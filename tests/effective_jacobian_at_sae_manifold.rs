@@ -35,9 +35,7 @@
 //! them as flat aliases.
 
 use gam::families::custom_family::FamilyLinearizationState;
-use gam::terms::sae_manifold::{
-    AssignmentMode, SaeAssignment, SaeManifoldAtom, SaeManifoldTerm,
-};
+use gam::terms::sae_manifold::{AssignmentMode, SaeAssignment, SaeManifoldAtom, SaeManifoldTerm};
 use ndarray::Array2;
 
 const N: usize = 16;

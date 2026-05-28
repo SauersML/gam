@@ -18,7 +18,6 @@
 
 #[path = "common/gpu_gate.rs"]
 mod gpu_gate;
-use gpu_gate::{GpuGate, gpu_gate};
 use faer::Side;
 use gam::construction::CanonicalPenalty;
 use gam::estimate::PenaltySpec;
@@ -28,6 +27,7 @@ use gam::types::{
     GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LogSmoothingParamsView, ResponseFamily,
     StandardLink,
 };
+use gpu_gate::{GpuGate, gpu_gate};
 use ndarray::{Array1, Array2};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -345,7 +345,9 @@ fn gpu_pirls_gating_3_offset_parity() {
 // ---------------------------------------------------------------------------
 #[test]
 fn gpu_pirls_gating_4_penalized_line_search_rejects_unpenalized_step() {
-    if let GpuGate::Skip = gpu_gate("gpu_pirls_gating_4_penalized_line_search_rejects_unpenalized_step") {
+    if let GpuGate::Skip =
+        gpu_gate("gpu_pirls_gating_4_penalized_line_search_rejects_unpenalized_step")
+    {
         return;
     }
 

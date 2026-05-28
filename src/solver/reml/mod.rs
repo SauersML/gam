@@ -4506,7 +4506,6 @@ pub(crate) struct RemlState<'a> {
     /// Used by P-IRLS for factored reparameterization.
     pub(crate) kronecker_factored: Option<crate::basis::KroneckerFactoredBasis>,
 
-
     /// Precomputed `(XᵀWX, XᵀW(y − offset))` for the Gaussian + Identity
     /// outer REML loop, populated once before the outer optimizer when the
     /// family / link / constraint preconditions hold and the design supports

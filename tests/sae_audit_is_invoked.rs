@@ -156,15 +156,8 @@ fn run_joint_fit_fails_with_aliased_atoms() {
     let mut rho = make_rho(2);
     let target = zero_target();
 
-    let result = term.run_joint_fit_arrow_schur(
-        target.view(),
-        &mut rho,
-        None,
-        1,
-        1.0,
-        1.0e-3,
-        1.0e-3,
-    );
+    let result =
+        term.run_joint_fit_arrow_schur(target.view(), &mut rho, None, 1, 1.0, 1.0e-3, 1.0e-3);
     assert!(
         result.is_err(),
         "run_joint_fit_arrow_schur must fail with aliased atoms (identical bases, equal assignments); \

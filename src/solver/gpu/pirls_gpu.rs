@@ -675,13 +675,7 @@ extern "C" __global__ void chol_logdet_col_major(
             .map_err(|e| format!("dgemm Qsᵀ·A·Qs (host-input step): {e}"))?;
         }
         // H_step = Qsᵀ·XᵀWX·Qs + (S + step_lm_lambda·I).
-        geam_add_inplace(
-            &ws.blas,
-            &ws.stream,
-            p,
-            &mut ws.h_dev,
-            &ws.penalty_dev,
-        )?;
+        geam_add_inplace(&ws.blas, &ws.stream, p, &mut ws.h_dev, &ws.penalty_dev)?;
 
         // Upload gradient into the persistent RHS buffer.
         // `input.gradient` is already in transformed coordinates (Qsᵀ-projected
@@ -909,13 +903,7 @@ extern "C" __global__ void chol_logdet_col_major(
                 }
                 .map_err(|e| format!("dgemm Qsᵀ·A·Qs (device-input large-p): {e}"))?;
             }
-            geam_add_inplace(
-                &ws.blas,
-                &ws.stream,
-                p,
-                &mut ws.h_dev,
-                &ws.penalty_dev,
-            )?;
+            geam_add_inplace(&ws.blas, &ws.stream, p, &mut ws.h_dev, &ws.penalty_dev)?;
             let gemv_cfg = GemvConfig::<f64> {
                 trans: cublasOperation_t::CUBLAS_OP_T,
                 m: n_i,
@@ -1003,13 +991,7 @@ extern "C" __global__ void chol_logdet_col_major(
             ws.stream
                 .memcpy_htod(penalty_step_col.as_ref(), &mut ws.penalty_dev)
                 .map_err(|e| format!("upload penalty (fused device-input): {e}"))?;
-            geam_add_inplace(
-                &ws.blas,
-                &ws.stream,
-                p,
-                &mut ws.h_dev,
-                &ws.penalty_dev,
-            )?;
+            geam_add_inplace(&ws.blas, &ws.stream, p, &mut ws.h_dev, &ws.penalty_dev)?;
         }
 
         // Apply rhs correction BEFORE the solve:
@@ -1299,13 +1281,7 @@ extern "C" __global__ void chol_logdet_col_major(
         ws.stream
             .memcpy_htod(penalty_step_col.as_ref(), &mut ws.penalty_dev)
             .map_err(|e| format!("upload penalty inplace: {e}"))?;
-        geam_add_inplace(
-            &ws.blas,
-            &ws.stream,
-            p,
-            &mut ws.h_dev,
-            &ws.penalty_dev,
-        )?;
+        geam_add_inplace(&ws.blas, &ws.stream, p, &mut ws.h_dev, &ws.penalty_dev)?;
 
         // Step 3: rhs = Qsᵀ score_p − S·β + linear_shift  (#257, #260).
         // First project score_p through Qsᵀ on device (p×p gemv):
@@ -1499,13 +1475,7 @@ extern "C" __global__ void chol_logdet_col_major(
         ws.stream
             .memcpy_htod(penalty_col.as_ref(), &mut ws.penalty_dev)
             .map_err(|e| format!("upload penalty (final H rebuild): {e}"))?;
-        geam_add_inplace(
-            &ws.blas,
-            &ws.stream,
-            p,
-            &mut ws.h_dev,
-            &ws.penalty_dev,
-        )?;
+        geam_add_inplace(&ws.blas, &ws.stream, p, &mut ws.h_dev, &ws.penalty_dev)?;
 
         // One download — the only H transfer in the entire PIRLS loop.
         let h_col = ws
@@ -1585,12 +1555,8 @@ extern "C" __global__ void chol_logdet_col_major(
         // never read by the one-shot Newton step path.
         let n_rows = input.x.nrows();
         let zero_n = ndarray::Array1::<f64>::zeros(n_rows);
-        let shared = PirlsGpuSharedData::upload_impl(
-            input.x,
-            zero_n.view(),
-            zero_n.view(),
-            zero_n.view(),
-        )?;
+        let shared =
+            PirlsGpuSharedData::upload_impl(input.x, zero_n.view(), zero_n.view(), zero_n.view())?;
         let mut ws = SigmaPirlsGpuWorkspace::allocate_impl(&shared)?;
         solve_step_on_stream(
             &shared,

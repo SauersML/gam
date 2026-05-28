@@ -29,7 +29,9 @@ const REL_ERR_TOL: f64 = 1e-5; // finite-diff error, generous to account for ε�
 
 /// A simple deterministic pseudo-random generator (no stdlib rand required).
 fn lcg(seed: &mut u64) -> f64 {
-    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *seed = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     let bits = ((*seed >> 33) as u32) as f64;
     bits / (u32::MAX as f64) * 2.0 - 1.0
 }
@@ -64,12 +66,8 @@ fn matvec(a: &Array2<f64>, x: &[f64]) -> Vec<f64> {
 ///
 /// `eta_fn(beta)` should return a `Vec<f64>` of length `3*N` representing
 /// the stacked outputs `[η0[0..N], η1[0..N], ad1[0..N]]` at the given β.
-fn assert_jacobian_matches_fd<F>(
-    name: &str,
-    jac: &Array2<f64>,
-    beta: &[f64],
-    eta_fn: F,
-) where
+fn assert_jacobian_matches_fd<F>(name: &str, jac: &Array2<f64>, beta: &[f64], eta_fn: F)
+where
     F: Fn(&[f64]) -> Vec<f64>,
 {
     let three_n = jac.nrows();
@@ -185,7 +183,10 @@ fn logslope_jacobian_fd_at_nonzero_beta() {
 
     // Compute the scalars at this beta
     let g: Vec<f64> = matvec(&design, &beta);
-    let c: Vec<f64> = g.iter().map(|&gi| (1.0 + (s * gi).powi(2)).sqrt()).collect();
+    let c: Vec<f64> = g
+        .iter()
+        .map(|&gi| (1.0 + (s * gi).powi(2)).sqrt())
+        .collect();
     // Use non-trivial q values
     let q0: Vec<f64> = (0..N).map(|_| lcg(&mut seed) * 0.5).collect();
     let q1: Vec<f64> = (0..N).map(|_| lcg(&mut seed) * 0.5).collect();
@@ -440,15 +441,13 @@ fn logslope_no_scalars_falls_back_to_c1() {
     for i in 0..N {
         for j in 0..P {
             let expected_eta0 = s * z[i] * design[[i, j]];
-            let rel_err =
-                (jac[[i, j]] - expected_eta0).abs() / expected_eta0.abs().max(1e-12);
+            let rel_err = (jac[[i, j]] - expected_eta0).abs() / expected_eta0.abs().max(1e-12);
             assert!(
                 rel_err < 1e-10,
                 "logslope no_scalars fallback: eta0 row={i} col={j} got={} expected={expected_eta0}",
                 jac[[i, j]],
             );
-            let rel_err1 =
-                (jac[[N + i, j]] - expected_eta0).abs() / expected_eta0.abs().max(1e-12);
+            let rel_err1 = (jac[[N + i, j]] - expected_eta0).abs() / expected_eta0.abs().max(1e-12);
             assert!(
                 rel_err1 < 1e-10,
                 "logslope no_scalars fallback: eta1 row={i} col={j} got={} expected={expected_eta0}",

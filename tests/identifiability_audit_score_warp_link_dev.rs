@@ -46,11 +46,7 @@ fn linspace(a: f64, b: f64, n: usize) -> Array1<f64> {
     Array1::from_iter((0..n).map(|i| a + step * i as f64))
 }
 
-fn spec(
-    name: &str,
-    design: Array2<f64>,
-    gauge_priority: u8,
-) -> ParameterBlockSpec {
+fn spec(name: &str, design: Array2<f64>, gauge_priority: u8) -> ParameterBlockSpec {
     let n_rows = design.nrows();
     ParameterBlockSpec {
         name: name.to_string(),
@@ -277,10 +273,7 @@ fn both_flex_blocks_aliased_both_attributed_non_fatal() {
         .dropped_columns
         .iter()
         .any(|d| d.block == "score_warp_dev");
-    let ld_drop = audit
-        .dropped_columns
-        .iter()
-        .any(|d| d.block == "link_dev");
+    let ld_drop = audit.dropped_columns.iter().any(|d| d.block == "link_dev");
     assert!(
         sw_drop || ld_drop,
         "at least one of score_warp_dev or link_dev must have dropped columns; \

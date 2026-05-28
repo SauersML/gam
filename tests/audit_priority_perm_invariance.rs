@@ -91,24 +91,22 @@ fn build_specs(scramble: bool) -> Vec<ParameterBlockSpec> {
 /// whether specs arrive in descending or scrambled priority order.
 #[test]
 fn rank_verdict_invariant_under_priority_scramble() {
-    let sorted_audit = audit_identifiability(&build_specs(false))
-        .expect("sorted-order audit must succeed");
-    let scrambled_audit = audit_identifiability(&build_specs(true))
-        .expect("scrambled-order audit must succeed");
+    let sorted_audit =
+        audit_identifiability(&build_specs(false)).expect("sorted-order audit must succeed");
+    let scrambled_audit =
+        audit_identifiability(&build_specs(true)).expect("scrambled-order audit must succeed");
 
     // Total columns = 3 + 3 + 3 = 9. Two shared constant columns are
     // redundant → joint rank = 7. Both audits must agree.
     let sorted_rank: usize = sorted_audit.blocks.iter().map(|b| b.effective_dim).sum();
     let scrambled_rank: usize = scrambled_audit.blocks.iter().map(|b| b.effective_dim).sum();
     assert_eq!(
-        sorted_rank,
-        scrambled_rank,
+        sorted_rank, scrambled_rank,
         "rank verdict must be identical regardless of spec ordering; \
          sorted_rank={sorted_rank} scrambled_rank={scrambled_rank}\n\
          sorted summary:   {}\n\
          scrambled summary: {}",
-        sorted_audit.summary,
-        scrambled_audit.summary,
+        sorted_audit.summary, scrambled_audit.summary,
     );
 
     // Neither audit should be fatal (distinct priorities resolve the alias).
@@ -127,8 +125,7 @@ fn rank_verdict_invariant_under_priority_scramble() {
 
     // Exact rank check: 9 − 2 = 7 kept columns.
     assert_eq!(
-        sorted_rank,
-        7,
+        sorted_rank, 7,
         "expected joint rank 7 (9 total − 2 shared constants); got {sorted_rank}"
     );
 }
@@ -138,8 +135,7 @@ fn rank_verdict_invariant_under_priority_scramble() {
 #[test]
 fn drops_attributed_to_lower_priority_blocks_in_both_orderings() {
     for scramble in [false, true] {
-        let audit = audit_identifiability(&build_specs(scramble))
-            .expect("audit must succeed");
+        let audit = audit_identifiability(&build_specs(scramble)).expect("audit must succeed");
 
         // Exactly two drops expected (two redundant constant columns).
         assert_eq!(
@@ -161,8 +157,16 @@ fn drops_attributed_to_lower_priority_blocks_in_both_orderings() {
         }
 
         // Each of `mid` and `low` must receive exactly one drop.
-        let mid_drops = audit.dropped_columns.iter().filter(|d| d.block == "mid").count();
-        let low_drops = audit.dropped_columns.iter().filter(|d| d.block == "low").count();
+        let mid_drops = audit
+            .dropped_columns
+            .iter()
+            .filter(|d| d.block == "mid")
+            .count();
+        let low_drops = audit
+            .dropped_columns
+            .iter()
+            .filter(|d| d.block == "low")
+            .count();
         assert_eq!(
             mid_drops, 1,
             "'mid' must receive exactly 1 drop (scramble={scramble}); \

@@ -107,15 +107,28 @@ fn bms_marginal_jacobian_matches_finite_difference() {
     // Analytic formula: ∂η_i/∂(β_m)_k = c_i · M[i,k]
     // where c_i = sqrt(1 + (S·g_i)²).
     for i in 0..N {
-        let g_i: f64 =
-            offset_s[i] + g_arr.row(i).iter().zip(&beta_s).map(|(x, b)| x * b).sum::<f64>();
+        let g_i: f64 = offset_s[i]
+            + g_arr
+                .row(i)
+                .iter()
+                .zip(&beta_s)
+                .map(|(x, b)| x * b)
+                .sum::<f64>();
         let c_i = (1.0 + (S * g_i).powi(2)).sqrt();
         let m_row: Vec<f64> = m_arr.row(i).to_vec();
         let g_row: Vec<f64> = g_arr.row(i).to_vec();
         for k in 0..P_M {
             let analytic = c_i * m_arr[[i, k]];
             let fd = fd_wrt_beta_m(
-                &m_row, &g_row, offset_m[i], offset_s[i], z_vals[i], S, &beta_m, &beta_s, k,
+                &m_row,
+                &g_row,
+                offset_m[i],
+                offset_s[i],
+                z_vals[i],
+                S,
+                &beta_m,
+                &beta_s,
+                k,
             );
             assert!(
                 (analytic - fd).abs() < 1e-6,
@@ -152,10 +165,20 @@ fn bms_logslope_jacobian_matches_finite_difference() {
 
     // Analytic formula: ∂η_i/∂(β_s)_k = (q_i·S²·g_i/c_i + S·z_i) · G[i,k]
     for i in 0..N {
-        let q_i: f64 =
-            offset_m[i] + m_arr.row(i).iter().zip(&beta_m).map(|(x, b)| x * b).sum::<f64>();
-        let g_i: f64 =
-            offset_s[i] + g_arr.row(i).iter().zip(&beta_s).map(|(x, b)| x * b).sum::<f64>();
+        let q_i: f64 = offset_m[i]
+            + m_arr
+                .row(i)
+                .iter()
+                .zip(&beta_m)
+                .map(|(x, b)| x * b)
+                .sum::<f64>();
+        let g_i: f64 = offset_s[i]
+            + g_arr
+                .row(i)
+                .iter()
+                .zip(&beta_s)
+                .map(|(x, b)| x * b)
+                .sum::<f64>();
         let sg = S * g_i;
         let c_i = (1.0 + sg * sg).sqrt();
         let factor = q_i * S * S * g_i / c_i + S * z_vals[i];
@@ -164,7 +187,15 @@ fn bms_logslope_jacobian_matches_finite_difference() {
         for k in 0..P_S {
             let analytic = factor * g_arr[[i, k]];
             let fd = fd_wrt_beta_s(
-                &m_row, &g_row, offset_m[i], offset_s[i], z_vals[i], S, &beta_m, &beta_s, k,
+                &m_row,
+                &g_row,
+                offset_m[i],
+                offset_s[i],
+                z_vals[i],
+                S,
+                &beta_m,
+                &beta_s,
+                k,
             );
             assert!(
                 (analytic - fd).abs() < 1e-6,
@@ -206,13 +237,26 @@ fn bms_jacobians_with_frailty_scale_match_fd() {
         let g_row: Vec<f64> = g_arr.row(i).to_vec();
 
         // marginal block
-        let g_i: f64 =
-            offset_s[i] + g_arr.row(i).iter().zip(&beta_s).map(|(x, b)| x * b).sum::<f64>();
+        let g_i: f64 = offset_s[i]
+            + g_arr
+                .row(i)
+                .iter()
+                .zip(&beta_s)
+                .map(|(x, b)| x * b)
+                .sum::<f64>();
         let c_i = (1.0 + (S * g_i).powi(2)).sqrt();
         for k in 0..P_M {
             let analytic = c_i * m_arr[[i, k]];
             let fd = fd_wrt_beta_m(
-                &m_row, &g_row, offset_m[i], offset_s[i], z_vals[i], S, &beta_m, &beta_s, k,
+                &m_row,
+                &g_row,
+                offset_m[i],
+                offset_s[i],
+                z_vals[i],
+                S,
+                &beta_m,
+                &beta_s,
+                k,
             );
             assert!(
                 (analytic - fd).abs() < 1e-6,
@@ -221,15 +265,28 @@ fn bms_jacobians_with_frailty_scale_match_fd() {
         }
 
         // logslope block
-        let q_i: f64 =
-            offset_m[i] + m_arr.row(i).iter().zip(&beta_m).map(|(x, b)| x * b).sum::<f64>();
+        let q_i: f64 = offset_m[i]
+            + m_arr
+                .row(i)
+                .iter()
+                .zip(&beta_m)
+                .map(|(x, b)| x * b)
+                .sum::<f64>();
         let sg = S * g_i;
         let c_i2 = (1.0 + sg * sg).sqrt();
         let factor = q_i * S * S * g_i / c_i2 + S * z_vals[i];
         for k in 0..P_S {
             let analytic = factor * g_arr[[i, k]];
             let fd = fd_wrt_beta_s(
-                &m_row, &g_row, offset_m[i], offset_s[i], z_vals[i], S, &beta_m, &beta_s, k,
+                &m_row,
+                &g_row,
+                offset_m[i],
+                offset_s[i],
+                z_vals[i],
+                S,
+                &beta_m,
+                &beta_s,
+                k,
             );
             assert!(
                 (analytic - fd).abs() < 1e-6,

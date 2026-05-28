@@ -10,25 +10,22 @@
 //! - `test_support` — thread-local penalized-deviance trace harness.
 
 use super::{
-    PIRLS_ETA_ABS_CAP, PirlsAcceptedStateCacheKey,
-    SoftAcceptProgress, WorkingModel, WorkingModelPirlsOptions,
-    add_scaled_diagonal_to_upper_sparse, compute_lm_d2,
-    constrained_stationarity_norm, linear_constraints_from_lower_bounds,
-    compute_constraint_kkt_diagnostics, effective_kkt_tolerance,
-    pirls_soft_acceptance, project_coefficients_to_lower_bounds,
-    solve_newton_directionwith_linear_constraints, update_scaled_diagonal_in_place,
-    solve_newton_directionwith_lower_bounds,
-    ExportedLaplaceCurvature, HessianCurvatureKind, PirlsStatus,
-    WorkingModelIterationInfo, WorkingModelPirlsResult, WorkingState,
-    array1_l2_norm,
-    restore_pending_arrow_latent_if_needed, commit_pending_arrow_latent,
-    solve_newton_direction_dense, solve_newton_direction_dense_with_factor,
-    solve_direction_with_dense_factor,
+    ExportedLaplaceCurvature, HessianCurvatureKind, PIRLS_ETA_ABS_CAP, PirlsAcceptedStateCacheKey,
+    PirlsStatus, SoftAcceptProgress, WorkingModel, WorkingModelIterationInfo,
+    WorkingModelPirlsOptions, WorkingModelPirlsResult, WorkingState,
+    add_scaled_diagonal_to_upper_sparse, array1_l2_norm, commit_pending_arrow_latent,
+    compute_constraint_kkt_diagnostics, compute_lm_d2, constrained_stationarity_norm,
+    effective_kkt_tolerance, linear_constraints_from_lower_bounds, pirls_soft_acceptance,
+    project_coefficients_to_lower_bounds, restore_pending_arrow_latent_if_needed,
+    solve_direction_with_dense_factor, solve_newton_direction_dense,
+    solve_newton_direction_dense_with_factor, solve_newton_directionwith_linear_constraints,
+    solve_newton_directionwith_lower_bounds, update_scaled_diagonal_in_place,
 };
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::FaerSymmetricFactor;
-use crate::linalg::sparse_exact::{factorize_sparse_spd, solve_sparse_spd_into,
-    sparse_symmetric_upper_matvec_public};
+use crate::linalg::sparse_exact::{
+    factorize_sparse_spd, solve_sparse_spd_into, sparse_symmetric_upper_matvec_public,
+};
 use crate::linalg::utils::{array_is_finite, inf_norm};
 use crate::types::Coefficients;
 use faer::sparse::SparseColMat;

@@ -305,12 +305,7 @@ pub fn compute_skewness_mu3(z: &[f64]) -> f64 {
 ///
 /// The shift is clamped to ±0.5 to prevent a degenerate skewed z from
 /// placing the null band entirely outside [−1, 1].
-pub fn bias_shift_for_pair(
-    z_a: Option<&[f64]>,
-    z_b: Option<&[f64]>,
-    s2_a: f64,
-    s2_b: f64,
-) -> f64 {
+pub fn bias_shift_for_pair(z_a: Option<&[f64]>, z_b: Option<&[f64]>, s2_a: f64, s2_b: f64) -> f64 {
     // Both blocks have the same row scaling → shift cancels.
     match (z_a, z_b) {
         (Some(za), Some(zb)) if za.len() == zb.len() => {
@@ -687,8 +682,9 @@ fn audit_identifiability_impl(
         );
     }
     let rrqr = if priority_perm_is_identity {
-        rrqr_with_permutation(&x_joint, default_rrqr_rank_alpha())
-            .map_err(|e| EstimationError::LayoutError(format!("identifiability audit joint RRQR failed: {e:?}")))?
+        rrqr_with_permutation(&x_joint, default_rrqr_rank_alpha()).map_err(|e| {
+            EstimationError::LayoutError(format!("identifiability audit joint RRQR failed: {e:?}"))
+        })?
     } else {
         let mut x_priority = Array2::<f64>::zeros((n, p_total));
         for (new_j, &old_j) in priority_perm.iter().enumerate() {
@@ -812,7 +808,8 @@ fn audit_identifiability_impl(
                     // Bias shift: non-zero when exactly one block carries
                     // row-scaling (or the two scalings differ).
                     let shift = bias_shift_for_pair(z_a, z_b, s2_ja, s2_jb);
-                    let report_half_width = pair_report_threshold(s2_ja, s2_jb, n, total_cross_pairs);
+                    let report_half_width =
+                        pair_report_threshold(s2_ja, s2_jb, n, total_cross_pairs);
                     let report_flag = cosine_outside_null_band(cosine, shift, report_half_width);
                     // Store the unsigned |cosine| in AliasedPair.overlap for
                     // backwards compatibility and human-readable diagnostics.
@@ -1048,10 +1045,7 @@ fn audit_identifiability_impl(
                 } else {
                     return false;
                 };
-                let other_priority = block_priority
-                    .get(other_block)
-                    .copied()
-                    .unwrap_or(100);
+                let other_priority = block_priority.get(other_block).copied().unwrap_or(100);
                 other_priority > drop_priority
             })
         });
@@ -1269,8 +1263,12 @@ pub fn audit_identifiability_channel_aware(
         std::iter::repeat(crate::families::identifiability_compiler::BlockOrder::Marginal)
             .take(operators.len())
             .collect();
-    let compiled = compile_with_dual_metric(operators, row_hess, &id_struct, &ordering)
-        .map_err(|e| EstimationError::LayoutError(format!("audit_identifiability_channel_aware compile failed: {e:?}")))?;
+    let compiled =
+        compile_with_dual_metric(operators, row_hess, &id_struct, &ordering).map_err(|e| {
+            EstimationError::LayoutError(format!(
+                "audit_identifiability_channel_aware compile failed: {e:?}"
+            ))
+        })?;
 
     // Build per-block identity entries from the compiled output.
     let mut blocks: Vec<BlockIdentity> = Vec::with_capacity(specs.len());
@@ -1426,16 +1424,13 @@ pub fn audit_identifiability_channel_aware(
                 } else {
                     return false;
                 };
-                let other_priority = block_priority_ca
-                    .get(other_block)
-                    .copied()
-                    .unwrap_or(100);
+                let other_priority = block_priority_ca.get(other_block).copied().unwrap_or(100);
                 other_priority > drop_priority
             })
         });
 
-    let fatal = (joint_rank_deficient && !gauge_resolves_rank_deficiency_ca)
-        || hard_alias_pair.is_some();
+    let fatal =
+        (joint_rank_deficient && !gauge_resolves_rank_deficiency_ca) || hard_alias_pair.is_some();
 
     let fatal_detail = if fatal {
         let mut parts: Vec<String> = Vec::new();
@@ -1545,9 +1540,7 @@ fn channel_aware_aliased_pairs(
     let k = operators[0].k();
     let n = operators[0].nrows();
     let nk = n.checked_mul(k).ok_or_else(|| {
-        EstimationError::LayoutError(format!(
-            "channel-aware audit: n*k overflow (n={n}, k={k})"
-        ))
+        EstimationError::LayoutError(format!("channel-aware audit: n*k overflow (n={n}, k={k})"))
     })?;
     let p_total = *col_offsets.last().unwrap_or(&0);
     if p_total == 0 || nk == 0 {
@@ -1605,8 +1598,7 @@ fn channel_aware_aliased_pairs(
                 dot += cols[a][i] * cols[b][i];
             }
             let overlap = (dot.abs() / (col_norms[a] * col_norms[b])).min(1.0);
-            let report_thr =
-                pair_report_threshold(col_s2[a], col_s2[b], nk, total_cross_pairs);
+            let report_thr = pair_report_threshold(col_s2[a], col_s2[b], nk, total_cross_pairs);
             if overlap >= report_thr {
                 let (block_a_idx, dir_a) = locate_block_column(col_offsets, a)?;
                 let (block_b_idx, dir_b) = locate_block_column(col_offsets, b)?;
@@ -1700,7 +1692,11 @@ pub fn maybe_log_audit_drift(
     // Threshold 0.5 and period 10 are inlined here per T34's contract.
     const BETA_RELATIVE_THRESHOLD: f64 = 0.5;
     const DEFAULT_EVERY_N_ITERS: usize = 10;
-    let period = if every_n_iters == 0 { DEFAULT_EVERY_N_ITERS } else { every_n_iters };
+    let period = if every_n_iters == 0 {
+        DEFAULT_EVERY_N_ITERS
+    } else {
+        every_n_iters
+    };
 
     let beta_pilot_norm: f64 = beta_pilot.iter().map(|b| b * b).sum::<f64>().sqrt();
     let beta_current_len = beta_current.len();
@@ -1787,9 +1783,8 @@ pub fn maybe_log_audit_drift(
         .map(|d| format!("{}[{}]", d.block, d.column))
         .collect();
 
-    let verdict_changed = pilot_rank != current_rank
-        || !newly_dropped.is_empty()
-        || !recovered.is_empty();
+    let verdict_changed =
+        pilot_rank != current_rank || !newly_dropped.is_empty() || !recovered.is_empty();
 
     if verdict_changed {
         // Structured INFO log so log-grep can find all drift events.
@@ -2054,7 +2049,8 @@ pub fn check_map_uniqueness(
         if ntsn < pen_tol {
             // Find the dominant block: the block whose columns have the
             // largest cumulative squared component in n_vec.
-            let dominant_block = dominant_block_for_direction(&n_vec.to_owned(), specs, col_offsets);
+            let dominant_block =
+                dominant_block_for_direction(&n_vec.to_owned(), specs, col_offsets);
 
             let message = format!(
                 "MAP estimate is non-unique: null direction {} of J^T W J (eigenvalue {lam:.3e}) \
@@ -2063,9 +2059,7 @@ pub fn check_map_uniqueness(
                  curvature); dominant block: '{}'. \
                  Fix: add a non-degenerate smoothness penalty to block '{}' that covers this \
                  direction, or remove the unpenalised null direction from the model.",
-                dir_idx,
-                dominant_block,
-                dominant_block,
+                dir_idx, dominant_block, dominant_block,
             );
             return Err(MapUniquenessError {
                 message,

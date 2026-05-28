@@ -372,16 +372,15 @@ impl ScoreWarpEffectiveJacobian {
     /// time derivative evaluated at training rows.
     pub fn new(dq: ndarray::Array2<f64>, dqd1: ndarray::Array2<f64>) -> Self {
         Self {
-            inner: crate::families::survival_marginal_slope_identifiability::QChannelBlockOperator::new(
-                dq, dqd1,
-            ),
+            inner:
+                crate::families::survival_marginal_slope_identifiability::QChannelBlockOperator::new(
+                    dq, dqd1,
+                ),
         }
     }
 }
 
-impl crate::families::identifiability_compiler::RowJacobianOperator
-    for ScoreWarpEffectiveJacobian
-{
+impl crate::families::identifiability_compiler::RowJacobianOperator for ScoreWarpEffectiveJacobian {
     fn k(&self) -> usize {
         self.inner.k()
     }
@@ -427,16 +426,15 @@ impl LinkDevEffectiveJacobian {
     /// training rows.
     pub fn new(dq: ndarray::Array2<f64>, dqd1: ndarray::Array2<f64>) -> Self {
         Self {
-            inner: crate::families::survival_marginal_slope_identifiability::QChannelBlockOperator::new(
-                dq, dqd1,
-            ),
+            inner:
+                crate::families::survival_marginal_slope_identifiability::QChannelBlockOperator::new(
+                    dq, dqd1,
+                ),
         }
     }
 }
 
-impl crate::families::identifiability_compiler::RowJacobianOperator
-    for LinkDevEffectiveJacobian
-{
+impl crate::families::identifiability_compiler::RowJacobianOperator for LinkDevEffectiveJacobian {
     fn k(&self) -> usize {
         self.inner.k()
     }

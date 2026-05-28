@@ -22457,10 +22457,18 @@ fn workflow_error_to_pyerr(py: Python<'_>, err: WorkflowError) -> PyErr {
             }
             exc
         }
-        WorkflowError::InvalidConfig { reason }
-        | WorkflowError::SchemaMismatch { reason }
-        | WorkflowError::MissingDependency { reason }
-        | WorkflowError::IntegrationFailed { reason } => py_value_error(reason),
+        // Variant-typed dispatch (issue #343). The four flavours that
+        // previously flattened to bare `py_value_error(reason)` now each
+        // carry a distinct typed subclass, so callers can branch on
+        // `except InvalidConfigurationError` / `SchemaMismatchError` /
+        // `MissingDependencyError` / `IntegrationError` without parsing
+        // the prose. All four still inherit from `GamError` (and
+        // therefore `ValueError`), so legacy `except ValueError` /
+        // `except GamError` handlers keep catching them.
+        WorkflowError::InvalidConfig { reason } => InvalidConfigurationError::new_err(reason),
+        WorkflowError::SchemaMismatch { reason } => SchemaMismatchError::new_err(reason),
+        WorkflowError::MissingDependency { reason } => MissingDependencyError::new_err(reason),
+        WorkflowError::IntegrationFailed { reason } => IntegrationError::new_err(reason),
         WorkflowError::FormulaDsl { .. } => FormulaError::new_err(err.to_string()),
     }
 }

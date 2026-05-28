@@ -516,11 +516,7 @@ impl ResponseFamily {
                 let n = y.len();
                 let mean: f64 = y.iter().copied().sum::<f64>() / (n as f64);
                 let ssq: f64 = y.iter().map(|&v| (v - mean) * (v - mean)).sum::<f64>();
-                let var = if n > 1 {
-                    ssq / ((n - 1) as f64)
-                } else {
-                    ssq
-                };
+                let var = if n > 1 { ssq / ((n - 1) as f64) } else { ssq };
                 let sd = var.sqrt();
                 if !sd.is_finite() || sd <= GAUSSIAN_MIN_SAMPLE_SD {
                     Err(ResponseDegeneracy {

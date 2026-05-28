@@ -120,10 +120,8 @@ fn build_dataset() -> gam::inference::data::EncodedDataset {
         let entry = 40.0 + 5.0 * rng.next_unit();
         let followup = 0.5 + 8.0 * rng.next_unit();
         let exit = entry + followup;
-        let score = 0.3 * prs + 0.4 * pc1 - 0.3 * pc2
-            + 0.2 * pc3
-            + 0.15 * sex
-            + 0.2 * rng.next_gauss();
+        let score =
+            0.3 * prs + 0.4 * pc1 - 0.3 * pc2 + 0.2 * pc3 + 0.15 * sex + 0.2 * rng.next_gauss();
         let event = if score > 0.0 { 1 } else { 0 };
         rows.push(StringRecord::from(vec![
             entry.to_string(),

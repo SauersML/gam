@@ -7,9 +7,7 @@ use ndarray::{Array1, Array2, ArrayView1};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use super::{
-    compute_observed_hessian_curvature_arrays, computeworkingweight_derivatives_from_eta,
-};
+use super::{compute_observed_hessian_curvature_arrays, computeworkingweight_derivatives_from_eta};
 
 /// Whether the solve operates in sparse-native or dense-transformed coordinates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

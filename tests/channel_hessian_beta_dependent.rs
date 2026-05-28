@@ -18,9 +18,7 @@
 use gam::families::custom_family::{FamilyChannelHessian, ParameterBlockSpec};
 use gam::families::survival_marginal_slope_identifiability::SurvivalRowHessian;
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
-use gam::solver::identifiability_audit::{
-    IdentifiabilityAudit, maybe_log_audit_drift,
-};
+use gam::solver::identifiability_audit::{IdentifiabilityAudit, maybe_log_audit_drift};
 use ndarray::{Array1, Array2};
 
 // ── helpers ────────────────────────────────────────────────────────────────
@@ -59,10 +57,9 @@ fn make_survival_row_hessian(
     let weights = Array1::from_elem(n, 1.0_f64);
     let event = Array1::from_elem(n, 1.0_f64);
     SurvivalRowHessian::from_pilot_primary_state(
-        &q0_arr, &q1_arr, &qd1_arr, &g_arr, &z_arr,
-        &weights, &event,
-        1e-6,  // derivative_guard
-        1.0,   // probit_scale
+        &q0_arr, &q1_arr, &qd1_arr, &g_arr, &z_arr, &weights, &event,
+        1e-6, // derivative_guard
+        1.0,  // probit_scale
     )
     .expect("make_survival_row_hessian: from_pilot_primary_state failed")
 }
@@ -87,10 +84,10 @@ fn survival_marginal_slope_w_changes_with_beta() {
 
     // State A: pilot β=0 → g=0, c=1, q0=q1=qd1=0.5.
     let hess_a = make_survival_row_hessian(
-        &[0.5, 0.5, 0.5, 0.5], // q0
-        &[0.5, 0.5, 0.5, 0.5], // q1
-        &[1.0, 1.0, 1.0, 1.0], // qd1 (must be > derivative_guard)
-        &[0.0, 0.0, 0.0, 0.0], // g = 0
+        &[0.5, 0.5, 0.5, 0.5],   // q0
+        &[0.5, 0.5, 0.5, 0.5],   // q1
+        &[1.0, 1.0, 1.0, 1.0],   // qd1 (must be > derivative_guard)
+        &[0.0, 0.0, 0.0, 0.0],   // g = 0
         &[1.0, -1.0, 0.5, -0.5], // z
     );
 
@@ -108,8 +105,13 @@ fn survival_marginal_slope_w_changes_with_beta() {
     let z_b = vec![1.0, -1.0, 0.5, -0.5];
     let s_b = 1.0_f64;
     let scalars_b = SurvivalMarginalSlopeFamilyScalars::new(
-        q0_b, q1_b, qd1_b, g_b.clone(), s_b,
-        z_b.clone(), g_b.clone(),
+        q0_b,
+        q1_b,
+        qd1_b,
+        g_b.clone(),
+        s_b,
+        z_b.clone(),
+        g_b.clone(),
     );
     let scalars_arc: Arc<dyn std::any::Any + Send + Sync> = Arc::new(scalars_b);
 

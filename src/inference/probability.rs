@@ -335,8 +335,7 @@ mod tests {
     use super::*;
     use crate::mixture_link::{state_from_sasspec, state_fromspec};
     use crate::types::{
-        InverseLink, LinkComponent, MixtureLinkSpec, ResponseFamily, SasLinkSpec,
-        StandardLink,
+        InverseLink, LinkComponent, MixtureLinkSpec, ResponseFamily, SasLinkSpec, StandardLink,
     };
     use ndarray::array;
 

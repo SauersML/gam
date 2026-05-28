@@ -165,11 +165,7 @@ fn make_synthetic_data(seed: u64) -> SyntheticData {
                     let d = pcs[[i, j]] - centers[[k, j]];
                     r2 += d * d;
                 }
-                phi[[i, 1 + D_PC + k]] = if r2 < 1e-30 {
-                    0.0
-                } else {
-                    r2 * r2.ln()
-                };
+                phi[[i, 1 + D_PC + k]] = if r2 < 1e-30 { 0.0 } else { r2 * r2.ln() };
             }
         }
         phi
@@ -194,7 +190,15 @@ fn make_synthetic_data(seed: u64) -> SyntheticData {
         qd1_base[i] = 0.5 + 0.1 * (z[i].powi(2)).min(2.0);
     }
 
-    SyntheticData { z, phi, phi_marg, phi_time, q0_base, q1_base, qd1_base }
+    SyntheticData {
+        z,
+        phi,
+        phi_marg,
+        phi_time,
+        q0_base,
+        q1_base,
+        qd1_base,
+    }
 }
 
 // ── Per-row primary scalars at a given β_logslope ─────────────────────────
@@ -211,7 +215,12 @@ fn compute_row_scalars(phi: &Array2<f64>, beta: &[f64], s_f: f64) -> RowScalars 
     let mut c = Array1::<f64>::zeros(n);
     let mut c1 = Array1::<f64>::zeros(n);
     for i in 0..n {
-        let gi = phi.row(i).iter().zip(beta.iter()).map(|(&x, &b)| x * b).sum::<f64>();
+        let gi = phi
+            .row(i)
+            .iter()
+            .zip(beta.iter())
+            .map(|(&x, &b)| x * b)
+            .sum::<f64>();
         g[i] = gi;
         let obs_g = s_f * gi;
         let ci = (1.0 + obs_g * obs_g).sqrt();
@@ -322,13 +331,7 @@ impl BlockEffectiveJacobian for LogslopeJacobianImpl {
         };
 
         Ok(analytical_logslope_jacobian(
-            &self.phi,
-            state.beta,
-            q0,
-            q1,
-            qd1,
-            z,
-            self.s_f,
+            &self.phi, state.beta, q0, q1, qd1, z, self.s_f,
         ))
     }
 
@@ -362,7 +365,13 @@ impl RowJacobianOperator for LogslopeOperator {
     fn apply_row(&self, row: usize, delta_beta: &[f64], out: &mut [f64]) {
         assert_eq!(out.len(), 3);
         // Compute only the single-row scalar (g, c1) for this row.
-        let gi: f64 = self.phi.row(row).iter().zip(self.beta.iter()).map(|(&x, &b)| x * b).sum();
+        let gi: f64 = self
+            .phi
+            .row(row)
+            .iter()
+            .zip(self.beta.iter())
+            .map(|(&x, &b)| x * b)
+            .sum();
         let obs_g = self.s_f * gi;
         let ci = (1.0 + obs_g * obs_g).sqrt();
         let c1i = self.s_f * self.s_f * gi / ci;
@@ -527,15 +536,8 @@ fn check_logslope_jacobian(
     s_f: f64,
     label: &str,
 ) {
-    let analytic = analytical_logslope_jacobian(
-        &data.phi,
-        beta_logslope,
-        q0,
-        q1,
-        qd1,
-        &data.z,
-        s_f,
-    );
+    let analytic =
+        analytical_logslope_jacobian(&data.phi, beta_logslope, q0, q1, qd1, &data.z, s_f);
     let beta_arr = Array1::from(beta_logslope.to_vec());
     let phi_ref = &data.phi;
     let q0_ref = q0;
@@ -543,7 +545,17 @@ fn check_logslope_jacobian(
     let qd1_ref = qd1;
     let z_ref = &data.z;
     let fd = finite_diff_jacobian(
-        |b| compute_eta_stack(phi_ref, b.as_slice().unwrap(), q0_ref, q1_ref, qd1_ref, z_ref, s_f),
+        |b| {
+            compute_eta_stack(
+                phi_ref,
+                b.as_slice().unwrap(),
+                q0_ref,
+                q1_ref,
+                qd1_ref,
+                z_ref,
+                s_f,
+            )
+        },
         &beta_arr,
         1e-6,
     );
@@ -567,7 +579,12 @@ fn check_effective_jacobian_matches_fd(
     s_f: f64,
     label: &str,
 ) {
-    let state = FamilyLinearizationState { beta, family_scalars, channel_hessian: None, probit_frailty_scale: s_f };
+    let state = FamilyLinearizationState {
+        beta,
+        family_scalars,
+        channel_hessian: None,
+        probit_frailty_scale: s_f,
+    };
     let jac = spec
         .effective_jacobian_at("test", &state)
         .unwrap_or_else(|e| panic!("{label}: effective_jacobian_at failed: {e}"));
@@ -578,7 +595,17 @@ fn check_effective_jacobian_matches_fd(
     let qd1_ref = qd1;
     let z_ref = z;
     let fd = finite_diff_jacobian(
-        |b| compute_eta_stack(phi_ref, b.as_slice().unwrap(), q0_ref, q1_ref, qd1_ref, z_ref, s_f),
+        |b| {
+            compute_eta_stack(
+                phi_ref,
+                b.as_slice().unwrap(),
+                q0_ref,
+                q1_ref,
+                qd1_ref,
+                z_ref,
+                s_f,
+            )
+        },
         &beta_arr,
         1e-6,
     );
@@ -685,8 +712,7 @@ fn logslope_jacobian_at_moderate_beta_has_hyperbolic_correction() {
         // With Phi containing values ~ O(1/sqrt(P)) and P=9, and N=200,
         // scale ~ 1/(s_f * sqrt(P)) gives s_f * g_i ~ O(1).
         let scale = 1.0 / (s_f * (P_BLOCK as f64).sqrt());
-        let beta_moderate: Vec<f64> =
-            (0..P_BLOCK).map(|_| rng.next_gauss() * scale).collect();
+        let beta_moderate: Vec<f64> = (0..P_BLOCK).map(|_| rng.next_gauss() * scale).collect();
 
         let label = format!("beta=moderate s_f={s_f}");
         check_logslope_jacobian(
@@ -709,10 +735,7 @@ fn logslope_jacobian_at_moderate_beta_has_hyperbolic_correction() {
                 hyp / base
             })
             .collect();
-        let max_frac = hyperbolic_fractions
-            .iter()
-            .cloned()
-            .fold(0.0_f64, f64::max);
+        let max_frac = hyperbolic_fractions.iter().cloned().fold(0.0_f64, f64::max);
         assert!(
             max_frac > 1e-3,
             "s_f={s_f}: moderate β did not produce meaningful hyperbolic correction \
@@ -800,8 +823,7 @@ fn effective_jacobian_at_matches_fd_at_three_linearization_points() {
         // β = moderate.
         {
             let scale = 1.0 / (s_f * (P_BLOCK as f64).sqrt());
-            let beta: Vec<f64> =
-                (0..P_BLOCK).map(|_| rng.next_gauss() * scale).collect();
+            let beta: Vec<f64> = (0..P_BLOCK).map(|_| rng.next_gauss() * scale).collect();
             check_effective_jacobian_matches_fd(
                 &spec,
                 &beta,
@@ -877,8 +899,7 @@ fn channel_aware_audit_overlap_below_one_at_moderate_beta() {
     let mut rng = Splitmix64::new(0xFACE_u64);
 
     let scale = 1.0 / (s_f * (P_BLOCK as f64).sqrt());
-    let beta_logslope: Vec<f64> =
-        (0..P_BLOCK).map(|_| rng.next_gauss() * scale).collect();
+    let beta_logslope: Vec<f64> = (0..P_BLOCK).map(|_| rng.next_gauss() * scale).collect();
 
     // Marginal block: its c_i is from the marginal block's own g_marg = phi_marg · β_marg.
     // At β_marg = 0 (no marginal predictor shift), g_marg = 0, c_i = 1 for all i.
@@ -948,7 +969,6 @@ fn channel_aware_audit_overlap_below_one_at_moderate_beta() {
          Summary: {}",
         audit.summary,
     );
-
 }
 
 /// The time block contributes `c * design` to both η0 and η1. At β_time = 0
@@ -989,7 +1009,12 @@ fn time_and_marginal_blocks_at_zero_beta_have_trivial_scaling() {
     };
 
     // Effective Jacobian via spec.effective_jacobian_at (RowScaledJacobian with scaling=1).
-    let state = FamilyLinearizationState { beta: &beta_zero, family_scalars: None, channel_hessian: None, probit_frailty_scale: s_f };
+    let state = FamilyLinearizationState {
+        beta: &beta_zero,
+        family_scalars: None,
+        channel_hessian: None,
+        probit_frailty_scale: s_f,
+    };
     let jac = spec
         .effective_jacobian_at("test", &state)
         .expect("time block effective_jacobian_at must succeed");
@@ -1041,7 +1066,12 @@ fn time_and_marginal_blocks_at_zero_beta_have_trivial_scaling() {
         })),
         audit_design: None,
     };
-    let marg_state = FamilyLinearizationState { beta: &beta_zero, family_scalars: None, channel_hessian: None, probit_frailty_scale: s_f };
+    let marg_state = FamilyLinearizationState {
+        beta: &beta_zero,
+        family_scalars: None,
+        channel_hessian: None,
+        probit_frailty_scale: s_f,
+    };
     let marg_jac = marg_spec
         .effective_jacobian_at("test", &marg_state)
         .expect("marginal block effective_jacobian_at must succeed");
@@ -1061,7 +1091,6 @@ fn time_and_marginal_blocks_at_zero_beta_have_trivial_scaling() {
         }
     }
 }
-
 
 /// The production `LogslopeBlockJacobian` (from survival_marginal_slope) enforces the
 /// hard contract: when `family_scalars` is `None` but beta is non-zero (causing g_i != 0
@@ -1088,7 +1117,13 @@ fn production_logslope_block_requires_scalars_at_nonzero_beta() {
 
     // Confirm at least one g_i is nonzero (sanity check for the test itself).
     let any_nonzero_g = (0..N).any(|i| {
-        data.phi.row(i).iter().zip(beta.iter()).map(|(&x, &b)| x * b).sum::<f64>() != 0.0
+        data.phi
+            .row(i)
+            .iter()
+            .zip(beta.iter())
+            .map(|(&x, &b)| x * b)
+            .sum::<f64>()
+            != 0.0
     });
     assert!(
         any_nonzero_g,
@@ -1121,7 +1156,13 @@ fn production_logslope_block_requires_scalars_at_nonzero_beta() {
         let scalars_arc: Arc<dyn Any + Send + Sync> = {
             let mut g_i = vec![0.0_f64; N];
             for i in 0..N {
-                g_i[i] = data.phi.row(i).iter().zip(beta.iter()).map(|(&x, &b)| x * b).sum();
+                g_i[i] = data
+                    .phi
+                    .row(i)
+                    .iter()
+                    .zip(beta.iter())
+                    .map(|(&x, &b)| x * b)
+                    .sum();
             }
             // q0/q1/qd1: use the baseline values from make_synthetic_data.
             // In a real fit these would come from the time/marginal blocks at current beta.
@@ -1130,7 +1171,13 @@ fn production_logslope_block_requires_scalars_at_nonzero_beta() {
             let qd1_i = data.qd1_base.to_vec();
             let z_i = data.z.to_vec();
             Arc::new(SurvivalMarginalSlopeFamilyScalars::new(
-                q0_i, q1_i, qd1_i, g_i, s_f, z_i, vec![0.0_f64; N],
+                q0_i,
+                q1_i,
+                qd1_i,
+                g_i,
+                s_f,
+                z_i,
+                vec![0.0_f64; N],
             ))
         };
 
@@ -1158,7 +1205,17 @@ fn production_logslope_block_requires_scalars_at_nonzero_beta() {
         let qd1_ref = &data.qd1_base;
         let z_ref = &data.z;
         let fd = finite_diff_jacobian(
-            |b| compute_eta_stack(phi_ref, b.as_slice().unwrap(), q0_ref, q1_ref, qd1_ref, z_ref, s_f),
+            |b| {
+                compute_eta_stack(
+                    phi_ref,
+                    b.as_slice().unwrap(),
+                    q0_ref,
+                    q1_ref,
+                    qd1_ref,
+                    z_ref,
+                    s_f,
+                )
+            },
             &beta_arr,
             1e-6,
         );
@@ -1178,9 +1235,9 @@ fn production_logslope_block_requires_scalars_at_nonzero_beta() {
             channel_hessian: None,
             probit_frailty_scale: s_f,
         };
-        let jac = cb
-            .effective_jacobian_at(&state)
-            .expect("production LogslopeBlockJacobian at beta=0 with family_scalars=None must return Ok");
+        let jac = cb.effective_jacobian_at(&state).expect(
+            "production LogslopeBlockJacobian at beta=0 with family_scalars=None must return Ok",
+        );
         // At g=0: coeff_eta0 = s_f*z_i, coeff_eta1 = s_f*z_i, coeff_ad1 = 0.
         for i in 0..N {
             let expected_scale = s_f * data.z[i];

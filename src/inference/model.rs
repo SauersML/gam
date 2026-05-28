@@ -20,8 +20,8 @@ use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec};
 use crate::smooth::{AdaptiveRegularizationDiagnostics, TermCollectionSpec};
 use crate::span::span_index_for_breakpoints;
 use crate::types::{
-    InverseLink, LatentCLogLogState, LikelihoodSpec, MixtureLinkState, SasLinkSpec,
-    SasLinkState, StandardLink,
+    InverseLink, LatentCLogLogState, LikelihoodSpec, MixtureLinkState, SasLinkSpec, SasLinkState,
+    StandardLink,
 };
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};

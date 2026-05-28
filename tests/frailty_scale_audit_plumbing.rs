@@ -30,7 +30,9 @@
 //! evaluation time, ensuring outer-loop σ updates (which rebuild the family
 //! with a new fixed σ) are reflected without requiring spec reconstruction.
 
-use gam::custom_family::{BlockEffectiveJacobian, FamilyLinearizationState, ParameterBlockSpec, RowScaledJacobian};
+use gam::custom_family::{
+    BlockEffectiveJacobian, FamilyLinearizationState, ParameterBlockSpec, RowScaledJacobian,
+};
 use gam::families::survival_marginal_slope::LogslopeBlockJacobian;
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
 use gam::solver::identifiability_audit::audit_identifiability;
@@ -46,7 +48,9 @@ fn make_design(seed: u64) -> Array2<f64> {
     let mut state = seed;
     for i in 0..N {
         for j in 0..P {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             out[[i, j]] = ((state >> 33) as f64) / (u32::MAX as f64) - 0.5;
         }
     }
@@ -58,7 +62,9 @@ fn make_z(seed: u64) -> Vec<f64> {
     let mut state = seed ^ 0xdeadbeef;
     (0..N)
         .map(|_| {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             0.3 + ((state >> 33) as f64) / (u32::MAX as f64) * 1.4
         })
         .collect()

@@ -10,48 +10,65 @@
 //! - The two GPU dispatch blocks (Stage 3.3) that call into
 //!   `crate::solver::gpu::pirls_dispatch_wire`.
 
-use super::{
-    GamWorkingModel, PirlsWorkspace, SparsePirlsDecision,
-    WorkingModelPirlsOptions, WorkingReparamTransform,
-    attach_penalty_shift, should_use_sparse_native_pirls, solve_penalized_least_squares_implicit,
-    runworking_model_pirls, standard_inverse_link_jet,
-    // edf helpers
-    calculate_edf_with_penalty, calculate_edfwithworkspace_with_penalty,
-    // state re-exports
-    AdaptiveKktTolerance, ExportedLaplaceCurvature, FirthDiagnostics, HessianCurvatureKind,
-    PirlsCoordinateFrame, PirlsLinearSolvePath, PirlsResult, PirlsStatus,
-    WorkingModelIterationInfo, WorkingModelPirlsResult, WorkingState,
-    LinearInequalityConstraints,
-    // penalty types
-    KroneckerQsTransform, PirlsPenalty,
-    // misc helpers
-    array1_l2_norm, inf_norm, compute_constraint_kkt_diagnostics,
-    // compute functions
-    calculate_deviance, calculate_loglikelihood_omitting_constants,
-    computeworkingweight_derivatives_from_eta,
-};
 use super::gpu_dispatch::{try_gaussian_pls_gpu, try_pirls_loop_gpu};
+use super::{
+    // state re-exports
+    AdaptiveKktTolerance,
+    ExportedLaplaceCurvature,
+    FirthDiagnostics,
+    GamWorkingModel,
+    HessianCurvatureKind,
+    // penalty types
+    KroneckerQsTransform,
+    LinearInequalityConstraints,
+    PirlsCoordinateFrame,
+    PirlsLinearSolvePath,
+    PirlsPenalty,
+    PirlsResult,
+    PirlsStatus,
+    PirlsWorkspace,
+    SparsePirlsDecision,
+    WorkingModelIterationInfo,
+    WorkingModelPirlsOptions,
+    WorkingModelPirlsResult,
+    WorkingReparamTransform,
+    WorkingState,
+    // misc helpers
+    array1_l2_norm,
+    attach_penalty_shift,
+    // compute functions
+    calculate_deviance,
+    // edf helpers
+    calculate_edf_with_penalty,
+    calculate_edfwithworkspace_with_penalty,
+    calculate_loglikelihood_omitting_constants,
+    compute_constraint_kkt_diagnostics,
+    computeworkingweight_derivatives_from_eta,
+    inf_norm,
+    runworking_model_pirls,
+    should_use_sparse_native_pirls,
+    solve_penalized_least_squares_implicit,
+    standard_inverse_link_jet,
+};
 use super::{
     ArrowSchurInnerConfig, GamModelFinalState, effective_kkt_tolerance,
     project_coefficients_to_lower_bounds,
 };
-use crate::faer_ndarray::fast_ab;
-use crate::probability::standard_normal_quantile;
-use crate::construction::{
-    KroneckerReparamResult, ReparamResult,
-};
+use crate::construction::{KroneckerReparamResult, ReparamResult};
 use crate::estimate::EstimationError;
+use crate::faer_ndarray::fast_ab;
 use crate::matrix::{DesignMatrix, LinearOperator, ReparamOperator, SymmetricMatrix};
+use crate::probability::standard_normal_quantile;
 use crate::solver::active_set;
 use crate::types::{
     Coefficients, GlmLikelihoodSpec, InverseLink, LinearPredictor, LinkFunction,
-    LogSmoothingParamsView, MixtureLinkState, RidgePassport, RidgePolicy,
-    SasLinkState, StandardLink,
+    LogSmoothingParamsView, MixtureLinkState, RidgePassport, RidgePolicy, SasLinkState,
+    StandardLink,
 };
+use faer::sparse::{SparseColMat, Triplet};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use std::borrow::Cow;
 use std::sync::Arc;
-use faer::sparse::{SparseColMat, Triplet};
 
 pub(super) fn default_beta_guess_external(
     p: usize,
@@ -258,10 +275,6 @@ pub(super) fn solve_intercept_for_prevalence(
     }
     Some(0.5 * (lo + hi))
 }
-
-
-
-
 
 pub(super) fn assemble_pirls_result(
     working_summary: &WorkingModelPirlsResult,
@@ -564,7 +577,6 @@ pub(super) fn canonical_prior_mean_aggregate(
     }
     mean
 }
-
 
 pub struct PirlsProblem<'a, X> {
     pub x: X,

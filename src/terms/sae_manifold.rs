@@ -30,8 +30,8 @@ use ndarray::{Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayView3
 use std::sync::Arc;
 
 use crate::solver::arrow_schur::{
-    ArrowRowBlock, ArrowSchurError, ArrowSchurSystem, BetaPenaltyOp,
-    CompositePenaltyOp, DensePenaltyOp, KroneckerPenaltyOp,
+    ArrowRowBlock, ArrowSchurError, ArrowSchurSystem, BetaPenaltyOp, CompositePenaltyOp,
+    DensePenaltyOp, KroneckerPenaltyOp,
 };
 use crate::terms::analytic_penalties::{
     ARDPenalty, AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry,
@@ -2556,100 +2556,111 @@ impl SaeManifoldTerm {
                         for atom_idx in 0..self.k_atoms() {
                             let off = offsets[atom_idx];
                             let coord = &self.assignment.coords[atom_idx];
-                        // Isometry requires per-step cache refresh from the
-                        // atom's second jet before grad_target / hvp are live.
-                        // The registry-held IsometryPenalty was constructed
-                        // with p_out equal to the latent dim (the "t" block's
-                        // `d` in the JSON latent spec) rather than the true
-                        // decoder output dimension; we build a corrected copy
-                        // here with the right p_out and populated caches.
-                        if let AnalyticPenaltyKind::Isometry(iso) = penalty {
-                            let atom = &self.atoms[atom_idx];
-                            // The registry penalty was built with p_out equal
-                            // to the latent dim (the "t" JSON block's `d`),
-                            // but IsometryPenalty.p_out must match the atom's
-                            // decoder output dim. Clone and fix p_out before
-                            // calling refresh_isometry_caches_from_atom.
-                            let p = atom.decoder_coefficients.ncols();
-                            let mut corrected: IsometryPenalty = (**iso).clone();
-                            corrected.p_out = p;
-                            let coords_mat = coord.as_matrix();
-                            let second_jet_installed = refresh_isometry_caches_from_atom(
-                                &corrected,
-                                atom,
-                                coords_mat.view(),
-                            )
-                            .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
-                            if !second_jet_installed {
-                                // refresh_isometry_caches_from_atom returns
-                                // false when the atom's basis_second_jet slot
-                                // is None (atom was registered via
-                                // with_basis_evaluator, not with_basis_second_jet).
-                                // Fall back to second_jet_dyn, which evaluators
-                                // like AffineCoordinateEvaluator override even
-                                // when the SaeBasisSecondJet supertrait Arc is
-                                // not in the slot.
-                                match atom
-                                    .basis_evaluator
-                                    .as_ref()
-                                    .and_then(|e| e.second_jet_dyn(coords_mat.view()))
-                                {
-                                    Some(Ok(hess)) => {
-                                        let n_obs = coords_mat.nrows();
-                                        let d = atom.latent_dim;
-                                        let m = atom.basis_size();
-                                        if hess.dim() != (n_obs, m, d, d) {
-                                            return Err(ArrowSchurError::SchurFactorFailed {
-                                                reason: format!(
-                                                    "SAE Isometry atom '{}': second_jet_dyn \
+                            // Isometry requires per-step cache refresh from the
+                            // atom's second jet before grad_target / hvp are live.
+                            // The registry-held IsometryPenalty was constructed
+                            // with p_out equal to the latent dim (the "t" block's
+                            // `d` in the JSON latent spec) rather than the true
+                            // decoder output dimension; we build a corrected copy
+                            // here with the right p_out and populated caches.
+                            if let AnalyticPenaltyKind::Isometry(iso) = penalty {
+                                let atom = &self.atoms[atom_idx];
+                                // The registry penalty was built with p_out equal
+                                // to the latent dim (the "t" JSON block's `d`),
+                                // but IsometryPenalty.p_out must match the atom's
+                                // decoder output dim. Clone and fix p_out before
+                                // calling refresh_isometry_caches_from_atom.
+                                let p = atom.decoder_coefficients.ncols();
+                                let mut corrected: IsometryPenalty = (**iso).clone();
+                                corrected.p_out = p;
+                                let coords_mat = coord.as_matrix();
+                                let second_jet_installed = refresh_isometry_caches_from_atom(
+                                    &corrected,
+                                    atom,
+                                    coords_mat.view(),
+                                )
+                                .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
+                                if !second_jet_installed {
+                                    // refresh_isometry_caches_from_atom returns
+                                    // false when the atom's basis_second_jet slot
+                                    // is None (atom was registered via
+                                    // with_basis_evaluator, not with_basis_second_jet).
+                                    // Fall back to second_jet_dyn, which evaluators
+                                    // like AffineCoordinateEvaluator override even
+                                    // when the SaeBasisSecondJet supertrait Arc is
+                                    // not in the slot.
+                                    match atom
+                                        .basis_evaluator
+                                        .as_ref()
+                                        .and_then(|e| e.second_jet_dyn(coords_mat.view()))
+                                    {
+                                        Some(Ok(hess)) => {
+                                            let n_obs = coords_mat.nrows();
+                                            let d = atom.latent_dim;
+                                            let m = atom.basis_size();
+                                            if hess.dim() != (n_obs, m, d, d) {
+                                                return Err(ArrowSchurError::SchurFactorFailed {
+                                                    reason: format!(
+                                                        "SAE Isometry atom '{}': second_jet_dyn \
                                                      returned shape {:?}, expected \
                                                      ({n_obs}, {m}, {d}, {d})",
-                                                    atom.name,
-                                                    hess.dim()
-                                                ),
-                                            });
-                                        }
-                                        let b = &atom.decoder_coefficients;
-                                        let mut jac2 = Array2::<f64>::zeros((n_obs, p * d * d));
-                                        for n in 0..n_obs {
-                                            for i in 0..p {
-                                                for a in 0..d {
-                                                    for c in 0..d {
-                                                        let mut acc = 0.0;
-                                                        for mm in 0..m {
-                                                            acc += hess[[n, mm, a, c]] * b[[mm, i]];
+                                                        atom.name,
+                                                        hess.dim()
+                                                    ),
+                                                });
+                                            }
+                                            let b = &atom.decoder_coefficients;
+                                            let mut jac2 = Array2::<f64>::zeros((n_obs, p * d * d));
+                                            for n in 0..n_obs {
+                                                for i in 0..p {
+                                                    for a in 0..d {
+                                                        for c in 0..d {
+                                                            let mut acc = 0.0;
+                                                            for mm in 0..m {
+                                                                acc += hess[[n, mm, a, c]]
+                                                                    * b[[mm, i]];
+                                                            }
+                                                            jac2[[n, (i * d + a) * d + c]] = acc;
                                                         }
-                                                        jac2[[n, (i * d + a) * d + c]] = acc;
                                                     }
                                                 }
                                             }
+                                            corrected
+                                                .set_jacobian_second_cache(Some(Arc::new(jac2)));
                                         }
-                                        corrected.set_jacobian_second_cache(Some(Arc::new(jac2)));
-                                    }
-                                    Some(Err(reason)) => {
-                                        return Err(ArrowSchurError::SchurFactorFailed { reason });
-                                    }
-                                    None => {
-                                        return Err(ArrowSchurError::SchurFactorFailed {
-                                            reason: format!(
-                                                "IsometryPenalty requested for SAE atom \
+                                        Some(Err(reason)) => {
+                                            return Err(ArrowSchurError::SchurFactorFailed {
+                                                reason,
+                                            });
+                                        }
+                                        None => {
+                                            return Err(ArrowSchurError::SchurFactorFailed {
+                                                reason: format!(
+                                                    "IsometryPenalty requested for SAE atom \
                                                  '{}' (basis kind {:?}) but this evaluator \
                                                  does not expose an analytic second jet; \
                                                  use AffineCoordinateEvaluator, \
                                                  SphereChartEvaluator, \
                                                  PeriodicHarmonicEvaluator, or \
                                                  TorusHarmonicEvaluator for SAE-Isometry",
-                                                atom.name, atom.basis_kind
-                                            ),
-                                        });
+                                                    atom.name, atom.basis_kind
+                                                ),
+                                            });
+                                        }
                                     }
                                 }
+                                let corrected_kind =
+                                    AnalyticPenaltyKind::Isometry(Arc::new(corrected));
+                                self.add_sae_coord_penalty(
+                                    sys,
+                                    off,
+                                    coord,
+                                    &corrected_kind,
+                                    rho_local,
+                                );
+                            } else {
+                                self.add_sae_coord_penalty(sys, off, coord, penalty, rho_local);
                             }
-                            let corrected_kind = AnalyticPenaltyKind::Isometry(Arc::new(corrected));
-                            self.add_sae_coord_penalty(sys, off, coord, &corrected_kind, rho_local);
-                        } else {
-                            self.add_sae_coord_penalty(sys, off, coord, penalty, rho_local);
-                        }
                         }
                     }
                 }
@@ -2949,13 +2960,14 @@ impl SaeManifoldTerm {
         // which atoms are near-aliased and consider merging them.
         {
             let specs = self.decoder_parameter_block_specs();
-            let audit =
-                crate::solver::identifiability_canonical::canonicalize_for_identifiability(
-                    &specs,
+            let audit = crate::solver::identifiability_canonical::canonicalize_for_identifiability(
+                &specs,
+            )
+            .map_err(|e| {
+                format!(
+                    "SaeManifoldTerm::run_joint_fit_arrow_schur: pre-fit identifiability audit: {e}"
                 )
-                .map_err(|e| {
-                    format!("SaeManifoldTerm::run_joint_fit_arrow_schur: pre-fit identifiability audit: {e}")
-                })?;
+            })?;
             if !audit.audit.dropped_columns.is_empty() {
                 log::info!(
                     "[SAE-AUDIT] run_joint_fit_arrow_schur: {} dropped decoder column(s); summary: {}",
@@ -2965,7 +2977,9 @@ impl SaeManifoldTerm {
                 for dc in &audit.audit.dropped_columns {
                     log::info!(
                         "[SAE-AUDIT]   dropped block='{}' col={}: {}",
-                        dc.block, dc.column, dc.reason,
+                        dc.block,
+                        dc.column,
+                        dc.reason,
                     );
                 }
             }
