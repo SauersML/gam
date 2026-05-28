@@ -589,30 +589,34 @@ fn log_det_from_chol_lower(l: &Array2<f64>) -> f64 {
 /// §2.2 / §7.
 pub fn ift_du_dbeta(cache: &ArrowFactorCache) -> Array2<f64> {
     let n = cache.undamped_factor_count();
-    let d = cache.d;
+    let total_len = cache.delta_t_len();
     let k = cache.k;
     if !cache.htbeta_available() {
-        return Array2::<f64>::from_elem((n * d, k), f64::NAN);
+        return Array2::<f64>::from_elem((total_len, k), f64::NAN);
     }
-    let mut out = Array2::<f64>::zeros((n * d, k));
+    let mut out = Array2::<f64>::zeros((total_len, k));
     let mut beta_basis = Array1::<f64>::zeros(k);
-    let mut rhs = Array1::<f64>::zeros(d);
+    // Allocate scratch at max_d; per-row slice is ..di.
+    let mut rhs = Array1::<f64>::zeros(cache.d);
     for i in 0..n {
+        let di = cache.row_dims[i];
+        let row_base = cache.row_offsets[i];
         let factor = cache.undamped_factor(i);
         // Solve H_uu_i Y = H_uβ_i column by column.
         for col in 0..k {
             beta_basis.fill(0.0);
             beta_basis[col] = 1.0;
+            let mut rhs_i = rhs.slice_mut(ndarray::s![..di]).to_owned();
             // The Tier-2 IFT assembler is built only when the family's
             // capability surface promises cached `H_tβ` row products.
-            if !cache.apply_htbeta_row(i, beta_basis.view(), &mut rhs) {
+            if !cache.apply_htbeta_row(i, beta_basis.view(), &mut rhs_i) {
                 // SAFETY: reaching `false` means a family declared the cache
                 // available but failed to populate it — contract violation.
-                return Array2::<f64>::from_elem((n * d, k), f64::NAN);
+                return Array2::<f64>::from_elem((total_len, k), f64::NAN);
             }
-            let y = chol_lower_solve_vector(factor, &rhs);
-            for c in 0..d {
-                out[[i * d + c, col]] = -y[c];
+            let y = chol_lower_solve_vector(factor, &rhs_i);
+            for c in 0..di {
+                out[[row_base + c, col]] = -y[c];
             }
         }
     }

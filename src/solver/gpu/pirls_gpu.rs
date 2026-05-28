@@ -801,24 +801,20 @@ extern "C" __global__ void chol_logdet_col_major(
         })
     }
 
-    /// In-place Newton step using the resident-X architecture (#269).
+    /// In-place Newton step: rhs = Xᵀ·score − S·β + linear_shift (#257, #260).
     ///
-    /// A=X_origᵀ W X_orig; H=QsᵀAQs+S+λI; rhs=Qsᵀ(X_origᵀ score)+linear_shift.
-    /// POTRF+POTRS in-place, logdet, negate → direction in ws.rhs_dev.
+    /// Solves H·δ = rhs (H = XᵀWX + S + step_lm_lambda·I). On return
+    /// `ws.rhs_dev` holds the Newton descent direction δ (not negated).
+    /// The loop copies `ws.rhs_dev` to `direction_dev` via `memcpy_dtod`.
     ///
-    /// On return:
-    ///
-    /// - `ws.h_dev` holds the Cholesky factor (overwritten by POTRF).
-    ///   Do not read it as a Hessian until rebuilt via `rebuild_h_final`.
-    /// - `ws.rhs_dev` holds `−H⁻¹·g` (the Newton direction), negated on
-    ///   device. The loop copies it to `direction_dev` via `memcpy_dtod`.
+    /// On return `ws.h_dev` holds the Cholesky factor; rebuild with
+    /// `rebuild_h_final` to get the exported penalised Hessian.
     ///
     /// Returns `logdet = log|H|` computed device-side.
     pub(super) fn solve_step_on_stream_device_inplace(
         shared: &PirlsGpuSharedData,
         ws: &mut SigmaPirlsGpuWorkspace,
         input: PirlsStepStreamDeviceInput<'_, '_>,
-        negate_func: &cudarc::driver::CudaFunction,
     ) -> Result<f64, String> {
         let n = shared.n;
         let p = shared.p;
@@ -847,8 +843,14 @@ extern "C" __global__ void chol_logdet_col_major(
             ));
         }
 
-        // Compute XᵀWX and Xᵀ·score.  Fused path (p < threshold): no n*p WX.
-        // Fallback (p >= threshold): ddgmm + dgemm + gemv via wx_dev_ib.
+        if input.linear_shift.len() != p {
+            return Err(format!(
+                "linear_shift length {} does not match p={p}",
+                input.linear_shift.len()
+            ));
+        }
+        // Step 1: A = X_origᵀ diag(w) X_orig and score_p = X_origᵀ grad_eta.
+        // Fused path (p < threshold) or ddgmm+dgemm+gemv (large p).
         let n_i = to_i32(n)?;
         let p_i = to_i32(p)?;
         if let Some(ref mut wx_dev_ib) = ws.wx_dev {
@@ -2049,25 +2051,66 @@ extern "C" __global__ void status_or(
                 .stream
                 .clone_dtoh(&loop_ws.alpha_ladder.status_dev)
                 .map_err(|e| format!("ladder dtoh stat it={it}: {e}"))?;
+            // Download the direction (p << n; one DtoH per iteration to
+            // compute the host-side penalty term and maintain beta_host).
+            let direction_host: Vec<f64> = ws
+                .stream
+                .clone_dtoh(&loop_ws.direction_dev)
+                .map_err(|e| format!("dtoh direction it={it}: {e}"))?;
+
+            // Penalized objective for each candidate step:
+            //   obj_pen[k] = deviance(eta + alpha_k * xd)
+            //               + (beta + alpha_k * d)^T S (beta + alpha_k * d)
+            //               - 2 (beta + alpha_k * d) . linear_shift
+            //               + constant_shift
+            // The quadratic in alpha expands as:
+            //   penalty(beta) + alpha * [2 d^T (S beta - linear_shift)]
+            //                  + alpha^2 * d^T S d
+            let sd = penalty_hessian.dot(ndarray::ArrayView1::from(&direction_host));
+            let s_beta = penalty_hessian.dot(&beta_host);
+            let dtsd = ndarray::ArrayView1::from(&direction_host).dot(&sd);
+            let linear_coeff = 2.0
+                * ndarray::ArrayView1::from(&direction_host)
+                    .dot(&(&s_beta - linear_shift));
+            let penalty_beta = beta_host.dot(&s_beta)
+                - 2.0 * beta_host.dot(&linear_shift)
+                + constant_shift;
+
             const FORBIDDEN_LINESEARCH: u32 =
                 crate::gpu::pirls_row::status_flags::INVALID_RESPONSE
                 | crate::gpu::pirls_row::status_flags::ZERO_PRIOR_WEIGHT;
             let mut alpha = 0.0_f64;
             let mut accepted_dev = prev_deviance;
+            let mut accepted_objective = prev_objective;
             let mut halving_count: usize = 0;
-            for (k, (&obj, &st)) in obj_host.iter().zip(stat_host.iter()).enumerate() {
-                if obj.is_finite() && obj < prev_deviance && (st & FORBIDDEN_LINESEARCH) == 0 {
-                    alpha = crate::gpu::pirls_row::ALPHA_LADDER[k];
-                    accepted_dev = obj;
+            for (k, (&dev_k, &st)) in obj_host.iter().zip(stat_host.iter()).enumerate() {
+                let a = crate::gpu::pirls_row::ALPHA_LADDER[k];
+                let pen_k = penalty_beta + a * linear_coeff + a * a * dtsd;
+                let obj_k = dev_k + pen_k;
+                if obj_k.is_finite()
+                    && obj_k < prev_objective
+                    && (st & FORBIDDEN_LINESEARCH) == 0
+                {
+                    alpha = a;
+                    accepted_dev = dev_k;
+                    accepted_objective = obj_k;
                     halving_count = k;
                     break;
                 }
             }
             if alpha == 0.0 {
-                // No descent -- take alpha=1 and let the outer trust-region adapt.
-                alpha = 1.0;
+                // No penalized descent found -- alpha=1 fallback.
+                let a1 = crate::gpu::pirls_row::ALPHA_LADDER[0];
+                alpha = a1;
                 accepted_dev = obj_host[0];
+                accepted_objective = accepted_dev
+                    + penalty_beta
+                    + a1 * linear_coeff
+                    + a1 * a1 * dtsd;
                 halving_count = 0;
+                step_search_exhausted = true;
+            } else {
+                step_search_exhausted = false;
             }
             // Commit accepted step: beta and eta updated in-place.
             axpy(
@@ -2086,6 +2129,10 @@ extern "C" __global__ void status_or(
                 &mut loop_ws.eta_dev,
                 n,
             )?;
+            // Maintain host-side beta mirror: beta_host += alpha * direction.
+            for (b, &d) in beta_host.iter_mut().zip(direction_host.iter()) {
+                *b += alpha * d;
+            }
             // Refresh the 4-output solve-row buffers for the next Newton iter.
             crate::gpu::pirls_row::launch_solve_row_on_stream(
                 backend,
@@ -2102,16 +2149,20 @@ extern "C" __global__ void status_or(
             .map_err(|e| format!("solve-row accepted it={it}: {e}"))?;
 
             let step_norm = alpha.abs() * dir_linf;
-            let dev_delta = (prev_deviance - accepted_dev).abs();
+            let dev_delta = (prev_objective - accepted_objective).abs();
             last_dev_delta = dev_delta;
             last_halving = halving_count;
             last_step_size = alpha;
             if accepted_dev < min_dev {
                 min_dev = accepted_dev;
             }
+            if accepted_objective < min_objective {
+                min_objective = accepted_objective;
+            }
             prev_deviance = accepted_dev;
+            prev_objective = accepted_objective;
 
-            if dir_linf <= tol && step_norm <= tol && dev_delta <= tol * (1.0 + prev_deviance.abs())
+            if dir_linf <= tol && step_norm <= tol && dev_delta <= tol * (1.0 + prev_objective.abs())
             {
                 converged = true;
                 // Final-row mode: write all 9 output fields once at convergence.
@@ -2152,6 +2203,7 @@ extern "C" __global__ void status_or(
                         last_step_halving: last_halving,
                         last_step_size,
                         min_deviance: min_dev,
+                        step_search_exhausted,
                     },
                     &status_or_func,
                 );
@@ -2196,6 +2248,7 @@ extern "C" __global__ void status_or(
                 last_step_halving: last_halving,
                 last_step_size,
                 min_deviance: min_dev,
+                step_search_exhausted,
             },
             &status_or_func,
         )
