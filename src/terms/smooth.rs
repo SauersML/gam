@@ -9438,6 +9438,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         initial_beta: Some(baseline.fit.beta.clone()),
         gauge_priority: 100,
         jacobian_callback: None,
+        audit_design: None,
     };
     let screening_cap = Arc::new(AtomicUsize::new(0));
     let outer_opts = BlockwiseFitOptions {
@@ -9838,6 +9839,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         initial_beta: Some(baseline.fit.beta.clone()),
         gauge_priority: 100,
         jacobian_callback: None,
+        audit_design: None,
     };
     let final_fit = fit_custom_family(
         &final_family,
@@ -12332,6 +12334,7 @@ fn fit_bounded_term_collection_with_design(
         initial_beta: Some(initial_beta),
         gauge_priority: 100,
         jacobian_callback: None,
+        audit_design: None,
     };
     let fit = fit_custom_family(
         &family_adapter,
@@ -26081,6 +26084,8 @@ mod tests {
             initial_beta: Some(array![0.0, 0.0]),
             gauge_priority: 100,
             jacobian_callback: None,
+            audit_design: None,
+        audit_design: None,
         };
         let deriv = CustomFamilyBlockPsiDerivative {
             penalty_index: None,
@@ -26586,6 +26591,8 @@ mod tests {
             initial_beta: Some(baseline.fit.beta.clone()),
             gauge_priority: 100,
             jacobian_callback: None,
+            audit_design: None,
+        audit_design: None,
         };
         let outer_opts = BlockwiseFitOptions {
             inner_max_cycles: 30,
@@ -26794,6 +26801,8 @@ mod tests {
             initial_beta: Some(baseline.fit.beta.clone()),
             gauge_priority: 100,
             jacobian_callback: None,
+            audit_design: None,
+        audit_design: None,
         };
         let outer_opts = BlockwiseFitOptions {
             inner_max_cycles: 20,
