@@ -21894,7 +21894,10 @@ fn workflow_error_to_pyerr(py: Python<'_>, err: WorkflowError) -> PyErr {
             // attribute access), we still raise the typed class with the
             // canonical message — the typed branch in `explain_error`
             // remains correct, only the per-instance enrichment is lost.
-            let _attach = (|| -> PyResult<()> {
+            // Errors are surfaced as Python unraisable warnings rather
+            // than escalating, since the typed exception class itself is
+            // the primary contract.
+            let attach_result: PyResult<()> = (|| {
                 bound.setattr("column", name.as_str())?;
                 match role.as_deref() {
                     Some(r) => bound.setattr("role", r)?,
@@ -21905,9 +21908,7 @@ fn workflow_error_to_pyerr(py: Python<'_>, err: WorkflowError) -> PyErr {
                 bound.setattr("tsv_hint", tsv_hint)?;
                 Ok(())
             })();
-            if let Err(attach_err) = _attach {
-                // Swallow as a Python warning rather than escalate — the
-                // typed exception class itself is the primary contract.
+            if let Err(attach_err) = attach_result {
                 attach_err.write_unraisable(py, Some(&bound));
             }
             exc
