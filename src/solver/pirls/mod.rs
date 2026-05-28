@@ -1195,54 +1195,7 @@ fn effective_kkt_tolerance(options: &WorkingModelPirlsOptions) -> f64 {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct WorkingModelIterationInfo {
-    pub iteration: usize,
-    pub deviance: f64,
-    pub gradient_norm: f64,
-    pub step_size: f64,
-    pub step_halving: usize,
-}
 
-#[derive(Clone)]
-pub struct WorkingModelPirlsResult {
-    pub beta: Coefficients,
-    pub state: WorkingState,
-    pub status: PirlsStatus,
-    pub iterations: usize,
-    pub lastgradient_norm: f64,
-    pub last_deviance_change: f64,
-    pub last_step_size: f64,
-    pub last_step_halving: usize,
-    pub max_abs_eta: f64,
-    pub constraint_kkt: Option<ConstraintKktDiagnostics>,
-    /// Levenberg-Marquardt damping coefficient at the last accepted
-    /// inner iter. Used by the REML runtime to seed the next PIRLS call
-    /// at the same outer fit, avoiding 4-6 iters of damping rediscovery
-    /// when the geometry calls for `λ_LM > 1e-6`.
-    pub final_lm_lambda: f64,
-    /// Gain ratio (`actual_reduction / predicted_reduction`) at the
-    /// last accepted inner iter. `None` when no step was accepted
-    /// (rejection-exhausted, MaxIterationsReached without acceptance).
-    /// Programmatic counterpart to the per-iter `[PIRLS lm-trajectory]`
-    /// log line's `accept_rho` field — the log is grep-only, this
-    /// field is queryable by the outer schedule and convergence guard.
-    /// Values near 1.0 indicate the quadratic model is faithful;
-    /// values much smaller indicate the LM model is over-stating
-    /// predicted reduction and the inner Newton may benefit from
-    /// shorter steps.
-    pub final_accept_rho: Option<f64>,
-    /// Minimum penalized deviance (`state.deviance + state.penalty_term`)
-    /// observed across all iterations whose state was computed during the
-    /// inner P-IRLS loop. Penalized deviance is monotonically decreasing
-    /// along any descent path the inner solver takes, so this minimum is a
-    /// principled seed-screening proxy that remains meaningful even when the
-    /// solver hit its iteration cap before reaching the mode. `f64::INFINITY`
-    /// when no state was ever computed (paths that synthesize a result
-    /// without iterating, e.g. zero-iteration warm-only paths).
-    pub min_penalized_deviance: f64,
-    pub exported_laplace_curvature: ExportedLaplaceCurvature,
-}
 
 // Fixed stabilization ridge for PIRLS/PLS. `penalty_term` carries this as
 // ridge * ||beta||^2 (equivalently 0.5 * ridge * ||beta||^2 in the

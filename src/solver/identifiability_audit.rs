@@ -132,6 +132,16 @@ pub struct AliasedPair {
     /// indicate partial overlap that the column-pivoted QR will still
     /// preserve (only fully redundant directions get pivoted out).
     pub overlap: f64,
+    /// Bias shift applied to the null-distribution mean for this pair,
+    /// equal to `bias_shift_for_pair(z_a, z_b, s2_a, s2_b)`.
+    /// Non-zero when exactly one block carries an `eta_row_scaling`
+    /// (or the two scalings differ) and the row-scaling vector is skewed.
+    /// Stored so that the halt-threshold check can apply the same
+    /// directional correction as the report-threshold check.
+    /// Zero for all pairs arising from the channel-aware audit path,
+    /// and for pairs from the flat path when both blocks have symmetric
+    /// (or absent) row scaling.
+    pub bias_shift: f64,
 }
 
 #[derive(Debug, Clone)]

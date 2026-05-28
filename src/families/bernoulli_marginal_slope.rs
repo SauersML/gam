@@ -19815,7 +19815,6 @@ fn build_marginal_blockspec_bms(
     logslope_offset: &Array1<f64>,
     logslope_baseline: f64,
     p_marginal: usize,
-    probit_scale: f64,
 ) -> Result<ParameterBlockSpec, String> {
     let offset_m = offset + baseline;
     let offset_s = logslope_offset + logslope_baseline;
@@ -19831,7 +19830,6 @@ fn build_marginal_blockspec_bms(
         offset_m: offset_m.clone(),
         offset_s,
         p_marginal,
-        probit_scale,
     });
     Ok(ParameterBlockSpec {
         name: "marginal_surface".to_string(),
@@ -19860,7 +19858,6 @@ fn build_logslope_blockspec_bms(
     marginal_baseline: f64,
     z: Arc<[f64]>,
     p_marginal: usize,
-    probit_scale: f64,
 ) -> Result<ParameterBlockSpec, String> {
     let offset_s = offset + baseline;
     let offset_m = marginal_offset + marginal_baseline;
@@ -19877,7 +19874,6 @@ fn build_logslope_blockspec_bms(
         offset_s: offset_s.clone(),
         z,
         p_marginal,
-        probit_scale,
     });
     Ok(ParameterBlockSpec {
         name: "logslope_surface".to_string(),
@@ -20378,7 +20374,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 &spec.logslope_offset,
                 baseline.1,
                 p_m,
-                probit_scale,
             )?,
             build_logslope_blockspec_bms(
                 logslope_design,
@@ -20391,7 +20386,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 baseline.0,
                 Arc::clone(&z),
                 p_m,
-                probit_scale,
             )?,
         ];
         push_deviation_aux_blockspecs(
