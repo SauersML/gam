@@ -189,7 +189,29 @@ from .recipes import (
     partial_supervision,
     sae_supervised,
 )
-from ._exceptions import FormulaError, GamError, PredictionError, SchemaMismatchError
+from ._exceptions import (
+    BasisError,
+    CalibratorError,
+    EigendecompositionError,
+    FormulaError,
+    GamError,
+    GradientUnavailableError,
+    HessianNotPositiveDefiniteError,
+    IllConditionedError,
+    InvalidInputError,
+    InvalidSpecificationError,
+    LayoutError,
+    LinearSystemSolveError,
+    ModelOverparameterizedError,
+    MonotoneRootError,
+    ParameterConstraintError,
+    PenaltySpectrumError,
+    PerfectSeparationError,
+    PirlsConvergenceError,
+    PredictionError,
+    RemlConvergenceError,
+    SchemaMismatchError,
+)
 from ._model import (
     CompetingRisksCIF,
     CompetingRisksPrediction,
