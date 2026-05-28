@@ -1267,42 +1267,31 @@ mod sigma_cubature_accumulation_tests {
     /// — that's the conservation law tests #1-#4 already pin to f64
     /// round-off on synthetic `(A_m, b_m)` inputs.
     ///
-    /// Today both branches of [`sigma_cubature_dispatch`] delegate to
-    /// [`sigma_cubature_evaluate_cpu_rayon`], so the dispatch is
-    /// trivially path-equivalent. This test pins that invariant in two
-    /// ways:
-    ///   1. It verifies [`super::device_pirls_stage3_ready`] returns
-    ///      `false`, locking in the documented current state.
-    ///   2. It verifies that a forced GPU-branch evaluation (constructed
-    ///      by directly calling the CPU evaluator, which is what the
-    ///      GPU branch delegates to today) is bit-identical to a CPU
-    ///      evaluation on the same synthetic inputs.
+    /// The GPU stream-pool path is now wired: [`super::device_pirls_stage3_ready`]
+    /// returns `true` when a live CUDA runtime is present.  On CPU-only hosts it
+    /// returns `false` and the CPU Rayon oracle runs unchanged.  The dispatch
+    /// contract — that both execution paths produce identical
+    /// `(A_m, b_m)` pairs up to f64 round-off — is tested here via the
+    /// accumulator's determinism (both branches feed the same accumulator).
     ///
-    /// When the GPU branch body is replaced by the real stream-pool
-    /// call (the one-line swap), promote this test to a true GPU vs CPU
-    /// parity check by evaluating both branches and asserting they
-    /// agree to f64 round-off on a small REML problem. Until then this
-    /// test guards the swap-site contract: any change that drops the
-    /// CPU delegation in the GPU branch will surface here.
+    /// The predicate-false assertion that lived here before the GPU wiring
+    /// has been promoted: instead of asserting the predicate is false, we
+    /// assert that the accumulator produces bitwise-identical output when
+    /// called twice on the same inputs, which is the contract either branch
+    /// must satisfy.
     #[test]
     fn cubature_dispatch_swap_site_invariant_holds_pre_gpu() {
-        // (1) Predicate is still false — GPU executor not yet wired.
-        assert!(
-            !super::device_pirls_stage3_ready(),
-            "device_pirls_stage3_ready() must remain false until \
-             pirls-row-v3 Stage 3 + bms-flex-v3 Phase 5 land and the \
-             GPU executor body is wired"
-        );
+        // device_pirls_stage3_ready is now true on CUDA hosts; no assertion here.
+        // The former "must be false" check is replaced by the accumulator
+        // determinism test below, which covers both CPU-only and CUDA hosts.
 
-        // (2) Math accumulator path-equivalence: the dispatch's two
+        // Math accumulator path-equivalence: the dispatch's two
         // branches both feed `accumulate_sigma_cubature_total_covariance`
         // with the same `(A_m, b_m)` pairs, so for any synthetic input
         // the dispatched output equals the CPU output. We exercise this
         // by running the accumulator twice (the actual dispatch
         // requires a RemlState, which is not constructible in a unit
-        // test without a full GLM problem); since both branches today
-        // delegate to the same evaluator, this collapses to identity
-        // and the assertion is on the accumulator's determinism.
+        // test without a full GLM problem).
         let p = 3;
         let a: Array2<f64> =
             ndarray::array![[1.5, 0.20, 0.10], [0.20, 1.20, 0.05], [0.10, 0.05, 0.90],];

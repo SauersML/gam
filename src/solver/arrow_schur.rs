@@ -1706,6 +1706,49 @@ impl ArrowSchurSystem {
         }
     }
 
+    /// Fill a `b×b` penalty sub-block for a set of arbitrary (possibly
+    /// non-contiguous) global column indices `cols`, routing through
+    /// `penalty_op` or falling back to `hbb` / `hbb_diag` inline.
+    ///
+    /// Used by the cluster-Jacobi preconditioner (#299) which groups columns
+    /// by spectral adjacency rather than contiguous block ranges.
+    #[inline]
+    fn penalty_subblock_add(
+        &self,
+        cols: &[usize],
+        out: &mut Array2<f64>,
+    ) {
+        let b = cols.len();
+        if let Some(op) = self.penalty_op.as_ref() {
+            // Probe each column basis vector and extract the sub-block entries.
+            let mut probe = Array1::<f64>::zeros(self.k);
+            let mut result = Array1::<f64>::zeros(self.k);
+            for bj in 0..b {
+                probe.fill(0.0);
+                probe[cols[bj]] = 1.0;
+                result.fill(0.0);
+                {
+                    let p_slice = probe.as_slice().expect("probe contiguous");
+                    let r_slice = result.as_slice_mut().expect("result contiguous");
+                    op.matvec(p_slice, r_slice);
+                }
+                for bi in 0..b {
+                    out[[bi, bj]] += result[cols[bi]];
+                }
+            }
+        } else if self.hbb.dim() == (self.k, self.k) {
+            for bi in 0..b {
+                for bj in 0..b {
+                    out[[bi, bj]] += self.hbb[[cols[bi], cols[bj]]];
+                }
+            }
+        } else if let Some(hbb_diag) = self.hbb_diag.as_ref() {
+            for bi in 0..b {
+                out[[bi, bi]] += hbb_diag[cols[bi]];
+            }
+        }
+    }
+
     /// Fold analytic-penalty contributions into the appropriate blocks.
     ///
     /// BA source mapping: these are extra prior/regularization normal-equation
@@ -3887,19 +3930,11 @@ impl ClusterJacobiPreconditioner {
                 continue;
             }
             let mut s_block = Array2::<f64>::zeros((b, b));
+            // Initialise from H_ββ via penalty_subblock_add (#296): routes
+            // through penalty_op or falls back to hbb / hbb_diag inline.
+            sys.penalty_subblock_add(cols, &mut s_block);
             for bi in 0..b {
-                for bj in 0..b {
-                    let gi = cols[bi];
-                    let gj = cols[bj];
-                    let base = if sys.hbb.dim() == (sys.k, sys.k) {
-                        sys.hbb[[gi, gj]]
-                    } else if bi == bj {
-                        sys.hbb_diag.as_ref().map(|hd| hd[gi]).unwrap_or(0.0)
-                    } else {
-                        0.0
-                    };
-                    s_block[[bi, bj]] = base + if bi == bj { ridge_beta } else { 0.0 };
-                }
+                s_block[[bi, bi]] += ridge_beta;
             }
             let mut col_vec = Array1::<f64>::zeros(d);
             let mut solved_cols = Array2::<f64>::zeros((d, b));

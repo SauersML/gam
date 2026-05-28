@@ -116,7 +116,7 @@ fn assert_finite_vec(v: &[f64], ctx: &str) {
 
 #[test]
 fn k8_softmax_assembly_is_finite() {
-    let f = build_fixture(8, 4, 1, 500, 2, AssignmentMode::softmax(1.0));
+    let mut f = build_fixture(8, 4, 1, 500, 2, AssignmentMode::softmax(1.0));
     let sys = f
         .term
         .assemble_arrow_schur(f.target.view(), &f.rho, None)
@@ -127,7 +127,7 @@ fn k8_softmax_assembly_is_finite() {
 
 #[test]
 fn k8_jumprelu_assembly_is_finite() {
-    let f = build_fixture(8, 4, 1, 500, 2, AssignmentMode::jumprelu(1.0, 0.0));
+    let mut f = build_fixture(8, 4, 1, 500, 2, AssignmentMode::jumprelu(1.0, 0.0));
     let sys = f
         .term
         .assemble_arrow_schur(f.target.view(), &f.rho, None)
@@ -138,7 +138,7 @@ fn k8_jumprelu_assembly_is_finite() {
 
 #[test]
 fn k8_softmax_direct_solve_is_finite() {
-    let f = build_fixture(8, 4, 1, 500, 2, AssignmentMode::softmax(1.0));
+    let mut f = build_fixture(8, 4, 1, 500, 2, AssignmentMode::softmax(1.0));
     let sys = f
         .term
         .assemble_arrow_schur(f.target.view(), &f.rho, None)
@@ -152,7 +152,7 @@ fn k8_softmax_direct_solve_is_finite() {
 
 #[test]
 fn k8_softmax_pcg_solve_is_finite() {
-    let f = build_fixture(8, 4, 1, 500, 2, AssignmentMode::softmax(1.0));
+    let mut f = build_fixture(8, 4, 1, 500, 2, AssignmentMode::softmax(1.0));
     let sys = f
         .term
         .assemble_arrow_schur(f.target.view(), &f.rho, None)
@@ -170,7 +170,7 @@ fn k8_softmax_pcg_solve_is_finite() {
 
 #[test]
 fn k16_softmax_assembly_is_finite() {
-    let f = build_fixture(16, 4, 1, 500, 2, AssignmentMode::softmax(1.0));
+    let mut f = build_fixture(16, 4, 1, 500, 2, AssignmentMode::softmax(1.0));
     let sys = f
         .term
         .assemble_arrow_schur(f.target.view(), &f.rho, None)
@@ -181,7 +181,7 @@ fn k16_softmax_assembly_is_finite() {
 
 #[test]
 fn k16_jumprelu_assembly_is_finite() {
-    let f = build_fixture(16, 4, 1, 500, 2, AssignmentMode::jumprelu(1.0, 0.0));
+    let mut f = build_fixture(16, 4, 1, 500, 2, AssignmentMode::jumprelu(1.0, 0.0));
     let sys = f
         .term
         .assemble_arrow_schur(f.target.view(), &f.rho, None)
@@ -192,7 +192,7 @@ fn k16_jumprelu_assembly_is_finite() {
 
 #[test]
 fn k16_softmax_direct_solve_is_finite() {
-    let f = build_fixture(16, 4, 1, 500, 2, AssignmentMode::softmax(1.0));
+    let mut f = build_fixture(16, 4, 1, 500, 2, AssignmentMode::softmax(1.0));
     let sys = f
         .term
         .assemble_arrow_schur(f.target.view(), &f.rho, None)
@@ -210,7 +210,7 @@ fn k16_softmax_direct_solve_is_finite() {
 
 #[test]
 fn k32_softmax_assembly_is_finite() {
-    let f = build_fixture(32, 8, 1, 500, 2, AssignmentMode::softmax(1.0));
+    let mut f = build_fixture(32, 8, 1, 500, 2, AssignmentMode::softmax(1.0));
     let sys = f
         .term
         .assemble_arrow_schur(f.target.view(), &f.rho, None)
@@ -221,7 +221,7 @@ fn k32_softmax_assembly_is_finite() {
 
 #[test]
 fn k32_jumprelu_assembly_is_finite() {
-    let f = build_fixture(32, 8, 1, 500, 2, AssignmentMode::jumprelu(1.0, 0.0));
+    let mut f = build_fixture(32, 8, 1, 500, 2, AssignmentMode::jumprelu(1.0, 0.0));
     let sys = f
         .term
         .assemble_arrow_schur(f.target.view(), &f.rho, None)
@@ -232,7 +232,7 @@ fn k32_jumprelu_assembly_is_finite() {
 
 #[test]
 fn k32_softmax_direct_solve_is_finite() {
-    let f = build_fixture(32, 8, 1, 500, 2, AssignmentMode::softmax(1.0));
+    let mut f = build_fixture(32, 8, 1, 500, 2, AssignmentMode::softmax(1.0));
     let sys = f
         .term
         .assemble_arrow_schur(f.target.view(), &f.rho, None)
@@ -246,7 +246,7 @@ fn k32_softmax_direct_solve_is_finite() {
 
 #[test]
 fn k32_softmax_pcg_solve_is_finite() {
-    let f = build_fixture(32, 8, 1, 500, 2, AssignmentMode::softmax(1.0));
+    let mut f = build_fixture(32, 8, 1, 500, 2, AssignmentMode::softmax(1.0));
     let sys = f
         .term
         .assemble_arrow_schur(f.target.view(), &f.rho, None)
@@ -264,7 +264,7 @@ fn k32_softmax_pcg_solve_is_finite() {
 
 #[test]
 fn k16_full_newton_step_is_finite() {
-    let f = build_fixture(16, 4, 1, 500, 2, AssignmentMode::softmax(1.0));
+    let mut f = build_fixture(16, 4, 1, 500, 2, AssignmentMode::softmax(1.0));
     let mut term = f.term;
     let mut rho = f.rho;
     let target = f.target;
@@ -291,7 +291,7 @@ fn hbb_shape_matches_beta_dim() {
     let p = 2usize;
     let beta_dim = k_atoms * m * p; // 128
 
-    let f = build_fixture(k_atoms, m, 1, 500, p, AssignmentMode::softmax(1.0));
+    let mut f = build_fixture(k_atoms, m, 1, 500, p, AssignmentMode::softmax(1.0));
     let sys = f
         .term
         .assemble_arrow_schur(f.target.view(), &f.rho, None)
@@ -321,7 +321,7 @@ fn row_block_dim_matches_k_times_one_plus_d() {
     let d = 1usize;
     let expected_q = k_atoms * (1 + d); // 32
 
-    let f = build_fixture(k_atoms, 4, d, 500, 2, AssignmentMode::softmax(1.0));
+    let mut f = build_fixture(k_atoms, 4, d, 500, 2, AssignmentMode::softmax(1.0));
     let sys = f
         .term
         .assemble_arrow_schur(f.target.view(), &f.rho, None)
