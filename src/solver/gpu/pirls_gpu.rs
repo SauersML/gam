@@ -675,13 +675,12 @@ extern "C" __global__ void chol_logdet_col_major(
             .map_err(|e| format!("dgemm Qsᵀ·A·Qs (host-input step): {e}"))?;
         }
         // H_step = Qsᵀ·XᵀWX·Qs + (S + step_lm_lambda·I).
-        geam_add(
+        geam_add_inplace(
             &ws.blas,
             &ws.stream,
             p,
-            &ws.h_dev,
-            &ws.penalty_dev,
             &mut ws.h_dev,
+            &ws.penalty_dev,
         )?;
 
         // Upload gradient into the persistent RHS buffer.
@@ -865,7 +864,7 @@ extern "C" __global__ void chol_logdet_col_major(
             }
             .map_err(|e| format!("cublas dgemm XtWX (device-input): {e}"))?;
             let penalty_step = penalty_with_ridge(input.penalty_hessian, input.step_lm_lambda);
-            let penalty_step_col = to_col_major(&penalty_step.view());
+            let penalty_step_col = to_col_major(&penalty_step);
             ws.stream
                 .memcpy_htod(penalty_step_col.as_ref(), &mut ws.penalty_dev)
                 .map_err(|e| format!("upload penalty (device-input): {e}"))?;
@@ -910,13 +909,12 @@ extern "C" __global__ void chol_logdet_col_major(
                 }
                 .map_err(|e| format!("dgemm Qsᵀ·A·Qs (device-input large-p): {e}"))?;
             }
-            geam_add(
+            geam_add_inplace(
                 &ws.blas,
                 &ws.stream,
                 p,
-                &ws.h_dev,
-                &ws.penalty_dev,
                 &mut ws.h_dev,
+                &ws.penalty_dev,
             )?;
             let gemv_cfg = GemvConfig::<f64> {
                 trans: cublasOperation_t::CUBLAS_OP_T,
@@ -1001,17 +999,16 @@ extern "C" __global__ void chol_logdet_col_major(
                 .map_err(|e| format!("dgemm Qsᵀ·A·Qs (device-input fused): {e}"))?;
             }
             let penalty_step = penalty_with_ridge(input.penalty_hessian, input.step_lm_lambda);
-            let penalty_step_col = to_col_major(&penalty_step.view());
+            let penalty_step_col = to_col_major(&penalty_step);
             ws.stream
                 .memcpy_htod(penalty_step_col.as_ref(), &mut ws.penalty_dev)
                 .map_err(|e| format!("upload penalty (fused device-input): {e}"))?;
-            geam_add(
+            geam_add_inplace(
                 &ws.blas,
                 &ws.stream,
                 p,
-                &ws.h_dev,
-                &ws.penalty_dev,
                 &mut ws.h_dev,
+                &ws.penalty_dev,
             )?;
         }
 
@@ -1298,17 +1295,16 @@ extern "C" __global__ void chol_logdet_col_major(
         }
         // H_step = H_xtx + (S + step_lm_lambda·I).
         let penalty_step = penalty_with_ridge(input.penalty_hessian, input.step_lm_lambda);
-        let penalty_step_col = to_col_major(&penalty_step.view());
+        let penalty_step_col = to_col_major(&penalty_step);
         ws.stream
             .memcpy_htod(penalty_step_col.as_ref(), &mut ws.penalty_dev)
             .map_err(|e| format!("upload penalty inplace: {e}"))?;
-        geam_add(
+        geam_add_inplace(
             &ws.blas,
             &ws.stream,
             p,
-            &ws.h_dev,
-            &ws.penalty_dev,
             &mut ws.h_dev,
+            &ws.penalty_dev,
         )?;
 
         // Step 3: rhs = Qsᵀ score_p − S·β + linear_shift  (#257, #260).
@@ -1499,17 +1495,16 @@ extern "C" __global__ void chol_logdet_col_major(
             .map_err(|e| format!("dgemm Qsᵀ·A·Qs (final H rebuild): {e}"))?;
         }
         let penalty = penalty_with_ridge(penalty_hessian, objective_ridge);
-        let penalty_col = to_col_major(&penalty.view());
+        let penalty_col = to_col_major(&penalty);
         ws.stream
             .memcpy_htod(penalty_col.as_ref(), &mut ws.penalty_dev)
             .map_err(|e| format!("upload penalty (final H rebuild): {e}"))?;
-        geam_add(
+        geam_add_inplace(
             &ws.blas,
             &ws.stream,
             p,
-            &ws.h_dev,
-            &ws.penalty_dev,
             &mut ws.h_dev,
+            &ws.penalty_dev,
         )?;
 
         // One download — the only H transfer in the entire PIRLS loop.
@@ -1697,21 +1692,28 @@ extern "C" __global__ void chol_logdet_col_major(
         }
     }
 
-    fn geam_add(
+    // In-place `a := a + b` for two `p*p` column-major device buffers via
+    // cublasDgeam. The C API explicitly permits `C = A` (output aliasing the
+    // first input), but Rust's borrow checker cannot prove that — every
+    // caller historically passed `&ws.h_dev, &ws.penalty_dev, &mut ws.h_dev`
+    // and ran into E0502. Forcing the in-place semantics into the wrapper
+    // signature makes the contract explicit and removes the aliasing-borrow
+    // class of errors at the call sites.
+    fn geam_add_inplace(
         blas: &CudaBlas,
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
         p: usize,
-        a: &CudaSlice<f64>,
+        a: &mut CudaSlice<f64>,
         b: &CudaSlice<f64>,
-        out: &mut CudaSlice<f64>,
     ) -> Result<(), String> {
         let p_i = to_i32(p)?;
         let alpha = 1.0_f64;
         let beta = 1.0_f64;
         let handle = *blas.handle();
-        let (a_ptr, _a_record) = a.device_ptr(stream);
         let (b_ptr, _b_record) = b.device_ptr(stream);
-        let (out_ptr, _out_record) = out.device_ptr_mut(stream);
+        let (a_ptr, _a_record) = a.device_ptr_mut(stream);
+        // cublasDgeam with C == A is allowed and computes `A := alpha*A + beta*B`.
+        let out_ptr = a_ptr;
         // SAFETY: FFI call into cuBLAS geam; a, b, out are live p*p device buffers in column-major
         // with leading dim p_i, scalars live on host stack, handle is valid.
         let status = unsafe {
@@ -2294,24 +2296,24 @@ extern "C" __global__ void status_or(
         loop_ws: &mut PirlsLoopWorkspace,
         family: crate::gpu::pirls_row::PirlsRowFamily,
         curvature: crate::gpu::pirls_row::CurvatureMode,
-        /// Active Gamma dispersion shape (α > 0). Forwarded to every
-        /// `launch_row_reweight_on_stream` call. Pass `1.0` for non-Gamma fits.
+        // Active Gamma dispersion shape (α > 0). Forwarded to every
+        // `launch_row_reweight_on_stream` call. Pass `1.0` for non-Gamma fits.
         gamma_shape: f64,
         beta0_host: ArrayView1<'_, f64>,
         penalty_hessian: ArrayView2<'_, f64>,
-        /// Linear shift `b` of the shifted-quadratic penalty
-        /// `βᵀSβ − 2βᵀb + c`. Length `p`. Mirrors
-        /// `PirlsPenalty::linear_shift()` in the CPU oracle. Pass a zero
-        /// vector for fits with no prior-mean shift.
+        // Linear shift `b` of the shifted-quadratic penalty
+        // `βᵀSβ − 2βᵀb + c`. Length `p`. Mirrors
+        // `PirlsPenalty::linear_shift()` in the CPU oracle. Pass a zero
+        // vector for fits with no prior-mean shift.
         linear_shift: ArrayView1<'_, f64>,
-        /// Constant shift `c` of the shifted-quadratic penalty. Pass
-        /// `0.0` for fits with no prior-mean shift.
+        // Constant shift `c` of the shifted-quadratic penalty. Pass
+        // `0.0` for fits with no prior-mean shift.
         constant_shift: f64,
-        /// Temporary LM damping for the Newton solves only; never enters
-        /// RidgePassport / exported Hessian / EDF / penalty term.
+        // Temporary LM damping for the Newton solves only; never enters
+        // RidgePassport / exported Hessian / EDF / penalty term.
         lm_ridge: f64,
-        /// Real model-objective ridge; enters RidgePassport / exported
-        /// Hessian / EDF / penalty term.
+        // Real model-objective ridge; enters RidgePassport / exported
+        // Hessian / EDF / penalty term.
         objective_ridge: f64,
         max_iter: usize,
         tol: f64,
@@ -3209,7 +3211,7 @@ extern "C" __global__ void status_or(
         let mut potrs_info_dev = stream
             .alloc_zeros::<i32>(1)
             .map_err(|e| format!("alloc potrs info (gaussian pls): {e}"))?;
-        let reg_col = to_col_major(&regularized.view());
+        let reg_col = to_col_major(&regularized);
         stream
             .memcpy_htod(reg_col.as_ref(), &mut h_dev)
             .map_err(|e| format!("upload H (gaussian pls): {e}"))?;
@@ -3377,14 +3379,14 @@ pub fn pirls_loop_on_stream(
     loop_ws: &mut cuda::PirlsLoopWorkspace,
     family: crate::gpu::pirls_row::PirlsRowFamily,
     curvature: crate::gpu::pirls_row::CurvatureMode,
-    /// Active Gamma dispersion shape (α > 0). Pass `1.0` for non-Gamma fits.
+    // Active Gamma dispersion shape (α > 0). Pass `1.0` for non-Gamma fits.
     gamma_shape: f64,
     beta0: ndarray::ArrayView1<'_, f64>,
     penalty_hessian: ndarray::ArrayView2<'_, f64>,
-    /// Linear shift `b` for the shifted-quadratic penalty `βᵀSβ−2βᵀb+c`.
-    /// Pass a zero-length or all-zero slice for fits with no prior-mean shift.
+    // Linear shift `b` for the shifted-quadratic penalty `βᵀSβ−2βᵀb+c`.
+    // Pass a zero-length or all-zero slice for fits with no prior-mean shift.
     linear_shift: ndarray::ArrayView1<'_, f64>,
-    /// Constant shift `c` for the shifted-quadratic penalty. Pass `0.0` when absent.
+    // Constant shift `c` for the shifted-quadratic penalty. Pass `0.0` when absent.
     constant_shift: f64,
     step_lm_lambda: f64,
     objective_ridge: f64,
