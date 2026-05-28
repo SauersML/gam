@@ -638,6 +638,20 @@ def shape_prediction_response(
             model_class, columns, id_column=id_column, row_ids=row_ids
         )
 
+    # Default predict() contract for standard GAMs: return the fitted mean as a
+    # 1-D array when the caller did not ask for a tabular shape (no return_type,
+    # no id_column, no interval). Asking for an interval, an id-column join, or
+    # an explicit return_type signals "I want the full table" (eta + mean and,
+    # when interval is set, effective_se + mean_lower + mean_upper).
+    if (
+        return_type is None
+        and id_column is None
+        and interval is None
+        and "mean" in columns
+    ):
+        mean_values = [float(value) for value in columns["mean"]]
+        return rust_module().vec_to_array1_f64(mean_values)
+
     out_columns_any: dict[str, list[Any]] = dict(columns)
     if id_column is not None:
         out_columns_any = {id_column: list(row_ids or []), **out_columns_any}

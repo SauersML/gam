@@ -143,20 +143,25 @@ def test_fit_predict_summary_check_report_and_roundtrip(tmp_path: pathlib.Path) 
     assert not summary.coefficients_frame().empty
 
     predicted = model.predict(prediction_rows())
-    assert list(predicted) == ["eta", "mean"]
-    assert len(predicted["mean"]) == 3
+    # Default predict() returns a 1-D array of fitted means; the eta/SE
+    # columns are only materialised when the caller asks for them via
+    # ``return_type`` / ``interval``.
+    predicted_arr = np.asarray(predicted, dtype=float)
+    assert predicted_arr.shape == (3,)
     # The training data is exactly y = x + 1 with no noise, so the
     # identity-link Gaussian model must recover that linear function within
-    # numerical tolerance — a renamed column or swapped eta/mean would break
-    # at least one of these checks. The 1e-3 tolerance matches the rmse
-    # bound used elsewhere in this suite (test_pandas_diagnostics_and_plotting)
-    # and accounts for any default ridge / shrinkage applied during fit.
+    # numerical tolerance. The 1e-3 tolerance matches the rmse bound used
+    # elsewhere in this suite (test_pandas_diagnostics_and_plotting) and
+    # accounts for any default ridge / shrinkage applied during fit.
     expected_mean = [2.5, 3.5, 4.5]
-    np.testing.assert_allclose(predicted["mean"], expected_mean, atol=1e-3)
+    np.testing.assert_allclose(predicted_arr, expected_mean, atol=1e-3)
+
+    full_table = model.predict(prediction_rows(), return_type="dict")
+    assert list(full_table) == ["eta", "mean"]
     # For the identity link, eta and mean are computed from the same beta·x
     # — a swap would still be detected here because the comparison is bit
     # close, just not strict bit-equality (allowing for any post-link copy).
-    np.testing.assert_allclose(predicted["eta"], predicted["mean"], atol=1e-9)
+    np.testing.assert_allclose(full_table["eta"], full_table["mean"], atol=1e-9)
 
     with_interval = model.predict(prediction_rows(), interval=0.95)
     assert list(with_interval) == [

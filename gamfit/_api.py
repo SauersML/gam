@@ -328,6 +328,20 @@ def _normalize_penalties(
     latent_names = list((latents or {}).keys())
     out: list[dict[str, Any]] = []
     for index, penalty in enumerate(penalties):
+        from .smooth import Smooth as _Smooth
+
+        if isinstance(penalty, _Smooth):
+            raise TypeError(
+                f"penalties[{index}] is a {type(penalty).__name__} smooth descriptor; "
+                "the `penalties=` kwarg only accepts analytic penalty wrappers "
+                "targeting latent blocks (e.g. OrthogonalityPenalty, ARDPenalty, "
+                "SparsityPenalty). To configure a Duchon/Matern/Sphere smooth via "
+                "the formula API, use the DSL: e.g. "
+                "`duchon(x, centers=K)`, `matern(x, centers=K, nu=1.5)`, "
+                "`sphere(lat, lon, centers=K)`. Explicit center coordinates and "
+                "Smooth descriptor objects are part of the lower-level numpy/torch "
+                "basis API, not the `fit(formula=...)` surface."
+            )
         if hasattr(penalty, "to_rust_descriptor"):
             descriptor = penalty.to_rust_descriptor()
         elif hasattr(penalty, "_to_rust_payload"):

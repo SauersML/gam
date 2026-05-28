@@ -308,12 +308,14 @@ def load_posterior(path: str | Path) -> PosteriorSamples:
 
 
 __all__ = [
-    "AdaptiveTopK",
-    "Crosscoder",
+    # Note: the lazy-torch primitives (AdaptiveTopK, Crosscoder,
+    # InterchangeSwapDecoder, PoincareAtoms) are intentionally NOT in __all__.
+    # They remain reachable as ``gamfit.AdaptiveTopK`` via ``__getattr__``;
+    # excluding them here keeps ``from gamfit import *`` working on torch-less
+    # installs where attribute access would otherwise raise AttributeError
+    # mid-iteration (see issue #303).
     "Diagnostics",
     "diagnostics",
-    "InterchangeSwapDecoder",
-    "PoincareAtoms",
     "EquivariantPenalty",
     "GaugeCompanion",
     "LieAtom",
