@@ -1858,7 +1858,7 @@ pub fn audit_identifiability_with_state(
     col_offsets.push(0);
     let mut blocks: Vec<BlockIdentity> = Vec::with_capacity(specs.len());
 
-    for (idx, spec) in specs.iter().enumerate() {
+    for spec in specs.iter() {
         let dense = spec
             .effective_jacobian_at(
                 "identifiability_audit::audit_identifiability_with_state",
@@ -1880,7 +1880,6 @@ pub fn audit_identifiability_with_state(
         let next_offset = col_offsets[col_offsets.len() - 1] + p_block;
         col_offsets.push(next_offset);
         dense_blocks.push(dense);
-        let _ = idx; // consumed via enumerate above
     }
 
     let p_total = *col_offsets.last().expect("col_offsets non-empty");
