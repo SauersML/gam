@@ -227,17 +227,12 @@ mod linux_impl {
             }
         }
 
-        // The offset is not separately threaded through pirls_loop_on_stream.
-        // The loop initialises eta via gemv(x, beta0) without an offset term;
-        // for sigma-cubature the zero-beta0 start means eta starts at 0, which
-        // matches the stateless CPU path that also starts from scratch.
-        let _ = offset;
-
         // Bootstrap shared data from the first sigma point to get a context +
-        // stream for workspace allocation.  Each point re-uploads x_transformed
+        // stream for workspace allocation.  Each point re-uploads x_transformed,
+        // y, prior_w, and offset (now required by upload_shared_pirls_gpu #258)
         // into its own PirlsGpuSharedData; workspaces (n, p) are the same.
         let bootstrap_shared =
-            pirls_gpu::upload_shared_pirls_gpu(first.x_transformed.view())
+            pirls_gpu::upload_shared_pirls_gpu(first.x_transformed.view(), y, prior_w, offset)
                 .map_err(|e| crate::gpu_err!("sigma stream pool bootstrap upload: {e}"))?;
 
         let n_streams = pool_size(m);

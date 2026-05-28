@@ -3917,7 +3917,8 @@ mod stream_device_parity_tests {
         let beta0 = ndarray::Array1::<f64>::zeros(p);
 
         // GPU timing.
-        let shared = upload_shared_pirls_gpu(x.view()).expect("upload shared design");
+        let offset_bench = ndarray::Array1::<f64>::zeros(n);
+        let shared = upload_shared_pirls_gpu(x.view(), y.view(), prior_w.view(), offset_bench.view()).expect("upload shared design");
         let mut ws = allocate_sigma_pirls_workspace(&shared).expect("alloc ws");
         let mut loop_ws = allocate_pirls_loop_workspace(&shared, &ws).expect("alloc loop_ws");
         let t0 = Instant::now();
@@ -4028,10 +4029,15 @@ mod stream_device_parity_tests {
         let penalty = ndarray::Array2::<f64>::eye(p) * 1e-4; // tiny ridge
         let beta0 = ndarray::Array1::<f64>::zeros(p);
 
-        let shared = upload_shared_pirls_gpu(x.view()).expect("upload shared design");
+        let offset_ols = ndarray::Array1::<f64>::zeros(n);
+        let shared = upload_shared_pirls_gpu(x.view(), y.view(), prior_w.view(), offset_ols.view()).expect("upload shared design");
         let mut ws = allocate_sigma_pirls_workspace(&shared).expect("alloc ws");
         let mut loop_ws = allocate_pirls_loop_workspace(&shared, &ws).expect("alloc loop_ws");
 
+        // No prior-mean shift in this OLS test — `linear_shift = 0`,
+        // `constant_shift = 0`. `y` / `prior_w` are now uploaded via
+        // the shared workspace (#258).
+        let linear_shift_zero = ndarray::Array1::<f64>::zeros(p);
         let outcome = pirls_loop_on_stream(
             &shared,
             &mut ws,
@@ -4040,9 +4046,9 @@ mod stream_device_parity_tests {
             crate::gpu::pirls_row::CurvatureMode::Fisher,
             1.0,
             beta0.view(),
-            y.view(),
-            prior_w.view(),
             penalty.view(),
+            linear_shift_zero.view(),
+            0.0,
             0.0,
             0.0,
             20,

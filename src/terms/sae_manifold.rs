@@ -1686,6 +1686,7 @@ impl SaeManifoldTerm {
             atoms,
             assignment,
             temperature_schedule: None,
+            last_row_layout: None,
         })
     }
 
@@ -1914,7 +1915,7 @@ impl SaeManifoldTerm {
 
     /// Assemble the enlarged `(logits, t)` row-local Arrow-Schur system.
     pub fn assemble_arrow_schur(
-        &self,
+        &mut self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
         analytic_penalties: Option<&AnalyticPenaltyRegistry>,
@@ -3580,12 +3581,17 @@ mod tests {
         let actual = term.loss(target.view(), &rho).unwrap().total() - loss0;
 
         let linear = sys.gb.dot(&delta);
-        let mut quadratic = 0.0;
-        for row in 0..delta.len() {
-            for col in 0..delta.len() {
-                quadratic += 0.5 * delta[row] * sys.hbb[[row, col]] * delta[col];
-            }
+        // Use penalty_op to include all H_ββ contributions (GN + smoothness)
+        // rather than reading sys.hbb directly, which no longer holds the
+        // smoothness term after the #296 BetaPenaltyOp migration.
+        let mut hbb_delta = Array1::<f64>::zeros(delta.len());
+        {
+            let op = sys.effective_penalty_op();
+            let d_slice = delta.as_slice().expect("delta is contiguous");
+            let hd_slice = hbb_delta.as_slice_mut().expect("hbb_delta is contiguous");
+            op.matvec(d_slice, hd_slice);
         }
+        let quadratic = 0.5 * delta.dot(&hbb_delta);
         let predicted = linear + quadratic;
         let error = (actual - predicted).abs();
         assert!(

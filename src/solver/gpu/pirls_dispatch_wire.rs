@@ -742,8 +742,7 @@ mod linux_impl {
         let gradient_norm = array1_l2_norm(&gradient);
         let max_abs_eta = inf_norm(finalmu.iter().copied());
 
-        let deviance = calculate_deviance(input.y, &finalmu, input.likelihood, input.priorweights)
-            .map_err(|e| format!("deviance computation failed: {e:?}"))?;
+        let deviance = calculate_deviance(input.y, &finalmu, input.likelihood, input.priorweights);
         let log_likelihood = calculate_loglikelihood_omitting_constants(
             input.y,
             &finalmu,
