@@ -4315,7 +4315,8 @@ fn prepare_survival_location_scale_model(
         )?,
         initial_beta: time_prepared.initial_beta.clone(),
         gauge_priority: 100,
-        jacobian_callback: Some(time_audit_jacobian),
+        jacobian_callback: None,
+        audit_design: Some(time_audit_design),
     };
 
     let threshold_prep = prepare_cov_block_kind(&spec.threshold_block)?;
@@ -4417,7 +4418,8 @@ fn prepare_survival_location_scale_model(
         initial_log_lambdas: threshold_initial_log_lambdas,
         initial_beta: threshold_initial_beta,
         gauge_priority: 100,
-        jacobian_callback: threshold_audit_jacobian,
+        jacobian_callback: None,
+        audit_design: threshold_audit_design,
     };
 
     let survival_primary_design = DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(
@@ -4543,7 +4545,8 @@ fn prepare_survival_location_scale_model(
         initial_log_lambdas: log_sigma_initial_log_lambdas,
         initial_beta: log_sigma_initial_beta,
         gauge_priority: 100,
-        jacobian_callback: log_sigma_audit_jacobian,
+        jacobian_callback: None,
+        audit_design: log_sigma_audit_design,
     };
     let wigglespec = if let Some(w) = spec.linkwiggle_block.as_ref() {
         Some(ParameterBlockSpec {
