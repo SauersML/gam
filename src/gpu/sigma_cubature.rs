@@ -159,9 +159,26 @@ pub fn try_gpu_sigma_stream_pool_eval(
 
     #[cfg(not(target_os = "linux"))]
     {
-        // Non-Linux: no CUDA runtime; all parameters are unused. Function
-        // parameters don't generate Rust unused-variable warnings so no
-        // suppression is needed.
+        // Non-Linux: no CUDA runtime. Consume every parameter in a single
+        // trace log so each binding is read once, satisfying -D warnings
+        // without an #[allow(unused_variables)] suppression.
+        log::trace!(
+            "[sigma stream pool] non-Linux target: skipping dispatch \
+             (x_original={}x{}, y_len={}, prior_w_len={}, offset_len={}, \
+              n_sigma={}, family={:?}, curvature={:?}, gamma_shape={}, \
+              tol={}, max_iter={})",
+            x_original.nrows(),
+            x_original.ncols(),
+            y.len(),
+            prior_w.len(),
+            offset.len(),
+            per_sigma.len(),
+            admission.family,
+            admission.curvature,
+            gamma_shape,
+            convergence_tol,
+            max_iter,
+        );
         Ok(None)
     }
 }

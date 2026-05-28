@@ -42,8 +42,6 @@ use ndarray::{Array2, ArrayView2};
 
 use super::error::GpuError;
 use super::{GpuDecision, GpuKernel, decide};
-use crate::gpu::error::GpuResultExt;
-use crate::gpu_err;
 
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
