@@ -2004,7 +2004,7 @@ where
     })
 }
 
-mod test_support {
+pub(super) mod test_support {
     //! Thread-local diagnostic trace for PIRLS penalized-deviance sequences.
     //! `record_penalized_deviance` is always on so the per-iteration call site
     //! in the PIRLS hot loop does not need a `#[cfg(test)]` gate; the trace
@@ -2012,11 +2012,11 @@ mod test_support {
     //! production. The capture entry point lives next to the test that uses
     //! it.
     thread_local! {
-        pub(super) static PIRLS_PENALIZED_DEVIANCE_TRACE: std::cell::RefCell<Option<Vec<f64>>> =
+        pub static PIRLS_PENALIZED_DEVIANCE_TRACE: std::cell::RefCell<Option<Vec<f64>>> =
             const { std::cell::RefCell::new(None) };
     }
 
-    pub(super) fn record_penalized_deviance(value: f64) {
+    pub fn record_penalized_deviance(value: f64) {
         PIRLS_PENALIZED_DEVIANCE_TRACE.with(|trace| {
             if let Some(ref mut buf) = *trace.borrow_mut() {
                 buf.push(value);

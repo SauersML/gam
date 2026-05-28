@@ -3790,6 +3790,7 @@ pub(super) fn solve_intercept_for_prevalence(
 // madsen_lm_accept_factor and runworking_model_pirls live in reweight.
 pub use reweight::runworking_model_pirls;
 use reweight::madsen_lm_accept_factor;
+use reweight::test_support;
 
 
 
