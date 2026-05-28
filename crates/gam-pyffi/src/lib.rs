@@ -26847,40 +26847,60 @@ fn dataset_from_x_array_with_model_schema(
     if x.ncols() == 0 {
         return Err("X must have at least one column".to_string());
     }
-    // Issue #341: predict_array on a model fitted with named columns used to
-    // tag the positional inputs as `x0, x1, ...` and then check those names
-    // against the training schema, which always failed for formula-fitted
-    // models (the schema speaks the original column names, e.g. `x`). The
-    // right semantics is: positional columns map, in order, to the feature
-    // columns captured at fit time. Recover that ordered list from the
-    // training headers minus anything the formula treats as response /
-    // offset / noise-offset / z / auxiliary-formula input. If the training
-    // headers were not saved (older payloads), fall back to schema order.
+    // Issue #341 — principled scope for predict_array:
+    //
+    // Positional X has a well-defined meaning only when the model itself
+    // was fit from a positional array (i.e. via `fit_array`), because
+    // `fit_array` is the only path that synthesizes a known column ordering
+    // (`x0, x1, ..., x{p-1}`) and bakes that ordering into both the saved
+    // schema and the user's formula. For models fit from a named table
+    // (`fit(df, formula)`) the schema speaks the user's own column names
+    // and there is NO way at the `.values` boundary to tell `df[["a","b"]]`
+    // from `df[["b","a"]]` apart — both arrive as an anonymous (n, 2) f64
+    // block. Quietly choosing one ordering (e.g. "training_headers order")
+    // produces silently wrong predictions on column swap, which is exactly
+    // the kind of footgun a principled API must refuse. So: refuse.
+    //
+    // Detection is cheap and exact. `fit_array` writes training_headers as
+    // `[<response>, "x0", "x1", ..., "x{p-1}"]` (or `[y0..yk-1, x0..xp-1]`
+    // for multi-response), which means the predictor-column suffix of
+    // training_headers is exactly the sorted positional sequence
+    // `x0..x{p-1}`. Anything else is a table-fit and must use
+    // `Model.predict(df_or_dict)` instead.
     let schema = model.require_data_schema()?;
-    let required = required_prediction_columns(model)?;
     let payload = model.payload();
-    let ordered_feature_names: Vec<String> = match payload.training_headers.as_ref() {
-        Some(training_headers) => training_headers
-            .iter()
-            .filter(|name| required.contains(name.as_str()))
-            .cloned()
-            .collect(),
-        None => schema
-            .columns
-            .iter()
-            .filter(|column| required.contains(column.name.as_str()))
-            .map(|column| column.name.clone())
-            .collect(),
-    };
-    if ordered_feature_names.len() != x.ncols() {
+    let training_headers = payload.training_headers.as_ref().ok_or_else(|| {
+        "predict_array requires a model fitted via fit_array (no training headers saved); \
+             call Model.predict(df_or_dict) instead so predictor columns can be matched by name"
+            .to_string()
+    })?;
+    let required = required_prediction_columns(model)?;
+    let positional_feature_names: Vec<String> = training_headers
+        .iter()
+        .filter(|name| required.contains(name.as_str()))
+        .cloned()
+        .collect();
+    let expected_positional: Vec<String> = (0..positional_feature_names.len())
+        .map(|index| format!("x{index}"))
+        .collect();
+    if positional_feature_names != expected_positional {
         return Err(format!(
-            "predict_array expected {} positional feature column(s) to match the training schema {:?}, but got {}",
-            ordered_feature_names.len(),
-            ordered_feature_names,
+            "predict_array is only defined for models fitted via fit_array \
+             (predictor columns must be the synthetic positional sequence \
+             x0..x{{p-1}}); this model was fitted from a named table with \
+             predictor columns {positional_feature_names:?}. Call \
+             Model.predict(df_or_dict) instead so columns can be matched by name."
+        ));
+    }
+    if positional_feature_names.len() != x.ncols() {
+        return Err(format!(
+            "predict_array expected {} positional feature column(s) to match \
+             the fit_array training schema, but the input X has {} column(s)",
+            positional_feature_names.len(),
             x.ncols()
         ));
     }
-    dataset_from_numeric_array_with_schema(ordered_feature_names, x.to_owned(), schema)
+    dataset_from_numeric_array_with_schema(positional_feature_names, x.to_owned(), schema)
 }
 
 fn dataset_from_numeric_array(
