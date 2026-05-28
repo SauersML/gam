@@ -4739,10 +4739,11 @@ fn gaussian_reml_fit_backward<'py>(
         .transpose()
         .map_err(py_value_error)?;
     let (grad_x, grad_by, grad_y, grad_penalty, grad_weights) =
-        detach_py_result(py, "gaussian_reml_fit_backward", move || {
+        detach_estimation_result(py, "gaussian_reml_fit_backward", move || {
             let gated_x;
             let fit_x = if let Some(by_arr) = by_values.as_ref() {
-                gated_x = apply_by_gate(x_values.view(), by_arr.view(), by_start_col)?;
+                gated_x = apply_by_gate(x_values.view(), by_arr.view(), by_start_col)
+                    .map_err(EstimationError::InvalidInput)?;
                 gated_x.view()
             } else {
                 x_values.view()
@@ -4773,8 +4774,7 @@ fn gaussian_reml_fit_backward<'py>(
                     grad_reml_score,
                     grad_edf,
                 )
-            }
-            .map_err(|err| err.to_string())?;
+            }?;
             let grad_x_raw = backward.grad_x;
             let (grad_x, grad_by) = if let Some(by_arr) = by_values.as_ref() {
                 let (grad_x, grad_by) = apply_by_gate_backward(
@@ -4782,7 +4782,8 @@ fn gaussian_reml_fit_backward<'py>(
                     by_arr.view(),
                     by_start_col,
                     grad_x_raw.view(),
-                )?;
+                )
+                .map_err(EstimationError::InvalidInput)?;
                 (grad_x, Some(grad_by))
             } else {
                 (grad_x_raw, None)

@@ -20,7 +20,7 @@ Two design rules this module enforces:
    table". Every per-class shaper consults it. Adding a new keyword to
    ``Model.predict`` is a one-line change here.
 2. **Policy is driven by caller intent, never by what columns the Rust core
-   happened to return.** If the backend emits ``effective_se`` without
+   happened to return.** If the backend emits ``std_error`` without
    being asked, that is a backend bug to fix upstream, not something to
    paper over with column sniffing.
 
@@ -64,14 +64,14 @@ def wants_table(
     * ``id_column`` — propagate an identifier column alongside predictions,
       which only makes sense in a tabular shape.
     * ``interval`` — a credible-interval coverage produces
-      ``effective_se`` / ``mean_lower`` / ``mean_upper`` columns; those are
+      ``std_error`` / ``mean_lower`` / ``mean_upper`` columns; those are
       meaningful only as a table.
 
     (Issue #342: an earlier ``with_uncertainty`` boolean was redundant with
     ``interval`` — coverage and the request to quantify uncertainty are the
     same decision — and was removed.)
 
-    Any other backend-visible state (e.g. presence of an ``effective_se``
+    Any other backend-visible state (e.g. presence of a ``std_error``
     column in the payload) is intentionally ignored: shape policy belongs
     to the caller, not the wire format.
     """
@@ -183,8 +183,8 @@ def _shape_standard(
 
     Default contract: a 1-D ``ndarray`` of fitted means. When the caller
     opted into a tabular shape, return whatever the Rust core emitted
-    (``eta`` + ``mean`` always; plus ``effective_se`` / ``mean_lower`` /
-    ``mean_upper`` when uncertainty was requested via the FFI options).
+    (``linear_predictor`` + ``mean`` always; plus ``std_error`` /
+    ``mean_lower`` / ``mean_upper`` when ``interval`` was set).
     """
     if not table_requested:
         mean_values = [float(value) for value in columns["mean"]]

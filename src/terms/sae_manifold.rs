@@ -1725,19 +1725,82 @@ impl SaeManifoldTerm {
         self.atoms.len()
     }
 
-    /// True when every atom carries the same coord latent dim. Row-block
-    /// analytic penalties (ARD, BlockOrthogonality, Sparsity/TopK/JumpReLU,
-    /// RowPrecisionPrior, ScadMcp, Isometry) target the "t" latent block
-    /// (n_obs × d_max). Per-atom dispatch is only correct when every coord
-    /// block matches the penalty target shape — i.e. when all atoms share
-    /// `latent_dim`. The K=1 case trivially satisfies this.
-    pub fn coords_share_latent_dim(&self) -> bool {
-        let mut iter = self.assignment.coords.iter().map(|c| c.latent_dim());
-        let first = match iter.next() {
-            Some(d) => d,
-            None => return true,
-        };
-        iter.all(|d| d == first)
+    /// Construction-time validation: every Psi-tier analytic penalty in the
+    /// registry must be dispatchable into the SAE arrow-Schur row layout.
+    ///
+    /// Two invariants are enforced upfront so the dispatch loop in
+    /// `add_sae_analytic_penalty_contributions` is total (no runtime
+    /// "unsupported penalty" fallthrough, no per-call K-gating):
+    ///
+    /// 1. Every Psi-tier penalty is either a logit-target penalty
+    ///    (`IBPAssignment`, `SoftmaxAssignmentSparsity`) or in
+    ///    [`sae_penalty_is_row_block_supported`]. Penalty kinds with
+    ///    cross-row structure (`TotalVariation`, `Monotonicity`,
+    ///    `NuclearNorm`, `BlockSparsity`, `IvaeRidgeMeanGauge`,
+    ///    `Orthogonality`, `NestedPrefix`, `SheafConsistency`) cannot be
+    ///    expressed in the SAE row-block layout and are refused here.
+    ///
+    /// 2. If any Psi-tier row-block penalty is present, every atom shares
+    ///    the same coord latent dim. The current registry model carries one
+    ///    `latent_dim` per descriptor (the "t" latent block declares one
+    ///    `d` value); per-atom dispatch with heterogeneous `d_k` would
+    ///    require per-atom registry entries or per-kind in-place
+    ///    reshaping. Mixed-d row-block fits are rejected with an actionable
+    ///    error pointing at the configuration mismatch.
+    ///
+    /// The K=1 case trivially satisfies (2). Beta-tier and rho-tier
+    /// penalties are not constrained here.
+    fn validate_analytic_penalty_registry(
+        &self,
+        registry: &AnalyticPenaltyRegistry,
+    ) -> Result<(), String> {
+        let mut row_block_penalty_present = false;
+        for penalty in &registry.penalties {
+            if penalty.tier() != PenaltyTier::Psi {
+                continue;
+            }
+            let is_logit = matches!(
+                penalty,
+                AnalyticPenaltyKind::IBPAssignment(_)
+                    | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
+            );
+            if is_logit {
+                continue;
+            }
+            if !sae_penalty_is_row_block_supported(penalty) {
+                return Err(format!(
+                    "SAE-manifold term refuses analytic penalty {:?}: this kind \
+                     has cross-row structure and cannot be expressed in the \
+                     arrow-Schur row layout. Use only row-block-supported \
+                     coord penalties (ARD, BlockOrthogonality, \
+                     Sparsity/TopK/JumpReLU, RowPrecisionPrior, \
+                     ParametricRowPrecisionPrior, ScadMcp, Isometry) on the \
+                     coord latent block, or move the penalty to a non-SAE \
+                     term",
+                    penalty.name()
+                ));
+            }
+            row_block_penalty_present = true;
+        }
+        if row_block_penalty_present {
+            let mut dims = self.assignment.coords.iter().map(|c| c.latent_dim());
+            if let Some(first) = dims.next() {
+                if let Some(mismatch) = dims.find(|d| *d != first) {
+                    return Err(format!(
+                        "SAE-manifold term refuses row-block analytic penalty: \
+                         atoms have heterogeneous coord latent dims (saw {first} \
+                         and {mismatch}). Row-block penalties (ARD, \
+                         BlockOrthogonality, ...) target the unified \"t\" \
+                         latent block whose declared `d` matches one shape; \
+                         per-atom dispatch with mixed `d_k` would silently \
+                         truncate or expand axes. Configure all atoms with the \
+                         same `atom_dim`, or split the row-block penalty into \
+                         per-atom descriptors keyed to per-atom latent blocks"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn output_dim(&self) -> usize {
@@ -2348,6 +2411,12 @@ impl SaeManifoldTerm {
             });
         }
         if let Some(registry) = analytic_penalties {
+            // Upfront validation: refuse penalty kinds the SAE row layout
+            // cannot host, and refuse mixed-d row-block configurations.
+            // This makes the dispatch loop below total — no runtime
+            // "unsupported penalty" fallthrough, no K-gating.
+            self.validate_analytic_penalty_registry(registry)
+                .map_err(|err| format!("SaeManifoldTerm::assemble_arrow_schur: {err}"))?;
             self.add_sae_analytic_penalty_contributions(&mut sys, registry)
                 .map_err(|err| format!("SaeManifoldTerm::assemble_arrow_schur: {err}"))?;
         }
@@ -2465,20 +2534,23 @@ impl SaeManifoldTerm {
                             | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
                     ) {
                         self.add_sae_logit_penalty(sys, penalty, logits_flat.view(), rho_local);
-                    } else if sae_penalty_is_row_block_supported(penalty)
-                        && self.coords_share_latent_dim()
-                    {
-                        // Row-block coord penalties (ARD, BlockOrthogonality,
-                        // Sparsity/TopK/JumpReLU, RowPrecisionPrior, ScadMcp,
-                        // Isometry) target the "t" latent block (n_obs ×
-                        // d_max). When every atom shares the same coord
-                        // latent dimension, the penalty's `(n_eff, d)` target
-                        // shape matches each atom's `(N, d_k)` coord block
-                        // exactly, so we dispatch per atom and accumulate
-                        // into the corresponding row offsets. The K=1 case
-                        // is just the K-atom loop with K=1 (preserves the
-                        // K=1 fast path bit-for-bit because the single atom
-                        // gets the same `off`/`coord`/`atom` as before).
+                    } else {
+                        // Every other Psi-tier penalty here is row-block
+                        // supported with a coord-shape that matches each
+                        // atom — `validate_analytic_penalty_registry`
+                        // refused everything else upfront, so this branch
+                        // is total and the K=1 vs K>=2 path is the same
+                        // loop. Row-block coord penalties (ARD,
+                        // BlockOrthogonality, Sparsity/TopK/JumpReLU,
+                        // RowPrecisionPrior, ScadMcp, Isometry) target the
+                        // "t" latent block (n_obs × d) and apply per atom
+                        // — accumulate into the corresponding row offsets.
+                        debug_assert!(
+                            sae_penalty_is_row_block_supported(penalty),
+                            "validate_analytic_penalty_registry should have \
+                             refused non-row-block Psi-tier penalty {:?}",
+                            penalty.name()
+                        );
                         let offsets = self.assignment.coord_offsets();
                         for atom_idx in 0..self.k_atoms() {
                             let off = offsets[atom_idx];

@@ -95,56 +95,6 @@ fn are_penalties_block_factored(penalties: &[crate::construction::CanonicalPenal
     true
 }
 
-fn infer_penalty_rank(penalty: &crate::construction::CanonicalPenalty) -> Result<usize, String> {
-    let block_dim = penalty.block_dim();
-    if penalty.positive_eigenvalues.len() + penalty.nullity == block_dim {
-        return Ok(penalty.positive_eigenvalues.len());
-    }
-    if block_dim == 0 {
-        return Ok(0);
-    }
-
-    let (evals, _) = penalty
-        .local
-        .eigh(Side::Lower)
-        .map_err(|e| format!("Penalty component eigendecomposition failed: {e}"))?;
-    let threshold = super::unified::positive_eigenvalue_threshold(evals.as_slice().unwrap());
-    Ok(evals.iter().filter(|&&e| e > threshold).count())
-}
-
-fn structural_nullity_from_penalties(
-    penalties: &[crate::construction::CanonicalPenalty],
-    lambdas: &[f64],
-    p_total: usize,
-) -> Result<Option<usize>, String> {
-    if penalties.is_empty() {
-        return Ok(None);
-    }
-
-    let lambda_threshold = active_lambda_threshold(lambdas);
-    let mut component_matrices = Vec::with_capacity(penalties.len());
-    let mut component_nullities = Vec::with_capacity(penalties.len());
-    for (k, penalty) in penalties.iter().enumerate() {
-        let lambda = lambdas.get(k).copied().unwrap_or(0.0);
-        if !lambda_is_active(lambda, lambda_threshold) {
-            continue;
-        }
-        let rank = infer_penalty_rank(penalty)?;
-        let mut component = Array2::<f64>::zeros((p_total, p_total));
-        penalty.accumulate_weighted(&mut component, 1.0);
-        component_matrices.push(component);
-        component_nullities.push(p_total.saturating_sub(rank));
-    }
-    if component_matrices.is_empty() {
-        return Ok(Some(p_total));
-    }
-
-    Ok(Some(super::unified::exact_intersection_nullity(
-        &component_matrices,
-        &component_nullities,
-    )))
-}
-
 /// Result of a penalty pseudo-logdet computation.
 ///
 /// Holds the eigendecomposition and precomputed W-factor so that derivative
@@ -155,17 +105,6 @@ struct PenaltyBlockSpan {
     end: usize,
     rank_start: usize,
     rank_end: usize,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PenaltyBlockStructuralNullities {
-    block_nullities: Vec<Option<usize>>,
-}
-
-impl PenaltyBlockStructuralNullities {
-    fn get(&self, idx: usize) -> Option<usize> {
-        self.block_nullities.get(idx).copied().flatten()
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -187,20 +126,6 @@ pub struct PenaltyPseudologdet {
 }
 
 impl PenaltyPseudologdet {
-    fn structural_nullity_from_active_sum(s_unridged: &Array2<f64>) -> Result<usize, String> {
-        let p_dim = s_unridged.nrows();
-        if p_dim == 0 {
-            return Ok(0);
-        }
-
-        let (evals, _) = s_unridged
-            .eigh(Side::Lower)
-            .map_err(|e| format!("Penalty structural eigendecomposition failed: {e}"))?;
-        let threshold = super::unified::positive_eigenvalue_threshold(evals.as_slice().unwrap());
-        let rank = evals.iter().filter(|&&e| e > threshold).count();
-        Ok(p_dim - rank)
-    }
-
     /// Compute tr(A B) = Σ_i Σ_k A[i,k] B[k,i] without materializing the product.
     #[inline]
     fn trace_dense_product(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
