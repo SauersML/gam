@@ -12053,6 +12053,37 @@ fn apply_joint_penalized_hessian_into(
     out: &mut Array1<f64>,
     joint_full_width: Option<&crate::families::joint_penalty::JointPenaltyBundle>,
 ) -> Result<(), String> {
+    let mut penalty = Array1::<f64>::zeros(vector.len());
+    apply_joint_penalized_hessian_into_with_workspace(
+        source,
+        ranges,
+        s_lambdas,
+        diagonal_ridge,
+        vector,
+        out,
+        &mut penalty,
+        joint_full_width,
+    )
+}
+
+/// Variant of [`apply_joint_penalized_hessian_into`] that reuses a
+/// caller-supplied scratch buffer for the penalty term instead of
+/// allocating per call.  Use this in hot loops (e.g. the trust-region
+/// trial loop) where `penalty_scratch` and the output `out` are hoisted
+/// outside the loop and reused across attempts.
+///
+/// `penalty_scratch` must have the same length as `vector`; its contents
+/// are overwritten on every call.
+fn apply_joint_penalized_hessian_into_with_workspace(
+    source: &JointHessianSource,
+    ranges: &[(usize, usize)],
+    s_lambdas: &[Array2<f64>],
+    diagonal_ridge: f64,
+    vector: &Array1<f64>,
+    out: &mut Array1<f64>,
+    penalty_scratch: &mut Array1<f64>,
+    joint_full_width: Option<&crate::families::joint_penalty::JointPenaltyBundle>,
+) -> Result<(), String> {
     match source {
         JointHessianSource::Dense(h_joint) => {
             crate::faer_ndarray::fast_av_view_into(h_joint, vector, out.view_mut());
@@ -12061,16 +12092,16 @@ fn apply_joint_penalized_hessian_into(
             apply_into(vector, out)?;
         }
     }
-    let mut penalty = Array1::<f64>::zeros(vector.len());
+    penalty_scratch.fill(0.0);
     apply_joint_block_penalty_into(
         ranges,
         s_lambdas,
         vector,
         diagonal_ridge,
-        &mut penalty,
+        penalty_scratch,
         joint_full_width,
     );
-    *out += &penalty;
+    *out += &*penalty_scratch;
     Ok(())
 }
 

@@ -17777,6 +17777,10 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
             .map(Some)
     }
 
+    fn hessian_matvec_available(&self) -> bool {
+        true
+    }
+
     fn hessian_matvec(&self, beta_flat: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
         // Hv-action against the full coefficient Hessian is consumed by inner
         // PCG / inner-Newton paths (not outer-only score), so the row mask

@@ -1787,6 +1787,7 @@ mod pirls_row_gpu_tests {
                 backend,
                 family,
                 curvature,
+                1.0,
                 &stream,
                 n,
                 &eta_dev,

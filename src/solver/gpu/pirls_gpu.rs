@@ -1292,7 +1292,12 @@ extern "C" __global__ void status_or(
         y_host: ArrayView1<'_, f64>,
         prior_w_host: ArrayView1<'_, f64>,
         penalty_hessian: ArrayView2<'_, f64>,
+        /// Temporary LM damping for the Newton solves only; never enters
+        /// RidgePassport / exported Hessian / EDF / penalty term.
         lm_ridge: f64,
+        /// Real model-objective ridge; enters RidgePassport / exported
+        /// Hessian / EDF / penalty term.
+        objective_ridge: f64,
         max_iter: usize,
         tol: f64,
         extra: Option<&PirlsLoopExtra<'_>>,
