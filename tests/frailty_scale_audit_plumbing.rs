@@ -30,11 +30,10 @@
 //! evaluation time, ensuring outer-loop σ updates (which rebuild the family
 //! with a new fixed σ) are reflected without requiring spec reconstruction.
 
-use gam::custom_family::FamilyLinearizationState;
+use gam::custom_family::{BlockEffectiveJacobian, FamilyLinearizationState, ParameterBlockSpec};
 use gam::families::survival_marginal_slope::LogslopeBlockJacobian;
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
 use gam::solver::identifiability_audit::audit_identifiability;
-use gam::custom_family::ParameterBlockSpec;
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
 
