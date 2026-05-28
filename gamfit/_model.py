@@ -557,39 +557,45 @@ class MultinomialModel:
 
     # ------------------------------------------------------------------ summary
     def summary(self) -> str:
-        """Human-readable summary covering convergence, classes, and per-class edf.
+        """Human-readable summary covering convergence, classes, per-class λ and edf.
 
-        Slice A reports the *unpenalized* coefficient-block edf — under a
-        uniform λ the active-class effective-degrees-of-freedom degenerate
-        to the per-class column count `P` (one block of unpenalised score
-        warps). Once REML wiring lands the next slice this method will
-        report the correct hat-matrix trace per class.
+        REML-driven path: the Rust core selects per-active-class λ via the
+        outer Laplace/REML loop, so this method reports both the selected
+        λ_a and the per-class hat-matrix trace (effective degrees of
+        freedom) when the inference block is available.
         """
         meta = self._metadata
         p = int(meta["p_per_class"])
         m = int(meta["n_active_classes"])
         levels = list(meta["class_levels"])
         ref = int(meta["reference_class_index"])
+        lambdas = list(meta.get("lambdas", []))
+        edf_per_class = meta.get("edf_per_class")
         lines = [
             f"MultinomialModel formula: {meta['formula']}",
             f"  classes: {levels}  (reference = {levels[ref]!r})",
             f"  active classes (K-1): {m}",
             f"  coefficients per class (P): {p}",
             f"  total coefficients: {p * m}",
-            f"  lambda: {float(meta['lambda']):.6g}",
             f"  iterations: {int(meta['iterations'])}  converged: {bool(meta['converged'])}",
             f"  deviance: {float(meta['deviance']):.6g}",
             f"  penalized -log L: {float(meta['penalized_neg_log_likelihood']):.6g}",
         ]
-        # Per-class slope-norm rollup: a quick orientation pass over what
-        # each class learned relative to the reference. Coefficients are
-        # stored in row-major `(P, K-1)` order; column `a` is class
+        # Per-class slope-norm + REML λ + hat-matrix trace rollup. Coefficients
+        # are stored in row-major `(P, K-1)` order; column `a` is class
         # `levels[a]`.
         coefs = list(meta["coefficients_flat"])
         for a in range(m):
             class_block = coefs[a * p : (a + 1) * p]
             norm = math.sqrt(sum(c * c for c in class_block))
-            lines.append(f"    class {levels[a]!r} vs ref: ‖β_a‖₂ = {norm:.4g}")
+            row_bits = [f"‖β_a‖₂ = {norm:.4g}"]
+            if a < len(lambdas):
+                row_bits.append(f"λ = {float(lambdas[a]):.4g}")
+            if edf_per_class is not None and a < len(edf_per_class):
+                row_bits.append(f"edf = {float(edf_per_class[a]):.4g}")
+            lines.append(
+                f"    class {levels[a]!r} vs ref: " + ", ".join(row_bits)
+            )
         return "\n".join(lines)
 
     # ------------------------------------------------------------------ identity / repr
