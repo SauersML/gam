@@ -2401,6 +2401,8 @@ fn sys_htbeta_materialize_row(
         return row.htbeta.clone();
     }
     // Zero-sized or mismatched dense block: materialize via the matvec.
+    // SAFETY: reaching here with no htbeta_matvec is a programming error —
+    // the assembler must either populate htbeta or install htbeta_matvec.
     let op = sys.htbeta_matvec.as_ref().unwrap_or_else(|| {
         panic!(
             "row {row_idx}: htbeta shape {:?} != ({di}, {k}) and no htbeta_matvec installed",

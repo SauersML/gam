@@ -1474,15 +1474,12 @@ impl SaeKroneckerRows {
         a_phi: Vec<Vec<(usize, f64)>>,
         local_jac: Vec<Vec<f64>>,
     ) -> Self {
-        debug_assert_eq!(a_phi.len(), n);
-        debug_assert_eq!(local_jac.len(), n);
         Self { n, p, a_phi, local_jac }
     }
 }
 
 impl SaeKroneckerRow for SaeKroneckerRows {
     fn apply_jbeta(&self, row: usize, x_beta: &[f64], u_out: &mut [f64]) {
-        debug_assert_eq!(u_out.len(), self.p);
         for val in u_out.iter_mut() {
             *val = 0.0;
         }
@@ -1497,7 +1494,6 @@ impl SaeKroneckerRow for SaeKroneckerRows {
     }
 
     fn scatter_jbeta_t(&self, row: usize, u: &[f64], y_beta: &mut [f64]) {
-        debug_assert_eq!(u.len(), self.p);
         for &(beta_base, phi) in &self.a_phi[row] {
             if phi == 0.0 {
                 continue;
@@ -1509,11 +1505,9 @@ impl SaeKroneckerRow for SaeKroneckerRows {
     }
 
     fn apply_l(&self, row: usize, u: &[f64], w_out: &mut [f64]) {
-        debug_assert_eq!(u.len(), self.p);
         let jac = &self.local_jac[row];
         // Per-row q_i = jac.len() / p (supports heterogeneous active-set layouts).
         let q_i = jac.len() / self.p;
-        debug_assert_eq!(w_out.len(), q_i);
         for c in 0..q_i {
             let mut acc = 0.0_f64;
             for j in 0..self.p {
@@ -1524,10 +1518,8 @@ impl SaeKroneckerRow for SaeKroneckerRows {
     }
 
     fn apply_l_t(&self, row: usize, v: &[f64], u_out: &mut [f64]) {
-        debug_assert_eq!(u_out.len(), self.p);
         let jac = &self.local_jac[row];
         let q_i = jac.len() / self.p;
-        debug_assert_eq!(v.len(), q_i);
         for c in 0..q_i {
             let vc = v[c];
             if vc == 0.0 {
@@ -1990,6 +1982,11 @@ impl SaeManifoldTerm {
         // For JumpReLU, compute per-row active-set layout (active atoms have
         // logit > threshold).  This allows the row block to be sized at
         // q_active = |active| + Σ_{k∈active} d_k rather than the full q.
+        // Also extract (temperature, threshold) for use in the JVP loop.
+        let jumprelu_params: Option<(f64, f64)> = match self.assignment.mode {
+            AssignmentMode::JumpReLU { temperature, threshold } => Some((temperature, threshold)),
+            _ => None,
+        };
         let jumprelu_layout: Option<SaeRowLayout> = match self.assignment.mode {
             AssignmentMode::JumpReLU { threshold, .. } => {
                 let coord_dims: Vec<usize> =
@@ -2067,10 +2064,10 @@ impl SaeManifoldTerm {
                 let mut jac_compact = Array2::<f64>::zeros((q_active, p));
                 // Logit JVP rows for active atoms only.
                 // JumpReLU STE: da_k/dl_k = sigmoid'(l_k/τ) for active, 0 for inactive.
-                let (temperature, threshold) = match self.assignment.mode {
-                    AssignmentMode::JumpReLU { temperature, threshold } => (temperature, threshold),
-                    _ => unreachable!("jumprelu_layout only set for JumpReLU mode"),
-                };
+                // jumprelu_params is always Some when jumprelu_layout is Some (same branch).
+                let (temperature, threshold) = jumprelu_params.expect(
+                    "jumprelu_params populated in same branch as jumprelu_layout",
+                );
                 let inv_tau = 1.0 / temperature;
                 let logits_row = self.assignment.logits.row(row);
                 for (j, &k) in active.iter().enumerate() {

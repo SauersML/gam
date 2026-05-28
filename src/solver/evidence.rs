@@ -702,9 +702,11 @@ pub fn ift_du_drho(
                 // violation against the joint-evidence capability surface.
                 return Array2::<f64>::from_elem((total_len, r), f64::NAN);
             }
-            let rhs_i = rhs.slice_mut(ndarray::s![..di]);
-            for c in 0..di {
-                rhs_i[c] = gu_rho[[row_base + c, a]] + htbeta_i[c];
+            {
+                let mut rhs_i = rhs.slice_mut(ndarray::s![..di]);
+                for c in 0..di {
+                    rhs_i[c] = gu_rho[[row_base + c, a]] + htbeta_i[c];
+                }
             }
             let rhs_slice = rhs.slice(ndarray::s![..di]).to_owned();
             // u_ρ_i = -H_uu_i⁻¹ rhs_i, undamped factor.
