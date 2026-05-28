@@ -5269,19 +5269,6 @@ impl RowPrimaryEvalCache {
         }
     }
 
-    /// Returns the host-side neglog and grad slices when the cache is in the
-    /// Device variant. Used by the fused gradient pass to avoid a second row
-    /// kernel pass even when the Hessian lives on the GPU.
-    #[cfg(target_os = "linux")]
-    #[inline]
-    pub(crate) fn device_neglog_grad(
-        &self,
-    ) -> Option<(&std::sync::Arc<[f64]>, &std::sync::Arc<[f64]>)> {
-        match self {
-            Self::Device { neglog, grad, .. } => Some((neglog, grad)),
-            _ => None,
-        }
-    }
 }
 
 /// Shared precomputed state plus pre-solved per-row contexts. All row
