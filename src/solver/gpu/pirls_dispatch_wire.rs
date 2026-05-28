@@ -53,6 +53,11 @@ mod linux_impl {
         /// Transformed dense penalty `S_λ` in transformed coordinates,
         /// shape `p × p`.
         pub s_transformed: ArrayView2<'a, f64>,
+        /// Linear shift `b` of the penalty `βᵀSβ − 2βᵀb + c`, length `p`.
+        /// Mirrors `PirlsPenalty::linear_shift()` in the CPU oracle.
+        pub linear_shift: ArrayView1<'a, f64>,
+        /// Constant shift `c` of the penalty `βᵀSβ − 2βᵀb + c`.
+        pub constant_shift: f64,
         /// Response vector `y`, length `n`.
         pub y: ArrayView1<'a, f64>,
         /// Prior weights, length `n`.

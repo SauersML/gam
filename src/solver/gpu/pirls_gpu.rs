@@ -2947,9 +2947,12 @@ pub fn pirls_loop_on_stream(
     /// Active Gamma dispersion shape (α > 0). Pass `1.0` for non-Gamma fits.
     gamma_shape: f64,
     beta0: ndarray::ArrayView1<'_, f64>,
-    y: ndarray::ArrayView1<'_, f64>,
-    prior_w: ndarray::ArrayView1<'_, f64>,
     penalty_hessian: ndarray::ArrayView2<'_, f64>,
+    /// Linear shift `b` for the shifted-quadratic penalty `βᵀSβ−2βᵀb+c`.
+    /// Pass a zero-length or all-zero slice for fits with no prior-mean shift.
+    linear_shift: ndarray::ArrayView1<'_, f64>,
+    /// Constant shift `c` for the shifted-quadratic penalty. Pass `0.0` when absent.
+    constant_shift: f64,
     step_lm_lambda: f64,
     objective_ridge: f64,
     max_iter: usize,
@@ -2964,9 +2967,9 @@ pub fn pirls_loop_on_stream(
         curvature,
         gamma_shape,
         beta0,
-        y,
-        prior_w,
         penalty_hessian,
+        linear_shift,
+        constant_shift,
         step_lm_lambda,
         objective_ridge,
         max_iter,

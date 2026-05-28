@@ -3496,24 +3496,18 @@ impl JacobiPreconditioner {
     ) -> Result<Self, ArrowSchurError> {
         let block_offsets = &sys.block_offsets;
         let mut blocks = Vec::with_capacity(block_offsets.len());
+        // Get the penalty op once; effective_penalty_op() may clone hbb for
+        // the dense fallback path so we avoid repeated clones inside the loop.
+        let penalty_op = sys.effective_penalty_op();
 
-        for range in block_offsets.iter() {
+        for (block_idx, range) in block_offsets.iter().enumerate() {
             let b = range.end - range.start;
             // Initialise the b×b Schur sub-block from H_ββ + ridge·I via
             // BetaPenaltyOp::block (#296). Structured ops (BlockPenaltyOp,
             // KroneckerPenaltyOp) fill only the entries they own; the rest
             // remain zero. DensePenaltyOp fills the full b×b submatrix.
             let mut schur_block = Array2::<f64>::zeros((b, b));
-            {
-                let op = sys.effective_penalty_op();
-                let block_id = BetaBlockId(
-                    block_offsets
-                        .iter()
-                        .position(|r| r == range)
-                        .unwrap_or(0),
-                );
-                op.block(block_id, block_offsets.as_ref(), &mut schur_block);
-            }
+            penalty_op.block(BetaBlockId(block_idx), block_offsets.as_ref(), &mut schur_block);
             for bi in 0..b {
                 schur_block[[bi, bi]] += ridge_beta;
             }
