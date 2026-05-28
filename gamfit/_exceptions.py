@@ -36,6 +36,13 @@ _rust = rust_module()
 
 GamError: type = _rust.GamError
 FormulaError: type = _rust.FormulaError
+# `ColumnNotFoundError` subclasses `FormulaError` (referencing a missing
+# column is a formula authoring error). Instances carry structured
+# attributes set by the Rust FFI boundary at raise time — `column` (str),
+# `role` (Optional[str]), `available` (list[str]), `similar` (list[str]),
+# `tsv_hint` (bool) — so `explain_error(...)` and any other consumer can
+# read the failure context without parsing the formatted message.
+ColumnNotFoundError: type = _rust.ColumnNotFoundError
 SchemaMismatchError: type = _rust.SchemaMismatchError
 PredictionError: type = _rust.PredictionError
 

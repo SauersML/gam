@@ -192,6 +192,7 @@ from .recipes import (
 from ._exceptions import (
     BasisError,
     CalibratorError,
+    ColumnNotFoundError,
     EigendecompositionError,
     FormulaError,
     GamError,
