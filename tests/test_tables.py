@@ -23,7 +23,7 @@ def test_normalize_table_rejects_zero_row_mapping() -> None:
 def test_restore_output_table_rejects_unknown_return_type() -> None:
     with pytest.raises(ValueError, match="unsupported return_type 'arrowish'"):
         restore_output_table(
-            {"mean": [1.0], "eta": [0.0]},
+            {"mean": [1.0], "linear_predictor": [0.0]},
             requested="arrowish",
             input_kind="mapping",
             training_kind=None,
@@ -34,22 +34,22 @@ def test_restore_output_table_supports_pyarrow_output() -> None:
     pyarrow = pytest.importorskip("pyarrow")
 
     restored = restore_output_table(
-        {"mean": [1.0, 2.0], "eta": [0.0, 0.5]},
+        {"mean": [1.0, 2.0], "linear_predictor": [0.0, 0.5]},
         requested="pyarrow",
         input_kind="mapping",
         training_kind=None,
     )
 
     assert isinstance(restored, pyarrow.Table)
-    assert restored.column_names == ["mean", "eta"]
-    assert restored.to_pydict() == {"mean": [1.0, 2.0], "eta": [0.0, 0.5]}
+    assert restored.column_names == ["mean", "linear_predictor"]
+    assert restored.to_pydict() == {"mean": [1.0, 2.0], "linear_predictor": [0.0, 0.5]}
 
 
 def test_restore_output_table_prefers_pyarrow_training_kind() -> None:
     pyarrow = pytest.importorskip("pyarrow")
 
     restored = restore_output_table(
-        {"mean": [1.0], "eta": [0.0]},
+        {"mean": [1.0], "linear_predictor": [0.0]},
         requested=None,
         input_kind="mapping",
         training_kind="pyarrow",

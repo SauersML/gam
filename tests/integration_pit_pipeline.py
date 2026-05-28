@@ -94,9 +94,9 @@ def merge_z_into_study(study_csv, pred_csv, out_csv) -> None:
             f"PIT prediction row mismatch: got {len(preds)} rows for {len(study)} study rows"
         )
     for s, p in zip(study, preds):
-        s["z"] = p["eta"]
+        s["z"] = p["linear_predictor"]
     write_csv(study, out_csv)
-    zs = [float(p["eta"]) for p in preds]
+    zs = [float(p["linear_predictor"]) for p in preds]
     n = len(zs)
     z_mean = sum(zs) / n
     z_sd = (sum((z - z_mean) ** 2 for z in zs) / n) ** 0.5
