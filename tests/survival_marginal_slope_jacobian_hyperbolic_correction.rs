@@ -502,7 +502,17 @@ fn check_logslope_jacobian(
         &data.z,
         s_f,
     );
-    let fd = fd_jacobian(&data.phi, beta_logslope, q0, q1, qd1, &data.z, s_f);
+    let beta_arr = Array1::from(beta_logslope.to_vec());
+    let phi_ref = &data.phi;
+    let q0_ref = q0;
+    let q1_ref = q1;
+    let qd1_ref = qd1;
+    let z_ref = &data.z;
+    let fd = finite_diff_jacobian(
+        |b| compute_eta_stack(phi_ref, b.as_slice().unwrap(), q0_ref, q1_ref, qd1_ref, z_ref, s_f),
+        &beta_arr,
+        1e-6,
+    );
     let rel_err = max_col_rel_error(&analytic, &fd);
     assert!(
         rel_err < 1e-5,
@@ -523,11 +533,21 @@ fn check_effective_jacobian_matches_fd(
     s_f: f64,
     label: &str,
 ) {
-    let state = FamilyLinearizationState { beta, family_scalars, channel_hessian: None };
+    let state = FamilyLinearizationState { beta, family_scalars, channel_hessian: None, probit_frailty_scale: s_f };
     let jac = spec
         .effective_jacobian_at("test", &state)
         .unwrap_or_else(|e| panic!("{label}: effective_jacobian_at failed: {e}"));
-    let fd = fd_jacobian(phi, beta, q0, q1, qd1, z, s_f);
+    let beta_arr = Array1::from(beta.to_vec());
+    let phi_ref = phi;
+    let q0_ref = q0;
+    let q1_ref = q1;
+    let qd1_ref = qd1;
+    let z_ref = z;
+    let fd = finite_diff_jacobian(
+        |b| compute_eta_stack(phi_ref, b.as_slice().unwrap(), q0_ref, q1_ref, qd1_ref, z_ref, s_f),
+        &beta_arr,
+        1e-6,
+    );
     let rel_err = max_col_rel_error(&jac, &fd);
     assert!(
         rel_err < 1e-5,
