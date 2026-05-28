@@ -7843,10 +7843,10 @@ mod tests {
     use super::{
         ChunkedKernelDesignOperator, CoefficientTransformOperator, DenseDesignMatrix,
         DenseDesignOperator, DesignMatrix, EmbeddedColumnBlock, MultiChannelOperator,
-        ReparamOperator, ResidualisedDesignOperator, RowwiseKroneckerOperator, SparseDesignMatrix,
-        SparseHessianAccumulator, dense_matvec, dense_operator_to_dense_by_chunks,
-        dense_transpose_matvec, dense_transpose_weighted_response, dense_xtwx_view,
-        streaming_sparse_csc_xt_diag_x,
+        PsdWeightsView, ReparamOperator, ResidualisedDesignOperator, RowwiseKroneckerOperator,
+        SparseDesignMatrix, SparseHessianAccumulator, dense_matvec,
+        dense_operator_to_dense_by_chunks, dense_transpose_matvec,
+        dense_transpose_weighted_response, dense_xtwx_view, streaming_sparse_csc_xt_diag_x,
     };
     use crate::linalg::matrix::LinearOperator;
     use crate::linalg::utils::{PcgSolveInfo, StableSolver};
