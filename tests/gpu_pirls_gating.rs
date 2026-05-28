@@ -258,7 +258,7 @@ fn gpu_pirls_gating_2_penalty_gradient_sign_and_shift() {
 // ---------------------------------------------------------------------------
 #[test]
 fn gpu_pirls_gating_3_offset_parity() {
-    if !cuda_selected() {
+    if let GpuGate::Skip = gpu_gate("gpu_pirls_gating_3_offset_parity") {
         return;
     }
 
@@ -344,7 +344,7 @@ fn gpu_pirls_gating_3_offset_parity() {
 // ---------------------------------------------------------------------------
 #[test]
 fn gpu_pirls_gating_4_penalized_line_search_rejects_unpenalized_step() {
-    if !cuda_selected() {
+    if let GpuGate::Skip = gpu_gate("gpu_pirls_gating_4_penalized_line_search_rejects_unpenalized_step") {
         return;
     }
 
@@ -431,7 +431,7 @@ fn gpu_pirls_gating_4_penalized_line_search_rejects_unpenalized_step() {
 // ---------------------------------------------------------------------------
 #[test]
 fn gpu_pirls_gating_5_qs_basis_semantics() {
-    if !cuda_selected() {
+    if let GpuGate::Skip = gpu_gate("gpu_pirls_gating_5_qs_basis_semantics") {
         return;
     }
 

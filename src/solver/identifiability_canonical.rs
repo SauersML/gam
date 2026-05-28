@@ -617,16 +617,17 @@ pub fn canonicalize_for_identifiability(
         per_block_transform.push(t_i);
     }
 
-    // ── Post-T invariant check ────────────────────────────────────────────
+    // ── Post-T invariant check + MAP uniqueness check ────────────────────
     //
     // Materialise the joint post-T Jacobian J_can = J · T_full where
     // J is the (n*k × p_total) stacked Jacobian and T_full is block-diagonal
     // of the per-block T_i.  Assert rank(J_can) == rank(J_pre_T).
     //
-    // This catches bugs in the T construction (wrong kept-column mapping,
-    // off-by-one indexing, etc.) before they silently degrade the fit.
-    // The check is run unconditionally — at GAM smooth widths (p_total ≪ n)
-    // the RRQR on J_can is cheap.
+    // After confirming the rank invariant, run the MAP uniqueness check:
+    //   ker(J^T W J) ∩ ker(S) = {0}
+    // where S = blockdiag of the reduced-spec joint penalty.  If any null
+    // direction of J^T W J also lies in ker(S), the MAP is non-unique —
+    // refuse with MapUniquenessFailure naming the dominant block.
     {
         let p_total_raw: usize = specs.iter().map(|s| s.design.ncols()).sum();
         let p_total_red: usize = per_block_transform.iter().map(|t| t.ncols()).sum();
@@ -730,6 +731,72 @@ pub fn canonicalize_for_identifiability(
                     block_shapes.join(", "),
                 ),
             });
+        }
+
+        // ── MAP uniqueness check ──────────────────────────────────────────
+        //
+        // Build the joint penalty S = blockdiag(sum_of_reduced_penalties_block_i)
+        // in the reduced parameter space (p_total_red × p_total_red).
+        // Each block's total penalty is the sum of its per-lambda penalty
+        // matrices (all with equal weight 1.0 — the uniqueness condition is
+        // independent of the specific λ values since we only need to know
+        // whether ANY penalty covers the direction, not the magnitude).
+        if p_total_red > 0 {
+            let mut s_joint = Array2::<f64>::zeros((p_total_red, p_total_red));
+            let mut red_off = 0usize;
+            for spec in reduced_specs.iter() {
+                let r_i = spec.design.ncols();
+                for pen in spec.penalties.iter() {
+                    let s_dense = pen.as_dense_cow();
+                    // s_dense is (r_i, r_i).  Add it into the diagonal block.
+                    if s_dense.nrows() == r_i && s_dense.ncols() == r_i {
+                        for ii in 0..r_i {
+                            for jj in 0..r_i {
+                                s_joint[[red_off + ii, red_off + jj]] += s_dense[[ii, jj]];
+                            }
+                        }
+                    }
+                }
+                red_off += r_i;
+            }
+
+            // Build col_offsets for the reduced specs.
+            let mut red_col_offsets: Vec<usize> = Vec::with_capacity(reduced_specs.len() + 1);
+            red_col_offsets.push(0);
+            for spec in reduced_specs.iter() {
+                let prev = *red_col_offsets.last().unwrap();
+                red_col_offsets.push(prev + spec.design.ncols());
+            }
+
+            // The MAP uniqueness check operates on the flat (n_rows, p_total_red)
+            // view of J_can.  For multi-channel families (k > 1), the channel
+            // stacking increases the effective row count but the penalty still
+            // lives in p_total_red dimensions.  We use the (nk, p_total_red)
+            // J_can directly: the additional channel rows only help — if J^T W J
+            // (with J being the full nk-row matrix) already has a non-trivial
+            // null space, those extra rows could only shrink it relative to the
+            // flat view.  Using the full J_can gives the tightest (most
+            // conservative) null-space detection.
+            crate::solver::identifiability_audit::check_map_uniqueness(
+                &j_can,
+                &[],
+                &s_joint,
+                &reduced_specs,
+                &red_col_offsets,
+            )
+            .map_err(|error| {
+                log::warn!(
+                    "[CANON] MAP uniqueness check failed: {}",
+                    error.message,
+                );
+                CustomFamilyError::MapUniquenessFailure { error }
+            })?;
+
+            log::debug!(
+                "[CANON] MAP uniqueness check passed \
+                 (p_red={p_total_red} penalty_blocks={})",
+                reduced_specs.iter().map(|s| s.penalties.len()).sum::<usize>(),
+            );
         }
     }
 

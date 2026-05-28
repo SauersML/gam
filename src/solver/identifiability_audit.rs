@@ -314,6 +314,7 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
         beta: &zeros_beta,
         family_scalars: None,
         channel_hessian: None,
+        probit_frailty_scale: 1.0,
     };
     for (idx, spec) in specs.iter().enumerate() {
         // Use spec.effective_jacobian_at() so the audit operates on the β-dependent
