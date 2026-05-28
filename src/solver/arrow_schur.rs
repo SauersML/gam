@@ -1631,12 +1631,78 @@ impl ArrowSchurSystem {
     /// Return the effective penalty operator: the installed `penalty_op` if
     /// present, otherwise a `DensePenaltyOp` wrapping the current `hbb`.
     ///
-    /// All hot paths call this once and dispatch through the trait, so there
-    /// is no parallel dense branch — `DensePenaltyOp` IS the dense path.
+    /// Note: when `penalty_op` is `None`, this clones `hbb` into a new
+    /// `DensePenaltyOp`. Callers in hot loops should call this once and
+    /// store the result, not call it per-iteration.
     pub fn effective_penalty_op(&self) -> Arc<dyn BetaPenaltyOp> {
         match self.penalty_op.as_ref() {
             Some(op) => Arc::clone(op),
             None => Arc::new(DensePenaltyOp(self.hbb.clone())),
+        }
+    }
+
+    /// `y += P x` without allocating a new Arc; dispatches to `penalty_op`
+    /// or falls back to `hbb` inline, avoiding the K×K clone hot-path cost.
+    #[inline]
+    fn penalty_matvec_add(&self, x: &[f64], y: &mut [f64]) {
+        if let Some(op) = self.penalty_op.as_ref() {
+            op.matvec(x, y);
+        } else {
+            let k = self.hbb.nrows();
+            for a in 0..k {
+                let mut acc = 0.0_f64;
+                for b in 0..k {
+                    acc += self.hbb[[a, b]] * x[b];
+                }
+                y[a] += acc;
+            }
+        }
+    }
+
+    /// `diag += diag(P)` without allocating; dispatches to `penalty_op`
+    /// or falls back to `hbb` diagonal / `hbb_diag` inline.
+    #[inline]
+    fn penalty_diagonal_add(&self, diag: &mut [f64]) {
+        if let Some(op) = self.penalty_op.as_ref() {
+            op.diagonal(diag);
+        } else if let Some(hbb_diag) = self.hbb_diag.as_ref() {
+            let k = hbb_diag.len().min(diag.len());
+            for j in 0..k {
+                diag[j] += hbb_diag[j];
+            }
+        } else {
+            let k = self.hbb.nrows().min(diag.len());
+            for j in 0..k {
+                diag[j] += self.hbb[[j, j]];
+            }
+        }
+    }
+
+    /// Add the `b×b` penalty sub-block for `id` to `out`, routing through
+    /// `penalty_op` or falling back to `hbb` / `hbb_diag` inline.
+    #[inline]
+    fn penalty_block_add(
+        &self,
+        id: BetaBlockId,
+        offsets: &[Range<usize>],
+        out: &mut Array2<f64>,
+    ) {
+        if let Some(op) = self.penalty_op.as_ref() {
+            op.block(id, offsets, out);
+        } else {
+            let range = &offsets[id.0];
+            let b = range.end - range.start;
+            if self.hbb.dim() == (self.k, self.k) {
+                for bi in 0..b {
+                    for bj in 0..b {
+                        out[[bi, bj]] += self.hbb[[range.start + bi, range.start + bj]];
+                    }
+                }
+            } else if let Some(hbb_diag) = self.hbb_diag.as_ref() {
+                for bi in 0..b {
+                    out[[bi, bi]] += hbb_diag[range.start + bi];
+                }
+            }
         }
     }
 
@@ -3033,13 +3099,13 @@ pub fn arrow_damped_quadratic_model_reduction(
     let mut lin = sys.gb.dot(&delta_beta);
     let mut quad = ridge_beta * delta_beta.dot(&delta_beta);
 
-    // Route H_ββ · Δβ through BetaPenaltyOp trait (#296).
+    // Route H_ββ · Δβ through penalty_matvec_add (#296):
+    // no Arc-clone; dispatches inline to penalty_op or hbb.
     let mut hbb_delta = Array1::<f64>::zeros(sys.k);
     {
-        let op = sys.effective_penalty_op();
         let x_slice = delta_beta.as_slice().expect("delta_beta must be contiguous");
         let y_slice = hbb_delta.as_slice_mut().expect("hbb_delta must be contiguous");
-        op.matvec(x_slice, y_slice);
+        sys.penalty_matvec_add(x_slice, y_slice);
     }
     quad += delta_beta.dot(&hbb_delta);
 
@@ -3397,14 +3463,12 @@ fn schur_matvec<B: BatchedBlockSolver>(
     backend: &B,
 ) {
     let k = sys.k;
-    // Route the penalty-side H_ββ x product through the BetaPenaltyOp trait
-    // (#296). effective_penalty_op() returns a DensePenaltyOp wrapping sys.hbb
-    // when no structured op is installed, preserving existing behaviour.
+    // Route the penalty-side H_ββ x product through penalty_matvec_add (#296):
+    // no Arc-clone hot-path cost when penalty_op is None (falls back to hbb inline).
     {
-        let op = sys.effective_penalty_op();
         let x_slice = x.as_slice().expect("x must be contiguous");
         let out_slice = out.as_slice_mut().expect("out must be contiguous");
-        op.matvec(x_slice, out_slice);
+        sys.penalty_matvec_add(x_slice, out_slice);
         for a in 0..k {
             out_slice[a] += ridge_beta * x_slice[a];
         }
@@ -3525,12 +3589,12 @@ impl JacobiPreconditioner {
         backend: &B,
     ) -> Result<Self, ArrowSchurError> {
         let k = sys.k;
-        // Extract diagonal of H_ββ via BetaPenaltyOp trait (#296).
+        // Extract diagonal of H_ββ via penalty_diagonal_add (#296):
+        // no Arc-clone; falls back to hbb_diag or hbb[[a,a]] inline.
         let mut diag = Array1::<f64>::zeros(k);
         {
-            let op = sys.effective_penalty_op();
             let diag_slice = diag.as_slice_mut().expect("diag must be contiguous");
-            op.diagonal(diag_slice);
+            sys.penalty_diagonal_add(diag_slice);
         }
         for a in 0..k {
             diag[a] += ridge_beta;
@@ -3592,18 +3656,14 @@ impl JacobiPreconditioner {
     ) -> Result<Self, ArrowSchurError> {
         let block_offsets = &sys.block_offsets;
         let mut blocks = Vec::with_capacity(block_offsets.len());
-        // Get the penalty op once; effective_penalty_op() may clone hbb for
-        // the dense fallback path so we avoid repeated clones inside the loop.
-        let penalty_op = sys.effective_penalty_op();
 
         for (block_idx, range) in block_offsets.iter().enumerate() {
             let b = range.end - range.start;
             // Initialise the b×b Schur sub-block from H_ββ + ridge·I via
-            // BetaPenaltyOp::block (#296). Structured ops (BlockPenaltyOp,
-            // KroneckerPenaltyOp) fill only the entries they own; the rest
-            // remain zero. DensePenaltyOp fills the full b×b submatrix.
+            // penalty_block_add (#296): routes to penalty_op or falls back to
+            // hbb / hbb_diag inline without Arc-clone per loop iteration.
             let mut schur_block = Array2::<f64>::zeros((b, b));
-            penalty_op.block(BetaBlockId(block_idx), block_offsets.as_ref(), &mut schur_block);
+            sys.penalty_block_add(BetaBlockId(block_idx), block_offsets.as_ref(), &mut schur_block);
             for bi in 0..b {
                 schur_block[[bi, bi]] += ridge_beta;
             }

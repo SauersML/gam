@@ -266,14 +266,8 @@ fn sigma_cubature_evaluate_gpu_stream_pool(
     }
 
     // Gamma dispersion shape: used by the Gamma-Log row kernel. All other
-    // families ignore this parameter (pirls_loop_on_stream passes it through
-    // to the row kernel, which is a no-op for non-Gamma families).
-    let gamma_shape = match &likelihood_spec.spec.response {
-        crate::types::ResponseFamily::Gamma => likelihood_spec
-            .gamma_shape()
-            .unwrap_or(1.0),
-        _ => 1.0,
-    };
+    // families ignore this parameter; pass 1.0 as the safe default.
+    let gamma_shape = likelihood_spec.gamma_shape().unwrap_or(1.0);
 
     try_gpu_sigma_stream_pool_eval(
         x_dense.view(),

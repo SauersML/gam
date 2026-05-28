@@ -1458,12 +1458,12 @@ pub struct SaeKroneckerRows {
     p: usize,
     /// Per-row sparse support: `a_phi[i]` is a `Vec<(beta_base_idx, weight)>`.
     a_phi: Vec<Vec<(usize, f64)>>,
-    /// Per-row local Jacobian `L_i`, shape `(q × p)` flattened row-major.
+    /// Per-row local Jacobian `L_i`, shape `(q_i × p)` flattened row-major.
     ///
     /// Element `(c, j)` is at `local_jac[i][c * p + j]`.
+    /// For heterogeneous (active-set) systems, each row may have a different
+    /// `q_i = local_jac[i].len() / p`.
     local_jac: Vec<Vec<f64>>,
-    /// Per-row `q` (row block dim; same for all rows in the SAE system).
-    q: usize,
 }
 
 impl SaeKroneckerRows {
@@ -1471,13 +1471,12 @@ impl SaeKroneckerRows {
     pub fn new(
         n: usize,
         p: usize,
-        q: usize,
         a_phi: Vec<Vec<(usize, f64)>>,
         local_jac: Vec<Vec<f64>>,
     ) -> Self {
         debug_assert_eq!(a_phi.len(), n);
         debug_assert_eq!(local_jac.len(), n);
-        Self { n, p, a_phi, local_jac, q }
+        Self { n, p, a_phi, local_jac }
     }
 }
 
@@ -1511,9 +1510,11 @@ impl SaeKroneckerRow for SaeKroneckerRows {
 
     fn apply_l(&self, row: usize, u: &[f64], w_out: &mut [f64]) {
         debug_assert_eq!(u.len(), self.p);
-        debug_assert_eq!(w_out.len(), self.q);
         let jac = &self.local_jac[row];
-        for c in 0..self.q {
+        // Per-row q_i = jac.len() / p (supports heterogeneous active-set layouts).
+        let q_i = jac.len() / self.p;
+        debug_assert_eq!(w_out.len(), q_i);
+        for c in 0..q_i {
             let mut acc = 0.0_f64;
             for j in 0..self.p {
                 acc += jac[c * self.p + j] * u[j];
@@ -1523,10 +1524,11 @@ impl SaeKroneckerRow for SaeKroneckerRows {
     }
 
     fn apply_l_t(&self, row: usize, v: &[f64], u_out: &mut [f64]) {
-        debug_assert_eq!(v.len(), self.q);
         debug_assert_eq!(u_out.len(), self.p);
         let jac = &self.local_jac[row];
-        for c in 0..self.q {
+        let q_i = jac.len() / self.p;
+        debug_assert_eq!(v.len(), q_i);
+        for c in 0..q_i {
             let vc = v[c];
             if vc == 0.0 {
                 continue;
@@ -2262,8 +2264,11 @@ impl SaeManifoldTerm {
         // `apply_riemannian_latent_geometry` does to `row.htbeta`, applied
         // here to the (q × p) kron_jac so the Kronecker htbeta_matvec uses
         // the Riemannian-projected form.
-        self.apply_sae_riemannian_geometry(&mut sys);
-        {
+        // Apply Riemannian geometry only for dense modes.  JumpReLU compact rows
+        // have heterogeneous q_i; the Riemannian projector path requires a uniform
+        // latent dimension and is not called when jumprelu_layout is active.
+        if jumprelu_layout.is_none() {
+            self.apply_sae_riemannian_geometry(&mut sys);
             let manifold = self.ext_coord_manifold();
             if !manifold.is_euclidean() {
                 let ext = self.ext_coord_matrix();
@@ -2272,14 +2277,16 @@ impl SaeManifoldTerm {
                     let t_i_owned: Vec<f64> = ext.row(row_idx).iter().copied().collect();
                     let t_i = ArrayView1::from(t_i_owned.as_slice());
                     let jac_flat = &mut kron_jac[row_idx];
-                    for c in 0..q {
+                    let q_row = jac_flat.len() / p;
+                    for c in 0..q_row {
                         for j in 0..p {
                             jac_mat[[c, j]] = jac_flat[c * p + j];
                         }
                     }
+                    let jac_view = jac_mat.slice(ndarray::s![..q_row, ..]).to_owned();
                     let projected =
-                        manifold.project_matrix_columns_to_tangent(t_i, jac_mat.view());
-                    for c in 0..q {
+                        manifold.project_matrix_columns_to_tangent(t_i, jac_view.view());
+                    for c in 0..q_row {
                         for j in 0..p {
                             jac_flat[c * p + j] = projected[[c, j]];
                         }
@@ -2294,7 +2301,7 @@ impl SaeManifoldTerm {
         // materializing the `(q × K·p)` block.  The closure is Arc-wrapped so
         // the Arrow-Schur solver can use it via `sys.htbeta_matvec`.
         {
-            let kron = Arc::new(SaeKroneckerRows::new(n, p, q, kron_a_phi, kron_jac));
+            let kron = Arc::new(SaeKroneckerRows::new(n, p, kron_a_phi, kron_jac));
             sys.set_row_htbeta_operator(move |row_idx, x, out| {
                 // Apply J_β^(row_idx) · x → out using the Kronecker form.
                 // x may or may not be contiguous; collect into a plain Vec
@@ -2328,6 +2335,8 @@ impl SaeManifoldTerm {
                 ops,
             }));
         }
+        // Store the active-set layout for `apply_newton_step`.
+        self.last_row_layout = jumprelu_layout;
         Ok(sys)
     }
 

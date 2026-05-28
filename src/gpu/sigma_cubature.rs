@@ -114,10 +114,13 @@ fn pool_size(m: usize) -> usize {
 /// result, `Ok(None)` when the device is unavailable (non-Linux or no
 /// runtime), `Err(_)` on driver / shape failure.
 pub fn try_gpu_sigma_stream_pool_eval(
-    per_sigma: &[SigmaPointGpuInput],
+    /// Original (pre-reparameterization) dense design matrix X_original, shape n × p.
+    /// Uploaded to device once and reused across all sigma points.
+    x_original: ndarray::ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
     prior_w: ArrayView1<'_, f64>,
     offset: ArrayView1<'_, f64>,
+    per_sigma: &[SigmaPointGpuInput],
     admission: crate::gpu::policy::PirlsLoopAdmission,
     /// Active Gamma dispersion shape (α > 0). Pass `1.0` for non-Gamma families.
     gamma_shape: f64,
@@ -141,10 +144,11 @@ pub fn try_gpu_sigma_stream_pool_eval(
         };
         let curvature = linux_impl::curvature_kind_to_row(admission.curvature);
         return linux_impl::stream_pool_eval(
-            per_sigma,
+            x_original,
             y,
             prior_w,
             offset,
+            per_sigma,
             family,
             curvature,
             gamma_shape,
@@ -155,7 +159,9 @@ pub fn try_gpu_sigma_stream_pool_eval(
 
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (y, prior_w, offset, admission, gamma_shape, convergence_tol, max_iter);
+        // Non-Linux: no CUDA runtime; all parameters are unused. Function
+        // parameters don't generate Rust unused-variable warnings so no
+        // suppression is needed.
         Ok(None)
     }
 }
@@ -201,10 +207,11 @@ mod linux_impl {
     }
 
     pub(super) fn stream_pool_eval(
-        per_sigma: &[SigmaPointGpuInput],
+        x_original: ndarray::ArrayView2<'_, f64>,
         y: ArrayView1<'_, f64>,
         prior_w: ArrayView1<'_, f64>,
         offset: ArrayView1<'_, f64>,
+        per_sigma: &[SigmaPointGpuInput],
         family: PirlsRowFamily,
         curvature: CurvatureMode,
         gamma_shape: f64,
@@ -215,15 +222,12 @@ mod linux_impl {
         use crate::solver::gpu::pirls_gpu;
 
         let m = per_sigma.len();
-        let first = &per_sigma[0];
-        let n = first.x_transformed.nrows();
-        let p = first.x_transformed.ncols();
+        let n = x_original.nrows();
+        let p = x_original.ncols();
 
         // Validate uniform shape across all sigma points.
-        for (idx, pt) in per_sigma.iter().enumerate().skip(1) {
-            if pt.x_transformed.nrows() != n
-                || pt.x_transformed.ncols() != p
-                || pt.s_transformed.shape() != [p, p]
+        for (idx, pt) in per_sigma.iter().enumerate() {
+            if pt.s_transformed.shape() != [p, p]
                 || pt.qs.shape() != [p, p]
             {
                 return Err(crate::gpu_err!(
@@ -232,12 +236,10 @@ mod linux_impl {
             }
         }
 
-        // Bootstrap shared data from the first sigma point to get a context +
-        // stream for workspace allocation.  Each point re-uploads x_transformed,
-        // y, prior_w, and offset (now required by upload_shared_pirls_gpu #258)
-        // into its own PirlsGpuSharedData; workspaces (n, p) are the same.
+        // Upload X_original, y, prior_w, offset once — shared across all sigma points.
+        // Per sigma point, only Qs changes; it gets uploaded via upload_qs_pirls.
         let bootstrap_shared =
-            pirls_gpu::upload_shared_pirls_gpu(first.x_transformed.view(), y, prior_w, offset)
+            pirls_gpu::upload_shared_pirls_gpu(x_original, y, prior_w, offset)
                 .map_err(|e| crate::gpu_err!("sigma stream pool bootstrap upload: {e}"))?;
 
         let n_streams = pool_size(m);
@@ -259,25 +261,21 @@ mod linux_impl {
         // have no warm-start; a zero seed matches the stateless CPU path.
         let beta0: Array1<f64> = Array1::zeros(p);
 
-        // For each sigma point, upload x_transformed into a fresh shared handle,
-        // run pirls_loop on the assigned stream workspace, collect outcomes.
+        // For each sigma point, upload Qs (small p×p) then run pirls_loop.
+        // X_original, y, prior_w, offset stay in bootstrap_shared throughout.
         let mut outcomes: Vec<SigmaPointResult> = Vec::with_capacity(m);
         for (idx, pt) in per_sigma.iter().enumerate() {
             let stream_idx = idx % n_streams;
 
-            // Upload this sigma point's X·Qs (changes per sigma point) plus the
-            // shared y, prior_w, offset (constant across all sigma points).
-            let shared =
-                pirls_gpu::upload_shared_pirls_gpu(pt.x_transformed.view(), y, prior_w, offset)
-                    .map_err(|e| {
-                        crate::gpu_err!("sigma stream pool upload pt[{idx}] shared: {e}")
-                    })?;
-
             let (ws, loop_ws) = &mut workspace_pairs[stream_idx];
+            // Upload this sigma point's Qs matrix to the workspace.
+            pirls_gpu::upload_qs_pirls(ws, pt.qs.view())
+                .map_err(|e| crate::gpu_err!("sigma stream pool upload Qs pt[{idx}]: {e}"))?;
+            let shared = &bootstrap_shared;
 
             // Use per-point linear_shift and constant_shift from SigmaPointGpuInput (#260).
             let outcome = pirls_gpu::pirls_loop_on_stream(
-                &shared,
+                shared,
                 ws,
                 loop_ws,
                 family,

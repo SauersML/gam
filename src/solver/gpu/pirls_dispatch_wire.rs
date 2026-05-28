@@ -163,6 +163,16 @@ mod linux_impl {
         if !cuda_selected() {
             return None;
         }
+        // Gaussian-identity fits have an exact GPU PLS path (issue #272) and
+        // must NOT be routed through the row-kernel PIRLS loop on device.
+        // The exact path (try_gpu_gaussian_pls_dispatch) fires before this
+        // dispatch site in fit_model_for_fixed_rho_with_adaptive_kkt.
+        // This gate ensures no future code path accidentally re-routes them
+        // here.  Tests that explicitly exercise the row kernel may bypass
+        // this gate by calling pirls_loop_on_stream directly.
+        if input.likelihood.spec.is_gaussian_identity() {
+            return None;
+        }
         let n = input.x_original.nrows();
         let p = input.x_original.ncols();
         // Engine-level admission: shape + family + curvature + runtime probe.
