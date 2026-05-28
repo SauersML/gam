@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use ndarray::{Array1, Array2, Array3};
 
-use crate::families::custom_family::PenaltyMatrix;
+use crate::families::custom_family::{FamilyChannelHessian, PenaltyMatrix};
 use crate::families::identifiability_compiler::{
     AnchorRowEvaluator, BlockOrder, RowHessian, RowJacobianOperator,
 };
@@ -150,6 +150,49 @@ impl RowHessian for SurvivalRowHessian {
         }
     }
     fn evaluate_full(&self) -> Array3<f64> {
+        self.h.clone()
+    }
+}
+
+/// `FamilyChannelHessian` for survival marginal-slope.
+///
+/// The 4×4 per-subject W_i is the Hessian of the row negative log-likelihood
+/// `ρ_i(q0, q1, qd1, g) = −δ_i log f(η_1, ad1) − (1−δ_i) log S(η_1) + log S(η_0)`
+/// with respect to the 4-vector primary state `(q0, q1, qd1, g)`.
+///
+/// Derivation of W_i entries (all from `row_primary_closed_form`):
+///
+/// - W[0,0] = u2_η0 · c²  (q0–q0; only η0 depends on q0)
+/// - W[1,1] = (u2_η1 + w·δ) · c²  (q1–q1; η1 and log-φ both depend on q1)
+/// - W[2,2] = w·δ · (∂ad1/∂qd1)² · (−1/ad1²)  (qd1–qd1 via neglog(ad1))
+/// - W[3,3] = u2_η0·(∂η0/∂g)² + u1_η0·(∂²η0/∂g²) + u2_η1·(∂η1/∂g)² + ...
+/// - W[0,3] = W[3,0] = u2_η0·c·(q0·c1 + s_f·z) + u1_η0·c1  (cross q0–g)
+/// - W[1,3] = W[3,1] = u2_η1·c·(q1·c1 + s_f·z) + u1_η1·c1  (cross q1–g)
+/// - W[2,3] = W[3,2] = u2_ad1·c·(qd1·c1) + u1_ad1·c1  (cross qd1–g)
+/// - All other off-diagonals are zero (η0, η1, ad1 depend on non-overlapping
+///   subsets of (q0,q1,qd1,g), and only g is shared across all three).
+///
+/// This is already computed by `row_primary_closed_form` and stored in
+/// `SurvivalRowHessian::h` after PSD-clamping.
+impl FamilyChannelHessian for SurvivalRowHessian {
+    fn n_outputs(&self) -> usize {
+        K_SURVIVAL
+    }
+
+    fn n_subjects(&self) -> usize {
+        self.h.shape()[0]
+    }
+
+    fn fill_subject(&self, i: usize, out: &mut [f64]) {
+        assert_eq!(out.len(), K_SURVIVAL * K_SURVIVAL);
+        for a in 0..K_SURVIVAL {
+            for b in 0..K_SURVIVAL {
+                out[a * K_SURVIVAL + b] = self.h[[i, a, b]];
+            }
+        }
+    }
+
+    fn evaluate_full(&self) -> ndarray::Array3<f64> {
         self.h.clone()
     }
 }

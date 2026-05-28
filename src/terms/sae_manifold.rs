@@ -3048,7 +3048,7 @@ impl SaeManifoldTerm {
                 initial_log_lambdas: Array1::<f64>::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-                row_scaling: None,
+                eta_row_scaling: None,
                 jacobian_callback: Some(cb),
             });
         }

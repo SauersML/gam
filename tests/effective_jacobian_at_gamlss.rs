@@ -166,6 +166,7 @@ fn make_state(beta: &[f64]) -> FamilyLinearizationState<'_> {
         beta,
         family_scalars: None,
         channel_hessian: None,
+        probit_frailty_scale: 1.0,
     }
 }
 
