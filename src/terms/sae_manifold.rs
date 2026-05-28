@@ -2720,48 +2720,32 @@ impl SaeManifoldTerm {
         }
 
         // When last_row_layout is set (JumpReLU compact mode), delta_ext_coord
-        // uses a variable-stride layout: row_offsets[i]..row_offsets[i+1].
-        // Expand each row back to full-q before applying.
+        // uses a variable-stride layout where row i occupies
+        // [compact_offset_i .. compact_offset_i + q_active_i].
+        // We expand each row back to full-q before applying.
         if let Some(ref layout) = self.last_row_layout.clone() {
-            // Compute expected total length from active sets.
             let total_len: usize = (0..n).map(|row| layout.row_q_active(row)).sum();
             if delta_ext_coord.len() != total_len {
                 return Err(format!(
-                    "SaeManifoldTerm::apply_newton_step: delta_ext_coord length {} != expected compact {}",
+                    "SaeManifoldTerm::apply_newton_step: compact delta_ext_coord length {} != expected {}",
                     delta_ext_coord.len(), total_len
                 ));
             }
-            // Expand to full-q and apply.
+            // Expand compact layout to full-q flat buffer.
             let mut full_delta = vec![0.0_f64; n * q];
             let mut compact_off = 0usize;
             for row in 0..n {
                 let q_active = layout.row_q_active(row);
-                let compact_row = delta_ext_coord.slice(ndarray::s![compact_off..compact_off + q_active]);
-                let out_slice = &mut full_delta[row * q..(row + 1) * q];
-                layout.expand_row(row, compact_row.as_slice().unwrap_or({
-                    // If not contiguous, collect.
-                    let v: Vec<f64> = compact_row.iter().copied().collect();
-                    // Can't use a temporary here - expand via collected.
-                    let mut tmp = vec![0.0_f64; q];
-                    layout.expand_row(row, &v, &mut tmp);
-                    let coord_offsets = self.assignment.coord_offsets();
-                    for atom_idx in 0..k_atoms {
-                        self.assignment.logits[[row, atom_idx]] +=
-                            step_size * tmp[atom_idx];
-                    }
-                    for atom_idx in 0..k_atoms {
-                        let d = self.assignment.coords[atom_idx].latent_dim();
-                        let off = coord_offsets[atom_idx];
-                        for axis in 0..d {
-                            out_slice[off + axis] = step_size * tmp[off + axis];
-                        }
-                    }
-                    compact_off += q_active;
-                    continue;
-                }), out_slice);
+                // Collect compact row (handles both contiguous and strided views).
+                let compact_row: Vec<f64> = delta_ext_coord
+                    .slice(ndarray::s![compact_off..compact_off + q_active])
+                    .iter()
+                    .copied()
+                    .collect();
+                layout.expand_row(row, &compact_row, &mut full_delta[row * q..(row + 1) * q]);
                 compact_off += q_active;
             }
-            // Apply logits.
+            // Apply logits from expanded buffer.
             for row in 0..n {
                 let row_base = row * q;
                 for atom_idx in 0..k_atoms {
@@ -2769,7 +2753,7 @@ impl SaeManifoldTerm {
                         step_size * full_delta[row_base + atom_idx];
                 }
             }
-            // Apply coords.
+            // Apply coords from expanded buffer.
             let coord_offsets = self.assignment.coord_offsets();
             for atom_idx in 0..k_atoms {
                 let d = self.assignment.coords[atom_idx].latent_dim();
