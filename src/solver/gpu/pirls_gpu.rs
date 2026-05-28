@@ -214,6 +214,11 @@ extern "C" __global__ void chol_logdet_col_major(
     /// `symmetrize_lower`: one thread per strict-lower pair `(j,k)` with
     /// `j > k`; copies `A[k + j*p] = A[j + k*p]` to fill the upper triangle.
     const FUSED_XTWX_PTX_SOURCE: &str = concat!(
+        // xtwx_lower: enumerate lower triangle row-by-row.
+        // Row j has entries (j,0),(j,1),...,(j,j).
+        // Cumulative offset before row j = j*(j+1)/2.
+        // Unrank t -> j = floor((sqrt(8t+1)-1)/2), k = t - j*(j+1)/2.
+        // Output: A[j + k*p] in col-major for j >= k.
         "extern \"C\" __global__ void xtwx_lower(",
         "const double* __restrict__ X,",
         "const double* __restrict__ w,",
@@ -221,15 +226,18 @@ extern "C" __global__ void chol_logdet_col_major(
         "int n, int p) {",
         "int t=blockIdx.x*blockDim.x+threadIdx.x;",
         "int np=p*(p+1)/2; if(t>=np)return;",
-        "int kv=(int)((__dsqrt_rn((double)(8*t+1))-1.0)*0.5);",
-        "while((kv+1)*(kv+2)/2<=t)kv++;",
-        "while(kv>0&&kv*(kv+1)/2>t)kv--;",
-        "int jv=t-kv*(kv+1)/2+kv;",
+        // j = floor((sqrt(8t+1)-1)/2); clamp for fp rounding
+        "int jv=(int)((__dsqrt_rn((double)(8*t+1))-1.0)*0.5);",
+        "while((long long)(jv+1)*(jv+2)/2<=t)jv++;",
+        "while(jv>0&&(long long)jv*(jv+1)/2>t)jv--;",
+        "int kv=t-(int)((long long)jv*(jv+1)/2);",
         "double acc=0.0;",
         "const double*Xj=X+(long long)jv*n;",
         "const double*Xk=X+(long long)kv*n;",
         "for(int i=0;i<n;++i)acc+=w[i]*Xj[i]*Xk[i];",
+        // col-major index: A[jv, kv] = A[jv + kv*p]
         "A[jv+(long long)kv*p]=acc;}",
+        // xtscore: one thread per output index j
         "extern \"C\" __global__ void xtscore(",
         "const double* __restrict__ X,",
         "const double* __restrict__ score,",
@@ -241,15 +249,21 @@ extern "C" __global__ void chol_logdet_col_major(
         "const double*Xj=X+(long long)j*n;",
         "for(int i=0;i<n;++i)acc+=score[i]*Xj[i];",
         "s[j]=acc;}",
+        // symmetrize_lower: strict lower pairs (j,k) with j>k.
+        // Enumerate row-by-row: row j=1 has entry (1,0); row j=2 has (2,0),(2,1); etc.
+        // Cumulative before row j: j*(j-1)/2.
+        // Unrank t -> j = floor((sqrt(8t+1)+1)/2), k = t - j*(j-1)/2.
         "extern \"C\" __global__ void symmetrize_lower(",
         "double* __restrict__ A, int p) {",
         "int ns=p*(p-1)/2;",
         "int t=blockIdx.x*blockDim.x+threadIdx.x;",
         "if(t>=ns)return;",
-        "int kv=(int)((__dsqrt_rn((double)(8*t+1))-1.0)*0.5);",
-        "while((kv+1)*(kv+2)/2<=t)kv++;",
-        "while(kv>0&&kv*(kv+1)/2>t)kv--;",
-        "int jv=t-kv*(kv+1)/2+kv+1;",
+        // j = floor((sqrt(8t+1)+1)/2); clamp
+        "int jv=(int)((__dsqrt_rn((double)(8*t+1))+1.0)*0.5);",
+        "while((long long)jv*(jv-1)/2>t)jv--;",
+        "while((long long)(jv+1)*jv/2<=t)jv++;",
+        "int kv=t-(int)((long long)jv*(jv-1)/2);",
+        // A[kv, jv] = A[kv + jv*p] = A[jv + kv*p] (copy lower to upper)
         "A[kv+(long long)jv*p]=A[jv+(long long)kv*p];}",
     );
 
@@ -2035,7 +2049,7 @@ extern "C" __global__ void status_or(
             - 2.0 * beta_host.dot(&linear_shift)
             + constant_shift;
         let mut prev_objective = prev_deviance + penalty_init;
-        let mut min_objective = prev_objective;
+
 
         // Diagnostic scalars surfaced on the outcome so the dispatch
         // wirer can populate WorkingModelPirlsResult / PirlsResult
@@ -2226,9 +2240,7 @@ extern "C" __global__ void status_or(
             if accepted_dev < min_dev {
                 min_dev = accepted_dev;
             }
-            if accepted_objective < min_objective {
-                min_objective = accepted_objective;
-            }
+
             prev_deviance = accepted_dev;
             prev_objective = accepted_objective;
 
