@@ -33,7 +33,6 @@ use std::sync::OnceLock;
 #[cfg(target_os = "linux")]
 use cudarc::driver::{CudaModule, CudaStream, LaunchConfig, PushKernelArg};
 
-#[cfg(target_os = "linux")]
 use super::error::GpuError;
 #[cfg(target_os = "linux")]
 use crate::gpu::error::GpuResultExt;
@@ -43,7 +42,6 @@ use crate::gpu_err;
 /// Hard ceiling on `r` (primary local dimension). Matches the BMS-FLEX row
 /// kernel's [`super::bms_flex_row::MAX_R`] so the same cached Hessian
 /// bundle can feed both kernels without revalidation.
-#[cfg(target_os = "linux")]
 pub(crate) const MAX_R: usize = super::bms_flex_row::MAX_R;
 
 /// `blockDim.x` for the per-row matvec / diagonal kernels. One CUDA block per
@@ -100,7 +98,6 @@ pub(crate) struct RowHessianDiagOutputs {
     pub d_rows: Vec<f64>,
 }
 
-#[cfg(target_os = "linux")]
 impl<'a> RowHessianMatvecInputs<'a> {
     /// Validate every shape the device kernel relies on.
     pub(crate) fn validate(&self) -> Result<(), GpuError> {
@@ -137,7 +134,6 @@ impl<'a> RowHessianMatvecInputs<'a> {
     }
 }
 
-#[cfg(target_os = "linux")]
 impl<'a> RowHessianDiagInputs<'a> {
     /// Validate every shape the device kernel relies on.
     pub(crate) fn validate(&self) -> Result<(), GpuError> {
@@ -447,7 +443,7 @@ pub(crate) fn cpu_row_hessian_diag(inputs: &RowHessianDiagInputs<'_>) -> Vec<f64
     d
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -456,7 +452,8 @@ mod tests {
     /// scrambled `A_i`, plus a per-row direction `v_i` with the same
     /// scrambling seed offset. Both `matvec` and `diag` parity tests
     /// share the same fixture so any regression in the cached-Hessian
-    /// upload path surfaces in both.
+    /// upload path surfaces in both. Only the GPU parity test consumes
+    /// this fixture, so it tracks that test's Linux gating.
     #[cfg(target_os = "linux")]
     fn make_fixture(n_rows: usize, r: usize) -> (Vec<f64>, Vec<f64>) {
         let mut h = vec![0.0_f64; n_rows * r * r];
@@ -489,7 +486,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn cpu_oracle_matches_handwritten_2x2() {
         // Two rows, r = 2 — small enough to verify by hand.
         // Row 0: H = [[2, 1], [1, 3]],  v = [1, -1]  => y = [1, -2]
@@ -517,7 +513,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn validate_rejects_mismatched_shapes() {
         let h_rows = vec![1.0; 8];
         let v_rows = vec![1.0; 3]; // wrong: should be 4 for n=2, r=2
@@ -551,91 +546,86 @@ mod tests {
         }
     }
 
-    /// CPU↔GPU parity for both kernels. Skips on non-Linux hosts and on
-    /// Linux hosts without a CUDA runtime, mirroring the convention in
+    /// CPU↔GPU parity for both kernels. The GPU launch entry points only
+    /// exist on Linux (cudarc is a Linux-only dependency), so the parity
+    /// test is gated to Linux as well. On Linux hosts without a CUDA
+    /// runtime the test skips at runtime, mirroring the convention in
     /// `bms_flex_row_kernel_matches_cpu_oracle_when_cuda_available`.
     ///
     /// Tolerances: abs ≤ 2e-8, rel ≤ 2e-7 per the Block 9 Phase 2/3
     /// charter. Fixture has r = 5 and n_rows = 4 to keep the test fast on
     /// CI while exercising both the strided thread loop (r < 32) and the
     /// per-row uploads.
+    #[cfg(target_os = "linux")]
     #[test]
     fn row_hessian_kernels_match_cpu_oracle_when_cuda_available() {
-        #[cfg(not(target_os = "linux"))]
-        {
-            eprintln!("[row_hessian_ops parity] non-Linux host — skipping CUDA parity");
+        let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+            eprintln!("[row_hessian_ops parity] no CUDA runtime — skipping CUDA parity");
             return;
-        }
-        #[cfg(target_os = "linux")]
-        {
-            let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
-                eprintln!("[row_hessian_ops parity] no CUDA runtime — skipping CUDA parity");
+        };
+        let n_rows = 4;
+        let r = 5;
+        let (h_rows, v_rows) = make_fixture(n_rows, r);
+
+        let matvec_inputs = RowHessianMatvecInputs {
+            n_rows,
+            r,
+            h_rows: &h_rows,
+            v_rows: &v_rows,
+        };
+        matvec_inputs
+            .validate()
+            .expect("matvec fixture must validate");
+        let cpu_y = cpu_row_hessian_matvec(&matvec_inputs);
+        let gpu_y = match launch_row_hessian_matvec(matvec_inputs) {
+            Ok(out) => out.y_rows,
+            Err(err) => {
+                eprintln!(
+                    "[row_hessian_ops parity] matvec launch failed: {err}; \
+                     treating as CI infra outage, not parity regression"
+                );
                 return;
-            };
-            let n_rows = 4;
-            let r = 5;
-            let (h_rows, v_rows) = make_fixture(n_rows, r);
-
-            let matvec_inputs = RowHessianMatvecInputs {
-                n_rows,
-                r,
-                h_rows: &h_rows,
-                v_rows: &v_rows,
-            };
-            matvec_inputs
-                .validate()
-                .expect("matvec fixture must validate");
-            let cpu_y = cpu_row_hessian_matvec(&matvec_inputs);
-            let gpu_y = match launch_row_hessian_matvec(matvec_inputs) {
-                Ok(out) => out.y_rows,
-                Err(err) => {
-                    eprintln!(
-                        "[row_hessian_ops parity] matvec launch failed: {err}; \
-                         treating as CI infra outage, not parity regression"
-                    );
-                    return;
-                }
-            };
-            let tol_abs = 2e-8_f64;
-            let tol_rel = 2e-7_f64;
-            assert_eq!(cpu_y.len(), gpu_y.len(), "matvec output length mismatch");
-            for (i, (&c, &g)) in cpu_y.iter().zip(gpu_y.iter()).enumerate() {
-                let diff = (c - g).abs();
-                let tol = tol_abs + tol_rel * c.abs();
-                assert!(
-                    diff <= tol,
-                    "matvec[{i}]: |cpu - gpu| = {diff:.3e} > tol = {tol:.3e}; \
-                     cpu={c:.17e}, gpu={g:.17e}"
-                );
             }
+        };
+        let tol_abs = 2e-8_f64;
+        let tol_rel = 2e-7_f64;
+        assert_eq!(cpu_y.len(), gpu_y.len(), "matvec output length mismatch");
+        for (i, (&c, &g)) in cpu_y.iter().zip(gpu_y.iter()).enumerate() {
+            let diff = (c - g).abs();
+            let tol = tol_abs + tol_rel * c.abs();
+            assert!(
+                diff <= tol,
+                "matvec[{i}]: |cpu - gpu| = {diff:.3e} > tol = {tol:.3e}; \
+                 cpu={c:.17e}, gpu={g:.17e}"
+            );
+        }
 
-            let diag_inputs = RowHessianDiagInputs {
-                n_rows,
-                r,
-                h_rows: &h_rows,
-            };
-            diag_inputs.validate().expect("diag fixture must validate");
-            let cpu_d = cpu_row_hessian_diag(&diag_inputs);
-            let gpu_d = match launch_row_hessian_diag(diag_inputs) {
-                Ok(out) => out.d_rows,
-                Err(err) => {
-                    eprintln!(
-                        "[row_hessian_ops parity] diag launch failed: {err}; \
-                         treating as CI infra outage, not parity regression"
-                    );
-                    return;
-                }
-            };
-            assert_eq!(cpu_d.len(), gpu_d.len(), "diag output length mismatch");
-            for (i, (&c, &g)) in cpu_d.iter().zip(gpu_d.iter()).enumerate() {
-                let diff = (c - g).abs();
-                let tol = tol_abs + tol_rel * c.abs();
-                assert!(
-                    diff <= tol,
-                    "diag[{i}]: |cpu - gpu| = {diff:.3e} > tol = {tol:.3e}; \
-                     cpu={c:.17e}, gpu={g:.17e}"
+        let diag_inputs = RowHessianDiagInputs {
+            n_rows,
+            r,
+            h_rows: &h_rows,
+        };
+        diag_inputs.validate().expect("diag fixture must validate");
+        let cpu_d = cpu_row_hessian_diag(&diag_inputs);
+        let gpu_d = match launch_row_hessian_diag(diag_inputs) {
+            Ok(out) => out.d_rows,
+            Err(err) => {
+                eprintln!(
+                    "[row_hessian_ops parity] diag launch failed: {err}; \
+                     treating as CI infra outage, not parity regression"
                 );
+                return;
             }
+        };
+        assert_eq!(cpu_d.len(), gpu_d.len(), "diag output length mismatch");
+        for (i, (&c, &g)) in cpu_d.iter().zip(gpu_d.iter()).enumerate() {
+            let diff = (c - g).abs();
+            let tol = tol_abs + tol_rel * c.abs();
+            assert!(
+                diff <= tol,
+                "diag[{i}]: |cpu - gpu| = {diff:.3e} > tol = {tol:.3e}; \
+                 cpu={c:.17e}, gpu={g:.17e}"
+            );
         }
     }
 }
