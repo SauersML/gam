@@ -52,6 +52,9 @@ jobs:
           PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: >-
+            --model claude-opus-4-7
+            --permission-mode bypassPermissions
           additional_permissions: |
             actions: read
           prompt: |
