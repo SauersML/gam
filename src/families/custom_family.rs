@@ -12193,26 +12193,27 @@ fn solve_joint_newton_step_on_spectral_range(
         ));
     }
     if null_rhs_inf > null_tol {
-        // Issue #322: when a Duchon smooth in the location block exposes
-        // high-order radial columns that alias the logslope-surface basis
-        // (overlap ≈ 1.0 in the identifiability audit), the joint Hessian
-        // acquires a structural null direction whose gradient component is
-        // nonzero, and the spectral Newton solve refuses to step.  The audit
-        // logs `alias-cluster marginal_surface ~ logslope_surface` upstream
-        // (visible in stderr at INFO level) when this is the cause.  Surface
-        // the most common remedies in the error message so users can act
-        // without crawling the audit log.
+        // Reaching this branch means the canonical-gauge identifiability
+        // pipeline did NOT remove a redundant cross-block direction that
+        // is now showing up as a Hessian nullspace at the joint Newton
+        // step.  The expected handler is
+        // `canonicalize_for_identifiability`, which compares block gauge
+        // priorities and routes alias drops to the lower-priority block.
+        // If that pass left a structural null behind, the most likely
+        // causes are (a) two blocks sharing the same `gauge_priority`
+        // and the same direction (no ordering exists to resolve them),
+        // or (b) a >2-way alias that the pairwise scan / RRQR could not
+        // attribute.  The audit log line `alias-cluster A ~ B` upstream
+        // identifies the offending pair.
         return Err(format!(
             "joint Newton model-space error: nonzero gradient in Hessian nullspace \
              (|P0 rhs|∞={null_rhs_inf:.3e} > tol={null_tol:.3e}, |P+ rhs|∞={range_rhs_inf:.3e}, \
              λ_min+={lambda_min_positive:.3e}, λ_max={lambda_max_abs:.3e}, nullity@{rank_tol:.0e}={nullity}/{p}); \
-             remove/fix the null coordinates or add an explicit model-level regularizer. \
-             Common cause: a high-dimensional smooth in the location block aliases the \
-             logslope/scale basis (look for `alias-cluster marginal_surface ~ \
-             logslope_surface` in the identifiability audit log). Common remedies: reduce \
-             the smooth's basis width (e.g. for `s(x, type=duchon, centers=N)` try N≤5 \
-             instead of N≥6), switch to a default `s(x)` cubic smooth, or constrain the \
-             location block with `identifiability=orthogonal_to_parametric`."
+             the canonical-gauge identifiability pass left a structural null direction in the \
+             joint Hessian. Inspect the upstream identifiability-audit log for `alias-cluster A ~ B` \
+             entries: if both blocks share the same `gauge_priority`, assign them strictly \
+             different priorities so RRQR demotes the lower-priority block's column; otherwise \
+             reduce the smooth's basis width or add an explicit model-level regularizer."
         ));
     }
     if !delta.iter().all(|v| v.is_finite()) {

@@ -320,8 +320,21 @@ fn build_marginal_blockspec_bms(
         nullspace_dims: design.nullspace_dims.clone(),
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
-        gauge_priority: 100,
+        // Canonical-gauge architecture (issue #322): give marginal_surface
+        // strictly higher priority than logslope_surface so the priority-
+        // ordered RRQR in `canonicalize_for_identifiability` presents
+        // marginal columns first and routes any cross-block alias drop into
+        // logslope.  Equal priorities (the previous default of 100/100)
+        // produced a same-priority `hard_alias_pair` whenever a
+        // high-dimensional smooth — e.g. `s(x, type=duchon, centers>=6)`
+        // in the location block — accidentally spanned the logslope basis
+        // direction, leaving the joint Hessian with a structural null and
+        // the spectral Newton solve refusing to step.  The values mirror
+        // the canonical-gauge entry for survival marginal-slope
+        // (marginal=150, logslope=120).
+        gauge_priority: 150,
         jacobian_callback: Some(callback),
+        audit_design: None,
     })
 }
 
@@ -363,8 +376,16 @@ fn build_logslope_blockspec_bms(
         nullspace_dims: design.nullspace_dims.clone(),
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
-        gauge_priority: 100,
+        // Canonical-gauge architecture (issue #322): logslope is strictly
+        // lower priority than marginal so the priority-ordered RRQR in
+        // `canonicalize_for_identifiability` demotes a shared cross-block
+        // direction here, not in marginal.  Mirrors the survival-mgs
+        // value (marginal=150, logslope=120).  See the matching comment
+        // on `build_marginal_blockspec_bms` for the failure mode this
+        // resolves.
+        gauge_priority: 120,
         jacobian_callback: Some(callback),
+        audit_design: None,
     })
 }
 
