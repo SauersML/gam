@@ -1675,12 +1675,14 @@ struct BmsFlexBlockContext {
     /// Densified anchor blocks in parametric-before-flex order.
     anchor_dense_blocks: Vec<Array2<f64>>,
     /// Per-anchor predict-time tags (same order as `anchor_dense_blocks`).
-    anchor_components: Vec<crate::families::bernoulli_marginal_slope::deviation_runtime::AnchorComponentTag>,
+    anchor_components:
+        Vec<crate::families::bernoulli_marginal_slope::deviation_runtime::AnchorComponentTag>,
     /// Horizontally stacked anchor matrix N_train (n × d_total).
     n_train: Array2<f64>,
     /// `BernoulliDenseDesignOperator` per anchor, then one for the candidate
     /// (trailing). Indices align with `ordering`.
-    operators: Vec<std::sync::Arc<dyn crate::families::identifiability_compiler::RowJacobianOperator>>,
+    operators:
+        Vec<std::sync::Arc<dyn crate::families::identifiability_compiler::RowJacobianOperator>>,
     /// Block-order tags parallel to `operators`.
     ordering: Vec<crate::families::identifiability_compiler::BlockOrder>,
     /// W-metric row Hessian built from the validated `training_row_weights`.
@@ -1998,39 +2000,43 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
     // (candidate) block means every direction in span(C) is reproducible by
     // the anchor union; return FullyAliased immediately without touching the
     // runtime.
-    let audit = audit_identifiability_channel_aware(&{
-        // Build minimal ParameterBlockSpec wrappers so the audit can record
-        // block names and column counts. The specs are audit-only; no
-        // penalties or log-lambdas are needed here.
-        let mut specs = Vec::with_capacity(anchor_dense_blocks.len() + 1);
-        for (idx, dense) in anchor_dense_blocks.iter().enumerate() {
+    let audit = audit_identifiability_channel_aware(
+        &{
+            // Build minimal ParameterBlockSpec wrappers so the audit can record
+            // block names and column counts. The specs are audit-only; no
+            // penalties or log-lambdas are needed here.
+            let mut specs = Vec::with_capacity(anchor_dense_blocks.len() + 1);
+            for (idx, dense) in anchor_dense_blocks.iter().enumerate() {
+                specs.push(crate::custom_family::ParameterBlockSpec {
+                    name: format!("anchor_{idx}"),
+                    design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                        dense.clone(),
+                    )),
+                    offset: Array1::<f64>::zeros(n),
+                    penalties: Vec::new(),
+                    nullspace_dims: Vec::new(),
+                    initial_log_lambdas: Array1::<f64>::zeros(0),
+                    initial_beta: None,
+                    gauge_priority: 200,
+                });
+            }
             specs.push(crate::custom_family::ParameterBlockSpec {
-                name: format!("anchor_{idx}"),
-                design: DesignMatrix::Dense(
-                    crate::matrix::DenseDesignMatrix::from(dense.clone()),
-                ),
+                name: "candidate_flex".to_string(),
+                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    candidate_design_dense.clone(),
+                )),
                 offset: Array1::<f64>::zeros(n),
                 penalties: Vec::new(),
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::<f64>::zeros(0),
                 initial_beta: None,
-                gauge_priority: 200,
+                gauge_priority: 100,
             });
-        }
-        specs.push(crate::custom_family::ParameterBlockSpec {
-            name: "candidate_flex".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                candidate_design_dense.clone(),
-            )),
-            offset: Array1::<f64>::zeros(n),
-            penalties: Vec::new(),
-            nullspace_dims: Vec::new(),
-            initial_log_lambdas: Array1::<f64>::zeros(0),
-            initial_beta: None,
-            gauge_priority: 100,
-        });
-        specs
-    }, &operators, &row_hess)
+            specs
+        },
+        &operators,
+        &row_hess,
+    )
     .map_err(|e| format!("cross-block identifiability audit failed: {e}"))?;
 
     if audit.fatal {
@@ -4657,11 +4663,7 @@ impl HyperOperator for BernoulliBlockHessianOperator {
     /// would incur. The psi-Hessian outer-eval path calls this once per
     /// ψ-direction per trace sweep; at biobank scale (rank ≈ 32) the saving
     /// is ~64 allocations per REML gradient step.
-    fn mul_vec_into(
-        &self,
-        v: ArrayView1<'_, f64>,
-        mut out: ArrayViewMut1<'_, f64>,
-    ) {
+    fn mul_vec_into(&self, v: ArrayView1<'_, f64>, mut out: ArrayViewMut1<'_, f64>) {
         let v_m = v.slice(s![self.marginal.clone()]);
         let v_g = v.slice(s![self.logslope.clone()]);
         out.fill(0.0);
@@ -5268,7 +5270,6 @@ impl RowPrimaryEvalCache {
             _ => None,
         }
     }
-
 }
 
 /// Shared precomputed state plus pre-solved per-row contexts. All row
@@ -5291,11 +5292,13 @@ struct BernoulliMarginalSlopeExactEvalCache {
     /// Lazily-built degree-15 bundle for outer dH (1st-derivative of Hessian)
     /// trace paths. Only populated when those paths actually execute.
     /// `RayonSafeOnce` keeps lazy initialization safe from parallel row passes.
-    row_cell_moments_d15: crate::resource::RayonSafeOnce<Result<Option<RowCellMomentsBundle>, String>>,
+    row_cell_moments_d15:
+        crate::resource::RayonSafeOnce<Result<Option<RowCellMomentsBundle>, String>>,
     /// Lazily-built degree-21 bundle for outer d²H (2nd-derivative of Hessian)
     /// trace paths. Only populated when those paths actually execute.
     /// `RayonSafeOnce` keeps lazy initialization safe from parallel row passes.
-    row_cell_moments_d21: crate::resource::RayonSafeOnce<Result<Option<RowCellMomentsBundle>, String>>,
+    row_cell_moments_d21:
+        crate::resource::RayonSafeOnce<Result<Option<RowCellMomentsBundle>, String>>,
     /// Flexible-path per-β per-row primary Hessians (`r×r` blocks flattened
     /// row-major into one wide `Array2`).  The matrix-free inner Newton/CG
     /// loop contracts the same primary Hessian against many trial directions
@@ -9608,8 +9611,7 @@ impl BernoulliMarginalSlopeFamily {
                                     started.elapsed().as_secs_f64()
                                 );
                             }
-                            let packed_neglog =
-                                Array1::<f64>::from_vec(outputs.neglog);
+                            let packed_neglog = Array1::<f64>::from_vec(outputs.neglog);
                             let packed_grad =
                                 Array2::<f64>::from_shape_vec((n, r), outputs.grad)
                                     .map_err(|err| format!("bms_flex_row grad shape: {err}"))?;
@@ -9618,7 +9620,10 @@ impl BernoulliMarginalSlopeFamily {
                                     .map_err(|err| format!("bms_flex_row hess shape: {err}"))?;
                             drop(heartbeat_guard);
                             return Ok(RowPrimaryEvalCache::Host(RowPrimaryEvalPin::new(
-                                packed_neglog, packed_grad, packed_hess, plan.bytes,
+                                packed_neglog,
+                                packed_grad,
+                                packed_hess,
+                                plan.bytes,
                             )));
                         }
                         Err(err) => {
@@ -9676,7 +9681,11 @@ impl BernoulliMarginalSlopeFamily {
                 Ok((
                     neglog,
                     scratch.grad.to_vec(),
-                    scratch.hess.as_slice().expect("hess is contiguous").to_vec(),
+                    scratch
+                        .hess
+                        .as_slice()
+                        .expect("hess is contiguous")
+                        .to_vec(),
                 ))
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -9706,7 +9715,10 @@ impl BernoulliMarginalSlopeFamily {
         }
         drop(heartbeat_guard);
         Ok(RowPrimaryEvalCache::Host(RowPrimaryEvalPin::new(
-            packed_neglog, packed_grad, packed_hess, plan.bytes,
+            packed_neglog,
+            packed_grad,
+            packed_hess,
+            plan.bytes,
         )))
     }
 
@@ -9973,18 +9985,22 @@ impl BernoulliMarginalSlopeFamily {
         if let Some(primary_h) = primary.h.as_ref()
             && let Some(block_h) = slices.h.as_ref()
         {
-            out.slice_mut(s![block_h.clone()])
-                .zip_mut_with(&primary_vec.slice(s![primary_h.start..primary_h.end]), |a, &b| {
+            out.slice_mut(s![block_h.clone()]).zip_mut_with(
+                &primary_vec.slice(s![primary_h.start..primary_h.end]),
+                |a, &b| {
                     *a += b;
-                });
+                },
+            );
         }
         if let Some(primary_w) = primary.w.as_ref()
             && let Some(block_w) = slices.w.as_ref()
         {
-            out.slice_mut(s![block_w.clone()])
-                .zip_mut_with(&primary_vec.slice(s![primary_w.start..primary_w.end]), |a, &b| {
+            out.slice_mut(s![block_w.clone()]).zip_mut_with(
+                &primary_vec.slice(s![primary_w.start..primary_w.end]),
+                |a, &b| {
                     *a += b;
-                });
+                },
+            );
         }
         Ok(())
     }
@@ -14815,13 +14831,7 @@ impl BernoulliMarginalSlopeFamily {
                     .iter_mut()
                     .zip(action_slice.iter())
                     .for_each(|(dst, &src)| *dst = src);
-                self.pullback_primary_vector_add_into(
-                    row,
-                    slices,
-                    primary,
-                    &row_dir_scratch,
-                    out,
-                )?;
+                self.pullback_primary_vector_add_into(row, slices, primary, &row_dir_scratch, out)?;
             }
             return Ok(());
         }
@@ -18264,11 +18274,7 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
         result
     }
 
-    fn hessian_matvec_into(
-        &self,
-        v: &Array1<f64>,
-        out: &mut Array1<f64>,
-    ) -> Result<bool, String> {
+    fn hessian_matvec_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<bool, String> {
         let call = self.matvec_calls.fetch_add(1, Ordering::Relaxed) + 1;
         let started = std::time::Instant::now();
         let heartbeat_guard = crate::heartbeat::scope(format!(
@@ -18276,12 +18282,13 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
             self.family.y.len(),
             self.cache.slices.total
         ));
-        self.family.exact_newton_joint_hessian_matvec_from_cache_into(
-            v,
-            &self.block_states,
-            &self.cache,
-            out,
-        )?;
+        self.family
+            .exact_newton_joint_hessian_matvec_from_cache_into(
+                v,
+                &self.block_states,
+                &self.cache,
+                out,
+            )?;
         if log_exact_work(self.family.y.len()) && (call <= 3 || call.is_power_of_two()) {
             log::info!(
                 "[BMS Hessian-Hv] call={} n={} p={} primary_hessian_cache={} elapsed={:.3}s (into)",

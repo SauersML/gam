@@ -26,7 +26,7 @@ use ndarray::{Array1, Array2, Array3};
 use std::hint::black_box;
 use std::time::Instant;
 
-use gam::solver::arrow_schur::{ArrowSolveOptions, ArrowSchurSystem};
+use gam::solver::arrow_schur::{ArrowSchurSystem, ArrowSolveOptions};
 use gam::terms::{
     AssignmentMode, SaeAssignment, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho,
     SaeManifoldTerm,
@@ -97,7 +97,9 @@ const CONFIGS_BIOBANK: &[BenchConfig] = &[
 /// Deterministic pseudo-random f64 from a linear-congruential generator.
 /// Avoids pulling in rand for the bench harness itself.
 fn lcg_f64(state: &mut u64) -> f64 {
-    *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     // Map to (-1, 1).
     (*state >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0
 }
@@ -157,9 +159,8 @@ fn build_term(cfg: &BenchConfig, mode: AssignmentMode) -> (SaeManifoldTerm, Arra
         coord_blocks.push(coords);
     }
 
-    let assignment =
-        SaeAssignment::from_blocks_with_mode(logits, coord_blocks, mode)
-            .expect("SaeAssignment::from_blocks_with_mode failed in benchmark fixture");
+    let assignment = SaeAssignment::from_blocks_with_mode(logits, coord_blocks, mode)
+        .expect("SaeAssignment::from_blocks_with_mode failed in benchmark fixture");
 
     let term = SaeManifoldTerm::new(atoms, assignment)
         .expect("SaeManifoldTerm::new failed in benchmark fixture");

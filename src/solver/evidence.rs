@@ -829,20 +829,14 @@ pub fn evidence_grad_rho(
         || huu_drho.iter().any(|row| row.len() != r)
         || htbeta_drho.iter().any(|row| row.len() != r)
         || hbb_drho.iter().any(|m| m.nrows() != k || m.ncols() != k)
-        || huu_drho
-            .iter()
-            .enumerate()
-            .any(|(i, row)| {
-                let di = cache.row_dims[i];
-                row.iter().any(|m| m.nrows() != di || m.ncols() != di)
-            })
-        || htbeta_drho
-            .iter()
-            .enumerate()
-            .any(|(i, row)| {
-                let di = cache.row_dims[i];
-                row.iter().any(|m| m.nrows() != di || m.ncols() != k)
-            })
+        || huu_drho.iter().enumerate().any(|(i, row)| {
+            let di = cache.row_dims[i];
+            row.iter().any(|m| m.nrows() != di || m.ncols() != di)
+        })
+        || htbeta_drho.iter().enumerate().any(|(i, row)| {
+            let di = cache.row_dims[i];
+            row.iter().any(|m| m.nrows() != di || m.ncols() != k)
+        })
     {
         out.fill(f64::NAN);
         return out;

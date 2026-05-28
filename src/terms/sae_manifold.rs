@@ -1474,7 +1474,12 @@ impl SaeKroneckerRows {
         a_phi: Vec<Vec<(usize, f64)>>,
         local_jac: Vec<Vec<f64>>,
     ) -> Self {
-        Self { n, p, a_phi, local_jac }
+        Self {
+            n,
+            p,
+            a_phi,
+            local_jac,
+        }
     }
 }
 
@@ -1600,7 +1605,12 @@ impl SaeRowLayout {
             active_atoms.push(active);
             coord_starts_all.push(starts);
         }
-        Self { active_atoms, coord_starts: coord_starts_all, coord_offsets_full, coord_dims }
+        Self {
+            active_atoms,
+            coord_starts: coord_starts_all,
+            coord_offsets_full,
+            coord_dims,
+        }
     }
 
     /// Per-row compressed dim.
@@ -1952,8 +1962,7 @@ impl SaeManifoldTerm {
             let mut scaled_s = Array2::<f64>::zeros((m, m));
             for i in 0..m {
                 for j in 0..m {
-                    let s_ij =
-                        0.5 * (atom.smooth_penalty[[i, j]] + atom.smooth_penalty[[j, i]]);
+                    let s_ij = 0.5 * (atom.smooth_penalty[[i, j]] + atom.smooth_penalty[[j, i]]);
                     scaled_s[[i, j]] = lambda_smooth * s_ij;
                 }
             }
@@ -1963,8 +1972,7 @@ impl SaeManifoldTerm {
                     let beta_i = off + i * p + out_col;
                     let mut grad = 0.0;
                     for j in 0..m {
-                        grad += scaled_s[[i, j]]
-                            * atom.decoder_coefficients[[j, out_col]];
+                        grad += scaled_s[[i, j]] * atom.decoder_coefficients[[j, out_col]];
                     }
                     sys.gb[beta_i] += grad;
                 }
@@ -1984,13 +1992,20 @@ impl SaeManifoldTerm {
         // q_active = |active| + Σ_{k∈active} d_k rather than the full q.
         // Also extract (temperature, threshold) for use in the JVP loop.
         let jumprelu_params: Option<(f64, f64)> = match self.assignment.mode {
-            AssignmentMode::JumpReLU { temperature, threshold } => Some((temperature, threshold)),
+            AssignmentMode::JumpReLU {
+                temperature,
+                threshold,
+            } => Some((temperature, threshold)),
             _ => None,
         };
         let jumprelu_layout: Option<SaeRowLayout> = match self.assignment.mode {
             AssignmentMode::JumpReLU { threshold, .. } => {
-                let coord_dims: Vec<usize> =
-                    self.assignment.coords.iter().map(|c| c.latent_dim()).collect();
+                let coord_dims: Vec<usize> = self
+                    .assignment
+                    .coords
+                    .iter()
+                    .map(|c| c.latent_dim())
+                    .collect();
                 let coord_offsets_full = self.assignment.coord_offsets();
                 Some(SaeRowLayout::new(
                     n,
@@ -2006,8 +2021,7 @@ impl SaeManifoldTerm {
         // Build the Arrow-Schur system: heterogeneous row dims for JumpReLU,
         // uniform q for all other modes.
         let mut sys = if let Some(ref layout) = jumprelu_layout {
-            let per_row_dims: Vec<usize> =
-                (0..n).map(|row| layout.row_q_active(row)).collect();
+            let per_row_dims: Vec<usize> = (0..n).map(|row| layout.row_q_active(row)).collect();
             ArrowSchurSystem::new_with_per_row_dims(per_row_dims, beta_dim)
         } else {
             ArrowSchurSystem::new(n, q, beta_dim)
@@ -2065,9 +2079,8 @@ impl SaeManifoldTerm {
                 // Logit JVP rows for active atoms only.
                 // JumpReLU STE: da_k/dl_k = sigmoid'(l_k/τ) for active, 0 for inactive.
                 // jumprelu_params is always Some when jumprelu_layout is Some (same branch).
-                let (temperature, threshold) = jumprelu_params.expect(
-                    "jumprelu_params populated in same branch as jumprelu_layout",
-                );
+                let (temperature, threshold) = jumprelu_params
+                    .expect("jumprelu_params populated in same branch as jumprelu_layout");
                 let inv_tau = 1.0 / temperature;
                 let logits_row = self.assignment.logits.row(row);
                 for (j, &k) in active.iter().enumerate() {
@@ -2327,10 +2340,7 @@ impl SaeManifoldTerm {
         {
             let mut ops: Vec<Arc<dyn BetaPenaltyOp>> = smooth_ops;
             ops.push(Arc::new(DensePenaltyOp(sys.hbb.clone())));
-            sys.set_penalty_op(Arc::new(CompositePenaltyOp {
-                k: beta_dim,
-                ops,
-            }));
+            sys.set_penalty_op(Arc::new(CompositePenaltyOp { k: beta_dim, ops }));
         }
         // Store the active-set layout for `apply_newton_step`.
         self.last_row_layout = jumprelu_layout;
@@ -2490,32 +2500,24 @@ impl SaeManifoldTerm {
                                             });
                                         }
                                         let b = &atom.decoder_coefficients;
-                                        let mut jac2 = Array2::<f64>::zeros(
-                                            (n_obs, p * d * d),
-                                        );
+                                        let mut jac2 = Array2::<f64>::zeros((n_obs, p * d * d));
                                         for n in 0..n_obs {
                                             for i in 0..p {
                                                 for a in 0..d {
                                                     for c in 0..d {
                                                         let mut acc = 0.0;
                                                         for mm in 0..m {
-                                                            acc += hess[[n, mm, a, c]]
-                                                                * b[[mm, i]];
+                                                            acc += hess[[n, mm, a, c]] * b[[mm, i]];
                                                         }
-                                                        jac2[[n, (i * d + a) * d + c]] =
-                                                            acc;
+                                                        jac2[[n, (i * d + a) * d + c]] = acc;
                                                     }
                                                 }
                                             }
                                         }
-                                        corrected.set_jacobian_second_cache(Some(
-                                            Arc::new(jac2),
-                                        ));
+                                        corrected.set_jacobian_second_cache(Some(Arc::new(jac2)));
                                     }
                                     Some(Err(reason)) => {
-                                        return Err(ArrowSchurError::SchurFactorFailed {
-                                            reason,
-                                        });
+                                        return Err(ArrowSchurError::SchurFactorFailed { reason });
                                     }
                                     None => {
                                         return Err(ArrowSchurError::SchurFactorFailed {
@@ -2533,15 +2535,8 @@ impl SaeManifoldTerm {
                                     }
                                 }
                             }
-                            let corrected_kind =
-                                AnalyticPenaltyKind::Isometry(Arc::new(corrected));
-                            self.add_sae_coord_penalty(
-                                sys,
-                                off,
-                                coord,
-                                &corrected_kind,
-                                rho_local,
-                            );
+                            let corrected_kind = AnalyticPenaltyKind::Isometry(Arc::new(corrected));
+                            self.add_sae_coord_penalty(sys, off, coord, &corrected_kind, rho_local);
                         } else {
                             self.add_sae_coord_penalty(sys, off, coord, penalty, rho_local);
                         }
@@ -2726,7 +2721,8 @@ impl SaeManifoldTerm {
             if delta_ext_coord.len() != total_len {
                 return Err(format!(
                     "SaeManifoldTerm::apply_newton_step: compact delta_ext_coord length {} != expected {}",
-                    delta_ext_coord.len(), total_len
+                    delta_ext_coord.len(),
+                    total_len
                 ));
             }
             // Expand compact layout to full-q flat buffer.

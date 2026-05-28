@@ -39,8 +39,8 @@ pub struct RefinementOutcome {
 mod cuda {
     use crate::gpu::driver::{from_col_major, to_col_major};
     use crate::linalg::faer_ndarray::cholesky_factor_logdet;
-    use cudarc::cublas::{CudaBlas, Gemv, GemvConfig};
     use cudarc::cublas::sys as cublas_sys;
+    use cudarc::cublas::{CudaBlas, Gemv, GemvConfig};
     use cudarc::cusolver::{DnHandle, sys as cusolver_sys};
     use cudarc::driver::{CudaContext, CudaSlice, DevicePtr, DevicePtrMut};
     use faer::MatRef;
@@ -326,16 +326,16 @@ mod cuda {
 
         // Cast A to f32 and upload.
         let h_col_f32: Vec<f32> = h_col_f64.iter().map(|&v| v as f32).collect();
-        let mut a_dev_f32 = pinned_htod(&stream, &h_col_f32)
-            .map_err(|e| format!("upload f32 A: {e}"))?;
+        let mut a_dev_f32 =
+            pinned_htod(&stream, &h_col_f32).map_err(|e| format!("upload f32 A: {e}"))?;
 
         // fp32 POTRF — returns Err if A is not SPD at f32 precision.
         spotrf_in_place(&solver, &stream, p, &mut a_dev_f32)?;
 
         // Cast b to f32 and upload; solve in fp32.
         let b_f32: Vec<f32> = rhs.iter().map(|&v| v as f32).collect();
-        let mut x_dev_f32 = pinned_htod(&stream, &b_f32)
-            .map_err(|e| format!("upload f32 rhs: {e}"))?;
+        let mut x_dev_f32 =
+            pinned_htod(&stream, &b_f32).map_err(|e| format!("upload f32 rhs: {e}"))?;
         spotrs_in_place(&solver, &stream, p, 1, &a_dev_f32, &mut x_dev_f32)?;
 
         // Lift x to f64.
@@ -348,8 +348,7 @@ mod cuda {
         let norm_b = rhs.iter().map(|v| v * v).sum::<f64>().sqrt();
         let norm_b_safe = if norm_b > 0.0 { norm_b } else { 1.0 };
 
-        let mut x_dev_f64 = pinned_htod(&stream, &x)
-            .map_err(|e| format!("upload f64 x: {e}"))?;
+        let mut x_dev_f64 = pinned_htod(&stream, &x).map_err(|e| format!("upload f64 x: {e}"))?;
         let (r0, norm_r0) = residual_norm_and_vec(&blas, &stream, p, &a_dev_f64, &x_dev_f64, rhs)?;
         let mut rel_residual = norm_r0 / norm_b_safe;
 
@@ -370,8 +369,8 @@ mod cuda {
         for _ in 0..max_steps {
             // Cast residual to f32, solve A e = r in fp32.
             let r_f32: Vec<f32> = r.iter().map(|&v| v as f32).collect();
-            let mut e_dev_f32 = pinned_htod(&stream, &r_f32)
-                .map_err(|e| format!("upload f32 residual: {e}"))?;
+            let mut e_dev_f32 =
+                pinned_htod(&stream, &r_f32).map_err(|e| format!("upload f32 residual: {e}"))?;
             spotrs_in_place(&solver, &stream, p, 1, &a_dev_f32, &mut e_dev_f32)?;
 
             // x += e in f64.
@@ -384,8 +383,7 @@ mod cuda {
             steps_taken += 1;
 
             // Reupload x_dev_f64 and compute new residual.
-            x_dev_f64 = pinned_htod(&stream, &x)
-                .map_err(|e| format!("upload refined x: {e}"))?;
+            x_dev_f64 = pinned_htod(&stream, &x).map_err(|e| format!("upload refined x: {e}"))?;
             let (r_new, norm_r_new) =
                 residual_norm_and_vec(&blas, &stream, p, &a_dev_f64, &x_dev_f64, rhs)?;
             rel_residual = norm_r_new / norm_b_safe;

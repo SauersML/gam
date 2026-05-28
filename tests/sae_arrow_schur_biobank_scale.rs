@@ -29,7 +29,9 @@ use gam::terms::{
 
 /// Deterministic pseudo-random f64 ∈ (-1, 1) via LCG.
 fn lcg_f64(state: &mut u64) -> f64 {
-    *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     (*state >> 11) as f64 / (1u64 << 53) as f64 * 2.0 - 1.0
 }
 
@@ -103,10 +105,7 @@ fn build_fixture(
 
 fn assert_finite_vec(v: &[f64], ctx: &str) {
     for (i, &x) in v.iter().enumerate() {
-        assert!(
-            x.is_finite(),
-            "{ctx}: element [{i}] = {x} is not finite"
-        );
+        assert!(x.is_finite(), "{ctx}: element [{i}] = {x} is not finite");
     }
 }
 

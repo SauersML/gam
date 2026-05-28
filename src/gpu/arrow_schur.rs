@@ -1340,8 +1340,7 @@ mod cuda {
                 .arg(&mut status_dev);
             // SAFETY: all buffers were allocated on `stream` with sizes
             // derived from `plan`; parameter list matches FORWARD_KERNEL_SOURCE.
-            unsafe { builder.launch(cfg) }
-                .map_err(|_| super::ArrowSchurGpuFailure::Unavailable)?;
+            unsafe { builder.launch(cfg) }.map_err(|_| super::ArrowSchurGpuFailure::Unavailable)?;
         }
         stream
             .synchronize()

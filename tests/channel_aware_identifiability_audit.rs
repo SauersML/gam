@@ -15,9 +15,7 @@
 //! `[1, 2, ..., n]`.
 
 use gam::families::custom_family::ParameterBlockSpec;
-use gam::families::identifiability_compiler::{
-    IdentityRowHessian, RowJacobianOperator,
-};
+use gam::families::identifiability_compiler::{IdentityRowHessian, RowJacobianOperator};
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
 use gam::solver::identifiability_audit::{
     audit_identifiability, audit_identifiability_channel_aware,
@@ -99,7 +97,10 @@ fn shared_column_block(name: &str) -> ParameterBlockSpec {
 
 #[test]
 fn flat_audit_flags_identical_raw_columns_as_fatal() {
-    let specs = [shared_column_block("block_a"), shared_column_block("block_b")];
+    let specs = [
+        shared_column_block("block_a"),
+        shared_column_block("block_b"),
+    ];
     let audit = audit_identifiability(&specs).expect("flat audit must run");
     assert!(
         audit.fatal,
@@ -111,7 +112,10 @@ fn flat_audit_flags_identical_raw_columns_as_fatal() {
 
 #[test]
 fn channel_aware_audit_passes_when_blocks_live_in_orthogonal_channels() {
-    let specs = [shared_column_block("block_a"), shared_column_block("block_b")];
+    let specs = [
+        shared_column_block("block_a"),
+        shared_column_block("block_b"),
+    ];
 
     let design_a = match &specs[0].design {
         DesignMatrix::Dense(d) => d.as_array().to_owned(),

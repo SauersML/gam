@@ -1407,8 +1407,8 @@ pub fn launch_solve_row_on_stream(
         .load_function(kernel_name)
         .gpu_ctx_with(|err| format!("solve-row load_function({kernel_name}): {err}"))?;
     const THREADS_PER_BLOCK: u32 = 256;
-    let n_u32 = u32::try_from(n)
-        .map_err(|_| gpu_err!("n={n} exceeds u32 for solve-row grid sizing"))?;
+    let n_u32 =
+        u32::try_from(n).map_err(|_| gpu_err!("n={n} exceeds u32 for solve-row grid sizing"))?;
     let grid_x = n_u32.div_ceil(THREADS_PER_BLOCK).max(1);
     let n_i32 = i32::try_from(n)
         .map_err(|_| gpu_err!("n={n} exceeds i32 for solve-row kernel argument"))?;
@@ -1475,8 +1475,8 @@ pub fn launch_alpha_ladder_on_stream(
         .load_function(kernel_name)
         .gpu_ctx_with(|err| format!("alpha-ladder load_function({kernel_name}): {err}"))?;
     const THREADS_PER_BLOCK: u32 = 256;
-    let n_u32 = u32::try_from(n)
-        .map_err(|_| gpu_err!("n={n} exceeds u32 for alpha-ladder grid sizing"))?;
+    let n_u32 =
+        u32::try_from(n).map_err(|_| gpu_err!("n={n} exceeds u32 for alpha-ladder grid sizing"))?;
     let row_blocks = n_u32.div_ceil(THREADS_PER_BLOCK).max(1);
     let n_i32 = i32::try_from(n)
         .map_err(|_| gpu_err!("n={n} exceeds i32 for alpha-ladder kernel argument"))?;
@@ -2575,10 +2575,18 @@ mod pirls_row_gpu_tests {
         // Gamma-log (non-canonical): observed = Fisher · (y/μ). Exercise
         // with shape=1 and shape=2.5 to confirm the plumbing.
         for &shape in &[1.0_f64, 2.5] {
-            let gf =
-                row_reweight_cpu(PirlsRowFamily::GammaLog, CurvatureMode::Fisher, input, shape);
-            let go =
-                row_reweight_cpu(PirlsRowFamily::GammaLog, CurvatureMode::Observed, input, shape);
+            let gf = row_reweight_cpu(
+                PirlsRowFamily::GammaLog,
+                CurvatureMode::Fisher,
+                input,
+                shape,
+            );
+            let go = row_reweight_cpu(
+                PirlsRowFamily::GammaLog,
+                CurvatureMode::Observed,
+                input,
+                shape,
+            );
             assert!(
                 (go.w_hessian - gf.w_fisher * (probe_y / gf.mu)).abs() <= 1e-12,
                 "Gamma-log observed mismatch (shape={shape}): got={} expected={} (mu={})",
@@ -2587,8 +2595,7 @@ mod pirls_row_gpu_tests {
                 gf.mu
             );
             assert_ne!(
-                gf.w_hessian,
-                go.w_hessian,
+                gf.w_hessian, go.w_hessian,
                 "Gamma-log: observed must differ from Fisher when y ≠ μ (shape={shape})"
             );
         }
@@ -2620,17 +2627,29 @@ mod pirls_row_gpu_tests {
         };
         let base = row_reweight_cpu(PirlsRowFamily::GammaLog, CurvatureMode::Fisher, input, 1.0);
         for &shape in &[0.5_f64, 1.5, 3.0, 10.0] {
-            let r =
-                row_reweight_cpu(PirlsRowFamily::GammaLog, CurvatureMode::Fisher, input, shape);
+            let r = row_reweight_cpu(
+                PirlsRowFamily::GammaLog,
+                CurvatureMode::Fisher,
+                input,
+                shape,
+            );
             assert!(
                 (r.w_fisher - shape * base.w_fisher).abs() <= 1e-14,
                 "w_fisher should scale with shape: got {} expected {} (shape={shape})",
                 r.w_fisher,
                 shape * base.w_fisher,
             );
-            assert_eq!(r.mu.to_bits(), base.mu.to_bits(), "mu must not depend on shape");
-            let ro =
-                row_reweight_cpu(PirlsRowFamily::GammaLog, CurvatureMode::Observed, input, shape);
+            assert_eq!(
+                r.mu.to_bits(),
+                base.mu.to_bits(),
+                "mu must not depend on shape"
+            );
+            let ro = row_reweight_cpu(
+                PirlsRowFamily::GammaLog,
+                CurvatureMode::Observed,
+                input,
+                shape,
+            );
             let expected_obs = r.w_fisher * (input.y / r.mu);
             assert!(
                 (ro.w_hessian - expected_obs).abs() <= 1e-13,
