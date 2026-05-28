@@ -322,19 +322,20 @@ pub struct ParameterBlockSpec {
     /// Defaults to 100. Set higher for blocks that should "own" shared
     /// affine/null-space directions (e.g. baseline time in survival).
     pub gauge_priority: u8,
-    /// Per-row scale vector for the identifiability audit. When set, the
-    /// audit uses `diag(eta_row_scaling) · block.design` as the effective
-    /// design for this block instead of the raw `block.design`. This
-    /// encodes the observation that blocks whose linear-predictor
-    /// contribution is `scaling_i · basis_row_i · β` (e.g. the logslope
-    /// block in survival marginal-slope, where `scaling_i = z_i`) look
-    /// identical to the raw-design audit but are linearly independent of
-    /// blocks that share the same raw basis but carry no z-scaling.
+    /// Per-row linear scale vector. When set, the block's effective design
+    /// for identifiability, canonicalisation, and joint Q_s assembly is
+    /// `D_eff = diag(row_scaling) · design` rather than the raw `design`.
     ///
-    /// Must have length `design.nrows()` when set; `None` means the raw
-    /// design is the correct effective design (no scaling — the default
-    /// for parametric, time-baseline, and marginal-main-effect blocks).
-    pub eta_row_scaling: Option<Array1<f64>>,
+    /// This encodes the invariant that a `ParameterBlockSpec` represents
+    /// a contribution of the form `D_eff · β + offset` to the linear
+    /// predictor η. For most blocks `row_scaling = None` (all-ones, so
+    /// `D_eff = design`). For the logslope block in survival marginal-slope
+    /// the actual contribution is `diag(z) · Φ · β_s`; setting
+    /// `row_scaling = Some(z_arc)` exposes that structure to every
+    /// consumer via [`ParameterBlockSpec::effective_design`].
+    ///
+    /// Length must equal `design.nrows()` when set.
+    pub row_scaling: Option<std::sync::Arc<[f64]>>,
 }
 
 impl ParameterBlockSpec {
@@ -356,7 +357,55 @@ impl ParameterBlockSpec {
             initial_log_lambdas: ndarray::Array1::<f64>::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
+            row_scaling: None,
+        }
+    }
+
+    /// Returns the effective design `D_eff` for this block — the matrix that
+    /// actually enters the linear predictor η as `D_eff · β + offset`.
+    ///
+    /// When `row_scaling` is `None`, `D_eff = design` (identity scaling —
+    /// the raw design is returned, densified to `Array2<f64>`).  When
+    /// `row_scaling` is `Some(s)`, `D_eff = diag(s) · design`: row `i` of
+    /// the design is scaled by `s[i]`. This is the correct effective design
+    /// for identifiability auditing, canonicalisation, and joint Q_s assembly
+    /// in every consumer that needs a rank-correct picture of the model.
+    ///
+    /// Callers that already have the raw design for hot-path row operations
+    /// (e.g. `evaluate_blockwise_exact_newton` via `syr_row_into_view`) do
+    /// NOT call this method — they interact with `self.design` directly because
+    /// the row-level scaling is applied by the family's Hessian assembly, not
+    /// by this method.
+    ///
+    /// Returns `Err` if `row_scaling` length != `design.nrows()` or if the
+    /// design cannot be densified.
+    pub fn effective_design(&self, caller: &str) -> Result<ndarray::Array2<f64>, String> {
+        let dense = self
+            .design
+            .try_to_dense_arc(&format!("{caller}::effective_design block '{}'", self.name))?
+            .as_ref()
+            .clone();
+        match self.row_scaling.as_ref() {
+            None => Ok(dense),
+            Some(scaling) => {
+                let n = dense.nrows();
+                if scaling.len() != n {
+                    return Err(format!(
+                        "{caller}::effective_design block '{}': row_scaling length {} != design nrows {}",
+                        self.name,
+                        scaling.len(),
+                        n,
+                    ));
+                }
+                let mut scaled = dense;
+                for i in 0..n {
+                    let s = scaling[i];
+                    for j in 0..scaled.ncols() {
+                        scaled[[i, j]] *= s;
+                    }
+                }
+                Ok(scaled)
+            }
         }
     }
 }

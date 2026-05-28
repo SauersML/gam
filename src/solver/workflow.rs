@@ -1376,7 +1376,7 @@ fn fit_cause_specific_survival_transformation_custom(
             initial_log_lambdas,
             initial_beta: Some(beta_start),
             gauge_priority: 100,
-            eta_row_scaling: None,
+            row_scaling: None,
         });
     }
 
