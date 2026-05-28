@@ -999,6 +999,24 @@ impl ArrowSchurSystem {
         self.refresh_row_hessian_fingerprint();
     }
 
+    /// Register term-block column ranges for the block-Jacobi Schur preconditioner.
+    ///
+    /// Each `Range<usize>` covers the columns of one GAM term (or custom
+    /// parameter family) in the shared `β` vector. The ranges must be
+    /// non-overlapping, sorted, and their union must cover `0..k`.
+    ///
+    /// Call this after building the system and before [`Self::solve`] /
+    /// [`Self::solve_with_options`] whenever the solver will use
+    /// [`ArrowSolverMode::InexactPCG`]. Absent a call, the preconditioner
+    /// falls back to scalar diagonal Jacobi (the pre-#283 behaviour).
+    ///
+    /// The same plumbing is compatible with #287 (custom `ParameterBlockSpec`
+    /// families): callers from that path simply supply ranges derived from
+    /// their own block layout instead of `EngineLayout.terms[*].col_range`.
+    pub fn set_block_offsets(&mut self, offsets: Arc<[Range<usize>]>) {
+        self.block_offsets = offsets;
+    }
+
     /// Fold analytic-penalty contributions into the appropriate blocks.
     ///
     /// BA source mapping: these are extra prior/regularization normal-equation
@@ -2585,7 +2603,7 @@ fn steihaug_pcg_reduced_system<B: BatchedBlockSolver>(
     trust: &ArrowTrustRegionOptions,
     backend: &B,
     metric_weights: Option<&MetricWeights>,
-) -> Result<Array1<f64>, ArrowSchurError> {
+) -> Result<(Array1<f64>, PcgDiagnostics), ArrowSchurError> {
     steihaug_cg(
         rhs,
         |p, out| schur_matvec(sys, htt_factors, ridge_beta, p, out, backend),
@@ -2605,7 +2623,7 @@ fn steihaug_dense_system(
     pcg: &ArrowPcgOptions,
     trust: &ArrowTrustRegionOptions,
     metric_weights: Option<&MetricWeights>,
-) -> Result<Array1<f64>, ArrowSchurError> {
+) -> Result<(Array1<f64>, PcgDiagnostics), ArrowSchurError> {
     steihaug_cg(
         rhs,
         |p, out| dense_matvec(schur, p, out),
