@@ -38,6 +38,50 @@ use crate::term_builder::resolve_role_col;
 use crate::terms::smooth::{TermCollectionSpec, build_term_collection_design};
 use crate::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 
+/// Resolved survival entry/exit column indices for a saved survival model.
+///
+/// `entry_col` is `None` when the model was trained with the right-censored
+/// shorthand `Surv(time, event)`; callers synthesize a zero entry time per
+/// row in that case via [`SurvivalTimeColumns::row_entry_time`]. Mirrors
+/// the CLI predict path so every site that consumes saved survival
+/// metadata applies the same fallback contract.
+pub struct SurvivalTimeColumns {
+    pub entry_col: Option<usize>,
+    pub exit_col: usize,
+}
+
+impl SurvivalTimeColumns {
+    /// Entry time for row `i`, defaulting to `0.0` when the saved model has
+    /// no `survival_entry` column (right-censored shorthand).
+    #[inline]
+    pub fn row_entry_time(&self, data: ArrayView2<'_, f64>, i: usize) -> f64 {
+        self.entry_col.map_or(0.0, |idx| data[[i, idx]])
+    }
+}
+
+/// Resolve saved survival entry/exit column names against the runtime
+/// `col_map`, treating an absent `survival_entry` as the right-censored
+/// shorthand (entry times synthesized as zero downstream).
+pub fn resolve_saved_survival_time_columns(
+    model: &SavedModel,
+    col_map: &HashMap<String, usize>,
+) -> Result<SurvivalTimeColumns, String> {
+    let entry_col: Option<usize> = model
+        .survival_entry
+        .as_deref()
+        .map(|name| resolve_role_col(col_map, name, "entry"))
+        .transpose()?;
+    let exitname = model
+        .survival_exit
+        .as_ref()
+        .ok_or_else(|| "survival model missing exit column metadata".to_string())?;
+    let exit_col = resolve_role_col(col_map, exitname, "exit")?;
+    Ok(SurvivalTimeColumns {
+        entry_col,
+        exit_col,
+    })
+}
+
 /// Smallest positive survival probability we admit before taking
 /// `-ln(S)` for the cumulative hazard. Using `f64::MIN_POSITIVE` (≈ 2.2e-308)
 /// would let `-ln(S)` reach ~709 and risk downstream `exp(-cum)` underflow

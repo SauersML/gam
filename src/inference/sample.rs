@@ -645,10 +645,17 @@ fn sample_survival(
     ) {
         return laplace_gaussian_fallback(model, cfg, "survival posterior fallback");
     }
-    let entryname = model
+    // `survival_entry == None` is the right-censored shorthand
+    // `Surv(time, event)`: training synthesized a zero entry column,
+    // and posterior sampling must do the same so artifacts fit with
+    // the shorthand are first-class through `gam sample` /
+    // `model.sample` just like `gam predict` already handles them in
+    // `run_predict_survival`.
+    let entry_col: Option<usize> = model
         .survival_entry
-        .as_ref()
-        .ok_or_else(|| "survival model missing entry column metadata".to_string())?;
+        .as_deref()
+        .map(|name| resolve_role_col(col_map, name, "entry"))
+        .transpose()?;
     let exitname = model
         .survival_exit
         .as_ref()
@@ -657,7 +664,6 @@ fn sample_survival(
         .survival_event
         .as_ref()
         .ok_or_else(|| "survival model missing event column metadata".to_string())?;
-    let entry_col = resolve_role_col(col_map, entryname, "entry")?;
     let exit_col = resolve_role_col(col_map, exitname, "exit")?;
     let event_col = resolve_role_col(col_map, eventname, "event")?;
     let termspec = resolve_termspec_for_prediction(
@@ -678,7 +684,8 @@ fn sample_survival(
     let event_competing = Array1::<u8>::zeros(n);
     let weights = Array1::<f64>::ones(n);
     for i in 0..n {
-        let (t0, t1) = normalize_survival_time_pair(data[[i, entry_col]], data[[i, exit_col]], i)?;
+        let entry_val = entry_col.map_or(0.0, |idx| data[[i, idx]]);
+        let (t0, t1) = normalize_survival_time_pair(entry_val, data[[i, exit_col]], i)?;
         age_entry[i] = t0;
         age_exit[i] = t1;
         event_target[i] = if data[[i, event_col]] >= 0.5 { 1 } else { 0 };
