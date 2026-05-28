@@ -14,6 +14,7 @@
 //! [`ClusterJacobiPreconditioner`]: super::arrow_schur::ClusterJacobiPreconditioner
 //! [`AdditiveSchwarzPreconditioner`]: super::arrow_schur::AdditiveSchwarzPreconditioner
 
+use ndarray::Array2;
 use std::ops::Range;
 
 /// Edge in the β-coefficient coupling graph.
