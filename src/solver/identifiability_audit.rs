@@ -1482,15 +1482,17 @@ fn channel_aware_aliased_pairs(
     >],
     col_offsets: &[usize],
     specs: &[ParameterBlockSpec],
-) -> Result<Vec<AliasedPair>, String> {
+) -> Result<Vec<AliasedPair>, EstimationError> {
     if operators.is_empty() {
         return Ok(Vec::new());
     }
     let k = operators[0].k();
     let n = operators[0].nrows();
-    let nk = n
-        .checked_mul(k)
-        .ok_or_else(|| format!("channel-aware audit: n*k overflow (n={n}, k={k})"))?;
+    let nk = n.checked_mul(k).ok_or_else(|| {
+        EstimationError::LayoutError(format!(
+            "channel-aware audit: n*k overflow (n={n}, k={k})"
+        ))
+    })?;
     let p_total = *col_offsets.last().unwrap_or(&0);
     if p_total == 0 || nk == 0 {
         return Ok(Vec::new());
