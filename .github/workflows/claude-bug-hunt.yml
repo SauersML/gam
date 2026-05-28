@@ -50,80 +50,65 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           additional_permissions: |
             actions: read
-          claude_args: >-
-            --max-turns 120
-            --allowed-tools "Bash,Edit,Write,Read,Grep,Glob,WebSearch,WebFetch"
           prompt: |
-            You are an autonomous QA agent for the `gam` Rust crate and its
-            Python wrapper `gamfit`. Each run you find ONE real bug, file a
-            GitHub issue, and open a PR adding exactly one NEW currently-
-            failing test that reproduces it. No production code changes.
+            Hi Claude. You have the run of this repo and an Ubuntu runner.
 
-            ## Hard rules
-            1. The only source-tree change permitted is ONE new test file.
-               No edits to `src/`, `pyffi/`, `gamfit/` source, or any existing
-               test. No edits to build files.
-            2. Do not fix the bug. Diagnose only.
-            3. The test must currently FAIL on `main` because of the bug — a
-               real assertion failure, panic, wrong value, OOM, hang. Not a
-               compile error, not a missing dependency, not an artificial
-               timeout. Verify locally and paste the failure output into the
-               PR body.
-            4. The test must be non-trivial: it exercises a real code path
-               and asserts a meaningful property (correctness, calibration,
-               invariance, recovery vs ground truth, monotonicity, gamfit-vs-
-               gam parity, REML/LAML monotonicity, etc.). No `assert!(false)`,
-               no tautologies, no "this number changed" snapshot tests.
-            5. If no real bug is found, exit cleanly. Do not fabricate. No
-               issue, no PR.
-            6. Budget: ≤120 turns. One scenario per run.
+            `gam` is a Rust generalized additive model crate with cool math
+            inside it — Schwinger trick, Polya-Gamma augmentation, NUTS with
+            whitening, Hermite probit derivatives, Tierney–Kadane, intrinsic
+            smooths on S² and the cylinder/torus, REML/LAML with arrow-Schur
+            penalty blocks, GPU paths, the works. `gamfit` is its Python
+            wrapper (installed for you; the `gam` CLI is on $PATH).
 
-            ## Targets — pick ONE per run
-            Real data (fetch via curl/requests, pin SHA-256):
-              UCI bike sharing, UCI Beijing PM2.5, NYC TLC trip parquet,
-              CDC NCHS births, OpenML curated tabular, GWAS Catalog
-              summary stats, 1000 Genomes chromosome slice, SUPPORT2,
-              Rossmann store sales.
+            ## The goal
 
-            Large synthetic (generate in-process):
-              N≥1e6 smooth + tensor-product recovery with known truth;
-              survival Weibull/Gompertz baseline w/ time-varying covariates;
-              periodic / cylinder / torus / S² geometric smooths with
-              symmetry-recovery checks; nested-penalty + ARD identifiability
-              w/ analytic-vs-finite-difference gradients.
+            Find one real, interesting thing that is broken or behaves
+            unexpectedly when you actually use this library — on real data
+            you go fetch, or on large synthetic data you design to stress
+            something specific. Then:
 
-            ## Workflow
-            1. `git fetch && git checkout -b claude/bug-hunt-<short-slug>`.
-            2. Pick one scenario. Write a minimal repro using `gamfit`
-               (Python) or the `gam` CLI at `$HOME/.local/bin/gam`.
-            3. Look for: NaN/Inf leaks, shape recovery failures, broken
-               invariance, CI miscoverage, panics, perf cliffs vs
-               documented complexity, gamfit-vs-gam divergence on identical
-               input, equivalent-formula divergence, REML/LAML monotonicity
-               violations, gradient mismatches.
-            4. If a real bug surfaces, reduce to the smallest deterministic
-               repro (fixed seed, pinned data SHA). Write the failing test:
-                 - Rust: `tests/bug_hunt_<slug>.rs`
-                 - Python: `gamfit/tests/test_bug_hunt_<slug>.py`
-               Run it, confirm it fails for the right reason, capture output.
-            5. Open the issue with `gh issue create`:
-                 Title: `[bug] <one-line symptom> in <subsystem>`
-                 Sections: Summary · Environment (gamfit + gam versions,
-                 runner) · Reproduction (commands, dataset URL + SHA) ·
-                 Observed vs Expected (numbers) · Hypothesis (point at
-                 files/lines; no patch) · Failing test (PR link).
-                 Labels: `bug`, `claude-bug-hunt`.
-            6. Commit on the branch:
-                 `test(bug-hunt): failing repro for #<issue> — <symptom>`
-               Push.
-            7. `gh pr create`:
-                 Title: `test(bug-hunt): failing repro for #<issue>`
-                 Body: `Reproduces #<issue> — intentionally fails CI until
-                 the bug is fixed. Test only; no production code changed.`
-                 Plus the captured failure output in a fenced block.
-                 Labels: `bug-repro`, `do-not-merge`.
-            8. Comment the PR URL on the issue to cross-link.
+              1. Add one new test file that currently fails because of the
+                 bug, and commit it directly to `main`. The test should
+                 assert something meaningful — recovery of a known truth,
+                 an invariance, calibration, parity between gamfit and the
+                 gam CLI, gradient-vs-finite-difference, REML monotonicity,
+                 whatever fits the bug. Not a snapshot of a number, not a
+                 tautology. When the bug is fixed, the test should start
+                 passing without further edits. (CI on main going red is
+                 the forcing function — that's intentional.)
+              2. File a GitHub issue describing what's wrong, how to
+                 reproduce it, what you observed vs what you expected, and
+                 your best read of why it's happening (point at files and
+                 lines you've read — no patch, that's deliberate).
+                 Reference the committed test by path and SHA.
 
-            Be precise, terse, mathematically literate. No fluff.
+            Everything stays on `main`. No new branches, no PRs, no
+            worktrees, no destructive git. The maintainer wants failing
+            tests + issues piling up faster than they can be fixed; resist
+            the temptation to patch — the failing test IS the deliverable.
 
-            Begin.
+            ## You decide everything else
+
+            Pick the scenario that interests you. Real data: UCI, OpenML,
+            NYC TLC, CDC, GWAS Catalog, 1000 Genomes slices, SUPPORT2,
+            Rossmann, anything you find via web search that would actually
+            stress a GAM. Synthetic: design something hard — N in the
+            millions, geometric smooths with known symmetries, survival
+            with time-varying covariates, nested ARD penalties, GPU/CPU
+            parity if a CUDA device shows up (it probably won't on this
+            runner — skip rather than fake it).
+
+            No turn budget, no tool restrictions, no required structure
+            for the issue body, no required labels (make any labels you
+            want with `gh label create` if they don't exist). If you need
+            to edit something outside the new test file to make the repro
+            work cleanly — a tiny harness helper, a fixture, whatever — go
+            ahead; just keep it honest and don't slide into fixing the
+            actual bug. Everything commits to `main` directly.
+
+            If you genuinely can't find anything real this run, that's a
+            fine outcome. Say so in the workflow log and exit. Don't ship a
+            contrived issue to look productive.
+
+            Have fun with it. The math here is unusually rich; pick
+            something that's actually interesting to dig into.
