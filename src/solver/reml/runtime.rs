@@ -3677,8 +3677,8 @@ impl<'a> RemlState<'a> {
     ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
         let (c_array, d_array) = self.hessian_cd_arrays(pirls_result)?;
         Ok(crate::pirls::outer_hessian_curvature_arrays(
-            &pirls_result.finalweights,
-            &pirls_result.solveweights,
+            pirls_result.final_weights_signed(),
+            pirls_result.solve_weights_psd(),
             &c_array,
             &d_array,
             &pirls_result.final_eta,

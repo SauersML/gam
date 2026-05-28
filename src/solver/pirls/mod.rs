@@ -5480,20 +5480,22 @@ pub fn solver_hessian_weight_floor(fisher_weight: f64) -> f64 {
 /// This helper returns the floored W, plus c and d masked to zero wherever
 /// the floor is active (so `∂W/∂η` is zero on the constant-floor branch).
 pub fn outer_hessian_curvature_arrays(
-    hessian_weights: &Array1<f64>,
-    fisher_weights: &Array1<f64>,
+    hessian_weights: crate::matrix::SignedWeightsView<'_>,
+    fisher_weights: crate::matrix::PsdWeightsView<'_>,
     c_array: &Array1<f64>,
     d_array: &Array1<f64>,
     eta: &Array1<f64>,
     inverse_link: &InverseLink,
 ) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
-    let n = hessian_weights.len();
+    let hessian_view = hessian_weights.view();
+    let fisher_view = fisher_weights.view();
+    let n = hessian_view.len();
     let mut w_out = Array1::<f64>::zeros(n);
     let mut c_out = Array1::<f64>::zeros(n);
     let mut d_out = Array1::<f64>::zeros(n);
     for i in 0..n {
-        let floor = solver_hessian_weight_floor(fisher_weights[i]);
-        let w = hessian_weights[i];
+        let floor = solver_hessian_weight_floor(fisher_view[i]);
+        let w = hessian_view[i];
         let clamp_active = eta_clamp_active(inverse_link, eta[i]);
         let w_below_floor = !(w.is_finite() && w > floor);
         if w_below_floor {
