@@ -4481,8 +4481,6 @@ where
                 diag.stopping_reason = PcgStopReason::TrustRegion;
                 return Ok((step_to_trust_boundary(&x, &p, radius, metric_weights), diag));
             }
-            diag.final_relative_residual = metric_norm(r.view(), metric_weights) / rhs_norm;
-            diag.stopping_reason = PcgStopReason::Indefinite;
             return Err(ArrowSchurError::PcgFailed {
                 reason: "negative curvature in unbounded Schur PCG".to_string(),
             });
@@ -4509,8 +4507,6 @@ where
         diag.precond_apply_calls += 1;
         let rz_next = metric_dot(&r, &z, metric_weights);
         if rz_next <= 0.0 || !rz_next.is_finite() {
-            diag.final_relative_residual = metric_norm(r.view(), metric_weights) / rhs_norm;
-            diag.stopping_reason = PcgStopReason::Stagnation;
             return Err(ArrowSchurError::PcgFailed {
                 reason: "non-positive or non-finite PCG residual".to_string(),
             });

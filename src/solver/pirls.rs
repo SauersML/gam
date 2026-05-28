@@ -8036,6 +8036,15 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         &mut iteration_logger,
     )?;
 
+    // Extract workspace before consuming working_model so we can reuse
+    // the pre-allocated buffers in calculate_edfwithworkspace_with_penalty.
+    // into_final_state() drops the workspace field anyway (it uses `..` in
+    // its destructure); we replace it with a zero-sized stub to satisfy the
+    // borrow checker, then keep the real workspace alive for the EDF call.
+    let mut saved_workspace = std::mem::replace(
+        &mut working_model.workspace,
+        PirlsWorkspace::new(0, 0, 0, 0),
+    );
     let final_state = working_model.into_final_state();
     let GamModelFinalState {
         likelihood: final_likelihood,
@@ -8063,7 +8072,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     // `final_aug_matrix` allocation; the sparse path still allocates
     // internally because no pre-computed factor is available at this site.
     let mut edf = if let Some(dense_h) = penalized_hessian_transformed.as_dense() {
-        calculate_edfwithworkspace_with_penalty(dense_h, &penalty_active, &mut working_model.workspace)?
+        calculate_edfwithworkspace_with_penalty(dense_h, &penalty_active, &mut saved_workspace)?
     } else {
         calculate_edf_with_penalty(&penalized_hessian_transformed, &penalty_active)?
     };
