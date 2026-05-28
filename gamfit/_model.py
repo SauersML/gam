@@ -348,7 +348,7 @@ class Model:
 
     @property
     def family_name(self) -> str:
-        return str(self.summary()["family_name"])
+        return self.summary().family_name
 
     @property
     def model_class(self) -> str:
@@ -454,34 +454,15 @@ class Model:
 
     def __str__(self) -> str:
         # Human-readable multi-line summary for ``print(model)``. The terse
-        # developer one-liner stays on ``__repr__``. Mirrors what R's mgcv
-        # prints on a bare ``model``. (issue #308)
+        # developer one-liner stays on ``__repr__``. The rendering itself
+        # lives in ``Summary.__str__`` so there is exactly one place that
+        # knows how to format the summary fields. (issue #308)
         try:
-            summary = self.summary()
-            payload = summary.payload
+            return str(self.summary())
         except Exception:
             # Summary materialisation can fail on partially-loaded artifacts;
             # fall back to the developer repr rather than crashing print().
             return repr(self)
-        lines = ["GAM fitted model"]
-        lines.append(f"  Formula: {payload.get('formula', self.formula)}")
-        family_name = str(payload.get("family_name", self.family_name))
-        lines.append(f"  Family:  {family_name}")
-        model_class = payload.get("model_class")
-        if model_class:
-            lines.append(f"  Class:   {model_class}")
-        n_obs = payload.get("n_observations") or payload.get("n") or payload.get("num_obs")
-        deviance = payload.get("deviance")
-        if deviance is not None:
-            tail = f"  (n={n_obs})" if n_obs is not None else ""
-            lines.append(f"  Deviance: {deviance:g}{tail}")
-        reml_score = payload.get("reml_score")
-        if reml_score is not None:
-            lines.append(f"  REML score: {reml_score:g}")
-        edf_total = payload.get("edf_total") or payload.get("effective_dof")
-        if edf_total is not None:
-            lines.append(f"  Effective dof: {edf_total:g}")
-        return "\n".join(lines)
 
     def _repr_html_(self) -> str:
         return self.report()
