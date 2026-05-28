@@ -474,3 +474,322 @@ pub fn fit_penalized_multinomial(
         deviance: -2.0 * log_lik,
     })
 }
+
+// ---------------------------------------------------------------------------
+// Formula-driven multinomial pipeline
+// ---------------------------------------------------------------------------
+//
+// Slice A of the multinomial integration: a single public entry that takes
+// a parsed `EncodedDataset`, a Wilkinson-style formula, and a uniform initial
+// smoothing parameter, then runs the full
+//
+//     parse → termspec → design (X, S blocks) → one-hot Y → Newton solve
+//
+// pipeline. REML / LAML λ-selection is the next slice; until that lands the
+// caller pins `init_lambda` (default 1.0) and the same value is used for every
+// penalty block and every active class. The reference class is the last level
+// of the categorical response column as recorded in the dataset schema.
+
+/// Saved-model payload for a multinomial fit driven by a Wilkinson formula.
+///
+/// This is what the FFI returns to Python. It carries everything the Python
+/// `MultinomialModel.predict` path needs to evaluate `softmax(X_new · β)` on
+/// fresh data using the *training* basis / penalty structure (no refit on
+/// predict, no re-derivation of class levels).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultinomialSavedModel {
+    /// The training formula, verbatim. Stored so Python's `summary()` and
+    /// any round-trip persistence path can echo what was fit.
+    pub formula: String,
+    /// Names of the *training* response levels in canonical order. The last
+    /// entry is the reference class (η = 0); the first `K - 1` carry the
+    /// active linear-predictor blocks. Class permutations are forbidden:
+    /// this list is fixed at fit time and predictions emit columns in the
+    /// same order.
+    pub class_levels: Vec<String>,
+    /// Index of the reference class within `class_levels` — currently always
+    /// `class_levels.len() - 1`, exposed as a field so future "user-pinned
+    /// reference" gauges (e.g. `family='multinomial', reference='setosa'`)
+    /// can land without changing the on-disk shape.
+    pub reference_class_index: usize,
+    /// Resolved term-collection spec used to build `X` at fit time. Replayed
+    /// on predict via [`crate::terms::smooth::build_term_collection_design`].
+    pub resolved_termspec: TermCollectionSpec,
+    /// Active-class coefficient block, shape `(P, K-1)`. Column `a` is the
+    /// coefficient vector for class `class_levels[a]`. Stored flat in
+    /// row-major order to keep the serde payload self-describing.
+    pub coefficients_flat: Vec<f64>,
+    /// `P` — coefficient count per active class. Matches the column count of
+    /// the design matrix the saved `resolved_termspec` produces.
+    pub p_per_class: usize,
+    /// Number of active classes (`K - 1`).
+    pub n_active_classes: usize,
+    /// Original training column headers, in dataset-column order. Needed at
+    /// predict time so the FFI can align a fresh `Dataset` to the training
+    /// schema before evaluating the basis.
+    pub training_headers: Vec<String>,
+    /// Penalty smoothing parameter used (uniform across all blocks and all
+    /// active classes in Slice A; REML follows in the next slice).
+    pub lambda: f64,
+    /// Newton iterations executed; recorded for the summary report.
+    pub iterations: usize,
+    /// `true` if the inner Newton solver hit the relative-step tolerance.
+    pub converged: bool,
+    /// Penalized negative log-likelihood at the returned `β̂`.
+    pub penalized_neg_log_likelihood: f64,
+    /// Unpenalized deviance `−2 log L(β̂)`.
+    pub deviance: f64,
+}
+
+impl MultinomialSavedModel {
+    /// Active-class coefficient block as an `(P, K-1)` `ndarray` view.
+    pub fn coefficients_active(&self) -> Array2<f64> {
+        Array2::from_shape_vec(
+            (self.p_per_class, self.n_active_classes),
+            self.coefficients_flat.clone(),
+        )
+        .expect(
+            "MultinomialSavedModel.coefficients_flat length must equal p_per_class * n_active_classes",
+        )
+    }
+
+    /// Evaluate `softmax(X · β)` at fresh data rows. `X_new` must have
+    /// `self.p_per_class` columns (i.e. it was built from the same
+    /// `resolved_termspec` as fit time). Returns an `(N_new, K)` matrix
+    /// with rows summing to 1; column order matches `self.class_levels`.
+    pub fn predict_probabilities(&self, x_new: ArrayView2<'_, f64>) -> Array2<f64> {
+        let n_new = x_new.nrows();
+        let p = self.p_per_class;
+        let m = self.n_active_classes;
+        let k = m + 1;
+        assert_eq!(
+            x_new.ncols(),
+            p,
+            "MultinomialSavedModel.predict_probabilities: X has {} cols, expected {p}",
+            x_new.ncols()
+        );
+        let beta = self.coefficients_active();
+        let mut probs = Array2::<f64>::zeros((n_new, k));
+        let mut eta_active = vec![0.0_f64; m];
+        let mut row_probs = vec![0.0_f64; k];
+        for row in 0..n_new {
+            for a in 0..m {
+                let mut v = 0.0_f64;
+                for i in 0..p {
+                    v += x_new[[row, i]] * beta[[i, a]];
+                }
+                eta_active[a] = v;
+            }
+            MultinomialLogitLikelihood::softmax_with_baseline(&eta_active, &mut row_probs);
+            for c in 0..k {
+                probs[[row, c]] = row_probs[c];
+            }
+        }
+        probs
+    }
+}
+
+/// One-hot-encode the categorical response column and return both the
+/// encoding and the captured level names. The level order matches the order
+/// recorded in the dataset schema, which is itself the order of first
+/// appearance during inferred-schema construction — so it is stable and
+/// deterministic across runs (no silent class permutation).
+fn one_hot_categorical_response(
+    data: &EncodedDataset,
+    y_col: usize,
+    response_name: &str,
+) -> Result<(Array2<f64>, Vec<String>), EstimationError> {
+    let levels: Vec<String> = data
+        .schema
+        .columns
+        .get(y_col)
+        .map(|sc| sc.levels.clone())
+        .unwrap_or_default();
+    if levels.len() < 2 {
+        crate::bail_invalid_estim!(
+            "multinomial response '{response_name}' must have at least 2 categorical levels (got {})",
+            levels.len()
+        );
+    }
+    let n = data.values.nrows();
+    let k = levels.len();
+    let mut y_one_hot = Array2::<f64>::zeros((n, k));
+    for row in 0..n {
+        let encoded = data.values[[row, y_col]];
+        if !encoded.is_finite() {
+            crate::bail_invalid_estim!(
+                "multinomial response '{response_name}' row {row} is non-finite ({encoded})"
+            );
+        }
+        let class_idx = encoded.round() as i64;
+        if class_idx < 0 || (class_idx as usize) >= k {
+            crate::bail_invalid_estim!(
+                "multinomial response '{response_name}' row {row} encoded as {encoded} \
+                 is outside the level range 0..{k}"
+            );
+        }
+        y_one_hot[[row, class_idx as usize]] = 1.0;
+    }
+    Ok((y_one_hot, levels))
+}
+
+/// Build `(TermCollectionSpec, TermCollectionDesign)` from a formula against
+/// a categorical-response dataset. Mirrors the early scaffolding inside
+/// `materialize_standard` (response role resolution, geometry-aware spec
+/// build) without touching the scalar-family resolution path — multinomial
+/// owns its own response kind check.
+fn build_formula_design_for_multinomial(
+    formula: &str,
+    data: &EncodedDataset,
+    config: &FitConfig,
+) -> Result<
+    (
+        TermCollectionSpec,
+        TermCollectionDesign,
+        usize,
+        String,
+        ResponseColumnKind,
+    ),
+    EstimationError,
+> {
+    let parsed = parse_formula(formula).map_err(|err| {
+        EstimationError::InvalidInput(format!(
+            "multinomial fit: failed to parse formula {formula:?}: {err}"
+        ))
+    })?;
+    let col_map = data.column_map();
+    let y_col = resolve_role_col(&col_map, &parsed.response, "response").map_err(|err| {
+        EstimationError::InvalidInput(format!("multinomial fit: {err}"))
+    })?;
+    let y_kind = crate::solver::workflow::response_column_kind(data, y_col);
+    let policy = resolved_resource_policy(config, data, ProblemHints::default());
+    let mut inference_notes: Vec<String> = Vec::new();
+    let spec = build_termspec_with_geometry(
+        &parsed.terms,
+        data,
+        &col_map,
+        &mut inference_notes,
+        config.scale_dimensions,
+        &policy,
+    )
+    .map_err(|err| {
+        EstimationError::InvalidInput(format!("multinomial fit: build termspec: {err}"))
+    })?;
+    let design = build_term_collection_design(data.values.view(), &spec).map_err(|err| {
+        EstimationError::InvalidInput(format!("multinomial fit: build design: {err}"))
+    })?;
+    Ok((spec, design, y_col, parsed.response, y_kind))
+}
+
+/// Top-level formula-driven multinomial fit. Slice A: uniform `init_lambda`
+/// across every penalty block, single inner Newton solve, no REML/LAML
+/// outer loop. REML follows in the next commit.
+///
+/// The categorical response column is recognised via the dataset schema
+/// (`ColumnKindTag::Categorical`); reference class = last level. Returns a
+/// [`MultinomialSavedModel`] that can be serialised to bytes for the Python
+/// wrapper or used in-process for `predict_probabilities`.
+pub fn fit_penalized_multinomial_formula(
+    data: &EncodedDataset,
+    formula: &str,
+    config: &FitConfig,
+    init_lambda: f64,
+    max_iter: usize,
+    tol: f64,
+) -> Result<MultinomialSavedModel, EstimationError> {
+    if !(init_lambda.is_finite() && init_lambda > 0.0) {
+        crate::bail_invalid_estim!(
+            "multinomial fit: init_lambda must be finite and > 0 (got {init_lambda})"
+        );
+    }
+    let (spec, design, y_col, response_name, y_kind) =
+        build_formula_design_for_multinomial(formula, data, config)?;
+    let class_levels = match y_kind {
+        ResponseColumnKind::Categorical { levels } => levels,
+        ResponseColumnKind::Binary => vec!["0".to_string(), "1".to_string()],
+        ResponseColumnKind::Numeric => {
+            crate::bail_invalid_estim!(
+                "multinomial fit: response '{response_name}' is numeric, not categorical; \
+                 use family='gaussian'/'binomial'/... or convert the column to a categorical type"
+            );
+        }
+    };
+    if data.column_kinds.get(y_col) == Some(&ColumnKindTag::Binary) {
+        // Promote to a 2-level categorical for the multinomial driver; the
+        // caller explicitly asked for multinomial, so we route through the
+        // K-1 = 1 active-class softmax (equivalent math to logistic).
+    } else if data.column_kinds.get(y_col) != Some(&ColumnKindTag::Categorical) {
+        crate::bail_invalid_estim!(
+            "multinomial fit: response '{response_name}' must be a categorical column \
+             (got column kind {:?})",
+            data.column_kinds.get(y_col)
+        );
+    }
+    let (y_one_hot, _) = one_hot_categorical_response(data, y_col, &response_name)?;
+    // Build the global X dense (the design is a DesignMatrix abstraction).
+    let x_dense = design
+        .design
+        .try_to_dense_by_chunks("multinomial fit design")
+        .map_err(EstimationError::InvalidInput)?;
+    let p_total = x_dense.ncols();
+    // Sum the penalty blocks at uniform λ = 1 (the per-class λ_a is folded
+    // back into the solver call below, so the assembled `S` here is the
+    // unweighted Σ_k S_k).
+    let lambdas_block = vec![1.0_f64; design.penalties.len()];
+    let s_total = weighted_blockwise_penalty_sum(&design.penalties, &lambdas_block, p_total);
+    let k = y_one_hot.ncols();
+    let m = k - 1;
+    let lambdas_class = Array1::from_elem(m, init_lambda);
+    let outputs = fit_penalized_multinomial(MultinomialFitInputs {
+        design: x_dense.view(),
+        y_one_hot: y_one_hot.view(),
+        penalty: s_total.view(),
+        lambdas: lambdas_class.view(),
+        row_weights: None,
+        max_iter,
+        tol,
+    })?;
+    let coefficients_flat: Vec<f64> = outputs.coefficients_active.iter().copied().collect();
+    Ok(MultinomialSavedModel {
+        formula: formula.to_string(),
+        class_levels: class_levels.clone(),
+        reference_class_index: class_levels.len() - 1,
+        resolved_termspec: spec,
+        coefficients_flat,
+        p_per_class: outputs.coefficients_active.nrows(),
+        n_active_classes: outputs.coefficients_active.ncols(),
+        training_headers: data.headers.clone(),
+        lambda: init_lambda,
+        iterations: outputs.iterations,
+        converged: outputs.converged,
+        penalized_neg_log_likelihood: outputs.penalized_neg_log_likelihood,
+        deviance: outputs.deviance,
+    })
+}
+
+/// Replay the saved termspec to build the predict-time design on a fresh
+/// dataset, then evaluate softmax probabilities. The predict dataset must
+/// carry the same feature columns the training data did (matched by name).
+pub fn predict_multinomial_formula(
+    model: &MultinomialSavedModel,
+    data: &EncodedDataset,
+) -> Result<Array2<f64>, EstimationError> {
+    let design = build_term_collection_design(data.values.view(), &model.resolved_termspec)
+        .map_err(|err| {
+            EstimationError::InvalidInput(format!(
+                "multinomial predict: rebuild design from saved termspec: {err}"
+            ))
+        })?;
+    let x_dense = design
+        .design
+        .try_to_dense_by_chunks("multinomial predict design")
+        .map_err(EstimationError::InvalidInput)?;
+    if x_dense.ncols() != model.p_per_class {
+        crate::bail_invalid_estim!(
+            "multinomial predict: predict design has {} cols, saved model expects {}",
+            x_dense.ncols(),
+            model.p_per_class
+        );
+    }
+    Ok(model.predict_probabilities(x_dense.view()))
+}
