@@ -3,6 +3,27 @@ use super::family::*;
 use super::gradient_paths::*;
 use super::install_flex::validate_spec;
 
+// ── BmsFamilyScalars ──────────────────────────────────────────────────────────
+//
+// Per-row scalars required by the BMS block Jacobians at non-zero β.
+// Mirrors the SurvivalMarginalSlopeFamilyScalars pattern (T26 hard contract).
+//
+// Fields:
+//   q_i  = M[i,:] · β_m + offset_m[i]    (marginal linear predictor)
+//   g_i  = G[i,:] · β_s + offset_s[i]    (log-slope linear predictor)
+//   c_i  = sqrt(1 + (s · g_i)²)
+//   s    = probit_frailty_scale
+//   z_i  = calibrated latent covariate for row i
+//
+// The marginal block needs c_i.  The logslope block needs q_i, g_i, c_i, z_i.
+pub struct BmsFamilyScalars {
+    pub q_i: Vec<f64>,
+    pub g_i: Vec<f64>,
+    pub c_i: Vec<f64>,
+    pub s: f64,
+    pub z_i: Vec<f64>,
+}
+
 // ── BlockEffectiveJacobian impls for BMS ─────────────────────────────────────
 //
 // BMS has a single Bernoulli output per row (n_outputs = 1). The observed η is
@@ -41,15 +62,33 @@ use super::install_flex::validate_spec;
 /// σ updates without rebuilding the block spec.
 ///
 /// Designs are pre-densified at construction to avoid repeated materialisation.
-struct BmsMarginalJacobian {
+pub struct BmsMarginalJacobian {
     /// Dense marginal design: n × p_m.
-    pub(super) marginal_dense: Arc<Array2<f64>>,
+    pub marginal_dense: Arc<Array2<f64>>,
     /// Dense logslope design: n × p_s.
-    pub(super) logslope_dense: Arc<Array2<f64>>,
-    pub(super) offset_m: Array1<f64>,
-    pub(super) offset_s: Array1<f64>,
+    pub logslope_dense: Arc<Array2<f64>>,
+    pub offset_m: Array1<f64>,
+    pub offset_s: Array1<f64>,
     /// Number of marginal columns (= size of β_m slice in the full β vector).
-    pub(super) p_marginal: usize,
+    pub p_marginal: usize,
+}
+
+impl BmsMarginalJacobian {
+    pub fn new(
+        marginal_dense: Arc<Array2<f64>>,
+        logslope_dense: Arc<Array2<f64>>,
+        offset_m: Array1<f64>,
+        offset_s: Array1<f64>,
+        p_marginal: usize,
+    ) -> Self {
+        Self {
+            marginal_dense,
+            logslope_dense,
+            offset_m,
+            offset_s,
+            p_marginal,
+        }
+    }
 }
 
 impl BlockEffectiveJacobian for BmsMarginalJacobian {
@@ -66,17 +105,49 @@ impl BlockEffectiveJacobian for BmsMarginalJacobian {
         let beta_s = &beta_s_raw[..p_s_use];
         let n = self.marginal_dense.nrows();
         let p_block = self.marginal_dense.ncols();
-        let mut out = Array2::<f64>::zeros((n, p_block));
+
+        // Compute per-row g_i = G[i, :p_s_use] · β_s + offset_s[i].
+        // This block owns the logslope design so g is self-computable.
+        // Hard contract (mirrors T26 LogslopeBlockJacobian): when any g_i is
+        // nonzero the per-row c_i depends on g and the caller must have
+        // populated BmsFamilyScalars in family_scalars.
+        let mut g_rows = vec![0.0_f64; n];
         for i in 0..n {
-            // g_i = G[i, :p_s_use] · β_s + offset_s[i]
-            let g_i = self.offset_s[i]
+            g_rows[i] = self.offset_s[i]
                 + self
                     .logslope_dense
                     .row(i)
                     .slice(ndarray::s![..p_s_use])
                     .dot(&ArrayView1::from(beta_s));
-            let sg = s * g_i;
-            let c_i = (1.0 + sg * sg).sqrt();
+        }
+
+        let scalars: Option<&BmsFamilyScalars> = state
+            .family_scalars
+            .as_ref()
+            .and_then(|a| a.downcast_ref::<BmsFamilyScalars>());
+
+        let any_nonzero_g = g_rows.iter().any(|&gi| gi != 0.0);
+        if any_nonzero_g && scalars.is_none() {
+            return Err(
+                "bms-marginal block requires BmsFamilyScalars when beta != 0 \
+                 (g_i != 0 for at least one row); got family_scalars: None. \
+                 The caller must compute per-row (q_i, g_i, c_i, z_i) at the \
+                 current beta and pass them via FamilyLinearizationState::family_scalars."
+                    .to_string(),
+            );
+        }
+
+        let mut out = Array2::<f64>::zeros((n, p_block));
+        for i in 0..n {
+            // c_i from family_scalars when present, otherwise g == 0 so c = 1.
+            let c_i = match scalars {
+                Some(sc) => sc.c_i[i],
+                None => {
+                    // g_i == 0.0 here (enforced by contract above), so c_i = 1.
+                    let sg = s * g_rows[i];
+                    (1.0 + sg * sg).sqrt()
+                }
+            };
             // J[i,:] = c_i · M[i,:]
             let m_row = self.marginal_dense.row(i);
             out.row_mut(i).assign(&m_row.mapv(|x| c_i * x));
@@ -100,16 +171,36 @@ impl BlockEffectiveJacobian for BmsMarginalJacobian {
 /// `probit_frailty_scale` is read from the evaluation state at call time.
 ///
 /// Designs are pre-densified at construction to avoid repeated materialisation.
-struct BmsLogslopeJacobian {
+pub struct BmsLogslopeJacobian {
     /// Dense marginal design: n × p_m.
-    pub(super) marginal_dense: Arc<Array2<f64>>,
+    pub marginal_dense: Arc<Array2<f64>>,
     /// Dense logslope design: n × p_s.
-    pub(super) logslope_dense: Arc<Array2<f64>>,
-    pub(super) offset_m: Array1<f64>,
-    pub(super) offset_s: Array1<f64>,
-    pub(super) z: Arc<[f64]>,
+    pub logslope_dense: Arc<Array2<f64>>,
+    pub offset_m: Array1<f64>,
+    pub offset_s: Array1<f64>,
+    pub z: Arc<[f64]>,
     /// Number of marginal columns (= start of β_s in the full β vector).
-    pub(super) p_marginal: usize,
+    pub p_marginal: usize,
+}
+
+impl BmsLogslopeJacobian {
+    pub fn new(
+        marginal_dense: Arc<Array2<f64>>,
+        logslope_dense: Arc<Array2<f64>>,
+        offset_m: Array1<f64>,
+        offset_s: Array1<f64>,
+        z: Arc<[f64]>,
+        p_marginal: usize,
+    ) -> Self {
+        Self {
+            marginal_dense,
+            logslope_dense,
+            offset_m,
+            offset_s,
+            z,
+            p_marginal,
+        }
+    }
 }
 
 impl BlockEffectiveJacobian for BmsLogslopeJacobian {
@@ -127,27 +218,59 @@ impl BlockEffectiveJacobian for BmsLogslopeJacobian {
         let p_s_use = p_s_block.min(beta_s_raw.len());
         let beta_s = &beta_s_raw[..p_s_use];
         let n = self.logslope_dense.nrows();
-        let mut out = Array2::<f64>::zeros((n, p_s_block));
+
+        // Compute per-row g_i to detect whether the hyperbolic formula is needed.
+        // Hard contract (mirrors T26): when any g_i != 0 the caller must have
+        // populated BmsFamilyScalars in family_scalars with the correct per-row
+        // (q_i, g_i, c_i, z_i) at the current beta.
+        let mut g_rows = vec![0.0_f64; n];
         for i in 0..n {
-            // q_i = M[i, :p_m_use] · β_m + offset_m[i]
-            let q_i = self.offset_m[i]
-                + self
-                    .marginal_dense
-                    .row(i)
-                    .slice(ndarray::s![..p_m_use])
-                    .dot(&ArrayView1::from(beta_m));
-            // g_i = G[i, :p_s_use] · β_s + offset_s[i]
-            let g_i = self.offset_s[i]
+            g_rows[i] = self.offset_s[i]
                 + self
                     .logslope_dense
                     .row(i)
                     .slice(ndarray::s![..p_s_use])
                     .dot(&ArrayView1::from(beta_s));
-            let sg = s * g_i;
-            let c_i = (1.0 + sg * sg).sqrt();
+        }
+
+        let scalars: Option<&BmsFamilyScalars> = state
+            .family_scalars
+            .as_ref()
+            .and_then(|a| a.downcast_ref::<BmsFamilyScalars>());
+
+        let any_nonzero_g = g_rows.iter().any(|&gi| gi != 0.0);
+        if any_nonzero_g && scalars.is_none() {
+            return Err(
+                "bms-logslope block requires BmsFamilyScalars when beta != 0 \
+                 (g_i != 0 for at least one row); got family_scalars: None. \
+                 The caller must compute per-row (q_i, g_i, c_i, z_i) at the \
+                 current beta and pass them via FamilyLinearizationState::family_scalars."
+                    .to_string(),
+            );
+        }
+
+        let mut out = Array2::<f64>::zeros((n, p_s_block));
+        for i in 0..n {
+            // q_i, g_i, c_i, z_i from family_scalars when present.
+            // When scalars is None, g_i == 0 (enforced above), so c_i = 1,
+            // q_i * s^2 * 0 / 1 = 0, and factor = s * z_i only.
+            let (q_i, g_i_val, c_i, z_i) = match scalars {
+                Some(sc) => (sc.q_i[i], sc.g_i[i], sc.c_i[i], sc.z_i[i]),
+                None => {
+                    // g_rows[i] == 0 here.
+                    let q_i_self = self.offset_m[i]
+                        + self
+                            .marginal_dense
+                            .row(i)
+                            .slice(ndarray::s![..p_m_use])
+                            .dot(&ArrayView1::from(beta_m));
+                    let sg = s * g_rows[i];
+                    let c_self = (1.0 + sg * sg).sqrt();
+                    (q_i_self, g_rows[i], c_self, self.z[i])
+                }
+            };
             // per-row scalar factor: q_i · s²·g_i / c_i + s·z_i
-            let z_i = self.z[i];
-            let factor = q_i * s * s * g_i / c_i + s * z_i;
+            let factor = q_i * s * s * g_i_val / c_i + s * z_i;
             // J[i,:] = factor · G[i,:]
             let g_row = self.logslope_dense.row(i);
             out.row_mut(i).assign(&g_row.mapv(|x| factor * x));

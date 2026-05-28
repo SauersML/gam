@@ -1121,4 +1121,5 @@ pub(crate) use install_flex::{
     validate_monotone_structural_feasible,
 };
 pub(crate) use gradient_paths::standardize_latent_z_with_policy;
+pub use block_specs::{BmsFamilyScalars, BmsLogslopeJacobian, BmsMarginalJacobian};
 pub(crate) use block_specs::{build_deviation_aux_blockspec, push_deviation_aux_blockspecs};

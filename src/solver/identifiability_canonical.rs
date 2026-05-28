@@ -607,14 +607,9 @@ pub fn canonicalize_for_identifiability(
             initial_log_lambdas: spec.initial_log_lambdas.clone(),
             initial_beta: reduced_initial_beta,
             gauge_priority: spec.gauge_priority,
-            // The reduction operates on raw-column selection; the
-            // effective linear-predictor scaling is unchanged after
-            // column selection (the surviving columns still carry the
-            // same per-row scaling as in the original spec).  The
-            // jacobian_callback (if any) is also forwarded: the callback
+            // The jacobian_callback (if any) is forwarded: the callback
             // internally uses the raw design width, which the column-
             // selection T_i accounts for by selecting surviving columns.
-            eta_row_scaling: spec.eta_row_scaling.clone(),
             jacobian_callback: spec.jacobian_callback.clone(),
         });
         per_block_transform.push(t_i);
@@ -885,7 +880,6 @@ mod tests {
             initial_log_lambdas: Array1::<f64>::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         }
     }
