@@ -257,22 +257,37 @@ extern "C" __global__ void chol_logdet_col_major(
 
     impl PirlsGpuSharedData {
         /// Upload `x` to the cached per-ordinal CUDA context and return a
-        /// shared batch handle.  One upload, many sigma fits.
-        pub(crate) fn upload_impl(x: ArrayView2<'_, f64>) -> Result<Self, String> {
+        /// Upload X_original, y, prior_w, and offset to the device once.
+        /// Returns a shared handle reused across all ρ / σ points.
+        pub(crate) fn upload_impl(
+            x: ArrayView2<'_, f64>,
+            y: ArrayView1<'_, f64>,
+            prior_w: ArrayView1<'_, f64>,
+            offset: ArrayView1<'_, f64>,
+        ) -> Result<Self, String> {
             let (n, p) = x.dim();
             if n == 0 || p == 0 {
                 return Err("empty design cannot be uploaded".to_string());
             }
+            if y.len() != n || prior_w.len() != n || offset.len() != n {
+                return Err(format!(
+                    "y/prior_w/offset length mismatch (y={}, w={}, offset={}, n={n})",
+                    y.len(), prior_w.len(), offset.len()
+                ));
+            }
             let (ctx, stream) = context_and_stream()?;
             let x_col = to_col_major(&x);
-            let x_dev = pinned_htod(&stream, &x_col)?;
-            // Synchronize the upload stream so the buffer is visible to
+            let x_original_dev = pinned_htod(&stream, &x_col)?;
+            let y_dev = pinned_htod(&stream, y.as_slice().ok_or("y not contiguous")?)?;
+            let prior_w_dev = pinned_htod(&stream, prior_w.as_slice().ok_or("prior_w not contiguous")?)?;
+            let offset_dev = pinned_htod(&stream, offset.as_slice().ok_or("offset not contiguous")?)?;
+            // Synchronize the upload stream so all buffers are visible to
             // every workspace we hand off to. Workspaces use independent
-            // streams; the upload completed on the bootstrap stream above.
+            // streams; the uploads completed on the bootstrap stream above.
             stream
                 .synchronize()
-                .map_err(|e| format!("cuda sync after x upload: {e}"))?;
-            Ok(Self { ctx, n, p, x_dev })
+                .map_err(|e| format!("cuda sync after model upload: {e}"))?;
+            Ok(Self { ctx, n, p, x_original_dev, y_dev, prior_w_dev, offset_dev })
         }
     }
 

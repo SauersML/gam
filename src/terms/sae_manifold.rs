@@ -2050,29 +2050,32 @@ impl SaeManifoldTerm {
             kron_jac.push(jac_flat);
             sys.rows[row] = block;
         }
-        // Apply Riemannian geometry to the per-row row blocks.  When the SAE
-        // ext-coord manifold is non-Euclidean (any atom latent on sphere /
-        // circle / interval), the local Jacobian columns that map into the
-        // t-block tangent space must be projected.  We apply the same
-        // per-row tangent projector to `kron_jac` here so the Kronecker
-        // htbeta_matvec uses the Riemannian-projected Jacobian — matching what
-        // `apply_riemannian_latent_geometry` would have done on `row.htbeta`
-        // had the dense block been materialized.
+        // Apply Riemannian geometry to the per-row row blocks (htt, gt) and
+        // also to the per-row Kronecker local Jacobians stored in kron_jac.
+        // When the SAE ext-coord manifold is non-Euclidean (any atom latent
+        // on sphere / circle / interval), the local Jacobian rows that map
+        // into the t-block tangent space must be projected via the per-row
+        // tangent projector P_i.  This mirrors what
+        // `apply_riemannian_latent_geometry` does to `row.htbeta`, applied
+        // here to the (q × p) kron_jac so the Kronecker htbeta_matvec uses
+        // the Riemannian-projected form.
         self.apply_sae_riemannian_geometry(&mut sys);
         {
             let manifold = self.ext_coord_manifold();
             if !manifold.is_euclidean() {
                 let ext = self.ext_coord_matrix();
                 let mut jac_mat = Array2::<f64>::zeros((q, p));
-                for row in 0..n {
-                    let t_i = ArrayView1::from(&ext.row(row).to_owned().into_raw_vec());
-                    let jac_flat = &mut kron_jac[row];
+                for row_idx in 0..n {
+                    let t_i_owned: Vec<f64> = ext.row(row_idx).iter().copied().collect();
+                    let t_i = ArrayView1::from(t_i_owned.as_slice());
+                    let jac_flat = &mut kron_jac[row_idx];
                     for c in 0..q {
                         for j in 0..p {
                             jac_mat[[c, j]] = jac_flat[c * p + j];
                         }
                     }
-                    let projected = manifold.project_matrix_columns_to_tangent(t_i, jac_mat.view());
+                    let projected =
+                        manifold.project_matrix_columns_to_tangent(t_i, jac_mat.view());
                     for c in 0..q {
                         for j in 0..p {
                             jac_flat[c * p + j] = projected[[c, j]];
