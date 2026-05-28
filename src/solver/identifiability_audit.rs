@@ -1219,9 +1219,9 @@ pub fn audit_identifiability_channel_aware(
 
 /// Pairwise overlap scan on the channel-weighted joint design
 /// `W = stack_b sqrt(I_K) · J_b` (identity structural metric).
-/// Returns one [`AliasedPair`] per column-pair whose normalised
-/// `|wᵀ w'|` exceeds [`ALIAS_OVERLAP_REPORTING_THRESHOLD`], in
-/// `(block_a < block_b)` order.
+/// Returns one [`AliasedPair`] per cross-block column-pair whose
+/// normalised `|wᵀ w'|` exceeds the per-pair leverage-based report
+/// threshold (`pair_report_threshold`), in `(block_a < block_b)` order.
 fn channel_aware_aliased_pairs(
     operators: &[std::sync::Arc<
         dyn crate::families::identifiability_compiler::RowJacobianOperator,
@@ -1241,10 +1241,12 @@ fn channel_aware_aliased_pairs(
     if p_total == 0 || nk == 0 {
         return Ok(Vec::new());
     }
-    // Materialise W = (n*K, p_total) column-major (i.e. one Vec<f64>
-    // of length nk per joint column).
+    // Materialise W = (n*K, p_total) column-major (one Array1<f64> of
+    // length nk per joint column).  Also compute S2 per column for the
+    // leverage-based threshold (see `compute_leverage_s2`).
     let mut cols: Vec<Array1<f64>> = Vec::with_capacity(p_total);
     let mut col_norms: Vec<f64> = Vec::with_capacity(p_total);
+    let mut col_s2: Vec<f64> = Vec::with_capacity(p_total);
     for op in operators.iter() {
         let j_full = op.evaluate_full();
         let p_b = op.ncols();
@@ -1256,14 +1258,27 @@ fn channel_aware_aliased_pairs(
                 }
             }
             let norm = w.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let s2 = compute_leverage_s2(&w.view());
             cols.push(w);
             col_norms.push(norm);
+            col_s2.push(s2);
         }
     }
+    // Total cross-block pairs for Bonferroni correction.
+    let total_cross_pairs: usize = {
+        let mut cnt = 0usize;
+        for a_idx in 0..specs.len() {
+            let a_cols = col_offsets[a_idx + 1] - col_offsets[a_idx];
+            for b_idx in (a_idx + 1)..specs.len() {
+                let b_cols = col_offsets[b_idx + 1] - col_offsets[b_idx];
+                cnt = cnt.saturating_add(a_cols.saturating_mul(b_cols));
+            }
+        }
+        cnt.max(1)
+    };
     // Pairwise scan: for every joint column pair (a < b) with both
     // norms positive, compute |wᵀw'| / (‖w‖·‖w'‖) and emit if above
-    // the reporting threshold. The pair is named by the owning blocks
-    // and the *local* column indices.
+    // the per-pair leverage-based reporting threshold.
     let mut pairs: Vec<AliasedPair> = Vec::new();
     for a in 0..p_total {
         if col_norms[a] <= 0.0 {
@@ -1278,7 +1293,9 @@ fn channel_aware_aliased_pairs(
                 dot += cols[a][i] * cols[b][i];
             }
             let overlap = (dot.abs() / (col_norms[a] * col_norms[b])).min(1.0);
-            if overlap >= ALIAS_OVERLAP_REPORTING_THRESHOLD {
+            let report_thr =
+                pair_report_threshold(col_s2[a], col_s2[b], nk, total_cross_pairs);
+            if overlap >= report_thr {
                 let (block_a_idx, dir_a) = locate_block_column(col_offsets, a)?;
                 let (block_b_idx, dir_b) = locate_block_column(col_offsets, b)?;
                 if block_a_idx == block_b_idx {
