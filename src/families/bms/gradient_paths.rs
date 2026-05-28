@@ -1,4 +1,5 @@
 use super::*;
+use super::family::clamp_bernoulli_link_probability;
 
     Ok(())
 }
