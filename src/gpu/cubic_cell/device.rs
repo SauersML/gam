@@ -29,7 +29,7 @@ use crate::gpu::cubic_cell::{
 #[cfg(target_os = "linux")]
 use crate::gpu::error::GpuError;
 #[cfg(target_os = "linux")]
-use crate::gpu::error::GpuResultExt;
+use crate::gpu_err;
 
 #[cfg(target_os = "linux")]
 use std::sync::{Arc, Mutex, OnceLock};
