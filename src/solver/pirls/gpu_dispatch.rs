@@ -17,10 +17,11 @@
 //! host-side admission logic and struct assembly.
 
 use super::{
-    FIXED_STABILIZATION_RIDGE, GaussianFixedCache, PirlsConfig, PirlsCoordinateFrame,
+    GaussianFixedCache, PirlsConfig, PirlsCoordinateFrame,
     PirlsPenalty, PirlsResult, WorkingModelPirlsResult, LinearInequalityConstraints,
-    make_reparam_operator,
 };
+#[cfg(target_os = "linux")]
+use super::{FIXED_STABILIZATION_RIDGE, make_reparam_operator};
 use crate::construction::ReparamResult;
 use crate::estimate::EstimationError;
 use crate::matrix::DesignMatrix;
@@ -90,7 +91,6 @@ where
             std::mem::size_of_val(&materialize_reparam),
             std::mem::discriminant(penalty_active),
         );
-        return None;
     }
     #[cfg(target_os = "linux")]
     if matches!(link_function, LinkFunction::Identity)
@@ -217,7 +217,6 @@ where
             std::mem::size_of_val(&materialize_reparam),
             std::mem::discriminant(penalty_active),
         );
-        return None;
     }
     #[cfg(target_os = "linux")]
     use super::HessianCurvatureKind;

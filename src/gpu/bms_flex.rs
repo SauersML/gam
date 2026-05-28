@@ -26,9 +26,6 @@ use std::sync::OnceLock;
 
 use ndarray::Array2;
 
-use crate::gpu::error::GpuResultExt;
-use crate::gpu_err;
-
 use super::error::GpuError;
 use super::{GpuDecision, GpuKernel, decide};
 
