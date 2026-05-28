@@ -23900,17 +23900,61 @@ pub fn compute_geometric_constraint_transform(
     Ok((z, s_constrained))
 }
 
+/// Result of auto-deriving a clamped B-spline knot vector from 1-D data.
+///
+/// The `degree` / `num_internal_knots` fields report the **effective** values
+/// that were actually used to build `knots`. They may differ from the
+/// requested values when the engine had to auto-shrink the configuration
+/// (issue #340): with small `n`, cubic-by-default gracefully degrades to
+/// quadratic / linear, and the interior-knot count shrinks toward zero.
+///
+/// `shrunk` is `true` iff at least one of the two parameters was reduced
+/// relative to the request, so callers can surface the decision in model
+/// summaries / logs without recomputing it.
+#[derive(Debug, Clone)]
+pub struct AutoBSplineKnots {
+    pub knots: Array1<f64>,
+    pub degree: usize,
+    pub num_internal_knots: usize,
+    pub shrunk: bool,
+}
+
 /// Build a clamped B-spline full knot vector from 1-D data.
 ///
 /// Thin public wrapper around
 /// [`internal::generate_full_knot_vector_quantile`] so external crates can
 /// request auto-derived knots without reimplementing the placement logic.
+///
+/// When `n = data.len()` is too small to support the requested
+/// `(num_internal_knots, degree)` combination, this function auto-shrinks the
+/// configuration to the largest feasible one (see [`auto_shrink_bspline_config`]):
+///   * `num_internal_knots` is capped at `n - 2`.
+///   * `degree` is reduced (cubic → quadratic → linear) until `n >= degree + 1`.
+///
+/// Only when even linear placement is impossible (`n < 2` or the data range is
+/// degenerate) does this raise an error. The returned [`AutoBSplineKnots`]
+/// records the effective configuration so downstream evaluators stay in sync.
 pub fn auto_knot_vector_1d_quantile(
     data: ArrayView1<'_, f64>,
     num_internal_knots: usize,
     degree: usize,
-) -> Result<Array1<f64>, BasisError> {
-    internal::generate_full_knot_vector_quantile(data, num_internal_knots, degree)
+) -> Result<AutoBSplineKnots, BasisError> {
+    let n = data.len();
+    let Some((eff_knots, eff_degree, shrunk)) =
+        auto_shrink_bspline_config(n, num_internal_knots, degree)
+    else {
+        crate::bail_invalid_basis!(
+            "auto-knot placement needs at least 2 finite evaluation points (got n={n}); \
+             cannot fit even a linear B-spline",
+        );
+    };
+    let knots = internal::generate_full_knot_vector_quantile(data, eff_knots, eff_degree)?;
+    Ok(AutoBSplineKnots {
+        knots,
+        degree: eff_degree,
+        num_internal_knots: eff_knots,
+        shrunk,
+    })
 }
 
 /// Place `num_centers` Duchon centers on 1-D data via the equal-mass strategy.
