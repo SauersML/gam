@@ -22931,7 +22931,6 @@ mod tests {
             initial_log_lambdas: rho.clone(),
             initial_beta: Some(beta.clone()),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let specs = vec![spec];
@@ -23771,7 +23770,6 @@ mod tests {
             initial_log_lambdas: array![0.1],
             initial_beta: Some(Array1::from_elem(wiggle_block.design.ncols(), 0.03)),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let family = BinomialLocationScaleWiggleFamily {
@@ -23819,7 +23817,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let specs = vec![mk_spec(12), mk_spec(20), mk_spec(8)];
@@ -23855,7 +23852,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(retained_rho_dim),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let coefficient_hessian_cost = n_train * (p as u64) * (p as u64);
@@ -23984,7 +23980,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let specs = vec![mk_spec(500, 10), mk_spec(500, 14)];
@@ -24064,7 +24059,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let specs = vec![mk_spec("a", 2), mk_spec("b", 3)];
@@ -24101,7 +24095,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
 
@@ -24130,7 +24123,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let mut state = CustomOuterState::new(None);
@@ -24303,7 +24295,6 @@ mod tests {
             initial_log_lambdas: array![0.0],
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         }];
         let (gradient, hessian) = custom_family_outer_derivatives(
@@ -24382,7 +24373,6 @@ mod tests {
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.2, -0.1]),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         }
     }
@@ -24561,7 +24551,6 @@ mod tests {
             initial_log_lambdas: array![0.0],
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         }];
         let options = BlockwiseFitOptions {
@@ -24615,7 +24604,6 @@ mod tests {
             initial_log_lambdas: array![0.0],
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         }];
         let options = BlockwiseFitOptions {
@@ -24704,7 +24692,6 @@ mod tests {
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.75]),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let options = BlockwiseFitOptions {
@@ -24807,7 +24794,6 @@ mod tests {
             initial_log_lambdas: array![0.0],
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         }];
         let options = BlockwiseFitOptions {
@@ -25755,7 +25741,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let options = BlockwiseFitOptions {
@@ -25806,7 +25791,6 @@ mod tests {
             initial_log_lambdas: array![10.0_f64.ln()],
             initial_beta: Some(array![1.0]),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let options = BlockwiseFitOptions {
@@ -25860,7 +25844,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![1.0]),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let options = BlockwiseFitOptions {
@@ -25918,7 +25901,6 @@ mod tests {
             initial_log_lambdas: array![0.2],
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let options = BlockwiseFitOptions {
@@ -25990,7 +25972,6 @@ mod tests {
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let options = BlockwiseFitOptions {
@@ -26027,7 +26008,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let spec1 = ParameterBlockSpec {
@@ -26039,7 +26019,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let options = BlockwiseFitOptions {
@@ -26326,7 +26305,6 @@ mod tests {
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let spec1 = ParameterBlockSpec {
@@ -26341,7 +26319,6 @@ mod tests {
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let options = BlockwiseFitOptions {
@@ -26379,7 +26356,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let options = BlockwiseFitOptions {
@@ -26414,7 +26390,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let deriv = CustomFamilyBlockPsiDerivative {
@@ -26477,7 +26452,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let result = fit_custom_family(
@@ -26606,7 +26580,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0, 0.0]),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let fit = fit_custom_family(
@@ -26812,7 +26785,6 @@ mod tests {
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let log_sigmaspec = ParameterBlockSpec {
@@ -26827,7 +26799,6 @@ mod tests {
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let threshold_design = thresholdspec.design.clone();
@@ -26922,7 +26893,6 @@ mod tests {
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.2]),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let log_sigmaspec = ParameterBlockSpec {
@@ -26937,7 +26907,6 @@ mod tests {
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![-0.1]),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let threshold_design = thresholdspec.design.clone();
@@ -27040,7 +27009,6 @@ mod tests {
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.15]),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let log_sigmaspec = ParameterBlockSpec {
@@ -27055,7 +27023,6 @@ mod tests {
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![-0.05]),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let threshold_design = thresholdspec.design.clone();
@@ -27226,7 +27193,6 @@ mod tests {
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.2]),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let log_sigmaspec = ParameterBlockSpec {
@@ -27241,7 +27207,6 @@ mod tests {
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![-0.1]),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let threshold_design = thresholdspec.design.clone();
@@ -27369,7 +27334,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![1.5]),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let family = OneBlockConstrainedExactFamily {
@@ -27424,7 +27388,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![1.5]),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let states = vec![ParameterBlockState {
@@ -27750,7 +27713,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let states = vec![ParameterBlockState {
@@ -27799,7 +27761,6 @@ mod tests {
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let options = BlockwiseFitOptions {
@@ -27832,7 +27793,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let options = BlockwiseFitOptions {
@@ -28091,7 +28051,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         }];
         let states = vec![ParameterBlockState {
@@ -28977,7 +28936,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let state = ParameterBlockState {
@@ -29054,7 +29012,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let state = ParameterBlockState {
@@ -29104,7 +29061,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let state = ParameterBlockState {
@@ -29634,7 +29590,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let h: Array2<f64> = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0e-10]];
@@ -29691,7 +29646,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let h: Array2<f64> = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0e-8]];
