@@ -62,12 +62,12 @@ class Model:
             Single uncertainty knob. ``None`` returns the point prediction(s)
             only. A float in ``(0, 1)`` (e.g. ``0.95``) requests the full
             uncertainty decomposition at that pointwise coverage; the output
-            gains ``effective_se``, ``effective_variance``, ``mean_lower``,
-            and ``mean_upper`` columns alongside ``eta`` / ``mean``. On
-            survival models it also produces per-cell hazard / survival SEs.
-            Issue #342 collapsed the previous overlapping
-            ``with_uncertainty`` boolean into this single flag (use
-            ``interval=0.95`` for the SE-only case).
+            gains ``std_error``, ``mean_lower``, and ``mean_upper`` columns
+            alongside ``linear_predictor`` / ``mean``. On survival models it
+            also produces per-cell hazard / survival SEs. Issue #342
+            collapsed the previous overlapping ``with_uncertainty`` boolean
+            into this single flag (use ``interval=0.95`` for the SE-only
+            case).
         return_type : {"dict", "pandas", "numpy", "polars", "pyarrow", "list"}, optional
             Force a specific output container. ``None`` (default) mirrors the
             shape of ``data`` (and the training table where unambiguous).
