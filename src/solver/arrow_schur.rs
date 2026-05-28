@@ -2893,7 +2893,6 @@ fn schur_matvec<B: BatchedBlockSolver>(
     backend: &B,
 ) {
     let k = sys.k;
-    let d = sys.d;
     if let Some(hbb_matvec) = sys.hbb_matvec.as_ref() {
         hbb_matvec(x.view(), out);
         for a in 0..k {
@@ -2908,14 +2907,17 @@ fn schur_matvec<B: BatchedBlockSolver>(
             out[a] = acc;
         }
     }
-    let mut local = Array1::<f64>::zeros(d);
+    // Allocate scratch at max_d; per-row slice is `..di`.
+    let mut local = Array1::<f64>::zeros(sys.d);
     let mut neg_contrib = Array1::<f64>::zeros(k);
     for (i, row) in sys.rows.iter().enumerate() {
-        // H_tβ^(i) · x → local (length d), routed through sys.htbeta_matvec
+        let di = sys.row_dims[i];
+        // H_tβ^(i) · x → local[..di], routed through sys.htbeta_matvec
         // when the dense block is absent.
-        local.fill(0.0);
-        sys_htbeta_apply_row(sys, i, row, x.view(), &mut local);
-        let solved = backend.solve_block_vector(&htt_factors[i], &local);
+        let mut local_i = local.slice_mut(ndarray::s![..di]).to_owned();
+        local_i.fill(0.0);
+        sys_htbeta_apply_row(sys, i, row, x.view(), &mut local_i);
+        let solved = backend.solve_block_vector(&htt_factors[i], &local_i);
         // H_βt^(i) · solved accumulates into neg_contrib (length k), then
         // subtracted from out.  Routed through sys.htbeta_matvec when needed.
         neg_contrib.fill(0.0);
@@ -3021,7 +3023,6 @@ impl JacobiPreconditioner {
         backend: &B,
     ) -> Result<Self, ArrowSchurError> {
         let k = sys.k;
-        let d = sys.d;
         let mut diag = Array1::<f64>::zeros(k);
         for a in 0..k {
             let base = match sys.hbb_diag.as_ref() {
@@ -3032,25 +3033,28 @@ impl JacobiPreconditioner {
         }
         // For each column a, extract H_tβ^(i) e_a via matvec probe when
         // dense slab is absent, then compute the scalar Schur diagonal.
-        let mut col = Array1::<f64>::zeros(d);
+        // Allocate scratch at max_d; per-row slice is ..di.
+        let mut col = Array1::<f64>::zeros(sys.d);
         let mut e_a = Array1::<f64>::zeros(k);
         for (i, row) in sys.rows.iter().enumerate() {
+            let di = sys.row_dims[i];
+            let mut col_i = col.slice_mut(ndarray::s![..di]).to_owned();
             for a in 0..k {
-                if sys.htbeta_matvec.is_some() || row.htbeta.dim() != (d, k) {
+                if sys.htbeta_matvec.is_some() || row.htbeta.dim() != (di, k) {
                     // Kronecker / matrix-free path: probe column a.
                     e_a.fill(0.0);
                     e_a[a] = 1.0;
-                    col.fill(0.0);
-                    sys_htbeta_apply_row(sys, i, row, e_a.view(), &mut col);
+                    col_i.fill(0.0);
+                    sys_htbeta_apply_row(sys, i, row, e_a.view(), &mut col_i);
                 } else {
-                    for c in 0..d {
-                        col[c] = row.htbeta[[c, a]];
+                    for c in 0..di {
+                        col_i[c] = row.htbeta[[c, a]];
                     }
                 }
-                let solved = backend.solve_block_vector(&htt_factors[i], &col);
+                let solved = backend.solve_block_vector(&htt_factors[i], &col_i);
                 let mut acc = 0.0;
-                for c in 0..d {
-                    acc += col[c] * solved[c];
+                for c in 0..di {
+                    acc += col_i[c] * solved[c];
                 }
                 diag[a] -= acc;
             }

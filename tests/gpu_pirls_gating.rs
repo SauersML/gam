@@ -110,7 +110,7 @@ fn gpu_pirls_gating_1_newton_sign_gaussian_direction() {
     let n = 50_usize;
     let p = 4_usize;
     let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF_0001);
-    let normal = Normal::new(0.0, 1.0).unwrap();
+    let normal = Normal::new(0.0, 1.0).expect("normal distribution parameters are valid");
 
     let x = Array2::from_shape_fn((n, p), |_| normal.sample(&mut rng));
     let y = Array1::from_shape_fn(n, |_| normal.sample(&mut rng));
@@ -192,7 +192,7 @@ fn gpu_pirls_gating_2_penalty_gradient_sign_and_shift() {
     let n = 80_usize;
     let p = 6_usize;
     let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF_0002);
-    let normal = Normal::new(0.0, 1.0).unwrap();
+    let normal = Normal::new(0.0, 1.0).expect("normal distribution parameters are valid");
 
     let x = Array2::from_shape_fn((n, p), |_| normal.sample(&mut rng));
     let true_beta = Array1::from_shape_fn(p, |j| 0.5 / (j as f64 + 1.0));
@@ -264,8 +264,8 @@ fn gpu_pirls_gating_3_offset_parity() {
     let n = 100_usize;
     let p = 5_usize;
     let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF_0003);
-    let normal = Normal::new(0.0, 1.0).unwrap();
-    let unif = Uniform::new(-0.5, 0.5).unwrap();
+    let normal = Normal::new(0.0, 1.0).expect("normal distribution parameters are valid");
+    let unif = Uniform::new(-0.5, 0.5).expect("uniform distribution parameters are valid");
 
     let x = Array2::from_shape_fn((n, p), |_| normal.sample(&mut rng));
     let offset = Array1::from_shape_fn(n, |_| unif.sample(&mut rng));
@@ -350,7 +350,7 @@ fn gpu_pirls_gating_4_penalized_line_search_rejects_unpenalized_step() {
     let n = 60_usize;
     let p = 3_usize;
     let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF_0004);
-    let normal = Normal::new(0.0, 1.0).unwrap();
+    let normal = Normal::new(0.0, 1.0).expect("normal distribution parameters are valid");
 
     let x = Array2::from_shape_fn((n, p), |_| normal.sample(&mut rng));
     let y = Array1::from_shape_fn(n, |i| 5.0 + 0.5 * (i as f64 / n as f64));
@@ -437,7 +437,7 @@ fn gpu_pirls_gating_5_qs_basis_semantics() {
     let n = 80_usize;
     let p = 8_usize;
     let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF_0005);
-    let normal = Normal::new(0.0, 1.0).unwrap();
+    let normal = Normal::new(0.0, 1.0).expect("normal distribution parameters are valid");
 
     let x = Array2::from_shape_fn((n, p), |_| normal.sample(&mut rng));
     let true_beta = Array1::from_shape_fn(p, |j| 0.3 / (j as f64 + 1.0));
@@ -529,7 +529,7 @@ fn gpu_pirls_gating_6_final_hessian_at_accepted_eta() {
     let n = 100_usize;
     let p = 6_usize;
     let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF_0006);
-    let normal = Normal::new(0.0, 1.0).unwrap();
+    let normal = Normal::new(0.0, 1.0).expect("normal distribution parameters are valid");
 
     let x = Array2::from_shape_fn((n, p), |_| normal.sample(&mut rng));
     let true_beta = Array1::from_shape_fn(p, |j| 0.4 / (j as f64 + 1.0));
@@ -609,8 +609,8 @@ fn gpu_pirls_gating_7_status_or_reduce() {
     let n = 120_usize;
     let p = 6_usize;
     let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF_0007);
-    let normal = Normal::new(0.0, 1.0).unwrap();
-    let unif = Uniform::new(0.0, 1.0).unwrap();
+    let normal = Normal::new(0.0, 1.0).expect("normal distribution parameters are valid");
+    let unif = Uniform::new(0.0, 1.0).expect("uniform distribution parameters are valid");
 
     let x = Array2::from_shape_fn((n, p), |_| normal.sample(&mut rng));
     let true_beta = Array1::from_shape_fn(p, |j| 0.2 / (j as f64 + 1.0));
@@ -706,7 +706,7 @@ fn gpu_pirls_gating_8_benchmark_baseline_uses_cpu_oracle() {
     let n = 200_usize;
     let p = 10_usize;
     let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF_0008);
-    let normal = Normal::new(0.0, 1.0).unwrap();
+    let normal = Normal::new(0.0, 1.0).expect("normal distribution parameters are valid");
 
     let x = Array2::from_shape_fn((n, p), |_| normal.sample(&mut rng));
     let true_beta = Array1::from_shape_fn(p, |j| 0.3 / (j as f64 + 1.0));

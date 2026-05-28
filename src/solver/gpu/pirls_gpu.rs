@@ -847,76 +847,70 @@ extern "C" __global__ void chol_logdet_col_major(
             ));
         }
 
-        // WX = diag(w_solver_dev) · X — no host round-trip for weights.
-        left_scale_rows_borrowed(
-            &ws.blas,
-            &ws.stream,
-            n,
-            p,
-            &shared.x_original_dev,
-            input.w_solver_dev,
-            &mut ws.wx_dev,
-        )?;
-
-        // XtWX = Xᵀ · WX → ws.xtwx_dev.
+        // Compute XᵀWX and Xᵀ·score.  Fused path (p < threshold): no n*p WX.
+        // Fallback (p >= threshold): ddgmm + dgemm + gemv via wx_dev_ib.
         let n_i = to_i32(n)?;
         let p_i = to_i32(p)?;
-        let gemm_cfg = GemmConfig::<f64> {
-            transa: cublasOperation_t::CUBLAS_OP_T,
-            transb: cublasOperation_t::CUBLAS_OP_N,
-            m: p_i,
-            n: p_i,
-            k: n_i,
-            alpha: 1.0,
-            lda: n_i,
-            ldb: n_i,
-            beta: 0.0,
-            ldc: p_i,
-        };
-        // SAFETY: validated i32 dims; shared.x_original_dev and ws.wx_dev are n*p
-        // f64 col-major buffers; ws.xtwx_dev is p*p; bound to ws.stream.
-        unsafe {
-            ws.blas
-                .gemm(gemm_cfg, &shared.x_original_dev, &ws.wx_dev, &mut ws.xtwx_dev)
+        if let Some(ref mut wx_dev_ib) = ws.wx_dev {
+            // Large-p fallback.
+            left_scale_rows_borrowed(
+                &ws.blas, &ws.stream, n, p, &shared.x_original_dev, input.w_solver_dev, wx_dev_ib,
+            )?;
+            let gemm_cfg = GemmConfig::<f64> {
+                transa: cublasOperation_t::CUBLAS_OP_T,
+                transb: cublasOperation_t::CUBLAS_OP_N,
+                m: p_i,
+                n: p_i,
+                k: n_i,
+                alpha: 1.0,
+                lda: n_i,
+                ldb: n_i,
+                beta: 0.0,
+                ldc: p_i,
+            };
+            // SAFETY: validated dims; shared.x_original_dev and wx_dev_ib n*p
+            // f64 col-major; ws.xtwx_dev is p*p; all on ws.stream.
+            unsafe { ws.blas.gemm(gemm_cfg, &shared.x_original_dev, wx_dev_ib, &mut ws.xtwx_dev) }
+                .map_err(|e| format!("cublas dgemm XtWX (inplace): {e}"))?;
+            let penalty_step = penalty_with_ridge(input.penalty_hessian, input.step_lm_lambda);
+            let penalty_step_col = to_col_major(&penalty_step.view());
+            ws.stream
+                .memcpy_htod(penalty_step_col.as_ref(), &mut ws.penalty_dev)
+                .map_err(|e| format!("upload penalty (inplace): {e}"))?;
+            geam_add(&ws.blas, &ws.stream, p, &ws.xtwx_dev, &ws.penalty_dev, &mut ws.h_dev)?;
+            let gemv_cfg = GemvConfig::<f64> {
+                trans: cublasOperation_t::CUBLAS_OP_T,
+                m: n_i,
+                n: p_i,
+                alpha: 1.0,
+                lda: n_i,
+                incx: 1,
+                beta: 0.0,
+                incy: 1,
+            };
+            // SAFETY: x_original_dev n*p col-major; grad_eta_dev length n; rhs_dev length p.
+            unsafe {
+                ws.blas.gemv(gemv_cfg, &shared.x_original_dev, input.grad_eta_dev, &mut ws.rhs_dev)
+            }
+            .map_err(|e| format!("cublas dgemv Xtg (inplace): {e}"))?;
+        } else {
+            // Fused path: row-sweep kernels, no n*p WX buffer.
+            launch_xtwx_lower(
+                &ws.stream, &shared.ctx, n, p,
+                &shared.x_original_dev, input.w_solver_dev, &mut ws.xtwx_dev,
+            )?;
+            launch_symmetrize_lower(&ws.stream, &shared.ctx, p, &mut ws.xtwx_dev)?;
+            launch_xtscore(
+                &ws.stream, &shared.ctx, n, p,
+                &shared.x_original_dev, input.grad_eta_dev, &mut ws.rhs_dev,
+            )?;
+            let penalty_step = penalty_with_ridge(input.penalty_hessian, input.step_lm_lambda);
+            let penalty_step_col = to_col_major(&penalty_step.view());
+            ws.stream
+                .memcpy_htod(penalty_step_col.as_ref(), &mut ws.penalty_dev)
+                .map_err(|e| format!("upload penalty (fused inplace): {e}"))?;
+            geam_add(&ws.blas, &ws.stream, p, &ws.xtwx_dev, &ws.penalty_dev, &mut ws.h_dev)?;
         }
-        .map_err(|e| format!("cublas dgemm XtWX (inplace): {e}"))?;
-
-        // Upload S + step_lm_lambda·I for the Newton solve only.
-        let penalty_step = penalty_with_ridge(input.penalty_hessian, input.step_lm_lambda);
-        let penalty_step_view = penalty_step.view();
-        let penalty_step_col = to_col_major(&penalty_step_view);
-        ws.stream
-            .memcpy_htod(penalty_step_col.as_ref(), &mut ws.penalty_dev)
-            .map_err(|e| format!("upload penalty (inplace): {e}"))?;
-
-        // H_step = XtWX + (S + step_lm_lambda·I).  POTRF overwrites next.
-        geam_add(
-            &ws.blas,
-            &ws.stream,
-            p,
-            &ws.xtwx_dev,
-            &ws.penalty_dev,
-            &mut ws.h_dev,
-        )?;
-
-        // RHS = Xᵀ · grad_eta_dev → ws.rhs_dev.  No host upload.
-        let gemv_cfg = GemvConfig::<f64> {
-            trans: cublasOperation_t::CUBLAS_OP_T,
-            m: n_i,
-            n: p_i,
-            alpha: 1.0,
-            lda: n_i,
-            incx: 1,
-            beta: 0.0,
-            incy: 1,
-        };
-        // SAFETY: shared.x_original_dev is n*p col-major; input.grad_eta_dev is
-        // length n; ws.rhs_dev is length p; cuBLAS contract satisfied.
-        unsafe {
-            ws.blas
-                .gemv(gemv_cfg, &shared.x_original_dev, input.grad_eta_dev, &mut ws.rhs_dev)
-        }
-        .map_err(|e| format!("cublas dgemv Xtg (inplace): {e}"))?;
 
         // Factor H_step in-place (ws.h_dev <- Cholesky factor).
         potrf_in_place_reuse(
@@ -985,39 +979,38 @@ extern "C" __global__ void chol_logdet_col_major(
         let n = shared.n;
         let p = shared.p;
 
-        // WX = diag(w_hessian) · X.
-        left_scale_rows_borrowed(
-            &ws.blas,
-            &ws.stream,
-            n,
-            p,
-            &shared.x_original_dev,
-            w_hessian_dev,
-            &mut ws.wx_dev,
-        )?;
-
-        // XtWX = Xᵀ · WX.
+        // XtWX via fused path (no n*p WX temp) or fallback ddgmm + dgemm.
         let n_i = to_i32(n)?;
         let p_i = to_i32(p)?;
-        let gemm_cfg = GemmConfig::<f64> {
-            transa: cublasOperation_t::CUBLAS_OP_T,
-            transb: cublasOperation_t::CUBLAS_OP_N,
-            m: p_i,
-            n: p_i,
-            k: n_i,
-            alpha: 1.0,
-            lda: n_i,
-            ldb: n_i,
-            beta: 0.0,
-            ldc: p_i,
-        };
-        // SAFETY: validated dims; shared.x_original_dev and ws.wx_dev are n*p col-major;
-        // ws.xtwx_dev is p*p; all bound to ws.stream.
-        unsafe {
-            ws.blas
-                .gemm(gemm_cfg, &shared.x_original_dev, &ws.wx_dev, &mut ws.xtwx_dev)
+        if let Some(ref mut wx_dev_rh) = ws.wx_dev {
+            // Large-p fallback: WX = diag(w_hessian) · X.
+            left_scale_rows_borrowed(
+                &ws.blas, &ws.stream, n, p, &shared.x_original_dev, w_hessian_dev, wx_dev_rh,
+            )?;
+            let gemm_cfg = GemmConfig::<f64> {
+                transa: cublasOperation_t::CUBLAS_OP_T,
+                transb: cublasOperation_t::CUBLAS_OP_N,
+                m: p_i,
+                n: p_i,
+                k: n_i,
+                alpha: 1.0,
+                lda: n_i,
+                ldb: n_i,
+                beta: 0.0,
+                ldc: p_i,
+            };
+            // SAFETY: validated dims; shared.x_original_dev and wx_dev_rh n*p
+            // col-major; ws.xtwx_dev is p*p; all on ws.stream.
+            unsafe { ws.blas.gemm(gemm_cfg, &shared.x_original_dev, wx_dev_rh, &mut ws.xtwx_dev) }
+                .map_err(|e| format!("cublas dgemm XtWX (final H rebuild): {e}"))?;
+        } else {
+            // Fused path: xtwx_lower + symmetrize, no n*p temp.
+            launch_xtwx_lower(
+                &ws.stream, &shared.ctx, n, p,
+                &shared.x_original_dev, w_hessian_dev, &mut ws.xtwx_dev,
+            )?;
+            launch_symmetrize_lower(&ws.stream, &shared.ctx, p, &mut ws.xtwx_dev)?;
         }
-        .map_err(|e| format!("cublas dgemm XtWX (final H rebuild): {e}"))?;
 
         // Upload S + objective_ridge·I.
         let penalty = penalty_with_ridge(penalty_hessian, objective_ridge);
@@ -1982,6 +1975,7 @@ extern "C" __global__ void status_or(
                 backend,
                 family,
                 curvature,
+                gamma_shape,
                 &ws.stream,
                 n,
                 &loop_ws.eta_dev,
@@ -2009,6 +2003,7 @@ extern "C" __global__ void status_or(
                     backend,
                     family,
                     curvature,
+                    gamma_shape,
                     &ws.stream,
                     n,
                     &loop_ws.eta_dev,
