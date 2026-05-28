@@ -643,10 +643,18 @@ def shape_prediction_response(
     # no id_column, no interval). Asking for an interval, an id-column join, or
     # an explicit return_type signals "I want the full table" (eta + mean and,
     # when interval is set, effective_se + mean_lower + mean_upper).
+    # ``effective_se`` only appears in ``columns`` when uncertainty was
+    # requested via ``interval=`` or ``with_uncertainty=True``; treat its
+    # presence as a tabular-output signal so callers who opted in still get
+    # the SE alongside the mean.
+    has_uncertainty_columns = any(
+        key in columns for key in ("effective_se", "mean_lower", "mean_upper")
+    )
     if (
         return_type is None
         and id_column is None
         and interval is None
+        and not has_uncertainty_columns
         and "mean" in columns
     ):
         mean_values = [float(value) for value in columns["mean"]]

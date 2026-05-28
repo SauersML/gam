@@ -104,6 +104,6 @@ print(m.model_class, m.formula)
 
 ```python
 blob = model.dumps()
-assert (gamfit.loads(blob).predict(test)["mean"]
-        == model.predict(test)["mean"]).all()
+assert (gamfit.loads(blob).predict(test)
+        == model.predict(test)).all()
 ```
