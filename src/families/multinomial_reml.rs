@@ -757,3 +757,170 @@ impl ExactNewtonJointHessianWorkspace for MultinomialHessianWorkspace {
             )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Identifiability + reference-class-gauge audit.
+    //!
+    //! The reference class `K − 1` carries `η ≡ 0` and is NOT represented
+    //! as a parameter block — so the gauge is set entirely by the block
+    //! layout. These tests pin three invariants the canonical
+    //! [`crate::solver::identifiability_canonical::canonicalize_for_identifiability`]
+    //! step must preserve:
+    //!
+    //! 1. Block count `= K − 1` and block names `class_0 … class_{K-2}`.
+    //! 2. Block ordering is class-order — never permuted.
+    //! 3. `gauge_priority` is strictly decreasing in active-class index, so
+    //!    the canonicaliser absorbs shared affine / null-space directions
+    //!    onto the class farthest from the reference and the saved-model
+    //!    `class_levels` order survives unchanged.
+    use super::*;
+    use ndarray::array;
+
+    fn toy_family(n_obs: usize, p: usize, k: usize) -> MultinomialFamily {
+        let y = {
+            let mut y = Array2::<f64>::zeros((n_obs, k));
+            for i in 0..n_obs {
+                y[[i, i % k]] = 1.0;
+            }
+            y
+        };
+        let weights = Array1::<f64>::ones(n_obs);
+        let design = Arc::new(Array2::<f64>::from_shape_fn((n_obs, p), |(i, j)| {
+            ((i + j + 1) as f64).sin()
+        }));
+        let penalty = Arc::new(Array2::<f64>::from_shape_fn((p, p), |(i, j)| {
+            if i == j { 1.0 } else { 0.0 }
+        }));
+        MultinomialFamily::new(y, weights, k, design, penalty, 0)
+            .expect("toy MultinomialFamily must construct")
+    }
+
+    #[test]
+    fn block_specs_have_one_per_active_class_in_order() {
+        let family = toy_family(8, 3, 4);
+        let specs = family.build_block_specs();
+        assert_eq!(specs.len(), 3, "expected K-1 = 3 active blocks for K=4");
+        for (a, spec) in specs.iter().enumerate() {
+            assert_eq!(spec.name, format!("class_{a}"));
+        }
+    }
+
+    #[test]
+    fn gauge_priority_is_strictly_decreasing_in_class_index() {
+        let family = toy_family(8, 3, 5);
+        let specs = family.build_block_specs();
+        for window in specs.windows(2) {
+            assert!(
+                window[0].gauge_priority > window[1].gauge_priority,
+                "class_{} priority {} must exceed class_{} priority {}",
+                window[0].name,
+                window[0].gauge_priority,
+                window[1].name,
+                window[1].gauge_priority,
+            );
+        }
+    }
+
+    #[test]
+    fn block_specs_share_design_shape_with_family() {
+        let family = toy_family(8, 3, 4);
+        let specs = family.build_block_specs();
+        let (n, p) = (family.design.nrows(), family.design.ncols());
+        for spec in &specs {
+            assert_eq!(spec.design.nrows(), n);
+            assert_eq!(spec.design.ncols(), p);
+        }
+    }
+
+    #[test]
+    fn each_block_carries_exactly_one_penalty_for_kronecker_form() {
+        let family = toy_family(6, 4, 3);
+        let specs = family.build_block_specs();
+        for spec in &specs {
+            assert_eq!(spec.penalties.len(), 1);
+            assert_eq!(spec.initial_log_lambdas.len(), 1);
+        }
+    }
+
+    #[test]
+    fn collect_eta_matrix_rejects_wrong_block_count() {
+        let family = toy_family(4, 2, 3);
+        let single = vec![ParameterBlockState {
+            beta: Array1::<f64>::zeros(2),
+            eta: Array1::<f64>::zeros(4),
+        }];
+        let err = family
+            .collect_eta_matrix(&single)
+            .expect_err("wrong block count must error");
+        assert!(err.contains("expects 2 blocks"));
+    }
+
+    #[test]
+    fn evaluate_uniform_eta_zero_matches_uniform_softmax() {
+        let family = toy_family(5, 2, 3);
+        let p = family.design.ncols();
+        let m = family.active_classes();
+        let n = family.weights.len();
+        let block_states: Vec<ParameterBlockState> = (0..m)
+            .map(|_| ParameterBlockState {
+                beta: Array1::<f64>::zeros(p),
+                eta: Array1::<f64>::zeros(n),
+            })
+            .collect();
+        let eval = family
+            .evaluate(&block_states)
+            .expect("baseline evaluate must succeed at β = 0");
+        let expected = (n as f64) * (1.0 / (family.total_classes as f64)).ln();
+        let diff = (eval.log_likelihood - expected).abs();
+        assert!(
+            diff < 1.0e-10,
+            "baseline log-lik {} != {}",
+            eval.log_likelihood,
+            expected,
+        );
+        assert_eq!(eval.blockworking_sets.len(), m);
+    }
+
+    #[test]
+    fn directional_fisher_jet_along_zero_vanishes() {
+        let family = toy_family(4, 2, 3);
+        let p = family.design.ncols();
+        let m = family.active_classes();
+        let n = family.weights.len();
+        let eta = Array2::<f64>::zeros((n, m));
+        let d_beta = Array1::<f64>::zeros(m * p);
+        let jet = family
+            .directional_fisher_jet(eta.view(), &d_beta)
+            .expect("zero direction must be valid");
+        for &v in jet.iter() {
+            assert!(v.abs() < 1.0e-14, "expected zero kernel, got {v}");
+        }
+    }
+
+    #[test]
+    fn beta_flat_dim_equals_active_classes_times_p() {
+        let family = toy_family(3, 5, 4);
+        assert_eq!(family.beta_flat_dim(), 3 * 5);
+    }
+
+    #[test]
+    fn parameter_names_emit_one_label_per_active_class() {
+        let family = toy_family(2, 1, 4);
+        let names = family.parameter_names();
+        assert_eq!(names, vec!["class_0", "class_1", "class_2"]);
+        assert_eq!(family.parameter_links().len(), names.len());
+    }
+
+    #[test]
+    fn new_rejects_k_less_than_two() {
+        let n = 3;
+        let y = array![[1.0], [1.0], [1.0]];
+        let w = Array1::<f64>::ones(n);
+        let x = Arc::new(Array2::<f64>::ones((n, 1)));
+        let s = Arc::new(Array2::<f64>::zeros((1, 1)));
+        let err =
+            MultinomialFamily::new(y, w, 1, x, s, 0).expect_err("K = 1 must be rejected");
+        assert!(err.contains("K"));
+    }
+}
