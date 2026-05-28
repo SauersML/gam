@@ -897,8 +897,13 @@ pub struct ArrowSchurSystem {
     pub hbb_matvec: Option<SharedBetaMatvec>,
     /// Optional row-local matrix-free multiply for `H_tβ^(i) x`.
     ///
-    /// When present, factor caches can retain this lightweight operator instead
-    /// of cloning every dense `d × K` row cross-block.
+    /// When present, all inner-Schur paths route through this operator instead
+    /// of indexing the per-row `htbeta` dense slabs: `reduced_rhs_beta`,
+    /// `schur_matvec` (PCG hot loop), back-substitution,
+    /// `JacobiPreconditioner` construction, `build_dense_schur_direct`, and
+    /// `build_dense_schur_sqrt_ba` all call `sys_htbeta_apply_row` or
+    /// `sys_htbeta_materialize_row`.  Factor caches retain the operator for
+    /// IFT/evidence consumers as before.
     pub htbeta_matvec: Option<RowHtbetaMatvec>,
     /// Optional diagonal of the matrix-free shared block, used by the
     /// Schur-Jacobi preconditioner in the Agarwal-style PCG path.

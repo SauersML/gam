@@ -44,7 +44,7 @@ mod cuda {
     use cudarc::cusolver::{DnHandle, sys as cusolver_sys};
     use cudarc::driver::{CudaContext, CudaSlice, DevicePtr, DevicePtrMut};
     use faer::MatRef;
-    use ndarray::{Array2, ArrayView2};
+    use ndarray::{Array1, Array2, ArrayView2};
 
     pub(super) fn cholesky_solve(
         hessian: ArrayView2<'_, f64>,

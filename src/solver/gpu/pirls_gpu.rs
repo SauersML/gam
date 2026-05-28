@@ -3441,6 +3441,7 @@ mod stream_device_parity_tests {
                         y: y[i],
                         prior_weight: prior_w[i],
                     },
+                    1.0,
                 );
                 w[i] = out.w_solver;
                 g[i] = out.grad_eta;

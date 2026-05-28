@@ -211,6 +211,72 @@ pub fn solve_arrow_newton_step_fused_force(
     }
 }
 
+/// Build a GPU-backed Schur matvec closure for CPU-driven PCG at K ≥ 5000.
+///
+/// Runs the fused NVRTC forward kernel once on the dense per-row `H_tβ` slabs
+/// to compute `Y_i = L_i^{-1} H_tβ^(i)` for all rows, persists the `Y_i`
+/// factors in a host-side buffer, and returns an `Arc<dyn Fn(...)>` closure
+/// that computes the full Schur matvec
+///
+/// ```text
+/// S·x = (H_ββ + ridge_beta·I)·x  −  Σ_i Y_i^T (Y_i·x)
+/// ```
+///
+/// each time it is called. At K ≥ 5000 the `Σ_i Y_i^T (Y_i·x)` term
+/// dominates over the host↔device transfer of the K-vector `x`, so the GPU
+/// path is a clear win even with per-iteration transfer.
+///
+/// `H_ββ·x` is evaluated on the CPU using `sys.hbb_matvec` when present (the
+/// matrix-free hook for SAE-manifold scale callers) or the dense `sys.hbb`
+/// block otherwise. The `Y_i` term uses cuBLAS batched GEMV device-side; only
+/// `x` (K doubles) and `out` (K doubles) cross the host↔device boundary per
+/// PCG iteration.
+///
+/// Returns `Err(ArrowSchurGpuFailure::Unavailable)` if CUDA is unavailable or
+/// the system shape is outside the fused kernel's admission range (e.g.
+/// `d > MAX_FUSED_P = 32` or no CUDA context). Callers should fall back to CPU
+/// `InexactPCG` on `Unavailable`.
+///
+/// Returns `Err(ArrowSchurGpuFailure::RidgeBumpRequired)` if a per-row Cholesky
+/// factor failed at the requested `ridge_t`; the outer LM escalation should
+/// bump `ridge_t` and retry.
+///
+/// # Composition with #286
+///
+/// When `sys.htbeta_matvec` is set (CPU matrix-free H_tβ from issue #286),
+/// the dense `H_tβ` slabs are absent and this function returns
+/// `GpuRequiresDenseSystem` — the row-procedural GPU H_tβ kernel that lifts
+/// this restriction is the remaining Part-B deliverable once the SAE Kronecker
+/// kernel (#293) lands.
+pub fn gpu_schur_matvec_backend(
+    sys: &ArrowSchurSystem,
+    ridge_t: f64,
+    ridge_beta: f64,
+) -> Result<crate::solver::arrow_schur::GpuSchurMatvec, ArrowSchurGpuFailure> {
+    // Matrix-free H_tβ operators cannot be consumed by the dense forward kernel.
+    // Return GpuRequiresDenseSystem so the caller knows to stay on CPU PCG.
+    let had_hbb_matvec = sys.hbb_matvec.is_some();
+    let had_htbeta_matvec = sys.htbeta_matvec.is_some();
+    if had_htbeta_matvec {
+        return Err(ArrowSchurGpuFailure::GpuRequiresDenseSystem {
+            had_hbb_matvec,
+            had_htbeta_matvec,
+        });
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Suppress unused-variable warnings on non-Linux.
+        let _ = (ridge_t, ridge_beta, had_hbb_matvec);
+        Err(ArrowSchurGpuFailure::Unavailable)
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        cuda::build_schur_matvec_backend(sys, ridge_t, ridge_beta)
+    }
+}
+
 /// Reference dense back-end used by tests and as the fallback when the
 /// GPU declines. Kept here (not in `arrow_schur_gpu.rs`) so the validation
 /// suite has one canonical baseline.

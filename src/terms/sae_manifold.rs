@@ -1908,6 +1908,11 @@ impl SaeManifoldTerm {
         // matrix retains all atoms for this row so the assignment-Jacobian
         // helper can read it.
         let mut decoded_scratch = vec![0.0_f64; p];
+        // Kronecker htbeta storage: per-row sparse support and local Jacobian.
+        // These replace the O(q · K · p) dense htbeta write with O(m_i · q · p)
+        // storage; the Arrow-Schur solver accesses them via htbeta_matvec.
+        let mut kron_a_phi: Vec<Vec<(usize, f64)>> = Vec::with_capacity(n);
+        let mut kron_jac: Vec<Vec<f64>> = Vec::with_capacity(n);
         for row in 0..n {
             let assignments = self.assignment.try_assignments_row(row)?;
             fitted.fill(0.0);

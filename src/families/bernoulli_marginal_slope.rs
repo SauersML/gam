@@ -14739,10 +14739,10 @@ impl BernoulliMarginalSlopeFamily {
         // call sites stay consistent.
         if let Some(host_pin) = cache.row_primary_hessians.host_pin() {
             let r_pr = primary.total;
-            let h_rows_arr = host_pin.rows();
+            let h_rows_arr = host_pin.hess();
             let h_rows_slice = h_rows_arr
                 .as_slice()
-                .expect("row_primary_hessians.rows() is row-major contiguous");
+                .expect("row_primary_hessians.hess() is row-major contiguous");
             let inputs = crate::gpu::row_hessian_ops::RowHessianDiagInputs {
                 n_rows: n,
                 r: r_pr,
