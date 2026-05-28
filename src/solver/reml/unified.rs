@@ -23178,4 +23178,53 @@ mod tests {
             "error message must name the offending field, got: {err}",
         );
     }
+
+    /// `DenseCholeskyValueOnlyOperator` must agree with `DenseSpectralOperator`
+    /// on `logdet`, `solve`, and `trace_hinv_product` for SPD inputs.
+    ///
+    /// This pins the acceptance criterion from issue #277: ValueOnly REML costs
+    /// routed through Cholesky must match the eigendecomposition baseline.
+    #[test]
+    fn dense_cholesky_value_only_matches_spectral() {
+        use approx::assert_relative_eq;
+
+        // 4×4 SPD matrix.
+        let h = array![
+            [6.0, 2.0, 1.0, 0.5],
+            [2.0, 5.0, 1.5, 0.25],
+            [1.0, 1.5, 4.0, 0.75],
+            [0.5, 0.25, 0.75, 3.0],
+        ];
+
+        let spectral = DenseSpectralOperator::from_symmetric(&h).unwrap();
+        let cholesky = DenseCholeskyValueOnlyOperator::from_spd(&h).unwrap();
+
+        // logdet must agree within floating-point tolerance.
+        assert_relative_eq!(cholesky.logdet(), spectral.logdet(), epsilon = 1e-10);
+
+        // dim and active_rank.
+        assert_eq!(cholesky.dim(), 4);
+        assert_eq!(cholesky.active_rank(), 4);
+
+        // solve must agree.
+        let rhs = array![1.0, 2.0, 3.0, 4.0];
+        let sol_spec = HessianOperator::solve(&spectral, &rhs);
+        let sol_chol = HessianOperator::solve(&cholesky, &rhs);
+        for i in 0..4 {
+            assert_relative_eq!(sol_chol[i], sol_spec[i], epsilon = 1e-10);
+        }
+
+        // trace_hinv_product must agree.
+        let a = array![
+            [2.0, 1.0, 0.0, 0.0],
+            [1.0, 3.0, 0.5, 0.0],
+            [0.0, 0.5, 2.5, 1.0],
+            [0.0, 0.0, 1.0, 1.5],
+        ];
+        assert_relative_eq!(
+            cholesky.trace_hinv_product(&a),
+            spectral.trace_hinv_product(&a),
+            epsilon = 1e-10
+        );
+    }
 }

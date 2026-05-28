@@ -3799,22 +3799,22 @@ where
             );
             Some(raw_se)
         } else if let Some(ref factor_t) = edf_factor {
-            // Solve-on-demand: process columns of Qs in chunks.
-            // (H_orig⁻¹)_{ii} = Qs[i,:] · H_t⁻¹ · Qs[:,i]
-            // Batch: solve H_t Z_chunk = Qs[:,col..col+chunk], extract dot.
-            let p_t = qs.ncols();
+            // Solve-on-demand: process columns of Qs^T in chunks.
+            // Qs is (p_cov × p_t) orthogonal. H_orig⁻¹ = Qs H_t⁻¹ Qs'.
+            // (H_orig⁻¹)_{ii} = Qs[i,:] · H_t⁻¹ · Qs[i,:]'
+            // Batch: column i of Qs^T is row i of Qs. Solve H_t Z = Qs^T[:,chunk]
+            // then dot each solution column back with the corresponding Qs row.
             let mut diag_inv = Array1::<f64>::zeros(p_cov);
             let mut col_start = 0usize;
             while col_start < p_cov {
                 let col_end = (col_start + COV_SE_CHUNK).min(p_cov);
                 let chunk = col_end - col_start;
-                // RHS: p_t rows × chunk cols (columns col_start..col_end of Qs^T)
+                // qs.t() has shape (p_t, p_cov); slice to (p_t, chunk).
                 let rhs = qs.t().slice(ndarray::s![.., col_start..col_end]).to_owned();
-                debug_assert_eq!(rhs.nrows(), p_t);
-                debug_assert_eq!(rhs.ncols(), chunk);
                 match factor_t.solvemulti(&rhs) {
                     Ok(z_chunk) => {
-                        // z_chunk is p_t × chunk; (H_orig⁻¹)_{i,i} = Qs[i,:] · z_chunk[:,i-col_start]
+                        // z_chunk is (p_t × chunk).
+                        // (H_orig⁻¹)_{ii} = qs.row(i) · z_chunk.column(i - col_start)
                         for local_i in 0..chunk {
                             let global_i = col_start + local_i;
                             let qs_row = qs.row(global_i);

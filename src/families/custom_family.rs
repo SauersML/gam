@@ -13383,6 +13383,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let mut tr_log_sig: Option<String> = None;
             let mut tr_log_first: usize = 0;
             let mut tr_log_last: usize = 0;
+            // Hoist the two full-size scratch buffers used in the predicted-
+            // reduction computation outside the trust-region attempt loop.
+            // The loop runs up to JOINT_TRUST_MAX_ATTEMPTS times per outer
+            // Newton step, so allocating these per-attempt would add O(total_p)
+            // heap traffic on every radius shrink/expand iteration.
+            let mut hpen_delta = Array1::<f64>::zeros(total_p);
+            let mut tr_penalty_scratch = Array1::<f64>::zeros(total_p);
             for trust_attempt in 0..JOINT_TRUST_MAX_ATTEMPTS {
                 line_search_attempts = trust_attempt + 1;
                 accepted_joint_workspace = None;
@@ -13420,7 +13427,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     .any(|(step_norm, radius)| {
                         joint_block_step_hit_trust_boundary(*step_norm, *radius)
                     });
-                let mut hpen_delta = Array1::<f64>::zeros(total_p);
                 // Predicted reduction must use the TRUE penalized Hessian
                 // (the one that appears in `f(β) = -ℓ + ½βᵀSβ + ½·joint_mode_diagonal_ridge·‖β‖²`),
                 // NOT the SPD-stabilized version. The stabilizing shift
@@ -13440,13 +13446,19 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // repeats every cycle — exactly the biobank-saturated
                 // failure trace. Pinned by
                 // `ridge_stabilization_gap_produces_exact_rho_two_in_null_direction`.
-                if apply_joint_penalized_hessian_into(
+                //
+                // `hpen_delta` and `tr_penalty_scratch` are hoisted outside
+                // this loop; the workspace variant reuses them without
+                // allocating per attempt.
+                hpen_delta.fill(0.0);
+                if apply_joint_penalized_hessian_into_with_workspace(
                     &joint_hessian_source,
                     &ranges,
                     &s_lambdas,
                     joint_mode_diagonal_ridge,
                     &trial_delta,
                     &mut hpen_delta,
+                    &mut tr_penalty_scratch,
                     joint_bundle,
                 )
                 .is_err()

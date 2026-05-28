@@ -4952,9 +4952,14 @@ fn decide_row_primary_hessian_cache(
     runtime_available_bytes: u64,
     workspace_pinned_bytes: u64,
 ) -> RowPrimaryHessianCachePlan {
+    // Account for neglog (1 per row) + grad (r per row) + hess (r*r per row).
+    // For r=20 this is 1+20+400=421 vs 400 hess-only: ~5.25% overhead.
+    let floats_per_row = (r as u64)
+        .saturating_mul(r as u64)
+        .saturating_add(r as u64)
+        .saturating_add(1);
     let bytes = (n as u64)
-        .saturating_mul(r as u64)
-        .saturating_mul(r as u64)
+        .saturating_mul(floats_per_row)
         .saturating_mul(std::mem::size_of::<f64>() as u64);
     let single_cache_budget_bytes = runtime_available_bytes
         .saturating_mul(BMS_ROW_PRIMARY_HESSIAN_SINGLE_FRACTION_NUM)
@@ -5087,6 +5092,14 @@ struct BernoulliMarginalSlopeExactEvalCache {
     /// drives the row kernel through a non-cell path, or when the estimated
     /// resident bytes would exceed the active resource policy budget.
     row_cell_moments: Option<RowCellMomentsBundle>,
+    /// Lazily-built degree-15 bundle for outer dH (1st-derivative of Hessian)
+    /// trace paths. Only populated when those paths actually execute.
+    /// `RayonSafeOnce` keeps lazy initialization safe from parallel row passes.
+    row_cell_moments_d15: crate::resource::RayonSafeOnce<Result<Option<RowCellMomentsBundle>, String>>,
+    /// Lazily-built degree-21 bundle for outer d²H (2nd-derivative of Hessian)
+    /// trace paths. Only populated when those paths actually execute.
+    /// `RayonSafeOnce` keeps lazy initialization safe from parallel row passes.
+    row_cell_moments_d21: crate::resource::RayonSafeOnce<Result<Option<RowCellMomentsBundle>, String>>,
     /// Flexible-path per-β per-row primary Hessians (`r×r` blocks flattened
     /// row-major into one wide `Array2`).  The matrix-free inner Newton/CG
     /// loop contracts the same primary Hessian against many trial directions

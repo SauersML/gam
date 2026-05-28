@@ -391,9 +391,26 @@ extern "C" __global__ void chol_logdet_col_major(
         let penalty_export = penalty_with_ridge(input.penalty_hessian, input.objective_ridge);
         let penalized_hessian = xtwx_host + &penalty_export;
 
-        // Factor + solve in place on the stream.
-        potrf_in_place(&ws.solver, &ws.stream, p, &mut ws.h_dev)?;
-        potrs_in_place(&ws.solver, &ws.stream, p, 1, &ws.h_dev, &mut ws.rhs_dev)?;
+        // Factor + solve in place on the stream using pre-allocated workspace
+        // and info buffers — no per-step allocation, no per-step info download.
+        potrf_in_place_reuse(
+            &ws.solver,
+            &ws.stream,
+            p,
+            ws.potrf_lwork,
+            &mut ws.h_dev,
+            &mut ws.potrf_work_dev,
+            &mut ws.potrf_info_dev,
+        )?;
+        potrs_in_place_reuse(
+            &ws.solver,
+            &ws.stream,
+            p,
+            1,
+            &ws.h_dev,
+            &mut ws.rhs_dev,
+            &mut ws.potrs_info_dev,
+        )?;
 
         // Logdet device-side: reduces the previous p² Cholesky-factor
         // download to a single f64 download. Stage 2's "no per-iteration
@@ -1404,7 +1421,8 @@ extern "C" __global__ void status_or(
                     w_solver_dev: &loop_ws.row_out.w_solver,
                     grad_eta_dev: &loop_ws.row_out.grad_eta,
                     penalty_hessian,
-                    lm_ridge,
+                    step_lm_lambda: lm_ridge,
+                    objective_ridge,
                 },
             )
             .map_err(|e| format!("inner step it={it}: {e}"))?;
@@ -1616,7 +1634,8 @@ extern "C" __global__ void status_or(
         deviance: f64,
         iterations: usize,
         converged: bool,
-        lm_ridge: f64,
+        step_lm_lambda: f64,
+        objective_ridge: f64,
         extra: Option<&PirlsLoopExtra<'_>>,
         diagnostics: LoopDiagnostics,
     ) -> Result<PirlsLoopOutcome, String> {
@@ -1643,8 +1662,10 @@ extern "C" __global__ void status_or(
             crate::solver::pirls::PirlsStatus::MaxIterationsReached
         };
 
+        // RidgePassport is built from objective_ridge only — step_lm_lambda
+        // is a solve-only artefact and must never contaminate EDF / REML.
         let default_ridge = crate::types::RidgePassport::scaled_identity(
-            lm_ridge,
+            objective_ridge,
             crate::types::RidgePolicy::explicit_stabilization_full(),
         );
 

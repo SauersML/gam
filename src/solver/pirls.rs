@@ -11515,7 +11515,8 @@ fn calculate_edf_from_sparse_factor(
             "calculate_edf_from_sparse_factor requires PirlsPenalty::Dense"
         );
     };
-    let p = factor.n();
+    // e_transformed has shape (r, p) — cols give the coefficient dimension p.
+    let p = e_transformed.ncols();
     let r = e_transformed.nrows();
     let mp = ((p - r) as f64).max(0.0);
     if r == 0 {

@@ -8597,6 +8597,10 @@ impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorksp
         Ok(Some(self.dense_hessian()?.clone()))
     }
 
+    fn hessian_matvec_available(&self) -> bool {
+        true
+    }
+
     fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
         Ok(Some(self.apply_hessian(v)?))
     }

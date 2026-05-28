@@ -958,7 +958,7 @@ extern "C" __global__ void {kernel_name}(
 
 /// Device-resident per-row output buffers for the GPU row-reweight kernel.
 ///
-/// One buffer per [`RowOutput`] field, length `n`. The host launcher
+/// **final-row mode**: all nine per-[`RowOutput`] fields. The host launcher
 /// [`launch_row_reweight_on_stream`] writes into these on the supplied
 /// stream; downstream Stage-3 kernels (XᵀWX assembly, Xᵀg formation,
 /// line-search deviance reduction) read them in place without any host
@@ -1899,6 +1899,7 @@ mod pirls_row_gpu_tests {
                 backend,
                 family,
                 curvature,
+                1.0,
                 &stream,
                 n,
                 &eta_dev,
@@ -1995,6 +1996,7 @@ mod pirls_row_gpu_tests {
                         y: ys[i],
                         prior_weight: priors[i],
                     },
+                    1.0,
                 );
                 for (label, cpu_v, jit_v) in [
                     ("mu", cpu.mu, mu_j[i]),
