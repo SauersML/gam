@@ -7548,7 +7548,13 @@ impl DesignMatrix {
         }
         match self {
             Self::Dense(DenseDesignMatrix::Materialized(matrix)) => {
-                Ok(dense_xtwx_view(matrix, weights))
+                // The `compute_xtwx_view` entry point asserts the symmetric
+                // PSD-Gram contract — Fisher-scoring / canonical-link IRLS
+                // working weights only. Discharge the `w ≥ 0` obligation
+                // here at the boundary; downstream `dense_xtwx_view` then
+                // consumes `PsdWeightsView` without re-scanning.
+                let psd = PsdWeightsView::try_new(weights)?;
+                Ok(dense_xtwx_view(matrix, psd))
             }
             Self::Dense(DenseDesignMatrix::Lazy(op)) => op.diag_xtw_x(&weights.to_owned()),
             Self::Sparse(xs) => {
