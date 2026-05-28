@@ -26835,12 +26835,40 @@ fn dataset_from_x_array_with_model_schema(
     if x.ncols() == 0 {
         return Err("X must have at least one column".to_string());
     }
-    let headers = (0..x.ncols())
-        .map(|index| format!("x{index}"))
-        .collect::<Vec<_>>();
-    ensure_required_numeric_array_columns(model, &headers)?;
+    // Issue #341: predict_array on a model fitted with named columns used to
+    // tag the positional inputs as `x0, x1, ...` and then check those names
+    // against the training schema, which always failed for formula-fitted
+    // models (the schema speaks the original column names, e.g. `x`). The
+    // right semantics is: positional columns map, in order, to the feature
+    // columns captured at fit time. Recover that ordered list from the
+    // training headers minus anything the formula treats as response /
+    // offset / noise-offset / z / auxiliary-formula input. If the training
+    // headers were not saved (older payloads), fall back to schema order.
     let schema = model.require_data_schema()?;
-    dataset_from_numeric_array_with_schema(headers, x.to_owned(), schema)
+    let required = required_prediction_columns(model)?;
+    let payload = model.payload();
+    let ordered_feature_names: Vec<String> = match payload.training_headers.as_ref() {
+        Some(training_headers) => training_headers
+            .iter()
+            .filter(|name| required.contains(name.as_str()))
+            .cloned()
+            .collect(),
+        None => schema
+            .columns
+            .iter()
+            .filter(|column| required.contains(column.name.as_str()))
+            .map(|column| column.name.clone())
+            .collect(),
+    };
+    if ordered_feature_names.len() != x.ncols() {
+        return Err(format!(
+            "predict_array expected {} positional feature column(s) to match the training schema {:?}, but got {}",
+            ordered_feature_names.len(),
+            ordered_feature_names,
+            x.ncols()
+        ));
+    }
+    dataset_from_numeric_array_with_schema(ordered_feature_names, x.to_owned(), schema)
 }
 
 fn dataset_from_numeric_array(

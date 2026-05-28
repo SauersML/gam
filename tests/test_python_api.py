@@ -205,7 +205,10 @@ def test_fit_predict_summary_check_report_and_roundtrip(tmp_path: pathlib.Path) 
 
     loaded = gamfit.load(model_path)
     reloaded_prediction = loaded.predict(prediction_rows())
-    assert reloaded_prediction["mean"] == predicted["mean"]
+    np.testing.assert_allclose(
+        np.asarray(reloaded_prediction, dtype=float),
+        predicted_arr,
+    )
 
 
 def test_group_metadata_roundtrips_through_saved_model(tmp_path: pathlib.Path) -> None:
@@ -257,8 +260,14 @@ def test_pandas_diagnostics_and_plotting() -> None:
     model = gamfit.fit(training_frame(), "y ~ x")
 
     predicted = model.predict(prediction_frame())
-    assert isinstance(predicted, pd.DataFrame)
-    assert list(predicted.columns) == ["eta", "mean"]
+    # Default predict() returns a 1-D mean array regardless of input kind;
+    # tabular outputs (eta/mean/SE/intervals) are opt-in via return_type
+    # or by passing ``interval``.
+    predicted_arr = np.asarray(predicted, dtype=float)
+    assert predicted_arr.shape == (3,)
+    tabular = model.predict(prediction_frame(), return_type="pandas")
+    assert isinstance(tabular, pd.DataFrame)
+    assert list(tabular.columns) == ["eta", "mean"]
 
     diagnostics = model.diagnose(training_frame())
     assert diagnostics.metrics["rmse"] < 1e-3
