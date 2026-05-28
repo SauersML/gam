@@ -53,6 +53,9 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: >-
+            --model claude-opus-4-7
+            --permission-mode bypassPermissions
           additional_permissions: |
             actions: read
           prompt: |
