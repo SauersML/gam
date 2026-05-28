@@ -361,43 +361,18 @@ mod linux_impl {
         // Xᵀ·(prior_w · (y − offset)).
         let xtwy: Array1<f64> = x_original.t().dot(&yw);
 
-        let zero_shift: Array1<f64> = Array1::zeros(p);
         let prior_mean_zero: Array1<f64> = Array1::zeros(p);
 
         let mut outcomes: Vec<SigmaPointResult> = Vec::with_capacity(per_sigma.len());
         for (idx, pt) in per_sigma.iter().enumerate() {
-            let qs_opt: Option<ndarray::ArrayView2<'_, f64>> = {
-                // Use Qs only if it differs from identity.
-                let is_identity = pt.qs.diag().iter().all(|&v| (v - 1.0).abs() < 1e-14)
-                    && {
-                        let mut off_diag_zero = true;
-                        for r in 0..p {
-                            for c in 0..p {
-                                if r != c && pt.qs[[r, c]].abs() > 1e-14 {
-                                    off_diag_zero = false;
-                                    break;
-                                }
-                            }
-                        }
-                        off_diag_zero
-                    };
-                if is_identity { None } else { Some(pt.qs.view()) }
-            };
-            // Use per-point linear_shift; fall back to zero when it is all-zero.
-            let shift_ref: ndarray::ArrayView1<'_, f64> =
-                if pt.linear_shift.iter().all(|&v| v == 0.0) {
-                    zero_shift.view()
-                } else {
-                    pt.linear_shift.view()
-                };
             let pls = crate::solver::gpu::pirls_gpu::solve_gaussian_pls_gpu(
                 xtwx.view(),
                 xtwy.view(),
                 pt.s_transformed.view(),
-                shift_ref,
+                pt.linear_shift.view(),
                 prior_mean_zero.view(),
                 0.0,
-                qs_opt,
+                Some(pt.qs.view()),
             )
             .map_err(|e| {
                 crate::gpu_err!("gaussian sigma pool: point[{idx}] pls failed: {e}")
