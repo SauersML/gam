@@ -165,11 +165,12 @@ arrays are endpoint-stacked with shape `(K * n_rows, n_times)`;
 
 ## Uncertainty on the survival surface
 
-For location-scale survival, `with_uncertainty=True` produces delta-method
-standard errors:
+For location-scale survival, passing any `interval=...` produces
+delta-method standard errors (issue #342 — the single `interval` knob
+replaces the previous `with_uncertainty` boolean):
 
 ```python
-pred = model.predict(test_df, with_uncertainty=True)
+pred = model.predict(test_df, interval=0.95)
 
 S = pred.survival_at([1, 5, 10])
 se_S = pred.survival_se_at([1, 5, 10])
@@ -178,7 +179,7 @@ upper = (S + 1.96 * se_S).clip(0.0, 1.0)
 lower = (S - 1.96 * se_S).clip(0.0, 1.0)
 ```
 
-Other survival likelihood modes reject `with_uncertainty=True` at the
+Other survival likelihood modes reject any non-`None` `interval` at the
 Rust boundary. `Model.sample(...)` can draw posterior coefficients for
 supported saved survival models, but `PosteriorSamples.predict(...)` /
 `predict_draws(...)` are restricted to standard, non-link-wiggle GAMs;

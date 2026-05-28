@@ -2,7 +2,7 @@
 
 `Model.predict(...)` is the single prediction entry point. The return
 shape depends on the fitted model class and on the keyword arguments
-`interval`, `id_column`, `return_type`, and `with_uncertainty`.
+`interval`, `id_column`, and `return_type`.
 
 ## Signature
 
@@ -13,17 +13,15 @@ model.predict(
     interval: float | None = None,
     return_type: str | None = None,
     id_column: str | None = None,
-    with_uncertainty: bool = False,
 )
 ```
 
 | Argument | Default | Meaning |
 | --- | --- | --- |
 | `data` | required | Table-like input matching the training schema. |
-| `interval` | `None` | Pointwise Wald-interval coverage probability in `(0, 1)`. Honored by standard GLM families (Gaussian, binomial, Poisson, negative-binomial, Gamma) and Gaussian/binomial location-scale models. Ignored by survival, transformation-normal, and bernoulli marginal-slope predictions. |
+| `interval` | `None` | Single uncertainty knob (issue #342). `None` returns point predictions only; a float in `(0, 1)` (e.g. `0.95`) requests the full uncertainty decomposition at that pointwise coverage. On standard GLMs / location-scale this populates `effective_se`, `effective_variance`, `mean_lower`, `mean_upper`. On survival location-scale it populates `survival_se` and `eta_se` on the returned `SurvivalPrediction`. Other survival likelihoods and competing-risks reject any non-`None` value at the Rust boundary. Ignored by transformation-normal and bernoulli marginal-slope. |
 | `return_type` | `None` | One of `"dict"`, `"numpy"`, `"pandas"`, `"polars"`, `"pyarrow"` for table-shaped outputs. Defaults to the input table kind, falling back to the training table kind. |
 | `id_column` | `None` | Name of a column in `data` whose stringified values are carried through into table outputs and `SurvivalPrediction`. |
-| `with_uncertainty` | `False` | Survival location-scale models only. Populates `survival_se` and `eta_se` on the returned `SurvivalPrediction`. |
 
 ## Return value by model class
 
@@ -94,7 +92,7 @@ H = pred.cumulative_hazard_at([10, 20])     # cumulative hazard
 | `times` | `numpy.ndarray \| None` | Shared time grid for the dense surfaces. |
 | `hazard`, `survival`, `cumulative_hazard` | `numpy.ndarray \| None` | `(n_rows, len(times))` dense surfaces when produced by the FFI. |
 | `linear_predictor` | `numpy.ndarray \| None` | Linear predictor at each row's exit time. |
-| `survival_se` | `numpy.ndarray \| None` | Delta-method standard error on `S(t)`. Populated only when `with_uncertainty=True` for the location-scale likelihood. |
+| `survival_se` | `numpy.ndarray \| None` | Delta-method standard error on `S(t)`. Populated only when `interval=...` is set and the model uses the location-scale survival likelihood. |
 | `eta_se` | `numpy.ndarray \| None` | Delta-method standard error on the linear predictor under the same conditions as `survival_se`. |
 | `id_column`, `row_ids` | `str \| None`, `Sequence[str] \| None` | Set when `id_column=` was passed to `predict`. |
 
@@ -141,11 +139,12 @@ Writes one row per `(prediction_row, time)` pair. Columns are
 
 ### Survival uncertainty
 
-For the location-scale survival likelihood, `with_uncertainty=True`
-populates delta-method standard errors:
+For the location-scale survival likelihood, passing any `interval=...`
+populates delta-method standard errors (issue #342 — there is no
+separate `with_uncertainty` flag; the coverage level is the request):
 
 ```python
-pred = model.predict(test_df, with_uncertainty=True)
+pred = model.predict(test_df, interval=0.95)
 S = pred.survival_at([1, 5, 10])
 se = pred.survival_se_at([1, 5, 10])
 
@@ -154,8 +153,8 @@ lower = (S - 1.96 * se).clip(0.0, 1.0)
 ```
 
 Other survival likelihood modes (transformation, Weibull, marginal-slope,
-latent, latent-binary) and competing-risks survival reject
-`with_uncertainty=True` at the Rust boundary. For those, use
+latent, latent-binary) and competing-risks survival reject any
+`interval=...` at the Rust boundary. For those, use
 `Model.sample(...)` to draw posterior coefficients; note that
 `PosteriorSamples.predict_draws(...)` is restricted to standard
 non-link-wiggle GAMs (see `posterior-sampling.md`).
