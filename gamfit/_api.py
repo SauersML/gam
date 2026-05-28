@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import difflib
+import functools
+import inspect
 import json
 import math
 import re
@@ -633,6 +636,53 @@ def _normalize_fisher_rao_w(value: Any, *, n_rows: int, dim: int) -> Any:
     return out
 
 
+_KWARG_TYPO_PATTERN = re.compile(r"unexpected keyword argument [\"']([^\"']+)[\"']")
+
+
+def _suggest_kwarg_typo(fn: Any) -> Any:
+    """Decorator: turn ``TypeError("...unexpected keyword argument 'X'...")``
+    into the same TypeError with a ``Did you mean 'Y'?`` hint appended.
+
+    Python 3.13 already adds these hints natively (PEP 657), but earlier
+    Python versions (3.10 - 3.12) raise a bare TypeError; this wrapper
+    backfills the hint uniformly so callers on any supported Python see the
+    same actionable message for case typos like ``formuLa=`` / ``Familiy=``
+    / ``Offset=`` against a long-keyword-list API (~25 kwargs). (issue #306)
+    """
+    sig = inspect.signature(fn)
+    known = frozenset(
+        name
+        for name, param in sig.parameters.items()
+        if param.kind
+        in (
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    )
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return fn(*args, **kwargs)
+        except TypeError as exc:
+            message = str(exc)
+            if "Did you mean" in message:
+                raise
+            match = _KWARG_TYPO_PATTERN.search(message)
+            if match is None:
+                raise
+            bad = match.group(1)
+            if bad in known:
+                raise
+            suggestions = difflib.get_close_matches(bad, known, n=1, cutoff=0.6)
+            if not suggestions:
+                raise
+            enriched = TypeError(f"{message}. Did you mean {suggestions[0]!r}?")
+            raise enriched from exc.__cause__
+
+    return wrapper
+
+
 @overload
 def fit(
     data: Any,
@@ -707,6 +757,7 @@ def fit(
 ) -> ResponseGeometryModel: ...
 
 
+@_suggest_kwarg_typo
 def fit(
     data: Any,
     formula: str,
@@ -980,6 +1031,7 @@ def fit(
     return Model(_model_bytes=model_bytes, _training_table_kind=table_kind)
 
 
+@_suggest_kwarg_typo
 def fit_array(
     X: Any,
     Y: Any,
@@ -1138,6 +1190,7 @@ def loads(model_bytes: bytes) -> Model:
     return Model(_model_bytes=model_bytes)
 
 
+@_suggest_kwarg_typo
 def validate_formula(
     data: Any,
     formula: str,

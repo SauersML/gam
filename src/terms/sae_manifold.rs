@@ -1725,6 +1725,21 @@ impl SaeManifoldTerm {
         self.atoms.len()
     }
 
+    /// True when every atom carries the same coord latent dim. Row-block
+    /// analytic penalties (ARD, BlockOrthogonality, Sparsity/TopK/JumpReLU,
+    /// RowPrecisionPrior, ScadMcp, Isometry) target the "t" latent block
+    /// (n_obs × d_max). Per-atom dispatch is only correct when every coord
+    /// block matches the penalty target shape — i.e. when all atoms share
+    /// `latent_dim`. The K=1 case trivially satisfies this.
+    pub fn coords_share_latent_dim(&self) -> bool {
+        let mut iter = self.assignment.coords.iter().map(|c| c.latent_dim());
+        let first = match iter.next() {
+            Some(d) => d,
+            None => return true,
+        };
+        iter.all(|d| d == first)
+    }
+
     pub fn output_dim(&self) -> usize {
         self.atoms[0].output_dim()
     }
@@ -2450,9 +2465,24 @@ impl SaeManifoldTerm {
                             | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
                     ) {
                         self.add_sae_logit_penalty(sys, penalty, logits_flat.view(), rho_local);
-                    } else if self.k_atoms() == 1 && sae_penalty_is_row_block_supported(penalty) {
-                        let off = self.assignment.coord_offsets()[0];
-                        let coord = &self.assignment.coords[0];
+                    } else if sae_penalty_is_row_block_supported(penalty)
+                        && self.coords_share_latent_dim()
+                    {
+                        // Row-block coord penalties (ARD, BlockOrthogonality,
+                        // Sparsity/TopK/JumpReLU, RowPrecisionPrior, ScadMcp,
+                        // Isometry) target the "t" latent block (n_obs ×
+                        // d_max). When every atom shares the same coord
+                        // latent dimension, the penalty's `(n_eff, d)` target
+                        // shape matches each atom's `(N, d_k)` coord block
+                        // exactly, so we dispatch per atom and accumulate
+                        // into the corresponding row offsets. The K=1 case
+                        // is just the K-atom loop with K=1 (preserves the
+                        // K=1 fast path bit-for-bit because the single atom
+                        // gets the same `off`/`coord`/`atom` as before).
+                        let offsets = self.assignment.coord_offsets();
+                        for atom_idx in 0..self.k_atoms() {
+                            let off = offsets[atom_idx];
+                            let coord = &self.assignment.coords[atom_idx];
                         // Isometry requires per-step cache refresh from the
                         // atom's second jet before grad_target / hvp are live.
                         // The registry-held IsometryPenalty was constructed
@@ -2461,7 +2491,7 @@ impl SaeManifoldTerm {
                         // decoder output dimension; we build a corrected copy
                         // here with the right p_out and populated caches.
                         if let AnalyticPenaltyKind::Isometry(iso) = penalty {
-                            let atom = &self.atoms[0];
+                            let atom = &self.atoms[atom_idx];
                             // The registry penalty was built with p_out equal
                             // to the latent dim (the "t" JSON block's `d`),
                             // but IsometryPenalty.p_out must match the atom's
@@ -2547,10 +2577,13 @@ impl SaeManifoldTerm {
                         } else {
                             self.add_sae_coord_penalty(sys, off, coord, penalty, rho_local);
                         }
+                        }
                     } else {
                         return Err(ArrowSchurError::SchurFactorFailed {
                             reason: format!(
-                                "analytic penalty {name:?} cannot be injected into the SAE-manifold row layout; multi-atom coordinate or cross-row penalties require an explicit atom target"
+                                "analytic penalty {name:?} cannot be injected into the SAE-manifold row layout; multi-atom coordinate or cross-row penalties require an explicit atom target (k_atoms={}, coords_share_latent_dim={})",
+                                self.k_atoms(),
+                                self.coords_share_latent_dim(),
                             ),
                         });
                     }
