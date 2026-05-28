@@ -23373,6 +23373,10 @@ mod tests {
             Ok(Some(Array2::eye(2)))
         }
 
+        fn hessian_matvec_available(&self) -> bool {
+            true
+        }
+
         fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
             self.matvec_calls.fetch_add(1, Ordering::Relaxed);
             Ok(Some(v.clone()))

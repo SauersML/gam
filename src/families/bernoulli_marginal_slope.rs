@@ -9652,6 +9652,22 @@ impl BernoulliMarginalSlopeFamily {
         primary_vec: &Array1<f64>,
     ) -> Result<Array1<f64>, String> {
         let mut out = Array1::<f64>::zeros(slices.total);
+        self.pullback_primary_vector_add_into(row, slices, primary, primary_vec, &mut out)?;
+        Ok(out)
+    }
+
+    /// Allocation-free variant of [`Self::pullback_primary_vector`]: *adds*
+    /// the pullback of `primary_vec` into the existing accumulator `out`
+    /// (length `slices.total`).  `out` is **not** zeroed first; the caller
+    /// must initialise it before the first call on a given accumulation.
+    fn pullback_primary_vector_add_into(
+        &self,
+        row: usize,
+        slices: &BlockSlices,
+        primary: &PrimarySlices,
+        primary_vec: &Array1<f64>,
+        out: &mut Array1<f64>,
+    ) -> Result<(), String> {
         {
             let mut marginal = out.slice_mut(s![slices.marginal.clone()]);
             self.marginal_design
@@ -9668,22 +9684,20 @@ impl BernoulliMarginalSlopeFamily {
         if let Some(primary_h) = primary.h.as_ref()
             && let Some(block_h) = slices.h.as_ref()
         {
-            out.slice_mut(s![block_h.clone()]).assign(
-                &primary_vec
-                    .slice(s![primary_h.start..primary_h.end])
-                    .to_owned(),
-            );
+            out.slice_mut(s![block_h.clone()])
+                .zip_mut_with(&primary_vec.slice(s![primary_h.start..primary_h.end]), |a, &b| {
+                    *a += b;
+                });
         }
         if let Some(primary_w) = primary.w.as_ref()
             && let Some(block_w) = slices.w.as_ref()
         {
-            out.slice_mut(s![block_w.clone()]).assign(
-                &primary_vec
-                    .slice(s![primary_w.start..primary_w.end])
-                    .to_owned(),
-            );
+            out.slice_mut(s![block_w.clone()])
+                .zip_mut_with(&primary_vec.slice(s![primary_w.start..primary_w.end]), |a, &b| {
+                    *a += b;
+                });
         }
-        Ok(out)
+        Ok(())
     }
 
     fn block_psi_row_from_map(
@@ -28514,6 +28528,8 @@ mod tests {
             primary: cached.primary.clone(),
             row_contexts: cached.row_contexts.clone(),
             row_cell_moments: None,
+            row_cell_moments_d15: crate::resource::RayonSafeOnce::new(),
+            row_cell_moments_d21: crate::resource::RayonSafeOnce::new(),
             row_primary_hessians: RowPrimaryHessianCache::Empty,
             rigid_third_full: crate::resource::RayonSafeOnce::new(),
             rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
