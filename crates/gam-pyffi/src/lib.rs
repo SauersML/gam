@@ -22500,9 +22500,19 @@ fn predict_columns(
     let fit = fit_result_from_saved_model_for_prediction(model)?;
 
     let mut columns = BTreeMap::<String, Vec<f64>>::new();
-    if let Some(interval) = options.interval {
+    // Issue #342: `with_uncertainty=True` used to be silently ignored on the
+    // non-survival predict path (only the survival branch wired it through).
+    // Honor it here too: when either an explicit `interval` is requested OR
+    // `with_uncertainty` is set, run the full-uncertainty predictor and
+    // emit SE columns. CI bound columns (`mean_lower`/`mean_upper`) are
+    // emitted only when an interval was explicitly requested; otherwise
+    // returning bounds tied to an undocumented default would mislead.
+    if options.interval.is_some() || options.with_uncertainty {
+        // Confidence level only matters when CI bounds are emitted; pick a
+        // conventional default when the caller asked for SE only.
+        let confidence_level = options.interval.unwrap_or(0.95);
         let uncertainty_options = gam::predict::PredictUncertaintyOptions {
-            confidence_level: interval,
+            confidence_level,
             covariance_mode:
                 gam::predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
             mean_interval_method: gam::predict::MeanIntervalMethod::TransformEta,
@@ -22527,8 +22537,10 @@ fn predict_columns(
                 .map(|se| se * se)
                 .collect(),
         );
-        columns.insert("mean_lower".to_string(), prediction.mean_lower.to_vec());
-        columns.insert("mean_upper".to_string(), prediction.mean_upper.to_vec());
+        if options.interval.is_some() {
+            columns.insert("mean_lower".to_string(), prediction.mean_lower.to_vec());
+            columns.insert("mean_upper".to_string(), prediction.mean_upper.to_vec());
+        }
     } else {
         let prediction = predictor
             .predict_plugin_response(&predict_input)
@@ -26946,23 +26958,6 @@ fn dataset_from_numeric_array_with_schema(
         },
         column_kinds,
     })
-}
-
-fn ensure_required_numeric_array_columns(
-    model: &FittedModel,
-    headers: &[String],
-) -> Result<(), String> {
-    let expected_names = required_prediction_columns(model)?;
-    let present_names = headers.iter().cloned().collect::<BTreeSet<_>>();
-    let missing = expected_names
-        .difference(&present_names)
-        .map(|name| format!("missing required column '{name}'"))
-        .collect::<Vec<_>>();
-    if missing.is_empty() {
-        Ok(())
-    } else {
-        Err(missing.join(" "))
-    }
 }
 
 fn ensure_unique_headers(headers: &[String]) -> Result<(), String> {
