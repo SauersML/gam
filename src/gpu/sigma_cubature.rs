@@ -113,20 +113,20 @@ fn pool_size(m: usize) -> usize {
 /// Returns `Ok(Some(results))` when every sigma point produced a usable GPU
 /// result, `Ok(None)` when the device is unavailable (non-Linux or no
 /// runtime), `Err(_)` on driver / shape failure.
+/// `x_original`: Original (pre-reparameterization) dense design matrix X_original, shape n × p.
+/// Uploaded to device once and reused across all sigma points.
+/// `gamma_shape`: Active Gamma dispersion shape (α > 0). Pass `1.0` for non-Gamma families.
 pub fn try_gpu_sigma_stream_pool_eval(
-    /// Original (pre-reparameterization) dense design matrix X_original, shape n × p.
-    /// Uploaded to device once and reused across all sigma points.
     x_original: ndarray::ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
     prior_w: ArrayView1<'_, f64>,
     offset: ArrayView1<'_, f64>,
     per_sigma: &[SigmaPointGpuInput],
     admission: crate::gpu::policy::PirlsLoopAdmission,
-    /// Active Gamma dispersion shape (α > 0). Pass `1.0` for non-Gamma families.
     gamma_shape: f64,
     convergence_tol: f64,
     max_iter: usize,
-) -> Result<Option<Vec<crate::solver::reml::eval::SigmaPointResult>>, GpuError> {
+) -> Result<Option<Vec<crate::solver::estimate::reml::eval::SigmaPointResult>>, GpuError> {
     if per_sigma.is_empty() {
         return Ok(Some(Vec::new()));
     }
@@ -174,7 +174,7 @@ mod linux_impl {
     use crate::gpu::policy::{PirlsLoopCurvatureKind, PirlsLoopFamilyKind};
     use crate::gpu::sigma_cubature::SigmaPointGpuInput;
     use crate::linalg::utils::matrix_inversewith_regularization;
-    use crate::solver::reml::eval::SigmaPointResult;
+    use crate::solver::estimate::reml::eval::SigmaPointResult;
     use ndarray::{Array1, ArrayView1};
 
     pub(super) fn family_kind_to_row(f: PirlsLoopFamilyKind) -> Option<PirlsRowFamily> {

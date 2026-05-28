@@ -389,6 +389,7 @@ pub fn ift_warm_start_latent(
     delta_gt: Option<ArrayView1<'_, f64>>,
 ) -> LatentIftOutcome {
     let n = cache.n_rows();
+    let d = cache.d;
     let k = cache.k;
     let total_dt_len = cache.delta_t_len();
 

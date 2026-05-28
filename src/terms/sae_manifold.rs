@@ -1952,9 +1952,11 @@ impl SaeManifoldTerm {
 
         // Decoder smoothness penalty: build one KroneckerPenaltyOp per atom
         // (structure = λ·S_k ⊗ I_p, offset = beta_offsets[k]) instead of
-        // materialising the dense K×K block.  The gradient is still written into
-        // sys.gb because it is a dense K-vector; only the Hessian is sparse (#296).
+        // materialising the dense K×K block.  The gradient is a dense K-vector
+        // accumulated into `smooth_grad_gb` and written into sys.gb after sys
+        // is constructed (#296).
         let mut smooth_ops: Vec<Arc<dyn BetaPenaltyOp>> = Vec::with_capacity(self.atoms.len());
+        let mut smooth_grad_gb = vec![0.0_f64; beta_dim];
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
             let m = atom.basis_size();
             let off = beta_offsets[atom_idx];
@@ -1974,7 +1976,7 @@ impl SaeManifoldTerm {
                     for j in 0..m {
                         grad += scaled_s[[i, j]] * atom.decoder_coefficients[[j, out_col]];
                     }
-                    sys.gb[beta_i] += grad;
+                    smooth_grad_gb[beta_i] += grad;
                 }
             }
             // KroneckerPenaltyOp: factor_a = λ·S_k (m×m), factor_b = I_p (p×p).
@@ -2026,6 +2028,10 @@ impl SaeManifoldTerm {
         } else {
             ArrowSchurSystem::new(n, q, beta_dim)
         };
+        // Apply accumulated smoothness-penalty gradients into sys.gb.
+        for (i, g) in smooth_grad_gb.iter().enumerate() {
+            sys.gb[i] += g;
+        }
         // Hoist per-row temporaries outside the row loop: these allocations
         // previously fired N times per assembly, and each `decoded_row` /
         // `decoded_derivative_row` call inside the loop allocated its own
@@ -3685,7 +3691,7 @@ mod tests {
             AssignmentMode::softmax(0.7),
         )
         .unwrap();
-        let term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
         let target = array![[0.20], [-0.10], [0.45]];
         let rho = SaeManifoldRho::new(0.0, -20.0, vec![Array1::<f64>::zeros(1)]);
 

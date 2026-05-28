@@ -492,24 +492,45 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
     }
 
     let joint_rank_deficient = joint_rank < p_total;
-    // Hard-halt cases (the audit-gate from task #5 — the safety net that
-    // would have prevented the biobank `eval=1/12` hours-long hang):
+    // Hard-halt and gauge-resolvability classification.
     //
-    //   (a) `joint_rank < p_total` — the joint design is structurally
-    //       rank-deficient. Whether RRQR attributed the deficiency via
-    //       `dropped_columns` does NOT change the fact that the inner
-    //       penalised-Newton KKT system has a non-trivial null space
-    //       inherited by the outer Hessian: the outer optimiser will
-    //       silently spin on the unattributed direction. The previous
-    //       gate (`deficient && pairs.empty() && drops.empty()`) only
-    //       fired when attribution was IMPOSSIBLE; that's the wrong
-    //       boundary because "attributed" does not imply "fittable".
+    // # Canonical-gauge contract
     //
-    //   (b) Any pairwise overlap `>= HARD_HALT_OVERLAP_THRESHOLD` (0.99)
-    //       between two named blocks. Two distinct blocks contributing
-    //       the same direction to within 1% noise floor is structurally
-    //       unfittable regardless of penalty values, regardless of
-    //       whether the joint rank happens to be full at this n.
+    // When the caller supplies a non-trivial `gauge_priority` configuration
+    // (at least two distinct priority values), the canonical-gauge pipeline
+    // (`canonicalize_for_identifiability`) is designed to handle cross-block
+    // rank deficiency by presenting higher-priority columns first to the
+    // RRQR pivot and attributing the alias drops to the lower-priority
+    // block. The audit MUST NOT FATAL on this case — doing so defeats the
+    // entire pipeline.
+    //
+    // # Hard-halt cases (always fatal regardless of gauge)
+    //
+    //   (a) Cross-block alias pair with overlap >= HARD_HALT_OVERLAP_THRESHOLD
+    //       where the two blocks carry the SAME `gauge_priority` — no
+    //       ordering exists to decide which block loses the direction. This
+    //       is the original "two blocks contributing the same direction, inner
+    //       KKT has no unique minimiser" failure mode the gate was built for.
+    //       When priorities differ, the canonical-gauge RRQR ordering resolves
+    //       the alias deterministically; do NOT halt those.
+    //
+    //   (b) Joint rank deficiency that gauge CANNOT resolve:
+    //       - All specs carry equal priority (no gauge ordering) AND
+    //         joint rank < p_total, OR
+    //       - Attribution is incomplete (dropped_columns.len() <
+    //         p_total - joint_rank) — unattributed null directions that
+    //         RRQR could not trace to any single block, OR
+    //       - A dropped column belongs to a block that is the HIGHER-priority
+    //         participant in its alias pair — RRQR attributed the drop to
+    //         the wrong block (guard against internal bugs).
+    //
+    // # Gauge-resolvable (non-fatal even with dropped columns / rank deficiency)
+    //
+    //   - All specs have at least two distinct priority values, AND
+    //   - RRQR attributed every deficient column (full attribution), AND
+    //   - Each attributed drop's block is the LOWER-priority participant
+    //     in at least one alias pair above the reporting threshold (confirming
+    //     the priority-ordered RRQR routed the drop to the correct block).
     //
     // RRQR's tolerance can disagree with the column-norm pairwise scan
     // on edge cases (e.g. a high-overlap pair that RRQR keeps because
@@ -523,16 +544,88 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
     // audit; they invoke
     // `audit_identifiability_channel_aware` with their per-block row
     // Jacobian operators + structural row Hessian.
+
+    // Name-to-priority lookup (one entry per spec; the audit may have
+    // duplicate block names across runs but not within a single call).
+    let block_priority: std::collections::HashMap<&str, u8> = specs
+        .iter()
+        .map(|s| (s.name.as_str(), s.gauge_priority))
+        .collect();
+
+    // True when all specs share the same gauge_priority value — in that
+    // case no priority ordering can resolve cross-block aliases and the
+    // original halt-on-deficiency behaviour is correct.
+    let all_priorities_equal = specs
+        .iter()
+        .all(|s| s.gauge_priority == specs[0].gauge_priority);
+
+    // A hard-alias pair is gauge-unresolvable (and thus causes a fatal halt)
+    // when both participating blocks have the SAME priority.  Cross-block
+    // pairs with strictly different priorities are resolved by the priority-
+    // ordered RRQR: the lower-priority block's column is demoted into the
+    // trailing rank-deficient space, leaving the higher-priority block's
+    // direction intact.  Two blocks contributing the same direction is only
+    // *unfittable* when no ordering exists to pick which one to drop.
     let hard_alias_pair = aliased_pairs
         .iter()
+        .filter(|p| p.overlap >= HARD_HALT_OVERLAP_THRESHOLD)
+        .filter(|p| {
+            let pa = block_priority
+                .get(p.block_a.as_str())
+                .copied()
+                .unwrap_or(100);
+            let pb = block_priority
+                .get(p.block_b.as_str())
+                .copied()
+                .unwrap_or(100);
+            // Same priority → ambiguous → halt.
+            // Distinct priorities → canonical-gauge resolves → do not halt.
+            pa == pb
+        })
         .max_by(|a, b| {
             a.overlap
                 .partial_cmp(&b.overlap)
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
-        .filter(|p| p.overlap >= HARD_HALT_OVERLAP_THRESHOLD)
         .cloned();
-    let fatal = joint_rank_deficient || hard_alias_pair.is_some();
+
+    // Gauge can resolve the rank deficiency when:
+    //   1. Not all priorities are equal (an ordering exists).
+    //   2. RRQR attributed every deficient column (complete attribution).
+    //   3. Each attributed drop's block is a lower-priority participant in
+    //      at least one alias pair — confirming the priority-ordered RRQR
+    //      correctly routed the drop to the lower-priority block.
+    let rank_deficiency_count = p_total.saturating_sub(joint_rank);
+    let attribution_complete =
+        rank_deficiency_count > 0 && dropped_columns.len() == rank_deficiency_count;
+    let gauge_resolves_rank_deficiency = !all_priorities_equal
+        && attribution_complete
+        && dropped_columns.iter().all(|drop| {
+            let drop_priority = block_priority
+                .get(drop.block.as_str())
+                .copied()
+                .unwrap_or(100);
+            // The drop is correctly attributed when there exists at least one
+            // alias pair where this block is the LOWER-priority participant
+            // (i.e. the other block has strictly higher priority).
+            aliased_pairs.iter().any(|pair| {
+                let other_block = if pair.block_a == drop.block {
+                    pair.block_b.as_str()
+                } else if pair.block_b == drop.block {
+                    pair.block_a.as_str()
+                } else {
+                    return false;
+                };
+                let other_priority = block_priority
+                    .get(other_block)
+                    .copied()
+                    .unwrap_or(100);
+                other_priority > drop_priority
+            })
+        });
+
+    let fatal =
+        (joint_rank_deficient && !gauge_resolves_rank_deficiency) || hard_alias_pair.is_some();
 
     let fatal_detail = if fatal {
         let mut parts: Vec<String> = Vec::new();
@@ -580,6 +673,18 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
             ));
         }
         format!(" — FATAL: {}", parts.join("; "))
+    } else if gauge_resolves_rank_deficiency {
+        // Non-fatal: the canonical-gauge pipeline will attribute the
+        // alias drops to the lower-priority blocks and proceed with
+        // reduced specs. This is the expected outcome for families like
+        // survival marginal-slope where time/marginal/logslope carry
+        // overlapping directions that the priority ordering resolves.
+        format!(
+            " — gauge-attributed drops: {} column(s) attributed to lower-priority blocks \
+             via gauge_priority ordering; canonical-gauge pipeline will proceed with \
+             reduced specs",
+            dropped_columns.len(),
+        )
     } else if !aliased_pairs.is_empty() {
         " — partial alias(es) below halt threshold; penalty + line search will resolve".to_string()
     } else {
@@ -768,20 +873,70 @@ pub fn audit_identifiability_channel_aware(
 
     let joint_rank = compiled.joint_rank;
     let joint_rank_deficient = joint_rank < p_total;
+
+    // Same gauge-priority gating as the flat audit path (see the
+    // corresponding comment in `audit_identifiability`).
+    let block_priority_ca: std::collections::HashMap<&str, u8> = specs
+        .iter()
+        .map(|s| (s.name.as_str(), s.gauge_priority))
+        .collect();
+    let all_priorities_equal_ca = specs
+        .iter()
+        .all(|s| s.gauge_priority == specs[0].gauge_priority);
+
     let hard_alias_pair = aliased_pairs
         .iter()
+        .filter(|p| p.overlap >= HARD_HALT_OVERLAP_THRESHOLD)
+        .filter(|p| {
+            let pa = block_priority_ca
+                .get(p.block_a.as_str())
+                .copied()
+                .unwrap_or(100);
+            let pb = block_priority_ca
+                .get(p.block_b.as_str())
+                .copied()
+                .unwrap_or(100);
+            pa == pb
+        })
         .max_by(|a, b| {
             a.overlap
                 .partial_cmp(&b.overlap)
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
-        .filter(|p| p.overlap >= HARD_HALT_OVERLAP_THRESHOLD)
         .cloned();
-    let fatal = joint_rank_deficient || hard_alias_pair.is_some();
+
+    let rank_deficiency_count_ca = p_total.saturating_sub(joint_rank);
+    let attribution_complete_ca =
+        rank_deficiency_count_ca > 0 && dropped_columns.len() == rank_deficiency_count_ca;
+    let gauge_resolves_rank_deficiency_ca = !all_priorities_equal_ca
+        && attribution_complete_ca
+        && dropped_columns.iter().all(|drop| {
+            let drop_priority = block_priority_ca
+                .get(drop.block.as_str())
+                .copied()
+                .unwrap_or(100);
+            aliased_pairs.iter().any(|pair| {
+                let other_block = if pair.block_a == drop.block {
+                    pair.block_b.as_str()
+                } else if pair.block_b == drop.block {
+                    pair.block_a.as_str()
+                } else {
+                    return false;
+                };
+                let other_priority = block_priority_ca
+                    .get(other_block)
+                    .copied()
+                    .unwrap_or(100);
+                other_priority > drop_priority
+            })
+        });
+
+    let fatal = (joint_rank_deficient && !gauge_resolves_rank_deficiency_ca)
+        || hard_alias_pair.is_some();
 
     let fatal_detail = if fatal {
         let mut parts: Vec<String> = Vec::new();
-        if joint_rank_deficient {
+        if joint_rank_deficient && !gauge_resolves_rank_deficiency_ca {
             let attribution = if let Some(first_drop) = dropped_columns.first() {
                 format!(
                     "first attributed drop: block '{}' local column {} \
@@ -819,6 +974,13 @@ pub fn audit_identifiability_channel_aware(
             ));
         }
         format!(" — FATAL: {}", parts.join("; "))
+    } else if gauge_resolves_rank_deficiency_ca {
+        format!(
+            " — gauge-attributed drops (channel-aware): {} column(s) attributed to \
+             lower-priority blocks via gauge_priority ordering; canonical-gauge pipeline \
+             will proceed with reduced specs",
+            dropped_columns.len(),
+        )
     } else if !aliased_pairs.is_empty() {
         " — partial alias(es) below halt threshold (channel-aware); penalty + line search will resolve"
             .to_string()

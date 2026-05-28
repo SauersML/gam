@@ -8063,7 +8063,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     // `final_aug_matrix` allocation; the sparse path still allocates
     // internally because no pre-computed factor is available at this site.
     let mut edf = if let Some(dense_h) = penalized_hessian_transformed.as_dense() {
-        calculate_edfwithworkspace_with_penalty(dense_h, &penalty_active, &mut workspace)?
+        calculate_edfwithworkspace_with_penalty(dense_h, &penalty_active, &mut working_model.workspace)?
     } else {
         calculate_edf_with_penalty(&penalized_hessian_transformed, &penalty_active)?
     };
