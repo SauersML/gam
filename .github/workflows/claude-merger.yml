@@ -1,0 +1,174 @@
+name: Claude Merger (improve, merge, release)
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"
+
+concurrency:
+  group: claude-merger
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      id-token: write
+      actions: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install publishing tools
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install build twine maturin
+
+      - name: Install gam CLI
+        run: |
+          set -euxo pipefail
+          curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Run Claude merger agent
+        uses: anthropics/claude-code-action@v1
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          additional_permissions: |
+            actions: read
+          prompt: |
+            Hi Claude. You have the run of this repo, an Ubuntu runner, no
+            turn budget, and as long as you need.
+
+            Your job each run, in order:
+
+              1. Find the open PR most worth landing this run.
+              2. Make it beautiful — bring any in-scope work into the PR
+                 itself until the change is genuinely complete and
+                 principled, not just "passes CI."
+              3. If main has moved, rebase / merge main into the PR branch
+                 by hand-resolving every conflict line-by-line.
+              4. Merge into `main` directly (no intermediate branches).
+              5. Bump versions and publish: crates.io for the Rust crate,
+                 PyPI for the `gamfit` Python wheel.
+              6. Monitor the publish workflows until they actually succeed
+                 on the registries.
+
+            ## 1 — Picking the PR
+
+            `gh pr list --state open --limit 100`, then `gh pr view <N>`
+            on the candidates. Skip:
+              - Drafts.
+              - PRs whose head ref had a commit pushed in the last 45
+                minutes (the fixer agent's heartbeat — they're not done).
+              - PRs with an explicit `do-not-merge` / `wip` label.
+            From the rest, pick what you judge most worth landing — the
+            most impactful, the most overdue, the most under-attended
+            subsystem. Your call. If nothing qualifies, exit cleanly.
+
+            **Never close a PR.** No `gh pr close`, ever. If a PR
+            shouldn't merge as-is, you improve it until it should.
+
+            ## 2 — Improve until it's beautiful
+
+            Bring work into scope freely. Suboptimal PR? Push the
+            improvements onto its branch directly. Missing tests, brittle
+            abstraction, sloppy error handling, half-implemented
+            adjacent thing the PR pretends to address — fix it in the
+            same PR. The bar is the same as the fixer agent's: principled,
+            root-cause, long-term correct, fully verified. Comment on the
+            PR as you go so the author / observers see the trail.
+
+            If the PR's underlying issue is only partially addressed
+            (e.g. the PR fixes the reported symptom but not the deeper
+            root cause), finish the deeper work in the same PR before
+            merging. Do not merge a half-fix and tell yourself a follow-
+            up will land later.
+
+            ## 3 — Conflict resolution, by hand
+
+            If `main` has moved and conflicts arise, merge `main` into
+            the PR branch (`git checkout <pr-branch> && git merge origin/main`)
+            and resolve every conflict by reading both sides and writing
+            the correct unified content yourself using Edit / Write. No
+            strategy flags — no `-X theirs`, no `-X ours`, no
+            `--strategy ours`. Every conflict hunk is a real semantic
+            decision that you make explicitly. Verify the resolution
+            builds and the relevant tests pass before continuing.
+
+            ## 4 — Merge into main
+
+            Once the PR is complete, conflicts resolved, tests green for
+            the touched subsystem, merge it into `main`:
+                `gh pr merge <N> --merge --delete-branch=false`
+            (or `--squash` if the history is messy and squashing produces
+            a cleaner record — your call). No intermediate branches, no
+            staging branches. Direct to `main`.
+
+            ## 5 — Bump versions and publish
+
+            After every merge that lands user-facing code, cut a release:
+
+              - **Rust crate (crates.io):** bump the version in the
+                workspace `Cargo.toml` (and any member crates that
+                publish). Pick the right semver step from the merged
+                diff: patch for fixes / internal cleanup, minor for new
+                public surface, major for breaking changes. Commit
+                directly to `main` with a message like
+                `release: gam vX.Y.Z`.
+              - **Python wrapper (PyPI):** bump `version` in
+                `pyproject.toml` for `gamfit`. Same semver judgment.
+                Commit to `main`: `release: gamfit vX.Y.Z`.
+
+            Push the version-bump commits. Then trigger / let fire the
+            repo's existing publish workflows (look under
+            `.github/workflows/` — `publish.yml`, `pypi-wheels.yml`, etc.
+            are the likely suspects; read them so you know what they
+            expect — a pushed tag, a manual dispatch, a version change).
+            If the existing flow needs a tag, create and push the tag
+            (`git tag gam-vX.Y.Z`, `git push origin gam-vX.Y.Z` etc.).
+
+            **Secrets:** `CARGO_REGISTRY_TOKEN` and `PYPI_API_TOKEN` are
+            available in the environment if you need to publish directly
+            (`cargo publish`, `twine upload`). Prefer the existing
+            workflow path if it exists — it's set up the way the
+            maintainer wants. Fall back to direct publish only if the
+            workflow path is broken.
+
+            ## 6 — Watch the publish through
+
+            Don't declare victory on `git push`. Watch the publish
+            workflow runs (`gh run watch <id>` or poll `gh run list`)
+            until they finish. If they fail, read the logs, fix the
+            cause, push again, watch again. Loop until both crates.io
+            and PyPI confirm the new versions are live:
+              - `curl -s https://crates.io/api/v1/crates/<crate>/versions | jq '.versions[0].num'`
+              - `curl -s https://pypi.org/pypi/gamfit/json | jq -r '.info.version'`
+            Both must equal the version you just bumped to before you
+            consider the run complete. Post the final state as a comment
+            on the merged PR so the maintainer can see at a glance that
+            release succeeded.
+
+            If the publish fails for a real reason (e.g. crates.io
+            rejects because the version was already taken — bump again
+            and retry; PyPI rejects because of a metadata problem — fix
+            the metadata in `main` and bump again), keep grinding until
+            it ships. Removing publish blockers is part of the job.
+
+            Have fun. Take your time. Get it perfect.
