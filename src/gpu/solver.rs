@@ -812,7 +812,8 @@ pub fn iterative_refinement_cholesky_solve(
                 // fp32 + refinement succeeded. Still run fp64 POTRF for logdet
                 // accuracy (the fp64 factor is always authoritative for EDF /
                 // REML curvature). Solution comes from the refined fp32 path.
-                if let Ok((_, logdet)) = cuda::cholesky_solve(hessian, rhs) {
+                if let Ok(fp64_result) = cuda::cholesky_solve(hessian, rhs) {
+                    let logdet = fp64_result.1;
                     let mut sol = Array2::<f64>::zeros((p, 1));
                     sol.column_mut(0).assign(&outcome.solution);
                     return Ok((sol, logdet, Some(outcome)));

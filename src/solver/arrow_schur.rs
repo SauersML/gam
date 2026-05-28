@@ -3501,24 +3501,23 @@ impl JacobiPreconditioner {
 
         for range in block_offsets.iter() {
             let b = range.end - range.start;
-            // Initialise the b×b Schur sub-block from H_ββ + ridge·I.
+            // Initialise the b×b Schur sub-block from H_ββ + ridge·I via
+            // BetaPenaltyOp::block (#296). Structured ops (BlockPenaltyOp,
+            // KroneckerPenaltyOp) fill only the entries they own; the rest
+            // remain zero. DensePenaltyOp fills the full b×b submatrix.
             let mut schur_block = Array2::<f64>::zeros((b, b));
+            {
+                let op = sys.effective_penalty_op();
+                let block_id = BetaBlockId(
+                    block_offsets
+                        .iter()
+                        .position(|r| r == range)
+                        .unwrap_or(0),
+                );
+                op.block(block_id, block_offsets.as_ref(), &mut schur_block);
+            }
             for bi in 0..b {
-                for bj in 0..b {
-                    let gi = range.start + bi;
-                    let gj = range.start + bj;
-                    let base = if sys.hbb.dim() == (sys.k, sys.k) {
-                        sys.hbb[[gi, gj]]
-                    } else {
-                        // matrix-free path: only diagonal available
-                        if bi == bj {
-                            sys.hbb_diag.as_ref().map(|hd| hd[gi]).unwrap_or(0.0)
-                        } else {
-                            0.0
-                        }
-                    };
-                    schur_block[[bi, bj]] = base + if bi == bj { ridge_beta } else { 0.0 };
-                }
+                schur_block[[bi, bi]] += ridge_beta;
             }
             // Subtract Schur contributions:
             // S_kk -= H_βt_k^(i) (H_tt^(i))^{-1} H_tβ_k^(i)
