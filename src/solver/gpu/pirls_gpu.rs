@@ -432,6 +432,69 @@ extern "C" __global__ void chol_logdet_col_major(
             .map_err(|e| format!("upload Qs identity: {e}"))
     }
 
+    /// Apply one fp64 iterative-refinement correction to a Newton step solve.
+    ///
+    /// Compute `r = g − H_step·x` (host, p-vector). When `p ≥ REFINEMENT_MIN_P`
+    /// and `‖r‖/‖g‖ > REFINEMENT_TOL`, apply one POTRS correction and return
+    /// `x + e`. Returns `direction_raw` unchanged when `p` is too small, the
+    /// residual is already tight, or `‖g‖ = 0`.
+    ///
+    /// `H_step·x = penalized_hessian·x + step_lm_delta·x`.
+    #[allow(clippy::too_many_arguments)]
+    fn newton_step_refine_once(
+        solver: &cudarc::cusolver::DnHandle,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        p: usize,
+        chol_factor_dev: &CudaSlice<f64>,
+        rhs_dev: &mut CudaSlice<f64>,
+        potrs_info_dev: &mut CudaSlice<i32>,
+        mut direction_raw: Vec<f64>,
+        g: &[f64],
+        penalized_hessian: &ndarray::Array2<f64>,
+        step_lm_delta: f64,
+    ) -> Result<Vec<f64>, String> {
+        use crate::gpu::policy::GpuDispatchPolicy;
+        if p < GpuDispatchPolicy::REFINEMENT_MIN_P {
+            return Ok(direction_raw);
+        }
+        let norm_g = g.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if norm_g == 0.0 {
+            return Ok(direction_raw);
+        }
+        let hx: Vec<f64> = (0..p)
+            .map(|i| {
+                penalized_hessian
+                    .row(i)
+                    .iter()
+                    .zip(direction_raw.iter())
+                    .map(|(hij, xj)| hij * xj)
+                    .sum::<f64>()
+                    + step_lm_delta * direction_raw[i]
+            })
+            .collect();
+        let residual: Vec<f64> = g
+            .iter()
+            .zip(hx.iter())
+            .map(|(gi, hxi)| gi - hxi)
+            .collect();
+        let rel_res = residual.iter().map(|v| v * v).sum::<f64>().sqrt() / norm_g;
+        if rel_res <= GpuDispatchPolicy::REFINEMENT_TOL {
+            return Ok(direction_raw);
+        }
+        stream
+            .memcpy_htod(&residual, rhs_dev)
+            .map_err(|e| format!("upload residual: {e}"))?;
+        potrs_in_place_reuse(solver, stream, p, 1, chol_factor_dev, rhs_dev, potrs_info_dev)?;
+        let correction = stream
+            .clone_dtoh(rhs_dev)
+            .map_err(|e| format!("download correction: {e}"))?;
+        check_deferred_potrs_info(stream, potrs_info_dev)?;
+        for (xi, ei) in direction_raw.iter_mut().zip(correction.iter()) {
+            *xi += ei;
+        }
+        Ok(direction_raw)
+    }
+
     /// Drive one PIRLS Newton step on the workspace's CUDA stream.
     ///
     /// Math is identical to [`solve_step`]: build `H = XᵀWX + S + λI`,
