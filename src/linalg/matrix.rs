@@ -2321,7 +2321,14 @@ impl BlockDesignOperator {
             let left_chunk = left.try_row_chunk(start..end).map_err(|e| e.to_string())?;
             let right_chunk = right.try_row_chunk(start..end).map_err(|e| e.to_string())?;
             for local in 0..(end - start) {
-                let wi = weights[start + local].max(0.0);
+                // Cross-block X_iᵀ diag(w) X_j is linear in w and well-defined
+                // for any sign — observed-Hessian assembly (binomial+cloglog,
+                // Gamma+identity, etc.) legitimately supplies signed w_hessian
+                // here. The prior `.max(0.0)` silently zeroed the negative-
+                // curvature contribution, producing an inconsistent off-
+                // diagonal block. Mirrors the dense-rows kernel's sign-correct
+                // accumulation a few hundred lines above.
+                let wi = weights[start + local];
                 if wi == 0.0 {
                     continue;
                 }
