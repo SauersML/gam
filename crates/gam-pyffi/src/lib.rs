@@ -8655,7 +8655,7 @@ fn multinomial_model_metadata_pyfunc<'py>(
     out.set_item("p_per_class", envelope.saved.p_per_class)?;
     out.set_item("n_active_classes", envelope.saved.n_active_classes)?;
     out.set_item("training_headers", envelope.saved.training_headers.clone())?;
-    out.set_item("lambda", envelope.saved.lambda)?;
+    out.set_item("lambdas", envelope.saved.lambdas.clone())?;
     out.set_item("iterations", envelope.saved.iterations)?;
     out.set_item("converged", envelope.saved.converged)?;
     out.set_item(
@@ -8667,6 +8667,9 @@ fn multinomial_model_metadata_pyfunc<'py>(
         "coefficients_flat",
         envelope.saved.coefficients_flat.clone(),
     )?;
+    if let Some(edf) = envelope.saved.edf_per_class.as_ref() {
+        out.set_item("edf_per_class", edf.clone())?;
+    }
     Ok(out.unbind())
 }
 

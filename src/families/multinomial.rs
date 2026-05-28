@@ -56,6 +56,8 @@
 //! `‖δ‖ / (1 + ‖β‖) ≤ tol`, matching the existing pyffi reference path.
 
 use crate::faer_ndarray::{FaerArrayView, array2_to_matmut, factorize_symmetricwith_fallback};
+use crate::families::custom_family::{BlockwiseFitOptions, fit_custom_family_with_rho_prior};
+use crate::families::multinomial_reml::MultinomialFamily;
 use crate::families::vector_response::{MultinomialLogitLikelihood, VectorLikelihood};
 use crate::inference::data::EncodedDataset;
 use crate::inference::formula_dsl::parse_formula;
@@ -75,6 +77,7 @@ use crate::types::ResponseColumnKind;
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Inputs to [`fit_penalized_multinomial`].
 ///
@@ -691,9 +694,14 @@ fn build_formula_design_for_multinomial(
     Ok((spec, design, y_col, parsed.response, y_kind))
 }
 
-/// Top-level formula-driven multinomial fit. Slice A: uniform `init_lambda`
-/// across every penalty block, single inner Newton solve, no REML/LAML
-/// outer loop. REML follows in the next commit.
+/// Top-level formula-driven multinomial fit.
+///
+/// Routes through [`fit_custom_family_with_rho_prior`] so the per-active-class
+/// smoothing parameters `λ_a` (one per class block, shared-penalty
+/// architecture) are selected by the outer REML/LAML loop rather than pinned
+/// by the caller. `init_lambda` survives as a warm-start hint that seeds
+/// every block's `initial_log_lambdas`; the inner Newton solve still uses
+/// `max_iter` / `tol` via `BlockwiseFitOptions`.
 ///
 /// The categorical response column is recognised via the dataset schema
 /// (`ColumnKindTag::Categorical`); reference class = last level. Returns a
@@ -743,37 +751,111 @@ pub fn fit_penalized_multinomial_formula(
         .map_err(EstimationError::InvalidInput)?;
     let p_total = x_dense.ncols();
     // Sum the penalty blocks at uniform λ = 1 (the per-class λ_a is folded
-    // back into the solver call below, so the assembled `S` here is the
-    // unweighted Σ_k S_k).
+    // back through the REML driver below, so the assembled `S` here is the
+    // unweighted Σ_k S_k that every active class shares).
     let lambdas_block = vec![1.0_f64; design.penalties.len()];
     let s_total = weighted_blockwise_penalty_sum(&design.penalties, &lambdas_block, p_total);
     let k = y_one_hot.ncols();
     let m = k - 1;
-    let lambdas_class = Array1::from_elem(m, init_lambda);
-    let outputs = fit_penalized_multinomial(MultinomialFitInputs {
-        design: x_dense.view(),
-        y_one_hot: y_one_hot.view(),
-        penalty: s_total.view(),
-        lambdas: lambdas_class.view(),
-        row_weights: None,
-        max_iter,
-        tol,
-    })?;
-    let coefficients_flat: Vec<f64> = outputs.coefficients_active.iter().copied().collect();
+    let n_obs = y_one_hot.nrows();
+
+    // ── Custom-family driven REML/LAML path ───────────────────────────────
+    // Each active class becomes one ParameterBlockSpec, all sharing X and S.
+    // `initial_log_lambdas` is seeded from the caller's `init_lambda`.
+    let design_arc = Arc::new(x_dense);
+    let penalty_arc = Arc::new(s_total);
+    let weights = Array1::<f64>::ones(n_obs);
+    let family = MultinomialFamily::new(
+        y_one_hot.clone(),
+        weights,
+        k,
+        design_arc.clone(),
+        penalty_arc.clone(),
+        0,
+    )
+    .map_err(EstimationError::InvalidInput)?;
+    let mut blocks = family.build_block_specs();
+    let log_init = init_lambda.ln();
+    for spec_block in blocks.iter_mut() {
+        for v in spec_block.initial_log_lambdas.iter_mut() {
+            *v = log_init;
+        }
+    }
+
+    let options = BlockwiseFitOptions {
+        inner_max_cycles: max_iter,
+        inner_tol: tol,
+        ..BlockwiseFitOptions::default()
+    };
+    let fit = fit_custom_family_with_rho_prior(
+        &family,
+        &blocks,
+        &options,
+        crate::types::RhoPrior::Flat,
+    )
+    .map_err(|err| EstimationError::InvalidInput(format!("multinomial REML: {err}")))?;
+
+    // ── Repack coefficients (P, K-1) from per-block β vectors ─────────────
+    if fit.blocks.len() != m {
+        crate::bail_invalid_estim!(
+            "multinomial REML: expected {m} fitted blocks (K-1), got {}",
+            fit.blocks.len()
+        );
+    }
+    let p_per_class = fit.blocks[0].beta.len();
+    let mut coefficients_active = Array2::<f64>::zeros((p_per_class, m));
+    for (a, block) in fit.blocks.iter().enumerate() {
+        if block.beta.len() != p_per_class {
+            crate::bail_invalid_estim!(
+                "multinomial REML: block {a} has {} coefs, expected {p_per_class}",
+                block.beta.len()
+            );
+        }
+        for i in 0..p_per_class {
+            coefficients_active[[i, a]] = block.beta[i];
+        }
+    }
+    let lambdas_per_class: Vec<f64> = fit
+        .blocks
+        .iter()
+        .map(|b| b.lambdas.iter().copied().next().unwrap_or(init_lambda))
+        .collect();
+    let edf_per_class = fit
+        .inference
+        .as_ref()
+        .map(|info| info.edf_by_block.clone());
+    let coefficients_flat: Vec<f64> = coefficients_active.iter().copied().collect();
+
+    // Unpenalized deviance recomputed from the converged probabilities so
+    // the saved-model number matches the legacy fixed-λ path's contract.
+    let likelihood = MultinomialLogitLikelihood::with_classes(k)?;
+    let mut eta = Array2::<f64>::zeros((n_obs, m));
+    for a in 0..m {
+        for row in 0..n_obs {
+            let mut v = 0.0_f64;
+            for i in 0..p_per_class {
+                v += design_arc[[row, i]] * coefficients_active[[i, a]];
+            }
+            eta[[row, a]] = v;
+        }
+    }
+    let deviance = -2.0 * likelihood.log_lik(eta.view(), y_one_hot.view());
+
     Ok(MultinomialSavedModel {
         formula: formula.to_string(),
         class_levels: class_levels.clone(),
         reference_class_index: class_levels.len() - 1,
         resolved_termspec: spec,
         coefficients_flat,
-        p_per_class: outputs.coefficients_active.nrows(),
-        n_active_classes: outputs.coefficients_active.ncols(),
+        p_per_class,
+        n_active_classes: m,
         training_headers: data.headers.clone(),
-        lambda: init_lambda,
-        iterations: outputs.iterations,
-        converged: outputs.converged,
-        penalized_neg_log_likelihood: outputs.penalized_neg_log_likelihood,
-        deviance: outputs.deviance,
+        lambdas: lambdas_per_class,
+        iterations: fit.inner_cycles,
+        converged: fit.outer_converged,
+        penalized_neg_log_likelihood: -fit.log_likelihood + 0.5 * fit.stable_penalty_term,
+        deviance,
+        edf_per_class,
     })
 }
 
