@@ -1800,6 +1800,26 @@ impl ArrowFactorCache {
         self.htbeta.apply_row(row, delta_beta, out)
     }
 
+    /// Accumulate `out[a] += H_βt^(row)[a, :] · v` for all `a in 0..k`.
+    ///
+    /// `v` has length `d`; `out` has length `k`. The caller must zero `out`
+    /// before the first call if it needs a fresh result.  Returns `false` when
+    /// the cache is `Disabled` and no `fallback_op` is provided; callers must
+    /// treat the accumulator as invalid in that case.
+    pub fn apply_htbeta_row_transpose(
+        &self,
+        row: usize,
+        v: ArrayView1<'_, f64>,
+        out: &mut Array1<f64>,
+        fallback_op: Option<&RowHtbetaMatvec>,
+    ) -> bool {
+        if v.len() != self.d || out.len() != self.k {
+            return false;
+        }
+        self.htbeta
+            .apply_row_transpose_accumulate(row, v, out, self.d, self.k, fallback_op)
+    }
+
     /// Apply `Δt_i = -(H_tt^(i))⁻¹ · (H_tβ^(i) · Δβ)` per row, returning
     /// the flat row-major `Δt` of length `N · d`.
     ///

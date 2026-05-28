@@ -139,8 +139,7 @@ pub(crate) mod cuda {
     use crate::gpu::driver::{from_col_major, to_col_major};
     use crate::gpu::solver::{
         check_deferred_potrf_info, check_deferred_potrs_info, context_and_stream, pinned_htod,
-        potrf_in_place, potrf_in_place_reuse, potrf_query_lwork, potrs_in_place,
-        potrs_in_place_reuse,
+        potrf_in_place_reuse, potrf_query_lwork, potrs_in_place_reuse,
     };
     use cudarc::cublas::sys::{
         cublasDdgmm, cublasDgeam, cublasOperation_t, cublasSideMode_t, cublasStatus_t,
@@ -1796,7 +1795,7 @@ extern "C" __global__ void status_or(
                     last_deviance_change: diagnostics.last_deviance_change,
                     last_step_halving: diagnostics.last_step_halving,
                     last_step_size: diagnostics.last_step_size,
-                    final_lm_lambda: lm_ridge,
+                    final_lm_lambda: step_lm_lambda,
                     min_deviance: diagnostics.min_deviance,
                     max_abs_eta,
                 })
@@ -1839,7 +1838,7 @@ extern "C" __global__ void status_or(
                     last_deviance_change: diagnostics.last_deviance_change,
                     last_step_halving: diagnostics.last_step_halving,
                     last_step_size: diagnostics.last_step_size,
-                    final_lm_lambda: lm_ridge,
+                    final_lm_lambda: step_lm_lambda,
                     min_deviance: diagnostics.min_deviance,
                     max_abs_eta,
                 })

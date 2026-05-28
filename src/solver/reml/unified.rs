@@ -11013,6 +11013,116 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
 
         Ok(Array1::from_vec(values?))
     }
+
+    /// Zero-alloc override for the inner-CG hot path.
+    ///
+    /// Eliminates the transient `Vec<f64>` + `Array1::from_vec` allocation that
+    /// `matvec` incurs on every CG step.  The parallel computation is identical;
+    /// results are written directly into the caller-supplied `out` buffer via
+    /// `par_iter_mut().enumerate()` rather than collected into a fresh `Vec`.
+    fn apply_into(
+        &self,
+        alpha: &ndarray::Array1<f64>,
+        out: &mut ndarray::Array1<f64>,
+    ) -> Result<(), String> {
+        if alpha.len() != self.coords.len() {
+            return Err(RemlError::DimensionMismatch {
+                reason: format!(
+                    "outer Hessian alpha length mismatch: got {}, expected {}",
+                    alpha.len(),
+                    self.coords.len()
+                ),
+            }
+            .into());
+        }
+        if out.len() != self.coords.len() {
+            return Err(RemlError::DimensionMismatch {
+                reason: format!(
+                    "outer Hessian apply_into output length mismatch: got {}, expected {}",
+                    out.len(),
+                    self.coords.len()
+                ),
+            }
+            .into());
+        }
+        let mut a_alpha = 0.0;
+        for (idx, coord) in self.coords.iter().enumerate() {
+            if alpha[idx] != 0.0 {
+                a_alpha += alpha[idx] * coord.a;
+            }
+        }
+        let correction_m_alpha = self.signed_mode_combo_for_correction(alpha);
+        let callback_neg_m_alpha =
+            matches!(self.kernel, OuterHessianDerivativeKernel::Callback { .. })
+                .then(|| -&correction_m_alpha);
+        let slice = out
+            .as_slice_mut()
+            .ok_or_else(|| "outer Hessian apply_into: non-contiguous output buffer".to_string())?;
+        slice
+            .par_iter_mut()
+            .enumerate()
+            .try_for_each(|(idx, cell)| {
+                let coord = &self.coords[idx];
+                let pair_a = self.pair_a.row(idx).dot(alpha);
+                let pair_ld_s = self.pair_ld_s.row(idx).dot(alpha);
+                let g_dot_v_alpha = self.g_dot_v.row(idx).dot(alpha);
+                let base_h2 = self.base_h2.row(idx).dot(alpha);
+                let m_terms = self.m_pair_trace.row(idx).dot(alpha);
+
+                let cross_trace = match self.cross_trace.as_ref() {
+                    Some(ct) => ct.row(idx).dot(alpha),
+                    None => 0.0,
+                };
+
+                let correction = if self.incl_logdet_h {
+                    match &self.kernel {
+                        OuterHessianDerivativeKernel::Gaussian => 0.0,
+                        OuterHessianDerivativeKernel::ScalarGlm { .. } => {
+                            self.scalar_correction_trace(
+                                idx,
+                                alpha,
+                                &coord.v,
+                                &correction_m_alpha,
+                            )?
+                        }
+                        OuterHessianDerivativeKernel::Callback { .. } => {
+                            let second_v = &self
+                                .callback_second_modes
+                                .as_ref()
+                                .expect("callback second modes")[idx];
+                            let rhs = self.pair_rhs_combo(idx, alpha);
+                            self.callback_correction_trace(
+                                &rhs,
+                                second_v,
+                                callback_neg_m_alpha
+                                    .as_ref()
+                                    .expect("callback negated mode"),
+                            )?
+                        }
+                    }
+                } else {
+                    0.0
+                };
+
+                *cell = outer_hessian_entry(
+                    coord.a,
+                    a_alpha,
+                    g_dot_v_alpha,
+                    pair_a,
+                    cross_trace,
+                    base_h2 + m_terms + correction,
+                    pair_ld_s,
+                    self.profiled_phi,
+                    self.profiled_nu,
+                    self.profiled_dp_cgrad,
+                    self.profiled_dp_cgrad2,
+                    self.is_profiled,
+                    self.incl_logdet_h,
+                    self.incl_logdet_s,
+                );
+                Ok(())
+            })
+    }
 }
 
 fn build_outer_hessian_operator(

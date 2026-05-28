@@ -772,6 +772,10 @@ impl AffineCoordinateEvaluator {
 }
 
 impl SaeBasisEvaluator for AffineCoordinateEvaluator {
+    fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
+        Some(<Self as SaeBasisSecondJet>::second_jet(self, coords))
+    }
+
     fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
         if coords.ncols() != self.latent_dim {
             return Err(format!(
@@ -792,6 +796,27 @@ impl SaeBasisEvaluator for AffineCoordinateEvaluator {
             }
         }
         Ok((phi, jet))
+    }
+}
+
+impl SaeBasisSecondJet for AffineCoordinateEvaluator {
+    /// Second derivative of the affine basis `[1, t_1, ..., t_d]`.
+    ///
+    /// Every basis function is at most linear in `t`, so all second derivatives
+    /// are identically zero. Returns the all-zeros tensor of shape
+    /// `(n_obs, d+1, d, d)`.
+    fn second_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array4<f64>, String> {
+        if coords.ncols() != self.latent_dim {
+            return Err(format!(
+                "AffineCoordinateEvaluator::second_jet: expected latent_dim {}, got {}",
+                self.latent_dim,
+                coords.ncols()
+            ));
+        }
+        let n = coords.nrows();
+        let m = self.latent_dim + 1;
+        let d = self.latent_dim;
+        Ok(Array4::<f64>::zeros((n, m, d, d)))
     }
 }
 

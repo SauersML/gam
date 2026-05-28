@@ -1235,6 +1235,132 @@ pub fn launch_row_reweight_jit_on_stream(
         .gpu_ctx_with(|err| format!("JIT row reweight launch({kernel_name}): {err}"))
 }
 
+/// **solve-row** mode launcher.
+///
+/// Runs the per-family row math and writes only the four fields needed by the
+/// PIRLS solver on each Newton iteration: `grad_eta`, `w_solver`, `deviance`,
+/// `status`. The CUDA kernel is compiled from a specialised source
+/// (`solve_row_source_for`) that skips the `mu`, `w_fisher`, `w_hessian`,
+/// `z_fisher`, `z_hessian` stores, reducing both bandwidth and register
+/// pressure relative to [`launch_row_reweight_on_stream`].
+///
+/// Call once per Newton step on the accepted η. At convergence, call
+/// [`launch_row_reweight_on_stream`] (final-row mode) to populate the full
+/// output surface before downloading.
+#[cfg(target_os = "linux")]
+pub fn launch_solve_row_on_stream(
+    backend: &PirlsRowBackend,
+    family: PirlsRowFamily,
+    curvature: CurvatureMode,
+    stream: &Arc<cudarc::driver::CudaStream>,
+    n: usize,
+    eta_dev: &cudarc::driver::CudaSlice<f64>,
+    y_dev: &cudarc::driver::CudaSlice<f64>,
+    prior_w_dev: &cudarc::driver::CudaSlice<f64>,
+    out: &mut SolveRowBuffers,
+) -> Result<(), GpuError> {
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+    if out.n != n {
+        crate::gpu_bail!("solve-row buffers shape {} mismatches n={n}", out.n);
+    }
+    let module = backend.module_for_solve(family, curvature)?;
+    let kernel_name = family.solve_kernel_name();
+    let func = module
+        .load_function(kernel_name)
+        .gpu_ctx_with(|err| format!("solve-row load_function({kernel_name}): {err}"))?;
+    const THREADS_PER_BLOCK: u32 = 256;
+    let n_u32 = u32::try_from(n)
+        .map_err(|_| gpu_err!("n={n} exceeds u32 for solve-row grid sizing"))?;
+    let grid_x = n_u32.div_ceil(THREADS_PER_BLOCK).max(1);
+    let n_i32 = i32::try_from(n)
+        .map_err(|_| gpu_err!("n={n} exceeds i32 for solve-row kernel argument"))?;
+    let cfg = LaunchConfig {
+        grid_dim: (grid_x, 1, 1),
+        block_dim: (THREADS_PER_BLOCK, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = stream.launch_builder(&func);
+    builder.arg(&n_i32);
+    builder.arg(eta_dev);
+    builder.arg(y_dev);
+    builder.arg(prior_w_dev);
+    builder.arg(&mut out.grad_eta);
+    builder.arg(&mut out.w_solver);
+    builder.arg(&mut out.deviance);
+    builder.arg(&mut out.status);
+    // SAFETY: solve_row_source_for emits:
+    //   (int n, const f64* eta, const f64* y, const f64* prior_w,
+    //    f64* grad_eta_out, f64* w_solver_out, f64* deviance_out, u32* status_out)
+    // 4 outputs match the 4 SolveRowBuffers fields; grid covers all n rows with
+    // per-thread guard `if (i >= n) return`.
+    unsafe { builder.launch(cfg) }
+        .map(|_event_pair| ())
+        .gpu_ctx_with(|err| format!("solve-row launch({kernel_name}): {err}"))
+}
+
+/// **candidate-objective / fused alpha-ladder** launcher.
+///
+/// Evaluates `η_trial_i = η_i + α_k · xδ_i` for all `i ∈ [0,n)` and all
+/// `k ∈ [0, ALPHA_LADDER_LEN)` simultaneously.  Each thread atomically
+/// accumulates the per-row deviance into `out.objective_dev[k]` and
+/// OR-accumulates status flags into `out.status_dev[k]`.
+///
+/// The grid is `(row_blocks × ALPHA_LADDER_LEN)`: block index `bx / n_blocks`
+/// selects the alpha slot, `bx % n_blocks` selects the row tile.
+///
+/// Caller must call [`AlphaLadderDevBuffers::zero`] before each launch, then
+/// issue a single `memcpy_dtoh` to read back `[f64; ALPHA_LADDER_LEN]` and
+/// `[u32; ALPHA_LADDER_LEN]` to pick the accepted step.
+#[cfg(target_os = "linux")]
+pub fn launch_alpha_ladder_on_stream(
+    backend: &PirlsRowBackend,
+    family: PirlsRowFamily,
+    curvature: CurvatureMode,
+    stream: &Arc<cudarc::driver::CudaStream>,
+    n: usize,
+    eta_dev: &cudarc::driver::CudaSlice<f64>,
+    xd_dev: &cudarc::driver::CudaSlice<f64>,
+    y_dev: &cudarc::driver::CudaSlice<f64>,
+    prior_w_dev: &cudarc::driver::CudaSlice<f64>,
+    out: &mut AlphaLadderDevBuffers,
+) -> Result<(), GpuError> {
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+    let module = backend.module_for_ladder(family, curvature)?;
+    let kernel_name = family.ladder_kernel_name();
+    let func = module
+        .load_function(kernel_name)
+        .gpu_ctx_with(|err| format!("alpha-ladder load_function({kernel_name}): {err}"))?;
+    const THREADS_PER_BLOCK: u32 = 256;
+    let n_u32 = u32::try_from(n)
+        .map_err(|_| gpu_err!("n={n} exceeds u32 for alpha-ladder grid sizing"))?;
+    let row_blocks = n_u32.div_ceil(THREADS_PER_BLOCK).max(1);
+    let n_i32 = i32::try_from(n)
+        .map_err(|_| gpu_err!("n={n} exceeds i32 for alpha-ladder kernel argument"))?;
+    // Grid: x = row tile index (0..row_blocks), y = alpha index (0..ALPHA_LADDER_LEN).
+    let cfg = LaunchConfig {
+        grid_dim: (row_blocks, ALPHA_LADDER_LEN as u32, 1),
+        block_dim: (THREADS_PER_BLOCK, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = stream.launch_builder(&func);
+    builder.arg(&n_i32);
+    builder.arg(eta_dev);
+    builder.arg(xd_dev);
+    builder.arg(y_dev);
+    builder.arg(prior_w_dev);
+    builder.arg(&mut out.objective_dev);
+    builder.arg(&mut out.status_dev);
+    // SAFETY: ladder_source_for emits:
+    //   (int n, const f64* eta, const f64* xd, const f64* y, const f64* prior_w,
+    //    f64* objective_out, u32* status_out)
+    // Grid is (row_blocks × ALPHA_LADDER_LEN); each thread reads alphas[] via
+    // blockIdx.y, rows via blockIdx.x * blockDim.x + threadIdx.x (guarded by n).
+    // Atomic double-precision add to objective_out[blockIdx.y], OR to status_out[blockIdx.y].
+    unsafe { builder.launch(cfg) }
+        .map(|_event_pair| ())
+        .gpu_ctx_with(|err| format!("alpha-ladder launch({kernel_name}): {err}"))
+}
+
 // ────────────────────────────────────────────────────────────────────────
 // CUDA sources (one per family / curvature pair)
 // ────────────────────────────────────────────────────────────────────────
