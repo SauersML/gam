@@ -310,6 +310,7 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
     let init_state = FamilyLinearizationState {
         beta: &zeros_beta,
         family_scalars: None,
+        channel_hessian: None,
     };
     for (idx, spec) in specs.iter().enumerate() {
         // Use spec.effective_jacobian_at() so the audit operates on the β-dependent
@@ -1031,9 +1032,38 @@ pub fn audit_identifiability_channel_aware(
         .iter()
         .all(|s| s.gauge_priority == specs[0].gauge_priority);
 
+    // The halt threshold is leverage-based (see flat audit path for details).
+    // For the channel-aware path we compute S2 on the materialised (n·K)
+    // channel-weighted column vectors, which correctly accounts for both
+    // the row dimension and channel weighting.
+    let block_name_to_idx_ca: std::collections::HashMap<&str, usize> = specs
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.name.as_str(), i))
+        .collect();
+    // Materialise per-column S2 values from the channel-weighted columns.
+    // This mirrors the inner loop of channel_aware_aliased_pairs but only
+    // computes norms and S2, not the full pairwise scan.
+    let ca_col_s2: Vec<f64> = {
+        let p_total_ca = *col_offsets.last().unwrap_or(&0);
+        let mut s2_vals: Vec<f64> = Vec::with_capacity(p_total_ca);
+        for op in operators.iter() {
+            let j_full = op.evaluate_full();
+            let p_b = op.ncols();
+            for c in 0..p_b {
+                let mut w = Array1::<f64>::zeros(n * k);
+                for i in 0..n {
+                    for ch in 0..k {
+                        w[i * k + ch] = j_full[[i, c, ch]];
+                    }
+                }
+                s2_vals.push(compute_leverage_s2(&w.view()));
+            }
+        }
+        s2_vals
+    };
     let hard_alias_pair = aliased_pairs
         .iter()
-        .filter(|p| p.overlap >= HARD_HALT_OVERLAP_THRESHOLD)
         .filter(|p| {
             let pa = block_priority_ca
                 .get(p.block_a.as_str())
@@ -1043,7 +1073,23 @@ pub fn audit_identifiability_channel_aware(
                 .get(p.block_b.as_str())
                 .copied()
                 .unwrap_or(100);
-            pa == pb
+            if pa != pb {
+                return false;
+            }
+            let ja = block_name_to_idx_ca
+                .get(p.block_a.as_str())
+                .map(|&bi| col_offsets[bi] + p.direction_a)
+                .unwrap_or(0);
+            let jb = block_name_to_idx_ca
+                .get(p.block_b.as_str())
+                .map(|&bi| col_offsets[bi] + p.direction_b)
+                .unwrap_or(0);
+            let halt_thr = pair_halt_threshold(
+                ca_col_s2.get(ja).copied().unwrap_or(1.0),
+                ca_col_s2.get(jb).copied().unwrap_or(1.0),
+                n * k,
+            );
+            p.overlap >= halt_thr
         })
         .max_by(|a, b| {
             a.overlap
@@ -1107,16 +1153,30 @@ pub fn audit_identifiability_channel_aware(
             ));
         }
         if let Some(pair) = hard_alias_pair.as_ref() {
+            let ja = block_name_to_idx_ca
+                .get(pair.block_a.as_str())
+                .map(|&bi| col_offsets[bi] + pair.direction_a)
+                .unwrap_or(0);
+            let jb = block_name_to_idx_ca
+                .get(pair.block_b.as_str())
+                .map(|&bi| col_offsets[bi] + pair.direction_b)
+                .unwrap_or(0);
+            let halt_thr = pair_halt_threshold(
+                ca_col_s2.get(ja).copied().unwrap_or(1.0),
+                ca_col_s2.get(jb).copied().unwrap_or(1.0),
+                n * k,
+            );
             parts.push(format!(
-                "alias pair: '{}'[{}] ~ '{}'[{}] overlap={:.4} >= halt threshold {:.2} \
-                 in channel-aware row-Jacobian view (reparam: orthogonalise one block's \
-                 column {} against the other or absorb the shared direction)",
+                "alias pair: '{}'[{}] ~ '{}'[{}] overlap={:.4} >= leverage-based halt \
+                 threshold {:.4} in channel-aware row-Jacobian view \
+                 (reparam: orthogonalise one block's column {} against the other \
+                 or absorb the shared direction)",
                 pair.block_a,
                 pair.direction_a,
                 pair.block_b,
                 pair.direction_b,
                 pair.overlap,
-                HARD_HALT_OVERLAP_THRESHOLD,
+                halt_thr,
                 pair.direction_b,
             ));
         }
@@ -1129,20 +1189,21 @@ pub fn audit_identifiability_channel_aware(
             dropped_columns.len(),
         )
     } else if !aliased_pairs.is_empty() {
-        " — partial alias(es) below halt threshold (channel-aware); penalty + line search will resolve"
+        " — partial alias(es) below leverage-based halt threshold (channel-aware); \
+         penalty + line search will resolve"
             .to_string()
     } else {
         " — clean (channel-aware)".to_string()
     };
 
     let summary = format!(
-        "identifiability audit (channel-aware, K={k}): {} block(s), {} joint columns, joint rank {}, \
-         {} alias pair(s) above overlap {:.3}, {} dropped column(s){}",
+        "identifiability audit (channel-aware, K={k}): {} block(s), {} joint columns, \
+         joint rank {}, {} alias pair(s) above leverage-based report threshold, \
+         {} dropped column(s){}",
         specs.len(),
         p_total,
         joint_rank,
         aliased_pairs.len(),
-        ALIAS_OVERLAP_REPORTING_THRESHOLD,
         dropped_columns.len(),
         fatal_detail,
     );

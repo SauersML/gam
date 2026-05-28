@@ -19654,14 +19654,20 @@ impl ExactNewtonJointPsiWorkspace for BernoulliMarginalSlopeExactNewtonJointPsiW
 
 /// β-dependent Jacobian for the BMS marginal block.
 ///
-/// ∂η_i/∂β_m = c_i · marginal_design[i,:]
-/// where c_i = sqrt(1 + (s · (logslope_design[i,:] · β_s + offset_s[i]))²).
+/// ∂η_i/∂β_m = c_i · M[i,:]
+/// where c_i = sqrt(1 + (s · g_i)²),
+///       g_i = G[i,:] · β_s + offset_s[i],
+///       s   = probit_frailty_scale.
+///
+/// Designs are pre-densified at construction to avoid repeated materialisation.
 struct BmsMarginalJacobian {
-    marginal_design: Arc<DesignMatrix>,
-    logslope_design: Arc<DesignMatrix>,
+    /// Dense marginal design: n × p_m.
+    marginal_dense: Arc<Array2<f64>>,
+    /// Dense logslope design: n × p_s.
+    logslope_dense: Arc<Array2<f64>>,
     offset_m: Array1<f64>,
     offset_s: Array1<f64>,
-    /// Number of marginal columns (= range of β_m in the full β vector).
+    /// Number of marginal columns (= size of β_m slice in the full β vector).
     p_marginal: usize,
     probit_scale: f64,
 }
@@ -19673,35 +19679,27 @@ impl BlockEffectiveJacobian for BmsMarginalJacobian {
     ) -> Result<Array2<f64>, String> {
         let beta = state.beta;
         let p_m = self.p_marginal;
-        let beta_s = if beta.len() > p_m {
-            &beta[p_m..]
-        } else {
-            &[][..]
-        };
-        let n = self.marginal_design.nrows();
-        let p_block = self.marginal_design.ncols();
+        let p_s_block = self.logslope_dense.ncols();
+        let beta_s_raw = if beta.len() > p_m { &beta[p_m..] } else { &[][..] };
+        let p_s_use = p_s_block.min(beta_s_raw.len());
+        let beta_s = &beta_s_raw[..p_s_use];
+        let n = self.marginal_dense.nrows();
+        let p_block = self.marginal_dense.ncols();
         let s = self.probit_scale;
         let mut out = Array2::<f64>::zeros((n, p_block));
         for i in 0..n {
-            // compute g_i = logslope_design[i,:] · β_s + offset_s[i]
-            let g_i = if p_m < beta.len() && self.logslope_design.ncols() > 0 {
-                let p_s = self.logslope_design.ncols().min(beta_s.len());
-                let mut acc = self.offset_s[i];
-                for k in 0..p_s {
-                    let x_ik = self.logslope_design.get_element(i, k).unwrap_or(0.0);
-                    acc += x_ik * beta_s[k];
-                }
-                acc
-            } else {
-                self.offset_s[i]
-            };
+            // g_i = G[i, :p_s_use] · β_s + offset_s[i]
+            let g_i = self.offset_s[i]
+                + self
+                    .logslope_dense
+                    .row(i)
+                    .slice(ndarray::s![..p_s_use])
+                    .dot(&ArrayView1::from(beta_s));
             let sg = s * g_i;
             let c_i = (1.0 + sg * sg).sqrt();
-            // row i of output = c_i * marginal_design[i,:]
-            for k in 0..p_block {
-                let x_ik = self.marginal_design.get_element(i, k).unwrap_or(0.0);
-                out[[i, k]] = c_i * x_ik;
-            }
+            // J[i,:] = c_i · M[i,:]
+            let m_row = self.marginal_dense.row(i);
+            out.row_mut(i).assign(&m_row.mapv(|x| c_i * x));
         }
         Ok(out)
     }
@@ -19713,13 +19711,17 @@ impl BlockEffectiveJacobian for BmsMarginalJacobian {
 
 /// β-dependent Jacobian for the BMS logslope block.
 ///
-/// ∂η_i/∂β_s = (q_i · s²·g_i / c_i + s·z_i) · logslope_design[i,:]
-/// where q_i = marginal_design[i,:] · β_m + offset_m[i],
-///       g_i = logslope_design[i,:] · β_s + offset_s[i],
+/// ∂η_i/∂β_s = (q_i · s²·g_i / c_i + s·z_i) · G[i,:]
+/// where q_i = M[i,:] · β_m + offset_m[i],
+///       g_i = G[i,:] · β_s + offset_s[i],
 ///       c_i = sqrt(1 + (s·g_i)²).
+///
+/// Designs are pre-densified at construction to avoid repeated materialisation.
 struct BmsLogslopeJacobian {
-    marginal_design: Arc<DesignMatrix>,
-    logslope_design: Arc<DesignMatrix>,
+    /// Dense marginal design: n × p_m.
+    marginal_dense: Arc<Array2<f64>>,
+    /// Dense logslope design: n × p_s.
+    logslope_dense: Arc<Array2<f64>>,
     offset_m: Array1<f64>,
     offset_s: Array1<f64>,
     z: Arc<[f64]>,
@@ -19735,35 +19737,38 @@ impl BlockEffectiveJacobian for BmsLogslopeJacobian {
     ) -> Result<Array2<f64>, String> {
         let beta = state.beta;
         let p_m = self.p_marginal;
-        let beta_m = if beta.len() >= p_m { &beta[..p_m] } else { &beta[..] };
-        let beta_s = if beta.len() > p_m { &beta[p_m..] } else { &[][..] };
-        let n = self.logslope_design.nrows();
-        let p_block = self.logslope_design.ncols();
+        let p_m_use = p_m.min(beta.len());
+        let beta_m = &beta[..p_m_use];
+        let beta_s_raw = if beta.len() > p_m { &beta[p_m..] } else { &[][..] };
+        let p_s_block = self.logslope_dense.ncols();
+        let p_s_use = p_s_block.min(beta_s_raw.len());
+        let beta_s = &beta_s_raw[..p_s_use];
+        let n = self.logslope_dense.nrows();
         let s = self.probit_scale;
-        let mut out = Array2::<f64>::zeros((n, p_block));
+        let mut out = Array2::<f64>::zeros((n, p_s_block));
         for i in 0..n {
-            // q_i = marginal_design[i,:] · β_m + offset_m[i]
-            let mut q_i = self.offset_m[i];
-            for k in 0..beta_m.len().min(self.marginal_design.ncols()) {
-                let x_ik = self.marginal_design.get_element(i, k).unwrap_or(0.0);
-                q_i += x_ik * beta_m[k];
-            }
-            // g_i = logslope_design[i,:] · β_s + offset_s[i]
-            let mut g_i = self.offset_s[i];
-            for k in 0..beta_s.len().min(p_block) {
-                let x_ik = self.logslope_design.get_element(i, k).unwrap_or(0.0);
-                g_i += x_ik * beta_s[k];
-            }
+            // q_i = M[i, :p_m_use] · β_m + offset_m[i]
+            let q_i = self.offset_m[i]
+                + self
+                    .marginal_dense
+                    .row(i)
+                    .slice(ndarray::s![..p_m_use])
+                    .dot(&ArrayView1::from(beta_m));
+            // g_i = G[i, :p_s_use] · β_s + offset_s[i]
+            let g_i = self.offset_s[i]
+                + self
+                    .logslope_dense
+                    .row(i)
+                    .slice(ndarray::s![..p_s_use])
+                    .dot(&ArrayView1::from(beta_s));
             let sg = s * g_i;
             let c_i = (1.0 + sg * sg).sqrt();
-            // scalar per-row factor: q_i · s²·g_i / c_i + s·z_i
+            // per-row scalar factor: q_i · s²·g_i / c_i + s·z_i
             let z_i = self.z[i];
             let factor = q_i * s * s * g_i / c_i + s * z_i;
-            // row i of output = factor * logslope_design[i,:]
-            for k in 0..p_block {
-                let x_ik = self.logslope_design.get_element(i, k).unwrap_or(0.0);
-                out[[i, k]] = factor * x_ik;
-            }
+            // J[i,:] = factor · G[i,:]
+            let g_row = self.logslope_dense.row(i);
+            out.row_mut(i).assign(&g_row.mapv(|x| factor * x));
         }
         Ok(out)
     }

@@ -41,7 +41,6 @@ use gam::basis::{
     CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
     OneDimensionalBoundary, SpatialIdentifiability, build_duchon_basis, duchon_nullspace_dimension,
 };
-use gam::linalg::matrix::LinearOperator;
 use ndarray::{Array1, Array2, s};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
