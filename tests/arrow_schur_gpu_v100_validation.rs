@@ -311,7 +311,7 @@ fn arrow_schur_gpu_dense_reference_matches_cpu_solve() {
     let ridge_beta = 0.0;
     let dense = solve_arrow_newton_step_dense_reference(&sys, ridge_t, ridge_beta)
         .expect("dense reference Cholesky must succeed on PD fixture");
-    let (delta_t_cpu, delta_beta_cpu) = sys
+    let (delta_t_cpu, delta_beta_cpu, _diag) = sys
         .solve(ridge_t, ridge_beta)
         .expect("ArrowSchurSystem::solve must succeed on PD fixture");
     let n = sys.rows.len();

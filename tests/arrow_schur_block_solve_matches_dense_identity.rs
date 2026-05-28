@@ -53,7 +53,7 @@ fn arrow_schur_block_solve_matches_dense_identity() {
     sys.hbb = array![[4.0, 0.3], [0.3, 3.5]];
     sys.gb = array![0.2, -0.5];
 
-    let (dt, db) = sys.solve(0.0, 0.0).expect("arrow-schur solve");
+    let (dt, db, _diag) = sys.solve(0.0, 0.0).expect("arrow-schur solve");
 
     let mut m = Array2::<f64>::zeros((6, 6));
     let mut rhs = Array1::<f64>::zeros(6);

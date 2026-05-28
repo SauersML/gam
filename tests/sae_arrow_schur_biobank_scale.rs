@@ -143,7 +143,7 @@ fn k8_softmax_direct_solve_is_finite() {
         .term
         .assemble_arrow_schur(f.target.view(), &f.rho, None)
         .unwrap_or_else(|e| panic!("assemble_arrow_schur failed: {e}"));
-    let (delta_t, delta_beta) = sys
+    let (delta_t, delta_beta, _diag) = sys
         .solve_with_options(1e-4, 1e-4, &ArrowSolveOptions::direct())
         .unwrap_or_else(|e| panic!("direct solve failed: {e}"));
     assert_finite_vec(delta_t.as_slice().unwrap(), "k8 direct delta_t");
@@ -157,7 +157,7 @@ fn k8_softmax_pcg_solve_is_finite() {
         .term
         .assemble_arrow_schur(f.target.view(), &f.rho, None)
         .unwrap_or_else(|e| panic!("assemble_arrow_schur failed: {e}"));
-    let (delta_t, delta_beta) = sys
+    let (delta_t, delta_beta, _diag) = sys
         .solve_with_options(1e-4, 1e-4, &ArrowSolveOptions::inexact_pcg())
         .unwrap_or_else(|e| panic!("PCG solve failed: {e}"));
     assert_finite_vec(delta_t.as_slice().unwrap(), "k8 pcg delta_t");
@@ -197,7 +197,7 @@ fn k16_softmax_direct_solve_is_finite() {
         .term
         .assemble_arrow_schur(f.target.view(), &f.rho, None)
         .unwrap_or_else(|e| panic!("assemble_arrow_schur failed: {e}"));
-    let (delta_t, delta_beta) = sys
+    let (delta_t, delta_beta, _diag) = sys
         .solve_with_options(1e-4, 1e-4, &ArrowSolveOptions::direct())
         .unwrap_or_else(|e| panic!("direct solve failed: {e}"));
     assert_finite_vec(delta_t.as_slice().unwrap(), "k16 direct delta_t");
@@ -237,7 +237,7 @@ fn k32_softmax_direct_solve_is_finite() {
         .term
         .assemble_arrow_schur(f.target.view(), &f.rho, None)
         .unwrap_or_else(|e| panic!("assemble_arrow_schur failed: {e}"));
-    let (delta_t, delta_beta) = sys
+    let (delta_t, delta_beta, _diag) = sys
         .solve_with_options(1e-4, 1e-4, &ArrowSolveOptions::direct())
         .unwrap_or_else(|e| panic!("direct solve failed: {e}"));
     assert_finite_vec(delta_t.as_slice().unwrap(), "k32 direct delta_t");
@@ -251,7 +251,7 @@ fn k32_softmax_pcg_solve_is_finite() {
         .term
         .assemble_arrow_schur(f.target.view(), &f.rho, None)
         .unwrap_or_else(|e| panic!("assemble_arrow_schur failed: {e}"));
-    let (delta_t, delta_beta) = sys
+    let (delta_t, delta_beta, _diag) = sys
         .solve_with_options(1e-4, 1e-4, &ArrowSolveOptions::inexact_pcg())
         .unwrap_or_else(|e| panic!("PCG solve failed: {e}"));
     assert_finite_vec(delta_t.as_slice().unwrap(), "k32 pcg delta_t");

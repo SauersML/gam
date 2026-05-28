@@ -2417,7 +2417,7 @@ fn sys_htbeta_materialize_row(
         e_a[a] = 1.0;
         col.fill(0.0);
         op(row_idx, e_a.view(), &mut col);
-        for c in 0..d {
+        for c in 0..di {
             mat[[c, a]] = col[c];
         }
     }

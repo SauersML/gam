@@ -63,7 +63,7 @@ fn schur_complement_matches_dense_formula_for_spd_blocks() {
     let expected = sys.hbb.clone() - sys.rows[0].htbeta.t().dot(&a_inv_b);
 
     let options = ArrowSolveOptions::direct();
-    let (_, db0) = sys
+    let (_, db0, _diag) = sys
         .solve_with_options(0.0, 0.0, &options)
         .expect("arrow-Schur should solve SPD system");
     let rhs = -&sys.gb;
