@@ -56,8 +56,6 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use super::error::GpuError;
 use super::pirls_row::{CurvatureMode, PirlsRowFamily};
-use crate::gpu::error::GpuResultExt;
-use crate::gpu_err;
 
 /// Per-sigma-point GPU PIRLS input: penalty, reparameterisation transform,
 /// and prior-mean shifts for one ρ / σ point.
@@ -224,7 +222,6 @@ mod linux_impl {
         use crate::solver::gpu::pirls_gpu;
 
         let m = per_sigma.len();
-        let n = x_original.nrows();
         let p = x_original.ncols();
 
         // Validate uniform shape across all sigma points.
@@ -645,7 +642,6 @@ mod linux {
     use crate::gpu::error::{GpuError, GpuResultExt};
     use cudarc::driver::{LaunchConfig, PushKernelArg};
     use ndarray::Array2;
-    use std::sync::Arc;
 
     /// Process-wide NVRTC cache for the device-side P6 reduction kernel.
     /// One source string, one compiled module, reused for every cubature

@@ -4220,7 +4220,6 @@ mod stream_device_parity_tests {
         let lm_ridge = 0.1;
 
         let n = x.nrows();
-        let p = x.ncols();
         let y_dummy = ndarray::Array1::<f64>::zeros(n);
         let prior_w_dummy = ndarray::Array1::<f64>::ones(n);
         let offset_dummy = ndarray::Array1::<f64>::zeros(n);
