@@ -59,6 +59,9 @@ use ndarray::{Array1, Array2, Array3};
 use std::any::Any;
 use std::sync::Arc;
 
+mod common;
+use common::fixtures::{Splitmix64, finite_diff_jacobian};
+
 // ── Problem dimensions ────────────────────────────────────────────────────
 
 const N: usize = 200;
@@ -67,28 +70,6 @@ const N_DUCHON_CENTERS: usize = 5;
 // Each block has one intercept + D_PC pc-linear terms + N_DUCHON_CENTERS
 // radial basis functions = 1 + 3 + 5 = 9 columns.
 const P_BLOCK: usize = 1 + D_PC + N_DUCHON_CENTERS;
-
-// ── Numeric helpers ───────────────────────────────────────────────────────
-
-/// Low-quality but deterministic splitmix64.
-fn splitmix64(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = *state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
-
-fn rand_f64(state: &mut u64) -> f64 {
-    (splitmix64(state) >> 11) as f64 / (1u64 << 53) as f64
-}
-
-fn rand_normal(state: &mut u64) -> f64 {
-    // Box-Muller
-    let u1 = rand_f64(state).max(1e-15);
-    let u2 = rand_f64(state);
-    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
-}
 
 // ── Synthetic data ────────────────────────────────────────────────────────
 
@@ -108,12 +89,12 @@ struct SyntheticData {
 }
 
 fn make_synthetic_data(seed: u64) -> SyntheticData {
-    let mut rng = seed;
+    let mut rng = Splitmix64::new(seed);
 
     // z ~ N(0,1), standardised.
     let mut z = Array1::<f64>::zeros(N);
     for i in 0..N {
-        z[i] = rand_normal(&mut rng);
+        z[i] = rng.next_gauss();
     }
     // Standardise to mean=0, var=1.
     let mean_z = z.sum() / (N as f64);
@@ -125,7 +106,7 @@ fn make_synthetic_data(seed: u64) -> SyntheticData {
     let mut pcs = Array2::<f64>::zeros((N, D_PC));
     for i in 0..N {
         for j in 0..D_PC {
-            pcs[[i, j]] = rand_normal(&mut rng);
+            pcs[[i, j]] = rng.next_gauss();
         }
     }
 
@@ -134,7 +115,7 @@ fn make_synthetic_data(seed: u64) -> SyntheticData {
     let mut centers = Array2::<f64>::zeros((N_DUCHON_CENTERS, D_PC));
     for k in 0..N_DUCHON_CENTERS {
         for j in 0..D_PC {
-            centers[[k, j]] = rand_normal(&mut rng) * 0.5;
+            centers[[k, j]] = rng.next_gauss() * 0.5;
         }
     }
 
@@ -233,40 +214,6 @@ fn compute_eta_stack(
         out[2 * n + i] = qd1[i] * scalars.c[i]; // ad1
     }
     out
-}
-
-// ── FD Jacobian ───────────────────────────────────────────────────────────
-//
-// Numerically differentiates η_stack w.r.t. β using central differences.
-// Returns (3*N, P) matrix.
-
-fn fd_jacobian(
-    phi: &Array2<f64>,
-    beta: &[f64],
-    q0: &Array1<f64>,
-    q1: &Array1<f64>,
-    qd1: &Array1<f64>,
-    z: &Array1<f64>,
-    s_f: f64,
-) -> Array2<f64> {
-    let p = beta.len();
-    let n = phi.nrows();
-    let h = 1e-6;
-    let mut jac = Array2::<f64>::zeros((3 * n, p));
-    let mut beta_plus = beta.to_vec();
-    let mut beta_minus = beta.to_vec();
-    for j in 0..p {
-        beta_plus[j] = beta[j] + h;
-        beta_minus[j] = beta[j] - h;
-        let eta_plus = compute_eta_stack(phi, &beta_plus, q0, q1, qd1, z, s_f);
-        let eta_minus = compute_eta_stack(phi, &beta_minus, q0, q1, qd1, z, s_f);
-        for row in 0..3 * n {
-            jac[[row, j]] = (eta_plus[row] - eta_minus[row]) / (2.0 * h);
-        }
-        beta_plus[j] = beta[j];
-        beta_minus[j] = beta[j];
-    }
-    jac
 }
 
 // ── Analytical Jacobian ───────────────────────────────────────────────────
