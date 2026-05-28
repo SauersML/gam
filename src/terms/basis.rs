@@ -9404,8 +9404,8 @@ pub(crate) fn auto_shrink_bspline_config(
     }
     let max_interior = n.saturating_sub(2);
     let num_internal_knots = requested_num_internal_knots.min(max_interior);
-    let shrunk = num_internal_knots != requested_num_internal_knots
-        || degree != requested_degree.max(1);
+    let shrunk =
+        num_internal_knots != requested_num_internal_knots || degree != requested_degree.max(1);
     Some((num_internal_knots, degree, shrunk))
 }
 
@@ -9418,10 +9418,7 @@ pub(crate) fn auto_shrink_bspline_config(
 ///
 /// When a shrink actually happens, an info-level log message is emitted so
 /// the decision is visible in fit logs and downstream model summaries.
-fn maybe_auto_shrink_bspline_spec(
-    spec: &BSplineBasisSpec,
-    n: usize,
-) -> BSplineBasisSpec {
+fn maybe_auto_shrink_bspline_spec(spec: &BSplineBasisSpec, n: usize) -> BSplineBasisSpec {
     match &spec.knotspec {
         BSplineKnotSpec::Generate {
             data_range,

@@ -5872,16 +5872,15 @@ mod tests {
     #[test]
     fn bernoulli_marginal_slope_predictor_rejects_structurally_invalid_or_unknown_runtime_kernel() {
         let seed = array![-1.5, -0.2, 0.6, 1.4];
-        let prepared =
-            crate::families::bms::build_score_warp_deviation_block_from_seed(
-                &seed,
-                &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
-                    degree: 3,
-                    num_internal_knots: 3,
-                    ..Default::default()
-                },
-            )
-            .expect("production score-warp runtime");
+        let prepared = crate::families::bms::build_score_warp_deviation_block_from_seed(
+            &seed,
+            &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
+                degree: 3,
+                num_internal_knots: 3,
+                ..Default::default()
+            },
+        )
+        .expect("production score-warp runtime");
         let production_runtime = saved_runtime_from_deviation_runtime(&prepared.runtime);
         let score_only = BernoulliMarginalSlopePredictor {
             beta_marginal: array![0.8],
@@ -5912,16 +5911,15 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("DenestedCubicTransport"));
 
-        let err =
-            crate::families::bms::build_score_warp_deviation_block_from_seed(
-                &seed,
-                &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
-                    degree: 2,
-                    num_internal_knots: 3,
-                    ..Default::default()
-                },
-            )
-            .expect_err("non-cubic deviation runtimes should be rejected");
+        let err = crate::families::bms::build_score_warp_deviation_block_from_seed(
+            &seed,
+            &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
+                degree: 2,
+                num_internal_knots: 3,
+                ..Default::default()
+            },
+        )
+        .expect_err("non-cubic deviation runtimes should be rejected");
         assert!(err.contains("degree must be 3"));
 
         let mut structurally_invalid = production_runtime.clone();
@@ -5936,15 +5934,14 @@ mod tests {
     #[test]
     fn saved_anchored_deviation_runtime_local_cubic_reconstructs_values() {
         let seed = array![-2.0, -0.75, 0.0, 1.0, 3.0];
-        let prepared =
-            crate::families::bms::build_score_warp_deviation_block_from_seed(
-                &seed,
-                &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
-                    num_internal_knots: 4,
-                    ..Default::default()
-                },
-            )
-            .expect("build saved anchored deviation runtime");
+        let prepared = crate::families::bms::build_score_warp_deviation_block_from_seed(
+            &seed,
+            &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..Default::default()
+            },
+        )
+        .expect("build saved anchored deviation runtime");
         let runtime = saved_runtime_from_deviation_runtime(&prepared.runtime);
         let beta = Array1::from_iter(
             (0..runtime.basis_dim)
@@ -5987,15 +5984,14 @@ mod tests {
         use crate::inference::model::{SavedAnchorComponent, SavedAnchorKind};
 
         let seed = array![-2.0, -0.75, 0.0, 1.0, 3.0];
-        let prepared =
-            crate::families::bms::build_score_warp_deviation_block_from_seed(
-                &seed,
-                &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
-                    num_internal_knots: 4,
-                    ..Default::default()
-                },
-            )
-            .expect("build saved anchored deviation runtime");
+        let prepared = crate::families::bms::build_score_warp_deviation_block_from_seed(
+            &seed,
+            &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..Default::default()
+            },
+        )
+        .expect("build saved anchored deviation runtime");
         let mut runtime = saved_runtime_from_deviation_runtime(&prepared.runtime);
 
         // Inject a non-trivial anchor residual: d = 3 anchor cols,
@@ -6222,15 +6218,14 @@ mod tests {
     #[test]
     fn saved_anchored_deviation_runtime_basis_cubic_matches_basis_column() {
         let seed = array![-2.0, -0.75, 0.0, 1.0, 3.0];
-        let prepared =
-            crate::families::bms::build_score_warp_deviation_block_from_seed(
-                &seed,
-                &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
-                    num_internal_knots: 4,
-                    ..Default::default()
-                },
-            )
-            .expect("build saved anchored deviation runtime");
+        let prepared = crate::families::bms::build_score_warp_deviation_block_from_seed(
+            &seed,
+            &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..Default::default()
+            },
+        )
+        .expect("build saved anchored deviation runtime");
         let runtime = saved_runtime_from_deviation_runtime(&prepared.runtime);
         let cubic = runtime.basis_span_cubic(0, 1).expect("basis span cubic");
         let x_eval = array![cubic.left, 0.5 * (cubic.left + cubic.right), cubic.right];

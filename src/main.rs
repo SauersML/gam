@@ -9817,8 +9817,11 @@ fn write_gaussian_location_scale_prediction_csv(
     let mean_v: Vec<f64> = mean.to_vec();
     let sigma_v: Vec<f64> = sigma.to_vec();
 
-    let mut cols: Vec<(&str, &[f64])> =
-        vec![("linear_predictor", &eta_v), ("mean", &mean_v), ("sigma", &sigma_v)];
+    let mut cols: Vec<(&str, &[f64])> = vec![
+        ("linear_predictor", &eta_v),
+        ("mean", &mean_v),
+        ("sigma", &sigma_v),
+    ];
 
     let lo_v: Vec<f64>;
     let hi_v: Vec<f64>;

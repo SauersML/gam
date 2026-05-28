@@ -1857,10 +1857,7 @@ pub trait OuterObjective {
     /// the variant. Callers that don't care (the continuation walk, which
     /// only proceeds-cold when the hint is unusable) ignore it and only
     /// propagate `Err`.
-    fn seed_inner_state(
-        &mut self,
-        beta: &Array1<f64>,
-    ) -> Result<SeedOutcome, EstimationError>;
+    fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError>;
 
     /// Optional opt-in to the device-resident outer REML BFGS-over-ρ driver
     /// (`crate::solver::gpu::reml_outer::run_reml_outer_on_device`). Returns
@@ -2153,10 +2150,7 @@ impl<'a> OuterObjective for CheckpointingObjective<'a> {
         Ok(r)
     }
 
-    fn seed_inner_state(
-        &mut self,
-        beta: &Array1<f64>,
-    ) -> Result<SeedOutcome, EstimationError> {
+    fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
         // Forward to the wrapped objective, then prime our last-inner-beta
         // cache so a subsequent finalize-write encodes the seeded β if no
         // eval surfaces a fresher β first. Only prime on actual install —
@@ -2268,10 +2262,7 @@ where
         }
     }
 
-    fn seed_inner_state(
-        &mut self,
-        beta: &Array1<f64>,
-    ) -> Result<SeedOutcome, EstimationError> {
+    fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
         // Empty β: by convention, "no warm-start available" — treat as a
         // no-op install. Distinct from `NoSlot` because the objective may
         // very well have a slot; the caller just didn't supply a β to fill

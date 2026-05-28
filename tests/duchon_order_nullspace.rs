@@ -110,9 +110,21 @@ fn nullspace_dimension_formula_matches_binom_for_d3() {
         );
     }
     // Spot-check the three canonical values.
-    assert_eq!(duchon_nullspace_dimension(3, 0), 1, "d=3 r=0 => constants only");
-    assert_eq!(duchon_nullspace_dimension(3, 1), 4, "d=3 r=1 => 1+3 linear terms");
-    assert_eq!(duchon_nullspace_dimension(3, 2), 10, "d=3 r=2 => 1+3+6 quadratic terms");
+    assert_eq!(
+        duchon_nullspace_dimension(3, 0),
+        1,
+        "d=3 r=0 => constants only"
+    );
+    assert_eq!(
+        duchon_nullspace_dimension(3, 1),
+        4,
+        "d=3 r=1 => 1+3 linear terms"
+    );
+    assert_eq!(
+        duchon_nullspace_dimension(3, 2),
+        10,
+        "d=3 r=2 => 1+3+6 quadratic terms"
+    );
 }
 
 /// Verify that the DuchonNullspaceOrder variants use the expected polynomial
@@ -148,7 +160,11 @@ fn duchon_order1_d3_design_width_equals_centers_no_identifiability() {
     let d = 3usize;
     let k = 10usize;
     let data = synthetic_data(n, d, 42);
-    let spec = duchon_spec(k, DuchonNullspaceOrder::Linear, SpatialIdentifiability::None);
+    let spec = duchon_spec(
+        k,
+        DuchonNullspaceOrder::Linear,
+        SpatialIdentifiability::None,
+    );
     let result = build_duchon_basis(data.view(), &spec).expect("build_duchon_basis succeeded");
     let ncols = result.design.ncols();
     assert_eq!(
@@ -169,7 +185,10 @@ fn duchon_order0_d3_design_width_equals_centers_no_identifiability() {
     let spec = duchon_spec(k, DuchonNullspaceOrder::Zero, SpatialIdentifiability::None);
     let result = build_duchon_basis(data.view(), &spec).expect("build_duchon_basis succeeded");
     let ncols = result.design.ncols();
-    assert_eq!(ncols, k, "order=0 d=3 k={k}: expected {k} cols, got {ncols}");
+    assert_eq!(
+        ncols, k,
+        "order=0 d=3 k={k}: expected {k} cols, got {ncols}"
+    );
 }
 
 /// Same check for order=2 (quadratic, 10 polynomial columns).
@@ -180,10 +199,17 @@ fn duchon_order2_d3_design_width_equals_centers_no_identifiability() {
     // Need k > C(d+2,2)=10, so use k=20.
     let k = 20usize;
     let data = synthetic_data(n, d, 44);
-    let spec = duchon_spec(k, DuchonNullspaceOrder::Degree(2), SpatialIdentifiability::None);
+    let spec = duchon_spec(
+        k,
+        DuchonNullspaceOrder::Degree(2),
+        SpatialIdentifiability::None,
+    );
     let result = build_duchon_basis(data.view(), &spec).expect("build_duchon_basis succeeded");
     let ncols = result.design.ncols();
-    assert_eq!(ncols, k, "order=2 d=3 k={k}: expected {k} cols, got {ncols}");
+    assert_eq!(
+        ncols, k,
+        "order=2 d=3 k={k}: expected {k} cols, got {ncols}"
+    );
 }
 
 /// With `OrthogonalToParametric` (the default), the intercept direction is
@@ -231,7 +257,11 @@ fn duchon_order1_kernel_block_orthogonal_to_polynomial_null_space_at_data() {
     let kernel_cols = k - poly_dim; // 6
 
     let data = synthetic_data(n, d, 46);
-    let spec = duchon_spec(k, DuchonNullspaceOrder::Linear, SpatialIdentifiability::None);
+    let spec = duchon_spec(
+        k,
+        DuchonNullspaceOrder::Linear,
+        SpatialIdentifiability::None,
+    );
     let result = build_duchon_basis(data.view(), &spec).expect("build_duchon_basis succeeded");
 
     // Materialize the full design matrix.
@@ -330,7 +360,11 @@ fn same_duchon_spec_twice_produces_identical_raw_designs() {
     // Build with SpatialIdentifiability::None so we compare the raw pre-ident
     // designs, which is what the joint audit sees before applying the shared
     // identifiability transform.
-    let spec = duchon_spec(k, DuchonNullspaceOrder::Linear, SpatialIdentifiability::None);
+    let spec = duchon_spec(
+        k,
+        DuchonNullspaceOrder::Linear,
+        SpatialIdentifiability::None,
+    );
 
     let result_a = build_duchon_basis(data.view(), &spec).expect("build a succeeded");
     let result_b = build_duchon_basis(data.view(), &spec).expect("build b succeeded");
@@ -348,7 +382,11 @@ fn same_duchon_spec_twice_produces_identical_raw_designs() {
         .as_ref()
         .clone();
 
-    assert_eq!(design_a.ncols(), design_b.ncols(), "column counts must match");
+    assert_eq!(
+        design_a.ncols(),
+        design_b.ncols(),
+        "column counts must match"
+    );
 
     for col in 0..design_a.ncols() {
         let a = design_a.column(col);

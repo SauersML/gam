@@ -38,7 +38,9 @@
 
 use gam::families::custom_family::{ParameterBlockSpec, RowScaledJacobian};
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
-use gam::solver::identifiability_audit::{audit_identifiability, bias_shift_for_pair, compute_skewness_mu3};
+use gam::solver::identifiability_audit::{
+    audit_identifiability, bias_shift_for_pair, compute_skewness_mu3,
+};
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
 
@@ -87,7 +89,9 @@ fn lcg_sequence(seed: u64, n: usize) -> Vec<f64> {
     let mut state = seed;
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         // Map to (0, 1) via the upper 32 bits.
         let u = (state >> 32) as f64 / u32::MAX as f64;
         out.push(u);
@@ -256,7 +260,10 @@ fn bias_shift_both_none_is_zero() {
 fn bias_shift_same_scaling_both_blocks_is_zero() {
     let z: Vec<f64> = lognormal_standardised(7, 100);
     let shift = bias_shift_for_pair(Some(&z), Some(&z), 0.05, 0.05);
-    assert_eq!(shift, 0.0, "identical scalings must cancel; got shift={shift:.6}");
+    assert_eq!(
+        shift, 0.0,
+        "identical scalings must cancel; got shift={shift:.6}"
+    );
 }
 
 /// Test bias_shift_for_pair: one block with skewed z gives a non-zero shift.

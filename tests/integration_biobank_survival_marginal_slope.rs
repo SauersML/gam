@@ -63,10 +63,7 @@ impl CapturedLogs {
         }
     }
     fn snapshot(&self) -> Vec<String> {
-        self.lines
-            .lock()
-            .map(|g| g.clone())
-            .unwrap_or_default()
+        self.lines.lock().map(|g| g.clone()).unwrap_or_default()
     }
 }
 
@@ -175,7 +172,11 @@ fn build_dataset() -> gam::inference::data::EncodedDataset {
         let pc2 = next_gauss(&mut state) * 0.5;
         let pc3 = next_gauss(&mut state) * 0.5;
         let prs = next_gauss(&mut state); // raw, not yet standardized
-        let sex: f64 = if next_unit(&mut state) < 0.5 { 1.0 } else { 0.0 };
+        let sex: f64 = if next_unit(&mut state) < 0.5 {
+            1.0
+        } else {
+            0.0
+        };
         let entry = 40.0 + 5.0 * next_unit(&mut state);
         let followup = 0.5 + 8.0 * next_unit(&mut state);
         prs_raw.push(prs);
@@ -184,8 +185,7 @@ fn build_dataset() -> gam::inference::data::EncodedDataset {
 
     // Standardize PRS to mean=0, var=1.
     let prs_mean = prs_raw.iter().sum::<f64>() / N as f64;
-    let prs_var =
-        prs_raw.iter().map(|v| (v - prs_mean).powi(2)).sum::<f64>() / N as f64;
+    let prs_var = prs_raw.iter().map(|v| (v - prs_mean).powi(2)).sum::<f64>() / N as f64;
     let prs_sd = prs_var.sqrt().max(1e-12);
     let prs_z: Vec<f64> = prs_raw.iter().map(|v| (v - prs_mean) / prs_sd).collect();
 
@@ -229,9 +229,7 @@ fn biobank_survival_marginal_slope_canonical_gauge_fix() {
     // Exactly the biobank formula shape: shared duchon + linkwiggle on both
     // the main (marginal) formula and the logslope formula.
     let duchon = format!("duchon(PC1, PC2, PC3, centers={CENTERS}, order=1)");
-    let formula = format!(
-        "Surv(entry_age, exit_age, event) ~ {duchon} + sex + linkwiggle()"
-    );
+    let formula = format!("Surv(entry_age, exit_age, event) ~ {duchon} + sex + linkwiggle()");
     let logslope = format!("{duchon} + linkwiggle()");
 
     let config = FitConfig {
@@ -264,8 +262,7 @@ fn biobank_survival_marginal_slope_canonical_gauge_fix() {
         result.fit.outer_converged,
         "biobank-class fit must converge; outer_converged=false \
          (iters={}, reml={:.6})",
-        result.fit.outer_iterations,
-        result.fit.reml_score,
+        result.fit.outer_iterations, result.fit.reml_score,
     );
 
     // ── Assertions 3a-b: drop attribution must target logslope only ───────
@@ -333,12 +330,8 @@ fn biobank_survival_marginal_slope_canonical_gauge_fix() {
         let p_total = p_marg + p_log;
 
         let mut joint = Array2::<f64>::zeros((n_rows, p_total));
-        joint
-            .slice_mut(s![.., ..p_marg])
-            .assign(&raw_marginal);
-        joint
-            .slice_mut(s![.., p_marg..])
-            .assign(&raw_logslope);
+        joint.slice_mut(s![.., ..p_marg]).assign(&raw_marginal);
+        joint.slice_mut(s![.., p_marg..]).assign(&raw_logslope);
 
         let rrqr = rrqr_with_permutation(&joint, default_rrqr_rank_alpha())
             .expect("RRQR on joint [marginal | logslope] design must not fail");

@@ -27,7 +27,9 @@ use std::sync::Arc;
 
 /// Simple LCG for deterministic pseudo-random numbers without an extra dep.
 fn lcg_next(state: &mut u64) -> f64 {
-    *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     let bits = (*state >> 33) as u32;
     (bits as f64) / (u32::MAX as f64) * 2.0 - 1.0
 }
@@ -39,11 +41,7 @@ fn random_design(n: usize, p: usize, rng: &mut u64) -> Array2<f64> {
 }
 
 /// Compute g_i = offset_s[i] + logslope_design[i,:p_s_use] · beta_s[..p_s_use].
-fn compute_g(
-    logslope_design: &Array2<f64>,
-    offset_s: &Array1<f64>,
-    beta_s: &[f64],
-) -> Vec<f64> {
+fn compute_g(logslope_design: &Array2<f64>, offset_s: &Array1<f64>, beta_s: &[f64]) -> Vec<f64> {
     let n = logslope_design.nrows();
     let p_s_use = logslope_design.ncols().min(beta_s.len());
     (0..n)
@@ -61,11 +59,7 @@ fn compute_g(
 }
 
 /// Compute q_i = offset_m[i] + marginal_design[i,:p_m_use] · beta_m[..p_m_use].
-fn compute_q(
-    marginal_design: &Array2<f64>,
-    offset_m: &Array1<f64>,
-    beta_m: &[f64],
-) -> Vec<f64> {
+fn compute_q(marginal_design: &Array2<f64>, offset_m: &Array1<f64>, beta_m: &[f64]) -> Vec<f64> {
     let n = marginal_design.nrows();
     let p_m_use = marginal_design.ncols().min(beta_m.len());
     (0..n)
@@ -307,14 +301,7 @@ fn bms_marginal_block_contract_beta_nonzero_scalars_some_ok_fd_match() {
     beta.extend_from_slice(&beta_s);
 
     let scalars = build_bms_scalars(
-        &marginal,
-        &logslope,
-        &offset_m,
-        &offset_s,
-        &z,
-        &beta_m,
-        &beta_s,
-        s,
+        &marginal, &logslope, &offset_m, &offset_s, &z, &beta_m, &beta_s, s,
     );
     let scalars_arc: Arc<dyn Any + Send + Sync> = Arc::new(scalars);
 
@@ -446,14 +433,7 @@ fn bms_logslope_block_contract_beta_nonzero_scalars_some_ok_fd_match() {
     beta.extend_from_slice(&beta_s);
 
     let scalars = build_bms_scalars(
-        &marginal,
-        &logslope,
-        &offset_m,
-        &offset_s,
-        &z_vec,
-        &beta_m,
-        &beta_s,
-        s,
+        &marginal, &logslope, &offset_m, &offset_s, &z_vec, &beta_m, &beta_s, s,
     );
     let scalars_arc: Arc<dyn Any + Send + Sync> = Arc::new(scalars);
 

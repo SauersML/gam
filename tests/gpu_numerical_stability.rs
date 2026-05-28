@@ -5,8 +5,8 @@
 // `warnings = "deny"` lint policy.
 #[path = "common/gpu_gate.rs"]
 mod gpu_gate;
-use gpu_gate::{GpuGate, gpu_gate};
 use gam::solver::gpu::{Device, configure_device};
+use gpu_gate::{GpuGate, gpu_gate};
 use ndarray::{Array1, Array2};
 
 fn close(a: f64, b: f64, tol: f64) -> bool {

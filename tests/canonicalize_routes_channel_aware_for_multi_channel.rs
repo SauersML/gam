@@ -29,9 +29,7 @@
 
 use std::sync::Arc;
 
-use gam::families::custom_family::{
-    AdditiveBlockJacobian, ParameterBlockSpec,
-};
+use gam::families::custom_family::{AdditiveBlockJacobian, ParameterBlockSpec};
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
 use gam::solver::identifiability_audit::audit_identifiability;
 use gam::solver::identifiability_canonical::canonicalize_for_identifiability;
@@ -144,10 +142,9 @@ fn channel_aware_routing_chosen_for_multi_output_blocks() {
         spec_with_callback("logslope", logslope_design, 2, K),
     ];
 
-    let canon =
-        canonicalize_for_identifiability(&specs).expect(
-            "channel-aware audit must pass: blocks in orthogonal channels are fully identifiable",
-        );
+    let canon = canonicalize_for_identifiability(&specs).expect(
+        "channel-aware audit must pass: blocks in orthogonal channels are fully identifiable",
+    );
 
     // Routing check: must have used channel-aware audit.
     assert!(
@@ -171,10 +168,9 @@ fn channel_aware_audit_passes_with_full_rank_for_orthogonal_channel_blocks() {
         spec_with_callback("logslope", logslope_design, 2, K),
     ];
 
-    let canon =
-        canonicalize_for_identifiability(&specs).expect(
-            "channel-aware audit must pass: blocks in orthogonal channels are fully identifiable",
-        );
+    let canon = canonicalize_for_identifiability(&specs).expect(
+        "channel-aware audit must pass: blocks in orthogonal channels are fully identifiable",
+    );
 
     // Audit must be non-fatal (full rank).
     assert!(
@@ -216,8 +212,8 @@ fn post_canonicalize_t_is_identity_for_full_rank_3_block_case() {
         spec_with_callback("logslope", logslope_design, 2, K),
     ];
 
-    let canon = canonicalize_for_identifiability(&specs)
-        .expect("full-rank 3-block case must succeed");
+    let canon =
+        canonicalize_for_identifiability(&specs).expect("full-rank 3-block case must succeed");
 
     // Each per-block T must be the identity (p × p) — no drops.
     for (i, t) in canon.per_block_transform.iter().enumerate() {

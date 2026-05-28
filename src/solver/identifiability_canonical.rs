@@ -327,7 +327,12 @@ pub fn canonicalize_for_identifiability(
     // is present; otherwise the block is always single-output (k=1).
     let max_n_outputs = specs
         .iter()
-        .map(|s| s.jacobian_callback.as_ref().map(|cb| cb.n_outputs()).unwrap_or(1))
+        .map(|s| {
+            s.jacobian_callback
+                .as_ref()
+                .map(|cb| cb.n_outputs())
+                .unwrap_or(1)
+        })
         .max()
         .unwrap_or(1);
     let use_channel_aware = max_n_outputs > 1;
@@ -338,7 +343,11 @@ pub fn canonicalize_for_identifiability(
         specs.len(),
         n_rows,
         max_n_outputs,
-        if use_channel_aware { "channel-aware" } else { "flat" },
+        if use_channel_aware {
+            "channel-aware"
+        } else {
+            "flat"
+        },
     );
 
     // ── Per-block Jacobian Frobenius-norm logging (instrumentation) ──────
@@ -348,7 +357,11 @@ pub fn canonicalize_for_identifiability(
     // audits are visible in the log stream.
     for spec in specs.iter() {
         let jac_nrows = if use_channel_aware {
-            let k = spec.jacobian_callback.as_ref().map(|cb| cb.n_outputs()).unwrap_or(1);
+            let k = spec
+                .jacobian_callback
+                .as_ref()
+                .map(|cb| cb.n_outputs())
+                .unwrap_or(1);
             n_rows * k
         } else {
             n_rows
@@ -390,100 +403,91 @@ pub fn canonicalize_for_identifiability(
         let k = max_n_outputs;
         let mut operators: Vec<Arc<dyn RowJacobianOperator>> = Vec::with_capacity(specs.len());
         for spec in specs.iter() {
-            let op: Arc<dyn RowJacobianOperator> =
-                match spec.jacobian_callback.as_ref() {
-                    Some(cb) if cb.n_outputs() == k => {
-                        let row_op =
-                            BlockJacobianAsRowOp::from_callback(cb.as_ref(), n_rows, &spec.name)
-                                .map_err(|e| CustomFamilyError::DimensionMismatch {
-                                    reason: format!(
-                                        "canonicalize_for_identifiability: build \
-                                         BlockJacobianAsRowOp for block '{}': {e}",
-                                        spec.name,
-                                    ),
-                                })?;
-                        Arc::new(row_op)
-                    }
-                    Some(cb) => {
-                        // k mismatch: this block has fewer outputs than
-                        // max_n_outputs — embed its Jacobian in the top
-                        // channels and zero-pad the rest.
-                        let k_block = cb.n_outputs();
-                        let row_op =
-                            BlockJacobianAsRowOp::from_callback(cb.as_ref(), n_rows, &spec.name)
-                                .map_err(|e| CustomFamilyError::DimensionMismatch {
-                                    reason: format!(
-                                        "canonicalize_for_identifiability: build \
-                                         BlockJacobianAsRowOp (k_mismatch) for block '{}': {e}",
-                                        spec.name,
-                                    ),
-                                })?;
-                        // Embed: extend jac channels from k_block to k by
-                        // zero-padding the trailing channels.
-                        let mut jac_ext = Array3::<f64>::zeros((
-                            row_op.nrows(),
-                            row_op.ncols(),
-                            k,
-                        ));
-                        let jac_inner = row_op.evaluate_full();
-                        for i in 0..row_op.nrows() {
-                            for j in 0..row_op.ncols() {
-                                for r in 0..k_block {
-                                    jac_ext[[i, j, r]] = jac_inner[[i, j, r]];
-                                }
-                            }
-                        }
-                        Arc::new(BlockJacobianAsRowOp { jac: jac_ext })
-                    }
-                    None => {
-                        // Single-output block: embed the flat design in the
-                        // first channel.
-                        let p = spec.design.ncols();
-                        let zeros = vec![0.0f64; p];
-                        let state = FamilyLinearizationState {
-                            beta: &zeros,
-                            family_scalars: None,
-                            channel_hessian: None,
-                            probit_frailty_scale: 1.0,
-                        };
-                        let flat = spec
-                            .effective_jacobian_at(
-                                "canonicalize_for_identifiability",
-                                &state,
-                            )
+            let op: Arc<dyn RowJacobianOperator> = match spec.jacobian_callback.as_ref() {
+                Some(cb) if cb.n_outputs() == k => {
+                    let row_op =
+                        BlockJacobianAsRowOp::from_callback(cb.as_ref(), n_rows, &spec.name)
                             .map_err(|e| CustomFamilyError::DimensionMismatch {
                                 reason: format!(
-                                    "canonicalize_for_identifiability: effective_jacobian_at \
-                                     for block '{}': {e}",
+                                    "canonicalize_for_identifiability: build \
+                                         BlockJacobianAsRowOp for block '{}': {e}",
                                     spec.name,
                                 ),
                             })?;
-                        let mut jac_ext =
-                            Array3::<f64>::zeros((n_rows, flat.ncols(), k));
-                        for i in 0..n_rows {
-                            for j in 0..flat.ncols() {
-                                jac_ext[[i, j, 0]] = flat[[i, j]];
+                    Arc::new(row_op)
+                }
+                Some(cb) => {
+                    // k mismatch: this block has fewer outputs than
+                    // max_n_outputs — embed its Jacobian in the top
+                    // channels and zero-pad the rest.
+                    let k_block = cb.n_outputs();
+                    let row_op =
+                        BlockJacobianAsRowOp::from_callback(cb.as_ref(), n_rows, &spec.name)
+                            .map_err(|e| CustomFamilyError::DimensionMismatch {
+                                reason: format!(
+                                    "canonicalize_for_identifiability: build \
+                                         BlockJacobianAsRowOp (k_mismatch) for block '{}': {e}",
+                                    spec.name,
+                                ),
+                            })?;
+                    // Embed: extend jac channels from k_block to k by
+                    // zero-padding the trailing channels.
+                    let mut jac_ext = Array3::<f64>::zeros((row_op.nrows(), row_op.ncols(), k));
+                    let jac_inner = row_op.evaluate_full();
+                    for i in 0..row_op.nrows() {
+                        for j in 0..row_op.ncols() {
+                            for r in 0..k_block {
+                                jac_ext[[i, j, r]] = jac_inner[[i, j, r]];
                             }
                         }
-                        Arc::new(BlockJacobianAsRowOp { jac: jac_ext })
                     }
-                };
+                    Arc::new(BlockJacobianAsRowOp { jac: jac_ext })
+                }
+                None => {
+                    // Single-output block: embed the flat design in the
+                    // first channel.
+                    let p = spec.design.ncols();
+                    let zeros = vec![0.0f64; p];
+                    let state = FamilyLinearizationState {
+                        beta: &zeros,
+                        family_scalars: None,
+                        channel_hessian: None,
+                        probit_frailty_scale: 1.0,
+                    };
+                    let flat = spec
+                        .effective_jacobian_at("canonicalize_for_identifiability", &state)
+                        .map_err(|e| CustomFamilyError::DimensionMismatch {
+                            reason: format!(
+                                "canonicalize_for_identifiability: effective_jacobian_at \
+                                     for block '{}': {e}",
+                                spec.name,
+                            ),
+                        })?;
+                    let mut jac_ext = Array3::<f64>::zeros((n_rows, flat.ncols(), k));
+                    for i in 0..n_rows {
+                        for j in 0..flat.ncols() {
+                            jac_ext[[i, j, 0]] = flat[[i, j]];
+                        }
+                    }
+                    Arc::new(BlockJacobianAsRowOp { jac: jac_ext })
+                }
+            };
             operators.push(op);
         }
         let row_hess = IdentityRowHessian::new(n_rows, k);
-        let audit_result =
-            audit_identifiability_channel_aware(specs, &operators, &row_hess).map_err(
-                |reason| CustomFamilyError::DimensionMismatch {
-                    reason: format!(
-                        "pre-fit channel-aware identifiability audit failed: {reason}"
-                    ),
-                },
-            )?;
+        let audit_result = audit_identifiability_channel_aware(specs, &operators, &row_hess)
+            .map_err(|reason| CustomFamilyError::DimensionMismatch {
+                reason: format!("pre-fit channel-aware identifiability audit failed: {reason}"),
+            })?;
 
         log::info!(
             "[CANON] channel-aware audit: {} blocks, joint_rank={}/{} (flat audit NOT used)",
             specs.len(),
-            audit_result.blocks.iter().map(|b| b.effective_dim).sum::<usize>(),
+            audit_result
+                .blocks
+                .iter()
+                .map(|b| b.effective_dim)
+                .sum::<usize>(),
             specs.iter().map(|s| s.design.ncols()).sum::<usize>(),
         );
 
@@ -493,13 +497,16 @@ pub fn canonicalize_for_identifiability(
         // is visible without being a false alarm.
         if let Ok(flat_audit) = audit_identifiability(specs) {
             let flat_rank: usize = flat_audit.blocks.iter().map(|b| b.effective_dim).sum();
-            let ca_rank: usize =
-                audit_result.blocks.iter().map(|b| b.effective_dim).sum();
+            let ca_rank: usize = audit_result.blocks.iter().map(|b| b.effective_dim).sum();
             if flat_rank != ca_rank {
                 log::info!(
                     "[CANON] rank discrepancy: flat_rank={flat_rank} channel_aware_rank={ca_rank}; \
                      the flat audit would have {action} this fit; the channel-aware verdict is used",
-                    action = if flat_audit.fatal { "refused" } else { "accepted (but with drops)" },
+                    action = if flat_audit.fatal {
+                        "refused"
+                    } else {
+                        "accepted (but with drops)"
+                    },
                 );
             } else {
                 log::debug!(
@@ -510,14 +517,19 @@ pub fn canonicalize_for_identifiability(
 
         audit_result
     } else {
-        let audit_result =
-            audit_identifiability(specs).map_err(|reason| CustomFamilyError::DimensionMismatch {
+        let audit_result = audit_identifiability(specs).map_err(|reason| {
+            CustomFamilyError::DimensionMismatch {
                 reason: format!("pre-fit identifiability audit failed: {reason}"),
-            })?;
+            }
+        })?;
         log::debug!(
             "[CANON] flat audit: {} blocks, joint_rank={}",
             specs.len(),
-            audit_result.blocks.iter().map(|b| b.effective_dim).sum::<usize>(),
+            audit_result
+                .blocks
+                .iter()
+                .map(|b| b.effective_dim)
+                .sum::<usize>(),
         );
         audit_result
     };
@@ -785,17 +797,17 @@ pub fn canonicalize_for_identifiability(
                 &red_col_offsets,
             )
             .map_err(|error| {
-                log::warn!(
-                    "[CANON] MAP uniqueness check failed: {}",
-                    error.message,
-                );
+                log::warn!("[CANON] MAP uniqueness check failed: {}", error.message,);
                 CustomFamilyError::MapUniquenessFailure { error }
             })?;
 
             log::debug!(
                 "[CANON] MAP uniqueness check passed \
                  (p_red={p_total_red} penalty_blocks={})",
-                reduced_specs.iter().map(|s| s.penalties.len()).sum::<usize>(),
+                reduced_specs
+                    .iter()
+                    .map(|s| s.penalties.len())
+                    .sum::<usize>(),
             );
         }
     }
@@ -1019,8 +1031,9 @@ mod tests {
         // With distinct gauge_priority values, the audit recognises that
         // the rank deficiency is gauge-resolvable and returns Ok (non-fatal).
         // The canonical-gauge pipeline proceeds with the column reductions.
-        let canon = canonicalize_for_identifiability(&specs)
-            .expect("five-block aliased joint with distinct gauge_priority must succeed (gauge-resolved)");
+        let canon = canonicalize_for_identifiability(&specs).expect(
+            "five-block aliased joint with distinct gauge_priority must succeed (gauge-resolved)",
+        );
 
         // The audit stored in canon.audit must be non-fatal.
         assert!(
@@ -1062,8 +1075,7 @@ mod tests {
         // The reduced specs must have 9 total columns (rank = 9).
         let reduced_total: usize = canon.reduced_specs.iter().map(|s| s.design.ncols()).sum();
         assert_eq!(
-            reduced_total,
-            9,
+            reduced_total, 9,
             "reduced specs must have joint rank = 9 total columns; got {reduced_total}",
         );
 

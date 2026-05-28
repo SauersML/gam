@@ -1,25 +1,25 @@
 use crate::estimate::EstimationError;
 use crate::estimate::reml::FirthDenseOperator;
 use crate::faer_ndarray::{
-    FaerCholesky, FaerEigh, FaerLinalgError, FaerSymmetricFactor, array1_to_col_matmut,
-    fast_ab, fast_av, fast_av_into,
+    FaerCholesky, FaerEigh, FaerLinalgError, FaerSymmetricFactor, array1_to_col_matmut, fast_ab,
+    fast_av, fast_av_into,
 };
 use crate::linalg::sparse_exact::{factorize_sparse_spd, solve_sparse_spd};
 use crate::linalg::utils::{StableSolver, boundary_hit_step_fraction};
 use crate::matrix::{DesignMatrix, LinearOperator};
-use crate::solver::active_set;
 use crate::mixture_link::{InverseLinkJet as MixtureInverseLinkJet, logit_inverse_link_jet5};
+use crate::solver::active_set;
 use crate::types::{Coefficients, LinearPredictor, StandardLink};
 use crate::types::{
     GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, MixtureLinkState, ResponseFamily,
     SasLinkState, is_valid_tweedie_power,
 };
 use dyn_stack::{MemBuffer, MemStack};
+use faer::sparse::SparseColMat;
 use faer::sparse::linalg::matmul::{
     SparseMatMulInfo, sparse_sparse_matmul_numeric, sparse_sparse_matmul_numeric_scratch,
     sparse_sparse_matmul_symbolic,
 };
-use faer::sparse::SparseColMat;
 use faer::sparse::{
     SparseColMatMut, SparseColMatRef, SparseRowMat, SymbolicSparseColMat, SymbolicSparseColMatRef,
 };
@@ -51,26 +51,28 @@ mod reweight;
 mod state;
 
 // Re-export public API that lived in the original flat file
-pub use state::{
-    AdaptiveKktTolerance, ExportedLaplaceCurvature, FirthDiagnostics, HessianCurvatureKind,
-    PirlsCoordinateFrame, PirlsLinearSolvePath, PirlsResult, PirlsStatus,
-    WorkingModelIterationInfo, WorkingModelPirlsResult, WorkingState,
+use convergence::effective_kkt_tolerance;
+use damping::{
+    add_scaled_diagonal_to_upper_sparse, compute_lm_d2, update_scaled_diagonal_in_place,
 };
-pub(crate) use state::array1_l2_norm;
 pub use edf::StablePLSResult;
 use edf::{
     calculate_edf_from_sparse_factor, calculate_edf_with_penalty,
     calculate_edfwithworkspace_from_factor, calculate_edfwithworkspace_with_penalty,
 };
-use damping::{add_scaled_diagonal_to_upper_sparse, compute_lm_d2, update_scaled_diagonal_in_place};
 use penalty::{
     KroneckerQsTransform, PirlsPenalty, WorkingCoordinateDesign, WorkingReparamTransform,
     attach_penalty_shift,
 };
-use convergence::effective_kkt_tolerance;
 use pls_solver::solve_penalized_least_squares_implicit;
 pub use pls_solver::{GaussianFixedCache, SparseXtwxPrecomputed};
 pub use reweight::runworking_model_pirls;
+pub(crate) use state::array1_l2_norm;
+pub use state::{
+    AdaptiveKktTolerance, ExportedLaplaceCurvature, FirthDiagnostics, HessianCurvatureKind,
+    PirlsCoordinateFrame, PirlsLinearSolvePath, PirlsResult, PirlsStatus,
+    WorkingModelIterationInfo, WorkingModelPirlsResult, WorkingState,
+};
 
 const GAMMA_SHAPE_MIN: f64 = 1e-8;
 const GAMMA_SHAPE_MAX: f64 = 1e12;
@@ -173,7 +175,6 @@ fn gamma_loglikelihood_with_shape(
         })
         .sum()
 }
-
 
 #[derive(Clone, Debug)]
 pub struct SparsePirlsDecision {
@@ -879,8 +880,6 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
     }
 }
 
-
-
 // Suggestion #6: Preallocate and reuse iteration workspaces
 pub struct PirlsWorkspace {
     // Common IRLS buffers. Only O(n) state is kept persistently; any
@@ -1175,9 +1174,6 @@ pub(super) fn commit_pending_arrow_latent(pending_snapshot: &mut Option<Array1<f
     drop(pending_snapshot.take());
 }
 
-
-
-
 // Fixed stabilization ridge for PIRLS/PLS. `penalty_term` carries this as
 // ridge * ||beta||^2 (equivalently 0.5 * ridge * ||beta||^2 in the
 // 0.5 * (deviance + penalty_term) objective), and it is constant w.r.t. rho.
@@ -1190,9 +1186,6 @@ pub(super) fn commit_pending_arrow_latent(pending_snapshot: &mut Option<Array1<f
 //   envelope-theorem gradient valid:
 //     dV/dρ_k = 0.5 λ_k βᵀ S_k β + 0.5 λ_k tr(H^{-1} S_k) - 0.5 det1[k].
 pub(super) const FIXED_STABILIZATION_RIDGE: f64 = 1e-8;
-
-
-
 
 pub(super) struct GamWorkingModel<'a> {
     x_original: DesignMatrix,
@@ -2820,7 +2813,10 @@ where
     Ok(())
 }
 
-pub(super) fn project_coefficients_to_lower_bounds(beta: &mut Array1<f64>, lower_bounds: &Array1<f64>) {
+pub(super) fn project_coefficients_to_lower_bounds(
+    beta: &mut Array1<f64>,
+    lower_bounds: &Array1<f64>,
+) {
     for i in 0..beta.len() {
         let lb = lower_bounds[i];
         if lb.is_finite() && beta[i] < lb {
@@ -3216,7 +3212,6 @@ where
     })
 }
 
-
 fn solve_subsystem_direction(
     h_sub: ndarray::ArrayView2<f64>,
     g_sub: ndarray::ArrayView1<f64>,
@@ -3584,12 +3579,9 @@ pub(super) fn solve_newton_directionwith_linear_constraints(
 // fit_model_for_fixed_rho_with_adaptive_kkt, PirlsConfig, make_reparam_operator,
 // build_transformed_lower_bound_constraints*, build_transformed_linear_constraints*,
 // merge_linear_constraints, sparse_from_denseview.
-pub use loop_driver::{
-    fit_model_for_fixed_rho, PirlsConfig, PirlsProblem, PenaltyConfig,
-};
-pub(crate) use loop_driver::fit_model_for_fixed_rho_with_adaptive_kkt;
 use loop_driver::assert_symmetric_tol;
-
+pub(crate) use loop_driver::fit_model_for_fixed_rho_with_adaptive_kkt;
+pub use loop_driver::{PenaltyConfig, PirlsConfig, PirlsProblem, fit_model_for_fixed_rho};
 
 #[inline]
 pub(super) fn standard_inverse_link_jet(
@@ -6481,11 +6473,6 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
     }
 }
 
-
-
-
-
-
 // ---------------------------------------------------------------------------
 // Latent-field hooks. New functions only; existing weighted-LS / Gram
 // code paths are intentionally untouched here (those belong to other
@@ -6864,6 +6851,8 @@ mod low_rank_weight_pirls_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::loop_driver::default_beta_guess_external;
+    use super::reweight::madsen_lm_accept_factor;
     use super::{
         LinearInequalityConstraints, PenaltyConfig, PirlsConfig, PirlsLinearSolvePath,
         PirlsProblem, PirlsWorkspace, bernoulli_geometry_from_jet, calculate_deviance,
@@ -6872,8 +6861,6 @@ mod tests {
         should_use_sparse_native_pirls, solve_newton_directionwith_linear_constraints,
         solve_newton_directionwith_lower_bounds, update_glmvectors,
     };
-    use super::loop_driver::default_beta_guess_external;
-    use super::reweight::madsen_lm_accept_factor;
     use crate::matrix::DesignMatrix;
     use crate::mixture_link::InverseLinkJet as MixtureInverseLinkJet;
     use crate::probability::standard_normal_quantile;

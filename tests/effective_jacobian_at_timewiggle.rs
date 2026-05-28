@@ -19,12 +19,12 @@ use std::sync::Arc;
 // ── Test geometry ────────────────────────────────────────────────────────────
 
 const N: usize = 6;
-const P_BASE: usize = 2;  // non-wiggle time columns
-const P_TW: usize = 2;    // wiggle tail columns
-const P_TIME: usize = P_BASE + P_TW;   // 4
-const P_M: usize = 3;     // marginal columns
-const P_G: usize = 1;     // logslope columns
-const P_JOINT: usize = P_TIME + P_M + P_G;  // 8
+const P_BASE: usize = 2; // non-wiggle time columns
+const P_TW: usize = 2; // wiggle tail columns
+const P_TIME: usize = P_BASE + P_TW; // 4
+const P_M: usize = 3; // marginal columns
+const P_G: usize = 1; // logslope columns
+const P_JOINT: usize = P_TIME + P_M + P_G; // 8
 
 /// Dense n × p_base entry design.
 fn design_entry() -> Array2<f64> {
@@ -52,9 +52,7 @@ fn design_deriv() -> Array2<f64> {
 
 /// Dense n × p_m marginal design.
 fn design_marginal() -> Array2<f64> {
-    let data: Vec<f64> = (0..N * P_M)
-        .map(|k| 0.1 * (k as f64 + 2.0))
-        .collect();
+    let data: Vec<f64> = (0..N * P_M).map(|k| 0.1 * (k as f64 + 2.0)).collect();
     Array2::from_shape_vec((N, P_M), data).unwrap()
 }
 
@@ -67,7 +65,7 @@ fn design_logslope() -> Array2<f64> {
 /// Per-row offsets (all three: entry, exit, deriv).
 fn offsets() -> (Array1<f64>, Array1<f64>, Array1<f64>) {
     let entry = Array1::from_iter((0..N).map(|i| 0.2 + 0.05 * i as f64));
-    let exit  = Array1::from_iter((0..N).map(|i| 0.4 + 0.07 * i as f64));
+    let exit = Array1::from_iter((0..N).map(|i| 0.4 + 0.07 * i as f64));
     let deriv = Array1::from_iter((0..N).map(|i| 0.9 + 0.03 * i as f64));
     (entry, exit, deriv)
 }
@@ -89,10 +87,8 @@ fn beta_nonzero() -> Array1<f64> {
         0.15, -0.07,
         // β_tw (2): positive (wiggle monotone constraint requires ≥ 0,
         // but we just need a valid input for the Jacobian)
-        0.20, 0.10,
-        // β_m (3)
-        0.05, -0.12, 0.08,
-        // β_g (1): set to 0 so c_i = 1 (simplifies ground truth)
+        0.20, 0.10, // β_m (3)
+        0.05, -0.12, 0.08, // β_g (1): set to 0 so c_i = 1 (simplifies ground truth)
         0.0,
     ])
 }
@@ -128,23 +124,33 @@ fn row_eta(i: usize, beta: &[f64]) -> (f64, f64, f64) {
     let (oe, ox, od) = offsets();
 
     let beta_t_base = &beta[..P_BASE];
-    let beta_tw     = &beta[P_BASE..P_TIME];
-    let beta_m      = &beta[P_TIME..P_TIME + P_M];
-    let beta_g      = &beta[P_TIME + P_M..P_TIME + P_M + P_G];
+    let beta_tw = &beta[P_BASE..P_TIME];
+    let beta_m = &beta[P_TIME..P_TIME + P_M];
+    let beta_g = &beta[P_TIME + P_M..P_TIME + P_M + P_G];
 
     // c_i from β_g (= 1 here since β_g = 0)
-    let g_i: f64 = (0..P_G).map(|j| design_logslope()[[i, j]] * beta_g[j]).sum();
+    let g_i: f64 = (0..P_G)
+        .map(|j| design_logslope()[[i, j]] * beta_g[j])
+        .sum();
     let s = 1.0_f64; // probit_scale
     let c_i = (1.0_f64 + (s * g_i).powi(2)).sqrt();
 
     let eta_m: f64 = (0..P_M).map(|j| dm[[i, j]] * beta_m[j]).sum();
 
-    let h0_base: f64 = oe[i] + eta_m
-        + (0..P_BASE).map(|j| de[[i, j]] * beta_t_base[j]).sum::<f64>();
-    let h1_base: f64 = ox[i] + eta_m
-        + (0..P_BASE).map(|j| dx[[i, j]] * beta_t_base[j]).sum::<f64>();
+    let h0_base: f64 = oe[i]
+        + eta_m
+        + (0..P_BASE)
+            .map(|j| de[[i, j]] * beta_t_base[j])
+            .sum::<f64>();
+    let h1_base: f64 = ox[i]
+        + eta_m
+        + (0..P_BASE)
+            .map(|j| dx[[i, j]] * beta_t_base[j])
+            .sum::<f64>();
     let d_raw: f64 = od[i]
-        + (0..P_BASE).map(|j| dd[[i, j]] * beta_t_base[j]).sum::<f64>();
+        + (0..P_BASE)
+            .map(|j| dd[[i, j]] * beta_t_base[j])
+            .sum::<f64>();
 
     let q0 = compute_q(h0_base, beta_tw);
     let q1 = compute_q(h1_base, beta_tw);
@@ -152,8 +158,12 @@ fn row_eta(i: usize, beta: &[f64]) -> (f64, f64, f64) {
     let knots = wiggle_knots();
     let h1_arr = Array1::from_vec(vec![h1_base]);
     let basis_d1 = gam::gamlss::monotone_wiggle_basis_with_derivative_order(
-        h1_arr.view(), &knots, WIGGLE_DEGREE, 1,
-    ).expect("basis_d1");
+        h1_arr.view(),
+        &knots,
+        WIGGLE_DEGREE,
+        1,
+    )
+    .expect("basis_d1");
     let dq_dq0: f64 = 1.0
         + (0..P_TW.min(basis_d1.ncols()))
             .map(|j| basis_d1[[0, j]] * beta_tw[j])
@@ -176,9 +186,9 @@ fn numerical_jacobian(beta_full: &[f64], block_start: usize, p_block: usize) -> 
         for i in 0..N {
             let (e0p, e1p, ad1p) = row_eta(i, &beta_p);
             let (e0m, e1m, ad1m) = row_eta(i, &beta_m);
-            jac[[i,       j]] = (e0p - e0m) / (2.0 * eps);
-            jac[[N + i,   j]] = (e1p - e1m) / (2.0 * eps);
-            jac[[2*N + i, j]] = (ad1p - ad1m) / (2.0 * eps);
+            jac[[i, j]] = (e0p - e0m) / (2.0 * eps);
+            jac[[N + i, j]] = (e1p - e1m) / (2.0 * eps);
+            jac[[2 * N + i, j]] = (ad1p - ad1m) / (2.0 * eps);
         }
         beta_p[block_start + j] -= eps;
         beta_m[block_start + j] += eps;
@@ -299,7 +309,9 @@ fn time_jacobian_at_zero_beta_matches_rigid() {
         channel_hessian: None,
         probit_frailty_scale: 1.0,
     };
-    let jac = jac_cb.effective_jacobian_at(&state).expect("time jacobian at zero");
+    let jac = jac_cb
+        .effective_jacobian_at(&state)
+        .expect("time jacobian at zero");
     assert_eq!(
         jac.dim(),
         (3 * N, P_TIME),
@@ -311,9 +323,9 @@ fn time_jacobian_at_zero_beta_matches_rigid() {
     let dd = design_deriv();
     for i in 0..N {
         for j in 0..P_BASE {
-            approx::assert_abs_diff_eq!(jac[[i,       j]], de[[i, j]], epsilon = 1e-12);
-            approx::assert_abs_diff_eq!(jac[[N + i,   j]], dx[[i, j]], epsilon = 1e-12);
-            approx::assert_abs_diff_eq!(jac[[2*N + i, j]], dd[[i, j]], epsilon = 1e-12);
+            approx::assert_abs_diff_eq!(jac[[i, j]], de[[i, j]], epsilon = 1e-12);
+            approx::assert_abs_diff_eq!(jac[[N + i, j]], dx[[i, j]], epsilon = 1e-12);
+            approx::assert_abs_diff_eq!(jac[[2 * N + i, j]], dd[[i, j]], epsilon = 1e-12);
         }
     }
 }
@@ -328,15 +340,21 @@ fn marginal_jacobian_at_zero_beta_matches_rigid() {
         channel_hessian: None,
         probit_frailty_scale: 1.0,
     };
-    let jac = jac_cb.effective_jacobian_at(&state).expect("marginal jacobian at zero");
-    assert_eq!(jac.dim(), (3 * N, P_M), "marginal Jacobian shape mismatch at β=0");
+    let jac = jac_cb
+        .effective_jacobian_at(&state)
+        .expect("marginal jacobian at zero");
+    assert_eq!(
+        jac.dim(),
+        (3 * N, P_M),
+        "marginal Jacobian shape mismatch at β=0"
+    );
     // At β=0: J[i,j] = J[n+i,j] = M[i,j], J[2n+i,j] = 0.
     let dm = design_marginal();
     for i in 0..N {
         for j in 0..P_M {
-            approx::assert_abs_diff_eq!(jac[[i,     j]], dm[[i, j]], epsilon = 1e-12);
+            approx::assert_abs_diff_eq!(jac[[i, j]], dm[[i, j]], epsilon = 1e-12);
             approx::assert_abs_diff_eq!(jac[[N + i, j]], dm[[i, j]], epsilon = 1e-12);
-            approx::assert_abs_diff_eq!(jac[[2*N + i, j]], 0.0,      epsilon = 1e-12);
+            approx::assert_abs_diff_eq!(jac[[2 * N + i, j]], 0.0, epsilon = 1e-12);
         }
     }
 }

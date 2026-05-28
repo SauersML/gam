@@ -332,8 +332,7 @@ fn cross_block_alias_with_distinct_priorities_is_not_fatal() {
                 drop.block, "logslope_surface",
                 "gauge must attribute drops to the lowest-priority block (logslope_surface); \
                  got drop on '{}' (summary: {})",
-                drop.block,
-                audit.summary,
+                drop.block, audit.summary,
             );
         }
         // Total kept = 33 − 10 = 23 (the 10 logslope columns are aliases
@@ -351,7 +350,9 @@ fn cross_block_alias_with_distinct_priorities_is_not_fatal() {
     // the joint rank is full and no drops are needed.
     {
         let z_scaling: std::sync::Arc<[f64]> = std::sync::Arc::from(
-            z_primary.as_slice().expect("z_primary must be C-contiguous"),
+            z_primary
+                .as_slice()
+                .expect("z_primary must be C-contiguous"),
         );
         let logslope_scaled_spec = ParameterBlockSpec {
             name: "logslope_surface".to_string(),
@@ -373,8 +374,7 @@ fn cross_block_alias_with_distinct_priorities_is_not_fatal() {
             make_spec("marginal_surface", marginal, 150),
             logslope_scaled_spec,
         ];
-        let audit = audit_identifiability(&specs_with_z_scaling)
-            .expect("z-scaled audit must run");
+        let audit = audit_identifiability(&specs_with_z_scaling).expect("z-scaled audit must run");
         assert!(
             !audit.fatal,
             "z-scaled logslope audit must be non-fatal (diag(z)·basis is independent \

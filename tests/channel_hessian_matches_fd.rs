@@ -168,16 +168,15 @@ fn survival_marginal_slope_channel_hessian_matches_fd() {
 /// for a specific response y ∈ {0, 1}.
 fn bernoulli_obs_nll(u: &[f64], y: f64, w: f64) -> f64 {
     let eta = u[0];
-    let p = gam::inference::probability::normal_cdf(eta).clamp(f64::MIN_POSITIVE, 1.0 - f64::MIN_POSITIVE);
+    let p = gam::inference::probability::normal_cdf(eta)
+        .clamp(f64::MIN_POSITIVE, 1.0 - f64::MIN_POSITIVE);
     let one_m = (1.0 - p).max(f64::MIN_POSITIVE);
     -(w * (y * p.ln() + (1.0 - y) * one_m.ln()))
 }
 
 #[test]
 fn bernoulli_channel_hessian_matches_fd() {
-    let etas: Vec<f64> = (0..N)
-        .map(|i| -1.5 + (i as f64) * 0.2)
-        .collect();
+    let etas: Vec<f64> = (0..N).map(|i| -1.5 + (i as f64) * 0.2).collect();
     let ws: Vec<f64> = (0..N).map(|i| 0.5 + (i as f64) * 0.05).collect();
 
     let eta_arr = Array1::from_iter(etas.iter().copied());

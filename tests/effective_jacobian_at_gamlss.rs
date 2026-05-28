@@ -469,7 +469,9 @@ fn jacobian_box_is_send() {
         channel_hessian: None,
         probit_frailty_scale: 1.0,
     };
-    let j = jac.effective_jacobian_at(&state).expect("effective_jacobian_at");
+    let j = jac
+        .effective_jacobian_at(&state)
+        .expect("effective_jacobian_at");
     assert!(j.nrows() > 0, "jacobian must have rows");
     assert!(j.ncols() > 0, "jacobian must have columns");
     // Compile-time Send invariant: constructing the box must be Send.

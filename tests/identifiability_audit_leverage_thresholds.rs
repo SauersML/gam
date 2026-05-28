@@ -183,8 +183,14 @@ fn leverage_concentrated_column_has_wide_threshold() {
     }
     // Verify the cosine with col_a.
     let dot_ab: f64 = (0..n).map(|i| design_a[[i, 0]] * design_b_07[[i, 0]]).sum();
-    let norm_a: f64 = (0..n).map(|i| design_a[[i, 0]] * design_a[[i, 0]]).sum::<f64>().sqrt();
-    let norm_b: f64 = (0..n).map(|i| design_b_07[[i, 0]] * design_b_07[[i, 0]]).sum::<f64>().sqrt();
+    let norm_a: f64 = (0..n)
+        .map(|i| design_a[[i, 0]] * design_a[[i, 0]])
+        .sum::<f64>()
+        .sqrt();
+    let norm_b: f64 = (0..n)
+        .map(|i| design_b_07[[i, 0]] * design_b_07[[i, 0]])
+        .sum::<f64>()
+        .sqrt();
     let actual_cos = dot_ab / (norm_a * norm_b);
     assert!(
         (actual_cos - 0.7).abs() < 1e-10,
@@ -269,9 +275,9 @@ fn exact_alias_fires_halt_regardless_of_n_eff() {
 #[test]
 fn cosine_07_fires_for_high_n_eff_but_not_low_n_eff() {
     let n = 100_000usize;
-    let r_low = 5usize;    // n_eff ≈ 5,   σ ≈ 0.447, halt thr = 0.999
+    let r_low = 5usize; // n_eff ≈ 5,   σ ≈ 0.447, halt thr = 0.999
     let r_high = 200usize; // n_eff ≈ 200,  σ = sqrt(1/200 - 1/100000) ≈ 0.0707,
-                           // halt thr = min(0.999, 10 · 0.0707) ≈ 0.707
+    // halt thr = min(0.999, 10 · 0.0707) ≈ 0.707
 
     // Build column A (low n_eff): unit mass on rows 0..r_low.
     // Build column B (low n_eff): cos(θ)·col_a + sin(θ)·perp on rows r_low..(2·r_low).
@@ -290,8 +296,14 @@ fn cosine_07_fires_for_high_n_eff_but_not_low_n_eff() {
     }
     // Verify overlap.
     let dot_low: f64 = (0..n).map(|i| col_a_low[[i, 0]] * col_b_low[[i, 0]]).sum();
-    let norm_a_low = (0..n).map(|i| col_a_low[[i, 0]].powi(2)).sum::<f64>().sqrt();
-    let norm_b_low = (0..n).map(|i| col_b_low[[i, 0]].powi(2)).sum::<f64>().sqrt();
+    let norm_a_low = (0..n)
+        .map(|i| col_a_low[[i, 0]].powi(2))
+        .sum::<f64>()
+        .sqrt();
+    let norm_b_low = (0..n)
+        .map(|i| col_b_low[[i, 0]].powi(2))
+        .sum::<f64>()
+        .sqrt();
     let actual_cos_low = dot_low / (norm_a_low * norm_b_low);
     assert!(
         (actual_cos_low - cos_target).abs() < 1e-10,
@@ -321,9 +333,17 @@ fn cosine_07_fires_for_high_n_eff_but_not_low_n_eff() {
         col_b_high[[i, 0]] = sin_target / (r_high as f64).sqrt();
     }
     // Verify overlap.
-    let dot_high: f64 = (0..n).map(|i| col_a_high[[i, 0]] * col_b_high[[i, 0]]).sum();
-    let norm_a_high = (0..n).map(|i| col_a_high[[i, 0]].powi(2)).sum::<f64>().sqrt();
-    let norm_b_high = (0..n).map(|i| col_b_high[[i, 0]].powi(2)).sum::<f64>().sqrt();
+    let dot_high: f64 = (0..n)
+        .map(|i| col_a_high[[i, 0]] * col_b_high[[i, 0]])
+        .sum();
+    let norm_a_high = (0..n)
+        .map(|i| col_a_high[[i, 0]].powi(2))
+        .sum::<f64>()
+        .sqrt();
+    let norm_b_high = (0..n)
+        .map(|i| col_b_high[[i, 0]].powi(2))
+        .sum::<f64>()
+        .sqrt();
     let actual_cos_high = dot_high / (norm_a_high * norm_b_high);
     assert!(
         (actual_cos_high - cos_target).abs() < 1e-10,

@@ -28,7 +28,9 @@ const FD_EPS: f64 = 1e-7;
 const REL_TOL: f64 = 5e-5;
 
 fn lcg(seed: &mut u64) -> f64 {
-    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *seed = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     (((*seed >> 33) as u32) as f64) / (u32::MAX as f64) * 2.0 - 1.0
 }
 
@@ -69,9 +71,7 @@ fn build_rigid_flex_scalars(
 
     let mut eta_u_entry = Array2::<f64>::zeros((n, p_primary));
     let mut eta_u_exit = Array2::<f64>::zeros((n, p_primary));
-    let chi_exit: Vec<f64> = (0..n)
-        .map(|i| (1.0 + (s * g[i]).powi(2)).sqrt())
-        .collect();
+    let chi_exit: Vec<f64> = (0..n).map(|i| (1.0 + (s * g[i]).powi(2)).sqrt()).collect();
     let mut chi_u_exit = Array2::<f64>::zeros((n, p_primary));
     let d_exit: Vec<f64> = chi_exit.clone();
     let mut d_u_exit = Array2::<f64>::zeros((n, p_primary));
@@ -409,9 +409,7 @@ fn flex_time_jacobian_rigid_fd() {
             .map(|i| (0..p_t).map(|j| dx[[i, j]] * b[j]).sum())
             .collect();
         let qd1_r: Vec<f64> = (0..N)
-            .map(|i| {
-                1.0 + (0..p_t).map(|j| dd[[i, j]] * b[j]).sum::<f64>()
-            })
+            .map(|i| 1.0 + (0..p_t).map(|j| dd[[i, j]] * b[j]).sum::<f64>())
             .collect();
         let g_zeros = vec![0.0_f64; N];
         let z_zeros = vec![0.0_f64; N];

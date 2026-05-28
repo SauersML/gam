@@ -50,8 +50,8 @@ const N: usize = 32;
 fn build_rank_deficient_j() -> Array2<f64> {
     let mut j = Array2::<f64>::zeros((N, 3));
     for i in 0..N {
-        j[[i, 0]] = 1.0;                   // v_shared
-        j[[i, 1]] = (i + 1) as f64;        // v_a = linramp
+        j[[i, 0]] = 1.0; // v_shared
+        j[[i, 1]] = (i + 1) as f64; // v_a = linramp
         j[[i, 2]] = 2.0 * (i + 1) as f64; // v_b = 2 * v_a
     }
     j
