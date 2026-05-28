@@ -137,32 +137,11 @@ jobs:
 
             ## Bailing is not on the table
 
-            Once you've picked an issue, you do not abandon it. There is
-            no "this turns out not to be a real bug" exit, no "blocked on
-            something external" exit, no "duplicate" exit, no "too hard"
-            exit. If the issue as filed is wrong-shaped — the failing
-            test isn't actually wrong, the root cause is in a dependency,
-            the fix requires a redesign three layers down — your job is
-            to remove the blocker, not name it.
-
-              - Dep is buggy? Vendor it, patch it, replace it, write the
-                fix upstream and pin to your fork in the meantime.
-              - Fix requires redesigning a subsystem? Redesign the
-                subsystem.
-              - The failing test asserts something subtly wrong? Fix the
-                test in the same PR with an explanation, and still solve
-                whatever real problem the issue points at.
-              - Issue is a "duplicate" of another open one? Solve both in
-                one PR and close both.
-              - Need infrastructure that doesn't exist yet (a benchmark
-                harness, a property-test generator, a numerical
-                cross-checker)? Build it.
-              - Will it take many runs? Many runs is fine. Hand off via
-                the branch and a clear status comment; pick up next time.
-
-            The only acceptable terminal states are: the PR is open and
-            the fix is genuinely complete, OR work is paused mid-flight
-            with the next concrete step documented. Not "I gave up."
+            Once you've picked an issue, you do not abandon it. Your job
+            is to remove blockers, not name them. The only acceptable
+            terminal states are: the PR is open and the fix is genuinely
+            complete, OR work is paused mid-flight with the next concrete
+            step documented for the next run. Not "I gave up."
 
             ## Branching and PRs (allowed here, unlike the bug-hunt agent)
 
