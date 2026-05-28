@@ -67,6 +67,46 @@ MonotoneRootError: type = _rust.MonotoneRootError
 CalibratorError: type = _rust.CalibratorError
 InvalidSpecificationError: type = _rust.InvalidSpecificationError
 
+# Remaining engine error enum subclasses (issue #343 follow-up). Each one
+# corresponds to a `pub enum *Error` in `src/`; the Rust side selects the
+# right class via the per-enum `*_error_to_pyerr` dispatcher.
+GeometryError: type = _rust.GeometryError
+MatrixMaterializationError: type = _rust.MatrixMaterializationError
+GpuError: type = _rust.GpuError
+LinearAlgebraError: type = _rust.LinearAlgebraError
+MatrixError: type = _rust.MatrixError
+CacheStoreError: type = _rust.CacheStoreError
+SmoothError: type = _rust.SmoothError
+ArrowSchurError: type = _rust.ArrowSchurError
+OuterStrategyError: type = _rust.OuterStrategyError
+TermBuilderError: type = _rust.TermBuilderError
+CorrectedCovarianceError: type = _rust.CorrectedCovarianceError
+PredictInputError: type = _rust.PredictInputError
+HmcError: type = _rust.HmcError
+AloError: type = _rust.AloError
+SurvivalError: type = _rust.SurvivalError
+CubicCellKernelError: type = _rust.CubicCellKernelError
+SurvivalConstructionError: type = _rust.SurvivalConstructionError
+TransformationNormalError: type = _rust.TransformationNormalError
+CustomFamilyError: type = _rust.CustomFamilyError
+GamlssError: type = _rust.GamlssError
+SurvivalMarginalSlopeError: type = _rust.SurvivalMarginalSlopeError
+LatentSurvivalError: type = _rust.LatentSurvivalError
+SurvivalPredictError: type = _rust.SurvivalPredictError
+DeviationRuntimeError: type = _rust.DeviationRuntimeError
+DataError: type = _rust.DataError
+FittedModelError: type = _rust.FittedModelError
+LognormalKernelError: type = _rust.LognormalKernelError
+ScaleDesignError: type = _rust.ScaleDesignError
+IdentifiabilityCompilerError: type = _rust.IdentifiabilityCompilerError
+JointPenaltyError: type = _rust.JointPenaltyError
+SurvivalLocationScaleError: type = _rust.SurvivalLocationScaleError
+MapUniquenessError: type = _rust.MapUniquenessError
+UnsupportedLinkError: type = _rust.UnsupportedLinkError
+InvalidConfigurationError: type = _rust.InvalidConfigurationError
+MissingDependencyError: type = _rust.MissingDependencyError
+IntegrationError: type = _rust.IntegrationError
+
 
 def map_exception(exc: BaseException) -> BaseException:
     """Normalize an exception caught at the gamfit Python boundary.
