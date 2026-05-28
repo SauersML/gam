@@ -38,7 +38,7 @@ use gam::families::custom_family::FamilyLinearizationState;
 use gam::terms::sae_manifold::{
     AssignmentMode, SaeAssignment, SaeManifoldAtom, SaeManifoldTerm,
 };
-use ndarray::{Array1, Array2};
+use ndarray::Array2;
 
 const N: usize = 16;
 const K_ATOMS: usize = 2;
