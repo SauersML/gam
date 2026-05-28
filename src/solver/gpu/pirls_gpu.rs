@@ -2182,8 +2182,15 @@ extern "C" __global__ void status_or(
                 let a = crate::gpu::pirls_row::ALPHA_LADDER[k];
                 let pen_k = penalty_beta + a * linear_coeff + a * a * dtsd;
                 let obj_k = dev_k + pen_k;
+                // Match the CPU oracle's acceptance test (#263):
+                // `<= prev_objective` is the `CandidateScreen`
+                // criterion — a step that holds the penalized
+                // objective steady (e.g. an exact zero-gradient
+                // direction) must still be accepted so the line
+                // search does not spuriously exhaust at a
+                // stationary point.
                 if obj_k.is_finite()
-                    && obj_k < prev_objective
+                    && obj_k <= prev_objective
                     && (st & FORBIDDEN_LINESEARCH) == 0
                 {
                     alpha = a;
@@ -2194,19 +2201,31 @@ extern "C" __global__ void status_or(
                 }
             }
             if alpha == 0.0 {
-                // No penalized descent found -- alpha=1 fallback.
-                let a1 = crate::gpu::pirls_row::ALPHA_LADDER[0];
-                alpha = a1;
-                accepted_dev = obj_host[0];
-                accepted_objective = accepted_dev
-                    + penalty_beta
-                    + a1 * linear_coeff
-                    + a1 * a1 * dtsd;
-                halving_count = 0;
+                // No α in the ladder produced a step lowering the
+                // *penalized* objective. The previous code (and the
+                // first draft of this rewrite) silently committed
+                // α=1 here and merely *flagged* exhaustion — that
+                // still commits a non-descent step, which is exactly
+                // what the issue forbids (#263).
+                //
+                // Signal exhaustion and exit the inner loop without
+                // committing β / η / solve-row buffers;
+                // `build_loop_outcome` then maps
+                // `step_search_exhausted` to
+                // `PirlsStatus::LmStepSearchExhausted`, exactly the
+                // CPU oracle's "no acceptable step direction even
+                // after damping" signal. The outer REML / LM
+                // controller can raise damping or reject the outer
+                // iteration. β / η / prev_deviance / prev_objective
+                // all stay at their last accepted values; the
+                // device buffers are likewise untouched.
                 step_search_exhausted = true;
-            } else {
-                step_search_exhausted = false;
+                last_halving = 0;
+                last_step_size = 0.0;
+                last_dev_delta = 0.0;
+                break;
             }
+            step_search_exhausted = false;
             // Commit accepted step: beta and eta updated in-place.
             axpy(
                 &ws.stream,

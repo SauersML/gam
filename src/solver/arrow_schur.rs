@@ -3230,13 +3230,15 @@ fn build_dense_schur_sqrt_ba<B: BatchedBlockSolver>(
     backend: &B,
 ) -> Result<Array2<f64>, ArrowSchurError> {
     let k = sys.k;
-    if sys.hbb.dim() != (k, k) {
+    // Materialise H_ββ via the BetaPenaltyOp trait (#296).
+    let op = sys.effective_penalty_op();
+    if op.dim() != k {
         return Err(ArrowSchurError::SchurFactorFailed {
-            reason: "Square-Root BA direct solve requires a dense K×K shared H_ββ block"
+            reason: "Square-Root BA direct solve requires a K×K shared H_ββ penalty operator"
                 .to_string(),
         });
     }
-    let mut schur = sys.hbb.clone();
+    let mut schur = op.to_dense();
     for j in 0..k {
         schur[[j, j]] += ridge_beta;
     }

@@ -288,6 +288,7 @@ mod linux_impl {
                 loop_ws,
                 family,
                 curvature,
+                gamma_shape,
                 beta0.view(),
                 y,
                 prior_w,
