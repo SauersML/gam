@@ -1,0 +1,130 @@
+name: Claude Fixer (one issue, done properly)
+
+on:
+  schedule:
+    - cron: "*/29 * * * *"
+
+concurrency:
+  group: claude-fixer
+  cancel-in-progress: false
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      id-token: write
+      actions: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install gam CLI
+        run: |
+          set -euxo pipefail
+          curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install gamfit
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install gamfit numpy pandas scipy scikit-learn pyarrow requests
+          python -c "import gamfit; print(gamfit.__version__)"
+
+      - name: Run Claude fixer agent
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          additional_permissions: |
+            actions: read
+          prompt: |
+            Hi Claude. You have the run of this repo, an Ubuntu runner, and
+            as long as you need.
+
+            `gam` is a Rust generalized additive model crate; `gamfit` is its
+            Python wrapper (both already installed). A sibling agent files
+            bug issues with failing tests committed directly to `main` —
+            those are the inbox. Humans file issues too. Either is fair game.
+
+            ## The goal
+
+            Pick one open issue. Solve it properly. Open a PR.
+
+            "Properly" here means the absolute ideal solution — beautiful,
+            principled, root-cause, long-term correct, fully verified, fully
+            implemented. Not the shortest patch that makes the failing test
+            green. If the right fix means rethinking an abstraction,
+            redesigning a numeric scheme, replacing a placeholder, or
+            sequencing several internally consistent changes — do that. The
+            failing test passing is necessary but not sufficient; the
+            *underlying behaviour* must be correct in the general case, not
+            just for the repro.
+
+            ## You are not racing the clock
+
+            There is no time pressure. A single issue may legitimately take
+            many runs of this workflow over days or weeks. The job has a
+            6-hour ceiling per run only because GitHub enforces it; the work
+            itself has none. If you need to stop mid-fix, leave the branch
+            in an honest, well-commented state with a status comment on the
+            issue describing exactly where you are and what's next, so a
+            future run (probably you again, fresh context) can pick up
+            cleanly. Continuity across runs is the point of the per-issue
+            branch.
+
+            ## Picking the issue
+
+            Survey open issues first — `gh issue list --state open --limit
+            100`. Skip any issue that already has an open PR linked from it
+            (someone — likely a previous run of yourself — is mid-fix; let
+            them finish). Among the rest, prefer:
+              - Issues where you can produce a *complete*, principled fix,
+                not a partial one. A hard issue done right beats two easy
+                ones done shallowly.
+              - Issues touching subsystems that haven't been fixed recently
+                (look at recent merged PRs and recent commits to see what
+                area has been getting attention). Spread the love.
+              - Issues with failing tests already committed to `main` — the
+                feedback loop is tightest.
+            If you start a partial fix on a fresh branch and discover the
+            issue is the wrong shape (duplicate, not actually a bug, blocked
+            on something external), say so on the issue and exit. Don't
+            ship a fix that isn't.
+
+            ## Branching and PRs (allowed here, unlike the bug-hunt agent)
+
+            For each issue you work on, use a stable branch named exactly
+            `fix/issue-<N>` where `<N>` is the issue number. If that branch
+            already exists on `origin`, check it out and continue the work
+            in progress. If not, create it from latest `main`. Push to it
+            often. When you believe the fix is complete and verified, open
+            (or update) a PR titled `fix: <one-line summary> (closes #<N>)`
+            with a body that explains the root cause, the chosen approach
+            and why, what was rejected and why, and the verification you
+            ran. Mark the issue closed by the PR with the standard
+            `Closes #<N>` line.
+
+            ## Verification bar
+
+            "Fully verified" means: the originally-failing test passes; you
+            added at least one additional test that would have caught a
+            regression of the same root cause from a different angle; you
+            ran the relevant existing tests for the touched subsystem and
+            they pass; you reasoned explicitly about edge cases (degeneracy,
+            extreme magnitudes, ill-conditioning, parallel/GPU paths if
+            applicable) and either tested or documented why each is handled.
+
+            Have fun. Take your time. Get it perfect.
