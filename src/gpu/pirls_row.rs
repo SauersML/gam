@@ -1015,11 +1015,16 @@ impl RowOutputDevBuffers {
 ///
 /// The kernel's `extern "C"` signature is fixed at the top of `cuda_source_for`
 /// (see `extern "C" __global__ void {kernel_name}(int n, …)` in this file).
+/// `gamma_shape`: active Gamma dispersion shape (α > 0). Forwarded as a
+/// scalar kernel argument only for `PirlsRowFamily::GammaLog`; all other
+/// families compile a 13-argument kernel and ignore this value. Pass `1.0`
+/// for non-Gamma fits.
 #[cfg(target_os = "linux")]
 pub fn launch_row_reweight_on_stream(
     backend: &PirlsRowBackend,
     family: PirlsRowFamily,
     curvature: CurvatureMode,
+    gamma_shape: f64,
     stream: &Arc<cudarc::driver::CudaStream>,
     n: usize,
     eta_dev: &cudarc::driver::CudaSlice<f64>,
@@ -1056,6 +1061,10 @@ pub fn launch_row_reweight_on_stream(
     builder.arg(eta_dev);
     builder.arg(y_dev);
     builder.arg(prior_w_dev);
+    // GammaLog kernel has `double shape` before the output buffers.
+    if matches!(family, PirlsRowFamily::GammaLog) {
+        builder.arg(&gamma_shape);
+    }
     builder.arg(&mut out.mu);
     builder.arg(&mut out.grad_eta);
     builder.arg(&mut out.w_fisher);
@@ -1065,11 +1074,12 @@ pub fn launch_row_reweight_on_stream(
     builder.arg(&mut out.z_hessian);
     builder.arg(&mut out.deviance);
     builder.arg(&mut out.status);
-    // SAFETY: kernel signature is fixed by cuda_source_for above (n:i32,
-    // 3 const f64*, 8 mut f64*, 1 mut u32*); arg order/types match
-    // one-for-one. Output buffers were allocated with `n` elements each
-    // (validated above); input buffers are caller-supplied with length n.
-    // Grid covers all n rows; threads guard `if (i >= n) return`.
+    // SAFETY: kernel signature for non-GammaLog is (n:i32, 3×const f64*,
+    // 8×mut f64*, 1×mut u32*). GammaLog extends this with `double shape`
+    // after `prior_w` and before the output buffers — see `cuda_source_for`.
+    // Arg order/types match one-for-one. Output buffers were allocated with
+    // `n` elements each (validated above); input buffers are caller-supplied
+    // with length n. Grid covers all n rows; threads guard `if (i >= n) return`.
     unsafe { builder.launch(cfg) }
         .map(|_event_pair| ())
         .gpu_ctx_with(|err| format!("row reweight launch({}): {err}", family.kernel_name()))
@@ -1484,7 +1494,7 @@ mod pirls_row_gpu_tests {
                         y,
                         prior_weight: wp,
                     };
-                    let out = row_reweight_cpu(family, CurvatureMode::Fisher, input);
+                    let out = row_reweight_cpu(family, CurvatureMode::Fisher, input, 1.0);
                     // Structural invariants of the contract.
                     assert!(
                         out.w_fisher >= 0.0,
@@ -1576,6 +1586,7 @@ mod pirls_row_gpu_tests {
                             y,
                             prior_weight: wp,
                         },
+                        1.0,
                     );
                     if out.w_fisher > 0.0 {
                         active += 1;
@@ -1633,6 +1644,7 @@ mod pirls_row_gpu_tests {
                 y: 1.0,
                 prior_weight: 2.0,
             },
+            1.0,
         );
         assert!(out.mu.is_finite() && out.deviance.is_finite());
         assert_close("mu", out.mu, 0.25, 0.0);

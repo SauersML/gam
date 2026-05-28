@@ -2532,20 +2532,92 @@ fn schur_matvec<B: BatchedBlockSolver>(
     }
 }
 
-/// Jacobi Schur preconditioner for BA's inexact reduced-system PCG.
+/// One per-term block factor for the block-Jacobi Schur preconditioner.
 ///
-/// This is the block-diagonal Schur preconditioner specialized to scalar
-/// decoder coefficients. When coefficient blocking metadata lands, this type
-/// is the replacement point for Ceres-style block-Jacobi or cluster-Jacobi.
-#[derive(Debug, Clone)]
-pub struct JacobiPreconditioner {
-    inverse_diag: Array1<f64>,
+/// Carries either a dense Cholesky factor (for PD blocks ≤ 256 columns) or
+/// the scalar inverses for that block's diagonal as a fallback.
+#[derive(Clone)]
+enum BlockFactor {
+    /// Cholesky L stored column-major via faer. `range` identifies the
+    /// columns in the full K-vector this block covers.
+    Chol { factor: FaerLlt<f64>, range: Range<usize> },
+    /// Scalar fallback: per-element `1/s_aa` for each column in `range`.
+    Scalar { inv: Array1<f64>, range: Range<usize> },
 }
 
+impl std::fmt::Debug for BlockFactor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BlockFactor::Chol { range, .. } => {
+                write!(f, "BlockFactor::Chol {{ range: {:?} }}", range)
+            }
+            BlockFactor::Scalar { inv, range } => {
+                write!(
+                    f,
+                    "BlockFactor::Scalar {{ inv.len: {}, range: {:?} }}",
+                    inv.len(),
+                    range
+                )
+            }
+        }
+    }
+}
+
+/// Block-Jacobi Schur preconditioner for BA's inexact reduced-system PCG.
+///
+/// When [`ArrowSchurSystem::block_offsets`] is populated (via
+/// [`ArrowSchurSystem::set_block_offsets`]) and the largest block has ≤ 256
+/// columns, builds one small dense Schur block per term, factors it with
+/// Cholesky (faer LLT), and applies the preconditioner as per-block
+/// triangular solves.  Non-PD blocks fall back to scalar diagonal inversion
+/// for that block only.  When `block_offsets` is empty or the largest block
+/// exceeds 256 columns the preconditioner reduces to pure scalar-diagonal
+/// Jacobi (pre-#283 behaviour), so callers that have not called
+/// `set_block_offsets` are unaffected.
+///
+/// The `block_offsets` plumbing is compatible with issue #287 (custom
+/// `ParameterBlockSpec` families): those callers supply ranges derived from
+/// their own block layout rather than `EngineLayout.terms[*].col_range`.
+#[derive(Debug, Clone)]
+pub struct JacobiPreconditioner {
+    blocks: Vec<BlockFactor>,
+}
+
+/// Maximum block size for which we attempt dense block-Jacobi factorization.
+const BLOCK_JACOBI_MAX_BLOCK: usize = 256;
+
 impl JacobiPreconditioner {
-    /// Build `diag(S)^-1` without materializing the dense Schur complement,
-    /// following the Schur-Jacobi preconditioner used by large BA PCG.
+    /// Build the block-Jacobi (or scalar fallback) preconditioner from the
+    /// Arrow-Schur system without materializing the full dense Schur
+    /// complement.
+    ///
+    /// When `sys.block_offsets` is non-empty and `max(block_size) ≤ 256`,
+    /// each block gets a dense `b×b` Schur sub-matrix formed, factored, and
+    /// stored.  Otherwise every column gets its own scalar entry.
     pub fn from_arrow_schur<B: BatchedBlockSolver>(
+        sys: &ArrowSchurSystem,
+        htt_factors: &[Array2<f64>],
+        ridge_beta: f64,
+        backend: &B,
+    ) -> Result<Self, ArrowSchurError> {
+        let use_block = !sys.block_offsets.is_empty()
+            && sys
+                .block_offsets
+                .iter()
+                .map(|r| r.end.saturating_sub(r.start))
+                .max()
+                .unwrap_or(0)
+                <= BLOCK_JACOBI_MAX_BLOCK;
+        if use_block {
+            Self::build_block_jacobi(sys, htt_factors, ridge_beta, backend)
+        } else {
+            Self::build_scalar_jacobi(sys, htt_factors, ridge_beta, backend)
+        }
+    }
+
+    /// Build scalar-diagonal Jacobi: one `BlockFactor::Scalar` of length 1
+    /// per column.  Matches pre-#283 semantics.
+    fn build_scalar_jacobi<B: BatchedBlockSolver>(
         sys: &ArrowSchurSystem,
         htt_factors: &[Array2<f64>],
         ridge_beta: f64,
@@ -2575,7 +2647,7 @@ impl JacobiPreconditioner {
                 diag[a] -= acc;
             }
         }
-        let mut inverse_diag = Array1::<f64>::zeros(k);
+        let mut blocks = Vec::with_capacity(k);
         for a in 0..k {
             let v = diag[a];
             if !v.is_finite() || v <= 1e-18 {
@@ -2586,15 +2658,138 @@ impl JacobiPreconditioner {
                     ),
                 });
             }
-            inverse_diag[a] = 1.0 / v;
+            blocks.push(BlockFactor::Scalar {
+                inv: Array1::from_elem(1, 1.0 / v),
+                range: a..a + 1,
+            });
         }
-        Ok(Self { inverse_diag })
+        Ok(Self { blocks })
+    }
+
+    /// Build term-block Jacobi: one dense `b×b` Schur block per term in
+    /// `sys.block_offsets`.
+    fn build_block_jacobi<B: BatchedBlockSolver>(
+        sys: &ArrowSchurSystem,
+        htt_factors: &[Array2<f64>],
+        ridge_beta: f64,
+        backend: &B,
+    ) -> Result<Self, ArrowSchurError> {
+        let d = sys.d;
+        let block_offsets = &sys.block_offsets;
+        let mut blocks = Vec::with_capacity(block_offsets.len());
+
+        for range in block_offsets.iter() {
+            let b = range.end - range.start;
+            // Initialise the b×b Schur sub-block from H_ββ + ridge·I.
+            let mut schur_block = Array2::<f64>::zeros((b, b));
+            for bi in 0..b {
+                for bj in 0..b {
+                    let gi = range.start + bi;
+                    let gj = range.start + bj;
+                    let base = if sys.hbb.dim() == (sys.k, sys.k) {
+                        sys.hbb[[gi, gj]]
+                    } else {
+                        // matrix-free path: only diagonal available
+                        if bi == bj {
+                            sys.hbb_diag.as_ref().map(|hd| hd[gi]).unwrap_or(0.0)
+                        } else {
+                            0.0
+                        }
+                    };
+                    schur_block[[bi, bj]] = base + if bi == bj { ridge_beta } else { 0.0 };
+                }
+            }
+            // Subtract Schur contributions:
+            // S_kk -= H_βt_k^(i) (H_tt^(i))^{-1} H_tβ_k^(i)
+            let mut col = Array1::<f64>::zeros(d);
+            let mut solved_cols = Array2::<f64>::zeros((d, b));
+            for (i, row) in sys.rows.iter().enumerate() {
+                for bj in 0..b {
+                    let gj = range.start + bj;
+                    for c in 0..d {
+                        col[c] = row.htbeta[[c, gj]];
+                    }
+                    let solved = backend.solve_block_vector(&htt_factors[i], &col);
+                    for c in 0..d {
+                        solved_cols[[c, bj]] = solved[c];
+                    }
+                }
+                for bi in 0..b {
+                    let gi = range.start + bi;
+                    for bj in 0..b {
+                        let mut acc = 0.0;
+                        for c in 0..d {
+                            acc += row.htbeta[[c, gi]] * solved_cols[[c, bj]];
+                        }
+                        schur_block[[bi, bj]] -= acc;
+                    }
+                }
+            }
+            // Attempt Cholesky (LLT) factorization.
+            let factor_opt = {
+                use faer::Side;
+                let view = FaerArrayView::new(&schur_block);
+                FaerLlt::new(view.as_ref(), Side::Lower).ok()
+            };
+            if let Some(llt) = factor_opt {
+                blocks.push(BlockFactor::Chol {
+                    factor: llt,
+                    range: range.clone(),
+                });
+            } else {
+                // Non-PD block: fall back to scalar diagonal for this block.
+                let mut inv = Array1::<f64>::zeros(b);
+                for bi in 0..b {
+                    let v = schur_block[[bi, bi]];
+                    if !v.is_finite() || v <= 1e-18 {
+                        return Err(ArrowSchurError::PcgFailed {
+                            reason: format!(
+                                "block Jacobi scalar fallback: non-PD diagonal at \
+                                 global index {}: {v}; regularization required",
+                                range.start + bi
+                            ),
+                        });
+                    }
+                    inv[bi] = 1.0 / v;
+                }
+                blocks.push(BlockFactor::Scalar {
+                    inv,
+                    range: range.clone(),
+                });
+            }
+        }
+        Ok(Self { blocks })
     }
 
     fn apply(&self, r: &Array1<f64>) -> Array1<f64> {
         let mut out = Array1::<f64>::zeros(r.len());
-        for i in 0..r.len() {
-            out[i] = self.inverse_diag[i] * r[i];
+        for block in &self.blocks {
+            match block {
+                BlockFactor::Scalar { inv, range } => {
+                    for (local, gi) in range.clone().enumerate() {
+                        out[gi] = inv[local] * r[gi];
+                    }
+                }
+                BlockFactor::Chol { factor, range } => {
+                    let b = range.end - range.start;
+                    let mut rhs = Array1::<f64>::zeros(b);
+                    for (local, gi) in range.clone().enumerate() {
+                        rhs[local] = r[gi];
+                    }
+                    use faer::linalg::solvers::Solve;
+                    let stride = rhs.strides()[0];
+                    let len = rhs.len();
+                    // SAFETY: rhs is a uniquely-borrowed contiguous Array1
+                    // with positive stride (standard layout).
+                    let rhs_mat = unsafe {
+                        faer::MatRef::from_raw_parts(rhs.as_ptr(), len, 1, stride, 0)
+                    };
+                    let solved = factor.solve(rhs_mat);
+                    for (local, gi) in range.clone().enumerate() {
+                        out[gi] = solved[(local, 0)];
+                    }
+                }
+            }
         }
         out
     }

@@ -4566,22 +4566,20 @@ struct RowCellMomentsBundle {
 }
 
 impl RowCellMomentsBundle {
+    /// Return the pre-built cell moments for `row` when the bundle was
+    /// constructed at `>= required_degree`.  Returns `None` both when the
+    /// row has no data (e.g. excluded by subsample mask) *and* when the
+    /// bundle's `max_degree` is too low for this caller — the caller must
+    /// fall back to per-row on-demand evaluation in either case.
     #[inline]
     fn row(&self, row: usize, required_degree: usize) -> Option<&[CachedDenestedCellMoments]> {
-        assert!(
-            self.max_degree >= required_degree,
-            "row cell moments bundle max_degree={} required_degree={}",
-            self.max_degree,
-            required_degree
-        );
-        (self.max_degree >= required_degree)
-            .then(|| {
-                self.rows
-                    .get(row)
-                    .and_then(Option::as_ref)
-                    .map(Vec::as_slice)
-            })
-            .flatten()
+        if self.max_degree < required_degree {
+            return None;
+        }
+        self.rows
+            .get(row)
+            .and_then(Option::as_ref)
+            .map(Vec::as_slice)
     }
 
     fn estimated_resident_bytes(n_rows: usize, n_cells: usize, max_degree: usize) -> usize {
@@ -4608,10 +4606,9 @@ struct BernoulliMarginalSlopeRowExactContext {
     m_a: f64,
     intercept_fast_path: bool,
     /// Degree-9 per-row cell moments at the converged row intercept. The
-    /// top-of-cycle [`RowCellMomentsBundle`] is preferred when present (and
-    /// is built at degree 21 so it can serve degree-9, degree-15 *and*
-    /// degree-21 consumers); this field remains the per-row lazy fallback
-    /// for callers without a bundle (e.g. legacy direct call sites).
+    /// top-of-cycle [`RowCellMomentsBundle`] (built at degree 9) is preferred
+    /// when present; this field remains the per-row lazy fallback for callers
+    /// without a bundle (e.g. legacy direct call sites).
     degree9_cells: Option<Vec<CachedDenestedCellMoments>>,
 }
 
@@ -7512,6 +7509,120 @@ impl BernoulliMarginalSlopeFamily {
         }
         log::info!(
             "[bernoulli intercept warm-start] preseeded={} (cold), kept_warm={} (carried over from previous PIRLS)",
+            preseeded,
+            kept_warm,
+        );
+        Ok(())
+    }
+
+    /// Row-subset variant of [`preseed_intercept_warm_starts`]: seeds only the
+    /// entries in `rows`, building intermediate vectors over all `n` training
+    /// rows only where the link-deviation runtime requires full-length input
+    /// (so correctness is identical to the full-`n` path for those rows).
+    ///
+    /// Used when `build_exact_eval_cache_with_options_and_context_rows` is
+    /// called with a non-`None` `context_rows` slice so that the warm-start
+    /// preseed does not pay O(n) work for a subsampled cache build.
+    fn preseed_intercept_warm_starts_for_rows(
+        &self,
+        block_states: &[ParameterBlockState],
+        rows: &[usize],
+    ) -> Result<(), String> {
+        if !self.effective_flex_active(block_states)? {
+            return Ok(());
+        }
+        let Some(cache) = self.intercept_warm_starts.as_ref() else {
+            return Ok(());
+        };
+        let beta_w = self.link_beta(block_states)?;
+        let n = self.y.len();
+        if cache.len() != n {
+            return Ok(());
+        }
+        let marginal_eta = &block_states[0].eta;
+        let slope_eta = &block_states[1].eta;
+        let probit_scale = self.probit_frailty_scale();
+
+        // Per-row marginal link map — computed only for the selected rows.
+        let marginals_for_rows: Vec<(usize, BernoulliMarginalLinkMap)> = rows
+            .iter()
+            .copied()
+            .filter(|&row| row < n)
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|row| {
+                let m = self.marginal_link_map(marginal_eta[row])?;
+                Ok((row, m))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        // Pre-scale intercept for selected rows.  We still need a full-length
+        // array for the link-deviation design call (the runtime's anchor
+        // residual is indexed by training-row position).  Fill non-selected
+        // positions with NaN — they are never read by the seed computation.
+        let mut a_pre_scale_vec: Array1<f64> = Array1::from_elem(n, f64::NAN);
+        for &(row, ref m) in &marginals_for_rows {
+            a_pre_scale_vec[row] =
+                rigid_intercept_from_marginal(m.q, slope_eta[row], probit_scale) / probit_scale;
+        }
+
+        // Batched link-deviation evaluation — must pass the full-length vector
+        // so the runtime's per-row anchor residual is applied at the correct
+        // positions.  NaN entries at non-selected rows propagate safely: we
+        // never read those positions below.
+        let (l_val_vec, l_d1_vec) = match (&self.link_dev, beta_w) {
+            (Some(runtime), Some(beta)) => {
+                let basis = runtime.design_at_training_with_residual(&a_pre_scale_vec)?;
+                let d1 = runtime.first_derivative_design(&a_pre_scale_vec)?;
+                (&a_pre_scale_vec + &basis.dot(beta), d1.dot(beta) + 1.0)
+            }
+            _ => (a_pre_scale_vec.clone(), Array1::ones(n)),
+        };
+
+        // Compute seeds and seed the cache only for the selected rows.
+        let seeds: Vec<(usize, f64)> = marginals_for_rows
+            .par_iter()
+            .map(|&(row, ref m)| {
+                let a = a_pre_scale_vec[row];
+                let ell1 = l_d1_vec[row];
+                let seed = if ell1 > BMS_DERIV_TOL {
+                    let ell0 = l_val_vec[row] - ell1 * a;
+                    let observed_logslope = probit_scale * ell1 * slope_eta[row];
+                    (m.q * (1.0 + observed_logslope * observed_logslope).sqrt() / probit_scale
+                        - ell0)
+                        / ell1
+                } else {
+                    a
+                };
+                (row, seed)
+            })
+            .collect();
+
+        let beta_h = self.score_beta(block_states)?;
+        let mut preseeded = 0usize;
+        let mut kept_warm = 0usize;
+        for (row, seed) in seeds {
+            if !seed.is_finite() {
+                continue;
+            }
+            let beta_tag = hash_intercept_warm_start_key_flex(
+                marginal_eta[row],
+                slope_eta[row],
+                beta_h,
+                beta_w,
+            );
+            match cache.compare_exchange_unseeded(row, seed, beta_tag) {
+                Ok(()) => preseeded += 1,
+                Err(prev_tag) => {
+                    if prev_tag == beta_tag {
+                        kept_warm += 1;
+                    }
+                }
+            }
+        }
+        log::info!(
+            "[bernoulli intercept warm-start rows={}] preseeded={} (cold), kept_warm={} (carried over from previous PIRLS)",
+            rows.len(),
             preseeded,
             kept_warm,
         );

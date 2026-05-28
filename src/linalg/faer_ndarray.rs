@@ -51,6 +51,17 @@ fn diagonal_log_sum(diagonal: DiagRef<'_, f64>) -> f64 {
 }
 
 impl FaerSymmetricFactor {
+    /// Returns the dimension of the factorized square matrix.
+    #[inline]
+    pub fn n(&self) -> usize {
+        use faer::linalg::solvers::ShapeCore;
+        match self {
+            FaerSymmetricFactor::Llt(f) => f.nrows(),
+            FaerSymmetricFactor::Ldlt(f) => f.nrows(),
+            FaerSymmetricFactor::Lblt(f) => f.nrows(),
+        }
+    }
+
     #[inline]
     pub fn solve(&self, rhs: MatRef<'_, f64>) -> Mat<f64> {
         match self {

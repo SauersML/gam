@@ -54,7 +54,7 @@ use crate::smooth::{
 use crate::solver::estimate::EstimationError;
 use crate::solver::estimate::reml::unified::HyperOperator;
 use crate::types::{InverseLink, StandardLink};
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, s};
 use rayon::prelude::*;
 use smallvec::{SmallVec, smallvec};
 use std::cell::RefCell;
@@ -3006,6 +3006,18 @@ impl HyperOperator for BlockHessianOperator {
     }
 
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        let mut out = Array1::zeros(self.slices.total);
+        self.mul_vec_into(v.view(), out.view_mut());
+        out
+    }
+
+    fn mul_vec_view(&self, v: ArrayView1<'_, f64>) -> Array1<f64> {
+        let mut out = Array1::zeros(self.slices.total);
+        self.mul_vec_into(v, out.view_mut());
+        out
+    }
+
+    fn mul_vec_into(&self, v: ArrayView1<'_, f64>, mut out: ArrayViewMut1<'_, f64>) {
         let v_t = v.slice(s![self.slices.time.clone()]);
         let v_m = v.slice(s![self.slices.marginal.clone()]);
         let v_g = v.slice(s![self.slices.logslope.clone()]);
@@ -3019,7 +3031,7 @@ impl HyperOperator for BlockHessianOperator {
             .link_dev
             .as_ref()
             .map(|range| v.slice(s![range.clone()]));
-        let mut out = Array1::zeros(self.slices.total);
+        out.fill(0.0);
         {
             let mut o_t = out.slice_mut(s![self.slices.time.clone()]);
             o_t += &self.h_tt.dot(&v_t);
@@ -3076,7 +3088,6 @@ impl HyperOperator for BlockHessianOperator {
             }
             o_w += &self.h_ww.dot(v_w);
         }
-        out
     }
 
     fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {

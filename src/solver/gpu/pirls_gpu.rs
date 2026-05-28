@@ -497,15 +497,15 @@ extern "C" __global__ void chol_logdet_col_major(
         }
         .map_err(|e| format!("cublas dgemm XtWX (device-input): {e}"))?;
 
-        // Upload penalty + ridge (p×p, small).
-        let penalty = penalty_with_ridge(input.penalty_hessian, input.lm_ridge);
-        let penalty_view = penalty.view();
-        let penalty_col = to_col_major(&penalty_view);
+        // Upload S + step_lm_lambda·I for the Newton solve (LM damping only).
+        let penalty_step = penalty_with_ridge(input.penalty_hessian, input.step_lm_lambda);
+        let penalty_step_view = penalty_step.view();
+        let penalty_step_col = to_col_major(&penalty_step_view);
         ws.stream
-            .memcpy_htod(penalty_col.as_ref(), &mut ws.penalty_dev)
+            .memcpy_htod(penalty_step_col.as_ref(), &mut ws.penalty_dev)
             .map_err(|e| format!("upload penalty (device-input): {e}"))?;
 
-        // H = XtWX + (S + λI).
+        // H_step = XᵀWX + (S + step_lm_lambda·I) for the Newton solve only.
         geam_add(
             &ws.blas,
             &ws.stream,
@@ -534,16 +534,17 @@ extern "C" __global__ void chol_logdet_col_major(
         }
         .map_err(|e| format!("cublas dgemv Xtg (device-input): {e}"))?;
 
-        // Snapshot the assembled penalised Hessian for the caller before
-        // potrf overwrites it with the Cholesky factor — caller contract
-        // matches host-input path. Single d→h copy at the step boundary,
-        // not per-iter.
-        let h_total_col = ws
+        // Exported penalised Hessian: H_final = XᵀWX + S + objective_ridge·I.
+        // Download XᵀWX and add the objective ridge on the host so LM damping
+        // never contaminates exported EDF / REML curvature / RidgePassport.
+        let xtwx_col = ws
             .stream
-            .clone_dtoh(&ws.h_dev)
-            .map_err(|e| format!("download penalised Hessian (device-input): {e}"))?;
-        let penalized_hessian =
-            from_col_major(&h_total_col, p, p).ok_or("H layout conversion failed")?;
+            .clone_dtoh(&ws.xtwx_dev)
+            .map_err(|e| format!("download XᵀWX (device-input): {e}"))?;
+        let xtwx_host = from_col_major(&xtwx_col, p, p)
+            .ok_or("XᵀWX layout conversion failed (device-input)")?;
+        let penalty_export = penalty_with_ridge(input.penalty_hessian, input.objective_ridge);
+        let penalized_hessian = xtwx_host + &penalty_export;
 
         potrf_in_place(&ws.solver, &ws.stream, p, &mut ws.h_dev)?;
         potrs_in_place(&ws.solver, &ws.stream, p, 1, &ws.h_dev, &mut ws.rhs_dev)?;
@@ -779,6 +780,90 @@ extern "C" __global__ void chol_logdet_col_major(
         } else {
             Err(format!("cublasDgeam failed with {status:?}"))
         }
+    }
+
+    /// Assemble the export Hessian `H_export = Xt * diag(w_hessian) * X + S`
+    /// using the device-resident `w_hessian` weights (NOT the solver-floored
+    /// `w_solver`), and without any LM-damping ridge. This is the matrix
+    /// exported for EDF, covariance, and REML curvature consumers after
+    /// PIRLS convergence (issue #262).
+    ///
+    /// Reuses workspace scratch buffers `wx_dev`, `xtwx_dev`, `penalty_dev`,
+    /// `h_dev` — no extra allocation. `h_dev` is clobbered (the Cholesky
+    /// factor written by the last Newton step is overwritten).
+    fn assemble_export_hessian(
+        shared: &PirlsGpuSharedData,
+        ws: &mut SigmaPirlsGpuWorkspace,
+        w_hessian_dev: &CudaSlice<f64>,
+        penalty_hessian: ArrayView2<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
+        let n = shared.n;
+        let p = shared.p;
+        if w_hessian_dev.len() != n {
+            return Err(format!(
+                "assemble_export_hessian: w_hessian_dev length {} != n={n}",
+                w_hessian_dev.len()
+            ));
+        }
+        if penalty_hessian.dim() != (p, p) {
+            return Err(format!(
+                "assemble_export_hessian: penalty shape {:?} != ({p},{p})",
+                penalty_hessian.dim()
+            ));
+        }
+        // WX = diag(w_hessian) . X  into ws.wx_dev.
+        left_scale_rows_borrowed(
+            &ws.blas,
+            &ws.stream,
+            n,
+            p,
+            &shared.x_dev,
+            w_hessian_dev,
+            &mut ws.wx_dev,
+        )?;
+        // XtWX = Xt . WX  into ws.xtwx_dev.
+        let n_i = to_i32(n)?;
+        let p_i = to_i32(p)?;
+        let gemm_cfg = GemmConfig::<f64> {
+            transa: cublasOperation_t::CUBLAS_OP_T,
+            transb: cublasOperation_t::CUBLAS_OP_N,
+            m: p_i,
+            n: p_i,
+            k: n_i,
+            alpha: 1.0,
+            lda: n_i,
+            ldb: n_i,
+            beta: 0.0,
+            ldc: p_i,
+        };
+        // SAFETY: validated i32 dims; shared.x_dev and ws.wx_dev are n*p
+        // f64 col-major; ws.xtwx_dev is p*p; all on ws.stream.
+        unsafe {
+            ws.blas
+                .gemm(gemm_cfg, &shared.x_dev, &ws.wx_dev, &mut ws.xtwx_dev)
+        }
+        .map_err(|e| format!("assemble_export_hessian dgemm XtWX: {e}"))?;
+        // Upload S (penalty only, no lm_ridge) to ws.penalty_dev.
+        let penalty_col = to_col_major(&penalty_hessian);
+        ws.stream
+            .memcpy_htod(penalty_col.as_ref(), &mut ws.penalty_dev)
+            .map_err(|e| format!("assemble_export_hessian upload penalty: {e}"))?;
+        // H_export = XtWX + S  into ws.h_dev (clobbers prior Cholesky factor).
+        geam_add(
+            &ws.blas,
+            &ws.stream,
+            p,
+            &ws.xtwx_dev,
+            &ws.penalty_dev,
+            &mut ws.h_dev,
+        )?;
+        // Download and return in row-major Array2.
+        let h_col = ws
+            .stream
+            .clone_dtoh(&ws.h_dev)
+            .map_err(|e| format!("assemble_export_hessian download: {e}"))?;
+        from_col_major(&h_col, p, p)
+            .ok_or_else(|| "assemble_export_hessian layout failed".to_string())
     }
 
     /// Launch the device-side Cholesky-factor logdet kernel and download

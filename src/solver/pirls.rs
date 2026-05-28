@@ -7778,78 +7778,87 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             no_constraints,
             dense_x,
         ) {
-            // Build the transformed dense design X·Qs once (column-major
-            // friendly because `upload_shared_pirls_gpu` repacks
-            // internally). When `transform_active` is `None` (identity),
-            // X is already in transformed coordinates.
-            let qs_view = qs_arc.as_ref().map(|qs| qs.view());
-            let x_transformed_owned: Option<Array2<f64>> = match transform_active.as_ref() {
-                Some(_) => qs_view.map(|qs| crate::faer_ndarray::fast_ab(&x_dense, &qs)),
-                None => None,
-            };
-            let x_t_view = match x_transformed_owned.as_ref() {
-                Some(xt) => xt.view(),
-                None => x_dense,
-            };
-            let s_transformed_view = match &penalty_active {
-                PirlsPenalty::Dense { s_transformed, .. } => s_transformed.view(),
-                // SAFETY: the GPU PIRLS dispatch path that reaches this
-                // match is gated on `PirlsPenalty::Dense { .. }` upstream
-                // (see the dispatch-admission check earlier in this
-                // function); the `Diagonal` arm is therefore unreachable
-                // at runtime. We panic rather than `unreachable!` per the
-                // build.rs ban on the latter macro; the comment-anchored
-                // contract is the same.
-                PirlsPenalty::Diagonal { .. } => {
-                    panic!("GPU PIRLS dispatch gated on PirlsPenalty::Dense above")
-                }
-            };
-            // Dense-design materialization for `PirlsResult.x_transformed`.
-            let qs_arc_for_design = qs_arc
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| Arc::new(Array2::<f64>::eye(penalty.p)));
-            let x_transformed_design = make_reparam_operator(
-                &x_original_for_result,
-                &qs_arc_for_design,
-                use_sparse_native,
-            );
-            let reparam_for_dispatch = materialize_final_reparam_result()?;
-            // Owned clone of the initial-β so the GPU dispatch input can
-            // borrow it without conflicting with the CPU fallback which
-            // moves `initial_beta` into `Coefficients::new` below.
-            let initial_beta_owned = initial_beta.clone();
-            let exported_curvature_kind = match link_function {
-                LinkFunction::Probit | LinkFunction::CLogLog => HessianCurvatureKind::Observed,
-                _ => HessianCurvatureKind::Fisher,
-            };
-            let dispatch = GpuPirlsDispatchInput {
-                likelihood: &config.likelihood,
-                inverse_link: &config.link_kind,
-                x_transformed: x_t_view,
-                s_transformed: s_transformed_view,
-                y,
-                priorweights,
-                offset,
-                initial_beta: initial_beta_owned.view(),
-                initial_lm_lambda: config.initial_lm_lambda,
-                max_iterations: options.max_iterations,
-                convergence_tolerance: options.convergence_tolerance,
-                linear_constraints: None,
-                qs: qs_view,
-                reparam_result: reparam_for_dispatch,
-                x_transformed_design,
-                coordinate_frame,
-                edf: None,
-                exported_curvature: exported_curvature_kind,
-            };
-            if let Some(result) = try_gpu_pirls_loop_dispatch(dispatch) {
-                match result {
-                    Ok(pair) => return Ok(pair),
-                    Err(err) => {
-                        log::warn!(
-                            "[PIRLS GPU dispatch] device loop returned error, falling back to CPU: {err}"
-                        );
+            // Cheap admission shim: tests cuda_selected(), runtime presence,
+            // family/curvature gate, and shape policy — all O(1) — before
+            // any O(N·p) work. CPU-default, no-runtime, and policy-rejected
+            // shapes skip fast_ab, make_reparam_operator, and
+            // materialize_final_reparam_result entirely.
+            let n_admit = x_dense.nrows();
+            let p_admit = x_dense.ncols();
+            if try_gpu_pirls_loop_admit(&config.likelihood, n_admit, p_admit) {
+                // Build the transformed dense design X·Qs once (column-major
+                // friendly because `upload_shared_pirls_gpu` repacks
+                // internally). When `transform_active` is `None` (identity),
+                // X is already in transformed coordinates.
+                let qs_view = qs_arc.as_ref().map(|qs| qs.view());
+                let x_transformed_owned: Option<Array2<f64>> = match transform_active.as_ref() {
+                    Some(_) => qs_view.map(|qs| crate::faer_ndarray::fast_ab(&x_dense, &qs)),
+                    None => None,
+                };
+                let x_t_view = match x_transformed_owned.as_ref() {
+                    Some(xt) => xt.view(),
+                    None => x_dense,
+                };
+                let s_transformed_view = match &penalty_active {
+                    PirlsPenalty::Dense { s_transformed, .. } => s_transformed.view(),
+                    // SAFETY: the GPU PIRLS dispatch path that reaches this
+                    // match is gated on `PirlsPenalty::Dense { .. }` upstream
+                    // (see the dispatch-admission check earlier in this
+                    // function); the `Diagonal` arm is therefore unreachable
+                    // at runtime. We panic rather than `unreachable!` per the
+                    // build.rs ban on the latter macro; the comment-anchored
+                    // contract is the same.
+                    PirlsPenalty::Diagonal { .. } => {
+                        panic!("GPU PIRLS dispatch gated on PirlsPenalty::Dense above")
+                    }
+                };
+                // Dense-design materialization for `PirlsResult.x_transformed`.
+                let qs_arc_for_design = qs_arc
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| Arc::new(Array2::<f64>::eye(penalty.p)));
+                let x_transformed_design = make_reparam_operator(
+                    &x_original_for_result,
+                    &qs_arc_for_design,
+                    use_sparse_native,
+                );
+                let reparam_for_dispatch = materialize_final_reparam_result()?;
+                // Owned clone of the initial-β so the GPU dispatch input can
+                // borrow it without conflicting with the CPU fallback which
+                // moves `initial_beta` into `Coefficients::new` below.
+                let initial_beta_owned = initial_beta.clone();
+                let exported_curvature_kind = match link_function {
+                    LinkFunction::Probit | LinkFunction::CLogLog => HessianCurvatureKind::Observed,
+                    _ => HessianCurvatureKind::Fisher,
+                };
+                let dispatch = GpuPirlsDispatchInput {
+                    likelihood: &config.likelihood,
+                    inverse_link: &config.link_kind,
+                    x_transformed: x_t_view,
+                    s_transformed: s_transformed_view,
+                    y,
+                    priorweights,
+                    offset,
+                    initial_beta: initial_beta_owned.view(),
+                    initial_lm_lambda: config.initial_lm_lambda,
+                    max_iterations: options.max_iterations,
+                    convergence_tolerance: options.convergence_tolerance,
+                    linear_constraints: None,
+                    qs: qs_view,
+                    reparam_result: reparam_for_dispatch,
+                    x_transformed_design,
+                    coordinate_frame,
+                    edf: None,
+                    exported_curvature: exported_curvature_kind,
+                };
+                if let Some(result) = try_gpu_pirls_loop_dispatch(dispatch) {
+                    match result {
+                        Ok(pair) => return Ok(pair),
+                        Err(err) => {
+                            log::warn!(
+                                "[PIRLS GPU dispatch] device loop returned error, falling back to CPU: {err}"
+                            );
+                        }
                     }
                 }
             }

@@ -6269,6 +6269,20 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
         Ok(None)
     }
 
+    /// Whether `hessian_matvec` / `hessian_matvec_into` will return `Some`.
+    /// A cheap synchronisation-free flag consulted by
+    /// `exact_newton_joint_hessian_source_from_workspace` to decide whether
+    /// to construct a matrix-free `JointHessianSource::Operator` variant.
+    /// Returning `false` is equivalent to returning `Ok(None)` from
+    /// `hessian_matvec` but avoids allocating and running a full HVP sweep
+    /// against a zero vector just to discover unavailability.
+    /// Default is `false` matching the base-trait `hessian_matvec` returning
+    /// `Ok(None)`. Concrete impls that override `hessian_matvec` must also
+    /// override this to return `true`.
+    fn hessian_matvec_available(&self) -> bool {
+        false
+    }
+
     fn hessian_matvec(&self, arr: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
         assert!(arr.iter().all(|v| !v.is_nan()));
         Ok(None)
