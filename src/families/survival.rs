@@ -2213,22 +2213,9 @@ impl WorkingModelSurvival {
             .iter()
             .map(|v| v.as_slice())
             .collect();
-        let per_block_nullspace_vecs: Vec<Vec<usize>> = active_penalty_blocks
-            .iter()
-            .map(|b| vec![b.nullspace_dim])
-            .collect();
-        let per_block_nullspace_refs: Vec<&[usize]> = per_block_nullspace_vecs
-            .iter()
-            .map(|v| v.as_slice())
-            .collect();
         let penalty_logdet = if k_count > 0 {
-            compute_block_penalty_logdet_derivs(
-                &per_block_rho,
-                &per_block_penalty_refs,
-                &per_block_nullspace_refs,
-                0.0,
-            )
-            .map_err(EstimationError::InvalidInput)?
+            compute_block_penalty_logdet_derivs(&per_block_rho, &per_block_penalty_refs, 0.0)
+                .map_err(EstimationError::InvalidInput)?
         } else {
             PenaltyLogdetDerivs {
                 value: 0.0,

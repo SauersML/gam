@@ -4313,7 +4313,6 @@ impl<'a> RemlState<'a> {
             ift_cached_factor: RwLock::new(None),
             kronecker_penalty_system: None,
             kronecker_factored: None,
-            penalty_block_structural_nullities: RwLock::new(None),
             gaussian_fixed_cache: RwLock::new(None),
             persistent_warm_start_key: RwLock::new(None),
             persistent_latent_values_fingerprint: None,
@@ -4365,7 +4364,6 @@ impl<'a> RemlState<'a> {
         self.linear_constraints = linear_constraints;
         self.kronecker_penalty_system = kronecker_penalty_system;
         self.kronecker_factored = kronecker_factored;
-        *self.penalty_block_structural_nullities.write().unwrap() = None;
         // The Gaussian-fixed cache is keyed to (X, y, w, offset); replacing the
         // design invalidates it. The new surface will repopulate it on demand.
         *self.gaussian_fixed_cache.write().unwrap() = None;

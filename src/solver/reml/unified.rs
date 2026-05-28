@@ -15685,7 +15685,6 @@ pub fn penalty_matrix_root(s: &Array2<f64>) -> Result<Array2<f64>, String> {
 pub fn compute_block_penalty_logdet_derivs(
     per_block_rho: &[Array1<f64>],
     per_block_penalties: &[&[Array2<f64>]],
-    per_block_nullspace_dims: &[&[usize]],
     ridge: f64,
 ) -> Result<PenaltyLogdetDerivs, String> {
     use super::penalty_logdet::PenaltyPseudologdet;
@@ -15720,27 +15719,13 @@ pub fn compute_block_penalty_logdet_derivs(
         }
         let lambdas: Vec<f64> = block_rho.iter().map(|&r| r.exp()).collect();
 
-        // Compute structural nullity if dimensions are available.
-        let block_nullspace_dims = if b < per_block_nullspace_dims.len() {
-            per_block_nullspace_dims[b]
-        } else {
-            &[]
-        };
-        let structural_nullity =
-            if !block_nullspace_dims.is_empty() && block_nullspace_dims.len() == penalties.len() {
-                Some(exact_intersection_nullity(penalties, block_nullspace_dims))
-            } else {
-                None
-            };
-
         // Single eigendecomposition via canonical PenaltyPseudologdet.
-        let pld = PenaltyPseudologdet::from_components_with_nullity(
-            penalties,
-            &lambdas,
-            ridge,
-            structural_nullity,
-        )
-        .map_err(|e| format!("penalty logdet failed for block {b}: {e}"))?;
+        //
+        // No metadata-based structural-nullity hint: the classifier derives
+        // the positive eigenspace from the assembled spectrum alone (issues
+        // #192/#318).
+        let pld = PenaltyPseudologdet::from_components(penalties, &lambdas, ridge)
+            .map_err(|e| format!("penalty logdet failed for block {b}: {e}"))?;
 
         let value = pld.value();
         let (first, second) = pld.rho_derivatives(penalties, &lambdas);
@@ -23084,15 +23069,8 @@ mod tests {
         let per_block_rho = vec![rho.clone()];
         let penalties_block = vec![s1.clone(), s2.clone()];
         let per_block_penalties: Vec<&[Array2<f64>]> = vec![penalties_block.as_slice()];
-        let null_dims = vec![0usize, 0usize];
-        let per_block_nullspace_dims: Vec<&[usize]> = vec![null_dims.as_slice()];
-        let out = compute_block_penalty_logdet_derivs(
-            &per_block_rho,
-            &per_block_penalties,
-            &per_block_nullspace_dims,
-            delta,
-        )
-        .expect("logdet derivs should be finite");
+        let out = compute_block_penalty_logdet_derivs(&per_block_rho, &per_block_penalties, delta)
+            .expect("logdet derivs should be finite");
         let f = |r: &Array1<f64>| -> f64 {
             let l1 = r[0].exp();
             let l2 = r[1].exp();

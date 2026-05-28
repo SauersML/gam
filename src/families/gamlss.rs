@@ -17758,23 +17758,12 @@ impl CustomFamily for BinomialLocationScaleFamily {
                 let lambda = per_block_rho[b][k].exp();
                 pen.add_scaled_to(lambda, &mut s_b);
             }
-            let nullity = if !specs[b].nullspace_dims.is_empty()
-                && specs[b].nullspace_dims.len() == specs[b].penalties.len()
-            {
-                let pen_dense: Vec<ndarray::Array2<f64>> =
-                    specs[b].penalties.iter().map(|p| p.to_dense()).collect();
-                Some(
-                    crate::solver::estimate::reml::unified::exact_intersection_nullity(
-                        &pen_dense,
-                        &specs[b].nullspace_dims,
-                    ),
-                )
-            } else {
-                None
-            };
+            // No metadata-based structural-nullity hint: the
+            // PenaltyPseudologdet classifier derives the positive eigenspace
+            // from the assembled spectrum alone (issues #192/#318).
             s_pseudologdet_blocks.push(
-                crate::solver::estimate::reml::penalty_logdet::PenaltyPseudologdet::from_assembled_with_nullity(
-                    s_b, None, nullity,
+                crate::solver::estimate::reml::penalty_logdet::PenaltyPseudologdet::from_assembled(
+                    s_b, None,
                 )?,
             );
         }
