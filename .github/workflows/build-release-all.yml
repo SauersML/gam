@@ -68,7 +68,7 @@ jobs:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
           # MacOS ARM (Apple Silicon) - GH Actions uses M1

@@ -100,7 +100,7 @@ jobs:
     if: needs.gate.outputs.should_run == 'true'
     runs-on: ${{ matrix.platform.runner }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         platform:
           - { runner: ubuntu-24.04,     target: x86_64 }
@@ -134,7 +134,7 @@ jobs:
     if: needs.gate.outputs.should_run == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
           - { runner: ubuntu-24.04,     target: x86_64 }
@@ -171,7 +171,7 @@ jobs:
     if: needs.gate.outputs.should_run == 'true' && github.event.inputs.linux_only != 'true'
     runs-on: ${{ matrix.platform.runner }}
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         platform:
           - { runner: macos-15-intel, target: x86_64 }
@@ -204,7 +204,7 @@ jobs:
     if: needs.gate.outputs.should_run == 'true' && github.event.inputs.linux_only != 'true'
     runs-on: windows-latest
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         target: [x64]
     steps:
