@@ -301,8 +301,56 @@ impl From<Array2<f64>> for PenaltyMatrix {
     }
 }
 
+/// β-linearization state passed to [`BlockEffectiveJacobian::effective_jacobian_at`].
+///
+/// At pre-fit initialization, pass `beta = &[]` / zeros and `family_scalars = None`.
+/// Families that need β-dependent scalars (e.g. survival marginal-slope's q0, q1,
+/// g, c, z) store them in `family_scalars` as a concrete type behind
+/// `Arc<dyn Any + Send + Sync>` and downcast inside their impl.
+pub struct FamilyLinearizationState<'a> {
+    pub beta: &'a [f64],
+    /// Optional family-shared scalars at this β linearization.
+    /// Downcast via `state.family_scalars.as_ref().and_then(|a| a.downcast_ref::<T>())`.
+    pub family_scalars: Option<Arc<dyn std::any::Any + Send + Sync>>,
+}
+
+/// β-dependent Jacobian callback for a parameter block.
+///
+/// Principled long-term contract for expressing how a block contributes to
+/// the stacked linear predictor at a given β:
+///
+/// ```text
+/// J(β) ∈ ℝ^{n_rows · n_outputs × p_block}
+/// ```
+///
+/// - Single-output linear block: returns `design.clone()`.
+/// - Row-scaled block: returns `diag(row_scaling) · design` (still linear in β).
+/// - Multi-output block (e.g. survival marginal-slope with η0, η1, ad1):
+///   stacks `∂eta_r/∂β_k` for `r ∈ 0..n_outputs`, row-major ordering.
+///
+/// The default impl on [`ParameterBlockSpec::effective_jacobian_at`] is:
+/// - `jacobian_callback = None`, `row_scaling = None` → `design.clone()`.
+/// - `jacobian_callback = None`, `row_scaling = Some(s)` → `diag(s)·design`.
+/// - `jacobian_callback = Some(cb)` → delegates to `cb.effective_jacobian_at`.
+pub trait BlockEffectiveJacobian: Send + Sync {
+    /// Stacked multi-output Jacobian at the current β.
+    ///
+    /// Shape: `(n_rows * n_outputs, p_block)`.
+    /// For `n_outputs = 1` this is identical to the `(n_rows, p_block)` effective
+    /// design used by the flat identifiability audit.
+    fn effective_jacobian_at(
+        &self,
+        state: &FamilyLinearizationState<'_>,
+    ) -> Result<Array2<f64>, String>;
+
+    /// Number of stacked output channels. 1 for most blocks.
+    fn n_outputs(&self) -> usize {
+        1
+    }
+}
+
 /// Static specification for one parameter block in a custom family.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ParameterBlockSpec {
     pub name: String,
     pub design: DesignMatrix,
@@ -322,20 +370,18 @@ pub struct ParameterBlockSpec {
     /// Defaults to 100. Set higher for blocks that should "own" shared
     /// affine/null-space directions (e.g. baseline time in survival).
     pub gauge_priority: u8,
-    /// Per-row linear scale vector. When set, the block's effective design
-    /// for identifiability, canonicalisation, and joint Q_s assembly is
-    /// `D_eff = diag(row_scaling) · design` rather than the raw `design`.
+    /// Per-row linear scale vector. Syntactic sugar for the single-output
+    /// diagonal-scaling case.  When set (and `jacobian_callback` is `None`),
+    /// `effective_jacobian_at` returns `diag(row_scaling) · design`.
     ///
-    /// This encodes the invariant that a `ParameterBlockSpec` represents
-    /// a contribution of the form `D_eff · β + offset` to the linear
-    /// predictor η. For most blocks `row_scaling = None` (all-ones, so
-    /// `D_eff = design`). For the logslope block in survival marginal-slope
-    /// the actual contribution is `diag(z) · Φ · β_s`; setting
-    /// `row_scaling = Some(z_arc)` exposes that structure to every
-    /// consumer via [`ParameterBlockSpec::effective_design`].
-    ///
-    /// Length must equal `design.nrows()` when set.
-    pub row_scaling: Option<std::sync::Arc<[f64]>>,
+    /// Superseded by `jacobian_callback` when a full β-dependent or multi-output
+    /// Jacobian is needed.  Length must equal `design.nrows()` when set.
+    pub row_scaling: Option<Arc<[f64]>>,
+    /// Full β-dependent Jacobian callback.  When `Some`, takes precedence over
+    /// `row_scaling` and is the authoritative source for `effective_jacobian_at`.
+    /// Callers writing simple families with at most row-wise scalar scaling should
+    /// leave this `None` and set `row_scaling` instead.
+    pub jacobian_callback: Option<Arc<dyn BlockEffectiveJacobian>>,
 }
 
 impl ParameterBlockSpec {
@@ -1455,6 +1501,79 @@ pub(crate) fn exact_newton_outer_geometry_supports_second_order_solver<F: Custom
 pub struct FamilyEvaluation {
     pub log_likelihood: f64,
     pub blockworking_sets: Vec<BlockWorkingSet>,
+}
+
+/// State passed to [`BlockEffectiveJacobian::effective_jacobian_at`].
+///
+/// `beta` is the current coefficient vector for this block.
+/// `family_scalars` carries any additional family-specific context needed to
+/// compute the Jacobian (e.g. evaluated design rows that depend nonlinearly on
+/// other blocks). Most location-scale blocks ignore it entirely.
+pub struct FamilyLinearizationState<'a> {
+    pub beta: &'a [f64],
+    pub family_scalars: Option<Arc<dyn Any + Send + Sync>>,
+}
+
+/// Linearization Jacobian ∂η_r[i] / ∂β_k[j] for a single parameter block.
+///
+/// For a family with `n_outputs` scalar outputs per observation row (e.g.
+/// location-scale has 2: μ and log σ), this trait lets each block advertise
+/// how its coefficients map into each output.
+///
+/// The returned matrix has shape `(n_outputs * n, p_block)` where `n` is the
+/// number of observations and `p_block` is the block's coefficient dimension.
+/// Row `r * n + i` holds `∂η_r[i] / ∂β[:p_block]` for output index `r` and
+/// observation `i`.
+///
+/// For purely additive blocks that contribute linearly to exactly one output
+/// `r_own`, the implementation is straightforward:
+/// - Rows `r_own * n .. (r_own + 1) * n`: the effective design matrix rows.
+/// - All other rows: zeros.
+pub trait BlockEffectiveJacobian: Send + Sync {
+    fn effective_jacobian_at(
+        &self,
+        state: &FamilyLinearizationState<'_>,
+    ) -> Result<Array2<f64>, String>;
+
+    fn n_outputs(&self) -> usize {
+        1
+    }
+}
+
+/// A [`BlockEffectiveJacobian`] for any block that contributes linearly to
+/// exactly one output of a multi-output family.
+///
+/// `own_output` is the zero-based output index that this block drives.
+/// `n_family_outputs` is the total number of outputs (e.g. 2 for location-scale).
+/// `design` is the block's effective design matrix (n × p_block).
+///
+/// The returned Jacobian has shape `(n_family_outputs * n, p_block)`:
+/// rows `own_output * n .. (own_output + 1) * n` contain `design`,
+/// all other rows are zero.
+pub struct AdditiveBlockJacobian {
+    pub design: Array2<f64>,
+    pub own_output: usize,
+    pub n_family_outputs: usize,
+}
+
+impl BlockEffectiveJacobian for AdditiveBlockJacobian {
+    fn effective_jacobian_at(
+        &self,
+        _state: &FamilyLinearizationState<'_>,
+    ) -> Result<Array2<f64>, String> {
+        let n = self.design.nrows();
+        let p = self.design.ncols();
+        let total_rows = self.n_family_outputs * n;
+        let mut jac = Array2::<f64>::zeros((total_rows, p));
+        let row_start = self.own_output * n;
+        jac.slice_mut(ndarray::s![row_start..row_start + n, ..])
+            .assign(&self.design);
+        Ok(jac)
+    }
+
+    fn n_outputs(&self) -> usize {
+        self.n_family_outputs
+    }
 }
 
 pub struct ExactNewtonJointGradientEvaluation {
