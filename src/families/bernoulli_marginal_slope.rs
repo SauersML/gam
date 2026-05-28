@@ -1651,12 +1651,183 @@ fn append_deviation_function_penalty(
 // residualisation theorem is `span(C) ⊆ span(A) ⇔ (I − P_A) C = 0`, and
 // that is what this code actually tests.
 //
-// `install_compiled_flex_block_into_runtime` takes two slices —
-// `parametric_anchors: &[(&DesignMatrix, ParametricAnchorBlock)]` and
-// `flex_anchors: &[&Array2<f64>]` — preserving the parametric-before-flex
-// invariant by construction. The K=1 row-Jacobian math runs through
-// `identifiability_compiler::compile`, so there is exactly one cross-block
-// residualisation math implementation in the codebase.
+// `install_compiled_flex_block_into_runtime` is a thin wrapper:
+//
+//   1. `build_bms_flex_block_context` — densifies anchors, stacks N_train,
+//      and assembles the `BernoulliDenseDesignOperator` + `BlockOrder` vectors
+//      needed for both the audit gate and the compile step.
+//   2. `audit_identifiability_channel_aware` — structural rank gate using
+//      the BMS K=1 row Jacobian; catches full aliasing before any install.
+//   3. `identifiability_compiler::compile` — W-metric Gram + eigendecomp,
+//      produces the V selector and anchor-correction M.
+//   4. Install V/M into the `DeviationRuntime` via `install_compiled_flex_block`,
+//      rebuild the block's design + penalties, and return `FlexCompileOutcome`.
+//
+// The K=1 row-Jacobian math still runs through `identifiability_compiler::compile`,
+// so there is exactly one cross-block residualisation math implementation in
+// the codebase.
+
+/// Assembled inputs for the BMS flex-block spec-builder → compile pipeline.
+///
+/// Produced by [`build_bms_flex_block_context`] and consumed by
+/// [`install_compiled_flex_block_into_runtime`].
+struct BmsFlexBlockContext {
+    /// Densified anchor blocks in parametric-before-flex order.
+    anchor_dense_blocks: Vec<Array2<f64>>,
+    /// Per-anchor predict-time tags (same order as `anchor_dense_blocks`).
+    anchor_components: Vec<crate::families::bernoulli_marginal_slope::deviation_runtime::AnchorComponentTag>,
+    /// Horizontally stacked anchor matrix N_train (n × d_total).
+    n_train: Array2<f64>,
+    /// `BernoulliDenseDesignOperator` per anchor, then one for the candidate
+    /// (trailing). Indices align with `ordering`.
+    operators: Vec<std::sync::Arc<dyn crate::families::identifiability_compiler::RowJacobianOperator>>,
+    /// Block-order tags parallel to `operators`.
+    ordering: Vec<crate::families::identifiability_compiler::BlockOrder>,
+    /// W-metric row Hessian built from the validated `training_row_weights`.
+    row_hess: crate::families::bernoulli_marginal_slope_identifiability::BernoulliRowHessian,
+    /// Dense candidate basis at training rows (n × p_candidate), cached to
+    /// avoid a second `design()` call after context construction.
+    candidate_design_dense: Array2<f64>,
+    /// Number of training rows.
+    n: usize,
+    /// Raw column count of the candidate block (= `candidate_design_dense.ncols()`).
+    p_candidate: usize,
+    /// Total anchor columns (= `n_train.ncols()`).
+    d_total: usize,
+}
+
+/// Validate inputs, densify anchors, stack N_train, and assemble the
+/// `BernoulliDenseDesignOperator` / `BlockOrder` / `BernoulliRowHessian`
+/// vectors needed by both [`audit_identifiability_channel_aware`] and
+/// [`identifiability_compiler::compile`].
+///
+/// Returns `Ok(None)` when the anchor union is empty (no-anchor fast path).
+fn build_bms_flex_block_context(
+    candidate: &DeviationPrepared,
+    candidate_arg_at_training_rows: &Array1<f64>,
+    parametric_anchors: &[(
+        &DesignMatrix,
+        crate::families::bernoulli_marginal_slope::deviation_runtime::ParametricAnchorBlock,
+    )],
+    flex_anchors: &[&Array2<f64>],
+    training_row_weights: &Array1<f64>,
+) -> Result<Option<BmsFlexBlockContext>, String> {
+    use crate::families::bernoulli_marginal_slope::deviation_runtime::AnchorComponentTag;
+    use crate::families::bernoulli_marginal_slope_identifiability::{
+        BernoulliDenseDesignOperator, BernoulliRowHessian,
+    };
+    use crate::families::identifiability_compiler::{BlockOrder, RowJacobianOperator};
+
+    let candidate_design = candidate.runtime.design(candidate_arg_at_training_rows)?;
+    let n = candidate_design.nrows();
+    let p_candidate = candidate_design.ncols();
+
+    if training_row_weights.len() != n {
+        return Err(format!(
+            "cross-block identifiability: training_row_weights length {} does not match candidate row count {}",
+            training_row_weights.len(),
+            n,
+        ));
+    }
+    for (i, &w) in training_row_weights.iter().enumerate() {
+        if !w.is_finite() || w < 0.0 {
+            return Err(format!(
+                "cross-block identifiability: training_row_weights[{i}] = {w} is not finite/non-negative",
+            ));
+        }
+    }
+
+    // Densify parametric anchors (parametric-before-flex ordering).
+    let mut anchor_dense_blocks: Vec<Array2<f64>> = Vec::new();
+    let mut anchor_components: Vec<AnchorComponentTag> = Vec::new();
+    let mut total_anchor_cols = 0usize;
+    for (d, block_tag) in parametric_anchors {
+        if d.nrows() != n {
+            return Err(format!(
+                "cross-block identifiability: parametric anchor has {} rows, candidate has {}",
+                d.nrows(),
+                n,
+            ));
+        }
+        let p_a = d.ncols();
+        if p_a == 0 {
+            continue;
+        }
+        let dense = d
+            .try_to_dense_arc("cross-block parametric anchor")?
+            .as_ref()
+            .clone();
+        anchor_dense_blocks.push(dense);
+        anchor_components.push(AnchorComponentTag::Parametric {
+            block: *block_tag,
+            ncols: p_a,
+        });
+        total_anchor_cols += p_a;
+    }
+    for a in flex_anchors {
+        if a.nrows() != n {
+            return Err(format!(
+                "cross-block identifiability: flex anchor has {} rows, candidate has {}",
+                a.nrows(),
+                n,
+            ));
+        }
+        let p_a = a.ncols();
+        if p_a == 0 {
+            continue;
+        }
+        anchor_dense_blocks.push((*a).clone());
+        anchor_components.push(AnchorComponentTag::FlexEvaluation { ncols: p_a });
+        total_anchor_cols += p_a;
+    }
+    if total_anchor_cols == 0 {
+        return Ok(None);
+    }
+
+    let d_total = total_anchor_cols;
+    let mut n_train = Array2::<f64>::zeros((n, d_total));
+    {
+        let mut col_offset = 0usize;
+        for block in &anchor_dense_blocks {
+            let bc = block.ncols();
+            n_train
+                .slice_mut(s![.., col_offset..col_offset + bc])
+                .assign(block);
+            col_offset += bc;
+        }
+    }
+
+    // Build BernoulliDenseDesignOperator per anchor block, then one for the
+    // candidate (trailing, BlockOrder::LinkDev).
+    let mut operators: Vec<std::sync::Arc<dyn RowJacobianOperator>> =
+        Vec::with_capacity(anchor_dense_blocks.len() + 1);
+    let mut ordering: Vec<BlockOrder> = Vec::with_capacity(anchor_dense_blocks.len() + 1);
+    for dense in &anchor_dense_blocks {
+        operators.push(std::sync::Arc::new(BernoulliDenseDesignOperator::new(
+            dense.clone(),
+        )));
+        ordering.push(BlockOrder::Marginal);
+    }
+    operators.push(std::sync::Arc::new(BernoulliDenseDesignOperator::new(
+        candidate_design.clone(),
+    )));
+    ordering.push(BlockOrder::LinkDev);
+
+    let row_hess = BernoulliRowHessian::from_row_weights(training_row_weights.clone());
+
+    Ok(Some(BmsFlexBlockContext {
+        anchor_dense_blocks,
+        anchor_components,
+        n_train,
+        operators,
+        ordering,
+        row_hess,
+        candidate_design_dense: candidate_design,
+        n,
+        p_candidate,
+        d_total,
+    }))
+}
 
 /// Outcome of [`install_compiled_flex_block_into_runtime`].
 ///
