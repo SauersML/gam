@@ -156,7 +156,7 @@ fn run_fit_predict(workdir: &Path, tag: &str, scale_dimensions: bool, csv_in: &P
 fn read_prediction_z(path: &Path) -> Vec<f64> {
     let mut reader = csv::Reader::from_path(path).expect("open prediction csv");
     let headers = reader.headers().expect("read prediction headers").clone();
-    let z_col = ["z", "z_score", "transformed", "eta", "mean"]
+    let z_col = ["z", "z_score", "transformed", "linear_predictor", "mean"]
         .iter()
         .find_map(|name| headers.iter().position(|header| header == *name))
         .unwrap_or_else(|| panic!("no z-like column in prediction headers: {headers:?}"));
