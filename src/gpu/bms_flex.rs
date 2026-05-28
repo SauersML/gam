@@ -27,6 +27,8 @@ use std::sync::OnceLock;
 use ndarray::Array2;
 
 use super::error::GpuError;
+#[cfg(target_os = "linux")]
+use super::error::GpuResultExt;
 use super::{GpuDecision, GpuKernel, decide};
 #[cfg(target_os = "linux")]
 use crate::gpu_err;
