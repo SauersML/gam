@@ -29,12 +29,12 @@
 //!
 //! T1's `BlockEffectiveJacobian` implementation for the logslope block must
 //! return the FULL formula above — not the simpler `s_f·diag(z)·Phi` shortcut
-//! that only holds at β=0.  A "eta_row_scaling shortcut" implementation would
+//! that only holds at β=0.  A static diagonal-scaling shortcut would
 //! pass the β=0 point but fail the moderate-β finite-difference check below.
 //!
 //! ## Failure mode of the shortcut
 //!
-//! If T1 uses `eta_row_scaling = Some(s_f · z)` (i.e. the static diagonal
+//! If T1 uses a static diagonal scaling `s_f · z` (i.e. the static diagonal
 //! scaling that equals the correct Jacobian only at g=0), then at moderate β
 //! the `effective_jacobian_at` output will equal `diag(s_f · z) · Phi` while
 //! the FD reference will equal `diag(q·c1 + s_f·z) · Phi`.  The rel-error
@@ -45,12 +45,12 @@
 //! With the correct Jacobian, marginal and logslope blocks have DIFFERENT
 //! per-row scale factors (c_i vs. q·c1_i + s_f·z_i), so their effective
 //! designs in the (n·K=3·n) channel-stacked space are NOT collinear.  The
-//! pairwise overlap is strictly less than 1.0.  With the eta_row_scaling shortcut,
+//! pairwise overlap is strictly less than 1.0.  With a static diagonal shortcut,
 //! both marginal and logslope blocks would have scale factor s_f·z_i,
 //! yielding overlap = 1.0 — triggering a spurious fatal audit halt.
 
 use gam::custom_family::{
-    BlockEffectiveJacobian, FamilyLinearizationState, ParameterBlockSpec,
+    BlockEffectiveJacobian, FamilyLinearizationState, ParameterBlockSpec, RowScaledJacobian,
 };
 use gam::families::identifiability_compiler::{IdentityRowHessian, RowJacobianOperator};
 use gam::families::survival_marginal_slope::{
@@ -444,7 +444,6 @@ fn make_spec_from_dense(name: &str, phi: Array2<f64>) -> ParameterBlockSpec {
         initial_log_lambdas: Array1::<f64>::zeros(0),
         initial_beta: None,
         gauge_priority: 100,
-        eta_row_scaling: None,
         jacobian_callback: None,
     }
 }
@@ -475,7 +474,6 @@ fn make_logslope_spec(
         initial_log_lambdas: Array1::<f64>::zeros(0),
         initial_beta: None,
         gauge_priority: 120,
-        eta_row_scaling: None,
         jacobian_callback: Some(cb),
     }
 }
@@ -556,7 +554,7 @@ fn check_effective_jacobian_matches_fd(
         rel_err < 1e-5,
         "{label}: effective_jacobian_at rel-error vs FD = {rel_err:.3e} (expected < 1e-5). \
          If this fires at moderate β but passes at β=0, T1's implementation is using \
-         the eta_row_scaling shortcut (s_f·diag(z)·Phi) instead of the full hyperbolic \
+         a static diagonal shortcut (s_f·diag(z)·Phi) instead of the full hyperbolic \
          correction (q·c1 + s_f·z)·Phi.",
     );
 }
@@ -644,7 +642,7 @@ fn logslope_jacobian_at_small_beta_matches_fd() {
 /// to s_f·z. FD check distinguishes the correct formula from the shortcut.
 ///
 /// SENTINEL: if this test fails while the β=0 test passes, T1's impl uses
-/// the `eta_row_scaling = s_f·z` shortcut everywhere, which is only correct at g=0.
+/// a static diagonal shortcut (s_f·z) everywhere, which is only correct at g=0.
 #[test]
 fn logslope_jacobian_at_moderate_beta_has_hyperbolic_correction() {
     let data = make_synthetic_data(777);
@@ -838,7 +836,7 @@ fn effective_jacobian_uses_family_scalars_when_provided() {
 /// DIFFERENT per-row scalings (c_i for marginal vs (q·c1+s_f·z)_i for
 /// logslope), so their pairwise overlap in (n·K=3·n) space is < 1.0.
 ///
-/// With the eta_row_scaling shortcut, both blocks would use s_f·z_i as their
+/// With a static diagonal shortcut, both blocks would use s_f·z_i as their
 /// row scaling, making the overlap = 1.0 and triggering a spurious fatal halt.
 #[test]
 fn channel_aware_audit_overlap_below_one_at_moderate_beta() {
@@ -894,7 +892,7 @@ fn channel_aware_audit_overlap_below_one_at_moderate_beta() {
     assert!(
         max_overlap < 0.99,
         "channel-aware audit: max cross-block overlap = {max_overlap:.4} (expected < 0.99). \
-         With the eta_row_scaling shortcut, marginal and logslope blocks both scale by s_f·z \
+         With a static diagonal shortcut, marginal and logslope blocks both scale by s_f·z \
          and this overlap would be 1.0, triggering a fatal halt. The correct hyperbolic \
          Jacobian has distinct per-row scalings and this overlap must be < 1. \
          Summary: {}",
@@ -940,7 +938,7 @@ fn time_and_marginal_blocks_at_zero_beta_have_trivial_scaling() {
     //
     // For this block, the "effective design" at β=0 is just Phi_time (c=1).
 
-    // Build a simple additive spec for the time block (c=1 means eta_row_scaling = ones).
+    // Build a simple additive spec for the time block (c=1 means row-scaling = ones).
     let scaling: Arc<[f64]> = vec![1.0_f64; N].into();
     let spec = ParameterBlockSpec {
         name: "time".to_string(),
@@ -951,11 +949,13 @@ fn time_and_marginal_blocks_at_zero_beta_have_trivial_scaling() {
         initial_log_lambdas: Array1::<f64>::zeros(0),
         initial_beta: None,
         gauge_priority: 200,
-        eta_row_scaling: Some(scaling),
-        jacobian_callback: None,
+        jacobian_callback: Some(Arc::new(RowScaledJacobian {
+            design: Arc::new(data.phi_time.clone()),
+            eta_scaling: scaling,
+        })),
     };
 
-    // Effective Jacobian via spec.effective_jacobian_at (eta_row_scaling=1).
+    // Effective Jacobian via spec.effective_jacobian_at (RowScaledJacobian with scaling=1).
     let state = FamilyLinearizationState { beta: &beta_zero, family_scalars: None, channel_hessian: None, probit_frailty_scale: s_f };
     let jac = spec
         .effective_jacobian_at("test", &state)
@@ -975,7 +975,7 @@ fn time_and_marginal_blocks_at_zero_beta_have_trivial_scaling() {
         jac.ncols()
     );
 
-    // With eta_row_scaling=1, effective Jacobian = design.
+    // With row-scaling=1, effective Jacobian = design.
     for i in 0..N {
         for j in 0..P_BLOCK {
             let got = jac[[i, j]];
@@ -1002,15 +1002,17 @@ fn time_and_marginal_blocks_at_zero_beta_have_trivial_scaling() {
         initial_log_lambdas: Array1::<f64>::zeros(0),
         initial_beta: None,
         gauge_priority: 150,
-        eta_row_scaling: Some(sf_z_arc),
-        jacobian_callback: None,
+        jacobian_callback: Some(Arc::new(RowScaledJacobian {
+            design: Arc::new(data.phi_marg.clone()),
+            eta_scaling: sf_z_arc,
+        })),
     };
     let marg_state = FamilyLinearizationState { beta: &beta_zero, family_scalars: None, channel_hessian: None, probit_frailty_scale: s_f };
     let marg_jac = marg_spec
         .effective_jacobian_at("test", &marg_state)
         .expect("marginal block effective_jacobian_at must succeed");
 
-    // Verify eta_row_scaling applied correctly: row i should equal s_f*z_i * Phi_marg[i,:]
+    // Verify RowScaledJacobian applied correctly: row i should equal s_f*z_i * Phi_marg[i,:]
     for i in 0..N {
         let scale = s_f * data.z[i];
         for j in 0..P_BLOCK {

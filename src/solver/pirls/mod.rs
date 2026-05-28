@@ -77,6 +77,7 @@ use penalty::{
     attach_penalty_shift, symmetrize_dense_matrix,
 };
 use convergence::effective_kkt_tolerance;
+use pls_solver::solve_penalized_least_squares_implicit;
 
 const GAMMA_SHAPE_MIN: f64 = 1e-8;
 const GAMMA_SHAPE_MAX: f64 = 1e12;
@@ -6105,78 +6106,8 @@ pub struct PirlsProblem<'a, X> {
     pub gaussian_fixed_cache: Option<&'a GaussianFixedCache>,
 }
 
-/// Reusable `XᵀWX` and `XᵀW(y − offset)` for Gaussian + Identity REML fits.
-///
-/// The Gaussian-identity P-IRLS short-circuit solves a single linear system
-/// `(XᵀWX + Σ λ_k S_k + ρ·I) β = XᵀW(y − offset)`. The right-hand-side matrix
-/// and vector are independent of the smoothing parameters `λ`, so when the
-/// outer REML loop evaluates the same problem at many `(λ_1, …, λ_k)`
-/// candidates we only need to assemble them **once** before the loop and
-/// reuse them inside every inner PIRLS call.
-///
-/// Stored in *original* coordinates (no Qs rotation applied). When the
-/// inner solver uses a `WorkingReparamTransform`, it conjugates / projects
-/// these matrices on the fly — that step is O(p³) / O(p²), independent of N.
-#[derive(Debug)]
-pub struct GaussianFixedCache {
-    /// `XᵀWX` in the original coefficient basis. Symmetric, p × p.
-    pub xtwx_orig: Array2<f64>,
-    /// `XᵀW(y − offset)` in the original basis. Length p.
-    pub xtwy_orig: Array1<f64>,
-    /// `(y − offset)ᵀW(y − offset)`.
-    ///
-    /// Together with `xtwx_orig` and `xtwy_orig`, this is the last scalar
-    /// sufficient statistic needed to evaluate the Gaussian penalized RSS
-    /// exactly at any λ without re-streaming the rows.
-    pub centered_weighted_y_sq: f64,
-    /// `XᵀWX` precomputed for the sparse path, aligned with the symbolic
-    /// pattern of `SparseXtWxCache::new(x)` on the original sparse design.
-    /// `None` when the design has no sparse form (e.g. dense-only fits).
-    ///
-    /// The sparse REML path rebuilds `H = XᵀWX + Sλ + δI` per outer
-    /// evaluation. For Gaussian-Identity the weights never change, so the
-    /// `XᵀWX` contribution is invariant across the outer loop and can be
-    /// scattered from this cached values vector instead of re-doing the
-    /// O(nnz²/n) SpGEMM each call.
-    pub xtwx_sparse_orig: Option<Arc<SparseXtwxPrecomputed>>,
-}
-
-/// Precomputed numerical values of `XᵀWX` aligned with the symbolic pattern
-/// that `SparseXtWxCache::new(x)` produces on its first call. Two such caches
-/// built from the same sparse `x` produce byte-identical symbolic patterns
-/// (faer's `sparse_sparse_matmul_symbolic` is deterministic), so the cached
-/// values can be installed back into a fresh `SparseXtWxCache` for the same
-/// `x` without rerunning the SpGEMM.
-///
-/// We snapshot the symbolic pattern (`col_ptr` / `row_idx`) alongside the
-/// values so the consumer can verify pattern equivalence and fall through to
-/// the per-call recomputation if anything diverges (e.g. an `x` with a
-/// different symbolic shape sneaks in).
-#[derive(Debug, Clone)]
-pub struct SparseXtwxPrecomputed {
-    pub xtwx_symbolic_col_ptr: Vec<usize>,
-    pub xtwx_symbolic_row_idx: Vec<usize>,
-    pub xtwxvalues: Vec<f64>,
-}
-
-impl SparseXtwxPrecomputed {
-    /// Build the precomputed `XᵀWX` value layout for `x` at the given
-    /// `weights`. The output reuses the same construction path the inner
-    /// PIRLS workspace uses, so it lands in exactly the symbolic pattern
-    /// the consumer expects.
-    pub fn build(
-        x: &SparseColMat<usize, f64>,
-        weights: &Array1<f64>,
-    ) -> Result<Self, EstimationError> {
-        let mut cache = SparseXtWxCache::new(x)?;
-        cache.compute_numeric(x, weights)?;
-        Ok(Self {
-            xtwx_symbolic_col_ptr: cache.xtwx_symbolic.col_ptr().to_vec(),
-            xtwx_symbolic_row_idx: cache.xtwx_symbolic.row_idx().to_vec(),
-            xtwxvalues: cache.xtwxvalues,
-        })
-    }
-}
+// GaussianFixedCache and SparseXtwxPrecomputed are defined in pls_solver.
+pub use pls_solver::{GaussianFixedCache, SparseXtwxPrecomputed};
 
 pub struct PenaltyConfig<'a> {
     /// Block-local canonical penalties with precomputed roots and spectral data.

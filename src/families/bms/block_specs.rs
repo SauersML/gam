@@ -92,7 +92,7 @@ impl BmsMarginalJacobian {
 }
 
 impl BlockEffectiveJacobian for BmsMarginalJacobian {
-    pub(super) fn effective_jacobian_at(
+    fn effective_jacobian_at(
         &self,
         state: &FamilyLinearizationState<'_>,
     ) -> Result<Array2<f64>, String> {
@@ -155,7 +155,7 @@ impl BlockEffectiveJacobian for BmsMarginalJacobian {
         Ok(out)
     }
 
-    pub(super) fn n_outputs(&self) -> usize {
+    fn n_outputs(&self) -> usize {
         1
     }
 }
@@ -204,7 +204,7 @@ impl BmsLogslopeJacobian {
 }
 
 impl BlockEffectiveJacobian for BmsLogslopeJacobian {
-    pub(super) fn effective_jacobian_at(
+    fn effective_jacobian_at(
         &self,
         state: &FamilyLinearizationState<'_>,
     ) -> Result<Array2<f64>, String> {
@@ -278,7 +278,7 @@ impl BlockEffectiveJacobian for BmsLogslopeJacobian {
         Ok(out)
     }
 
-    pub(super) fn n_outputs(&self) -> usize {
+    fn n_outputs(&self) -> usize {
         1
     }
 }

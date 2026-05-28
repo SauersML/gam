@@ -626,17 +626,17 @@ pub(super) struct BernoulliBlockHessianOperator {
 }
 
 impl HyperOperator for BernoulliBlockHessianOperator {
-    pub(super) fn dim(&self) -> usize {
+    fn dim(&self) -> usize {
         self.total
     }
 
-    pub(super) fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         let mut out = Array1::zeros(self.total);
         self.mul_vec_into(v.view(), out.view_mut());
         out
     }
 
-    pub(super) fn mul_vec_view(&self, v: ArrayView1<'_, f64>) -> Array1<f64> {
+    fn mul_vec_view(&self, v: ArrayView1<'_, f64>) -> Array1<f64> {
         let mut out = Array1::zeros(self.total);
         self.mul_vec_into(v, out.view_mut());
         out
@@ -648,7 +648,7 @@ impl HyperOperator for BernoulliBlockHessianOperator {
     /// would incur. The psi-Hessian outer-eval path calls this once per
     /// ψ-direction per trace sweep; at biobank scale (rank ≈ 32) the saving
     /// is ~64 allocations per REML gradient step.
-    pub(super) fn mul_vec_into(&self, v: ArrayView1<'_, f64>, mut out: ArrayViewMut1<'_, f64>) {
+    fn mul_vec_into(&self, v: ArrayView1<'_, f64>, mut out: ArrayViewMut1<'_, f64>) {
         let v_m = v.slice(s![self.marginal.clone()]);
         let v_g = v.slice(s![self.logslope.clone()]);
         out.fill(0.0);
@@ -667,7 +667,7 @@ impl HyperOperator for BernoulliBlockHessianOperator {
         }
     }
 
-    pub(super) fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
+    fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
         let v_m = v.slice(s![self.marginal.clone()]);
         let v_g = v.slice(s![self.logslope.clone()]);
         let u_m = u.slice(s![self.marginal.clone()]);
@@ -685,7 +685,7 @@ impl HyperOperator for BernoulliBlockHessianOperator {
         total
     }
 
-    pub(super) fn to_dense(&self) -> Array2<f64> {
+    fn to_dense(&self) -> Array2<f64> {
         let mut out = Array2::zeros((self.total, self.total));
         out.slice_mut(s![self.marginal.clone(), self.marginal.clone()])
             .assign(&self.h_mm);
@@ -701,7 +701,7 @@ impl HyperOperator for BernoulliBlockHessianOperator {
         out
     }
 
-    pub(super) fn is_implicit(&self) -> bool {
+    fn is_implicit(&self) -> bool {
         false
     }
 }

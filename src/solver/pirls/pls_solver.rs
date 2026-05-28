@@ -10,17 +10,15 @@
 //!   PLS, dense and sparse-native paths.
 
 use super::{
-    FIXED_STABILIZATION_RIDGE, PirlsPenalty, PirlsWorkspace, WorkingReparamTransform,
-    ensure_sparse_positive_definitewithridge, max_symmetric_asymmetry,
+    FIXED_STABILIZATION_RIDGE, PirlsPenalty, PirlsWorkspace, SparseXtWxCache,
+    StablePLSResult, WorkingReparamTransform, calculate_edf_from_sparse_factor,
+    calculate_edfwithworkspace_from_factor, ensure_sparse_positive_definitewithridge,
+    max_symmetric_asymmetry, solve_sparse_spd,
 };
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{FaerLinalgError, array1_to_col_matmut};
-use crate::linalg::sparse_exact::solve_sparse_spd;
 use crate::linalg::utils::{StableSolver, array_is_finite};
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
-use crate::solver::pirls::edf::{
-    StablePLSResult, calculate_edf_from_sparse_factor, calculate_edfwithworkspace_from_factor,
-};
 use crate::types::{Coefficients, LinkFunction};
 use faer::sparse::SparseColMat;
 use ndarray::{Array1, Array2, ArrayView1};
@@ -89,7 +87,7 @@ impl SparseXtwxPrecomputed {
         x: &SparseColMat<usize, f64>,
         weights: &Array1<f64>,
     ) -> Result<Self, EstimationError> {
-        let mut cache = super::SparseXtWxCache::new(x)?;
+        let mut cache = SparseXtWxCache::new(x)?;
         cache.compute_numeric(x, weights)?;
         Ok(Self {
             xtwx_symbolic_col_ptr: cache.xtwx_symbolic.col_ptr().to_vec(),
