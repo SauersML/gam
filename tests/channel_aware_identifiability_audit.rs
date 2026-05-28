@@ -119,11 +119,11 @@ fn channel_aware_audit_passes_when_blocks_live_in_orthogonal_channels() {
     ];
 
     let design_a = match &specs[0].design {
-        DesignMatrix::Dense(d) => d.as_array().to_owned(),
+        DesignMatrix::Dense(d) => d.to_dense(),
         _ => panic!("expected dense"),
     };
     let design_b = match &specs[1].design {
-        DesignMatrix::Dense(d) => d.as_array().to_owned(),
+        DesignMatrix::Dense(d) => d.to_dense(),
         _ => panic!("expected dense"),
     };
 
@@ -166,11 +166,11 @@ fn channel_aware_audit_still_flags_real_aliases_within_one_channel() {
     // fatal.
     let specs = [shared_column_block("a"), shared_column_block("b")];
     let design_a = match &specs[0].design {
-        DesignMatrix::Dense(d) => d.as_array().to_owned(),
+        DesignMatrix::Dense(d) => d.to_dense(),
         _ => panic!("expected dense"),
     };
     let design_b = match &specs[1].design {
-        DesignMatrix::Dense(d) => d.as_array().to_owned(),
+        DesignMatrix::Dense(d) => d.to_dense(),
         _ => panic!("expected dense"),
     };
     let operators: Vec<Arc<dyn RowJacobianOperator>> = vec![
