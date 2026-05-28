@@ -53,7 +53,7 @@
 //!                + a_u · tau_v + r_uv
 //! ```
 //!
-//! Probit Mills (stable; mirrors `log_ndtr_and_mills` in `survival_flex.rs`):
+//! Probit Mills (stable; uses `log_ndtr_and_mills` from `numerics_device::PROBIT_NUMERICS_CU`):
 //!
 //! ```text
 //!     s = 2y − 1 ;  m = s · e_obs
@@ -231,7 +231,7 @@ pub(crate) struct BmsFlexRowKernelInputs<'a> {
 /// before [`launch_bms_flex_row_kernel`] uploads to the device.
 ///
 /// Holds all per-row + per-cell SoA buffers in the exact layouts the device
-/// kernel reads (`bms_flex_row_kernel` in [`ROW_KERNEL_SOURCE`]):
+/// kernel reads (`bms_flex_row_kernel` in [`ROW_KERNEL_BODY`]):
 ///   * scalars `n_rows`, `r`, `p_h`, `p_w`, `s_f`,
 ///   * per-row `q / b / mu_1 / mu_2 / z_obs / y / w / chi_obs / xi_obs`,
 ///   * per-row `rho_u [n*r]`, `tau_u [n*r]`, `r_uv [n*r*r]`,
@@ -443,69 +443,25 @@ impl<'a> BmsFlexRowKernelInputs<'a> {
     }
 }
 
-/// NVRTC kernel source. One CUDA block per row; 32 threads per block parallise
-/// the per-cell sums into shared-memory scratch; thread 0 of the block finishes
-/// the IFT + observed-point + Mills + Hessian write-out.
+/// NVRTC kernel source body. One CUDA block per row; 32 threads per block
+/// parallise the per-cell sums into shared-memory scratch; thread 0 of the
+/// block finishes the IFT + observed-point + Mills + Hessian write-out.
+///
+/// Shared probit numerics (`erfcx_nonnegative`, `log_ndtr`,
+/// `log_ndtr_and_mills`) are provided by
+/// `numerics_device::PROBIT_NUMERICS_CU`, which is prepended before
+/// passing to `cudarc::nvrtc::compile_ptx`.
 ///
 /// **CPU parity reference**: the body mirrors
 /// `compute_row_analytic_flex_from_parts_into` in
-/// `src/families/bernoulli_marginal_slope.rs`. The probit Mills helpers are
-/// duplicated from `src/gpu/survival_flex.rs` (lines 224–283) until a shared
-/// `numerics_device.rs` lands; the two copies must stay byte-for-byte
-/// identical so any future numerics fix lands in both.
+/// `src/families/bernoulli_marginal_slope.rs`.
 #[cfg(target_os = "linux")]
-const ROW_KERNEL_SOURCE: &str = r#"
+const ROW_KERNEL_BODY: &str = r#"
 // One block per row. blockDim.x = 32; threadIdx.x parallises per-cell sums.
 // CPU parity reference: src/families/bernoulli_marginal_slope.rs
 //                      ::compute_row_analytic_flex_from_parts_into.
 
 #define INV_TWO_PI     0.15915494309189535
-#define INV_SQRT_2PI   0.3989422804014327
-#define SQRT_2         1.4142135623730951
-
-// ---- erfcx / log_ndtr / mills helpers (mirror src/gpu/survival_flex.rs) ----
-extern "C" __device__ __forceinline__ double erfcx_nonnegative(double x) {
-    if (!isfinite(x)) {
-        return (x > 0.0) ? 0.0 : (1.0 / 0.0);
-    }
-    if (x <= 0.0) return 1.0;
-    if (x < 26.0) {
-        double xx = x * x;
-        if (xx > 700.0) xx = 700.0;
-        return exp(xx) * erfc(x);
-    }
-    double inv  = 1.0 / x;
-    double inv2 = inv * inv;
-    double poly = 1.0
-                - 0.5    * inv2
-                + 0.75   * inv2 * inv2
-                - 1.875  * inv2 * inv2 * inv2
-                + 6.5625 * inv2 * inv2 * inv2 * inv2;
-    const double inv_sqrt_pi = 0.5641895835477563;
-    return inv * poly * inv_sqrt_pi;
-}
-
-extern "C" __device__ __forceinline__ void
-log_ndtr_and_mills(double x, double *log_cdf, double *lambda) {
-    if (x ==  (1.0 / 0.0)) { *log_cdf = 0.0;            *lambda = 0.0;            return; }
-    if (x == -(1.0 / 0.0)) { *log_cdf = -(1.0 / 0.0);   *lambda = (1.0 / 0.0);    return; }
-    if (isnan(x))          { *log_cdf = x;              *lambda = x;              return; }
-    if (x < 0.0) {
-        double u   = -x / SQRT_2;
-        double ex  = erfcx_nonnegative(u);
-        if (ex < 1e-300) ex = 1e-300;
-        *log_cdf = -u * u + log(0.5 * ex);
-        const double sqrt_2_over_pi = 0.7978845608028654;
-        *lambda  = sqrt_2_over_pi / ex;
-    } else {
-        double cdf = 0.5 * erfc(-x / SQRT_2);
-        if (cdf < 1e-300) cdf = 1e-300;
-        if (cdf > 1.0)    cdf = 1.0;
-        double pdf = INV_SQRT_2PI * exp(-0.5 * x * x);
-        *log_cdf = log(cdf);
-        *lambda  = pdf / cdf;
-    }
-}
 
 // `nan_fill_outputs`: thread-0-only path used when row inputs are degenerate
 // (`F_a` non-finite or non-positive). Writes NaNs to neglog/grad/hess so the
@@ -873,7 +829,12 @@ impl RowKernelBackend {
                         ),
                     })?;
                 let stream = ctx.default_stream();
-                let ptx = cudarc::nvrtc::compile_ptx(ROW_KERNEL_SOURCE).map_err(|err| {
+                let row_kernel_source = [
+                    super::numerics_device::PROBIT_NUMERICS_CU,
+                    ROW_KERNEL_BODY,
+                ]
+                .concat();
+                let ptx = cudarc::nvrtc::compile_ptx(row_kernel_source).map_err(|err| {
                     GpuError::DriverCallFailed {
                         reason: format!("bms_flex_row NVRTC compile failed: {err}"),
                     }
@@ -2988,10 +2949,10 @@ mod tests {
         }
     }
 
-    // ── CPU oracle that mirrors ROW_KERNEL_SOURCE bit-for-bit ────────────────
+    // ── CPU oracle that mirrors ROW_KERNEL_BODY bit-for-bit ──────────────────
     //
     // `cpu_oracle_outputs` implements the same algebra as
-    // `bms_flex_row_kernel` in ROW_KERNEL_SOURCE: per-cell `T_n` / `D` / `Q`
+    // `bms_flex_row_kernel` in ROW_KERNEL_BODY: per-cell `T_n` / `D` / `Q`
     // contractions, q-row override, IFT to `a_u` / `a_uv`, observed-point
     // assembly to `bar_e_u` / `bar_e_uv`, probit Mills, and the final
     // `out_grad` / `out_hess` writes. It takes the same
@@ -3575,9 +3536,9 @@ mod tests {
         // wires this to bms_flex.rs cross-checks parity against the CPU
         // function named here.
         #[cfg(target_os = "linux")]
-        assert!(ROW_KERNEL_SOURCE.contains("compute_row_analytic_flex_from_parts_into"));
+        assert!(ROW_KERNEL_BODY.contains("compute_row_analytic_flex_from_parts_into"));
         #[cfg(target_os = "linux")]
-        assert!(ROW_KERNEL_SOURCE.contains("cell_first_derivative_from_moments"));
+        assert!(ROW_KERNEL_BODY.contains("cell_first_derivative_from_moments"));
     }
 
     // ── Phase-3 HVP / diagonal CPU oracles + GPU parity tests ────────────────

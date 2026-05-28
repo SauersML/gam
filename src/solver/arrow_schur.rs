@@ -174,6 +174,43 @@ impl ArrowSolverMode {
     }
 }
 
+/// Reason the Steihaug-CG loop stopped.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum PcgStopReason {
+    /// Residual fell below the relative tolerance threshold.
+    #[default]
+    Converged,
+    /// Loop exhausted max_iterations without converging.
+    MaxIter,
+    /// Step hit the trust-region boundary (Steihaug boundary projection).
+    TrustRegion,
+    /// Negative curvature detected in an unbounded solve.
+    Indefinite,
+    /// Non-positive or non-finite preconditioned residual after an update.
+    Stagnation,
+}
+
+/// Per-solve instrumentation counters returned alongside the PCG solution.
+///
+/// All fields default to zero; callers that do not need diagnostics simply
+/// ignore the value. The struct is Copy so passing it through return tuples
+/// is zero-overhead.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PcgDiagnostics {
+    /// Number of CG iterations executed.
+    pub iterations: usize,
+    /// Total calls to the Schur matvec A·p.
+    pub matvec_calls: usize,
+    /// Total calls to the preconditioner M^{-1}·r.
+    pub precond_apply_calls: usize,
+    /// Number of times the LM ridge was escalated before a successful factor.
+    pub ridge_escalations: usize,
+    /// Relative residual at termination; 0.0 when the RHS was zero.
+    pub final_relative_residual: f64,
+    /// Why the loop stopped.
+    pub stopping_reason: PcgStopReason,
+}
+
 /// PCG controls for BA's inexact reduced-camera-system solve.
 ///
 /// The defaults mirror the loose inner tolerances used by inexact-step LM in

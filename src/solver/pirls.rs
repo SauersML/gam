@@ -5994,6 +5994,60 @@ where
                 lm_attempts_done,
             );
         }
+
+        // ── Timing-driven adaptive early-exit ──────────────────────────────
+        // Update the short EMA of per-iter wall-clock.  α = 0.3 gives a
+        // memory of roughly 3 iters.
+        let iter_secs = iter_elapsed.as_secs_f64();
+        let ema = match ema_iter_elapsed_secs {
+            None => iter_secs,
+            Some(prev) => 0.3 * iter_secs + 0.7 * prev,
+        };
+        ema_iter_elapsed_secs = Some(ema);
+
+        // Only attempt the predicate after we have at least 2 data points
+        // (so the EMA is meaningful) and when the hard convergence checks
+        // above have NOT already exited (we are still in the loop).
+        //
+        // Constants (baked in, no CLI flags):
+        //   ε_t  = 0.25  — iter must be < 25 % of the EMA to be "trivially cheap"
+        //   10 × hard tol for the relaxed deviance and grad-ratio bands
+        if iter >= 2 {
+            // (a) Iteration has become trivially cheap: the solver is coasting.
+            let iter_cheap = ema > 0.0 && iter_secs < 0.25 * ema;
+
+            // (b) Deviance change is negligible relative to |F|.
+            let f_abs = current_penalized.abs().max(1.0);
+            let deviance_ok = (last_deviance_change / f_abs).abs()
+                < options.convergence_tolerance * 10.0;
+
+            // (c) Gradient has collapsed relative to its initial value.
+            let grad_ok = match initial_gradient_norm {
+                Some(g0) if g0 > 0.0 && lastgradient_norm.is_finite() => {
+                    lastgradient_norm / g0 < options.convergence_tolerance * 10.0
+                }
+                _ => false,
+            };
+
+            if iter_cheap && deviance_ok && grad_ok {
+                log::info!(
+                    "[PIRLS] iter {iter} timing-driven adaptive early-exit: \
+                     iter={:.4}s ema={:.4}s dev_rel={:.3e} grad_ratio={:.3e}",
+                    iter_secs,
+                    ema,
+                    (last_deviance_change / f_abs).abs(),
+                    match initial_gradient_norm {
+                        Some(g0) if g0 > 0.0 => lastgradient_norm / g0,
+                        _ => f64::NAN,
+                    },
+                );
+                // Use the best accepted state we have (set by the accept
+                // branch earlier this iteration, or the previous iter).
+                status = PirlsStatus::Converged;
+                break 'pirls_loop;
+            }
+        }
+        // ── end timing-driven adaptive early-exit ──────────────────────────
     }
 
     // Solve-end summary: one line per accepted (or rescued) PIRLS solve
