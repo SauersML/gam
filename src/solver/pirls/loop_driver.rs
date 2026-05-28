@@ -31,7 +31,10 @@ use super::{
     computeworkingweight_derivatives_from_eta,
 };
 use super::gpu_dispatch::{try_gaussian_pls_gpu, try_pirls_loop_gpu};
-use super::effective_kkt_tolerance;
+use super::{
+    ArrowSchurInnerConfig, GamModelFinalState, effective_kkt_tolerance,
+    project_coefficients_to_lower_bounds,
+};
 use crate::faer_ndarray::fast_ab;
 use crate::probability::standard_normal_quantile;
 use crate::construction::{

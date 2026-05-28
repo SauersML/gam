@@ -3585,7 +3585,7 @@ pub use loop_driver::{
     fit_model_for_fixed_rho, PirlsConfig, PirlsProblem, PenaltyConfig,
 };
 pub(crate) use loop_driver::fit_model_for_fixed_rho_with_adaptive_kkt;
-use loop_driver::{make_reparam_operator, assert_symmetric_tol};
+use loop_driver::assert_symmetric_tol;
 
 
 #[inline]
