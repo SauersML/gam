@@ -2585,6 +2585,15 @@ pub enum BasisMetadata {
         knots: Array1<f64>,
         identifiability_transform: Option<Array2<f64>>,
         periodic: Option<(f64, f64, usize)>,
+        /// Effective B-spline polynomial degree carried by `knots`.
+        ///
+        /// Persisted alongside `knots` so prediction can reconstruct an
+        /// evaluator that matches fit-time geometry, even when the fit-time
+        /// auto-shrink (issue #340) reduced the user's requested degree to
+        /// fit the available data (`n` too small for cubic ⇒ quadratic ⇒
+        /// linear). When `None` the consumer should fall back to the
+        /// upstream `BSplineBasisSpec.degree` (legacy / non-shrunk path).
+        degree: Option<usize>,
     },
     ThinPlate {
         centers: Array2<f64>,
@@ -9337,6 +9346,56 @@ fn default_internal_knot_count_for_data(n: usize, degree: usize) -> usize {
     let heuristic = if n < 16 { 3 } else { (n / 4).max(3) };
     let max_reasonable = n.saturating_sub(degree + 2);
     heuristic.min(40).min(max_reasonable)
+}
+
+/// Auto-shrink a requested B-spline configuration to the largest feasible
+/// `(num_internal_knots, degree)` that the available data can support.
+///
+/// Issue #340: when `n` is small (e.g. `n = 3` with a default cubic + 4
+/// interior knots), the upstream auto-knot placement otherwise errors out and
+/// forces the user to manually downgrade their model. This helper folds the
+/// downgrade decision into the engine so cubic-by-default gracefully degrades
+/// to quadratic / linear, and the interior-knot count shrinks toward zero,
+/// matching what the data can express.
+///
+/// Constraints we must satisfy for the generated clamped knot vector to be
+/// non-degenerate:
+///   * `n >= num_internal_knots + 2`  (one min, one max, one strict interior
+///     value per interior knot in the best case)
+///   * `n >= degree + 1`              (clamped vector covers `degree + 1`
+///     boundary repeats on each side; we need at least that many distinct
+///     evaluation points for the basis to span)
+///
+/// The shrink rule (deterministic, magic-by-default):
+///   1. Cap `num_internal_knots` at `n.saturating_sub(2)`.
+///   2. While `degree + 1 > n` and `degree > 1`, drop the degree by one
+///      (cubic → quadratic → linear).
+///   3. If even linear (`degree = 1`, requiring `n >= 2`) is impossible,
+///      return `None` and let the caller raise a clear "not enough points"
+///      diagnostic.
+///
+/// Returns `(effective_num_internal_knots, effective_degree)` along with a
+/// boolean flagging whether either parameter was actually reduced.
+pub(crate) fn auto_shrink_bspline_config(
+    n: usize,
+    requested_num_internal_knots: usize,
+    requested_degree: usize,
+) -> Option<(usize, usize, bool)> {
+    if n < 2 {
+        return None;
+    }
+    let mut degree = requested_degree.max(1);
+    while degree + 1 > n && degree > 1 {
+        degree -= 1;
+    }
+    if degree + 1 > n {
+        return None;
+    }
+    let max_interior = n.saturating_sub(2);
+    let num_internal_knots = requested_num_internal_knots.min(max_interior);
+    let shrunk = num_internal_knots != requested_num_internal_knots
+        || degree != requested_degree.max(1);
+    Some((num_internal_knots, degree, shrunk))
 }
 
 fn finite_data_range(data: ArrayView1<'_, f64>) -> Result<(f64, f64), BasisError> {

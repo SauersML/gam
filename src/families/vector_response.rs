@@ -461,7 +461,7 @@ impl MultinomialLogitLikelihood {
     /// matrix-free callers route through this method rather than carrying
     /// their own softmax.
     pub fn softmax_with_baseline(eta_active: &[f64], out: &mut [f64]) {
-        debug_assert_eq!(out.len(), eta_active.len() + 1);
+        assert_eq!(out.len(), eta_active.len() + 1);
         let mut max_eta = 0.0_f64;
         for &v in eta_active {
             if v > max_eta {

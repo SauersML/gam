@@ -2545,7 +2545,7 @@ impl SaeManifoldTerm {
                         // RowPrecisionPrior, ScadMcp, Isometry) target the
                         // "t" latent block (n_obs × d) and apply per atom
                         // — accumulate into the corresponding row offsets.
-                        debug_assert!(
+                        assert!(
                             sae_penalty_is_row_block_supported(penalty),
                             "validate_analytic_penalty_registry should have \
                              refused non-row-block Psi-tier penalty {:?} \
