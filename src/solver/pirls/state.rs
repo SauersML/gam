@@ -2,13 +2,12 @@ use crate::construction::ReparamResult;
 use crate::estimate::EstimationError;
 use crate::matrix::{DesignMatrix, ReparamOperator, SymmetricMatrix};
 use crate::solver::active_set::{ConstraintKktDiagnostics, LinearInequalityConstraints};
-use crate::types::{Coefficients, GlmLikelihoodSpec, InverseLink, LinearPredictor, RidgePassport, RidgePolicy};
+use crate::types::{Coefficients, GlmLikelihoodSpec, InverseLink, LinearPredictor, RidgePassport};
 use ndarray::{Array1, Array2, ArrayView1};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use super::{
-    FirthDenseOperator, HessianCurvatureKind, WorkingModelPirlsResult, WorkingModelPirlsOptions,
     compute_observed_hessian_curvature_arrays, computeworkingweight_derivatives_from_eta,
 };
 

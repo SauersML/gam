@@ -410,6 +410,20 @@ pub struct FamilyLinearizationState<'a> {
     /// builder use the channel-stacked Fisher information instead of the
     /// scalar-weight approximation.  Single-output families leave this `None`.
     pub channel_hessian: Option<Arc<dyn FamilyChannelHessian>>,
+    /// Probit frailty scale factor `s_f = 1/√(1+σ²)`.
+    ///
+    /// For survival marginal-slope families the logslope η contribution is
+    /// `s_f · g · z`, so any Jacobian callback that depends on g or z must
+    /// read `s_f` from here rather than from a captured-at-construction value.
+    /// When σ = 0 (no frailty) or for non-frailty families, set this to 1.0.
+    ///
+    /// Since σ is always **fixed** (not jointly optimised with β) in the
+    /// survival family, `s_f` is a static scalar for the entire inner fit;
+    /// `∂s_f/∂σ` never appears in the β-Jacobian.  The field is nonetheless
+    /// carried through state so that Jacobian callbacks are not required to
+    /// capture `s_f` at spec-construction time — they can read it at
+    /// evaluation time and thus stay correct across outer-loop σ updates.
+    pub probit_frailty_scale: f64,
 }
 
 /// β-dependent Jacobian callback for a parameter block.
@@ -585,6 +599,7 @@ impl ParameterBlockSpec {
             beta: &zeros,
             family_scalars: None,
             channel_hessian: None,
+            probit_frailty_scale: 1.0,
         };
         self.effective_jacobian_at(caller, &state)
     }

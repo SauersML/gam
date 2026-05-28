@@ -16,12 +16,13 @@
 //! If a test fails because the underlying GPU PIRLS fix has not yet landed,
 //! leave it as-is — it documents the gating contract.
 
+mod common;
+use common::gpu_gate::{GpuGate, gpu_gate};
 use faer::Side;
 use gam::construction::CanonicalPenalty;
 use gam::estimate::PenaltySpec;
 use gam::faer_ndarray::{FaerArrayView, FaerColView, factorize_symmetricwith_fallback};
 use gam::pirls::{PenaltyConfig, PirlsConfig, PirlsProblem, PirlsStatus, fit_model_for_fixed_rho};
-use gam::solver::gpu::cuda_selected;
 use gam::types::{
     GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LogSmoothingParamsView, ResponseFamily,
     StandardLink,
@@ -104,7 +105,7 @@ fn allclose(a: &Array1<f64>, b: &Array1<f64>, tol: f64) -> bool {
 // ---------------------------------------------------------------------------
 #[test]
 fn gpu_pirls_gating_1_newton_sign_gaussian_direction() {
-    if !cuda_selected() {
+    if let GpuGate::Skip = gpu_gate("gpu_pirls_gating_1_newton_sign_gaussian_direction") {
         return;
     }
 
@@ -186,7 +187,7 @@ fn gpu_pirls_gating_1_newton_sign_gaussian_direction() {
 // ---------------------------------------------------------------------------
 #[test]
 fn gpu_pirls_gating_2_penalty_gradient_sign_and_shift() {
-    if !cuda_selected() {
+    if let GpuGate::Skip = gpu_gate("gpu_pirls_gating_2_penalty_gradient_sign_and_shift") {
         return;
     }
 

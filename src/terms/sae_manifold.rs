@@ -3056,6 +3056,68 @@ impl SaeManifoldTerm {
     }
 }
 
+/// [`crate::families::custom_family::BlockEffectiveJacobian`] for one SAE
+/// decoder atom.
+///
+/// Computes `∂η / ∂β_k` where `β_k` are the decoder coefficients `B_k`
+/// (flattened row-major: `β_k[m·p + out] = B_k[m, out]`).
+///
+/// ## Shape
+///
+/// The returned matrix has shape `(n·p, M_k·p)`.  Entry
+/// `[i·p + out,  m·p + out] = a_ik · Φ_k[i, m]` (block-diagonal in `out`).
+///
+/// ## Construction
+///
+/// Built by [`SaeManifoldTerm::decoder_parameter_block_specs`] from a
+/// snapshot of the current assignment weights and basis evaluations.  The
+/// snapshot is β-independent at fixed latent coordinates and assignments;
+/// mid-fit callers should rebuild after each coordinate/assignment update.
+#[derive(Debug, Clone)]
+pub struct SaeDecoderBlockJacobian {
+    /// Zero-based index of this atom in the parent term.
+    pub atom_idx: usize,
+    /// `Φ_k(t_{·k})`, shape `(n, M_k)`.
+    pub basis_values: Array2<f64>,
+    /// `a_{·k}` — per-row assignment weight for this atom, length `n`.
+    pub assignments_col: Array1<f64>,
+    /// `p` — decoder output dimension (= K for the channel-aware audit).
+    pub n_outputs: usize,
+    /// `M_k · p` — total beta columns for this atom.
+    pub n_beta_cols: usize,
+}
+
+impl crate::families::custom_family::BlockEffectiveJacobian for SaeDecoderBlockJacobian {
+    fn effective_jacobian_at(
+        &self,
+        _state: &crate::families::custom_family::FamilyLinearizationState<'_>,
+    ) -> Result<Array2<f64>, String> {
+        let n = self.basis_values.nrows();
+        let m = self.basis_values.ncols();
+        let p = self.n_outputs;
+        // Shape: (n·p, M_k·p).
+        let mut jac = Array2::<f64>::zeros((n * p, m * p));
+        for row in 0..n {
+            let a_k = self.assignments_col[row];
+            for basis_col in 0..m {
+                let phi = self.basis_values[[row, basis_col]];
+                let scale = a_k * phi;
+                if scale == 0.0 {
+                    continue;
+                }
+                for out in 0..p {
+                    jac[[row * p + out, basis_col * p + out]] = scale;
+                }
+            }
+        }
+        Ok(jac)
+    }
+
+    fn n_outputs(&self) -> usize {
+        self.n_outputs
+    }
+}
+
 fn sae_manifold_newton_directional_decrease(
     sys: &ArrowSchurSystem,
     delta_ext_coord: ArrayView1<'_, f64>,
