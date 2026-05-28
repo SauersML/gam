@@ -74,8 +74,7 @@ jobs:
                  gam CLI, gradient-vs-finite-difference, REML monotonicity,
                  whatever fits the bug. Not a snapshot of a number, not a
                  tautology. When the bug is fixed, the test should start
-                 passing without further edits. (CI on main going red is
-                 the forcing function — that's intentional.)
+                 passing without further edits.
               2. File a GitHub issue describing what's wrong, how to
                  reproduce it, what you observed vs what you expected, and
                  your best read of why it's happening (point at files and
@@ -84,8 +83,9 @@ jobs:
 
             Everything stays on `main`. No new branches, no PRs, no
             worktrees, no destructive git. The maintainer wants failing
-            tests + issues piling up faster than they can be fixed; resist
-            the temptation to patch — the failing test IS the deliverable.
+            tests + issues piling up faster than they can be fixed —
+            resist the temptation to patch; the failing test IS the
+            deliverable.
 
             ## You decide everything else
 
@@ -98,17 +98,9 @@ jobs:
             parity if a CUDA device shows up (it probably won't on this
             runner — skip rather than fake it).
 
-            No turn budget, no tool restrictions, no required structure
-            for the issue body, no required labels (make any labels you
-            want with `gh label create` if they don't exist). If you need
-            to edit something outside the new test file to make the repro
-            work cleanly — a tiny harness helper, a fixture, whatever — go
-            ahead; just keep it honest and don't slide into fixing the
-            actual bug. Everything commits to `main` directly.
-
             If you genuinely can't find anything real this run, that's a
-            fine outcome. Say so in the workflow log and exit. Don't ship a
-            contrived issue to look productive.
+            fine outcome. Say so in the workflow log and exit. Don't ship
+            a contrived issue to look productive.
 
             Have fun with it. The math here is unusually rich; pick
             something that's actually interesting to dig into.
