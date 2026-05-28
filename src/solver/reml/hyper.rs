@@ -84,7 +84,11 @@ struct TauTauPairHyperOperator {
     x_tau_tau: Option<TauTauDesignTerm>,
     x_design: std::sync::Arc<DesignMatrix>,
     basis: TauPairBasis,
-    w_diag: std::sync::Arc<Array1<f64>>,
+    // Observed-Hessian working weights are signed for non-canonical links;
+    // typed at the struct boundary via `SignedWeightsArc` so the residual
+    // implicit-sign gap the function-boundary `SignedWeightsView` cannot
+    // reach (the cached Arc that survives between mul_vec calls) is closed.
+    w_diag: crate::matrix::SignedWeightsArc,
     c_x_tau_i_beta: Option<Array1<f64>>,
     c_x_tau_j_beta: Option<Array1<f64>>,
     d_cross: Option<Array1<f64>>,
@@ -835,7 +839,7 @@ impl<'a> RemlState<'a> {
         x_tau_beta_list: std::sync::Arc<Vec<Array1<f64>>>,
         x_tau_tau: std::sync::Arc<Vec<Vec<Option<TauTauDesignTerm>>>>,
         u: std::sync::Arc<Array1<f64>>,
-        w_diag: std::sync::Arc<Array1<f64>>,
+        w_diag: crate::matrix::SignedWeightsArc,
         c_array: std::sync::Arc<Array1<f64>>,
         d_array: std::sync::Arc<Array1<f64>>,
         p_dim: usize,
@@ -926,7 +930,7 @@ impl<'a> RemlState<'a> {
                         x_tau_tau: x_tau_tau[i][j].clone(),
                         x_design: std::sync::Arc::clone(&x_design),
                         basis: basis.clone(),
-                        w_diag: std::sync::Arc::clone(&w_diag),
+                        w_diag: w_diag.clone(),
                         c_x_tau_i_beta: (!is_gaussian_identity).then_some(c_x_tau_i_beta.clone()),
                         c_x_tau_j_beta,
                         d_cross,
