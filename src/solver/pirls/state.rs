@@ -48,6 +48,26 @@ impl FirthDiagnostics {
     }
 }
 
+/// Which information matrix the penalized Hessian carries at the current
+/// PIRLS iterate.
+///
+/// Canonical links (logit-Binomial, log-Poisson) have W_obs == W_Fisher, so
+/// the two choices coincide. Non-canonical links (probit, cloglog, mixture,
+/// flexible, Gamma-log, ...) need observed information W_obs = W_Fisher -
+/// (y - mu) * B for the outer REML/Laplace log|H| and trace terms to be
+/// exact; Fisher weights alone yield a PQL-type surrogate. We fall back to
+/// `Fisher` only when the observed-information Hessian fails the
+/// positive-definiteness check, since the inner Newton step must be SPD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HessianCurvatureKind {
+    /// Expected (Fisher) information: W_Fisher = h'^2 / (phi * V(mu)).
+    /// Used as the inner iteration matrix when observed curvature fails (non-SPD).
+    Fisher,
+    /// Observed information: W_obs = W_Fisher - (y - mu) * B.
+    /// Required for the outer REML log|H| and trace terms (exact Laplace).
+    Observed,
+}
+
 /// The exported Laplace curvature kind used for the outer REML criterion.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ExportedLaplaceCurvature {
