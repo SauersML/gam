@@ -399,6 +399,39 @@ extern "C" __global__ void chol_logdet_col_major(
         }
     }
 
+    /// Upload a new `Qs` matrix (p×p, row-major host) to `ws.qs_dev`.
+    /// Call once per ρ / σ point before calling `pirls_loop` or any step
+    /// function. When no reparameterisation is active, pass the identity.
+    pub(super) fn upload_qs(
+        ws: &mut SigmaPirlsGpuWorkspace,
+        qs: ArrayView2<'_, f64>,
+    ) -> Result<(), String> {
+        let p = ws.p;
+        if qs.dim() != (p, p) {
+            return Err(format!(
+                "upload_qs: Qs shape {:?} != ({p},{p})",
+                qs.dim()
+            ));
+        }
+        let qs_col = to_col_major(&qs);
+        ws.stream
+            .memcpy_htod(qs_col.as_ref(), &mut ws.qs_dev)
+            .map_err(|e| format!("upload Qs: {e}"))
+    }
+
+    /// Upload an identity `Qs` (no reparameterisation) for the current ρ point.
+    pub(super) fn upload_qs_identity(ws: &mut SigmaPirlsGpuWorkspace) -> Result<(), String> {
+        let p = ws.p;
+        let pp = p * p;
+        let mut qs_host = vec![0.0_f64; pp];
+        for i in 0..p {
+            qs_host[i * p + i] = 1.0;
+        }
+        ws.stream
+            .memcpy_htod(&qs_host, &mut ws.qs_dev)
+            .map_err(|e| format!("upload Qs identity: {e}"))
+    }
+
     /// Drive one PIRLS Newton step on the workspace's CUDA stream.
     ///
     /// Math is identical to [`solve_step`]: build `H = XᵀWX + S + λI`,
@@ -2007,15 +2040,24 @@ extern "C" __global__ void status_or(
         )
     }
 
-    /// Internal carrier for the four scalar diagnostics tracked
-    /// across the inner Newton loop. Surfaced verbatim on
-    /// `PirlsLoopOutcome` so the dispatch wirer's plumbing to
-    /// `WorkingModelPirlsResult` is a direct field copy.
+    /// Internal carrier for the scalar diagnostics tracked across the
+    /// inner Newton loop. Surfaced verbatim on `PirlsLoopOutcome` so the
+    /// dispatch wirer's plumbing to `WorkingModelPirlsResult` is a
+    /// direct field copy.
+    ///
+    /// `step_search_exhausted` is the GPU mirror of the CPU oracle's
+    /// `PirlsStatus::LmStepSearchExhausted` signal: the line-search
+    /// halving ladder produced no step that lowered the *penalized*
+    /// objective. When true, `build_loop_outcome` promotes the emitted
+    /// status accordingly so the outer REML / LM controller can raise
+    /// damping or fail the iteration cleanly instead of being handed a
+    /// silently non-descent step.
     struct LoopDiagnostics {
         last_deviance_change: f64,
         last_step_halving: usize,
         last_step_size: f64,
         min_deviance: f64,
+        step_search_exhausted: bool,
     }
 
     /// Build a full-surface [`PirlsLoopOutcome`] from the loop's

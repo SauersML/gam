@@ -1831,6 +1831,12 @@ fn solve_row_source_for(family: PirlsRowFamily, curvature: CurvatureMode) -> Str
         CurvatureMode::Fisher => "#define PIRLS_CURVATURE_FISHER 1",
         CurvatureMode::Observed => "#define PIRLS_CURVATURE_OBSERVED 1",
     };
+    // GammaLog solve kernel also takes `double shape` after `prior_w`.
+    let shape_param = if matches!(family, PirlsRowFamily::GammaLog) {
+        "    double         shape,\n"
+    } else {
+        ""
+    };
     format!(
         r#"
 {curvature_define}
@@ -1841,7 +1847,7 @@ extern "C" __global__ void {kernel_name}(
     const double* __restrict__ eta,
     const double* __restrict__ y,
     const double* __restrict__ prior_w,
-    double* __restrict__ grad_eta_out,
+{shape_param}    double* __restrict__ grad_eta_out,
     double* __restrict__ w_solver_out,
     double* __restrict__ deviance_out,
     unsigned int* __restrict__ status_out
