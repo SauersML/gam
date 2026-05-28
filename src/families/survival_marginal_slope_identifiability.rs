@@ -226,6 +226,31 @@ fn psd_clamp_4x4(m: &Array2<f64>) -> Array2<f64> {
     out
 }
 
+/// Evaluate the survival marginal-slope row NLL at the given primary-state
+/// and data scalars.
+///
+/// This is a thin public wrapper around the crate-private
+/// `row_primary_for_compiler` for use in integration tests that
+/// finite-difference the NLL to verify `SurvivalRowHessian`.
+///
+/// Returns `(nll, grad[4], hess[4][4])` on the stack. See
+/// `row_primary_closed_form` for the complete derivation.
+pub fn survival_row_nll_grad_hess(
+    q0: f64,
+    q1: f64,
+    qd1: f64,
+    g: f64,
+    z: f64,
+    w: f64,
+    d: f64,
+    derivative_guard: f64,
+    probit_scale: f64,
+) -> Result<(f64, [f64; 4], [[f64; 4]; 4]), String> {
+    crate::families::survival_marginal_slope::row_primary_for_compiler(
+        q0, q1, qd1, g, z, w, d, derivative_guard, probit_scale,
+    )
+}
+
 /// Row Jacobian operator for the survival time block. Channels (q0, q1,
 /// qd1) come from the three time designs; the g channel is zero.
 pub struct TimeBlockOperator {

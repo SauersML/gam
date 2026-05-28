@@ -133,7 +133,7 @@ fn simulate_events_from_truth(
     true_slopes: &[f64; K],
     covariance: &MarginalSlopeCovariance,
 ) -> SimData {
-    let mut state = seed ^ 0xD1B5_4A32_D192_ED03;
+    let mut rng = Splitmix64::new(seed ^ 0xD1B5_4A32_D192_ED03);
     let mut z = Array2::<f64>::zeros((N, K));
     let mut q0 = Array1::<f64>::zeros(N);
     let mut q1 = Array1::<f64>::zeros(N);
@@ -141,15 +141,15 @@ fn simulate_events_from_truth(
     let mut event = Array1::<f64>::zeros(N);
 
     for i in 0..N {
-        let (g1, g2) = next_gauss_pair(&mut state);
+        let (g1, g2) = rng.next_gauss_pair();
         z[[i, 0]] = g1;
         z[[i, 1]] = g2;
 
-        let (gq, _) = next_gauss_pair(&mut state);
+        let (gq, _) = rng.next_gauss_pair();
         let base = 0.25 * gq;
         q0[i] = base - 0.6;
         q1[i] = base + 0.6;
-        qd1[i] = 0.7 + 0.1 * next_unit(&mut state);
+        qd1[i] = 0.7 + 0.1 * rng.next_unit();
 
         let z_row = [z[[i, 0]], z[[i, 1]]];
         let eta1 = survival_marginal_slope_vector_eta(
@@ -166,11 +166,7 @@ fn simulate_events_from_truth(
         let censor_score = normal_cdf(-eta1);
         let p_event = (event_score / (event_score + censor_score)).clamp(0.0, 1.0);
 
-        event[i] = if next_unit(&mut state) < p_event {
-            1.0
-        } else {
-            0.0
-        };
+        event[i] = if rng.next_unit() < p_event { 1.0 } else { 0.0 };
     }
     SimData {
         z,

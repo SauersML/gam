@@ -3,9 +3,6 @@ use super::family::*;
 use super::gradient_paths::*;
 use super::install_flex::validate_spec;
 
-    }
-}
-
 // ── BlockEffectiveJacobian impls for BMS ─────────────────────────────────────
 //
 // BMS has a single Bernoulli output per row (n_outputs = 1). The observed η is

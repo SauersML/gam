@@ -10,7 +10,7 @@
 //! surface that includes the constant (parametric intercept) column,
 //! while the time block carries its own structural baseline. The shared
 //! constant forces the V+M compile to drop at least one column, which
-//! triggers the `[smgs phase-4b active] applying per-term V: ...` log
+//! triggers the `[smgs phase-4b compiled-map] applying CompiledMap T: ...` log
 //! line in `src/families/survival_marginal_slope.rs`.
 //!
 //! Hard contract (see teammate brief):
@@ -182,13 +182,16 @@ fn survival_marginal_slope_v_plus_m_exact_engages_and_lifts_beta_to_raw_width() 
     );
 
     let logs = log_sink().snapshot();
-    let active_marker = "[smgs phase-4b active] applying per-term V:";
-    let active_seen = logs.iter().any(|line| line.contains(active_marker));
+    // After T13's channel-aware Gram migration the closed-form
+    // `compile_from_raw_grams` path handles the shared-constant alias.
+    // The compiled-map log line proves the closed-form cutover engaged.
+    let compiled_map_marker = "[smgs phase-4b compiled-map] applying CompiledMap T:";
+    let compiled_map_seen = logs.iter().any(|line| line.contains(compiled_map_marker));
     assert!(
-        active_seen,
-        "expected log line containing {:?}; this proves the V+M cutover engaged. \
-         Captured {} log lines.",
-        active_marker,
+        compiled_map_seen,
+        "expected log line containing {:?}; this proves the closed-form \
+         compiled-map cutover engaged. Captured {} log lines.",
+        compiled_map_marker,
         logs.len(),
     );
 
