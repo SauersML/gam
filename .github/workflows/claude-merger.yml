@@ -54,7 +54,8 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           claude_args: >-
             --model claude-opus-4-7
-            --permission-mode bypassPermissions
+            --dangerously-skip-permissions
+            --allowedTools "Bash,Edit,Read,Write,Glob,Grep,WebFetch,WebSearch,TodoWrite,Task,NotebookEdit,KillBash,BashOutput"
           additional_permissions: |
             actions: read
           prompt: |
