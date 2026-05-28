@@ -357,7 +357,7 @@ fn cross_block_alias_with_distinct_priorities_is_not_fatal() {
             initial_log_lambdas: Array1::<f64>::zeros(0),
             initial_beta: None,
             gauge_priority: 120,
-            eta_row_scaling: Some(z_primary.clone()),
+            row_scaling: Some(z_primary.as_slice().into()),
         };
         let specs_with_z_scaling = [
             make_spec("time_surface", time, 200),
