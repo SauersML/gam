@@ -914,6 +914,29 @@ extern "C" __global__ void chol_logdet_col_major(
             geam_add(&ws.blas, &ws.stream, p, &ws.xtwx_dev, &ws.penalty_dev, &mut ws.h_dev)?;
         }
 
+        // RHS correction: rhs = Xᵀ·score − S·β + linear_shift (#257, #260).
+        // Download p-vectors rhs and β; compute S·β on host (S = penalty_hessian);
+        // add linear_shift; re-upload corrected rhs before the Cholesky solve.
+        let rhs_raw = ws
+            .stream
+            .clone_dtoh(&ws.rhs_dev)
+            .map_err(|e| format!("download rhs for correction (inplace): {e}"))?;
+        let beta_raw_corr = ws
+            .stream
+            .clone_dtoh(input.beta_dev)
+            .map_err(|e| format!("download beta for correction (inplace): {e}"))?;
+        let mut rhs_host = Array1::from_vec(rhs_raw);
+        let beta_host_corr = Array1::from_vec(beta_raw_corr);
+        let s_beta = input.penalty_hessian.dot(&beta_host_corr);
+        rhs_host -= &s_beta;
+        rhs_host += &input.linear_shift;
+        ws.stream
+            .memcpy_htod(
+                rhs_host.as_slice().ok_or("rhs_host not contiguous")?,
+                &mut ws.rhs_dev,
+            )
+            .map_err(|e| format!("re-upload corrected rhs (inplace): {e}"))?;
+
         // Factor H_step in-place (ws.h_dev <- Cholesky factor).
         potrf_in_place_reuse(
             &ws.solver,
@@ -925,7 +948,7 @@ extern "C" __global__ void chol_logdet_col_major(
             &mut ws.potrf_info_dev,
         )?;
 
-        // Solve H·d = g in-place (ws.rhs_dev <- H^-1·g).
+        // Solve H·δ = rhs — ws.rhs_dev <- H⁻¹·rhs = δ, the descent direction.
         potrs_in_place_reuse(
             &ws.solver,
             &ws.stream,
@@ -943,24 +966,8 @@ extern "C" __global__ void chol_logdet_col_major(
         check_deferred_potrf_info(&ws.stream, &ws.potrf_info_dev)?;
         check_deferred_potrs_info(&ws.stream, &ws.potrs_info_dev)?;
 
-        // Negate ws.rhs_dev in-place on device: direction <- -H^-1·g.
-        const NEG_THREADS: u32 = 256;
-        let p_i_neg = to_i32(p)?;
-        let p_u = u32::try_from(p).map_err(|_| format!("negate p={p} > u32"))?;
-        let grid = p_u.div_ceil(NEG_THREADS).max(1);
-        let cfg_neg = LaunchConfig {
-            grid_dim: (grid, 1, 1),
-            block_dim: (NEG_THREADS, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let mut builder = ws.stream.launch_builder(negate_func);
-        builder.arg(&mut ws.rhs_dev);
-        builder.arg(&p_i_neg);
-        // SAFETY: negate_n signature is (double*, int); ws.rhs_dev has length p.
-        unsafe { builder.launch(cfg_neg) }
-            .map(|_event| ())
-            .map_err(|e| format!("negate_n launch (inplace): {e}"))?;
-
+        // ws.rhs_dev holds the Newton descent direction δ = H⁻¹·rhs.
+        // No negation: the corrected RHS already gives the descent direction (#257).
         Ok(logdet)
     }
 
