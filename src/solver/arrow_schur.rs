@@ -2643,12 +2643,14 @@ fn arrow_gradient_dot_step(
     delta_t: ArrayView1<'_, f64>,
     delta_beta: ArrayView1<'_, f64>,
 ) -> f64 {
-    assert_eq!(delta_t.len(), sys.rows.len() * sys.d);
+    assert_eq!(delta_t.len(), sys.row_offsets[sys.rows.len()]);
     assert_eq!(delta_beta.len(), sys.k);
     let mut out = 0.0;
     for (i, row) in sys.rows.iter().enumerate() {
-        for c in 0..sys.d {
-            out += row.gt[c] * delta_t[i * sys.d + c];
+        let di = sys.row_dims[i];
+        let row_base = sys.row_offsets[i];
+        for c in 0..di {
+            out += row.gt[c] * delta_t[row_base + c];
         }
     }
     for a in 0..sys.k {

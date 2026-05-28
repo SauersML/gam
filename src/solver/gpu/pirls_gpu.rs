@@ -802,11 +802,12 @@ extern "C" __global__ void chol_logdet_col_major(
         })
     }
 
-    /// In-place variant of [`solve_step_on_stream_device`] for the PIRLS loop.
+    /// In-place Newton step using the resident-X architecture (#269).
     ///
-    /// Assembles `H = XᵀWX + S + step_lm_lambda·I`, factors with POTRF,
-    /// solves `H·d = g` with POTRS — but skips both the XᵀWX download and
-    /// the post-solve direction download. On return:
+    /// A=X_origᵀ W X_orig; H=QsᵀAQs+S+λI; rhs=Qsᵀ(X_origᵀ score)+linear_shift.
+    /// POTRF+POTRS in-place, logdet, negate → direction in ws.rhs_dev.
+    ///
+    /// On return:
     ///
     /// - `ws.h_dev` holds the Cholesky factor (overwritten by POTRF).
     ///   Do not read it as a Hessian until rebuilt via `rebuild_h_final`.
