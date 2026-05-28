@@ -15,8 +15,8 @@
 //! linkwiggle on both formulas) at n = 400 and centers = 4 to keep RAM
 //! safe, and asserts:
 //!   * the fit converges (`outer_converged == true`),
-//!   * the V+M log line `[smgs phase-4b active] applying per-term V: ...`
-//!     fires with at least one drop reported,
+//!   * the V+M log line `[smgs phase-4b compiled-map] applying CompiledMap T: ...`
+//!     fires with at least one drop reported (closed-form channel-aware path),
 //!   * fitted β block widths still match RAW design widths (T-lift ran),
 //!   * every β coefficient is finite,
 //!   * predictions on training rows are finite.
@@ -191,27 +191,27 @@ fn survival_marginal_slope_biobank_repro_vm_exact_engages_and_converges() {
     );
 
     let logs = log_sink().snapshot();
-    let active_marker = "[smgs phase-4b active] applying per-term V:";
-    let active_lines: Vec<&String> = logs
+    // After T13's channel-aware Gram migration, the closed-form path
+    // handles the shared-column alias. Assert the compiled-map log fires.
+    let compiled_map_marker = "[smgs phase-4b compiled-map] applying CompiledMap T:";
+    let compiled_map_lines: Vec<&String> = logs
         .iter()
-        .filter(|line| line.contains(active_marker))
+        .filter(|line| line.contains(compiled_map_marker))
         .collect();
     assert!(
-        !active_lines.is_empty(),
-        "expected log line containing {:?}; this proves the V+M cutover engaged on \
-         the biobank-shape formula. Captured {} log lines.",
-        active_marker,
+        !compiled_map_lines.is_empty(),
+        "expected log line containing {:?}; this proves the closed-form compiled-map \
+         cutover engaged on the biobank-shape formula. Captured {} log lines.",
+        compiled_map_marker,
         logs.len(),
     );
 
-    // The active marker reports `drops_by_block`; at least one block
-    // must report a non-zero drop on this duplicated-duchon shape, or
-    // the test isn't actually exercising the V+M reduction.
-    let saw_drop = active_lines.iter().any(|line| {
-        if let Some(idx) = line.find("drops_by_block") {
+    // The compiled-map log reports per-channel drops; at least one block
+    // must report a non-zero drop on this duplicated-duchon shape.
+    let saw_drop = compiled_map_lines.iter().any(|line| {
+        // Log format: "drops time=N, marginal=M, logslope=P"
+        if let Some(idx) = line.find("drops ") {
             let tail = &line[idx..];
-            // Any non-zero digit (1-9) appearing inside the brackets is
-            // sufficient evidence of a real drop.
             tail.chars().any(|c| matches!(c, '1'..='9'))
         } else {
             false
@@ -219,10 +219,10 @@ fn survival_marginal_slope_biobank_repro_vm_exact_engages_and_converges() {
     });
     assert!(
         saw_drop,
-        "no V+M log line reported a non-zero drop on the duplicated-duchon biobank \
-         repro; captured {} active lines, e.g. {:?}",
-        active_lines.len(),
-        active_lines.first()
+        "no compiled-map log line reported a non-zero drop on the duplicated-duchon \
+         biobank repro; captured {} compiled-map lines, e.g. {:?}",
+        compiled_map_lines.len(),
+        compiled_map_lines.first()
     );
 
     // After lift, β block widths must match RAW design widths.
