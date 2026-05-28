@@ -26,6 +26,9 @@ use gam::matrix::LinearOperator;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
+
+mod common;
+use common::fixtures::Splitmix64;
 use std::sync::{Arc, Mutex, Once, OnceLock};
 
 const N: usize = 400;
