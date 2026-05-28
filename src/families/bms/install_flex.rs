@@ -196,7 +196,7 @@ fn build_bms_flex_block_context(
 ///   pre-call state (the reparameterisation is never applied) so the
 ///   caller can safely discard it.
 #[derive(Debug)]
-pub(crate) enum FlexCompileOutcome {
+pub enum FlexCompileOutcome {
     Reparameterised,
     FullyAliased { reason: String },
 }
