@@ -498,38 +498,27 @@ pub fn try_device_moment_reduce(
     }
 }
 
-/// P7 (#32) — batched sigma-point evaluation in a single kernel launch
-/// per family.
+/// P7 (#32) — batched sigma-point packaging for the P6 moment reducer.
 ///
-/// For batches where `p` is small and `M` (number of sigma points) is
-/// large, the per-launch driver overhead of the P5 one-stream-per-point
-/// fan-out dominates the actual row work.  This entry fuses every sigma
-/// point in `batch` into a single 2-D grid launch sized
-/// `(grid_x = ceil(N / threads), grid_y = M)` per family, so the launcher
-/// pays one JIT lookup + one grid setup for the whole cubature pass.
+/// For batches where `p ≤ BATCHED_DISPATCH_MAX_P` and
+/// `M ≥ BATCHED_DISPATCH_MIN_M`, packages all pre-computed
+/// `(hessian_inv, beta)` pairs from `batch` into `Vec<DeviceSigmaPoint>`
+/// in a single pass, ready for [`try_device_moment_reduce`] (P6).
 ///
-/// The kernel ABI follows the same per-row family contract as
-/// [`crate::gpu::pirls_row::launch_row_reweight_on_stream`]; only the input
-/// pointers are strided by `M`. Each block reads its sigma index from
-/// `blockIdx.y` and indexes into the `(M, N)`-strided `eta` / output
-/// buffers.
+/// The primary GPU sigma-cubature path is [`try_gpu_sigma_stream_pool_eval`]
+/// (full PIRLS on device); this entry handles the complementary case where
+/// the caller already has IRLS state and wants the on-device P6 reduction.
 ///
-/// Returns `Ok(Some(vec_of_pairs))` on success, `Ok(None)` when device
-/// unavailable or `M` falls below the batched-dispatch breakeven
-/// ([`BATCHED_DISPATCH_MIN_M`]), `Err(_)` on driver / shape failure.
+/// Returns `Ok(None)` when device unavailable, `M < BATCHED_DISPATCH_MIN_M`,
+/// or `p > BATCHED_DISPATCH_MAX_P`. `Err(_)` on shape failure.
 pub fn try_device_sigma_eval_batched(
     batch: &SigmaCubatureBatch<'_>,
 ) -> Result<Option<Vec<DeviceSigmaPoint>>, GpuError> {
     let (_n_rows, p) = batch.check_shape()?;
     if batch.m() < BATCHED_DISPATCH_MIN_M {
-        // Below breakeven the per-stream P5 path wins. Decline so the
-        // caller falls through to it (which itself may decline if Stage 3
-        // is not yet ready).
+        // Below breakeven the per-stream P5 path wins.
         return Ok(None);
     }
-    // Above the breakeven, the batched dispatch is the only on-device
-    // path that wins against CPU at small p / large M; the small-p ceiling
-    // protects against the register-pressure cliff in the fused kernel.
     if p > BATCHED_DISPATCH_MAX_P {
         return Ok(None);
     }
@@ -539,12 +528,18 @@ pub fn try_device_sigma_eval_batched(
         if !super::runtime::GpuRuntime::is_available() {
             return Ok(None);
         }
-        // Same upstream gate as P5: until the device-resident outer PIRLS
-        // is wired, the batched launch has no `β̂_m` to download.  Once
-        // the gate flips, `linux::sigma_eval_batched_linux` becomes the
-        // entry — it composes the fused per-family launch with the P6
-        // reducer and a single device→host transfer for the final V̂_p.
-        Ok(None)
+        // Package all pre-computed `(H_m⁻¹, β̂_m)` pairs so the caller can
+        // pass them directly to `try_device_moment_reduce` (P6). The fused
+        // 2-D grid launch for raw PIRLS (the original P7 design) is superseded
+        // by `try_gpu_sigma_stream_pool_eval` which dispatches full PIRLS on
+        // N_streams concurrent streams; P7 batching here refers to the
+        // packaging optimisation for the P6 reducer path.
+        let points: Vec<DeviceSigmaPoint> = batch
+            .points
+            .iter()
+            .map(|pt| (pt.hessian_inv.to_owned(), pt.beta.to_owned()))
+            .collect();
+        Ok(Some(points))
     }
 
     #[cfg(not(target_os = "linux"))]

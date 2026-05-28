@@ -600,6 +600,33 @@ extern "C" __global__ void chol_logdet_col_major(
         // info scalars at end-of-step rather than one per cuSOLVER call.
         check_deferred_potrf_info(&ws.stream, &ws.potrf_info_dev)?;
         check_deferred_potrs_info(&ws.stream, &ws.potrs_info_dev)?;
+
+        // Iterative refinement: one fp64 residual-correction step driven by
+        // the measured solve residual ‖g − H·x‖ / ‖g‖.
+        //
+        // Operates entirely at fp64 using the Cholesky factor already resident
+        // in `h_dev`. The residual is computed on the host (only p-vector
+        // arithmetic; `xtwx_host` was already downloaded). The policy gates
+        // the attempt on `p ≥ REFINEMENT_MIN_P` so the extra POTRS cost is
+        // negligible relative to the factorisation for large systems.
+        let g_slice = input
+            .gradient
+            .as_slice()
+            .ok_or("gradient must be contiguous for refinement")?;
+        let direction_raw = newton_step_refine_once(
+            &ws.solver,
+            &ws.stream,
+            p,
+            ws.potrf_lwork,
+            &ws.h_dev,
+            &mut ws.rhs_dev,
+            &mut ws.potrs_info_dev,
+            direction_raw,
+            g_slice,
+            &penalized_hessian,
+            input.step_lm_lambda,
+        )?;
+
         let mut direction = Array1::from_vec(direction_raw);
         direction.mapv_inplace(|v| -v);
 
@@ -656,78 +683,70 @@ extern "C" __global__ void chol_logdet_col_major(
             ));
         }
 
-        // Form WX = diag(w_solver_dev) · X into ws.wx_dev. We borrow
-        // the caller's device buffer through `left_scale_rows`'s
-        // device_ptr API; no upload.
-        left_scale_rows_borrowed(
-            &ws.blas,
-            &ws.stream,
-            n,
-            p,
-            &shared.x_dev,
-            input.w_solver_dev,
-            &mut ws.wx_dev,
-        )?;
-
-        // XtWX = Xᵀ · WX → ws.xtwx_dev.
+        // Compute XᵀWX and Xᵀ·score.  Fused path (p < threshold): no n*p WX.
+        // Fallback (p >= threshold): ddgmm + dgemm + gemv via wx_dev_fb.
         let n_i = to_i32(n)?;
         let p_i = to_i32(p)?;
-        let gemm_cfg = GemmConfig::<f64> {
-            transa: cublasOperation_t::CUBLAS_OP_T,
-            transb: cublasOperation_t::CUBLAS_OP_N,
-            m: p_i,
-            n: p_i,
-            k: n_i,
-            alpha: 1.0,
-            lda: n_i,
-            ldb: n_i,
-            beta: 0.0,
-            ldc: p_i,
-        };
-        // SAFETY: validated i32 dims; shared.x_dev and ws.wx_dev are n*p
-        // f64 col-major buffers; ws.xtwx_dev is p*p; bound to ws.stream.
-        unsafe {
-            ws.blas
-                .gemm(gemm_cfg, &shared.x_dev, &ws.wx_dev, &mut ws.xtwx_dev)
+        if let Some(ref mut wx_dev_fb) = ws.wx_dev {
+            // Large-p fallback.
+            left_scale_rows_borrowed(
+                &ws.blas, &ws.stream, n, p, &shared.x_dev, input.w_solver_dev, wx_dev_fb,
+            )?;
+            let gemm_cfg = GemmConfig::<f64> {
+                transa: cublasOperation_t::CUBLAS_OP_T,
+                transb: cublasOperation_t::CUBLAS_OP_N,
+                m: p_i,
+                n: p_i,
+                k: n_i,
+                alpha: 1.0,
+                lda: n_i,
+                ldb: n_i,
+                beta: 0.0,
+                ldc: p_i,
+            };
+            // SAFETY: validated dims; shared.x_dev and wx_dev_fb are n*p
+            // f64 col-major; ws.xtwx_dev is p*p; all on ws.stream.
+            unsafe { ws.blas.gemm(gemm_cfg, &shared.x_dev, wx_dev_fb, &mut ws.xtwx_dev) }
+                .map_err(|e| format!("cublas dgemm XtWX (device-input): {e}"))?;
+            let penalty_step = penalty_with_ridge(input.penalty_hessian, input.step_lm_lambda);
+            let penalty_step_col = to_col_major(&penalty_step.view());
+            ws.stream
+                .memcpy_htod(penalty_step_col.as_ref(), &mut ws.penalty_dev)
+                .map_err(|e| format!("upload penalty (device-input): {e}"))?;
+            geam_add(&ws.blas, &ws.stream, p, &ws.xtwx_dev, &ws.penalty_dev, &mut ws.h_dev)?;
+            let gemv_cfg = GemvConfig::<f64> {
+                trans: cublasOperation_t::CUBLAS_OP_T,
+                m: n_i,
+                n: p_i,
+                alpha: 1.0,
+                lda: n_i,
+                incx: 1,
+                beta: 0.0,
+                incy: 1,
+            };
+            // SAFETY: shared.x_dev n*p col-major; grad_eta_dev length n; rhs_dev length p.
+            unsafe {
+                ws.blas.gemv(gemv_cfg, &shared.x_dev, input.grad_eta_dev, &mut ws.rhs_dev)
+            }
+            .map_err(|e| format!("cublas dgemv Xtg (device-input): {e}"))?;
+        } else {
+            // Fused path: row-sweep kernels, no n*p WX buffer.
+            launch_xtwx_lower(
+                &ws.stream, &shared.ctx, n, p,
+                &shared.x_dev, input.w_solver_dev, &mut ws.xtwx_dev,
+            )?;
+            launch_symmetrize_lower(&ws.stream, &shared.ctx, p, &mut ws.xtwx_dev)?;
+            launch_xtscore(
+                &ws.stream, &shared.ctx, n, p,
+                &shared.x_dev, input.grad_eta_dev, &mut ws.rhs_dev,
+            )?;
+            let penalty_step = penalty_with_ridge(input.penalty_hessian, input.step_lm_lambda);
+            let penalty_step_col = to_col_major(&penalty_step.view());
+            ws.stream
+                .memcpy_htod(penalty_step_col.as_ref(), &mut ws.penalty_dev)
+                .map_err(|e| format!("upload penalty (fused device-input): {e}"))?;
+            geam_add(&ws.blas, &ws.stream, p, &ws.xtwx_dev, &ws.penalty_dev, &mut ws.h_dev)?;
         }
-        .map_err(|e| format!("cublas dgemm XtWX (device-input): {e}"))?;
-
-        // Upload S + step_lm_lambda·I for the Newton solve (LM damping only).
-        let penalty_step = penalty_with_ridge(input.penalty_hessian, input.step_lm_lambda);
-        let penalty_step_view = penalty_step.view();
-        let penalty_step_col = to_col_major(&penalty_step_view);
-        ws.stream
-            .memcpy_htod(penalty_step_col.as_ref(), &mut ws.penalty_dev)
-            .map_err(|e| format!("upload penalty (device-input): {e}"))?;
-
-        // H_step = XᵀWX + (S + step_lm_lambda·I) for the Newton solve only.
-        geam_add(
-            &ws.blas,
-            &ws.stream,
-            p,
-            &ws.xtwx_dev,
-            &ws.penalty_dev,
-            &mut ws.h_dev,
-        )?;
-
-        // RHS = Xᵀ · grad_eta_dev → ws.rhs_dev (length p). No host upload.
-        let gemv_cfg = GemvConfig::<f64> {
-            trans: cublasOperation_t::CUBLAS_OP_T,
-            m: n_i,
-            n: p_i,
-            alpha: 1.0,
-            lda: n_i,
-            incx: 1,
-            beta: 0.0,
-            incy: 1,
-        };
-        // SAFETY: shared.x_dev is n*p col-major; input.grad_eta_dev is
-        // length n; ws.rhs_dev is length p; cuBLAS contract satisfied.
-        unsafe {
-            ws.blas
-                .gemv(gemv_cfg, &shared.x_dev, input.grad_eta_dev, &mut ws.rhs_dev)
-        }
-        .map_err(|e| format!("cublas dgemv Xtg (device-input): {e}"))?;
 
         // Exported penalised Hessian: H_final = XᵀWX + S + objective_ridge·I.
         // Download XᵀWX and add the objective ridge on the host so LM damping
@@ -1852,109 +1871,59 @@ extern "C" __global__ void status_or(
                 &mut loop_ws.xd_dev,
             )?;
 
+            // -- Fused alpha-ladder (candidate-objective mode) ----------------
+            // One kernel launch evaluates eta + alpha_k*xdelta for all k in
+            // ALPHA_LADDER simultaneously, atomically accumulating per-row
+            // deviance into objective_dev[k] and OR-accumulating status flags
+            // into status_dev[k].  A single DtoH of 7+7 scalars selects the
+            // accepted step -- no per-alpha kernel launch, no full row-output
+            // write, no per-alpha host scalar sync.
+            loop_ws
+                .alpha_ladder
+                .zero(&ws.stream)
+                .map_err(|e| format!("ladder zero it={it}: {e}"))?;
+            crate::gpu::pirls_row::launch_alpha_ladder_on_stream(
+                backend,
+                family,
+                curvature,
+                &ws.stream,
+                n,
+                &loop_ws.eta_dev,
+                &loop_ws.xd_dev,
+                &loop_ws.y_dev,
+                &loop_ws.prior_w_dev,
+                &mut loop_ws.alpha_ladder,
+            )
+            .map_err(|e| format!("alpha-ladder it={it}: {e}"))?;
+            let obj_host: Vec<f64> = ws
+                .stream
+                .clone_dtoh(&loop_ws.alpha_ladder.objective_dev)
+                .map_err(|e| format!("ladder dtoh obj it={it}: {e}"))?;
+            let stat_host: Vec<u32> = ws
+                .stream
+                .clone_dtoh(&loop_ws.alpha_ladder.status_dev)
+                .map_err(|e| format!("ladder dtoh stat it={it}: {e}"))?;
+            const FORBIDDEN_LINESEARCH: u32 =
+                crate::gpu::pirls_row::status_flags::INVALID_RESPONSE
+                | crate::gpu::pirls_row::status_flags::ZERO_PRIOR_WEIGHT;
             let mut alpha = 0.0_f64;
             let mut accepted_dev = prev_deviance;
             let mut halving_count: usize = 0;
-            for (ladder_idx, &a) in [1.0_f64, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625]
-                .iter()
-                .enumerate()
-            {
-                ws.stream
-                    .memcpy_dtod(&loop_ws.eta_dev, &mut loop_ws.eta_cand_dev)
-                    .map_err(|e| format!("copy eta→cand: {e}"))?;
-                axpy(
-                    &ws.stream,
-                    &axpy_func,
-                    a,
-                    &loop_ws.xd_dev,
-                    &mut loop_ws.eta_cand_dev,
-                    n,
-                )?;
-                crate::gpu::pirls_row::launch_row_reweight_on_stream(
-                    backend,
-                    family,
-                    curvature,
-                    gamma_shape,
-                    &ws.stream,
-                    n,
-                    &loop_ws.eta_cand_dev,
-                    &loop_ws.y_dev,
-                    &loop_ws.prior_w_dev,
-                    &mut loop_ws.row_out_cand,
-                )
-                .map_err(|e| format!("cand reweight α={a}: {e}"))?;
-                let cand = reduce_scalar(
-                    &ws.stream,
-                    &sum_func,
-                    &loop_ws.row_out_cand.deviance,
-                    n,
-                    &mut loop_ws.scalar_dev,
-                    "cand_dev",
-                )?;
-                // Forbidden status bits: INVALID_RESPONSE means y is
-                // outside the family's support (produces NaN deviance
-                // that can be masked by floating-point cancellation).
-                // ZERO_PRIOR_WEIGHT means a row is structurally invalid.
-                // Either bit means the candidate's arithmetic is bad even
-                // if the summed deviance happens to look finite/lower.
-                let cand_status = reduce_status_or(
-                    &ws.stream,
-                    &status_or_func,
-                    &loop_ws.row_out_cand.status,
-                    n,
-                    &mut loop_ws.status_u32_dev,
-                    "cand_status",
-                )?;
-                const FORBIDDEN_LINESEARCH: u32 =
-                    crate::gpu::pirls_row::status_flags::INVALID_RESPONSE
-                    | crate::gpu::pirls_row::status_flags::ZERO_PRIOR_WEIGHT;
-                if cand.is_finite()
-                    && cand < prev_deviance
-                    && (cand_status & FORBIDDEN_LINESEARCH) == 0
-                {
-                    alpha = a;
-                    accepted_dev = cand;
-                    halving_count = ladder_idx;
+            for (k, (&obj, &st)) in obj_host.iter().zip(stat_host.iter()).enumerate() {
+                if obj.is_finite() && obj < prev_deviance && (st & FORBIDDEN_LINESEARCH) == 0 {
+                    alpha = crate::gpu::pirls_row::ALPHA_LADDER[k];
+                    accepted_dev = obj;
+                    halving_count = k;
                     break;
                 }
             }
             if alpha == 0.0 {
-                // No descent — take α=1 anyway and let outer trust-region adjust.
+                // No descent -- take alpha=1 and let the outer trust-region adapt.
                 alpha = 1.0;
-                ws.stream
-                    .memcpy_dtod(&loop_ws.eta_dev, &mut loop_ws.eta_cand_dev)
-                    .map_err(|e| format!("copy eta→cand fb: {e}"))?;
-                axpy(
-                    &ws.stream,
-                    &axpy_func,
-                    1.0,
-                    &loop_ws.xd_dev,
-                    &mut loop_ws.eta_cand_dev,
-                    n,
-                )?;
-                crate::gpu::pirls_row::launch_row_reweight_on_stream(
-                    backend,
-                    family,
-                    curvature,
-                    gamma_shape,
-                    &ws.stream,
-                    n,
-                    &loop_ws.eta_cand_dev,
-                    &loop_ws.y_dev,
-                    &loop_ws.prior_w_dev,
-                    &mut loop_ws.row_out_cand,
-                )
-                .map_err(|e| format!("cand reweight fb: {e}"))?;
-                accepted_dev = reduce_scalar(
-                    &ws.stream,
-                    &sum_func,
-                    &loop_ws.row_out_cand.deviance,
-                    n,
-                    &mut loop_ws.scalar_dev,
-                    "fb_dev",
-                )?;
+                accepted_dev = obj_host[0];
+                halving_count = 0;
             }
-
+            // Commit accepted step: beta and eta updated in-place.
             axpy(
                 &ws.stream,
                 &axpy_func,
@@ -1963,10 +1932,27 @@ extern "C" __global__ void status_or(
                 &mut loop_ws.beta_dev,
                 p,
             )?;
-            ws.stream
-                .memcpy_dtod(&loop_ws.eta_cand_dev, &mut loop_ws.eta_dev)
-                .map_err(|e| format!("commit eta: {e}"))?;
-            std::mem::swap(&mut loop_ws.row_out, &mut loop_ws.row_out_cand);
+            axpy(
+                &ws.stream,
+                &axpy_func,
+                alpha,
+                &loop_ws.xd_dev,
+                &mut loop_ws.eta_dev,
+                n,
+            )?;
+            // Refresh the 4-output solve-row buffers for the next Newton iter.
+            crate::gpu::pirls_row::launch_solve_row_on_stream(
+                backend,
+                family,
+                curvature,
+                &ws.stream,
+                n,
+                &loop_ws.eta_dev,
+                &loop_ws.y_dev,
+                &loop_ws.prior_w_dev,
+                &mut loop_ws.row_solve,
+            )
+            .map_err(|e| format!("solve-row accepted it={it}: {e}"))?;
 
             let step_norm = alpha.abs() * dir_linf;
             let dev_delta = (prev_deviance - accepted_dev).abs();
@@ -1981,10 +1967,23 @@ extern "C" __global__ void status_or(
             if dir_linf <= tol && step_norm <= tol && dev_delta <= tol * (1.0 + prev_deviance.abs())
             {
                 converged = true;
+                // Final-row mode: write all 9 output fields once at convergence.
+                crate::gpu::pirls_row::launch_row_reweight_on_stream(
+                    backend,
+                    family,
+                    curvature,
+                    &ws.stream,
+                    n,
+                    &loop_ws.eta_dev,
+                    &loop_ws.y_dev,
+                    &loop_ws.prior_w_dev,
+                    &mut loop_ws.row_final,
+                )
+                .map_err(|e| format!("final-row converged: {e}"))?;
                 let h_final = rebuild_h_final(
                     shared,
                     ws,
-                    &loop_ws.row_out.w_hessian,
+                    &loop_ws.row_final.w_hessian,
                     penalty_hessian,
                     objective_ridge,
                 )
@@ -2011,10 +2010,23 @@ extern "C" __global__ void status_or(
             }
         }
 
+        // Final-row mode: write all 9 output fields once at max-iter exit.
+        crate::gpu::pirls_row::launch_row_reweight_on_stream(
+            backend,
+            family,
+            curvature,
+            &ws.stream,
+            n,
+            &loop_ws.eta_dev,
+            &loop_ws.y_dev,
+            &loop_ws.prior_w_dev,
+            &mut loop_ws.row_final,
+        )
+        .map_err(|e| format!("final-row max_iter: {e}"))?;
         let h_final = rebuild_h_final(
             shared,
             ws,
-            &loop_ws.row_out.w_hessian,
+            &loop_ws.row_final.w_hessian,
             penalty_hessian,
             objective_ridge,
         )
@@ -2090,10 +2102,10 @@ extern "C" __global__ void status_or(
     ) -> Result<PirlsLoopOutcome, String> {
         let beta = download_vec(&ws.stream, &loop_ws.beta_dev)?;
         let final_eta = download_vec(&ws.stream, &loop_ws.eta_dev)?;
-        let final_mu = download_vec(&ws.stream, &loop_ws.row_out.mu)?;
-        let final_grad_eta = download_vec(&ws.stream, &loop_ws.row_out.grad_eta)?;
-        let final_w_hessian = download_vec(&ws.stream, &loop_ws.row_out.w_hessian)?;
-        let final_w_solver = download_vec(&ws.stream, &loop_ws.row_out.w_solver)?;
+        let final_mu = download_vec(&ws.stream, &loop_ws.row_final.mu)?;
+        let final_grad_eta = download_vec(&ws.stream, &loop_ws.row_final.grad_eta)?;
+        let final_w_hessian = download_vec(&ws.stream, &loop_ws.row_final.w_hessian)?;
+        let final_w_solver = download_vec(&ws.stream, &loop_ws.row_final.w_solver)?;
 
         // OR-reduce the per-row status flags of the final accepted step.
         // Any INVALID_RESPONSE or ZERO_PRIOR_WEIGHT bit that survived to
@@ -2103,7 +2115,7 @@ extern "C" __global__ void status_or(
         let final_row_status = reduce_status_or(
             &ws.stream,
             status_or_func,
-            &loop_ws.row_out.status,
+            &loop_ws.row_final.status,
             n_rows,
             &mut loop_ws.status_u32_dev,
             "final_row_status",

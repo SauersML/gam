@@ -1950,123 +1950,117 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
     flex_anchors: &[&Array2<f64>],
     training_row_weights: &Array1<f64>,
 ) -> Result<FlexCompileOutcome, String> {
-    use crate::families::bernoulli_marginal_slope::deviation_runtime::AnchorComponentTag;
-    use crate::families::bernoulli_marginal_slope_identifiability::{
-        BernoulliDenseDesignOperator, BernoulliRowHessian,
+    use crate::families::identifiability_compiler::compile;
+    use crate::solver::identifiability_audit::audit_identifiability_channel_aware;
+
+    // Fast path: zero-column candidate carries nothing to residualise.
+    let p_check = candidate
+        .runtime
+        .design(candidate_arg_at_training_rows)?
+        .ncols();
+    if p_check == 0 {
+        return Ok(FlexCompileOutcome::Reparameterised);
+    }
+
+    // Step 1 — spec-builder: validate inputs, densify anchors, stack N_train,
+    // assemble operators + row_hess. Returns None when the anchor union is
+    // empty (no residualisation needed).
+    let ctx = match build_bms_flex_block_context(
+        candidate,
+        candidate_arg_at_training_rows,
+        parametric_anchors,
+        flex_anchors,
+        training_row_weights,
+    )? {
+        None => {
+            // No anchors — the candidate's per-block smoothness-null-space
+            // drop already handles intra-block aliasing.
+            return Ok(FlexCompileOutcome::Reparameterised);
+        }
+        Some(c) => c,
     };
-    use crate::families::identifiability_compiler::{BlockOrder, RowJacobianOperator, compile};
+    let BmsFlexBlockContext {
+        anchor_dense_blocks,
+        anchor_components,
+        n_train,
+        operators,
+        ordering,
+        row_hess,
+        candidate_design_dense: _,
+        n,
+        p_candidate,
+        d_total,
+    } = ctx;
 
-    let candidate_design = candidate.runtime.design(candidate_arg_at_training_rows)?;
-    let n = candidate_design.nrows();
-    let p_candidate = candidate_design.ncols();
-    if p_candidate == 0 {
-        return Ok(FlexCompileOutcome::Reparameterised);
-    }
-    if training_row_weights.len() != n {
-        return Err(format!(
-            "cross-block identifiability: training_row_weights length {} does not match candidate row count {}",
-            training_row_weights.len(),
-            n,
-        ));
-    }
-    for (i, &w) in training_row_weights.iter().enumerate() {
-        if !w.is_finite() || w < 0.0 {
-            return Err(format!(
-                "cross-block identifiability: training_row_weights[{i}] = {w} is not finite/non-negative",
-            ));
+    // Step 2 — audit gate: `audit_identifiability_channel_aware` uses the
+    // structural BMS K=1 row Jacobian to detect full aliasing before any
+    // install. A fatal audit with effective_dim == 0 for the trailing
+    // (candidate) block means every direction in span(C) is reproducible by
+    // the anchor union; return FullyAliased immediately without touching the
+    // runtime.
+    let audit = audit_identifiability_channel_aware(&{
+        // Build minimal ParameterBlockSpec wrappers so the audit can record
+        // block names and column counts. The specs are audit-only; no
+        // penalties or log-lambdas are needed here.
+        let mut specs = Vec::with_capacity(anchor_dense_blocks.len() + 1);
+        for (idx, dense) in anchor_dense_blocks.iter().enumerate() {
+            specs.push(crate::custom_family::ParameterBlockSpec {
+                name: format!("anchor_{idx}"),
+                design: DesignMatrix::Dense(
+                    crate::matrix::DenseDesignMatrix::from(dense.clone()),
+                ),
+                offset: Array1::<f64>::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: Array1::<f64>::zeros(0),
+                initial_beta: None,
+                gauge_priority: 200,
+            });
         }
-    }
-
-    // Stack the anchor designs in the canonical parametric-before-flex
-    // order required by the predict-side reconstruction. Densify each
-    // parametric anchor once into a contiguous `n × p_a` block; flex anchor
-    // matrices are already dense and used as-is.
-    let mut anchor_dense_blocks: Vec<Array2<f64>> = Vec::new();
-    let mut anchor_components: Vec<AnchorComponentTag> = Vec::new();
-    let mut total_anchor_cols = 0usize;
-    for (d, block_tag) in parametric_anchors {
-        if d.nrows() != n {
-            return Err(format!(
-                "cross-block identifiability: parametric anchor has {} rows, candidate has {}",
-                d.nrows(),
-                n,
-            ));
-        }
-        let p_a = d.ncols();
-        if p_a == 0 {
-            continue;
-        }
-        let dense = d
-            .try_to_dense_arc("cross-block parametric anchor")?
-            .as_ref()
-            .clone();
-        anchor_dense_blocks.push(dense);
-        anchor_components.push(AnchorComponentTag::Parametric {
-            block: *block_tag,
-            ncols: p_a,
+        specs.push(crate::custom_family::ParameterBlockSpec {
+            name: "candidate_flex".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                operators
+                    .last()
+                    .ok_or_else(|| {
+                        "cross-block identifiability: operator list is empty after context build"
+                            .to_string()
+                    })?
+                    .evaluate_full()
+                    .slice(ndarray::s![.., .., 0])
+                    .to_owned(),
+            )),
+            offset: Array1::<f64>::zeros(n),
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: Array1::<f64>::zeros(0),
+            initial_beta: None,
+            gauge_priority: 100,
         });
-        total_anchor_cols += p_a;
-    }
-    for a in flex_anchors {
-        if a.nrows() != n {
-            return Err(format!(
-                "cross-block identifiability: flex anchor has {} rows, candidate has {}",
-                a.nrows(),
-                n,
-            ));
-        }
-        let p_a = a.ncols();
-        if p_a == 0 {
-            continue;
-        }
-        anchor_dense_blocks.push((*a).clone());
-        anchor_components.push(AnchorComponentTag::FlexEvaluation { ncols: p_a });
-        total_anchor_cols += p_a;
-    }
-    if total_anchor_cols == 0 {
-        // No anchors to residualise against — the candidate's own per-block
-        // smoothness-null-space drop already handles intra-block aliasing.
-        return Ok(FlexCompileOutcome::Reparameterised);
-    }
+        specs
+    }, &operators, &row_hess)
+    .map_err(|e| format!("cross-block identifiability audit failed: {e}"))?;
 
-    // Stack the anchor dense blocks horizontally into N_train (n × d_total)
-    // for both the install-side anchor row cache and the compiler-input
-    // operator stack below.
-    let d_total = total_anchor_cols;
-    let mut n_train = Array2::<f64>::zeros((n, d_total));
-    {
-        let mut col_offset = 0usize;
-        for block in &anchor_dense_blocks {
-            let bc = block.ncols();
-            n_train
-                .slice_mut(s![.., col_offset..col_offset + bc])
-                .assign(block);
-            col_offset += bc;
+    if audit.fatal {
+        let candidate_block = audit.blocks.last();
+        let effective = candidate_block.map(|b| b.effective_dim).unwrap_or(0);
+        if effective == 0 {
+            let reason = format!(
+                "candidate flex basis ({p_candidate} cols) has zero directions remaining after \
+                 W-metric residualisation against the anchor union ({d_total} anchor cols) at the \
+                 {n} training rows. The channel-aware audit collapses every direction in \
+                 span(C) — every direction in span(C) is reproducible by the anchor union up to \
+                 numerical tolerance. Drop the flex block or remove the anchor term that reproduces \
+                 its argument; knot count is NOT the relevant lever for this failure mode.",
+            );
+            return Ok(FlexCompileOutcome::FullyAliased { reason });
         }
     }
 
-    // Delegate the W-metric Gram + eigendecomposition + V/M extraction to
-    // the family-agnostic identifiability compiler. The compiler runs at K=1
-    // here (BMS row primary state = scalar η) using `BernoulliRowHessian` as
-    // the row metric — there is now exactly ONE math implementation of the
-    // cross-block residualisation in the codebase. Per-anchor designs each
-    // become a single-block `BernoulliDenseDesignOperator`; the candidate is
-    // the trailing block whose `t_lw` and `anchor_correction` the compiler
-    // emits as `CompiledBlock { t_lw: V, anchor_correction: Some(M) }`.
-    let mut operators: Vec<std::sync::Arc<dyn RowJacobianOperator>> =
-        Vec::with_capacity(anchor_dense_blocks.len() + 1);
-    let mut ordering: Vec<BlockOrder> = Vec::with_capacity(anchor_dense_blocks.len() + 1);
-    for dense in &anchor_dense_blocks {
-        operators.push(std::sync::Arc::new(BernoulliDenseDesignOperator::new(
-            dense.clone(),
-        )));
-        ordering.push(BlockOrder::Marginal);
-    }
-    operators.push(std::sync::Arc::new(BernoulliDenseDesignOperator::new(
-        candidate_design.clone(),
-    )));
-    ordering.push(BlockOrder::LinkDev);
-    let row_hess = BernoulliRowHessian::from_row_weights(training_row_weights.clone());
+    // Step 3 — W-metric compile: Gram + eigendecomp → V selector (t_lw) and
+    // anchor-correction M. The compiler runs at K=1 (BMS row primary state =
+    // scalar η) using `BernoulliRowHessian` as the row metric. This is the
+    // single math implementation of the cross-block W-metric residualisation.
     let compiled = compile(&operators, &row_hess, &ordering).map_err(|e| {
         format!(
             "cross-block identifiability: compile failed (n={n}, d_total={d_total}, p_c={p_candidate}): {e}",
@@ -2076,8 +2070,7 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
         .blocks
         .last()
         .ok_or_else(|| "cross-block identifiability: compile returned no blocks".to_string())?;
-    let v_selector = candidate_compiled.t_lw.clone();
-    let k_kept = v_selector.ncols();
+    let k_kept = candidate_compiled.t_lw.ncols();
     if k_kept == 0 {
         let reason = format!(
             "candidate flex basis ({p_candidate} cols) has zero directions remaining after \
@@ -2090,9 +2083,7 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
         return Ok(FlexCompileOutcome::FullyAliased { reason });
     }
     // Shape contract: compile() must emit (d_total × k_kept) anchor_correction
-    // for the trailing candidate block. The install path re-validates but
-    // emits a less specific error; catch it here with the d_total/k_kept
-    // context.
+    // for the trailing candidate block.
     {
         let m = candidate_compiled
             .anchor_correction
@@ -2112,11 +2103,10 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
         }
     }
 
-    // Install: hand the compiled flex block to the runtime in one call.
-    // `install_compiled_flex_block` caches N_train rows, applies the
-    // right-selector V to span_c{0..3} + boundary/monotonicity rows, and
-    // stores the anchor correction M alongside the per-anchor predict-time
-    // tags so the saved model can replay the anchor row map.
+    // Step 4 — install: wrap compiled output into the runtime as an
+    // InstalledFlexBlock (anchor_correction M + anchor_components tags),
+    // cache N_train, apply selector V to span_c{0..3} + boundary/monotonicity
+    // rows, then rebuild the block's design + penalties in the new basis.
     candidate.runtime.install_compiled_flex_block(
         candidate_compiled,
         anchor_components,

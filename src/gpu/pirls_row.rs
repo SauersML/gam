@@ -1925,6 +1925,12 @@ fn ladder_source_for(family: PirlsRowFamily, curvature: CurvatureMode) -> String
     // Bernoulli), which is correct — the per-family body reassigns `eta_c` from
     // the (now trial-eta-valued) `eta_i`. For GaussianIdentity the body reads
     // `eta_i` directly as `mu`, which is also correct after the substitution.
+    // GammaLog ladder kernel also takes `double shape` after `prior_w`.
+    let shape_param = if matches!(family, PirlsRowFamily::GammaLog) {
+        "    double         shape,\n"
+    } else {
+        ""
+    };
     format!(
         r#"
 {curvature_define}
@@ -1937,7 +1943,7 @@ extern "C" __global__ void {kernel_name}(
     const double* __restrict__ xd,
     const double* __restrict__ y,
     const double* __restrict__ prior_w,
-    double* __restrict__ objective_out,
+{shape_param}    double* __restrict__ objective_out,
     unsigned int* __restrict__ status_out
 ) {{
     int i = blockIdx.x * blockDim.x + threadIdx.x;

@@ -2315,6 +2315,8 @@ pub fn solve_arrow_newton_step_with_options(
         ridge_beta,
         htbeta,
         d: sys.d,
+        row_dims: Arc::clone(&sys.row_dims),
+        row_offsets: Arc::clone(&sys.row_offsets),
         k: sys.k,
         manifold_mode_fingerprint: sys.manifold_mode_fingerprint,
         row_hessian_fingerprint: sys.current_row_hessian_fingerprint(),

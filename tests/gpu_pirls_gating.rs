@@ -19,6 +19,7 @@ use faer::Side;
 use gam::construction::CanonicalPenalty;
 use gam::estimate::PenaltySpec;
 use gam::faer_ndarray::{FaerArrayView, factorize_symmetricwith_fallback};
+use gam::matrix::FactorizedSystem;
 use gam::pirls::{PenaltyConfig, PirlsConfig, PirlsProblem, PirlsStatus, fit_model_for_fixed_rho};
 use gam::solver::gpu::cuda_selected;
 use gam::types::{
