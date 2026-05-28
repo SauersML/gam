@@ -3090,8 +3090,15 @@ pub struct SaeDecoderBlockJacobian {
 impl crate::families::custom_family::BlockEffectiveJacobian for SaeDecoderBlockJacobian {
     fn effective_jacobian_at(
         &self,
-        _: &crate::families::custom_family::FamilyLinearizationState<'_>,
+        state: &crate::families::custom_family::FamilyLinearizationState<'_>,
     ) -> Result<Array2<f64>, String> {
+        // SAE decoder block: Jacobian is β-independent (multi-output linear in β).
+        // Validate beta for NaN when provided — same contract as AdditiveBlockJacobian.
+        if !state.beta.is_empty() && state.beta.iter().any(|v| v.is_nan()) {
+            return Err(
+                "SaeDecoderBlockJacobian::effective_jacobian_at: beta contains NaN".to_string(),
+            );
+        }
         let n = self.basis_values.nrows();
         let m = self.basis_values.ncols();
         let p = self.n_outputs;

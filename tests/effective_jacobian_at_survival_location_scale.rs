@@ -117,7 +117,7 @@ fn make_state(beta: &[f64]) -> FamilyLinearizationState<'_> {
 
 const N_OUTPUTS: usize = 3;
 
-fn check_block(
+fn assert_block_jacobian(
     label: &str,
     block_idx: usize,
     specs: &[ParameterBlockSpec],
@@ -189,7 +189,7 @@ fn survival_ls_time_block_jacobian() {
         make_spec("log_sigma", design_p3()),
     ];
     // time block (0) → output 0
-    check_block("SurvivalLS/time", 0, &specs, Some(0));
+    assert_block_jacobian("SurvivalLS/time", 0, &specs, Some(0));
 }
 
 #[test]
@@ -200,7 +200,7 @@ fn survival_ls_threshold_block_jacobian() {
         make_spec("log_sigma", design_p3()),
     ];
     // threshold block (1) → output 1
-    check_block("SurvivalLS/threshold", 1, &specs, Some(1));
+    assert_block_jacobian("SurvivalLS/threshold", 1, &specs, Some(1));
 }
 
 #[test]
@@ -211,7 +211,7 @@ fn survival_ls_log_sigma_block_jacobian() {
         make_spec("log_sigma", design_p3()),
     ];
     // log_sigma block (2) → output 2
-    check_block("SurvivalLS/log_sigma", 2, &specs, Some(2));
+    assert_block_jacobian("SurvivalLS/log_sigma", 2, &specs, Some(2));
 }
 
 #[test]
@@ -223,7 +223,7 @@ fn survival_ls_linkwiggle_block_jacobian_is_zero() {
         make_spec("linkwiggle", design_p2_wiggle()),
     ];
     // linkwiggle block (3) → zero Jacobian for all outputs
-    check_block("SurvivalLS/linkwiggle", 3, &specs, None);
+    assert_block_jacobian("SurvivalLS/linkwiggle", 3, &specs, None);
 }
 
 #[test]
@@ -331,7 +331,9 @@ fn survival_ls_jacobian_equals_design_exactly() {
 /// Box<dyn BlockEffectiveJacobian> satisfies Send bound.
 #[test]
 fn survival_ls_jacobian_box_is_send() {
-    fn assert_send<T: Send>(_t: T) {}
+    fn assert_send<T: Send>(t: T) {
+        std::mem::drop(t);
+    }
     let specs = vec![
         make_spec("time_transform", design_p4()),
         make_spec("threshold", design_p2()),
