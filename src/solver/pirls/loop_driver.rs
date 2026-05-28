@@ -34,11 +34,18 @@ use super::{
     // moved into mod.rs but referenced from this driver:
     ArrowSchurInnerConfig, GamModelFinalState, project_coefficients_to_lower_bounds,
 };
-use super::convergence::effective_kkt_tolerance;
 use super::gpu_dispatch::{try_gaussian_pls_gpu, try_pirls_loop_gpu};
-use crate::linalg::faer_ndarray::fast_ab;
+use super::{
+    GamModelFinalState, ArrowSchurInnerConfig, effective_kkt_tolerance,
+    project_coefficients_to_lower_bounds,
+};
+use crate::faer_ndarray::fast_ab;
 use crate::probability::standard_normal_quantile;
-use crate::construction::{KroneckerReparamResult, ReparamResult};
+use crate::construction::{
+    EngineDims, KroneckerReparamResult, ReparamResult,
+    create_balanced_penalty_root_from_canonical,
+    kronecker_reparameterization_engine, stable_reparameterization_engine_canonical,
+};
 use crate::estimate::EstimationError;
 use crate::matrix::{DesignMatrix, LinearOperator, ReparamOperator, SymmetricMatrix};
 use crate::solver::active_set;
@@ -583,6 +590,9 @@ pub struct PirlsProblem<'a, X> {
     /// the cached `XᵀWX`.
     pub gaussian_fixed_cache: Option<&'a GaussianFixedCache>,
 }
+
+// GaussianFixedCache and SparseXtwxPrecomputed are defined in pls_solver.
+pub use super::pls_solver::{GaussianFixedCache, SparseXtwxPrecomputed};
 
 pub struct PenaltyConfig<'a> {
     /// Block-local canonical penalties with precomputed roots and spectral data.
