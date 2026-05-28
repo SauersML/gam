@@ -22491,17 +22491,15 @@ fn predict_columns(
     let fit = fit_result_from_saved_model_for_prediction(model)?;
 
     let mut columns = BTreeMap::<String, Vec<f64>>::new();
-    // Issue #342: `with_uncertainty=True` used to be silently ignored on the
-    // non-survival predict path (only the survival branch wired it through).
-    // Honor it here too: when either an explicit `interval` is requested OR
-    // `with_uncertainty` is set, run the full-uncertainty predictor and
-    // emit SE columns. CI bound columns (`mean_lower`/`mean_upper`) are
-    // emitted only when an interval was explicitly requested; otherwise
-    // returning bounds tied to an undocumented default would mislead.
-    if options.interval.is_some() || options.with_uncertainty {
-        // Confidence level only matters when CI bounds are emitted; pick a
-        // conventional default when the caller asked for SE only.
-        let confidence_level = options.interval.unwrap_or(0.95);
+    // Issue #342 — single uncertainty knob: `interval` is the only switch.
+    // `Some(level)` means "quantify uncertainty at this coverage and return
+    // SE + CI bounds"; `None` means "point predictions only". The earlier
+    // overlapping `with_uncertainty` boolean has been removed: it was
+    // strictly weaker than `interval` (SE is a strict subset of
+    // SE + bounds), and supporting both forced callers to learn two
+    // partially-redundant flags. Migration: `with_uncertainty=True` →
+    // `interval=0.95`.
+    if let Some(confidence_level) = options.interval {
         let uncertainty_options = gam::predict::PredictUncertaintyOptions {
             confidence_level,
             covariance_mode:
@@ -22528,10 +22526,8 @@ fn predict_columns(
                 .map(|se| se * se)
                 .collect(),
         );
-        if options.interval.is_some() {
-            columns.insert("mean_lower".to_string(), prediction.mean_lower.to_vec());
-            columns.insert("mean_upper".to_string(), prediction.mean_upper.to_vec());
-        }
+        columns.insert("mean_lower".to_string(), prediction.mean_lower.to_vec());
+        columns.insert("mean_upper".to_string(), prediction.mean_upper.to_vec());
     } else {
         let prediction = predictor
             .predict_plugin_response(&predict_input)

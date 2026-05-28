@@ -116,7 +116,7 @@ class Model:
             )
         except Exception as exc:
             raise map_exception(exc) from exc
-        return shape_prediction_response(
+        return shape_predict_response(
             raw,
             headers=headers,
             rows=rows,
@@ -127,6 +127,7 @@ class Model:
             interval=interval,
             return_type=return_type,
             id_column=id_column,
+            with_uncertainty=with_uncertainty,
             row_ids=row_ids,
             restore=restore_output_table,
         )
