@@ -1796,7 +1796,7 @@ impl BernoulliMarginalSlopePredictor {
         score_warp_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
         link_dev_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
     ) -> Result<ObservedDenestedCellPartials, EstimationError> {
-        use crate::families::bernoulli_marginal_slope::exact_kernel as exact;
+        use crate::families::bms::exact_kernel as exact;
 
         let zero_span = exact::LocalSpanCubic {
             left: 0.0,

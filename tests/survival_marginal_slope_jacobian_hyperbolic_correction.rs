@@ -1048,7 +1048,7 @@ fn production_logslope_block_requires_scalars_at_nonzero_beta() {
 
     // Moderate beta so g_i != 0 for some rows.
     let scale = 1.0 / (s_f * (P_BLOCK as f64).sqrt());
-    let beta: Vec<f64> = (0..P_BLOCK).map(|_| { let v = rand_normal(&mut rng) * scale; v }).collect();
+    let beta: Vec<f64> = (0..P_BLOCK).map(|_| rand_normal(&mut rng) * scale).collect();
 
     // Confirm at least one g_i is nonzero (sanity check for the test itself).
     let any_nonzero_g = (0..N).any(|i| {
