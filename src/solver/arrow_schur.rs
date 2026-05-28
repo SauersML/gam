@@ -357,6 +357,7 @@ impl ArrowSolveOptions {
             trust_region: ArrowTrustRegionOptions::default(),
             streaming_chunk_size: None,
             riemannian_trust_region: false,
+            gpu_matvec: None,
         }
     }
 
@@ -369,6 +370,7 @@ impl ArrowSolveOptions {
             trust_region: ArrowTrustRegionOptions::default(),
             streaming_chunk_size: None,
             riemannian_trust_region: false,
+            gpu_matvec: None,
         }
     }
 
@@ -380,6 +382,7 @@ impl ArrowSolveOptions {
             trust_region: ArrowTrustRegionOptions::default(),
             streaming_chunk_size: None,
             riemannian_trust_region: false,
+            gpu_matvec: None,
         }
     }
 
@@ -391,6 +394,7 @@ impl ArrowSolveOptions {
             trust_region: ArrowTrustRegionOptions::default(),
             streaming_chunk_size: None,
             riemannian_trust_region: false,
+            gpu_matvec: None,
         }
     }
 

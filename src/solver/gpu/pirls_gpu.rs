@@ -1912,6 +1912,7 @@ extern "C" __global__ void status_or(
                     backend,
                     family,
                     curvature,
+                    gamma_shape,
                     &ws.stream,
                     n,
                     &loop_ws.eta_cand_dev,
