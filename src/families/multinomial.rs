@@ -530,9 +530,12 @@ pub struct MultinomialSavedModel {
     /// predict time so the FFI can align a fresh `Dataset` to the training
     /// schema before evaluating the basis.
     pub training_headers: Vec<String>,
-    /// Penalty smoothing parameter used (uniform across all blocks and all
-    /// active classes in Slice A; REML follows in the next slice).
-    pub lambda: f64,
+    /// Per-active-class REML/LAML-selected smoothing parameter, length
+    /// `K - 1` (one entry per active class block; the shared-penalty
+    /// architecture means each class owns exactly one λ). When the outer
+    /// REML loop is bypassed (legacy fixed-λ path), every entry is the
+    /// caller-supplied initial value.
+    pub lambdas: Vec<f64>,
     /// Newton iterations executed; recorded for the summary report.
     pub iterations: usize,
     /// `true` if the inner Newton solver hit the relative-step tolerance.
@@ -541,6 +544,11 @@ pub struct MultinomialSavedModel {
     pub penalized_neg_log_likelihood: f64,
     /// Unpenalized deviance `−2 log L(β̂)`.
     pub deviance: f64,
+    /// Per-active-class effective degrees of freedom (hat-matrix trace),
+    /// length `K - 1`. Populated when the REML driver reports an
+    /// inference block; falls back to `None` for the legacy fixed-λ path.
+    #[serde(default)]
+    pub edf_per_class: Option<Vec<f64>>,
 }
 
 impl MultinomialSavedModel {
