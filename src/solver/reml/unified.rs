@@ -1077,8 +1077,8 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
         // where c = dW_H/dη (the Hessian-side third-derivative weight array).
         //
         // This method returns the correction (dH/dρₖ − Aₖ), which is NEGATIVE.
-        // Stays matrix-free: `matrixvectormultiply` and `compute_xtwx` route
-        // through the operator-backed design's chunked kernels at biobank
+        // Stays matrix-free: `matrixvectormultiply` and `xt_diag_x_signed_op`
+        // route through the operator-backed design's chunked kernels at biobank
         // scale, so we never materialize the full (n×p) dense block.
         let x_v = self.x_transformed.matrixvectormultiply(v_k); // X vₖ: n-vector
 
@@ -1109,7 +1109,7 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
         // H_{kl} includes contributions from both c (third) and d (fourth) derivatives:
         //   Xᵀ diag(c ⊙ X u_{kl} + d ⊙ (X vₖ) ⊙ (X vₗ)) X
         // Stays matrix-free via the design's `matrixvectormultiply` and
-        // `compute_xtwx` so biobank-scale designs never densify the (n×p)
+        // `xt_diag_x_signed_op` so biobank-scale designs never densify the (n×p)
         // block.
         let x_vk = self.x_transformed.matrixvectormultiply(v_k);
         let x_vl = self.x_transformed.matrixvectormultiply(v_l);
