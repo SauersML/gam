@@ -134,13 +134,18 @@ fn survival_marginal_slope_channel_hessian_matches_fd() {
 
 // ── Bernoulli marginal-slope (K=1) ────────────────────────────────────────────
 
-/// Probit Bernoulli NLL as a function of the scalar predictor η.
-/// ρ(η) = -[y·log Φ(η) + (1-y)·log Φ(-η)] with sample weight w.
-fn bernoulli_row_nll(u: &[f64], y: f64, w: f64) -> f64 {
+/// Expected probit Bernoulli NLL as a function of the scalar predictor η.
+/// E[ρ(η; Y)] = -Φ(η)·log Φ(η) - (1-Φ(η))·log(1-Φ(η)) with sample weight w.
+///
+/// `BernoulliRowHessian` stores the probit IRLS weight = Fisher information =
+/// ∂²/∂η² E[ρ(η; Y)] = φ(η)²/(Φ(η)·(1-Φ(η))). We FD the expected NLL to
+/// match this, not the y-specific observed NLL.
+fn bernoulli_expected_nll(u: &[f64], w: f64) -> f64 {
     let eta = u[0];
     let p = gam::inference::probability::normal_cdf(eta).clamp(f64::MIN_POSITIVE, 1.0 - f64::MIN_POSITIVE);
-    let nll = -(w * (y * p.ln() + (1.0 - y) * (1.0 - p).ln()));
-    nll
+    let one_m = (1.0 - p).max(f64::MIN_POSITIVE);
+    // Entropy: -[p·log p + (1-p)·log(1-p)]; negative NLL under true param.
+    w * (-(p * p.ln() + one_m * one_m.ln()))
 }
 
 #[test]
@@ -149,32 +154,30 @@ fn bernoulli_channel_hessian_matches_fd() {
         .map(|i| -1.5 + (i as f64) * 0.2)
         .collect();
     let ws: Vec<f64> = (0..N).map(|i| 0.5 + (i as f64) * 0.05).collect();
-    let ys = [0.0_f64, 1.0_f64];
 
     let eta_arr = Array1::from_iter(etas.iter().copied());
     let w_arr = Array1::from_iter(ws.iter().copied());
     let row_hess = BernoulliRowHessian::from_eta_pilot(&eta_arr, &w_arr);
 
-    for &y in &ys {
-        for i in 0..N {
-            let u = [etas[i]];
-            let f = |uu: &[f64]| bernoulli_row_nll(uu, y, ws[i]);
-            let fd = fd_hessian(&f, &u, 1, FD_H);
+    for i in 0..N {
+        let u = [etas[i]];
+        // FD the expected NLL = -E[log L]. Second derivative = Fisher info = IRLS weight.
+        let f = |uu: &[f64]| bernoulli_expected_nll(uu, ws[i]);
+        let fd = fd_hessian(&f, &u, 1, FD_H);
 
-            let mut buf = [0.0f64; 1];
-            row_hess.fill_subject(i, &mut buf);
+        let mut buf = [0.0f64; 1];
+        row_hess.fill_subject(i, &mut buf);
 
-            let got = buf[0];
-            let ref_val = fd[0][0];
-            if !ref_val.is_finite() {
-                continue;
-            }
-            let err = rel_err(got, ref_val);
-            assert!(
-                err < REL_TOL,
-                "bernoulli W_i[0,0] row {i} y={y}: got={got:.6e} fd={ref_val:.6e} rel_err={err:.2e} > tol={REL_TOL:.0e}"
-            );
+        let got = buf[0];
+        let ref_val = fd[0][0];
+        if !ref_val.is_finite() {
+            continue;
         }
+        let err = rel_err(got, ref_val);
+        assert!(
+            err < REL_TOL,
+            "bernoulli W_i[0,0] row {i}: got={got:.6e} fd={ref_val:.6e} rel_err={err:.2e} > tol={REL_TOL:.0e}"
+        );
     }
 }
 
