@@ -717,12 +717,12 @@ fn validate_alo_solve_setup(input: &AloInput, n: usize, p: usize) -> Result<(), 
             });
         }
     }
-    if input.hessian_weights.iter().any(|v| !v.is_finite()) {
+    if input.hessian_weights.view().iter().any(|v| !v.is_finite()) {
         return Err(AloError::WeightInvalid {
             reason: "ALO diagnostics require finite Hessian-side weights".to_string(),
         });
     }
-    if input.score_weights.iter().any(|v| !v.is_finite()) {
+    if input.score_weights.view().iter().any(|v| !v.is_finite()) {
         return Err(AloError::WeightInvalid {
             reason: "ALO diagnostics require finite score-side weights".to_string(),
         });
