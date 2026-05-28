@@ -190,100 +190,16 @@ impl<'a> SurvivalFlexGpuRowInputs<'a> {
 // ────────────────────────────────────────────────────────────────────────
 // NVRTC source — Step 1 (rigid 4-primary row kernel).
 //
-// Kept as a single CUDA translation unit so the device-side helpers
-// (`log_ndtr`, `mills_ratio`, `c_derivatives`, the row primitive itself)
-// can inline freely.  Layout mirrors `row_primary_closed_form` so the
-// term-by-term parity check is direct.
-//
-// Block 8 sibling note: the `log_ndtr` / `mills_ratio` blocks below are
-// the same numerics the BMS-flex sibling needs.  Once both kernels land
-// they will be factored out into a shared NVRTC header
-// (`numerics_device.cuh`) — but that header doesn't exist yet, so for
-// the Step-1 commit each backend ships the source inline.  Lifting it
-// out is a no-op for the rigid kernel because NVRTC source caches by
-// (source-text, options) and the eventual header will be compiled with
-// the same options.  Tracked in the coordination message to
-// `nvrtc-bms-flex`.
+// Shared probit numerics (`erfcx_nonnegative`, `log_ndtr`,
+// `log_ndtr_and_mills`) live in `numerics_device::PROBIT_NUMERICS_CU` and
+// are prepended at compile time.  The body below contains only the
+// kernel-specific defines and device helpers.
 // ────────────────────────────────────────────────────────────────────────
 
 #[cfg(target_os = "linux")]
-const SURVIVAL_FLEX_RIGID_SOURCE: &str = r#"
-// -------- numerics ----------------------------------------------------
-// All math in double precision.  No --use_fast_math.
-//
-// `log_ndtr(x)` = log Φ(x).  For x < 0 uses the erfcx representation
-//   log Φ(x) = -u² + log(½ · erfcx(u)),   u = -x / √2
-// which preserves digits all the way into the deep left tail (matches
-// the CPU `normal_logcdf`).  For x ≥ 0 falls back to log Φ(x).
-//
-// `mills_ratio(x)` = φ(x) / Φ(x).  For x < 0 uses the same erfcx so the
-// ratio remains stable even when Φ(x) underflows.
-
-#define INV_SQRT_2PI 0.3989422804014327
-#define SQRT_2       1.4142135623730951
+const SURVIVAL_FLEX_RIGID_BODY: &str = r#"
+// -------- kernel-specific defines ----------------------------------------
 #define LN_TAU       1.8378770664093453  // log(2π)
-
-extern "C" __device__ __forceinline__ double erfcx_nonnegative(double x) {
-    if (!isfinite(x)) {
-        return (x > 0.0) ? 0.0 : (1.0 / 0.0);
-    }
-    if (x <= 0.0) return 1.0;
-    if (x < 26.0) {
-        double xx = x * x;
-        if (xx > 700.0) xx = 700.0;
-        return exp(xx) * erfc(x);
-    }
-    // 4-term asymptotic expansion of erfcx for large x.
-    double inv  = 1.0 / x;
-    double inv2 = inv * inv;
-    double poly = 1.0
-                - 0.5      * inv2
-                + 0.75     * inv2 * inv2
-                - 1.875    * inv2 * inv2 * inv2
-                + 6.5625   * inv2 * inv2 * inv2 * inv2;
-    const double inv_sqrt_pi = 0.5641895835477563; // 1/√π
-    return inv * poly * inv_sqrt_pi;
-}
-
-extern "C" __device__ __forceinline__ double log_ndtr(double x) {
-    if (x ==  (1.0 / 0.0)) return 0.0;
-    if (x == -(1.0 / 0.0)) return -(1.0 / 0.0);
-    if (isnan(x)) return x;
-    if (x < 0.0) {
-        double u   = -x / SQRT_2;
-        double ex  = erfcx_nonnegative(u);
-        if (ex < 1e-300) ex = 1e-300;
-        return -u * u + log(0.5 * ex);
-    } else {
-        double c = 0.5 * erfc(-x / SQRT_2);
-        if (c < 1e-300) c = 1e-300;
-        if (c > 1.0)    c = 1.0;
-        return log(c);
-    }
-}
-
-// Returns (log Φ(x), φ(x)/Φ(x)).
-extern "C" __device__ __forceinline__ void
-log_ndtr_and_mills(double x, double *log_cdf, double *lambda) {
-    if (x ==  (1.0 / 0.0)) { *log_cdf = 0.0;            *lambda = 0.0;            return; }
-    if (x == -(1.0 / 0.0)) { *log_cdf = -(1.0 / 0.0);   *lambda = (1.0 / 0.0);    return; }
-    if (isnan(x))          { *log_cdf = x;              *lambda = x;              return; }
-    if (x < 0.0) {
-        double u   = -x / SQRT_2;
-        double ex  = erfcx_nonnegative(u);
-        if (ex < 1e-300) ex = 1e-300;
-        *log_cdf = -u * u + log(0.5 * ex);
-        const double sqrt_2_over_pi = 0.7978845608028654; // √(2/π)
-        *lambda  = sqrt_2_over_pi / ex;
-    } else {
-        double cdf = 0.5 * erfc(-x / SQRT_2);
-        if (cdf < 1e-300) cdf = 1e-300;
-        if (cdf > 1.0)    cdf = 1.0;
-        double pdf = INV_SQRT_2PI * exp(-0.5 * x * x);
-        *log_cdf = log(cdf);
-        *lambda  = pdf / cdf;
-    }
-}
 
 // `signed_probit_neglog_derivatives_up_to_fourth` first two outputs
 // (k1, k2) — Step 1 only needs the first two; k3/k4 land in Step 4.
@@ -597,10 +513,12 @@ impl SurvivalFlexGpuBackend {
     /// NVRTC-compile (or fetch from cache) the rigid-kernel module.
     #[cfg(target_os = "linux")]
     fn compile_rigid_module(&self) -> Result<&Arc<CudaModule>, GpuError> {
+        let source =
+            [super::numerics_device::PROBIT_NUMERICS_CU, SURVIVAL_FLEX_RIGID_BODY].concat();
         self.inner.module.get_or_compile(
             &self.inner.ctx,
             "survival_flex",
-            SURVIVAL_FLEX_RIGID_SOURCE,
+            &source,
         )
     }
 

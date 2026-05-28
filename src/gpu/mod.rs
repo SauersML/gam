@@ -23,6 +23,7 @@ pub mod identifiability_compile;
 pub mod identifiability_compile_kernel;
 pub mod linalg;
 pub mod memory;
+pub mod numerics_device;
 pub mod pirls_row;
 pub mod policy;
 pub mod polya_gamma;

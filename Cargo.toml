@@ -189,6 +189,11 @@ name = "cubic_hex_tensor_gpu_parity"
 path = "bench/cargo_benches/cubic_hex_tensor_gpu_parity.rs"
 harness = false
 
+[[bench]]
+name = "sae_arrow_schur_bench"
+path = "bench/cargo_benches/sae_arrow_schur_bench.rs"
+harness = false
+
 [[example]]
 name = "arrow_schur_hill_climb"
 path = "examples/perf/arrow_schur_hill_climb.rs"
