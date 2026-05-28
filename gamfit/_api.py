@@ -1245,6 +1245,16 @@ def explain_error(exc: BaseException) -> str:
         return "Build the extension with maturin before calling Rust-backed APIs."
     from ._exceptions import FormulaError, GamError, PredictionError, SchemaMismatchError
 
+    message = str(exc)
+    # Column-not-found errors carry actionable context (which column was
+    # referenced, which columns exist) in the message itself. Surface a hint
+    # that names the offending column and the available alternatives,
+    # regardless of whether the exception is the typed FormulaError or a
+    # bare ValueError (e.g. raised before the binding layer re-typed it).
+    column_hint = _column_not_found_hint(message)
+    if column_hint is not None:
+        return column_hint
+
     if isinstance(exc, FormulaError):
         return "Check the formula syntax and confirm every referenced column exists."
     if isinstance(exc, SchemaMismatchError):
@@ -1254,6 +1264,43 @@ def explain_error(exc: BaseException) -> str:
     if isinstance(exc, GamError):
         return "The Rust engine returned an error. Inspect the exception message for the underlying failure detail."
     return "Unexpected error. Inspect the full traceback and the original exception message."
+
+
+def _column_not_found_hint(message: str) -> str | None:
+    """Detect a column-not-found message and return a column-specific hint.
+
+    The Rust data layer emits messages of the form::
+
+        column 'z' not found in data. Available columns: [x, y]
+        response column 'z' not found in data. Available columns: [x, y]
+
+    Returns a hint that names the missing column and the available
+    columns when the pattern matches; otherwise ``None``.
+    """
+    import re
+
+    lower = message.lower()
+    if "not found in data" not in lower and "available columns:" not in lower:
+        return None
+    name_match = re.search(r"column ['\"]([^'\"]+)['\"]", message)
+    avail_match = re.search(r"Available columns:\s*\[([^\]]*)\]", message)
+    missing = name_match.group(1) if name_match else None
+    available = avail_match.group(1).strip() if avail_match else None
+    if missing is not None and available is not None:
+        return (
+            f"Column {missing!r} is referenced by the formula but is not in "
+            f"the input table. Available columns: [{available}]. Fix the "
+            f"formula or add the column to the data."
+        )
+    if missing is not None:
+        return (
+            f"Column {missing!r} referenced by the formula is not present in "
+            f"the input table. Fix the formula or add the column to the data."
+        )
+    return (
+        "A formula-referenced column is missing from the input table. "
+        "Check the formula and confirm every referenced column exists."
+    )
 
 
 def bspline_basis(
