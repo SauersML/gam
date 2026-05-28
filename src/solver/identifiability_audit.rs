@@ -92,6 +92,7 @@ use crate::families::custom_family::{FamilyLinearizationState, ParameterBlockSpe
 use crate::linalg::faer_ndarray::{
     FaerEigh, FaerQr, default_rrqr_rank_alpha, rrqr_with_permutation,
 };
+use crate::solver::estimate::EstimationError;
 
 /// Per-block accounting record. `original_dim` is the spec's column
 /// count at audit entry (post `joint_null_rotation` absorption — the
@@ -460,7 +461,9 @@ fn signed_cosine(dot: f64, norm_a: f64, norm_b: f64) -> f64 {
 ///   4. Report all (a, b) column pairs whose normalised inner
 ///      product exceeds the per-pair leverage-based reporting threshold
 ///      (`pair_report_threshold`).
-pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<IdentifiabilityAudit, String> {
+pub fn audit_identifiability(
+    specs: &[ParameterBlockSpec],
+) -> Result<IdentifiabilityAudit, EstimationError> {
     if specs.is_empty() {
         return Ok(IdentifiabilityAudit {
             blocks: Vec::new(),
@@ -474,13 +477,13 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
     let n = specs[0].design.nrows();
     for (idx, spec) in specs.iter().enumerate() {
         if spec.design.nrows() != n {
-            return Err(format!(
+            return Err(EstimationError::LayoutError(format!(
                 "identifiability audit: block {} ({}) has {} rows, expected {}",
                 idx,
                 spec.name,
                 spec.design.nrows(),
                 n,
-            ));
+            )));
         }
     }
 

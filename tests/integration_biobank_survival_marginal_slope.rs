@@ -265,8 +265,8 @@ fn biobank_survival_marginal_slope_canonical_gauge_fix() {
 
     // ── Assertions 3a-b: drop attribution must target logslope only ───────
     //
-    // The V+M active path emits:
-    //   "[smgs phase-4b active] applying per-term V: … (drops time=T, marginal=M, logslope=G)"
+    // After T13's channel-aware Gram migration the closed-form path emits:
+    //   "[smgs phase-4b compiled-map] applying CompiledMap T: … (drops time=T, marginal=M, logslope=G); …"
     //
     // The canonical-gauge contract (gauge_priority time=200 > marginal=150 > logslope=120)
     // guarantees that any alias between the shared duchon term on both formulas
@@ -275,13 +275,13 @@ fn biobank_survival_marginal_slope_canonical_gauge_fix() {
     // T must be 0 and M must be 0. G >= 0 is allowed (may be 0 if the V+M
     // path detected no aliasing via the W-metric path at this n).
     let logs = log_sink().snapshot();
-    let active_marker = "[smgs phase-4b active] applying per-term V:";
+    let active_marker = "[smgs phase-4b compiled-map] applying CompiledMap T:";
     let active_lines: Vec<&String> = logs
         .iter()
         .filter(|line| line.contains(active_marker))
         .collect();
 
-    // If V+M active fired, check that time and marginal drops are zero.
+    // If the compiled-map path fired, check that time and marginal drops are zero.
     for line in &active_lines {
         // Parse "drops time=T, marginal=M, logslope=G" from the log string.
         let time_drops = parse_drops_field(line, "time");
