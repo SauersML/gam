@@ -1929,19 +1929,21 @@ impl ArrowSchurSystem {
         );
     }
 
-    /// Schur-eliminate the per-row latent block and solve for `(Δt, Δβ)`.
+    /// Schur-eliminate the per-row latent block and solve for `(Δt, Δβ, diag)`.
     ///
     /// This uses [`ArrowSolveOptions::automatic`]: BA dense RCS for
     /// `K <= 2000`, and Agarwal-style inexact Schur PCG above that size.
     /// Call [`ArrowSchurSystem::solve_with_options`] to force Square-Root BA
     /// or a specific inexact solve policy.
     ///
-    /// Returns `(delta_t, delta_beta)` with `delta_t` flat row-major of
-    /// length `N · d` and `delta_beta` of length `K`. The sign convention
-    /// matches `solve_newton_direction_dense`: the returned increments
-    /// satisfy the bordered system with RHS `[-g_t; -g_β]`, i.e. they are
-    /// the *negated* solutions of the standard Newton-direction
-    /// formulation.
+    /// Returns `(delta_t, delta_beta, PcgDiagnostics)` with `delta_t` flat
+    /// row-major of length `N · d` and `delta_beta` of length `K`. The sign
+    /// convention matches `solve_newton_direction_dense`: the returned
+    /// increments satisfy the bordered system with RHS `[-g_t; -g_β]`, i.e.
+    /// they are the *negated* solutions of the standard Newton-direction
+    /// formulation. `PcgDiagnostics` is zero-valued for the Direct path and
+    /// carries live counters (PCG iters, ridge escalations, residual) for
+    /// InexactPCG.
     ///
     /// `ridge_t` and `ridge_beta` are nonnegative diagonal regularizers
     /// added to the latent and β blocks respectively before factorization
@@ -1980,13 +1982,15 @@ impl ArrowSchurSystem {
         solve_with_lm_escalation_inner(self, ridge_t, ridge_beta, &options)
     }
 
-    /// Solve with an explicit BA Schur mode.
+    /// Solve with an explicit BA Schur mode, returning `(Δt, Δβ, PcgDiagnostics)`.
     ///
     /// [`ArrowSolverMode::Direct`] is the classic dense reduced-camera-system
     /// Cholesky path; [`ArrowSolverMode::SqrtBA`] forms the same dense system
     /// through Square-Root BA factors; [`ArrowSolverMode::InexactPCG`] runs
     /// inexact-step LM on the reduced system with Jacobi-preconditioned
-    /// Steihaug-CG.
+    /// Steihaug-CG. `PcgDiagnostics` is zero-valued for Direct/SqrtBA and
+    /// carries live counters for InexactPCG (iterations, matvec calls,
+    /// preconditioner escalations, final relative residual, stopping reason).
     pub fn solve_with_options(
         &self,
         ridge_t: f64,
