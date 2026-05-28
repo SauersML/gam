@@ -498,20 +498,34 @@ fn audit_identifiability_impl(
         });
     }
 
-    let n = specs[0].design.nrows();
-    for (idx, spec) in specs.iter().enumerate() {
-        if spec.design.nrows() != n {
+    // Materialise each block's effective Jacobian first; the row-equality
+    // invariant must apply to what the audit actually inspects
+    // (the effective design exposed through `effective_jacobian_at`),
+    // not to the raw `spec.design.nrows()` which can legitimately differ from
+    // the audit-visible row count when a block carries a `jacobian_callback`
+    // (e.g. a survival time block stores a stacked entry/exit/derivative
+    // operator in `design` but exposes a single-channel exit-only Jacobian to
+    // the audit).
+    let mut dense_blocks: Vec<Array2<f64>> = Vec::with_capacity(specs.len());
+    for spec in specs.iter() {
+        let dense = spec
+            .effective_jacobian_at("identifiability_audit::audit_identifiability", state)
+            .map_err(|e| EstimationError::LayoutError(format!("identifiability audit: {e}")))?;
+        dense_blocks.push(dense);
+    }
+    let n = dense_blocks[0].nrows();
+    for (idx, dense) in dense_blocks.iter().enumerate() {
+        if dense.nrows() != n {
             return Err(EstimationError::LayoutError(format!(
-                "identifiability audit: block {} ({}) has {} rows, expected {}",
+                "identifiability audit: block {} ({}) has {} effective-Jacobian rows, expected {}",
                 idx,
-                spec.name,
-                spec.design.nrows(),
+                specs[idx].name,
+                dense.nrows(),
                 n,
             )));
         }
     }
 
-    let mut dense_blocks: Vec<Array2<f64>> = Vec::with_capacity(specs.len());
     let mut blocks: Vec<BlockIdentity> = Vec::with_capacity(specs.len());
     let mut col_offsets: Vec<usize> = Vec::with_capacity(specs.len() + 1);
     col_offsets.push(0);
@@ -519,14 +533,11 @@ fn audit_identifiability_impl(
     let block_heartbeat = (n.saturating_mul(specs.len()) >= 1_000_000)
         .then(crate::util::heartbeat::Heartbeat::default_interval);
     for (idx, spec) in specs.iter().enumerate() {
-        // Use spec.effective_jacobian_at() so the audit operates on the β-dependent
-        // effective design. The caller-supplied `state` carries β and family scalars;
-        // for blocks with no callback this is a no-op (J = design).
-        let dense = spec
-            .effective_jacobian_at("identifiability_audit::audit_identifiability", state)
-            .map_err(|e| EstimationError::LayoutError(format!("identifiability audit: {e}")))?;
+        // Effective Jacobians were pre-materialised above so the row-count
+        // invariant could be checked against the audit-visible rows.
+        let dense = &dense_blocks[idx];
         let p_block = dense.ncols();
-        let block_singular = block_pivoted_qr_diagonal(&dense)?;
+        let block_singular = block_pivoted_qr_diagonal(dense)?;
         let block_rank = count_rank(&block_singular, n, p_block);
         blocks.push(BlockIdentity {
             block_name: spec.name.clone(),

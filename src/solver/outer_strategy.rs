@@ -1842,13 +1842,25 @@ pub trait OuterObjective {
     fn reset(&mut self);
 
     /// Seed the inner-solver iterate before the first eval, e.g. when the
-    /// outer-iterate cache restored a `(ρ, β)` pair from a prior run.
+    /// outer-iterate cache restored a `(ρ, β)` pair from a prior run, or
+    /// when the continuation walk forwards `OuterEval::inner_beta_hint`
+    /// from the previous step.
     ///
-    /// Objectives must make an explicit choice here. Implementations with an
-    /// inner β slot install the seed; implementations without one return a
-    /// contract error instead of silently degrading a β-bearing checkpoint into
-    /// a ρ-only resume.
-    fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<(), EstimationError>;
+    /// Objectives make an explicit choice via the [`SeedOutcome`] return:
+    /// implementations with an inner β slot return [`SeedOutcome::Installed`]
+    /// after storing β; implementations without one return
+    /// [`SeedOutcome::NoSlot`]. Genuine seeding failures (wrong dimension
+    /// when a slot exists, etc.) are reported via `Err(EstimationError)`.
+    ///
+    /// Callers that need to distinguish "no slot" from "installed" (the
+    /// outer cache warm-start path, which logs cache provenance) branch on
+    /// the variant. Callers that don't care (the continuation walk, which
+    /// only proceeds-cold when the hint is unusable) ignore it and only
+    /// propagate `Err`.
+    fn seed_inner_state(
+        &mut self,
+        beta: &Array1<f64>,
+    ) -> Result<SeedOutcome, EstimationError>;
 
     /// Optional opt-in to the device-resident outer REML BFGS-over-ρ driver
     /// (`crate::solver::gpu::reml_outer::run_reml_outer_on_device`). Returns
@@ -2141,12 +2153,17 @@ impl<'a> OuterObjective for CheckpointingObjective<'a> {
         Ok(r)
     }
 
-    fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<(), EstimationError> {
+    fn seed_inner_state(
+        &mut self,
+        beta: &Array1<f64>,
+    ) -> Result<SeedOutcome, EstimationError> {
         // Forward to the wrapped objective, then prime our last-inner-beta
         // cache so a subsequent finalize-write encodes the seeded β if no
-        // eval surfaces a fresher β first.
+        // eval surfaces a fresher β first. Only prime on actual install —
+        // `NoSlot` means the inner solver will not see β, so the cache
+        // entry would be a lie.
         let result = self.inner.seed_inner_state(beta);
-        if result.is_ok()
+        if matches!(result, Ok(SeedOutcome::Installed))
             && beta.iter().all(|v| v.is_finite())
             && let Ok(mut guard) = self.last_inner_beta.lock()
         {

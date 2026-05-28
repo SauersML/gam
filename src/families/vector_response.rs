@@ -18,7 +18,7 @@
 //! what the arrow Schur elimination in `solver/arrow_schur.rs` consumes.
 
 use crate::estimate::EstimationError;
-use ndarray::{Array1, Array2, ArrayView2};
+use ndarray::{Array1, Array2, Array3, ArrayView2};
 
 /// Per-output noise model for a vector response.
 ///
@@ -167,6 +167,31 @@ pub trait VectorLikelihood {
     /// Diagonal of the per-row Hessian −∂² log p / ∂ η ∂ η, shape (N, M).
     /// This is the per-row block consumed by `solver/arrow_schur.rs`.
     fn hess_diag(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> Array2<f64>;
+
+    /// Per-row dense Hessian block −∂² log p / ∂η_a ∂η_b, shape (N, M, M).
+    ///
+    /// Default implementation lifts [`Self::hess_diag`] onto the per-row
+    /// diagonal so existing diagonal-likelihood implementors (e.g.
+    /// [`GaussianVectorLikelihood`]) require no override. Likelihoods whose
+    /// per-row Hessian is genuinely non-diagonal across outputs — most
+    /// importantly multinomial-logit, where the per-row Fisher block is
+    /// `p_a (δ_ab − p_b)` — must override this method.
+    ///
+    /// The returned array is consumed by
+    /// [`crate::solver::pirls::dense_block_xtwx`] /
+    /// [`crate::solver::pirls::dense_block_xtwy`] to build `XᵀWX` and `XᵀWy`
+    /// for vector-response IRLS in output-major coefficient ordering.
+    fn hess_block(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> Array3<f64> {
+        let diag = self.hess_diag(eta, y);
+        let (n, m) = diag.dim();
+        let mut out = Array3::<f64>::zeros((n, m, m));
+        for row in 0..n {
+            for j in 0..m {
+                out[[row, j, j]] = diag[[row, j]];
+            }
+        }
+        out
+    }
 }
 
 /// Gaussian vector likelihood with identity link.
