@@ -3,6 +3,7 @@ name: Claude Bug Hunt (real + synthetic data)
 on:
   schedule:
     - cron: "0 */2 * * *"
+  workflow_dispatch:
 
 concurrency:
   group: claude-bug-hunt

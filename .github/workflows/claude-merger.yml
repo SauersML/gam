@@ -3,6 +3,7 @@ name: Claude Merger (improve, merge, release)
 on:
   schedule:
     - cron: "0 */4 * * *"
+  workflow_dispatch:
 
 concurrency:
   group: claude-merger

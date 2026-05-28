@@ -3,6 +3,7 @@ name: Claude Fixer (one issue, done properly)
 on:
   schedule:
     - cron: "*/29 * * * *"
+  workflow_dispatch:
 
 concurrency:
   group: claude-fixer
