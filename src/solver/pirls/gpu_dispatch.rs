@@ -21,7 +21,9 @@ use super::{
     PirlsPenalty, PirlsResult, WorkingModelPirlsResult, LinearInequalityConstraints,
 };
 #[cfg(target_os = "linux")]
-use super::{FIXED_STABILIZATION_RIDGE, make_reparam_operator};
+use super::FIXED_STABILIZATION_RIDGE;
+#[cfg(target_os = "linux")]
+use super::loop_driver::make_reparam_operator;
 use crate::construction::ReparamResult;
 use crate::estimate::EstimationError;
 use crate::matrix::DesignMatrix;

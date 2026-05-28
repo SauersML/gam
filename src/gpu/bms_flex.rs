@@ -28,6 +28,7 @@ use ndarray::Array2;
 
 use super::error::GpuError;
 use super::{GpuDecision, GpuKernel, decide};
+use crate::gpu_err;
 
 use super::bms_flex_row::{
     BmsFlexRowKernelInputs, BmsFlexRowKernelOutputs, launch_bms_flex_row_kernel,
