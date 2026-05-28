@@ -8148,7 +8148,11 @@ impl BernoulliMarginalSlopeFamily {
             );
         }
         let preseed_started = std::time::Instant::now();
-        self.preseed_intercept_warm_starts(block_states)?;
+        if let Some(rows) = selected_context_rows.as_deref() {
+            self.preseed_intercept_warm_starts_for_rows(block_states, rows)?;
+        } else {
+            self.preseed_intercept_warm_starts(block_states)?;
+        }
         if log_exact_work(n) {
             log::info!(
                 "[BMS exact-cache] preseed done n={} context_rows={} elapsed={:.3}s",

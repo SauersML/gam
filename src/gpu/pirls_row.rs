@@ -1691,6 +1691,7 @@ mod pirls_row_gpu_tests {
                 y: 1.0,
                 prior_weight: 3.0,
             },
+            1.0,
         );
         assert!(mu > 0.0 && mu < 1.0);
         assert_close("mu", out.mu, mu, 1e-12);
@@ -1709,6 +1710,7 @@ mod pirls_row_gpu_tests {
                 y: 0.0,
                 prior_weight: 1.0,
             },
+            1.0,
         );
         assert!(out.status & status_flags::ETA_CLAMPED != 0);
     }
