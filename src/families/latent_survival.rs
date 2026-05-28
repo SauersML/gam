@@ -940,7 +940,7 @@ fn build_time_blockspec(
             .unwrap_or_else(|| Array1::zeros(prepared.penalties.len())),
         initial_beta: prepared.initial_beta.clone(),
         gauge_priority: 100,
-        row_scaling: None,
+        eta_row_scaling: None,
         jacobian_callback: None,
     }
 }
@@ -955,7 +955,7 @@ fn build_mean_blockspec(design: &TermCollectionDesign, offset: Array1<f64>) -> P
         initial_log_lambdas: Array1::zeros(design.penalties.len()),
         initial_beta: None,
         gauge_priority: 100,
-        row_scaling: None,
+        eta_row_scaling: None,
         jacobian_callback: None,
     }
 }
@@ -976,7 +976,7 @@ fn build_log_sigma_blockspec(initial_sigma: f64) -> ParameterBlockSpec {
             exp_sigma_eta_for_sigma_scalar(initial_sigma),
         )),
         gauge_priority: 100,
-        row_scaling: None,
+        eta_row_scaling: None,
         jacobian_callback: None,
     }
 }
@@ -4056,7 +4056,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-                row_scaling: None,
+                eta_row_scaling: None,
                 jacobian_callback: None,
             })
             .collect()
@@ -4138,7 +4138,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-                row_scaling: None,
+                eta_row_scaling: None,
                 jacobian_callback: None,
             },
             ParameterBlockSpec {
@@ -4153,7 +4153,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-                row_scaling: None,
+                eta_row_scaling: None,
                 jacobian_callback: None,
             },
             ParameterBlockSpec {
@@ -4168,7 +4168,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-                row_scaling: None,
+                eta_row_scaling: None,
                 jacobian_callback: None,
             },
         ];

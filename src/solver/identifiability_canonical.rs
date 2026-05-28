@@ -82,6 +82,7 @@ impl BlockJacobianAsRowOp {
             beta: &zeros,
             family_scalars: None,
             channel_hessian: None,
+            probit_frailty_scale: 1.0,
         };
         let stacked = cb
             .effective_jacobian_at(&state)
@@ -359,6 +360,7 @@ pub fn canonicalize_for_identifiability(
                 beta: &zeros,
                 family_scalars: None,
                 channel_hessian: None,
+                probit_frailty_scale: 1.0,
             };
             match spec.effective_jacobian_at("canonicalize_for_identifiability", &state) {
                 Ok(j) => j.iter().map(|v| v * v).sum(),

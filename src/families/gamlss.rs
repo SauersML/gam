@@ -816,7 +816,7 @@ impl ParameterBlockInput {
             initial_log_lambdas,
             initial_beta: self.initial_beta,
             gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
         })
     }
@@ -2675,7 +2675,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
             initial_log_lambdas: mean_log_lambdas,
             initial_beta: mean_beta_hint,
             gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let mut noisespec = ParameterBlockSpec {
@@ -2687,7 +2687,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
             initial_log_lambdas: noise_log_lambdas,
             initial_beta: noise_beta_hint,
             gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
         };
         if meanspec.initial_beta.is_none() || noisespec.initial_beta.is_none() {
@@ -2827,7 +2827,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
             initial_log_lambdas: layout.mean_from(theta),
             initial_beta: mean_beta_hint,
             gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let mut noisespec = ParameterBlockSpec {
@@ -2839,7 +2839,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
             initial_log_lambdas: layout.noise_from(theta),
             initial_beta: noise_beta_hint,
             gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
         };
         if meanspec.initial_beta.is_none() || noisespec.initial_beta.is_none() {
@@ -2893,7 +2893,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
                 initial_log_lambdas: layout.wiggle_from(theta),
                 initial_beta: self.wiggle_block.initial_beta.clone(),
                 gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
             },
         ])
@@ -3021,7 +3021,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
             initial_log_lambdas: layout.mean_from(theta),
             initial_beta: mean_beta_hint,
             gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let mut log_sigmaspec = ParameterBlockSpec {
@@ -3033,7 +3033,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
             initial_log_lambdas: layout.noise_from(theta),
             initial_beta: noise_beta_hint,
             gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
         };
         if thresholdspec.initial_beta.is_none() || log_sigmaspec.initial_beta.is_none() {
@@ -3180,7 +3180,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
             initial_log_lambdas: layout.mean_from(theta),
             initial_beta: mean_beta_hint,
             gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let mut log_sigmaspec = ParameterBlockSpec {
@@ -3192,7 +3192,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
             initial_log_lambdas: layout.noise_from(theta),
             initial_beta: noise_beta_hint,
             gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
         };
         if thresholdspec.initial_beta.is_none() || log_sigmaspec.initial_beta.is_none() {
@@ -3246,7 +3246,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
                 initial_log_lambdas: layout.wiggle_from(theta),
                 initial_beta: self.wiggle_block.initial_beta.clone(),
                 gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
             },
         ])
@@ -3769,7 +3769,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 initial_log_lambdas: theta.slice(s![0..eta_penalty_count]).to_owned(),
                 initial_beta: Some(pilot_beta.clone()),
                 gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
             },
             ParameterBlockSpec {
@@ -3802,7 +3802,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 initial_log_lambdas: theta.slice(s![eta_penalty_count..rho_dim]).to_owned(),
                 initial_beta: wiggle_initial_beta.clone(),
                 gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
             },
         ];
@@ -23092,7 +23092,7 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
         }
     }
@@ -23317,7 +23317,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
             },
             ParameterBlockSpec {
@@ -23331,7 +23331,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
             },
         ];
@@ -23371,7 +23371,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
             },
             ParameterBlockSpec {
@@ -23385,7 +23385,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
             },
         ];
@@ -23480,7 +23480,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
             },
             ParameterBlockSpec {
@@ -23492,7 +23492,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
             },
         ];
@@ -23553,7 +23553,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
             },
             ParameterBlockSpec {
@@ -23565,7 +23565,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
             },
         ];
@@ -23892,7 +23892,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
             },
             ParameterBlockSpec {
@@ -23904,7 +23904,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
             },
         ];
@@ -24456,7 +24456,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
             },
             ParameterBlockSpec {
@@ -24468,7 +24468,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
             },
             ParameterBlockSpec {
@@ -24480,7 +24480,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
             },
         ];
@@ -24610,7 +24610,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
             },
             ParameterBlockSpec {
@@ -24622,7 +24622,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
             },
             ParameterBlockSpec {
@@ -24634,7 +24634,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
             },
         ];
@@ -24933,7 +24933,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
             },
             ParameterBlockSpec {
@@ -24945,7 +24945,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
             },
             ParameterBlockSpec {
@@ -24957,7 +24957,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
             },
         ];
@@ -25081,7 +25081,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
             },
             ParameterBlockSpec {
@@ -25093,7 +25093,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
             },
             ParameterBlockSpec {
@@ -25105,7 +25105,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
             },
         ];
@@ -26075,7 +26075,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(k),
                 initial_beta: None,
                 gauge_priority: 100,
-                row_scaling: None,
+                eta_row_scaling: None,
                 jacobian_callback: None,
             }
         }
@@ -29478,7 +29478,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
             },
             ParameterBlockSpec {
@@ -29490,7 +29490,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
             },
         ];
@@ -29603,7 +29603,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
             },
             ParameterBlockSpec {
@@ -29617,7 +29617,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
             },
         ];
