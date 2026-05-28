@@ -7797,6 +7797,14 @@ pub fn build_bspline_basis_1d(
         return Err(BasisError::InvalidRange(start, end));
     }
 
+    // Issue #340: auto-shrink the requested (degree, num_internal_knots) when
+    // `n = data.len()` is too small for the user's request. The shrink only
+    // touches the auto/data-driven knot specs — when the caller provides an
+    // explicit clamped knot vector or periodic geometry, we respect it
+    // verbatim (their knots already encode a deliberate degree choice).
+    let spec_owned = maybe_auto_shrink_bspline_spec(spec, data.len());
+    let spec = &spec_owned;
+
     let periodic_build = match &spec.knotspec {
         BSplineKnotSpec::PeriodicUniform {
             data_range,

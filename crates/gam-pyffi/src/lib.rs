@@ -3448,10 +3448,18 @@ fn auto_knots_1d<'py>(
     t: PyReadonlyArray1<'py, f64>,
     num_internal_knots: usize,
     degree: usize,
-) -> PyResult<Py<PyArray1<f64>>> {
-    let knots = auto_knot_vector_1d_quantile(t.as_array(), num_internal_knots, degree)
+) -> PyResult<(Py<PyArray1<f64>>, usize, usize, bool)> {
+    // Issue #340: return the auto-shrunk effective `(degree, num_internal_knots)`
+    // alongside the knot vector so Python callers can observe when the engine
+    // had to downgrade their requested basis to fit small-n data.
+    let result = auto_knot_vector_1d_quantile(t.as_array(), num_internal_knots, degree)
         .map_err(|err| py_value_error(err.to_string()))?;
-    Ok(knots.into_pyarray(py).unbind())
+    Ok((
+        result.knots.into_pyarray(py).unbind(),
+        result.degree,
+        result.num_internal_knots,
+        result.shrunk,
+    ))
 }
 
 #[pyfunction(signature = (t, num_centers))]

@@ -37,6 +37,52 @@ ShapeConstraintLiteral = Literal[
 from ._basis_protocol import BasisDescriptor as _BasisDescriptor
 
 
+def _smooth_kind_name(cls: type) -> str:
+    """Map a ``Smooth`` subclass to its canonical Rust ``kind`` discriminator.
+
+    The discriminator is the same string the formula DSL uses as the
+    smooth-term head (``duchon``, ``matern``, ``sphere``, ``bspline``,
+    ``tensor_bspline``, ``pca``, ``periodic_spline_curve``, ``categorical``).
+    Used by :meth:`Smooth.to_rust_descriptor` so the Rust bridge can match a
+    descriptor against the formula-DSL smooth that names the same symbol.
+    """
+    name = cls.__name__
+    if name == "TensorBSpline":
+        return "tensor_bspline"
+    if name == "PeriodicSplineCurve":
+        return "periodic_spline_curve"
+    return name.lower()
+
+
+def _array_to_list(value: Any) -> Any:
+    """Coerce an array-like to a plain nested list of floats.
+
+    The Rust bridge accepts JSON-able ``Vec<Vec<f64>>`` for 2-D center
+    matrices and ``Vec<f64>`` for 1-D knot vectors. Anything that does not
+    look numeric round-trips as-is so downstream serialization can reject it
+    with a precise error.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return [_array_to_list(v) for v in value]
+    import numpy as np
+
+    if isinstance(value, np.ndarray):
+        if value.ndim == 1:
+            return [float(v) for v in value.tolist()]
+        if value.ndim == 2:
+            return [[float(v) for v in row] for row in value.tolist()]
+        raise ValueError(
+            f"smooth descriptor array must be 1-D or 2-D; got {value.ndim}-D"
+        )
+    try:
+        arr = np.asarray(value, dtype=float)
+    except (TypeError, ValueError):
+        return value
+    return _array_to_list(arr)
+
+
 @dataclass(slots=True)
 class Smooth(_BasisDescriptor):
     """Base class for all smooth-term specs. Don't instantiate directly.
@@ -228,6 +274,20 @@ class Duchon(Smooth):
         from ._basis_eval import duchon_evaluate_numpy
         return duchon_evaluate_numpy(self, coords)
 
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        out = super().to_rust_descriptor()
+        if self.centers is not None:
+            if isinstance(self.centers, int):
+                out["n_centers"] = int(self.centers)
+            else:
+                out["centers"] = _array_to_list(self.centers)
+        out["m"] = int(self.m)
+        if self.length_scale is not None:
+            out["length_scale"] = float(self.length_scale)
+        if self.periodic_per_axis is not None:
+            out["periodic_per_axis"] = [bool(b) for b in self.periodic_per_axis]
+        return out
+
     SUPPORTED_BACKENDS: ClassVar[frozenset[str]] = frozenset({"torch", "numpy", "jax"})
 
 
@@ -264,6 +324,19 @@ class BSpline(Smooth):
     def _evaluate_numpy(self, coords: Any) -> Any:
         from ._basis_eval import bspline_evaluate_numpy
         return bspline_evaluate_numpy(self, coords)
+
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        out = super().to_rust_descriptor()
+        if self.knots is not None:
+            if isinstance(self.knots, int):
+                out["n_knots"] = int(self.knots)
+            else:
+                out["knots"] = _array_to_list(self.knots)
+        out["degree"] = int(self.degree)
+        out["penalty_order"] = int(self.penalty_order)
+        if self.periodic:
+            out["periodic"] = True
+        return out
 
     SUPPORTED_BACKENDS: ClassVar[frozenset[str]] = frozenset({"torch", "numpy", "jax"})
 
