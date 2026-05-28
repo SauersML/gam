@@ -8575,9 +8575,10 @@ fn fit_multinomial_formula_pyfunc<'py>(
     max_iter: usize,
     tol: f64,
 ) -> PyResult<Py<PyBytes>> {
-    let bytes = detach_py_result(py, "fit_multinomial_formula", move || {
-        let dataset = dataset_with_inferred_schema(headers, rows)
-            .map_err(|err| err.to_string())?;
+    let bytes = detach_pyresult(py, "fit_multinomial_formula", move || {
+        let dataset = dataset_with_inferred_schema(headers, rows).map_err(py_value_error)?;
+        // Typed engine path: `EstimationError` → matching `gamfit.*Error`
+        // subclass via `estimation_error_to_pyerr` (issue #343).
         let saved = gam::families::multinomial::fit_penalized_multinomial_formula(
             &dataset,
             &formula,
@@ -8586,13 +8587,14 @@ fn fit_multinomial_formula_pyfunc<'py>(
             max_iter,
             tol,
         )
-        .map_err(|err| err.to_string())?;
+        .map_err(estimation_error_to_pyerr)?;
         let envelope = MultinomialModelEnvelope {
             model_class: "multinomial".to_string(),
             saved,
         };
-        serde_json::to_vec(&envelope)
-            .map_err(|err| format!("failed to serialize multinomial model: {err}"))
+        serde_json::to_vec(&envelope).map_err(|err| {
+            py_value_error(format!("failed to serialize multinomial model: {err}"))
+        })
     })?;
     Ok(PyBytes::new(py, &bytes).unbind())
 }
