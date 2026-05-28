@@ -460,8 +460,8 @@ fn jacobian_box_is_send() {
     let specs = vec![make_spec("mu", xa), make_spec("log_sigma", xb)];
     let jac = GaussianLocationScaleFamily::block_effective_jacobian(&specs, 0)
         .expect("block_effective_jacobian");
-    // Verify the jacobian is non-trivially constructed (non-zero shape).
-    let state = gam::families::custom_family::FamilyLinearizationState {
+    // Verify the jacobian produces a well-formed matrix.
+    let state = FamilyLinearizationState {
         beta: &[],
         family_scalars: None,
         channel_hessian: None,
@@ -470,5 +470,6 @@ fn jacobian_box_is_send() {
     let j = jac.effective_jacobian_at(&state).expect("effective_jacobian_at");
     assert!(j.nrows() > 0, "jacobian must have rows");
     assert!(j.ncols() > 0, "jacobian must have columns");
+    // Compile-time Send invariant: constructing the box must be Send.
     assert_send(jac);
 }
