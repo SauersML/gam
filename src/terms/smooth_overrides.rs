@@ -601,13 +601,10 @@ fn parse_2d_array(value: &JsonValue, field: &str, symbol: &str) -> Result<Array2
         .map_err(|e| format!("smooths[{symbol:?}].{field} shape conversion failed: {e}"))
 }
 
-fn parse_periodic_per_axis(
-    value: &JsonValue,
-    symbol: &str,
-) -> Result<Vec<Option<f64>>, String> {
-    let arr = value.as_array().ok_or_else(|| {
-        format!("smooths[{symbol:?}].periodic_per_axis must be an array")
-    })?;
+fn parse_periodic_per_axis(value: &JsonValue, symbol: &str) -> Result<Vec<Option<f64>>, String> {
+    let arr = value
+        .as_array()
+        .ok_or_else(|| format!("smooths[{symbol:?}].periodic_per_axis must be an array"))?;
     // We accept either form: per-axis booleans (the Python descriptor's
     // default emission) or per-axis explicit numeric periods. Booleans map
     // to `None` (open axis) or `Some(0.0)` (sentinel meaning "infer from

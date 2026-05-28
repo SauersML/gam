@@ -2904,8 +2904,8 @@ fn competing_risks_cif_impl(
     // `ndarray::stack` is a pure shape contract violation — keep it as a
     // bare `PyValueError` rather than forcing it through a typed engine
     // enum it does not belong to.
-    let cumulative_hazard = ndarray::stack(Axis(0), &endpoint_views)
-        .map_err(|err| py_value_error(err.to_string()))?;
+    let cumulative_hazard =
+        ndarray::stack(Axis(0), &endpoint_views).map_err(|err| py_value_error(err.to_string()))?;
     // Typed engine path: `assemble_competing_risks_cif` returns
     // `Result<_, SurvivalError>`, dispatch to `gamfit.SurvivalError`.
     let result = gam::survival::assemble_competing_risks_cif(times, cumulative_hazard.view())
@@ -8594,9 +8594,8 @@ fn fit_multinomial_formula_pyfunc<'py>(
             model_class: "multinomial".to_string(),
             saved,
         };
-        serde_json::to_vec(&envelope).map_err(|err| {
-            py_value_error(format!("failed to serialize multinomial model: {err}"))
-        })
+        serde_json::to_vec(&envelope)
+            .map_err(|err| py_value_error(format!("failed to serialize multinomial model: {err}")))
     })?;
     Ok(PyBytes::new(py, &bytes).unbind())
 }
