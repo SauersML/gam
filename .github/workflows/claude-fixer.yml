@@ -85,24 +85,61 @@ jobs:
             cleanly. Continuity across runs is the point of the per-issue
             branch.
 
-            ## Picking the issue
+            ## Picking the issue (with a real lock, not just etiquette)
 
-            Survey open issues first — `gh issue list --state open --limit
-            100`. Skip any issue that already has an open PR linked from it
-            (someone — likely a previous run of yourself — is mid-fix; let
-            them finish). Among the rest, prefer:
-              - Issues where you can produce a *complete*, principled fix,
-                not a partial one. A hard issue done right beats two easy
-                ones done shallowly.
-              - Issues touching subsystems that haven't been fixed recently
-                (look at recent merged PRs and recent commits to see what
-                area has been getting attention). Spread the love.
-              - Issues with failing tests already committed to `main` — the
-                feedback loop is tightest.
-            If you start a partial fix on a fresh branch and discover the
-            issue is the wrong shape (duplicate, not actually a bug, blocked
-            on something external), say so on the issue and exit. Don't
-            ship a fix that isn't.
+            You get to choose. Survey open issues — `gh issue list --state
+            open --limit 200` plus `gh issue view <N>` on anything that
+            catches your eye. Pick what you want to work on based on
+            whatever criteria you find compelling (hardest, most beautiful,
+            longest-stalled, freshest, most under-attended subsystem —
+            your call).
+
+            But you must not pick an issue another concurrent run is
+            already working on. Concurrent runs are real here — the cron
+            is tight and individual fixes can take hours. Use this lock
+            protocol exactly:
+
+            **1. Compute who-is-busy.** An issue `<N>` is considered
+            actively claimed if ANY of these hold:
+              a. Its most recent comment whose body starts with
+                 `🔒 claim:` is younger than 45 minutes AND names a run-id
+                 different from yours.
+              b. Branch `fix/issue-<N>` exists on `origin` and was pushed
+                 to in the last 45 minutes (`gh api repos/{owner}/{repo}/branches/fix/issue-<N>`
+                 or `git for-each-ref --format='%(committerdate:iso) %(refname)' refs/remotes/origin/fix/issue-<N>`).
+              c. An open PR linked to `<N>` had a commit pushed in the
+                 last 45 minutes.
+            45 minutes is the heartbeat window: longer than one cron tick,
+            short enough that abandoned claims expire on their own.
+
+            **2. Pick from the unclaimed set.** Free choice within it.
+
+            **3. Claim atomically.** Before doing any real work, post a
+            comment on the chosen issue whose first line is exactly:
+                `🔒 claim: run ${{ github.run_id }} attempt ${{ github.run_attempt }}`
+            Then `sleep 15` and re-fetch the issue's comments. If a
+            different run posted its own `🔒 claim:` comment at a
+            timestamp earlier than yours (or simultaneously and with a
+            lower run-id), you lost the race — drop the issue, pick
+            another, repeat. If you won, proceed.
+
+            **4. Heartbeat while working.** Push to `fix/issue-<N>` (even
+            a tiny WIP commit) or post a brief progress comment at least
+            every 40 minutes. This keeps your claim alive for any other
+            run that wakes up during your work.
+
+            **5. Release on exit.** When you stop — whether finished,
+            handing off mid-fix, or bailing on a wrong-shape issue — post
+            a final comment whose first line is exactly:
+                `🔓 release: run ${{ github.run_id }}` followed by a
+            one-paragraph status (done / paused at step X / not a real
+            bug / etc.). This lets the next run skip the 45-minute wait
+            if you finished cleanly.
+
+            If you bail because the issue is the wrong shape (duplicate,
+            not reproducible, blocked on something external), close the
+            release comment with your assessment. Don't ship a fix that
+            isn't.
 
             ## Branching and PRs (allowed here, unlike the bug-hunt agent)
 
