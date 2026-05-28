@@ -517,7 +517,11 @@ pub struct MatvecDiagPenaltyOp {
 impl MatvecDiagPenaltyOp {
     pub fn new(k: usize, matvec: SharedBetaMatvec, diagonal_vec: Array1<f64>) -> Self {
         assert_eq!(diagonal_vec.len(), k);
-        Self { k, matvec, diagonal_vec }
+        Self {
+            k,
+            matvec,
+            diagonal_vec,
+        }
     }
 }
 
@@ -1462,9 +1466,11 @@ impl ArrowSchurSystem {
         // Mirror the closure into a BetaPenaltyOp so all hot paths (#296)
         // route through the trait while preserving hbb_matvec + hbb_diag for
         // code that inspects them directly.
-        let penalty_op: Option<Arc<dyn BetaPenaltyOp>> = Some(Arc::new(
-            MatvecDiagPenaltyOp::new(k, Arc::clone(&matvec_arc), diag.clone()),
-        ));
+        let penalty_op: Option<Arc<dyn BetaPenaltyOp>> = Some(Arc::new(MatvecDiagPenaltyOp::new(
+            k,
+            Arc::clone(&matvec_arc),
+            diag.clone(),
+        )));
         let mut sys = Self {
             rows,
             hbb: Array2::<f64>::zeros((0, 0)),
@@ -1681,12 +1687,7 @@ impl ArrowSchurSystem {
     /// Add the `b×b` penalty sub-block for `id` to `out`, routing through
     /// `penalty_op` or falling back to `hbb` / `hbb_diag` inline.
     #[inline]
-    fn penalty_block_add(
-        &self,
-        id: BetaBlockId,
-        offsets: &[Range<usize>],
-        out: &mut Array2<f64>,
-    ) {
+    fn penalty_block_add(&self, id: BetaBlockId, offsets: &[Range<usize>], out: &mut Array2<f64>) {
         if let Some(op) = self.penalty_op.as_ref() {
             op.block(id, offsets, out);
         } else {
@@ -1713,11 +1714,7 @@ impl ArrowSchurSystem {
     /// Used by the cluster-Jacobi preconditioner (#299) which groups columns
     /// by spectral adjacency rather than contiguous block ranges.
     #[inline]
-    fn penalty_subblock_add(
-        &self,
-        cols: &[usize],
-        out: &mut Array2<f64>,
-    ) {
+    fn penalty_subblock_add(&self, cols: &[usize], out: &mut Array2<f64>) {
         let b = cols.len();
         if let Some(op) = self.penalty_op.as_ref() {
             // Probe each column basis vector and extract the sub-block entries.
@@ -2253,10 +2250,7 @@ impl StreamingArrowSchur {
         if row.gt.len() != expected_di {
             return Err(ArrowSchurError::PerRowFactorFailed {
                 row: row_idx,
-                reason: format!(
-                    "streaming row g_t length {} != {expected_di}",
-                    row.gt.len()
-                ),
+                reason: format!("streaming row g_t length {} != {expected_di}", row.gt.len()),
             });
         }
         Ok::<(), _>(())
@@ -2857,7 +2851,9 @@ impl ArrowFactorCache {
         for i in 0..n {
             let di = self.row_dims[i];
             let row_base = self.row_offsets[i];
-            let rhs = delta_gt.slice(ndarray::s![row_base..row_base + di]).to_owned();
+            let rhs = delta_gt
+                .slice(ndarray::s![row_base..row_base + di])
+                .to_owned();
             let v = chol_solve_vector(self.undamped_factor(i), &rhs);
             for c in 0..di {
                 out[row_base + c] = -v[c];
@@ -3156,8 +3152,12 @@ pub fn arrow_damped_quadratic_model_reduction(
     // no Arc-clone; dispatches inline to penalty_op or hbb.
     let mut hbb_delta = Array1::<f64>::zeros(sys.k);
     {
-        let x_slice = delta_beta.as_slice().expect("delta_beta must be contiguous");
-        let y_slice = hbb_delta.as_slice_mut().expect("hbb_delta must be contiguous");
+        let x_slice = delta_beta
+            .as_slice()
+            .expect("delta_beta must be contiguous");
+        let y_slice = hbb_delta
+            .as_slice_mut()
+            .expect("hbb_delta must be contiguous");
         sys.penalty_matvec_add(x_slice, y_slice);
     }
     quad += delta_beta.dot(&hbb_delta);
@@ -3215,9 +3215,8 @@ pub fn arrow_bare_quadratic_model_reduction(
     // Compute the damped version first, then subtract the ridge contributions
     // to recover the bare-H quadratic.  This mirrors the beta-only PIRLS path:
     //     δ'(H+λI)δ − λ‖δ‖² = δ'Hδ
-    let damped = arrow_damped_quadratic_model_reduction(
-        sys, delta_t, delta_beta, ridge_t, ridge_beta,
-    )?;
+    let damped =
+        arrow_damped_quadratic_model_reduction(sys, delta_t, delta_beta, ridge_t, ridge_beta)?;
     // Subtract 0.5 * (ridge_beta * ‖δβ‖² + ridge_t * ‖δt‖²).
     // The sign convention: arrow_damped returns -(lin + 0.5*quad), so the
     // ridge terms enter with a negative sign there.  To remove them we add
@@ -3319,12 +3318,14 @@ fn solve_arrow_newton_step_artifacts(
     let (delta_beta, schur_factor, pcg_diagnostics) = match options.mode {
         ArrowSolverMode::Direct => {
             let schur = build_dense_schur_direct(sys, &htt_factors, ridge_beta, &backend)?;
-            let (db, sf, diag) = solve_dense_reduced_system(&schur, &rhs_beta, options, trust_metric_weights)?;
+            let (db, sf, diag) =
+                solve_dense_reduced_system(&schur, &rhs_beta, options, trust_metric_weights)?;
             (db, sf, diag)
         }
         ArrowSolverMode::SqrtBA => {
             let schur = build_dense_schur_sqrt_ba(sys, &htt_factors, ridge_beta, &backend)?;
-            let (db, sf, diag) = solve_dense_reduced_system(&schur, &rhs_beta, options, trust_metric_weights)?;
+            let (db, sf, diag) =
+                solve_dense_reduced_system(&schur, &rhs_beta, options, trust_metric_weights)?;
             (db, sf, diag)
         }
         ArrowSolverMode::InexactPCG => {
@@ -3555,9 +3556,15 @@ fn schur_matvec<B: BatchedBlockSolver>(
 enum BlockFactor {
     /// Cholesky L stored column-major via faer. `range` identifies the
     /// columns in the full K-vector this block covers.
-    Chol { factor: FaerLlt<f64>, range: Range<usize> },
+    Chol {
+        factor: FaerLlt<f64>,
+        range: Range<usize>,
+    },
     /// Scalar fallback: per-element `1/s_aa` for each column in `range`.
-    Scalar { inv: Array1<f64>, range: Range<usize> },
+    Scalar {
+        inv: Array1<f64>,
+        range: Range<usize>,
+    },
 }
 
 impl std::fmt::Debug for BlockFactor {
@@ -3716,7 +3723,11 @@ impl JacobiPreconditioner {
             // penalty_block_add (#296): routes to penalty_op or falls back to
             // hbb / hbb_diag inline without Arc-clone per loop iteration.
             let mut schur_block = Array2::<f64>::zeros((b, b));
-            sys.penalty_block_add(BetaBlockId(block_idx), block_offsets.as_ref(), &mut schur_block);
+            sys.penalty_block_add(
+                BetaBlockId(block_idx),
+                block_offsets.as_ref(),
+                &mut schur_block,
+            );
             for bi in 0..b {
                 schur_block[[bi, bi]] += ridge_beta;
             }
@@ -3732,10 +3743,8 @@ impl JacobiPreconditioner {
                 let mut solved_cols = Array2::<f64>::zeros((di, b));
                 for bj in 0..b {
                     let gj = range.start + bj;
-                    let solved = backend.solve_block_vector(
-                        &htt_factors[i],
-                        &htbeta_full.column(gj).to_owned(),
-                    );
+                    let solved = backend
+                        .solve_block_vector(&htt_factors[i], &htbeta_full.column(gj).to_owned());
                     for c in 0..di {
                         solved_cols[[c, bj]] = solved[c];
                     }
@@ -3807,9 +3816,8 @@ impl JacobiPreconditioner {
                     let len = rhs.len();
                     // SAFETY: rhs is a uniquely-borrowed contiguous Array1
                     // with positive stride (standard layout).
-                    let rhs_mat = unsafe {
-                        faer::MatRef::from_raw_parts(rhs.as_ptr(), len, 1, stride, 0)
-                    };
+                    let rhs_mat =
+                        unsafe { faer::MatRef::from_raw_parts(rhs.as_ptr(), len, 1, stride, 0) };
                     let solved = factor.solve(rhs_mat);
                     for (local, gi) in range.clone().enumerate() {
                         out[gi] = solved[(local, 0)];
@@ -3855,8 +3863,14 @@ const PRECOND_ESCALATE_K_THRESHOLD: usize = 100;
 /// Cholesky or scalar factor for one cluster of the beta-coefficient graph.
 #[derive(Clone)]
 enum ClusterFactor {
-    Chol { cols: Vec<usize>, factor: FaerLlt<f64> },
-    Scalar { cols: Vec<usize>, inv: Vec<f64> },
+    Chol {
+        cols: Vec<usize>,
+        factor: FaerLlt<f64>,
+    },
+    Scalar {
+        cols: Vec<usize>,
+        inv: Vec<f64>,
+    },
 }
 
 impl std::fmt::Debug for ClusterFactor {
@@ -3897,13 +3911,14 @@ impl ClusterJacobiPreconditioner {
     ) -> Result<Self, ArrowSchurError> {
         if sys.block_offsets.is_empty() {
             let cols: Vec<usize> = (0..sys.k).collect();
-            return Self::build_from_column_groups(
-                sys, htt_factors, ridge_beta, backend, &[cols],
-            );
+            return Self::build_from_column_groups(sys, htt_factors, ridge_beta, backend, &[cols]);
         }
         let graph = BetaCouplingGraph::build(
             &sys.block_offsets,
-            &sys.rows.iter().map(|r| r.htbeta.clone()).collect::<Vec<_>>(),
+            &sys.rows
+                .iter()
+                .map(|r| r.htbeta.clone())
+                .collect::<Vec<_>>(),
         );
         let col_groups: Vec<Vec<usize>> = graph
             .component_partition()
@@ -3936,7 +3951,10 @@ impl ClusterJacobiPreconditioner {
             }
             if b > CLUSTER_JACOBI_MAX_CLUSTER {
                 let inv = build_schur_scalar_inv(sys, htt_factors, ridge_beta, backend, cols)?;
-                clusters.push(ClusterFactor::Scalar { cols: cols.clone(), inv });
+                clusters.push(ClusterFactor::Scalar {
+                    cols: cols.clone(),
+                    inv,
+                });
                 continue;
             }
             let mut s_block = Array2::<f64>::zeros((b, b));
@@ -3977,10 +3995,16 @@ impl ClusterJacobiPreconditioner {
                 FaerLlt::new(view.as_ref(), Side::Lower).ok()
             };
             if let Some(llt) = factor_opt {
-                clusters.push(ClusterFactor::Chol { cols: cols.clone(), factor: llt });
+                clusters.push(ClusterFactor::Chol {
+                    cols: cols.clone(),
+                    factor: llt,
+                });
             } else {
                 let inv = build_schur_scalar_inv(sys, htt_factors, ridge_beta, backend, cols)?;
-                clusters.push(ClusterFactor::Scalar { cols: cols.clone(), inv });
+                clusters.push(ClusterFactor::Scalar {
+                    cols: cols.clone(),
+                    inv,
+                });
             }
         }
         Ok(Self { clusters })
@@ -4014,13 +4038,23 @@ impl AdditiveSchwarzPreconditioner {
         if sys.block_offsets.is_empty() {
             let cols: Vec<usize> = (0..sys.k).collect();
             let inner = ClusterJacobiPreconditioner::build_from_column_groups(
-                sys, htt_factors, ridge_beta, backend, &[cols],
+                sys,
+                htt_factors,
+                ridge_beta,
+                backend,
+                &[cols],
             )?;
-            return Ok(Self { clusters: inner.clusters, weights: vec![1.0f64; sys.k] });
+            return Ok(Self {
+                clusters: inner.clusters,
+                weights: vec![1.0f64; sys.k],
+            });
         }
         let graph = BetaCouplingGraph::build(
             &sys.block_offsets,
-            &sys.rows.iter().map(|r| r.htbeta.clone()).collect::<Vec<_>>(),
+            &sys.rows
+                .iter()
+                .map(|r| r.htbeta.clone())
+                .collect::<Vec<_>>(),
         );
         let col_groups: Vec<Vec<usize>> = graph
             .component_partition()
@@ -4045,12 +4079,21 @@ impl AdditiveSchwarzPreconditioner {
                 counts[gi] += 1;
             }
         }
-        let weights: Vec<f64> =
-            counts.iter().map(|&c| if c == 0 { 1.0 } else { 1.0 / c as f64 }).collect();
+        let weights: Vec<f64> = counts
+            .iter()
+            .map(|&c| if c == 0 { 1.0 } else { 1.0 / c as f64 })
+            .collect();
         let inner = ClusterJacobiPreconditioner::build_from_column_groups(
-            sys, htt_factors, ridge_beta, backend, &col_groups,
+            sys,
+            htt_factors,
+            ridge_beta,
+            backend,
+            &col_groups,
         )?;
-        Ok(Self { clusters: inner.clusters, weights })
+        Ok(Self {
+            clusters: inner.clusters,
+            weights,
+        })
     }
 
     fn apply(&self, r: &Array1<f64>) -> Array1<f64> {
@@ -4063,11 +4106,7 @@ impl AdditiveSchwarzPreconditioner {
 }
 
 /// Apply a cluster factor (overwrite) for non-overlapping clusters.
-fn apply_cluster_non_overlapping(
-    cluster: &ClusterFactor,
-    r: &Array1<f64>,
-    out: &mut Array1<f64>,
-) {
+fn apply_cluster_non_overlapping(cluster: &ClusterFactor, r: &Array1<f64>, out: &mut Array1<f64>) {
     match cluster {
         ClusterFactor::Scalar { cols, inv } => {
             for (local, &gi) in cols.iter().enumerate() {
@@ -4084,8 +4123,7 @@ fn apply_cluster_non_overlapping(
             let stride = rhs.strides()[0];
             let len = rhs.len();
             // SAFETY: rhs is uniquely-borrowed contiguous Array1 with positive stride.
-            let rhs_mat =
-                unsafe { faer::MatRef::from_raw_parts(rhs.as_ptr(), len, 1, stride, 0) };
+            let rhs_mat = unsafe { faer::MatRef::from_raw_parts(rhs.as_ptr(), len, 1, stride, 0) };
             let solved = factor.solve(rhs_mat);
             for (local, &gi) in cols.iter().enumerate() {
                 out[gi] = solved[(local, 0)];
@@ -4118,8 +4156,7 @@ fn apply_cluster_overlapping(
             let stride = rhs.strides()[0];
             let len = rhs.len();
             // SAFETY: rhs is uniquely-borrowed contiguous Array1 with positive stride.
-            let rhs_mat =
-                unsafe { faer::MatRef::from_raw_parts(rhs.as_ptr(), len, 1, stride, 0) };
+            let rhs_mat = unsafe { faer::MatRef::from_raw_parts(rhs.as_ptr(), len, 1, stride, 0) };
             let solved = factor.solve(rhs_mat);
             for (local, &gi) in cols.iter().enumerate() {
                 out[gi] += weights[gi] * solved[(local, 0)];
@@ -4189,32 +4226,52 @@ fn steihaug_pcg_auto<B: BatchedBlockSolver>(
     gpu_matvec: Option<&GpuSchurMatvec>,
     metric_weights: Option<&MetricWeights>,
 ) -> Result<(Array1<f64>, PcgDiagnostics), ArrowSchurError> {
-    let jacobi =
-        JacobiPreconditioner::from_arrow_schur(sys, htt_factors, ridge_beta, backend)?;
+    let jacobi = JacobiPreconditioner::from_arrow_schur(sys, htt_factors, ridge_beta, backend)?;
     let (x0, diag0) = run_pcg_with_preconditioner(
-        sys, htt_factors, ridge_beta, rhs, |r| jacobi.apply(r),
-        pcg, trust, backend, gpu_matvec, metric_weights,
+        sys,
+        htt_factors,
+        ridge_beta,
+        rhs,
+        |r| jacobi.apply(r),
+        pcg,
+        trust,
+        backend,
+        gpu_matvec,
+        metric_weights,
     )?;
-    if sys.k <= PRECOND_ESCALATE_K_THRESHOLD
-        || diag0.stopping_reason != PcgStopReason::MaxIter
-    {
+    if sys.k <= PRECOND_ESCALATE_K_THRESHOLD || diag0.stopping_reason != PcgStopReason::MaxIter {
         return Ok((x0, diag0));
     }
     let cluster =
         ClusterJacobiPreconditioner::from_arrow_schur(sys, htt_factors, ridge_beta, backend)?;
     let (x1, diag1) = run_pcg_with_preconditioner(
-        sys, htt_factors, ridge_beta, rhs, |r| cluster.apply(r),
-        pcg, trust, backend, gpu_matvec, metric_weights,
+        sys,
+        htt_factors,
+        ridge_beta,
+        rhs,
+        |r| cluster.apply(r),
+        pcg,
+        trust,
+        backend,
+        gpu_matvec,
+        metric_weights,
     )?;
     if diag1.stopping_reason != PcgStopReason::MaxIter {
         return Ok((x1, diag1));
     }
-    let schwarz = AdditiveSchwarzPreconditioner::from_arrow_schur(
-        sys, htt_factors, ridge_beta, backend, 1,
-    )?;
+    let schwarz =
+        AdditiveSchwarzPreconditioner::from_arrow_schur(sys, htt_factors, ridge_beta, backend, 1)?;
     run_pcg_with_preconditioner(
-        sys, htt_factors, ridge_beta, rhs, |r| schwarz.apply(r),
-        pcg, trust, backend, gpu_matvec, metric_weights,
+        sys,
+        htt_factors,
+        ridge_beta,
+        rhs,
+        |r| schwarz.apply(r),
+        pcg,
+        trust,
+        backend,
+        gpu_matvec,
+        metric_weights,
     )
 }
 
@@ -4236,7 +4293,9 @@ where
     ApplyPrec: FnMut(&Array1<f64>) -> Array1<f64>,
 {
     let max_iters = pcg.max_iterations.min(trust.max_iterations);
-    let tol = pcg.relative_tolerance.max(trust.steihaug_relative_tolerance);
+    let tol = pcg
+        .relative_tolerance
+        .max(trust.steihaug_relative_tolerance);
     if let Some(gpu_mv) = gpu_matvec {
         let gpu_mv = Arc::clone(gpu_mv);
         steihaug_cg(
@@ -4378,8 +4437,7 @@ where
     let mut rz = metric_dot(&r, &z, metric_weights);
     if rz <= 0.0 || !rz.is_finite() {
         if radius.is_finite() {
-            diag.final_relative_residual =
-                metric_norm(r.view(), metric_weights) / rhs_norm;
+            diag.final_relative_residual = metric_norm(r.view(), metric_weights) / rhs_norm;
             diag.stopping_reason = PcgStopReason::TrustRegion;
             return Ok((step_to_trust_boundary(&x, &r, radius, metric_weights), diag));
         }
@@ -4402,13 +4460,11 @@ where
         let pap = metric_dot(&p, &ap, metric_weights);
         if pap <= 0.0 || !pap.is_finite() {
             if radius.is_finite() {
-                diag.final_relative_residual =
-                    metric_norm(r.view(), metric_weights) / rhs_norm;
+                diag.final_relative_residual = metric_norm(r.view(), metric_weights) / rhs_norm;
                 diag.stopping_reason = PcgStopReason::TrustRegion;
                 return Ok((step_to_trust_boundary(&x, &p, radius, metric_weights), diag));
             }
-            diag.final_relative_residual =
-                metric_norm(r.view(), metric_weights) / rhs_norm;
+            diag.final_relative_residual = metric_norm(r.view(), metric_weights) / rhs_norm;
             diag.stopping_reason = PcgStopReason::Indefinite;
             return Err(ArrowSchurError::PcgFailed {
                 reason: "negative curvature in unbounded Schur PCG".to_string(),
@@ -4419,8 +4475,7 @@ where
             candidate[i] = x[i] + alpha * p[i];
         }
         if radius.is_finite() && metric_norm(candidate.view(), metric_weights) >= radius {
-            diag.final_relative_residual =
-                metric_norm(r.view(), metric_weights) / rhs_norm;
+            diag.final_relative_residual = metric_norm(r.view(), metric_weights) / rhs_norm;
             diag.stopping_reason = PcgStopReason::TrustRegion;
             return Ok((step_to_trust_boundary(&x, &p, radius, metric_weights), diag));
         }
@@ -4429,8 +4484,7 @@ where
             r[i] -= alpha * ap[i];
         }
         if metric_norm(r.view(), metric_weights) <= tol {
-            diag.final_relative_residual =
-                metric_norm(r.view(), metric_weights) / rhs_norm;
+            diag.final_relative_residual = metric_norm(r.view(), metric_weights) / rhs_norm;
             diag.stopping_reason = PcgStopReason::Converged;
             return Ok((x, diag));
         }
@@ -4438,8 +4492,7 @@ where
         diag.precond_apply_calls += 1;
         let rz_next = metric_dot(&r, &z, metric_weights);
         if rz_next <= 0.0 || !rz_next.is_finite() {
-            diag.final_relative_residual =
-                metric_norm(r.view(), metric_weights) / rhs_norm;
+            diag.final_relative_residual = metric_norm(r.view(), metric_weights) / rhs_norm;
             diag.stopping_reason = PcgStopReason::Stagnation;
             return Err(ArrowSchurError::PcgFailed {
                 reason: "non-positive or non-finite PCG residual".to_string(),

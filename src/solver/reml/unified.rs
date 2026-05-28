@@ -11078,12 +11078,7 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
                     match &self.kernel {
                         OuterHessianDerivativeKernel::Gaussian => 0.0,
                         OuterHessianDerivativeKernel::ScalarGlm { .. } => {
-                            self.scalar_correction_trace(
-                                idx,
-                                alpha,
-                                &coord.v,
-                                &correction_m_alpha,
-                            )?
+                            self.scalar_correction_trace(idx, alpha, &coord.v, &correction_m_alpha)?
                         }
                         OuterHessianDerivativeKernel::Callback { .. } => {
                             let second_v = &self

@@ -22,9 +22,8 @@
 //! K-cap multiplier mechanism quantitatively.
 
 use gam::families::marginal_slope_shared::{
-    AUTO_OUTER_MIN_K_FLOOR, AUTO_OUTER_WORK_BUDGET, AutoOuterCapReason,
-    AutoOuterSubsampleOptions, auto_outer_score_subsample,
-    maybe_install_auto_outer_subsample,
+    AUTO_OUTER_MIN_K_FLOOR, AUTO_OUTER_WORK_BUDGET, AutoOuterCapReason, AutoOuterSubsampleOptions,
+    auto_outer_score_subsample, maybe_install_auto_outer_subsample,
 };
 use gam::solver::identifiability_audit::audit_identifiability;
 use ndarray::{Array1, Array2};
@@ -70,7 +69,10 @@ fn h1b_target_k_with_survival_work_per_k_picks_work_rule() {
         .target_k_detailed(BIOBANK_N)
         .expect("biobank n should auto-subsample");
     let expected_k_work = (AUTO_OUTER_WORK_BUDGET / SURVIVAL_WORK_PER_K_UNIT) as usize;
-    assert_eq!(choice.k_work, expected_k_work, "k_work = 5e8 / 250_000 = 2_000");
+    assert_eq!(
+        choice.k_work, expected_k_work,
+        "k_work = 5e8 / 250_000 = 2_000"
+    );
     assert_eq!(
         choice.cap_reason,
         AutoOuterCapReason::Work,
@@ -99,7 +101,9 @@ fn h1c_maybe_install_honors_outer_work_per_k_unit_argument() {
     //
     // Post-fix: the function threads `outer_work_per_k_unit` into the options
     // it constructs, so the cap binds and K lands near 2_000.
-    let z: Vec<f64> = (0..BIOBANK_N).map(|i| (i as f64) / (BIOBANK_N as f64)).collect();
+    let z: Vec<f64> = (0..BIOBANK_N)
+        .map(|i| (i as f64) / (BIOBANK_N as f64))
+        .collect();
     let stratum: Vec<u8> = (0..BIOBANK_N).map(|i| (i & 1) as u8).collect();
     let opts_struct = gam::families::custom_family::BlockwiseFitOptions {
         auto_outer_subsample: true,
@@ -163,7 +167,9 @@ fn h1d_direct_capped_options_do_produce_small_k() {
     // mask comes out small. This proves the cap mechanism itself works,
     // so the bug is specifically in `maybe_install_auto_outer_subsample`
     // constructing default options at line 1109.
-    let z: Vec<f64> = (0..BIOBANK_N).map(|i| (i as f64) / (BIOBANK_N as f64)).collect();
+    let z: Vec<f64> = (0..BIOBANK_N)
+        .map(|i| (i as f64) / (BIOBANK_N as f64))
+        .collect();
     let stratum: Vec<u8> = (0..BIOBANK_N).map(|i| (i & 1) as u8).collect();
     let capped = AutoOuterSubsampleOptions {
         outer_work_per_k_unit: SURVIVAL_WORK_PER_K_UNIT,
@@ -201,7 +207,9 @@ fn h3a_uncapped_vs_capped_subsample_size_ratio_is_about_10x() {
     // HT-weighted row pass dominates, so this K ratio is the wall-time
     // and intermediate-working-set blowup the survival family would
     // suffer if the cap argument were not honoured.
-    let z: Vec<f64> = (0..BIOBANK_N).map(|i| (i as f64) / (BIOBANK_N as f64)).collect();
+    let z: Vec<f64> = (0..BIOBANK_N)
+        .map(|i| (i as f64) / (BIOBANK_N as f64))
+        .collect();
     let stratum: Vec<u8> = (0..BIOBANK_N).map(|i| (i & 1) as u8).collect();
 
     let uncapped = AutoOuterSubsampleOptions::default();
@@ -226,8 +234,16 @@ fn h3a_uncapped_vs_capped_subsample_size_ratio_is_about_10x() {
         k_capped,
         multiplier,
     );
-    assert!(k_capped <= 2_500, "capped K should ≤ 2500, got {}", k_capped);
-    assert!(k_uncapped >= 19_000, "uncapped K should ≥ 19_000, got {}", k_uncapped);
+    assert!(
+        k_capped <= 2_500,
+        "capped K should ≤ 2500, got {}",
+        k_capped
+    );
+    assert!(
+        k_uncapped >= 19_000,
+        "uncapped K should ≥ 19_000, got {}",
+        k_uncapped
+    );
     eprintln!(
         "H3a: K_uncapped={} K_capped={} multiplier={:.2}x (the resource ratio the cap argument saves)",
         k_uncapped, k_capped, multiplier
@@ -326,8 +342,7 @@ fn h2a_audit_marks_biobank_shape_fatal() {
     );
     // Independent line of evidence: rank deficiency is visible AND named.
     assert!(
-        audit.summary.contains("FATAL")
-            || audit.summary.contains("joint rank"),
+        audit.summary.contains("FATAL") || audit.summary.contains("joint rank"),
         "summary should name rank deficiency; got {:?}",
         audit.summary
     );
@@ -347,7 +362,9 @@ fn h2b_release_log_string_absent_from_current_source() {
     let specs = build_biobank_like_aliased_specs();
     let audit = audit_identifiability(&specs).expect("audit must run");
     assert!(
-        !audit.summary.contains("family-specific reparameterisation required"),
+        !audit
+            .summary
+            .contains("family-specific reparameterisation required"),
         "release-only phrase leaked into current source: {:?}",
         audit.summary
     );
@@ -375,9 +392,6 @@ fn h2c_canonicalize_returns_identifiability_failure_on_biobank_shape() {
             "canonicalize_for_identifiability should refuse the biobank shape; \
              it instead returned Ok (current source is missing the halt)."
         ),
-        Err(other) => panic!(
-            "expected IdentifiabilityFailure, got: {:?}",
-            other
-        ),
+        Err(other) => panic!("expected IdentifiabilityFailure, got: {:?}", other),
     }
 }

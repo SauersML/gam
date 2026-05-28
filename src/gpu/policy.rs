@@ -285,9 +285,7 @@ mod refinement_policy_tests {
     #[test]
     fn refinement_policy_rejects_small_p() {
         let pol = GpuDispatchPolicy::default();
-        assert!(!pol.iterative_refinement_should_attempt(
-            GpuDispatchPolicy::REFINEMENT_MIN_P - 1
-        ));
+        assert!(!pol.iterative_refinement_should_attempt(GpuDispatchPolicy::REFINEMENT_MIN_P - 1));
         assert!(!pol.iterative_refinement_should_attempt(0));
     }
 

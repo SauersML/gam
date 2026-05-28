@@ -31,12 +31,8 @@ pub fn solve_arrow_newton_step_gpu(
         Err(ArrowSchurGpuFailure::Unavailable) => {
             // Mirror the CPU path's failure variant so the outer loop falls
             // through to its existing recovery logic.
-            sys.solve_with_options(
-                ridge_t,
-                ridge_beta,
-                &ArrowSolveOptions::automatic(sys.k),
-            )
-            .map(|(dt, db, _diag)| (dt, db))
+            sys.solve_with_options(ridge_t, ridge_beta, &ArrowSolveOptions::automatic(sys.k))
+                .map(|(dt, db, _diag)| (dt, db))
         }
         Err(ArrowSchurGpuFailure::GpuRequiresDenseSystem { .. }) => {
             // Matrix-free H_ββ or H_tβ operators present — the dense GPU

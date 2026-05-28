@@ -196,8 +196,7 @@ fn gpu_pirls_gating_2_penalty_gradient_sign_and_shift() {
 
     let x = Array2::from_shape_fn((n, p), |_| normal.sample(&mut rng));
     let true_beta = Array1::from_shape_fn(p, |j| 0.5 / (j as f64 + 1.0));
-    let y = x.dot(&true_beta)
-        + Array1::from_shape_fn(n, |_| 0.3 * normal.sample(&mut rng));
+    let y = x.dot(&true_beta) + Array1::from_shape_fn(n, |_| 0.3 * normal.sample(&mut rng));
     let offset = Array1::<f64>::zeros(n);
     let weights = Array1::<f64>::ones(n);
 
@@ -441,8 +440,7 @@ fn gpu_pirls_gating_5_qs_basis_semantics() {
 
     let x = Array2::from_shape_fn((n, p), |_| normal.sample(&mut rng));
     let true_beta = Array1::from_shape_fn(p, |j| 0.3 / (j as f64 + 1.0));
-    let y = x.dot(&true_beta)
-        + Array1::from_shape_fn(n, |_| 0.1 * normal.sample(&mut rng));
+    let y = x.dot(&true_beta) + Array1::from_shape_fn(n, |_| 0.1 * normal.sample(&mut rng));
     let offset = Array1::<f64>::zeros(n);
     let weights = Array1::<f64>::ones(n);
 
@@ -533,8 +531,7 @@ fn gpu_pirls_gating_6_final_hessian_at_accepted_eta() {
 
     let x = Array2::from_shape_fn((n, p), |_| normal.sample(&mut rng));
     let true_beta = Array1::from_shape_fn(p, |j| 0.4 / (j as f64 + 1.0));
-    let y = x.dot(&true_beta)
-        + Array1::from_shape_fn(n, |_| 0.2 * normal.sample(&mut rng));
+    let y = x.dot(&true_beta) + Array1::from_shape_fn(n, |_| 0.2 * normal.sample(&mut rng));
     let offset = Array1::<f64>::zeros(n);
     let weights = Array1::<f64>::ones(n);
 
@@ -710,8 +707,7 @@ fn gpu_pirls_gating_8_benchmark_baseline_uses_cpu_oracle() {
 
     let x = Array2::from_shape_fn((n, p), |_| normal.sample(&mut rng));
     let true_beta = Array1::from_shape_fn(p, |j| 0.3 / (j as f64 + 1.0));
-    let y = x.dot(&true_beta)
-        + Array1::from_shape_fn(n, |_| 0.25 * normal.sample(&mut rng));
+    let y = x.dot(&true_beta) + Array1::from_shape_fn(n, |_| 0.25 * normal.sample(&mut rng));
     let offset = Array1::<f64>::zeros(n);
     let weights = Array1::<f64>::ones(n);
 
@@ -797,8 +793,7 @@ fn gpu_pirls_gating_8_benchmark_baseline_uses_cpu_oracle() {
     );
 
     assert!(
-        (fit_gpu.deviance - fit_cpu.deviance).abs()
-            < 1e-5 * (1.0 + fit_cpu.deviance.abs()),
+        (fit_gpu.deviance - fit_cpu.deviance).abs() < 1e-5 * (1.0 + fit_cpu.deviance.abs()),
         "GPU PIRLS deviance must match CPU oracle deviance. \
          gpu = {:.6e}, cpu = {:.6e}",
         fit_gpu.deviance,

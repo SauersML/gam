@@ -5199,7 +5199,11 @@ where
                             // PcgDiagnostics); the GPU dense path provides
                             // zero-valued diagnostics (it does not use PCG).
                             let arrow_solve_result: Result<
-                                (ndarray::Array1<f64>, ndarray::Array1<f64>, crate::solver::arrow_schur::PcgDiagnostics),
+                                (
+                                    ndarray::Array1<f64>,
+                                    ndarray::Array1<f64>,
+                                    crate::solver::arrow_schur::PcgDiagnostics,
+                                ),
                                 crate::solver::arrow_schur::ArrowSchurError,
                             > = if crate::solver::gpu::cuda_selected() {
                                 let has_matvec = arrow_system.hbb_matvec.is_some()
@@ -5249,7 +5253,8 @@ where
                                         "[arrow-Schur] iter {:>3} | k={} | pcg_iters={} | \
                                          precond_calls={} | ridge_escalations={} | \
                                          final_residual={:.3e} | stop={:?}",
-                                        iter, arrow_system.k,
+                                        iter,
+                                        arrow_system.k,
                                         pcg_diag.iterations,
                                         pcg_diag.precond_apply_calls,
                                         pcg_diag.ridge_escalations,
@@ -6175,8 +6180,8 @@ where
 
             // (b) Deviance change is negligible relative to |F|.
             let f_abs = current_penalized.abs().max(1.0);
-            let deviance_ok = (last_deviance_change / f_abs).abs()
-                < options.convergence_tolerance * 10.0;
+            let deviance_ok =
+                (last_deviance_change / f_abs).abs() < options.convergence_tolerance * 10.0;
 
             // (c) Gradient has collapsed relative to its initial value.
             let grad_ok = match initial_gradient_norm {
@@ -7574,11 +7579,8 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                         .as_ref()
                         .cloned()
                         .unwrap_or_else(|| Arc::new(Array2::<f64>::eye(penalty.p)));
-                    let x_transformed_design = make_reparam_operator(
-                        &x_original,
-                        &qs_arc_for_design,
-                        use_sparse_native,
-                    );
+                    let x_transformed_design =
+                        make_reparam_operator(&x_original, &qs_arc_for_design, use_sparse_native);
                     let reparam_for_gpu = materialize_final_reparam_result()?;
                     let gpu_input = GpuGaussianPlsInput {
                         xtwx_orig: cache.xtwx_orig.view(),
@@ -7955,23 +7957,23 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 let qs_view = qs_arc.as_ref().map(|qs| qs.view());
                 let (s_transformed_view, linear_shift_view, constant_shift_val) =
                     match &penalty_active {
-                    PirlsPenalty::Dense {
-                        s_transformed,
-                        linear_shift,
-                        constant_shift,
-                        ..
-                    } => (s_transformed.view(), linear_shift.view(), *constant_shift),
-                    // SAFETY: the GPU PIRLS dispatch path that reaches this
-                    // match is gated on `PirlsPenalty::Dense { .. }` upstream
-                    // (see the dispatch-admission check earlier in this
-                    // function); the `Diagonal` arm is therefore unreachable
-                    // at runtime. We panic rather than `unreachable!` per the
-                    // build.rs ban on the latter macro; the comment-anchored
-                    // contract is the same.
-                    PirlsPenalty::Diagonal { .. } => {
-                        panic!("GPU PIRLS dispatch gated on PirlsPenalty::Dense above")
-                    }
-                };
+                        PirlsPenalty::Dense {
+                            s_transformed,
+                            linear_shift,
+                            constant_shift,
+                            ..
+                        } => (s_transformed.view(), linear_shift.view(), *constant_shift),
+                        // SAFETY: the GPU PIRLS dispatch path that reaches this
+                        // match is gated on `PirlsPenalty::Dense { .. }` upstream
+                        // (see the dispatch-admission check earlier in this
+                        // function); the `Diagonal` arm is therefore unreachable
+                        // at runtime. We panic rather than `unreachable!` per the
+                        // build.rs ban on the latter macro; the comment-anchored
+                        // contract is the same.
+                        PirlsPenalty::Diagonal { .. } => {
+                            panic!("GPU PIRLS dispatch gated on PirlsPenalty::Dense above")
+                        }
+                    };
                 // Dense-design materialization for `PirlsResult.x_transformed`.
                 let qs_arc_for_design = qs_arc
                     .as_ref()
@@ -11679,9 +11681,7 @@ fn calculate_edf_from_sparse_factor(
     penalty: &PirlsPenalty,
 ) -> Result<f64, EstimationError> {
     let PirlsPenalty::Dense { e_transformed, .. } = penalty else {
-        crate::bail_invalid_estim!(
-            "calculate_edf_from_sparse_factor requires PirlsPenalty::Dense"
-        );
+        crate::bail_invalid_estim!("calculate_edf_from_sparse_factor requires PirlsPenalty::Dense");
     };
     // e_transformed has shape (r, p) — cols give the coefficient dimension p.
     let p = e_transformed.ncols();
@@ -11691,9 +11691,11 @@ fn calculate_edf_from_sparse_factor(
         return Ok(p as f64);
     }
     let rhs_arr = e_transformed.t().to_owned();
-    let sol = crate::linalg::sparse_exact::solve_sparse_spdmulti(factor, &rhs_arr)
-        .map_err(|_| EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
+    let sol =
+        crate::linalg::sparse_exact::solve_sparse_spdmulti(factor, &rhs_arr).map_err(|_| {
+            EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            }
         })?;
     if sol.nrows() == p && sol.ncols() == r && sol.iter().all(|v| v.is_finite()) {
         return Ok(edf_from_solution(p, r, mp, e_transformed, |i, j| {

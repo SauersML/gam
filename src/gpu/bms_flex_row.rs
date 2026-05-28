@@ -829,11 +829,8 @@ impl RowKernelBackend {
                         ),
                     })?;
                 let stream = ctx.default_stream();
-                let row_kernel_source = [
-                    super::numerics_device::PROBIT_NUMERICS_CU,
-                    ROW_KERNEL_BODY,
-                ]
-                .concat();
+                let row_kernel_source =
+                    [super::numerics_device::PROBIT_NUMERICS_CU, ROW_KERNEL_BODY].concat();
                 let ptx = cudarc::nvrtc::compile_ptx(row_kernel_source).map_err(|err| {
                     GpuError::DriverCallFailed {
                         reason: format!("bms_flex_row NVRTC compile failed: {err}"),

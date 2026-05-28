@@ -134,8 +134,7 @@ pub(crate) type SigmaPointResult = Option<(Array2<f64>, Array1<f64>)>;
 /// properties that determine correctness.
 #[inline]
 fn device_pirls_stage3_ready() -> bool {
-    crate::solver::gpu::cuda_selected()
-        && crate::gpu::runtime::GpuRuntime::global().is_some()
+    crate::solver::gpu::cuda_selected() && crate::gpu::runtime::GpuRuntime::global().is_some()
 }
 
 /// Sigma-cubature executor dispatch — the swap site between the CPU Rayon
@@ -202,9 +201,9 @@ fn sigma_cubature_evaluate_gpu_stream_pool(
     sigma_points: &[Array1<f64>],
 ) -> Result<Option<Vec<SigmaPointResult>>, crate::gpu::GpuError> {
     use crate::construction::{EngineDims, stable_reparameterization_engine_canonical};
+    use crate::gpu::runtime::GpuRuntime;
     use crate::gpu::sigma_cubature::try_gpu_sigma_stream_pool_eval;
     use crate::solver::gpu::pirls_dispatch::admission_for;
-    use crate::gpu::runtime::GpuRuntime;
 
     if sigma_points.is_empty() {
         return Ok(Some(Vec::new()));

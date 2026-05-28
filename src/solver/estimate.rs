@@ -3737,12 +3737,9 @@ where
         if let Some(ref h_inv) = beta_covariance_unscaled {
             // Full inverse available: wrap as phi-scaled covariance, compute
             // frequentist quantities, and pass to smoothing-correction cubature.
-            beta_covariance = Some(
-                crate::inference::dispersion_cov::PhiScaledCovariance::wrap(scaled_covariance(
-                    h_inv.clone(),
-                    dispersion_phi,
-                )),
-            );
+            beta_covariance = Some(crate::inference::dispersion_cov::PhiScaledCovariance::wrap(
+                scaled_covariance(h_inv.clone(), dispersion_phi),
+            ));
 
             // Frequentist covariance Ve = F H⁻¹ φ and influence matrix F = H⁻¹ X'WX.
             // Both require the full unscaled inverse; computed in original basis.
@@ -3795,7 +3792,10 @@ where
             // Fast path: SE from stored full inverse (already phi-scaled via
             // beta_covariance, but we need the unscaled diagonal here).
             let raw_se = Array1::from_iter(
-                h_inv.diag().iter().map(|&v| (dispersion_phi * v.max(0.0)).sqrt()),
+                h_inv
+                    .diag()
+                    .iter()
+                    .map(|&v| (dispersion_phi * v.max(0.0)).sqrt()),
             );
             Some(raw_se)
         } else if let Some(ref factor_t) = edf_factor {

@@ -513,13 +513,14 @@ impl SurvivalFlexGpuBackend {
     /// NVRTC-compile (or fetch from cache) the rigid-kernel module.
     #[cfg(target_os = "linux")]
     fn compile_rigid_module(&self) -> Result<&Arc<CudaModule>, GpuError> {
-        let source =
-            [super::numerics_device::PROBIT_NUMERICS_CU, SURVIVAL_FLEX_RIGID_BODY].concat();
-        self.inner.module.get_or_compile(
-            &self.inner.ctx,
-            "survival_flex",
-            &source,
-        )
+        let source = [
+            super::numerics_device::PROBIT_NUMERICS_CU,
+            SURVIVAL_FLEX_RIGID_BODY,
+        ]
+        .concat();
+        self.inner
+            .module
+            .get_or_compile(&self.inner.ctx, "survival_flex", &source)
     }
 
     /// Round-trip the arena.  Mirrors `bms_flex` so the V100 smoke test

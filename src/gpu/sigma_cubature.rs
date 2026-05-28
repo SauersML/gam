@@ -140,7 +140,9 @@ pub fn try_gpu_sigma_stream_pool_eval(
             return Ok(None);
         };
         let Some(family) = linux_impl::family_kind_to_row(family_kind) else {
-            return Err(crate::gpu_err!("sigma stream pool: family not in JIT-cached set"));
+            return Err(crate::gpu_err!(
+                "sigma stream pool: family not in JIT-cached set"
+            ));
         };
         let curvature = linux_impl::curvature_kind_to_row(admission.curvature);
         return linux_impl::stream_pool_eval(
@@ -168,8 +170,8 @@ pub fn try_gpu_sigma_stream_pool_eval(
 
 #[cfg(target_os = "linux")]
 mod linux_impl {
-    use crate::gpu::policy::{PirlsLoopCurvatureKind, PirlsLoopFamilyKind};
     use crate::gpu::pirls_row::{CurvatureMode, PirlsRowFamily};
+    use crate::gpu::policy::{PirlsLoopCurvatureKind, PirlsLoopFamilyKind};
     use crate::gpu::sigma_cubature::SigmaPointGpuInput;
     use crate::linalg::utils::matrix_inversewith_regularization;
     use crate::solver::reml::eval::SigmaPointResult;
@@ -227,9 +229,7 @@ mod linux_impl {
 
         // Validate uniform shape across all sigma points.
         for (idx, pt) in per_sigma.iter().enumerate() {
-            if pt.s_transformed.shape() != [p, p]
-                || pt.qs.shape() != [p, p]
-            {
+            if pt.s_transformed.shape() != [p, p] || pt.qs.shape() != [p, p] {
                 return Err(crate::gpu_err!(
                     "sigma stream pool: point[{idx}] shape mismatch against point[0]"
                 ));
@@ -244,9 +244,7 @@ mod linux_impl {
         // exact Gaussian PLS solver with the per-point (Qs, S_transformed,
         // linear_shift) — no row-kernel PIRLS loop, no iterative solver.
         if family == PirlsRowFamily::GaussianIdentity {
-            return gaussian_sigma_pool_eval(
-                x_original, y, prior_w, offset, per_sigma, p,
-            );
+            return gaussian_sigma_pool_eval(x_original, y, prior_w, offset, per_sigma, p);
         }
 
         // Upload X_original, y, prior_w, offset once — shared across all sigma points.
@@ -347,11 +345,8 @@ mod linux_impl {
         use ndarray::Array1;
         // XᵀWX = Xᵀ·diag(prior_w)·X (constant across all sigma points).
         // Computed on the GPU via weighted_crossprod_gpu.
-        let xtwx = crate::solver::gpu::pirls_gpu::weighted_crossprod_gpu(
-            x_original,
-            prior_w,
-        )
-        .map_err(|e| crate::gpu_err!("gaussian sigma: XᵀWX gpu failed: {e}"))?;
+        let xtwx = crate::solver::gpu::pirls_gpu::weighted_crossprod_gpu(x_original, prior_w)
+            .map_err(|e| crate::gpu_err!("gaussian sigma: XᵀWX gpu failed: {e}"))?;
 
         // XᵀW(y − offset) = Xᵀ·diag(prior_w)·(y − offset).
         // Compute on the host (n-vector; the GPU would need a separate kernel).
@@ -374,9 +369,7 @@ mod linux_impl {
                 0.0,
                 Some(pt.qs.view()),
             )
-            .map_err(|e| {
-                crate::gpu_err!("gaussian sigma pool: point[{idx}] pls failed: {e}")
-            })?;
+            .map_err(|e| crate::gpu_err!("gaussian sigma pool: point[{idx}] pls failed: {e}"))?;
 
             let h_orig = hessian_to_original(&pls.penalized_hessian, &pt.qs);
             let cov = matrix_inversewith_regularization(&h_orig, "gaussian sigma point")?;

@@ -27,9 +27,9 @@ mod linux_impl {
     use crate::solver::active_set::{
         LinearInequalityConstraints, compute_constraint_kkt_diagnostics,
     };
+    use crate::solver::gpu::cuda_selected;
     use crate::solver::gpu::pirls_dispatch::admission_for;
     use crate::solver::gpu::pirls_gpu::{self, cuda};
-    use crate::solver::gpu::cuda_selected;
     use crate::solver::pirls::{
         ExportedLaplaceCurvature, FirthDiagnostics, HessianCurvatureKind, PirlsCoordinateFrame,
         PirlsResult, PirlsStatus, WorkingModelPirlsResult, WorkingState,
@@ -309,11 +309,9 @@ mod linux_impl {
         // at the dispatch boundary rather than silently passing a corrupt
         // iterate to the outer REML loop.
         {
-            const FORBIDDEN_ROW: u32 =
-                crate::gpu::pirls_row::status_flags::INVALID_RESPONSE
+            const FORBIDDEN_ROW: u32 = crate::gpu::pirls_row::status_flags::INVALID_RESPONSE
                 | crate::gpu::pirls_row::status_flags::ZERO_PRIOR_WEIGHT;
-            if (per_row_status_or & FORBIDDEN_ROW) != 0
-                && !matches!(status, PirlsStatus::Unstable)
+            if (per_row_status_or & FORBIDDEN_ROW) != 0 && !matches!(status, PirlsStatus::Unstable)
             {
                 return Err(format!(
                     "GPU PIRLS: per_row_status_or={per_row_status_or:#010x} has forbidden row \
@@ -686,12 +684,12 @@ mod linux_impl {
     fn run_gpu_gaussian_pls(
         input: GpuGaussianPlsInput<'_>,
     ) -> Result<(PirlsResult, WorkingModelPirlsResult), String> {
+        use crate::linalg::utils::inf_norm;
         use crate::matrix::LinearOperator;
         use crate::solver::pirls::{
             array1_l2_norm, calculate_deviance, calculate_loglikelihood_omitting_constants,
             computeworkingweight_derivatives_from_eta,
         };
-        use crate::linalg::utils::inf_norm;
         use crate::types::{RidgePassport, RidgePolicy};
         use ndarray::Array1;
 
@@ -731,7 +729,9 @@ mod linux_impl {
         weighted_residual -= &finalz;
         weighted_residual *= &input.priorweights;
         // Xᵀ W r (in original coords) via DesignMatrix::transpose_vector_multiply.
-        let xt_wr_orig = input.x_original.transpose_vector_multiply(&weighted_residual);
+        let xt_wr_orig = input
+            .x_original
+            .transpose_vector_multiply(&weighted_residual);
         // Rotate to transformed coords: QsᵀXᵀWr.
         let gradient_data: Array1<f64> = if let Some(qs_v) = input.qs {
             qs_v.t().dot(&xt_wr_orig)

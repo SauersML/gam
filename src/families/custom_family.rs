@@ -6673,11 +6673,7 @@ impl crate::solver::outer_strategy::OuterHessianOperator for OwnedDenseOuterHess
 
     /// Zero-alloc override: write `matrix · v` directly into `out` using a
     /// row-dot loop, avoiding the `matrix.dot(v)` allocation.
-    fn apply_into(
-        &self,
-        v: &Array1<f64>,
-        out: &mut Array1<f64>,
-    ) -> Result<(), String> {
+    fn apply_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<(), String> {
         if v.len() != self.matrix.ncols() {
             return Err(CustomFamilyError::DimensionMismatch {
                 reason: format!(

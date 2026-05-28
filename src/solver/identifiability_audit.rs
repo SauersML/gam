@@ -641,7 +641,9 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
 /// [`HARD_HALT_OVERLAP_THRESHOLD`].
 pub fn audit_identifiability_channel_aware(
     specs: &[ParameterBlockSpec],
-    operators: &[std::sync::Arc<dyn crate::families::identifiability_compiler::RowJacobianOperator>],
+    operators: &[std::sync::Arc<
+        dyn crate::families::identifiability_compiler::RowJacobianOperator,
+    >],
     row_hess: &dyn crate::families::identifiability_compiler::RowHessian,
 ) -> Result<IdentifiabilityAudit, String> {
     use crate::families::identifiability_compiler::{IdentityRowHessian, compile_with_dual_metric};
@@ -851,7 +853,9 @@ pub fn audit_identifiability_channel_aware(
 /// `|wᵀ w'|` exceeds [`ALIAS_OVERLAP_REPORTING_THRESHOLD`], in
 /// `(block_a < block_b)` order.
 fn channel_aware_aliased_pairs(
-    operators: &[std::sync::Arc<dyn crate::families::identifiability_compiler::RowJacobianOperator>],
+    operators: &[std::sync::Arc<
+        dyn crate::families::identifiability_compiler::RowJacobianOperator,
+    >],
     col_offsets: &[usize],
     specs: &[ParameterBlockSpec],
 ) -> Result<Vec<AliasedPair>, String> {
@@ -860,9 +864,9 @@ fn channel_aware_aliased_pairs(
     }
     let k = operators[0].k();
     let n = operators[0].nrows();
-    let nk = n.checked_mul(k).ok_or_else(|| {
-        format!("channel-aware audit: n*k overflow (n={n}, k={k})")
-    })?;
+    let nk = n
+        .checked_mul(k)
+        .ok_or_else(|| format!("channel-aware audit: n*k overflow (n={n}, k={k})"))?;
     let p_total = *col_offsets.last().unwrap_or(&0);
     if p_total == 0 || nk == 0 {
         return Ok(Vec::new());

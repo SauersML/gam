@@ -93,8 +93,7 @@ impl BetaCouplingGraph {
         edge_set.sort_unstable();
         edge_set.dedup();
 
-        let edges: Vec<BetaEdge> =
-            edge_set.iter().map(|&(a, b)| BetaEdge { a, b }).collect();
+        let edges: Vec<BetaEdge> = edge_set.iter().map(|&(a, b)| BetaEdge { a, b }).collect();
 
         // Build CSR adjacency (undirected: add both directions).
         let mut degree = vec![0usize; num_blocks];
@@ -116,7 +115,12 @@ impl BetaCouplingGraph {
             cursor[b] += 1;
         }
 
-        Self { num_blocks, edges, adj_start, adj_targets }
+        Self {
+            num_blocks,
+            edges,
+            adj_start,
+            adj_targets,
+        }
     }
 
     /// Iterator over block indices adjacent to `node`.
