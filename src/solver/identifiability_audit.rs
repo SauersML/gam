@@ -464,6 +464,30 @@ fn signed_cosine(dot: f64, norm_a: f64, norm_b: f64) -> f64 {
 pub fn audit_identifiability(
     specs: &[ParameterBlockSpec],
 ) -> Result<IdentifiabilityAudit, EstimationError> {
+    // Default at-init linearization state: β = 0, no family scalars.
+    // Families whose callbacks need β-dependent scalars must call
+    // `audit_identifiability_with_state` directly with the current β.
+    let p_total_hint: usize = specs.iter().map(|s| s.design.ncols()).sum();
+    let zeros_beta = vec![0.0f64; p_total_hint];
+    let init_state = FamilyLinearizationState {
+        beta: &zeros_beta,
+        family_scalars: None,
+        channel_hessian: None,
+        probit_frailty_scale: 1.0,
+    };
+    audit_identifiability_impl(specs, &init_state)
+}
+
+/// Implementation body shared by [`audit_identifiability`] and
+/// [`audit_identifiability_with_state`]. The two public entry points differ
+/// only in how they construct the [`FamilyLinearizationState`] — every other
+/// step (gauge-priority sort, joint RRQR, pairwise overlap scan, drop
+/// attribution, gauge-resolves-rank-deficiency logic, hard-alias / fatal
+/// classification) is identical, so it lives here once.
+fn audit_identifiability_impl(
+    specs: &[ParameterBlockSpec],
+    state: &FamilyLinearizationState<'_>,
+) -> Result<IdentifiabilityAudit, EstimationError> {
     if specs.is_empty() {
         return Ok(IdentifiabilityAudit {
             blocks: Vec::new(),
@@ -494,24 +518,12 @@ pub fn audit_identifiability(
     let block_phase_started = std::time::Instant::now();
     let block_heartbeat = (n.saturating_mul(specs.len()) >= 1_000_000)
         .then(crate::util::heartbeat::Heartbeat::default_interval);
-    // Build a default at-init linearization state: β = 0, no family scalars.
-    // Families whose callbacks need β-dependent scalars must pass a state with
-    // the current β when invoking the channel-aware audit after initialization.
-    let p_total_hint: usize = specs.iter().map(|s| s.design.ncols()).sum();
-    let zeros_beta = vec![0.0f64; p_total_hint];
-    let init_state = FamilyLinearizationState {
-        beta: &zeros_beta,
-        family_scalars: None,
-        channel_hessian: None,
-        probit_frailty_scale: 1.0,
-    };
     for (idx, spec) in specs.iter().enumerate() {
         // Use spec.effective_jacobian_at() so the audit operates on the β-dependent
-        // effective design. At initialization (β = 0, family_scalars = None), callbacks
-        // return the linearization at β = 0.  For blocks with no callback and
-        // For blocks with no callback this is a no-op (J = design).
+        // effective design. The caller-supplied `state` carries β and family scalars;
+        // for blocks with no callback this is a no-op (J = design).
         let dense = spec
-            .effective_jacobian_at("identifiability_audit::audit_identifiability", &init_state)
+            .effective_jacobian_at("identifiability_audit::audit_identifiability", state)
             .map_err(|e| EstimationError::LayoutError(format!("identifiability audit: {e}")))?;
         let p_block = dense.ncols();
         let block_singular = block_pivoted_qr_diagonal(&dense)?;
@@ -1814,150 +1826,17 @@ pub fn maybe_log_audit_drift(
 /// so callers can pass the current β and `family_scalars` at any point in the
 /// outer loop.
 ///
-/// This is a thin wrapper around `audit_identifiability` that constructs the
-/// zero-β state internally. The `state` argument is forwarded to each block's
-/// `effective_jacobian_at` call (replacing the default β=0 zeros state built
-/// inside the flat audit function).
-///
-/// Note: the flat audit always builds its own zero-β state for the J(β)
-/// computation.  This function overrides that by densifying each block's
-/// Jacobian with `state` before feeding into the existing joint-RRQR path.
-/// For families without `jacobian_callback`, the design is returned as-is
-/// regardless of `state`.
+/// Identical to [`audit_identifiability`] in every step (per-block QR,
+/// gauge-priority sort, joint RRQR, pairwise overlap scan, drop attribution,
+/// gauge-resolves-rank-deficiency logic, hard-alias / fatal classification) —
+/// only the [`FamilyLinearizationState`] handed to each block's
+/// `effective_jacobian_at` differs. For families without a `jacobian_callback`
+/// the design is returned as-is regardless of `state`.
 pub fn audit_identifiability_with_state(
     specs: &[ParameterBlockSpec],
     state: &crate::families::custom_family::FamilyLinearizationState<'_>,
 ) -> Result<IdentifiabilityAudit, EstimationError> {
-    if specs.is_empty() {
-        return Ok(IdentifiabilityAudit {
-            blocks: Vec::new(),
-            aliased_pairs: Vec::new(),
-            dropped_columns: Vec::new(),
-            fatal: false,
-            summary: "identifiability audit (state): no blocks supplied".to_string(),
-        });
-    }
-
-    let n = specs[0].design.nrows();
-    for (idx, spec) in specs.iter().enumerate() {
-        if spec.design.nrows() != n {
-            return Err(EstimationError::LayoutError(format!(
-                "identifiability audit (state): block {} ({}) has {} rows, expected {}",
-                idx,
-                spec.name,
-                spec.design.nrows(),
-                n,
-            )));
-        }
-    }
-
-    // Densify each block using the caller-supplied state (carries current β
-    // and family_scalars). Blocks without a callback return the flat design.
-    let mut dense_blocks: Vec<ndarray::Array2<f64>> = Vec::with_capacity(specs.len());
-    let mut col_offsets: Vec<usize> = Vec::with_capacity(specs.len() + 1);
-    col_offsets.push(0);
-    let mut blocks: Vec<BlockIdentity> = Vec::with_capacity(specs.len());
-
-    for spec in specs.iter() {
-        let dense = spec
-            .effective_jacobian_at(
-                "identifiability_audit::audit_identifiability_with_state",
-                state,
-            )
-            .map_err(|e| {
-                EstimationError::LayoutError(format!("identifiability audit (state): {e}"))
-            })?;
-        let p_block = dense.ncols();
-        let block_singular = block_pivoted_qr_diagonal(&dense)?;
-        let block_rank = count_rank(&block_singular, n, p_block);
-        blocks.push(BlockIdentity {
-            block_name: spec.name.clone(),
-            original_dim: p_block,
-            effective_dim: p_block,
-            design_range_rank: block_rank,
-            design_range_singular_values: block_singular,
-        });
-        let next_offset = col_offsets[col_offsets.len() - 1] + p_block;
-        col_offsets.push(next_offset);
-        dense_blocks.push(dense);
-    }
-
-    let p_total = *col_offsets.last().expect("col_offsets non-empty");
-    if p_total == 0 {
-        return Ok(IdentifiabilityAudit {
-            blocks,
-            aliased_pairs: Vec::new(),
-            dropped_columns: Vec::new(),
-            fatal: false,
-            summary: "identifiability audit (state): every block is empty".to_string(),
-        });
-    }
-
-    // Assemble joint design and run RRQR (same path as the flat audit).
-    let mut x_joint = ndarray::Array2::<f64>::zeros((n, p_total));
-    for (idx, block) in dense_blocks.iter().enumerate() {
-        let start = col_offsets[idx];
-        let end = col_offsets[idx + 1];
-        if end > start {
-            x_joint.slice_mut(ndarray::s![.., start..end]).assign(block);
-        }
-    }
-    let rrqr =
-        rrqr_with_permutation(&x_joint, default_rrqr_rank_alpha()).map_err(|e| {
-            EstimationError::LayoutError(format!(
-                "audit_identifiability_with_state joint RRQR failed: {e:?}"
-            ))
-        })?;
-    let joint_rank = rrqr.rank;
-    let joint_rank_tol = rrqr.rank_tol;
-
-    let demoted_joint_cols: Vec<usize> = rrqr.column_permutation[rrqr.rank..].to_vec();
-
-    let mut dropped_columns: Vec<DroppedColumn> = Vec::new();
-    for &joint_col in &demoted_joint_cols {
-        let (block_idx, local_col) = locate_block_column(&col_offsets, joint_col)?;
-        let block_name = specs[block_idx].name.clone();
-        let reason = format!(
-            "joint-design column {joint_col} (block '{block_name}' local column \
-             {local_col}) demoted past joint RRQR rank tolerance {tol:.3e} at current β; \
-             earlier blocks' column span absorbs this direction",
-            tol = joint_rank_tol,
-        );
-        dropped_columns.push(DroppedColumn {
-            block: block_name,
-            column: local_col,
-            reason,
-        });
-    }
-
-    for (block_idx, block) in blocks.iter_mut().enumerate() {
-        let lo = col_offsets[block_idx];
-        let hi = col_offsets[block_idx + 1];
-        let dropped_here = demoted_joint_cols
-            .iter()
-            .filter(|&&j| j >= lo && j < hi)
-            .count();
-        block.effective_dim = block.original_dim.saturating_sub(dropped_here);
-    }
-
-    let fatal = joint_rank < p_total;
-    let summary = format!(
-        "identifiability audit (state β-dependent): {} block(s), {} joint columns, \
-         joint rank {}, {} dropped column(s){}",
-        specs.len(),
-        p_total,
-        joint_rank,
-        dropped_columns.len(),
-        if fatal { " — rank deficient" } else { " — clean" },
-    );
-
-    Ok(IdentifiabilityAudit {
-        blocks,
-        aliased_pairs: Vec::new(),
-        dropped_columns,
-        fatal,
-        summary,
-    })
+    audit_identifiability_impl(specs, state)
 }
 
 fn locate_block_column(
