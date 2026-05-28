@@ -50,7 +50,7 @@ use crate::smooth::{
 };
 use crate::solver::estimate::UnifiedFitResult;
 use crate::solver::estimate::{
-    EstimationError, FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
+    FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
 };
 use crate::terms::construction::kronecker_product;
 use crate::types::{InverseLink, StandardLink};

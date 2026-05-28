@@ -37,9 +37,7 @@ use crate::families::identifiability_compiler::{
     AnchorRowEvaluator, BlockOrder, RowHessian, RowJacobianOperator,
 };
 use crate::linalg::faer_ndarray::{FaerEigh, fast_ab};
-use crate::linalg::matrix::{
-    CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix, ResidualisedDesignOperator,
-};
+use crate::linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
 use faer::Side;
 
 const K_SURVIVAL: usize = 4;

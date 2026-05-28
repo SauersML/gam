@@ -881,8 +881,6 @@ fn accumulate_flex_block_grad_hess(
     *hess += &src_h;
 }
 
-use crate::families::jet_partitions::MultiDirJet;
-
 pub(super) const COEFF_SUPPORT_BHW: CoeffSupport = CoeffSupport {
     include_primary: true,
     include_h: true,

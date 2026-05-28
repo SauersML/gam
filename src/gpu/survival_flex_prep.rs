@@ -44,7 +44,6 @@ use crate::families::cubic_cell_kernel::{
     DenestedCubicCell, DenestedPartitionCell, LocalSpanCubic,
 };
 use crate::gpu::error::GpuError;
-use crate::gpu_err;
 
 /// CUDA C++ kernel source strings for the two NVRTC kernels.  Both bodies are
 /// the literal translation of the CPU implementations cited above.

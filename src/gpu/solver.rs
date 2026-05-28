@@ -4,7 +4,7 @@
 //! algebra dispatch and higher-level solver code. CPU solves do not live behind
 //! these entry points: unavailable CUDA support is reported as an error.
 
-use ndarray::{Array1, Array2, ArrayView2};
+use ndarray::{Array2, ArrayView2};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendStatus {
@@ -44,7 +44,7 @@ mod cuda {
     use cudarc::cusolver::{DnHandle, sys as cusolver_sys};
     use cudarc::driver::{CudaContext, CudaSlice, DevicePtr, DevicePtrMut};
     use faer::MatRef;
-    use ndarray::{Array1, Array2, ArrayView2};
+    use ndarray::{Array2, ArrayView2};
 
     pub(super) fn cholesky_solve(
         hessian: ArrayView2<'_, f64>,

@@ -23,7 +23,7 @@ mod linux_impl {
     use crate::gpu::policy::{PirlsLoopAdmission, PirlsLoopCurvatureKind, PirlsLoopFamilyKind};
     use crate::gpu::runtime::GpuRuntime;
     use crate::linalg::matrix::SymmetricMatrix;
-    use crate::matrix::{DesignMatrix, LinearOperator};
+    use crate::matrix::DesignMatrix;
     use crate::solver::active_set::{
         LinearInequalityConstraints, compute_constraint_kkt_diagnostics,
     };

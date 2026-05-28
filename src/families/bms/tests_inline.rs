@@ -3,9 +3,7 @@ use super::family::*;
 use super::gradient_paths::*;
 use super::hessian_paths::*;
 use super::exact_eval_cache::*;
-use super::row_kernel::*;
 use super::install_flex::validate_spec;
-use crate::custom_family::CustomFamily;
 
 
 #[cfg(test)]

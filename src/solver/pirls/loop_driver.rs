@@ -11,8 +11,8 @@
 //!   `crate::solver::gpu::pirls_dispatch_wire`.
 
 use super::{
-    FIXED_STABILIZATION_RIDGE, GamWorkingModel, PirlsWorkspace, SparsePirlsDecision,
-    WorkingModel, WorkingModelPirlsOptions, WorkingReparamTransform,
+    GamWorkingModel, PirlsWorkspace, SparsePirlsDecision,
+    WorkingModelPirlsOptions, WorkingReparamTransform,
     attach_penalty_shift, should_use_sparse_native_pirls, solve_penalized_least_squares_implicit,
     runworking_model_pirls, standard_inverse_link_jet,
     // edf helpers
@@ -23,7 +23,7 @@ use super::{
     WorkingModelIterationInfo, WorkingModelPirlsResult, WorkingState,
     LinearInequalityConstraints,
     // pls_solver types
-    GaussianFixedCache, SparseXtwxPrecomputed,
+    GaussianFixedCache,
     // penalty types
     KroneckerQsTransform, PirlsPenalty,
     // misc helpers
@@ -38,11 +38,7 @@ use super::convergence::effective_kkt_tolerance;
 use super::gpu_dispatch::{try_gaussian_pls_gpu, try_pirls_loop_gpu};
 use crate::linalg::faer_ndarray::fast_ab;
 use crate::probability::standard_normal_quantile;
-use crate::construction::{
-    EngineDims, KroneckerReparamResult, ReparamResult,
-    create_balanced_penalty_root_from_canonical,
-    kronecker_reparameterization_engine, stable_reparameterization_engine_canonical,
-};
+use crate::construction::{KroneckerReparamResult, ReparamResult};
 use crate::estimate::EstimationError;
 use crate::matrix::{DesignMatrix, LinearOperator, ReparamOperator, SymmetricMatrix};
 use crate::solver::active_set;

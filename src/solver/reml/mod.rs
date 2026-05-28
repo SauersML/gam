@@ -5,7 +5,7 @@ use crate::linalg::sparse_exact::{
 };
 use crate::solver::outer_strategy::OuterEval;
 use crate::solver::pirls::PIRLS_CACHE_BYTE_BUDGET;
-use crate::types::{SasLinkState, StandardLink};
+use crate::types::SasLinkState;
 use ndarray::{Array2, s};
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;

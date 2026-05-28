@@ -1,4 +1,4 @@
-use super::{AdaptiveKktTolerance, WorkingModelPirlsOptions};
+use super::WorkingModelPirlsOptions;
 
 /// Compute the effective KKT convergence tolerance, honouring the optional
 /// adaptive schedule when its parameters are all finite and ordered.

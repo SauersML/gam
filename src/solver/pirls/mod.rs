@@ -1,43 +1,36 @@
-use crate::construction::{KroneckerReparamResult, ReparamResult};
 use crate::estimate::EstimationError;
 use crate::estimate::reml::FirthDenseOperator;
 use crate::faer_ndarray::{
     FaerCholesky, FaerEigh, FaerLinalgError, FaerSymmetricFactor, array1_to_col_matmut,
-    array2_to_matmut, fast_ab, fast_atb, fast_atv, fast_av, fast_av_into,
+    fast_ab, fast_av, fast_av_into,
 };
-use crate::linalg::sparse_exact::{
-    factorize_sparse_spd, solve_sparse_spd, solve_sparse_spd_into,
-    sparse_symmetric_upper_matvec_public,
-};
+use crate::linalg::sparse_exact::{factorize_sparse_spd, solve_sparse_spd};
 use crate::linalg::utils::{StableSolver, boundary_hit_step_fraction};
-use crate::matrix::{DesignMatrix, LinearOperator, ReparamOperator, SymmetricMatrix};
-use crate::mixture_link::{InverseLinkJet as MixtureInverseLinkJet, logit_inverse_link_jet5};
-use crate::probability::standard_normal_quantile;
+use crate::matrix::{DesignMatrix, LinearOperator};
 use crate::solver::active_set;
-use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView, StandardLink};
+use crate::mixture_link::{InverseLinkJet as MixtureInverseLinkJet, logit_inverse_link_jet5};
+use crate::types::{Coefficients, LinearPredictor, StandardLink};
 use crate::types::{
     GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, MixtureLinkState, ResponseFamily,
-    RidgePassport, RidgePolicy, SasLinkState, is_valid_tweedie_power,
+    SasLinkState, is_valid_tweedie_power,
 };
 use dyn_stack::{MemBuffer, MemStack};
 use faer::sparse::linalg::matmul::{
     SparseMatMulInfo, sparse_sparse_matmul_numeric, sparse_sparse_matmul_numeric_scratch,
     sparse_sparse_matmul_symbolic,
 };
-use faer::sparse::{SparseColMat, Triplet};
+use faer::sparse::SparseColMat;
 use faer::sparse::{
     SparseColMatMut, SparseColMatRef, SparseRowMat, SymbolicSparseColMat, SymbolicSparseColMatRef,
 };
 use faer::{Accum, Par, Side, Unbind, get_global_parallelism};
 use log;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3, ShapeBuilder, Zip, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3, ShapeBuilder, Zip};
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
-use serde::{Deserialize, Serialize};
 use statrs::function::gamma::{digamma, ln_gamma};
 
 use faer::linalg::cholesky::llt::factor::LltParams;
 use faer::{Auto, Spec};
-use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -66,21 +59,18 @@ pub use state::{
 pub(crate) use state::array1_l2_norm;
 pub use edf::StablePLSResult;
 use edf::{
-    calculate_edf, calculate_edf_from_diagonal_penalty, calculate_edf_from_sparse_factor,
-    calculate_edf_with_penalty, calculate_edfwithworkspace,
-    calculate_edfwithworkspace_from_diagonal_penalty, calculate_edfwithworkspace_from_factor,
-    calculate_edfwithworkspace_with_penalty, edf_from_solution,
+    calculate_edf_from_sparse_factor, calculate_edf_with_penalty,
+    calculate_edfwithworkspace_from_factor, calculate_edfwithworkspace_with_penalty,
 };
 use damping::{add_scaled_diagonal_to_upper_sparse, compute_lm_d2, update_scaled_diagonal_in_place};
 use penalty::{
     KroneckerQsTransform, PirlsPenalty, WorkingCoordinateDesign, WorkingReparamTransform,
-    attach_penalty_shift, symmetrize_dense_matrix,
+    attach_penalty_shift,
 };
 use convergence::effective_kkt_tolerance;
 use pls_solver::solve_penalized_least_squares_implicit;
 pub use pls_solver::{GaussianFixedCache, SparseXtwxPrecomputed};
 pub use reweight::runworking_model_pirls;
-use reweight::{madsen_lm_accept_factor, test_support};
 
 const GAMMA_SHAPE_MIN: f64 = 1e-8;
 const GAMMA_SHAPE_MAX: f64 = 1e12;
@@ -3595,16 +3585,7 @@ pub use loop_driver::{
     fit_model_for_fixed_rho, PirlsConfig, PirlsProblem, PenaltyConfig,
 };
 pub(crate) use loop_driver::fit_model_for_fixed_rho_with_adaptive_kkt;
-use loop_driver::{
-    default_beta_guess_external, solve_intercept_for_prevalence,
-    assemble_pirls_result, detect_logit_instability,
-    stack_lambdaweighted_penalty_root_canonical, build_sparse_native_reparam_result,
-    build_diagonal_penalty_from_kronecker, canonical_prior_shift, canonical_prior_mean_aggregate,
-    make_reparam_operator, assert_symmetric_tol,
-    build_transformed_lower_bound_constraints, build_transformed_lower_bound_constraints_with_transform,
-    build_transformed_linear_constraints, build_transformed_linear_constraints_with_transform,
-    merge_linear_constraints, sparse_from_denseview,
-};
+use loop_driver::{make_reparam_operator, assert_symmetric_tol};
 
 
 #[inline]
@@ -6884,11 +6865,12 @@ mod tests {
         LinearInequalityConstraints, PenaltyConfig, PirlsConfig, PirlsLinearSolvePath,
         PirlsProblem, PirlsWorkspace, bernoulli_geometry_from_jet, calculate_deviance,
         compute_constraint_kkt_diagnostics, compute_observed_hessian_curvature_arrays,
-        default_beta_guess_external, fit_model_for_fixed_rho, madsen_lm_accept_factor,
-        select_active_set_release, should_log_pirls_decision_summary,
+        fit_model_for_fixed_rho, select_active_set_release, should_log_pirls_decision_summary,
         should_use_sparse_native_pirls, solve_newton_directionwith_linear_constraints,
         solve_newton_directionwith_lower_bounds, update_glmvectors,
     };
+    use super::loop_driver::default_beta_guess_external;
+    use super::reweight::madsen_lm_accept_factor;
     use crate::matrix::DesignMatrix;
     use crate::mixture_link::InverseLinkJet as MixtureInverseLinkJet;
     use crate::probability::standard_normal_quantile;
@@ -8177,6 +8159,7 @@ mod tests {
 #[cfg(test)]
 mod root_cause_tests {
     use super::*;
+    use crate::types::LogSmoothingParamsView;
     use approx::assert_relative_eq;
     use ndarray::{Array1, Array2, array};
 

@@ -8378,7 +8378,6 @@ impl<'a> RemlState<'a> {
         // fix the comment above motivates.
         let (hessian_logdet_correction, penalty_subspace_trace) =
             if matches!(hessian_mode, PseudoLogdetMode::Smooth) && c_nontrivial {
-                use super::unified::HessianOperator;
                 let Some(penalty_subspace) = penalty_subspace.as_ref() else {
                     crate::bail_invalid_estim!(
                         "projected Hessian logdet requires penalty subspace"
@@ -8728,7 +8727,6 @@ impl<'a> RemlState<'a> {
         // canonical Gaussian, where the leakage is identically zero.
         let (hessian_logdet_correction, penalty_subspace_trace) =
             if matches!(hessian_mode, PseudoLogdetMode::Smooth) && c_nontrivial {
-                use super::unified::HessianOperator;
                 let Some(penalty_subspace) = penalty_subspace.as_ref() else {
                     crate::bail_invalid_estim!(
                         "projected Hessian logdet requires penalty subspace"
