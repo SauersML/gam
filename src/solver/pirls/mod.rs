@@ -1235,19 +1235,19 @@ pub(super) struct GamWorkingModel<'a> {
     quadctx: crate::quadrature::QuadratureContext,
 }
 
-struct GamModelFinalState {
-    likelihood: GlmLikelihoodSpec,
-    coordinate_frame: PirlsCoordinateFrame,
-    finalmu: Array1<f64>,
-    finalweights: Array1<f64>,
-    scoreweights: Array1<f64>,
-    finalz: Array1<f64>,
-    final_c: Array1<f64>,
-    final_d: Array1<f64>,
-    final_dmu_deta: Array1<f64>,
-    final_d2mu_deta2: Array1<f64>,
-    final_d3mu_deta3: Array1<f64>,
-    penalty_term: f64,
+pub(super) struct GamModelFinalState {
+    pub(super) likelihood: GlmLikelihoodSpec,
+    pub(super) coordinate_frame: PirlsCoordinateFrame,
+    pub(super) finalmu: Array1<f64>,
+    pub(super) finalweights: Array1<f64>,
+    pub(super) scoreweights: Array1<f64>,
+    pub(super) finalz: Array1<f64>,
+    pub(super) final_c: Array1<f64>,
+    pub(super) final_d: Array1<f64>,
+    pub(super) final_dmu_deta: Array1<f64>,
+    pub(super) final_d2mu_deta2: Array1<f64>,
+    pub(super) final_d3mu_deta3: Array1<f64>,
+    pub(super) penalty_term: f64,
 }
 
 impl<'a> GamWorkingModel<'a> {
@@ -3600,7 +3600,7 @@ use loop_driver::{
     assemble_pirls_result, detect_logit_instability,
     stack_lambdaweighted_penalty_root_canonical, build_sparse_native_reparam_result,
     build_diagonal_penalty_from_kronecker, canonical_prior_shift, canonical_prior_mean_aggregate,
-    make_reparam_operator,
+    make_reparam_operator, assert_symmetric_tol,
     build_transformed_lower_bound_constraints, build_transformed_lower_bound_constraints_with_transform,
     build_transformed_linear_constraints, build_transformed_linear_constraints_with_transform,
     merge_linear_constraints, sparse_from_denseview,

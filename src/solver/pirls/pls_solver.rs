@@ -13,8 +13,9 @@ use super::{
     FIXED_STABILIZATION_RIDGE, PirlsPenalty, PirlsWorkspace, SparseXtWxCache,
     StablePLSResult, WorkingReparamTransform, calculate_edf_from_sparse_factor,
     calculate_edfwithworkspace_from_factor, ensure_sparse_positive_definitewithridge,
-    max_symmetric_asymmetry, solve_sparse_spd,
+    solve_sparse_spd,
 };
+use super::loop_driver::max_symmetric_asymmetry;
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::{FaerLinalgError, array1_to_col_matmut};
 use crate::linalg::utils::{StableSolver, array_is_finite};

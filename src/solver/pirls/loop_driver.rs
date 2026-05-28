@@ -31,8 +31,13 @@ use super::{
     // compute functions
     calculate_deviance, calculate_loglikelihood_omitting_constants,
     computeworkingweight_derivatives_from_eta,
+    // moved into mod.rs but referenced from this driver:
+    ArrowSchurInnerConfig, GamModelFinalState, project_coefficients_to_lower_bounds,
 };
-use gpu_dispatch::{try_gaussian_pls_gpu, try_pirls_loop_gpu};
+use super::convergence::effective_kkt_tolerance;
+use super::gpu_dispatch::{try_gaussian_pls_gpu, try_pirls_loop_gpu};
+use crate::linalg::faer_ndarray::fast_ab;
+use crate::probability::standard_normal_quantile;
 use crate::construction::{
     EngineDims, KroneckerReparamResult, ReparamResult,
     create_balanced_penalty_root_from_canonical,
@@ -261,7 +266,7 @@ pub(super) fn solve_intercept_for_prevalence(
 
 
 
-fn assemble_pirls_result(
+pub(super) fn assemble_pirls_result(
     working_summary: &WorkingModelPirlsResult,
     likelihood: GlmLikelihoodSpec,
     offset: ArrayView1<'_, f64>,
@@ -333,7 +338,7 @@ fn assemble_pirls_result(
     }
 }
 
-fn detect_logit_instability(
+pub(super) fn detect_logit_instability(
     link: LinkFunction,
     has_penalty: bool,
     firth_active: bool,
@@ -409,7 +414,7 @@ fn detect_logit_instability(
 /// Stack λ-weighted penalty roots from canonical penalties into a single
 /// `total_rank × p` matrix for PIRLS. Each block-local root is embedded
 /// into the full column space on-the-fly.
-fn stack_lambdaweighted_penalty_root_canonical(
+pub(super) fn stack_lambdaweighted_penalty_root_canonical(
     penalties: &[crate::construction::CanonicalPenalty],
     lambdas: &[f64],
     p: usize,
@@ -440,7 +445,7 @@ fn stack_lambdaweighted_penalty_root_canonical(
     e
 }
 
-fn build_sparse_native_reparam_result(
+pub(super) fn build_sparse_native_reparam_result(
     base: ReparamResult,
     penalties: &[crate::construction::CanonicalPenalty],
     lambdas: &[f64],
@@ -474,7 +479,7 @@ fn build_sparse_native_reparam_result(
     }
 }
 
-fn build_diagonal_penalty_from_kronecker(
+pub(super) fn build_diagonal_penalty_from_kronecker(
     kron_result: &KroneckerReparamResult,
     lambdas: &[f64],
 ) -> PirlsPenalty {
@@ -524,7 +529,7 @@ fn build_diagonal_penalty_from_kronecker(
     }
 }
 
-fn canonical_prior_shift(
+pub(super) fn canonical_prior_shift(
     penalties: &[crate::construction::CanonicalPenalty],
     lambdas: &[f64],
     p: usize,
@@ -552,7 +557,7 @@ fn canonical_prior_shift(
 /// `canonical_prior_shift` with all λ = 1 and dropping `S_k` from the linear
 /// piece (i.e., raw μ rather than `S_k μ`). Returned in the *original*
 /// coordinates; callers transform if needed.
-fn canonical_prior_mean_aggregate(
+pub(super) fn canonical_prior_mean_aggregate(
     penalties: &[crate::construction::CanonicalPenalty],
     p: usize,
 ) -> Array1<f64> {
@@ -582,9 +587,6 @@ pub struct PirlsProblem<'a, X> {
     /// the cached `XᵀWX`.
     pub gaussian_fixed_cache: Option<&'a GaussianFixedCache>,
 }
-
-// GaussianFixedCache and SparseXtwxPrecomputed are defined in pls_solver.
-pub use pls_solver::{GaussianFixedCache, SparseXtwxPrecomputed};
 
 pub struct PenaltyConfig<'a> {
     /// Block-local canonical penalties with precomputed roots and spectral data.
@@ -1431,7 +1433,7 @@ pub(super) fn max_symmetric_asymmetry(matrix: &Array2<f64>) -> f64 {
 }
 
 #[inline]
-fn assert_symmetric_tol(matrix: &Array2<f64>, label: &str, tol: f64) {
+pub(super) fn assert_symmetric_tol(matrix: &Array2<f64>, label: &str, tol: f64) {
     let max_asym = max_symmetric_asymmetry(matrix);
     assert!(
         max_asym <= tol,
@@ -1459,7 +1461,7 @@ pub(super) fn make_reparam_operator(
 
 // solve_penalized_least_squares_implicit lives in pls_solver (imported above).
 
-fn build_transformed_lower_bound_constraints(
+pub(super) fn build_transformed_lower_bound_constraints(
     qs: &Array2<f64>,
     coefficient_lower_bounds: Option<&Array1<f64>>,
 ) -> Option<LinearInequalityConstraints> {
@@ -1480,7 +1482,7 @@ fn build_transformed_lower_bound_constraints(
     Some(LinearInequalityConstraints::from_paired(a, b))
 }
 
-fn build_transformed_lower_bound_constraints_with_transform(
+pub(super) fn build_transformed_lower_bound_constraints_with_transform(
     transform: &WorkingReparamTransform,
     coefficient_lower_bounds: Option<&Array1<f64>>,
 ) -> Option<LinearInequalityConstraints> {
@@ -1508,7 +1510,7 @@ fn build_transformed_lower_bound_constraints_with_transform(
     Some(LinearInequalityConstraints::from_paired(a, b))
 }
 
-fn build_transformed_linear_constraints(
+pub(super) fn build_transformed_linear_constraints(
     qs: &Array2<f64>,
     linear_constraints: Option<&LinearInequalityConstraints>,
 ) -> Option<LinearInequalityConstraints> {
@@ -1522,7 +1524,7 @@ fn build_transformed_linear_constraints(
     ))
 }
 
-fn build_transformed_linear_constraints_with_transform(
+pub(super) fn build_transformed_linear_constraints_with_transform(
     transform: &WorkingReparamTransform,
     linear_constraints: Option<&LinearInequalityConstraints>,
 ) -> Option<LinearInequalityConstraints> {
@@ -1542,7 +1544,7 @@ fn build_transformed_linear_constraints_with_transform(
     Some(LinearInequalityConstraints { a, b: lc.b.clone() })
 }
 
-fn merge_linear_constraints(
+pub(super) fn merge_linear_constraints(
     first: Option<LinearInequalityConstraints>,
     second: Option<LinearInequalityConstraints>,
 ) -> Option<LinearInequalityConstraints> {
@@ -1566,7 +1568,7 @@ fn merge_linear_constraints(
     }
 }
 
-fn sparse_from_denseview(x: ArrayView2<f64>) -> Option<DesignMatrix> {
+pub(super) fn sparse_from_denseview(x: ArrayView2<f64>) -> Option<DesignMatrix> {
     let nrows = x.nrows();
     let ncols = x.ncols();
     if nrows == 0 || ncols == 0 {
