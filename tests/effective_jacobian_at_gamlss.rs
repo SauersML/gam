@@ -454,7 +454,9 @@ fn out_of_range_block_idx_returns_err() {
 /// Box<dyn BlockEffectiveJacobian> can be sent across threads (Send + Sync bound).
 #[test]
 fn jacobian_box_is_send() {
-    fn assert_send<T: Send>(_t: T) {}
+    fn assert_send<T: Send>(t: T) {
+        std::mem::drop(t);
+    }
     let xa = design_a();
     let xb = design_b();
     let specs = vec![make_spec("mu", xa), make_spec("log_sigma", xb)];

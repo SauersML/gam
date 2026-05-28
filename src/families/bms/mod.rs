@@ -1089,7 +1089,7 @@ pub(crate) mod hessian_paths;
 pub(crate) mod install_flex;
 pub(crate) mod row_kernel;
 #[cfg(test)]
-pub(crate) mod tests_inline;
+mod tests_inline;
 pub(crate) mod workspace;
 
 // ---------------------------------------------------------------------------

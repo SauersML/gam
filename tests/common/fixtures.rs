@@ -107,7 +107,6 @@ impl Splitmix64 {
 pub fn build_survival_marginal_slope_synth(
     n: usize,
     d_pc: usize,
-    _centers: usize,
     seed: u64,
 ) -> EncodedDataset {
     let mut rng = Splitmix64::new(seed);
