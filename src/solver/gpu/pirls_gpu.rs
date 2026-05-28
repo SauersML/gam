@@ -1918,8 +1918,6 @@ extern "C" __global__ void status_or(
         /// `launch_row_reweight_on_stream` call. Pass `1.0` for non-Gamma fits.
         gamma_shape: f64,
         beta0_host: ArrayView1<'_, f64>,
-        y_host: ArrayView1<'_, f64>,
-        prior_w_host: ArrayView1<'_, f64>,
         penalty_hessian: ArrayView2<'_, f64>,
         /// Linear shift `b` of the shifted-quadratic penalty
         /// `βᵀSβ − 2βᵀb + c`. Length `p`. Mirrors
@@ -1950,13 +1948,7 @@ extern "C" __global__ void status_or(
         if beta0_host.len() != p {
             return Err(format!("beta0 length {} ≠ p={p}", beta0_host.len()));
         }
-        if y_host.len() != n || prior_w_host.len() != n {
-            return Err(format!(
-                "y/prior_w length mismatch (y={}, w={}, n={n})",
-                y_host.len(),
-                prior_w_host.len()
-            ));
-        }
+
         if linear_shift.len() != p {
             return Err(format!(
                 "linear_shift length {} ≠ p={p}",
@@ -1976,18 +1968,7 @@ extern "C" __global__ void status_or(
                 &mut loop_ws.beta_dev,
             )
             .map_err(|e| format!("upload beta0: {e}"))?;
-        ws.stream
-            .memcpy_htod(
-                y_host.as_slice().ok_or("y not contiguous")?,
-                &mut loop_ws.y_dev,
-            )
-            .map_err(|e| format!("upload y: {e}"))?;
-        ws.stream
-            .memcpy_htod(
-                prior_w_host.as_slice().ok_or("prior_w not contiguous")?,
-                &mut loop_ws.prior_w_dev,
-            )
-            .map_err(|e| format!("upload prior_w: {e}"))?;
+
 
         let backend = crate::gpu::pirls_row::PirlsRowBackend::probe()
             .map_err(|e| format!("pirls_row backend: {e}"))?;
@@ -2026,8 +2007,8 @@ extern "C" __global__ void status_or(
             &ws.stream,
             n,
             &loop_ws.eta_dev,
-            &loop_ws.y_dev,
-            &loop_ws.prior_w_dev,
+            &shared.y_dev,
+            &shared.prior_w_dev,
             &mut loop_ws.row_solve,
         )
         .map_err(|e| format!("solve-row init: {e}"))?;
@@ -2104,12 +2085,21 @@ extern "C" __global__ void status_or(
                 "dir_linf",
             )?;
 
+            // dir_orig = Qs · direction (transform direction to original coords).
+            gemv_no_trans(
+                &ws.blas,
+                p,
+                p,
+                &ws.qs_dev,
+                &loop_ws.direction_dev,
+                &mut ws.dir_orig_dev,
+            )?;
             gemv_no_trans(
                 &ws.blas,
                 n,
                 p,
                 &shared.x_original_dev,
-                &loop_ws.direction_dev,
+                &ws.dir_orig_dev,
                 &mut loop_ws.xd_dev,
             )?;
 
@@ -2133,8 +2123,8 @@ extern "C" __global__ void status_or(
                 n,
                 &loop_ws.eta_dev,
                 &loop_ws.xd_dev,
-                &loop_ws.y_dev,
-                &loop_ws.prior_w_dev,
+                &shared.y_dev,
+                &shared.prior_w_dev,
                 &mut loop_ws.alpha_ladder,
             )
             .map_err(|e| format!("alpha-ladder it={it}: {e}"))?;
@@ -2256,8 +2246,8 @@ extern "C" __global__ void status_or(
                 &ws.stream,
                 n,
                 &loop_ws.eta_dev,
-                &loop_ws.y_dev,
-                &loop_ws.prior_w_dev,
+                &shared.y_dev,
+                &shared.prior_w_dev,
                 &mut loop_ws.row_solve,
             )
             .map_err(|e| format!("solve-row accepted it={it}: {e}"))?;
@@ -2286,8 +2276,8 @@ extern "C" __global__ void status_or(
                     &ws.stream,
                     n,
                     &loop_ws.eta_dev,
-                    &loop_ws.y_dev,
-                    &loop_ws.prior_w_dev,
+                    &shared.y_dev,
+                    &shared.prior_w_dev,
                     &mut loop_ws.row_final,
                 )
                 .map_err(|e| format!("final-row converged: {e}"))?;
@@ -2331,8 +2321,8 @@ extern "C" __global__ void status_or(
             &ws.stream,
             n,
             &loop_ws.eta_dev,
-            &loop_ws.y_dev,
-            &loop_ws.prior_w_dev,
+            &shared.y_dev,
+            &shared.prior_w_dev,
             &mut loop_ws.row_final,
         )
         .map_err(|e| format!("final-row max_iter: {e}"))?;

@@ -3431,13 +3431,15 @@ impl JacobiPreconditioner {
         backend: &B,
     ) -> Result<Self, ArrowSchurError> {
         let k = sys.k;
+        // Extract diagonal of H_ββ via BetaPenaltyOp trait (#296).
         let mut diag = Array1::<f64>::zeros(k);
+        {
+            let op = sys.effective_penalty_op();
+            let diag_slice = diag.as_slice_mut().expect("diag must be contiguous");
+            op.diagonal(diag_slice);
+        }
         for a in 0..k {
-            let base = match sys.hbb_diag.as_ref() {
-                Some(hbb_diag) => hbb_diag[a],
-                None => sys.hbb[[a, a]],
-            };
-            diag[a] = base + ridge_beta;
+            diag[a] += ridge_beta;
         }
         // For each column a, extract H_tβ^(i) e_a via matvec probe when
         // dense slab is absent, then compute the scalar Schur diagonal.
