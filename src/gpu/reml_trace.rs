@@ -828,7 +828,6 @@ mod linux_cuda {
         cholesky_logdet_from_col_major, context_and_stream, pinned_htod, potrf_in_place,
         potrs_in_place,
     };
-    use crate::gpu_err;
     use cudarc::cublas::sys::cublasOperation_t;
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
     use cudarc::cusolver::DnHandle;

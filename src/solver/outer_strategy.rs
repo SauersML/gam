@@ -6998,7 +6998,8 @@ mod tests {
             Ok(())
         });
 
-        obj.seed_inner_state(&array![1.5, -2.0]).unwrap();
+        let outcome = obj.seed_inner_state(&array![1.5, -2.0]).unwrap();
+        assert_eq!(outcome, SeedOutcome::Installed);
         assert_eq!(obj.state, vec![1.5, -2.0]);
     }
 
@@ -9403,9 +9404,12 @@ mod tests {
                 })
             }
             fn reset(&mut self) {}
-            fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<(), EstimationError> {
+            fn seed_inner_state(
+                &mut self,
+                beta: &Array1<f64>,
+            ) -> Result<SeedOutcome, EstimationError> {
                 *self.seeded.lock().unwrap() = Some(beta.clone());
-                Ok(())
+                Ok(SeedOutcome::Installed)
             }
         }
 
@@ -9477,9 +9481,12 @@ mod tests {
                 })
             }
             fn reset(&mut self) {}
-            fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<(), EstimationError> {
+            fn seed_inner_state(
+                &mut self,
+                beta: &Array1<f64>,
+            ) -> Result<SeedOutcome, EstimationError> {
                 *self.seed_calls.lock().unwrap() += beta.len().max(1);
-                Ok(())
+                Ok(SeedOutcome::Installed)
             }
         }
 

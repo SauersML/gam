@@ -8,7 +8,7 @@ side has to translate that into one of several public return shapes:
   Bernoulli marginal-slope, and transformation-normal models);
 * a tabular payload (``dict`` / ``DataFrame`` / ``polars`` / ``pyarrow`` /
   ``numpy``) when the caller explicitly opts in via ``return_type=``,
-  ``id_column=``, ``interval=``, or ``with_uncertainty=True``;
+  ``id_column=``, or ``interval=``;
 * a structured :class:`SurvivalPrediction` /
   :class:`CompetingRisksPrediction` for survival families (those have their
   own dedicated containers and ignore the shape policy by construction).
@@ -16,9 +16,9 @@ side has to translate that into one of several public return shapes:
 Two design rules this module enforces:
 
 1. **Single shape predicate.** :func:`wants_table` is the *only* place that
-   maps user intent ``(return_type, id_column, interval, with_uncertainty)``
-   to "1-D array vs table". Every per-class shaper consults it. Adding a new
-   keyword to ``Model.predict`` is a one-line change here.
+   maps user intent ``(return_type, id_column, interval)`` to "1-D array vs
+   table". Every per-class shaper consults it. Adding a new keyword to
+   ``Model.predict`` is a one-line change here.
 2. **Policy is driven by caller intent, never by what columns the Rust core
    happened to return.** If the backend emits ``effective_se`` without
    being asked, that is a backend bug to fix upstream, not something to
@@ -53,11 +53,10 @@ def wants_table(
     return_type: str | None,
     id_column: str | None,
     interval: float | None,
-    with_uncertainty: bool,
 ) -> bool:
     """Return ``True`` when the caller has opted into a tabular return shape.
 
-    The four signals are the *complete* set of public knobs that promote
+    These three signals are the *complete* set of public knobs that promote
     ``Model.predict`` from "1-D point estimate" to "full column payload":
 
     * ``return_type`` — explicit output kind (``"dict"`` / ``"pandas"`` /
@@ -67,19 +66,16 @@ def wants_table(
     * ``interval`` — a credible-interval coverage produces
       ``effective_se`` / ``mean_lower`` / ``mean_upper`` columns; those are
       meaningful only as a table.
-    * ``with_uncertainty`` — request the full uncertainty decomposition;
-      same reasoning as ``interval``.
+
+    (Issue #342: an earlier ``with_uncertainty`` boolean was redundant with
+    ``interval`` — coverage and the request to quantify uncertainty are the
+    same decision — and was removed.)
 
     Any other backend-visible state (e.g. presence of an ``effective_se``
     column in the payload) is intentionally ignored: shape policy belongs
     to the caller, not the wire format.
     """
-    return (
-        return_type is not None
-        or id_column is not None
-        or interval is not None
-        or with_uncertainty
-    )
+    return return_type is not None or id_column is not None or interval is not None
 
 
 def shape_predict_response(
@@ -94,7 +90,6 @@ def shape_predict_response(
     interval: float | None,
     return_type: str | None,
     id_column: str | None,
-    with_uncertainty: bool,
     row_ids: list[str] | None,
     restore: Any,
 ) -> Any:
@@ -130,7 +125,6 @@ def shape_predict_response(
         return_type=return_type,
         id_column=id_column,
         interval=interval,
-        with_uncertainty=with_uncertainty,
     )
 
     if model_class in _TRANSFORMATION_NORMAL_MODEL_CLASSES:

@@ -2726,88 +2726,6 @@ pub fn materialize<'a>(
     }
 }
 
-/// Validate that the response column lies in the support of `response_family`.
-///
-/// Gamma is supported on `y > 0`; Poisson, NegativeBinomial, and Tweedie
-/// (compound-Poisson-Gamma) are supported on `y ≥ 0`. Beta requires
-/// `y ∈ (0, 1)` and is validated upstream on the external-design GLM path —
-/// we mirror it here for the formula path so the user gets the same error
-/// regardless of entry point. All other families either accept the real line
-/// (Gaussian) or have their own domain-specific validation (Binomial requires
-/// {0,1} which `is_binary_response` already guards downstream).
-///
-/// Reports up to `MAX_REPORTED` row indices so the message stays bounded on
-/// large datasets but still identifies the offending data.
-fn validate_response_support_for_family(
-    response_family: &ResponseFamily,
-    response_name: &str,
-    y: ArrayView1<'_, f64>,
-) -> Result<(), WorkflowError> {
-    const MAX_REPORTED: usize = 5;
-    let (family_label, requirement, predicate): (&str, &str, fn(f64) -> bool) = match response_family
-    {
-        ResponseFamily::Gamma => (
-            "Gamma",
-            "strictly positive response values (y > 0)",
-            |yi| yi.is_finite() && yi > 0.0,
-        ),
-        ResponseFamily::Poisson => (
-            "Poisson",
-            "non-negative response values (y ≥ 0)",
-            |yi| yi.is_finite() && yi >= 0.0,
-        ),
-        ResponseFamily::NegativeBinomial { .. } => (
-            "Negative-Binomial",
-            "non-negative response values (y ≥ 0)",
-            |yi| yi.is_finite() && yi >= 0.0,
-        ),
-        ResponseFamily::Tweedie { .. } => (
-            "Tweedie",
-            "non-negative response values (y ≥ 0)",
-            |yi| yi.is_finite() && yi >= 0.0,
-        ),
-        ResponseFamily::Beta { .. } => (
-            "Beta",
-            "response values strictly in the open interval (0, 1)",
-            |yi| yi.is_finite() && yi > 0.0 && yi < 1.0,
-        ),
-        // Gaussian accepts the entire real line; Binomial is enforced by
-        // is_binary_response and PIRLS at fit time; RoystonParmar uses the
-        // survival pathway, not the standard formula materializer.
-        ResponseFamily::Gaussian
-        | ResponseFamily::Binomial
-        | ResponseFamily::RoystonParmar => return Ok(()),
-    };
-
-    let mut bad: Vec<(usize, f64)> = Vec::new();
-    for (i, &yi) in y.iter().enumerate() {
-        if !predicate(yi) {
-            if bad.len() < MAX_REPORTED {
-                bad.push((i, yi));
-            } else {
-                bad.push((i, yi));
-                break;
-            }
-        }
-    }
-    if bad.is_empty() {
-        return Ok(());
-    }
-    let shown = bad
-        .iter()
-        .take(MAX_REPORTED)
-        .map(|(i, v)| format!("y[{i}]={v}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let more = if bad.len() > MAX_REPORTED { ", ..." } else { "" };
-    Err(WorkflowError::InvalidConfig {
-        reason: format!(
-            "{family_label} family requires {requirement}; response column '{response_name}' \
-             violates this constraint at row(s) [{shown}{more}]",
-        ),
-    })
-}
-
 /// Detect whether a response column is binary (0/1 only).
 pub fn is_binary_response(y: ArrayView1<'_, f64>) -> bool {
     if y.is_empty() {
@@ -2961,11 +2879,23 @@ fn validate_response_degeneracy_and_size(
 }
 
 /// Resolve a family from an optional name, optional link choice, and response data.
+///
+/// `y_kind` describes the *source* representation of the response column
+/// (string-valued `Categorical`, numeric `Binary` short-circuit, or generic
+/// `Numeric`). It is consulted only on the auto-detect path — explicit
+/// `family=...` always wins — but is required there because the same numeric
+/// `y = [0.0, 1.0, ...]` payload may come from a real binary outcome or from
+/// a categorical column whose two levels happened to encode to those indices.
+/// Routing the kind through [`ResponseFamily::infer_from_response`] is what
+/// stops the auto-detector from silently inferring Binomial off encoded
+/// strings (see `tests/issues/issue_304`).
 pub fn resolve_family(
     family: Option<&str>,
     negative_binomial_theta: Option<f64>,
     link_choice: Option<&LinkChoice>,
     y: ArrayView1<'_, f64>,
+    y_kind: ResponseColumnKind,
+    response_name: &str,
 ) -> Result<LikelihoodSpec, String> {
     let nb_theta = negative_binomial_theta.unwrap_or(1.0);
     if !nb_theta.is_finite() || nb_theta <= 0.0 {

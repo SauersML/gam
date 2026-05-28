@@ -682,11 +682,14 @@ mod tests {
             self.last_seeded_beta_len = None;
         }
 
-        fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<(), EstimationError> {
+        fn seed_inner_state(
+            &mut self,
+            beta: &Array1<f64>,
+        ) -> Result<crate::solver::outer_strategy::SeedOutcome, EstimationError> {
             assert_eq!(beta.len(), self.n_params);
             self.seed_calls += 1;
             self.last_seeded_beta_len = Some(beta.len());
-            Ok(())
+            Ok(crate::solver::outer_strategy::SeedOutcome::Installed)
         }
     }
 

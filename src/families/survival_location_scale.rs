@@ -4315,7 +4315,7 @@ fn prepare_survival_location_scale_model(
         )?,
         initial_beta: time_prepared.initial_beta.clone(),
         gauge_priority: 100,
-        jacobian_callback: None,
+        jacobian_callback: Some(time_audit_jacobian),
     };
 
     let threshold_prep = prepare_cov_block_kind(&spec.threshold_block)?;
@@ -4388,6 +4388,26 @@ fn prepare_survival_location_scale_model(
         } else {
             (threshold_design.clone(), threshold_prep.offset.clone())
         };
+    // Time-varying threshold blocks store an `[exit; entry; deriv]` stacked
+    // operator in `design` with 3*n rows. The identifiability audit only needs
+    // the n-row exit channel; expose that via the callback so the audit's
+    // row-equality invariant holds across blocks.
+    let threshold_audit_jacobian: Option<Arc<dyn BlockEffectiveJacobian>> =
+        if threshold_entry_design.is_some() {
+            let exit_dense = threshold_design
+                .try_to_dense_arc(
+                    "survival_location_scale threshold block audit Jacobian",
+                )?
+                .as_ref()
+                .clone();
+            Some(Arc::new(AdditiveBlockJacobian {
+                design: exit_dense,
+                own_output: 0,
+                n_family_outputs: 1,
+            }))
+        } else {
+            None
+        };
     let thresholdspec = ParameterBlockSpec {
         name: "threshold".to_string(),
         design: threshold_solver_design,
@@ -4397,7 +4417,7 @@ fn prepare_survival_location_scale_model(
         initial_log_lambdas: threshold_initial_log_lambdas,
         initial_beta: threshold_initial_beta,
         gauge_priority: 100,
-        jacobian_callback: None,
+        jacobian_callback: threshold_audit_jacobian,
     };
 
     let survival_primary_design = DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(
