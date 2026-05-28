@@ -77,7 +77,6 @@ fn spec_with_callback(
         initial_log_lambdas: Array1::<f64>::zeros(0),
         initial_beta: None,
         gauge_priority: 100,
-        eta_row_scaling: None,
         jacobian_callback: Some(cb),
     }
 }
@@ -110,7 +109,6 @@ fn flat_audit_flags_fatal_on_shared_raw_columns() {
             initial_log_lambdas: Array1::<f64>::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         }
     };
