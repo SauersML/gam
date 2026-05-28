@@ -345,7 +345,8 @@ fn flex_time_jacobian_rigid_fd() {
     let design_deriv = make_design(N, p_t, &mut seed);
     let s = 0.45_f64;
 
-    let beta_t: Vec<f64> = (0..p_t).map(|_| lcg(&mut seed) * 0.4).collect();
+    // Use small beta_t so qd1 = 1.0 + design_deriv·beta_t stays well positive.
+    let beta_t: Vec<f64> = (0..p_t).map(|_| lcg(&mut seed) * 0.1).collect();
     let q0: Vec<f64> = (0..N)
         .map(|i| (0..p_t).map(|j| design_entry[[i, j]] * beta_t[j]).sum())
         .collect();
@@ -354,10 +355,9 @@ fn flex_time_jacobian_rigid_fd() {
         .collect();
     let qd1: Vec<f64> = (0..N)
         .map(|i| {
-            0.3 + (0..p_t)
+            1.0 + (0..p_t)
                 .map(|j| design_deriv[[i, j]] * beta_t[j])
                 .sum::<f64>()
-                .abs()
         })
         .collect();
     let g_row = vec![0.0_f64; N];
@@ -413,7 +413,7 @@ fn flex_time_jacobian_rigid_fd() {
             .collect();
         let qd1_r: Vec<f64> = (0..N)
             .map(|i| {
-                0.3 + (0..p_t).map(|j| dd[[i, j]] * b[j]).sum::<f64>().abs()
+                1.0 + (0..p_t).map(|j| dd[[i, j]] * b[j]).sum::<f64>()
             })
             .collect();
         let g_zeros = vec![0.0_f64; N];
