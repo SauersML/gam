@@ -175,17 +175,6 @@ fn gamma_loglikelihood_with_shape(
         .sum()
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PirlsLinearSolvePath {
-    DenseTransformed,
-    SparseNative,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PirlsCoordinateFrame {
-    TransformedQs,
-    OriginalSparseNative,
-}
 
 #[derive(Clone, Debug)]
 pub struct SparsePirlsDecision {
@@ -891,27 +880,6 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub enum FirthDiagnostics {
-    #[default]
-    Inactive,
-    Active {
-        jeffreys_logdet: f64,
-        hat_diag: Array1<f64>,
-    },
-}
-
-impl FirthDiagnostics {
-    #[inline]
-    pub fn jeffreys_logdet(&self) -> Option<f64> {
-        match self {
-            Self::Inactive => None,
-            Self::Active {
-                jeffreys_logdet, ..
-            } => Some(*jeffreys_logdet),
-        }
-    }
-}
 
 /// Which curvature surface is used for the Hessian-side weights in PIRLS.
 ///

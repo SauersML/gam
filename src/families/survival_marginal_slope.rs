@@ -20272,11 +20272,12 @@ pub fn fit_survival_marginal_slope_terms(
                 &spec.logslope_offset,
                 rho_logslope,
                 hints.logslope_beta.clone(),
-                std::sync::Arc::from(
+                Arc::from(
                     z_primary
                         .as_slice()
                         .expect("z_primary must be C-contiguous"),
                 ),
+                probit_scale,
             ),
         ];
         // V+M-exact cutover: when the active cutover fired, the

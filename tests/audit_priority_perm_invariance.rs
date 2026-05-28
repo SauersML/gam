@@ -44,7 +44,7 @@ fn spec_with_priority(name: &str, design: Array2<f64>, priority: u8) -> Paramete
         initial_log_lambdas: Array1::<f64>::zeros(0),
         initial_beta: None,
         gauge_priority: priority,
-        row_scaling: None,
+        eta_row_scaling: None,
         jacobian_callback: None,
     }
 }

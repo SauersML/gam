@@ -155,7 +155,7 @@ fn pirls_gpu_matches_cpu_across_stability_grid() {
 
 #[test]
 fn reml_gpu_logdet_and_score_match_cpu() {
-    if !cuda_available() {
+    if let GpuGate::Skip = gpu_gate("reml_gpu_logdet_and_score_match_cpu") {
         return;
     }
     configure_device(Device::Cuda);
