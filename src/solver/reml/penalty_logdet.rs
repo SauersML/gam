@@ -794,7 +794,27 @@ impl PenaltyPseudologdet {
         if let (Some(m0), Some(null_threshold)) = (structural_nullity, ridged_null_threshold) {
             // Count eigenvalues that look like ridge-only directions.
             let null_like_count = evals.iter().filter(|&&e| e <= null_threshold).count();
-            if null_like_count != m0 {
+            // Two failure modes are possible (see issue #192 and issue #318):
+            //
+            //   null_like_count > m0  — the assembled matrix has more
+            //     eigenvalues at-or-below the ridge level than the metadata
+            //     accounts for.  This is the original #192 concern: an active
+            //     penalty contributes λ_k σ_k < r, so a positional rule would
+            //     conflate an active direction with a structural null.  We
+            //     genuinely cannot disambiguate here, so error out.
+            //
+            //   null_like_count < m0  — the metadata claims more structural
+            //     nulls than the assembled spectrum actually exhibits at this
+            //     λ (issue #318).  This happens when a "structural" eigenvalue
+            //     classified by `analyze_penalty_block`'s relative tolerance
+            //     is in truth a tiny positive σ that, once amplified by a
+            //     large λ, sits well above the ridge.  In that regime the
+            //     metadata nullity is a soft upper bound: the eigenvalue
+            //     spectrum is authoritative and identifies fewer nulls than
+            //     the metadata predicted.  Treat the eigenvalue split as
+            //     truth and proceed — the would-be structural-null direction
+            //     is genuinely active in `Σ λ_k S_k + r·I` at this λ.
+            if null_like_count > m0 {
                 return Err(format!(
                     "PenaltyPseudologdet: structural nullity invariant violated — expected {m0} \
                      eigenvalue(s) at or below ridge threshold {null_threshold:.6e}, but found \

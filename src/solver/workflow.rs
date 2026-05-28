@@ -180,10 +180,18 @@ pub struct LinkWiggleConfig {
     pub double_penalty: bool,
 }
 
+/// Configuration for the second-stage binomial-mean wiggle fit appended to a
+/// standard pilot. The blockwise refit options live inside this struct so the
+/// pilot config (`link_kind` + `wiggle`) and its required `refit_options` can
+/// never disagree: either the whole standard-wiggle request is `Some`, or it
+/// is `None`. The previous shape had two sibling `Option` fields on
+/// `StandardFitRequest`, which allowed the materialize path to construct an
+/// inconsistent state (#320: linkwiggle config without blockwise options).
 #[derive(Clone, Debug)]
 pub struct StandardBinomialWiggleConfig {
     pub link_kind: InverseLink,
     pub wiggle: LinkWiggleConfig,
+    pub refit_options: BlockwiseFitOptions,
 }
 
 pub struct StandardFitRequest<'a> {
@@ -196,7 +204,6 @@ pub struct StandardFitRequest<'a> {
     pub options: FitOptions,
     pub kappa_options: SpatialLengthScaleOptimizationOptions,
     pub wiggle: Option<StandardBinomialWiggleConfig>,
-    pub wiggle_options: Option<BlockwiseFitOptions>,
     pub coefficient_groups: Vec<CoefficientGroupSpec>,
     pub penalty_block_gamma_priors: Vec<(String, f64, f64)>,
     pub latent_coord: Option<StandardLatentCoordConfig>,
@@ -994,9 +1001,10 @@ fn fit_standard_model(request: StandardFitRequest<'_>) -> Result<StandardFitResu
     let Some(wiggle) = request.wiggle else {
         return Ok(result);
     };
-    let wiggle_options = request
-        .wiggle_options
-        .ok_or_else(|| "standard wiggle workflow requires blockwise wiggle options".to_string())?;
+    // `StandardBinomialWiggleConfig` now carries `refit_options` directly, so
+    // the previous "pilot config present, blockwise options missing" failure
+    // state (#320) is unrepresentable at the type level.
+    let wiggle_options = wiggle.refit_options.clone();
     let wiggle_link_kind =
         resolved_wiggle_inverse_link(&request.family, &result.fit, &wiggle.link_kind)?;
     let selected_wiggle_basis = select_binomial_mean_link_wiggle_basis_from_pilot(
@@ -5394,6 +5402,12 @@ fn materialize_standard<'a>(
                 penalty_orders: cfg.penalty_orders.clone(),
                 double_penalty: cfg.double_penalty,
             },
+            // The second-stage refit options live inside the wiggle config so
+            // the pilot can't be configured without them (see
+            // `StandardBinomialWiggleConfig` doc + #320). Magic-by-default:
+            // no caller-supplied options are required for the Python /
+            // formula-DSL path.
+            refit_options: BlockwiseFitOptions::default(),
         })
     });
 
@@ -5407,15 +5421,6 @@ fn materialize_standard<'a>(
             family,
             options,
             kappa_options,
-            wiggle_options: if wiggle.is_some() {
-                // The standard wiggle workflow always needs BlockwiseFitOptions
-                // for the second-stage refit; supply defaults when a linkwiggle()
-                // term materializes a binomial-mean wiggle config. Magic-by-default:
-                // no new option is required from the caller.
-                Some(BlockwiseFitOptions::default())
-            } else {
-                None
-            },
             wiggle,
             coefficient_groups: config.coefficient_groups.clone(),
             penalty_block_gamma_priors: config.penalty_block_gamma_priors.clone(),

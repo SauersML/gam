@@ -17,6 +17,7 @@ pub mod cubic_bspline_moments;
 pub mod cubic_cell;
 pub mod device;
 pub mod driver;
+#[macro_use]
 pub mod error;
 pub mod identifiability_compile;
 #[cfg(target_os = "linux")]
