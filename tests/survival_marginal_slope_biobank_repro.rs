@@ -95,30 +95,6 @@ fn install_logger() {
     });
 }
 
-#[inline]
-fn splitmix64(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = *state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
-
-#[inline]
-fn next_unit(state: &mut u64) -> f64 {
-    let bits = splitmix64(state) >> 11;
-    (bits as f64) * (1.0_f64 / ((1u64 << 53) as f64))
-}
-
-#[inline]
-fn next_gauss(state: &mut u64) -> f64 {
-    let u1 = next_unit(state).max(f64::MIN_POSITIVE);
-    let u2 = next_unit(state);
-    let r = (-2.0 * u1.ln()).sqrt();
-    let theta = std::f64::consts::TAU * u2;
-    r * theta.cos()
-}
-
 fn build_dataset() -> gam::inference::data::EncodedDataset {
     let headers = vec![
         "entry_age".to_string(),
@@ -131,26 +107,22 @@ fn build_dataset() -> gam::inference::data::EncodedDataset {
         "sex".to_string(),
     ];
 
-    let mut state = 0xB10B_A11C_5EED_2026_u64;
+    let mut rng = Splitmix64::new(0xB10B_A11C_5EED_2026_u64);
     let mut rows: Vec<StringRecord> = Vec::with_capacity(N);
 
     for _ in 0..N {
-        let pc1 = next_gauss(&mut state) * 0.5;
-        let pc2 = next_gauss(&mut state) * 0.5;
-        let pc3 = next_gauss(&mut state) * 0.5;
-        let prs = next_gauss(&mut state);
-        let sex = if next_unit(&mut state) < 0.5 {
-            1.0
-        } else {
-            0.0
-        };
-        let entry = 40.0 + 5.0 * next_unit(&mut state);
-        let followup = 0.5 + 8.0 * next_unit(&mut state);
+        let pc1 = rng.next_gauss() * 0.5;
+        let pc2 = rng.next_gauss() * 0.5;
+        let pc3 = rng.next_gauss() * 0.5;
+        let prs = rng.next_gauss();
+        let sex = if rng.next_unit() < 0.5 { 1.0 } else { 0.0 };
+        let entry = 40.0 + 5.0 * rng.next_unit();
+        let followup = 0.5 + 8.0 * rng.next_unit();
         let exit = entry + followup;
         let score = 0.3 * prs + 0.4 * pc1 - 0.3 * pc2
             + 0.2 * pc3
             + 0.15 * sex
-            + 0.2 * next_gauss(&mut state);
+            + 0.2 * rng.next_gauss();
         let event = if score > 0.0 { 1 } else { 0 };
         rows.push(StringRecord::from(vec![
             entry.to_string(),
