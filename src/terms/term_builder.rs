@@ -916,34 +916,32 @@ fn bspline_boundary_declares_periodic_axis(options: &BTreeMap<String, String>) -
 
 /// Canonical-name lookup for the `bs=`/`type=` smooth selector.
 ///
-/// User-facing names — including every mgcv-compatible spelling — collapse to
-/// the engine-internal canonical names used by the dispatch in
-/// [`build_smooth_basis`]. Adding a new alias is a one-line entry here; the
-/// match arms below carry only canonical names, so new aliases never require
-/// edits in multiple places.
+/// User-facing names — including mgcv-compatible spellings whose semantics
+/// match an existing gamfit smooth exactly — collapse to the engine-internal
+/// canonical names used by the dispatch in [`build_smooth_basis`]. Adding a
+/// new exactly-equivalent alias is a one-line entry here; the match arms
+/// below remain the single dispatch site.
 ///
-/// The canonical names (right-hand side) match the strings used in the match
-/// arms of [`build_smooth_basis`]. Unrecognised inputs pass through unchanged
-/// so the dispatch can produce its usual "unsupported smooth type" error,
-/// preserving the existing diagnostic surface for genuine typos.
+/// Aliases listed here MUST be true semantic equivalents of the canonical
+/// target, not approximations. mgcv names whose semantics differ from any
+/// gamfit smooth (e.g. `bs="cs"` shrinkage thin-plate, `bs="ad"` adaptive)
+/// are intentionally NOT mapped here — they should reach the unsupported-type
+/// path so users get a real diagnostic instead of a silent semantic
+/// substitution.
+///
+/// Unrecognised inputs pass through unchanged so the dispatch can produce its
+/// usual "unsupported smooth type" error, preserving the existing diagnostic
+/// surface for genuine typos.
 fn canonicalize_smooth_type(raw: &str) -> &str {
     match raw {
-        // Thin-plate spline (mgcv: bs="tp" / "ts"; gamfit: "tps" / "thinplate")
-        "tp" | "ts" | "thinplate" | "thin-plate" => "tps",
-        // Gaussian process / Matérn (mgcv: bs="gp"; gamfit: "matern")
+        // Thin-plate spline. mgcv `bs="tp"` is the default thin-plate
+        // regression spline — exact semantic equivalent of gamfit's `"tps"`.
+        "tp" => "tps",
+        // Gaussian process / Matérn. mgcv `bs="gp"` defaults to a Matérn
+        // covariance kernel with REML smoothing parameter selection, which
+        // matches gamfit's `"matern"` exactly (same kernel-Gram identity,
+        // same REML route).
         "gp" => "matern",
-        // Cubic regression spline family (mgcv: bs="cr"/"cs"/"cc") — gamfit's
-        // B-spline + cyclic boundary handles these. Periodic dispatch is
-        // handled separately via the cyclic/periodic options; map non-cyclic
-        // variants to the canonical bspline name.
-        "cr" | "cs" => "bspline",
-        // P-spline (mgcv: bs="ps") — B-spline with difference penalty, which
-        // is gamfit's bspline default.
-        "ps" => "bspline",
-        // Spherical-spline-on-sphere (mgcv: bs="sos") — gamfit's sphere term.
-        "sos" => "sphere",
-        // Random effect (mgcv: bs="re") — preserved verbatim; handled by the
-        // dedicated re/fs/sz arm.
         other => other,
     }
 }
