@@ -5778,36 +5778,6 @@ mod test_support {
 
 
 impl PirlsResult {
-    /// Export the stabilized transformed Hessian as an exact dense matrix for
-    /// downstream solve paths that require explicit Hessians.
-    ///
-    /// The returned matrix is the convergence Hessian already used by PIRLS and
-    /// REML (`X'W_HX + S_λ`, plus the explicit stabilization ridge when active).
-    /// Sparse-native fits are materialized from their assembled sparse Hessian;
-    /// no numerical Hessian approximation or compatibility fallback is used.
-    pub fn dense_stabilizedhessian_transformed(
-        &self,
-        context: &str,
-    ) -> Result<Array2<f64>, EstimationError> {
-        self.stabilizedhessian_transformed
-            .try_to_dense_exact(context)
-            .map_err(EstimationError::InvalidInput)
-    }
-
-    #[inline]
-    pub fn jeffreys_logdet(&self) -> Option<f64> {
-        self.firth.jeffreys_logdet()
-    }
-
-    /// Scale-invariant relative gradient residual at the accepted PIRLS state.
-    ///
-    /// Returns ‖g‖ / (1 + ‖score‖ + ‖Sβ‖ + ridge·‖β‖). Numerator is
-    /// `lastgradient_norm`; denominator is `1 + gradient_natural_scale`.
-    /// This is the "r_g" used by seed-screening cost augmentation.
-    #[inline]
-    pub fn relative_gradient_norm(&self) -> f64 {
-        self.lastgradient_norm / (1.0 + self.gradient_natural_scale)
-    }
 
     pub(crate) fn compact_for_reml_cache(&self) -> Self {
         Self {
