@@ -7520,6 +7520,83 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         }
     };
 
+    // Stage 3.3-GI: GPU exact PLS dispatch for Gaussian-identity.
+    //
+    // When a CUDA runtime is available and the GaussianFixedCache has been
+    // populated, route through the exact device-side POTRF/POTRS solve instead
+    // of the row-kernel PIRLS loop.  A single call to solve_gaussian_pls_gpu
+    // replaces the entire iterative PIRLS loop for this algebraically exact
+    // family.  On error, falls through to the CPU identity path below.
+    //
+    // Gating conditions mirror `cache_eligible` below: identity link, Gaussian
+    // family, no Firth, no lower bounds, no constraints.
+    #[cfg(target_os = "linux")]
+    if matches!(link_function, LinkFunction::Identity)
+        && likelihood.spec.is_gaussian_identity()
+        && !config.firth_bias_reduction
+        && penalty.coefficient_lower_bounds.is_none()
+        && penalty.linear_constraints_original.is_none()
+    {
+        use crate::solver::gpu::pirls_dispatch_wire::{
+            GpuGaussianPlsInput, try_gpu_gaussian_pls_dispatch,
+        };
+        if let Some(cache) = gaussian_fixed_cache {
+            if let PirlsPenalty::Dense {
+                s_transformed,
+                linear_shift,
+                constant_shift,
+                prior_mean_target,
+                ..
+            } = &penalty_active
+            {
+                let qs_view = qs_arc.as_ref().map(|qs| qs.view());
+                let x_dense_opt = x_original.as_dense().map(|d| d.view());
+                if x_dense_opt.is_some() {
+                    let qs_arc_for_design = qs_arc
+                        .as_ref()
+                        .cloned()
+                        .unwrap_or_else(|| Arc::new(Array2::<f64>::eye(penalty.p)));
+                    let x_transformed_design = make_reparam_operator(
+                        &x_original_for_result,
+                        &qs_arc_for_design,
+                        use_sparse_native,
+                    );
+                    let reparam_for_gpu = materialize_final_reparam_result()?;
+                    let gpu_input = GpuGaussianPlsInput {
+                        xtwx_orig: cache.xtwx_orig.view(),
+                        xtwy_orig: cache.xtwy_orig.view(),
+                        s_transformed: s_transformed.view(),
+                        linear_shift: linear_shift.view(),
+                        prior_mean_target: prior_mean_target.view(),
+                        constant_shift: *constant_shift,
+                        qs: qs_view,
+                        ridge: FIXED_STABILIZATION_RIDGE,
+                        likelihood: &config.likelihood,
+                        inverse_link: &config.link_kind,
+                        x_original: &x_original,
+                        y,
+                        priorweights,
+                        offset,
+                        reparam_result: reparam_for_gpu,
+                        x_transformed_design,
+                        coordinate_frame,
+                        linear_constraints: linear_constraints.clone(),
+                    };
+                    if let Some(result) = try_gpu_gaussian_pls_dispatch(gpu_input) {
+                        match result {
+                            Ok(pair) => return Ok(pair),
+                            Err(err) => {
+                                log::warn!(
+                                    "[PIRLS GPU Gaussian PLS] device solve error,                                      falling back to CPU: {err}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if matches!(link_function, LinkFunction::Identity) {
         // Apply the Gaussian-Identity fixed-data cache only when every
         // precondition for the short-circuit's exact reuse holds: the family
@@ -7855,19 +7932,9 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             let n_admit = x_dense.nrows();
             let p_admit = x_dense.ncols();
             if try_gpu_pirls_loop_admit(&config.likelihood, n_admit, p_admit) {
-                // Build the transformed dense design X·Qs once (column-major
-                // friendly because `upload_shared_pirls_gpu` repacks
-                // internally). When `transform_active` is `None` (identity),
-                // X is already in transformed coordinates.
+                // Resident-X architecture (#269): ship X_original once to device,
+                // ship only Qs per ρ/σ point. No fast_ab materialization needed.
                 let qs_view = qs_arc.as_ref().map(|qs| qs.view());
-                let x_transformed_owned: Option<Array2<f64>> = match transform_active.as_ref() {
-                    Some(_) => qs_view.map(|qs| crate::faer_ndarray::fast_ab(&x_dense, &qs)),
-                    None => None,
-                };
-                let x_t_view = match x_transformed_owned.as_ref() {
-                    Some(xt) => xt.view(),
-                    None => x_dense,
-                };
                 let (s_transformed_view, linear_shift_view, constant_shift_val) =
                     match &penalty_active {
                     PirlsPenalty::Dense {
@@ -7909,7 +7976,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 let dispatch = GpuPirlsDispatchInput {
                     likelihood: &config.likelihood,
                     inverse_link: &config.link_kind,
-                    x_transformed: x_t_view,
+                    x_original: x_dense,
                     s_transformed: s_transformed_view,
                     linear_shift: linear_shift_view,
                     constant_shift: constant_shift_val,

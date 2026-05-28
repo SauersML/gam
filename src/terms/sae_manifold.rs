@@ -1945,7 +1945,6 @@ impl SaeManifoldTerm {
         let lambda_smooth = rho.lambda_smooth();
         let (assignment_grad, assignment_hdiag) =
             assignment_prior_grad_hdiag(&self.assignment, rho)?;
-        let mut sys = ArrowSchurSystem::new(n, q, beta_dim);
 
         // Decoder smoothness penalty: build one KroneckerPenaltyOp per atom
         // (structure = λ·S_k ⊗ I_p, offset = beta_offsets[k]) instead of
@@ -2014,7 +2013,6 @@ impl SaeManifoldTerm {
         } else {
             ArrowSchurSystem::new(n, q, beta_dim)
         };
-        // Store the smooth ops now that sys exists.
         // Hoist per-row temporaries outside the row loop: these allocations
         // previously fired N times per assembly, and each `decoded_row` /
         // `decoded_derivative_row` call inside the loop allocated its own

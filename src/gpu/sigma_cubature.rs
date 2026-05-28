@@ -59,24 +59,29 @@ use super::pirls_row::{CurvatureMode, PirlsRowFamily};
 use crate::gpu::error::GpuResultExt;
 use crate::gpu_err;
 
-/// Per-sigma-point GPU PIRLS input: the transformed design matrix, penalty,
-/// and reparameterisation transform for one ρ / σ point.
+/// Per-sigma-point GPU PIRLS input: penalty, reparameterisation transform,
+/// and prior-mean shifts for one ρ / σ point.
 ///
 /// Built by [`crate::solver::reml::eval::sigma_cubature_evaluate_gpu_stream_pool`]
-/// from the reparameterisation engine output before the stream pool is
-/// allocated. Keeping construction host-side and upload GPU-side lets the
-/// pool allocate all workspaces once and reuse them across the M sigma points.
+/// from the reparameterisation engine output before the stream pool is allocated.
+/// The shared model data (`X_original`, `y`, `prior_w`, `offset`) is uploaded
+/// ONCE into [`crate::solver::gpu::pirls_gpu::PirlsGpuSharedData`]; only the
+/// small per-point algebra (p×p Qs, p×p S, length-p shift, scalar) needs
+/// uploading per sigma point.
 pub struct SigmaPointGpuInput {
-    /// `n × p` transformed design `X_original · Qs`, row-major f64.
-    /// Uploaded to a dedicated `PirlsGpuSharedData` once per sigma point
-    /// and discarded after the PIRLS loop finishes on that stream.
-    pub x_transformed: Array2<f64>,
     /// `p × p` penalised-Hessian contribution `S_λ` in the transformed basis.
     pub s_transformed: Array2<f64>,
-    /// `p × p` reparameterisation matrix `Qs`. Used to map the loop's
-    /// `β_transformed` and `H_transformed` back to the original basis so the
-    /// downstream cubature accumulator receives `(H_original⁻¹, β_original)`.
+    /// `p × p` reparameterisation matrix `Qs`. Uploaded via
+    /// `pirls_gpu::upload_qs_pirls` once per sigma point; also used on the
+    /// CPU to map the loop's `β_transformed` and `H_transformed` back to the
+    /// original basis so the downstream cubature accumulator receives
+    /// `(H_original⁻¹, β_original)`.
     pub qs: Array2<f64>,
+    /// Length-p linear shift `b` for the shifted-quadratic penalty
+    /// `βᵀSβ − 2βᵀb + c`. All-zero for the default sigma-cubature path.
+    pub linear_shift: Array1<f64>,
+    /// Scalar constant shift `c`. Zero for the default sigma-cubature path.
+    pub constant_shift: f64,
 }
 
 /// Default number of concurrent CUDA streams in the sigma-cubature pool.

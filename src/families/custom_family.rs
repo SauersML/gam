@@ -20183,14 +20183,10 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_shared<
 }
 
 fn block_param_ranges(specs: &[ParameterBlockSpec]) -> Vec<(usize, usize)> {
-    let mut out = Vec::with_capacity(specs.len());
-    let mut at = 0usize;
-    for spec in specs {
-        let p = spec.design.ncols();
-        out.push((at, at + p));
-        at += p;
-    }
-    out
+    block_offsets_from_specs(specs)
+        .iter()
+        .map(|r| (r.start, r.end))
+        .collect()
 }
 
 const JOINT_MATRIX_FREE_MIN_DIM: usize = 512;
