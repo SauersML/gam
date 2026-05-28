@@ -1646,6 +1646,15 @@ extern "C" __global__ void status_or(
         /// `PirlsResult::max_abs_eta`. Used by REML's
         /// perfect-separation detection.
         pub max_abs_eta: f64,
+        /// Bitwise-OR of all per-row status flags across the n rows at
+        /// the final accepted PIRLS step. Carries
+        /// [`crate::gpu::pirls_row::status_flags`] bits so callers can
+        /// distinguish saturation (`ETA_CLAMPED`), numerical floor
+        /// (`MU_FLOORED`), or invalid input (`INVALID_RESPONSE`,
+        /// `ZERO_PRIOR_WEIGHT`). A value of 0 means no per-row
+        /// anomaly was detected. Contributes to the `Unstable`
+        /// classification when forbidden bits are set.
+        pub per_row_status_or: u32,
     }
 
     /// Full device-resident PIRLS loop. Only three scalar (1 f64)
@@ -1726,6 +1735,9 @@ extern "C" __global__ void status_or(
         let status_or_func = loop_module
             .load_function("status_or")
             .map_err(|e| format!("load status_or: {e}"))?;
+        let negate_func = loop_module
+            .load_function("negate_n")
+            .map_err(|e| format!("load negate_n: {e}"))?;
 
         gemv_no_trans(
             &ws.blas,
@@ -1757,7 +1769,6 @@ extern "C" __global__ void status_or(
             "deviance_init",
         )?;
         let mut last_logdet = 0.0_f64;
-        let mut last_h = Array2::<f64>::zeros((p, p));
         let mut converged = false;
         // Diagnostic scalars surfaced on the outcome so the dispatch
         // wirer can populate WorkingModelPirlsResult / PirlsResult
@@ -1769,7 +1780,7 @@ extern "C" __global__ void status_or(
         let mut min_dev = prev_deviance;
 
         for it in 0..max_iter {
-            let step = solve_step_on_stream_device(
+            last_logdet = solve_step_on_stream_device_inplace(
                 shared,
                 ws,
                 PirlsStepStreamDeviceInput {
@@ -1779,18 +1790,14 @@ extern "C" __global__ void status_or(
                     step_lm_lambda: lm_ridge,
                     objective_ridge,
                 },
+                &negate_func,
             )
             .map_err(|e| format!("inner step it={it}: {e}"))?;
-            last_h = step.penalized_hessian.clone();
-            last_logdet = step.logdet;
+            // Direction is already in ws.rhs_dev (negated on device).
+            // Copy device-to-device: no host round-trip.
             ws.stream
-                .memcpy_htod(
-                    step.direction
-                        .as_slice()
-                        .ok_or("direction not contiguous")?,
-                    &mut loop_ws.direction_dev,
-                )
-                .map_err(|e| format!("upload direction: {e}"))?;
+                .memcpy_dtod(&ws.rhs_dev, &mut loop_ws.direction_dev)
+                .map_err(|e| format!("direction d2d copy it={it}: {e}"))?;
 
             let dir_linf = reduce_scalar(
                 &ws.stream,
@@ -1937,10 +1944,18 @@ extern "C" __global__ void status_or(
             if dir_linf <= tol && step_norm <= tol && dev_delta <= tol * (1.0 + prev_deviance.abs())
             {
                 converged = true;
+                let h_final = rebuild_h_final(
+                    shared,
+                    ws,
+                    &loop_ws.row_out.w_hessian,
+                    penalty_hessian,
+                    objective_ridge,
+                )
+                .map_err(|e| format!("rebuild H_final (converged): {e}"))?;
                 return build_loop_outcome(
                     ws,
                     loop_ws,
-                    last_h,
+                    h_final,
                     last_logdet,
                     prev_deviance,
                     it + 1,
@@ -1959,10 +1974,18 @@ extern "C" __global__ void status_or(
             }
         }
 
+        let h_final = rebuild_h_final(
+            shared,
+            ws,
+            &loop_ws.row_out.w_hessian,
+            penalty_hessian,
+            objective_ridge,
+        )
+        .map_err(|e| format!("rebuild H_final (max_iter): {e}"))?;
         build_loop_outcome(
             ws,
             loop_ws,
-            last_h,
+            h_final,
             last_logdet,
             prev_deviance,
             max_iter,
@@ -2172,6 +2195,7 @@ extern "C" __global__ void status_or(
                     final_lm_lambda: step_lm_lambda,
                     min_deviance: diagnostics.min_deviance,
                     max_abs_eta,
+                    per_row_status_or: final_row_status,
                 })
             }
             None => {
