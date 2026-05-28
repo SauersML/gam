@@ -1148,7 +1148,7 @@ pub fn audit_identifiability_channel_aware(
         dyn crate::families::identifiability_compiler::RowJacobianOperator,
     >],
     row_hess: &dyn crate::families::identifiability_compiler::RowHessian,
-) -> Result<IdentifiabilityAudit, String> {
+) -> Result<IdentifiabilityAudit, EstimationError> {
     use crate::families::identifiability_compiler::{IdentityRowHessian, compile_with_dual_metric};
 
     if specs.is_empty() {
@@ -1161,35 +1161,35 @@ pub fn audit_identifiability_channel_aware(
         });
     }
     if specs.len() != operators.len() {
-        return Err(format!(
+        return Err(EstimationError::LayoutError(format!(
             "audit_identifiability_channel_aware: specs ({}) and operators ({}) length mismatch",
             specs.len(),
             operators.len()
-        ));
+        )));
     }
     let k = row_hess.k();
     let n = row_hess.nrows();
     for (idx, op) in operators.iter().enumerate() {
         if op.k() != k {
-            return Err(format!(
+            return Err(EstimationError::LayoutError(format!(
                 "audit_identifiability_channel_aware: operator {idx} has K={} but row_hess K={k}",
                 op.k(),
-            ));
+            )));
         }
         if op.nrows() != n {
-            return Err(format!(
+            return Err(EstimationError::LayoutError(format!(
                 "audit_identifiability_channel_aware: operator {idx} has nrows={} but row_hess nrows={n}",
                 op.nrows(),
-            ));
+            )));
         }
         if op.ncols() != specs[idx].design.ncols() {
-            return Err(format!(
+            return Err(EstimationError::LayoutError(format!(
                 "audit_identifiability_channel_aware: operator {idx} ({}) has ncols={} but spec '{}' design ncols={}",
                 idx,
                 op.ncols(),
                 specs[idx].name,
                 specs[idx].design.ncols(),
-            ));
+            )));
         }
     }
 
