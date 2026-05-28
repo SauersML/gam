@@ -200,15 +200,23 @@ pub fn predict_survival(
         with_uncertainty,
     } = req;
 
-    let entryname = model
+    // `survival_entry == None` is the right-censored shorthand
+    // `Surv(time, event)` produced by `gam fit` / `gamfit.fit`: no entry
+    // column was supplied at training time, so entry ages default to
+    // zero at prediction time too. The CLI's `run_predict_survival`
+    // applies the same fallback; mirroring it here keeps `gam predict`,
+    // `gam sample`, and the Python `model.predict` FFI symmetric across
+    // every likelihood that lands in this code path (weibull,
+    // transformation, ...).
+    let entry_col: Option<usize> = model
         .survival_entry
-        .as_ref()
-        .ok_or_else(|| "survival model missing entry column metadata".to_string())?;
+        .as_deref()
+        .map(|name| resolve_role_col(col_map, name, "entry"))
+        .transpose()?;
     let exitname = model
         .survival_exit
         .as_ref()
         .ok_or_else(|| "survival model missing exit column metadata".to_string())?;
-    let entry_col = resolve_role_col(col_map, entryname, "entry")?;
     let exit_col = resolve_role_col(col_map, exitname, "exit")?;
 
     let termspec = resolve_termspec_for_prediction(
@@ -241,7 +249,10 @@ pub fn predict_survival(
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let pairs: Result<Vec<(f64, f64)>, String> = (0..n)
         .into_par_iter()
-        .map(|i| normalize_survival_time_pair(data[[i, entry_col]], data[[i, exit_col]], i))
+        .map(|i| {
+            let entry_val = entry_col.map_or(0.0, |idx| data[[i, idx]]);
+            normalize_survival_time_pair(entry_val, data[[i, exit_col]], i)
+        })
         .collect();
     let pairs = pairs?;
     let mut age_entry = Array1::<f64>::zeros(n);
@@ -632,15 +643,18 @@ pub fn predict_competing_risks_survival(
         });
     }
 
-    let entryname = model
+    // Right-censored shorthand: same fallback as the single-cause path
+    // above — entry ages default to zero when the model was fit without
+    // an explicit entry column.
+    let entry_col: Option<usize> = model
         .survival_entry
-        .as_ref()
-        .ok_or_else(|| "survival model missing entry column metadata".to_string())?;
+        .as_deref()
+        .map(|name| resolve_role_col(col_map, name, "entry"))
+        .transpose()?;
     let exitname = model
         .survival_exit
         .as_ref()
         .ok_or_else(|| "survival model missing exit column metadata".to_string())?;
-    let entry_col = resolve_role_col(col_map, entryname, "entry")?;
     let exit_col = resolve_role_col(col_map, exitname, "exit")?;
 
     let termspec = resolve_termspec_for_prediction(
@@ -668,7 +682,10 @@ pub fn predict_competing_risks_survival(
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let pairs: Result<Vec<(f64, f64)>, String> = (0..n)
         .into_par_iter()
-        .map(|i| normalize_survival_time_pair(data[[i, entry_col]], data[[i, exit_col]], i))
+        .map(|i| {
+            let entry_val = entry_col.map_or(0.0, |idx| data[[i, idx]]);
+            normalize_survival_time_pair(entry_val, data[[i, exit_col]], i)
+        })
         .collect();
     let pairs = pairs?;
     let mut age_entry = Array1::<f64>::zeros(n);
