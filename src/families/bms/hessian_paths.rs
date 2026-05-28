@@ -1,6 +1,5 @@
 use super::*;
 
-}
 /// Block-local psi derivative row: avoids allocating a full p-vector
 /// when the psi derivative lives in a single channel (marginal or logslope).
 pub(super) struct BlockPsiRow {

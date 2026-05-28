@@ -1684,3 +1684,4 @@ pub(crate) fn unary_derivatives_log(x: f64) -> [f64; 5] {
 pub(crate) fn unary_derivatives_log_normal_pdf(x: f64) -> [f64; 5] {
     let c = 0.5 * (2.0 * std::f64::consts::PI).ln();
     [-0.5 * x * x - c, -x, -1.0, 0.0, 0.0]
+}
