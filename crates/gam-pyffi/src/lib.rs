@@ -21854,6 +21854,84 @@ where
     }
 }
 
+/// Variant-dispatch the engine's top-level `WorkflowError` into the matching
+/// Python exception class. The key entry is `WorkflowError::ColumnNotFound`,
+/// which surfaces as `gamfit.ColumnNotFoundError` with the structured
+/// fields attached as Python attributes (`column`, `role`, `available`,
+/// `similar`, `tsv_hint`) — issue #305 / #343. Other variants degrade to
+/// the most appropriate existing gamfit exception type; new variants can
+/// be added to this single chokepoint as their dispatch is needed,
+/// without ever growing a message-regex classifier.
+fn workflow_error_to_pyerr(py: Python<'_>, err: WorkflowError) -> PyErr {
+    match err {
+        WorkflowError::ColumnNotFound {
+            name,
+            role,
+            available,
+            similar,
+            tsv_hint,
+        } => {
+            // Build the canonical human-readable message from a `Display`
+            // reconstruction so its text is anchored at the typed source,
+            // never re-parsed downstream.
+            let display = WorkflowError::ColumnNotFound {
+                name: name.clone(),
+                role: role.clone(),
+                available: available.clone(),
+                similar: similar.clone(),
+                tsv_hint,
+            }
+            .to_string();
+            let exc = ColumnNotFoundError::new_err(display);
+            // Attach the structured payload as Python-side attributes so
+            // `explain_error(exc)` and downstream code can read them via
+            // `exc.column`, `exc.available`, etc. — no regex on the
+            // formatted prose. PyO3 5 exposes `Bound<'_, PyAny>` from the
+            // PyErr instance; setattr on it persists on the exception.
+            let bound = exc.value(py);
+            // Best-effort attribute attachment. If any setattr fails (e.g.
+            // because a future PyO3 release tightens exception-instance
+            // attribute access), we still raise the typed class with the
+            // canonical message — the typed branch in `explain_error`
+            // remains correct, only the per-instance enrichment is lost.
+            let _attach = (|| -> PyResult<()> {
+                bound.setattr("column", name.as_str())?;
+                match role.as_deref() {
+                    Some(r) => bound.setattr("role", r)?,
+                    None => bound.setattr("role", py.None())?,
+                }
+                bound.setattr("available", available)?;
+                bound.setattr("similar", similar)?;
+                bound.setattr("tsv_hint", tsv_hint)?;
+                Ok(())
+            })();
+            if let Err(attach_err) = _attach {
+                // Swallow as a Python warning rather than escalate — the
+                // typed exception class itself is the primary contract.
+                attach_err.write_unraisable(py, Some(&bound));
+            }
+            exc
+        }
+        WorkflowError::InvalidConfig { reason }
+        | WorkflowError::SchemaMismatch { reason }
+        | WorkflowError::MissingDependency { reason }
+        | WorkflowError::IntegrationFailed { reason } => py_value_error(reason),
+        WorkflowError::FormulaDsl { .. } => FormulaError::new_err(err.to_string()),
+    }
+}
+
+fn detach_workflow_result<T, F>(py: Python<'_>, context: &'static str, f: F) -> PyResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, WorkflowError> + Send + 'static,
+{
+    match py.detach(move || catch_unwind(AssertUnwindSafe(f))) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => Err(workflow_error_to_pyerr(py, err)),
+        Err(payload) => Err(py_panic_error(context, payload)),
+    }
+}
+
 fn fit_table_impl(
     headers: Vec<String>,
     rows: Vec<Vec<String>>,
