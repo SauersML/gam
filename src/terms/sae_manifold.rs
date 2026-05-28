@@ -1986,6 +1986,35 @@ impl SaeManifoldTerm {
             }));
         }
 
+        // For JumpReLU, compute per-row active-set layout (active atoms have
+        // logit > threshold).  This allows the row block to be sized at
+        // q_active = |active| + Σ_{k∈active} d_k rather than the full q.
+        let jumprelu_layout: Option<SaeRowLayout> = match self.assignment.mode {
+            AssignmentMode::JumpReLU { threshold, .. } => {
+                let coord_dims: Vec<usize> =
+                    self.assignment.coords.iter().map(|c| c.latent_dim()).collect();
+                let coord_offsets_full = self.assignment.coord_offsets();
+                Some(SaeRowLayout::new(
+                    n,
+                    k_atoms,
+                    threshold,
+                    &self.assignment.logits,
+                    coord_dims,
+                    coord_offsets_full,
+                ))
+            }
+            _ => None,
+        };
+        // Build the Arrow-Schur system: heterogeneous row dims for JumpReLU,
+        // uniform q for all other modes.
+        let mut sys = if let Some(ref layout) = jumprelu_layout {
+            let per_row_dims: Vec<usize> =
+                (0..n).map(|row| layout.row_q_active(row)).collect();
+            ArrowSchurSystem::new_with_per_row_dims(per_row_dims, beta_dim)
+        } else {
+            ArrowSchurSystem::new(n, q, beta_dim)
+        };
+        // Store the smooth ops now that sys exists.
         // Hoist per-row temporaries outside the row loop: these allocations
         // previously fired N times per assembly, and each `decoded_row` /
         // `decoded_derivative_row` call inside the loop allocated its own

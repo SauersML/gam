@@ -649,6 +649,7 @@ mod linux_impl {
     fn run_gpu_gaussian_pls(
         input: GpuGaussianPlsInput<'_>,
     ) -> Result<(PirlsResult, WorkingModelPirlsResult), String> {
+        use crate::matrix::LinearOperator;
         use crate::solver::pirls::{
             array1_l2_norm, calculate_deviance, calculate_loglikelihood_omitting_constants,
             computeworkingweight_derivatives_from_eta,
