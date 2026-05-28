@@ -17687,9 +17687,8 @@ fn poincare_mobius_add<'py>(
 ) -> PyResult<Py<PyArray1<f64>>> {
     let u_owned = u.as_array().to_owned();
     let v_owned = v.as_array().to_owned();
-    let out = detach_py_result(py, "poincare_mobius_add", move || {
+    let out = detach_geometry_result(py, "poincare_mobius_add", move || {
         poincare_mobius_add_impl(u_owned.view(), v_owned.view(), curvature)
-            .map_err(|e| e.to_string())
     })?;
     Ok(out.into_pyarray(py).unbind())
 }
@@ -22482,6 +22481,33 @@ where
     match py.detach(move || catch_unwind(AssertUnwindSafe(f))) {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(err)) => Err(workflow_error_to_pyerr(py, err)),
+        Err(payload) => Err(py_panic_error(context, payload)),
+    }
+}
+
+/// Variant-dispatch the engine's `GeometryError` into the typed Python
+/// `gamfit.GeometryError`. All three variants — `DimensionMismatch`,
+/// `InvalidPoint`, `Singular` — share the same Python class because the
+/// distinction matters only in the message text; the typed class makes
+/// `except gamfit.GeometryError` actionable without parsing the prose.
+fn geometry_error_to_pyerr(err: EngineGeometryError) -> PyErr {
+    GeometryError::new_err(err.to_string())
+}
+
+/// Detach the GIL, run a closure returning a typed `GeometryError`, and
+/// preserve the variant across the Python boundary via
+/// `geometry_error_to_pyerr` — the principled engine→Python adaptor for
+/// every Poincaré / Lorentz / manifold primitive. Replaces the
+/// `.map_err(|e| e.to_string())` flattening that used to surface as a
+/// bare `PyValueError` (issue #343).
+fn detach_geometry_result<T, F>(py: Python<'_>, context: &'static str, f: F) -> PyResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, EngineGeometryError> + Send + 'static,
+{
+    match py.detach(move || catch_unwind(AssertUnwindSafe(f))) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => Err(geometry_error_to_pyerr(err)),
         Err(payload) => Err(py_panic_error(context, payload)),
     }
 }
