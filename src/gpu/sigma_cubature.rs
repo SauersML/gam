@@ -236,6 +236,19 @@ mod linux_impl {
             }
         }
 
+        // Gaussian-identity exact PLS bypass (#272).
+        //
+        // For Gaussian-identity the working weight is prior_w (constant across
+        // all sigma points). XᵀWX and XᵀW(y−offset) are therefore the same for
+        // every point. Compute them once, then for each sigma point call the
+        // exact Gaussian PLS solver with the per-point (Qs, S_transformed,
+        // linear_shift) — no row-kernel PIRLS loop, no iterative solver.
+        if family == PirlsRowFamily::GaussianIdentity {
+            return gaussian_sigma_pool_eval(
+                x_original, y, prior_w, offset, per_sigma, p,
+            );
+        }
+
         // Upload X_original, y, prior_w, offset once — shared across all sigma points.
         // Per sigma point, only Qs changes; it gets uploaded via upload_qs_pirls.
         let bootstrap_shared =
@@ -310,6 +323,90 @@ mod linux_impl {
             };
 
             outcomes.push(sigma_result);
+        }
+
+        Ok(Some(outcomes))
+    }
+
+    /// Gaussian-identity sigma-cubature bypass (#272).
+    ///
+    /// For Gaussian-identity the working weight equals the prior weight, which
+    /// is the same for every sigma point. XᵀWX and XᵀW(y−offset) are computed
+    /// once from `x_original`, `prior_w`, `y`, `offset`, and then the exact GPU
+    /// PLS solver is called per sigma point with the per-point `(Qs, S, shift)`.
+    /// This eliminates the row-kernel PIRLS loop entirely for Gaussian fits,
+    /// matching the single-fit `try_gpu_gaussian_pls_dispatch` bypass.
+    fn gaussian_sigma_pool_eval(
+        x_original: ndarray::ArrayView2<'_, f64>,
+        y: ArrayView1<'_, f64>,
+        prior_w: ArrayView1<'_, f64>,
+        offset: ArrayView1<'_, f64>,
+        per_sigma: &[SigmaPointGpuInput],
+        p: usize,
+    ) -> Result<Option<Vec<SigmaPointResult>>, crate::gpu::GpuError> {
+        use ndarray::Array1;
+        // XᵀWX = Xᵀ·diag(prior_w)·X (constant across all sigma points).
+        // Computed on the GPU via weighted_crossprod_gpu.
+        let xtwx = crate::solver::gpu::pirls_gpu::weighted_crossprod_gpu(
+            x_original,
+            prior_w,
+        )
+        .map_err(|e| crate::gpu_err!("gaussian sigma: XᵀWX gpu failed: {e}"))?;
+
+        // XᵀW(y − offset) = Xᵀ·diag(prior_w)·(y − offset).
+        // Compute on the host (n-vector; the GPU would need a separate kernel).
+        let mut yw = y.to_owned();
+        yw -= &offset;
+        yw *= &prior_w;
+        // Xᵀ·(prior_w · (y − offset)).
+        let xtwy: Array1<f64> = x_original.t().dot(&yw);
+
+        let zero_shift: Array1<f64> = Array1::zeros(p);
+        let prior_mean_zero: Array1<f64> = Array1::zeros(p);
+
+        let mut outcomes: Vec<SigmaPointResult> = Vec::with_capacity(per_sigma.len());
+        for (idx, pt) in per_sigma.iter().enumerate() {
+            let qs_opt: Option<ndarray::ArrayView2<'_, f64>> = {
+                // Use Qs only if it differs from identity.
+                let is_identity = pt.qs.diag().iter().all(|&v| (v - 1.0).abs() < 1e-14)
+                    && {
+                        let mut off_diag_zero = true;
+                        for r in 0..p {
+                            for c in 0..p {
+                                if r != c && pt.qs[[r, c]].abs() > 1e-14 {
+                                    off_diag_zero = false;
+                                    break;
+                                }
+                            }
+                        }
+                        off_diag_zero
+                    };
+                if is_identity { None } else { Some(pt.qs.view()) }
+            };
+            // Use per-point linear_shift; fall back to zero when it is all-zero.
+            let shift_ref: ndarray::ArrayView1<'_, f64> =
+                if pt.linear_shift.iter().all(|&v| v == 0.0) {
+                    zero_shift.view()
+                } else {
+                    pt.linear_shift.view()
+                };
+            let pls = crate::solver::gpu::pirls_gpu::solve_gaussian_pls_gpu(
+                xtwx.view(),
+                xtwy.view(),
+                pt.s_transformed.view(),
+                shift_ref,
+                prior_mean_zero.view(),
+                0.0,
+                qs_opt,
+            )
+            .map_err(|e| {
+                crate::gpu_err!("gaussian sigma pool: point[{idx}] pls failed: {e}")
+            })?;
+
+            let h_orig = hessian_to_original(&pls.penalized_hessian, &pt.qs);
+            let cov = matrix_inversewith_regularization(&h_orig, "gaussian sigma point")?;
+            let beta_orig = pt.qs.dot(&pls.beta);
+            outcomes.push(Some((cov, beta_orig)));
         }
 
         Ok(Some(outcomes))
