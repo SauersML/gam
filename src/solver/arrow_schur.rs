@@ -3089,14 +3089,14 @@ fn solve_arrow_newton_step_artifacts(
             (db, sf, diag)
         }
         ArrowSolverMode::InexactPCG => {
-            let preconditioner =
-                JacobiPreconditioner::from_arrow_schur(sys, &htt_factors, ridge_beta, &backend)?;
-            let (delta, diag) = steihaug_pcg_reduced_system(
+            // Auto-select preconditioner level: starts with JacobiPreconditioner
+            // (Diagonal / BetaBlockJacobi) and escalates to ClusterJacobi or
+            // AdditiveSchwarz when K > 100 and PCG exhausts max_iterations.
+            let (delta, diag) = steihaug_pcg_auto(
                 sys,
                 &htt_factors,
                 ridge_beta,
                 &rhs_beta,
-                &preconditioner,
                 &options.pcg,
                 &options.trust_region,
                 &backend,
