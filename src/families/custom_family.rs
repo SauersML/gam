@@ -9703,7 +9703,9 @@ fn exact_newton_joint_hessian_from_working_sets<F: CustomFamily + ?Sized>(
             BlockWorkingSet::ExactNewton { hessian, .. } => hessian.to_dense(),
             BlockWorkingSet::Diagonal {
                 working_weights, ..
-            } => spec.design.diag_xtw_x(working_weights)?,
+            } => spec
+                .design
+                .xt_diag_x_signed_op(SignedWeightsView::from_array(working_weights))?,
         };
         if dense.nrows() != p_block || dense.ncols() != p_block {
             return Err(CustomFamilyError::DimensionMismatch { reason: format!(
@@ -9926,7 +9928,8 @@ fn exact_newton_joint_hessian_directional_derivative_from_working_sets<F: Custom
                         &d_eta,
                     )?
                     .map(|dw| {
-                        let mut local = solver_design.diag_xtw_x(&dw)?;
+                        let mut local = solver_design
+                            .xt_diag_x_signed_op(SignedWeightsView::from_array(&dw))?;
                         local += &geometry_correction;
                         Ok::<Array2<f64>, String>(local)
                     })
@@ -21840,7 +21843,11 @@ fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'static>(
         };
         let spec = &specs[0];
         let lambdas = per_block_log_lambdas[0].mapv(f64::exp);
-        let Some(mut h) = spec.design.diag_xtw_x(working_weights).ok() else {
+        let Some(mut h) = spec
+            .design
+            .xt_diag_x_signed_op(SignedWeightsView::from_array(working_weights))
+            .ok()
+        else {
             return Ok(None);
         };
         for (k, s) in spec.penalties.iter().enumerate() {
@@ -24535,7 +24542,9 @@ mod tests {
             let u_eta = spec.design.apply(u);
             let v_eta = spec.design.apply(v);
             assert_eq!(block_states[0].eta.len(), u_eta.len());
-            spec.design.diag_xtw_x(&((&u_eta * &v_eta) * 2.0)).map(Some)
+            spec.design
+                .xt_diag_x_signed_op(SignedWeightsView::from_array(&((&u_eta * &v_eta) * 2.0)))
+                .map(Some)
         }
     }
 
@@ -24576,7 +24585,9 @@ mod tests {
             .expect("diagonal working sets should assemble an exact joint Hessian");
         let expected_h = spec
             .design
-            .diag_xtw_x(&eta.mapv(|value| 2.0 + value * value))
+            .xt_diag_x_signed_op(SignedWeightsView::from_array(
+                &eta.mapv(|value| 2.0 + value * value),
+            ))
             .unwrap();
         assert_eq!(h, expected_h);
 
@@ -24590,7 +24601,10 @@ mod tests {
             .expect("default joint dH hook should succeed")
             .expect("diagonal weight derivative should assemble an exact joint dH");
         let d_eta = spec.design.apply(&direction);
-        let expected_dh = spec.design.diag_xtw_x(&((&eta * &d_eta) * 2.0)).unwrap();
+        let expected_dh = spec
+            .design
+            .xt_diag_x_signed_op(SignedWeightsView::from_array(&((&eta * &d_eta) * 2.0)))
+            .unwrap();
         assert_eq!(dh, expected_dh);
 
         let d2h = family
@@ -24600,7 +24614,7 @@ mod tests {
         let beta_eta = spec.design.apply(&beta);
         let expected_d2h = spec
             .design
-            .diag_xtw_x(&((&d_eta * &beta_eta) * 2.0))
+            .xt_diag_x_signed_op(SignedWeightsView::from_array(&((&d_eta * &beta_eta) * 2.0)))
             .unwrap();
         assert_eq!(d2h, expected_d2h);
     }
