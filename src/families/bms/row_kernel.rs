@@ -29,7 +29,7 @@ pub(super) struct BernoulliRigidRowKernel {
 }
 
 impl BernoulliRigidRowKernel {
-    fn new(family: BernoulliMarginalSlopeFamily, block_states: Vec<ParameterBlockState>) -> Self {
+    pub(super) fn new(family: BernoulliMarginalSlopeFamily, block_states: Vec<ParameterBlockState>) -> Self {
         let slices = block_slices(&family);
         Self {
             family,
@@ -48,7 +48,7 @@ impl BernoulliRigidRowKernel {
     /// likelihood is non-finite at the converged β snapshot — propagate via
     /// panic, mirroring how every other kernel-level numerical contract in
     /// this module surfaces post-PIRLS invariant violations.
-    fn third_full_cache(&self) -> &[[[[f64; 2]; 2]; 2]] {
+    pub(super) fn third_full_cache(&self) -> &[[[[f64; 2]; 2]; 2]] {
         self.third_full_cache
             .get_or_compute(|| {
                 (0..self.family.y.len())
@@ -76,7 +76,7 @@ impl BernoulliRigidRowKernel {
     /// `row_fourth_contracted` so each (u, v) ψ-axis pair finishes in a
     /// 16-multiply [`contract_fourth_full`] bilinear instead of triggering
     /// a fresh empirical-grid 8-direction jet.
-    fn fourth_full_cache(&self) -> &[[[[[f64; 2]; 2]; 2]; 2]] {
+    pub(super) fn fourth_full_cache(&self) -> &[[[[[f64; 2]; 2]; 2]; 2]] {
         self.fourth_full_cache
             .get_or_compute(|| {
                 (0..self.family.y.len())
@@ -360,36 +360,36 @@ fn axis_jf_via_column_dot(
 }
 
 pub(super) struct BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
-    family: BernoulliMarginalSlopeFamily,
-    block_states: Vec<ParameterBlockState>,
-    cache: Arc<BernoulliMarginalSlopeExactEvalCache>,
-    matvec_calls: AtomicUsize,
-    fused_gradient_dense: OnceLock<Result<Arc<ExactNewtonJointFusedDenseEvaluation>, String>>,
+    pub(super) family: BernoulliMarginalSlopeFamily,
+    pub(super) block_states: Vec<ParameterBlockState>,
+    pub(super) cache: Arc<BernoulliMarginalSlopeExactEvalCache>,
+    pub(super) matvec_calls: AtomicUsize,
+    pub(super) fused_gradient_dense: OnceLock<Result<Arc<ExactNewtonJointFusedDenseEvaluation>, String>>,
     /// Outer-only joint-Hessian directional-derivative options. The
     /// `outer_score_subsample` field is the row mask threaded through the
     /// `_with_options` directional-derivative helpers so the cached joint
     /// Hessian Hv-action paths can downscale to the stratified subsample at
     /// biobank scale. When `None`, the row iteration is identical to the
     /// legacy full-data path.
-    options: BlockwiseFitOptions,
+    pub(super) options: BlockwiseFitOptions,
 }
 
 pub(super) struct ExactNewtonJointFusedDenseEvaluation {
-    gradient: ExactNewtonJointGradientEvaluation,
-    hessian: Array2<f64>,
+    pub(super) gradient: ExactNewtonJointGradientEvaluation,
+    pub(super) hessian: Array2<f64>,
 }
 
 pub(super) struct BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
-    family: BernoulliMarginalSlopeFamily,
-    block_states: Vec<ParameterBlockState>,
-    specs: Vec<ParameterBlockSpec>,
-    derivative_blocks: Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>,
-    cache: Arc<BernoulliMarginalSlopeExactEvalCache>,
+    pub(super) family: BernoulliMarginalSlopeFamily,
+    pub(super) block_states: Vec<ParameterBlockState>,
+    pub(super) specs: Vec<ParameterBlockSpec>,
+    pub(super) derivative_blocks: Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>,
+    pub(super) cache: Arc<BernoulliMarginalSlopeExactEvalCache>,
     /// Outer-only ψ-calculus options. The `outer_score_subsample` field is
     /// the row mask threaded through `sigma_exact_joint_psi_terms_with_options`
     /// and the second-order / Hessian-drift counterparts to make the cached
     /// ψ calculus subsample-aware.
-    options: BlockwiseFitOptions,
+    pub(super) options: BlockwiseFitOptions,
 }
 
 

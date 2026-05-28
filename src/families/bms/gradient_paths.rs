@@ -1256,22 +1256,22 @@ pub(crate) fn empirical_intercept_from_marginal(
 /// η = q·c(g) + s_f·g·z,  c(g) = √(1+(s_f g)²),  s = 2y−1,  m = s·η.
 /// u_k absorb weight and sign: u1=w·s·κ₁, u2=w·κ₂, u3=w·s·κ₃, u4=w·κ₄.
 pub(super) struct RigidProbitKernel {
-    logcdf: f64,
-    u1: f64,
-    u2: f64,
-    u3: f64,
-    u4: f64,
-    c1: f64,
-    c2: f64,
-    c3: f64,
-    c4: f64,
-    eta_q: f64,
-    eta_g: f64,
+    pub(super) logcdf: f64,
+    pub(super) u1: f64,
+    pub(super) u2: f64,
+    pub(super) u3: f64,
+    pub(super) u4: f64,
+    pub(super) c1: f64,
+    pub(super) c2: f64,
+    pub(super) c3: f64,
+    pub(super) c4: f64,
+    pub(super) eta_q: f64,
+    pub(super) eta_g: f64,
 }
 
 impl RigidProbitKernel {
     #[inline]
-    fn new(q: f64, g: f64, z: f64, y: f64, w: f64, probit_scale: f64) -> Result<Self, String> {
+    pub(super) fn new(q: f64, g: f64, z: f64, y: f64, w: f64, probit_scale: f64) -> Result<Self, String> {
         let s = 2.0 * y - 1.0;
         let observed_logslope = rigid_observed_logslope(g, probit_scale);
         let g2 = observed_logslope * observed_logslope;
@@ -1314,7 +1314,7 @@ impl RigidProbitKernel {
     /// the rigid-path log-likelihood-only loop in
     /// [`log_likelihood_only_with_options`].
     #[inline]
-    fn neglog_only(
+    pub(super) fn neglog_only(
         q: f64,
         g: f64,
         z: f64,
@@ -1335,7 +1335,7 @@ impl RigidProbitKernel {
     }
 
     #[inline]
-    fn primary_hessian(&self, q: f64) -> [[f64; 2]; 2] {
+    pub(super) fn primary_hessian(&self, q: f64) -> [[f64; 2]; 2] {
         let h00 = self.u2 * self.eta_q * self.eta_q;
         let h01 = self.u2 * self.eta_q * self.eta_g + self.u1 * self.c1;
         let h11 = self.u2 * self.eta_g * self.eta_g + self.u1 * q * self.c2;
@@ -1343,7 +1343,7 @@ impl RigidProbitKernel {
     }
 
     #[inline]
-    fn third_contracted(&self, q: f64, dq: f64, dg: f64) -> [[f64; 2]; 2] {
+    pub(super) fn third_contracted(&self, q: f64, dq: f64, dg: f64) -> [[f64; 2]; 2] {
         let dd = self.eta_q * dq + self.eta_g * dg;
         let dd_q = self.c1 * dg;
         let dd_g = self.c1 * dq + q * self.c2 * dg;
@@ -1360,7 +1360,7 @@ impl RigidProbitKernel {
     }
 
     #[inline]
-    fn fourth_contracted(&self, q: f64, uq: f64, ug: f64, vq: f64, vg: f64) -> [[f64; 2]; 2] {
+    pub(super) fn fourth_contracted(&self, q: f64, uq: f64, ug: f64, vq: f64, vg: f64) -> [[f64; 2]; 2] {
         let du = self.eta_q * uq + self.eta_g * ug;
         let dv = self.eta_q * vq + self.eta_g * vg;
         let du_a = [self.c1 * ug, self.c1 * uq + q * self.c2 * ug];

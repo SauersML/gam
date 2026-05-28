@@ -361,7 +361,7 @@ impl DeviationRuntime {
         Self::try_new_with_smoothness_drop(knots, monotonicity_eps, max_penalty_derivative_order)
     }
 
-    fn try_new_with_smoothness_drop(
+    pub(super) fn try_new_with_smoothness_drop(
         knots: Array1<f64>,
         monotonicity_eps: f64,
         max_penalty_derivative_order: usize,
@@ -804,7 +804,7 @@ impl DeviationRuntime {
 
     // ── design evaluation ──
 
-    fn validate_beta_shape(&self, beta: &Array1<f64>, label: &str) -> Result<(), String> {
+    pub(super) fn validate_beta_shape(&self, beta: &Array1<f64>, label: &str) -> Result<(), String> {
         if beta.len() != self.basis_dim {
             return Err(DeviationRuntimeError::DimensionMismatch {
                 reason: format!(
@@ -822,7 +822,7 @@ impl DeviationRuntime {
     /// anchor-residual subtraction. Internal — callers that need the
     /// residualised design must go through `design()` (which asserts no
     /// residual) or `design_with_anchor_rows()`.
-    fn evaluate_span_polynomial_design_raw(
+    pub(super) fn evaluate_span_polynomial_design_raw(
         &self,
         values: &Array1<f64>,
         derivative_order: usize,
@@ -978,7 +978,7 @@ impl DeviationRuntime {
 
     // ── span geometry ──
 
-    fn span_count(&self) -> usize {
+    pub(super) fn span_count(&self) -> usize {
         self.endpoint_points.len().saturating_sub(1)
     }
 
@@ -986,7 +986,7 @@ impl DeviationRuntime {
         &self.endpoint_points
     }
 
-    fn span_interval(&self, span_idx: usize) -> Result<(f64, f64), String> {
+    pub(super) fn span_interval(&self, span_idx: usize) -> Result<(f64, f64), String> {
         if span_idx >= self.span_count() {
             return Err(DeviationRuntimeError::InvalidInput {
                 reason: format!(
@@ -1003,7 +1003,7 @@ impl DeviationRuntime {
         ))
     }
 
-    fn span_index_for(&self, value: f64) -> Result<usize, String> {
+    pub(super) fn span_index_for(&self, value: f64) -> Result<usize, String> {
         span_index_for_breakpoints(
             self.endpoint_points.as_slice().ok_or_else(|| {
                 String::from(DeviationRuntimeError::InvalidInput {
@@ -1015,7 +1015,7 @@ impl DeviationRuntime {
         )
     }
 
-    fn left_biased_span_index_for(&self, value: f64) -> Result<usize, String> {
+    pub(super) fn left_biased_span_index_for(&self, value: f64) -> Result<usize, String> {
         let mut span_idx = self.span_index_for(value)?;
         // Bias to the LEFT-hand span at internal breakpoints. The cubic basis
         // is C², so value, first derivative, and second derivative are
@@ -1026,7 +1026,7 @@ impl DeviationRuntime {
         Ok(span_idx)
     }
 
-    fn span_derivative_polynomial_coefficients(
+    pub(super) fn span_derivative_polynomial_coefficients(
         &self,
         span_idx: usize,
         basis_idx: usize,
@@ -1251,13 +1251,13 @@ impl DeviationRuntime {
 
     /// Left-tail constant: deviation value at the leftmost breakpoint.
     /// For anchored I-spline bases this is the anchor value (typically 0).
-    fn left_tail_value(&self, beta: &Array1<f64>) -> f64 {
+    pub(super) fn left_tail_value(&self, beta: &Array1<f64>) -> f64 {
         self.span_c0.row(0).dot(beta)
     }
 
     /// Right-tail constant: deviation value at the rightmost breakpoint.
     /// For I-spline bases this is the saturated integral value.
-    fn right_tail_value(&self, beta: &Array1<f64>) -> f64 {
+    pub(super) fn right_tail_value(&self, beta: &Array1<f64>) -> f64 {
         self.right_boundary_value_row.dot(beta)
     }
 
@@ -1317,7 +1317,7 @@ impl DeviationRuntime {
 
     // ── monotonicity enforcement ──
 
-    fn support_interval(&self) -> Result<(f64, f64), String> {
+    pub(super) fn support_interval(&self) -> Result<(f64, f64), String> {
         match (self.endpoint_points.first(), self.endpoint_points.last()) {
             (Some(&left), Some(&right)) => Ok((left, right)),
             _ => Err(DeviationRuntimeError::InvalidInput {

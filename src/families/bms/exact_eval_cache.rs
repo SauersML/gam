@@ -52,16 +52,16 @@ impl RowPrimaryHessianCacheReason {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct RowPrimaryHessianCachePlan {
-    materialize: bool,
-    bytes: u64,
-    runtime_available_bytes: u64,
-    workspace_pinned_bytes: u64,
-    single_cache_budget_bytes: u64,
-    global_pin_budget_bytes: u64,
-    expected_reuse_passes: usize,
-    materialized_row_hessian_evals: usize,
-    streamed_row_hessian_evals: usize,
-    reason: RowPrimaryHessianCacheReason,
+    pub(super) materialize: bool,
+    pub(super) bytes: u64,
+    pub(super) runtime_available_bytes: u64,
+    pub(super) workspace_pinned_bytes: u64,
+    pub(super) single_cache_budget_bytes: u64,
+    pub(super) global_pin_budget_bytes: u64,
+    pub(super) expected_reuse_passes: usize,
+    pub(super) materialized_row_hessian_evals: usize,
+    pub(super) streamed_row_hessian_evals: usize,
+    pub(super) reason: RowPrimaryHessianCacheReason,
 }
 
 pub(super) fn decide_row_primary_hessian_cache(
@@ -114,7 +114,7 @@ pub(super) fn decide_row_primary_hessian_cache(
 /// RAII handle around a materialized row-primary evaluation cache
 /// (neglog + gradient + Hessian) that decrements the process-global
 /// pinned-bytes counter on drop.
-pub(crate) struct RowPrimaryEvalPin {
+pub struct RowPrimaryEvalPin {
     /// Per-row negative log-likelihood, length `n`.
     neglog: Array1<f64>,
     /// Per-row gradient, shape `(n, r)`.
@@ -125,7 +125,7 @@ pub(crate) struct RowPrimaryEvalPin {
 }
 
 impl RowPrimaryEvalPin {
-    fn new(neglog: Array1<f64>, grad: Array2<f64>, hess: Array2<f64>, bytes: u64) -> Self {
+    pub(super) fn new(neglog: Array1<f64>, grad: Array2<f64>, hess: Array2<f64>, bytes: u64) -> Self {
         bms_row_primary_hessian_pinned_bytes().fetch_add(bytes, Ordering::AcqRel);
         Self {
             neglog,
@@ -135,15 +135,15 @@ impl RowPrimaryEvalPin {
         }
     }
 
-    fn neglog(&self) -> &Array1<f64> {
+    pub(super) fn neglog(&self) -> &Array1<f64> {
         &self.neglog
     }
 
-    fn grad(&self) -> &Array2<f64> {
+    pub(super) fn grad(&self) -> &Array2<f64> {
         &self.grad
     }
 
-    fn hess(&self) -> &Array2<f64> {
+    pub(super) fn hess(&self) -> &Array2<f64> {
         &self.hess
     }
 }
@@ -167,7 +167,7 @@ impl Drop for RowPrimaryEvalPin {
 ///   [`BernoulliMarginalSlopeFamily::cached_row_primary_eval`].
 /// - `Device` (Linux/CUDA only): Hessian + designs live on the GPU; neglog and
 ///   gradient are kept as host `Arc<[f64]>` slices for the fused gradient pass.
-pub(crate) enum RowPrimaryEvalCache {
+pub enum RowPrimaryEvalCache {
     Empty,
     Host(RowPrimaryEvalPin),
     /// Device-resident row Hessian + designs, plus host-side neglog/grad.
@@ -220,10 +220,10 @@ impl RowPrimaryEvalCache {
 /// calls (matvec, diagonal, psi, directional derivatives) never redundantly
 /// re-solve the Newton intercept equation.
 pub(super) struct BernoulliMarginalSlopeExactEvalCache {
-    slices: BlockSlices,
-    primary: PrimarySlices,
+    pub(super) slices: BlockSlices,
+    pub(super) primary: PrimarySlices,
     /// Pre-solved row contexts (intercept, M_a, observed score-warp value).
-    row_contexts: Vec<BernoulliMarginalSlopeRowExactContext>,
+    pub(super) row_contexts: Vec<BernoulliMarginalSlopeRowExactContext>,
     /// Batched per-row denested cell moments for the current β snapshot.
     /// Built once at exact-cache construction (after row intercepts converge)
     /// and consumed by row gradient/Hessian/Hv/diagonal/derivative-tensor
@@ -231,16 +231,16 @@ pub(super) struct BernoulliMarginalSlopeExactEvalCache {
     /// `None` when the FLEX path is inactive, when an empirical latent grid
     /// drives the row kernel through a non-cell path, or when the estimated
     /// resident bytes would exceed the active resource policy budget.
-    row_cell_moments: Option<RowCellMomentsBundle>,
+    pub(super) row_cell_moments: Option<RowCellMomentsBundle>,
     /// Lazily-built degree-15 bundle for outer dH (1st-derivative of Hessian)
     /// trace paths. Only populated when those paths actually execute.
     /// `RayonSafeOnce` keeps lazy initialization safe from parallel row passes.
-    row_cell_moments_d15:
+    pub(super) row_cell_moments_d15:
         crate::resource::RayonSafeOnce<Result<Option<RowCellMomentsBundle>, String>>,
     /// Lazily-built degree-21 bundle for outer d²H (2nd-derivative of Hessian)
     /// trace paths. Only populated when those paths actually execute.
     /// `RayonSafeOnce` keeps lazy initialization safe from parallel row passes.
-    row_cell_moments_d21:
+    pub(super) row_cell_moments_d21:
         crate::resource::RayonSafeOnce<Result<Option<RowCellMomentsBundle>, String>>,
     /// Flexible-path per-β per-row primary Hessians (`r×r` blocks flattened
     /// row-major into one wide `Array2`).  The matrix-free inner Newton/CG
@@ -249,7 +249,7 @@ pub(super) struct BernoulliMarginalSlopeExactEvalCache {
     /// avoids rebuilding cell moments + reduced flex jets on every Hv product.
     /// `None` whenever the flex path is inactive (rigid kernel) or the
     /// caller did not opt in to materialization.
-    row_primary_hessians: RowPrimaryEvalCache,
+    pub(super) row_primary_hessians: RowPrimaryEvalCache,
     /// Per-row uncontracted third-derivative tensor in the rigid path,
     /// lazily built on first access. The `build_psi_hyper_coords` row pass
     /// hits `rigid_row_third_contracted` once per (row, ψ-axis) — 32× per
@@ -262,7 +262,7 @@ pub(super) struct BernoulliMarginalSlopeExactEvalCache {
     /// surface a non-finite value). `RayonSafeOnce` keeps lazy initialization
     /// safe when the first caller is already inside a Rayon row pass; failure
     /// is sticky and propagated identically to every caller.
-    rigid_third_full: crate::resource::RayonSafeOnce<Result<Vec<[[[f64; 2]; 2]; 2]>, String>>,
+    pub(super) rigid_third_full: crate::resource::RayonSafeOnce<Result<Vec<[[[f64; 2]; 2]; 2]>, String>>,
 
     /// Per-row uncontracted fourth-derivative tensor in the rigid path —
     /// the second-order analogue of `rigid_third_full`. The outer-Hessian
@@ -271,7 +271,7 @@ pub(super) struct BernoulliMarginalSlopeExactEvalCache {
     /// rank=32. Per-row, the five distinct components are axis-invariant,
     /// so caching them lets every pair contraction be a 16-multiply 2×2
     /// bilinear instead of a fresh 8-direction empirical jet.
-    rigid_fourth_full: crate::resource::RayonSafeOnce<Result<Vec<[[[[f64; 2]; 2]; 2]; 2]>, String>>,
+    pub(super) rigid_fourth_full: crate::resource::RayonSafeOnce<Result<Vec<[[[[f64; 2]; 2]; 2]; 2]>, String>>,
 }
 
 // ── RowKernel<2> implementation (rigid path only) ────────────────────
@@ -298,7 +298,7 @@ struct BernoulliRigidRowKernel {
 }
 
 impl BernoulliRigidRowKernel {
-    fn new(family: BernoulliMarginalSlopeFamily, block_states: Vec<ParameterBlockState>) -> Self {
+    pub(super) fn new(family: BernoulliMarginalSlopeFamily, block_states: Vec<ParameterBlockState>) -> Self {
         let slices = block_slices(&family);
         Self {
             family,
@@ -317,7 +317,7 @@ impl BernoulliRigidRowKernel {
     /// likelihood is non-finite at the converged β snapshot — propagate via
     /// panic, mirroring how every other kernel-level numerical contract in
     /// this module surfaces post-PIRLS invariant violations.
-    fn third_full_cache(&self) -> &[[[[f64; 2]; 2]; 2]] {
+    pub(super) fn third_full_cache(&self) -> &[[[[f64; 2]; 2]; 2]] {
         self.third_full_cache
             .get_or_compute(|| {
                 (0..self.family.y.len())
@@ -345,7 +345,7 @@ impl BernoulliRigidRowKernel {
     /// `row_fourth_contracted` so each (u, v) ψ-axis pair finishes in a
     /// 16-multiply [`contract_fourth_full`] bilinear instead of triggering
     /// a fresh empirical-grid 8-direction jet.
-    fn fourth_full_cache(&self) -> &[[[[[f64; 2]; 2]; 2]; 2]] {
+    pub(super) fn fourth_full_cache(&self) -> &[[[[[f64; 2]; 2]; 2]; 2]] {
         self.fourth_full_cache
             .get_or_compute(|| {
                 (0..self.family.y.len())
@@ -710,18 +710,18 @@ where
 
 impl BernoulliMarginalSlopeFamily {
     #[inline]
-    fn probit_frailty_scale(&self) -> f64 {
+    pub(super) fn probit_frailty_scale(&self) -> f64 {
         probit_frailty_scale(self.gaussian_frailty_sd)
     }
 
     #[inline]
-    fn unit_primary_direction(r: usize, idx: usize) -> Array1<f64> {
+    pub(super) fn unit_primary_direction(r: usize, idx: usize) -> Array1<f64> {
         let mut out = Array1::<f64>::zeros(r);
         out[idx] = 1.0;
         out
     }
 
-    fn empirical_rigid_intercept_for_row(
+    pub(super) fn empirical_rigid_intercept_for_row(
         &self,
         row: usize,
         marginal: BernoulliMarginalLinkMap,
@@ -756,7 +756,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(root)
     }
 
-    fn empirical_rigid_calibration_jets(
+    pub(super) fn empirical_rigid_calibration_jets(
         &self,
         intercept: &MultiDirJet,
         mu: &MultiDirJet,
@@ -793,7 +793,7 @@ impl BernoulliMarginalSlopeFamily {
     /// Reuses the same `intercept_warm_starts` cache as `empirical_rigid_neglog_jet`,
     /// so successive line-search trials at nearby intercepts converge in
     /// `O(1)` Newton iterations per row.
-    fn empirical_rigid_neglog_only(
+    pub(super) fn empirical_rigid_neglog_only(
         &self,
         row: usize,
         marginal: BernoulliMarginalLinkMap,
@@ -820,7 +820,7 @@ impl BernoulliMarginalSlopeFamily {
     /// latent measure and [`Self::empirical_rigid_neglog_only`] for any
     /// empirical-grid measure. Replaces `rigid_row_kernel_eval(...)`'s
     /// `(neglog, _, _)` return when only the scalar is needed.
-    fn rigid_row_neglog_only(
+    pub(super) fn rigid_row_neglog_only(
         &self,
         row: usize,
         marginal: BernoulliMarginalLinkMap,
@@ -841,7 +841,7 @@ impl BernoulliMarginalSlopeFamily {
         }
     }
 
-    fn empirical_rigid_neglog_jet(
+    pub(super) fn empirical_rigid_neglog_jet(
         &self,
         row: usize,
         marginal_eta: f64,
@@ -887,7 +887,7 @@ impl BernoulliMarginalSlopeFamily {
         )))
     }
 
-    fn primary_component_jet(
+    pub(super) fn primary_component_jet(
         n_dirs: usize,
         base: f64,
         directions: &[ArrayView1<'_, f64>],
@@ -907,7 +907,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(MultiDirJet::linear(n_dirs, base, &first))
     }
 
-    fn local_cubic_value_jet(cubic: exact_kernel::LocalSpanCubic, x: &MultiDirJet) -> MultiDirJet {
+    pub(super) fn local_cubic_value_jet(cubic: exact_kernel::LocalSpanCubic, x: &MultiDirJet) -> MultiDirJet {
         let n_dirs = x.coeffs.len().trailing_zeros() as usize;
         let t = x.add(&MultiDirJet::constant(n_dirs, -cubic.left));
         let t2 = t.mul(&t);
@@ -918,7 +918,7 @@ impl BernoulliMarginalSlopeFamily {
             .add(&t3.scale(cubic.c3))
     }
 
-    fn local_cubic_first_derivative_jet(
+    pub(super) fn local_cubic_first_derivative_jet(
         cubic: exact_kernel::LocalSpanCubic,
         x: &MultiDirJet,
     ) -> MultiDirJet {
@@ -930,7 +930,7 @@ impl BernoulliMarginalSlopeFamily {
             .add(&t2.scale(3.0 * cubic.c3))
     }
 
-    fn empirical_flex_eta_and_eta_a_jet_at_z(
+    pub(super) fn empirical_flex_eta_and_eta_a_jet_at_z(
         &self,
         primary: &PrimarySlices,
         a_jet: &MultiDirJet,
@@ -1004,7 +1004,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok((eta, eta_a))
     }
 
-    fn empirical_flex_calibration_jets(
+    pub(super) fn empirical_flex_calibration_jets(
         &self,
         primary: &PrimarySlices,
         a_jet: &MultiDirJet,
@@ -1030,7 +1030,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok((f, f_a))
     }
 
-    fn empirical_flex_neglog_jet(
+    pub(super) fn empirical_flex_neglog_jet(
         &self,
         row: usize,
         primary: &PrimarySlices,
@@ -1104,7 +1104,7 @@ impl BernoulliMarginalSlopeFamily {
         )))
     }
 
-    fn empirical_flex_row_third_contracted_recompute(
+    pub(super) fn empirical_flex_row_third_contracted_recompute(
         &self,
         row: usize,
         primary: &PrimarySlices,
@@ -1153,7 +1153,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(out)
     }
 
-    fn empirical_flex_row_fourth_contracted_recompute(
+    pub(super) fn empirical_flex_row_fourth_contracted_recompute(
         &self,
         row: usize,
         primary: &PrimarySlices,
@@ -1210,7 +1210,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(out)
     }
 
-    fn rigid_row_kernel_eval(
+    pub(super) fn rigid_row_kernel_eval(
         &self,
         row: usize,
         marginal_eta: f64,
@@ -1255,7 +1255,7 @@ impl BernoulliMarginalSlopeFamily {
         }
     }
 
-    fn rigid_row_third_contracted(
+    pub(super) fn rigid_row_third_contracted(
         &self,
         row: usize,
         marginal_eta: f64,
@@ -1278,7 +1278,7 @@ impl BernoulliMarginalSlopeFamily {
     /// first published value wins and every subsequent caller observes the
     /// same stored result. A failed build is captured in the `Err` arm of the
     /// stored `Result` and propagates identically on every subsequent call.
-    fn rigid_third_full_cached<'a>(
+    pub(super) fn rigid_third_full_cached<'a>(
         &self,
         block_states: &[ParameterBlockState],
         cache: &'a BernoulliMarginalSlopeExactEvalCache,
@@ -1306,7 +1306,7 @@ impl BernoulliMarginalSlopeFamily {
     /// per-row tensor. With this cache the empirical-grid 8-direction jet
     /// (or the closed-form 5-component build) runs at most once per row,
     /// then 528 cheap [`contract_fourth_full`] bilinears finish the work.
-    fn rigid_fourth_full_cached<'a>(
+    pub(super) fn rigid_fourth_full_cached<'a>(
         &self,
         block_states: &[ParameterBlockState],
         cache: &'a BernoulliMarginalSlopeExactEvalCache,
@@ -1338,7 +1338,7 @@ impl BernoulliMarginalSlopeFamily {
     ///
     /// Returns `Ok(None)` for any `required_degree` outside {15, 21}; callers
     /// handle that the same way as a missing bundle.
-    fn bundle_for_degree<'a>(
+    pub(super) fn bundle_for_degree<'a>(
         &self,
         block_states: &[ParameterBlockState],
         cache: &'a BernoulliMarginalSlopeExactEvalCache,
@@ -1374,7 +1374,7 @@ impl BernoulliMarginalSlopeFamily {
     /// ψ-axis directions are then folded in with a cheap 2×2 bilinear
     /// `[contract_third_full]` per call, replacing the previous
     /// `rank` separate 5-direction jets per row.
-    fn rigid_row_third_full(
+    pub(super) fn rigid_row_third_full(
         &self,
         row: usize,
         marginal_eta: f64,
@@ -1440,7 +1440,7 @@ impl BernoulliMarginalSlopeFamily {
     /// T_qqgg, T_qggg, T_gggg` are read directly. The (u, v) directions are
     /// folded in afterwards via the cheap [`contract_fourth_full`] bilinear
     /// — at most one jet per row total, instead of `(rank²+rank)/2` per row.
-    fn rigid_row_fourth_full(
+    pub(super) fn rigid_row_fourth_full(
         &self,
         row: usize,
         marginal_eta: f64,
@@ -1717,7 +1717,7 @@ impl BernoulliMarginalSlopeFamily {
         total
     }
 
-    fn is_sigma_aux_index(
+    pub(super) fn is_sigma_aux_index(
         &self,
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
@@ -1725,7 +1725,7 @@ impl BernoulliMarginalSlopeFamily {
         shared_is_sigma_aux_index(self.gaussian_frailty_sd, derivative_blocks, psi_index)
     }
 
-    fn sigma_scale_jet(
+    pub(super) fn sigma_scale_jet(
         &self,
         n_dirs: usize,
         first_masks: &[usize],
@@ -1740,7 +1740,7 @@ impl BernoulliMarginalSlopeFamily {
         )
     }
 
-    fn row_neglog_directional_with_scale_jet(
+    pub(super) fn row_neglog_directional_with_scale_jet(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
@@ -1785,7 +1785,7 @@ impl BernoulliMarginalSlopeFamily {
             .coeff((1usize << k) - 1))
     }
 
-    fn row_sigma_primary_terms(
+    pub(super) fn row_sigma_primary_terms(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
@@ -1861,7 +1861,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok((objective, grad, hess))
     }
 
-    fn accumulate_rigid_sigma_pullback(
+    pub(super) fn accumulate_rigid_sigma_pullback(
         &self,
         row: usize,
         slices: &BlockSlices,
@@ -1884,7 +1884,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(())
     }
 
-    fn sigma_exact_joint_psi_terms(
+    pub(super) fn sigma_exact_joint_psi_terms(
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
@@ -1970,7 +1970,7 @@ impl BernoulliMarginalSlopeFamily {
         }))
     }
 
-    fn sigma_exact_joint_psisecond_order_terms(
+    pub(super) fn sigma_exact_joint_psisecond_order_terms(
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
@@ -2038,7 +2038,7 @@ impl BernoulliMarginalSlopeFamily {
         }))
     }
 
-    fn sigma_exact_joint_psihessian_directional_derivative(
+    pub(super) fn sigma_exact_joint_psihessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
@@ -2132,42 +2132,42 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     #[inline]
-    fn marginal_link_map(&self, eta: f64) -> Result<BernoulliMarginalLinkMap, String> {
+    pub(super) fn marginal_link_map(&self, eta: f64) -> Result<BernoulliMarginalLinkMap, String> {
         bernoulli_marginal_link_map(&self.base_link, eta)
     }
 
     #[inline]
-    fn exact_newton_score_component_from_objective_gradient(
+    pub(super) fn exact_newton_score_component_from_objective_gradient(
         objective_gradient_component: f64,
     ) -> f64 {
         -objective_gradient_component
     }
 
     #[inline]
-    fn exact_newton_score_from_objective_gradient(objective_gradient: Array1<f64>) -> Array1<f64> {
+    pub(super) fn exact_newton_score_from_objective_gradient(objective_gradient: Array1<f64>) -> Array1<f64> {
         -objective_gradient
     }
 
     #[inline]
-    fn exact_newton_observed_information_from_objective_hessian(
+    pub(super) fn exact_newton_observed_information_from_objective_hessian(
         objective_hessian: Array2<f64>,
     ) -> Array2<f64> {
         objective_hessian
     }
 
     #[inline]
-    fn score_block_index(&self) -> Option<usize> {
+    pub(super) fn score_block_index(&self) -> Option<usize> {
         self.score_warp.as_ref().map(|_| 2)
     }
 
     #[inline]
-    fn link_block_index(&self) -> Option<usize> {
+    pub(super) fn link_block_index(&self) -> Option<usize> {
         self.link_dev
             .as_ref()
             .map(|_| 2 + usize::from(self.score_warp.is_some()))
     }
 
-    fn optional_exact_block_state<'a>(
+    pub(super) fn optional_exact_block_state<'a>(
         &self,
         block_states: &'a [ParameterBlockState],
         block_idx: Option<usize>,
@@ -2182,21 +2182,21 @@ impl BernoulliMarginalSlopeFamily {
         }
     }
 
-    fn score_block_state<'a>(
+    pub(super) fn score_block_state<'a>(
         &self,
         block_states: &'a [ParameterBlockState],
     ) -> Result<Option<&'a ParameterBlockState>, String> {
         self.optional_exact_block_state(block_states, self.score_block_index(), "score-warp")
     }
 
-    fn link_block_state<'a>(
+    pub(super) fn link_block_state<'a>(
         &self,
         block_states: &'a [ParameterBlockState],
     ) -> Result<Option<&'a ParameterBlockState>, String> {
         self.optional_exact_block_state(block_states, self.link_block_index(), "link deviation")
     }
 
-    fn score_beta<'a>(
+    pub(super) fn score_beta<'a>(
         &self,
         block_states: &'a [ParameterBlockState],
     ) -> Result<Option<&'a Array1<f64>>, String> {
@@ -2205,7 +2205,7 @@ impl BernoulliMarginalSlopeFamily {
             .map(|state| &state.beta))
     }
 
-    fn link_beta<'a>(
+    pub(super) fn link_beta<'a>(
         &self,
         block_states: &'a [ParameterBlockState],
     ) -> Result<Option<&'a Array1<f64>>, String> {
@@ -2214,7 +2214,7 @@ impl BernoulliMarginalSlopeFamily {
             .map(|state| &state.beta))
     }
 
-    fn validate_exact_block_state_shapes(
+    pub(super) fn validate_exact_block_state_shapes(
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<(), String> {
@@ -2306,7 +2306,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(())
     }
 
-    fn denested_partition_cells(
+    pub(super) fn denested_partition_cells(
         &self,
         a: f64,
         b: f64,
@@ -2324,7 +2324,7 @@ impl BernoulliMarginalSlopeFamily {
         )
     }
 
-    fn max_denested_partition_cells_per_row(&self) -> usize {
+    pub(super) fn max_denested_partition_cells_per_row(&self) -> usize {
         let score_splits = self
             .score_warp
             .as_ref()
@@ -2337,7 +2337,7 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     #[inline]
-    fn evaluate_cell_moments_lru(
+    pub(super) fn evaluate_cell_moments_lru(
         &self,
         cell: exact_kernel::DenestedCubicCell,
         max_degree: usize,
@@ -2347,7 +2347,7 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     #[inline]
-    fn evaluate_cell_derivative_moments_lru(
+    pub(super) fn evaluate_cell_derivative_moments_lru(
         &self,
         cell: exact_kernel::DenestedCubicCell,
         max_degree: usize,
@@ -2361,7 +2361,7 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     #[inline]
-    fn for_each_deviation_basis_cubic_at<F>(
+    pub(super) fn for_each_deviation_basis_cubic_at<F>(
         runtime: &DeviationRuntime,
         primary_range: &std::ops::Range<usize>,
         value: f64,
@@ -2391,7 +2391,7 @@ impl BernoulliMarginalSlopeFamily {
     /// did not reduce calibration evaluations on the biobank FLEX repro, and
     /// it made each value-bearing cell evaluation slower; degree 4 is the
     /// correct cost/accuracy point for this solver.
-    fn evaluate_denested_calibration_newton(
+    pub(super) fn evaluate_denested_calibration_newton(
         &self,
         a: f64,
         marginal_eta: f64,
@@ -2420,7 +2420,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok((f, f_a, 0.0))
     }
 
-    fn evaluate_empirical_grid_calibration_newton(
+    pub(super) fn evaluate_empirical_grid_calibration_newton(
         &self,
         a: f64,
         marginal_eta: f64,
@@ -2451,7 +2451,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok((f, f_a, f_aa))
     }
 
-    fn evaluate_calibration_newton(
+    pub(super) fn evaluate_calibration_newton(
         &self,
         row: usize,
         a: f64,
@@ -2475,14 +2475,14 @@ impl BernoulliMarginalSlopeFamily {
         }
     }
 
-    fn flex_active(&self) -> bool {
+    pub(super) fn flex_active(&self) -> bool {
         self.score_warp.is_some() || self.link_dev.is_some()
     }
 
     /// The denested exact path is active whenever either deviation runtime is
     /// configured. Zero coefficient vectors still keep the flexible geometry
     /// live so derivatives with respect to those coefficients remain available.
-    fn effective_flex_active(&self, block_states: &[ParameterBlockState]) -> Result<bool, String> {
+    pub(super) fn effective_flex_active(&self, block_states: &[ParameterBlockState]) -> Result<bool, String> {
         if self.score_warp.is_some() && self.score_beta(block_states)?.is_none() {
             return Err("missing bernoulli score-warp block state".to_string());
         }
@@ -2492,7 +2492,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(self.flex_active())
     }
 
-    fn validate_exact_monotonicity(
+    pub(super) fn validate_exact_monotonicity(
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<(), String> {
@@ -2530,7 +2530,7 @@ impl BernoulliMarginalSlopeFamily {
     /// with the runtime's cached training-row anchor sliced to a single
     /// row. The derivative path is unaffected — the subtraction is
     /// constant in `η`, so its derivative is identically zero.
-    fn link_terms_value_d1_at_row(
+    pub(super) fn link_terms_value_d1_at_row(
         &self,
         row: usize,
         eta0: f64,
@@ -2556,7 +2556,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok((eta0 + basis.row(0).dot(beta), d1.row(0).dot(beta) + 1.0))
     }
 
-    fn row_intercept_closed_form_seed(
+    pub(super) fn row_intercept_closed_form_seed(
         &self,
         row: usize,
         marginal: BernoulliMarginalLinkMap,
@@ -2588,7 +2588,7 @@ impl BernoulliMarginalSlopeFamily {
     /// from a prior PIRLS/outer iteration are preserved verbatim — only NaN
     /// slots are CAS-installed. This avoids recomputing the seed inside every
     /// `solve_row_intercept_base` call on cold cycle 0.
-    fn preseed_intercept_warm_starts(
+    pub(super) fn preseed_intercept_warm_starts(
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<(), String> {
@@ -2716,7 +2716,7 @@ impl BernoulliMarginalSlopeFamily {
     /// Used when `build_exact_eval_cache_with_options_and_context_rows` is
     /// called with a non-`None` `context_rows` slice so that the warm-start
     /// preseed does not pay O(n) work for a subsampled cache build.
-    fn preseed_intercept_warm_starts_for_rows(
+    pub(super) fn preseed_intercept_warm_starts_for_rows(
         &self,
         block_states: &[ParameterBlockState],
         rows: &[usize],
@@ -2823,7 +2823,7 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     #[inline]
-    fn row_intercept_newton_is_converged(a: f64, f: f64, f_a: f64, abs_tol: f64) -> bool {
+    pub(super) fn row_intercept_newton_is_converged(a: f64, f: f64, f_a: f64, abs_tol: f64) -> bool {
         if !a.is_finite() || !f.is_finite() || !f_a.is_finite() || f_a == 0.0 {
             return false;
         }
@@ -2846,7 +2846,7 @@ struct BernoulliInterceptSolveStats {
 }
 
 impl BernoulliInterceptSolveStats {
-    fn record_seed_residual(&self, residual: f64, abs_tol: f64) {
+    pub(super) fn record_seed_residual(&self, residual: f64, abs_tol: f64) {
         let abs = residual.abs();
         if abs <= 1e-12 {
             self.seed_residual_le_1e12.fetch_add(1, Ordering::Relaxed);
@@ -2863,7 +2863,7 @@ impl BernoulliInterceptSolveStats {
         }
     }
 
-    fn record_full_solver(&self, refine_iters: usize) {
+    pub(super) fn record_full_solver(&self, refine_iters: usize) {
         self.full_solver.fetch_add(1, Ordering::Relaxed);
         let mut current = self.max_full_solver_iters.load(Ordering::Relaxed);
         while refine_iters > current {
@@ -2881,7 +2881,7 @@ impl BernoulliInterceptSolveStats {
 }
 
 impl BernoulliMarginalSlopeFamily {
-    fn intercept_primary_point(
+    pub(super) fn intercept_primary_point(
         q: f64,
         b: f64,
         beta_h: Option<&Array1<f64>>,
@@ -2903,7 +2903,7 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     #[inline]
-    fn cache_row_intercept(
+    pub(super) fn cache_row_intercept(
         &self,
         row: usize,
         a: f64,
@@ -2918,7 +2918,7 @@ impl BernoulliMarginalSlopeFamily {
         }
     }
 
-    fn cache_row_intercept_predictor(
+    pub(super) fn cache_row_intercept_predictor(
         &self,
         row: usize,
         a: f64,
@@ -2939,12 +2939,12 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     #[inline]
-    fn beta_linf(beta: Option<&Array1<f64>>) -> f64 {
+    pub(super) fn beta_linf(beta: Option<&Array1<f64>>) -> f64 {
         beta.map(|b| b.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs())))
             .unwrap_or(0.0)
     }
 
-    fn near_zero_deviation_residual_bound(
+    pub(super) fn near_zero_deviation_residual_bound(
         &self,
         slope: f64,
         beta_h_linf: f64,
@@ -2972,7 +2972,7 @@ impl BernoulliMarginalSlopeFamily {
             * (slope.abs() * score_basis_sup * beta_h_linf + link_basis_sup * beta_w_linf)
     }
 
-    fn solve_row_intercept_base(
+    pub(super) fn solve_row_intercept_base(
         &self,
         row: usize,
         marginal_eta: f64,
@@ -3184,7 +3184,7 @@ impl BernoulliMarginalSlopeFamily {
 
         Ok((a, abs_deriv, false))
     }
-    fn build_row_exact_context_with_stats_and_cell_cache(
+    pub(super) fn build_row_exact_context_with_stats_and_cell_cache(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
@@ -3269,21 +3269,21 @@ impl BernoulliMarginalSlopeFamily {
 
     /// Look up the pre-solved row context from the cache.
     #[inline]
-    fn row_ctx(
+    pub(super) fn row_ctx(
         cache: &BernoulliMarginalSlopeExactEvalCache,
         row: usize,
     ) -> &BernoulliMarginalSlopeRowExactContext {
         &cache.row_contexts[row]
     }
 
-    fn build_exact_eval_cache_with_order(
+    pub(super) fn build_exact_eval_cache_with_order(
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<BernoulliMarginalSlopeExactEvalCache, String> {
         self.build_exact_eval_cache_with_options(block_states, None)
     }
 
-    fn build_exact_eval_cache_with_options(
+    pub(super) fn build_exact_eval_cache_with_options(
         &self,
         block_states: &[ParameterBlockState],
         options: Option<&BlockwiseFitOptions>,
@@ -3291,7 +3291,7 @@ impl BernoulliMarginalSlopeFamily {
         self.build_exact_eval_cache_with_options_and_context_rows(block_states, options, None)
     }
 
-    fn build_exact_eval_cache_for_selected_context_rows(
+    pub(super) fn build_exact_eval_cache_for_selected_context_rows(
         &self,
         block_states: &[ParameterBlockState],
         options: &BlockwiseFitOptions,
@@ -3304,7 +3304,7 @@ impl BernoulliMarginalSlopeFamily {
         )
     }
 
-    fn build_exact_eval_cache_with_options_and_context_rows(
+    pub(super) fn build_exact_eval_cache_with_options_and_context_rows(
         &self,
         block_states: &[ParameterBlockState],
         options: Option<&BlockwiseFitOptions>,
@@ -3534,7 +3534,7 @@ impl BernoulliMarginalSlopeFamily {
     /// resource-policy budget. Numerical equivalence with the legacy per-row
     /// path is unconditional: callers always fall back to
     /// `degree9_cells`/on-demand cell evaluation when the bundle is absent.
-    fn build_row_cell_moments_bundle(
+    pub(super) fn build_row_cell_moments_bundle(
         &self,
         block_states: &[ParameterBlockState],
         row_contexts: &[BernoulliMarginalSlopeRowExactContext],
@@ -3812,7 +3812,7 @@ impl BernoulliMarginalSlopeFamily {
     /// per-cell coefficient families are built here on the host (cheap
     /// scalar work) so the device kernel reads only flat SoA buffers and
     /// keeps its inner loop free of cubic-cell partial-derivative math.
-    fn pack_bms_flex_row_kernel_inputs(
+    pub(super) fn pack_bms_flex_row_kernel_inputs(
         &self,
         block_states: &[ParameterBlockState],
         cache: &BernoulliMarginalSlopeExactEvalCache,
@@ -4363,7 +4363,7 @@ impl BernoulliMarginalSlopeFamily {
         ))
     }
 
-    fn build_row_primary_hessian_cache(
+    pub(super) fn build_row_primary_hessian_cache(
         &self,
         block_states: &[ParameterBlockState],
         cache: &BernoulliMarginalSlopeExactEvalCache,
@@ -4674,7 +4674,7 @@ impl BernoulliMarginalSlopeFamily {
     /// caches. Returns `None` when the cache is absent, device-resident, or
     /// the row is out of range.
     #[inline]
-    fn cached_row_primary_hessian<'a>(
+    pub(super) fn cached_row_primary_hessian<'a>(
         cache: &'a BernoulliMarginalSlopeExactEvalCache,
         row: usize,
     ) -> Option<ArrayView2<'a, f64>> {
@@ -4693,7 +4693,7 @@ impl BernoulliMarginalSlopeFamily {
     /// caches. Returns `None` when the cache is absent, device-resident, or
     /// the row is out of range.
     #[inline]
-    fn cached_row_primary_eval<'a>(
+    pub(super) fn cached_row_primary_eval<'a>(
         cache: &'a BernoulliMarginalSlopeExactEvalCache,
         row: usize,
     ) -> Option<(f64, ArrayView1<'a, f64>)> {
@@ -4713,14 +4713,14 @@ impl BernoulliMarginalSlopeFamily {
         Some((neglog_val, grad_row))
     }
 
-    fn build_exact_eval_cache(
+    pub(super) fn build_exact_eval_cache(
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<BernoulliMarginalSlopeExactEvalCache, String> {
         self.build_exact_eval_cache_with_order(block_states)
     }
 
-    fn row_primary_direction_from_flat(
+    pub(super) fn row_primary_direction_from_flat(
         &self,
         row: usize,
         slices: &BlockSlices,
@@ -4735,7 +4735,7 @@ impl BernoulliMarginalSlopeFamily {
     /// Allocation-free variant of [`Self::row_primary_direction_from_flat`]:
     /// fills `out` (length `primary.total`) with the primary-space projection
     /// of `d_beta_flat`. `out` is fully overwritten on success.
-    fn row_primary_direction_from_flat_into(
+    pub(super) fn row_primary_direction_from_flat_into(
         &self,
         row: usize,
         slices: &BlockSlices,
@@ -4767,7 +4767,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(())
     }
 
-    fn stacked_direction_block(
+    pub(super) fn stacked_direction_block(
         d_beta_flats: &[Array1<f64>],
         range: std::ops::Range<usize>,
     ) -> Array2<f64> {
@@ -4779,7 +4779,7 @@ impl BernoulliMarginalSlopeFamily {
         out
     }
 
-    fn row_primary_directions_from_projected(
+    pub(super) fn row_primary_directions_from_projected(
         local_row: usize,
         slices: &BlockSlices,
         primary: &PrimarySlices,
@@ -4811,7 +4811,7 @@ impl BernoulliMarginalSlopeFamily {
         out
     }
 
-    fn batched_directional_derivative_chunk_rows(n: usize, n_dirs: usize) -> (usize, bool) {
+    pub(super) fn batched_directional_derivative_chunk_rows(n: usize, n_dirs: usize) -> (usize, bool) {
         // CPU-only path: chunk by a fixed float-count budget so each chunk is
         // small enough to keep the per-row workspaces in L2/L3 across the
         // directional sweep. The GPU dispatch path was removed when the
@@ -4823,7 +4823,7 @@ impl BernoulliMarginalSlopeFamily {
         (cpu_rows.min(n.max(1)), false)
     }
 
-    fn row_primary_psi_direction_from_map(
+    pub(super) fn row_primary_psi_direction_from_map(
         &self,
         row: usize,
         block_idx: usize,
@@ -4854,7 +4854,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(out)
     }
 
-    fn row_primary_psi_action_on_direction_from_map(
+    pub(super) fn row_primary_psi_action_on_direction_from_map(
         &self,
         row: usize,
         block_idx: usize,
@@ -4888,7 +4888,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(out)
     }
 
-    fn pullback_primary_vector(
+    pub(super) fn pullback_primary_vector(
         &self,
         row: usize,
         slices: &BlockSlices,
@@ -4904,7 +4904,7 @@ impl BernoulliMarginalSlopeFamily {
     /// the pullback of `primary_vec` into the existing accumulator `out`
     /// (length `slices.total`).  `out` is **not** zeroed first; the caller
     /// must initialise it before the first call on a given accumulation.
-    fn pullback_primary_vector_add_into(
+    pub(super) fn pullback_primary_vector_add_into(
         &self,
         row: usize,
         slices: &BlockSlices,
@@ -4948,7 +4948,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(())
     }
 
-    fn block_psi_row_from_map(
+    pub(super) fn block_psi_row_from_map(
         &self,
         row: usize,
         block_idx: usize,
@@ -4983,7 +4983,7 @@ impl BernoulliMarginalSlopeFamily {
 
     /// Returns (neg_log_lik, gradient, Hessian) in primary coordinates.
     /// Fully analytic for both flex and non-flex paths — no AD jets.
-    fn compute_row_primary_gradient_hessian(
+    pub(super) fn compute_row_primary_gradient_hessian(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
@@ -5022,7 +5022,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok((neglog, grad, hess))
     }
 
-    fn compute_row_primary_gradient_hessian_reusing_cache(
+    pub(super) fn compute_row_primary_gradient_hessian_reusing_cache(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
@@ -5054,7 +5054,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok((grad, hess))
     }
 
-    fn compute_row_analytic_flex_into(
+    pub(super) fn compute_row_analytic_flex_into(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
@@ -5074,7 +5074,7 @@ impl BernoulliMarginalSlopeFamily {
         )
     }
 
-    fn compute_row_analytic_flex_into_with_moments(
+    pub(super) fn compute_row_analytic_flex_into_with_moments(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
@@ -5102,7 +5102,7 @@ impl BernoulliMarginalSlopeFamily {
         )
     }
 
-    fn compute_row_analytic_flex_from_parts_into(
+    pub(super) fn compute_row_analytic_flex_from_parts_into(
         &self,
         row: usize,
         primary: &PrimarySlices,
@@ -5591,7 +5591,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(neglog_val)
     }
 
-    fn primary_point_from_block_states(
+    pub(super) fn primary_point_from_block_states(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
@@ -5619,7 +5619,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(point)
     }
 
-    fn primary_point_components(
+    pub(super) fn primary_point_components(
         &self,
         point: &Array1<f64>,
         primary: &PrimarySlices,
@@ -5635,7 +5635,7 @@ impl BernoulliMarginalSlopeFamily {
         (point[primary.q], point[primary.logslope], beta_h, beta_w)
     }
 
-    fn observed_denested_cell_partials(
+    pub(super) fn observed_denested_cell_partials(
         &self,
         row: usize,
         a: f64,
@@ -5655,7 +5655,7 @@ impl BernoulliMarginalSlopeFamily {
         )
     }
 
-    fn observed_denested_cell_partials_at_z(
+    pub(super) fn observed_denested_cell_partials_at_z(
         &self,
         z_value: f64,
         a: f64,
@@ -5684,7 +5684,7 @@ impl BernoulliMarginalSlopeFamily {
     /// already parallelize the outer row reductions with Rayon (`row_iter` /
     /// chunk `into_par_iter()` folds), which avoids nested Rayon overhead for
     /// the small per-row matrices assembled here.
-    fn row_primary_third_contracted_recompute(
+    pub(super) fn row_primary_third_contracted_recompute(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
@@ -5701,7 +5701,7 @@ impl BernoulliMarginalSlopeFamily {
         )
     }
 
-    fn row_primary_third_contracted_recompute_with_moments(
+    pub(super) fn row_primary_third_contracted_recompute_with_moments(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
@@ -6257,7 +6257,7 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     #[inline]
-    fn coeff4_eval_adjoint(z: f64, scalar_adjoint: f64) -> [f64; 4] {
+    pub(super) fn coeff4_eval_adjoint(z: f64, scalar_adjoint: f64) -> [f64; 4] {
         let z2 = z * z;
         [
             scalar_adjoint,
@@ -6268,14 +6268,14 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     #[inline]
-    fn add_coeff4_adjoint(target: &mut [f64; 4], source: &[f64; 4]) {
+    pub(super) fn add_coeff4_adjoint(target: &mut [f64; 4], source: &[f64; 4]) {
         for idx in 0..4 {
             target[idx] += source[idx];
         }
     }
 
     #[inline]
-    fn add_eval_directional_family_adjoint(
+    pub(super) fn add_eval_directional_family_adjoint(
         jet: &SparsePrimaryCoeffJetView<'_>,
         family: &[[f64; 4]],
         support: CoeffSupport,
@@ -6288,7 +6288,7 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     #[inline]
-    fn add_eval_param_directional_adjoint(
+    pub(super) fn add_eval_param_directional_adjoint(
         jet: &SparsePrimaryCoeffJetView<'_>,
         family: &[[f64; 4]],
         param: usize,
@@ -6308,7 +6308,7 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     #[inline]
-    fn add_eval_pair_directional_adjoint(
+    pub(super) fn add_eval_pair_directional_adjoint(
         jet: &SparsePrimaryCoeffJetView<'_>,
         family: &[[f64; 4]],
         u: usize,
@@ -6329,7 +6329,7 @@ impl BernoulliMarginalSlopeFamily {
         );
     }
 
-    fn add_cell_second_direction_adjoint(
+    pub(super) fn add_cell_second_direction_adjoint(
         cell: exact_kernel::DenestedCubicCell,
         first_r: &[f64; 4],
         moments: &[f64],
@@ -6360,7 +6360,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(())
     }
 
-    fn add_cell_third_direction_adjoint(
+    pub(super) fn add_cell_third_direction_adjoint(
         cell: exact_kernel::DenestedCubicCell,
         first_r: &[f64; 4],
         first_s: &[f64; 4],
@@ -6429,7 +6429,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(())
     }
 
-    fn row_primary_third_trace_gradient_with_moments(
+    pub(super) fn row_primary_third_trace_gradient_with_moments(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
@@ -7174,7 +7174,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(Array1::from_vec(direction_adjoint))
     }
 
-    fn row_primary_third_trace_many_with_moments(
+    pub(super) fn row_primary_third_trace_many_with_moments(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
@@ -7746,7 +7746,7 @@ impl BernoulliMarginalSlopeFamily {
     ///   out[k,l] = sum_{m,n} f_{klmn} dir_u[m] dir_v[n]
     /// Rigid path uses the closed-form kernel. The flexible de-nested
     /// transport path contracts the cell-moment kernel analytically.
-    fn row_primary_fourth_contracted_recompute_ordered(
+    pub(super) fn row_primary_fourth_contracted_recompute_ordered(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
@@ -8754,7 +8754,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(out)
     }
 
-    fn row_primary_fourth_contracted_recompute(
+    pub(super) fn row_primary_fourth_contracted_recompute(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
@@ -8795,7 +8795,7 @@ impl BernoulliMarginalSlopeFamily {
     /// Like `add_pullback_primary_hessian` but only accumulates the h/w
     /// cross-block contributions. The marginal-marginal, marginal-logslope,
     /// and logslope-logslope blocks are handled by the weighted-Gram operator.
-    fn add_pullback_primary_hessian_hw_only(
+    pub(super) fn add_pullback_primary_hessian_hw_only(
         &self,
         target: &mut Array2<f64>,
         row: usize,
@@ -8922,7 +8922,7 @@ impl BernoulliMarginalSlopeFamily {
         }
     }
 
-    fn exact_newton_joint_hessian_dense_from_cache(
+    pub(super) fn exact_newton_joint_hessian_dense_from_cache(
         &self,
         block_states: &[ParameterBlockState],
         cache: &BernoulliMarginalSlopeExactEvalCache,
@@ -9106,7 +9106,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(dense)
     }
 
-    fn exact_newton_joint_fused_gradient_dense_from_cache(
+    pub(super) fn exact_newton_joint_fused_gradient_dense_from_cache(
         &self,
         block_states: &[ParameterBlockState],
         cache: &BernoulliMarginalSlopeExactEvalCache,
@@ -9396,7 +9396,7 @@ impl BernoulliMarginalSlopeFamily {
         })
     }
 
-    fn log_likelihood_from_exact_cache(
+    pub(super) fn log_likelihood_from_exact_cache(
         &self,
         block_states: &[ParameterBlockState],
         cache: &BernoulliMarginalSlopeExactEvalCache,
@@ -9458,7 +9458,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(log_likelihood)
     }
 
-    fn exact_newton_joint_gradient_evaluation_from_cache(
+    pub(super) fn exact_newton_joint_gradient_evaluation_from_cache(
         &self,
         block_states: &[ParameterBlockState],
         cache: &BernoulliMarginalSlopeExactEvalCache,
@@ -9594,7 +9594,7 @@ impl BernoulliMarginalSlopeFamily {
         })
     }
 
-    fn exact_newton_joint_hessian_matvec_from_cache(
+    pub(super) fn exact_newton_joint_hessian_matvec_from_cache(
         &self,
         direction: &Array1<f64>,
         block_states: &[ParameterBlockState],
@@ -9839,7 +9839,7 @@ impl BernoulliMarginalSlopeFamily {
         *out += &partial;
         Ok(())
     }
-    fn exact_newton_joint_hessian_diagonal_from_cache(
+    pub(super) fn exact_newton_joint_hessian_diagonal_from_cache(
         &self,
         block_states: &[ParameterBlockState],
         cache: &BernoulliMarginalSlopeExactEvalCache,
@@ -10077,7 +10077,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(diagonal)
     }
 
-    fn exact_newton_joint_psi_terms_from_cache(
+    pub(super) fn exact_newton_joint_psi_terms_from_cache(
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
@@ -10116,7 +10116,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(Some(results.remove(0)))
     }
 
-    fn resolve_psi_axis_spec(
+    pub(super) fn resolve_psi_axis_spec(
         &self,
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         block_idx: usize,
@@ -10154,7 +10154,7 @@ impl BernoulliMarginalSlopeFamily {
         })
     }
 
-    fn run_psi_row_pass_for_axes(
+    pub(super) fn run_psi_row_pass_for_axes(
         &self,
         block_states: &[ParameterBlockState],
         cache: &BernoulliMarginalSlopeExactEvalCache,
@@ -10290,7 +10290,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(out)
     }
 
-    fn exact_newton_joint_psisecond_order_terms_from_cache(
+    pub(super) fn exact_newton_joint_psisecond_order_terms_from_cache(
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
@@ -10646,7 +10646,7 @@ impl BernoulliMarginalSlopeFamily {
         }))
     }
 
-    fn exact_newton_joint_psihessian_directional_derivative_from_cache(
+    pub(super) fn exact_newton_joint_psihessian_directional_derivative_from_cache(
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
@@ -10932,7 +10932,7 @@ impl BernoulliMarginalSlopeFamily {
         ))
     }
 
-    fn exact_newton_joint_hessian_directional_derivative_from_cache(
+    pub(super) fn exact_newton_joint_hessian_directional_derivative_from_cache(
         &self,
         block_states: &[ParameterBlockState],
         d_beta_flat: &Array1<f64>,
@@ -11481,7 +11481,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(operators)
     }
 
-    fn exact_newton_joint_hessiansecond_directional_derivative_from_cache(
+    pub(super) fn exact_newton_joint_hessiansecond_directional_derivative_from_cache(
         &self,
         block_states: &[ParameterBlockState],
         d_beta_u_flat: &Array1<f64>,
@@ -11698,7 +11698,7 @@ impl BernoulliMarginalSlopeFamily {
         ))
     }
 
-    fn evaluate_flex_block_diagonals_from_cache(
+    pub(super) fn evaluate_flex_block_diagonals_from_cache(
         &self,
         block_states: &[ParameterBlockState],
         slices: &BlockSlices,
@@ -11818,7 +11818,7 @@ impl BernoulliMarginalSlopeFamily {
         })
     }
 
-    fn evaluate_blockwise_exact_newton(
+    pub(super) fn evaluate_blockwise_exact_newton(
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<FamilyEvaluation, String> {
@@ -12943,7 +12943,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
 }
 
 impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
-    fn new(
+    pub(super) fn new(
         family: BernoulliMarginalSlopeFamily,
         block_states: Vec<ParameterBlockState>,
         options: BlockwiseFitOptions,
@@ -12991,7 +12991,7 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
         workspace
     }
 
-    fn from_arc_cache(
+    pub(super) fn from_arc_cache(
         family: BernoulliMarginalSlopeFamily,
         block_states: Vec<ParameterBlockState>,
         cache: Arc<BernoulliMarginalSlopeExactEvalCache>,
@@ -13007,7 +13007,7 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
         })
     }
 
-    fn fused_gradient_dense(&self) -> Result<Arc<ExactNewtonJointFusedDenseEvaluation>, String> {
+    pub(super) fn fused_gradient_dense(&self) -> Result<Arc<ExactNewtonJointFusedDenseEvaluation>, String> {
         self.fused_gradient_dense
             .get_or_init(|| {
                 self.family
@@ -13031,7 +13031,7 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
     /// PCG with the joint penalty preconditioner typically converges in a
     /// handful of HVPs, so routing the inner solve through the operator path
     /// beats per-cycle dense reassembly.
-    fn matrix_free_inner_route(&self) -> bool {
+    pub(super) fn matrix_free_inner_route(&self) -> bool {
         if self.cache.row_primary_hessians.is_some() {
             return false;
         }
@@ -13350,7 +13350,7 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
 }
 
 impl BernoulliMarginalSlopeFamily {
-    fn block_ranges_from_specs(specs: &[ParameterBlockSpec]) -> Vec<(usize, usize)> {
+    pub(super) fn block_ranges_from_specs(specs: &[ParameterBlockSpec]) -> Vec<(usize, usize)> {
         let mut cursor = 0usize;
         specs
             .iter()
@@ -13362,7 +13362,7 @@ impl BernoulliMarginalSlopeFamily {
             .collect()
     }
 
-    fn flatten_block_state_betas_for_specs(
+    pub(super) fn flatten_block_state_betas_for_specs(
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
     ) -> Result<Array1<f64>, String> {
@@ -13392,7 +13392,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(beta)
     }
 
-    fn row_factor_primary_projection(
+    pub(super) fn row_factor_primary_projection(
         &self,
         row: usize,
         slices: &BlockSlices,
@@ -13436,7 +13436,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(())
     }
 
-    fn row_primary_gram_from_projection(
+    pub(super) fn row_primary_gram_from_projection(
         primary_total: usize,
         rank: usize,
         projection: &[f64],
@@ -13457,7 +13457,7 @@ impl BernoulliMarginalSlopeFamily {
         gram
     }
 
-    fn primary_tail_block_pairs(
+    pub(super) fn primary_tail_block_pairs(
         slices: &BlockSlices,
         primary: &PrimarySlices,
     ) -> Vec<(usize, usize)> {
@@ -13481,7 +13481,7 @@ impl BernoulliMarginalSlopeFamily {
         out
     }
 
-    fn primary_tail_tail_gram(
+    pub(super) fn primary_tail_tail_gram(
         primary_total: usize,
         rank: usize,
         factor: &Array2<f64>,
@@ -13501,7 +13501,7 @@ impl BernoulliMarginalSlopeFamily {
         gram
     }
 
-    fn row_primary_trace_contract(third: &Array2<f64>, gram: &[f64]) -> f64 {
+    pub(super) fn row_primary_trace_contract(third: &Array2<f64>, gram: &[f64]) -> f64 {
         let r = third.nrows();
         assert_eq!(third.ncols(), r);
         assert_eq!(gram.len(), r * r);
@@ -13514,7 +13514,7 @@ impl BernoulliMarginalSlopeFamily {
         total
     }
 
-    fn row_primary_third_contracted_many_with_moments(
+    pub(super) fn row_primary_third_contracted_many_with_moments(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
@@ -14068,7 +14068,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(out)
     }
 
-    fn batched_rho_correction_logdet_traces_for_rows(
+    pub(super) fn batched_rho_correction_logdet_traces_for_rows(
         &self,
         block_states: &[ParameterBlockState],
         cache: &BernoulliMarginalSlopeExactEvalCache,
@@ -14195,7 +14195,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(Array1::from_vec(traces))
     }
 
-    fn batched_rho_correction_logdet_traces_full_rows(
+    pub(super) fn batched_rho_correction_logdet_traces_full_rows(
         &self,
         block_states: &[ParameterBlockState],
         cache: &BernoulliMarginalSlopeExactEvalCache,
@@ -14387,7 +14387,7 @@ impl BernoulliMarginalSlopeFamily {
 }
 
 impl BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
-    fn new(
+    pub(super) fn new(
         family: BernoulliMarginalSlopeFamily,
         block_states: Vec<ParameterBlockState>,
         specs: Vec<ParameterBlockSpec>,
