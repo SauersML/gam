@@ -72,7 +72,6 @@ fn fit_constant_exposure_cause_specific(event_counts: &[usize], n: usize) -> Arr
                 ((event_counts[cause] as f64 + 0.5) / n as f64).ln(),
             ])),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         });
     }

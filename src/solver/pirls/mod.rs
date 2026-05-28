@@ -88,7 +88,7 @@ const GAMMA_SHAPE_TARGET_TOL: f64 = 1e-12;
 /// This value no longer rejects otherwise finite step candidates. Stable
 /// likelihood code owns tail arithmetic; this threshold only helps the rescue
 /// logic classify a stalled fit pinned deep in a separated/saturated tail.
-const PIRLS_ETA_ABS_CAP: f64 = 40.0;
+pub(super) const PIRLS_ETA_ABS_CAP: f64 = 40.0;
 
 #[inline]
 fn gamma_shape_score(shape: f64, target: f64) -> f64 {
@@ -621,7 +621,7 @@ impl CandidateEvaluation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct PirlsAcceptedStateCacheKey {
+pub(super) struct PirlsAcceptedStateCacheKey {
     curvature: HessianCurvatureKind,
     firth_active: bool,
     beta_bits: Vec<u64>,
@@ -2488,7 +2488,7 @@ fn accumulate_outer_upper(
     }
 }
 
-fn compute_jeffreys_pirls_diagnostics_sparse(
+pub(super) fn compute_jeffreys_pirls_diagnostics_sparse(
     x_design_csr: &SparseRowMat<usize, f64>,
     eta: ArrayView1<f64>,
     observation_weights: ArrayView1<f64>,
@@ -2512,7 +2512,7 @@ fn compute_jeffreys_pirls_diagnostics_sparse(
     compute_jeffreys_pirls_diagnostics(x_dense.view(), eta, observation_weights)
 }
 
-fn compute_jeffreys_pirls_diagnostics(
+pub(super) fn compute_jeffreys_pirls_diagnostics(
     x_design: ArrayView2<f64>,
     eta: ArrayView1<f64>,
     observation_weights: ArrayView1<f64>,
@@ -2824,7 +2824,7 @@ where
     Ok(())
 }
 
-fn project_coefficients_to_lower_bounds(beta: &mut Array1<f64>, lower_bounds: &Array1<f64>) {
+pub(super) fn project_coefficients_to_lower_bounds(beta: &mut Array1<f64>, lower_bounds: &Array1<f64>) {
     for i in 0..beta.len() {
         let lb = lower_bounds[i];
         if lb.is_finite() && beta[i] < lb {
@@ -2839,7 +2839,7 @@ fn project_coefficients_to_lower_bounds(beta: &mut Array1<f64>, lower_bounds: &A
 /// bound that point into the infeasible direction (gradient > 0 for minimization)
 /// are KKT multipliers, not convergence defects.  Zeroing them gives the
 /// standard "projected gradient" used to test stationarity.
-fn projected_gradient_norm(
+pub(super) fn projected_gradient_norm(
     gradient: &Array1<f64>,
     beta: &Array1<f64>,
     lower_bounds: Option<&Array1<f64>>,
@@ -2874,7 +2874,7 @@ fn projected_gradient_norm(
 /// instead of grinding to `MaxIterations` only to be rescued with the
 /// same conditions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PirlsSoftAccept {
+pub(super) enum PirlsSoftAccept {
     /// Projected gradient inside the 10× near-stationary band AND the
     /// progress signal has plateaued at `tol · objective_scale` (or, in
     /// the LM-rejection context, at the much tighter `1e-12 · |Φ|` model
@@ -2919,7 +2919,7 @@ enum PirlsSoftAccept {
 ///   relative-band tests both rely on a realized deviance change and
 ///   would widen acceptance if applied with `predicted=0`).
 #[derive(Clone, Copy, Debug)]
-enum SoftAcceptProgress {
+pub(super) enum SoftAcceptProgress {
     /// Realized change in penalized deviance from the most recent
     /// accepted step (per-iter) or final accepted step (post-loop).
     Realized { dev_change: f64 },
@@ -2955,7 +2955,7 @@ enum SoftAcceptProgress {
 /// early-exit, and the LM-rejection branch accepts exactly the same set
 /// of states it accepted before unification.
 #[inline]
-fn pirls_soft_acceptance(
+pub(super) fn pirls_soft_acceptance(
     state: &WorkingState,
     projected_grad: f64,
     progress: SoftAcceptProgress,
@@ -3019,7 +3019,7 @@ fn pirls_soft_acceptance(
     None
 }
 
-fn constrained_stationarity_norm(
+pub(super) fn constrained_stationarity_norm(
     gradient: &Array1<f64>,
     beta: &Array1<f64>,
     lower_bounds: Option<&Array1<f64>>,
@@ -3279,13 +3279,13 @@ fn solve_subsystem_direction(
     Ok(())
 }
 
-fn linear_constraints_from_lower_bounds(
+pub(super) fn linear_constraints_from_lower_bounds(
     lower_bounds: &Array1<f64>,
 ) -> Option<LinearInequalityConstraints> {
     LinearInequalityConstraints::from_per_coordinate_lower_bounds(lower_bounds)
 }
 
-fn compute_constraint_kkt_diagnostics(
+pub(super) fn compute_constraint_kkt_diagnostics(
     beta: &Array1<f64>,
     gradient: &Array1<f64>,
     constraints: &LinearInequalityConstraints,
@@ -3309,7 +3309,7 @@ fn compute_constraint_kkt_diagnostics(
 ///   with Bland-compatible tie-breaking on entering, it guarantees the
 ///   active-set sequence visits each vertex at most once and so terminates
 ///   in finitely many pivots.
-fn select_active_set_release(
+pub(super) fn select_active_set_release(
     gradient: &Array1<f64>,
     hd: &Array1<f64>,
     active_idx: &[usize],
@@ -3563,7 +3563,7 @@ pub(crate) fn solve_newton_directionwith_lower_bounds(
 ///
 /// This is a shared numerical primitive used by both the PIRLS and
 /// custom-family active-set solvers.
-fn solve_newton_directionwith_linear_constraints(
+pub(super) fn solve_newton_directionwith_linear_constraints(
     hessian: &Array2<f64>,
     gradient: &Array1<f64>,
     beta: &Array1<f64>,
@@ -3581,7 +3581,7 @@ fn solve_newton_directionwith_linear_constraints(
     )
 }
 
-fn default_beta_guess_external(
+pub(super) fn default_beta_guess_external(
     p: usize,
     link_function: LinkFunction,
     y: ArrayView1<f64>,
@@ -3682,7 +3682,7 @@ fn default_beta_guess_external(
     beta
 }
 
-fn solve_intercept_for_prevalence(
+pub(super) fn solve_intercept_for_prevalence(
     link_function: LinkFunction,
     prevalence: f64,
     mixture_link_state: Option<&MixtureLinkState>,
@@ -3815,7 +3815,7 @@ fn solve_intercept_for_prevalence(
 /// post-accept ρ can be as small as `noise_floor / predicted_reduction`,
 /// where the cubic blow-up isn't physical.
 #[inline]
-fn madsen_lm_accept_factor(rho: f64) -> f64 {
+pub(super) fn madsen_lm_accept_factor(rho: f64) -> f64 {
     let two_rho_minus_one = 2.0 * rho - 1.0;
     let cube = two_rho_minus_one * two_rho_minus_one * two_rho_minus_one;
     (1.0 - cube).clamp(1.0 / 3.0, 2.0)

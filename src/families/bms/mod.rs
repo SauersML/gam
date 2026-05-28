@@ -1097,12 +1097,13 @@ pub(crate) mod workspace;
 // Public re-exports — preserve the original module path's public surface.
 // ---------------------------------------------------------------------------
 pub use block_specs::fit_bernoulli_marginal_slope_terms;
-pub use exact_eval_cache::{RowPrimaryEvalCache, RowPrimaryEvalPin};
+pub(crate) use exact_eval_cache::{RowPrimaryEvalCache, RowPrimaryEvalPin};
 pub use gradient_paths::{
     MarginalSlopeCovariance, MarginalSlopeCovarianceShape, marginal_slope_covariance_from_scores,
     marginal_slope_preserving_scale, marginal_slope_probit_eta, padded_deviation_seed,
 };
-pub use install_flex::{CrossBlockIdentifiabilityWarning, FlexCompileOutcome};
+pub use install_flex::CrossBlockIdentifiabilityWarning;
+pub(crate) use install_flex::FlexCompileOutcome;
 
 // pub(crate) re-exports for internal callers:
 pub(crate) use family::{

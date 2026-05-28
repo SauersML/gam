@@ -78,7 +78,6 @@ fn build_two_block_specs() -> (Vec<ParameterBlockSpec>, Vec<usize>) {
         initial_log_lambdas: Array1::<f64>::zeros(0),
         initial_beta: None,
         gauge_priority: 100,
-        eta_row_scaling: None,
         jacobian_callback: None,
     };
     let spec_b = ParameterBlockSpec {
@@ -90,7 +89,6 @@ fn build_two_block_specs() -> (Vec<ParameterBlockSpec>, Vec<usize>) {
         initial_log_lambdas: Array1::<f64>::zeros(0),
         initial_beta: None,
         gauge_priority: 100,
-        eta_row_scaling: None,
         jacobian_callback: None,
     };
     let col_offsets = vec![0usize, 2, 3];
@@ -203,7 +201,6 @@ fn canonicalize_clean_model_with_penalties_passes_map_check() {
         initial_log_lambdas: Array1::from(vec![0.0]),
         initial_beta: None,
         gauge_priority: 100,
-        eta_row_scaling: None,
         jacobian_callback: None,
     };
     let spec_b = ParameterBlockSpec {
@@ -215,7 +212,6 @@ fn canonicalize_clean_model_with_penalties_passes_map_check() {
         initial_log_lambdas: Array1::from(vec![0.0]),
         initial_beta: None,
         gauge_priority: 100,
-        eta_row_scaling: None,
         jacobian_callback: None,
     };
 

@@ -2,6 +2,7 @@ use super::*;
 use super::family::*;
 use super::gradient_paths::*;
 use super::install_flex::validate_spec;
+use super::hessian_paths::{new_cell_moment_lru_cache, new_cell_moment_cache_stats};
 
 // ── BmsFamilyScalars ──────────────────────────────────────────────────────────
 //
