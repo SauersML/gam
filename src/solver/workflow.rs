@@ -6472,6 +6472,7 @@ fn materialize_location_scale<'a>(
 ) -> Result<MaterializedModel<'a>, String> {
     let y_col = resolve_role_col(col_map, &parsed.response, "response")?;
     let y = data.values.column(y_col).to_owned();
+    let y_kind = response_column_kind(data, y_col);
     let mut inference_notes = Vec::new();
 
     let noise_formula = config
@@ -6486,7 +6487,16 @@ fn materialize_location_scale<'a>(
         config.negative_binomial_theta,
         link_choice.as_ref(),
         y.view(),
+        y_kind,
+        &parsed.response,
     )?;
+
+    // Per-family response-support validation, owned by the family type.
+    // See `ResponseFamily::validate_response_support`.
+    family
+        .response
+        .validate_response_support(y.view())
+        .map_err(|violation| violation.message_for(&parsed.response))?;
 
     let effective_linkwiggle =
         effectivelinkwiggle_formulaspec(parsed.linkwiggle.as_ref(), link_choice.as_ref());

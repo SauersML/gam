@@ -119,18 +119,16 @@ def test_standard_gam_default_returns_1d_mean(monkeypatch: Any) -> None:
     np.testing.assert_allclose(arr, [0.2, 0.5, 0.8])
 
 
-def test_standard_gam_with_uncertainty_returns_table(monkeypatch: Any) -> None:
-    """``with_uncertainty=True`` is a tabular-output signal on its own,
-    even when ``return_type`` / ``id_column`` / ``interval`` are all
-    ``None``. This is the principled way to ask for SE columns alongside
-    the mean; the dispatcher must not require the user to also pass
-    ``return_type=`` to get them."""
+def test_standard_gam_with_return_type_returns_table(monkeypatch: Any) -> None:
+    """``return_type="dict"`` alone is enough to opt into the table even
+    when ``interval`` / ``id_column`` are ``None``. This pins the shape
+    policy as a pure caller-intent decision: every public knob promotes
+    the return shape independently."""
     raw = json.dumps(
         {
             "columns": {
                 "eta": [-1.0, 0.0, 1.0],
                 "mean": [0.2, 0.5, 0.8],
-                "effective_se": [0.01, 0.02, 0.03],
             }
         }
     )
@@ -140,14 +138,40 @@ def test_standard_gam_with_uncertainty_returns_table(monkeypatch: Any) -> None:
         raw,
         fallback_model_class="standard",
         fallback_family="gaussian",
-        with_uncertainty=True,
+        return_type="dict",
     )
 
-    # restore_output_table with input_kind="pandas" yields a DataFrame.
+    assert isinstance(out, dict)
+    assert list(out) == ["eta", "mean"]
+
+
+def test_standard_gam_with_id_column_returns_table(monkeypatch: Any) -> None:
+    """``id_column`` only makes sense alongside a tabular shape, so its
+    presence must flip the return shape on its own."""
+    raw = json.dumps(
+        {
+            "columns": {
+                "eta": [-1.0, 0.0, 1.0],
+                "mean": [0.2, 0.5, 0.8],
+            }
+        }
+    )
+
+    out = _dispatch(
+        monkeypatch,
+        raw,
+        fallback_model_class="standard",
+        fallback_family="gaussian",
+        id_column="person_id",
+    )
+
+    # ``row_ids=None`` is normalised to an empty list by the shaper; the
+    # important contract here is that we got a tabular shape with the id
+    # column on the left, not a bare 1-D ndarray.
     import pandas as pd
 
     assert isinstance(out, pd.DataFrame)
-    assert list(out.columns) == ["eta", "mean", "effective_se"]
+    assert list(out.columns) == ["person_id", "eta", "mean"]
 
 
 def test_standard_gam_with_interval_returns_table(monkeypatch: Any) -> None:
