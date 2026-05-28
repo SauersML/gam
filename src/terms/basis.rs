@@ -9406,6 +9406,84 @@ pub(crate) fn auto_shrink_bspline_config(
     Some((num_internal_knots, degree, shrunk))
 }
 
+/// Apply [`auto_shrink_bspline_config`] to a [`BSplineBasisSpec`] when the
+/// caller's `knotspec` is data-driven, returning the (possibly mutated) spec.
+///
+/// Touches only auto / generate-from-range knot specs; `Provided` and
+/// `PeriodicUniform` are pass-through because the caller has already
+/// hard-committed to a specific basis geometry.
+///
+/// When a shrink actually happens, an info-level log message is emitted so
+/// the decision is visible in fit logs and downstream model summaries.
+fn maybe_auto_shrink_bspline_spec(
+    spec: &BSplineBasisSpec,
+    n: usize,
+) -> BSplineBasisSpec {
+    match &spec.knotspec {
+        BSplineKnotSpec::Generate {
+            data_range,
+            num_internal_knots,
+        } => {
+            let Some((eff_interior, eff_degree, shrunk)) =
+                auto_shrink_bspline_config(n, *num_internal_knots, spec.degree)
+            else {
+                return spec.clone();
+            };
+            if !shrunk {
+                return spec.clone();
+            }
+            log::info!(
+                "B-spline auto-shrink (#340): n={} forced degree {}→{} and \
+                 interior knots {}→{} on Generate knotspec",
+                n,
+                spec.degree,
+                eff_degree,
+                num_internal_knots,
+                eff_interior,
+            );
+            let mut shrunk_spec = spec.clone();
+            shrunk_spec.degree = eff_degree;
+            shrunk_spec.knotspec = BSplineKnotSpec::Generate {
+                data_range: *data_range,
+                num_internal_knots: eff_interior,
+            };
+            shrunk_spec
+        }
+        BSplineKnotSpec::Automatic {
+            num_internal_knots,
+            placement,
+        } => {
+            let requested_interior = num_internal_knots
+                .unwrap_or_else(|| default_internal_knot_count_for_data(n, spec.degree));
+            let Some((eff_interior, eff_degree, shrunk)) =
+                auto_shrink_bspline_config(n, requested_interior, spec.degree)
+            else {
+                return spec.clone();
+            };
+            if !shrunk {
+                return spec.clone();
+            }
+            log::info!(
+                "B-spline auto-shrink (#340): n={} forced degree {}→{} and \
+                 interior knots {}→{} on Automatic knotspec",
+                n,
+                spec.degree,
+                eff_degree,
+                requested_interior,
+                eff_interior,
+            );
+            let mut shrunk_spec = spec.clone();
+            shrunk_spec.degree = eff_degree;
+            shrunk_spec.knotspec = BSplineKnotSpec::Automatic {
+                num_internal_knots: Some(eff_interior),
+                placement: *placement,
+            };
+            shrunk_spec
+        }
+        BSplineKnotSpec::Provided(_) | BSplineKnotSpec::PeriodicUniform { .. } => spec.clone(),
+    }
+}
+
 fn finite_data_range(data: ArrayView1<'_, f64>) -> Result<(f64, f64), BasisError> {
     if data.is_empty() {
         crate::bail_invalid_basis!("cannot infer knot range from empty data");

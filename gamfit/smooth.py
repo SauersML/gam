@@ -438,6 +438,19 @@ class Matern(Smooth):
         from ._basis_eval import matern_evaluate_numpy
         return matern_evaluate_numpy(self, coords)
 
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        out = super().to_rust_descriptor()
+        if self.centers is not None:
+            if isinstance(self.centers, int):
+                out["n_centers"] = int(self.centers)
+            else:
+                out["centers"] = _array_to_list(self.centers)
+        out["nu"] = float(self.nu)
+        out["length_scale"] = float(self.length_scale)
+        if self.aniso_log_scales is not None:
+            out["aniso_log_scales"] = [float(v) for v in self.aniso_log_scales]
+        return out
+
     SUPPORTED_BACKENDS: ClassVar[frozenset[str]] = frozenset({"torch", "numpy", "jax"})
 
 
