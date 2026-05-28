@@ -6,7 +6,13 @@ pub struct PirlsGpuInput<'a> {
     pub weights: ArrayView1<'a, f64>,
     pub penalty_hessian: ArrayView2<'a, f64>,
     pub gradient: ArrayView1<'a, f64>,
-    pub lm_ridge: f64,
+    /// Temporary Levenberg–Marquardt damping; added to H for the solve
+    /// only. Never enters the exported `penalized_hessian`, `RidgePassport`,
+    /// EDF, REML curvature, or penalty term.
+    pub step_lm_lambda: f64,
+    /// Real model-objective ridge. Enters the exported `penalized_hessian`,
+    /// `RidgePassport`, EDF, REML curvature, and penalty term.
+    pub objective_ridge: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -28,7 +34,12 @@ pub struct PirlsStepStreamInput<'a> {
     pub weights: ArrayView1<'a, f64>,
     pub penalty_hessian: ArrayView2<'a, f64>,
     pub gradient: ArrayView1<'a, f64>,
-    pub lm_ridge: f64,
+    /// Temporary LM damping for this Newton solve step only. Added to H
+    /// before potrf; stripped out of the snapshotted `penalized_hessian`.
+    pub step_lm_lambda: f64,
+    /// Real model-objective ridge. Appears in the exported
+    /// `penalized_hessian` that flows to EDF / REML curvature.
+    pub objective_ridge: f64,
 }
 
 /// Stage 3.2 device-input variant of [`PirlsStepStreamInput`].
@@ -50,8 +61,12 @@ pub struct PirlsStepStreamDeviceInput<'a, 'b> {
     pub grad_eta_dev: &'b cudarc::driver::CudaSlice<f64>,
     /// Penalty Hessian Sλ in row-major host layout (p × p).
     pub penalty_hessian: ArrayView2<'b, f64>,
-    /// Levenberg-Marquardt diagonal ridge added to H before potrf.
-    pub lm_ridge: f64,
+    /// Temporary LM damping for this Newton solve step only. Added to H
+    /// before potrf; stripped out of the snapshotted `penalized_hessian`.
+    pub step_lm_lambda: f64,
+    /// Real model-objective ridge. Appears in the exported
+    /// `penalized_hessian` that flows to EDF / REML curvature.
+    pub objective_ridge: f64,
 }
 
 /// Shared, batch-wide GPU state for stream-pool sigma-cubature PIRLS.
@@ -846,6 +861,39 @@ extern "C" __global__ void linf_norm(
     }
     if (tid == 0) out[0] = sm[0];
 }
+
+extern "C" __global__ void negate_n(
+    double* __restrict__ v,
+    int n
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    v[i] = -v[i];
+}
+
+// OR-reduction over a u32 status array (length n).  Single-block;
+// same launch config as deviance_sum (1 block of 1024 threads).
+// out[0] receives the bitwise-OR of all status[i] for i in [0, n).
+extern "C" __global__ void status_or(
+    const unsigned int* __restrict__ status,
+    int n,
+    unsigned int* __restrict__ out
+) {
+    __shared__ unsigned int sm[1024];
+    int tid = threadIdx.x;
+    int bdim = blockDim.x;
+    unsigned int acc = 0u;
+    for (int i = tid; i < n; i += bdim) {
+        acc |= status[i];
+    }
+    sm[tid] = acc;
+    __syncthreads();
+    for (int stride = bdim / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) sm[tid] |= sm[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) out[0] = sm[0];
+}
 "#;
 
     static PIRLS_LOOP_CACHE: PtxModuleCache = PtxModuleCache::new();
@@ -970,14 +1018,14 @@ extern "C" __global__ void linf_norm(
         /// Jeffreys-logdet + hat-diagonal vector.
         pub firth: Option<crate::solver::pirls::FirthDiagnostics>,
         /// Canonical-basis transform `qs` (size `p × p`) that maps
-        /// transformed-basis β back to original coordinates. When
-        /// `Some`, the postpass populates
-        /// `PirlsLoopOutcome::beta_transformed = qsᵀ · beta` so the
-        /// CPU oracle's `PirlsResult::beta_transformed` field can be
-        /// stamped directly. When `None`, `beta_transformed = beta`
-        /// (identity transform — appropriate when the caller already
-        /// fit in transformed coordinates or has no canonical
-        /// reparameterization).
+        /// transformed-basis β to original coordinates via
+        /// `beta_original = qs · beta_transformed`. Carried on the
+        /// struct for callers that need original-coordinate β; the
+        /// postpass does **not** apply `qs` to the loop's β because
+        /// the GPU loop already solved in the transformed design
+        /// `X·Qs`, so the loop's β *is* `beta_transformed`. When
+        /// `None`, no reparameterization is active and transformed
+        /// and original coordinates coincide.
         pub qs: Option<ndarray::ArrayView2<'a, f64>>,
         /// Effective degrees of freedom at the converged mode, when
         /// the dispatch wirer has it precomputed (typical case: the
@@ -1019,9 +1067,10 @@ extern "C" __global__ void linf_norm(
         /// `PirlsLoopExtra::offset` when supplied, otherwise an empty
         /// array. Maps to `PirlsResult::final_offset`.
         pub final_offset: Array1<f64>,
-        /// β in the canonical transformed basis. Equals
-        /// `extra.qsᵀ · beta` when `extra.qs` is `Some`, otherwise
-        /// equals `beta`. Maps to `PirlsResult::beta_transformed`.
+        /// β in the canonical transformed basis. Always equals
+        /// `beta` because the GPU loop solved in the transformed
+        /// design `X·Qs`, so the loop's β is already transformed.
+        /// Maps to `PirlsResult::beta_transformed`.
         pub beta_transformed: Array1<f64>,
         /// Hessian-side `finalweights` after optional Fisher→observed
         /// promotion driven by `extra.exported_curvature`. Empty when
@@ -1499,10 +1548,12 @@ extern "C" __global__ void linf_norm(
                     }
                 };
 
-                let beta_transformed = match ext.qs {
-                    Some(qs_view) => qs_view.t().dot(&beta),
-                    None => beta.clone(),
-                };
+                // The GPU loop solves in the transformed design X·Qs, so
+                // the loop's β is already in transformed coordinates.
+                // beta_original = qs · beta_transformed (not applied here;
+                // callers that need original coordinates compute it from
+                // reparam_result.qs per the PirlsResult contract).
+                let beta_transformed = beta.clone();
 
                 let constraint_kkt = ext.linear_constraints.and_then(|lin| {
                     if lin.a.nrows() == 0 {
