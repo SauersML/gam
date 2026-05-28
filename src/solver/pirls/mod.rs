@@ -50,7 +50,11 @@ use crate::linalg::utils::{array_is_finite, inf_norm};
 mod convergence;
 mod damping;
 mod edf;
+mod gpu_dispatch;
+mod loop_driver;
 mod penalty;
+mod pls_solver;
+mod reweight;
 mod state;
 
 // Re-export public API that lived in the original flat file
