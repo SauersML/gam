@@ -6,19 +6,20 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: claude-merger
+  group: claude-merger-${{ github.ref }}
   cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  id-token: write
+  actions: write
 
 jobs:
   merge:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-    permissions:
-      contents: write
-      issues: write
-      pull-requests: write
-      id-token: write
-      actions: write
 
     steps:
       - uses: actions/checkout@v4
