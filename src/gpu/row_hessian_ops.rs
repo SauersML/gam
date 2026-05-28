@@ -33,6 +33,7 @@ use std::sync::OnceLock;
 #[cfg(target_os = "linux")]
 use cudarc::driver::{CudaModule, CudaStream, LaunchConfig, PushKernelArg};
 
+#[cfg(target_os = "linux")]
 use super::error::GpuError;
 #[cfg(target_os = "linux")]
 use crate::gpu::error::GpuResultExt;
@@ -488,6 +489,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn cpu_oracle_matches_handwritten_2x2() {
         // Two rows, r = 2 — small enough to verify by hand.
         // Row 0: H = [[2, 1], [1, 3]],  v = [1, -1]  => y = [1, -2]
@@ -515,6 +517,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn validate_rejects_mismatched_shapes() {
         let h_rows = vec![1.0; 8];
         let v_rows = vec![1.0; 3]; // wrong: should be 4 for n=2, r=2
