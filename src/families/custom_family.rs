@@ -668,7 +668,7 @@ pub struct ParameterBlockSpec {
     ///
     /// When `Some`, the solver consumes this matrix (typically
     /// `(k·n × p)` for `k` stacked channels — e.g. survival
-    /// `[exit; entry; deriv]` with `k = 3`) to evaluate `eta = stacked · β`.
+    /// `[exit; entry; deriv]` with `k = 3`) to evaluate `eta = stacked · β + stacked_offset`.
     /// The audit and shape policy NEVER read this field; they only ever
     /// inspect `design` (which always has `n_obs` rows).
     ///
@@ -677,7 +677,14 @@ pub struct ParameterBlockSpec {
     /// time-varying blocks).
     ///
     /// Read this field via [`Self::solver_design`], never directly.
+    ///
+    /// Invariant: when `stacked_design = Some(_)`, `stacked_offset` MUST
+    /// also be `Some(_)` and its length MUST equal `stacked_design.nrows()`.
     pub stacked_design: Option<DesignMatrix>,
+    /// Optional offset paired with [`Self::stacked_design`]. Same Option
+    /// state as `stacked_design` (both `Some` or both `None`).
+    /// Read via [`Self::solver_offset`].
+    pub stacked_offset: Option<Array1<f64>>,
 }
 
 impl std::fmt::Debug for ParameterBlockSpec {
@@ -721,6 +728,7 @@ impl ParameterBlockSpec {
             gauge_priority: 100,
             jacobian_callback: None,
             stacked_design: None,
+            stacked_offset: None,
         }
     }
 
@@ -737,6 +745,13 @@ impl ParameterBlockSpec {
     /// always equals `n_obs`, never `3·n_obs`.
     pub fn solver_design(&self) -> &DesignMatrix {
         self.stacked_design.as_ref().unwrap_or(&self.design)
+    }
+
+    /// Returns the offset paired with [`Self::solver_design`]. When
+    /// `stacked_offset = Some(o)` this returns `&o`; otherwise it falls
+    /// back to `&self.offset`.
+    pub fn solver_offset(&self) -> &Array1<f64> {
+        self.stacked_offset.as_ref().unwrap_or(&self.offset)
     }
 
     /// Returns the effective design `D_eff` for this block at β = 0 with no
