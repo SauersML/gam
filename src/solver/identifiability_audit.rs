@@ -1544,6 +1544,11 @@ fn channel_aware_aliased_pairs(
                     direction_a: dir_a,
                     direction_b: dir_b,
                     overlap,
+                    // Channel-aware path: no row-scaling bias correction;
+                    // the channel weighting already accounts for per-block
+                    // structure, and the row Jacobian operators are not
+                    // parameterised through eta_row_scaling here.
+                    bias_shift: 0.0,
                 });
             }
         }

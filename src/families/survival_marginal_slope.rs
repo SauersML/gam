@@ -19674,25 +19674,17 @@ pub fn fit_survival_marginal_slope_terms(
 
     // Phase-4b V+M-exact active cutover: when the parametric joint
     // design carries cross-block aliasing in the (q₀, q₁, q′₁, g) row
-    // primary state, residualise each block's terms against the
-    // cumulative anchor in the structural row metric (identity 4×4 H
-    // per row), wrap raw designs through `ResidualisedDesignOperator`
-    // (the exact `C_b·V_b − A_{<b}·R_b` row form), and pull each
-    // per-term penalty back through the full triangular T (V's on the
-    // diagonal, `−R_{a→b}` off-diagonals). The inner Newton then
-    // operates on a rank-clean reparameterised joint design; at fit
-    // result the joint β is lifted via `T · θ` back to raw width so
-    // predict-time consumes raw β unchanged.
+    // primary state, build the channel-aware Gram (K^H, K^S) via
+    // `build_primary_grams_gpu_or_cpu`, compile a global T via
+    // `compile_from_raw_grams`, and apply it through
+    // `apply_compiled_map_to_designs`. The inner Newton then operates
+    // on a rank-clean reparameterised joint design; at fit result the
+    // joint β is lifted via `T · θ` back to raw width so predict-time
+    // consumes raw β unchanged.
     //
-    // When no aliasing is detected (drops_by_block == (0, 0, 0) for the
-    // structural pass) the cutover is a no-op: raw designs / penalties
+    // When no aliasing is detected (all compiled block widths equal
+    // their raw widths) the cutover is a no-op: raw designs / penalties
     // propagate forward and `smgs_lift_v` stays None.
-    //
-    // The preflight observability block earlier already runs the same
-    // structural compile and logs the drops_by_block summary. This site
-    // re-runs the compile (cheap relative to the inner solve) and
-    // additionally applies the V+M-exact per-term construction when
-    // reduction is needed.
     // Recompile-after-first-PIRLS-accept context. Captured inside the
     // cutover branch so we can re-run `compile_survival_parametric_designs_per_term`
     // against a data-adaptive row Hessian built at the converged β, then
