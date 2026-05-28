@@ -698,7 +698,7 @@ fn gpu_pirls_gating_7_status_or_reduce() {
 // ---------------------------------------------------------------------------
 #[test]
 fn gpu_pirls_gating_8_benchmark_baseline_uses_cpu_oracle() {
-    if !cuda_selected() {
+    if let GpuGate::Skip = gpu_gate("gpu_pirls_gating_8_benchmark_baseline_uses_cpu_oracle") {
         return;
     }
 
