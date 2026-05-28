@@ -1,6 +1,7 @@
 use super::*;
 use super::family::*;
 use super::gradient_paths::*;
+use super::hessian_paths::*;
 use super::install_flex::validate_spec;
 
 // ── BlockEffectiveJacobian impls for BMS ─────────────────────────────────────
@@ -107,7 +108,7 @@ struct BmsLogslopeJacobian {
     logslope_dense: Arc<Array2<f64>>,
     offset_m: Array1<f64>,
     offset_s: Array1<f64>,
-    z: Arc<[f64]>,
+    z: Arc<Array1<f64>>,
     /// Number of marginal columns (= start of β_s in the full β vector).
     p_marginal: usize,
 }
@@ -233,7 +234,7 @@ fn build_logslope_blockspec_bms(
     marginal_design: &TermCollectionDesign,
     marginal_offset: &Array1<f64>,
     marginal_baseline: f64,
-    z: Arc<[f64]>,
+    z: Arc<Array1<f64>>,
     p_marginal: usize,
 ) -> Result<ParameterBlockSpec, String> {
     let offset_s = offset + baseline;
