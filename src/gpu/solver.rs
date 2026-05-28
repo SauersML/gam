@@ -97,6 +97,322 @@ mod cuda {
         Ok(lower)
     }
 
+    // -----------------------------------------------------------------------
+    // fp32 helpers: Cholesky factorization and triangular solve in f32
+    // -----------------------------------------------------------------------
+
+    /// Compute the cuSOLVER workspace size for a p×p fp32 Cholesky.
+    fn spotrf_lwork(
+        solver: &DnHandle,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        p: usize,
+    ) -> Result<usize, String> {
+        let p_i = to_i32(p)?;
+        let uplo = cusolver_sys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER;
+        let mut lwork = 0_i32;
+        let mut dummy = stream
+            .alloc_zeros::<f32>(p.checked_mul(p).ok_or("p² overflow")?)
+            .map_err(|e| format!("alloc f32 dummy: {e}"))?;
+        {
+            let (ptr, _rec) = dummy.device_ptr_mut(stream);
+            // SAFETY: buffer-size query; dummy is a live p*p f32 device buffer.
+            let status = unsafe {
+                cusolver_sys::cusolverDnSpotrf_bufferSize(
+                    solver.cu(),
+                    uplo,
+                    p_i,
+                    ptr as *mut f32,
+                    p_i,
+                    &mut lwork,
+                )
+            };
+            check_cusolver(status, "cusolverDnSpotrf_bufferSize")?;
+        }
+        usize::try_from(lwork).map_err(|_| "negative spotrf lwork".to_string())
+    }
+
+    /// Factor a p×p symmetric positive-definite f32 device buffer in-place
+    /// (lower-triangular Cholesky). Returns `Err` if the matrix is
+    /// singular/indefinite.
+    fn spotrf_in_place(
+        solver: &DnHandle,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        p: usize,
+        a: &mut CudaSlice<f32>,
+    ) -> Result<(), String> {
+        let p_i = to_i32(p)?;
+        let lwork = spotrf_lwork(solver, stream, p)?;
+        let mut workspace = stream
+            .alloc_zeros::<f32>(lwork.max(1))
+            .map_err(|e| format!("alloc spotrf workspace: {e}"))?;
+        let mut info = stream
+            .alloc_zeros::<i32>(1)
+            .map_err(|e| format!("alloc spotrf info: {e}"))?;
+        let uplo = cusolver_sys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER;
+        {
+            let (a_ptr, _a_rec) = a.device_ptr_mut(stream);
+            let (work_ptr, _work_rec) = workspace.device_ptr_mut(stream);
+            let (info_ptr, _info_rec) = info.device_ptr_mut(stream);
+            // SAFETY: cuSOLVER Spotrf; a is p*p col-major f32, workspace was
+            // sized by Spotrf_bufferSize, info is a 1-element i32 device buffer.
+            let status = unsafe {
+                cusolver_sys::cusolverDnSpotrf(
+                    solver.cu(),
+                    uplo,
+                    p_i,
+                    a_ptr as *mut f32,
+                    p_i,
+                    work_ptr as *mut f32,
+                    i32::try_from(lwork.max(1)).map_err(|_| "lwork i32 overflow")?,
+                    info_ptr as *mut i32,
+                )
+            };
+            check_cusolver(status, "cusolverDnSpotrf")?;
+        }
+        let info_host = stream
+            .clone_dtoh(&info)
+            .map_err(|e| format!("download spotrf info: {e}"))?;
+        if info_host[0] == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "cusolverDnSpotrf returned info={} (matrix not SPD at f32)",
+                info_host[0]
+            ))
+        }
+    }
+
+    /// Triangular solve using a pre-factored fp32 Cholesky lower-triangle.
+    /// Solves `A · x = rhs` in-place into `rhs` (column-major, p × nrhs).
+    fn spotrs_in_place(
+        solver: &DnHandle,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        p: usize,
+        nrhs: usize,
+        factor: &CudaSlice<f32>,
+        rhs: &mut CudaSlice<f32>,
+    ) -> Result<(), String> {
+        let p_i = to_i32(p)?;
+        let nrhs_i = to_i32(nrhs)?;
+        let uplo = cusolver_sys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER;
+        let mut info = stream
+            .alloc_zeros::<i32>(1)
+            .map_err(|e| format!("alloc spotrs info: {e}"))?;
+        {
+            let (f_ptr, _f_rec) = factor.device_ptr(stream);
+            let (r_ptr, _r_rec) = rhs.device_ptr_mut(stream);
+            let (info_ptr, _info_rec) = info.device_ptr_mut(stream);
+            // SAFETY: cuSOLVER Spotrs; factor is p*p lower-triangular f32 from
+            // Spotrf, rhs is p*nrhs col-major f32, info is 1-element i32 device.
+            let status = unsafe {
+                cusolver_sys::cusolverDnSpotrs(
+                    solver.cu(),
+                    uplo,
+                    p_i,
+                    nrhs_i,
+                    f_ptr as *const f32,
+                    p_i,
+                    r_ptr as *mut f32,
+                    p_i,
+                    info_ptr as *mut i32,
+                )
+            };
+            check_cusolver(status, "cusolverDnSpotrs")?;
+        }
+        let info_host = stream
+            .clone_dtoh(&info)
+            .map_err(|e| format!("download spotrs info: {e}"))?;
+        if info_host[0] == 0 {
+            Ok(())
+        } else {
+            Err(format!("cusolverDnSpotrs returned info={}", info_host[0]))
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // fp64 DGEMV residual: r = b − A·x in double precision
+    // -----------------------------------------------------------------------
+
+    /// Compute `r = b − A·x` in fp64 where A is p×p and x, b, r are length p.
+    ///
+    /// Overwrites the output buffer `r_dev` with the residual. Uses
+    /// `cublasDgemv` (CUBLAS_OP_N): `r = 1·A·x + 0·0 = A·x`, then the host
+    /// subtracts from b. Because p is small here (the policy gates on p ≥ 64
+    /// and the Newton system is p×p), downloading the p-vector for the host
+    /// subtract is cheap relative to the GEMV.
+    fn residual_norm_and_vec(
+        blas: &CudaBlas,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        p: usize,
+        a_dev: &CudaSlice<f64>,
+        x_dev: &CudaSlice<f64>,
+        b_host: &[f64],
+    ) -> Result<(Vec<f64>, f64), String> {
+        let p_i = to_i32(p)?;
+        // ax_dev = A · x
+        let mut ax_dev = stream
+            .alloc_zeros::<f64>(p)
+            .map_err(|e| format!("alloc ax: {e}"))?;
+        {
+            let cfg = GemvConfig::<f64> {
+                trans: cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                m: p_i,
+                n: p_i,
+                alpha: 1.0_f64,
+                lda: p_i,
+                incx: 1,
+                beta: 0.0_f64,
+                incy: 1,
+            };
+            // SAFETY: cuBLAS Dgemv; a_dev is p*p col-major f64, x_dev is
+            // length-p f64, ax_dev is length-p output; all on the same stream.
+            unsafe { blas.gemv(cfg, a_dev, x_dev, &mut ax_dev) }
+                .map_err(|e| format!("cublasDgemv for residual: {e}"))?;
+        }
+        let ax_host = stream
+            .clone_dtoh(&ax_dev)
+            .map_err(|e| format!("download A·x: {e}"))?;
+        // r = b − A·x  (host subtract; p is small)
+        let r: Vec<f64> = b_host
+            .iter()
+            .zip(ax_host.iter())
+            .map(|(bi, axi)| bi - axi)
+            .collect();
+        let norm_r = r.iter().map(|v| v * v).sum::<f64>().sqrt();
+        Ok((r, norm_r))
+    }
+
+    // -----------------------------------------------------------------------
+    // Iterative refinement: fp32 factor → fp32 solve → fp64 residual loop
+    // -----------------------------------------------------------------------
+
+    /// Solve `A x = b` using an fp32 Cholesky factorization with up to
+    /// `max_steps` fp64-residual iterative refinement corrections.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Cast `A` (f64) to f32 on device. Factor in fp32 (POTRF).
+    /// 2. Cast `b` (f64) to f32. Solve `A x = b` in fp32 (POTRS). Lift `x`
+    ///    to f64.
+    /// 3. Loop up to `max_steps`:
+    ///    a. `r = b − A·x` accumulated in fp64 (cuBLAS Dgemv).
+    ///    b. `‖r‖ / ‖b‖ ≤ tol` → converged, break.
+    ///    c. Residual did not drop below previous step → bail, return `Err`.
+    ///    d. Cast `r` to f32. Solve `A e = r` in fp32. `x += e` (f64).
+    /// 4. Return `(x, ‖r‖/‖b‖, refinement_steps)`.
+    ///
+    /// Returns `Err` when the fp32 POTRF fails (not SPD at f32) or when the
+    /// residual does not decrease monotonically (κ(A)·u_f32 ≥ 1 regime).
+    /// Callers should fall back to fp64 POTRF on `Err`.
+    pub(super) fn iterative_refinement_solve_impl(
+        hessian: ArrayView2<'_, f64>,
+        rhs: &[f64],
+    ) -> Result<super::RefinementOutcome, String> {
+        use crate::gpu::policy::GpuDispatchPolicy;
+        let (p, p2) = hessian.dim();
+        if p == 0 || p != p2 || rhs.len() != p {
+            return Err("iterative_refinement_solve: dimension mismatch".to_string());
+        }
+        let max_steps = GpuDispatchPolicy::REFINEMENT_MAX_STEPS;
+        let tol = GpuDispatchPolicy::REFINEMENT_TOL;
+
+        let (_, stream) = context_and_stream()?;
+        let solver = DnHandle::new(stream.clone()).map_err(|e| format!("cusolver init: {e}"))?;
+        let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("cublas init: {e}"))?;
+
+        // Upload fp64 hessian for residual GEMV.
+        let h_col_f64 = to_col_major(&hessian);
+        let a_dev_f64 = pinned_htod(&stream, &h_col_f64)?;
+
+        // Cast A to f32 and upload.
+        let h_col_f32: Vec<f32> = h_col_f64.iter().map(|&v| v as f32).collect();
+        let mut a_dev_f32 = pinned_htod(&stream, &h_col_f32)
+            .map_err(|e| format!("upload f32 A: {e}"))?;
+
+        // fp32 POTRF — returns Err if A is not SPD at f32 precision.
+        spotrf_in_place(&solver, &stream, p, &mut a_dev_f32)?;
+
+        // Cast b to f32 and upload; solve in fp32.
+        let b_f32: Vec<f32> = rhs.iter().map(|&v| v as f32).collect();
+        let mut x_dev_f32 = pinned_htod(&stream, &b_f32)
+            .map_err(|e| format!("upload f32 rhs: {e}"))?;
+        spotrs_in_place(&solver, &stream, p, 1, &a_dev_f32, &mut x_dev_f32)?;
+
+        // Lift x to f64.
+        let x_f32 = stream
+            .clone_dtoh(&x_dev_f32)
+            .map_err(|e| format!("download f32 x: {e}"))?;
+        let mut x: Vec<f64> = x_f32.iter().map(|&v| v as f64).collect();
+
+        // Compute ‖b‖ for relative residual.
+        let norm_b = rhs.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let norm_b_safe = if norm_b > 0.0 { norm_b } else { 1.0 };
+
+        let mut x_dev_f64 = pinned_htod(&stream, &x)
+            .map_err(|e| format!("upload f64 x: {e}"))?;
+        let (r0, norm_r0) = residual_norm_and_vec(&blas, &stream, p, &a_dev_f64, &x_dev_f64, rhs)?;
+        let mut rel_residual = norm_r0 / norm_b_safe;
+
+        // Early exit: already converged after initial solve.
+        if rel_residual <= tol {
+            return Ok(super::RefinementOutcome {
+                solution: ndarray::Array1::from_vec(x),
+                relative_residual: rel_residual,
+                used_fp32_factor: true,
+                refinement_steps: 0,
+            });
+        }
+
+        let mut r = r0;
+        let mut prev_norm_r = norm_r0;
+        let mut steps_taken = 0_usize;
+
+        for _ in 0..max_steps {
+            // Cast residual to f32, solve A e = r in fp32.
+            let r_f32: Vec<f32> = r.iter().map(|&v| v as f32).collect();
+            let mut e_dev_f32 = pinned_htod(&stream, &r_f32)
+                .map_err(|e| format!("upload f32 residual: {e}"))?;
+            spotrs_in_place(&solver, &stream, p, 1, &a_dev_f32, &mut e_dev_f32)?;
+
+            // x += e in f64.
+            let e_f32 = stream
+                .clone_dtoh(&e_dev_f32)
+                .map_err(|e| format!("download f32 e: {e}"))?;
+            for (xi, ei) in x.iter_mut().zip(e_f32.iter()) {
+                *xi += *ei as f64;
+            }
+            steps_taken += 1;
+
+            // Reupload x_dev_f64 and compute new residual.
+            x_dev_f64 = pinned_htod(&stream, &x)
+                .map_err(|e| format!("upload refined x: {e}"))?;
+            let (r_new, norm_r_new) =
+                residual_norm_and_vec(&blas, &stream, p, &a_dev_f64, &x_dev_f64, rhs)?;
+            rel_residual = norm_r_new / norm_b_safe;
+
+            // Check monotone decrease. Non-monotone → κ(A)·u ≥ 1.
+            if norm_r_new >= prev_norm_r {
+                return Err(format!(
+                    "iterative refinement: residual not decreasing ({norm_r_new:.3e} ≥ {prev_norm_r:.3e}); \
+                     κ(A)·u_f32 ≥ 1, cannot refine"
+                ));
+            }
+            prev_norm_r = norm_r_new;
+            r = r_new;
+
+            if rel_residual <= tol {
+                break;
+            }
+        }
+
+        Ok(super::RefinementOutcome {
+            solution: ndarray::Array1::from_vec(x),
+            relative_residual: rel_residual,
+            used_fp32_factor: true,
+            refinement_steps: steps_taken,
+        })
+    }
+
     pub(crate) fn context_and_stream() -> Result<
         (
             std::sync::Arc<CudaContext>,

@@ -183,6 +183,63 @@ extern "C" __global__ void chol_logdet_col_major(
 
     static CHOL_LOGDET_CACHE: PtxModuleCache = PtxModuleCache::new();
 
+    /// When `p` is below this threshold the workspace uses the fused
+    /// `xtwx_lower` + `xtscore` + `symmetrize_lower` kernels and omits the
+    /// `n*p` `wx_dev` temporary entirely. For `p >= FUSED_XTWX_P_THRESHOLD`
+    /// the existing `ddgmm + dgemm` path is used.
+    const FUSED_XTWX_P_THRESHOLD: usize = 256;
+
+    /// NVRTC kernels for the fused path.
+    ///
+    /// `xtwx_lower`: one thread per lower-tri pair `(j,k)` with `j >= k`;
+    /// iterates over `n` rows, writes `A[j + k*p]` (col-major lower triangle).
+    ///
+    /// `xtscore`: one thread per `j`; writes `s[j] = sum_i score[i]*X[i,j]`.
+    ///
+    /// `symmetrize_lower`: one thread per strict-lower pair `(j,k)` with
+    /// `j > k`; copies `A[k + j*p] = A[j + k*p]` to fill the upper triangle.
+    const FUSED_XTWX_PTX_SOURCE: &str = concat!(
+        "extern \"C\" __global__ void xtwx_lower(",
+        "const double* __restrict__ X,",
+        "const double* __restrict__ w,",
+        "double* __restrict__ A,",
+        "int n, int p) {",
+        "int t=blockIdx.x*blockDim.x+threadIdx.x;",
+        "int np=p*(p+1)/2; if(t>=np)return;",
+        "int kv=(int)((__dsqrt_rn((double)(8*t+1))-1.0)*0.5);",
+        "while((kv+1)*(kv+2)/2<=t)kv++;",
+        "while(kv>0&&kv*(kv+1)/2>t)kv--;",
+        "int jv=t-kv*(kv+1)/2+kv;",
+        "double acc=0.0;",
+        "const double*Xj=X+(long long)jv*n;",
+        "const double*Xk=X+(long long)kv*n;",
+        "for(int i=0;i<n;++i)acc+=w[i]*Xj[i]*Xk[i];",
+        "A[jv+(long long)kv*p]=acc;}",
+        "extern \"C\" __global__ void xtscore(",
+        "const double* __restrict__ X,",
+        "const double* __restrict__ score,",
+        "double* __restrict__ s,",
+        "int n, int p) {",
+        "int j=blockIdx.x*blockDim.x+threadIdx.x;",
+        "if(j>=p)return;",
+        "double acc=0.0;",
+        "const double*Xj=X+(long long)j*n;",
+        "for(int i=0;i<n;++i)acc+=score[i]*Xj[i];",
+        "s[j]=acc;}",
+        "extern \"C\" __global__ void symmetrize_lower(",
+        "double* __restrict__ A, int p) {",
+        "int ns=p*(p-1)/2;",
+        "int t=blockIdx.x*blockDim.x+threadIdx.x;",
+        "if(t>=ns)return;",
+        "int kv=(int)((__dsqrt_rn((double)(8*t+1))-1.0)*0.5);",
+        "while((kv+1)*(kv+2)/2<=t)kv++;",
+        "while(kv>0&&kv*(kv+1)/2>t)kv--;",
+        "int jv=t-kv*(kv+1)/2+kv+1;",
+        "A[kv+(long long)jv*p]=A[jv+(long long)kv*p];}",
+    );
+
+    static FUSED_XTWX_CACHE: PtxModuleCache = PtxModuleCache::new();
+
     impl PirlsGpuSharedData {
         /// Upload `x` to the cached per-ordinal CUDA context and return a
         /// shared batch handle.  One upload, many sigma fits.
