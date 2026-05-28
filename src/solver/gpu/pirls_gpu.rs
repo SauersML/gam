@@ -279,9 +279,16 @@ extern "C" __global__ void chol_logdet_col_major(
                 DnHandle::new(stream.clone()).map_err(|e| format!("cusolver init: {e}"))?;
             let np = n.checked_mul(p).ok_or("X size overflow")?;
             let pp = p.checked_mul(p).ok_or("H size overflow")?;
-            let wx_dev = stream
-                .alloc_zeros::<f64>(np)
-                .map_err(|e| format!("cuda alloc WX: {e}"))?;
+            // Skip the n*p WX scratch when the fused kernels will be used.
+            let wx_dev = if p >= FUSED_XTWX_P_THRESHOLD {
+                Some(
+                    stream
+                        .alloc_zeros::<f64>(np)
+                        .map_err(|e| format!("cuda alloc WX: {e}"))?,
+                )
+            } else {
+                None
+            };
             let w_dev = stream
                 .alloc_zeros::<f64>(n)
                 .map_err(|e| format!("cuda alloc W: {e}"))?;
@@ -1666,6 +1673,9 @@ extern "C" __global__ void status_or(
         loop_ws: &mut PirlsLoopWorkspace,
         family: crate::gpu::pirls_row::PirlsRowFamily,
         curvature: crate::gpu::pirls_row::CurvatureMode,
+        /// Active Gamma dispersion shape (α > 0). Forwarded to every
+        /// `launch_row_reweight_on_stream` call. Pass `1.0` for non-Gamma fits.
+        gamma_shape: f64,
         beta0_host: ArrayView1<'_, f64>,
         y_host: ArrayView1<'_, f64>,
         prior_w_host: ArrayView1<'_, f64>,
@@ -2239,6 +2249,7 @@ extern "C" __global__ void status_or(
                     final_lm_lambda: step_lm_lambda,
                     min_deviance: diagnostics.min_deviance,
                     max_abs_eta,
+                    per_row_status_or: final_row_status,
                 })
             }
         }

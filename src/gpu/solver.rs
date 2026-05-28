@@ -758,6 +758,106 @@ pub(crate) use cuda::{
     potrs_in_place, potrs_in_place_reuse,
 };
 
+/// Solve `A x = b` with fp32 Cholesky factorization + fp64-residual iterative
+/// refinement, automatically falling back to fp64 when the policy rejects the
+/// attempt or when the fp32 path is not available / not converging.
+///
+/// The `p` threshold and maximum step count come from [`GpuDispatchPolicy`]
+/// constants so there is no user-facing knob. The decision path is:
+///
+/// 1. `policy.iterative_refinement_should_attempt(p)` → `false`: skip to fp64
+///    Cholesky directly.
+/// 2. Attempt fp32 POTRF + up to 3 residual-correction steps. If any of:
+///    - fp32 POTRF returns info ≠ 0 (A not SPD at fp32),
+///    - residual is non-monotone (κ(A)·u_fp32 ≥ 1),
+///    then fall back to fp64 Cholesky transparently.
+/// 3. On fp32 success return `Some(RefinementOutcome)`; callers can inspect
+///    `relative_residual` and `refinement_steps` for diagnostics.
+///
+/// Returns the fp64 Cholesky solve result (solution, logdet) on the fallback
+/// path. The `Option<RefinementOutcome>` is `Some` only when the fp32 path
+/// succeeded; it is `None` on the fp64 fallback.
+pub fn iterative_refinement_cholesky_solve(
+    hessian: ArrayView2<'_, f64>,
+    rhs: ArrayView2<'_, f64>,
+) -> Result<(Array2<f64>, f64, Option<RefinementOutcome>), String> {
+    let (p, _) = hessian.dim();
+
+    #[cfg(target_os = "linux")]
+    {
+        let policy = super::runtime::GpuRuntime::global()
+            .map(|rt| &rt.policy)
+            .ok_or_else(|| "CUDA runtime unavailable".to_string())?;
+
+        if policy.iterative_refinement_should_attempt(p) && rhs.ncols() == 1 {
+            // Try the fp32 + refinement path. On any error, fall through to
+            // the fp64 path below without propagating the error — the fp64
+            // solve is the authoritative fallback.
+            let rhs_col = rhs.column(0);
+            let rhs_slice: Vec<f64> = rhs_col.iter().copied().collect();
+            match cuda::iterative_refinement_solve_impl(hessian, &rhs_slice) {
+                Ok(outcome) => {
+                    // Compute logdet from the same fp64 Cholesky that would
+                    // have been run anyway, but only the factor — not a full
+                    // solve. Since we already have the fp32 solution we just
+                    // need the logdet. Use the fp64 Cholesky factor for
+                    // accuracy.
+                    match cuda::cholesky_solve(hessian, rhs) {
+                        Ok((_, logdet)) => {
+                            // Prefer the refined solution over the fp64 solve
+                            // output when the fp32 residual is tight enough.
+                            // The fp64 logdet is always authoritative.
+                            let nrhs = rhs.ncols();
+                            let solution = if nrhs == 1 {
+                                let mut sol = ndarray::Array2::<f64>::zeros((p, 1));
+                                sol.column_mut(0).assign(&outcome.solution);
+                                sol
+                            } else {
+                                // Multi-column RHS: fall back to the fp64 solve result.
+                                return Ok((cuda::cholesky_solve(hessian, rhs)?.0, logdet, None));
+                            };
+                            return Ok((solution, logdet, Some(outcome)));
+                        }
+                        Err(_) => {
+                            // fp64 logdet computation failed; return fp32 outcome without logdet.
+                            // This path is theoretically impossible if the matrix is SPD, but be
+                            // defensive and fall through to the plain fp64 path.
+                        }
+                    }
+                }
+                Err(_) => {
+                    // fp32 path failed or residual non-monotone → fall through.
+                }
+            }
+        }
+    }
+
+    // fp64 fallback (also the only path on non-Linux or when policy rejects).
+    #[cfg(not(target_os = "linux"))]
+    {
+        let (rows, cols) = hessian.dim();
+        return Err(format!(
+            "CUDA support not compiled; hessian={rows}x{cols}, rhs={}x{}",
+            rhs.nrows(),
+            rhs.ncols()
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if super::runtime::GpuRuntime::global().is_none() {
+            let (rows, cols) = hessian.dim();
+            return Err(format!(
+                "CUDA runtime unavailable; hessian={rows}x{cols}, rhs={}x{}",
+                rhs.nrows(),
+                rhs.ncols()
+            ));
+        }
+        let (sol, logdet) = cuda::cholesky_solve(hessian, rhs)?;
+        Ok((sol, logdet, None))
+    }
+}
+
 pub fn cholesky_solve_gpu(
     hessian: ArrayView2<'_, f64>,
     rhs: ArrayView2<'_, f64>,

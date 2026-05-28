@@ -1297,6 +1297,10 @@ impl std::fmt::Debug for ArrowSchurInnerConfig {
             .field("solver_mode", &self.solver_mode)
             .field("streaming_chunk_size", &self.streaming_chunk_size)
             .field("trust_region_radius", &self.trust_region_radius)
+            .field(
+                "block_offsets",
+                &self.block_offsets.as_ref().map(|o| o.len()),
+            )
             .finish_non_exhaustive()
     }
 }

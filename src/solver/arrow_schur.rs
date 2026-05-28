@@ -605,9 +605,21 @@ fn row_hessian_fingerprint_for_system(sys: &ArrowSchurSystem) -> u64 {
     hasher.write_usize(sys.rows.len());
     hasher.write_usize(sys.d);
     hasher.write_usize(sys.k);
+    // When htbeta_matvec is installed (Kronecker / matrix-free path),
+    // row.htbeta is a zero slab that does not capture the operator state.
+    // Hash the Arc pointer address as a proxy: a new Arc is allocated per
+    // assemble call, so the fingerprint is invalidated each time the system
+    // is rebuilt with a fresh Kronecker operator.
+    let htbeta_op_addr: Option<usize> = sys
+        .htbeta_matvec
+        .as_ref()
+        .map(|op| Arc::as_ptr(op) as usize);
     for row in sys.rows.iter() {
         write_array2_fingerprint(&mut hasher, &row.htt);
-        write_array2_fingerprint(&mut hasher, &row.htbeta);
+        match htbeta_op_addr {
+            Some(addr) => hasher.write_usize(addr),
+            None => write_array2_fingerprint(&mut hasher, &row.htbeta),
+        }
     }
     write_array2_fingerprint(&mut hasher, &sys.hbb);
     match sys.hbb_diag.as_ref() {

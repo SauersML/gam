@@ -14068,28 +14068,60 @@ impl BernoulliMarginalSlopeFamily {
                         .map(|range| Array2::<f64>::zeros((range.len(), range.len())));
                     let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
                     for (local, row) in (start..end).enumerate() {
-                        let row_ctx = Self::row_ctx(cache, row);
-                        let cached_hessian = Self::cached_row_primary_hessian(cache, row);
-                        let row_moments = cache
-                            .row_cell_moments
-                            .as_ref()
-                            .and_then(|bundle| bundle.row(row, 9));
-                        let neglog = self.compute_row_analytic_flex_into_with_moments(
-                            row,
-                            block_states,
-                            primary,
-                            row_ctx,
-                            row_moments,
-                            cached_hessian.is_none(),
-                            &mut scratch,
-                        )?;
+                        // When both neglog+grad+hess are cached (Host variant),
+                        // consume them directly — no second row kernel pass.
+                        let cached_hessian;
+                        let neglog;
+                        let grad_src: &dyn std::ops::Index<usize, Output = f64>;
+                        // We need a stable place for the cached grad row.
+                        let cached_grad_row_storage;
+                        if let Some((cached_neglog, cached_grad_row)) =
+                            Self::cached_row_primary_eval(cache, row)
+                        {
+                            neglog = cached_neglog;
+                            // The cached grad row is an ArrayView1; we hold it.
+                            cached_grad_row_storage = Some(cached_grad_row);
+                            let cached_hess =
+                                Self::cached_row_primary_hessian(cache, row);
+                            cached_hessian = cached_hess;
+                        } else {
+                            // Cache miss (device-resident or no cache): run the
+                            // row kernel once for neglog + grad + (maybe) hess.
+                            cached_grad_row_storage = None;
+                            let row_ctx = Self::row_ctx(cache, row);
+                            let cached_hess =
+                                Self::cached_row_primary_hessian(cache, row);
+                            let row_moments = cache
+                                .row_cell_moments
+                                .as_ref()
+                                .and_then(|bundle| bundle.row(row, 9));
+                            let computed_neglog =
+                                self.compute_row_analytic_flex_into_with_moments(
+                                    row,
+                                    block_states,
+                                    primary,
+                                    row_ctx,
+                                    row_moments,
+                                    cached_hess.is_none(),
+                                    &mut scratch,
+                                )?;
+                            neglog = computed_neglog;
+                            cached_hessian = cached_hess;
+                        }
+                        // Resolve grad source: cached row or scratch.grad.
+                        let grad_ref: &dyn std::ops::Index<usize, Output = f64> =
+                            if let Some(ref cgr) = cached_grad_row_storage {
+                                cgr
+                            } else {
+                                &scratch.grad
+                            };
                         acc.0 -= neglog;
                         {
                             let mut marginal = acc.1.view_mut();
                             self.marginal_design.axpy_row_into(
                                 row,
                                 Self::exact_newton_score_component_from_objective_gradient(
-                                    scratch.grad[0],
+                                    grad_ref[0],
                                 ),
                                 &mut marginal,
                             )?;
@@ -14099,7 +14131,7 @@ impl BernoulliMarginalSlopeFamily {
                             self.logslope_design.axpy_row_into(
                                 row,
                                 Self::exact_newton_score_component_from_objective_gradient(
-                                    scratch.grad[1],
+                                    grad_ref[1],
                                 ),
                                 &mut logslope,
                             )?;
@@ -14110,7 +14142,7 @@ impl BernoulliMarginalSlopeFamily {
                             for idx in 0..primary_h.len() {
                                 grad_h[idx] +=
                                     Self::exact_newton_score_component_from_objective_gradient(
-                                        scratch.grad[primary_h.start + idx],
+                                        grad_ref[primary_h.start + idx],
                                     );
                             }
                         }
@@ -14120,7 +14152,7 @@ impl BernoulliMarginalSlopeFamily {
                             for idx in 0..primary_w.len() {
                                 grad_w[idx] +=
                                     Self::exact_newton_score_component_from_objective_gradient(
-                                        scratch.grad[primary_w.start + idx],
+                                        grad_ref[primary_w.start + idx],
                                     );
                             }
                         }
