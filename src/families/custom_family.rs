@@ -3274,7 +3274,7 @@ pub struct OuterEvalContext {
 }
 
 /// Stable public API for installing outer-score subsampling.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct BlockwiseFitOptions {
     pub inner_max_cycles: usize,
     pub inner_tol: f64,
