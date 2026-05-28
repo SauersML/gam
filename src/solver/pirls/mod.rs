@@ -78,6 +78,7 @@ use penalty::{
 };
 use convergence::effective_kkt_tolerance;
 use pls_solver::solve_penalized_least_squares_implicit;
+pub use pls_solver::{GaussianFixedCache, SparseXtwxPrecomputed};
 
 const GAMMA_SHAPE_MIN: f64 = 1e-8;
 const GAMMA_SHAPE_MAX: f64 = 1e12;
@@ -8181,11 +8182,11 @@ mod root_cause_tests {
     where
         F: FnOnce() -> R,
     {
-        super::test_support::PIRLS_PENALIZED_DEVIANCE_TRACE.with(|trace| {
+        super::reweight::test_support::PIRLS_PENALIZED_DEVIANCE_TRACE.with(|trace| {
             *trace.borrow_mut() = Some(Vec::new());
         });
         let result = run();
-        let captured = super::test_support::PIRLS_PENALIZED_DEVIANCE_TRACE
+        let captured = super::reweight::test_support::PIRLS_PENALIZED_DEVIANCE_TRACE
             .with(|trace| trace.borrow_mut().take().unwrap());
         (result, captured)
     }
