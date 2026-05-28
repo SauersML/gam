@@ -3200,12 +3200,15 @@ fn build_dense_schur_direct<B: BatchedBlockSolver>(
     backend: &B,
 ) -> Result<Array2<f64>, ArrowSchurError> {
     let k = sys.k;
-    if sys.hbb.dim() != (k, k) {
+    // Materialise H_ββ via the BetaPenaltyOp trait (#296): DensePenaltyOp
+    // for the legacy dense path, structured ops for SAE / Kronecker smooths.
+    let op = sys.effective_penalty_op();
+    if op.dim() != k {
         return Err(ArrowSchurError::SchurFactorFailed {
-            reason: "Direct BA requires a dense K×K shared H_ββ block".to_string(),
+            reason: "Direct BA requires a K×K shared H_ββ penalty operator".to_string(),
         });
     }
-    let mut schur = sys.hbb.clone();
+    let mut schur = op.to_dense();
     for j in 0..k {
         schur[[j, j]] += ridge_beta;
     }
@@ -3298,18 +3301,16 @@ fn schur_matvec<B: BatchedBlockSolver>(
     backend: &B,
 ) {
     let k = sys.k;
-    if let Some(hbb_matvec) = sys.hbb_matvec.as_ref() {
-        hbb_matvec(x.view(), out);
+    // Route the penalty-side H_ββ x product through the BetaPenaltyOp trait
+    // (#296). effective_penalty_op() returns a DensePenaltyOp wrapping sys.hbb
+    // when no structured op is installed, preserving existing behaviour.
+    {
+        let op = sys.effective_penalty_op();
+        let x_slice = x.as_slice().expect("x must be contiguous");
+        let out_slice = out.as_slice_mut().expect("out must be contiguous");
+        op.matvec(x_slice, out_slice);
         for a in 0..k {
-            out[a] += ridge_beta * x[a];
-        }
-    } else {
-        for a in 0..k {
-            let mut acc = ridge_beta * x[a];
-            for b in 0..k {
-                acc += sys.hbb[[a, b]] * x[b];
-            }
-            out[a] = acc;
+            out_slice[a] += ridge_beta * x_slice[a];
         }
     }
     // Allocate scratch at max_d; per-row slice is `..di`.

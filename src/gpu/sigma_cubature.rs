@@ -201,6 +201,7 @@ mod linux_impl {
         offset: ArrayView1<'_, f64>,
         family: PirlsRowFamily,
         curvature: CurvatureMode,
+        gamma_shape: f64,
         convergence_tol: f64,
         max_iter: usize,
     ) -> Result<Option<Vec<SigmaPointResult>>, crate::gpu::GpuError> {
