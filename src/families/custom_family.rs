@@ -395,11 +395,20 @@ pub trait FamilyChannelHessian: Send + Sync {
     /// missing in that case (same error-message style as T26's contract).
     fn channel_hessian_at(
         &self,
-        _beta: &[f64],
-        _family_scalars: Option<&std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+        beta: &[f64],
+        family_scalars: Option<&std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     ) -> Result<Arc<dyn FamilyChannelHessian>, String> {
         // Default: W is β-independent — return a snapshot of the frozen W
-        // wrapped in a simple tensor-backed implementation.
+        // wrapped in a simple tensor-backed implementation. The β and
+        // family_scalars are ignored in this path but validated for NaN so
+        // callers that pass garbage state still see an Err rather than a
+        // silently-stale W.
+        if beta.iter().any(|v| v.is_nan()) {
+            return Err(
+                "channel_hessian_at: beta contains NaN".to_string(),
+            );
+        }
+        let _ = family_scalars; // signal "intentionally not used in default impl"
         let tensor = self.evaluate_full();
         Ok(Arc::new(TensorChannelHessian { h: tensor }))
     }
@@ -411,8 +420,8 @@ pub trait FamilyChannelHessian: Send + Sync {
 ///
 /// This is the β-independent path: `fill_subject` reads from the frozen
 /// tensor without any recomputation.
-pub(crate) struct TensorChannelHessian {
-    pub(crate) h: ndarray::Array3<f64>,
+pub struct TensorChannelHessian {
+    pub h: ndarray::Array3<f64>,
 }
 
 impl FamilyChannelHessian for TensorChannelHessian {

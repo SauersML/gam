@@ -180,7 +180,7 @@ pub struct BmsLogslopeJacobian {
     pub logslope_dense: Arc<Array2<f64>>,
     pub offset_m: Array1<f64>,
     pub offset_s: Array1<f64>,
-    pub z: Arc<[f64]>,
+    pub z: Arc<Array1<f64>>,
     /// Number of marginal columns (= start of β_s in the full β vector).
     pub p_marginal: usize,
 }
@@ -191,7 +191,7 @@ impl BmsLogslopeJacobian {
         logslope_dense: Arc<Array2<f64>>,
         offset_m: Array1<f64>,
         offset_s: Array1<f64>,
-        z: Arc<[f64]>,
+        z: Arc<Array1<f64>>,
         p_marginal: usize,
     ) -> Self {
         Self {
