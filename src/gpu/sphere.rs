@@ -1246,9 +1246,6 @@ mod sphere_gpu_tests {
         SphereWahbaKernel, sobolev_s2_truncated_coefficients, sphere_truncated_spectral_eval,
         spherical_wahba_kernel_matrix_with_kind,
     };
-    use crate::gpu::error::GpuResultExt;
-    use crate::gpu_bail;
-    use crate::gpu_err;
     use ndarray::Array2;
 
     fn small_latlon_grid(n_lat: usize, n_lon: usize) -> Array2<f64> {

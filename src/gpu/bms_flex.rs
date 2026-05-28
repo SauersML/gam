@@ -736,9 +736,6 @@ pub fn gpu_hessian_dense(inputs: BmsFlexGpuRowInputs<'_>) -> Result<Array2<f64>,
 #[cfg(test)]
 mod bms_flex_gpu_tests {
     use super::*;
-    use crate::gpu::error::GpuResultExt;
-    use crate::gpu_bail;
-    use crate::gpu_err;
 
     /// Allocate zero-filled row + cell buffers for a small rigid (no
     /// flex blocks) test problem.

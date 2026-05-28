@@ -352,7 +352,7 @@ fn bms_logslope_block_contract_beta_zero_scalars_none_ok() {
     let logslope = Arc::new(random_design(n, p_s, &mut rng));
     let offset_m = Array1::zeros(n);
     let offset_s = Array1::zeros(n);
-    let z: Arc<[f64]> = Arc::from(vec![0.5_f64; n].into_boxed_slice());
+    let z: Arc<Array1<f64>> = Arc::new(Array1::from_elem(n, 0.5_f64));
     let cb = BmsLogslopeJacobian::new(
         Arc::clone(&marginal),
         Arc::clone(&logslope),
@@ -384,7 +384,7 @@ fn bms_logslope_block_contract_beta_nonzero_scalars_none_err() {
     let logslope = Arc::new(random_design(n, p_s, &mut rng));
     let offset_m = Array1::zeros(n);
     let offset_s = Array1::zeros(n);
-    let z: Arc<[f64]> = Arc::from(vec![0.5_f64; n].into_boxed_slice());
+    let z: Arc<Array1<f64>> = Arc::new(Array1::from_elem(n, 0.5_f64));
     let cb = BmsLogslopeJacobian::new(
         Arc::clone(&marginal),
         Arc::clone(&logslope),
@@ -430,7 +430,7 @@ fn bms_logslope_block_contract_beta_nonzero_scalars_some_ok_fd_match() {
     let offset_m = Array1::from_vec((0..n).map(|_| lcg_next(&mut rng) * 0.1).collect());
     let offset_s = Array1::from_vec((0..n).map(|_| lcg_next(&mut rng) * 0.1).collect());
     let z_vec: Vec<f64> = (0..n).map(|_| lcg_next(&mut rng)).collect();
-    let z_arc: Arc<[f64]> = Arc::from(z_vec.clone().into_boxed_slice());
+    let z_arc: Arc<Array1<f64>> = Arc::new(Array1::from(z_vec.clone()));
     let cb = BmsLogslopeJacobian::new(
         Arc::clone(&marginal),
         Arc::clone(&logslope),

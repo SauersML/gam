@@ -66,9 +66,6 @@ fn build_rigid_flex_scalars(
     logslope_design: Array2<f64>,
 ) -> SurvivalFlexFamilyScalars {
     let p_primary = 4usize;
-    let p_time = dq0_time.ncols();
-    let p_m = dq0_marginal.ncols();
-    let p_g = logslope_design.ncols();
 
     let mut eta_u_entry = Array2::<f64>::zeros((n, p_primary));
     let mut eta_u_exit = Array2::<f64>::zeros((n, p_primary));
@@ -426,7 +423,6 @@ fn flex_time_jacobian_rigid_fd() {
 
 #[test]
 fn flex_score_warp_empty_returns_zero() {
-    let mut seed = 0xCAFE_BABE_u64;
     let s = 0.5_f64;
     let q0 = vec![0.0_f64; N];
     let q1 = vec![0.0_f64; N];
@@ -468,7 +464,6 @@ fn flex_score_warp_empty_returns_zero() {
 
 #[test]
 fn flex_link_dev_empty_returns_zero() {
-    let mut seed = 0x0123_4567_u64;
     let s = 0.5_f64;
     let q0 = vec![0.0_f64; N];
     let q1 = vec![0.0_f64; N];

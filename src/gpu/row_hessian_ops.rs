@@ -463,9 +463,6 @@ pub(crate) fn cpu_row_hessian_diag(inputs: &RowHessianDiagInputs<'_>) -> Vec<f64
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gpu::error::GpuResultExt;
-    use crate::gpu_bail;
-    use crate::gpu_err;
 
     /// Deterministic non-trivial Hessian fixture. Generates per-row
     /// symmetric `r×r` blocks via `H_i = A_i + A_iᵀ + r·I` for a

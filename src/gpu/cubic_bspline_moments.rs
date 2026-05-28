@@ -2018,9 +2018,6 @@ fn build_tetrahedral_moments_device(
 #[cfg(test)]
 mod cubic_bspline_moments_tests {
     use super::*;
-    use crate::gpu::error::GpuResultExt;
-    use crate::gpu_bail;
-    use crate::gpu_err;
 
     fn open_uniform_knots(n_basis: usize) -> Vec<f64> {
         // Open uniform clamped knot vector for n_basis cubic B-splines on [0,1].

@@ -599,7 +599,6 @@ mod tests {
     use crate::gpu::error::GpuError;
     use crate::gpu::error::GpuResultExt;
     use crate::gpu::runtime::GpuRuntime;
-    use crate::gpu_err;
 
     /// Test-only DtoH helper for cubic-cell device residency parity tests.
     fn download_moments(

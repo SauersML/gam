@@ -1510,9 +1510,6 @@ fn solve_cholesky(l: &Array2<f64>, rhs: &[f64]) -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gpu::error::GpuResultExt;
-    use crate::gpu_bail;
-    use crate::gpu_err;
     use ndarray::{Array2, ArrayView2};
 
     fn make_spd(p: usize, jitter: f64) -> Array2<f64> {
