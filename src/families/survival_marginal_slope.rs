@@ -19158,21 +19158,30 @@ pub fn fit_survival_marginal_slope_terms(
             let g_dg = logslope_design
                 .design
                 .try_to_dense_by_chunks("smgs phase-4b preflight logslope")?;
-            // Identity 4×4 row Hessian per row — purely structural
-            // orthogonalisation in the K=4 row primary space. A data-
-            // adaptive row Hessian (PSD-clamped from the pilot β) is
-            // strictly more informative but requires the pilot β, which
-            // is established further down the construction site; the
-            // structural pass already catches every column-level cross-
-            // block alias (the only failure mode the biobank repro
-            // surfaced).
-            let mut h_full = ndarray::Array3::<f64>::zeros((n_rows, 4, 4));
+            // Channel-aware per-subject Fisher Gram (T8). Pilot primary
+            // state at β=0: q0 = offset_entry, q1 = offset_exit +
+            // marginal_offset, qd1 = derivative_offset_exit, g =
+            // logslope_offset. All offsets are available before the
+            // inner Newton, so the pilot-H is fully determined at
+            // preflight time without waiting for a converged β.
+            let q0_pf = spec.time_block.offset_entry.clone();
+            let mut q1_pf = spec.time_block.offset_exit.clone();
             for i in 0..n_rows {
-                for k in 0..4 {
-                    h_full[[i, k, k]] = 1.0;
-                }
+                q1_pf[i] += spec.marginal_offset[i];
             }
-            let row_hess = SurvivalRowHessian::from_full(h_full);
+            let qd1_pf = spec.time_block.derivative_offset_exit.clone();
+            let g_pf = spec.logslope_offset.clone();
+            let row_hess = SurvivalRowHessian::from_pilot_primary_state(
+                &q0_pf,
+                &q1_pf,
+                &qd1_pf,
+                &g_pf,
+                &z_primary,
+                &spec.weights,
+                &spec.event_target,
+                spec.derivative_guard,
+                probit_scale,
+            )?;
             let compiled =
                 compile_survival_parametric_designs(dq0, dq1, dqd1, m_dq, m_dqd1, g_dg, &row_hess)?;
             let (dt, dm, dg) = compiled.drops_by_block;
