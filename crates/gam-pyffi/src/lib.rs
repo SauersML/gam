@@ -6661,10 +6661,12 @@ fn gaussian_reml_fit_with_constraints_backward<'py>(
     let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
     let grad_coefficients_values = grad_coefficients.as_ref().map(|g| g.as_array().to_owned());
     let grad_fitted_values = grad_fitted.as_ref().map(|g| g.as_array().to_owned());
-    let backward = detach_py_result(
+    let backward = detach_pyresult(
         py,
         "gaussian_reml_fit_with_constraints_backward",
         move || {
+            // Typed engine path: `EstimationError` → matching `gamfit.*Error`
+            // subclass via `estimation_error_to_pyerr` (issue #343).
             gaussian_reml_multi_closed_form_backward(
                 x_values.view(),
                 y_values.view(),
@@ -6677,7 +6679,7 @@ fn gaussian_reml_fit_with_constraints_backward<'py>(
                 grad_reml_score,
                 grad_edf,
             )
-            .map_err(|err| err.to_string())
+            .map_err(estimation_error_to_pyerr)
         },
     )?;
 
