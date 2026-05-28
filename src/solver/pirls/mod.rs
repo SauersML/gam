@@ -5775,40 +5775,6 @@ mod test_support {
     }
 }
 
-/// The status of the P-IRLS convergence.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PirlsStatus {
-    /// Converged successfully within tolerance.
-    Converged,
-    /// Reached maximum iterations but the gradient and Hessian indicate a valid minimum.
-    StalledAtValidMinimum,
-    /// Reached maximum iterations without converging.
-    MaxIterationsReached,
-    /// Levenberg-Marquardt step search exhausted its retry budget (damping λ
-    /// reached its ceiling, attempts counter expired, or λ went non-finite)
-    /// before the projected gradient entered the near-stationary band. Distinct
-    /// from `MaxIterationsReached`, which means the outer iteration counter
-    /// itself ran out — that exhaustion is a "looped 100×, made progress each
-    /// time but never converged" signal, while this one is a "no acceptable
-    /// step direction even after damping" signal pointing at curvature trouble
-    /// or saturated likelihoods.
-    LmStepSearchExhausted,
-    /// Fitting process became unstable, likely due to perfect separation.
-    Unstable,
-}
-
-impl PirlsStatus {
-    /// Whether the inner loop concluded without producing a usable mode.
-    /// Both the iteration-cap and LM-exhausted exits should be treated the
-    /// same by callers that just want to know "did we get a valid solution?".
-    #[inline]
-    pub const fn is_failed_max_iterations(self) -> bool {
-        matches!(
-            self,
-            PirlsStatus::MaxIterationsReached | PirlsStatus::LmStepSearchExhausted
-        )
-    }
-}
 
 /// Holds the result of a converged P-IRLS inner loop for a fixed rho.
 ///
