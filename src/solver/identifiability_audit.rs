@@ -669,6 +669,13 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
     // concentration S2_k = Σ_i p_i² (p_i = φ_i²/‖φ‖²).  See the
     // doc-comments on `compute_leverage_s2`, `pair_report_threshold`,
     // and `pair_halt_threshold` for the underlying finite-sample identity.
+    //
+    // Bias correction: when one block carries `eta_row_scaling = Some(z)`,
+    // the null distribution of the cross-block cosine is no longer centred
+    // at 0.  The null mean is approximately shift_k = −(μ_3/2)·S2_k where
+    // μ_3 is the standardised third moment of z (skewness).  We test
+    // |cosine − shift_k| >= half_width instead of |cosine| >= half_width.
+    // See `bias_shift_for_pair` and `compute_skewness_mu3` for the derivation.
     let pairwise_started = std::time::Instant::now();
     log::info!(
         "[STAGE] identifiability audit: pairwise overlap scan start n={} p_total={} blocks={}",
@@ -705,9 +712,19 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
     for a_block_idx in 0..specs.len() {
         let a_start = col_offsets[a_block_idx];
         let a_end = col_offsets[a_block_idx + 1];
+        // Extract the row-scaling vector for block A (used for the bias shift).
+        let z_a = specs[a_block_idx]
+            .eta_row_scaling
+            .as_ref()
+            .map(|arc| arc.as_ref());
         for b_block_idx in (a_block_idx + 1)..specs.len() {
             let b_start = col_offsets[b_block_idx];
             let b_end = col_offsets[b_block_idx + 1];
+            // Extract the row-scaling vector for block B.
+            let z_b = specs[b_block_idx]
+                .eta_row_scaling
+                .as_ref()
+                .map(|arc| arc.as_ref());
             for ja in a_start..a_end {
                 let na = col_norms[ja];
                 if na == 0.0 {
@@ -721,14 +738,19 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
                     }
                     let cb = x_joint.column(jb);
                     let dot: f64 = ca.iter().zip(cb.iter()).map(|(a, b)| a * b).sum();
-                    let overlap = (dot.abs() / (na * nb)).min(1.0);
-                    let report_thr = pair_report_threshold(
-                        col_s2[ja],
-                        col_s2[jb],
-                        n,
-                        total_cross_pairs,
-                    );
-                    if overlap >= report_thr {
+                    // Signed cosine: preserves direction for bias-shift test.
+                    let cosine = signed_cosine(dot, na, nb);
+                    let s2_ja = col_s2[ja];
+                    let s2_jb = col_s2[jb];
+                    // Bias shift: non-zero when exactly one block carries
+                    // row-scaling (or the two scalings differ).
+                    let shift = bias_shift_for_pair(z_a, z_b, s2_ja, s2_jb);
+                    let report_half_width = pair_report_threshold(s2_ja, s2_jb, n, total_cross_pairs);
+                    let (report_flag, _) = cosine_outside_null_band(cosine, shift, report_half_width);
+                    // Store the unsigned |cosine| in AliasedPair.overlap for
+                    // backwards compatibility and human-readable diagnostics.
+                    let overlap = cosine.abs();
+                    if report_flag {
                         aliased_pairs.push(AliasedPair {
                             block_a: specs[a_block_idx].name.clone(),
                             block_b: specs[b_block_idx].name.clone(),
