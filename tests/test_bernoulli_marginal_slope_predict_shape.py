@@ -45,7 +45,6 @@ def _dispatch(
     interval: float | None = None,
     return_type: str | None = None,
     id_column: str | None = None,
-    with_uncertainty: bool = False,
 ) -> Any:
     rust = _FakeRust()
     monkeypatch.setattr(_predict_shape, "rust_module", lambda: rust)
@@ -60,7 +59,6 @@ def _dispatch(
         interval=interval,
         return_type=return_type,
         id_column=id_column,
-        with_uncertainty=with_uncertainty,
         row_ids=None,
         restore=restore_output_table,
     )
@@ -94,11 +92,10 @@ def test_standard_gam_default_returns_1d_mean(monkeypatch: Any) -> None:
     """The default predict shape for a plain GAM is a 1-D ``ndarray``.
 
     This is the contract issue #329 codified: no ``interval`` /
-    ``id_column`` / ``return_type`` / ``with_uncertainty`` means no
-    DataFrame, regardless of what auxiliary columns the backend put in
-    the payload. The presence of ``effective_se`` here is a *data*
-    artefact and must not flip the return shape — that decision is a
-    caller-intent decision only.
+    ``id_column`` / ``return_type`` means no DataFrame, regardless of
+    what auxiliary columns the backend put in the payload. The presence
+    of ``effective_se`` here is a *data* artefact and must not flip the
+    return shape — that decision is a caller-intent decision only.
     """
     raw = json.dumps(
         {

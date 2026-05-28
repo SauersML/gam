@@ -38,6 +38,69 @@ pub enum DataError {
     /// numeric parquet column, or an unsupported parquet data type for the
     /// column.
     InvalidValue { reason: String },
+    /// A formula or call site references a column name that is not present in
+    /// the input data. Structured so the FFI boundary can raise a typed
+    /// Python exception (`gamfit.ColumnNotFoundError`) carrying the missing
+    /// name, available columns, and similarity suggestions as attributes —
+    /// not as a parsed-back-out substring of the human display text.
+    ///
+    /// `Display` still produces the exact same string as the legacy
+    /// `missing_column_message(...)` so CLI and stringified-error consumers
+    /// see identical text.
+    ColumnNotFound {
+        /// The missing column name, exactly as the user wrote it.
+        name: String,
+        /// Optional role label (`"response"`, `"entry"`, `"exit"`, etc.)
+        /// supplied at the resolution site to disambiguate which slot in the
+        /// formula referenced the bad name. `None` for bare term references.
+        role: Option<String>,
+        /// All headers present in the input table at resolution time, sorted.
+        available: Vec<String>,
+        /// Cheap similarity suggestions (case-insensitive substring or
+        /// shared-prefix length ≥ 3), sorted; empty when no header is close.
+        similar: Vec<String>,
+        /// True iff the available set has exactly one entry and that entry
+        /// contains a literal tab — i.e. the user almost certainly handed gam
+        /// a TSV file under a `.csv` filename. Surfaced as a structured
+        /// boolean rather than re-parsed from prose at the boundary.
+        tsv_hint: bool,
+    },
+}
+
+impl DataError {
+    /// Build a typed `ColumnNotFound` from the column map of the resolved
+    /// dataset. Centralises the similarity / TSV-hint heuristics that the
+    /// legacy `missing_column_message` helper used to perform inline so all
+    /// callers — leaf `resolve_col*` shims and the multi-column requested-
+    /// columns aggregator — produce identical payloads.
+    pub fn column_not_found(
+        col_map: &HashMap<String, usize>,
+        name: &str,
+        role: Option<&str>,
+    ) -> Self {
+        let target_lower = name.to_lowercase();
+        let mut similar: Vec<String> = col_map
+            .keys()
+            .filter(|k| {
+                let k_lower = k.to_lowercase();
+                k_lower.contains(&target_lower)
+                    || target_lower.contains(&k_lower)
+                    || shared_prefix(&k_lower, &target_lower) >= 3
+            })
+            .cloned()
+            .collect();
+        similar.sort_unstable();
+        let mut available: Vec<String> = col_map.keys().cloned().collect();
+        available.sort_unstable();
+        let tsv_hint = available.len() == 1 && available[0].contains('\t');
+        Self::ColumnNotFound {
+            name: name.to_string(),
+            role: role.map(str::to_string),
+            available,
+            similar,
+            tsv_hint,
+        }
+    }
 }
 
 impl fmt::Display for DataError {
@@ -48,6 +111,41 @@ impl fmt::Display for DataError {
             | DataError::EncodingFailure { reason }
             | DataError::EmptyInput { reason }
             | DataError::InvalidValue { reason } => f.write_str(reason),
+            DataError::ColumnNotFound {
+                name,
+                role,
+                available,
+                similar,
+                tsv_hint,
+            } => {
+                let label = match role {
+                    Some(r) => format!("{r} column '{name}'"),
+                    None => format!("column '{name}'"),
+                };
+                // Match the legacy `missing_column_message` text exactly so
+                // CLI scripts and existing log scrapers that pattern-match
+                // human prose stay byte-compatible.
+                let tsv_suffix = if *tsv_hint {
+                    " — your file appears to be tab-separated; gam expects comma-separated CSV. \
+         Replace tabs with commas, or pre-convert with `tr '\\t' ',' < file.tsv > file.csv`."
+                } else {
+                    ""
+                };
+                if similar.is_empty() {
+                    write!(
+                        f,
+                        "{label} not found in data. Available columns: [{}]{tsv_suffix}",
+                        available.join(", ")
+                    )
+                } else {
+                    write!(
+                        f,
+                        "{label} not found in data. Did you mean one of [{}]? Full list: [{}]{tsv_suffix}",
+                        similar.join(", "),
+                        available.join(", ")
+                    )
+                }
+            }
         }
     }
 }
@@ -121,55 +219,22 @@ impl EncodedDataset {
     }
 }
 
+/// Thin compatibility shim around `DataError::column_not_found(...)`.
+///
+/// New code should construct the typed `DataError::ColumnNotFound` variant
+/// directly so the FFI boundary can read its structured fields (column name,
+/// available headers, similarity suggestions, role label, TSV hint flag) and
+/// surface them as attributes on the Python-side `ColumnNotFoundError`
+/// exception. This stringification helper exists for the in-module
+/// multi-missing aggregator that joins several missing-column messages into
+/// one `DataError::SchemaMismatch` reason; it produces text byte-identical
+/// to the variant's `Display` implementation.
 pub fn missing_column_message(
     col_map: &HashMap<String, usize>,
     name: &str,
     role: Option<&str>,
 ) -> String {
-    // Suggest similar names. Cheap Damerau-style match: case-insensitive
-    // substring or shared-prefix length.
-    let target_lower = name.to_lowercase();
-    let mut similar: Vec<&str> = col_map
-        .keys()
-        .filter(|k| {
-            let k_lower = k.to_lowercase();
-            k_lower.contains(&target_lower)
-                || target_lower.contains(&k_lower)
-                || shared_prefix(&k_lower, &target_lower) >= 3
-        })
-        .map(String::as_str)
-        .collect();
-    similar.sort_unstable();
-    let mut all: Vec<&str> = col_map.keys().map(String::as_str).collect();
-    all.sort_unstable();
-    let label = role.map_or_else(
-        || format!("column '{name}'"),
-        |role| format!("{role} column '{name}'"),
-    );
-    // Detect TSV-instead-of-CSV: when there's exactly one header and it
-    // contains tab characters, the user's file is almost certainly
-    // tab-separated. Without this hint the message reads
-    //   "column 'x' not found in data. Did you mean one of [x\ty]?"
-    // which leaves the user staring at a literal tab inside what looks
-    // like a column name.
-    let tsv_hint = if all.len() == 1 && all[0].contains('\t') {
-        " — your file appears to be tab-separated; gam expects comma-separated CSV. \
-         Replace tabs with commas, or pre-convert with `tr '\\t' ',' < file.tsv > file.csv`."
-    } else {
-        ""
-    };
-    if similar.is_empty() {
-        format!(
-            "{label} not found in data. Available columns: [{}]{tsv_hint}",
-            all.join(", ")
-        )
-    } else {
-        format!(
-            "{label} not found in data. Did you mean one of [{}]? Full list: [{}]{tsv_hint}",
-            similar.join(", "),
-            all.join(", ")
-        )
-    }
+    DataError::column_not_found(col_map, name, role).to_string()
 }
 
 fn shared_prefix(a: &str, b: &str) -> usize {

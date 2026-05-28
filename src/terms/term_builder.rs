@@ -18,7 +18,7 @@ use crate::basis::{
     default_num_centers, default_spatial_center_strategy, default_spherical_harmonic_degree,
     plan_spatial_basis, resolve_duchon_orders,
 };
-use crate::inference::data::{EncodedDataset as Dataset, missing_column_message};
+use crate::inference::data::{DataError, EncodedDataset as Dataset};
 use crate::inference::formula_dsl::{
     ParsedTerm, SmoothKind, option_bool, option_f64, option_f64_strict, option_usize,
     option_usize_any, option_usize_any_strict, option_usize_strict, strip_quotes,
