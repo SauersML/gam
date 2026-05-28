@@ -5112,49 +5112,8 @@ fn materialize_standard<'a>(
     }
     let y_col = resolve_role_col(col_map, &parsed.response, "response")?;
     let y = data.values.column(y_col).to_owned();
+    let y_kind = response_column_kind(data, y_col);
     let mut inference_notes = Vec::new();
-
-    // String-valued response columns are encoded as Categorical level indices
-    // (e.g. "yes"/"no" → 0.0/1.0). When the user did not pin a family the
-    // auto-detector then sees a 0/1 column and silently infers Binomial,
-    // producing a probability model the user never asked for (see #304).
-    // Reject upfront with an explicit, actionable error.
-    if config.family.is_none()
-        && matches!(
-            data.column_kinds.get(y_col),
-            Some(ColumnKindTag::Categorical)
-        )
-    {
-        let levels = data
-            .schema
-            .columns
-            .get(y_col)
-            .map(|sc| sc.levels.clone())
-            .unwrap_or_default();
-        let preview = {
-            let n = levels.len().min(5);
-            let head = levels
-                .iter()
-                .take(n)
-                .map(|s| format!("'{s}'"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            if levels.len() > n {
-                format!("[{head}, ...]")
-            } else {
-                format!("[{head}]")
-            }
-        };
-        return Err(WorkflowError::InvalidConfig {
-            reason: format!(
-                "response column '{name}' contains non-numeric values {preview}. \
-                 Did you mean to use family='binomial' for a binary outcome, \
-                 or does '{name}' contain categorical labels that should be encoded first?",
-                name = parsed.response,
-            ),
-        }
-        .into());
-    }
 
     let link_choice = parse_link_choice(config.link.as_deref(), config.flexible_link)?;
     let family = resolve_family(
@@ -5162,14 +5121,20 @@ fn materialize_standard<'a>(
         config.negative_binomial_theta,
         link_choice.as_ref(),
         y.view(),
+        y_kind,
+        &parsed.response,
     )?;
 
-    // Validate response-domain support for families whose log-likelihood is
-    // undefined outside a restricted set (#335 Gamma requires y > 0;
-    // #337 Poisson/NegativeBinomial require y ≥ 0). We report at most a few
-    // offending row indices so the user can locate the bad data.
-    validate_response_support_for_family(&family.response, &parsed.response, y.view())
-        .map_err(String::from)?;
+    // Per-family response-support validation (#335 Gamma requires y > 0;
+    // #337 Poisson/NegativeBinomial require y ≥ 0; mirrors the Beta
+    // (0,1)-support check in the external-design GLM path). The family
+    // itself owns the check — see `ResponseFamily::validate_response_support`
+    // — so adding a new family that constrains its support is a single edit
+    // on the type, not a coordinated update across every materializer.
+    family
+        .response
+        .validate_response_support(y.view())
+        .map_err(|violation| violation.message_for(&parsed.response))?;
 
     // Pre-flight degeneracy / sample-size gate (#309, #331, #332). Catches
     // all-zero or all-one Bernoulli responses, near-constant Gaussian

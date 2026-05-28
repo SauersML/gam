@@ -528,6 +528,168 @@ fn sklearn_fit_metadata(
     Ok((fit_formula, feature_names, target_name))
 }
 
+// =========================================================================
+// gamfit exception hierarchy (Rust-defined, Python-visible)
+// =========================================================================
+//
+// The Rust engine has rich `thiserror`-typed errors — `EstimationError`
+// alone has ~20 variants. Historically those variants were flattened to
+// `String` at the FFI boundary and reclassified on the Python side by
+// regex on the message text. That round-trip discarded structured
+// information that already existed upstream.
+//
+// The principled design (issue #343) is variant-dispatch at the
+// engine→Python boundary: each engine error variant maps to a concrete
+// Python exception class via a typed mapping function, with no
+// string-regex bridge. The classes themselves live here (defined via
+// `pyo3::create_exception!`) so the Rust extension owns the canonical
+// type identity; `gamfit/_exceptions.py` re-exports them so the public
+// names remain `gamfit.GamError`, `gamfit.FormulaError`, etc.
+//
+// Inheritance: every gamfit exception is a subclass of `GamError`, and
+// `GamError` itself is a subclass of Python's built-in `ValueError`.
+// That preserves the historical contract that `except ValueError`
+// catches every engine-side failure (the Rust extension previously
+// raised bare `PyValueError` for everything), while `except GamError`
+// becomes the documented broad catch — see issue #330.
+//
+// Adding a new engine error variant: extend `estimation_error_to_pyerr`
+// (or the per-enum analogue) with the new variant; do NOT add new
+// patterns to a message-regex classifier.
+
+use pyo3::create_exception;
+
+create_exception!(_rust, GamError, PyValueError,
+    "Base class for Python-facing gamfit engine errors.\n\
+     \n\
+     All gamfit-specific exceptions raised by the Rust extension inherit\n\
+     from `GamError`, which itself inherits from `ValueError` to preserve\n\
+     the historical `except ValueError` contract.");
+
+create_exception!(_rust, FormulaError, GamError,
+    "The Wilkinson-style formula could not be parsed or references columns \
+     missing from the input table.");
+
+create_exception!(_rust, SchemaMismatchError, GamError,
+    "Prediction input does not match the training schema.");
+
+create_exception!(_rust, PredictionError, GamError,
+    "Prediction failed for a reason that is not a pure schema mismatch.");
+
+// EstimationError variant subclasses.
+//
+// Each subclass corresponds to exactly one variant of
+// `gam::estimate::EstimationError`. Catching the specific subclass lets
+// callers branch on the exact failure mode (e.g. retry with looser
+// tolerances on `RemlConvergenceError`, suggest more data on
+// `ModelOverparameterizedError`).
+
+create_exception!(_rust, BasisError, GamError,
+    "Underlying basis function generation failed.");
+
+create_exception!(_rust, LinearSystemSolveError, GamError,
+    "A linear system solve failed; the penalized Hessian may be singular.");
+
+create_exception!(_rust, EigendecompositionError, GamError,
+    "Eigendecomposition failed.");
+
+create_exception!(_rust, PenaltySpectrumError, GamError,
+    "Penalty spectrum check failed (non-finite or indefinite eigenvalue).");
+
+create_exception!(_rust, ParameterConstraintError, GamError,
+    "Parameter constraint violation.");
+
+create_exception!(_rust, PirlsConvergenceError, GamError,
+    "The P-IRLS inner loop did not converge within its iteration budget.");
+
+create_exception!(_rust, PerfectSeparationError, GamError,
+    "Perfect or quasi-perfect separation detected during model fitting.");
+
+create_exception!(_rust, HessianNotPositiveDefiniteError, GamError,
+    "Hessian matrix is not positive definite at the converged iterate.");
+
+create_exception!(_rust, RemlConvergenceError, GamError,
+    "REML smoothing optimization failed to converge.");
+
+create_exception!(_rust, GradientUnavailableError, GamError,
+    "The unified evaluator returned no gradient in the requested mode.");
+
+create_exception!(_rust, LayoutError, GamError,
+    "An internal error occurred during model layout or coefficient mapping.");
+
+create_exception!(_rust, ModelOverparameterizedError, GamError,
+    "Model is over-parameterized: more coefficients than samples.");
+
+create_exception!(_rust, IllConditionedError, GamError,
+    "Model is ill-conditioned (large condition number).");
+
+create_exception!(_rust, InvalidInputError, GamError,
+    "Invalid input to the engine (shape/dtype/range violation).");
+
+create_exception!(_rust, MonotoneRootError, GamError,
+    "Monotone-root solve failed.");
+
+create_exception!(_rust, CalibratorError, GamError,
+    "Calibrator training failed.");
+
+create_exception!(_rust, InvalidSpecificationError, GamError,
+    "Invalid specification supplied to the engine.");
+
+/// Variant-dispatch: convert a typed engine error into the matching
+/// Python exception subclass. This is the single chokepoint where
+/// `EstimationError`'s typing is preserved across the FFI boundary —
+/// no `err.to_string()` flattening, no Python-side regex reclassification.
+fn estimation_error_to_pyerr(err: EstimationError) -> PyErr {
+    let message = err.to_string();
+    match err {
+        EstimationError::BasisError(_) => BasisError::new_err(message),
+        EstimationError::LinearSystemSolveFailed(_) => LinearSystemSolveError::new_err(message),
+        EstimationError::EigendecompositionFailed(_) => EigendecompositionError::new_err(message),
+        EstimationError::PenaltySpectrumNonFinite { .. } => PenaltySpectrumError::new_err(message),
+        EstimationError::PenaltySpectrumIndefinite { .. } => PenaltySpectrumError::new_err(message),
+        EstimationError::ParameterConstraintViolation(_) => {
+            ParameterConstraintError::new_err(message)
+        }
+        EstimationError::PirlsDidNotConverge { .. } => PirlsConvergenceError::new_err(message),
+        EstimationError::PerfectSeparationDetected { .. } => {
+            PerfectSeparationError::new_err(message)
+        }
+        EstimationError::HessianNotPositiveDefinite { .. } => {
+            HessianNotPositiveDefiniteError::new_err(message)
+        }
+        EstimationError::RemlOptimizationFailed(_) => RemlConvergenceError::new_err(message),
+        EstimationError::GradientUnavailable { .. } => GradientUnavailableError::new_err(message),
+        EstimationError::LayoutError(_) => LayoutError::new_err(message),
+        EstimationError::ModelOverparameterized { .. } => {
+            ModelOverparameterizedError::new_err(message)
+        }
+        EstimationError::ModelIsIllConditioned { .. } => IllConditionedError::new_err(message),
+        EstimationError::InvalidInput(_) => InvalidInputError::new_err(message),
+        EstimationError::MonotoneRoot(_) => MonotoneRootError::new_err(message),
+        EstimationError::CalibratorTrainingFailed(_) => CalibratorError::new_err(message),
+        EstimationError::InvalidSpecification(_) => InvalidSpecificationError::new_err(message),
+        EstimationError::PredictionError => PredictionError::new_err(message),
+    }
+}
+
+// -------------------------------------------------------------------------
+// Legacy message-regex classifier
+// -------------------------------------------------------------------------
+//
+// Retained ONLY for error sources that still flow through `Result<_, String>`
+// at the FFI boundary (formula validation, schema checks during predict,
+// basis builder errors not wrapped in `EstimationError`, etc.). Issue #343
+// tracked the variant-dispatch refactor: `EstimationError` is now fully
+// typed via `estimation_error_to_pyerr` and bypasses this classifier
+// entirely (typed exceptions short-circuit `map_exception` on the Python
+// side via the `isinstance(exc, GamError)` check).
+//
+// As the remaining engine-error enums (~44 of them) are migrated to
+// per-variant dispatch, the corresponding branches of this classifier
+// shrink; the function will be deleted once every Rust→Python error path
+// is variant-typed. Until then, NEW error variants MUST be added to a
+// typed dispatch function, never to this regex pipeline.
+
 enum PythonExceptionKind {
     Formula,
     SchemaMismatch,
@@ -21510,12 +21672,22 @@ where
     }
 }
 
+/// Detach the GIL, run a closure returning a typed `EstimationError`, and
+/// preserve the variant across the Python boundary via
+/// `estimation_error_to_pyerr`. This is the principled engine→Python
+/// adaptor: no `err.to_string()` flattening, no message-regex
+/// reclassification on the Python side. Each `EstimationError` variant
+/// surfaces as a specific `gamfit.GamError` subclass (see issue #343).
 fn detach_estimation_result<T, F>(py: Python<'_>, context: &'static str, f: F) -> PyResult<T>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, EstimationError> + Send + 'static,
 {
-    detach_py_result(py, context, move || f().map_err(|err| err.to_string()))
+    match py.detach(move || catch_unwind(AssertUnwindSafe(f))) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => Err(estimation_error_to_pyerr(err)),
+        Err(payload) => Err(py_panic_error(context, payload)),
+    }
 }
 
 fn fit_table_impl(
