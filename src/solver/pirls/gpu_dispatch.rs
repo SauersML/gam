@@ -22,7 +22,6 @@ use super::{
     make_reparam_operator,
 };
 use crate::construction::ReparamResult;
-use log;
 use crate::estimate::EstimationError;
 use crate::matrix::DesignMatrix;
 use crate::types::LinkFunction;
