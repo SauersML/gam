@@ -1,9 +1,6 @@
 use super::*;
 use super::family::clamp_bernoulli_link_probability;
 
-    Ok(())
-}
-
 pub(crate) fn standardize_latent_z_with_policy(
     z: &Array1<f64>,
     weights: &Array1<f64>,
