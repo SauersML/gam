@@ -122,6 +122,18 @@ impl From<TermBuilderError> for String {
     }
 }
 
+/// Catchall lift for the term-builder's internal `Result<_, String>` helpers
+/// (numeric expression parsing, option lookup, boundary-condition parsing,
+/// ...) that flow into `build_termspec` via `?`. Maps to
+/// `IncompatibleConfig`, which is the most appropriate generic bucket for
+/// option/config-style failures — leaf sites that emit structured payloads
+/// (`From<DataError>` for column-not-found) bypass this fallback.
+impl From<String> for TermBuilderError {
+    fn from(reason: String) -> Self {
+        Self::IncompatibleConfig { reason }
+    }
+}
+
 /// Typed lift from data-layer errors. `DataError::ColumnNotFound` becomes
 /// `TermBuilderError::ColumnNotFound` field-for-field — no stringification,
 /// no information loss — so the FFI boundary downstream can dispatch on

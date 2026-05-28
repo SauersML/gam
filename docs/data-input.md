@@ -115,7 +115,7 @@ preds = model.predict(
     id_column="patient_id",
     return_type="dict",
 )
-# preds = {"patient_id": ["P001", "P002"], "eta": [...], "mean": [...]}
+# preds = {"patient_id": ["P001", "P002"], "linear_predictor": [...], "mean": [...]}
 ```
 
 The id column is excluded from the model and may be any type that

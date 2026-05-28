@@ -19,7 +19,7 @@ model.predict(
 | Argument | Default | Meaning |
 | --- | --- | --- |
 | `data` | required | Table-like input matching the training schema. |
-| `interval` | `None` | Single uncertainty knob (issue #342). `None` returns point predictions only; a float in `(0, 1)` (e.g. `0.95`) requests the full uncertainty decomposition at that pointwise coverage. On standard GLMs / location-scale this populates `effective_se`, `effective_variance`, `mean_lower`, `mean_upper`. On survival location-scale it populates `survival_se` and `eta_se` on the returned `SurvivalPrediction`. Other survival likelihoods and competing-risks reject any non-`None` value at the Rust boundary. Ignored by transformation-normal and bernoulli marginal-slope. |
+| `interval` | `None` | Single uncertainty knob (issue #342). `None` returns point predictions only; a float in `(0, 1)` (e.g. `0.95`) requests the full uncertainty decomposition at that pointwise coverage. On standard GLMs / location-scale this populates `std_error`, `mean_lower`, `mean_upper`. On survival location-scale it populates `survival_se` and `eta_se` on the returned `SurvivalPrediction`. Other survival likelihoods and competing-risks reject any non-`None` value at the Rust boundary. Ignored by transformation-normal and bernoulli marginal-slope. (Issue #310 renamed the column from `effective_se` to `std_error` and dropped the redundant `effective_variance` column.) |
 | `return_type` | `None` | One of `"dict"`, `"numpy"`, `"pandas"`, `"polars"`, `"pyarrow"` for table-shaped outputs. Defaults to the input table kind, falling back to the training table kind. |
 | `id_column` | `None` | Name of a column in `data` whose stringified values are carried through into table outputs and `SurvivalPrediction`. |
 
@@ -27,8 +27,8 @@ model.predict(
 
 | Model class | Default return | Columns / fields |
 | --- | --- | --- |
-| Gaussian, binomial, Poisson, negative-binomial, Gamma | Table | `eta`, `mean`; adds `effective_se`, `effective_variance`, `mean_lower`, `mean_upper` when `interval` is set. |
-| Gaussian / binomial location-scale | Table | `eta`, `mean`; adds `effective_se`, `effective_variance`, `mean_lower`, `mean_upper` when `interval` is set. |
+| Gaussian, binomial, Poisson, negative-binomial, Gamma | Table | `linear_predictor`, `mean`; adds `std_error`, `mean_lower`, `mean_upper` when `interval` is set. |
+| Gaussian / binomial location-scale | Table | `linear_predictor`, `mean`; adds `std_error`, `mean_lower`, `mean_upper` when `interval` is set. |
 | Transformation-normal | 1-D `numpy.ndarray` | Per-row conditional z-scores. |
 | Bernoulli marginal-slope | 1-D `numpy.ndarray` | Per-row probabilities clipped to `[0, 1]`. |
 | Survival (any likelihood mode) | `SurvivalPrediction` | Per-row hazard / survival evaluators. |
@@ -43,7 +43,7 @@ Passing `id_column=` adds that stringified id column first.
 
 ```python
 preds = model.predict(test_df, interval=0.95)
-# columns: eta, mean, effective_se, effective_variance, mean_lower, mean_upper
+# columns: linear_predictor, mean, std_error, mean_lower, mean_upper
 ```
 
 Intervals are computed from the asymptotic covariance of the fitted
@@ -60,7 +60,7 @@ preds = model.predict(
     id_column="patient_id",
     return_type="dict",
 )
-# preds = {"patient_id": ["P001", "P002"], "eta": [...], "mean": [...]}
+# preds = {"patient_id": ["P001", "P002"], "linear_predictor": [...], "mean": [...]}
 ```
 
 The id column is not used by the model. Values are copied through after
