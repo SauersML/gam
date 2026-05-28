@@ -1,5 +1,9 @@
-pub mod fixtures;
-pub mod gpu_gate;
+// `fixtures` and `gpu_gate` are NOT declared as submodules here. Each
+// integration test that needs one of them includes the source directly via
+// a `#[path]` attribute so per-binary `dead_code` lints only fire when a
+// test actually drags in unused helpers, instead of every test that touches
+// the `common` module (this file exists primarily to host the
+// `assert_manual_ad_band!` macro below).
 
 #[macro_export]
 macro_rules! assert_manual_ad_band {

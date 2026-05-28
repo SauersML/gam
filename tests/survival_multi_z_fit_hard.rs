@@ -37,8 +37,16 @@ use gam::survival_marginal_slope::{
 };
 use ndarray::{Array1, Array2};
 
-mod common;
-use common::fixtures::Splitmix64;
+#[path = "common/fixtures.rs"]
+mod fixtures;
+use fixtures::Splitmix64;
+
+/// Draw two independent standard normals. Each call to `Splitmix64::next_gauss`
+/// performs one Box-Muller step and discards the second sample; the pair form
+/// here just lets callers destructure two samples at once.
+fn next_gauss_pair(rng: &mut Splitmix64) -> (f64, f64) {
+    (rng.next_gauss(), rng.next_gauss())
+}
 
 // ── Data generation ───────────────────────────────────────────────────────
 
@@ -69,12 +77,12 @@ fn simulate(seed: u64, corr: f64) -> SimData {
     let s = (1.0 - rho * rho).sqrt();
 
     for i in 0..N {
-        let (g1, g2) = rng.next_gauss_pair();
+        let (g1, g2) = next_gauss_pair(&mut rng);
         z[[i, 0]] = g1;
         z[[i, 1]] = rho * g1 + s * g2;
 
         // Synthetic baseline probit channel: q1 > q0, qd1 > 0.
-        let (gq, _) = rng.next_gauss_pair();
+        let (gq, _) = next_gauss_pair(&mut rng);
         let base = 0.25 * gq; // small dispersion of underlying frailty
         q0[i] = base - 0.6;
         q1[i] = base + 0.6;
@@ -141,11 +149,11 @@ fn simulate_events_from_truth(
     let mut event = Array1::<f64>::zeros(N);
 
     for i in 0..N {
-        let (g1, g2) = rng.next_gauss_pair();
+        let (g1, g2) = next_gauss_pair(&mut rng);
         z[[i, 0]] = g1;
         z[[i, 1]] = g2;
 
-        let (gq, _) = rng.next_gauss_pair();
+        let (gq, _) = next_gauss_pair(&mut rng);
         let base = 0.25 * gq;
         q0[i] = base - 0.6;
         q1[i] = base + 0.6;
