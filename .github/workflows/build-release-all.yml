@@ -21,9 +21,50 @@ env:
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
+  # Throttle: skip this run if another run of THIS workflow started within
+  # the last 15 minutes and was NOT cancelled. Cancelled runs don't count
+  # — the next push should still produce a release.
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      - name: Check recent non-cancelled runs
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_FILE: build-release-all.yml
+          SELF_RUN_ID: ${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cutoff=$(date -u -d '15 minutes ago' '+%Y-%m-%dT%H:%M:%SZ')
+          echo "Cutoff (UTC): $cutoff"
+          runs=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_FILE}/runs?per_page=30" \
+            --jq '.workflow_runs[] | {id: .id, status: .status, conclusion: .conclusion, created_at: .created_at}')
+          echo "$runs"
+          conflict=$(echo "$runs" | jq -s --arg cutoff "$cutoff" --arg self "$SELF_RUN_ID" '
+            map(select(
+              (.id|tostring) != $self
+              and .created_at > $cutoff
+              and .conclusion != "cancelled"
+              and .status != "cancelled"
+            )) | length')
+          echo "Conflicting recent runs: $conflict"
+          if [[ "$conflict" -gt 0 ]]; then
+            echo "Another non-cancelled run started in the last 15 min — skipping."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    needs: gate
+    if: needs.gate.outputs.should_run == 'true'
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
