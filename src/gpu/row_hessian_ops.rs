@@ -33,6 +33,7 @@ use std::sync::OnceLock;
 #[cfg(target_os = "linux")]
 use cudarc::driver::{CudaModule, CudaStream, LaunchConfig, PushKernelArg};
 
+#[cfg(target_os = "linux")]
 use super::error::GpuError;
 #[cfg(target_os = "linux")]
 use crate::gpu::error::GpuResultExt;
@@ -41,7 +42,9 @@ use crate::gpu_err;
 
 /// Hard ceiling on `r` (primary local dimension). Matches the BMS-FLEX row
 /// kernel's [`super::bms_flex_row::MAX_R`] so the same cached Hessian
-/// bundle can feed both kernels without revalidation.
+/// bundle can feed both kernels without revalidation. Linux-only because
+/// the consumers (`validate` impls and the launcher) are Linux-only.
+#[cfg(target_os = "linux")]
 pub(crate) const MAX_R: usize = super::bms_flex_row::MAX_R;
 
 /// `blockDim.x` for the per-row matvec / diagonal kernels. One CUDA block per
@@ -98,6 +101,7 @@ pub(crate) struct RowHessianDiagOutputs {
     pub d_rows: Vec<f64>,
 }
 
+#[cfg(target_os = "linux")]
 impl<'a> RowHessianMatvecInputs<'a> {
     /// Validate every shape the device kernel relies on.
     pub(crate) fn validate(&self) -> Result<(), GpuError> {
@@ -134,6 +138,7 @@ impl<'a> RowHessianMatvecInputs<'a> {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl<'a> RowHessianDiagInputs<'a> {
     /// Validate every shape the device kernel relies on.
     pub(crate) fn validate(&self) -> Result<(), GpuError> {
