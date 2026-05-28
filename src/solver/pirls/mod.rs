@@ -79,6 +79,8 @@ use penalty::{
 use convergence::effective_kkt_tolerance;
 use pls_solver::solve_penalized_least_squares_implicit;
 pub use pls_solver::{GaussianFixedCache, SparseXtwxPrecomputed};
+pub use reweight::runworking_model_pirls;
+use reweight::{madsen_lm_accept_factor, test_support};
 
 const GAMMA_SHAPE_MIN: f64 = 1e-8;
 const GAMMA_SHAPE_MAX: f64 = 1e12;
