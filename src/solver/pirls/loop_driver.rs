@@ -41,7 +41,7 @@ use crate::estimate::EstimationError;
 use crate::matrix::{DesignMatrix, LinearOperator, ReparamOperator, SymmetricMatrix};
 use crate::solver::active_set;
 use crate::types::{
-    Coefficients, GlmLikelihoodSpec, InverseLink, LinkFunction,
+    Coefficients, GlmLikelihoodSpec, InverseLink, LinearPredictor, LinkFunction,
     LogSmoothingParamsView, MixtureLinkState, RidgePassport, RidgePolicy,
     SasLinkState, StandardLink,
 };
