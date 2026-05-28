@@ -502,7 +502,7 @@ mod cuda_impl {
             })
         }
 
-        fn compute_grams_cublas(&self, h_packed: &Array2<f64>) -> Option<GramBundle> {
+        pub(super) fn compute_grams_cublas(&self, h_packed: &Array2<f64>) -> Option<GramBundle> {
             let (n_rows, packed_cols) = h_packed.dim();
             if packed_cols != PACKED_LEN || n_rows != self.n_rows {
                 return None;
@@ -915,7 +915,7 @@ mod tests {
                 );
                 return;
             };
-            let Some(blas_bundle) = workspace.inner.compute_grams_cublas_only(&h_packed) else {
+            let Some(blas_bundle) = workspace.inner.compute_grams_cublas(&h_packed) else {
                 eprintln!(
                     "[identifiability_compile] cuBLAS Gram build returned None — \
                      treating as CI infra outage, not a parity regression"
