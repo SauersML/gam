@@ -2937,15 +2937,13 @@ pub fn arrow_damped_quadratic_model_reduction(
     let mut lin = sys.gb.dot(&delta_beta);
     let mut quad = ridge_beta * delta_beta.dot(&delta_beta);
 
+    // Route H_ββ · Δβ through BetaPenaltyOp trait (#296).
     let mut hbb_delta = Array1::<f64>::zeros(sys.k);
-    if let Some(hbb_matvec) = sys.hbb_matvec.as_ref() {
-        hbb_matvec(delta_beta, &mut hbb_delta);
-    } else if sys.hbb.dim() == (sys.k, sys.k) {
-        hbb_delta.assign(&sys.hbb.dot(&delta_beta));
-    } else {
-        return Err(ArrowSchurError::SchurFactorFailed {
-            reason: "Arrow-Schur predicted reduction requires a dense H_ββ block or matrix-free H_ββ operator".to_string(),
-        });
+    {
+        let op = sys.effective_penalty_op();
+        let x_slice = delta_beta.as_slice().expect("delta_beta must be contiguous");
+        let y_slice = hbb_delta.as_slice_mut().expect("hbb_delta must be contiguous");
+        op.matvec(x_slice, y_slice);
     }
     quad += delta_beta.dot(&hbb_delta);
 
