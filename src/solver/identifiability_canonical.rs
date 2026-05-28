@@ -444,6 +444,7 @@ pub fn canonicalize_for_identifiability(
                             beta: &zeros,
                             family_scalars: None,
                             channel_hessian: None,
+                            probit_frailty_scale: 1.0,
                         };
                         let flat = spec
                             .effective_jacobian_at(
