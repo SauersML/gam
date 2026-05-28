@@ -20,11 +20,19 @@ class Summary:
     of per-coefficient dictionaries). Use :meth:`coefficients_frame` to view the
     coefficient table as a pandas DataFrame.
 
+    Top-level payload keys are also reachable as attributes: ``summary.formula``,
+    ``summary.family_name``, ``summary.deviance``, ``summary.reml_score``, etc.
+    are equivalent to ``summary["..."]`` and avoid an opaque ``AttributeError``
+    on the natural attribute-style access. Subscript access remains the
+    canonical / fully-documented form.
+
     Examples
     --------
     >>> summary = model.summary()
     >>> summary["family_name"]
-    'gaussian'
+    'Gaussian Identity'
+    >>> summary.family_name  # attribute-style mirror of the subscript form
+    'Gaussian Identity'
     >>> summary.coefficients_frame().head()
     """
 
@@ -53,6 +61,27 @@ class Summary:
 
     def __getitem__(self, key: str) -> Any:
         return self.payload[key]
+
+    def __getattr__(self, name: str) -> Any:
+        # Python only calls __getattr__ when normal attribute lookup fails, so
+        # the dataclass field ``payload`` is already handled by the slot
+        # descriptor and never routes through here. Top-level payload keys
+        # (``formula``, ``family_name``, ``deviance``, ``reml_score``, ...)
+        # are surfaced as attributes for ergonomics; the repr advertises them
+        # like dataclass fields, and a bare ``AttributeError`` with no hint is
+        # an unhelpful papercut. Subscript access (``summary["key"]``) remains
+        # the documented form. (issue #311)
+        try:
+            payload = object.__getattribute__(self, "payload")
+        except AttributeError:
+            raise AttributeError(name) from None
+        try:
+            return payload[name]
+        except KeyError:
+            raise AttributeError(
+                f"'Summary' object has no attribute {name!r} "
+                f"(top-level payload keys: {sorted(payload)!r})"
+            ) from None
 
     def get(self, key: str, default: Any = None) -> Any:
         """Return ``payload[key]`` if present, otherwise ``default``.
