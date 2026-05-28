@@ -61,7 +61,8 @@ fn spec(
         initial_log_lambdas: Array1::<f64>::zeros(0),
         initial_beta: None,
         gauge_priority,
-        eta_row_scaling: None,
+        row_scaling: None,
+        jacobian_callback: None,
     }
 }
 

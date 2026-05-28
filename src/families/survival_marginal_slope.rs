@@ -17712,7 +17712,11 @@ impl crate::custom_family::BlockEffectiveJacobian for LogslopeBlockJacobian {
         let any_nonzero_g = g_rows.iter().any(|&gi| gi != 0.0);
         if any_nonzero_g && scalars.is_none() {
             return Err(
-                "survival marginal-slope logslope block requires                  SurvivalMarginalSlopeFamilyScalars when beta != 0 (g_i != 0 for at                  least one row); got family_scalars: None. The caller must compute                  per-row (q0, q1, qd1) at the current beta and pass them via                  FamilyLinearizationState::family_scalars."
+                "survival marginal-slope logslope block requires \
+                 SurvivalMarginalSlopeFamilyScalars when beta != 0 \
+                 (g_i != 0 for at least one row); got family_scalars: None. \
+                 The caller must compute per-row (q0, q1, qd1) at the current \
+                 beta and pass them via FamilyLinearizationState::family_scalars."
                     .to_string(),
             );
         }
@@ -17798,7 +17802,10 @@ impl crate::custom_family::BlockEffectiveJacobian for MarginalBlockJacobian {
         let beta_nonzero = state.beta.iter().any(|&b| b != 0.0);
         if beta_nonzero && scalars.is_none() {
             return Err(
-                "survival marginal-slope marginal block requires                  SurvivalMarginalSlopeFamilyScalars when beta != 0 (c_i != 1 in general);                  got family_scalars: None. The caller must populate per-row c_i via                  FamilyLinearizationState::family_scalars."
+                "survival marginal-slope marginal block requires \
+                 SurvivalMarginalSlopeFamilyScalars when beta != 0 (c_i != 1 in general); \
+                 got family_scalars: None. The caller must populate per-row c_i via \
+                 FamilyLinearizationState::family_scalars."
                     .to_string(),
             );
         }
@@ -17895,7 +17902,10 @@ impl crate::custom_family::BlockEffectiveJacobian for TimeBlockJacobian {
         let beta_nonzero = state.beta.iter().any(|&b| b != 0.0);
         if beta_nonzero && scalars.is_none() {
             return Err(
-                "survival marginal-slope time block requires                  SurvivalMarginalSlopeFamilyScalars when beta != 0 (c_i != 1 in general);                  got family_scalars: None. The caller must populate per-row c_i via                  FamilyLinearizationState::family_scalars."
+                "survival marginal-slope time block requires \
+                 SurvivalMarginalSlopeFamilyScalars when beta != 0 (c_i != 1 in general); \
+                 got family_scalars: None. The caller must populate per-row c_i via \
+                 FamilyLinearizationState::family_scalars."
                     .to_string(),
             );
         }
@@ -17920,6 +17930,422 @@ impl crate::custom_family::BlockEffectiveJacobian for TimeBlockJacobian {
     fn n_outputs(&self) -> usize {
         3
     }
+}
+
+// ── Timewiggle-active Jacobians ───────────────────────────────────────
+//
+// When timewiggle is active, (q0, q1, qd1) are nonlinear functions of
+// (β_time, β_marginal) through the composition:
+//
+//   h0 = X_entry_base[i] · β_t_base + offset_entry[i] + M[i] · β_m
+//   q0 = h0 + B(h0) · β_tw           (B = monotone wiggle basis)
+//
+// and analogously for q1 and qd1.  The chain rule gives:
+//
+//   ∂q0/∂β_t[j < p_base] = (1 + B'(h0)·β_tw) · X_entry[i,j]
+//                         = dq_dq0(h0) · X_entry[i,j]
+//   ∂q0/∂β_t[p_base + k] = B_k(h0)
+//   ∂q0/∂β_m[j]          = dq_dq0(h0) · M[i,j]
+//
+// Since η_r = c · q_r + … and ∂η_r/∂β_block = c · ∂q_r/∂β_block,
+// the stacked Jacobian for each block is:
+//
+//   J[i,       j] = c_i · ∂q0/∂β_block[j]
+//   J[n + i,   j] = c_i · ∂q1/∂β_block[j]
+//   J[2*n + i, j] = c_i · ∂qd1/∂β_block[j]
+//
+// where c_i = sqrt(1 + (s · g_i)²) and g_i = G[i] · β_g.
+//
+// At β = 0: dq_dq0 = 1, d²q/dh² = 0, c_i = 1, so both timewiggle
+// callbacks reduce to the rigid-path `TimeBlockJacobian` /
+// `MarginalBlockJacobian` values.
+//
+// Joint β layout (same for both callbacks):
+//   [β_t (p_time) | β_m (p_m) | β_g (p_g) | …]
+//
+// p_time = p_base + p_tw where p_tw = time_wiggle_ncols.
+
+/// n_outputs = 3 stacked Jacobian for the **time** block when timewiggle
+/// is active.  Computes `c_i` from the embedded logslope design and
+/// joint β, so no `family_scalars` are required.
+pub struct SmsTimewiggleTimeJacobian {
+    design_entry: Arc<Array2<f64>>,
+    design_exit: Arc<Array2<f64>>,
+    design_deriv: Arc<Array2<f64>>,
+    design_marginal: Arc<Array2<f64>>,
+    design_logslope: Arc<Array2<f64>>,
+    offset_entry: Arc<Array1<f64>>,
+    offset_exit: Arc<Array1<f64>>,
+    offset_deriv: Arc<Array1<f64>>,
+    time_wiggle_knots: Array1<f64>,
+    time_wiggle_degree: usize,
+    /// Full time block width (= design_entry.ncols()).
+    p_time: usize,
+    /// Wiggle tail width.
+    p_tw: usize,
+    /// Marginal block width (for joint β parsing).
+    p_m: usize,
+    /// Logslope block width (for joint β parsing).
+    p_g: usize,
+    /// Probit frailty scale s.
+    probit_scale: f64,
+}
+
+impl SmsTimewiggleTimeJacobian {
+    /// Construct.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        design_entry: Arc<Array2<f64>>,
+        design_exit: Arc<Array2<f64>>,
+        design_deriv: Arc<Array2<f64>>,
+        design_marginal: Arc<Array2<f64>>,
+        design_logslope: Arc<Array2<f64>>,
+        offset_entry: Arc<Array1<f64>>,
+        offset_exit: Arc<Array1<f64>>,
+        offset_deriv: Arc<Array1<f64>>,
+        time_wiggle_knots: Array1<f64>,
+        time_wiggle_degree: usize,
+        p_tw: usize,
+        p_m: usize,
+        p_g: usize,
+        probit_scale: f64,
+    ) -> Self {
+        let p_time = design_entry.ncols();
+        Self {
+            design_entry,
+            design_exit,
+            design_deriv,
+            design_marginal,
+            design_logslope,
+            offset_entry,
+            offset_exit,
+            offset_deriv,
+            time_wiggle_knots,
+            time_wiggle_degree,
+            p_time,
+            p_tw,
+            p_m,
+            p_g,
+            probit_scale,
+        }
+    }
+}
+
+impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleTimeJacobian {
+    fn effective_jacobian_at(
+        &self,
+        state: &crate::custom_family::FamilyLinearizationState<'_>,
+    ) -> Result<Array2<f64>, String> {
+        let n = self.design_entry.nrows();
+        let p = self.p_time;
+        let p_base = p.saturating_sub(self.p_tw);
+
+        let beta = state.beta;
+        // β_t = joint β[0 .. p_time]
+        let beta_t = if beta.len() >= p { &beta[..p] } else { beta };
+        let beta_t_base = &beta_t[..p_base.min(beta_t.len())];
+        let beta_tw = if beta_t.len() > p_base { &beta_t[p_base..] } else { &[][..] };
+        // β_m = joint β[p_time .. p_time + p_m]
+        let beta_m = {
+            let s = p;
+            let e = (s + self.p_m).min(beta.len());
+            if e > s { &beta[s..e] } else { &[][..] }
+        };
+        // β_g = joint β[p_time + p_m .. p_time + p_m + p_g]
+        let beta_g = {
+            let s = p + self.p_m;
+            let e = (s + self.p_g).min(beta.len());
+            if e > s { &beta[s..e] } else { &[][..] }
+        };
+
+        let sc = self.probit_scale;
+        let knots = &self.time_wiggle_knots;
+        let degree = self.time_wiggle_degree;
+
+        let mut jac = Array2::<f64>::zeros((3 * n, p));
+
+        for i in 0..n {
+            // c_i computed directly from logslope design and joint β_g.
+            let g_i: f64 = beta_g
+                .iter()
+                .enumerate()
+                .filter(|&(j, _)| j < self.design_logslope.ncols())
+                .map(|(j, &b)| self.design_logslope[[i, j]] * b)
+                .sum();
+            let c_i = (1.0_f64 + (sc * g_i).powi(2)).sqrt();
+
+            // Base marginal η contribution.
+            let eta_m: f64 = beta_m
+                .iter()
+                .enumerate()
+                .filter(|&(j, _)| j < self.design_marginal.ncols())
+                .map(|(j, &b)| self.design_marginal[[i, j]] * b)
+                .sum();
+
+            let h0: f64 = self.offset_entry[i]
+                + eta_m
+                + (0..p_base.min(beta_t_base.len()).min(self.design_entry.ncols()))
+                    .map(|j| self.design_entry[[i, j]] * beta_t_base[j])
+                    .sum::<f64>();
+            let h1: f64 = self.offset_exit[i]
+                + eta_m
+                + (0..p_base.min(beta_t_base.len()).min(self.design_exit.ncols()))
+                    .map(|j| self.design_exit[[i, j]] * beta_t_base[j])
+                    .sum::<f64>();
+            let d_raw: f64 = self.offset_deriv[i]
+                + (0..p_base.min(beta_t_base.len()).min(self.design_deriv.ncols()))
+                    .map(|j| self.design_deriv[[i, j]] * beta_t_base[j])
+                    .sum::<f64>();
+
+            let beta_tw_view = ndarray::ArrayView1::from(beta_tw);
+            let eg = sms_tw_first_order_geom(
+                ndarray::ArrayView1::from(&[h0][..]),
+                beta_tw_view,
+                knots,
+                degree,
+            )?;
+            let xg = sms_tw_first_order_geom(
+                ndarray::ArrayView1::from(&[h1][..]),
+                beta_tw_view,
+                knots,
+                degree,
+            )?;
+
+            let (entry_dq, exit_dq, exit_d2q, entry_basis, exit_basis, exit_basis_d1) =
+                match (eg, xg) {
+                    (Some(eg), Some(xg)) => (
+                        eg.dq_dq0[0],
+                        xg.dq_dq0[0],
+                        xg.d2q_dq02[0],
+                        Some(eg.basis),
+                        Some(xg.basis),
+                        Some(xg.basis_d1),
+                    ),
+                    _ => (1.0_f64, 1.0_f64, 0.0_f64, None, None, None),
+                };
+
+            // Base columns j < p_base.
+            for j in 0..p_base.min(self.design_entry.ncols()) {
+                let xe = self.design_entry[[i, j]];
+                let xx = self.design_exit[[i, j]];
+                let xd = self.design_deriv[[i, j]];
+                jac[[i,       j]] = c_i * entry_dq * xe;
+                jac[[n + i,   j]] = c_i * exit_dq * xx;
+                jac[[2*n + i, j]] = c_i * (exit_d2q * d_raw * xx + exit_dq * xd);
+            }
+
+            // Wiggle tail columns.
+            for local_idx in 0..self.p_tw {
+                let col = p_base + local_idx;
+                let b0  = entry_basis.as_ref().map_or(0.0, |b| b[[0, local_idx]]);
+                let b1  = exit_basis.as_ref().map_or(0.0, |b| b[[0, local_idx]]);
+                let bd1 = exit_basis_d1.as_ref().map_or(0.0, |b| b[[0, local_idx]]);
+                jac[[i,       col]] = c_i * b0;
+                jac[[n + i,   col]] = c_i * b1;
+                jac[[2*n + i, col]] = c_i * bd1 * d_raw;
+            }
+        }
+        Ok(jac)
+    }
+
+    fn n_outputs(&self) -> usize {
+        3
+    }
+}
+
+/// n_outputs = 3 stacked Jacobian for the **marginal** block when timewiggle
+/// is active.
+pub struct SmsTimewiggleMarginalJacobian {
+    design_entry: Arc<Array2<f64>>,
+    design_exit: Arc<Array2<f64>>,
+    design_deriv: Arc<Array2<f64>>,
+    design_marginal: Arc<Array2<f64>>,
+    design_logslope: Arc<Array2<f64>>,
+    offset_entry: Arc<Array1<f64>>,
+    offset_exit: Arc<Array1<f64>>,
+    offset_deriv: Arc<Array1<f64>>,
+    time_wiggle_knots: Array1<f64>,
+    time_wiggle_degree: usize,
+    p_time: usize,
+    p_tw: usize,
+    p_g: usize,
+    probit_scale: f64,
+}
+
+impl SmsTimewiggleMarginalJacobian {
+    /// Construct.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        design_entry: Arc<Array2<f64>>,
+        design_exit: Arc<Array2<f64>>,
+        design_deriv: Arc<Array2<f64>>,
+        design_marginal: Arc<Array2<f64>>,
+        design_logslope: Arc<Array2<f64>>,
+        offset_entry: Arc<Array1<f64>>,
+        offset_exit: Arc<Array1<f64>>,
+        offset_deriv: Arc<Array1<f64>>,
+        time_wiggle_knots: Array1<f64>,
+        time_wiggle_degree: usize,
+        p_time: usize,
+        p_tw: usize,
+        p_g: usize,
+        probit_scale: f64,
+    ) -> Self {
+        Self {
+            design_entry,
+            design_exit,
+            design_deriv,
+            design_marginal,
+            design_logslope,
+            offset_entry,
+            offset_exit,
+            offset_deriv,
+            time_wiggle_knots,
+            time_wiggle_degree,
+            p_time,
+            p_tw,
+            p_g,
+            probit_scale,
+        }
+    }
+}
+
+impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleMarginalJacobian {
+    fn effective_jacobian_at(
+        &self,
+        state: &crate::custom_family::FamilyLinearizationState<'_>,
+    ) -> Result<Array2<f64>, String> {
+        let n = self.design_marginal.nrows();
+        let p_m = self.design_marginal.ncols();
+        let p_t = self.p_time;
+        let p_base = p_t.saturating_sub(self.p_tw);
+
+        let beta = state.beta;
+        let beta_t = if beta.len() >= p_t { &beta[..p_t] } else { beta };
+        let beta_t_base = &beta_t[..p_base.min(beta_t.len())];
+        let beta_tw = if beta_t.len() > p_base { &beta_t[p_base..] } else { &[][..] };
+        let beta_m = {
+            let s = p_t;
+            let e = (s + p_m).min(beta.len());
+            if e > s { &beta[s..e] } else { &[][..] }
+        };
+        let beta_g = {
+            let s = p_t + p_m;
+            let e = (s + self.p_g).min(beta.len());
+            if e > s { &beta[s..e] } else { &[][..] }
+        };
+
+        let sc = self.probit_scale;
+        let knots = &self.time_wiggle_knots;
+        let degree = self.time_wiggle_degree;
+
+        let mut jac = Array2::<f64>::zeros((3 * n, p_m));
+
+        for i in 0..n {
+            let g_i: f64 = beta_g
+                .iter()
+                .enumerate()
+                .filter(|&(j, _)| j < self.design_logslope.ncols())
+                .map(|(j, &b)| self.design_logslope[[i, j]] * b)
+                .sum();
+            let c_i = (1.0_f64 + (sc * g_i).powi(2)).sqrt();
+
+            let eta_m: f64 = beta_m
+                .iter()
+                .enumerate()
+                .filter(|&(j, _)| j < p_m)
+                .map(|(j, &b)| self.design_marginal[[i, j]] * b)
+                .sum();
+
+            let h0: f64 = self.offset_entry[i]
+                + eta_m
+                + (0..p_base.min(beta_t_base.len()).min(self.design_entry.ncols()))
+                    .map(|j| self.design_entry[[i, j]] * beta_t_base[j])
+                    .sum::<f64>();
+            let h1: f64 = self.offset_exit[i]
+                + eta_m
+                + (0..p_base.min(beta_t_base.len()).min(self.design_exit.ncols()))
+                    .map(|j| self.design_exit[[i, j]] * beta_t_base[j])
+                    .sum::<f64>();
+            let d_raw: f64 = self.offset_deriv[i]
+                + (0..p_base.min(beta_t_base.len()).min(self.design_deriv.ncols()))
+                    .map(|j| self.design_deriv[[i, j]] * beta_t_base[j])
+                    .sum::<f64>();
+
+            let beta_tw_view = ndarray::ArrayView1::from(beta_tw);
+            let eg = sms_tw_first_order_geom(
+                ndarray::ArrayView1::from(&[h0][..]),
+                beta_tw_view,
+                knots,
+                degree,
+            )?;
+            let xg = sms_tw_first_order_geom(
+                ndarray::ArrayView1::from(&[h1][..]),
+                beta_tw_view,
+                knots,
+                degree,
+            )?;
+
+            let (entry_dq, exit_dq, exit_d2q) = match (eg, xg) {
+                (Some(eg), Some(xg)) => (eg.dq_dq0[0], xg.dq_dq0[0], xg.d2q_dq02[0]),
+                _ => (1.0_f64, 1.0_f64, 0.0_f64),
+            };
+
+            for j in 0..p_m {
+                let m_ij = self.design_marginal[[i, j]];
+                jac[[i,       j]] = c_i * entry_dq * m_ij;
+                jac[[n + i,   j]] = c_i * exit_dq * m_ij;
+                jac[[2*n + i, j]] = c_i * exit_d2q * d_raw * m_ij;
+            }
+        }
+        Ok(jac)
+    }
+
+    fn n_outputs(&self) -> usize {
+        3
+    }
+}
+
+/// Compute timewiggle first-order geometry at a single evaluation point `h0`.
+///
+/// Returns `Ok(None)` when `beta_tw` is empty (no active wiggle columns).
+/// This is a free-function mirror of
+/// `SurvivalMarginalSlopeFamily::time_wiggle_first_order_geometry` for use in
+/// `BlockEffectiveJacobian` impls that do not hold a family reference.
+fn sms_tw_first_order_geom(
+    h0: ndarray::ArrayView1<'_, f64>,
+    beta_tw: ndarray::ArrayView1<'_, f64>,
+    knots: &Array1<f64>,
+    degree: usize,
+) -> Result<Option<SurvivalTimeWiggleFirstOrderGeometry>, String> {
+    if beta_tw.is_empty() {
+        return Ok(None);
+    }
+    let basis   = monotone_wiggle_basis_with_derivative_order(h0, knots, degree, 0)?;
+    let basis_d1 = monotone_wiggle_basis_with_derivative_order(h0, knots, degree, 1)?;
+    let basis_d2 = monotone_wiggle_basis_with_derivative_order(h0, knots, degree, 2)?;
+    if basis.ncols() != beta_tw.len()
+        || basis_d1.ncols() != beta_tw.len()
+        || basis_d2.ncols() != beta_tw.len()
+    {
+        return Err(format!(
+            "sms_tw_first_order_geom: basis/beta_tw width mismatch \
+             B/B'/B''={}/{}/{} beta_tw={}",
+            basis.ncols(),
+            basis_d1.ncols(),
+            basis_d2.ncols(),
+            beta_tw.len(),
+        ));
+    }
+    let dq_dq0   = fast_av(&basis_d1, &beta_tw) + 1.0;
+    let d2q_dq02 = fast_av(&basis_d2, &beta_tw);
+    Ok(Some(SurvivalTimeWiggleFirstOrderGeometry {
+        basis,
+        basis_d1,
+        basis_d2,
+        dq_dq0,
+        d2q_dq02,
+    }))
 }
 
 // ── Building block specs ──────────────────────────────────────────────

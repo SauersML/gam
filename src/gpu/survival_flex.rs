@@ -3949,7 +3949,7 @@ pub fn cpu_oracle_third_contraction(
     let wi = inputs.w;
     let di = inputs.d;
 
-    use crate::families::bernoulli_marginal_slope::signed_probit_neglog_derivatives_up_to_fourth;
+    use crate::families::bms::signed_probit_neglog_derivatives_up_to_fourth;
     let (entry_k1, entry_k2, entry_k3, _) =
         signed_probit_neglog_derivatives_up_to_fourth(-entry.eta, -wi)?;
     let (exit_k1, exit_k2, exit_k3, _) =
@@ -4061,7 +4061,7 @@ fn b10_fourth_ordered(
     entry_bi: &SurvivalFlexBlock10TimepointBiDirectional,
     exit_bi: &SurvivalFlexBlock10TimepointBiDirectional,
 ) -> Result<Vec<f64>, String> {
-    use crate::families::bernoulli_marginal_slope::signed_probit_neglog_derivatives_up_to_fourth;
+    use crate::families::bms::signed_probit_neglog_derivatives_up_to_fourth;
 
     let (entry_k1, entry_k2, entry_k3, entry_k4) =
         signed_probit_neglog_derivatives_up_to_fourth(-entry_base.eta, -wi)?;

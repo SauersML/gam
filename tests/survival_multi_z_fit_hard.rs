@@ -37,43 +37,8 @@ use gam::survival_marginal_slope::{
 };
 use ndarray::{Array1, Array2};
 
-// ── Inline RNG: splitmix64 + Box-Muller (no external crates) ──────────────
-
-#[inline]
-fn splitmix64(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = *state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
-
-#[inline]
-fn next_unit(state: &mut u64) -> f64 {
-    // 53-bit mantissa in [0, 1)
-    let bits = splitmix64(state) >> 11;
-    (bits as f64) * (1.0_f64 / ((1u64 << 53) as f64))
-}
-
-#[inline]
-fn next_open_unit(state: &mut u64) -> f64 {
-    // (0, 1) — avoid the 0.0 endpoint so ln() never blows up in Box-Muller.
-    let v = next_unit(state);
-    if v <= f64::MIN_POSITIVE {
-        f64::MIN_POSITIVE
-    } else {
-        v
-    }
-}
-
-#[inline]
-fn next_gauss_pair(state: &mut u64) -> (f64, f64) {
-    let u1 = next_open_unit(state);
-    let u2 = next_unit(state);
-    let r = (-2.0 * u1.ln()).sqrt();
-    let theta = std::f64::consts::TAU * u2;
-    (r * theta.cos(), r * theta.sin())
-}
+mod common;
+use common::fixtures::Splitmix64;
 
 // ── Data generation ───────────────────────────────────────────────────────
 
@@ -93,7 +58,7 @@ struct SimData {
 /// Gaussian. `corr` is the off-diagonal correlation in standard-normal
 /// space; pass 0.0 for independent z.
 fn simulate(seed: u64, corr: f64) -> SimData {
-    let mut state = seed ^ 0xD1B5_4A32_D192_ED03;
+    let mut rng = Splitmix64::new(seed ^ 0xD1B5_4A32_D192_ED03);
     let mut z = Array2::<f64>::zeros((N, K));
     let mut q0 = Array1::<f64>::zeros(N);
     let mut q1 = Array1::<f64>::zeros(N);
@@ -104,23 +69,19 @@ fn simulate(seed: u64, corr: f64) -> SimData {
     let s = (1.0 - rho * rho).sqrt();
 
     for i in 0..N {
-        let (g1, g2) = next_gauss_pair(&mut state);
+        let (g1, g2) = rng.next_gauss_pair();
         z[[i, 0]] = g1;
         z[[i, 1]] = rho * g1 + s * g2;
 
         // Synthetic baseline probit channel: q1 > q0, qd1 > 0.
-        let (gq, _) = next_gauss_pair(&mut state);
+        let (gq, _) = rng.next_gauss_pair();
         let base = 0.25 * gq; // small dispersion of underlying frailty
         q0[i] = base - 0.6;
         q1[i] = base + 0.6;
-        qd1[i] = 0.7 + 0.1 * next_unit(&mut state);
+        qd1[i] = 0.7 + 0.1 * rng.next_unit();
 
         // event: probability of exit-event in [0,1].
-        event[i] = if next_unit(&mut state) < 0.5 {
-            1.0
-        } else {
-            0.0
-        };
+        event[i] = if rng.next_unit() < 0.5 { 1.0 } else { 0.0 };
     }
 
     SimData {

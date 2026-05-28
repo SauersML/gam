@@ -71,6 +71,20 @@ impl Splitmix64 {
     pub fn uniform(&mut self, lo: f64, hi: f64) -> f64 {
         lo + (hi - lo) * self.next_unit()
     }
+
+    /// Draw two independent standard normals using one Box-Muller step.
+    ///
+    /// Returns `(cos_sample, sin_sample)`. Useful when callers need pairs
+    /// to avoid wasting one sample; the second element is independent of
+    /// the first.
+    pub fn next_gauss_pair(&mut self) -> (f64, f64) {
+        // Use (0,1)-open lower bound to keep ln() finite.
+        let u1 = self.next_unit().max(f64::MIN_POSITIVE);
+        let u2 = self.next_unit();
+        let r = (-2.0 * u1.ln()).sqrt();
+        let theta = std::f64::consts::TAU * u2;
+        (r * theta.cos(), r * theta.sin())
+    }
 }
 
 // ── Survival-marginal-slope synthetic dataset ─────────────────────────────

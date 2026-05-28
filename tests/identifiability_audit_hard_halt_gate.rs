@@ -43,7 +43,7 @@ mod common {
             initial_log_lambdas: Array1::<f64>::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
+            row_scaling: None,
             jacobian_callback: None,
         }
     }
@@ -359,9 +359,10 @@ fn cross_block_alias_with_distinct_priorities_is_not_fatal() {
             initial_log_lambdas: Array1::<f64>::zeros(0),
             initial_beta: None,
             gauge_priority: 120,
-            eta_row_scaling: Some(std::sync::Arc::from(
+            row_scaling: Some(std::sync::Arc::from(
                 z_primary.as_slice().expect("z_primary must be C-contiguous"),
             )),
+            jacobian_callback: None,
         };
         let specs_with_z_scaling = [
             make_spec("time_surface", time, 200),
