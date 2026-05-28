@@ -4297,6 +4297,7 @@ fn prepare_survival_location_scale_model(
         )?,
         initial_beta: time_prepared.initial_beta.clone(),
         gauge_priority: 100,
+        eta_row_scaling: None,
     };
 
     let threshold_prep = prepare_cov_block_kind(&spec.threshold_block)?;
@@ -4378,6 +4379,7 @@ fn prepare_survival_location_scale_model(
         initial_log_lambdas: threshold_initial_log_lambdas,
         initial_beta: threshold_initial_beta,
         gauge_priority: 100,
+        eta_row_scaling: None,
     };
 
     let survival_primary_design = DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(
@@ -4484,6 +4486,7 @@ fn prepare_survival_location_scale_model(
         initial_log_lambdas: log_sigma_initial_log_lambdas,
         initial_beta: log_sigma_initial_beta,
         gauge_priority: 100,
+        eta_row_scaling: None,
     };
     let wigglespec = if let Some(w) = spec.linkwiggle_block.as_ref() {
         Some(ParameterBlockSpec {
@@ -4513,6 +4516,7 @@ fn prepare_survival_location_scale_model(
             initial_log_lambdas: initial_log_lambdas(&w.penalties, w.initial_log_lambdas.clone())?,
             initial_beta: w.initial_beta.clone(),
             gauge_priority: 100,
+            eta_row_scaling: None,
         })
     } else {
         None
@@ -11058,6 +11062,7 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
+            eta_row_scaling: None,
         };
         let specs = vec![
             mk_spec("time", p_time),
@@ -11088,6 +11093,7 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
+            eta_row_scaling: None,
         };
         let specs = vec![
             mk_spec("time", 200),
@@ -11120,6 +11126,7 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
+            eta_row_scaling: None,
         };
         let specs = vec![
             mk_spec("time", 200),
@@ -11156,6 +11163,7 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
+            eta_row_scaling: None,
         };
 
         let feasible = family
@@ -11297,6 +11305,7 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
+            eta_row_scaling: None,
         };
         let returned = family
             .post_update_block_beta(
@@ -11539,6 +11548,7 @@ mod tests {
                 initial_log_lambdas: array![0.0],
                 initial_beta: Some(array![0.2]),
                 gauge_priority: 100,
+                eta_row_scaling: None,
             },
             ParameterBlockSpec {
                 name: "threshold".to_string(),
@@ -11553,6 +11563,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(array![0.35]),
                 gauge_priority: 100,
+                eta_row_scaling: None,
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
@@ -11567,6 +11578,7 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(array![-0.15]),
                 gauge_priority: 100,
+                eta_row_scaling: None,
             },
         ]
     }
