@@ -930,52 +930,30 @@ extern "C" __global__ void chol_logdet_col_major(
                 input.linear_shift.len()
             ));
         }
-        // Step 1: A = X_origᵀ diag(w) X_orig and score_p = X_origᵀ grad_eta.
-        // Fused path (p < threshold) or ddgmm+dgemm+gemv (large p).
         let n_i = to_i32(n)?;
         let p_i = to_i32(p)?;
+
+        // Step 1: A = X_origᵀ diag(w_solver) X_orig → ws.xtwx_dev.
+        //         score_p = X_origᵀ grad_eta → ws.rhs_dev.
         if let Some(ref mut wx_dev_ib) = ws.wx_dev {
-            // Large-p fallback.
+            // Large-p path: ddgmm then dgemm, then gemv.
             left_scale_rows_borrowed(
                 &ws.blas, &ws.stream, n, p, &shared.x_original_dev, input.w_solver_dev, wx_dev_ib,
             )?;
-            let gemm_cfg = GemmConfig::<f64> {
-                transa: cublasOperation_t::CUBLAS_OP_T,
-                transb: cublasOperation_t::CUBLAS_OP_N,
-                m: p_i,
-                n: p_i,
-                k: n_i,
-                alpha: 1.0,
-                lda: n_i,
-                ldb: n_i,
-                beta: 0.0,
-                ldc: p_i,
+            let cfg_xtx = GemmConfig::<f64> {
+                transa: cublasOperation_t::CUBLAS_OP_T, transb: cublasOperation_t::CUBLAS_OP_N,
+                m: p_i, n: p_i, k: n_i, alpha: 1.0, lda: n_i, ldb: n_i, beta: 0.0, ldc: p_i,
             };
-            // SAFETY: validated dims; shared.x_original_dev and wx_dev_ib n*p
-            // f64 col-major; ws.xtwx_dev is p*p; all on ws.stream.
-            unsafe { ws.blas.gemm(gemm_cfg, &shared.x_original_dev, wx_dev_ib, &mut ws.xtwx_dev) }
-                .map_err(|e| format!("cublas dgemm XtWX (inplace): {e}"))?;
-            let penalty_step = penalty_with_ridge(input.penalty_hessian, input.step_lm_lambda);
-            let penalty_step_col = to_col_major(&penalty_step.view());
-            ws.stream
-                .memcpy_htod(penalty_step_col.as_ref(), &mut ws.penalty_dev)
-                .map_err(|e| format!("upload penalty (inplace): {e}"))?;
-            geam_add(&ws.blas, &ws.stream, p, &ws.xtwx_dev, &ws.penalty_dev, &mut ws.h_dev)?;
-            let gemv_cfg = GemvConfig::<f64> {
-                trans: cublasOperation_t::CUBLAS_OP_T,
-                m: n_i,
-                n: p_i,
-                alpha: 1.0,
-                lda: n_i,
-                incx: 1,
-                beta: 0.0,
-                incy: 1,
+            // SAFETY: x_original_dev and wx_dev_ib n*p col-major; xtwx_dev p*p; ws.stream.
+            unsafe { ws.blas.gemm(cfg_xtx, &shared.x_original_dev, wx_dev_ib, &mut ws.xtwx_dev) }
+                .map_err(|e| format!("dgemm XtWX inplace (large-p): {e}"))?;
+            let cfg_xts = GemvConfig::<f64> {
+                trans: cublasOperation_t::CUBLAS_OP_T, m: n_i, n: p_i, alpha: 1.0,
+                lda: n_i, incx: 1, beta: 0.0, incy: 1,
             };
             // SAFETY: x_original_dev n*p col-major; grad_eta_dev length n; rhs_dev length p.
-            unsafe {
-                ws.blas.gemv(gemv_cfg, &shared.x_original_dev, input.grad_eta_dev, &mut ws.rhs_dev)
-            }
-            .map_err(|e| format!("cublas dgemv Xtg (inplace): {e}"))?;
+            unsafe { ws.blas.gemv(cfg_xts, &shared.x_original_dev, input.grad_eta_dev, &mut ws.rhs_dev) }
+                .map_err(|e| format!("dgemv Xᵀ·score inplace (large-p): {e}"))?;
         } else {
             // Fused path: row-sweep kernels, no n*p WX buffer.
             launch_xtwx_lower(
@@ -987,28 +965,64 @@ extern "C" __global__ void chol_logdet_col_major(
                 &ws.stream, &shared.ctx, n, p,
                 &shared.x_original_dev, input.grad_eta_dev, &mut ws.rhs_dev,
             )?;
-            let penalty_step = penalty_with_ridge(input.penalty_hessian, input.step_lm_lambda);
-            let penalty_step_col = to_col_major(&penalty_step.view());
-            ws.stream
-                .memcpy_htod(penalty_step_col.as_ref(), &mut ws.penalty_dev)
-                .map_err(|e| format!("upload penalty (fused inplace): {e}"))?;
-            geam_add(&ws.blas, &ws.stream, p, &ws.xtwx_dev, &ws.penalty_dev, &mut ws.h_dev)?;
         }
 
-        // RHS correction: rhs = Xᵀ·score − S·β + linear_shift (#257, #260).
-        // Download p-vectors rhs and β; compute S·β on host (S = penalty_hessian);
-        // add linear_shift; re-upload corrected rhs before the Cholesky solve.
-        let rhs_raw = ws
-            .stream
+        // Step 2: H_xtx = Qsᵀ A Qs  (two p×p gemms).
+        //   tmp = A · Qs → ws.qs_tmp_dev.
+        {
+            let cfg_aq = GemmConfig::<f64> {
+                transa: cublasOperation_t::CUBLAS_OP_N, transb: cublasOperation_t::CUBLAS_OP_N,
+                m: p_i, n: p_i, k: p_i, alpha: 1.0, lda: p_i, ldb: p_i, beta: 0.0, ldc: p_i,
+            };
+            // SAFETY: xtwx_dev and qs_dev p*p col-major; qs_tmp_dev p*p output.
+            unsafe { ws.blas.gemm(cfg_aq, &ws.xtwx_dev, &ws.qs_dev, &mut ws.qs_tmp_dev) }
+                .map_err(|e| format!("dgemm A·Qs inplace: {e}"))?;
+        }
+        //   H_xtx = Qsᵀ · tmp → ws.h_dev.
+        {
+            let cfg_qt = GemmConfig::<f64> {
+                transa: cublasOperation_t::CUBLAS_OP_T, transb: cublasOperation_t::CUBLAS_OP_N,
+                m: p_i, n: p_i, k: p_i, alpha: 1.0, lda: p_i, ldb: p_i, beta: 0.0, ldc: p_i,
+            };
+            // SAFETY: qs_dev p*p (transposed); qs_tmp_dev p*p; h_dev p*p output.
+            unsafe { ws.blas.gemm(cfg_qt, &ws.qs_dev, &ws.qs_tmp_dev, &mut ws.h_dev) }
+                .map_err(|e| format!("dgemm Qsᵀ·A·Qs inplace: {e}"))?;
+        }
+        // H_step = H_xtx + (S + step_lm_lambda·I).
+        let penalty_step = penalty_with_ridge(input.penalty_hessian, input.step_lm_lambda);
+        let penalty_step_col = to_col_major(&penalty_step.view());
+        ws.stream
+            .memcpy_htod(penalty_step_col.as_ref(), &mut ws.penalty_dev)
+            .map_err(|e| format!("upload penalty inplace: {e}"))?;
+        geam_add(&ws.blas, &ws.stream, p, &ws.h_dev, &ws.penalty_dev, &mut ws.h_dev)?;
+
+        // Step 3: rhs = Qsᵀ score_p − S·β + linear_shift  (#257, #260).
+        // First project score_p through Qsᵀ on device (p×p gemv):
+        //   beta_orig_dev = Qsᵀ · rhs_dev,  then swap back.
+        {
+            let cfg_qts = GemvConfig::<f64> {
+                trans: cublasOperation_t::CUBLAS_OP_T, m: p_i, n: p_i, alpha: 1.0,
+                lda: p_i, incx: 1, beta: 0.0, incy: 1,
+            };
+            // SAFETY: qs_dev p*p (transposed); rhs_dev length p; beta_orig_dev length p.
+            unsafe { ws.blas.gemv(cfg_qts, &ws.qs_dev, &ws.rhs_dev, &mut ws.beta_orig_dev) }
+                .map_err(|e| format!("dgemv Qsᵀ·score inplace: {e}"))?;
+            ws.stream
+                .memcpy_dtod(&ws.beta_orig_dev, &mut ws.rhs_dev)
+                .map_err(|e| format!("d2d Qsᵀ·score→rhs inplace: {e}"))?;
+        }
+        // Now download rhs and β (both p-vectors; small, bounded-cost round-trip).
+        // Apply rhs −= S·β and rhs += linear_shift on the host for correctness.
+        let rhs_raw = ws.stream
             .clone_dtoh(&ws.rhs_dev)
-            .map_err(|e| format!("download rhs for correction (inplace): {e}"))?;
-        let beta_raw_corr = ws
-            .stream
+            .map_err(|e| format!("download Qsᵀ·score inplace: {e}"))?;
+        let beta_raw = ws.stream
             .clone_dtoh(input.beta_dev)
-            .map_err(|e| format!("download beta for correction (inplace): {e}"))?;
+            .map_err(|e| format!("download beta inplace: {e}"))?;
         let mut rhs_host = Array1::from_vec(rhs_raw);
-        let beta_host_corr = Array1::from_vec(beta_raw_corr);
-        let s_beta = input.penalty_hessian.dot(&beta_host_corr);
+        let beta_host = Array1::from_vec(beta_raw);
+        // S·β in transformed coordinates (S = input.penalty_hessian in transformed frame).
+        let s_beta = input.penalty_hessian.dot(&beta_host);
         rhs_host -= &s_beta;
         rhs_host += &input.linear_shift;
         ws.stream
@@ -1016,39 +1030,23 @@ extern "C" __global__ void chol_logdet_col_major(
                 rhs_host.as_slice().ok_or("rhs_host not contiguous")?,
                 &mut ws.rhs_dev,
             )
-            .map_err(|e| format!("re-upload corrected rhs (inplace): {e}"))?;
+            .map_err(|e| format!("re-upload corrected rhs inplace: {e}"))?;
 
-        // Factor H_step in-place (ws.h_dev <- Cholesky factor).
+        // Step 4: Cholesky factor + solve in-place.
         potrf_in_place_reuse(
-            &ws.solver,
-            &ws.stream,
-            p,
-            ws.potrf_lwork,
-            &mut ws.h_dev,
-            &mut ws.potrf_work_dev,
-            &mut ws.potrf_info_dev,
+            &ws.solver, &ws.stream, p, ws.potrf_lwork,
+            &mut ws.h_dev, &mut ws.potrf_work_dev, &mut ws.potrf_info_dev,
         )?;
-
-        // Solve H·δ = rhs — ws.rhs_dev <- H⁻¹·rhs = δ, the descent direction.
         potrs_in_place_reuse(
-            &ws.solver,
-            &ws.stream,
-            p,
-            1,
-            &ws.h_dev,
-            &mut ws.rhs_dev,
-            &mut ws.potrs_info_dev,
+            &ws.solver, &ws.stream, p, 1,
+            &ws.h_dev, &mut ws.rhs_dev, &mut ws.potrs_info_dev,
         )?;
-
-        // log|H| via the device-side diagonal kernel — one scalar download.
         let logdet = cholesky_logdet_device(&ws.stream, &shared.ctx, p, &ws.h_dev)?;
-
-        // Check deferred POTRF/POTRS info after logdet (which syncs).
         check_deferred_potrf_info(&ws.stream, &ws.potrf_info_dev)?;
         check_deferred_potrs_info(&ws.stream, &ws.potrs_info_dev)?;
 
-        // ws.rhs_dev holds the Newton descent direction δ = H⁻¹·rhs.
-        // No negation: the corrected RHS already gives the descent direction (#257).
+        // ws.rhs_dev = δ = H⁻¹·(Qsᵀ score_p − Sβ + linear_shift) — descent direction.
+        // No negation: the corrected RHS directly gives the descent direction (#257).
         Ok(logdet)
     }
 

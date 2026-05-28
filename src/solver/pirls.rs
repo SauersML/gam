@@ -7868,8 +7868,14 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                     Some(xt) => xt.view(),
                     None => x_dense,
                 };
-                let s_transformed_view = match &penalty_active {
-                    PirlsPenalty::Dense { s_transformed, .. } => s_transformed.view(),
+                let (s_transformed_view, linear_shift_view, constant_shift_val) =
+                    match &penalty_active {
+                    PirlsPenalty::Dense {
+                        s_transformed,
+                        linear_shift,
+                        constant_shift,
+                        ..
+                    } => (s_transformed.view(), linear_shift.view(), *constant_shift),
                     // SAFETY: the GPU PIRLS dispatch path that reaches this
                     // match is gated on `PirlsPenalty::Dense { .. }` upstream
                     // (see the dispatch-admission check earlier in this
@@ -7905,6 +7911,8 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                     inverse_link: &config.link_kind,
                     x_transformed: x_t_view,
                     s_transformed: s_transformed_view,
+                    linear_shift: linear_shift_view,
+                    constant_shift: constant_shift_val,
                     y,
                     priorweights,
                     offset,

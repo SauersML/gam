@@ -114,8 +114,6 @@ pub fn try_gpu_sigma_stream_pool_eval(
     prior_w: ArrayView1<'_, f64>,
     offset: ArrayView1<'_, f64>,
     admission: crate::gpu::policy::PirlsLoopAdmission,
-    /// Active Gamma dispersion shape (α > 0). Pass `1.0` for non-Gamma families.
-    gamma_shape: f64,
     convergence_tol: f64,
     max_iter: usize,
 ) -> Result<Option<Vec<crate::solver::reml::eval::SigmaPointResult>>, GpuError> {
@@ -128,10 +126,12 @@ pub fn try_gpu_sigma_stream_pool_eval(
         if crate::gpu::runtime::GpuRuntime::global().is_none() {
             return Ok(None);
         }
-        let family = admission
-            .family
-            .and_then(|f| linux_impl::family_kind_to_row(f))
-            .ok_or_else(|| crate::gpu_err!("sigma stream pool: family not in JIT-cached set"))?;
+        let Some(family_kind) = admission.family else {
+            return Ok(None);
+        };
+        let Some(family) = linux_impl::family_kind_to_row(family_kind) else {
+            return Err(crate::gpu_err!("sigma stream pool: family not in JIT-cached set"));
+        };
         let curvature = linux_impl::curvature_kind_to_row(admission.curvature);
         return linux_impl::stream_pool_eval(
             per_sigma,
@@ -140,7 +140,6 @@ pub fn try_gpu_sigma_stream_pool_eval(
             offset,
             family,
             curvature,
-            gamma_shape,
             convergence_tol,
             max_iter,
         );
@@ -148,8 +147,7 @@ pub fn try_gpu_sigma_stream_pool_eval(
 
     #[cfg(not(target_os = "linux"))]
     {
-        // Suppress unused-variable warnings on non-Linux builds.
-        let _ = (y, prior_w, offset, admission, gamma_shape, convergence_tol, max_iter);
+        let _ = (y, prior_w, offset, admission, convergence_tol, max_iter);
         Ok(None)
     }
 }
@@ -201,7 +199,6 @@ mod linux_impl {
         offset: ArrayView1<'_, f64>,
         family: PirlsRowFamily,
         curvature: CurvatureMode,
-        gamma_shape: f64,
         convergence_tol: f64,
         max_iter: usize,
     ) -> Result<Option<Vec<SigmaPointResult>>, crate::gpu::GpuError> {
@@ -226,15 +223,10 @@ mod linux_impl {
             }
         }
 
-        // The `offset` view is used here only for shape-validation.  The GPU
-        // PIRLS loop bakes the offset into `eta` at the start; the loop itself
-        // reads `y` and `prior_w` but not `offset` through the workspace
-        // (PirlsLoopWorkspace uploads y + prior_w; eta is initialised from
-        // beta0 via a gemv, so offset must already be reflected in beta0 or
-        // added later). For sigma-cubature the offset is zero-initialised in
-        // the workspace and we rely on the row-reweight kernel to absorb it.
-        // We keep the parameter in the signature so the caller documents the
-        // intent without needing a separate "no-op" call site.
+        // The offset is not separately threaded through pirls_loop_on_stream.
+        // The loop initialises eta via gemv(x, beta0) without an offset term;
+        // for sigma-cubature the zero-beta0 start means eta starts at 0, which
+        // matches the stateless CPU path that also starts from scratch.
         let _ = offset;
 
         // Bootstrap shared data from the first sigma point to get a context +
@@ -265,16 +257,12 @@ mod linux_impl {
 
         // For each sigma point, upload x_transformed into a fresh shared handle,
         // run pirls_loop on the assigned stream workspace, collect outcomes.
-        // Streams run asynchronously; the synchronise inside pirls_loop_on_stream
-        // (implicit at exit once beta + H are downloaded) serialises that
-        // stream's work before we move to the next point on the same stream.
         let mut outcomes: Vec<SigmaPointResult> = Vec::with_capacity(m);
         for (idx, pt) in per_sigma.iter().enumerate() {
             let stream_idx = idx % n_streams;
 
-            // Upload this sigma point's x_transformed. Reusing bootstrap_shared
-            // for workspace sizes; a new upload is needed per point because
-            // x_transformed = X * Qs(rho) changes with rho.
+            // Upload this sigma point's x_transformed. A new upload is needed
+            // per point because x_transformed = X * Qs(rho) changes with rho.
             let shared = pirls_gpu::upload_shared_pirls_gpu(pt.x_transformed.view())
                 .map_err(|e| {
                     crate::gpu_err!("sigma stream pool upload pt[{idx}] x_transformed: {e}")
@@ -282,22 +270,20 @@ mod linux_impl {
 
             let (ws, loop_ws) = &mut workspace_pairs[stream_idx];
 
+            // pirls_loop_on_stream: family, curvature, beta0, y, prior_w,
+            // penalty_hessian, step_lm_lambda, objective_ridge, max_iter, tol, extra.
+            // The model ridge is already baked into s_transformed; objective_ridge=0.
             let outcome = pirls_gpu::pirls_loop_on_stream(
                 &shared,
                 ws,
                 loop_ws,
                 family,
                 curvature,
-                gamma_shape,
                 beta0.view(),
                 y,
                 prior_w,
                 pt.s_transformed.view(),
-                // step_lm_lambda: initial LM damping for Newton stabilisation.
-                // The model ridge is already baked into s_transformed.
                 1e-6,
-                // objective_ridge: 0.0 because s_transformed carries the full
-                // penalty; no identity ridge enters the exported Hessian.
                 0.0,
                 max_iter,
                 convergence_tol,
@@ -324,9 +310,6 @@ mod linux_impl {
             outcomes.push(sigma_result);
         }
 
-        // If any point returned None the batch is a numerical failure; surface
-        // as Ok(Some(results)) so the caller's existing None-counting logic
-        // (which falls back to first-order on any None in the batch) handles it.
         Ok(Some(outcomes))
     }
 }
