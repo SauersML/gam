@@ -19,6 +19,7 @@ fn spec(name: &str, x: &Array2<f64>) -> ParameterBlockSpec {
         initial_beta: None,
         gauge_priority: 100,
         row_scaling: None,
+        jacobian_callback: None,
     }
 }
 

@@ -817,6 +817,7 @@ impl ParameterBlockInput {
             initial_beta: self.initial_beta,
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         })
     }
 }
@@ -2675,6 +2676,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
             initial_beta: mean_beta_hint,
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         };
         let mut noisespec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
@@ -2686,6 +2688,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
             initial_beta: noise_beta_hint,
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         };
         if meanspec.initial_beta.is_none() || noisespec.initial_beta.is_none() {
             let (betamu0, beta_ls0, _) = gaussian_location_scalewarm_start(
@@ -2825,6 +2828,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
             initial_beta: mean_beta_hint,
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         };
         let mut noisespec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
@@ -2836,6 +2840,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
             initial_beta: noise_beta_hint,
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         };
         if meanspec.initial_beta.is_none() || noisespec.initial_beta.is_none() {
             let (betamu0, beta_ls0, _) = gaussian_location_scalewarm_start(
@@ -2889,6 +2894,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
                 initial_beta: self.wiggle_block.initial_beta.clone(),
                 gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
             },
         ])
     }
@@ -3016,6 +3022,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
             initial_beta: mean_beta_hint,
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         };
         let mut log_sigmaspec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
@@ -3027,6 +3034,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
             initial_beta: noise_beta_hint,
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         };
         if thresholdspec.initial_beta.is_none() || log_sigmaspec.initial_beta.is_none() {
             let (beta_t0, beta_ls0) = binomial_location_scalewarm_start(
@@ -3173,6 +3181,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
             initial_beta: mean_beta_hint,
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         };
         let mut log_sigmaspec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
@@ -3184,6 +3193,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
             initial_beta: noise_beta_hint,
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         };
         if thresholdspec.initial_beta.is_none() || log_sigmaspec.initial_beta.is_none() {
             let (beta_t0, beta_ls0) = binomial_location_scalewarm_start(
@@ -3237,6 +3247,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
                 initial_beta: self.wiggle_block.initial_beta.clone(),
                 gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
             },
         ])
     }
@@ -3759,6 +3770,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 initial_beta: Some(pilot_beta.clone()),
                 gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
             },
             ParameterBlockSpec {
                 name: "wiggle".to_string(),
@@ -3791,6 +3803,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 initial_beta: wiggle_initial_beta.clone(),
                 gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
             },
         ];
         Ok((resolvedspec, design, blocks, eta_derivs))
@@ -7623,6 +7636,41 @@ impl GaussianLocationScaleFamily {
             &mixedweights,
         )
     }
+
+    /// Build the [`BlockEffectiveJacobian`] for block `block_idx` given the
+    /// realised block specs.  Returns an [`AdditiveBlockJacobian`] encoding the
+    /// linear map η_r[i] = X_r[i,:] · β_r:
+    ///
+    /// - block 0 (mu):       output 0 = design rows, output 1 = zeros
+    /// - block 1 (log_sigma): output 0 = zeros, output 1 = design rows
+    pub fn block_effective_jacobian(
+        specs: &[ParameterBlockSpec],
+        block_idx: usize,
+    ) -> Result<Box<dyn BlockEffectiveJacobian>, String> {
+        const N_OUTPUTS: usize = 2;
+        if block_idx >= specs.len() {
+            return Err(format!(
+                "GaussianLocationScaleFamily::block_effective_jacobian: block_idx {} out of range (specs.len()={})",
+                block_idx,
+                specs.len()
+            ));
+        }
+        match block_idx {
+            Self::BLOCK_MU | Self::BLOCK_LOG_SIGMA => {
+                let design = specs[block_idx]
+                    .effective_design("GaussianLocationScaleFamily::block_effective_jacobian")?;
+                Ok(Box::new(AdditiveBlockJacobian {
+                    design,
+                    own_output: block_idx,
+                    n_family_outputs: N_OUTPUTS,
+                }))
+            }
+            other => Err(format!(
+                "GaussianLocationScaleFamily::block_effective_jacobian: unknown block_idx {}",
+                other
+            )),
+        }
+    }
 }
 
 impl CustomFamily for GaussianLocationScaleFamily {
@@ -9577,6 +9625,54 @@ impl GaussianLocationScaleWiggleFamily {
             return self.dense_block_designs_fromspecs(specs).map(Some);
         }
         Ok(None)
+    }
+
+    /// Build the [`BlockEffectiveJacobian`] for block `block_idx`.
+    ///
+    /// The wiggle block (block 2) modulates the inverse link nonlinearly and
+    /// does not contribute a linear additive term to any output η; its
+    /// Jacobian is an `(2 * n, p_wiggle)` zero matrix.
+    ///
+    /// - block 0 (mu):        output 0 = design rows, output 1 = zeros
+    /// - block 1 (log_sigma): output 0 = zeros, output 1 = design rows
+    /// - block 2 (wiggle):    all zeros (nonlinear link modulation)
+    pub fn block_effective_jacobian(
+        specs: &[ParameterBlockSpec],
+        block_idx: usize,
+    ) -> Result<Box<dyn BlockEffectiveJacobian>, String> {
+        const N_OUTPUTS: usize = 2;
+        if block_idx >= specs.len() {
+            return Err(format!(
+                "GaussianLocationScaleWiggleFamily::block_effective_jacobian: block_idx {} out of range ({})",
+                block_idx,
+                specs.len()
+            ));
+        }
+        match block_idx {
+            Self::BLOCK_MU | Self::BLOCK_LOG_SIGMA => {
+                let design = specs[block_idx].effective_design(
+                    "GaussianLocationScaleWiggleFamily::block_effective_jacobian",
+                )?;
+                Ok(Box::new(AdditiveBlockJacobian {
+                    design,
+                    own_output: block_idx,
+                    n_family_outputs: N_OUTPUTS,
+                }))
+            }
+            Self::BLOCK_WIGGLE => {
+                let n = specs[Self::BLOCK_MU].design.nrows();
+                let p = specs[block_idx].design.ncols();
+                Ok(Box::new(AdditiveBlockJacobian {
+                    design: ndarray::Array2::<f64>::zeros((n, p)),
+                    own_output: 0,
+                    n_family_outputs: N_OUTPUTS,
+                }))
+            }
+            other => Err(format!(
+                "GaussianLocationScaleWiggleFamily::block_effective_jacobian: unknown block_idx {}",
+                other
+            )),
+        }
     }
 }
 
@@ -12892,6 +12988,49 @@ impl BinomialMeanWiggleFamily {
             ],
             n,
         ))))
+    }
+
+    /// Build the [`BlockEffectiveJacobian`] for block `block_idx`.
+    ///
+    /// `BinomialMeanWiggle` has a single location output (n_outputs = 1):
+    /// - block 0 (eta):    output 0 = design rows
+    /// - block 1 (wiggle): all zeros (nonlinear link modulation)
+    pub fn block_effective_jacobian(
+        specs: &[ParameterBlockSpec],
+        block_idx: usize,
+    ) -> Result<Box<dyn BlockEffectiveJacobian>, String> {
+        const N_OUTPUTS: usize = 1;
+        if block_idx >= specs.len() {
+            return Err(format!(
+                "BinomialMeanWiggleFamily::block_effective_jacobian: block_idx {} out of range ({})",
+                block_idx,
+                specs.len()
+            ));
+        }
+        match block_idx {
+            Self::BLOCK_ETA => {
+                let design = specs[block_idx]
+                    .effective_design("BinomialMeanWiggleFamily::block_effective_jacobian")?;
+                Ok(Box::new(AdditiveBlockJacobian {
+                    design,
+                    own_output: 0,
+                    n_family_outputs: N_OUTPUTS,
+                }))
+            }
+            Self::BLOCK_WIGGLE => {
+                let n = specs[Self::BLOCK_ETA].design.nrows();
+                let p = specs[block_idx].design.ncols();
+                Ok(Box::new(AdditiveBlockJacobian {
+                    design: ndarray::Array2::<f64>::zeros((n, p)),
+                    own_output: 0,
+                    n_family_outputs: N_OUTPUTS,
+                }))
+            }
+            other => Err(format!(
+                "BinomialMeanWiggleFamily::block_effective_jacobian: unknown block_idx {}",
+                other
+            )),
+        }
     }
 }
 
@@ -16522,6 +16661,40 @@ impl BinomialLocationScaleFamily {
             .assign(&ll_block);
         mirror_upper_to_lower(&mut out);
         Ok(out)
+    }
+
+    /// Build the [`BlockEffectiveJacobian`] for block `block_idx`.
+    ///
+    /// The two-output map is (η_threshold, η_log_sigma):
+    /// - block 0 (threshold):  output 0 = design rows, output 1 = zeros
+    /// - block 1 (log_sigma):  output 0 = zeros, output 1 = design rows
+    pub fn block_effective_jacobian(
+        specs: &[ParameterBlockSpec],
+        block_idx: usize,
+    ) -> Result<Box<dyn BlockEffectiveJacobian>, String> {
+        const N_OUTPUTS: usize = 2;
+        if block_idx >= specs.len() {
+            return Err(format!(
+                "BinomialLocationScaleFamily::block_effective_jacobian: block_idx {} out of range ({})",
+                block_idx,
+                specs.len()
+            ));
+        }
+        match block_idx {
+            Self::BLOCK_T | Self::BLOCK_LOG_SIGMA => {
+                let design = specs[block_idx]
+                    .effective_design("BinomialLocationScaleFamily::block_effective_jacobian")?;
+                Ok(Box::new(AdditiveBlockJacobian {
+                    design,
+                    own_output: block_idx,
+                    n_family_outputs: N_OUTPUTS,
+                }))
+            }
+            other => Err(format!(
+                "BinomialLocationScaleFamily::block_effective_jacobian: unknown block_idx {}",
+                other
+            )),
+        }
     }
 }
 
@@ -20411,6 +20584,56 @@ impl BinomialLocationScaleWiggleHessianRowPieces {
     }
 }
 
+impl BinomialLocationScaleWiggleFamily {
+    /// Build the [`BlockEffectiveJacobian`] for block `block_idx`.
+    ///
+    /// The two-output map is (η_threshold, η_log_sigma).
+    /// The wiggle block operates on the combined linear predictor through the
+    /// nonlinear inverse link and has a zero effective linear Jacobian.
+    ///
+    /// - block 0 (threshold):  output 0 = design rows, output 1 = zeros
+    /// - block 1 (log_sigma):  output 0 = zeros, output 1 = design rows
+    /// - block 2 (wiggle):     all zeros (nonlinear link modulation)
+    pub fn block_effective_jacobian(
+        specs: &[ParameterBlockSpec],
+        block_idx: usize,
+    ) -> Result<Box<dyn BlockEffectiveJacobian>, String> {
+        const N_OUTPUTS: usize = 2;
+        if block_idx >= specs.len() {
+            return Err(format!(
+                "BinomialLocationScaleWiggleFamily::block_effective_jacobian: block_idx {} out of range ({})",
+                block_idx,
+                specs.len()
+            ));
+        }
+        match block_idx {
+            Self::BLOCK_T | Self::BLOCK_LOG_SIGMA => {
+                let design = specs[block_idx].effective_design(
+                    "BinomialLocationScaleWiggleFamily::block_effective_jacobian",
+                )?;
+                Ok(Box::new(AdditiveBlockJacobian {
+                    design,
+                    own_output: block_idx,
+                    n_family_outputs: N_OUTPUTS,
+                }))
+            }
+            Self::BLOCK_WIGGLE => {
+                let n = specs[Self::BLOCK_T].design.nrows();
+                let p = specs[block_idx].design.ncols();
+                Ok(Box::new(AdditiveBlockJacobian {
+                    design: ndarray::Array2::<f64>::zeros((n, p)),
+                    own_output: 0,
+                    n_family_outputs: N_OUTPUTS,
+                }))
+            }
+            other => Err(format!(
+                "BinomialLocationScaleWiggleFamily::block_effective_jacobian: unknown block_idx {}",
+                other
+            )),
+        }
+    }
+}
+
 impl CustomFamily for BinomialLocationScaleWiggleFamily {
     /// The Binomial location-scale-wiggle joint Hessian depends on β because
     /// it involves the nonlinear link function evaluated at the combined
@@ -22870,6 +23093,7 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         }
     }
 
@@ -23094,6 +23318,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
@@ -23107,6 +23332,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
             },
         ];
         let p_total = (p_mu + p_log_sigma) as u64;
@@ -23146,6 +23372,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
@@ -23159,6 +23386,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
             },
         ];
 
@@ -23253,6 +23481,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
@@ -23264,6 +23493,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
             },
         ];
         (family, states, specs)
@@ -23324,6 +23554,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
@@ -23335,6 +23566,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
             },
         ];
         (family, states, specs)
@@ -23661,6 +23893,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
@@ -23672,6 +23905,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
             },
         ];
         assert!(family.inner_coefficient_hessian_hvp_available(&specs));
@@ -24223,6 +24457,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
@@ -24234,6 +24469,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
             },
             ParameterBlockSpec {
                 name: "wiggle".to_string(),
@@ -24245,6 +24481,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
             },
         ];
 
@@ -24374,6 +24611,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
@@ -24385,6 +24623,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
             },
             ParameterBlockSpec {
                 name: "wiggle".to_string(),
@@ -24396,6 +24635,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
             },
         ];
         (family, states, specs, xt, xls, wiggle_design_current)
@@ -24694,6 +24934,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
@@ -24705,6 +24946,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
             },
             ParameterBlockSpec {
                 name: "wiggle".to_string(),
@@ -24716,6 +24958,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
             },
         ];
 
@@ -24839,6 +25082,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
@@ -24850,6 +25094,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
             },
             ParameterBlockSpec {
                 name: "wiggle".to_string(),
@@ -24861,6 +25106,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
             },
         ];
         (family, states, specs, xmu, xls, xw_at_q0)
@@ -25830,6 +26076,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
                 row_scaling: None,
+                jacobian_callback: None,
             }
         }
 
@@ -29232,6 +29479,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
             },
             ParameterBlockSpec {
                 name: "wiggle".to_string(),
@@ -29243,6 +29491,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
             },
         ];
         (family, states, specs, x_eta)
@@ -29355,6 +29604,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
             },
             ParameterBlockSpec {
                 name: "wiggle".to_string(),
@@ -29368,6 +29618,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
             },
         ];
         assert!(family.inner_coefficient_hessian_hvp_available(&specs));

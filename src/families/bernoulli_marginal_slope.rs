@@ -1,11 +1,12 @@
 use crate::custom_family::{
-    BatchedOuterGradientTerms, BlockWorkingSet, BlockwiseFitOptions, CustomFamily,
-    CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
-    ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
-    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, build_block_spatial_psi_derivatives,
-    custom_family_outer_derivatives, evaluate_custom_family_joint_hyper_efs_shared,
-    evaluate_custom_family_joint_hyper_shared, fit_custom_family,
-    joint_hyper_options_for_outer_tolerance,
+    BatchedOuterGradientTerms, BlockEffectiveJacobian, BlockWorkingSet, BlockwiseFitOptions,
+    CustomFamily, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation,
+    ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
+    ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, FamilyEvaluation,
+    FamilyLinearizationState, ParameterBlockSpec, ParameterBlockState,
+    build_block_spatial_psi_derivatives, custom_family_outer_derivatives,
+    evaluate_custom_family_joint_hyper_efs_shared, evaluate_custom_family_joint_hyper_shared,
+    fit_custom_family, joint_hyper_options_for_outer_tolerance,
 };
 use crate::estimate::UnifiedFitResult;
 use crate::estimate::reml::unified::{DenseSpectralOperator, HessianOperator, HyperOperator};
@@ -2019,6 +2020,7 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
                     initial_beta: None,
                     gauge_priority: 200,
                     row_scaling: None,
+                    jacobian_callback: None,
                 });
             }
             specs.push(crate::custom_family::ParameterBlockSpec {
@@ -2033,6 +2035,7 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
                 initial_beta: None,
                 gauge_priority: 100,
                 row_scaling: None,
+                jacobian_callback: None,
             });
             specs
         },
@@ -19623,6 +19626,153 @@ impl ExactNewtonJointPsiWorkspace for BernoulliMarginalSlopeExactNewtonJointPsiW
     }
 }
 
+// ── BlockEffectiveJacobian impls for BMS ─────────────────────────────────────
+//
+// BMS has a single Bernoulli output per row (n_outputs = 1). The observed η is
+//
+//   η_i = q_i · c_i + s·g_i · z_i
+//
+// where
+//   q_i   = marginal_design[i,:] · β_m + offset_m[i]      (marginal η)
+//   g_i   = logslope_design[i,:] · β_s + offset_s[i]      (log-slope η)
+//   s     = probit_frailty_scale(gaussian_frailty_sd)
+//   c_i   = sqrt(1 + (s·g_i)²)
+//
+// Per-block Jacobians ∂η_i / ∂β_block:
+//
+//   Marginal block  → ∂η_i/∂β_m = c_i · M_i
+//     (M_i = marginal_design row i; c_i is β-dependent but does not involve β_m)
+//
+//   Logslope block  → ∂η_i/∂β_s = (q_i · s²·g_i / c_i + s·z_i) · G_i
+//     (G_i = logslope_design row i)
+//
+// score_warp_dev and link_dev blocks use IFT-corrected η, but their
+// contribution to the identifiability audit is captured by the raw design
+// columns (the IFT correction adds a direction already in the anchor span at
+// compile time). These blocks leave jacobian_callback = None and rely on
+// effective_design (= raw design) for the flat audit.
+
+/// β-dependent Jacobian for the BMS marginal block.
+///
+/// ∂η_i/∂β_m = c_i · marginal_design[i,:]
+/// where c_i = sqrt(1 + (s · (logslope_design[i,:] · β_s + offset_s[i]))²).
+struct BmsMarginalJacobian {
+    marginal_design: Arc<DesignMatrix>,
+    logslope_design: Arc<DesignMatrix>,
+    offset_m: Array1<f64>,
+    offset_s: Array1<f64>,
+    /// Number of marginal columns (= range of β_m in the full β vector).
+    p_marginal: usize,
+    probit_scale: f64,
+}
+
+impl BlockEffectiveJacobian for BmsMarginalJacobian {
+    fn effective_jacobian_at(
+        &self,
+        state: &FamilyLinearizationState<'_>,
+    ) -> Result<Array2<f64>, String> {
+        let beta = state.beta;
+        let p_m = self.p_marginal;
+        let beta_s = if beta.len() > p_m {
+            &beta[p_m..]
+        } else {
+            &[][..]
+        };
+        let n = self.marginal_design.nrows();
+        let p_block = self.marginal_design.ncols();
+        let s = self.probit_scale;
+        let mut out = Array2::<f64>::zeros((n, p_block));
+        for i in 0..n {
+            // compute g_i = logslope_design[i,:] · β_s + offset_s[i]
+            let g_i = if p_m < beta.len() && self.logslope_design.ncols() > 0 {
+                let p_s = self.logslope_design.ncols().min(beta_s.len());
+                let mut acc = self.offset_s[i];
+                for k in 0..p_s {
+                    let x_ik = self.logslope_design.get_element(i, k).unwrap_or(0.0);
+                    acc += x_ik * beta_s[k];
+                }
+                acc
+            } else {
+                self.offset_s[i]
+            };
+            let sg = s * g_i;
+            let c_i = (1.0 + sg * sg).sqrt();
+            // row i of output = c_i * marginal_design[i,:]
+            for k in 0..p_block {
+                let x_ik = self.marginal_design.get_element(i, k).unwrap_or(0.0);
+                out[[i, k]] = c_i * x_ik;
+            }
+        }
+        Ok(out)
+    }
+
+    fn n_outputs(&self) -> usize {
+        1
+    }
+}
+
+/// β-dependent Jacobian for the BMS logslope block.
+///
+/// ∂η_i/∂β_s = (q_i · s²·g_i / c_i + s·z_i) · logslope_design[i,:]
+/// where q_i = marginal_design[i,:] · β_m + offset_m[i],
+///       g_i = logslope_design[i,:] · β_s + offset_s[i],
+///       c_i = sqrt(1 + (s·g_i)²).
+struct BmsLogslopeJacobian {
+    marginal_design: Arc<DesignMatrix>,
+    logslope_design: Arc<DesignMatrix>,
+    offset_m: Array1<f64>,
+    offset_s: Array1<f64>,
+    z: Arc<[f64]>,
+    /// Number of marginal columns (= start of β_s in the full β vector).
+    p_marginal: usize,
+    probit_scale: f64,
+}
+
+impl BlockEffectiveJacobian for BmsLogslopeJacobian {
+    fn effective_jacobian_at(
+        &self,
+        state: &FamilyLinearizationState<'_>,
+    ) -> Result<Array2<f64>, String> {
+        let beta = state.beta;
+        let p_m = self.p_marginal;
+        let beta_m = if beta.len() >= p_m { &beta[..p_m] } else { &beta[..] };
+        let beta_s = if beta.len() > p_m { &beta[p_m..] } else { &[][..] };
+        let n = self.logslope_design.nrows();
+        let p_block = self.logslope_design.ncols();
+        let s = self.probit_scale;
+        let mut out = Array2::<f64>::zeros((n, p_block));
+        for i in 0..n {
+            // q_i = marginal_design[i,:] · β_m + offset_m[i]
+            let mut q_i = self.offset_m[i];
+            for k in 0..beta_m.len().min(self.marginal_design.ncols()) {
+                let x_ik = self.marginal_design.get_element(i, k).unwrap_or(0.0);
+                q_i += x_ik * beta_m[k];
+            }
+            // g_i = logslope_design[i,:] · β_s + offset_s[i]
+            let mut g_i = self.offset_s[i];
+            for k in 0..beta_s.len().min(p_block) {
+                let x_ik = self.logslope_design.get_element(i, k).unwrap_or(0.0);
+                g_i += x_ik * beta_s[k];
+            }
+            let sg = s * g_i;
+            let c_i = (1.0 + sg * sg).sqrt();
+            // scalar per-row factor: q_i · s²·g_i / c_i + s·z_i
+            let z_i = self.z[i];
+            let factor = q_i * s * s * g_i / c_i + s * z_i;
+            // row i of output = factor * logslope_design[i,:]
+            for k in 0..p_block {
+                let x_ik = self.logslope_design.get_element(i, k).unwrap_or(0.0);
+                out[[i, k]] = factor * x_ik;
+            }
+        }
+        Ok(out)
+    }
+
+    fn n_outputs(&self) -> usize {
+        1
+    }
+}
+
 fn build_blockspec(
     name: &str,
     design: &TermCollectionDesign,
@@ -19641,6 +19791,88 @@ fn build_blockspec(
         initial_beta: beta_hint,
         gauge_priority: 100,
         row_scaling: None,
+        jacobian_callback: None,
+    }
+}
+
+fn build_marginal_blockspec_bms(
+    design: &TermCollectionDesign,
+    baseline: f64,
+    offset: &Array1<f64>,
+    rho: Array1<f64>,
+    beta_hint: Option<Array1<f64>>,
+    logslope_design: &TermCollectionDesign,
+    logslope_offset: &Array1<f64>,
+    logslope_baseline: f64,
+    z: Arc<[f64]>,
+    p_marginal: usize,
+    probit_scale: f64,
+) -> ParameterBlockSpec {
+    let marginal_arc = Arc::new(design.design.clone());
+    let logslope_arc = Arc::new(logslope_design.design.clone());
+    let offset_s = logslope_offset + logslope_baseline;
+    let offset_m = offset + baseline;
+    let callback: Arc<dyn BlockEffectiveJacobian> = Arc::new(BmsMarginalJacobian {
+        marginal_design: Arc::clone(&marginal_arc),
+        logslope_design: Arc::clone(&logslope_arc),
+        offset_m: offset_m.clone(),
+        offset_s,
+        p_marginal,
+        probit_scale,
+    });
+    // logslope_arc held by callback; z not needed here
+    drop(z);
+    ParameterBlockSpec {
+        name: "marginal_surface".to_string(),
+        design: (*marginal_arc).clone(),
+        offset: offset_m,
+        penalties: design.penalties_as_penalty_matrix(),
+        nullspace_dims: design.nullspace_dims.clone(),
+        initial_log_lambdas: rho,
+        initial_beta: beta_hint,
+        gauge_priority: 100,
+        row_scaling: None,
+        jacobian_callback: Some(callback),
+    }
+}
+
+fn build_logslope_blockspec_bms(
+    design: &TermCollectionDesign,
+    baseline: f64,
+    offset: &Array1<f64>,
+    rho: Array1<f64>,
+    beta_hint: Option<Array1<f64>>,
+    marginal_design: &TermCollectionDesign,
+    marginal_offset: &Array1<f64>,
+    marginal_baseline: f64,
+    z: Arc<[f64]>,
+    p_marginal: usize,
+    probit_scale: f64,
+) -> ParameterBlockSpec {
+    let marginal_arc = Arc::new(marginal_design.design.clone());
+    let logslope_arc = Arc::new(design.design.clone());
+    let offset_m = marginal_offset + marginal_baseline;
+    let offset_s = offset + baseline;
+    let callback: Arc<dyn BlockEffectiveJacobian> = Arc::new(BmsLogslopeJacobian {
+        marginal_design: Arc::clone(&marginal_arc),
+        logslope_design: Arc::clone(&logslope_arc),
+        offset_m,
+        offset_s: offset_s.clone(),
+        z,
+        p_marginal,
+        probit_scale,
+    });
+    ParameterBlockSpec {
+        name: "logslope_surface".to_string(),
+        design: (*logslope_arc).clone(),
+        offset: offset_s,
+        penalties: design.penalties_as_penalty_matrix(),
+        nullspace_dims: design.nullspace_dims.clone(),
+        initial_log_lambdas: rho,
+        initial_beta: beta_hint,
+        gauge_priority: 100,
+        row_scaling: None,
+        jacobian_callback: Some(callback),
     }
 }
 
@@ -19920,16 +20152,25 @@ pub fn fit_bernoulli_marginal_slope_terms(
         match outcome {
             FlexCompileOutcome::Reparameterised => Some(prepared),
             FlexCompileOutcome::FullyAliased { reason } => {
-                log::warn!(
-                    "[BMS cross-block identifiability] score-warp block fully aliased \
-                     by marginal+logslope anchors; dropping the block. {reason}"
-                );
+                // Record via the structured channel. Build a zero-column
+                // prepared block so the unified audit sees score_warp_dev
+                // with effective_dim=0 and attributes the drop via
+                // dropped_columns rather than a family-side log message.
                 cross_block_warnings.push(CrossBlockIdentifiabilityWarning {
                     candidate_label: "score_warp",
                     anchor_summary: "marginal+logslope".to_string(),
                     reason,
                 });
-                None
+                let n_rows = prepared.block.design.nrows();
+                prepared.block.design = DesignMatrix::Dense(
+                    crate::matrix::DenseDesignMatrix::from(
+                        ndarray::Array2::<f64>::zeros((n_rows, 0)),
+                    ),
+                );
+                prepared.block.penalties.clear();
+                prepared.block.nullspace_dims.clear();
+                prepared.block.initial_beta = Some(ndarray::Array1::zeros(0));
+                Some(prepared)
             }
         }
     } else {
@@ -20043,16 +20284,24 @@ pub fn fit_bernoulli_marginal_slope_terms(
         match outcome {
             FlexCompileOutcome::Reparameterised => Some(prepared),
             FlexCompileOutcome::FullyAliased { reason } => {
-                log::warn!(
-                    "[BMS cross-block identifiability] link-deviation block fully aliased \
-                     by parametric + score-warp anchors; dropping the block. {reason}"
-                );
+                // Record via the structured channel. Build a zero-column
+                // prepared block so the unified audit sees link_dev with
+                // effective_dim=0 and attributes the drop via dropped_columns.
                 cross_block_warnings.push(CrossBlockIdentifiabilityWarning {
                     candidate_label: "link_deviation",
                     anchor_summary: "marginal+logslope+score_warp".to_string(),
                     reason,
                 });
-                None
+                let n_rows = prepared.block.design.nrows();
+                prepared.block.design = DesignMatrix::Dense(
+                    crate::matrix::DenseDesignMatrix::from(
+                        ndarray::Array2::<f64>::zeros((n_rows, 0)),
+                    ),
+                );
+                prepared.block.penalties.clear();
+                prepared.block.nullspace_dims.clear();
+                prepared.block.initial_beta = Some(ndarray::Array1::zeros(0));
+                Some(prepared)
             }
         }
     } else {
@@ -20552,6 +20801,7 @@ mod tests {
             initial_beta: Some(Array1::zeros(p)),
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         }
     }
 
@@ -23487,6 +23737,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
                 row_scaling: None,
+                jacobian_callback: None,
             })
             .collect();
         let small_cost = default_coefficient_hessian_cost(&small_specs);
@@ -23515,6 +23766,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
                 row_scaling: None,
+                jacobian_callback: None,
             })
             .collect();
         let big_cost = default_coefficient_hessian_cost(&big_specs);
@@ -23546,6 +23798,7 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         }];
         let ctn_cost: u64 = 400_000u64 * 300 * 300;
         assert_eq!(
@@ -23576,6 +23829,7 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         }];
         assert_eq!(
             exact_outer_order_with_outer_hvp(&huge_k_specs, 0, true),
@@ -23624,6 +23878,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
                 row_scaling: None,
+                jacobian_callback: None,
             },
             ParameterBlockSpec {
                 name: "logslope".to_string(),
@@ -23637,6 +23892,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
                 row_scaling: None,
+                jacobian_callback: None,
             },
         ];
 

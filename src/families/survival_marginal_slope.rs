@@ -17607,6 +17607,7 @@ fn build_time_blockspec(
         // OTHER block, so time_surface receives the highest priority.
         gauge_priority: 200,
         row_scaling: None,
+        jacobian_callback: None,
     }
 }
 
@@ -17640,6 +17641,7 @@ fn build_logslope_blockspec(
         // audit sees two copies of the raw basis and flags them as a
         // fatal alias.
         row_scaling: Some(z_scaling),
+        jacobian_callback: None,
     }
 }
 
@@ -17665,6 +17667,7 @@ fn build_marginal_blockspec(
         // logslope_surface.
         gauge_priority: 150,
         row_scaling: None,
+        jacobian_callback: None,
     }
 }
 
@@ -19024,16 +19027,35 @@ pub fn fit_survival_marginal_slope_terms(
                 &spec.z,
             )?),
             FlexCompileOutcome::FullyAliased { reason } => {
-                log::warn!(
-                    "[survival-marginal-slope cross-block identifiability] score-warp block fully aliased \
-                     by marginal+logslope anchors; dropping the block. {reason}"
-                );
+                // Record via the structured channel — the unified audit
+                // will attribute the drop to score_warp_dev via
+                // dropped_columns rather than a family-side side message.
+                // Build a zero-column prepared block so the audit sees
+                // the block with effective_dim=0 and populates aliased_pairs
+                // correctly (gauge_priority=80 ensures the drop is attributed
+                // to score_warp_dev, not to any higher-priority block).
                 cross_block_warnings.push(CrossBlockIdentifiabilityWarning {
                     candidate_label: "score_warp",
                     anchor_summary: "marginal+logslope".to_string(),
                     reason,
                 });
-                None
+                let zero_block = crate::families::gamlss::ParameterBlockInput {
+                    design: crate::linalg::matrix::DesignMatrix::Dense(
+                        crate::linalg::matrix::DenseDesignMatrix::from(
+                            ndarray::Array2::<f64>::zeros((n, 0)),
+                        ),
+                    ),
+                    offset: ndarray::Array1::zeros(n),
+                    penalties: Vec::new(),
+                    nullspace_dims: Vec::new(),
+                    initial_log_lambdas: None,
+                    initial_beta: Some(ndarray::Array1::zeros(0)),
+                };
+                Some(PerZScoreWarpPrepared {
+                    block: zero_block,
+                    runtime: base.runtime,
+                    score_dim: spec.z.ncols(),
+                })
             }
         }
     } else {
@@ -19105,16 +19127,26 @@ pub fn fit_survival_marginal_slope_terms(
         match outcome {
             FlexCompileOutcome::Reparameterised => Some(prepared),
             FlexCompileOutcome::FullyAliased { reason } => {
-                log::warn!(
-                    "[survival-marginal-slope cross-block identifiability] link-deviation block fully aliased \
-                     by marginal+logslope anchors; dropping the block. {reason}"
-                );
+                // Record via the structured channel. Build a zero-column
+                // prepared block so the unified audit sees link_dev with
+                // effective_dim=0 and attributes the drop via dropped_columns
+                // (gauge_priority=60 ensures link_dev is always the lower-
+                // priority participant in any alias pair with parametric blocks).
                 cross_block_warnings.push(CrossBlockIdentifiabilityWarning {
                     candidate_label: "link_deviation",
                     anchor_summary: "marginal+logslope".to_string(),
                     reason,
                 });
-                None
+                let n_rows = prepared.block.design.nrows();
+                prepared.block.design = crate::linalg::matrix::DesignMatrix::Dense(
+                    crate::linalg::matrix::DenseDesignMatrix::from(
+                        ndarray::Array2::<f64>::zeros((n_rows, 0)),
+                    ),
+                );
+                prepared.block.penalties.clear();
+                prepared.block.nullspace_dims.clear();
+                prepared.block.initial_beta = Some(ndarray::Array1::zeros(0));
+                Some(prepared)
             }
         }
     } else {
@@ -21045,6 +21077,7 @@ mod tests {
             initial_beta: Some(Array1::zeros(cols)),
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         }
     }
 
@@ -23617,6 +23650,7 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         };
         let constraints = family
             .block_linear_constraints(&[], 0, &spec)
@@ -23687,6 +23721,7 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         };
 
         let constraints = family
@@ -23939,6 +23974,7 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         };
         let err = family
             .post_update_block_beta(
@@ -24011,6 +24047,7 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         };
         let current = array![0.4, 7.0];
         // qd1 at current = 1.0·0.4 + 0.0·7.0 + 1e-6 ≈ 0.4 (feasible)
@@ -24087,6 +24124,7 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         };
         // current qd1 = -1.0 + 1e-6 < guard → infeasible.
         let err = family

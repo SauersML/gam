@@ -2318,9 +2318,44 @@ pub enum MaternIdentifiability {
 }
 
 /// Duchon null-space polynomial degree.
-/// `0` keeps the constant null space (`m=1`), `1` keeps
-/// `[1, x_1, ..., x_d]` (`m=2`), and `Degree(k)` keeps all monomials
-/// with total degree <= k.
+///
+/// Controls the polynomial null space of the Duchon / polyharmonic spline. The
+/// Duchon seminorm `‖D^m f‖²` annihilates all polynomials of total degree
+/// `< m`, so those polynomials must be handled as explicit unpenalized columns.
+///
+/// The user-facing `order` knob selects the polynomial degree cutoff `r`, and
+/// the resulting polynomial null space has dimension `C(d + r, r)` where `d`
+/// is the covariate dimension.  In the `duchon(...)` formula DSL:
+///
+/// | `order=` | Variant         | max total degree | null-space dim  |
+/// |----------|-----------------|------------------|-----------------|
+/// | `0`      | `Zero`          | 0                | `C(d+0,0) = 1`  |
+/// | `1`      | `Linear`        | 1                | `C(d+1,1) = d+1`|
+/// | `k≥2`    | `Degree(k)`     | k                | `C(d+k,k)`      |
+///
+/// **How the polynomial null space is consumed during basis construction:**
+///
+/// 1. `polynomial_block_from_order` materialises an `(n, C(d+r,r))` block `P`
+///    of monomials up to total degree `r` at the selected `centers`.
+/// 2. `kernel_constraint_nullspace` computes `Z = null(P_centers^T)`, a
+///    `(k, k − C(d+r,r))` matrix. Reparameterising the radial kernel
+///    coefficients as `α = Z γ` enforces the side condition `P_centers^T α = 0`
+///    and yields `k − C(d+r,r)` free kernel parameters.
+/// 3. The polynomial block `P_data` evaluated at the data rows is appended to
+///    the kernel block `Φ Z`, giving a total of
+///    `(k − C(d+r,r)) + C(d+r,r) = k` columns before the spatial
+///    identifiability transform.  Crucially, the total width equals the
+///    requested center count `k`, **not** `k + C(d+r,r)`.
+///
+/// **Example — `duchon(PC1, PC2, PC3, centers=10, order=1)` (d=3):**
+///
+/// - Polynomial null space: `C(3+1,1) = 4` monomials `{1, x₁, x₂, x₃}`.
+/// - Kernel columns after constraint: `10 − 4 = 6`.
+/// - Appended polynomial block: 4 columns.
+/// - Pre-identifiability total: `6 + 4 = 10` columns, i.e. exactly `centers`.
+///
+/// The variant naming matches the Duchon `m` parameter:
+/// `Zero` → `m=1`, `Linear` → `m=2`, `Degree(k)` → `m=k+1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DuchonNullspaceOrder {
     Zero,
@@ -12947,6 +12982,34 @@ fn frozen_spatial_identifiability_transform(
     }
 }
 
+/// Returns the parametric-constraint columns used by the standalone
+/// `OrthogonalToParametric` spatial identifiability transform.
+///
+/// **What it contains:** a single all-ones column (the global intercept).
+///
+/// **What it consumes vs. what it does not:**
+///
+/// - *Consumes* (orthogonalises the smooth against): the intercept direction
+///   only.  After this transform the smooth columns have zero unweighted mean,
+///   so they cannot absorb a global additive constant that belongs to the
+///   intercept parameter.
+///
+/// - *Does not consume*: the full polynomial null space of the Duchon kernel
+///   (constants + linear + higher-order monomials).  The linear and higher
+///   monomial directions in `[1, x₁, …, x_d]` are already handled by the
+///   kernel side-condition projection inside `kernel_constraint_nullspace` —
+///   that step compresses the radial kernel block from `k` columns down to
+///   `k − C(d+r, r)` columns, so those directions never appear as free
+///   smooth columns in the first place.  The spatial identifiability transform
+///   only needs to remove the global-intercept residual left over after that
+///   projection.
+///
+/// - *Does not consume*: cross-block aliases that arise when the same Duchon
+///   smooth appears in multiple formula channels (e.g. marginal and logslope).
+///   Two channels with identical raw bases have cosine-similarity 1.0 between
+///   the corresponding columns; that aliasing is detected and resolved by the
+///   joint cross-block identifiability audit (`audit_identifiability` /
+///   `audit_identifiability_channel_aware`), not here.
 fn spatial_parametric_constraint_block(data: ArrayView2<'_, f64>) -> Array2<f64> {
     let n = data.nrows();
     Array2::<f64>::ones((n, 1))
@@ -13019,6 +13082,17 @@ fn build_matern_kernel_penalty(
     Ok(penalty_kernel)
 }
 
+/// Compute the spatial identifiability transform for a dense design matrix.
+///
+/// For the `OrthogonalToParametric` policy the transform orthogonalises `design`
+/// against the **intercept only** (a column of ones built from `data`).  This
+/// removes one direction from the smooth's column space, so a basis with
+/// pre-transform width `p` yields a post-transform width of `p − 1`.
+///
+/// The polynomial null space of the Duchon kernel is consumed *upstream* by
+/// `kernel_constraint_nullspace`, not here.  See
+/// [`spatial_parametric_constraint_block`] for a precise description of what
+/// this step does and does not consume.
 fn spatial_identifiability_transform_from_design(
     data: ArrayView2<'_, f64>,
     design: ArrayView2<'_, f64>,
@@ -15145,6 +15219,21 @@ fn shared_owned_centers_matrix_from_view(centers: ArrayView2<'_, f64>) -> Arc<Ar
     Arc::new(centers.to_owned())
 }
 
+/// Compute the kernel reparameterisation transform `Z = null(P_centers^T)`.
+///
+/// `Z` is a `(k, k − C(d+r, r))` orthonormal matrix whose columns span the
+/// null space of the polynomial side-condition system.  Reparameterising the
+/// radial kernel coefficients as `α = Z γ` enforces `P_centers^T α = 0` and
+/// reduces the kernel column count from `k` to `k − C(d+r, r)`.
+///
+/// After this projection the polynomial block `P_data` is appended as separate
+/// explicit unpenalized columns (see `build_duchon_basis_designwithworkspace`),
+/// so the pre-identifiability total width is always `k` (equal to the center
+/// count), regardless of the polynomial null-space dimension.
+///
+/// This is the step that absorbs the full `C(d+r, r)`-dimensional polynomial
+/// null space.  The subsequent `spatial_parametric_constraint_block` step only
+/// removes the intercept.
 fn kernel_constraint_nullspace(
     centers: ArrayView2<'_, f64>,
     order: DuchonNullspaceOrder,
@@ -22356,6 +22445,24 @@ pub fn build_duchon_basiswithworkspace(
     })
 }
 
+/// Materialise the polynomial null-space block for a Duchon basis.
+///
+/// Returns an `(n, C(d+r, r))` matrix whose columns are all monomials of total
+/// degree `≤ r` evaluated at `points`, where `r` is the degree implied by
+/// `order` and `d = points.ncols()`.
+///
+/// | `order`        | columns        | content                      |
+/// |----------------|----------------|------------------------------|
+/// | `Zero`         | 1              | constant `1`                 |
+/// | `Linear`       | `d + 1`        | `[1, x₁, …, x_d]`           |
+/// | `Degree(k)`    | `C(d+k, k)`   | all monomials ≤ degree `k`   |
+///
+/// **Role in basis construction:**
+/// At *centers*, this block forms the side-condition matrix `Q` whose null
+/// space `null(Q^T)` is the kernel reparameterisation transform `Z`.  At
+/// *data rows*, the same block is appended as explicit unpenalized columns so
+/// the smooth can represent low-degree polynomial trends.  The column count
+/// equals `C(d + r, r)` by the stars-and-bars identity.
 fn polynomial_block_from_order(
     points: ArrayView2<'_, f64>,
     order: DuchonNullspaceOrder,

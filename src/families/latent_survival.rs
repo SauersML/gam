@@ -941,6 +941,7 @@ fn build_time_blockspec(
         initial_beta: prepared.initial_beta.clone(),
         gauge_priority: 100,
         row_scaling: None,
+        jacobian_callback: None,
     }
 }
 
@@ -955,6 +956,7 @@ fn build_mean_blockspec(design: &TermCollectionDesign, offset: Array1<f64>) -> P
         initial_beta: None,
         gauge_priority: 100,
         row_scaling: None,
+        jacobian_callback: None,
     }
 }
 
@@ -975,6 +977,7 @@ fn build_log_sigma_blockspec(initial_sigma: f64) -> ParameterBlockSpec {
         )),
         gauge_priority: 100,
         row_scaling: None,
+        jacobian_callback: None,
     }
 }
 
@@ -4054,6 +4057,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
                 row_scaling: None,
+                jacobian_callback: None,
             })
             .collect()
     }
@@ -4135,6 +4139,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
                 row_scaling: None,
+                jacobian_callback: None,
             },
             ParameterBlockSpec {
                 name: "mean".to_string(),
@@ -4149,6 +4154,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
                 row_scaling: None,
+                jacobian_callback: None,
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
@@ -4163,6 +4169,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
                 row_scaling: None,
+                jacobian_callback: None,
             },
         ];
         let p_total = p_time + p_mean + p_log_sigma;

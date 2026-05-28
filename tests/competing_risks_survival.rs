@@ -73,6 +73,7 @@ fn fit_constant_exposure_cause_specific(event_counts: &[usize], n: usize) -> Arr
             ])),
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         });
     }
     let family = CauseSpecificRoystonParmarFamily::new(blocks)

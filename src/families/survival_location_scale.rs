@@ -1,12 +1,13 @@
 use crate::basis::BasisOptions;
 use crate::custom_family::{
-    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
-    CustomFamilyJointDesignChannel, CustomFamilyJointDesignPairContribution,
-    CustomFamilyJointPsiOperator, CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef,
-    CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
+    AdditiveBlockJacobian, BlockEffectiveJacobian, BlockWorkingSet, BlockwiseFitOptions,
+    CustomFamily, CustomFamilyBlockPsiDerivative, CustomFamilyJointDesignChannel,
+    CustomFamilyJointDesignPairContribution, CustomFamilyJointPsiOperator,
+    CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef, CustomFamilyWarmStart,
+    ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
-    ExactNewtonOuterCurvature, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
-    PenaltyMatrix, PsiDesignMap, build_embedded_dense_psi_operator,
+    ExactNewtonOuterCurvature, FamilyEvaluation, FamilyLinearizationState, ParameterBlockSpec,
+    ParameterBlockState, PenaltyMatrix, PsiDesignMap, build_embedded_dense_psi_operator,
     build_rowwise_kronecker_psi_operator, evaluate_custom_family_joint_hyper,
     evaluate_custom_family_joint_hyper_efs, first_psi_linear_map, fit_custom_family,
     resolve_custom_family_x_psi_map, shared_dense_arc, weighted_crossprod_psi_maps,
@@ -4298,6 +4299,7 @@ fn prepare_survival_location_scale_model(
         initial_beta: time_prepared.initial_beta.clone(),
         gauge_priority: 100,
         row_scaling: None,
+        jacobian_callback: None,
     };
 
     let threshold_prep = prepare_cov_block_kind(&spec.threshold_block)?;
@@ -4380,6 +4382,7 @@ fn prepare_survival_location_scale_model(
         initial_beta: threshold_initial_beta,
         gauge_priority: 100,
         row_scaling: None,
+        jacobian_callback: None,
     };
 
     let survival_primary_design = DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(
@@ -4487,6 +4490,7 @@ fn prepare_survival_location_scale_model(
         initial_beta: log_sigma_initial_beta,
         gauge_priority: 100,
         row_scaling: None,
+        jacobian_callback: None,
     };
     let wigglespec = if let Some(w) = spec.linkwiggle_block.as_ref() {
         Some(ParameterBlockSpec {
@@ -4517,6 +4521,7 @@ fn prepare_survival_location_scale_model(
             initial_beta: w.initial_beta.clone(),
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         })
     } else {
         None
@@ -8571,6 +8576,57 @@ impl SurvivalLocationScaleFamily {
 
         Ok((ll, block_gradients))
     }
+
+    /// Build the [`BlockEffectiveJacobian`] for block `block_idx` given the
+    /// realised block specs.
+    ///
+    /// Survival location-scale has three linear outputs per row:
+    ///   - output 0: η_time       ← time_transform block (block 0)
+    ///   - output 1: η_threshold  ← threshold block (block 1)
+    ///   - output 2: η_log_sigma  ← log_sigma block (block 2)
+    ///
+    /// The optional linkwiggle block (block 3) modulates the inverse link
+    /// nonlinearly and has an all-zero effective linear Jacobian.
+    ///
+    /// The stacked Jacobian for block k has shape `(3 * n, p_k)`.
+    pub fn block_effective_jacobian(
+        specs: &[ParameterBlockSpec],
+        block_idx: usize,
+    ) -> Result<Box<dyn BlockEffectiveJacobian>, String> {
+        const N_OUTPUTS: usize = 3;
+        if block_idx >= specs.len() {
+            return Err(format!(
+                "SurvivalLocationScaleFamily::block_effective_jacobian: block_idx {} out of range ({})",
+                block_idx,
+                specs.len()
+            ));
+        }
+        match block_idx {
+            Self::BLOCK_TIME | Self::BLOCK_THRESHOLD | Self::BLOCK_LOG_SIGMA => {
+                let design = specs[block_idx].effective_design(
+                    "SurvivalLocationScaleFamily::block_effective_jacobian",
+                )?;
+                Ok(Box::new(AdditiveBlockJacobian {
+                    design,
+                    own_output: block_idx,
+                    n_family_outputs: N_OUTPUTS,
+                }))
+            }
+            Self::BLOCK_LINK_WIGGLE => {
+                let n = specs[Self::BLOCK_TIME].design.nrows();
+                let p = specs[block_idx].design.ncols();
+                Ok(Box::new(AdditiveBlockJacobian {
+                    design: ndarray::Array2::<f64>::zeros((n, p)),
+                    own_output: 0,
+                    n_family_outputs: N_OUTPUTS,
+                }))
+            }
+            other => Err(format!(
+                "SurvivalLocationScaleFamily::block_effective_jacobian: unknown block_idx {}",
+                other
+            )),
+        }
+    }
 }
 
 /// Observed vs expected information: The survival location-scale family uses
@@ -11063,6 +11119,7 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         };
         let specs = vec![
             mk_spec("time", p_time),
@@ -11094,6 +11151,7 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         };
         let specs = vec![
             mk_spec("time", 200),
@@ -11127,6 +11185,7 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         };
         let specs = vec![
             mk_spec("time", 200),
@@ -11164,6 +11223,7 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         };
 
         let feasible = family
@@ -11306,6 +11366,7 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         };
         let returned = family
             .post_update_block_beta(
@@ -11549,6 +11610,7 @@ mod tests {
                 initial_beta: Some(array![0.2]),
                 gauge_priority: 100,
                 row_scaling: None,
+                jacobian_callback: None,
             },
             ParameterBlockSpec {
                 name: "threshold".to_string(),
@@ -11564,6 +11626,7 @@ mod tests {
                 initial_beta: Some(array![0.35]),
                 gauge_priority: 100,
                 row_scaling: None,
+                jacobian_callback: None,
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
@@ -11579,6 +11642,7 @@ mod tests {
                 initial_beta: Some(array![-0.15]),
                 gauge_priority: 100,
                 row_scaling: None,
+                jacobian_callback: None,
             },
         ]
     }
