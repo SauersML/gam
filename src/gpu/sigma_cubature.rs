@@ -202,6 +202,7 @@ mod linux_impl {
         offset: ArrayView1<'_, f64>,
         family: PirlsRowFamily,
         curvature: CurvatureMode,
+        gamma_shape: f64,
         convergence_tol: f64,
         max_iter: usize,
     ) -> Result<Option<Vec<SigmaPointResult>>, crate::gpu::GpuError> {
@@ -273,7 +274,7 @@ mod linux_impl {
 
             let (ws, loop_ws) = &mut workspace_pairs[stream_idx];
 
-            // pirls_loop_on_stream: family, curvature, beta0, y, prior_w,
+            // pirls_loop_on_stream: family, curvature, gamma_shape, beta0, y, prior_w,
             // penalty_hessian, step_lm_lambda, objective_ridge, max_iter, tol, extra.
             // The model ridge is already baked into s_transformed; objective_ridge=0.
             let outcome = pirls_gpu::pirls_loop_on_stream(
@@ -282,6 +283,7 @@ mod linux_impl {
                 loop_ws,
                 family,
                 curvature,
+                gamma_shape,
                 beta0.view(),
                 y,
                 prior_w,
