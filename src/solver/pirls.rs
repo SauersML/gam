@@ -5194,7 +5194,14 @@ where
                             //     Part B).  On Unavailable/RidgeBump the
                             //     closure is dropped and the CPU-only path
                             //     takes over.
-                            let arrow_solve_result = if crate::solver::gpu::cuda_selected() {
+                            // Dispatch: GPU dense → GPU PCG matvec → CPU PCG.
+                            // All three paths produce (delta_t, delta_beta,
+                            // PcgDiagnostics); the GPU dense path provides
+                            // zero-valued diagnostics (it does not use PCG).
+                            let arrow_solve_result: Result<
+                                (ndarray::Array1<f64>, ndarray::Array1<f64>, crate::solver::arrow_schur::PcgDiagnostics),
+                                crate::solver::arrow_schur::ArrowSchurError,
+                            > = if crate::solver::gpu::cuda_selected() {
                                 let has_matvec = arrow_system.hbb_matvec.is_some()
                                     || arrow_system.htbeta_matvec.is_some();
                                 if has_matvec
@@ -5231,12 +5238,24 @@ where
                                         0.0,
                                         loop_lambda,
                                     )
+                                    .map(|(dt, db)| (dt, db, crate::solver::arrow_schur::PcgDiagnostics::default()))
                                 }
                             } else {
                                 arrow_system.solve_with_options(0.0, loop_lambda, &solve_options)
                             };
                             match arrow_solve_result {
-                                Ok((delta_t, delta_beta)) => {
+                                Ok((delta_t, delta_beta, pcg_diag)) => {
+                                    log::debug!(
+                                        "[arrow-Schur] iter {:>3} | k={} | pcg_iters={} | \
+                                         precond_calls={} | ridge_escalations={} | \
+                                         final_residual={:.3e} | stop={:?}",
+                                        iter, arrow_system.k,
+                                        pcg_diag.iterations,
+                                        pcg_diag.precond_apply_calls,
+                                        pcg_diag.ridge_escalations,
+                                        pcg_diag.final_relative_residual,
+                                        pcg_diag.stopping_reason,
+                                    );
                                     let arrow_predicted_reduction =
                                         match crate::solver::arrow_schur::arrow_bare_quadratic_model_reduction(
                                             &arrow_system,
