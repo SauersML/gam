@@ -1986,13 +1986,23 @@ extern "C" __global__ void status_or(
             .load_function("status_or")
             .map_err(|e| format!("load status_or: {e}"))?;
 
-        // η = X·β then η += offset (#258).
+        // beta_orig = Qs · beta  (transforms from transformed to original coords).
+        // For identity Qs, this is a copy; always goes through ws.beta_orig_dev.
+        gemv_no_trans(
+            &ws.blas,
+            p,
+            p,
+            &ws.qs_dev,
+            &loop_ws.beta_dev,
+            &mut ws.beta_orig_dev,
+        )?;
+        // η = X_original · beta_orig  then η += offset (#258).
         gemv_no_trans(
             &ws.blas,
             n,
             p,
             &shared.x_original_dev,
-            &loop_ws.beta_dev,
+            &ws.beta_orig_dev,
             &mut loop_ws.eta_dev,
         )?;
         axpy(&ws.stream, &axpy_func, 1.0, &shared.offset_dev, &mut loop_ws.eta_dev, n)?;

@@ -594,8 +594,8 @@ mod linux_impl {
         pub likelihood: &'a crate::types::GlmLikelihoodSpec,
         /// Inverse link.
         pub inverse_link: &'a crate::types::InverseLink,
-        /// Original dense design X (n×p) for computing η = offset + X·Qs·β.
-        pub x_original: ArrayView2<'a, f64>,
+        /// Original design X for computing η = offset + X·Qs·β.
+        pub x_original: &'a DesignMatrix,
         /// Response y, length n.
         pub y: ArrayView1<'a, f64>,
         /// Prior weights, length n.
@@ -671,8 +671,6 @@ mod linux_impl {
         let beta = pls.beta.clone();
         let penalized_hessian = pls.penalized_hessian;
         let p = beta.len();
-        let n = input.y.len();
-
         // eta = offset + X · (Qs · beta), or offset + X · beta if no Qs.
         let qbeta: Array1<f64> = if let Some(qs_v) = input.qs {
             qs_v.dot(&beta)
@@ -680,32 +678,18 @@ mod linux_impl {
             beta.clone()
         };
         let mut eta = input.offset.to_owned();
-        for j in 0..p {
-            for i in 0..n {
-                eta[i] += input.x_original[[i, j]] * qbeta[j];
-            }
-        }
+        eta += &input.x_original.apply(&qbeta);
         let finalmu = eta.clone();
         let finalz = input.y.to_owned();
 
-        // gradient_data = Xᵀ · (W · (mu - z)) = Xᵀ · (W · (eta - y)).
-        // For Gaussian-identity: gradient w.r.t. β (in transformed coords) =
-        //   QsᵀXᵀ W (Xb - y) = penalized_hessian·β - xtwy_orig_transformed
-        // but it's simplest to compute directly:
+        // gradient_data = QsᵀXᵀ W (mu - y) in transformed coordinates.
         let mut weighted_residual = finalmu.clone();
         weighted_residual -= &finalz;
         for i in 0..n {
             weighted_residual[i] *= input.priorweights[i];
         }
-        // Xᵀ W r (in original coords)
-        let mut xt_wr_orig: Array1<f64> = Array1::zeros(p);
-        for j in 0..p {
-            let mut acc = 0.0_f64;
-            for i in 0..n {
-                acc += input.x_original[[i, j]] * weighted_residual[i];
-            }
-            xt_wr_orig[j] = acc;
-        }
+        // Xᵀ W r (in original coords) via DesignMatrix::transpose_vector_multiply.
+        let xt_wr_orig = input.x_original.transpose_vector_multiply(&weighted_residual);
         // Rotate to transformed coords: QsᵀXᵀWr.
         let gradient_data: Array1<f64> = if let Some(qs_v) = input.qs {
             qs_v.t().dot(&xt_wr_orig)

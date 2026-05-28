@@ -29,7 +29,10 @@
 use ndarray::{Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayView3, ArrayView4, s};
 use std::sync::Arc;
 
-use crate::solver::arrow_schur::{ArrowRowBlock, ArrowSchurError, ArrowSchurSystem};
+use crate::solver::arrow_schur::{
+    ArrowRowBlock, ArrowSchurError, ArrowSchurSystem, BetaPenaltyOp, BlockPenaltyOp,
+    CompositePenaltyOp, DensePenaltyOp, KroneckerPenaltyOp,
+};
 use crate::terms::analytic_penalties::{
     ARDPenalty, AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry,
     IBPAssignmentPenalty, IsometryPenalty, PenaltyTier, PsiSlice, SoftmaxAssignmentSparsityPenalty,
