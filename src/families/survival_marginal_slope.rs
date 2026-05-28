@@ -17606,7 +17606,7 @@ fn build_time_blockspec(
         // time_surface and another block must be dropped from the
         // OTHER block, so time_surface receives the highest priority.
         gauge_priority: 200,
-        eta_row_scaling: None,
+        row_scaling: None,
     }
 }
 
@@ -17616,7 +17616,7 @@ fn build_logslope_blockspec(
     offset: &Array1<f64>,
     rho: Array1<f64>,
     beta_hint: Option<Array1<f64>>,
-    z_scaling: Array1<f64>,
+    z_scaling: std::sync::Arc<[f64]>,
 ) -> ParameterBlockSpec {
     ParameterBlockSpec {
         name: "logslope_surface".to_string(),
@@ -17639,7 +17639,7 @@ fn build_logslope_blockspec(
         // same raw basis columns.  Without this scaling the flat RRQR
         // audit sees two copies of the raw basis and flags them as a
         // fatal alias.
-        eta_row_scaling: Some(z_scaling),
+        row_scaling: Some(z_scaling),
     }
 }
 
@@ -17664,7 +17664,7 @@ fn build_marginal_blockspec(
         // directions with logslope_surface are dropped from
         // logslope_surface.
         gauge_priority: 150,
-        eta_row_scaling: None,
+        row_scaling: None,
     }
 }
 
@@ -19929,7 +19929,7 @@ pub fn fit_survival_marginal_slope_terms(
                 &spec.logslope_offset,
                 rho_logslope,
                 hints.logslope_beta.clone(),
-                z_primary.clone(),
+                z_primary.as_slice().into(),
             ),
         ];
         // V+M-exact cutover: when the active cutover fired, the
@@ -21040,7 +21040,7 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(Array1::zeros(cols)),
             gauge_priority: 100,
-            eta_row_scaling: None,
+            row_scaling: None,
         }
     }
 
@@ -23612,7 +23612,7 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
+            row_scaling: None,
         };
         let constraints = family
             .block_linear_constraints(&[], 0, &spec)
@@ -23682,7 +23682,7 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
+            row_scaling: None,
         };
 
         let constraints = family
@@ -23934,7 +23934,7 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
+            row_scaling: None,
         };
         let err = family
             .post_update_block_beta(
@@ -24006,7 +24006,7 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
+            row_scaling: None,
         };
         let current = array![0.4, 7.0];
         // qd1 at current = 1.0·0.4 + 0.0·7.0 + 1e-6 ≈ 0.4 (feasible)
@@ -24082,7 +24082,7 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
+            row_scaling: None,
         };
         // current qd1 = -1.0 + 1e-6 < guard → infeasible.
         let err = family
