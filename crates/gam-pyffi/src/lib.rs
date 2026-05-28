@@ -21276,6 +21276,115 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         "InvalidSpecificationError",
         module.py().get_type::<InvalidSpecificationError>(),
     )?;
+    // Remaining engine error enum subclasses (issue #343 follow-up).
+    module.add("GeometryError", module.py().get_type::<GeometryError>())?;
+    module.add(
+        "MatrixMaterializationError",
+        module.py().get_type::<MatrixMaterializationError>(),
+    )?;
+    module.add("GpuError", module.py().get_type::<GpuError>())?;
+    module.add(
+        "LinearAlgebraError",
+        module.py().get_type::<LinearAlgebraError>(),
+    )?;
+    module.add("MatrixError", module.py().get_type::<MatrixError>())?;
+    module.add("CacheStoreError", module.py().get_type::<CacheStoreError>())?;
+    module.add("SmoothError", module.py().get_type::<SmoothError>())?;
+    module.add("ArrowSchurError", module.py().get_type::<ArrowSchurError>())?;
+    module.add(
+        "OuterStrategyError",
+        module.py().get_type::<OuterStrategyError>(),
+    )?;
+    module.add("TermBuilderError", module.py().get_type::<TermBuilderError>())?;
+    module.add(
+        "CorrectedCovarianceError",
+        module.py().get_type::<CorrectedCovarianceError>(),
+    )?;
+    module.add(
+        "PredictInputError",
+        module.py().get_type::<PredictInputError>(),
+    )?;
+    module.add("HmcError", module.py().get_type::<HmcError>())?;
+    module.add("AloError", module.py().get_type::<AloError>())?;
+    module.add("SurvivalError", module.py().get_type::<SurvivalError>())?;
+    module.add(
+        "CubicCellKernelError",
+        module.py().get_type::<CubicCellKernelError>(),
+    )?;
+    module.add(
+        "SurvivalConstructionError",
+        module.py().get_type::<SurvivalConstructionError>(),
+    )?;
+    module.add(
+        "TransformationNormalError",
+        module.py().get_type::<TransformationNormalError>(),
+    )?;
+    module.add(
+        "CustomFamilyError",
+        module.py().get_type::<CustomFamilyError>(),
+    )?;
+    module.add("GamlssError", module.py().get_type::<GamlssError>())?;
+    module.add(
+        "SurvivalMarginalSlopeError",
+        module.py().get_type::<SurvivalMarginalSlopeError>(),
+    )?;
+    module.add(
+        "LatentSurvivalError",
+        module.py().get_type::<LatentSurvivalError>(),
+    )?;
+    module.add(
+        "SurvivalPredictError",
+        module.py().get_type::<SurvivalPredictError>(),
+    )?;
+    module.add(
+        "DeviationRuntimeError",
+        module.py().get_type::<DeviationRuntimeError>(),
+    )?;
+    module.add("DataError", module.py().get_type::<DataError>())?;
+    module.add(
+        "FittedModelError",
+        module.py().get_type::<FittedModelError>(),
+    )?;
+    module.add(
+        "LognormalKernelError",
+        module.py().get_type::<LognormalKernelError>(),
+    )?;
+    module.add(
+        "ScaleDesignError",
+        module.py().get_type::<ScaleDesignError>(),
+    )?;
+    module.add(
+        "IdentifiabilityCompilerError",
+        module.py().get_type::<IdentifiabilityCompilerError>(),
+    )?;
+    module.add(
+        "JointPenaltyError",
+        module.py().get_type::<JointPenaltyError>(),
+    )?;
+    module.add(
+        "SurvivalLocationScaleError",
+        module.py().get_type::<SurvivalLocationScaleError>(),
+    )?;
+    module.add(
+        "MapUniquenessError",
+        module.py().get_type::<MapUniquenessError>(),
+    )?;
+    module.add(
+        "UnsupportedLinkError",
+        module.py().get_type::<UnsupportedLinkError>(),
+    )?;
+    module.add(
+        "InvalidConfigurationError",
+        module.py().get_type::<InvalidConfigurationError>(),
+    )?;
+    module.add(
+        "MissingDependencyError",
+        module.py().get_type::<MissingDependencyError>(),
+    )?;
+    module.add(
+        "IntegrationError",
+        module.py().get_type::<IntegrationError>(),
+    )?;
     module.add_class::<EuclideanManifold>()?;
     module.add_class::<CircleManifold>()?;
     module.add_class::<SphereManifold>()?;

@@ -756,6 +756,14 @@ class PeriodicSplineCurve(Smooth):
         coords_np[:, 0] = coords_np[:, 0] - np.floor(coords_np[:, 0])
         return periodic_curve_evaluate_numpy(self, coords_np)
 
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        out = super().to_rust_descriptor()
+        out["n_knots"] = int(self.n_knots)
+        out["degree"] = int(self.degree)
+        out["output_dim"] = int(self.output_dim)
+        out["penalty_order"] = int(self.penalty_order)
+        return out
+
     SUPPORTED_BACKENDS: ClassVar[frozenset[str]] = frozenset({"torch", "numpy", "jax"})
 
 
@@ -877,6 +885,13 @@ class Categorical(Smooth):
     # a descriptor with its own basis evaluator. The empty set is the honest
     # contract: there are no `_evaluate_<backend>` paths to advertise.
     SUPPORTED_BACKENDS: ClassVar[frozenset[str]] = frozenset()
+
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        out = super().to_rust_descriptor()
+        if self.levels is not None:
+            out["levels"] = _array_to_list(self.levels)
+        out["n_levels"] = int(self.n_levels)
+        return out
 
 
 __all__ = [
