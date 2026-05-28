@@ -237,6 +237,7 @@ def _build_fit_payload(
     precision_hyperpriors: Any | None,
     latents: Mapping[str, Any] | None,
     penalties: Sequence[Any] | None,
+    smooths: Mapping[Any, Any] | None,
     config: dict[str, Any] | None,
 ) -> dict[str, Any]:
     normalized_latents = _normalize_latents(latents)
@@ -265,6 +266,7 @@ def _build_fit_payload(
         "precision_hyperpriors": precision_hyperpriors,
         "latents": normalized_latents,
         "penalties": _normalize_penalties(penalties, normalized_latents),
+        "smooths": _normalize_smooths(smooths),
     }
     for key, value in kwarg_items.items():
         if value is not None:
@@ -320,6 +322,52 @@ def _normalize_latents(latents: Mapping[str, Any] | None) -> dict[str, Any] | No
     return out
 
 
+def _normalize_smooths(
+    smooths: Mapping[Any, Any] | None,
+) -> dict[str, dict[str, Any]] | None:
+    """Serialize ``smooths={symbol: BasisDescriptor}`` to the Rust bridge form.
+
+    Keys may be either a single column name (``"x"``) or a tuple of column
+    names for multivariate smooths (``("lat", "lon")``); the latter is
+    normalized to a comma-joined string so the Rust side can deserialize
+    into a plain ``BTreeMap<String, _>``. Values must implement
+    :meth:`Smooth.to_rust_descriptor`; arrays inside the descriptor (centers
+    matrices, knot vectors) are pre-flattened to JSON-able nested lists.
+    """
+    if smooths is None:
+        return None
+    if not isinstance(smooths, Mapping):
+        raise TypeError(
+            "smooths must be a mapping of formula symbol -> Smooth descriptor"
+        )
+    from .smooth import Smooth as _Smooth
+
+    out: dict[str, dict[str, Any]] = {}
+    for raw_key, descriptor in smooths.items():
+        if isinstance(raw_key, (tuple, list)):
+            key = ",".join(str(v).strip() for v in raw_key)
+        else:
+            key = str(raw_key).strip()
+        if not key:
+            raise ValueError("smooths keys must be non-empty symbols")
+        if not isinstance(descriptor, _Smooth):
+            raise TypeError(
+                f"smooths[{key!r}] must be a gamfit.smooth.Smooth descriptor "
+                f"(Duchon / Matern / Sphere / BSpline / TensorBSpline / Pca / "
+                f"PeriodicSplineCurve / Categorical), got {type(descriptor).__name__}"
+            )
+        payload = descriptor.to_rust_descriptor()
+        if not isinstance(payload, Mapping):
+            raise TypeError(
+                f"{type(descriptor).__name__}.to_rust_descriptor() must return a "
+                f"mapping; got {type(payload).__name__}"
+            )
+        payload = dict(payload)
+        payload.setdefault("vars", [v.strip() for v in key.split(",")])
+        out[key] = payload
+    return out
+
+
 def _normalize_penalties(
     penalties: Sequence[Any] | None,
     latents: Mapping[str, Any] | None,
@@ -338,42 +386,16 @@ def _normalize_penalties(
             # target latent blocks (OrthogonalityPenalty, ARDPenalty,
             # SparsityPenalty, ...). Smooth descriptors (Duchon, Matern,
             # Sphere, ...) describe formula *terms*, not latent-block
-            # penalties, so they semantically belong on a different kwarg.
-            #
-            # The principled long-term route is a sibling kwarg
-            # `smooths={symbol: BasisDescriptor}` on `fit(...)` that maps
-            # formula symbols to per-term basis configuration (analogous to
-            # `latents=` for per-row latent coordinates). The engine-side
-            # support is already present: term_builder.rs accepts
-            # `CenterStrategy::UserProvided(centers)`. Only the Python ->
-            # Rust bridge is missing. Tracking issue: gam #315.
-            #
-            # Until that bridge lands, the formula DSL `centers=K` option
-            # accepts only an integer center *count* — picked by the
-            # engine's farthest-point / equal-mass strategy on the training
-            # data — and does NOT accept user-supplied center-coordinate
-            # arrays. Users who need explicit center coordinates today must
-            # drop to the lower-level numpy/torch basis API (the `Smooth`
-            # descriptor's own `evaluate_*` methods) and assemble the model
-            # outside `fit(formula=...)`. We deliberately do not point at
-            # `duchon(x, centers=K)` here, because that path silently
-            # discards the user's center array.
+            # penalties, so they belong on the sibling ``smooths=`` kwarg
+            # (gam issue #315). Point users at it instead of dropping the
+            # value silently.
             raise TypeError(
                 f"penalties[{index}] is a {type(penalty).__name__} smooth "
-                "descriptor; the `penalties=` kwarg of fit() is reserved for "
-                "analytic penalty wrappers targeting latent blocks "
-                "(OrthogonalityPenalty, ARDPenalty, SparsityPenalty, ...), "
-                "not for basis-term descriptors. There is currently no "
-                "formula-API kwarg that accepts a Smooth descriptor with "
-                "explicit center coordinates: the DSL `centers=K` takes only "
-                "an integer count and the engine chooses center locations "
-                "from the data. Either (a) use the formula DSL with an "
-                "integer center count and let the engine choose center "
-                "locations, or (b) drop to the lower-level numpy/torch basis "
-                f"API ({type(penalty).__name__}.evaluate_* / "
-                "_evaluate_numpy / _evaluate_torch) for full control over "
-                "center coordinates. A first-class `smooths=` kwarg is the "
-                "planned long-term fix (tracking: gam issue #315)."
+                "descriptor; pass it via the `smooths=` kwarg of fit() "
+                "instead. `penalties=` is for analytic penalty wrappers "
+                "targeting latent blocks (OrthogonalityPenalty, ARDPenalty, "
+                "SparsityPenalty, ...). Example: "
+                f"`fit(df, formula, smooths={{<symbol>: {type(penalty).__name__}(...)}})`."
             )
         if hasattr(penalty, "to_rust_descriptor"):
             descriptor = penalty.to_rust_descriptor()
