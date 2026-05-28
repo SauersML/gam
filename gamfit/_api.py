@@ -328,22 +328,52 @@ def _normalize_penalties(
         return None
     if isinstance(penalties, (str, bytes)) or not isinstance(penalties, Sequence):
         raise TypeError("penalties must be a sequence of analytic penalty wrappers")
+    from .smooth import Smooth as _Smooth
+
     latent_names = list((latents or {}).keys())
     out: list[dict[str, Any]] = []
     for index, penalty in enumerate(penalties):
-        from .smooth import Smooth as _Smooth
-
         if isinstance(penalty, _Smooth):
+            # `penalties=` is reserved for analytic penalty wrappers that
+            # target latent blocks (OrthogonalityPenalty, ARDPenalty,
+            # SparsityPenalty, ...). Smooth descriptors (Duchon, Matern,
+            # Sphere, ...) describe formula *terms*, not latent-block
+            # penalties, so they semantically belong on a different kwarg.
+            #
+            # The principled long-term route is a sibling kwarg
+            # `smooths={symbol: BasisDescriptor}` on `fit(...)` that maps
+            # formula symbols to per-term basis configuration (analogous to
+            # `latents=` for per-row latent coordinates). The engine-side
+            # support is already present: term_builder.rs accepts
+            # `CenterStrategy::UserProvided(centers)`. Only the Python ->
+            # Rust bridge is missing. Tracking issue: gam #315.
+            #
+            # Until that bridge lands, the formula DSL `centers=K` option
+            # accepts only an integer center *count* — picked by the
+            # engine's farthest-point / equal-mass strategy on the training
+            # data — and does NOT accept user-supplied center-coordinate
+            # arrays. Users who need explicit center coordinates today must
+            # drop to the lower-level numpy/torch basis API (the `Smooth`
+            # descriptor's own `evaluate_*` methods) and assemble the model
+            # outside `fit(formula=...)`. We deliberately do not point at
+            # `duchon(x, centers=K)` here, because that path silently
+            # discards the user's center array.
             raise TypeError(
-                f"penalties[{index}] is a {type(penalty).__name__} smooth descriptor; "
-                "the `penalties=` kwarg only accepts analytic penalty wrappers "
-                "targeting latent blocks (e.g. OrthogonalityPenalty, ARDPenalty, "
-                "SparsityPenalty). To configure a Duchon/Matern/Sphere smooth via "
-                "the formula API, use the DSL: e.g. "
-                "`duchon(x, centers=K)`, `matern(x, centers=K, nu=1.5)`, "
-                "`sphere(lat, lon, centers=K)`. Explicit center coordinates and "
-                "Smooth descriptor objects are part of the lower-level numpy/torch "
-                "basis API, not the `fit(formula=...)` surface."
+                f"penalties[{index}] is a {type(penalty).__name__} smooth "
+                "descriptor; the `penalties=` kwarg of fit() is reserved for "
+                "analytic penalty wrappers targeting latent blocks "
+                "(OrthogonalityPenalty, ARDPenalty, SparsityPenalty, ...), "
+                "not for basis-term descriptors. There is currently no "
+                "formula-API kwarg that accepts a Smooth descriptor with "
+                "explicit center coordinates: the DSL `centers=K` takes only "
+                "an integer count and the engine chooses center locations "
+                "from the data. Either (a) use the formula DSL with an "
+                "integer center count and let the engine choose center "
+                "locations, or (b) drop to the lower-level numpy/torch basis "
+                f"API ({type(penalty).__name__}.evaluate_* / "
+                "_evaluate_numpy / _evaluate_torch) for full control over "
+                "center coordinates. A first-class `smooths=` kwarg is the "
+                "planned long-term fix (tracking: gam issue #315)."
             )
         if hasattr(penalty, "to_rust_descriptor"):
             descriptor = penalty.to_rust_descriptor()
