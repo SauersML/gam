@@ -1,3 +1,5 @@
+mod common;
+use common::gpu_gate::{GpuGate, gpu_gate};
 use gam::solver::gpu::{Device, configure_device};
 use ndarray::{Array1, Array2};
 
