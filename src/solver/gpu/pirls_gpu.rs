@@ -2007,6 +2007,7 @@ extern "C" __global__ void status_or(
             .load_function("status_or")
             .map_err(|e| format!("load status_or: {e}"))?;
 
+        // η = X·β then η += offset (#258).
         gemv_no_trans(
             &ws.blas,
             n,
@@ -2015,6 +2016,7 @@ extern "C" __global__ void status_or(
             &loop_ws.beta_dev,
             &mut loop_ws.eta_dev,
         )?;
+        axpy(&ws.stream, &axpy_func, 1.0, &shared.offset_dev, &mut loop_ws.eta_dev, n)?;
         // Initial solve-row pass on the starting η (4-output kernel only).
         crate::gpu::pirls_row::launch_solve_row_on_stream(
             backend,

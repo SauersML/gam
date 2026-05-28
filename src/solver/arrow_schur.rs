@@ -1521,6 +1521,29 @@ impl ArrowSchurSystem {
         self.block_offsets = offsets;
     }
 
+    /// Install a matrix-free penalty-side `H_ββ` operator (#296).
+    ///
+    /// When set, all hot paths (`schur_matvec`, `build_dense_schur_*`,
+    /// `JacobiPreconditioner`, quadratic-form reduction) route through this
+    /// operator instead of the dense `hbb` accumulator, enabling
+    /// `BlockPenaltyOp` / `KroneckerPenaltyOp` to avoid `O(K²)` allocation
+    /// for structured smoothness penalties.
+    pub fn set_penalty_op(&mut self, op: Arc<dyn BetaPenaltyOp>) {
+        self.penalty_op = Some(op);
+    }
+
+    /// Return the effective penalty operator: the installed `penalty_op` if
+    /// present, otherwise a `DensePenaltyOp` wrapping the current `hbb`.
+    ///
+    /// All hot paths call this once and dispatch through the trait, so there
+    /// is no parallel dense branch — `DensePenaltyOp` IS the dense path.
+    pub fn effective_penalty_op(&self) -> Arc<dyn BetaPenaltyOp> {
+        match self.penalty_op.as_ref() {
+            Some(op) => Arc::clone(op),
+            None => Arc::new(DensePenaltyOp(self.hbb.clone())),
+        }
+    }
+
     /// Fold analytic-penalty contributions into the appropriate blocks.
     ///
     /// BA source mapping: these are extra prior/regularization normal-equation
