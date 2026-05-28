@@ -2268,17 +2268,25 @@ where
         }
     }
 
-    fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<(), EstimationError> {
+    fn seed_inner_state(
+        &mut self,
+        beta: &Array1<f64>,
+    ) -> Result<SeedOutcome, EstimationError> {
+        // Empty β: by convention, "no warm-start available" — treat as a
+        // no-op install. Distinct from `NoSlot` because the objective may
+        // very well have a slot; the caller just didn't supply a β to fill
+        // it. Reporting `Installed` is correct: the slot's pre-existing
+        // state (cold default) is the post-seed state.
         if beta.is_empty() {
-            return Ok(());
+            return Ok(SeedOutcome::Installed);
         }
-        if let Some(f) = self.seed_fn.as_mut() {
-            return f(&mut self.state, beta);
+        match self.seed_fn.as_mut() {
+            Some(f) => f(&mut self.state, beta).map(|()| SeedOutcome::Installed),
+            // No hook installed — the objective owns no inner-β slot.
+            // The caller decides whether this is a loud cache-provenance
+            // event or a silent continuation-walk degradation.
+            None => Ok(SeedOutcome::NoSlot),
         }
-        Err(EstimationError::InvalidInput(format!(
-            "cached inner beta has length {}, but this objective does not expose an inner-state seeding hook",
-            beta.len()
-        )))
     }
 
     fn reset(&mut self) {
@@ -4845,8 +4853,15 @@ impl OuterProblem {
         // `seed_inner_state` to install β before the first eval.
         if let Some(beta) = cached_inner_beta.as_ref() {
             match checkpointing.seed_inner_state(beta) {
-                Ok(()) => log::info!(
+                Ok(SeedOutcome::Installed) => log::info!(
                     "[CACHE] beta-warm key={}.. context={} beta_dim={} action=installed",
+                    short_key,
+                    context,
+                    beta.len(),
+                ),
+                Ok(SeedOutcome::NoSlot) => log::warn!(
+                    "[CACHE] beta-warm key={}.. context={} beta_dim={} action=skip \
+                     reason=objective_has_no_inner_beta_slot",
                     short_key,
                     context,
                     beta.len(),

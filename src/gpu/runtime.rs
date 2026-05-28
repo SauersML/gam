@@ -10,8 +10,6 @@ use super::device::GpuDeviceInfo;
 use super::error::GpuError;
 use super::policy::GpuDispatchPolicy;
 #[cfg(target_os = "linux")]
-use crate::gpu_err;
-#[cfg(target_os = "linux")]
 use cudarc::driver::{CudaContext, result, sys};
 
 #[path = "diagnostics.rs"]

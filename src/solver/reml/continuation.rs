@@ -206,24 +206,17 @@ fn eval_step(
     beta_seed: &Array1<f64>,
     order: OuterEvalOrder,
 ) -> Result<OuterEval, InnerFailure> {
-    if let Err(e) = obj.seed_inner_state(beta_seed) {
-        // An objective that publishes `inner_beta_hint` but does not wire
-        // `seed_inner_state` (e.g. standard REML's `ClosureObjective` built
-        // without `.with_seed_inner_state(...)`) returns `InvalidInput` with
-        // the message "does not expose an inner-state seeding hook" (issue
-        // #236). That is not a structural failure — it means "warm-start
-        // ignored, proceed cold". Forward all other errors as hard failures.
-        let is_no_hook = matches!(
-            &e,
-            EstimationError::InvalidInput(msg)
-                if msg.contains("does not expose an inner-state seeding hook")
-        );
-        if !is_no_hook {
-            return Err(inner_failure_from(e));
-        }
-        // Silently drop the warm-start and proceed cold — the objective
-        // will use its own cold default β for this ρ.
-    }
+    // The seed-hook contract is encoded in the typed `SeedOutcome`:
+    //   - `Ok(Installed)`: β is now in the inner-β slot for `eval_with_order`.
+    //   - `Ok(NoSlot)`: the objective owns no inner-β slot; the hint is
+    //     silently discarded and we proceed cold. This is the documented
+    //     fallback for objectives that publish `inner_beta_hint` from a
+    //     read-only view of inner state without exposing a write hook —
+    //     not a structural failure (issue #236).
+    //   - `Err(_)`: a genuine seeding failure (dimension mismatch when a
+    //     slot exists, etc.). Forward as a hard failure.
+    obj.seed_inner_state(beta_seed)
+        .map_err(inner_failure_from)?;
     obj.eval_with_order(rho, order).map_err(inner_failure_from)
 }
 
