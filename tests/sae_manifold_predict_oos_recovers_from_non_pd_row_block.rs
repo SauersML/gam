@@ -111,7 +111,7 @@ fn solve_newton_step_recovers_on_oos_predict_path() {
     // line-search driver). Previously this called `sys.solve(...)` directly,
     // bypassing the escalation. The fix routes it through
     // `solve_with_lm_escalation` so the predict path is uniformly self-healing.
-    let (term, rho, target) = degenerate_oos_term();
+    let (mut term, rho, target) = degenerate_oos_term();
     let result = term.solve_newton_step(target.view(), &rho, None, 1.0e-6, 1.0e-6);
     assert!(
         result.is_ok(),

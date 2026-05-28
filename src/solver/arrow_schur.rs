@@ -4131,18 +4131,14 @@ fn build_schur_scalar_inv<B: BatchedBlockSolver>(
     let d = sys.d;
     let mut result = Vec::with_capacity(cols.len());
     let mut col_vec = Array1::<f64>::zeros(d);
+    // Extract the penalty diagonal for all K columns once, then index per-column.
+    let mut full_diag = Array1::<f64>::zeros(sys.k);
+    {
+        let fd_slice = full_diag.as_slice_mut().expect("full_diag contiguous");
+        sys.penalty_diagonal_add(fd_slice);
+    }
     for &gi in cols {
-        let base = match sys.hbb_diag.as_ref() {
-            Some(hd) => hd[gi],
-            None => {
-                if sys.hbb.dim() == (sys.k, sys.k) {
-                    sys.hbb[[gi, gi]]
-                } else {
-                    0.0
-                }
-            }
-        };
-        let mut s = base + ridge_beta;
+        let mut s = full_diag[gi] + ridge_beta;
         for (row_idx, row) in sys.rows.iter().enumerate() {
             for c in 0..d {
                 col_vec[c] = row.htbeta[[c, gi]];
