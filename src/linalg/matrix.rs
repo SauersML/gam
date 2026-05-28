@@ -666,33 +666,26 @@ fn dense_transpose_matvec_view(matrix: &Array2<f64>, vector: ArrayView1<'_, f64>
 }
 
 #[inline]
-fn dense_xtwx_view(matrix: &Array2<f64>, weights: ArrayView1<'_, f64>) -> Array2<f64> {
-    // PSD precondition for the symmetric `Xᵀ W X` form: callers
-    // (Fisher-scoring Gram) must supply nonneg weights. Signed-weight
-    // observed-Hessian assembly must route through the signed Gram path
-    // (`xt_diag_x_signed` → `streaming_blas_xt_diag_x`), which is sign-correct
-    // and does not assert. Guarding here (not inside the shared
-    // `weighted_crossprod_dense_rows` kernel) lets `BlockDesignOperator::cross_block`
-    // reuse the same kernel with the asymmetric form `X_iᵀ W X_j`, which is not
-    // PSD even when `w ≥ 0` and legitimately receives signed weights from the
-    // outer REML Hessian-derivative correction `c · X v`.
-    assert!(
-        weights.iter().all(|&w| w >= 0.0),
-        "dense_xtwx_view requires nonneg weights; use the signed Gram routine for observed-Hessian assembly"
-    );
-    weighted_crossprod_dense_view(matrix, weights, matrix)
+fn dense_xtwx_view(matrix: &Array2<f64>, weights: PsdWeightsView<'_>) -> Array2<f64> {
+    // PSD precondition for the symmetric `Xᵀ W X` form is discharged by the
+    // `PsdWeightsView` constructor — the previous runtime `assert!` is now a
+    // type-level obligation paid once at the call boundary (typically in
+    // `DesignMatrix::compute_xtwx_view` via `PsdWeights::try_new`). The
+    // asymmetric / observed-Hessian path keeps using `SignedWeightsView` and
+    // routes through `weighted_crossprod_dense_rows` directly (e.g.
+    // `BlockDesignOperator::cross_block` with `c · X v` weights from the
+    // outer REML Hessian-derivative correction).
+    weighted_crossprod_dense_view(matrix, weights.view(), matrix)
 }
 
 #[inline]
-fn dense_diag_gram_view(matrix: &Array2<f64>, weights: ArrayView1<'_, f64>) -> Array1<f64> {
+fn dense_diag_gram_view(matrix: &Array2<f64>, weights: PsdWeightsView<'_>) -> Array1<f64> {
     // Diagonal of XᵀWX — used as Fisher-info diagonal for preconditioning and
     // for diagonal-of-Gram queries. Negative weights have no sensible meaning
-    // here (the diagonal must be nonneg for it to act as a preconditioner), so
-    // we require the precondition rather than silently clipping.
-    assert!(
-        weights.iter().all(|&w| w >= 0.0),
-        "dense_diag_gram_view requires nonneg weights"
-    );
+    // here (the diagonal must be nonneg for it to act as a preconditioner);
+    // typed at the boundary via `PsdWeightsView` so the previous runtime
+    // `assert!` is no longer required inside the kernel.
+    let weights = weights.view();
     let p = matrix.ncols();
     let n = matrix.nrows();
     let large = (n as u64) * (p as u64) >= DENSE_ROW_PARALLEL_MIN_NP;
