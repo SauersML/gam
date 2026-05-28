@@ -457,6 +457,92 @@ impl ResponseFamily {
         }
     }
 
+    /// Detect a *degenerate* response: one whose value distribution makes the
+    /// family's REML log-likelihood non-finite even though every individual
+    /// `y_i` lies inside the family's distributional support.
+    ///
+    /// Symmetric counterpart to [`Self::validate_response_support`]: support
+    /// rejects out-of-domain *values* (e.g. a negative Poisson count); this
+    /// rejects *distributions* that send the saturated MLE to a boundary at
+    /// which the score diverges. Each family answers the question for itself
+    /// — adding a new family does not require touching workflow.rs.
+    ///
+    /// Concretely:
+    /// * `Binomial` — refuses an all-zero or all-one response: the saturated
+    ///   logit is ±∞ and the REML score is +∞ (issue #331).
+    /// * `Gaussian` — refuses a response whose sample standard deviation is
+    ///   below `GAUSSIAN_MIN_SAMPLE_SD` (≈ machine ε); the marginal
+    ///   `-n/2·log σ²` REML term diverges to +∞ as σ → 0 (issue #332).
+    /// * Every other family currently returns `Ok(())` at this layer — the
+    ///   support check already guarantees enough variation to make the
+    ///   log-likelihood finite.
+    pub fn validate_response_degeneracy(
+        &self,
+        y: ArrayView1<'_, f64>,
+    ) -> Result<(), ResponseDegeneracy> {
+        match self {
+            Self::Binomial => {
+                let mut saw_zero = false;
+                let mut saw_one = false;
+                for &yi in y.iter() {
+                    if (yi - 0.0).abs() < 1e-12 {
+                        saw_zero = true;
+                    } else if (yi - 1.0).abs() < 1e-12 {
+                        saw_one = true;
+                    }
+                    if saw_zero && saw_one {
+                        return Ok(());
+                    }
+                }
+                let kind = if saw_one {
+                    ResponseDegeneracyKind::BinomialAllOnes
+                } else if saw_zero {
+                    ResponseDegeneracyKind::BinomialAllZeros
+                } else {
+                    // y is empty or contains no exact 0/1 — defer to the
+                    // existing binarity check downstream rather than claiming
+                    // degeneracy of the saturated-boundary flavour here.
+                    return Ok(());
+                };
+                Err(ResponseDegeneracy {
+                    family_label: self.response_support_label(),
+                    kind,
+                })
+            }
+            Self::Gaussian => {
+                if y.is_empty() {
+                    return Ok(());
+                }
+                let n = y.len();
+                let mean: f64 = y.iter().copied().sum::<f64>() / (n as f64);
+                let ssq: f64 = y.iter().map(|&v| (v - mean) * (v - mean)).sum::<f64>();
+                let var = if n > 1 {
+                    ssq / ((n - 1) as f64)
+                } else {
+                    ssq
+                };
+                let sd = var.sqrt();
+                if !sd.is_finite() || sd <= GAUSSIAN_MIN_SAMPLE_SD {
+                    Err(ResponseDegeneracy {
+                        family_label: self.response_support_label(),
+                        kind: ResponseDegeneracyKind::GaussianNearConstant {
+                            sample_sd: sd,
+                            min_sd: GAUSSIAN_MIN_SAMPLE_SD,
+                        },
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+            Self::Poisson
+            | Self::Tweedie { .. }
+            | Self::NegativeBinomial { .. }
+            | Self::Beta { .. }
+            | Self::Gamma
+            | Self::RoystonParmar => Ok(()),
+        }
+    }
+
     /// Auto-infer a likelihood family when the user did not specify one.
     ///
     /// Policy:
@@ -549,6 +635,91 @@ impl std::fmt::Display for ResponseSupportViolation {
 }
 
 impl std::error::Error for ResponseSupportViolation {}
+
+/// Floor on the sample standard deviation of a Gaussian response.
+///
+/// The marginal Gaussian REML objective contains `-n/2·log σ̂²`; when σ̂ → 0
+/// this diverges to +∞ and the outer solver reports the cryptic
+/// `fit_result.reml_score must be finite, got inf` (issue #332). The
+/// threshold is generous (≈ machine ε scaled) so well-conditioned scientific
+/// data never trips it; only data that is effectively constant in f64
+/// arithmetic gets rejected.
+pub const GAUSSIAN_MIN_SAMPLE_SD: f64 = 1.0e-10;
+
+/// Classifier for a [`ResponseDegeneracy`]. Each variant carries the family-
+/// specific evidence the caller needs to format a useful message without
+/// having to re-derive the diagnostic.
+#[derive(Debug, Clone)]
+pub enum ResponseDegeneracyKind {
+    /// Bernoulli / Binomial response with every observed value equal to 0.
+    BinomialAllZeros,
+    /// Bernoulli / Binomial response with every observed value equal to 1.
+    BinomialAllOnes,
+    /// Gaussian response whose sample sd is below
+    /// [`GAUSSIAN_MIN_SAMPLE_SD`]; carries the observed sd and the threshold
+    /// so the message can be precise.
+    GaussianNearConstant { sample_sd: f64, min_sd: f64 },
+}
+
+/// Degenerate-response detail produced by
+/// [`ResponseFamily::validate_response_degeneracy`].
+///
+/// Mirrors [`ResponseSupportViolation`]: it owns its own `Display` and
+/// `message_for(column_name)` so call sites in the workflow, the CLI, and
+/// any future binding produce identical user-facing prose without coupling
+/// each one to the family-internal classifier.
+#[derive(Debug, Clone)]
+pub struct ResponseDegeneracy {
+    pub family_label: &'static str,
+    pub kind: ResponseDegeneracyKind,
+}
+
+impl ResponseDegeneracy {
+    /// Format the degeneracy against a specific response column name. The
+    /// column name is supplied by the caller because [`ResponseFamily`] does
+    /// not know which column the user pointed at.
+    pub fn message_for(&self, response_name: &str) -> String {
+        match self.kind {
+            ResponseDegeneracyKind::BinomialAllZeros => format!(
+                "{family} response '{name}' is degenerate: all values are 0 (no events). \
+                 The maximum-likelihood logit is −∞ at this boundary, so the REML score \
+                 is not finite. Fix: ensure the response contains at least one 0 and \
+                 at least one 1 (e.g. drop the offending subgroup, or refit on a pooled \
+                 sample that includes both classes).",
+                family = self.family_label,
+                name = response_name,
+            ),
+            ResponseDegeneracyKind::BinomialAllOnes => format!(
+                "{family} response '{name}' is degenerate: all values are 1 (no non-events). \
+                 The maximum-likelihood logit is +∞ at this boundary, so the REML score \
+                 is not finite. Fix: ensure the response contains at least one 0 and \
+                 at least one 1 (e.g. drop the offending subgroup, or refit on a pooled \
+                 sample that includes both classes).",
+                family = self.family_label,
+                name = response_name,
+            ),
+            ResponseDegeneracyKind::GaussianNearConstant { sample_sd, min_sd } => format!(
+                "{family} response '{name}' is effectively constant (sample sd ≈ {sd:.3e} ≤ {floor:.0e}); \
+                 the marginal REML log-likelihood −n/2·log σ² diverges to +∞ as σ → 0. \
+                 Fix: check the response column units (is it being read in the right \
+                 scale?), centre/rescale the response, or drop the column if it carries \
+                 no signal.",
+                family = self.family_label,
+                name = response_name,
+                sd = sample_sd,
+                floor = min_sd,
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for ResponseDegeneracy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message_for("y"))
+    }
+}
+
+impl std::error::Error for ResponseDegeneracy {}
 
 /// Caller-supplied description of the response column's *source* kind.
 ///

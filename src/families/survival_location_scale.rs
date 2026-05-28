@@ -4515,6 +4515,25 @@ fn prepare_survival_location_scale_model(
         } else {
             (log_sigma_design.clone(), log_sigma_prep.offset.clone())
         };
+    // Same audit-facing trick as the threshold block: time-varying log_sigma
+    // stores a stacked 3*n-row operator but the audit only needs the n-row
+    // exit channel for the row-equality invariant.
+    let log_sigma_audit_jacobian: Option<Arc<dyn BlockEffectiveJacobian>> =
+        if log_sigma_entry_design.is_some() {
+            let exit_dense = log_sigma_design
+                .try_to_dense_arc(
+                    "survival_location_scale log_sigma block audit Jacobian",
+                )?
+                .as_ref()
+                .clone();
+            Some(Arc::new(AdditiveBlockJacobian {
+                design: exit_dense,
+                own_output: 0,
+                n_family_outputs: 1,
+            }))
+        } else {
+            None
+        };
     let log_sigmaspec = ParameterBlockSpec {
         name: "log_sigma".to_string(),
         design: log_sigma_solver_design,
@@ -4524,7 +4543,7 @@ fn prepare_survival_location_scale_model(
         initial_log_lambdas: log_sigma_initial_log_lambdas,
         initial_beta: log_sigma_initial_beta,
         gauge_priority: 100,
-        jacobian_callback: None,
+        jacobian_callback: log_sigma_audit_jacobian,
     };
     let wigglespec = if let Some(w) = spec.linkwiggle_block.as_ref() {
         Some(ParameterBlockSpec {

@@ -307,170 +307,60 @@ def load_posterior(path: str | Path) -> PosteriorSamples:
     return PosteriorSamples.load(path)
 
 
-__all__ = [
-    # Note: the lazy-torch primitives (AdaptiveTopK, Crosscoder,
-    # InterchangeSwapDecoder, PoincareAtoms) are intentionally NOT in __all__.
-    # They remain reachable as ``gamfit.AdaptiveTopK`` via ``__getattr__``;
-    # excluding them here keeps ``from gamfit import *`` working on torch-less
-    # installs where attribute access would otherwise raise AttributeError
-    # mid-iteration (see issue #303).
-    "Diagnostics",
-    "diagnostics",
-    "EquivariantPenalty",
-    "GaugeCompanion",
-    "LieAtom",
-    "PartialSupervisionFit",
-    "PartialSupervisionRecipe",
-    "SaeSupervisedFit",
-    "partial_supervision",
-    "sae_supervised",
-    "recipes",
-    "equivariant_smooth",
-    "gauge_companion",
-    "rho_so2",
-    "rho_so2_jvp",
-    "rho_so3",
-    "rho_so3_jvp",
-    "FormulaError",
-    "FormulaValidation",
-    "GamError",
-    "GumbelTemperatureSchedule",
-    "ManifoldSAE",
-    "CompetingRisksCIF",
-    "CompetingRisksPrediction",
-    "Model",
-    "CumulativeIncidenceDraws",
-    "PairedPosteriorSamples",
-    "PosteriorPredictive",
-    "PosteriorSamples",
-    "PredictionError",
-    "ResponseGeometryModel",
-    "RustExtensionUnavailableError",
-    "SamplingConfig",
-    "SaeManifoldAtomFit",
-    "SaeManifoldFitResult",
-    "ScalarWeightSchedule",
-    "SINDyAtoms",
-    "SchemaCheck",
-    "SchemaIssue",
-    "SchemaMismatchError",
-    "SharedPrecisionGroup",
-    "CircleManifold",
-    "EuclideanManifold",
-    "GrassmannManifold",
-    "ProductManifold",
-    "SpdManifold",
-    "SphereManifold",
-    "StiefelManifold",
-    "TorusManifold",
-    "BasisSpec",
-    "ARDPenalty",
-    "AnalyticPenaltyKind",
-    "AuxConditionalPriorPenalty",
-    "BlockOrthogonalityPenalty",
-    "SheafConsistencyPenalty",
-    "BlockSparsityPenalty",
-    "GatedSAEDecoder",
-    "IBPAssignmentPenalty",
-    "IdentifiabilityReport",
-    "IdentifiabilityTheoremResult",
-    "IdentifiableFactorFitResult",
-    "identifiability",
-    "identifiability_check",
-    "identifiable_factor_fit",
-    "IsometryPenalty",
-    "IvaeRidgeMeanGauge",
-    "MechanismSparsityPenalty",
-    "NuclearNormPenalty",
-    "OrthogonalityPenalty",
-    "ParametricAuxConditionalPriorPenalty",
-    "Penalty",
-    "PENALTY_MANIFEST",
-    "Pca",
-    "ScadMcpPenalty",
-    "SoftmaxAssignmentSparsityPenalty",
-    "SparsityPenalty",
-    "TopKActivationPenalty",
-    "JumpReLUPenalty",
-    "TotalVariationPenalty",
-    "Summary",
-    "ScoreKind",
-    "ScoreScale",
-    "SelectTopologyResult",
-    "SurvivalPrediction",
-    "TermBlock",
-    "__version__",
-    "alr",
-    "build_info",
-    "bspline_basis",
-    "bspline_basis_derivative",
-    "closure",
-    "clr",
-    "compare_models",
-    "conditional_prior_ivae",
-    "competing_risks_cif",
-    "cross_fit_shared_precision_groups",
-    "cuda_diagnostics",
-    "cuda_subprocess_env",
-    "cuda_subprocess_library_dirs",
-    "BSpline",
-    "Categorical",
-    "Duchon",
-    "LatentCoord",
-    "Matern",
-    "PeriodicSplineCurve",
-    "ShapeConstraintLiteral",
-    "Smooth",
-    "Sphere",
-    "TensorBSpline",
-    "topology",
-    "Circle",
-    "Cylinder",
-    "EuclideanPatch",
-    "TopologySphere",
-    "TopologyAutoSelector",
-    "TopologyAutoSelectorRank",
-    "TopologyAutoSelectorResult",
-    "Torus",
-    "duchon_basis",
-    "duchon_function_norm_penalty",
-    "explain_error",
-    "fit",
-    "format_cuda_diagnostics",
-    "fit_array",
-    "gaussian_reml_fit",
-    "gaussian_reml_fit_backward",
-    "gaussian_reml_fit_batched",
-    "gaussian_reml_fit_batched_backward",
-    "gaussian_reml_fit_blocks_backward",
-    "gaussian_reml_fit_blocks_forward",
-    "gaussian_reml_fit_formula",
-    "gaussian_reml_fit_latent",
-    "gaussian_reml_fit_latent_backward",
-    "glm_reml_fit_latent",
-    "glm_reml_fit_latent_backward",
-    "gaussian_reml_fit_positions",
-    "gaussian_reml_fit_positions_backward",
-    "gaussian_reml_fit_positions_batched",
-    "gaussian_reml_fit_positions_batched_backward",
-    "gaussian_reml_fit_with_constraints_backward",
-    "gaussian_reml_fit_with_constraints_forward",
-    "gaussian_weighted_ridge",
-    "gaussian_weighted_ridge_batch",
-    "gumbel_geometric_schedule",
-    "gumbel_linear_schedule",
-    "gumbel_reciprocal_iter_schedule",
-    "load",
-    "load_posterior",
-    "loads",
-    "save",
-    "mechanism_sparsity_jacobian",
-    "periodic_spline_curve_basis",
-    "sphere_basis",
-    "simplex_frechet_mean",
-    "smoothness_penalty",
-    "sphere_frechet_mean",
-    "sae_manifold_fit",
-    "select_topology",
-    "validate_formula",
-]
+def _build_public_api() -> list[str]:
+    """Derive ``__all__`` from what is actually importable at this install.
+
+    Hand-maintaining ``__all__`` is brittle: every new top-level export has to
+    be added in two places, and lazy-torch names placed in ``__all__`` blow
+    up ``from gamfit import *`` on torch-less installs because Python's
+    star-import iterates ``__all__`` and runs ``getattr`` on every entry
+    (issue #303).
+
+    Instead, derive the public API at import time:
+      1. every non-underscore name currently bound in the module globals
+         (the heavy ``from ._x import ...`` blocks above), minus submodules
+         and private re-imports;
+      2. every lazy-torch name in ``_LAZY_TORCH_ATTRS`` *whose backing
+         module is actually importable on this install* — torch-less
+         installs skip them automatically, so star-import never crashes;
+      3. an explicit allowlist of submodule attributes (``diagnostics``,
+         ``recipes``, ``topology``, ``identifiability``, ``manifolds``,
+         ``kernels``) that are part of the public API even though they are
+         module objects.
+    """
+    from types import ModuleType
+    from importlib import import_module
+
+    public_submodules = {
+        "diagnostics",
+        "recipes",
+        "topology",
+        "identifiability",
+        "manifolds",
+        "kernels",
+    }
+    api: set[str] = set()
+    for name, value in globals().items():
+        if name.startswith("_"):
+            continue
+        # Skip module objects unless they are explicitly in the public
+        # submodule allowlist: ``importlib``, ``Path``, etc. were imported
+        # for internal use and should not leak into star imports.
+        if isinstance(value, ModuleType) and name not in public_submodules:
+            continue
+        api.add(name)
+    api.add("__version__")
+    # Lazy-torch names: include only when importable on this install. We
+    # probe with ``import_module`` (cheap on a cache hit) rather than calling
+    # ``__getattr__`` because the latter raises AttributeError on missing
+    # torch, which is precisely the failure mode we are designing around.
+    for lazy_name, (module_path, _attr) in _LAZY_TORCH_ATTRS.items():
+        try:
+            import_module(module_path)
+        except ImportError:
+            continue
+        api.add(lazy_name)
+    return sorted(api)
+
+
+__all__ = _build_public_api()
