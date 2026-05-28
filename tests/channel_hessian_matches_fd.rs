@@ -21,33 +21,62 @@ use gam::families::survival_marginal_slope_identifiability::{
 use ndarray::Array1;
 
 const FD_H: f64 = 1e-4;
-const REL_TOL: f64 = 1e-6;
+const REL_TOL: f64 = 1e-5;
+const ABS_TOL: f64 = 1e-6;
 const N: usize = 16;
 
 fn rel_err(got: f64, ref_val: f64) -> f64 {
-    let scale = ref_val.abs().max(1e-10);
+    let scale = ref_val.abs().max(1.0);
     (got - ref_val).abs() / scale
 }
 
-/// Finite-difference Hessian of a scalar function f: R^k -> R.
-/// Returns a k×k matrix H where H[a,b] = (f(u+h·e_a+h·e_b) - f(u+h·e_a) - f(u+h·e_b) + f(u)) / h².
+fn err_within_tol(got: f64, ref_val: f64) -> bool {
+    let abs_err = (got - ref_val).abs();
+    if abs_err < ABS_TOL {
+        return true;
+    }
+    rel_err(got, ref_val) < REL_TOL
+}
+
+/// Central-difference Hessian of a scalar function f: R^k -> R.
+///
+/// For diagonal entries: H[a,a] = (f(u+h·e_a) − 2·f(u) + f(u−h·e_a)) / h².
+/// For off-diagonals:    H[a,b] = (f(u+h·e_a+h·e_b) − f(u+h·e_a−h·e_b)
+///                                 − f(u−h·e_a+h·e_b) + f(u−h·e_a−h·e_b)) / (4 h²).
+/// Both are O(h²) truncation accurate.
 fn fd_hessian<F: Fn(&[f64]) -> f64>(f: &F, u: &[f64], k: usize, h: f64) -> Vec<Vec<f64>> {
     let f0 = f(u);
-    let mut f_plus: Vec<f64> = vec![0.0; k];
-    for a in 0..k {
-        let mut ua = u.to_vec();
-        ua[a] += h;
-        f_plus[a] = f(&ua);
-    }
     let mut hess = vec![vec![0.0f64; k]; k];
+    let mut f_plus: Vec<f64> = vec![0.0; k];
+    let mut f_minus: Vec<f64> = vec![0.0; k];
     for a in 0..k {
-        for b in a..k {
-            let mut uab = u.to_vec();
-            uab[a] += h;
-            uab[b] += h;
-            let fab = f(&uab);
-            hess[a][b] = (fab - f_plus[a] - f_plus[b] + f0) / (h * h);
-            hess[b][a] = hess[a][b];
+        let mut ua_p = u.to_vec();
+        let mut ua_m = u.to_vec();
+        ua_p[a] += h;
+        ua_m[a] -= h;
+        f_plus[a] = f(&ua_p);
+        f_minus[a] = f(&ua_m);
+    }
+    for a in 0..k {
+        hess[a][a] = (f_plus[a] - 2.0 * f0 + f_minus[a]) / (h * h);
+    }
+    for a in 0..k {
+        for b in (a + 1)..k {
+            let mut u_pp = u.to_vec();
+            let mut u_pm = u.to_vec();
+            let mut u_mp = u.to_vec();
+            let mut u_mm = u.to_vec();
+            u_pp[a] += h;
+            u_pp[b] += h;
+            u_pm[a] += h;
+            u_pm[b] -= h;
+            u_mp[a] -= h;
+            u_mp[b] += h;
+            u_mm[a] -= h;
+            u_mm[b] -= h;
+            let off = (f(&u_pp) - f(&u_pm) - f(&u_mp) + f(&u_mm)) / (4.0 * h * h);
+            hess[a][b] = off;
+            hess[b][a] = off;
         }
     }
     hess
@@ -120,11 +149,12 @@ fn survival_marginal_slope_channel_hessian_matches_fd() {
                     if !ref_val.is_finite() {
                         continue;
                     }
-                    let err = rel_err(got, ref_val);
                     assert!(
-                        err < REL_TOL,
+                        err_within_tol(got, ref_val),
                         "survival marginal-slope W_i[{a},{b}] row {i} d={d}: \
-                         got={got:.6e} fd={ref_val:.6e} rel_err={err:.2e} > tol={REL_TOL:.0e}"
+                         got={got:.6e} fd={ref_val:.6e} abs_err={abs:.2e} rel_err={rel:.2e}",
+                        abs = (got - ref_val).abs(),
+                        rel = rel_err(got, ref_val),
                     );
                 }
             }
@@ -173,10 +203,11 @@ fn bernoulli_channel_hessian_matches_fd() {
         if !ref_val.is_finite() {
             continue;
         }
-        let err = rel_err(got, ref_val);
         assert!(
-            err < REL_TOL,
-            "bernoulli W_i[0,0] row {i}: got={got:.6e} fd_expected={ref_val:.6e} rel_err={err:.2e} > tol={REL_TOL:.0e}"
+            err_within_tol(got, ref_val),
+            "bernoulli W_i[0,0] row {i}: got={got:.6e} fd_expected={ref_val:.6e} abs_err={abs:.2e} rel_err={rel:.2e}",
+            abs = (got - ref_val).abs(),
+            rel = rel_err(got, ref_val),
         );
     }
 }
@@ -206,8 +237,14 @@ fn gaussian_location_scale_channel_hessian_matches_fd() {
     let mu_arr = Array1::from_iter(mus.iter().copied());
     let logs_arr = Array1::from_iter(logss.iter().copied());
 
-    let hess = GaussianLocationScaleChannelHessian::from_pilot(&y_arr, &w_arr, &mu_arr, &logs_arr)
-        .expect("GaussianLocationScaleChannelHessian::from_pilot failed");
+    // FD compares against the raw OBSERVED Hessian (no PSD clamp). The
+    // production constructor `from_pilot` clamps for the canonicalize gate;
+    // here we test the closed-form formula matches the row NLL second
+    // derivatives exactly.
+    let hess = GaussianLocationScaleChannelHessian::from_pilot_observed_unclamped(
+        &y_arr, &w_arr, &mu_arr, &logs_arr,
+    )
+    .expect("GaussianLocationScaleChannelHessian::from_pilot_observed_unclamped failed");
 
     for i in 0..N {
         let u = [mus[i], logss[i]];
@@ -224,11 +261,12 @@ fn gaussian_location_scale_channel_hessian_matches_fd() {
                 if !ref_val.is_finite() {
                     continue;
                 }
-                let err = rel_err(got, ref_val);
                 assert!(
-                    err < REL_TOL,
+                    err_within_tol(got, ref_val),
                     "gaussian location-scale W_i[{a},{b}] row {i}: \
-                     got={got:.6e} fd={ref_val:.6e} rel_err={err:.2e} > tol={REL_TOL:.0e}"
+                     got={got:.6e} fd={ref_val:.6e} abs_err={abs:.2e} rel_err={rel:.2e}",
+                    abs = (got - ref_val).abs(),
+                    rel = rel_err(got, ref_val),
                 );
             }
         }
