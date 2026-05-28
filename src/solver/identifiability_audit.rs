@@ -911,7 +911,7 @@ fn channel_aware_aliased_pairs(
     // of length nk per joint column).
     let mut cols: Vec<Array1<f64>> = Vec::with_capacity(p_total);
     let mut col_norms: Vec<f64> = Vec::with_capacity(p_total);
-    for (b_idx, op) in operators.iter().enumerate() {
+    for op in operators.iter() {
         let j_full = op.evaluate_full();
         let p_b = op.ncols();
         for c in 0..p_b {
@@ -925,8 +925,6 @@ fn channel_aware_aliased_pairs(
             cols.push(w);
             col_norms.push(norm);
         }
-        // Suppress unused; the per-block iteration is bounded by p_b.
-        let _ = b_idx;
     }
     // Pairwise scan: for every joint column pair (a < b) with both
     // norms positive, compute |wᵀw'| / (‖w‖·‖w'‖) and emit if above
