@@ -17,7 +17,32 @@ permissions:
   actions: write
 
 jobs:
+  check_open_prs:
+    # Gate: the merger only has work when there's at least one open PR.
+    # On scheduled runs with no open PRs, skip the heavy job entirely so
+    # we don't burn a runner just to have Claude exit immediately.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      has_open_prs: ${{ steps.check.outputs.has_open_prs }}
+    steps:
+      - name: Check for open PRs
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          count=$(gh pr list --repo "${{ github.repository }}" --state open --json number --jq 'length')
+          echo "open PR count: $count"
+          if [ "$count" -gt 0 ]; then
+            echo "has_open_prs=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_open_prs=false" >> "$GITHUB_OUTPUT"
+          fi
+
   merge:
+    needs: check_open_prs
+    if: needs.check_open_prs.outputs.has_open_prs == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
