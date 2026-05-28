@@ -22,9 +22,10 @@ use super::{
     make_reparam_operator,
 };
 use crate::construction::ReparamResult;
+use log;
 use crate::estimate::EstimationError;
 use crate::matrix::DesignMatrix;
-use crate::types::{Coefficients, GlmLikelihoodSpec, InverseLink, LinkFunction};
+use crate::types::LinkFunction;
 use ndarray::{Array1, Array2, ArrayView1};
 use std::sync::Arc;
 
@@ -216,13 +217,8 @@ where
                     LinkFunction::Probit | LinkFunction::CLogLog => HessianCurvatureKind::Observed,
                     _ => HessianCurvatureKind::Fisher,
                 };
-                // Options passed through to GPU dispatch — keep in sync with
-                // the CPU WorkingModelPirlsOptions built just below.
-                let max_iterations = if config.firth_bias_reduction {
-                    config.max_iterations.max(200)
-                } else {
-                    config.max_iterations
-                };
+                // Firth is already gated out upstream (no_firth check).
+                let max_iterations = config.max_iterations;
                 let dispatch = GpuPirlsDispatchInput {
                     likelihood: &config.likelihood,
                     inverse_link: &config.link_kind,

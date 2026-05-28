@@ -1443,7 +1443,7 @@ fn assert_symmetric_tol(matrix: &Array2<f64>, label: &str, tol: f64) {
 }
 
 /// Build a DesignMatrix wrapping a lazy ReparamOperator (or the original for sparse-native).
-fn make_reparam_operator(
+pub(super) fn make_reparam_operator(
     x_original: &DesignMatrix,
     qs_arc: &Arc<Array2<f64>>,
     use_sparse_native: bool,
