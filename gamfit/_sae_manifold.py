@@ -369,6 +369,14 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     smoothness = float(kwargs.pop("smoothness", smoothness_weight))
     sparsity = float(kwargs.pop("sparsity_strength", sparsity_weight))
     tau = float(kwargs.pop("tau", _schedule_tau_start(gumbel_schedule, 0.5)))
+    if "mechanism_sparsity_groups" in kwargs:
+        raise TypeError(
+            "sae_manifold_fit: 'mechanism_sparsity_groups' has been removed. "
+            "Use 'decoder_feature_sparsity_groups' instead — the kwarg was renamed "
+            "to reflect that in the SAE decoder the row index is a basis-function "
+            "index (M_k), not a latent mechanism axis. The groups still partition "
+            "the p_out output features."
+        )
     if kwargs:
         raise TypeError(f"unexpected sae_manifold_fit keyword(s): {', '.join(sorted(kwargs))}")
     if k_atoms <= 0:

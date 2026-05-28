@@ -563,8 +563,26 @@ extern "C" __global__ void chol_logdet_col_major(
         let penalty_export = penalty_with_ridge(input.penalty_hessian, input.objective_ridge);
         let penalized_hessian = xtwx_host + &penalty_export;
 
-        potrf_in_place(&ws.solver, &ws.stream, p, &mut ws.h_dev)?;
-        potrs_in_place(&ws.solver, &ws.stream, p, 1, &ws.h_dev, &mut ws.rhs_dev)?;
+        // Factor + solve in place on the stream using pre-allocated workspace
+        // and info buffers — no per-step allocation, no per-step info download.
+        potrf_in_place_reuse(
+            &ws.solver,
+            &ws.stream,
+            p,
+            ws.potrf_lwork,
+            &mut ws.h_dev,
+            &mut ws.potrf_work_dev,
+            &mut ws.potrf_info_dev,
+        )?;
+        potrs_in_place_reuse(
+            &ws.solver,
+            &ws.stream,
+            p,
+            1,
+            &ws.h_dev,
+            &mut ws.rhs_dev,
+            &mut ws.potrs_info_dev,
+        )?;
 
         let logdet = cholesky_logdet_device(&ws.stream, &shared.ctx, p, &ws.h_dev)?;
 
@@ -1713,23 +1731,11 @@ extern "C" __global__ void status_or(
                         return None;
                     }
                     // Reconstruct the penalised gradient at the
-                    // converged β: g = Xᵀ(grad_eta) + S β.  The first
-                    // term comes from the device-resident grad_eta we
-                    // just downloaded, recombined with the shared
-                    // design (host-side gemv on the same n × p Xᵀ
-                    // that lives in `shared.x_dev`'s host copy is too
-                    // expensive to re-fetch here, so we approximate
-                    // the active-set residual against `lm_ridge·β +
-                    // (H_pen · β)` which equals the converged
-                    // gradient at a KKT-feasible solution).  This is
-                    // exact at the optimum because at convergence
-                    // ‖H_pen·β − Xᵀ·grad_eta‖₂ ≤ tol.
-                    let mut grad = penalized_hessian.dot(&beta);
-                    if lm_ridge != 0.0 {
-                        for (gi, &bi) in grad.iter_mut().zip(beta.iter()) {
-                            *gi += lm_ridge * bi;
-                        }
-                    }
+                    // converged β: g = Xᵀ(grad_eta) + S β + objective_ridge·β.
+                    // `penalized_hessian` is already XᵀWX + S + objective_ridge·I
+                    // (step_lm_lambda was stripped from the export), so
+                    // H_pen·β ≈ Xᵀ·grad_eta at a KKT-feasible solution.
+                    let grad = penalized_hessian.dot(&beta);
                     Some(
                         crate::solver::active_set::compute_constraint_kkt_diagnostics(
                             &beta, &grad, lin,

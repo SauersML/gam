@@ -8315,7 +8315,7 @@ impl BernoulliMarginalSlopeFamily {
             .map(|subsample| subsample.mask.as_slice());
         let row_cell_started = std::time::Instant::now();
         let row_cell_moments =
-            self.build_row_cell_moments_bundle(block_states, &row_contexts, 21, row_cell_mask)?;
+            self.build_row_cell_moments_bundle(block_states, &row_contexts, 9, row_cell_mask)?;
         if log_exact_work(n) {
             log::info!(
                 "[BMS exact-cache] row-cell phase done n={} selected_rows={} built={} elapsed={:.3}s",
@@ -8339,6 +8339,8 @@ impl BernoulliMarginalSlopeFamily {
             primary,
             row_contexts,
             row_cell_moments,
+            row_cell_moments_d15: crate::resource::RayonSafeOnce::new(),
+            row_cell_moments_d21: crate::resource::RayonSafeOnce::new(),
             row_primary_hessians: RowPrimaryHessianCache::Empty,
             rigid_third_full: crate::resource::RayonSafeOnce::new(),
             rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
@@ -9481,6 +9483,22 @@ impl BernoulliMarginalSlopeFamily {
         primary: &PrimarySlices,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Array1<f64>, String> {
+        let mut out = Array1::<f64>::zeros(primary.total);
+        self.row_primary_direction_from_flat_into(row, slices, primary, d_beta_flat, &mut out)?;
+        Ok(out)
+    }
+
+    /// Allocation-free variant of [`Self::row_primary_direction_from_flat`]:
+    /// fills `out` (length `primary.total`) with the primary-space projection
+    /// of `d_beta_flat`. `out` is fully overwritten on success.
+    fn row_primary_direction_from_flat_into(
+        &self,
+        row: usize,
+        slices: &BlockSlices,
+        primary: &PrimarySlices,
+        d_beta_flat: &Array1<f64>,
+        out: &mut Array1<f64>,
+    ) -> Result<(), String> {
         if d_beta_flat.len() != slices.total {
             return Err(format!(
                 "bernoulli marginal-slope d_beta length mismatch: got {}, expected {}",
@@ -9488,7 +9506,6 @@ impl BernoulliMarginalSlopeFamily {
                 slices.total
             ));
         }
-        let mut out = Array1::<f64>::zeros(primary.total);
         out[primary.q] = self
             .marginal_design
             .dot_row_view(row, d_beta_flat.slice(s![slices.marginal.clone()]));
@@ -9503,7 +9520,7 @@ impl BernoulliMarginalSlopeFamily {
             out.slice_mut(s![primary_range.start..primary_range.end])
                 .assign(&d_beta_flat.slice(s![block_range.clone()]).to_owned());
         }
-        Ok(out)
+        Ok(())
     }
 
     fn stacked_direction_block(

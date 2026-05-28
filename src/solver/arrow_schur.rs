@@ -1627,6 +1627,70 @@ impl ArrowHtbetaCache {
             Self::Disabled { .. } => false,
         }
     }
+
+    /// Apply the transpose: `out[a] += H_tβ^(row)[c, a] · v[c]` for all a.
+    ///
+    /// `v` has length `d`; `out` has length `k`. Accumulates (does NOT zero
+    /// `out` first) so callers can sum across rows into a shared accumulator.
+    fn apply_row_transpose_accumulate(
+        &self,
+        row: usize,
+        v: ArrayView1<'_, f64>,
+        out: &mut Array1<f64>,
+        d: usize,
+        k: usize,
+        htbeta_matvec: Option<&RowHtbetaMatvec>,
+    ) -> bool {
+        match self {
+            Self::Dense { blocks, .. } => {
+                let Some(block) = blocks.get(row) else {
+                    return false;
+                };
+                if block.nrows() != v.len() || block.ncols() != out.len() {
+                    return false;
+                }
+                // H_βt^(i) · v: outer-loop c hoists v[c], inner-loop a is
+                // contiguous in row-major (d, k) layout.
+                for c in 0..block.nrows() {
+                    let vc = v[c];
+                    if vc == 0.0 {
+                        continue;
+                    }
+                    for a in 0..block.ncols() {
+                        out[a] += block[[c, a]] * vc;
+                    }
+                }
+                true
+            }
+            Self::Matvec { .. } | Self::Disabled { .. } => {
+                // For the Matvec / Disabled cache variants the dense block is not
+                // retained.  Route through the system-level htbeta_matvec by probing
+                // each standard basis vector: apply H_tβ^(row) e_a → column a, then
+                // dot with v.  When no matvec is available and the cache is Disabled,
+                // return false.
+                let op = match htbeta_matvec {
+                    Some(op) => op,
+                    None => return matches!(self, Self::Disabled { .. }).then_some(false).unwrap_or(false),
+                };
+                // For each beta index a, get column a of H_tβ^(row) via matvec probe.
+                let mut e_a = Array1::<f64>::zeros(k);
+                let mut col_a = Array1::<f64>::zeros(d);
+                for a in 0..k {
+                    e_a.fill(0.0);
+                    e_a[a] = 1.0;
+                    col_a.fill(0.0);
+                    op(row, e_a.view(), &mut col_a);
+                    // dot(col_a, v) → contribution to out[a]
+                    let mut acc = 0.0_f64;
+                    for c in 0..d {
+                        acc += col_a[c] * v[c];
+                    }
+                    out[a] += acc;
+                }
+                true
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

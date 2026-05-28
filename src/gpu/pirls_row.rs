@@ -958,11 +958,10 @@ extern "C" __global__ void {kernel_name}(
 
 /// Device-resident per-row output buffers for the GPU row-reweight kernel.
 ///
-/// **final-row mode**: all nine per-[`RowOutput`] fields. The host launcher
-/// [`launch_row_reweight_on_stream`] writes into these on the supplied
-/// stream; downstream Stage-3 kernels (XᵀWX assembly, Xᵀg formation,
-/// line-search deviance reduction) read them in place without any host
-/// round-trip.
+/// **final-row mode**: all nine per-[`RowOutput`] fields, length `n`. Written
+/// once at convergence by [`launch_row_reweight_on_stream`]. For the hot
+/// inner-loop use [`SolveRowBuffers`]; for line-search use
+/// [`AlphaLadderDevBuffers`].
 #[cfg(target_os = "linux")]
 pub struct RowOutputDevBuffers {
     pub mu: cudarc::driver::CudaSlice<f64>,

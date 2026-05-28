@@ -8044,8 +8044,7 @@ fn analytic_penalty_value_for_targets(
     {
         let rho_local = rho.slice(s![rho_slice]);
         let target = match (tier, penalty) {
-            (PenaltyTier::Psi, _)
-            | (PenaltyTier::Beta, AnalyticPenaltyKind::MechanismSparsity(_)) => target_t.view(),
+            (PenaltyTier::Psi, _) => target_t.view(),
             (PenaltyTier::Beta, _) => {
                 let Some(target_beta) = target_beta.as_ref() else {
                     continue;

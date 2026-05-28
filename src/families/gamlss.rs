@@ -8983,6 +8983,10 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleHessianWorkspace 
         Ok(Some(h))
     }
 
+    fn hessian_matvec_available(&self) -> bool {
+        true
+    }
+
     fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
         let pmu = self.xmu.ncols();
         let p_ls = self.x_ls.ncols();
@@ -12063,6 +12067,10 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleWiggleHessianWork
         Ok(Some(dense))
     }
 
+    fn hessian_matvec_available(&self) -> bool {
+        true
+    }
+
     fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
         let pmu = self.xmu.ncols();
         let p_ls = self.x_ls.ncols();
@@ -13758,6 +13766,10 @@ impl BinomialMeanWiggleHessianWorkspace {
 }
 
 impl ExactNewtonJointHessianWorkspace for BinomialMeanWiggleHessianWorkspace {
+    fn hessian_matvec_available(&self) -> bool {
+        true
+    }
+
     fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
         Ok(Some(
             crate::solver::estimate::reml::unified::HyperOperator::mul_vec(
