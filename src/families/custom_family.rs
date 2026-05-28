@@ -23111,7 +23111,6 @@ mod tests {
                 initial_log_lambdas: rho.clone(),
                 initial_beta: Some(beta.clone()),
                 gauge_priority: 100,
-                eta_row_scaling: None,
                 jacobian_callback: None,
             };
             let specs = vec![spec];
@@ -23434,7 +23433,6 @@ mod tests {
                 initial_log_lambdas: rho_block,
                 initial_beta: Some(beta_flat.slice(s![..p]).to_owned()),
                 gauge_priority: 100,
-                eta_row_scaling: None,
                 jacobian_callback: None,
             }
         };
@@ -27909,7 +27907,6 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(array![0.0]),
                 gauge_priority: 100,
-                eta_row_scaling: None,
                 jacobian_callback: None,
             },
             ParameterBlockSpec {
@@ -27923,7 +27920,6 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(array![0.0, 0.0]),
                 gauge_priority: 100,
-                eta_row_scaling: None,
                 jacobian_callback: None,
             },
         ]
@@ -28340,7 +28336,6 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(Array1::from_elem(p0, 1.0)),
                 gauge_priority: 100,
-                eta_row_scaling: None,
                 jacobian_callback: None,
             },
             ParameterBlockSpec {
@@ -28355,7 +28350,6 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(Array1::from_elem(p1, 1.0)),
                 gauge_priority: 100,
-                eta_row_scaling: None,
                 jacobian_callback: None,
             },
         ]
@@ -28406,7 +28400,6 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(Array1::from_elem(2, 1.0)),
                 gauge_priority: 100,
-                eta_row_scaling: None,
                 jacobian_callback: None,
             },
             ParameterBlockSpec {
@@ -28420,7 +28413,6 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(Array1::from_elem(2, 1.0)),
                 gauge_priority: 100,
-                eta_row_scaling: None,
                 jacobian_callback: None,
             },
         ];
@@ -29756,7 +29748,6 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-                eta_row_scaling: None,
                 jacobian_callback: None,
             });
             states.push(ParameterBlockState {
@@ -29930,7 +29921,6 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-                eta_row_scaling: None,
                 jacobian_callback: None,
             });
             states.push(ParameterBlockState {
@@ -30056,7 +30046,6 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-                eta_row_scaling: None,
                 jacobian_callback: None,
             });
             states.push(ParameterBlockState {
