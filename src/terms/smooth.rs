@@ -7906,7 +7906,7 @@ pub fn fit_term_collection_with_coefficient_groups(
     let base_fit_opts = adaptive_fit_options_base(options, &design);
     let realized = design
         .realize_coefficient_groups(groups, &base_fit_opts.rho_prior)
-        .map_err(|err| EstimationError::InvalidInput(err.to_string()))?;
+        .map_err(EstimationError::BasisError)?;
     let mut grouped_options = base_fit_opts.clone();
     grouped_options.rho_prior = realized.rho_prior;
     let fitted = FittedTermCollection {
@@ -7943,7 +7943,7 @@ where
     let design = build_term_collection_design(data, spec)?;
     let mut fit_opts = adaptive_fit_options_base(options, &design);
     fit_opts.rho_prior = realize_penalty_block_gamma_priors(&design, callback)
-        .map_err(|err| EstimationError::InvalidInput(err.to_string()))?;
+        .map_err(EstimationError::BasisError)?;
     let fitted = FittedTermCollection {
         fit: fit_gamwith_heuristic_lambdas(
             design.design.clone(),
@@ -7975,7 +7975,7 @@ pub fn fit_term_collection_with_penalty_block_gamma_priors(
     let design = build_term_collection_design(data, spec)?;
     let mut fit_opts = adaptive_fit_options_base(options, &design);
     fit_opts.rho_prior = realize_keyed_penalty_block_gamma_priors(&design, priors)
-        .map_err(|err| EstimationError::InvalidInput(err.to_string()))?;
+        .map_err(EstimationError::BasisError)?;
     let fitted = FittedTermCollection {
         fit: fit_gamwith_heuristic_lambdas(
             design.design.clone(),
@@ -8019,10 +8019,10 @@ pub fn fit_term_collection_with_coefficient_groups_and_penalty_block_gamma_prior
     let design = build_term_collection_design(data, spec)?;
     let base_fit_opts = adaptive_fit_options_base(options, &design);
     let base_rho_prior = realize_keyed_penalty_block_gamma_priors(&design, priors)
-        .map_err(|err| EstimationError::InvalidInput(err.to_string()))?;
+        .map_err(EstimationError::BasisError)?;
     let realized = design
         .realize_coefficient_groups(groups, &base_rho_prior)
-        .map_err(|err| EstimationError::InvalidInput(err.to_string()))?;
+        .map_err(EstimationError::BasisError)?;
     let mut grouped_options = base_fit_opts.clone();
     grouped_options.rho_prior = realized.rho_prior;
     let fitted = FittedTermCollection {
