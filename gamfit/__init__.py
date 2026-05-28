@@ -253,6 +253,7 @@ from ._model import (
     CompetingRisksCIF,
     CompetingRisksPrediction,
     Model,
+    MultinomialModel,
     SurvivalPrediction,
     TermBlock,
     competing_risks_cif,

@@ -1064,6 +1064,46 @@ def fit(
         )
 
     headers, rows, table_kind = normalize_table(data)
+
+    # ── Vector-response (multinomial-logit) dispatch (#328). ──────────────
+    # The scalar `fit_table` payload pipeline is parameterised by a single
+    # `ResponseFamily × InverseLink` likelihood spec; multinomial-logit
+    # carries K-1 active linear predictors and a per-row dense Fisher block,
+    # which the scalar pipeline cannot represent. Routing here keeps the
+    # high-level Python API uniform — `gamfit.fit(data, formula,
+    # family='multinomial')` returns a `MultinomialModel` — while the
+    # underlying Rust entry is a dedicated formula→design→Newton path that
+    # bypasses the workflow.rs `FitRequest::Standard` materialiser. REML /
+    # LAML λ-selection for this family follows in the next slice; until
+    # then the inner solver uses a single uniform initial smoothing
+    # parameter shared across penalty blocks and active classes.
+    family_canonical = str(family).lower().replace("_", "-") if family is not None else "auto"
+    if family_canonical in {
+        "multinomial",
+        "multinomial-logit",
+        "categorical",
+        "categorical-logit",
+        "softmax",
+    }:
+        try:
+            model_bytes = bytes(
+                rust_module().fit_multinomial_formula_pyfunc(
+                    headers,
+                    rows,
+                    formula,
+                    1.0,   # init_lambda — REML-selected λ lands in the next slice.
+                    50,    # max_iter
+                    1.0e-7,  # tol
+                )
+            )
+        except Exception as exc:
+            raise map_exception(exc) from exc
+        from ._model import MultinomialModel
+        return MultinomialModel(
+            _model_bytes=model_bytes,
+            _training_table_kind=table_kind,
+        )
+
     fisher_w = None
     if fisher_rao_w is not None:
         fisher_w = _normalize_fisher_rao_w(fisher_rao_w, n_rows=len(rows), dim=1)
