@@ -316,6 +316,10 @@ pub fn canonicalize_for_identifiability(
         });
     }
 
+    // `design.nrows() == n_obs` is a struct invariant for every
+    // ParameterBlockSpec: the canonical n-row operator is what the audit
+    // and shape policy read.  Multi-channel survival LS stacked operators
+    // live in `stacked_design` and are deliberately invisible here.
     let n_rows = specs[0].design.nrows();
 
     // ── Multi-channel routing decision ───────────────────────────────────
@@ -578,6 +582,18 @@ pub fn canonicalize_for_identifiability(
             build_reduced_design(&spec.design, &kept, &spec.name, &t_i)?
         };
 
+        // Column-reduce the optional stacked solver operator alongside
+        // `design` so the post-canonical β still indexes the same
+        // surviving columns in both views.
+        let reduced_stacked_design: Option<DesignMatrix> = match spec.stacked_design.as_ref() {
+            Some(stacked) if !dropped_sorted.is_empty() => {
+                Some(build_reduced_design(stacked, &kept, &spec.name, &t_i)?)
+            }
+            Some(stacked) => Some(stacked.clone()),
+            None => None,
+        };
+        let reduced_stacked_offset = spec.stacked_offset.clone();
+
         let reduced_penalties: Vec<PenaltyMatrix> = spec
             .penalties
             .iter()
@@ -623,7 +639,8 @@ pub fn canonicalize_for_identifiability(
             // internally uses the raw design width, which the column-
             // selection T_i accounts for by selecting surviving columns.
             jacobian_callback: spec.jacobian_callback.clone(),
-            audit_design: spec.audit_design.clone(),
+            stacked_design: reduced_stacked_design,
+            stacked_offset: reduced_stacked_offset,
         });
         per_block_transform.push(t_i);
     }
@@ -894,7 +911,8 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         }
     }
 

@@ -941,7 +941,8 @@ fn build_time_blockspec(
         initial_beta: prepared.initial_beta.clone(),
         gauge_priority: 100,
         jacobian_callback: None,
-        audit_design: None,
+        stacked_design: None,
+        stacked_offset: None,
     }
 }
 
@@ -956,7 +957,8 @@ fn build_mean_blockspec(design: &TermCollectionDesign, offset: Array1<f64>) -> P
         initial_beta: None,
         gauge_priority: 100,
         jacobian_callback: None,
-        audit_design: None,
+        stacked_design: None,
+        stacked_offset: None,
     }
 }
 
@@ -977,7 +979,8 @@ fn build_log_sigma_blockspec(initial_sigma: f64) -> ParameterBlockSpec {
         )),
         gauge_priority: 100,
         jacobian_callback: None,
-        audit_design: None,
+        stacked_design: None,
+        stacked_offset: None,
     }
 }
 
@@ -4057,7 +4060,8 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
                 jacobian_callback: None,
-                audit_design: None,
+                stacked_design: None,
+                stacked_offset: None,
             })
             .collect()
     }
@@ -4139,7 +4143,8 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
                 jacobian_callback: None,
-                audit_design: None,
+                stacked_design: None,
+                stacked_offset: None,
             },
             ParameterBlockSpec {
                 name: "mean".to_string(),
@@ -4154,7 +4159,8 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
                 jacobian_callback: None,
-                audit_design: None,
+                stacked_design: None,
+                stacked_offset: None,
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
@@ -4169,7 +4175,8 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
                 jacobian_callback: None,
-                audit_design: None,
+                stacked_design: None,
+                stacked_offset: None,
             },
         ];
         let p_total = p_time + p_mean + p_log_sigma;

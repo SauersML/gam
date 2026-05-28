@@ -4281,19 +4281,19 @@ fn prepare_survival_location_scale_model(
         &spec.time_block.offset_exit,
         &spec.time_block.derivative_offset_exit,
     ]);
-    // Audit-facing design for the time block.  The solver's `design` field
-    // stacks `[entry; exit; derivative_exit]` for a row count of `3*n`
-    // (eta length = 3*n).  For the identifiability audit only the n-row
-    // exit design is the relevant linear-predictor channel.  Exposing this
-    // n-row view via `ParameterBlockSpec::audit_design` keeps every block's
-    // audit-visible row count equal to n while leaving the solver's stacked
-    // operator untouched — the two concerns (eta-producing operator vs
-    // audit-observation matrix) live in two structurally separate fields.
-    let time_audit_design: DesignMatrix = time_prepared.design_exit.clone();
+    // Canonical n-row view of the time block: `spec.design` is the n-row
+    // exit design (one row per observation, len(eta_canonical) = n).
+    // The solver's stacked `[entry; exit; derivative_exit]` operator and
+    // its matching `3*n`-row offset live in `spec.stacked_design` /
+    // `spec.stacked_offset`; the solver consumes those via
+    // `solver_design()` / `solver_offset()`.  The audit and shape policy
+    // only read `spec.design`, so every block's audit-visible row count
+    // is `n`.
+    let time_canonical_design: DesignMatrix = time_prepared.design_exit.clone();
     let timespec = ParameterBlockSpec {
         name: "time_transform".to_string(),
-        design: time_solver_design,
-        offset: time_stacked_offset,
+        design: time_canonical_design,
+        offset: spec.time_block.offset_exit.clone(),
         penalties: time_prepared
             .penalties
             .iter()
@@ -4308,7 +4308,8 @@ fn prepare_survival_location_scale_model(
         initial_beta: time_prepared.initial_beta.clone(),
         gauge_priority: 100,
         jacobian_callback: None,
-        audit_design: Some(time_audit_design),
+        stacked_design: Some(time_solver_design),
+        stacked_offset: Some(time_stacked_offset),
     };
 
     let threshold_prep = prepare_cov_block_kind(&spec.threshold_block)?;
@@ -4359,48 +4360,46 @@ fn prepare_survival_location_scale_model(
         threshold_full_ncols,
         "survival location-scale threshold",
     )?;
-    let (threshold_solver_design, threshold_solver_offset) =
+    // For time-varying threshold blocks, the solver consumes a stacked
+    // `[exit; entry; deriv]` operator (3*n rows) via `solver_design()`;
+    // the canonical `spec.design` is the n-row exit channel only — the
+    // single field both audit and shape policy read.  Non-time-varying
+    // threshold blocks have no stacking: `stacked_design`/`stacked_offset`
+    // stay `None` and the solver reads `design` directly.
+    let (threshold_stacked_design, threshold_stacked_offset) =
         if let Some(x_entry) = threshold_entry_design.as_ref() {
             let x_deriv = threshold_deriv_design.as_ref().ok_or_else(|| {
                 "time-varying threshold block is missing its exit derivative design".to_string()
             })?;
             (
-                DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(
+                Some(DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(
                     MultiChannelOperator::new(vec![
                         threshold_design.clone(),
                         x_entry.clone(),
                         x_deriv.clone(),
                     ])?,
-                ))),
-                stack_offsets(&[
+                )))),
+                Some(stack_offsets(&[
                     &threshold_prep.offset,
                     &threshold_prep.offset,
                     &Array1::zeros(n),
-                ]),
+                ])),
             )
         } else {
-            (threshold_design.clone(), threshold_prep.offset.clone())
+            (None, None)
         };
-    // Audit-facing design for time-varying threshold blocks: the solver's
-    // `design` stacks `[exit; entry; deriv]` to 3*n rows, but the audit only
-    // needs the n-row exit channel.  When the block is *not* time-varying
-    // `design` already has n rows and no audit override is needed.
-    let threshold_audit_design: Option<DesignMatrix> = if threshold_entry_design.is_some() {
-        Some(threshold_design.clone())
-    } else {
-        None
-    };
     let thresholdspec = ParameterBlockSpec {
         name: "threshold".to_string(),
-        design: threshold_solver_design,
-        offset: threshold_solver_offset,
+        design: threshold_design.clone(),
+        offset: threshold_prep.offset.clone(),
         penalties: threshold_penalties.clone(),
         nullspace_dims: threshold_nullspace_dims.clone(),
         initial_log_lambdas: threshold_initial_log_lambdas,
         initial_beta: threshold_initial_beta,
         gauge_priority: 100,
         jacobian_callback: None,
-        audit_design: threshold_audit_design,
+        stacked_design: threshold_stacked_design,
+        stacked_offset: threshold_stacked_offset,
     };
 
     let survival_primary_design = DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(
@@ -4476,47 +4475,44 @@ fn prepare_survival_location_scale_model(
         log_sigma_full_ncols,
         "survival location-scale log-sigma",
     )?;
-    let (log_sigma_solver_design, log_sigma_solver_offset) =
+    // Same canonical-vs-stacked split as the threshold block: time-varying
+    // log_sigma stacks `[exit; entry; deriv]` (3*n rows) into
+    // `stacked_design`; the canonical `spec.design` is the n-row exit
+    // channel only.
+    let (log_sigma_stacked_design, log_sigma_stacked_offset) =
         if let Some(ref ls_entry) = log_sigma_entry_design {
             let ls_deriv = log_sigma_deriv_design.as_ref().ok_or_else(|| {
                 "time-varying log-sigma block is missing its exit derivative design".to_string()
             })?;
             (
-                DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(
+                Some(DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(
                     MultiChannelOperator::new(vec![
                         log_sigma_design.clone(),
                         ls_entry.clone(),
                         ls_deriv.clone(),
                     ])?,
-                ))),
-                stack_offsets(&[
+                )))),
+                Some(stack_offsets(&[
                     &log_sigma_prep.offset,
                     &log_sigma_prep.offset,
                     &Array1::zeros(n),
-                ]),
+                ])),
             )
         } else {
-            (log_sigma_design.clone(), log_sigma_prep.offset.clone())
+            (None, None)
         };
-    // Same audit-facing decomposition as the threshold block: time-varying
-    // log_sigma stacks `[exit; entry; deriv]` to 3*n rows in `design`; the
-    // audit needs only the n-row exit channel.
-    let log_sigma_audit_design: Option<DesignMatrix> = if log_sigma_entry_design.is_some() {
-        Some(log_sigma_design.clone())
-    } else {
-        None
-    };
     let log_sigmaspec = ParameterBlockSpec {
         name: "log_sigma".to_string(),
-        design: log_sigma_solver_design,
-        offset: log_sigma_solver_offset,
+        design: log_sigma_design.clone(),
+        offset: log_sigma_prep.offset.clone(),
         penalties: log_sigma_penalties.clone(),
         nullspace_dims: log_sigma_nullspace_dims.clone(),
         initial_log_lambdas: log_sigma_initial_log_lambdas,
         initial_beta: log_sigma_initial_beta,
         gauge_priority: 100,
         jacobian_callback: None,
-        audit_design: log_sigma_audit_design,
+        stacked_design: log_sigma_stacked_design,
+        stacked_offset: log_sigma_stacked_offset,
     };
     let wigglespec = if let Some(w) = spec.linkwiggle_block.as_ref() {
         Some(ParameterBlockSpec {
@@ -4547,7 +4543,8 @@ fn prepare_survival_location_scale_model(
             initial_beta: w.initial_beta.clone(),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         })
     } else {
         None
@@ -11252,7 +11249,8 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let specs = vec![
             mk_spec("time", p_time),
@@ -11284,7 +11282,8 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let specs = vec![
             mk_spec("time", 200),
@@ -11318,7 +11317,8 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let specs = vec![
             mk_spec("time", 200),
@@ -11356,7 +11356,8 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
 
         let feasible = family
@@ -11499,7 +11500,8 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let returned = family
             .post_update_block_beta(
@@ -11743,7 +11745,8 @@ mod tests {
                 initial_beta: Some(array![0.2]),
                 gauge_priority: 100,
                 jacobian_callback: None,
-                audit_design: None,
+                stacked_design: None,
+                stacked_offset: None,
             },
             ParameterBlockSpec {
                 name: "threshold".to_string(),
@@ -11759,7 +11762,8 @@ mod tests {
                 initial_beta: Some(array![0.35]),
                 gauge_priority: 100,
                 jacobian_callback: None,
-                audit_design: None,
+                stacked_design: None,
+                stacked_offset: None,
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
@@ -11775,7 +11779,8 @@ mod tests {
                 initial_beta: Some(array![-0.15]),
                 gauge_priority: 100,
                 jacobian_callback: None,
-                audit_design: None,
+                stacked_design: None,
+                stacked_offset: None,
             },
         ]
     }

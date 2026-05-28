@@ -496,11 +496,12 @@ fn audit_identifiability_impl(
     // Materialise each block's effective Jacobian first; the row-equality
     // invariant must apply to what the audit actually inspects
     // (the effective design exposed through `effective_jacobian_at`),
-    // not to the raw `spec.design.nrows()` which can legitimately differ from
-    // the audit-visible row count when a block carries a `jacobian_callback`
-    // (e.g. a survival time block stores a stacked entry/exit/derivative
-    // operator in `design` but exposes a single-channel exit-only Jacobian to
-    // the audit).
+    // not to the raw `spec.design.nrows()`.  With the canonical-row
+    // architecture `spec.design.nrows() == n_obs` is guaranteed by
+    // construction; the survival LS stacked operator lives in
+    // `spec.stacked_design`, which the audit never reads.  The
+    // `effective_jacobian_at` route is still used here because
+    // multi-output blocks (e.g. marginal-slope) produce `n_obs * k` rows.
     let mut dense_blocks: Vec<Array2<f64>> = Vec::with_capacity(specs.len());
     for spec in specs.iter() {
         let dense = spec
@@ -2115,7 +2116,8 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         }
     }
 

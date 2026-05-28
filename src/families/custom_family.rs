@@ -7551,6 +7551,46 @@ fn validate_blockspecs(specs: &[ParameterBlockSpec]) -> Result<Vec<usize>, Strin
             }
             .into());
         }
+        // `stacked_design` and `stacked_offset` must be `Some` together
+        // and their row/length must agree.  This enforces the contract
+        // that `solver_design()` and `solver_offset()` always return a
+        // matched pair.
+        match (&spec.stacked_design, &spec.stacked_offset) {
+            (Some(sd), Some(so)) => {
+                if sd.nrows() != so.len() {
+                    return Err(CustomFamilyError::DimensionMismatch {
+                        reason: format!(
+                            "block {b} stacked_design/stacked_offset row mismatch: \
+                             stacked_design.nrows()={}, stacked_offset.len()={}",
+                            sd.nrows(),
+                            so.len(),
+                        ),
+                    }
+                    .into());
+                }
+                if sd.ncols() != spec.design.ncols() {
+                    return Err(CustomFamilyError::DimensionMismatch {
+                        reason: format!(
+                            "block {b} stacked_design column count {} disagrees with \
+                             design column count {}",
+                            sd.ncols(),
+                            spec.design.ncols(),
+                        ),
+                    }
+                    .into());
+                }
+            }
+            (None, None) => {}
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(CustomFamilyError::ConstraintViolation {
+                    reason: format!(
+                        "block {b} stacked_design and stacked_offset must be Some together \
+                         or both None"
+                    ),
+                }
+                .into());
+            }
+        }
         let p = spec.design.ncols();
         if let Some(beta0) = &spec.initial_beta
             && beta0.len() != p
@@ -7596,12 +7636,13 @@ fn with_block_geometry<F: CustomFamily + ?Sized, T>(
 ) -> Result<T, String> {
     if family.block_geometry_is_dynamic() {
         let (x_dyn, off_dyn) = family.block_geometry(block_states, spec)?;
-        if x_dyn.nrows() != spec.design.nrows() {
+        let expected_rows = spec.solver_design().nrows();
+        if x_dyn.nrows() != expected_rows {
             return Err(CustomFamilyError::DimensionMismatch {
                 reason: format!(
                     "block {block_idx} dynamic design row mismatch: got {}, expected {}",
                     x_dyn.nrows(),
-                    spec.design.nrows()
+                    expected_rows
                 ),
             }
             .into());
@@ -7616,19 +7657,19 @@ fn with_block_geometry<F: CustomFamily + ?Sized, T>(
             }
             .into());
         }
-        if off_dyn.len() != spec.design.nrows() {
+        if off_dyn.len() != expected_rows {
             return Err(CustomFamilyError::DimensionMismatch {
                 reason: format!(
                     "block {block_idx} dynamic offset length mismatch: got {}, expected {}",
                     off_dyn.len(),
-                    spec.design.nrows()
+                    expected_rows
                 ),
             }
             .into());
         }
         f(&x_dyn, &off_dyn)
     } else {
-        f(&spec.design, &spec.offset)
+        f(spec.solver_design(), spec.solver_offset())
     }
 }
 
@@ -8124,7 +8165,10 @@ fn refresh_all_block_etas<F: CustomFamily + Clone + Send + Sync + 'static>(
 
     let refreshed_etas: Vec<Array1<f64>> = (0..specs.len())
         .into_par_iter()
-        .map(|b| specs[b].design.matrixvectormultiply(&states[b].beta) + &specs[b].offset)
+        .map(|b| {
+            specs[b].solver_design().matrixvectormultiply(&states[b].beta)
+                + specs[b].solver_offset()
+        })
         .collect();
 
     for (state, eta) in states.iter_mut().zip(refreshed_etas) {
@@ -9061,9 +9105,10 @@ fn block_penalized_hessian_vector(
         BlockWorkingSet::Diagonal {
             working_weights, ..
         } => {
-            let x_direction = spec.design.matrixvectormultiply(direction);
+            let solver_design = spec.solver_design();
+            let x_direction = solver_design.matrixvectormultiply(direction);
             let wx_direction = &x_direction * working_weights;
-            spec.design.transpose_vector_multiply(&wx_direction)
+            solver_design.transpose_vector_multiply(&wx_direction)
         }
     };
     hpen += &s_lambda.dot(direction);
@@ -9831,7 +9876,8 @@ fn exact_newton_joint_hessian_directional_derivative_from_working_sets<F: Custom
             BlockWorkingSet::Diagonal {
                 working_weights, ..
             } => {
-                let mut d_eta = spec.design.apply(&d_beta_block);
+                let solver_design = spec.solver_design();
+                let mut d_eta = solver_design.apply(&d_beta_block);
                 let mut geometry_correction = Array2::<f64>::zeros((p_block, p_block));
                 if let Some(geometry) = family.block_geometry_directional_derivative(
                     block_states,
@@ -9848,18 +9894,18 @@ fn exact_newton_joint_hessian_directional_derivative_from_working_sets<F: Custom
                     }
                     d_eta += &geometry.d_offset;
                     if let Some(d_design) = geometry.d_design {
-                        if d_design.nrows() != spec.design.nrows() || d_design.ncols() != p_block {
+                        if d_design.nrows() != solver_design.nrows() || d_design.ncols() != p_block {
                             return Err(CustomFamilyError::DimensionMismatch { reason: format!(
                                 "exact_newton_joint_hessian_directional_derivative_with_specs default: block {block_idx} d_design shape {}x{} != expected {}x{}",
                                 d_design.nrows(),
                                 d_design.ncols(),
-                                spec.design.nrows(),
+                                solver_design.nrows(),
                                 p_block
                             ) }.into());
                         }
                         d_eta += &d_design.dot(&state.beta);
 
-                        let x_dense = spec.design.to_dense();
+                        let x_dense = solver_design.to_dense();
                         let mut weighted_x = x_dense.clone();
                         let mut weighted_dx = d_design.clone();
                         ndarray::Zip::from(weighted_x.rows_mut())
@@ -9880,7 +9926,7 @@ fn exact_newton_joint_hessian_directional_derivative_from_working_sets<F: Custom
                         &d_eta,
                     )?
                     .map(|dw| {
-                        let mut local = spec.design.diag_xtw_x(&dw)?;
+                        let mut local = solver_design.diag_xtw_x(&dw)?;
                         local += &geometry_correction;
                         Ok::<Array2<f64>, String>(local)
                     })
@@ -15665,7 +15711,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // Reuse pre-allocated eta backup to avoid O(n) allocation per block per cycle.
             let eta_checkpoint = BlockEtaCheckpoint::capture_reuse(&states[b], &mut eta_backups[b]);
             let x_delta = if !is_dynamic {
-                Some(spec.design.matrixvectormultiply(&delta))
+                Some(spec.solver_design().matrixvectormultiply(&delta))
             } else {
                 None
             };
@@ -15773,10 +15819,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     // IRLS local-quadratic gradient and Hessian:
                     //   rhs = X^T W (z − Xβ) − Sβ
                     //   H_pen δ = X^T W X δ + Sδ
-                    let xb = spec.design.matrixvectormultiply(&beta_old);
+                    let solver_design = spec.solver_design();
+                    let xb = solver_design.matrixvectormultiply(&beta_old);
                     let resid = working_response - &xb;
                     let w_resid = &resid * working_weights;
-                    let mut rhs = spec.design.transpose_vector_multiply(&w_resid);
+                    let mut rhs = solver_design.transpose_vector_multiply(&w_resid);
                     rhs -= &s_lambda.dot(&beta_old);
                     if options.ridge_policy.include_quadratic_penalty && ridge > 0.0 {
                         rhs.scaled_add(-ridge, &beta_old);
@@ -15828,7 +15875,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     if dir_norm > inner_tol {
                         // Precompute X * descent_dir once for incremental eta updates.
                         let x_descent = if !is_dynamic {
-                            Some(spec.design.matrixvectormultiply(&descent_dir))
+                            Some(spec.solver_design().matrixvectormultiply(&descent_dir))
                         } else {
                             None
                         };
@@ -23045,7 +23092,8 @@ mod tests {
             initial_beta: Some(beta.clone()),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let specs = vec![spec];
         let inner = BlockwiseInnerResult {
@@ -23226,7 +23274,8 @@ mod tests {
                 initial_beta: Some(beta.clone()),
                 gauge_priority: 100,
                 jacobian_callback: None,
-                audit_design: None,
+                stacked_design: None,
+                stacked_offset: None,
             };
             let specs = vec![spec];
             let inner = BlockwiseInnerResult {
@@ -23549,7 +23598,8 @@ mod tests {
                 initial_beta: Some(beta_flat.slice(s![..p]).to_owned()),
                 gauge_priority: 100,
                 jacobian_callback: None,
-                audit_design: None,
+                stacked_design: None,
+                stacked_offset: None,
             }
         };
         let specs = vec![
@@ -23885,7 +23935,8 @@ mod tests {
             initial_beta: Some(Array1::from_elem(wiggle_block.design.ncols(), 0.03)),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let family = BinomialLocationScaleWiggleFamily {
             y: base.y,
@@ -23933,7 +23984,8 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let specs = vec![mk_spec(12), mk_spec(20), mk_spec(8)];
         assert_eq!(
@@ -23969,7 +24021,8 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let coefficient_hessian_cost = n_train * (p as u64) * (p as u64);
 
@@ -24098,7 +24151,8 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let specs = vec![mk_spec(500, 10), mk_spec(500, 14)];
         let h_cost = default_coefficient_hessian_cost(&specs);
@@ -24178,7 +24232,8 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let specs = vec![mk_spec("a", 2), mk_spec("b", 3)];
 
@@ -24215,7 +24270,8 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
 
         let err = match constrained_warm_start_from_cached_beta(1, &[spec], &array![1.0, f64::NAN])
@@ -24244,7 +24300,8 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let mut state = CustomOuterState::new(None);
         state
@@ -24417,7 +24474,8 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         }];
         let (gradient, hessian) = custom_family_outer_derivatives(
             &OneBlockFirstOrderOnlyFamily,
@@ -24496,7 +24554,8 @@ mod tests {
             initial_beta: Some(array![0.2, -0.1]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         }
     }
 
@@ -24675,7 +24734,8 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         }];
         let options = BlockwiseFitOptions {
             use_remlobjective: true,
@@ -24729,7 +24789,8 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         }];
         let options = BlockwiseFitOptions {
             use_remlobjective: true,
@@ -24818,7 +24879,8 @@ mod tests {
             initial_beta: Some(array![0.75]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let options = BlockwiseFitOptions {
             inner_tol: 1e-11,
@@ -24921,7 +24983,8 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         }];
         let options = BlockwiseFitOptions {
             use_remlobjective: true,
@@ -25869,7 +25932,8 @@ mod tests {
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let options = BlockwiseFitOptions {
             inner_max_cycles: 1,
@@ -25920,7 +25984,8 @@ mod tests {
             initial_beta: Some(array![1.0]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let options = BlockwiseFitOptions {
             inner_max_cycles: 20,
@@ -25974,7 +26039,8 @@ mod tests {
             initial_beta: Some(array![1.0]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let options = BlockwiseFitOptions {
             inner_max_cycles: 1,
@@ -26032,7 +26098,8 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let options = BlockwiseFitOptions {
             use_remlobjective: true,
@@ -26104,7 +26171,8 @@ mod tests {
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let options = BlockwiseFitOptions {
             use_remlobjective: true,
@@ -26141,7 +26209,8 @@ mod tests {
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let spec1 = ParameterBlockSpec {
             name: "block1".to_string(),
@@ -26153,7 +26222,8 @@ mod tests {
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let options = BlockwiseFitOptions {
             inner_max_cycles: 1,
@@ -26440,7 +26510,8 @@ mod tests {
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let spec1 = ParameterBlockSpec {
             name: "block1".to_string(),
@@ -26455,7 +26526,8 @@ mod tests {
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let options = BlockwiseFitOptions {
             use_remlobjective: true,
@@ -26493,7 +26565,8 @@ mod tests {
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let options = BlockwiseFitOptions {
             use_remlobjective: true,
@@ -26528,7 +26601,8 @@ mod tests {
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let deriv = CustomFamilyBlockPsiDerivative {
             penalty_index: None,
@@ -26591,7 +26665,8 @@ mod tests {
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let result = fit_custom_family(
             &OneBlockIndefinitePseudoLaplaceFamily,
@@ -26720,7 +26795,8 @@ mod tests {
             initial_beta: Some(array![0.0, 0.0]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let fit = fit_custom_family(
             &OneBlockNearlySymmetricPseudoLaplaceFamily,
@@ -26926,7 +27002,8 @@ mod tests {
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let log_sigmaspec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
@@ -26941,7 +27018,8 @@ mod tests {
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let threshold_design = thresholdspec.design.clone();
         let log_sigma_design = log_sigmaspec.design.clone();
@@ -27036,7 +27114,8 @@ mod tests {
             initial_beta: Some(array![0.2]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let log_sigmaspec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
@@ -27051,7 +27130,8 @@ mod tests {
             initial_beta: Some(array![-0.1]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let threshold_design = thresholdspec.design.clone();
         let log_sigma_design = log_sigmaspec.design.clone();
@@ -27154,7 +27234,8 @@ mod tests {
             initial_beta: Some(array![0.15]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let log_sigmaspec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
@@ -27169,7 +27250,8 @@ mod tests {
             initial_beta: Some(array![-0.05]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let threshold_design = thresholdspec.design.clone();
         let log_sigma_design = log_sigmaspec.design.clone();
@@ -27340,7 +27422,8 @@ mod tests {
             initial_beta: Some(array![0.2]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let log_sigmaspec = ParameterBlockSpec {
             name: "log_sigma".to_string(),
@@ -27355,7 +27438,8 @@ mod tests {
             initial_beta: Some(array![-0.1]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let threshold_design = thresholdspec.design.clone();
         let log_sigma_design = log_sigmaspec.design.clone();
@@ -27483,7 +27567,8 @@ mod tests {
             initial_beta: Some(array![1.5]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let family = OneBlockConstrainedExactFamily {
             target: 0.0,
@@ -27538,7 +27623,8 @@ mod tests {
             initial_beta: Some(array![1.5]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let states = vec![ParameterBlockState {
             beta: array![1.5],
@@ -27864,7 +27950,8 @@ mod tests {
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let states = vec![ParameterBlockState {
             beta: array![0.0],
@@ -27913,7 +28000,8 @@ mod tests {
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let options = BlockwiseFitOptions {
             outer_max_iter: 3,
@@ -27946,7 +28034,8 @@ mod tests {
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let options = BlockwiseFitOptions {
             use_remlobjective: false,
@@ -28063,7 +28152,8 @@ mod tests {
                 initial_beta: Some(array![0.0]),
                 gauge_priority: 100,
                 jacobian_callback: None,
-                audit_design: None,
+                stacked_design: None,
+                stacked_offset: None,
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
@@ -28077,7 +28167,8 @@ mod tests {
                 initial_beta: Some(array![0.0, 0.0]),
                 gauge_priority: 100,
                 jacobian_callback: None,
-                audit_design: None,
+                stacked_design: None,
+                stacked_offset: None,
             },
         ]
     }
@@ -28205,7 +28296,8 @@ mod tests {
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         }];
         let states = vec![ParameterBlockState {
             beta: array![0.0],
@@ -28495,7 +28587,8 @@ mod tests {
                 initial_beta: Some(Array1::from_elem(p0, 1.0)),
                 gauge_priority: 100,
                 jacobian_callback: None,
-                audit_design: None,
+                stacked_design: None,
+                stacked_offset: None,
             },
             ParameterBlockSpec {
                 name: "small_block".to_string(),
@@ -28510,7 +28603,8 @@ mod tests {
                 initial_beta: Some(Array1::from_elem(p1, 1.0)),
                 gauge_priority: 100,
                 jacobian_callback: None,
-                audit_design: None,
+                stacked_design: None,
+                stacked_offset: None,
             },
         ]
     }
@@ -28561,7 +28655,8 @@ mod tests {
                 initial_beta: Some(Array1::from_elem(2, 1.0)),
                 gauge_priority: 100,
                 jacobian_callback: None,
-                audit_design: None,
+                stacked_design: None,
+                stacked_offset: None,
             },
             ParameterBlockSpec {
                 name: "block_b".to_string(),
@@ -28575,7 +28670,8 @@ mod tests {
                 initial_beta: Some(Array1::from_elem(2, 1.0)),
                 gauge_priority: 100,
                 jacobian_callback: None,
-                audit_design: None,
+                stacked_design: None,
+                stacked_offset: None,
             },
         ];
         let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
@@ -29091,7 +29187,8 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let state = ParameterBlockState {
             beta: array![0.25, 0.75],
@@ -29168,7 +29265,8 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let state = ParameterBlockState {
             beta: array![2.0, -1.0],
@@ -29218,7 +29316,8 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let state = ParameterBlockState {
             beta: array![10.0, -4.0],
@@ -29748,7 +29847,8 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let h: Array2<f64> = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0e-10]];
         let work = BlockWorkingSet::ExactNewton {
@@ -29805,7 +29905,8 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let h: Array2<f64> = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0e-8]];
         let work = BlockWorkingSet::ExactNewton {
@@ -29916,7 +30017,8 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
                 jacobian_callback: None,
-                audit_design: None,
+                stacked_design: None,
+                stacked_offset: None,
             });
             states.push(ParameterBlockState {
                 beta: Array1::zeros(width),
@@ -30090,7 +30192,8 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
                 jacobian_callback: None,
-                audit_design: None,
+                stacked_design: None,
+                stacked_offset: None,
             });
             states.push(ParameterBlockState {
                 beta: Array1::zeros(width),
@@ -30216,7 +30319,8 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
                 jacobian_callback: None,
-                audit_design: None,
+                stacked_design: None,
+                stacked_offset: None,
             });
             states.push(ParameterBlockState {
                 beta: Array1::zeros(width),

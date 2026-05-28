@@ -336,8 +336,7 @@ pub fn build_termspec(
                             if coefficient_min.is_some() || coefficient_max.is_some() {
                                 return Err(TermBuilderError::incompatible_config(format!(
                                     "coefficient constraints are not supported for categorical auto-random-effect term '{name}'; use group({name}) or an unconstrained numeric term"
-                                ))
-                                .to_string());
+                                )));
                             }
                             random_terms.push(RandomEffectTermSpec {
                                 name: name.clone(),
@@ -366,8 +365,7 @@ pub fn build_termspec(
                 if !matches!(auto_kind, ColumnKindTag::Continuous | ColumnKindTag::Binary) {
                     return Err(TermBuilderError::incompatible_config(format!(
                         "bounded() currently supports only numeric columns, got categorical '{name}'"
-                    ))
-                    .to_string());
+                    )));
                 }
                 linear_terms.push(LinearTermSpec {
                     name: name.clone(),
@@ -414,7 +412,8 @@ pub fn build_termspec(
                         return Err(format!(
                             "bs=sz smooth '{}' expects a factor followed by one or more smooth variables",
                             label
-                        ));
+                        )
+                        .into());
                     }
                     smooth_vars = vars[1..].to_vec();
                 }
@@ -447,7 +446,8 @@ pub fn build_termspec(
                         return Err(format!(
                             "bs=sz smooth '{}' requires categorical factor '{}'; got numeric column",
                             label, vars[0]
-                        ));
+                        )
+                        .into());
                     }
                     let mut levels: Vec<u64> = ds
                         .values
@@ -536,8 +536,7 @@ pub fn build_termspec(
             ParsedTerm::LogSlopeSurface { .. } => {
                 return Err(TermBuilderError::malformed_formula(
                     "logslope(...) declarations must be resolved by the marginal-slope formula path before building a term spec",
-                )
-                .to_string());
+                ));
             }
             ParsedTerm::Interaction { vars } => {
                 // Validate every atom resolves to a numeric column. Linear
@@ -563,8 +562,7 @@ pub fn build_termspec(
                                  (continuous/binary) operands. Use te(...) for smooth \
                                  interactions or pre-encode the factor as numeric columns.",
                                 vars.join(":")
-                            ))
-                            .to_string());
+                            )));
                         }
                     }
                 }

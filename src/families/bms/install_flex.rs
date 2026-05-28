@@ -368,7 +368,8 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
                     initial_beta: None,
                     gauge_priority: 200,
                     jacobian_callback: None,
-                    audit_design: None,
+                    stacked_design: None,
+                    stacked_offset: None,
                 });
             }
             specs.push(crate::custom_family::ParameterBlockSpec {
@@ -383,7 +384,8 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
                 initial_beta: None,
                 gauge_priority: 100,
                 jacobian_callback: None,
-                audit_design: None,
+                stacked_design: None,
+                stacked_offset: None,
             });
             specs
         },

@@ -1523,7 +1523,8 @@ fn fit_cause_specific_survival_transformation_custom(
             initial_beta: Some(beta_start),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         });
     }
 

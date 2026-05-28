@@ -1098,65 +1098,15 @@ fn estimation_error_to_pyerr(err: EstimationError) -> PyErr {
 }
 
 // -------------------------------------------------------------------------
-// Legacy message-regex classifier
+// (Removed) Legacy message-regex classifier — issue #343.
+//
+// `classify_exception_message` was a string-regex bridge that guessed a
+// Python exception subclass from the prose of a flattened error message.
+// It is gone. The principled path is variant-dispatch at the engine→Python
+// boundary: `estimation_error_to_pyerr`, `workflow_error_to_pyerr`,
+// `geometry_error_to_pyerr`, etc. New engine error variants extend the
+// matching typed dispatcher, never a string classifier.
 // -------------------------------------------------------------------------
-//
-// Retained ONLY for error sources that still flow through `Result<_, String>`
-// at the FFI boundary (formula validation, schema checks during predict,
-// basis builder errors not wrapped in `EstimationError`, etc.). Issue #343
-// tracked the variant-dispatch refactor: `EstimationError` is now fully
-// typed via `estimation_error_to_pyerr` and bypasses this classifier
-// entirely (typed exceptions short-circuit `map_exception` on the Python
-// side via the `isinstance(exc, GamError)` check).
-//
-// As the remaining engine-error enums (~44 of them) are migrated to
-// per-variant dispatch, the corresponding branches of this classifier
-// shrink; the function will be deleted once every Rust→Python error path
-// is variant-typed. Until then, NEW error variants MUST be added to a
-// typed dispatch function, never to this regex pipeline.
-
-enum PythonExceptionKind {
-    Formula,
-    SchemaMismatch,
-    Prediction,
-    Gam,
-}
-
-impl PythonExceptionKind {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::Formula => "formula",
-            Self::SchemaMismatch => "schema_mismatch",
-            Self::Prediction => "prediction",
-            Self::Gam => "gam",
-        }
-    }
-}
-
-#[pyfunction]
-fn classify_exception_message(message: String) -> &'static str {
-    // Column-not-found used to be routed here via substring matching
-    // (`"not found in data"` / `"available columns:"`). It now flows
-    // through the typed `WorkflowError::ColumnNotFound` →
-    // `gamfit.ColumnNotFoundError` dispatch in `workflow_error_to_pyerr`
-    // (issues #305 / #343), so the substring branch was removed: every
-    // column-not-found error reaches Python as the typed exception class
-    // before `map_exception` ever consults this fallback.
-    let lower = message.to_lowercase();
-    let kind = if lower.contains("formula") || lower.contains("parse") {
-        PythonExceptionKind::Formula
-    } else if lower.contains("schema")
-        || lower.contains("missing required column")
-        || lower.contains("unknown column")
-    {
-        PythonExceptionKind::SchemaMismatch
-    } else if lower.contains("prediction") || lower.contains("predict") {
-        PythonExceptionKind::Prediction
-    } else {
-        PythonExceptionKind::Gam
-    };
-    kind.as_str()
-}
 
 #[pyfunction]
 fn torch_from_fitted(
@@ -1206,7 +1156,6 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "check",
             "report",
             "sklearn_fit_metadata",
-            "classify_exception_message",
             "cross_fit_shared_precision_groups",
             "save",
             "validate_formula",
@@ -21660,7 +21609,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<SpdManifold>()?;
     module.add_class::<ProductManifold>()?;
     module.add_function(wrap_pyfunction!(fit_penalized_multinomial_pyfunc, module)?)?;
-    module.add_function(wrap_pyfunction!(classify_exception_message, module)?)?;
     module.add_function(wrap_pyfunction!(sklearn_fit_metadata, module)?)?;
     module.add_function(wrap_pyfunction!(build_info, module)?)?;
     module.add_function(wrap_pyfunction!(identifiability_check_json, module)?)?;
