@@ -12,6 +12,7 @@ pub mod bernoulli_marginal_slope {
     }
 }
 pub mod bernoulli_marginal_slope_identifiability;
+pub mod binomial_multi;
 pub mod cubic_cell_kernel;
 pub mod custom_family;
 pub mod gamlss;
