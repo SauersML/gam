@@ -522,7 +522,7 @@ fn gpu_pirls_gating_5_qs_basis_semantics() {
 // ---------------------------------------------------------------------------
 #[test]
 fn gpu_pirls_gating_6_final_hessian_at_accepted_eta() {
-    if !cuda_selected() {
+    if let GpuGate::Skip = gpu_gate("gpu_pirls_gating_6_final_hessian_at_accepted_eta") {
         return;
     }
 
@@ -601,7 +601,7 @@ fn gpu_pirls_gating_6_final_hessian_at_accepted_eta() {
 // ---------------------------------------------------------------------------
 #[test]
 fn gpu_pirls_gating_7_status_or_reduce() {
-    if !cuda_selected() {
+    if let GpuGate::Skip = gpu_gate("gpu_pirls_gating_7_status_or_reduce") {
         return;
     }
 
