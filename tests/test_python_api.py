@@ -270,7 +270,7 @@ def test_pandas_diagnostics_and_plotting() -> None:
     assert predicted_arr.shape == (3,)
     tabular = model.predict(prediction_frame(), return_type="pandas")
     assert isinstance(tabular, pd.DataFrame)
-    assert list(tabular.columns) == ["eta", "mean"]
+    assert list(tabular.columns) == ["linear_predictor", "mean"]
 
     diagnostics = model.diagnose(training_frame())
     assert diagnostics.metrics["rmse"] < 1e-3
@@ -449,7 +449,7 @@ def test_predict_can_passthrough_id_column() -> None:
     )
 
     assert pred["person_id"] == ["a", "b"]
-    assert set(pred) == {"person_id", "eta", "mean"}
+    assert set(pred) == {"person_id", "linear_predictor", "mean"}
 
 
 # ---------------------------------------------------------------------------
@@ -620,7 +620,7 @@ def test_survival_prediction_dense_surfaces_smoke() -> None:
     pred = gamfit.SurvivalPrediction(
         model_class="survival marginal-slope",
         parameters=np.zeros((2, 1), dtype=float),
-        parameter_names=("eta",),
+        parameter_names=("linear_predictor",),
         times=times,
         hazard=hazard_surface,
         survival=survival_surface,
@@ -762,7 +762,7 @@ def test_competing_risks_cif_plateaus_and_probability_bounds() -> None:
         f"cause_{idx + 1}": gamfit.SurvivalPrediction(
             model_class="survival",
             parameters=np.zeros((2, 1), dtype=float),
-            parameter_names=("eta",),
+            parameter_names=("linear_predictor",),
             times=times,
             cumulative_hazard=cumulative[idx],
             survival=np.exp(-cumulative[idx]),
@@ -815,7 +815,7 @@ def test_survival_prediction_large_curves_auto_chunk_dense_output(tmp_path: path
     pred = gamfit.SurvivalPrediction(
         model_class="survival marginal-slope",
         parameters=np.zeros((1_001, 1), dtype=float),
-        parameter_names=("eta",),
+        parameter_names=("linear_predictor",),
     )
     grid = np.linspace(0.0, 1000.0, 1000, dtype=float)
 
