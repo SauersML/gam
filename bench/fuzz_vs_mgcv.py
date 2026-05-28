@@ -244,7 +244,9 @@ def _prediction_mean(predicted: typing.Any) -> np.ndarray:
         return predicted["mean"].to_numpy(dtype=float)
     if isinstance(predicted, dict):
         return np.asarray(predicted["mean"], dtype=float)
-    return np.asarray(predicted["mean"], dtype=float)
+    # Default ``model.predict`` now returns a 1-D ndarray of fitted means
+    # for standard GAMs; preserve that shape here.
+    return np.asarray(predicted, dtype=float)
 
 
 def _prediction_sigma(predicted: typing.Any) -> np.ndarray | None:

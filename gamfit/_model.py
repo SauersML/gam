@@ -50,7 +50,61 @@ class Model:
         id_column: str | None = None,
         with_uncertainty: bool = False,
     ) -> Any:
-        """Predict from ``data``."""
+        """Predict from new ``data``.
+
+        Parameters
+        ----------
+        data : table-like
+            Input rows in any format accepted by :func:`gamfit.fit`
+            (``pandas.DataFrame``, ``pyarrow.Table``, ``polars.DataFrame``,
+            ``dict`` of columns, ``list`` of record dicts, ...). Columns must
+            cover every predictor referenced by the fitted formula.
+        interval : float or None, default None
+            Pointwise credible-interval coverage. ``0.95`` returns 95% CIs.
+            When set, the output gains ``mean_lower``, ``mean_upper``,
+            ``effective_se``, and ``effective_variance`` columns. ``None``
+            returns only the point prediction(s).
+        return_type : {"dict", "pandas", "numpy", "polars", "pyarrow", "list"}, optional
+            Force a specific output container. ``None`` (default) mirrors the
+            shape of ``data`` (and the training table where unambiguous).
+        id_column : str or None, default None
+            Name of an identifier column in ``data`` to propagate as a row key
+            in the output (so predictions can be joined back to the input).
+        with_uncertainty : bool, default False
+            Request the full uncertainty decomposition (linear-predictor and
+            response-scale variances, plus interval columns). Implies
+            ``interval`` when no explicit level is given.
+
+        Returns
+        -------
+        ndarray | dict | DataFrame | SurvivalPrediction | CompetingRisksPrediction
+            The shape depends on the model class and on whether ``interval``,
+            ``id_column``, or ``return_type`` was set:
+
+            * Standard GAM, no interval / id_column / return_type: a 1-D
+              ``ndarray`` of point predictions on the response scale (the
+              fitted mean).
+            * Standard GAM with ``interval`` / ``id_column`` / ``return_type``:
+              a table (dict / DataFrame / ...) with columns ``eta``
+              (linear-predictor scale; equals ``mean`` for identity-link
+              models), ``mean`` (response scale; the point prediction),
+              ``effective_se`` (response-scale standard error including both
+              fixed-effect and smoothing uncertainty),
+              ``effective_variance`` = ``effective_se ** 2`` (kept so callers
+              can add variances additively without re-squaring), and
+              ``mean_lower`` / ``mean_upper`` (interval endpoints).
+            * Bernoulli marginal-slope: a 1-D ``ndarray`` of probabilities.
+            * Transformation-normal: a 1-D ``ndarray`` of z-scores.
+            * Survival models: :class:`SurvivalPrediction`.
+            * Competing-risks models: :class:`CompetingRisksPrediction`.
+
+        Notes
+        -----
+        For Gaussian / identity-link GLMs, ``eta`` and ``mean`` are numerically
+        identical (linear predictor == response scale). For non-identity links
+        (logit, log, ...) ``mean = link^{-1}(eta)`` and the two columns carry
+        distinct information. Issues #310 and #313.
+        """
         headers, rows, table_kind = normalize_table(data)
         row_ids = extract_row_ids(headers, rows, id_column)
         opts_json = rust_module().build_model_predict_payload_json(
@@ -77,14 +131,28 @@ class Model:
             restore=restore_output_table,
         )
 
-    def predict_array(self, X: Any, *, interval: float | None = None) -> Any:
-        """Predict directly from a numeric NumPy-compatible feature matrix."""
+    def predict_array(
+        self,
+        X: Any,
+        *,
+        interval: float | None = None,
+        with_uncertainty: bool = False,
+    ) -> Any:
+        """Predict directly from a numeric NumPy-compatible feature matrix.
+
+        Positional columns are matched, in order, to the model's training
+        feature columns (issue #341). When ``with_uncertainty=True`` the
+        returned array gains SE columns alongside ``eta``/``mean`` even
+        without an explicit ``interval`` (issue #342).
+        """
         try:
             rust = rust_module()
             return rust.predict_array(
                 self._model_bytes,
                 rust.numeric_matrix_f64(X, "X"),
-                json.dumps({"interval": interval}),
+                json.dumps(
+                    {"interval": interval, "with_uncertainty": with_uncertainty}
+                ),
             )
         except Exception as exc:
             raise map_exception(exc) from exc
@@ -382,6 +450,37 @@ class Model:
             f"training_table_kind={self._training_table_kind!r}",
         ]
         return f"Model({', '.join(parts)})"
+
+    def __str__(self) -> str:
+        # Human-readable multi-line summary for ``print(model)``. The terse
+        # developer one-liner stays on ``__repr__``. Mirrors what R's mgcv
+        # prints on a bare ``model``. (issue #308)
+        try:
+            summary = self.summary()
+            payload = summary.payload
+        except Exception:
+            # Summary materialisation can fail on partially-loaded artifacts;
+            # fall back to the developer repr rather than crashing print().
+            return repr(self)
+        lines = ["GAM fitted model"]
+        lines.append(f"  Formula: {payload.get('formula', self.formula)}")
+        family_name = str(payload.get("family_name", self.family_name))
+        lines.append(f"  Family:  {family_name}")
+        model_class = payload.get("model_class")
+        if model_class:
+            lines.append(f"  Class:   {model_class}")
+        n_obs = payload.get("n_observations") or payload.get("n") or payload.get("num_obs")
+        deviance = payload.get("deviance")
+        if deviance is not None:
+            tail = f"  (n={n_obs})" if n_obs is not None else ""
+            lines.append(f"  Deviance: {deviance:g}{tail}")
+        reml_score = payload.get("reml_score")
+        if reml_score is not None:
+            lines.append(f"  REML score: {reml_score:g}")
+        edf_total = payload.get("edf_total") or payload.get("effective_dof")
+        if edf_total is not None:
+            lines.append(f"  Effective dof: {edf_total:g}")
+        return "\n".join(lines)
 
     def _repr_html_(self) -> str:
         return self.report()

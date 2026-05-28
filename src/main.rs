@@ -92,9 +92,9 @@ use gam::survival_marginal_slope::SurvivalMarginalSlopeTermSpec;
 use gam::survival_predict::{
     apply_inverse_link_state_to_fit_result, build_saved_survival_marginal_slope_predictor,
     fit_result_from_saved_model_for_prediction, require_saved_survival_likelihood_mode,
-    resolve_survival_inverse_link_from_saved, resolve_termspec_for_prediction,
-    saved_baseline_timewiggle_components, saved_survival_location_scale_fit_result,
-    saved_survival_runtime_baseline_config,
+    resolve_saved_survival_time_columns, resolve_survival_inverse_link_from_saved,
+    resolve_termspec_for_prediction, saved_baseline_timewiggle_components,
+    saved_survival_location_scale_fit_result, saved_survival_runtime_baseline_config,
 };
 use gam::term_builder::{
     build_termspec, column_map_with_alias, enable_scale_dimensions, resolve_role_col,
@@ -3290,17 +3290,12 @@ fn run_predict_survival(
     progress.set_stage("predict", "building survival prediction design");
     // `survival_entry == None` means the training response was the
     // right-censored shorthand `Surv(time, event)`; entry times are
-    // synthesized as zero at prediction time too.
-    let entry_col: Option<usize> = model
-        .survival_entry
-        .as_deref()
-        .map(|name| resolve_role_col(col_map, name, "entry"))
-        .transpose()?;
-    let exitname = model
-        .survival_exit
-        .as_ref()
-        .ok_or_else(|| "survival model missing exit column metadata".to_string())?;
-    let exit_col = resolve_role_col(col_map, exitname, "exit")?;
+    // synthesized as zero at prediction time too. Resolution flows
+    // through the shared `resolve_saved_survival_time_columns` helper
+    // so the CLI predict, library predict, FFI predict, and CLI sample
+    // paths all agree on the same fallback contract.
+    let time_cols = resolve_saved_survival_time_columns(model, col_map)?;
+    let exit_col = time_cols.exit_col;
     let termspec = resolve_termspec_for_prediction(
         &model.resolved_termspec,
         training_headers,
@@ -3324,8 +3319,11 @@ fn run_predict_survival(
     let mut age_entry = Array1::<f64>::zeros(n);
     let mut age_exit = Array1::<f64>::zeros(n);
     for i in 0..n {
-        let entry_val = entry_col.map_or(0.0, |idx| data[[i, idx]]);
-        let (t0, t1) = normalize_survival_time_pair(entry_val, data[[i, exit_col]], i)?;
+        let (t0, t1) = normalize_survival_time_pair(
+            time_cols.row_entry_time(data, i),
+            data[[i, exit_col]],
+            i,
+        )?;
         age_entry[i] = t0;
         age_exit[i] = t1;
     }

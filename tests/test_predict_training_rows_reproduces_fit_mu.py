@@ -16,7 +16,7 @@ def test_predict_on_training_rows_matches_fit_time_mu() -> None:
     model = gamfit.fit(rows, "y ~ x")
     pred = model.predict(rows)
     fitted = np.asarray(model.summary()["fitted"], dtype=float)
-    mean = np.asarray(pred["mean"], dtype=float)
+    mean = np.asarray(pred, dtype=float)
     np.testing.assert_allclose(
         mean,
         fitted,
