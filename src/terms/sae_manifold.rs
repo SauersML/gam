@@ -2969,12 +2969,14 @@ fn sae_manifold_newton_directional_decrease(
     delta_ext_coord: ArrayView1<'_, f64>,
     delta_beta: ArrayView1<'_, f64>,
 ) -> f64 {
-    assert_eq!(delta_ext_coord.len(), sys.rows.len() * sys.d);
+    // delta_ext_coord has variable-stride layout for heterogeneous systems.
+    assert_eq!(delta_ext_coord.len(), sys.row_offsets[sys.rows.len()]);
     assert_eq!(delta_beta.len(), sys.k);
     let mut gradient_dot_step = 0.0;
     for (row_idx, row) in sys.rows.iter().enumerate() {
-        let row_base = row_idx * sys.d;
-        for axis in 0..sys.d {
+        let row_base = sys.row_offsets[row_idx];
+        let di = sys.row_dims[row_idx];
+        for axis in 0..di {
             gradient_dot_step += row.gt[axis] * delta_ext_coord[row_base + axis];
         }
     }
