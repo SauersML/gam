@@ -133,7 +133,6 @@ fn logslope_jacobian_fd_at_zero_beta() {
     let s = 0.5_f64;
 
     let g_zero = vec![0.0f64; N];
-    let c_one = vec![1.0f64; N];
     let scalars = Arc::new(SurvivalMarginalSlopeFamilyScalars::new(
         q0.clone(),
         q1.clone(),
