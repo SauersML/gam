@@ -1098,23 +1098,34 @@ extern "C" __global__ void chol_logdet_col_major(
             launch_symmetrize_lower(&ws.stream, &shared.ctx, p, &mut ws.xtwx_dev)?;
         }
 
-        // Upload S + objective_ridge·I.
+        // H_final = Qsᵀ (XtWX) Qs + S + objective_ridge·I.
+        let p_i = to_i32(p)?;
+        // tmp = XtWX · Qs → ws.qs_tmp_dev.
+        {
+            let cfg_aq = GemmConfig::<f64> {
+                transa: cublasOperation_t::CUBLAS_OP_N, transb: cublasOperation_t::CUBLAS_OP_N,
+                m: p_i, n: p_i, k: p_i, alpha: 1.0, lda: p_i, ldb: p_i, beta: 0.0, ldc: p_i,
+            };
+            // SAFETY: xtwx_dev and qs_dev p*p col-major; qs_tmp_dev p*p output.
+            unsafe { ws.blas.gemm(cfg_aq, &ws.xtwx_dev, &ws.qs_dev, &mut ws.qs_tmp_dev) }
+                .map_err(|e| format!("dgemm A·Qs (final H rebuild): {e}"))?;
+        }
+        // H_xtx = Qsᵀ · tmp → ws.h_dev.
+        {
+            let cfg_qt = GemmConfig::<f64> {
+                transa: cublasOperation_t::CUBLAS_OP_T, transb: cublasOperation_t::CUBLAS_OP_N,
+                m: p_i, n: p_i, k: p_i, alpha: 1.0, lda: p_i, ldb: p_i, beta: 0.0, ldc: p_i,
+            };
+            // SAFETY: qs_dev p*p (transposed); qs_tmp_dev p*p; h_dev p*p output.
+            unsafe { ws.blas.gemm(cfg_qt, &ws.qs_dev, &ws.qs_tmp_dev, &mut ws.h_dev) }
+                .map_err(|e| format!("dgemm Qsᵀ·A·Qs (final H rebuild): {e}"))?;
+        }
         let penalty = penalty_with_ridge(penalty_hessian, objective_ridge);
-        let penalty_view = penalty.view();
-        let penalty_col = to_col_major(&penalty_view);
+        let penalty_col = to_col_major(&penalty.view());
         ws.stream
             .memcpy_htod(penalty_col.as_ref(), &mut ws.penalty_dev)
             .map_err(|e| format!("upload penalty (final H rebuild): {e}"))?;
-
-        // H_final = XtWX + (S + objective_ridge·I) -> ws.h_dev.
-        geam_add(
-            &ws.blas,
-            &ws.stream,
-            p,
-            &ws.xtwx_dev,
-            &ws.penalty_dev,
-            &mut ws.h_dev,
-        )?;
+        geam_add(&ws.blas, &ws.stream, p, &ws.h_dev, &ws.penalty_dev, &mut ws.h_dev)?;
 
         // One download — the only H transfer in the entire PIRLS loop.
         let h_col = ws

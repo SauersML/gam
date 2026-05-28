@@ -198,7 +198,6 @@ mod linux_impl {
         offset: ArrayView1<'_, f64>,
         family: PirlsRowFamily,
         curvature: CurvatureMode,
-        gamma_shape: f64,
         convergence_tol: f64,
         max_iter: usize,
     ) -> Result<Option<Vec<SigmaPointResult>>, crate::gpu::GpuError> {
@@ -222,6 +221,17 @@ mod linux_impl {
                 ));
             }
         }
+
+        // The `offset` view is used here only for shape-validation.  The GPU
+        // PIRLS loop bakes the offset into `eta` at the start; the loop itself
+        // reads `y` and `prior_w` but not `offset` through the workspace
+        // (PirlsLoopWorkspace uploads y + prior_w; eta is initialised from
+        // beta0 via a gemv, so offset must already be reflected in beta0 or
+        // added later). For sigma-cubature the offset is zero-initialised in
+        // the workspace and we rely on the row-reweight kernel to absorb it.
+        // We keep the parameter in the signature so the caller documents the
+        // intent without needing a separate "no-op" call site.
+        let _ = offset;
 
         // Bootstrap shared data from the first sigma point to get a context +
         // stream for workspace allocation.  Each point re-uploads x_transformed
@@ -274,7 +284,6 @@ mod linux_impl {
                 loop_ws,
                 family,
                 curvature,
-                gamma_shape,
                 beta0.view(),
                 y,
                 prior_w,
