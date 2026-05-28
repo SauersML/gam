@@ -208,6 +208,75 @@ impl<'a> PsdWeightsView<'a> {
     }
 }
 
+/// Owned, shareable counterpart to [`SignedWeightsView`].
+///
+/// A handful of long-lived hyper-derivative operator structs in
+/// `solver/reml/{hyper,unified}.rs` (`TauTauPairHyperOperator`,
+/// `ImplicitHyperOperator`, `SparseDirectionalHyperOperator`) cache the
+/// observed-Hessian working weight diagonal as `Arc<Array1<f64>>` and consume
+/// it via several distinct signed kernels inside their `mul_vec` bodies
+/// (`Wᵀ X v`, `Wᵀ X_τ v`, `Xᵀ diag(c ⊙ X_τ β̂) X v`, ...). Encoding the
+/// sign character at the struct boundary closes the residual implicit-sign
+/// gap that the function-boundary [`SignedWeightsView`] / [`PsdWeightsView`]
+/// could not reach: those views are constructed at the kernel call site, so
+/// the cached struct field is the only place the sign character could
+/// otherwise leak as untyped `Arc<Array1<f64>>`.
+///
+/// The newtype derefs to `Array1<f64>` so existing arithmetic like
+/// `&*self.w_diag * &x_v` is unchanged. `view_signed()` produces the
+/// borrowed function-boundary view when a kernel is called.
+#[derive(Clone)]
+#[repr(transparent)]
+pub struct SignedWeightsArc(Arc<Array1<f64>>);
+
+impl SignedWeightsArc {
+    /// Wrap an existing `Arc<Array1<f64>>` as a sign-honest owned weight
+    /// buffer. Cheap (Arc clone is a refcount bump); no allocation, no scan.
+    #[inline]
+    pub fn from_arc(arc: Arc<Array1<f64>>) -> Self {
+        Self(arc)
+    }
+
+    /// Take ownership of an `Array1<f64>` and wrap it in an Arc.
+    #[inline]
+    pub fn from_array(array: Array1<f64>) -> Self {
+        Self(Arc::new(array))
+    }
+
+    /// Borrow as a function-boundary [`SignedWeightsView`] for crossing into
+    /// a signed kernel (`weighted_crossprod_dense_rows`, `xt_diag_x_signed_op`,
+    /// `BlockDesignOperator::cross_block`).
+    #[inline]
+    pub fn view_signed(&self) -> SignedWeightsView<'_> {
+        SignedWeightsView::from_array(self.0.as_ref())
+    }
+
+    /// Inner `Arc<Array1<f64>>` for sites that genuinely need the shared
+    /// pointer (e.g. cloning into a sibling operator that holds its own
+    /// `SignedWeightsArc`). Prefer `Clone` on the newtype itself when the
+    /// destination accepts a `SignedWeightsArc`.
+    #[inline]
+    pub fn as_arc(&self) -> &Arc<Array1<f64>> {
+        &self.0
+    }
+}
+
+impl Deref for SignedWeightsArc {
+    type Target = Array1<f64>;
+
+    #[inline]
+    fn deref(&self) -> &Array1<f64> {
+        self.0.as_ref()
+    }
+}
+
+impl AsRef<Array1<f64>> for SignedWeightsArc {
+    #[inline]
+    fn as_ref(&self) -> &Array1<f64> {
+        self.0.as_ref()
+    }
+}
+
 /// Typed error for `src/linalg/matrix.rs` operations.  All error sites in this
 /// module construct a `MatrixError` variant; trait method bodies that still
 /// return `Result<_, String>` convert via `From<MatrixError> for String` (which
