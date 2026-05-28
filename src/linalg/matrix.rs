@@ -6066,7 +6066,7 @@ impl LinearOperator for DesignMatrix {
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
         if weights.len() != self.nrows() {
             return Err(format!(
-                "compute_xtwx dimension mismatch: weights length {} != nrows {}",
+                "xt_diag_x dimension mismatch: weights length {} != nrows {}",
                 weights.len(),
                 self.nrows()
             ));
@@ -6125,7 +6125,7 @@ impl LinearOperator for DesignMatrix {
                 }
                 let csr = xs
                     .to_csr_arc()
-                    .ok_or_else(|| "failed to obtain CSR view in compute_xtwx".to_string())?;
+                    .ok_or_else(|| "failed to obtain CSR view in xt_diag_x".to_string())?;
                 let sym = csr.symbolic();
                 Ok(sparse_csr_weighted_xtwx(
                     sym.row_ptr(),
@@ -6352,7 +6352,7 @@ impl LinearOperator for DenseRightProductView<'_> {
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
         if weights.len() != self.nrows() {
             return Err(format!(
-                "compute_xtwx dimension mismatch: weights length {} != nrows {}",
+                "xt_diag_x dimension mismatch: weights length {} != nrows {}",
                 weights.len(),
                 self.nrows()
             ));
@@ -6431,7 +6431,7 @@ impl LinearOperator for EmbeddedColumnBlock<'_> {
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
         if weights.len() != self.nrows() {
             return Err(format!(
-                "compute_xtwx dimension mismatch: weights length {} != nrows {}",
+                "xt_diag_x dimension mismatch: weights length {} != nrows {}",
                 weights.len(),
                 self.nrows()
             ));
