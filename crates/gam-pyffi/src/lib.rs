@@ -265,11 +265,13 @@ struct PyExtensionPrior {
 struct PyPredictOptions {
     /// Single uncertainty knob (issue #342): `Some(level)` requests the
     /// full-uncertainty predictor with that pointwise coverage level
-    /// (yields `effective_se`, `effective_variance`, and CI bounds on the
-    /// standard path; per-cell `survival_se` / `eta_se` on the survival
-    /// path). `None` requests point predictions only. There is no
-    /// separate `with_uncertainty` flag — coverage and the request to
-    /// quantify uncertainty are the same decision.
+    /// (yields `std_error` and CI bounds on the standard path; per-cell
+    /// `survival_se` / `eta_se` on the survival path). `None` requests
+    /// point predictions only. There is no separate `with_uncertainty`
+    /// flag — coverage and the request to quantify uncertainty are the
+    /// same decision. (Issue #310 renamed the SE column from
+    /// `effective_se` and dropped the redundant `effective_variance` ==
+    /// `std_error ** 2` column.)
     interval: Option<f64>,
     time_grid: Option<Vec<f64>>,
 }
