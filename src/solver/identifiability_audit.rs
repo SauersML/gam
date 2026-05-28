@@ -1599,11 +1599,9 @@ fn block_pivoted_qr_diagonal(block: &Array2<f64>) -> Result<Vec<f64>, Estimation
     if block.ncols() == 0 {
         return Ok(Vec::new());
     }
-    let (_q, r) = block.qr().map_err(|e| {
-        EstimationError::EigendecompositionFailed(crate::linalg::faer_ndarray::FaerLinalgError {
-            message: format!("identifiability audit per-block QR failed: {e:?}"),
-        })
-    })?;
+    let (_q, r) = block
+        .qr()
+        .map_err(EstimationError::EigendecompositionFailed)?;
     let diag_len = r.nrows().min(r.ncols());
     let mut out: Vec<f64> = (0..diag_len).map(|i| r[[i, i]].abs()).collect();
     out.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
