@@ -39,12 +39,13 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | bash
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Install gamfit
+      - name: Build gamfit from source (maturin develop)
         run: |
           set -euxo pipefail
-          python -m pip install --upgrade pip
-          python -m pip install gamfit numpy pandas scipy scikit-learn pyarrow requests
-          python -c "import gamfit; print(gamfit.__version__)"
+          python -m pip install --upgrade pip maturin
+          python -m pip install numpy pandas scipy scikit-learn pyarrow requests
+          maturin develop
+          python -c "import gamfit; print('gamfit ok')"
 
       - name: Run Claude bug-hunt agent
         uses: anthropics/claude-code-action@v1
