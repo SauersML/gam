@@ -110,13 +110,9 @@ fn cpu_cholesky_solve(h: &Array2<f64>, rhs: &Array2<f64>) -> (Array2<f64>, f64) 
     (y, 2.0 * logdet)
 }
 
-fn cuda_available() -> bool {
-    gam::gpu::runtime::GpuRuntime::global().is_some()
-}
-
 #[test]
 fn pirls_gpu_matches_cpu_across_stability_grid() {
-    if !cuda_available() {
+    if let GpuGate::Skip = gpu_gate("pirls_gpu_matches_cpu_across_stability_grid") {
         return;
     }
     configure_device(Device::Cuda);
