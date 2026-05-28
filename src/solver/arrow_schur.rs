@@ -142,6 +142,367 @@ pub type GpuSchurMatvec = Arc<dyn Fn(&Array1<f64>, &mut Array1<f64>) + Send + Sy
 
 type MetricWeights = [f64];
 
+// ---------------------------------------------------------------------------
+// BetaPenaltyOp — matrix-free penalty-side H_ββ abstraction (#296)
+// ---------------------------------------------------------------------------
+
+/// Identifies one contiguous column block in the shared β vector for
+/// block-Jacobi Schur pre-conditioning (#287).
+///
+/// A `BetaBlockId(i)` refers to the `i`-th range in
+/// [`ArrowSchurSystem::block_offsets`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BetaBlockId(pub usize);
+
+/// Matrix-free operator for the penalty side of `H_ββ`.
+///
+/// Callers must satisfy the additive convention: every method **adds** its
+/// contribution to the output buffer (i.e. `y += P x`, not `y = P x`).
+/// This matches the assembly pattern where multiple penalty terms are
+/// accumulated into the same gradient / Hessian buffers.
+pub trait BetaPenaltyOp: Send + Sync {
+    /// Full dimension `K` of the β vector.
+    fn dim(&self) -> usize;
+    /// `y += P x` — penalty Hessian-vector product (length `K`).
+    fn matvec(&self, x: &[f64], y: &mut [f64]);
+    /// Penalty gradient: `out += P β`.
+    fn gradient(&self, beta: &[f64], out: &mut [f64]);
+    /// `diag += diag(P)` — diagonal entries used by Jacobi preconditioner.
+    fn diagonal(&self, diag: &mut [f64]);
+    /// Add the `b×b` dense penalty sub-block for block `id` into `out`
+    /// (row-major, block size `b = offsets[id.0].len()`).
+    /// Used by the block-Jacobi Schur preconditioner (#287).
+    fn block(&self, id: BetaBlockId, offsets: &[Range<usize>], out: &mut Array2<f64>);
+    /// Materialize the full `K×K` dense penalty matrix (needed by
+    /// Direct / SqrtBA modes that form the Schur complement explicitly).
+    fn to_dense(&self) -> Array2<f64>;
+}
+
+/// Dense fallback: wraps the existing `K×K` `H_ββ` accumulator.
+pub struct DensePenaltyOp(pub Array2<f64>);
+
+impl BetaPenaltyOp for DensePenaltyOp {
+    fn dim(&self) -> usize {
+        self.0.nrows()
+    }
+
+    fn matvec(&self, x: &[f64], y: &mut [f64]) {
+        let k = self.0.nrows();
+        for a in 0..k {
+            let mut acc = 0.0_f64;
+            for b in 0..k {
+                acc += self.0[[a, b]] * x[b];
+            }
+            y[a] += acc;
+        }
+    }
+
+    fn gradient(&self, beta: &[f64], out: &mut [f64]) {
+        let k = self.0.nrows();
+        for a in 0..k {
+            let mut acc = 0.0_f64;
+            for b in 0..k {
+                acc += self.0[[a, b]] * beta[b];
+            }
+            out[a] += acc;
+        }
+    }
+
+    fn diagonal(&self, diag: &mut [f64]) {
+        let k = self.0.nrows().min(diag.len());
+        for j in 0..k {
+            diag[j] += self.0[[j, j]];
+        }
+    }
+
+    fn block(&self, id: BetaBlockId, offsets: &[Range<usize>], out: &mut Array2<f64>) {
+        let range = &offsets[id.0];
+        let b = range.end - range.start;
+        for bi in 0..b {
+            for bj in 0..b {
+                out[[bi, bj]] += self.0[[range.start + bi, range.start + bj]];
+            }
+        }
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        self.0.clone()
+    }
+}
+
+/// Block-local penalty operator: applies per-block penalty matrices
+/// (matching `ParameterBlockSpec` boundaries) without materialising a
+/// full `K×K` dense matrix.
+///
+/// Each entry is `(global_offset, local_matrix)` where `global_offset`
+/// is the start of that block in the full β vector.
+pub struct BlockPenaltyOp {
+    /// Full β dimension `K`.
+    pub k: usize,
+    /// `(global_start, local_matrix)` for each atom/block.
+    pub blocks: Vec<(usize, Array2<f64>)>,
+}
+
+impl BetaPenaltyOp for BlockPenaltyOp {
+    fn dim(&self) -> usize {
+        self.k
+    }
+
+    fn matvec(&self, x: &[f64], y: &mut [f64]) {
+        for (off, local) in &self.blocks {
+            let b = local.nrows();
+            for i in 0..b {
+                let gi = off + i;
+                let mut acc = 0.0_f64;
+                for j in 0..b {
+                    acc += local[[i, j]] * x[off + j];
+                }
+                y[gi] += acc;
+            }
+        }
+    }
+
+    fn gradient(&self, beta: &[f64], out: &mut [f64]) {
+        for (off, local) in &self.blocks {
+            let b = local.nrows();
+            for i in 0..b {
+                let gi = off + i;
+                let mut acc = 0.0_f64;
+                for j in 0..b {
+                    acc += local[[i, j]] * beta[off + j];
+                }
+                out[gi] += acc;
+            }
+        }
+    }
+
+    fn diagonal(&self, diag: &mut [f64]) {
+        for (off, local) in &self.blocks {
+            let b = local.nrows();
+            for j in 0..b {
+                diag[off + j] += local[[j, j]];
+            }
+        }
+    }
+
+    fn block(&self, id: BetaBlockId, offsets: &[Range<usize>], out: &mut Array2<f64>) {
+        let range = &offsets[id.0];
+        let b_out = range.end - range.start;
+        for (off, local) in &self.blocks {
+            let b = local.nrows();
+            let block_end = off + b;
+            if block_end <= range.start || *off >= range.end {
+                continue;
+            }
+            for bi in 0..b_out {
+                let gi = range.start + bi;
+                if gi < *off || gi >= block_end {
+                    continue;
+                }
+                let li = gi - off;
+                for bj in 0..b_out {
+                    let gj = range.start + bj;
+                    if gj < *off || gj >= block_end {
+                        continue;
+                    }
+                    let lj = gj - off;
+                    out[[bi, bj]] += local[[li, lj]];
+                }
+            }
+        }
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((self.k, self.k));
+        for (off, local) in &self.blocks {
+            let b = local.nrows();
+            for i in 0..b {
+                for j in 0..b {
+                    out[[off + i, off + j]] += local[[i, j]];
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Kronecker-product penalty: `P = A ⊗ B` applied without materialising
+/// the full `(p_a·p_b)×(p_a·p_b)` matrix.
+pub struct KroneckerPenaltyOp {
+    /// Left factor `A`, shape `(p_a, p_a)`.
+    pub factor_a: Array2<f64>,
+    /// Right factor `B`, shape `(p_b, p_b)`.
+    pub factor_b: Array2<f64>,
+    /// Global offset into the β vector where this block starts.
+    pub global_offset: usize,
+    /// Full β dimension `K`.
+    pub k: usize,
+}
+
+impl BetaPenaltyOp for KroneckerPenaltyOp {
+    fn dim(&self) -> usize {
+        self.k
+    }
+
+    fn matvec(&self, x: &[f64], y: &mut [f64]) {
+        let p_a = self.factor_a.nrows();
+        let p_b = self.factor_b.nrows();
+        let off = self.global_offset;
+        // (A ⊗ B) vec(V) where V is (p_b, p_a) with Fortran/vec ordering.
+        for i_a in 0..p_a {
+            for i_b in 0..p_b {
+                let gi = off + i_a * p_b + i_b;
+                let mut acc = 0.0_f64;
+                for j_a in 0..p_a {
+                    let a_ij = self.factor_a[[i_a, j_a]];
+                    if a_ij == 0.0 {
+                        continue;
+                    }
+                    for j_b in 0..p_b {
+                        acc += a_ij * self.factor_b[[i_b, j_b]] * x[off + j_a * p_b + j_b];
+                    }
+                }
+                y[gi] += acc;
+            }
+        }
+    }
+
+    fn gradient(&self, beta: &[f64], out: &mut [f64]) {
+        let p_a = self.factor_a.nrows();
+        let p_b = self.factor_b.nrows();
+        let off = self.global_offset;
+        for i_a in 0..p_a {
+            for i_b in 0..p_b {
+                let gi = off + i_a * p_b + i_b;
+                let mut acc = 0.0_f64;
+                for j_a in 0..p_a {
+                    let a_ij = self.factor_a[[i_a, j_a]];
+                    if a_ij == 0.0 {
+                        continue;
+                    }
+                    for j_b in 0..p_b {
+                        acc += a_ij * self.factor_b[[i_b, j_b]] * beta[off + j_a * p_b + j_b];
+                    }
+                }
+                out[gi] += acc;
+            }
+        }
+    }
+
+    fn diagonal(&self, diag: &mut [f64]) {
+        let p_a = self.factor_a.nrows();
+        let p_b = self.factor_b.nrows();
+        let off = self.global_offset;
+        for i_a in 0..p_a {
+            for i_b in 0..p_b {
+                diag[off + i_a * p_b + i_b] +=
+                    self.factor_a[[i_a, i_a]] * self.factor_b[[i_b, i_b]];
+            }
+        }
+    }
+
+    fn block(&self, id: BetaBlockId, offsets: &[Range<usize>], out: &mut Array2<f64>) {
+        let range = &offsets[id.0];
+        let b = range.end - range.start;
+        let p_a = self.factor_a.nrows();
+        let p_b = self.factor_b.nrows();
+        let off = self.global_offset;
+        let block_end = off + p_a * p_b;
+        if block_end <= range.start || off >= range.end {
+            return;
+        }
+        for bi in 0..b {
+            let gi = range.start + bi;
+            if gi < off || gi >= block_end {
+                continue;
+            }
+            let li = gi - off;
+            let i_a = li / p_b;
+            let i_b = li % p_b;
+            for bj in 0..b {
+                let gj = range.start + bj;
+                if gj < off || gj >= block_end {
+                    continue;
+                }
+                let lj = gj - off;
+                let j_a = lj / p_b;
+                let j_b = lj % p_b;
+                out[[bi, bj]] += self.factor_a[[i_a, j_a]] * self.factor_b[[i_b, j_b]];
+            }
+        }
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        let p_a = self.factor_a.nrows();
+        let p_b = self.factor_b.nrows();
+        let off = self.global_offset;
+        let mut out = Array2::<f64>::zeros((self.k, self.k));
+        for i_a in 0..p_a {
+            for i_b in 0..p_b {
+                let gi = off + i_a * p_b + i_b;
+                for j_a in 0..p_a {
+                    let a_ij = self.factor_a[[i_a, j_a]];
+                    if a_ij == 0.0 {
+                        continue;
+                    }
+                    for j_b in 0..p_b {
+                        let gj = off + j_a * p_b + j_b;
+                        out[[gi, gj]] += a_ij * self.factor_b[[i_b, j_b]];
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Composite penalty: sum of multiple `BetaPenaltyOp` operators.
+pub struct CompositePenaltyOp {
+    /// Full β dimension `K`.
+    pub k: usize,
+    /// Component operators, each contributing additively.
+    pub ops: Vec<Arc<dyn BetaPenaltyOp>>,
+}
+
+impl BetaPenaltyOp for CompositePenaltyOp {
+    fn dim(&self) -> usize {
+        self.k
+    }
+
+    fn matvec(&self, x: &[f64], y: &mut [f64]) {
+        for op in &self.ops {
+            op.matvec(x, y);
+        }
+    }
+
+    fn gradient(&self, beta: &[f64], out: &mut [f64]) {
+        for op in &self.ops {
+            op.gradient(beta, out);
+        }
+    }
+
+    fn diagonal(&self, diag: &mut [f64]) {
+        for op in &self.ops {
+            op.diagonal(diag);
+        }
+    }
+
+    fn block(&self, id: BetaBlockId, offsets: &[Range<usize>], out: &mut Array2<f64>) {
+        for op in &self.ops {
+            op.block(id, offsets, out);
+        }
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((self.k, self.k));
+        for op in &self.ops {
+            let dense = op.to_dense();
+            out += &dense;
+        }
+        out
+    }
+}
+
 /// BA Schur solve variant for the reduced shared `β` system.
 ///
 /// * [`ArrowSolverMode::Direct`] is BA's dense reduced-camera-system solve:

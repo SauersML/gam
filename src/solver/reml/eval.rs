@@ -273,6 +273,7 @@ fn sigma_cubature_evaluate_gpu_stream_pool(
         state.weights,
         state.offset.view(),
         admission,
+        likelihood_spec.gamma_shape().unwrap_or(1.0),
         state.config.pirls_convergence_tolerance,
         state.config.max_iterations,
     )
