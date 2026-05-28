@@ -275,9 +275,7 @@ mod linux_impl {
 
             let (ws, loop_ws) = &mut workspace_pairs[stream_idx];
 
-            // Sigma-cubature PIRLS has no prior-mean shift: linear_shift = 0,
-            // constant_shift = 0. The model ridge is baked into s_transformed.
-            let zero_shift = ndarray::Array1::<f64>::zeros(p);
+            // Use per-point linear_shift and constant_shift from SigmaPointGpuInput (#260).
             let outcome = pirls_gpu::pirls_loop_on_stream(
                 &shared,
                 ws,
@@ -287,8 +285,8 @@ mod linux_impl {
                 gamma_shape,
                 beta0.view(),
                 pt.s_transformed.view(),
-                zero_shift.view(),
-                0.0,
+                pt.linear_shift.view(),
+                pt.constant_shift,
                 1e-6,
                 0.0,
                 max_iter,

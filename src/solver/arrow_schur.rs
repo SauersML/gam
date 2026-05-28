@@ -503,6 +503,86 @@ impl BetaPenaltyOp for CompositePenaltyOp {
     }
 }
 
+/// Adapts a closure-based matrix-free `H_ββ` operator (from
+/// [`ArrowSchurSystem::set_shared_beta_operator`]) to the `BetaPenaltyOp` trait.
+///
+/// `diagonal` holds the precomputed `diag(H_ββ)` supplied alongside the matvec;
+/// `to_dense` falls back to probing all `K` canonical basis vectors.
+pub struct MatvecDiagPenaltyOp {
+    k: usize,
+    matvec: SharedBetaMatvec,
+    diagonal_vec: Array1<f64>,
+}
+
+impl MatvecDiagPenaltyOp {
+    pub fn new(k: usize, matvec: SharedBetaMatvec, diagonal_vec: Array1<f64>) -> Self {
+        assert_eq!(diagonal_vec.len(), k);
+        Self { k, matvec, diagonal_vec }
+    }
+}
+
+impl BetaPenaltyOp for MatvecDiagPenaltyOp {
+    fn dim(&self) -> usize {
+        self.k
+    }
+
+    fn matvec(&self, x: &[f64], y: &mut [f64]) {
+        let x_arr = Array1::from_iter(x.iter().copied());
+        let mut out = Array1::<f64>::zeros(self.k);
+        (self.matvec)(x_arr.view(), &mut out);
+        for a in 0..self.k {
+            y[a] += out[a];
+        }
+    }
+
+    fn gradient(&self, beta: &[f64], out: &mut [f64]) {
+        let beta_arr = Array1::from_iter(beta.iter().copied());
+        let mut hb = Array1::<f64>::zeros(self.k);
+        (self.matvec)(beta_arr.view(), &mut hb);
+        for a in 0..self.k {
+            out[a] += hb[a];
+        }
+    }
+
+    fn diagonal(&self, diag: &mut [f64]) {
+        for j in 0..self.k.min(diag.len()) {
+            diag[j] += self.diagonal_vec[j];
+        }
+    }
+
+    fn block(&self, id: BetaBlockId, offsets: &[Range<usize>], out: &mut Array2<f64>) {
+        // Probe each basis vector in the block range to extract the sub-block.
+        let range = &offsets[id.0];
+        let b = range.end - range.start;
+        let mut probe = Array1::<f64>::zeros(self.k);
+        for bj in 0..b {
+            probe.fill(0.0);
+            probe[range.start + bj] = 1.0;
+            let mut col = Array1::<f64>::zeros(self.k);
+            (self.matvec)(probe.view(), &mut col);
+            for bi in 0..b {
+                out[[bi, bj]] += col[range.start + bi];
+            }
+        }
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        let k = self.k;
+        let mut out = Array2::<f64>::zeros((k, k));
+        let mut probe = Array1::<f64>::zeros(k);
+        for j in 0..k {
+            probe.fill(0.0);
+            probe[j] = 1.0;
+            let mut col = Array1::<f64>::zeros(k);
+            (self.matvec)(probe.view(), &mut col);
+            for i in 0..k {
+                out[[i, j]] = col[i];
+            }
+        }
+        out
+    }
+}
+
 /// BA Schur solve variant for the reduced shared `β` system.
 ///
 /// * [`ArrowSolverMode::Direct`] is BA's dense reduced-camera-system solve:
@@ -1378,10 +1458,17 @@ impl ArrowSchurSystem {
         let rows = (0..n).map(|_| ArrowRowBlock::new(d, k)).collect();
         let row_dims: Arc<[usize]> = (0..n).map(|_| d).collect::<Vec<_>>().into();
         let row_offsets: Arc<[usize]> = (0..=n).map(|i| i * d).collect::<Vec<_>>().into();
+        let matvec_arc: SharedBetaMatvec = Arc::new(matvec);
+        // Mirror the closure into a BetaPenaltyOp so all hot paths (#296)
+        // route through the trait while preserving hbb_matvec + hbb_diag for
+        // code that inspects them directly.
+        let penalty_op: Option<Arc<dyn BetaPenaltyOp>> = Some(Arc::new(
+            MatvecDiagPenaltyOp::new(k, Arc::clone(&matvec_arc), diag.clone()),
+        ));
         let mut sys = Self {
             rows,
             hbb: Array2::<f64>::zeros((0, 0)),
-            hbb_matvec: Some(Arc::new(matvec)),
+            hbb_matvec: Some(matvec_arc),
             htbeta_matvec: None,
             hbb_diag: Some(diag),
             gb: Array1::<f64>::zeros(k),
@@ -1393,7 +1480,7 @@ impl ArrowSchurSystem {
             row_hessian_fingerprint: 0,
             analytic_row_hessian_fingerprint: 0,
             block_offsets: Arc::from([] as [Range<usize>; 0]),
-            penalty_op: None,
+            penalty_op,
         };
         sys.refresh_row_hessian_fingerprint();
         sys
@@ -1479,7 +1566,16 @@ impl ArrowSchurSystem {
         F: for<'a> Fn(ArrayView1<'a, f64>, &mut Array1<f64>) + Send + Sync + 'static,
     {
         assert_eq!(diag.len(), self.k);
-        self.hbb_matvec = Some(Arc::new(matvec));
+        let matvec_arc: SharedBetaMatvec = Arc::new(matvec);
+        // Mirror the closure into a BetaPenaltyOp so all hot paths (#296)
+        // route through the trait, preserving the existing hbb_matvec +
+        // hbb_diag fields for code that inspects them directly.
+        self.penalty_op = Some(Arc::new(MatvecDiagPenaltyOp::new(
+            self.k,
+            Arc::clone(&matvec_arc),
+            diag.clone(),
+        )));
+        self.hbb_matvec = Some(matvec_arc);
         self.hbb_diag = Some(diag);
         self.refresh_row_hessian_fingerprint();
     }

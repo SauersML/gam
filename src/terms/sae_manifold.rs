@@ -2055,68 +2055,144 @@ impl SaeManifoldTerm {
                 error[out_col] = fitted[out_col] - target[[row, out_col]];
             }
 
-            local_jac.fill(0.0);
-            fill_assignment_logit_jvp_rows(
-                self.assignment.mode,
-                self.assignment.logits.row(row),
-                assignments.view(),
-                decoded.view(),
-                fitted.view(),
-                ibp_prior_slice,
-                &mut local_jac,
-            );
-            // Coordinate columns.
-            for atom_idx in 0..k_atoms {
-                let d = self.atoms[atom_idx].latent_dim;
-                let off = coord_offsets[atom_idx];
-                let a_k = assignments[atom_idx];
-                for axis in 0..d {
-                    self.atoms[atom_idx].fill_decoded_derivative_row(row, axis, &mut dg_buf);
+            // Determine whether this row uses the compact active-set layout.
+            // JumpReLU: only active atoms (logit > threshold) enter the block.
+            // All other modes: dense q layout.
+            let (q_row, local_jac_row) = if let Some(ref layout) = jumprelu_layout {
+                let active = &layout.active_atoms[row];
+                let starts = &layout.coord_starts[row];
+                let q_active = layout.row_q_active(row);
+                let mut jac_compact = Array2::<f64>::zeros((q_active, p));
+                // Logit JVP rows for active atoms only.
+                // JumpReLU STE: da_k/dl_k = sigmoid'(l_k/τ) for active, 0 for inactive.
+                let (temperature, threshold) = match self.assignment.mode {
+                    AssignmentMode::JumpReLU { temperature, threshold } => (temperature, threshold),
+                    _ => unreachable!("jumprelu_layout only set for JumpReLU mode"),
+                };
+                let inv_tau = 1.0 / temperature;
+                let logits_row = self.assignment.logits.row(row);
+                for (j, &k) in active.iter().enumerate() {
+                    if logits_row[k] <= threshold {
+                        continue; // should not happen since active means logit > threshold
+                    }
+                    let activation = crate::linalg::utils::stable_logistic(logits_row[k] * inv_tau);
+                    let da = activation * (1.0 - activation) * inv_tau;
                     for out_col in 0..p {
-                        local_jac[[off + axis, out_col]] = a_k * dg_buf[out_col];
+                        jac_compact[[j, out_col]] = da * decoded[[k, out_col]];
                     }
                 }
-            }
+                // Coordinate JVP rows for active atoms only.
+                for (j, &k) in active.iter().enumerate() {
+                    let d = self.atoms[k].latent_dim;
+                    let a_k = assignments[k];
+                    let coord_start = starts[j];
+                    for axis in 0..d {
+                        self.atoms[k].fill_decoded_derivative_row(row, axis, &mut dg_buf);
+                        for out_col in 0..p {
+                            jac_compact[[coord_start + axis, out_col]] = a_k * dg_buf[out_col];
+                        }
+                    }
+                }
+                (q_active, jac_compact)
+            } else {
+                local_jac.fill(0.0);
+                fill_assignment_logit_jvp_rows(
+                    self.assignment.mode,
+                    self.assignment.logits.row(row),
+                    assignments.view(),
+                    decoded.view(),
+                    fitted.view(),
+                    ibp_prior_slice,
+                    &mut local_jac,
+                );
+                // Coordinate columns for all atoms.
+                for atom_idx in 0..k_atoms {
+                    let d = self.atoms[atom_idx].latent_dim;
+                    let off = coord_offsets[atom_idx];
+                    let a_k = assignments[atom_idx];
+                    for axis in 0..d {
+                        self.atoms[atom_idx].fill_decoded_derivative_row(row, axis, &mut dg_buf);
+                        for out_col in 0..p {
+                            local_jac[[off + axis, out_col]] = a_k * dg_buf[out_col];
+                        }
+                    }
+                }
+                (q, local_jac.clone())
+            };
 
-            let mut block = ArrowRowBlock::new(q, beta_dim);
-            for a in 0..q {
+            // Build the per-row Arrow-Schur block at the row's active dim.
+            let mut block = ArrowRowBlock::new(q_row, beta_dim);
+            for a in 0..q_row {
                 let mut g = 0.0;
                 for out_col in 0..p {
-                    g += local_jac[[a, out_col]] * error[out_col];
+                    g += local_jac_row[[a, out_col]] * error[out_col];
                 }
                 block.gt[a] += g;
-                for b in 0..q {
+                for b in 0..q_row {
                     let mut h = 0.0;
                     for out_col in 0..p {
-                        h += local_jac[[a, out_col]] * local_jac[[b, out_col]];
+                        h += local_jac_row[[a, out_col]] * local_jac_row[[b, out_col]];
                     }
                     block.htt[[a, b]] += h;
                 }
             }
 
             // Assignment prior in logit space.
+            // For compact layout: position `j` = active_atoms index.
+            // For dense layout: position `atom_idx` directly.
             let assignment_base = row * k_atoms;
-            for atom_idx in 0..k_atoms {
-                block.gt[atom_idx] += assignment_grad[assignment_base + atom_idx];
-                block.htt[[atom_idx, atom_idx]] += assignment_hdiag[assignment_base + atom_idx];
+            if let Some(ref layout) = jumprelu_layout {
+                let active = &layout.active_atoms[row];
+                for (j, &k) in active.iter().enumerate() {
+                    block.gt[j] += assignment_grad[assignment_base + k];
+                    block.htt[[j, j]] += assignment_hdiag[assignment_base + k];
+                }
+            } else {
+                for atom_idx in 0..k_atoms {
+                    block.gt[atom_idx] += assignment_grad[assignment_base + atom_idx];
+                    block.htt[[atom_idx, atom_idx]] += assignment_hdiag[assignment_base + atom_idx];
+                }
             }
 
             // ARD on each on-atom coordinate.
-            for atom_idx in 0..k_atoms {
-                let coord = &self.assignment.coords[atom_idx];
-                let d = coord.latent_dim();
-                if rho.log_ard[atom_idx].len() != d {
-                    return Err(format!(
-                        "ARD rho atom {atom_idx} has len {} but atom dim is {d}",
-                        rho.log_ard[atom_idx].len()
-                    ));
+            // For compact layout: only active atoms; coord positions use compact starts.
+            // For dense layout: all atoms; coord positions use coord_offsets.
+            if let Some(ref layout) = jumprelu_layout {
+                let active = &layout.active_atoms[row];
+                let starts = &layout.coord_starts[row];
+                for (j, &k) in active.iter().enumerate() {
+                    let coord = &self.assignment.coords[k];
+                    let d = coord.latent_dim();
+                    if rho.log_ard[k].len() != d {
+                        return Err(format!(
+                            "ARD rho atom {k} has len {} but atom dim is {d}",
+                            rho.log_ard[k].len()
+                        ));
+                    }
+                    let row_t = coord.row(row);
+                    for axis in 0..d {
+                        let alpha = rho.log_ard[k][axis].exp();
+                        block.gt[starts[j] + axis] += alpha * row_t[axis];
+                        block.htt[[starts[j] + axis, starts[j] + axis]] += alpha;
+                    }
                 }
-                let off = coord_offsets[atom_idx];
-                let row_t = coord.row(row);
-                for axis in 0..d {
-                    let alpha = rho.log_ard[atom_idx][axis].exp();
-                    block.gt[off + axis] += alpha * row_t[axis];
-                    block.htt[[off + axis, off + axis]] += alpha;
+            } else {
+                for atom_idx in 0..k_atoms {
+                    let coord = &self.assignment.coords[atom_idx];
+                    let d = coord.latent_dim();
+                    if rho.log_ard[atom_idx].len() != d {
+                        return Err(format!(
+                            "ARD rho atom {atom_idx} has len {} but atom dim is {d}",
+                            rho.log_ard[atom_idx].len()
+                        ));
+                    }
+                    let off = coord_offsets[atom_idx];
+                    let row_t = coord.row(row);
+                    for axis in 0..d {
+                        let alpha = rho.log_ard[atom_idx][axis].exp();
+                        block.gt[off + axis] += alpha * row_t[axis];
+                        block.htt[[off + axis, off + axis]] += alpha;
+                    }
                 }
             }
 
@@ -2131,7 +2207,7 @@ impl SaeManifoldTerm {
             // and inner `(atom_j, basis_col2)` loops.
             //
             // The dense (q × K·p) htbeta block is NOT written here.  Instead,
-            // `a_phi` and `local_jac` are captured per-row into `SaeKroneckerRows`
+            // `a_phi` and `local_jac_row` are captured per-row into `SaeKroneckerRows`
             // and installed as `sys.htbeta_matvec` after the row loop.  All
             // Arrow-Schur inner paths (schur_matvec, reduced_rhs_beta,
             // build_dense_schur_*, JacobiPreconditioner) route through
@@ -2167,11 +2243,11 @@ impl SaeManifoldTerm {
             }
             // Save per-row Kronecker data for htbeta_matvec construction.
             kron_a_phi.push(a_phi);
-            // Flatten local_jac row-major into a plain Vec<f64> (q * p entries).
-            let mut jac_flat = vec![0.0_f64; q * p];
-            for c in 0..q {
+            // Flatten local_jac_row row-major into a plain Vec<f64> (q_row * p entries).
+            let mut jac_flat = vec![0.0_f64; q_row * p];
+            for c in 0..q_row {
                 for j in 0..p {
-                    jac_flat[c * p + j] = local_jac[[c, j]];
+                    jac_flat[c * p + j] = local_jac_row[[c, j]];
                 }
             }
             kron_jac.push(jac_flat);

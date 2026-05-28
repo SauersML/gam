@@ -213,7 +213,7 @@ fn sigma_cubature_evaluate_gpu_stream_pool(
     let n = state.x.nrows();
     let p = state.p;
 
-    // Dense-only: the GPU loop expects a column-major dense x_transformed.
+    // Dense-only: the GPU loop requires X_original as a dense column-major array.
     let x_dense = match state.x.as_dense() {
         Some(d) => d,
         None => return Ok(None),
@@ -235,16 +235,12 @@ fn sigma_cubature_evaluate_gpu_stream_pool(
     // Compute the reparameterisation for every sigma point on the host.
     // This is a moderate-cost eigendecomposition (O(p³) per point); it
     // runs sequentially here because the downstream GPU launches dominate.
-    let lambdas_rho_exp: Vec<ndarray::Array1<f64>> = sigma_points
-        .iter()
-        .map(|rho| rho.mapv(f64::exp))
-        .collect();
-
     let engine_dims = EngineDims::new(p, state.canonical_penalties.len());
     let mut per_sigma: Vec<crate::gpu::sigma_cubature::SigmaPointGpuInput> =
         Vec::with_capacity(sigma_points.len());
 
-    for lambdas in &lambdas_rho_exp {
+    for rho in sigma_points {
+        let lambdas = rho.mapv(f64::exp);
         let lambdas_slice = lambdas
             .as_slice_memory_order()
             .ok_or_else(|| crate::gpu_err!("sigma rho lambdas not contiguous"))?;
@@ -257,23 +253,36 @@ fn sigma_cubature_evaluate_gpu_stream_pool(
         )
         .map_err(|e| crate::gpu_err!("sigma reparam engine: {e:?}"))?;
 
-        // x_transformed = X_original · Qs  (host-side; small p×p matmul cost)
-        let x_transformed = crate::faer_ndarray::fast_ab(x_dense, &reparam.qs);
+        // Compute prior-mean shifts in the transformed basis. These are zero
+        // for the standard sigma-cubature path (no explicit prior-mean offset).
+        let linear_shift = ndarray::Array1::<f64>::zeros(p);
 
         per_sigma.push(crate::gpu::sigma_cubature::SigmaPointGpuInput {
-            x_transformed,
             s_transformed: reparam.s_transformed,
             qs: reparam.qs,
+            linear_shift,
+            constant_shift: 0.0,
         });
     }
 
+    // Gamma dispersion shape: used by the Gamma-Log row kernel. All other
+    // families ignore this parameter (pirls_loop_on_stream passes it through
+    // to the row kernel, which is a no-op for non-Gamma families).
+    let gamma_shape = match &likelihood_spec.spec.response {
+        crate::types::ResponseFamily::Gamma => likelihood_spec
+            .gamma_shape()
+            .unwrap_or(1.0),
+        _ => 1.0,
+    };
+
     try_gpu_sigma_stream_pool_eval(
-        &per_sigma,
+        x_dense.view(),
         state.y,
         state.weights,
         state.offset.view(),
+        &per_sigma,
         admission,
-        likelihood_spec.gamma_shape().unwrap_or(1.0),
+        gamma_shape,
         state.config.pirls_convergence_tolerance,
         state.config.max_iterations,
     )

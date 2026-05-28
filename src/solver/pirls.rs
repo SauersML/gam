@@ -7550,14 +7550,13 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             } = &penalty_active
             {
                 let qs_view = qs_arc.as_ref().map(|qs| qs.view());
-                let x_dense_opt = x_original.as_dense().map(|d| d.view());
-                if x_dense_opt.is_some() {
+                {
                     let qs_arc_for_design = qs_arc
                         .as_ref()
                         .cloned()
                         .unwrap_or_else(|| Arc::new(Array2::<f64>::eye(penalty.p)));
                     let x_transformed_design = make_reparam_operator(
-                        &x_original_for_result,
+                        &x_original,
                         &qs_arc_for_design,
                         use_sparse_native,
                     );
