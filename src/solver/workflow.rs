@@ -5884,19 +5884,22 @@ fn materialize_survival<'a>(
             if ls_parsed.linkspec.is_some() {
                 return Err(
                         "link(...) is not supported in logslope_formula for the survival marginal-slope family"
-                            .to_string(),
+                            .to_string()
+                            .into(),
                     );
             }
             if ls_parsed.timewiggle.is_some() {
                 return Err(
                         "timewiggle(...) is not supported in logslope_formula for the survival marginal-slope family"
-                            .to_string(),
+                            .to_string()
+                            .into(),
                     );
             }
             if ls_parsed.survivalspec.is_some() {
                 return Err(
                         "survmodel(...) is not supported in logslope_formula for the survival marginal-slope family"
-                            .to_string(),
+                            .to_string()
+                            .into(),
                     );
             }
             validate_marginal_slope_z_column_exclusion(
@@ -6449,7 +6452,7 @@ fn materialize_survival<'a>(
                 );
                 baseline_cfg.clone()
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         }
     } else if baseline_cfg.target != SurvivalBaselineTarget::Linear {
         optimize_survival_baseline_config(
