@@ -16438,6 +16438,7 @@ pub fn freeze_term_collection_from_design(
                 SmoothBasisSpec::BySmooth { smooth, by_kind },
                 BasisMetadata::FactorSmooth {
                     knots,
+                    degree,
                     periodic,
                     group_levels,
                     ..
@@ -16447,6 +16448,11 @@ pub fn freeze_term_collection_from_design(
                     *frozen_levels = Some(group_levels.clone());
                 }
                 if let SmoothBasisSpec::BSpline1D { spec: inner, .. } = smooth.as_mut() {
+                    // Issue #340: FactorSmooth metadata records the per-axis
+                    // spline degree directly (not optional); reflect it on
+                    // the inner spec so reload sees a self-consistent
+                    // (degree, knots) pair after fit-time auto-shrink.
+                    inner.degree = *degree;
                     inner.knotspec = periodic
                         .map(
                             |(domain_start, period, num_basis)| BSplineKnotSpec::PeriodicUniform {
@@ -16464,9 +16470,14 @@ pub fn freeze_term_collection_from_design(
                         knots,
                         periodic,
                         identifiability_transform,
+                        degree: meta_degree,
                         ..
                     } = metadata
                 {
+                    // Issue #340: persist auto-shrunk effective degree.
+                    if let Some(d) = meta_degree {
+                        inner.degree = *d;
+                    }
                     inner.knotspec = periodic
                         .map(
                             |(domain_start, period, num_basis)| BSplineKnotSpec::PeriodicUniform {
