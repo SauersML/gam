@@ -62,8 +62,37 @@ use ndarray::{Array1, Array2, Array3};
 use std::any::Any;
 use std::sync::Arc;
 
-mod common;
-use common::fixtures::{Splitmix64, finite_diff_jacobian};
+#[path = "common/fixtures.rs"]
+mod fixtures;
+use fixtures::Splitmix64;
+
+/// Numerically differentiate `eta_fn: R^p → R^m` at `beta` using central
+/// differences with step size `eps`. Returns the `(m, p)` Jacobian matrix
+/// `J` where
+/// `J[row, col] ≈ (eta_fn(β + eps·e_col)[row] - eta_fn(β - eps·e_col)[row]) / (2·eps)`.
+fn finite_diff_jacobian<F>(eta_fn: F, beta: &Array1<f64>, eps: f64) -> Array2<f64>
+where
+    F: Fn(&Array1<f64>) -> Array1<f64>,
+{
+    let p = beta.len();
+    let eta0 = eta_fn(beta);
+    let m = eta0.len();
+    let mut jac = Array2::<f64>::zeros((m, p));
+    let mut beta_plus = beta.clone();
+    let mut beta_minus = beta.clone();
+    for col in 0..p {
+        beta_plus[col] = beta[col] + eps;
+        beta_minus[col] = beta[col] - eps;
+        let eta_plus = eta_fn(&beta_plus);
+        let eta_minus = eta_fn(&beta_minus);
+        for row in 0..m {
+            jac[[row, col]] = (eta_plus[row] - eta_minus[row]) / (2.0 * eps);
+        }
+        beta_plus[col] = beta[col];
+        beta_minus[col] = beta[col];
+    }
+    jac
+}
 
 // ── Problem dimensions ────────────────────────────────────────────────────
 
@@ -256,12 +285,14 @@ fn analytical_logslope_jacobian(
 // `LogslopeFamilyScalars` which contains q0, q1, qd1, z, s_f computed at
 // the current linearization point (updated each time β changes).
 
+// `s_f` (probit frailty scale) is read from `state.probit_frailty_scale` at
+// evaluation time, not carried inside this struct: that lets the same scalars
+// instance stay correct across outer-loop σ updates without rebuilding.
 struct LogslopeFamilyScalars {
     q0: Array1<f64>,
     q1: Array1<f64>,
     qd1: Array1<f64>,
     z: Array1<f64>,
-    s_f: f64,
 }
 
 struct LogslopeJacobianImpl {
@@ -622,9 +653,9 @@ fn logslope_jacobian_at_zero_beta_equals_sf_diag_z_phi() {
 fn logslope_jacobian_at_small_beta_matches_fd() {
     let data = make_synthetic_data(123);
     assert_eq!(data.phi.nrows(), N, "synthetic data must have N rows");
-    let mut rng = 0xDEAD_BEEF_u64;
+    let mut rng = Splitmix64::new(0xDEAD_BEEF_u64);
     for s_f in [1.0_f64, 0.8] {
-        let beta_small: Vec<f64> = (0..P_BLOCK).map(|_| rand_normal(&mut rng) * 0.05).collect();
+        let beta_small: Vec<f64> = (0..P_BLOCK).map(|_| rng.next_gauss() * 0.05).collect();
         let label = format!("beta=small s_f={s_f}");
         check_logslope_jacobian(
             &data,
@@ -646,14 +677,14 @@ fn logslope_jacobian_at_small_beta_matches_fd() {
 #[test]
 fn logslope_jacobian_at_moderate_beta_has_hyperbolic_correction() {
     let data = make_synthetic_data(777);
-    let mut rng = 0xC0_FFEE_u64;
+    let mut rng = Splitmix64::new(0xC0_FFEE_u64);
     for s_f in [1.0_f64, 0.8] {
         // Scale β so that s_f * g_i ~ O(1) on average.
         // With Phi containing values ~ O(1/sqrt(P)) and P=9, and N=200,
         // scale ~ 1/(s_f * sqrt(P)) gives s_f * g_i ~ O(1).
         let scale = 1.0 / (s_f * (P_BLOCK as f64).sqrt());
         let beta_moderate: Vec<f64> =
-            (0..P_BLOCK).map(|_| rand_normal(&mut rng) * scale).collect();
+            (0..P_BLOCK).map(|_| rng.next_gauss() * scale).collect();
 
         let label = format!("beta=moderate s_f={s_f}");
         check_logslope_jacobian(
@@ -718,7 +749,7 @@ fn logslope_jacobian_at_moderate_beta_has_hyperbolic_correction() {
 fn effective_jacobian_at_matches_fd_at_three_linearization_points() {
     let data = make_synthetic_data(314);
     assert_eq!(data.phi.nrows(), N, "synthetic data must have N rows");
-    let mut rng = 0x1337_u64;
+    let mut rng = Splitmix64::new(0x1337_u64);
 
     for s_f in [1.0_f64, 0.8] {
         let spec = make_logslope_spec(
@@ -749,7 +780,7 @@ fn effective_jacobian_at_matches_fd_at_three_linearization_points() {
 
         // β = small.
         {
-            let beta: Vec<f64> = (0..P_BLOCK).map(|_| rand_normal(&mut rng) * 0.05).collect();
+            let beta: Vec<f64> = (0..P_BLOCK).map(|_| rng.next_gauss() * 0.05).collect();
             check_effective_jacobian_matches_fd(
                 &spec,
                 &beta,
@@ -768,7 +799,7 @@ fn effective_jacobian_at_matches_fd_at_three_linearization_points() {
         {
             let scale = 1.0 / (s_f * (P_BLOCK as f64).sqrt());
             let beta: Vec<f64> =
-                (0..P_BLOCK).map(|_| rand_normal(&mut rng) * scale).collect();
+                (0..P_BLOCK).map(|_| rng.next_gauss() * scale).collect();
             check_effective_jacobian_matches_fd(
                 &spec,
                 &beta,
@@ -791,7 +822,7 @@ fn effective_jacobian_at_matches_fd_at_three_linearization_points() {
 fn effective_jacobian_uses_family_scalars_when_provided() {
     let data = make_synthetic_data(999);
     assert_eq!(data.phi.nrows(), N, "synthetic data must have N rows");
-    let mut rng = 0xABCD_u64;
+    let mut rng = Splitmix64::new(0xABCD_u64);
     let s_f = 0.8_f64;
 
     // Build spec with STALE q0/q1/qd1 (all zeros).
@@ -806,7 +837,7 @@ fn effective_jacobian_uses_family_scalars_when_provided() {
     );
 
     let scale = 1.0 / (s_f * (P_BLOCK as f64).sqrt());
-    let beta: Vec<f64> = (0..P_BLOCK).map(|_| rand_normal(&mut rng) * scale).collect();
+    let beta: Vec<f64> = (0..P_BLOCK).map(|_| rng.next_gauss() * scale).collect();
 
     // Provide correct scalars via family_scalars.
     let fs: Arc<dyn Any + Send + Sync> = Arc::new(LogslopeFamilyScalars {
@@ -814,7 +845,6 @@ fn effective_jacobian_uses_family_scalars_when_provided() {
         q1: data.q1_base.clone(),
         qd1: data.qd1_base.clone(),
         z: data.z.clone(),
-        s_f,
     });
 
     // Jacobian with updated scalars must match FD.
@@ -842,11 +872,11 @@ fn effective_jacobian_uses_family_scalars_when_provided() {
 fn channel_aware_audit_overlap_below_one_at_moderate_beta() {
     let data = make_synthetic_data(2024);
     let s_f = 0.8_f64;
-    let mut rng = 0xFACE_u64;
+    let mut rng = Splitmix64::new(0xFACE_u64);
 
     let scale = 1.0 / (s_f * (P_BLOCK as f64).sqrt());
     let beta_logslope: Vec<f64> =
-        (0..P_BLOCK).map(|_| rand_normal(&mut rng) * scale).collect();
+        (0..P_BLOCK).map(|_| rng.next_gauss() * scale).collect();
 
     // Marginal block: its c_i is from the marginal block's own g_marg = phi_marg · β_marg.
     // At β_marg = 0 (no marginal predictor shift), g_marg = 0, c_i = 1 for all i.
@@ -1039,7 +1069,7 @@ fn time_and_marginal_blocks_at_zero_beta_have_trivial_scaling() {
 fn production_logslope_block_requires_scalars_at_nonzero_beta() {
     let data = make_synthetic_data(31415);
     let s_f = 0.8_f64;
-    let mut rng = 0xDEAD_u64;
+    let mut rng = Splitmix64::new(0xDEAD_u64);
 
     // Build a production LogslopeBlockJacobian with the test's phi and z.
     let cb = Arc::new(LogslopeBlockJacobian::new(
@@ -1050,7 +1080,7 @@ fn production_logslope_block_requires_scalars_at_nonzero_beta() {
 
     // Moderate beta so g_i != 0 for some rows.
     let scale = 1.0 / (s_f * (P_BLOCK as f64).sqrt());
-    let beta: Vec<f64> = (0..P_BLOCK).map(|_| rand_normal(&mut rng) * scale).collect();
+    let beta: Vec<f64> = (0..P_BLOCK).map(|_| rng.next_gauss() * scale).collect();
 
     // Confirm at least one g_i is nonzero (sanity check for the test itself).
     let any_nonzero_g = (0..N).any(|i| {
@@ -1117,7 +1147,17 @@ fn production_logslope_block_requires_scalars_at_nonzero_beta() {
         );
 
         // FD verification: Jacobian must match finite differences.
-        let fd = fd_jacobian(&data.phi, &beta, &data.q0_base, &data.q1_base, &data.qd1_base, &data.z, s_f);
+        let beta_arr = Array1::from(beta.clone());
+        let phi_ref = &data.phi;
+        let q0_ref = &data.q0_base;
+        let q1_ref = &data.q1_base;
+        let qd1_ref = &data.qd1_base;
+        let z_ref = &data.z;
+        let fd = finite_diff_jacobian(
+            |b| compute_eta_stack(phi_ref, b.as_slice().unwrap(), q0_ref, q1_ref, qd1_ref, z_ref, s_f),
+            &beta_arr,
+            1e-6,
+        );
         let rel_err = max_col_rel_error(&jac, &fd);
         assert!(
             rel_err < 1e-5,
