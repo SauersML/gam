@@ -1201,7 +1201,7 @@ pub(super) const FIXED_STABILIZATION_RIDGE: f64 = 1e-8;
 
 
 
-struct GamWorkingModel<'a> {
+pub(super) struct GamWorkingModel<'a> {
     x_original: DesignMatrix,
     coordinate_design: WorkingCoordinateDesign,
     offset: Array1<f64>,
@@ -3155,7 +3155,7 @@ fn estimate_sparse_native_decision(
     }
 }
 
-fn should_use_sparse_native_pirls(
+pub(super) fn should_use_sparse_native_pirls(
     workspace: &mut PirlsWorkspace,
     x_original: &DesignMatrix,
     s_lambda: &Array2<f64>,
@@ -5292,7 +5292,7 @@ fn sparse_from_denseview(x: ArrayView2<f64>) -> Option<DesignMatrix> {
 }
 
 #[inline]
-fn standard_inverse_link_jet(
+pub(super) fn standard_inverse_link_jet(
     inverse_link: &InverseLink,
     eta: f64,
 ) -> Result<MixtureInverseLinkJet, EstimationError> {

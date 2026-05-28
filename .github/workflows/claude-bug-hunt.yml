@@ -39,14 +39,15 @@ jobs:
           curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | bash
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Build gamfit from source
+      - name: Try to build gamfit from source (non-fatal)
+        continue-on-error: true
         run: |
-          set -euxo pipefail
+          set -uxo pipefail
           python -m pip install --upgrade pip maturin
           python -m pip install numpy pandas scipy scikit-learn pyarrow requests
-          python -m pip install .
-          # Verify import from a directory that doesn't shadow the package
-          (cd /tmp && python -c "import gamfit; print('gamfit ok')")
+          python -m pip install . && \
+            (cd /tmp && python -c "import gamfit; print('gamfit ok')") || \
+            echo "::warning::gamfit source build failed — agent can still use the gam CLI from install.sh"
 
       - name: Run Claude bug-hunt agent
         uses: anthropics/claude-code-action@v1

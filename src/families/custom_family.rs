@@ -367,6 +367,76 @@ pub trait FamilyChannelHessian: Send + Sync {
         }
         out
     }
+
+    /// Return a refreshed W evaluated at `beta` using `family_scalars` when
+    /// those scalars carry the per-row primary state at the current β.
+    ///
+    /// # Fisher information identity
+    ///
+    /// `I(β) = J(β)^T W(β) J(β)`. T8 originally froze W at β=0; T34 refreshes
+    /// both J and W at the current β so the audit's rank verdict reflects the
+    /// actual local identifiability.
+    ///
+    /// # Default implementation (β-independent W)
+    ///
+    /// Families whose W is β-independent (e.g. Gaussian-identity where
+    /// `W = prior_w`) return a clone of their frozen W by delegating to
+    /// `evaluate_full()`. No recomputation is performed. `beta` and
+    /// `family_scalars` are ignored.
+    ///
+    /// # Override (β-dependent W)
+    ///
+    /// Families with β-dependent W (e.g. survival marginal-slope where
+    /// `W_i(β)` depends on `(q0_i, q1_i, qd1_i, g_i)`) must override this
+    /// method and recompute W from the current primary state.
+    ///
+    /// When `beta` is non-zero in a way that affects W (i.e. `g_i != 0`),
+    /// `family_scalars` MUST be `Some(..)`. Return `Err` if scalars are
+    /// missing in that case (same error-message style as T26's contract).
+    fn channel_hessian_at(
+        &self,
+        _beta: &[f64],
+        _family_scalars: Option<&std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Result<Arc<dyn FamilyChannelHessian>, String> {
+        // Default: W is β-independent — return a snapshot of the frozen W
+        // wrapped in a simple tensor-backed implementation.
+        let tensor = self.evaluate_full();
+        Ok(Arc::new(TensorChannelHessian { h: tensor }))
+    }
+}
+
+/// A [`FamilyChannelHessian`] backed directly by a pre-computed
+/// `(n × K × K)` tensor. Used by the default `channel_hessian_at`
+/// implementation and by tests.
+///
+/// This is the β-independent path: `fill_subject` reads from the frozen
+/// tensor without any recomputation.
+pub(crate) struct TensorChannelHessian {
+    pub(crate) h: ndarray::Array3<f64>,
+}
+
+impl FamilyChannelHessian for TensorChannelHessian {
+    fn n_outputs(&self) -> usize {
+        self.h.shape()[1]
+    }
+
+    fn n_subjects(&self) -> usize {
+        self.h.shape()[0]
+    }
+
+    fn fill_subject(&self, i: usize, out: &mut [f64]) {
+        let k = self.h.shape()[1];
+        assert_eq!(out.len(), k * k);
+        for a in 0..k {
+            for b in 0..k {
+                out[a * k + b] = self.h[[i, a, b]];
+            }
+        }
+    }
+
+    fn evaluate_full(&self) -> ndarray::Array3<f64> {
+        self.h.clone()
+    }
 }
 
 /// Adapter that turns a [`FamilyChannelHessian`] into a
