@@ -12,7 +12,7 @@
 ///
 /// where eta_r[i] = X_r[i,:] · β_r + offset_r.  Tolerance: 1e-7 relative.
 use gam::custom_family::{FamilyLinearizationState, ParameterBlockSpec};
-use gam::families::survival_location_scale::SurvivalLocationScaleFamily;
+use gam::families::survival_location_scale::survival_location_scale_block_effective_jacobian;
 use gam::matrix::DesignMatrix;
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
@@ -128,7 +128,7 @@ fn check_block(
     let beta0 = Array1::zeros(p);
     let state = make_state(beta0.as_slice().unwrap());
 
-    let jac_box = SurvivalLocationScaleFamily::block_effective_jacobian(specs, block_idx)
+    let jac_box = survival_location_scale_block_effective_jacobian(specs, block_idx)
         .expect("block_effective_jacobian");
     let jac = jac_box
         .effective_jacobian_at(&state)
