@@ -87,21 +87,6 @@ positions), so encoder gradients in the example above flow through the
 TopK `by` amplitudes; use a differentiable basis path if you need coordinate
 gradients.
 
-## Indicative timing (single-process CPU)
-
-These numbers are from a synthetic benchmark on a single laptop-class
-CPU core; server-class CPUs are typically 2-5x faster.
-
-| F     | D    | N    | mode          | dt (s)  |
-| ---   | ---  | ---  | ---           | ---     |
-| 8     | 16   | 64   | independent   | 0.01    |
-| 80    | 1    | 100  | auto → independent | 0.01 |
-| 1024  | 64   | 256  | independent   | 0.35    |
-| 4096  | 64   | 256  | independent   | 1.36    |
-
-Cost scales linearly in F for fixed per-smooth width (as predicted by
-O(Σ_k M_k³)).
-
 ## Future work: sparse joint REML
 
 The truly right algorithm at F=100K with TopK gating is **sparse joint
