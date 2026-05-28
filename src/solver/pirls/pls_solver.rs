@@ -268,9 +268,12 @@ pub(super) fn solve_penalized_least_squares_implicit(
                 // Operator-form fallback: sparse designs and lazy operator-backed
                 // dense designs cannot be densified, so route through the signed
                 // XᵀWX operator.
-                crate::matrix::xt_diag_x_signed(x_original, &weights_owned)
-                    .map(|h| h.to_dense())
-                    .map_err(EstimationError::InvalidInput)?
+                crate::matrix::xt_diag_x_signed(
+                    x_original,
+                    crate::matrix::SignedWeightsView::from_array(&weights_owned),
+                )
+                .map(|h| h.to_dense())
+                .map_err(EstimationError::InvalidInput)?
             }
         }
     };

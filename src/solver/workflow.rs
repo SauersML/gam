@@ -2926,7 +2926,7 @@ fn check_smooth_capacity(
 /// numeric scan inside [`ResponseFamily::infer_from_response`]; `Continuous`
 /// maps to `Numeric` and the family layer scans `y` itself to decide
 /// Gaussian vs. Binomial.
-fn response_column_kind(data: &Dataset, y_col: usize) -> ResponseColumnKind {
+pub(crate) fn response_column_kind(data: &Dataset, y_col: usize) -> ResponseColumnKind {
     match data.column_kinds.get(y_col) {
         Some(ColumnKindTag::Categorical) => ResponseColumnKind::Categorical {
             levels: data

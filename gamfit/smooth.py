@@ -373,6 +373,11 @@ class TensorBSpline(Smooth):
         from ._basis_eval import tensor_bspline_evaluate_numpy
         return tensor_bspline_evaluate_numpy(self, coords)
 
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        out = super().to_rust_descriptor()
+        out["marginals"] = [m.to_rust_descriptor() for m in self.marginals]
+        return out
+
     SUPPORTED_BACKENDS: ClassVar[frozenset[str]] = frozenset({"torch", "numpy", "jax"})
 
 
