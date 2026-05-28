@@ -19734,8 +19734,7 @@ pub fn fit_survival_marginal_slope_terms(
     ): SmgsCutoverTuple = {
         use crate::families::survival_marginal_slope_identifiability::{
             CompiledSurvivalDesignsVMExact, SmgsLiftViaT, SurvivalRowHessian,
-            apply_compiled_map_to_designs, apply_per_term_vm_exact,
-            compile_survival_parametric_designs_per_term,
+            apply_compiled_map_to_designs,
             extract_term_partition_from_penalty_ranges,
         };
         // Recompile context, populated when the densify + compile half

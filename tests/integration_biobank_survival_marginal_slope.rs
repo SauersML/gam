@@ -34,7 +34,7 @@ use gam::matrix::LinearOperator;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use ndarray::Array2;
+use ndarray::{Array2, s};
 use std::sync::{Arc, Mutex, Once, OnceLock};
 
 // ── constants ─────────────────────────────────────────────────────────────────
@@ -427,12 +427,23 @@ fn biobank_survival_marginal_slope_canonical_gauge_fix() {
 
 // ── helper ────────────────────────────────────────────────────────────────────
 
-/// Extract the integer value of `"drops <field>=<N>"` from a log line.
+/// Extract the integer value of `"<field>=<N>"` from inside a `(drops …)`
+/// clause in a log line.
+///
+/// The V+M active log line has the shape:
+///   `… (drops time=T, marginal=M, logslope=G)`
+/// so the individual fields are separated by ", " after the opening
+/// "(drops " that marks the start of the parenthesised clause.
+/// We look for the substring `"<field>="` and parse the digits that follow.
 /// Returns `None` when the pattern is not present.
 fn parse_drops_field(line: &str, field: &str) -> Option<usize> {
-    let needle = format!("drops {field}=");
-    let start = line.find(needle.as_str())? + needle.len();
-    let rest = &line[start..];
+    // Only search inside the drops parenthesis to avoid false matches on the
+    // "time X→Y" section of the same line.
+    let drops_start = line.find("(drops ")?;
+    let drops_section = &line[drops_start..];
+    let needle = format!("{field}=");
+    let after_eq = drops_section.find(needle.as_str())? + needle.len();
+    let rest = &drops_section[after_eq..];
     let end = rest
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(rest.len());

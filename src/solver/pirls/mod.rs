@@ -1017,14 +1017,6 @@ impl PirlsWorkspace {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct AdaptiveKktTolerance {
-    pub eta: f64,
-    pub floor: f64,
-    pub ceiling: f64,
-    pub outer_grad_norm: f64,
-}
-
 #[derive(Clone, Debug)]
 pub struct WorkingModelPirlsOptions {
     pub max_iterations: usize,
