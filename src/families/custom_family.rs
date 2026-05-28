@@ -21,8 +21,7 @@ use crate::solver::estimate::reml::unified::{
     FixedDriftDerivFn, HessianDerivativeProvider, HessianOperator, HyperCoord, HyperCoordDrift,
     HyperCoordPair, HyperOperator, MatrixFreeSpdOperator, PenaltySubspaceTrace,
     ProjectedKktResidual, StochasticTraceState, compute_block_penalty_logdet_derivs,
-    exact_intersection_nullity, exact_pseudo_logdet, positive_eigenvalue_threshold,
-    spectral_epsilon, spectral_regularize,
+    exact_pseudo_logdet, positive_eigenvalue_threshold, spectral_epsilon, spectral_regularize,
 };
 use crate::solver::estimate::{
     EstimationError, FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
