@@ -46,10 +46,9 @@ mod linux_impl {
         pub likelihood: &'a GlmLikelihoodSpec,
         /// Inverse link the row kernel was driven by.
         pub inverse_link: &'a InverseLink,
-        /// Transformed dense design `X · Qs`, shape `n × p`, row-major.
-        /// The GPU loop expects this column-major; this routine uploads
-        /// after a row→col-major repack.
-        pub x_transformed: ArrayView2<'a, f64>,
+        /// Original dense design `X_original` (before reparameterization), shape `n × p`, row-major.
+        /// Uploaded once to device-resident shared model cache; Qs is uploaded separately per ρ/σ point.
+        pub x_original: ArrayView2<'a, f64>,
         /// Transformed dense penalty `S_λ` in transformed coordinates,
         /// shape `p × p`.
         pub s_transformed: ArrayView2<'a, f64>,
@@ -164,8 +163,8 @@ mod linux_impl {
         if !cuda_selected() {
             return None;
         }
-        let n = input.x_transformed.nrows();
-        let p = input.x_transformed.ncols();
+        let n = input.x_original.nrows();
+        let p = input.x_original.ncols();
         // Engine-level admission: shape + family + curvature + runtime probe.
         let admission = admission_for(&input.likelihood.spec, n, p)?;
         let runtime = GpuRuntime::global()?;
@@ -193,12 +192,18 @@ mod linux_impl {
         // --- Device upload + workspace allocation -----------------------
         // Upload X, y, prior_w, and offset (#258) once; shared by all iters.
         let shared = pirls_gpu::upload_shared_pirls_gpu(
-            input.x_transformed,
+            input.x_original,
             input.y,
             input.priorweights,
             input.offset,
         )?;
+        // Upload Qs for this ρ/σ point. Identity when no reparameterization.
         let mut ws = pirls_gpu::allocate_sigma_pirls_workspace(&shared)?;
+        if let Some(qs) = input.qs {
+            pirls_gpu::upload_qs_pirls(&mut ws, qs)?;
+        } else {
+            pirls_gpu::upload_qs_identity_pirls(&mut ws)?;
+        }
         let mut loop_ws = pirls_gpu::allocate_pirls_loop_workspace(&shared, &ws)?;
 
         let lm_ridge = input.initial_lm_lambda.unwrap_or(1e-6);
@@ -394,21 +399,24 @@ mod linux_impl {
             final_eta.iter().fold(0.0_f64, |a, &x| a.max(x.abs()))
         };
 
-        // Penalized-objective gradient = S·β − linear_shift − Xᵀ·score_eta (#257).
-        // The GPU loop minimises −ℓ + ½βᵀSβ − linear_shiftᵀβ, so the gradient
-        // of the objective is ∂/∂β(−ℓ + ½βᵀSβ − lsᵀβ) = −Xᵀscore + S·β − ls.
+        // Gradient in transformed coordinates: Qsᵀ (X_originalᵀ · score_eta).
+        // X_originalᵀ · score_eta is p-vector; then project through Qsᵀ.
         let xt_grad_eta = {
-            let xt = input.x_transformed;
-            // p-vector
-            let mut out = Array1::<f64>::zeros(p);
+            let xo = input.x_original;
+            let mut xo_score = Array1::<f64>::zeros(p);
             for j in 0..p {
                 let mut acc = 0.0_f64;
                 for i in 0..n {
-                    acc += xt[[i, j]] * final_grad_eta[i];
+                    acc += xo[[i, j]] * final_grad_eta[i];
                 }
-                out[j] = acc;
+                xo_score[j] = acc;
             }
-            out
+            // Project through Qsᵀ: xt_grad_eta = Qsᵀ · xo_score.
+            if let Some(qs) = input.qs {
+                qs.t().dot(&xo_score)
+            } else {
+                xo_score
+            }
         };
         let s_beta = {
             let mut acc = Array1::<f64>::zeros(p);
