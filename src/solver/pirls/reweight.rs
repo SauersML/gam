@@ -23,11 +23,12 @@ use super::{
     outer_hessian_curvature_arrays, compute_observed_hessian_curvature_arrays,
     ExportedLaplaceCurvature, HessianCurvatureKind, PirlsStatus,
     WorkingModelIterationInfo, WorkingModelPirlsResult, WorkingState,
-    LinearInequalityConstraints, ConstraintKktDiagnostics,
+    LinearInequalityConstraints, array1_l2_norm,
 };
 use crate::estimate::EstimationError;
 use crate::solver::active_set;
 use crate::types::Coefficients;
+use faer::sparse::SparseColMat;
 use ndarray::{Array1, Zip};
 
 /// Madsen-Nielsen-Tingleff smooth Marquardt trust-region update (eq 3.17 in

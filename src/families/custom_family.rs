@@ -527,7 +527,7 @@ pub struct RowScaledJacobian {
 impl BlockEffectiveJacobian for RowScaledJacobian {
     fn effective_jacobian_at(
         &self,
-        _state: &FamilyLinearizationState<'_>,
+        state: &FamilyLinearizationState<'_>,
     ) -> Result<Array2<f64>, String> {
         let n = self.design.nrows();
         if self.eta_scaling.len() != n {
@@ -536,6 +536,13 @@ impl BlockEffectiveJacobian for RowScaledJacobian {
                 self.eta_scaling.len(),
                 n,
             ));
+        }
+        // Row-scaled blocks are β-linear; verify the linearization point
+        // contains no NaN when β is provided (sanity check on caller state).
+        if !state.beta.is_empty() && state.beta.iter().any(|v| v.is_nan()) {
+            return Err(
+                "RowScaledJacobian::effective_jacobian_at: state.beta contains NaN".to_string(),
+            );
         }
         let mut scaled = self.design.as_ref().clone();
         for i in 0..n {

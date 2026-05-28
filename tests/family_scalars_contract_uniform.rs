@@ -233,8 +233,10 @@ fn bms_marginal_block_contract_beta_zero_scalars_none_ok() {
         channel_hessian: None,
         probit_frailty_scale: 1.0,
     };
-    cb.effective_jacobian_at(&state)
+    let jac = cb
+        .effective_jacobian_at(&state)
         .expect("bms marginal: beta=0, scalars=None must return Ok");
+    assert_eq!(jac.nrows(), n, "Jacobian must have n rows");
 }
 
 #[test]
@@ -366,8 +368,10 @@ fn bms_logslope_block_contract_beta_zero_scalars_none_ok() {
         channel_hessian: None,
         probit_frailty_scale: 1.0,
     };
-    cb.effective_jacobian_at(&state)
+    let jac = cb
+        .effective_jacobian_at(&state)
         .expect("bms logslope: beta=0, scalars=None must return Ok");
+    assert_eq!(jac.nrows(), n, "Jacobian must have n rows");
 }
 
 #[test]
