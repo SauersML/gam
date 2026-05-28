@@ -1315,6 +1315,18 @@ pub struct ArrowSchurSystem {
     /// The default (empty slice) causes `JacobiPreconditioner` to fall back
     /// to pure scalar diagonal inversion, preserving the pre-#283 behaviour.
     pub block_offsets: Arc<[Range<usize>]>,
+    /// Optional matrix-free penalty-side `H_ββ` operator (#296).
+    ///
+    /// When set, all hot paths (`schur_matvec`, `build_dense_schur_*`,
+    /// `JacobiPreconditioner`, quadratic-form reduction) route through this
+    /// operator instead of the dense `hbb` accumulator, enabling
+    /// `BlockPenaltyOp` / `KroneckerPenaltyOp` to skip the `O(K²)` dense
+    /// materialisation for structured smoothness penalties.
+    ///
+    /// When `None`, those paths fall back to wrapping `hbb` in a transient
+    /// `DensePenaltyOp` — identical observable behaviour, no new allocation
+    /// hot-path cost for callers that have not opted in.
+    pub penalty_op: Option<Arc<dyn BetaPenaltyOp>>,
 }
 
 impl ArrowSchurSystem {

@@ -817,7 +817,6 @@ pub fn evidence_grad_rho(
 ) -> Array1<f64> {
     let r = value_rho.len();
     let n = cache.undamped_factor_count();
-    let d = cache.d;
     let k = cache.k;
     let mut out = Array1::<f64>::zeros(r);
     if !cache.htbeta_available()
@@ -830,10 +829,18 @@ pub fn evidence_grad_rho(
         || hbb_drho.iter().any(|m| m.nrows() != k || m.ncols() != k)
         || huu_drho
             .iter()
-            .any(|row| row.iter().any(|m| m.nrows() != d || m.ncols() != d))
+            .enumerate()
+            .any(|(i, row)| {
+                let di = cache.row_dims[i];
+                row.iter().any(|m| m.nrows() != di || m.ncols() != di)
+            })
         || htbeta_drho
             .iter()
-            .any(|row| row.iter().any(|m| m.nrows() != d || m.ncols() != k))
+            .enumerate()
+            .any(|(i, row)| {
+                let di = cache.row_dims[i];
+                row.iter().any(|m| m.nrows() != di || m.ncols() != k)
+            })
     {
         out.fill(f64::NAN);
         return out;
@@ -854,26 +861,29 @@ pub fn evidence_grad_rho(
         }
     };
 
-    // Precompute Y_i = H_uu_i⁻¹ H_uβ_i (d × K). Used by both the Schur
+    // Precompute Y_i = H_uu_i⁻¹ H_uβ_i (di × K). Used by both the Schur
     // derivative formula (§3.5) and the row trace `tr(H_uu_i⁻¹ ∂H_uu_i)`.
     let mut y_blocks: Vec<Array2<f64>> = Vec::with_capacity(n);
     let mut beta_basis = Array1::<f64>::zeros(k);
-    let mut rhs = Array1::<f64>::zeros(d);
+    // Scratch sized to max_d; per-row slice is ..di.
+    let mut rhs = Array1::<f64>::zeros(cache.d);
     for i in 0..n {
+        let di = cache.row_dims[i];
         let factor = cache.undamped_factor(i);
-        let mut yi = Array2::<f64>::zeros((d, k));
+        let mut yi = Array2::<f64>::zeros((di, k));
         for col in 0..k {
             beta_basis.fill(0.0);
             beta_basis[col] = 1.0;
+            let mut rhs_i = rhs.slice_mut(ndarray::s![..di]).to_owned();
             // Same H_tβ cache contract as the IFT du/dβ and du/dρ paths.
-            if !cache.apply_htbeta_row(i, beta_basis.view(), &mut rhs) {
+            if !cache.apply_htbeta_row(i, beta_basis.view(), &mut rhs_i) {
                 // SAFETY: `false` means the family declared the cache
                 // available but did not populate it — contract violation.
                 out.fill(f64::NAN);
                 return out;
             }
-            let v = chol_lower_solve_vector(factor, &rhs);
-            for c in 0..d {
+            let v = chol_lower_solve_vector(factor, &rhs_i);
+            for c in 0..di {
                 yi[[c, col]] = v[c];
             }
         }
@@ -881,8 +891,9 @@ pub fn evidence_grad_rho(
     }
 
     // Outer-hoisted scratch reused across all (a, i) iterations.
-    let mut trace_rhs = Array1::<f64>::zeros(d);
-    let mut da_tmp = Array2::<f64>::zeros((d, k));
+    // Sized to max_d for trace_rhs and da_tmp; per-row slices used below.
+    let mut trace_rhs = Array1::<f64>::zeros(cache.d);
+    let mut da_tmp = Array2::<f64>::zeros((cache.d, k));
     let mut col_scratch = Array1::<f64>::zeros(k);
     for a in 0..r {
         // Part 1: F_{ρ_a} envelope contribution.
