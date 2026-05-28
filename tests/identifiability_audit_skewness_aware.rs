@@ -54,6 +54,7 @@ fn spec_from_dense(name: &str, design: Array2<f64>) -> ParameterBlockSpec {
         initial_beta: None,
         gauge_priority: 100,
         jacobian_callback: None,
+        audit_design: None,
     }
 }
 
@@ -75,6 +76,7 @@ fn spec_with_scaling(name: &str, design: Array2<f64>, z: Vec<f64>) -> ParameterB
         initial_beta: None,
         gauge_priority: 100,
         jacobian_callback: Some(jac),
+        audit_design: None,
     }
 }
 

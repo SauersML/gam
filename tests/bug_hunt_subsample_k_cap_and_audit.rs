@@ -323,6 +323,7 @@ fn build_biobank_like_aliased_specs() -> Vec<gam::families::custom_family::Param
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
+            audit_design: None,
         });
     }
     specs

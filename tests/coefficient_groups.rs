@@ -247,6 +247,7 @@ fn custom_family_group_spanning_blocks_uses_one_precision_coordinate() {
         initial_beta: None,
         gauge_priority: 100,
         jacobian_callback: None,
+        audit_design: None,
     };
     let groups = vec![CustomCoefficientGroupSpec {
         label: "shared_endpoint_group".to_string(),
@@ -303,6 +304,7 @@ fn custom_family_parent_group_ties_concatenated_child_penalties() {
         initial_beta: None,
         gauge_priority: 100,
         jacobian_callback: None,
+        audit_design: None,
     };
     let groups = vec![
         CustomCoefficientGroupSpec::new(
@@ -364,6 +366,7 @@ fn custom_family_nested_group_rejects_uncovered_parent_coefficients() {
         initial_beta: None,
         gauge_priority: 100,
         jacobian_callback: None,
+        audit_design: None,
     };
     let groups = vec![
         CustomCoefficientGroupSpec::new(

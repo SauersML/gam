@@ -62,6 +62,7 @@ fn spec(
         initial_beta: None,
         gauge_priority,
         jacobian_callback: None,
+        audit_design: None,
     }
 }
 
