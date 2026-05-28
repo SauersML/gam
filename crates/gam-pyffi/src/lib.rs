@@ -20939,6 +20939,65 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     gam::heartbeat::ensure_started();
     module.add("__doc__", "PyO3 boundary for the gam Rust engine.")?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    // gamfit exception hierarchy (see the comment block at the
+    // `create_exception!` definitions above and issue #343). Registering
+    // the classes here makes them addressable as `gam._rust.GamError`,
+    // `gam._rust.RemlConvergenceError`, etc.; `gamfit/_exceptions.py`
+    // re-exports each one under its public `gamfit.*` name so the class
+    // identity caught by `pytest.raises(gamfit.RemlConvergenceError)`
+    // and constructed by `RemlConvergenceError::new_err(...)` on the
+    // Rust side is exactly the same object.
+    module.add("GamError", module.py().get_type::<GamError>())?;
+    module.add("FormulaError", module.py().get_type::<FormulaError>())?;
+    module.add("SchemaMismatchError", module.py().get_type::<SchemaMismatchError>())?;
+    module.add("PredictionError", module.py().get_type::<PredictionError>())?;
+    module.add("BasisError", module.py().get_type::<BasisError>())?;
+    module.add(
+        "LinearSystemSolveError",
+        module.py().get_type::<LinearSystemSolveError>(),
+    )?;
+    module.add(
+        "EigendecompositionError",
+        module.py().get_type::<EigendecompositionError>(),
+    )?;
+    module.add("PenaltySpectrumError", module.py().get_type::<PenaltySpectrumError>())?;
+    module.add(
+        "ParameterConstraintError",
+        module.py().get_type::<ParameterConstraintError>(),
+    )?;
+    module.add(
+        "PirlsConvergenceError",
+        module.py().get_type::<PirlsConvergenceError>(),
+    )?;
+    module.add(
+        "PerfectSeparationError",
+        module.py().get_type::<PerfectSeparationError>(),
+    )?;
+    module.add(
+        "HessianNotPositiveDefiniteError",
+        module.py().get_type::<HessianNotPositiveDefiniteError>(),
+    )?;
+    module.add(
+        "RemlConvergenceError",
+        module.py().get_type::<RemlConvergenceError>(),
+    )?;
+    module.add(
+        "GradientUnavailableError",
+        module.py().get_type::<GradientUnavailableError>(),
+    )?;
+    module.add("LayoutError", module.py().get_type::<LayoutError>())?;
+    module.add(
+        "ModelOverparameterizedError",
+        module.py().get_type::<ModelOverparameterizedError>(),
+    )?;
+    module.add("IllConditionedError", module.py().get_type::<IllConditionedError>())?;
+    module.add("InvalidInputError", module.py().get_type::<InvalidInputError>())?;
+    module.add("MonotoneRootError", module.py().get_type::<MonotoneRootError>())?;
+    module.add("CalibratorError", module.py().get_type::<CalibratorError>())?;
+    module.add(
+        "InvalidSpecificationError",
+        module.py().get_type::<InvalidSpecificationError>(),
+    )?;
     module.add_class::<EuclideanManifold>()?;
     module.add_class::<CircleManifold>()?;
     module.add_class::<SphereManifold>()?;

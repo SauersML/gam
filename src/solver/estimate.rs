@@ -6169,21 +6169,16 @@ where
             "fit_gam external design path does not support RoystonParmar; use survival training APIs"
         );
     }
-    // Validate Beta-regression response domain upfront on the external-design
-    // GLM path so callers get a clear error before PIRLS is even constructed.
-    // Beta GLM requires y strictly in (0, 1); any boundary or out-of-range
-    // value must be rejected here with a message explicitly identifying the
-    // external GLM routing constraint.
-    if matches!(resolved_family.response, ResponseFamily::Beta { .. }) {
-        for (i, (&yi, &wi)) in y.iter().zip(weights.iter()).enumerate() {
-            if wi > 0.0 && (!yi.is_finite() || yi <= 0.0 || yi >= 1.0) {
-                crate::bail_invalid_estim!(
-                    "GLM Beta-regression family rejects response y[{i}]={yi}: \
-                     fit_gam external GLM routing requires y strictly in the open interval (0, 1); \
-                     boundary values 0 or 1 are not in the Beta sample space"
-                );
-            }
-        }
+    // Per-family response-support validation, owned by the family type.
+    // Gamma `y > 0`, Poisson / NegativeBinomial / Tweedie `y ≥ 0`, Beta
+    // `y ∈ (0, 1)`. Centralising the rule on `ResponseFamily` means the
+    // external-design GLM path and the formula path produce identical
+    // user-facing messages for the same domain violation, and adding a new
+    // constrained family is a single edit on the type. The response column
+    // name is unknown on the external-design path (the caller passes a bare
+    // `y: ArrayView1<f64>`) so we surface it as the generic "y".
+    if let Err(violation) = resolved_family.response.validate_response_support(y.view()) {
+        crate::bail_invalid_estim!("{}", violation);
     }
     validate_penalty_specs(&specs, x.ncols(), "fit_gam")?;
     let ext_opts = ExternalOptimOptions {

@@ -1,113 +1,101 @@
-class GamError(ValueError):
-    """Base class for Python-facing GAM errors.
+"""Public exception hierarchy for gamfit.
 
-    All gamfit-specific exceptions raised by the Python binding inherit from
-    ``GamError``, so catching this class is the broadest way to handle a
-    failure originating from the Rust engine or the binding layer.
+Every gamfit exception is defined in Rust via ``pyo3::create_exception!``
+(see ``crates/gam-pyffi/src/lib.rs``) and re-exported here under its public
+``gamfit.*`` name. The class identity caught by user code with
+``except gamfit.RemlConvergenceError`` is exactly the same Python type
+object that the Rust extension constructs via ``RemlConvergenceError::new_err``;
+there is no parallel Python-defined class shadowing the Rust one.
 
-    ``GamError`` is a subclass of :class:`ValueError`. Engine-side failures
-    (REML convergence, ill-conditioning, degenerate inner iterates, response
-    geometry domain violations) historically surfaced as bare ``ValueError``
-    because the Rust extension raises ``PyValueError`` for every domain-style
-    error. Inheriting from ``ValueError`` keeps that contract intact —
-    ``except ValueError`` still catches them — while ``except GamError`` now
-    works as the documented broad catch for any gamfit engine error.
+Architecture (issue #343):
 
-    Examples
-    --------
-    >>> try:
-    ...     gamfit.fit(df, "y ~ s(x)")
-    ... except gamfit.GamError as exc:
-    ...     print(gamfit.explain_error(exc))
-    """
+* The Rust engine has rich ``thiserror``-typed error enums.
+  ``EstimationError`` (in ``src/solver/estimate.rs``) has ~20 variants;
+  ``crates/gam-pyffi/src/lib.rs::estimation_error_to_pyerr`` dispatches
+  each variant to its corresponding subclass below. No ``err.to_string()``
+  flattening, no message-regex reclassification.
+* ``GamError`` inherits from :class:`ValueError`, so legacy ``except
+  ValueError`` catches every gamfit engine error unchanged (issue #330).
+* The remaining ``Result<_, String>`` error paths at the FFI boundary
+  (formula validation, schema-mismatch during predict, basis builders
+  not wrapped in ``EstimationError``, etc.) still flow through
+  :func:`map_exception` and the legacy message-regex classifier. They
+  will be migrated to typed dispatch one enum at a time; until then,
+  NEW error variants for already-typed enums MUST extend the Rust-side
+  dispatcher, never the regex classifier.
+"""
 
+from __future__ import annotations
 
-class FormulaError(GamError):
-    """The formula is invalid or unsupported.
+from ._binding import RustExtensionUnavailableError, rust_module
 
-    Raised when the Wilkinson-style formula string cannot be parsed, references
-    columns missing from the input table, or describes a model the engine does
-    not support.
+# Pull every gamfit exception class out of the Rust extension. This
+# happens at import time so the public ``gamfit.GamError`` name is the
+# same type object as ``gam._rust.GamError``.
+_rust = rust_module()
 
-    Examples
-    --------
-    >>> try:
-    ...     gamfit.fit(df, "y ~ s(nope)")
-    ... except gamfit.FormulaError as exc:
-    ...     print(exc)
-    """
+GamError: type = _rust.GamError
+FormulaError: type = _rust.FormulaError
+SchemaMismatchError: type = _rust.SchemaMismatchError
+PredictionError: type = _rust.PredictionError
 
-
-class SchemaMismatchError(GamError):
-    """Prediction input does not match the training schema.
-
-    Raised when the table passed to :meth:`Model.predict` or related methods
-    lacks columns that were present at fit time, has incompatible dtypes, or
-    introduces unknown categorical levels.
-
-    Examples
-    --------
-    >>> try:
-    ...     model.predict(serving_df)
-    ... except gamfit.SchemaMismatchError as exc:
-    ...     print(model.check(serving_df))
-    """
-
-
-class PredictionError(GamError):
-    """Prediction failed.
-
-    Raised for runtime failures during prediction that are not pure schema
-    problems (numerical issues, unsupported prediction modes for the fitted
-    model, etc.).
-
-    Examples
-    --------
-    >>> try:
-    ...     model.predict(test_df)
-    ... except gamfit.PredictionError as exc:
-    ...     print(gamfit.explain_error(exc))
-    """
+# EstimationError variant subclasses. Each one corresponds to exactly
+# one variant of ``gam::estimate::EstimationError``; the Rust side
+# selects the right class via ``estimation_error_to_pyerr``.
+BasisError: type = _rust.BasisError
+LinearSystemSolveError: type = _rust.LinearSystemSolveError
+EigendecompositionError: type = _rust.EigendecompositionError
+PenaltySpectrumError: type = _rust.PenaltySpectrumError
+ParameterConstraintError: type = _rust.ParameterConstraintError
+PirlsConvergenceError: type = _rust.PirlsConvergenceError
+PerfectSeparationError: type = _rust.PerfectSeparationError
+HessianNotPositiveDefiniteError: type = _rust.HessianNotPositiveDefiniteError
+RemlConvergenceError: type = _rust.RemlConvergenceError
+GradientUnavailableError: type = _rust.GradientUnavailableError
+LayoutError: type = _rust.LayoutError
+ModelOverparameterizedError: type = _rust.ModelOverparameterizedError
+IllConditionedError: type = _rust.IllConditionedError
+InvalidInputError: type = _rust.InvalidInputError
+MonotoneRootError: type = _rust.MonotoneRootError
+CalibratorError: type = _rust.CalibratorError
+InvalidSpecificationError: type = _rust.InvalidSpecificationError
 
 
 def map_exception(exc: BaseException) -> BaseException:
-    from ._binding import RustExtensionUnavailableError, rust_module
+    """Normalize an exception caught at the gamfit Python boundary.
 
+    Typed errors raised by the Rust extension (any subclass of
+    :class:`GamError`) pass through unchanged — the FFI boundary already
+    selected the correct subclass via variant dispatch, so there is
+    nothing to reclassify.
+
+    For error paths that still flow as ``Result<_, String>`` through the
+    FFI (formula / schema-mismatch / prediction routes that have not
+    yet been migrated to typed dispatch, see issue #343), the legacy
+    message-regex classifier picks the matching subclass. Once every
+    engine error enum is variant-typed, this fallback collapses to a
+    no-op identity function and the classifier disappears.
+
+    ``TypeError`` / ``LookupError`` / ``ArithmeticError`` describe
+    Python-native contract violations rather than gamfit engine errors,
+    so they pass through unwrapped. Every other ``ValueError`` is
+    promoted to :class:`GamError` to preserve the documented
+    ``except gamfit.GamError`` umbrella from issue #330 — this is a
+    type-hierarchy widening, never a narrowing, because ``GamError``
+    inherits from ``ValueError``.
+    """
     if isinstance(exc, RustExtensionUnavailableError):
         return exc
     if isinstance(exc, GamError):
         return exc
     message = str(exc)
-    kind = rust_module().classify_exception_message(message)
+    kind = _rust.classify_exception_message(message)
     if kind == "formula":
         return FormulaError(message)
     if kind == "schema_mismatch":
         return SchemaMismatchError(message)
     if kind == "prediction":
         return PredictionError(message)
-    # No formula/schema/prediction classification matched. The Rust extension
-    # raises ``PyValueError`` for both engine-side failures (REML convergence,
-    # numerical breakdown, degenerate inner iterates) and caller-input domain
-    # errors (response-geometry antipodal sphere log, non-positive simplex
-    # mass, mismatched base-point dimensions). Both belong under the documented
-    # ``except gamfit.GamError`` umbrella — see issue #330 — so we promote
-    # ``ValueError`` to ``GamError`` here. Because ``GamError`` inherits from
-    # ``ValueError``, callers using ``except ValueError`` continue to catch
-    # these errors unchanged: the type-hierarchy widens, it does not narrow.
-    #
-    # ``TypeError`` / ``LookupError`` / ``ArithmeticError`` describe genuine
-    # Python-native contract violations (shape/dtype mismatch, missing key,
-    # division-by-zero) that are not gamfit engine errors, so they pass
-    # through untouched.
-    #
-    # ARCHITECTURAL NOTE: this regex-classifier-plus-catch-all pattern is
-    # tactical, not the long-term design. The principled approach is
-    # variant-dispatch at the engine→FFI boundary — every ``EstimateError``
-    # (and every other engine-error enum) maps to a concrete ``GamError``
-    # subclass on the Rust side, with no string-regex bridge and no
-    # catch-all. Tracked in issue #343. Do not extend the message-regex
-    # classifier in ``crates/gam-pyffi/src/lib.rs::classify_exception_message``
-    # for new variants; extend the typed mapping instead.
     if isinstance(exc, ValueError):
         return GamError(message)
     if isinstance(exc, (TypeError, LookupError, ArithmeticError)):

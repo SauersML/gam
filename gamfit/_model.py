@@ -48,7 +48,6 @@ class Model:
         interval: float | None = None,
         return_type: str | None = None,
         id_column: str | None = None,
-        with_uncertainty: bool = False,
     ) -> Any:
         """Predict from new ``data``.
 
@@ -60,20 +59,21 @@ class Model:
             ``dict`` of columns, ``list`` of record dicts, ...). Columns must
             cover every predictor referenced by the fitted formula.
         interval : float or None, default None
-            Pointwise credible-interval coverage. ``0.95`` returns 95% CIs.
-            When set, the output gains ``mean_lower``, ``mean_upper``,
-            ``effective_se``, and ``effective_variance`` columns. ``None``
-            returns only the point prediction(s).
+            Single uncertainty knob. ``None`` returns the point prediction(s)
+            only. A float in ``(0, 1)`` (e.g. ``0.95``) requests the full
+            uncertainty decomposition at that pointwise coverage; the output
+            gains ``effective_se``, ``effective_variance``, ``mean_lower``,
+            and ``mean_upper`` columns alongside ``eta`` / ``mean``. On
+            survival models it also produces per-cell hazard / survival SEs.
+            Issue #342 collapsed the previous overlapping
+            ``with_uncertainty`` boolean into this single flag (use
+            ``interval=0.95`` for the SE-only case).
         return_type : {"dict", "pandas", "numpy", "polars", "pyarrow", "list"}, optional
             Force a specific output container. ``None`` (default) mirrors the
             shape of ``data`` (and the training table where unambiguous).
         id_column : str or None, default None
             Name of an identifier column in ``data`` to propagate as a row key
             in the output (so predictions can be joined back to the input).
-        with_uncertainty : bool, default False
-            Request the full uncertainty decomposition (linear-predictor and
-            response-scale variances, plus interval columns). Implies
-            ``interval`` when no explicit level is given.
 
         Returns
         -------
@@ -103,22 +103,12 @@ class Model:
         For Gaussian / identity-link GLMs, ``eta`` and ``mean`` are numerically
         identical (linear predictor == response scale). For non-identity links
         (logit, log, ...) ``mean = link^{-1}(eta)`` and the two columns carry
-        distinct information. Issues #310 and #313.
+        distinct information. Issues #310, #313, #342.
         """
         headers, rows, table_kind = normalize_table(data)
         row_ids = extract_row_ids(headers, rows, id_column)
-        # ``with_uncertainty=True`` is documented to imply a credible-interval
-        # request when no explicit level was given; resolve that implication
-        # here at the API boundary so the rest of the pipeline (Rust opts +
-        # the shape policy in ``_predict_shape``) only ever sees a single
-        # ``interval`` signal. After this normalisation, ``with_uncertainty``
-        # is purely a Rust-side opts flag controlling which uncertainty
-        # decomposition is computed; shape policy is driven by ``interval``.
-        effective_interval = interval
-        if effective_interval is None and with_uncertainty:
-            effective_interval = 0.95
         opts_json = rust_module().build_model_predict_payload_json(
-            self._model_bytes, headers, rows, effective_interval, with_uncertainty
+            self._model_bytes, headers, rows, interval
         )
         try:
             raw = rust_module().predict_table(
@@ -134,7 +124,7 @@ class Model:
             training_table_kind=self._training_table_kind,
             fallback_model_class=self._model_class_from_payload(),
             fallback_family=self._family_from_payload(),
-            interval=effective_interval,
+            interval=interval,
             return_type=return_type,
             id_column=id_column,
             row_ids=row_ids,
@@ -146,23 +136,27 @@ class Model:
         X: Any,
         *,
         interval: float | None = None,
-        with_uncertainty: bool = False,
     ) -> Any:
         """Predict directly from a numeric NumPy-compatible feature matrix.
 
-        Positional columns are matched, in order, to the model's training
-        feature columns (issue #341). When ``with_uncertainty=True`` the
-        returned array gains SE columns alongside ``eta``/``mean`` even
-        without an explicit ``interval`` (issue #342).
+        Only valid for models fitted via :func:`gamfit.fit_array` — positional
+        column order is only well-defined when the model itself was fitted
+        from a positional array, so the engine knows the predictor columns
+        are the synthetic sequence ``x0, x1, ..., x{p-1}`` (issue #341). For
+        models fitted from a named table (``gamfit.fit(df, formula)``), call
+        :meth:`predict` with a ``dict`` / DataFrame instead so columns can
+        be matched by name; silently mapping positional X to named features
+        would misorder swapped columns and produce wrong predictions.
+
+        ``interval`` is the single uncertainty knob (issue #342); see
+        :meth:`predict` for its semantics.
         """
         try:
             rust = rust_module()
             return rust.predict_array(
                 self._model_bytes,
                 rust.numeric_matrix_f64(X, "X"),
-                json.dumps(
-                    {"interval": interval, "with_uncertainty": with_uncertainty}
-                ),
+                json.dumps({"interval": interval}),
             )
         except Exception as exc:
             raise map_exception(exc) from exc
