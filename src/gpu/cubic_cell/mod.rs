@@ -92,6 +92,7 @@ pub(crate) enum CubicCellMomentResidency {
     /// shared cubic-cell context. Linux+CUDA only; on other platforms this
     /// variant degrades to `Host`-shaped output through the host substrate
     /// (no silent device claim).
+    #[cfg(target_os = "linux")]
     Device,
 }
 
@@ -199,12 +200,10 @@ pub(crate) fn try_build_cubic_cell_derivative_moments(
                 .map_err(|reason| GpuError::DriverCallFailed { reason })?;
             Ok(Some(into_host_output(batch)))
         }
+        #[cfg(target_os = "linux")]
         CubicCellMomentResidency::Device => {
-            #[cfg(target_os = "linux")]
-            {
-                if let Some(device_batch) = device::try_device_moments_resident(&input)? {
-                    return Ok(Some(device_batch));
-                }
+            if let Some(device_batch) = device::try_device_moments_resident(&input)? {
+                return Ok(Some(device_batch));
             }
             // Non-Linux, or no usable runtime: fall back to the host shape so
             // the caller has a parity-shaped result instead of a phantom

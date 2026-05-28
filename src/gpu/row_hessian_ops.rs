@@ -42,6 +42,7 @@ use crate::gpu_err;
 /// Hard ceiling on `r` (primary local dimension). Matches the BMS-FLEX row
 /// kernel's [`super::bms_flex_row::MAX_R`] so the same cached Hessian
 /// bundle can feed both kernels without revalidation.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) const MAX_R: usize = super::bms_flex_row::MAX_R;
 
 /// `blockDim.x` for the per-row matvec / diagonal kernels. One CUDA block per
@@ -72,6 +73,7 @@ pub(crate) struct RowHessianMatvecInputs<'a> {
 }
 
 /// Per-row outputs from [`launch_row_hessian_matvec`].
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub(crate) struct RowHessianMatvecOutputs {
     /// Per-row product `y_i = H_i · v_i`, row-major `[n_rows, r]`.
@@ -90,12 +92,14 @@ pub(crate) struct RowHessianDiagInputs<'a> {
 }
 
 /// Per-row outputs from [`launch_row_hessian_diag`].
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub(crate) struct RowHessianDiagOutputs {
     /// Per-row diagonal `d_i[u] = H_i[u, u]`, row-major `[n_rows, r]`.
     pub d_rows: Vec<f64>,
 }
 
+#[cfg(any(target_os = "linux", test))]
 impl<'a> RowHessianMatvecInputs<'a> {
     /// Validate every shape the device kernel relies on.
     pub(crate) fn validate(&self) -> Result<(), GpuError> {
@@ -132,6 +136,7 @@ impl<'a> RowHessianMatvecInputs<'a> {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 impl<'a> RowHessianDiagInputs<'a> {
     /// Validate every shape the device kernel relies on.
     pub(crate) fn validate(&self) -> Result<(), GpuError> {
@@ -170,6 +175,7 @@ impl<'a> RowHessianDiagInputs<'a> {
 ///     `src/families/bernoulli_marginal_slope.rs`;
 ///   * diag:   `row_hess[[u, u]]` reads inside
 ///     `exact_newton_joint_hessian_diagonal_from_cache`.
+#[cfg(target_os = "linux")]
 const ROW_KERNEL_SOURCE: &str = r#"
 extern "C" {
 
@@ -277,44 +283,24 @@ impl RowOpsBackend {
     }
 }
 
-/// Launch the per-row Hessian matvec. On non-Linux returns
-/// [`GpuError::DriverLibraryUnavailable`]; on Linux NVRTC-compiles the
-/// shared kernel source (cached for the process lifetime), uploads the
-/// per-row buffers, and dispatches one block per row.
+/// Launch the per-row Hessian matvec. Linux-only; on non-Linux the entire
+/// kernel cache machinery is compiled out and callers must take the CPU path.
+#[cfg(target_os = "linux")]
 pub(crate) fn launch_row_hessian_matvec(
     inputs: RowHessianMatvecInputs<'_>,
 ) -> Result<RowHessianMatvecOutputs, GpuError> {
     inputs.validate()?;
-    #[cfg(target_os = "linux")]
-    {
-        launch_matvec_linux(inputs)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        Err(GpuError::DriverLibraryUnavailable {
-            reason: "row_hessian_matvec GPU kernel is Linux-only".to_string(),
-        })
-    }
+    launch_matvec_linux(inputs)
 }
 
-/// Launch the per-row Hessian diagonal extraction. On non-Linux returns
-/// [`GpuError::DriverLibraryUnavailable`]; on Linux NVRTC-compiles the
-/// shared kernel source (cached for the process lifetime), uploads the
-/// per-row Hessian bundle, and dispatches one block per row.
+/// Launch the per-row Hessian diagonal extraction. Linux-only; non-Linux
+/// callers compile out the call site entirely.
+#[cfg(target_os = "linux")]
 pub(crate) fn launch_row_hessian_diag(
     inputs: RowHessianDiagInputs<'_>,
 ) -> Result<RowHessianDiagOutputs, GpuError> {
     inputs.validate()?;
-    #[cfg(target_os = "linux")]
-    {
-        launch_diag_linux(inputs)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        Err(GpuError::DriverLibraryUnavailable {
-            reason: "row_hessian_diag GPU kernel is Linux-only".to_string(),
-        })
-    }
+    launch_diag_linux(inputs)
 }
 
 #[cfg(target_os = "linux")]
@@ -470,6 +456,7 @@ mod tests {
     /// scrambling seed offset. Both `matvec` and `diag` parity tests
     /// share the same fixture so any regression in the cached-Hessian
     /// upload path surfaces in both.
+    #[cfg(target_os = "linux")]
     fn make_fixture(n_rows: usize, r: usize) -> (Vec<f64>, Vec<f64>) {
         let mut h = vec![0.0_f64; n_rows * r * r];
         let mut v = vec![0.0_f64; n_rows * r];

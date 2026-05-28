@@ -622,6 +622,7 @@ pub struct DeviceMarginalTable {
 /// NVRTC module-cache key. The module is specialised at compile-time by
 /// (D, AMAX, NALPHA, hashed alpha/derivative tables, output layout, CC) so a
 /// re-fit with the same spec resolves to a cache hit.
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct HexMomentModuleKey {
     cc_major: i32,
@@ -637,6 +638,7 @@ struct HexMomentModuleKey {
 /// 64-bit FNV-style hash of the alpha multi-index table. Stable across runs;
 /// used as part of the module cache key so two specs with the same alpha grid
 /// share one NVRTC compile.
+#[cfg(target_os = "linux")]
 fn hash_alpha_table(alphas: &[Vec<u8>]) -> u64 {
     let mut h = DefaultHasher::new();
     (alphas.len() as u64).hash(&mut h);
@@ -649,6 +651,7 @@ fn hash_alpha_table(alphas: &[Vec<u8>]) -> u64 {
     h.finish()
 }
 
+#[cfg(target_os = "linux")]
 fn hash_deriv_table(deriv_left: &[Vec<u8>], deriv_right: &[Vec<u8>]) -> u64 {
     let mut h = DefaultHasher::new();
     (deriv_left.len() as u64).hash(&mut h);
@@ -669,6 +672,7 @@ fn hash_deriv_table(deriv_left: &[Vec<u8>], deriv_right: &[Vec<u8>]) -> u64 {
 }
 
 #[inline]
+#[cfg(target_os = "linux")]
 fn layout_tag(layout: MomentLayout) -> u8 {
     match layout {
         MomentLayout::AlphaMajor => 0,
@@ -691,6 +695,7 @@ fn layout_tag(layout: MomentLayout) -> u8 {
 /// `alpha_table[NALPHA][D]` carries the exponent multi-indices for the spec.
 /// Output is alpha-major with stride `((n_cells+31)/32)*32` so consecutive
 /// threads write coalesced f64s on Volta+.
+#[cfg(target_os = "linux")]
 fn build_hex_tensor_kernel_source(d: usize, amax: usize, alphas: &[Vec<u8>]) -> String {
     let nalpha = alphas.len();
     let mut alpha_decl = String::new();
@@ -1307,6 +1312,7 @@ impl TetrahedralMomentSpec {
 
 /// 64-bit FNV-style hash of the β multi-index table for the NVRTC module
 /// cache key.
+#[cfg(target_os = "linux")]
 fn hash_beta_table(betas: &[Vec<u8>]) -> u64 {
     let mut h = DefaultHasher::new();
     (betas.len() as u64).hash(&mut h);
@@ -1320,6 +1326,7 @@ fn hash_beta_table(betas: &[Vec<u8>]) -> u64 {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[cfg(target_os = "linux")]
 struct TetMomentModuleKey {
     cc_major: i32,
     cc_minor: i32,
@@ -1490,6 +1497,7 @@ pub fn tetrahedral_geom_moment_cpu(
 /// Generate NVRTC C++ source for the geometric-moment kernel. One thread =
 /// one (tet, β-slot). The β multi-index table is baked in as a
 /// `__constant__` array so the per-axis loop unrolls.
+#[cfg(target_os = "linux")]
 fn build_tet_geom_kernel_source(d: usize, betas: &[Vec<u8>]) -> String {
     let nbeta = betas.len();
     let beta_total_max: u32 = betas
@@ -1672,6 +1680,7 @@ extern "C" __global__ void tetrahedral_geom_moments_kernel(
 /// thread = one (cell, α-slot, pair-slot). Reads the per-tet geometric
 /// moment table emitted by stage 1 plus the per-cell weight tensor and
 /// accumulates the basis-pair moment for the cell.
+#[cfg(target_os = "linux")]
 fn build_tet_contract_kernel_source(nalpha: usize, nbeta: usize, pairs: usize) -> String {
     format!(
         r#"
@@ -2477,6 +2486,7 @@ mod cubic_bspline_moments_tests {
     /// host-side guard that the NVRTC template stays callable from the dispatcher
     /// even when nobody can run NVRTC (macOS CI). Compiles only on rendering.
     #[test]
+    #[cfg(target_os = "linux")]
     fn hex_tensor_kernel_source_contains_required_symbols() {
         let alphas = vec![vec![0u8, 0u8], vec![1, 0], vec![0, 1], vec![2, 1]];
         let src = super::build_hex_tensor_kernel_source(2, 2, &alphas);
@@ -2509,6 +2519,7 @@ mod cubic_bspline_moments_tests {
     /// whenever any byte in the table changes. Required so the NVRTC module
     /// cache key stays canonical for the same spec.
     #[test]
+    #[cfg(target_os = "linux")]
     fn alpha_table_hash_is_stable_and_sensitive() {
         let a = vec![vec![0u8, 0u8], vec![1, 0], vec![0, 1]];
         let b = vec![vec![0u8, 0u8], vec![1, 0], vec![0, 1]];
@@ -2695,6 +2706,7 @@ mod cubic_bspline_moments_tests {
     /// host dispatcher looks up by name. Catches any future rename that
     /// would surface only as a runtime "function not found" failure.
     #[test]
+    #[cfg(target_os = "linux")]
     fn tetrahedral_kernel_sources_contain_required_symbols() {
         let betas = vec![vec![0u8, 0, 0], vec![1, 0, 0]];
         let geom_src = super::build_tet_geom_kernel_source(3, &betas);
