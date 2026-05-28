@@ -1436,6 +1436,7 @@ impl ArrowSchurSystem {
             row_hessian_fingerprint: 0,
             analytic_row_hessian_fingerprint: 0,
             block_offsets: Arc::from([] as [Range<usize>; 0]),
+            penalty_op: None,
         };
         sys.refresh_row_hessian_fingerprint();
         sys

@@ -6,13 +6,10 @@
 //! entry in that row's `H_tβ` slab — i.e. both blocks actively couple to
 //! the latent coordinate for that observation.
 //!
-//! The graph is used by [`ClusterJacobiPreconditioner`] (connected-component
-//! partition) and [`AdditiveSchwarzPreconditioner`] (1-hop neighbourhood
-//! expansion). Both preconditioners are built on top of this graph rather
-//! than duplicating the connectivity scan.
-//!
-//! [`ClusterJacobiPreconditioner`]: super::arrow_schur::ClusterJacobiPreconditioner
-//! [`AdditiveSchwarzPreconditioner`]: super::arrow_schur::AdditiveSchwarzPreconditioner
+//! The graph is used by `ClusterJacobiPreconditioner` (connected-component
+//! partition) and `AdditiveSchwarzPreconditioner` (1-hop neighbourhood
+//! expansion), both defined in `arrow_schur`. Both preconditioners build on
+//! top of this graph rather than duplicating the connectivity scan.
 
 use ndarray::Array2;
 use std::ops::Range;
