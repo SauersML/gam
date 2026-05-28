@@ -7690,6 +7690,7 @@ fn with_identifiability_transform(
             identifiability_transform,
             periodic,
             degree,
+            auto_shrink_note,
         } => Ok(BasisMetadata::BSpline1D {
             knots: knots.clone(),
             periodic: *periodic,
@@ -7698,6 +7699,7 @@ fn with_identifiability_transform(
                 transform,
             )?,
             degree: *degree,
+            auto_shrink_note: auto_shrink_note.clone(),
         }),
         BasisMetadata::ThinPlate {
             centers,

@@ -5457,6 +5457,11 @@ pub struct SmoothTermSummary {
     pub chi_sq: Option<f64>,
     pub pvalue: Option<f64>,
     pub continuous_order: Option<ContinuousSmoothnessOrder>,
+    /// Issue #340: human-readable note describing an automatic B-spline
+    /// basis-shrink performed at fit time when `n` was too small for the
+    /// user's requested `(degree, num_internal_knots)`. `None` means no
+    /// shrink occurred (or the term is not a B-spline 1D smooth).
+    pub basis_note: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
