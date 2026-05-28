@@ -322,6 +322,7 @@ fn build_biobank_like_aliased_specs() -> Vec<gam::families::custom_family::Param
             initial_log_lambdas: Array1::<f64>::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
+            eta_row_scaling: None,
         });
     }
     specs
