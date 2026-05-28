@@ -8192,6 +8192,11 @@ fn dense_fisher_gaussian_fit_to_pydict<'py>(
     Ok(out.unbind())
 }
 
+/// Numerically stable logistic CDF used by `numerics_sigmoid_stable` (a
+/// scalar Python helper exposed to the gamfit numerics module). The
+/// multi-output penalised fitter no longer needs this helper directly —
+/// it routes through `gam::families::binomial_multi` whose internal
+/// `sigmoid_stable` lives in the Rust core.
 fn sigmoid_stable(eta: f64) -> f64 {
     if eta >= 0.0 {
         let e = (-eta).exp();
@@ -8202,54 +8207,50 @@ fn sigmoid_stable(eta: f64) -> f64 {
     }
 }
 
-/// Local FFI shim delegating to the canonical
-/// [`gam::families::vector_response::MultinomialLogitLikelihood::softmax_with_baseline`].
+/// FFI shim wrapping the canonical multi-output penalized fitters at fixed λ.
 ///
-/// The math is single-sourced in the Rust core; this wrapper preserves the
-/// existing call sites inside `dense_fisher_glm_fit_to_pydict` (a
-/// latent-coordinate path with its own dict-shape contract) without
-/// duplicating the softmax implementation.
-fn softmax_with_baseline(eta_active: &[f64], out: &mut [f64]) {
-    gam::families::vector_response::MultinomialLogitLikelihood::softmax_with_baseline(
-        eta_active, out,
-    );
-}
-
-fn dense_fisher_glm_fit_to_pydict<'py>(
+/// Dispatches to either
+/// [`gam::families::multinomial::fit_penalized_multinomial`] (softmax
+/// reference-coded multinomial-logit, `K − 1` active classes coupled by the
+/// dense per-row Fisher block `μ_a δ_{ab} − μ_a μ_b`) or
+/// [`gam::families::binomial_multi::fit_penalized_binomial_multi`] (`K`
+/// independent binomial-logit columns with row-diagonal Fisher
+/// `μ_a (1 − μ_a)`). REML / LAML λ selection is not performed on this
+/// latent-coordinate path; `init_lambda` is taken as the fixed smoothing
+/// parameter and the `reml_grad_*` / `reml_hess_*` diagnostic fields stay
+/// NaN, matching the prior `dense_fisher_glm_fit_to_pydict` dict-shape
+/// contract that downstream Python callers consume.
+fn latent_multi_output_fit_to_pydict<'py>(
     py: Python<'py>,
     design: ArrayView2<'_, f64>,
     y: ArrayView2<'_, f64>,
     penalty: ArrayView2<'_, f64>,
     weights: Option<ArrayView1<'_, f64>>,
-    fisher_w: Option<ArrayView3<'_, f64>>,
     init_lambda: Option<f64>,
     family_name: &str,
     latent_prior_score: f64,
     aux_strength_state: Option<LatentAuxStrengthState>,
 ) -> PyResult<Py<PyDict>> {
     let n_obs = design.nrows();
-    let k = design.ncols();
+    let p = design.ncols();
     let n_outputs = y.ncols();
     if y.nrows() != n_obs || n_outputs == 0 {
         return Err(py_value_error(format!(
-            "dense Fisher GLM response shape mismatch: X has {n_obs} rows, y is {}x{}",
+            "multi-output GLM latent response shape mismatch: X has {n_obs} rows, y is {}x{}",
             y.nrows(),
             y.ncols()
         )));
     }
     if y.iter().any(|v| !v.is_finite()) {
         return Err(py_value_error(
-            "dense Fisher GLM response must be finite".to_string(),
+            "multi-output GLM latent response must be finite".to_string(),
         ));
-    }
-    if let Some(fw) = fisher_w.as_ref() {
-        validate_dense_fisher_w(n_obs, n_outputs, fw.view()).map_err(py_value_error)?;
     }
     let row_weights = latent_row_weights(n_obs, weights).map_err(py_value_error)?;
     let lambda = init_lambda.unwrap_or(1.0);
     if !(lambda.is_finite() && lambda > 0.0) {
         return Err(py_value_error(format!(
-            "init_lambda must be finite and positive for dense Fisher GLM fit; got {lambda}"
+            "init_lambda must be finite and positive for multi-output GLM latent fit; got {lambda}"
         )));
     }
     let normalized = family_name.to_ascii_lowercase().replace('_', "-");
@@ -8268,160 +8269,94 @@ fn dense_fisher_glm_fit_to_pydict<'py>(
     }
     if !(multinomial || binomial_multi) {
         return Err(py_value_error(format!(
-            "dense multi-output GLM latent supports binomial-logit and multinomial-logit; got {family_name:?}"
+            "multi-output GLM latent supports binomial-logit and multinomial-logit; got {family_name:?}"
         )));
     }
 
+    // Per-class smoothing pulled from `init_lambda`: the latent path is a
+    // fixed-λ inner solve, so every active class shares the same λ. REML
+    // selection per class is a separate slice (issue #349 follow-up).
     let active_outputs = if multinomial {
         n_outputs - 1
     } else {
         n_outputs
     };
-    let mut coefficients_active = Array2::<f64>::zeros((k, active_outputs));
-    let mut fitted = Array2::<f64>::zeros((n_obs, n_outputs));
-    let mut h_blocks = Array3::<f64>::zeros((n_obs, active_outputs, active_outputs));
-    let mut gradient = Array1::<f64>::zeros(k * active_outputs);
+    let lambdas_vec = Array1::<f64>::from_elem(active_outputs, lambda);
+
     let max_iter = 50usize;
     let tol = 1.0e-7_f64;
-    let mut iterations = 0usize;
-    let mut converged = false;
 
-    for iter in 0..max_iter {
-        iterations = iter + 1;
-        gradient.fill(0.0);
-        h_blocks.fill(0.0);
-        if multinomial {
-            let mut eta = vec![0.0_f64; active_outputs];
-            let mut probs = vec![0.0_f64; n_outputs];
-            for row in 0..n_obs {
-                for a in 0..active_outputs {
-                    let mut v = 0.0_f64;
-                    for col in 0..k {
-                        v += design[[row, col]] * coefficients_active[[col, a]];
-                    }
-                    eta[a] = v;
-                }
-                softmax_with_baseline(&eta, &mut probs);
-                for a in 0..n_outputs {
-                    fitted[[row, a]] = probs[a];
-                }
-                for a in 0..active_outputs {
-                    let resid = probs[a] - y[[row, a]];
-                    for col in 0..k {
-                        gradient[a * k + col] += row_weights[row] * design[[row, col]] * resid;
-                    }
-                    for b in 0..active_outputs {
-                        h_blocks[[row, a, b]] = if let Some(fw) = fisher_w.as_ref() {
-                            fw[[row, a, b]]
-                        } else if a == b {
-                            probs[a] * (1.0 - probs[a])
-                        } else {
-                            -probs[a] * probs[b]
-                        };
-                    }
-                }
-            }
-        } else {
-            for row in 0..n_obs {
-                for a in 0..active_outputs {
-                    let mut eta = 0.0_f64;
-                    for col in 0..k {
-                        eta += design[[row, col]] * coefficients_active[[col, a]];
-                    }
-                    let mu = sigmoid_stable(eta);
-                    fitted[[row, a]] = mu;
-                    let resid = mu - y[[row, a]];
-                    for col in 0..k {
-                        gradient[a * k + col] += row_weights[row] * design[[row, col]] * resid;
-                    }
-                }
-                for a in 0..active_outputs {
-                    for b in 0..active_outputs {
-                        h_blocks[[row, a, b]] = if let Some(fw) = fisher_w.as_ref() {
-                            fw[[row, a, b]]
-                        } else if a == b {
-                            fitted[[row, a]] * (1.0 - fitted[[row, a]])
-                        } else {
-                            0.0
-                        };
-                    }
-                }
-            }
-        }
-        let mut hessian =
-            gam::pirls::dense_block_xtwx(design, h_blocks.view(), Some(row_weights.view()))
-                .map_err(|err| py_value_error(err.to_string()))?;
-        add_block_diagonal_penalty(&mut hessian, penalty, lambda, active_outputs)
-            .map_err(py_value_error)?;
-        for a in 0..active_outputs {
-            let beta_col = coefficients_active.column(a);
-            let s_beta = penalty.dot(&beta_col);
-            for col in 0..k {
-                gradient[a * k + col] += lambda * s_beta[col];
-            }
-        }
-        let rhs = gradient.mapv(|v| -v);
-        let delta =
-            solve_dense_block_system(&hessian, &rhs, "dense Fisher GLM").map_err(py_value_error)?;
-        let mut step_norm = 0.0_f64;
-        for a in 0..active_outputs {
-            for col in 0..k {
-                let d = delta[a * k + col];
-                coefficients_active[[col, a]] += d;
-                step_norm += d * d;
-            }
-        }
-        if step_norm.sqrt()
-            <= tol
-                * (1.0
-                    + coefficients_active
-                        .iter()
-                        .map(|v| v * v)
-                        .sum::<f64>()
-                        .sqrt())
-        {
-            converged = true;
-            break;
-        }
-    }
+    // Coefficients matrix `(P, K)` with reference-class column zeroed for
+    // the multinomial branch (so the wire-level shape matches the prior
+    // `dense_fisher_glm_fit_to_pydict` contract).
+    let mut coefficients = Array2::<f64>::zeros((p, n_outputs));
+    let fitted: Array2<f64>;
+    let iterations: usize;
+    let converged: bool;
+    let penalized_neg_log_likelihood: f64;
 
-    let mut objective = latent_prior_score;
     if multinomial {
-        for row in 0..n_obs {
-            for a in 0..n_outputs {
-                objective -= row_weights[row] * y[[row, a]] * fitted[[row, a]].max(1.0e-12).ln();
+        let outputs = gam::families::multinomial::fit_penalized_multinomial(
+            gam::families::multinomial::MultinomialFitInputs {
+                design,
+                y_one_hot: y,
+                penalty,
+                lambdas: lambdas_vec.view(),
+                row_weights: Some(row_weights.view()),
+                max_iter,
+                tol,
+            },
+        )
+        .map_err(|err| py_value_error(err.to_string()))?;
+        // Pack the (P, K-1) active coefficients into the (P, K) wire shape;
+        // reference class column K-1 stays zero by construction.
+        for a in 0..active_outputs {
+            for col in 0..p {
+                coefficients[[col, a]] = outputs.coefficients_active[[col, a]];
             }
         }
+        fitted = outputs.fitted_probabilities;
+        iterations = outputs.iterations;
+        converged = outputs.converged;
+        penalized_neg_log_likelihood = outputs.penalized_neg_log_likelihood;
     } else {
-        for row in 0..n_obs {
-            for a in 0..n_outputs {
-                let mu = fitted[[row, a]].clamp(1.0e-12, 1.0 - 1.0e-12);
-                objective -= row_weights[row]
-                    * (y[[row, a]] * mu.ln() + (1.0 - y[[row, a]]) * (1.0 - mu).ln());
-            }
-        }
+        let outputs = gam::families::binomial_multi::fit_penalized_binomial_multi(
+            gam::families::binomial_multi::BinomialMultiFitInputs {
+                design,
+                y,
+                penalty,
+                lambdas: lambdas_vec.view(),
+                row_weights: Some(row_weights.view()),
+                max_iter,
+                tol,
+            },
+        )
+        .map_err(|err| py_value_error(err.to_string()))?;
+        coefficients = outputs.coefficients;
+        fitted = outputs.fitted_probabilities;
+        iterations = outputs.iterations;
+        converged = outputs.converged;
+        penalized_neg_log_likelihood = outputs.penalized_neg_log_likelihood;
     }
-    for a in 0..active_outputs {
-        let beta_col = coefficients_active.column(a);
-        let s_beta = penalty.dot(&beta_col);
-        objective += 0.5 * lambda * beta_col.dot(&s_beta);
-    }
-    let mut coefficients = Array2::<f64>::zeros((k, n_outputs));
-    for a in 0..active_outputs {
-        for col in 0..k {
-            coefficients[[col, a]] = coefficients_active[[col, a]];
-        }
-    }
+
+    // `reml_score` on this fixed-λ path is the penalized negative
+    // log-likelihood plus the latent prior / analytic penalty contribution
+    // pre-summed in `latent_prior_score`. The full REML log-marginal would
+    // additionally include the log|H| / log|S| Laplace terms; those are
+    // not computed here (consistent with the prior contract, which left
+    // every `reml_grad_*` / `reml_hess_*` field NaN).
+    let reml_score = penalized_neg_log_likelihood + latent_prior_score;
+
     let out = PyDict::new(py);
     out.set_item("status", if converged { "ok" } else { "not_converged" })?;
     out.set_item("lambda", lambda)?;
     out.set_item("rho", lambda.ln())?;
-    out.set_item("reml_score", objective)?;
+    out.set_item("reml_score", reml_score)?;
     out.set_item("reml_grad_lambda", f64::NAN)?;
     out.set_item("reml_hess_lambda", f64::NAN)?;
     out.set_item("reml_grad_rho", f64::NAN)?;
     out.set_item("reml_hess_rho", f64::NAN)?;
-    out.set_item("edf", (k * active_outputs) as f64)?;
+    out.set_item("edf", (p * active_outputs) as f64)?;
     out.set_item("coefficients", coefficients.into_pyarray(py))?;
     out.set_item("fitted", fitted.into_pyarray(py))?;
     out.set_item("sigma2", Array1::<f64>::ones(n_outputs).into_pyarray(py))?;
@@ -12217,6 +12152,17 @@ fn glm_reml_fit_latent<'py>(
             "multinomial" | "multinomial-logit" | "softmax" | "categorical-logit"
         )
     {
+        // Per-row Fisher-block override is deferred for the multi-output
+        // paths (issue #349). The scalar-output branch below still honours
+        // `fisher_w` via `latent_scalar_weights_with_fisher`; refusing it
+        // here is preferable to silently dropping the user's override.
+        if fisher_values.is_some() {
+            return Err(py_value_error(format!(
+                "glm_reml_fit_latent: per-row fisher_w override is not currently supported \
+                 on the multi-output ({family_name:?}) branch; pass fisher_w=None or use the \
+                 scalar single-output path. See https://github.com/SauersML/gam/issues/349."
+            )));
+        }
         let (design, t_mat) = build_latent_duchon_design(
             t_values.view(),
             n_obs,
@@ -12235,13 +12181,12 @@ fn glm_reml_fit_latent<'py>(
         .map_err(py_value_error)?;
         let analytic_score = analytic_penalty_value_for_targets(&registry, t_values.view(), None)
             .map_err(py_value_error)?;
-        return dense_fisher_glm_fit_to_pydict(
+        return latent_multi_output_fit_to_pydict(
             py,
             design.view(),
             y_values.view(),
             penalty_values.view(),
             weight_values.as_ref().map(|w| w.view()),
-            fisher_values.as_ref().map(|w| w.view()),
             init_lambda,
             &family_name,
             prior_score + analytic_score,
