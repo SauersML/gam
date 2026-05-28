@@ -4574,6 +4574,7 @@ fn prepare_survival_location_scale_model(
             initial_beta: w.initial_beta.clone(),
             gauge_priority: 100,
             jacobian_callback: None,
+            audit_design: None,
         })
     } else {
         None
@@ -11279,6 +11280,7 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
+            audit_design: None,
         };
         let specs = vec![
             mk_spec("time", p_time),
@@ -11310,6 +11312,7 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
+            audit_design: None,
         };
         let specs = vec![
             mk_spec("time", 200),
@@ -11343,6 +11346,7 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
+            audit_design: None,
         };
         let specs = vec![
             mk_spec("time", 200),
@@ -11380,6 +11384,7 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
+            audit_design: None,
         };
 
         let feasible = family
@@ -11522,6 +11527,7 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
+            audit_design: None,
         };
         let returned = family
             .post_update_block_beta(
@@ -11765,6 +11771,7 @@ mod tests {
                 initial_beta: Some(array![0.2]),
                 gauge_priority: 100,
                 jacobian_callback: None,
+                audit_design: None,
             },
             ParameterBlockSpec {
                 name: "threshold".to_string(),
@@ -11780,6 +11787,7 @@ mod tests {
                 initial_beta: Some(array![0.35]),
                 gauge_priority: 100,
                 jacobian_callback: None,
+                audit_design: None,
             },
             ParameterBlockSpec {
                 name: "log_sigma".to_string(),
@@ -11795,6 +11803,7 @@ mod tests {
                 initial_beta: Some(array![-0.15]),
                 gauge_priority: 100,
                 jacobian_callback: None,
+                audit_design: None,
             },
         ]
     }
