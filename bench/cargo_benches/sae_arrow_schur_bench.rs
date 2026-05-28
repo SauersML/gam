@@ -26,7 +26,7 @@ use ndarray::{Array1, Array2, Array3};
 use std::hint::black_box;
 use std::time::Instant;
 
-use gam::solver::arrow_schur::{ArrowSchurSystem, ArrowSolveOptions};
+use gam::solver::arrow_schur::ArrowSolveOptions;
 use gam::terms::{
     AssignmentMode, SaeAssignment, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho,
     SaeManifoldTerm,
@@ -193,7 +193,7 @@ fn bench_assembly_softmax(c: &mut Criterion) {
 
     for cfg in CONFIGS_CI {
         let mode = AssignmentMode::softmax(1.0);
-        let (term, target) = build_term(cfg, mode);
+        let (mut term, target) = build_term(cfg, mode);
         let rho = build_rho(cfg);
         let id = BenchmarkId::new("assemble", label(cfg, "softmax"));
 
@@ -221,7 +221,7 @@ fn bench_assembly_jumprelu(c: &mut Criterion) {
     for cfg in CONFIGS_CI {
         // JumpReLU at threshold=0.0 → ~50% active fraction (sigmoid(0)=0.5).
         let mode = AssignmentMode::jumprelu(1.0, 0.0);
-        let (term, target) = build_term(cfg, mode);
+        let (mut term, target) = build_term(cfg, mode);
         let rho = build_rho(cfg);
         let id = BenchmarkId::new("assemble", label(cfg, "jumprelu"));
 
@@ -248,7 +248,7 @@ fn bench_solve_direct(c: &mut Criterion) {
 
     for cfg in CONFIGS_CI {
         let mode = AssignmentMode::softmax(1.0);
-        let (term, target) = build_term(cfg, mode);
+        let (mut term, target) = build_term(cfg, mode);
         let rho = build_rho(cfg);
         let sys = term
             .assemble_arrow_schur(target.view(), &rho, None)
@@ -279,7 +279,7 @@ fn bench_solve_pcg(c: &mut Criterion) {
 
     for cfg in CONFIGS_CI {
         let mode = AssignmentMode::softmax(1.0);
-        let (term, target) = build_term(cfg, mode);
+        let (mut term, target) = build_term(cfg, mode);
         let rho = build_rho(cfg);
         let sys = term
             .assemble_arrow_schur(target.view(), &rho, None)
@@ -350,7 +350,7 @@ fn bench_biobank_assembly(c: &mut Criterion) {
             ("softmax", AssignmentMode::softmax(1.0)),
             ("jumprelu", AssignmentMode::jumprelu(1.0, 0.0)),
         ] {
-            let (term, target) = build_term(cfg, mode);
+            let (mut term, target) = build_term(cfg, mode);
             let rho = build_rho(cfg);
             let id = BenchmarkId::new("assemble", label(cfg, variant));
 
