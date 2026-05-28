@@ -2912,30 +2912,30 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
             self.wiggle_block.penalties.len(),
         );
         layout.validate_theta_len(theta.len(), "gaussian location-scale wiggle")?;
-        let mut meanspec = ParameterBlockSpec {
-            name: "mu".to_string(),
-            design: mean_design.design.clone(),
-            offset: self.mean_offset.clone(),
-            penalties: mean_design.penalties_as_penalty_matrix(),
-            nullspace_dims: vec![],
-            initial_log_lambdas: layout.mean_from(theta),
-            initial_beta: mean_beta_hint,
-            gauge_priority: 100,
-            jacobian_callback: None,
-            audit_design: None,
-        };
-        let mut noisespec = ParameterBlockSpec {
-            name: "log_sigma".to_string(),
-            design: prepared_gaussian_log_sigma_design(&mean_design.design, &noise_design.design)?,
-            offset: self.noise_offset.clone(),
-            penalties: noise_design.penalties_as_penalty_matrix(),
-            nullspace_dims: vec![],
-            initial_log_lambdas: layout.noise_from(theta),
-            initial_beta: noise_beta_hint,
-            gauge_priority: 100,
-            jacobian_callback: None,
-            audit_design: None,
-        };
+        let mut meanspec = build_location_scale_block(
+            "mu",
+            mean_design.design.clone(),
+            self.mean_offset.clone(),
+            mean_design.penalties_as_penalty_matrix(),
+            vec![],
+            layout.mean_from(theta),
+            mean_beta_hint,
+            0,
+            LOCATION_SCALE_N_OUTPUTS,
+            "GaussianLocationScaleWiggle::build_blocks: mu",
+        )?;
+        let mut noisespec = build_location_scale_block(
+            "log_sigma",
+            prepared_gaussian_log_sigma_design(&mean_design.design, &noise_design.design)?,
+            self.noise_offset.clone(),
+            noise_design.penalties_as_penalty_matrix(),
+            vec![],
+            layout.noise_from(theta),
+            noise_beta_hint,
+            1,
+            LOCATION_SCALE_N_OUTPUTS,
+            "GaussianLocationScaleWiggle::build_blocks: log_sigma",
+        )?;
         if meanspec.initial_beta.is_none() || noisespec.initial_beta.is_none() {
             let (betamu0, beta_ls0, _) = gaussian_location_scalewarm_start(
                 &self.y,
@@ -2953,44 +2953,39 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
                 noisespec.initial_beta = Some(beta_ls0);
             }
         }
-        let mut wigglespec = ParameterBlockSpec {
-            name: "wiggle".to_string(),
-            design: self.wiggle_block.design.clone(),
-            offset: self.wiggle_block.offset.clone(),
-            penalties: {
-                let p_wiggle = self.wiggle_block.design.ncols();
-                self.wiggle_block
-                    .penalties
-                    .iter()
-                    .map(|spec| match spec {
-                        crate::solver::estimate::PenaltySpec::Block {
-                            local,
-                            col_range,
-                            ..
-                        } => PenaltyMatrix::Blockwise {
-                            local: local.clone(),
-                            col_range: col_range.clone(),
-                            total_dim: p_wiggle,
-                        },
-                        crate::solver::estimate::PenaltySpec::Dense(m)
-                        | crate::solver::estimate::PenaltySpec::DenseWithMean {
-                            matrix: m,
-                            ..
-                        } => PenaltyMatrix::Dense(m.clone()),
-                    })
-                    .collect()
-            },
-            nullspace_dims: self.wiggle_block.nullspace_dims.clone(),
-            initial_log_lambdas: layout.wiggle_from(theta),
-            initial_beta: self.wiggle_block.initial_beta.clone(),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            audit_design: None,
+        let n_rows = meanspec.design.nrows();
+        let wiggle_penalties: Vec<PenaltyMatrix> = {
+            let p_wiggle = self.wiggle_block.design.ncols();
+            self.wiggle_block
+                .penalties
+                .iter()
+                .map(|spec| match spec {
+                    crate::solver::estimate::PenaltySpec::Block {
+                        local,
+                        col_range,
+                        ..
+                    } => PenaltyMatrix::Blockwise {
+                        local: local.clone(),
+                        col_range: col_range.clone(),
+                        total_dim: p_wiggle,
+                    },
+                    crate::solver::estimate::PenaltySpec::Dense(m)
+                    | crate::solver::estimate::PenaltySpec::DenseWithMean {
+                        matrix: m,
+                        ..
+                    } => PenaltyMatrix::Dense(m.clone()),
+                })
+                .collect()
         };
-        install_additive_callbacks_two_block_with_wiggle(
-            &mut meanspec,
-            &mut noisespec,
-            &mut wigglespec,
+        let wigglespec = build_location_scale_wiggle_block(
+            "wiggle",
+            self.wiggle_block.design.clone(),
+            self.wiggle_block.offset.clone(),
+            wiggle_penalties,
+            self.wiggle_block.nullspace_dims.clone(),
+            layout.wiggle_from(theta),
+            self.wiggle_block.initial_beta.clone(),
+            n_rows,
         )?;
         Ok(vec![meanspec, noisespec, wigglespec])
     }

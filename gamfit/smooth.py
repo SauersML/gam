@@ -536,6 +536,19 @@ class Pca(Smooth):
         from ._basis_eval import pca_evaluate_numpy
         return pca_evaluate_numpy(self, coords)
 
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        out = super().to_rust_descriptor()
+        if self.K is not None:
+            out["K"] = int(self.K)
+        if self.basis is not None:
+            out["basis"] = _array_to_list(self.basis)
+        if self.lazy_path is not None:
+            out["lazy_path"] = str(self.lazy_path)
+        out["chunk_size"] = int(self.chunk_size)
+        out["centered"] = bool(self.centered)
+        out["smooth_penalty"] = float(self.smooth_penalty)
+        return out
+
     SUPPORTED_BACKENDS: ClassVar[frozenset[str]] = frozenset({"torch", "numpy", "jax"})
 
 
@@ -656,6 +669,16 @@ class Sphere(Smooth):
     def _evaluate_torch(self, coords: Any) -> Any:
         from ._basis_eval import sphere_evaluate
         return sphere_evaluate(self, coords)
+
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        out = super().to_rust_descriptor()
+        out["n_centers"] = int(self.n_centers)
+        out["penalty_order"] = int(self.penalty_order)
+        out["kernel"] = str(self.kernel)
+        out["radians"] = bool(self.radians)
+        if self.centers is not None:
+            out["centers"] = _array_to_list(self.centers)
+        return out
 
     SUPPORTED_BACKENDS: ClassVar[frozenset[str]] = frozenset({"torch", "numpy", "jax"})
 
