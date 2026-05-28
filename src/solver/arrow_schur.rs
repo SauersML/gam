@@ -2057,13 +2057,23 @@ impl ArrowFactorCache {
         (0..self.undamped_factor_count()).map(|row| self.undamped_factor(row))
     }
 
+    /// The total length of `delta_t` / IFT output vectors for this cache.
+    pub fn delta_t_len(&self) -> usize {
+        self.row_offsets[self.n_rows()]
+    }
+
     pub fn apply_htbeta_row(
         &self,
         row: usize,
         delta_beta: ArrayView1<'_, f64>,
         out: &mut Array1<f64>,
     ) -> bool {
-        if out.len() != self.d || delta_beta.len() != self.k {
+        let di = if row < self.row_dims.len() {
+            self.row_dims[row]
+        } else {
+            self.d
+        };
+        if out.len() != di || delta_beta.len() != self.k {
             return false;
         }
         self.htbeta.apply_row(row, delta_beta, out)
@@ -2071,10 +2081,10 @@ impl ArrowFactorCache {
 
     /// Accumulate `out[a] += H_βt^(row)[a, :] · v` for all `a in 0..k`.
     ///
-    /// `v` has length `d`; `out` has length `k`. The caller must zero `out`
-    /// before the first call if it needs a fresh result.  Returns `false` when
-    /// the cache is `Disabled` and no `fallback_op` is provided; callers must
-    /// treat the accumulator as invalid in that case.
+    /// `v` has length `row_dims[row]`; `out` has length `k`. The caller must
+    /// zero `out` before the first call if it needs a fresh result.  Returns
+    /// `false` when the cache is `Disabled` and no `fallback_op` is provided;
+    /// callers must treat the accumulator as invalid in that case.
     pub fn apply_htbeta_row_transpose(
         &self,
         row: usize,
@@ -2082,15 +2092,20 @@ impl ArrowFactorCache {
         out: &mut Array1<f64>,
         fallback_op: Option<&RowHtbetaMatvec>,
     ) -> bool {
-        if v.len() != self.d || out.len() != self.k {
+        let di = if row < self.row_dims.len() {
+            self.row_dims[row]
+        } else {
+            self.d
+        };
+        if v.len() != di || out.len() != self.k {
             return false;
         }
         self.htbeta
-            .apply_row_transpose_accumulate(row, v, out, self.d, self.k, fallback_op)
+            .apply_row_transpose_accumulate(row, v, out, di, self.k, fallback_op)
     }
 
     /// Apply `Δt_i = -(H_tt^(i))⁻¹ · (H_tβ^(i) · Δβ)` per row, returning
-    /// the flat row-major `Δt` of length `N · d`.
+    /// the flat `Δt` of total length `row_offsets[N]`.
     ///
     /// IFT first-order predictor for the latent field under a
     /// shape-coefficient perturbation `Δβ`. See
@@ -2098,20 +2113,25 @@ impl ArrowFactorCache {
     /// reduced-camera-system solve.
     pub fn predict_delta_t_from_delta_beta(&self, delta_beta: ArrayView1<'_, f64>) -> Array1<f64> {
         let n = self.undamped_factor_count();
-        let d = self.d;
+        let total_len = self.delta_t_len();
         assert_eq!(delta_beta.len(), self.k);
         if !self.htbeta_available() {
-            return Array1::<f64>::zeros(n * d);
+            return Array1::<f64>::zeros(total_len);
         }
-        let mut out = Array1::<f64>::zeros(n * d);
-        let mut rhs = Array1::<f64>::zeros(d);
+        let mut out = Array1::<f64>::zeros(total_len);
+        let mut rhs = Array1::<f64>::zeros(self.d);
         for i in 0..n {
-            if !self.apply_htbeta_row(i, delta_beta.view(), &mut rhs) {
-                return Array1::<f64>::zeros(n * d);
+            let di = self.row_dims[i];
+            rhs.fill(0.0);
+            let rhs_i = rhs.slice_mut(ndarray::s![..di]);
+            let mut rhs_slice = rhs_i.to_owned();
+            if !self.apply_htbeta_row(i, delta_beta.view(), &mut rhs_slice) {
+                return Array1::<f64>::zeros(total_len);
             }
-            let v = chol_solve_vector(self.undamped_factor(i), &rhs);
-            for c in 0..d {
-                out[i * d + c] = -v[c];
+            let v = chol_solve_vector(self.undamped_factor(i), &rhs_slice);
+            let row_base = self.row_offsets[i];
+            for c in 0..di {
+                out[row_base + c] = -v[c];
             }
         }
         out
@@ -2132,38 +2152,44 @@ impl ArrowFactorCache {
         delta_gt: Option<ArrayView1<'_, f64>>,
     ) -> Array1<f64> {
         let n = self.undamped_factor_count();
-        let d = self.d;
+        let total_len = self.delta_t_len();
         if let Some(db) = delta_beta.as_ref() {
             assert_eq!(db.len(), self.k);
         }
         if let Some(dg) = delta_gt.as_ref() {
-            assert_eq!(dg.len(), n * d);
+            assert_eq!(dg.len(), total_len);
         }
-        let mut out = Array1::<f64>::zeros(n * d);
-        let mut rhs = Array1::<f64>::zeros(d);
-        // Hoist per-row scratch outside the loop; cleared each iteration.
-        let mut htbeta_delta = Array1::<f64>::zeros(d);
+        let mut out = Array1::<f64>::zeros(total_len);
+        // Hoist per-row scratch outside the loop; sized to max_d.
+        let mut rhs = Array1::<f64>::zeros(self.d);
+        let mut htbeta_delta = Array1::<f64>::zeros(self.d);
         for i in 0..n {
-            for c in 0..d {
+            let di = self.row_dims[i];
+            let row_base = self.row_offsets[i];
+            for c in 0..di {
                 rhs[c] = 0.0;
             }
             if let Some(db) = delta_beta.as_ref() {
-                htbeta_delta.fill(0.0);
-                if !self.apply_htbeta_row(i, db.view(), &mut htbeta_delta) {
-                    return Array1::<f64>::zeros(n * d);
+                for c in 0..di {
+                    htbeta_delta[c] = 0.0;
                 }
-                for c in 0..d {
-                    rhs[c] += htbeta_delta[c];
+                let mut htbeta_slice = htbeta_delta.slice_mut(ndarray::s![..di]).to_owned();
+                if !self.apply_htbeta_row(i, db.view(), &mut htbeta_slice) {
+                    return Array1::<f64>::zeros(total_len);
+                }
+                for c in 0..di {
+                    rhs[c] += htbeta_slice[c];
                 }
             }
             if let Some(dg) = delta_gt.as_ref() {
-                for c in 0..d {
-                    rhs[c] += dg[i * d + c];
+                for c in 0..di {
+                    rhs[c] += dg[row_base + c];
                 }
             }
-            let v = chol_solve_vector(self.undamped_factor(i), &rhs);
-            for c in 0..d {
-                out[i * d + c] = -v[c];
+            let rhs_slice = rhs.slice(ndarray::s![..di]).to_owned();
+            let v = chol_solve_vector(self.undamped_factor(i), &rhs_slice);
+            for c in 0..di {
+                out[row_base + c] = -v[c];
             }
         }
         out
@@ -2207,22 +2233,21 @@ impl ArrowFactorCache {
     /// factors for local point updates after shared parameters move.
     pub fn predict_delta_t_from_delta_gt(&self, delta_gt: ArrayView1<'_, f64>) -> Array1<f64> {
         let n = self.undamped_factor_count();
-        let d = self.d;
-        assert_eq!(delta_gt.len(), n * d);
+        let total_len = self.delta_t_len();
+        assert_eq!(delta_gt.len(), total_len);
         assert_eq!(
             self.undamped_factor_count(),
             n,
             "undamped factor cache and N must agree"
         );
-        let mut out = Array1::<f64>::zeros(n * d);
-        let mut rhs = Array1::<f64>::zeros(d);
+        let mut out = Array1::<f64>::zeros(total_len);
         for i in 0..n {
-            for c in 0..d {
-                rhs[c] = delta_gt[i * d + c];
-            }
+            let di = self.row_dims[i];
+            let row_base = self.row_offsets[i];
+            let rhs = delta_gt.slice(ndarray::s![row_base..row_base + di]).to_owned();
             let v = chol_solve_vector(self.undamped_factor(i), &rhs);
-            for c in 0..d {
-                out[i * d + c] = -v[c];
+            for c in 0..di {
+                out[row_base + c] = -v[c];
             }
         }
         out

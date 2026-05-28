@@ -1381,11 +1381,15 @@ pub fn launch_row_reweight_jit_on_stream(
 /// Call once per Newton step on the accepted η. At convergence, call
 /// [`launch_row_reweight_on_stream`] (final-row mode) to populate the full
 /// output surface before downloading.
+///
+/// `gamma_shape`: active Gamma dispersion shape (α > 0). Forwarded as a kernel
+/// argument only for `PirlsRowFamily::GammaLog`. Pass `1.0` for non-Gamma fits.
 #[cfg(target_os = "linux")]
 pub fn launch_solve_row_on_stream(
     backend: &PirlsRowBackend,
     family: PirlsRowFamily,
     curvature: CurvatureMode,
+    gamma_shape: f64,
     stream: &Arc<cudarc::driver::CudaStream>,
     n: usize,
     eta_dev: &cudarc::driver::CudaSlice<f64>,
@@ -1418,13 +1422,18 @@ pub fn launch_solve_row_on_stream(
     builder.arg(eta_dev);
     builder.arg(y_dev);
     builder.arg(prior_w_dev);
+    // GammaLog solve kernel has `double shape` before the output buffers.
+    if matches!(family, PirlsRowFamily::GammaLog) {
+        builder.arg(&gamma_shape);
+    }
     builder.arg(&mut out.grad_eta);
     builder.arg(&mut out.w_solver);
     builder.arg(&mut out.deviance);
     builder.arg(&mut out.status);
-    // SAFETY: solve_row_source_for emits:
+    // SAFETY: solve_row_source_for emits for non-GammaLog:
     //   (int n, const f64* eta, const f64* y, const f64* prior_w,
     //    f64* grad_eta_out, f64* w_solver_out, f64* deviance_out, u32* status_out)
+    // For GammaLog the signature inserts `double shape` after `prior_w`.
     // 4 outputs match the 4 SolveRowBuffers fields; grid covers all n rows with
     // per-thread guard `if (i >= n) return`.
     unsafe { builder.launch(cfg) }

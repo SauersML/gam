@@ -2128,6 +2128,15 @@ extern "C" __global__ void status_or(
             crate::solver::pirls::PirlsStatus::Unstable
         } else if converged {
             crate::solver::pirls::PirlsStatus::Converged
+        } else if diagnostics.step_search_exhausted {
+            // The α-ladder produced no step lowering the *penalized*
+            // objective — exactly the CPU oracle's "no acceptable step
+            // direction even after damping" signal. Distinct from the
+            // iteration-cap exhaustion (MaxIterationsReached) so the
+            // outer REML / LM controller can react (raise damping / try
+            // a different curvature) rather than silently accepting an
+            // ascent step.
+            crate::solver::pirls::PirlsStatus::LmStepSearchExhausted
         } else {
             crate::solver::pirls::PirlsStatus::MaxIterationsReached
         };

@@ -15,8 +15,10 @@
 //! If a test fails because the underlying GPU PIRLS fix has not yet landed,
 //! leave it as-is — it documents the gating contract.
 
+use faer::Side;
 use gam::construction::CanonicalPenalty;
 use gam::estimate::PenaltySpec;
+use gam::faer_ndarray::{FaerArrayView, factorize_symmetricwith_fallback};
 use gam::pirls::{PenaltyConfig, PirlsConfig, PirlsProblem, PirlsStatus, fit_model_for_fixed_rho};
 use gam::solver::gpu::cuda_selected;
 use gam::types::{
@@ -64,13 +66,21 @@ fn binomial_logit_config() -> PirlsConfig {
     }
 }
 
-/// Canonicalize a single dense `p×p` penalty matrix into a `Vec<CanonicalPenalty>`.
+/// Canonicalize a single dense `p×p` penalty matrix.
 fn make_canonical(s: &Array2<f64>, p: usize) -> Vec<CanonicalPenalty> {
     let spec = PenaltySpec::Dense(s.clone());
     gam::construction::canonicalize_penalty_spec(&spec, p, 0, "gpu_pirls_gating")
         .expect("canonicalize_penalty_spec must succeed on a valid dense matrix")
         .into_iter()
         .collect()
+}
+
+/// Solve (A)x = b for symmetric PD matrix A using Cholesky.
+fn chol_solve(a: &Array2<f64>, b: &Array1<f64>) -> Array1<f64> {
+    let av = FaerArrayView::new(a);
+    let factor = factorize_symmetricwith_fallback(av.as_ref(), Side::Lower)
+        .expect("matrix must factorize for chol_solve");
+    factor.solvevec(b)
 }
 
 fn allclose(a: &Array1<f64>, b: &Array1<f64>, tol: f64) -> bool {
@@ -80,27 +90,13 @@ fn allclose(a: &Array1<f64>, b: &Array1<f64>, tol: f64) -> bool {
             .all(|(x, y)| (x - y).abs() <= tol * (1.0_f64.max(x.abs()).max(y.abs())))
 }
 
-/// Solve (A)x = b via Cholesky, returning x as an ndarray Array1.
-fn cholesky_solve(a: &Array2<f64>, b: &Array1<f64>) -> Array1<f64> {
-    use faer::linalg::solvers::Solve;
-    let p = a.nrows();
-    let fa = gam::faer_ndarray::FaerArray2View::from(a.view());
-    let mat = faer::Mat::from_fn(p, p, |i, j| fa[[i, j]]);
-    let chol = mat
-        .cholesky(faer::Side::Lower)
-        .expect("matrix must be PD for cholesky_solve");
-    let rhs = faer::Col::from_fn(p, |i| b[i]);
-    let sol = chol.solve(rhs);
-    Array1::from_shape_fn(p, |i| sol[i])
-}
-
 // ---------------------------------------------------------------------------
 // Test 1 — Newton-sign / Gaussian direction
 //
 // Contract: for Gaussian identity with β₀ = 0 and S = 0 (identity Qs),
-// the PIRLS solution δ must equal (XᵀX)⁻¹ Xᵀy — the OLS solution — NOT
-// its negative.  A wrong sign in the GPU gradient flips the accepted step
-// direction and causes the solver to diverge or converge to -β*.
+// the PIRLS solution must equal (XᵀX)⁻¹ Xᵀy — the OLS solution — NOT
+// its negative.  A wrong gradient sign in the GPU kernel flips the step
+// direction and causes the solver to diverge or return -β*.
 // ---------------------------------------------------------------------------
 #[test]
 fn gpu_pirls_gating_1_newton_sign_gaussian_direction() {
@@ -122,7 +118,7 @@ fn gpu_pirls_gating_1_newton_sign_gaussian_direction() {
     // OLS closed-form: β* = (XᵀX)⁻¹ Xᵀy.
     let xtwx = x.t().dot(&x);
     let xtwy = x.t().dot(&y);
-    let ols_beta = cholesky_solve(&xtwx, &xtwy);
+    let ols_beta = chol_solve(&xtwx, &xtwy);
 
     let canonical: Vec<CanonicalPenalty> = Vec::new();
     let (fit, _) = fit_model_for_fixed_rho(
@@ -150,16 +146,18 @@ fn gpu_pirls_gating_1_newton_sign_gaussian_direction() {
     )
     .expect("Gaussian identity PIRLS must succeed");
 
-    let beta = fit.beta_transformed.as_ref().clone();
+    // Recover original-basis β.
+    let qs = &fit.reparam_result.qs;
+    let beta = qs.dot(fit.beta_transformed.as_ref());
 
-    // Must match OLS to high precision (Gaussian identity is a one-step solve).
+    // Must match OLS (Gaussian identity is a one-step solve).
     assert!(
         allclose(&beta, &ols_beta, 1e-6),
         "GPU PIRLS β must equal (XᵀX)⁻¹ Xᵀy, not its negative. \
          beta={beta:?}, ols_beta={ols_beta:?}"
     );
 
-    // Explicitly verify sign alignment on every coefficient.
+    // Explicitly verify sign alignment on every component with signal.
     for k in 0..p {
         if ols_beta[k].abs() > 1e-10 {
             assert_eq!(
@@ -177,10 +175,10 @@ fn gpu_pirls_gating_1_newton_sign_gaussian_direction() {
 // ---------------------------------------------------------------------------
 // Test 2 — Penalty gradient sign and shift
 //
-// Contract: with non-zero S and linear_shift, the gradient used in the loop
-// must be g = Sβ − linear_shift − Xᵀscore (not +Xᵀscore or −Sβ).  We
-// verify indirectly: the converged β must satisfy KKT stationarity
-// ‖Sβ + Xᵀresid‖ / (1 + ‖β‖) ≈ 0 under a ridge penalty.
+// Contract: with non-zero S and linear_shift, the gradient inside the loop
+// must be g = Sβ − linear_shift − Xᵀscore (not +Xᵀscore or −Sβ).
+// We verify indirectly: the converged β must satisfy the KKT stationarity
+// condition ‖Sβ + Xᵀresid‖ / (1 + ‖β‖) ≈ 0.
 // ---------------------------------------------------------------------------
 #[test]
 fn gpu_pirls_gating_2_penalty_gradient_sign_and_shift() {
@@ -200,7 +198,6 @@ fn gpu_pirls_gating_2_penalty_gradient_sign_and_shift() {
     let offset = Array1::<f64>::zeros(n);
     let weights = Array1::<f64>::ones(n);
 
-    // Non-zero ridge penalty on all coefficients, moderate strength.
     let lambda = 1.0_f64;
     let rho = Array1::from_elem(1, lambda.ln());
     let s = Array2::from_diag(&Array1::ones(p));
@@ -231,13 +228,12 @@ fn gpu_pirls_gating_2_penalty_gradient_sign_and_shift() {
     )
     .expect("penalized Gaussian PIRLS must succeed");
 
-    // At convergence, the KKT condition is (XᵀX + λI)β = Xᵀy,
-    // i.e. g = (XᵀX + λI)β − Xᵀy = Xᵀ(Xβ − y) + λβ ≈ 0.
-    let beta = fit.beta_transformed.as_ref().clone();
+    // KKT condition: (XᵀX + λI)β − Xᵀy = Xᵀ(Xβ − y) + λβ ≈ 0.
+    let qs = &fit.reparam_result.qs;
+    let beta = qs.dot(fit.beta_transformed.as_ref());
     let resid = x.dot(&beta) - &y;
     let xt_resid = x.t().dot(&resid);
-    let s_beta = &beta * lambda;
-    let gradient = &s_beta + &xt_resid;
+    let gradient = &beta * lambda + &xt_resid;
     let grad_norm = gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
     let beta_norm = beta.iter().map(|v| v * v).sum::<f64>().sqrt();
     let relative_grad = grad_norm / (1.0 + beta_norm);
@@ -254,8 +250,7 @@ fn gpu_pirls_gating_2_penalty_gradient_sign_and_shift() {
 // Test 3 — Offset parity
 //
 // Contract: when a non-zero offset is supplied, η = offset + X·β.  The GPU
-// fit must reproduce fit.final_eta == offset + X·β_transformed via the
-// original-basis β.
+// fit must reproduce fit.final_eta == offset + X · beta_original.
 // ---------------------------------------------------------------------------
 #[test]
 fn gpu_pirls_gating_3_offset_parity() {
@@ -303,7 +298,6 @@ fn gpu_pirls_gating_3_offset_parity() {
     )
     .expect("offset-parity Gaussian fit");
 
-    // Recover original-basis β = qs · beta_transformed.
     let qs = &fit.reparam_result.qs;
     let beta_original = qs.dot(fit.beta_transformed.as_ref());
 
@@ -317,11 +311,10 @@ fn gpu_pirls_gating_3_offset_parity() {
 
     assert!(
         max_abs_diff < 1e-8,
-        "GPU PIRLS: offset + X·β_original must equal final_eta. \
+        "GPU PIRLS: offset + X · beta_original must equal final_eta. \
          Max abs diff = {max_abs_diff:.3e}"
     );
 
-    // β must be reasonably close to true_beta (loose check).
     let beta_err = (&beta_original - &true_beta)
         .iter()
         .map(|v| v.abs())
@@ -336,14 +329,14 @@ fn gpu_pirls_gating_3_offset_parity() {
 // ---------------------------------------------------------------------------
 // Test 4 — Penalized line search
 //
-// Contract: construct a step where the penalty inflates more than the raw
-// deviance drops.  The GPU loop must reject α = 1 in that case.
+// Contract: when the penalty inflates more than the raw deviance drops, the
+// GPU loop must reject α = 1 and use a smaller step (or converge to the
+// penalized mode).
 //
-// We use a very strong ridge (λ = 10⁴) with a response y that is far from
-// 0, so the unpenalized OLS solution has large β norm.  Under the strong
-// ridge, the penalized minimum is near β = 0.  The accepted β must have
-// a small norm (< 0.1) — if the line search only checked raw deviance and
-// accepted the full step, β would be far from 0.
+// Setup: very strong ridge (λ = 10⁴) with y far from 0, so the unpenalized
+// OLS β has large norm.  The penalized minimum is near β = 0.  A correct
+// penalized line search shrinks β to small norm; a buggy unpenalized check
+// would accept the full OLS step and produce a large-norm β.
 // ---------------------------------------------------------------------------
 #[test]
 fn gpu_pirls_gating_4_penalized_line_search_rejects_unpenalized_step() {
@@ -361,7 +354,6 @@ fn gpu_pirls_gating_4_penalized_line_search_rejects_unpenalized_step() {
     let offset = Array1::<f64>::zeros(n);
     let weights = Array1::<f64>::ones(n);
 
-    // Very strong ridge: penalized minimum is near β = 0.
     let lambda = 1e4_f64;
     let rho = Array1::from_elem(1, lambda.ln());
     let s = Array2::from_diag(&Array1::ones(p));
@@ -392,9 +384,8 @@ fn gpu_pirls_gating_4_penalized_line_search_rejects_unpenalized_step() {
     )
     .expect("penalized line search test fit");
 
-    let beta = fit.beta_transformed.as_ref().clone();
     let qs = &fit.reparam_result.qs;
-    let beta_orig = qs.dot(&beta);
+    let beta_orig = qs.dot(fit.beta_transformed.as_ref());
     let beta_norm = beta_orig.iter().map(|v| v * v).sum::<f64>().sqrt();
 
     // With λ = 10⁴ the ridge must shrink β to near 0.
@@ -405,34 +396,24 @@ fn gpu_pirls_gating_4_penalized_line_search_rejects_unpenalized_step() {
          the penalized line search accepted the unpenalized gradient step."
     );
 
-    // The accepted penalized deviance must be ≤ the penalized deviance of
-    // the unpenalized OLS solution, confirming descent in the correct objective.
+    // The accepted penalized deviance must be ≤ the unpenalized OLS penalized
+    // deviance, confirming descent in the correct objective.
     let resid_accepted = x.dot(&beta_orig) - &y;
-    let dev_accepted: f64 = resid_accepted.iter().map(|v| v * v).sum();
-    let pen_accepted: f64 = lambda * beta_orig.iter().map(|v| v * v).sum::<f64>();
+    let pendev_accepted: f64 = resid_accepted.iter().map(|v| v * v).sum::<f64>()
+        + lambda * beta_orig.iter().map(|v| v * v).sum::<f64>();
 
     let xtwx = x.t().dot(&x);
     let xtwy = x.t().dot(&y);
-    let ols_beta = cholesky_solve(
-        &{
-            let mut m = xtwx.clone();
-            for k in 0..p {
-                m[[k, k]] += 0.0; // plain OLS, no regularization
-            }
-            m
-        },
-        &xtwy,
-    );
+    let ols_beta = chol_solve(&xtwx, &xtwy);
     let resid_ols = x.dot(&ols_beta) - &y;
-    let dev_ols: f64 = resid_ols.iter().map(|v| v * v).sum();
-    let pen_ols: f64 = lambda * ols_beta.iter().map(|v| v * v).sum::<f64>();
+    let pendev_ols: f64 = resid_ols.iter().map(|v| v * v).sum::<f64>()
+        + lambda * ols_beta.iter().map(|v| v * v).sum::<f64>();
 
     assert!(
-        dev_accepted + pen_accepted <= dev_ols + pen_ols + 1.0,
-        "GPU PIRLS must converge to a penalized deviance no worse than OLS. \
-         penalized_dev(accepted) = {:.4e}, penalized_dev(ols) = {:.4e}",
-        dev_accepted + pen_accepted,
-        dev_ols + pen_ols
+        pendev_accepted <= pendev_ols + 1.0,
+        "GPU PIRLS must converge to penalized deviance ≤ unpenalized OLS \
+         penalized deviance.  pendev(accepted)={pendev_accepted:.4e}, \
+         pendev(ols)={pendev_ols:.4e}"
     );
 }
 
@@ -442,6 +423,7 @@ fn gpu_pirls_gating_4_penalized_line_search_rejects_unpenalized_step() {
 // Contract: PirlsResult.beta_transformed is the loop β in the TRANSFORMED
 // (Qs) basis.  beta_original = qs · beta_transformed.  Both must be
 // consistent with fit.final_eta: offset + X · beta_original ≈ final_eta.
+// The qs matrix must be p×p.
 // ---------------------------------------------------------------------------
 #[test]
 fn gpu_pirls_gating_5_qs_basis_semantics() {
@@ -493,12 +475,13 @@ fn gpu_pirls_gating_5_qs_basis_semantics() {
     .expect("Qs basis semantics fit");
 
     let qs = &fit.reparam_result.qs;
-    let beta_transformed = fit.beta_transformed.as_ref().clone();
-    let beta_original = qs.dot(&beta_transformed);
 
     // qs must be p×p.
     assert_eq!(qs.nrows(), p, "reparam_result.qs must have {p} rows");
     assert_eq!(qs.ncols(), p, "reparam_result.qs must have {p} cols");
+
+    let beta_transformed = fit.beta_transformed.as_ref().clone();
+    let beta_original = qs.dot(&beta_transformed);
 
     // offset + X · beta_original must equal final_eta.
     let eta_check = x.dot(&beta_original) + &offset;
@@ -514,7 +497,7 @@ fn gpu_pirls_gating_5_qs_basis_semantics() {
          Max abs diff = {max_diff:.3e}"
     );
 
-    // The original-basis fit must be close to true_beta.
+    // beta_original must be a reasonable fit.
     let fit_err = (&beta_original - &true_beta)
         .iter()
         .map(|v| v.abs())
@@ -530,10 +513,9 @@ fn gpu_pirls_gating_5_qs_basis_semantics() {
 // Test 6 — Final Hessian at accepted η
 //
 // Contract: the exported penalized Hessian H = XᵀW_H X + Sλ must be built
-// at the FINAL accepted η / finalweights, not a stale linearization point.
-// For Gaussian identity, W_H = 1 (Fisher = observed identically), so
-// finalweights must all equal 1.0.  The stabilized Hessian must be PSD
-// (Cholesky succeeds).
+// at the FINAL accepted η / finalweights, not a stale linearization.  For
+// Gaussian identity, W_H = 1 (Fisher = observed), so finalweights must all
+// equal 1.0.  The stabilized Hessian must be PSD (Cholesky succeeds).
 // ---------------------------------------------------------------------------
 #[test]
 fn gpu_pirls_gating_6_final_hessian_at_accepted_eta() {
@@ -583,24 +565,23 @@ fn gpu_pirls_gating_6_final_hessian_at_accepted_eta() {
     )
     .expect("final Hessian test fit");
 
-    // For Gaussian identity, prior-weight = 1 ⇒ Fisher weight = 1 always.
+    // For Gaussian identity, Fisher weight = 1 always.
     for (i, &w) in fit.finalweights.iter().enumerate() {
         assert!(
             (w - 1.0).abs() < 1e-8,
-            "Gaussian identity: finalweights[{i}] must be 1.0 (Fisher weight \
-             at the accepted β), got {w:.6e}.  A stale Hessian would have the \
-             wrong weights."
+            "Gaussian identity: finalweights[{i}] must be 1.0, got {w:.6e}. \
+             A stale Hessian would carry weights from the wrong iteration."
         );
     }
 
-    // The stabilized Hessian must be PSD (Cholesky succeeds).
+    // Stabilized Hessian must be PSD.
     let h = fit.dense_stabilizedhessian_transformed();
-    let fa = gam::faer_ndarray::FaerArray2View::from(h.view());
-    let h_faer = faer::Mat::from_fn(p, p, |i, j| fa[[i, j]]);
+    let hv = FaerArrayView::new(&h);
+    let factor = factorize_symmetricwith_fallback(hv.as_ref(), Side::Lower);
     assert!(
-        h_faer.cholesky(faer::Side::Lower).is_ok(),
-        "GPU PIRLS final stabilized Hessian must be PSD.  Cholesky failed, \
-         indicating the Hessian was assembled at the wrong (stale) η."
+        factor.is_ok(),
+        "GPU PIRLS final stabilized Hessian must be PSD.  Factorization \
+         failed, indicating the Hessian was assembled at a stale η."
     );
 }
 
@@ -610,9 +591,9 @@ fn gpu_pirls_gating_6_final_hessian_at_accepted_eta() {
 // Contract: PirlsStatus must reflect per-row anomalies.
 //   (a) A well-conditioned Binomial fit must reach Converged or
 //       StalledAtValidMinimum (never Unstable or MaxIterationsReached).
-//   (b) All finalweights and final_eta entries must be finite and non-negative
-//       at convergence — the GPU OR-reduce must not silently accept steps
-//       that contain non-finite per-row values.
+//   (b) All finalweights and final_eta entries must be finite and
+//       non-negative at convergence — the GPU OR-reduce must not silently
+//       accept steps that contain non-finite per-row values.
 // ---------------------------------------------------------------------------
 #[test]
 fn gpu_pirls_gating_7_status_or_reduce() {
@@ -670,19 +651,18 @@ fn gpu_pirls_gating_7_status_or_reduce() {
     )
     .expect("status OR-reduce Binomial fit must not error");
 
-    // Status must indicate convergence, not instability.
     assert!(
         matches!(
             fit.status,
             PirlsStatus::Converged | PirlsStatus::StalledAtValidMinimum
         ),
         "Well-conditioned Binomial PIRLS must converge.  Got {:?}. \
-         If Unstable, the GPU OR-reduce is incorrectly escalating per-row \
-         clamping to a global rejection.",
+         Unstable or MaxIterationsReached on a simple problem indicates the \
+         GPU OR-reduce is incorrectly escalating per-row clamping to a global \
+         rejection.",
         fit.status
     );
 
-    // All finalweights must be finite and non-negative.
     for (i, &w) in fit.finalweights.iter().enumerate() {
         assert!(
             w.is_finite() && w >= 0.0,
@@ -691,7 +671,6 @@ fn gpu_pirls_gating_7_status_or_reduce() {
         );
     }
 
-    // All final_eta must be finite.
     for (i, &e) in fit.final_eta.iter().enumerate() {
         assert!(
             e.is_finite(),
@@ -709,8 +688,9 @@ fn gpu_pirls_gating_7_status_or_reduce() {
 // that shares the same sign convention.  We enforce this by running both
 // paths on the same problem and asserting agreement to 1e-5.
 //
-// The CPU oracle is obtained by switching to Device::Cpu before the call
-// and restoring Device::Cuda after.  Both fits must agree on β and deviance.
+// The CPU oracle is obtained by forcing Device::Cpu before the second call
+// and restoring Device::Cuda after.  Both β vectors and deviances must
+// agree within tolerance.
 // ---------------------------------------------------------------------------
 #[test]
 fn gpu_pirls_gating_8_benchmark_baseline_uses_cpu_oracle() {
@@ -789,14 +769,21 @@ fn gpu_pirls_gating_8_benchmark_baseline_uses_cpu_oracle() {
     .expect("CPU oracle fit");
     gam::solver::gpu::configure_device(gam::solver::gpu::Device::Cuda);
 
-    let beta_gpu = fit_gpu.beta_transformed.as_ref().clone();
-    let beta_cpu = fit_cpu.beta_transformed.as_ref().clone();
+    // Recover original-basis β for both paths.
+    let beta_gpu = fit_gpu
+        .reparam_result
+        .qs
+        .dot(fit_gpu.beta_transformed.as_ref());
+    let beta_cpu = fit_cpu
+        .reparam_result
+        .qs
+        .dot(fit_cpu.beta_transformed.as_ref());
 
     assert!(
         allclose(&beta_gpu, &beta_cpu, 1e-5),
-        "GPU PIRLS β must match CPU oracle β to 1e-5 relative tolerance. \
-         Max diff = {:.3e}.  A benchmark that compares GPU against a synthetic \
-         loop sharing the same sign convention would not catch sign errors.",
+        "GPU PIRLS β must match CPU oracle β to 1e-5.  Max diff = {:.3e}. \
+         A benchmark comparing GPU against a synthetic loop sharing the same \
+         sign convention would not catch gradient sign errors.",
         beta_gpu
             .iter()
             .zip(beta_cpu.iter())
@@ -813,7 +800,7 @@ fn gpu_pirls_gating_8_benchmark_baseline_uses_cpu_oracle() {
         fit_cpu.deviance
     );
 
-    // The CPU oracle must itself converge so it is a valid reference.
+    // CPU oracle must itself converge so it is a valid reference point.
     assert_eq!(
         fit_cpu.status,
         PirlsStatus::Converged,

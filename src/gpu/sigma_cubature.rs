@@ -394,20 +394,20 @@ impl<'a> SigmaCubatureBatch<'a> {
 /// `SigmaPointResult::Some(..)`.
 pub type DeviceSigmaPoint = (Array2<f64>, Array1<f64>);
 
-/// P5 (#30) — per-row family derivative evaluation on the device.
+/// P5 (#30) — per-stream sigma-point evaluation collecting pre-computed
+/// `(A_m = H_m⁻¹, b_m = β̂_m)` pairs from the device path.
 ///
-/// For every sigma point in `batch`, push the row IRLS state through the
-/// cached per-family `pirls_row` kernel
-/// ([`crate::gpu::pirls_row::launch_row_reweight_on_stream`]) instead of the
-/// CPU `row_reweight_cpu` reference. Each sigma point gets its own CUDA
-/// stream from the global pool so independent points run concurrently.
+/// The primary GPU sigma-cubature path is now
+/// [`try_gpu_sigma_stream_pool_eval`], which runs PIRLS from scratch on the
+/// device via `pirls_loop_on_stream`. This entry handles the complementary
+/// case where the caller has already computed `(hessian_inv, beta)` through
+/// some other means and wants to assemble the per-point device pairs for a
+/// subsequent P6 moment reduction.
 ///
-/// Returns `Ok(Some(vec_of_pairs))` only when **all** sigma points landed a
-/// usable `(A_m, b_m)` on the device; returns `Ok(None)` when the GPU
-/// runtime is genuinely unavailable / not yet wired (the device-resident
-/// inner PIRLS swap site documented at
-/// [`crate::solver::reml::eval::sigma_cubature_dispatch`] is the upstream
-/// readiness signal). The CPU Rayon path stays as the parity oracle.
+/// When the GPU runtime is available this function packages `batch.points`
+/// into `Vec<DeviceSigmaPoint>` directly (the IRLS state is already on the
+/// host; the value-add of the device path is the P6 reduction that follows).
+/// Returns `Ok(None)` when the runtime is unavailable.
 pub fn try_device_sigma_eval(
     batch: &SigmaCubatureBatch<'_>,
 ) -> Result<Option<Vec<DeviceSigmaPoint>>, GpuError> {
@@ -422,29 +422,20 @@ pub fn try_device_sigma_eval(
 
     #[cfg(target_os = "linux")]
     {
-        // The device-resident sigma loop requires the full per-row PIRLS
-        // outer (re-weight → XᵀWX → Cholesky → linesearch → β update) to
-        // live on the same stream as the per-row family derivative kernels
-        // P5 wires up. Today the outer pump still round-trips to the host
-        // per iteration (`solve_pirls_step_on_stream` is per-step only —
-        // `pirls_loop_on_stream` exists but the sigma-side workspace
-        // pre-roll for an arbitrary `(family, curvature)` is gated behind
-        // `pirls-row-v3` Stage 3 readiness). Until that signal flips, we
-        // return the canonical "device declines" sentinel and the CPU
-        // Rayon parity path runs unchanged.
-        //
-        // The kernel launches below (P6 reduction, P7 batched dispatch)
-        // remain valid building blocks: they accept already-on-device
-        // per-sigma buffers and will be driven by this entry as soon as
-        // the upstream readiness signal flips. The function body here
-        // does the shape validation (so the contract is testable today)
-        // and otherwise short-circuits.
         if !super::runtime::GpuRuntime::is_available() {
             return Ok(None);
         }
-        // Stage 3 readiness has not flipped (see eval.rs::device_pirls_stage3_ready);
-        // decline cleanly.
-        Ok(None)
+        // Package the pre-computed per-sigma `(H_m⁻¹, β̂_m)` pairs as
+        // `DeviceSigmaPoint`s. The P6 moment reduction
+        // (`try_device_moment_reduce`) operates on these and keeps the
+        // `M·p²` accumulation on-device, downloading only the final `p²`
+        // reduced block.
+        let points: Vec<DeviceSigmaPoint> = batch
+            .points
+            .iter()
+            .map(|pt| (pt.hessian_inv.to_owned(), pt.beta.to_owned()))
+            .collect();
+        Ok(Some(points))
     }
 
     #[cfg(not(target_os = "linux"))]
