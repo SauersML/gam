@@ -1776,6 +1776,39 @@ pub fn cell_first_derivative_from_moments(
     Ok(value * INV_TWO_PI)
 }
 
+/// Maximum moment index (i.e. `max_degree` passed to
+/// `evaluate_cell_moments`) required to evaluate
+/// `cell_first_derivative_from_moments(derivative_coefficients, moments)`.
+///
+/// Callers must request at least `cell_first_derivative_required_max_degree(
+/// derivative_coefficients)` so the moment dot is well-defined; #321 was
+/// caused by hardcoding a smaller value at one call site.
+#[inline]
+pub fn cell_first_derivative_required_max_degree(derivative_coefficients: &[f64]) -> usize {
+    derivative_coefficients.len().saturating_sub(1)
+}
+
+/// Maximum moment index required by `cell_second_derivative_from_moments`.
+///
+/// Mirrors the kernel's internal `needed = max(second_deg, product_deg) + 1`
+/// computation, but returned as `max_degree` (i.e. `needed - 1`) so it lines
+/// up with the `evaluate_cell_moments(cell, max_degree)` argument convention.
+/// The contraction folds an inner cubic `eta` (always degree 3) with the two
+/// first-coefficient slices and the second-coefficient slice; the +3 below is
+/// the cubic-cell eta polynomial.
+#[inline]
+pub fn cell_second_derivative_required_max_degree(
+    first_coefficients_r: &[f64],
+    first_coefficients_s: &[f64],
+    second_coefficients_rs: &[f64],
+) -> usize {
+    let second_degree = second_coefficients_rs.len().saturating_sub(1);
+    let product_degree = first_coefficients_r.len().saturating_sub(1)
+        + first_coefficients_s.len().saturating_sub(1)
+        + 3;
+    second_degree.max(product_degree)
+}
+
 #[inline]
 pub fn cell_polynomial_integral_from_moments(
     polynomial_coefficients: &[f64],

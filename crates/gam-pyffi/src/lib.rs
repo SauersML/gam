@@ -411,7 +411,7 @@ struct SurvivalPredictionPayload {
     linear_predictor: Vec<f64>,
     columns: BTreeMap<String, Vec<f64>>,
     /// Delta-method standard errors on the survival surface, when the
-    /// caller requested `with_uncertainty=true`.  Same shape as
+    /// caller requested uncertainty via `interval=...`.  Same shape as
     /// `survival`.  `None` otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     survival_se: Option<Vec<Vec<f64>>>,
