@@ -19809,27 +19809,30 @@ fn build_marginal_blockspec_bms(
     logslope_design: &TermCollectionDesign,
     logslope_offset: &Array1<f64>,
     logslope_baseline: f64,
-    z: Arc<[f64]>,
     p_marginal: usize,
     probit_scale: f64,
-) -> ParameterBlockSpec {
-    let marginal_arc = Arc::new(design.design.clone());
-    let logslope_arc = Arc::new(logslope_design.design.clone());
-    let offset_s = logslope_offset + logslope_baseline;
+) -> Result<ParameterBlockSpec, String> {
     let offset_m = offset + baseline;
+    let offset_s = logslope_offset + logslope_baseline;
+    let marginal_dense = design
+        .design
+        .try_to_dense_arc("build_marginal_blockspec_bms::marginal")?;
+    let logslope_dense = logslope_design
+        .design
+        .try_to_dense_arc("build_marginal_blockspec_bms::logslope")?;
     let callback: Arc<dyn BlockEffectiveJacobian> = Arc::new(BmsMarginalJacobian {
-        marginal_design: Arc::clone(&marginal_arc),
-        logslope_design: Arc::clone(&logslope_arc),
+        marginal_dense: Arc::clone(&marginal_dense),
+        logslope_dense,
         offset_m: offset_m.clone(),
         offset_s,
         p_marginal,
         probit_scale,
     });
-    // logslope_arc held by callback; z not needed here
-    drop(z);
-    ParameterBlockSpec {
+    Ok(ParameterBlockSpec {
         name: "marginal_surface".to_string(),
-        design: (*marginal_arc).clone(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            (*marginal_dense).clone(),
+        )),
         offset: offset_m,
         penalties: design.penalties_as_penalty_matrix(),
         nullspace_dims: design.nullspace_dims.clone(),
@@ -19838,7 +19841,7 @@ fn build_marginal_blockspec_bms(
         gauge_priority: 100,
         row_scaling: None,
         jacobian_callback: Some(callback),
-    }
+    })
 }
 
 fn build_logslope_blockspec_bms(
@@ -19853,23 +19856,29 @@ fn build_logslope_blockspec_bms(
     z: Arc<[f64]>,
     p_marginal: usize,
     probit_scale: f64,
-) -> ParameterBlockSpec {
-    let marginal_arc = Arc::new(marginal_design.design.clone());
-    let logslope_arc = Arc::new(design.design.clone());
-    let offset_m = marginal_offset + marginal_baseline;
+) -> Result<ParameterBlockSpec, String> {
     let offset_s = offset + baseline;
+    let offset_m = marginal_offset + marginal_baseline;
+    let marginal_dense = marginal_design
+        .design
+        .try_to_dense_arc("build_logslope_blockspec_bms::marginal")?;
+    let logslope_dense = design
+        .design
+        .try_to_dense_arc("build_logslope_blockspec_bms::logslope")?;
     let callback: Arc<dyn BlockEffectiveJacobian> = Arc::new(BmsLogslopeJacobian {
-        marginal_design: Arc::clone(&marginal_arc),
-        logslope_design: Arc::clone(&logslope_arc),
+        marginal_dense,
+        logslope_dense: Arc::clone(&logslope_dense),
         offset_m,
         offset_s: offset_s.clone(),
         z,
         p_marginal,
         probit_scale,
     });
-    ParameterBlockSpec {
+    Ok(ParameterBlockSpec {
         name: "logslope_surface".to_string(),
-        design: (*logslope_arc).clone(),
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            (*logslope_dense).clone(),
+        )),
         offset: offset_s,
         penalties: design.penalties_as_penalty_matrix(),
         nullspace_dims: design.nullspace_dims.clone(),
@@ -19878,7 +19887,7 @@ fn build_logslope_blockspec_bms(
         gauge_priority: 100,
         row_scaling: None,
         jacobian_callback: Some(callback),
-    }
+    })
 }
 
 pub(crate) fn build_deviation_aux_blockspec(
