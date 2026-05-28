@@ -1,4 +1,8 @@
-use super::*;
+use crate::estimate::EstimationError;
+use crate::matrix::SymmetricMatrix;
+use faer::sparse::SparseColMat;
+use faer::sparse::Triplet;
+use ndarray::Array1;
 
 /// Add `lambda * d2[col]` to the diagonal of a sparse upper-triangular CSC matrix.
 ///
@@ -116,19 +120,19 @@ pub(super) fn update_scaled_diagonal_in_place(
 /// the actual curvature in each coordinate and is invariant to the choice of
 /// whether curvature comes from Fisher or observed information — we always
 /// clamp to the Fisher-curvature floor via `max(·, ε)`.
-pub(super) fn compute_lm_d2(h: &crate::linalg::matrix::SymmetricMatrix) -> Array1<f64> {
+pub(super) fn compute_lm_d2(h: &SymmetricMatrix) -> Array1<f64> {
     const D2_EPS: f64 = 1e-8;
     const D2_MIN: f64 = 1e-8;
     const D2_MAX: f64 = 1e8;
     let p = h.nrows();
     let mut d2 = Array1::<f64>::zeros(p);
     match h {
-        crate::linalg::matrix::SymmetricMatrix::Dense(mat) => {
+        SymmetricMatrix::Dense(mat) => {
             for i in 0..p {
                 d2[i] = mat[[i, i]].max(D2_EPS).clamp(D2_MIN, D2_MAX);
             }
         }
-        crate::linalg::matrix::SymmetricMatrix::Sparse(mat) => {
+        SymmetricMatrix::Sparse(mat) => {
             let (symbolic, values) = mat.parts();
             let col_ptr = symbolic.col_ptr();
             let row_idx = symbolic.row_idx();

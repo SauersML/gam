@@ -466,10 +466,17 @@ pub struct AdditiveBlockJacobian {
 impl BlockEffectiveJacobian for AdditiveBlockJacobian {
     fn effective_jacobian_at(
         &self,
-        _state: &FamilyLinearizationState<'_>,
+        state: &FamilyLinearizationState<'_>,
     ) -> Result<Array2<f64>, String> {
         let n = self.design.nrows();
         let p = self.design.ncols();
+        // Additive (linear) block: Jacobian is β-independent — design does
+        // not depend on state.beta. Verify beta contains no NaN when provided.
+        if !state.beta.is_empty() && state.beta.iter().any(|v| v.is_nan()) {
+            return Err(
+                "AdditiveBlockJacobian::effective_jacobian_at: beta contains NaN".to_string(),
+            );
+        }
         let total_rows = self.n_family_outputs * n;
         let mut jac = Array2::<f64>::zeros((total_rows, p));
         let row_start = self.own_output * n;

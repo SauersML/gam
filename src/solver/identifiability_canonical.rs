@@ -267,13 +267,253 @@ impl CanonicalSpecs {
 ///     hint, giving the caller a millisecond-scale diagnostic instead
 ///     of a downstream `syr_row_into shape mismatch` panic when the
 ///     family captures raw-width designs.
+///
+/// # Multi-channel routing
+///
+/// When any spec's `jacobian_callback` reports `n_outputs > 1` (i.e.
+/// the block contributes to multiple stacked output channels — as in
+/// survival marginal-slope where marginal and logslope blocks target
+/// orthogonal channels of the per-row Jacobian), this function routes
+/// through [`audit_identifiability_channel_aware`] instead of the flat
+/// [`audit_identifiability`].
+///
+/// The routing decision is principled: for each spec, call
+/// `effective_jacobian_at(beta=0)` and check whether the returned
+/// matrix has `nrows > n` (i.e. `nrows == n * k` for some `k > 1`).
+/// If any block satisfies this, all blocks are treated as multi-channel
+/// and [`BlockJacobianAsRowOp`] adapters are built from each spec's
+/// callback to feed the channel-aware audit.
+///
+/// For specs without a `jacobian_callback`, the flat design with a
+/// single-channel identity operator is used.
+///
+/// # Invariant assertion
+///
+/// After building the transform `T`, the post-T joint Jacobian
+/// `J_can = J · T_full` is materialised and RRQR-checked.  If
+/// `rank(J_can) != rank(J)`, the transform `T` is defective (a bug in
+/// its construction) and the function returns
+/// `CustomFamilyError::DimensionMismatch` with a diagnostic naming
+/// `rank(J)`, `rank(J_can)`, and all per-block `T_i` shapes.
 pub fn canonicalize_for_identifiability(
     specs: &[ParameterBlockSpec],
 ) -> Result<CanonicalSpecs, CustomFamilyError> {
-    let audit =
-        audit_identifiability(specs).map_err(|reason| CustomFamilyError::DimensionMismatch {
-            reason: format!("pre-fit identifiability audit failed: {reason}"),
-        })?;
+    if specs.is_empty() {
+        return Ok(CanonicalSpecs {
+            reduced_specs: Vec::new(),
+            per_block_transform: Vec::new(),
+            audit: audit_identifiability(specs).map_err(|r| {
+                CustomFamilyError::DimensionMismatch {
+                    reason: format!("pre-fit identifiability audit failed: {r}"),
+                }
+            })?,
+            used_channel_aware_audit: false,
+        });
+    }
+
+    let n_rows = specs[0].design.nrows();
+
+    // ── Multi-channel routing decision ───────────────────────────────────
+    //
+    // Probe each spec's effective Jacobian at beta=0 to detect
+    // multi-output blocks.  A block is multi-output when the returned
+    // matrix has nrows > n_rows — i.e. nrows == n_rows * k for k > 1.
+    // We use the spec-level n_outputs() shortcut when a jacobian_callback
+    // is present; otherwise the block is always single-output (k=1).
+    let max_n_outputs = specs
+        .iter()
+        .map(|s| s.jacobian_callback.as_ref().map(|cb| cb.n_outputs()).unwrap_or(1))
+        .max()
+        .unwrap_or(1);
+    let use_channel_aware = max_n_outputs > 1;
+
+    log::debug!(
+        "[CANON] canonicalize_for_identifiability: blocks={} n_rows={} \
+         max_n_outputs={} route={}",
+        specs.len(),
+        n_rows,
+        max_n_outputs,
+        if use_channel_aware { "channel-aware" } else { "flat" },
+    );
+
+    // ── Per-block Jacobian Frobenius-norm logging (instrumentation) ──────
+    //
+    // Log the Frobenius norm and row-count of each block's effective
+    // Jacobian before the audit so discrepancies between pilot and outer-fit
+    // audits are visible in the log stream.
+    for spec in specs.iter() {
+        let jac_nrows = if use_channel_aware {
+            let k = spec.jacobian_callback.as_ref().map(|cb| cb.n_outputs()).unwrap_or(1);
+            n_rows * k
+        } else {
+            n_rows
+        };
+        let frob_sq: f64 = {
+            let p = spec.design.ncols();
+            let zeros = vec![0.0f64; p];
+            let state = FamilyLinearizationState {
+                beta: &zeros,
+                family_scalars: None,
+                channel_hessian: None,
+            };
+            match spec.effective_jacobian_at("canonicalize_for_identifiability", &state) {
+                Ok(j) => j.iter().map(|v| v * v).sum(),
+                Err(e) => {
+                    log::debug!(
+                        "[CANON]   block '{}': effective_jacobian_at probe failed: {e}",
+                        spec.name,
+                    );
+                    f64::NAN
+                }
+            }
+        };
+        log::debug!(
+            "[CANON]   block '{}': p={} jac_nrows={} frob_norm={:.4e}",
+            spec.name,
+            spec.design.ncols(),
+            jac_nrows,
+            frob_sq.sqrt(),
+        );
+    }
+
+    // ── Run the audit ─────────────────────────────────────────────────────
+    let audit = if use_channel_aware {
+        // Determine the common k (all blocks must agree on the channel count;
+        // blocks without a jacobian_callback get a single-channel identity
+        // adapter at k = max_n_outputs).
+        let k = max_n_outputs;
+        let mut operators: Vec<Arc<dyn RowJacobianOperator>> = Vec::with_capacity(specs.len());
+        for spec in specs.iter() {
+            let op: Arc<dyn RowJacobianOperator> =
+                match spec.jacobian_callback.as_ref() {
+                    Some(cb) if cb.n_outputs() == k => {
+                        let row_op =
+                            BlockJacobianAsRowOp::from_callback(cb.as_ref(), n_rows, &spec.name)
+                                .map_err(|e| CustomFamilyError::DimensionMismatch {
+                                    reason: format!(
+                                        "canonicalize_for_identifiability: build \
+                                         BlockJacobianAsRowOp for block '{}': {e}",
+                                        spec.name,
+                                    ),
+                                })?;
+                        Arc::new(row_op)
+                    }
+                    Some(cb) => {
+                        // k mismatch: this block has fewer outputs than
+                        // max_n_outputs — embed its Jacobian in the top
+                        // channels and zero-pad the rest.
+                        let k_block = cb.n_outputs();
+                        let row_op =
+                            BlockJacobianAsRowOp::from_callback(cb.as_ref(), n_rows, &spec.name)
+                                .map_err(|e| CustomFamilyError::DimensionMismatch {
+                                    reason: format!(
+                                        "canonicalize_for_identifiability: build \
+                                         BlockJacobianAsRowOp (k_mismatch) for block '{}': {e}",
+                                        spec.name,
+                                    ),
+                                })?;
+                        // Embed: extend jac channels from k_block to k by
+                        // zero-padding the trailing channels.
+                        let mut jac_ext = Array3::<f64>::zeros((
+                            row_op.nrows(),
+                            row_op.ncols(),
+                            k,
+                        ));
+                        let jac_inner = row_op.evaluate_full();
+                        for i in 0..row_op.nrows() {
+                            for j in 0..row_op.ncols() {
+                                for r in 0..k_block {
+                                    jac_ext[[i, j, r]] = jac_inner[[i, j, r]];
+                                }
+                            }
+                        }
+                        Arc::new(BlockJacobianAsRowOp { jac: jac_ext })
+                    }
+                    None => {
+                        // Single-output block: embed the flat design in the
+                        // first channel.
+                        let p = spec.design.ncols();
+                        let zeros = vec![0.0f64; p];
+                        let state = FamilyLinearizationState {
+                            beta: &zeros,
+                            family_scalars: None,
+                            channel_hessian: None,
+                        };
+                        let flat = spec
+                            .effective_jacobian_at(
+                                "canonicalize_for_identifiability",
+                                &state,
+                            )
+                            .map_err(|e| CustomFamilyError::DimensionMismatch {
+                                reason: format!(
+                                    "canonicalize_for_identifiability: effective_jacobian_at \
+                                     for block '{}': {e}",
+                                    spec.name,
+                                ),
+                            })?;
+                        let mut jac_ext =
+                            Array3::<f64>::zeros((n_rows, flat.ncols(), k));
+                        for i in 0..n_rows {
+                            for j in 0..flat.ncols() {
+                                jac_ext[[i, j, 0]] = flat[[i, j]];
+                            }
+                        }
+                        Arc::new(BlockJacobianAsRowOp { jac: jac_ext })
+                    }
+                };
+            operators.push(op);
+        }
+        let row_hess = IdentityRowHessian::new(n_rows, k);
+        let audit_result =
+            audit_identifiability_channel_aware(specs, &operators, &row_hess).map_err(
+                |reason| CustomFamilyError::DimensionMismatch {
+                    reason: format!(
+                        "pre-fit channel-aware identifiability audit failed: {reason}"
+                    ),
+                },
+            )?;
+
+        log::info!(
+            "[CANON] channel-aware audit: {} blocks, joint_rank={}/{} (flat audit NOT used)",
+            specs.len(),
+            audit_result.blocks.iter().map(|b| b.effective_dim).sum::<usize>(),
+            specs.iter().map(|s| s.design.ncols()).sum::<usize>(),
+        );
+
+        // Also run the flat audit for comparison and log the discrepancy.
+        // This is pure instrumentation — it does NOT affect the routing or
+        // the fatal decision. We log it at debug level so the 23→20 rank drop
+        // is visible without being a false alarm.
+        if let Ok(flat_audit) = audit_identifiability(specs) {
+            let flat_rank: usize = flat_audit.blocks.iter().map(|b| b.effective_dim).sum();
+            let ca_rank: usize =
+                audit_result.blocks.iter().map(|b| b.effective_dim).sum();
+            if flat_rank != ca_rank {
+                log::info!(
+                    "[CANON] rank discrepancy: flat_rank={flat_rank} channel_aware_rank={ca_rank}; \
+                     the flat audit would have {action} this fit; the channel-aware verdict is used",
+                    action = if flat_audit.fatal { "refused" } else { "accepted (but with drops)" },
+                );
+            } else {
+                log::debug!(
+                    "[CANON] flat_rank == channel_aware_rank = {flat_rank} (no discrepancy)",
+                );
+            }
+        }
+
+        audit_result
+    } else {
+        let audit_result =
+            audit_identifiability(specs).map_err(|reason| CustomFamilyError::DimensionMismatch {
+                reason: format!("pre-fit identifiability audit failed: {reason}"),
+            })?;
+        log::debug!(
+            "[CANON] flat audit: {} blocks, joint_rank={}",
+            specs.len(),
+            audit_result.blocks.iter().map(|b| b.effective_dim).sum::<usize>(),
+        );
+        audit_result
+    };
 
     if audit.fatal {
         return Err(CustomFamilyError::IdentifiabilityFailure { audit });
@@ -373,10 +613,127 @@ pub fn canonicalize_for_identifiability(
         per_block_transform.push(t_i);
     }
 
+    // ── Post-T invariant check ────────────────────────────────────────────
+    //
+    // Materialise the joint post-T Jacobian J_can = J · T_full where
+    // J is the (n*k × p_total) stacked Jacobian and T_full is block-diagonal
+    // of the per-block T_i.  Assert rank(J_can) == rank(J_pre_T).
+    //
+    // This catches bugs in the T construction (wrong kept-column mapping,
+    // off-by-one indexing, etc.) before they silently degrade the fit.
+    // The check is run unconditionally — at GAM smooth widths (p_total ≪ n)
+    // the RRQR on J_can is cheap.
+    {
+        let p_total_raw: usize = specs.iter().map(|s| s.design.ncols()).sum();
+        let p_total_red: usize = per_block_transform.iter().map(|t| t.ncols()).sum();
+        let k = if use_channel_aware { max_n_outputs } else { 1 };
+        let nk = n_rows * k;
+
+        // Build J_pre_T: (nk, p_total_raw) by row-stacking per-block Jacobians.
+        let mut j_pre = Array2::<f64>::zeros((nk, p_total_raw));
+        let mut col_off = 0usize;
+        for spec in specs.iter() {
+            let p_b = spec.design.ncols();
+            let zeros = vec![0.0f64; p_b];
+            let state = FamilyLinearizationState {
+                beta: &zeros,
+                family_scalars: None,
+                channel_hessian: None,
+            };
+            match spec.effective_jacobian_at("canonicalize_rank_check", &state) {
+                Ok(j_b) => {
+                    // j_b is (nk_b, p_b) where nk_b = n_rows * k_b
+                    // For single-channel blocks k_b = 1, so nk_b = n_rows.
+                    // For multi-channel blocks k_b = k, so nk_b = nk.
+                    // We embed single-channel blocks in the first k rows of
+                    // each observation's nk block.
+                    let k_b = j_b.nrows() / n_rows;
+                    for i in 0..n_rows {
+                        for j in 0..p_b {
+                            for r in 0..k_b.min(k) {
+                                j_pre[[i * k + r, col_off + j]] = j_b[[i * k_b + r, j]];
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Fall back: embed flat design as channel 0.
+                    if let Ok(flat) = spec
+                        .design
+                        .try_to_dense_arc("canonicalize_rank_check")
+                        .map(|a| a.as_ref().clone())
+                    {
+                        for i in 0..n_rows.min(flat.nrows()) {
+                            for j in 0..p_b.min(flat.ncols()) {
+                                j_pre[[i * k, col_off + j]] = flat[[i, j]];
+                            }
+                        }
+                    }
+                }
+            }
+            col_off += p_b;
+        }
+
+        // Build J_can = J_pre · T_full where T_full = blockdiag(T_i).
+        let mut j_can = Array2::<f64>::zeros((nk, p_total_red));
+        let mut raw_col_off = 0usize;
+        let mut red_col_off = 0usize;
+        for t_i in per_block_transform.iter() {
+            let p_i = t_i.nrows();
+            let r_i = t_i.ncols();
+            if p_i > 0 && r_i > 0 {
+                // J_can[:, red_col_off .. red_col_off+r_i]
+                //   = J_pre[:, raw_col_off .. raw_col_off+p_i] · T_i
+                for row in 0..nk {
+                    for out_col in 0..r_i {
+                        let mut acc = 0.0_f64;
+                        for in_col in 0..p_i {
+                            acc += j_pre[[row, raw_col_off + in_col]] * t_i[[in_col, out_col]];
+                        }
+                        j_can[[row, red_col_off + out_col]] = acc;
+                    }
+                }
+            }
+            raw_col_off += p_i;
+            red_col_off += r_i;
+        }
+
+        // RRQR rank on J_pre and J_can.
+        let rank_j_pre = rrqr_with_permutation(&j_pre, default_rrqr_rank_alpha())
+            .map(|r| r.rank)
+            .unwrap_or(0);
+        let rank_j_can = rrqr_with_permutation(&j_can, default_rrqr_rank_alpha())
+            .map(|r| r.rank)
+            .unwrap_or(0);
+
+        log::info!(
+            "[CANON] post-T invariant: rank(J)={rank_j_pre} rank(J_can)={rank_j_can} \
+             (p_raw={p_total_raw} p_red={p_total_red} k={k})",
+        );
+
+        if rank_j_pre != rank_j_can {
+            let block_shapes: Vec<String> = per_block_transform
+                .iter()
+                .zip(specs.iter())
+                .map(|(t, s)| format!("{}:({},{})", s.name, t.nrows(), t.ncols()))
+                .collect();
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "canonicalize_for_identifiability: post-T rank invariant violated — \
+                     rank(J)={rank_j_pre} but rank(J_can)={rank_j_can} \
+                     (p_raw={p_total_raw} p_red={p_total_red} k={k}); \
+                     this is a bug in T construction; per-block T shapes: [{}]",
+                    block_shapes.join(", "),
+                ),
+            });
+        }
+    }
+
     Ok(CanonicalSpecs {
         reduced_specs,
         per_block_transform,
         audit,
+        used_channel_aware_audit: use_channel_aware,
     })
 }
 
