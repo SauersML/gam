@@ -1535,52 +1535,98 @@ fn gaussian_location_scalewarm_start(
     Ok((betamu, beta_log_sigma, sigma_hat))
 }
 
-/// Install `AdditiveBlockJacobian` callbacks on two location-scale sub-model
-/// blocks (e.g. `mu`/`log_sigma` or `threshold`/`log_sigma`) so the
-/// identifiability audit routes through the channel-aware variant. Each block
-/// drives a distinct output channel (block 0 → channel 0, block 1 → channel 1),
-/// so a shared intercept (or any shared column) between blocks is no longer
-/// treated as a flat-joint alias.
-fn install_additive_callbacks_two_block(
-    block0: &mut ParameterBlockSpec,
-    block1: &mut ParameterBlockSpec,
-) -> Result<(), String> {
-    const N_OUTPUTS: usize = 2;
-    let d0 = block0
-        .effective_design("install_additive_callbacks_two_block: block 0")?;
-    let d1 = block1
-        .effective_design("install_additive_callbacks_two_block: block 1")?;
-    block0.jacobian_callback = Some(std::sync::Arc::new(AdditiveBlockJacobian {
-        design: d0,
-        own_output: 0,
-        n_family_outputs: N_OUTPUTS,
+/// Total output count for every two-block location-scale family in this
+/// module (mu/log_sigma or threshold/log_sigma). The wiggle variants add a
+/// third zero-channel block but still drive only two output channels.
+const LOCATION_SCALE_N_OUTPUTS: usize = 2;
+
+/// Construct a fully wired location-scale parameter block.
+///
+/// This is the **only** way to build a LocationScale `ParameterBlockSpec` in
+/// this module — by construction the `AdditiveBlockJacobian` callback is
+/// always installed, so the channel-aware identifiability audit cannot be
+/// silently bypassed by a future `build_blocks` impl that forgets to wire
+/// the callback at the tail (re-introducing #319).
+///
+/// `own_output` is the zero-based output channel this block drives
+/// (e.g. 0 for `mu`/`threshold`, 1 for `log_sigma`). `n_family_outputs` is
+/// fixed at [`LOCATION_SCALE_N_OUTPUTS`] for every two-block family here
+/// but is exposed so the helper composes cleanly with any future
+/// k-block extension.
+#[allow(clippy::too_many_arguments)]
+fn build_location_scale_block(
+    name: impl Into<String>,
+    design: DesignMatrix,
+    offset: Array1<f64>,
+    penalties: Vec<PenaltyMatrix>,
+    nullspace_dims: Vec<usize>,
+    initial_log_lambdas: Array1<f64>,
+    initial_beta: Option<Array1<f64>>,
+    own_output: usize,
+    n_family_outputs: usize,
+    caller: &str,
+) -> Result<ParameterBlockSpec, String> {
+    if own_output >= n_family_outputs {
+        return Err(format!(
+            "{caller}: own_output={own_output} >= n_family_outputs={n_family_outputs}"
+        ));
+    }
+    let mut spec = ParameterBlockSpec {
+        name: name.into(),
+        design,
+        offset,
+        penalties,
+        nullspace_dims,
+        initial_log_lambdas,
+        initial_beta,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        audit_design: None,
+    };
+    let dense = spec.effective_design(caller)?;
+    spec.jacobian_callback = Some(std::sync::Arc::new(AdditiveBlockJacobian {
+        design: dense,
+        own_output,
+        n_family_outputs,
     }));
-    block1.jacobian_callback = Some(std::sync::Arc::new(AdditiveBlockJacobian {
-        design: d1,
-        own_output: 1,
-        n_family_outputs: N_OUTPUTS,
-    }));
-    Ok(())
+    Ok(spec)
 }
 
-/// Same as [`install_additive_callbacks_two_block`] but also installs a
-/// zero-Jacobian callback on the wiggle block. Wiggle blocks modulate the
-/// inverse link nonlinearly and contribute no linear effective Jacobian.
-fn install_additive_callbacks_two_block_with_wiggle(
-    block0: &mut ParameterBlockSpec,
-    block1: &mut ParameterBlockSpec,
-    wiggle: &mut ParameterBlockSpec,
-) -> Result<(), String> {
-    const N_OUTPUTS: usize = 2;
-    install_additive_callbacks_two_block(block0, block1)?;
-    let n = block0.design.nrows();
-    let p_w = wiggle.design.ncols();
-    wiggle.jacobian_callback = Some(std::sync::Arc::new(AdditiveBlockJacobian {
-        design: ndarray::Array2::<f64>::zeros((n, p_w)),
+/// Construct the wiggle block that accompanies a two-block location-scale
+/// family. The wiggle modulates the inverse link nonlinearly and
+/// contributes no linear effective Jacobian — the installed callback
+/// therefore exposes a zero `(n × p_w)` design under
+/// `n_family_outputs = LOCATION_SCALE_N_OUTPUTS`.
+#[allow(clippy::too_many_arguments)]
+fn build_location_scale_wiggle_block(
+    name: impl Into<String>,
+    design: DesignMatrix,
+    offset: Array1<f64>,
+    penalties: Vec<PenaltyMatrix>,
+    nullspace_dims: Vec<usize>,
+    initial_log_lambdas: Array1<f64>,
+    initial_beta: Option<Array1<f64>>,
+    n_rows: usize,
+) -> Result<ParameterBlockSpec, String> {
+    let p_w = design.ncols();
+    let mut spec = ParameterBlockSpec {
+        name: name.into(),
+        design,
+        offset,
+        penalties,
+        nullspace_dims,
+        initial_log_lambdas,
+        initial_beta,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        audit_design: None,
+    };
+    spec.jacobian_callback = Some(std::sync::Arc::new(AdditiveBlockJacobian {
+        design: ndarray::Array2::<f64>::zeros((n_rows, p_w)),
         own_output: 0,
-        n_family_outputs: N_OUTPUTS,
+        n_family_outputs: LOCATION_SCALE_N_OUTPUTS,
     }));
-    Ok(())
+    Ok(spec)
 }
 
 fn prepared_gaussian_log_sigma_design(

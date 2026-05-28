@@ -5265,26 +5265,28 @@ impl SymmetricMatrix {
 ///
 /// Callers in PIRLS should select `_signed` for observed-Hessian / Newton
 /// curvature assembly and `_psd` for Fisher-scoring updates where the working
-/// weights are guaranteed nonneg.
+/// weights are guaranteed nonneg. The sign character is now encoded in the
+/// argument types: `xt_diag_x_signed` takes a `SignedWeightsView<'_>` (free
+/// construction), and `xt_diag_x_psd` takes a `PsdWeightsView<'_>` (one-time
+/// `try_new` scan at the call site).
 pub fn xt_diag_x_signed(
     design: &DesignMatrix,
-    diag: &Array1<f64>,
+    diag: SignedWeightsView<'_>,
 ) -> Result<SymmetricMatrix, String> {
-    xt_diag_x_symmetric(design, diag)
+    xt_diag_x_symmetric(design, &diag.view().to_owned())
 }
 
 /// PSD-precondition Gram: `XᵀWX` with `w ≥ 0`.
 ///
 /// Use for Fisher-scoring / canonical-link IRLS, where the working weights are
-/// guaranteed nonneg by construction. The precondition is checked under
-/// `assertions` and silently inherited in release builds; the underlying
-/// numeric path is identical to `xt_diag_x_signed`.
-pub fn xt_diag_x_psd(design: &DesignMatrix, diag: &Array1<f64>) -> Result<SymmetricMatrix, String> {
-    assert!(
-        diag.iter().all(|&w| w >= 0.0),
-        "xt_diag_x_psd requires nonneg weights; use xt_diag_x_signed for observed-Hessian assembly"
-    );
-    xt_diag_x_symmetric(design, diag)
+/// guaranteed nonneg by construction. The `w ≥ 0` precondition is discharged
+/// at the `PsdWeightsView::try_new` constructor; the kernel below performs no
+/// further scan. Numeric path is identical to `xt_diag_x_signed`.
+pub fn xt_diag_x_psd(
+    design: &DesignMatrix,
+    diag: PsdWeightsView<'_>,
+) -> Result<SymmetricMatrix, String> {
+    xt_diag_x_symmetric(design, &diag.view().to_owned())
 }
 
 pub fn xt_diag_x_symmetric(

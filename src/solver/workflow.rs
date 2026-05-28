@@ -2781,7 +2781,7 @@ impl Default for FitConfig {
 /// `p_estimate = 0` because the per-block coefficient count isn't known until
 /// the spec has been built; the n_rows and hints triggers are sufficient to
 /// flip strict mode for every shape that needs it.
-fn resolved_resource_policy(
+pub(crate) fn resolved_resource_policy(
     config: &FitConfig,
     data: &Dataset,
     hints: crate::resource::ProblemHints,
@@ -3260,7 +3260,7 @@ pub fn resolve_family(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-fn build_termspec_with_geometry(
+pub(crate) fn build_termspec_with_geometry(
     terms: &[ParsedTerm],
     data: &Dataset,
     col_map: &HashMap<String, usize>,

@@ -1486,9 +1486,12 @@ impl<'a> GamWorkingModel<'a> {
             // (binomial + cloglog, Gamma + identity, etc.). Route through the
             // signed-Gram API so the CSC / sparse-accumulator paths preserve
             // sign instead of silently clipping negative-curvature mass.
-            _ => crate::matrix::xt_diag_x_signed(design, weights)
-                .map(|h| h.to_dense())
-                .map_err(EstimationError::InvalidInput),
+            _ => crate::matrix::xt_diag_x_signed(
+                design,
+                crate::matrix::SignedWeightsView::from_array(weights),
+            )
+            .map(|h| h.to_dense())
+            .map_err(EstimationError::InvalidInput),
         }
     }
 
