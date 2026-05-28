@@ -17675,7 +17675,17 @@ impl crate::custom_family::BlockEffectiveJacobian for LogslopeBlockJacobian {
     ) -> Result<Array2<f64>, String> {
         let n = self.design.nrows();
         let p = self.design.ncols();
-        let s = self.s;
+        // Prefer s_f from the linearization state over the captured-at-construction
+        // value. This ensures that outer-loop σ updates (which rebuild the family and
+        // repopulate probit_frailty_scale in the state) are reflected in the Jacobian
+        // without requiring the spec to be rebuilt. When the caller did not populate
+        // probit_frailty_scale (default = 1.0), fall back to self.s so that the
+        // zero-frailty case and legacy callers remain correct.
+        let s = if state.probit_frailty_scale != 1.0 {
+            state.probit_frailty_scale
+        } else {
+            self.s
+        };
 
         // Try to get per-row scalars from family_scalars.
         let scalars: Option<&SurvivalMarginalSlopeFamilyScalars> = state

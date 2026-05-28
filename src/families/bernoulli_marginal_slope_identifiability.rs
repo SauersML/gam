@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use ndarray::{Array1, Array2, Array3};
 
+use crate::families::custom_family::FamilyChannelHessian;
 use crate::families::identifiability_compiler::{
     AnchorRowEvaluator, BlockOrder, RowHessian, RowJacobianOperator,
 };
@@ -95,6 +96,43 @@ impl RowHessian for BernoulliRowHessian {
     fn evaluate_full(&self) -> Array3<f64> {
         let n = self.w.len();
         let mut out = Array3::<f64>::zeros((n, 1, 1));
+        for i in 0..n {
+            out[[i, 0, 0]] = self.w[i];
+        }
+        out
+    }
+}
+
+/// `FamilyChannelHessian` for Bernoulli marginal-slope.
+///
+/// BMS has a single output channel (K=1). The per-subject channel Hessian
+/// W_i is the scalar probit IRLS weight:
+///
+/// ```text
+/// W_i = w_i · φ(η_i)² / (Φ(η_i) · (1 − Φ(η_i)))
+/// ```
+///
+/// This is exactly the 1×1 scalar stored in `BernoulliRowHessian::w`.
+/// Since K=1, the scalar fast path is used and cross-channel curvature
+/// is vacuous. Families that genuinely have a single output channel
+/// (Gaussian, Binomial, Poisson, etc.) all use this 1×1 identity path.
+impl FamilyChannelHessian for BernoulliRowHessian {
+    fn n_outputs(&self) -> usize {
+        1
+    }
+
+    fn n_subjects(&self) -> usize {
+        self.w.len()
+    }
+
+    fn fill_subject(&self, i: usize, out: &mut [f64]) {
+        assert_eq!(out.len(), 1, "BernoulliRowHessian::fill_subject expects K=1");
+        out[0] = self.w[i];
+    }
+
+    fn evaluate_full(&self) -> ndarray::Array3<f64> {
+        let n = self.w.len();
+        let mut out = ndarray::Array3::<f64>::zeros((n, 1, 1));
         for i in 0..n {
             out[[i, 0, 0]] = self.w[i];
         }
