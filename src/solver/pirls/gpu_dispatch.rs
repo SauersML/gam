@@ -253,13 +253,13 @@ where
                             ..
                         } => (s_transformed.view(), linear_shift.view(), *constant_shift),
                         PirlsPenalty::Diagonal { .. } => {
-                            // SAFETY: the enclosing `if let Some(_) = ...` of
-                            // `dense_penalty` ABOVE (line ~203) admits only the
-                            // PirlsPenalty::Dense variant; reaching here means a
-                            // mid-function mutation has changed `penalty_active`
-                            // out from under us, which is a programming error
-                            // in this single-threaded function body. Falling
-                            // back to None would silently mask the bug.
+                            // SAFETY: the enclosing dense_penalty admission
+                            // ABOVE (matches!(penalty_active, PirlsPenalty::Dense{..}))
+                            // restricts execution to the Dense variant; reaching
+                            // here means a mid-function mutation has changed
+                            // `penalty_active` out from under us, which is a
+                            // programming error in this single-threaded function
+                            // body. Falling back to None would silently mask the bug.
                             panic!("GPU PIRLS dispatch gated on PirlsPenalty::Dense above")
                         }
                     };
