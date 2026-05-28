@@ -388,8 +388,9 @@ mod linux_impl {
             final_eta.iter().fold(0.0_f64, |a, &x| a.max(x.abs()))
         };
 
-        // Gradient = Xᵀ · grad_eta + S·β.
-        // Build X·Qs is already in `x_transformed`; gradient stays in transformed coords.
+        // Penalized-objective gradient = S·β − linear_shift − Xᵀ·score_eta (#257).
+        // The GPU loop minimises −ℓ + ½βᵀSβ − linear_shiftᵀβ, so the gradient
+        // of the objective is ∂/∂β(−ℓ + ½βᵀSβ − lsᵀβ) = −Xᵀscore + S·β − ls.
         let xt_grad_eta = {
             let xt = input.x_transformed;
             // p-vector
@@ -414,8 +415,10 @@ mod linux_impl {
             }
             acc
         };
-        let mut gradient_total = xt_grad_eta.clone();
-        gradient_total += &s_beta;
+        // gradient = S·β − linear_shift − Xᵀ·score_eta
+        let mut gradient_total = s_beta.clone();
+        gradient_total -= &input.linear_shift;
+        gradient_total -= &xt_grad_eta;
         let lastgradient_norm = gradient_total.dot(&gradient_total).sqrt();
         let score_norm = xt_grad_eta.dot(&xt_grad_eta).sqrt();
         let s_beta_norm = s_beta.dot(&s_beta).sqrt();
@@ -565,7 +568,316 @@ mod linux_impl {
 
         Ok((pirls_result, working_summary))
     }
+
+    /// All inputs needed for the GPU Gaussian-identity exact PLS dispatch.
+    /// Built by the CPU PIRLS driver immediately before the CPU
+    /// `solve_penalized_least_squares_implicit` fast-path, so the GPU path
+    /// fires first when available.
+    pub struct GpuGaussianPlsInput<'a> {
+        /// Precomputed `XᵀWX` in original (pre-Qs) coordinates, p×p.
+        pub xtwx_orig: ArrayView2<'a, f64>,
+        /// Precomputed `XᵀW(y − offset)` in original coordinates, length p.
+        pub xtwy_orig: ArrayView1<'a, f64>,
+        /// Penalty `Σλₖ Sₖ` in transformed (post-Qs) coordinates, p×p.
+        pub s_transformed: ArrayView2<'a, f64>,
+        /// Additive RHS correction in transformed coordinates, length p.
+        pub linear_shift: ArrayView1<'a, f64>,
+        /// Prior-mean vector for Tikhonov RHS, length p.
+        pub prior_mean_target: ArrayView1<'a, f64>,
+        /// Constant term of the shifted penalty quadratic (for penalty_term).
+        pub constant_shift: f64,
+        /// Reparameterisation matrix Qs (p×p).  `None` = identity transform.
+        pub qs: Option<ArrayView2<'a, f64>>,
+        /// Stabilisation ridge δ.
+        pub ridge: f64,
+        /// GLM likelihood spec.
+        pub likelihood: &'a crate::types::GlmLikelihoodSpec,
+        /// Inverse link.
+        pub inverse_link: &'a crate::types::InverseLink,
+        /// Original dense design X (n×p) for computing η = offset + X·Qs·β.
+        pub x_original: ArrayView2<'a, f64>,
+        /// Response y, length n.
+        pub y: ArrayView1<'a, f64>,
+        /// Prior weights, length n.
+        pub priorweights: ArrayView1<'a, f64>,
+        /// Observation offset, length n.
+        pub offset: ArrayView1<'a, f64>,
+        /// Full reparameterisation result for `PirlsResult::reparam_result`.
+        pub reparam_result: ReparamResult,
+        /// Design matrix for `PirlsResult::x_transformed`.
+        pub x_transformed_design: DesignMatrix,
+        /// Coordinate frame for `PirlsResult::coordinate_frame`.
+        pub coordinate_frame: PirlsCoordinateFrame,
+        /// Linear constraints (None when cache_eligible was true).
+        pub linear_constraints: Option<LinearInequalityConstraints>,
+    }
+
+    /// Cheap admission gate for the GPU Gaussian-identity exact PLS path.
+    /// Returns `true` iff cuda_selected(), runtime available, and the likelihood
+    /// is Gaussian-identity.
+    pub fn try_gpu_gaussian_pls_admit(likelihood: &crate::types::GlmLikelihoodSpec) -> bool {
+        if !crate::solver::gpu::cuda_selected() {
+            return false;
+        }
+        if crate::gpu::runtime::GpuRuntime::global().is_none() {
+            return false;
+        }
+        likelihood.spec.is_gaussian_identity()
+    }
+
+    /// Attempt to run the exact GPU PLS for Gaussian-identity.
+    ///
+    /// Returns `Some(Ok(...))` when the device solve completed and the full
+    /// CPU-oracle surface was assembled; returns `None` when admission was
+    /// denied; returns `Some(Err(...))` on device failure (caller logs and
+    /// falls through to CPU).
+    pub fn try_gpu_gaussian_pls_dispatch(
+        input: GpuGaussianPlsInput<'_>,
+    ) -> Option<Result<(PirlsResult, WorkingModelPirlsResult), String>> {
+        if !try_gpu_gaussian_pls_admit(input.likelihood) {
+            return None;
+        }
+        Some(run_gpu_gaussian_pls(input))
+    }
+
+    fn run_gpu_gaussian_pls(
+        input: GpuGaussianPlsInput<'_>,
+    ) -> Result<(PirlsResult, WorkingModelPirlsResult), String> {
+        use crate::solver::pirls::{
+            array1_l2_norm, calculate_deviance, calculate_loglikelihood_omitting_constants,
+            computeworkingweight_derivatives_from_eta,
+        };
+        use crate::linalg::utils::inf_norm;
+        use crate::types::{RidgePassport, RidgePolicy};
+        use ndarray::Array1;
+
+        let pls = pirls_gpu::solve_gaussian_pls_gpu(
+            input.xtwx_orig,
+            input.xtwy_orig,
+            input.s_transformed,
+            input.linear_shift,
+            input.prior_mean_target,
+            input.ridge,
+            input.qs,
+        )?;
+
+        if !pls.logdet.is_finite() {
+            return Err(format!(
+                "GPU Gaussian PLS returned non-finite log|H| = {}",
+                pls.logdet
+            ));
+        }
+
+        let beta = pls.beta.clone();
+        let penalized_hessian = pls.penalized_hessian;
+        let p = beta.len();
+        let n = input.y.len();
+
+        // eta = offset + X · (Qs · beta), or offset + X · beta if no Qs.
+        let qbeta: Array1<f64> = if let Some(qs_v) = input.qs {
+            qs_v.dot(&beta)
+        } else {
+            beta.clone()
+        };
+        let mut eta = input.offset.to_owned();
+        for j in 0..p {
+            for i in 0..n {
+                eta[i] += input.x_original[[i, j]] * qbeta[j];
+            }
+        }
+        let finalmu = eta.clone();
+        let finalz = input.y.to_owned();
+
+        // gradient_data = Xᵀ · (W · (mu - z)) = Xᵀ · (W · (eta - y)).
+        // For Gaussian-identity: gradient w.r.t. β (in transformed coords) =
+        //   QsᵀXᵀ W (Xb - y) = penalized_hessian·β - xtwy_orig_transformed
+        // but it's simplest to compute directly:
+        let mut weighted_residual = finalmu.clone();
+        weighted_residual -= &finalz;
+        for i in 0..n {
+            weighted_residual[i] *= input.priorweights[i];
+        }
+        // Xᵀ W r (in original coords)
+        let mut xt_wr_orig: Array1<f64> = Array1::zeros(p);
+        for j in 0..p {
+            let mut acc = 0.0_f64;
+            for i in 0..n {
+                acc += input.x_original[[i, j]] * weighted_residual[i];
+            }
+            xt_wr_orig[j] = acc;
+        }
+        // Rotate to transformed coords: QsᵀXᵀWr.
+        let gradient_data: Array1<f64> = if let Some(qs_v) = input.qs {
+            qs_v.t().dot(&xt_wr_orig)
+        } else {
+            xt_wr_orig
+        };
+        let score_norm = array1_l2_norm(&gradient_data);
+
+        // s_beta = S·β − linear_shift.
+        let mut s_beta: Array1<f64> = Array1::zeros(p);
+        for i in 0..p {
+            let mut acc = 0.0_f64;
+            for j in 0..p {
+                acc += input.s_transformed[[i, j]] * beta[j];
+            }
+            s_beta[i] = acc - input.linear_shift[i];
+        }
+        let s_beta_norm = array1_l2_norm(&s_beta);
+
+        let mut gradient = gradient_data.clone();
+        gradient += &s_beta;
+
+        // penalty_term = betaᵀ·S·β − 2·betaᵀ·linear_shift + constant_shift.
+        let mut penalty_term: f64 = input.constant_shift;
+        for i in 0..p {
+            let mut s_row_b = 0.0_f64;
+            for j in 0..p {
+                s_row_b += input.s_transformed[[i, j]] * beta[j];
+            }
+            penalty_term += beta[i] * s_row_b;
+            penalty_term -= 2.0 * beta[i] * input.linear_shift[i];
+        }
+
+        let ridge_used = input.ridge;
+        let mut ridge_grad_norm = 0.0_f64;
+        if ridge_used > 0.0 {
+            let beta_sq: f64 = beta.dot(&beta);
+            penalty_term += ridge_used * beta_sq;
+            let ridge_contrib = beta.mapv(|v| ridge_used * v);
+            gradient += &ridge_contrib;
+            ridge_grad_norm = ridge_used * array1_l2_norm(&beta);
+        }
+
+        let gradient_norm = array1_l2_norm(&gradient);
+        let max_abs_eta = inf_norm(finalmu.iter().copied());
+
+        let deviance = calculate_deviance(input.y, &finalmu, input.likelihood, input.priorweights)
+            .map_err(|e| format!("deviance computation failed: {e:?}"))?;
+        let log_likelihood = calculate_loglikelihood_omitting_constants(
+            input.y,
+            &finalmu,
+            input.likelihood,
+            input.priorweights,
+        );
+
+        // Stabilised Hessian = penalized_hessian + ridge_used·I.
+        let mut stab = penalized_hessian.clone();
+        if ridge_used > 0.0 {
+            for i in 0..p {
+                stab[[i, i]] += ridge_used;
+            }
+        }
+        let penalized_hessian_sym = SymmetricMatrix::Dense(penalized_hessian.clone());
+        let stabilizedhessian_sym = SymmetricMatrix::Dense(stab);
+
+        let priorweights_owned = input.priorweights.to_owned();
+        let beta_coef = Coefficients::new(beta.clone());
+
+        let zero_iter_penalized = deviance + penalty_term;
+
+        let working_state = WorkingState {
+            eta: LinearPredictor::new(finalmu.clone()),
+            gradient: gradient.clone(),
+            hessian: penalized_hessian_sym.clone(),
+            log_likelihood,
+            deviance,
+            penalty_term,
+            firth: FirthDiagnostics::Inactive,
+            ridge_used,
+            hessian_curvature: HessianCurvatureKind::Fisher,
+            gradient_natural_scale: score_norm + s_beta_norm + ridge_grad_norm,
+        };
+
+        let constraint_kkt_val = if let Some(lin) = input.linear_constraints.as_ref() {
+            Some(compute_constraint_kkt_diagnostics(&beta, &gradient, lin))
+        } else {
+            None
+        };
+
+        let working_summary = WorkingModelPirlsResult {
+            beta: beta_coef.clone(),
+            state: working_state,
+            status: PirlsStatus::Converged,
+            iterations: 1,
+            lastgradient_norm: gradient_norm,
+            last_deviance_change: 0.0,
+            last_step_size: 1.0,
+            last_step_halving: 0,
+            max_abs_eta,
+            constraint_kkt: constraint_kkt_val.clone(),
+            min_penalized_deviance: if zero_iter_penalized.is_finite() {
+                zero_iter_penalized
+            } else {
+                f64::INFINITY
+            },
+            final_lm_lambda: 1e-6,
+            final_accept_rho: None,
+            exported_laplace_curvature: ExportedLaplaceCurvature::ExpectedInformationSurrogate,
+        };
+
+        let (solve_c_array, solve_d_array, solve_dmu_deta, solve_d2mu_deta2, solve_d3mu_deta3) =
+            computeworkingweight_derivatives_from_eta(
+                input.likelihood,
+                input.inverse_link,
+                &eta,
+                input.priorweights,
+            )
+            .map_err(|e| format!("derivative computation failed: {e:?}"))?;
+
+        let pirls_result = PirlsResult {
+            likelihood: input.likelihood.clone(),
+            beta_transformed: beta_coef.clone(),
+            penalized_hessian_transformed: penalized_hessian_sym,
+            stabilizedhessian_transformed: stabilizedhessian_sym,
+            ridge_passport: RidgePassport::scaled_identity(
+                ridge_used,
+                RidgePolicy::explicit_stabilization_full(),
+            ),
+            ridge_used,
+            deviance,
+            edf: f64::NAN, // recomputed by outer REML from penalized_hessian + e_transformed
+            stable_penalty_term: penalty_term,
+            firth: FirthDiagnostics::Inactive,
+            finalweights: priorweights_owned.clone(),
+            final_offset: input.offset.to_owned(),
+            final_eta: eta.clone(),
+            finalmu: finalmu.clone(),
+            solveweights: priorweights_owned,
+            solveworking_response: finalz.clone(),
+            solvemu: finalmu.clone(),
+            solve_dmu_deta,
+            solve_d2mu_deta2,
+            solve_d3mu_deta3,
+            solve_c_array,
+            solve_d_array,
+            derivatives_unsupported: false,
+            status: PirlsStatus::Converged,
+            iteration: 1,
+            max_abs_eta,
+            lastgradient_norm: gradient_norm,
+            gradient_natural_scale: score_norm + s_beta_norm + ridge_grad_norm,
+            last_deviance_change: 0.0,
+            last_step_halving: 0,
+            hessian_curvature: HessianCurvatureKind::Fisher,
+            exported_laplace_curvature: ExportedLaplaceCurvature::ExpectedInformationSurrogate,
+            final_lm_lambda: 1e-6,
+            final_accept_rho: None,
+            constraint_kkt: constraint_kkt_val,
+            linear_constraints_transformed: input.linear_constraints,
+            reparam_result: input.reparam_result,
+            x_transformed: input.x_transformed_design,
+            coordinate_frame: input.coordinate_frame,
+            cache_compacted: false,
+            min_penalized_deviance: working_summary.min_penalized_deviance,
+        };
+
+        Ok((pirls_result, working_summary))
+    }
 }
 
 #[cfg(target_os = "linux")]
-pub use linux_impl::{GpuPirlsDispatchInput, try_gpu_pirls_loop_admit, try_gpu_pirls_loop_dispatch};
+pub use linux_impl::{
+    GpuGaussianPlsInput, GpuPirlsDispatchInput, try_gpu_gaussian_pls_admit,
+    try_gpu_gaussian_pls_dispatch, try_gpu_pirls_loop_admit, try_gpu_pirls_loop_dispatch,
+};
