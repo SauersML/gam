@@ -260,18 +260,19 @@ mod linux_impl {
         for (idx, pt) in per_sigma.iter().enumerate() {
             let stream_idx = idx % n_streams;
 
-            // Upload this sigma point's x_transformed. A new upload is needed
-            // per point because x_transformed = X * Qs(rho) changes with rho.
-            let shared = pirls_gpu::upload_shared_pirls_gpu(pt.x_transformed.view())
-                .map_err(|e| {
-                    crate::gpu_err!("sigma stream pool upload pt[{idx}] x_transformed: {e}")
-                })?;
+            // Upload this sigma point's X·Qs (changes per sigma point) plus the
+            // shared y, prior_w, offset (constant across all sigma points).
+            let shared =
+                pirls_gpu::upload_shared_pirls_gpu(pt.x_transformed.view(), y, prior_w, offset)
+                    .map_err(|e| {
+                        crate::gpu_err!("sigma stream pool upload pt[{idx}] shared: {e}")
+                    })?;
 
             let (ws, loop_ws) = &mut workspace_pairs[stream_idx];
 
-            // pirls_loop_on_stream: family, curvature, gamma_shape, beta0, y, prior_w,
-            // penalty_hessian, step_lm_lambda, objective_ridge, max_iter, tol, extra.
-            // The model ridge is already baked into s_transformed; objective_ridge=0.
+            // Sigma-cubature PIRLS has no prior-mean shift: linear_shift = 0,
+            // constant_shift = 0. The model ridge is baked into s_transformed.
+            let zero_shift = ndarray::Array1::<f64>::zeros(p);
             let outcome = pirls_gpu::pirls_loop_on_stream(
                 &shared,
                 ws,
@@ -280,9 +281,9 @@ mod linux_impl {
                 curvature,
                 gamma_shape,
                 beta0.view(),
-                y,
-                prior_w,
                 pt.s_transformed.view(),
+                zero_shift.view(),
+                0.0,
                 1e-6,
                 0.0,
                 max_iter,
