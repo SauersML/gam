@@ -456,8 +456,11 @@ impl MultinomialLogitLikelihood {
     ///
     /// Writes `K` probabilities into `out` (length `M + 1`). The shift uses
     /// `max(0, max(eta_active))` so the reference class is included in the
-    /// max and the denominator stays bounded.
-    fn softmax_with_baseline(eta_active: &[f64], out: &mut [f64]) {
+    /// max and the denominator stays bounded. This is the canonical
+    /// reference implementation; the FFI surface and any direct
+    /// matrix-free callers route through this method rather than carrying
+    /// their own softmax.
+    pub fn softmax_with_baseline(eta_active: &[f64], out: &mut [f64]) {
         debug_assert_eq!(out.len(), eta_active.len() + 1);
         let mut max_eta = 0.0_f64;
         for &v in eta_active {

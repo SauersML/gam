@@ -7820,21 +7820,17 @@ fn sigmoid_stable(eta: f64) -> f64 {
     }
 }
 
+/// Local FFI shim delegating to the canonical
+/// [`gam::families::vector_response::MultinomialLogitLikelihood::softmax_with_baseline`].
+///
+/// The math is single-sourced in the Rust core; this wrapper preserves the
+/// existing call sites inside `dense_fisher_glm_fit_to_pydict` (a
+/// latent-coordinate path with its own dict-shape contract) without
+/// duplicating the softmax implementation.
 fn softmax_with_baseline(eta_active: &[f64], out: &mut [f64]) {
-    let mut max_eta = 0.0_f64;
-    for &v in eta_active {
-        max_eta = max_eta.max(v);
-    }
-    let mut denom = (-max_eta).exp();
-    for (idx, &v) in eta_active.iter().enumerate() {
-        let e = (v - max_eta).exp();
-        out[idx] = e;
-        denom += e;
-    }
-    for v in out.iter_mut().take(eta_active.len()) {
-        *v /= denom;
-    }
-    out[eta_active.len()] = (-max_eta).exp() / denom;
+    gam::families::vector_response::MultinomialLogitLikelihood::softmax_with_baseline(
+        eta_active, out,
+    );
 }
 
 fn dense_fisher_glm_fit_to_pydict<'py>(

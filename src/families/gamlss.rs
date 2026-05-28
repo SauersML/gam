@@ -26301,7 +26301,6 @@ mod tests {
                 gauge_priority: 100,
                 jacobian_callback: None,
                 audit_design: None,
-            audit_design: None,
             }
         }
 
