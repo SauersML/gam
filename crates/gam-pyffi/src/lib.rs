@@ -203,6 +203,13 @@ struct PyFitConfig {
     penalty_block_gamma_priors: Option<serde_json::Value>,
     latents: Option<serde_json::Value>,
     penalties: Option<serde_json::Value>,
+    /// `gamfit.fit(..., smooths={symbol: Smooth(...)})` registry. Maps
+    /// formula symbols (single column name or comma-joined tuple) to
+    /// JSON-serialized basis descriptors. Threaded through `FitConfig` as
+    /// `smooth_overrides` and applied after term construction so any
+    /// explicit center matrix / knot vector flows into
+    /// `CenterStrategy::UserProvided` (or its kind-specific equivalent).
+    smooths: Option<serde_json::Value>,
     topology_auto_selector: Option<serde_json::Value>,
 
     // Frailty (only consumed by survival families today). Mirrors the CLI
