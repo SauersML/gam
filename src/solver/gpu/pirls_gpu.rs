@@ -1637,14 +1637,12 @@ extern "C" __global__ void status_or(
     pub struct PirlsLoopWorkspace {
         pub beta_dev: CudaSlice<f64>,
         pub eta_dev: CudaSlice<f64>,
-        pub y_dev: CudaSlice<f64>,
-        pub prior_w_dev: CudaSlice<f64>,
-        /// Solve-row buffers: `grad_eta`, `w_solver`, `deviance`, `status`.
-        pub row_solve: crate::gpu::pirls_row::SolveRowBuffers,
-        /// Alpha-ladder buffers: `objective[7]`, `status[7]`.
-        pub alpha_ladder: crate::gpu::pirls_row::AlphaLadderDevBuffers,
-        /// Full final-row buffers: all 9 fields, written once at convergence.
-        pub row_final: crate::gpu::pirls_row::RowOutputDevBuffers,
+        /// Candidate eta for line search (`eta + α·xd`).
+        pub eta_cand_dev: CudaSlice<f64>,
+        /// Row-output buffers for the accepted iterate.
+        pub row_out: crate::gpu::pirls_row::RowOutputDevBuffers,
+        /// Row-output buffers for the candidate iterate (line search).
+        pub row_out_cand: crate::gpu::pirls_row::RowOutputDevBuffers,
         pub direction_dev: CudaSlice<f64>,
         pub xd_dev: CudaSlice<f64>,
         pub scalar_dev: CudaSlice<f64>,
@@ -1669,14 +1667,11 @@ extern "C" __global__ void status_or(
             Ok(Self {
                 beta_dev: alloc_f64("beta", p)?,
                 eta_dev: alloc_f64("eta", n)?,
-                y_dev: alloc_f64("y", n)?,
-                prior_w_dev: alloc_f64("prior_w", n)?,
-                row_solve: crate::gpu::pirls_row::SolveRowBuffers::allocate(stream, n)
-                    .map_err(|e| format!("pirls loop alloc row_solve: {e}"))?,
-                alpha_ladder: crate::gpu::pirls_row::AlphaLadderDevBuffers::allocate(stream)
-                    .map_err(|e| format!("pirls loop alloc alpha_ladder: {e}"))?,
-                row_final: crate::gpu::pirls_row::RowOutputDevBuffers::allocate(stream, n)
-                    .map_err(|e| format!("pirls loop alloc row_final: {e}"))?,
+                eta_cand_dev: alloc_f64("eta_cand", n)?,
+                row_out: crate::gpu::pirls_row::RowOutputDevBuffers::allocate(stream, n)
+                    .map_err(|e| format!("pirls loop alloc row_out: {e}"))?,
+                row_out_cand: crate::gpu::pirls_row::RowOutputDevBuffers::allocate(stream, n)
+                    .map_err(|e| format!("pirls loop alloc row_out_cand: {e}"))?,
                 direction_dev: alloc_f64("direction", p)?,
                 xd_dev: alloc_f64("xd", n)?,
                 scalar_dev: alloc_f64("scalar", 1)?,

@@ -230,7 +230,7 @@ pub trait BlockHtbetaRow {
     fn has_nonzero_in_range(&self, range: Range<usize>) -> bool;
 }
 
-impl BlockHtbetaRow for ndarray::Array2<f64> {
+impl BlockHtbetaRow for Array2<f64> {
     fn has_nonzero_in_range(&self, range: Range<usize>) -> bool {
         let d = self.nrows();
         for col in range {
@@ -247,7 +247,6 @@ impl BlockHtbetaRow for ndarray::Array2<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::Array2;
 
     fn make_htbeta(d: usize, k: usize, nonzeros: &[(usize, usize)]) -> Array2<f64> {
         let mut m = Array2::<f64>::zeros((d, k));
