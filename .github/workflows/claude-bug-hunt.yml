@@ -53,28 +53,23 @@ jobs:
           prompt: |
             Hi Claude. You have the run of this repo and an Ubuntu runner.
 
-            `gam` is a Rust generalized additive model crate with cool math
-            inside it — Schwinger trick, Polya-Gamma augmentation, NUTS with
-            whitening, Hermite probit derivatives, Tierney–Kadane, intrinsic
-            smooths on S² and the cylinder/torus, REML/LAML with arrow-Schur
-            penalty blocks, GPU paths, the works. `gamfit` is its Python
-            wrapper (installed for you; the `gam` CLI is on $PATH).
+            `gam` is a Rust generalized additive model crate. `gamfit` is
+            its Python wrapper (installed for you; the `gam` CLI is on
+            $PATH). Read around. The README, the docs/, the source, and the
+            cool-math primitives sprinkled through `src/` will tell you
+            what this library is actually trying to do.
 
             ## The goal
 
             Find one real, interesting thing that is broken or behaves
             unexpectedly when you actually use this library — on real data
-            you go fetch, or on large synthetic data you design to stress
-            something specific. Then:
+            you go fetch, or on large synthetic data you design. Then:
 
               1. Add one new test file that currently fails because of the
-                 bug, and commit it directly to `main`. The test should
-                 assert something meaningful — recovery of a known truth,
-                 an invariance, calibration, parity between gamfit and the
-                 gam CLI, gradient-vs-finite-difference, REML monotonicity,
-                 whatever fits the bug. Not a snapshot of a number, not a
-                 tautology. When the bug is fixed, the test should start
-                 passing without further edits.
+                 bug, and commit it directly to `main`. The test must
+                 assert something meaningful and well-posed. When the bug
+                 is fixed, the test should start passing without further
+                 edits. No snapshot tests, no tautologies.
               2. File a GitHub issue describing what's wrong, how to
                  reproduce it, what you observed vs what you expected, and
                  your best read of why it's happening (point at files and
@@ -87,20 +82,20 @@ jobs:
             resist the temptation to patch; the failing test IS the
             deliverable.
 
-            ## You decide everything else
+            ## Diversity matters — you are one of many runs
 
-            Pick the scenario that interests you. Real data: UCI, OpenML,
-            NYC TLC, CDC, GWAS Catalog, 1000 Genomes slices, SUPPORT2,
-            Rossmann, anything you find via web search that would actually
-            stress a GAM. Synthetic: design something hard — N in the
-            millions, geometric smooths with known symmetries, survival
-            with time-varying covariates, nested ARD penalties, GPU/CPU
-            parity if a CUDA device shows up (it probably won't on this
-            runner — skip rather than fake it).
+            Many copies of you have already filed issues and tests, and
+            many more will after you. Before picking what to investigate,
+            look at what's already been hunted: `gh issue list --label
+            claude-bug-hunt --state all --limit 100`, `ls tests/bug_hunt_*
+            gamfit/tests/test_bug_hunt_* 2>/dev/null`, skim recent commits.
+            Then deliberately pick a subsystem, family, data shape, failure
+            mode, or mathematical primitive that is **under-represented**
+            in that history. Repeating yesterday's angle on a fresh dataset
+            is still collapse. Surprise the maintainer.
 
             If you genuinely can't find anything real this run, that's a
             fine outcome. Say so in the workflow log and exit. Don't ship
             a contrived issue to look productive.
 
-            Have fun with it. The math here is unusually rich; pick
-            something that's actually interesting to dig into.
+            Have fun with it.
