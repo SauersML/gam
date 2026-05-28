@@ -231,6 +231,24 @@ extern "C" __global__ void chol_logdet_col_major(
             let penalty_dev = stream
                 .alloc_zeros::<f64>(pp)
                 .map_err(|e| format!("cuda alloc penalty: {e}"))?;
+            // Query the POTRF workspace size once using the actual p so we
+            // can size the persistent buffer. This is the only buffer-size
+            // query in the hot path — every Newton step reuses it.
+            let potrf_lwork_usize = potrf_query_lwork(&solver, &stream, p)?;
+            let potrf_lwork = i32::try_from(potrf_lwork_usize)
+                .map_err(|_| format!("potrf lwork {potrf_lwork_usize} exceeds i32"))?;
+            // Allocate at least 1 element so the device pointer is always
+            // valid; cuSOLVER accepts a zero-length workspace when lwork==0.
+            let alloc_len = potrf_lwork_usize.max(1);
+            let potrf_work_dev = stream
+                .alloc_zeros::<f64>(alloc_len)
+                .map_err(|e| format!("cuda alloc potrf workspace: {e}"))?;
+            let potrf_info_dev = stream
+                .alloc_zeros::<i32>(1)
+                .map_err(|e| format!("cuda alloc potrf info: {e}"))?;
+            let potrs_info_dev = stream
+                .alloc_zeros::<i32>(1)
+                .map_err(|e| format!("cuda alloc potrs info: {e}"))?;
             Ok(Self {
                 stream,
                 blas,
@@ -241,6 +259,10 @@ extern "C" __global__ void chol_logdet_col_major(
                 h_dev,
                 rhs_dev,
                 penalty_dev,
+                potrf_work_dev,
+                potrf_lwork,
+                potrf_info_dev,
+                potrs_info_dev,
                 n,
                 p,
             })
@@ -330,15 +352,15 @@ extern "C" __global__ void chol_logdet_col_major(
         }
         .map_err(|e| format!("cublas dgemm XtWX: {e}"))?;
 
-        // Upload S + λI per step (the penalty + ridge are the only structural inputs that change).
-        let penalty = penalty_with_ridge(input.penalty_hessian, input.lm_ridge);
-        let penalty_view = penalty.view();
-        let penalty_col = to_col_major(&penalty_view);
+        // Upload S + step_lm_lambda·I for the Newton solve (LM damping only).
+        let penalty_step = penalty_with_ridge(input.penalty_hessian, input.step_lm_lambda);
+        let penalty_step_view = penalty_step.view();
+        let penalty_step_col = to_col_major(&penalty_step_view);
         ws.stream
-            .memcpy_htod(penalty_col.as_ref(), &mut ws.penalty_dev)
+            .memcpy_htod(penalty_step_col.as_ref(), &mut ws.penalty_dev)
             .map_err(|e| format!("upload penalty: {e}"))?;
 
-        // H = XtWX + (S + λI), in-place into ws.h_dev.
+        // H_step = XᵀWX + (S + step_lm_lambda·I) for the Newton solve only.
         geam_add(
             &ws.blas,
             &ws.stream,
@@ -357,14 +379,17 @@ extern "C" __global__ void chol_logdet_col_major(
             .memcpy_htod(g_slice, &mut ws.rhs_dev)
             .map_err(|e| format!("upload gradient: {e}"))?;
 
-        // Snapshot the assembled penalised Hessian for the caller before potrf
-        // overwrites it with the Cholesky factor. Single d→h copy.
-        let h_total_col = ws
+        // Exported penalised Hessian: H_final = XᵀWX + S + objective_ridge·I.
+        // Download XᵀWX and add the objective ridge on the host so LM damping
+        // never contaminates exported EDF / REML curvature / RidgePassport.
+        let xtwx_col = ws
             .stream
-            .clone_dtoh(&ws.h_dev)
-            .map_err(|e| format!("download penalised Hessian: {e}"))?;
-        let penalized_hessian =
-            from_col_major(&h_total_col, p, p).ok_or("H layout conversion failed")?;
+            .clone_dtoh(&ws.xtwx_dev)
+            .map_err(|e| format!("download XᵀWX: {e}"))?;
+        let xtwx_host =
+            from_col_major(&xtwx_col, p, p).ok_or("XᵀWX layout conversion failed")?;
+        let penalty_export = penalty_with_ridge(input.penalty_hessian, input.objective_ridge);
+        let penalized_hessian = xtwx_host + &penalty_export;
 
         // Factor + solve in place on the stream.
         potrf_in_place(&ws.solver, &ws.stream, p, &mut ws.h_dev)?;

@@ -7759,7 +7759,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     #[cfg(target_os = "linux")]
     {
         use crate::solver::gpu::pirls_dispatch_wire::{
-            GpuPirlsDispatchInput, try_gpu_pirls_loop_dispatch,
+            GpuPirlsDispatchInput, try_gpu_pirls_loop_admit, try_gpu_pirls_loop_dispatch,
         };
         // Conservative scope: dispatch only when every assumption the
         // GPU loop wires up is satisfied. Anything outside this surface
@@ -11413,6 +11413,118 @@ pub struct StablePLSResult {
     pub standard_deviation: f64,
     /// Ridge added to ensure the SPD solve is well-posed.
     pub ridge_used: f64,
+}
+
+/// EDF from an already-factorized dense regularized Hessian (dense path).
+///
+/// Mirrors `calculate_edfwithworkspace_with_penalty` but accepts the
+/// `FaerSymmetricFactor` that PLS already produced, eliminating the redundant
+/// second O(p³) factorization inside every PIRLS outer iteration.
+fn calculate_edfwithworkspace_from_factor(
+    factor: &FaerSymmetricFactor,
+    penalty: &PirlsPenalty,
+    workspace: &mut PirlsWorkspace,
+) -> Result<f64, EstimationError> {
+    match penalty {
+        PirlsPenalty::Dense { e_transformed, .. } => {
+            let p = factor.n();
+            let r = e_transformed.nrows();
+            let mp = ((p - r) as f64).max(0.0);
+            if r == 0 {
+                return Ok(p as f64);
+            }
+            if workspace.final_aug_matrix.nrows() != p || workspace.final_aug_matrix.ncols() != r {
+                workspace.final_aug_matrix = Array2::zeros((p, r));
+            }
+            for j in 0..r {
+                for i in 0..p {
+                    workspace.final_aug_matrix[[i, j]] = e_transformed[[j, i]];
+                }
+            }
+            {
+                let mut rhsview = array2_to_matmut(&mut workspace.final_aug_matrix);
+                factor.solve_in_place(rhsview.as_mut());
+            }
+            if workspace.final_aug_matrix.nrows() == p
+                && workspace.final_aug_matrix.ncols() == r
+                && array_is_finite(&workspace.final_aug_matrix)
+            {
+                return Ok(edf_from_solution(p, r, mp, e_transformed, |i, j| {
+                    workspace.final_aug_matrix[(i, j)]
+                }));
+            }
+            Err(EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            })
+        }
+        PirlsPenalty::Diagonal {
+            diag,
+            positive_indices,
+            ..
+        } => {
+            let p = factor.n();
+            let r = positive_indices.len();
+            let mp = ((p - r) as f64).max(0.0);
+            if r == 0 {
+                return Ok(p as f64);
+            }
+            if workspace.final_aug_matrix.nrows() != p || workspace.final_aug_matrix.ncols() != r {
+                workspace.final_aug_matrix = Array2::zeros((p, r));
+            } else {
+                workspace.final_aug_matrix.fill(0.0);
+            }
+            for (col, &idx) in positive_indices.iter().enumerate() {
+                workspace.final_aug_matrix[[idx, col]] = 1.0;
+            }
+            {
+                let mut rhsview = array2_to_matmut(&mut workspace.final_aug_matrix);
+                factor.solve_in_place(rhsview.as_mut());
+            }
+            let mut tr = 0.0;
+            for (col, &idx) in positive_indices.iter().enumerate() {
+                tr += diag[idx] * workspace.final_aug_matrix[[idx, col]];
+            }
+            Ok((p as f64 - tr).clamp(mp, p as f64))
+        }
+    }
+}
+
+/// EDF from an already-factorized sparse penalized Hessian (sparse path).
+///
+/// Mirrors `calculate_edf_with_penalty` but accepts the `SparseExactFactor`
+/// that PLS already produced, eliminating the redundant second sparse
+/// factorization inside every PIRLS outer iteration.
+///
+/// Only the `PirlsPenalty::Dense` variant is handled because the sparse-native
+/// path requires `PirlsPenalty::Dense` (enforced by the caller).
+fn calculate_edf_from_sparse_factor(
+    factor: &crate::linalg::sparse_exact::SparseExactFactor,
+    penalty: &PirlsPenalty,
+) -> Result<f64, EstimationError> {
+    let PirlsPenalty::Dense { e_transformed, .. } = penalty else {
+        crate::bail_invalid_estim!(
+            "calculate_edf_from_sparse_factor requires PirlsPenalty::Dense"
+        );
+    };
+    let p = factor.n();
+    let r = e_transformed.nrows();
+    let mp = ((p - r) as f64).max(0.0);
+    if r == 0 {
+        return Ok(p as f64);
+    }
+    let rhs_arr = e_transformed.t().to_owned();
+    let sol = crate::linalg::sparse_exact::solve_sparse_spdmulti(factor, &rhs_arr)
+        .map_err(|_| EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        })?;
+    if sol.nrows() == p && sol.ncols() == r && sol.iter().all(|v| v.is_finite()) {
+        return Ok(edf_from_solution(p, r, mp, e_transformed, |i, j| {
+            sol[[i, j]]
+        }));
+    }
+    Err(EstimationError::ModelIsIllConditioned {
+        condition_number: f64::INFINITY,
+    })
 }
 
 fn calculate_edf(

@@ -1184,6 +1184,10 @@ __device__ __forceinline__ double std_norm_pdf(double x) {
 /// Build the per-family CUDA source. Each source defines exactly one entry
 /// kernel (`family.kernel_name()`) reading the input arrays and writing the
 /// output arrays defined by the [`RowOutput`] contract above.
+///
+/// The GammaLog kernel has an extra `double shape` parameter after `prior_w`
+/// so the host can forward the active dispersion shape. All other families
+/// use the standard 13-argument signature.
 #[cfg(target_os = "linux")]
 fn cuda_source_for(family: PirlsRowFamily, curvature: CurvatureMode) -> String {
     let body = match family {
@@ -1203,6 +1207,13 @@ fn cuda_source_for(family: PirlsRowFamily, curvature: CurvatureMode) -> String {
         CurvatureMode::Fisher => "#define PIRLS_CURVATURE_FISHER 1",
         CurvatureMode::Observed => "#define PIRLS_CURVATURE_OBSERVED 1",
     };
+    // GammaLog receives the active shape as a scalar kernel argument so the
+    // host can forward any positive shape without recompiling the PTX.
+    let shape_param = if matches!(family, PirlsRowFamily::GammaLog) {
+        "    double         shape,\n"
+    } else {
+        ""
+    };
     format!(
         r#"
 {curvature_define}
@@ -1213,7 +1224,7 @@ extern "C" __global__ void {kernel_name}(
     const double* __restrict__ eta,
     const double* __restrict__ y,
     const double* __restrict__ prior_w,
-    double* __restrict__ mu_out,
+{shape_param}    double* __restrict__ mu_out,
     double* __restrict__ grad_eta_out,
     double* __restrict__ w_fisher_out,
     double* __restrict__ w_hessian_out,
@@ -1301,12 +1312,11 @@ fn poisson_log_body(curvature: CurvatureMode) -> String {
 
 #[cfg(target_os = "linux")]
 fn gamma_log_body(curvature: CurvatureMode) -> String {
-    // Shape passed via constant memory in Stage 2; Stage-1 reference uses
-    // unit shape (matches CPU `gamma_shape().unwrap_or(1.0)` default).
+    // `shape` is a kernel parameter (see `cuda_source_for`); the body reads it
+    // directly. No local shadowing needed.
     let tag = curvature_tag(curvature);
     format!(
-        r#"{tag}    const double shape = 1.0;
-    double eta_c = clamp_eta(eta_i, &flags);
+        r#"{tag}    double eta_c = clamp_eta(eta_i, &flags);
     double mu_raw = exp(eta_c);
     if (mu_raw < 1e-10) flags |= 0x2u;
     double mu = (mu_raw > 1e-10) ? mu_raw : 1e-10;

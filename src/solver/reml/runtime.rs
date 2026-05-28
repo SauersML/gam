@@ -8615,14 +8615,41 @@ impl<'a> RemlState<'a> {
         } else {
             PseudoLogdetMode::Smooth
         };
-        let hessian_op = std::sync::Arc::new(
-            DenseSpectralOperator::from_symmetric_with_mode(&h_total_original, hessian_mode)
-                .map_err(|e| {
-                    EstimationError::InvalidInput(format!(
-                        "DenseSpectralOperator from original-basis PIRLS Hessian: {e}"
-                    ))
-                })?,
-        );
+        // Same Cholesky fast path as `build_dense_assembly`: for ValueOnly
+        // evaluations with `Smooth` mode (no Firth), LLT replaces eigh.
+        // `build_dense_original_assembly` is only called when there is no
+        // active constraint free-basis, so the no-hard-constraints condition
+        // is always satisfied here.
+        let hessian_op: std::sync::Arc<dyn super::unified::HessianOperator> = {
+            use super::unified::DenseCholeskyValueOnlyOperator;
+            if mode == super::unified::EvalMode::ValueOnly
+                && matches!(hessian_mode, PseudoLogdetMode::Smooth)
+            {
+                match DenseCholeskyValueOnlyOperator::from_spd(&h_total_original) {
+                    Ok(chol_op) => std::sync::Arc::new(chol_op),
+                    Err(_) => std::sync::Arc::new(
+                        DenseSpectralOperator::from_symmetric_with_mode(
+                            &h_total_original,
+                            hessian_mode,
+                        )
+                        .map_err(|e| {
+                            EstimationError::InvalidInput(format!(
+                                "DenseSpectralOperator from original-basis PIRLS Hessian: {e}"
+                            ))
+                        })?,
+                    ),
+                }
+            } else {
+                std::sync::Arc::new(
+                    DenseSpectralOperator::from_symmetric_with_mode(&h_total_original, hessian_mode)
+                        .map_err(|e| {
+                            EstimationError::InvalidInput(format!(
+                                "DenseSpectralOperator from original-basis PIRLS Hessian: {e}"
+                            ))
+                        })?,
+                )
+            }
+        };
 
         let e_for_logdet = &pirls_result.reparam_result.e_transformed;
         let c_nontrivial = pirls_result.solve_c_array.iter().any(|&c| c != 0.0);
