@@ -15007,7 +15007,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     const DIVERGENCE_FROZEN_LOGLIK_CYCLES: usize = 8;
 
     let is_dynamic = family.block_geometry_is_dynamic();
+    // EMA of per-cycle wall-clock for timing-driven adaptive early-exit (#289).
+    // α = 0.3 gives a short memory (~3 cycles) so the EMA tracks recent cost.
+    let mut ema_cycle_secs: Option<f64> = None;
+    // Initial objective for the grad-ratio predicate.
+    let initial_objective = lastobjective;
     for cycle in 0..inner_max_cycles {
+        let cycle_start = std::time::Instant::now();
         // Fires at the top of each blockwise coordinate cycle so we can count
         // iterations from CI logs when a benchmark hangs inside the first
         // outer-eval. Emitted at info-level: same rationale as the joint-Newton
