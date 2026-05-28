@@ -4281,23 +4281,15 @@ fn prepare_survival_location_scale_model(
         &spec.time_block.offset_exit,
         &spec.time_block.derivative_offset_exit,
     ]);
-    // Audit-facing single-channel Jacobian for the time block: the solver's
-    // `design` field stacks [entry; exit; derivative_exit] for a row count of
-    // `3*n`, but for the identifiability audit only the n-row exit design is
-    // the relevant linear-predictor channel. Exposing this n-row view via the
-    // callback keeps every block's audit-visible row count equal to n while
-    // leaving the solver's stacked operator untouched.
-    let time_exit_dense = time_prepared
-        .design_exit
-        .try_to_dense_arc("survival_location_scale time block audit Jacobian")?
-        .as_ref()
-        .clone();
-    let time_audit_jacobian: Arc<dyn BlockEffectiveJacobian> =
-        Arc::new(AdditiveBlockJacobian {
-            design: time_exit_dense,
-            own_output: 0,
-            n_family_outputs: 1,
-        });
+    // Audit-facing design for the time block.  The solver's `design` field
+    // stacks `[entry; exit; derivative_exit]` for a row count of `3*n`
+    // (eta length = 3*n).  For the identifiability audit only the n-row
+    // exit design is the relevant linear-predictor channel.  Exposing this
+    // n-row view via `ParameterBlockSpec::audit_design` keeps every block's
+    // audit-visible row count equal to n while leaving the solver's stacked
+    // operator untouched — the two concerns (eta-producing operator vs
+    // audit-observation matrix) live in two structurally separate fields.
+    let time_audit_design: DesignMatrix = time_prepared.design_exit.clone();
     let timespec = ParameterBlockSpec {
         name: "time_transform".to_string(),
         design: time_solver_design,
@@ -4389,26 +4381,15 @@ fn prepare_survival_location_scale_model(
         } else {
             (threshold_design.clone(), threshold_prep.offset.clone())
         };
-    // Time-varying threshold blocks store an `[exit; entry; deriv]` stacked
-    // operator in `design` with 3*n rows. The identifiability audit only needs
-    // the n-row exit channel; expose that via the callback so the audit's
-    // row-equality invariant holds across blocks.
-    let threshold_audit_jacobian: Option<Arc<dyn BlockEffectiveJacobian>> =
-        if threshold_entry_design.is_some() {
-            let exit_dense = threshold_design
-                .try_to_dense_arc(
-                    "survival_location_scale threshold block audit Jacobian",
-                )?
-                .as_ref()
-                .clone();
-            Some(Arc::new(AdditiveBlockJacobian {
-                design: exit_dense,
-                own_output: 0,
-                n_family_outputs: 1,
-            }))
-        } else {
-            None
-        };
+    // Audit-facing design for time-varying threshold blocks: the solver's
+    // `design` stacks `[exit; entry; deriv]` to 3*n rows, but the audit only
+    // needs the n-row exit channel.  When the block is *not* time-varying
+    // `design` already has n rows and no audit override is needed.
+    let threshold_audit_design: Option<DesignMatrix> = if threshold_entry_design.is_some() {
+        Some(threshold_design.clone())
+    } else {
+        None
+    };
     let thresholdspec = ParameterBlockSpec {
         name: "threshold".to_string(),
         design: threshold_solver_design,
@@ -4517,25 +4498,14 @@ fn prepare_survival_location_scale_model(
         } else {
             (log_sigma_design.clone(), log_sigma_prep.offset.clone())
         };
-    // Same audit-facing trick as the threshold block: time-varying log_sigma
-    // stores a stacked 3*n-row operator but the audit only needs the n-row
-    // exit channel for the row-equality invariant.
-    let log_sigma_audit_jacobian: Option<Arc<dyn BlockEffectiveJacobian>> =
-        if log_sigma_entry_design.is_some() {
-            let exit_dense = log_sigma_design
-                .try_to_dense_arc(
-                    "survival_location_scale log_sigma block audit Jacobian",
-                )?
-                .as_ref()
-                .clone();
-            Some(Arc::new(AdditiveBlockJacobian {
-                design: exit_dense,
-                own_output: 0,
-                n_family_outputs: 1,
-            }))
-        } else {
-            None
-        };
+    // Same audit-facing decomposition as the threshold block: time-varying
+    // log_sigma stacks `[exit; entry; deriv]` to 3*n rows in `design`; the
+    // audit needs only the n-row exit channel.
+    let log_sigma_audit_design: Option<DesignMatrix> = if log_sigma_entry_design.is_some() {
+        Some(log_sigma_design.clone())
+    } else {
+        None
+    };
     let log_sigmaspec = ParameterBlockSpec {
         name: "log_sigma".to_string(),
         design: log_sigma_solver_design,
