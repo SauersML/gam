@@ -1416,13 +1416,39 @@ mod tests {
             "null direction should align with e_1 (eigenvalue r); got |u0[1,0]| = {aligned}"
         );
 
-        // If the caller lies about the nullity (e.g. claims m0 = 1 when no
-        // eigenvalue lies near the ridge), the new rule must surface the
-        // invariant violation rather than silently discarding an active
-        // direction.
+        // Issue #318: when the metadata's structural nullity is a *soft upper
+        // bound* and the assembled spectrum at the current λ has fewer
+        // ridge-level eigenvalues than `m0` predicts (e.g. a small positive σ
+        // classified as null by `analyze_penalty_block`'s relative tolerance
+        // gets amplified by a large λ above the ridge), the metadata is
+        // overruled by the eigenvalue spectrum.  The build must succeed using
+        // the actual `null_like_count` rather than erroring on the mismatch.
         let s_no_null = array![[1.0 + ridge, 0.0], [0.0, 2.0 + ridge]];
-        let err = PenaltyPseudologdet::from_assembled_with_nullity(s_no_null, Some(ridge), Some(1))
-            .expect_err("must error when no eigenvalue clusters near ridge");
+        let pld_no_null =
+            PenaltyPseudologdet::from_assembled_with_nullity(s_no_null, Some(ridge), Some(1))
+                .expect("must accept m0 as an upper bound when no eigenvalue clusters at ridge");
+        assert_eq!(
+            pld_no_null.rank(),
+            2,
+            "all eigenvalues above the ridge threshold are treated as positive",
+        );
+        assert!(
+            pld_no_null.u_null.is_none(),
+            "no nullspace basis when null_like_count == 0",
+        );
+
+        // Issue #192 invariant remains: when the assembled spectrum has *more*
+        // ridge-level eigenvalues than the metadata predicts (`null_like_count
+        // > m0`), positional null-detection would conflate an active direction
+        // with a structural null, so the build must still surface the
+        // invariant violation.
+        let s_extra_nulls = array![[ridge, 0.0], [0.0, ridge]];
+        let err = PenaltyPseudologdet::from_assembled_with_nullity(
+            s_extra_nulls,
+            Some(ridge),
+            Some(1),
+        )
+        .expect_err("must error when more eigenvalues cluster at ridge than expected");
         assert!(
             err.contains("structural nullity invariant violated"),
             "unexpected error message: {err}"
