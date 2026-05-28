@@ -50,7 +50,7 @@
 //! yielding overlap = 1.0 — triggering a spurious fatal audit halt.
 
 use gam::custom_family::{
-    BlockEffectiveJacobian, FamilyLinearizationState, ParameterBlockSpec,
+    BlockEffectiveJacobian, FamilyChannelHessian, FamilyLinearizationState, ParameterBlockSpec,
 };
 use gam::families::identifiability_compiler::{IdentityRowHessian, RowJacobianOperator};
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};

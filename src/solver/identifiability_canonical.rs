@@ -71,9 +71,13 @@ impl BlockJacobianAsRowOp {
         n_rows: usize,
         block_name: &str,
     ) -> Result<Self, String> {
-        let p = 0; // placeholder; will be determined from callback output below
+        // Pass a zero beta of length 0 — the contract for `effective_jacobian_at`
+        // at pre-fit initialization is that `beta = &[]` or `beta = &[0, ..., 0]`
+        // both produce the linearised Jacobian at the origin.  Callbacks that
+        // need a specific p-length vector will read the design width from their
+        // captured state, not from the beta length.
         let k = cb.n_outputs();
-        let zeros = vec![0.0f64; p];
+        let zeros: Vec<f64> = Vec::new();
         let state = FamilyLinearizationState {
             beta: &zeros,
             family_scalars: None,

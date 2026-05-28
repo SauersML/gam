@@ -19027,35 +19027,24 @@ pub fn fit_survival_marginal_slope_terms(
                 &spec.z,
             )?),
             FlexCompileOutcome::FullyAliased { reason } => {
-                // Record via the structured channel — the unified audit
-                // will attribute the drop to score_warp_dev via
-                // dropped_columns rather than a family-side side message.
-                // Build a zero-column prepared block so the audit sees
-                // the block with effective_dim=0 and populates aliased_pairs
-                // correctly (gauge_priority=80 ensures the drop is attributed
-                // to score_warp_dev, not to any higher-priority block).
+                // Record via the structured channel. The block is still
+                // included with its original (non-compiled) design so the
+                // unified audit's canonicalize_for_identifiability sees it
+                // and attributes the drop to score_warp_dev via
+                // dropped_columns (gauge_priority=80 is below marginal=150
+                // and logslope=120 so RRQR correctly demotes score_warp_dev).
+                // No family-side log.warn — the audit's DroppedColumn record
+                // IS the authoritative structured report.
                 cross_block_warnings.push(CrossBlockIdentifiabilityWarning {
                     candidate_label: "score_warp",
                     anchor_summary: "marginal+logslope".to_string(),
                     reason,
                 });
-                let zero_block = crate::families::gamlss::ParameterBlockInput {
-                    design: crate::linalg::matrix::DesignMatrix::Dense(
-                        crate::linalg::matrix::DenseDesignMatrix::from(
-                            ndarray::Array2::<f64>::zeros((n, 0)),
-                        ),
-                    ),
-                    offset: ndarray::Array1::zeros(n),
-                    penalties: Vec::new(),
-                    nullspace_dims: Vec::new(),
-                    initial_log_lambdas: None,
-                    initial_beta: Some(ndarray::Array1::zeros(0)),
-                };
-                Some(PerZScoreWarpPrepared {
-                    block: zero_block,
-                    runtime: base.runtime,
-                    score_dim: spec.z.ncols(),
-                })
+                Some(stripe_score_warp_across_z_coords(
+                    base.block,
+                    base.runtime,
+                    &spec.z,
+                )?)
             }
         }
     } else {
@@ -19127,25 +19116,16 @@ pub fn fit_survival_marginal_slope_terms(
         match outcome {
             FlexCompileOutcome::Reparameterised => Some(prepared),
             FlexCompileOutcome::FullyAliased { reason } => {
-                // Record via the structured channel. Build a zero-column
-                // prepared block so the unified audit sees link_dev with
-                // effective_dim=0 and attributes the drop via dropped_columns
-                // (gauge_priority=60 ensures link_dev is always the lower-
-                // priority participant in any alias pair with parametric blocks).
+                // Record via the structured channel. Keep the original
+                // (non-compiled) design so the unified audit sees link_dev
+                // with its original columns and attributes the alias drop
+                // via dropped_columns (gauge_priority=60 < marginal=150 /
+                // logslope=120 so RRQR correctly demotes link_dev).
                 cross_block_warnings.push(CrossBlockIdentifiabilityWarning {
                     candidate_label: "link_deviation",
                     anchor_summary: "marginal+logslope".to_string(),
                     reason,
                 });
-                let n_rows = prepared.block.design.nrows();
-                prepared.block.design = crate::linalg::matrix::DesignMatrix::Dense(
-                    crate::linalg::matrix::DenseDesignMatrix::from(
-                        ndarray::Array2::<f64>::zeros((n_rows, 0)),
-                    ),
-                );
-                prepared.block.penalties.clear();
-                prepared.block.nullspace_dims.clear();
-                prepared.block.initial_beta = Some(ndarray::Array1::zeros(0));
                 Some(prepared)
             }
         }

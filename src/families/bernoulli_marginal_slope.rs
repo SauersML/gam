@@ -20376,23 +20376,33 @@ pub fn fit_bernoulli_marginal_slope_terms(
             .slice(s![cursor..cursor + logslope_design.penalties.len()])
             .to_owned();
         cursor += logslope_design.penalties.len();
+        let p_m = marginal_design.design.ncols();
         let mut blocks = vec![
-            build_blockspec(
-                "marginal_surface",
+            build_marginal_blockspec_bms(
                 marginal_design,
                 baseline.0,
                 &spec.marginal_offset,
                 rho_marginal,
                 hints.marginal_beta.clone(),
-            ),
-            build_blockspec(
-                "logslope_surface",
+                logslope_design,
+                &spec.logslope_offset,
+                baseline.1,
+                p_m,
+                probit_scale,
+            )?,
+            build_logslope_blockspec_bms(
                 logslope_design,
                 baseline.1,
                 &spec.logslope_offset,
                 rho_logslope,
                 hints.logslope_beta.clone(),
-            ),
+                marginal_design,
+                &spec.marginal_offset,
+                baseline.0,
+                Arc::clone(&z),
+                p_m,
+                probit_scale,
+            )?,
         ];
         push_deviation_aux_blockspecs(
             &mut blocks,
