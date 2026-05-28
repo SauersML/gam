@@ -1529,10 +1529,11 @@ impl StreamingArrowSchur {
         let backend = CpuBatchedBlockSolver;
         for row_idx in start..end {
             let row = (self.row_builder)(row_idx)?;
+            let di = row.htt.nrows();
             self.validate_row(row_idx, &row)?;
-            let factor = factor_one_row(&row, ridge_t, self.d, row_idx)?;
+            let factor = factor_one_row(&row, ridge_t, di, row_idx)?;
             let v = backend.solve_block_vector(&factor, &row.gt);
-            for c in 0..self.d {
+            for c in 0..di {
                 let vc = v[c];
                 if vc == 0.0 {
                     continue;
@@ -1588,15 +1589,18 @@ impl StreamingArrowSchur {
         delta_beta: ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, ArrowSchurError> {
         let backend = CpuBatchedBlockSolver;
-        let mut delta_t = Array1::<f64>::zeros(self.n_rows * self.d);
+        // Total delta_t length = row_offsets[n_rows].
+        let total_len = self.row_offsets[self.n_rows];
+        let mut delta_t = Array1::<f64>::zeros(total_len);
         let mut rhs = Array1::<f64>::zeros(self.d);
         for start in (0..self.n_rows).step_by(self.chunk_size) {
             let end = (start + self.chunk_size).min(self.n_rows);
             for row_idx in start..end {
                 let row = (self.row_builder)(row_idx)?;
+                let di = row.htt.nrows();
                 self.validate_row(row_idx, &row)?;
-                let factor = factor_one_row(&row, ridge_t, self.d, row_idx)?;
-                for c in 0..self.d {
+                let factor = factor_one_row(&row, ridge_t, di, row_idx)?;
+                for c in 0..di {
                     let mut acc = row.gt[c];
                     for a in 0..self.k {
                         acc += row.htbeta[[c, a]] * delta_beta[a];
@@ -1604,8 +1608,8 @@ impl StreamingArrowSchur {
                     rhs[c] = acc;
                 }
                 let dt_i = backend.solve_block_vector(&factor, &rhs);
-                let row_base = row_idx * self.d;
-                for c in 0..self.d {
+                let row_base = self.row_offsets[row_idx];
+                for c in 0..di {
                     delta_t[row_base + c] = -dt_i[c];
                 }
             }
@@ -1614,31 +1618,37 @@ impl StreamingArrowSchur {
     }
 
     fn validate_row(&self, row_idx: usize, row: &ArrowRowBlock) -> Result<(), ArrowSchurError> {
-        if row.htt.dim() != (self.d, self.d) {
+        let expected_di = if row_idx < self.row_dims.len() {
+            self.row_dims[row_idx]
+        } else {
+            self.d
+        };
+        let actual_di = row.htt.nrows();
+        if actual_di != expected_di || row.htt.ncols() != expected_di {
             return Err(ArrowSchurError::PerRowFactorFailed {
                 row: row_idx,
                 reason: format!(
-                    "streaming row H_tt shape {:?} != ({}, {})",
+                    "streaming row H_tt shape {:?} != ({expected_di}, {expected_di})",
                     row.htt.dim(),
-                    self.d,
-                    self.d
                 ),
             });
         }
-        if row.htbeta.dim() != (self.d, self.k) {
+        if row.htbeta.dim() != (expected_di, self.k) {
             return Err(ArrowSchurError::SchurFactorFailed {
                 reason: format!(
-                    "streaming row H_tβ shape {:?} != ({}, {})",
+                    "streaming row H_tβ shape {:?} != ({expected_di}, {})",
                     row.htbeta.dim(),
-                    self.d,
                     self.k
                 ),
             });
         }
-        if row.gt.len() != self.d {
+        if row.gt.len() != expected_di {
             return Err(ArrowSchurError::PerRowFactorFailed {
                 row: row_idx,
-                reason: format!("streaming row g_t length {} != {}", row.gt.len(), self.d),
+                reason: format!(
+                    "streaming row g_t length {} != {expected_di}",
+                    row.gt.len()
+                ),
             });
         }
         Ok::<(), _>(())

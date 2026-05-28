@@ -18103,6 +18103,38 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
         result
     }
 
+    fn hessian_matvec_into(
+        &self,
+        v: &Array1<f64>,
+        out: &mut Array1<f64>,
+    ) -> Result<bool, String> {
+        let call = self.matvec_calls.fetch_add(1, Ordering::Relaxed) + 1;
+        let started = std::time::Instant::now();
+        let heartbeat_guard = crate::heartbeat::scope(format!(
+            "BMS Hessian-Hv (into) call={call} n={} p={}",
+            self.family.y.len(),
+            self.cache.slices.total
+        ));
+        self.family.exact_newton_joint_hessian_matvec_from_cache_into(
+            v,
+            &self.block_states,
+            &self.cache,
+            out,
+        )?;
+        if log_exact_work(self.family.y.len()) && (call <= 3 || call.is_power_of_two()) {
+            log::info!(
+                "[BMS Hessian-Hv] call={} n={} p={} primary_hessian_cache={} elapsed={:.3}s (into)",
+                call,
+                self.family.y.len(),
+                self.cache.slices.total,
+                self.cache.row_primary_hessians.is_some(),
+                started.elapsed().as_secs_f64()
+            );
+        }
+        drop(heartbeat_guard);
+        Ok(true)
+    }
+
     fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
         // Diagonal is consumed by inner preconditioners; full-data semantics
         // preserved (see `hessian_matvec`).

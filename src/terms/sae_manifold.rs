@@ -2050,6 +2050,37 @@ impl SaeManifoldTerm {
             kron_jac.push(jac_flat);
             sys.rows[row] = block;
         }
+        // Apply Riemannian geometry to the per-row row blocks.  When the SAE
+        // ext-coord manifold is non-Euclidean (any atom latent on sphere /
+        // circle / interval), the local Jacobian columns that map into the
+        // t-block tangent space must be projected.  We apply the same
+        // per-row tangent projector to `kron_jac` here so the Kronecker
+        // htbeta_matvec uses the Riemannian-projected Jacobian — matching what
+        // `apply_riemannian_latent_geometry` would have done on `row.htbeta`
+        // had the dense block been materialized.
+        self.apply_sae_riemannian_geometry(&mut sys);
+        {
+            let manifold = self.ext_coord_manifold();
+            if !manifold.is_euclidean() {
+                let ext = self.ext_coord_matrix();
+                let mut jac_mat = Array2::<f64>::zeros((q, p));
+                for row in 0..n {
+                    let t_i = ArrayView1::from(&ext.row(row).to_owned().into_raw_vec());
+                    let jac_flat = &mut kron_jac[row];
+                    for c in 0..q {
+                        for j in 0..p {
+                            jac_mat[[c, j]] = jac_flat[c * p + j];
+                        }
+                    }
+                    let projected = manifold.project_matrix_columns_to_tangent(t_i, jac_mat.view());
+                    for c in 0..q {
+                        for j in 0..p {
+                            jac_flat[c * p + j] = projected[[c, j]];
+                        }
+                    }
+                }
+            }
+        }
         // Build and install the Kronecker htbeta_matvec.
         //
         // `SaeKroneckerRows` holds per-row `(a_phi, local_jac)` and implements
@@ -2075,7 +2106,6 @@ impl SaeManifoldTerm {
             self.add_sae_analytic_penalty_contributions(&mut sys, registry)
                 .map_err(|err| format!("SaeManifoldTerm::assemble_arrow_schur: {err}"))?;
         }
-        self.apply_sae_riemannian_geometry(&mut sys);
         // Wire per-atom β block ranges so the Jacobi preconditioner builds one
         // dense Schur sub-block per atom (block-Jacobi) instead of scalar-diagonal
         // inversion.  Each atom's decoder coefficients form a natural block:
