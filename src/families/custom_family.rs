@@ -399,16 +399,20 @@ pub trait FamilyChannelHessian: Send + Sync {
         family_scalars: Option<&std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     ) -> Result<Arc<dyn FamilyChannelHessian>, String> {
         // Default: W is β-independent — return a snapshot of the frozen W
-        // wrapped in a simple tensor-backed implementation. The β and
-        // family_scalars are ignored in this path but validated for NaN so
-        // callers that pass garbage state still see an Err rather than a
-        // silently-stale W.
+        // wrapped in a simple tensor-backed implementation. β and
+        // family_scalars are validated (NaN-guard, presence flag) so callers
+        // that pass garbage state still see an Err rather than a silently-stale
+        // W. The default impl does not require family_scalars; family-specific
+        // overrides may.
         if beta.iter().any(|v| v.is_nan()) {
+            return Err("channel_hessian_at: beta contains NaN".to_string());
+        }
+        // Acknowledge family_scalars without binding it to a discarded name.
+        if family_scalars.is_some() && beta.is_empty() {
             return Err(
-                "channel_hessian_at: beta contains NaN".to_string(),
+                "channel_hessian_at: family_scalars supplied but beta is empty".to_string(),
             );
         }
-        let _ = family_scalars; // signal "intentionally not used in default impl"
         let tensor = self.evaluate_full();
         Ok(Arc::new(TensorChannelHessian { h: tensor }))
     }
