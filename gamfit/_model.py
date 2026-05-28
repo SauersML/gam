@@ -474,10 +474,140 @@ class Model:
         return self.report()
 
 
+class MultinomialModel:
+    """Fitted penalized multinomial-logit GAM.
+
+    Returned by ``gamfit.fit(data, formula, family='multinomial')``. The
+    underlying solver is the canonical
+    ``gam::families::multinomial::fit_penalized_multinomial`` Newton solve
+    against a reference-coded softmax likelihood; the reference class is the
+    last level recorded in the dataset schema (i.e. order of first appearance
+    in the training table, which is stable across runs).
+
+    Class names are preserved verbatim from the categorical response column,
+    so :attr:`classes_` matches what ``predict`` columns line up with — no
+    silent permutation.
+
+    Slice A of issue #328: a single uniform smoothing parameter is shared
+    across every penalty block and every active class. REML / LAML λ
+    selection lands in the follow-up slice.
+    """
+
+    __slots__ = ("_model_bytes", "_training_table_kind", "_metadata")
+
+    def __init__(
+        self,
+        *,
+        _model_bytes: bytes,
+        _training_table_kind: str | None = None,
+    ) -> None:
+        self._model_bytes = _model_bytes
+        self._training_table_kind = _training_table_kind
+        # Cache the metadata dict on construction; it never changes for a
+        # fitted model and downstream property accessors deserve a cheap
+        # attribute read rather than an FFI round-trip per call.
+        self._metadata = rust_module().multinomial_model_metadata_pyfunc(self._model_bytes)
+
+    # ------------------------------------------------------------------ class metadata
+    @property
+    def classes_(self) -> list[str]:
+        """Class labels in the order ``predict`` columns line up with.
+
+        The last entry is the reference class. Matches the response level
+        order recorded in the training dataset schema.
+        """
+        return list(self._metadata["class_levels"])
+
+    @property
+    def formula(self) -> str:
+        return str(self._metadata["formula"])
+
+    @property
+    def family_name(self) -> str:
+        return "multinomial"
+
+    @property
+    def converged(self) -> bool:
+        return bool(self._metadata["converged"])
+
+    @property
+    def deviance(self) -> float:
+        return float(self._metadata["deviance"])
+
+    @property
+    def n_iter_(self) -> int:
+        return int(self._metadata["iterations"])
+
+    # ------------------------------------------------------------------ predict
+    def predict(self, data: Any) -> Any:
+        """Predict class probabilities for new rows.
+
+        Returns an ``(N, K)`` numpy array whose columns are aligned with
+        :attr:`classes_` (column ``j`` is ``P(Y = self.classes_[j] | x)``).
+        Rows sum to 1.
+        """
+        headers, rows, _ = normalize_table(data)
+        try:
+            probs = rust_module().predict_multinomial_formula_pyfunc(
+                self._model_bytes, headers, rows
+            )
+        except Exception as exc:
+            raise map_exception(exc) from exc
+        return probs
+
+    # ------------------------------------------------------------------ summary
+    def summary(self) -> str:
+        """Human-readable summary covering convergence, classes, and per-class edf.
+
+        Slice A reports the *unpenalized* coefficient-block edf — under a
+        uniform λ the active-class effective-degrees-of-freedom degenerate
+        to the per-class column count `P` (one block of unpenalised score
+        warps). Once REML wiring lands the next slice this method will
+        report the correct hat-matrix trace per class.
+        """
+        meta = self._metadata
+        p = int(meta["p_per_class"])
+        m = int(meta["n_active_classes"])
+        levels = list(meta["class_levels"])
+        ref = int(meta["reference_class_index"])
+        lines = [
+            f"MultinomialModel formula: {meta['formula']}",
+            f"  classes: {levels}  (reference = {levels[ref]!r})",
+            f"  active classes (K-1): {m}",
+            f"  coefficients per class (P): {p}",
+            f"  total coefficients: {p * m}",
+            f"  lambda: {float(meta['lambda']):.6g}",
+            f"  iterations: {int(meta['iterations'])}  converged: {bool(meta['converged'])}",
+            f"  deviance: {float(meta['deviance']):.6g}",
+            f"  penalized -log L: {float(meta['penalized_neg_log_likelihood']):.6g}",
+        ]
+        # Per-class slope-norm rollup: a quick orientation pass over what
+        # each class learned relative to the reference. Coefficients are
+        # stored in row-major `(P, K-1)` order; column `a` is class
+        # `levels[a]`.
+        coefs = list(meta["coefficients_flat"])
+        for a in range(m):
+            class_block = coefs[a * p : (a + 1) * p]
+            norm = math.sqrt(sum(c * c for c in class_block))
+            lines.append(f"    class {levels[a]!r} vs ref: ‖β_a‖₂ = {norm:.4g}")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------ identity / repr
+    def __repr__(self) -> str:
+        return (
+            f"MultinomialModel(formula={self.formula!r}, "
+            f"classes={self.classes_!r}, converged={self.converged})"
+        )
+
+    def __str__(self) -> str:
+        return self.summary()
+
+
 __all__ = [
     "CompetingRisksCIF",
     "CompetingRisksPrediction",
     "Model",
+    "MultinomialModel",
     "SurvivalPrediction",
     "TermBlock",
     "competing_risks_cif",
