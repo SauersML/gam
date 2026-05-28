@@ -2636,6 +2636,108 @@ extern "C" __global__ void status_or(
             .map_err(|e| format!("download vec: {e}"))?;
         Ok(Array1::from_vec(host))
     }
+
+    /// Result of one GPU Gaussian exact penalised least-squares solve.
+    pub struct GaussianPlsResult {
+        pub beta: Array1<f64>,
+        pub penalized_hessian: Array2<f64>,
+        pub logdet: f64,
+    }
+
+    /// Exact GPU PLS for Gaussian-identity: assembles QsT A Qs + S on host,
+    /// then runs POTRF/POTRS on device.  Replaces the PIRLS loop for this family.
+    pub fn solve_gaussian_pls_on_stream(
+        a_orig: ArrayView2<'_, f64>,
+        b_orig: ArrayView1<'_, f64>,
+        s_transformed: ArrayView2<'_, f64>,
+        linear_shift: ArrayView1<'_, f64>,
+        prior_mean_target: ArrayView1<'_, f64>,
+        ridge: f64,
+        qs: Option<ArrayView2<'_, f64>>,
+    ) -> Result<GaussianPlsResult, String> {
+        let p = b_orig.len();
+        if a_orig.dim() != (p, p) {
+            return Err(format!("A shape {:?} != ({p},{p})", a_orig.dim()));
+        }
+        if s_transformed.dim() != (p, p) {
+            return Err(format!("S shape {:?} != ({p},{p})", s_transformed.dim()));
+        }
+        if linear_shift.len() != p {
+            return Err(format!("linear_shift len {} != p={p}", linear_shift.len()));
+        }
+        if prior_mean_target.len() != p {
+            return Err(format!("prior_mean_target len {} != p={p}", prior_mean_target.len()));
+        }
+        if let Some(qs_v) = qs {
+            if qs_v.dim() != (p, p) {
+                return Err(format!("qs shape {:?} != ({p},{p})", qs_v.dim()));
+            }
+        }
+        let (h_rotated, rhs_base) = if let Some(qs_v) = qs {
+            let qs_owned = qs_v.to_owned();
+            let tmp = a_orig.dot(&qs_owned);
+            let h = qs_owned.t().dot(&tmp);
+            let rb = qs_owned.t().dot(&b_orig);
+            (h, rb)
+        } else {
+            (a_orig.to_owned(), b_orig.to_owned())
+        };
+        let penalized_hessian: Array2<f64> = &h_rotated + &s_transformed;
+        let mut regularized = penalized_hessian.clone();
+        if ridge > 0.0 {
+            for i in 0..p {
+                regularized[[i, i]] += ridge;
+            }
+        }
+        let mut rhs_host = rhs_base;
+        rhs_host += &linear_shift;
+        if ridge > 0.0 {
+            rhs_host.scaled_add(ridge, &prior_mean_target);
+        }
+        let (ctx, stream) = context_and_stream()?;
+        let solver = DnHandle::new(stream.clone())
+            .map_err(|e| format!("cusolver init (gaussian pls): {e}"))?;
+        let pp = p.checked_mul(p).ok_or("p*p overflow (gaussian pls)")?;
+        let mut h_dev = stream
+            .alloc_zeros::<f64>(pp)
+            .map_err(|e| format!("alloc H (gaussian pls): {e}"))?;
+        let mut rhs_dev = stream
+            .alloc_zeros::<f64>(p)
+            .map_err(|e| format!("alloc rhs (gaussian pls): {e}"))?;
+        let potrf_lwork_usize = potrf_query_lwork(&solver, &stream, p)?;
+        let potrf_lwork = i32::try_from(potrf_lwork_usize)
+            .map_err(|_| "potrf lwork overflow (gaussian pls)".to_string())?;
+        let mut potrf_work_dev = stream
+            .alloc_zeros::<f64>(potrf_lwork_usize.max(1))
+            .map_err(|e| format!("alloc potrf workspace (gaussian pls): {e}"))?;
+        let mut potrf_info_dev = stream
+            .alloc_zeros::<i32>(1)
+            .map_err(|e| format!("alloc potrf info (gaussian pls): {e}"))?;
+        let mut potrs_info_dev = stream
+            .alloc_zeros::<i32>(1)
+            .map_err(|e| format!("alloc potrs info (gaussian pls): {e}"))?;
+        let reg_col = to_col_major(&regularized.view());
+        stream
+            .memcpy_htod(reg_col.as_ref(), &mut h_dev)
+            .map_err(|e| format!("upload H (gaussian pls): {e}"))?;
+        let rhs_slice = rhs_host.as_slice().ok_or("rhs_host not contiguous (gaussian pls)")?;
+        stream
+            .memcpy_htod(rhs_slice, &mut rhs_dev)
+            .map_err(|e| format!("upload rhs (gaussian pls): {e}"))?;
+        potrf_in_place_reuse(&solver, &stream, p, potrf_lwork, &mut h_dev, &mut potrf_work_dev, &mut potrf_info_dev)?;
+        potrs_in_place_reuse(&solver, &stream, p, 1, &h_dev, &mut rhs_dev, &mut potrs_info_dev)?;
+        let logdet = cholesky_logdet_device(&stream, &ctx, p, &h_dev)?;
+        let beta_raw = stream
+            .clone_dtoh(&rhs_dev)
+            .map_err(|e| format!("download beta (gaussian pls): {e}"))?;
+        check_deferred_potrf_info(&stream, &potrf_info_dev)?;
+        check_deferred_potrs_info(&stream, &potrs_info_dev)?;
+        Ok(GaussianPlsResult {
+            beta: Array1::from_vec(beta_raw),
+            penalized_hessian,
+            logdet,
+        })
+    }
 }
 
 pub fn weighted_crossprod_gpu(

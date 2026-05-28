@@ -674,37 +674,43 @@ pub fn ift_du_drho(
     dbeta_drho: ArrayView2<'_, f64>,
 ) -> Array2<f64> {
     let n = cache.undamped_factor_count();
-    let d = cache.d;
+    let total_len = cache.delta_t_len();
     let k = cache.k;
     let r = dbeta_drho.ncols();
     if !cache.htbeta_available()
-        || gu_rho.nrows() != n * d
+        || gu_rho.nrows() != total_len
         || gu_rho.ncols() != r
         || dbeta_drho.nrows() != k
     {
-        return Array2::<f64>::from_elem((n * d, r), f64::NAN);
+        return Array2::<f64>::from_elem((total_len, r), f64::NAN);
     }
 
-    let mut out = Array2::<f64>::zeros((n * d, r));
-    let mut rhs = Array1::<f64>::zeros(d);
-    let mut htbeta_delta = Array1::<f64>::zeros(d);
+    let mut out = Array2::<f64>::zeros((total_len, r));
+    // Allocate scratch at max_d; per-row slice is ..di.
+    let mut rhs = Array1::<f64>::zeros(cache.d);
+    let mut htbeta_delta = Array1::<f64>::zeros(cache.d);
     for a in 0..r {
         // Per-row: rhs_i = G_{u_i,ρ_a} + H_uβ_i · ∂β*/∂ρ_a.
         for i in 0..n {
+            let di = cache.row_dims[i];
+            let row_base = cache.row_offsets[i];
+            let mut htbeta_i = htbeta_delta.slice_mut(ndarray::s![..di]).to_owned();
             // Companion to the `du/dβ` assembler above; same H_tβ cache.
-            if !cache.apply_htbeta_row(i, dbeta_drho.column(a), &mut htbeta_delta) {
+            if !cache.apply_htbeta_row(i, dbeta_drho.column(a), &mut htbeta_i) {
                 // SAFETY: `false` here means the family declared H_tβ row
                 // products available but did not populate them — contract
                 // violation against the joint-evidence capability surface.
-                return Array2::<f64>::from_elem((n * d, r), f64::NAN);
+                return Array2::<f64>::from_elem((total_len, r), f64::NAN);
             }
-            for c in 0..d {
-                rhs[c] = gu_rho[[i * d + c, a]] + htbeta_delta[c];
+            let rhs_i = rhs.slice_mut(ndarray::s![..di]);
+            for c in 0..di {
+                rhs_i[c] = gu_rho[[row_base + c, a]] + htbeta_i[c];
             }
+            let rhs_slice = rhs.slice(ndarray::s![..di]).to_owned();
             // u_ρ_i = -H_uu_i⁻¹ rhs_i, undamped factor.
-            let v = chol_lower_solve_vector(cache.undamped_factor(i), &rhs);
-            for c in 0..d {
-                out[[i * d + c, a]] = -v[c];
+            let v = chol_lower_solve_vector(cache.undamped_factor(i), &rhs_slice);
+            for c in 0..di {
+                out[[row_base + c, a]] = -v[c];
             }
         }
     }
