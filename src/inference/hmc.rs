@@ -37,7 +37,7 @@ use crate::solver::mixture_link::{
     InverseLinkKernel, LinkParamPartials, inverse_link_jet_for_inverse_link, softmax_last_fixedzero,
 };
 use crate::types::{
-    InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoPrior, StandardLink,
+    InverseLink, LikelihoodSpec, ResponseFamily, RhoPrior, StandardLink,
     is_valid_tweedie_power,
 };
 use crate::visualizer::VisualizerSession;
@@ -1603,7 +1603,7 @@ mod tests {
     use crate::matrix::DesignMatrix;
     use crate::survival::{MonotonicityPenalty, PenaltyBlocks, SurvivalSpec};
     use crate::types::{
-        InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LinkFunction,
+        InverseLink, LikelihoodScaleMetadata, LikelihoodSpec,
         LogLikelihoodNormalization, ResponseFamily, RhoPrior, StandardLink,
     };
     use general_mcmc::generic_hmc::HamiltonianTarget;

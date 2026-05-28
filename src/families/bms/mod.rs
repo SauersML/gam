@@ -38,12 +38,9 @@ use crate::smooth::{
     build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices,
 };
-use crate::solver::estimate::EstimationError;
 use crate::types::{InverseLink, StandardLink, WigglePenaltyConfig};
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, s};
-use rayon::iter::{
-    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
-};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, s};
+use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -1097,7 +1094,6 @@ pub(crate) mod workspace;
 // Public re-exports — preserve the original module path's public surface.
 // ---------------------------------------------------------------------------
 pub use block_specs::fit_bernoulli_marginal_slope_terms;
-pub(crate) use exact_eval_cache::{RowPrimaryEvalCache, RowPrimaryEvalPin};
 pub use gradient_paths::{
     MarginalSlopeCovariance, MarginalSlopeCovarianceShape, marginal_slope_covariance_from_scores,
     marginal_slope_preserving_scale, marginal_slope_probit_eta, padded_deviation_seed,
@@ -1108,7 +1104,6 @@ pub(crate) use install_flex::FlexCompileOutcome;
 // pub(crate) re-exports for internal callers:
 pub(crate) use family::{
     BernoulliMarginalLinkMap, bernoulli_marginal_link_map,
-    bernoulli_marginal_slope_eta_from_probability,
     build_link_deviation_block_from_knots_design_seed_and_weights,
     build_score_warp_deviation_block_from_seed,
 };
@@ -1123,4 +1118,4 @@ pub(crate) use install_flex::{
 };
 pub(crate) use gradient_paths::standardize_latent_z_with_policy;
 pub use block_specs::{BmsFamilyScalars, BmsLogslopeJacobian, BmsMarginalJacobian};
-pub(crate) use block_specs::{build_deviation_aux_blockspec, push_deviation_aux_blockspecs};
+pub(crate) use block_specs::push_deviation_aux_blockspecs;
