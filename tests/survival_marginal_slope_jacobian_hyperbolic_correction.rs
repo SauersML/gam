@@ -55,7 +55,7 @@ use gam::custom_family::{
 use gam::families::identifiability_compiler::{IdentityRowHessian, RowJacobianOperator};
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
 use gam::solver::identifiability_audit::audit_identifiability_channel_aware;
-use ndarray::{Array1, Array2, Array3};
+use ndarray::{Array1, Array2, Array3, s};
 use std::any::Any;
 use std::sync::Arc;
 
@@ -380,19 +380,21 @@ impl RowJacobianOperator for LogslopeOperator {
     }
     fn apply_row(&self, row: usize, delta_beta: &[f64], out: &mut [f64]) {
         assert_eq!(out.len(), 3);
-        let n = self.phi.nrows();
-        let scalars = compute_row_scalars(&self.phi, &self.beta, self.s_f);
+        // Compute only the single-row scalar (g, c1) for this row.
+        let gi: f64 = self.phi.row(row).iter().zip(self.beta.iter()).map(|(&x, &b)| x * b).sum();
+        let obs_g = self.s_f * gi;
+        let ci = (1.0 + obs_g * obs_g).sqrt();
+        let c1i = self.s_f * self.s_f * gi / ci;
         let mut dg = 0.0;
         for (j, &db) in delta_beta.iter().enumerate() {
             dg += self.phi[[row, j]] * db;
         }
-        let scale_eta0 = self.q0[row] * scalars.c1[row] + self.s_f * self.z[row];
-        let scale_eta1 = self.q1[row] * scalars.c1[row] + self.s_f * self.z[row];
-        let scale_ad1 = self.qd1[row] * scalars.c1[row];
+        let scale_eta0 = self.q0[row] * c1i + self.s_f * self.z[row];
+        let scale_eta1 = self.q1[row] * c1i + self.s_f * self.z[row];
+        let scale_ad1 = self.qd1[row] * c1i;
         out[0] = scale_eta0 * dg;
         out[1] = scale_eta1 * dg;
         out[2] = scale_ad1 * dg;
-        let _ = n;
     }
     fn evaluate_full(&self) -> Array3<f64> {
         let n = self.phi.nrows();

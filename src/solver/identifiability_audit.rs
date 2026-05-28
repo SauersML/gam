@@ -419,12 +419,29 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
     // tolerance as the per-block diagonal counter above, so the joint
     // verdict and the per-block diagnostics are tolerance-consistent.
     let rrqr_started = std::time::Instant::now();
-    log::info!(
-        "[STAGE] identifiability audit: joint RRQR start n={} p_total={} priority_reorder={}",
-        n,
-        p_total,
-        !priority_perm_is_identity,
-    );
+    if priority_perm_is_identity {
+        log::info!(
+            "[STAGE] identifiability audit: joint RRQR start n={} p_total={} priority_reorder=false",
+            n,
+            p_total,
+        );
+    } else {
+        // The priority permutation actually changes column order — log which
+        // blocks are being reordered so production runs can confirm the
+        // canonical-gauge path is exercised.  This surfaces in logs even
+        // at INFO level so it's always visible without debug builds.
+        let block_priority_summary: Vec<String> = specs
+            .iter()
+            .map(|s| format!("{}={}", s.name, s.gauge_priority))
+            .collect();
+        log::info!(
+            "[STAGE] identifiability audit: joint RRQR start n={} p_total={} \
+             priority_reorder=true blocks=[{}]",
+            n,
+            p_total,
+            block_priority_summary.join(", "),
+        );
+    }
     let rrqr = if priority_perm_is_identity {
         rrqr_with_permutation(&x_joint, default_rrqr_rank_alpha())
             .map_err(|e| format!("identifiability audit joint RRQR failed: {e:?}"))?
