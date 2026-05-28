@@ -1869,24 +1869,43 @@ impl SaeManifoldTerm {
             assignment_prior_grad_hdiag(&self.assignment, rho)?;
         let mut sys = ArrowSchurSystem::new(n, q, beta_dim);
 
-        // Decoder smoothness penalty in the beta block.
+        // Decoder smoothness penalty: build one KroneckerPenaltyOp per atom
+        // (structure = λ·S_k ⊗ I_p, offset = beta_offsets[k]) instead of
+        // materialising the dense K×K block.  The gradient is still written into
+        // sys.gb because it is a dense K-vector; only the Hessian is sparse (#296).
+        let mut smooth_ops: Vec<Arc<dyn BetaPenaltyOp>> = Vec::with_capacity(self.atoms.len());
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
             let m = atom.basis_size();
             let off = beta_offsets[atom_idx];
+            // Symmetrise and scale the smoothness penalty matrix.
+            let mut scaled_s = Array2::<f64>::zeros((m, m));
+            for i in 0..m {
+                for j in 0..m {
+                    let s_ij =
+                        0.5 * (atom.smooth_penalty[[i, j]] + atom.smooth_penalty[[j, i]]);
+                    scaled_s[[i, j]] = lambda_smooth * s_ij;
+                }
+            }
+            // Gradient: g[beta_i] += (λ S_k B_k)[i, out_col]
             for out_col in 0..p {
                 for i in 0..m {
                     let beta_i = off + i * p + out_col;
                     let mut grad = 0.0;
                     for j in 0..m {
-                        let beta_j = off + j * p + out_col;
-                        let s_ij =
-                            0.5 * (atom.smooth_penalty[[i, j]] + atom.smooth_penalty[[j, i]]);
-                        sys.hbb[[beta_i, beta_j]] += lambda_smooth * s_ij;
-                        grad += lambda_smooth * s_ij * atom.decoder_coefficients[[j, out_col]];
+                        grad += scaled_s[[i, j]]
+                            * atom.decoder_coefficients[[j, out_col]];
                     }
                     sys.gb[beta_i] += grad;
                 }
             }
+            // KroneckerPenaltyOp: factor_a = λ·S_k (m×m), factor_b = I_p (p×p).
+            let identity_p = Array2::<f64>::eye(p);
+            smooth_ops.push(Arc::new(KroneckerPenaltyOp {
+                factor_a: scaled_s,
+                factor_b: identity_p,
+                global_offset: off,
+                k: beta_dim,
+            }));
         }
 
         // Hoist per-row temporaries outside the row loop: these allocations

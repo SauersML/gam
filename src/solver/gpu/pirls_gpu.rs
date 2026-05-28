@@ -2883,17 +2883,22 @@ pub fn solve_pirls_step_gpu(input: PirlsGpuInput<'_>) -> Result<PirlsGpuStep, St
     }
 }
 
-/// Upload `x` once and return a shared device-resident handle that many
-/// [`SigmaPirlsGpuWorkspace`]s can read from concurrently. The shared
-/// handle keeps the cached per-ordinal `CudaContext` alive so all peer
-/// workspaces bind to the same context and can interleave on its
-/// asynchronous engines.
+/// Upload X_original, y, prior_w, and offset once per model and return a
+/// shared device-resident handle reused across all ρ / σ points. All four
+/// arrays must have the same row-count `n`. The shared handle keeps the
+/// cached per-ordinal `CudaContext` alive so all peer workspaces bind to
+/// the same context and can interleave on its asynchronous engines.
 #[cfg(target_os = "linux")]
-pub fn upload_shared_pirls_gpu(x: ArrayView2<'_, f64>) -> Result<PirlsGpuSharedData, String> {
+pub fn upload_shared_pirls_gpu(
+    x: ndarray::ArrayView2<'_, f64>,
+    y: ndarray::ArrayView1<'_, f64>,
+    prior_w: ndarray::ArrayView1<'_, f64>,
+    offset: ndarray::ArrayView1<'_, f64>,
+) -> Result<PirlsGpuSharedData, String> {
     if crate::gpu::runtime::GpuRuntime::global().is_none() {
         return Err("cuda runtime unavailable; cannot upload shared GPU PIRLS data".to_string());
     }
-    PirlsGpuSharedData::upload_impl(x)
+    PirlsGpuSharedData::upload_impl(x, y, prior_w, offset)
 }
 
 /// Allocate a per-stream workspace bound to a fresh non-default CUDA
@@ -2904,6 +2909,25 @@ pub fn allocate_sigma_pirls_workspace(
     shared: &PirlsGpuSharedData,
 ) -> Result<SigmaPirlsGpuWorkspace, String> {
     SigmaPirlsGpuWorkspace::allocate_impl(shared)
+}
+
+/// Upload the reparameterisation matrix `Qs` (p×p) for the current ρ / σ
+/// point. Call once per ρ / σ point before calling
+/// [`pirls_loop_on_stream`]. When no reparameterisation is active, pass an
+/// identity matrix.
+#[cfg(target_os = "linux")]
+pub fn upload_qs_pirls(
+    ws: &mut SigmaPirlsGpuWorkspace,
+    qs: ndarray::ArrayView2<'_, f64>,
+) -> Result<(), String> {
+    cuda::upload_qs(ws, qs)
+}
+
+/// Upload an identity Qs for the current ρ / σ point. Equivalent to
+/// [`upload_qs_pirls`] with an identity matrix; avoids host allocation.
+#[cfg(target_os = "linux")]
+pub fn upload_qs_identity_pirls(ws: &mut SigmaPirlsGpuWorkspace) -> Result<(), String> {
+    cuda::upload_qs_identity(ws)
 }
 
 /// Drive one PIRLS Newton step on the workspace's CUDA stream against the
@@ -3889,6 +3913,10 @@ mod stream_device_parity_tests {
         let mut ws = allocate_sigma_pirls_workspace(&shared).expect("alloc ws");
         let mut loop_ws = allocate_pirls_loop_workspace(&shared, &ws).expect("alloc loop_ws");
         let t0 = Instant::now();
+        // No prior-mean shift in this benchmark — penalty = ½βᵀSβ
+        // with `s_transformed = penalty`, `linear_shift = 0`,
+        // `constant_shift = 0`.
+        let linear_shift_zero = ndarray::Array1::<f64>::zeros(p);
         drop(
             pirls_loop_on_stream(
                 &shared,
@@ -3898,9 +3926,9 @@ mod stream_device_parity_tests {
                 CurvatureMode::Fisher,
                 1.0,
                 beta0.view(),
-                y.view(),
-                prior_w.view(),
                 penalty.view(),
+                linear_shift_zero.view(),
+                0.0,
                 0.0,
                 0.0,
                 30,

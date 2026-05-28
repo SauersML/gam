@@ -191,7 +191,13 @@ mod linux_impl {
         assert_eq!(admission.n, n);
         assert_eq!(admission.p, p);
         // --- Device upload + workspace allocation -----------------------
-        let shared = pirls_gpu::upload_shared_pirls_gpu(input.x_transformed)?;
+        // Upload X, y, prior_w, and offset (#258) once; shared by all iters.
+        let shared = pirls_gpu::upload_shared_pirls_gpu(
+            input.x_transformed,
+            input.y,
+            input.priorweights,
+            input.offset,
+        )?;
         let mut ws = pirls_gpu::allocate_sigma_pirls_workspace(&shared)?;
         let mut loop_ws = pirls_gpu::allocate_pirls_loop_workspace(&shared, &ws)?;
 
