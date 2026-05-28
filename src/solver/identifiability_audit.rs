@@ -590,6 +590,35 @@ pub fn audit_identifiability(
     // default = 100) `priority_perm` is the identity (stable sort
     // preserves spec order), so legacy callers see no behaviour
     // change.
+    //
+    // LOAD-BEARING: this reorder is NOT dead code even though every
+    // built-in family happens to assemble specs in descending priority
+    // order.  Three active use cases require the non-identity path:
+    //
+    //   1. Custom families via the Python API — Python callers build
+    //      `ParameterBlockSpec` lists and pass them to
+    //      `audit_identifiability` without any pre-sort guarantee.
+    //      Priority ownership (which block loses the shared direction)
+    //      must be honoured regardless of the list order.
+    //
+    //   2. `bms/install_flex.rs` drives RRQR through this function
+    //      for the cross-block identifiability check during BMS flex
+    //      installation.  The anchor blocks (priority=200) are pushed
+    //      before the candidate (priority=100), which is descending,
+    //      but callers that add flex blocks interleaved with anchors
+    //      could arrive in non-descending order.
+    //
+    //   3. The `audit_priority_perm_invariance` integration tests
+    //      explicitly pass scrambled spec lists (e.g. [low=80,
+    //      high=200, mid=150]) to verify the rank verdict and drop
+    //      attribution are invariant under spec-list permutation.
+    //      Those tests would fail if this branch were removed, because
+    //      RRQR on natural column order of [low, high, mid] would
+    //      offer the alias to "low" first — which is the WRONG block.
+    //
+    // The identity fast-path (`priority_perm_is_identity`) is kept so
+    // that the common case (all specs already in descending order)
+    // avoids an O(p_total) copy of `x_joint`.
     let mut priority_perm: Vec<usize> = (0..p_total).collect();
     let col_block_idx: Vec<usize> = (0..specs.len())
         .flat_map(|i| std::iter::repeat(i).take(col_offsets[i + 1] - col_offsets[i]))
