@@ -9444,8 +9444,13 @@ fn maybe_auto_shrink_bspline_spec(
                 return (spec.clone(), None);
             }
             let note = format!(
-                "auto-shrink (#340): n={} forced degree {}->{} and interior knots {}->{}",
-                n, spec.degree, eff_degree, num_internal_knots, eff_interior,
+                "auto-shrink (#340): n={n} too small for requested degree={req_deg}, \
+                 interior_knots={req_ki}; using degree={eff_deg}, interior_knots={eff_ki}",
+                n = n,
+                req_deg = spec.degree,
+                req_ki = num_internal_knots,
+                eff_deg = eff_degree,
+                eff_ki = eff_interior,
             );
             log::info!("B-spline {note} on Generate knotspec");
             let mut shrunk_spec = spec.clone();
