@@ -1210,55 +1210,6 @@ fn effective_kkt_tolerance(options: &WorkingModelPirlsOptions) -> f64 {
 //     dV/dρ_k = 0.5 λ_k βᵀ S_k β + 0.5 λ_k tr(H^{-1} S_k) - 0.5 det1[k].
 const FIXED_STABILIZATION_RIDGE: f64 = 1e-8;
 
-enum WorkingCoordinateDesign {
-    OriginalSparseNative,
-    TransformedExplicit {
-        x_transformed: DesignMatrix,
-        x_csr: Option<SparseRowMat<usize, f64>>,
-    },
-    TransformedImplicit {
-        transform: WorkingReparamTransform,
-    },
-}
-
-#[derive(Clone)]
-enum WorkingReparamTransform {
-    Dense(Arc<Array2<f64>>),
-    Kronecker(Arc<KroneckerQsTransform>),
-}
-
-impl WorkingReparamTransform {
-    fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
-        match self {
-            Self::Dense(qs) => fast_av(qs.as_ref(), vector),
-            Self::Kronecker(transform) => transform.apply(vector),
-        }
-    }
-
-    fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
-        match self {
-            Self::Dense(qs) => fast_atv(qs, vector),
-            Self::Kronecker(transform) => transform.apply_transpose(vector),
-        }
-    }
-
-    fn materialize_dense(&self) -> Array2<f64> {
-        match self {
-            Self::Dense(qs) => qs.as_ref().clone(),
-            Self::Kronecker(transform) => transform.materialize(),
-        }
-    }
-
-    fn conjugate_matrix(&self, matrix: &Array2<f64>) -> Array2<f64> {
-        match self {
-            Self::Dense(qs) => {
-                let tmp = fast_atb(qs, matrix);
-                symmetrize_dense_matrix(&fast_ab(&tmp, qs))
-            }
-            Self::Kronecker(transform) => transform.conjugate_matrix(matrix),
-        }
-    }
-}
 
 #[derive(Clone)]
 enum PirlsPenalty {

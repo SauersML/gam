@@ -7673,6 +7673,126 @@ impl GaussianLocationScaleFamily {
     }
 }
 
+/// Per-subject 2×2 channel Hessian `W_i` for Gaussian location-scale.
+///
+/// The row negative log-likelihood (with per-row weight `w_i`, response `y_i`,
+/// mean predictor `μ_i`, log-scale predictor `s_i = log σ_i`) is
+///
+/// ```text
+/// ρ_i(μ, s) = w_i [s + 0.5·(y_i − μ)²·exp(−2s)]
+/// ```
+///
+/// The 2×2 Hessian in `(μ, s)` coordinates:
+///
+/// ```text
+/// W_i[0,0] = w_i · exp(−2 s_i)                        ∂²ρ/∂μ²
+/// W_i[1,1] = w_i · 2·(y_i − μ_i)²·exp(−2 s_i)        ∂²ρ/∂s²
+/// W_i[0,1] = W_i[1,0] = w_i · 2·(y_i − μ_i)·exp(−2 s_i)  ∂²ρ/∂μ∂s
+/// ```
+///
+/// The off-diagonal cross-channel term `∂²ρ/∂μ∂s` is nonzero whenever the
+/// residual `(y_i − μ_i) ≠ 0`, i.e. away from the fitted mean.
+pub struct GaussianLocationScaleChannelHessian {
+    /// Row-major `(n × 2 × 2)` PSD-clamped per-subject Hessian.
+    h: ndarray::Array3<f64>,
+}
+
+impl GaussianLocationScaleChannelHessian {
+    /// Construct from pilot predictors (μ and log σ at current β) and data.
+    ///
+    /// `y` is the response, `w` the per-row sample weights, `eta_mu` and
+    /// `eta_log_sigma` the current linear predictors. Negative eigenvalues
+    /// are projected to zero (PSD clamp) before storage.
+    pub fn from_pilot(
+        y: &ndarray::Array1<f64>,
+        w: &ndarray::Array1<f64>,
+        eta_mu: &ndarray::Array1<f64>,
+        eta_log_sigma: &ndarray::Array1<f64>,
+    ) -> Result<Self, String> {
+        let n = y.len();
+        if w.len() != n || eta_mu.len() != n || eta_log_sigma.len() != n {
+            return Err(format!(
+                "GaussianLocationScaleChannelHessian::from_pilot: \
+                 length mismatch y={n} w={} eta_mu={} eta_log_sigma={}",
+                w.len(),
+                eta_mu.len(),
+                eta_log_sigma.len(),
+            ));
+        }
+        let mut h = ndarray::Array3::<f64>::zeros((n, 2, 2));
+        for i in 0..n {
+            let wi = w[i];
+            let mu_i = eta_mu[i];
+            let s_i = eta_log_sigma[i];
+            let inv_sigma2 = (-2.0 * s_i).exp(); // exp(-2s) = 1/sigma^2
+            let resid = y[i] - mu_i;
+            // Hessian of w_i * ρ_i
+            let h00 = wi * inv_sigma2;
+            let h11 = wi * 2.0 * resid * resid * inv_sigma2;
+            let h01 = wi * 2.0 * resid * inv_sigma2;
+            // PSD clamp via eigendecomposition of 2×2 matrix.
+            let (e0, e1, v00, v01, v10, v11) = psd_clamp_2x2(h00, h01, h01, h11);
+            h[[i, 0, 0]] = e0 * v00 * v00 + e1 * v01 * v01;
+            h[[i, 0, 1]] = e0 * v00 * v10 + e1 * v01 * v11;
+            h[[i, 1, 0]] = h[[i, 0, 1]];
+            h[[i, 1, 1]] = e0 * v10 * v10 + e1 * v11 * v11;
+        }
+        Ok(Self { h })
+    }
+}
+
+/// Eigendecompose a 2×2 symmetric matrix `[[a, b], [b, d]]` and return
+/// `(λ_max.max(0), λ_min.max(0), v0[0], v0[1], v1[0], v1[1])` where
+/// `v0` and `v1` are the eigenvectors for λ_max and λ_min respectively.
+/// Negative eigenvalues are clamped to zero for PSD projection.
+#[inline]
+fn psd_clamp_2x2(a: f64, b: f64, _c: f64, d: f64) -> (f64, f64, f64, f64, f64, f64) {
+    // Symmetric 2×2 eigenvalues via the closed-form formula.
+    let trace = a + d;
+    let det = a * d - b * b;
+    let disc = (trace * trace * 0.25 - det).max(0.0).sqrt();
+    let lam1 = (trace * 0.5 + disc).max(0.0); // larger eigenvalue (clamped)
+    let lam2 = (trace * 0.5 - disc).max(0.0); // smaller eigenvalue (clamped)
+    // Eigenvector for lam1.
+    let (v00, v01, v10, v11) = if b.abs() > 1e-15 * (a.abs() + d.abs()).max(1.0) {
+        let v0x = lam1 - d;
+        let v0y = b;
+        let norm0 = (v0x * v0x + v0y * v0y).sqrt().max(1e-300);
+        let (v00_, v01_) = (v0x / norm0, v0y / norm0);
+        // Second eigenvector orthogonal to first.
+        let (v10_, v11_) = (-v01_, v00_);
+        (v00_, v01_, v10_, v11_)
+    } else if a >= d {
+        // Already diagonal (or nearly so), larger eigenvalue is a.
+        (1.0, 0.0, 0.0, 1.0)
+    } else {
+        (0.0, 1.0, 1.0, 0.0)
+    };
+    (lam1, lam2, v00, v01, v10, v11)
+}
+
+impl FamilyChannelHessian for GaussianLocationScaleChannelHessian {
+    fn n_outputs(&self) -> usize {
+        2
+    }
+
+    fn n_subjects(&self) -> usize {
+        self.h.shape()[0]
+    }
+
+    fn fill_subject(&self, i: usize, out: &mut [f64]) {
+        assert_eq!(out.len(), 4);
+        out[0] = self.h[[i, 0, 0]];
+        out[1] = self.h[[i, 0, 1]];
+        out[2] = self.h[[i, 1, 0]];
+        out[3] = self.h[[i, 1, 1]];
+    }
+
+    fn evaluate_full(&self) -> ndarray::Array3<f64> {
+        self.h.clone()
+    }
+}
+
 impl CustomFamily for GaussianLocationScaleFamily {
     /// The Gaussian location-scale joint Hessian depends on β because the
     /// cross-block (μ,log σ) and (log σ,log σ) blocks contain the residual
