@@ -681,3 +681,5 @@ pub(super) fn validate_spec(
             );
         }
     }
+    Ok(())
+}
