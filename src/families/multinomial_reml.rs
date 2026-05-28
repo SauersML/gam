@@ -81,7 +81,7 @@ use std::sync::Arc;
 /// * `penalty.dim() == (P, P)` (symmetric, PSD).
 ///
 /// All four are validated by [`MultinomialFamily::new`].
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct MultinomialFamily {
     /// One-hot response matrix `Y ∈ ℝ^{N × K}` (label-smoothed rows accepted;
     /// row sums need only be finite). Column `K − 1` is the reference class.
