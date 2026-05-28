@@ -1736,9 +1736,10 @@ fn sys_htbeta_apply_row(
     if let Some(op) = sys.htbeta_matvec.as_ref() {
         op(row_idx, x, out);
     } else {
-        let d = sys.d;
+        // Per-row dim from the actual block shape (supports hetereogeneous systems).
+        let di = row.htbeta.nrows();
         let k = sys.k;
-        for c in 0..d {
+        for c in 0..di {
             let mut acc = 0.0_f64;
             for a in 0..k {
                 acc += row.htbeta[[c, a]] * x[a];
@@ -1762,11 +1763,13 @@ fn sys_htbeta_accumulate_transpose(
     out: &mut Array1<f64>,
 ) {
     if let Some(op) = sys.htbeta_matvec.as_ref() {
-        htbeta_probe_transpose(row_idx, op, v, out, sys.d, sys.k);
+        let di = v.len();
+        htbeta_probe_transpose(row_idx, op, v, out, di, sys.k);
     } else {
-        let d = sys.d;
+        // Per-row dim from actual block shape.
+        let di = row.htbeta.nrows();
         let k = sys.k;
-        for c in 0..d {
+        for c in 0..di {
             let vc = v[c];
             if vc == 0.0 {
                 continue;
@@ -1778,31 +1781,31 @@ fn sys_htbeta_accumulate_transpose(
     }
 }
 
-/// Materialize the dense `(d, k)` cross-block for one row.
+/// Materialize the dense `(di, k)` cross-block for one row.
 ///
 /// When `sys.htbeta_matvec` is set and `row.htbeta` is zero-sized, probes each
 /// of the `k` standard basis vectors to reconstruct the matrix.  When the dense
-/// block is already present (`(d, k)` shape), clones it.
+/// block is already present with the correct per-row shape, clones it.
 fn sys_htbeta_materialize_row(
     sys: &ArrowSchurSystem,
     row_idx: usize,
     row: &ArrowRowBlock,
 ) -> Array2<f64> {
-    let d = sys.d;
+    let di = sys.row_dims[row_idx];
     let k = sys.k;
-    if row.htbeta.dim() == (d, k) {
+    if row.htbeta.dim() == (di, k) {
         return row.htbeta.clone();
     }
     // Zero-sized or mismatched dense block: materialize via the matvec.
     let op = sys.htbeta_matvec.as_ref().unwrap_or_else(|| {
         panic!(
-            "row {row_idx}: htbeta shape {:?} != ({d}, {k}) and no htbeta_matvec installed",
+            "row {row_idx}: htbeta shape {:?} != ({di}, {k}) and no htbeta_matvec installed",
             row.htbeta.dim()
         )
     });
-    let mut mat = Array2::<f64>::zeros((d, k));
+    let mut mat = Array2::<f64>::zeros((di, k));
     let mut e_a = Array1::<f64>::zeros(k);
-    let mut col = Array1::<f64>::zeros(d);
+    let mut col = Array1::<f64>::zeros(di);
     for a in 0..k {
         e_a.fill(0.0);
         e_a[a] = 1.0;
@@ -2680,12 +2683,12 @@ fn solve_arrow_newton_step_artifacts(
         });
     }
     let n = sys.rows.len();
-    let d = sys.d;
     let backend = CpuBatchedBlockSolver;
 
     // 1. BA point elimination: per-row Cholesky factors of
-    // (H_tt^(i) + ridge_t · I).
-    let htt_factors = backend.factor_blocks(&sys.rows, ridge_t, d)?;
+    // (H_tt^(i) + ridge_t · I).  `factor_blocks` reads the actual row
+    // dimension from `row.htt.nrows()` so heterogeneous systems work.
+    let htt_factors = backend.factor_blocks(&sys.rows, ridge_t, sys.d)?;
 
     // 2. Reduced RHS r_β = -g_β + Σ_i H_βt^(i) (H_tt^(i))⁻¹ g_t^(i).
     let rhs_beta = reduced_rhs_beta(sys, &htt_factors, &backend);
@@ -2729,19 +2732,29 @@ fn solve_arrow_newton_step_artifacts(
     //
     // H_tβ^(i) · Δβ is routed through sys.htbeta_matvec when the dense slab
     // is absent; otherwise indexed directly from row.htbeta.
-    let mut delta_t = Array1::<f64>::zeros(n * d);
-    let mut rhs = Array1::<f64>::zeros(d);
-    let mut htbeta_delta = Array1::<f64>::zeros(d);
+    // `row_offsets[n]` gives the total delta_t length for hetereogeneous dims.
+    let total_dt_len = sys.row_offsets[n];
+    let mut delta_t = Array1::<f64>::zeros(total_dt_len);
+    // Allocate scratch at max_d so no per-row realloc.
+    let mut rhs = Array1::<f64>::zeros(sys.d);
+    let mut htbeta_delta = Array1::<f64>::zeros(sys.d);
     for i in 0..n {
-        assert_eq!(sys.rows[i].gt.len(), d);
-        htbeta_delta.fill(0.0);
-        sys_htbeta_apply_row(sys, i, &sys.rows[i], delta_beta.view(), &mut htbeta_delta);
-        for c in 0..d {
-            rhs[c] = sys.rows[i].gt[c] + htbeta_delta[c];
+        let di = sys.row_dims[i];
+        let row_base = sys.row_offsets[i];
+        assert_eq!(sys.rows[i].gt.len(), di);
+        for c in 0..di {
+            htbeta_delta[c] = 0.0;
         }
-        let dt_i = backend.solve_block_vector(&htt_factors[i], &rhs);
-        for c in 0..d {
-            delta_t[i * d + c] = -dt_i[c];
+        let mut htbeta_slice = htbeta_delta.slice_mut(ndarray::s![..di]).to_owned();
+        sys_htbeta_apply_row(sys, i, &sys.rows[i], delta_beta.view(), &mut htbeta_slice);
+        let rhs_i = rhs.slice_mut(ndarray::s![..di]);
+        for c in 0..di {
+            rhs_i[c] = sys.rows[i].gt[c] + htbeta_slice[c];
+        }
+        let rhs_slice = rhs.slice(ndarray::s![..di]).to_owned();
+        let dt_i = backend.solve_block_vector(&htt_factors[i], &rhs_slice);
+        for c in 0..di {
+            delta_t[row_base + c] = -dt_i[c];
         }
     }
 

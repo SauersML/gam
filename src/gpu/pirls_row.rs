@@ -1459,6 +1459,7 @@ pub fn launch_alpha_ladder_on_stream(
     backend: &PirlsRowBackend,
     family: PirlsRowFamily,
     curvature: CurvatureMode,
+    gamma_shape: f64,
     stream: &Arc<cudarc::driver::CudaStream>,
     n: usize,
     eta_dev: &cudarc::driver::CudaSlice<f64>,
@@ -1491,11 +1492,16 @@ pub fn launch_alpha_ladder_on_stream(
     builder.arg(xd_dev);
     builder.arg(y_dev);
     builder.arg(prior_w_dev);
+    // GammaLog ladder kernel has `double shape` before the output buffers.
+    if matches!(family, PirlsRowFamily::GammaLog) {
+        builder.arg(&gamma_shape);
+    }
     builder.arg(&mut out.objective_dev);
     builder.arg(&mut out.status_dev);
-    // SAFETY: ladder_source_for emits:
+    // SAFETY: for non-GammaLog, ladder_source_for emits:
     //   (int n, const f64* eta, const f64* xd, const f64* y, const f64* prior_w,
     //    f64* objective_out, u32* status_out)
+    // For GammaLog `double shape` is inserted after `prior_w`.
     // Grid is (row_blocks × ALPHA_LADDER_LEN); each thread reads alphas[] via
     // blockIdx.y, rows via blockIdx.x * blockDim.x + threadIdx.x (guarded by n).
     // Atomic double-precision add to objective_out[blockIdx.y], OR to status_out[blockIdx.y].

@@ -24,16 +24,26 @@
 // # BMS flex-block path
 //
 // `crate::families::bernoulli_marginal_slope::install_compiled_flex_block_into_runtime`
-// handles the construction-time W-metric residualisation for BMS deviation
-// blocks (score_warp_dev, link_dev). It delegates to
-// `crate::families::identifiability_compiler::compile` for the exact W-metric
-// Gram+eigenvector math, then installs the reparameterisation into the
-// block's `DeviationRuntime` so every predict-time row evaluation folds in
-// the anchor correction. `FlexEvaluation` anchors (an earlier flex block's
-// training-row evaluation) are now a genuine participant in the anchor union
-// — `AnchorComponentTag::FlexEvaluation` is pushed into the anchor stack and
-// the residualisation runs against the full `[parametric | flex_evals]`
-// horizontally-stacked anchor. The regression guard lives in the BMS test
+// is now a thin spec-builder → audit → compile → install wrapper:
+//
+//   1. `build_bms_flex_block_context` densifies anchors, stacks N_train, and
+//      assembles `BernoulliDenseDesignOperator` + `BlockOrder` + `BernoulliRowHessian`
+//      from the BMS-specific inputs.
+//   2. `audit_identifiability_channel_aware` (this module) acts as the
+//      structural rank gate — it detects full aliasing via the K=1 BMS row
+//      Jacobian before any install. `FlexEvaluation` anchors participate here.
+//   3. `crate::families::identifiability_compiler::compile` does the W-metric
+//      Gram + eigendecomp to produce the V selector and anchor-correction M.
+//   4. The compiled V/M are installed into the `DeviationRuntime`
+//      (`install_compiled_flex_block`), and the block design + penalties are
+//      rebuilt in the new basis.
+//
+// `FlexEvaluation` anchors (an earlier flex block's training-row evaluation)
+// are a genuine participant in the anchor union at both the audit gate and the
+// compile step — `AnchorComponentTag::FlexEvaluation` is pushed into the
+// anchor stack and the residualisation runs against the full
+// `[parametric | flex_evals]` horizontally-stacked anchor. The regression
+// guard lives in the BMS test
 // `cross_block_identifiability_flex_anchor_true_alias_returns_fully_aliased`.
 //
 // After this per-block construction the resulting reparameterised designs are

@@ -1986,7 +1986,7 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
         operators,
         ordering,
         row_hess,
-        candidate_design_dense: _,
+        candidate_design_dense,
         n,
         p_candidate,
         d_total,
@@ -2020,15 +2020,7 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
         specs.push(crate::custom_family::ParameterBlockSpec {
             name: "candidate_flex".to_string(),
             design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                operators
-                    .last()
-                    .ok_or_else(|| {
-                        "cross-block identifiability: operator list is empty after context build"
-                            .to_string()
-                    })?
-                    .evaluate_full()
-                    .slice(ndarray::s![.., .., 0])
-                    .to_owned(),
+                candidate_design_dense.clone(),
             )),
             offset: Array1::<f64>::zeros(n),
             penalties: Vec::new(),

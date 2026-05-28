@@ -492,7 +492,7 @@ extern "C" __global__ void chol_logdet_col_major(
                 &ws.stream,
                 n,
                 p,
-                &shared.x_dev,
+                &shared.x_original_dev,
                 &mut ws.w_dev,
                 wx_dev,
             )?;
@@ -508,9 +508,9 @@ extern "C" __global__ void chol_logdet_col_major(
                 beta: 0.0,
                 ldc: p_i,
             };
-            // SAFETY: validated i32 dims; shared.x_dev and wx_dev are n*p
+            // SAFETY: validated i32 dims; shared.x_original_dev and wx_dev are n*p
             // f64 col-major; ws.xtwx_dev is the p*p output.
-            unsafe { ws.blas.gemm(cfg, &shared.x_dev, wx_dev, &mut ws.xtwx_dev) }
+            unsafe { ws.blas.gemm(cfg, &shared.x_original_dev, wx_dev, &mut ws.xtwx_dev) }
                 .map_err(|e| format!("cublas dgemm XtWX: {e}"))?;
         } else {
             launch_xtwx_lower(
@@ -518,7 +518,7 @@ extern "C" __global__ void chol_logdet_col_major(
                 &shared.ctx,
                 n,
                 p,
-                &shared.x_dev,
+                &shared.x_original_dev,
                 &ws.w_dev,
                 &mut ws.xtwx_dev,
             )?;
@@ -690,7 +690,7 @@ extern "C" __global__ void chol_logdet_col_major(
         if let Some(ref mut wx_dev_fb) = ws.wx_dev {
             // Large-p fallback.
             left_scale_rows_borrowed(
-                &ws.blas, &ws.stream, n, p, &shared.x_dev, input.w_solver_dev, wx_dev_fb,
+                &ws.blas, &ws.stream, n, p, &shared.x_original_dev, input.w_solver_dev, wx_dev_fb,
             )?;
             let gemm_cfg = GemmConfig::<f64> {
                 transa: cublasOperation_t::CUBLAS_OP_T,
@@ -704,9 +704,9 @@ extern "C" __global__ void chol_logdet_col_major(
                 beta: 0.0,
                 ldc: p_i,
             };
-            // SAFETY: validated dims; shared.x_dev and wx_dev_fb are n*p
+            // SAFETY: validated dims; shared.x_original_dev and wx_dev_fb are n*p
             // f64 col-major; ws.xtwx_dev is p*p; all on ws.stream.
-            unsafe { ws.blas.gemm(gemm_cfg, &shared.x_dev, wx_dev_fb, &mut ws.xtwx_dev) }
+            unsafe { ws.blas.gemm(gemm_cfg, &shared.x_original_dev, wx_dev_fb, &mut ws.xtwx_dev) }
                 .map_err(|e| format!("cublas dgemm XtWX (device-input): {e}"))?;
             let penalty_step = penalty_with_ridge(input.penalty_hessian, input.step_lm_lambda);
             let penalty_step_col = to_col_major(&penalty_step.view());
@@ -724,21 +724,21 @@ extern "C" __global__ void chol_logdet_col_major(
                 beta: 0.0,
                 incy: 1,
             };
-            // SAFETY: shared.x_dev n*p col-major; grad_eta_dev length n; rhs_dev length p.
+            // SAFETY: shared.x_original_dev n*p col-major; grad_eta_dev length n; rhs_dev length p.
             unsafe {
-                ws.blas.gemv(gemv_cfg, &shared.x_dev, input.grad_eta_dev, &mut ws.rhs_dev)
+                ws.blas.gemv(gemv_cfg, &shared.x_original_dev, input.grad_eta_dev, &mut ws.rhs_dev)
             }
             .map_err(|e| format!("cublas dgemv Xtg (device-input): {e}"))?;
         } else {
             // Fused path: row-sweep kernels, no n*p WX buffer.
             launch_xtwx_lower(
                 &ws.stream, &shared.ctx, n, p,
-                &shared.x_dev, input.w_solver_dev, &mut ws.xtwx_dev,
+                &shared.x_original_dev, input.w_solver_dev, &mut ws.xtwx_dev,
             )?;
             launch_symmetrize_lower(&ws.stream, &shared.ctx, p, &mut ws.xtwx_dev)?;
             launch_xtscore(
                 &ws.stream, &shared.ctx, n, p,
-                &shared.x_dev, input.grad_eta_dev, &mut ws.rhs_dev,
+                &shared.x_original_dev, input.grad_eta_dev, &mut ws.rhs_dev,
             )?;
             let penalty_step = penalty_with_ridge(input.penalty_hessian, input.step_lm_lambda);
             let penalty_step_col = to_col_major(&penalty_step.view());
@@ -853,7 +853,7 @@ extern "C" __global__ void chol_logdet_col_major(
             &ws.stream,
             n,
             p,
-            &shared.x_dev,
+            &shared.x_original_dev,
             input.w_solver_dev,
             &mut ws.wx_dev,
         )?;
@@ -873,11 +873,11 @@ extern "C" __global__ void chol_logdet_col_major(
             beta: 0.0,
             ldc: p_i,
         };
-        // SAFETY: validated i32 dims; shared.x_dev and ws.wx_dev are n*p
+        // SAFETY: validated i32 dims; shared.x_original_dev and ws.wx_dev are n*p
         // f64 col-major buffers; ws.xtwx_dev is p*p; bound to ws.stream.
         unsafe {
             ws.blas
-                .gemm(gemm_cfg, &shared.x_dev, &ws.wx_dev, &mut ws.xtwx_dev)
+                .gemm(gemm_cfg, &shared.x_original_dev, &ws.wx_dev, &mut ws.xtwx_dev)
         }
         .map_err(|e| format!("cublas dgemm XtWX (inplace): {e}"))?;
 
@@ -910,11 +910,11 @@ extern "C" __global__ void chol_logdet_col_major(
             beta: 0.0,
             incy: 1,
         };
-        // SAFETY: shared.x_dev is n*p col-major; input.grad_eta_dev is
+        // SAFETY: shared.x_original_dev is n*p col-major; input.grad_eta_dev is
         // length n; ws.rhs_dev is length p; cuBLAS contract satisfied.
         unsafe {
             ws.blas
-                .gemv(gemv_cfg, &shared.x_dev, input.grad_eta_dev, &mut ws.rhs_dev)
+                .gemv(gemv_cfg, &shared.x_original_dev, input.grad_eta_dev, &mut ws.rhs_dev)
         }
         .map_err(|e| format!("cublas dgemv Xtg (inplace): {e}"))?;
 
@@ -991,7 +991,7 @@ extern "C" __global__ void chol_logdet_col_major(
             &ws.stream,
             n,
             p,
-            &shared.x_dev,
+            &shared.x_original_dev,
             w_hessian_dev,
             &mut ws.wx_dev,
         )?;
@@ -1011,11 +1011,11 @@ extern "C" __global__ void chol_logdet_col_major(
             beta: 0.0,
             ldc: p_i,
         };
-        // SAFETY: validated dims; shared.x_dev and ws.wx_dev are n*p col-major;
+        // SAFETY: validated dims; shared.x_original_dev and ws.wx_dev are n*p col-major;
         // ws.xtwx_dev is p*p; all bound to ws.stream.
         unsafe {
             ws.blas
-                .gemm(gemm_cfg, &shared.x_dev, &ws.wx_dev, &mut ws.xtwx_dev)
+                .gemm(gemm_cfg, &shared.x_original_dev, &ws.wx_dev, &mut ws.xtwx_dev)
         }
         .map_err(|e| format!("cublas dgemm XtWX (final H rebuild): {e}"))?;
 
@@ -1751,6 +1751,18 @@ extern "C" __global__ void status_or(
                 prior_w_host.len()
             ));
         }
+        if linear_shift.len() != p {
+            return Err(format!(
+                "linear_shift length {} ≠ p={p}",
+                linear_shift.len()
+            ));
+        }
+        if penalty_hessian.dim() != (p, p) {
+            return Err(format!(
+                "penalty_hessian shape {:?} ≠ (p={p}, p={p})",
+                penalty_hessian.dim()
+            ));
+        }
 
         ws.stream
             .memcpy_htod(
@@ -1796,7 +1808,7 @@ extern "C" __global__ void status_or(
             &ws.blas,
             n,
             p,
-            &shared.x_dev,
+            &shared.x_original_dev,
             &loop_ws.beta_dev,
             &mut loop_ws.eta_dev,
         )?;
@@ -1805,6 +1817,7 @@ extern "C" __global__ void status_or(
             backend,
             family,
             curvature,
+            gamma_shape,
             &ws.stream,
             n,
             &loop_ws.eta_dev,
@@ -1824,14 +1837,37 @@ extern "C" __global__ void status_or(
         )?;
         let mut last_logdet = 0.0_f64;
         let mut converged = false;
+
+        // Host-side mirror of `beta_dev`. Maintained in lock-step with
+        // every accepted Newton step so we can evaluate the
+        // shifted-quadratic penalty `βᵀSβ − 2βᵀlinear_shift +
+        // constant_shift` on the host without an extra `β` DtoH per
+        // iteration. The initial state is `beta0_host` verbatim.
+        let mut beta_host: Array1<f64> = beta0_host.to_owned();
+
+        // Initial *penalized* objective = data-deviance(β₀) + shifted
+        // quadratic(β₀). This is the value the line search and
+        // convergence test compare candidates against — matches the CPU
+        // oracle's `penalized_objective` in `CandidateScreen`.
+        let s_beta0 = penalty_hessian.dot(&beta_host);
+        let penalty_init = beta_host.dot(&s_beta0)
+            - 2.0 * beta_host.dot(&linear_shift)
+            + constant_shift;
+        let mut prev_objective = prev_deviance + penalty_init;
+        let mut min_objective = prev_objective;
+
         // Diagnostic scalars surfaced on the outcome so the dispatch
         // wirer can populate WorkingModelPirlsResult / PirlsResult
-        // fields without re-running the loop. All four mirror the CPU
-        // oracle's per-iter tracking in runworking_model_pirls.
+        // fields without re-running the loop. They mirror the CPU
+        // oracle's per-iter tracking in runworking_model_pirls; the
+        // "deviance change" diagnostic now carries the *penalized*
+        // objective delta (matches the CPU oracle's convergence-test
+        // input and what the issue requested).
         let mut last_dev_delta = 0.0_f64;
         let mut last_halving: usize = 0;
         let mut last_step_size = 0.0_f64;
         let mut min_dev = prev_deviance;
+        let mut step_search_exhausted = false;
 
         for it in 0..max_iter {
             last_logdet = solve_step_on_stream_device_inplace(
@@ -1866,7 +1902,7 @@ extern "C" __global__ void status_or(
                 &ws.blas,
                 n,
                 p,
-                &shared.x_dev,
+                &shared.x_original_dev,
                 &loop_ws.direction_dev,
                 &mut loop_ws.xd_dev,
             )?;
@@ -1886,6 +1922,7 @@ extern "C" __global__ void status_or(
                 backend,
                 family,
                 curvature,
+                gamma_shape,
                 &ws.stream,
                 n,
                 &loop_ws.eta_dev,

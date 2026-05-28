@@ -18,8 +18,7 @@
 use faer::Side;
 use gam::construction::CanonicalPenalty;
 use gam::estimate::PenaltySpec;
-use gam::faer_ndarray::{FaerArrayView, factorize_symmetricwith_fallback};
-use gam::matrix::FactorizedSystem;
+use gam::faer_ndarray::{FaerArrayView, FaerColView, factorize_symmetricwith_fallback};
 use gam::pirls::{PenaltyConfig, PirlsConfig, PirlsProblem, PirlsStatus, fit_model_for_fixed_rho};
 use gam::solver::gpu::cuda_selected;
 use gam::types::{
@@ -76,12 +75,15 @@ fn make_canonical(s: &Array2<f64>, p: usize) -> Vec<CanonicalPenalty> {
         .collect()
 }
 
-/// Solve (A)x = b for symmetric PD matrix A using Cholesky.
+/// Solve (A)x = b for symmetric PD matrix A using Cholesky (or LDLT fallback).
 fn chol_solve(a: &Array2<f64>, b: &Array1<f64>) -> Array1<f64> {
+    let p = a.nrows();
     let av = FaerArrayView::new(a);
     let factor = factorize_symmetricwith_fallback(av.as_ref(), Side::Lower)
         .expect("matrix must factorize for chol_solve");
-    factor.solvevec(b)
+    let bv = FaerColView::new(b);
+    let sol = factor.solve(bv.as_ref());
+    Array1::from_shape_fn(p, |i| sol[(i, 0)])
 }
 
 fn allclose(a: &Array1<f64>, b: &Array1<f64>, tol: f64) -> bool {
@@ -576,7 +578,9 @@ fn gpu_pirls_gating_6_final_hessian_at_accepted_eta() {
     }
 
     // Stabilized Hessian must be PSD.
-    let h = fit.dense_stabilizedhessian_transformed();
+    let h = fit
+        .dense_stabilizedhessian_transformed("gpu_pirls_gating_6")
+        .expect("dense_stabilizedhessian_transformed must succeed");
     let hv = FaerArrayView::new(&h);
     let factor = factorize_symmetricwith_fallback(hv.as_ref(), Side::Lower);
     assert!(
