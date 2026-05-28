@@ -20166,24 +20166,16 @@ pub fn fit_bernoulli_marginal_slope_terms(
         match outcome {
             FlexCompileOutcome::Reparameterised => Some(prepared),
             FlexCompileOutcome::FullyAliased { reason } => {
-                // Record via the structured channel. Build a zero-column
-                // prepared block so the unified audit sees score_warp_dev
-                // with effective_dim=0 and attributes the drop via
-                // dropped_columns rather than a family-side log message.
+                // Record via the structured channel. Keep the original
+                // (non-compiled) design so the unified audit sees score_warp_dev
+                // and attributes the drop via dropped_columns (gauge_priority=80
+                // is below marginal=150 / logslope=120, so RRQR correctly
+                // demotes score_warp_dev when it aliases those blocks).
                 cross_block_warnings.push(CrossBlockIdentifiabilityWarning {
                     candidate_label: "score_warp",
                     anchor_summary: "marginal+logslope".to_string(),
                     reason,
                 });
-                let n_rows = prepared.block.design.nrows();
-                prepared.block.design = DesignMatrix::Dense(
-                    crate::matrix::DenseDesignMatrix::from(
-                        ndarray::Array2::<f64>::zeros((n_rows, 0)),
-                    ),
-                );
-                prepared.block.penalties.clear();
-                prepared.block.nullspace_dims.clear();
-                prepared.block.initial_beta = Some(ndarray::Array1::zeros(0));
                 Some(prepared)
             }
         }

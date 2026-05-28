@@ -50,7 +50,7 @@
 //! yielding overlap = 1.0 — triggering a spurious fatal audit halt.
 
 use gam::custom_family::{
-    BlockEffectiveJacobian, FamilyChannelHessian, FamilyLinearizationState, ParameterBlockSpec,
+    BlockEffectiveJacobian, FamilyLinearizationState, ParameterBlockSpec,
 };
 use gam::families::identifiability_compiler::{IdentityRowHessian, RowJacobianOperator};
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
@@ -574,7 +574,7 @@ fn check_effective_jacobian_matches_fd(
     s_f: f64,
     label: &str,
 ) {
-    let state = FamilyLinearizationState { beta, family_scalars };
+    let state = FamilyLinearizationState { beta, family_scalars, channel_hessian: None };
     let jac = spec
         .effective_jacobian_at("test", &state)
         .unwrap_or_else(|e| panic!("{label}: effective_jacobian_at failed: {e}"));
@@ -986,7 +986,7 @@ fn time_and_marginal_blocks_at_zero_beta_have_trivial_scaling() {
     };
 
     // Effective Jacobian via spec.effective_jacobian_at (row_scaling=1).
-    let state = FamilyLinearizationState { beta: &beta_zero, family_scalars: None };
+    let state = FamilyLinearizationState { beta: &beta_zero, family_scalars: None, channel_hessian: None };
     let jac = spec
         .effective_jacobian_at("test", &state)
         .expect("time block effective_jacobian_at must succeed");
@@ -1035,7 +1035,7 @@ fn time_and_marginal_blocks_at_zero_beta_have_trivial_scaling() {
         row_scaling: Some(sf_z_arc),
         jacobian_callback: None,
     };
-    let marg_state = FamilyLinearizationState { beta: &beta_zero, family_scalars: None };
+    let marg_state = FamilyLinearizationState { beta: &beta_zero, family_scalars: None, channel_hessian: None };
     let marg_jac = marg_spec
         .effective_jacobian_at("test", &marg_state)
         .expect("marginal block effective_jacobian_at must succeed");

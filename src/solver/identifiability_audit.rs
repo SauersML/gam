@@ -613,7 +613,7 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
     //
     // # Hard-halt cases (always fatal regardless of gauge)
     //
-    //   (a) Cross-block alias pair with overlap >= HARD_HALT_OVERLAP_THRESHOLD
+    //   (a) Cross-block alias pair with overlap >= pair_halt_threshold(s2_a, s2_b, n)
     //       where the two blocks carry the SAME `gauge_priority` — no
     //       ordering exists to decide which block loses the direction. This
     //       is the original "two blocks contributing the same direction, inner
@@ -888,10 +888,10 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
 ///
 /// The output [`IdentifiabilityAudit`] preserves the same contract as
 /// the flat path: `dropped_columns` attributed to (block, local_col),
-/// `aliased_pairs` reported above
-/// [`ALIAS_OVERLAP_REPORTING_THRESHOLD`] in the channel-weighted view,
-/// `fatal` true on rank deficiency or hard-alias pair above
-/// [`HARD_HALT_OVERLAP_THRESHOLD`].
+/// `aliased_pairs` reported above the per-pair leverage-based report
+/// threshold in the channel-weighted view, `fatal` true on rank
+/// deficiency or hard-alias pair above the per-pair leverage-based
+/// halt threshold (`pair_halt_threshold`).
 pub fn audit_identifiability_channel_aware(
     specs: &[ParameterBlockSpec],
     operators: &[std::sync::Arc<
