@@ -266,8 +266,11 @@ pub fn gpu_schur_matvec_backend(
 
     #[cfg(not(target_os = "linux"))]
     {
-        // Suppress unused-variable warnings on non-Linux.
-        let _ = (ridge_t, ridge_beta, had_hbb_matvec);
+        // On non-Linux there is no CUDA runtime; all three params are valid
+        // inputs but there is no device to dispatch to.
+        if ridge_t.is_nan() || ridge_beta.is_nan() || had_hbb_matvec {
+            return Err(ArrowSchurGpuFailure::Unavailable);
+        }
         Err(ArrowSchurGpuFailure::Unavailable)
     }
 
@@ -1238,6 +1241,192 @@ mod cuda {
             delta_beta,
             log_det_hessian: log_det,
         })
+    }
+
+    /// Pre-compute `Y_i = L_i^{-1} H_tβ^(i)` via the fused forward kernel and
+    /// return a closure that evaluates the full Schur matvec
+    /// `S·x = (H_ββ + ρ·I)·x − Σ_i Y_i^T (Y_i·x)` for each PCG iteration.
+    ///
+    /// The `Y_i` factors are kept in a host-side buffer after one GPU forward
+    /// pass. Each matvec call runs O(N·d·K) host loops over the pre-computed
+    /// buffer plus an optional `H_ββ·x` call (matrix-free or dense). This is
+    /// the first landing of the GPU matvec; a future iteration can move the
+    /// `Y_i·x` / `Y_i^T z_i` steps to cuBLAS batched GEMV.
+    pub(super) fn build_schur_matvec_backend(
+        sys: &ArrowSchurSystem,
+        ridge_t: f64,
+        ridge_beta: f64,
+    ) -> Result<crate::solver::arrow_schur::GpuSchurMatvec, super::ArrowSchurGpuFailure> {
+        let n = sys.rows.len();
+        let d = sys.d;
+        let k = sys.k;
+        let plan = crate::gpu::arrow_schur_nvrtc::plan_fused_launch(n, d, k)
+            .ok_or(super::ArrowSchurGpuFailure::Unavailable)?;
+        let p_max = plan.p_max;
+        let r_template = plan.r_template;
+
+        let runtime = crate::gpu::linalg::route_through_gpu(
+            crate::gpu::linalg::DispatchOp::SmallDenseBatchedPotrf { p: d, batch: n },
+        )
+        .ok_or(super::ArrowSchurGpuFailure::Unavailable)?;
+        let ctx = crate::gpu::runtime::cuda_context_for(runtime.device.ordinal)
+            .ok_or(super::ArrowSchurGpuFailure::Unavailable)?;
+        let stream = ctx
+            .new_stream()
+            .map_err(|_| super::ArrowSchurGpuFailure::Unavailable)?;
+        let cap = &runtime.device.capability;
+        let key = crate::gpu::arrow_schur_nvrtc::FusedModuleCacheKey {
+            cc_major: cap.compute_major,
+            cc_minor: cap.compute_minor,
+            p_max: p_max as u32,
+            r_template: r_template as u32,
+        };
+        let module = fused_module_for(&ctx, key)?;
+        let forward = module
+            .load_function("arrow_schur_forward_pgroup")
+            .map_err(|_| super::ArrowSchurGpuFailure::Unavailable)?;
+
+        let (d_host, b_host, g_host) = pack_fused_host(sys, ridge_t, p_max, r_template);
+        let d_dev = stream
+            .clone_htod(&d_host)
+            .map_err(|_| super::ArrowSchurGpuFailure::Unavailable)?;
+        let b_dev = stream
+            .clone_htod(&b_host)
+            .map_err(|_| super::ArrowSchurGpuFailure::Unavailable)?;
+        let g_dev = stream
+            .clone_htod(&g_host)
+            .map_err(|_| super::ArrowSchurGpuFailure::Unavailable)?;
+        let mut l_out = stream
+            .alloc_zeros::<f64>(n * p_max * p_max)
+            .map_err(|_| super::ArrowSchurGpuFailure::Unavailable)?;
+        let mut u_out = stream
+            .alloc_zeros::<f64>(n * p_max)
+            .map_err(|_| super::ArrowSchurGpuFailure::Unavailable)?;
+        let mut y_out = stream
+            .alloc_zeros::<f64>(n * p_max * r_template)
+            .map_err(|_| super::ArrowSchurGpuFailure::Unavailable)?;
+        let mut partial_s = stream
+            .alloc_zeros::<f64>(plan.partial_s_doubles)
+            .map_err(|_| super::ArrowSchurGpuFailure::Unavailable)?;
+        let mut partial_r = stream
+            .alloc_zeros::<f64>(plan.partial_r_doubles)
+            .map_err(|_| super::ArrowSchurGpuFailure::Unavailable)?;
+        let mut status_dev = stream
+            .alloc_zeros::<i32>(n)
+            .map_err(|_| super::ArrowSchurGpuFailure::Unavailable)?;
+
+        let cfg = LaunchConfig {
+            grid_dim: (plan.blocks, 1, 1),
+            block_dim: (plan.threads_per_block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_i32 = to_i32(n).ok_or(super::ArrowSchurGpuFailure::Unavailable)?;
+        let p_i32 = to_i32(d).ok_or(super::ArrowSchurGpuFailure::Unavailable)?;
+        let r_i32 = to_i32(k).ok_or(super::ArrowSchurGpuFailure::Unavailable)?;
+        let ridge_arg = ridge_t;
+        {
+            let mut builder = stream.launch_builder(&forward);
+            builder
+                .arg(&d_dev)
+                .arg(&b_dev)
+                .arg(&g_dev)
+                .arg(&n_i32)
+                .arg(&p_i32)
+                .arg(&r_i32)
+                .arg(&ridge_arg)
+                .arg(&mut l_out)
+                .arg(&mut u_out)
+                .arg(&mut y_out)
+                .arg(&mut partial_s)
+                .arg(&mut partial_r)
+                .arg(&mut status_dev);
+            // SAFETY: all buffers were allocated on `stream` with sizes
+            // derived from `plan`; parameter list matches FORWARD_KERNEL_SOURCE.
+            unsafe { builder.launch(cfg) }
+                .map_err(|_| super::ArrowSchurGpuFailure::Unavailable)?;
+        }
+        stream
+            .synchronize()
+            .map_err(|_| super::ArrowSchurGpuFailure::Unavailable)?;
+
+        let status_host = stream
+            .clone_dtoh(&status_dev)
+            .map_err(|_| super::ArrowSchurGpuFailure::Unavailable)?;
+        if let Some(row) = status_host.iter().position(|s| *s != 0) {
+            let pivot = status_host[row];
+            let scale = sys.rows[row]
+                .htt
+                .diag()
+                .iter()
+                .map(|v| v.abs())
+                .fold(0.0_f64, f64::max)
+                .max(1.0);
+            return Err(super::ArrowSchurGpuFailure::RidgeBumpRequired {
+                row,
+                bump: scale * (pivot.abs() as f64).max(1.0) * f64::EPSILON.sqrt() * 1024.0,
+            });
+        }
+
+        // Download Y_i factors: n × p_max × r_template column-major per block.
+        let y_host = stream
+            .clone_dtoh(&y_out)
+            .map_err(|_| super::ArrowSchurGpuFailure::Unavailable)?;
+
+        // Capture H_ββ data for the closure. Use the matrix-free hook if present
+        // (SAE-manifold callers), otherwise fall back to the dense matrix rows.
+        let hbb_host: Vec<f64> = sys.hbb.iter().copied().collect();
+        let hbb_is_kk = sys.hbb.dim() == (k, k);
+        let hbb_matvec_opt = sys.hbb_matvec.clone();
+
+        let closure: crate::solver::arrow_schur::GpuSchurMatvec =
+            Arc::new(move |x: &Array1<f64>, out: &mut Array1<f64>| {
+                assert_eq!(x.len(), k, "gpu_schur_matvec: x.len() != k");
+                assert_eq!(out.len(), k, "gpu_schur_matvec: out.len() != k");
+
+                // (H_ββ + ρ·I)·x into out.
+                if let Some(ref mv) = hbb_matvec_opt {
+                    mv(x.view(), out);
+                    for a in 0..k {
+                        out[a] += ridge_beta * x[a];
+                    }
+                } else if hbb_is_kk {
+                    // hbb_host row-major: hbb[a, b] = hbb_host[a * k + b].
+                    for a in 0..k {
+                        let mut acc = ridge_beta * x[a];
+                        for b in 0..k {
+                            acc += hbb_host[a * k + b] * x[b];
+                        }
+                        out[a] = acc;
+                    }
+                } else {
+                    for a in 0..k {
+                        out[a] = ridge_beta * x[a];
+                    }
+                }
+
+                // out[c] -= Σ_i (Y_i^T (Y_i·x))[c].
+                // Y_i column-major at y_host[i·p_max·r_template + col·p_max + row].
+                let mut z = vec![0.0_f64; d];
+                for i in 0..n {
+                    let y_base = i * p_max * r_template;
+                    for r in 0..d {
+                        let mut acc = 0.0;
+                        for c in 0..k {
+                            acc += y_host[y_base + c * p_max + r] * x[c];
+                        }
+                        z[r] = acc;
+                    }
+                    for c in 0..k {
+                        let mut acc = 0.0;
+                        for r in 0..d {
+                            acc += y_host[y_base + c * p_max + r] * z[r];
+                        }
+                        out[c] -= acc;
+                    }
+                }
+            });
+
+        Ok(closure)
     }
 }
 

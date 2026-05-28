@@ -1396,7 +1396,13 @@ impl ArrowSchurSystem {
 /// Chunked Schur assembler that never retains all row cross-blocks.
 pub struct StreamingArrowSchur {
     pub n_rows: usize,
+    /// Maximum per-row latent dim (upper bound for scratch buffers).
     pub d: usize,
+    /// Per-row latent dims `row_dims[i] == rows[i].htt.nrows()`.
+    pub row_dims: Arc<[usize]>,
+    /// Flat-buffer row offsets: `row_offsets[i]` is the start of row `i` in
+    /// `delta_t`; `row_offsets[n_rows]` is the total `delta_t` length.
+    pub row_offsets: Arc<[usize]>,
     pub k: usize,
     pub chunk_size: usize,
     pub s_acc: Array2<f64>,
@@ -1422,6 +1428,8 @@ impl StreamingArrowSchur {
     pub fn new(
         n_rows: usize,
         d: usize,
+        row_dims: Arc<[usize]>,
+        row_offsets: Arc<[usize]>,
         k: usize,
         hbb: Array2<f64>,
         gb: Array1<f64>,
@@ -1433,6 +1441,8 @@ impl StreamingArrowSchur {
         Self {
             n_rows,
             d,
+            row_dims,
+            row_offsets,
             k,
             chunk_size: chunk_size.max(1),
             s_acc: Array2::<f64>::zeros((k, k)),
@@ -1475,6 +1485,8 @@ impl StreamingArrowSchur {
         Self::new(
             sys.rows.len(),
             sys.d,
+            Arc::clone(&sys.row_dims),
+            Arc::clone(&sys.row_offsets),
             sys.k,
             sys.hbb.clone(),
             sys.gb.clone(),

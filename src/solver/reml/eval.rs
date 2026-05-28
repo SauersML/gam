@@ -139,57 +139,143 @@ fn device_pirls_stage3_ready() -> bool {
 }
 
 /// Sigma-cubature executor dispatch — the swap site between the CPU Rayon
-/// path (today) and the GPU stream-pool path (`pirls-row-v3` Stage 3 +
-/// `bms-flex-v3` Phase 5).
+/// path and the GPU stream-pool path (Stage 3.3 + stream pool).
 ///
-/// Both branches must return per-sigma `(A_m, b_m)` pairs that the
-/// downstream [`accumulate_sigma_cubature_total_covariance`] consumes
-/// without knowing which executor produced them; that's the contract
+/// Both branches return per-sigma `(A_m, b_m)` pairs that the downstream
+/// [`accumulate_sigma_cubature_total_covariance`] consumes without knowing
+/// which executor produced them; that's the contract
 /// `cubature_linear_exactness_recovers_jvjt` pins to f64 round-off.
 ///
-/// The selector takes no arguments other than the REML state and sigma
-/// points — magic by default, no flags. When [`device_pirls_stage3_ready`]
-/// flips to `true` the GPU branch fires for every cubature batch where the
-/// problem geometry justifies it; today it stays on the CPU path.
+/// Magic by default: no flags. When [`device_pirls_stage3_ready`] returns
+/// `true` the GPU branch fires for every cubature batch where the problem
+/// geometry justifies it (family in JIT-cached set, `p ≥ 32`,
+/// `n ≥ row_kernel_min_n`, dense design); if the GPU path declines
+/// (`Ok(None)`) or errors, the CPU Rayon oracle runs unchanged.
 pub(crate) fn sigma_cubature_dispatch(
     state: &RemlState<'_>,
     sigma_points: &[Array1<f64>],
 ) -> Vec<SigmaPointResult> {
     if device_pirls_stage3_ready() {
-        // Device path (sigma-cubature P5 + P6 + P7).
-        //
-        // The new `crate::gpu::sigma_cubature` module exposes the
-        // three on-device entries; the dispatch tries the batched
-        // (P7) path first when `M` clears the breakeven, then the
-        // per-stream (P5) path, then falls through to the CPU Rayon
-        // parity oracle when either returns `Ok(None)`.
-        //
-        // Every entry validates shapes and consults the runtime probe
-        // before touching CUDA, so `Ok(None)` means "device truly
-        // unavailable for this batch" — never silently disabled.
-        // `Err(_)` is reserved for genuine driver / shape failures and
-        // is surfaced by the CPU fallback's `None`-on-failure contract.
-        // The per-sigma `(eta, y, prior_w, beta, H⁻¹)` tuples the
-        // device entries consume live behind
-        // `execute_pirls_stateless_for_cubature`, which has not yet
-        // been split from the inner PIRLS pump. When that split lands,
-        // construct a [`crate::gpu::sigma_cubature::SigmaCubatureBatch`]
-        // here and try the entries in order:
-        //
-        //   1. `try_device_sigma_eval_batched` (P7) — wins at large M.
-        //   2. `try_device_sigma_eval`         (P5) — fallback per-stream.
-        //   3. Either reduces device-side via `try_device_moment_reduce`
-        //      (P6) at the call site in
-        //      `compute_smoothing_correction_auto`.
-        //
-        // For now the readiness gate keeps us on the CPU Rayon oracle
-        // even when `device_pirls_stage3_ready()` flips, so the device
-        // dispatch site is fully wired but inert until the upstream
-        // sigma-state staging lands.
-        return sigma_cubature_evaluate_cpu_rayon(state, sigma_points);
+        // Device path: try GPU stream-pool executor first.
+        match sigma_cubature_evaluate_gpu_stream_pool(state, sigma_points) {
+            Ok(Some(results)) => return results,
+            Ok(None) => {
+                // Device declined (shape / family / policy gate); fall through.
+                log::debug!(
+                    "[sigma-cubature] GPU stream pool declined (Ok(None)) — \
+                     falling through to CPU Rayon oracle"
+                );
+            }
+            Err(e) => {
+                // Device driver / shape failure; log and fall through.
+                log::warn!(
+                    "[sigma-cubature] GPU stream pool error — \
+                     falling through to CPU Rayon oracle: {e:?}"
+                );
+            }
+        }
     }
 
     sigma_cubature_evaluate_cpu_rayon(state, sigma_points)
+}
+
+/// GPU stream-pool sigma-cubature evaluator.
+///
+/// For each sigma point this function:
+///   1. Runs the reparameterisation engine to obtain `Qs` and
+///      `s_transformed` for that ρ value.
+///   2. Materialises `x_transformed = X_original · Qs` on the host
+///      (dense-only; sparse design returns `Ok(None)`).
+///   3. Passes the per-sigma inputs to
+///      [`crate::gpu::sigma_cubature::try_gpu_sigma_stream_pool_eval`]
+///      which allocates a stream pool (N_streams = min(8, M)), rotates
+///      sigma points across streams, runs `pirls_loop_on_stream` on each,
+///      and returns one `(H_original⁻¹, β_original)` pair per point.
+///
+/// Returns:
+///   * `Ok(Some(results))` — every sigma point returned a usable GPU result.
+///   * `Ok(None)` — GPU path not eligible for this batch (sparse design,
+///     family not in JIT-cached set, policy gate, etc.).
+///   * `Err(_)` — GPU driver / shape failure the caller should log.
+fn sigma_cubature_evaluate_gpu_stream_pool(
+    state: &RemlState<'_>,
+    sigma_points: &[Array1<f64>],
+) -> Result<Option<Vec<SigmaPointResult>>, crate::gpu::GpuError> {
+    use crate::construction::{EngineDims, stable_reparameterization_engine_canonical};
+    use crate::gpu::sigma_cubature::try_gpu_sigma_stream_pool_eval;
+    use crate::solver::gpu::pirls_dispatch::admission_for;
+    use crate::gpu::runtime::GpuRuntime;
+
+    if sigma_points.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+
+    let n = state.x.nrows();
+    let p = state.p;
+
+    // Dense-only: the GPU loop expects a column-major dense x_transformed.
+    let x_dense = match state.x.as_dense() {
+        Some(d) => d,
+        None => return Ok(None),
+    };
+
+    // Admission check: family must be in the JIT-cached set and n/p must
+    // clear the policy floor. Use the likelihood spec from the REML config.
+    let likelihood_spec = &state.config.likelihood;
+    let Some(admission) = admission_for(&likelihood_spec.spec, n, p) else {
+        return Ok(None);
+    };
+    let Some(runtime) = GpuRuntime::global() else {
+        return Ok(None);
+    };
+    if !runtime.policy().should_use_gpu_pirls_loop(admission) {
+        return Ok(None);
+    }
+
+    // Compute the reparameterisation for every sigma point on the host.
+    // This is a moderate-cost eigendecomposition (O(p³) per point); it
+    // runs sequentially here because the downstream GPU launches dominate.
+    let lambdas_rho_exp: Vec<ndarray::Array1<f64>> = sigma_points
+        .iter()
+        .map(|rho| rho.mapv(f64::exp))
+        .collect();
+
+    let engine_dims = EngineDims::new(p, state.canonical_penalties.len());
+    let mut per_sigma: Vec<crate::gpu::sigma_cubature::SigmaPointGpuInput> =
+        Vec::with_capacity(sigma_points.len());
+
+    for lambdas in &lambdas_rho_exp {
+        let lambdas_slice = lambdas
+            .as_slice_memory_order()
+            .ok_or_else(|| crate::gpu_err!("sigma rho lambdas not contiguous"))?;
+        let reparam = stable_reparameterization_engine_canonical(
+            &state.canonical_penalties,
+            lambdas_slice,
+            engine_dims,
+            Some(&state.reparam_invariant),
+            state.penalty_shrinkage_floor,
+        )
+        .map_err(|e| crate::gpu_err!("sigma reparam engine: {e:?}"))?;
+
+        // x_transformed = X_original · Qs  (host-side; small p×p matmul cost)
+        let x_transformed = crate::faer_ndarray::fast_ab(x_dense, &reparam.qs);
+
+        per_sigma.push(crate::gpu::sigma_cubature::SigmaPointGpuInput {
+            x_transformed,
+            s_transformed: reparam.s_transformed,
+            qs: reparam.qs,
+        });
+    }
+
+    try_gpu_sigma_stream_pool_eval(
+        &per_sigma,
+        state.y,
+        state.weights,
+        state.offset.view(),
+        admission,
+        state.config.pirls_convergence_tolerance,
+        state.config.max_iterations,
+    )
 }
 
 /// CPU Rayon sigma evaluator. The same loop that lived inline at the call

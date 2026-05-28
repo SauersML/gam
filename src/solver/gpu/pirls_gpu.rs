@@ -1608,6 +1608,14 @@ extern "C" __global__ void status_or(
         y_host: ArrayView1<'_, f64>,
         prior_w_host: ArrayView1<'_, f64>,
         penalty_hessian: ArrayView2<'_, f64>,
+        /// Linear shift `b` of the shifted-quadratic penalty
+        /// `βᵀSβ − 2βᵀb + c`. Length `p`. Mirrors
+        /// `PirlsPenalty::linear_shift()` in the CPU oracle. Pass a zero
+        /// vector for fits with no prior-mean shift.
+        linear_shift: ArrayView1<'_, f64>,
+        /// Constant shift `c` of the shifted-quadratic penalty. Pass
+        /// `0.0` for fits with no prior-mean shift.
+        constant_shift: f64,
         /// Temporary LM damping for the Newton solves only; never enters
         /// RidgePassport / exported Hessian / EDF / penalty term.
         lm_ridge: f64,
