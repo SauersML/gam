@@ -2,6 +2,7 @@ use crate::estimate::EstimationError;
 use crate::estimate::{FitGeometry, UnifiedFitResult};
 use crate::faer_ndarray::FaerArrayView;
 use crate::linalg::utils::StableSolver;
+use crate::matrix::{PsdWeightsView, SignedWeightsView};
 use crate::pirls;
 use crate::types::LinkFunction;
 use faer::Mat as FaerMat;
@@ -275,8 +276,8 @@ fn compute_alo_diagnostics_from_pirls_inner(
     let input = AloInput {
         design: x_dense,
         penalized_hessian: &h_dense_for_alo,
-        hessian_weights: &base.finalweights,
-        score_weights: &base.solveweights,
+        hessian_weights: base.final_weights_signed(),
+        score_weights: base.solve_weights_psd(),
         working_response: &base.solveworking_response,
         eta: &base.final_eta,
         offset: &base.final_offset,
@@ -407,10 +408,16 @@ pub struct AloInput<'a> {
     pub design: &'a Array2<f64>,
     /// Penalized Hessian H = X'WX + S(λ) at convergence (p × p).
     pub penalized_hessian: &'a Array2<f64>,
-    /// Hessian-side IRLS weights W_H at convergence (n).
-    pub hessian_weights: &'a Array1<f64>,
+    /// Hessian-side IRLS weights W_H at convergence (n). Sign-honest: for
+    /// non-canonical links the observed-information diagonal can have negative
+    /// entries, so the typed [`SignedWeightsView`] is the contract here. PSD
+    /// callers needing to promote (e.g. the canonical-link case where the
+    /// caller has discharged W_H ≥ 0 algebraically) can route through
+    /// `SignedWeightsView::as_psd()` at the consumer.
+    pub hessian_weights: SignedWeightsView<'a>,
     /// Score-side IRLS weights W_S paired with `working_response` (n).
-    pub score_weights: &'a Array1<f64>,
+    /// PSD-by-construction: the score-side Fisher weights `h'²/(φ V(μ)) ≥ 0`.
+    pub score_weights: PsdWeightsView<'a>,
     /// IRLS working response at convergence (n).
     pub working_response: &'a Array1<f64>,
     /// Fitted linear predictor η̂ (n).
@@ -438,13 +445,19 @@ impl<'a> AloInput<'a> {
         link: LinkFunction,
         phi: f64,
     ) -> Self {
+        // FitGeometry stores one working-weight vector, so this constructor is
+        // exact only when the score- and Hessian-side IRLS weights coincide
+        // (canonical-link case where Fisher == Observed). In that path the
+        // diagonal is the Fisher weight `h'²/(φ V(μ)) ≥ 0`, so the PSD
+        // obligation is discharged algebraically without a runtime scan;
+        // `as_signed()` re-views the same buffer for the Hessian-side slot.
+        let psd_w =
+            PsdWeightsView::from_view_unchecked(geom.working_weights.view());
         Self {
             design,
             penalized_hessian: &geom.penalized_hessian,
-            // FitGeometry stores one working-weight vector, so this constructor is
-            // exact only when the score- and Hessian-side IRLS weights coincide.
-            hessian_weights: &geom.working_weights,
-            score_weights: &geom.working_weights,
+            hessian_weights: psd_w.as_signed(),
+            score_weights: psd_w,
             working_response: &geom.working_response,
             eta,
             offset,
@@ -469,8 +482,11 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
     let x_dense = input.design;
     let n = x_dense.nrows();
     let p = x_dense.ncols();
-    let w_h = input.hessian_weights;
-    let w_s = input.score_weights;
+    // Bind the underlying ArrayView1 once so the loop body can index and
+    // borrow as before; the sign-character contract lives in the
+    // `AloInput` field types, not in this local binding.
+    let w_h = input.hessian_weights.view();
+    let w_s = input.score_weights.view();
 
     validate_alo_solve_setup(input, n, p)?;
 
@@ -651,7 +667,7 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
         se_sandwich,
         pred_identity: eta_hat.clone(),
         leverage: aii,
-        fisherweights: w_h.clone(),
+        fisherweights: w_h.to_owned(),
     })
 }
 
