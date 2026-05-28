@@ -647,6 +647,327 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
     })
 }
 
+/// Channel-aware identifiability audit for multi-channel families.
+///
+/// The flat [`audit_identifiability`] runs RRQR on
+/// `X_joint ∈ ℝ^{n × p_total}`, treating every block's raw design as
+/// living in the same row space. For multi-channel families
+/// (e.g. survival marginal-slope, `K = 4`), two columns from different
+/// blocks with identical raw row values may contribute to *orthogonal*
+/// `K`-channels of the row Jacobian — they look aliased in `X_joint`
+/// but are separately identifiable through the likelihood. The flat
+/// audit reports those as fatal hard-alias pairs and refuses the fit;
+/// the channel-aware audit operates on the
+/// `(n·K) × p_total` channel-weighted joint design
+/// `W_joint = stack_i sqrt(K^S_i) · J_i`
+/// and gets the correct answer.
+///
+/// `operators[i]` is the row Jacobian for block `i` (so
+/// `operators[i].apply_row(row, δβ, out)` writes `J_{i,row}·δβ ∈ ℝ^K`).
+/// `specs[i].design.ncols()` MUST equal `operators[i].ncols()`,
+/// `specs[i].design.nrows()` MUST equal `operators[i].nrows()`, and
+/// every operator must share the same `K = row_hess.k()`.
+///
+/// `row_hess` is the structural row metric `K^S` (typically an
+/// [`crate::families::identifiability_compiler::IdentityRowHessian`] —
+/// see [`compile_with_dual_metric`] for why the structural metric is
+/// the rank-decision metric, not the pilot curvature).
+///
+/// The output [`IdentifiabilityAudit`] preserves the same contract as
+/// the flat path: `dropped_columns` attributed to (block, local_col),
+/// `aliased_pairs` reported above
+/// [`ALIAS_OVERLAP_REPORTING_THRESHOLD`] in the channel-weighted view,
+/// `fatal` true on rank deficiency or hard-alias pair above
+/// [`HARD_HALT_OVERLAP_THRESHOLD`].
+pub fn audit_identifiability_channel_aware(
+    specs: &[ParameterBlockSpec],
+    operators: &[std::sync::Arc<dyn crate::families::identifiability_compiler::RowJacobianOperator>],
+    row_hess: &dyn crate::families::identifiability_compiler::RowHessian,
+) -> Result<IdentifiabilityAudit, String> {
+    use crate::families::identifiability_compiler::{IdentityRowHessian, compile_with_dual_metric};
+
+    if specs.is_empty() {
+        return Ok(IdentifiabilityAudit {
+            blocks: Vec::new(),
+            aliased_pairs: Vec::new(),
+            dropped_columns: Vec::new(),
+            fatal: false,
+            summary: "identifiability audit (channel-aware): no blocks supplied".to_string(),
+        });
+    }
+    if specs.len() != operators.len() {
+        return Err(format!(
+            "audit_identifiability_channel_aware: specs ({}) and operators ({}) length mismatch",
+            specs.len(),
+            operators.len()
+        ));
+    }
+    let k = row_hess.k();
+    let n = row_hess.nrows();
+    for (idx, op) in operators.iter().enumerate() {
+        if op.k() != k {
+            return Err(format!(
+                "audit_identifiability_channel_aware: operator {idx} has K={} but row_hess K={k}",
+                op.k(),
+            ));
+        }
+        if op.nrows() != n {
+            return Err(format!(
+                "audit_identifiability_channel_aware: operator {idx} has nrows={} but row_hess nrows={n}",
+                op.nrows(),
+            ));
+        }
+        if op.ncols() != specs[idx].design.ncols() {
+            return Err(format!(
+                "audit_identifiability_channel_aware: operator {idx} ({}) has ncols={} but spec '{}' design ncols={}",
+                idx,
+                op.ncols(),
+                specs[idx].name,
+                specs[idx].design.ncols(),
+            ));
+        }
+    }
+
+    // Per-block "in-isolation" rank decision uses the structural row
+    // metric directly, so the audit's reported `design_range_rank`
+    // matches the within-block RRQR of `sqrt(K^S) · J_i` in
+    // `(n·K, p_i)` space. Reuse the same identity-K^S the compiler
+    // defaults to: decoupling the rank-decision metric from a possibly
+    // rank-deficient pilot curvature is what makes the channel-aware
+    // audit a structural identifiability check rather than a
+    // curvature-aware one.
+    let id_struct = IdentityRowHessian::new(n, k);
+
+    // Joint compile-with-dual-metric does the heavy lifting: it
+    // returns per-block selectors `t_lw`, the joint rank, and demoted
+    // (block, local_col) attributions in the structural metric.
+    // Routing the audit through this path is what guarantees that the
+    // channel-aware view replaces — not augments — the flat view's
+    // joint RRQR pass.
+    let ordering: Vec<crate::families::identifiability_compiler::BlockOrder> =
+        std::iter::repeat(crate::families::identifiability_compiler::BlockOrder::Marginal)
+            .take(operators.len())
+            .collect();
+    let compiled = compile_with_dual_metric(operators, row_hess, &id_struct, &ordering)
+        .map_err(|e| format!("audit_identifiability_channel_aware compile failed: {e:?}"))?;
+
+    // Build per-block identity entries from the compiled output.
+    let mut blocks: Vec<BlockIdentity> = Vec::with_capacity(specs.len());
+    let mut col_offsets: Vec<usize> = Vec::with_capacity(specs.len() + 1);
+    col_offsets.push(0);
+    for (idx, spec) in specs.iter().enumerate() {
+        let p_block = spec.design.ncols();
+        let kept = compiled
+            .blocks
+            .get(idx)
+            .map(|b| b.t_lw.ncols())
+            .unwrap_or(p_block);
+        blocks.push(BlockIdentity {
+            block_name: spec.name.clone(),
+            original_dim: p_block,
+            effective_dim: kept,
+            // The channel-aware path does not produce per-block
+            // singular values in the flat-X sense; report an empty
+            // vector and rely on `effective_dim` < `original_dim`
+            // as the structural-rank signal.
+            design_range_rank: kept,
+            design_range_singular_values: Vec::new(),
+        });
+        let next = col_offsets[col_offsets.len() - 1] + p_block;
+        col_offsets.push(next);
+    }
+    let p_total = *col_offsets.last().expect("col_offsets non-empty");
+
+    // Dropped columns come straight from the compiler's
+    // audit-attribution pass. The compiler reports `(block_idx,
+    // local_col)`; map to `DroppedColumn { block, column, reason }`
+    // with a channel-aware reason string.
+    let mut dropped_columns: Vec<DroppedColumn> = Vec::new();
+    for (block_idx, local_col) in &compiled.dropped {
+        let block_name = specs[*block_idx].name.clone();
+        dropped_columns.push(DroppedColumn {
+            block: block_name.clone(),
+            column: *local_col,
+            reason: format!(
+                "channel-aware audit (K={k}) demoted block '{block_name}' \
+                 local column {local_col}: column is in the row-Jacobian span \
+                 of earlier blocks under the structural row metric",
+            ),
+        });
+    }
+
+    // Pairwise overlap scan in the channel-weighted view. The compiler
+    // already eigendecomposed the structural Gram block-by-block; we
+    // need joint column-column overlaps to surface near-alias pairs
+    // above the reporting threshold. Compute on the (n·K, p_total)
+    // weighted joint W where W_b = sqrt(K^S) · J_b. With K^S = I,
+    // sqrt(K^S) = I and W_b is just J_b flattened to (n·K, p_b).
+    let aliased_pairs = channel_aware_aliased_pairs(operators, &col_offsets, specs)?;
+
+    let joint_rank = compiled.joint_rank;
+    let joint_rank_deficient = joint_rank < p_total;
+    let hard_alias_pair = aliased_pairs
+        .iter()
+        .max_by(|a, b| {
+            a.overlap
+                .partial_cmp(&b.overlap)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .filter(|p| p.overlap >= HARD_HALT_OVERLAP_THRESHOLD)
+        .cloned();
+    let fatal = joint_rank_deficient || hard_alias_pair.is_some();
+
+    let fatal_detail = if fatal {
+        let mut parts: Vec<String> = Vec::new();
+        if joint_rank_deficient {
+            let attribution = if let Some(first_drop) = dropped_columns.first() {
+                format!(
+                    "first attributed drop: block '{}' local column {} \
+                     (reparam: replace this column with a sum-to-zero or \
+                     orthogonal-complement projection against earlier blocks, \
+                     or remove the redundant term entirely)",
+                    first_drop.block, first_drop.column,
+                )
+            } else {
+                "no per-column attribution (>2-way structural alias in the \
+                 channel-aware row-Jacobian space)"
+                    .to_string()
+            };
+            parts.push(format!(
+                "channel-aware joint rank {} < joint columns {} \
+                 ({} dropped column(s); {})",
+                joint_rank,
+                p_total,
+                dropped_columns.len(),
+                attribution,
+            ));
+        }
+        if let Some(pair) = hard_alias_pair.as_ref() {
+            parts.push(format!(
+                "alias pair: '{}'[{}] ~ '{}'[{}] overlap={:.4} >= halt threshold {:.2} \
+                 in channel-aware row-Jacobian view (reparam: orthogonalise one block's \
+                 column {} against the other or absorb the shared direction)",
+                pair.block_a,
+                pair.direction_a,
+                pair.block_b,
+                pair.direction_b,
+                pair.overlap,
+                HARD_HALT_OVERLAP_THRESHOLD,
+                pair.direction_b,
+            ));
+        }
+        format!(" — FATAL: {}", parts.join("; "))
+    } else if !aliased_pairs.is_empty() {
+        " — partial alias(es) below halt threshold (channel-aware); penalty + line search will resolve"
+            .to_string()
+    } else {
+        " — clean (channel-aware)".to_string()
+    };
+
+    let summary = format!(
+        "identifiability audit (channel-aware, K={k}): {} block(s), {} joint columns, joint rank {}, \
+         {} alias pair(s) above overlap {:.3}, {} dropped column(s){}",
+        specs.len(),
+        p_total,
+        joint_rank,
+        aliased_pairs.len(),
+        ALIAS_OVERLAP_REPORTING_THRESHOLD,
+        dropped_columns.len(),
+        fatal_detail,
+    );
+
+    Ok(IdentifiabilityAudit {
+        blocks,
+        aliased_pairs,
+        dropped_columns,
+        fatal,
+        summary,
+    })
+}
+
+/// Pairwise overlap scan on the channel-weighted joint design
+/// `W = stack_b sqrt(I_K) · J_b` (identity structural metric).
+/// Returns one [`AliasedPair`] per column-pair whose normalised
+/// `|wᵀ w'|` exceeds [`ALIAS_OVERLAP_REPORTING_THRESHOLD`], in
+/// `(block_a < block_b)` order.
+fn channel_aware_aliased_pairs(
+    operators: &[std::sync::Arc<dyn crate::families::identifiability_compiler::RowJacobianOperator>],
+    col_offsets: &[usize],
+    specs: &[ParameterBlockSpec],
+) -> Result<Vec<AliasedPair>, String> {
+    if operators.is_empty() {
+        return Ok(Vec::new());
+    }
+    let k = operators[0].k();
+    let n = operators[0].nrows();
+    let nk = n.checked_mul(k).ok_or_else(|| {
+        format!("channel-aware audit: n*k overflow (n={n}, k={k})")
+    })?;
+    let p_total = *col_offsets.last().unwrap_or(&0);
+    if p_total == 0 || nk == 0 {
+        return Ok(Vec::new());
+    }
+    // Materialise W = (n*K, p_total) column-major (i.e. one Vec<f64>
+    // of length nk per joint column).
+    let mut cols: Vec<Array1<f64>> = Vec::with_capacity(p_total);
+    let mut col_norms: Vec<f64> = Vec::with_capacity(p_total);
+    for (b_idx, op) in operators.iter().enumerate() {
+        let j_full = op.evaluate_full();
+        let p_b = op.ncols();
+        for c in 0..p_b {
+            let mut w = Array1::<f64>::zeros(nk);
+            for i in 0..n {
+                for ch in 0..k {
+                    w[i * k + ch] = j_full[[i, c, ch]];
+                }
+            }
+            let norm = w.iter().map(|v| v * v).sum::<f64>().sqrt();
+            cols.push(w);
+            col_norms.push(norm);
+        }
+        // Suppress unused; the per-block iteration is bounded by p_b.
+        let _ = b_idx;
+    }
+    // Pairwise scan: for every joint column pair (a < b) with both
+    // norms positive, compute |wᵀw'| / (‖w‖·‖w'‖) and emit if above
+    // the reporting threshold. The pair is named by the owning blocks
+    // and the *local* column indices.
+    let mut pairs: Vec<AliasedPair> = Vec::new();
+    for a in 0..p_total {
+        if col_norms[a] <= 0.0 {
+            continue;
+        }
+        for b in (a + 1)..p_total {
+            if col_norms[b] <= 0.0 {
+                continue;
+            }
+            let mut dot = 0.0_f64;
+            for i in 0..nk {
+                dot += cols[a][i] * cols[b][i];
+            }
+            let overlap = (dot.abs() / (col_norms[a] * col_norms[b])).min(1.0);
+            if overlap >= ALIAS_OVERLAP_REPORTING_THRESHOLD {
+                let (block_a_idx, dir_a) = locate_block_column(col_offsets, a)?;
+                let (block_b_idx, dir_b) = locate_block_column(col_offsets, b)?;
+                if block_a_idx == block_b_idx {
+                    // Within-block aliasing is a separate concern
+                    // (per-block QR catches it); the cross-block scan
+                    // only reports inter-block pairs.
+                    continue;
+                }
+                pairs.push(AliasedPair {
+                    block_a: specs[block_a_idx].name.clone(),
+                    block_b: specs[block_b_idx].name.clone(),
+                    direction_a: dir_a,
+                    direction_b: dir_b,
+                    overlap,
+                });
+            }
+        }
+    }
+    Ok(pairs)
+}
+
 fn locate_block_column(col_offsets: &[usize], joint_col: usize) -> Result<(usize, usize), String> {
     // col_offsets has length specs.len() + 1; col_offsets[i..i+1] is
     // the joint-column range for block i. Linear scan is fine — the

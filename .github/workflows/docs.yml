@@ -1,16 +1,9 @@
 name: docs
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    paths:
-      - "docs/**"
-      - "mkdocs.yml"
-      - ".readthedocs.yaml"
-      - "gamfit/**"
-      - "pyproject.toml"
-      - ".github/workflows/docs.yml"
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read

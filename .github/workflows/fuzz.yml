@@ -1,28 +1,8 @@
 name: Fuzz vs mgcv
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "src/**"
-      - "bench/fuzz_vs_mgcv.py"
-      - "bench/run_suite.py"
-      - "tests/bench_fuzz_vs_mgcv_test.py"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/fuzz.yml"
-      - ".github/actions/setup-bench-r/**"
-  pull_request:
-    branches: [main]
-    paths:
-      - "src/**"
-      - "bench/fuzz_vs_mgcv.py"
-      - "bench/run_suite.py"
-      - "tests/bench_fuzz_vs_mgcv_test.py"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/fuzz.yml"
-      - ".github/actions/setup-bench-r/**"
+  schedule:
+    - cron: "0 3 * * *"
   workflow_dispatch:
 
 concurrency:
