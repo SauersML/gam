@@ -70,7 +70,11 @@ jobs:
 
             ## The goal
 
-            Pick one open issue. Solve it properly. Open a PR.
+            Pick one open issue. Solve it properly. Open a PR. When that
+            one is done, if there are closely related open issues
+            (same subsystem, same root cause cluster, same failure mode),
+            you may pick another one and chain it in the same run. See
+            "Chaining related issues" below.
 
             "Properly" here means the absolute ideal solution — beautiful,
             principled, root-cause, long-term correct, fully verified, fully
@@ -145,6 +149,36 @@ jobs:
                 `🔓 release: run ${{ github.run_id }}` followed by a
             one-paragraph summary. This lets any other run skip the
             45-minute wait.
+
+            **One claim at a time.** Do NOT lock a batch of issues up
+            front. Lock the next issue only when you're actually about to
+            start working on it. If you survey and pick three candidates,
+            still claim only the first; the others stay unclaimed for
+            other runs to grab.
+
+            **Exception — closely related cluster.** If two or three open
+            issues share the same root cause and you'll genuinely fix them
+            in one coherent diff (e.g., the same broken abstraction is
+            surfacing as three symptoms), you may claim that small cluster
+            together at the start. Each one still gets its own 🔒 claim:
+            comment. The bar is: the fixes are inseparable, not just
+            adjacent.
+
+            ## Chaining related issues serially
+
+            After you've opened the PR for your first issue and posted the
+            🔓 release:, you may pick another issue and start a new
+            claim → fix → release cycle in the same run, *as long as*
+            the next issue is closely related to the work you just did
+            (same subsystem, same root cause cluster, same numerical
+            failure mode). Chaining unrelated work in one run hurts the
+            quality bar — open a fresh PR for fresh territory.
+
+            Each issue in the chain gets its own claim cycle (steps 1-5),
+            its own `fix/issue-<N>` branch, and its own PR. Don't
+            claim them all upfront — claim the next one only when you're
+            about to start it, so other concurrent runs can pick up
+            unrelated issues in the meantime.
 
             ## Removing blockers is part of the job
 
