@@ -7902,7 +7902,8 @@ mod tests {
 
         fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
             let dense = dense_operator_to_dense_by_chunks(self).map_err(|err| err.to_string())?;
-            Ok(dense_xtwx_view(&dense, weights.view()))
+            let psd = PsdWeightsView::try_new(weights.view())?;
+            Ok(dense_xtwx_view(&dense, psd))
         }
     }
 
