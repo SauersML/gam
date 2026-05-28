@@ -1,7 +1,7 @@
 //! Block 9 Phase 2/3 — device kernels that consume the row-primary Hessian
 //! cache (the per-row `r × r` blocks materialised by
 //! [`crate::families::bernoulli_marginal_slope::BernoulliMarginalSlopeFamily::build_row_primary_hessian_cache`]
-//! and stored in [`crate::families::bernoulli_marginal_slope::RowPrimaryHessianCache`])
+//! and stored in [`crate::families::bernoulli_marginal_slope::RowPrimaryEvalCache`])
 //! and emit either:
 //!
 //! * **Phase 2 — per-row matvec** `y_i = H_i · v_i` for every row `i ∈ [0, n)`,

@@ -191,6 +191,11 @@ mod linux_impl {
         let mut loop_ws = pirls_gpu::allocate_pirls_loop_workspace(&shared, &ws)?;
 
         let lm_ridge = input.initial_lm_lambda.unwrap_or(1e-6);
+        // Forward the active Gamma shape so the GammaLog kernel uses the
+        // correct dispersion. Defaults to 1.0 (unit-shape Gamma / Poisson
+        // analogue) when the spec does not carry an explicit shape — this
+        // matches the CPU PIRLS path's `gamma_shape().unwrap_or(1.0)` fallback.
+        let gamma_shape = input.likelihood.gamma_shape().unwrap_or(1.0);
         let qs_view = input.qs;
         let firth_default = FirthDiagnostics::Inactive;
         // Sanity-check that the host-side enum maps round-trip; if a future
@@ -224,6 +229,7 @@ mod linux_impl {
             &mut loop_ws,
             family,
             curvature,
+            gamma_shape,
             input.initial_beta,
             input.y,
             input.priorweights,

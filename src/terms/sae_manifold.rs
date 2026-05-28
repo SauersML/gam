@@ -2050,6 +2050,27 @@ impl SaeManifoldTerm {
             kron_jac.push(jac_flat);
             sys.rows[row] = block;
         }
+        // Build and install the Kronecker htbeta_matvec.
+        //
+        // `SaeKroneckerRows` holds per-row `(a_phi, local_jac)` and implements
+        // `H_tβ^(i) x` via the gather-scatter Kronecker form without ever
+        // materializing the `(q × K·p)` block.  The closure is Arc-wrapped so
+        // the Arrow-Schur solver can use it via `sys.htbeta_matvec`.
+        {
+            let kron = Arc::new(SaeKroneckerRows::new(n, p, q, kron_a_phi, kron_jac));
+            sys.set_row_htbeta_operator(move |row_idx, x, out| {
+                // Apply J_β^(row_idx) · x → out using the Kronecker form.
+                // x may or may not be contiguous; collect into a plain Vec
+                // only when a contiguous slice is not available.
+                let out_slice = out.as_slice_mut().expect("out is always standard-layout");
+                if let Some(xs) = x.as_slice() {
+                    kron.apply_jbeta(row_idx, xs, out_slice);
+                } else {
+                    let x_vec: Vec<f64> = x.iter().copied().collect();
+                    kron.apply_jbeta(row_idx, &x_vec, out_slice);
+                }
+            });
+        }
         if let Some(registry) = analytic_penalties {
             self.add_sae_analytic_penalty_contributions(&mut sys, registry)
                 .map_err(|err| format!("SaeManifoldTerm::assemble_arrow_schur: {err}"))?;

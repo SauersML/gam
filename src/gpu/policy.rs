@@ -269,3 +269,43 @@ impl GpuDispatchPolicy {
         }
     }
 }
+
+#[cfg(test)]
+mod refinement_policy_tests {
+    use super::*;
+
+    #[test]
+    fn refinement_policy_admits_large_p() {
+        let pol = GpuDispatchPolicy::default();
+        // Default policy is Refinement; large p should be admitted.
+        assert!(pol.iterative_refinement_should_attempt(512));
+        assert!(pol.iterative_refinement_should_attempt(GpuDispatchPolicy::REFINEMENT_MIN_P));
+    }
+
+    #[test]
+    fn refinement_policy_rejects_small_p() {
+        let pol = GpuDispatchPolicy::default();
+        assert!(!pol.iterative_refinement_should_attempt(
+            GpuDispatchPolicy::REFINEMENT_MIN_P - 1
+        ));
+        assert!(!pol.iterative_refinement_should_attempt(0));
+    }
+
+    #[test]
+    fn off_policy_never_attempts_refinement() {
+        let pol = GpuDispatchPolicy {
+            mixed_precision: MixedPrecisionPolicy::Off,
+            ..Default::default()
+        };
+        assert!(!pol.iterative_refinement_should_attempt(1024));
+    }
+
+    #[test]
+    fn never_policy_never_attempts_refinement() {
+        let pol = GpuDispatchPolicy {
+            mixed_precision: MixedPrecisionPolicy::Never,
+            ..Default::default()
+        };
+        assert!(!pol.iterative_refinement_should_attempt(1024));
+    }
+}

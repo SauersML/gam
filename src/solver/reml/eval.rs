@@ -118,37 +118,24 @@ pub(crate) type SigmaPointResult = Option<(Array2<f64>, Array1<f64>)>;
 /// Predicate: is the device-resident inner PIRLS that the GPU stream-pool
 /// sigma executor needs available in this build/runtime?
 ///
-/// Today this returns `false` unconditionally. It flips to `true` exactly
-/// when both of these land:
-///   * `pirls-row-v3` Stage 3 — full GPU PIRLS loop in
-///     [`crate::solver::gpu::pirls_gpu`] (eta → row kernel → XtWX → Cholesky
-///     → linesearch → beta, all device-resident).
-///   * `bms-flex-v3` Phase 5 — device-resident family derivative kernels
-///     the row-by-row inner loop depends on for the row metric / gradient.
+/// Returns `true` when both of the following hold:
+///   * The active solver device is `Cuda` (`cuda_selected()`).
+///   * A live [`crate::gpu::runtime::GpuRuntime`] is present, confirming
+///     that CUDA is initialised and the JIT row-kernel cache is warm.
 ///
-/// The intentional non-flag gate is the only thing standing between the
-/// existing Rayon-CPU loop and the GPU stream-pool path — flipping this
-/// predicate (and pointing it at a real readiness signal those teams
-/// expose) is the documented one-line swap.
+/// The full Stage 3.3 device-resident PIRLS loop (`pirls_loop_on_stream`)
+/// already exists in [`crate::solver::gpu::pirls_gpu`] and covers all six
+/// canonical (family, link) pairings supported by the GPU admission gate.
+/// The sigma-cubature stream-pool executor
+/// ([`sigma_cubature_evaluate_gpu_stream_pool`]) uses it directly.
 ///
-/// We deliberately do not surface a CLI flag, env var, or Cargo feature for
-/// this — magic by default. The predicate inspects only the immutable
-/// build + runtime properties that determine correctness, not user intent.
+/// The intentional non-flag gate is magic by default: no CLI flag, no env
+/// var, no Cargo feature. The predicate inspects only build + runtime
+/// properties that determine correctness.
 #[inline]
 fn device_pirls_stage3_ready() -> bool {
-    // pirls-row-v3 Stage 3 + bms-flex-v3 Phase 5 not yet landed. The GPU
-    // primitives in `solve_pirls_step_on_stream` exist (P2) but they
-    // implement only a *single* Newton step over an already-uploaded X;
-    // the full PIRLS outer loop (re-weight → re-step → linesearch) still
-    // round-trips to the host for each iteration. Until the device-side
-    // loop replaces those host round-trips, the GPU stream-pool path
-    // would be no faster than CPU and would burn upload bandwidth, so we
-    // stay on Rayon.
-    //
-    // When ready, replace the body with `crate::solver::gpu::runtime::
-    // GpuRuntime::global().is_some()` (or whatever finer-grained probe
-    // the device-resident inner PIRLS module exposes).
-    false
+    crate::solver::gpu::cuda_selected()
+        && crate::gpu::runtime::GpuRuntime::global().is_some()
 }
 
 /// Sigma-cubature executor dispatch — the swap site between the CPU Rayon

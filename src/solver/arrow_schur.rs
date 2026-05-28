@@ -1002,6 +1002,8 @@ impl ArrowSchurSystem {
     {
         assert_eq!(diag.len(), k);
         let rows = (0..n).map(|_| ArrowRowBlock::new(d, k)).collect();
+        let row_dims: Arc<[usize]> = (0..n).map(|_| d).collect::<Vec<_>>().into();
+        let row_offsets: Arc<[usize]> = (0..=n).map(|i| i * d).collect::<Vec<_>>().into();
         let mut sys = Self {
             rows,
             hbb: Array2::<f64>::zeros((0, 0)),
@@ -1010,6 +1012,50 @@ impl ArrowSchurSystem {
             hbb_diag: Some(diag),
             gb: Array1::<f64>::zeros(k),
             d,
+            row_dims,
+            row_offsets,
+            k,
+            manifold_mode_fingerprint: EUCLIDEAN_MANIFOLD_MODE_FINGERPRINT,
+            row_hessian_fingerprint: 0,
+            analytic_row_hessian_fingerprint: 0,
+            block_offsets: Arc::from([] as [Range<usize>; 0]),
+        };
+        sys.refresh_row_hessian_fingerprint();
+        sys
+    }
+
+    /// Allocate a heterogeneous BA system where each row has its own latent
+    /// dimensionality `per_row_dims[i]`.
+    ///
+    /// Used by sparse-assignment SAE paths (JumpReLU / TopK / sparsemax /
+    /// hard-concrete) where the active-set size varies per observation.
+    /// `sys.d` is set to `max(per_row_dims)` (or 0 for an empty system).
+    pub fn new_with_per_row_dims(per_row_dims: Vec<usize>, k: usize) -> Self {
+        let n = per_row_dims.len();
+        let max_d = per_row_dims.iter().copied().max().unwrap_or(0);
+        let row_dims: Arc<[usize]> = per_row_dims.iter().copied().collect::<Vec<_>>().into();
+        let mut off_vec = Vec::with_capacity(n + 1);
+        let mut cursor = 0usize;
+        for &di in &per_row_dims {
+            off_vec.push(cursor);
+            cursor += di;
+        }
+        off_vec.push(cursor);
+        let row_offsets: Arc<[usize]> = off_vec.into();
+        let rows = per_row_dims
+            .iter()
+            .map(|&di| ArrowRowBlock::new(di, k))
+            .collect();
+        let mut sys = Self {
+            rows,
+            hbb: Array2::<f64>::zeros((k, k)),
+            hbb_matvec: None,
+            htbeta_matvec: None,
+            hbb_diag: None,
+            gb: Array1::<f64>::zeros(k),
+            d: max_d,
+            row_dims,
+            row_offsets,
             k,
             manifold_mode_fingerprint: EUCLIDEAN_MANIFOLD_MODE_FINGERPRINT,
             row_hessian_fingerprint: 0,

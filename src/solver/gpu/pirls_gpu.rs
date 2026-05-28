@@ -1155,90 +1155,6 @@ extern "C" __global__ void chol_logdet_col_major(
         }
     }
 
-    /// Assemble the export Hessian `H_export = Xt * diag(w_hessian) * X + S`
-    /// using the device-resident `w_hessian` weights (NOT the solver-floored
-    /// `w_solver`), and without any LM-damping ridge. This is the matrix
-    /// exported for EDF, covariance, and REML curvature consumers after
-    /// PIRLS convergence (issue #262).
-    ///
-    /// Reuses workspace scratch buffers `wx_dev`, `xtwx_dev`, `penalty_dev`,
-    /// `h_dev` — no extra allocation. `h_dev` is clobbered (the Cholesky
-    /// factor written by the last Newton step is overwritten).
-    fn assemble_export_hessian(
-        shared: &PirlsGpuSharedData,
-        ws: &mut SigmaPirlsGpuWorkspace,
-        w_hessian_dev: &CudaSlice<f64>,
-        penalty_hessian: ArrayView2<'_, f64>,
-    ) -> Result<Array2<f64>, String> {
-        let n = shared.n;
-        let p = shared.p;
-        if w_hessian_dev.len() != n {
-            return Err(format!(
-                "assemble_export_hessian: w_hessian_dev length {} != n={n}",
-                w_hessian_dev.len()
-            ));
-        }
-        if penalty_hessian.dim() != (p, p) {
-            return Err(format!(
-                "assemble_export_hessian: penalty shape {:?} != ({p},{p})",
-                penalty_hessian.dim()
-            ));
-        }
-        // WX = diag(w_hessian) . X  into ws.wx_dev.
-        left_scale_rows_borrowed(
-            &ws.blas,
-            &ws.stream,
-            n,
-            p,
-            &shared.x_dev,
-            w_hessian_dev,
-            &mut ws.wx_dev,
-        )?;
-        // XtWX = Xt . WX  into ws.xtwx_dev.
-        let n_i = to_i32(n)?;
-        let p_i = to_i32(p)?;
-        let gemm_cfg = GemmConfig::<f64> {
-            transa: cublasOperation_t::CUBLAS_OP_T,
-            transb: cublasOperation_t::CUBLAS_OP_N,
-            m: p_i,
-            n: p_i,
-            k: n_i,
-            alpha: 1.0,
-            lda: n_i,
-            ldb: n_i,
-            beta: 0.0,
-            ldc: p_i,
-        };
-        // SAFETY: validated i32 dims; shared.x_dev and ws.wx_dev are n*p
-        // f64 col-major; ws.xtwx_dev is p*p; all on ws.stream.
-        unsafe {
-            ws.blas
-                .gemm(gemm_cfg, &shared.x_dev, &ws.wx_dev, &mut ws.xtwx_dev)
-        }
-        .map_err(|e| format!("assemble_export_hessian dgemm XtWX: {e}"))?;
-        // Upload S (penalty only, no ridge) to ws.penalty_dev.
-        let penalty_col = to_col_major(&penalty_hessian);
-        ws.stream
-            .memcpy_htod(penalty_col.as_ref(), &mut ws.penalty_dev)
-            .map_err(|e| format!("assemble_export_hessian upload penalty: {e}"))?;
-        // H_export = XtWX + S  into ws.h_dev (clobbers prior Cholesky factor).
-        geam_add(
-            &ws.blas,
-            &ws.stream,
-            p,
-            &ws.xtwx_dev,
-            &ws.penalty_dev,
-            &mut ws.h_dev,
-        )?;
-        // Download and return in row-major Array2.
-        let h_col = ws
-            .stream
-            .clone_dtoh(&ws.h_dev)
-            .map_err(|e| format!("assemble_export_hessian download: {e}"))?;
-        from_col_major(&h_col, p, p)
-            .ok_or_else(|| "assemble_export_hessian layout failed".to_string())
-    }
-
     /// Launch the device-side Cholesky-factor logdet kernel and download
     /// the single scalar result. Replaces the per-step p² host download of
     /// the Cholesky factor that the host-side `cholesky_logdet_from_col_major`
@@ -1767,24 +1683,24 @@ extern "C" __global__ void status_or(
             &loop_ws.beta_dev,
             &mut loop_ws.eta_dev,
         )?;
-        crate::gpu::pirls_row::launch_row_reweight_on_stream(
+        // Initial solve-row pass on the starting η (4-output kernel only).
+        crate::gpu::pirls_row::launch_solve_row_on_stream(
             backend,
             family,
             curvature,
-            gamma_shape,
             &ws.stream,
             n,
             &loop_ws.eta_dev,
             &loop_ws.y_dev,
             &loop_ws.prior_w_dev,
-            &mut loop_ws.row_out,
+            &mut loop_ws.row_solve,
         )
-        .map_err(|e| format!("row reweight init: {e}"))?;
+        .map_err(|e| format!("solve-row init: {e}"))?;
 
         let mut prev_deviance = reduce_scalar(
             &ws.stream,
             &sum_func,
-            &loop_ws.row_out.deviance,
+            &loop_ws.row_solve.deviance,
             n,
             &mut loop_ws.scalar_dev,
             "deviance_init",
@@ -1805,8 +1721,8 @@ extern "C" __global__ void status_or(
                 shared,
                 ws,
                 PirlsStepStreamDeviceInput {
-                    w_solver_dev: &loop_ws.row_out.w_solver,
-                    grad_eta_dev: &loop_ws.row_out.grad_eta,
+                    w_solver_dev: &loop_ws.row_solve.w_solver,
+                    grad_eta_dev: &loop_ws.row_solve.grad_eta,
                     penalty_hessian,
                     step_lm_lambda: lm_ridge,
                     objective_ridge,
@@ -3515,6 +3431,7 @@ mod stream_device_parity_tests {
             &mut loop_ws,
             crate::gpu::pirls_row::PirlsRowFamily::GaussianIdentity,
             crate::gpu::pirls_row::CurvatureMode::Fisher,
+            1.0,
             beta0.view(),
             y.view(),
             prior_w.view(),
