@@ -5120,8 +5120,16 @@ fn materialize_standard<'a>(
             family,
             options,
             kappa_options,
+            wiggle_options: if wiggle.is_some() {
+                // The standard wiggle workflow always needs BlockwiseFitOptions
+                // for the second-stage refit; supply defaults when a linkwiggle()
+                // term materializes a binomial-mean wiggle config. Magic-by-default:
+                // no new option is required from the caller.
+                Some(BlockwiseFitOptions::default())
+            } else {
+                None
+            },
             wiggle,
-            wiggle_options: None,
             coefficient_groups: config.coefficient_groups.clone(),
             penalty_block_gamma_priors: config.penalty_block_gamma_priors.clone(),
             latent_coord,

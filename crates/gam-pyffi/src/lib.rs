@@ -555,7 +555,15 @@ impl PythonExceptionKind {
 #[pyfunction]
 fn classify_exception_message(message: String) -> &'static str {
     let lower = message.to_lowercase();
-    let kind = if lower.contains("formula") || lower.contains("parse") {
+    // Column-not-found from formula evaluation surfaces from the Rust data
+    // layer as `column 'z' not found in data. Available columns: [...]`.
+    // That's a formula authoring error (referenced a column that doesn't
+    // exist), so route it to FormulaError so callers can catch it via
+    // `except gamfit.FormulaError` and `explain_error` returns the
+    // formula-specific hint instead of the generic fallback.
+    let is_column_not_found = lower.contains("not found in data")
+        || lower.contains("available columns:");
+    let kind = if lower.contains("formula") || lower.contains("parse") || is_column_not_found {
         PythonExceptionKind::Formula
     } else if lower.contains("schema")
         || lower.contains("missing required column")
