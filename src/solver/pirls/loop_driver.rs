@@ -32,6 +32,7 @@ use super::{
     calculate_deviance, calculate_loglikelihood_omitting_constants,
     computeworkingweight_derivatives_from_eta,
 };
+use gpu_dispatch::{try_gaussian_pls_gpu, try_pirls_loop_gpu};
 use crate::construction::{
     EngineDims, KroneckerReparamResult, ReparamResult,
     create_balanced_penalty_root_from_canonical,
@@ -907,77 +908,26 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         }
     };
 
-    // Stage 3.3-GI: GPU exact PLS dispatch for Gaussian-identity.
-    //
-    // When a CUDA runtime is available and the GaussianFixedCache has been
-    // populated, route through the exact device-side POTRF/POTRS solve instead
-    // of the row-kernel PIRLS loop.  A single call to solve_gaussian_pls_gpu
-    // replaces the entire iterative PIRLS loop for this algebraically exact
-    // family.  On error, falls through to the CPU identity path below.
-    //
-    // Gating conditions mirror `cache_eligible` below: identity link, Gaussian
-    // family, no Firth, no lower bounds, no constraints.
-    #[cfg(target_os = "linux")]
-    if matches!(link_function, LinkFunction::Identity)
-        && likelihood.spec.is_gaussian_identity()
-        && !config.firth_bias_reduction
-        && penalty.coefficient_lower_bounds.is_none()
-        && penalty.linear_constraints_original.is_none()
-    {
-        use crate::solver::gpu::pirls_dispatch_wire::{
-            GpuGaussianPlsInput, try_gpu_gaussian_pls_dispatch,
-        };
-        if let Some(cache) = gaussian_fixed_cache {
-            if let PirlsPenalty::Dense {
-                s_transformed,
-                linear_shift,
-                constant_shift,
-                prior_mean_target,
-                ..
-            } = &penalty_active
-            {
-                let qs_view = qs_arc.as_ref().map(|qs| qs.view());
-                {
-                    let qs_arc_for_design = qs_arc
-                        .as_ref()
-                        .cloned()
-                        .unwrap_or_else(|| Arc::new(Array2::<f64>::eye(penalty.p)));
-                    let x_transformed_design =
-                        make_reparam_operator(&x_original, &qs_arc_for_design, use_sparse_native);
-                    let reparam_for_gpu = materialize_final_reparam_result()?;
-                    let gpu_input = GpuGaussianPlsInput {
-                        xtwx_orig: cache.xtwx_orig.view(),
-                        xtwy_orig: cache.xtwy_orig.view(),
-                        s_transformed: s_transformed.view(),
-                        linear_shift: linear_shift.view(),
-                        prior_mean_target: prior_mean_target.view(),
-                        constant_shift: *constant_shift,
-                        qs: qs_view,
-                        ridge: FIXED_STABILIZATION_RIDGE,
-                        likelihood: &config.likelihood,
-                        inverse_link: &config.link_kind,
-                        x_original: &x_original,
-                        y,
-                        priorweights,
-                        offset,
-                        reparam_result: reparam_for_gpu,
-                        x_transformed_design,
-                        coordinate_frame,
-                        linear_constraints: linear_constraints.clone(),
-                    };
-                    if let Some(result) = try_gpu_gaussian_pls_dispatch(gpu_input) {
-                        match result {
-                            Ok(pair) => return Ok(pair),
-                            Err(err) => {
-                                log::warn!(
-                                    "[PIRLS GPU Gaussian PLS] device solve error, falling back to CPU: {err}"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    // Stage 3.3-GI: GPU exact PLS dispatch — see gpu_dispatch::try_gaussian_pls_gpu.
+    if let Some(result) = try_gaussian_pls_gpu(
+        link_function,
+        config,
+        penalty.coefficient_lower_bounds,
+        penalty.linear_constraints_original,
+        gaussian_fixed_cache,
+        &penalty_active,
+        &qs_arc,
+        &x_original,
+        use_sparse_native,
+        penalty.p,
+        || materialize_final_reparam_result(),
+        y,
+        priorweights,
+        offset,
+        coordinate_frame,
+        &linear_constraints,
+    ) {
+        return result;
     }
 
     if matches!(link_function, LinkFunction::Identity) {
@@ -1270,126 +1220,26 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         );
     };
 
-    // ──────────────────────────────────────────────────────────────────
-    // Stage 3.3 GPU PIRLS-loop dispatch.
-    //
-    // Before paying for the host LM loop, ask
-    // `try_gpu_pirls_loop_dispatch` whether this fit's shape, family,
-    // and runtime device admit the device-resident loop. When `Some`,
-    // the GPU loop has already produced a CPU-oracle-equivalent
-    // `(PirlsResult, WorkingModelPirlsResult)` and we return immediately;
-    // when `None`, dispatch was denied (admission policy, custom
-    // family, sparse-native / Kronecker shape, Firth, constraints, or
-    // no CUDA runtime) and we fall through to the CPU LM loop below.
-    //
-    // The CPU path executes unchanged when the GPU branch returns
-    // `None`, preserving bit-for-bit behaviour on every workload the
-    // device-resident loop does not yet cover.
-    #[cfg(target_os = "linux")]
-    {
-        use crate::solver::gpu::pirls_dispatch_wire::{
-            GpuPirlsDispatchInput, try_gpu_pirls_loop_admit, try_gpu_pirls_loop_dispatch,
-        };
-        // Conservative scope: dispatch only when every assumption the
-        // GPU loop wires up is satisfied. Anything outside this surface
-        // stays on the CPU LM loop until the wire is extended.
-        let dense_x = x_original.as_dense().map(|d| d.view());
-        let dense_penalty = matches!(&penalty_active, PirlsPenalty::Dense { .. });
-        let no_kronecker = kronecker_runtime.is_none();
-        let no_sparse_native = !use_sparse_native;
-        let no_firth = !config.firth_bias_reduction;
-        let no_constraints = linear_constraints.is_none();
-        if let (true, true, true, true, true, Some(x_dense)) = (
-            dense_penalty,
-            no_kronecker,
-            no_sparse_native,
-            no_firth,
-            no_constraints,
-            dense_x,
-        ) {
-            // Cheap admission shim: tests cuda_selected(), runtime presence,
-            // family/curvature gate, and shape policy — all O(1) — before
-            // any O(N·p) work. CPU-default, no-runtime, and policy-rejected
-            // shapes skip fast_ab, make_reparam_operator, and
-            // materialize_final_reparam_result entirely.
-            let n_admit = x_dense.nrows();
-            let p_admit = x_dense.ncols();
-            if try_gpu_pirls_loop_admit(&config.likelihood, n_admit, p_admit) {
-                // Resident-X architecture (#269): ship X_original once to device,
-                // ship only Qs per ρ/σ point. No fast_ab materialization needed.
-                let qs_view = qs_arc.as_ref().map(|qs| qs.view());
-                let (s_transformed_view, linear_shift_view, constant_shift_val) =
-                    match &penalty_active {
-                        PirlsPenalty::Dense {
-                            s_transformed,
-                            linear_shift,
-                            constant_shift,
-                            ..
-                        } => (s_transformed.view(), linear_shift.view(), *constant_shift),
-                        // SAFETY: the GPU PIRLS dispatch path that reaches this
-                        // match is gated on `PirlsPenalty::Dense { .. }` upstream
-                        // (see the dispatch-admission check earlier in this
-                        // function); the `Diagonal` arm is therefore unreachable
-                        // at runtime. We panic rather than `unreachable!` per the
-                        // build.rs ban on the latter macro; the comment-anchored
-                        // contract is the same.
-                        PirlsPenalty::Diagonal { .. } => {
-                            panic!("GPU PIRLS dispatch gated on PirlsPenalty::Dense above")
-                        }
-                    };
-                // Dense-design materialization for `PirlsResult.x_transformed`.
-                let qs_arc_for_design = qs_arc
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or_else(|| Arc::new(Array2::<f64>::eye(penalty.p)));
-                let x_transformed_design = make_reparam_operator(
-                    &x_original_for_result,
-                    &qs_arc_for_design,
-                    use_sparse_native,
-                );
-                let reparam_for_dispatch = materialize_final_reparam_result()?;
-                // Owned clone of the initial-β so the GPU dispatch input can
-                // borrow it without conflicting with the CPU fallback which
-                // moves `initial_beta` into `Coefficients::new` below.
-                let initial_beta_owned = initial_beta.clone();
-                let exported_curvature_kind = match link_function {
-                    LinkFunction::Probit | LinkFunction::CLogLog => HessianCurvatureKind::Observed,
-                    _ => HessianCurvatureKind::Fisher,
-                };
-                let dispatch = GpuPirlsDispatchInput {
-                    likelihood: &config.likelihood,
-                    inverse_link: &config.link_kind,
-                    x_original: x_dense,
-                    s_transformed: s_transformed_view,
-                    linear_shift: linear_shift_view,
-                    constant_shift: constant_shift_val,
-                    y,
-                    priorweights,
-                    offset,
-                    initial_beta: initial_beta_owned.view(),
-                    initial_lm_lambda: config.initial_lm_lambda,
-                    max_iterations: options.max_iterations,
-                    convergence_tolerance: options.convergence_tolerance,
-                    linear_constraints: None,
-                    qs: qs_view,
-                    reparam_result: reparam_for_dispatch,
-                    x_transformed_design,
-                    coordinate_frame,
-                    edf: None,
-                    exported_curvature: exported_curvature_kind,
-                };
-                if let Some(result) = try_gpu_pirls_loop_dispatch(dispatch) {
-                    match result {
-                        Ok(pair) => return Ok(pair),
-                        Err(err) => {
-                            log::warn!(
-                                "[PIRLS GPU dispatch] device loop returned error, falling back to CPU: {err}"
-                            );
-                        }
-                    }
-                }
-            }
-        }
+    // Stage 3.3 GPU PIRLS-loop dispatch — see gpu_dispatch::try_pirls_loop_gpu.
+    if let Some(result) = try_pirls_loop_gpu(
+        config,
+        &penalty_active,
+        kronecker_runtime.is_none(),
+        use_sparse_native,
+        &linear_constraints,
+        &x_original,
+        &qs_arc,
+        penalty.p,
+        &x_original_for_result,
+        || materialize_final_reparam_result(),
+        y,
+        priorweights,
+        offset,
+        &initial_beta,
+        link_function,
+        coordinate_frame,
+    ) {
+        return result;
     }
 
     let mut working_summary = runworking_model_pirls(
