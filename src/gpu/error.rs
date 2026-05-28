@@ -97,6 +97,19 @@ macro_rules! gpu_bail {
 ///   full reason string. Use it when the reason is not a simple
 ///   `prefix: err` concatenation (e.g. multi-line, or with the error
 ///   embedded mid-message).
+///
+/// **Cfg note**: The trait and its blanket impl are gated to
+/// `target_os = "linux"` so the symbol literally does not exist on
+/// non-Linux targets. Every callsite is inside a
+/// `#[cfg(target_os = "linux")]` block that wraps CUDA driver / cuBLAS /
+/// cuSOLVER calls; on non-Linux those blocks are erased and the trait
+/// would have no users. Cfg-gating the definition means a warning-fix
+/// sweep running on non-Linux cannot see "unused" callsites because the
+/// trait itself is absent — the consuming `use super::error::GpuResultExt;`
+/// imports must therefore be `#[cfg(target_os = "linux")]` to match, and
+/// that cfg-symmetry is the architectural contract that prevents the
+/// drop-the-import regression that broke the Linux build in #302.
+#[cfg(target_os = "linux")]
 pub trait GpuResultExt<T> {
     /// Map the error to `GpuError::DriverCallFailed { reason: format!("{prefix}: {err}") }`.
     fn gpu_ctx(self, prefix: &str) -> Result<T, GpuError>;
@@ -108,6 +121,7 @@ pub trait GpuResultExt<T> {
         F: FnOnce(&dyn std::fmt::Display) -> String;
 }
 
+#[cfg(target_os = "linux")]
 impl<T, E: std::fmt::Display> GpuResultExt<T> for Result<T, E> {
     #[inline]
     fn gpu_ctx(self, prefix: &str) -> Result<T, GpuError> {
