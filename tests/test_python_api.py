@@ -1664,7 +1664,7 @@ def test_gaussian_reml_fit_with_constraints_forward_monotone_on_x_squared() -> N
         "y ~ s(x)",
         constraints={"s(x)": "monotone_increasing"},
     )
-    fitted = np.asarray(model.predict(frame)["mean"], dtype=float)
+    fitted = np.asarray(model.predict(frame), dtype=float)
     assert fitted.shape == (n,)
     diffs = np.diff(fitted)
     assert (diffs >= -1e-6).all(), (

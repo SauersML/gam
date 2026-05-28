@@ -1749,9 +1749,19 @@ impl BernoulliMarginalSlopePredictor {
         let mut f_aa = 0.0;
         for partition_cell in cells {
             let cell = partition_cell.cell;
+            // `cell_second_derivative_from_moments` below contracts the
+            // outer-product of two cubic first-coefficient slices (length 4)
+            // with the inner cubic eta (length 4), yielding a product
+            // polynomial of degree 9 -> 10 moments. Requesting only 7 produced
+            // 8 moments and tripped the "insufficient reduced moments for
+            // second derivative: need 10, have 8" error at predict time.
+            // The matching call sites in `evaluate_cell_moments_observed_*`
+            // (and every other production caller of
+            // `cell_second_derivative_from_moments` across BMS / survival)
+            // already use max_degree = 9; align with them here.
             let state =
                 crate::families::bernoulli_marginal_slope::exact_kernel::evaluate_cell_moments(
-                    cell, 7,
+                    cell, 9,
                 )
                 .map_err(EstimationError::InvalidInput)?;
             f += state.value;

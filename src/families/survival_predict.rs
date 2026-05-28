@@ -252,16 +252,8 @@ pub fn predict_survival(
     // `gam sample`, and the Python `model.predict` FFI symmetric across
     // every likelihood that lands in this code path (weibull,
     // transformation, ...).
-    let entry_col: Option<usize> = model
-        .survival_entry
-        .as_deref()
-        .map(|name| resolve_role_col(col_map, name, "entry"))
-        .transpose()?;
-    let exitname = model
-        .survival_exit
-        .as_ref()
-        .ok_or_else(|| "survival model missing exit column metadata".to_string())?;
-    let exit_col = resolve_role_col(col_map, exitname, "exit")?;
+    let time_cols = resolve_saved_survival_time_columns(model, col_map)?;
+    let exit_col = time_cols.exit_col;
 
     let termspec = resolve_termspec_for_prediction(
         &model.resolved_termspec,
@@ -294,8 +286,11 @@ pub fn predict_survival(
     let pairs: Result<Vec<(f64, f64)>, String> = (0..n)
         .into_par_iter()
         .map(|i| {
-            let entry_val = entry_col.map_or(0.0, |idx| data[[i, idx]]);
-            normalize_survival_time_pair(entry_val, data[[i, exit_col]], i)
+            normalize_survival_time_pair(
+                time_cols.row_entry_time(data, i),
+                data[[i, exit_col]],
+                i,
+            )
         })
         .collect();
     let pairs = pairs?;
@@ -690,16 +685,8 @@ pub fn predict_competing_risks_survival(
     // Right-censored shorthand: same fallback as the single-cause path
     // above — entry ages default to zero when the model was fit without
     // an explicit entry column.
-    let entry_col: Option<usize> = model
-        .survival_entry
-        .as_deref()
-        .map(|name| resolve_role_col(col_map, name, "entry"))
-        .transpose()?;
-    let exitname = model
-        .survival_exit
-        .as_ref()
-        .ok_or_else(|| "survival model missing exit column metadata".to_string())?;
-    let exit_col = resolve_role_col(col_map, exitname, "exit")?;
+    let time_cols = resolve_saved_survival_time_columns(model, col_map)?;
+    let exit_col = time_cols.exit_col;
 
     let termspec = resolve_termspec_for_prediction(
         &model.resolved_termspec,
@@ -727,8 +714,11 @@ pub fn predict_competing_risks_survival(
     let pairs: Result<Vec<(f64, f64)>, String> = (0..n)
         .into_par_iter()
         .map(|i| {
-            let entry_val = entry_col.map_or(0.0, |idx| data[[i, idx]]);
-            normalize_survival_time_pair(entry_val, data[[i, exit_col]], i)
+            normalize_survival_time_pair(
+                time_cols.row_entry_time(data, i),
+                data[[i, exit_col]],
+                i,
+            )
         })
         .collect();
     let pairs = pairs?;
