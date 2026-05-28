@@ -45,9 +45,10 @@ use crate::types::{
     LogSmoothingParamsView, MixtureLinkState, RidgePassport, RidgePolicy,
     SasLinkState, StandardLink,
 };
-use ndarray::{Array1, Array2, ArrayView1, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use std::borrow::Cow;
 use std::sync::Arc;
+use faer::sparse::{SparseColMat, Triplet};
 
 pub(super) fn default_beta_guess_external(
     p: usize,
