@@ -8597,7 +8597,7 @@ fn predict_multinomial_formula_pyfunc<'py>(
     model_bytes: Vec<u8>,
     headers: Vec<String>,
     rows: Vec<Vec<String>>,
-) -> PyResult<Py<PyAny>> {
+) -> PyResult<Py<PyArray2<f64>>> {
     let probs = detach_py_result(py, "predict_multinomial_formula", move || {
         let envelope: MultinomialModelEnvelope = serde_json::from_slice(&model_bytes)
             .map_err(|err| format!("failed to deserialize multinomial model: {err}"))?;
@@ -8612,15 +8612,17 @@ fn predict_multinomial_formula_pyfunc<'py>(
         gam::families::multinomial::predict_multinomial_formula(&envelope.saved, &dataset)
             .map_err(|err| err.to_string())
     })?;
-    let array = probs.into_pyarray(py);
-    Ok(array.into_any().unbind())
+    Ok(probs.into_pyarray(py).unbind())
 }
 
 /// Inspect a multinomial saved-model byte blob and return the class-level
 /// metadata needed by `MultinomialModel.summary()` and `.classes_`. Keeping
 /// this on the FFI side avoids re-encoding the serde envelope in Python.
 #[pyfunction(signature = (model_bytes))]
-fn multinomial_model_metadata_pyfunc(model_bytes: Vec<u8>) -> PyResult<Py<PyAny>> {
+fn multinomial_model_metadata_pyfunc<'py>(
+    py: Python<'py>,
+    model_bytes: Vec<u8>,
+) -> PyResult<Py<PyDict>> {
     let envelope: MultinomialModelEnvelope =
         serde_json::from_slice(&model_bytes).map_err(|err| {
             py_value_error(format!(
@@ -8633,28 +8635,26 @@ fn multinomial_model_metadata_pyfunc(model_bytes: Vec<u8>) -> PyResult<Py<PyAny>
             envelope.model_class
         )));
     }
-    Python::attach(|py| {
-        let out = PyDict::new(py);
-        out.set_item("formula", &envelope.saved.formula)?;
-        out.set_item("class_levels", envelope.saved.class_levels.clone())?;
-        out.set_item("reference_class_index", envelope.saved.reference_class_index)?;
-        out.set_item("p_per_class", envelope.saved.p_per_class)?;
-        out.set_item("n_active_classes", envelope.saved.n_active_classes)?;
-        out.set_item("training_headers", envelope.saved.training_headers.clone())?;
-        out.set_item("lambda", envelope.saved.lambda)?;
-        out.set_item("iterations", envelope.saved.iterations)?;
-        out.set_item("converged", envelope.saved.converged)?;
-        out.set_item(
-            "penalized_neg_log_likelihood",
-            envelope.saved.penalized_neg_log_likelihood,
-        )?;
-        out.set_item("deviance", envelope.saved.deviance)?;
-        out.set_item(
-            "coefficients_flat",
-            envelope.saved.coefficients_flat.clone(),
-        )?;
-        Ok(out.into_any().unbind())
-    })
+    let out = PyDict::new(py);
+    out.set_item("formula", &envelope.saved.formula)?;
+    out.set_item("class_levels", envelope.saved.class_levels.clone())?;
+    out.set_item("reference_class_index", envelope.saved.reference_class_index)?;
+    out.set_item("p_per_class", envelope.saved.p_per_class)?;
+    out.set_item("n_active_classes", envelope.saved.n_active_classes)?;
+    out.set_item("training_headers", envelope.saved.training_headers.clone())?;
+    out.set_item("lambda", envelope.saved.lambda)?;
+    out.set_item("iterations", envelope.saved.iterations)?;
+    out.set_item("converged", envelope.saved.converged)?;
+    out.set_item(
+        "penalized_neg_log_likelihood",
+        envelope.saved.penalized_neg_log_likelihood,
+    )?;
+    out.set_item("deviance", envelope.saved.deviance)?;
+    out.set_item(
+        "coefficients_flat",
+        envelope.saved.coefficients_flat.clone(),
+    )?;
+    Ok(out.unbind())
 }
 
 fn latent_augmented_hessian_factor(

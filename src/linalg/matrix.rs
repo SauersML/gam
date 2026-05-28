@@ -669,8 +669,8 @@ fn dense_transpose_matvec_view(matrix: &Array2<f64>, vector: ArrayView1<'_, f64>
 fn dense_xtwx_view(matrix: &Array2<f64>, weights: PsdWeightsView<'_>) -> Array2<f64> {
     // PSD precondition for the symmetric `Xᵀ W X` form is discharged by the
     // `PsdWeightsView` constructor — the previous runtime `assert!` is now a
-    // type-level obligation paid once at the call boundary (typically in
-    // `DesignMatrix::compute_xtwx_view` via `PsdWeights::try_new`). The
+    // type-level obligation paid once at the call boundary (typically at the
+    // `PsdWeightsView::try_new` site inside callers of `xt_diag_x_psd_op`). The
     // asymmetric / observed-Hessian path keeps using `SignedWeightsView` and
     // routes through `weighted_crossprod_dense_rows` directly (e.g.
     // `BlockDesignOperator::cross_block` with `c · X v` weights from the
@@ -3054,7 +3054,9 @@ impl LinearOperator for MultiChannelOperator {
         }
         let mut xtwx = Array2::<f64>::zeros((self.p, self.p));
         for (i, ch) in self.channels.iter().enumerate() {
-            let ch_xtwx = ch.compute_xtwx_view(weights.slice(s![i * n..(i + 1) * n]))?;
+            let ch_xtwx = ch.xt_diag_x_signed_op(SignedWeightsView::new(
+                weights.slice(s![i * n..(i + 1) * n]),
+            ))?;
             xtwx += &ch_xtwx;
         }
         Ok(xtwx)
@@ -4623,7 +4625,9 @@ impl LinearOperator for RowwiseKroneckerOperator {
                     .and(&time_t1)
                     .and(&time_t2)
                     .for_each(|g, &w, &a, &b| *g = w.max(0.0) * a * b);
-                self.cov.compute_xtwx(&gamma).map(|block| (t1, t2, block))
+                self.cov
+                    .xt_diag_x_signed_op(SignedWeightsView::from_array(&gamma))
+                    .map(|block| (t1, t2, block))
             })
             .collect();
         for (t1, t2, block) in blocks? {
@@ -5916,12 +5920,9 @@ pub trait LinearOperator {
             .ok_or_else(|| "solve_systemwith_policy failed after ridge retries".to_string())
     }
 
-    // Backward-compatible aliases.
+    // Backward-compatible alias for `apply` (matvec is the canonical BLAS name).
     fn matvec(&self, vector: &Array1<f64>) -> Array1<f64> {
         self.apply(vector)
-    }
-    fn compute_xtwx(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
-        self.diag_xtw_x(weights)
     }
 }
 
@@ -7565,43 +7566,6 @@ impl DesignMatrix {
         }
     }
 
-    fn compute_xtwx_view(&self, weights: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
-        if weights.len() != self.nrows() {
-            return Err(format!(
-                "compute_xtwx dimension mismatch: weights length {} != nrows {}",
-                weights.len(),
-                self.nrows()
-            ));
-        }
-        match self {
-            Self::Dense(DenseDesignMatrix::Materialized(matrix)) => {
-                // The `compute_xtwx_view` entry point asserts the symmetric
-                // PSD-Gram contract — Fisher-scoring / canonical-link IRLS
-                // working weights only. Discharge the `w ≥ 0` obligation
-                // here at the boundary; downstream `dense_xtwx_view` then
-                // consumes `PsdWeightsView` without re-scanning.
-                let psd = PsdWeightsView::try_new(weights)?;
-                Ok(dense_xtwx_view(matrix, psd))
-            }
-            Self::Dense(DenseDesignMatrix::Lazy(op)) => op.diag_xtw_x(&weights.to_owned()),
-            Self::Sparse(xs) => {
-                let p = xs.ncols();
-                let csr = xs
-                    .to_csr_arc()
-                    .ok_or_else(|| "failed to obtain CSR view in compute_xtwx".to_string())?;
-                let sym = csr.symbolic();
-                Ok(sparse_csr_weighted_xtwx(
-                    sym.row_ptr(),
-                    sym.col_idx(),
-                    csr.val(),
-                    xs.nrows(),
-                    p,
-                    weights,
-                ))
-            }
-        }
-    }
-
     fn diag_gram_view(&self, weights: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
         if weights.len() != self.nrows() {
             return Err(format!(
@@ -7692,10 +7656,6 @@ impl DesignMatrix {
 
     pub fn transpose_vector_multiply(&self, vector: &Array1<f64>) -> Array1<f64> {
         <Self as LinearOperator>::apply_transpose(self, vector)
-    }
-
-    pub fn compute_xtwx(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
-        <Self as LinearOperator>::diag_xtw_x(self, weights)
     }
 
     pub fn compute_xtwy(
@@ -8828,7 +8788,11 @@ mod tests {
             r => 0.5 + r as f64 * 0.125,
         }));
 
-        let got = design.compute_xtwx(&weights).unwrap();
+        let got = <DesignMatrix as LinearOperator>::xt_diag_x_signed_op(
+            &design,
+            SignedWeightsView::from_array(&weights),
+        )
+        .unwrap();
         let mut reference = Array2::<f64>::zeros((p, p));
         for i in 0..n {
             let wi = weights[i].max(0.0);
