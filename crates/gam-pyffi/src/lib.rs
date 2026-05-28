@@ -654,6 +654,173 @@ create_exception!(_rust, CalibratorError, GamError,
 create_exception!(_rust, InvalidSpecificationError, GamError,
     "Invalid specification supplied to the engine.");
 
+// -------------------------------------------------------------------------
+// Remaining engine error enum subclasses (issue #343 follow-up).
+//
+// Each `pub enum *Error` in `src/` gets a corresponding subclass below, so
+// every engine error path is variant-typed at the FFI boundary and no
+// longer flows through the message-regex classifier. Inheritance is
+// chosen by semantic relationship: builder-layer errors that arise from
+// formula authoring (e.g. `TermBuilderError`) inherit from
+// `FormulaError`; prediction-time input errors inherit from
+// `PredictionError`; everything else inherits from `GamError`.
+// -------------------------------------------------------------------------
+
+create_exception!(_rust, GeometryError, GamError,
+    "Riemannian-geometry / manifold-primitive operation failed \
+     (dimension mismatch, invalid point, singular tangent space).");
+
+create_exception!(_rust, MatrixMaterializationError, GamError,
+    "Lazy design-matrix materialization failed (size cap exceeded, \
+     forbidden by policy, or row-block evaluation failure).");
+
+create_exception!(_rust, GpuError, GamError,
+    "GPU offload path failed (driver unavailable, kernel launch error, \
+     calibration failure, or feature not yet implemented on this device).");
+
+create_exception!(_rust, LinearAlgebraError, GamError,
+    "Dense linear-algebra primitive failed (factorization, SVD, or \
+     eigendecomposition reported non-convergence or non-finite input).");
+
+create_exception!(_rust, MatrixError, GamError,
+    "Matrix-level invariant violated (dimension mismatch, refused \
+     densification, or related shape contract failure).");
+
+create_exception!(_rust, CacheStoreError, GamError,
+    "Persistent on-disk model cache I/O or serialization failure.");
+
+create_exception!(_rust, SmoothError, GamError,
+    "Smooth-term construction failed (invalid configuration for the \
+     requested basis or penalty).");
+
+create_exception!(_rust, ArrowSchurError, GamError,
+    "Arrow-Schur block solver failed (per-row factor failure, ill-\
+     conditioning, PCG non-convergence, or adaptive-correction failure).");
+
+create_exception!(_rust, OuterStrategyError, GamError,
+    "Outer smoothing-strategy contract violated (operator-shape \
+     mismatch, non-finite Hessian, or rho-block shape error).");
+
+create_exception!(_rust, TermBuilderError, FormulaError,
+    "A formula term could not be built from the input data \
+     (missing column, incompatible options, degenerate data, etc.). \
+     Subclass of `FormulaError` so existing `except FormulaError` \
+     handlers still catch it.");
+
+create_exception!(_rust, CorrectedCovarianceError, GamError,
+    "Corrected posterior covariance construction failed \
+     (shape mismatch, eigendecomposition failure, or indefinite outer \
+     Hessian).");
+
+create_exception!(_rust, PredictInputError, PredictionError,
+    "Prediction input is invalid or incompatible with the fitted model \
+     (shape mismatch, missing metadata, or malformed payload). \
+     Subclass of `PredictionError`.");
+
+create_exception!(_rust, HmcError, GamError,
+    "Hamiltonian Monte Carlo sampler failed (non-finite state, invalid \
+     configuration, unsupported family / link, or sampling divergence).");
+
+create_exception!(_rust, AloError, GamError,
+    "Approximate leave-one-out computation failed (invalid input, \
+     degenerate design, or influence-matrix factorization failure).");
+
+create_exception!(_rust, SurvivalError, GamError,
+    "Survival kernel invariant violated (dimension mismatch, non-finite \
+     input, invalid time grid, non-monotone cumulative hazard, etc.).");
+
+create_exception!(_rust, CubicCellKernelError, GamError,
+    "Cubic-cell-moment kernel rejected an input (degenerate interval, \
+     invalid cell shape, insufficient moments, or out-of-domain \
+     bivariate-normal evaluation).");
+
+create_exception!(_rust, SurvivalConstructionError, GamError,
+    "Survival model construction failed (invalid config, missing column, \
+     dimension mismatch, data validation, or unsupported distribution).");
+
+create_exception!(_rust, TransformationNormalError, GamError,
+    "Transformation-normal family rejected the design / response \
+     (degenerate design, non-finite input, or monotonicity violation).");
+
+create_exception!(_rust, CustomFamilyError, GamError,
+    "Custom family contract violated (invalid input, optimization \
+     failure, numerical failure, or identifiability violation).");
+
+create_exception!(_rust, GamlssError, GamError,
+    "GAMLSS location-scale family rejected the input (dimension \
+     mismatch, non-finite, unsupported configuration, or constraint \
+     violation).");
+
+create_exception!(_rust, SurvivalMarginalSlopeError, GamError,
+    "Survival marginal-slope family failed (invalid input, \
+     monotonicity violation, integration failure, or unsupported \
+     configuration).");
+
+create_exception!(_rust, LatentSurvivalError, GamError,
+    "Latent-survival family rejected the dataset (invalid frailty, \
+     invalid dataset, block mismatch, or numerical failure).");
+
+create_exception!(_rust, SurvivalPredictError, PredictionError,
+    "Survival prediction failed (invalid input, missing fit metadata, \
+     incompatible schema, or numerical failure). Subclass of \
+     `PredictionError`.");
+
+create_exception!(_rust, DeviationRuntimeError, GamError,
+    "Marginal-slope deviation runtime rejected the input (invalid \
+     input, dimension mismatch, or numerical failure).");
+
+create_exception!(_rust, DataError, GamError,
+    "Input dataset failed schema / encoding validation (parse error, \
+     empty input, invalid value, missing column).");
+
+create_exception!(_rust, FittedModelError, GamError,
+    "Saved fitted-model payload is incompatible (schema mismatch, \
+     corrupt payload, missing field, or incompatible config).");
+
+create_exception!(_rust, LognormalKernelError, GamError,
+    "Lognormal kernel configuration is invalid.");
+
+create_exception!(_rust, ScaleDesignError, GamError,
+    "Scale-design construction failed (invalid weights, dimension \
+     mismatch, non-finite input, degenerate design, or SVD failure).");
+
+create_exception!(_rust, IdentifiabilityCompilerError, GamError,
+    "Identifiability compiler rejected the block layout (dimension \
+     mismatch, fully aliased block, or linear-algebra failure).");
+
+create_exception!(_rust, JointPenaltyError, GamError,
+    "Joint penalty matrix rejected (not square, not symmetric, \
+     non-finite entry, or nullspace too large).");
+
+create_exception!(_rust, SurvivalLocationScaleError, GamError,
+    "Survival location-scale family rejected the input (dimension \
+     mismatch, invalid configuration, constraint violation, or \
+     numerical failure).");
+
+create_exception!(_rust, MapUniquenessError, GamError,
+    "MAP-uniqueness identifiability audit detected duplicate or \
+     overlapping posterior modes.");
+
+create_exception!(_rust, UnsupportedLinkError, InvalidSpecificationError,
+    "An inverse-link / link transform was requested that the engine \
+     does not support for the chosen family. Subclass of \
+     `InvalidSpecificationError`.");
+
+create_exception!(_rust, InvalidConfigurationError, InvalidSpecificationError,
+    "Fit configuration is internally inconsistent or selects an \
+     unsupported combination (conflicting family/link, unsupported \
+     link placement, frailty for an incompatible family, duplicate or \
+     out-of-range hyperpriors). Subclass of `InvalidSpecificationError`.");
+
+create_exception!(_rust, MissingDependencyError, GamError,
+    "A required input column, frailty parameter, baseline target, or \
+     cause count is missing for the requested fit mode.");
+
+create_exception!(_rust, IntegrationError, GamError,
+    "An underlying numerical step (PIRLS / smoothing-parameter \
+     optimizer / profile-cost evaluation) failed to converge or \
+     produced a non-finite value.");
+
 /// Variant-dispatch: convert a typed engine error into the matching
 /// Python exception subclass. This is the single chokepoint where
 /// `EstimationError`'s typing is preserved across the FFI boundary —
