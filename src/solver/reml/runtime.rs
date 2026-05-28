@@ -5828,7 +5828,10 @@ impl<'a> RemlState<'a> {
                 w * centered * centered
             })
             .sum::<f64>();
-        let xtwx = match self.x.compute_xtwx(&weights_owned) {
+        let xtwx = match crate::linalg::matrix::LinearOperator::xt_diag_x_signed_op(
+            &self.x,
+            crate::linalg::matrix::SignedWeightsView::from_array(&weights_owned),
+        ) {
             Ok(m) => m,
             Err(e) => {
                 log::warn!("[gaussian-fixed-cache] disabling cache: failed to build XᵀWX: {e}");
