@@ -286,11 +286,7 @@ pub fn predict_survival(
     let pairs: Result<Vec<(f64, f64)>, String> = (0..n)
         .into_par_iter()
         .map(|i| {
-            normalize_survival_time_pair(
-                time_cols.row_entry_time(data, i),
-                data[[i, exit_col]],
-                i,
-            )
+            normalize_survival_time_pair(time_cols.row_entry_time(data, i), data[[i, exit_col]], i)
         })
         .collect();
     let pairs = pairs?;
@@ -714,11 +710,7 @@ pub fn predict_competing_risks_survival(
     let pairs: Result<Vec<(f64, f64)>, String> = (0..n)
         .into_par_iter()
         .map(|i| {
-            normalize_survival_time_pair(
-                time_cols.row_entry_time(data, i),
-                data[[i, exit_col]],
-                i,
-            )
+            normalize_survival_time_pair(time_cols.row_entry_time(data, i), data[[i, exit_col]], i)
         })
         .collect();
     let pairs = pairs?;

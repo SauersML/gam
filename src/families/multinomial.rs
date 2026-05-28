@@ -55,17 +55,15 @@
 //! convergence test is the relative coefficient step norm
 //! `‖δ‖ / (1 + ‖β‖) ≤ tol`, matching the existing pyffi reference path.
 
-use crate::solver::estimate::EstimationError;
-use crate::families::vector_response::{MultinomialLogitLikelihood, VectorLikelihood};
 use crate::faer_ndarray::{FaerArrayView, array2_to_matmut, factorize_symmetricwith_fallback};
+use crate::families::vector_response::{MultinomialLogitLikelihood, VectorLikelihood};
 use crate::inference::data::EncodedDataset;
 use crate::inference::formula_dsl::parse_formula;
 use crate::inference::model::ColumnKindTag;
 use crate::pirls::dense_block_xtwx;
 use crate::resource::ProblemHints;
-use crate::solver::workflow::{
-    FitConfig, build_termspec_with_geometry, resolved_resource_policy,
-};
+use crate::solver::estimate::EstimationError;
+use crate::solver::workflow::{FitConfig, build_termspec_with_geometry, resolved_resource_policy};
 use crate::terms::smooth::{
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
     weighted_blockwise_penalty_sum,
@@ -404,7 +402,9 @@ pub fn fit_penalized_multinomial(
         let mut accepted_beta = proposed_beta(alpha);
         let mut new_objective = evaluate_objective(&accepted_beta);
         let mut backtrack = 0usize;
-        while (!new_objective.is_finite() || new_objective > last_objective + 1.0e-12) && backtrack < 8 {
+        while (!new_objective.is_finite() || new_objective > last_objective + 1.0e-12)
+            && backtrack < 8
+        {
             alpha *= 0.5;
             accepted_beta = proposed_beta(alpha);
             new_objective = evaluate_objective(&accepted_beta);
@@ -658,9 +658,8 @@ fn build_formula_design_for_multinomial(
         ))
     })?;
     let col_map = data.column_map();
-    let y_col = resolve_role_col(&col_map, &parsed.response, "response").map_err(|err| {
-        EstimationError::InvalidInput(format!("multinomial fit: {err}"))
-    })?;
+    let y_col = resolve_role_col(&col_map, &parsed.response, "response")
+        .map_err(|err| EstimationError::InvalidInput(format!("multinomial fit: {err}")))?;
     let y_kind = crate::solver::workflow::response_column_kind(data, y_col);
     let policy = resolved_resource_policy(config, data, ProblemHints::default());
     let mut inference_notes: Vec<String> = Vec::new();

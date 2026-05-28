@@ -1,9 +1,9 @@
-use super::*;
+use super::exact_eval_cache::*;
 use super::family::*;
 use super::gradient_paths::*;
 use super::hessian_paths::*;
-use super::exact_eval_cache::*;
 use super::row_kernel::*;
+use super::*;
 
 impl BernoulliMarginalSlopeFamily {
     #[inline]
@@ -204,7 +204,10 @@ impl BernoulliMarginalSlopeFamily {
         Ok(MultiDirJet::linear(n_dirs, base, &first))
     }
 
-    pub(super) fn local_cubic_value_jet(cubic: exact_kernel::LocalSpanCubic, x: &MultiDirJet) -> MultiDirJet {
+    pub(super) fn local_cubic_value_jet(
+        cubic: exact_kernel::LocalSpanCubic,
+        x: &MultiDirJet,
+    ) -> MultiDirJet {
         let n_dirs = x.coeffs.len().trailing_zeros() as usize;
         let t = x.add(&MultiDirJet::constant(n_dirs, -cubic.left));
         let t2 = t.mul(&t);
@@ -1441,7 +1444,9 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     #[inline]
-    pub(super) fn exact_newton_score_from_objective_gradient(objective_gradient: Array1<f64>) -> Array1<f64> {
+    pub(super) fn exact_newton_score_from_objective_gradient(
+        objective_gradient: Array1<f64>,
+    ) -> Array1<f64> {
         -objective_gradient
     }
 
@@ -1779,7 +1784,10 @@ impl BernoulliMarginalSlopeFamily {
     /// The denested exact path is active whenever either deviation runtime is
     /// configured. Zero coefficient vectors still keep the flexible geometry
     /// live so derivatives with respect to those coefficients remain available.
-    pub(super) fn effective_flex_active(&self, block_states: &[ParameterBlockState]) -> Result<bool, String> {
+    pub(super) fn effective_flex_active(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<bool, String> {
         if self.score_warp.is_some() && self.score_beta(block_states)?.is_none() {
             return Err("missing bernoulli score-warp block state".to_string());
         }
@@ -2120,7 +2128,12 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     #[inline]
-    pub(super) fn row_intercept_newton_is_converged(a: f64, f: f64, f_a: f64, abs_tol: f64) -> bool {
+    pub(super) fn row_intercept_newton_is_converged(
+        a: f64,
+        f: f64,
+        f_a: f64,
+        abs_tol: f64,
+    ) -> bool {
         if !a.is_finite() || !f.is_finite() || !f_a.is_finite() || f_a == 0.0 {
             return false;
         }
@@ -4106,7 +4119,10 @@ impl BernoulliMarginalSlopeFamily {
         out
     }
 
-    pub(super) fn batched_directional_derivative_chunk_rows(n: usize, n_dirs: usize) -> (usize, bool) {
+    pub(super) fn batched_directional_derivative_chunk_rows(
+        n: usize,
+        n_dirs: usize,
+    ) -> (usize, bool) {
         // CPU-only path: chunk by a fixed float-count budget so each chunk is
         // small enough to keep the per-row workspaces in L2/L3 across the
         // directional sweep. The GPU dispatch path was removed when the
@@ -12297,7 +12313,9 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
         })
     }
 
-    pub(super) fn fused_gradient_dense(&self) -> Result<Arc<ExactNewtonJointFusedDenseEvaluation>, String> {
+    pub(super) fn fused_gradient_dense(
+        &self,
+    ) -> Result<Arc<ExactNewtonJointFusedDenseEvaluation>, String> {
         self.fused_gradient_dense
             .get_or_init(|| {
                 self.family

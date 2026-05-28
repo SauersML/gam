@@ -11,6 +11,7 @@ use crate::custom_family::{
 use crate::estimate::UnifiedFitResult;
 use crate::estimate::reml::unified::{DenseSpectralOperator, HessianOperator, HyperOperator};
 use crate::families::gamlss::{ParameterBlockInput, initialize_monotone_wiggle_knots_from_seed};
+use crate::families::jet_partitions::MultiDirJet;
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::marginal_slope_shared::{
     CoeffSupport, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView, WeightedOuterRow,
@@ -25,7 +26,6 @@ use crate::families::row_kernel::{
     RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
     row_kernel_hessian_dense, row_kernel_log_likelihood,
 };
-use crate::families::jet_partitions::MultiDirJet;
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{
@@ -1102,11 +1102,14 @@ pub use install_flex::CrossBlockIdentifiabilityWarning;
 pub(crate) use install_flex::FlexCompileOutcome;
 
 // pub(crate) re-exports for internal callers:
+pub(crate) use block_specs::push_deviation_aux_blockspecs;
+pub use block_specs::{BmsFamilyScalars, BmsLogslopeJacobian, BmsMarginalJacobian};
 pub(crate) use family::{
     BernoulliMarginalLinkMap, bernoulli_marginal_link_map,
     build_link_deviation_block_from_knots_design_seed_and_weights,
     build_score_warp_deviation_block_from_seed,
 };
+pub(crate) use gradient_paths::standardize_latent_z_with_policy;
 pub(crate) use gradient_paths::{
     empirical_intercept_from_marginal, signed_probit_neglog_derivatives_up_to_fourth,
     unary_derivatives_log, unary_derivatives_log_normal_pdf, unary_derivatives_neglog_phi,
@@ -1116,6 +1119,3 @@ pub(crate) use install_flex::{
     install_compiled_flex_block_into_runtime, project_monotone_feasible_beta,
     validate_monotone_structural_feasible,
 };
-pub(crate) use gradient_paths::standardize_latent_z_with_policy;
-pub use block_specs::{BmsFamilyScalars, BmsLogslopeJacobian, BmsMarginalJacobian};
-pub(crate) use block_specs::push_deviation_aux_blockspecs;

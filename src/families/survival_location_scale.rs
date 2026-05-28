@@ -8629,9 +8629,8 @@ impl SurvivalLocationScaleFamily {
         }
         match block_idx {
             Self::BLOCK_TIME | Self::BLOCK_THRESHOLD | Self::BLOCK_LOG_SIGMA => {
-                let design = specs[block_idx].effective_design(
-                    "SurvivalLocationScaleFamily::block_effective_jacobian",
-                )?;
+                let design = specs[block_idx]
+                    .effective_design("SurvivalLocationScaleFamily::block_effective_jacobian")?;
                 Ok(Box::new(AdditiveBlockJacobian {
                     design,
                     own_output: block_idx,

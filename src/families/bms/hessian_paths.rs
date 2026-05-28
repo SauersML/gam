@@ -1,5 +1,5 @@
-use super::*;
 use super::family::BernoulliMarginalSlopeFamily;
+use super::*;
 
 /// Block-local psi derivative row: avoids allocating a full p-vector
 /// when the psi derivative lives in a single channel (marginal or logslope).
@@ -734,7 +734,11 @@ impl RowCellMomentsBundle {
     /// bundle's `max_degree` is too low for this caller — the caller must
     /// fall back to per-row on-demand evaluation in either case.
     #[inline]
-    pub(super) fn row(&self, row: usize, required_degree: usize) -> Option<&[CachedDenestedCellMoments]> {
+    pub(super) fn row(
+        &self,
+        row: usize,
+        required_degree: usize,
+    ) -> Option<&[CachedDenestedCellMoments]> {
         if self.max_degree < required_degree {
             return None;
         }
@@ -744,7 +748,11 @@ impl RowCellMomentsBundle {
             .map(Vec::as_slice)
     }
 
-    pub(super) fn estimated_resident_bytes(n_rows: usize, n_cells: usize, max_degree: usize) -> usize {
+    pub(super) fn estimated_resident_bytes(
+        n_rows: usize,
+        n_cells: usize,
+        max_degree: usize,
+    ) -> usize {
         let row_vecs =
             n_rows.saturating_mul(std::mem::size_of::<Option<Vec<CachedDenestedCellMoments>>>());
         let cell_records = n_cells.saturating_mul(std::mem::size_of::<CachedDenestedCellMoments>());
@@ -1000,7 +1008,11 @@ impl BernoulliExactNewtonAccumulator {
     }
 }
 
-pub(super) fn add_weighted_chunk_gradient(chunk: &Array2<f64>, weights: &[f64], target: &mut Array1<f64>) {
+pub(super) fn add_weighted_chunk_gradient(
+    chunk: &Array2<f64>,
+    weights: &[f64],
+    target: &mut Array1<f64>,
+) {
     let weights_view = ndarray::ArrayView1::from(weights);
     *target += &crate::faer_ndarray::fast_atv(chunk, &weights_view);
 }
@@ -1016,7 +1028,11 @@ pub(super) fn new_cell_moment_cache_stats() -> Arc<exact_kernel::CellMomentCache
     Arc::new(exact_kernel::CellMomentCacheStats::default())
 }
 
-pub(super) fn add_weighted_chunk_gram(chunk: &Array2<f64>, weights: &[f64], target: &mut Array2<f64>) {
+pub(super) fn add_weighted_chunk_gram(
+    chunk: &Array2<f64>,
+    weights: &[f64],
+    target: &mut Array2<f64>,
+) {
     let weights_view = ndarray::ArrayView1::from(weights);
     *target += &crate::faer_ndarray::fast_xt_diag_x(chunk, &weights_view);
 }

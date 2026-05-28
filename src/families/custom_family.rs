@@ -681,7 +681,10 @@ impl std::fmt::Debug for ParameterBlockSpec {
             .field("gauge_priority", &self.gauge_priority)
             .field(
                 "jacobian_callback",
-                &self.jacobian_callback.as_ref().map(|_| "<BlockEffectiveJacobian>"),
+                &self
+                    .jacobian_callback
+                    .as_ref()
+                    .map(|_| "<BlockEffectiveJacobian>"),
             )
             .finish()
     }
@@ -695,11 +698,9 @@ impl ParameterBlockSpec {
     pub fn defaults() -> Self {
         Self {
             name: String::new(),
-            design: DesignMatrix::Dense(
-                crate::linalg::matrix::DenseDesignMatrix::from(
-                    ndarray::Array2::<f64>::zeros((0, 0)),
-                ),
-            ),
+            design: DesignMatrix::Dense(crate::linalg::matrix::DenseDesignMatrix::from(
+                ndarray::Array2::<f64>::zeros((0, 0)),
+            )),
             offset: ndarray::Array1::<f64>::zeros(0),
             penalties: Vec::new(),
             nullspace_dims: Vec::new(),
@@ -16851,11 +16852,8 @@ fn build_custom_family_inner_assembly<'dp>(
     } else {
         0.0
     };
-    let penalty_logdet = compute_block_penalty_logdet_derivs(
-        per_block,
-        &per_block_penalties,
-        penalty_logdet_ridge,
-    )?;
+    let penalty_logdet =
+        compute_block_penalty_logdet_derivs(per_block, &per_block_penalties, penalty_logdet_ridge)?;
 
     let n_observations = inner.block_states.first().map(|s| s.eta.len()).unwrap_or(0);
 

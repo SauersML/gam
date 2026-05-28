@@ -1,6 +1,5 @@
 use super::*;
 
-
 #[derive(Clone)]
 pub(super) struct BernoulliMarginalSlopeFamily {
     pub(super) y: Arc<Array1<f64>>,
@@ -154,7 +153,12 @@ impl BernoulliInterceptWarmStartCache {
     /// was installed, `Err(prev_tag)` if some prior write already populated
     /// the slot (in which case the caller should keep the existing entry).
     #[inline]
-    pub(super) fn compare_exchange_unseeded(&self, row: usize, value: f64, beta_tag: u64) -> Result<(), u64> {
+    pub(super) fn compare_exchange_unseeded(
+        &self,
+        row: usize,
+        value: f64,
+        beta_tag: u64,
+    ) -> Result<(), u64> {
         let value_slot = self.intercept_value.get(row).ok_or(0u64)?;
         let tag_slot = self.intercept_tag.get(row).ok_or(0u64)?;
         match tag_slot.compare_exchange(0, beta_tag, Ordering::AcqRel, Ordering::Acquire) {
@@ -314,7 +318,6 @@ pub(crate) fn build_score_warp_deviation_block_from_seed(
 ) -> Result<DeviationPrepared, String> {
     build_deviation_block_from_knots_and_design_seed(seed, seed, cfg)
 }
-
 
 /// Positivity floor on a sample / weighted standard deviation (or variance)
 /// before it is used as a divisor for z-normalization or as a closed-form
@@ -506,7 +509,9 @@ pub(super) fn build_deviation_block_from_knots_and_design_seed(
     Ok(DeviationPrepared { block, runtime })
 }
 
-pub(super) fn resolve_deviation_operator_orders(cfg: &DeviationBlockConfig) -> Result<Vec<usize>, String> {
+pub(super) fn resolve_deviation_operator_orders(
+    cfg: &DeviationBlockConfig,
+) -> Result<Vec<usize>, String> {
     let mut orders = Vec::new();
     let requested = if cfg.penalty_orders.is_empty() {
         std::slice::from_ref(&cfg.penalty_order)

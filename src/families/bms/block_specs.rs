@@ -1,8 +1,8 @@
-use super::*;
 use super::family::*;
 use super::gradient_paths::*;
+use super::hessian_paths::{new_cell_moment_cache_stats, new_cell_moment_lru_cache};
 use super::install_flex::validate_spec;
-use super::hessian_paths::{new_cell_moment_lru_cache, new_cell_moment_cache_stats};
+use super::*;
 
 // ── BmsFamilyScalars ──────────────────────────────────────────────────────────
 //
@@ -101,7 +101,11 @@ impl BlockEffectiveJacobian for BmsMarginalJacobian {
         let s = state.probit_frailty_scale;
         let p_m = self.p_marginal;
         let p_s_block = self.logslope_dense.ncols();
-        let beta_s_raw = if beta.len() > p_m { &beta[p_m..] } else { &[][..] };
+        let beta_s_raw = if beta.len() > p_m {
+            &beta[p_m..]
+        } else {
+            &[][..]
+        };
         let p_s_use = p_s_block.min(beta_s_raw.len());
         let beta_s = &beta_s_raw[..p_s_use];
         let n = self.marginal_dense.nrows();
@@ -214,7 +218,11 @@ impl BlockEffectiveJacobian for BmsLogslopeJacobian {
         let p_m = self.p_marginal;
         let p_m_use = p_m.min(beta.len());
         let beta_m = &beta[..p_m_use];
-        let beta_s_raw = if beta.len() > p_m { &beta[p_m..] } else { &[][..] };
+        let beta_s_raw = if beta.len() > p_m {
+            &beta[p_m..]
+        } else {
+            &[][..]
+        };
         let p_s_block = self.logslope_dense.ncols();
         let p_s_use = p_s_block.min(beta_s_raw.len());
         let beta_s = &beta_s_raw[..p_s_use];
