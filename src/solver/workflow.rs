@@ -3275,37 +3275,15 @@ pub fn resolve_family(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-pub(crate) fn build_termspec_with_geometry(
-    terms: &[ParsedTerm],
-    data: &Dataset,
-    col_map: &HashMap<String, usize>,
-    inference_notes: &mut Vec<String>,
-    scale_dimensions: bool,
-    policy: &crate::resource::ResourcePolicy,
-) -> Result<TermCollectionSpec, WorkflowError> {
-    build_termspec_with_geometry_and_overrides(
-        terms,
-        data,
-        col_map,
-        inference_notes,
-        scale_dimensions,
-        policy,
-        None,
-    )
-}
-
-/// Variant of [`build_termspec_with_geometry`] that also applies the
-/// `gamfit.fit(..., smooths={...})` Python override registry, threading
-/// caller-supplied basis configuration (explicit center coordinate
-/// matrices, knot vectors, kernel hyperparameters) onto the
-/// `TermCollectionSpec` the formula DSL produced.
-///
-/// This is the single canonical lowering path: the formula DSL always builds
-/// the initial `SmoothBasisSpec`, then any registry entry whose
-/// `feature_cols` match the term's column set replaces the spec's
-/// kind-specific tunables in place. When all descriptor fields default to
-/// the same values the DSL would auto-pick, the override is a no-op and the
-/// spec is bit-identical to the formula-only path.
+/// Canonical termspec lowering path: formula DSL builds the initial
+/// `SmoothBasisSpec`, then any `gamfit.fit(..., smooths={...})` Python
+/// override registry entry whose `feature_cols` match the term's column set
+/// replaces the spec's kind-specific tunables in place (explicit center
+/// coordinate matrices, knot vectors, kernel hyperparameters). When all
+/// descriptor fields default to the same values the DSL would auto-pick, the
+/// override is a no-op and the spec is bit-identical to the formula-only
+/// path. Callers that don't have overrides simply pass `smooth_overrides =
+/// None`.
 pub(crate) fn build_termspec_with_geometry_and_overrides(
     terms: &[ParsedTerm],
     data: &Dataset,
@@ -5319,7 +5297,7 @@ fn materialize_standard<'a>(
 
     // Sample size vs basis-rank gate (#309). Each smooth basis answers
     // `min_sample_rows()` for itself; this helper just sums and compares.
-    // Runs *after* `build_termspec_with_geometry` so the lower bound is
+    // Runs *after* `build_termspec_with_geometry_and_overrides` so the lower bound is
     // computed on the fully resolved basis spec (e.g. tensor-product columns,
     // knot counts inferred at materialization time).
     check_smooth_capacity(&spec, y.len(), &parsed.response)?;
