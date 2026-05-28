@@ -3319,9 +3319,9 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
                         total_dim: p_wiggle,
                     },
                     crate::solver::estimate::PenaltySpec::Dense(m)
-                    | crate::solver::estimate::PenaltySpec::DenseWithMean {
-                        matrix: m, ..
-                    } => PenaltyMatrix::Dense(m.clone()),
+                    | crate::solver::estimate::PenaltySpec::DenseWithMean { matrix: m, .. } => {
+                        PenaltyMatrix::Dense(m.clone())
+                    }
                 })
                 .collect()
         };

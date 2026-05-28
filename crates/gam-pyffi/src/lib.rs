@@ -29,6 +29,7 @@ use gam::gaussian_reml::{
     gaussian_reml_multi_closed_form_backward_batch,
     gaussian_reml_multi_closed_form_backward_from_fit, gaussian_reml_multi_closed_form_with_cache,
 };
+use gam::geometry::manifold::GeometryError as EngineGeometryError;
 use gam::geometry::poincare::{
     exp_origin as poincare_exp_origin_impl, from_lorentz as poincare_from_lorentz_impl,
     log_origin as poincare_log_origin_impl,
@@ -42,7 +43,6 @@ use gam::geometry::poincare::{
     tangent_decode_forward as poincare_tangent_decode_forward_impl,
     to_lorentz as poincare_to_lorentz_impl,
 };
-use gam::geometry::manifold::GeometryError as EngineGeometryError;
 use gam::geometry::simplex::simplex_frechet_mean;
 use gam::hmc::{NutsConfig, NutsResult};
 use gam::inference::data::{
@@ -8638,12 +8638,8 @@ fn multinomial_model_metadata_pyfunc<'py>(
     py: Python<'py>,
     model_bytes: Vec<u8>,
 ) -> PyResult<Py<PyDict>> {
-    let envelope: MultinomialModelEnvelope =
-        serde_json::from_slice(&model_bytes).map_err(|err| {
-            py_value_error(format!(
-                "failed to deserialize multinomial model: {err}"
-            ))
-        })?;
+    let envelope: MultinomialModelEnvelope = serde_json::from_slice(&model_bytes)
+        .map_err(|err| py_value_error(format!("failed to deserialize multinomial model: {err}")))?;
     if envelope.model_class != "multinomial" {
         return Err(py_value_error(format!(
             "multinomial_model_metadata: model_class = {:?}, expected 'multinomial'",
@@ -8653,7 +8649,10 @@ fn multinomial_model_metadata_pyfunc<'py>(
     let out = PyDict::new(py);
     out.set_item("formula", &envelope.saved.formula)?;
     out.set_item("class_levels", envelope.saved.class_levels.clone())?;
-    out.set_item("reference_class_index", envelope.saved.reference_class_index)?;
+    out.set_item(
+        "reference_class_index",
+        envelope.saved.reference_class_index,
+    )?;
     out.set_item("p_per_class", envelope.saved.p_per_class)?;
     out.set_item("n_active_classes", envelope.saved.n_active_classes)?;
     out.set_item("training_headers", envelope.saved.training_headers.clone())?;
@@ -17926,9 +17925,10 @@ fn poincare_tangent_decode_forward<'py>(
 )> {
     let atoms_owned = atoms.as_array().to_owned();
     let gates_owned = gates.as_array().to_owned();
-    let (x_hat, cache) = detach_geometry_result(py, "poincare_tangent_decode_forward", move || {
-        poincare_tangent_decode_forward_impl(atoms_owned.view(), gates_owned.view(), curvature)
-    })?;
+    let (x_hat, cache) =
+        detach_geometry_result(py, "poincare_tangent_decode_forward", move || {
+            poincare_tangent_decode_forward_impl(atoms_owned.view(), gates_owned.view(), curvature)
+        })?;
     Ok((
         x_hat.into_pyarray(py).unbind(),
         cache.atoms_projected.into_pyarray(py).unbind(),
@@ -21763,7 +21763,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<ProductManifold>()?;
     module.add_function(wrap_pyfunction!(fit_penalized_multinomial_pyfunc, module)?)?;
     module.add_function(wrap_pyfunction!(fit_multinomial_formula_pyfunc, module)?)?;
-    module.add_function(wrap_pyfunction!(predict_multinomial_formula_pyfunc, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        predict_multinomial_formula_pyfunc,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(multinomial_model_metadata_pyfunc, module)?)?;
     module.add_function(wrap_pyfunction!(sklearn_fit_metadata, module)?)?;
     module.add_function(wrap_pyfunction!(build_info, module)?)?;
@@ -22656,9 +22659,7 @@ where
 // so each enum exposes its converter explicitly.
 // -------------------------------------------------------------------------
 
-fn matrix_materialization_error_to_pyerr(
-    err: gam::resource::MatrixMaterializationError,
-) -> PyErr {
+fn matrix_materialization_error_to_pyerr(err: gam::resource::MatrixMaterializationError) -> PyErr {
     MatrixMaterializationError::new_err(err.to_string())
 }
 

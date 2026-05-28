@@ -5697,10 +5697,7 @@ pub trait LinearOperator {
     /// but not guaranteed PSD (so consumers cannot assume the `SymmetricMatrix`
     /// PSD contract). Default impl delegates to `diag_xtw_x` for legacy
     /// operators; overriding impls may take a sign-aware fast path.
-    fn xt_diag_x_signed_op(
-        &self,
-        weights: SignedWeightsView<'_>,
-    ) -> Result<Array2<f64>, String> {
+    fn xt_diag_x_signed_op(&self, weights: SignedWeightsView<'_>) -> Result<Array2<f64>, String> {
         self.diag_xtw_x(&weights.view().to_owned())
     }
 
@@ -5708,10 +5705,7 @@ pub trait LinearOperator {
     /// `PsdWeightsView` constructor. Returns a typed `SymmetricMatrix` so
     /// downstream consumers can route through PSD-only solvers (Cholesky).
     /// Default impl wraps the signed path's `Array2` in `SymmetricMatrix::Dense`.
-    fn xt_diag_x_psd_op(
-        &self,
-        weights: PsdWeightsView<'_>,
-    ) -> Result<SymmetricMatrix, String> {
+    fn xt_diag_x_psd_op(&self, weights: PsdWeightsView<'_>) -> Result<SymmetricMatrix, String> {
         let xtwx = self.diag_xtw_x(&weights.view().to_owned())?;
         Ok(SymmetricMatrix::Dense(xtwx))
     }

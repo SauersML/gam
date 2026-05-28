@@ -6793,7 +6793,9 @@ mod low_rank_weight_pirls_tests {
         let weight = LowRankWeight::new(d.view(), u.view(), v.view()).unwrap();
         let mut ws = PirlsWorkspace::new(5, 3, 0, 0);
         let got = compute_xtwx_low_rank(&mut ws, &design, &weight).unwrap();
-        let want = design.xt_diag_x_signed_op(SignedWeightsView::from_array(&d)).unwrap();
+        let want = design
+            .xt_diag_x_signed_op(SignedWeightsView::from_array(&d))
+            .unwrap();
         let diff = (&got - &want).mapv(f64::abs).sum();
         assert!(diff < 1e-12, "rank-0 path diverged from diagonal: {}", diff);
     }

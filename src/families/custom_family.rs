@@ -8166,7 +8166,9 @@ fn refresh_all_block_etas<F: CustomFamily + Clone + Send + Sync + 'static>(
     let refreshed_etas: Vec<Array1<f64>> = (0..specs.len())
         .into_par_iter()
         .map(|b| {
-            specs[b].solver_design().matrixvectormultiply(&states[b].beta)
+            specs[b]
+                .solver_design()
+                .matrixvectormultiply(&states[b].beta)
                 + specs[b].solver_offset()
         })
         .collect();
@@ -9896,7 +9898,8 @@ fn exact_newton_joint_hessian_directional_derivative_from_working_sets<F: Custom
                     }
                     d_eta += &geometry.d_offset;
                     if let Some(d_design) = geometry.d_design {
-                        if d_design.nrows() != solver_design.nrows() || d_design.ncols() != p_block {
+                        if d_design.nrows() != solver_design.nrows() || d_design.ncols() != p_block
+                        {
                             return Err(CustomFamilyError::DimensionMismatch { reason: format!(
                                 "exact_newton_joint_hessian_directional_derivative_with_specs default: block {block_idx} d_design shape {}x{} != expected {}x{}",
                                 d_design.nrows(),

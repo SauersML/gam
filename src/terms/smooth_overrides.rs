@@ -64,9 +64,9 @@ pub fn apply_smooth_overrides(
         .collect();
 
     for (symbol, descriptor) in registry {
-        let descriptor_obj = descriptor.as_object().ok_or_else(|| {
-            format!("smooths[{symbol:?}] descriptor must be a JSON object")
-        })?;
+        let descriptor_obj = descriptor
+            .as_object()
+            .ok_or_else(|| format!("smooths[{symbol:?}] descriptor must be a JSON object"))?;
         let vars = resolve_symbol_columns(symbol, descriptor_obj, &column_index)?;
         let term = locate_smooth_term(spec, &vars).ok_or_else(|| {
             format!(
@@ -91,14 +91,14 @@ fn resolve_symbol_columns(
     column_index: &HashMap<&str, usize>,
 ) -> Result<Vec<usize>, String> {
     let raw_vars: Vec<String> = if let Some(vars_val) = descriptor.get("vars") {
-        let arr = vars_val.as_array().ok_or_else(|| {
-            format!("smooths[{symbol:?}].vars must be an array of column names")
-        })?;
+        let arr = vars_val
+            .as_array()
+            .ok_or_else(|| format!("smooths[{symbol:?}].vars must be an array of column names"))?;
         let mut out = Vec::with_capacity(arr.len());
         for v in arr {
-            let s = v.as_str().ok_or_else(|| {
-                format!("smooths[{symbol:?}].vars entries must be strings")
-            })?;
+            let s = v
+                .as_str()
+                .ok_or_else(|| format!("smooths[{symbol:?}].vars entries must be strings"))?;
             out.push(s.trim().to_string());
         }
         out
@@ -110,7 +110,9 @@ fn resolve_symbol_columns(
             .collect()
     };
     if raw_vars.is_empty() {
-        return Err(format!("smooths[{symbol:?}] resolved to empty variable list"));
+        return Err(format!(
+            "smooths[{symbol:?}] resolved to empty variable list"
+        ));
     }
     let mut cols = Vec::with_capacity(raw_vars.len());
     for name in &raw_vars {
@@ -402,7 +404,10 @@ fn apply_sphere(
             }
         }
     }
-    if let Some(double_penalty) = descriptor.get("double_penalty").and_then(JsonValue::as_bool) {
+    if let Some(double_penalty) = descriptor
+        .get("double_penalty")
+        .and_then(JsonValue::as_bool)
+    {
         spec.double_penalty = double_penalty;
     }
     Ok(())
@@ -427,10 +432,12 @@ fn apply_bspline_1d(
                 num_internal_knots: Some(n_internal),
                 placement: *placement,
             },
-            BSplineKnotSpec::PeriodicUniform { data_range, .. } => BSplineKnotSpec::PeriodicUniform {
-                data_range: *data_range,
-                num_basis: n as usize,
-            },
+            BSplineKnotSpec::PeriodicUniform { data_range, .. } => {
+                BSplineKnotSpec::PeriodicUniform {
+                    data_range: *data_range,
+                    num_basis: n as usize,
+                }
+            }
             BSplineKnotSpec::Provided(existing) => BSplineKnotSpec::Provided(existing.clone()),
         };
     }
@@ -440,7 +447,10 @@ fn apply_bspline_1d(
     if let Some(po) = descriptor.get("penalty_order").and_then(JsonValue::as_u64) {
         spec.penalty_order = po as usize;
     }
-    if let Some(dp) = descriptor.get("double_penalty").and_then(JsonValue::as_bool) {
+    if let Some(dp) = descriptor
+        .get("double_penalty")
+        .and_then(JsonValue::as_bool)
+    {
         spec.double_penalty = dp;
     }
     Ok(())
@@ -470,7 +480,10 @@ fn apply_tensor_bspline(
             apply_bspline_1d(&mut spec.marginalspecs[axis], marginal_obj, symbol)?;
         }
     }
-    if let Some(dp) = descriptor.get("double_penalty").and_then(JsonValue::as_bool) {
+    if let Some(dp) = descriptor
+        .get("double_penalty")
+        .and_then(JsonValue::as_bool)
+    {
         spec.double_penalty = dp;
     }
     Ok(())
@@ -502,14 +515,14 @@ fn apply_center_strategy(
 }
 
 fn parse_f64_vec(value: &JsonValue, field: &str, symbol: &str) -> Result<Vec<f64>, String> {
-    let arr = value.as_array().ok_or_else(|| {
-        format!("smooths[{symbol:?}].{field} must be a 1-D numeric array")
-    })?;
+    let arr = value
+        .as_array()
+        .ok_or_else(|| format!("smooths[{symbol:?}].{field} must be a 1-D numeric array"))?;
     let mut out = Vec::with_capacity(arr.len());
     for (i, v) in arr.iter().enumerate() {
-        let f = v.as_f64().ok_or_else(|| {
-            format!("smooths[{symbol:?}].{field}[{i}] must be a finite number")
-        })?;
+        let f = v
+            .as_f64()
+            .ok_or_else(|| format!("smooths[{symbol:?}].{field}[{i}] must be a finite number"))?;
         if !f.is_finite() {
             return Err(format!(
                 "smooths[{symbol:?}].{field}[{i}] must be finite, got {f}"
@@ -533,9 +546,9 @@ fn parse_2d_array(value: &JsonValue, field: &str, symbol: &str) -> Result<Array2
     if outer.iter().all(|v| v.is_number()) {
         let mut data = Vec::with_capacity(outer.len());
         for (i, v) in outer.iter().enumerate() {
-            let f = v.as_f64().ok_or_else(|| {
-                format!("smooths[{symbol:?}].{field}[{i}] must be a number")
-            })?;
+            let f = v
+                .as_f64()
+                .ok_or_else(|| format!("smooths[{symbol:?}].{field}[{i}] must be a number"))?;
             if !f.is_finite() {
                 return Err(format!(
                     "smooths[{symbol:?}].{field}[{i}] must be finite, got {f}"
@@ -544,9 +557,8 @@ fn parse_2d_array(value: &JsonValue, field: &str, symbol: &str) -> Result<Array2
             data.push(f);
         }
         let k = data.len();
-        return Array2::from_shape_vec((k, 1), data).map_err(|e| {
-            format!("smooths[{symbol:?}].{field} shape conversion failed: {e}")
-        });
+        return Array2::from_shape_vec((k, 1), data)
+            .map_err(|e| format!("smooths[{symbol:?}].{field} shape conversion failed: {e}"));
     }
     // 2-D case: each row is itself an array of numbers.
     let first_row = outer[0].as_array().ok_or_else(|| {
@@ -563,9 +575,9 @@ fn parse_2d_array(value: &JsonValue, field: &str, symbol: &str) -> Result<Array2
     let k = outer.len();
     let mut data = Vec::with_capacity(k * d);
     for (i, row_val) in outer.iter().enumerate() {
-        let row = row_val.as_array().ok_or_else(|| {
-            format!("smooths[{symbol:?}].{field}[{i}] must be an array")
-        })?;
+        let row = row_val
+            .as_array()
+            .ok_or_else(|| format!("smooths[{symbol:?}].{field}[{i}] must be an array"))?;
         if row.len() != d {
             return Err(format!(
                 "smooths[{symbol:?}].{field} is not rectangular: row 0 has width {d}, \
@@ -574,9 +586,9 @@ fn parse_2d_array(value: &JsonValue, field: &str, symbol: &str) -> Result<Array2
             ));
         }
         for (j, v) in row.iter().enumerate() {
-            let f = v.as_f64().ok_or_else(|| {
-                format!("smooths[{symbol:?}].{field}[{i}][{j}] must be a number")
-            })?;
+            let f = v
+                .as_f64()
+                .ok_or_else(|| format!("smooths[{symbol:?}].{field}[{i}][{j}] must be a number"))?;
             if !f.is_finite() {
                 return Err(format!(
                     "smooths[{symbol:?}].{field}[{i}][{j}] must be finite, got {f}"
@@ -653,4 +665,3 @@ fn parse_matern_nu(nu: f64, symbol: &str) -> Result<MaternNu, String> {
         "smooths[{symbol:?}].nu must be one of 0.5, 1.5, 2.5, 3.5, 4.5; got {nu}"
     ))
 }
-
