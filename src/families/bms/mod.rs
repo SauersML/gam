@@ -2019,6 +2019,7 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
                     initial_beta: None,
                     gauge_priority: 200,
                     row_scaling: None,
+                    jacobian_callback: None,
                 });
             }
             specs.push(crate::custom_family::ParameterBlockSpec {
@@ -2033,6 +2034,7 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
                 initial_beta: None,
                 gauge_priority: 100,
                 row_scaling: None,
+                jacobian_callback: None,
             });
             specs
         },
@@ -19641,6 +19643,7 @@ fn build_blockspec(
         initial_beta: beta_hint,
         gauge_priority: 100,
         row_scaling: None,
+        jacobian_callback: None,
     }
 }
 
@@ -20552,6 +20555,7 @@ mod tests {
             initial_beta: Some(Array1::zeros(p)),
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         }
     }
 
@@ -23487,6 +23491,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
                 row_scaling: None,
+                jacobian_callback: None,
             })
             .collect();
         let small_cost = default_coefficient_hessian_cost(&small_specs);
@@ -23515,6 +23520,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
                 row_scaling: None,
+                jacobian_callback: None,
             })
             .collect();
         let big_cost = default_coefficient_hessian_cost(&big_specs);
@@ -23546,6 +23552,7 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         }];
         let ctn_cost: u64 = 400_000u64 * 300 * 300;
         assert_eq!(
@@ -23576,6 +23583,7 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         }];
         assert_eq!(
             exact_outer_order_with_outer_hvp(&huge_k_specs, 0, true),
@@ -23624,6 +23632,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
                 row_scaling: None,
+                jacobian_callback: None,
             },
             ParameterBlockSpec {
                 name: "logslope".to_string(),
@@ -23637,6 +23646,7 @@ mod tests {
                 initial_beta: None,
                 gauge_priority: 100,
                 row_scaling: None,
+                jacobian_callback: None,
             },
         ];
 

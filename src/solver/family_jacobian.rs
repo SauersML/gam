@@ -11,6 +11,32 @@
 //!
 //! T1 (this module) only defines the abstraction and the data structures used
 //! to evaluate it. Wiring into the cross-block residualizer happens in T2.
+//!
+//! # BlockEffectiveJacobian — IFT-derived Jacobians for flex blocks
+//!
+//! Score-warp and link-deviation blocks parameterise the survival family via
+//! the implicit function theorem (IFT).  For a constraint
+//!
+//!   Γ_i(a_ri, g_i, h, w) − q_ri = 0,   where a(β) is implicitly defined,
+//!
+//! the effective Jacobian (∂eta_r/∂β_k) has the form
+//!
+//!   ∂eta_r/∂β_k = (E_a/Γ_a)·∂q_r/∂β_k
+//!                 + (E_g − E_a·Γ_g/Γ_a)·∂g/∂β_k
+//!                 + (E_h − E_a·Γ_h/Γ_a)·∂h/∂β_k   [score-warp]
+//!                 + (E_w − E_a·Γ_w/Γ_a)·∂w/∂β_k   [link-dev]
+//!
+//! At rigid initialisation (a=0, g=0, h=0, w=0) the correction terms
+//! simplify and `∂h/∂β_score` reduces to the local-cubic basis evaluated
+//! at z (score-warp) and `∂w/∂β_link` reduces to the local-cubic basis
+//! evaluated at `u = a + g·z` (link-dev).
+//!
+//! [`BlockEffectiveJacobian`] is a marker super-trait over
+//! [`crate::families::identifiability_compiler::RowJacobianOperator`] that
+//! documents this IFT provenance and provides a human-readable block label.
+//! Concrete impls for SMGS are [`ScoreWarpEffectiveJacobian`] and
+//! [`LinkDevEffectiveJacobian`]; the Bernoulli analogues follow the same
+//! `QChannelBlockOperator` shape with K=1.
 
 use ndarray::Array3;
 
@@ -296,6 +322,141 @@ impl BlockPrimaryJacobian for BernoulliPrimaryJacobian {
             metric[[i, 0, 0]] = self.pilot_irls_w[i];
         }
         metric
+    }
+}
+
+// ── BlockEffectiveJacobian — IFT-derived marker trait ─────────────────
+
+/// Marker super-trait for row-Jacobian operators whose column layout
+/// is derived from the implicit function theorem (IFT) at the family's
+/// current linearisation state.
+///
+/// Implementors carry the same interface as
+/// [`crate::families::identifiability_compiler::RowJacobianOperator`]
+/// and additionally expose a human-readable `block_label` so the
+/// unified audit can attribute any dropped column to the correct
+/// flex-block name in its `DroppedColumn` records.
+///
+/// At rigid initialisation (a=0, g=0, h=0, w=0) the IFT correction
+/// terms vanish and the effective Jacobian reduces to the local-cubic
+/// basis evaluated at the block's linearisation argument (z for
+/// score-warp, `u = a + g·z` for link-dev).  The concrete impls
+/// below capture this via the `dq` / `dqd1` matrices passed to
+/// [`crate::families::survival_marginal_slope_identifiability::QChannelBlockOperator`].
+pub trait BlockEffectiveJacobian:
+    crate::families::identifiability_compiler::RowJacobianOperator
+{
+    /// Human-readable label identifying this flex block.
+    /// Used by the unified audit to populate [`crate::solver::identifiability_audit::DroppedColumn::block`].
+    fn block_label(&self) -> &str;
+}
+
+/// IFT-derived effective Jacobian for the survival score-warp-deviation
+/// block.
+///
+/// At rigid initialisation the channel contributions reduce to:
+///
+/// - q0 channel: `dq[i, j]`  (local-cubic basis row)
+/// - q1 channel: `dq[i, j]`  (same, enter and exit indices share the block)
+/// - qd1 channel: `dqd1[i, j]` (derivative of the cubic basis wrt t, evaluated at exit t)
+/// - g channel: 0
+///
+/// This matches the [`crate::families::survival_marginal_slope_identifiability::QChannelBlockOperator`]
+/// channel routing exactly.
+pub struct ScoreWarpEffectiveJacobian {
+    inner: crate::families::survival_marginal_slope_identifiability::QChannelBlockOperator,
+}
+
+impl ScoreWarpEffectiveJacobian {
+    /// Construct from the (n × p) local-cubic-basis design and its
+    /// time derivative evaluated at training rows.
+    pub fn new(dq: ndarray::Array2<f64>, dqd1: ndarray::Array2<f64>) -> Self {
+        Self {
+            inner: crate::families::survival_marginal_slope_identifiability::QChannelBlockOperator::new(
+                dq, dqd1,
+            ),
+        }
+    }
+}
+
+impl crate::families::identifiability_compiler::RowJacobianOperator
+    for ScoreWarpEffectiveJacobian
+{
+    fn k(&self) -> usize {
+        self.inner.k()
+    }
+    fn ncols(&self) -> usize {
+        self.inner.ncols()
+    }
+    fn nrows(&self) -> usize {
+        self.inner.nrows()
+    }
+    fn apply_row(&self, row: usize, delta_beta: &[f64], out: &mut [f64]) {
+        self.inner.apply_row(row, delta_beta, out);
+    }
+    fn evaluate_full(&self) -> ndarray::Array3<f64> {
+        self.inner.evaluate_full()
+    }
+}
+
+impl BlockEffectiveJacobian for ScoreWarpEffectiveJacobian {
+    fn block_label(&self) -> &str {
+        "score_warp_dev"
+    }
+}
+
+/// IFT-derived effective Jacobian for the survival link-deviation block.
+///
+/// At rigid initialisation `u = a + g·z = 0` and the channel contributions
+/// reduce to:
+///
+/// - q0 channel: `dq[i, j]`  (local-cubic basis in u, evaluated at u≈0=z)
+/// - q1 channel: `dq[i, j]`
+/// - qd1 channel: `dqd1[i, j]`
+/// - g channel: 0
+///
+/// Same channel routing as [`ScoreWarpEffectiveJacobian`]; the distinction
+/// is purely semantic (the linearisation argument is u, not z).
+pub struct LinkDevEffectiveJacobian {
+    inner: crate::families::survival_marginal_slope_identifiability::QChannelBlockOperator,
+}
+
+impl LinkDevEffectiveJacobian {
+    /// Construct from the (n × p) local-cubic-basis-in-u design and its
+    /// derivative, evaluated at the pilot `u` (= exit-location index) at
+    /// training rows.
+    pub fn new(dq: ndarray::Array2<f64>, dqd1: ndarray::Array2<f64>) -> Self {
+        Self {
+            inner: crate::families::survival_marginal_slope_identifiability::QChannelBlockOperator::new(
+                dq, dqd1,
+            ),
+        }
+    }
+}
+
+impl crate::families::identifiability_compiler::RowJacobianOperator
+    for LinkDevEffectiveJacobian
+{
+    fn k(&self) -> usize {
+        self.inner.k()
+    }
+    fn ncols(&self) -> usize {
+        self.inner.ncols()
+    }
+    fn nrows(&self) -> usize {
+        self.inner.nrows()
+    }
+    fn apply_row(&self, row: usize, delta_beta: &[f64], out: &mut [f64]) {
+        self.inner.apply_row(row, delta_beta, out);
+    }
+    fn evaluate_full(&self) -> ndarray::Array3<f64> {
+        self.inner.evaluate_full()
+    }
+}
+
+impl BlockEffectiveJacobian for LinkDevEffectiveJacobian {
+    fn block_label(&self) -> &str {
+        "link_dev"
     }
 }
 

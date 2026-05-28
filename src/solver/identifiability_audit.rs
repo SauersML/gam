@@ -59,9 +59,9 @@
 // |-----------|---------|--------|
 // | Joint rank deficient, gauge cannot resolve (same priority or no attribution) | true | `IdentifiabilityFailure` |
 // | Joint rank deficient, gauge resolves (distinct priorities, full attribution to lower-priority blocks) | false | gauge-attributed drops message |
-// | Cross-block overlap ≥ `HARD_HALT_OVERLAP_THRESHOLD` (0.99), same-priority blocks | true | `IdentifiabilityFailure` |
-// | Cross-block overlap ≥ `HARD_HALT_OVERLAP_THRESHOLD` (0.99), distinct-priority blocks | false | gauge-attributed drops message |
-// | Any pairwise overlap in `[ALIAS_OVERLAP_REPORTING_THRESHOLD, 0.99)` | false | INFO log |
+// | Cross-block overlap ≥ per-pair halt threshold (leverage-scaled), same-priority blocks | true | `IdentifiabilityFailure` |
+// | Cross-block overlap ≥ per-pair halt threshold (leverage-scaled), distinct-priority blocks | false | gauge-attributed drops message |
+// | Any pairwise overlap ≥ per-pair report threshold (leverage-scaled) | false | INFO log |
 // | All blocks clean | false | silent pass |
 //
 // `InnerFailure::IdentifiabilityFailure` is the upstream variant that
@@ -81,12 +81,13 @@
 //    local_col)` origin via `col_offsets`. `effective_dim` per block is
 //    updated.
 // 5. Pairwise normalised inner-product scan over cross-block column pairs
-//    surfaces `AliasedPair` records above `ALIAS_OVERLAP_REPORTING_THRESHOLD`.
-// 6. `fatal = joint_rank_deficient || any_pair_above_hard_halt_threshold`.
+//    surfaces `AliasedPair` records above the per-pair leverage-based
+//    reporting threshold (see `pair_report_threshold`).
+// 6. `fatal = joint_rank_deficient || any_pair_above_per_pair_halt_threshold`.
 
 use ndarray::{Array1, Array2};
 
-use crate::families::custom_family::ParameterBlockSpec;
+use crate::families::custom_family::{FamilyLinearizationState, ParameterBlockSpec};
 use crate::linalg::faer_ndarray::{FaerQr, default_rrqr_rank_alpha, rrqr_with_permutation};
 
 /// Per-block accounting record. `original_dim` is the spec's column
@@ -151,38 +152,105 @@ pub struct IdentifiabilityAudit {
     pub summary: String,
 }
 
-/// Overlap magnitude above which an `AliasedPair` is reported.
-/// Independent of the column-pivoted QR drop tolerance: we drop
-/// columns whose pivoted residual collapses to the numerical noise
-/// floor, but we *report* partial overlaps far above that floor so
-/// callers can see structurally-redundant terms before the QR even
-/// makes a decision.
-const ALIAS_OVERLAP_REPORTING_THRESHOLD: f64 = 0.95;
+/// Compute the leverage concentration S2_k for a joint design column.
+///
+/// # Finite-sample identity for cross-block cosine under standardised z
+///
+/// Let φ be a length-n column vector.  Define normalised leverage weights
+///   p_i = φ_i² / Σ_j φ_j²
+/// so that Σ_i p_i = 1.  For a sample-standardised independent noise
+/// vector z (zero mean, unit variance per component), the cosine between
+/// φ and z·φ satisfies the exact finite-sample identity
+///
+///   cos_W(φ, z·φ) = E_p[z] / √(E_p[z²])
+///
+/// Under the null (z truly random and independent of φ), the
+/// concentration scale of this cosine is
+///
+///   σ_k² = S2_k − 1/n,   S2_k = Σ_i p_i² = Σ_i φ_i⁴ / (Σ_i φ_i²)²
+///
+/// giving effective sample size n_eff,k = 1/S2_k.  A column with
+/// uniform φ_i = 1/√n has S2_k = 1/n (n_eff = n, tight null); a column
+/// concentrated on r rows has S2_k ≈ 1/r (n_eff ≈ r, wide null).
+///
+/// Returns S2_k.  For a zero-norm column returns 1.0 (n_eff = 1,
+/// most conservative possible).
+fn compute_leverage_s2(col: &ndarray::ArrayView1<f64>) -> f64 {
+    let sq_norm: f64 = col.iter().map(|v| v * v).sum();
+    if sq_norm <= 0.0 {
+        return 1.0;
+    }
+    // S2_k = Σ_i (φ_i² / sq_norm)² = Σ_i φ_i⁴ / sq_norm²
+    col.iter().map(|v| (v * v / sq_norm).powi(2)).sum()
+}
 
-/// Overlap magnitude above which the audit halts the fit unconditionally.
+/// Per-pair null cosine concentration scale.
 ///
-/// At or above this threshold, two named blocks contribute the *same*
-/// direction up to 1% relative noise. The joint penalised-Newton inner
-/// solve has no unique minimiser in that direction — the inner KKT
-/// system is structurally rank-deficient regardless of penalty value,
-/// the outer Hessian inherits the same null space, and the outer
-/// optimiser silently spins on the unattributed direction. This is the
-/// "auto-subsample eval=1/12 hung for hours" failure mode the audit-gate
-/// task (#5) installs the safety net for: the audit must refuse, with
-/// an actionable message naming the offending blocks/columns and a
-/// reparameterisation hint, BEFORE the outer solver ever enters.
+/// σ = √(max(0, S2_max − 1/n)) where S2_max = max(S2_a, S2_b).
+/// Taking the maximum of the two columns' S2 values selects the more
+/// concentrated (smaller n_eff) column, which has the wider null
+/// cosine distribution.  Using that wider scale for both the report
+/// and halt thresholds prevents false positives when one column is
+/// highly non-uniform.
+fn pair_null_sigma(s2_a: f64, s2_b: f64, n: usize) -> f64 {
+    let inv_n = if n == 0 { 0.0 } else { 1.0 / n as f64 };
+    let s2 = s2_a.max(s2_b);
+    (s2 - inv_n).max(0.0).sqrt()
+}
+
+/// Overlap threshold above which an `AliasedPair` is reported.
 ///
-/// Note this is strictly stricter than
-/// `ALIAS_OVERLAP_REPORTING_THRESHOLD` (0.95). The 0.95 threshold is
-/// for *reporting* — partial overlap that the penalty and line search
-/// can still resolve. The 0.99 threshold is for *halting* — overlap so
-/// close to 1.0 that no penalty value can distinguish the two
-/// directions and no warm-start can untangle them. The aliasing-fix
-/// peer's basis reparameterisation should keep biobank specs below
-/// this threshold; if this gate ever fires on production specs after
-/// their fix lands, that's a real bug surfaced rather than silently
-/// absorbed.
-const HARD_HALT_OVERLAP_THRESHOLD: f64 = 0.99;
+/// # K-multiplier and false-positive rate
+///
+/// The threshold is K_report · σ where σ = pair_null_sigma(s2_a, s2_b, n).
+///
+/// K_report is Bonferroni-corrected across the m_pairs total column pairs:
+///   K_report = max(3, √(2 · ln(2 · m_pairs / α)))
+/// with α = 0.05.  For m_pairs = 1 this gives K = 3 (three-sigma).
+/// For m_pairs = 1000 (large biobank audit) this gives K ≈ 5.1.
+///
+/// The floor of 0.10 prevents collapse to near-zero on pathological
+/// inputs; the ceiling 0.999 is the absolute alias boundary.
+/// For a column with n_eff = 100 and m_pairs = 100: σ ≈ 0.1,
+/// K ≈ 4.3, threshold ≈ 0.43.  For n_eff = 10000: σ ≈ 0.01,
+/// threshold ≈ 0.043, clamped to 0.10.
+fn pair_report_threshold(s2_a: f64, s2_b: f64, n: usize, m_pairs: usize) -> f64 {
+    let sigma = pair_null_sigma(s2_a, s2_b, n);
+    if sigma <= 0.0 {
+        return 0.10_f64;
+    }
+    let k_report = if m_pairs <= 1 {
+        3.0_f64
+    } else {
+        (2.0 * (2.0 * m_pairs as f64 / 0.05_f64).ln())
+            .sqrt()
+            .max(3.0)
+    };
+    (k_report * sigma).clamp(0.10, 0.999)
+}
+
+/// Overlap threshold above which the audit halts the fit for this pair.
+///
+/// # K-multiplier and false-positive rate
+///
+/// The threshold is K_halt · σ where σ = pair_null_sigma(s2_a, s2_b, n).
+///
+/// K_halt = 10.0 (≈ √(2 · ln(2M / α)) for M ~ 1000 pairs and α = 1e-6).
+/// For a column with n_eff = 100: σ ≈ 0.1, halt threshold ≈ 1.0 → clamped
+/// to 0.999 (only near-exact aliases halt for wide-null columns).
+/// For n_eff = 10000: σ ≈ 0.01, threshold = 0.10 (moderate overlaps
+/// that are wildly outside the null distribution at that resolution).
+///
+/// The ceiling 0.999 ensures that floating-point near-exact aliases
+/// (cos = 0.9999…) always fire the halt.  The floor 0.05 prevents
+/// pathological over-sensitivity on very long columns.
+fn pair_halt_threshold(s2_a: f64, s2_b: f64, n: usize) -> f64 {
+    let sigma = pair_null_sigma(s2_a, s2_b, n);
+    if sigma <= 0.0 {
+        return 0.999_f64;
+    }
+    (10.0_f64 * sigma).clamp(0.05, 0.999)
+}
 
 /// Run the pre-fit cross-block identifiability audit on a finalised
 /// list of `ParameterBlockSpec`s. The caller is responsible for
@@ -201,7 +269,8 @@ const HARD_HALT_OVERLAP_THRESHOLD: f64 = 0.99;
 ///      whose range absorbs it (largest projection norm). Ambiguous
 ///      attribution → `fatal = true`.
 ///   4. Report all (a, b) column pairs whose normalised inner
-///      product exceeds `ALIAS_OVERLAP_REPORTING_THRESHOLD`.
+///      product exceeds the per-pair leverage-based reporting threshold
+///      (`pair_report_threshold`).
 pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<IdentifiabilityAudit, String> {
     if specs.is_empty() {
         return Ok(IdentifiabilityAudit {
@@ -233,12 +302,22 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
     let block_phase_started = std::time::Instant::now();
     let block_heartbeat = (n.saturating_mul(specs.len()) >= 1_000_000)
         .then(crate::util::heartbeat::Heartbeat::default_interval);
+    // Build a default at-init linearization state: β = 0, no family scalars.
+    // Families whose callbacks need β-dependent scalars must pass a state with
+    // the current β when invoking the channel-aware audit after initialization.
+    let p_total_hint: usize = specs.iter().map(|s| s.design.ncols()).sum();
+    let zeros_beta = vec![0.0f64; p_total_hint];
+    let init_state = FamilyLinearizationState {
+        beta: &zeros_beta,
+        family_scalars: None,
+    };
     for (idx, spec) in specs.iter().enumerate() {
-        // Use spec.effective_design() so the audit operates on the correct
-        // D_eff = diag(row_scaling) · design rather than the raw design.
-        // For blocks with row_scaling = None this is a no-op (D_eff = design).
+        // Use spec.effective_jacobian_at() so the audit operates on the β-dependent
+        // effective design. At initialization (β = 0, family_scalars = None), callbacks
+        // return the linearization at β = 0.  For blocks with no callback and
+        // row_scaling = None this is a no-op (J = design).
         let dense = spec
-            .effective_design("identifiability_audit::audit_identifiability")
+            .effective_jacobian_at("identifiability_audit::audit_identifiability", &init_state)
             .map_err(|e| format!("identifiability audit: {e}"))?;
         let p_block = dense.ncols();
         let block_singular = block_pivoted_qr_diagonal(&dense)?;
@@ -385,6 +464,11 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
     // columns. O(p_total² · n) — fine at GAM smooth widths. We only
     // record pairs whose blocks are distinct (within-block aliasing
     // is the within-smooth nullspace problem, owned by nullspace-lead).
+    //
+    // Thresholds are column-specific, derived from the leverage
+    // concentration S2_k = Σ_i p_i² (p_i = φ_i²/‖φ‖²).  See the
+    // doc-comments on `compute_leverage_s2`, `pair_report_threshold`,
+    // and `pair_halt_threshold` for the underlying finite-sample identity.
     let pairwise_started = std::time::Instant::now();
     log::info!(
         "[STAGE] identifiability audit: pairwise overlap scan start n={} p_total={} blocks={}",
@@ -393,10 +477,27 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
         specs.len(),
     );
     let mut col_norms = Array1::<f64>::zeros(p_total);
+    // S2_k for each joint column; computed once and reused for both
+    // report and halt threshold decisions below.
+    let mut col_s2 = Array1::<f64>::zeros(p_total);
     for j in 0..p_total {
-        let nrm = x_joint.column(j).iter().map(|v| v * v).sum::<f64>().sqrt();
+        let col = x_joint.column(j);
+        let nrm = col.iter().map(|v| v * v).sum::<f64>().sqrt();
         col_norms[j] = nrm;
+        col_s2[j] = compute_leverage_s2(&col);
     }
+    // Total number of cross-block column pairs for Bonferroni correction.
+    let total_cross_pairs: usize = {
+        let mut cnt = 0usize;
+        for a_idx in 0..specs.len() {
+            let a_cols = col_offsets[a_idx + 1] - col_offsets[a_idx];
+            for b_idx in (a_idx + 1)..specs.len() {
+                let b_cols = col_offsets[b_idx + 1] - col_offsets[b_idx];
+                cnt = cnt.saturating_add(a_cols.saturating_mul(b_cols));
+            }
+        }
+        cnt.max(1)
+    };
     let pairwise_block_heartbeat = (n.saturating_mul(p_total) >= 1_000_000)
         .then(crate::util::heartbeat::Heartbeat::default_interval);
     let mut aliased_pairs: Vec<AliasedPair> = Vec::new();
@@ -421,7 +522,13 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
                     let cb = x_joint.column(jb);
                     let dot: f64 = ca.iter().zip(cb.iter()).map(|(a, b)| a * b).sum();
                     let overlap = (dot.abs() / (na * nb)).min(1.0);
-                    if overlap >= ALIAS_OVERLAP_REPORTING_THRESHOLD {
+                    let report_thr = pair_report_threshold(
+                        col_s2[ja],
+                        col_s2[jb],
+                        n,
+                        total_cross_pairs,
+                    );
+                    if overlap >= report_thr {
                         aliased_pairs.push(AliasedPair {
                             block_a: specs[a_block_idx].name.clone(),
                             block_b: specs[b_block_idx].name.clone(),
@@ -565,9 +672,17 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
     // trailing rank-deficient space, leaving the higher-priority block's
     // direction intact.  Two blocks contributing the same direction is only
     // *unfittable* when no ordering exists to pick which one to drop.
+    //
+    // The halt threshold is column-specific (leverage-based): for each pair
+    // we reconstruct the joint column indices from block name → block index
+    // → col_offsets + direction offset, then call `pair_halt_threshold`.
+    let block_name_to_idx: std::collections::HashMap<&str, usize> = specs
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.name.as_str(), i))
+        .collect();
     let hard_alias_pair = aliased_pairs
         .iter()
-        .filter(|p| p.overlap >= HARD_HALT_OVERLAP_THRESHOLD)
         .filter(|p| {
             let pa = block_priority
                 .get(p.block_a.as_str())
@@ -579,7 +694,24 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
                 .unwrap_or(100);
             // Same priority → ambiguous → halt.
             // Distinct priorities → canonical-gauge resolves → do not halt.
-            pa == pb
+            if pa != pb {
+                return false;
+            }
+            // Compute per-pair halt threshold from stored S2 values.
+            let ja = block_name_to_idx
+                .get(p.block_a.as_str())
+                .map(|&bi| col_offsets[bi] + p.direction_a)
+                .unwrap_or(0);
+            let jb = block_name_to_idx
+                .get(p.block_b.as_str())
+                .map(|&bi| col_offsets[bi] + p.direction_b)
+                .unwrap_or(0);
+            let halt_thr = pair_halt_threshold(
+                col_s2.get(ja).copied().unwrap_or(1.0),
+                col_s2.get(jb).copied().unwrap_or(1.0),
+                n,
+            );
+            p.overlap >= halt_thr
         })
         .max_by(|a, b| {
             a.overlap
@@ -657,9 +789,23 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
             ));
         }
         if let Some(pair) = hard_alias_pair.as_ref() {
+            let ja = block_name_to_idx
+                .get(pair.block_a.as_str())
+                .map(|&bi| col_offsets[bi] + pair.direction_a)
+                .unwrap_or(0);
+            let jb = block_name_to_idx
+                .get(pair.block_b.as_str())
+                .map(|&bi| col_offsets[bi] + pair.direction_b)
+                .unwrap_or(0);
+            let halt_thr = pair_halt_threshold(
+                col_s2.get(ja).copied().unwrap_or(1.0),
+                col_s2.get(jb).copied().unwrap_or(1.0),
+                n,
+            );
             parts.push(format!(
-                "alias pair: '{}'[{}] ~ '{}'[{}] overlap={:.4} >= halt threshold {:.2} \
-                 (reparam: orthogonalise one block's column {} against the other \
+                "alias pair: '{}'[{}] ~ '{}'[{}] overlap={:.4} >= leverage-based halt \
+                 threshold {:.4} (n_eff_a≈{:.0}, n_eff_b≈{:.0}; \
+                 reparam: orthogonalise one block's column {} against the other \
                  via sum-to-zero, or absorb the shared direction into a single \
                  parametric block)",
                 pair.block_a,
@@ -667,7 +813,9 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
                 pair.block_b,
                 pair.direction_b,
                 pair.overlap,
-                HARD_HALT_OVERLAP_THRESHOLD,
+                halt_thr,
+                1.0 / col_s2.get(ja).copied().unwrap_or(1.0).max(f64::EPSILON),
+                1.0 / col_s2.get(jb).copied().unwrap_or(1.0).max(f64::EPSILON),
                 pair.direction_b,
             ));
         }
@@ -685,19 +833,19 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
             dropped_columns.len(),
         )
     } else if !aliased_pairs.is_empty() {
-        " — partial alias(es) below halt threshold; penalty + line search will resolve".to_string()
+        " — partial alias(es) below leverage-based halt threshold; penalty + line search will resolve"
+            .to_string()
     } else {
         " — clean".to_string()
     };
 
     let summary = format!(
         "identifiability audit: {} block(s), {} joint columns, joint rank {}, \
-         {} alias pair(s) above overlap {:.3}, {} dropped column(s){}",
+         {} alias pair(s) above leverage-based report threshold, {} dropped column(s){}",
         specs.len(),
         p_total,
         joint_rank,
         aliased_pairs.len(),
-        ALIAS_OVERLAP_REPORTING_THRESHOLD,
         dropped_columns.len(),
         fatal_detail,
     );
@@ -1149,6 +1297,7 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         }
     }
 

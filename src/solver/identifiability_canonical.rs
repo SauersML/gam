@@ -35,11 +35,110 @@
 
 use std::sync::Arc;
 
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, Array3};
 
-use crate::families::custom_family::{CustomFamilyError, ParameterBlockSpec, PenaltyMatrix};
+use crate::families::custom_family::{
+    BlockEffectiveJacobian, CustomFamilyError, FamilyLinearizationState, ParameterBlockSpec,
+    PenaltyMatrix,
+};
+use crate::families::identifiability_compiler::{IdentityRowHessian, RowJacobianOperator};
+use crate::linalg::faer_ndarray::{default_rrqr_rank_alpha, rrqr_with_permutation};
 use crate::linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
-use crate::solver::identifiability_audit::{IdentifiabilityAudit, audit_identifiability};
+use crate::solver::identifiability_audit::{
+    IdentifiabilityAudit, audit_identifiability, audit_identifiability_channel_aware,
+};
+
+/// A [`RowJacobianOperator`] built from a [`BlockEffectiveJacobian`] callback.
+///
+/// At audit time we call `effective_jacobian_at` once with `beta = 0` and
+/// no family scalars.  The callback returns an `(n * k, p)` stacked matrix
+/// (row-major channel stacking: block `i·k .. (i+1)·k` is observation `i`).
+/// We reshape that into the `(n, p, k)` tensor that `RowJacobianOperator`
+/// expects.
+struct BlockJacobianAsRowOp {
+    /// Materialised `(n, p, k)` Jacobian tensor.
+    jac: Array3<f64>,
+}
+
+impl BlockJacobianAsRowOp {
+    /// Build from a `BlockEffectiveJacobian` callback.
+    ///
+    /// `n_rows` is the number of training observations, `k` is the number of
+    /// output channels.  The `effective_jacobian_at` call uses `beta = 0` and
+    /// `family_scalars = None`.
+    fn from_callback(
+        cb: &dyn BlockEffectiveJacobian,
+        n_rows: usize,
+        block_name: &str,
+    ) -> Result<Self, String> {
+        let p = 0; // placeholder; will be determined from callback output below
+        let k = cb.n_outputs();
+        let zeros = vec![0.0f64; p];
+        let state = FamilyLinearizationState {
+            beta: &zeros,
+            family_scalars: None,
+            channel_hessian: None,
+        };
+        let stacked = cb
+            .effective_jacobian_at(&state)
+            .map_err(|e| format!("BlockJacobianAsRowOp block '{block_name}': {e}"))?;
+        // stacked: (n_rows * k, p_block)
+        let nk = stacked.nrows();
+        let p_block = stacked.ncols();
+        if k == 0 {
+            return Err(format!(
+                "BlockJacobianAsRowOp block '{block_name}': n_outputs=0 is invalid"
+            ));
+        }
+        if nk != n_rows * k {
+            return Err(format!(
+                "BlockJacobianAsRowOp block '{block_name}': effective_jacobian_at returned \
+                 {} rows but expected n_rows({n_rows}) * k({k}) = {}",
+                nk,
+                n_rows * k,
+            ));
+        }
+        // Reshape (n*k, p) → (n, p, k) by interpreting stacked row `i*k + r`
+        // as channel `r` for observation `i`.
+        let mut jac = Array3::<f64>::zeros((n_rows, p_block, k));
+        for i in 0..n_rows {
+            for j in 0..p_block {
+                for r in 0..k {
+                    jac[[i, j, r]] = stacked[[i * k + r, j]];
+                }
+            }
+        }
+        Ok(Self { jac })
+    }
+}
+
+impl RowJacobianOperator for BlockJacobianAsRowOp {
+    fn k(&self) -> usize {
+        self.jac.shape()[2]
+    }
+    fn ncols(&self) -> usize {
+        self.jac.shape()[1]
+    }
+    fn nrows(&self) -> usize {
+        self.jac.shape()[0]
+    }
+    fn apply_row(&self, row: usize, delta_beta: &[f64], out: &mut [f64]) {
+        let k = self.k();
+        assert_eq!(out.len(), k);
+        assert_eq!(delta_beta.len(), self.ncols());
+        for r in 0..k {
+            out[r] = 0.0;
+        }
+        for (j, &b) in delta_beta.iter().enumerate() {
+            for r in 0..k {
+                out[r] += self.jac[[row, j, r]] * b;
+            }
+        }
+    }
+    fn evaluate_full(&self) -> Array3<f64> {
+        self.jac.clone()
+    }
+}
 
 /// Specs after pre-fit cross-block identifiability canonicalisation.
 ///
@@ -47,11 +146,19 @@ use crate::solver::identifiability_audit::{IdentifiabilityAudit, audit_identifia
 /// `p_i`-column design via `CoefficientTransformOperator`. Penalties
 /// are pulled back as `T_iᵀ S_k T_i`. `per_block_transform[i]` is the
 /// raw-to-reduced selection matrix `T_i` of shape `(p_i_raw, r_i)`.
+///
+/// `used_channel_aware_audit` is `true` when the multi-channel path was
+/// taken (i.e. at least one block declared `n_outputs > 1` via its
+/// `jacobian_callback`).  Tests that assert routing correctness inspect
+/// this field directly.
 #[derive(Debug)]
 pub struct CanonicalSpecs {
     pub reduced_specs: Vec<ParameterBlockSpec>,
     pub per_block_transform: Vec<Array2<f64>>,
     pub audit: IdentifiabilityAudit,
+    /// `true` iff the audit was routed through `audit_identifiability_channel_aware`
+    /// (multi-channel families such as survival marginal-slope).
+    pub used_channel_aware_audit: bool,
 }
 
 impl CanonicalSpecs {
@@ -256,8 +363,12 @@ pub fn canonicalize_for_identifiability(
             // The reduction operates on raw-column selection; the
             // effective linear-predictor scaling is unchanged after
             // column selection (the surviving columns still carry the
-            // same per-row scaling as in the original spec).
+            // same per-row scaling as in the original spec).  The
+            // jacobian_callback (if any) is also forwarded: the callback
+            // internally uses the raw design width, which the column-
+            // selection T_i accounts for by selecting surviving columns.
             row_scaling: spec.row_scaling.clone(),
+            jacobian_callback: spec.jacobian_callback.clone(),
         });
         per_block_transform.push(t_i);
     }
@@ -343,6 +454,7 @@ mod tests {
             initial_beta: None,
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         }
     }
 

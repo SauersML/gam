@@ -1194,6 +1194,7 @@ impl TransformationNormalFamily {
             initial_beta: Some(self.initial_beta.clone()),
             gauge_priority: 100,
             row_scaling: None,
+            jacobian_callback: None,
         }
     }
 

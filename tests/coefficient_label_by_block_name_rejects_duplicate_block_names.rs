@@ -17,6 +17,7 @@ fn make_spec(name: &str) -> ParameterBlockSpec {
         initial_beta: None,
         gauge_priority: 100,
         row_scaling: None,
+        jacobian_callback: None,
     }
 }
 
