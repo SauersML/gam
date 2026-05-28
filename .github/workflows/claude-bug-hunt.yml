@@ -6,19 +6,20 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: claude-bug-hunt
+  group: claude-bug-hunt-${{ github.ref }}
   cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  id-token: write
+  actions: read
 
 jobs:
   hunt:
     runs-on: ubuntu-latest
     timeout-minutes: 330
-    permissions:
-      contents: write
-      issues: write
-      pull-requests: write
-      id-token: write
-      actions: read
 
     steps:
       - uses: actions/checkout@v4
