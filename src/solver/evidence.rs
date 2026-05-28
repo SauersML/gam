@@ -1199,9 +1199,12 @@ mod tests {
                 estimated_bytes: std::mem::size_of::<f64>(),
             },
             d: 1,
+            row_dims: std::sync::Arc::from(vec![1usize]),
+            row_offsets: std::sync::Arc::from(vec![0usize, 1usize]),
             k: 1,
             manifold_mode_fingerprint: 0,
             row_hessian_fingerprint: 0,
+            pcg_diagnostics: crate::solver::arrow_schur::PcgDiagnostics::default(),
         }
     }
 

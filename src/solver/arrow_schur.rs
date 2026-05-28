@@ -733,7 +733,7 @@ impl Default for ArrowTrustRegionOptions {
 /// use [`ArrowSolveOptions::sqrt_ba`] when the assembler has single-precision
 /// row blocks or an ill-conditioned gauge; use [`ArrowSolveOptions::inexact_pcg`]
 /// for SAE-manifold scale `K`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ArrowSolveOptions {
     pub mode: ArrowSolverMode,
     pub pcg: ArrowPcgOptions,
@@ -750,6 +750,19 @@ pub struct ArrowSolveOptions {
     /// `crate::gpu::arrow_schur::gpu_schur_matvec_backend` when `cuda_selected()`
     /// and the system has dense per-row H_tβ slabs. `None` means CPU-only PCG.
     pub gpu_matvec: Option<GpuSchurMatvec>,
+}
+
+impl std::fmt::Debug for ArrowSolveOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArrowSolveOptions")
+            .field("mode", &self.mode)
+            .field("pcg", &self.pcg)
+            .field("trust_region", &self.trust_region)
+            .field("streaming_chunk_size", &self.streaming_chunk_size)
+            .field("riemannian_trust_region", &self.riemannian_trust_region)
+            .field("gpu_matvec", &self.gpu_matvec.is_some())
+            .finish()
+    }
 }
 
 /// Globalization guard for non-convex arrow-Schur inner steps.
@@ -1066,10 +1079,13 @@ fn row_hessian_fingerprint_for_system(sys: &ArrowSchurSystem) -> u64 {
     // Hash the Arc pointer address as a proxy: a new Arc is allocated per
     // assemble call, so the fingerprint is invalidated each time the system
     // is rebuilt with a fresh Kronecker operator.
+    // SAFETY: We cast the fat pointer to a thin *const () to extract the data
+    // pointer address as a fingerprint proxy. No dereference occurs; the only
+    // use is as a usize hash input, which is sound for any aligned pointer.
     let htbeta_op_addr: Option<usize> = sys
         .htbeta_matvec
         .as_ref()
-        .map(|op| Arc::as_ptr(op) as usize);
+        .map(|op| Arc::as_ptr(op) as *const () as usize);
     for row in sys.rows.iter() {
         write_array2_fingerprint(&mut hasher, &row.htt);
         match htbeta_op_addr {
@@ -3366,10 +3382,11 @@ fn solve_arrow_newton_step_artifacts(
         }
         let mut htbeta_slice = htbeta_delta.slice_mut(ndarray::s![..di]).to_owned();
         sys_htbeta_apply_row(sys, i, &sys.rows[i], delta_beta.view(), &mut htbeta_slice);
-        let rhs_i = rhs.slice_mut(ndarray::s![..di]);
+        let mut rhs_i = rhs.slice_mut(ndarray::s![..di]);
         for c in 0..di {
             rhs_i[c] = sys.rows[i].gt[c] + htbeta_slice[c];
         }
+        drop(rhs_i);
         let rhs_slice = rhs.slice(ndarray::s![..di]).to_owned();
         let dt_i = backend.solve_block_vector(&htt_factors[i], &rhs_slice);
         for c in 0..di {
