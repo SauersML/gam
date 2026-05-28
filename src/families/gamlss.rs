@@ -1534,6 +1534,54 @@ fn gaussian_location_scalewarm_start(
     Ok((betamu, beta_log_sigma, sigma_hat))
 }
 
+/// Install `AdditiveBlockJacobian` callbacks on two location-scale sub-model
+/// blocks (e.g. `mu`/`log_sigma` or `threshold`/`log_sigma`) so the
+/// identifiability audit routes through the channel-aware variant. Each block
+/// drives a distinct output channel (block 0 → channel 0, block 1 → channel 1),
+/// so a shared intercept (or any shared column) between blocks is no longer
+/// treated as a flat-joint alias.
+fn install_additive_callbacks_two_block(
+    block0: &mut ParameterBlockSpec,
+    block1: &mut ParameterBlockSpec,
+) -> Result<(), String> {
+    const N_OUTPUTS: usize = 2;
+    let d0 = block0
+        .effective_design("install_additive_callbacks_two_block: block 0")?;
+    let d1 = block1
+        .effective_design("install_additive_callbacks_two_block: block 1")?;
+    block0.jacobian_callback = Some(std::sync::Arc::new(AdditiveBlockJacobian {
+        design: d0,
+        own_output: 0,
+        n_family_outputs: N_OUTPUTS,
+    }));
+    block1.jacobian_callback = Some(std::sync::Arc::new(AdditiveBlockJacobian {
+        design: d1,
+        own_output: 1,
+        n_family_outputs: N_OUTPUTS,
+    }));
+    Ok(())
+}
+
+/// Same as [`install_additive_callbacks_two_block`] but also installs a
+/// zero-Jacobian callback on the wiggle block. Wiggle blocks modulate the
+/// inverse link nonlinearly and contribute no linear effective Jacobian.
+fn install_additive_callbacks_two_block_with_wiggle(
+    block0: &mut ParameterBlockSpec,
+    block1: &mut ParameterBlockSpec,
+    wiggle: &mut ParameterBlockSpec,
+) -> Result<(), String> {
+    const N_OUTPUTS: usize = 2;
+    install_additive_callbacks_two_block(block0, block1)?;
+    let n = block0.design.nrows();
+    let p_w = wiggle.design.ncols();
+    wiggle.jacobian_callback = Some(std::sync::Arc::new(AdditiveBlockJacobian {
+        design: ndarray::Array2::<f64>::zeros((n, p_w)),
+        own_output: 0,
+        n_family_outputs: N_OUTPUTS,
+    }));
+    Ok(())
+}
+
 fn prepared_gaussian_log_sigma_design(
     mu_design: &DesignMatrix,
     log_sigma_design: &DesignMatrix,
@@ -3206,43 +3254,45 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
                 log_sigmaspec.initial_beta = Some(beta_ls0);
             }
         }
-        Ok(vec![
-            thresholdspec,
-            log_sigmaspec,
-            ParameterBlockSpec {
-                name: "wiggle".to_string(),
-                design: self.wiggle_block.design.clone(),
-                offset: self.wiggle_block.offset.clone(),
-                penalties: {
-                    let p_wiggle = self.wiggle_block.design.ncols();
-                    self.wiggle_block
-                        .penalties
-                        .iter()
-                        .map(|spec| match spec {
-                            crate::solver::estimate::PenaltySpec::Block {
-                                local,
-                                col_range,
-                                ..
-                            } => PenaltyMatrix::Blockwise {
-                                local: local.clone(),
-                                col_range: col_range.clone(),
-                                total_dim: p_wiggle,
-                            },
-                            crate::solver::estimate::PenaltySpec::Dense(m)
-                            | crate::solver::estimate::PenaltySpec::DenseWithMean {
-                                matrix: m,
-                                ..
-                            } => PenaltyMatrix::Dense(m.clone()),
-                        })
-                        .collect()
-                },
-                nullspace_dims: vec![],
-                initial_log_lambdas: layout.wiggle_from(theta),
-                initial_beta: self.wiggle_block.initial_beta.clone(),
-                gauge_priority: 100,
-            jacobian_callback: None,
+        let mut wigglespec = ParameterBlockSpec {
+            name: "wiggle".to_string(),
+            design: self.wiggle_block.design.clone(),
+            offset: self.wiggle_block.offset.clone(),
+            penalties: {
+                let p_wiggle = self.wiggle_block.design.ncols();
+                self.wiggle_block
+                    .penalties
+                    .iter()
+                    .map(|spec| match spec {
+                        crate::solver::estimate::PenaltySpec::Block {
+                            local,
+                            col_range,
+                            ..
+                        } => PenaltyMatrix::Blockwise {
+                            local: local.clone(),
+                            col_range: col_range.clone(),
+                            total_dim: p_wiggle,
+                        },
+                        crate::solver::estimate::PenaltySpec::Dense(m)
+                        | crate::solver::estimate::PenaltySpec::DenseWithMean {
+                            matrix: m,
+                            ..
+                        } => PenaltyMatrix::Dense(m.clone()),
+                    })
+                    .collect()
             },
-        ])
+            nullspace_dims: vec![],
+            initial_log_lambdas: layout.wiggle_from(theta),
+            initial_beta: self.wiggle_block.initial_beta.clone(),
+            gauge_priority: 100,
+            jacobian_callback: None,
+        };
+        install_additive_callbacks_two_block_with_wiggle(
+            &mut thresholdspec,
+            &mut log_sigmaspec,
+            &mut wigglespec,
+        )?;
+        Ok(vec![thresholdspec, log_sigmaspec, wigglespec])
     }
 
     fn build_family(
