@@ -114,6 +114,8 @@ pub fn try_gpu_sigma_stream_pool_eval(
     prior_w: ArrayView1<'_, f64>,
     offset: ArrayView1<'_, f64>,
     admission: crate::gpu::policy::PirlsLoopAdmission,
+    /// Active Gamma dispersion shape (α > 0). Pass `1.0` for non-Gamma families.
+    gamma_shape: f64,
     convergence_tol: f64,
     max_iter: usize,
 ) -> Result<Option<Vec<crate::solver::reml::eval::SigmaPointResult>>, GpuError> {
@@ -138,6 +140,7 @@ pub fn try_gpu_sigma_stream_pool_eval(
             offset,
             family,
             curvature,
+            gamma_shape,
             convergence_tol,
             max_iter,
         );
@@ -146,7 +149,7 @@ pub fn try_gpu_sigma_stream_pool_eval(
     #[cfg(not(target_os = "linux"))]
     {
         // Suppress unused-variable warnings on non-Linux builds.
-        let _ = (y, prior_w, offset, admission, convergence_tol, max_iter);
+        let _ = (y, prior_w, offset, admission, gamma_shape, convergence_tol, max_iter);
         Ok(None)
     }
 }

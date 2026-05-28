@@ -835,9 +835,9 @@ pub fn cholesky_solve_gpu(
 ) -> Result<(Array2<f64>, f64), String> {
     // Route through iterative refinement. The function falls back to fp64
     // internally, so callers always get a valid result; the refinement
-    // outcome metadata is discarded here.
-    let (sol, logdet, _outcome) = iterative_refinement_cholesky_solve(hessian, rhs)?;
-    Ok((sol, logdet))
+    // outcome metadata is intentionally not surfaced by this thin wrapper.
+    let result = iterative_refinement_cholesky_solve(hessian, rhs)?;
+    Ok((result.0, result.1))
 }
 
 pub fn cholesky_lower_gpu(hessian: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
