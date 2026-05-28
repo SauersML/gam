@@ -2704,6 +2704,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
                 noisespec.initial_beta = Some(beta_ls0);
             }
         }
+        install_additive_callbacks_two_block(&mut meanspec, &mut noisespec)?;
         Ok(vec![meanspec, noisespec])
     }
 
