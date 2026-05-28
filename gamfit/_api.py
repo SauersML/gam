@@ -787,7 +787,6 @@ def fit(
 ) -> ResponseGeometryModel: ...
 
 
-@_suggest_kwarg_typo
 def fit(
     data: Any,
     formula: str,
@@ -1061,7 +1060,6 @@ def fit(
     return Model(_model_bytes=model_bytes, _training_table_kind=table_kind)
 
 
-@_suggest_kwarg_typo
 def fit_array(
     X: Any,
     Y: Any,
@@ -1220,7 +1218,6 @@ def loads(model_bytes: bytes) -> Model:
     return Model(_model_bytes=model_bytes)
 
 
-@_suggest_kwarg_typo
 def validate_formula(
     data: Any,
     formula: str,
@@ -3591,3 +3588,55 @@ def _numeric_tensor3(values: Any, label: str) -> Any:
     if not np.all(np.isfinite(arr)):
         raise ValueError(f"{label} must contain only finite values")
     return arr
+
+
+# ---------------------------------------------------------------------------
+# Kwarg-typo "Did you mean" hint, applied once from a single registry.
+# ---------------------------------------------------------------------------
+#
+# Issue #306: ``fit()`` / ``fit_array()`` / ``validate_formula()`` expose ~25
+# keyword arguments each. Case typos like ``formuLa=`` / ``Familiy=`` /
+# ``Offset=`` produce a bare ``TypeError`` with no spelling hint on Python
+# < 3.13 (Python 3.13 adds these natively via PEP 657).
+#
+# The principled fix is *one* registry of "kwarg-validated public entry
+# points" and *one* place that wraps them. Adding a new public entry point
+# means adding its name to ``_KWARG_VALIDATED_ENTRY_POINTS`` and nothing
+# else — no per-function ``@_suggest_kwarg_typo`` decoration to remember to
+# stamp on the new definition. Removing the wrapping from a function means
+# removing the name from the registry; there is no second source of truth.
+#
+# The registry holds *names* rather than function references so resolution
+# happens against the final, post-overload, post-definition binding in
+# ``globals()``. (``fit`` has ``@overload`` stubs; the wrappable target is
+# the concrete implementation that ends up bound to the name.)
+
+_KWARG_VALIDATED_ENTRY_POINTS: tuple[str, ...] = (
+    "fit",
+    "fit_array",
+    "validate_formula",
+)
+
+
+def _install_kwarg_typo_hints() -> None:
+    """Wrap every entry point in ``_KWARG_VALIDATED_ENTRY_POINTS`` once.
+
+    Each wrapper is closed over the function's signature at install time,
+    so the known-keyword set is captured exactly once and reused on every
+    call. The wrapper is otherwise a no-op: it observes the call, catches a
+    ``TypeError`` matching the "unexpected keyword argument" shape, and
+    re-raises the same error with an appended ``. Did you mean 'Y'?`` hint.
+    """
+    module_globals = globals()
+    for name in _KWARG_VALIDATED_ENTRY_POINTS:
+        target = module_globals.get(name)
+        if target is None:
+            raise RuntimeError(
+                f"_KWARG_VALIDATED_ENTRY_POINTS lists {name!r} but no such "
+                f"function is defined in gamfit._api; remove it from the "
+                f"registry or define the function."
+            )
+        module_globals[name] = _suggest_kwarg_typo(target)
+
+
+_install_kwarg_typo_hints()

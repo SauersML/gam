@@ -282,7 +282,7 @@ pub fn build_termspec(
     col_map: &HashMap<String, usize>,
     inference_notes: &mut Vec<String>,
     policy: &ResourcePolicy,
-) -> Result<TermCollectionSpec, String> {
+) -> Result<TermCollectionSpec, TermBuilderError> {
     let mut linear_terms = Vec::<LinearTermSpec>::new();
     let mut random_terms = Vec::<RandomEffectTermSpec>::new();
     let mut smooth_terms = Vec::<SmoothTermSpec>::new();
