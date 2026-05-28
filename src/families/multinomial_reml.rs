@@ -245,7 +245,6 @@ impl MultinomialFamily {
     /// each block carries one `λ`). Callers that want a custom warm start
     /// override per-block before passing to `fit_custom_family_with_rho_prior`.
     pub fn build_block_specs(&self) -> Vec<ParameterBlockSpec> {
-        let p = self.design.ncols();
         let nullspace_dims = vec![self.penalty_nullspace_dim];
         let m = self.active_classes();
         (0..m)
