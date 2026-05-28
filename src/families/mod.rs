@@ -1,4 +1,16 @@
-pub mod bernoulli_marginal_slope;
+pub mod bms;
+/// Backward-compatible path alias: all callers of
+/// `crate::families::bernoulli_marginal_slope::*` continue to resolve
+/// because every public symbol is re-exported here.
+pub mod bernoulli_marginal_slope {
+    pub use crate::families::bms::*;
+    pub mod deviation_runtime {
+        pub use crate::families::bms::deviation_runtime::*;
+    }
+    pub mod exact_kernel {
+        pub use crate::families::bms::exact_kernel::*;
+    }
+}
 pub mod bernoulli_marginal_slope_identifiability;
 pub mod cubic_cell_kernel;
 pub mod custom_family;

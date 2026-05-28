@@ -1333,12 +1333,16 @@ pub fn audit_identifiability_channel_aware(
                 .get(p.block_b.as_str())
                 .map(|&bi| col_offsets[bi] + p.direction_b)
                 .unwrap_or(0);
-            let halt_thr = pair_halt_threshold(
+            let halt_half_width = pair_halt_threshold(
                 ca_col_s2.get(ja).copied().unwrap_or(1.0),
                 ca_col_s2.get(jb).copied().unwrap_or(1.0),
                 n * k,
             );
-            p.overlap >= halt_thr
+            // Channel-aware path: bias_shift is always 0 (set when pair is
+            // created in channel_aware_aliased_pairs), so this is just
+            // p.overlap >= halt_half_width, matching the pre-skewness logic.
+            let conservative_deviation = (p.overlap - p.bias_shift.abs()).abs();
+            conservative_deviation >= halt_half_width
         })
         .max_by(|a, b| {
             a.overlap
