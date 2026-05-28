@@ -105,6 +105,23 @@ impl From<String> for PredictInputError {
     }
 }
 
+impl From<crate::inference::data::DataError> for PredictInputError {
+    /// Inbound conversion from the typed data-layer error channel
+    /// (`resolve_col` / `resolve_role_col` returning
+    /// `DataError::ColumnNotFound` for formula-referenced columns missing
+    /// from the prediction input). Preserves the human text byte-identical
+    /// to the legacy `Display` output; the typed structural payload is
+    /// flattened here because predict input has its own request-vs-model
+    /// classification, but the FFI boundary path that needs the structured
+    /// payload (issue #305) routes through `WorkflowError::ColumnNotFound`,
+    /// not through this conversion.
+    fn from(err: crate::inference::data::DataError) -> PredictInputError {
+        PredictInputError::InvalidInput {
+            reason: err.to_string(),
+        }
+    }
+}
+
 impl From<SurvivalPredictError> for PredictInputError {
     /// Survival-prediction helpers (`resolve_termspec_for_prediction`,
     /// `fit_result_from_saved_model_for_prediction`) emit their own typed
