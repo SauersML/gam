@@ -87,7 +87,7 @@ fn block_solve_recovers_joint_system_solution_within_tolerance() {
     sys.rows[1].gt = array![-1.1];
     sys.gb = array![0.3, -0.2];
 
-    let (dt, db) = sys
+    let (dt, db, _diag) = sys
         .solve(0.0, 0.0)
         .expect("arrow-Schur solve should succeed");
 
@@ -143,7 +143,7 @@ fn per_row_arrow_structure_matches_dense_block_solve_for_vector_response_shape()
     sys.rows[2].gt = array![-0.5];
     sys.hbb = array![[5.0]];
     sys.gb = array![0.6];
-    let (dt, db) = sys.solve(0.0, 0.0).expect("arrow solve should succeed");
+    let (dt, db, _diag) = sys.solve(0.0, 0.0).expect("arrow solve should succeed");
 
     let mut dense = Array2::<f64>::zeros((4, 4));
     dense[[0, 0]] = 2.0;

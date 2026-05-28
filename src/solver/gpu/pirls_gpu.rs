@@ -696,7 +696,7 @@ extern "C" __global__ void chol_logdet_col_major(
         // host round-trip" budget keeps the p² factor on the device.
         let logdet = cholesky_logdet_device(&ws.stream, &shared.ctx, p, &ws.h_dev)?;
 
-        // Direction: the convention is d = −H⁻¹ g.
+        // Direction: d = H⁻¹ g (no negation; g is the full corrected RHS, #257).
         let direction_raw = ws
             .stream
             .clone_dtoh(&ws.rhs_dev)
