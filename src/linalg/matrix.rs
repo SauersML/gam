@@ -55,7 +55,7 @@ pub use crate::linalg::utils::PcgSolveInfo;
 // Conventions:
 // * `PsdWeightsView<'_>` is owned/lifetime-bound to a 1D float view whose
 //   constructor has already discharged the `w_i ≥ 0` obligation. PSD-Gram
-//   kernels (`dense_xtwx_view`, `dense_diag_gram_view`,
+//   kernels (`weighted_crossprod_dense_view`, `dense_diag_gram_view`,
 //   `sparse_csr_weighted_xtwx_*`) accept only this view, so the `assert!`
 //   that previously fired inside the kernels migrates entirely to
 //   `PsdWeights::try_new`. PSD callers either go through this constructor,
@@ -146,7 +146,7 @@ pub struct PsdWeightsView<'a>(ArrayView1<'a, f64>);
 impl<'a> PsdWeightsView<'a> {
     /// Construct a PSD weight view, discharging the `w_i ≥ 0` precondition
     /// once at the call site. The previous runtime `assert!` inside
-    /// `dense_xtwx_view` / `dense_diag_gram_view` migrates entirely to this
+    /// `weighted_crossprod_dense_view` / `dense_diag_gram_view` migrates entirely to this
     /// constructor — kernels that accept `PsdWeightsView` no longer need to
     /// recheck.
     #[inline]
@@ -439,7 +439,7 @@ fn weighted_crossprod_dense_rows(
 ) -> Array2<f64> {
     // The per-row body below is `Σᵢ wᵢ · leftᵢᵀ · rightᵢ`, which is linear in
     // `wᵢ` and therefore sign-correct without any PSD assumption. The PSD
-    // precondition belongs at the symmetric `Xᵀ W X` caller (`dense_xtwx_view`),
+    // precondition belongs at the symmetric `Xᵀ W X` caller (`weighted_crossprod_dense_view`),
     // not at this kernel: `BlockDesignOperator::cross_block` legitimately uses
     // the asymmetric form `X_iᵀ W X_j` with signed `c·Xv` weights from the outer
     // REML Hessian-derivative correction, which is not PSD even when `w ≥ 0`.
@@ -732,19 +732,6 @@ fn dense_transpose_matvec_view(matrix: &Array2<f64>, vector: ArrayView1<'_, f64>
                 a
             },
         )
-}
-
-#[inline]
-fn dense_xtwx_view(matrix: &Array2<f64>, weights: PsdWeightsView<'_>) -> Array2<f64> {
-    // PSD precondition for the symmetric `Xᵀ W X` form is discharged by the
-    // `PsdWeightsView` constructor — the previous runtime `assert!` is now a
-    // type-level obligation paid once at the call boundary (typically at the
-    // `PsdWeightsView::try_new` site inside callers of `xt_diag_x_psd_op`). The
-    // asymmetric / observed-Hessian path keeps using `SignedWeightsView` and
-    // routes through `weighted_crossprod_dense_rows` directly (e.g.
-    // `BlockDesignOperator::cross_block` with `c · X v` weights from the
-    // outer REML Hessian-derivative correction).
-    weighted_crossprod_dense_view(matrix, weights.view(), matrix)
 }
 
 #[inline]
@@ -7879,7 +7866,8 @@ mod tests {
         PsdWeightsView, ReparamOperator, ResidualisedDesignOperator, RowwiseKroneckerOperator,
         SparseDesignMatrix, SparseHessianAccumulator, dense_matvec,
         dense_operator_to_dense_by_chunks, dense_transpose_matvec,
-        dense_transpose_weighted_response, dense_xtwx_view, streaming_sparse_csc_xt_diag_x,
+        dense_transpose_weighted_response, streaming_sparse_csc_xt_diag_x,
+        weighted_crossprod_dense_view,
     };
     use crate::linalg::matrix::LinearOperator;
     use crate::linalg::utils::{PcgSolveInfo, StableSolver};
@@ -7938,7 +7926,7 @@ mod tests {
         fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
             let dense = dense_operator_to_dense_by_chunks(self).map_err(|err| err.to_string())?;
             let psd = PsdWeightsView::try_new(weights.view())?;
-            Ok(dense_xtwx_view(&dense, psd))
+            Ok(weighted_crossprod_dense_view(&dense, psd.view(), &dense))
         }
     }
 
