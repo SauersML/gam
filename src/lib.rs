@@ -40,9 +40,6 @@
 //! - [`inference`] — prediction, posterior sampling, diagnostics
 //! - [`linalg`] — faer ↔ ndarray bridges + numerics helpers
 //! - [`gpu`] — runtime CUDA dispatch for hot linear algebra paths
-#![allow(dead_code)]
-#![allow(unused_variables)]
-#![allow(unused_imports)]
 
 include!(concat!(env!("OUT_DIR"), "/lint_errors.rs"));
 
