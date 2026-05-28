@@ -426,7 +426,7 @@ fn exact_joint_quadratic_lamlgradient_matches_three_autodiff_engines() {
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
         },
         ParameterBlockSpec {
@@ -438,7 +438,7 @@ fn exact_joint_quadratic_lamlgradient_matches_three_autodiff_engines() {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
         },
     ];
@@ -515,7 +515,7 @@ fn exact_joint_quadratic_lamlgradient_respects_active_constraint_tangent_space()
         initial_log_lambdas: array![0.0],
         initial_beta: Some(array![lower]),
         gauge_priority: 100,
-        row_scaling: None,
+        eta_row_scaling: None,
         jacobian_callback: None,
     }];
     let derivative_blocks = vec![Vec::<CustomFamilyBlockPsiDerivative>::new()];
@@ -591,7 +591,7 @@ fn exact_joint_quadratic_lamlgradient_requires_joint_stationarity() {
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
         },
         ParameterBlockSpec {
@@ -603,7 +603,7 @@ fn exact_joint_quadratic_lamlgradient_requires_joint_stationarity() {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
         },
     ];
@@ -687,7 +687,7 @@ fn exact_joint_quadratic_lamlhessian_matches_gradient_finite_difference() {
             initial_log_lambdas: array![0.0],
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
         },
         ParameterBlockSpec {
@@ -699,7 +699,7 @@ fn exact_joint_quadratic_lamlhessian_matches_gradient_finite_difference() {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
-            row_scaling: None,
+            eta_row_scaling: None,
             jacobian_callback: None,
         },
     ];
