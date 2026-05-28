@@ -4,8 +4,9 @@ These exercise :func:`gamfit._predict_shape.shape_predict_response` against
 synthetic Rust-FFI payloads. The dispatcher's contract is:
 
 * the shape policy is fully determined by caller intent
-  ``(return_type, id_column, interval, with_uncertainty)`` via
-  :func:`wants_table` — no sniffing of payload columns;
+  ``(return_type, id_column, interval)`` via :func:`wants_table` — no
+  sniffing of payload columns (issue #342 collapsed an earlier
+  ``with_uncertainty`` flag into ``interval``);
 * Bernoulli marginal-slope, transformation-normal, and standard GAMs all
   default to a 1-D ``ndarray`` of point predictions when no tabular knob
   was set, and to a column payload otherwise.
@@ -164,15 +165,17 @@ def test_standard_gam_with_id_column_returns_table(monkeypatch: Any) -> None:
         fallback_model_class="standard",
         fallback_family="gaussian",
         id_column="person_id",
+        row_ids=["a", "b", "c"],
     )
 
-    # ``row_ids=None`` is normalised to an empty list by the shaper; the
-    # important contract here is that we got a tabular shape with the id
-    # column on the left, not a bare 1-D ndarray.
+    # The id column lands on the left so callers can join predictions
+    # back to the input by row; the data columns follow in their
+    # preferred order.
     import pandas as pd
 
     assert isinstance(out, pd.DataFrame)
     assert list(out.columns) == ["person_id", "eta", "mean"]
+    assert out["person_id"].tolist() == ["a", "b", "c"]
 
 
 def test_standard_gam_with_interval_returns_table(monkeypatch: Any) -> None:
@@ -241,36 +244,32 @@ def test_marginal_slope_non_bernoulli_falls_through_to_standard_shaper(
 
 def test_wants_table_predicate_is_purely_caller_driven() -> None:
     """:func:`wants_table` is the single source of truth for the shape
-    decision. Every opt-in flag flips it to ``True`` independently;
-    omitting them all yields ``False``. This test pins the predicate
-    directly so future shape-policy work has an unambiguous spec."""
+    decision. Each of the three public knobs flips it to ``True``
+    independently; omitting them all yields ``False``. This test pins
+    the predicate so future shape-policy work has an unambiguous spec.
+
+    Issue #342 collapsed the prior ``with_uncertainty`` flag into the
+    single ``interval`` knob; the predicate's three signals are exactly
+    the public ``Model.predict`` keywords that can promote the return
+    shape, and nothing else.
+    """
     assert _predict_shape.wants_table(
         return_type=None,
         id_column=None,
         interval=None,
-        with_uncertainty=False,
     ) is False
     assert _predict_shape.wants_table(
         return_type="dict",
         id_column=None,
         interval=None,
-        with_uncertainty=False,
     ) is True
     assert _predict_shape.wants_table(
         return_type=None,
         id_column="person_id",
         interval=None,
-        with_uncertainty=False,
     ) is True
     assert _predict_shape.wants_table(
         return_type=None,
         id_column=None,
         interval=0.95,
-        with_uncertainty=False,
-    ) is True
-    assert _predict_shape.wants_table(
-        return_type=None,
-        id_column=None,
-        interval=None,
-        with_uncertainty=True,
     ) is True

@@ -22743,19 +22743,22 @@ fn predict_columns(
         let prediction = predictor
             .predict_full_uncertainty(&predict_input, &fit, &uncertainty_options)
             .map_err(|err| format!("prediction with uncertainty failed: {err}"))?;
-        columns.insert("eta".to_string(), prediction.eta.to_vec());
+        // User-facing column names. Issue #310: the engine's internal labels
+        // ("eta", "effective_se", "effective_variance") leaked through the FFI
+        // as the public prediction-table schema. Rename at the Python boundary
+        // to names a user would actually look up:
+        //   eta                 -> linear_predictor (standard GLM terminology)
+        //   effective_se        -> std_error        (standard statistical term)
+        //   effective_variance  -> dropped (== std_error ** 2; trivial for the
+        //                          caller to compute and not worth a separate
+        //                          column they have to learn about).
+        // Internal Rust fields (``prediction.eta`` / ``eta_standard_error``)
+        // keep their theoretic names because they describe the math object.
+        columns.insert("linear_predictor".to_string(), prediction.eta.to_vec());
         columns.insert("mean".to_string(), prediction.mean.to_vec());
         columns.insert(
-            "effective_se".to_string(),
+            "std_error".to_string(),
             prediction.eta_standard_error.to_vec(),
-        );
-        columns.insert(
-            "effective_variance".to_string(),
-            prediction
-                .eta_standard_error
-                .iter()
-                .map(|se| se * se)
-                .collect(),
         );
         columns.insert("mean_lower".to_string(), prediction.mean_lower.to_vec());
         columns.insert("mean_upper".to_string(), prediction.mean_upper.to_vec());
@@ -22763,7 +22766,7 @@ fn predict_columns(
         let prediction = predictor
             .predict_plugin_response(&predict_input)
             .map_err(|err| format!("prediction failed: {err}"))?;
-        columns.insert("eta".to_string(), prediction.eta.to_vec());
+        columns.insert("linear_predictor".to_string(), prediction.eta.to_vec());
         columns.insert("mean".to_string(), prediction.mean.to_vec());
     }
 
