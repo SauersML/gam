@@ -5253,7 +5253,9 @@ fn materialize_standard<'a>(
 ) -> Result<MaterializedModel<'a>, WorkflowError> {
     if config.noise_offset_column.is_some() {
         return Err(
-            "noise_offset_column requires a location-scale model with noise_formula".to_string(),
+            "noise_offset_column requires a location-scale model with noise_formula"
+                .to_string()
+                .into(),
         );
     }
     let y_col = resolve_role_col(col_map, &parsed.response, "response")?;
@@ -5712,7 +5714,8 @@ fn materialize_survival<'a>(
     {
         return Err(
             "latent hazard-window families require a non-linear scalar baseline target; use baseline_target weibull, gompertz, or gompertz-makeham"
-                .to_string(),
+                .to_string()
+                .into(),
         );
     }
     let time_cfg = if effective_timewiggle.is_some() {
@@ -5759,7 +5762,8 @@ fn materialize_survival<'a>(
         return Err(
             "timewiggle requires a non-linear scalar survival baseline target; \
              use baseline_target weibull, gompertz, or gompertz-makeham"
-                .to_string(),
+                .to_string()
+                .into(),
         );
     }
 
