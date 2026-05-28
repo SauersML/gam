@@ -61,7 +61,7 @@ fn build_spec(
         initial_log_lambdas: Array1::from(vec![0.0]),
         initial_beta: None,
         gauge_priority: priority,
-        row_scaling: None,
+        eta_row_scaling: None,
         jacobian_callback: None,
     }
 }
