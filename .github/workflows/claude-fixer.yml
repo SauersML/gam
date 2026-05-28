@@ -5,9 +5,6 @@ on:
     - cron: "*/29 * * * *"
   workflow_dispatch:
 
-concurrency:
-  group: claude-fixer-${{ github.ref }}
-  cancel-in-progress: false
 
 permissions:
   contents: write
