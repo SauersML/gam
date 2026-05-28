@@ -1016,90 +1016,69 @@ mod tests {
         assert!(pld.u_null.is_none());
     }
 
-    /// Regression test for issue #192.
+    /// Regression test for issues #192 and #318 under the unified pure-spectrum rule.
     ///
-    /// Constructs an assembled penalty matrix with one structurally-null direction
-    /// and one barely-active eigenvalue whose unridged magnitude (`λ_k σ_k = 1e-10`)
-    /// is many orders of magnitude smaller than the ridge (`r = 1e-4`).
-    ///
-    /// In the assembled matrix `S_active + r·I`, the eigenvalues are
-    /// `[r, r + 1e-10]` (ascending). The structural-null direction is the one
-    /// with eigenvalue `r`; the barely-active direction is at `r + 1e-10`.
-    /// Both lie well below the "positive eigenvalue threshold" used by the
-    /// generic `from_assembled` heuristic, so without a structural-nullity
-    /// hint, both would be discarded.
-    ///
-    /// The fix routes through eigenvalue-based detection: with `ridge = 1e-4`
-    /// and `m0 = 1`, we identify only the eigenvalue within tolerance of `r`
-    /// as null, and keep `r + 1e-10` in `log|S|₊`.
+    /// The classifier is now driven entirely by the assembled eigenspectrum
+    /// relative to `r + noise_band`, where `noise_band = 100·p·ε·max|e|`.  No
+    /// metadata `m0` hint is consulted, so the failure modes both issues
+    /// described — "metadata claims a null direction that doesn't exist"
+    /// (#318) and "positional rule misclassifies a barely-active direction
+    /// near the ridge" (#192) — are dissolved at the same point: the
+    /// spectrum is the sole authority and is C∞ in ρ over the positive
+    /// eigenspace.
     #[test]
-    fn test_assembled_eigenvalue_based_null_detection_issue_192() {
+    fn test_assembled_pure_spectrum_classifier_issue_192_and_318() {
         let ridge = 1e-4_f64;
-        let active_eval = 1e-10_f64; // λ_k σ_k strictly less than ridge.
-        // Diagonal assembled matrix: structural null at index 1, active at index 0.
-        // After eigendecomposition the sorted (ascending) eigenvalues are
-        // [r, r + 1e-10], which is exactly what the new detection rule expects.
+
+        // ── #192 case: one structural null at r, one barely-active at r + 1e-10.
+        //
+        // The barely-active eigenvalue `r + 1e-10` lies above `r + noise_band`
+        // (noise_band ≈ 100 · 2 · ε · r ≈ 4.4e-18, far below 1e-10), so it is
+        // correctly classified as positive and contributes log(r + 1e-10) to
+        // log|S|₊; the eigenvalue at exactly `r` is the structural null.
+        let active_eval = 1e-10_f64;
         let s = array![[ridge + active_eval, 0.0], [0.0, ridge]];
-
-        let pld = PenaltyPseudologdet::from_assembled_with_nullity(s.clone(), Some(ridge), Some(1))
-            .expect("ridged assembled with structural nullity");
-
-        assert_eq!(pld.rank(), 1, "rank must equal p_dim − m0");
+        let pld =
+            PenaltyPseudologdet::from_assembled(s.clone(), Some(ridge)).expect("ridged assembled");
+        assert_eq!(pld.rank(), 1);
         let expected = (ridge + active_eval).ln();
         assert!(
             (pld.value() - expected).abs() < 1e-14,
-            "log|S|₊ should retain the barely-active eigenvalue {} but got {}",
-            expected,
-            pld.value()
+            "log|S|₊ should retain the barely-active eigenvalue {expected} but got {}",
+            pld.value(),
         );
-
-        // Sanity: the U₀ direction must align with the structurally-null axis
-        // (the second canonical basis vector here, since that eigenvalue is r).
         let u0 = pld.u_null.as_ref().expect("nullspace basis present");
         assert_eq!(u0.ncols(), 1);
         let aligned = u0[[1, 0]].abs();
         assert!(
             aligned > 0.999,
-            "null direction should align with e_1 (eigenvalue r); got |u0[1,0]| = {aligned}"
+            "null direction should align with e_1 (eigenvalue r); got |u0[1,0]| = {aligned}",
         );
 
-        // Issue #318: when the metadata's structural nullity is a *soft upper
-        // bound* and the assembled spectrum at the current λ has fewer
-        // ridge-level eigenvalues than `m0` predicts (e.g. a small positive σ
-        // classified as null by `analyze_penalty_block`'s relative tolerance
-        // gets amplified by a large λ above the ridge), the metadata is
-        // overruled by the eigenvalue spectrum.  The build must succeed using
-        // the actual `null_like_count` rather than erroring on the mismatch.
+        // ── #318 case: no eigenvalue near r; the assembled matrix is fully
+        // active relative to the noise band.  Under the old rule, a metadata
+        // `m0 = 1` would have produced a spurious "structural nullity
+        // invariant violated" error here.  Under the pure-spectrum rule the
+        // build succeeds with rank 2 and no nullspace basis.
         let s_no_null = array![[1.0 + ridge, 0.0], [0.0, 2.0 + ridge]];
         let pld_no_null =
-            PenaltyPseudologdet::from_assembled_with_nullity(s_no_null, Some(ridge), Some(1))
-                .expect("must accept m0 as an upper bound when no eigenvalue clusters at ridge");
-        assert_eq!(
-            pld_no_null.rank(),
-            2,
-            "all eigenvalues above the ridge threshold are treated as positive",
-        );
-        assert!(
-            pld_no_null.u_null.is_none(),
-            "no nullspace basis when null_like_count == 0",
-        );
+            PenaltyPseudologdet::from_assembled(s_no_null, Some(ridge)).expect("fully active");
+        assert_eq!(pld_no_null.rank(), 2);
+        assert!(pld_no_null.u_null.is_none());
 
-        // Issue #192 invariant remains: when the assembled spectrum has *more*
-        // ridge-level eigenvalues than the metadata predicts (`null_like_count
-        // > m0`), positional null-detection would conflate an active direction
-        // with a structural null, so the build must still surface the
-        // invariant violation.
+        // ── Two-null case: both eigenvalues sit at the ridge level (the
+        // assembled matrix is structurally fully null).  Rank 0, both
+        // directions go into the nullspace basis — there is nothing to
+        // disambiguate, no error, no metadata cross-check.
         let s_extra_nulls = array![[ridge, 0.0], [0.0, ridge]];
-        let err = PenaltyPseudologdet::from_assembled_with_nullity(
-            s_extra_nulls,
-            Some(ridge),
-            Some(1),
-        )
-        .expect_err("must error when more eigenvalues cluster at ridge than expected");
-        assert!(
-            err.contains("structural nullity invariant violated"),
-            "unexpected error message: {err}"
-        );
+        let pld_two_nulls = PenaltyPseudologdet::from_assembled(s_extra_nulls, Some(ridge))
+            .expect("ridge-only spectrum");
+        assert_eq!(pld_two_nulls.rank(), 0);
+        let u0 = pld_two_nulls
+            .u_null
+            .as_ref()
+            .expect("two structural nulls populate u_null");
+        assert_eq!(u0.ncols(), 2);
     }
 
     /// Verify that the pseudo-logdet of a rank-deficient matrix
@@ -1140,8 +1119,7 @@ mod tests {
         let ridge = 1e-4_f64;
 
         let pld =
-            PenaltyPseudologdet::from_components_with_nullity(&[s1, s2], &lambdas, ridge, Some(0))
-                .unwrap();
+            PenaltyPseudologdet::from_components(&[s1, s2], &lambdas, ridge).unwrap();
 
         assert_eq!(pld.rank(), 1);
         assert!((pld.value() - (8.0 + ridge).ln()).abs() < 1e-12);
@@ -1264,9 +1242,8 @@ mod tests {
         for i in 0..2 {
             s_ridged[[i, i]] += ridge;
         }
-        let assembled =
-            PenaltyPseudologdet::from_assembled_with_nullity(s_ridged, Some(ridge), Some(1))
-                .expect("assembled pseudo-logdet with structural nullity");
+        let assembled = PenaltyPseudologdet::from_assembled(s_ridged, Some(ridge))
+            .expect("assembled pseudo-logdet");
 
         assert_eq!(block_factored.rank(), assembled.rank());
         assert!(
@@ -1287,12 +1264,11 @@ mod tests {
 
         let block_factored = PenaltyPseudologdet::from_penalties(&penalties, &[1.0, 0.0], ridge, 2)
             .expect("block-factored pseudo-logdet");
-        let assembled = PenaltyPseudologdet::from_assembled_with_nullity(
+        let assembled = PenaltyPseudologdet::from_assembled(
             array![[1.0 + ridge, 0.0], [0.0, ridge]],
             Some(ridge),
-            Some(1),
         )
-        .expect("assembled pseudo-logdet with active structural nullity");
+        .expect("assembled pseudo-logdet");
 
         assert_eq!(block_factored.rank(), assembled.rank());
         assert!(
@@ -1331,16 +1307,15 @@ mod tests {
 
         let overlapping = PenaltyPseudologdet::from_penalties(&penalties, &[1.0, 0.0], ridge, 3)
             .expect("overlapping pseudo-logdet");
-        let assembled = PenaltyPseudologdet::from_assembled_with_nullity(
+        let assembled = PenaltyPseudologdet::from_assembled(
             array![
                 [1.0 + ridge, 0.0, 0.0],
                 [0.0, ridge, 0.0],
                 [0.0, 0.0, ridge],
             ],
             Some(ridge),
-            Some(2),
         )
-        .expect("assembled pseudo-logdet with active structural nullity");
+        .expect("assembled pseudo-logdet");
 
         assert_eq!(overlapping.rank(), assembled.rank());
         assert!(
@@ -1431,9 +1406,8 @@ mod tests {
             [0.0, lambdas[1] + ridge, 0.0],
             [0.0, 0.0, ridge]
         ];
-        let assembled =
-            PenaltyPseudologdet::from_assembled_with_nullity(s_ridged, Some(ridge), Some(1))
-                .expect("assembled pseudo-logdet with structural nullity");
+        let assembled = PenaltyPseudologdet::from_assembled(s_ridged, Some(ridge))
+            .expect("assembled pseudo-logdet");
 
         assert_eq!(overlapping.rank(), assembled.rank());
         assert!(
