@@ -87,11 +87,13 @@ pub struct SigmaPointGpuInput {
 /// Caps at `min(8, M)` so we never allocate more streams than sigma points.
 /// Eight concurrent streams saturates the SM scheduler on all shipping
 /// datacenter GPUs without exhausting the per-context stream limit.
+#[cfg(target_os = "linux")]
 const STREAM_POOL_MAX: usize = 8;
 
 /// Compute the stream-pool size for a batch of M sigma points.
 ///
 /// Auto-derived — no flag, no env var.
+#[cfg(target_os = "linux")]
 #[inline]
 fn pool_size(m: usize) -> usize {
     m.min(STREAM_POOL_MAX).max(1)

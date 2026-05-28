@@ -42,7 +42,7 @@ use crate::gpu_err;
 /// Hard ceiling on `r` (primary local dimension). Matches the BMS-FLEX row
 /// kernel's [`super::bms_flex_row::MAX_R`] so the same cached Hessian
 /// bundle can feed both kernels without revalidation.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 pub(crate) const MAX_R: usize = super::bms_flex_row::MAX_R;
 
 /// `blockDim.x` for the per-row matvec / diagonal kernels. One CUDA block per
@@ -99,7 +99,7 @@ pub(crate) struct RowHessianDiagOutputs {
     pub d_rows: Vec<f64>,
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 impl<'a> RowHessianMatvecInputs<'a> {
     /// Validate every shape the device kernel relies on.
     pub(crate) fn validate(&self) -> Result<(), GpuError> {
@@ -136,7 +136,7 @@ impl<'a> RowHessianMatvecInputs<'a> {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 impl<'a> RowHessianDiagInputs<'a> {
     /// Validate every shape the device kernel relies on.
     pub(crate) fn validate(&self) -> Result<(), GpuError> {

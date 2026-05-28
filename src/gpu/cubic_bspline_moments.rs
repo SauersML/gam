@@ -62,7 +62,9 @@
 
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
 use std::collections::hash_map::DefaultHasher;
+#[cfg(target_os = "linux")]
 use std::hash::{Hash, Hasher};
 #[cfg(target_os = "linux")]
 use std::sync::Mutex;
