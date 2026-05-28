@@ -2132,15 +2132,15 @@ impl BernoulliMarginalSlopeFamily {
 
 #[derive(Default)]
 struct BernoulliInterceptSolveStats {
-    cached_short_circuit: AtomicUsize,
-    closed_form_short_circuit: AtomicUsize,
-    full_solver: AtomicUsize,
-    seed_residual_le_1e12: AtomicUsize,
-    seed_residual_le_1e10: AtomicUsize,
-    seed_residual_le_1e8: AtomicUsize,
-    seed_residual_le_abs_tol: AtomicUsize,
-    seed_residual_gt_abs_tol: AtomicUsize,
-    max_full_solver_iters: AtomicUsize,
+    pub(super) cached_short_circuit: AtomicUsize,
+    pub(super) closed_form_short_circuit: AtomicUsize,
+    pub(super) full_solver: AtomicUsize,
+    pub(super) seed_residual_le_1e12: AtomicUsize,
+    pub(super) seed_residual_le_1e10: AtomicUsize,
+    pub(super) seed_residual_le_1e8: AtomicUsize,
+    pub(super) seed_residual_le_abs_tol: AtomicUsize,
+    pub(super) seed_residual_gt_abs_tol: AtomicUsize,
+    pub(super) max_full_solver_iters: AtomicUsize,
 }
 
 impl BernoulliInterceptSolveStats {

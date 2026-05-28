@@ -52,16 +52,16 @@ impl RowPrimaryHessianCacheReason {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct RowPrimaryHessianCachePlan {
-    materialize: bool,
-    bytes: u64,
-    runtime_available_bytes: u64,
-    workspace_pinned_bytes: u64,
-    single_cache_budget_bytes: u64,
-    global_pin_budget_bytes: u64,
-    expected_reuse_passes: usize,
-    materialized_row_hessian_evals: usize,
-    streamed_row_hessian_evals: usize,
-    reason: RowPrimaryHessianCacheReason,
+    pub(super) materialize: bool,
+    pub(super) bytes: u64,
+    pub(super) runtime_available_bytes: u64,
+    pub(super) workspace_pinned_bytes: u64,
+    pub(super) single_cache_budget_bytes: u64,
+    pub(super) global_pin_budget_bytes: u64,
+    pub(super) expected_reuse_passes: usize,
+    pub(super) materialized_row_hessian_evals: usize,
+    pub(super) streamed_row_hessian_evals: usize,
+    pub(super) reason: RowPrimaryHessianCacheReason,
 }
 
 pub(super) fn decide_row_primary_hessian_cache(
@@ -116,12 +116,12 @@ pub(super) fn decide_row_primary_hessian_cache(
 /// pinned-bytes counter on drop.
 pub(crate) struct RowPrimaryEvalPin {
     /// Per-row negative log-likelihood, length `n`.
-    neglog: Array1<f64>,
+    pub(super) neglog: Array1<f64>,
     /// Per-row gradient, shape `(n, r)`.
-    grad: Array2<f64>,
+    pub(super) grad: Array2<f64>,
     /// Per-row Hessian, shape `(n, r*r)`.
-    hess: Array2<f64>,
-    bytes: u64,
+    pub(super) hess: Array2<f64>,
+    pub(super) bytes: u64,
 }
 
 impl RowPrimaryEvalPin {
@@ -220,10 +220,10 @@ impl RowPrimaryEvalCache {
 /// calls (matvec, diagonal, psi, directional derivatives) never redundantly
 /// re-solve the Newton intercept equation.
 pub(super) struct BernoulliMarginalSlopeExactEvalCache {
-    slices: BlockSlices,
-    primary: PrimarySlices,
+    pub(super) slices: BlockSlices,
+    pub(super) primary: PrimarySlices,
     /// Pre-solved row contexts (intercept, M_a, observed score-warp value).
-    row_contexts: Vec<BernoulliMarginalSlopeRowExactContext>,
+    pub(super) row_contexts: Vec<BernoulliMarginalSlopeRowExactContext>,
     /// Batched per-row denested cell moments for the current β snapshot.
     /// Built once at exact-cache construction (after row intercepts converge)
     /// and consumed by row gradient/Hessian/Hv/diagonal/derivative-tensor
@@ -231,16 +231,16 @@ pub(super) struct BernoulliMarginalSlopeExactEvalCache {
     /// `None` when the FLEX path is inactive, when an empirical latent grid
     /// drives the row kernel through a non-cell path, or when the estimated
     /// resident bytes would exceed the active resource policy budget.
-    row_cell_moments: Option<RowCellMomentsBundle>,
+    pub(super) row_cell_moments: Option<RowCellMomentsBundle>,
     /// Lazily-built degree-15 bundle for outer dH (1st-derivative of Hessian)
     /// trace paths. Only populated when those paths actually execute.
     /// `RayonSafeOnce` keeps lazy initialization safe from parallel row passes.
-    row_cell_moments_d15:
+    pub(super) row_cell_moments_d15:
         crate::resource::RayonSafeOnce<Result<Option<RowCellMomentsBundle>, String>>,
     /// Lazily-built degree-21 bundle for outer d²H (2nd-derivative of Hessian)
     /// trace paths. Only populated when those paths actually execute.
     /// `RayonSafeOnce` keeps lazy initialization safe from parallel row passes.
-    row_cell_moments_d21:
+    pub(super) row_cell_moments_d21:
         crate::resource::RayonSafeOnce<Result<Option<RowCellMomentsBundle>, String>>,
     /// Flexible-path per-β per-row primary Hessians (`r×r` blocks flattened
     /// row-major into one wide `Array2`).  The matrix-free inner Newton/CG
@@ -249,7 +249,7 @@ pub(super) struct BernoulliMarginalSlopeExactEvalCache {
     /// avoids rebuilding cell moments + reduced flex jets on every Hv product.
     /// `None` whenever the flex path is inactive (rigid kernel) or the
     /// caller did not opt in to materialization.
-    row_primary_hessians: RowPrimaryEvalCache,
+    pub(super) row_primary_hessians: RowPrimaryEvalCache,
     /// Per-row uncontracted third-derivative tensor in the rigid path,
     /// lazily built on first access. The `build_psi_hyper_coords` row pass
     /// hits `rigid_row_third_contracted` once per (row, ψ-axis) — 32× per
@@ -262,7 +262,7 @@ pub(super) struct BernoulliMarginalSlopeExactEvalCache {
     /// surface a non-finite value). `RayonSafeOnce` keeps lazy initialization
     /// safe when the first caller is already inside a Rayon row pass; failure
     /// is sticky and propagated identically to every caller.
-    rigid_third_full: crate::resource::RayonSafeOnce<Result<Vec<[[[f64; 2]; 2]; 2]>, String>>,
+    pub(super) rigid_third_full: crate::resource::RayonSafeOnce<Result<Vec<[[[f64; 2]; 2]; 2]>, String>>,
 
     /// Per-row uncontracted fourth-derivative tensor in the rigid path —
     /// the second-order analogue of `rigid_third_full`. The outer-Hessian
@@ -271,5 +271,5 @@ pub(super) struct BernoulliMarginalSlopeExactEvalCache {
     /// rank=32. Per-row, the five distinct components are axis-invariant,
     /// so caching them lets every pair contraction be a 16-multiply 2×2
     /// bilinear instead of a fresh 8-direction empirical jet.
-    rigid_fourth_full: crate::resource::RayonSafeOnce<Result<Vec<[[[[f64; 2]; 2]; 2]; 2]>, String>>,
+    pub(super) rigid_fourth_full: crate::resource::RayonSafeOnce<Result<Vec<[[[[f64; 2]; 2]; 2]; 2]>, String>>,
 }

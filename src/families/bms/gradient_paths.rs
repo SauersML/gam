@@ -1256,17 +1256,17 @@ pub(crate) fn empirical_intercept_from_marginal(
 /// η = q·c(g) + s_f·g·z,  c(g) = √(1+(s_f g)²),  s = 2y−1,  m = s·η.
 /// u_k absorb weight and sign: u1=w·s·κ₁, u2=w·κ₂, u3=w·s·κ₃, u4=w·κ₄.
 pub(super) struct RigidProbitKernel {
-    logcdf: f64,
-    u1: f64,
-    u2: f64,
-    u3: f64,
-    u4: f64,
-    c1: f64,
-    c2: f64,
-    c3: f64,
-    c4: f64,
-    eta_q: f64,
-    eta_g: f64,
+    pub(super) logcdf: f64,
+    pub(super) u1: f64,
+    pub(super) u2: f64,
+    pub(super) u3: f64,
+    pub(super) u4: f64,
+    pub(super) c1: f64,
+    pub(super) c2: f64,
+    pub(super) c3: f64,
+    pub(super) c4: f64,
+    pub(super) eta_q: f64,
+    pub(super) eta_g: f64,
 }
 
 impl RigidProbitKernel {
