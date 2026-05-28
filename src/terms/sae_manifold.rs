@@ -2136,6 +2136,17 @@ impl SaeManifoldTerm {
         // inversion.  Each atom's decoder coefficients form a natural block:
         // `[beta_offsets[k] .. beta_offsets[k] + basis_size[k] * p_out]`.
         sys.set_block_offsets(self.beta_block_offsets());
+        // Install the composite BetaPenaltyOp (#296): smoothness contributions
+        // via per-atom KroneckerPenaltyOp (avoid dense K×K materialisation) plus
+        // the data-Gauss-Newton outer products accumulated in sys.hbb.
+        {
+            let mut ops: Vec<Arc<dyn BetaPenaltyOp>> = smooth_ops;
+            ops.push(Arc::new(DensePenaltyOp(sys.hbb.clone())));
+            sys.set_penalty_op(Arc::new(CompositePenaltyOp {
+                k: beta_dim,
+                ops,
+            }));
+        }
         Ok(sys)
     }
 

@@ -3797,7 +3797,12 @@ mod stream_device_parity_tests {
         let penalty = arr2(&[[0.4, 0.0, 0.0], [0.0, 0.9, 0.0], [0.0, 0.0, 1.2]]);
         let lm_ridge = 0.1;
 
-        let shared = upload_shared_pirls_gpu(x.view()).expect("upload shared design");
+        let n = x.nrows();
+        let p = x.ncols();
+        let y_dummy = ndarray::Array1::<f64>::zeros(n);
+        let prior_w_dummy = ndarray::Array1::<f64>::ones(n);
+        let offset_dummy = ndarray::Array1::<f64>::zeros(n);
+        let shared = upload_shared_pirls_gpu(x.view(), y_dummy.view(), prior_w_dummy.view(), offset_dummy.view()).expect("upload shared design");
         let mut ws_host = allocate_sigma_pirls_workspace(&shared).expect("alloc host-input ws");
         let mut ws_dev = allocate_sigma_pirls_workspace(&shared).expect("alloc device-input ws");
 
@@ -3814,7 +3819,6 @@ mod stream_device_parity_tests {
         )
         .expect("host-input step");
 
-        let n = x.nrows();
         let mut w_dev = ws_dev.stream.alloc_zeros::<f64>(n).expect("alloc w_dev");
         let mut g_dev = ws_dev.stream.alloc_zeros::<f64>(n).expect("alloc g_dev");
         ws_dev
@@ -3826,6 +3830,8 @@ mod stream_device_parity_tests {
             .memcpy_htod(g_eta.as_slice().unwrap(), &mut g_dev)
             .expect("upload g_dev");
 
+        let beta_dev_test = ws_dev.stream.alloc_zeros::<f64>(x.ncols()).expect("alloc beta_dev_test");
+        let linear_shift_test = ndarray::Array1::<f64>::zeros(x.ncols());
         let dev_step = solve_pirls_step_on_stream_device(
             &shared,
             &mut ws_dev,
@@ -3835,6 +3841,8 @@ mod stream_device_parity_tests {
                 penalty_hessian: penalty.view(),
                 step_lm_lambda: lm_ridge,
                 objective_ridge: 0.0,
+                beta_dev: &beta_dev_test,
+                linear_shift: linear_shift_test.view(),
             },
         )
         .expect("device-input step");
