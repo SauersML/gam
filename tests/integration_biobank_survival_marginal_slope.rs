@@ -329,10 +329,10 @@ fn biobank_survival_marginal_slope_canonical_gauge_fix() {
 
         let mut joint = Array2::<f64>::zeros((n_rows, p_total));
         joint
-            .slice_mut(ndarray::s![.., ..p_marg])
+            .slice_mut(s![.., ..p_marg])
             .assign(&raw_marginal);
         joint
-            .slice_mut(ndarray::s![.., p_marg..])
+            .slice_mut(s![.., p_marg..])
             .assign(&raw_logslope);
 
         let rrqr = rrqr_with_permutation(&joint, default_rrqr_rank_alpha())

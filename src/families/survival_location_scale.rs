@@ -8629,6 +8629,22 @@ impl SurvivalLocationScaleFamily {
     }
 }
 
+/// Public entry point for building a [`BlockEffectiveJacobian`] for one block of
+/// the survival location-scale model.
+///
+/// This thin wrapper exposes the otherwise-private `SurvivalLocationScaleFamily`
+/// associated function so integration tests and downstream crates can verify the
+/// block Jacobian contract without depending on the internal struct.
+///
+/// See [`SurvivalLocationScaleFamily::block_effective_jacobian`] for the full
+/// contract.
+pub fn survival_location_scale_block_effective_jacobian(
+    specs: &[ParameterBlockSpec],
+    block_idx: usize,
+) -> Result<Box<dyn BlockEffectiveJacobian>, String> {
+    SurvivalLocationScaleFamily::block_effective_jacobian(specs, block_idx)
+}
+
 /// Observed vs expected information: The survival location-scale family uses
 /// `BlockWorkingSet::ExactNewton` which provides the actual gradient and Hessian
 /// (-nabla^2 log L) from the survival likelihood. This is the **observed** Hessian

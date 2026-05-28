@@ -1,3 +1,4 @@
+pub mod fixtures;
 pub mod gpu_gate;
 
 #[macro_export]

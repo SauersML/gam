@@ -17675,13 +17675,13 @@ impl crate::custom_family::BlockEffectiveJacobian for LogslopeBlockJacobian {
     ) -> Result<Array2<f64>, String> {
         let n = self.design.nrows();
         let p = self.design.ncols();
-        // Prefer s_f from the linearization state over the captured-at-construction
-        // value. This ensures that outer-loop σ updates (which rebuild the family and
-        // repopulate probit_frailty_scale in the state) are reflected in the Jacobian
-        // without requiring the spec to be rebuilt. When the caller did not populate
-        // probit_frailty_scale (default = 1.0), fall back to self.s so that the
-        // zero-frailty case and legacy callers remain correct.
-        let s = if state.probit_frailty_scale != 1.0 {
+        // Read s_f from the linearization state so that outer-loop σ updates are
+        // reflected without requiring the spec to be rebuilt.  Every construction
+        // site sets probit_frailty_scale = 1.0 when it does not know the family's
+        // σ; `self.s` carries the construction-time value as a fallback.  Use the
+        // state value when positive and finite; fall back to self.s otherwise.
+        // For the no-frailty case both are 1.0 so the choice is immaterial.
+        let s = if state.probit_frailty_scale > 0.0 && state.probit_frailty_scale.is_finite() {
             state.probit_frailty_scale
         } else {
             self.s
@@ -19737,13 +19737,13 @@ pub fn fit_survival_marginal_slope_terms(
             apply_compiled_map_to_designs,
             extract_term_partition_from_penalty_ranges,
         };
-        // Recompile context, populated when the densify + compile half
-        // of the attempt succeeds (regardless of whether apply_per_term
-        // fired). The post-solve recompile-after-accept hook consumes
+        // Recompile context, populated when the closed-form compile
+        // succeeds. The post-solve recompile-after-accept hook consumes
         // this to rebuild row Hessians at the converged β.
         let mut recompile_ctx: Option<SmgsRecompileAfterAcceptContext> = None;
-        // Try the active cutover. Failure (e.g. densification budget,
-        // compile error) falls back to raw — observability preflight
+        // Try the active cutover via the closed-form compiled-map path.
+        // Failure (e.g. densification budget, FullyAliased, linalg error)
+        // propagates as Err and skips phase-4b; observability preflight
         // and downstream canonicalize_for_identifiability still gate
         // on the audit.
         let attempt =
@@ -19989,99 +19989,19 @@ pub fn fit_survival_marginal_slope_terms(
                             let lift = SmgsLiftViaT::from_compiled_map(&map, &ordering);
                             return Ok(Some((applied, lift)));
                         }
-                        Ok(None) => {}
                         Err(reason) => {
-                            log::info!(
-                                "[smgs phase-4b compiled-map] closed-form path unavailable ({reason}); \
-                             falling back to per_term_vm_exact"
-                            );
+                            return Err(format!(
+                                "closed-form path unavailable: {reason}"
+                            ));
                         }
                     }
                 }
-
-                let compiled = compile_survival_parametric_designs_per_term(
-                    dq0.clone(),
-                    dq1.clone(),
-                    dqd1.clone(),
-                    &time_partition,
-                    m_dq.clone(),
-                    m_dqd1.clone(),
-                    &marginal_partition,
-                    g_dg.clone(),
-                    &logslope_partition,
-                    &row_hess,
-                )?;
-                let drops_by_block_initial = compiled.drops_by_block;
-                recompile_ctx = Some(SmgsRecompileAfterAcceptContext {
-                    dq0,
-                    dq1,
-                    dqd1,
-                    m_dq,
-                    m_dqd1,
-                    g_dg,
-                    time_partition: time_partition.clone(),
-                    marginal_partition: marginal_partition.clone(),
-                    logslope_partition: logslope_partition.clone(),
-                    offset_entry: spec.time_block.offset_entry.clone(),
-                    offset_exit: spec.time_block.offset_exit.clone(),
-                    derivative_offset_exit: spec.time_block.derivative_offset_exit.clone(),
-                    marginal_offset: spec.marginal_offset.clone(),
-                    logslope_offset: spec.logslope_offset.clone(),
-                    z_primary: z_primary.clone(),
-                    weights: spec.weights.clone(),
-                    event: spec.event_target.clone(),
-                    derivative_guard,
-                    probit_scale,
-                    drops_by_block_initial,
-                });
-                let (dt, dm, dg) = drops_by_block_initial;
-                if dt + dm + dg == 0 {
-                    // No aliasing → no reduction needed. Skip the apply.
-                    return Ok(None);
-                }
-                log::info!(
-                    "[smgs phase-4b active] applying per-term V: \
-                 time {}→{}, marginal {}→{}, logslope {}→{} \
-                 (drops time={}, marginal={}, logslope={})",
-                    p_time,
-                    p_time.saturating_sub(dt),
-                    p_marg,
-                    p_marg.saturating_sub(dm),
-                    p_log,
-                    p_log.saturating_sub(dg),
-                    dt,
-                    dm,
-                    dg,
-                );
-                let applied: CompiledSurvivalDesignsVMExact = apply_per_term_vm_exact(
-                    &compiled,
-                    &time_partition,
-                    &marginal_partition,
-                    &logslope_partition,
-                    spec.time_block.design_entry.clone(),
-                    spec.time_block.design_exit.clone(),
-                    spec.time_block.design_derivative_exit.clone(),
-                    marginal_design.design.clone(),
-                    logslope_design.design.clone(),
-                    &spec
-                        .time_block
-                        .penalties
-                        .iter()
-                        .map(|p| crate::terms::smooth::BlockwisePenalty::new(0..p_time, p.clone()))
-                        .collect::<Vec<_>>(),
-                    &marginal_design.penalties,
-                    &logslope_design.penalties,
-                )?;
-                // Flatten per-term V's in global compile order: time,
-                // then marginal, then logslope. Matches the ordering
-                // `apply_per_term_vm_exact` used to build `t_full` and
-                // `compiled.r_lw_per_term`.
-                let mut v_per_block: Vec<ndarray::Array2<f64>> = Vec::new();
-                v_per_block.extend(compiled.v_time_per_term.iter().cloned());
-                v_per_block.extend(compiled.v_marginal_per_term.iter().cloned());
-                v_per_block.extend(compiled.v_logslope_per_term.iter().cloned());
-                let lift = SmgsLiftViaT::from_v_and_r(&v_per_block, &compiled.r_lw_per_term);
-                Ok(Some((applied, lift)))
+                // The closed-form path returned Ok(Some(...)) with an explicit
+                // `return` above, so this line is only reached when
+                // compile_from_raw_grams succeeded but produced no drops (the
+                // `return Ok(None)` early-exit inside the Ok(Some) arm). All
+                // other outcomes either returned Ok(Some(...)) or propagated Err.
+                Ok(None)
             })();
         match attempt {
             Ok(Some((applied, lift))) => {
