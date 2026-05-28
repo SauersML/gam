@@ -4,7 +4,6 @@ use super::gradient_paths::*;
 use super::hessian_paths::*;
 use super::exact_eval_cache::*;
 use super::row_kernel::*;
-use super::install_flex::validate_spec;
 
 impl BernoulliMarginalSlopeFamily {
     #[inline]
@@ -3815,7 +3814,7 @@ impl BernoulliMarginalSlopeFamily {
                                     block_layout,
                                     primary_layout,
                                 ) {
-                                    Ok((neglog_vec, grad_vec, device_state)) => {
+                                    Ok(device_state) => {
                                         if log_exact_work(n) {
                                             log::info!(
                                                 "[BMS row-primary-hessian-cache] gpu_device_resident_ok rows={} r={} elapsed={:.3}s",
@@ -3825,11 +3824,7 @@ impl BernoulliMarginalSlopeFamily {
                                             );
                                         }
                                         drop(heartbeat_guard);
-                                        return Ok(RowPrimaryEvalCache::Device {
-                                            neglog: neglog_vec.into(),
-                                            grad: grad_vec.into(),
-                                            hess: device_state,
-                                        });
+                                        return Ok(RowPrimaryEvalCache::Device(device_state));
                                     }
                                     Err(err) => {
                                         log::info!(
@@ -3989,7 +3984,9 @@ impl BernoulliMarginalSlopeFamily {
 
     /// Returns the cached row-primary (neglog, grad_row) for host-resident
     /// caches. Returns `None` when the cache is absent, device-resident, or
-    /// the row is out of range.
+    /// the row is out of range. Device-resident caches recompute the row
+    /// kernel on the rare CPU-fused-gradient fallback path; the GPU
+    /// dense-block kernel handles the hot path for them directly.
     #[inline]
     pub(super) fn cached_row_primary_eval<'a>(
         cache: &'a BernoulliMarginalSlopeExactEvalCache,

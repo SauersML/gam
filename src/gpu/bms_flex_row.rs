@@ -1806,7 +1806,7 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
     logslope_design_row_major: &[f64],
     block: BmsFlexBlockLayout,
     primary: BmsFlexPrimaryLayout,
-) -> Result<(Vec<f64>, Vec<f64>, DeviceResidentRowHess), GpuError> {
+) -> Result<DeviceResidentRowHess, GpuError> {
     inputs.validate()?;
     if !s_f_diagnostic_finite(&inputs) {
         return Err(GpuError::DriverCallFailed {
@@ -2001,16 +2001,15 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
             reason: format!("bms_flex_row device-resident synchronize: {err}"),
         })?;
 
-    let neglog = stream
-        .clone_dtoh(&d_neglog)
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("bms_flex_row device-resident download neglog: {err}"),
-        })?;
-    let grad = stream
-        .clone_dtoh(&d_grad)
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("bms_flex_row device-resident download grad: {err}"),
-        })?;
+    // The kernel writes neglog + grad alongside the row Hessian, but the
+    // device-resident cache path keeps neither on the host: the fused
+    // CPU gradient pass (the only consumer of host-side neglog/grad) is
+    // dispatched only as a fallback when the GPU dense-block kernel does
+    // not apply, and in that fallback the row kernel runs again locally.
+    // Drop the device buffers so the allocation pool reclaims them
+    // immediately rather than tying them to the cache's lifetime.
+    drop(d_neglog);
+    drop(d_grad);
     // Drop the per-cell uploads; keep d_hess + designs.
     drop(d_q);
     drop(d_b);
@@ -2042,21 +2041,16 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
 
     let bytes = ((n * r * r + marginal_design_row_major.len() + logslope_design_row_major.len())
         * std::mem::size_of::<f64>()) as u64;
-    Ok((
-        neglog,
-        grad,
-        DeviceResidentRowHess {
-            hess: d_hess,
-            marginal_design: d_marginal,
-            logslope_design: d_logslope,
-            n,
-            r,
-            block,
-            primary,
-
-            bytes,
-        },
-    ))
+    Ok(DeviceResidentRowHess {
+        hess: d_hess,
+        marginal_design: d_marginal,
+        logslope_design: d_logslope,
+        n,
+        r,
+        block,
+        primary,
+        bytes,
+    })
 }
 
 /// Device-output HVP. Runs `bms_flex_row_hvp_partial(_packed)` +
