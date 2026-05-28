@@ -25,6 +25,7 @@ use crate::families::row_kernel::{
     RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
     row_kernel_hessian_dense, row_kernel_log_likelihood,
 };
+use crate::families::jet_partitions::MultiDirJet;
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{
@@ -1095,12 +1096,13 @@ mod tests_inline;
 // Public re-exports — preserve the original module path's public surface.
 // ---------------------------------------------------------------------------
 pub use block_specs::fit_bernoulli_marginal_slope_terms;
-pub use exact_eval_cache::{RowPrimaryEvalCache, RowPrimaryEvalPin};
+pub(crate) use exact_eval_cache::{RowPrimaryEvalCache, RowPrimaryEvalPin};
 pub use gradient_paths::{
     MarginalSlopeCovariance, MarginalSlopeCovarianceShape, marginal_slope_covariance_from_scores,
     marginal_slope_preserving_scale, marginal_slope_probit_eta, padded_deviation_seed,
 };
-pub use install_flex::{CrossBlockIdentifiabilityWarning, FlexCompileOutcome};
+pub use install_flex::CrossBlockIdentifiabilityWarning;
+pub(crate) use install_flex::FlexCompileOutcome;
 
 // pub(crate) re-exports for internal callers:
 pub(crate) use family::{
@@ -1119,4 +1121,5 @@ pub(crate) use install_flex::{
     validate_monotone_structural_feasible,
 };
 pub(crate) use gradient_paths::standardize_latent_z_with_policy;
+pub use block_specs::{BmsFamilyScalars, BmsLogslopeJacobian, BmsMarginalJacobian};
 pub(crate) use block_specs::{build_deviation_aux_blockspec, push_deviation_aux_blockspecs};

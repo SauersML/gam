@@ -9,10 +9,10 @@
 //!    output proportionally: the β=0 logslope Jacobian row for output η0 is
 //!    `s_f · z_i · G[i,:]`, so doubling s_f doubles the Jacobian.
 //!
-//! 2. The flat identifiability audit (`audit_identifiability`) sees a logslope
-//!    block with `eta_row_scaling = s_f · z` and correctly identifies the
-//!    logslope block as non-aliased with the marginal block (which has
-//!    `eta_row_scaling = None` and contributes via a different column design).
+//! 2. The flat identifiability audit (`audit_identifiability`) sees the logslope
+//!    spec's `RowScaledJacobian` with s_f · z scaling and correctly identifies
+//!    the logslope block as non-aliased with the marginal block (which has no
+//!    scaling callback and contributes via a different column design).
 //!
 //! 3. A state with `probit_frailty_scale = 1.0` (no frailty) yields a
 //!    Jacobian that differs from a state with `probit_frailty_scale = s_f < 1`
@@ -30,7 +30,7 @@
 //! evaluation time, ensuring outer-loop σ updates (which rebuild the family
 //! with a new fixed σ) are reflected without requiring spec reconstruction.
 
-use gam::custom_family::{BlockEffectiveJacobian, FamilyLinearizationState, ParameterBlockSpec};
+use gam::custom_family::{BlockEffectiveJacobian, FamilyLinearizationState, ParameterBlockSpec, RowScaledJacobian};
 use gam::families::survival_marginal_slope::LogslopeBlockJacobian;
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
 use gam::solver::identifiability_audit::audit_identifiability;
@@ -64,12 +64,17 @@ fn make_z(seed: u64) -> Vec<f64> {
         .collect()
 }
 
-/// Build a `LogslopeBlockJacobian` spec with the given s_f.
+/// Build a logslope spec with a `RowScaledJacobian` callback using s_f·z scaling.
+///
+/// This expresses the β=0 flat single-output effective design `diag(s_f·z)·design`
+/// through the unified `jacobian_callback` path.  For tests that need the full
+/// β-dependent multi-output `LogslopeBlockJacobian`, construct it directly.
 fn make_logslope_spec(design: &Array2<f64>, z: &[f64], s_f: f64) -> ParameterBlockSpec {
     let sf_z: Arc<[f64]> = z.iter().map(|&zi| s_f * zi).collect::<Vec<f64>>().into();
-    let jac_cb: Arc<dyn BlockEffectiveJacobian> = Arc::new(
-        LogslopeBlockJacobian::new(design.clone(), z.to_vec(), s_f),
-    );
+    let jac_cb: Arc<dyn BlockEffectiveJacobian> = Arc::new(RowScaledJacobian {
+        design: Arc::new(design.clone()),
+        eta_scaling: sf_z,
+    });
     ParameterBlockSpec {
         name: "logslope_surface".to_string(),
         design: DesignMatrix::Dense(DenseDesignMatrix::from(design.clone())),
@@ -79,7 +84,6 @@ fn make_logslope_spec(design: &Array2<f64>, z: &[f64], s_f: f64) -> ParameterBlo
         initial_log_lambdas: Array1::<f64>::zeros(0),
         initial_beta: None,
         gauge_priority: 120,
-        eta_row_scaling: Some(sf_z),
         jacobian_callback: Some(jac_cb),
     }
 }
@@ -95,7 +99,6 @@ fn make_marginal_spec(design: &Array2<f64>) -> ParameterBlockSpec {
         initial_log_lambdas: Array1::<f64>::zeros(0),
         initial_beta: None,
         gauge_priority: 150,
-        eta_row_scaling: None,
         jacobian_callback: None,
     }
 }
@@ -167,19 +170,19 @@ fn logslope_jacobian_incorporates_sf_from_state_at_beta_zero() {
     );
 }
 
-/// The `eta_row_scaling` for the logslope block is s_f·z, not bare z.
-/// Verify that the flat single-output effective design (via the spec's
-/// `eta_row_scaling` fallback) has the correct s_f factor.
+/// The logslope spec's `RowScaledJacobian` uses s_f·z, not bare z.
+/// Verify that the flat single-output effective Jacobian (via `RowScaledJacobian`)
+/// has the correct s_f factor.
 #[test]
-fn logslope_eta_row_scaling_includes_sf() {
+fn logslope_row_scaled_jacobian_includes_sf() {
     let design = make_design(7);
     let z = make_z(7);
     let s_f = 0.82_f64;
 
     let spec = make_logslope_spec(&design, &z, s_f);
 
-    // The `effective_jacobian_at` via the callback (which takes precedence) returns
-    // the 3-output stacked Jacobian. Verify row 0 = s_f·z·design at β=0.
+    // The `RowScaledJacobian` callback returns the single-output (N×P) scaled design.
+    // Verify jac[i, j] == s_f * z[i] * design[i, j].
     let beta_zero = vec![0.0f64; P];
     let state = FamilyLinearizationState {
         beta: &beta_zero,
@@ -191,7 +194,9 @@ fn logslope_eta_row_scaling_includes_sf() {
         .effective_jacobian_at("test", &state)
         .expect("effective_jacobian_at must succeed");
 
-    // η0 rows (output 0): jac[i, j] == s_f * z[i] * design[i, j]
+    assert_eq!(jac.nrows(), N, "RowScaledJacobian must have N rows");
+    assert_eq!(jac.ncols(), P, "RowScaledJacobian must have P cols");
+
     for i in 0..N {
         for j in 0..P {
             let got = jac[[i, j]];
@@ -200,7 +205,7 @@ fn logslope_eta_row_scaling_includes_sf() {
             let denom = expected.abs().max(1e-14);
             assert!(
                 err / denom < 1e-10 || err < 1e-12,
-                "η0 row {i} col {j}: got {got:.6e} expected s_f*z*G = {expected:.6e}",
+                "row {i} col {j}: got {got:.6e} expected s_f*z*G = {expected:.6e}",
             );
         }
     }

@@ -1,4 +1,5 @@
 use super::*;
+use super::family::BernoulliMarginalSlopeFamily;
 
 /// Block-local psi derivative row: avoids allocating a full p-vector
 /// when the psi derivative lives in a single channel (marginal or logslope).
@@ -90,10 +91,10 @@ pub(super) fn primary_slices(slices: &BlockSlices) -> PrimarySlices {
 // is avoiding O(n * (p_m^2 + p_g^2)) dense accumulation into a full p*p target.
 
 pub(super) struct BernoulliBlockHessianAccumulator {
-    h_mm: Array2<f64>,
-    h_gg: Array2<f64>,
-    h_mg: Array2<f64>,
-    dense_correction: Option<Array2<f64>>,
+    pub(super) h_mm: Array2<f64>,
+    pub(super) h_gg: Array2<f64>,
+    pub(super) h_mg: Array2<f64>,
+    pub(super) dense_correction: Option<Array2<f64>>,
 }
 
 impl BernoulliBlockHessianAccumulator {
@@ -616,13 +617,13 @@ impl BernoulliBlockHessianAccumulator {
 /// for h/w cross-blocks.  Matvec is O(p_m^2 + p_g^2 + p_m*p_g) for the block part,
 /// plus O(p_total^2) only if h/w blocks exist (which is rare and tiny).
 pub(super) struct BernoulliBlockHessianOperator {
-    h_mm: Array2<f64>,
-    h_gg: Array2<f64>,
-    h_mg: Array2<f64>,
-    dense_correction: Option<Array2<f64>>,
-    marginal: std::ops::Range<usize>,
-    logslope: std::ops::Range<usize>,
-    total: usize,
+    pub(super) h_mm: Array2<f64>,
+    pub(super) h_gg: Array2<f64>,
+    pub(super) h_mg: Array2<f64>,
+    pub(super) dense_correction: Option<Array2<f64>>,
+    pub(super) marginal: std::ops::Range<usize>,
+    pub(super) logslope: std::ops::Range<usize>,
+    pub(super) total: usize,
 }
 
 impl HyperOperator for BernoulliBlockHessianOperator {
@@ -722,8 +723,8 @@ pub(super) struct CachedDenestedCellMoments {
 /// same β.
 #[derive(Clone)]
 pub(super) struct RowCellMomentsBundle {
-    max_degree: usize,
-    rows: Vec<Option<Vec<CachedDenestedCellMoments>>>,
+    pub(super) max_degree: usize,
+    pub(super) rows: Vec<Option<Vec<CachedDenestedCellMoments>>>,
 }
 
 impl RowCellMomentsBundle {
@@ -899,15 +900,15 @@ pub(super) const COEFF_SUPPORT_W: CoeffSupport = CoeffSupport {
 };
 
 pub(super) struct BernoulliExactNewtonAccumulator {
-    ll: f64,
-    grad_marginal: Array1<f64>,
-    grad_logslope: Array1<f64>,
-    hess_marginal: Array2<f64>,
-    hess_logslope: Array2<f64>,
-    grad_h: Option<Array1<f64>>,
-    grad_w: Option<Array1<f64>>,
-    hess_h: Option<Array2<f64>>,
-    hess_w: Option<Array2<f64>>,
+    pub(super) ll: f64,
+    pub(super) grad_marginal: Array1<f64>,
+    pub(super) grad_logslope: Array1<f64>,
+    pub(super) hess_marginal: Array2<f64>,
+    pub(super) hess_logslope: Array2<f64>,
+    pub(super) grad_h: Option<Array1<f64>>,
+    pub(super) grad_w: Option<Array1<f64>>,
+    pub(super) hess_h: Option<Array2<f64>>,
+    pub(super) hess_w: Option<Array2<f64>>,
 }
 
 impl BernoulliExactNewtonAccumulator {

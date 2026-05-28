@@ -3,7 +3,7 @@
 //! # Background
 //!
 //! When one of the two blocks in a cross-block cosine comparison carries
-//! `eta_row_scaling = Some(z)`, the effective Jacobian column is `z ⊙ φ`
+//! a `RowScaledJacobian` with scaling `z`, the effective Jacobian column is `z ⊙ φ`
 //! instead of `φ`.  The cross-block cosine between `φ` (unscaled block) and
 //! `z ⊙ φ` (scaled block) has a non-zero null mean under the null hypothesis
 //! (z and φ independent) when z is skewed.  Specifically:
@@ -36,7 +36,7 @@
 //! 5. **μ_3 estimator finite-sample correction**: verify that `compute_skewness_mu3`
 //!    produces the correct sign and rough magnitude for a known skewed distribution.
 
-use gam::families::custom_family::ParameterBlockSpec;
+use gam::families::custom_family::{ParameterBlockSpec, RowScaledJacobian};
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
 use gam::solver::identifiability_audit::{audit_identifiability, bias_shift_for_pair, compute_skewness_mu3};
 use ndarray::{Array1, Array2};
@@ -53,13 +53,18 @@ fn spec_from_dense(name: &str, design: Array2<f64>) -> ParameterBlockSpec {
         initial_log_lambdas: Array1::<f64>::zeros(0),
         initial_beta: None,
         gauge_priority: 100,
-        eta_row_scaling: None,
         jacobian_callback: None,
     }
 }
 
 fn spec_with_scaling(name: &str, design: Array2<f64>, z: Vec<f64>) -> ParameterBlockSpec {
     let n = design.nrows();
+    let eta_scaling: Arc<[f64]> = Arc::from(z.as_slice());
+    let jac: Arc<dyn gam::families::custom_family::BlockEffectiveJacobian> =
+        Arc::new(RowScaledJacobian {
+            design: Arc::new(design.clone()),
+            eta_scaling,
+        });
     ParameterBlockSpec {
         name: name.to_string(),
         design: DesignMatrix::Dense(DenseDesignMatrix::from(design)),
@@ -69,8 +74,7 @@ fn spec_with_scaling(name: &str, design: Array2<f64>, z: Vec<f64>) -> ParameterB
         initial_log_lambdas: Array1::<f64>::zeros(0),
         initial_beta: None,
         gauge_priority: 100,
-        eta_row_scaling: Some(Arc::from(z.as_slice())),
-        jacobian_callback: None,
+        jacobian_callback: Some(jac),
     }
 }
 
@@ -352,9 +356,9 @@ fn skewed_z_lognormal_cosine_at_null_mean_not_reported() {
 
     // Build the two blocks.
     // Block A: raw design = φ (hot rows 0..r), no row scaling.
-    // Block B: raw design = φ BUT with eta_row_scaling = z so the effective
-    //          column is z ⊙ φ.  The actual cosine between φ and z⊙φ will
-    //          be some value near `shift` (the null mean).
+    // Block B: raw design = φ BUT with a RowScaledJacobian using z so the
+    //          effective column is z ⊙ φ.  The actual cosine between φ and z⊙φ
+    //          will be some value near `shift` (the null mean).
     let mut design_phi = Array2::<f64>::zeros((n, 1));
     for i in 0..r {
         design_phi[[i, 0]] = 1.0 / (r as f64).sqrt();

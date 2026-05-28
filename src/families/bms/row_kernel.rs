@@ -8,9 +8,9 @@ use super::exact_eval_cache::*;
 // ── RowKernel<2> implementation (rigid path only) ────────────────────
 
 pub(super) struct BernoulliRigidRowKernel {
-    family: BernoulliMarginalSlopeFamily,
-    block_states: Vec<ParameterBlockState>,
-    slices: BlockSlices,
+    pub(super) family: BernoulliMarginalSlopeFamily,
+    pub(super) block_states: Vec<ParameterBlockState>,
+    pub(super) slices: BlockSlices,
     /// Per-row uncontracted third-derivative tensor, lazily populated in a
     /// single parallel pass on first access. Every ψ-axis directional
     /// derivative operator that consults this kernel shares this cache via
@@ -18,14 +18,14 @@ pub(super) struct BernoulliRigidRowKernel {
     /// runs at most once per row across the full ext-dim sweep, instead of
     /// once per (row, ψ-axis) pair. Per-axis `row_third_contracted` becomes
     /// a 2×2 bilinear contraction against the cached tensor.
-    third_full_cache: crate::resource::RayonSafeOnce<Vec<[[[f64; 2]; 2]; 2]>>,
+    pub(super) third_full_cache: crate::resource::RayonSafeOnce<Vec<[[[f64; 2]; 2]; 2]>>,
     /// Per-row uncontracted fourth-derivative tensor — the outer-Hessian
     /// analogue of `third_full_cache`. The second-directional-derivative
     /// operator's trace path touches every row × (u, v) pair; with this
     /// cache the heavy 8-direction empirical jet (or closed-form 5-component
     /// build) runs at most once per row, leaving each pair with a cheap
     /// [`contract_fourth_full`] bilinear.
-    fourth_full_cache: crate::resource::RayonSafeOnce<Vec<[[[[f64; 2]; 2]; 2]; 2]>>,
+    pub(super) fourth_full_cache: crate::resource::RayonSafeOnce<Vec<[[[[f64; 2]; 2]; 2]; 2]>>,
 }
 
 impl BernoulliRigidRowKernel {

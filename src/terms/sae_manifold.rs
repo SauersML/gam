@@ -2826,6 +2826,51 @@ impl SaeManifoldTerm {
                 "SaeManifoldTerm::run_joint_fit_arrow_schur: step_size must be finite and positive; got {step_size}"
             ));
         }
+        // ── Pre-fit identifiability audit ──────────────────────────────────
+        //
+        // Build one `ParameterBlockSpec` per decoder atom, each carrying a
+        // `SaeDecoderBlockJacobian` callback (n_outputs = p > 1).
+        // `canonicalize_for_identifiability` auto-detects the multi-output
+        // structure and routes through `audit_identifiability_channel_aware`,
+        // which operates on the `(n·p) × M_k·p` channel-weighted joint design.
+        //
+        // The channel-aware path correctly handles the SAE structure: two atoms
+        // may share similar basis evaluations on overlapping training rows (the
+        // normal mixture-model regime) without being aliased, because each atom
+        // contributes to the predictor through its own output-channel columns.
+        // The flat audit would incorrectly flag those as fatal hard-alias pairs.
+        //
+        // When `fatal = true` the audit has found structural aliasing that the
+        // Arrow-Schur Newton solver cannot resolve — a rank-deficient decoder
+        // block Hessian whose Cholesky will fail or produce garbage steps.
+        // We surface this as an immediate error rather than spending iterations
+        // on a singular inner system.
+        //
+        // Dropped columns (non-fatal) are logged as INFO so callers can see
+        // which atoms are near-aliased and consider merging them.
+        {
+            let specs = self.decoder_parameter_block_specs();
+            let audit =
+                crate::solver::identifiability_canonical::canonicalize_for_identifiability(
+                    &specs,
+                )
+                .map_err(|e| {
+                    format!("SaeManifoldTerm::run_joint_fit_arrow_schur: pre-fit identifiability audit: {e:?}")
+                })?;
+            if !audit.audit.dropped_columns.is_empty() {
+                log::info!(
+                    "[SAE-AUDIT] run_joint_fit_arrow_schur: {} dropped decoder column(s); summary: {}",
+                    audit.audit.dropped_columns.len(),
+                    audit.audit.summary,
+                );
+                for dc in &audit.audit.dropped_columns {
+                    log::info!(
+                        "[SAE-AUDIT]   dropped block='{}' col={}: {}",
+                        dc.block, dc.column, dc.reason,
+                    );
+                }
+            }
+        }
         for _ in 0..max_iter {
             self.advance_temperature_schedule()?;
             self.update_ard_reml(rho)?;
@@ -3048,7 +3093,6 @@ impl SaeManifoldTerm {
                 initial_log_lambdas: Array1::<f64>::zeros(0),
                 initial_beta: None,
                 gauge_priority: 100,
-                eta_row_scaling: None,
                 jacobian_callback: Some(cb),
             });
         }

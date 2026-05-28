@@ -1193,7 +1193,6 @@ impl TransformationNormalFamily {
             initial_log_lambdas: self.initial_log_lambdas.clone(),
             initial_beta: Some(self.initial_beta.clone()),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         }
     }

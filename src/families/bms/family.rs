@@ -80,9 +80,9 @@ pub(super) struct BernoulliMarginalSlopeFamily {
 
 #[derive(Clone)]
 pub(super) struct BernoulliInterceptPredictorWarmStart {
-    intercept: f64,
-    primary_point: Vec<f64>,
-    intercept_primary_deriv: Vec<f64>,
+    pub(super) intercept: f64,
+    pub(super) primary_point: Vec<f64>,
+    pub(super) intercept_primary_deriv: Vec<f64>,
 }
 
 /// Per-row warm-start cache for the scalar intercept root-finder.
@@ -105,9 +105,9 @@ pub(super) struct BernoulliInterceptPredictorWarmStart {
 /// torn read where another thread interleaved a tag bump between the value
 /// read and the second tag load.
 pub(super) struct BernoulliInterceptWarmStartCache {
-    intercept_value: Vec<AtomicU64>,
-    intercept_tag: Vec<AtomicU64>,
-    predictors: Vec<Mutex<Option<BernoulliInterceptPredictorWarmStart>>>,
+    pub(super) intercept_value: Vec<AtomicU64>,
+    pub(super) intercept_tag: Vec<AtomicU64>,
+    pub(super) predictors: Vec<Mutex<Option<BernoulliInterceptPredictorWarmStart>>>,
 }
 
 impl BernoulliInterceptWarmStartCache {

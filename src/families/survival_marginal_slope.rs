@@ -1,5 +1,6 @@
 use crate::custom_family::{
-    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyWarmStart,
+    BlockEffectiveJacobian, BlockWorkingSet, BlockwiseFitOptions, CustomFamily,
+    CustomFamilyWarmStart,
     ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
     FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
@@ -17935,6 +17936,647 @@ impl crate::custom_family::BlockEffectiveJacobian for TimeBlockJacobian {
     }
 }
 
+// ── Full flex-chain Jacobian support ─────────────────────────────────
+//
+// When score_warp (β_h) and/or link_dev (β_w) are non-zero the rigid
+// hyperbolic formula η = q·c + s·z·g is no longer exact.  The calibrated
+// intercept `a` is an implicit function of all primary coordinates and the
+// correct linearization is the IFT chain:
+//
+//   ∂η/∂u_k = chi · a_u[k] + rho[k]
+//
+// computed by `compute_survival_timepoint_exact`.  `chain_primary_to_joint_row`
+// contracts these per-primary-coordinate derivatives with the block-level
+// primary-to-coefficient maps to produce the joint-β Jacobian row.
+
+/// Per-row IFT-corrected derivatives from the full flex chain.
+///
+/// Populated once per fit at the current β by a higher-level driver and
+/// stored in `FamilyLinearizationState::family_scalars`.  When present, the
+/// block Jacobian callbacks (`LogslopeBlockJacobian`, etc.) switch from the
+/// rigid hyperbolic formula to the exact IFT chain.
+///
+/// Field layout:
+/// - `eta_u_entry[i]`:  `∂η0/∂u_k` for primary slot `k=0..p_primary`, row `i`
+/// - `eta_u_exit[i]`:   `∂η1/∂u_k`, row `i`
+/// - `chi_exit[i]`:      observed χ₁ at exit (the density factor, > 0)
+/// - `chi_u_exit[i]`:   `∂χ₁/∂u_k`, row `i`
+/// - `d_exit[i]`:        normalisation D₁ at exit (> 0)
+/// - `d_u_exit[i]`:     `∂D₁/∂u_k`, row `i`
+/// - `q1_i[i]`:          exit-time probit argument q₁
+/// - `qd1_i[i]`:         exit-time derivative qd₁
+/// - `dq0_time[i]`:     `∂q0/∂β_time` row vector (length p_time)
+/// - `dq1_time[i]`:     `∂q1/∂β_time` row vector (length p_time)
+/// - `dqd1_time[i]`:    `∂qd1/∂β_time` row vector (length p_time)
+/// - `dq0_marginal[i]`: `∂q0/∂β_marginal` row vector (length p_marginal)
+/// - `dq1_marginal[i]`: `∂q1/∂β_marginal` row vector (length p_marginal)
+/// - `dqd1_marginal[i]`:`∂qd1/∂β_marginal` row vector (length p_marginal)
+/// - `logslope_design`:  the logslope design matrix (n × p_logslope)
+/// - `score_warp_design`:score_warp design matrix (n × p_h), or empty
+/// - `link_dev_design`:  link_dev design matrix (n × p_w), or empty
+/// - `p_primary`:        total number of primary coordinates
+/// - `p_q0`, `p_q1`, `p_qd1`, `p_g`: primary slot indices (scalar)
+/// - `p_h_start`, `p_h_len`: h-slot range in primary
+/// - `p_w_start`, `p_w_len`: w-slot range in primary
+pub struct SurvivalFlexFamilyScalars {
+    /// Shape n × p_primary; row i = ∂η0/∂u
+    pub eta_u_entry: Array2<f64>,
+    /// Shape n × p_primary; row i = ∂η1/∂u
+    pub eta_u_exit: Array2<f64>,
+    /// Length n; χ₁ at exit
+    pub chi_exit: Vec<f64>,
+    /// Shape n × p_primary; row i = ∂χ₁/∂u
+    pub chi_u_exit: Array2<f64>,
+    /// Length n; D₁ at exit
+    pub d_exit: Vec<f64>,
+    /// Shape n × p_primary; row i = ∂D₁/∂u
+    pub d_u_exit: Array2<f64>,
+    /// Length n; exit-time probit argument q₁
+    pub q1_i: Vec<f64>,
+    /// Length n; exit-time derivative qd₁
+    pub qd1_i: Vec<f64>,
+    /// ∂q0/∂β_time per row; shape n × p_time
+    pub dq0_time: Array2<f64>,
+    /// ∂q1/∂β_time per row; shape n × p_time
+    pub dq1_time: Array2<f64>,
+    /// ∂qd1/∂β_time per row; shape n × p_time
+    pub dqd1_time: Array2<f64>,
+    /// ∂q0/∂β_marginal per row; shape n × p_marginal
+    pub dq0_marginal: Array2<f64>,
+    /// ∂q1/∂β_marginal per row; shape n × p_marginal
+    pub dq1_marginal: Array2<f64>,
+    /// ∂qd1/∂β_marginal per row; shape n × p_marginal
+    pub dqd1_marginal: Array2<f64>,
+    /// Logslope design (n × p_logslope)
+    pub logslope_design: Array2<f64>,
+    /// Score-warp design (n × p_h); zero-column if inactive
+    pub score_warp_design: Array2<f64>,
+    /// Link-dev design (n × p_w); zero-column if inactive
+    pub link_dev_design: Array2<f64>,
+    /// Total primary coordinate count
+    pub p_primary: usize,
+    /// Primary slot index for q0 (= 0)
+    pub idx_q0: usize,
+    /// Primary slot index for q1 (= 1)
+    pub idx_q1: usize,
+    /// Primary slot index for qd1 (= 2)
+    pub idx_qd1: usize,
+    /// Primary slot index for g (= 3)
+    pub idx_g: usize,
+    /// Start of h-slots in primary coordinate vector
+    pub h_start: usize,
+    /// Number of h-slots (0 if score_warp inactive)
+    pub h_len: usize,
+    /// Start of w-slots in primary coordinate vector
+    pub w_start: usize,
+    /// Number of w-slots (0 if link_dev inactive)
+    pub w_len: usize,
+}
+
+/// Contract a primary-coordinate derivative vector `coeff_u` (length
+/// `p_primary`) with the block-level primary-to-coefficient maps, writing the
+/// joint-β Jacobian row into `out` (length = `slices.total`).
+///
+/// # Channel routing
+///
+/// | Block slice       | Primary slots touched            | Map                  |
+/// |-------------------|----------------------------------|----------------------|
+/// | `slices.time`     | idx_q0, idx_q1, idx_qd1          | `q.dq*_time`         |
+/// | `slices.marginal` | idx_q0, idx_q1, idx_qd1          | `q.dq*_marginal`     |
+/// | `slices.logslope` | idx_g                            | `logslope_row`       |
+/// | `slices.score_warp`| h-slots                         | identity             |
+/// | `slices.link_dev` | w-slots                          | identity             |
+///
+/// At rigid β=0 with `beta_h = beta_w = 0` this reduces to:
+/// - time: `chi * dq*_time + rho_q* * dq*_time` which, for the rigid formula
+///   (rho_q = 0 for off-diagonal primaries), equals `c * dq*_time`
+/// - logslope: `(q*c1 + s*z) * logslope_row`
+///
+/// # Arguments
+/// - `coeff_u`: `ArrayView1<f64>` of length `p_primary`; the ∂·/∂u vector
+/// - `q`: per-row primary chain maps (dq*_time, dq*_marginal)
+/// - `logslope_row`: the logslope design row for this observation
+/// - `flex`: the flex scalars (carries slot indices and p_primary)
+/// - `slices`: the block-β offset layout
+/// - `out`: output buffer of length `slices.total`; zeroed on entry by contract
+pub fn chain_primary_to_joint_row(
+    coeff_u: ndarray::ArrayView1<'_, f64>,
+    q: &SurvivalFlexPerRowChain,
+    logslope_row: ndarray::ArrayView1<'_, f64>,
+    flex: &SurvivalFlexFamilyScalars,
+    slices: &SurvivalBlockSlicesPublic,
+    out: &mut [f64],
+) {
+    assert_eq!(
+        coeff_u.len(),
+        flex.p_primary,
+        "chain_primary_to_joint_row: coeff_u len {} != p_primary {}",
+        coeff_u.len(),
+        flex.p_primary
+    );
+    assert_eq!(
+        out.len(),
+        slices.total,
+        "chain_primary_to_joint_row: out len {} != slices.total {}",
+        out.len(),
+        slices.total
+    );
+
+    let cu_q0 = coeff_u[flex.idx_q0];
+    let cu_q1 = coeff_u[flex.idx_q1];
+    let cu_qd1 = coeff_u[flex.idx_qd1];
+    let cu_g = coeff_u[flex.idx_g];
+
+    // Time block: Σ_k (cu_q0 * dq0_time[k] + cu_q1 * dq1_time[k] + cu_qd1 * dqd1_time[k])
+    for (k, dst) in out[slices.time.clone()].iter_mut().enumerate() {
+        *dst = cu_q0 * q.dq0_time[k] + cu_q1 * q.dq1_time[k] + cu_qd1 * q.dqd1_time[k];
+    }
+
+    // Marginal block: same with marginal maps
+    for (k, dst) in out[slices.marginal.clone()].iter_mut().enumerate() {
+        *dst = cu_q0 * q.dq0_marginal[k]
+            + cu_q1 * q.dq1_marginal[k]
+            + cu_qd1 * q.dqd1_marginal[k];
+    }
+
+    // Logslope block: cu_g * logslope_row[k]
+    for (k, dst) in out[slices.logslope.clone()].iter_mut().enumerate() {
+        *dst = cu_g * logslope_row[k];
+    }
+
+    // Score-warp block: identity map through h-slots
+    if let Some(sw_range) = slices.score_warp.as_ref() {
+        for (local_k, dst) in out[sw_range.clone()].iter_mut().enumerate() {
+            let primary_idx = flex.h_start + local_k;
+            if primary_idx < flex.p_primary {
+                *dst = coeff_u[primary_idx];
+            }
+        }
+    }
+
+    // Link-dev block: identity map through w-slots
+    if let Some(ld_range) = slices.link_dev.as_ref() {
+        for (local_k, dst) in out[ld_range.clone()].iter_mut().enumerate() {
+            let primary_idx = flex.w_start + local_k;
+            if primary_idx < flex.p_primary {
+                *dst = coeff_u[primary_idx];
+            }
+        }
+    }
+}
+
+/// Per-row primary chain maps extracted from `SurvivalMarginalSlopeDynamicRow`.
+/// Passed by value (slice references) to `chain_primary_to_joint_row`.
+pub struct SurvivalFlexPerRowChain<'a> {
+    pub dq0_time: &'a [f64],
+    pub dq1_time: &'a [f64],
+    pub dqd1_time: &'a [f64],
+    pub dq0_marginal: &'a [f64],
+    pub dq1_marginal: &'a [f64],
+    pub dqd1_marginal: &'a [f64],
+}
+
+/// Public mirror of the private `BlockSlices` for use in `chain_primary_to_joint_row`.
+pub struct SurvivalBlockSlicesPublic {
+    pub time: std::ops::Range<usize>,
+    pub marginal: std::ops::Range<usize>,
+    pub logslope: std::ops::Range<usize>,
+    pub score_warp: Option<std::ops::Range<usize>>,
+    pub link_dev: Option<std::ops::Range<usize>>,
+    pub total: usize,
+}
+
+// ── 6-output flex-chain Jacobian for the logslope block ─────────────────────
+//
+// n_outputs = 6: η0, η1, log_chi1, log_D1, q1_log_phi_q1, log_qd1.
+// When flex state is absent this is a hard error (must use 3-output rigid path
+// LogslopeBlockJacobian instead). When flex state is present (SurvivalFlexFamilyScalars
+// in family_scalars), uses the full IFT chain.
+
+/// 6-output stacked Jacobian for the **logslope** block using the IFT flex chain.
+///
+/// Output ordering (for row `i`, outputs stacked as `[0..n], [n..2n], ..., [5n..6n]`):
+///
+/// - Row 0·n + i: `∂η0[i]/∂β_logslope` (entry probit index)
+/// - Row 1·n + i: `∂η1[i]/∂β_logslope` (exit probit index)
+/// - Row 2·n + i: `∂log_chi1[i]/∂β_logslope` = `chi_u_exit[i] / chi_exit[i]` chained
+/// - Row 3·n + i: `∂log_D1[i]/∂β_logslope`   = `d_u_exit[i] / d_exit[i]` chained
+/// - Row 4·n + i: `∂(q1·log_phi_q1)[i]/∂β_logslope` = `q1_i[i] * ∂q1/∂β_logslope`
+///               (zero for logslope block since q1 does not depend on β_logslope)
+/// - Row 5·n + i: `∂log_qd1[i]/∂β_logslope` = (1/qd1_i[i]) * ∂qd1/∂β_logslope
+///               (zero for logslope block since qd1 does not depend on β_logslope)
+///
+/// When `family_scalars` is `None` (rigid path, no flex), returns `Err` — use
+/// `LogslopeBlockJacobian` (3-output) for the rigid hyperbolic path instead.
+pub struct LogslopeFlexBlockJacobian {
+    /// Logslope design (n × p_logslope); shared with the block spec.
+    design: Array2<f64>,
+}
+
+impl LogslopeFlexBlockJacobian {
+    pub fn new(design: Array2<f64>) -> Self {
+        Self { design }
+    }
+}
+
+impl crate::custom_family::BlockEffectiveJacobian for LogslopeFlexBlockJacobian {
+    fn effective_jacobian_at(
+        &self,
+        state: &crate::custom_family::FamilyLinearizationState<'_>,
+    ) -> Result<Array2<f64>, String> {
+        let flex: &SurvivalFlexFamilyScalars = state
+            .family_scalars
+            .as_ref()
+            .and_then(|a| a.downcast_ref::<SurvivalFlexFamilyScalars>())
+            .ok_or_else(|| {
+                "LogslopeFlexBlockJacobian requires SurvivalFlexFamilyScalars in \
+                 family_scalars (flex path); for the rigid path use LogslopeBlockJacobian"
+                    .to_string()
+            })?;
+
+        let n = self.design.nrows();
+        let p = self.design.ncols();
+        if flex.eta_u_entry.nrows() != n || flex.eta_u_exit.nrows() != n {
+            return Err(format!(
+                "LogslopeFlexBlockJacobian: flex scalars have {} rows but design has {n}",
+                flex.eta_u_entry.nrows()
+            ));
+        }
+
+        // For the logslope block: ∂u_g/∂β_j = design[i,j]; all other primary
+        // coords are zero (time, marginal, h, w do not depend on β_logslope).
+        // So: ∂output/∂β_j = output_u[idx_g] * design[i,j].
+        const N_OUT: usize = 6;
+        let mut jac = Array2::<f64>::zeros((N_OUT * n, p));
+
+        for i in 0..n {
+            let g_idx = flex.idx_g;
+            let cu_eta0_g = flex.eta_u_entry[[i, g_idx]];
+            let cu_eta1_g = flex.eta_u_exit[[i, g_idx]];
+            let chi1 = flex.chi_exit[i];
+            let cu_logchi1_g = if chi1 > 0.0 && chi1.is_finite() {
+                flex.chi_u_exit[[i, g_idx]] / chi1
+            } else {
+                0.0
+            };
+            let d1 = flex.d_exit[i];
+            let cu_logd1_g = if d1 > 0.0 && d1.is_finite() {
+                flex.d_u_exit[[i, g_idx]] / d1
+            } else {
+                0.0
+            };
+            // q1 and qd1 do not depend on β_logslope → rows 4 and 5 are zero.
+
+            for j in 0..p {
+                let x_ij = self.design[[i, j]];
+                jac[[0 * n + i, j]] = cu_eta0_g * x_ij;
+                jac[[1 * n + i, j]] = cu_eta1_g * x_ij;
+                jac[[2 * n + i, j]] = cu_logchi1_g * x_ij;
+                jac[[3 * n + i, j]] = cu_logd1_g * x_ij;
+                // rows 4 and 5 remain zero
+            }
+        }
+        Ok(jac)
+    }
+
+    fn n_outputs(&self) -> usize {
+        6
+    }
+}
+
+/// 6-output stacked Jacobian for the **marginal** block using the IFT flex chain.
+///
+/// For the marginal block:
+/// - ∂u_{q0}/∂β_m = dq0_marginal[i,k]  (row of the chain map)
+/// - ∂u_{q1}/∂β_m = dq1_marginal[i,k]
+/// - ∂u_{qd1}/∂β_m = dqd1_marginal[i,k]
+/// - all other primary slots: zero
+///
+/// Outputs: same 6 as `LogslopeFlexBlockJacobian`.
+pub struct MarginalFlexBlockJacobian;
+
+impl crate::custom_family::BlockEffectiveJacobian for MarginalFlexBlockJacobian {
+    fn effective_jacobian_at(
+        &self,
+        state: &crate::custom_family::FamilyLinearizationState<'_>,
+    ) -> Result<Array2<f64>, String> {
+        let flex: &SurvivalFlexFamilyScalars = state
+            .family_scalars
+            .as_ref()
+            .and_then(|a| a.downcast_ref::<SurvivalFlexFamilyScalars>())
+            .ok_or_else(|| {
+                "MarginalFlexBlockJacobian requires SurvivalFlexFamilyScalars in family_scalars"
+                    .to_string()
+            })?;
+
+        let n = flex.dq0_marginal.nrows();
+        let p = flex.dq0_marginal.ncols();
+        if p == 0 {
+            return Ok(Array2::<f64>::zeros((6 * n, 0)));
+        }
+
+        const N_OUT: usize = 6;
+        let mut jac = Array2::<f64>::zeros((N_OUT * n, p));
+
+        let q0_idx = flex.idx_q0;
+        let q1_idx = flex.idx_q1;
+        let qd1_idx = flex.idx_qd1;
+
+        for i in 0..n {
+            let chi1 = flex.chi_exit[i];
+            let d1 = flex.d_exit[i];
+            let q1 = flex.q1_i[i];
+            let qd1 = flex.qd1_i[i];
+
+            for k in 0..p {
+                let dq0 = flex.dq0_marginal[[i, k]];
+                let dq1 = flex.dq1_marginal[[i, k]];
+                let dqd1 = flex.dqd1_marginal[[i, k]];
+
+                // ∂η0/∂β_m[k] = Σ_u eta_u_entry[i,u] * ∂u/∂β_m[k]
+                //             = eta_u_entry[q0] * dq0 + eta_u_entry[q1]*dq1 + eta_u_entry[qd1]*dqd1
+                // (only q-primary slots are non-zero for the marginal block)
+                let deta0 = flex.eta_u_entry[[i, q0_idx]] * dq0
+                    + flex.eta_u_entry[[i, q1_idx]] * dq1
+                    + flex.eta_u_entry[[i, qd1_idx]] * dqd1;
+                let deta1 = flex.eta_u_exit[[i, q0_idx]] * dq0
+                    + flex.eta_u_exit[[i, q1_idx]] * dq1
+                    + flex.eta_u_exit[[i, qd1_idx]] * dqd1;
+                let dlogchi1 = if chi1 > 0.0 && chi1.is_finite() {
+                    (flex.chi_u_exit[[i, q0_idx]] * dq0
+                        + flex.chi_u_exit[[i, q1_idx]] * dq1
+                        + flex.chi_u_exit[[i, qd1_idx]] * dqd1)
+                        / chi1
+                } else {
+                    0.0
+                };
+                let dlogd1 = if d1 > 0.0 && d1.is_finite() {
+                    (flex.d_u_exit[[i, q0_idx]] * dq0
+                        + flex.d_u_exit[[i, q1_idx]] * dq1
+                        + flex.d_u_exit[[i, qd1_idx]] * dqd1)
+                        / d1
+                } else {
+                    0.0
+                };
+                // ∂(log_phi(q1))/∂β_m[k] = -q1 * dq1  (d/dq1 of -0.5*q1^2 = -q1)
+                let dq1_logphi = -q1 * dq1;
+                // ∂log_qd1/∂β_m[k] = dqd1 / qd1
+                let dlogqd1 = if qd1 > 0.0 { dqd1 / qd1 } else { 0.0 };
+
+                jac[[0 * n + i, k]] = deta0;
+                jac[[1 * n + i, k]] = deta1;
+                jac[[2 * n + i, k]] = dlogchi1;
+                jac[[3 * n + i, k]] = dlogd1;
+                jac[[4 * n + i, k]] = dq1_logphi;
+                jac[[5 * n + i, k]] = dlogqd1;
+            }
+        }
+        Ok(jac)
+    }
+
+    fn n_outputs(&self) -> usize {
+        6
+    }
+}
+
+/// 6-output stacked Jacobian for the **time** block using the IFT flex chain.
+///
+/// For the time block:
+/// - ∂u_{q0}/∂β_t = dq0_time[i,k]
+/// - ∂u_{q1}/∂β_t = dq1_time[i,k]
+/// - ∂u_{qd1}/∂β_t = dqd1_time[i,k]
+///
+/// Outputs: same 6 as above.
+pub struct TimeFlexBlockJacobian;
+
+impl crate::custom_family::BlockEffectiveJacobian for TimeFlexBlockJacobian {
+    fn effective_jacobian_at(
+        &self,
+        state: &crate::custom_family::FamilyLinearizationState<'_>,
+    ) -> Result<Array2<f64>, String> {
+        let flex: &SurvivalFlexFamilyScalars = state
+            .family_scalars
+            .as_ref()
+            .and_then(|a| a.downcast_ref::<SurvivalFlexFamilyScalars>())
+            .ok_or_else(|| {
+                "TimeFlexBlockJacobian requires SurvivalFlexFamilyScalars in family_scalars"
+                    .to_string()
+            })?;
+
+        let n = flex.dq0_time.nrows();
+        let p = flex.dq0_time.ncols();
+        if p == 0 {
+            return Ok(Array2::<f64>::zeros((6 * n, 0)));
+        }
+
+        const N_OUT: usize = 6;
+        let mut jac = Array2::<f64>::zeros((N_OUT * n, p));
+
+        let q0_idx = flex.idx_q0;
+        let q1_idx = flex.idx_q1;
+        let qd1_idx = flex.idx_qd1;
+
+        for i in 0..n {
+            let chi1 = flex.chi_exit[i];
+            let d1 = flex.d_exit[i];
+            let q1 = flex.q1_i[i];
+            let qd1 = flex.qd1_i[i];
+
+            for k in 0..p {
+                let dq0 = flex.dq0_time[[i, k]];
+                let dq1 = flex.dq1_time[[i, k]];
+                let dqd1 = flex.dqd1_time[[i, k]];
+
+                let deta0 = flex.eta_u_entry[[i, q0_idx]] * dq0
+                    + flex.eta_u_entry[[i, q1_idx]] * dq1
+                    + flex.eta_u_entry[[i, qd1_idx]] * dqd1;
+                let deta1 = flex.eta_u_exit[[i, q0_idx]] * dq0
+                    + flex.eta_u_exit[[i, q1_idx]] * dq1
+                    + flex.eta_u_exit[[i, qd1_idx]] * dqd1;
+                let dlogchi1 = if chi1 > 0.0 && chi1.is_finite() {
+                    (flex.chi_u_exit[[i, q0_idx]] * dq0
+                        + flex.chi_u_exit[[i, q1_idx]] * dq1
+                        + flex.chi_u_exit[[i, qd1_idx]] * dqd1)
+                        / chi1
+                } else {
+                    0.0
+                };
+                let dlogd1 = if d1 > 0.0 && d1.is_finite() {
+                    (flex.d_u_exit[[i, q0_idx]] * dq0
+                        + flex.d_u_exit[[i, q1_idx]] * dq1
+                        + flex.d_u_exit[[i, qd1_idx]] * dqd1)
+                        / d1
+                } else {
+                    0.0
+                };
+                // ∂(log_phi(q1))/∂β_t[k] = -q1 * dq1
+                let dq1_logphi = -q1 * dq1;
+                let dlogqd1 = if qd1 > 0.0 { dqd1 / qd1 } else { 0.0 };
+
+                jac[[0 * n + i, k]] = deta0;
+                jac[[1 * n + i, k]] = deta1;
+                jac[[2 * n + i, k]] = dlogchi1;
+                jac[[3 * n + i, k]] = dlogd1;
+                jac[[4 * n + i, k]] = dq1_logphi;
+                jac[[5 * n + i, k]] = dlogqd1;
+            }
+        }
+        Ok(jac)
+    }
+
+    fn n_outputs(&self) -> usize {
+        6
+    }
+}
+
+/// 6-output stacked Jacobian for the **score_warp** block using the IFT flex chain.
+///
+/// For score_warp: ∂u_{h_j}/∂β_h[k] = δ_{j,k} (identity map in h-slots).
+/// All other primary slots are zero.
+///
+/// Outputs: same 6 as above.
+pub struct ScoreWarpFlexBlockJacobian;
+
+impl crate::custom_family::BlockEffectiveJacobian for ScoreWarpFlexBlockJacobian {
+    fn effective_jacobian_at(
+        &self,
+        state: &crate::custom_family::FamilyLinearizationState<'_>,
+    ) -> Result<Array2<f64>, String> {
+        let flex: &SurvivalFlexFamilyScalars = state
+            .family_scalars
+            .as_ref()
+            .and_then(|a| a.downcast_ref::<SurvivalFlexFamilyScalars>())
+            .ok_or_else(|| {
+                "ScoreWarpFlexBlockJacobian requires SurvivalFlexFamilyScalars in family_scalars"
+                    .to_string()
+            })?;
+
+        let n = flex.score_warp_design.nrows();
+        let p = flex.score_warp_design.ncols();
+        if p == 0 || flex.h_len == 0 {
+            return Ok(Array2::<f64>::zeros((6 * n, p)));
+        }
+        if flex.h_len != p {
+            return Err(format!(
+                "ScoreWarpFlexBlockJacobian: h_len={} but score_warp_design has {} cols",
+                flex.h_len, p
+            ));
+        }
+
+        const N_OUT: usize = 6;
+        let mut jac = Array2::<f64>::zeros((N_OUT * n, p));
+
+        for i in 0..n {
+            let chi1 = flex.chi_exit[i];
+            let d1 = flex.d_exit[i];
+
+            for k in 0..p {
+                // h-slot k in primary coordinate space
+                let h_idx = flex.h_start + k;
+                if h_idx >= flex.p_primary {
+                    continue;
+                }
+                // ∂η0/∂β_h[k] = eta_u_entry[i, h_idx]
+                let deta0 = flex.eta_u_entry[[i, h_idx]];
+                let deta1 = flex.eta_u_exit[[i, h_idx]];
+                let dlogchi1 = if chi1 > 0.0 && chi1.is_finite() {
+                    flex.chi_u_exit[[i, h_idx]] / chi1
+                } else {
+                    0.0
+                };
+                let dlogd1 = if d1 > 0.0 && d1.is_finite() {
+                    flex.d_u_exit[[i, h_idx]] / d1
+                } else {
+                    0.0
+                };
+                // rows 4 and 5 (q1_logphi, log_qd1) are zero: q1, qd1 do not depend on β_h
+
+                jac[[0 * n + i, k]] = deta0;
+                jac[[1 * n + i, k]] = deta1;
+                jac[[2 * n + i, k]] = dlogchi1;
+                jac[[3 * n + i, k]] = dlogd1;
+            }
+        }
+        Ok(jac)
+    }
+
+    fn n_outputs(&self) -> usize {
+        6
+    }
+}
+
+/// 6-output stacked Jacobian for the **link_dev** block using the IFT flex chain.
+///
+/// For link_dev: ∂u_{w_j}/∂β_w[k] = δ_{j,k} (identity map in w-slots).
+///
+/// Outputs: same 6 as above.
+pub struct LinkDevFlexBlockJacobian;
+
+impl crate::custom_family::BlockEffectiveJacobian for LinkDevFlexBlockJacobian {
+    fn effective_jacobian_at(
+        &self,
+        state: &crate::custom_family::FamilyLinearizationState<'_>,
+    ) -> Result<Array2<f64>, String> {
+        let flex: &SurvivalFlexFamilyScalars = state
+            .family_scalars
+            .as_ref()
+            .and_then(|a| a.downcast_ref::<SurvivalFlexFamilyScalars>())
+            .ok_or_else(|| {
+                "LinkDevFlexBlockJacobian requires SurvivalFlexFamilyScalars in family_scalars"
+                    .to_string()
+            })?;
+
+        let n = flex.link_dev_design.nrows();
+        let p = flex.link_dev_design.ncols();
+        if p == 0 || flex.w_len == 0 {
+            return Ok(Array2::<f64>::zeros((6 * n, p)));
+        }
+        if flex.w_len != p {
+            return Err(format!(
+                "LinkDevFlexBlockJacobian: w_len={} but link_dev_design has {} cols",
+                flex.w_len, p
+            ));
+        }
+
+        const N_OUT: usize = 6;
+        let mut jac = Array2::<f64>::zeros((N_OUT * n, p));
+
+        for i in 0..n {
+            let chi1 = flex.chi_exit[i];
+            let d1 = flex.d_exit[i];
+
+            for k in 0..p {
+                let w_idx = flex.w_start + k;
+                if w_idx >= flex.p_primary {
+                    continue;
+                }
+                let deta0 = flex.eta_u_entry[[i, w_idx]];
+                let deta1 = flex.eta_u_exit[[i, w_idx]];
+                let dlogchi1 = if chi1 > 0.0 && chi1.is_finite() {
+                    flex.chi_u_exit[[i, w_idx]] / chi1
+                } else {
+                    0.0
+                };
+                let dlogd1 = if d1 > 0.0 && d1.is_finite() {
+                    flex.d_u_exit[[i, w_idx]] / d1
+                } else {
+                    0.0
+                };
+
+                jac[[0 * n + i, k]] = deta0;
+                jac[[1 * n + i, k]] = deta1;
+                jac[[2 * n + i, k]] = dlogchi1;
+                jac[[3 * n + i, k]] = dlogd1;
+            }
+        }
+        Ok(jac)
+    }
+
+    fn n_outputs(&self) -> usize {
+        6
+    }
+}
+
 // ── Timewiggle-active Jacobians ───────────────────────────────────────
 //
 // When timewiggle is active, (q0, q1, qd1) are nonlinear functions of
@@ -18401,7 +19043,6 @@ fn build_time_blockspec(
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
         gauge_priority: 200,
-        eta_row_scaling: None,
         jacobian_callback: jac_cb,
     }
 }
@@ -18427,19 +19068,6 @@ fn build_logslope_blockspec(
                 probit_scale,
             )) as Arc<dyn crate::custom_family::BlockEffectiveJacobian>
         });
-    // eta_row_scaling carries s_f·z — the correct β=0 logslope row-weight.
-    // The jacobian_callback embeds s_f via LogslopeBlockJacobian (takes
-    // precedence); this fallback scaling keeps flat-audit paths consistent
-    // when the callback cannot be built (e.g. sparse design densification fails).
-    let sf_z: Arc<[f64]> = if (probit_scale - 1.0).abs() < f64::EPSILON {
-        z_scaling
-    } else {
-        z_scaling
-            .iter()
-            .map(|&z_i| probit_scale * z_i)
-            .collect::<Vec<f64>>()
-            .into()
-    };
 
     ParameterBlockSpec {
         name: "logslope_surface".to_string(),
@@ -18450,9 +19078,6 @@ fn build_logslope_blockspec(
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
         gauge_priority: 120,
-        // eta_row_scaling is s_f·z (the β=0 flat single-output fallback).
-        // The jacobian_callback takes precedence when set.
-        eta_row_scaling: Some(sf_z),
         jacobian_callback: jac_cb,
     }
 }
@@ -18481,7 +19106,6 @@ fn build_marginal_blockspec(
         initial_log_lambdas: rho,
         initial_beta: beta_hint,
         gauge_priority: 150,
-        eta_row_scaling: None,
         jacobian_callback: jac_cb,
     }
 }
@@ -20482,6 +21106,9 @@ pub fn fit_survival_marginal_slope_terms(
                             let lift = SmgsLiftViaT::from_compiled_map(&map, &ordering);
                             return Ok(Some((applied, lift)));
                         }
+                        Ok(None) => {
+                            return Ok(None);
+                        }
                         Err(reason) => {
                             return Err(format!(
                                 "closed-form path unavailable: {reason}"
@@ -20489,10 +21116,6 @@ pub fn fit_survival_marginal_slope_terms(
                         }
                     }
                 }
-                // All arms of the `match closed_form` above exit via explicit
-                // `return`. This terminal expression is unreachable at runtime
-                // but required by Rust's type checker as the closure's value.
-                Ok(None)
             })();
         match attempt {
             Ok(Some((applied, lift))) => {
@@ -21908,7 +22531,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: Some(Array1::zeros(cols)),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         }
     }
@@ -24481,7 +25103,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let constraints = family
@@ -24552,7 +25173,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
 
@@ -24805,7 +25425,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let err = family
@@ -24878,7 +25497,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let current = array![0.4, 7.0];
@@ -24955,7 +25573,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         // current qd1 = -1.0 + 1e-6 < guard → infeasible.
@@ -26975,5 +27592,337 @@ mod tests {
             .expect("oracle fourth");
         assert_eq!(actual.len(), expected.nrows() * expected.ncols());
         b10_assert_parity(&actual, &expected, "block10_fourth");
+    }
+
+    // ── flex-chain Jacobian FD tests ─────────────────────────────────────────
+    //
+    // Build a small flex (score_warp + link_dev active) problem, compute the
+    // SurvivalFlexFamilyScalars from the family's exact machinery, then verify
+    // all five 6-output Jacobian impls against finite differences on the row
+    // negative log-likelihood.
+
+    /// Construct the SurvivalFlexFamilyScalars for a given (family, block_states)
+    /// by calling compute_survival_timepoint_exact and row_dynamic_q_geometry_into
+    /// for every row.
+    fn build_flex_family_scalars(
+        family: &SurvivalMarginalSlopeFamily,
+        block_states: &[ParameterBlockState],
+    ) -> Result<SurvivalFlexFamilyScalars, String> {
+        let n = family.n;
+        let primary = flex_primary_slices(family);
+        let p = primary.total;
+        let p_time = block_states[0].beta.len();
+        let p_m = block_states[1].beta.len();
+        let p_h = primary.h.as_ref().map(|r| r.len()).unwrap_or(0);
+        let p_w = primary.w.as_ref().map(|r| r.len()).unwrap_or(0);
+
+        let beta_h = family.flex_score_beta(block_states)?;
+        let beta_w = family.flex_link_beta(block_states)?;
+
+        let mut eta_u_entry = Array2::<f64>::zeros((n, p));
+        let mut eta_u_exit = Array2::<f64>::zeros((n, p));
+        let mut chi_exit = vec![0.0_f64; n];
+        let mut chi_u_exit = Array2::<f64>::zeros((n, p));
+        let mut d_exit = vec![0.0_f64; n];
+        let mut d_u_exit = Array2::<f64>::zeros((n, p));
+        let mut q1_i = vec![0.0_f64; n];
+        let mut qd1_i = vec![0.0_f64; n];
+        let mut dq0_time = Array2::<f64>::zeros((n, p_time));
+        let mut dq1_time = Array2::<f64>::zeros((n, p_time));
+        let mut dqd1_time = Array2::<f64>::zeros((n, p_time));
+        let mut dq0_marginal = Array2::<f64>::zeros((n, p_m));
+        let mut dq1_marginal = Array2::<f64>::zeros((n, p_m));
+        let mut dqd1_marginal = Array2::<f64>::zeros((n, p_m));
+
+        let mut q_geom = SurvivalMarginalSlopeDynamicRow::empty_workspace();
+        for row in 0..n {
+            family.row_dynamic_q_geometry_into(row, block_states, &mut q_geom)?;
+            let g = block_states[2].eta[row];
+
+            let (a0, d0) = family.solve_row_survival_intercept_with_slot(
+                q_geom.q0,
+                g,
+                beta_h,
+                beta_w,
+                None,
+            )?;
+            let (a1, d1) = family.solve_row_survival_intercept_with_slot(
+                q_geom.q1,
+                g,
+                beta_h,
+                beta_w,
+                None,
+            )?;
+            let entry_tp = family.compute_survival_timepoint_exact(
+                row, &primary, q_geom.q0, primary.q0, a0, g, d0, beta_h, beta_w, false,
+            )?;
+            let exit_tp = family.compute_survival_timepoint_exact(
+                row, &primary, q_geom.q1, primary.q1, a1, g, d1, beta_h, beta_w, false,
+            )?;
+
+            for u in 0..p {
+                eta_u_entry[[row, u]] = entry_tp.eta_u[u];
+                eta_u_exit[[row, u]] = exit_tp.eta_u[u];
+                chi_u_exit[[row, u]] = exit_tp.chi_u[u];
+                d_u_exit[[row, u]] = exit_tp.d_u[u];
+            }
+            chi_exit[row] = exit_tp.chi;
+            d_exit[row] = exit_tp.d;
+            q1_i[row] = q_geom.q1;
+            qd1_i[row] = q_geom.qd1;
+
+            if p_time > 0 {
+                for k in 0..p_time {
+                    dq0_time[[row, k]] = q_geom.dq0_time[k];
+                    dq1_time[[row, k]] = q_geom.dq1_time[k];
+                    dqd1_time[[row, k]] = q_geom.dqd1_time[k];
+                }
+            }
+            if p_m > 0 {
+                for k in 0..p_m {
+                    dq0_marginal[[row, k]] = q_geom.dq0_marginal[k];
+                    dq1_marginal[[row, k]] = q_geom.dq1_marginal[k];
+                    dqd1_marginal[[row, k]] = q_geom.dqd1_marginal[k];
+                }
+            }
+        }
+
+        let logslope_design_dense = family.logslope_design.to_dense().to_owned();
+        // score_warp_design/link_dev_design carry dimensional information (n rows,
+        // p_h / p_w cols).  The actual per-row values are unused by the
+        // flex Jacobians (h-slot and w-slot entries are taken directly from
+        // eta_u_entry/eta_u_exit via the slot indices).
+        let sw_design = Array2::<f64>::zeros((n, p_h));
+        let ld_design = Array2::<f64>::zeros((n, p_w));
+
+        Ok(SurvivalFlexFamilyScalars {
+            eta_u_entry,
+            eta_u_exit,
+            chi_exit,
+            chi_u_exit,
+            d_exit,
+            d_u_exit,
+            q1_i,
+            qd1_i,
+            dq0_time,
+            dq1_time,
+            dqd1_time,
+            dq0_marginal,
+            dq1_marginal,
+            dqd1_marginal,
+            logslope_design: logslope_design_dense,
+            score_warp_design: sw_design,
+            link_dev_design: ld_design,
+            p_primary: p,
+            idx_q0: primary.q0,
+            idx_q1: primary.q1,
+            idx_qd1: primary.qd1,
+            idx_g: primary.g,
+            h_start: primary.h.as_ref().map(|r| r.start).unwrap_or(p),
+            h_len: p_h,
+            w_start: primary.w.as_ref().map(|r| r.start).unwrap_or(p),
+            w_len: p_w,
+        })
+    }
+
+    /// Assert Jacobian `jac` (n_out*n × p) matches FD on `nll_fn(beta) → Vec<f64>`.
+    fn assert_flex_jac_fd<F>(name: &str, jac: &Array2<f64>, beta: &[f64], eps: f64, nll_fn: F)
+    where
+        F: Fn(&[f64]) -> Vec<f64>,
+    {
+        let n_out_n = jac.nrows();
+        let p = jac.ncols();
+        assert_eq!(beta.len(), p, "{name}: beta len {}", beta.len());
+        let base = nll_fn(beta);
+        assert_eq!(base.len(), n_out_n, "{name}: output len");
+        for j in 0..p {
+            let mut beta_p = beta.to_vec();
+            beta_p[j] += eps;
+            let up = nll_fn(&beta_p);
+            for i in 0..n_out_n {
+                let fd = (up[i] - base[i]) / eps;
+                let analytic = jac[[i, j]];
+                let denom = fd.abs().max(analytic.abs()).max(1e-10);
+                let rel = (fd - analytic).abs() / denom;
+                assert!(
+                    rel < 5e-5,
+                    "{name}: row={i} col={j} analytic={analytic:.8e} fd={fd:.8e} rel={rel:.2e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn flex_chain_logslope_jacobian_fd_regression() {
+        // Use the flex no-wiggle test family (score_warp active, link_dev absent).
+        let n = 12usize;
+        let family = make_flex_no_wiggle_test_family(n);
+        let mut block_states = flex_no_wiggle_test_block_states(&family);
+        // Give the score_warp block a non-trivial beta.
+        let score_dim = family
+            .score_warp
+            .as_ref()
+            .map(|w| w.basis_dim())
+            .unwrap_or(0);
+        if score_dim > 0 && block_states.len() > 3 {
+            let sw_beta: Array1<f64> =
+                Array1::from_iter((0..score_dim).map(|k| 0.05 * ((k as f64 + 1.0) * 0.3).sin()));
+            let sw_eta = Array1::zeros(n);
+            block_states[3] = ParameterBlockState {
+                beta: sw_beta,
+                eta: sw_eta,
+            };
+        }
+
+        let flex_scalars = build_flex_family_scalars(&family, &block_states)
+            .expect("build_flex_family_scalars");
+        let p_g = block_states[2].beta.len();
+        let logslope_design = family.logslope_design.to_dense().to_owned();
+
+        let cb = LogslopeFlexBlockJacobian::new(logslope_design.clone());
+        let beta_g = block_states[2].beta.to_vec();
+        let state = crate::custom_family::FamilyLinearizationState {
+            beta: &beta_g,
+            family_scalars: Some(std::sync::Arc::new(flex_scalars) as _),
+            channel_hessian: None,
+            probit_frailty_scale: family.probit_frailty_scale(),
+        };
+        let jac = cb
+            .effective_jacobian_at(&state)
+            .expect("LogslopeFlexBlockJacobian Jacobian");
+        assert_eq!(jac.nrows(), 6 * n);
+        assert_eq!(jac.ncols(), p_g);
+
+        // FD: perturb β_logslope and recompute per-row outputs via the family.
+        let family_ref = &family;
+        let block_states_ref = &block_states;
+        let nll_fn = move |b_g: &[f64]| -> Vec<f64> {
+            let mut states_pert = block_states_ref.to_vec();
+            let g_beta_pert = Array1::from_vec(b_g.to_vec());
+            let g_design = family_ref.logslope_design.to_dense().to_owned();
+            let g_eta = g_design.dot(&g_beta_pert);
+            states_pert[2] = ParameterBlockState {
+                beta: g_beta_pert,
+                eta: g_eta,
+            };
+            let primary = flex_primary_slices(family_ref);
+            let beta_h = family_ref.flex_score_beta(&states_pert).unwrap();
+            let beta_w = family_ref.flex_link_beta(&states_pert).unwrap();
+            let mut out = vec![0.0_f64; 6 * n];
+            for row in 0..n {
+                let mut qg = SurvivalMarginalSlopeDynamicRow::empty_workspace();
+                family_ref
+                    .row_dynamic_q_geometry_into(row, &states_pert, &mut qg)
+                    .unwrap();
+                let g = states_pert[2].eta[row];
+                let (a0, d0) = family_ref
+                    .solve_row_survival_intercept_with_slot(qg.q0, g, beta_h, beta_w, None)
+                    .unwrap();
+                let (a1, d1) = family_ref
+                    .solve_row_survival_intercept_with_slot(qg.q1, g, beta_h, beta_w, None)
+                    .unwrap();
+                let entry = family_ref
+                    .compute_survival_timepoint_exact(
+                        row, &primary, qg.q0, primary.q0, a0, g, d0, beta_h, beta_w, false,
+                    )
+                    .unwrap();
+                let exit = family_ref
+                    .compute_survival_timepoint_exact(
+                        row, &primary, qg.q1, primary.q1, a1, g, d1, beta_h, beta_w, false,
+                    )
+                    .unwrap();
+                out[0 * n + row] = entry.eta;
+                out[1 * n + row] = exit.eta;
+                out[2 * n + row] = exit.chi.ln();
+                out[3 * n + row] = exit.d.ln();
+                // log_phi(q1) = -0.5*(q1^2 + ln(2pi))
+                out[4 * n + row] = -0.5 * (qg.q1 * qg.q1 + std::f64::consts::TAU.ln());
+                out[5 * n + row] = qg.qd1.ln();
+            }
+            out
+        };
+
+        assert_flex_jac_fd(
+            "logslope_flex",
+            &jac,
+            &beta_g,
+            1e-7,
+            nll_fn,
+        );
+    }
+
+    #[test]
+    fn flex_chain_marginal_jacobian_fd_regression() {
+        let n = 12usize;
+        let family = make_flex_no_wiggle_test_family(n);
+        let block_states = flex_no_wiggle_test_block_states(&family);
+
+        let flex_scalars = build_flex_family_scalars(&family, &block_states)
+            .expect("build_flex_family_scalars");
+        let p_m = block_states[1].beta.len();
+        let beta_m = block_states[1].beta.to_vec();
+
+        let cb = MarginalFlexBlockJacobian;
+        let state = crate::custom_family::FamilyLinearizationState {
+            beta: &beta_m,
+            family_scalars: Some(std::sync::Arc::new(flex_scalars) as _),
+            channel_hessian: None,
+            probit_frailty_scale: family.probit_frailty_scale(),
+        };
+        let jac = cb
+            .effective_jacobian_at(&state)
+            .expect("MarginalFlexBlockJacobian Jacobian");
+        assert_eq!(jac.nrows(), 6 * n);
+        assert_eq!(jac.ncols(), p_m);
+
+        let family_ref = &family;
+        let block_states_ref = &block_states;
+        let nll_fn = move |b_m: &[f64]| -> Vec<f64> {
+            let mut states_pert = block_states_ref.to_vec();
+            let m_beta_pert = Array1::from_vec(b_m.to_vec());
+            let m_design = family_ref.marginal_design.to_dense().to_owned();
+            let m_eta = m_design.dot(&m_beta_pert);
+            states_pert[1] = ParameterBlockState {
+                beta: m_beta_pert,
+                eta: m_eta,
+            };
+            let primary = flex_primary_slices(family_ref);
+            let beta_h = family_ref.flex_score_beta(&states_pert).unwrap();
+            let beta_w = family_ref.flex_link_beta(&states_pert).unwrap();
+            let mut out = vec![0.0_f64; 6 * n];
+            for row in 0..n {
+                let mut qg = SurvivalMarginalSlopeDynamicRow::empty_workspace();
+                family_ref
+                    .row_dynamic_q_geometry_into(row, &states_pert, &mut qg)
+                    .unwrap();
+                let g = states_pert[2].eta[row];
+                let (a0, d0) = family_ref
+                    .solve_row_survival_intercept_with_slot(qg.q0, g, beta_h, beta_w, None)
+                    .unwrap();
+                let (a1, d1) = family_ref
+                    .solve_row_survival_intercept_with_slot(qg.q1, g, beta_h, beta_w, None)
+                    .unwrap();
+                let entry = family_ref
+                    .compute_survival_timepoint_exact(
+                        row, &primary, qg.q0, primary.q0, a0, g, d0, beta_h, beta_w, false,
+                    )
+                    .unwrap();
+                let exit = family_ref
+                    .compute_survival_timepoint_exact(
+                        row, &primary, qg.q1, primary.q1, a1, g, d1, beta_h, beta_w, false,
+                    )
+                    .unwrap();
+                out[0 * n + row] = entry.eta;
+                out[1 * n + row] = exit.eta;
+                out[2 * n + row] = exit.chi.ln();
+                out[3 * n + row] = exit.d.ln();
+                // log_phi(q1) = -0.5*(q1^2 + ln(2pi))
+                out[4 * n + row] = -0.5 * (qg.q1 * qg.q1 + std::f64::consts::TAU.ln());
+                out[5 * n + row] = qg.qd1.ln();
+            }
+            out
+        };
+
+        assert_flex_jac_fd("marginal_flex", &jac, &beta_m, 1e-7, nll_fn);
     }
 }

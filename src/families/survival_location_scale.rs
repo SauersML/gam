@@ -4298,7 +4298,6 @@ fn prepare_survival_location_scale_model(
         )?,
         initial_beta: time_prepared.initial_beta.clone(),
         gauge_priority: 100,
-        eta_row_scaling: None,
         jacobian_callback: None,
     };
 
@@ -4381,7 +4380,6 @@ fn prepare_survival_location_scale_model(
         initial_log_lambdas: threshold_initial_log_lambdas,
         initial_beta: threshold_initial_beta,
         gauge_priority: 100,
-        eta_row_scaling: None,
         jacobian_callback: None,
     };
 
@@ -4489,7 +4487,6 @@ fn prepare_survival_location_scale_model(
         initial_log_lambdas: log_sigma_initial_log_lambdas,
         initial_beta: log_sigma_initial_beta,
         gauge_priority: 100,
-        eta_row_scaling: None,
         jacobian_callback: None,
     };
     let wigglespec = if let Some(w) = spec.linkwiggle_block.as_ref() {
@@ -4520,7 +4517,6 @@ fn prepare_survival_location_scale_model(
             initial_log_lambdas: initial_log_lambdas(&w.penalties, w.initial_log_lambdas.clone())?,
             initial_beta: w.initial_beta.clone(),
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         })
     } else {
@@ -11226,7 +11222,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let specs = vec![
@@ -11258,7 +11253,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let specs = vec![
@@ -11292,7 +11286,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let specs = vec![
@@ -11330,7 +11323,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
 
@@ -11473,7 +11465,6 @@ mod tests {
             initial_log_lambdas: Array1::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
             jacobian_callback: None,
         };
         let returned = family
@@ -11717,7 +11708,6 @@ mod tests {
                 initial_log_lambdas: array![0.0],
                 initial_beta: Some(array![0.2]),
                 gauge_priority: 100,
-                eta_row_scaling: None,
                 jacobian_callback: None,
             },
             ParameterBlockSpec {
@@ -11733,7 +11723,6 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(array![0.35]),
                 gauge_priority: 100,
-                eta_row_scaling: None,
                 jacobian_callback: None,
             },
             ParameterBlockSpec {
@@ -11749,7 +11738,6 @@ mod tests {
                 initial_log_lambdas: Array1::zeros(0),
                 initial_beta: Some(array![-0.15]),
                 gauge_priority: 100,
-                eta_row_scaling: None,
                 jacobian_callback: None,
             },
         ]
@@ -12573,7 +12561,7 @@ mod tests {
     }
 
     #[test]
-    fn weighted_crossprod_dense_falls_back_when_eta_row_scaling_would_overflow() {
+    fn weighted_crossprod_dense_falls_back_when_row_scaled_product_would_overflow() {
         let left = array![[1.0e-200]];
         let right = array![[1.0e200]];
         let weights = array![1.0e200];
