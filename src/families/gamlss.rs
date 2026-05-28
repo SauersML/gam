@@ -2760,30 +2760,30 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
         layout.validate_theta_len(theta.len(), "gaussian location-scale")?;
         let mean_log_lambdas = layout.mean_from(theta);
         let noise_log_lambdas = layout.noise_from(theta);
-        let mut meanspec = ParameterBlockSpec {
-            name: "mu".to_string(),
-            design: mean_design.design.clone(),
-            offset: self.mean_offset.clone(),
-            penalties: mean_design.penalties_as_penalty_matrix(),
-            nullspace_dims: mean_design.nullspace_dims.clone(),
-            initial_log_lambdas: mean_log_lambdas,
-            initial_beta: mean_beta_hint,
-            gauge_priority: 100,
-            jacobian_callback: None,
-            audit_design: None,
-        };
-        let mut noisespec = ParameterBlockSpec {
-            name: "log_sigma".to_string(),
-            design: prepared_gaussian_log_sigma_design(&mean_design.design, &noise_design.design)?,
-            offset: self.noise_offset.clone(),
-            penalties: noise_design.penalties_as_penalty_matrix(),
-            nullspace_dims: noise_design.nullspace_dims.clone(),
-            initial_log_lambdas: noise_log_lambdas,
-            initial_beta: noise_beta_hint,
-            gauge_priority: 100,
-            jacobian_callback: None,
-            audit_design: None,
-        };
+        let mut meanspec = build_location_scale_block(
+            "mu",
+            mean_design.design.clone(),
+            self.mean_offset.clone(),
+            mean_design.penalties_as_penalty_matrix(),
+            mean_design.nullspace_dims.clone(),
+            mean_log_lambdas,
+            mean_beta_hint,
+            0,
+            LOCATION_SCALE_N_OUTPUTS,
+            "GaussianLocationScale::build_blocks: mu",
+        )?;
+        let mut noisespec = build_location_scale_block(
+            "log_sigma",
+            prepared_gaussian_log_sigma_design(&mean_design.design, &noise_design.design)?,
+            self.noise_offset.clone(),
+            noise_design.penalties_as_penalty_matrix(),
+            noise_design.nullspace_dims.clone(),
+            noise_log_lambdas,
+            noise_beta_hint,
+            1,
+            LOCATION_SCALE_N_OUTPUTS,
+            "GaussianLocationScale::build_blocks: log_sigma",
+        )?;
         if meanspec.initial_beta.is_none() || noisespec.initial_beta.is_none() {
             let (betamu0, beta_ls0, _) = gaussian_location_scalewarm_start(
                 &self.y,
@@ -2801,7 +2801,6 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
                 noisespec.initial_beta = Some(beta_ls0);
             }
         }
-        install_additive_callbacks_two_block(&mut meanspec, &mut noisespec)?;
         Ok(vec![meanspec, noisespec])
     }
 
