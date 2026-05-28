@@ -263,29 +263,23 @@ struct PyExtensionPrior {
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PyPredictOptions {
+    /// Single uncertainty knob (issue #342): `Some(level)` requests the
+    /// full-uncertainty predictor with that pointwise coverage level
+    /// (yields `effective_se`, `effective_variance`, and CI bounds on the
+    /// standard path; per-cell `survival_se` / `eta_se` on the survival
+    /// path). `None` requests point predictions only. There is no
+    /// separate `with_uncertainty` flag — coverage and the request to
+    /// quantify uncertainty are the same decision.
     interval: Option<f64>,
     time_grid: Option<Vec<f64>>,
-    /// Request delta-method standard errors on the survival surface
-    /// (and the linear predictor at each row's exit time).  Honored
-    /// only by the survival prediction path.  When set, the resulting
-    /// payload carries `survival_se` (per-cell SE) and `eta_se` (per-row
-    /// SE at the exit time).
-    #[serde(default)]
-    with_uncertainty: bool,
 }
 
 #[derive(Serialize)]
 struct PyPredictOptionsPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     interval: Option<f64>,
-    #[serde(skip_serializing_if = "bool_is_false")]
-    with_uncertainty: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     time_grid: Option<Vec<f64>>,
-}
-
-fn bool_is_false(value: &bool) -> bool {
-    !*value
 }
 
 #[derive(Deserialize)]
@@ -2290,12 +2284,10 @@ fn formula_validation_html_json(payload_json: String) -> PyResult<String> {
 #[pyfunction]
 fn build_predict_payload_json(
     interval: Option<f64>,
-    with_uncertainty: bool,
     time_grid: Option<Vec<f64>>,
 ) -> PyResult<String> {
     let payload = PyPredictOptionsPayload {
         interval,
-        with_uncertainty,
         time_grid,
     };
     serde_json::to_string(&payload)
@@ -2308,12 +2300,11 @@ fn build_model_predict_payload_json(
     headers: Vec<String>,
     rows: Vec<Vec<String>>,
     interval: Option<f64>,
-    with_uncertainty: bool,
 ) -> PyResult<String> {
     let model_class = required_saved_model_payload_string_value(&model_bytes, "model_kind")?;
     let formula = required_saved_model_payload_string_value(&model_bytes, "formula")?;
     let time_grid = default_survival_time_grid(&model_class, &formula, headers, rows)?;
-    build_predict_payload_json(interval, with_uncertainty, time_grid)
+    build_predict_payload_json(interval, time_grid)
 }
 
 #[pyfunction]

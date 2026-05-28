@@ -1721,6 +1721,43 @@ pub struct EfsEval {
     pub inner_hessian_scale: Option<f64>,
 }
 
+/// Outcome of [`OuterObjective::seed_inner_state`].
+///
+/// Distinguishes two non-error outcomes that callers handle differently:
+///
+/// - [`SeedOutcome::Installed`] — the objective owns an inner-β slot and the
+///   provided β has been stored there. The next `eval*` will warm-start from
+///   this β.
+/// - [`SeedOutcome::NoSlot`] — the objective has no inner-β slot at all. The
+///   provided β is silently discarded. This is the contract reply for
+///   objectives whose inner iterate is conceptually empty (e.g. line-search
+///   bridges, screening proxies, fixed-spec objectives).
+///
+/// Genuine seeding failures (wrong dimension when a slot exists, internal
+/// allocation faults, …) are reported via `Err(EstimationError)`.
+///
+/// The two non-error variants exist because the two real callers want
+/// opposite behavior on the no-slot path:
+///
+/// - The outer cache warm-start path (`OuterProblem::run`) reads a `(ρ, β)`
+///   pair from disk; if the objective has no β slot it must log loudly
+///   ("β-bearing checkpoint silently degraded to ρ-only resume") so cache
+///   provenance is auditable.
+/// - The continuation walk (`prime_outer_seed`) forwards `inner_beta_hint`
+///   from the previous step; if the objective has no β slot the walk
+///   simply proceeds cold — no log, no error.
+///
+/// Encoding the distinction in the return type lets each caller branch on
+/// the variant without inspecting error message strings (the previous
+/// brittle approach, see git history for `is_no_hook` in continuation.rs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedOutcome {
+    /// The objective installed the provided β into its inner-β slot.
+    Installed,
+    /// The objective has no inner-β slot; the β was discarded.
+    NoSlot,
+}
+
 /// Common interface for outer smoothing-parameter objectives.
 ///
 /// Every model path that optimizes smoothing parameters implements this trait.
