@@ -70,9 +70,10 @@ jobs:
 
             ## The goal
 
-            Find one real, interesting thing that is broken or behaves
+            Find real, interesting things that are broken or behave
             unexpectedly when you actually use this library — on real data
-            you go fetch, or on large synthetic data you design. Then:
+            you go fetch, or on large synthetic data you design. Then for
+            EACH one:
 
               1. Add one new test file that currently fails because of the
                  bug, and commit it directly to `main`. The test must
@@ -84,6 +85,26 @@ jobs:
                  your best read of why it's happening (point at files and
                  lines you've read — no patch, that's deliberate).
                  Reference the committed test by path and SHA.
+
+            ## Take on multiple issues — chain them in serial
+
+            Don't stop after one. If your investigation surfaces a cluster
+            of related bugs (same subsystem, same family, same numerical
+            failure mode), knock them all out in one run: file the first
+            issue + committed test, then move on to the next related bug,
+            commit + file, and so on. Several smaller related issues each
+            with their own failing test are MORE valuable to the maintainer
+            than one big writeup.
+
+            If you find a lot of bugs (5+), keep going as long as each one
+            is genuinely distinct and well-posed. Don't pad — quality over
+            quantity. But also don't artificially stop at one when you've
+            uncovered a chain.
+
+            Between issues, briefly run `gh issue list --label claude-bug-hunt
+            --state open --limit 20` to make sure you're not duplicating a
+            sibling agent's work. Cross-link related issues you file
+            yourself in this run with `Related: #N` lines in the body.
 
             Everything stays on `main`. No new branches, no PRs, no
             worktrees, no destructive git. No new `.md` files anywhere —
