@@ -1799,30 +1799,17 @@ pub struct CompiledSurvivalDesignsVMExact {
     pub t_full: Array2<f64>,
 }
 
-/// Per-term V+M-exact apply: produce compiled designs assembled via
-/// `ResidualisedDesignOperator`, per-term penalties pulled back through
-/// the full triangular T, and `t_full` for result-time lift.
+/// Project a raw-space warm start β_raw into compiled coordinates θ via the
+/// Gram-aware least-squares formula
 ///
-/// NOTE: this function is no longer called from the production SMGS
-/// cutover path (which uses `apply_compiled_map_to_designs` driven by
-/// the channel-aware `compile_from_raw_grams` since T13). It is
-/// retained only to support the unit test below; both will be deleted
-/// once the test is confirmed redundant.
-#[allow(clippy::too_many_arguments)]
-pub fn apply_per_term_vm_exact(
-    compiled: &SurvivalParametricCompiledPerTerm,
-    time_partition: &[std::ops::Range<usize>],
-    marginal_partition: &[std::ops::Range<usize>],
-    logslope_partition: &[std::ops::Range<usize>],
-    time_design_entry: DesignMatrix,
-    time_design_exit: DesignMatrix,
-    time_design_derivative_exit: DesignMatrix,
-    marginal_design: DesignMatrix,
-    logslope_design: DesignMatrix,
-    time_penalties: &[crate::terms::smooth::BlockwisePenalty],
-    marginal_penalties: &[crate::terms::smooth::BlockwisePenalty],
-    logslope_penalties: &[crate::terms::smooth::BlockwisePenalty],
-) -> Result<CompiledSurvivalDesignsVMExact, String> {
+///     θ = (Tᵀ K^S T)^+ · Tᵀ K^S · β_raw
+///
+/// where K^S is the structural Gram on raw space. This is the correct
+/// projection whenever T's columns are not Euclidean-orthonormal (e.g. the
+/// V+M-exact compiled basis), because Vᵀ·β is only an orthogonal projector
+/// in the Euclidean inner product, not in the K^S-induced inner product
+/// the compiled coordinates live under.
+MARKER_DELETE_BODY_START
     let n_time = time_partition.len();
     let n_marg = marginal_partition.len();
     let n_log = logslope_partition.len();

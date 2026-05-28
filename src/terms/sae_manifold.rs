@@ -3090,7 +3090,7 @@ pub struct SaeDecoderBlockJacobian {
 impl crate::families::custom_family::BlockEffectiveJacobian for SaeDecoderBlockJacobian {
     fn effective_jacobian_at(
         &self,
-        _state: &crate::families::custom_family::FamilyLinearizationState<'_>,
+        _: &crate::families::custom_family::FamilyLinearizationState<'_>,
     ) -> Result<Array2<f64>, String> {
         let n = self.basis_values.nrows();
         let m = self.basis_values.ncols();

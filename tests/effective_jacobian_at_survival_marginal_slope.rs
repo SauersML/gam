@@ -156,6 +156,7 @@ fn logslope_jacobian_fd_at_zero_beta() {
         beta: &beta,
         family_scalars: Some(scalars),
         channel_hessian: None,
+        probit_frailty_scale: 1.0,
     };
     let jac = cb
         .effective_jacobian_at(&state)
@@ -207,6 +208,7 @@ fn logslope_jacobian_fd_at_nonzero_beta() {
         beta: &beta,
         family_scalars: Some(scalars),
         channel_hessian: None,
+        probit_frailty_scale: 1.0,
     };
     let jac = cb
         .effective_jacobian_at(&state)
@@ -262,6 +264,7 @@ fn marginal_jacobian_fd_at_zero_beta() {
         beta: &beta,
         family_scalars: Some(scalars),
         channel_hessian: None,
+        probit_frailty_scale: 1.0,
     };
     let jac = cb
         .effective_jacobian_at(&state)
@@ -297,6 +300,7 @@ fn marginal_jacobian_fd_at_nonzero_beta() {
         beta: &beta,
         family_scalars: Some(scalars),
         channel_hessian: None,
+        probit_frailty_scale: 1.0,
     };
     let jac = cb
         .effective_jacobian_at(&state)
@@ -356,6 +360,7 @@ fn time_jacobian_fd_at_zero_beta() {
         beta: &beta,
         family_scalars: Some(scalars),
         channel_hessian: None,
+        probit_frailty_scale: 1.0,
     };
     let jac = cb
         .effective_jacobian_at(&state)
@@ -394,6 +399,7 @@ fn time_jacobian_fd_at_nonzero_beta() {
         beta: &beta,
         family_scalars: Some(scalars),
         channel_hessian: None,
+        probit_frailty_scale: 1.0,
     };
     let jac = cb
         .effective_jacobian_at(&state)
@@ -423,6 +429,7 @@ fn logslope_no_scalars_falls_back_to_c1() {
         beta: &beta,
         family_scalars: None,
         channel_hessian: None,
+        probit_frailty_scale: 1.0,
     };
     let jac = cb
         .effective_jacobian_at(&state)
