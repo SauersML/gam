@@ -548,7 +548,6 @@ fn audit_identifiability_impl(
         });
         let next_offset = col_offsets[col_offsets.len() - 1] + p_block;
         col_offsets.push(next_offset);
-        dense_blocks.push(dense);
         if let Some(hb) = block_heartbeat.as_ref() {
             hb.tick(1, |progress, elapsed| {
                 log::info!(

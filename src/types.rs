@@ -360,7 +360,264 @@ impl ResponseFamily {
             | Self::Gamma => None,
         }
     }
+
+    /// Per-family textual description of the response-support requirement.
+    /// `None` means the family is supported on the entire real line at the
+    /// validation layer (Gaussian) or has its support enforced by a downstream
+    /// pathway (Binomial via `is_binary_response` and the PIRLS row kernel;
+    /// RoystonParmar via the survival pipeline).
+    #[inline]
+    pub fn response_support_requirement(&self) -> Option<&'static str> {
+        match self {
+            Self::Gamma => Some("strictly positive response values (y > 0)"),
+            Self::Poisson | Self::NegativeBinomial { .. } | Self::Tweedie { .. } => {
+                Some("non-negative response values (y ≥ 0)")
+            }
+            Self::Beta { .. } => Some("response values strictly in the open interval (0, 1)"),
+            Self::Gaussian | Self::Binomial | Self::RoystonParmar => None,
+        }
+    }
+
+    /// Predicate that returns `true` iff `yi` lies in this family's response
+    /// support (used to detect domain violations before fit). Families with no
+    /// distribution-level domain constraint at this layer return `true` for
+    /// every finite value.
+    #[inline]
+    fn response_support_contains(&self, yi: f64) -> bool {
+        match self {
+            Self::Gamma => yi.is_finite() && yi > 0.0,
+            Self::Poisson | Self::NegativeBinomial { .. } | Self::Tweedie { .. } => {
+                yi.is_finite() && yi >= 0.0
+            }
+            Self::Beta { .. } => yi.is_finite() && yi > 0.0 && yi < 1.0,
+            Self::Gaussian | Self::Binomial | Self::RoystonParmar => yi.is_finite() || yi.is_nan(),
+        }
+    }
+
+    /// Human-readable family label used in domain-violation error messages
+    /// (capitalised to match user-facing prose, distinct from `name()` which
+    /// returns the lowercase canonical identifier).
+    #[inline]
+    fn response_support_label(&self) -> &'static str {
+        match self {
+            Self::Gaussian => "Gaussian",
+            Self::Binomial => "Binomial",
+            Self::Poisson => "Poisson",
+            Self::Tweedie { .. } => "Tweedie",
+            Self::NegativeBinomial { .. } => "Negative-Binomial",
+            Self::Beta { .. } => "Beta",
+            Self::Gamma => "Gamma",
+            Self::RoystonParmar => "Royston-Parmar",
+        }
+    }
+
+    /// Validate that every element of `y` lies in this family's response
+    /// support. The check is the upfront, fit-blocking enforcement of the
+    /// family's distributional support — e.g. Gamma rejects `y ≤ 0` because
+    /// the log-likelihood contains `log(y)`, Poisson rejects `y < 0` because
+    /// the log-mass contains `log(y!)`.
+    ///
+    /// Returns `Ok(())` for families whose support is the entire real line at
+    /// this layer (Gaussian) or whose support is enforced by a downstream
+    /// pathway (Binomial via `is_binary_response` + PIRLS, RoystonParmar via
+    /// the survival pipeline).
+    ///
+    /// Up to `ResponseSupportViolation::MAX_REPORTED` offending row indices
+    /// are returned in the violation so the message stays bounded on large
+    /// datasets while still identifying offending rows.
+    pub fn validate_response_support(
+        &self,
+        y: ArrayView1<'_, f64>,
+    ) -> Result<(), ResponseSupportViolation> {
+        let requirement = match self.response_support_requirement() {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+        let mut offending: Vec<(usize, f64)> = Vec::new();
+        let mut total_violations: usize = 0;
+        for (i, &yi) in y.iter().enumerate() {
+            if !self.response_support_contains(yi) {
+                total_violations += 1;
+                if offending.len() < ResponseSupportViolation::MAX_REPORTED {
+                    offending.push((i, yi));
+                }
+            }
+        }
+        if total_violations == 0 {
+            Ok(())
+        } else {
+            Err(ResponseSupportViolation {
+                family_label: self.response_support_label(),
+                requirement,
+                offending,
+                total_violations,
+            })
+        }
+    }
+
+    /// Auto-infer a likelihood family when the user did not specify one.
+    ///
+    /// Policy:
+    ///   * A string-valued (`Categorical`) response column is refused —
+    ///     numeric-encoded level indices (e.g. `"yes"`/`"no"` → `0.0`/`1.0`)
+    ///     would otherwise be silently interpreted as a binary outcome,
+    ///     producing a probability model the user never asked for.
+    ///   * A strictly-binary numeric response (`Binary` kind, or `Numeric`
+    ///     with only `{0, 1}` values) maps to `Binomial`.
+    ///   * Anything else maps to `Gaussian`.
+    ///
+    /// The fallback to `is_binary_response` inside the `Numeric` arm is what
+    /// historically lived directly inside `resolve_family`; centralising the
+    /// policy here means every entry point (formula API, CLI, future bindings)
+    /// gets the same default-inference behaviour.
+    pub fn infer_from_response(
+        y: ArrayView1<'_, f64>,
+        y_kind: ResponseColumnKind,
+    ) -> Result<Self, ResponseInferenceRefusal> {
+        match y_kind {
+            ResponseColumnKind::Categorical { levels } => Err(ResponseInferenceRefusal {
+                reason: ResponseInferenceRefusalReason::NonNumericResponse,
+                levels,
+            }),
+            ResponseColumnKind::Binary => Ok(Self::Binomial),
+            ResponseColumnKind::Numeric => {
+                let binary = !y.is_empty()
+                    && y.iter().all(|v| {
+                        v.is_finite() && ((*v - 0.0).abs() < 1e-12 || (*v - 1.0).abs() < 1e-12)
+                    });
+                if binary {
+                    Ok(Self::Binomial)
+                } else {
+                    Ok(Self::Gaussian)
+                }
+            }
+        }
+    }
 }
+
+/// Domain-violation detail produced by [`ResponseFamily::validate_response_support`].
+///
+/// Owns its own `Display` impl so call sites in the workflow, the CLI, and the
+/// external-design GLM path produce identical user-facing prose. The
+/// `total_violations` counter is kept distinct from `offending.len()` so the
+/// message can honestly say `(N total)` even when only the first
+/// `MAX_REPORTED` indices are surfaced.
+#[derive(Debug, Clone)]
+pub struct ResponseSupportViolation {
+    pub family_label: &'static str,
+    pub requirement: &'static str,
+    pub offending: Vec<(usize, f64)>,
+    pub total_violations: usize,
+}
+
+impl ResponseSupportViolation {
+    /// Maximum number of offending row indices reported in the error message.
+    /// Keeps the message bounded on biobank-scale data while still pointing
+    /// the user at concrete bad rows to inspect.
+    pub const MAX_REPORTED: usize = 5;
+
+    /// Format the violation against a specific response column name. The
+    /// column name is supplied by the caller because [`ResponseFamily`] does
+    /// not know which column the user pointed at.
+    pub fn message_for(&self, response_name: &str) -> String {
+        let shown = self
+            .offending
+            .iter()
+            .map(|(i, v)| format!("y[{i}]={v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = if self.total_violations > self.offending.len() {
+            format!(", ... ({} total)", self.total_violations)
+        } else {
+            String::new()
+        };
+        format!(
+            "{family} family requires {req}; response column '{name}' violates this constraint at row(s) [{shown}{more}]",
+            family = self.family_label,
+            req = self.requirement,
+            name = response_name,
+        )
+    }
+}
+
+impl std::fmt::Display for ResponseSupportViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message_for("y"))
+    }
+}
+
+impl std::error::Error for ResponseSupportViolation {}
+
+/// Caller-supplied description of the response column's *source* kind.
+///
+/// `Categorical { levels }` flags a column that arrived as non-numeric strings
+/// (the ingest layer encoded its levels to `0.0, 1.0, ...` indices) — the
+/// `levels` list is preserved so the auto-inference refusal can echo them
+/// back to the user verbatim. `Binary` is the ingest-layer signal that a
+/// numeric column already contains only `{0, 1}` (used to short-circuit the
+/// scan inside [`ResponseFamily::infer_from_response`]). `Numeric` is the
+/// generic continuous case.
+#[derive(Debug, Clone)]
+pub enum ResponseColumnKind {
+    Numeric,
+    Binary,
+    Categorical { levels: Vec<String> },
+}
+
+/// Reason [`ResponseFamily::infer_from_response`] refused to pick a default
+/// family. Kept as an enum so future policy extensions (e.g. "refuse on
+/// constant response" — currently a separate CLI-side check) can be added
+/// without breaking the call site's match arms.
+#[derive(Debug, Clone)]
+pub enum ResponseInferenceRefusalReason {
+    NonNumericResponse,
+}
+
+/// Auto-inference refusal carrying the levels seen in the source column so
+/// the workflow error can echo them in its message.
+#[derive(Debug, Clone)]
+pub struct ResponseInferenceRefusal {
+    pub reason: ResponseInferenceRefusalReason,
+    pub levels: Vec<String>,
+}
+
+impl ResponseInferenceRefusal {
+    /// Format the refusal against a specific response column name.
+    pub fn message_for(&self, response_name: &str) -> String {
+        match self.reason {
+            ResponseInferenceRefusalReason::NonNumericResponse => {
+                let n = self.levels.len().min(5);
+                let head = self
+                    .levels
+                    .iter()
+                    .take(n)
+                    .map(|s| format!("'{s}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let preview = if self.levels.len() > n {
+                    format!("[{head}, ...]")
+                } else {
+                    format!("[{head}]")
+                };
+                format!(
+                    "response column '{name}' contains non-numeric values {preview}. \
+                     Did you mean to use family='binomial' for a binary outcome, \
+                     or does '{name}' contain categorical labels that should be encoded first?",
+                    name = response_name,
+                    preview = preview,
+                )
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for ResponseInferenceRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message_for("y"))
+    }
+}
+
+impl std::error::Error for ResponseInferenceRefusal {}
 
 /// Unified likelihood specification: response distribution + parameterized link.
 ///
