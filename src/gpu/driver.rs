@@ -18,7 +18,6 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use super::error::GpuError;
-use crate::gpu_err;
 
 pub type CuResult = i32;
 // SAFETY: libcuda FFI fn-pointer alias matching the C ABI we dlsym
