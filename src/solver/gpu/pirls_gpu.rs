@@ -1257,6 +1257,122 @@ extern "C" __global__ void chol_logdet_col_major(
         }
     }
 
+    /// Launch the `xtwx_lower` kernel: one thread per lower-tri pair `(j,k)`,
+    /// iterates over all `n` rows and writes `A[j + k*p]` (col-major lower
+    /// triangle of `XᵀWX`). Call `launch_symmetrize_lower` afterwards.
+    fn launch_xtwx_lower(
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        ctx: &std::sync::Arc<cudarc::driver::CudaContext>,
+        n: usize,
+        p: usize,
+        x_dev: &CudaSlice<f64>,
+        w_dev: &CudaSlice<f64>,
+        a_dev: &mut CudaSlice<f64>,
+    ) -> Result<(), String> {
+        let module = FUSED_XTWX_CACHE
+            .get_or_compile(ctx, "fused_xtwx", FUSED_XTWX_PTX_SOURCE)
+            .map_err(|e| format!("fused_xtwx module: {e}"))?;
+        let func = module
+            .load_function("xtwx_lower")
+            .map_err(|e| format!("load xtwx_lower: {e}"))?;
+        let n_i = to_i32(n)?;
+        let p_i = to_i32(p)?;
+        let num_pairs = p * (p + 1) / 2;
+        let num_pairs_u32 = u32::try_from(num_pairs)
+            .map_err(|_| format!("xtwx_lower: num_pairs {num_pairs} > u32"))?;
+        const BLOCK: u32 = 256;
+        let grid = num_pairs_u32.div_ceil(BLOCK).max(1);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = stream.launch_builder(&func);
+        builder.arg(x_dev);
+        builder.arg(w_dev);
+        builder.arg(a_dev);
+        builder.arg(&n_i);
+        builder.arg(&p_i);
+        // SAFETY: x_dev is n*p col-major f64; w_dev is length n; a_dev is p*p;
+        // num_pairs threads each write one lower-tri entry A[j + k*p].
+        unsafe { builder.launch(cfg) }.map_err(|e| format!("xtwx_lower launch: {e}"))
+    }
+
+    /// Launch the `xtscore` kernel: one thread per output index `j`,
+    /// iterates over `n` rows and writes `s[j] = sum_i score[i]*X[i,j]`.
+    fn launch_xtscore(
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        ctx: &std::sync::Arc<cudarc::driver::CudaContext>,
+        n: usize,
+        p: usize,
+        x_dev: &CudaSlice<f64>,
+        score_dev: &CudaSlice<f64>,
+        s_dev: &mut CudaSlice<f64>,
+    ) -> Result<(), String> {
+        let module = FUSED_XTWX_CACHE
+            .get_or_compile(ctx, "fused_xtwx", FUSED_XTWX_PTX_SOURCE)
+            .map_err(|e| format!("fused_xtwx module (xtscore): {e}"))?;
+        let func = module
+            .load_function("xtscore")
+            .map_err(|e| format!("load xtscore: {e}"))?;
+        let n_i = to_i32(n)?;
+        let p_i = to_i32(p)?;
+        let p_u32 = u32::try_from(p).map_err(|_| format!("xtscore: p {p} > u32"))?;
+        const BLOCK: u32 = 256;
+        let grid = p_u32.div_ceil(BLOCK).max(1);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = stream.launch_builder(&func);
+        builder.arg(x_dev);
+        builder.arg(score_dev);
+        builder.arg(s_dev);
+        builder.arg(&n_i);
+        builder.arg(&p_i);
+        // SAFETY: x_dev is n*p col-major f64; score_dev is length n; s_dev is length p;
+        // p threads each write one output entry s[j].
+        unsafe { builder.launch(cfg) }.map_err(|e| format!("xtscore launch: {e}"))
+    }
+
+    /// Launch the `symmetrize_lower` kernel: one thread per strict lower-tri
+    /// pair `(j,k)` with `j > k`; copies `A[k + j*p] = A[j + k*p]` to fill
+    /// the upper triangle from the lower triangle populated by `xtwx_lower`.
+    fn launch_symmetrize_lower(
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        ctx: &std::sync::Arc<cudarc::driver::CudaContext>,
+        p: usize,
+        a_dev: &mut CudaSlice<f64>,
+    ) -> Result<(), String> {
+        if p <= 1 {
+            return Ok(());
+        }
+        let module = FUSED_XTWX_CACHE
+            .get_or_compile(ctx, "fused_xtwx", FUSED_XTWX_PTX_SOURCE)
+            .map_err(|e| format!("fused_xtwx module (sym): {e}"))?;
+        let func = module
+            .load_function("symmetrize_lower")
+            .map_err(|e| format!("load symmetrize_lower: {e}"))?;
+        let p_i = to_i32(p)?;
+        let num_strict = p * (p - 1) / 2;
+        let num_strict_u32 = u32::try_from(num_strict)
+            .map_err(|_| format!("symmetrize_lower: num_strict {num_strict} > u32"))?;
+        const BLOCK: u32 = 256;
+        let grid = num_strict_u32.div_ceil(BLOCK).max(1);
+        let cfg = cudarc::driver::LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = stream.launch_builder(&func);
+        builder.arg(a_dev);
+        builder.arg(&p_i);
+        // SAFETY: a_dev is p*p col-major f64; each of the num_strict threads
+        // writes one upper-triangle entry mirrored from the lower triangle.
+        unsafe { builder.launch(cfg) }.map_err(|e| format!("symmetrize_lower launch: {e}"))
+    }
+
     /// Launch the device-side Cholesky-factor logdet kernel and download
     /// the single scalar result. Replaces the per-step p² host download of
     /// the Cholesky factor that the host-side `cholesky_logdet_from_col_major`
@@ -2047,6 +2163,7 @@ extern "C" __global__ void status_or(
             backend,
             family,
             curvature,
+            gamma_shape,
             &ws.stream,
             n,
             &loop_ws.eta_dev,

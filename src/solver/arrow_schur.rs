@@ -3086,7 +3086,6 @@ impl JacobiPreconditioner {
         ridge_beta: f64,
         backend: &B,
     ) -> Result<Self, ArrowSchurError> {
-        let d = sys.d;
         let block_offsets = &sys.block_offsets;
         let mut blocks = Vec::with_capacity(block_offsets.len());
 
@@ -3114,19 +3113,20 @@ impl JacobiPreconditioner {
             // Subtract Schur contributions:
             // S_kk -= H_βt_k^(i) (H_tt^(i))^{-1} H_tβ_k^(i)
             //
-            // Materialize the per-row (d, k) cross-block once and slice out
+            // Materialize the per-row (di, k) cross-block once and slice out
             // the b-column submatrix.  sys_htbeta_materialize_row handles the
             // Kronecker / htbeta_matvec path transparently.
-            let mut solved_cols = Array2::<f64>::zeros((d, b));
             for (i, row) in sys.rows.iter().enumerate() {
+                let di = sys.row_dims[i];
                 let htbeta_full = sys_htbeta_materialize_row(sys, i, row);
+                let mut solved_cols = Array2::<f64>::zeros((di, b));
                 for bj in 0..b {
                     let gj = range.start + bj;
                     let solved = backend.solve_block_vector(
                         &htt_factors[i],
                         &htbeta_full.column(gj).to_owned(),
                     );
-                    for c in 0..d {
+                    for c in 0..di {
                         solved_cols[[c, bj]] = solved[c];
                     }
                 }
@@ -3134,7 +3134,7 @@ impl JacobiPreconditioner {
                     let gi = range.start + bi;
                     for bj in 0..b {
                         let mut acc = 0.0;
-                        for c in 0..d {
+                        for c in 0..di {
                             acc += htbeta_full[[c, gi]] * solved_cols[[c, bj]];
                         }
                         schur_block[[bi, bj]] -= acc;
