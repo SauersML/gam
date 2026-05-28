@@ -202,14 +202,13 @@ fn weighted_crossprod_dense_rows(
     right: &Array2<f64>,
     rows: Range<usize>,
 ) -> Array2<f64> {
-    // PSD precondition: callers (Fisher-scoring weighted crossprod) must supply
-    // nonneg weights. The prior `.max(0.0)` clip silently discarded
-    // negative-curvature contributions and masked sign bugs upstream; the debug
-    // assertion turns that into a loud failure in tests instead.
-    assert!(
-        weights.iter().all(|&w| w >= 0.0),
-        "weighted_crossprod_dense_rows requires nonneg weights; use the signed Gram routine for observed-Hessian assembly"
-    );
+    // The per-row body below is `Σᵢ wᵢ · leftᵢᵀ · rightᵢ`, which is linear in
+    // `wᵢ` and therefore sign-correct without any PSD assumption. The PSD
+    // precondition belongs at the symmetric `Xᵀ W X` caller (`dense_xtwx_view`),
+    // not at this kernel: `BlockDesignOperator::cross_block` legitimately uses
+    // the asymmetric form `X_iᵀ W X_j` with signed `c·Xv` weights from the outer
+    // REML Hessian-derivative correction, which is not PSD even when `w ≥ 0`.
+    // The prior assert here turned that legitimate signed use into a panic.
     let p_left = left.ncols();
     let p_right = right.ncols();
     let mut out = Array2::<f64>::zeros((p_left, p_right));
@@ -502,6 +501,19 @@ fn dense_transpose_matvec_view(matrix: &Array2<f64>, vector: ArrayView1<'_, f64>
 
 #[inline]
 fn dense_xtwx_view(matrix: &Array2<f64>, weights: ArrayView1<'_, f64>) -> Array2<f64> {
+    // PSD precondition for the symmetric `Xᵀ W X` form: callers
+    // (Fisher-scoring Gram) must supply nonneg weights. Signed-weight
+    // observed-Hessian assembly must route through the signed Gram path
+    // (`xt_diag_x_signed` → `streaming_blas_xt_diag_x`), which is sign-correct
+    // and does not assert. Guarding here (not inside the shared
+    // `weighted_crossprod_dense_rows` kernel) lets `BlockDesignOperator::cross_block`
+    // reuse the same kernel with the asymmetric form `X_iᵀ W X_j`, which is not
+    // PSD even when `w ≥ 0` and legitimately receives signed weights from the
+    // outer REML Hessian-derivative correction `c · X v`.
+    assert!(
+        weights.iter().all(|&w| w >= 0.0),
+        "dense_xtwx_view requires nonneg weights; use the signed Gram routine for observed-Hessian assembly"
+    );
     weighted_crossprod_dense_view(matrix, weights, matrix)
 }
 
