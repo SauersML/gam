@@ -8606,19 +8606,22 @@ fn predict_multinomial_formula_pyfunc<'py>(
     headers: Vec<String>,
     rows: Vec<Vec<String>>,
 ) -> PyResult<Py<PyArray2<f64>>> {
-    let probs = detach_py_result(py, "predict_multinomial_formula", move || {
-        let envelope: MultinomialModelEnvelope = serde_json::from_slice(&model_bytes)
-            .map_err(|err| format!("failed to deserialize multinomial model: {err}"))?;
+    let probs = detach_pyresult(py, "predict_multinomial_formula", move || {
+        let envelope: MultinomialModelEnvelope =
+            serde_json::from_slice(&model_bytes).map_err(|err| {
+                py_value_error(format!("failed to deserialize multinomial model: {err}"))
+            })?;
         if envelope.model_class != "multinomial" {
-            return Err(format!(
+            return Err(py_value_error(format!(
                 "predict_multinomial_formula: model_class = {:?}, expected 'multinomial'",
                 envelope.model_class
-            ));
+            )));
         }
-        let dataset = dataset_with_inferred_schema(headers, rows)
-            .map_err(|err| err.to_string())?;
+        let dataset = dataset_with_inferred_schema(headers, rows).map_err(py_value_error)?;
+        // Typed engine path: `EstimationError` → matching `gamfit.*Error`
+        // subclass via `estimation_error_to_pyerr` (issue #343).
         gam::families::multinomial::predict_multinomial_formula(&envelope.saved, &dataset)
-            .map_err(|err| err.to_string())
+            .map_err(estimation_error_to_pyerr)
     })?;
     Ok(probs.into_pyarray(py).unbind())
 }

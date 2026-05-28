@@ -305,7 +305,10 @@ fn apply_duchon(
         spec.aniso_log_scales = Some(parse_f64_vec(anis, "aniso_log_scales", symbol)?);
     }
     if let Some(per) = descriptor.get("periodic_per_axis") {
-        spec.periodic = Some(parse_periodic_per_axis(per, symbol)?);
+        let parsed = parse_periodic_per_axis(per, symbol)?;
+        if parsed.iter().any(Option::is_some) {
+            spec.periodic = Some(parsed);
+        }
     }
     Ok(())
 }
@@ -325,7 +328,10 @@ fn apply_thinplate(
         spec.length_scale = ls;
     }
     if let Some(per) = descriptor.get("periodic_per_axis") {
-        spec.periodic = Some(parse_periodic_per_axis(per, symbol)?);
+        let parsed = parse_periodic_per_axis(per, symbol)?;
+        if parsed.iter().any(Option::is_some) {
+            spec.periodic = Some(parsed);
+        }
     }
     Ok(())
 }
@@ -590,30 +596,32 @@ fn parse_periodic_per_axis(
     let arr = value.as_array().ok_or_else(|| {
         format!("smooths[{symbol:?}].periodic_per_axis must be an array")
     })?;
-    // We accept the Python descriptor form (per-axis booleans) and convert
-    // to the Rust form (per-axis optional period). A `true` flag without a
-    // user-supplied period leaves period inference to the basis builder by
-    // emitting `Some(0.0)` would be wrong; instead we emit `None` for false
-    // and `Some(f64::NAN)`-style sentinels are also wrong. The cleanest
-    // resolution is to require the user to supply a numeric period when
-    // they want periodicity from the override path — booleans alone don't
-    // carry enough information to drive `BSplineKnotSpec::PeriodicUniform`.
+    // We accept either form: per-axis booleans (the Python descriptor's
+    // default emission) or per-axis explicit numeric periods. Booleans map
+    // to `None` (open axis) or `Some(0.0)` (sentinel meaning "infer from
+    // data range" — downstream basis builders treat a non-positive period
+    // as a request for data-range inference). Explicit numbers must be
+    // strictly positive and finite.
     let mut out = Vec::with_capacity(arr.len());
     for (i, v) in arr.iter().enumerate() {
-        if v.is_boolean() {
-            return Err(format!(
-                "smooths[{symbol:?}].periodic_per_axis[{i}] is a bool; the override path \
-                 requires explicit numeric periods (Some(period) for periodic axes, \
-                 null for open axes). Use the formula DSL form \
-                 `duchon(..., periodic=...)` for boolean periodicity flags.",
-            ));
+        if let Some(b) = v.as_bool() {
+            if b {
+                return Err(format!(
+                    "smooths[{symbol:?}].periodic_per_axis[{i}] is `true` without a numeric \
+                     period; the override path needs an explicit period (e.g. \
+                     `[2.0 * math.pi, None]`). Mixing bool=False with an explicit period for \
+                     periodic axes is supported."
+                ));
+            }
+            out.push(None);
+            continue;
         }
         if v.is_null() {
             out.push(None);
         } else {
             let f = v.as_f64().ok_or_else(|| {
                 format!(
-                    "smooths[{symbol:?}].periodic_per_axis[{i}] must be a positive number or null"
+                    "smooths[{symbol:?}].periodic_per_axis[{i}] must be a positive number, bool, or null"
                 )
             })?;
             if !f.is_finite() || f <= 0.0 {
