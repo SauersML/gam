@@ -29,8 +29,6 @@ use ndarray::Array2;
 use super::error::GpuError;
 use super::{GpuDecision, GpuKernel, decide};
 #[cfg(target_os = "linux")]
-use crate::gpu_err;
-#[cfg(target_os = "linux")]
 use super::error::GpuResultExt;
 
 use super::bms_flex_row::{

@@ -18,6 +18,7 @@ from ._exceptions import map_exception
 from ._sampling import PosteriorSamples
 from ._schema import SchemaCheck
 from ._summary import Summary
+from ._predict_shape import shape_predict_response
 from ._survival import (
     CompetingRisksCIF,
     CompetingRisksPrediction,
@@ -28,7 +29,6 @@ from ._survival import (
     _TRANSFORMATION_NORMAL_MODEL_CLASSES,
     competing_risks_cif,
     extract_row_ids,
-    shape_prediction_response,
     term_blocks_for_model,
 )
 from ._tables import normalize_table, response_column_name, restore_output_table
