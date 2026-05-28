@@ -6,9 +6,6 @@ use super::exact_eval_cache::*;
 use super::row_kernel::*;
 use super::install_flex::validate_spec;
 
-    Ok(total_ll)
-}
-
 impl BernoulliMarginalSlopeFamily {
     #[inline]
     fn probit_frailty_scale(&self) -> f64 {
@@ -13862,3 +13859,5 @@ impl ExactNewtonJointPsiWorkspace for BernoulliMarginalSlopeExactNewtonJointPsiW
             .map(|result| {
                 result.map(crate::solver::estimate::reml::unified::DriftDerivResult::Operator)
             })
+    }
+}
