@@ -2884,7 +2884,7 @@ fn competing_risks_cif<'py>(
         .iter()
         .map(|hazard| hazard.as_array().to_owned())
         .collect::<Vec<_>>();
-    let (cif, overall_survival) = detach_py_result(py, "competing_risks_cif", move || {
+    let (cif, overall_survival) = detach_pyresult(py, "competing_risks_cif", move || {
         competing_risks_cif_impl(time_values.view(), &cumulative_hazard_values)
     })?;
     Ok((
@@ -2896,17 +2896,23 @@ fn competing_risks_cif<'py>(
 fn competing_risks_cif_impl(
     times: ArrayView1<'_, f64>,
     cumulative_hazards: &[Array2<f64>],
-) -> Result<(Array3<f64>, Array2<f64>), String> {
+) -> PyResult<(Array3<f64>, Array2<f64>)> {
     let endpoint_views = cumulative_hazards
         .iter()
         .map(|hazard| hazard.view())
         .collect::<Vec<_>>();
-    let cumulative_hazard =
-        ndarray::stack(Axis(0), &endpoint_views).map_err(|err| err.to_string())?;
+    // `ndarray::stack` is a pure shape contract violation — keep it as a
+    // bare `PyValueError` rather than forcing it through a typed engine
+    // enum it does not belong to.
+    let cumulative_hazard = ndarray::stack(Axis(0), &endpoint_views)
+        .map_err(|err| py_value_error(err.to_string()))?;
+    // Typed engine path: `assemble_competing_risks_cif` returns
+    // `Result<_, SurvivalError>`, dispatch to `gamfit.SurvivalError`.
     let result = gam::survival::assemble_competing_risks_cif(times, cumulative_hazard.view())
-        .map_err(|err| err.to_string())?;
+        .map_err(survival_error_to_pyerr)?;
     let cif_views = result.cif.iter().map(|m| m.view()).collect::<Vec<_>>();
-    let cif_stacked = ndarray::stack(Axis(0), &cif_views).map_err(|err| err.to_string())?;
+    let cif_stacked =
+        ndarray::stack(Axis(0), &cif_views).map_err(|err| py_value_error(err.to_string()))?;
     Ok((cif_stacked, result.overall_survival))
 }
 
@@ -2964,7 +2970,7 @@ fn competing_risks_cif_from_predictions<'py>(
         .map(|hazard| hazard.as_array().to_owned())
         .collect::<Vec<_>>();
     let (cif, overall_survival) =
-        detach_py_result(py, "competing_risks_cif_from_predictions", move || {
+        detach_pyresult(py, "competing_risks_cif_from_predictions", move || {
             competing_risks_cif_from_predictions_impl(time_values.view(), &cumulative_hazard_values)
         })?;
     let cif_arrays = PyList::empty(py);
@@ -2980,10 +2986,12 @@ fn competing_risks_cif_from_predictions<'py>(
 fn competing_risks_cif_from_predictions_impl(
     times: ArrayView1<'_, f64>,
     cumulative_hazards: &[Array2<f64>],
-) -> Result<(Vec<Array2<f64>>, Array2<f64>), String> {
+) -> PyResult<(Vec<Array2<f64>>, Array2<f64>)> {
+    // Typed engine path: `SurvivalError` → `gamfit.SurvivalError` (issue
+    // #343), no string flattening.
     let result =
         gam::survival::assemble_competing_risks_cif_from_endpoints(times, cumulative_hazards)
-            .map_err(|err| err.to_string())?;
+            .map_err(survival_error_to_pyerr)?;
     let cif = result.cif;
     Ok((cif, result.overall_survival))
 }
@@ -22470,6 +22478,26 @@ where
     match py.detach(move || catch_unwind(AssertUnwindSafe(f))) {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(message)) => Err(py_value_error(message)),
+        Err(payload) => Err(py_panic_error(context, payload)),
+    }
+}
+
+/// Detach the GIL, run a closure that has already produced a typed
+/// `PyResult<T>` (with the engine→Python class selection baked in), and
+/// preserve panics as `py_panic_error`. This is the chokepoint for call
+/// sites that need typed-variant dispatch where the engine error
+/// originates inside the closure: convert with the matching
+/// `*_error_to_pyerr` helper before returning. Replaces the
+/// `.map_err(|e| e.to_string())?` flattening to typed-class loss (issue
+/// #343).
+fn detach_pyresult<T, F>(py: Python<'_>, context: &'static str, f: F) -> PyResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> PyResult<T> + Send + 'static,
+{
+    match py.detach(move || catch_unwind(AssertUnwindSafe(f))) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => Err(err),
         Err(payload) => Err(py_panic_error(context, payload)),
     }
 }
