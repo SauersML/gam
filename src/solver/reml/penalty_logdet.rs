@@ -1108,7 +1108,7 @@ mod tests {
     fn test_rank_deficient_value() {
         // S = [[4, 2], [2, 1]] has rank 1, eigenvalue 5.
         let s = array![[4.0, 2.0], [2.0, 1.0]];
-        let pld = PenaltyPseudologdet::from_assembled(s).unwrap();
+        let pld = PenaltyPseudologdet::from_assembled(s, None).unwrap();
         assert_eq!(pld.rank(), 1);
         assert!((pld.value() - 5.0_f64.ln()).abs() < 1e-12);
     }
@@ -1198,7 +1198,7 @@ mod tests {
         let r_psi = array![[-s, 0.0, -c], [0.0, 0.0, 0.0], [c, 0.0, -s]];
         let s_psi = r_psi.dot(&d).dot(&r.t()) + r.dot(&d).dot(&r_psi.t());
 
-        let pld = PenaltyPseudologdet::from_assembled(s_mat).unwrap();
+        let pld = PenaltyPseudologdet::from_assembled(s_mat, None).unwrap();
         assert_eq!(pld.rank(), 2);
 
         let grad = pld.tau_gradient_component(&s_psi);
@@ -1235,7 +1235,7 @@ mod tests {
         let block_factored = PenaltyPseudologdet::from_penalties(&[penalty], &[1.0], 0.0, 3)
             .expect("block-factored pseudo-logdet");
         let assembled =
-            PenaltyPseudologdet::from_assembled(s_mat).expect("assembled pseudo-logdet");
+            PenaltyPseudologdet::from_assembled(s_mat, None).expect("assembled pseudo-logdet");
 
         let block_hess = block_factored.tau_hessian_component(&s_psi, &s_psi, Some(&s_psi_psi));
         let assembled_hess = assembled.tau_hessian_component(&s_psi, &s_psi, Some(&s_psi_psi));
