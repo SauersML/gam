@@ -101,6 +101,29 @@ class Smooth(_BasisDescriptor):
     # :meth:`_evaluate_impl`) plus :attr:`intrinsic_dim` / :attr:`basis_size`.
     # ------------------------------------------------------------------
 
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        """Serialize this smooth descriptor for the Rust ``smooths=`` bridge.
+
+        Returns a plain JSON-able dict consumed by ``FitConfig.smooths`` on
+        the Rust side. The same canonical lowering produces a
+        ``SmoothBasisSpec`` bit-identical to what the formula DSL would
+        produce for the equivalent ``smooth(...)`` invocation — only the
+        ``CenterStrategy::UserProvided`` array is threaded in addition.
+
+        The base implementation handles the universal ``Smooth`` fields
+        (``name``, ``shape_constraint``, ``double_penalty``). Each concrete
+        subclass extends this with its own ``kind`` discriminator and
+        kind-specific tunables.
+        """
+        out: dict[str, Any] = {"kind": _smooth_kind_name(type(self))}
+        if self.name is not None:
+            out["name"] = str(self.name)
+        if self.shape_constraint is not None:
+            out["shape_constraint"] = str(self.shape_constraint)
+        if self.double_penalty:
+            out["double_penalty"] = True
+        return out
+
 
 def _as_torch_tensor(x: Any, *, name: str) -> "torch.Tensor":
     """Coerce ``x`` to a torch tensor without copying when possible.
