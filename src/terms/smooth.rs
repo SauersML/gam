@@ -4063,11 +4063,16 @@ fn build_shape_constraint_design_1d(
                 knots,
                 identifiability_transform,
                 periodic,
+                degree: meta_degree,
                 ..
             },
         ) => {
+            // Issue #340: predict against the metadata-recorded effective
+            // degree so fit-time auto-shrink (cubic → linear for small n) is
+            // honoured at prediction time too.
+            let effective_degree = meta_degree.unwrap_or(spec.degree);
             let evalspec = BSplineBasisSpec {
-                degree: spec.degree,
+                degree: effective_degree,
                 penalty_order: spec.penalty_order,
                 knotspec: periodic
                     .map(
@@ -14724,15 +14729,22 @@ impl SingleBlockLatentCoordDesignCache {
             (
                 SmoothBasisSpec::BSpline1D { spec, .. },
                 BasisMetadata::BSpline1D {
-                    knots, periodic, ..
+                    knots,
+                    periodic,
+                    degree: meta_degree,
+                    ..
                 },
             ) => {
+                // Issue #340: prefer the metadata-recorded effective degree
+                // (which reflects fit-time auto-shrink) over the upstream
+                // user-requested `spec.degree`.
+                let effective_degree = meta_degree.unwrap_or(spec.degree);
                 if let Some((domain_start, period, num_basis)) = periodic {
                     Ok(
                         crate::solver::latent_cache::LatentBasisKind::PeriodicBspline {
                             domain_start: *domain_start,
                             period: *period,
-                            degree: spec.degree,
+                            degree: effective_degree,
                             num_basis: *num_basis,
                             chunk_size: crate::basis::auto_streaming_chunk_size_for_dense(
                                 self.n_obs, *num_basis,
@@ -14740,11 +14752,11 @@ impl SingleBlockLatentCoordDesignCache {
                         },
                     )
                 } else {
-                    let num_basis_est = knots.len().saturating_sub(spec.degree + 1);
+                    let num_basis_est = knots.len().saturating_sub(effective_degree + 1);
                     Ok(
                         crate::solver::latent_cache::LatentBasisKind::TensorBspline {
                             knots: vec![knots.clone()],
-                            degrees: vec![spec.degree],
+                            degrees: vec![effective_degree],
                             chunk_size: crate::basis::auto_streaming_chunk_size_for_dense(
                                 self.n_obs,
                                 num_basis_est,

@@ -768,6 +768,7 @@ def fit(
     fisher_rao_w: Any | None = ...,
     latents: Mapping[str, Any] | None = ...,
     penalties: Sequence[Any] | None = ...,
+    smooths: Mapping[Any, Any] | None = ...,
     config: dict[str, Any] | None = ...,
 ) -> Model: ...
 
@@ -805,6 +806,7 @@ def fit(
     fisher_rao_w: Any | None = ...,
     latents: Mapping[str, Any] | None = ...,
     penalties: Sequence[Any] | None = ...,
+    smooths: Mapping[Any, Any] | None = ...,
     config: dict[str, Any] | None = ...,
 ) -> ResponseGeometryModel: ...
 
@@ -841,6 +843,7 @@ def fit(
     fisher_rao_w: Any | None = None,
     latents: Mapping[str, Any] | None = None,
     penalties: Sequence[Any] | None = None,
+    smooths: Mapping[Any, Any] | None = None,
     config: dict[str, Any] | None = None,
 ) -> Model | ResponseGeometryModel:
     """Fit a GAM model from a formula and a tabular dataset.
@@ -1029,6 +1032,7 @@ def fit(
                 "fisher_rao_w": fisher_rao_w,
                 "latents": latents,
                 "penalties": penalties,
+                "smooths": smooths,
                 "config": nested_config or None,
             },
         )
@@ -1071,6 +1075,7 @@ def fit(
         precision_hyperpriors=resolved_precision_hyperpriors,
         latents=latents,
         penalties=penalties,
+        smooths=smooths,
         config=rust_config or None,
     )
     try:

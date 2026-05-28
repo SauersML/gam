@@ -17702,8 +17702,8 @@ fn poincare_distance<'py>(
 ) -> PyResult<f64> {
     let a_owned = a.as_array().to_owned();
     let b_owned = b.as_array().to_owned();
-    detach_py_result(py, "poincare_distance", move || {
-        poincare_distance_impl(a_owned.view(), b_owned.view(), curvature).map_err(|e| e.to_string())
+    detach_geometry_result(py, "poincare_distance", move || {
+        poincare_distance_impl(a_owned.view(), b_owned.view(), curvature)
     })
 }
 
@@ -17714,8 +17714,8 @@ fn poincare_project_into_ball<'py>(
     curvature: f64,
 ) -> PyResult<Py<PyArray1<f64>>> {
     let owned = point.as_array().to_owned();
-    let out = detach_py_result(py, "poincare_project_into_ball", move || {
-        poincare_project_into_ball_impl(owned.view(), curvature).map_err(|e| e.to_string())
+    let out = detach_geometry_result(py, "poincare_project_into_ball", move || {
+        poincare_project_into_ball_impl(owned.view(), curvature)
     })?;
     Ok(out.into_pyarray(py).unbind())
 }
@@ -17727,8 +17727,8 @@ fn poincare_log_origin<'py>(
     curvature: f64,
 ) -> PyResult<Py<PyArray1<f64>>> {
     let owned = y.as_array().to_owned();
-    let out = detach_py_result(py, "poincare_log_origin", move || {
-        poincare_log_origin_impl(owned.view(), curvature).map_err(|e| e.to_string())
+    let out = detach_geometry_result(py, "poincare_log_origin", move || {
+        poincare_log_origin_impl(owned.view(), curvature)
     })?;
     Ok(out.into_pyarray(py).unbind())
 }
@@ -17740,8 +17740,8 @@ fn poincare_exp_origin<'py>(
     curvature: f64,
 ) -> PyResult<Py<PyArray1<f64>>> {
     let owned = v.as_array().to_owned();
-    let out = detach_py_result(py, "poincare_exp_origin", move || {
-        poincare_exp_origin_impl(owned.view(), curvature).map_err(|e| e.to_string())
+    let out = detach_geometry_result(py, "poincare_exp_origin", move || {
+        poincare_exp_origin_impl(owned.view(), curvature)
     })?;
     Ok(out.into_pyarray(py).unbind())
 }
@@ -17753,8 +17753,8 @@ fn poincare_to_lorentz<'py>(
     curvature: f64,
 ) -> PyResult<Py<PyArray1<f64>>> {
     let owned = y.as_array().to_owned();
-    let out = detach_py_result(py, "poincare_to_lorentz", move || {
-        poincare_to_lorentz_impl(owned.view(), curvature).map_err(|e| e.to_string())
+    let out = detach_geometry_result(py, "poincare_to_lorentz", move || {
+        poincare_to_lorentz_impl(owned.view(), curvature)
     })?;
     Ok(out.into_pyarray(py).unbind())
 }
@@ -17766,8 +17766,8 @@ fn poincare_from_lorentz<'py>(
     curvature: f64,
 ) -> PyResult<Py<PyArray1<f64>>> {
     let owned = x.as_array().to_owned();
-    let out = detach_py_result(py, "poincare_from_lorentz", move || {
-        poincare_from_lorentz_impl(owned.view(), curvature).map_err(|e| e.to_string())
+    let out = detach_geometry_result(py, "poincare_from_lorentz", move || {
+        poincare_from_lorentz_impl(owned.view(), curvature)
     })?;
     Ok(out.into_pyarray(py).unbind())
 }
@@ -17779,8 +17779,8 @@ fn poincare_lorentz_log_origin<'py>(
     curvature: f64,
 ) -> PyResult<Py<PyArray1<f64>>> {
     let owned = x.as_array().to_owned();
-    let out = detach_py_result(py, "poincare_lorentz_log_origin", move || {
-        poincare_lorentz_log_origin_impl(owned.view(), curvature).map_err(|e| e.to_string())
+    let out = detach_geometry_result(py, "poincare_lorentz_log_origin", move || {
+        poincare_lorentz_log_origin_impl(owned.view(), curvature)
     })?;
     Ok(out.into_pyarray(py).unbind())
 }
@@ -17792,8 +17792,8 @@ fn poincare_lorentz_exp_origin<'py>(
     curvature: f64,
 ) -> PyResult<Py<PyArray1<f64>>> {
     let owned = v_spatial.as_array().to_owned();
-    let out = detach_py_result(py, "poincare_lorentz_exp_origin", move || {
-        poincare_lorentz_exp_origin_impl(owned.view(), curvature).map_err(|e| e.to_string())
+    let out = detach_geometry_result(py, "poincare_lorentz_exp_origin", move || {
+        poincare_lorentz_exp_origin_impl(owned.view(), curvature)
     })?;
     Ok(out.into_pyarray(py).unbind())
 }
