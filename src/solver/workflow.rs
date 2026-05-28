@@ -3048,6 +3048,35 @@ pub fn resolve_family(
                     ),
                     true,
                 ),
+                "multinomial" | "multinomial-logit" | "categorical" | "categorical-logit"
+                | "softmax" => {
+                    // Multinomial-logit is a vector-response family with K-1
+                    // active linear predictors and a per-row dense Fisher
+                    // block — it cannot be represented by the scalar
+                    // `LikelihoodSpec` (one `ResponseFamily` × one
+                    // `InverseLink`) that this entry point produces.
+                    //
+                    // The principled coefficient-space solver lives in
+                    // `crate::families::multinomial::fit_penalized_multinomial`,
+                    // which routes the canonical
+                    // `MultinomialLogitLikelihood: VectorLikelihood` through
+                    // `crate::pirls::dense_block_xtwx` in output-major
+                    // coefficient ordering. The forthcoming
+                    // `gamfit.fit_multinomial(...)` Python entry exposes that
+                    // path with formula → design wiring; until that wrapper
+                    // lands, callers reach the driver directly through the
+                    // FFI surface.
+                    return Err(WorkflowError::InvalidConfig {
+                        reason: format!(
+                            "family '{name}' is a vector-response family; use \
+                             the dedicated multinomial entry point \
+                             (`crate::families::multinomial::fit_penalized_multinomial` \
+                             in Rust, or `gamfit.fit_multinomial(...)` in Python) \
+                             rather than the scalar `fit(family=...)` path"
+                        ),
+                    }
+                    .into());
+                }
                 _ => {
                     return Err(WorkflowError::InvalidConfig {
                         reason: format!("unknown family '{name}'"),

@@ -147,65 +147,15 @@ impl PenaltyPseudologdet {
     /// of a single `p × p` spectral solve. When blocks overlap, falls back
     /// to assembling the full combined penalty and eigendecomposing once.
     ///
-    /// This is the preferred entry point for REML logdet computation.
+    /// This is the preferred entry point for REML logdet computation.  No
+    /// metadata-based structural-nullity hint is consumed; the positive
+    /// eigenspace is identified purely from the assembled spectrum (see
+    /// [`Self::from_assembled`]).
     pub fn from_penalties(
         penalties: &[crate::construction::CanonicalPenalty],
         lambdas: &[f64],
         ridge: f64,
         p_total: usize,
-    ) -> Result<Self, String> {
-        Self::from_penalties_with_cached_block_nullities(penalties, lambdas, ridge, p_total, None)
-    }
-
-    pub(crate) fn structural_block_nullities(
-        penalties: &[crate::construction::CanonicalPenalty],
-    ) -> Result<PenaltyBlockStructuralNullities, String> {
-        struct BlockData {
-            start: usize,
-            end: usize,
-            component_matrices: Vec<Array2<f64>>,
-            component_nullities: Vec<usize>,
-        }
-
-        let mut blocks: Vec<BlockData> = Vec::new();
-        for cp in penalties {
-            let r = &cp.col_range;
-            let local_rank = infer_penalty_rank(cp)?;
-            let local_nullity = cp.block_dim().saturating_sub(local_rank);
-            if let Some(bd) = blocks
-                .iter_mut()
-                .find(|bd| bd.start == r.start && bd.end == r.end)
-            {
-                bd.component_matrices.push(cp.local.clone());
-                bd.component_nullities.push(local_nullity);
-            } else {
-                blocks.push(BlockData {
-                    start: r.start,
-                    end: r.end,
-                    component_matrices: vec![cp.local.clone()],
-                    component_nullities: vec![local_nullity],
-                });
-            }
-        }
-
-        let block_nullities = blocks
-            .iter()
-            .map(|bd| {
-                Some(super::unified::exact_intersection_nullity(
-                    &bd.component_matrices,
-                    &bd.component_nullities,
-                ))
-            })
-            .collect();
-        Ok(PenaltyBlockStructuralNullities { block_nullities })
-    }
-
-    pub(crate) fn from_penalties_with_cached_block_nullities(
-        penalties: &[crate::construction::CanonicalPenalty],
-        lambdas: &[f64],
-        ridge: f64,
-        p_total: usize,
-        cached_block_nullities: Option<&PenaltyBlockStructuralNullities>,
     ) -> Result<Self, String> {
         if penalties.is_empty() {
             return Ok(Self {
@@ -223,20 +173,8 @@ impl PenaltyPseudologdet {
 
         if disjoint {
             // Block-factored path: assemble and eigendecompose per-block.
-            // Group penalties by overlapping column ranges.
-            Self::from_penalties_block_factored(
-                penalties,
-                lambdas,
-                ridge,
-                p_total,
-                cached_block_nullities,
-            )
+            Self::from_penalties_block_factored(penalties, lambdas, ridge, p_total)
         } else {
-            let structural_nullity = if ridge > 0.0 {
-                structural_nullity_from_penalties(penalties, lambdas, p_total)?
-            } else {
-                None
-            };
             // Fallback: assemble full p×p combined penalty.
             let mut s_total = Array2::<f64>::zeros((p_total, p_total));
             for (k, cp) in penalties.iter().enumerate() {
@@ -250,7 +188,7 @@ impl PenaltyPseudologdet {
                 }
             }
             let ridge_hint = if ridge > 0.0 { Some(ridge) } else { None };
-            Self::from_assembled_with_nullity(s_total, ridge_hint, structural_nullity)
+            Self::from_assembled(s_total, ridge_hint)
         }
     }
 
@@ -263,7 +201,6 @@ impl PenaltyPseudologdet {
         lambdas: &[f64],
         ridge: f64,
         p_total: usize,
-        cached_block_nullities: Option<&PenaltyBlockStructuralNullities>,
     ) -> Result<Self, String> {
         use ndarray::s;
 
@@ -273,59 +210,27 @@ impl PenaltyPseudologdet {
             start: usize,
             end: usize,
             local: Array2<f64>,
-            structural_nullity: Option<usize>,
-            component_matrices: Vec<Array2<f64>>,
-            component_nullities: Vec<usize>,
         }
 
         // Group penalties by their exact block range.
-        let lambda_threshold = active_lambda_threshold(lambdas);
         let mut blocks: Vec<BlockData> = Vec::new();
         for (k, cp) in penalties.iter().enumerate() {
             let lambda = if k < lambdas.len() { lambdas[k] } else { 0.0 };
-            let lambda_active = lambda_is_active(lambda, lambda_threshold);
             let r = &cp.col_range;
-            let local_rank = infer_penalty_rank(cp)?;
-            let local_nullity = cp.block_dim().saturating_sub(local_rank);
             // Find or create block with matching range.
             if let Some(bd) = blocks
                 .iter_mut()
                 .find(|bd| bd.start == r.start && bd.end == r.end)
             {
                 bd.local.scaled_add(lambda, &cp.local);
-                if lambda_active {
-                    bd.component_matrices.push(cp.local.clone());
-                    bd.component_nullities.push(local_nullity);
-                } else {
-                    bd.structural_nullity = None;
-                }
             } else {
                 let bd = cp.block_dim();
                 let mut local = Array2::<f64>::zeros((bd, bd));
                 local.scaled_add(lambda, &cp.local);
-                let idx = blocks.len();
-                let structural_nullity = if lambda_active {
-                    cached_block_nullities.and_then(|cache| cache.get(idx))
-                } else {
-                    None
-                };
-                let component_matrices = if lambda_active {
-                    vec![cp.local.clone()]
-                } else {
-                    Vec::new()
-                };
-                let component_nullities = if lambda_active {
-                    vec![local_nullity]
-                } else {
-                    Vec::new()
-                };
                 blocks.push(BlockData {
                     start: r.start,
                     end: r.end,
                     local,
-                    structural_nullity,
-                    component_matrices,
-                    component_nullities,
                 });
             }
         }
@@ -365,83 +270,32 @@ impl PenaltyPseudologdet {
             nullity: usize,
         }
 
+        let ridge_hint = if ridge > 0.0 { Some(ridge) } else { None };
+        let process_block = |bd: &BlockData| -> Result<BlockResult, String> {
+            let block_pld = Self::from_assembled(bd.local.clone(), ridge_hint)?;
+            let nullity = block_pld.u_null.as_ref().map_or(0, Array2::ncols);
+            Ok(BlockResult {
+                start: bd.start,
+                end: bd.end,
+                w_local: block_pld.w_factor,
+                u_null_local: block_pld
+                    .u_null
+                    .unwrap_or_else(|| Array2::<f64>::zeros((bd.end - bd.start, 0))),
+                inv_evals_sq: block_pld.inv_evals_sq.to_vec(),
+                value: block_pld.value,
+                rank: block_pld.rank,
+                nullity,
+            })
+        };
         let mut block_results: Vec<BlockResult> = if rayon::current_thread_index().is_some() {
             blocks
                 .iter()
-                .map(|bd| {
-                    let structural_nullity = if ridge > 0.0 {
-                        bd.structural_nullity.or_else(|| {
-                            if bd.component_matrices.is_empty() {
-                                Some(bd.end - bd.start)
-                            } else {
-                                Some(super::unified::exact_intersection_nullity(
-                                    &bd.component_matrices,
-                                    &bd.component_nullities,
-                                ))
-                            }
-                        })
-                    } else {
-                        None
-                    };
-                    let ridge_hint = if ridge > 0.0 { Some(ridge) } else { None };
-                    let block_pld = Self::from_assembled_with_nullity(
-                        bd.local.clone(),
-                        ridge_hint,
-                        structural_nullity,
-                    )?;
-                    let nullity = block_pld.u_null.as_ref().map_or(0, Array2::ncols);
-                    Ok(BlockResult {
-                        start: bd.start,
-                        end: bd.end,
-                        w_local: block_pld.w_factor,
-                        u_null_local: block_pld
-                            .u_null
-                            .unwrap_or_else(|| Array2::<f64>::zeros((bd.end - bd.start, 0))),
-                        inv_evals_sq: block_pld.inv_evals_sq.to_vec(),
-                        value: block_pld.value,
-                        rank: block_pld.rank,
-                        nullity,
-                    })
-                })
+                .map(process_block)
                 .collect::<Result<Vec<_>, String>>()?
         } else {
             blocks
                 .par_iter()
-                .map(|bd| {
-                    let structural_nullity = if ridge > 0.0 {
-                        bd.structural_nullity.or_else(|| {
-                            if bd.component_matrices.is_empty() {
-                                Some(bd.end - bd.start)
-                            } else {
-                                Some(super::unified::exact_intersection_nullity(
-                                    &bd.component_matrices,
-                                    &bd.component_nullities,
-                                ))
-                            }
-                        })
-                    } else {
-                        None
-                    };
-                    let ridge_hint = if ridge > 0.0 { Some(ridge) } else { None };
-                    let block_pld = Self::from_assembled_with_nullity(
-                        bd.local.clone(),
-                        ridge_hint,
-                        structural_nullity,
-                    )?;
-                    let nullity = block_pld.u_null.as_ref().map_or(0, Array2::ncols);
-                    Ok(BlockResult {
-                        start: bd.start,
-                        end: bd.end,
-                        w_local: block_pld.w_factor,
-                        u_null_local: block_pld
-                            .u_null
-                            .unwrap_or_else(|| Array2::<f64>::zeros((bd.end - bd.start, 0))),
-                        inv_evals_sq: block_pld.inv_evals_sq.to_vec(),
-                        value: block_pld.value,
-                        rank: block_pld.rank,
-                        nullity,
-                    })
-                })
+                .map(process_block)
                 .collect::<Result<Vec<_>, String>>()?
         };
 

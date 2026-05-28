@@ -85,14 +85,13 @@ class Model:
               ``ndarray`` of point predictions on the response scale (the
               fitted mean).
             * Standard GAM with ``interval`` / ``id_column`` / ``return_type``:
-              a table (dict / DataFrame / ...) with columns ``eta``
-              (linear-predictor scale; equals ``mean`` for identity-link
-              models), ``mean`` (response scale; the point prediction),
-              ``effective_se`` (response-scale standard error including both
-              fixed-effect and smoothing uncertainty),
-              ``effective_variance`` = ``effective_se ** 2`` (kept so callers
-              can add variances additively without re-squaring), and
-              ``mean_lower`` / ``mean_upper`` (interval endpoints).
+              a table (dict / DataFrame / ...) with columns
+              ``linear_predictor`` (linear-predictor scale; equals ``mean``
+              for identity-link models), ``mean`` (response scale; the point
+              prediction), and — when ``interval`` is set — ``std_error``
+              (response-scale standard error including both fixed-effect and
+              smoothing uncertainty) plus ``mean_lower`` / ``mean_upper``
+              (interval endpoints).
             * Bernoulli marginal-slope: a 1-D ``ndarray`` of probabilities.
             * Transformation-normal: a 1-D ``ndarray`` of z-scores.
             * Survival models: :class:`SurvivalPrediction`.
@@ -100,10 +99,14 @@ class Model:
 
         Notes
         -----
-        For Gaussian / identity-link GLMs, ``eta`` and ``mean`` are numerically
-        identical (linear predictor == response scale). For non-identity links
-        (logit, log, ...) ``mean = link^{-1}(eta)`` and the two columns carry
-        distinct information. Issues #310, #313, #342.
+        For Gaussian / identity-link GLMs, ``linear_predictor`` and ``mean``
+        are numerically identical (linear-predictor scale == response scale).
+        For non-identity links (logit, log, ...) ``mean = link^{-1}(linear_predictor)``
+        and the two columns carry distinct information. Issues #310, #313, #342
+        renamed the columns from the engine-internal ``eta`` /
+        ``effective_se`` / ``effective_variance`` labels to the standard
+        statistical names; ``effective_variance`` was dropped (it was always
+        exactly ``std_error ** 2``, trivial to compute downstream).
         """
         headers, rows, table_kind = normalize_table(data)
         row_ids = extract_row_ids(headers, rows, id_column)

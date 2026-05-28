@@ -157,17 +157,20 @@ def test_fit_predict_summary_check_report_and_roundtrip(tmp_path: pathlib.Path) 
     np.testing.assert_allclose(predicted_arr, expected_mean, atol=1e-3)
 
     full_table = model.predict(prediction_rows(), return_type="dict")
-    assert list(full_table) == ["eta", "mean"]
-    # For the identity link, eta and mean are computed from the same beta·x
-    # — a swap would still be detected here because the comparison is bit
-    # close, just not strict bit-equality (allowing for any post-link copy).
-    np.testing.assert_allclose(full_table["eta"], full_table["mean"], atol=1e-9)
+    assert list(full_table) == ["linear_predictor", "mean"]
+    # For the identity link, linear_predictor and mean are computed from the
+    # same beta·x — a swap would still be detected here because the
+    # comparison is bit close, just not strict bit-equality (allowing for any
+    # post-link copy).
+    np.testing.assert_allclose(
+        full_table["linear_predictor"], full_table["mean"], atol=1e-9
+    )
 
     with_interval = model.predict(prediction_rows(), interval=0.95)
     assert list(with_interval) == [
-        "eta",
+        "linear_predictor",
         "mean",
-        "effective_se",
+        "std_error",
         "mean_lower",
         "mean_upper",
     ]
@@ -176,7 +179,7 @@ def test_fit_predict_summary_check_report_and_roundtrip(tmp_path: pathlib.Path) 
     interval_mean = np.asarray(with_interval["mean"], dtype=float)
     interval_lower = np.asarray(with_interval["mean_lower"], dtype=float)
     interval_upper = np.asarray(with_interval["mean_upper"], dtype=float)
-    interval_se = np.asarray(with_interval["effective_se"], dtype=float)
+    interval_se = np.asarray(with_interval["std_error"], dtype=float)
     assert np.all(interval_lower <= interval_mean + 1e-12)
     assert np.all(interval_mean <= interval_upper + 1e-12)
     assert np.all(interval_upper > interval_lower)

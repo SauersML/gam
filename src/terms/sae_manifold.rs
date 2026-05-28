@@ -2548,7 +2548,8 @@ impl SaeManifoldTerm {
                         debug_assert!(
                             sae_penalty_is_row_block_supported(penalty),
                             "validate_analytic_penalty_registry should have \
-                             refused non-row-block Psi-tier penalty {:?}",
+                             refused non-row-block Psi-tier penalty {:?} \
+                             (registry layout name {name:?})",
                             penalty.name()
                         );
                         let offsets = self.assignment.coord_offsets();
@@ -2650,14 +2651,6 @@ impl SaeManifoldTerm {
                             self.add_sae_coord_penalty(sys, off, coord, penalty, rho_local);
                         }
                         }
-                    } else {
-                        return Err(ArrowSchurError::SchurFactorFailed {
-                            reason: format!(
-                                "analytic penalty {name:?} cannot be injected into the SAE-manifold row layout; multi-atom coordinate or cross-row penalties require an explicit atom target (k_atoms={}, coords_share_latent_dim={})",
-                                self.k_atoms(),
-                                self.coords_share_latent_dim(),
-                            ),
-                        });
                     }
                 }
                 PenaltyTier::Beta => {
