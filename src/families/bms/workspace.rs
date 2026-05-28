@@ -2131,7 +2131,7 @@ impl BernoulliMarginalSlopeFamily {
 }
 
 #[derive(Default)]
-struct BernoulliInterceptSolveStats {
+pub(super) struct BernoulliInterceptSolveStats {
     pub(super) cached_short_circuit: AtomicUsize,
     pub(super) closed_form_short_circuit: AtomicUsize,
     pub(super) full_solver: AtomicUsize,
