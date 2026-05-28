@@ -97,7 +97,7 @@ pub(super) struct BernoulliBlockHessianAccumulator {
 }
 
 impl BernoulliBlockHessianAccumulator {
-    fn new(slices: &BlockSlices) -> Self {
+    pub(super) fn new(slices: &BlockSlices) -> Self {
         let p_m = slices.marginal.len();
         let p_g = slices.logslope.len();
         let has_hw = slices.h.is_some() || slices.w.is_some();
@@ -116,7 +116,7 @@ impl BernoulliBlockHessianAccumulator {
     /// Accumulate a primary-space Hessian into block-local matrices.
     /// The marginal block uses H[0,0], logslope uses H[1,1],
     /// cross uses H[0,1].  All h/w cross-blocks go to dense_correction.
-    fn add_pullback(
+    pub(super) fn add_pullback(
         &mut self,
         family: &BernoulliMarginalSlopeFamily,
         row: usize,
@@ -166,7 +166,7 @@ impl BernoulliBlockHessianAccumulator {
     /// `dense_correction` branch — which is `None` whenever this method is
     /// reached because the flex-inactive path constructs the accumulator from
     /// `BlockSlices` with no `h`/`w` ranges.
-    fn add_pullback_rigid_2x2(
+    pub(super) fn add_pullback_rigid_2x2(
         &mut self,
         family: &BernoulliMarginalSlopeFamily,
         row: usize,
@@ -199,7 +199,7 @@ impl BernoulliBlockHessianAccumulator {
         }
     }
 
-    fn add_hw_pullback_only(
+    pub(super) fn add_hw_pullback_only(
         &mut self,
         family: &BernoulliMarginalSlopeFamily,
         row: usize,
@@ -218,7 +218,7 @@ impl BernoulliBlockHessianAccumulator {
         }
     }
 
-    fn add_weighted_design_grams(
+    pub(super) fn add_weighted_design_grams(
         &mut self,
         family: &BernoulliMarginalSlopeFamily,
         rows: std::ops::Range<usize>,
@@ -238,7 +238,7 @@ impl BernoulliBlockHessianAccumulator {
         Ok(())
     }
 
-    fn add_weighted_design_grams_from_chunks(
+    pub(super) fn add_weighted_design_grams_from_chunks(
         &mut self,
         x: &Array2<f64>,
         g: &Array2<f64>,
@@ -263,7 +263,7 @@ impl BernoulliBlockHessianAccumulator {
     /// tiny.  This routine keeps the same exact Hessian entries, but turns the
     /// cross terms into `X_chunk^T weights` / `G_chunk^T weights` products and
     /// sums the tiny h/w self-blocks in registers.
-    fn add_weighted_hw_cross_terms(
+    pub(super) fn add_weighted_hw_cross_terms(
         &mut self,
         family: &BernoulliMarginalSlopeFamily,
         rows: std::ops::Range<usize>,
@@ -380,7 +380,7 @@ impl BernoulliBlockHessianAccumulator {
     /// operator re-dispatches `row_chunk_into` for every nonzero psi index
     /// (psi_dim×rank-2 = 2*psi_dim row materializations per call), which is
     /// the dominant cost of joint-spatial Hessian builds at biobank scale.
-    fn add_rank1_psi_cross(
+    pub(super) fn add_rank1_psi_cross(
         &mut self,
         family: &BernoulliMarginalSlopeFamily,
         row: usize,
@@ -547,7 +547,7 @@ impl BernoulliBlockHessianAccumulator {
 
     /// Add outer product of two psi block-local rows (possibly in different blocks).
     /// Adds both alpha * (a outer b) and alpha * (b outer a) to maintain symmetry.
-    fn add_psi_psi_outer(
+    pub(super) fn add_psi_psi_outer(
         &mut self,
         block_i: usize,
         psi_row_i: &Array1<f64>,
@@ -570,7 +570,7 @@ impl BernoulliBlockHessianAccumulator {
     }
 
     /// Merge another accumulator into this one (for parallel reduce).
-    fn add(&mut self, other: &BernoulliBlockHessianAccumulator) {
+    pub(super) fn add(&mut self, other: &BernoulliBlockHessianAccumulator) {
         self.h_mm += &other.h_mm;
         self.h_gg += &other.h_gg;
         self.h_mg += &other.h_mg;
@@ -582,7 +582,7 @@ impl BernoulliBlockHessianAccumulator {
         }
     }
 
-    fn to_dense(&self, slices: &BlockSlices) -> Array2<f64> {
+    pub(super) fn to_dense(&self, slices: &BlockSlices) -> Array2<f64> {
         let mut out = Array2::zeros((slices.total, slices.total));
         out.slice_mut(s![slices.marginal.clone(), slices.marginal.clone()])
             .assign(&self.h_mm);
@@ -598,7 +598,7 @@ impl BernoulliBlockHessianAccumulator {
         out
     }
 
-    fn into_operator(self, slices: &BlockSlices) -> BernoulliBlockHessianOperator {
+    pub(super) fn into_operator(self, slices: &BlockSlices) -> BernoulliBlockHessianOperator {
         BernoulliBlockHessianOperator {
             h_mm: self.h_mm,
             h_gg: self.h_gg,
@@ -626,17 +626,17 @@ pub(super) struct BernoulliBlockHessianOperator {
 }
 
 impl HyperOperator for BernoulliBlockHessianOperator {
-    fn dim(&self) -> usize {
+    pub(super) fn dim(&self) -> usize {
         self.total
     }
 
-    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+    pub(super) fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
         let mut out = Array1::zeros(self.total);
         self.mul_vec_into(v.view(), out.view_mut());
         out
     }
 
-    fn mul_vec_view(&self, v: ArrayView1<'_, f64>) -> Array1<f64> {
+    pub(super) fn mul_vec_view(&self, v: ArrayView1<'_, f64>) -> Array1<f64> {
         let mut out = Array1::zeros(self.total);
         self.mul_vec_into(v, out.view_mut());
         out
@@ -648,7 +648,7 @@ impl HyperOperator for BernoulliBlockHessianOperator {
     /// would incur. The psi-Hessian outer-eval path calls this once per
     /// ψ-direction per trace sweep; at biobank scale (rank ≈ 32) the saving
     /// is ~64 allocations per REML gradient step.
-    fn mul_vec_into(&self, v: ArrayView1<'_, f64>, mut out: ArrayViewMut1<'_, f64>) {
+    pub(super) fn mul_vec_into(&self, v: ArrayView1<'_, f64>, mut out: ArrayViewMut1<'_, f64>) {
         let v_m = v.slice(s![self.marginal.clone()]);
         let v_g = v.slice(s![self.logslope.clone()]);
         out.fill(0.0);
@@ -667,7 +667,7 @@ impl HyperOperator for BernoulliBlockHessianOperator {
         }
     }
 
-    fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
+    pub(super) fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
         let v_m = v.slice(s![self.marginal.clone()]);
         let v_g = v.slice(s![self.logslope.clone()]);
         let u_m = u.slice(s![self.marginal.clone()]);
@@ -685,7 +685,7 @@ impl HyperOperator for BernoulliBlockHessianOperator {
         total
     }
 
-    fn to_dense(&self) -> Array2<f64> {
+    pub(super) fn to_dense(&self) -> Array2<f64> {
         let mut out = Array2::zeros((self.total, self.total));
         out.slice_mut(s![self.marginal.clone(), self.marginal.clone()])
             .assign(&self.h_mm);
@@ -701,7 +701,7 @@ impl HyperOperator for BernoulliBlockHessianOperator {
         out
     }
 
-    fn is_implicit(&self) -> bool {
+    pub(super) fn is_implicit(&self) -> bool {
         false
     }
 }
@@ -733,7 +733,7 @@ impl RowCellMomentsBundle {
     /// bundle's `max_degree` is too low for this caller — the caller must
     /// fall back to per-row on-demand evaluation in either case.
     #[inline]
-    fn row(&self, row: usize, required_degree: usize) -> Option<&[CachedDenestedCellMoments]> {
+    pub(super) fn row(&self, row: usize, required_degree: usize) -> Option<&[CachedDenestedCellMoments]> {
         if self.max_degree < required_degree {
             return None;
         }
@@ -743,7 +743,7 @@ impl RowCellMomentsBundle {
             .map(Vec::as_slice)
     }
 
-    fn estimated_resident_bytes(n_rows: usize, n_cells: usize, max_degree: usize) -> usize {
+    pub(super) fn estimated_resident_bytes(n_rows: usize, n_cells: usize, max_degree: usize) -> usize {
         let row_vecs =
             n_rows.saturating_mul(std::mem::size_of::<Option<Vec<CachedDenestedCellMoments>>>());
         let cell_records = n_cells.saturating_mul(std::mem::size_of::<CachedDenestedCellMoments>());
@@ -803,7 +803,7 @@ pub(super) struct BernoulliMarginalSlopeFlexRowScratch {
 }
 
 impl BernoulliMarginalSlopeFlexRowScratch {
-    fn new(primary_dim: usize) -> Self {
+    pub(super) fn new(primary_dim: usize) -> Self {
         Self {
             m_u: Array1::zeros(primary_dim),
             m_au: Array1::zeros(primary_dim),
@@ -826,7 +826,7 @@ impl BernoulliMarginalSlopeFlexRowScratch {
         }
     }
 
-    fn reset(&mut self, need_hessian: bool) {
+    pub(super) fn reset(&mut self, need_hessian: bool) {
         self.m_u.fill(0.0);
         self.a_u.fill(0.0);
         self.rho.fill(0.0);
@@ -911,7 +911,7 @@ pub(super) struct BernoulliExactNewtonAccumulator {
 }
 
 impl BernoulliExactNewtonAccumulator {
-    fn new(slices: &BlockSlices) -> Self {
+    pub(super) fn new(slices: &BlockSlices) -> Self {
         Self {
             ll: 0.0,
             grad_marginal: Array1::zeros(slices.marginal.len()),
@@ -935,7 +935,7 @@ impl BernoulliExactNewtonAccumulator {
     /// block-diagonal working sets. This method is intentionally row-local:
     /// callers invoke it only on Rayon thread-local accumulators, then merge
     /// whole accumulators after the row sweep completes.
-    fn add_pullback_block_diagonals(
+    pub(super) fn add_pullback_block_diagonals(
         &mut self,
         family: &BernoulliMarginalSlopeFamily,
         row: usize,
@@ -988,7 +988,7 @@ impl BernoulliExactNewtonAccumulator {
         Ok(())
     }
 
-    fn add(&mut self, other: &Self) {
+    pub(super) fn add(&mut self, other: &Self) {
         self.ll += other.ll;
         self.grad_marginal += &other.grad_marginal;
         self.grad_logslope += &other.grad_logslope;

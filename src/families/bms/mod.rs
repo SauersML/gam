@@ -25,6 +25,7 @@ use crate::families::row_kernel::{
     RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
     row_kernel_hessian_dense, row_kernel_log_likelihood,
 };
+use crate::families::jet_partitions::MultiDirJet;
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{
@@ -1117,6 +1118,7 @@ pub(crate) use gradient_paths::{
 };
 pub(crate) use install_flex::{
     install_compiled_flex_block_into_runtime, project_monotone_feasible_beta,
-    standardize_latent_z_with_policy, validate_monotone_structural_feasible,
+    validate_monotone_structural_feasible,
 };
+pub(crate) use gradient_paths::standardize_latent_z_with_policy;
 pub(crate) use block_specs::{build_deviation_aux_blockspec, push_deviation_aux_blockspecs};

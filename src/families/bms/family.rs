@@ -112,14 +112,14 @@ pub(super) struct BernoulliInterceptWarmStartCache {
 
 impl BernoulliInterceptWarmStartCache {
     #[inline]
-    fn len(&self) -> usize {
+    pub(super) fn len(&self) -> usize {
         self.intercept_value.len()
     }
 
     /// Return the cached intercept iff the slot's stored `beta_tag` matches
     /// the caller's `beta_tag` and the stored value is finite.
     #[inline]
-    fn load_tagged(&self, row: usize, beta_tag: u64) -> Option<f64> {
+    pub(super) fn load_tagged(&self, row: usize, beta_tag: u64) -> Option<f64> {
         let value_slot = self.intercept_value.get(row)?;
         let tag_slot = self.intercept_tag.get(row)?;
         let tag_before = tag_slot.load(Ordering::Acquire);
@@ -137,7 +137,7 @@ impl BernoulliInterceptWarmStartCache {
 
     /// Stamp the slot with the converged intercept under `beta_tag`.
     #[inline]
-    fn store_tagged(&self, row: usize, value: f64, beta_tag: u64) {
+    pub(super) fn store_tagged(&self, row: usize, value: f64, beta_tag: u64) {
         if let (Some(value_slot), Some(tag_slot)) =
             (self.intercept_value.get(row), self.intercept_tag.get(row))
         {
@@ -154,7 +154,7 @@ impl BernoulliInterceptWarmStartCache {
     /// was installed, `Err(prev_tag)` if some prior write already populated
     /// the slot (in which case the caller should keep the existing entry).
     #[inline]
-    fn compare_exchange_unseeded(&self, row: usize, value: f64, beta_tag: u64) -> Result<(), u64> {
+    pub(super) fn compare_exchange_unseeded(&self, row: usize, value: f64, beta_tag: u64) -> Result<(), u64> {
         let value_slot = self.intercept_value.get(row).ok_or(0u64)?;
         let tag_slot = self.intercept_tag.get(row).ok_or(0u64)?;
         match tag_slot.compare_exchange(0, beta_tag, Ordering::AcqRel, Ordering::Acquire) {
@@ -169,7 +169,7 @@ impl BernoulliInterceptWarmStartCache {
         }
     }
 
-    fn predictor_seed(&self, row: usize, current_point: &[f64]) -> Option<f64> {
+    pub(super) fn predictor_seed(&self, row: usize, current_point: &[f64]) -> Option<f64> {
         let warm = self.predictors.get(row)?.lock().ok()?.as_ref().cloned()?;
         if warm.primary_point.len() != current_point.len()
             || warm.intercept_primary_deriv.len() != current_point.len()
@@ -187,7 +187,7 @@ impl BernoulliInterceptWarmStartCache {
         seed.is_finite().then_some(seed)
     }
 
-    fn store_predictor(
+    pub(super) fn store_predictor(
         &self,
         row: usize,
         intercept: f64,
