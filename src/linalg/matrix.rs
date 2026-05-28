@@ -7585,7 +7585,12 @@ impl DesignMatrix {
         }
         match self {
             Self::Dense(DenseDesignMatrix::Materialized(matrix)) => {
-                Ok(dense_diag_gram_view(matrix, weights))
+                // Diagonal-of-Gram is a PSD-precondition kernel (used as a
+                // Jacobi preconditioner diagonal). Discharge `w ≥ 0` once at
+                // the boundary so the kernel below operates on a typed PSD
+                // view without re-scanning.
+                let psd = PsdWeightsView::try_new(weights)?;
+                Ok(dense_diag_gram_view(matrix, psd))
             }
             Self::Dense(DenseDesignMatrix::Lazy(op)) => op.diag_gram(&weights.to_owned()),
             Self::Sparse(xs) => {
