@@ -234,42 +234,12 @@ pub fn audit_identifiability(specs: &[ParameterBlockSpec]) -> Result<Identifiabi
     let block_heartbeat = (n.saturating_mul(specs.len()) >= 1_000_000)
         .then(crate::util::heartbeat::Heartbeat::default_interval);
     for (idx, spec) in specs.iter().enumerate() {
-        let dense_raw = spec
-            .design
-            .try_to_dense_arc(&format!(
-                "identifiability_audit::audit_identifiability block '{}'",
-                spec.name
-            ))?
-            .as_ref()
-            .clone();
-        // Apply per-row eta scaling when the block specifies it.  For
-        // blocks whose linear-predictor contribution is
-        // `scaling_i · basis_row_i · β` (e.g. the logslope block in
-        // survival marginal-slope where `scaling_i = z_i`), the raw
-        // basis rows look identical to the marginal block's rows and the
-        // flat RRQR flags them as aliases.  Using the scaled rows gives
-        // the correct independence picture.
-        let dense = if let Some(ref scaling) = spec.eta_row_scaling {
-            if scaling.len() != n {
-                return Err(format!(
-                    "identifiability audit: block '{}' eta_row_scaling length {} \
-                     != design nrows {}",
-                    spec.name,
-                    scaling.len(),
-                    n,
-                ));
-            }
-            let mut scaled = dense_raw.clone();
-            for i in 0..n {
-                let s = scaling[i];
-                for j in 0..dense_raw.ncols() {
-                    scaled[[i, j]] *= s;
-                }
-            }
-            scaled
-        } else {
-            dense_raw
-        };
+        // Use spec.effective_design() so the audit operates on the correct
+        // D_eff = diag(row_scaling) · design rather than the raw design.
+        // For blocks with row_scaling = None this is a no-op (D_eff = design).
+        let dense = spec
+            .effective_design("identifiability_audit::audit_identifiability")
+            .map_err(|e| format!("identifiability audit: {e}"))?;
         let p_block = dense.ncols();
         let block_singular = block_pivoted_qr_diagonal(&dense)?;
         let block_rank = count_rank(&block_singular, n, p_block);
@@ -1178,7 +1148,7 @@ mod tests {
             initial_log_lambdas: Array1::<f64>::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
+            row_scaling: None,
         }
     }
 

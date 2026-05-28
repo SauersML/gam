@@ -257,7 +257,7 @@ pub fn canonicalize_for_identifiability(
             // effective linear-predictor scaling is unchanged after
             // column selection (the surviving columns still carry the
             // same per-row scaling as in the original spec).
-            eta_row_scaling: spec.eta_row_scaling.clone(),
+            row_scaling: spec.row_scaling.clone(),
         });
         per_block_transform.push(t_i);
     }
@@ -342,7 +342,7 @@ mod tests {
             initial_log_lambdas: Array1::<f64>::zeros(0),
             initial_beta: None,
             gauge_priority: 100,
-            eta_row_scaling: None,
+            row_scaling: None,
         }
     }
 
