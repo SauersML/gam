@@ -3803,7 +3803,7 @@ mod tests {
             AssignmentMode::softmax(0.7),
         )
         .unwrap();
-        let term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
 
         // Two groups partition the 4 features: {0,1} and {2,3}. Each row
         // of the decoder block has non-zero entries in both groups, so the
