@@ -6465,12 +6465,29 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
                 })
                 .sum()
         }
-        ResponseFamily::Gamma => gamma_loglikelihood_with_shape(
-            y,
-            mu,
-            priorweights,
-            likelihood.gamma_shape().unwrap_or(1.0),
-        ),
+        ResponseFamily::Gamma => {
+            // REML/LAML outer objective: use the scaled-deviance form
+            //   ℓ = −½ D(y, μ) = −Σ wᵢ · shape · d(yᵢ, μᵢ)
+            // (with `shape = 1/φ` folded into the deviance), exactly as the
+            // Tweedie branch above. This is the mgcv convention: the outer
+            // objective only needs the β-dependent part of the log-likelihood
+            // plus the penalty/log-determinant terms; the saturated-likelihood
+            // normalizing constants `shape·ln(shape) − lnΓ(shape) − shape − ln y`
+            // are independent of β (hence of the outer derivative under the
+            // fixed-dispersion handling Gamma is routed through) and are
+            // intentionally dropped.
+            //
+            // Using the full saturated form here is what made the Gamma outer
+            // cost non-finite: the per-iterate shape estimate saturates to
+            // `GAMMA_SHAPE_MAX = 1e12` whenever the working fit drives the unit
+            // deviance toward zero (the common high-dispersion / CV≈1 case),
+            // and `shape·ln(shape) − lnΓ(shape)` evaluated at 1e12 across n rows
+            // overflows. The scaled-deviance form carries no such term: the
+            // bounded unit deviance keeps the product `shape · d(y, μ)` finite
+            // even as the shape grows, so the seed screen no longer rejects
+            // every ρ candidate. See issue #359.
+            -0.5 * calculate_deviance(y, mu, likelihood, priorweights)
+        }
         ResponseFamily::RoystonParmar => f64::NAN,
     }
 }
