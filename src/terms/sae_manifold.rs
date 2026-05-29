@@ -4243,32 +4243,6 @@ impl SaeManifoldTerm {
         })
     }
 
-    /// REML ARD update from accumulated `Σ t²` sufficient statistics, mirroring
-    /// [`Self::update_ard_reml`] but driven by the streaming pass's online
-    /// accumulator instead of a retained coordinate matrix.
-    fn update_ard_reml_from_sumsq(
-        &self,
-        rho: &mut SaeManifoldRho,
-        sumsq: &[Array1<f64>],
-        n_total: usize,
-    ) {
-        let n = n_total as f64;
-        for (atom_idx, coord) in self.assignment.coords.iter().enumerate() {
-            let d = coord.latent_dim();
-            if atom_idx >= sumsq.len() || rho.log_ard[atom_idx].len() != d {
-                continue;
-            }
-            for axis in 0..d {
-                let sq = sumsq[atom_idx][axis];
-                if sq < 1.0e-10 {
-                    continue;
-                }
-                let alpha = n / sq;
-                rho.log_ard[atom_idx][axis] = alpha.ln().clamp(-8.0, 16.0);
-            }
-        }
-    }
-
     pub fn run_single_external_basis_refresh_step_arrow_schur(
         &mut self,
         target: ArrayView2<'_, f64>,
@@ -4279,7 +4253,8 @@ impl SaeManifoldTerm {
         ridge_beta: f64,
     ) -> Result<SaeManifoldLoss, String> {
         self.advance_temperature_schedule()?;
-        self.update_ard_reml(rho)?;
+        // ρ is owned by the outer engine and held fixed across this single
+        // external-basis-refresh Newton step; no in-loop ARD update.
         let pre_step_loss = self.loss(target, rho)?;
         let (delta_ext_coord, delta_beta) = self
             .solve_newton_step(target, rho, analytic_penalties, ridge_ext_coord, ridge_beta)
@@ -4293,7 +4268,6 @@ impl SaeManifoldTerm {
             delta_beta.view(),
             step_size,
         )?;
-        self.update_ard_reml(rho)?;
         Ok(pre_step_loss)
     }
 
