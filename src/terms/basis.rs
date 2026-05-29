@@ -7113,13 +7113,21 @@ fn build_aniso_design_psi_derivatives_shared(
 
     let cs = IMPLICIT_MATVEC_CHUNK_SIZE;
     let nc = n.div_ceil(cs);
-    let err_flag = std::sync::atomic::AtomicBool::new(false);
+    // Capture the *first* underlying radial-evaluation error rather than a
+    // bare boolean: at an extreme trial hyperparameter the anisotropic
+    // distance `r` can push the Duchon/Matérn radial kernel out of its
+    // evaluable range, and the caller (the spatial-κ optimizer) needs the
+    // real cause to decide whether the trial point is merely infeasible
+    // (retreat) versus a genuine invariant violation (abort). Swallowing it
+    // as "radial scalar evaluation failed" hid both the cause and the
+    // recoverability.
+    let first_err: std::sync::Mutex<Option<BasisError>> = std::sync::Mutex::new(None);
     {
         let pp = SendPtr(phi_values.as_mut_ptr());
         let qp = SendPtr(q_values.as_mut_ptr());
         let tp = SendPtr(t_values.as_mut_ptr());
         let ap = SendPtr(axis_components.as_mut_ptr());
-        let ef = &err_flag;
+        let ferr = &first_err;
         (0..nc).into_par_iter().for_each(move |ci| {
             let start = ci * cs;
             let end = start.saturating_add(cs).min(n);
@@ -7136,8 +7144,11 @@ fn build_aniso_design_psi_derivatives_shared(
                     let (r, sv) = aniso_distance_and_components(&drb, &cb, eta);
                     let (phi, q, t) = match radial_kind.eval_design_triplet(r) {
                         Ok(p) => p,
-                        Err(_) => {
-                            ef.store(true, std::sync::atomic::Ordering::Relaxed);
+                        Err(e) => {
+                            let mut slot = ferr.lock().unwrap_or_else(|p| p.into_inner());
+                            if slot.is_none() {
+                                *slot = Some(e);
+                            }
                             return;
                         }
                     };
@@ -7157,10 +7168,11 @@ fn build_aniso_design_psi_derivatives_shared(
             }
         });
     }
-    if err_flag.load(std::sync::atomic::Ordering::Relaxed) {
-        crate::bail_invalid_basis!(
-            "radial scalar evaluation failed during aniso derivative construction".into(),
-        );
+    if let Some(cause) = first_err.into_inner().unwrap_or_else(|p| p.into_inner()) {
+        return Err(BasisError::InvalidInput(format!(
+            "radial scalar evaluation failed during aniso derivative construction \
+             (eta={eta:?}): {cause}"
+        )));
     }
 
     let op = ImplicitDesignPsiDerivative::new(
@@ -7278,13 +7290,13 @@ fn build_scalar_design_psi_derivatives_shared(
 
     let cs = IMPLICIT_MATVEC_CHUNK_SIZE;
     let nc = n.div_ceil(cs);
-    let err_flag = std::sync::atomic::AtomicBool::new(false);
+    let first_err: std::sync::Mutex<Option<BasisError>> = std::sync::Mutex::new(None);
     {
         let pp = SendPtr(phi_values.as_mut_ptr());
         let qp = SendPtr(q_values.as_mut_ptr());
         let tp = SendPtr(t_values.as_mut_ptr());
         let ap = SendPtr(axis_components.as_mut_ptr());
-        let ef = &err_flag;
+        let ferr = &first_err;
         (0..nc).into_par_iter().for_each(move |ci| {
             let start = ci * cs;
             let end = start.saturating_add(cs).min(n);
@@ -7309,8 +7321,11 @@ fn build_scalar_design_psi_derivatives_shared(
                     };
                     let (phi, q, t) = match radial_kind.eval_design_triplet(r) {
                         Ok(p) => p,
-                        Err(_) => {
-                            ef.store(true, std::sync::atomic::Ordering::Relaxed);
+                        Err(e) => {
+                            let mut slot = ferr.lock().unwrap_or_else(|p| p.into_inner());
+                            if slot.is_none() {
+                                *slot = Some(e);
+                            }
                             return;
                         }
                     };
@@ -7328,10 +7343,10 @@ fn build_scalar_design_psi_derivatives_shared(
             }
         });
     }
-    if err_flag.load(std::sync::atomic::Ordering::Relaxed) {
-        crate::bail_invalid_basis!(
-            "radial scalar evaluation failed during scalar derivative construction".into(),
-        );
+    if let Some(cause) = first_err.into_inner().unwrap_or_else(|p| p.into_inner()) {
+        return Err(BasisError::InvalidInput(format!(
+            "radial scalar evaluation failed during scalar derivative construction: {cause}"
+        )));
     }
 
     let op = ImplicitDesignPsiDerivative::new(
