@@ -122,7 +122,7 @@ class _AdaptiveTopKSTE(torch.autograd.Function):
             _, idx = torch.topk(abs_z[row], k=kk)
             hard_mask[row, idx] = 1.0
         z_active_soft = z * soft_mask.to(z.dtype)
-        z_active = z + (z * hard_mask - z_active_soft).detach()
+        z_active = z_active_soft + (z * hard_mask - z_active_soft).detach()
         k_pred_sum = soft_mask.sum(dim=-1)
         ctx.save_for_backward(z, soft_mask, tau, abs_z, k_pred)
         ctx.temperature = float(temperature)
