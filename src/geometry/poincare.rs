@@ -225,6 +225,11 @@ pub struct TangentDecodeCache {
     pub v: Array2<f64>,
     /// Atom positions used (after ball projection), shape `(F, d)`.
     pub atoms_projected: Array2<f64>,
+    /// Per-atom radial ball-projection factor `s_f = min(1, max_norm/|a_raw|)`,
+    /// shape `(F,)`. `s_f == 1` for atoms that were already inside the ball;
+    /// `s_f < 1` marks the atoms that were clamped and so carry a non-identity
+    /// projection Jacobian in [`tangent_decode_backward`] step 4.
+    pub proj_scale: Array1<f64>,
     /// Gate matrix used, shape `(batch, F)`.
     pub gates: Array2<f64>,
     /// Curvature used.
@@ -250,15 +255,23 @@ fn check_atoms_shape(atoms: ArrayView2<'_, f64>, gates: ArrayView2<'_, f64>) -> 
 }
 
 /// Project every atom into the ball, then take `log_0` row-wise.
+///
+/// Returns `(projected, tangents, proj_scale)` where `proj_scale[f]` is the
+/// radial ball-projection factor `s_f = min(1, max_norm / |a_raw_f|)` that was
+/// applied to atom `f`. `s_f == 1` means the raw atom was already inside the
+/// ball (projection is the identity); `s_f < 1` means it was clamped and the
+/// projection Jacobian is non-trivial — [`tangent_decode_backward`] needs
+/// `s_f` to chain the gradient back to the *raw* atom storage.
 fn project_and_log(
     atoms: ArrayView2<'_, f64>,
     curvature: f64,
-) -> GeometryResult<(Array2<f64>, Array2<f64>)> {
+) -> GeometryResult<(Array2<f64>, Array2<f64>, Array1<f64>)> {
     let sqrt_negc = require_negative_curvature(curvature)?;
     let max_norm = (1.0 - BOUNDARY_EPS) / sqrt_negc;
     let (f_atoms, d) = atoms.dim();
     let mut projected = Array2::<f64>::zeros((f_atoms, d));
     let mut tangents = Array2::<f64>::zeros((f_atoms, d));
+    let mut proj_scale = Array1::<f64>::ones(f_atoms);
     for f in 0..f_atoms {
         let row = atoms.row(f);
         let nrm = row.iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -267,6 +280,7 @@ fn project_and_log(
         } else {
             1.0
         };
+        proj_scale[f] = scale;
         for i in 0..d {
             projected[[f, i]] = row[i] * scale;
         }
@@ -284,7 +298,7 @@ fn project_and_log(
             tangents[[f, i]] = coeff * projected[[f, i]];
         }
     }
-    Ok((projected, tangents))
+    Ok((projected, tangents, proj_scale))
 }
 
 /// Forward pass for the Poincaré tangent-space-at-origin decoder.
@@ -298,7 +312,7 @@ pub fn tangent_decode_forward(
 ) -> GeometryResult<(Array2<f64>, TangentDecodeCache)> {
     check_atoms_shape(atoms, gates)?;
     let sqrt_negc = require_negative_curvature(curvature)?;
-    let (projected, tangents) = project_and_log(atoms, curvature)?;
+    let (projected, tangents, proj_scale) = project_and_log(atoms, curvature)?;
     let v = gates.dot(&tangents);
     let (batch, d) = v.dim();
     let mut x_hat = Array2::<f64>::zeros((batch, d));
@@ -318,6 +332,7 @@ pub fn tangent_decode_forward(
         tangents,
         v,
         atoms_projected: projected,
+        proj_scale,
         gates: gates.to_owned(),
         curvature,
     };
@@ -433,22 +448,44 @@ pub fn tangent_decode_backward(
         }
     }
 
-    // Step 4: optional chain rule through the radial ball projection
-    // a_proj = a * min(1, max_norm / |a|). For atoms that were strictly
-    // inside, the projection is the identity and we are done. For atoms
-    // outside, a_proj = (max_norm / |a|) * a, whose Jacobian is
+    // Step 4: chain rule through the radial ball projection
+    // a_proj = a_raw * s_f, with s_f = min(1, max_norm / |a_raw|).
     //
-    //   ∂a_proj_i/∂a_j = (max_norm / |a|) (δ_{ij} - a_i a_j / |a|^2).
+    // For atoms that were strictly inside (s_f == 1) the projection is the
+    // identity and grad_a_raw == grad_a_proj. For atoms that were clamped
+    // (s_f < 1), a_proj = (max_norm / |a_raw|) a_raw, whose Jacobian is
     //
-    // We compare original atoms (not available here) — but `cache.atoms_projected`
-    // is exactly the post-projection value the gradient was computed on, and
-    // for the Python wrapper the parameter is the *raw* atom storage. The
-    // projection is only fired in pathological cases; we pass through the
-    // gradient unchanged here so that the optimiser still moves atoms back
-    // toward the interior (the projection is idempotent so this is the
-    // correct "use the projected gradient" semantics; documented at the
-    // call site).
-    let grad_atoms = grad_atoms_proj;
+    //   ∂a_proj_i/∂a_raw_j = s_f (δ_{ij} - â_i â_j),   â = a_raw / |a_raw|.
+    //
+    // Since a_proj is parallel to a_raw, â = a_proj / |a_proj|, and the
+    // transpose-applied VJP is grad_a_raw = s_f (I - â âᵀ) grad_a_proj. The
+    // radial component of grad_a_proj is annihilated (moving the raw atom
+    // radially outward does not change the clamped projection) — exactly the
+    // missing factor the previous pass-through dropped.
+    let mut grad_atoms = grad_atoms_proj;
+    for f in 0..n_atoms {
+        let s_f = cache.proj_scale[f];
+        if s_f >= 1.0 {
+            continue;
+        }
+        let a_row = cache.atoms_projected.row(f);
+        let a_norm_sq: f64 = (0..d).map(|i| a_row[i] * a_row[i]).sum();
+        if a_norm_sq <= ORIGIN_EPS * ORIGIN_EPS {
+            // Clamp toward the origin cannot fire with a zero-norm projection;
+            // nothing radial to remove.
+            for j in 0..d {
+                grad_atoms[[f, j]] *= s_f;
+            }
+            continue;
+        }
+        // â âᵀ projector onto the radial direction.
+        let g_row: Vec<f64> = (0..d).map(|j| grad_atoms[[f, j]]).collect();
+        let g_dot_a: f64 = (0..d).map(|i| g_row[i] * a_row[i]).sum();
+        let radial_coeff = g_dot_a / a_norm_sq;
+        for j in 0..d {
+            grad_atoms[[f, j]] = s_f * (g_row[j] - radial_coeff * a_row[j]);
+        }
+    }
 
     Ok((grad_gates, grad_atoms))
 }
@@ -808,6 +845,74 @@ mod tests {
             "atom grad: analytic {} vs FD {}",
             grad_atoms[[1, 0]],
             fd_atom
+        );
+    }
+
+    #[test]
+    fn tangent_backward_includes_ball_projection_jacobian() {
+        // Atom 0 starts strictly OUTSIDE the unit ball (|a| ≈ 2.24 > 1 for
+        // curvature -1) so `project_into_ball` clamps it. The backward must
+        // then chain grad through the radial projection a_proj = s·a_raw,
+        // i.e. left-multiply by s·(I - â âᵀ). Finite-differencing the forward
+        // w.r.t. the *raw* atom storage is the only correct guardrail: the
+        // forward consumes raw atoms and re-projects internally, so the FD
+        // gradient is exactly the projected gradient.
+        let atoms = array![[2.0, 1.0], [-0.03, 0.04]];
+        let gates = array![[0.7, -0.5], [0.2, 0.9]];
+        let (x_hat, cache) =
+            tangent_decode_forward(atoms.view(), gates.view(), -1.0).expect("forward");
+        // Atom 0 must have actually been clamped (s_0 < 1); otherwise this
+        // test would silently exercise the identity branch and prove nothing.
+        assert!(
+            cache.proj_scale[0] < 1.0,
+            "atom 0 should have been clamped, got proj_scale {}",
+            cache.proj_scale[0]
+        );
+        assert!(
+            (cache.proj_scale[1] - 1.0).abs() < 1.0e-12,
+            "atom 1 should be interior (proj_scale == 1), got {}",
+            cache.proj_scale[1]
+        );
+
+        let mut grad_x = Array2::<f64>::zeros(x_hat.dim());
+        for i in 0..x_hat.dim().0 {
+            for j in 0..x_hat.dim().1 {
+                grad_x[[i, j]] = 2.0 * x_hat[[i, j]];
+            }
+        }
+        let (_grad_gates, grad_atoms) =
+            tangent_decode_backward(&cache, grad_x.view()).expect("backward");
+
+        let eps = 1.0e-6;
+        // Finite-difference BOTH raw components of the clamped atom 0.
+        for comp in 0..2usize {
+            let mut atoms_p = atoms.clone();
+            atoms_p[[0, comp]] += eps;
+            let (x_p, _) = tangent_decode_forward(atoms_p.view(), gates.view(), -1.0).unwrap();
+            let mut atoms_m = atoms.clone();
+            atoms_m[[0, comp]] -= eps;
+            let (x_m, _) = tangent_decode_forward(atoms_m.view(), gates.view(), -1.0).unwrap();
+            let lp: f64 = x_p.iter().map(|v| v * v).sum();
+            let lm: f64 = x_m.iter().map(|v| v * v).sum();
+            let fd = (lp - lm) / (2.0 * eps);
+            assert!(
+                (fd - grad_atoms[[0, comp]]).abs() < 1.0e-5,
+                "clamped-atom grad comp {comp}: analytic {} vs FD {}",
+                grad_atoms[[0, comp]],
+                fd
+            );
+        }
+
+        // The radial component of the analytic gradient on the clamped atom
+        // must be (numerically) annihilated: moving the raw atom further out
+        // radially does not change its projection, so the projected gradient
+        // is orthogonal to â. Verify directly.
+        let a0 = cache.atoms_projected.row(0);
+        let a0_norm = (a0[0] * a0[0] + a0[1] * a0[1]).sqrt();
+        let radial = (grad_atoms[[0, 0]] * a0[0] + grad_atoms[[0, 1]] * a0[1]) / a0_norm;
+        assert!(
+            radial.abs() < 1.0e-8,
+            "clamped-atom gradient should have ~zero radial component, got {radial}"
         );
     }
 

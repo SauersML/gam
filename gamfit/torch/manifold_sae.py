@@ -52,6 +52,7 @@ from .penalties import (
     IBPAssignmentPenalty,
     JumpReLUPenalty,
     MonotonicityPenalty,
+    ibp_map,
 )
 
 
@@ -476,36 +477,30 @@ class _SparsityLayer(nn.Module):
         self.register_buffer(
             "tau", torch.tensor(float(cfg.sparsity.tau_start)), persistent=True
         )
-        self._tau_start = float(cfg.sparsity.tau_start)
-        self._tau_min = float(cfg.sparsity.tau_min)
-        self._tau_schedule = str(cfg.sparsity.tau_schedule)
-        self._tau_steps = int(cfg.sparsity.tau_steps)
-        self._step = 0
+        # Single source of truth for annealing: the Rust
+        # GumbelTemperatureSchedule. We hold the descriptor and query τ through
+        # the FFI accessor rather than re-deriving the decay in Python.
+        self._schedule = cfg.sparsity.gumbel_schedule()
+        self._init_alpha = float(cfg.sparsity.init_alpha)
 
     @torch.no_grad()
     def advance_temperature(self) -> None:
-        """Anneal ``tau`` along the configured schedule.
+        """Anneal ``tau`` by advancing the Rust ``GumbelTemperatureSchedule``.
 
-        Mirrors the schedule policy of :class:`gamfit.GumbelTemperatureSchedule`
-        (decay kinds match the Rust descriptor's accepted set).
+        The schedule owns the iteration counter and evaluates the decay through
+        the Rust ``gumbel_schedule_tau`` FFI, so the annealing arithmetic lives
+        in exactly one place (no Python-side step bookkeeping).
         """
-        self._step += 1
-        s = float(self._step)
-        if self._tau_schedule == "linear":
-            frac = min(1.0, s / float(self._tau_steps))
-            new_tau = self._tau_start + (self._tau_min - self._tau_start) * frac
-        elif self._tau_schedule == "geometric":
-            rate = (self._tau_min / self._tau_start) ** (1.0 / max(1, self._tau_steps))
-            new_tau = max(self._tau_min, self._tau_start * (rate ** s))
-        else:
-            new_tau = max(self._tau_min, self._tau_start / (1.0 + s))
-        self.tau.fill_(float(new_tau))
+        self.tau.fill_(float(self._schedule.step()))
 
     def forward(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply the sparsity gate. Returns ``(assignments, gate_pre)``."""
         if self.kind == "ibp_gumbel":
-            tau = float(self.tau.item())
-            assignments = torch.sigmoid(logits / max(tau, 1e-6))
+            tau = max(float(self.tau.item()), 1e-6)
+            # Route through the Rust IBP-MAP value+grad kernel so the torch
+            # forward applies the stick-breaking prior π_k and temperature
+            # scaling that the closed-form fit uses (single source of truth).
+            assignments = ibp_map(logits, tau, self._init_alpha)
             return assignments, logits
         if self.kind == "softmax_topk":
             tau = float(self.tau.item())

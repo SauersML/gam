@@ -175,6 +175,83 @@ impl RiemannianManifold for SphereManifold {
         check_len("Sphere projection vector", vec.len(), self.ambient_dim())?;
         Ok(vec.to_owned() - &(point.to_owned() * dot(point, vec)))
     }
+
+    fn exp_map_vjp(
+        &self,
+        point: ArrayView1<'_, f64>,
+        tangent_vec: ArrayView1<'_, f64>,
+        grad_output: ArrayView1<'_, f64>,
+    ) -> GeometryResult<(Array1<f64>, Array1<f64>)> {
+        let m = self.ambient_dim();
+        check_len("Sphere exp_map_vjp point", point.len(), m)?;
+        check_len("Sphere exp_map_vjp tangent", tangent_vec.len(), m)?;
+        check_len("Sphere exp_map_vjp grad", grad_output.len(), m)?;
+
+        // Forward map: with `xi = (I - p p^T) v`, `theta = |xi|`,
+        //   y = cos(theta) p + (sin(theta)/theta) xi.
+        // We differentiate this closed form and return the transpose-applied
+        // (vector–Jacobian) products w.r.t. the base point `p` and the raw
+        // (unprojected) tangent input `v`.
+        let c = dot(point, tangent_vec); // p · v
+        let xi = &tangent_vec.to_owned() - &(point.to_owned() * c);
+        let theta = norm(xi.view());
+        let g = grad_output;
+        let p = point;
+        let v = tangent_vec;
+
+        // Small-theta limit: y -> normalize(p + xi) and to first order the map
+        // is exp_p(v) ≈ p + xi, so g_xi = (I - p p^T) g and the radial part
+        // collapses. Use a Taylor-stable branch that matches `exp_map`'s
+        // `theta < 1e-10` switch so backward is consistent with forward.
+        if theta < 1.0e-10 {
+            // xi ≈ 0. dy/dv = (I - p p^T); dy/dp = (1 - c) I - p v^T (from
+            // y ≈ p + v - p(p·v), the first-order normalized expansion).
+            let p_dot_g = dot(p, g.view());
+            // grad_v = (I - p p^T) g = g - p (p·g).
+            let grad_v = &g.to_owned() - &(p.to_owned() * p_dot_g);
+            // grad_p = (1 - c) g - v (p·g)  [transpose of (1-c) I - p v^T].
+            let grad_p = &(g.to_owned() * (1.0 - c)) - &(v.to_owned() * p_dot_g);
+            return Ok((grad_p, grad_v));
+        }
+
+        let sin_t = theta.sin();
+        let cos_t = theta.cos();
+        let g_fn = sin_t / theta; // g(theta) = sin(theta)/theta
+        // g'(theta) = (theta cos(theta) - sin(theta)) / theta^2.
+        let g_prime = (theta * cos_t - sin_t) / (theta * theta);
+
+        // We do NOT assume |p| == 1: the forward `exp_map` uses `point`
+        // verbatim, so the honest VJP must be exact for any ambient `p`. With
+        //   c = p·v,  n2 = |p|^2,  xi = v - c p,  theta = |xi|,
+        //   y = cos(theta) p + g(theta) xi,
+        // and using xi·p = c(1 - n2), the differentials give (see module
+        // notes / derivation below) for any cotangent `g`:
+        //   grad_v = alpha * w_v + g_fn (g - p (p·g)),
+        //   grad_p = cos(theta) g + alpha * w_p - g_fn (c g + v (p·g)),
+        // where
+        //   alpha = -sin(theta)(p·g) + g'(theta)(xi·g),
+        //   w_v   = (xi - c(1 - n2) p) / theta,
+        //   w_p   = -(c xi + c(1 - n2) v) / theta.
+        // For unit p (n2 == 1) the `c(1 - n2)` terms vanish and this reduces
+        // to the textbook on-sphere Jacobi-field VJP.
+        let n2 = dot(p, p);
+        let p_dot_g = dot(p, g);
+        let xi_dot_g = dot(xi.view(), g);
+        let alpha = -sin_t * p_dot_g + g_prime * xi_dot_g;
+        let cn = c * (1.0 - n2);
+
+        // w_v = (xi - c(1-n2) p) / theta.
+        let w_v = (&xi - &(p.to_owned() * cn)) / theta;
+        let g_perp = &g.to_owned() - &(p.to_owned() * p_dot_g);
+        let grad_v = &(&w_v * alpha) + &(&g_perp * g_fn);
+
+        // w_p = -(c xi + c(1-n2) v) / theta.
+        let w_p = (&(&xi * c) + &(v.to_owned() * cn)) / (-theta);
+        let p_term = &(g.to_owned() * c) + &(v.to_owned() * p_dot_g);
+        let grad_p = &(&(&w_p * alpha) + &(g.to_owned() * cos_t)) - &(&p_term * g_fn);
+
+        Ok((grad_p, grad_v))
+    }
 }
 
 fn validate_sphere_matrix(values: ArrayView2<'_, f64>) -> Result<(), String> {

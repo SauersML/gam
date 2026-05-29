@@ -10,13 +10,14 @@ which in turn calls the canonical Rust implementations under
 
 Torch interop: when the input is a ``torch.Tensor`` we wrap the Rust call
 in a :class:`torch.autograd.Function` so callers get a tensor back.
-Backward is implemented for the flat (Euclidean / Circle / Torus /
-Cylinder product) cases where ``∂ exp_p(v)/∂{p, v}`` is the identity;
-curved manifolds (Sphere, Grassmann, …) currently return ``None``
-gradients for ``p`` and ``v`` from the Rust path — callers that need
-``grad`` through curved-manifold exp/log should rely on the analytic
-identity that the gradient lives in the tangent space (i.e. project
-through ``project_tangent`` themselves).
+Backward routes through the canonical Rust analytic vector–Jacobian product
+``gam_pyffi._rust.manifold_exp_map_vjp`` (dispatching
+``RiemannianManifold::exp_map_vjp``): exact for flat manifolds (Euclidean /
+Circle / Torus / products thereof, where the VJP collapses to the identity)
+*and* for curved ones (Sphere, products containing a Sphere). No
+straight-through identity is applied to a curved manifold, and no Riemannian
+math is recomputed on the torch side. Manifolds with no closed-form backward
+(Grassmann / Stiefel / SPD) raise from Rust rather than emit wrong gradients.
 """
 
 from __future__ import annotations
@@ -33,6 +34,24 @@ from ._protocol import ManifoldDescriptor, _require_torch
 def _exp_map_rust(manifold_json: str, points: np.ndarray, vecs: np.ndarray) -> np.ndarray:
     out = _rust_module().manifold_exp_map(manifold_json, points, vecs)
     return np.asarray(out, dtype=np.float64)
+
+
+def _exp_map_vjp_rust(
+    manifold_json: str,
+    points: np.ndarray,
+    vecs: np.ndarray,
+    grad_output: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Analytic vector–Jacobian product of ``exp_p(v)``, all math in Rust.
+
+    Returns ``(grad_points, grad_vecs)`` as float64 arrays. Raises whatever
+    the Rust ``RiemannianManifold::exp_map_vjp`` raises for manifolds with no
+    closed-form backward (Grassmann / Stiefel / SPD) — we never substitute a
+    silently-wrong identity gradient on a curved manifold."""
+    grad_p, grad_v = _rust_module().manifold_exp_map_vjp(
+        manifold_json, points, vecs, grad_output
+    )
+    return np.asarray(grad_p, dtype=np.float64), np.asarray(grad_v, dtype=np.float64)
 
 
 def _log_map_rust(manifold_json: str, p_from: np.ndarray, p_to: np.ndarray) -> np.ndarray:
@@ -73,10 +92,15 @@ def _to_2d_numpy(x: Any) -> tuple[np.ndarray, tuple[int, ...]]:
 class _ExpMapFn:
     """Lazy torch.autograd.Function wrapping the Rust ``manifold_exp_map``.
 
-    Backward returns straight-through gradients on ``p`` and ``v``; this
-    matches the Rust ``RiemannianManifold`` contract for the flat cases
-    (Euclidean / Circle / Torus / product-of-flats) and is the standard
-    first-order tangent-space approximation for curved cases.
+    Backward is the *analytic* vector–Jacobian product of ``exp_p(v)``,
+    computed entirely in Rust via ``manifold_exp_map_vjp`` (which dispatches
+    ``RiemannianManifold::exp_map_vjp``). This is exact for both flat manifolds
+    (Euclidean / Circle / Torus / products thereof, where the VJP reduces to
+    the identity) and curved ones (Sphere, and products containing a Sphere,
+    where the Jacobi-field VJP is genuinely non-identity). There is no
+    straight-through approximation and no torch-side recompute of the
+    geometry. Manifolds without a closed-form backward (Grassmann / Stiefel /
+    SPD) raise from Rust rather than return a silently-wrong gradient.
     """
 
     _impl = None
@@ -99,14 +123,29 @@ class _ExpMapFn:
                 if squeeze:
                     out = out.reshape(-1)
                 ctx.save_for_backward(p, v)
+                ctx.manifold_json = manifold_json
+                ctx.squeeze = squeeze
                 return torch.as_tensor(out, dtype=p.dtype, device=p.device)
 
             @staticmethod
             def backward(ctx: Any, grad_output: Any) -> tuple[Any, Any, None]:
                 p, v = ctx.saved_tensors
+                squeeze = ctx.squeeze
+                p_np = p.detach().cpu().to(torch.float64).contiguous().numpy()
+                v_np = v.detach().cpu().to(torch.float64).contiguous().numpy()
+                g_np = grad_output.detach().cpu().to(torch.float64).contiguous().numpy()
+                p_2d = p_np.reshape(1, -1) if squeeze else p_np
+                v_2d = v_np.reshape(1, -1) if v_np.ndim == 1 else v_np
+                g_2d = g_np.reshape(1, -1) if squeeze else g_np
+                grad_p_np, grad_v_np = _exp_map_vjp_rust(
+                    ctx.manifold_json, p_2d, v_2d, g_2d
+                )
+                if squeeze:
+                    grad_p_np = grad_p_np.reshape(-1)
+                    grad_v_np = grad_v_np.reshape(-1)
                 return (
-                    grad_output.to(dtype=p.dtype, device=p.device),
-                    grad_output.to(dtype=v.dtype, device=v.device),
+                    torch.as_tensor(grad_p_np, dtype=p.dtype, device=p.device),
+                    torch.as_tensor(grad_v_np, dtype=v.dtype, device=v.device),
                     None,
                 )
 

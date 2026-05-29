@@ -228,3 +228,152 @@ fn geodesic_integrator_should_approximately_conserve_energy_on_sphere() {
         "GeodesicIntegrator should approximately conserve kinetic energy along the curve"
     );
 }
+
+// --- Curved-manifold exp backward (analytic VJP) parity guardrail ---------
+//
+// `RiemannianManifold::exp_map_vjp` must return the *exact* transpose-Jacobian
+// of the ambient map `exp_p(v)` as implemented (NOT a straight-through
+// identity). We pin it on the Sphere — the curved manifold reachable from the
+// Python `gamfit.Sphere` autograd wrapper — by central finite-differencing the
+// scalar `L(p, v) = g · exp_p(v)` for an arbitrary cotangent `g`; then
+// `dL/dp == grad_p` and `dL/dv == grad_v` componentwise. The probe perturbs
+// both `p` (deliberately taken slightly OFF the unit sphere) and `v`, so it
+// exercises the general |p| != 1 form of the VJP, not just the on-sphere case.
+#[test]
+fn sphere_exp_map_vjp_matches_finite_difference() {
+    let m = SphereManifold::new(2);
+    // Base point intentionally slightly off the unit sphere so the test
+    // covers the general n2 = |p|^2 != 1 branch of the analytic VJP.
+    let p = array![0.9, 0.2, -0.3];
+    let v = array![0.1, 0.5, 0.25];
+    // Arbitrary, non-degenerate cotangent so every Jacobian entry is probed.
+    let g = array![0.7, -1.3, 0.4];
+
+    // Theta must be safely inside the main (non-small-angle) branch.
+    let c = p.dot(&v);
+    let xi = &v - &(&p * c);
+    let theta = norm(&xi);
+    assert!(
+        theta > 1.0e-3,
+        "test setup should exercise the main branch, got theta {theta}"
+    );
+
+    let (grad_p, grad_v) = m
+        .exp_map_vjp(p.view(), v.view(), g.view())
+        .expect("sphere exp_map_vjp");
+
+    let scalar_loss = |pp: &Array1<f64>, vv: &Array1<f64>| -> f64 {
+        let y = m.exp_map(pp.view(), vv.view()).expect("exp_map");
+        g.dot(&y)
+    };
+
+    let eps = 1.0e-6;
+    for i in 0..3 {
+        let mut pp = p.clone();
+        pp[i] += eps;
+        let mut pm = p.clone();
+        pm[i] -= eps;
+        let fd_p = (scalar_loss(&pp, &v) - scalar_loss(&pm, &v)) / (2.0 * eps);
+        assert!(
+            (fd_p - grad_p[i]).abs() < 1.0e-5,
+            "sphere grad_p[{i}]: analytic {} vs FD {}",
+            grad_p[i],
+            fd_p
+        );
+
+        let mut vp = v.clone();
+        vp[i] += eps;
+        let mut vm = v.clone();
+        vm[i] -= eps;
+        let fd_v = (scalar_loss(&p, &vp) - scalar_loss(&p, &vm)) / (2.0 * eps);
+        assert!(
+            (fd_v - grad_v[i]).abs() < 1.0e-5,
+            "sphere grad_v[{i}]: analytic {} vs FD {}",
+            grad_v[i],
+            fd_v
+        );
+    }
+}
+
+// Curved manifolds without a closed-form backward must REFUSE rather than
+// inherit the silently-wrong flat identity default. Grassmann/Stiefel/SPD all
+// route through `GeometryError::Unsupported`.
+#[test]
+fn closed_form_less_manifolds_refuse_exp_map_vjp() {
+    let gr = GrassmannManifold::new(1, 3);
+    let p = array![1.0, 0.0, 0.0];
+    let v = array![0.0, 0.2, 0.1];
+    let g = array![0.3, -0.4, 0.5];
+    assert!(
+        gr.exp_map_vjp(p.view(), v.view(), g.view()).is_err(),
+        "Grassmann exp_map_vjp must refuse instead of returning identity grads"
+    );
+
+    let st = StiefelManifold::new(1, 3);
+    assert!(
+        st.exp_map_vjp(p.view(), v.view(), g.view()).is_err(),
+        "Stiefel exp_map_vjp must refuse instead of returning identity grads"
+    );
+
+    let spd = SpdManifold::new(2);
+    let p_spd = array![1.0, 0.0, 0.0, 1.0];
+    let v_spd = array![0.1, 0.05, 0.05, 0.2];
+    let g_spd = array![0.3, -0.1, -0.1, 0.4];
+    assert!(
+        spd.exp_map_vjp(p_spd.view(), v_spd.view(), g_spd.view())
+            .is_err(),
+        "SPD exp_map_vjp must refuse instead of returning identity grads"
+    );
+}
+
+// Flat manifolds (and products thereof) keep the exact identity VJP, and a
+// product dispatches per-component so a Sphere factor uses its real backward.
+#[test]
+fn flat_and_product_exp_map_vjp_dispatch_correctly() {
+    // Euclidean: exp_p(v) = p + v, both Jacobians are the identity.
+    let e = EuclideanManifold::new(3);
+    let p = array![0.1, -0.2, 0.3];
+    let v = array![0.4, 0.5, -0.6];
+    let g = array![1.0, -2.0, 3.0];
+    let (gp, gv) = e.exp_map_vjp(p.view(), v.view(), g.view()).unwrap();
+    assert!(norm(&(&gp - &g)) < 1.0e-12 && norm(&(&gv - &g)) < 1.0e-12);
+
+    // Product Circle x Euclidean(1) (the cylinder model): both factors flat,
+    // so the whole VJP is the identity. Validate via FD of the ambient map.
+    let prod = ProductManifold::new(vec![
+        Box::new(CircleManifold::new()),
+        Box::new(EuclideanManifold::new(1)),
+    ]);
+    let pp = array![0.3, 0.7];
+    let vv = array![0.2, -0.4];
+    let gg = array![0.9, -1.1];
+    let (gpp, gvv) = prod.exp_map_vjp(pp.view(), vv.view(), gg.view()).unwrap();
+    let loss = |a: &Array1<f64>, b: &Array1<f64>| -> f64 {
+        gg.dot(&prod.exp_map(a.view(), b.view()).unwrap())
+    };
+    let eps = 1.0e-6;
+    for i in 0..2 {
+        let mut a_p = pp.clone();
+        a_p[i] += eps;
+        let mut a_m = pp.clone();
+        a_m[i] -= eps;
+        let fd = (loss(&a_p, &vv) - loss(&a_m, &vv)) / (2.0 * eps);
+        assert!(
+            (fd - gpp[i]).abs() < 1.0e-5,
+            "product grad_p[{i}]: analytic {} vs FD {}",
+            gpp[i],
+            fd
+        );
+        let mut b_p = vv.clone();
+        b_p[i] += eps;
+        let mut b_m = vv.clone();
+        b_m[i] -= eps;
+        let fdv = (loss(&pp, &b_p) - loss(&pp, &b_m)) / (2.0 * eps);
+        assert!(
+            (fdv - gvv[i]).abs() < 1.0e-5,
+            "product grad_v[{i}]: analytic {} vs FD {}",
+            gvv[i],
+            fdv
+        );
+    }
+}

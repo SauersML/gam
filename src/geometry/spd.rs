@@ -188,4 +188,22 @@ impl RiemannianManifold for SpdManifold {
         check_len("SPD projection point", point.len(), self.ambient_dim())?;
         Ok(flatten(&sym(&from_flat(vec, self.n, self.n)?)))
     }
+
+    fn exp_map_vjp(
+        &self,
+        point: ArrayView1<'_, f64>,
+        tangent_vec: ArrayView1<'_, f64>,
+        grad_output: ArrayView1<'_, f64>,
+    ) -> GeometryResult<(Array1<f64>, Array1<f64>)> {
+        let m = self.ambient_dim();
+        check_len("SPD exp_map_vjp point", point.len(), m)?;
+        check_len("SPD exp_map_vjp tangent", tangent_vec.len(), m)?;
+        check_len("SPD exp_map_vjp grad", grad_output.len(), m)?;
+        // The affine-invariant SPD exponential VJP requires differentiating
+        // the symmetric matrix exponential / Fréchet derivative; no closed
+        // form is wired up. Refuse rather than inherit the identity default.
+        Err(GeometryError::Unsupported(
+            "SPD exp_map_vjp: no analytic backward implemented",
+        ))
+    }
 }

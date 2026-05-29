@@ -1,8 +1,8 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::geometry::manifold::{
-    GeometryResult, RiemannianManifold, check_len, dot, flatten, from_flat, identity, qr_thin, sym,
-    zero_christoffel,
+    GeometryError, GeometryResult, RiemannianManifold, check_len, dot, flatten, from_flat, identity,
+    qr_thin, sym, zero_christoffel,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,5 +151,23 @@ impl RiemannianManifold for StiefelManifold {
         tangent_vec: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
         self.exp_map(point, tangent_vec)
+    }
+
+    fn exp_map_vjp(
+        &self,
+        point: ArrayView1<'_, f64>,
+        tangent_vec: ArrayView1<'_, f64>,
+        grad_output: ArrayView1<'_, f64>,
+    ) -> GeometryResult<(Array1<f64>, Array1<f64>)> {
+        let m = self.ambient_dim();
+        check_len("Stiefel exp_map_vjp point", point.len(), m)?;
+        check_len("Stiefel exp_map_vjp tangent", tangent_vec.len(), m)?;
+        check_len("Stiefel exp_map_vjp grad", grad_output.len(), m)?;
+        // The Stiefel geodesic VJP requires differentiating the matrix
+        // exponential of the canonical block form; no closed form is wired
+        // up. Refuse rather than inherit the flat identity default.
+        Err(GeometryError::Unsupported(
+            "Stiefel exp_map_vjp: no analytic backward implemented",
+        ))
     }
 }

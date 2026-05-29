@@ -13,6 +13,10 @@ pub enum GeometryError {
     },
     InvalidPoint(&'static str),
     Singular(&'static str),
+    /// A manifold primitive has no implementation for this manifold and must
+    /// not silently fall back to a wrong default (e.g. a curved-manifold VJP
+    /// for which no closed form is wired up yet).
+    Unsupported(&'static str),
 }
 
 impl fmt::Display for GeometryError {
@@ -25,6 +29,7 @@ impl fmt::Display for GeometryError {
             } => write!(f, "{context} expected length {expected}, got {got}"),
             Self::InvalidPoint(message) => write!(f, "invalid manifold point: {message}"),
             Self::Singular(message) => write!(f, "singular geometry operation: {message}"),
+            Self::Unsupported(message) => write!(f, "unsupported geometry operation: {message}"),
         }
     }
 }
@@ -96,6 +101,35 @@ pub trait RiemannianManifold: Send + Sync {
         tangent_vec: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
         self.exp_map(point, tangent_vec)
+    }
+
+    /// Vector–Jacobian product of the ambient map `exp_p(v)`.
+    ///
+    /// Given a cotangent `grad_output` w.r.t. the ambient output of
+    /// [`exp_map`](Self::exp_map), return `(grad_point, grad_tangent)`, the
+    /// pullbacks w.r.t. the base point `p` and the (raw, unprojected) tangent
+    /// input `v`. This is the analytic backward used by reverse-mode autodiff
+    /// wrappers (e.g. the Python `torch.autograd.Function` around
+    /// `manifold_exp_map`); it must never be the silent straight-through
+    /// identity for a curved manifold.
+    ///
+    /// The default is the exact VJP for *flat* manifolds, where
+    /// `exp_p(v) = p + v` in ambient coordinates and so both Jacobians are the
+    /// identity (Euclidean, Circle, Torus, and products thereof). Curved
+    /// manifolds **must** override this with their analytic Jacobi-field VJP;
+    /// a manifold without a closed form must override it to return an error
+    /// rather than inherit the wrong identity default.
+    fn exp_map_vjp(
+        &self,
+        point: ArrayView1<'_, f64>,
+        tangent_vec: ArrayView1<'_, f64>,
+        grad_output: ArrayView1<'_, f64>,
+    ) -> GeometryResult<(Array1<f64>, Array1<f64>)> {
+        let m = self.ambient_dim();
+        check_len("exp_map_vjp point", point.len(), m)?;
+        check_len("exp_map_vjp tangent", tangent_vec.len(), m)?;
+        check_len("exp_map_vjp grad_output", grad_output.len(), m)?;
+        Ok((grad_output.to_owned(), grad_output.to_owned()))
     }
 }
 
