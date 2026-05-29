@@ -184,6 +184,36 @@ pub enum ShapeConstraint {
     Concave,
 }
 
+/// Parse a shape-constraint string into a [`ShapeConstraint`].
+///
+/// This is the single source of truth shared by the formula DSL
+/// (`s(x, shape=...)`) and the `smooths={...}` override path
+/// (`Smooth.shape_constraint`). The accepted spellings cover the canonical
+/// Python `ShapeConstraintLiteral` strings exactly
+/// (`"none"` / `"monotone_increasing"` / `"monotone_decreasing"` /
+/// `"convex"` / `"concave"`) plus a few common aliases. Hyphens and case are
+/// normalized, so `"Monotone-Increasing"` and `"mono_inc"` both resolve to
+/// [`ShapeConstraint::MonotoneIncreasing`].
+pub fn parse_shape_constraint(raw: &str) -> Result<ShapeConstraint, String> {
+    let normalized = raw.trim().to_ascii_lowercase().replace('-', "_");
+    match normalized.as_str() {
+        "" | "none" => Ok(ShapeConstraint::None),
+        "monotone_increasing" | "monotonic_increasing" | "increasing" | "mono_inc" | "mpi" => {
+            Ok(ShapeConstraint::MonotoneIncreasing)
+        }
+        "monotone_decreasing" | "monotonic_decreasing" | "decreasing" | "mono_dec" | "mpd" => {
+            Ok(ShapeConstraint::MonotoneDecreasing)
+        }
+        "convex" | "cvx" => Ok(ShapeConstraint::Convex),
+        "concave" | "ccv" => Ok(ShapeConstraint::Concave),
+        other => Err(format!(
+            "unknown shape constraint {other:?}; expected one of \
+             \"none\", \"monotone_increasing\", \"monotone_decreasing\", \
+             \"convex\", \"concave\""
+        )),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BySmoothKind {
     Numeric,
