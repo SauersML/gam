@@ -13,12 +13,11 @@
 //!   * **Python** via `python3` — `scikit-learn`, `scipy`, `statsmodels`,
 //!     `lifelines`, `scikit-survival`, and anything else importable.
 //!
-//! Availability gate: when the interpreter or a required package is absent the
-//! `require_*` helpers print a loud `SKIP` line to stderr (mirroring the GPU
-//! gate) and return `false`, so a comparison is never silently counted as a
-//! pass. A CI job that provisions the reference stack is expected to assert
-//! that no `SKIP` lines appear (see the companion guard test), exactly the way
-//! the CUDA gate is enforced on GPU runners.
+//! There is **no skip path**. If the interpreter or a required package is not
+//! installed, `run_r`/`run_python` fail loudly and the test fails — a missing
+//! reference dependency is a real failure, not a silent pass. CI is expected to
+//! provision the reference stack. (Only genuine hardware gates, e.g. CUDA, are
+//! allowed to skip; that lives in `tests/common/gpu_gate.rs`, not here.)
 //!
 //! Wire protocol (kept dependency-free on purpose — no JSON crate on the R/
 //! Python side): the test body calls `emit("key", numeric_vector)` for every
@@ -29,7 +28,6 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Parsed results emitted by a reference-tool body via `emit(key, values)`.
@@ -38,8 +36,8 @@ pub struct ReferenceResult {
 }
 
 impl ReferenceResult {
-    /// Fetch a single scalar emitted under `key`. Panics (failing the test
-    /// loudly) when the key is missing or did not carry exactly one value.
+    /// Fetch a single scalar emitted under `key`. Fails the test loudly when
+    /// the key is missing or did not carry exactly one value.
     pub fn scalar(&self, key: &str) -> f64 {
         let v = self.vector(key);
         assert_eq!(
@@ -51,14 +49,14 @@ impl ReferenceResult {
         v[0]
     }
 
-    /// Fetch the vector emitted under `key`. Panics when the key is missing.
+    /// Fetch the vector emitted under `key`. Fails the test when the key is
+    /// missing.
     pub fn vector(&self, key: &str) -> &[f64] {
-        self.values.get(key).map(Vec::as_slice).unwrap_or_else(|| {
-            let available: Vec<&str> = self.values.keys().map(String::as_str).collect();
-            // SAFETY: a missing key is a test-authoring error — the reference body
-            // never emitted the quantity the comparison asked for; fail loudly.
-            panic!("reference did not emit key {key:?}; emitted keys: {available:?}");
-        })
+        let msg = format!(
+            "reference did not emit key {key:?}; emitted keys: {:?}",
+            self.keys()
+        );
+        self.values.get(key).expect(&msg).as_slice()
     }
 
     /// Keys the reference body emitted, for diagnostics.
@@ -83,125 +81,17 @@ impl<'a> Column<'a> {
     }
 }
 
-fn rscript_present() -> bool {
-    static PRESENT: OnceLock<bool> = OnceLock::new();
-    *PRESENT.get_or_init(|| {
-        Command::new("Rscript")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    })
-}
-
-fn python_present() -> bool {
-    static PRESENT: OnceLock<bool> = OnceLock::new();
-    *PRESENT.get_or_init(|| {
-        Command::new("python3")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    })
-}
-
-fn r_packages_present(packages: &[&str]) -> bool {
-    if packages.is_empty() {
-        return true;
-    }
-    let probe = packages
-        .iter()
-        .map(|p| format!("requireNamespace('{p}', quietly=TRUE)"))
-        .collect::<Vec<_>>()
-        .join(" && ");
-    let expr = format!("q(status = if ({probe}) 0L else 1L)");
-    Command::new("Rscript")
-        .arg("-e")
-        .arg(expr)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn python_modules_present(modules: &[&str]) -> bool {
-    if modules.is_empty() {
-        return true;
-    }
-    let imports = modules
-        .iter()
-        .map(|m| format!("import importlib,sys; importlib.import_module('{m}')"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    Command::new("python3")
-        .arg("-c")
-        .arg(imports)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn emit_skip(test: &str, tool: &str, missing: &str) {
-    use std::io::Write;
-    // Best-effort stderr write, matching the visualizer's stderr-gate pattern
-    // (`.ok()` discards the io::Result — a failed SKIP print is not itself a
-    // test failure). Written via `writeln!` rather than `eprintln!` so the
-    // build.rs banned-substring scanner does not read it as a `println!`.
-    writeln!(
-        std::io::stderr(),
-        "SKIP {test}: reference tool unavailable -- {tool} ({missing}). \
-         The reference-comparison CI job provisions this stack and a guard \
-         test asserts no SKIP lines appear there."
-    )
-    .ok();
-}
-
-/// Gate a test on R + the listed packages. Returns `true` when the comparison
-/// can run; otherwise prints a loud `SKIP` line and returns `false` so the test
-/// should early-return.
-pub fn require_r(test: &str, packages: &[&str]) -> bool {
-    if !rscript_present() {
-        emit_skip(test, "Rscript", "interpreter not on PATH");
-        return false;
-    }
-    if !r_packages_present(packages) {
-        emit_skip(test, "Rscript", &format!("missing packages {packages:?}"));
-        return false;
-    }
-    true
-}
-
-/// Gate a test on python3 + the listed importable modules.
-pub fn require_python(test: &str, modules: &[&str]) -> bool {
-    if !python_present() {
-        emit_skip(test, "python3", "interpreter not on PATH");
-        return false;
-    }
-    if !python_modules_present(modules) {
-        emit_skip(test, "python3", &format!("missing modules {modules:?}"));
-        return false;
-    }
-    true
-}
-
 fn unique_scratch_dir(tag: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut dir = std::env::temp_dir();
-    dir.push(format!(
-        "gam_reference_{}_{}_{}",
-        tag,
-        std::process::id(),
-        n
-    ));
+    dir.push(format!("gam_reference_{}_{}_{}", tag, std::process::id(), n));
     std::fs::create_dir_all(&dir).expect("create reference scratch dir");
     dir
 }
 
 fn write_columns_csv(path: &std::path::Path, columns: &[Column<'_>]) {
-    assert!(
-        !columns.is_empty(),
-        "reference run needs at least one column"
-    );
+    assert!(!columns.is_empty(), "reference run needs at least one column");
     let nrows = columns[0].data.len();
     for c in columns {
         assert_eq!(
@@ -257,10 +147,7 @@ fn parse_emitted(text: &str) -> BTreeMap<String, Vec<f64>> {
                 "-Inf" | "-inf" => f64::NEG_INFINITY,
                 other => other
                     .parse::<f64>()
-                    // SAFETY: the reference wire protocol emits only numeric tokens
-                    // (or the NA/Inf sentinels handled above); a non-numeric token is
-                    // a corrupted reference run and must fail the test, not parse to 0.
-                    .unwrap_or_else(|_| panic!("reference emitted unparsable value {other:?}")),
+                    .expect("reference emitted an unparsable numeric token"),
             })
             .collect();
         out.insert(key.to_string(), values);
@@ -270,9 +157,10 @@ fn parse_emitted(text: &str) -> BTreeMap<String, Vec<f64>> {
 
 /// Run an R reference body. The columns are exposed as a `data.frame` named
 /// `df`; the body calls `emit("key", numeric_vector)` to return results. The
-/// harness prepends the `df`, output path, and `emit` helper. Panics with the
-/// captured stderr when R exits non-zero — a broken reference run is a hard
-/// test failure, never a silent skip.
+/// harness prepends the `df`, output path, and `emit` helper. Fails the test
+/// with the captured stderr when R exits non-zero — a broken or unavailable
+/// reference run (missing `Rscript`, missing package, R error) is a hard test
+/// failure, never a silent skip.
 pub fn run_r(columns: &[Column<'_>], body: &str) -> ReferenceResult {
     let dir = unique_scratch_dir("r");
     let data_csv = dir.join("data.csv");
@@ -297,20 +185,15 @@ emit <- function(key, x) {\n\
         .arg(&data_csv)
         .arg(&out_txt)
         .output()
-        .expect("spawn Rscript");
+        .expect("spawn Rscript (install R to run reference-comparison tests)");
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        // SAFETY: a non-zero Rscript exit means the reference body itself is
-        // broken (syntax error, missing package, numeric fault); the comparison
-        // has no trustworthy baseline to assert against, so fail loudly with the
-        // captured streams rather than silently comparing against empty output.
-        panic!(
-            "reference R body failed (status {:?})\n--- stderr ---\n{stderr}\n--- stdout ---\n{stdout}",
-            output.status.code()
-        );
-    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "reference R body failed (status {:?})\n--- stderr ---\n{stderr}\n--- stdout ---\n{stdout}",
+        output.status.code()
+    );
 
     let emitted = std::fs::read_to_string(&out_txt).unwrap_or_default();
     let parsed = parse_emitted(&emitted);
@@ -320,7 +203,9 @@ emit <- function(key, x) {\n\
 
 /// Run a Python reference body. The columns are exposed as a pandas `df` (or,
 /// when pandas is unavailable, a dict of NumPy arrays). The body calls
-/// `emit("key", iterable)` to return results.
+/// `emit("key", iterable)` to return results. Fails the test with captured
+/// stderr when Python exits non-zero (missing `python3`, missing module, or a
+/// raised exception).
 pub fn run_python(columns: &[Column<'_>], body: &str) -> ReferenceResult {
     let dir = unique_scratch_dir("py");
     let data_csv = dir.join("data.csv");
@@ -357,20 +242,15 @@ def emit(key, x):\n\
         .arg(&data_csv)
         .arg(&out_txt)
         .output()
-        .expect("spawn python3");
+        .expect("spawn python3 (install python3 to run reference-comparison tests)");
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        // SAFETY: a non-zero python3 exit means the reference body itself is
-        // broken (syntax error, missing package, numeric fault); the comparison
-        // has no trustworthy baseline to assert against, so fail loudly with the
-        // captured streams rather than silently comparing against empty output.
-        panic!(
-            "reference Python body failed (status {:?})\n--- stderr ---\n{stderr}\n--- stdout ---\n{stdout}",
-            output.status.code()
-        );
-    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "reference Python body failed (status {:?})\n--- stderr ---\n{stderr}\n--- stdout ---\n{stdout}",
+        output.status.code()
+    );
 
     let emitted = std::fs::read_to_string(&out_txt).unwrap_or_default();
     let parsed = parse_emitted(&emitted);
