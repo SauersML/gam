@@ -990,6 +990,23 @@ pub struct ArrowSolveOptions {
     /// `crate::gpu::arrow_schur::gpu_schur_matvec_backend` when `cuda_selected()`
     /// and the system has dense per-row H_tβ slabs. `None` means CPU-only PCG.
     pub gpu_matvec: Option<GpuSchurMatvec>,
+    /// Skip the ill-conditioning *rejection* (the κ-based
+    /// [`ArrowSchurError::PerRowFactorIllConditioned`] per-row guard and the
+    /// matching reduced-Schur κ guard) while still requiring genuine positive
+    /// definiteness (a non-PD Cholesky pivot still errors).
+    ///
+    /// The κ guards exist to protect the accuracy of the Newton *step*: a
+    /// barely-PD `H_tt^(i)` or an over-conditioned reduced Schur yields an
+    /// inaccurate `Δβ`/`Δt`. Evidence-only callers
+    /// (e.g. `SaeManifoldTerm::reml_criterion_with_cache`) do not consume the
+    /// step — they need only the factor cache for the log-determinant
+    /// (`½log|H|`, exact from `diag(L)` regardless of κ) and the selected-inverse
+    /// traces. For those callers the κ rejection is a false abort when ρ sweeps
+    /// to extreme values, so this flag lifts it and hands the
+    /// "is this step trustworthy" decision back to the caller.
+    ///
+    /// Default `false`: ordinary solves keep the full guard.
+    pub tolerate_ill_conditioning: bool,
 }
 
 impl std::fmt::Debug for ArrowSolveOptions {
@@ -1001,6 +1018,7 @@ impl std::fmt::Debug for ArrowSolveOptions {
             .field("streaming_chunk_size", &self.streaming_chunk_size)
             .field("riemannian_trust_region", &self.riemannian_trust_region)
             .field("gpu_matvec", &self.gpu_matvec.is_some())
+            .field("tolerate_ill_conditioning", &self.tolerate_ill_conditioning)
             .finish()
     }
 }
@@ -1056,6 +1074,7 @@ impl ArrowSolveOptions {
             streaming_chunk_size: None,
             riemannian_trust_region: false,
             gpu_matvec: None,
+            tolerate_ill_conditioning: false,
         }
     }
 
@@ -1069,6 +1088,7 @@ impl ArrowSolveOptions {
             streaming_chunk_size: None,
             riemannian_trust_region: false,
             gpu_matvec: None,
+            tolerate_ill_conditioning: false,
         }
     }
 
@@ -1081,6 +1101,7 @@ impl ArrowSolveOptions {
             streaming_chunk_size: None,
             riemannian_trust_region: false,
             gpu_matvec: None,
+            tolerate_ill_conditioning: false,
         }
     }
 
@@ -1093,11 +1114,24 @@ impl ArrowSolveOptions {
             streaming_chunk_size: None,
             riemannian_trust_region: false,
             gpu_matvec: None,
+            tolerate_ill_conditioning: false,
         }
     }
 
     pub fn with_streaming_chunk_size(mut self, chunk_size: Option<usize>) -> Self {
         self.streaming_chunk_size = chunk_size.filter(|&chunk| chunk > 0);
+        self
+    }
+
+    /// Lift the ill-conditioning *rejection* for evidence/log-det-only callers
+    /// while still requiring genuine PD. See [`Self::tolerate_ill_conditioning`].
+    ///
+    /// Use this when the returned `(Δt, Δβ)` Newton step is discarded and only
+    /// the factor cache is consumed (log-determinant + selected-inverse traces).
+    /// The cache stays undamped at `ridge_t = 0`, so the log-determinant is
+    /// exact regardless of κ.
+    pub fn with_ill_conditioning_tolerated(mut self) -> Self {
+        self.tolerate_ill_conditioning = true;
         self
     }
 }
@@ -1112,11 +1146,15 @@ impl ArrowSolveOptions {
 pub trait BatchedBlockSolver {
     /// Factor every per-row point block `H_tt^(i) + ridge_t I`, as in BA's
     /// point elimination stage.
+    ///
+    /// `tolerate_ill_conditioning` lifts the per-row κ rejection (still
+    /// requiring genuine PD); see [`ArrowSolveOptions::tolerate_ill_conditioning`].
     fn factor_blocks(
         &self,
         rows: &[ArrowRowBlock],
         ridge_t: f64,
         d: usize,
+        tolerate_ill_conditioning: bool,
     ) -> Result<Vec<Array2<f64>>, ArrowSchurError>;
 
     /// Solve one factored point block against a vector RHS.
@@ -1146,10 +1184,17 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
         rows: &[ArrowRowBlock],
         ridge_t: f64,
         d: usize,
+        tolerate_ill_conditioning: bool,
     ) -> Result<Vec<Array2<f64>>, ArrowSchurError> {
         let mut out = Vec::with_capacity(rows.len());
         for (row_idx, row) in rows.iter().enumerate() {
-            out.push(factor_one_row(row, ridge_t, d, row_idx)?);
+            out.push(factor_one_row(
+                row,
+                ridge_t,
+                d,
+                row_idx,
+                tolerate_ill_conditioning,
+            )?);
         }
         Ok(out)
     }
@@ -1242,6 +1287,7 @@ fn factor_one_row(
     ridge_t: f64,
     d: usize,
     row_idx: usize,
+    tolerate_ill_conditioning: bool,
 ) -> Result<Array2<f64>, ArrowSchurError> {
     // Dimension mismatches in caller-supplied row blocks must surface as a
     // typed error rather than aborting the process. The BA/SAE assembler can
@@ -1289,12 +1335,19 @@ fn factor_one_row(
     // Diagonal-ratio condition-number proxy κ(L Lᵀ) ≈ (max L_ii / min L_ii)²,
     // compared against the dimension-scaled Higham near-singularity ceiling.
     // See `cholesky_factor_kappa_estimate` / `safe_spd_kappa_max`.
-    let kappa_est = cholesky_factor_kappa_estimate(&factor);
-    if !kappa_est.is_finite() || kappa_est > safe_spd_kappa_max(d) {
-        return Err(ArrowSchurError::PerRowFactorIllConditioned {
-            row: row_idx,
-            kappa_estimate: kappa_est,
-        });
+    //
+    // Evidence/log-det-only callers set `tolerate_ill_conditioning` to skip
+    // this *rejection* (the factor itself is still genuinely PD — Cholesky
+    // above would have errored otherwise — so its diagonal gives an exact
+    // log-determinant and the selected-inverse traces remain well-defined).
+    if !tolerate_ill_conditioning {
+        let kappa_est = cholesky_factor_kappa_estimate(&factor);
+        if !kappa_est.is_finite() || kappa_est > safe_spd_kappa_max(d) {
+            return Err(ArrowSchurError::PerRowFactorIllConditioned {
+                row: row_idx,
+                kappa_estimate: kappa_est,
+            });
+        }
     }
     Ok(factor)
 }
@@ -2331,6 +2384,11 @@ pub struct StreamingArrowSchur {
     /// `d_i ≪ K`, this is the per-row sparse apply that replaces the `O(K)`
     /// column-probe in the streaming reduced-Schur accumulation.
     htbeta_transpose_matvec: Option<RowHtbetaTransposeMatvec>,
+    /// Lift the per-row κ rejection for evidence/log-det-only solves; see
+    /// [`ArrowSolveOptions::tolerate_ill_conditioning`]. Set by [`Self::solve`]
+    /// from the options; defaults to `false` so direct callers of
+    /// [`Self::accumulate_chunk`] keep the full guard.
+    tolerate_ill_conditioning: bool,
 }
 
 impl std::fmt::Debug for StreamingArrowSchur {
@@ -2373,6 +2431,7 @@ impl StreamingArrowSchur {
             row_builder,
             htbeta_matvec: None,
             htbeta_transpose_matvec: None,
+            tolerate_ill_conditioning: false,
         }
     }
 
@@ -2529,7 +2588,7 @@ impl StreamingArrowSchur {
             let di = row.htt.nrows();
             self.validate_row(row_idx, &row)?;
             let htbeta = self.row_htbeta(row_idx, &row, di);
-            let factor = factor_one_row(&row, ridge_t, di, row_idx)?;
+            let factor = factor_one_row(&row, ridge_t, di, row_idx, self.tolerate_ill_conditioning)?;
             let v = backend.solve_block_vector(&factor, &row.gt);
             for c in 0..di {
                 let vc = v[c];
@@ -2569,6 +2628,11 @@ impl StreamingArrowSchur {
         ridge_beta: f64,
         options: &ArrowSolveOptions,
     ) -> Result<(Array1<f64>, Array1<f64>, Option<Array2<f64>>), ArrowSchurError> {
+        // Propagate the evidence/log-det ill-conditioning tolerance to the
+        // per-row factor calls inside `accumulate_chunk` / `back_substitute`,
+        // which take their stable public signatures. Direct callers of
+        // `accumulate_chunk` keep the conservative default (`false`, full guard).
+        self.tolerate_ill_conditioning = options.tolerate_ill_conditioning;
         self.reset_accumulator(ridge_beta)?;
         for start in (0..self.n_rows).step_by(self.chunk_size) {
             let end = (start + self.chunk_size).min(self.n_rows);
@@ -2601,7 +2665,8 @@ impl StreamingArrowSchur {
                 let row = (self.row_builder)(row_idx)?;
                 let di = row.htt.nrows();
                 self.validate_row(row_idx, &row)?;
-                let factor = factor_one_row(&row, ridge_t, di, row_idx)?;
+                let factor =
+                    factor_one_row(&row, ridge_t, di, row_idx, self.tolerate_ill_conditioning)?;
                 // `H_tβ^(i) Δβ`: route through the procedural operator when
                 // present (no dense slab), else through the dense slab.
                 let mut htbeta_delta = Array1::<f64>::zeros(di);
@@ -3496,7 +3561,11 @@ pub fn solve_arrow_newton_step_with_options(
     let htt_factors_undamped = if ridge_t == 0.0 {
         ArrowUndampedFactors::SameAsDamped
     } else {
-        ArrowUndampedFactors::Owned(backend.factor_blocks(&sys.rows, 0.0, sys.d)?.into())
+        ArrowUndampedFactors::Owned(
+            backend
+                .factor_blocks(&sys.rows, 0.0, sys.d, options.tolerate_ill_conditioning)?
+                .into(),
+        )
     };
     let cache = ArrowFactorCache {
         htt_factors,
@@ -3896,7 +3965,8 @@ fn solve_arrow_newton_step_artifacts(
     // 1. BA point elimination: per-row Cholesky factors of
     // (H_tt^(i) + ridge_t · I).  `factor_blocks` reads the actual row
     // dimension from `row.htt.nrows()` so heterogeneous systems work.
-    let htt_factors = backend.factor_blocks(&sys.rows, ridge_t, sys.d)?;
+    let htt_factors =
+        backend.factor_blocks(&sys.rows, ridge_t, sys.d, options.tolerate_ill_conditioning)?;
 
     // 2. Reduced RHS r_β = -g_β + Σ_i H_βt^(i) (H_tt^(i))⁻¹ g_t^(i).
     let rhs_beta = reduced_rhs_beta(sys, &htt_factors, &backend);
@@ -4084,15 +4154,21 @@ fn solve_dense_reduced_system(
     // `ridge_beta` and re-forms a better-conditioned Schur. This guard is
     // exclusive to the dense Direct / SqrtBA path (the only caller of this
     // function); the inexact-PCG path tolerates higher κ(S) and is unaffected.
-    let schur_kappa = cholesky_factor_kappa_estimate(&factor);
-    if !schur_kappa.is_finite() || schur_kappa > safe_spd_kappa_max(schur.nrows()) {
-        return Err(ArrowSchurError::SchurFactorFailed {
-            reason: format!(
-                "reduced Schur complement Cholesky succeeded but is ill-conditioned \
-                 (kappa_estimate={schur_kappa:e}); accumulated per-row \
-                 (H_tt)⁻¹ contamination would yield an inaccurate Δβ"
-            ),
-        });
+    // Evidence/log-det-only callers (`tolerate_ill_conditioning`) skip this
+    // rejection: the factor is genuinely PD (Cholesky above succeeded), so its
+    // diagonal still yields an exact `log|S|`, and an inaccurate Δβ is harmless
+    // because the step is discarded.
+    if !options.tolerate_ill_conditioning {
+        let schur_kappa = cholesky_factor_kappa_estimate(&factor);
+        if !schur_kappa.is_finite() || schur_kappa > safe_spd_kappa_max(schur.nrows()) {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: format!(
+                    "reduced Schur complement Cholesky succeeded but is ill-conditioned \
+                     (kappa_estimate={schur_kappa:e}); accumulated per-row \
+                     (H_tt)⁻¹ contamination would yield an inaccurate Δβ"
+                ),
+            });
+        }
     }
     let direct = chol_solve_vector(&factor, rhs_beta);
     if step_inside_trust_region(direct.view(), options.trust_region.radius, metric_weights) {
@@ -5686,7 +5762,7 @@ mod tests {
         row.htbeta = array![[1.0_f64, 0.0], [0.0, 1.0]];
         row.gt = array![0.0_f64, 0.0];
 
-        let err = factor_one_row(&row, 0.0, d, 0)
+        let err = factor_one_row(&row, 0.0, d, 0, false)
             .expect_err("barely-PD H_tt must be rejected by the condition check");
         match err {
             ArrowSchurError::PerRowFactorIllConditioned {
@@ -5702,13 +5778,45 @@ mod tests {
             other => panic!("expected PerRowFactorIllConditioned, got {other:?}"),
         }
 
+        // Evidence/log-det mode (`tolerate_ill_conditioning = true`) must
+        // accept the same barely-PD block and return its genuine Cholesky
+        // factor — the diagonal gives an exact log-determinant.
+        let factor = factor_one_row(&row, 0.0, d, 0, true)
+            .expect("tolerate_ill_conditioning must accept a barely-PD-but-PD block");
+        // L Lᵀ must reproduce the original block (the factor is real, not a
+        // damped surrogate).
+        for i in 0..d {
+            for j in 0..d {
+                let mut acc = 0.0_f64;
+                for kk in 0..d {
+                    acc += factor[[i, kk]] * factor[[j, kk]];
+                }
+                assert!(
+                    (acc - row.htt[[i, j]]).abs() < 1e-12,
+                    "tolerated factor must satisfy L Lᵀ = H_tt at ({i},{j})"
+                );
+            }
+        }
+
+        // A genuinely non-PD block must STILL error even under tolerance —
+        // the flag lifts only the κ rejection, not the PD requirement.
+        let mut row_npd = ArrowRowBlock::new(d, k);
+        row_npd.htt = array![[1.0_f64, 2.0], [2.0, 1.0]]; // indefinite (eigvals 3, -1)
+        row_npd.htbeta = array![[1.0_f64, 0.0], [0.0, 1.0]];
+        row_npd.gt = array![0.0_f64, 0.0];
+        let npd = factor_one_row(&row_npd, 0.0, d, 0, true);
+        assert!(
+            matches!(npd, Err(ArrowSchurError::PerRowFactorFailed { .. })),
+            "non-PD block must error even with tolerate_ill_conditioning; got {npd:?}"
+        );
+
         // Sanity: a well-conditioned block at the same dimension still
         // factors successfully.
         let mut row_ok = ArrowRowBlock::new(d, k);
         row_ok.htt = array![[2.0_f64, 0.1], [0.1, 3.0]];
         row_ok.htbeta = array![[1.0_f64, 0.0], [0.0, 1.0]];
         row_ok.gt = array![0.0_f64, 0.0];
-        factor_one_row(&row_ok, 0.0, d, 0)
+        factor_one_row(&row_ok, 0.0, d, 0, false)
             .expect("well-conditioned block must still factor at ridge_t=0");
     }
 
@@ -5729,7 +5837,7 @@ mod tests {
         sys.gb = array![0.3_f64, -0.1];
 
         // Direct factor at ridge_t=0 must report ill-conditioning.
-        let direct = factor_one_row(&sys.rows[0], 0.0, d, 0);
+        let direct = factor_one_row(&sys.rows[0], 0.0, d, 0, false);
         assert!(matches!(
             direct,
             Err(ArrowSchurError::PerRowFactorIllConditioned { .. })
@@ -5943,5 +6051,92 @@ mod tests {
             (trace - trace_dense).abs() < 1e-9,
             "Kron-block trace {trace} vs dense {trace_dense}"
         );
+    }
+
+    /// Evidence/log-det mode: a per-row `H_tt` that is PD but ill-conditioned
+    /// (κ above the safe-Schur ceiling) must be REJECTED by the default
+    /// `direct()` solve, yet ACCEPTED by `with_ill_conditioning_tolerated()`,
+    /// which returns a usable cache whose log-determinant equals the exact
+    /// dense `log|H|`. This is the SAE evidence path under a wide ARD α sweep.
+    #[test]
+    fn ill_conditioning_tolerated_returns_cache_with_exact_logdet() {
+        let n = 2usize;
+        let d = 2usize;
+        let k = 2usize;
+        let mut sys = ArrowSchurSystem::new(n, d, k);
+        // Barely-PD rows: second pivot ~1e-9 of the first ⇒ κ ≈ 1e9, above
+        // the safe-Schur ceiling but genuinely PD (Cholesky succeeds).
+        sys.rows[0].htt = array![[1.0_f64, 0.0], [0.0, 1e-9]];
+        sys.rows[0].htbeta = array![[0.3_f64, 0.1], [0.05, 0.2]];
+        sys.rows[1].htt = array![[2.0_f64, 0.0], [0.0, 2e-9]];
+        sys.rows[1].htbeta = array![[0.2_f64, -0.1], [0.1, 0.15]];
+        for row in sys.rows.iter_mut() {
+            row.gt = array![0.0_f64, 0.0];
+        }
+        sys.hbb = array![[5.0_f64, 0.3], [0.3, 4.0]];
+        sys.gb = array![0.0_f64, 0.0];
+
+        // Default guard rejects the ill-conditioned per-row block.
+        let strict = solve_arrow_newton_step_with_options(
+            &sys,
+            0.0,
+            0.0,
+            &ArrowSolveOptions::direct(),
+        );
+        assert!(
+            matches!(
+                strict,
+                Err(ArrowSchurError::PerRowFactorIllConditioned { .. })
+            ),
+            "default direct() must reject the ill-conditioned block; got {strict:?}"
+        );
+
+        // Evidence mode accepts it and returns a cache.
+        let opts = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+        let (_dt, _db, cache) = solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &opts)
+            .expect("tolerate mode must factor the ill-conditioned-but-PD system");
+
+        // Cache log-determinant (Σ log|H_tt^i| + log|S_β|) must equal the exact
+        // dense log|H|, regardless of conditioning — the whole point.
+        let (log_det_tt, log_det_schur) = cache.arrow_log_det();
+        let log_det_cache = log_det_tt + log_det_schur.expect("dense Schur factor present");
+
+        // Dense reference: assemble H and take log|H| = 2 Σ log L_ii.
+        let dim = n * d + k;
+        let mut h = Array2::<f64>::zeros((dim, dim));
+        for i in 0..n {
+            let base = i * d;
+            for r in 0..d {
+                for c in 0..d {
+                    h[[base + r, base + c]] = sys.rows[i].htt[[r, c]];
+                }
+            }
+            for r in 0..d {
+                for c in 0..k {
+                    let v = sys.rows[i].htbeta[[r, c]];
+                    h[[base + r, n * d + c]] = v;
+                    h[[n * d + c, base + r]] = v;
+                }
+            }
+        }
+        for r in 0..k {
+            for c in 0..k {
+                h[[n * d + r, n * d + c]] = sys.hbb[[r, c]];
+            }
+        }
+        let lh = cholesky_lower(&h).expect("assembled bordered H must be SPD");
+        let log_det_dense: f64 = 2.0 * (0..dim).map(|i| lh[[i, i]].ln()).sum::<f64>();
+
+        assert!(
+            (log_det_cache - log_det_dense).abs() < 1e-6,
+            "tolerated-cache log|H| {log_det_cache} vs dense {log_det_dense}"
+        );
+
+        // Selected-inverse traces must still be available from the cache.
+        let tdiag = cache
+            .latent_block_inverse_diagonal()
+            .expect("tolerated cache must support latent_block_inverse_diagonal");
+        assert_eq!(tdiag.len(), n * d);
+        assert!(tdiag.iter().all(|v| v.is_finite()));
     }
 }
