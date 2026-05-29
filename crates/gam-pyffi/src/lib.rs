@@ -10965,7 +10965,7 @@ fn sae_build_atom_plans(
             }
             SaeAtomBasisKind::Precomputed(name) => {
                 return Err(format!(
-                    "sae_build_atom_plans: unsupported atom_basis {:?}; sae_manifold_fit_auto can build only periodic, duchon, sphere, torus, or euclidean_patch atoms",
+                    "sae_build_atom_plans: unsupported atom_basis {:?}; sae_manifold_fit_minimal can build only periodic, duchon, sphere, torus, or euclidean_patch atoms",
                     name
                 ));
             }
@@ -11001,7 +11001,7 @@ fn sae_build_atom_plans(
     random_state = 0,
     top_k = None,
 ))]
-fn sae_manifold_fit_auto<'py>(
+fn sae_manifold_fit_minimal<'py>(
     py: Python<'py>,
     z: PyReadonlyArray2<'py, f64>,
     atom_basis: Vec<String>,
@@ -11027,24 +11027,24 @@ fn sae_manifold_fit_auto<'py>(
     let k_atoms = atom_basis.len();
     if n_obs == 0 || z_view.ncols() == 0 {
         return Err(py_value_error(format!(
-            "sae_manifold_fit_auto: z must be non-empty; got shape ({}, {})",
+            "sae_manifold_fit_minimal: z must be non-empty; got shape ({}, {})",
             n_obs,
             z_view.ncols()
         )));
     }
     if k_atoms == 0 {
         return Err(py_value_error(
-            "sae_manifold_fit_auto: atom_basis must be non-empty".into(),
+            "sae_manifold_fit_minimal: atom_basis must be non-empty".into(),
         ));
     }
     if !z_view.iter().all(|v| v.is_finite()) {
         return Err(py_value_error(
-            "sae_manifold_fit_auto: z contains non-finite values".into(),
+            "sae_manifold_fit_minimal: z contains non-finite values".into(),
         ));
     }
     if atom_dim.len() != k_atoms {
         return Err(py_value_error(format!(
-            "sae_manifold_fit_auto: atom_dim length {} must equal atom_basis length {k_atoms}",
+            "sae_manifold_fit_minimal: atom_dim length {} must equal atom_basis length {k_atoms}",
             atom_dim.len()
         )));
     }
@@ -22034,7 +22034,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(equivariant_gauge_companion_loss, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit_ibp, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_manifold_fit_auto, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_manifold_fit_minimal, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_predict_oos, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_reconstruction_r2, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_assignment_summary, module)?)?;

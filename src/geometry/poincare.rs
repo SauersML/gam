@@ -499,19 +499,30 @@ pub fn tangent_decode_backward(
 /// Rescale `y -> sqrt(k) y` so `|ŷ| < 1`, apply the unit-curvature
 /// projection, then divide by `sqrt(k)` to land on the hyperboloid of
 /// curvature `c = -k`. The output is `(x_0, x_s)` packed as `(d+1)`-vector.
+///
+/// The input is first run through [`project_into_ball`] so the boundary-
+/// vanishing denominator `1 - |ŷ|^2` is bounded below by `~2·BOUNDARY_EPS`.
+/// A point on (or outside) the ideal boundary would otherwise drive the
+/// denominator to the `ORIGIN_EPS` floor (`1e-15`) and blow the output up by
+/// `~1e15`; projecting first keeps the map well-conditioned and makes the
+/// `from_lorentz ∘ to_lorentz` round-trip equal `project_into_ball(y)`.
 pub fn to_lorentz(y: ArrayView1<'_, f64>, curvature: f64) -> GeometryResult<Array1<f64>> {
     let sqrt_negc = require_negative_curvature(curvature)?;
     let d = y.len();
     if d == 0 {
         return Err(GeometryError::InvalidPoint("to_lorentz requires d >= 1"));
     }
-    let yhat_sq: f64 = y.iter().map(|v| (sqrt_negc * v).powi(2)).sum();
-    let denom = (1.0 - yhat_sq).max(ORIGIN_EPS);
+    let y_proj = project_into_ball(y, curvature)?;
+    let yhat_sq: f64 = y_proj.iter().map(|v| (sqrt_negc * v).powi(2)).sum();
+    // After `project_into_ball`, `sqrt(k)|y| <= 1 - BOUNDARY_EPS`, so
+    // `1 - yhat_sq >= 2·BOUNDARY_EPS - BOUNDARY_EPS^2 > 0`; the floor is a
+    // defensive no-op held at `BOUNDARY_EPS` (never the `1e15` `ORIGIN_EPS`).
+    let denom = (1.0 - yhat_sq).max(BOUNDARY_EPS);
     let z0 = (1.0 + yhat_sq) / denom;
     let mut out = Array1::<f64>::zeros(d + 1);
     out[0] = z0 / sqrt_negc;
     for i in 0..d {
-        out[i + 1] = (2.0 * sqrt_negc * y[i] / denom) / sqrt_negc;
+        out[i + 1] = (2.0 * sqrt_negc * y_proj[i] / denom) / sqrt_negc;
     }
     Ok(out)
 }
@@ -746,6 +757,50 @@ mod tests {
         let norm = (proj[0] * proj[0] + proj[1] * proj[1]).sqrt();
         assert!(norm < 1.0, "norm {} should be inside ball", norm);
         assert!(norm <= 1.0 - BOUNDARY_EPS + 1e-12);
+    }
+
+    #[test]
+    fn lorentz_round_trip_interior_point() {
+        // For a point strictly inside the ball, `project_into_ball` is the
+        // identity, so `from_lorentz(to_lorentz(y)) == y` exactly.
+        let y = array![0.2, -0.15, 0.05];
+        let z = to_lorentz(y.view(), -1.0).expect("to_lorentz");
+        assert!(z.iter().all(|v| v.is_finite()), "lorentz image must be finite");
+        let back = from_lorentz(z.view(), -1.0).expect("from_lorentz");
+        for i in 0..y.len() {
+            assert!(
+                (back[i] - y[i]).abs() < 1.0e-12,
+                "round trip mismatch at {i}: {} vs {}",
+                back[i],
+                y[i]
+            );
+        }
+    }
+
+    #[test]
+    fn lorentz_round_trip_near_boundary_equals_projection() {
+        // A point on/outside the ideal boundary must not blow up: the
+        // composition equals `project_into_ball(y)` (the boundary clamp),
+        // and the intermediate hyperboloid point stays finite.
+        for curvature in [-1.0, -0.25, -4.0] {
+            let y = array![1.5, 0.0, 0.0];
+            let z = to_lorentz(y.view(), curvature).expect("to_lorentz");
+            assert!(
+                z.iter().all(|v| v.is_finite()),
+                "boundary point must yield a finite hyperboloid image, got {z:?}"
+            );
+            let back = from_lorentz(z.view(), curvature).expect("from_lorentz");
+            let expected = project_into_ball(y.view(), curvature).expect("project");
+            for i in 0..y.len() {
+                assert!(
+                    (back[i] - expected[i]).abs() < 1.0e-9,
+                    "near-boundary round trip must equal projection at {i} \
+                     (curvature {curvature}): {} vs {}",
+                    back[i],
+                    expected[i]
+                );
+            }
+        }
     }
 
     #[test]
