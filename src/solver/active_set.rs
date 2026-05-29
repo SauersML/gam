@@ -7,6 +7,20 @@ use ndarray::{Array1, Array2, s};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+/// Primal-feasibility tolerance the inequality-constrained active-set Newton
+/// solver guarantees on its returned iterate, measured in the *scaled*
+/// constraint-row coordinate system in which `A * beta >= b` is expressed.
+///
+/// The solver accepts a step when the worst scaled violation
+/// `max_i (b_i - a_i^T beta)` is below this threshold (see the acceptance
+/// gate in [`solve_linear_constrained_newton_step`] and the KKT diagnostics
+/// in [`compute_constraint_kkt_diagnostics`]). Any consumer that re-derives a
+/// raw (un-scaled) feasibility tolerance from a returned iterate must scale
+/// this value by the per-row normalization that the constraint builder
+/// applied; demanding tighter feasibility than this is inconsistent with the
+/// solver contract and will spuriously reject valid boundary solutions.
+pub const ACTIVE_SET_PRIMAL_FEASIBILITY_TOL: f64 = 1e-8;
+
 #[derive(Clone, Debug)]
 pub struct LinearInequalityConstraints {
     pub a: Array2<f64>,
@@ -163,7 +177,7 @@ pub(crate) fn compute_constraint_kkt_diagnostics(
     constraints: &LinearInequalityConstraints,
 ) -> ConstraintKktDiagnostics {
     let m = constraints.a.nrows();
-    let active_tolerance = 1e-8;
+    let active_tolerance = ACTIVE_SET_PRIMAL_FEASIBILITY_TOL;
 
     let mut slack = Array1::<f64>::zeros(m);
     let mut primal_feasibility: f64 = 0.0;
@@ -738,7 +752,7 @@ pub(crate) fn working_set_kkt_diagnostics_from_multipliers(
         dual_feasibility,
         complementarity,
         stationarity,
-        active_tolerance: 1e-8,
+        active_tolerance: ACTIVE_SET_PRIMAL_FEASIBILITY_TOL,
     })
 }
 
@@ -1063,11 +1077,11 @@ fn solve_newton_direction_with_linear_constraints_impl(
         && working_kkt.complementarity <= 1e-6;
     let model_descent_ok = predicted_delta <= -1e-10 * (1.0 + grad_inf * step_inf);
     let degenerate_boundary_ok = compressed_working.is_degenerate_face()
-        && worst <= 1e-8
-        && working_kkt.primal_feasibility <= 1e-8
+        && worst <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
+        && working_kkt.primal_feasibility <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
         && working_kkt.complementarity <= 1e-6
         && (working_kkt.stationarity <= 1e-3 || stationarity_rel <= 2e-6);
-    if worst <= 1e-8
+    if worst <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
         && ((working_kkt.dual_feasibility <= 1e-8 && (kkt_strong_ok || model_descent_ok))
             || degenerate_boundary_ok)
     {

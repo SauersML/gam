@@ -35,7 +35,9 @@ use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-pub use crate::solver::active_set::{ConstraintKktDiagnostics, LinearInequalityConstraints};
+pub use crate::solver::active_set::{
+    ACTIVE_SET_PRIMAL_FEASIBILITY_TOL, ConstraintKktDiagnostics, LinearInequalityConstraints,
+};
 
 use crate::linalg::utils::{array_is_finite, inf_norm};
 
