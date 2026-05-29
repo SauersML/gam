@@ -252,13 +252,24 @@ fn validate_cause_specific_block(
             reason: "dimension mismatch".to_string(),
         });
     }
+    // A cause-specific block's `event_target` is the binary cause-k indicator
+    // produced by `cause_specific_event_indicator`; a label > 1 here means the
+    // caller passed raw multi-cause codes instead of projecting per cause. That
+    // is a valid finite label, not non-finite input, so it gets its own clear
+    // error rather than the misleading "non-finite input".
+    if let Some(&label) = block.event_target.iter().find(|&&v| v > 1) {
+        return Err(SurvivalError::EventCodeInvalid {
+            reason: format!(
+                "cause-specific block event_target must be the binary cause indicator {{0, 1}}, got multi-cause label {label}; project raw codes per cause via cause_specific_event_indicator"
+            ),
+        });
+    }
     if block.age_entry.iter().any(|v| !v.is_finite())
         || block.age_exit.iter().any(|v| !v.is_finite())
         || block
             .sampleweight
             .iter()
             .any(|v| !v.is_finite() || *v < 0.0)
-        || block.event_target.iter().any(|&v| v > 1)
         || block.x_entry.iter().any(|v| !v.is_finite())
         || block.x_exit.iter().any(|v| !v.is_finite())
         || block.x_derivative.iter().any(|v| !v.is_finite())
@@ -732,6 +743,39 @@ pub fn cause_count_from_event_codes(
     }
 
     Ok(max_code)
+}
+
+/// Project multi-cause competing-risks event codes `{0 = censored, k = cause k}`
+/// onto the binary `{0, 1}` *any-event* indicator the pooled single-hazard
+/// baseline engine consumes.
+///
+/// The shared Royston-Parmar baseline working model fits one hazard across all
+/// causes; every observed event (regardless of cause) informs that baseline, so
+/// the indicator is `1` exactly when *any* cause occurred. This is one of the
+/// two cause-aware projections of the raw code vector; the other is
+/// [`cause_specific_event_indicator`]. Centralizing both here keeps the single
+/// source of truth for "how multi-cause labels become a single-hazard binary
+/// contract", so no construction path open-codes a fragile `mapv` and then
+/// trips the binary `event_target > 1` guard on the raw labels.
+pub fn pooled_any_event_indicator(event_codes: ArrayView1<'_, u8>) -> Array1<u8> {
+    event_codes.mapv(|label| u8::from(label > 0))
+}
+
+/// Project multi-cause competing-risks event codes `{0 = censored, k = cause k}`
+/// onto the binary `{0, 1}` indicator for the cause-specific Royston-Parmar
+/// block of cause `cause` (1-based).
+///
+/// Within cause `cause`'s block the event of interest is `event == cause`; every
+/// competing cause is treated as censoring (indicator `0`), which is exactly the
+/// cause-specific hazard likelihood. Like [`pooled_any_event_indicator`], this
+/// yields a binary contract that satisfies the single-hazard `event_target` guard
+/// — the raw multi-cause labels are never handed to a binary engine.
+pub fn cause_specific_event_indicator(
+    event_codes: ArrayView1<'_, u8>,
+    cause: usize,
+) -> Array1<u8> {
+    let cause_code = cause as u8;
+    event_codes.mapv(|observed| u8::from(observed == cause_code))
 }
 
 fn compress_positive_collinear_constraints(
@@ -1406,14 +1450,38 @@ impl WorkingModelSurvival {
         if age_entry.iter().any(|v| !v.is_finite())
             || age_exit.iter().any(|v| !v.is_finite())
             || sampleweight.iter().any(|v| !v.is_finite() || *v < 0.0)
-            || event_target.iter().any(|&v| v > 1)
-            || event_competing.iter().any(|&v| v > 1)
-            || event_target
-                .iter()
-                .zip(event_competing.iter())
-                .any(|(&target, &competing)| target > 0 && competing > 0)
         {
             return Err(SurvivalError::NonFiniteInput);
+        }
+        // The single-hazard engine's `event_target` contract is binary {0, 1}.
+        // A code > 1 is a *valid finite multi-cause label* that simply must be
+        // projected first (any-event for the pooled baseline, cause-specific for
+        // each block); it is NOT a non-finite input. Report it as such so the
+        // failure is actionable and never surfaces as the misleading "inputs
+        // contain non-finite values".
+        if let Some(&label) = event_target.iter().find(|&&v| v > 1) {
+            return Err(SurvivalError::EventCodeInvalid {
+                reason: format!(
+                    "single-hazard survival engine requires a binary {{0, 1}} event_target, got multi-cause label {label}; competing-risks codes must be projected via pooled_any_event_indicator / cause_specific_event_indicator before construction"
+                ),
+            });
+        }
+        if let Some(&label) = event_competing.iter().find(|&&v| v > 1) {
+            return Err(SurvivalError::EventCodeInvalid {
+                reason: format!(
+                    "single-hazard survival engine requires a binary {{0, 1}} event_competing, got multi-cause label {label}"
+                ),
+            });
+        }
+        if event_target
+            .iter()
+            .zip(event_competing.iter())
+            .any(|(&target, &competing)| target > 0 && competing > 0)
+        {
+            return Err(SurvivalError::EventCodeInvalid {
+                reason: "a row cannot be simultaneously a target event and a competing event"
+                    .to_string(),
+            });
         }
         if age_entry
             .iter()
@@ -2964,9 +3032,12 @@ mod tests {
         // cause labels straight through used to bail out of construction via the
         // `event_target > 1` guard and surface as the misleading
         // `SurvivalError::NonFiniteInput` ("inputs contain non-finite values"),
-        // even though every input value is finite. The fix collapses cause labels
-        // to an any-event {0, 1} indicator before constructing the pooled
-        // baseline. This test pins both halves of that contract.
+        // even though every input value is finite. The fix (a) reports a
+        // multi-cause label as the actionable `EventCodeInvalid`, never the
+        // misleading "non-finite", and (b) projects cause labels to the
+        // any-event {0, 1} indicator via the single-source-of-truth
+        // `pooled_any_event_indicator` before constructing the pooled baseline.
+        // This pins both halves of that contract.
         let age_entry = array![0.0_f64, 0.0, 0.0, 0.0];
         let age_exit = array![1.2_f64, 0.8, 2.1, 1.5];
         // Competing-risks cause labels: censored, cause 1, cause 2, censored.
@@ -2995,7 +3066,9 @@ mod tests {
         let mono = MonotonicityPenalty { tolerance: 1e-8 };
 
         // Raw cause labels {0,1,2} violate the single-hazard binary contract and
-        // must be rejected (documenting why the caller has to collapse them).
+        // must be rejected -- but as an *actionable* `EventCodeInvalid`, NOT the
+        // misleading `NonFiniteInput`: the labels are finite, they merely need
+        // projecting. (The old fix left this surfacing as "non-finite".)
         let raw = survival_model(
             survival_inputs(
                 &age_entry,
@@ -3012,14 +3085,23 @@ mod tests {
             SurvivalSpec::Net,
         );
         assert!(
-            matches!(raw, Err(SurvivalError::NonFiniteInput)),
-            "raw competing-risks cause labels must be rejected by the single-hazard engine, got {raw:?}"
+            matches!(raw, Err(SurvivalError::EventCodeInvalid { .. })),
+            "raw competing-risks cause labels must be rejected as EventCodeInvalid (not NonFiniteInput), got {raw:?}"
         );
 
-        // The pooled-baseline collapse the workflow now performs: any observed
-        // event (any cause) informs the shared baseline hazard.
-        let any_event = cause_labels.mapv(|label| u8::from(label > 0));
+        // The pooled-baseline projection the workflow now performs through the
+        // single source of truth: any observed event (any cause) -> {0, 1}.
+        let any_event = pooled_any_event_indicator(cause_labels.view());
         assert_eq!(any_event, array![0u8, 1u8, 1u8, 0u8]);
+        // And the per-cause projection that seeds each cause-specific block.
+        assert_eq!(
+            cause_specific_event_indicator(cause_labels.view(), 1),
+            array![0u8, 1u8, 0u8, 0u8]
+        );
+        assert_eq!(
+            cause_specific_event_indicator(cause_labels.view(), 2),
+            array![0u8, 0u8, 1u8, 0u8]
+        );
         let model = survival_model(
             survival_inputs(
                 &age_entry,
