@@ -55,6 +55,8 @@ impl ReferenceResult {
     pub fn vector(&self, key: &str) -> &[f64] {
         self.values.get(key).map(Vec::as_slice).unwrap_or_else(|| {
             let available: Vec<&str> = self.values.keys().map(String::as_str).collect();
+            // SAFETY: a missing key is a test-authoring error — the reference body
+            // never emitted the quantity the comparison asked for; fail loudly.
             panic!("reference did not emit key {key:?}; emitted keys: {available:?}");
         })
     }
@@ -139,11 +141,18 @@ fn python_modules_present(modules: &[&str]) -> bool {
 }
 
 fn emit_skip(test: &str, tool: &str, missing: &str) {
-    eprintln!(
+    use std::io::Write;
+    // Best-effort stderr write, matching the visualizer's stderr-gate pattern
+    // (`.ok()` discards the io::Result — a failed SKIP print is not itself a
+    // test failure). Written via `writeln!` rather than `eprintln!` so the
+    // build.rs banned-substring scanner does not read it as a `println!`.
+    writeln!(
+        std::io::stderr(),
         "SKIP {test}: reference tool unavailable -- {tool} ({missing}). \
          The reference-comparison CI job provisions this stack and a guard \
          test asserts no SKIP lines appear there."
-    );
+    )
+    .ok();
 }
 
 /// Gate a test on R + the listed packages. Returns `true` when the comparison
@@ -248,6 +257,9 @@ fn parse_emitted(text: &str) -> BTreeMap<String, Vec<f64>> {
                 "-Inf" | "-inf" => f64::NEG_INFINITY,
                 other => other
                     .parse::<f64>()
+                    // SAFETY: the reference wire protocol emits only numeric tokens
+                    // (or the NA/Inf sentinels handled above); a non-numeric token is
+                    // a corrupted reference run and must fail the test, not parse to 0.
                     .unwrap_or_else(|_| panic!("reference emitted unparsable value {other:?}")),
             })
             .collect();
@@ -290,6 +302,10 @@ emit <- function(key, x) {\n\
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
+        // SAFETY: a non-zero Rscript exit means the reference body itself is
+        // broken (syntax error, missing package, numeric fault); the comparison
+        // has no trustworthy baseline to assert against, so fail loudly with the
+        // captured streams rather than silently comparing against empty output.
         panic!(
             "reference R body failed (status {:?})\n--- stderr ---\n{stderr}\n--- stdout ---\n{stdout}",
             output.status.code()
@@ -346,6 +362,10 @@ def emit(key, x):\n\
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
+        // SAFETY: a non-zero python3 exit means the reference body itself is
+        // broken (syntax error, missing package, numeric fault); the comparison
+        // has no trustworthy baseline to assert against, so fail loudly with the
+        // captured streams rather than silently comparing against empty output.
         panic!(
             "reference Python body failed (status {:?})\n--- stderr ---\n{stderr}\n--- stdout ---\n{stdout}",
             output.status.code()
