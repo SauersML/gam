@@ -2863,20 +2863,97 @@ pub fn materialize<'a>(
             &exit_col,
             &event_col,
         )
-    } else if config.transformation_normal {
-        if config.noise_formula.is_some() {
-            return Err(WorkflowError::InvalidConfig {
-                reason: "transformation_normal cannot be combined with noise_formula".to_string(),
-            });
-        }
-        materialize_transformation_normal(&parsed, data, &col_map, config)
-    } else if config.logslope_formula.is_some() || config.z_column.is_some() {
-        materialize_bernoulli_marginal_slope(&parsed, data, &col_map, config)
-    } else if config.noise_formula.is_some() {
-        materialize_location_scale(&parsed, data, &col_map, config)
     } else {
-        materialize_standard(&parsed, data, &col_map, config)
+        // Non-survival response: `timewiggle(...)` and `survmodel(...)` are
+        // structurally meaningless (there is no baseline hazard / time axis to
+        // wiggle and no survival likelihood to configure). They are parsed into
+        // `ParsedFormula` but consumed *only* by `materialize_survival`; without
+        // this guard every non-survival materializer below would silently drop
+        // them, fitting an ordinary GAM while the user believes they requested a
+        // time-varying / survival model (#371). Reject here — the single
+        // chokepoint for all non-survival paths — mirroring the symmetric
+        // auxiliary-formula rejection in `validate_auxiliary_formula_controls`.
+        reject_survival_only_terms_for_nonsurvival(&parsed)?;
+        if config.transformation_normal {
+            if config.noise_formula.is_some() {
+                return Err(WorkflowError::InvalidConfig {
+                    reason: "transformation_normal cannot be combined with noise_formula"
+                        .to_string(),
+                });
+            }
+            materialize_transformation_normal(&parsed, data, &col_map, config)
+        } else if config.logslope_formula.is_some() || config.z_column.is_some() {
+            materialize_bernoulli_marginal_slope(&parsed, data, &col_map, config)
+        } else if config.noise_formula.is_some() {
+            materialize_location_scale(&parsed, data, &col_map, config)
+        } else {
+            materialize_standard(&parsed, data, &col_map, config)
+        }
     }
+}
+
+/// Reject `timewiggle(...)` / `survmodel(...)` in a formula whose response is
+/// not `Surv(...)`.
+///
+/// These two DSL controls only have meaning under the survival likelihood: a
+/// `timewiggle(...)` term parameterizes the time-varying baseline-hazard /
+/// log-cumulative-hazard surface, and `survmodel(...)` selects the survival
+/// likelihood mode. Both are read exclusively by `materialize_survival`. When
+/// the main formula has no `Surv(...)` response, leaving them unguarded means
+/// the term is parsed and option-validated and then dropped on the floor —
+/// the contract violation reported in #371. We error instead, with the same
+/// "only supported in the main survival formula" phrasing the auxiliary-formula
+/// path already uses.
+fn reject_survival_only_terms_for_nonsurvival(
+    parsed: &ParsedFormula,
+) -> Result<(), WorkflowError> {
+    if parsed.timewiggle.is_some() {
+        return Err(WorkflowError::InvalidConfig {
+            reason: "timewiggle(...) is only supported in the main survival formula \
+                     (a formula with a Surv(...) response); it is meaningless for a \
+                     non-survival response and would otherwise be silently ignored"
+                .to_string(),
+        });
+    }
+    if parsed.survivalspec.is_some() {
+        return Err(WorkflowError::InvalidConfig {
+            reason: "survmodel(...) is only supported in the main survival formula \
+                     (a formula with a Surv(...) response); it is meaningless for a \
+                     non-survival response and would otherwise be silently ignored"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Reject an *explicitly requested* `linkwiggle(...)` term when the resolved
+/// response family is not binomial.
+///
+/// `linkwiggle(...)` adds a spline-flexible correction to the *link* function
+/// (logit / probit / cloglog), which only carries meaning for a binomial mean
+/// model — the standard and location-scale materializers wire `wiggle` into the
+/// fit only inside their `family.is_binomial()` arm. For a Gaussian / Gamma /
+/// Poisson / etc. response the term is built and then dropped on the floor,
+/// the same silent-no-op contract violation as #371. We error here.
+///
+/// This guards only the *explicit* formula term (`parsed.linkwiggle`), not the
+/// implicit wiggle auto-derived from a `Flexible` link choice: a flexible link
+/// requested against a non-binomial family is a separate, already-handled link
+/// concern, and silently declining to add a binomial-only correction there is
+/// the intended behavior rather than a dropped user-authored term.
+fn reject_explicit_linkwiggle_for_nonbinomial(
+    parsed: &ParsedFormula,
+    family: &LikelihoodSpec,
+) -> Result<(), WorkflowError> {
+    if parsed.linkwiggle.is_some() && !family.is_binomial() {
+        return Err(WorkflowError::InvalidConfig {
+            reason: "linkwiggle(...) corrects the link function of a binomial mean model \
+                     and is only supported for a binomial response; it is meaningless for \
+                     the resolved non-binomial family and would otherwise be silently ignored"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Detect whether a response column is binary (0/1 only).
@@ -5271,6 +5348,11 @@ fn materialize_standard<'a>(
         .validate_response_degeneracy(y.view())
         .map_err(|deg| deg.message_for(&parsed.response))?;
 
+    // An explicit `linkwiggle(...)` term is only wired into the fit below for a
+    // binomial family; reject it for a non-binomial response rather than drop
+    // it silently (#371).
+    reject_explicit_linkwiggle_for_nonbinomial(parsed, &family)?;
+
     let effective_linkwiggle =
         effectivelinkwiggle_formulaspec(parsed.linkwiggle.as_ref(), link_choice.as_ref());
 
@@ -6651,6 +6733,11 @@ fn materialize_location_scale<'a>(
         .validate_response_degeneracy(y.view())
         .map_err(|deg| deg.message_for(&parsed.response))?;
 
+    // An explicit `linkwiggle(...)` term is only wired into the fit below for a
+    // binomial family; reject it for a non-binomial response rather than drop
+    // it silently (#371).
+    reject_explicit_linkwiggle_for_nonbinomial(parsed, &family)?;
+
     let effective_linkwiggle =
         effectivelinkwiggle_formulaspec(parsed.linkwiggle.as_ref(), link_choice.as_ref());
 
@@ -7235,5 +7322,76 @@ mod tests {
 
         assert!(err.contains("produced an invalid inverse-link state"));
         assert!(err.contains("9.0"));
+    }
+
+    // #371: survival-only / binomial-only DSL controls must be *rejected* in a
+    // non-survival main formula, not parsed-and-silently-dropped. The bug was
+    // that `parsed.timewiggle` / `parsed.survivalspec` are consumed only by
+    // `materialize_survival`, and an explicit `linkwiggle(...)` is wired into
+    // the fit only on the binomial arm, so a Gaussian formula carrying any of
+    // these accepted the term and then ignored it — the user got an ordinary
+    // GAM while believing they had configured a time-varying / wiggled model.
+
+    #[test]
+    fn timewiggle_rejected_in_nonsurvival_main_formula() {
+        // `bmi` is a continuous response -> Gaussian standard path, no Surv(...).
+        let data = workflow_test_dataset();
+        let err = materialize("bmi ~ z + timewiggle(internal_knots=4)", &data, &FitConfig::default())
+            .err()
+            .expect("timewiggle in a non-survival formula must be rejected, not silently ignored");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("timewiggle(...)") && msg.contains("survival"),
+            "error should explain timewiggle is survival-only, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn survmodel_rejected_in_nonsurvival_main_formula() {
+        let data = workflow_test_dataset();
+        let err = materialize("bmi ~ z + survmodel(spec=net)", &data, &FitConfig::default())
+            .err()
+            .expect("survmodel in a non-survival formula must be rejected, not silently ignored");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("survmodel(...)") && msg.contains("survival"),
+            "error should explain survmodel is survival-only, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn linkwiggle_rejected_for_nonbinomial_response() {
+        // `bmi` is continuous -> Gaussian; an explicit `linkwiggle(...)` corrects
+        // a binomial link and would otherwise be dropped on the floor here.
+        let data = workflow_test_dataset();
+        let err = materialize("bmi ~ z + linkwiggle(internal_knots=4)", &data, &FitConfig::default())
+            .err()
+            .expect("linkwiggle on a non-binomial response must be rejected, not silently ignored");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("linkwiggle(...)") && msg.contains("binomial"),
+            "error should explain linkwiggle is binomial-only, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn timewiggle_still_accepted_in_survival_formula() {
+        // Guard must not regress the legitimate survival path: a Surv(...)
+        // response still consumes timewiggle(...) without hitting the
+        // non-survival rejection. We assert it does not error with the
+        // non-survival "only supported in the main survival formula" message.
+        let data = load_survival_dataset();
+        let result = materialize(
+            "Surv(entry, exit, event) ~ x + timewiggle(internal_knots=2)",
+            &data,
+            &FitConfig::default(),
+        );
+        if let Err(err) = result {
+            let msg = err.to_string();
+            assert!(
+                !(msg.contains("timewiggle(...)") && msg.contains("meaningless")),
+                "survival timewiggle wrongly rejected by the non-survival guard: {msg}"
+            );
+        }
     }
 }
