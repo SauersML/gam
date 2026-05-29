@@ -11212,7 +11212,6 @@ fn sae_manifold_fit_minimal<'py>(
     learning_rate = 0.04,
     ridge_ext_coord = 1.0e-6,
     ridge_beta = 1.0e-6,
-    random_state = 0,
 ))]
 fn sae_manifold_predict_oos<'py>(
     py: Python<'py>,
@@ -11231,7 +11230,6 @@ fn sae_manifold_predict_oos<'py>(
     learning_rate: f64,
     ridge_ext_coord: f64,
     ridge_beta: f64,
-    random_state: u64,
 ) -> PyResult<Py<PyArray2<f64>>> {
     let x_view = x_new.as_array();
     let (n_obs, p_out) = x_view.dim();

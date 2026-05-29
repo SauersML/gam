@@ -147,7 +147,6 @@ class ManifoldSAE:
             alpha=float(self.alpha), tau=float(self.tau), assignment_kind=str(kind),
             sparsity_strength=float(self.sparsity_strength), smoothness=float(self.smoothness),
             max_iter=int(self.max_iter), learning_rate=float(self.learning_rate),
-            random_state=int(self.random_state),
         ), dtype=float)
 
     def predict(self, X: Any) -> np.ndarray:
