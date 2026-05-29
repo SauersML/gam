@@ -525,9 +525,11 @@ def _score_for_kind(
             fit_obj
         ) + _tk_normalizer_for_fit(fit_obj, null_dim)
     if score_kind == "reml":
-        return _extract_reml_score_raw(
-            fit_obj
-        ) + _tk_normalizer_for_fit(fit_obj, null_dim)
+        # Bare raw REML/evidence with no Tierney-Kadane normalizer. The
+        # `tk` kind is the only one that adds `_tk_normalizer_for_fit`; the
+        # null-space gauge-invariance caveat in `select_topology` applies to
+        # that normalizer alone, so `reml` deliberately returns the raw score.
+        return _extract_reml_score_raw(fit_obj)
     if score_kind == "laml":
         return _extract_laml_score(
             fit_obj

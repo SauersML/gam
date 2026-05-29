@@ -1,10 +1,11 @@
-//! RED tests for issue #227: `GatedSAEDecoder` must follow canonical
-//! Gated-SAE Heaviside gating — `gate_i = 1` iff `(W_gate x)_i > 0`,
+//! GREEN regression contract for issue #227: `GatedSAEDecoder` follows
+//! canonical Gated-SAE Heaviside gating — `gate_i = 1` iff `(W_gate x)_i > 0`,
 //! and 0 otherwise (including exact zero and all negative logits).
 //!
-//! The current implementation uses `logit != 0.0`, which incorrectly
-//! activates the gate for negative logits. These tests will fail until
-//! `src/terms/gated_decoder.rs:61` is changed to `if logit > 0.0`.
+//! The strict `if logit > 0.0` predicate lives at
+//! `src/terms/gated_decoder.rs:59`. These tests guard against any regression
+//! back to a non-strict comparison (e.g. `logit != 0.0`), which would wrongly
+//! activate the gate for negative or exactly-zero logits.
 
 use gam::terms::gated_decoder::GatedSAEDecoder;
 use ndarray::{Array1, Array2, array};

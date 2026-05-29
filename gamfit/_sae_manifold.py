@@ -491,7 +491,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     penalties = [n for n, ok in (("IsometryPenalty", isometry_weight > 0.0), ("ARDPenalty", ard_per_atom),
         ("MechanismSparsityPenalty", decoder_feature_sparsity_groups is not None),
         ("BlockOrthogonalityPenalty", block_orthogonality_weight > 0.0)) if ok]
-    # Build the analytic-penalty registry payload that `sae_manifold_fit_auto`
+    # Build the analytic-penalty registry payload that `sae_manifold_fit_minimal`
     # passes into `run_joint_fit_arrow_schur`. The four user-facing knobs map
     # to descriptors targeting the SAE latent block "t" (shape (n_obs, d_max)
     # where d_max = max(atom_dim) — matches the registry latent built in
@@ -506,27 +506,30 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         p_out=int(x.shape[1]),
         k_atoms=k_atoms,
     )
+    # `top_k = 0` (legacy sentinel) and `None` both disable top-k gating;
+    # anything in `[1, k_atoms]` is forwarded to the Rust driver, which
+    # projects the final assignments onto a per-row top-k support and
+    # recomputes `fitted` from the projected distribution. The Rust kernel
+    # owns the hard top-k contract end to end — there is no Python-side mask.
+    top_k_arg = int(top_k) if (top_k is not None and int(top_k) > 0) else None
     payload = rust_module().sae_manifold_fit_minimal(
         np.ascontiguousarray(x),
-        int(k_atoms),
         [str(b) for b in bases],
         [int(d) for d in dims],
-        str(kind),
         float(alpha_value),
         float(tau),
         bool(alpha == "auto"),
-        float(sparsity),
-        float(smoothness),
-        int(max_iter_total),
-        float(effective_lr),
-        int(random_state),
-        int(top_k) if top_k is not None else 0,
+        str(kind),
+        sparsity_strength=float(sparsity),
+        smoothness=float(smoothness),
+        max_iter=int(max_iter_total),
+        learning_rate=float(effective_lr),
         gumbel_schedule=_schedule_payload(gumbel_schedule),
         analytic_penalties=analytic_penalties_json,
+        random_state=int(random_state),
+        top_k=top_k_arg,
     )
     payload_dict = dict(payload)
-    if top_k is not None and int(top_k) > 0 and int(top_k) < k_atoms:
-        _apply_top_k_mask(payload_dict, int(top_k))
     return ManifoldSAE.from_payload(
         x, payload_dict, resolved_topology, assignment, penalties,
         alpha=float(alpha_value), learnable_alpha=bool(alpha == "auto"),
@@ -569,7 +572,7 @@ def _build_analytic_penalties_payload(
     k_atoms: int,
 ) -> str | None:
     """Translate the SAE regularizer knobs into the analytic-penalty JSON
-    payload consumed by ``sae_manifold_fit_auto``.
+    payload consumed by ``sae_manifold_fit_minimal``.
 
     All five knobs now route through ``src/terms/sae_manifold.rs``.
     ``ard_per_atom``, ``isometry_weight``, and ``block_orthogonality_weight``
@@ -656,32 +659,6 @@ def _build_analytic_penalties_payload(
     if not items:
         return None
     return json.dumps(items)
-
-
-def _apply_top_k_mask(payload: dict, top_k: int) -> None:
-    """Zero out all but the top-k assignments per row.
-
-    The Rust kernel does not yet enforce hard top-k selection internally;
-    the closed-form solver returns dense softmax/IBP probabilities. Apply
-    the constraint in Python so the user-facing assignment matrix honours
-    ``top_k``. Per-atom ``assignments_z`` slices and the global
-    ``assignments_z`` matrix stay consistent after masking.
-    """
-    A = np.asarray(payload["assignments_z"], dtype=float)
-    if A.ndim != 2 or A.shape[1] <= top_k:
-        return
-    keep = np.argpartition(-A, top_k - 1, axis=1)[:, :top_k]
-    mask = np.zeros_like(A)
-    rows = np.arange(A.shape[0])[:, None]
-    mask[rows, keep] = 1.0
-    A_masked = A * mask
-    payload["assignments_z"] = A_masked
-    new_atoms = []
-    for j, atom in enumerate(payload.get("atoms", [])):
-        atom_copy = dict(atom)
-        atom_copy["assignments_z"] = A_masked[:, j]
-        new_atoms.append(atom_copy)
-    payload["atoms"] = new_atoms
 
 
 def _as_2d_float(value: Any, name: str) -> np.ndarray:
