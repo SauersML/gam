@@ -9684,6 +9684,16 @@ fn sae_manifold_fit_inner<'py>(
     }
 
     let log_ard: Vec<Array1<f64>> = atom_dim.iter().map(|&d| Array1::<f64>::zeros(d)).collect();
+    // Auto-derive the streaming dispatch from the problem size and the
+    // hardware memory budget — no new kwarg. The full-batch arrow-Schur path
+    // retains the `(N × M_total)` basis, `(N × M_total × d)` jacobian, and
+    // `(N × K)` logit buffers; at LLM scale (hundreds of millions of rows)
+    // these blow past memory. When `n_obs · (M_total + K) · 8 bytes` exceeds an
+    // in-core threshold derived from the GPU memory budget (or, on CPU-only
+    // hosts, a conservative host-RAM fraction), the fit streams in row chunks
+    // sized to keep one chunk's buffers inside the L2-cache / budget window.
+    let (use_streaming, stream_chunk_size) =
+        sae_streaming_plan(n_obs, total_basis, k_atoms, max_dim);
     let mut best_term = None;
     let mut best_rho = None;
     let mut best_loss = None;
@@ -9692,20 +9702,46 @@ fn sae_manifold_fit_inner<'py>(
         let mut candidate_term = base_term.clone();
         let mut candidate_rho =
             SaeManifoldRho::new(sparsity_strength.ln(), lambda_smooth.ln(), log_ard.clone());
-        let mut candidate_loss = candidate_term
-            .run_joint_fit_arrow_schur(
-                z_view,
-                &mut candidate_rho,
-                Some(&registry),
-                1,
-                learning_rate,
-                ridge_ext_coord,
-                ridge_beta,
-            )
-            .map_err(py_value_error)?;
-        let mut prev_total = candidate_loss.total();
-        for _ in 1..max_iter {
-            let step_loss = candidate_term
+        let candidate_loss = if use_streaming {
+            // Streaming / minibatch fit: each chunk re-seeds its coordinates
+            // from the SAE PCA seed restricted to the chunk's `Z` rows and
+            // reuses the chunk's gating-logit seed. The decoder coefficients
+            // (and ARD ρ) are the only state refined across chunks; the chunk's
+            // `(logits, coords, basis)` are recomputed on demand and discarded.
+            let basis_kinds_chunk = basis_kinds.clone();
+            let atom_dim_chunk = atom_dim.clone();
+            let chunk_init = |start: usize, end: usize| -> Result<
+                (Array2<f64>, Vec<Array2<f64>>, Array2<f64>),
+                String,
+            > {
+                let z_chunk = z_view.slice(s![start..end, ..]).to_owned();
+                let logits_chunk = initial_logits.slice(s![start..end, ..]).to_owned();
+                let seed = sae_pca_seed_initial_coords(
+                    z_chunk.view(),
+                    &basis_kinds_chunk,
+                    &atom_dim_chunk,
+                )?;
+                let mut coords = Vec::with_capacity(atom_dim_chunk.len());
+                for (atom_idx, &d) in atom_dim_chunk.iter().enumerate() {
+                    coords.push(seed.slice(s![atom_idx, .., 0..d]).to_owned());
+                }
+                Ok((logits_chunk, coords, z_chunk))
+            };
+            candidate_term
+                .run_joint_fit_arrow_schur_streaming(
+                    n_obs,
+                    stream_chunk_size,
+                    &mut candidate_rho,
+                    Some(&registry),
+                    max_iter,
+                    learning_rate,
+                    ridge_ext_coord,
+                    ridge_beta,
+                    chunk_init,
+                )
+                .map_err(py_value_error)?
+        } else {
+            let mut candidate_loss = candidate_term
                 .run_joint_fit_arrow_schur(
                     z_view,
                     &mut candidate_rho,
@@ -9716,18 +9752,33 @@ fn sae_manifold_fit_inner<'py>(
                     ridge_beta,
                 )
                 .map_err(py_value_error)?;
-            let new_total = step_loss.total();
-            candidate_loss = step_loss;
-            if !new_total.is_finite() {
-                break;
+            let mut prev_total = candidate_loss.total();
+            for _ in 1..max_iter {
+                let step_loss = candidate_term
+                    .run_joint_fit_arrow_schur(
+                        z_view,
+                        &mut candidate_rho,
+                        Some(&registry),
+                        1,
+                        learning_rate,
+                        ridge_ext_coord,
+                        ridge_beta,
+                    )
+                    .map_err(py_value_error)?;
+                let new_total = step_loss.total();
+                candidate_loss = step_loss;
+                if !new_total.is_finite() {
+                    break;
+                }
+                let denom = prev_total.abs().max(1.0e-12);
+                let rel_change = (prev_total - new_total).abs() / denom;
+                prev_total = new_total;
+                if rel_change < 1.0e-6 {
+                    break;
+                }
             }
-            let denom = prev_total.abs().max(1.0e-12);
-            let rel_change = (prev_total - new_total).abs() / denom;
-            prev_total = new_total;
-            if rel_change < 1.0e-6 {
-                break;
-            }
-        }
+            candidate_loss
+        };
         let candidate_score = candidate_loss.evidence_proxy();
         if candidate_score > best_score {
             best_score = candidate_score;
@@ -9991,6 +10042,68 @@ fn sae_periodic_basis_size(n_harmonics: usize) -> Result<usize, String> {
         .ok_or_else(|| {
             format!("sae_build_periodic_atom: basis size overflows for n_harmonics={n_harmonics}")
         })
+}
+
+/// Auto-derive whether the SAE joint fit should stream, and the row-chunk size.
+///
+/// The full-batch arrow-Schur path retains, for all `n_obs` rows, the basis
+/// `(N × M_total)`, the basis jacobian `(N × M_total × d_max)`, and the gating
+/// logits `(N × K)`. The dominant per-row working set is therefore
+/// `w = (M_total · (1 + d_max) + K) · 8` bytes. When `n_obs · w` exceeds the
+/// in-core budget — the GPU memory budget when a device is present, else a
+/// conservative host-RAM working-set fraction — the fit streams in row chunks.
+///
+/// The chunk size keeps one chunk's per-row working set inside a cache/budget
+/// window: on GPU, a modest fraction of the device memory budget; on CPU, a
+/// multiple of the L2-cache estimate so a chunk's basis stays hot. The chunk is
+/// clamped to `[1, n_obs]` and to at least a small floor so the per-chunk
+/// reduced-Schur amortizes its `O(M² p + K³_reduced)` overhead.
+fn sae_streaming_plan(
+    n_obs: usize,
+    total_basis: usize,
+    k_atoms: usize,
+    d_max: usize,
+) -> (bool, usize) {
+    const BYTES_PER_F64: usize = 8;
+    // Host working-set we are willing to materialize for the dense full-batch
+    // path on a CPU-only host before switching to streaming.
+    const HOST_IN_CORE_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
+    // CPU L2-cache estimate used to size a chunk so its hot basis stays
+    // resident; chunks are sized to several multiples of this window.
+    const CPU_L2_CACHE_BYTES: usize = 1024 * 1024; // 1 MiB
+    const CHUNK_CACHE_MULTIPLE: usize = 8;
+    const MIN_CHUNK_ROWS: usize = 256;
+
+    let per_row_words = total_basis
+        .saturating_mul(1 + d_max)
+        .saturating_add(k_atoms)
+        .max(1);
+    let per_row_bytes = per_row_words.saturating_mul(BYTES_PER_F64);
+    let full_batch_bytes = n_obs.saturating_mul(per_row_bytes);
+
+    let runtime = gam::gpu::GpuRuntime::global();
+    let (in_core_budget, chunk_window_bytes) = match runtime {
+        Some(rt) => {
+            let budget = rt.memory_budget_bytes;
+            // Allow up to one quarter of the device budget for the dense
+            // full-batch buffers; size chunks to a small fraction so several
+            // chunks (plus the reduced system) coexist on-device.
+            let chunk_window = (budget / 16).max(CPU_L2_CACHE_BYTES * CHUNK_CACHE_MULTIPLE);
+            (budget / 4, chunk_window)
+        }
+        None => (
+            HOST_IN_CORE_BYTES,
+            CPU_L2_CACHE_BYTES * CHUNK_CACHE_MULTIPLE,
+        ),
+    };
+
+    if full_batch_bytes <= in_core_budget {
+        return (false, n_obs.max(1));
+    }
+    // Streaming: rows per chunk so the chunk's per-row working set fits the
+    // window, clamped to a floor for amortization and to `n_obs`.
+    let rows_per_chunk = (chunk_window_bytes / per_row_bytes).max(MIN_CHUNK_ROWS);
+    (true, rows_per_chunk.min(n_obs).max(1))
 }
 
 /// PCA seed: returns coords with shape `(k_atoms, n_obs, d_max)`. For periodic
