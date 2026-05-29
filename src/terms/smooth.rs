@@ -463,6 +463,16 @@ pub enum TensorBSplineIdentifiability {
     None,
     #[default]
     SumToZero,
+    /// mgcv `ti(...)` semantics: a *tensor interaction* smooth that excludes the
+    /// marginal main effects. A sum-to-zero constraint is applied to **each
+    /// marginal basis independently** before forming the tensor product, so the
+    /// resulting column space contains no function of a single variable alone —
+    /// only the pure interaction survives. The realized identifiability
+    /// transform is the Kronecker product `Z = Z₀ ⊗ Z₁ ⊗ … ⊗ Z_{d-1}` of the
+    /// per-margin sum-to-zero null-space bases, which is exactly the
+    /// reparameterization that turns the full-tensor design into the tensor
+    /// product of the centered margins.
+    MarginalSumToZero,
     FrozenTransform {
         transform: Array2<f64>,
     },
@@ -1032,6 +1042,7 @@ impl TermCollectionSpec {
                     if matches!(
                         spec.identifiability,
                         TensorBSplineIdentifiability::SumToZero
+                            | TensorBSplineIdentifiability::MarginalSumToZero
                     ) {
                         return Err(SmoothError::invalid_config(format!(
                             "{label} term '{}' is not frozen: tensor identifiability must be FrozenTransform or None",
@@ -4708,6 +4719,35 @@ fn build_tensor_bspline_basis(
                 )
             })?;
             let (_, z) = apply_sum_to_zero_constraint(dense_design_ref.view(), None)?;
+            Some(z)
+        }
+        TensorBSplineIdentifiability::MarginalSumToZero => {
+            // `ti(...)`: drop the marginal main effects by centering every
+            // margin independently, then form the tensor product of the
+            // centered margins. Concretely, each margin `j` is reparameterized
+            // by its own sum-to-zero null basis `Z_j` (so the constant — i.e.
+            // the marginal intercept — is removed from that axis), and the
+            // combined reparameterization is the Kronecker product
+            // `Z = Z₀ ⊗ Z₁ ⊗ … ⊗ Z_{d-1}`. Applying `Z` to the full-tensor
+            // design `B = B₀ ⊗ … ⊗ B_{d-1}` yields `B Z = (B₀ Z₀) ⊗ … ⊗
+            // (B_{d-1} Z_{d-1})`, the tensor product of the centered margins,
+            // which by construction contains no pure main effect.
+            if marginal_designs.len() < 2 {
+                crate::bail_invalid_basis!(
+                    "tensor interaction (ti) identifiability requires at least 2 margins"
+                );
+            }
+            let mut z = Array2::<f64>::eye(1);
+            for (dim, marginal) in marginal_designs.iter().enumerate() {
+                if marginal.ncols() < 2 {
+                    crate::bail_invalid_basis!(
+                        "tensor interaction (ti) margin {dim} has fewer than 2 basis functions; \
+                         cannot remove its marginal main effect"
+                    );
+                }
+                let (_, z_dim) = apply_sum_to_zero_constraint(marginal.view(), None)?;
+                z = kronecker_product(&z, &z_dim);
+            }
             Some(z)
         }
         TensorBSplineIdentifiability::FrozenTransform { transform } => {
