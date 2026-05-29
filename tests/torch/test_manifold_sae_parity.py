@@ -212,6 +212,135 @@ def test_basis_eval_backward_uses_rust_jet():
     assert torch.isfinite(x.grad).all()
 
 
+def test_advance_temperature_queries_rust_schedule():
+    # advance_temperature must drive the Rust GumbelTemperatureSchedule, not a
+    # duplicated Python decay. Each call advances the schedule's own iter_count
+    # and writes the Rust-evaluated tau into the layer buffer. Regression for the
+    # parity workstream: the previous code passed an extra positional argument to
+    # `current_tau`, which raised TypeError and silently never annealed.
+    from gamfit.torch.manifold_sae import _SparsityLayer  # type: ignore[attr-defined]
+
+    cfg = gt.ManifoldSAEConfig(
+        input_dim=4,
+        n_atoms=3,
+        intrinsic_rank=1,
+        n_basis_per_atom=4,
+        sparsity={"kind": "ibp_gumbel", "init_alpha": 1.0, "tau_schedule": "linear:4.0->1.0"},
+    )
+    layer = _SparsityLayer(cfg)
+    schedule = cfg.sparsity.gumbel_schedule()
+
+    # tau starts at tau_start before any annealing step.
+    assert float(layer.tau.item()) == pytest.approx(cfg.sparsity.tau_start)
+
+    # Each advance must equal the Rust schedule evaluated at the matching iter.
+    prev = float(layer.tau.item())
+    for step in range(1, 5):
+        layer.advance_temperature()
+        expected = float(schedule.step())
+        assert float(layer.tau.item()) == pytest.approx(expected), (
+            f"advance_temperature at step {step} diverged from Rust schedule"
+        )
+        # Linear decay from 4.0 -> 1.0 is monotone non-increasing.
+        assert float(layer.tau.item()) <= prev + 1e-12
+        prev = float(layer.tau.item())
+
+
+def test_ibp_gumbel_forward_applies_stick_breaking_prior():
+    # The torch IBP-Gumbel forward must route through the Rust ibp_map kernel so
+    # it applies the stick-breaking prior pi_k = (alpha/(alpha+1))^k and the
+    # temperature scaling that the closed-form SaeAssignment IBP path uses. A bare
+    # sigmoid(logits/tau) would omit pi_k. We pin it by reproducing the Rust
+    # value out-of-band and asserting the forward matches bit-for-bit.
+    from gamfit.torch.manifold_sae import _SparsityLayer  # type: ignore[attr-defined]
+    from gamfit.torch.penalties import ibp_map  # type: ignore[attr-defined]
+
+    alpha = 1.3
+    tau_start = 2.5
+    cfg = gt.ManifoldSAEConfig(
+        input_dim=4,
+        n_atoms=5,
+        intrinsic_rank=1,
+        n_basis_per_atom=4,
+        sparsity={"kind": "ibp_gumbel", "init_alpha": alpha, "tau_start": tau_start, "tau_min": 0.5},
+    )
+    layer = _SparsityLayer(cfg)
+    rng = np.random.default_rng(7)
+    logits = torch.as_tensor(rng.standard_normal((6, 5)), dtype=torch.float64)
+
+    assignments, gate_pre = layer(logits)
+
+    # gate_pre is the untouched logits; assignments carry the prior + temperature.
+    np.testing.assert_allclose(gate_pre.detach().numpy(), logits.numpy(), rtol=0.0, atol=0.0)
+
+    tau = max(tau_start, 1e-6)
+    expected = ibp_map(logits, tau, alpha)
+    np.testing.assert_allclose(
+        assignments.detach().numpy(), expected.detach().numpy(), rtol=0.0, atol=0.0
+    )
+
+    # The stick-breaking prior strictly decays in atom index: with tied logits the
+    # per-atom mass must fall off geometrically, which bare sigmoid(logits/tau)
+    # could never produce.
+    tied = torch.zeros((1, 5), dtype=torch.float64)
+    tied_assign = layer(tied)[0].detach().numpy().reshape(-1)
+    ratio = alpha / (alpha + 1.0)
+    sig0 = float(tied_assign[0])
+    for k in range(5):
+        np.testing.assert_allclose(tied_assign[k], sig0 * ratio**k, rtol=0.0, atol=1e-12)
+    assert np.all(np.diff(tied_assign) < 0.0), "stick-breaking prior must strictly decay"
+
+
+def test_isometry_backward_grad_matches_rust_grad_jacobian():
+    # _IsometryPenaltyFn.backward must obtain dP/dJ from the Rust grad_jacobian
+    # kernel (W-/reference-/weight-aware), not recompute 2*mu*J*(J^TJ - I) in
+    # Python. We pin the autograd basis gradient against a central-difference of
+    # the Rust penalty value, so any Python recompute that drops scalar_weight or
+    # the reference metric would fail.
+    weight = 0.8
+    pen = gt.IsometryPenalty(weight=weight)
+    latent = torch.tensor(
+        [[0.2, -0.1, 0.7], [0.5, 0.3, -0.4], [-0.2, 0.8, 0.1]],
+        dtype=torch.float64,
+    )
+    basis = torch.tensor(
+        [[1.1, 0.2, -0.3], [0.0, 0.9, 0.4], [-0.5, 0.1, 1.2], [0.3, -0.6, 0.7]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    value = pen(latent, basis)
+    value.backward()
+    assert basis.grad is not None
+    autograd_grad = basis.grad.detach().numpy().copy()
+
+    # Central-difference of the closed-form Rust value w.r.t. each basis entry.
+    base_np = basis.detach().numpy().copy()
+    latent_np = latent.detach().numpy()
+    h = 1e-6
+    numeric = np.zeros_like(base_np)
+    for i in range(base_np.shape[0]):
+        for j in range(base_np.shape[1]):
+            bp = base_np.copy()
+            bm = base_np.copy()
+            bp[i, j] += h
+            bm[i, j] -= h
+            v_plus = pen.rust_value(latent_np, basis=bp)
+            v_minus = pen.rust_value(latent_np, basis=bm)
+            numeric[i, j] = (v_plus - v_minus) / (2.0 * h)
+
+    np.testing.assert_allclose(autograd_grad, numeric, rtol=1e-5, atol=1e-7)
+
+    # And the gradient must scale linearly with the scalar weight (scalar_weight
+    # is not dropped). Doubling the weight doubles dP/dJ.
+    pen2 = gt.IsometryPenalty(weight=2.0 * weight)
+    basis2 = basis.detach().clone().requires_grad_(True)
+    pen2(latent, basis2).backward()
+    assert basis2.grad is not None
+    np.testing.assert_allclose(
+        basis2.grad.detach().numpy(), 2.0 * autograd_grad, rtol=1e-9, atol=1e-9
+    )
+
+
 def test_invalid_config_raises():
     with pytest.raises(ValueError):
         gt.ManifoldSAEConfig(input_dim=0, n_atoms=4)

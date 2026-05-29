@@ -111,6 +111,54 @@ def test_lorentz_near_boundary_is_finite() -> None:
     assert torch.isfinite(x_hat).all()
 
 
+def test_large_gate_decode_stays_strictly_interior() -> None:
+    # Regression for #354: a large gate drives a large aggregated tangent.
+    # The exp/decode must return points strictly inside the open ball
+    # (||x|| < 1, and <= 1 - BOUNDARY_EPS), not saturated onto the boundary,
+    # so downstream distance/log stay finite.
+    boundary_eps = 1.0e-5
+    for lorentz in (False, True):
+        pa = _atoms(F=4, ball_dim=6, curvature=-1.0, lorentz=lorentz)
+        x = pa(torch.full((3, 4), 1e3, dtype=pa.atoms.dtype))
+        assert torch.isfinite(x).all(), f"decode must be finite (lorentz={lorentz})"
+        norms = torch.linalg.vector_norm(x, dim=-1)
+        assert bool((norms < 1.0).all()), (
+            f"decode must be strictly inside the ball (lorentz={lorentz}), "
+            f"got norms {norms.tolist()}"
+        )
+        assert bool((norms <= 1.0 - boundary_eps + 1e-12).all()), (
+            f"decode must respect the open-ball invariant (lorentz={lorentz}), "
+            f"got norms {norms.tolist()}"
+        )
+        d = pa.distance(torch.zeros_like(x), x)
+        assert torch.isfinite(d).all(), (
+            f"distance(0, x) must be finite (lorentz={lorentz}), got {d.tolist()}"
+        )
+
+
+def test_exp_origin_large_tangent_is_finite_and_interior() -> None:
+    # Direct primitive check for #354 on both exp paths: a tangent with
+    # norm ~1e3 must produce a finite, strictly-interior point with no NaN.
+    np = pytest.importorskip("numpy")
+    import gamfit._rust as rust
+
+    boundary_eps = 1.0e-5
+    v = np.array([1e3, -5e2, 2e2, 7e1], dtype=np.float64)
+    curvature = -1.0
+
+    x_p = np.asarray(rust.poincare_exp_origin(v, curvature))
+    norm_p = float(np.linalg.norm(x_p))
+    assert np.isfinite(x_p).all()
+    assert norm_p < 1.0 and norm_p <= 1.0 - boundary_eps + 1e-12
+
+    x_h = np.asarray(rust.poincare_lorentz_exp_origin(v, curvature))
+    assert np.isfinite(x_h).all()
+    y = np.asarray(rust.poincare_from_lorentz(x_h, curvature))
+    norm_l = float(np.linalg.norm(y))
+    assert np.isfinite(y).all()
+    assert norm_l < 1.0 and norm_l <= 1.0 - boundary_eps + 1e-12
+
+
 def test_rejects_nonnegative_curvature() -> None:
     with pytest.raises(ValueError):
         _atoms(F=2, ball_dim=3, curvature=0.0)

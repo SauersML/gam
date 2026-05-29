@@ -1,29 +1,28 @@
-//! Verify that the channel-aware identifiability audit fires inside
+//! Verify that the per-atom decoder identifiability audit fires inside
 //! `SaeManifoldTerm::run_joint_fit_arrow_schur`.
 //!
 //! # What is tested
 //!
 //! Two scenarios:
 //!
-//! 1. **Aliased atoms** — two decoder atoms with intentionally identical
-//!    basis evaluations on the training rows.  Because the two atoms
-//!    map to the same `(n·p, M·p)` effective Jacobian columns, the
-//!    channel-aware audit detects the alias and `run_joint_fit_arrow_schur`
-//!    returns an `Err` whose message mentions the identifiability failure.
+//! 1. **Well-posed atoms** — two decoder atoms whose per-atom weighted designs
+//!    `D_k = diag(a_·k)·Φ_k` are each full column rank.  The audit passes
+//!    cleanly and `run_joint_fit_arrow_schur` returns `Ok`.
 //!
-//! 2. **Non-aliased atoms** — two atoms with distinct, linearly independent
-//!    basis evaluations.  The audit passes cleanly and the fit returns `Ok`.
+//! 2. **Rank-0 atom** — one atom whose basis evaluations are identically zero,
+//!    so its weighted design `D_k` is rank 0.  The Arrow-Schur Newton system
+//!    for that decoder block is singular, and the pre-fit audit surfaces this
+//!    as an identifiability error before any Newton step.
 //!
-//! # Why this confirms the callback is load-bearing
+//! # Why this is the correct check
 //!
-//! `decoder_parameter_block_specs()` is called inside
-//! `run_joint_fit_arrow_schur` before the Newton loop.  The specs carry
-//! `SaeDecoderBlockJacobian` callbacks (n_outputs = p), which makes
-//! `canonicalize_for_identifiability` route through
-//! `audit_identifiability_channel_aware`.  An alias that the flat audit
-//! would have missed (due to orthogonal output channels) is correctly
-//! classified; a true structural alias (same Jacobian column in the same
-//! channel) is caught and surfaces as a fit error.
+//! The SAE decoder Hessian for atom `k` is `H_data = G_k ⊗ I_p` with
+//! `G_k = D_kᵀ D_k`, so decoder identifiability is fully determined by the
+//! per-atom `(n, M_k)` design `D_k` — the `p`-fold output replication carries
+//! no extra structural information.  The audit therefore runs the pivoted-QR
+//! rank check directly on each `D_k`, never materialising the (mis-specified)
+//! `(n·p, M_k·p)` channel-replicated block that previously broadcast-panicked
+//! when routed through the cross-block flat audit.
 
 use gam::terms::sae_manifold::{
     AssignmentMode, SaeAssignment, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho,
@@ -77,7 +76,8 @@ fn make_rho(k_atoms: usize) -> SaeManifoldRho {
 }
 
 /// Distinct polynomial-like basis: atom 0 uses {1, t, t²}, atom 1 uses {1, 1-t, (1-t)²}.
-/// These are linearly independent over N=20 generic points, so the audit passes.
+/// These are each full column rank over N=20 generic points, so the per-atom
+/// audit passes for both atoms.
 fn distinct_phi(atom_idx: usize) -> Array2<f64> {
     let mut phi = Array2::<f64>::zeros((N, M));
     for i in 0..N {
@@ -93,21 +93,6 @@ fn distinct_phi(atom_idx: usize) -> Array2<f64> {
     phi
 }
 
-/// Aliased basis: both atoms return the identical polynomial basis {1, t, t²}.
-/// In the channel-aware Jacobian (n·p, M·p), the two blocks produce the same
-/// weighted columns when the assignments are equal, making the joint design
-/// rank-deficient. The audit should detect this and the fit should fail.
-fn aliased_phi() -> Array2<f64> {
-    let mut phi = Array2::<f64>::zeros((N, M));
-    for i in 0..N {
-        let t = (i as f64 + 1.0) / (N as f64);
-        phi[[i, 0]] = 1.0;
-        phi[[i, 1]] = t;
-        phi[[i, 2]] = t * t;
-    }
-    phi
-}
-
 /// A trivial target matrix (all zeros). The audit runs before any Newton step,
 /// so the target only affects the loss, not the audit outcome.
 fn zero_target() -> Array2<f64> {
@@ -115,9 +100,9 @@ fn zero_target() -> Array2<f64> {
 }
 
 #[test]
-fn run_joint_fit_passes_with_distinct_atoms() {
-    // Two atoms with distinct, linearly independent bases — audit should pass
-    // cleanly and the fit should return Ok.
+fn run_joint_fit_passes_with_full_rank_atoms() {
+    // Two atoms with distinct, full-column-rank weighted designs — the per-atom
+    // audit passes cleanly and the fit returns Ok.
     let phi0 = distinct_phi(0);
     let phi1 = distinct_phi(1);
     let atom0 = make_atom("atom_a", phi0);
@@ -138,19 +123,21 @@ fn run_joint_fit_passes_with_distinct_atoms() {
     );
     assert!(
         result.is_ok(),
-        "run_joint_fit_arrow_schur must succeed with distinct atoms; got: {:?}",
+        "run_joint_fit_arrow_schur must succeed with full-rank atoms; got: {:?}",
         result,
     );
 }
 
 #[test]
-fn run_joint_fit_fails_with_aliased_atoms() {
-    // Two atoms with identical basis evaluations — the channel-aware audit
-    // detects the alias (both atoms produce the same Jacobian columns in each
-    // output channel when the assignments are equal) and the fit must error.
-    let phi = aliased_phi();
-    let atom0 = make_atom("atom_alias_0", phi.clone());
-    let atom1 = make_atom("atom_alias_1", phi);
+fn run_joint_fit_fails_with_rank_zero_atom() {
+    // One atom whose basis evaluations are identically zero — its weighted
+    // design D_k is rank 0, so the decoder block Hessian G_k ⊗ I_p is singular.
+    // The pre-fit per-atom audit must catch this and the fit must error before
+    // any Newton step.
+    let phi0 = distinct_phi(0);
+    let phi_zero = Array2::<f64>::zeros((N, M));
+    let atom0 = make_atom("atom_ok", phi0);
+    let atom1 = make_atom("atom_degenerate", phi_zero);
     let assignment = make_assignment(2);
     let mut term = SaeManifoldTerm::new(vec![atom0, atom1], assignment).unwrap();
     let mut rho = make_rho(2);
@@ -160,8 +147,7 @@ fn run_joint_fit_fails_with_aliased_atoms() {
         term.run_joint_fit_arrow_schur(target.view(), &mut rho, None, 1, 1.0, 1.0e-3, 1.0e-3);
     assert!(
         result.is_err(),
-        "run_joint_fit_arrow_schur must fail with aliased atoms (identical bases, equal assignments); \
-         got Ok(…)",
+        "run_joint_fit_arrow_schur must fail when an atom has a rank-0 weighted design; got Ok(…)",
     );
     let msg = result.unwrap_err();
     assert!(

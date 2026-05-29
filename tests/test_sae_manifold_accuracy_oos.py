@@ -160,6 +160,68 @@ def test_curved_circle_atom_oos_r2():
     )
 
 
+def test_oos_uses_fit_time_hyperparameters():
+    """The OOS predict path must solve the *same* regularized problem as
+    the fit: ``reconstruct``/``predict`` must thread the fit-time alpha,
+    tau, sparsity_strength, smoothness, and the effective learning_rate
+    into the Rust OOS solver — not hardcoded alpha=1.0/tau=0.5/
+    sparsity=1.0/smoothness=1.0/lr=0.04. We fit with deliberately
+    non-default knobs and assert the fit object persists exactly those
+    values, then confirm a serialize/deserialize round-trip reproduces
+    OOS predictions bit-exactly (which is only possible if every knob is
+    carried, not silently reset to a default).
+    """
+    z_full, _ = _circle_data(n=400, p=64, noise=0.04, seed=3)
+    z_train = z_full[:200]
+    z_test = z_full[200:]
+
+    fit = gamfit.sae_manifold_fit(
+        Z=z_train,
+        n_atoms=1,
+        atom_basis="periodic",
+        atom_dim=2,
+        assignment_prior="ibp_map",
+        max_iter=37,
+        learning_rate=0.07,
+        tau=0.3,
+        sparsity_strength=0.5,
+        smoothness=2.0,
+        random_state=5,
+    )
+
+    # The fit-time knobs must be persisted on the fit object verbatim so
+    # OOS re-estimation reproduces the training-time regularized problem.
+    assert fit.tau == pytest.approx(0.3)
+    assert fit.sparsity_strength == pytest.approx(0.5)
+    assert fit.smoothness == pytest.approx(2.0)
+    assert fit.learning_rate == pytest.approx(0.07)
+    assert fit.max_iter == 37
+    assert fit.random_state == 5
+    # None of these may collapse to the old hardcoded OOS defaults.
+    assert not (
+        fit.tau == pytest.approx(0.5)
+        and fit.sparsity_strength == pytest.approx(1.0)
+        and fit.smoothness == pytest.approx(1.0)
+        and fit.learning_rate == pytest.approx(0.04)
+    ), "OOS hyperparameters collapsed to the old hardcoded defaults."
+
+    oos_direct = fit.reconstruct(z_test)
+
+    # Round-trip through serialization: the deserialized fit must carry
+    # the same hyperparameters and therefore reproduce OOS predictions
+    # bit-exactly. If any knob were dropped on the way through, the OOS
+    # solve would diverge here.
+    restored = gamfit.ManifoldSAE.from_dict(fit.to_dict())
+    assert restored.tau == pytest.approx(0.3)
+    assert restored.sparsity_strength == pytest.approx(0.5)
+    assert restored.smoothness == pytest.approx(2.0)
+    assert restored.learning_rate == pytest.approx(0.07)
+    assert restored.max_iter == 37
+    assert restored.random_state == 5
+    oos_restored = restored.reconstruct(z_test)
+    np.testing.assert_allclose(oos_restored, oos_direct, rtol=0.0, atol=0.0)
+
+
 def test_curved_sphere_atom_on_sphere_data():
     """Sphere topology check: a Sphere atom on S^2 ground-truth data
     should reach R^2 >= 0.85. This catches bugs that the periodic-1D
@@ -183,4 +245,57 @@ def test_curved_sphere_atom_on_sphere_data():
         f"can represent any first-order spherical harmonic mixture; "
         f"if this is below threshold the sphere-chart basis or its "
         f"jacobian is wrong."
+    )
+
+
+def test_sae_manifold_oos_reconstruction_idempotence():
+    """OOS prediction is a pure function of (input data, trained atoms,
+    frozen hyperparameters): the Rust OOS solver uses fixed initialization,
+    a deterministic Newton optimizer (Arrow-Schur + Armijo, no RNG), and
+    frozen decoder weights. Calling ``reconstruct`` repeatedly on the same
+    held-out matrix must therefore return bit-exactly identical arrays.
+
+    ``test_oos_uses_fit_time_hyperparameters`` validates this indirectly via
+    a serialize/deserialize round-trip; this test asserts the invariant
+    directly — three identical OOS calls in a row — and also confirms the
+    input matrix is not mutated in place by the FFI.
+    """
+    z_full, _ = _circle_data(n=400, p=64, noise=0.04, seed=11)
+    z_train = z_full[:200]
+    z_test = z_full[200:]
+
+    fit = gamfit.sae_manifold_fit(
+        Z=z_train,
+        n_atoms=1,
+        atom_basis="periodic",
+        atom_dim=2,
+        assignment_prior="ibp_map",
+        max_iter=40,
+        learning_rate=0.04,
+        random_state=0,
+    )
+
+    z_test_guard = z_test.copy()
+    outputs = [fit.reconstruct(z_test) for _ in range(3)]
+
+    for r in outputs:
+        assert np.all(np.isfinite(r)), "OOS reconstruction produced NaN/Inf"
+
+    # All three calls must agree bit-exactly (no RNG, no mutable state).
+    np.testing.assert_array_equal(
+        outputs[0],
+        outputs[1],
+        err_msg="OOS reconstruct is not idempotent: call 1 != call 2",
+    )
+    np.testing.assert_array_equal(
+        outputs[0],
+        outputs[2],
+        err_msg="OOS reconstruct is not idempotent: call 1 != call 3",
+    )
+
+    # The OOS input must not be mutated in place by the FFI round-trip.
+    np.testing.assert_array_equal(
+        z_test,
+        z_test_guard,
+        err_msg="reconstruct mutated its input array in place",
     )

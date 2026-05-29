@@ -81,8 +81,9 @@ use gam::terms::basis::{
     build_duchon_operator_penalty_matrices, build_matern_basis, build_periodic_bspline_basis_1d,
     build_spherical_spline_basis, build_thin_plate_penalty_matrix, create_basis,
     create_cyclic_difference_penalty_matrix, create_difference_penalty_matrix,
-    duchon_polynomial_first_derivative_nd, duchon_radial_first_derivative_nd,
-    duchon_radial_second_derivative_nd, evaluate_bspline_basis_scalar,
+    duchon_nullspace_dimension, duchon_polynomial_first_derivative_nd,
+    duchon_radial_first_derivative_nd, duchon_radial_second_derivative_nd,
+    evaluate_bspline_basis_scalar,
     matern_radial_first_derivative_nd, matern_radial_second_derivative_nd, monomial_exponents,
     periodic_bspline_first_derivative_nd, resolve_duchon_orders,
     select_spherical_farthest_point_centers, sphere_first_derivative_nd,
@@ -98,9 +99,9 @@ use gam::terms::interchange_decoder::{
 };
 use gam::terms::latent_coord::{AuxPriorFamily, aux_prior_targets};
 use gam::terms::sae_manifold::{
-    AssignmentMode, GumbelTemperatureSchedule, PeriodicHarmonicEvaluator, SaeAtomBasisKind,
-    SaeBasisEvaluator, SaeManifoldRho, ScheduleKind, SphereChartEvaluator, StaticBasisEvaluator,
-    TorusHarmonicEvaluator, term_from_padded_blocks_with_mode,
+    AssignmentMode, DuchonCoordinateEvaluator, EuclideanPatchEvaluator, GumbelTemperatureSchedule,
+    PeriodicHarmonicEvaluator, SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldRho, ScheduleKind,
+    SphereChartEvaluator, TorusHarmonicEvaluator, term_from_padded_blocks_with_mode,
 };
 use gam::terms::skip_transcoder::{
     SkipTranscoderRemlInputs, skip_transcoder_reml_metrics as skip_transcoder_reml_metrics_core,
@@ -1094,6 +1095,7 @@ fn estimation_error_to_pyerr(err: EstimationError) -> PyErr {
         EstimationError::CalibratorTrainingFailed(_) => CalibratorError::new_err(message),
         EstimationError::InvalidSpecification(_) => InvalidSpecificationError::new_err(message),
         EstimationError::PredictionError => PredictionError::new_err(message),
+        EstimationError::CustomFamily(_) => CustomFamilyError::new_err(message),
     }
 }
 
@@ -1223,6 +1225,14 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "gaussian-location-scale",
             "binomial-location-scale",
         ],
+    )?;
+    // SAE row-block analytic penalty kinds this build supports, so the Python
+    // wrapper can refuse cleanly on a stale extension rather than forward a
+    // descriptor that fails with a cryptic Schur error (issue #338). Derived
+    // from the same source of truth as `sae_penalty_is_row_block_supported`.
+    info.set_item(
+        "sae_row_block_penalties",
+        gam::terms::sae_manifold::sae_row_block_penalty_kinds().to_vec(),
     )?;
     Ok(info.unbind())
 }
@@ -8226,6 +8236,7 @@ fn latent_multi_output_fit_to_pydict<'py>(
     y: ArrayView2<'_, f64>,
     penalty: ArrayView2<'_, f64>,
     weights: Option<ArrayView1<'_, f64>>,
+    fisher_w: Option<ArrayView3<'_, f64>>,
     init_lambda: Option<f64>,
     family_name: &str,
     latent_prior_score: f64,
@@ -8286,6 +8297,59 @@ fn latent_multi_output_fit_to_pydict<'py>(
     let max_iter = 50usize;
     let tol = 1.0e-7_f64;
 
+    // Per-row Fisher-block override (issue #349). The wire-level array is
+    // `(N, K, K)`; validate finiteness + non-negative diagonal here, then adapt
+    // to each branch's curvature gauge:
+    //   - multinomial: the fitter consumes the active `(N, K-1, K-1)` leading
+    //     sub-block (the reference class K-1 is dropped); require each per-row
+    //     active block to be symmetric.
+    //   - binomial-multi: the K columns are fit independently, so off-diagonal
+    //     cross terms cannot be represented — require them to be zero — and the
+    //     full `(N, K, K)` array is forwarded for its diagonal.
+    let multinomial_fisher_active: Option<Array3<f64>> = match fisher_w.as_ref() {
+        Some(fw) => {
+            validate_dense_fisher_w(n_obs, n_outputs, *fw).map_err(py_value_error)?;
+            if multinomial {
+                let mut active = Array3::<f64>::zeros((n_obs, active_outputs, active_outputs));
+                for n in 0..n_obs {
+                    for a in 0..active_outputs {
+                        for b in 0..active_outputs {
+                            active[[n, a, b]] = fw[[n, a, b]];
+                        }
+                    }
+                    for a in 0..active_outputs {
+                        for b in (a + 1)..active_outputs {
+                            if (fw[[n, a, b]] - fw[[n, b, a]]).abs() > 1.0e-9 {
+                                return Err(py_value_error(format!(
+                                    "fisher_w active block[{n}] must be symmetric for the \
+                                     multinomial path; entries [{a},{b}] and [{b},{a}] differ"
+                                )));
+                            }
+                        }
+                    }
+                }
+                Some(active)
+            } else {
+                for n in 0..n_obs {
+                    for a in 0..n_outputs {
+                        for b in 0..n_outputs {
+                            if a != b && fw[[n, a, b]] != 0.0 {
+                                return Err(py_value_error(format!(
+                                    "fisher_w block[{n}] off-diagonal [{a},{b}] must be zero for \
+                                     the binomial-multi path (each response column is fit \
+                                     independently); got {}",
+                                    fw[[n, a, b]]
+                                )));
+                            }
+                        }
+                    }
+                }
+                None
+            }
+        }
+        None => None,
+    };
+
     // Coefficients matrix `(P, K)` with reference-class column zeroed for
     // the multinomial branch (so the wire-level shape matches the prior
     // `dense_fisher_glm_fit_to_pydict` contract).
@@ -8303,6 +8367,7 @@ fn latent_multi_output_fit_to_pydict<'py>(
                 penalty,
                 lambdas: lambdas_vec.view(),
                 row_weights: Some(row_weights.view()),
+                fisher_w_override: multinomial_fisher_active.as_ref().map(|a| a.view()),
                 max_iter,
                 tol,
             },
@@ -8327,6 +8392,7 @@ fn latent_multi_output_fit_to_pydict<'py>(
                 penalty,
                 lambdas: lambdas_vec.view(),
                 row_weights: Some(row_weights.view()),
+                fisher_w_override: fisher_w,
                 max_iter,
                 tol,
             },
@@ -8432,6 +8498,7 @@ fn fit_penalized_multinomial_pyfunc<'py>(
             penalty: penalty_view,
             lambdas: lambdas_view,
             row_weights: row_weights_view,
+            fisher_w_override: None,
             max_iter,
             tol,
         },
@@ -9059,6 +9126,31 @@ fn sae_atom_basis_kind_from_str(value: &str) -> SaeAtomBasisKind {
 const SAE_DEFAULT_TORUS_HARMONICS: usize = 3;
 /// Sphere chart basis size (lat/lon ⇒ `[1, x, y, z, xy, yz, xz]`).
 const SAE_SPHERE_BASIS_SIZE: usize = 7;
+/// Duchon nullspace knob `m` for a SAE-manifold atom of latent dimension
+/// `dim`, derived so the scale-free (`power = 0`) curvature seminorm
+/// (`OperatorStiffness`) is always well-posed.
+///
+/// `m` maps to the polynomial-nullspace order via [`duchon_nullspace_from_m`]
+/// (`m = 1 → Zero/p=1`, `m = 2 → Linear/p=2`, `m = k+1 → Degree(k)/p=k+1`), so
+/// `p_order == m`. The scale-free curvature (D²) penalty requires D2
+/// collocation `2(p + s) > dim + 2`; with `s = 0` (the pure-polyharmonic basis
+/// the `DuchonCoordinateEvaluator` evaluates) this is `2·m > dim + 2`, whose
+/// smallest integer solution is `m = ⌊dim / 2⌋ + 2`.
+///
+/// For `dim == 1` this reproduces the historical `m = 2` (constant + linear
+/// null space). For `dim ≥ 2` it grows the null space just enough to admit the
+/// curvature penalty — the previous hard-coded `m = 2` left the resolved
+/// power/order inconsistent with the power-0 evaluator and emitted no usable
+/// smoothness penalty. The seed build and every
+/// [`DuchonCoordinateEvaluator`] refresh read this same derived `m`, so the
+/// design `Φ`, its jet, and the penalty stay column-consistent (the issue-247
+/// invariant).
+fn sae_duchon_atom_m(dim: usize) -> usize {
+    dim / 2 + 2
+}
+/// Maximum total monomial degree for a Euclidean tangent-patch SAE atom
+/// (`{1, t_a, t_a t_b}` at degree 2).
+const SAE_EUCLIDEAN_PATCH_MAX_DEGREE: usize = 2;
 
 fn gumbel_temperature_schedule_from_pydict(
     schedule: Option<&Bound<'_, PyDict>>,
@@ -9128,27 +9220,33 @@ fn gumbel_temperature_schedule_from_pydict(
 /// Build per-atom Rust basis evaluators so the Newton loop can refresh
 /// `Phi_k` and `dPhi_k/dt` between steps without bouncing back to Python.
 ///
-/// `Periodic` atoms with `latent_dim == 1` are served by an analytic harmonic
-/// evaluator. Other kinds (Duchon, Sphere, EuclideanPatch, Precomputed, or
-/// higher-dimensional Periodic) currently fall back to a frozen snapshot of
-/// the caller-supplied design, which keeps the multi-step loop well-defined
-/// while leaving logits / coords / β free to move.
+/// Every supported kind has a concrete analytic evaluator: `Periodic`
+/// (`latent_dim == 1`) → harmonic, `Sphere` (`latent_dim == 2`) → chart,
+/// `Torus` → tensor harmonic, `Duchon` → radial+polynomial coordinate
+/// evaluator (requires the atom's centers in `atom_centers`), and
+/// `EuclideanPatch` → monomial patch. A `Precomputed` atom — or a kind whose
+/// refresh metadata is missing (e.g. a Duchon atom with no centers) — has no
+/// way to re-evaluate `Phi(t)` at updated coordinates, so construction errors
+/// rather than freezing a stale snapshot.
 fn build_sae_basis_evaluators(
     basis_kinds: &[SaeAtomBasisKind],
     basis_sizes: &[usize],
     atom_dim: &[usize],
     coord_blocks: &[Array2<f64>],
-    basis_values: ArrayView3<'_, f64>,
-    basis_jacobian: ArrayView4<'_, f64>,
-    n_obs: usize,
+    atom_centers: &[Option<Array2<f64>>],
 ) -> Result<Vec<Option<Arc<dyn SaeBasisEvaluator>>>, String> {
     let k_atoms = basis_kinds.len();
-    if atom_dim.len() != k_atoms || basis_sizes.len() != k_atoms || coord_blocks.len() != k_atoms {
+    if atom_dim.len() != k_atoms
+        || basis_sizes.len() != k_atoms
+        || coord_blocks.len() != k_atoms
+        || atom_centers.len() != k_atoms
+    {
         return Err(format!(
-            "build_sae_basis_evaluators: K-length metadata mismatch (kinds={k_atoms}, dims={}, sizes={}, coords={})",
+            "build_sae_basis_evaluators: K-length metadata mismatch (kinds={k_atoms}, dims={}, sizes={}, coords={}, centers={})",
             atom_dim.len(),
             basis_sizes.len(),
-            coord_blocks.len()
+            coord_blocks.len(),
+            atom_centers.len()
         ));
     }
     let mut out: Vec<Option<Arc<dyn SaeBasisEvaluator>>> = Vec::with_capacity(k_atoms);
@@ -9168,10 +9266,46 @@ fn build_sae_basis_evaluators(
                 let h = (axis_m - 1) / 2;
                 Arc::new(TorusHarmonicEvaluator::new(d, h)?)
             }
-            _ => {
-                let phi = basis_values.slice(s![k, 0..n_obs, 0..m]).to_owned();
-                let jet = basis_jacobian.slice(s![k, 0..n_obs, 0..m, 0..d]).to_owned();
-                Arc::new(StaticBasisEvaluator::new(phi, jet)?)
+            SaeAtomBasisKind::Duchon => {
+                let centers = atom_centers[k].as_ref().ok_or_else(|| {
+                    format!(
+                        "build_sae_basis_evaluators: Duchon atom {k} cannot refresh its basis without centers; \
+                         build the atom through the SAE auto path so its Duchon centers are threaded in"
+                    )
+                })?;
+                // Same dimension-aware `m` the seed build
+                // (`sae_build_duchon_atom`) used: both read `centers.ncols()`,
+                // so the refreshed `Φ`/jet stays column-consistent with the
+                // seed design and its curvature penalty (issue-247 invariant).
+                Arc::new(DuchonCoordinateEvaluator::new(
+                    centers.clone(),
+                    sae_duchon_atom_m(centers.ncols()),
+                )?)
+            }
+            SaeAtomBasisKind::EuclideanPatch => {
+                Arc::new(EuclideanPatchEvaluator::new(d, SAE_EUCLIDEAN_PATCH_MAX_DEGREE)?)
+            }
+            SaeAtomBasisKind::Precomputed(label) => {
+                return Err(format!(
+                    "build_sae_basis_evaluators: atom {k} basis {label:?} is precomputed and has no \
+                     analytic refresh routine; the inner Newton latent update requires a basis kind \
+                     that can re-evaluate Phi(t)/dPhi/dt at updated coordinates"
+                ));
+            }
+            SaeAtomBasisKind::Periodic => {
+                return Err(format!(
+                    "build_sae_basis_evaluators: Periodic atom {k} requires latent_dim == 1 and odd basis size; got dim={d}, m={m}"
+                ));
+            }
+            SaeAtomBasisKind::Sphere => {
+                return Err(format!(
+                    "build_sae_basis_evaluators: Sphere atom {k} requires latent_dim == 2 and basis size {SAE_SPHERE_BASIS_SIZE}; got dim={d}, m={m}"
+                ));
+            }
+            SaeAtomBasisKind::Torus => {
+                return Err(format!(
+                    "build_sae_basis_evaluators: Torus atom {k} requires latent_dim >= 1; got dim={d}, m={m}"
+                ));
             }
         };
         out.push(Some(evaluator));
@@ -9182,10 +9316,14 @@ fn build_sae_basis_evaluators(
 /// Fit a SAE-manifold term end-to-end in Rust: up to `max_iter` Newton steps
 /// per λ_smooth candidate, refreshing `Phi` and `dPhi/dt` between steps via
 /// the per-atom [`SaeBasisEvaluator`] (analytic harmonic for `Periodic`
-/// atoms with `latent_dim == 1`; frozen snapshot fallback otherwise). The
-/// inner loop terminates early when the relative change in the penalized
-/// objective drops below `1e-6`. `lambda_grid` evaluates candidate smoothness
-/// lambdas in Rust and the best evidence-proxy wins.
+/// `latent_dim == 1`, chart for `Sphere`, tensor harmonic for `Torus`; the
+/// radial+polynomial Duchon and monomial Euclidean evaluators refresh from the
+/// auto path that threads their metadata). This precomputed-basis entry point
+/// carries no Duchon centers, so a Duchon/precomputed atom here errors instead
+/// of freezing the seed snapshot. The inner loop terminates early when the
+/// relative change in the penalized objective drops below `1e-6`.
+/// `lambda_grid` evaluates candidate smoothness lambdas in Rust and the best
+/// evidence-proxy wins.
 #[pyfunction(signature = (
     z,
     atom_basis,
@@ -9239,11 +9377,19 @@ fn sae_manifold_fit<'py>(
     analytic_penalties: Option<String>,
     top_k: Option<usize>,
 ) -> PyResult<Py<PyDict>> {
+    // The precomputed-basis entry point carries no Duchon centers / kernel
+    // metadata, so any basis kind whose refresh needs them cannot re-evaluate
+    // `Phi(t)` at updated coordinates. Pass empty per-atom centers; the
+    // evaluator builder errors for such kinds (rather than silently freezing
+    // the seed snapshot). Kinds with an analytic, centers-free basis
+    // (periodic, sphere, torus) refresh as usual.
+    let atom_centers: Vec<Option<Array2<f64>>> = vec![None; atom_basis.len()];
     sae_manifold_fit_inner(
         py,
         z.as_array(),
         &atom_basis,
         atom_dim,
+        &atom_centers,
         basis_values.as_array(),
         basis_jacobian.as_array(),
         basis_sizes,
@@ -9273,6 +9419,7 @@ fn sae_manifold_fit_inner<'py>(
     z_view: ArrayView2<'_, f64>,
     atom_basis: &[String],
     atom_dim: Vec<usize>,
+    atom_centers: &[Option<Array2<f64>>],
     basis_values: ArrayView3<'_, f64>,
     basis_jacobian: ArrayView4<'_, f64>,
     basis_sizes: Vec<usize>,
@@ -9320,24 +9467,27 @@ fn sae_manifold_fit_inner<'py>(
     }
     // The "t" block addresses the per-row latent coordinates (n_obs × d_max,
     // tier=Psi) — ARD, Isometry, BlockOrthogonality, etc. target this. The
-    // "beta" block addresses the decoder coefficient matrix; for k_atoms=1
-    // its shape matches a single atom's (M, p_out) block, which is exactly
-    // the layout MechanismSparsityPenalty group-lassoes over (rows = basis
-    // functions, columns = output features). Multi-atom fits omit "beta"
-    // because flatten_beta concatenates per-atom (M_k, p_out) blocks with
-    // different M_k, and the single-(latent_dim, p_features) target view
-    // assumed by MechanismSparsityPenalty cannot represent that.
+    // "beta" block addresses the decoder coefficient matrix. `flatten_beta`
+    // concatenates per-atom (M_k, p_out) blocks; the total decoder vector has
+    // length `(Σ_k M_k) · p_out`. We register one "beta" block covering the
+    // full vector with `d = Σ_k M_k` so the descriptor builder constructs a
+    // valid MechanismSparsityPenalty (target length = d · p_out, feature
+    // groups partitioning p_out). For multi-atom fits the penalty cannot
+    // group-lasso the whole concatenation as a single (Σ M_k, p_out) matrix —
+    // instead `add_sae_beta_penalty` in src/terms/sae_manifold.rs dispatches
+    // the penalty per atom, rebuilding its target range/latent_dim to each
+    // atom's (M_k, p_out) block. For k_atoms == 1 the per-atom dispatch
+    // collapses to exactly this single block, so both paths agree (#240).
+    let total_basis: usize = basis_sizes.iter().copied().sum();
     let mut latent_blocks = serde_json::Map::new();
     latent_blocks.insert(
         "t".into(),
         serde_json::json!({"name": "t", "n": n_obs, "d": atom_dim.iter().copied().max().unwrap_or(1)}),
     );
-    if basis_sizes.len() == 1 {
-        latent_blocks.insert(
-            "beta".into(),
-            serde_json::json!({"name": "beta", "n": p_out, "d": basis_sizes[0]}),
-        );
-    }
+    latent_blocks.insert(
+        "beta".into(),
+        serde_json::json!({"name": "beta", "n": p_out, "d": total_basis}),
+    );
     let latent_payload = serde_json::Value::Object(latent_blocks);
     let registry = build_analytic_penalty_registry_from_json(
         Some(&latent_payload),
@@ -9500,16 +9650,15 @@ fn sae_manifold_fit_inner<'py>(
             )));
         }
     };
-    let evaluators = build_sae_basis_evaluators(
-        &basis_kinds,
-        &basis_sizes,
-        &atom_dim,
-        &coord_blocks,
-        basis_values,
-        basis_jacobian,
-        n_obs,
-    )
-    .map_err(py_value_error)?;
+    if atom_centers.len() != k_atoms {
+        return Err(py_value_error(format!(
+            "sae_manifold_fit: atom_centers length {} must equal K={k_atoms}",
+            atom_centers.len()
+        )));
+    }
+    let evaluators =
+        build_sae_basis_evaluators(&basis_kinds, &basis_sizes, &atom_dim, &coord_blocks, atom_centers)
+            .map_err(py_value_error)?;
     let mut base_term = term_from_padded_blocks_with_mode(
         n_obs,
         p_out,
@@ -9535,6 +9684,16 @@ fn sae_manifold_fit_inner<'py>(
     }
 
     let log_ard: Vec<Array1<f64>> = atom_dim.iter().map(|&d| Array1::<f64>::zeros(d)).collect();
+    // Auto-derive the streaming dispatch from the problem size and the
+    // hardware memory budget — no new kwarg. The full-batch arrow-Schur path
+    // retains the `(N × M_total)` basis, `(N × M_total × d)` jacobian, and
+    // `(N × K)` logit buffers; at LLM scale (hundreds of millions of rows)
+    // these blow past memory. When `n_obs · (M_total + K) · 8 bytes` exceeds an
+    // in-core threshold derived from the GPU memory budget (or, on CPU-only
+    // hosts, a conservative host-RAM fraction), the fit streams in row chunks
+    // sized to keep one chunk's buffers inside the L2-cache / budget window.
+    let (use_streaming, stream_chunk_size) =
+        sae_streaming_plan(n_obs, total_basis, k_atoms, max_dim);
     let mut best_term = None;
     let mut best_rho = None;
     let mut best_loss = None;
@@ -9543,20 +9702,46 @@ fn sae_manifold_fit_inner<'py>(
         let mut candidate_term = base_term.clone();
         let mut candidate_rho =
             SaeManifoldRho::new(sparsity_strength.ln(), lambda_smooth.ln(), log_ard.clone());
-        let mut candidate_loss = candidate_term
-            .run_joint_fit_arrow_schur(
-                z_view,
-                &mut candidate_rho,
-                Some(&registry),
-                1,
-                learning_rate,
-                ridge_ext_coord,
-                ridge_beta,
-            )
-            .map_err(py_value_error)?;
-        let mut prev_total = candidate_loss.total();
-        for _ in 1..max_iter {
-            let step_loss = candidate_term
+        let candidate_loss = if use_streaming {
+            // Streaming / minibatch fit: each chunk re-seeds its coordinates
+            // from the SAE PCA seed restricted to the chunk's `Z` rows and
+            // reuses the chunk's gating-logit seed. The decoder coefficients
+            // (and ARD ρ) are the only state refined across chunks; the chunk's
+            // `(logits, coords, basis)` are recomputed on demand and discarded.
+            let basis_kinds_chunk = basis_kinds.clone();
+            let atom_dim_chunk = atom_dim.clone();
+            let chunk_init = |start: usize, end: usize| -> Result<
+                (Array2<f64>, Vec<Array2<f64>>, Array2<f64>),
+                String,
+            > {
+                let z_chunk = z_view.slice(s![start..end, ..]).to_owned();
+                let logits_chunk = initial_logits.slice(s![start..end, ..]).to_owned();
+                let seed = sae_pca_seed_initial_coords(
+                    z_chunk.view(),
+                    &basis_kinds_chunk,
+                    &atom_dim_chunk,
+                )?;
+                let mut coords = Vec::with_capacity(atom_dim_chunk.len());
+                for (atom_idx, &d) in atom_dim_chunk.iter().enumerate() {
+                    coords.push(seed.slice(s![atom_idx, .., 0..d]).to_owned());
+                }
+                Ok((logits_chunk, coords, z_chunk))
+            };
+            candidate_term
+                .run_joint_fit_arrow_schur_streaming(
+                    n_obs,
+                    stream_chunk_size,
+                    &mut candidate_rho,
+                    Some(&registry),
+                    max_iter,
+                    learning_rate,
+                    ridge_ext_coord,
+                    ridge_beta,
+                    chunk_init,
+                )
+                .map_err(py_value_error)?
+        } else {
+            let mut candidate_loss = candidate_term
                 .run_joint_fit_arrow_schur(
                     z_view,
                     &mut candidate_rho,
@@ -9567,18 +9752,33 @@ fn sae_manifold_fit_inner<'py>(
                     ridge_beta,
                 )
                 .map_err(py_value_error)?;
-            let new_total = step_loss.total();
-            candidate_loss = step_loss;
-            if !new_total.is_finite() {
-                break;
+            let mut prev_total = candidate_loss.total();
+            for _ in 1..max_iter {
+                let step_loss = candidate_term
+                    .run_joint_fit_arrow_schur(
+                        z_view,
+                        &mut candidate_rho,
+                        Some(&registry),
+                        1,
+                        learning_rate,
+                        ridge_ext_coord,
+                        ridge_beta,
+                    )
+                    .map_err(py_value_error)?;
+                let new_total = step_loss.total();
+                candidate_loss = step_loss;
+                if !new_total.is_finite() {
+                    break;
+                }
+                let denom = prev_total.abs().max(1.0e-12);
+                let rel_change = (prev_total - new_total).abs() / denom;
+                prev_total = new_total;
+                if rel_change < 1.0e-6 {
+                    break;
+                }
             }
-            let denom = prev_total.abs().max(1.0e-12);
-            let rel_change = (prev_total - new_total).abs() / denom;
-            prev_total = new_total;
-            if rel_change < 1.0e-6 {
-                break;
-            }
-        }
+            candidate_loss
+        };
         let candidate_score = candidate_loss.evidence_proxy();
         if candidate_score > best_score {
             best_score = candidate_score;
@@ -9842,6 +10042,75 @@ fn sae_periodic_basis_size(n_harmonics: usize) -> Result<usize, String> {
         .ok_or_else(|| {
             format!("sae_build_periodic_atom: basis size overflows for n_harmonics={n_harmonics}")
         })
+}
+
+/// Auto-derive whether the SAE joint fit should stream, and the row-chunk size.
+///
+/// The full-batch arrow-Schur path retains, for all `n_obs` rows, the basis
+/// `(N × M_total)`, the basis jacobian `(N × M_total × d_max)`, and the gating
+/// logits `(N × K)`. The dominant per-row working set is therefore
+/// `w = (M_total · (1 + d_max) + K) · 8` bytes. When `n_obs · w` exceeds the
+/// in-core budget — the GPU memory budget when a device is present, else a
+/// conservative host-RAM working-set fraction — the fit streams in row chunks.
+///
+/// The chunk size keeps one chunk's per-row working set inside a cache/budget
+/// window: on GPU, a modest fraction of the device memory budget; on CPU, a
+/// multiple of the L2-cache estimate so a chunk's basis stays hot. The chunk is
+/// clamped to `[1, n_obs]` and to at least a small floor so the per-chunk
+/// reduced-Schur amortizes its `O(M² p + K³_reduced)` overhead.
+///
+/// Exposed to Python as a read-only diagnostic so callers (and the LLM-scale
+/// streaming demo) can inspect the exact dispatch decision and chunk size the
+/// fit will follow for a given `(n_obs, total_basis, k_atoms, d_max)` without
+/// running it. It carries no tunable knobs — the plan is fully derived from the
+/// problem size and the `GpuRuntime` memory budget.
+#[pyfunction]
+fn sae_streaming_plan(
+    n_obs: usize,
+    total_basis: usize,
+    k_atoms: usize,
+    d_max: usize,
+) -> (bool, usize) {
+    const BYTES_PER_F64: usize = 8;
+    // Host working-set we are willing to materialize for the dense full-batch
+    // path on a CPU-only host before switching to streaming.
+    const HOST_IN_CORE_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
+    // CPU L2-cache estimate used to size a chunk so its hot basis stays
+    // resident; chunks are sized to several multiples of this window.
+    const CPU_L2_CACHE_BYTES: usize = 1024 * 1024; // 1 MiB
+    const CHUNK_CACHE_MULTIPLE: usize = 8;
+    const MIN_CHUNK_ROWS: usize = 256;
+
+    let per_row_words = total_basis
+        .saturating_mul(1 + d_max)
+        .saturating_add(k_atoms)
+        .max(1);
+    let per_row_bytes = per_row_words.saturating_mul(BYTES_PER_F64);
+    let full_batch_bytes = n_obs.saturating_mul(per_row_bytes);
+
+    let runtime = gam::gpu::GpuRuntime::global();
+    let (in_core_budget, chunk_window_bytes) = match runtime {
+        Some(rt) => {
+            let budget = rt.memory_budget_bytes;
+            // Allow up to one quarter of the device budget for the dense
+            // full-batch buffers; size chunks to a small fraction so several
+            // chunks (plus the reduced system) coexist on-device.
+            let chunk_window = (budget / 16).max(CPU_L2_CACHE_BYTES * CHUNK_CACHE_MULTIPLE);
+            (budget / 4, chunk_window)
+        }
+        None => (
+            HOST_IN_CORE_BYTES,
+            CPU_L2_CACHE_BYTES * CHUNK_CACHE_MULTIPLE,
+        ),
+    };
+
+    if full_batch_bytes <= in_core_budget {
+        return (false, n_obs.max(1));
+    }
+    // Streaming: rows per chunk so the chunk's per-row working set fits the
+    // window, clamped to a floor for amortization and to `n_obs`.
+    let rows_per_chunk = (chunk_window_bytes / per_row_bytes).max(MIN_CHUNK_ROWS);
+    (true, rows_per_chunk.min(n_obs).max(1))
 }
 
 /// PCA seed: returns coords with shape `(k_atoms, n_obs, d_max)`. For periodic
@@ -10365,74 +10634,83 @@ fn sae_build_duchon_atom(
     pts: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
 ) -> Result<(Array2<f64>, Array3<f64>, Array2<f64>), String> {
-    // Resolve (nullspace_order, power) for the requested atom dimension so the
-    // full operator-penalty triplet (mass + tension + stiffness) satisfies its
-    // collocation inequalities at every dim. The default Active triplet
-    // requires D2 collocation `2(p+s) > d+2`; hard-coding `power=0.0,
-    // nullspace=Linear` violated that for d ∈ {1, 2, 3} (issue #246). Routing
-    // through `resolve_duchon_hybrid_config(..., max_op=2)` auto-picks the
-    // smallest valid `s` so the build always produces a Primary penalty.
-    let m: usize = 2;
+    // The `DuchonCoordinateEvaluator` evaluates the *pure* scale-free
+    // polyharmonic basis (`length_scale = None`, `power = 0`) at the resolved
+    // nullspace order, so the matching smoothness penalty is the scale-free
+    // curvature seminorm `∫|∇^(p) f|²` (the kernel reproducing norm), which
+    // `build_duchon_basis` emits as `PenaltySource::OperatorStiffness` — the
+    // same block `duchon_function_norm_penalty` selects. The mass and tension
+    // terms reintroduce a finite reversion length through `∫f²` / `∫|∇f|²`,
+    // exactly the Type-A behaviour the polyharmonic basis is chosen to avoid,
+    // so only the top-order curvature term is requested here.
+    //
+    // The nullspace order and power MUST match the evaluator (`power = 0`,
+    // order = `duchon_nullspace_from_m(m)`); the D2 collocation inequality
+    // `2(p + s) > d + 2` is satisfied by construction because
+    // `m = sae_duchon_atom_m(d)` is the smallest `m` with `2·m > d + 2`.
     let dim = centers.ncols();
-    let cfg = resolve_duchon_hybrid_config(dim, m, None, None, None, /* max_op = */ 2)
-        .map_err(|err| err.to_string())?;
-    let requested_nullspace = cfg.nullspace_order;
+    let m: usize = sae_duchon_atom_m(dim);
     let spec = DuchonBasisSpec {
         center_strategy: CenterStrategy::UserProvided(centers.to_owned()),
-        length_scale: cfg.length_scale,
-        power: cfg.power,
-        nullspace_order: requested_nullspace,
+        length_scale: None,
+        power: 0.0,
+        nullspace_order: duchon_nullspace_from_m(m),
         identifiability: SpatialIdentifiability::None,
         aniso_log_scales: None,
-        operator_penalties: Default::default(),
+        operator_penalties: DuchonOperatorPenaltySpec {
+            mass: OperatorPenaltySpec::Disabled,
+            tension: OperatorPenaltySpec::Disabled,
+            stiffness: OperatorPenaltySpec::Active {
+                initial_log_lambda: 0.0,
+                prior: None,
+            },
+        },
         periodic: None,
         boundary: OneDimensionalBoundary::Open,
     };
-    let built = if pts.nrows() == 0 {
-        let probe_pts = Array2::<f64>::zeros((1, pts.ncols()));
-        build_duchon_basis(probe_pts.view(), &spec).map_err(|err| err.to_string())?
-    } else {
-        build_duchon_basis(pts, &spec).map_err(|err| err.to_string())?
-    };
-    let built_phi = built.design.to_dense();
-    let phi = if pts.nrows() == 0 {
-        Array2::<f64>::zeros((0, built_phi.ncols()))
-    } else {
-        built_phi
-    };
-    let primary_idx = built
+    // The penalty matrix is the only piece sourced from the full builder; the
+    // design `Phi` and its input-location jet come from the single
+    // amplification-consistent core entry point so the seed atom matches the
+    // `DuchonCoordinateEvaluator` refresh bit-for-bit (issue #247).
+    let built = build_duchon_basis(centers, &spec).map_err(|err| err.to_string())?;
+    // The scale-free curvature seminorm is the `OperatorStiffness` block. With
+    // `m = sae_duchon_atom_m(dim)` the D2 collocation inequality holds, so this
+    // block is always built and active — assert it as a structural invariant
+    // rather than silently returning `None`.
+    let stiffness_idx = built
         .penaltyinfo
         .iter()
-        .position(|info| matches!(info.source, gam::basis::PenaltySource::Primary))
-        .ok_or_else(|| "sae_build_duchon_atom: primary penalty was not built".to_string())?;
-    let penalty = built
-        .penalties
-        .get(primary_idx)
+        .position(|info| matches!(info.source, gam::basis::PenaltySource::OperatorStiffness))
         .ok_or_else(|| {
             format!(
-                "sae_build_duchon_atom: primary penalty index {primary_idx} exceeds {} penalty matrices",
+                "sae_build_duchon_atom: curvature (OperatorStiffness) penalty was not built for \
+                 dim={dim}, m={m}, nullspace_order={:?}; the D2 collocation invariant \
+                 2*m > dim+2 should guarantee it",
+                duchon_nullspace_from_m(m),
+            )
+        })?;
+    let penalty = built
+        .penalties
+        .get(stiffness_idx)
+        .ok_or_else(|| {
+            format!(
+                "sae_build_duchon_atom: curvature penalty index {stiffness_idx} exceeds {} penalty matrices",
                 built.penalties.len()
             )
         })?
         .clone();
-    let effective_nullspace = pyffi_duchon_effective_nullspace_order(centers, requested_nullspace);
-    let radial_transform = pyffi_duchon_kernel_constraint_nullspace(centers, effective_nullspace)
-        .map_err(|err| err.to_string())?;
-    let radial_first = duchon_radial_first_derivative_nd(pts, centers, None, effective_nullspace)
-        .map_err(|err| err.to_string())?;
-    let radial_jet = radial_input_location_jet(pts, centers, radial_first.view())
-        .map_err(|err| err.to_string())?;
-    let poly_jet = duchon_polynomial_first_derivative_nd(pts, effective_nullspace);
-    let n_rows = pts.nrows();
-    let dim = pts.ncols();
-    let n_kernel = radial_transform.ncols();
-    let n_poly = poly_jet.shape()[1];
-    let mut jet = Array3::<f64>::zeros((n_rows, n_kernel + n_poly, dim));
-    for axis in 0..dim {
-        let projected = radial_jet.index_axis(Axis(2), axis).dot(&radial_transform);
-        jet.slice_mut(s![.., ..n_kernel, axis]).assign(&projected);
-    }
-    jet.slice_mut(s![.., n_kernel.., ..]).assign(&poly_jet);
+    let evaluator = DuchonCoordinateEvaluator::new(centers.to_owned(), m)?;
+    let (phi, jet) = if pts.nrows() == 0 {
+        let probe = Array2::<f64>::zeros((1, pts.ncols()));
+        let (probe_phi, _probe_jet) = evaluator.evaluate(probe.view())?;
+        let cols = probe_phi.ncols();
+        (
+            Array2::<f64>::zeros((0, cols)),
+            Array3::<f64>::zeros((0, cols, dim)),
+        )
+    } else {
+        evaluator.evaluate(pts)?
+    };
     if phi.ncols() != jet.shape()[1] {
         return Err(format!(
             "sae_build_duchon_atom: phi/jet column mismatch {} vs {}",
@@ -10459,31 +10737,21 @@ fn sae_build_euclidean_atom(
     pts: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
 ) -> Result<(Array2<f64>, Array3<f64>, Array2<f64>), String> {
-    const EUCLIDEAN_PATCH_MAX_DEGREE: usize = 2;
     let dim = centers.ncols();
-    let nullspace = if EUCLIDEAN_PATCH_MAX_DEGREE == 0 {
-        DuchonNullspaceOrder::Zero
-    } else if EUCLIDEAN_PATCH_MAX_DEGREE == 1 {
-        DuchonNullspaceOrder::Linear
-    } else {
-        DuchonNullspaceOrder::Degree(EUCLIDEAN_PATCH_MAX_DEGREE)
-    };
-    let exponents = monomial_exponents(dim, EUCLIDEAN_PATCH_MAX_DEGREE);
+    let exponents = monomial_exponents(dim, SAE_EUCLIDEAN_PATCH_MAX_DEGREE);
     let n_basis = exponents.len();
-    let n_rows = pts.nrows();
-    let mut phi = Array2::<f64>::zeros((n_rows, n_basis));
-    for (col, alpha) in exponents.iter().enumerate() {
-        for row in 0..n_rows {
-            let mut value = 1.0_f64;
-            for (axis, &exp) in alpha.iter().enumerate() {
-                if exp != 0 {
-                    value *= pts[[row, axis]].powi(exp as i32);
-                }
-            }
-            phi[[row, col]] = value;
-        }
-    }
-    let jet = duchon_polynomial_first_derivative_nd(pts, nullspace);
+    // The design `Phi` and its jet come from the same evaluator the inner
+    // Newton loop refreshes against, so the seed atom and every refresh share
+    // one monomial layout.
+    let evaluator = EuclideanPatchEvaluator::new(dim, SAE_EUCLIDEAN_PATCH_MAX_DEGREE)?;
+    let (phi, jet) = if pts.nrows() == 0 {
+        (
+            Array2::<f64>::zeros((0, n_basis)),
+            Array3::<f64>::zeros((0, n_basis, dim)),
+        )
+    } else {
+        evaluator.evaluate(pts)?
+    };
     if jet.shape()[1] != n_basis {
         return Err(format!(
             "sae_build_euclidean_atom: monomial/jet column mismatch {} vs {}",
@@ -10781,14 +11049,12 @@ fn sae_build_atom_plans(
                 // a periodic basis selects the *number of harmonics* in the
                 // truncated Fourier expansion (basis size `2·n_harmonics + 1`),
                 // not a latent-space dimensionality. Setting
-                // `latent_dim = atom_dim` would force
-                // `build_sae_basis_evaluators` to fall back to the frozen
-                // `StaticBasisEvaluator` snapshot (the analytic
+                // `latent_dim = atom_dim` would make
+                // `build_sae_basis_evaluators` reject the atom (the analytic
                 // `PeriodicHarmonicEvaluator` requires `latent_dim == 1`),
-                // killing Phi-refresh between Newton steps and collapsing the
-                // fit to a degenerate null solution. Bind the optimizer-visible
-                // latent dimension to 1 and route the user's `d_atom` into the
-                // harmonic count.
+                // since there is no longer a frozen-snapshot fallback. Bind the
+                // optimizer-visible latent dimension to 1 and route the user's
+                // `d_atom` into the harmonic count.
                 let n_harmonics = d.max(1);
                 let basis_size = sae_periodic_basis_size(n_harmonics)?;
                 plans.push(SaeAtomBuildPlan {
@@ -10840,7 +11106,21 @@ fn sae_build_atom_plans(
                 });
             }
             SaeAtomBasisKind::Duchon | SaeAtomBasisKind::EuclideanPatch => {
-                let n_centers = n_obs.min(32).max(8.min(n_obs));
+                // A Duchon atom's curvature penalty degrades (and ultimately
+                // fails its D2 collocation) when the center count does not
+                // exceed the polynomial nullspace dimension of its resolved
+                // order. Pick enough centers to clear that dimension with a
+                // margin (so a positive-rank kernel block survives), bounded
+                // above by `n_obs` and the dense cap. The Euclidean patch
+                // ignores centers, so this lower bound is harmless there.
+                let duchon_m = sae_duchon_atom_m(d);
+                let poly_nullspace_dim =
+                    duchon_nullspace_dimension(d, duchon_m.saturating_sub(1));
+                let center_floor = (poly_nullspace_dim + d + 1).max(8);
+                let center_ceiling = center_floor.max(32);
+                let lo = center_floor.min(n_obs);
+                let hi = center_ceiling.min(n_obs);
+                let n_centers = n_obs.min(hi).max(lo);
                 let idx = sae_pick_duchon_center_indices(
                     n_obs,
                     n_centers,
@@ -10873,7 +11153,7 @@ fn sae_build_atom_plans(
             }
             SaeAtomBasisKind::Precomputed(name) => {
                 return Err(format!(
-                    "sae_build_atom_plans: unsupported atom_basis {:?}; sae_manifold_fit_auto can build only periodic, duchon, sphere, torus, or euclidean_patch atoms",
+                    "sae_build_atom_plans: unsupported atom_basis {:?}; sae_manifold_fit_minimal can build only periodic, duchon, sphere, torus, or euclidean_patch atoms",
                     name
                 ));
             }
@@ -10889,6 +11169,15 @@ fn sae_build_atom_plans(
 /// [`sae_manifold_fit`]. Returns the same payload dict with one extra key,
 /// `"atom_plans"`, holding the per-atom basis spec so OOS prediction can
 /// rebuild the design without going through Python.
+///
+/// Warm starts (issue #357): `initial_logits` (N, K) and `initial_coords`
+/// (K, N, D_max) are optional caller-supplied seeds for the assignment logits
+/// and the per-atom on-manifold coordinates. When supplied they replace the
+/// internal PCA seed coords / zero-jitter logit init, so an amortized encoder
+/// can predict `(a_init, t_init)` and have the joint solver refine them for a
+/// bounded `max_iter` steps. The basis *design* (Duchon centers, harmonic
+/// counts) is still derived from the PCA seed so the warm coordinates are
+/// evaluated against the same atom geometry the unconstrained fit would build.
 #[pyfunction(signature = (
     z,
     atom_basis,
@@ -10908,8 +11197,10 @@ fn sae_build_atom_plans(
     analytic_penalties = None,
     random_state = 0,
     top_k = None,
+    initial_logits = None,
+    initial_coords = None,
 ))]
-fn sae_manifold_fit_auto<'py>(
+fn sae_manifold_fit_minimal<'py>(
     py: Python<'py>,
     z: PyReadonlyArray2<'py, f64>,
     atom_basis: Vec<String>,
@@ -10929,30 +11220,32 @@ fn sae_manifold_fit_auto<'py>(
     analytic_penalties: Option<String>,
     random_state: u64,
     top_k: Option<usize>,
+    initial_logits: Option<PyReadonlyArray2<'py, f64>>,
+    initial_coords: Option<PyReadonlyArray3<'py, f64>>,
 ) -> PyResult<Py<PyDict>> {
     let z_view = z.as_array();
     let (n_obs, _p_out) = z_view.dim();
     let k_atoms = atom_basis.len();
     if n_obs == 0 || z_view.ncols() == 0 {
         return Err(py_value_error(format!(
-            "sae_manifold_fit_auto: z must be non-empty; got shape ({}, {})",
+            "sae_manifold_fit_minimal: z must be non-empty; got shape ({}, {})",
             n_obs,
             z_view.ncols()
         )));
     }
     if k_atoms == 0 {
         return Err(py_value_error(
-            "sae_manifold_fit_auto: atom_basis must be non-empty".into(),
+            "sae_manifold_fit_minimal: atom_basis must be non-empty".into(),
         ));
     }
     if !z_view.iter().all(|v| v.is_finite()) {
         return Err(py_value_error(
-            "sae_manifold_fit_auto: z contains non-finite values".into(),
+            "sae_manifold_fit_minimal: z contains non-finite values".into(),
         ));
     }
     if atom_dim.len() != k_atoms {
         return Err(py_value_error(format!(
-            "sae_manifold_fit_auto: atom_dim length {} must equal atom_basis length {k_atoms}",
+            "sae_manifold_fit_minimal: atom_dim length {} must equal atom_basis length {k_atoms}",
             atom_dim.len()
         )));
     }
@@ -10970,10 +11263,50 @@ fn sae_manifold_fit_auto<'py>(
         random_state,
     )
     .map_err(py_value_error)?;
+    // The optimizer's per-atom latent dimension is `plan.latent_dim`, not the
+    // user-supplied `atom_dim` (periodic atoms carry a harmonic count there).
+    let plan_latent_dim: Vec<usize> = plans.iter().map(|plan| plan.latent_dim).collect();
+    // Warm-start coordinates (issue #357). When the caller supplies
+    // `initial_coords` (an amortized encoder's predicted on-manifold `t`), use
+    // them as the Newton start and as the point at which the basis stacks are
+    // first evaluated; otherwise fall back to the PCA seed. The basis *design*
+    // (`plans`) is always built from the PCA seed so the atom geometry matches
+    // the cold-start fit. Shape must be `(K, N, D_max)` with `D_max` covering
+    // every atom's `plan.latent_dim`.
+    let start_coords: Array3<f64> = match &initial_coords {
+        Some(arr) => {
+            let view = arr.as_array();
+            let shape = view.shape();
+            if shape.len() != 3 {
+                return Err(py_value_error(
+                    "sae_manifold_fit_minimal: initial_coords must be a rank-3 (K, N, D_max) array"
+                        .to_string(),
+                ));
+            }
+            if shape[0] != k_atoms || shape[1] != n_obs {
+                return Err(py_value_error(format!(
+                    "sae_manifold_fit_minimal: initial_coords must start with (K, N)=({k_atoms}, {n_obs}); got {shape:?}"
+                )));
+            }
+            let max_dim = *shape.get(2).unwrap_or(&0);
+            for (atom_idx, &d) in plan_latent_dim.iter().enumerate() {
+                if d > max_dim {
+                    return Err(py_value_error(format!(
+                        "sae_manifold_fit_minimal: initial_coords D_max={max_dim} is too small for atom {atom_idx} latent_dim={d}"
+                    )));
+                }
+            }
+            if !view.iter().all(|v| v.is_finite()) {
+                return Err(py_value_error(
+                    "sae_manifold_fit_minimal: initial_coords contains non-finite values".into(),
+                ));
+            }
+            view.to_owned()
+        }
+        None => seed_coords.clone(),
+    };
     let (basis_values, basis_jacobian, smooth_penalties, basis_sizes, _coord_blocks) =
-        sae_build_padded_basis_stacks(&plans, seed_coords.view(), n_obs).map_err(py_value_error)?;
-    let m_max = basis_sizes.iter().copied().max().unwrap_or(1).max(1);
-    let p_out = z_view.ncols();
+        sae_build_padded_basis_stacks(&plans, start_coords.view(), n_obs).map_err(py_value_error)?;
     // JumpReLU gates strictly on `logit > threshold` (threshold = 0.0 in the
     // production inner driver). Zero-initialised logits would leave every
     // gate closed at step 0, making the data-fit Jacobian, the sparsity
@@ -10983,18 +11316,44 @@ fn sae_manifold_fit_auto<'py>(
     // the fit can learn which atoms to prune. Softmax (translation-invariant)
     // and IBP-MAP (uses sigmoid prior with stick-breaking) are unaffected by
     // a uniform logit shift, so zero remains the natural init for those.
-    let mut initial_logits = if assignment_kind == "jumprelu" {
-        Array2::<f64>::from_elem((n_obs, k_atoms), 1.0)
-    } else {
-        Array2::<f64>::zeros((n_obs, k_atoms))
+    // Warm-start logits (issue #357): a caller-supplied `(N, K)` assignment
+    // logit seed (from an amortized encoder) replaces the cold-start init.
+    // When absent we fall back to the documented zero / JumpReLU-positive init
+    // plus the seed-keyed jitter below.
+    let warm_logits: Option<Array2<f64>> = match &initial_logits {
+        Some(arr) => {
+            let view = arr.as_array();
+            if view.dim() != (n_obs, k_atoms) {
+                return Err(py_value_error(format!(
+                    "sae_manifold_fit_minimal: initial_logits must be ({n_obs}, {k_atoms}); got {:?}",
+                    view.dim()
+                )));
+            }
+            if !view.iter().all(|v| v.is_finite()) {
+                return Err(py_value_error(
+                    "sae_manifold_fit_minimal: initial_logits contains non-finite values".into(),
+                ));
+            }
+            Some(view.to_owned())
+        }
+        None => None,
+    };
+    let logits_are_cold = warm_logits.is_none();
+    let mut initial_logits = match warm_logits {
+        Some(logits) => logits,
+        None if assignment_kind == "jumprelu" => Array2::<f64>::from_elem((n_obs, k_atoms), 1.0),
+        None => Array2::<f64>::zeros((n_obs, k_atoms)),
     };
     // Wire `random_state` into the optimizer init: jitter the initial
     // assignment logits with a tiny, seed-keyed deterministic perturbation
     // so different seeds explore different Newton trajectories (issue #178).
     // The jitter is uniform in `±SAE_RANDOM_STATE_LOGIT_JITTER` and uses the
     // same Lehmer LCG pattern as the Duchon-center picker, keyed by
-    // `random_state`. Fixed seeds still produce bit-identical fits.
-    if n_obs > 0 && k_atoms > 0 {
+    // `random_state`. Fixed seeds still produce bit-identical fits. A
+    // warm-started logit seed is left untouched: the encoder's prediction is
+    // the requested starting point and the bounded refinement must begin
+    // exactly there.
+    if n_obs > 0 && k_atoms > 0 && logits_are_cold {
         const SAE_RANDOM_STATE_LOGIT_JITTER: f64 = 1.0e-3;
         let mut state = random_state
             .wrapping_mul(6364136223846793005)
@@ -11025,23 +11384,28 @@ fn sae_manifold_fit_auto<'py>(
         tau,
     )
     .map_err(py_value_error)?;
-    // The optimizer's latent dimension per atom must match `plan.latent_dim`,
-    // not the user-supplied `atom_dim` — for periodic atoms `atom_dim` carries
-    // a harmonic count, not a coord-block width. Periodic atoms have
-    // `latent_dim == 1`; only the per-atom planning step knows that.
-    let effective_atom_dim: Vec<usize> = plans.iter().map(|plan| plan.latent_dim).collect();
+    // `plan_latent_dim` (computed above) is the optimizer's per-atom latent
+    // dimension — `plan.latent_dim`, not the user-supplied `atom_dim` (periodic
+    // atoms carry a harmonic count there; their `latent_dim == 1`).
+    let effective_atom_dim: Vec<usize> = plan_latent_dim.clone();
+    // Thread the per-atom Duchon centers into the inner driver so its
+    // `DuchonCoordinateEvaluator` can re-evaluate `Phi(t)` / `dPhi/dt` at each
+    // updated latent coordinate instead of freezing the seed snapshot.
+    let atom_centers: Vec<Option<Array2<f64>>> =
+        plans.iter().map(|plan| plan.duchon_centers.clone()).collect();
     let result_dict = sae_manifold_fit_inner(
         py,
         z_view,
         &atom_basis,
         effective_atom_dim,
+        &atom_centers,
         basis_values.view(),
         basis_jacobian.view(),
         basis_sizes.clone(),
         decoder_coefficients.view(),
         smooth_penalties.view(),
         initial_logits.view(),
-        seed_coords.view(),
+        start_coords.view(),
         alpha,
         tau,
         learnable_alpha,
@@ -11090,10 +11454,19 @@ fn sae_manifold_fit_auto<'py>(
     Ok(result_dict)
 }
 
-/// Out-of-sample reconstruction: same Newton driver as the fit path, with the
+/// Out-of-sample inference: same Newton driver as the fit path, with the
 /// trained decoder blocks held frozen across iterations. `decoder_blocks` is
 /// a per-atom list of `(M_k, p)` arrays; `duchon_centers` is `Some` only for
 /// non-periodic atoms; `n_harmonics_list` is `Some` only for periodic atoms.
+///
+/// Returns the same full payload dict as the fit path (issue #357): the
+/// converged per-token assignments `assignments_z` (N, K), per-atom
+/// on-manifold coordinates `on_atom_coords_t`, gating logits, and the
+/// reconstruction `fitted`. Downstream supervised heads consume the OOS
+/// assignments directly, and the amortized-encoder loop reads the converged
+/// coordinates as distillation targets. `initial_logits` (N, K) and
+/// `initial_coords` (K, N, D_max) optionally warm-start the OOS refinement
+/// from an encoder's per-token prediction.
 #[pyfunction(signature = (
     x_new,
     atom_basis,
@@ -11110,7 +11483,8 @@ fn sae_manifold_fit_auto<'py>(
     learning_rate = 0.04,
     ridge_ext_coord = 1.0e-6,
     ridge_beta = 1.0e-6,
-    random_state = 0,
+    initial_logits = None,
+    initial_coords = None,
 ))]
 fn sae_manifold_predict_oos<'py>(
     py: Python<'py>,
@@ -11129,8 +11503,9 @@ fn sae_manifold_predict_oos<'py>(
     learning_rate: f64,
     ridge_ext_coord: f64,
     ridge_beta: f64,
-    random_state: u64,
-) -> PyResult<Py<PyArray2<f64>>> {
+    initial_logits: Option<PyReadonlyArray2<'py, f64>>,
+    initial_coords: Option<PyReadonlyArray3<'py, f64>>,
+) -> PyResult<Py<PyDict>> {
     let x_view = x_new.as_array();
     let (n_obs, p_out) = x_view.dim();
     let k_atoms = atom_basis.len();
@@ -11242,8 +11617,44 @@ fn sae_manifold_predict_oos<'py>(
             }
         }
     }
+    // Warm-start coordinates (issue #357): an amortized encoder's predicted
+    // per-token on-manifold `t` seeds the OOS Newton refinement. When absent
+    // the PCA seed of `x_new` is the cold start. Layout `(K, N, D_max)` with
+    // `D_max` covering every atom's `atom_dim`.
+    let start_coords: Array3<f64> = match &initial_coords {
+        Some(arr) => {
+            let view = arr.as_array();
+            let shape = view.shape();
+            if shape.len() != 3 {
+                return Err(py_value_error(
+                    "sae_manifold_predict_oos: initial_coords must be a rank-3 (K, N, D_max) array"
+                        .to_string(),
+                ));
+            }
+            if shape[0] != k_atoms || shape[1] != n_obs {
+                return Err(py_value_error(format!(
+                    "sae_manifold_predict_oos: initial_coords must start with (K, N)=({k_atoms}, {n_obs}); got {shape:?}"
+                )));
+            }
+            let max_dim = *shape.get(2).unwrap_or(&0);
+            for (atom_idx, &d) in atom_dim.iter().enumerate() {
+                if d > max_dim {
+                    return Err(py_value_error(format!(
+                        "sae_manifold_predict_oos: initial_coords D_max={max_dim} is too small for atom {atom_idx} atom_dim={d}"
+                    )));
+                }
+            }
+            if !view.iter().all(|v| v.is_finite()) {
+                return Err(py_value_error(
+                    "sae_manifold_predict_oos: initial_coords contains non-finite values".into(),
+                ));
+            }
+            view.to_owned()
+        }
+        None => seed_coords.clone(),
+    };
     let (basis_values, basis_jacobian, smooth_penalties, basis_sizes, _coord_blocks) =
-        sae_build_padded_basis_stacks(&plans, seed_coords.view(), n_obs).map_err(py_value_error)?;
+        sae_build_padded_basis_stacks(&plans, start_coords.view(), n_obs).map_err(py_value_error)?;
     let m_max = basis_sizes.iter().copied().max().unwrap_or(1).max(1);
     // Pad trained decoder blocks into (K, M_max, p)
     let mut decoder_coefficients = Array3::<f64>::zeros((k_atoms, m_max, p_out));
@@ -11273,24 +11684,52 @@ fn sae_manifold_predict_oos<'py>(
             .slice_mut(s![atom_idx, 0..m_k, 0..p_out])
             .assign(&block.slice(s![0..m_k, 0..p_out]));
     }
-    let mut initial_logits = Array2::<f64>::zeros((n_obs, k_atoms));
-    if k_atoms == 1 && assignment_kind == "ibp_map" {
-        for row in 0..n_obs {
-            initial_logits[[row, 0]] = 4.0;
+    let initial_logits = match &initial_logits {
+        Some(arr) => {
+            let view = arr.as_array();
+            if view.dim() != (n_obs, k_atoms) {
+                return Err(py_value_error(format!(
+                    "sae_manifold_predict_oos: initial_logits must be ({n_obs}, {k_atoms}); got {:?}",
+                    view.dim()
+                )));
+            }
+            if !view.iter().all(|v| v.is_finite()) {
+                return Err(py_value_error(
+                    "sae_manifold_predict_oos: initial_logits contains non-finite values".into(),
+                ));
+            }
+            view.to_owned()
         }
-    }
-    let result_dict = sae_manifold_fit_inner(
+        None => {
+            let mut logits = Array2::<f64>::zeros((n_obs, k_atoms));
+            if k_atoms == 1 && assignment_kind == "ibp_map" {
+                for row in 0..n_obs {
+                    logits[[row, 0]] = 4.0;
+                }
+            }
+            logits
+        }
+    };
+    // Mirror the fit path: re-evaluate each Duchon atom's basis at the OOS
+    // coordinates the Newton loop produces, using the trained centers.
+    let atom_centers: Vec<Option<Array2<f64>>> =
+        plans.iter().map(|plan| plan.duchon_centers.clone()).collect();
+    // Return the full inner payload (issue #357): converged `assignments_z`,
+    // per-atom `on_atom_coords_t`, `logits`, and `fitted`. The supervised head
+    // reads OOS assignments; the amortized encoder reads converged coords.
+    sae_manifold_fit_inner(
         py,
         x_view,
         &atom_basis,
         atom_dim,
+        &atom_centers,
         basis_values.view(),
         basis_jacobian.view(),
         basis_sizes,
         decoder_coefficients.view(),
         smooth_penalties.view(),
         initial_logits.view(),
-        seed_coords.view(),
+        start_coords.view(),
         alpha,
         tau,
         false,
@@ -11305,17 +11744,16 @@ fn sae_manifold_predict_oos<'py>(
         None,
         None,
         None,
-    )?;
-    let bound = result_dict.bind(py);
-    let fitted_any = bound.get_item("fitted")?.ok_or_else(|| {
-        py_value_error("sae_manifold_predict_oos: inner fit missing fitted".into())
-    })?;
-    let fitted_arr: Py<PyArray2<f64>> = fitted_any.extract()?;
-    Ok(fitted_arr)
+    )
 }
 
-/// Coefficient of determination R^2 = 1 - SSR / SST for a fitted SAE-manifold
-/// reconstruction. Pure-Rust closed-form so the Python wrapper is one FFI call.
+/// Global coefficient of determination
+/// R^2 = 1 - (Σ_ij (y_ij - ŷ_ij)²) / (Σ_ij (y_ij - mean_j)²)
+/// for a fitted SAE-manifold reconstruction, where `mean_j` is the per-column
+/// mean of the observed matrix. Both SSR and SST are summed across all rows and
+/// columns, so this returns a single scalar (a global metric), not a vector of
+/// per-column R² values. Pure-Rust closed-form so the Python wrapper is one FFI
+/// call.
 #[pyfunction]
 fn sae_manifold_reconstruction_r2(
     observed: PyReadonlyArray2<'_, f64>,
@@ -12152,17 +12590,10 @@ fn glm_reml_fit_latent<'py>(
             "multinomial" | "multinomial-logit" | "softmax" | "categorical-logit"
         )
     {
-        // Per-row Fisher-block override is deferred for the multi-output
-        // paths (issue #349). The scalar-output branch below still honours
-        // `fisher_w` via `latent_scalar_weights_with_fisher`; refusing it
-        // here is preferable to silently dropping the user's override.
-        if fisher_values.is_some() {
-            return Err(py_value_error(format!(
-                "glm_reml_fit_latent: per-row fisher_w override is not currently supported \
-                 on the multi-output ({family_name:?}) branch; pass fisher_w=None or use the \
-                 scalar single-output path. See https://github.com/SauersML/gam/issues/349."
-            )));
-        }
+        // Per-row Fisher-block override is now threaded through the
+        // multi-output canonical fitters (issue #349): the multinomial path
+        // consumes the active `(N, K-1, K-1)` leading sub-block and the
+        // binomial-multi path the diagonal of each `(N, K, K)` block.
         let (design, t_mat) = build_latent_duchon_design(
             t_values.view(),
             n_obs,
@@ -12187,6 +12618,7 @@ fn glm_reml_fit_latent<'py>(
             y_values.view(),
             penalty_values.view(),
             weight_values.as_ref().map(|w| w.view()),
+            fisher_values.as_ref().map(|w| w.view()),
             init_lambda,
             &family_name,
             prior_score + analytic_score,
@@ -17855,9 +18287,11 @@ fn poincare_lorentz_exp_origin<'py>(
 
 /// Forward pass for the Poincaré tangent-space-at-origin decoder.
 ///
-/// Returns `(x_hat, atoms_projected, v, tangents)` so the Python
-/// autograd.Function can stash them and use them on the backward pass
-/// without recomputing.
+/// Returns `(x_hat, atoms_projected, v, tangents, proj_scale)` so the Python
+/// autograd.Function can stash them and use them on the backward pass without
+/// recomputing. `proj_scale` (shape `(F,)`) is the per-atom radial
+/// ball-projection factor needed by the backward to chain gradients through
+/// the projection back to the raw atom storage.
 #[pyfunction]
 fn poincare_tangent_decode_forward<'py>(
     py: Python<'py>,
@@ -17869,6 +18303,7 @@ fn poincare_tangent_decode_forward<'py>(
     Py<PyArray2<f64>>,
     Py<PyArray2<f64>>,
     Py<PyArray2<f64>>,
+    Py<PyArray1<f64>>,
 )> {
     let atoms_owned = atoms.as_array().to_owned();
     let gates_owned = gates.as_array().to_owned();
@@ -17881,6 +18316,7 @@ fn poincare_tangent_decode_forward<'py>(
         cache.atoms_projected.into_pyarray(py).unbind(),
         cache.v.into_pyarray(py).unbind(),
         cache.tangents.into_pyarray(py).unbind(),
+        cache.proj_scale.into_pyarray(py).unbind(),
     ))
 }
 
@@ -17894,6 +18330,7 @@ fn poincare_tangent_decode_backward<'py>(
     gates: PyReadonlyArray2<'py, f64>,
     v: PyReadonlyArray2<'py, f64>,
     tangents: PyReadonlyArray2<'py, f64>,
+    proj_scale: PyReadonlyArray1<'py, f64>,
     grad_x_hat: PyReadonlyArray2<'py, f64>,
     curvature: f64,
 ) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
@@ -17901,6 +18338,7 @@ fn poincare_tangent_decode_backward<'py>(
     let gates_owned = gates.as_array().to_owned();
     let v_owned = v.as_array().to_owned();
     let tangents_owned = tangents.as_array().to_owned();
+    let proj_scale_owned = proj_scale.as_array().to_owned();
     let grad_owned = grad_x_hat.as_array().to_owned();
     let (gg, ga) = detach_geometry_result(py, "poincare_tangent_decode_backward", move || {
         let cache = gam::geometry::poincare::TangentDecodeCache {
@@ -17908,6 +18346,7 @@ fn poincare_tangent_decode_backward<'py>(
             gates: gates_owned,
             v: v_owned,
             tangents: tangents_owned,
+            proj_scale: proj_scale_owned,
             curvature,
         };
         poincare_tangent_decode_backward_impl(&cache, grad_owned.view())
@@ -17942,6 +18381,7 @@ fn poincare_lorentz_decode_backward<'py>(
     gates: PyReadonlyArray2<'py, f64>,
     v: PyReadonlyArray2<'py, f64>,
     tangents: PyReadonlyArray2<'py, f64>,
+    proj_scale: PyReadonlyArray1<'py, f64>,
     grad_x_hat: PyReadonlyArray2<'py, f64>,
     curvature: f64,
 ) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
@@ -17949,6 +18389,7 @@ fn poincare_lorentz_decode_backward<'py>(
     let gates_owned = gates.as_array().to_owned();
     let v_owned = v.as_array().to_owned();
     let tangents_owned = tangents.as_array().to_owned();
+    let proj_scale_owned = proj_scale.as_array().to_owned();
     let grad_owned = grad_x_hat.as_array().to_owned();
     let (gg, ga) = detach_geometry_result(py, "poincare_lorentz_decode_backward", move || {
         let cache = gam::geometry::poincare::TangentDecodeCache {
@@ -17956,6 +18397,7 @@ fn poincare_lorentz_decode_backward<'py>(
             gates: gates_owned,
             v: v_owned,
             tangents: tangents_owned,
+            proj_scale: proj_scale_owned,
             curvature,
         };
         poincare_lorentz_decode_backward_impl(&cache, grad_owned.view())
@@ -21861,9 +22303,13 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(register_analytic_penalties, module)?)?;
     module.add_function(wrap_pyfunction!(analytic_penalty_value_grad, module)?)?;
     module.add_function(wrap_pyfunction!(analytic_penalty_hvp, module)?)?;
+    module.add_function(wrap_pyfunction!(gumbel_schedule_tau, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_ibp_map_value_grad, module)?)?;
+    module.add_function(wrap_pyfunction!(jumprelu_gate_value_grad, module)?)?;
     module.add_function(wrap_pyfunction!(equivariant_penalty_value, module)?)?;
     module.add_function(wrap_pyfunction!(riemannian_retract, module)?)?;
     module.add_function(wrap_pyfunction!(manifold_exp_map, module)?)?;
+    module.add_function(wrap_pyfunction!(manifold_exp_map_vjp, module)?)?;
     module.add_function(wrap_pyfunction!(manifold_log_map, module)?)?;
     module.add_function(wrap_pyfunction!(manifold_metric_tensor, module)?)?;
     module.add_function(wrap_pyfunction!(manifold_dimension, module)?)?;
@@ -21923,9 +22369,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(equivariant_gauge_companion_loss, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit_ibp, module)?)?;
-    module.add_function(wrap_pyfunction!(sae_manifold_fit_auto, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_manifold_fit_minimal, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_predict_oos, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_reconstruction_r2, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_streaming_plan, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_assignment_summary, module)?)?;
     module.add_function(wrap_pyfunction!(gated_sae_decode, module)?)?;
     module.add_function(wrap_pyfunction!(interchange_decode_forward, module)?)?;
@@ -22407,7 +22854,11 @@ fn py_value_error(message: String) -> PyErr {
     } else {
         message
     };
-    PyValueError::new_err(user_facing)
+    // Engine errors funneled here are gamfit-specific failures, so they must
+    // carry GamError identity (a ValueError subclass) — preserving the
+    // historical `except ValueError` contract while making `except
+    // gamfit.GamError` reliable for engine errors (issue #330).
+    GamError::new_err(user_facing)
 }
 
 fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -22643,7 +23094,7 @@ fn term_builder_error_to_pyerr(err: gam::terms::term_builder::TermBuilderError) 
 }
 
 fn corrected_covariance_error_to_pyerr(
-    err: gam::solver::reml::unified::CorrectedCovarianceError,
+    err: gam::solver::CorrectedCovarianceError,
 ) -> PyErr {
     CorrectedCovarianceError::new_err(err.to_string())
 }
@@ -22860,10 +23311,10 @@ fn fit_dataset_impl(
             let standard_result = match fit_result {
                 FitResult::Standard(standard_result) => standard_result,
                 _ => {
-                    return Err(
-                        "python binding expected the standard workflow to return a standard fit result"
+                    return Err(gam::WorkflowError::SchemaMismatch {
+                        reason: "python binding expected the standard workflow to return a standard fit result"
                             .to_string(),
-                    );
+                    });
                 }
             };
             let saved_fit = standard_result.fit.clone();
@@ -22885,10 +23336,10 @@ fn fit_dataset_impl(
             let tn_result = match fit_result {
                 FitResult::TransformationNormal(result) => result,
                 _ => {
-                    return Err(
-                        "python binding expected the transformation-normal workflow to return a transformation-normal fit result"
+                    return Err(gam::WorkflowError::SchemaMismatch {
+                        reason: "python binding expected the transformation-normal workflow to return a transformation-normal fit result"
                             .to_string(),
-                    );
+                    });
                 }
             };
             build_transformation_normal_ffi_payload(formula, &dataset, &fit_config, tn_result)?
@@ -22900,10 +23351,10 @@ fn fit_dataset_impl(
             let ms_result = match fit_result {
                 FitResult::BernoulliMarginalSlope(result) => result,
                 _ => {
-                    return Err(
-                        "python binding expected the bernoulli marginal-slope workflow to return a marginal-slope fit result"
+                    return Err(gam::WorkflowError::SchemaMismatch {
+                        reason: "python binding expected the bernoulli marginal-slope workflow to return a marginal-slope fit result"
                             .to_string(),
-                    );
+                    });
                 }
             };
             build_bernoulli_marginal_slope_ffi_payload(
@@ -22921,10 +23372,10 @@ fn fit_dataset_impl(
             let ms_result = match fit_result {
                 FitResult::SurvivalMarginalSlope(result) => result,
                 _ => {
-                    return Err(
-                        "python binding expected the survival marginal-slope workflow to return a survival marginal-slope fit result"
+                    return Err(gam::WorkflowError::SchemaMismatch {
+                        reason: "python binding expected the survival marginal-slope workflow to return a survival marginal-slope fit result"
                             .to_string(),
-                    );
+                    });
                 }
             };
             build_survival_marginal_slope_ffi_payload(
@@ -22940,10 +23391,10 @@ fn fit_dataset_impl(
             let ls_result = match fit_result {
                 FitResult::GaussianLocationScale(result) => result,
                 _ => {
-                    return Err(
-                        "python binding expected the gaussian location-scale workflow to return a gaussian location-scale fit result"
+                    return Err(gam::WorkflowError::SchemaMismatch {
+                        reason: "python binding expected the gaussian location-scale workflow to return a gaussian location-scale fit result"
                             .to_string(),
-                    );
+                    });
                 }
             };
             build_gaussian_location_scale_ffi_payload(
@@ -22961,10 +23412,10 @@ fn fit_dataset_impl(
             let ls_result = match fit_result {
                 FitResult::BinomialLocationScale(result) => result,
                 _ => {
-                    return Err(
-                        "python binding expected the binomial location-scale workflow to return a binomial location-scale fit result"
+                    return Err(gam::WorkflowError::SchemaMismatch {
+                        reason: "python binding expected the binomial location-scale workflow to return a binomial location-scale fit result"
                             .to_string(),
-                    );
+                    });
                 }
             };
             build_binomial_location_scale_ffi_payload(
@@ -22982,10 +23433,10 @@ fn fit_dataset_impl(
             let ls_result = match fit_result {
                 FitResult::SurvivalLocationScale(result) => result,
                 _ => {
-                    return Err(
-                        "python binding expected the survival location-scale workflow to return a survival location-scale fit result"
+                    return Err(gam::WorkflowError::SchemaMismatch {
+                        reason: "python binding expected the survival location-scale workflow to return a survival location-scale fit result"
                             .to_string(),
-                    );
+                    });
                 }
             };
             build_survival_location_scale_ffi_payload(
@@ -23001,10 +23452,10 @@ fn fit_dataset_impl(
             let rp_result = match fit_result {
                 FitResult::SurvivalTransformation(result) => result,
                 _ => {
-                    return Err(
-                        "python binding expected the survival transformation workflow to return a survival transformation fit result"
+                    return Err(gam::WorkflowError::SchemaMismatch {
+                        reason: "python binding expected the survival transformation workflow to return a survival transformation fit result"
                             .to_string(),
-                    );
+                    });
                 }
             };
             build_survival_transformation_ffi_payload(formula, &dataset, &fit_config, rp_result)?
@@ -23015,10 +23466,10 @@ fn fit_dataset_impl(
             let lat_result = match fit_result {
                 FitResult::LatentSurvival(result) => result,
                 _ => {
-                    return Err(
-                        "python binding expected the latent survival workflow to return a latent survival fit result"
+                    return Err(gam::WorkflowError::SchemaMismatch {
+                        reason: "python binding expected the latent survival workflow to return a latent survival fit result"
                             .to_string(),
-                    );
+                    });
                 }
             };
             build_latent_survival_ffi_payload(formula, &dataset, &fit_config, frailty, lat_result)?
@@ -23029,10 +23480,10 @@ fn fit_dataset_impl(
             let lat_result = match fit_result {
                 FitResult::LatentBinary(result) => result,
                 _ => {
-                    return Err(
-                        "python binding expected the latent binary workflow to return a latent binary fit result"
+                    return Err(gam::WorkflowError::SchemaMismatch {
+                        reason: "python binding expected the latent binary workflow to return a latent binary fit result"
                             .to_string(),
-                    );
+                    });
                 }
             };
             build_latent_binary_ffi_payload(formula, &dataset, &fit_config, frailty, lat_result)?
@@ -23040,7 +23491,9 @@ fn fit_dataset_impl(
     };
     payload.group_metadata = fit_config.group_metadata.clone();
     let model = FittedModel::from_payload(payload);
-    serde_json::to_vec(&model).map_err(|err| format!("failed to serialize model: {err}"))
+    serde_json::to_vec(&model).map_err(|err| gam::WorkflowError::IntegrationFailed {
+        reason: format!("failed to serialize model: {err}"),
+    })
 }
 
 fn load_model_impl(model_bytes: &[u8]) -> Result<FittedModel, String> {
@@ -24250,9 +24703,9 @@ fn posterior_predict_bands_table_impl(
     let (eta_mean, eta_lower, eta_upper, mean, mean_lower, mean_upper) =
         eta_bands_from_matrix(eta.view(), &family_kind, level)?;
     let payload = PosteriorPredictBandsPayload {
-        eta_mean,
-        eta_lower,
-        eta_upper,
+        linear_predictor: eta_mean,
+        linear_predictor_lower: eta_lower,
+        linear_predictor_upper: eta_upper,
         mean,
         mean_lower,
         mean_upper,
@@ -27067,6 +27520,114 @@ fn register_analytic_penalties(latents_json: &str, penalties_json: &str) -> PyRe
     .map_err(|err| py_value_error(err.to_string()))
 }
 
+/// JumpReLU activation-gate value and straight-through-estimator gradients.
+///
+/// Returns `(value, dphi_dz, dphi_dtau)`, all shaped like `z` `(N, F)`, where
+/// `value = z · 1[z > τ]` and the per-element derivatives come from the smooth
+/// surrogate `z · σ((z − τ)/ε)` (see
+/// `gam::terms::analytic_penalties::jumprelu_gate_value_grad`). `tau` holds the
+/// per-column (per-axis) effective thresholds. torch's `_JumpReLUSTEFn` consumes
+/// these instead of recomputing the STE in Python.
+#[pyfunction(signature = (z, tau, smoothing_eps))]
+fn jumprelu_gate_value_grad<'py>(
+    py: Python<'py>,
+    z: PyReadonlyArray2<'py, f64>,
+    tau: PyReadonlyArray1<'py, f64>,
+    smoothing_eps: f64,
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
+    if !(smoothing_eps.is_finite() && smoothing_eps > 0.0) {
+        return Err(py_value_error(format!(
+            "jumprelu_gate_value_grad: smoothing_eps must be finite and positive; got {smoothing_eps}"
+        )));
+    }
+    let z_view = z.as_array();
+    let tau_view = tau.as_array();
+    let (n_rows, n_cols) = z_view.dim();
+    if tau_view.len() != n_cols {
+        return Err(py_value_error(format!(
+            "jumprelu_gate_value_grad: tau length {} does not match z columns {n_cols}",
+            tau_view.len()
+        )));
+    }
+    let mut value = Array2::<f64>::zeros((n_rows, n_cols));
+    let mut dphi_dz = Array2::<f64>::zeros((n_rows, n_cols));
+    let mut dphi_dtau = Array2::<f64>::zeros((n_rows, n_cols));
+    for r in 0..n_rows {
+        for c in 0..n_cols {
+            let (v, dz, dt) = gam::terms::analytic_penalties::jumprelu_gate_value_grad(
+                z_view[[r, c]],
+                tau_view[c],
+                smoothing_eps,
+            );
+            value[[r, c]] = v;
+            dphi_dz[[r, c]] = dz;
+            dphi_dtau[[r, c]] = dt;
+        }
+    }
+    Ok((
+        value.into_pyarray(py).unbind(),
+        dphi_dz.into_pyarray(py).unbind(),
+        dphi_dtau.into_pyarray(py).unbind(),
+    ))
+}
+
+/// Temperature `τ` of the Rust [`GumbelTemperatureSchedule`] at iteration
+/// `iter`, so torch's sparsity-layer annealing queries the single Rust schedule
+/// instead of duplicating the decay arithmetic in Python. `schedule` is the
+/// same descriptor dict the SAE composition surface accepts (keys: `tau_start`,
+/// `tau_min`/`tau_end`, `decay`, and `rate`/`steps` as required by the decay).
+#[pyfunction(signature = (schedule, iter))]
+fn gumbel_schedule_tau(schedule: &Bound<'_, PyDict>, iter: usize) -> PyResult<f64> {
+    let parsed = gumbel_temperature_schedule_from_pydict(Some(schedule))
+        .map_err(py_value_error)?
+        .ok_or_else(|| py_value_error("gumbel_schedule_tau requires a schedule descriptor".to_string()))?;
+    Ok(parsed.current_tau(iter))
+}
+
+/// IBP-MAP concrete-relaxation activations and their diagonal logit Jacobian.
+///
+/// Returns `(z, dz_dl)` where `z_k = σ(l_k/τ) · π_k` (stick-breaking prior
+/// `π_k = (α/(α+1))^k`) and `dz_dl_k = ∂z_k/∂l_k`. The map is diagonal in `k`,
+/// so torch's autograd `Function` multiplies the upstream gradient elementwise
+/// by `dz_dl`. This is the single source of truth shared with the closed-form
+/// `SaeAssignment` IBP path so torch IBP-Gumbel applies the same prior and
+/// temperature scaling as the Rust fit.
+#[pyfunction(signature = (logits, temperature, alpha))]
+fn sae_ibp_map_value_grad<'py>(
+    py: Python<'py>,
+    logits: PyReadonlyArray1<'py, f64>,
+    temperature: f64,
+    alpha: f64,
+) -> PyResult<(Py<PyArray1<f64>>, Py<PyArray1<f64>>)> {
+    if !(temperature.is_finite() && temperature > 0.0) {
+        return Err(py_value_error(format!(
+            "sae_ibp_map_value_grad: temperature must be finite and positive; got {temperature}"
+        )));
+    }
+    if !(alpha.is_finite() && alpha > 0.0) {
+        return Err(py_value_error(format!(
+            "sae_ibp_map_value_grad: alpha must be finite and positive; got {alpha}"
+        )));
+    }
+    let logits_view = logits.as_array();
+    for (col, &v) in logits_view.iter().enumerate() {
+        if !v.is_finite() {
+            return Err(py_value_error(format!(
+                "sae_ibp_map_value_grad: non-finite logit at atom {col}: {v}"
+            )));
+        }
+    }
+    let (value, grad) = gam::terms::sae_manifold::ibp_map_row_value_grad(
+        logits_view.view(),
+        temperature,
+        alpha,
+    );
+    Ok((
+        value.into_pyarray(py).unbind(),
+        grad.into_pyarray(py).unbind(),
+    ))
+}
+
 #[pyfunction(signature = (
     latents_json,
     penalties_json,
@@ -27083,7 +27644,12 @@ fn analytic_penalty_value_grad<'py>(
     rho: Option<PyReadonlyArray1<'py, f64>>,
     isometry_jacobian: Option<PyReadonlyArray2<'py, f64>>,
     isometry_jacobian_second: Option<PyReadonlyArray2<'py, f64>>,
-) -> PyResult<(f64, Py<PyArray1<f64>>, Py<PyArray1<f64>>)> {
+) -> PyResult<(
+    f64,
+    Py<PyArray1<f64>>,
+    Py<PyArray1<f64>>,
+    Option<Py<PyArray2<f64>>>,
+)> {
     let latents: serde_json::Value = serde_json::from_str(latents_json)
         .map_err(|err| py_value_error(format!("invalid latents json: {err}")))?;
     let penalties: serde_json::Value = serde_json::from_str(penalties_json)
@@ -27091,6 +27657,7 @@ fn analytic_penalty_value_grad<'py>(
     let mut registry = build_analytic_penalty_registry_from_json(Some(&latents), Some(&penalties))
         .map_err(py_value_error)?;
 
+    let want_jacobian_grad = isometry_jacobian.is_some();
     if let Some(j) = isometry_jacobian {
         let j_cache = Arc::new(j.as_array().to_owned());
         let h_cache = isometry_jacobian_second.map(|h| Arc::new(h.as_array().to_owned()));
@@ -27121,6 +27688,7 @@ fn analytic_penalty_value_grad<'py>(
     let mut value = 0.0_f64;
     let mut grad = Array1::<f64>::zeros(target_view.len());
     let mut grad_rho = Array1::<f64>::zeros(rho_owned.len());
+    let mut grad_jacobian: Option<Array2<f64>> = None;
     for (penalty, (rho_slice, tier, _name)) in registry.penalties.iter().zip(registry.rho_layout())
     {
         if matches!(tier, PenaltyTier::Rho) {
@@ -27133,11 +27701,21 @@ fn analytic_penalty_value_grad<'py>(
         for (local, global) in (rho_slice.start..rho_slice.end).enumerate() {
             grad_rho[global] += local_grad_rho[local];
         }
+        if want_jacobian_grad {
+            if let AnalyticPenaltyKind::Isometry(inner) = penalty {
+                let contrib = inner.grad_jacobian(target_view.view(), rho_local);
+                match grad_jacobian.as_mut() {
+                    Some(acc) => *acc += &contrib,
+                    None => grad_jacobian = Some(contrib),
+                }
+            }
+        }
     }
     Ok((
         value,
         grad.into_pyarray(py).unbind(),
         grad_rho.into_pyarray(py).unbind(),
+        grad_jacobian.map(|g| g.into_pyarray(py).unbind()),
     ))
 }
 
@@ -27407,6 +27985,69 @@ fn manifold_exp_map<'py>(
         out.row_mut(row).assign(&next);
     }
     Ok(out.into_pyarray(py).unbind())
+}
+
+/// Batched vector–Jacobian product of the Riemannian exponential map.
+///
+/// Given base points ``points`` ``(N, ambient_dim)``, raw tangent inputs
+/// ``vecs`` ``(N, ambient_dim)``, and a cotangent ``grad_output``
+/// ``(N, ambient_dim)`` w.r.t. the output of :func:`manifold_exp_map`, returns
+/// ``(grad_points, grad_vecs)`` — the analytic pullbacks w.r.t. ``points`` and
+/// ``vecs``. This is the backward used by the Python ``torch.autograd.Function``
+/// wrapping ``manifold_exp_map``; it routes through the canonical Rust
+/// ``RiemannianManifold::exp_map_vjp`` so curved manifolds (Sphere, products
+/// containing a Sphere) get their true analytic Jacobi-field gradients instead
+/// of a silent straight-through identity. Manifolds with no closed-form
+/// backward (Grassmann, Stiefel, SPD) raise rather than return wrong grads.
+#[pyfunction(signature = (manifold_json, points, vecs, grad_output))]
+fn manifold_exp_map_vjp<'py>(
+    py: Python<'py>,
+    manifold_json: &str,
+    points: PyReadonlyArray2<'py, f64>,
+    vecs: PyReadonlyArray2<'py, f64>,
+    grad_output: PyReadonlyArray2<'py, f64>,
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
+    let value: serde_json::Value = serde_json::from_str(manifold_json)
+        .map_err(|err| py_value_error(format!("invalid manifold json: {err}")))?;
+    let kind = parse_manifold_kind(&value).map_err(py_value_error)?;
+    let manifold = kind.build();
+    let p = points.as_array();
+    let v = vecs.as_array();
+    let g = grad_output.as_array();
+    if p.dim() != v.dim() {
+        return Err(py_value_error(format!(
+            "manifold_exp_map_vjp: points shape {:?} does not match vecs shape {:?}",
+            p.dim(),
+            v.dim()
+        )));
+    }
+    if p.dim() != g.dim() {
+        return Err(py_value_error(format!(
+            "manifold_exp_map_vjp: points shape {:?} does not match grad_output shape {:?}",
+            p.dim(),
+            g.dim()
+        )));
+    }
+    if p.ncols() != manifold.ambient_dim() {
+        return Err(py_value_error(format!(
+            "manifold_exp_map_vjp: points width {} does not match manifold ambient_dim {}",
+            p.ncols(),
+            manifold.ambient_dim()
+        )));
+    }
+    let mut grad_points = Array2::<f64>::zeros(p.dim());
+    let mut grad_vecs = Array2::<f64>::zeros(p.dim());
+    for row in 0..p.nrows() {
+        let (gp, gv) = manifold
+            .exp_map_vjp(p.row(row), v.row(row), g.row(row))
+            .map_err(|err| py_value_error(err.to_string()))?;
+        grad_points.row_mut(row).assign(&gp);
+        grad_vecs.row_mut(row).assign(&gv);
+    }
+    Ok((
+        grad_points.into_pyarray(py).unbind(),
+        grad_vecs.into_pyarray(py).unbind(),
+    ))
 }
 
 /// Batched Riemannian log map: for each row, return ``log_p(q)``.

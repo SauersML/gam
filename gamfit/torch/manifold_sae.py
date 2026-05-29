@@ -52,6 +52,7 @@ from .penalties import (
     IBPAssignmentPenalty,
     JumpReLUPenalty,
     MonotonicityPenalty,
+    ibp_map,
 )
 
 
@@ -476,36 +477,30 @@ class _SparsityLayer(nn.Module):
         self.register_buffer(
             "tau", torch.tensor(float(cfg.sparsity.tau_start)), persistent=True
         )
-        self._tau_start = float(cfg.sparsity.tau_start)
-        self._tau_min = float(cfg.sparsity.tau_min)
-        self._tau_schedule = str(cfg.sparsity.tau_schedule)
-        self._tau_steps = int(cfg.sparsity.tau_steps)
-        self._step = 0
+        # Single source of truth for annealing: the Rust
+        # GumbelTemperatureSchedule. We hold the descriptor and query τ through
+        # the FFI accessor rather than re-deriving the decay in Python.
+        self._schedule = cfg.sparsity.gumbel_schedule()
+        self._init_alpha = float(cfg.sparsity.init_alpha)
 
     @torch.no_grad()
     def advance_temperature(self) -> None:
-        """Anneal ``tau`` along the configured schedule.
+        """Anneal ``tau`` by advancing the Rust ``GumbelTemperatureSchedule``.
 
-        Mirrors the schedule policy of :class:`gamfit.GumbelTemperatureSchedule`
-        (decay kinds match the Rust descriptor's accepted set).
+        The schedule owns the iteration counter and evaluates the decay through
+        the Rust ``gumbel_schedule_tau`` FFI, so the annealing arithmetic lives
+        in exactly one place (no Python-side step bookkeeping).
         """
-        self._step += 1
-        s = float(self._step)
-        if self._tau_schedule == "linear":
-            frac = min(1.0, s / float(self._tau_steps))
-            new_tau = self._tau_start + (self._tau_min - self._tau_start) * frac
-        elif self._tau_schedule == "geometric":
-            rate = (self._tau_min / self._tau_start) ** (1.0 / max(1, self._tau_steps))
-            new_tau = max(self._tau_min, self._tau_start * (rate ** s))
-        else:
-            new_tau = max(self._tau_min, self._tau_start / (1.0 + s))
-        self.tau.fill_(float(new_tau))
+        self.tau.fill_(float(self._schedule.step()))
 
     def forward(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply the sparsity gate. Returns ``(assignments, gate_pre)``."""
         if self.kind == "ibp_gumbel":
-            tau = float(self.tau.item())
-            assignments = torch.sigmoid(logits / max(tau, 1e-6))
+            tau = max(float(self.tau.item()), 1e-6)
+            # Route through the Rust IBP-MAP value+grad kernel so the torch
+            # forward applies the stick-breaking prior π_k and temperature
+            # scaling that the closed-form fit uses (single source of truth).
+            assignments = ibp_map(logits, tau, self._init_alpha)
             return assignments, logits
         if self.kind == "softmax_topk":
             tau = float(self.tau.item())
@@ -742,7 +737,31 @@ class ManifoldSAE(nn.Module):
         random_state: int = 0,
         learning_rate: float | None = None,
     ) -> _ClosedFormManifoldSAE:
-        """Run the closed-form Rust solve and copy results into this module."""
+        """Run the closed-form Rust solve and put this module into the solved state.
+
+        After this returns the module is in a "closed-form solved" state: the
+        returned fit (also cached as ``self._last_fit``) is the source of truth.
+        :meth:`forward` is rerouted through :meth:`_forward_from_closed_form`,
+        which reconstructs ``x_hat`` / ``positions`` / ``assignments`` /
+        ``reml_score`` directly from the fit and ignores the module's
+        ``encoder`` and ``atom_raw_anchor`` parameters entirely. Only
+        ``decoder_blocks`` is copied back into the module's parameters; the
+        ``encoder`` and ``atom_raw_anchor`` remain at their pre-fit values and
+        carry no learned information.
+
+        Consequently a *solved* module must NOT be used for:
+
+        * gradient training / fine-tuning (the encoder and anchor are stale, so
+          their gradients are meaningless and would corrupt the fit);
+        * serialization of the learned model (``state_dict`` does not capture the
+          closed-form solution — persist the returned fit instead);
+        * out-of-sample :meth:`forward` (the closed-form path requires the
+          in-sample ``x`` and raises ``NotImplementedError`` otherwise; use
+          ``fit.reconstruct(x)`` / ``fit.predict(x)`` for OOS inputs).
+
+        The supported use is calling :meth:`forward` on the same in-sample ``x``
+        to obtain the closed-form outputs.
+        """
         if not isinstance(x, torch.Tensor):
             raise TypeError("ManifoldSAE.fit expects a torch.Tensor")
         if x.dim() != 2 or x.shape[1] != self.cfg.input_dim:

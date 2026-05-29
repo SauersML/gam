@@ -29,13 +29,20 @@ pub fn apply_inverse_link_vec(eta: &[f64], family_kind: &str) -> Result<Vec<f64>
         "probit" => {
             let inv_sqrt2 = 1.0 / std::f64::consts::SQRT_2;
             for &e in eta {
-                out.push(0.5 * (1.0 + statrs::function::erf::erf(e * inv_sqrt2)));
+                // Φ(η) = ½·erfc(−η/√2). The naive ½(1+erf(η/√2)) form cancels
+                // in the deep negative tail (erf saturates at −1.0 for η ≲ −8.3,
+                // collapsing Φ to exactly 0.0); erfc is a dedicated complementary
+                // tail evaluator and stays accurate to the f64 underflow boundary.
+                out.push(0.5 * statrs::function::erf::erfc(-e * inv_sqrt2));
             }
         }
         "cloglog" => {
             for &e in eta {
                 let clamped = e.clamp(-50.0, 50.0);
-                out.push(1.0 - (-clamped.exp()).exp());
+                // μ = 1 − exp(−exp(η)); use -expm1(-exp(η)) to preserve precision
+                // in the deep negative tail where exp(-exp(η)) rounds to 1.0 and
+                // the naive `1.0 - …` form collapses to 0 for η ≲ -36.
+                out.push(-(-clamped.exp()).exp_m1());
             }
         }
         "log" => {

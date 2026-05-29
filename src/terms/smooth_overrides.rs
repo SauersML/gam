@@ -29,14 +29,15 @@
 use ndarray::{Array1, Array2};
 use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use crate::inference::data::EncodedDataset as Dataset;
 use crate::terms::basis::{
     BSplineBasisSpec, BSplineKnotSpec, CenterStrategy, DuchonBasisSpec, MaternBasisSpec, MaternNu,
-    SphereMethod, SphericalSplineBasisSpec, ThinPlateBasisSpec,
+    OneDimensionalBoundary, SphereMethod, SphericalSplineBasisSpec, ThinPlateBasisSpec,
 };
 use crate::terms::smooth::{
-    SmoothBasisSpec, SmoothTermSpec, TensorBSplineSpec, TermCollectionSpec,
+    parse_shape_constraint, SmoothBasisSpec, SmoothTermSpec, TensorBSplineSpec, TermCollectionSpec,
 };
 
 /// Apply the Python-side `smooths={...}` registry to a built term collection.
@@ -184,6 +185,18 @@ fn apply_one_override(
         term.name = name.to_string();
     }
 
+    // Universal shape constraint (`Smooth.shape_constraint`). Stamped onto the
+    // term, not the basis: the constraint solver (box-reparam / tangent-LAML)
+    // keys off `SmoothTermSpec.shape`. A basis-incompatible request fails
+    // loudly downstream via `shape_supports_basis`.
+    if let Some(shape_val) = descriptor.get("shape_constraint") {
+        let raw = shape_val.as_str().ok_or_else(|| {
+            format!("smooths[{symbol:?}].shape_constraint must be a string")
+        })?;
+        term.shape =
+            parse_shape_constraint(raw).map_err(|e| format!("smooths[{symbol:?}].{e}"))?;
+    }
+
     apply_kind_specific(&mut term.basis, kind, descriptor, symbol)?;
 
     inference_notes.push(format!(
@@ -233,24 +246,9 @@ fn apply_kind_specific(
         | ("te", SmoothBasisSpec::TensorBSpline { spec, .. }) => {
             apply_tensor_bspline(spec, descriptor, symbol)
         }
-        ("pca", SmoothBasisSpec::Pca { .. }) => {
-            // PCA descriptors only support the formula path today; tunables
-            // (basis matrix, lazy_path) are loaded in the formula builder
-            // because they need a path resolved against the working
-            // directory. Accept the descriptor as a no-op so users can use
-            // the same `smooths={...}` dict to attach a name/by/double_penalty
-            // to a PCA term without erroring.
-            Ok(())
-        }
-        ("periodic_spline_curve", SmoothBasisSpec::TensorBSpline { .. })
-        | ("periodic_spline_curve", SmoothBasisSpec::BSpline1D { .. }) => {
-            // PeriodicSplineCurve is a parametric closed-curve construction
-            // built directly in the formula DSL; the override surface for
-            // it is currently empty (knots / degree / penalty order are
-            // already exposed via the DSL itself).
-            Ok(())
-        }
-        ("categorical", _) => Ok(()),
+        ("pca", basis @ SmoothBasisSpec::Pca { .. }) => apply_pca(basis, descriptor, symbol),
+        ("periodic_spline_curve", _) => apply_periodic_spline_curve_reject(descriptor, symbol),
+        ("categorical", _) => apply_categorical_reject(descriptor, symbol),
         (other, _) => Err(format!(
             "smooths[{symbol:?}] descriptor kind={other:?} is not compatible with the \
              formula-built smooth shape (term basis: {})",
@@ -312,6 +310,17 @@ fn apply_duchon(
             spec.periodic = Some(parsed);
         }
     }
+    // The Duchon function-norm penalty already spans the polynomial null space,
+    // so `DuchonBasisSpec` deliberately carries no `double_penalty` field
+    // (`deny_unknown_fields`, locked by
+    // `test_duchon_basis_spec_rejects_removed_double_penalty_field`). Python
+    // only emits the key when `True`, so reject it loudly rather than drop it.
+    if descriptor.get("double_penalty").and_then(JsonValue::as_bool) == Some(true) {
+        return Err(format!(
+            "smooths[{symbol:?}]: double_penalty is not supported on Duchon smooths; the \
+             Duchon function-norm penalty already spans the polynomial null space"
+        ));
+    }
     Ok(())
 }
 
@@ -335,6 +344,12 @@ fn apply_thinplate(
             spec.periodic = Some(parsed);
         }
     }
+    if let Some(dp) = descriptor
+        .get("double_penalty")
+        .and_then(JsonValue::as_bool)
+    {
+        spec.double_penalty = dp;
+    }
     Ok(())
 }
 
@@ -357,6 +372,12 @@ fn apply_matern(
     }
     if let Some(anis) = descriptor.get("aniso_log_scales") {
         spec.aniso_log_scales = Some(parse_f64_vec(anis, "aniso_log_scales", symbol)?);
+    }
+    if let Some(dp) = descriptor
+        .get("double_penalty")
+        .and_then(JsonValue::as_bool)
+    {
+        spec.double_penalty = dp;
     }
     Ok(())
 }
@@ -453,6 +474,47 @@ fn apply_bspline_1d(
     {
         spec.double_penalty = dp;
     }
+    // `BSpline(periodic=True)` — promote the spec to a cyclic basis, producing
+    // a knot/boundary pair bit-identical to the formula DSL `cyclic()`/`cc()`
+    // build (see `term_builder.rs` periodic arm). Python emits the key only
+    // when `True`.
+    if descriptor.get("periodic").and_then(JsonValue::as_bool) == Some(true) {
+        let (start, end, num_basis) = match &spec.knotspec {
+            BSplineKnotSpec::Generate {
+                data_range,
+                num_internal_knots,
+            } => (
+                data_range.0,
+                data_range.1,
+                num_internal_knots + spec.degree + 1,
+            ),
+            BSplineKnotSpec::Automatic { .. } => {
+                // The data range for an Automatic knot spec is not resolved at
+                // override time, so the periodic loop cannot be placed here.
+                return Err(format!(
+                    "smooths[{symbol:?}]: periodic=True needs a known data range, but the \
+                     term uses automatically inferred knots whose domain is not resolved at \
+                     override time. Pass knots= with an explicit range, or build the smooth \
+                     periodically via the formula DSL `cyclic()`/`cc()`."
+                ));
+            }
+            BSplineKnotSpec::Provided(_) => {
+                return Err(format!(
+                    "smooths[{symbol:?}]: periodic=True is ambiguous against an explicit open \
+                     knot vector. Build the periodic smooth via the formula DSL `cc()`/`cyclic()`."
+                ));
+            }
+            BSplineKnotSpec::PeriodicUniform { .. } => {
+                // Already periodic — nothing to do.
+                return Ok(());
+            }
+        };
+        spec.knotspec = BSplineKnotSpec::PeriodicUniform {
+            data_range: (start, end),
+            num_basis,
+        };
+        spec.boundary = OneDimensionalBoundary::Cyclic { start, end };
+    }
     Ok(())
 }
 
@@ -485,6 +547,149 @@ fn apply_tensor_bspline(
         .and_then(JsonValue::as_bool)
     {
         spec.double_penalty = dp;
+    }
+    Ok(())
+}
+
+fn apply_pca(
+    basis: &mut SmoothBasisSpec,
+    descriptor: &serde_json::Map<String, JsonValue>,
+    symbol: &str,
+) -> Result<(), String> {
+    let SmoothBasisSpec::Pca {
+        feature_cols,
+        basis_matrix,
+        centered,
+        smooth_penalty,
+        pca_basis_path,
+        chunk_size,
+        ..
+    } = basis
+    else {
+        return Err(format!(
+            "smooths[{symbol:?}]: internal error — apply_pca dispatched on a non-PCA basis"
+        ));
+    };
+
+    if let Some(basis_val) = descriptor.get("basis") {
+        let parsed = parse_2d_array(basis_val, "basis", symbol)?;
+        if parsed.nrows() != feature_cols.len() {
+            return Err(format!(
+                "smooths[{symbol:?}].basis must have one row per feature column \
+                 (expected {} rows for columns {:?}); got {} rows",
+                feature_cols.len(),
+                feature_cols,
+                parsed.nrows(),
+            ));
+        }
+        if let Some(k) = descriptor.get("K").and_then(JsonValue::as_u64) {
+            if k as usize != parsed.ncols() {
+                return Err(format!(
+                    "smooths[{symbol:?}].K ({k}) must equal the number of basis columns ({})",
+                    parsed.ncols(),
+                ));
+            }
+        }
+        *basis_matrix = parsed;
+        // An explicit dense basis overrides any lazy memmap path.
+        *pca_basis_path = None;
+    } else if let Some(k) = descriptor.get("K").and_then(JsonValue::as_u64) {
+        if k as usize != basis_matrix.ncols() {
+            return Err(format!(
+                "smooths[{symbol:?}].K ({k}) must equal the number of basis columns ({}) on \
+                 the formula-built PCA term; pass basis= to change the column count",
+                basis_matrix.ncols(),
+            ));
+        }
+    }
+
+    if let Some(lazy_val) = descriptor.get("lazy_path") {
+        let path = lazy_val.as_str().ok_or_else(|| {
+            format!("smooths[{symbol:?}].lazy_path must be a string filesystem path")
+        })?;
+        *pca_basis_path = Some(PathBuf::from(path));
+    }
+
+    if let Some(c) = descriptor.get("centered").and_then(JsonValue::as_bool) {
+        *centered = c;
+    }
+
+    if let Some(sp) = descriptor.get("smooth_penalty").and_then(JsonValue::as_f64) {
+        if !sp.is_finite() || sp < 0.0 {
+            return Err(format!(
+                "smooths[{symbol:?}].smooth_penalty must be a non-negative finite value, got {sp}"
+            ));
+        }
+        *smooth_penalty = sp;
+    }
+
+    if let Some(cs) = descriptor.get("chunk_size").and_then(JsonValue::as_u64) {
+        *chunk_size = (cs as usize).max(1);
+    }
+
+    Ok(())
+}
+
+/// `PeriodicSplineCurve` is a parametric closed-curve construction whose
+/// knot/degree/output-dimension tunables are consumed only while building the
+/// basis in the formula DSL; there is no post-build override surface. Honor a
+/// name-only / shape-only descriptor (those universal fields are applied in
+/// `apply_one_override` before dispatch), but reject any kind-specific tunable
+/// loudly rather than silently dropping it.
+fn apply_periodic_spline_curve_reject(
+    descriptor: &serde_json::Map<String, JsonValue>,
+    symbol: &str,
+) -> Result<(), String> {
+    // Python always emits these with their build defaults; only a value that
+    // differs from the formula-DSL default could change the built term, and
+    // that change cannot be re-applied post-build.
+    let touched = descriptor
+        .get("n_knots")
+        .and_then(JsonValue::as_u64)
+        .is_some_and(|v| v != 20)
+        || descriptor
+            .get("degree")
+            .and_then(JsonValue::as_u64)
+            .is_some_and(|v| v != 3)
+        || descriptor
+            .get("output_dim")
+            .and_then(JsonValue::as_u64)
+            .is_some_and(|v| v != 1)
+        || descriptor
+            .get("penalty_order")
+            .and_then(JsonValue::as_u64)
+            .is_some_and(|v| v != 2);
+    if touched {
+        return Err(format!(
+            "smooths[{symbol:?}]: PeriodicSplineCurve tunables (n_knots / degree / output_dim / \
+             penalty_order) are build-time-only and cannot be applied via smooths={{...}}; set \
+             them on the formula DSL `pcurve(...)` construction instead. Only the universal \
+             name / shape_constraint fields are honored through the override path."
+        ));
+    }
+    Ok(())
+}
+
+/// `Categorical` materializes into sum-to-zero contrasts during formula
+/// compilation; its `levels` / `n_levels` tunables have no post-build override
+/// surface. Honor a name-only / shape-only descriptor; reject the tunables
+/// loudly.
+fn apply_categorical_reject(
+    descriptor: &serde_json::Map<String, JsonValue>,
+    symbol: &str,
+) -> Result<(), String> {
+    let touched = descriptor.contains_key("levels")
+        || descriptor
+            .get("n_levels")
+            .and_then(JsonValue::as_u64)
+            .is_some_and(|v| v != 0);
+    if touched {
+        return Err(format!(
+            "smooths[{symbol:?}]: Categorical tunables (levels / n_levels) are consumed during \
+             formula compilation and cannot be applied via smooths={{...}}; declare the factor in \
+             the formula instead. Only the universal name / shape_constraint fields are honored \
+             through the override path."
+        ));
     }
     Ok(())
 }
@@ -661,4 +866,293 @@ fn parse_matern_nu(nu: f64, symbol: &str) -> Result<MaternNu, String> {
     Err(format!(
         "smooths[{symbol:?}].nu must be one of 0.5, 1.5, 2.5, 3.5, 4.5; got {nu}"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terms::basis::{
+        BSplineIdentifiability, DuchonNullspaceOrder, MaternNu, SpatialIdentifiability,
+    };
+    use crate::terms::smooth::ShapeConstraint;
+    use serde_json::json;
+
+    fn obj(v: serde_json::Value) -> serde_json::Map<String, JsonValue> {
+        v.as_object().expect("test descriptor must be a JSON object").clone()
+    }
+
+    fn open_bspline_spec() -> BSplineBasisSpec {
+        BSplineBasisSpec {
+            degree: 3,
+            penalty_order: 2,
+            knotspec: BSplineKnotSpec::Generate {
+                data_range: (0.0, 1.0),
+                num_internal_knots: 5,
+            },
+            double_penalty: false,
+            identifiability: BSplineIdentifiability::None,
+            boundary: OneDimensionalBoundary::Open,
+            boundary_conditions: Default::default(),
+        }
+    }
+
+    fn bspline_term() -> SmoothTermSpec {
+        SmoothTermSpec {
+            name: "s(x)".to_string(),
+            basis: SmoothBasisSpec::BSpline1D {
+                feature_col: 0,
+                spec: open_bspline_spec(),
+            },
+            shape: ShapeConstraint::None,
+            joint_null_rotation: None,
+        }
+    }
+
+    fn thinplate_spec() -> ThinPlateBasisSpec {
+        ThinPlateBasisSpec {
+            center_strategy: CenterStrategy::EqualMass { num_centers: 10 },
+            periodic: None,
+            length_scale: 1.0,
+            double_penalty: false,
+            identifiability: SpatialIdentifiability::default(),
+            radial_reparam: None,
+        }
+    }
+
+    fn matern_spec() -> MaternBasisSpec {
+        MaternBasisSpec {
+            center_strategy: CenterStrategy::EqualMass { num_centers: 10 },
+            periodic: None,
+            length_scale: 1.0,
+            nu: MaternNu::ThreeHalves,
+            include_intercept: false,
+            double_penalty: false,
+            identifiability: Default::default(),
+            aniso_log_scales: None,
+        }
+    }
+
+    fn duchon_spec() -> DuchonBasisSpec {
+        DuchonBasisSpec {
+            center_strategy: CenterStrategy::EqualMass { num_centers: 10 },
+            periodic: None,
+            length_scale: None,
+            power: 1.0,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            identifiability: SpatialIdentifiability::default(),
+            aniso_log_scales: None,
+            operator_penalties: Default::default(),
+            boundary: OneDimensionalBoundary::Open,
+        }
+    }
+
+    #[test]
+    fn shape_constraint_string_sets_term_shape() {
+        let mut term = bspline_term();
+        let descriptor = obj(json!({"kind": "bspline", "shape_constraint": "monotone_increasing"}));
+        let mut notes = Vec::new();
+        apply_one_override(&mut term, "bspline", &descriptor, "x", &mut notes)
+            .expect("valid shape constraint should apply");
+        assert_eq!(term.shape, ShapeConstraint::MonotoneIncreasing);
+
+        let mut term2 = bspline_term();
+        let descriptor2 = obj(json!({"kind": "bspline", "shape_constraint": "convex"}));
+        let mut notes2 = Vec::new();
+        apply_one_override(&mut term2, "bspline", &descriptor2, "x", &mut notes2).unwrap();
+        assert_eq!(term2.shape, ShapeConstraint::Convex);
+    }
+
+    #[test]
+    fn shape_constraint_bad_string_errors() {
+        let mut term = bspline_term();
+        let descriptor = obj(json!({"kind": "bspline", "shape_constraint": "wiggly"}));
+        let mut notes = Vec::new();
+        let err = apply_one_override(&mut term, "bspline", &descriptor, "x", &mut notes)
+            .expect_err("unknown shape constraint must error");
+        assert!(err.contains("unknown shape constraint"), "got: {err}");
+
+        let mut term2 = bspline_term();
+        let descriptor2 = obj(json!({"kind": "bspline", "shape_constraint": 7}));
+        let mut notes2 = Vec::new();
+        let err2 = apply_one_override(&mut term2, "bspline", &descriptor2, "x", &mut notes2)
+            .expect_err("non-string shape constraint must error");
+        assert!(err2.contains("must be a string"), "got: {err2}");
+    }
+
+    #[test]
+    fn double_penalty_wires_into_thinplate_and_matern() {
+        let mut tps = thinplate_spec();
+        apply_thinplate(&mut tps, &obj(json!({"double_penalty": true})), "x").unwrap();
+        assert!(tps.double_penalty);
+
+        let mut mat = matern_spec();
+        apply_matern(&mut mat, &obj(json!({"double_penalty": true})), "x").unwrap();
+        assert!(mat.double_penalty);
+    }
+
+    #[test]
+    fn double_penalty_rejected_for_duchon() {
+        let mut duchon = duchon_spec();
+        let err = apply_duchon(&mut duchon, &obj(json!({"double_penalty": true})), "x")
+            .expect_err("double_penalty on Duchon must be rejected");
+        assert!(err.contains("not supported on Duchon"), "got: {err}");
+
+        // A Duchon descriptor without double_penalty (or with it false) is fine.
+        let mut duchon_ok = duchon_spec();
+        apply_duchon(&mut duchon_ok, &obj(json!({"m": 2.0})), "x").unwrap();
+    }
+
+    #[test]
+    fn periodic_true_promotes_generate_to_cyclic() {
+        let mut spec = open_bspline_spec(); // Generate { (0,1), 5 internal }, degree 3
+        apply_bspline_1d(&mut spec, &obj(json!({"periodic": true})), "x").unwrap();
+        match spec.knotspec {
+            BSplineKnotSpec::PeriodicUniform {
+                data_range,
+                num_basis,
+            } => {
+                assert_eq!(data_range, (0.0, 1.0));
+                // num_internal_knots + degree + 1 = 5 + 3 + 1 = 9
+                assert_eq!(num_basis, 9);
+            }
+            other => panic!("expected PeriodicUniform, got {other:?}"),
+        }
+        match spec.boundary {
+            OneDimensionalBoundary::Cyclic { start, end } => {
+                assert_eq!((start, end), (0.0, 1.0));
+            }
+            other => panic!("expected Cyclic boundary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn periodic_true_rejects_provided_and_automatic_knots() {
+        let mut provided = open_bspline_spec();
+        provided.knotspec = BSplineKnotSpec::Provided(Array1::from(vec![0.0, 0.25, 0.5, 0.75, 1.0]));
+        let err = apply_bspline_1d(&mut provided, &obj(json!({"periodic": true})), "x")
+            .expect_err("periodic against explicit knots must error");
+        assert!(err.contains("ambiguous"), "got: {err}");
+
+        let mut automatic = open_bspline_spec();
+        automatic.knotspec = BSplineKnotSpec::Automatic {
+            num_internal_knots: Some(5),
+            placement: crate::terms::basis::BSplineKnotPlacement::Quantile,
+        };
+        let err2 = apply_bspline_1d(&mut automatic, &obj(json!({"periodic": true})), "x")
+            .expect_err("periodic against automatic knots must error");
+        assert!(err2.contains("data range"), "got: {err2}");
+    }
+
+    #[test]
+    fn pca_basis_sets_matrix_and_clears_lazy_path() {
+        // PCA over two feature columns; basis must have 2 rows.
+        let mut basis = SmoothBasisSpec::Pca {
+            feature_cols: vec![0, 1],
+            basis_matrix: Array2::<f64>::zeros((2, 1)),
+            centered: true,
+            smooth_penalty: 1.0,
+            center_mean: None,
+            pca_basis_path: Some(PathBuf::from("/tmp/scores.npy")),
+            chunk_size: 4096,
+        };
+        let descriptor = obj(json!({
+            "kind": "pca",
+            "basis": [[1.0, 0.0, 2.0], [0.0, 1.0, 3.0]],
+            "K": 3,
+            "centered": false,
+            "smooth_penalty": 2.5,
+            "chunk_size": 0,
+        }));
+        apply_pca(&mut basis, &descriptor, "x").unwrap();
+        match basis {
+            SmoothBasisSpec::Pca {
+                basis_matrix,
+                centered,
+                smooth_penalty,
+                pca_basis_path,
+                chunk_size,
+                ..
+            } => {
+                assert_eq!(basis_matrix.shape(), &[2, 3]);
+                assert!(!centered);
+                assert_eq!(smooth_penalty, 2.5);
+                assert!(pca_basis_path.is_none(), "explicit basis must clear lazy path");
+                assert_eq!(chunk_size, 1, "chunk_size 0 must clamp to 1");
+            }
+            other => panic!("expected Pca, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pca_basis_rejects_row_count_mismatch() {
+        let mut basis = SmoothBasisSpec::Pca {
+            feature_cols: vec![0, 1, 2],
+            basis_matrix: Array2::<f64>::zeros((3, 1)),
+            centered: true,
+            smooth_penalty: 1.0,
+            center_mean: None,
+            pca_basis_path: None,
+            chunk_size: 4096,
+        };
+        // 2 rows but 3 feature columns.
+        let descriptor = obj(json!({"kind": "pca", "basis": [[1.0], [2.0]]}));
+        let err = apply_pca(&mut basis, &descriptor, "x")
+            .expect_err("basis row count must match feature column count");
+        assert!(err.contains("one row per feature column"), "got: {err}");
+    }
+
+    #[test]
+    fn pca_k_mismatch_against_built_basis_errors() {
+        let mut basis = SmoothBasisSpec::Pca {
+            feature_cols: vec![0, 1],
+            basis_matrix: Array2::<f64>::zeros((2, 4)),
+            centered: true,
+            smooth_penalty: 1.0,
+            center_mean: None,
+            pca_basis_path: None,
+            chunk_size: 4096,
+        };
+        let err = apply_pca(&mut basis, &obj(json!({"kind": "pca", "K": 7})), "x")
+            .expect_err("K must match built basis column count");
+        assert!(err.contains("must equal the number of basis columns"), "got: {err}");
+    }
+
+    #[test]
+    fn periodic_spline_curve_tunables_error_but_name_only_passes() {
+        // Defaults (n_knots=20, degree=3, output_dim=1, penalty_order=2) → accepted.
+        apply_periodic_spline_curve_reject(
+            &obj(json!({
+                "kind": "periodic_spline_curve",
+                "n_knots": 20,
+                "degree": 3,
+                "output_dim": 1,
+                "penalty_order": 2,
+            })),
+            "t",
+        )
+        .expect("default tunables (name-only descriptor) must be accepted");
+
+        let err = apply_periodic_spline_curve_reject(
+            &obj(json!({"kind": "periodic_spline_curve", "n_knots": 40})),
+            "t",
+        )
+        .expect_err("non-default tunable must be rejected");
+        assert!(err.contains("build-time-only"), "got: {err}");
+    }
+
+    #[test]
+    fn categorical_tunables_error_but_name_only_passes() {
+        apply_categorical_reject(
+            &obj(json!({"kind": "categorical", "n_levels": 0})),
+            "g",
+        )
+        .expect("default tunables (name-only descriptor) must be accepted");
+
+        let err = apply_categorical_reject(
+            &obj(json!({"kind": "categorical", "levels": [0, 1, 2], "n_levels": 3})),
+            "g",
+        )
+        .expect_err("explicit levels must be rejected");
+        assert!(err.contains("consumed during"), "got: {err}");
+    }
 }

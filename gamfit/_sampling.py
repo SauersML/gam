@@ -61,9 +61,9 @@ class PosteriorPredictive:
             raise map_exception(exc) from exc
         parsed = json.loads(raw)
         return {
-            "eta_mean": np.asarray(parsed["eta_mean"], dtype=float),
-            "eta_lower": np.asarray(parsed["eta_lower"], dtype=float),
-            "eta_upper": np.asarray(parsed["eta_upper"], dtype=float),
+            "linear_predictor": np.asarray(parsed["linear_predictor"], dtype=float),
+            "linear_predictor_lower": np.asarray(parsed["linear_predictor_lower"], dtype=float),
+            "linear_predictor_upper": np.asarray(parsed["linear_predictor_upper"], dtype=float),
             "mean": np.asarray(parsed["mean"], dtype=float),
             "mean_lower": np.asarray(parsed["mean_lower"], dtype=float),
             "mean_upper": np.asarray(parsed["mean_upper"], dtype=float),
@@ -238,6 +238,15 @@ class PosteriorSamples:
         return headers, rows
 
     def predict(self, new_data: Any, *, level: float = 0.95) -> dict[str, Any]:
+        """Posterior predictive bands for ``new_data``.
+
+        Returns a dict with linear-predictor-scale bands
+        (``linear_predictor``, ``linear_predictor_lower``,
+        ``linear_predictor_upper``) and response-scale summaries
+        (``mean``, ``mean_lower``, ``mean_upper``), each a 1-D array of
+        length ``n_rows``. The vocabulary matches ``Model.predict`` — no
+        engine-internal ``eta`` key is exposed.
+        """
         import numpy as np
         self._need_model()
         h, r = self._normalize(new_data)
@@ -245,9 +254,9 @@ class PosteriorSamples:
                                   np.asarray(self.samples, dtype=float).ravel().tolist(),
                                   self.n_draws, self.n_coeffs, float(level)))
         return {
-            "eta_mean": np.asarray(parsed["eta_mean"], dtype=float),
-            "eta_lower": np.asarray(parsed["eta_lower"], dtype=float),
-            "eta_upper": np.asarray(parsed["eta_upper"], dtype=float),
+            "linear_predictor": np.asarray(parsed["linear_predictor"], dtype=float),
+            "linear_predictor_lower": np.asarray(parsed["linear_predictor_lower"], dtype=float),
+            "linear_predictor_upper": np.asarray(parsed["linear_predictor_upper"], dtype=float),
             "mean": np.asarray(parsed["mean"], dtype=float),
             "mean_lower": np.asarray(parsed["mean_lower"], dtype=float),
             "mean_upper": np.asarray(parsed["mean_upper"], dtype=float),

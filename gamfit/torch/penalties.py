@@ -74,13 +74,13 @@ def _call_rust_value_grad(
     *,
     isometry_jacobian: torch.Tensor | None = None,
     isometry_jacobian_second: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     kwargs = {}
     if isometry_jacobian is not None:
         kwargs["isometry_jacobian"] = to_numpy_f64(isometry_jacobian)
     if isometry_jacobian_second is not None:
         kwargs["isometry_jacobian_second"] = to_numpy_f64(isometry_jacobian_second)
-    value, grad, grad_rho = rust_module().analytic_penalty_value_grad(
+    value, grad, grad_rho, grad_jac = rust_module().analytic_penalty_value_grad(
         latents_json,
         penalties_json,
         to_numpy_f64(_as_flat_target(target)),
@@ -90,7 +90,8 @@ def _call_rust_value_grad(
     value_t = torch.as_tensor(value, dtype=target.dtype, device=target.device)
     grad_t = from_numpy_like(grad, target).reshape_as(target)
     grad_rho_t = from_numpy_like(grad_rho, rho).reshape_as(rho)
-    return value_t, grad_t, grad_rho_t
+    grad_jac_t = None if grad_jac is None else from_numpy_like(grad_jac, target)
+    return value_t, grad_t, grad_rho_t, grad_jac_t
 
 
 class _RustPenaltyFn(torch.autograd.Function):
@@ -102,7 +103,7 @@ class _RustPenaltyFn(torch.autograd.Function):
         latents_json: str,
         penalties_json: str,
     ) -> torch.Tensor:
-        value, _, _ = _call_rust_value_grad(target, rho, latents_json, penalties_json)
+        value = _call_rust_value_grad(target, rho, latents_json, penalties_json)[0]
         ctx.save_for_backward(target, rho)
         ctx.latents_json = latents_json
         ctx.penalties_json = penalties_json
@@ -111,7 +112,7 @@ class _RustPenaltyFn(torch.autograd.Function):
     @staticmethod
     def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, None, None]:
         target, rho = ctx.saved_tensors
-        _, grad_target, grad_rho = _call_rust_value_grad(
+        _, grad_target, grad_rho, _ = _call_rust_value_grad(
             target, rho, ctx.latents_json, ctx.penalties_json
         )
         scale = grad_output.to(dtype=target.dtype, device=target.device)
@@ -133,14 +134,14 @@ class _IsometryPenaltyFn(torch.autograd.Function):
             jacobian = basis.unsqueeze(0).expand(target.shape[0], -1, -1)
         else:
             jacobian = basis
-        value, _, _ = _call_rust_value_grad(
+        value = _call_rust_value_grad(
             target,
             rho,
             latents_json,
             penalties_json,
             isometry_jacobian=jacobian.reshape(target.shape[0], -1),
             isometry_jacobian_second=jacobian_second,
-        )
+        )[0]
         saved_second = jacobian_second if jacobian_second is not None else torch.empty(0, dtype=target.dtype, device=target.device)
         ctx.save_for_backward(target, rho, basis, saved_second)
         ctx.has_second = jacobian_second is not None
@@ -158,7 +159,7 @@ class _IsometryPenaltyFn(torch.autograd.Function):
             jacobian = basis.unsqueeze(0).expand(target.shape[0], -1, -1)
         else:
             jacobian = basis
-        _, grad_target, grad_rho = _call_rust_value_grad(
+        _, grad_target, grad_rho, grad_jac_flat = _call_rust_value_grad(
             target,
             rho,
             ctx.latents_json,
@@ -166,13 +167,15 @@ class _IsometryPenaltyFn(torch.autograd.Function):
             isometry_jacobian=jacobian.reshape(target.shape[0], -1),
             isometry_jacobian_second=jacobian_second,
         )
+        if grad_jac_flat is None:
+            raise RuntimeError(
+                "analytic_penalty_value_grad did not return an isometry Jacobian "
+                "gradient even though an isometry Jacobian was supplied"
+            )
+        # Rust returns ∂P/∂J flattened as (N, p*d), W-/reference-/weight-aware
+        # (src/terms/analytic_penalties.rs IsometryPenalty::grad_jacobian).
         d = target.shape[1]
-        j = jacobian.reshape(target.shape[0], -1, d)
-        eye = torch.eye(d, dtype=j.dtype, device=j.device)
-        gram = torch.matmul(j.transpose(1, 2), j)
-        diff = gram - eye
-        mu = torch.exp(rho.reshape(-1)[0]).to(dtype=j.dtype, device=j.device)
-        grad_j = 2.0 * mu * torch.matmul(j, diff)
+        grad_j = grad_jac_flat.reshape(target.shape[0], -1, d)
         if basis.dim() == 2:
             grad_basis = grad_j.sum(dim=0)
         else:
@@ -664,24 +667,66 @@ class _JumpReLUSTEFn(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx: Any, z: torch.Tensor, tau: torch.Tensor, smoothing_eps: float) -> torch.Tensor:
-        ctx.save_for_backward(z, tau)
-        ctx.smoothing_eps = float(smoothing_eps)
-        return z * (z > tau.unsqueeze(0)).to(z.dtype)
+        # All gate / STE math lives in Rust
+        # (gam::terms::analytic_penalties::jumprelu_gate_value_grad); Python only
+        # marshals tensors so torch's backward matches the analytic smoothed gate.
+        z_np = to_numpy_f64(z).reshape(z.shape[0], -1)
+        tau_np = to_numpy_f64(tau).reshape(-1)
+        value, dphi_dz, dphi_dtau = rust_module().jumprelu_gate_value_grad(
+            z_np, tau_np, float(smoothing_eps)
+        )
+        ctx.save_for_backward(
+            from_numpy_like(dphi_dz, z).reshape_as(z),
+            from_numpy_like(dphi_dtau, z).reshape_as(z),
+        )
+        return from_numpy_like(value, z).reshape_as(z)
 
     @staticmethod
     def backward(ctx: Any, grad_output: torch.Tensor):
-        z, tau = ctx.saved_tensors
-        eps = ctx.smoothing_eps
-        diff = (z - tau.unsqueeze(0)) / eps
-        # Rectangular STE for z: nonzero in [tau-eps, tau+eps], smooth elsewhere.
-        # Equivalent in expectation to the derivative of the sigmoid-smoothed
-        # gate; on average ∂φ/∂z = sigmoid'(diff)·z/eps + sigmoid(diff).
-        gate = torch.sigmoid(diff)
-        dphi_dz = gate + z * gate * (1.0 - gate) / eps
-        dphi_dtau = -(gate + z * gate * (1.0 - gate) / eps)
+        dphi_dz, dphi_dtau = ctx.saved_tensors
         grad_z = grad_output * dphi_dz
         grad_tau = (grad_output * dphi_dtau).sum(dim=0)
         return grad_z, grad_tau, None
+
+
+class _IBPMapFn(torch.autograd.Function):
+    """IBP-MAP concrete relaxation, value+grad from the Rust source of truth.
+
+    Forward returns ``z_k = σ(l_k/τ) · π_k`` where ``π_k = (α/(α+1))^k`` is the
+    truncated stick-breaking prior; backward multiplies the upstream gradient by
+    the diagonal logit Jacobian ``∂z_k/∂l_k`` that Rust returns. Replacing the
+    bare ``sigmoid(logits/τ)`` torch path makes torch IBP-Gumbel agree with the
+    closed-form ``SaeAssignment`` IBP-MAP assignments (see
+    ``src/terms/sae_manifold.rs`` ``ibp_map_row``).
+    """
+
+    @staticmethod
+    def forward(ctx: Any, logits: torch.Tensor, temperature: float, alpha: float) -> torch.Tensor:
+        rust = rust_module()
+        rows = to_numpy_f64(logits).reshape(logits.shape[0], -1)
+        value = np.empty_like(rows)
+        grad = np.empty_like(rows)
+        for r in range(rows.shape[0]):
+            v_r, g_r = rust.sae_ibp_map_value_grad(
+                np.ascontiguousarray(rows[r]), float(temperature), float(alpha)
+            )
+            value[r] = np.asarray(v_r, dtype=np.float64)
+            grad[r] = np.asarray(g_r, dtype=np.float64)
+        ctx.save_for_backward(from_numpy_like(grad, logits).reshape_as(logits))
+        return from_numpy_like(value, logits).reshape_as(logits)
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None, None]:
+        (jac_diag,) = ctx.saved_tensors
+        return grad_output * jac_diag, None, None
+
+
+def ibp_map(logits: torch.Tensor, temperature: float, alpha: float) -> torch.Tensor:
+    """Differentiable IBP-MAP assignments via the Rust value+grad kernel."""
+    if not isinstance(logits, torch.Tensor):
+        raise TypeError("ibp_map logits must be a torch.Tensor")
+    apply = cast(Callable[..., torch.Tensor], _IBPMapFn.apply)
+    return apply(logits, float(temperature), float(alpha))
 
 
 class GumbelTemperatureSchedule:
@@ -700,12 +745,14 @@ class GumbelTemperatureSchedule:
         return self.current_tau()
 
     def current_tau(self) -> float:
-        if self.decay in {"geometric", "exponential"}:
-            return max(self.tau_min, self.tau_start * (self.rate ** self.iter_count))
-        if self.decay == "linear":
-            frac = min(1.0, self.iter_count / max(1, self.steps))
-            return max(self.tau_min, self.tau_start + frac * (self.tau_min - self.tau_start))
-        return max(self.tau_min, self.tau_start / (1.0 + self.iter_count))
+        """Temperature at the current iteration, evaluated by the Rust
+        :class:`gam.terms.sae_manifold.GumbelTemperatureSchedule` so the decay
+        arithmetic lives in exactly one place."""
+        return float(
+            rust_module().gumbel_schedule_tau(
+                self.to_rust_descriptor(), int(self.iter_count)
+            )
+        )
 
     def to_rust_descriptor(self) -> dict[str, Any]:
         payload = {
@@ -792,4 +839,5 @@ __all__ = [
     "MechanismSparsityPenalty",
     "RiemannianRetraction",
     "TopologyAutoSelector",
+    "ibp_map",
 ]

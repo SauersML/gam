@@ -106,6 +106,16 @@ use crate::terms::latent_coord::{LatentCoordValues, LatentManifold};
 const DIRECT_SOLVE_MAX_K: usize = 2_000;
 const DEFAULT_PCG_MAX_ITERATIONS: usize = 200;
 const DEFAULT_PCG_RELATIVE_TOLERANCE: f64 = 1e-4;
+/// Absolute floor on the Steihaug-CG residual stopping threshold.
+///
+/// The native PCG criterion is purely relative: `tol = rel_tol · ‖rhs‖`. When
+/// `‖rhs‖` is tiny (degenerate / near-stationary reduced systems) this product
+/// can fall below the roundoff resolution of `metric_norm` (~1e-15 for f64),
+/// so the loop would "converge" on floating-point noise rather than a genuinely
+/// accurate solution. Floor the threshold at 1e-14: above machine epsilon
+/// (~2.2e-16) yet below any practical single-iteration residual reduction, so
+/// well-scaled problems are unaffected while degenerate ones stop cleanly.
+const PCG_ABSOLUTE_TOLERANCE_FLOOR: f64 = 1e-14;
 const DEFAULT_TRUST_REGION_RADIUS: f64 = f64::INFINITY;
 pub const DEFAULT_PROXIMAL_INITIAL_RIDGE: f64 = 1e-8;
 pub const DEFAULT_PROXIMAL_RIDGE_GROWTH: f64 = 10.0;
@@ -123,6 +133,16 @@ const ARROW_FACTOR_CACHE_HTBETA_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 pub type SharedBetaMatvec =
     Arc<dyn for<'a> Fn(ArrayView1<'a, f64>, &mut Array1<f64>) + Send + Sync>;
 pub type RowHtbetaMatvec =
+    Arc<dyn for<'a> Fn(usize, ArrayView1<'a, f64>, &mut Array1<f64>) + Send + Sync>;
+/// Row-local matrix-free transpose multiply `out += H_βt^(i) · v` (length `K`).
+///
+/// This is the adjoint of [`RowHtbetaMatvec`]: it scatters a per-row latent
+/// vector `v` (length `d_i`) back into the shared β gradient, **adding** its
+/// contribution to `out`. For the SAE Kronecker form this is the sparse
+/// `scatter_jbeta_t` over the row's active atoms — `O(m_i · p)` per row, the
+/// per-row sparse apply that replaces the `O(K)` column-probe in the GPU and
+/// streaming Schur matvec.
+pub type RowHtbetaTransposeMatvec =
     Arc<dyn for<'a> Fn(usize, ArrayView1<'a, f64>, &mut Array1<f64>) + Send + Sync>;
 pub type StreamingArrowRowBuilder =
     Arc<dyn Fn(usize) -> Result<ArrowRowBlock, ArrowSchurError> + Send + Sync>;
@@ -176,6 +196,14 @@ pub trait BetaPenaltyOp: Send + Sync {
     /// Materialize the full `K×K` dense penalty matrix (needed by
     /// Direct / SqrtBA modes that form the Schur complement explicitly).
     fn to_dense(&self) -> Array2<f64>;
+    /// Mix the operator's defining state into `hasher` for cache-validity
+    /// fingerprinting. Must change whenever `matvec` / `to_dense` would change,
+    /// so the factorization / evidence cache (`cache_matches_system`) is
+    /// invalidated when the β-block content changes. Implementations hash their
+    /// own compact defining data (e.g. Kronecker factors, block matrices)
+    /// rather than the full `K×K` dense form, which would defeat the structured
+    /// operator's storage savings.
+    fn fingerprint(&self, hasher: &mut Fingerprinter);
 }
 
 /// Dense fallback: wraps the existing `K×K` `H_ββ` accumulator.
@@ -227,6 +255,11 @@ impl BetaPenaltyOp for DensePenaltyOp {
 
     fn to_dense(&self) -> Array2<f64> {
         self.0.clone()
+    }
+
+    fn fingerprint(&self, hasher: &mut Fingerprinter) {
+        hasher.write_str("dense-penalty-op-v1");
+        write_array2_fingerprint(hasher, &self.0);
     }
 }
 
@@ -323,6 +356,16 @@ impl BetaPenaltyOp for BlockPenaltyOp {
             }
         }
         out
+    }
+
+    fn fingerprint(&self, hasher: &mut Fingerprinter) {
+        hasher.write_str("block-penalty-op-v1");
+        hasher.write_usize(self.k);
+        hasher.write_usize(self.blocks.len());
+        for (off, local) in &self.blocks {
+            hasher.write_usize(*off);
+            write_array2_fingerprint(hasher, local);
+        }
     }
 }
 
@@ -454,6 +497,183 @@ impl BetaPenaltyOp for KroneckerPenaltyOp {
         }
         out
     }
+
+    fn fingerprint(&self, hasher: &mut Fingerprinter) {
+        hasher.write_str("kronecker-penalty-op-v1");
+        hasher.write_usize(self.global_offset);
+        hasher.write_usize(self.k);
+        write_array2_fingerprint(hasher, &self.factor_a);
+        write_array2_fingerprint(hasher, &self.factor_b);
+    }
+}
+
+/// One co-occurring atom-pair block of a block-sparse left factor `A`.
+///
+/// `data` is the dense `(m_i × m_j)` coupling between the basis columns of
+/// atom `i` (rows, starting at left-factor offset `row_off`) and atom `j`
+/// (columns, starting at `col_off`). Both offsets are in *left-factor* (`A`)
+/// coordinates, i.e. `μ`-space, not β-space.
+#[derive(Debug, Clone)]
+pub struct SparseGBlock {
+    /// Left-factor (`μ`-space) row offset = `beta_offset[atom_i] / p`.
+    pub row_off: usize,
+    /// Left-factor (`μ`-space) column offset = `beta_offset[atom_j] / p`.
+    pub col_off: usize,
+    /// Dense `(m_i × m_j)` coupling block.
+    pub data: Array2<f64>,
+}
+
+/// Block-sparse Kronecker penalty `P = A ⊗ I_p` where the left factor `A`
+/// (dimension `dim_a × dim_a` in `μ`-space) is stored only on its non-empty
+/// co-occurring atom-pair blocks rather than as a dense `(dim_a × dim_a)`
+/// matrix.
+///
+/// This is the sparse-atom (`K = 100K`) replacement for wrapping the dense
+/// data-fit Gauss-Newton Gram `G` (`m_total × m_total`) in a
+/// [`KroneckerPenaltyOp`]: with per-row active sets of size `k_active ≪ K`,
+/// only the `(atom, atom')` pairs that co-occur in some row contribute a
+/// non-zero `(m_i × m_j)` block, so the storage and every matvec/diagonal
+/// pass cost `O(Σ_pairs m_i m_j · p)` instead of `O((m_total · p)²)`.
+///
+/// The β index of left-factor coordinate `μ` and output channel `oc` is
+/// `μ · p + oc` (the same `μ`-major / `oc`-minor layout the dense
+/// `KroneckerPenaltyOp { factor_b: I_p }` uses), so this op is a drop-in
+/// structured replacement: with the full dense pair set it reproduces the
+/// dense operator exactly.
+pub struct SparseBlockKroneckerPenaltyOp {
+    /// Right-factor identity dimension `p` (number of decoder output channels).
+    pub p: usize,
+    /// Left-factor dimension `dim_a` in `μ`-space (= `m_total`).
+    pub dim_a: usize,
+    /// Full β dimension `K = dim_a · p`.
+    pub k: usize,
+    /// Non-empty `(atom_i, atom_j)` coupling blocks of `A`.
+    pub blocks: Vec<SparseGBlock>,
+}
+
+impl BetaPenaltyOp for SparseBlockKroneckerPenaltyOp {
+    fn dim(&self) -> usize {
+        self.k
+    }
+
+    fn matvec(&self, x: &[f64], y: &mut [f64]) {
+        let p = self.p;
+        for blk in &self.blocks {
+            let (m_i, m_j) = blk.data.dim();
+            for li in 0..m_i {
+                let gi_base = (blk.row_off + li) * p;
+                for lj in 0..m_j {
+                    let a_ij = blk.data[[li, lj]];
+                    if a_ij == 0.0 {
+                        continue;
+                    }
+                    let gj_base = (blk.col_off + lj) * p;
+                    for oc in 0..p {
+                        y[gi_base + oc] += a_ij * x[gj_base + oc];
+                    }
+                }
+            }
+        }
+    }
+
+    fn gradient(&self, beta: &[f64], out: &mut [f64]) {
+        self.matvec(beta, out);
+    }
+
+    fn diagonal(&self, diag: &mut [f64]) {
+        let p = self.p;
+        for blk in &self.blocks {
+            // Only on-diagonal `A` blocks (row_off == col_off) carry diagonal
+            // mass; their `(li, li)` entries map to `(row_off+li)·p + oc`.
+            if blk.row_off != blk.col_off {
+                continue;
+            }
+            let (m_i, m_j) = blk.data.dim();
+            let m = m_i.min(m_j);
+            for li in 0..m {
+                let a_ii = blk.data[[li, li]];
+                let gi_base = (blk.row_off + li) * p;
+                for oc in 0..p {
+                    diag[gi_base + oc] += a_ii;
+                }
+            }
+        }
+    }
+
+    fn block(&self, id: BetaBlockId, offsets: &[Range<usize>], out: &mut Array2<f64>) {
+        let range = &offsets[id.0];
+        let b = range.end - range.start;
+        let p = self.p;
+        for blk in &self.blocks {
+            let (m_i, m_j) = blk.data.dim();
+            let row_start = blk.row_off * p;
+            let row_end = (blk.row_off + m_i) * p;
+            let col_start = blk.col_off * p;
+            let col_end = (blk.col_off + m_j) * p;
+            if row_end <= range.start
+                || row_start >= range.end
+                || col_end <= range.start
+                || col_start >= range.end
+            {
+                continue;
+            }
+            for bi in 0..b {
+                let gi = range.start + bi;
+                if gi < row_start || gi >= row_end {
+                    continue;
+                }
+                let li = (gi - row_start) / p;
+                let oc_i = (gi - row_start) % p;
+                for bj in 0..b {
+                    let gj = range.start + bj;
+                    if gj < col_start || gj >= col_end {
+                        continue;
+                    }
+                    let oc_j = (gj - col_start) % p;
+                    if oc_i != oc_j {
+                        continue;
+                    }
+                    let lj = (gj - col_start) / p;
+                    out[[bi, bj]] += blk.data[[li, lj]];
+                }
+            }
+        }
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        let p = self.p;
+        let mut out = Array2::<f64>::zeros((self.k, self.k));
+        for blk in &self.blocks {
+            let (m_i, m_j) = blk.data.dim();
+            for li in 0..m_i {
+                let gi_base = (blk.row_off + li) * p;
+                for lj in 0..m_j {
+                    let a_ij = blk.data[[li, lj]];
+                    if a_ij == 0.0 {
+                        continue;
+                    }
+                    let gj_base = (blk.col_off + lj) * p;
+                    for oc in 0..p {
+                        out[[gi_base + oc, gj_base + oc]] += a_ij;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn fingerprint(&self, hasher: &mut Fingerprinter) {
+        hasher.write_str("sparse-block-kronecker-penalty-op-v1");
+        hasher.write_usize(self.p);
+        hasher.write_usize(self.dim_a);
+        hasher.write_usize(self.k);
+        hasher.write_usize(self.blocks.len());
+        for blk in &self.blocks {
+            hasher.write_usize(blk.row_off);
+            hasher.write_usize(blk.col_off);
+            write_array2_fingerprint(hasher, &blk.data);
+        }
+    }
 }
 
 /// Composite penalty: sum of multiple `BetaPenaltyOp` operators.
@@ -500,6 +720,15 @@ impl BetaPenaltyOp for CompositePenaltyOp {
             out += &dense;
         }
         out
+    }
+
+    fn fingerprint(&self, hasher: &mut Fingerprinter) {
+        hasher.write_str("composite-penalty-op-v1");
+        hasher.write_usize(self.k);
+        hasher.write_usize(self.ops.len());
+        for op in &self.ops {
+            op.fingerprint(hasher);
+        }
     }
 }
 
@@ -584,6 +813,17 @@ impl BetaPenaltyOp for MatvecDiagPenaltyOp {
             }
         }
         out
+    }
+
+    fn fingerprint(&self, hasher: &mut Fingerprinter) {
+        // The matvec closure cannot be hashed by content; the precomputed
+        // diagonal is the operator's stable defining proxy (it is recomputed
+        // alongside the matvec each time the operator is installed).
+        hasher.write_str("matvec-diag-penalty-op-v1");
+        hasher.write_usize(self.k);
+        for &value in self.diagonal_vec.iter() {
+            hasher.write_f64(value);
+        }
     }
 }
 
@@ -956,6 +1196,47 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
     }
 }
 
+/// Diagonal-ratio condition-number proxy for an SPD matrix from its lower
+/// Cholesky factor `L` (where `A = L Lᵀ`):
+///     κ(A) ≈ (max_i L_ii / min_i L_ii)².
+///
+/// (Golub & Van Loan, "Matrix Computations" 4th ed., §4.2.4 — the ratio of
+/// diagonal entries of the Cholesky factor bounds the 2-norm condition number
+/// of the SPD matrix.) Returns `f64::INFINITY` when the factor has a
+/// non-positive or non-finite diagonal pivot, which the callers treat as a
+/// hard ill-conditioning signal.
+fn cholesky_factor_kappa_estimate(factor: &Array2<f64>) -> f64 {
+    let d = factor.nrows();
+    let mut min_diag = f64::INFINITY;
+    let mut max_diag = 0.0_f64;
+    for a in 0..d {
+        let v = factor[[a, a]];
+        if v < min_diag {
+            min_diag = v;
+        }
+        if v > max_diag {
+            max_diag = v;
+        }
+    }
+    if min_diag > 0.0 && max_diag.is_finite() {
+        let ratio = max_diag / min_diag;
+        ratio * ratio
+    } else {
+        f64::INFINITY
+    }
+}
+
+/// Near-singularity condition-number ceiling for double precision at dimension
+/// `dim`: κ_max = 1 / (sqrt(DBL_EPS) · max(dim, 1)).
+///
+/// Classic Higham rule (Higham, "Accuracy and Stability of Numerical
+/// Algorithms" 2nd ed., §10.1): a system is treated as numerically
+/// rank-deficient once κ · ε approaches 1/sqrt(ε), scaled by problem dimension.
+fn safe_spd_kappa_max(dim: usize) -> f64 {
+    let d_scale = (dim as f64).max(1.0);
+    1.0 / (f64::EPSILON.sqrt() * d_scale)
+}
+
 fn factor_one_row(
     row: &ArrowRowBlock,
     ridge_t: f64,
@@ -1005,44 +1286,14 @@ fn factor_one_row(
     // the outer Cholesky on S succeed. Treat that case as functionally
     // equivalent to a PSD failure so LM escalation lifts ridge_t.
     //
-    // Diagonal-ratio condition-number proxy: for a Cholesky factor L,
-    //     κ(L Lᵀ) ≈ (max_i L_ii / min_i L_ii)².
-    // (Golub & Van Loan, "Matrix Computations" 4th ed., §4.2.4 — the
-    // ratio of diagonal entries of the Cholesky factor bounds the
-    // 2-norm condition number of the SPD matrix.)
-    //
-    // Near-singularity threshold for double precision at dimension d:
-    //     κ_max = 1 / (sqrt(DBL_EPS) · max(d, 1)).
-    // This is the classic Higham (Higham, "Accuracy and Stability of
-    // Numerical Algorithms" 2nd ed., §10.1) rule: a system is treated
-    // as numerically rank-deficient once κ · ε approaches 1/sqrt(ε),
-    // scaled by problem dimension.
-    let mut min_diag = f64::INFINITY;
-    let mut max_diag = 0.0_f64;
-    for a in 0..d {
-        let v = factor[[a, a]];
-        if v < min_diag {
-            min_diag = v;
-        }
-        if v > max_diag {
-            max_diag = v;
-        }
-    }
-    if min_diag > 0.0 && max_diag.is_finite() {
-        let ratio = max_diag / min_diag;
-        let kappa_est = ratio * ratio;
-        let d_scale = (d as f64).max(1.0);
-        let kappa_max = 1.0 / (f64::EPSILON.sqrt() * d_scale);
-        if !kappa_est.is_finite() || kappa_est > kappa_max {
-            return Err(ArrowSchurError::PerRowFactorIllConditioned {
-                row: row_idx,
-                kappa_estimate: kappa_est,
-            });
-        }
-    } else {
+    // Diagonal-ratio condition-number proxy κ(L Lᵀ) ≈ (max L_ii / min L_ii)²,
+    // compared against the dimension-scaled Higham near-singularity ceiling.
+    // See `cholesky_factor_kappa_estimate` / `safe_spd_kappa_max`.
+    let kappa_est = cholesky_factor_kappa_estimate(&factor);
+    if !kappa_est.is_finite() || kappa_est > safe_spd_kappa_max(d) {
         return Err(ArrowSchurError::PerRowFactorIllConditioned {
             row: row_idx,
-            kappa_estimate: f64::INFINITY,
+            kappa_estimate: kappa_est,
         });
     }
     Ok(factor)
@@ -1093,7 +1344,21 @@ fn row_hessian_fingerprint_for_system(sys: &ArrowSchurSystem) -> u64 {
             None => write_array2_fingerprint(&mut hasher, &row.htbeta),
         }
     }
-    write_array2_fingerprint(&mut hasher, &sys.hbb);
+    // Hash the β-block operator's defining state. When a structured
+    // `penalty_op` is installed (e.g. the SAE composite carrying the data-fit
+    // Gauss-Newton block as `G ⊗ I_p`), hashing the operator captures the full
+    // β-block content cheaply; the dense `sys.hbb` no longer holds it. When no
+    // `penalty_op` is installed, fall back to hashing the dense accumulator.
+    match sys.penalty_op.as_ref() {
+        Some(op) => {
+            hasher.write_bool(true);
+            op.fingerprint(&mut hasher);
+        }
+        None => {
+            hasher.write_bool(false);
+            write_array2_fingerprint(&mut hasher, &sys.hbb);
+        }
+    }
     match sys.hbb_diag.as_ref() {
         Some(diag) => {
             hasher.write_bool(true);
@@ -1366,6 +1631,15 @@ pub struct ArrowSchurSystem {
     /// `sys_htbeta_materialize_row`.  Factor caches retain the operator for
     /// IFT/evidence consumers as before.
     pub htbeta_matvec: Option<RowHtbetaMatvec>,
+    /// Optional row-local matrix-free transpose multiply `out += H_βt^(i) · v`.
+    ///
+    /// The sparse adjoint of [`Self::htbeta_matvec`]. When present, the
+    /// reduced-Schur matvec applies `H_βt^(i)` directly (sparse `scatter`)
+    /// instead of probing the forward operator against `K` basis vectors. This
+    /// is the per-row sparse apply that lifts the `O(K)` column-probe in the
+    /// GPU PCG and streaming Schur paths to `O(m_i · p)` per row. Installed in
+    /// lock-step with `htbeta_matvec` by [`Self::set_row_htbeta_operator`].
+    pub htbeta_transpose_matvec: Option<RowHtbetaTransposeMatvec>,
     /// Optional diagonal of the matrix-free shared block, used by the
     /// Schur-Jacobi preconditioner in the Agarwal-style PCG path.
     pub hbb_diag: Option<Array1<f64>>,
@@ -1441,6 +1715,7 @@ impl ArrowSchurSystem {
             hbb: Array2::<f64>::zeros((k, k)),
             hbb_matvec: None,
             htbeta_matvec: None,
+            htbeta_transpose_matvec: None,
             hbb_diag: None,
             gb: Array1::<f64>::zeros(k),
             d,
@@ -1492,6 +1767,7 @@ impl ArrowSchurSystem {
             hbb: Array2::<f64>::zeros((0, 0)),
             hbb_matvec: Some(matvec_arc),
             htbeta_matvec: None,
+            htbeta_transpose_matvec: None,
             hbb_diag: Some(diag),
             gb: Array1::<f64>::zeros(k),
             d,
@@ -1535,6 +1811,7 @@ impl ArrowSchurSystem {
             hbb: Array2::<f64>::zeros((k, k)),
             hbb_matvec: None,
             htbeta_matvec: None,
+            htbeta_transpose_matvec: None,
             hbb_diag: None,
             gb: Array1::<f64>::zeros(k),
             d: max_d,
@@ -1602,22 +1879,28 @@ impl ArrowSchurSystem {
         self.refresh_row_hessian_fingerprint();
     }
 
-    /// Install a matrix-free per-row cross-block operator.
+    /// Install a matrix-free per-row cross-block operator and its sparse
+    /// adjoint.
     ///
-    /// The closure must write `out = H_tβ^(row) x` for `out.len() == d` and
-    /// `x.len() == K`.
+    /// `forward` must write `out = H_tβ^(row) x` for `out.len() == d` and
+    /// `x.len() == K`. `transpose` must **add** `H_βt^(row) v` into `out` for
+    /// `out.len() == K` and `v.len() == d` (the sparse `scatter` adjoint).
     ///
-    /// When installed, the operator is used both during the Newton solve
+    /// When installed, the forward operator is used during the Newton solve
     /// (inside `reduced_rhs_beta`, `schur_matvec`, back-substitution, and
     /// `JacobiPreconditioner` construction) and afterwards by IFT/evidence
     /// predictors.  Per-row `htbeta` slabs in `ArrowRowBlock` may be left
     /// zero-sized when this operator is installed — all inner-Schur paths route
-    /// through the matvec instead of indexing the dense block.
-    pub fn set_row_htbeta_operator<F>(&mut self, matvec: F)
+    /// through the matvec instead of indexing the dense block. The transpose
+    /// operator lets the reduced-Schur matvec apply `H_βt^(row)` directly
+    /// (`O(m_i · p)`) instead of probing `forward` against `K` basis vectors.
+    pub fn set_row_htbeta_operator<F, T>(&mut self, forward: F, transpose: T)
     where
         F: for<'a> Fn(usize, ArrayView1<'a, f64>, &mut Array1<f64>) + Send + Sync + 'static,
+        T: for<'a> Fn(usize, ArrayView1<'a, f64>, &mut Array1<f64>) + Send + Sync + 'static,
     {
-        self.htbeta_matvec = Some(Arc::new(matvec));
+        self.htbeta_matvec = Some(Arc::new(forward));
+        self.htbeta_transpose_matvec = Some(Arc::new(transpose));
         self.refresh_row_hessian_fingerprint();
     }
 
@@ -1648,6 +1931,10 @@ impl ArrowSchurSystem {
     /// for structured smoothness penalties.
     pub fn set_penalty_op(&mut self, op: Arc<dyn BetaPenaltyOp>) {
         self.penalty_op = Some(op);
+        // The row-Hessian fingerprint now reads the β-block content from the
+        // installed operator; refresh it so the factorization / evidence cache
+        // (`cache_matches_system`) invalidates when the β-block changes.
+        self.refresh_row_hessian_fingerprint();
     }
 
     /// Return the effective penalty operator: the installed `penalty_op` if
@@ -2031,6 +2318,19 @@ pub struct StreamingArrowSchur {
     hbb: Array2<f64>,
     gb: Array1<f64>,
     row_builder: StreamingArrowRowBuilder,
+    /// Procedural cross-block operator `H_tβ^(i) x`. When present, the dense
+    /// per-row `H_tβ` slabs are never materialized: `accumulate_chunk` and
+    /// `back_substitute` probe this operator column-by-column to apply the
+    /// cross-block, matching the Kronecker / matrix-free assembly path. When
+    /// `None` (legacy dense BA callers), the per-row `row.htbeta` slab is used.
+    htbeta_matvec: Option<RowHtbetaMatvec>,
+    /// Sparse adjoint of `htbeta_matvec`. When present, `row_htbeta` rebuilds
+    /// the dense `(d_i × K)` cross-block by probing the transpose with `d_i`
+    /// basis vectors — `O(d_i · m_i · p)` total, vs the `O(K · m_i · p)` cost
+    /// of probing the forward operator with `K` basis vectors. Since
+    /// `d_i ≪ K`, this is the per-row sparse apply that replaces the `O(K)`
+    /// column-probe in the streaming reduced-Schur accumulation.
+    htbeta_transpose_matvec: Option<RowHtbetaTransposeMatvec>,
 }
 
 impl std::fmt::Debug for StreamingArrowSchur {
@@ -2071,25 +2371,27 @@ impl StreamingArrowSchur {
             hbb,
             gb,
             row_builder,
+            htbeta_matvec: None,
+            htbeta_transpose_matvec: None,
         }
     }
 
     #[must_use]
     pub fn from_system(sys: &ArrowSchurSystem, chunk_size: usize) -> Self {
         // When a Kronecker / matrix-free htbeta_matvec is installed, the dense
-        // row.htbeta slabs may be zero-sized.  Materialize them now so the
-        // streaming accumulator's validate_row + direct arithmetic can work.
-        let rows: Vec<ArrowRowBlock> = if sys.htbeta_matvec.is_some() {
+        // row.htbeta slabs may be zero-sized.  Rather than materialize every
+        // `(d × K)` slab (the very `(N·K)`-scale buffer the streaming path
+        // exists to avoid), retain the procedural operator and probe it per row
+        // inside `accumulate_chunk` / `back_substitute`.  The row builder then
+        // only carries the small `H_tt` / `g_t` blocks.
+        let htbeta_matvec = sys.htbeta_matvec.clone();
+        let rows: Vec<ArrowRowBlock> = if htbeta_matvec.is_some() {
             sys.rows
                 .iter()
-                .enumerate()
-                .map(|(row_idx, row)| {
-                    let htbeta = sys_htbeta_materialize_row(sys, row_idx, row);
-                    ArrowRowBlock {
-                        htt: row.htt.clone(),
-                        htbeta,
-                        gt: row.gt.clone(),
-                    }
+                .map(|row| ArrowRowBlock {
+                    htt: row.htt.clone(),
+                    htbeta: Array2::<f64>::zeros((0, 0)),
+                    gt: row.gt.clone(),
                 })
                 .collect()
         } else {
@@ -2103,17 +2405,91 @@ impl StreamingArrowSchur {
                     reason: format!("streaming row {row} out of bounds"),
                 })
         });
-        Self::new(
+        // Materialize the dense β-block from the effective penalty operator so
+        // the streaming accumulator stays correct when contributions live in a
+        // structured `BetaPenaltyOp` (e.g. the SAE data-fit Gauss-Newton block,
+        // represented as `G ⊗ I_p`) rather than the dense `hbb` accumulator.
+        // When no `penalty_op` is installed this reduces to `hbb.clone()`.
+        let hbb_dense = sys.effective_penalty_op().to_dense();
+        let mut streaming = Self::new(
             sys.rows.len(),
             sys.d,
             Arc::clone(&sys.row_dims),
             Arc::clone(&sys.row_offsets),
             sys.k,
-            sys.hbb.clone(),
+            hbb_dense,
             sys.gb.clone(),
             row_builder,
             chunk_size,
-        )
+        );
+        streaming.htbeta_matvec = htbeta_matvec;
+        streaming.htbeta_transpose_matvec = sys.htbeta_transpose_matvec.clone();
+        streaming
+    }
+
+    /// Build the `(di × k)` cross-block for `row_idx` on demand.
+    ///
+    /// When the sparse transpose adjoint is installed, probes it with `di`
+    /// standard basis vectors — each yields a full `K`-row of `H_βt^(i)`
+    /// (i.e. a row of the `(di × k)` block) via the sparse scatter, for
+    /// `O(di · m_i · p)` total, far below the `O(K · m_i · p)` cost of probing
+    /// the forward operator with `K` basis vectors when `di ≪ K`.
+    ///
+    /// When only the forward operator is installed (no adjoint), falls back to
+    /// the `k`-column forward probe. Otherwise clones the dense `row.htbeta`
+    /// slab.
+    fn row_htbeta(&self, row_idx: usize, row: &ArrowRowBlock, di: usize) -> Array2<f64> {
+        if let Some(op_t) = self.htbeta_transpose_matvec.as_ref() {
+            // Probe the adjoint: for each latent index c, scatter e_c to obtain
+            // row c of the (di × k) block.
+            let mut mat = Array2::<f64>::zeros((di, self.k));
+            let mut e_c = Array1::<f64>::zeros(di);
+            let mut beta_row = Array1::<f64>::zeros(self.k);
+            for c in 0..di {
+                e_c.fill(0.0);
+                e_c[c] = 1.0;
+                beta_row.fill(0.0);
+                op_t(row_idx, e_c.view(), &mut beta_row);
+                for a in 0..self.k {
+                    mat[[c, a]] = beta_row[a];
+                }
+            }
+            return mat;
+        }
+        match self.htbeta_matvec.as_ref() {
+            Some(op) => {
+                let mut mat = Array2::<f64>::zeros((di, self.k));
+                let mut e_a = Array1::<f64>::zeros(self.k);
+                let mut col = Array1::<f64>::zeros(di);
+                for a in 0..self.k {
+                    e_a.fill(0.0);
+                    e_a[a] = 1.0;
+                    col.fill(0.0);
+                    op(row_idx, e_a.view(), &mut col);
+                    for c in 0..di {
+                        mat[[c, a]] = col[c];
+                    }
+                }
+                mat
+            }
+            None => row.htbeta.clone(),
+        }
+    }
+
+    /// Move out the accumulated reduced Schur block `s_acc` and reduced RHS
+    /// `rhs_acc`, leaving fresh zero buffers in their place.
+    ///
+    /// The reduced contribution is `s_acc = hbb − Σ_i H_βt^(i)(H_tt^(i))⁻¹H_tβ^(i)`
+    /// (the β-block `hbb` seeded by `reset_accumulator`, minus the per-row
+    /// reduction summed by `accumulate_chunk`) and
+    /// `rhs_acc = +Σ_i H_βt^(i)(H_tt^(i))⁻¹g_t^(i)`. Used by external online
+    /// drivers (e.g. the SAE streaming joint fit) that accumulate the reduced
+    /// system across re-materialized chunk systems.
+    #[must_use]
+    pub fn take_accumulators(&mut self) -> (Array2<f64>, Array1<f64>) {
+        let s = std::mem::replace(&mut self.s_acc, Array2::<f64>::zeros((self.k, self.k)));
+        let rhs = std::mem::replace(&mut self.rhs_acc, Array1::<f64>::zeros(self.k));
+        (s, rhs)
     }
 
     /// Reset the dense shared accumulator to `H_ββ + ridge_beta I`.
@@ -2152,6 +2528,7 @@ impl StreamingArrowSchur {
             let row = (self.row_builder)(row_idx)?;
             let di = row.htt.nrows();
             self.validate_row(row_idx, &row)?;
+            let htbeta = self.row_htbeta(row_idx, &row, di);
             let factor = factor_one_row(&row, ridge_t, di, row_idx)?;
             let v = backend.solve_block_vector(&factor, &row.gt);
             for c in 0..di {
@@ -2160,22 +2537,26 @@ impl StreamingArrowSchur {
                     continue;
                 }
                 for a in 0..self.k {
-                    self.rhs_acc[a] += row.htbeta[[c, a]] * vc;
+                    self.rhs_acc[a] += htbeta[[c, a]] * vc;
                 }
             }
             match mode {
-                ArrowSolverMode::Direct => {
-                    let solved = backend.solve_block_matrix(&factor, &row.htbeta);
-                    backend.block_gemm_subtract(&mut self.s_acc, &row.htbeta, &solved);
+                // The streaming accumulator forms the dense reduced Schur
+                // complement `S = H_ββ + ridge·I − Σ_i H_βt^(i)(H_tt^(i))⁻¹H_tβ^(i)`
+                // incrementally across chunks. `InexactPCG` differs from
+                // `Direct` only in how the *reduced* system is solved, not in
+                // how it is assembled — and `solve_dense_reduced_system` already
+                // owns the reduced solve. So InexactPCG reduces, by construction,
+                // to the same dense Schur subtraction here; the prior hard
+                // rejection at this site is lifted because chunked assembly is
+                // exactly the matrix-free reduction the PCG path wants.
+                ArrowSolverMode::Direct | ArrowSolverMode::InexactPCG => {
+                    let solved = backend.solve_block_matrix(&factor, &htbeta);
+                    backend.block_gemm_subtract(&mut self.s_acc, &htbeta, &solved);
                 }
                 ArrowSolverMode::SqrtBA => {
-                    let whitened = backend.sqrt_solve_block_matrix(&factor, &row.htbeta);
+                    let whitened = backend.sqrt_solve_block_matrix(&factor, &htbeta);
                     backend.block_gemm_subtract(&mut self.s_acc, &whitened, &whitened);
-                }
-                ArrowSolverMode::InexactPCG => {
-                    return Err(ArrowSchurError::PcgFailed {
-                        reason: "streaming Arrow-Schur accumulator is for dense direct modes; use matrix-free PCG without streaming_chunk_size".to_string(),
-                    });
                 }
             }
         }
@@ -2221,12 +2602,22 @@ impl StreamingArrowSchur {
                 let di = row.htt.nrows();
                 self.validate_row(row_idx, &row)?;
                 let factor = factor_one_row(&row, ridge_t, di, row_idx)?;
-                for c in 0..di {
-                    let mut acc = row.gt[c];
-                    for a in 0..self.k {
-                        acc += row.htbeta[[c, a]] * delta_beta[a];
+                // `H_tβ^(i) Δβ`: route through the procedural operator when
+                // present (no dense slab), else through the dense slab.
+                let mut htbeta_delta = Array1::<f64>::zeros(di);
+                if let Some(op) = self.htbeta_matvec.as_ref() {
+                    op(row_idx, delta_beta, &mut htbeta_delta);
+                } else {
+                    for c in 0..di {
+                        let mut acc = 0.0_f64;
+                        for a in 0..self.k {
+                            acc += row.htbeta[[c, a]] * delta_beta[a];
+                        }
+                        htbeta_delta[c] = acc;
                     }
-                    rhs[c] = acc;
+                }
+                for c in 0..di {
+                    rhs[c] = row.gt[c] + htbeta_delta[c];
                 }
                 let dt_i = backend.solve_block_vector(&factor, &rhs);
                 let row_base = self.row_offsets[row_idx];
@@ -2254,7 +2645,10 @@ impl StreamingArrowSchur {
                 ),
             });
         }
-        if row.htbeta.dim() != (expected_di, self.k) {
+        // The dense `H_tβ` slab is only validated when no procedural operator is
+        // installed; with `htbeta_matvec` the slab is intentionally zero-sized
+        // and the cross-block is probed in `row_htbeta`.
+        if self.htbeta_matvec.is_none() && row.htbeta.dim() != (expected_di, self.k) {
             return Err(ArrowSchurError::SchurFactorFailed {
                 reason: format!(
                     "streaming row H_tβ shape {:?} != ({expected_di}, {})",
@@ -2989,9 +3383,16 @@ pub fn solve_arrow_newton_step_core(
 /// geometrically grow a `proximal_ridge` on top of the caller-supplied
 /// `ridge_t` / `ridge_beta` and retry, exactly as the Ceres-style proximal
 /// correction the Newton driver in `run_joint_fit_arrow_schur` does around
-/// `solve`. Non-factorization failures (PCG divergence, adaptive-correction
-/// exhaustion) surface immediately because they are not recoverable by
-/// shifting the diagonal.
+/// `solve`. Adaptive-correction exhaustion surfaces immediately because it is
+/// not recoverable by shifting the diagonal.
+///
+/// A `PcgFailed` is likewise treated as recoverable: when the inexact-PCG
+/// path stalls (all preconditioner tiers hit `MaxIter`, negative curvature on
+/// an unbounded solve, or a non-PD preconditioned residual), shifting the
+/// diagonal improves both conditioning and curvature, so a ridge bump is the
+/// right response. Only `AdaptiveCorrectionFailed` surfaces immediately, since
+/// it is an option-validation / line-search failure that a ridge shift cannot
+/// repair.
 ///
 /// Returns `(Δt, Δβ, PcgDiagnostics)` from `solve_arrow_newton_step_core`,
 /// computed with the smallest escalated ridge that produced a successful factor.
@@ -3019,6 +3420,7 @@ pub fn solve_with_lm_escalation_inner(
                     ArrowSchurError::PerRowFactorFailed { .. }
                         | ArrowSchurError::PerRowFactorIllConditioned { .. }
                         | ArrowSchurError::SchurFactorFailed { .. }
+                        | ArrowSchurError::PcgFailed { .. }
                 );
                 last_err = Some(err);
                 if !recoverable {
@@ -3494,6 +3896,30 @@ fn solve_dense_reduced_system(
 ) -> Result<(Array1<f64>, Option<Array2<f64>>, PcgDiagnostics), ArrowSchurError> {
     let factor =
         cholesky_lower(schur).map_err(|e| ArrowSchurError::SchurFactorFailed { reason: e })?;
+    // Ill-conditioned-but-PD Schur guard. The per-row factor checks reject
+    // any single barely-PD H_tt^(i) block, but the reduced Schur complement
+    //     S = H_ββ + ridge_β·I − Σ_i H_tβ^(i)ᵀ (H_tt^(i))⁻¹ H_tβ^(i)
+    // accumulates the (H_tt^(i))⁻¹ contributions of every row in finite
+    // precision. With many weak-but-admissible rows those terms can sum to a
+    // Schur matrix whose Cholesky succeeds yet whose condition number is far
+    // past the safe inversion regime, so `chol_solve_vector` yields an
+    // inaccurate Δβ that is silently propagated to the Newton step. Apply the
+    // same diagonal-ratio κ proxy used per-row to the reduced factor and treat
+    // an over-threshold estimate as a Schur-stability failure: `SchurFactorFailed`
+    // is already recoverable in `solve_with_lm_escalation_inner`, so this lifts
+    // `ridge_beta` and re-forms a better-conditioned Schur. This guard is
+    // exclusive to the dense Direct / SqrtBA path (the only caller of this
+    // function); the inexact-PCG path tolerates higher κ(S) and is unaffected.
+    let schur_kappa = cholesky_factor_kappa_estimate(&factor);
+    if !schur_kappa.is_finite() || schur_kappa > safe_spd_kappa_max(schur.nrows()) {
+        return Err(ArrowSchurError::SchurFactorFailed {
+            reason: format!(
+                "reduced Schur complement Cholesky succeeded but is ill-conditioned \
+                 (kappa_estimate={schur_kappa:e}); accumulated per-row \
+                 (H_tt)⁻¹ contamination would yield an inaccurate Δβ"
+            ),
+        });
+    }
     let direct = chol_solve_vector(&factor, rhs_beta);
     if step_inside_trust_region(direct.view(), options.trust_region.radius, metric_weights) {
         return Ok((direct, Some(factor), PcgDiagnostics::default()));
@@ -3515,6 +3941,78 @@ fn solve_dense_reduced_system(
         metric_weights,
     )?;
     Ok((delta, Some(factor), diag))
+}
+
+/// Solve an externally accumulated dense reduced β system
+/// `S Δβ = rhs_β` with the same LM-style ridge escalation the full-batch
+/// driver applies: on a `SchurFactorFailed` (non-PD or ill-conditioned `S`),
+/// geometrically grow a proximal ridge on `S`'s diagonal and retry.
+///
+/// Used by the SAE streaming joint fit, which accumulates `S` and `rhs_β` over
+/// re-materialized row chunks (via [`StreamingArrowSchur::take_accumulators`])
+/// and must solve the single global reduced system without a per-row
+/// `ArrowSchurSystem`. `S` is symmetrized from its lower triangle before each
+/// factorization. `base_ridge_beta` is folded into the caller's `S` already;
+/// this routine only adds the *escalation* ridge on top.
+pub fn solve_streaming_reduced_beta(
+    s_acc: &Array2<f64>,
+    rhs_beta: &Array1<f64>,
+    options: &ArrowSolveOptions,
+) -> Result<Array1<f64>, ArrowSchurError> {
+    let mut proximal_ridge = 0.0_f64;
+    let mut last_err: Option<ArrowSchurError> = None;
+    for attempt in 0..=DEFAULT_PROXIMAL_MAX_ATTEMPTS {
+        let mut schur = s_acc.clone();
+        symmetrize_upper_from_lower(&mut schur);
+        if proximal_ridge > 0.0 {
+            for j in 0..schur.nrows() {
+                schur[[j, j]] += proximal_ridge;
+            }
+        }
+        // Reduced K-system on device: Jacobi-preconditioned CG over the dense
+        // symmetric `S`. The `O(K²)` `S·p` matvec runs device-side; only the
+        // K-vectors cross the boundary per CG iteration. This is the dominant
+        // cost of the streaming SAE joint fit at `K = 100K`. Any device-side
+        // failure (`Unavailable`, non-PD Jacobi diagonal) falls through to the
+        // CPU `solve_dense_reduced_system`, which then drives the same proximal
+        // ridge escalation. A genuine device PD failure is non-recoverable for
+        // this attempt's `schur`, so we let the CPU path re-confirm and escalate.
+        if crate::gpu::runtime::GpuRuntime::is_available() {
+            match crate::gpu::arrow_schur::solve_reduced_beta_pcg(
+                &schur,
+                rhs_beta,
+                options.trust_region.max_iterations,
+                options.trust_region.steihaug_relative_tolerance,
+            ) {
+                Ok(delta_beta) => return Ok(delta_beta),
+                Err(crate::gpu::arrow_schur::ArrowSchurGpuFailure::Unavailable) => {}
+                Err(_) => {
+                    // Device declined this `schur` (e.g. non-PD Jacobi diag);
+                    // let the CPU path confirm and escalate the proximal ridge.
+                }
+            }
+        }
+        match solve_dense_reduced_system(&schur, rhs_beta, options, None) {
+            Ok((delta_beta, _factor, _diag)) => return Ok(delta_beta),
+            Err(err) => {
+                let recoverable = matches!(
+                    err,
+                    ArrowSchurError::SchurFactorFailed { .. }
+                        | ArrowSchurError::PcgFailed { .. }
+                );
+                last_err = Some(err);
+                if !recoverable || attempt == DEFAULT_PROXIMAL_MAX_ATTEMPTS {
+                    break;
+                }
+                proximal_ridge = if proximal_ridge == 0.0 {
+                    DEFAULT_PROXIMAL_INITIAL_RIDGE
+                } else {
+                    proximal_ridge * DEFAULT_PROXIMAL_RIDGE_GROWTH
+                };
+            }
+        }
+    }
+    Err(last_err.expect("escalation loop set last_err on failure"))
 }
 
 fn step_inside_trust_region(
@@ -4278,7 +4776,7 @@ fn steihaug_pcg_auto<B: BatchedBlockSolver>(
     }
     let schwarz =
         AdditiveSchwarzPreconditioner::from_arrow_schur(sys, htt_factors, ridge_beta, backend, 1)?;
-    run_pcg_with_preconditioner(
+    let (x2, diag2) = run_pcg_with_preconditioner(
         sys,
         htt_factors,
         ridge_beta,
@@ -4289,7 +4787,25 @@ fn steihaug_pcg_auto<B: BatchedBlockSolver>(
         backend,
         gpu_matvec,
         metric_weights,
-    )
+    )?;
+    // All three preconditioner tiers (Jacobi -> ClusterJacobi ->
+    // AdditiveSchwarz) exhausted their iteration budget without driving the
+    // residual below tolerance. Returning the truncated AdditiveSchwarz iterate
+    // as `Ok` would feed an arbitrarily-large-residual step into the Newton
+    // driver, where the PCG diagnostics are discarded. Surface a recoverable
+    // failure instead so `solve_with_lm_escalation_inner` escalates the
+    // proximal ridge: better conditioning is precisely what a stalled PCG on
+    // an ill-conditioned reduced system needs.
+    if diag2.stopping_reason == PcgStopReason::MaxIter {
+        return Err(ArrowSchurError::PcgFailed {
+            reason: format!(
+                "Schur PCG exhausted all preconditioner tiers (Jacobi, ClusterJacobi, \
+                 AdditiveSchwarz) at MaxIter; final relative residual = {:e}",
+                diag2.final_relative_residual
+            ),
+        });
+    }
+    Ok((x2, diag2))
 }
 
 /// Run Steihaug-CG with a generic preconditioner closure.
@@ -4395,7 +4911,7 @@ where
     if rhs_norm == 0.0 {
         return Ok((Array1::<f64>::zeros(n), PcgDiagnostics::default()));
     }
-    let tol = relative_tolerance.max(0.0) * rhs_norm;
+    let tol = (relative_tolerance.max(0.0) * rhs_norm).max(PCG_ABSOLUTE_TOLERANCE_FLOOR);
     let mut x = Array1::<f64>::zeros(n);
     let mut r = rhs.clone();
     let mut z = apply_preconditioner(&r);
@@ -4720,6 +5236,112 @@ fn lower_triangular_solve_matrix(l: &Array2<f64>, b: &Array2<f64>) -> Array2<f64
 mod tests {
     use super::*;
     use ndarray::array;
+
+    /// `SparseBlockKroneckerPenaltyOp` must reproduce the dense
+    /// `KroneckerPenaltyOp { factor_a: G, factor_b: I_p }` on every interface
+    /// (matvec, gradient, diagonal, to_dense) when the sparse block set covers
+    /// the same `(atom, atom')` couplings — this is the equivalence that makes
+    /// the sparse op a drop-in replacement for the dense data Gram.
+    #[test]
+    fn sparse_block_kronecker_matches_dense_kronecker() {
+        // Two atoms: atom 0 has m_0 = 2 basis cols (μ offset 0), atom 1 has
+        // m_1 = 3 (μ offset 2). p = 2 output channels ⇒ dim_a = 5, k = 10.
+        let p = 2usize;
+        let dim_a = 5usize;
+        let k = dim_a * p;
+        // Dense G (5×5) with non-zero (0,0), (0,1), (1,0), (1,1) atom blocks.
+        let g_dense = array![
+            [3.0_f64, 0.5, 0.2, -0.1, 0.0],
+            [0.5, 4.0, 0.0, 0.3, 0.1],
+            [0.2, 0.0, 2.0, 0.4, -0.2],
+            [-0.1, 0.3, 0.4, 5.0, 0.6],
+            [0.0, 0.1, -0.2, 0.6, 1.5],
+        ];
+        let dense = KroneckerPenaltyOp {
+            factor_a: g_dense.clone(),
+            factor_b: Array2::<f64>::eye(p),
+            global_offset: 0,
+            k,
+        };
+        // Sparse: atom 0 block = G[0..2, 0..2], cross blocks G[0..2,2..5] and
+        // its transpose, atom 1 block = G[2..5, 2..5].
+        let block_00 = g_dense.slice(ndarray::s![0..2, 0..2]).to_owned();
+        let block_01 = g_dense.slice(ndarray::s![0..2, 2..5]).to_owned();
+        let block_10 = g_dense.slice(ndarray::s![2..5, 0..2]).to_owned();
+        let block_11 = g_dense.slice(ndarray::s![2..5, 2..5]).to_owned();
+        let sparse = SparseBlockKroneckerPenaltyOp {
+            p,
+            dim_a,
+            k,
+            blocks: vec![
+                SparseGBlock { row_off: 0, col_off: 0, data: block_00 },
+                SparseGBlock { row_off: 0, col_off: 2, data: block_01 },
+                SparseGBlock { row_off: 2, col_off: 0, data: block_10 },
+                SparseGBlock { row_off: 2, col_off: 2, data: block_11 },
+            ],
+        };
+
+        // to_dense parity.
+        let d_dense = dense.to_dense();
+        let d_sparse = sparse.to_dense();
+        for i in 0..k {
+            for j in 0..k {
+                assert!(
+                    (d_dense[[i, j]] - d_sparse[[i, j]]).abs() < 1e-12,
+                    "to_dense mismatch at ({i},{j}): {} vs {}",
+                    d_dense[[i, j]],
+                    d_sparse[[i, j]]
+                );
+            }
+        }
+
+        // matvec / gradient parity on an arbitrary vector.
+        let x: Vec<f64> = (0..k).map(|i| 0.1 * (i as f64) - 0.3).collect();
+        let mut y_dense = vec![0.0_f64; k];
+        let mut y_sparse = vec![0.0_f64; k];
+        dense.matvec(&x, &mut y_dense);
+        sparse.matvec(&x, &mut y_sparse);
+        for i in 0..k {
+            assert!(
+                (y_dense[i] - y_sparse[i]).abs() < 1e-12,
+                "matvec mismatch at {i}: {} vs {}",
+                y_dense[i],
+                y_sparse[i]
+            );
+        }
+
+        // diagonal parity.
+        let mut diag_dense = vec![0.0_f64; k];
+        let mut diag_sparse = vec![0.0_f64; k];
+        dense.diagonal(&mut diag_dense);
+        sparse.diagonal(&mut diag_sparse);
+        for i in 0..k {
+            assert!(
+                (diag_dense[i] - diag_sparse[i]).abs() < 1e-12,
+                "diagonal mismatch at {i}: {} vs {}",
+                diag_dense[i],
+                diag_sparse[i]
+            );
+        }
+
+        // block parity: probe the per-atom β block ranges.
+        let offsets = [0..(2 * p), (2 * p)..k];
+        for id in 0..offsets.len() {
+            let b = offsets[id].end - offsets[id].start;
+            let mut blk_dense = Array2::<f64>::zeros((b, b));
+            let mut blk_sparse = Array2::<f64>::zeros((b, b));
+            dense.block(BetaBlockId(id), &offsets, &mut blk_dense);
+            sparse.block(BetaBlockId(id), &offsets, &mut blk_sparse);
+            for i in 0..b {
+                for j in 0..b {
+                    assert!(
+                        (blk_dense[[i, j]] - blk_sparse[[i, j]]).abs() < 1e-12,
+                        "block {id} mismatch at ({i},{j})"
+                    );
+                }
+            }
+        }
+    }
 
     /// Verify the arrow-Schur solve against a small dense reference.
     /// Build the joint bordered system as a single dense (K + N·d)² matrix,

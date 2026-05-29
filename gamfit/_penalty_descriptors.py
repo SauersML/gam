@@ -63,7 +63,7 @@ def _call_value_grad(
     # total_rho_count. These wrappers never manage rho themselves.
     latents_json = _latent_json(n, d, name=target_name)
     penalties_json = _penalty_json(descriptor)
-    value, grad, grad_rho = _rust_module().analytic_penalty_value_grad(
+    value, grad, grad_rho, _ = _rust_module().analytic_penalty_value_grad(
         latents_json, penalties_json, t_flat, None,
     )
     return float(value), np.asarray(grad, dtype=np.float64), np.asarray(grad_rho, dtype=np.float64)

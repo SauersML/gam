@@ -2668,6 +2668,13 @@ def gaussian_reml_fit_latent(
     Passing neither identifiability option is allowed for mechanical
     experiments, but the latent coordinate is gauge-unfixed and gradients in
     null directions are not meaningful.
+
+    ``fisher_w`` is the scalar-response Fisher-block override hook: a dense
+    ``(N, 1, 1)`` ``float64`` array whose single diagonal entry per row
+    replaces the analytic IRLS weight. This Gaussian decoder is single-output,
+    so only the ``(N, 1, 1)`` block is accepted here; the multi-output
+    ``(N, K, K)`` multinomial/binomial-multi override lives on
+    :func:`glm_reml_fit_latent`. ``None`` uses the analytic weight.
     """
     import numpy as np
 
@@ -2758,6 +2765,11 @@ def gaussian_reml_fit_latent_backward(
 
     ``basis_kind`` currently supports ``"duchon"`` and ``"tensor_bspline"``
     for this backward path.
+
+    ``fisher_w`` mirrors the forward hook on :func:`gaussian_reml_fit_latent`:
+    a single-output ``(N, 1, 1)`` ``float64`` per-row diagonal override of the
+    analytic IRLS weight (this backward companion is scalar-only). ``None``
+    uses the analytic weight.
     """
     import numpy as np
 
@@ -2836,10 +2848,38 @@ def glm_reml_fit_latent(
 
     ``family`` accepts ``"binomial-logit"``, ``"binomial-probit"``,
     ``"binomial-cloglog"``, ``"poisson-log"``, ``"tweedie-log"``,
-    ``"negbin-log"``, ``"beta-regression-logit"``, ``"gamma-log"``, and ``"gaussian-identity"``.
-    ``tweedie_p`` defaults to ``1.5``. ``fisher_w`` is an advanced internal
-    hook; this scalar-response entry point currently accepts blocks with shape
-    ``(N,1,1)``.
+    ``"negbin-log"``, ``"beta-regression-logit"``, ``"gamma-log"``,
+    ``"gaussian-identity"``, and the multi-output families
+    ``"multinomial-logit"`` (aliases ``"multinomial"`` / ``"softmax"`` /
+    ``"categorical-logit"``) and a multi-column binomial-logit fit (pass a
+    multi-column ``y`` with ``family="binomial-logit"``). ``tweedie_p``
+    defaults to ``1.5``.
+
+    ``fisher_w`` is an advanced research hook: a per-row Fisher-block override
+    that replaces the analytic curvature in the inner penalised Newton/PIRLS
+    step while the gradient and residual stay analytic. It is supplied as a
+    dense ``(N, K, K)`` ``float64`` array (one ``K × K`` block per observation)
+    and its meaning is fixed by the dispatched fitter:
+
+    * **Scalar single-output path** (single-column ``y`` with a non-multinomial
+      family): ``K = 1``, so the override is an ``(N, 1, 1)`` block honoured by
+      the scalar fitter — the per-row diagonal IRLS weight.
+    * **Multinomial** (``family="multinomial-*"`` / multi-column ``y`` routed to
+      softmax): the leading active ``(K-1) × (K-1)`` sub-block of each row
+      replaces the analytic softmax Fisher
+      ``H_{n,a,b} = p_a (δ_{ab} − p_b)`` over the reference-coded active
+      classes. The active block must be finite, symmetric, and have a
+      non-negative diagonal; a non-symmetric active block is rejected at the
+      boundary.
+    * **Binomial-multi** (multi-column ``y`` with ``family="binomial-logit"``):
+      the diagonal of each ``(N, K, K)`` block replaces the per-class analytic
+      Fisher ``H_{n,a,a} = μ_a (1 − μ_a)``. The ``K`` columns are fit
+      independently, so the off-diagonals must be zero (and finite,
+      non-negative on the diagonal); any non-zero off-diagonal is rejected at
+      the boundary.
+
+    When ``fisher_w`` is ``None`` the analytic Fisher is used and the fit is
+    bit-for-bit identical to omitting the hook.
     """
     import numpy as np
 
@@ -2933,6 +2973,12 @@ def glm_reml_fit_latent_backward(
 
     The ``basis_kind`` argument is accepted for signature symmetry, but this
     low-level GLM backward path currently implements only ``"duchon"``.
+
+    ``fisher_w`` is the scalar-response Fisher-block override: a dense
+    ``(N, 1, 1)`` ``float64`` per-row diagonal replacement of the analytic
+    IRLS weight. This backward path is scalar-only; the multi-output
+    ``(N, K, K)`` multinomial/binomial-multi override is exposed on the
+    forward :func:`glm_reml_fit_latent`. ``None`` uses the analytic weight.
     """
     import numpy as np
 

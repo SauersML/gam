@@ -45,3 +45,7 @@ pub use topology_selector::{
 /// (and integration tests) can construct and probe barrier objectives without
 /// reaching through the private `estimate::reml::unified` path.
 pub use estimate::reml::unified::BarrierConfig;
+/// Re-exported for the Python bindings (`gam-pyffi`), which must name the
+/// covariance-correction error type without reaching through the private
+/// `estimate::reml::unified` path.
+pub use estimate::reml::unified::CorrectedCovarianceError;

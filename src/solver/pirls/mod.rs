@@ -151,31 +151,6 @@ fn estimate_gamma_shape_from_eta(
     0.5 * (lo + hi)
 }
 
-#[inline]
-fn gamma_loglikelihood_with_shape(
-    y: ArrayView1<'_, f64>,
-    mu: &Array1<f64>,
-    priorweights: ArrayView1<'_, f64>,
-    shape: f64,
-) -> f64 {
-    const EPS: f64 = 1e-12;
-    use rayon::iter::{IntoParallelIterator, ParallelIterator};
-    let shape_c = shape.clamp(GAMMA_SHAPE_MIN, GAMMA_SHAPE_MAX);
-    let shape_ln = shape_c.ln();
-    let ln_gamma_shape = ln_gamma(shape_c);
-    (0..y.len())
-        .into_par_iter()
-        .map(|i| {
-            let yi_c = y[i].max(EPS);
-            let mui_c = mu[i].max(EPS);
-            priorweights[i]
-                * (shape_c * shape_ln - ln_gamma_shape - shape_c * mui_c.ln()
-                    + (shape_c - 1.0) * yi_c.ln()
-                    - shape_c * yi_c / mui_c)
-        })
-        .sum()
-}
-
 #[derive(Clone, Debug)]
 pub struct SparsePirlsDecision {
     pub path: PirlsLinearSolvePath,
@@ -6465,12 +6440,29 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
                 })
                 .sum()
         }
-        ResponseFamily::Gamma => gamma_loglikelihood_with_shape(
-            y,
-            mu,
-            priorweights,
-            likelihood.gamma_shape().unwrap_or(1.0),
-        ),
+        ResponseFamily::Gamma => {
+            // REML/LAML outer objective: use the scaled-deviance form
+            //   ℓ = −½ D(y, μ) = −Σ wᵢ · shape · d(yᵢ, μᵢ)
+            // (with `shape = 1/φ` folded into the deviance), exactly as the
+            // Tweedie branch above. This is the mgcv convention: the outer
+            // objective only needs the β-dependent part of the log-likelihood
+            // plus the penalty/log-determinant terms; the saturated-likelihood
+            // normalizing constants `shape·ln(shape) − lnΓ(shape) − shape − ln y`
+            // are independent of β (hence of the outer derivative under the
+            // fixed-dispersion handling Gamma is routed through) and are
+            // intentionally dropped.
+            //
+            // Using the full saturated form here is what made the Gamma outer
+            // cost non-finite: the per-iterate shape estimate saturates to
+            // `GAMMA_SHAPE_MAX = 1e12` whenever the working fit drives the unit
+            // deviance toward zero (the common high-dispersion / CV≈1 case),
+            // and `shape·ln(shape) − lnΓ(shape)` evaluated at 1e12 across n rows
+            // overflows. The scaled-deviance form carries no such term: the
+            // bounded unit deviance keeps the product `shape · d(y, μ)` finite
+            // even as the shape grows, so the seed screen no longer rejects
+            // every ρ candidate. See issue #359.
+            -0.5 * calculate_deviance(y, mu, likelihood, priorweights)
+        }
         ResponseFamily::RoystonParmar => f64::NAN,
     }
 }

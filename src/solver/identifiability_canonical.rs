@@ -495,30 +495,15 @@ pub fn canonicalize_for_identifiability(
             specs.iter().map(|s| s.design.ncols()).sum::<usize>(),
         );
 
-        // Also run the flat audit for comparison and log the discrepancy.
-        // This is pure instrumentation — it does NOT affect the routing or
-        // the fatal decision. We log it at debug level so the 23→20 rank drop
-        // is visible without being a false alarm.
-        if let Ok(flat_audit) = audit_identifiability(specs) {
-            let flat_rank: usize = flat_audit.blocks.iter().map(|b| b.effective_dim).sum();
-            let ca_rank: usize = audit_result.blocks.iter().map(|b| b.effective_dim).sum();
-            if flat_rank != ca_rank {
-                log::info!(
-                    "[CANON] rank discrepancy: flat_rank={flat_rank} channel_aware_rank={ca_rank}; \
-                     the flat audit would have {action} this fit; the channel-aware verdict is used",
-                    action = if flat_audit.fatal {
-                        "refused"
-                    } else {
-                        "accepted (but with drops)"
-                    },
-                );
-            } else {
-                log::debug!(
-                    "[CANON] flat_rank == channel_aware_rank = {flat_rank} (no discrepancy)",
-                );
-            }
-        }
-
+        // NOTE: the flat audit (`audit_identifiability`) must NOT be run on
+        // multi-output blocks. It re-materialises each block's effective
+        // Jacobian — which the channel-aware path has already proven is
+        // `(n·k)`-row — and then the surrounding reduced-design / post-T
+        // reconstruction conflates those `(n·k)`-row operators with the
+        // `n`-row placeholder designs, broadcasting `(n·k, p)` into `(n, p)`
+        // and panicking inside ndarray. The channel-aware `audit_result` is
+        // the authoritative verdict (consumed below); no comparison audit is
+        // sound or needed here.
         audit_result
     } else {
         let audit_result = audit_identifiability(specs).map_err(|reason| {

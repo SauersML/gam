@@ -427,6 +427,16 @@ pub fn build_termspec(
                     inner_options.remove("bs");
                     inner_options.remove("type");
                 }
+                // Pop the shape constraint before `build_smooth_basis` runs so
+                // it never reaches the per-kind `validate_known_options`
+                // allow-lists (the constraint is a property of the smooth term,
+                // not of any one basis kind). Basis-incompatible requests still
+                // fail loudly downstream via `shape_supports_basis`.
+                let shape = match inner_options.remove("shape") {
+                    None => ShapeConstraint::None,
+                    Some(raw) => crate::terms::smooth::parse_shape_constraint(&raw)
+                        .map_err(TermBuilderError::invalid_option)?,
+                };
                 let inner_basis = build_smooth_basis(
                     *kind,
                     &smooth_vars,
@@ -464,7 +474,7 @@ pub fn build_termspec(
                             by_col,
                             levels,
                         },
-                        shape: ShapeConstraint::None,
+                        shape,
                         joint_null_rotation: None,
                     });
                 } else if let Some(by_name) = by_name {
@@ -499,7 +509,7 @@ pub fn build_termspec(
                                             label: level_label,
                                         },
                                     },
-                                    shape: ShapeConstraint::None,
+                                    shape,
                                     joint_null_rotation: None,
                                 });
                             }
@@ -513,7 +523,7 @@ pub fn build_termspec(
                                     kind: BySmoothKind::Numeric,
                                     by: ByVariableSpec::Numeric,
                                 },
-                                shape: ShapeConstraint::None,
+                                shape,
                                 joint_null_rotation: None,
                             });
                         }
@@ -522,7 +532,7 @@ pub fn build_termspec(
                     smooth_terms.push(SmoothTermSpec {
                         name: label.clone(),
                         basis: inner_basis,
-                        shape: ShapeConstraint::None,
+                        shape,
                         joint_null_rotation: None,
                     });
                 }
@@ -1119,10 +1129,13 @@ pub fn build_smooth_basis(
             })
             .unwrap_or(false);
     // Read the raw user-facing smooth selector (`type=`/`bs=`) and collapse
-    // mgcv-compatible aliases (`tp`, `gp`, `cr`, `cs`, `ps`, `sos`, ...) to
-    // their gamfit canonical names via the single source of truth in
-    // `canonicalize_smooth_type`. The match arms below see only canonical
-    // names — adding the next alias never requires touching the dispatch.
+    // the mgcv-compatible aliases that have an exact gamfit equivalent (`tp` →
+    // `tps`, `gp` → `matern`) to their canonical names via the single source
+    // of truth in `canonicalize_smooth_type`. Aliases without an exact
+    // semantic match (e.g. `cs`, `ad`) are intentionally left unmapped so they
+    // reach the unsupported-type diagnostic. The match arms below see only
+    // canonical names — adding the next alias never requires touching the
+    // dispatch.
     let type_opt = options
         .get("type")
         .or_else(|| options.get("bs"))
@@ -2711,6 +2724,51 @@ mod tests {
                 num_basis: 8
             } if *data_range == (0.0, std::f64::consts::TAU)
         ));
+    }
+
+    #[test]
+    fn formula_shape_constraint_round_trips_and_rejects_bogus() {
+        let ds = continuous_dataset(
+            &["y", "x"],
+            (0..32)
+                .map(|i| {
+                    let x = i as f64 / 31.0;
+                    vec![x * x, x]
+                })
+                .collect(),
+        );
+        let col_map = ds.column_map();
+
+        let parsed = parse_formula("y ~ s(x, shape=monotone_increasing)")
+            .expect("parse monotone smooth");
+        let mut notes = Vec::new();
+        let terms = build_termspec(
+            &parsed.terms,
+            &ds,
+            &col_map,
+            &mut notes,
+            &crate::resource::ResourcePolicy::default_library(),
+        )
+        .expect("monotone smooth should build");
+        assert_eq!(
+            terms.smooth_terms[0].shape,
+            ShapeConstraint::MonotoneIncreasing
+        );
+
+        let parsed_bad = parse_formula("y ~ s(x, shape=bogus)").expect("parse bogus shape");
+        let mut notes_bad = Vec::new();
+        let err = build_termspec(
+            &parsed_bad.terms,
+            &ds,
+            &col_map,
+            &mut notes_bad,
+            &crate::resource::ResourcePolicy::default_library(),
+        )
+        .expect_err("bogus shape must error");
+        assert!(
+            format!("{err:?}").contains("unknown shape constraint"),
+            "got: {err:?}"
+        );
     }
 
     #[test]

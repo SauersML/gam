@@ -1,8 +1,8 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::geometry::manifold::{
-    GEOMETRY_EPS, GeometryResult, RiemannianManifold, check_len, dot, flatten, from_flat, identity,
-    inverse, jacobi_symmetric, qr_thin, zero_christoffel,
+    GEOMETRY_EPS, GeometryError, GeometryResult, RiemannianManifold, check_len, dot, flatten,
+    from_flat, identity, inverse, jacobi_symmetric, qr_thin, zero_christoffel,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,5 +208,23 @@ impl RiemannianManifold for GrassmannManifold {
             self.k,
         )?;
         Ok(flatten(&self.orthonormalize(&(y + tangent))))
+    }
+
+    fn exp_map_vjp(
+        &self,
+        point: ArrayView1<'_, f64>,
+        tangent_vec: ArrayView1<'_, f64>,
+        grad_output: ArrayView1<'_, f64>,
+    ) -> GeometryResult<(Array1<f64>, Array1<f64>)> {
+        let m = self.ambient_dim();
+        check_len("Grassmann exp_map_vjp point", point.len(), m)?;
+        check_len("Grassmann exp_map_vjp tangent", tangent_vec.len(), m)?;
+        check_len("Grassmann exp_map_vjp grad", grad_output.len(), m)?;
+        // The Grassmann geodesic VJP requires the SVD-Jacobi-field
+        // differential; no closed form is wired up. Refuse rather than
+        // inherit the flat identity default, which would be silently wrong.
+        Err(GeometryError::Unsupported(
+            "Grassmann exp_map_vjp: no analytic backward implemented",
+        ))
     }
 }
