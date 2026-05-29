@@ -9357,10 +9357,9 @@ fn build_sae_basis_evaluators(
 /// radial+polynomial Duchon and monomial Euclidean evaluators refresh from the
 /// auto path that threads their metadata). This precomputed-basis entry point
 /// carries no Duchon centers, so a Duchon/precomputed atom here errors instead
-/// of freezing the seed snapshot. The inner loop terminates early when the
-/// relative change in the penalized objective drops below `1e-6`.
-/// `lambda_grid` evaluates candidate smoothness lambdas in Rust and the best
-/// evidence-proxy wins.
+/// of freezing the seed snapshot. The smoothing / sparsity / ARD strengths
+/// (ρ) are selected automatically by the generic outer cascade driving the
+/// term's REML criterion — no per-call λ-grid.
 #[pyfunction(signature = (
     z,
     atom_basis,
@@ -9378,7 +9377,6 @@ fn build_sae_basis_evaluators(
     assignment_kind,
     sparsity_strength = 1.0,
     smoothness = 1.0,
-    lambda_grid = None,
     max_iter = 12,
     learning_rate = 1.0,
     ridge_ext_coord = 1.0e-6,
@@ -9405,7 +9403,6 @@ fn sae_manifold_fit<'py>(
     assignment_kind: String,
     sparsity_strength: f64,
     smoothness: f64,
-    lambda_grid: Option<Vec<f64>>,
     max_iter: usize,
     learning_rate: f64,
     ridge_ext_coord: f64,
@@ -9440,7 +9437,6 @@ fn sae_manifold_fit<'py>(
         assignment_kind,
         sparsity_strength,
         smoothness,
-        lambda_grid,
         max_iter,
         learning_rate,
         ridge_ext_coord,
@@ -9470,7 +9466,6 @@ fn sae_manifold_fit_inner<'py>(
     assignment_kind: String,
     sparsity_strength: f64,
     smoothness: f64,
-    lambda_grid: Option<Vec<f64>>,
     max_iter: usize,
     learning_rate: f64,
     ridge_ext_coord: f64,
@@ -9580,24 +9575,6 @@ fn sae_manifold_fit_inner<'py>(
         SPARSITY_DISABLED_FLOOR
     } else {
         sparsity_strength
-    };
-    let lambda_candidates = match lambda_grid {
-        Some(grid) => {
-            if grid.is_empty() {
-                return Err(py_value_error(
-                    "lambda_grid must contain at least one candidate".to_string(),
-                ));
-            }
-            for (idx, value) in grid.iter().copied().enumerate() {
-                if !value.is_finite() || value <= 0.0 {
-                    return Err(py_value_error(format!(
-                        "lambda_grid[{idx}] must be finite and positive; got {value}"
-                    )));
-                }
-            }
-            grid
-        }
-        None => vec![smoothness],
     };
 
     let basis_values_shape = basis_values.shape().to_vec();
@@ -9726,118 +9703,44 @@ fn sae_manifold_fit_inner<'py>(
     }
 
     let log_ard: Vec<Array1<f64>> = atom_dim.iter().map(|&d| Array1::<f64>::zeros(d)).collect();
-    // Auto-derive the streaming dispatch from the problem size and the
-    // hardware memory budget — no new kwarg. The full-batch arrow-Schur path
-    // retains the `(N × M_total)` basis, `(N × M_total × d)` jacobian, and
-    // `(N × K)` logit buffers; at LLM scale (hundreds of millions of rows)
-    // these blow past memory. When `n_obs · (M_total + K) · 8 bytes` exceeds an
-    // in-core threshold derived from the GPU memory budget (or, on CPU-only
-    // hosts, a conservative host-RAM fraction), the fit streams in row chunks
-    // sized to keep one chunk's buffers inside the L2-cache / budget window.
-    let (use_streaming, stream_chunk_size) =
-        sae_streaming_plan(n_obs, total_basis, k_atoms, max_dim);
-    let mut best_term = None;
-    let mut best_rho = None;
-    let mut best_loss = None;
-    let mut best_score = f64::NEG_INFINITY;
-    for lambda_smooth in lambda_candidates {
-        let mut candidate_term = base_term.clone();
-        let mut candidate_rho =
-            SaeManifoldRho::new(sparsity_strength.ln(), lambda_smooth.ln(), log_ard.clone());
-        let candidate_loss = if use_streaming {
-            // Streaming / minibatch fit: each chunk re-seeds its coordinates
-            // from the SAE PCA seed restricted to the chunk's `Z` rows and
-            // reuses the chunk's gating-logit seed. The decoder coefficients
-            // (and ARD ρ) are the only state refined across chunks; the chunk's
-            // `(logits, coords, basis)` are recomputed on demand and discarded.
-            let basis_kinds_chunk = basis_kinds.clone();
-            let atom_dim_chunk = atom_dim.clone();
-            let chunk_init =
-                |start: usize,
-                 end: usize|
-                 -> Result<(Array2<f64>, Vec<Array2<f64>>, Array2<f64>), String> {
-                    let z_chunk = z_view.slice(s![start..end, ..]).to_owned();
-                    let logits_chunk = initial_logits.slice(s![start..end, ..]).to_owned();
-                    let seed = sae_pca_seed_initial_coords(
-                        z_chunk.view(),
-                        &basis_kinds_chunk,
-                        &atom_dim_chunk,
-                    )?;
-                    let mut coords = Vec::with_capacity(atom_dim_chunk.len());
-                    for (atom_idx, &d) in atom_dim_chunk.iter().enumerate() {
-                        coords.push(seed.slice(s![atom_idx, .., 0..d]).to_owned());
-                    }
-                    Ok((logits_chunk, coords, z_chunk))
-                };
-            candidate_term
-                .run_joint_fit_arrow_schur_streaming(
-                    n_obs,
-                    stream_chunk_size,
-                    &mut candidate_rho,
-                    Some(&registry),
-                    max_iter,
-                    learning_rate,
-                    ridge_ext_coord,
-                    ridge_beta,
-                    chunk_init,
-                )
-                .map_err(py_value_error)?
-        } else {
-            let mut candidate_loss = candidate_term
-                .run_joint_fit_arrow_schur(
-                    z_view,
-                    &mut candidate_rho,
-                    Some(&registry),
-                    1,
-                    learning_rate,
-                    ridge_ext_coord,
-                    ridge_beta,
-                )
-                .map_err(py_value_error)?;
-            let mut prev_total = candidate_loss.total();
-            for _ in 1..max_iter {
-                let step_loss = candidate_term
-                    .run_joint_fit_arrow_schur(
-                        z_view,
-                        &mut candidate_rho,
-                        Some(&registry),
-                        1,
-                        learning_rate,
-                        ridge_ext_coord,
-                        ridge_beta,
-                    )
-                    .map_err(py_value_error)?;
-                let new_total = step_loss.total();
-                candidate_loss = step_loss;
-                if !new_total.is_finite() {
-                    break;
-                }
-                let denom = prev_total.abs().max(1.0e-12);
-                let rel_change = (prev_total - new_total).abs() / denom;
-                prev_total = new_total;
-                if rel_change < 1.0e-6 {
-                    break;
-                }
-            }
-            candidate_loss
-        };
-        let candidate_score = candidate_loss.evidence_proxy();
-        if candidate_score > best_score {
-            best_score = candidate_score;
-            best_term = Some(candidate_term);
-            best_rho = Some(candidate_rho);
-            best_loss = Some(candidate_loss);
-        }
-    }
-    let term = best_term.ok_or_else(|| {
-        py_value_error("lambda_grid must contain at least one candidate".to_string())
-    })?;
-    let rho = best_rho.ok_or_else(|| {
-        py_value_error("lambda_grid must contain at least one candidate".to_string())
-    })?;
-    let loss = best_loss.ok_or_else(|| {
-        py_value_error("lambda_grid must contain at least one candidate".to_string())
-    })?;
+    // Drive ρ (sparsity / smoothing λ's + per-atom ARD precisions) through the
+    // one generic outer cascade — the same engine the GAM REML path uses
+    // (`OuterProblem::run` → `plan()` → derivative-free / FD outer strategy).
+    // `SaeManifoldOuterObjective::eval_cost` evaluates the term's true REML
+    // criterion at each candidate ρ via an inner Arrow-Schur joint fit; the
+    // engine selects ρ. No hand-rolled λ-grid, no manual `evidence_proxy` max:
+    // the criterion + cascade subsume both, so smoothness/sparsity selection is
+    // automatic (magic by default — no per-call grid kwarg).
+    //
+    // `init_rho` packs `[log_lambda_sparse, log_lambda_smooth, per-atom ARD]`;
+    // its `to_flat()` defines the outer ρ vector the engine optimizes, and its
+    // length is the objective's declared `n_params`.
+    let init_rho = SaeManifoldRho::new(sparsity_strength.ln(), smoothness.ln(), log_ard);
+    let init_rho_flat = init_rho.to_flat();
+    let n_params = init_rho_flat.len();
+    // TODO(sae-streaming-objective): LLM-scale fits (hundreds of millions of
+    // rows) want a minibatch REML objective so the `(N × M_total)` basis /
+    // `(N × M_total × d)` jacobian / `(N × K)` logit buffers never materialize
+    // in full. v1 routes every problem size through the full-batch objective on
+    // the owned `target`; a follow-up replaces `target` with a chunked
+    // accumulator inside `SaeManifoldOuterObjective`. `sae_streaming_plan`
+    // remains a standalone diagnostic pyfunction for that work.
+    let mut objective = gam::terms::sae_manifold::SaeManifoldOuterObjective::new(
+        base_term,
+        z_view.to_owned(),
+        Some(registry),
+        init_rho,
+        max_iter,
+        learning_rate,
+        ridge_ext_coord,
+        ridge_beta,
+    );
+    let problem = gam::solver::outer_strategy::OuterProblem::new(n_params)
+        .with_initial_rho(init_rho_flat);
+    problem
+        .run(&mut objective, "SAE manifold")
+        .map_err(estimation_error_to_pyerr)?;
+    let (term, rho, loss) = objective.into_fitted();
 
     let mut assignments = term.assignment.assignments();
     let mut fitted = term.fitted();
@@ -9990,7 +9893,6 @@ fn sae_manifold_fit_inner<'py>(
     learnable_alpha,
     sparsity_strength = 1.0,
     smoothness = 1.0,
-    lambda_grid = None,
     max_iter = 12,
     learning_rate = 1.0,
     ridge_ext_coord = 1.0e-6,
@@ -10015,7 +9917,6 @@ fn sae_manifold_fit_ibp<'py>(
     learnable_alpha: bool,
     sparsity_strength: f64,
     smoothness: f64,
-    lambda_grid: Option<Vec<f64>>,
     max_iter: usize,
     learning_rate: f64,
     ridge_ext_coord: f64,
@@ -10041,7 +9942,6 @@ fn sae_manifold_fit_ibp<'py>(
         "ibp_map".to_string(),
         sparsity_strength,
         smoothness,
-        lambda_grid,
         max_iter,
         learning_rate,
         ridge_ext_coord,
@@ -11229,7 +11129,6 @@ fn sae_build_atom_plans(
     assignment_kind,
     sparsity_strength = 1.0,
     smoothness = 1.0,
-    lambda_grid = None,
     max_iter = 50,
     learning_rate = 0.05,
     ridge_ext_coord = 1.0e-6,
@@ -11252,7 +11151,6 @@ fn sae_manifold_fit_minimal<'py>(
     assignment_kind: String,
     sparsity_strength: f64,
     smoothness: f64,
-    lambda_grid: Option<Vec<f64>>,
     max_iter: usize,
     learning_rate: f64,
     ridge_ext_coord: f64,
@@ -11456,7 +11354,6 @@ fn sae_manifold_fit_minimal<'py>(
         assignment_kind,
         sparsity_strength,
         smoothness,
-        lambda_grid,
         max_iter,
         learning_rate,
         ridge_ext_coord,
