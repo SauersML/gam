@@ -4307,7 +4307,31 @@ fn prepare_survival_location_scale_model(
             spec.time_block.initial_log_lambdas.clone(),
         )?,
         initial_beta: time_prepared.initial_beta.clone(),
-        gauge_priority: 100,
+        // Canonical-gauge ownership for the location-scale joint design.
+        //
+        // The three coupled blocks (`time_transform`, `threshold`,
+        // `log_sigma`) each contribute a constant / intercept-like direction
+        // into the flat n-row joint design the pre-fit identifiability audit
+        // RRQRs (`solver::identifiability_audit::audit_identifiability`).
+        // Those constant directions are mutually aliased (e.g. for a single
+        // linear covariate the `time_transform[0] ~ threshold[0]` overlap is
+        // ≈ 0.98), so the joint design is genuinely rank-deficient by exactly
+        // the number of surplus constants. The audit can only *attribute and
+        // drop* a redundant joint column to a strictly lower-priority block;
+        // with the previous uniform `gauge_priority: 100` the surplus
+        // direction was un-attributable and the audit escalated to
+        // `fatal = true`, refusing every well-posed fit (issue #366).
+        //
+        // Assigning strictly descending priorities makes the surplus
+        // constant deterministically attributable: `time_transform` owns the
+        // shared constant (it carries the structural monotone baseline that
+        // anchors the whole location-scale parameterisation), and any aliased
+        // column is dropped from the lower-priority `threshold` / `log_sigma`
+        // / `linkwiggle` blocks. This is the exact gauge-ownership contract
+        // documented by `identifiability_canonical::
+        // canonical_five_block_gauge_ownership_succeeds_with_attribution` and
+        // already used by survival marginal-slope (time=200 highest).
+        gauge_priority: 200,
         jacobian_callback: None,
         stacked_design: Some(time_solver_design),
         stacked_offset: Some(time_stacked_offset),
@@ -4397,7 +4421,11 @@ fn prepare_survival_location_scale_model(
         nullspace_dims: threshold_nullspace_dims.clone(),
         initial_log_lambdas: threshold_initial_log_lambdas,
         initial_beta: threshold_initial_beta,
-        gauge_priority: 100,
+        // Lower than `time_transform` (200): the location-channel covariate
+        // block yields the shared constant direction to the time baseline.
+        // See the canonical-gauge ownership note on the `time_transform`
+        // spec above (issue #366).
+        gauge_priority: 150,
         jacobian_callback: None,
         stacked_design: threshold_stacked_design,
         stacked_offset: threshold_stacked_offset,
@@ -4510,7 +4538,11 @@ fn prepare_survival_location_scale_model(
         nullspace_dims: log_sigma_nullspace_dims.clone(),
         initial_log_lambdas: log_sigma_initial_log_lambdas,
         initial_beta: log_sigma_initial_beta,
-        gauge_priority: 100,
+        // Below `time_transform` (200) and `threshold` (150): the scale
+        // channel yields the shared constant direction to the location
+        // blocks. See the canonical-gauge ownership note on the
+        // `time_transform` spec above (issue #366).
+        gauge_priority: 120,
         jacobian_callback: None,
         stacked_design: log_sigma_stacked_design,
         stacked_offset: log_sigma_stacked_offset,
@@ -4542,7 +4574,11 @@ fn prepare_survival_location_scale_model(
             nullspace_dims: w.nullspace_dims.clone(),
             initial_log_lambdas: initial_log_lambdas(&w.penalties, w.initial_log_lambdas.clone())?,
             initial_beta: w.initial_beta.clone(),
-            gauge_priority: 100,
+            // Lowest of the four location-scale blocks: the optional
+            // link-wiggle correction yields the shared constant direction to
+            // every structural block above it. See the canonical-gauge
+            // ownership note on the `time_transform` spec above (issue #366).
+            gauge_priority: 80,
             jacobian_callback: None,
             stacked_design: None,
             stacked_offset: None,
