@@ -1386,7 +1386,8 @@ pub fn pull_back_blockwise_penalty_through_block_v(
     }
     let mut embedded = Array2::<f64>::zeros((raw_p, raw_p));
     if block_p > 0 {
-        let mut dst = embedded.slice_mut(ndarray::s![embed_start..embed_end, embed_start..embed_end]);
+        let mut dst =
+            embedded.slice_mut(ndarray::s![embed_start..embed_end, embed_start..embed_end]);
         for i in 0..block_p {
             for j in 0..block_p {
                 dst[[i, j]] = pen.local[[i, j]];
@@ -2873,19 +2874,22 @@ mod tests {
         // Time raw 3 → compiled 3 (block 0: no anchor, V pure, R=None).
         // Marginal raw 3 → compiled 2 (a real drop, with nonzero R against time).
         // Logslope raw 2 → compiled 2 (nonzero R against time+marginal).
-        let v_time = Array2::<f64>::from_shape_fn((3, 3), |(i, j)| {
-            if i == j { 1.0 } else { 0.1 * ((i + j) as f64) }
-        });
+        let v_time =
+            Array2::<f64>::from_shape_fn(
+                (3, 3),
+                |(i, j)| {
+                    if i == j { 1.0 } else { 0.1 * ((i + j) as f64) }
+                },
+            );
         let v_marg = Array2::<f64>::from_shape_fn((3, 2), |(i, j)| {
             0.5 + 0.3 * (i as f64) - 0.2 * (j as f64)
         });
-        let v_log = Array2::<f64>::from_shape_fn((2, 2), |(i, j)| {
-            if i == j { 1.2 } else { 0.4 }
-        });
+        let v_log = Array2::<f64>::from_shape_fn((2, 2), |(i, j)| if i == j { 1.2 } else { 0.4 });
         // R_marg: rows = time raw width 3, cols = marginal compiled width 2.
         let r_marg = Array2::<f64>::from_shape_fn((3, 2), |(i, j)| 0.7 - 0.1 * ((i + j) as f64));
         // R_log: rows = time+marg raw width 5, cols = logslope compiled width 2.
-        let r_log = Array2::<f64>::from_shape_fn((5, 2), |(i, j)| 0.3 + 0.05 * ((i * 2 + j) as f64));
+        let r_log =
+            Array2::<f64>::from_shape_fn((5, 2), |(i, j)| 0.3 + 0.05 * ((i * 2 + j) as f64));
 
         let t = build_full_t_matrix(
             &[v_time.clone(), v_marg.clone(), v_log.clone()],
@@ -2900,11 +2904,9 @@ mod tests {
         };
 
         // Raw designs (dense, n rows).
-        let raw_time_entry =
-            DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::from_shape_fn(
-                (n, 3),
-                |(i, j)| 1.0 + (i as f64) * 0.1 + (j as f64),
-            )));
+        let raw_time_entry = DesignMatrix::Dense(DenseDesignMatrix::from(
+            Array2::<f64>::from_shape_fn((n, 3), |(i, j)| 1.0 + (i as f64) * 0.1 + (j as f64)),
+        ));
         let raw_time_exit = raw_time_entry.clone();
         let raw_time_deriv = raw_time_entry.clone();
         let raw_marg = DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::from_shape_fn(
@@ -2917,16 +2919,17 @@ mod tests {
         )));
 
         // Block-local penalties (col_range relative to each block's first col).
-        let s_time = Array2::<f64>::from_shape_fn(
-            (3, 3),
-            |(i, j)| if i == j { (i + 2) as f64 } else { 0.3 },
-        );
-        let s_marg = Array2::<f64>::from_shape_fn(
-            (3, 3),
-            |(i, j)| if i == j { 1.5 + i as f64 } else { 0.2 },
-        );
-        let s_log =
-            Array2::<f64>::from_shape_fn((2, 2), |(i, j)| if i == j { 2.0 } else { 0.5 });
+        let s_time =
+            Array2::<f64>::from_shape_fn(
+                (3, 3),
+                |(i, j)| if i == j { (i + 2) as f64 } else { 0.3 },
+            );
+        let s_marg =
+            Array2::<f64>::from_shape_fn(
+                (3, 3),
+                |(i, j)| if i == j { 1.5 + i as f64 } else { 0.2 },
+            );
+        let s_log = Array2::<f64>::from_shape_fn((2, 2), |(i, j)| if i == j { 2.0 } else { 0.5 });
         let time_pens = vec![BlockwisePenalty::new(0..3, s_time.clone())];
         let marg_pens = vec![BlockwisePenalty::new(0..3, s_marg.clone())];
         let log_pens = vec![BlockwisePenalty::new(0..2, s_log.clone())];

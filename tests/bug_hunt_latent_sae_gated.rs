@@ -5,7 +5,7 @@ use gam::terms::sae_manifold::{
     AssignmentMode, GumbelTemperatureSchedule, SaeAssignment, SaeManifoldAtom,
     SaeManifoldOuterObjective, SaeManifoldRho, SaeManifoldTerm, ScheduleKind,
 };
-use ndarray::{Array1, Array2, Array3, array};
+use ndarray::{Array2, Array3, array};
 
 #[test]
 fn latent_coord_assignment_decode_roundtrip_matches_dictionary_atom() {
@@ -154,7 +154,12 @@ fn reml_criterion_keeps_alpha_finite_on_collapsing_axis() {
     // ½log|H| Laplace term (rising in α) balances the −½n·logα data/prior term
     // (falling in α). Sweep log α on the collapsing axis and assert the argmin
     // is finite and interior — no clamp needed.
-    let coords = array![[1.0, 1.0e-6], [3.0, -1.0e-6], [-2.0, 1.0e-6], [0.5, -1.0e-6]];
+    let coords = array![
+        [1.0, 1.0e-6],
+        [3.0, -1.0e-6],
+        [-2.0, 1.0e-6],
+        [0.5, -1.0e-6]
+    ];
     let target = array![[0.4], [1.1], [-0.7], [0.2]];
     let mut term = build_collapse_probe_term(coords);
 
@@ -166,7 +171,10 @@ fn reml_criterion_keeps_alpha_finite_on_collapsing_axis() {
         let (v, _loss) = term
             .reml_criterion(target.view(), &rho, None, 3, 1.0, 1.0e-6, 1.0e-6)
             .expect("criterion should evaluate");
-        assert!(v.is_finite(), "criterion must be finite at log α={la}; got {v}");
+        assert!(
+            v.is_finite(),
+            "criterion must be finite at log α={la}; got {v}"
+        );
         if v < best.0 {
             best = (v, la);
         }
@@ -225,7 +233,10 @@ fn reml_criterion_has_interior_minimum_in_log_lambda_smooth() {
         let (v, _loss) = term
             .reml_criterion(target.view(), &rho, None, 3, 1.0, 1.0e-6, 1.0e-6)
             .expect("criterion should evaluate");
-        assert!(v.is_finite(), "criterion must be finite at log λ={ll}; got {v}");
+        assert!(
+            v.is_finite(),
+            "criterion must be finite at log λ={ll}; got {v}"
+        );
         if v < best.0 {
             best = (v, ll);
         }
@@ -247,7 +258,12 @@ fn efs_ard_fixed_point_recovers_cost_criterion_argmin_and_stays_finite() {
     // Fellner-Schall/Mackay fixed point α_new = n/(‖t‖²+tr(H⁻¹)) must:
     //   (a) converge to a FINITE α on the collapsing axis (no clamp), and
     //   (b) agree with the α that minimizes the v1 cost criterion.
-    let coords = array![[1.0, 1.0e-5], [3.0, -1.0e-5], [-2.0, 1.0e-5], [0.5, -1.0e-5]];
+    let coords = array![
+        [1.0, 1.0e-5],
+        [3.0, -1.0e-5],
+        [-2.0, 1.0e-5],
+        [0.5, -1.0e-5]
+    ];
     let target = array![[0.4], [1.1], [-0.7], [0.2]];
     let term = build_collapse_probe_term(coords);
 
@@ -272,7 +288,10 @@ fn efs_ard_fixed_point_recovers_cost_criterion_argmin_and_stays_finite() {
         assert_eq!(efs.steps.len(), rho_flat.len());
         let mut step_norm = 0.0_f64;
         for (i, s) in efs.steps.iter().enumerate() {
-            assert!(s.is_finite(), "EFS step[{i}]={s} must be finite (no α blow-up)");
+            assert!(
+                s.is_finite(),
+                "EFS step[{i}]={s} must be finite (no α blow-up)"
+            );
             rho_flat[i] += s;
             step_norm += s * s;
         }

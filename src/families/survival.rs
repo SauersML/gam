@@ -770,10 +770,7 @@ pub fn pooled_any_event_indicator(event_codes: ArrayView1<'_, u8>) -> Array1<u8>
 /// cause-specific hazard likelihood. Like [`pooled_any_event_indicator`], this
 /// yields a binary contract that satisfies the single-hazard `event_target` guard
 /// — the raw multi-cause labels are never handed to a binary engine.
-pub fn cause_specific_event_indicator(
-    event_codes: ArrayView1<'_, u8>,
-    cause: usize,
-) -> Array1<u8> {
+pub fn cause_specific_event_indicator(event_codes: ArrayView1<'_, u8>, cause: usize) -> Array1<u8> {
     let cause_code = cause as u8;
     event_codes.mapv(|observed| u8::from(observed == cause_code))
 }

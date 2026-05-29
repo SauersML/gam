@@ -58,7 +58,13 @@ fn t0_symmetric_under_reflection_of_the_interval() {
     // T_0(a, b) = T_0(−b, −a): the standard normal is even, so reflecting the
     // window about 0 must leave the integral unchanged to f64. This pins both
     // tails to the *same* value and would fail loudly if only one tail were fixed.
-    let pairs = [(2.0, 4.0), (6.0, 8.0), (8.0, 9.0), (10.0, 12.0), (11.0, 13.0)];
+    let pairs = [
+        (2.0, 4.0),
+        (6.0, 8.0),
+        (8.0, 9.0),
+        (10.0, 12.0),
+        (11.0, 13.0),
+    ];
     for &(a, b) in &pairs {
         let pos = affine_anchor_moment_vector(0.0, 0.0, a, b, 2)[0];
         let neg = affine_anchor_moment_vector(0.0, 0.0, -b, -a, 2)[0];

@@ -9739,8 +9739,8 @@ fn sae_manifold_fit_inner<'py>(
         ridge_ext_coord,
         ridge_beta,
     );
-    let problem = gam::solver::outer_strategy::OuterProblem::new(n_params)
-        .with_initial_rho(init_rho_flat);
+    let problem =
+        gam::solver::outer_strategy::OuterProblem::new(n_params).with_initial_rho(init_rho_flat);
     problem
         .run(&mut objective, "SAE manifold")
         .map_err(estimation_error_to_pyerr)?;
@@ -13284,7 +13284,9 @@ fn gaussian_reml_fit_formula_table_impl(
     }
     let d = y.ncols();
     if d == 0 {
-        return Err("shared-tangent Gaussian REML requires at least one tangent output".to_string());
+        return Err(
+            "shared-tangent Gaussian REML requires at least one tangent output".to_string(),
+        );
     }
     if k == 0 {
         return Err(
@@ -13303,7 +13305,9 @@ fn gaussian_reml_fit_formula_table_impl(
         ));
     }
     if weights.iter().any(|v| !v.is_finite() || *v < 0.0) {
-        return Err("shared-tangent Gaussian REML weights must be finite and non-negative".to_string());
+        return Err(
+            "shared-tangent Gaussian REML weights must be finite and non-negative".to_string(),
+        );
     }
     if let Some(w) = fisher_rao_w.as_ref() {
         validate_dense_fisher_w(n, d, *w)?;
@@ -18869,7 +18873,11 @@ fn equivariant_gauge_companion_loss<'py>(
     })
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "EuclideanManifold", skip_from_py_object)]
+#[pyclass(
+    module = "gam_pyffi._rust",
+    name = "EuclideanManifold",
+    skip_from_py_object
+)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct EuclideanManifold {
     #[pyo3(get, set)]
@@ -18899,7 +18907,11 @@ impl EuclideanManifold {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "CircleManifold", skip_from_py_object)]
+#[pyclass(
+    module = "gam_pyffi._rust",
+    name = "CircleManifold",
+    skip_from_py_object
+)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CircleManifold {}
 
@@ -18925,7 +18937,11 @@ impl CircleManifold {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "SphereManifold", skip_from_py_object)]
+#[pyclass(
+    module = "gam_pyffi._rust",
+    name = "SphereManifold",
+    skip_from_py_object
+)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SphereManifold {
     #[pyo3(get, set)]
@@ -18955,7 +18971,11 @@ impl SphereManifold {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "TorusManifold", skip_from_py_object)]
+#[pyclass(
+    module = "gam_pyffi._rust",
+    name = "TorusManifold",
+    skip_from_py_object
+)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TorusManifold {
     #[pyo3(get, set)]
@@ -18985,7 +19005,11 @@ impl TorusManifold {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "GrassmannManifold", skip_from_py_object)]
+#[pyclass(
+    module = "gam_pyffi._rust",
+    name = "GrassmannManifold",
+    skip_from_py_object
+)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct GrassmannManifold {
     #[pyo3(get, set)]
@@ -19018,7 +19042,11 @@ impl GrassmannManifold {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "StiefelManifold", skip_from_py_object)]
+#[pyclass(
+    module = "gam_pyffi._rust",
+    name = "StiefelManifold",
+    skip_from_py_object
+)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StiefelManifold {
     #[pyo3(get, set)]
@@ -28383,8 +28411,8 @@ fn fit_config_training_table_kind(config_json: Option<&str>) -> Result<Option<St
         Some(raw) if !raw.trim().is_empty() => raw,
         _ => return Ok(None),
     };
-    let value: serde_json::Value = serde_json::from_str(raw)
-        .map_err(|err| format!("invalid fit config json: {err}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|err| format!("invalid fit config json: {err}"))?;
     match value.get("training_table_kind") {
         None | Some(serde_json::Value::Null) => Ok(None),
         Some(serde_json::Value::String(kind)) => Ok(Some(kind.clone())),
@@ -29763,8 +29791,7 @@ mod batch_tests {
             "std_error": [0.2],
             "mean_lower": [0.1]
         }"#;
-        let ordered_json =
-            ordered_prediction_columns(columns_json).expect("ordering must succeed");
+        let ordered_json = ordered_prediction_columns(columns_json).expect("ordering must succeed");
         // `ordered_prediction_columns` serialises keys in emission order via the
         // manual `ordered_json_object_string` writer, so the textual byte order
         // of the `"key":` tokens is the authoritative column order (round-trip
@@ -29783,7 +29810,9 @@ mod batch_tests {
             .map(|key| {
                 ordered_json
                     .find(&format!("\"{key}\":"))
-                    .unwrap_or_else(|| panic!("emitted JSON must contain key {key}: {ordered_json}"))
+                    .unwrap_or_else(|| {
+                        panic!("emitted JSON must contain key {key}: {ordered_json}")
+                    })
             })
             .collect();
         for w in positions.windows(2) {
@@ -32933,9 +32962,8 @@ mod tests {
             let mut out = [[0.0_f64; 3]; 3];
             for i in 0..3 {
                 for j in 0..3 {
-                    out[i][j] =
-                        (-r_p2[i][j] + 8.0 * r_p1[i][j] - 8.0 * r_m1[i][j] + r_m2[i][j])
-                            / (12.0 * h);
+                    out[i][j] = (-r_p2[i][j] + 8.0 * r_p1[i][j] - 8.0 * r_m1[i][j] + r_m2[i][j])
+                        / (12.0 * h);
                 }
             }
             out
@@ -32988,15 +33016,11 @@ mod tests {
     #[test]
     fn so3_jvp_parallel_direction_unaffected_by_right_jacobian_fix() {
         // ω || dω: J_r(ω)·dω = dω because [ω]×·ω = 0 and [ω]²×·ω = 0.
-        let omega =
-            ndarray::Array2::from_shape_vec((1, 3), vec![0.3, -0.6, 0.4]).expect("omega");
+        let omega = ndarray::Array2::from_shape_vec((1, 3), vec![0.3, -0.6, 0.4]).expect("omega");
         let domega = {
             let scale = 1.7_f64;
-            ndarray::Array2::from_shape_vec(
-                (1, 3),
-                vec![scale * 0.3, scale * -0.6, scale * 0.4],
-            )
-            .expect("domega")
+            ndarray::Array2::from_shape_vec((1, 3), vec![scale * 0.3, scale * -0.6, scale * 0.4])
+                .expect("domega")
         };
         let jvp = rg_rho_so3_jvp_impl(omega.view(), domega.view()).expect("JVP");
         // Expected: R(ω) · [dω]× (pre-fix and post-fix agree for parallel dω).

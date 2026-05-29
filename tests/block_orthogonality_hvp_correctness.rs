@@ -27,7 +27,11 @@ use gam::terms::AnalyticPenalty;
 use gam::terms::BlockOrthogonalityPenalty;
 use gam::terms::analytic_penalties::PsiSlice;
 
-fn make_penalty(n_obs: usize, latent_dim: usize, groups: Vec<Vec<usize>>) -> BlockOrthogonalityPenalty {
+fn make_penalty(
+    n_obs: usize,
+    latent_dim: usize,
+    groups: Vec<Vec<usize>>,
+) -> BlockOrthogonalityPenalty {
     let psi_slice = PsiSlice {
         range: 0..(n_obs * latent_dim),
         latent_dim: Some(latent_dim),
@@ -49,7 +53,12 @@ fn flatten(m: &Array2<f64>) -> Array1<f64> {
 }
 
 /// Deterministic 3x4 latent: n_obs=3, latent_dim=4, two groups {0,1} and {2,3}.
-fn fixture() -> (BlockOrthogonalityPenalty, Array1<f64>, Array1<f64>, Array1<f64>) {
+fn fixture() -> (
+    BlockOrthogonalityPenalty,
+    Array1<f64>,
+    Array1<f64>,
+    Array1<f64>,
+) {
     let n = 3usize;
     let d = 4usize;
     let groups = vec![vec![0usize, 1], vec![2usize, 3]];

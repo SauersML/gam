@@ -27179,7 +27179,9 @@ mod tests {
         // Deterministic LCG -> uniform(0,1); probit gives standard-normal draws.
         let mut lcg: u64 = 0x2545_F491_4F6C_DD1D;
         let mut next_unit = || {
-            lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            lcg = lcg
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             // Top 53 bits -> (0,1), nudged off the open-interval endpoints so
             // the probit stays finite.
             let bits = (lcg >> 11) as f64 / ((1u64 << 53) as f64);

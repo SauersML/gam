@@ -142,11 +142,10 @@ fn smooth_noise_formula_recovers_mean_on_homoscedastic_data_365() {
     // so the fitted Scale block must carry more than a lone intercept; this is
     // the same coefficient block `predict_noise_scale` (and the FFI
     // `noise_scale` column) reads to expose σ to callers.
-    let scale_block = fit
-        .fit
-        .fit
-        .block_by_role(BlockRole::Scale)
-        .expect("smooth noise_formula must fit a retrievable Scale (log-sigma) coefficient block");
+    let scale_block =
+        fit.fit.fit.block_by_role(BlockRole::Scale).expect(
+            "smooth noise_formula must fit a retrievable Scale (log-sigma) coefficient block",
+        );
     assert!(
         scale_block.beta.len() >= 2,
         "smooth noise_formula must materialize a multi-coefficient scale basis, got {} \
@@ -162,7 +161,9 @@ fn smooth_noise_formula_recovers_mean_on_homoscedastic_data_365() {
     );
 
     let mean_rmse = rmse(&pred_mean, &truth);
-    eprintln!("[issue-365] smooth-noise mean RMSE = {mean_rmse:.4} (broken ≈ 1.53, healthy ≈ 0.03)");
+    eprintln!(
+        "[issue-365] smooth-noise mean RMSE = {mean_rmse:.4} (broken ≈ 1.53, healthy ≈ 0.03)"
+    );
 
     // The broken joint solve stalls at mean RMSE ≈ 1.53 (issue: 1.5279 /
     // 1.5581 / 1.5624 across seeds). A healthy fit reaches ≈ 0.03–0.06. The
