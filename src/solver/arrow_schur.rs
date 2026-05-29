@@ -2121,6 +2121,12 @@ pub struct StreamingArrowSchur {
     hbb: Array2<f64>,
     gb: Array1<f64>,
     row_builder: StreamingArrowRowBuilder,
+    /// Procedural cross-block operator `H_tβ^(i) x`. When present, the dense
+    /// per-row `H_tβ` slabs are never materialized: `accumulate_chunk` and
+    /// `back_substitute` probe this operator column-by-column to apply the
+    /// cross-block, matching the Kronecker / matrix-free assembly path. When
+    /// `None` (legacy dense BA callers), the per-row `row.htbeta` slab is used.
+    htbeta_matvec: Option<RowHtbetaMatvec>,
 }
 
 impl std::fmt::Debug for StreamingArrowSchur {
@@ -2161,25 +2167,35 @@ impl StreamingArrowSchur {
             hbb,
             gb,
             row_builder,
+            htbeta_matvec: None,
         }
+    }
+
+    /// Install a procedural cross-block operator `H_tβ^(i) x`, so the streaming
+    /// accumulator probes it per row instead of relying on dense `row.htbeta`
+    /// slabs. Returns `self` for builder-style chaining.
+    #[must_use]
+    pub fn with_htbeta_operator(mut self, op: RowHtbetaMatvec) -> Self {
+        self.htbeta_matvec = Some(op);
+        self
     }
 
     #[must_use]
     pub fn from_system(sys: &ArrowSchurSystem, chunk_size: usize) -> Self {
         // When a Kronecker / matrix-free htbeta_matvec is installed, the dense
-        // row.htbeta slabs may be zero-sized.  Materialize them now so the
-        // streaming accumulator's validate_row + direct arithmetic can work.
-        let rows: Vec<ArrowRowBlock> = if sys.htbeta_matvec.is_some() {
+        // row.htbeta slabs may be zero-sized.  Rather than materialize every
+        // `(d × K)` slab (the very `(N·K)`-scale buffer the streaming path
+        // exists to avoid), retain the procedural operator and probe it per row
+        // inside `accumulate_chunk` / `back_substitute`.  The row builder then
+        // only carries the small `H_tt` / `g_t` blocks.
+        let htbeta_matvec = sys.htbeta_matvec.clone();
+        let rows: Vec<ArrowRowBlock> = if htbeta_matvec.is_some() {
             sys.rows
                 .iter()
-                .enumerate()
-                .map(|(row_idx, row)| {
-                    let htbeta = sys_htbeta_materialize_row(sys, row_idx, row);
-                    ArrowRowBlock {
-                        htt: row.htt.clone(),
-                        htbeta,
-                        gt: row.gt.clone(),
-                    }
+                .map(|row| ArrowRowBlock {
+                    htt: row.htt.clone(),
+                    htbeta: Array2::<f64>::zeros((0, 0)),
+                    gt: row.gt.clone(),
                 })
                 .collect()
         } else {
@@ -2199,7 +2215,7 @@ impl StreamingArrowSchur {
         // represented as `G ⊗ I_p`) rather than the dense `hbb` accumulator.
         // When no `penalty_op` is installed this reduces to `hbb.clone()`.
         let hbb_dense = sys.effective_penalty_op().to_dense();
-        Self::new(
+        let mut streaming = Self::new(
             sys.rows.len(),
             sys.d,
             Arc::clone(&sys.row_dims),
@@ -2209,7 +2225,34 @@ impl StreamingArrowSchur {
             sys.gb.clone(),
             row_builder,
             chunk_size,
-        )
+        );
+        streaming.htbeta_matvec = htbeta_matvec;
+        streaming
+    }
+
+    /// Build the `(di × k)` cross-block for `row_idx` on demand. When a
+    /// procedural `htbeta_matvec` is installed, probes its `k` standard basis
+    /// vectors (the Kronecker gather costs `O(m_i · p)` per probe, far below a
+    /// dense `(di · K)` retain). Otherwise clones the dense `row.htbeta` slab.
+    fn row_htbeta(&self, row_idx: usize, row: &ArrowRowBlock, di: usize) -> Array2<f64> {
+        match self.htbeta_matvec.as_ref() {
+            Some(op) => {
+                let mut mat = Array2::<f64>::zeros((di, self.k));
+                let mut e_a = Array1::<f64>::zeros(self.k);
+                let mut col = Array1::<f64>::zeros(di);
+                for a in 0..self.k {
+                    e_a.fill(0.0);
+                    e_a[a] = 1.0;
+                    col.fill(0.0);
+                    op(row_idx, e_a.view(), &mut col);
+                    for c in 0..di {
+                        mat[[c, a]] = col[c];
+                    }
+                }
+                mat
+            }
+            None => row.htbeta.clone(),
+        }
     }
 
     /// Reset the dense shared accumulator to `H_ββ + ridge_beta I`.
@@ -2248,6 +2291,7 @@ impl StreamingArrowSchur {
             let row = (self.row_builder)(row_idx)?;
             let di = row.htt.nrows();
             self.validate_row(row_idx, &row)?;
+            let htbeta = self.row_htbeta(row_idx, &row, di);
             let factor = factor_one_row(&row, ridge_t, di, row_idx)?;
             let v = backend.solve_block_vector(&factor, &row.gt);
             for c in 0..di {
@@ -2256,22 +2300,26 @@ impl StreamingArrowSchur {
                     continue;
                 }
                 for a in 0..self.k {
-                    self.rhs_acc[a] += row.htbeta[[c, a]] * vc;
+                    self.rhs_acc[a] += htbeta[[c, a]] * vc;
                 }
             }
             match mode {
-                ArrowSolverMode::Direct => {
-                    let solved = backend.solve_block_matrix(&factor, &row.htbeta);
-                    backend.block_gemm_subtract(&mut self.s_acc, &row.htbeta, &solved);
+                // The streaming accumulator forms the dense reduced Schur
+                // complement `S = H_ββ + ridge·I − Σ_i H_βt^(i)(H_tt^(i))⁻¹H_tβ^(i)`
+                // incrementally across chunks. `InexactPCG` differs from
+                // `Direct` only in how the *reduced* system is solved, not in
+                // how it is assembled — and `solve_dense_reduced_system` already
+                // owns the reduced solve. So InexactPCG reduces, by construction,
+                // to the same dense Schur subtraction here; the prior hard
+                // rejection at this site is lifted because chunked assembly is
+                // exactly the matrix-free reduction the PCG path wants.
+                ArrowSolverMode::Direct | ArrowSolverMode::InexactPCG => {
+                    let solved = backend.solve_block_matrix(&factor, &htbeta);
+                    backend.block_gemm_subtract(&mut self.s_acc, &htbeta, &solved);
                 }
                 ArrowSolverMode::SqrtBA => {
-                    let whitened = backend.sqrt_solve_block_matrix(&factor, &row.htbeta);
+                    let whitened = backend.sqrt_solve_block_matrix(&factor, &htbeta);
                     backend.block_gemm_subtract(&mut self.s_acc, &whitened, &whitened);
-                }
-                ArrowSolverMode::InexactPCG => {
-                    return Err(ArrowSchurError::PcgFailed {
-                        reason: "streaming Arrow-Schur accumulator is for dense direct modes; use matrix-free PCG without streaming_chunk_size".to_string(),
-                    });
                 }
             }
         }
@@ -2317,12 +2365,22 @@ impl StreamingArrowSchur {
                 let di = row.htt.nrows();
                 self.validate_row(row_idx, &row)?;
                 let factor = factor_one_row(&row, ridge_t, di, row_idx)?;
-                for c in 0..di {
-                    let mut acc = row.gt[c];
-                    for a in 0..self.k {
-                        acc += row.htbeta[[c, a]] * delta_beta[a];
+                // `H_tβ^(i) Δβ`: route through the procedural operator when
+                // present (no dense slab), else through the dense slab.
+                let mut htbeta_delta = Array1::<f64>::zeros(di);
+                if let Some(op) = self.htbeta_matvec.as_ref() {
+                    op(row_idx, delta_beta, &mut htbeta_delta);
+                } else {
+                    for c in 0..di {
+                        let mut acc = 0.0_f64;
+                        for a in 0..self.k {
+                            acc += row.htbeta[[c, a]] * delta_beta[a];
+                        }
+                        htbeta_delta[c] = acc;
                     }
-                    rhs[c] = acc;
+                }
+                for c in 0..di {
+                    rhs[c] = row.gt[c] + htbeta_delta[c];
                 }
                 let dt_i = backend.solve_block_vector(&factor, &rhs);
                 let row_base = self.row_offsets[row_idx];
@@ -2350,7 +2408,10 @@ impl StreamingArrowSchur {
                 ),
             });
         }
-        if row.htbeta.dim() != (expected_di, self.k) {
+        // The dense `H_tβ` slab is only validated when no procedural operator is
+        // installed; with `htbeta_matvec` the slab is intentionally zero-sized
+        // and the cross-block is probed in `row_htbeta`.
+        if self.htbeta_matvec.is_none() && row.htbeta.dim() != (expected_di, self.k) {
             return Err(ArrowSchurError::SchurFactorFailed {
                 reason: format!(
                     "streaming row H_tβ shape {:?} != ({expected_di}, {})",
