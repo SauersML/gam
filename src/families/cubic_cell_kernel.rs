@@ -3069,7 +3069,7 @@ fn fill_truncated_gaussian_moments(a: f64, b: f64, out: &mut [f64]) {
         if x.is_infinite() {
             if x.is_sign_positive() { 1.0 } else { 0.0 }
         } else {
-            0.5 * (1.0 + statrs::function::erf::erf(x / std::f64::consts::SQRT_2))
+            0.5 * statrs::function::erf::erfc(-x / std::f64::consts::SQRT_2)
         }
     };
     out[0] = (2.0 * std::f64::consts::PI).sqrt() * (cdf(b) - cdf(a));
