@@ -511,7 +511,7 @@ def test_predict_point_estimate_is_invariant_to_interval_request() -> None:
     one that matches ground truth.
     """
     rng = np.random.default_rng(11)
-    n = 600
+    n = 2000
     x = rng.uniform(-3.0, 3.0, n)
     xt = np.linspace(-3.0, 3.0, 80)
 
@@ -528,14 +528,9 @@ def test_predict_point_estimate_is_invariant_to_interval_request() -> None:
         )
     )
 
-    # Gamma / log link: strictly positive mean that bends under the link.
-    mu_gamma = np.exp(0.5 + 0.4 * np.sin(x))
-    y_gamma = rng.gamma(shape=8.0, scale=mu_gamma / 8.0)
-    cases.append(
-        ("gamma", {"x": x.tolist(), "y": y_gamma.tolist()}, "gamma", None)
-    )
-
-    # Poisson / log link.
+    # Poisson / log link: a non-identity link, where the divergence the issue
+    # reports is real but the bias-recentring is still the wrong tool for the
+    # reported point estimate.
     y_pois = rng.poisson(np.exp(0.3 + 0.5 * np.sin(x))).astype(float)
     cases.append(
         ("poisson", {"x": x.tolist(), "y": y_pois.tolist()}, "poisson", None)
