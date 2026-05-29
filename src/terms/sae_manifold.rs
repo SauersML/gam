@@ -3340,6 +3340,74 @@ impl SaeManifoldTerm {
         Ok(traces)
     }
 
+    /// Decoder smoothness penalty quadratic form `Σ_k Σ_oc B_k[:,oc]ᵀ S_k B_k[:,oc]`.
+    ///
+    /// This is `βᵀ (⊕_k S_k ⊗ I_p) β` — the un-scaled (λ-free) penalty energy
+    /// in the flat β layout, the denominator of the λ_smooth Fellner-Schall
+    /// update. `S_k` is symmetrised defensively (as the assembler does).
+    fn decoder_smoothness_quadratic_form(&self) -> f64 {
+        let mut acc = 0.0_f64;
+        for atom in &self.atoms {
+            let s = &atom.smooth_penalty;
+            let b = &atom.decoder_coefficients;
+            let m = atom.basis_size();
+            let p = atom.output_dim();
+            for oc in 0..p {
+                for i in 0..m {
+                    for j in 0..m {
+                        let s_ij = 0.5 * (s[[i, j]] + s[[j, i]]);
+                        acc += b[[i, oc]] * s_ij * b[[j, oc]];
+                    }
+                }
+            }
+        }
+        acc
+    }
+
+    /// Effective penalized dof of the decoder smoothness penalty:
+    /// `tr(S_β⁻¹ · M)` with `M = ⊕_k (λ_smooth · S_k) ⊗ I_p` embedded in the
+    /// flat β layout, where `S_β⁻¹ = (H⁻¹)_ββ` is the Schur-complement inverse.
+    ///
+    /// Built per keystone's documented pattern on
+    /// [`ArrowFactorCache::schur_inverse_apply`]:
+    /// `tr(S_β⁻¹ M) = Σ_col e_colᵀ S_β⁻¹ M e_col`. Column `(k, μ, oc)` of `M`
+    /// (global index `off_k + μ·p + oc`) is `λ·S_k[:,μ] ⊗ e_oc` — nonzero only
+    /// at `off_k + ν·p + oc` for `ν in 0..M_k` — so we materialise just that
+    /// sparse K-vector, apply `S_β⁻¹`, and read back `result[col]`. The
+    /// `⊗ I_p` only couples equal `oc`, but `S_β` itself couples channels
+    /// through the data-fit block, so all `p` channels are summed (no
+    /// channel-block-identity shortcut). Total cost `beta_dim` Schur solves.
+    fn decoder_smoothness_effective_dof(
+        &self,
+        cache: &ArrowFactorCache,
+        lambda_smooth: f64,
+    ) -> Result<f64, ArrowSchurError> {
+        let p = self.output_dim();
+        let beta_offsets = self.beta_offsets();
+        let k = cache.k;
+        let mut trace = 0.0_f64;
+        let mut m_col = Array1::<f64>::zeros(k);
+        for (atom_idx, atom) in self.atoms.iter().enumerate() {
+            let s = &atom.smooth_penalty;
+            let m = atom.basis_size();
+            let off = beta_offsets[atom_idx];
+            for mu in 0..m {
+                for oc in 0..p {
+                    let col = off + mu * p + oc;
+                    // M[:,col] = λ · S_k[:,mu] ⊗ e_oc (nonzero at off+ν·p+oc).
+                    m_col.fill(0.0);
+                    for nu in 0..m {
+                        let s_nu_mu = 0.5 * (s[[nu, mu]] + s[[mu, nu]]);
+                        m_col[off + nu * p + oc] = lambda_smooth * s_nu_mu;
+                    }
+                    let z = cache.schur_inverse_apply(m_col.view())?;
+                    trace += z[col];
+                }
+            }
+        }
+        Ok(trace)
+    }
+
     /// Returns `true` when a Beta-tier analytic penalty was accumulated into
     /// the dense `sys.hbb` block (so the caller knows to wrap it in a
     /// `DensePenaltyOp`); `false` leaves `sys.hbb` all-zero and lets the
