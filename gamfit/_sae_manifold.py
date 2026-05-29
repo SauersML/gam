@@ -312,6 +312,11 @@ class GumbelTemperatureSchedule:
             out["steps"] = int(self.steps)
         return out
 
+    def current_tau(self, iter_count: int) -> float:
+        """Temperature at ``iter_count``, evaluated by the Rust
+        ``GumbelTemperatureSchedule`` so the decay arithmetic has one home."""
+        return float(rust_module().gumbel_schedule_tau(self.to_rust_descriptor(), int(iter_count)))
+
 
 def gumbel_geometric_schedule(tau_start: float, tau_min: float, rate: float, iter_count: int = 0) -> GumbelTemperatureSchedule:
     return GumbelTemperatureSchedule(tau_start, tau_min, "geometric", rate=rate, iter_count=iter_count)
@@ -505,6 +510,28 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     )
 
 
+def _require_sae_row_block_penalty(kind: str, kwarg: str) -> None:
+    """Refuse a SAE row-block penalty the running extension does not advertise.
+
+    The compiled extension reports the row-block penalty kinds it supports via
+    ``build_info()["sae_row_block_penalties"]`` (kept in lockstep with the Rust
+    ``sae_penalty_is_row_block_supported`` matcher). A stale binary that predates
+    a given penalty either omits the key entirely or lists a subset; forwarding
+    the descriptor anyway would surface as a cryptic internal Schur-Cholesky
+    error. Detect the mismatch here and raise a clear ``NotImplementedError``
+    naming the user-facing kwarg (issue #338).
+    """
+    supported = rust_module().build_info().get("sae_row_block_penalties", [])
+    if kind not in supported:
+        raise NotImplementedError(
+            f"sae_manifold_fit: {kwarg} requires SAE row-block penalty "
+            f"'{kind}', which the installed gam-pyffi extension does not "
+            "advertise (it predates row-block support for this penalty). "
+            f"Upgrade gamfit to a build that supports '{kind}', or pass "
+            f"{kwarg}=0.0 to disable it."
+        )
+
+
 def _build_analytic_penalties_payload(
     *,
     isometry_weight: float,
@@ -539,13 +566,18 @@ def _build_analytic_penalties_payload(
         )
     items: list[dict[str, Any]] = []
     if bool(ard_per_atom):
+        _require_sae_row_block_penalty("ard", "ard_per_atom")
         items.append({"kind": "ard", "target": "t"})
     if isometry_weight is not None and float(isometry_weight) > 0.0:
+        _require_sae_row_block_penalty("isometry", "isometry_weight")
         items.append({"kind": "isometry", "target": "t"})
     if (
         block_orthogonality_weight is not None
         and float(block_orthogonality_weight) > 0.0
     ):
+        _require_sae_row_block_penalty(
+            "block_orthogonality", "block_orthogonality_weight"
+        )
         # The latent block "t" is (n_obs, d_max). BlockOrth requires ≥2
         # groups that partition contiguous axes from 0 — split into
         # singletons so each axis is in its own group, which is the most

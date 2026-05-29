@@ -1119,10 +1119,13 @@ pub fn build_smooth_basis(
             })
             .unwrap_or(false);
     // Read the raw user-facing smooth selector (`type=`/`bs=`) and collapse
-    // mgcv-compatible aliases (`tp`, `gp`, `cr`, `cs`, `ps`, `sos`, ...) to
-    // their gamfit canonical names via the single source of truth in
-    // `canonicalize_smooth_type`. The match arms below see only canonical
-    // names — adding the next alias never requires touching the dispatch.
+    // the mgcv-compatible aliases that have an exact gamfit equivalent (`tp` →
+    // `tps`, `gp` → `matern`) to their canonical names via the single source
+    // of truth in `canonicalize_smooth_type`. Aliases without an exact
+    // semantic match (e.g. `cs`, `ad`) are intentionally left unmapped so they
+    // reach the unsupported-type diagnostic. The match arms below see only
+    // canonical names — adding the next alias never requires touching the
+    // dispatch.
     let type_opt = options
         .get("type")
         .or_else(|| options.get("bs"))

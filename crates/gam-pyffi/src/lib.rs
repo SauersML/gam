@@ -1224,6 +1224,14 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "binomial-location-scale",
         ],
     )?;
+    // SAE row-block analytic penalty kinds this build supports, so the Python
+    // wrapper can refuse cleanly on a stale extension rather than forward a
+    // descriptor that fails with a cryptic Schur error (issue #338). Derived
+    // from the same source of truth as `sae_penalty_is_row_block_supported`.
+    info.set_item(
+        "sae_row_block_penalties",
+        gam::terms::sae_manifold::sae_row_block_penalty_kinds().to_vec(),
+    )?;
     Ok(info.unbind())
 }
 
@@ -8226,6 +8234,7 @@ fn latent_multi_output_fit_to_pydict<'py>(
     y: ArrayView2<'_, f64>,
     penalty: ArrayView2<'_, f64>,
     weights: Option<ArrayView1<'_, f64>>,
+    fisher_w: Option<ArrayView3<'_, f64>>,
     init_lambda: Option<f64>,
     family_name: &str,
     latent_prior_score: f64,
@@ -8286,6 +8295,59 @@ fn latent_multi_output_fit_to_pydict<'py>(
     let max_iter = 50usize;
     let tol = 1.0e-7_f64;
 
+    // Per-row Fisher-block override (issue #349). The wire-level array is
+    // `(N, K, K)`; validate finiteness + non-negative diagonal here, then adapt
+    // to each branch's curvature gauge:
+    //   - multinomial: the fitter consumes the active `(N, K-1, K-1)` leading
+    //     sub-block (the reference class K-1 is dropped); require each per-row
+    //     active block to be symmetric.
+    //   - binomial-multi: the K columns are fit independently, so off-diagonal
+    //     cross terms cannot be represented — require them to be zero — and the
+    //     full `(N, K, K)` array is forwarded for its diagonal.
+    let multinomial_fisher_active: Option<Array3<f64>> = match fisher_w.as_ref() {
+        Some(fw) => {
+            validate_dense_fisher_w(n_obs, n_outputs, *fw).map_err(py_value_error)?;
+            if multinomial {
+                let mut active = Array3::<f64>::zeros((n_obs, active_outputs, active_outputs));
+                for n in 0..n_obs {
+                    for a in 0..active_outputs {
+                        for b in 0..active_outputs {
+                            active[[n, a, b]] = fw[[n, a, b]];
+                        }
+                    }
+                    for a in 0..active_outputs {
+                        for b in (a + 1)..active_outputs {
+                            if (fw[[n, a, b]] - fw[[n, b, a]]).abs() > 1.0e-9 {
+                                return Err(py_value_error(format!(
+                                    "fisher_w active block[{n}] must be symmetric for the \
+                                     multinomial path; entries [{a},{b}] and [{b},{a}] differ"
+                                )));
+                            }
+                        }
+                    }
+                }
+                Some(active)
+            } else {
+                for n in 0..n_obs {
+                    for a in 0..n_outputs {
+                        for b in 0..n_outputs {
+                            if a != b && fw[[n, a, b]] != 0.0 {
+                                return Err(py_value_error(format!(
+                                    "fisher_w block[{n}] off-diagonal [{a},{b}] must be zero for \
+                                     the binomial-multi path (each response column is fit \
+                                     independently); got {}",
+                                    fw[[n, a, b]]
+                                )));
+                            }
+                        }
+                    }
+                }
+                None
+            }
+        }
+        None => None,
+    };
+
     // Coefficients matrix `(P, K)` with reference-class column zeroed for
     // the multinomial branch (so the wire-level shape matches the prior
     // `dense_fisher_glm_fit_to_pydict` contract).
@@ -8303,6 +8365,7 @@ fn latent_multi_output_fit_to_pydict<'py>(
                 penalty,
                 lambdas: lambdas_vec.view(),
                 row_weights: Some(row_weights.view()),
+                fisher_w_override: multinomial_fisher_active.as_ref().map(|a| a.view()),
                 max_iter,
                 tol,
             },
@@ -8327,6 +8390,7 @@ fn latent_multi_output_fit_to_pydict<'py>(
                 penalty,
                 lambdas: lambdas_vec.view(),
                 row_weights: Some(row_weights.view()),
+                fisher_w_override: fisher_w,
                 max_iter,
                 tol,
             },
@@ -8432,6 +8496,7 @@ fn fit_penalized_multinomial_pyfunc<'py>(
             penalty: penalty_view,
             lambdas: lambdas_view,
             row_weights: row_weights_view,
+            fisher_w_override: None,
             max_iter,
             tol,
         },
@@ -12152,17 +12217,10 @@ fn glm_reml_fit_latent<'py>(
             "multinomial" | "multinomial-logit" | "softmax" | "categorical-logit"
         )
     {
-        // Per-row Fisher-block override is deferred for the multi-output
-        // paths (issue #349). The scalar-output branch below still honours
-        // `fisher_w` via `latent_scalar_weights_with_fisher`; refusing it
-        // here is preferable to silently dropping the user's override.
-        if fisher_values.is_some() {
-            return Err(py_value_error(format!(
-                "glm_reml_fit_latent: per-row fisher_w override is not currently supported \
-                 on the multi-output ({family_name:?}) branch; pass fisher_w=None or use the \
-                 scalar single-output path. See https://github.com/SauersML/gam/issues/349."
-            )));
-        }
+        // Per-row Fisher-block override is now threaded through the
+        // multi-output canonical fitters (issue #349): the multinomial path
+        // consumes the active `(N, K-1, K-1)` leading sub-block and the
+        // binomial-multi path the diagonal of each `(N, K, K)` block.
         let (design, t_mat) = build_latent_duchon_design(
             t_values.view(),
             n_obs,
@@ -12187,6 +12245,7 @@ fn glm_reml_fit_latent<'py>(
             y_values.view(),
             penalty_values.view(),
             weight_values.as_ref().map(|w| w.view()),
+            fisher_values.as_ref().map(|w| w.view()),
             init_lambda,
             &family_name,
             prior_score + analytic_score,
@@ -17855,9 +17914,11 @@ fn poincare_lorentz_exp_origin<'py>(
 
 /// Forward pass for the Poincaré tangent-space-at-origin decoder.
 ///
-/// Returns `(x_hat, atoms_projected, v, tangents)` so the Python
-/// autograd.Function can stash them and use them on the backward pass
-/// without recomputing.
+/// Returns `(x_hat, atoms_projected, v, tangents, proj_scale)` so the Python
+/// autograd.Function can stash them and use them on the backward pass without
+/// recomputing. `proj_scale` (shape `(F,)`) is the per-atom radial
+/// ball-projection factor needed by the backward to chain gradients through
+/// the projection back to the raw atom storage.
 #[pyfunction]
 fn poincare_tangent_decode_forward<'py>(
     py: Python<'py>,
@@ -17869,6 +17930,7 @@ fn poincare_tangent_decode_forward<'py>(
     Py<PyArray2<f64>>,
     Py<PyArray2<f64>>,
     Py<PyArray2<f64>>,
+    Py<PyArray1<f64>>,
 )> {
     let atoms_owned = atoms.as_array().to_owned();
     let gates_owned = gates.as_array().to_owned();
@@ -17881,6 +17943,7 @@ fn poincare_tangent_decode_forward<'py>(
         cache.atoms_projected.into_pyarray(py).unbind(),
         cache.v.into_pyarray(py).unbind(),
         cache.tangents.into_pyarray(py).unbind(),
+        cache.proj_scale.into_pyarray(py).unbind(),
     ))
 }
 
@@ -17894,6 +17957,7 @@ fn poincare_tangent_decode_backward<'py>(
     gates: PyReadonlyArray2<'py, f64>,
     v: PyReadonlyArray2<'py, f64>,
     tangents: PyReadonlyArray2<'py, f64>,
+    proj_scale: PyReadonlyArray1<'py, f64>,
     grad_x_hat: PyReadonlyArray2<'py, f64>,
     curvature: f64,
 ) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
@@ -17901,6 +17965,7 @@ fn poincare_tangent_decode_backward<'py>(
     let gates_owned = gates.as_array().to_owned();
     let v_owned = v.as_array().to_owned();
     let tangents_owned = tangents.as_array().to_owned();
+    let proj_scale_owned = proj_scale.as_array().to_owned();
     let grad_owned = grad_x_hat.as_array().to_owned();
     let (gg, ga) = detach_geometry_result(py, "poincare_tangent_decode_backward", move || {
         let cache = gam::geometry::poincare::TangentDecodeCache {
@@ -17908,6 +17973,7 @@ fn poincare_tangent_decode_backward<'py>(
             gates: gates_owned,
             v: v_owned,
             tangents: tangents_owned,
+            proj_scale: proj_scale_owned,
             curvature,
         };
         poincare_tangent_decode_backward_impl(&cache, grad_owned.view())
@@ -17942,6 +18008,7 @@ fn poincare_lorentz_decode_backward<'py>(
     gates: PyReadonlyArray2<'py, f64>,
     v: PyReadonlyArray2<'py, f64>,
     tangents: PyReadonlyArray2<'py, f64>,
+    proj_scale: PyReadonlyArray1<'py, f64>,
     grad_x_hat: PyReadonlyArray2<'py, f64>,
     curvature: f64,
 ) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
@@ -17949,6 +18016,7 @@ fn poincare_lorentz_decode_backward<'py>(
     let gates_owned = gates.as_array().to_owned();
     let v_owned = v.as_array().to_owned();
     let tangents_owned = tangents.as_array().to_owned();
+    let proj_scale_owned = proj_scale.as_array().to_owned();
     let grad_owned = grad_x_hat.as_array().to_owned();
     let (gg, ga) = detach_geometry_result(py, "poincare_lorentz_decode_backward", move || {
         let cache = gam::geometry::poincare::TangentDecodeCache {
@@ -17956,6 +18024,7 @@ fn poincare_lorentz_decode_backward<'py>(
             gates: gates_owned,
             v: v_owned,
             tangents: tangents_owned,
+            proj_scale: proj_scale_owned,
             curvature,
         };
         poincare_lorentz_decode_backward_impl(&cache, grad_owned.view())
@@ -21861,9 +21930,13 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(register_analytic_penalties, module)?)?;
     module.add_function(wrap_pyfunction!(analytic_penalty_value_grad, module)?)?;
     module.add_function(wrap_pyfunction!(analytic_penalty_hvp, module)?)?;
+    module.add_function(wrap_pyfunction!(gumbel_schedule_tau, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_ibp_map_value_grad, module)?)?;
+    module.add_function(wrap_pyfunction!(jumprelu_gate_value_grad, module)?)?;
     module.add_function(wrap_pyfunction!(equivariant_penalty_value, module)?)?;
     module.add_function(wrap_pyfunction!(riemannian_retract, module)?)?;
     module.add_function(wrap_pyfunction!(manifold_exp_map, module)?)?;
+    module.add_function(wrap_pyfunction!(manifold_exp_map_vjp, module)?)?;
     module.add_function(wrap_pyfunction!(manifold_log_map, module)?)?;
     module.add_function(wrap_pyfunction!(manifold_metric_tensor, module)?)?;
     module.add_function(wrap_pyfunction!(manifold_dimension, module)?)?;
@@ -22407,7 +22480,11 @@ fn py_value_error(message: String) -> PyErr {
     } else {
         message
     };
-    PyValueError::new_err(user_facing)
+    // Engine errors funneled here are gamfit-specific failures, so they must
+    // carry GamError identity (a ValueError subclass) — preserving the
+    // historical `except ValueError` contract while making `except
+    // gamfit.GamError` reliable for engine errors (issue #330).
+    GamError::new_err(user_facing)
 }
 
 fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -24250,9 +24327,9 @@ fn posterior_predict_bands_table_impl(
     let (eta_mean, eta_lower, eta_upper, mean, mean_lower, mean_upper) =
         eta_bands_from_matrix(eta.view(), &family_kind, level)?;
     let payload = PosteriorPredictBandsPayload {
-        eta_mean,
-        eta_lower,
-        eta_upper,
+        linear_predictor: eta_mean,
+        linear_predictor_lower: eta_lower,
+        linear_predictor_upper: eta_upper,
         mean,
         mean_lower,
         mean_upper,
@@ -27067,6 +27144,114 @@ fn register_analytic_penalties(latents_json: &str, penalties_json: &str) -> PyRe
     .map_err(|err| py_value_error(err.to_string()))
 }
 
+/// JumpReLU activation-gate value and straight-through-estimator gradients.
+///
+/// Returns `(value, dphi_dz, dphi_dtau)`, all shaped like `z` `(N, F)`, where
+/// `value = z · 1[z > τ]` and the per-element derivatives come from the smooth
+/// surrogate `z · σ((z − τ)/ε)` (see
+/// `gam::terms::analytic_penalties::jumprelu_gate_value_grad`). `tau` holds the
+/// per-column (per-axis) effective thresholds. torch's `_JumpReLUSTEFn` consumes
+/// these instead of recomputing the STE in Python.
+#[pyfunction(signature = (z, tau, smoothing_eps))]
+fn jumprelu_gate_value_grad<'py>(
+    py: Python<'py>,
+    z: PyReadonlyArray2<'py, f64>,
+    tau: PyReadonlyArray1<'py, f64>,
+    smoothing_eps: f64,
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
+    if !(smoothing_eps.is_finite() && smoothing_eps > 0.0) {
+        return Err(py_value_error(format!(
+            "jumprelu_gate_value_grad: smoothing_eps must be finite and positive; got {smoothing_eps}"
+        )));
+    }
+    let z_view = z.as_array();
+    let tau_view = tau.as_array();
+    let (n_rows, n_cols) = z_view.dim();
+    if tau_view.len() != n_cols {
+        return Err(py_value_error(format!(
+            "jumprelu_gate_value_grad: tau length {} does not match z columns {n_cols}",
+            tau_view.len()
+        )));
+    }
+    let mut value = Array2::<f64>::zeros((n_rows, n_cols));
+    let mut dphi_dz = Array2::<f64>::zeros((n_rows, n_cols));
+    let mut dphi_dtau = Array2::<f64>::zeros((n_rows, n_cols));
+    for r in 0..n_rows {
+        for c in 0..n_cols {
+            let (v, dz, dt) = gam::terms::analytic_penalties::jumprelu_gate_value_grad(
+                z_view[[r, c]],
+                tau_view[c],
+                smoothing_eps,
+            );
+            value[[r, c]] = v;
+            dphi_dz[[r, c]] = dz;
+            dphi_dtau[[r, c]] = dt;
+        }
+    }
+    Ok((
+        value.into_pyarray(py).unbind(),
+        dphi_dz.into_pyarray(py).unbind(),
+        dphi_dtau.into_pyarray(py).unbind(),
+    ))
+}
+
+/// Temperature `τ` of the Rust [`GumbelTemperatureSchedule`] at iteration
+/// `iter`, so torch's sparsity-layer annealing queries the single Rust schedule
+/// instead of duplicating the decay arithmetic in Python. `schedule` is the
+/// same descriptor dict the SAE composition surface accepts (keys: `tau_start`,
+/// `tau_min`/`tau_end`, `decay`, and `rate`/`steps` as required by the decay).
+#[pyfunction(signature = (schedule, iter))]
+fn gumbel_schedule_tau(schedule: &Bound<'_, PyDict>, iter: usize) -> PyResult<f64> {
+    let parsed = gumbel_temperature_schedule_from_pydict(Some(schedule))
+        .map_err(py_value_error)?
+        .ok_or_else(|| py_value_error("gumbel_schedule_tau requires a schedule descriptor"))?;
+    Ok(parsed.current_tau(iter))
+}
+
+/// IBP-MAP concrete-relaxation activations and their diagonal logit Jacobian.
+///
+/// Returns `(z, dz_dl)` where `z_k = σ(l_k/τ) · π_k` (stick-breaking prior
+/// `π_k = (α/(α+1))^k`) and `dz_dl_k = ∂z_k/∂l_k`. The map is diagonal in `k`,
+/// so torch's autograd `Function` multiplies the upstream gradient elementwise
+/// by `dz_dl`. This is the single source of truth shared with the closed-form
+/// `SaeAssignment` IBP path so torch IBP-Gumbel applies the same prior and
+/// temperature scaling as the Rust fit.
+#[pyfunction(signature = (logits, temperature, alpha))]
+fn sae_ibp_map_value_grad<'py>(
+    py: Python<'py>,
+    logits: PyReadonlyArray1<'py, f64>,
+    temperature: f64,
+    alpha: f64,
+) -> PyResult<(Py<PyArray1<f64>>, Py<PyArray1<f64>>)> {
+    if !(temperature.is_finite() && temperature > 0.0) {
+        return Err(py_value_error(format!(
+            "sae_ibp_map_value_grad: temperature must be finite and positive; got {temperature}"
+        )));
+    }
+    if !(alpha.is_finite() && alpha > 0.0) {
+        return Err(py_value_error(format!(
+            "sae_ibp_map_value_grad: alpha must be finite and positive; got {alpha}"
+        )));
+    }
+    let logits_view = logits.as_array();
+    for (col, &v) in logits_view.iter().enumerate() {
+        if !v.is_finite() {
+            return Err(py_value_error(format!(
+                "sae_ibp_map_value_grad: non-finite logit at atom {col}: {v}"
+            )));
+        }
+    }
+    let (value, grad) = gam::terms::sae_manifold::ibp_map_row_value_grad(
+        logits_view.view(),
+        temperature,
+        alpha,
+    );
+    Ok((
+        value.into_pyarray(py).unbind(),
+        grad.into_pyarray(py).unbind(),
+    ))
+}
+
 #[pyfunction(signature = (
     latents_json,
     penalties_json,
@@ -27083,7 +27268,12 @@ fn analytic_penalty_value_grad<'py>(
     rho: Option<PyReadonlyArray1<'py, f64>>,
     isometry_jacobian: Option<PyReadonlyArray2<'py, f64>>,
     isometry_jacobian_second: Option<PyReadonlyArray2<'py, f64>>,
-) -> PyResult<(f64, Py<PyArray1<f64>>, Py<PyArray1<f64>>)> {
+) -> PyResult<(
+    f64,
+    Py<PyArray1<f64>>,
+    Py<PyArray1<f64>>,
+    Option<Py<PyArray2<f64>>>,
+)> {
     let latents: serde_json::Value = serde_json::from_str(latents_json)
         .map_err(|err| py_value_error(format!("invalid latents json: {err}")))?;
     let penalties: serde_json::Value = serde_json::from_str(penalties_json)
@@ -27091,6 +27281,7 @@ fn analytic_penalty_value_grad<'py>(
     let mut registry = build_analytic_penalty_registry_from_json(Some(&latents), Some(&penalties))
         .map_err(py_value_error)?;
 
+    let want_jacobian_grad = isometry_jacobian.is_some();
     if let Some(j) = isometry_jacobian {
         let j_cache = Arc::new(j.as_array().to_owned());
         let h_cache = isometry_jacobian_second.map(|h| Arc::new(h.as_array().to_owned()));
@@ -27121,6 +27312,7 @@ fn analytic_penalty_value_grad<'py>(
     let mut value = 0.0_f64;
     let mut grad = Array1::<f64>::zeros(target_view.len());
     let mut grad_rho = Array1::<f64>::zeros(rho_owned.len());
+    let mut grad_jacobian: Option<Array2<f64>> = None;
     for (penalty, (rho_slice, tier, _name)) in registry.penalties.iter().zip(registry.rho_layout())
     {
         if matches!(tier, PenaltyTier::Rho) {
@@ -27133,11 +27325,21 @@ fn analytic_penalty_value_grad<'py>(
         for (local, global) in (rho_slice.start..rho_slice.end).enumerate() {
             grad_rho[global] += local_grad_rho[local];
         }
+        if want_jacobian_grad {
+            if let AnalyticPenaltyKind::Isometry(inner) = penalty {
+                let contrib = inner.grad_jacobian(target_view.view(), rho_local);
+                match grad_jacobian.as_mut() {
+                    Some(acc) => *acc += &contrib,
+                    None => grad_jacobian = Some(contrib),
+                }
+            }
+        }
     }
     Ok((
         value,
         grad.into_pyarray(py).unbind(),
         grad_rho.into_pyarray(py).unbind(),
+        grad_jacobian.map(|g| g.into_pyarray(py).unbind()),
     ))
 }
 
@@ -27407,6 +27609,69 @@ fn manifold_exp_map<'py>(
         out.row_mut(row).assign(&next);
     }
     Ok(out.into_pyarray(py).unbind())
+}
+
+/// Batched vector–Jacobian product of the Riemannian exponential map.
+///
+/// Given base points ``points`` ``(N, ambient_dim)``, raw tangent inputs
+/// ``vecs`` ``(N, ambient_dim)``, and a cotangent ``grad_output``
+/// ``(N, ambient_dim)`` w.r.t. the output of :func:`manifold_exp_map`, returns
+/// ``(grad_points, grad_vecs)`` — the analytic pullbacks w.r.t. ``points`` and
+/// ``vecs``. This is the backward used by the Python ``torch.autograd.Function``
+/// wrapping ``manifold_exp_map``; it routes through the canonical Rust
+/// ``RiemannianManifold::exp_map_vjp`` so curved manifolds (Sphere, products
+/// containing a Sphere) get their true analytic Jacobi-field gradients instead
+/// of a silent straight-through identity. Manifolds with no closed-form
+/// backward (Grassmann, Stiefel, SPD) raise rather than return wrong grads.
+#[pyfunction(signature = (manifold_json, points, vecs, grad_output))]
+fn manifold_exp_map_vjp<'py>(
+    py: Python<'py>,
+    manifold_json: &str,
+    points: PyReadonlyArray2<'py, f64>,
+    vecs: PyReadonlyArray2<'py, f64>,
+    grad_output: PyReadonlyArray2<'py, f64>,
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
+    let value: serde_json::Value = serde_json::from_str(manifold_json)
+        .map_err(|err| py_value_error(format!("invalid manifold json: {err}")))?;
+    let kind = parse_manifold_kind(&value).map_err(py_value_error)?;
+    let manifold = kind.build();
+    let p = points.as_array();
+    let v = vecs.as_array();
+    let g = grad_output.as_array();
+    if p.dim() != v.dim() {
+        return Err(py_value_error(format!(
+            "manifold_exp_map_vjp: points shape {:?} does not match vecs shape {:?}",
+            p.dim(),
+            v.dim()
+        )));
+    }
+    if p.dim() != g.dim() {
+        return Err(py_value_error(format!(
+            "manifold_exp_map_vjp: points shape {:?} does not match grad_output shape {:?}",
+            p.dim(),
+            g.dim()
+        )));
+    }
+    if p.ncols() != manifold.ambient_dim() {
+        return Err(py_value_error(format!(
+            "manifold_exp_map_vjp: points width {} does not match manifold ambient_dim {}",
+            p.ncols(),
+            manifold.ambient_dim()
+        )));
+    }
+    let mut grad_points = Array2::<f64>::zeros(p.dim());
+    let mut grad_vecs = Array2::<f64>::zeros(p.dim());
+    for row in 0..p.nrows() {
+        let (gp, gv) = manifold
+            .exp_map_vjp(p.row(row), v.row(row), g.row(row))
+            .map_err(|err| py_value_error(err.to_string()))?;
+        grad_points.row_mut(row).assign(&gp);
+        grad_vecs.row_mut(row).assign(&gv);
+    }
+    Ok((
+        grad_points.into_pyarray(py).unbind(),
+        grad_vecs.into_pyarray(py).unbind(),
+    ))
 }
 
 /// Batched Riemannian log map: for each row, return ``log_p(q)``.

@@ -7,9 +7,9 @@ use crate::util::quantile::quantile_from_sorted;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PosteriorPredictBandsPayload {
-    pub eta_mean: Vec<f64>,
-    pub eta_lower: Vec<f64>,
-    pub eta_upper: Vec<f64>,
+    pub linear_predictor: Vec<f64>,
+    pub linear_predictor_lower: Vec<f64>,
+    pub linear_predictor_upper: Vec<f64>,
     pub mean: Vec<f64>,
     pub mean_lower: Vec<f64>,
     pub mean_upper: Vec<f64>,
@@ -111,9 +111,9 @@ pub fn posterior_eta_bands(
     let (eta_mean, eta_lower, eta_upper, mean, mean_lower, mean_upper) =
         eta_bands_from_matrix(eta.view(), family_kind, level)?;
     Ok(PosteriorPredictBandsPayload {
-        eta_mean,
-        eta_lower,
-        eta_upper,
+        linear_predictor: eta_mean,
+        linear_predictor_lower: eta_lower,
+        linear_predictor_upper: eta_upper,
         mean,
         mean_lower,
         mean_upper,

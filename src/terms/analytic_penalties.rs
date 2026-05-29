@@ -1294,6 +1294,63 @@ impl IsometryPenalty {
             }
         }
     }
+
+    /// Exact closed-form gradient of the isometry penalty with respect to the
+    /// cached decoder Jacobian `J ∈ ℝ^{n_obs × p × d}` (the autograd input that
+    /// torch's `_IsometryPenaltyFn` differentiates). Returns the flattened
+    /// `(n_obs, p*d)` layout that matches the Jacobian cache.
+    ///
+    /// Derivation (W-aware, reference-aware, weight-aware):
+    ///
+    ///   P        = ½ μ Σ_n ‖g_n − g^ref_n‖²_F,   g_n = J_n^T W_n J_n
+    ///   D_n      = g_n − g^ref_n   (symmetric, since g and g_ref are)
+    ///   ∂g_{ab}/∂J_{i,c}
+    ///            = δ_{ca}(W J)_{i,b} + δ_{cb}(W J)_{i,a}   (W symmetric)
+    ///   ∂P/∂J_{i,c}
+    ///            = μ Σ_{a,b} D_{ab} ∂g_{ab}/∂J_{i,c}
+    ///            = 2 μ Σ_b D_{cb} (W J)_{i,b}
+    ///            = 2 μ ((W J) D)_{i,c}
+    ///
+    /// where `μ = scalar_weight · exp(ρ_index)`. For the unweighted Euclidean
+    /// reference (`W = I`, `g^ref = I`, `scalar_weight = 1`) this collapses to
+    /// the familiar `2 μ J (J^T J − I)`.
+    pub fn grad_jacobian(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array2<f64> {
+        let d = self
+            .target
+            .latent_dim
+            .expect("IsometryPenalty requires latent_dim on its PsiSlice");
+        let n_obs = target.len() / d;
+        let p = self.p_out;
+        let mut grad = Array2::<f64>::zeros((n_obs, p * d));
+        if !self.has_jacobian_cache("grad_jacobian") {
+            return grad;
+        }
+        let Some(g) = self.pullback_metric(d) else {
+            return grad;
+        };
+        let g_ref = self.reference_metric(n_obs, d);
+        let mu = self.scalar_weight * rho[self.rho_index].exp();
+        for n in 0..n_obs {
+            let Some(wj) = self.weighted_jacobian_row(n, d) else {
+                return Array2::<f64>::zeros((n_obs, p * d));
+            };
+            for i in 0..p {
+                for c in 0..d {
+                    let mut acc = 0.0;
+                    for b in 0..d {
+                        let diff = g[[n, c * d + b]] - g_ref[[n, c * d + b]];
+                        acc += diff * wj[[i, b]];
+                    }
+                    grad[[n, i * d + c]] = 2.0 * mu * acc;
+                }
+            }
+        }
+        grad
+    }
 }
 
 impl AnalyticPenalty for IsometryPenalty {
@@ -2747,6 +2804,30 @@ impl JumpReLUPenalty {
         let slope = gate * (1.0 - gate);
         self.weight * tau * slope * slope / (self.smoothing_eps * self.smoothing_eps)
     }
+}
+
+/// JumpReLU activation gate `φ(z) = z · 1[z > τ]` together with the
+/// straight-through-estimator derivatives of its smooth surrogate
+/// `φ̃(z) = z · σ((z − τ)/ε)`. The forward value is the hard gate; the backward
+/// uses the surrogate's gradients so the activation has a usable subgradient in
+/// the smoothing band `|z − τ| ≲ ε`:
+///
+///   g       = σ((z − τ)/ε)
+///   φ        = z · 1[z > τ]                 (returned value)
+///   ∂φ̃/∂z   = g + z · g (1 − g) / ε          (`dphi_dz`)
+///   ∂φ̃/∂τ   = − z · g (1 − g) / ε            (`dphi_dtau`)
+///
+/// This is the single Rust source of truth that `gamfit.torch`'s
+/// `_JumpReLUSTEFn` consumes so the torch activation gate's backward matches the
+/// smoothed gate exactly instead of re-deriving it in Python.
+#[must_use]
+pub fn jumprelu_gate_value_grad(z: f64, tau: f64, smoothing_eps: f64) -> (f64, f64, f64) {
+    let g = crate::linalg::utils::stable_logistic((z - tau) / smoothing_eps);
+    let value = if z > tau { z } else { 0.0 };
+    let slope = z * g * (1.0 - g) / smoothing_eps;
+    let dphi_dz = g + slope;
+    let dphi_dtau = -slope;
+    (value, dphi_dz, dphi_dtau)
 }
 
 impl AnalyticPenalty for JumpReLUPenalty {
