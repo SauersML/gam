@@ -370,6 +370,16 @@ pub fn compile_with_dual_metric(
         // Compose V = D · T_inner (raw-block → kept).
         let v = fast_ab(&d, &t_inner);
 
+        // `m_h_inner_opt` was residualised against `anchor_h` as it stands
+        // *here*, i.e. the cumulative kept-direction anchor of all PRIOR
+        // blocks. Snapshot that pre-append anchor and its raw counterpart
+        // before this block's residual columns are appended below; the
+        // change-of-basis for this block's correction must be expressed
+        // against the prior-block anchor that `m` is indexed against, not the
+        // post-append anchor that already carries this block's own columns.
+        let prior_anchor_h = anchor_h.clone();
+        let prior_raw_anchor_h = raw_anchor_h.clone();
+
         // Append residual-V columns to both cumulative anchors so future
         // blocks see the structurally-orthogonal and curvature-orthogonal
         // residual designs of this block, never the raw scaled block.
@@ -386,34 +396,39 @@ pub fn compile_with_dual_metric(
         // is the *raw* anchor evaluation (one column per raw anchor column).
         //
         // `m_h_inner_opt · t_inner` (call it `M_kept`) lives in the
-        // *kept-direction* anchor coordinates of `anchor_h`: its row count is
-        // `anchor_h.ncols()`, which equals the raw anchor width only when no
-        // upstream block shed an aliased column. The predict path multiplies
-        // by the raw anchor matrix `A_raw`, so we must re-express `M_kept` in
-        // raw-anchor-column coordinates.
+        // *kept-direction* anchor coordinates of the PRIOR-block anchor
+        // `prior_anchor_h` (the value `anchor_h` held when `m` was produced at
+        // `residualise_in_metric` above, before this block's residual columns
+        // were appended). Its row count is `prior_anchor_h.ncols()`, which
+        // equals the prior-block raw anchor width only when no upstream block
+        // shed an aliased column. The predict path multiplies by the raw
+        // anchor matrix `A_raw` (one column per raw anchor column of the prior
+        // blocks), so we must re-express `M_kept` in raw-anchor-column
+        // coordinates.
         //
-        // `anchor_h` and `raw_anchor_h` span the same column space in the
-        // curvature metric (the residualisation/rotation only drops directions
-        // that lie inside that span), so there is an exact `Z` with
-        // `raw_anchor_h · Z = anchor_h`. Then
-        //   `anchor_h · M_kept = raw_anchor_h · (Z · M_kept)`,
+        // `prior_anchor_h` and `prior_raw_anchor_h` span the same column space
+        // in the curvature metric (the residualisation/rotation only drops
+        // directions that lie inside that span), so there is an exact `Z` with
+        // `prior_raw_anchor_h · Z = prior_anchor_h`. Then
+        //   `prior_anchor_h · M_kept = prior_raw_anchor_h · (Z · M_kept)`,
         // and the raw-coordinate correction is `M_raw = Z · M_kept`, with row
-        // count `raw_anchor_h.ncols()` = the sum of raw anchor block widths.
-        // `Z = (raw_anchor_hᵀ raw_anchor_h)⁺ raw_anchor_hᵀ anchor_h` is the
-        // metric-exact least-squares change of basis (`solve_psd_system`).
+        // count `prior_raw_anchor_h.ncols()` = the sum of prior raw anchor
+        // block widths. `Z = (Aᵀ A)⁺ Aᵀ prior_anchor_h` (with
+        // `A = prior_raw_anchor_h`) is the metric-exact least-squares change of
+        // basis (`solve_psd_system`).
         let m_compiled = match m_h_inner_opt.as_ref() {
             Some(m) => {
                 let m_kept = fast_ab(m, &t_inner);
-                if m_kept.nrows() != anchor_h.ncols() {
+                if m_kept.nrows() != prior_anchor_h.ncols() {
                     return Err(CompilerError::DimensionMismatch(format!(
-                        "anchor correction must be indexed by kept anchor directions: \
-                         m_kept has {} rows but anchor_h has {} columns",
+                        "anchor correction must be indexed by prior-block kept anchor directions: \
+                         m_kept has {} rows but prior_anchor_h has {} columns",
                         m_kept.nrows(),
-                        anchor_h.ncols()
+                        prior_anchor_h.ncols()
                     )));
                 }
-                let g_raw = fast_atb(&raw_anchor_h, &raw_anchor_h);
-                let z_rhs = fast_atb(&raw_anchor_h, &anchor_h);
+                let g_raw = fast_atb(&prior_raw_anchor_h, &prior_raw_anchor_h);
+                let z_rhs = fast_atb(&prior_raw_anchor_h, &prior_anchor_h);
                 let z = solve_psd_system(&g_raw, &z_rhs)?;
                 Some(fast_ab(&z, &m_kept))
             }
