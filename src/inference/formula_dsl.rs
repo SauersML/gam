@@ -743,6 +743,43 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
+    fn linkwiggle_parser_does_not_bake_in_cubic_only_restriction() {
+        // Regression for #384: the cubic-only constraint belongs to the
+        // score-warp / link-deviation `DeviationRuntime`, NOT to this shared
+        // parser. `parse_linkwiggle_formulaspec` also feeds `timewiggle` and
+        // the location-scale survival path, whose general monotone I-spline
+        // value basis honors any `degree >= 2`. So the parser must accept
+        // non-cubic degrees and carry them through verbatim; the cubic gate is
+        // applied downstream only where the cubic-only runtime is built. A
+        // prior fix wrongly forced `degree == 3` here, breaking timewiggle and
+        // location-scale callers — this pins that the parser stays general.
+        for deg in [2usize, 4, 5, 10] {
+            let mut options = BTreeMap::new();
+            options.insert("degree".to_string(), deg.to_string());
+            options.insert("internal_knots".to_string(), "3".to_string());
+            let raw = format!("timewiggle(degree={deg}, internal_knots=3)");
+            let spec = parse_linkwiggle_formulaspec(&options, &raw)
+                .expect("non-cubic wiggle degree must parse at the shared layer");
+            assert_eq!(
+                spec.degree, deg,
+                "parser must carry the requested degree through verbatim"
+            );
+        }
+
+        // The only universal lower bound the shared parser enforces is that a
+        // polynomial degree is positive.
+        let mut zero = BTreeMap::new();
+        zero.insert("degree".to_string(), "0".to_string());
+        zero.insert("internal_knots".to_string(), "3".to_string());
+        let err = parse_linkwiggle_formulaspec(&zero, "linkwiggle(degree=0, internal_knots=3)")
+            .expect_err("degree=0 must be rejected");
+        assert!(
+            err.contains("degree >= 1"),
+            "error should state the positive-degree lower bound, got: {err}"
+        );
+    }
+
+    #[test]
     fn parses_nested_formula_terms() {
         let parsed =
             parse_formula_dsl("log(y) ~ x1 + s(log(x2 + 1), bs=\"tps\", k=10) + te(x3, x4)")
@@ -891,52 +928,6 @@ mod tests {
         assert_eq!(parsed.logslope_surfaces[0].terms.len(), 1);
         assert_eq!(parsed.logslope_surfaces[1].z_column, "z3");
         assert_eq!(parsed.logslope_surfaces[1].terms.len(), 1);
-    }
-
-    #[test]
-    fn linkwiggle_rejects_non_cubic_degree_at_parse_time() {
-        // Regression for #384: the score-warp / link-deviation runtime is a
-        // structurally cubic I-spline basis (`DeviationRuntime`), so the only
-        // realizable `degree` is 3. Previously `parse_linkwiggle_formulaspec`
-        // accepted any `degree >= 1`, then the fit blew up deep in
-        // `build_deviation_block_from_knots_and_design_seed` with "structural
-        // deviation runtime is cubic; degree must be 3, got k" — a documented
-        // knob that always fails for non-3 values after expensive setup. The
-        // contract must be enforced up front, at parse time.
-        for deg in [1usize, 2, 4, 10] {
-            let mut options = BTreeMap::new();
-            options.insert("degree".to_string(), deg.to_string());
-            options.insert("internal_knots".to_string(), "3".to_string());
-            let raw = format!("linkwiggle(degree={deg}, internal_knots=3)");
-            let err = parse_linkwiggle_formulaspec(&options, &raw)
-                .expect_err("non-cubic linkwiggle degree must be rejected at parse time");
-            assert!(
-                err.contains("degree must be 3"),
-                "error should state degree must be 3, got: {err}"
-            );
-            assert!(
-                err.contains("cubic"),
-                "error should explain the runtime is cubic, got: {err}"
-            );
-            assert!(
-                err.contains(&format!("degree={deg}")),
-                "error should echo the rejected degree, got: {err}"
-            );
-        }
-
-        // degree=3 (and the default, when `degree` is omitted) must still parse.
-        let mut three = BTreeMap::new();
-        three.insert("degree".to_string(), "3".to_string());
-        three.insert("internal_knots".to_string(), "3".to_string());
-        let spec = parse_linkwiggle_formulaspec(&three, "linkwiggle(degree=3, internal_knots=3)")
-            .expect("degree=3 must parse");
-        assert_eq!(spec.degree, 3);
-
-        let mut omitted = BTreeMap::new();
-        omitted.insert("internal_knots".to_string(), "3".to_string());
-        let spec = parse_linkwiggle_formulaspec(&omitted, "linkwiggle(internal_knots=3)")
-            .expect("omitted degree must default to cubic");
-        assert_eq!(spec.degree, 3, "default degree must be cubic");
     }
 
     #[test]
@@ -1611,25 +1602,22 @@ pub fn parse_linkwiggle_formulaspec(
     // Strict parsing: a present-but-unparseable value (`degree=abc`, `=-3`,
     // `=6.5`) must be rejected, not silently dropped and replaced by the
     // default as the lossy `option_usize`/`option_bool` readers would do.
-    // The score-warp / link-deviation runtime that consumes this spec is a
-    // monotone *cubic* I-spline derivative-control basis (see
-    // `DeviationRuntime` / `build_deviation_block_from_knots_and_design_seed`):
-    // its span tables, C2-continuous I-spline construction, and derivative
-    // operators (orders up to 3) are all structurally cubic. There is no
-    // arbitrary-degree code path. So `degree` is a single-valued contract:
-    // only 3 is realizable. Reject any other value here, up front, with a
-    // message explaining why — rather than parsing it successfully and then
-    // failing deep inside the solver after expensive setup ("structural
-    // deviation runtime is cubic; degree must be 3, got k"). A documented
-    // option that silently accepts values it can never honor is a lie.
+    //
+    // This parser is shared by *all* wiggle grammars: `linkwiggle` and
+    // `timewiggle` (see `parse_formula`), the standard-model flexible-link
+    // wiggle, and the marginal-slope score-warp / link-deviation routing.
+    // The general monotone I-spline value basis (`monotone_wiggle_*` in
+    // `families::gamlss`, used by `timewiggle` and the location-scale survival
+    // path) honors arbitrary `degree >= 2`, while only the cubic-only
+    // score-warp / link-deviation `DeviationRuntime` is restricted to 3.
+    // A consumer-specific limit therefore must NOT be baked into this shared
+    // parser — it is enforced at the routing layer that feeds the cubic-only
+    // runtime (`deviation_block_config_from_formula_linkwiggle`). Here we only
+    // enforce the universal lower bound that a polynomial degree is positive.
     let degree = option_usize_strict(options, "degree")?.unwrap_or(defaults.degree);
-    if degree != 3 {
+    if degree < 1 {
         return Err(FormulaDslError::InvalidArgument {
-            reason: format!(
-                "{term_name}() degree must be 3: the monotone score-warp / \
-                 link-deviation basis is a cubic I-spline runtime and only \
-                 supports cubic splines; got degree={degree}: {raw}"
-            ),
+            reason: format!("{term_name}() requires degree >= 1: {raw}"),
         }
         .into());
     }

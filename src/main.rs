@@ -7419,16 +7419,33 @@ fn saved_compiled_flex_block(runtime: &DeviationRuntime) -> SavedCompiledFlexBlo
 
 fn deviation_block_config_from_formula_linkwiggle(
     wiggle: &LinkWiggleFormulaSpec,
-) -> DeviationBlockConfig {
+) -> Result<DeviationBlockConfig, String> {
+    // The score-warp / link-deviation block is realized by the structurally
+    // *cubic* I-spline `DeviationRuntime` (see
+    // `build_deviation_block_from_knots_and_design_seed`): its span tables,
+    // C2-continuous construction, and derivative operators are all hard-wired
+    // to cubic, so the only realizable `degree` is 3. The shared formula parser
+    // intentionally stays general (it also feeds the arbitrary-degree
+    // `timewiggle` / location-scale monotone basis), so the cubic-only contract
+    // is enforced here, at the routing boundary that feeds this runtime —
+    // up front, instead of failing deep inside the fit after expensive setup.
+    if wiggle.degree != 3 {
+        return Err(format!(
+            "linkwiggle() degree must be 3 when routed into the score-warp / \
+             link-deviation block: that runtime is a cubic I-spline and only \
+             supports cubic splines; got degree={}",
+            wiggle.degree
+        ));
+    }
     let defaults = WigglePenaltyConfig::cubic_triple_operator_default();
-    DeviationBlockConfig {
+    Ok(DeviationBlockConfig {
         degree: wiggle.degree,
         num_internal_knots: wiggle.num_internal_knots,
         penalty_order: *wiggle.penalty_orders.iter().max().unwrap_or(&2),
         penalty_orders: wiggle.penalty_orders.clone(),
         double_penalty: wiggle.double_penalty,
         monotonicity_eps: defaults.monotonicity_eps,
-    }
+    })
 }
 
 #[derive(Debug)]
@@ -7442,8 +7459,12 @@ fn route_marginal_slope_deviation_blocks(
     logslope_linkwiggle: Option<&LinkWiggleFormulaSpec>,
 ) -> Result<MarginalSlopeDeviationRouting, String> {
     Ok(MarginalSlopeDeviationRouting {
-        score_warp: logslope_linkwiggle.map(deviation_block_config_from_formula_linkwiggle),
-        link_dev: main_linkwiggle.map(deviation_block_config_from_formula_linkwiggle),
+        score_warp: logslope_linkwiggle
+            .map(deviation_block_config_from_formula_linkwiggle)
+            .transpose()?,
+        link_dev: main_linkwiggle
+            .map(deviation_block_config_from_formula_linkwiggle)
+            .transpose()?,
     })
 }
 
@@ -12657,13 +12678,14 @@ mod tests {
     #[test]
     fn marginal_slope_linkwiggle_routes_into_anchored_deviation_config() {
         let parsed = parse_formula(
-            "y ~ x + linkwiggle(degree=4, internal_knots=9, penalty_order=\"1,3\", double_penalty=false)",
+            "y ~ x + linkwiggle(degree=3, internal_knots=9, penalty_order=\"1,3\", double_penalty=false)",
         )
         .expect("formula");
         let routed = super::deviation_block_config_from_formula_linkwiggle(
             parsed.linkwiggle.as_ref().expect("linkwiggle config"),
-        );
-        assert_eq!(routed.degree, 4);
+        )
+        .expect("cubic linkwiggle must route into the deviation config");
+        assert_eq!(routed.degree, 3);
         assert_eq!(routed.num_internal_knots, 9);
         assert_eq!(routed.penalty_order, 3);
         assert_eq!(routed.penalty_orders, vec![1, 3]);
@@ -12671,13 +12693,48 @@ mod tests {
     }
 
     #[test]
+    fn marginal_slope_linkwiggle_rejects_non_cubic_degree_at_routing_boundary() {
+        // Regression for #384: the score-warp / link-deviation block is a
+        // structurally cubic I-spline `DeviationRuntime`, so only degree 3 is
+        // realizable. The shared formula parser stays general (it also feeds
+        // arbitrary-degree timewiggle / location-scale wiggles), so non-cubic
+        // linkwiggle degrees must be rejected at this routing boundary — up
+        // front, with a clear cubic-only message — instead of parsing fine and
+        // then blowing up deep in the fit with "structural deviation runtime is
+        // cubic; degree must be 3, got k". On the pre-fix code these degrees
+        // routed successfully (the test would fail at the `expect_err`).
+        for deg in [1usize, 2, 4, 5, 10] {
+            let parsed = parse_formula(&format!(
+                "y ~ x + linkwiggle(degree={deg}, internal_knots=9)"
+            ))
+            .expect("non-cubic linkwiggle must still parse at the shared layer");
+            let err = super::deviation_block_config_from_formula_linkwiggle(
+                parsed.linkwiggle.as_ref().expect("linkwiggle config"),
+            )
+            .expect_err("non-cubic linkwiggle must be rejected when routed into the cubic block");
+            assert!(
+                err.contains("degree must be 3"),
+                "error should state degree must be 3, got: {err}"
+            );
+            assert!(
+                err.contains("cubic"),
+                "error should explain the runtime is cubic, got: {err}"
+            );
+            assert!(
+                err.contains(&format!("degree={deg}")),
+                "error should echo the rejected degree, got: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn marginal_slope_deviation_routing_splits_main_and_logslope_linkwiggles() {
         let parsed_main = parse_formula(
-            "y ~ x + linkwiggle(degree=4, internal_knots=9, penalty_order=\"1,3\", double_penalty=false)",
+            "y ~ x + linkwiggle(degree=3, internal_knots=9, penalty_order=\"1,3\", double_penalty=false)",
         )
         .expect("main formula");
         let (_, parsed_logslope) = parse_matching_auxiliary_formula(
-            "1 + linkwiggle(degree=5, internal_knots=7, penalty_order=\"2,3\")",
+            "1 + linkwiggle(degree=3, internal_knots=7, penalty_order=\"2,3\")",
             "y",
             "--logslope-formula",
         )
@@ -12689,16 +12746,37 @@ mod tests {
         .expect("routing");
         let link_dev = routed.link_dev.expect("main link-deviation config");
         let score_warp = routed.score_warp.expect("logslope score-warp config");
-        assert_eq!(link_dev.degree, 4);
+        assert_eq!(link_dev.degree, 3);
         assert_eq!(link_dev.num_internal_knots, 9);
         assert_eq!(link_dev.penalty_order, 3);
         assert_eq!(link_dev.penalty_orders, vec![1, 3]);
         assert!(!link_dev.double_penalty);
-        assert_eq!(score_warp.degree, 5);
+        assert_eq!(score_warp.degree, 3);
         assert_eq!(score_warp.num_internal_knots, 7);
         assert_eq!(score_warp.penalty_order, 3);
         assert_eq!(score_warp.penalty_orders, vec![2, 3]);
         assert!(score_warp.double_penalty);
+    }
+
+    #[test]
+    fn marginal_slope_routing_rejects_non_cubic_in_either_slot() {
+        // #384: rejection must trigger from either the main (link-deviation)
+        // or logslope (score-warp) slot, since both feed the cubic runtime.
+        let parsed_main = parse_formula("y ~ x + linkwiggle(degree=4, internal_knots=9)")
+            .expect("main formula parses");
+        let err = super::route_marginal_slope_deviation_blocks(parsed_main.linkwiggle.as_ref(), None)
+            .expect_err("non-cubic main linkwiggle must be rejected at routing");
+        assert!(err.contains("degree must be 3"), "got: {err}");
+
+        let (_, parsed_logslope) = parse_matching_auxiliary_formula(
+            "1 + linkwiggle(degree=5, internal_knots=7)",
+            "y",
+            "--logslope-formula",
+        )
+        .expect("logslope formula parses");
+        let err = super::route_marginal_slope_deviation_blocks(None, parsed_logslope.linkwiggle.as_ref())
+            .expect_err("non-cubic logslope linkwiggle must be rejected at routing");
+        assert!(err.contains("degree must be 3"), "got: {err}");
     }
 
     #[test]
