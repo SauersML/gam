@@ -1,8 +1,6 @@
 //! Bernoulli marginal-slope concrete impls for the family-agnostic
 //! identifiability compiler (`crate::families::identifiability_compiler`).
 //!
-//! Phase 2 architecture: `docs/identifiability_compiler.md` §1, §2, §4, §9.
-//!
 //! Bernoulli's row primary state is the scalar linear predictor `η_i`, so
 //! `K = 1` throughout. Every block's row Jacobian is the row of its dense
 //! design matrix; the row Hessian is the standard probit IRLS weight

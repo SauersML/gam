@@ -3338,11 +3338,14 @@ fn validate_nuts_target_accept(target_accept: f64) -> Result<(), HmcError> {
 const MIN_NUTS_SAMPLES: usize = 4;
 
 /// Minimum number of parallel chains. With zero chains the engine receives an
-/// empty initial-position vector and panics in `ndarray::stack`; with a single
-/// chain the between-chain variance in the split-R-hat diagnostic is undefined.
-/// Two chains is the smallest count for which convergence diagnostics are
-/// meaningful.
-const MIN_NUTS_CHAINS: usize = 2;
+/// empty initial-position vector and panics in `ndarray::stack` (and the
+/// Laplace fallback would produce an empty `(0, p)` posterior). A *single*
+/// chain is well-defined and is a supported, tested configuration: the engine
+/// splits each chain in half for the diagnostic, so one chain still yields the
+/// two split-chains the R-hat path needs, and `compute_split_rhat_and_ess`
+/// gracefully early-returns for `n_chains < 2`. We therefore only reject the
+/// genuinely-degenerate `n_chains == 0`.
+const MIN_NUTS_CHAINS: usize = 1;
 
 /// Validate the draw / chain counts of a NUTS configuration up front, mirroring
 /// `validate_nuts_target_accept`, so that out-of-range values surface as a typed
@@ -3352,8 +3355,8 @@ fn validate_nuts_draws(config: &NutsConfig) -> Result<(), HmcError> {
     if config.n_chains < MIN_NUTS_CHAINS {
         return Err(HmcError::InvalidConfig {
             reason: format!(
-                "NUTS n_chains must be >= {MIN_NUTS_CHAINS} so between-chain \
-                 convergence diagnostics are defined, got {}",
+                "NUTS n_chains must be >= {MIN_NUTS_CHAINS}; with zero chains the \
+                 sampler has no initial positions to run, got {}",
                 config.n_chains
             ),
         });
@@ -3371,8 +3374,9 @@ fn validate_nuts_draws(config: &NutsConfig) -> Result<(), HmcError> {
 }
 
 /// Full up-front validation of a NUTS configuration shared by every sampling
-/// entry point (dense, link-wiggle, joint (β, ρ), survival).
-fn validate_nuts_config(config: &NutsConfig) -> Result<(), HmcError> {
+/// entry point (dense NUTS, link-wiggle, joint (β, ρ), survival, the
+/// auto-selected Pólya-Gamma Gibbs path, and the Laplace-Gaussian fallback).
+pub(crate) fn validate_nuts_config(config: &NutsConfig) -> Result<(), HmcError> {
     validate_nuts_target_accept(config.target_accept)?;
     validate_nuts_draws(config)?;
     Ok(())
@@ -3627,6 +3631,13 @@ pub fn run_logit_polya_gamma_gibbs(
         .into());
     }
     validate_binary_responses("run_logit_polya_gamma_gibbs", &y, &weights).map_err(String::from)?;
+    // Issue #399: the auto-selected PG-Gibbs path is reached for the canonical
+    // unit-weight Bernoulli-logit GAM. Without this guard, `n_chains == 0` /
+    // `n_samples == 0` would not panic but silently return a degenerate empty
+    // `(0, p)` posterior, diverging from the typed error the NUTS path raises
+    // for the same inputs. Route it through the shared validator so every
+    // `Model.sample` surface rejects degenerate draw/chain counts identically.
+    validate_nuts_config(config).map_err(String::from)?;
 
     let n_iter = config.nwarmup + config.n_samples;
 
