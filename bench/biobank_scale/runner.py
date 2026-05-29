@@ -1849,6 +1849,15 @@ def rust_formula_classification(spec: MethodSpec) -> tuple[str, str]:
     smooths. Lat/lon coordinates are NOT used as predictors. The mean and
     sigma blocks share the joint-PC term so any heteroscedastic structure
     is over the same ancestry surface as the location surface.
+
+    For binomial location-scale lanes (``include_sigma=True``) the CLI
+    rejects the default logit link with ``binomial blended-inverse-link
+    location-scale fitting requires link(type=blended(...))`` because the
+    Logit + ``--predict-noise`` path is gated on an explicit mixture/blended
+    link spec. The marginal-slope companion already pins ``link(type=probit)``
+    for the same reason, so we use the same standard-link choice here to
+    keep all biobank ancestry-manifold lanes routed through a comparable
+    binomial inverse-link.
     """
     centers = int(spec.centers or 60)
     pc_count = int(spec.pc_count)
@@ -1859,6 +1868,8 @@ def rust_formula_classification(spec: MethodSpec) -> tuple[str, str]:
         "smooth(age_entry_std)",
         spatial,
     ]
+    if spec.include_sigma:
+        mean_terms.append("link(type=probit)")
     sigma_terms = [
         "smooth(age_entry_std)",
         spatial,
