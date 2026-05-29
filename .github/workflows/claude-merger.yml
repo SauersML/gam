@@ -1,4 +1,4 @@
-name: Claude Merger (improve, merge, release)
+name: Claude Releaser (review main, improve, release)
 
 on:
   schedule:
@@ -13,32 +13,38 @@ permissions:
   actions: write
 
 jobs:
-  check_open_prs:
-    # Gate: the merger only has work when there's at least one open PR.
-    # On scheduled runs with no open PRs, skip the heavy job entirely so
-    # we don't burn a runner just to have Claude exit immediately.
+  check_unreleased:
+    # Gate: the agent only has work when `main` has advanced since the
+    # last release. On scheduled runs with nothing new to ship, skip the
+    # heavy job so we don't burn a runner just to have Claude exit.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      has_open_prs: ${{ steps.check.outputs.has_open_prs }}
+      has_unreleased: ${{ steps.check.outputs.has_unreleased }}
     steps:
-      - name: Check for open PRs
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check for unreleased commits on main
         id: check
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euxo pipefail
-          count=$(gh pr list --repo "${{ github.repository }}" --state open --json number --jq 'length')
-          echo "open PR count: $count"
-          if [ "$count" -gt 0 ]; then
-            echo "has_open_prs=true" >> "$GITHUB_OUTPUT"
+          last_release=$(git log -1 --grep='^release:' --format='%H' || true)
+          if [ -n "$last_release" ]; then
+            count=$(git rev-list --count "${last_release}..HEAD")
           else
-            echo "has_open_prs=false" >> "$GITHUB_OUTPUT"
+            count=$(git rev-list --count HEAD)
+          fi
+          echo "commits on main since last release: $count"
+          if [ "$count" -gt 0 ]; then
+            echo "has_unreleased=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_unreleased=false" >> "$GITHUB_OUTPUT"
           fi
 
-  merge:
-    needs: check_open_prs
-    if: needs.check_open_prs.outputs.has_open_prs == 'true'
+  release:
+    needs: check_unreleased
+    if: needs.check_unreleased.outputs.has_unreleased == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
@@ -83,72 +89,51 @@ jobs:
             Hi Claude. You have the run of this repo, an Ubuntu runner, no
             turn budget, and as long as you need.
 
-            Your job each run, in order:
+            Fixes land directly on `main` now — the fixer and bug-hunt
+            agents commit straight to main, so there are no PRs to merge.
+            Your job is to keep main releasable and to ship it. Each run,
+            in order:
 
-              1. Find the open PR most worth landing this run.
-              2. Make it beautiful — bring any in-scope work into the PR
-                 itself until the change is genuinely complete and
-                 principled, not just "passes CI."
-              3. If main has moved, rebase / merge main into the PR branch
-                 by hand-resolving every conflict line-by-line.
-              4. Merge into `main` directly (no intermediate branches).
-              5. Bump versions and publish: crates.io for the Rust crate,
+              1. Review the unreleased work on `main` (everything since the
+                 last `release:` commit).
+              2. Make it beautiful — if anything that landed is sub-bar
+                 (missing tests, half-fix, brittle abstraction, sloppy
+                 error handling), finish it properly by committing directly
+                 to `main` and pushing as you go. Don't ship a half-fix.
+              3. Bump versions and publish: crates.io for the Rust crate,
                  PyPI for the `gamfit` Python wheel.
-              6. Monitor the publish workflows until they actually succeed
+              4. Monitor the publish workflows until they actually succeed
                  on the registries.
 
-            ## 1 — Picking the PR
+            ## 1 — Review the unreleased work on main
 
-            `gh pr list --state open --limit 100`, then `gh pr view <N>`
-            on the candidates. Skip:
-              - Drafts.
-              - PRs whose head ref had a commit pushed in the last 45
-                minutes (the fixer agent's heartbeat — they're not done).
-              - PRs with an explicit `do-not-merge` / `wip` label.
-            From the rest, pick what you judge most worth landing — the
-            most impactful, the most overdue, the most under-attended
-            subsystem. Your call. If nothing qualifies, exit cleanly.
+            Find the last release with `git log -1 --grep='^release:'
+            --format='%H'`, then read what has landed since:
+            `git log <last-release>..origin/main` and `git show` the diffs
+            that look user-facing, following the issues they reference
+            (`gh issue view <N>`). Build a clear picture of what this
+            release would ship.
 
-            **Never close a PR.** No `gh pr close`, ever. If a PR
-            shouldn't merge as-is, you improve it until it should.
+            If nothing of user-facing substance has landed since the last
+            release, exit cleanly — you don't need to cut a release every
+            run.
 
             ## 2 — Improve until it's beautiful
 
-            Bring work into scope freely. Suboptimal PR? Push the
-            improvements onto its branch directly. Missing tests, brittle
-            abstraction, sloppy error handling, half-implemented
-            adjacent thing the PR pretends to address — fix it in the
-            same PR. The bar is the same as the fixer agent's: principled,
-            root-cause, long-term correct, fully verified. Comment on the
-            PR as you go so the author / observers see the trail.
+            If any landed change is sub-bar, fix it before you ship —
+            commit the improvement directly to `main` and push as you go
+            (pull --rebase first if main has moved; never stash). Missing
+            tests, brittle abstraction, sloppy error handling, a
+            half-implemented adjacent thing — bring it up to the same bar
+            the fixer agent holds: principled, root-cause, long-term
+            correct, fully verified.
 
-            If the PR's underlying issue is only partially addressed
-            (e.g. the PR fixes the reported symptom but not the deeper
-            root cause), finish the deeper work in the same PR before
-            merging. Do not merge a half-fix and tell yourself a follow-
-            up will land later.
+            If a landed change only partially addressed its issue (fixed
+            the reported symptom but not the deeper root cause), finish the
+            deeper work on `main` before cutting the release. Do not ship a
+            half-fix and tell yourself a follow-up will land later.
 
-            ## 3 — Conflict resolution, by hand
-
-            If `main` has moved and conflicts arise, merge `main` into
-            the PR branch (`git checkout <pr-branch> && git merge origin/main`)
-            and resolve every conflict by reading both sides and writing
-            the correct unified content yourself using Edit / Write. No
-            strategy flags — no `-X theirs`, no `-X ours`, no
-            `--strategy ours`. Every conflict hunk is a real semantic
-            decision that you make explicitly. Verify the resolution
-            builds and the relevant tests pass before continuing.
-
-            ## 4 — Merge into main
-
-            Once the PR is complete, conflicts resolved, tests green for
-            the touched subsystem, merge it into `main`:
-                `gh pr merge <N> --merge --delete-branch=false`
-            (or `--squash` if the history is messy and squashing produces
-            a cleaner record — your call). No intermediate branches, no
-            staging branches. Direct to `main`.
-
-            ## 5 — Bump versions and publish
+            ## 3 — Bump versions and publish
 
             After every merge that lands user-facing code, cut a release:
 
@@ -178,7 +163,7 @@ jobs:
             maintainer wants. Fall back to direct publish only if the
             workflow path is broken.
 
-            ## 6 — Watch the publish through
+            ## 4 — Watch the publish through
 
             Don't declare victory on `git push`. Watch the publish
             workflow runs (`gh run watch <id>` or poll `gh run list`)
@@ -188,8 +173,9 @@ jobs:
               - `curl -s https://crates.io/api/v1/crates/<crate>/versions | jq '.versions[0].num'`
               - `curl -s https://pypi.org/pypi/gamfit/json | jq -r '.info.version'`
             Both must equal the version you just bumped to before you
-            consider the run complete. Post the final state as a comment
-            on the merged PR so the maintainer can see at a glance that
+            consider the run complete. Note the final state — a brief
+            comment on a representative shipped issue, or the release
+            commit message — so the maintainer can see at a glance that the
             release succeeded.
 
             If the publish fails for a real reason (e.g. crates.io
