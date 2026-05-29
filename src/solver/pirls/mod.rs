@@ -151,31 +151,6 @@ fn estimate_gamma_shape_from_eta(
     0.5 * (lo + hi)
 }
 
-#[inline]
-fn gamma_loglikelihood_with_shape(
-    y: ArrayView1<'_, f64>,
-    mu: &Array1<f64>,
-    priorweights: ArrayView1<'_, f64>,
-    shape: f64,
-) -> f64 {
-    const EPS: f64 = 1e-12;
-    use rayon::iter::{IntoParallelIterator, ParallelIterator};
-    let shape_c = shape.clamp(GAMMA_SHAPE_MIN, GAMMA_SHAPE_MAX);
-    let shape_ln = shape_c.ln();
-    let ln_gamma_shape = ln_gamma(shape_c);
-    (0..y.len())
-        .into_par_iter()
-        .map(|i| {
-            let yi_c = y[i].max(EPS);
-            let mui_c = mu[i].max(EPS);
-            priorweights[i]
-                * (shape_c * shape_ln - ln_gamma_shape - shape_c * mui_c.ln()
-                    + (shape_c - 1.0) * yi_c.ln()
-                    - shape_c * yi_c / mui_c)
-        })
-        .sum()
-}
-
 #[derive(Clone, Debug)]
 pub struct SparsePirlsDecision {
     pub path: PirlsLinearSolvePath,
