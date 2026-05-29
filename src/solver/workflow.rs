@@ -1399,6 +1399,35 @@ fn survival_unified_fit_result(
     .map_err(|err| err.to_string())
 }
 
+/// Replicate the single pooled-baseline coefficient seed (length `p`) across
+/// every competing-risks cause.
+///
+/// `build_working_model` fits one shared single-hazard Royston-Parmar baseline
+/// and returns a length-`p` coefficient seed (the Weibull scale/shape seed for
+/// the parametric path). The cause-specific assembly in
+/// `fit_cause_specific_survival_transformation_custom` stacks one coefficient
+/// block per cause and slices `cause * p..(cause + 1) * p` out of its
+/// `beta0_flat`, so it requires exactly `p * cause_count` initial coefficients.
+/// Passing the un-replicated length-`p` seed straight through (the original
+/// #378 fix did) aborts every `cause_count > 1` fit with a length-mismatch
+/// `SchemaMismatch`. Seeding every cause from the same pooled baseline is the
+/// correct start: each cause-specific block treats the competing causes as
+/// censored, so they share the pooled baseline hazard until PIRLS specializes.
+/// For `cause_count == 1` this is the identity.
+fn replicate_pooled_baseline_seed_per_cause(
+    pooled_seed: ArrayView1<'_, f64>,
+    cause_count: usize,
+) -> Array1<f64> {
+    let p = pooled_seed.len();
+    let mut beta0_flat = Array1::<f64>::zeros(p * cause_count);
+    for cause in 0..cause_count {
+        beta0_flat
+            .slice_mut(s![cause * p..(cause + 1) * p])
+            .assign(&pooled_seed);
+    }
+    beta0_flat
+}
+
 fn fit_cause_specific_survival_transformation_custom(
     spec: &SurvivalTransformationTermSpec,
     resolvedspec: TermCollectionSpec,
@@ -2018,6 +2047,7 @@ fn fit_survival_transformation_model(
     let (prepared, penalty_blocks, beta0, structural_lower_bounds, mut model) =
         build_working_model(&baseline_cfg)?;
     if cause_count > 1 || !spec.penalty_block_gamma_priors.is_empty() {
+        let beta0_flat = replicate_pooled_baseline_seed_per_cause(beta0.view(), cause_count);
         return fit_cause_specific_survival_transformation_custom(
             &spec,
             resolvedspec,
@@ -2025,7 +2055,7 @@ fn fit_survival_transformation_model(
             prepared,
             &dense_cov_design,
             penalty_blocks,
-            beta0,
+            beta0_flat,
             exact_derivative_guard,
             &spec.penalty_block_gamma_priors,
         );
@@ -6885,6 +6915,39 @@ mod tests {
             ],
         )
         .expect("load survival dataset")
+    }
+
+    #[test]
+    fn competing_risks_baseline_seed_replicates_to_match_cause_specific_beta_length() {
+        // Regression for #378's downstream break: the cause-specific assembly in
+        // `fit_cause_specific_survival_transformation_custom` requires exactly
+        // `p * cause_count` initial coefficients (it slices `cause * p..(cause +
+        // 1) * p` per cause). The pooled baseline working model returns a
+        // length-`p` seed, so without per-cause replication every `cause_count >
+        // 1` fit aborts with a `SchemaMismatch` length mismatch. This pins that
+        // the replication helper produces the exact length the assembly checks
+        // for, and seeds each cause from the same pooled baseline.
+        let pooled = Array1::from_vec(vec![-1.5_f64, 0.8, 0.0]);
+        let p = pooled.len();
+
+        for cause_count in [1usize, 2, 3] {
+            let flat = replicate_pooled_baseline_seed_per_cause(pooled.view(), cause_count);
+            // The exact invariant the cause-specific length guard enforces.
+            assert_eq!(
+                flat.len(),
+                p * cause_count,
+                "replicated seed must satisfy the `p * cause_count` length contract"
+            );
+            // Every per-cause slice must equal the shared pooled baseline seed.
+            for cause in 0..cause_count {
+                let slice = flat.slice(s![cause * p..(cause + 1) * p]);
+                assert_eq!(
+                    slice.to_owned(),
+                    pooled,
+                    "cause {cause} block must be seeded from the pooled baseline"
+                );
+            }
+        }
     }
 
     #[test]
