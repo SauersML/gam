@@ -1078,6 +1078,12 @@ pub fn validate_marginal_slope_z_column_exclusion(
 pub enum SmoothKind {
     S,
     Te,
+    /// Tensor *interaction* smooth (`ti(...)`): a tensor-product smooth whose
+    /// marginal main effects are excluded, so the term captures only the pure
+    /// interaction between its variables. Materializes through the same tensor
+    /// path as [`SmoothKind::Te`] but with per-margin sum-to-zero
+    /// identifiability (`TensorBSplineIdentifiability::MarginalSumToZero`).
+    Ti,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2181,6 +2187,26 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                     options,
                 });
             }
+            "ti" => {
+                // Tensor interaction smooth (mgcv `ti`): structurally a
+                // tensor-product smooth, but the marginal main effects are
+                // excluded so only the pure interaction is modeled. Shares the
+                // tensor materialization path with `te`; the distinct
+                // `SmoothKind::Ti` drives per-margin sum-to-zero
+                // identifiability in the term builder.
+                if vars.len() < 2 {
+                    return Err(FormulaDslError::InvalidArgument {
+                        reason: format!("ti() requires at least two variables: {raw}"),
+                    }
+                    .into());
+                }
+                return Ok(ParsedTerm::Smooth {
+                    label: raw.to_string(),
+                    vars,
+                    kind: SmoothKind::Ti,
+                    options,
+                });
+            }
             "fs" | "sz" => {
                 if vars.len() != 2 {
                     return Err(format!("{}() expects exactly two variables: {raw}", name));
@@ -2434,7 +2460,7 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
             }
             _ => {
                 return Err(format!(
-                    "unknown term function `{name}` in '{raw}'. Supported: bounded(), linear(), constrain()/constraint()/box(), nonnegative(), nonpositive(), smooth()/s(), cyclic()/cc()/cp(), thinplate()/thin_plate()/tps(), tensor()/interaction()/te(), fs(), sz(), group()/re()/factor(), sphere()/sos()/spherical(), s2(), matern(), duchon(), pca(), logslope()/log_slope(), linkwiggle(), timewiggle(), link(), survmodel()"
+                    "unknown term function `{name}` in '{raw}'. Supported: bounded(), linear(), constrain()/constraint()/box(), nonnegative(), nonpositive(), smooth()/s(), cyclic()/cc()/cp(), thinplate()/thin_plate()/tps(), tensor()/interaction()/te(), ti(), fs(), sz(), group()/re()/factor(), sphere()/sos()/spherical(), s2(), matern(), duchon(), pca(), logslope()/log_slope(), linkwiggle(), timewiggle(), link(), survmodel()"
                 ));
             }
         }

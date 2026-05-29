@@ -983,18 +983,32 @@ fn parse_tensor_k_list(
 
 /// Parse the `identifiability=` option for tensor-product smooths. Mirrors the
 /// vocabulary of the Matern/Duchon parsers so the formula DSL is consistent.
+///
+/// `kind` selects the default identifiability when no explicit
+/// `identifiability=` option is supplied: `te(...)` ([`SmoothKind::Te`]) keeps
+/// the full-tensor sum-to-zero default, while `ti(...)` ([`SmoothKind::Ti`])
+/// defaults to per-margin sum-to-zero so the marginal main effects are excluded
+/// (the mgcv tensor-interaction semantics). An explicit option always wins.
 fn parse_tensor_identifiability(
     options: &BTreeMap<String, String>,
+    kind: SmoothKind,
 ) -> Result<TensorBSplineIdentifiability, String> {
     let Some(raw) = options.get("identifiability").map(String::as_str) else {
-        return Ok(TensorBSplineIdentifiability::default());
+        return Ok(match kind {
+            SmoothKind::Ti => TensorBSplineIdentifiability::MarginalSumToZero,
+            _ => TensorBSplineIdentifiability::default(),
+        });
     };
     match raw.trim().to_ascii_lowercase().as_str() {
         "none" => Ok(TensorBSplineIdentifiability::None),
         "sum_tozero" | "sum-to-zero" | "center_sum_tozero" | "center-sum-to-zero" | "centered"
         | "sumtozero" => Ok(TensorBSplineIdentifiability::SumToZero),
+        "marginal_sum_tozero" | "marginal-sum-to-zero" | "marginal_sumtozero"
+        | "marginalsumtozero" | "interaction" => {
+            Ok(TensorBSplineIdentifiability::MarginalSumToZero)
+        }
         other => Err(TermBuilderError::unsupported_feature(format!(
-            "invalid tensor identifiability '{other}'; expected one of: none, sum_tozero"
+            "invalid tensor identifiability '{other}'; expected one of: none, sum_tozero, marginal_sum_tozero"
         ))
         .to_string()),
     }
@@ -1141,7 +1155,7 @@ pub fn build_smooth_basis(
         .or_else(|| options.get("bs"))
         .map(|s| canonicalize_smooth_type(&s.to_ascii_lowercase()).to_string())
         .unwrap_or_else(|| match kind {
-            SmoothKind::Te => "tensor".to_string(),
+            SmoothKind::Te | SmoothKind::Ti => "tensor".to_string(),
             SmoothKind::S if cols.len() == 1 => "bspline".to_string(),
             // Mixed periodic Euclidean radial kernels are not separable on the
             // cylinder. Use a tensor product with a cyclic margin so s(theta,h)
@@ -1980,7 +1994,7 @@ pub fn build_smooth_basis(
                     marginalspecs: margins,
                     periods: periods_vec,
                     double_penalty: smooth_double_penalty,
-                    identifiability: parse_tensor_identifiability(options)?,
+                    identifiability: parse_tensor_identifiability(options, kind)?,
                 },
             })
         }
