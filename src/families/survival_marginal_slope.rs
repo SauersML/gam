@@ -21297,20 +21297,35 @@ pub fn fit_survival_marginal_slope_terms(
             FlexActivation::On => link_dev_prepared.as_ref(),
             FlexActivation::OffForRigidPilot => None,
         };
+        // The warm-start hint `hints.time_beta` is seeded from the rigid
+        // pilot's time block (line ~21559). After the pilot's identifiability
+        // reduction the stored β can have a *lower* dimension than the raw
+        // `design_exit.ncols()` used to build `time_linear_constraints` here
+        // (issue #374: with `logslope_formula="1"` the rigid pilot fires,
+        // seeds a reduced-width `time_beta`, and feeding it straight into the
+        // raw-width projection panicked on an ndarray shape mismatch). Only a
+        // hint whose length matches the projection dimension is geometrically
+        // meaningful; otherwise fall back to the spec's `initial_beta`, then to
+        // the origin inside the projection.
+        let time_dim = design_exit.ncols();
+        let time_beta_seed = hints
+            .time_beta
+            .as_ref()
+            .filter(|beta| beta.len() == time_dim)
+            .or_else(|| {
+                time_block_ref
+                    .initial_beta
+                    .as_ref()
+                    .filter(|beta| beta.len() == time_dim)
+            });
         let time_beta_hint = if let Some(constraints) = time_linear_constraints.as_ref() {
             Some(project_onto_linear_constraints(
-                design_exit.ncols(),
+                time_dim,
                 constraints,
-                hints
-                    .time_beta
-                    .as_ref()
-                    .or(time_block_ref.initial_beta.as_ref()),
-            ))
+                time_beta_seed,
+            )?)
         } else {
-            hints
-                .time_beta
-                .clone()
-                .or_else(|| time_block_ref.initial_beta.clone())
+            time_beta_seed.cloned()
         };
         let mut blocks = vec![
             build_time_blockspec(&time_block_ref, &design_exit, rho_time, time_beta_hint),
