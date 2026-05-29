@@ -256,10 +256,14 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
                 )
             return np.asarray(columns[y])
         if y is None:
+            # `has_external_target=False`: the formula's LHS names a column
+            # already present in `X`, and `sklearn_fit_metadata` returns that
+            # name in the third slot. Passing `True` here would (correctly)
+            # error out because the target column is in fact in `X`.
             rust = rust_module()
             columns, _ = table_columns(X)
             _, _, target_name = rust.sklearn_fit_metadata(
-                list(columns), self.formula, None, True,
+                list(columns), self.formula, None, False,
             )
             if target_name not in columns:
                 raise KeyError(
@@ -298,9 +302,12 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
         if isinstance(y, str):
             target_name = y
         else:
+            # y is None: target column already lives in X under the formula's
+            # LHS name. `has_external_target=False` matches that state; True
+            # would (correctly) refuse the call because the target is in X.
             rust = rust_module()
             _, _, target_name = rust.sklearn_fit_metadata(
-                list(columns), self.formula, None, True,
+                list(columns), self.formula, None, False,
             )
         new_columns: dict[str, list[Any]] = {
             name: list(values) for name, values in columns.items()
