@@ -3784,11 +3784,12 @@ fn solve_arrow_newton_step_artifacts(
         }
         let mut htbeta_slice = htbeta_delta.slice_mut(ndarray::s![..di]).to_owned();
         sys_htbeta_apply_row(sys, i, &sys.rows[i], delta_beta.view(), &mut htbeta_slice);
-        let mut rhs_i = rhs.slice_mut(ndarray::s![..di]);
-        for c in 0..di {
-            rhs_i[c] = sys.rows[i].gt[c] + htbeta_slice[c];
+        {
+            let mut rhs_i = rhs.slice_mut(ndarray::s![..di]);
+            for c in 0..di {
+                rhs_i[c] = sys.rows[i].gt[c] + htbeta_slice[c];
+            }
         }
-        drop(rhs_i);
         let rhs_slice = rhs.slice(ndarray::s![..di]).to_owned();
         let dt_i = backend.solve_block_vector(&htt_factors[i], &rhs_slice);
         for c in 0..di {
@@ -3997,8 +3998,7 @@ pub fn solve_streaming_reduced_beta(
             Err(err) => {
                 let recoverable = matches!(
                     err,
-                    ArrowSchurError::SchurFactorFailed { .. }
-                        | ArrowSchurError::PcgFailed { .. }
+                    ArrowSchurError::SchurFactorFailed { .. } | ArrowSchurError::PcgFailed { .. }
                 );
                 last_err = Some(err);
                 if !recoverable || attempt == DEFAULT_PROXIMAL_MAX_ATTEMPTS {
@@ -5274,10 +5274,26 @@ mod tests {
             dim_a,
             k,
             blocks: vec![
-                SparseGBlock { row_off: 0, col_off: 0, data: block_00 },
-                SparseGBlock { row_off: 0, col_off: 2, data: block_01 },
-                SparseGBlock { row_off: 2, col_off: 0, data: block_10 },
-                SparseGBlock { row_off: 2, col_off: 2, data: block_11 },
+                SparseGBlock {
+                    row_off: 0,
+                    col_off: 0,
+                    data: block_00,
+                },
+                SparseGBlock {
+                    row_off: 0,
+                    col_off: 2,
+                    data: block_01,
+                },
+                SparseGBlock {
+                    row_off: 2,
+                    col_off: 0,
+                    data: block_10,
+                },
+                SparseGBlock {
+                    row_off: 2,
+                    col_off: 2,
+                    data: block_11,
+                },
             ],
         };
 

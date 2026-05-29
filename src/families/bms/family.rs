@@ -319,21 +319,6 @@ pub(crate) fn build_score_warp_deviation_block_from_seed(
     build_deviation_block_from_knots_and_design_seed(seed, seed, cfg)
 }
 
-/// Positivity floor on a sample / weighted standard deviation (or variance)
-/// before it is used as a divisor for z-normalization or as a closed-form
-/// slope denominator. Strictly a numerical-safety threshold: an `sd` (or
-/// `var`) at or below this magnitude is treated as "effectively zero" and
-/// the dependent computation either fails fast with a context-tagged error
-/// or falls back to a safe default (e.g. slope = 0). Distinct from
-/// `BERNOULLI_LINK_PROBABILITY_EPS` (which clamps a probability, not a
-/// scale) and from any convergence / derivative tolerance.
-
-/// Lower magnitude on a first-derivative / gradient quantity below which
-/// the value is treated as numerically zero. Used both as a 2-D pilot
-/// gradient-norm convergence threshold and as an observed-logslope
-/// denominator guard in the marginal-slope row kernel. Hoisted so all
-/// "is this derivative effectively zero?" sites share one tolerance.
-
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BernoulliMarginalLinkMap {
     pub mu: f64,

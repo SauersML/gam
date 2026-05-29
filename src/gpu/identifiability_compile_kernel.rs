@@ -35,8 +35,6 @@
 //! chunks of `ROW_CHUNK`; per chunk we co-load row entries into registers
 //! and the 4×4 H slice into shared memory once per row.
 
-#![cfg(target_os = "linux")]
-
 /// Kernel symbol exported by the NVRTC module.
 pub const KERNEL_NAME: &str = "fused_primary_state_gram_kernel";
 
