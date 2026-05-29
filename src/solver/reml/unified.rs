@@ -17432,6 +17432,65 @@ mod tests {
     use approx::assert_relative_eq;
     use ndarray::array;
 
+    // ─── Regression for #376 ─────────────────────────────────────────────
+    //
+    // When a linear-inequality active set (from a `monotone_decreasing` /
+    // `convex` / `concave` shape constraint binding on the data) reduces the
+    // inner solve onto a free subspace `β = z β_f`, the penalty coordinates
+    // must be projected onto the SAME subspace. Otherwise `InnerSolutionBuilder::
+    // build` trips its `assert_eq!(coord.dim(), beta.len())` — the panic the
+    // released gamfit surfaced as `fit_table panicked inside Rust boundary`.
+    //
+    // This locks the core invariant directly: projecting a full-dimension
+    // penalty coordinate onto an orthonormal free basis `z` (p × m, m < p)
+    // yields a coordinate of dimension `m` (matching the reduced `β`), and the
+    // quadratic form is preserved exactly: `βᵀ S β = β_fᵀ (zᵀ S z) β_f`.
+    #[test]
+    fn penalty_coord_projection_reduces_dim_and_preserves_quadratic_form() {
+        // Full-space penalty root R (rank-deficient, like a smoothing penalty):
+        // S = Rᵀ R is 5×5 with a 1-dim nullspace.
+        let root = array![
+            [1.0, -1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, -1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, -1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0, -1.0],
+        ];
+        let coord = PenaltyCoordinate::DenseRoot(root.clone());
+        assert_eq!(coord.dim(), 5);
+
+        // Orthonormal free basis z (5 × 2): two active constraints removed.
+        // Columns are orthonormal so zᵀz = I.
+        let inv_sqrt2 = 1.0 / 2.0_f64.sqrt();
+        let z = array![
+            [inv_sqrt2, 0.0],
+            [-inv_sqrt2, 0.0],
+            [0.0, inv_sqrt2],
+            [0.0, -inv_sqrt2],
+            [0.0, 0.0],
+        ];
+
+        let projected = coord.project_into_subspace(&z);
+        assert_eq!(
+            projected.dim(),
+            z.ncols(),
+            "projected penalty coordinate dim must equal the reduced beta length"
+        );
+
+        // Quadratic-form preservation: with β = z·β_f, the full-space penalty
+        // βᵀSβ must equal the reduced β_fᵀ (zᵀSz) β_f computed by the
+        // projected coordinate.
+        let beta_f = array![0.7, -1.3];
+        let beta_full = z.dot(&beta_f);
+
+        let s_beta_full = coord.apply_penalty(&beta_full, 1.0);
+        let full_quadratic = beta_full.dot(&s_beta_full);
+
+        let s_beta_reduced = projected.apply_penalty(&beta_f, 1.0);
+        let reduced_quadratic = beta_f.dot(&s_beta_reduced);
+
+        assert_relative_eq!(reduced_quadratic, full_quadratic, max_relative = 1e-12);
+    }
+
     // ─── Verification tests for the projected-pseudo-inverse IFT fix ─────
     //
     // The hypothesis: when the inner KKT residual `r` has spurious noise

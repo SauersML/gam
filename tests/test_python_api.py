@@ -1733,6 +1733,67 @@ def test_gaussian_reml_fit_with_constraints_forward_monotone_on_x_squared() -> N
     )
 
 
+@pytest.mark.parametrize(
+    "kind",
+    ["monotone_increasing", "monotone_decreasing", "convex", "concave"],
+)
+def test_gaussian_reml_fit_all_shape_constraints_do_not_panic(kind: str) -> None:
+    """Regression for #376.
+
+    All four documented univariate shape-constraint kinds — not just
+    ``monotone_increasing`` — must fit clean, well-conditioned 1D data
+    through the high-level ``gamfit.fit`` boundary without tripping the
+    ``InnerSolutionBuilder`` penalty-dimension ``assert_eq!`` (which used
+    to cross the FFI as ``fit_table panicked inside Rust boundary``).
+
+    The active inequality set from ``monotone_decreasing`` / ``convex`` /
+    ``concave`` on this increasing data binds many constraints, reducing
+    the inner solve onto a small free subspace ``β = z β_f``; the penalty
+    coordinates must be projected onto the same subspace so their
+    dimension matches the reduced ``β``.  Before the fix only the
+    (unbinding) ``monotone_increasing`` case avoided the mismatch.
+    """
+    rng = np.random.default_rng(5)
+    n = 300
+    x = np.sort(rng.uniform(0.0, 1.0, n))
+    # Smooth, monotone-increasing, well-conditioned data: the decreasing /
+    # convex / concave constraints all bind (data violates them), which is
+    # exactly the active-set regime that panicked.
+    y = 2.0 * x + rng.normal(0.0, 0.1, n)
+    frame = pd.DataFrame({"y": y, "x": x})
+
+    model = gamfit.fit(frame, "y ~ s(x)", constraints={"s(x)": kind})
+    fitted = np.asarray(model.predict(frame), dtype=float)
+    assert fitted.shape == (n,)
+    assert np.all(np.isfinite(fitted)), (
+        f"{kind}: fitted values contain non-finite entries"
+    )
+
+    # The constrained fit must actually respect the requested shape on the
+    # fitted curve (sorted in x), not merely avoid the panic.
+    tol = 1e-5 * (np.abs(fitted).max() + 1.0)
+    if kind == "monotone_increasing":
+        diffs = np.diff(fitted)
+        assert (diffs >= -tol).all(), (
+            f"monotone_increasing violated; min diff={diffs.min()}"
+        )
+    elif kind == "monotone_decreasing":
+        diffs = np.diff(fitted)
+        assert (diffs <= tol).all(), (
+            f"monotone_decreasing violated; max diff={diffs.max()}"
+        )
+    elif kind == "convex":
+        second = np.diff(fitted, n=2)
+        assert (second >= -tol).all(), (
+            f"convex violated; min second-diff={second.min()}"
+        )
+    else:  # concave
+        second = np.diff(fitted, n=2)
+        assert (second <= tol).all(), (
+            f"concave violated; max second-diff={second.max()}"
+        )
+
+
 def test_gaussian_reml_fit_with_constraints_forward_no_constraints_matches_unconstrained() -> None:
     """With no inequality system (``a_inequality=None``), the constrained
     REML forward must reproduce the unconstrained Gaussian REML fit."""
