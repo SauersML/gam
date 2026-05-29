@@ -737,8 +737,10 @@ fn parse_call_pair(call: Pair<'_, Rule>) -> Result<FunctionCallSpec, String> {
 mod tests {
     use super::{
         CallArgSpec, parse_formula, parse_formula_dsl, parse_function_call,
-        parsed_terms_reference_column, validate_marginal_slope_z_column_exclusion,
+        parse_linkwiggle_formulaspec, parsed_terms_reference_column,
+        validate_marginal_slope_z_column_exclusion,
     };
+    use std::collections::BTreeMap;
 
     #[test]
     fn parses_nested_formula_terms() {
@@ -889,6 +891,52 @@ mod tests {
         assert_eq!(parsed.logslope_surfaces[0].terms.len(), 1);
         assert_eq!(parsed.logslope_surfaces[1].z_column, "z3");
         assert_eq!(parsed.logslope_surfaces[1].terms.len(), 1);
+    }
+
+    #[test]
+    fn linkwiggle_rejects_non_cubic_degree_at_parse_time() {
+        // Regression for #384: the score-warp / link-deviation runtime is a
+        // structurally cubic I-spline basis (`DeviationRuntime`), so the only
+        // realizable `degree` is 3. Previously `parse_linkwiggle_formulaspec`
+        // accepted any `degree >= 1`, then the fit blew up deep in
+        // `build_deviation_block_from_knots_and_design_seed` with "structural
+        // deviation runtime is cubic; degree must be 3, got k" — a documented
+        // knob that always fails for non-3 values after expensive setup. The
+        // contract must be enforced up front, at parse time.
+        for deg in [1usize, 2, 4, 10] {
+            let mut options = BTreeMap::new();
+            options.insert("degree".to_string(), deg.to_string());
+            options.insert("internal_knots".to_string(), "3".to_string());
+            let raw = format!("linkwiggle(degree={deg}, internal_knots=3)");
+            let err = parse_linkwiggle_formulaspec(&options, &raw)
+                .expect_err("non-cubic linkwiggle degree must be rejected at parse time");
+            assert!(
+                err.contains("degree must be 3"),
+                "error should state degree must be 3, got: {err}"
+            );
+            assert!(
+                err.contains("cubic"),
+                "error should explain the runtime is cubic, got: {err}"
+            );
+            assert!(
+                err.contains(&format!("degree={deg}")),
+                "error should echo the rejected degree, got: {err}"
+            );
+        }
+
+        // degree=3 (and the default, when `degree` is omitted) must still parse.
+        let mut three = BTreeMap::new();
+        three.insert("degree".to_string(), "3".to_string());
+        three.insert("internal_knots".to_string(), "3".to_string());
+        let spec = parse_linkwiggle_formulaspec(&three, "linkwiggle(degree=3, internal_knots=3)")
+            .expect("degree=3 must parse");
+        assert_eq!(spec.degree, 3);
+
+        let mut omitted = BTreeMap::new();
+        omitted.insert("internal_knots".to_string(), "3".to_string());
+        let spec = parse_linkwiggle_formulaspec(&omitted, "linkwiggle(internal_knots=3)")
+            .expect("omitted degree must default to cubic");
+        assert_eq!(spec.degree, 3, "default degree must be cubic");
     }
 
     #[test]
@@ -1563,10 +1611,25 @@ pub fn parse_linkwiggle_formulaspec(
     // Strict parsing: a present-but-unparseable value (`degree=abc`, `=-3`,
     // `=6.5`) must be rejected, not silently dropped and replaced by the
     // default as the lossy `option_usize`/`option_bool` readers would do.
+    // The score-warp / link-deviation runtime that consumes this spec is a
+    // monotone *cubic* I-spline derivative-control basis (see
+    // `DeviationRuntime` / `build_deviation_block_from_knots_and_design_seed`):
+    // its span tables, C2-continuous I-spline construction, and derivative
+    // operators (orders up to 3) are all structurally cubic. There is no
+    // arbitrary-degree code path. So `degree` is a single-valued contract:
+    // only 3 is realizable. Reject any other value here, up front, with a
+    // message explaining why — rather than parsing it successfully and then
+    // failing deep inside the solver after expensive setup ("structural
+    // deviation runtime is cubic; degree must be 3, got k"). A documented
+    // option that silently accepts values it can never honor is a lie.
     let degree = option_usize_strict(options, "degree")?.unwrap_or(defaults.degree);
-    if degree < 1 {
+    if degree != 3 {
         return Err(FormulaDslError::InvalidArgument {
-            reason: format!("{term_name}() requires degree >= 1: {raw}"),
+            reason: format!(
+                "{term_name}() degree must be 3: the monotone score-warp / \
+                 link-deviation basis is a cubic I-spline runtime and only \
+                 supports cubic splines; got degree={degree}: {raw}"
+            ),
         }
         .into());
     }
