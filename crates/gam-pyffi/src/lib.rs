@@ -1706,9 +1706,21 @@ fn write_survival_csv(
 #[pyfunction]
 fn survival_coerce_times<'py>(
     py: Python<'py>,
-    times: PyReadonlyArrayDyn<'py, f64>,
+    times: &Bound<'py, PyAny>,
 ) -> PyResult<Py<PyArray1<f64>>> {
-    let values: Vec<f64> = times.as_array().iter().copied().collect();
+    // ``times`` is documented as array-like (`Any`): a scalar, list, tuple, or
+    // ndarray of any shape. Normalize through ``numpy.asarray`` so the Rust
+    // core remains the single source of truth for coercion and validation,
+    // matching the ``numeric_matrix_validate`` pattern used elsewhere in this
+    // module. ``reshape(-1)`` flattens a 0-d scalar or N-d input to the 1-D
+    // time grid the survival kernels expect.
+    let np = py.import("numpy")?;
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("dtype", "float64")?;
+    let array = np.call_method("asarray", (times,), Some(&kwargs))?;
+    let flat = array.call_method1("reshape", (-1,))?;
+    let typed = flat.cast_into::<PyArray1<f64>>().map_err(PyErr::from)?;
+    let values: Vec<f64> = typed.readonly().as_array().iter().copied().collect();
     if values.is_empty() {
         return Err(py_value_error(
             "survival prediction requires at least one time".to_string(),
