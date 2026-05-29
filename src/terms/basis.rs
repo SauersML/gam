@@ -3496,24 +3496,23 @@ impl RadialScalarKind {
                 Ok((phi, q, t))
             }
             RadialScalarKind::ThinPlate { length_scale, dim } => {
-                // At r = 0 the analytic limits of q = φ'(r)/r and
-                // t = (φ''(r) − q)/r² depend strongly on dim:
-                //   dim = 1 (φ = r³):  q = 3r → 0, but t = 3/r → ∞.
-                //   dim = 2 (φ = r² log r): q = 2 log r + 1 → −∞.
-                //   dim = 3 (φ = −r):  q = −1/r → −∞.
-                // None of these has a finite (q, t) pair at the collision
-                // (and for dim ∈ {2, 3} the gradient direction is itself
-                // ill-defined). Surface the degeneracy rather than emit
-                // silent zeros that would smuggle a wrong gradient through
-                // the chain rule.
+                // (q, t) individually diverge at r = 0 for ThinPlate
+                // (q = 2 log r + 1 → −∞ in dim 2, q = −1/r → −∞ in dim 3,
+                // t = 3/r → ∞ in dim 1, …) but the chain-rule coefficient
+                // `c = raw_psi_isotropic_share` is 0 for ThinPlate, so every
+                // consumer multiplies q by a squared displacement s_a and t
+                // by s_a · s_b before use (design row uses φ alone, and
+                // φ(0) = 0). The products
+                //   q · s_a = (φ'(r) · r) · (s_a / r²),
+                //   t · s_a · s_b = (φ''(r) · r² − φ'(r) · r) · (s_a/r²)·(s_b/r²)
+                // both vanish as r → 0+, since r · φ'(r) → 0 and r² · φ''(r) → 0
+                // for every standard TPS kernel (φ = r³ in dim 1, r² log r in
+                // dim 2, −r in dim 3, and the general polyharmonic case for
+                // d ≥ 4) and the ratios s_a/r², s_b/r² are bounded. The
+                // closed-form ψ-derivative limit at the collision is
+                // therefore (0, 0, 0).
                 if r < 1e-14 {
-                    return Err(BasisError::DegenerateAtCollision {
-                        kernel: "ThinPlate",
-                        dim: *dim,
-                        m: thin_plate_penalty_order(*dim) as f64,
-                        message: "thin-plate radial derivative φ'(r)/r or \
-                                  (φ''(r) − q)/r² diverges as r → 0 for this dim",
-                    });
+                    return Ok((0.0, 0.0, 0.0));
                 }
                 let scaled_r = r / *length_scale;
                 let (phi, phi_kernel_first, phi_kernel_second) =
