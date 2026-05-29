@@ -234,8 +234,12 @@ class Euclidean(_RustManifold):
 
 
 class Circle(_RustManifold):
-    """The unit circle ``S^1`` parameterized as a unit 2-vector in
-    ambient ``R^2``. All math from ``gam::geometry::Circle``."""
+    """The unit circle ``S^1`` parameterized by a single angle coordinate
+    ``theta`` (a 1-vector ``[theta]``), matching the Rust
+    ``gam::geometry::Circle``. Points and tangents are both 1-D; ``exp`` adds
+    the tangent to the angle and wraps to ``(-pi, pi]``. The ambient and
+    intrinsic dimensions are therefore both ``1`` — there is no ``R^2``
+    unit-vector embedding. All math from ``gam::geometry::Circle``."""
 
     # Composition contract: ``gamfit._smooth`` reads this when deciding
     # whether a manifold-basis pair is allowed.
@@ -244,7 +248,7 @@ class Circle(_RustManifold):
     def __init__(self) -> None:
         self.json = {"kind": "circle"}
         self._dim = 1
-        self._ambient_dim = 2
+        self._ambient_dim = 1
 
     def __repr__(self) -> str:
         return "Circle()"
@@ -281,7 +285,12 @@ class Torus(_RustManifold):
 
 class CylinderManifold(_RustManifold):
     """The cylinder ``S^1 × R^k`` modeled as the Rust product manifold
-    ``Circle × Euclidean(k)`` (math fully in ``gam::geometry::Product``)."""
+    ``Circle × Euclidean(k)`` (math fully in ``gam::geometry::Product``).
+
+    A point is the concatenation ``[theta, x_1, ..., x_k]``: a single angle
+    coordinate for the circle factor (1-D, matching :class:`Circle`) followed
+    by the ``k`` Euclidean coordinates. Ambient and intrinsic dimensions are
+    both ``1 + open_dim`` — there is no ``R^2`` embedding of the circle."""
 
     def __init__(self, open_dim: int = 1) -> None:
         if int(open_dim) < 0:
@@ -292,7 +301,8 @@ class CylinderManifold(_RustManifold):
         self.json = {"kind": "product", "parts": parts}
         self._open = int(open_dim)
         self._dim = 1 + int(open_dim)
-        self._ambient_dim = 2 + int(open_dim)  # Circle ambient (2) + Euclidean
+        # Circle angle (1) + Euclidean(open_dim); matches Rust product ambient.
+        self._ambient_dim = 1 + int(open_dim)
 
     def __repr__(self) -> str:
         return f"CylinderManifold(open_dim={self._open})"
