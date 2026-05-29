@@ -67,11 +67,13 @@ jobs:
 
             ## The goal
 
-            Pick one open issue. Solve it properly. Open a PR. When that
-            one is done, if there are closely related open issues
-            (same subsystem, same root cause cluster, same failure mode),
-            you may pick another one and chain it in the same run. See
-            "Chaining related issues" below.
+            Pick one open issue. Solve it properly, committing and pushing
+            to `main` as you go — small commits pushed continuously as the
+            work progresses, NOT one big drop at the end and NOT on a side
+            branch. When that one is done, if there are closely related open
+            issues (same subsystem, same root cause cluster, same failure
+            mode), you may pick another one and chain it in the same run.
+            See "Chaining related issues" below.
 
             "Properly" here means the absolute ideal solution — beautiful,
             principled, root-cause, long-term correct, fully verified, fully
@@ -91,7 +93,8 @@ jobs:
             that. Stay on the issue until the PR is open and the fix is
             complete. Don't pace yourself, don't pause voluntarily, don't
             split the work into "today I'll do part of it." Drive it
-            straight through to done in this session.
+            straight through to done in this session — but push each
+            coherent step to main as you reach it, don't hold the work.
 
             ## Picking the issue (with a real lock, not just etiquette)
 
@@ -112,11 +115,10 @@ jobs:
               a. Its most recent comment whose body starts with
                  `🔒 claim:` is younger than 45 minutes AND names a run-id
                  different from yours.
-              b. Branch `fix/issue-<N>` exists on `origin` and was pushed
-                 to in the last 45 minutes (`gh api repos/{owner}/{repo}/branches/fix/issue-<N>`
-                 or `git for-each-ref --format='%(committerdate:iso) %(refname)' refs/remotes/origin/fix/issue-<N>`).
-              c. An open PR linked to `<N>` had a commit pushed in the
-                 last 45 minutes.
+              b. A commit whose message references `#<N>` (e.g.
+                 `fix(...) #<N>` or `Closes #<N>`) was pushed to `main` by a
+                 different run in the last 45 minutes
+                 (`git log --since='45 minutes ago' --grep='#<N>' origin/main`).
             45 minutes is the heartbeat window: longer than one cron tick,
             short enough that abandoned claims expire on their own.
 
@@ -131,18 +133,20 @@ jobs:
             lower run-id), you lost the race — drop the issue, pick
             another, repeat. If you won, proceed.
 
-            **4. Heartbeat while working.** Commit, push, and post a
-            progress comment on the issue often — at minimum every 40
-            minutes, ideally much more often. WIP commits are encouraged;
-            messy intermediate state is fine; thinking-out-loud comments
-            on the issue are fine. The point is that the branch and the
-            issue thread together show a live trail of where the work is
-            so anyone watching (humans, future-you, the lock protocol)
-            knows it's alive. Don't sit silently for an hour and dump
-            everything at the end.
+            **4. Commit to main as you work.** Commit and push to `main`
+            after every meaningful edit — continuously, as the work
+            progresses, not on a timer and never batched to the end. As
+            soon as you've made a coherent change, push it before starting
+            the next one. WIP commits are encouraged; messy intermediate
+            state on main is fine — CI and the PyPI publish step are the
+            real gates, not main, so a transient red main is acceptable.
+            Reference the issue in commit subjects (`fix(...) #<N>`) and
+            drop a short progress comment on the issue now and then so the
+            thread shows a live trail. Don't sit silently for an hour and
+            dump everything at the end, and don't hold finished work back.
 
-            **5. Release on finish.** When the PR is open and the fix is
-            complete, post a final comment whose first line is exactly:
+            **5. Release on finish.** When the fix is complete and pushed
+            to main, post a final comment whose first line is exactly:
                 `🔓 release: run ${{ github.run_id }}` followed by a
             one-paragraph summary. This lets any other run skip the
             45-minute wait.
@@ -163,40 +167,42 @@ jobs:
 
             ## Chaining related issues serially
 
-            After you've opened the PR for your first issue and posted the
-            🔓 release:, you may pick another issue and start a new
-            claim → fix → release cycle in the same run, *as long as*
-            the next issue is closely related to the work you just did
-            (same subsystem, same root cause cluster, same numerical
+            After you've pushed the complete fix for your first issue to
+            main and posted the 🔓 release:, you may pick another issue and
+            start a new claim → fix → release cycle in the same run, *as
+            long as* the next issue is closely related to the work you just
+            did (same subsystem, same root cause cluster, same numerical
             failure mode). Chaining unrelated work in one run hurts the
-            quality bar — open a fresh PR for fresh territory.
+            quality bar — start fresh territory in its own clean cycle.
 
             Each issue in the chain gets its own claim cycle (steps 1-5),
-            its own `fix/issue-<N>` branch, and its own PR. Don't
-            claim them all upfront — claim the next one only when you're
-            about to start it, so other concurrent runs can pick up
-            unrelated issues in the meantime.
+            committed straight to main. Don't claim them all upfront —
+            claim the next one only when you're about to start it, so other
+            concurrent runs can pick up unrelated issues in the meantime.
 
             ## Removing blockers is part of the job
 
             Once you've picked an issue, you carry it through. Whatever
             stands between you and the fix — a missing abstraction, a
             buggy dep, a wrong-shaped subsystem, infra that doesn't exist
-            yet — is part of the work. The terminal state is: PR open
-            with a complete, verified fix.
+            yet — is part of the work. The terminal state is: the
+            complete, verified fix pushed to main and the issue closed.
 
-            ## Branching and PRs (allowed here, unlike the bug-hunt agent)
+            ## Commit directly to main — no branches, no PRs
 
-            For each issue you work on, use a stable branch named exactly
-            `fix/issue-<N>` where `<N>` is the issue number. If that branch
-            already exists on `origin`, check it out and continue the work
-            in progress. If not, create it from latest `main`. Push to it
-            often. When you believe the fix is complete and verified, open
-            (or update) a PR titled `fix: <one-line summary> (closes #<N>)`
-            with a body that explains the root cause, the chosen approach
-            and why, what was rejected and why, and the verification you
-            ran. Mark the issue closed by the PR with the standard
-            `Closes #<N>` line.
+            Work on `main` and push continuously as you go (step 4). Do NOT
+            create a `fix/issue-<N>` branch and do NOT open a PR — main is
+            the work surface here; CI and the PyPI publish step are the
+            release gates. If main has moved when you push, `git pull
+            --rebase` first (never `git stash` / `--autostash` — commit your
+            work first) and resolve any conflict by editing, never by
+            discarding another run's commits. Close the issue by putting
+            `Closes #<N>` in the message of the commit that completes the
+            fix (it auto-closes when that lands on main), or close it
+            explicitly with `gh issue close` in your 🔓 release step. Your
+            commit messages carry what a PR body would: the commit that
+            completes a fix should explain the root cause, the approach and
+            why, what you rejected, and the verification you ran.
 
             ## Verification bar
 
