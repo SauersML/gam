@@ -152,6 +152,62 @@ def test_latent_survival_accepts_frailty_kwargs() -> None:
     assert validation.supported_by_python is True
 
 
+def test_survival_at_accepts_array_like_times() -> None:
+    # Regression for #380: survival_at / hazard_at / cumulative_hazard_at
+    # accept any array-like ``times`` (list / tuple / scalar), not only an
+    # ndarray, and produce results identical to the ndarray path.
+    model = gamfit.fit(
+        make_weibull(260),
+        "Surv(entry, exit, event) ~ age",
+        survival_likelihood="transformation",
+    )
+    pred = model.predict(prediction_rows())
+
+    times_list = [0.5, 1.0, 2.0]
+    times_arr = np.array(times_list, dtype=float)
+
+    for method in ("survival_at", "hazard_at", "cumulative_hazard_at"):
+        reference = np.asarray(getattr(pred, method)(times_arr), dtype=float)
+        from_list = np.asarray(getattr(pred, method)(times_list), dtype=float)
+        from_tuple = np.asarray(getattr(pred, method)(tuple(times_list)), dtype=float)
+        assert reference.shape == (3, len(times_list))
+        np.testing.assert_allclose(from_list, reference, rtol=0.0, atol=0.0)
+        np.testing.assert_allclose(from_tuple, reference, rtol=0.0, atol=0.0)
+
+    # A bare Python scalar must coerce to a single-column 1-time grid.
+    scalar_result = np.asarray(pred.survival_at(1.0), dtype=float)
+    scalar_reference = np.asarray(
+        pred.survival_at(np.array([1.0], dtype=float)), dtype=float
+    )
+    assert scalar_result.shape == (3, 1)
+    np.testing.assert_allclose(scalar_result, scalar_reference, rtol=0.0, atol=0.0)
+
+
+def test_competing_risks_cif_accepts_array_like_times() -> None:
+    # Regression for #380: the standalone competing_risks_cif assembler also
+    # routes ``times`` through coercion and must accept array-likes.
+    train = make_weibull(280)
+    cause = gamfit.fit(
+        train,
+        "Surv(entry, exit, event) ~ age",
+        survival_likelihood="transformation",
+    )
+    pred = cause.predict(prediction_rows())
+
+    times_list = [1.0, 3.0, 6.0]
+    from_arr = gamfit.competing_risks_cif(
+        {"cause_1": pred}, times=np.array(times_list, dtype=float)
+    )
+    from_list = gamfit.competing_risks_cif({"cause_1": pred}, times=times_list)
+    np.testing.assert_allclose(
+        np.asarray(from_list.cif, dtype=float),
+        np.asarray(from_arr.cif, dtype=float),
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert np.asarray(from_list.times, dtype=float).tolist() == times_list
+
+
 def _fit_marginal_slope_worker(result_queue) -> None:
     try:
         gamfit.fit(
