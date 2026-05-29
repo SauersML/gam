@@ -7518,7 +7518,7 @@ impl From<CustomFamilyError> for String {
     }
 }
 
-fn validate_blockspecs(specs: &[ParameterBlockSpec]) -> Result<Vec<usize>, String> {
+pub(crate) fn validate_blockspecs(specs: &[ParameterBlockSpec]) -> Result<Vec<usize>, String> {
     if specs.is_empty() {
         return Err(CustomFamilyError::UnsupportedConfiguration {
             reason: "fit_custom_family requires at least one parameter block".to_string(),
