@@ -2956,6 +2956,103 @@ mod tests {
     }
 
     #[test]
+    fn competing_risk_cause_labels_collapse_to_pooled_baseline_indicator() {
+        // Regression for #378: the joint competing-risks Weibull path seeds a
+        // shared single-hazard baseline working model from the dataset's event
+        // *labels* {0 = censored, 1 = cause 1, 2 = cause 2}. The single-hazard
+        // engine's `event_target` contract is binary {0, 1}, so feeding the raw
+        // cause labels straight through used to bail out of construction via the
+        // `event_target > 1` guard and surface as the misleading
+        // `SurvivalError::NonFiniteInput` ("inputs contain non-finite values"),
+        // even though every input value is finite. The fix collapses cause labels
+        // to an any-event {0, 1} indicator before constructing the pooled
+        // baseline. This test pins both halves of that contract.
+        let age_entry = array![0.0_f64, 0.0, 0.0, 0.0];
+        let age_exit = array![1.2_f64, 0.8, 2.1, 1.5];
+        // Competing-risks cause labels: censored, cause 1, cause 2, censored.
+        let cause_labels = array![0u8, 1u8, 2u8, 0u8];
+        let event_competing = Array1::<u8>::zeros(cause_labels.len());
+        let sampleweight = array![1.0_f64, 1.0, 1.0, 1.0];
+        let x_entry = array![
+            [1.0, age_entry[0].max(1e-8).ln()],
+            [1.0, age_entry[1].max(1e-8).ln()],
+            [1.0, age_entry[2].max(1e-8).ln()],
+            [1.0, age_entry[3].max(1e-8).ln()],
+        ];
+        let x_exit = array![
+            [1.0, age_exit[0].ln()],
+            [1.0, age_exit[1].ln()],
+            [1.0, age_exit[2].ln()],
+            [1.0, age_exit[3].ln()],
+        ];
+        let x_derivative = array![
+            [0.0, 1.0 / age_exit[0]],
+            [0.0, 1.0 / age_exit[1]],
+            [0.0, 1.0 / age_exit[2]],
+            [0.0, 1.0 / age_exit[3]],
+        ];
+        let penalties = PenaltyBlocks::new(Vec::new());
+        let mono = MonotonicityPenalty { tolerance: 1e-8 };
+
+        // Raw cause labels {0,1,2} violate the single-hazard binary contract and
+        // must be rejected (documenting why the caller has to collapse them).
+        let raw = survival_model(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &cause_labels,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
+            penalties.clone(),
+            mono,
+            SurvivalSpec::Net,
+        );
+        assert!(
+            matches!(raw, Err(SurvivalError::NonFiniteInput)),
+            "raw competing-risks cause labels must be rejected by the single-hazard engine, got {raw:?}"
+        );
+
+        // The pooled-baseline collapse the workflow now performs: any observed
+        // event (any cause) informs the shared baseline hazard.
+        let any_event = cause_labels.mapv(|label| u8::from(label > 0));
+        assert_eq!(any_event, array![0u8, 1u8, 1u8, 0u8]);
+        let model = survival_model(
+            survival_inputs(
+                &age_entry,
+                &age_exit,
+                &any_event,
+                &event_competing,
+                &sampleweight,
+                &x_entry,
+                &x_exit,
+                &x_derivative,
+            ),
+            penalties,
+            mono,
+            SurvivalSpec::Net,
+        )
+        .expect("pooled any-event baseline model must construct from competing-risks data");
+
+        // The constructed pooled baseline must yield a finite working state, so
+        // the downstream baseline-seeding PIRLS loop has something to optimize.
+        let beta = array![-1.0_f64, 0.8];
+        let state = model.update_state(&beta).expect("pooled baseline state");
+        assert!(
+            state.deviance.is_finite(),
+            "pooled baseline deviance must be finite, got {}",
+            state.deviance
+        );
+        assert!(
+            state.gradient.iter().all(|g| g.is_finite()),
+            "pooled baseline gradient must be finite"
+        );
+    }
+
+    #[test]
     fn offset_channel_residuals_match_central_fd_of_nll() {
         // Three observations: two events (non-origin entry and origin entry)
         // and one censored row. This exercises every nonzero channel at least
