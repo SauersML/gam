@@ -2856,6 +2856,148 @@ mod tests {
         assert_eq!(out.logslope_design.nrows(), n);
     }
 
+    /// Regression for #368: the phase-4b compiled-map penalty pullback must
+    /// emit a PER-BLOCK-WIDTH penalty for every block (sized to that block's
+    /// COMPILED design width), even when a block drops columns and the
+    /// triangular T carries nonzero off-diagonal cross-block residualisation
+    /// `R_{a→b}`. The original bug pulled penalties back through the full
+    /// joint T (`Tᵀ S T`), producing joint-compiled-width penalties (e.g.
+    /// 7×7) that did not fit a single per-block `ParameterBlockSpec.penalties`
+    /// slot (e.g. time block compiled width 3), making `validate_blockspecs`
+    /// fail and `assert_valid_blockspecs` panic across the FFI boundary on
+    /// ordinary survival data.
+    #[test]
+    fn compiled_map_penalty_pullback_is_per_block_width_with_nonzero_residual() {
+        use crate::families::identifiability_compiler::CompiledMap;
+        use crate::terms::smooth::BlockwisePenalty;
+
+        let n = 10;
+        // Time raw 3 → compiled 3 (block 0: no anchor, V pure, R=None).
+        // Marginal raw 3 → compiled 2 (a real drop, with nonzero R against time).
+        // Logslope raw 2 → compiled 2 (nonzero R against time+marginal).
+        let v_time = Array2::<f64>::from_shape_fn((3, 3), |(i, j)| {
+            if i == j { 1.0 } else { 0.1 * ((i + j) as f64) }
+        });
+        let v_marg = Array2::<f64>::from_shape_fn((3, 2), |(i, j)| {
+            0.5 + 0.3 * (i as f64) - 0.2 * (j as f64)
+        });
+        let v_log = Array2::<f64>::from_shape_fn((2, 2), |(i, j)| {
+            if i == j { 1.2 } else { 0.4 }
+        });
+        // R_marg: rows = time raw width 3, cols = marginal compiled width 2.
+        let r_marg = Array2::<f64>::from_shape_fn((3, 2), |(i, j)| 0.7 - 0.1 * ((i + j) as f64));
+        // R_log: rows = time+marg raw width 5, cols = logslope compiled width 2.
+        let r_log = Array2::<f64>::from_shape_fn((5, 2), |(i, j)| 0.3 + 0.05 * ((i * 2 + j) as f64));
+
+        let t = build_full_t_matrix(
+            &[v_time.clone(), v_marg.clone(), v_log.clone()],
+            &[None, Some(r_marg.clone()), Some(r_log.clone())],
+        );
+        assert_eq!(t.dim(), (8, 7), "joint raw 8 × joint compiled 7");
+
+        let map = CompiledMap {
+            raw_from_compiled: t.clone(),
+            compiled_block_ranges: vec![0..3, 3..5, 5..7],
+            raw_block_ranges: vec![0..3, 3..6, 6..8],
+        };
+
+        // Raw designs (dense, n rows).
+        let raw_time_entry =
+            DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::from_shape_fn(
+                (n, 3),
+                |(i, j)| 1.0 + (i as f64) * 0.1 + (j as f64),
+            )));
+        let raw_time_exit = raw_time_entry.clone();
+        let raw_time_deriv = raw_time_entry.clone();
+        let raw_marg = DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::from_shape_fn(
+            (n, 3),
+            |(i, j)| 0.2 * (i as f64) - 0.3 * (j as f64),
+        )));
+        let raw_log = DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::from_shape_fn(
+            (n, 2),
+            |(i, j)| 0.5 + (i as f64) * (j as f64 + 1.0),
+        )));
+
+        // Block-local penalties (col_range relative to each block's first col).
+        let s_time = Array2::<f64>::from_shape_fn(
+            (3, 3),
+            |(i, j)| if i == j { (i + 2) as f64 } else { 0.3 },
+        );
+        let s_marg = Array2::<f64>::from_shape_fn(
+            (3, 3),
+            |(i, j)| if i == j { 1.5 + i as f64 } else { 0.2 },
+        );
+        let s_log =
+            Array2::<f64>::from_shape_fn((2, 2), |(i, j)| if i == j { 2.0 } else { 0.5 });
+        let time_pens = vec![BlockwisePenalty::new(0..3, s_time.clone())];
+        let marg_pens = vec![BlockwisePenalty::new(0..3, s_marg.clone())];
+        let log_pens = vec![BlockwisePenalty::new(0..2, s_log.clone())];
+
+        let out = apply_compiled_map_to_designs(
+            &map,
+            raw_time_entry,
+            raw_time_exit,
+            raw_time_deriv,
+            raw_marg,
+            raw_log,
+            &time_pens,
+            &marg_pens,
+            &log_pens,
+        )
+        .expect("apply_compiled_map_to_designs must succeed");
+
+        // Designs carry per-block compiled widths.
+        assert_eq!(out.time_design_entry.ncols(), 3);
+        assert_eq!(out.marginal_design.ncols(), 2);
+        assert_eq!(out.logslope_design.ncols(), 2);
+
+        // Core invariant the bug violated: every penalty is sized to ITS
+        // OWN block's compiled width, NOT the joint compiled width (7).
+        for s in &out.time_penalties {
+            assert_eq!(
+                s.as_dense_cow().dim(),
+                (3, 3),
+                "time penalty must be per-block 3×3, not joint-width"
+            );
+        }
+        for s in &out.marginal_penalties {
+            assert_eq!(
+                s.as_dense_cow().dim(),
+                (2, 2),
+                "marginal penalty must match reduced compiled width 2, not joint 7"
+            );
+        }
+        for s in &out.logslope_penalties {
+            assert_eq!(s.as_dense_cow().dim(), (2, 2));
+        }
+
+        // For the time block (block 0, no anchor ⇒ R=None), the per-block
+        // pullback is EXACT: θ_timeᵀ P_time θ_time == γ_timeᵀ S_time γ_time
+        // with γ_time = V_time · θ_time. Verify the quadratic-form identity.
+        let p_time_dense = out.time_penalties[0].as_dense_cow().into_owned();
+        let theta_time = Array1::<f64>::from_shape_fn(3, |k| 0.4 + 0.7 * (k as f64));
+        let gamma_time = v_time.dot(&theta_time);
+        let lhs = theta_time.dot(&p_time_dense.dot(&theta_time));
+        let rhs = gamma_time.dot(&s_time.dot(&gamma_time));
+        assert!(
+            (lhs - rhs).abs() < 1e-10,
+            "time-block per-block pullback must be exact: lhs={lhs}, rhs={rhs}"
+        );
+
+        // The marginal pullback must equal V_margᵀ S_marg V_marg exactly
+        // (block-local; the cross-block R_marg lives in the design, not here).
+        let p_marg_dense = out.marginal_penalties[0].as_dense_cow().into_owned();
+        let want_marg = v_marg.t().dot(&s_marg.dot(&v_marg));
+        for i in 0..2 {
+            for j in 0..2 {
+                assert!(
+                    (p_marg_dense[[i, j]] - want_marg[[i, j]]).abs() < 1e-12,
+                    "marginal penalty must be V_margᵀ S_marg V_marg at ({i},{j})"
+                );
+            }
+        }
+    }
+
     /// Top-level Phase-4b API test for the SMGS parametric path:
     /// call `compile_survival_parametric_designs` on a shared-constant
     /// alias between time and marginal, with an identity row Hessian.
