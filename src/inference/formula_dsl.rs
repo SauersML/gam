@@ -1328,6 +1328,31 @@ pub fn option_bool(map: &BTreeMap<String, String>, key: &str) -> Option<bool> {
         })
 }
 
+/// Strict boolean option: `Ok(None)` if absent, `Ok(Some(b))` for a recognized
+/// truthy/falsy token, and `Err(msg)` for a present-but-unparseable value. The
+/// lenient `option_bool` maps an unrecognized value to `None`, which callers
+/// then silently treat as "not specified" — masking user typos like
+/// `double_penalty=ture`.
+pub fn option_bool_strict(
+    map: &BTreeMap<String, String>,
+    key: &str,
+) -> Result<Option<bool>, String> {
+    match map.get(key) {
+        None => Ok(None),
+        Some(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "y" => Ok(Some(true)),
+            "false" | "0" | "no" | "n" => Ok(Some(false)),
+            _ => Err(FormulaDslError::InvalidArgument {
+                reason: format!(
+                    "option `{key}={raw}` is not a boolean; \
+                     expected one of true/false/yes/no/1/0"
+                ),
+            }
+            .into()),
+        },
+    }
+}
+
 pub fn strip_quotes(v: &str) -> &str {
     let b = v.as_bytes();
     if b.len() >= 2
@@ -1488,8 +1513,8 @@ pub fn parse_linkwiggle_formulaspec(
         .filter(|key| !allowed.contains(&key.as_str()))
         .cloned()
         .collect::<Vec<_>>();
+    let term_name = raw.split('(').next().unwrap_or("linkwiggle");
     if !unknown.is_empty() {
-        let term_name = raw.split('(').next().unwrap_or("linkwiggle");
         return Err(FormulaDslError::InvalidArgument {
             reason: format!(
                 "{}() does not support option(s) {}: {raw}",
@@ -1500,24 +1525,28 @@ pub fn parse_linkwiggle_formulaspec(
         .into());
     }
     let defaults = WigglePenaltyConfig::cubic_triple_operator_default();
-    let degree = option_usize(options, "degree").unwrap_or(defaults.degree);
+    // Strict parsing: a present-but-unparseable value (`degree=abc`, `=-3`,
+    // `=6.5`) must be rejected, not silently dropped and replaced by the
+    // default as the lossy `option_usize`/`option_bool` readers would do.
+    let degree = option_usize_strict(options, "degree")?.unwrap_or(defaults.degree);
     if degree < 1 {
         return Err(FormulaDslError::InvalidArgument {
-            reason: format!("linkwiggle() requires degree >= 1: {raw}"),
+            reason: format!("{term_name}() requires degree >= 1: {raw}"),
         }
         .into());
     }
     let num_internal_knots =
-        option_usize(options, "internal_knots").unwrap_or(defaults.num_internal_knots);
+        option_usize_strict(options, "internal_knots")?.unwrap_or(defaults.num_internal_knots);
     if num_internal_knots == 0 {
         return Err(FormulaDslError::InvalidArgument {
-            reason: format!("linkwiggle() requires internal_knots > 0: {raw}"),
+            reason: format!("{term_name}() requires internal_knots > 0: {raw}"),
         }
         .into());
     }
     let penalty_orders =
         parse_linkwiggle_penalty_orders(options.get("penalty_order").map(String::as_str))?;
-    let double_penalty = option_bool(options, "double_penalty").unwrap_or(defaults.double_penalty);
+    let double_penalty =
+        option_bool_strict(options, "double_penalty")?.unwrap_or(defaults.double_penalty);
     Ok(LinkWiggleFormulaSpec {
         degree,
         num_internal_knots,
