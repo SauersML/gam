@@ -865,12 +865,6 @@ pub fn fit_penalized_multinomial_formula(
     // UnifiedFitResult.log_likelihood. This reproduces the legacy fixed-λ
     // path's `deviance = -2 · log_lik` contract bit-for-bit, so the previous
     // row-by-row η = Xβ rebuild and softmax recompute were pure dead work.
-    if fit.block_states.len() != m {
-        crate::bail_invalid_estim!(
-            "multinomial REML: expected {m} fitted block states (K-1), got {}",
-            fit.block_states.len()
-        );
-    }
     let deviance = -2.0 * fit.log_likelihood;
 
     Ok(MultinomialSavedModel {
