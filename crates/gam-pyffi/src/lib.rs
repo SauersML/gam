@@ -11070,8 +11070,6 @@ fn sae_manifold_fit_minimal<'py>(
     .map_err(py_value_error)?;
     let (basis_values, basis_jacobian, smooth_penalties, basis_sizes, _coord_blocks) =
         sae_build_padded_basis_stacks(&plans, seed_coords.view(), n_obs).map_err(py_value_error)?;
-    let m_max = basis_sizes.iter().copied().max().unwrap_or(1).max(1);
-    let p_out = z_view.ncols();
     // JumpReLU gates strictly on `logit > threshold` (threshold = 0.0 in the
     // production inner driver). Zero-initialised logits would leave every
     // gate closed at step 0, making the data-fit Jacobian, the sparsity
