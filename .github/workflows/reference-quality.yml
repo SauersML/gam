@@ -68,13 +68,25 @@ jobs:
           Rscript -e '
             options(repos = c(CRAN = "https://packagemanager.posit.co/cran/__linux__/jammy/latest"))
             pkgs <- c("mgcv","survival","gamlss","gamlss.dist","gamlss.cens",
-                      "flexsurv","VGAM","nnet","MASS","ordinal","betareg",
-                      "scam","splines2","cmprsk","lme4","nlme","fields","gss",
-                      "quantreg","mlt","tram","basefun","loo","jsonlite")
+                      "flexsurv","rstpm2","VGAM","nnet","MASS","ordinal","betareg",
+                      "scam","splines2","cmprsk","lme4","nlme","fields","gss","GpGp",
+                      "quantreg","mlt","tram","basefun","loo","jsonlite",
+                      "spheresmooth","Directional","nprotreg","compositions",
+                      "robCompositions","scoringrules","gamboostLSS","mboost","bamlss")
             for (p in pkgs) if (!requireNamespace(p, quietly=TRUE))
               try(install.packages(p), silent=TRUE)
             cat("installed R packages:\n")
             for (p in pkgs) cat(sprintf("  %-14s %s\n", p, requireNamespace(p, quietly=TRUE)))
+          '
+          # R-INLA is not on CRAN; it ships from its own repository. Best-effort
+          # (large download); tests that need it fail loudly if it is unavailable.
+          Rscript -e '
+            options(repos = c(getOption("repos"),
+                              INLA = "https://inla.r-inla-download.org/R/stable",
+                              CRAN = "https://packagemanager.posit.co/cran/__linux__/jammy/latest"))
+            if (!requireNamespace("INLA", quietly=TRUE))
+              try(install.packages("INLA", dependencies=TRUE), silent=TRUE)
+            cat(sprintf("  %-14s %s\n", "INLA", requireNamespace("INLA", quietly=TRUE)))
           '
 
       - name: Set up Python
@@ -90,9 +102,11 @@ jobs:
           # Core (must succeed); heavy/optional ones best-effort so one failure
           # does not block the rest.
           pip install numpy pandas scipy scikit-learn statsmodels
-          pip install pygam lifelines scikit-survival properscoring || true
-          pip install geomstats GPy || true
-          pip install numpyro arviz || true
+          pip install pygam lifelines scikit-survival properscoring scoringrules || true
+          pip install geomstats GPy gpytorch || true
+          pip install numpyro arviz pymc || true
+          pip install interpret pysindy ngboost || true
+          pip install xgboostlss lightgbmlss || true
           python -c "import numpy,scipy,sklearn,statsmodels,pandas; print('core python refs ok')"
 
       - name: Verify R stack loads
