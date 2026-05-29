@@ -242,7 +242,13 @@ class SharedGaussianRemlTangentFit:
 
 @dataclass(slots=True)
 class ResponseGeometryModel:
-    """A fitted response-geometry GAM with shared smoothing across tangent coordinates."""
+    """A fitted response-geometry GAM.
+
+    Each tangent coordinate is fitted as its own scalar Gaussian GAM (with its
+    own per-smooth smoothing parameters) through the general multi-penalty REML
+    solver. The coordinates are estimated jointly so an optional Fisher-Rao
+    precision metric can couple their residuals.
+    """
 
     models: Sequence[Any]
     response_geometry: str
