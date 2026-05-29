@@ -1,26 +1,28 @@
-//! Uniform hard-contract tests for β-dependent block Jacobians.
+//! Self-compute correctness tests for the β-dependent BMS block Jacobians.
 //!
-//! Each β-dependent block must:
-//!   1. Return `Ok` at `beta=zeros`, `family_scalars=None`.
-//!   2. Return `Err` (naming the expected scalars type) at `beta=nonzero`,
-//!      `family_scalars=None`, when any `g_i != 0`.
-//!   3. Return `Ok` and FD-matching values at `beta=nonzero`,
-//!      `family_scalars=Some(correct)`.
+//! The Bernoulli marginal-slope (BMS) blocks own every input their effective
+//! Jacobian needs — both designs, both offsets, the latent z, and (via the
+//! linearization state) β and the probit frailty scale s. Each block therefore
+//! self-computes the per-row scalars q_i, g_i, c_i, z_i at the current β with
+//! NO caller-supplied `family_scalars`. This is the fix for issue #367: the
+//! previous "hard contract" rejected the self-compute path whenever any
+//! g_i != 0, but g_i = offset_s[i] is generically nonzero at β = 0 because it
+//! absorbs the fitted logslope baseline, which made the pre-fit identifiability
+//! audit (β = 0, family_scalars = None) reject every BMS model before fitting.
+//!
+//! Each block must now:
+//!   1. Return `Ok` at `beta = zeros`, `family_scalars = None` — even when the
+//!      offsets (and hence g_i) are nonzero, modelling the fitted baseline.
+//!   2. Return `Ok` and FD-matching values at `beta = nonzero`,
+//!      `family_scalars = None` (no scalars are ever required).
 //!
 //! Families covered:
 //!   - BMS marginal block  (`BmsMarginalJacobian`)
 //!   - BMS logslope block  (`BmsLogslopeJacobian`)
-//!
-//! Survival location-scale and all GAMLSS families use `AdditiveBlockJacobian`
-//! (β-independent linear blocks) — the contract is vacuously satisfied and
-//! those families are confirmed here to compile but need no enforcement check.
 
-use gam::families::bernoulli_marginal_slope::{
-    BmsFamilyScalars, BmsLogslopeJacobian, BmsMarginalJacobian,
-};
+use gam::families::bernoulli_marginal_slope::{BmsLogslopeJacobian, BmsMarginalJacobian};
 use gam::families::custom_family::{BlockEffectiveJacobian, FamilyLinearizationState};
 use ndarray::{Array1, Array2};
-use std::any::Any;
 use std::sync::Arc;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -74,35 +76,6 @@ fn compute_q(marginal_design: &Array2<f64>, offset_m: &Array1<f64>, beta_m: &[f6
                     .sum::<f64>()
         })
         .collect()
-}
-
-/// Build correct BmsFamilyScalars from designs + beta.
-fn build_bms_scalars(
-    marginal_design: &Array2<f64>,
-    logslope_design: &Array2<f64>,
-    offset_m: &Array1<f64>,
-    offset_s: &Array1<f64>,
-    z: &[f64],
-    beta_m: &[f64],
-    beta_s: &[f64],
-    s: f64,
-) -> BmsFamilyScalars {
-    let q_i = compute_q(marginal_design, offset_m, beta_m);
-    let g_i = compute_g(logslope_design, offset_s, beta_s);
-    let c_i: Vec<f64> = g_i
-        .iter()
-        .map(|&gi| {
-            let sg = s * gi;
-            (1.0 + sg * sg).sqrt()
-        })
-        .collect();
-    BmsFamilyScalars {
-        q_i,
-        g_i,
-        c_i,
-        s,
-        z_i: z.to_vec(),
-    }
 }
 
 /// Finite-difference the marginal Jacobian: ∂η/∂β_m[j] ≈ (η(β+ε·e_j) − η(β−ε·e_j)) / (2ε).
@@ -203,21 +176,27 @@ fn max_rel_error(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
 
 // ── BMS marginal block ────────────────────────────────────────────────────────
 
+/// Issue #367 regression: a NONZERO logslope offset (the fitted logslope
+/// baseline) makes g_i != 0 even at β = 0. The marginal block must still
+/// return Ok at β = 0 with family_scalars = None — this is exactly the state
+/// the pre-fit identifiability audit evaluates, and it used to error out.
 #[test]
-fn bms_marginal_block_contract_beta_zero_scalars_none_ok() {
+fn bms_marginal_block_beta_zero_nonzero_offset_self_computes_ok() {
     let mut rng = 0xC0FFEE_u64;
     let n = 15;
     let p_m = 3;
     let p_s = 4;
+    let s = 0.9_f64;
     let marginal = Arc::new(random_design(n, p_m, &mut rng));
     let logslope = Arc::new(random_design(n, p_s, &mut rng));
     let offset_m = Array1::zeros(n);
-    let offset_s = Array1::zeros(n);
+    // Nonzero logslope offset == fitted logslope baseline ⇒ g_i != 0 at β = 0.
+    let offset_s = Array1::from_elem(n, 0.37_f64);
     let cb = BmsMarginalJacobian::new(
         Arc::clone(&marginal),
         Arc::clone(&logslope),
-        offset_m,
-        offset_s,
+        offset_m.clone(),
+        offset_s.clone(),
         p_m,
     );
     let beta_zero = vec![0.0_f64; p_m + p_s];
@@ -225,58 +204,31 @@ fn bms_marginal_block_contract_beta_zero_scalars_none_ok() {
         beta: &beta_zero,
         family_scalars: None,
         channel_hessian: None,
-        probit_frailty_scale: 1.0,
+        probit_frailty_scale: s,
     };
     let jac = cb
         .effective_jacobian_at(&state)
-        .expect("bms marginal: beta=0, scalars=None must return Ok");
-    assert_eq!(jac.nrows(), n, "Jacobian must have n rows");
+        .expect("bms marginal: beta=0, nonzero offset, scalars=None must return Ok (issue #367)");
+    assert_eq!(jac.shape(), &[n, p_m], "Jacobian must be n × p_m");
+
+    // The self-computed value must equal the analytic c_i · M[i,:] with
+    // c_i = sqrt(1 + (s·offset_s[i])²) at β = 0.
+    for i in 0..n {
+        let sg = s * offset_s[i];
+        let c_i = (1.0 + sg * sg).sqrt();
+        for j in 0..p_m {
+            let expected = c_i * marginal[[i, j]];
+            assert!(
+                (jac[[i, j]] - expected).abs() < 1e-12,
+                "marginal J[{i},{j}] = {} != c_i·M = {expected}",
+                jac[[i, j]],
+            );
+        }
+    }
 }
 
 #[test]
-fn bms_marginal_block_contract_beta_nonzero_scalars_none_err() {
-    let mut rng = 0xBEEF_u64;
-    let n = 15;
-    let p_m = 3;
-    let p_s = 4;
-    let marginal = Arc::new(random_design(n, p_m, &mut rng));
-    let logslope = Arc::new(random_design(n, p_s, &mut rng));
-    let offset_m = Array1::zeros(n);
-    let offset_s = Array1::zeros(n);
-    let cb = BmsMarginalJacobian::new(
-        Arc::clone(&marginal),
-        Arc::clone(&logslope),
-        offset_m,
-        offset_s,
-        p_m,
-    );
-    // beta_s is nonzero → g_i != 0 for at least one row (design has random values).
-    let mut beta = vec![0.0_f64; p_m + p_s];
-    beta[p_m] = 1.0;
-    let state = FamilyLinearizationState {
-        beta: &beta,
-        family_scalars: None,
-        channel_hessian: None,
-        probit_frailty_scale: 1.0,
-    };
-    let result = cb.effective_jacobian_at(&state);
-    assert!(
-        result.is_err(),
-        "bms marginal block must return Err when beta_s nonzero and family_scalars=None; got Ok"
-    );
-    let msg = result.unwrap_err();
-    assert!(
-        msg.contains("BmsFamilyScalars"),
-        "error message must name BmsFamilyScalars; got: {msg}"
-    );
-    assert!(
-        msg.contains("family_scalars: None"),
-        "error message must mention family_scalars: None; got: {msg}"
-    );
-}
-
-#[test]
-fn bms_marginal_block_contract_beta_nonzero_scalars_some_ok_fd_match() {
+fn bms_marginal_block_beta_nonzero_scalars_none_fd_match() {
     let mut rng = 0xDEAD_u64;
     let n = 20;
     let p_m = 3;
@@ -300,20 +252,16 @@ fn bms_marginal_block_contract_beta_nonzero_scalars_some_ok_fd_match() {
     let mut beta = beta_m.clone();
     beta.extend_from_slice(&beta_s);
 
-    let scalars = build_bms_scalars(
-        &marginal, &logslope, &offset_m, &offset_s, &z, &beta_m, &beta_s, s,
-    );
-    let scalars_arc: Arc<dyn Any + Send + Sync> = Arc::new(scalars);
-
+    // No family_scalars: the block self-computes c_i from owned data.
     let state = FamilyLinearizationState {
         beta: &beta,
-        family_scalars: Some(scalars_arc),
+        family_scalars: None,
         channel_hessian: None,
         probit_frailty_scale: s,
     };
     let jac = cb
         .effective_jacobian_at(&state)
-        .expect("bms marginal: beta nonzero, scalars=Some must return Ok");
+        .expect("bms marginal: beta nonzero, scalars=None must return Ok");
 
     assert_eq!(jac.shape(), &[n, p_m]);
 
@@ -329,22 +277,28 @@ fn bms_marginal_block_contract_beta_nonzero_scalars_some_ok_fd_match() {
 
 // ── BMS logslope block ────────────────────────────────────────────────────────
 
+/// Issue #367 regression for the logslope block: nonzero logslope offset at
+/// β = 0 ⇒ g_i != 0, and the block must self-compute the full hyperbolic
+/// factor (q_i·s²·g_i/c_i + s·z_i) with family_scalars = None rather than
+/// erroring.
 #[test]
-fn bms_logslope_block_contract_beta_zero_scalars_none_ok() {
+fn bms_logslope_block_beta_zero_nonzero_offset_self_computes_ok() {
     let mut rng = 0xABCD_u64;
     let n = 15;
     let p_m = 3;
     let p_s = 4;
+    let s = 0.85_f64;
     let marginal = Arc::new(random_design(n, p_m, &mut rng));
     let logslope = Arc::new(random_design(n, p_s, &mut rng));
-    let offset_m = Array1::zeros(n);
-    let offset_s = Array1::zeros(n);
-    let z: Arc<Array1<f64>> = Arc::new(Array1::from_elem(n, 0.5_f64));
+    let offset_m = Array1::from_elem(n, 0.21_f64);
+    let offset_s = Array1::from_elem(n, 0.41_f64);
+    let z_vec: Vec<f64> = (0..n).map(|_| lcg_next(&mut rng)).collect();
+    let z: Arc<Array1<f64>> = Arc::new(Array1::from(z_vec.clone()));
     let cb = BmsLogslopeJacobian::new(
         Arc::clone(&marginal),
         Arc::clone(&logslope),
-        offset_m,
-        offset_s,
+        offset_m.clone(),
+        offset_s.clone(),
         Arc::clone(&z),
         p_m,
     );
@@ -353,60 +307,33 @@ fn bms_logslope_block_contract_beta_zero_scalars_none_ok() {
         beta: &beta_zero,
         family_scalars: None,
         channel_hessian: None,
-        probit_frailty_scale: 1.0,
+        probit_frailty_scale: s,
     };
     let jac = cb
         .effective_jacobian_at(&state)
-        .expect("bms logslope: beta=0, scalars=None must return Ok");
-    assert_eq!(jac.nrows(), n, "Jacobian must have n rows");
+        .expect("bms logslope: beta=0, nonzero offset, scalars=None must return Ok (issue #367)");
+    assert_eq!(jac.shape(), &[n, p_s], "Jacobian must be n × p_s");
+
+    // Analytic check at β = 0: q_i = offset_m[i], g_i = offset_s[i].
+    for i in 0..n {
+        let q_i = offset_m[i];
+        let g_i = offset_s[i];
+        let sg = s * g_i;
+        let c_i = (1.0 + sg * sg).sqrt();
+        let factor = q_i * s * s * g_i / c_i + s * z_vec[i];
+        for j in 0..p_s {
+            let expected = factor * logslope[[i, j]];
+            assert!(
+                (jac[[i, j]] - expected).abs() < 1e-12,
+                "logslope J[{i},{j}] = {} != factor·G = {expected}",
+                jac[[i, j]],
+            );
+        }
+    }
 }
 
 #[test]
-fn bms_logslope_block_contract_beta_nonzero_scalars_none_err() {
-    let mut rng = 0x1234_u64;
-    let n = 15;
-    let p_m = 3;
-    let p_s = 4;
-    let marginal = Arc::new(random_design(n, p_m, &mut rng));
-    let logslope = Arc::new(random_design(n, p_s, &mut rng));
-    let offset_m = Array1::zeros(n);
-    let offset_s = Array1::zeros(n);
-    let z: Arc<Array1<f64>> = Arc::new(Array1::from_elem(n, 0.5_f64));
-    let cb = BmsLogslopeJacobian::new(
-        Arc::clone(&marginal),
-        Arc::clone(&logslope),
-        offset_m,
-        offset_s,
-        Arc::clone(&z),
-        p_m,
-    );
-    // beta_s nonzero → g_i != 0 for at least one row.
-    let mut beta = vec![0.0_f64; p_m + p_s];
-    beta[p_m] = 1.0;
-    let state = FamilyLinearizationState {
-        beta: &beta,
-        family_scalars: None,
-        channel_hessian: None,
-        probit_frailty_scale: 1.0,
-    };
-    let result = cb.effective_jacobian_at(&state);
-    assert!(
-        result.is_err(),
-        "bms logslope block must return Err when beta_s nonzero and family_scalars=None; got Ok"
-    );
-    let msg = result.unwrap_err();
-    assert!(
-        msg.contains("BmsFamilyScalars"),
-        "error message must name BmsFamilyScalars; got: {msg}"
-    );
-    assert!(
-        msg.contains("family_scalars: None"),
-        "error message must mention family_scalars: None; got: {msg}"
-    );
-}
-
-#[test]
-fn bms_logslope_block_contract_beta_nonzero_scalars_some_ok_fd_match() {
+fn bms_logslope_block_beta_nonzero_scalars_none_fd_match() {
     let mut rng = 0xFACE_u64;
     let n = 20;
     let p_m = 3;
@@ -432,20 +359,16 @@ fn bms_logslope_block_contract_beta_nonzero_scalars_some_ok_fd_match() {
     let mut beta = beta_m.clone();
     beta.extend_from_slice(&beta_s);
 
-    let scalars = build_bms_scalars(
-        &marginal, &logslope, &offset_m, &offset_s, &z_vec, &beta_m, &beta_s, s,
-    );
-    let scalars_arc: Arc<dyn Any + Send + Sync> = Arc::new(scalars);
-
+    // No family_scalars: the block self-computes q_i, g_i, c_i, z_i.
     let state = FamilyLinearizationState {
         beta: &beta,
-        family_scalars: Some(scalars_arc),
+        family_scalars: None,
         channel_hessian: None,
         probit_frailty_scale: s,
     };
     let jac = cb
         .effective_jacobian_at(&state)
-        .expect("bms logslope: beta nonzero, scalars=Some must return Ok");
+        .expect("bms logslope: beta nonzero, scalars=None must return Ok");
 
     assert_eq!(jac.shape(), &[n, p_s]);
 
