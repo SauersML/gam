@@ -3255,6 +3255,91 @@ impl SaeManifoldTerm {
         Ok((v, loss))
     }
 
+    /// Per-atom, per-axis coordinate sum-of-squares `‖t_kj‖² = Σ_i t_{i,k,j}²`.
+    ///
+    /// This is the data-fit sufficient statistic for the ARD precision update
+    /// (the numerator-side `‖t‖²` of the deleted `α = n/‖t‖²` rule). Returned
+    /// per atom as an `Array1` of length `d_k`.
+    fn ard_coord_sumsq(&self) -> Vec<Array1<f64>> {
+        let mut out = Vec::with_capacity(self.k_atoms());
+        for coord in &self.assignment.coords {
+            let d = coord.latent_dim();
+            let mut sq = Array1::<f64>::zeros(d);
+            for row in 0..coord.n_obs() {
+                let t = coord.row(row);
+                for axis in 0..d {
+                    sq[axis] += t[axis] * t[axis];
+                }
+            }
+            out.push(sq);
+        }
+        out
+    }
+
+    /// Per-atom, per-axis posterior-variance trace `tr_kj(H⁻¹) =
+    /// Σ_i [(H⁻¹)_tt]_{(i,k,j),(i,k,j)}` from the converged factor cache.
+    ///
+    /// `cache.latent_block_inverse_diagonal()` returns the diagonal of the
+    /// latent block `(H⁻¹)_tt` in the cache's compact per-row `delta_t`
+    /// layout (length `row_offsets[N]`); each per-row block is laid out as
+    /// `[logit scalars…, then per-active-atom coord axes…]`. This routine
+    /// sums those diagonal entries over the coord positions belonging to each
+    /// `(atom k, axis j)` across all observation rows where atom `k` is active.
+    ///
+    /// `self.last_row_layout` must be the layout from the *same* assemble that
+    /// produced `cache`:
+    /// - `Some(layout)`: compact active-set mode (JumpReLU / large-K
+    ///   softmax-IBP truncation). For row `i`, atom `k`'s position in the
+    ///   active list gives its compact coord-block start `coord_starts[i][pos]`;
+    ///   inactive atoms contribute 0 (the prior dominates there anyway).
+    /// - `None`: dense full-support layout, uniform row dim
+    ///   `q = K + Σ d_k`; atom `k`'s coord block sits at the fixed full-row
+    ///   offset `coord_offsets[k]` after the `K` logit scalars.
+    ///
+    /// This `tr_kj(H⁻¹)` is exactly the posterior-variance term the deleted
+    /// `α = n/‖t‖²` rule dropped; the corrected Mackay/Fellner-Schall fixed
+    /// point is `α_new = n / (‖t_kj‖² + tr_kj(H⁻¹))`.
+    fn ard_inverse_traces(
+        &self,
+        cache: &ArrowFactorCache,
+    ) -> Result<Vec<Array1<f64>>, ArrowSchurError> {
+        let inv_diag = cache.latent_block_inverse_diagonal()?;
+        let n = self.n_obs();
+        let coord_offsets = self.assignment.coord_offsets();
+        let mut traces: Vec<Array1<f64>> = self
+            .assignment
+            .coords
+            .iter()
+            .map(|c| Array1::<f64>::zeros(c.latent_dim()))
+            .collect();
+        for row in 0..n {
+            let row_base = cache.row_offsets[row];
+            match self.last_row_layout {
+                Some(ref layout) => {
+                    let active = &layout.active_atoms[row];
+                    let starts = &layout.coord_starts[row];
+                    for (pos, &k) in active.iter().enumerate() {
+                        let d = self.assignment.coords[k].latent_dim();
+                        let block_start = starts[pos];
+                        for axis in 0..d {
+                            traces[k][axis] += inv_diag[row_base + block_start + axis];
+                        }
+                    }
+                }
+                None => {
+                    for k in 0..self.k_atoms() {
+                        let d = self.assignment.coords[k].latent_dim();
+                        let block_start = coord_offsets[k];
+                        for axis in 0..d {
+                            traces[k][axis] += inv_diag[row_base + block_start + axis];
+                        }
+                    }
+                }
+            }
+        }
+        Ok(traces)
+    }
+
     /// Returns `true` when a Beta-tier analytic penalty was accumulated into
     /// the dense `sys.hbb` block (so the caller knows to wrap it in a
     /// `DensePenaltyOp`); `false` leaves `sys.hbb` all-zero and lets the
