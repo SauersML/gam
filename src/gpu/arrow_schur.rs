@@ -301,7 +301,6 @@ fn build_row_procedural_matvec(
     ridge_t: f64,
     ridge_beta: f64,
 ) -> Result<crate::solver::arrow_schur::GpuSchurMatvec, ArrowSchurGpuFailure> {
-    use crate::solver::arrow_schur::BetaPenaltyOp;
     use std::sync::Arc;
     let n = sys.rows.len();
     let k = sys.k;

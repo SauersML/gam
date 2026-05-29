@@ -31,8 +31,8 @@ use std::sync::Arc;
 
 use crate::solver::arrow_schur::{
     ArrowRowBlock, ArrowSchurError, ArrowSchurSystem, ArrowSolveOptions, BetaPenaltyOp,
-    CompositePenaltyOp, DensePenaltyOp, KroneckerPenaltyOp, StreamingArrowSchur,
-    solve_streaming_reduced_beta,
+    CompositePenaltyOp, DensePenaltyOp, KroneckerPenaltyOp, SparseBlockKroneckerPenaltyOp,
+    SparseGBlock, StreamingArrowSchur, solve_streaming_reduced_beta,
 };
 use crate::terms::analytic_penalties::{
     ARDPenalty, AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry,
