@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -31,18 +32,57 @@ from gamfit.manifolds import Sphere as ManifoldSphere
 def test_circle_exp_returns_tensor_with_grad_through_v() -> None:
     M = ManifoldCircle()
     assert M.dimension == 1
-    assert M.ambient_dim == 2
-    # Circle uses ambient R^2: p = (cos θ, sin θ), v in tangent space.
-    p = torch.tensor([1.0, 0.0], dtype=torch.float64)
-    v = torch.tensor([0.0, 0.5], dtype=torch.float64, requires_grad=True)
+    # Circle is parameterized by a single angle coordinate, matching the Rust
+    # ``gam::geometry::Circle`` (ambient == intrinsic == 1). There is no R^2
+    # unit-vector embedding; see issue #397.
+    assert M.ambient_dim == 1
+    # Point and tangent are both 1-D angle coordinates; exp wraps to (-pi, pi].
+    p = torch.tensor([0.5], dtype=torch.float64)
+    v = torch.tensor([0.1], dtype=torch.float64, requires_grad=True)
     q = M.exp(p, v)
     assert isinstance(q, torch.Tensor)
     assert q.dtype == torch.float64
-    assert q.shape == (2,)
-    # Gradient flows back through v (straight-through identity for Circle).
+    assert q.shape == (1,)
+    # exp_theta(v) = wrap(theta + v); for small angles this is just theta + v.
+    assert torch.allclose(q.detach(), torch.tensor([0.6], dtype=torch.float64), atol=1e-12)
+    # Gradient flows back through v (the flat-circle VJP is the identity).
     q.sum().backward()
     assert v.grad is not None
     assert torch.isfinite(v.grad).all()
+    assert torch.allclose(v.grad, torch.tensor([1.0], dtype=torch.float64), atol=1e-12)
+
+
+def test_circle_cylinder_ambient_dim_matches_rust_source_of_truth() -> None:
+    """Regression for issue #397: the Python descriptor's documented contract
+    and its cached ``_ambient_dim`` must agree with the Rust manifold, which
+    uses the 1-D angle parameterization (ambient == intrinsic). Following the
+    old ``R^2`` "unit 2-vector" docstring raised a hard ``GamError``."""
+    from gamfit.manifolds import CylinderManifold
+
+    circle = ManifoldCircle()
+    # Rust-backed property and the cached fallback must agree, and both == 1.
+    assert circle.ambient_dim == 1
+    assert circle._ambient_dim == 1
+    assert circle.ambient_dim == circle._ambient_dim
+    # The numpy path exercises the Rust manifold directly: the 1-D angle form
+    # must succeed and wrap correctly.
+    out = circle.exp(np.array([0.5]), np.array([0.1]))
+    assert out.shape == (1,)
+    assert math.isclose(float(out[0]), 0.6, abs_tol=1e-12)
+
+    for open_dim in (0, 1, 3):
+        cyl = CylinderManifold(open_dim)
+        assert cyl.ambient_dim == 1 + open_dim
+        assert cyl._ambient_dim == 1 + open_dim
+        assert cyl.ambient_dim == cyl._ambient_dim
+        # A point is [theta, x_1, ..., x_k] of width 1 + open_dim.
+        p = np.zeros(1 + open_dim, dtype=np.float64)
+        v = np.zeros(1 + open_dim, dtype=np.float64)
+        p[0] = 0.5
+        v[0] = 0.1
+        q = cyl.exp(p, v)
+        assert q.shape == (1 + open_dim,)
+        assert math.isclose(float(q[0]), 0.6, abs_tol=1e-12)
 
 
 def test_sphere_metric_is_symmetric_psd() -> None:
