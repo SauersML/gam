@@ -1313,17 +1313,50 @@ fn factor_one_row(
             ),
         });
     }
-    let mut block = row.htt.clone();
-    for a in 0..d {
-        block[[a, a]] += ridge_t;
-    }
-    let factor = cholesky_lower(&block).map_err(|e| ArrowSchurError::PerRowFactorFailed {
-        row: row_idx,
-        reason: format!(
-            "row {row_idx} H_tt was non-PD at ridge_t={ridge_t}; \
-             cholesky error: {e}"
-        ),
-    })?;
+    // Per-row adaptive Tikhonov ridge. A non-convex objective (e.g. softmax
+    // assignment) can leave an individual token's latent Hessian H_tt^(i)
+    // indefinite, so `H_tt + ridge_t·I` has a negative Cholesky pivot. Rather
+    // than fail and force the OUTER LM loop to lift `ridge_t` for EVERY row
+    // (over-damping the well-conditioned tokens), damp only this block by the
+    // minimal amount it needs: escalate this row's ridge geometrically from the
+    // caller's base `ridge_t` until the factor is positive-definite. A
+    // positive-definite block factors at the base ridge with zero escalation,
+    // so the common case is bit-for-bit unchanged. The escalation is capped
+    // relative to the block's diagonal scale, so a genuinely broken block
+    // (non-finite, or unboundedly indefinite) still surfaces as
+    // `PerRowFactorFailed` for the outer loop to handle rather than looping.
+    let diag_scale = (0..d)
+        .map(|a| row.htt[[a, a]].abs())
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
+    let ridge_cap = ridge_t.max(1.0e-12 * diag_scale) * 1.0e12;
+    let mut ridge_eff = ridge_t;
+    let factor = loop {
+        let mut block = row.htt.clone();
+        for a in 0..d {
+            block[[a, a]] += ridge_eff;
+        }
+        match cholesky_lower(&block) {
+            Ok(factor) => break factor,
+            Err(e) => {
+                let next = if ridge_eff > 0.0 {
+                    ridge_eff * 10.0
+                } else {
+                    1.0e-10 * diag_scale
+                };
+                if !next.is_finite() || next > ridge_cap {
+                    return Err(ArrowSchurError::PerRowFactorFailed {
+                        row: row_idx,
+                        reason: format!(
+                            "row {row_idx} H_tt remained non-PD up to ridge {ridge_eff:e} \
+                             (base ridge_t={ridge_t}); last cholesky error: {e}"
+                        ),
+                    });
+                }
+                ridge_eff = next;
+            }
+        }
+    };
     // Cholesky succeeded, but barely-PD H_tt^(i) (pivots on the order of
     // ε·trace) yield an inverse with condition number ~1/ε. Plugging that
     // inverse into the Schur reduction
