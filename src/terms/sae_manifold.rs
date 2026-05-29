@@ -54,6 +54,29 @@ use faer::Side;
 const SAE_MANIFOLD_ARMIJO_C1: f64 = 1.0e-4;
 const SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS: usize = 12;
 
+/// Fixed precision of the proper Gaussian identifiability prior on the
+/// assignment logits, `½·κ·‖logit_row‖²` per observation row.
+///
+/// The softmax assignment is shift-invariant per row (adding a constant to
+/// every logit leaves `a = softmax(logit)` unchanged), so the logit
+/// Gauss-Newton curvature along the all-ones direction is *exactly* zero for
+/// every `K`: with the JVP `∂a_k/∂l_j = a_k(δ_kj − a_j)/τ`, the shift
+/// direction gives `Σ_j ∂a_k/∂l_j = a_k(1 − Σ_j a_j)/τ = 0`. For the
+/// single-atom `K=1` case the whole logit block is structurally zero. The
+/// assignment-sparsity prior (`assignment_hdiag`) does not in general cover
+/// that null direction. Left unregularised, the per-row latent Hessian
+/// `H_tt` is rank-deficient, so the REML/Laplace evidence `½log|H|` and the
+/// undamped selected-inverse traces are ill-defined at `ridge_t = 0`.
+///
+/// This κ is a *proper* prior (it enters the loss, gradient, and Hessian
+/// diagonal consistently), not a solver jitter: it pins the otherwise-flat
+/// logit gauge to 0, exactly as `mgcv` ridges an unpenalised smooth null
+/// space. It is a fixed model constant — independent of ρ — so it shifts the
+/// evidence by a ρ-independent amount and does not bias ρ-optimisation, while
+/// making `H_tt` positive-definite by construction so the exact undamped
+/// `arrow_log_det_from_cache` evidence and the IFT/EFS traces are well-posed.
+const SAE_LOGIT_IDENTIFIABILITY_PRECISION: f64 = 1.0e-4;
+
 /// Decay law for deterministic Gumbel/concrete assignment temperature.
 #[derive(Debug, Clone)]
 pub enum ScheduleKind {
@@ -5236,16 +5259,23 @@ fn flat_logits(logits: ArrayView2<'_, f64>) -> Array1<f64> {
 }
 
 fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifoldRho) -> f64 {
-    if assignment.k_atoms() == 1 {
-        return 0.0;
-    }
-
     for row in 0..assignment.n_obs() {
         validate_finite_logits(assignment.logits.row(row), row)
             .expect("assignment logits must be finite");
     }
     let target = flat_logits(assignment.logits.view());
-    match assignment.mode {
+    // Proper Gaussian identifiability prior ½·κ·‖logit‖² over every logit,
+    // pinning the shift-invariant softmax gauge (and the wholly-flat K=1
+    // logit) so the assembled H_tt is PD. See
+    // `SAE_LOGIT_IDENTIFIABILITY_PRECISION`. Applied for all K and all modes;
+    // it is the only assignment-prior term when `k_atoms() == 1`.
+    let identifiability: f64 = 0.5
+        * SAE_LOGIT_IDENTIFIABILITY_PRECISION
+        * target.iter().map(|&l| l * l).sum::<f64>();
+    if assignment.k_atoms() == 1 {
+        return identifiability;
+    }
+    let sparsity_value = match assignment.mode {
         AssignmentMode::Softmax {
             temperature,
             sparsity,
@@ -5285,34 +5315,45 @@ fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifoldRho) -> f
             }
             sparsity_strength * acc
         }
-    }
+    };
+    sparsity_value + identifiability
 }
 
 fn assignment_prior_grad_hdiag(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
 ) -> Result<(Array1<f64>, Array1<f64>), String> {
-    if assignment.k_atoms() == 1 {
-        let n_obs = assignment.n_obs();
-        return Ok((Array1::zeros(n_obs), Array1::zeros(n_obs)));
-    }
-
     for row in 0..assignment.n_obs() {
         validate_finite_logits(assignment.logits.row(row), row)?;
     }
     let target = flat_logits(assignment.logits.view());
-    match assignment.mode {
+    // Proper Gaussian identifiability prior ½·κ·‖logit‖²: gradient `κ·logit`,
+    // Hessian diagonal `κ` on every logit. This pins the shift-invariant
+    // softmax gauge (and the flat K=1 logit) so the per-row H_tt logit block
+    // is PD. See `SAE_LOGIT_IDENTIFIABILITY_PRECISION`. Computed for all K;
+    // the sparsity prior (absent at K=1) is added on top below.
+    let kappa = SAE_LOGIT_IDENTIFIABILITY_PRECISION;
+    let mut grad = Array1::<f64>::zeros(target.len());
+    let mut diag = Array1::<f64>::zeros(target.len());
+    for idx in 0..target.len() {
+        grad[idx] = kappa * target[idx];
+        diag[idx] = kappa;
+    }
+    if assignment.k_atoms() == 1 {
+        return Ok((grad, diag));
+    }
+    let (sparsity_grad, sparsity_diag) = match assignment.mode {
         AssignmentMode::Softmax {
             temperature,
             sparsity,
         } => {
             let penalty = SoftmaxAssignmentSparsityPenalty::new(assignment.k_atoms(), temperature);
             let rho_view = Array1::from_vec(vec![rho.log_lambda_sparse + sparsity.ln()]);
-            let grad = penalty.grad_target(target.view(), rho_view.view());
-            let diag = penalty
+            let g = penalty.grad_target(target.view(), rho_view.view());
+            let d = penalty
                 .hessian_diag(target.view(), rho_view.view())
                 .ok_or_else(|| "softmax assignment hessian diag unavailable".to_string())?;
-            Ok((grad, diag))
+            (g, d)
         }
         AssignmentMode::IBPMap {
             temperature,
@@ -5330,11 +5371,11 @@ fn assignment_prior_grad_hdiag(
             } else {
                 Array1::zeros(0)
             };
-            let grad = penalty.grad_target(target.view(), rho_view.view());
-            let diag = penalty
+            let g = penalty.grad_target(target.view(), rho_view.view());
+            let d = penalty
                 .hessian_diag(target.view(), rho_view.view())
                 .ok_or_else(|| "IBP assignment hessian diag unavailable".to_string())?;
-            Ok((grad, diag))
+            (g, d)
         }
         AssignmentMode::JumpReLU {
             temperature,
@@ -5343,8 +5384,8 @@ fn assignment_prior_grad_hdiag(
             let sparsity_strength = rho.log_lambda_sparse.exp();
             let inv_tau = 1.0 / temperature;
             let inv_tau2 = inv_tau * inv_tau;
-            let mut grad = Array1::<f64>::zeros(target.len());
-            let mut diag = Array1::<f64>::zeros(target.len());
+            let mut g = Array1::<f64>::zeros(target.len());
+            let mut d = Array1::<f64>::zeros(target.len());
             for idx in 0..target.len() {
                 let logit = target[idx];
                 if logit <= threshold {
@@ -5352,12 +5393,15 @@ fn assignment_prior_grad_hdiag(
                 }
                 let activation = crate::linalg::utils::stable_logistic(logit * inv_tau);
                 let slope = activation * (1.0 - activation);
-                grad[idx] = sparsity_strength * slope * inv_tau;
-                diag[idx] = sparsity_strength * slope * slope * inv_tau2;
+                g[idx] = sparsity_strength * slope * inv_tau;
+                d[idx] = sparsity_strength * slope * slope * inv_tau2;
             }
-            Ok((grad, diag))
+            (g, d)
         }
-    }
+    };
+    grad += &sparsity_grad;
+    diag += &sparsity_diag;
+    Ok((grad, diag))
 }
 
 fn sae_penalty_is_row_block_supported(penalty: &AnalyticPenaltyKind) -> bool {
@@ -6720,16 +6764,21 @@ mod tests {
         assert_eq!(diag.len(), n * k);
         for (idx, &entry) in diag.iter().enumerate() {
             let logit = logits[[idx / k, idx % k]];
-            let expected = if logit > threshold {
+            // Expected = JumpReLU gated majorizer PLUS the fixed logit
+            // identifiability prior κ (added on every logit for all modes so
+            // the per-row H_tt logit block is PD).
+            let sparsity = if logit > threshold {
                 let activation = crate::linalg::utils::stable_logistic(logit * inv_tau);
                 let slope = activation * (1.0 - activation);
                 sparsity_strength * slope * slope * inv_tau2
             } else {
                 0.0
             };
+            let expected = sparsity + SAE_LOGIT_IDENTIFIABILITY_PRECISION;
             assert!(
-                entry.is_finite() && entry >= 0.0,
-                "JumpReLU gated hessian_diag majorizer must be finite and PSD at index {idx}; entry={entry}"
+                entry.is_finite() && entry >= SAE_LOGIT_IDENTIFIABILITY_PRECISION,
+                "JumpReLU gated hessian_diag majorizer + identifiability prior must be finite and \
+                 ≥ κ at index {idx}; entry={entry}"
             );
             assert_abs_diff_eq!(entry, expected, epsilon = 1e-12);
         }
