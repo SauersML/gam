@@ -3056,55 +3056,6 @@ impl SaeManifoldTerm {
         sys.apply_riemannian_latent_geometry(&latent);
     }
 
-    pub fn update_ard_reml(&self, rho: &mut SaeManifoldRho) -> Result<(), String> {
-        if rho.log_ard.len() != self.k_atoms() {
-            return Err(format!(
-                "SaeManifoldTerm::update_ard_reml: log_ard length {} != K {}",
-                rho.log_ard.len(),
-                self.k_atoms()
-            ));
-        }
-        let n = self.n_obs() as f64;
-        for (atom_idx, coord) in self.assignment.coords.iter().enumerate() {
-            let d = coord.latent_dim();
-            if rho.log_ard[atom_idx].len() != d {
-                return Err(format!(
-                    "SaeManifoldTerm::update_ard_reml: atom {atom_idx} log_ard length {} != dim {d}",
-                    rho.log_ard[atom_idx].len()
-                ));
-            }
-            for axis in 0..d {
-                let mut sq = 0.0;
-                for row in 0..coord.n_obs() {
-                    let v = coord.row(row)[axis];
-                    sq += v * v;
-                }
-                // REML-optimal precision is α = n / ‖t‖². When the coordinate
-                // variance collapses toward zero (PCA-seeded near-zero init or a
-                // mid-fit coordinate collapse), α explodes to ~n/1e-13, the
-                // Hessian-diagonal contribution `exp(log α)` saturates the
-                // clamp ceiling, and downstream LM ridge escalation is forced to
-                // compensate — a workaround, not a fix. Skip the update for such
-                // degenerate axes and preserve the existing α; the prior is
-                // already extremely strong there and the coordinate can re-grow
-                // as optimisation progresses without a discontinuous jump to the
-                // clamp ceiling.
-                if sq < 1.0e-10 {
-                    log::warn!(
-                        "[SAE-ARD] update_ard_reml: atom {atom_idx} axis {axis} coordinate \
-                         variance ‖t‖²={sq:.3e} below 1e-10; preserving prior log_ard={} rather \
-                         than letting α=n/‖t‖² saturate the clamp ceiling",
-                        rho.log_ard[atom_idx][axis],
-                    );
-                    continue;
-                }
-                let alpha = n / sq;
-                rho.log_ard[atom_idx][axis] = alpha.ln().clamp(-8.0, 16.0);
-            }
-        }
-        Ok(())
-    }
-
     /// Returns `true` when a Beta-tier analytic penalty was accumulated into
     /// the dense `sys.hbb` block (so the caller knows to wrap it in a
     /// `DensePenaltyOp`); `false` leaves `sys.hbb` all-zero and lets the
@@ -3678,7 +3629,15 @@ impl SaeManifoldTerm {
         }
         for _ in 0..max_iter {
             self.advance_temperature_schedule()?;
-            self.update_ard_reml(rho)?;
+            // ρ (including the ARD precisions) is owned by the outer engine
+            // (`SaeManifoldOuterObjective`) and held FIXED across this inner
+            // (t, β) Newton solve. The inner loop solves the joint manifold +
+            // decoder system at the engine's current ρ; the engine alone
+            // moves ρ by minimising the true REML criterion (see
+            // `SaeManifoldTerm::reml_criterion`). The former in-loop
+            // `update_ard_reml` rule (α = n / ‖t‖²) dropped the logdet /
+            // effective-dof term and collapsed α on near-degenerate axes; it
+            // has been removed in favour of the criterion-driven update.
             let pre_step_loss = self.loss(target, rho)?;
             let pre_step_total = pre_step_loss.total();
             let sys = self
@@ -3781,7 +3740,8 @@ impl SaeManifoldTerm {
                 break;
             }
         }
-        self.update_ard_reml(rho)?;
+        // ρ is owned by the outer engine and unchanged here; just return the
+        // converged inner loss at the fixed ρ.
         self.loss(target, rho)
     }
 
@@ -4079,13 +4039,10 @@ impl SaeManifoldTerm {
             let mut s_acc = Array2::<f64>::zeros((beta_dim, beta_dim));
             let mut rhs_acc = Array1::<f64>::zeros(beta_dim);
             let mut gb_acc = Array1::<f64>::zeros(beta_dim);
-            // ARD online sufficient statistics: Σ t² per atom/axis.
-            let mut ard_sumsq: Vec<Array1<f64>> = self
-                .assignment
-                .coords
-                .iter()
-                .map(|c| Array1::<f64>::zeros(c.latent_dim()))
-                .collect();
+            // ρ (including the ARD precisions) is owned by the outer engine and
+            // held FIXED across this streaming inner solve; the former online
+            // `Σ t²` ARD accumulator + `update_ard_reml_from_sumsq` rule has
+            // been removed in favour of the criterion-driven update.
             let mut pre_step_total = 0.0_f64;
             // Retain only the per-chunk row ranges so the line search can
             // re-materialize each chunk by re-invoking `chunk_init` at trial β
@@ -4109,16 +4066,6 @@ impl SaeManifoldTerm {
                 }
                 let mut chunk = self.materialize_chunk(logits, coords)?;
                 chunk_ranges.push((start, end));
-                // Accumulate ARD sufficient statistics from the chunk coords.
-                for (atom_idx, coord) in chunk.assignment.coords.iter().enumerate() {
-                    let d = coord.latent_dim();
-                    for row in 0..coord.n_obs() {
-                        let row_t = coord.row(row);
-                        for axis in 0..d {
-                            ard_sumsq[atom_idx][axis] += row_t[axis] * row_t[axis];
-                        }
-                    }
-                }
                 pre_step_total += chunk
                     .loss_scaled(z_chunk.view(), rho, penalty_scale)?
                     .total();
@@ -4177,8 +4124,8 @@ impl SaeManifoldTerm {
                 && directional_decrease.is_finite()
                 && directional_decrease > 0.0)
             {
-                // No descent direction available; ARD refresh + stop.
-                self.update_ard_reml_from_sumsq(rho, &ard_sumsq, n_total);
+                // No descent direction available; ρ is engine-owned and fixed,
+                // so just record the loss and stop.
                 last_loss = self.streaming_loss(&chunk_ranges, rho, n_total, &mut chunk_init)?;
                 break;
             }
@@ -4203,13 +4150,12 @@ impl SaeManifoldTerm {
             }
             match accepted_loss {
                 Some(loss) => {
-                    self.update_ard_reml_from_sumsq(rho, &ard_sumsq, n_total);
                     last_loss = loss;
                 }
                 None => {
-                    // Restore the pre-step β and refresh ARD before stopping.
+                    // Restore the pre-step β before stopping. ρ is engine-owned
+                    // and held fixed across the streaming inner solve.
                     self.set_flat_beta(beta0.view())?;
-                    self.update_ard_reml_from_sumsq(rho, &ard_sumsq, n_total);
                     last_loss =
                         self.streaming_loss(&chunk_ranges, rho, n_total, &mut chunk_init)?;
                     break;
