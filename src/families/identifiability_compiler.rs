@@ -1564,8 +1564,6 @@ mod tests {
         // Now wrap A's design behind a mock anchor evaluator and feed it
         // to the compiler as a `DenseScalarOperator` with the same span.
         // The B-block result must match the parametric reference.
-        let _flex_eval: Arc<dyn AnchorRowEvaluator> =
-            Arc::new(MockAnchorEvaluator { rows: a.clone() });
         let ops_flex = vec![op(a.clone()), op(b.clone())];
         let compiled_flex = compile(
             &ops_flex,
@@ -2203,7 +2201,6 @@ mod tests {
         b: &Array2<f64>,
         w: &Array1<f64>,
     ) -> (Array2<f64>, Array2<f64>, Vec<std::ops::Range<usize>>) {
-        let n = a.nrows();
         let p_a = a.ncols();
         let p_b = b.ncols();
         let raw_ranges = vec![0..p_a, p_a..(p_a + p_b)];
@@ -2211,7 +2208,6 @@ mod tests {
             blocks: vec![vec![Some(a.clone())], vec![Some(b.clone())]],
         };
         let row_hess = DiagonalScalarRowHessian::new(w.clone());
-        let _ = n; // silence
         let gram_h =
             build_raw_grams_from_channel_blocks(&channel_blocks, &row_hess, &raw_ranges).unwrap();
         let gram_struct = build_raw_grams_structural(&channel_blocks, &raw_ranges);
