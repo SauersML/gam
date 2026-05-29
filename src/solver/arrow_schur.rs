@@ -2171,15 +2171,6 @@ impl StreamingArrowSchur {
         }
     }
 
-    /// Install a procedural cross-block operator `H_tβ^(i) x`, so the streaming
-    /// accumulator probes it per row instead of relying on dense `row.htbeta`
-    /// slabs. Returns `self` for builder-style chaining.
-    #[must_use]
-    pub fn with_htbeta_operator(mut self, op: RowHtbetaMatvec) -> Self {
-        self.htbeta_matvec = Some(op);
-        self
-    }
-
     #[must_use]
     pub fn from_system(sys: &ArrowSchurSystem, chunk_size: usize) -> Self {
         // When a Kronecker / matrix-free htbeta_matvec is installed, the dense
@@ -2253,6 +2244,22 @@ impl StreamingArrowSchur {
             }
             None => row.htbeta.clone(),
         }
+    }
+
+    /// Move out the accumulated reduced Schur block `s_acc` and reduced RHS
+    /// `rhs_acc`, leaving fresh zero buffers in their place.
+    ///
+    /// The reduced contribution is `s_acc = hbb − Σ_i H_βt^(i)(H_tt^(i))⁻¹H_tβ^(i)`
+    /// (the β-block `hbb` seeded by `reset_accumulator`, minus the per-row
+    /// reduction summed by `accumulate_chunk`) and
+    /// `rhs_acc = +Σ_i H_βt^(i)(H_tt^(i))⁻¹g_t^(i)`. Used by external online
+    /// drivers (e.g. the SAE streaming joint fit) that accumulate the reduced
+    /// system across re-materialized chunk systems.
+    #[must_use]
+    pub fn take_accumulators(&mut self) -> (Array2<f64>, Array1<f64>) {
+        let s = std::mem::replace(&mut self.s_acc, Array2::<f64>::zeros((self.k, self.k)));
+        let rhs = std::mem::replace(&mut self.rhs_acc, Array1::<f64>::zeros(self.k));
+        (s, rhs)
     }
 
     /// Reset the dense shared accumulator to `H_ββ + ridge_beta I`.
@@ -3704,6 +3711,55 @@ fn solve_dense_reduced_system(
         metric_weights,
     )?;
     Ok((delta, Some(factor), diag))
+}
+
+/// Solve an externally accumulated dense reduced β system
+/// `S Δβ = rhs_β` with the same LM-style ridge escalation the full-batch
+/// driver applies: on a `SchurFactorFailed` (non-PD or ill-conditioned `S`),
+/// geometrically grow a proximal ridge on `S`'s diagonal and retry.
+///
+/// Used by the SAE streaming joint fit, which accumulates `S` and `rhs_β` over
+/// re-materialized row chunks (via [`StreamingArrowSchur::take_accumulators`])
+/// and must solve the single global reduced system without a per-row
+/// `ArrowSchurSystem`. `S` is symmetrized from its lower triangle before each
+/// factorization. `base_ridge_beta` is folded into the caller's `S` already;
+/// this routine only adds the *escalation* ridge on top.
+pub fn solve_streaming_reduced_beta(
+    s_acc: &Array2<f64>,
+    rhs_beta: &Array1<f64>,
+    options: &ArrowSolveOptions,
+) -> Result<Array1<f64>, ArrowSchurError> {
+    let mut proximal_ridge = 0.0_f64;
+    let mut last_err: Option<ArrowSchurError> = None;
+    for attempt in 0..=DEFAULT_PROXIMAL_MAX_ATTEMPTS {
+        let mut schur = s_acc.clone();
+        symmetrize_upper_from_lower(&mut schur);
+        if proximal_ridge > 0.0 {
+            for j in 0..schur.nrows() {
+                schur[[j, j]] += proximal_ridge;
+            }
+        }
+        match solve_dense_reduced_system(&schur, rhs_beta, options, None) {
+            Ok((delta_beta, _factor, _diag)) => return Ok(delta_beta),
+            Err(err) => {
+                let recoverable = matches!(
+                    err,
+                    ArrowSchurError::SchurFactorFailed { .. }
+                        | ArrowSchurError::PcgFailed { .. }
+                );
+                last_err = Some(err);
+                if !recoverable || attempt == DEFAULT_PROXIMAL_MAX_ATTEMPTS {
+                    break;
+                }
+                proximal_ridge = if proximal_ridge == 0.0 {
+                    DEFAULT_PROXIMAL_INITIAL_RIDGE
+                } else {
+                    proximal_ridge * DEFAULT_PROXIMAL_RIDGE_GROWTH
+                };
+            }
+        }
+    }
+    Err(last_err.expect("escalation loop set last_err on failure"))
 }
 
 fn step_inside_trust_region(

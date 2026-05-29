@@ -30,8 +30,9 @@ use ndarray::{Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayView3
 use std::sync::Arc;
 
 use crate::solver::arrow_schur::{
-    ArrowRowBlock, ArrowSchurError, ArrowSchurSystem, BetaPenaltyOp, CompositePenaltyOp,
-    DensePenaltyOp, KroneckerPenaltyOp,
+    ArrowRowBlock, ArrowSchurError, ArrowSchurSystem, ArrowSolveOptions, BetaPenaltyOp,
+    CompositePenaltyOp, DensePenaltyOp, KroneckerPenaltyOp, StreamingArrowSchur,
+    solve_streaming_reduced_beta,
 };
 use crate::terms::analytic_penalties::{
     ARDPenalty, AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry,
@@ -3637,7 +3638,6 @@ impl SaeManifoldTerm {
             ));
         }
         let n_chunk = chunk_logits.nrows();
-        let p = self.output_dim();
         let mut atoms = Vec::with_capacity(k_atoms);
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
             let coords = &chunk_coords[atom_idx];
@@ -3684,9 +3684,6 @@ impl SaeManifoldTerm {
             chunk_atom.basis_evaluator = atom.basis_evaluator.clone();
             chunk_atom.basis_second_jet = atom.basis_second_jet.clone();
             atoms.push(chunk_atom);
-        }
-        if p != self.output_dim() {
-            return Err("SaeManifoldTerm::materialize_chunk: output dim drift".to_string());
         }
         // Rebuild the assignment from the chunk's logits + coords, preserving
         // each atom's latent manifold and the global assignment mode.
@@ -3854,32 +3851,33 @@ impl SaeManifoldTerm {
                 )?;
                 start = end;
             }
-            // The β-block penalty `H_ββ + ridge_β·I` is global (B-only) and must
-            // be added exactly once. Form it from a one-row probe term so the
-            // structured penalty op (smoothness `λS ⊗ I_p`, analytic β) is
-            // counted at full strength, not minibatch-scaled.
-            self.add_global_beta_penalty(&mut s_acc, &mut gb_acc, rho, analytic_penalties, ridge_beta)?;
+            // The summed chunk β-blocks already reconstruct the full
+            // `H_ββ` (data-fit GN `G ⊗ I_p` + smoothness + analytic β); add the
+            // global β ridge exactly once, and form the reduced RHS. After this
+            // step `rhs_acc = Σ_i H_βt^(i)(H_tt^(i))⁻¹g_t^(i) − g_β` is the
+            // negated Schur-reduced β gradient `−g_reduced`, so the reduced
+            // system `S Δβ = rhs_acc` yields the marginal Newton step in β with
+            // the per-row latent eliminated.
             for j in 0..beta_dim {
+                s_acc[[j, j]] += ridge_beta;
                 rhs_acc[j] -= gb_acc[j];
             }
-            symmetrize_streaming_lower_to_upper(&mut s_acc);
             // ── Solve the global reduced β system with LM ridge escalation. ──
-            let delta_beta = solve_streaming_reduced_beta(
-                &s_acc,
-                &rhs_acc,
-                ridge_beta,
-                &options,
-            )
-            .map_err(|err| {
-                format!("SaeManifoldTerm::run_joint_fit_arrow_schur_streaming: {err}")
-            })?;
+            let delta_beta = solve_streaming_reduced_beta(&s_acc, &rhs_acc, &options)
+                .map_err(|err| {
+                    format!("SaeManifoldTerm::run_joint_fit_arrow_schur_streaming: {err}")
+                })?;
             // ── Streaming Armijo line search on Δβ. ──
+            // The directional decrease uses the *reduced* β gradient
+            // `g_reduced = −rhs_acc`, the true gradient of the β-marginal
+            // objective along which the line search backtracks (the per-row
+            // latent block is profiled out, not stepped, in streaming).
             let beta0 = self.flatten_beta();
-            let mut grad_dot_step = 0.0_f64;
+            let mut directional_decrease = 0.0_f64;
             for j in 0..beta_dim {
-                grad_dot_step += gb_acc[j] * delta_beta[j];
+                // dd = −(g_reduced · Δβ) = −((−rhs_acc) · Δβ) = rhs_acc · Δβ.
+                directional_decrease += rhs_acc[j] * delta_beta[j];
             }
-            let directional_decrease = -grad_dot_step;
             if !(pre_step_total.is_finite()
                 && directional_decrease.is_finite()
                 && directional_decrease > 0.0)
@@ -3924,9 +3922,17 @@ impl SaeManifoldTerm {
         Ok(last_loss)
     }
 
-    /// Accumulate one chunk system's reduced Schur contribution into the shared
+    /// Accumulate one chunk system's reduced-Schur contribution into the shared
     /// `(β × β)` accumulator and reduced RHS, consuming the chunk's Kronecker
     /// `htbeta_matvec` procedurally via [`StreamingArrowSchur`].
+    ///
+    /// The chunk system's β-block already carries the chunk's data-fit
+    /// Gauss-Newton curvature `G_chunk ⊗ I_p` (a genuine per-row sum) plus its
+    /// minibatch-scaled smoothness / analytic-β penalty. So the contribution
+    /// `s_acc_chunk = hbb_chunk − Σ_i H_βt^(i)(H_tt^(i))⁻¹H_tβ^(i)` and
+    /// `rhs_acc_chunk = +Σ_i H_βt^(i)(H_tt^(i))⁻¹g_t^(i)` sum across a full pass
+    /// to `H_ββ − Σ_all_i (…)` and `Σ_all_i (…)` respectively, with the global
+    /// β ridge added exactly once by the caller. No per-chunk ridge is applied.
     fn accumulate_chunk_reduced_schur(
         sys: &ArrowSchurSystem,
         ridge_ext_coord: f64,
@@ -3934,15 +3940,13 @@ impl SaeManifoldTerm {
         s_acc: &mut Array2<f64>,
         rhs_acc: &mut Array1<f64>,
     ) -> Result<(), String> {
-        // One streaming accumulator per chunk, with a zero β-block so the
-        // contribution is purely the chunk's `−Σ_i H_βt(H_tt)⁻¹H_tβ` and
-        // `+Σ_i H_βt(H_tt)⁻¹g_t`; the global β penalty is added once by the
-        // caller. The chunk is processed as a single internal block.
         let k = sys.k;
         let chunk_n = sys.rows.len();
         let mut streaming = StreamingArrowSchur::from_system(sys, chunk_n.max(1));
-        // Zero the β-block so only the per-row reduction is accumulated.
-        streaming.set_beta_block_zero();
+        // `reset_accumulator(0.0)` seeds `s_acc` with the chunk's dense β-block
+        // (`hbb_chunk`, including the data-fit GN block and the minibatch-scaled
+        // penalty) and no ridge; `accumulate_chunk` then subtracts the per-row
+        // reduction. The global β ridge is applied once by the streaming driver.
         streaming.reset_accumulator(0.0).map_err(|e| e.to_string())?;
         streaming
             .accumulate_chunk(0, chunk_n, ridge_ext_coord, options.mode)
@@ -3955,102 +3959,6 @@ impl SaeManifoldTerm {
             }
         }
         Ok(())
-    }
-
-    /// Add the global decoder β penalty `H_ββ + ridge_β·I` (decoder smoothness
-    /// `λS ⊗ I_p` plus any analytic β penalty) and its gradient exactly once.
-    ///
-    /// Assembled at full strength (`penalty_scale = 1.0`) from a single-row
-    /// probe term that shares `self`'s atom geometry: the β-penalty operator
-    /// depends only on the decoder coefficients, smoothness penalties, and ρ —
-    /// not on the rows — so a one-row term reproduces it exactly while keeping
-    /// the assembly cost `O(M² p)`.
-    fn add_global_beta_penalty(
-        &self,
-        s_acc: &mut Array2<f64>,
-        gb_acc: &mut Array1<f64>,
-        rho: &SaeManifoldRho,
-        analytic_penalties: Option<&AnalyticPenaltyRegistry>,
-        ridge_beta: f64,
-    ) -> Result<(), String> {
-        let beta_dim = self.beta_dim();
-        let probe = self.single_row_probe_term()?;
-        let mut probe = probe;
-        let z = Array2::<f64>::zeros((1, self.output_dim()));
-        let sys = probe
-            .assemble_arrow_schur(z.view(), rho, analytic_penalties)
-            .map_err(|err| {
-                format!("SaeManifoldTerm::add_global_beta_penalty: {err}")
-            })?;
-        let penalty_op = sys.effective_penalty_op();
-        let mut e_j = Array1::<f64>::zeros(beta_dim);
-        let mut col = Array1::<f64>::zeros(beta_dim);
-        for j in 0..beta_dim {
-            e_j.fill(0.0);
-            e_j[j] = 1.0;
-            col.fill(0.0);
-            penalty_op.matvec(
-                e_j.as_slice().expect("contiguous"),
-                col.as_slice_mut().expect("contiguous"),
-            );
-            for i in 0..beta_dim {
-                s_acc[[i, j]] += col[i];
-            }
-            s_acc[[j, j]] += ridge_beta;
-        }
-        // The probe's `g_β` is the global β-penalty gradient (its one synthetic
-        // row contributes a data-fit term against a zero target; subtract that
-        // data-fit gradient out by re-deriving the penalty-only gradient from
-        // the penalty op acting on the current β).
-        let beta_now = self.flatten_beta();
-        let mut pen_grad = Array1::<f64>::zeros(beta_dim);
-        penalty_op.matvec(
-            beta_now.as_slice().expect("contiguous"),
-            pen_grad.as_slice_mut().expect("contiguous"),
-        );
-        for j in 0..beta_dim {
-            gb_acc[j] += pen_grad[j];
-        }
-        Ok(())
-    }
-
-    /// Build a one-row probe term sharing this term's atom geometry, used to
-    /// reproduce the global β-penalty operator without retaining any rows.
-    fn single_row_probe_term(&self) -> Result<SaeManifoldTerm, String> {
-        let k_atoms = self.k_atoms();
-        let mut atoms = Vec::with_capacity(k_atoms);
-        for atom in &self.atoms {
-            let m = atom.basis_size();
-            let phi = Array2::<f64>::zeros((1, m));
-            let jet = Array3::<f64>::zeros((1, m, atom.latent_dim));
-            let mut probe_atom = SaeManifoldAtom::new(
-                atom.name.clone(),
-                atom.basis_kind.clone(),
-                atom.latent_dim,
-                phi,
-                jet,
-                atom.decoder_coefficients.clone(),
-                atom.smooth_penalty.clone(),
-            )?;
-            probe_atom.basis_evaluator = atom.basis_evaluator.clone();
-            probe_atom.basis_second_jet = atom.basis_second_jet.clone();
-            atoms.push(probe_atom);
-        }
-        let logits = Array2::<f64>::zeros((1, k_atoms));
-        let coords: Vec<LatentCoordValues> = self
-            .assignment
-            .coords
-            .iter()
-            .map(|c| {
-                LatentCoordValues::from_matrix_with_manifold(
-                    Array2::<f64>::zeros((1, c.latent_dim())).view(),
-                    LatentIdMode::None,
-                    c.manifold().clone(),
-                )
-            })
-            .collect();
-        let assignment = SaeAssignment::with_mode(logits, coords, self.assignment.mode)?;
-        SaeManifoldTerm::new(atoms, assignment)
     }
 
     /// Streaming total loss: sum of the minibatch-scaled per-chunk losses at the
