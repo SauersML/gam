@@ -81,8 +81,9 @@ use gam::terms::basis::{
     build_duchon_operator_penalty_matrices, build_matern_basis, build_periodic_bspline_basis_1d,
     build_spherical_spline_basis, build_thin_plate_penalty_matrix, create_basis,
     create_cyclic_difference_penalty_matrix, create_difference_penalty_matrix,
-    duchon_polynomial_first_derivative_nd, duchon_radial_first_derivative_nd,
-    duchon_radial_second_derivative_nd, evaluate_bspline_basis_scalar,
+    duchon_nullspace_dimension, duchon_polynomial_first_derivative_nd,
+    duchon_radial_first_derivative_nd, duchon_radial_second_derivative_nd,
+    evaluate_bspline_basis_scalar,
     matern_radial_first_derivative_nd, matern_radial_second_derivative_nd, monomial_exponents,
     periodic_bspline_first_derivative_nd, resolve_duchon_orders,
     select_spherical_farthest_point_centers, sphere_first_derivative_nd,
@@ -9125,10 +9126,28 @@ fn sae_atom_basis_kind_from_str(value: &str) -> SaeAtomBasisKind {
 const SAE_DEFAULT_TORUS_HARMONICS: usize = 3;
 /// Sphere chart basis size (lat/lon ⇒ `[1, x, y, z, xy, yz, xz]`).
 const SAE_SPHERE_BASIS_SIZE: usize = 7;
-/// Duchon `m` for SAE-manifold atoms (constant + linear null space). The full
-/// operator-penalty triplet is resolved per-dimension from this `m` via
-/// [`resolve_duchon_hybrid_config`].
-const SAE_DUCHON_ATOM_M: usize = 2;
+/// Duchon nullspace knob `m` for a SAE-manifold atom of latent dimension
+/// `dim`, derived so the scale-free (`power = 0`) curvature seminorm
+/// (`OperatorStiffness`) is always well-posed.
+///
+/// `m` maps to the polynomial-nullspace order via [`duchon_nullspace_from_m`]
+/// (`m = 1 → Zero/p=1`, `m = 2 → Linear/p=2`, `m = k+1 → Degree(k)/p=k+1`), so
+/// `p_order == m`. The scale-free curvature (D²) penalty requires D2
+/// collocation `2(p + s) > dim + 2`; with `s = 0` (the pure-polyharmonic basis
+/// the `DuchonCoordinateEvaluator` evaluates) this is `2·m > dim + 2`, whose
+/// smallest integer solution is `m = ⌊dim / 2⌋ + 2`.
+///
+/// For `dim == 1` this reproduces the historical `m = 2` (constant + linear
+/// null space). For `dim ≥ 2` it grows the null space just enough to admit the
+/// curvature penalty — the previous hard-coded `m = 2` left the resolved
+/// power/order inconsistent with the power-0 evaluator and emitted no usable
+/// smoothness penalty. The seed build and every
+/// [`DuchonCoordinateEvaluator`] refresh read this same derived `m`, so the
+/// design `Φ`, its jet, and the penalty stay column-consistent (the issue-247
+/// invariant).
+fn sae_duchon_atom_m(dim: usize) -> usize {
+    dim / 2 + 2
+}
 /// Maximum total monomial degree for a Euclidean tangent-patch SAE atom
 /// (`{1, t_a, t_a t_b}` at degree 2).
 const SAE_EUCLIDEAN_PATCH_MAX_DEGREE: usize = 2;
@@ -9254,9 +9273,13 @@ fn build_sae_basis_evaluators(
                          build the atom through the SAE auto path so its Duchon centers are threaded in"
                     )
                 })?;
+                // Same dimension-aware `m` the seed build
+                // (`sae_build_duchon_atom`) used: both read `centers.ncols()`,
+                // so the refreshed `Φ`/jet stays column-consistent with the
+                // seed design and its curvature penalty (issue-247 invariant).
                 Arc::new(DuchonCoordinateEvaluator::new(
                     centers.clone(),
-                    SAE_DUCHON_ATOM_M,
+                    sae_duchon_atom_m(centers.ncols()),
                 )?)
             }
             SaeAtomBasisKind::EuclideanPatch => {
@@ -9444,24 +9467,27 @@ fn sae_manifold_fit_inner<'py>(
     }
     // The "t" block addresses the per-row latent coordinates (n_obs × d_max,
     // tier=Psi) — ARD, Isometry, BlockOrthogonality, etc. target this. The
-    // "beta" block addresses the decoder coefficient matrix; for k_atoms=1
-    // its shape matches a single atom's (M, p_out) block, which is exactly
-    // the layout MechanismSparsityPenalty group-lassoes over (rows = basis
-    // functions, columns = output features). Multi-atom fits omit "beta"
-    // because flatten_beta concatenates per-atom (M_k, p_out) blocks with
-    // different M_k, and the single-(latent_dim, p_features) target view
-    // assumed by MechanismSparsityPenalty cannot represent that.
+    // "beta" block addresses the decoder coefficient matrix. `flatten_beta`
+    // concatenates per-atom (M_k, p_out) blocks; the total decoder vector has
+    // length `(Σ_k M_k) · p_out`. We register one "beta" block covering the
+    // full vector with `d = Σ_k M_k` so the descriptor builder constructs a
+    // valid MechanismSparsityPenalty (target length = d · p_out, feature
+    // groups partitioning p_out). For multi-atom fits the penalty cannot
+    // group-lasso the whole concatenation as a single (Σ M_k, p_out) matrix —
+    // instead `add_sae_beta_penalty` in src/terms/sae_manifold.rs dispatches
+    // the penalty per atom, rebuilding its target range/latent_dim to each
+    // atom's (M_k, p_out) block. For k_atoms == 1 the per-atom dispatch
+    // collapses to exactly this single block, so both paths agree (#240).
+    let total_basis: usize = basis_sizes.iter().copied().sum();
     let mut latent_blocks = serde_json::Map::new();
     latent_blocks.insert(
         "t".into(),
         serde_json::json!({"name": "t", "n": n_obs, "d": atom_dim.iter().copied().max().unwrap_or(1)}),
     );
-    if basis_sizes.len() == 1 {
-        latent_blocks.insert(
-            "beta".into(),
-            serde_json::json!({"name": "beta", "n": p_out, "d": basis_sizes[0]}),
-        );
-    }
+    latent_blocks.insert(
+        "beta".into(),
+        serde_json::json!({"name": "beta", "n": p_out, "d": total_basis}),
+    );
     let latent_payload = serde_json::Value::Object(latent_blocks);
     let registry = build_analytic_penalty_registry_from_json(
         Some(&latent_payload),
@@ -10488,26 +10514,37 @@ fn sae_build_duchon_atom(
     pts: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
 ) -> Result<(Array2<f64>, Array3<f64>, Array2<f64>), String> {
-    // Resolve (nullspace_order, power) for the requested atom dimension so the
-    // full operator-penalty triplet (mass + tension + stiffness) satisfies its
-    // collocation inequalities at every dim. The default Active triplet
-    // requires D2 collocation `2(p+s) > d+2`; hard-coding `power=0.0,
-    // nullspace=Linear` violated that for d ∈ {1, 2, 3} (issue #246). Routing
-    // through `resolve_duchon_hybrid_config(..., max_op=2)` auto-picks the
-    // smallest valid `s` so the build always produces a Primary penalty.
-    let m: usize = SAE_DUCHON_ATOM_M;
+    // The `DuchonCoordinateEvaluator` evaluates the *pure* scale-free
+    // polyharmonic basis (`length_scale = None`, `power = 0`) at the resolved
+    // nullspace order, so the matching smoothness penalty is the scale-free
+    // curvature seminorm `∫|∇^(p) f|²` (the kernel reproducing norm), which
+    // `build_duchon_basis` emits as `PenaltySource::OperatorStiffness` — the
+    // same block `duchon_function_norm_penalty` selects. The mass and tension
+    // terms reintroduce a finite reversion length through `∫f²` / `∫|∇f|²`,
+    // exactly the Type-A behaviour the polyharmonic basis is chosen to avoid,
+    // so only the top-order curvature term is requested here.
+    //
+    // The nullspace order and power MUST match the evaluator (`power = 0`,
+    // order = `duchon_nullspace_from_m(m)`); the D2 collocation inequality
+    // `2(p + s) > d + 2` is satisfied by construction because
+    // `m = sae_duchon_atom_m(d)` is the smallest `m` with `2·m > d + 2`.
     let dim = centers.ncols();
-    let cfg = resolve_duchon_hybrid_config(dim, m, None, None, None, /* max_op = */ 2)
-        .map_err(|err| err.to_string())?;
-    let requested_nullspace = cfg.nullspace_order;
+    let m: usize = sae_duchon_atom_m(dim);
     let spec = DuchonBasisSpec {
         center_strategy: CenterStrategy::UserProvided(centers.to_owned()),
-        length_scale: cfg.length_scale,
-        power: cfg.power,
-        nullspace_order: requested_nullspace,
+        length_scale: None,
+        power: 0.0,
+        nullspace_order: duchon_nullspace_from_m(m),
         identifiability: SpatialIdentifiability::None,
         aniso_log_scales: None,
-        operator_penalties: Default::default(),
+        operator_penalties: DuchonOperatorPenaltySpec {
+            mass: OperatorPenaltySpec::Disabled,
+            tension: OperatorPenaltySpec::Disabled,
+            stiffness: OperatorPenaltySpec::Active {
+                initial_log_lambda: 0.0,
+                prior: None,
+            },
+        },
         periodic: None,
         boundary: OneDimensionalBoundary::Open,
     };
@@ -10516,17 +10553,28 @@ fn sae_build_duchon_atom(
     // amplification-consistent core entry point so the seed atom matches the
     // `DuchonCoordinateEvaluator` refresh bit-for-bit (issue #247).
     let built = build_duchon_basis(centers, &spec).map_err(|err| err.to_string())?;
-    let primary_idx = built
+    // The scale-free curvature seminorm is the `OperatorStiffness` block. With
+    // `m = sae_duchon_atom_m(dim)` the D2 collocation inequality holds, so this
+    // block is always built and active — assert it as a structural invariant
+    // rather than silently returning `None`.
+    let stiffness_idx = built
         .penaltyinfo
         .iter()
-        .position(|info| matches!(info.source, gam::basis::PenaltySource::Primary))
-        .ok_or_else(|| "sae_build_duchon_atom: primary penalty was not built".to_string())?;
-    let penalty = built
-        .penalties
-        .get(primary_idx)
+        .position(|info| matches!(info.source, gam::basis::PenaltySource::OperatorStiffness))
         .ok_or_else(|| {
             format!(
-                "sae_build_duchon_atom: primary penalty index {primary_idx} exceeds {} penalty matrices",
+                "sae_build_duchon_atom: curvature (OperatorStiffness) penalty was not built for \
+                 dim={dim}, m={m}, nullspace_order={:?}; the D2 collocation invariant \
+                 2*m > dim+2 should guarantee it",
+                duchon_nullspace_from_m(m),
+            )
+        })?;
+    let penalty = built
+        .penalties
+        .get(stiffness_idx)
+        .ok_or_else(|| {
+            format!(
+                "sae_build_duchon_atom: curvature penalty index {stiffness_idx} exceeds {} penalty matrices",
                 built.penalties.len()
             )
         })?
@@ -10938,7 +10986,21 @@ fn sae_build_atom_plans(
                 });
             }
             SaeAtomBasisKind::Duchon | SaeAtomBasisKind::EuclideanPatch => {
-                let n_centers = n_obs.min(32).max(8.min(n_obs));
+                // A Duchon atom's curvature penalty degrades (and ultimately
+                // fails its D2 collocation) when the center count does not
+                // exceed the polynomial nullspace dimension of its resolved
+                // order. Pick enough centers to clear that dimension with a
+                // margin (so a positive-rank kernel block survives), bounded
+                // above by `n_obs` and the dense cap. The Euclidean patch
+                // ignores centers, so this lower bound is harmless there.
+                let duchon_m = sae_duchon_atom_m(d);
+                let poly_nullspace_dim =
+                    duchon_nullspace_dimension(d, duchon_m.saturating_sub(1));
+                let center_floor = (poly_nullspace_dim + d + 1).max(8);
+                let center_ceiling = center_floor.max(32);
+                let lo = center_floor.min(n_obs);
+                let hi = center_ceiling.min(n_obs);
+                let n_centers = n_obs.min(hi).max(lo);
                 let idx = sae_pick_duchon_center_indices(
                     n_obs,
                     n_centers,

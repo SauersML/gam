@@ -1864,7 +1864,7 @@ fn locate_block_column(
     )))
 }
 
-fn block_pivoted_qr_diagonal(block: &Array2<f64>) -> Result<Vec<f64>, EstimationError> {
+pub(crate) fn block_pivoted_qr_diagonal(block: &Array2<f64>) -> Result<Vec<f64>, EstimationError> {
     if block.ncols() == 0 {
         return Ok(Vec::new());
     }
@@ -1878,7 +1878,7 @@ fn block_pivoted_qr_diagonal(block: &Array2<f64>) -> Result<Vec<f64>, Estimation
     Ok(out)
 }
 
-fn count_rank(singular_values: &[f64], n: usize, p: usize) -> usize {
+pub(crate) fn count_rank(singular_values: &[f64], n: usize, p: usize) -> usize {
     if singular_values.is_empty() {
         return 0;
     }
