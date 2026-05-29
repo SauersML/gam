@@ -1115,6 +1115,12 @@ def fit(
         "response_reference",
     ):
         rust_config.pop(key, None)
+    # Persist the training-table container type into the model payload (the
+    # single serialized source of truth) so the predict-time output-container
+    # fallback for dict/list inputs survives save/load and dumps/loads. Without
+    # this, a reloaded model silently returns dict instead of the original
+    # container type for ambiguous prediction inputs (#394).
+    rust_config["training_table_kind"] = table_kind
     resolved_precision_hyperpriors = _resolve_precision_hyperpriors(
         precision_hyperpriors, formula, headers, rows, rust_config.get("group_metadata")
     )
@@ -1196,6 +1202,10 @@ def fit_array(
             f"X and Y row counts must match; got {X_arr.shape[0]} and {Y_arr.shape[0]}"
         )
     rust_config = dict(config or {})
+    # See the matching note in `fit`: persist the training-table container type
+    # (always "numpy" for the array entry point) so the predict-time
+    # output-container fallback round-trips through save/load (#394).
+    rust_config["training_table_kind"] = "numpy"
     resolved_precision_hyperpriors = _resolve_precision_hyperpriors(
         precision_hyperpriors, formula, [], [], rust_config.get("group_metadata")
     )
@@ -1308,9 +1318,16 @@ def loads(model_bytes: bytes) -> Model:
     """
     try:
         rust_module().load_model(model_bytes)
+        # Restore the training-table container type persisted in the payload so
+        # the reloaded model reproduces the original predict-time
+        # output-container fallback for dict/list inputs. `None` for older
+        # payloads written before #394, which degrade to the "dict" fallback.
+        training_table_kind = rust_module().saved_model_payload_string(
+            model_bytes, "training_table_kind"
+        )
     except Exception as exc:
         raise map_exception(exc) from exc
-    return Model(_model_bytes=model_bytes)
+    return Model(_model_bytes=model_bytes, _training_table_kind=training_table_kind)
 
 
 def validate_formula(
