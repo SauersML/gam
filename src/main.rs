@@ -4075,7 +4075,15 @@ fn build_survival_time_initial_beta(
     };
     time_initial_constraints.as_ref().map_or_else(
         || Array1::zeros(p),
-        |constraints| project_onto_linear_constraints(p, constraints, None),
+        |constraints| {
+            // `beta0` is `None`, so the projection starts at the length-`p`
+            // origin and cannot hit a beta0/dim mismatch; the constraints come
+            // from `LinearInequalityConstraints::new` with matching A/b shapes.
+            // On any unexpected error fall back to the zero seed described
+            // above rather than panic out of this seed builder.
+            project_onto_linear_constraints(p, constraints, None)
+                .unwrap_or_else(|_| Array1::zeros(p))
+        },
     )
 }
 
@@ -16073,7 +16081,8 @@ mod tests {
             b: Array1::from_vec(vec![0.25, 0.5, 0.75]),
         };
 
-        let beta0 = project_onto_linear_constraints(3, &constraints, None);
+        let beta0 = project_onto_linear_constraints(3, &constraints, None)
+            .expect("projection from origin onto well-formed constraints must succeed");
 
         assert!(beta0.iter().all(|v| v.is_finite()));
         for i in 0..constraints.a.nrows() {
@@ -16089,7 +16098,8 @@ mod tests {
             b: Array1::from_vec(vec![-0.5, 0.4]),
         };
 
-        let beta0 = project_onto_linear_constraints(2, &constraints, None);
+        let beta0 = project_onto_linear_constraints(2, &constraints, None)
+            .expect("projection from origin onto well-formed constraints must succeed");
 
         assert!(beta0.iter().all(|v| v.is_finite()));
         assert!(constraints.a.row(0).dot(&beta0) - constraints.b[0] >= -1e-9);

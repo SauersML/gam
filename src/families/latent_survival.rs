@@ -868,13 +868,18 @@ fn prepare_latent_time_block(
         &input.derivative_offset_exit,
         derivative_guard,
     )?;
-    let initial_beta = linear_constraints.as_ref().map(|constraints| {
-        project_onto_linear_constraints(
+    let initial_beta = match linear_constraints.as_ref() {
+        // `project_onto_linear_constraints` validates that any supplied
+        // `initial_beta` matches `design_exit.ncols()`; surface a mismatch as a
+        // structured error rather than letting an ndarray broadcast panic
+        // (issue #374).
+        Some(constraints) => Some(project_onto_linear_constraints(
             design_exit.ncols(),
             constraints,
             input.initial_beta.as_ref(),
-        )
-    });
+        )?),
+        None => None,
+    };
     Ok(PreparedLatentTimeBlock {
         design_entry,
         design_exit,

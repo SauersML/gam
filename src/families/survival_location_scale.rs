@@ -4096,7 +4096,12 @@ fn structural_time_initial_beta_guess(
     if let Some(lower_bounds) = coefficient_lower_bounds
         && let Some(constraints) = lower_bound_constraints(lower_bounds)
     {
-        beta_init = project_onto_linear_constraints(p, &constraints, Some(&beta_init));
+        // `beta_init` is the length-`p` ridge solution and `constraints` is
+        // derived from the same `p`-column derivative design, so the projection
+        // is dimensionally consistent by construction. If a future refactor
+        // breaks that invariant, abandon the structural guess rather than
+        // propagate a hard error out of this best-effort warm start.
+        beta_init = project_onto_linear_constraints(p, &constraints, Some(&beta_init)).ok()?;
     }
 
     let d_raw_init = fast_av(design_derivative_exit, &beta_init) + derivative_offset_exit;
@@ -5148,14 +5153,48 @@ fn structural_time_coefficient_lower_bounds_with_monotone_time_wiggle(
     Ok(lower_bounds)
 }
 
+/// Project `beta0` (or the origin when `beta0` is `None`) onto the feasible
+/// polytope `{x : A x >= b}` via cyclic Dykstra projections.
+///
+/// The geometry only makes sense when every operand lives in the same
+/// `dim`-dimensional space, so the function validates its three independent
+/// dimensions up front rather than letting an ndarray broadcast mismatch
+/// `unwrap()` into a process-wide panic (see issue #374: a stale, lower-
+/// dimensional warm-start hint reached this projection with `beta0.len() !=
+/// dim` and the `&beta + &corrections.row(i)` add panicked with
+/// `IncompatibleShape`). A length mismatch is a caller contract violation,
+/// so it is surfaced as a structured `Result::Err` that the marginal-slope /
+/// location-scale pipelines turn into a clean `GamError` instead of a panic
+/// crossing the Rust/Python boundary.
 pub fn project_onto_linear_constraints(
     dim: usize,
     constraints: &LinearInequalityConstraints,
     beta0: Option<&Array1<f64>>,
-) -> Array1<f64> {
+) -> Result<Array1<f64>, String> {
+    if let Some(b0) = beta0
+        && b0.len() != dim
+    {
+        return Err(SurvivalLocationScaleError::DimensionMismatch {
+            reason: format!(
+                "project_onto_linear_constraints: beta0 length {} does not match dim {dim}",
+                b0.len()
+            ),
+        }
+        .into());
+    }
+    if constraints.a.nrows() != constraints.b.len() {
+        return Err(SurvivalLocationScaleError::DimensionMismatch {
+            reason: format!(
+                "project_onto_linear_constraints: constraint A has {} rows but b has length {}",
+                constraints.a.nrows(),
+                constraints.b.len()
+            ),
+        }
+        .into());
+    }
     let mut beta = beta0.cloned().unwrap_or_else(|| Array1::zeros(dim));
     if constraints.a.ncols() != dim || constraints.a.nrows() == 0 {
-        return beta;
+        return Ok(beta);
     }
     let mut corrections = Array2::<f64>::zeros((constraints.a.nrows(), dim));
     for _ in 0..100 {
@@ -5182,7 +5221,7 @@ pub fn project_onto_linear_constraints(
             break;
         }
     }
-    beta
+    Ok(beta)
 }
 
 fn validate_linear_constraints(
@@ -5274,7 +5313,7 @@ fn prepare_identified_time_block(
         append_linear_constraints(coefficient_constraints.clone(), derivative_constraints)?;
     let initial_beta = match (linear_constraints.as_ref(), input.initial_beta.as_ref()) {
         (Some(constraints), Some(beta0)) => {
-            Some(project_onto_linear_constraints(p, constraints, Some(beta0)))
+            Some(project_onto_linear_constraints(p, constraints, Some(beta0))?)
         }
         (_, Some(beta0)) => Some(beta0.clone()),
         _ => None,
