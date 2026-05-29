@@ -3367,6 +3367,83 @@ impl ArrowFactorCache {
         }
         Ok(out)
     }
+
+    /// Apply the β-block of the full inverse, `(H⁻¹)_ββ · rhs = S_β⁻¹ · rhs`,
+    /// where `S_β` is the Schur complement on β whose Cholesky factor this
+    /// cache holds in [`Self::schur_factor`].
+    ///
+    /// For the bordered arrow Hessian `H = [[A, B], [Bᵀ, H_ββ]]`, the
+    /// β-block of `H⁻¹` is exactly the inverse of the Schur complement
+    /// `S_β = H_ββ − Bᵀ A⁻¹ B`. One Cholesky back-substitution per call,
+    /// reusing the cached factor; `rhs` and the returned vector both have
+    /// length `K`.
+    ///
+    /// This is the general single-solve primitive for the β border. Callers
+    /// that need a Schur-inverse trace `tr(S_β⁻¹ M)` against a structured
+    /// penalty `M` (e.g. the SAE λ_smooth Fellner-Schall step, where
+    /// `M = blockdiag_k(λ_k S_k ⊗ I_p)`) build it as
+    /// `Σ_col e_colᵀ S_β⁻¹ M e_col` — apply this to each column of `M`
+    /// (exploiting whatever sparsity `M` has) and read off `result[col]`.
+    /// Keeping `M`'s layout on the caller side avoids coupling this solver
+    /// to penalty-op types.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArrowSchurError::SchurFactorFailed`] when this cache has no
+    /// dense Schur factor (an [`ArrowSolverMode::InexactPCG`] solve) — the
+    /// same not-yet-supported branch as [`Self::latent_block_inverse_diagonal`]
+    /// — or when `rhs.len() != k`.
+    pub fn schur_inverse_apply(
+        &self,
+        rhs: ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, ArrowSchurError> {
+        let Some(schur_factor) = self.schur_factor.as_ref() else {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: "schur_inverse_apply requires a dense Schur factor; \
+                         the InexactPCG mode does not form one"
+                    .to_string(),
+            });
+        };
+        if rhs.len() != self.k {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: format!(
+                    "schur_inverse_apply: rhs length {} != K {}",
+                    rhs.len(),
+                    self.k
+                ),
+            });
+        }
+        let rhs_owned = rhs.to_owned();
+        Ok(chol_solve_vector(schur_factor, &rhs_owned))
+    }
+
+    /// Diagonal of the β-block of the full inverse, `diag((H⁻¹)_ββ) = diag(S_β⁻¹)`,
+    /// length `K`.
+    ///
+    /// Convenience built from `K` Cholesky back-substitutions against the
+    /// unit vectors (`[S_β⁻¹]_{jj} = e_jᵀ S_β⁻¹ e_j`), reusing the cached
+    /// factor. Useful for the per-β-coordinate effective dof. Same dense-Schur
+    /// requirement / error contract as [`Self::schur_inverse_apply`].
+    pub fn schur_inverse_diagonal(&self) -> Result<Array1<f64>, ArrowSchurError> {
+        let Some(schur_factor) = self.schur_factor.as_ref() else {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: "schur_inverse_diagonal requires a dense Schur factor; \
+                         the InexactPCG mode does not form one"
+                    .to_string(),
+            });
+        };
+        let mut out = Array1::<f64>::zeros(self.k);
+        let mut e_j = Array1::<f64>::zeros(self.k);
+        for j in 0..self.k {
+            for c in 0..self.k {
+                e_j[c] = 0.0;
+            }
+            e_j[j] = 1.0;
+            let col = chol_solve_vector(schur_factor, &e_j);
+            out[j] = col[j];
+        }
+        Ok(out)
+    }
 }
 
 /// Schur-eliminate the per-row latent block and solve with an explicit BA
@@ -5754,6 +5831,117 @@ mod tests {
         assert!(
             (trace_selected - trace_dense).abs() < 1e-9,
             "full latent trace {trace_selected} vs dense {trace_dense}"
+        );
+    }
+
+    /// `schur_inverse_apply` / `schur_inverse_diagonal` must reproduce the
+    /// β-block of the dense bordered-arrow inverse `(H⁻¹)_ββ = S_β⁻¹`, and a
+    /// caller-assembled `tr(S_β⁻¹ M)` must match the dense Kron-block trace —
+    /// the β-side analogue used by the SAE λ_smooth Fellner-Schall step.
+    #[test]
+    fn schur_inverse_beta_block_matches_dense() {
+        let n = 3usize;
+        let d = 2usize;
+        let k = 2usize;
+        let mut sys = ArrowSchurSystem::new(n, d, k);
+        sys.rows[0].htt = array![[4.0_f64, 0.5], [0.5, 3.0]];
+        sys.rows[0].htbeta = array![[1.0_f64, 0.2], [-0.3, 0.7]];
+        sys.rows[1].htt = array![[5.0_f64, -0.4], [-0.4, 2.5]];
+        sys.rows[1].htbeta = array![[0.6_f64, -0.1], [0.4, 0.9]];
+        sys.rows[2].htt = array![[3.5_f64, 0.2], [0.2, 4.5]];
+        sys.rows[2].htbeta = array![[-0.2_f64, 0.5], [0.8, -0.6]];
+        for row in sys.rows.iter_mut() {
+            row.gt = array![0.0_f64, 0.0];
+        }
+        sys.hbb = array![[12.0_f64, 0.7], [0.7, 10.0]];
+        sys.gb = array![0.0_f64, 0.0];
+
+        let options = ArrowSolveOptions::direct();
+        let (_dt, _db, cache) = solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options)
+            .expect("direct arrow solve should factor this SPD system");
+
+        // Dense bordered H and its inverse (same assembly as the t-block test).
+        let dim = n * d + k;
+        let mut h = Array2::<f64>::zeros((dim, dim));
+        for i in 0..n {
+            let base = i * d;
+            for r in 0..d {
+                for c in 0..d {
+                    h[[base + r, base + c]] = sys.rows[i].htt[[r, c]];
+                }
+            }
+            for r in 0..d {
+                for c in 0..k {
+                    let v = sys.rows[i].htbeta[[r, c]];
+                    h[[base + r, n * d + c]] = v;
+                    h[[n * d + c, base + r]] = v;
+                }
+            }
+        }
+        for r in 0..k {
+            for c in 0..k {
+                h[[n * d + r, n * d + c]] = sys.hbb[[r, c]];
+            }
+        }
+        let l = cholesky_lower(&h).expect("assembled bordered H must be SPD");
+        let h_inv = chol_solve_matrix(&l, &Array2::<f64>::eye(dim));
+
+        // The β-block of H⁻¹ is the bottom-right K×K corner.
+        let beta_off = n * d;
+
+        // schur_inverse_diagonal vs dense β-block diagonal.
+        let sdiag = cache
+            .schur_inverse_diagonal()
+            .expect("dense Schur cache must support schur_inverse_diagonal");
+        assert_eq!(sdiag.len(), k);
+        for j in 0..k {
+            let expected = h_inv[[beta_off + j, beta_off + j]];
+            assert!(
+                (sdiag[j] - expected).abs() < 1e-9,
+                "β diag {j}: {} vs dense {expected}",
+                sdiag[j]
+            );
+        }
+
+        // schur_inverse_apply against each unit column reproduces the full
+        // β-block (every entry, not just the diagonal).
+        for col in 0..k {
+            let mut e = Array1::<f64>::zeros(k);
+            e[col] = 1.0;
+            let x = cache
+                .schur_inverse_apply(e.view())
+                .expect("dense Schur cache must support schur_inverse_apply");
+            for r in 0..k {
+                let expected = h_inv[[beta_off + r, beta_off + col]];
+                assert!(
+                    (x[r] - expected).abs() < 1e-9,
+                    "S_β⁻¹[{r},{col}] {} vs dense {expected}",
+                    x[r]
+                );
+            }
+        }
+
+        // Caller-assembled Kron trace tr(S_β⁻¹ M) for a single atom block
+        // M = A_k ⊗ I_p with K = M_k · p. Here M_k = 1, p = 2 ⇒ K = 2, so
+        // A_k is 1×1 = [a] and M = a·I_2. tr(S_β⁻¹ M) = a·tr(S_β⁻¹).
+        let a_scalar = 0.75_f64;
+        let mut trace = 0.0_f64;
+        for col in 0..k {
+            // (A_k ⊗ I_p) e_col = a_scalar · e_col for this M_k=1 block.
+            let mut m_col = Array1::<f64>::zeros(k);
+            m_col[col] = a_scalar;
+            let z = cache
+                .schur_inverse_apply(m_col.view())
+                .expect("schur_inverse_apply");
+            trace += z[col];
+        }
+        let trace_dense: f64 = a_scalar
+            * (0..k)
+                .map(|j| h_inv[[beta_off + j, beta_off + j]])
+                .sum::<f64>();
+        assert!(
+            (trace - trace_dense).abs() < 1e-9,
+            "Kron-block trace {trace} vs dense {trace_dense}"
         );
     }
 }
