@@ -2300,6 +2300,96 @@ mod tests {
     }
 
     #[test]
+    fn run_nuts_sampling_rejects_zero_or_too_few_samples() {
+        // Issue #399: `samples=0` (and `samples` in {1, 2, 3}) reached the
+        // engine and panicked across the FFI boundary in `general-mcmc`'s
+        // `.expect(...)` (empty stack / "split R-hat and ESS require at least 2
+        // split chains and 2 draws per split chain"). The up-front guard must
+        // reject anything below the split-R-hat-defined minimum of 4 draws with
+        // a clean typed error *before* the sampler is constructed.
+        let x = array![[1.0], [1.0], [1.0]];
+        let y = array![0.5, -0.5, 1.0];
+        let weights = array![1.0, 1.0, 1.0];
+        let penalty = array![[0.25]];
+        let mode = array![0.0];
+        let hessian = array![[1.25]];
+
+        for bad_samples in [0usize, 1, 2, 3] {
+            let cfg = NutsConfig {
+                n_samples: bad_samples,
+                nwarmup: 10,
+                n_chains: 2,
+                target_accept: 0.8,
+                seed: 222,
+            };
+
+            let err = super::run_nuts_sampling(
+                x.view(),
+                y.view(),
+                weights.view(),
+                penalty.view(),
+                mode.view(),
+                hessian.view(),
+                NutsFamily::Gaussian,
+                1.0,
+                crate::estimate::Dispersion::Known(1.0),
+                false,
+                &cfg,
+            )
+            .expect_err("too-few samples must be rejected before sampling");
+
+            assert!(
+                err.contains("n_samples must be >= 4"),
+                "n_samples={bad_samples} gave unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_nuts_sampling_rejects_zero_or_single_chain() {
+        // Issue #399: `chains=0` produced an empty initial-position vector and
+        // panicked in `ndarray::stack`; a single chain leaves the between-chain
+        // variance in the split-R-hat diagnostic undefined. Both must be
+        // rejected up front with a typed error.
+        let x = array![[1.0], [1.0], [1.0]];
+        let y = array![0.5, -0.5, 1.0];
+        let weights = array![1.0, 1.0, 1.0];
+        let penalty = array![[0.25]];
+        let mode = array![0.0];
+        let hessian = array![[1.25]];
+
+        for bad_chains in [0usize, 1] {
+            let cfg = NutsConfig {
+                n_samples: 50,
+                nwarmup: 10,
+                n_chains: bad_chains,
+                target_accept: 0.8,
+                seed: 222,
+            };
+
+            let err = super::run_nuts_sampling(
+                x.view(),
+                y.view(),
+                weights.view(),
+                penalty.view(),
+                mode.view(),
+                hessian.view(),
+                NutsFamily::Gaussian,
+                1.0,
+                crate::estimate::Dispersion::Known(1.0),
+                false,
+                &cfg,
+            )
+            .expect_err("too-few chains must be rejected before sampling");
+
+            assert!(
+                err.contains("n_chains must be >= 2"),
+                "n_chains={bad_chains} gave unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn joint_hmc_boundary_rejects_nonlogit_firth_family() {
         let x = array![[1.0, 0.2], [1.0, -0.1], [1.0, 1.2], [1.0, -0.7]];
         let y = array![1.0, 2.0, 0.0, 3.0];
@@ -3238,6 +3328,56 @@ fn validate_nuts_target_accept(target_accept: f64) -> Result<(), HmcError> {
     }
 }
 
+/// Minimum number of post-warmup draws per chain that keeps the split-R-hat /
+/// ESS machinery well-defined. Each chain is split in half for the
+/// Gelman-Rubin diagnostic (`compute_split_rhat_and_ess` and the engine's own
+/// run-stats path), so both halves need at least two draws, i.e. four draws
+/// total. Below this the engine `.expect(...)` calls (empty-stack / "split
+/// R-hat and ESS require at least 2 split chains and 2 draws per split chain")
+/// panic across the FFI boundary instead of returning a typed error.
+const MIN_NUTS_SAMPLES: usize = 4;
+
+/// Minimum number of parallel chains. With zero chains the engine receives an
+/// empty initial-position vector and panics in `ndarray::stack`; with a single
+/// chain the between-chain variance in the split-R-hat diagnostic is undefined.
+/// Two chains is the smallest count for which convergence diagnostics are
+/// meaningful.
+const MIN_NUTS_CHAINS: usize = 2;
+
+/// Validate the draw / chain counts of a NUTS configuration up front, mirroring
+/// `validate_nuts_target_accept`, so that out-of-range values surface as a typed
+/// `HmcError::InvalidConfig` *before* the sampling engine is constructed rather
+/// than as a panic caught at the FFI boundary.
+fn validate_nuts_draws(config: &NutsConfig) -> Result<(), HmcError> {
+    if config.n_chains < MIN_NUTS_CHAINS {
+        return Err(HmcError::InvalidConfig {
+            reason: format!(
+                "NUTS n_chains must be >= {MIN_NUTS_CHAINS} so between-chain \
+                 convergence diagnostics are defined, got {}",
+                config.n_chains
+            ),
+        });
+    }
+    if config.n_samples < MIN_NUTS_SAMPLES {
+        return Err(HmcError::InvalidConfig {
+            reason: format!(
+                "NUTS n_samples must be >= {MIN_NUTS_SAMPLES} so split-R-hat / ESS \
+                 diagnostics are defined, got {}",
+                config.n_samples
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Full up-front validation of a NUTS configuration shared by every sampling
+/// entry point (dense, link-wiggle, joint (β, ρ), survival).
+fn validate_nuts_config(config: &NutsConfig) -> Result<(), HmcError> {
+    validate_nuts_target_accept(config.target_accept)?;
+    validate_nuts_draws(config)?;
+    Ok(())
+}
+
 #[inline]
 fn splitmix64(x: u64) -> u64 {
     crate::linalg::utils::splitmix64_hash(x)
@@ -3803,7 +3943,7 @@ pub(crate) fn run_nuts_sampling(
     config: &NutsConfig,
 ) -> Result<NutsResult, String> {
     validate_firth_support(nuts_family, firth_bias_reduction).map_err(String::from)?;
-    validate_nuts_target_accept(config.target_accept).map_err(String::from)?;
+    validate_nuts_config(config).map_err(String::from)?;
     if nuts_family == NutsFamily::TweedieLog && !is_valid_tweedie_power(gamma_shape) {
         return Err(format!(
             "Tweedie variance power must be finite and strictly between 1 and 2; got {gamma_shape}"
@@ -4703,7 +4843,7 @@ pub fn run_link_wiggle_nuts_sampling(
     scale: f64,
     config: &NutsConfig,
 ) -> Result<NutsResult, String> {
-    validate_nuts_target_accept(config.target_accept).map_err(String::from)?;
+    validate_nuts_config(config).map_err(String::from)?;
     let dim = mode_beta.len() + mode_theta.len();
     let target = LinkWigglePosterior::new(
         x,
@@ -5679,7 +5819,7 @@ pub fn run_joint_beta_rho_sampling(
 ) -> Result<JointBetaRhoResult, String> {
     validate_firth_likelihood_support(&inputs.likelihood, inputs.firth_bias_reduction)
         .map_err(String::from)?;
-    validate_nuts_target_accept(config.target_accept).map_err(String::from)?;
+    validate_nuts_config(config).map_err(String::from)?;
     let n_beta = inputs.mode.len();
     let n_rho = inputs.penalty_roots.len();
     let n_link_params = JointBetaRhoPosterior::link_param_mode(&inputs.likelihood.link).len();
@@ -5994,7 +6134,7 @@ mod survival_hmc {
         hessian: ArrayView2<f64>,
         config: &NutsConfig,
     ) -> Result<NutsResult, String> {
-        validate_nuts_target_accept(config.target_accept).map_err(String::from)?;
+        validate_nuts_config(config).map_err(String::from)?;
         // Create posterior target
         let target = SurvivalPosterior::new(
             age_entry,
