@@ -2120,6 +2120,16 @@ impl SaeManifoldTerm {
         if k_atoms <= 1 {
             return None;
         }
+        // The per-row tangent projection used for non-Euclidean atom latents
+        // requires the uniform-`q` dense layout; the compact active-set path
+        // skips it. So the effective (truncating) sparse plan only engages
+        // when the ext-coord manifold is Euclidean. JumpReLU's structural gate
+        // is exact and handled separately, so this restriction does not affect
+        // it. At huge `K` on a curved manifold the streaming driver still
+        // bounds memory; only the per-atom truncation is withheld.
+        if !self.ext_coord_manifold().is_euclidean() {
+            return None;
+        }
         let p = self.output_dim();
         let m_total: usize = self.atoms.iter().map(|a| a.basis_size()).sum();
         // Dense data Gram footprint: (m_total · m_total) f64.
@@ -2425,40 +2435,64 @@ impl SaeManifoldTerm {
             }));
         }
 
-        // For JumpReLU, compute per-row active-set layout (active atoms have
-        // logit > threshold).  This allows the row block to be sized at
-        // q_active = |active| + Σ_{k∈active} d_k rather than the full q.
-        // Also extract (temperature, threshold) for use in the JVP loop.
-        let jumprelu_params: Option<(f64, f64)> = match self.assignment.mode {
-            AssignmentMode::JumpReLU {
-                temperature,
+        // Per-row active-set layout. Engaged for two regimes:
+        //   * JumpReLU — structural gate (`logit > threshold`); the compact
+        //     solve is bit-identical to the dense one (gated atoms carry zero
+        //     assignment mass).
+        //   * Softmax / IBP-MAP at large `K` — the dense `(m_total · p)²` data
+        //     Gram is infeasible, so each row is truncated to its
+        //     top-`k_active` atoms above a relative magnitude cutoff
+        //     ([`Self::sparse_active_plan`]). Small-`K` problems return `None`
+        //     and keep the exact full-support layout.
+        // The compact row block is sized `q_active = |active| + Σ_{k∈active}
+        // d_k` instead of the full `q`.
+        let coord_dims: Vec<usize> = self
+            .assignment
+            .coords
+            .iter()
+            .map(|c| c.latent_dim())
+            .collect();
+        let row_layout: Option<SaeRowLayout> = match self.assignment.mode {
+            AssignmentMode::JumpReLU { threshold, .. } => Some(SaeRowLayout::from_jumprelu(
+                n,
+                k_atoms,
                 threshold,
-            } => Some((temperature, threshold)),
-            _ => None,
-        };
-        let jumprelu_layout: Option<SaeRowLayout> = match self.assignment.mode {
-            AssignmentMode::JumpReLU { threshold, .. } => {
-                let coord_dims: Vec<usize> = self
-                    .assignment
-                    .coords
-                    .iter()
-                    .map(|c| c.latent_dim())
-                    .collect();
-                let coord_offsets_full = self.assignment.coord_offsets();
-                Some(SaeRowLayout::new(
-                    n,
-                    k_atoms,
-                    threshold,
-                    &self.assignment.logits,
-                    coord_dims,
-                    coord_offsets_full,
-                ))
+                &self.assignment.logits,
+                coord_dims.clone(),
+                self.assignment.coord_offsets(),
+            )),
+            AssignmentMode::Softmax { .. } | AssignmentMode::IBPMap { .. } => {
+                match self.sparse_active_plan() {
+                    Some((k_active_cap, relative_cutoff)) => {
+                        // Build per-row dense assignments once to derive the
+                        // active set; the row loop re-derives `assignments`
+                        // (cheap softmax) and reuses these active sets.
+                        let mut assignments_all = Vec::with_capacity(n);
+                        for row in 0..n {
+                            assignments_all.push(self.assignment.try_assignments_row(row)?);
+                        }
+                        // Absolute cutoff = relative_cutoff · max row peak, so a
+                        // single threshold drops sub-1e-3 mass across all rows.
+                        let peak = assignments_all
+                            .iter()
+                            .flat_map(|a| a.iter())
+                            .fold(0.0_f64, |m, &v| m.max(v.abs()));
+                        let cutoff = relative_cutoff * peak;
+                        Some(SaeRowLayout::from_dense_weights(
+                            &assignments_all,
+                            k_active_cap,
+                            cutoff,
+                            coord_dims.clone(),
+                            self.assignment.coord_offsets(),
+                        ))
+                    }
+                    None => None,
+                }
             }
-            _ => None,
         };
-        // Build the Arrow-Schur system: heterogeneous row dims for JumpReLU,
-        // uniform q for all other modes.
-        let mut sys = if let Some(ref layout) = jumprelu_layout {
+        // Build the Arrow-Schur system: heterogeneous row dims when a compact
+        // layout is active, uniform `q` otherwise.
+        let mut sys = if let Some(ref layout) = row_layout {
             let per_row_dims: Vec<usize> = (0..n).map(|row| layout.row_q_active(row)).collect();
             ArrowSchurSystem::new_with_per_row_dims(per_row_dims, beta_dim)
         } else {
@@ -2481,14 +2515,26 @@ impl SaeManifoldTerm {
         // `β[μ·p + oc] = B[μ, oc]` (μ enumerating (atom, basis_col)) the GN
         // outer product `Jβᵀ Jβ` couples only equal `oc`, with the same
         // `(M_total × M_total)` block `G[μ, μ'] = Σ_rows (a_k φ_k[m])(a_{k'} φ_{k'}[m'])`
-        // for every channel. So `H_data = G ⊗ I_p`. We accumulate the single
-        // `M_total × M_total` block `g_data` here and install it as one
-        // `KroneckerPenaltyOp` after the loop, instead of materialising the
-        // dense `(K·p)²` `sys.hbb`. The `μ` index of an `a_phi` entry whose
-        // global β base is `beta_base` is `beta_base / p` (every `beta_offset`
-        // and the `basis_col·p` stride are multiples of `p`).
+        // for every channel. So `H_data = G ⊗ I_p`. The `μ` index of an `a_phi`
+        // entry whose global β base is `beta_base` is `beta_base / p` (every
+        // `beta_offset` and the `basis_col·p` stride are multiples of `p`).
+        //
+        // `G` is only non-zero on `(atom_i, atom_j)` pairs that co-occur in
+        // some row's active set, so we accumulate it as a sparse map of dense
+        // per-atom-pair `(m_i × m_j)` blocks keyed by `(atom_i, atom_j)` rather
+        // than as a dense `(m_total × m_total)` matrix. At `K = 100K` with
+        // per-row active sets of size `k_active ≪ K`, only `O(N · k_active²)`
+        // pairs are ever touched, so the data Gram (and every matvec /
+        // diagonal pass over it via `SparseBlockKroneckerPenaltyOp`) tracks the
+        // active atoms instead of `K²`. In the dense full-support layout the
+        // map degenerates to every co-occurring pair, reproducing the dense
+        // Gram exactly. A `BTreeMap` key order keeps the installed op's
+        // fingerprint deterministic. The `μ`-space offset of atom `k` is
+        // `beta_offsets[k] / p`.
         let m_total: usize = self.atoms.iter().map(|a| a.basis_size()).sum();
-        let mut g_data = Array2::<f64>::zeros((m_total, m_total));
+        let mu_offsets: Vec<usize> = beta_offsets.iter().map(|&off| off / p).collect();
+        let mut g_blocks: std::collections::BTreeMap<(usize, usize), Array2<f64>> =
+            std::collections::BTreeMap::new();
         // Stick-breaking prior for IBP-MAP depends only on (k_atoms, alpha)
         // which are constant across rows; precompute once.
         let ibp_prior_vec = match self.assignment.mode {
@@ -2507,15 +2553,40 @@ impl SaeManifoldTerm {
         // storage; the Arrow-Schur solver accesses them via htbeta_matvec.
         let mut kron_a_phi: Vec<Vec<(usize, f64)>> = Vec::with_capacity(n);
         let mut kron_jac: Vec<Vec<f64>> = Vec::with_capacity(n);
+        // Dense full-support index `[0, k_atoms)`, used by the row loop when no
+        // compact layout is engaged so the active-atom iteration is uniform.
+        let all_atoms_index: Vec<usize> = (0..k_atoms).collect();
         for row in 0..n {
             let assignments = self.assignment.try_assignments_row(row)?;
+            // Reconstruction uses the row's active support: for the dense
+            // full-support layout this is all atoms (exact); for a compact
+            // layout the dropped atoms carry negligible `O(a)` reconstruction
+            // mass and zero curvature, so excluding them keeps `fitted`,
+            // `error`, and the logit-JVP cross term `(decoded[k] − fitted)`
+            // mutually consistent with the curvature actually assembled.
             fitted.fill(0.0);
-            for atom_idx in 0..k_atoms {
-                let a_k = assignments[atom_idx];
-                self.atoms[atom_idx].fill_decoded_row(row, &mut decoded_scratch);
-                for out_col in 0..p {
-                    decoded[[atom_idx, out_col]] = decoded_scratch[out_col];
-                    fitted[out_col] += a_k * decoded_scratch[out_col];
+            let row_active_owned: Option<&[usize]> =
+                row_layout.as_ref().map(|l| l.active_atoms[row].as_slice());
+            match row_active_owned {
+                Some(active) => {
+                    for &atom_idx in active {
+                        let a_k = assignments[atom_idx];
+                        self.atoms[atom_idx].fill_decoded_row(row, &mut decoded_scratch);
+                        for out_col in 0..p {
+                            decoded[[atom_idx, out_col]] = decoded_scratch[out_col];
+                            fitted[out_col] += a_k * decoded_scratch[out_col];
+                        }
+                    }
+                }
+                None => {
+                    for atom_idx in 0..k_atoms {
+                        let a_k = assignments[atom_idx];
+                        self.atoms[atom_idx].fill_decoded_row(row, &mut decoded_scratch);
+                        for out_col in 0..p {
+                            decoded[[atom_idx, out_col]] = decoded_scratch[out_col];
+                            fitted[out_col] += a_k * decoded_scratch[out_col];
+                        }
+                    }
                 }
             }
             for out_col in 0..p {
@@ -2523,29 +2594,30 @@ impl SaeManifoldTerm {
             }
 
             // Determine whether this row uses the compact active-set layout.
-            // JumpReLU: only active atoms (logit > threshold) enter the block.
-            // All other modes: dense q layout.
-            let (q_row, local_jac_row) = if let Some(ref layout) = jumprelu_layout {
+            //   * JumpReLU: only gated atoms (logit > threshold) enter.
+            //   * Softmax / IBP-MAP at large K: only the top-`k_active` atoms.
+            //   * Otherwise (small K): the dense uniform-q layout.
+            let (q_row, local_jac_row) = if let Some(ref layout) = row_layout {
                 let active = &layout.active_atoms[row];
                 let starts = &layout.coord_starts[row];
                 let q_active = layout.row_q_active(row);
                 let mut jac_compact = Array2::<f64>::zeros((q_active, p));
-                // Logit JVP rows for active atoms only.
-                // JumpReLU STE: da_k/dl_k = sigmoid'(l_k/τ) for active, 0 for inactive.
-                // jumprelu_params is always Some when jumprelu_layout is Some (same branch).
-                let (temperature, threshold) = jumprelu_params
-                    .expect("jumprelu_params populated in same branch as jumprelu_layout");
-                let inv_tau = 1.0 / temperature;
+                // Logit JVP rows for active atoms only, using the per-mode
+                // assignment sensitivity `da_k/dl_k` contracted into the
+                // decoded / fitted-corrected output direction.
                 let logits_row = self.assignment.logits.row(row);
                 for (j, &k) in active.iter().enumerate() {
-                    if logits_row[k] <= threshold {
-                        continue; // should not happen since active means logit > threshold
-                    }
-                    let activation = crate::linalg::utils::stable_logistic(logits_row[k] * inv_tau);
-                    let da = activation * (1.0 - activation) * inv_tau;
-                    for out_col in 0..p {
-                        jac_compact[[j, out_col]] = da * decoded[[k, out_col]];
-                    }
+                    fill_active_atom_logit_jvp(
+                        self.assignment.mode,
+                        k,
+                        logits_row[k],
+                        assignments[k],
+                        decoded.row(k),
+                        fitted.view(),
+                        ibp_prior_slice,
+                        &mut jac_compact,
+                        j,
+                    );
                 }
                 // Coordinate JVP rows for active atoms only.
                 for (j, &k) in active.iter().enumerate() {
@@ -2612,7 +2684,7 @@ impl SaeManifoldTerm {
             // For compact layout: position `j` = active_atoms index.
             // For dense layout: position `atom_idx` directly.
             let assignment_base = row * k_atoms;
-            if let Some(ref layout) = jumprelu_layout {
+            if let Some(ref layout) = row_layout {
                 let active = &layout.active_atoms[row];
                 for (j, &k) in active.iter().enumerate() {
                     block.gt[j] += assignment_grad[assignment_base + k];
@@ -2628,7 +2700,7 @@ impl SaeManifoldTerm {
             // ARD on each on-atom coordinate.
             // For compact layout: only active atoms; coord positions use compact starts.
             // For dense layout: all atoms; coord positions use coord_offsets.
-            if let Some(ref layout) = jumprelu_layout {
+            if let Some(ref layout) = row_layout {
                 let active = &layout.active_atoms[row];
                 let starts = &layout.coord_starts[row];
                 for (j, &k) in active.iter().enumerate() {
@@ -2688,39 +2760,71 @@ impl SaeManifoldTerm {
             // build_dense_schur_*, JacobiPreconditioner) route through
             // `sys_htbeta_apply_row` / `sys_htbeta_accumulate_transpose` which
             // already prefer `htbeta_matvec` over the dense slab.
-            let mut a_phi: Vec<(usize, f64)> = Vec::with_capacity(k_atoms * 4);
-            for atom_idx in 0..k_atoms {
+            //
+            // Only the row's active atoms contribute `a_phi` support and data
+            // curvature: in a compact layout (JumpReLU gate or large-K
+            // top-`k_active` truncation) the inactive atoms carry zero (gated)
+            // or sub-cutoff assignment mass and are excluded — this is what
+            // keeps both the htbeta support and the `G` accumulation
+            // `O(k_active)` rather than `O(K)`. In the dense full-support
+            // layout `row_active` spans all atoms.
+            let row_active: &[usize] = match row_layout {
+                Some(ref layout) => layout.active_atoms[row].as_slice(),
+                None => &all_atoms_index,
+            };
+            let mut a_phi: Vec<(usize, f64)> = Vec::with_capacity(row_active.len() * 4);
+            // Per-active-atom weighted basis row `a_k · φ_k[·]`, retained so the
+            // data Gram blocks can be accumulated as clean per-atom-pair outer
+            // products `(a_k φ_k) (a_{k'} φ_{k'})ᵀ`.
+            let mut weighted_phi: Vec<(usize, Vec<f64>)> = Vec::with_capacity(row_active.len());
+            for &atom_idx in row_active {
                 let atom = &self.atoms[atom_idx];
                 let atom_beta_off = beta_offsets[atom_idx];
                 let m = atom.basis_size();
                 let a_k = assignments[atom_idx];
+                let mut wphi = Vec::with_capacity(m);
                 for basis_col in 0..m {
                     let phi = atom.basis_values[[row, basis_col]];
-                    a_phi.push((atom_beta_off + basis_col * p, a_k * phi));
+                    let w = a_k * phi;
+                    a_phi.push((atom_beta_off + basis_col * p, w));
+                    wphi.push(w);
                 }
+                weighted_phi.push((atom_idx, wphi));
             }
+            // β data-fit gradient `gᵦ += J_βᵀ error`.
             for &(beta_base_i, j_beta_i) in a_phi.iter() {
                 if j_beta_i == 0.0 {
-                    // Skip rank-1 outer product whose left factor is zero;
-                    // saves a full Σ M · p pass for masked / inactive atoms
-                    // (e.g. assignment exactly zeroed by JumpReLU).
                     continue;
                 }
-                // Data-fit GN β-Hessian: accumulate the channel-independent
-                // `(M_total × M_total)` block `G` once per `(i, j)` pair (the
-                // `out_col` dimension is carried by `I_p` in the Kronecker op),
-                // instead of the previous `p` dense writes into `sys.hbb`.
-                let mu_i = beta_base_i / p;
-                for &(beta_base_j, j_beta_j) in a_phi.iter() {
-                    let mu_j = beta_base_j / p;
-                    g_data[[mu_i, mu_j]] += j_beta_i * j_beta_j;
-                }
                 for out_col in 0..p {
-                    let beta_idx = beta_base_i + out_col;
-                    sys.gb[beta_idx] += j_beta_i * error[out_col];
+                    sys.gb[beta_base_i + out_col] += j_beta_i * error[out_col];
                     // No htbeta write — the Kronecker matvec handles this.
-                    // No dense hbb write — the `G ⊗ I_p` Kronecker op installed
+                    // No dense hbb write — the sparse `G ⊗ I_p` op installed
                     // after the loop carries the data-fit GN β-Hessian.
+                }
+            }
+            // Data-fit GN β-Hessian: accumulate the channel-independent block
+            // `G[μ_i, μ_j] += (a_k φ_k)[μ_i] (a_{k'} φ_{k'})[μ_j]` into the
+            // sparse per-atom-pair map (the `out_col` dimension is carried by
+            // `I_p`). Only co-occurring `(atom_i, atom_j)` pairs are touched.
+            for ai in 0..weighted_phi.len() {
+                let (atom_i, ref wphi_i) = weighted_phi[ai];
+                let m_i = wphi_i.len();
+                for aj in 0..weighted_phi.len() {
+                    let (atom_j, ref wphi_j) = weighted_phi[aj];
+                    let m_j = wphi_j.len();
+                    let blk = g_blocks
+                        .entry((atom_i, atom_j))
+                        .or_insert_with(|| Array2::<f64>::zeros((m_i, m_j)));
+                    for li in 0..m_i {
+                        let wi = wphi_i[li];
+                        if wi == 0.0 {
+                            continue;
+                        }
+                        for lj in 0..m_j {
+                            blk[[li, lj]] += wi * wphi_j[lj];
+                        }
+                    }
                 }
             }
             // Save per-row Kronecker data for htbeta_matvec construction.
@@ -2744,10 +2848,13 @@ impl SaeManifoldTerm {
         // `apply_riemannian_latent_geometry` does to `row.htbeta`, applied
         // here to the (q × p) kron_jac so the Kronecker htbeta_matvec uses
         // the Riemannian-projected form.
-        // Apply Riemannian geometry only for dense modes.  JumpReLU compact rows
-        // have heterogeneous q_i; the Riemannian projector path requires a uniform
-        // latent dimension and is not called when jumprelu_layout is active.
-        if jumprelu_layout.is_none() {
+        // Apply Riemannian geometry only for the dense uniform-q layout. Any
+        // compact active-set layout (JumpReLU gate or large-K softmax/IBP
+        // truncation) has heterogeneous q_i; the Riemannian projector path
+        // requires a uniform latent dimension. The sparse plan only engages on
+        // Euclidean ext-coord manifolds (see `sparse_active_plan`), so skipping
+        // the projector here is correct — there is nothing to project.
+        if row_layout.is_none() {
             self.apply_sae_riemannian_geometry(&mut sys);
             let manifold = self.ext_coord_manifold();
             if !manifold.is_euclidean() {
@@ -2824,19 +2931,38 @@ impl SaeManifoldTerm {
         // Install the composite BetaPenaltyOp (#296): smoothness contributions
         // via per-atom KroneckerPenaltyOp (avoid dense K×K materialisation), the
         // data-fit Gauss-Newton β-Hessian as the structured `G ⊗ I_p`
-        // KroneckerPenaltyOp (block-diagonal across the `p` output channels,
+        // SparseBlockKroneckerPenaltyOp (block-sparse over co-occurring
+        // `(atom, atom')` pairs, block-diagonal across the `p` output channels,
         // identical per channel), plus — only when a Beta-tier analytic penalty
         // was written — the dense `sys.hbb` residual contribution. When no beta
         // penalty fired, `sys.hbb` is all-zero and the dense `(K·p)²` operator
-        // is skipped entirely.
+        // is skipped entirely. The sparse data op tracks only the active-atom
+        // couplings, so its storage and matvec cost scale with `k_active`, not
+        // `K`, at `K = 100K`.
         {
-            let identity_p = Array2::<f64>::eye(p);
+            // Convert the per-atom-pair coupling map into `SparseGBlock`s keyed
+            // by μ-space offsets. Empty blocks (no co-occurrence) are simply
+            // absent from the map.
+            let g_sparse_blocks: Vec<SparseGBlock> = g_blocks
+                .into_iter()
+                .filter_map(|((atom_i, atom_j), data)| {
+                    if data.iter().all(|&v| v == 0.0) {
+                        None
+                    } else {
+                        Some(SparseGBlock {
+                            row_off: mu_offsets[atom_i],
+                            col_off: mu_offsets[atom_j],
+                            data,
+                        })
+                    }
+                })
+                .collect();
             let mut ops: Vec<Arc<dyn BetaPenaltyOp>> = smooth_ops;
-            ops.push(Arc::new(KroneckerPenaltyOp {
-                factor_a: g_data,
-                factor_b: identity_p,
-                global_offset: 0,
+            ops.push(Arc::new(SparseBlockKroneckerPenaltyOp {
+                p,
+                dim_a: m_total,
                 k: beta_dim,
+                blocks: g_sparse_blocks,
             }));
             if beta_penalty_written {
                 ops.push(Arc::new(DensePenaltyOp(sys.hbb.clone())));
@@ -2844,7 +2970,7 @@ impl SaeManifoldTerm {
             sys.set_penalty_op(Arc::new(CompositePenaltyOp { k: beta_dim, ops }));
         }
         // Store the active-set layout for `apply_newton_step`.
-        self.last_row_layout = jumprelu_layout;
+        self.last_row_layout = row_layout;
         Ok(sys)
     }
 
@@ -3380,8 +3506,9 @@ impl SaeManifoldTerm {
             ));
         }
 
-        // When last_row_layout is set (JumpReLU compact mode), delta_ext_coord
-        // uses a variable-stride layout where row i occupies
+        // When last_row_layout is set (any compact active-set mode — JumpReLU
+        // gate or large-K softmax/IBP truncation), delta_ext_coord uses a
+        // variable-stride layout where row i occupies
         // [compact_offset_i .. compact_offset_i + q_active_i].
         // We expand each row back to full-q before applying.
         if let Some(ref layout) = self.last_row_layout.clone() {
@@ -3493,7 +3620,8 @@ impl SaeManifoldTerm {
         // Each decoder atom `k` contributes `η_i += a_ik · Φ_k(t_ik) · B_k`,
         // with `B_k ∈ ℝ^{M_k × p}`. The decoder Hessian for atom `k` is
         // `H_data = G_k ⊗ I_p` where `G_k = (diag(a_·k)·Φ_k)ᵀ (diag(a_·k)·Φ_k)`
-        // (see the Kronecker `g_data` assembly at `assemble_arrow_schur`); the
+        // (the diagonal `(atom_k, atom_k)` block of the sparse data Gram `G`
+        // assembled in `assemble_arrow_schur`); the
         // `p` output channels share the identical `M_k × M_k` Gram, so decoder
         // identifiability is fully determined by the per-atom `(n, M_k)` design
         // `D_k = diag(a_·k)·Φ_k`. The `p`-fold output replication carries no
@@ -4344,6 +4472,67 @@ fn jumprelu_row(logits: ArrayView1<'_, f64>, temperature: f64, threshold: f64) -
     out
 }
 
+/// Fill the single compact logit-JVP row `jac_compact[[j, ·]]` for active atom
+/// `k`, using the per-mode assignment sensitivity `da_k/dl_k` contracted into
+/// the decoded / fitted-corrected output direction. This is the active-set
+/// analogue of [`fill_assignment_logit_jvp_rows`]: it reproduces that
+/// function's diagonal logit row exactly for the atom `k`, but writes into the
+/// compact position `j` of a heterogeneous-`q` row block instead of the dense
+/// full-`K` Jacobian. `fitted` is the row's *active-set* reconstruction so the
+/// softmax cross term `(decoded_k − fitted)` is consistent with the curvature
+/// the compact block carries.
+#[allow(clippy::too_many_arguments)]
+fn fill_active_atom_logit_jvp(
+    mode: AssignmentMode,
+    k: usize,
+    logit_k: f64,
+    a_k: f64,
+    decoded_k: ArrayView1<'_, f64>,
+    fitted: ArrayView1<'_, f64>,
+    ibp_prior: Option<&[f64]>,
+    jac_compact: &mut Array2<f64>,
+    j: usize,
+) {
+    let p = fitted.len();
+    match mode {
+        AssignmentMode::Softmax { temperature, .. } => {
+            // da_k/dl_k contracted: a_k (decoded_k − fitted) / τ.
+            let inv_tau = 1.0 / temperature;
+            for out_col in 0..p {
+                jac_compact[[j, out_col]] = a_k * (decoded_k[out_col] - fitted[out_col]) * inv_tau;
+            }
+        }
+        AssignmentMode::IBPMap { temperature, .. } => {
+            // z_k = σ(l_k/τ)·π_k ⇒ dz_k/dl_k = a_k(π_k − a_k)/(π_k τ) · π_k form
+            // (matches `fill_assignment_logit_jvp_rows`).
+            let inv_tau = 1.0 / temperature;
+            let prior = ibp_prior
+                .expect("fill_active_atom_logit_jvp: IBPMap requires precomputed prior");
+            let pi_k = prior[k];
+            let sig = if pi_k > 0.0 { a_k / pi_k } else { 0.0 };
+            let dz = sig * (1.0 - sig) * inv_tau * pi_k;
+            for out_col in 0..p {
+                jac_compact[[j, out_col]] = dz * decoded_k[out_col];
+            }
+        }
+        AssignmentMode::JumpReLU {
+            temperature,
+            threshold,
+        } => {
+            // Hard-gate STE: sigmoid derivative, only above threshold.
+            if logit_k <= threshold {
+                return;
+            }
+            let inv_tau = 1.0 / temperature;
+            let activation = crate::linalg::utils::stable_logistic(logit_k * inv_tau);
+            let da = activation * (1.0 - activation) * inv_tau;
+            for out_col in 0..p {
+                jac_compact[[j, out_col]] = da * decoded_k[out_col];
+            }
+        }
+    }
+}
+
 fn fill_assignment_logit_jvp_rows(
     mode: AssignmentMode,
     logits: ArrayView1<'_, f64>,
@@ -5169,6 +5358,53 @@ mod tests {
             error <= 1.0e-4,
             "actual={actual:.12e}, predicted={predicted:.12e}, error={error:.12e}"
         );
+    }
+
+    /// `SaeRowLayout::from_dense_weights` must keep, per row, the
+    /// top-`k_active_cap` atoms above the magnitude cutoff (always at least
+    /// one), with compact coord starts that reproduce the `expand_row`
+    /// round-trip back to full-q positions.
+    #[test]
+    fn sae_row_layout_from_dense_weights_top_k_and_cutoff() {
+        // 3 atoms, coord dims [2, 1, 2] ⇒ full q = 3 + 5 = 8.
+        let coord_dims = vec![2usize, 1, 2];
+        let coord_offsets_full = vec![3usize, 5, 6];
+        let assignments = vec![
+            // Row 0: weights [0.7, 0.01, 0.29]; cutoff 0.05, cap 2 ⇒ {0, 2}.
+            Array1::from_vec(vec![0.7, 0.01, 0.29]),
+            // Row 1: weights [0.001, 0.002, 0.0005]; all below cutoff ⇒ keep
+            // single largest-magnitude atom {1}.
+            Array1::from_vec(vec![0.001, 0.002, 0.0005]),
+        ];
+        let layout = SaeRowLayout::from_dense_weights(
+            &assignments,
+            2,
+            0.05,
+            coord_dims,
+            coord_offsets_full,
+        );
+        assert_eq!(layout.active_atoms[0], vec![0, 2]);
+        assert_eq!(layout.active_atoms[1], vec![1]);
+        // Row 0 compact dim = |{0,2}| + d_0 + d_2 = 2 + 2 + 2 = 6.
+        assert_eq!(layout.row_q_active(0), 6);
+        // Row 1 compact dim = 1 + d_1 = 1 + 1 = 2.
+        assert_eq!(layout.row_q_active(1), 2);
+        // expand_row round-trip for row 0: compact [logit0, logit2, t0_0,
+        // t0_1, t2_0, t2_1] → full-q with zeros for inactive atom 1.
+        let compact = vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let mut full = vec![0.0_f64; 8];
+        layout.expand_row(0, &compact, &mut full);
+        // logits: full[0] = atom0 logit, full[2] = atom2 logit, full[1] = 0.
+        assert_eq!(full[0], 1.0);
+        assert_eq!(full[1], 0.0);
+        assert_eq!(full[2], 2.0);
+        // coords: atom0 at offset 3 (d=2), atom2 at offset 6 (d=2); atom1
+        // (offset 5, d=1) is inactive ⇒ zero.
+        assert_eq!(full[3], 3.0);
+        assert_eq!(full[4], 4.0);
+        assert_eq!(full[5], 0.0);
+        assert_eq!(full[6], 5.0);
+        assert_eq!(full[7], 6.0);
     }
 
     /// MechanismSparsityPenalty must reach the SAE arrow-Schur system's
