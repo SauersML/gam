@@ -279,7 +279,11 @@ fn schur_condition_number(
 }
 
 fn build_shifted_schur(sys: &ArrowSchurSystem, ridge: f64) -> Option<Array2<f64>> {
-    let mut schur = sys.hbb.clone();
+    // Start from the effective β-block operator so the Schur complement is
+    // correct when β contributions live in a structured `BetaPenaltyOp`
+    // (e.g. the SAE data-fit `G ⊗ I_p` block) rather than the dense `hbb`
+    // accumulator. Reduces to `hbb.clone()` when no `penalty_op` is installed.
+    let mut schur = sys.effective_penalty_op().to_dense();
     for row in sys.rows.iter() {
         let di = row.htt.nrows();
         let mut htt = row.htt.clone();

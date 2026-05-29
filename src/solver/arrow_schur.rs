@@ -176,6 +176,14 @@ pub trait BetaPenaltyOp: Send + Sync {
     /// Materialize the full `K×K` dense penalty matrix (needed by
     /// Direct / SqrtBA modes that form the Schur complement explicitly).
     fn to_dense(&self) -> Array2<f64>;
+    /// Mix the operator's defining state into `hasher` for cache-validity
+    /// fingerprinting. Must change whenever `matvec` / `to_dense` would change,
+    /// so the factorization / evidence cache (`cache_matches_system`) is
+    /// invalidated when the β-block content changes. Implementations hash their
+    /// own compact defining data (e.g. Kronecker factors, block matrices)
+    /// rather than the full `K×K` dense form, which would defeat the structured
+    /// operator's storage savings.
+    fn fingerprint(&self, hasher: &mut Fingerprinter);
 }
 
 /// Dense fallback: wraps the existing `K×K` `H_ββ` accumulator.
@@ -227,6 +235,11 @@ impl BetaPenaltyOp for DensePenaltyOp {
 
     fn to_dense(&self) -> Array2<f64> {
         self.0.clone()
+    }
+
+    fn fingerprint(&self, hasher: &mut Fingerprinter) {
+        hasher.write_str("dense-penalty-op-v1");
+        write_array2_fingerprint(hasher, &self.0);
     }
 }
 
@@ -323,6 +336,16 @@ impl BetaPenaltyOp for BlockPenaltyOp {
             }
         }
         out
+    }
+
+    fn fingerprint(&self, hasher: &mut Fingerprinter) {
+        hasher.write_str("block-penalty-op-v1");
+        hasher.write_usize(self.k);
+        hasher.write_usize(self.blocks.len());
+        for (off, local) in &self.blocks {
+            hasher.write_usize(*off);
+            write_array2_fingerprint(hasher, local);
+        }
     }
 }
 
@@ -454,6 +477,14 @@ impl BetaPenaltyOp for KroneckerPenaltyOp {
         }
         out
     }
+
+    fn fingerprint(&self, hasher: &mut Fingerprinter) {
+        hasher.write_str("kronecker-penalty-op-v1");
+        hasher.write_usize(self.global_offset);
+        hasher.write_usize(self.k);
+        write_array2_fingerprint(hasher, &self.factor_a);
+        write_array2_fingerprint(hasher, &self.factor_b);
+    }
 }
 
 /// Composite penalty: sum of multiple `BetaPenaltyOp` operators.
@@ -500,6 +531,15 @@ impl BetaPenaltyOp for CompositePenaltyOp {
             out += &dense;
         }
         out
+    }
+
+    fn fingerprint(&self, hasher: &mut Fingerprinter) {
+        hasher.write_str("composite-penalty-op-v1");
+        hasher.write_usize(self.k);
+        hasher.write_usize(self.ops.len());
+        for op in &self.ops {
+            op.fingerprint(hasher);
+        }
     }
 }
 
@@ -584,6 +624,17 @@ impl BetaPenaltyOp for MatvecDiagPenaltyOp {
             }
         }
         out
+    }
+
+    fn fingerprint(&self, hasher: &mut Fingerprinter) {
+        // The matvec closure cannot be hashed by content; the precomputed
+        // diagonal is the operator's stable defining proxy (it is recomputed
+        // alongside the matvec each time the operator is installed).
+        hasher.write_str("matvec-diag-penalty-op-v1");
+        hasher.write_usize(self.k);
+        for &value in self.diagonal_vec.iter() {
+            hasher.write_f64(value);
+        }
     }
 }
 
@@ -1093,7 +1144,21 @@ fn row_hessian_fingerprint_for_system(sys: &ArrowSchurSystem) -> u64 {
             None => write_array2_fingerprint(&mut hasher, &row.htbeta),
         }
     }
-    write_array2_fingerprint(&mut hasher, &sys.hbb);
+    // Hash the β-block operator's defining state. When a structured
+    // `penalty_op` is installed (e.g. the SAE composite carrying the data-fit
+    // Gauss-Newton block as `G ⊗ I_p`), hashing the operator captures the full
+    // β-block content cheaply; the dense `sys.hbb` no longer holds it. When no
+    // `penalty_op` is installed, fall back to hashing the dense accumulator.
+    match sys.penalty_op.as_ref() {
+        Some(op) => {
+            hasher.write_bool(true);
+            op.fingerprint(&mut hasher);
+        }
+        None => {
+            hasher.write_bool(false);
+            write_array2_fingerprint(&mut hasher, &sys.hbb);
+        }
+    }
     match sys.hbb_diag.as_ref() {
         Some(diag) => {
             hasher.write_bool(true);
@@ -1648,6 +1713,10 @@ impl ArrowSchurSystem {
     /// for structured smoothness penalties.
     pub fn set_penalty_op(&mut self, op: Arc<dyn BetaPenaltyOp>) {
         self.penalty_op = Some(op);
+        // The row-Hessian fingerprint now reads the β-block content from the
+        // installed operator; refresh it so the factorization / evidence cache
+        // (`cache_matches_system`) invalidates when the β-block changes.
+        self.refresh_row_hessian_fingerprint();
     }
 
     /// Return the effective penalty operator: the installed `penalty_op` if
@@ -2103,13 +2172,19 @@ impl StreamingArrowSchur {
                     reason: format!("streaming row {row} out of bounds"),
                 })
         });
+        // Materialize the dense β-block from the effective penalty operator so
+        // the streaming accumulator stays correct when contributions live in a
+        // structured `BetaPenaltyOp` (e.g. the SAE data-fit Gauss-Newton block,
+        // represented as `G ⊗ I_p`) rather than the dense `hbb` accumulator.
+        // When no `penalty_op` is installed this reduces to `hbb.clone()`.
+        let hbb_dense = sys.effective_penalty_op().to_dense();
         Self::new(
             sys.rows.len(),
             sys.d,
             Arc::clone(&sys.row_dims),
             Arc::clone(&sys.row_offsets),
             sys.k,
-            sys.hbb.clone(),
+            hbb_dense,
             sys.gb.clone(),
             row_builder,
             chunk_size,
