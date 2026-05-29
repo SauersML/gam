@@ -2895,36 +2895,54 @@ impl SaeManifoldTerm {
         // Build and install the Kronecker htbeta_matvec.
         //
         // `SaeKroneckerRows` holds per-row `(a_phi, local_jac)` and implements
-        // `H_tβ^(i) x` via the gather-scatter Kronecker form without ever
-        // materializing the `(q × K·p)` block.  The closure is Arc-wrapped so
-        // the Arrow-Schur solver can use it via `sys.htbeta_matvec`.
+        // the cross-block operator without ever materialising the dense
+        // `(q × K·p)` slab.  The cross-block factorises as `H_tβ = L · J_β`,
+        // where `J_β = φᵀ ⊗ I_p` projects a length-`K` β vector onto the
+        // `p`-dimensional decoded output space (`apply_jbeta`) and `L_i` is
+        // the per-row `(q_i × p)` assignment+coordinate Jacobian that lifts
+        // that p-vector into the row's `q_i`-dim tangent block (`apply_l`).
+        // Both factors are required: the contract of `set_row_htbeta_operator`
+        // is `out.len() == d` (= `q_i`), so writing `apply_jbeta`'s p-vector
+        // output directly into a length-`q_i` buffer overflows whenever
+        // `p > q_i` (the common case once `p` reflects real feature width).
+        // Symmetric for the transpose: `H_βt = J_βᵀ · Lᵀ`, so apply `Lᵀ`
+        // first to map the q_i-vector back to p-space, then scatter through
+        // the support.
         {
             let kron = Arc::new(SaeKroneckerRows::new(p, kron_a_phi, kron_jac));
             let kron_t = Arc::clone(&kron);
+            let p_dim = p;
             sys.set_row_htbeta_operator(
                 move |row_idx, x, out| {
-                    // Apply J_β^(row_idx) · x → out using the Kronecker form.
-                    // x may or may not be contiguous; collect into a plain Vec
-                    // only when a contiguous slice is not available.
+                    // out = L_i · (J_β · x). Allocate a length-p scratch buffer
+                    // for the intermediate decoded-output vector; both factors
+                    // overwrite their output buffers (`apply_jbeta` zeroes
+                    // before accumulating, `apply_l` writes per-row), so no
+                    // pre-zeroing of `u_p`/`out` is needed.
                     let out_slice = out.as_slice_mut().expect("out is always standard-layout");
+                    let mut u_p = vec![0.0_f64; p_dim];
                     if let Some(xs) = x.as_slice() {
-                        kron.apply_jbeta(row_idx, xs, out_slice);
+                        kron.apply_jbeta(row_idx, xs, &mut u_p);
                     } else {
                         let x_vec: Vec<f64> = x.iter().copied().collect();
-                        kron.apply_jbeta(row_idx, &x_vec, out_slice);
+                        kron.apply_jbeta(row_idx, &x_vec, &mut u_p);
                     }
+                    kron.apply_l(row_idx, &u_p, out_slice);
                 },
                 move |row_idx, v, out| {
-                    // Accumulate H_βt^(row_idx) · v → out via the sparse scatter
-                    // adjoint over the row's active atoms (O(m_i · p)). `out` is
-                    // the length-K β accumulator; `scatter_jbeta_t` adds into it.
+                    // out += J_βᵀ · (Lᵀ · v). `apply_l_t` accumulates into a
+                    // zero-initialised length-p buffer to produce the p-vector
+                    // `Lᵀ v`; `scatter_jbeta_t` then adds φ_i[s] · u_p[j] into
+                    // the length-K β accumulator at each active `(s, j)`.
                     let out_slice = out.as_slice_mut().expect("out is always standard-layout");
+                    let mut u_p = vec![0.0_f64; p_dim];
                     if let Some(vs) = v.as_slice() {
-                        kron_t.scatter_jbeta_t(row_idx, vs, out_slice);
+                        kron_t.apply_l_t(row_idx, vs, &mut u_p);
                     } else {
                         let v_vec: Vec<f64> = v.iter().copied().collect();
-                        kron_t.scatter_jbeta_t(row_idx, &v_vec, out_slice);
+                        kron_t.apply_l_t(row_idx, &v_vec, &mut u_p);
                     }
+                    kron_t.scatter_jbeta_t(row_idx, &u_p, out_slice);
                 },
             );
         }
