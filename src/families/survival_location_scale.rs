@@ -12191,6 +12191,172 @@ mod tests {
     }
 
     #[test]
+    fn prepare_model_assigns_distinct_descending_gauge_priorities() {
+        // Regression for #366: every location-scale block previously carried
+        // the uniform `gauge_priority: 100`, which made the redundant
+        // intercept direction in the flat joint design un-attributable and
+        // forced the identifiability audit to refuse (`fatal = true`).  The
+        // four blocks must now own strictly descending priorities so the
+        // surplus constant is attributed to the lower-priority block.
+        let n = 4usize;
+        let derivative_guard = 1e-6;
+        let spec = SurvivalLocationScaleSpec {
+            age_entry: Array1::from_elem(n, 1.0),
+            age_exit: Array1::from_iter((0..n).map(|i| 5.0 + i as f64)),
+            event_target: array![1.0, 0.0, 1.0, 1.0],
+            weights: Array1::ones(n),
+            inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
+            derivative_guard,
+            max_iter: 4,
+            tol: 1e-8,
+            time_block: TimeBlockInput {
+                design_entry: DesignMatrix::from(Array2::zeros((n, 1))),
+                design_exit: DesignMatrix::from(Array2::zeros((n, 1))),
+                design_derivative_exit: DesignMatrix::from(Array2::ones((n, 1))),
+                offset_entry: Array1::zeros(n),
+                offset_exit: Array1::zeros(n),
+                derivative_offset_exit: Array1::from_elem(n, 2e-6),
+                time_monotonicity: TimeBlockMonotonicity::EnforcedByCoordinateCone,
+                penalties: vec![Array2::zeros((1, 1))],
+                nullspace_dims: vec![1],
+                initial_log_lambdas: None,
+                initial_beta: None,
+            },
+            threshold_block: CovariateBlockKind::Static(CovariateBlockInput {
+                design: DesignMatrix::from(Array2::ones((n, 1))),
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: None,
+                initial_beta: None,
+            }),
+            log_sigma_block: CovariateBlockKind::Static(CovariateBlockInput {
+                design: DesignMatrix::from(Array2::ones((n, 1))),
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: None,
+                initial_beta: None,
+            }),
+            timewiggle_block: None,
+            linkwiggle_block: None,
+            cache_session: None,
+            cache_mirror_sessions: Vec::new(),
+        };
+
+        let prepared =
+            prepare_survival_location_scale_model(&spec).expect("location-scale model prepares");
+
+        let priority = |name: &str| {
+            prepared
+                .blockspecs
+                .iter()
+                .find(|b| b.name == name)
+                .unwrap_or_else(|| panic!("missing block '{name}'"))
+                .gauge_priority
+        };
+        let time = priority("time_transform");
+        let threshold = priority("threshold");
+        let log_sigma = priority("log_sigma");
+        assert_eq!(
+            time, 200,
+            "time_transform must own the highest gauge priority"
+        );
+        assert!(
+            time > threshold && threshold > log_sigma,
+            "gauge priorities must be strictly descending so the redundant \
+             intercept is attributable: time={time}, threshold={threshold}, \
+             log_sigma={log_sigma}"
+        );
+        // The whole point of the fix: no two structural blocks may share a
+        // gauge priority (equal priority is what produced the fatal audit).
+        let mut seen = std::collections::HashSet::new();
+        for block in &prepared.blockspecs {
+            assert!(
+                seen.insert(block.gauge_priority),
+                "blocks must carry distinct gauge priorities; '{}' duplicates {}",
+                block.name,
+                block.gauge_priority,
+            );
+        }
+    }
+
+    #[test]
+    fn prepare_model_joint_audit_resolves_via_gauge_ownership() {
+        // End-to-end exercise of the #366 root cause: build the three coupled
+        // location-scale blocks with mutually-aliased intercept directions
+        // (the exact pathology the released-0.1.135 repro hit) and confirm the
+        // cross-block identifiability audit now *resolves* the rank deficiency
+        // via gauge ownership instead of refusing the fit. Under the old
+        // uniform `gauge_priority: 100` this same joint produced
+        // `fatal = true` (`IdentifiabilityFailure`).
+        use crate::solver::identifiability_canonical::canonicalize_for_identifiability;
+
+        let n = 8usize;
+        // A shared constant column plus a per-block linear covariate. The
+        // constant directions across the three blocks are exactly aliased, so
+        // the flat joint design is rank-deficient by two — only resolvable by
+        // a strict priority ordering.
+        let mk = |col1: &[f64]| {
+            let mut d = Array2::<f64>::zeros((n, 2));
+            for i in 0..n {
+                d[[i, 0]] = 1.0;
+                d[[i, 1]] = col1[i];
+            }
+            DesignMatrix::from(d)
+        };
+        let lin: Vec<f64> = (0..n).map(|i| i as f64 - 3.5).collect();
+        let quad: Vec<f64> = (0..n).map(|i| ((i as f64) - 3.5).powi(2)).collect();
+        let cube: Vec<f64> = (0..n).map(|i| ((i as f64) - 3.5).powi(3)).collect();
+
+        // Each block carries a shared constant in column 0; those three
+        // constant directions are mutually aliased, so the flat joint design
+        // is genuinely rank-deficient by two and only resolvable by a strict
+        // priority ordering.
+        let t_spec = spec_from_dense_for_test("time_transform", mk(&lin), 200);
+        let thr_spec = spec_from_dense_for_test("threshold", mk(&quad), 150);
+        let ls_spec = spec_from_dense_for_test("log_sigma", mk(&cube), 120);
+
+        let specs = [t_spec, thr_spec, ls_spec];
+        let canon = canonicalize_for_identifiability(&specs)
+            .expect("distinct gauge priorities must resolve the aliased joint (issue #366)");
+        assert!(
+            !canon.audit.fatal,
+            "joint audit must be non-fatal once the three blocks carry distinct \
+             descending gauge priorities; summary: {}",
+            canon.audit.summary,
+        );
+        // Raw p_total = 2+2+2 = 6; two aliased constants are dropped, so the
+        // resolved joint rank is 4.
+        let total_kept: usize = canon.audit.blocks.iter().map(|b| b.effective_dim).sum();
+        assert_eq!(
+            total_kept, 4,
+            "expected joint rank 6 − 2 = 4 after gauge-attributed drops; got {total_kept}",
+        );
+    }
+
+    fn spec_from_dense_for_test(
+        name: &str,
+        design: DesignMatrix,
+        gauge_priority: u8,
+    ) -> ParameterBlockSpec {
+        let n = design.nrows();
+        ParameterBlockSpec {
+            name: name.to_string(),
+            design,
+            offset: Array1::zeros(n),
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: None,
+            gauge_priority,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        }
+    }
+
+    #[test]
     fn identified_time_block_degenerate_entry_preserves_full_dimension() {
         let design_entry = array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
         let design_exit = array![[0.1, 0.5, 0.9], [0.2, 0.6, 1.0], [0.3, 0.7, 1.0]];
