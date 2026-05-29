@@ -119,7 +119,8 @@ jobs:
           set -uo pipefail
           mapfile -t files < <(ls tests/quality_vs_*.rs 2>/dev/null | xargs -n1 basename | sed 's/\.rs$//')
           pass=0; fail=0; cerr=0
-          declare -a fail_list cerr_list
+          fail_list=()
+          cerr_list=()
           for t in "${files[@]}"; do
             echo "::group::run $t"
             if ! cargo test --test "$t" --no-run >/dev/null 2>&1; then
@@ -142,10 +143,15 @@ jobs:
             echo "| diverged (assertion fail) | $fail |"
             echo "| compile error | $cerr |"
             echo ""
-            if [ "${#fail_list[@]}" -gt 0 ]; then
+            # Gate on the integer counters, not on ${#arr[@]}: GHA's default
+            # `bash -eo pipefail` plus this script's `set -u` makes accessing
+            # ${#empty_array[@]} fire "unbound variable", which `-e` then turns
+            # into an abort — the intended `exit 0` below never runs, the job
+            # goes red, and the compile-error section is silently dropped.
+            if [ "$fail" -gt 0 ]; then
               echo "### Diverged from reference"; printf '%s\n' "${fail_list[@]/#/- }"; echo ""
             fi
-            if [ "${#cerr_list[@]}" -gt 0 ]; then
+            if [ "$cerr" -gt 0 ]; then
               echo "### Compile errors (test breakage to fix)"; printf '%s\n' "${cerr_list[@]/#/- }"; echo ""
             fi
           } >> "$GITHUB_STEP_SUMMARY"
