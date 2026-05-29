@@ -1329,6 +1329,83 @@ mod tests {
         );
     }
 
+    /// Regression for #372: an anchor block that internally sheds an aliased
+    /// column makes the residualised kept-anchor width (`anchor_h.ncols()`)
+    /// strictly smaller than the raw anchor width (`d_total`). The emitted
+    /// `anchor_correction` must be expressed in *raw* anchor-column
+    /// coordinates so the predict-time / install-time subtraction
+    /// `A_raw(x)·M` is dimensionally and metrically correct. Previously the
+    /// correction was indexed by kept directions, producing a (d_total−1)×k
+    /// matrix and the failure
+    /// `anchor_correction shape 36x6 does not match d_total=37`.
+    #[test]
+    fn compile_emits_anchor_correction_in_raw_column_coordinates() {
+        let n = 64;
+        // Anchor block A has 3 raw columns but only rank 2: col 2 is an exact
+        // linear combination of cols 0 and 1, so the compiler keeps just two
+        // anchor directions (kept width 2 < raw width 3).
+        let a: Array2<f64> = Array2::from_shape_fn((n, 3), |(i, j)| {
+            let c0 = (i as f64 * 0.07 + 1.0).ln();
+            let c1 = (i as f64 * 0.13).sin();
+            match j {
+                0 => c0,
+                1 => c1,
+                _ => 2.0 * c0 - 0.5 * c1,
+            }
+        });
+        // Candidate block C: partly aliases A's span plus genuine signal.
+        let c: Array2<f64> = Array2::from_shape_fn((n, 2), |(i, j)| {
+            0.4 * a[[i, 0]] + (j as f64) * (i as f64 * 0.05).cos() + (i as f64 * 0.011).tanh()
+        });
+        let w = Array1::from_shape_fn(n, |i| 0.3 + (i as f64 * 0.17).sin().abs());
+        let hess = DiagonalScalarRowHessian::new(w.clone());
+        let ops = vec![op(a.clone()), op(c.clone())];
+        let compiled = compile(&ops, &hess, &[BlockOrder::Marginal, BlockOrder::LinkDev])
+            .expect("compile should succeed");
+
+        let v = &compiled.blocks[1].t_lw;
+        let m = compiled.blocks[1]
+            .anchor_correction
+            .as_ref()
+            .expect("candidate block must carry an anchor correction");
+        let k_kept = v.ncols();
+        assert!(k_kept >= 1, "candidate must keep at least one direction");
+
+        // The off-by-one the issue tripped on: M must have one row per *raw*
+        // anchor column (3), not per kept anchor direction (2).
+        assert_eq!(
+            m.nrows(),
+            a.ncols(),
+            "anchor_correction must be indexed by raw anchor columns (d_total), \
+             got {} rows for {} raw anchor columns",
+            m.nrows(),
+            a.ncols(),
+        );
+        assert_eq!(m.ncols(), k_kept, "anchor_correction width must match V");
+
+        // Metric correctness: the raw-coordinate subtraction A_raw·M must make
+        // the compiled candidate design W-orthogonal to the full raw anchor
+        // span. C̃ = C·V − A·M; require Aᵀ W C̃ ≈ 0 column-wise.
+        let c_v = c.dot(v);
+        let a_m = a.dot(m);
+        let c_tilde = &c_v - &a_m;
+        let mut max_cross = 0.0_f64;
+        for ac in 0..a.ncols() {
+            for cc in 0..c_tilde.ncols() {
+                let mut acc = 0.0;
+                for i in 0..n {
+                    acc += w[i] * a[[i, ac]] * c_tilde[[i, cc]];
+                }
+                max_cross = max_cross.max(acc.abs());
+            }
+        }
+        assert!(
+            max_cross < 1e-9,
+            "raw-coordinate anchor correction must W-orthogonalise the candidate \
+             against the raw anchor span; max |Aᵀ W C̃| = {max_cross:e}"
+        );
+    }
+
     /// §10 test #4: deliberately rank-deficient joint design. The trailing
     /// pivot drop must come from the *latest* block in the ordering.
     #[test]
