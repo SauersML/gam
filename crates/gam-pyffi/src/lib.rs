@@ -83,10 +83,9 @@ use gam::terms::basis::{
     create_cyclic_difference_penalty_matrix, create_difference_penalty_matrix,
     duchon_nullspace_dimension, duchon_polynomial_first_derivative_nd,
     duchon_radial_first_derivative_nd, duchon_radial_second_derivative_nd,
-    evaluate_bspline_basis_scalar,
-    matern_radial_first_derivative_nd, matern_radial_second_derivative_nd, monomial_exponents,
-    periodic_bspline_first_derivative_nd, resolve_duchon_orders,
-    select_spherical_farthest_point_centers, sphere_first_derivative_nd,
+    evaluate_bspline_basis_scalar, matern_radial_first_derivative_nd,
+    matern_radial_second_derivative_nd, monomial_exponents, periodic_bspline_first_derivative_nd,
+    resolve_duchon_orders, select_spherical_farthest_point_centers, sphere_first_derivative_nd,
 };
 use gam::terms::input_loc_derivatives::contract_input_loc_gradient;
 use gam::terms::interchange_decoder::{
@@ -9282,9 +9281,10 @@ fn build_sae_basis_evaluators(
                     sae_duchon_atom_m(centers.ncols()),
                 )?)
             }
-            SaeAtomBasisKind::EuclideanPatch => {
-                Arc::new(EuclideanPatchEvaluator::new(d, SAE_EUCLIDEAN_PATCH_MAX_DEGREE)?)
-            }
+            SaeAtomBasisKind::EuclideanPatch => Arc::new(EuclideanPatchEvaluator::new(
+                d,
+                SAE_EUCLIDEAN_PATCH_MAX_DEGREE,
+            )?),
             SaeAtomBasisKind::Precomputed(label) => {
                 return Err(format!(
                     "build_sae_basis_evaluators: atom {k} basis {label:?} is precomputed and has no \
@@ -9656,9 +9656,14 @@ fn sae_manifold_fit_inner<'py>(
             atom_centers.len()
         )));
     }
-    let evaluators =
-        build_sae_basis_evaluators(&basis_kinds, &basis_sizes, &atom_dim, &coord_blocks, atom_centers)
-            .map_err(py_value_error)?;
+    let evaluators = build_sae_basis_evaluators(
+        &basis_kinds,
+        &basis_sizes,
+        &atom_dim,
+        &coord_blocks,
+        atom_centers,
+    )
+    .map_err(py_value_error)?;
     let mut base_term = term_from_padded_blocks_with_mode(
         n_obs,
         p_out,
@@ -9710,23 +9715,23 @@ fn sae_manifold_fit_inner<'py>(
             // `(logits, coords, basis)` are recomputed on demand and discarded.
             let basis_kinds_chunk = basis_kinds.clone();
             let atom_dim_chunk = atom_dim.clone();
-            let chunk_init = |start: usize, end: usize| -> Result<
-                (Array2<f64>, Vec<Array2<f64>>, Array2<f64>),
-                String,
-            > {
-                let z_chunk = z_view.slice(s![start..end, ..]).to_owned();
-                let logits_chunk = initial_logits.slice(s![start..end, ..]).to_owned();
-                let seed = sae_pca_seed_initial_coords(
-                    z_chunk.view(),
-                    &basis_kinds_chunk,
-                    &atom_dim_chunk,
-                )?;
-                let mut coords = Vec::with_capacity(atom_dim_chunk.len());
-                for (atom_idx, &d) in atom_dim_chunk.iter().enumerate() {
-                    coords.push(seed.slice(s![atom_idx, .., 0..d]).to_owned());
-                }
-                Ok((logits_chunk, coords, z_chunk))
-            };
+            let chunk_init =
+                |start: usize,
+                 end: usize|
+                 -> Result<(Array2<f64>, Vec<Array2<f64>>, Array2<f64>), String> {
+                    let z_chunk = z_view.slice(s![start..end, ..]).to_owned();
+                    let logits_chunk = initial_logits.slice(s![start..end, ..]).to_owned();
+                    let seed = sae_pca_seed_initial_coords(
+                        z_chunk.view(),
+                        &basis_kinds_chunk,
+                        &atom_dim_chunk,
+                    )?;
+                    let mut coords = Vec::with_capacity(atom_dim_chunk.len());
+                    for (atom_idx, &d) in atom_dim_chunk.iter().enumerate() {
+                        coords.push(seed.slice(s![atom_idx, .., 0..d]).to_owned());
+                    }
+                    Ok((logits_chunk, coords, z_chunk))
+                };
             candidate_term
                 .run_joint_fit_arrow_schur_streaming(
                     n_obs,
@@ -11114,8 +11119,7 @@ fn sae_build_atom_plans(
                 // above by `n_obs` and the dense cap. The Euclidean patch
                 // ignores centers, so this lower bound is harmless there.
                 let duchon_m = sae_duchon_atom_m(d);
-                let poly_nullspace_dim =
-                    duchon_nullspace_dimension(d, duchon_m.saturating_sub(1));
+                let poly_nullspace_dim = duchon_nullspace_dimension(d, duchon_m.saturating_sub(1));
                 let center_floor = (poly_nullspace_dim + d + 1).max(8);
                 let center_ceiling = center_floor.max(32);
                 let lo = center_floor.min(n_obs);
@@ -11306,7 +11310,8 @@ fn sae_manifold_fit_minimal<'py>(
         None => seed_coords.clone(),
     };
     let (basis_values, basis_jacobian, smooth_penalties, basis_sizes, _coord_blocks) =
-        sae_build_padded_basis_stacks(&plans, start_coords.view(), n_obs).map_err(py_value_error)?;
+        sae_build_padded_basis_stacks(&plans, start_coords.view(), n_obs)
+            .map_err(py_value_error)?;
     // JumpReLU gates strictly on `logit > threshold` (threshold = 0.0 in the
     // production inner driver). Zero-initialised logits would leave every
     // gate closed at step 0, making the data-fit Jacobian, the sparsity
@@ -11391,8 +11396,10 @@ fn sae_manifold_fit_minimal<'py>(
     // Thread the per-atom Duchon centers into the inner driver so its
     // `DuchonCoordinateEvaluator` can re-evaluate `Phi(t)` / `dPhi/dt` at each
     // updated latent coordinate instead of freezing the seed snapshot.
-    let atom_centers: Vec<Option<Array2<f64>>> =
-        plans.iter().map(|plan| plan.duchon_centers.clone()).collect();
+    let atom_centers: Vec<Option<Array2<f64>>> = plans
+        .iter()
+        .map(|plan| plan.duchon_centers.clone())
+        .collect();
     let result_dict = sae_manifold_fit_inner(
         py,
         z_view,
@@ -11654,7 +11661,8 @@ fn sae_manifold_predict_oos<'py>(
         None => seed_coords.clone(),
     };
     let (basis_values, basis_jacobian, smooth_penalties, basis_sizes, _coord_blocks) =
-        sae_build_padded_basis_stacks(&plans, start_coords.view(), n_obs).map_err(py_value_error)?;
+        sae_build_padded_basis_stacks(&plans, start_coords.view(), n_obs)
+            .map_err(py_value_error)?;
     let m_max = basis_sizes.iter().copied().max().unwrap_or(1).max(1);
     // Pad trained decoder blocks into (K, M_max, p)
     let mut decoder_coefficients = Array3::<f64>::zeros((k_atoms, m_max, p_out));
@@ -11712,8 +11720,10 @@ fn sae_manifold_predict_oos<'py>(
     };
     // Mirror the fit path: re-evaluate each Duchon atom's basis at the OOS
     // coordinates the Newton loop produces, using the trained centers.
-    let atom_centers: Vec<Option<Array2<f64>>> =
-        plans.iter().map(|plan| plan.duchon_centers.clone()).collect();
+    let atom_centers: Vec<Option<Array2<f64>>> = plans
+        .iter()
+        .map(|plan| plan.duchon_centers.clone())
+        .collect();
     // Return the full inner payload (issue #357): converged `assignments_z`,
     // per-atom `on_atom_coords_t`, `logits`, and `fitted`. The supervised head
     // reads OOS assignments; the amortized encoder reads converged coords.
@@ -23093,9 +23103,7 @@ fn term_builder_error_to_pyerr(err: gam::terms::term_builder::TermBuilderError) 
     TermBuilderError::new_err(err.to_string())
 }
 
-fn corrected_covariance_error_to_pyerr(
-    err: gam::solver::CorrectedCovarianceError,
-) -> PyErr {
+fn corrected_covariance_error_to_pyerr(err: gam::solver::CorrectedCovarianceError) -> PyErr {
     CorrectedCovarianceError::new_err(err.to_string())
 }
 
@@ -27580,7 +27588,9 @@ fn jumprelu_gate_value_grad<'py>(
 fn gumbel_schedule_tau(schedule: &Bound<'_, PyDict>, iter: usize) -> PyResult<f64> {
     let parsed = gumbel_temperature_schedule_from_pydict(Some(schedule))
         .map_err(py_value_error)?
-        .ok_or_else(|| py_value_error("gumbel_schedule_tau requires a schedule descriptor".to_string()))?;
+        .ok_or_else(|| {
+            py_value_error("gumbel_schedule_tau requires a schedule descriptor".to_string())
+        })?;
     Ok(parsed.current_tau(iter))
 }
 
@@ -27617,11 +27627,8 @@ fn sae_ibp_map_value_grad<'py>(
             )));
         }
     }
-    let (value, grad) = gam::terms::sae_manifold::ibp_map_row_value_grad(
-        logits_view.view(),
-        temperature,
-        alpha,
-    );
+    let (value, grad) =
+        gam::terms::sae_manifold::ibp_map_row_value_grad(logits_view.view(), temperature, alpha);
     Ok((
         value.into_pyarray(py).unbind(),
         grad.into_pyarray(py).unbind(),

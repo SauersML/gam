@@ -4313,10 +4313,9 @@ impl PenaltyCoordinate {
         );
         match self {
             Self::DenseRoot(root) => Self::DenseRoot(root.dot(z)),
-            Self::DenseRootCentered { root, prior_mean } => Self::from_dense_root_with_mean(
-                root.dot(z),
-                z.t().dot(prior_mean),
-            ),
+            Self::DenseRootCentered { root, prior_mean } => {
+                Self::from_dense_root_with_mean(root.dot(z), z.t().dot(prior_mean))
+            }
             Self::BlockRoot {
                 root, start, end, ..
             } => {
@@ -4335,7 +4334,10 @@ impl PenaltyCoordinate {
                 // `β[start..end]`; lift it into the full coordinate before
                 // projecting so the free-space mean is `zᵀ (E_block μ_k)`.
                 let z_block_owned = z_block.to_owned();
-                Self::from_dense_root_with_mean(root.dot(&z_block_owned), z_block_owned.t().dot(prior_mean))
+                Self::from_dense_root_with_mean(
+                    root.dot(&z_block_owned),
+                    z_block_owned.t().dot(prior_mean),
+                )
             }
             Self::KroneckerMarginal { .. } => reml_contract_panic(
                 "PenaltyCoordinate::project_into_subspace: Kronecker-factored \

@@ -37,7 +37,7 @@ use crate::terms::basis::{
     OneDimensionalBoundary, SphereMethod, SphericalSplineBasisSpec, ThinPlateBasisSpec,
 };
 use crate::terms::smooth::{
-    parse_shape_constraint, SmoothBasisSpec, SmoothTermSpec, TensorBSplineSpec, TermCollectionSpec,
+    SmoothBasisSpec, SmoothTermSpec, TensorBSplineSpec, TermCollectionSpec, parse_shape_constraint,
 };
 
 /// Apply the Python-side `smooths={...}` registry to a built term collection.
@@ -190,11 +190,10 @@ fn apply_one_override(
     // keys off `SmoothTermSpec.shape`. A basis-incompatible request fails
     // loudly downstream via `shape_supports_basis`.
     if let Some(shape_val) = descriptor.get("shape_constraint") {
-        let raw = shape_val.as_str().ok_or_else(|| {
-            format!("smooths[{symbol:?}].shape_constraint must be a string")
-        })?;
-        term.shape =
-            parse_shape_constraint(raw).map_err(|e| format!("smooths[{symbol:?}].{e}"))?;
+        let raw = shape_val
+            .as_str()
+            .ok_or_else(|| format!("smooths[{symbol:?}].shape_constraint must be a string"))?;
+        term.shape = parse_shape_constraint(raw).map_err(|e| format!("smooths[{symbol:?}].{e}"))?;
     }
 
     apply_kind_specific(&mut term.basis, kind, descriptor, symbol)?;
@@ -315,7 +314,11 @@ fn apply_duchon(
     // (`deny_unknown_fields`, locked by
     // `test_duchon_basis_spec_rejects_removed_double_penalty_field`). Python
     // only emits the key when `True`, so reject it loudly rather than drop it.
-    if descriptor.get("double_penalty").and_then(JsonValue::as_bool) == Some(true) {
+    if descriptor
+        .get("double_penalty")
+        .and_then(JsonValue::as_bool)
+        == Some(true)
+    {
         return Err(format!(
             "smooths[{symbol:?}]: double_penalty is not supported on Duchon smooths; the \
              Duchon function-norm penalty already spans the polynomial null space"
@@ -878,7 +881,9 @@ mod tests {
     use serde_json::json;
 
     fn obj(v: serde_json::Value) -> serde_json::Map<String, JsonValue> {
-        v.as_object().expect("test descriptor must be a JSON object").clone()
+        v.as_object()
+            .expect("test descriptor must be a JSON object")
+            .clone()
     }
 
     fn open_bspline_spec() -> BSplineBasisSpec {
@@ -1028,7 +1033,8 @@ mod tests {
     #[test]
     fn periodic_true_rejects_provided_and_automatic_knots() {
         let mut provided = open_bspline_spec();
-        provided.knotspec = BSplineKnotSpec::Provided(Array1::from(vec![0.0, 0.25, 0.5, 0.75, 1.0]));
+        provided.knotspec =
+            BSplineKnotSpec::Provided(Array1::from(vec![0.0, 0.25, 0.5, 0.75, 1.0]));
         let err = apply_bspline_1d(&mut provided, &obj(json!({"periodic": true})), "x")
             .expect_err("periodic against explicit knots must error");
         assert!(err.contains("ambiguous"), "got: {err}");
@@ -1076,7 +1082,10 @@ mod tests {
                 assert_eq!(basis_matrix.shape(), &[2, 3]);
                 assert!(!centered);
                 assert_eq!(smooth_penalty, 2.5);
-                assert!(pca_basis_path.is_none(), "explicit basis must clear lazy path");
+                assert!(
+                    pca_basis_path.is_none(),
+                    "explicit basis must clear lazy path"
+                );
                 assert_eq!(chunk_size, 1, "chunk_size 0 must clamp to 1");
             }
             other => panic!("expected Pca, got {other:?}"),
@@ -1114,7 +1123,10 @@ mod tests {
         };
         let err = apply_pca(&mut basis, &obj(json!({"kind": "pca", "K": 7})), "x")
             .expect_err("K must match built basis column count");
-        assert!(err.contains("must equal the number of basis columns"), "got: {err}");
+        assert!(
+            err.contains("must equal the number of basis columns"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -1142,11 +1154,8 @@ mod tests {
 
     #[test]
     fn categorical_tunables_error_but_name_only_passes() {
-        apply_categorical_reject(
-            &obj(json!({"kind": "categorical", "n_levels": 0})),
-            "g",
-        )
-        .expect("default tunables (name-only descriptor) must be accepted");
+        apply_categorical_reject(&obj(json!({"kind": "categorical", "n_levels": 0})), "g")
+            .expect("default tunables (name-only descriptor) must be accepted");
 
         let err = apply_categorical_reject(
             &obj(json!({"kind": "categorical", "levels": [0, 1, 2], "n_levels": 3})),

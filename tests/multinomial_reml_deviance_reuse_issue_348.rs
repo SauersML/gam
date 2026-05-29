@@ -22,7 +22,10 @@ use gam::{FitConfig, encode_recordswith_inferred_schema, init_parallelism};
 /// 3-class categorical response with one numeric feature that separates the
 /// classes along `x`, so the softmax fit converges to a non-degenerate optimum.
 fn categorical_dataset() -> (gam::data::EncodedDataset, Vec<String>) {
-    let headers = ["x", "y"].into_iter().map(str::to_string).collect::<Vec<_>>();
+    let headers = ["x", "y"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
     let mut labels = Vec::new();
     let rows = (0..30)
         .map(|i| {
@@ -39,7 +42,8 @@ fn categorical_dataset() -> (gam::data::EncodedDataset, Vec<String>) {
             StringRecord::from(vec![x.to_string(), label.to_string()])
         })
         .collect::<Vec<_>>();
-    let data = encode_recordswith_inferred_schema(headers, rows).expect("encode categorical dataset");
+    let data =
+        encode_recordswith_inferred_schema(headers, rows).expect("encode categorical dataset");
     (data, labels)
 }
 
@@ -49,15 +53,9 @@ fn multinomial_formula_deviance_equals_independent_softmax_recompute() {
     let (data, labels) = categorical_dataset();
 
     // Same entry point + tuning the Python FFI uses (fit_multinomial_formula_pyfunc).
-    let model = fit_penalized_multinomial_formula(
-        &data,
-        "y ~ x",
-        &FitConfig::default(),
-        1.0,
-        50,
-        1.0e-7,
-    )
-    .expect("multinomial formula fit must succeed");
+    let model =
+        fit_penalized_multinomial_formula(&data, "y ~ x", &FitConfig::default(), 1.0, 50, 1.0e-7)
+            .expect("multinomial formula fit must succeed");
 
     // Independently recompute the unpenalized deviance from the fitted softmax
     // probabilities on the training rows — exactly the quantity the deleted
@@ -74,7 +72,10 @@ fn multinomial_formula_deviance_equals_independent_softmax_recompute() {
             .position(|lvl| lvl == label)
             .expect("training label must be one of the fitted class levels");
         let p = probs[[i, class_idx]];
-        assert!(p.is_finite() && p > 0.0, "softmax prob p[{i}] must be finite & positive (got {p})");
+        assert!(
+            p.is_finite() && p > 0.0,
+            "softmax prob p[{i}] must be finite & positive (got {p})"
+        );
         recomputed_deviance += p.ln();
     }
     recomputed_deviance *= -2.0;

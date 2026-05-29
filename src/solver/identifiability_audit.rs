@@ -1910,10 +1910,7 @@ pub(crate) fn rank_of_gram(gram: &Array2<f64>, n_total: usize) -> Result<usize, 
     let (evals, _evecs) = gram
         .eigh(Side::Lower)
         .map_err(EstimationError::EigendecompositionFailed)?;
-    let mut singular: Vec<f64> = evals
-        .iter()
-        .map(|&lambda| lambda.max(0.0).sqrt())
-        .collect();
+    let mut singular: Vec<f64> = evals.iter().map(|&lambda| lambda.max(0.0).sqrt()).collect();
     singular.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
     Ok(count_rank(&singular, n_total, p))
 }

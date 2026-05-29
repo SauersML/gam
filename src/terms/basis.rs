@@ -21449,11 +21449,14 @@ pub fn duchon_sae_atom_second_jet(
     }
 
     // Polynomial Hessian block.
-    let exponents = monomial_exponents(dim, match effective_order {
-        DuchonNullspaceOrder::Zero => 0,
-        DuchonNullspaceOrder::Linear => 1,
-        DuchonNullspaceOrder::Degree(k) => k,
-    });
+    let exponents = monomial_exponents(
+        dim,
+        match effective_order {
+            DuchonNullspaceOrder::Zero => 0,
+            DuchonNullspaceOrder::Linear => 1,
+            DuchonNullspaceOrder::Degree(k) => k,
+        },
+    );
     if exponents.len() != poly_block_t_cols {
         crate::bail_dim_basis!(
             "duchon_sae_atom_second_jet: monomial count {} != polynomial block columns {poly_block_t_cols}",
@@ -21469,7 +21472,11 @@ pub fn duchon_sae_atom_second_jet(
                     if coeff_a == 0 {
                         continue;
                     }
-                    let coeff_c = if a == c { alpha[c].saturating_sub(1) } else { alpha[c] };
+                    let coeff_c = if a == c {
+                        alpha[c].saturating_sub(1)
+                    } else {
+                        alpha[c]
+                    };
                     if a != c && coeff_c == 0 {
                         continue;
                     }

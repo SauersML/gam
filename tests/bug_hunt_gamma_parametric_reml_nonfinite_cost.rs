@@ -50,7 +50,10 @@ fn build_data() -> gam::data::EncodedDataset {
         .collect();
 
     for &yi in &y {
-        assert!(yi.is_finite() && yi > 0.0, "constructed y must be positive finite");
+        assert!(
+            yi.is_finite() && yi > 0.0,
+            "constructed y must be positive finite"
+        );
     }
 
     let headers = ["x", "y"].into_iter().map(String::from).collect();

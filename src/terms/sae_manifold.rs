@@ -2133,7 +2133,9 @@ impl SaeManifoldTerm {
         let p = self.output_dim();
         let m_total: usize = self.atoms.iter().map(|a| a.basis_size()).sum();
         // Dense data Gram footprint: (m_total · m_total) f64.
-        let dense_gram_bytes = m_total.saturating_mul(m_total).saturating_mul(BYTES_PER_F64);
+        let dense_gram_bytes = m_total
+            .saturating_mul(m_total)
+            .saturating_mul(BYTES_PER_F64);
 
         let budget = match crate::gpu::runtime::GpuRuntime::global() {
             // Allow up to one quarter of the device budget for the dense Gram,
@@ -3243,13 +3245,7 @@ impl SaeManifoldTerm {
                 PenaltyTier::Beta => {
                     // β-tier analytic penalties are global (B-only); minibatch-
                     // scaled so per-chunk sums reconstruct one global copy.
-                    self.add_sae_beta_penalty(
-                        sys,
-                        penalty,
-                        beta.view(),
-                        rho_local,
-                        penalty_scale,
-                    );
+                    self.add_sae_beta_penalty(sys, penalty, beta.view(), rho_local, penalty_scale);
                     beta_penalty_written = true;
                 }
                 PenaltyTier::Rho => {}
@@ -3717,8 +3713,7 @@ impl SaeManifoldTerm {
             for &v in delta_beta.iter() {
                 step_norm_sq += v * v;
             }
-            let directional_decrease_floor =
-                1.0e-14 * grad_norm_sq.sqrt() * step_norm_sq.sqrt();
+            let directional_decrease_floor = 1.0e-14 * grad_norm_sq.sqrt() * step_norm_sq.sqrt();
             // Snapshot only the state that `apply_newton_step` + `loss`
             // perturb (decoder coefficients, basis evaluations, assignment
             // logits/coords) once before the line search. Each rejected trial
@@ -3840,14 +3835,15 @@ impl SaeManifoldTerm {
             if m == 0 {
                 continue;
             }
-            let rank = crate::solver::identifiability_audit::rank_of_gram(&grams[atom_idx], n_total)
-                .map_err(|e| {
-                    format!(
-                        "SaeManifoldTerm: pre-fit decoder audit (atom '{}'): \
+            let rank =
+                crate::solver::identifiability_audit::rank_of_gram(&grams[atom_idx], n_total)
+                    .map_err(|e| {
+                        format!(
+                            "SaeManifoldTerm: pre-fit decoder audit (atom '{}'): \
                          Gram eigendecomposition failed: {e}",
-                        atom.name,
-                    )
-                })?;
+                            atom.name,
+                        )
+                    })?;
             if rank < m {
                 let dropped = m - rank;
                 if rank == 0 {
@@ -3967,7 +3963,8 @@ impl SaeManifoldTerm {
                 )
             })
             .collect();
-        let assignment = SaeAssignment::with_mode(chunk_logits, coord_values, self.assignment.mode)?;
+        let assignment =
+            SaeAssignment::with_mode(chunk_logits, coord_values, self.assignment.mode)?;
         let mut term = SaeManifoldTerm::new(atoms, assignment)?;
         // The temperature schedule is global outer state; the chunk term is
         // assembled at the schedule's current temperature, which the caller
@@ -4024,10 +4021,16 @@ impl SaeManifoldTerm {
             ));
         }
         if chunk_size == 0 {
-            return Err("SaeManifoldTerm::run_joint_fit_arrow_schur_streaming: chunk_size must be positive".to_string());
+            return Err(
+                "SaeManifoldTerm::run_joint_fit_arrow_schur_streaming: chunk_size must be positive"
+                    .to_string(),
+            );
         }
         if n_total == 0 {
-            return Err("SaeManifoldTerm::run_joint_fit_arrow_schur_streaming: n_total must be positive".to_string());
+            return Err(
+                "SaeManifoldTerm::run_joint_fit_arrow_schur_streaming: n_total must be positive"
+                    .to_string(),
+            );
         }
         let beta_dim = self.beta_dim();
 
@@ -4102,7 +4105,12 @@ impl SaeManifoldTerm {
                     .loss_scaled(z_chunk.view(), rho, penalty_scale)?
                     .total();
                 let sys = chunk
-                    .assemble_arrow_schur_scaled(z_chunk.view(), rho, analytic_penalties, penalty_scale)
+                    .assemble_arrow_schur_scaled(
+                        z_chunk.view(),
+                        rho,
+                        analytic_penalties,
+                        penalty_scale,
+                    )
                     .map_err(|err| {
                         format!("SaeManifoldTerm::run_joint_fit_arrow_schur_streaming: {err}")
                     })?;
@@ -4132,8 +4140,8 @@ impl SaeManifoldTerm {
                 rhs_acc[j] -= gb_acc[j];
             }
             // ── Solve the global reduced β system with LM ridge escalation. ──
-            let delta_beta = solve_streaming_reduced_beta(&s_acc, &rhs_acc, &options)
-                .map_err(|err| {
+            let delta_beta =
+                solve_streaming_reduced_beta(&s_acc, &rhs_acc, &options).map_err(|err| {
                     format!("SaeManifoldTerm::run_joint_fit_arrow_schur_streaming: {err}")
                 })?;
             // ── Streaming Armijo line search on Δβ. ──
@@ -4164,7 +4172,8 @@ impl SaeManifoldTerm {
                     trial_beta[j] += trial_step * delta_beta[j];
                 }
                 self.set_flat_beta(trial_beta.view())?;
-                let trial_loss = self.streaming_loss(&chunk_ranges, rho, n_total, &mut chunk_init)?;
+                let trial_loss =
+                    self.streaming_loss(&chunk_ranges, rho, n_total, &mut chunk_init)?;
                 let trial_total = trial_loss.total();
                 let armijo_bound =
                     pre_step_total - SAE_MANIFOLD_ARMIJO_C1 * trial_step * directional_decrease;
@@ -4183,7 +4192,8 @@ impl SaeManifoldTerm {
                     // Restore the pre-step β and refresh ARD before stopping.
                     self.set_flat_beta(beta0.view())?;
                     self.update_ard_reml_from_sumsq(rho, &ard_sumsq, n_total);
-                    last_loss = self.streaming_loss(&chunk_ranges, rho, n_total, &mut chunk_init)?;
+                    last_loss =
+                        self.streaming_loss(&chunk_ranges, rho, n_total, &mut chunk_init)?;
                     break;
                 }
             }
@@ -4216,7 +4226,9 @@ impl SaeManifoldTerm {
         // (`hbb_chunk`, including the data-fit GN block and the minibatch-scaled
         // penalty) and no ridge; `accumulate_chunk` then subtracts the per-row
         // reduction. The global β ridge is applied once by the streaming driver.
-        streaming.reset_accumulator(0.0).map_err(|e| e.to_string())?;
+        streaming
+            .reset_accumulator(0.0)
+            .map_err(|e| e.to_string())?;
         streaming
             .accumulate_chunk(0, chunk_n, ridge_ext_coord, options.mode)
             .map_err(|e| e.to_string())?;
@@ -4365,7 +4377,6 @@ impl SaeManifoldTerm {
         }
         (assignment, ard)
     }
-
 }
 
 fn sae_manifold_newton_directional_decrease(
@@ -4521,8 +4532,8 @@ fn fill_active_atom_logit_jvp(
             // z_k = σ(l_k/τ)·π_k ⇒ dz_k/dl_k = a_k(π_k − a_k)/(π_k τ) · π_k form
             // (matches `fill_assignment_logit_jvp_rows`).
             let inv_tau = 1.0 / temperature;
-            let prior = ibp_prior
-                .expect("fill_active_atom_logit_jvp: IBPMap requires precomputed prior");
+            let prior =
+                ibp_prior.expect("fill_active_atom_logit_jvp: IBPMap requires precomputed prior");
             let pi_k = prior[k];
             let sig = if pi_k > 0.0 { a_k / pi_k } else { 0.0 };
             let dz = sig * (1.0 - sig) * inv_tau * pi_k;
@@ -5391,13 +5402,8 @@ mod tests {
             // single largest-magnitude atom {1}.
             Array1::from_vec(vec![0.001, 0.002, 0.0005]),
         ];
-        let layout = SaeRowLayout::from_dense_weights(
-            &assignments,
-            2,
-            0.05,
-            coord_dims,
-            coord_offsets_full,
-        );
+        let layout =
+            SaeRowLayout::from_dense_weights(&assignments, 2, 0.05, coord_dims, coord_offsets_full);
         assert_eq!(layout.active_atoms[0], vec![0, 2]);
         assert_eq!(layout.active_atoms[1], vec![1]);
         // Row 0 compact dim = |{0,2}| + d_0 + d_2 = 2 + 2 + 2 = 6.
@@ -5728,10 +5734,7 @@ mod tests {
     #[test]
     fn duchon_coordinate_evaluator_phi_and_jet_share_column_count() {
         for (d, centers) in [
-            (
-                1usize,
-                array![[-1.0], [-0.4], [0.1], [0.6], [1.2], [1.9]],
-            ),
+            (1usize, array![[-1.0], [-0.4], [0.1], [0.6], [1.2], [1.9]]),
             (
                 2usize,
                 array![

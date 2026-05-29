@@ -931,9 +931,9 @@ impl<'a> RemlState<'a> {
                         x_tau_tau: x_tau_tau[i][j].clone(),
                         x_design: std::sync::Arc::clone(&x_design),
                         basis: basis.clone(),
-                        w_diag: crate::matrix::SignedWeightsArc::from_arc(
-                            std::sync::Arc::clone(&w_diag),
-                        ),
+                        w_diag: crate::matrix::SignedWeightsArc::from_arc(std::sync::Arc::clone(
+                            &w_diag,
+                        )),
                         c_x_tau_i_beta: (!is_gaussian_identity).then_some(c_x_tau_i_beta.clone()),
                         c_x_tau_j_beta,
                         d_cross,
@@ -1885,8 +1885,7 @@ impl<'a> RemlState<'a> {
 
         let u = &pirls_result.solveweights
             * &(&pirls_result.solveworking_response - &pirls_result.final_eta);
-        let w_diag =
-            crate::matrix::SignedWeightsArc::from_array(pirls_result.finalweights.clone());
+        let w_diag = crate::matrix::SignedWeightsArc::from_array(pirls_result.finalweights.clone());
         let x_design = self.x().clone();
 
         let is_gaussian_identity = matches!(self.config.link_function(), LinkFunction::Identity);

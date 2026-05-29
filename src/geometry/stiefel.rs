@@ -1,8 +1,8 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::geometry::manifold::{
-    GeometryError, GeometryResult, RiemannianManifold, check_len, dot, flatten, from_flat, identity,
-    qr_thin, sym, zero_christoffel,
+    GeometryError, GeometryResult, RiemannianManifold, check_len, dot, flatten, from_flat,
+    identity, qr_thin, sym, zero_christoffel,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

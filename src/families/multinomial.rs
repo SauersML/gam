@@ -284,9 +284,10 @@ pub fn fit_penalized_multinomial(
         // softmax Fisher block. The gradient/residual path below stays
         // analytic in both cases, matching the old override-replaces-Fisher
         // semantics.
-        let analytic_fisher = fisher_w_override
-            .as_ref()
-            .map_or_else(|| Some(likelihood.hess_block(eta.view(), y_one_hot)), |_| None);
+        let analytic_fisher = fisher_w_override.as_ref().map_or_else(
+            || Some(likelihood.hess_block(eta.view(), y_one_hot)),
+            |_| None,
+        );
         let fisher_blocks = match fisher_w_override.as_ref() {
             Some(fw) => *fw,
             None => analytic_fisher
@@ -819,13 +820,9 @@ pub fn fit_penalized_multinomial_formula(
         inner_tol: tol,
         ..BlockwiseFitOptions::default()
     };
-    let fit = fit_custom_family_with_rho_prior(
-        &family,
-        &blocks,
-        &options,
-        crate::types::RhoPrior::Flat,
-    )
-    .map_err(|err| EstimationError::InvalidInput(format!("multinomial REML: {err}")))?;
+    let fit =
+        fit_custom_family_with_rho_prior(&family, &blocks, &options, crate::types::RhoPrior::Flat)
+            .map_err(|err| EstimationError::InvalidInput(format!("multinomial REML: {err}")))?;
 
     // ── Repack coefficients (P, K-1) from per-block β vectors ─────────────
     if fit.blocks.len() != m {
@@ -852,10 +849,7 @@ pub fn fit_penalized_multinomial_formula(
         .iter()
         .map(|b| b.lambdas.iter().copied().next().unwrap_or(init_lambda))
         .collect();
-    let edf_per_class = fit
-        .inference
-        .as_ref()
-        .map(|info| info.edf_by_block.clone());
+    let edf_per_class = fit.inference.as_ref().map(|info| info.edf_by_block.clone());
     let coefficients_flat: Vec<f64> = coefficients_active.iter().copied().collect();
 
     // Unpenalized deviance read directly from the converged unpenalized
@@ -921,9 +915,13 @@ mod fisher_override_tests {
         let n = 15;
         let p = 2;
         let k = 3;
-        let design = Array2::<f64>::from_shape_fn((n, p), |(i, j)| {
-            if j == 0 { 1.0 } else { ((i + 2) as f64).cos() }
-        });
+        let design =
+            Array2::<f64>::from_shape_fn(
+                (n, p),
+                |(i, j)| {
+                    if j == 0 { 1.0 } else { ((i + 2) as f64).cos() }
+                },
+            );
         let mut y = Array2::<f64>::zeros((n, k));
         for i in 0..n {
             y[[i, i % k]] = 1.0;
@@ -952,7 +950,11 @@ mod fisher_override_tests {
         };
         let a = mk(None);
         let b = mk(None);
-        for (x, z) in a.coefficients_active.iter().zip(b.coefficients_active.iter()) {
+        for (x, z) in a
+            .coefficients_active
+            .iter()
+            .zip(b.coefficients_active.iter())
+        {
             assert_eq!(x, z);
         }
     }
