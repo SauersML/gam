@@ -217,6 +217,13 @@ struct PyFitConfig {
     frailty_kind: Option<String>,
     frailty_sd: Option<f64>,
     hazard_loading: Option<String>,
+
+    // Python-only presentation provenance: the container type of the table the
+    // model was fitted on (`"pandas"`, `"polars"`, `"pyarrow"`, `"numpy"`, or
+    // an ambiguous tag like `"unknown"`). The Rust solver ignores it; it is
+    // copied verbatim into `FittedModelPayload.training_table_kind` so that the
+    // predict-time output-container fallback survives `save`/`load`.
+    training_table_kind: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -23490,6 +23497,7 @@ fn fit_dataset_impl(
     let mut progress = gam::visualizer::VisualizerSession::new(true);
     progress.set_stage("fit", "optimizing penalized likelihood");
     progress.start_workflow_open_ended("Fit");
+    let training_table_kind = fit_config_training_table_kind(config_json)?;
     let mut fit_config = parse_fit_config(config_json)?;
     if let Some(w) = fisher_rao_w {
         inject_scalar_fisher_rao_weight(&mut dataset, &mut fit_config, w)?;
@@ -23683,6 +23691,7 @@ fn fit_dataset_impl(
         }
     };
     payload.group_metadata = fit_config.group_metadata.clone();
+    payload.training_table_kind = training_table_kind;
     let model = FittedModel::from_payload(payload);
     serde_json::to_vec(&model).map_err(|err| gam::WorkflowError::IntegrationFailed {
         reason: format!("failed to serialize model: {err}"),
@@ -28368,6 +28377,30 @@ fn periodic_harmonic_basis_derivative<'py>(
         }
     }
     Ok(out.into_pyarray(py).unbind())
+}
+
+/// Extract the Python-only `training_table_kind` provenance tag from the fit
+/// config JSON, if present. This is intentionally separate from
+/// [`parse_fit_config`]: the value never enters the core solver
+/// [`gam::FitConfig`] (which carries math/solver state only) — it is persisted
+/// straight onto [`FittedModelPayload::training_table_kind`] so the predict-time
+/// output-container fallback survives `save`/`load`. A blank or absent config,
+/// or a config that omits the key, yields `None`. The key, when present, must be
+/// a JSON string.
+fn fit_config_training_table_kind(config_json: Option<&str>) -> Result<Option<String>, String> {
+    let raw = match config_json {
+        Some(raw) if !raw.trim().is_empty() => raw,
+        _ => return Ok(None),
+    };
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|err| format!("invalid fit config json: {err}"))?;
+    match value.get("training_table_kind") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(kind)) => Ok(Some(kind.clone())),
+        Some(other) => Err(format!(
+            "training_table_kind must be a JSON string, got {other}"
+        )),
+    }
 }
 
 fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
