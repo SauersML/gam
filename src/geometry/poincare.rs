@@ -58,6 +58,29 @@ pub const BOUNDARY_EPS: f64 = 1.0e-5;
 /// not a degeneracy — they are the well-defined identity case.
 pub const ORIGIN_EPS: f64 = 1.0e-15;
 
+/// Largest radial exp-map argument `s = sqrt(k)|v|` worth evaluating
+/// hyperbolic functions at. Above this, `tanh(s)` is already
+/// `1 - BOUNDARY_EPS` in f64 (and `cosh`/`sinh` would eventually overflow to
+/// `inf` near `s ≈ 710`), so the Lorentz lift caps `s` here to stay finite
+/// while landing on the same clamped boundary as the Poincaré path. Derived
+/// from [`BOUNDARY_EPS`] — no magic literal: `atanh(1 - BOUNDARY_EPS) ≈ 6.1`.
+const EXP_SATURATION_CAP: f64 = {
+    // `atanh` is not const-evaluable; the cap is fixed by BOUNDARY_EPS as
+    // `atanh(1 - BOUNDARY_EPS)` and is pinned by
+    // `exp_saturation_cap_matches_boundary_eps`.
+    6.1030338227611125
+};
+
+/// Poincaré exp radial coefficient `tanh(s)/s` with the open-ball boundary
+/// clamp baked in. Because `sqrt(k)|exp_0(v)| = tanh(s)`, clamping `tanh(s)`
+/// to `1 - BOUNDARY_EPS` makes the output norm exactly `max_norm`, i.e.
+/// strictly interior and consistent with [`project_into_ball`]. Callers must
+/// guard `s > ORIGIN_EPS` before calling (norms at/under the origin floor
+/// short-circuit to the identity), so no divide-by-zero is introduced.
+fn exp_coeff(s: f64) -> f64 {
+    (s.tanh().min(1.0 - BOUNDARY_EPS)) / s
+}
+
 fn require_negative_curvature(curvature: f64) -> GeometryResult<f64> {
     if !(curvature < 0.0) || !curvature.is_finite() {
         return Err(GeometryError::InvalidPoint(
@@ -202,7 +225,7 @@ pub fn exp_origin(v: ArrayView1<'_, f64>, curvature: f64) -> GeometryResult<Arra
         return Ok(out);
     }
     let s = sqrt_negc * norm;
-    let coeff = s.tanh() / s;
+    let coeff = exp_coeff(s);
     for x in out.iter_mut() {
         *x *= coeff;
     }
@@ -323,7 +346,7 @@ pub fn tangent_decode_forward(
             continue;
         }
         let s = sqrt_negc * nrm;
-        let coeff = s.tanh() / s;
+        let coeff = exp_coeff(s);
         for i in 0..d {
             x_hat[[b, i]] = coeff * v[[b, i]];
         }
@@ -543,7 +566,12 @@ pub fn from_lorentz(x: ArrayView1<'_, f64>, curvature: f64) -> GeometryResult<Ar
         let xs_scaled = x[i + 1] * sqrt_negc;
         out[i] = (xs_scaled / denom) / sqrt_negc;
     }
-    Ok(out)
+    // Symmetric with `to_lorentz`, which projects its input into the ball:
+    // enforce the open-ball invariant `sqrt(k)|out| <= 1 - BOUNDARY_EPS` here
+    // too. `tanh(s/2)` saturates to exactly 1.0 for large hyperboloid points,
+    // which would land `out` ON the ideal boundary; the projection nudges it
+    // strictly interior so every `from_lorentz` consumer is boundary-safe.
+    project_into_ball(out.view(), curvature)
 }
 
 /// Lorentz log at the origin `o = (1/sqrt(k), 0, ..., 0)`.
@@ -586,9 +614,22 @@ pub fn lorentz_exp_origin(
     let norm_sq: f64 = v_spatial.iter().map(|x| x * x).sum();
     let norm = norm_sq.sqrt().max(ORIGIN_EPS);
     let s = sqrt_negc * norm;
+    // Cap the argument fed to `cosh`/`sinh`. For `s` beyond ~710 these
+    // overflow to `inf`, giving an `inf/(inf+1) = NaN` ball point downstream;
+    // mathematically the hyperboloid point's spatial/temporal ratio is
+    // `tanh(s) -> 1`, so capping at `EXP_SATURATION_CAP` (where `tanh` already
+    // reads `1 - BOUNDARY_EPS` in f64) keeps the lift finite and lands on the
+    // same clamped boundary the Poincaré path produces. `from_lorentz` then
+    // projects strictly interior, so the composed decode never NaNs.
+    let s_eval = s.min(EXP_SATURATION_CAP);
     let mut out = Array1::<f64>::zeros(d + 1);
-    out[0] = s.cosh() / sqrt_negc;
-    let coeff = s.sinh() / s;
+    out[0] = s_eval.cosh() / sqrt_negc;
+    // Radial scaling stays in the original (uncapped) tangent direction: the
+    // spatial part is `(sinh(s_eval)/s) * v`, i.e. the capped hyperbolic
+    // magnitude distributed along `v`. `from_lorentz`'s ratio depends only on
+    // `cosh`/`sinh` of `s_eval`, so the cap and projection together fix the
+    // output norm at `max_norm` exactly as the Poincaré path does.
+    let coeff = s_eval.sinh() / s;
     for i in 0..d {
         out[i + 1] = coeff * v_spatial[i];
     }
@@ -1042,6 +1083,104 @@ mod tests {
             grad_atoms[[1, 0]],
             fd_atom
         );
+    }
+
+    #[test]
+    fn exp_saturation_cap_matches_boundary_eps() {
+        // The named cap must equal `atanh(1 - BOUNDARY_EPS)` so the Lorentz
+        // lift caps exactly where `tanh` first reads `1 - BOUNDARY_EPS` in f64.
+        let expected = (1.0 - BOUNDARY_EPS).atanh();
+        assert!(
+            (EXP_SATURATION_CAP - expected).abs() < 1.0e-12,
+            "cap {EXP_SATURATION_CAP} vs atanh(1-eps) {expected}"
+        );
+    }
+
+    #[test]
+    fn exp_origin_large_tangent_stays_strictly_interior() {
+        // Regression for #354: a large tangent must not saturate ONTO the ball
+        // boundary. `tanh(s)` rounds to exactly 1.0 for s ≳ 19, so the
+        // unclamped map would land |x| == 1; the clamp keeps it interior.
+        for curvature in [-1.0, -0.25, -4.0] {
+            let sqrt_negc = (-curvature).sqrt();
+            let max_norm = (1.0 - BOUNDARY_EPS) / sqrt_negc;
+            let v = array![1.0e3, -5.0e2, 2.0e2, 7.0e1];
+            let x = exp_origin(v.view(), curvature).expect("exp");
+            assert!(x.iter().all(|q| q.is_finite()), "exp must be finite: {x:?}");
+            let norm = x.iter().map(|q| q * q).sum::<f64>().sqrt();
+            assert!(
+                sqrt_negc * norm <= 1.0 - BOUNDARY_EPS + 1.0e-12,
+                "exp must stay strictly interior (curvature {curvature}): \
+                 sqrt(k)|x| = {}",
+                sqrt_negc * norm
+            );
+            assert!(
+                (norm - max_norm).abs() < 1.0e-9,
+                "saturated exp must sit at max_norm {max_norm}, got {norm}"
+            );
+            // log/distance must remain finite for the clamped point.
+            let origin = Array1::<f64>::zeros(x.len());
+            let dist = poincare_distance(origin.view(), x.view(), curvature).expect("dist");
+            assert!(dist.is_finite(), "distance must be finite, got {dist}");
+        }
+    }
+
+    #[test]
+    fn lorentz_exp_origin_large_tangent_is_finite_and_interior() {
+        // Companion regression for #354 on the Lorentz path: large tangents
+        // must not overflow cosh/sinh to inf (which becomes NaN downstream),
+        // and the round-tripped ball point must stay strictly interior.
+        for curvature in [-1.0, -0.25, -4.0] {
+            let sqrt_negc = (-curvature).sqrt();
+            // Spatial tangent with norm ~1e3 — far past both the tanh-1.0
+            // saturation (s ≳ 19) and the cosh/sinh overflow (s ≳ 710) regimes.
+            let v = array![1.0e3, -5.0e2, 2.0e2];
+            let x_h = lorentz_exp_origin(v.view(), curvature).expect("lorentz exp");
+            assert!(
+                x_h.iter().all(|q| q.is_finite()),
+                "lorentz hyperboloid point must be finite, got {x_h:?}"
+            );
+            let y = from_lorentz(x_h.view(), curvature).expect("from_lorentz");
+            assert!(
+                y.iter().all(|q| q.is_finite()),
+                "ball point must be finite, got {y:?}"
+            );
+            let norm = y.iter().map(|q| q * q).sum::<f64>().sqrt();
+            assert!(
+                sqrt_negc * norm <= 1.0 - BOUNDARY_EPS + 1.0e-12,
+                "lorentz decode must stay strictly interior (curvature \
+                 {curvature}): sqrt(k)|y| = {}",
+                sqrt_negc * norm
+            );
+        }
+    }
+
+    #[test]
+    fn decode_large_gates_stay_strictly_interior_both_paths() {
+        // End-to-end #354 repro analog: large gates drive a large aggregated
+        // tangent. Both the Poincaré and Lorentz decoders must return points
+        // strictly inside the ball (not on the boundary).
+        let atoms = array![
+            [0.3, 0.1, -0.2, 0.05, 0.0, 0.1],
+            [-0.1, 0.2, 0.05, -0.15, 0.1, 0.0],
+            [0.05, -0.05, 0.2, 0.1, -0.1, 0.15],
+            [0.1, 0.1, -0.1, 0.2, 0.05, -0.05],
+        ];
+        let gates = Array2::<f64>::from_elem((3, 4), 1.0e3);
+        let curvature = -1.0;
+
+        let (x_p, _) =
+            tangent_decode_forward(atoms.view(), gates.view(), curvature).expect("poincare");
+        let x_l = lorentz_decode_forward(atoms.view(), gates.view(), curvature).expect("lorentz");
+        for x in [&x_p, &x_l] {
+            for b in 0..x.dim().0 {
+                let norm = (0..x.dim().1).map(|i| x[[b, i]] * x[[b, i]]).sum::<f64>().sqrt();
+                assert!(
+                    norm.is_finite() && norm <= 1.0 - BOUNDARY_EPS + 1.0e-12,
+                    "decode row {b} must be strictly interior, got norm {norm}"
+                );
+            }
+        }
     }
 
     #[test]
