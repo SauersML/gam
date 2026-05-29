@@ -1,5 +1,7 @@
 //! Generic testing utilities.
 
+pub mod reference;
+
 use crate::families::custom_family::{ParameterBlockSpec, PenaltyMatrix};
 use crate::matrix::{DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator};
 use crate::resource::MatrixMaterializationError;
