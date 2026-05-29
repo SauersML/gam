@@ -4287,6 +4287,64 @@ impl PenaltyCoordinate {
         )
     }
 
+    /// Restrict this penalty coordinate onto the free subspace spanned by the
+    /// orthonormal columns of `z` (shape `p × m`, `m ≤ p`, `zᵀz = I`).
+    ///
+    /// When a linear-inequality active set is non-empty, the inner solve and the
+    /// penalized Hessian are reduced to the free subspace `β = z β_f` of
+    /// dimension `m = p − active_set_size`. The penalty must move in lockstep:
+    /// the quadratic `βᵀ S_k β = β_fᵀ (zᵀ S_k z) β_f`, and since `S_k = R_kᵀ R_k`
+    /// the reduced root is `R_k z` (shape `rank_k × m`). For a block-local root
+    /// `R_k` acting on `β[start..end]` the same identity gives reduced dense root
+    /// `R_k · z[start..end, :]`, so the reduced coordinate is always a
+    /// (dimension-`m`) `DenseRoot` / `DenseRootCentered` — the block structure
+    /// does not survive an arbitrary subspace rotation. A centered mean `μ_k`
+    /// maps to `zᵀ μ_k`, the representation of `μ_k` in the free subspace.
+    ///
+    /// This keeps `dim()` equal to the reduced `beta.len()`, which
+    /// `InnerSolutionBuilder::build` asserts.
+    pub fn project_into_subspace(&self, z: &Array2<f64>) -> Self {
+        assert_eq!(
+            z.nrows(),
+            self.dim(),
+            "PenaltyCoordinate::project_into_subspace: free-basis row count {} does not match coordinate dimension {}",
+            z.nrows(),
+            self.dim()
+        );
+        match self {
+            Self::DenseRoot(root) => Self::DenseRoot(root.dot(z)),
+            Self::DenseRootCentered { root, prior_mean } => Self::from_dense_root_with_mean(
+                root.dot(z),
+                z.t().dot(prior_mean),
+            ),
+            Self::BlockRoot {
+                root, start, end, ..
+            } => {
+                let z_block = z.slice(ndarray::s![*start..*end, ..]);
+                Self::DenseRoot(root.dot(&z_block))
+            }
+            Self::BlockRootCentered {
+                root,
+                start,
+                end,
+                prior_mean,
+                ..
+            } => {
+                let z_block = z.slice(ndarray::s![*start..*end, ..]);
+                // Reduced mean: the block-local prior `μ_k` sits at
+                // `β[start..end]`; lift it into the full coordinate before
+                // projecting so the free-space mean is `zᵀ (E_block μ_k)`.
+                let z_block_owned = z_block.to_owned();
+                Self::from_dense_root_with_mean(root.dot(&z_block_owned), z_block_owned.t().dot(prior_mean))
+            }
+            Self::KroneckerMarginal { .. } => reml_contract_panic(
+                "PenaltyCoordinate::project_into_subspace: Kronecker-factored \
+                 coordinates do not co-occur with linear-inequality active sets \
+                 (box/monotone constraints lower to dense/block roots)",
+            ),
+        }
+    }
+
     fn apply_root(&self, beta: &Array1<f64>) -> Array1<f64> {
         assert_eq!(beta.len(), self.dim());
         match self {
