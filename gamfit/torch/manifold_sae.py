@@ -737,7 +737,31 @@ class ManifoldSAE(nn.Module):
         random_state: int = 0,
         learning_rate: float | None = None,
     ) -> _ClosedFormManifoldSAE:
-        """Run the closed-form Rust solve and copy results into this module."""
+        """Run the closed-form Rust solve and put this module into the solved state.
+
+        After this returns the module is in a "closed-form solved" state: the
+        returned fit (also cached as ``self._last_fit``) is the source of truth.
+        :meth:`forward` is rerouted through :meth:`_forward_from_closed_form`,
+        which reconstructs ``x_hat`` / ``positions`` / ``assignments`` /
+        ``reml_score`` directly from the fit and ignores the module's
+        ``encoder`` and ``atom_raw_anchor`` parameters entirely. Only
+        ``decoder_blocks`` is copied back into the module's parameters; the
+        ``encoder`` and ``atom_raw_anchor`` remain at their pre-fit values and
+        carry no learned information.
+
+        Consequently a *solved* module must NOT be used for:
+
+        * gradient training / fine-tuning (the encoder and anchor are stale, so
+          their gradients are meaningless and would corrupt the fit);
+        * serialization of the learned model (``state_dict`` does not capture the
+          closed-form solution — persist the returned fit instead);
+        * out-of-sample :meth:`forward` (the closed-form path requires the
+          in-sample ``x`` and raises ``NotImplementedError`` otherwise; use
+          ``fit.reconstruct(x)`` / ``fit.predict(x)`` for OOS inputs).
+
+        The supported use is calling :meth:`forward` on the same in-sample ``x``
+        to obtain the closed-form outputs.
+        """
         if not isinstance(x, torch.Tensor):
             raise TypeError("ManifoldSAE.fit expects a torch.Tensor")
         if x.dim() != 2 or x.shape[1] != self.cfg.input_dim:
