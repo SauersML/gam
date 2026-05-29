@@ -387,6 +387,19 @@ pub struct FittedModelPayload {
     pub survival_distribution: Option<ResidualDistribution>,
     #[serde(default)]
     pub training_headers: Option<Vec<String>>,
+    /// Container type of the table the model was fitted on, as detected by the
+    /// Python binding (`"pandas"`, `"polars"`, `"pyarrow"`, `"numpy"`, or an
+    /// ambiguous tag such as `"unknown"`). This is presentation provenance, not
+    /// math: `gamfit.Model.predict` uses it as the output-container fallback
+    /// when the *prediction input* is itself container-ambiguous (a `dict` of
+    /// columns or a `list` of record dicts). Persisting it in the model payload
+    /// makes the fallback survive `save`/`load` and `dumps`/`loads`, so a
+    /// reloaded model predicts into the same container as the in-memory one.
+    /// `None` for older payloads (and for fits that never recorded a kind), in
+    /// which case the fallback degrades to `"dict"`, matching pre-persistence
+    /// behaviour for unknown-kind training tables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub training_table_kind: Option<String>,
     /// Per-column (min, max) of the training input matrix, parallel to
     /// `training_headers`. At predict time, inputs are axis-clipped to these
     /// ranges so that out-of-distribution points evaluate at the nearest face
@@ -652,6 +665,7 @@ impl FittedModelPayload {
             survival_noise_projection_ridge_alpha: None,
             survival_distribution: None,
             training_headers: None,
+            training_table_kind: None,
             training_feature_ranges: None,
             group_metadata: None,
             deployment_extensions: Vec::new(),
