@@ -513,3 +513,145 @@ fn duchon_2d_aniso_binomial_fits_successfully() {
         "aniso_log_scales must contain finite values"
     );
 }
+
+/// Issue #382 regression: `scale_dimensions=True` (learned per-axis
+/// anisotropic length scales) used to abort the entire REML optimization on
+/// clean, well-conditioned data with
+///   `IntegrationError: ... spatial kappa optimization failed: ...
+///    radial scalar evaluation failed during aniso derivative construction`.
+///
+/// The joint spatial-κ / anisotropy outer optimizer probes trial
+/// hyperparameters; at an extreme trial point the learned per-axis scaling can
+/// stretch the anisotropic distance until the Duchon radial kernel is no longer
+/// constructible. That trial point is *infeasible*, not a fatal error — the
+/// cost-only eval path already mapped it to objective `+∞`, but the
+/// gradient/Hessian path propagated the `BasisError` fatally. The fix treats a
+/// non-constructible trial kernel as `OuterEval::infeasible` so the optimizer
+/// retreats and the fit completes.
+///
+/// This mirrors the exact issue repro: n = 500 normal(0,1) draws on two axes,
+/// `y = d0² + 0.5·d1 + N(0, 0.1)`, a 15-center hybrid Duchon smooth, and
+/// `enable_scale_dimensions` (the Rust core behind gamfit's `scale_dimensions`
+/// kwarg). The identical fit without anisotropy succeeds, so the anisotropic
+/// path must not regress to a hard abort.
+#[test]
+fn duchon_2d_scale_dimensions_does_not_abort_on_clean_data_issue_382() {
+    let n = 500usize;
+    let d = 2usize;
+
+    // Deterministic clean quadratic-surface data, matching the issue repro.
+    let mut rng = StdRng::seed_from_u64(13);
+    let axis = Normal::new(0.0, 1.0).expect("normal params must be valid");
+    let noise = Normal::new(0.0, 0.1).expect("normal params must be valid");
+    let mut x = Array2::<f64>::zeros((n, d));
+    let mut y = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let d0 = axis.sample(&mut rng);
+        let d1 = axis.sample(&mut rng);
+        x[[i, 0]] = d0;
+        x[[i, 1]] = d1;
+        y[i] = d0 * d0 + 0.5 * d1 + noise.sample(&mut rng);
+    }
+
+    let mut spec = TermCollectionSpec {
+        linear_terms: vec![],
+        random_effect_terms: vec![],
+        smooth_terms: vec![SmoothTermSpec {
+            name: "duchon_d0_d1".to_string(),
+            basis: SmoothBasisSpec::Duchon {
+                feature_cols: (0..d).collect(),
+                spec: DuchonBasisSpec {
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 15 },
+                    // Hybrid Duchon (length_scale is Some) — required for aniso.
+                    length_scale: Some(1.0),
+                    power: 1.0,
+                    nullspace_order: DuchonNullspaceOrder::Linear,
+                    identifiability: gam::basis::SpatialIdentifiability::default(),
+                    // Isotropic start; scale_dimensions turns this into a
+                    // learned per-axis anisotropy via `enable_scale_dimensions`.
+                    aniso_log_scales: None,
+                    operator_penalties: DuchonOperatorPenaltySpec::default(),
+                    periodic: None,
+                    boundary: OneDimensionalBoundary::Open,
+                },
+                input_scales: None,
+            },
+            shape: ShapeConstraint::None,
+            joint_null_rotation: None,
+        }],
+    };
+
+    // This is the Rust core behind gamfit's `scale_dimensions=True` kwarg.
+    gam::term_builder::enable_scale_dimensions(&mut spec);
+    let aniso_enabled = matches!(
+        &spec.smooth_terms[0].basis,
+        SmoothBasisSpec::Duchon { spec, .. } if spec.aniso_log_scales.is_some()
+    );
+    assert!(
+        aniso_enabled,
+        "enable_scale_dimensions must seed aniso_log_scales on the Duchon term"
+    );
+
+    let weights = Array1::ones(n);
+    let offset = Array1::zeros(n);
+
+    // Before the fix this returned `Err(RemlOptimizationFailed(\"spatial kappa
+    // optimization failed: ... radial scalar evaluation failed during aniso
+    // derivative construction\"))`. It must now complete.
+    let fitted = gam::smooth::fit_term_collection_forspec(
+        x.view(),
+        y.view(),
+        weights.view(),
+        offset.view(),
+        &spec,
+        gaussian_identity_likelihood(),
+        &FitOptions {
+            latent_cloglog: None,
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
+            compute_inference: false,
+            max_iter: 16,
+            tol: 1e-4,
+            nullspace_dims: vec![],
+            linear_constraints: None,
+            firth_bias_reduction: false,
+            adaptive_regularization: None,
+            penalty_shrinkage_floor: None,
+            rho_prior: Default::default(),
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
+        },
+    )
+    .expect(
+        "scale_dimensions=True Duchon fit on clean quadratic-surface data must \
+         complete, not abort the REML optimization (issue #382)",
+    );
+
+    // Coefficients must be finite and the fit must explain real signal: the
+    // surface is dominated by d0², so a degenerate fit (e.g. one that retreated
+    // to a trivial intercept) would have near-baseline error.
+    assert!(
+        fitted.fit.beta.iter().all(|v| v.is_finite()),
+        "fitted coefficients must be finite"
+    );
+
+    let design = fitted.design.design.to_dense();
+    let pred = design.dot(&fitted.fit.beta) + &offset;
+    assert!(
+        pred.iter().all(|v| v.is_finite()),
+        "fitted predictions must be finite"
+    );
+
+    let y_mean = y.mean().unwrap_or(0.0);
+    let sse_model: f64 = (&pred - &y).mapv(|v| v * v).sum();
+    let sse_baseline: f64 = y.iter().map(|&v| (v - y_mean).powi(2)).sum();
+    assert!(
+        sse_model < 0.5 * sse_baseline,
+        "anisotropic Duchon fit must explain the quadratic surface (beat mean-only \
+         by ≥50%): sse_model={sse_model:.6e}, sse_baseline={sse_baseline:.6e} \
+         (ratio={ratio:.3})",
+        ratio = sse_model / sse_baseline,
+    );
+}
