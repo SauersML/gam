@@ -28018,4 +28018,88 @@ mod tests {
 
         assert_flex_jac_fd("marginal_flex", &jac, &beta_m, 1e-7, nll_fn);
     }
+
+    /// Build a one-row time-block family whose single derivative-design row has
+    /// the given coefficient and offset, so we can drive
+    /// `validate_time_qd1_feasible` with a controlled raw `qd1` and constraint
+    /// row scaling. Mirrors the field layout of the other in-module fixtures.
+    fn make_time_guard_family(
+        deriv_coeff: f64,
+        deriv_offset: f64,
+    ) -> SurvivalMarginalSlopeFamily {
+        SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![1.0]),
+            weights: Arc::new(array![1.0]),
+            z: Arc::new(array![0.0].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_derivative_exit: DesignMatrix::from(array![[deriv_coeff]]),
+            offset_entry: Arc::new(array![0.0]),
+            offset_exit: Arc::new(array![0.0]),
+            derivative_offset_exit: Arc::new(array![deriv_offset]),
+            marginal_design: DesignMatrix::from(Array2::zeros((1, 1))),
+            logslope_design: DesignMatrix::from(array![[1.0]]),
+            logslope_surface_ranges: empty_logslope_surface_ranges(),
+            score_warp: None,
+            link_dev: None,
+            time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Regression for #379: a full-rank PH marginal-slope fit aborted because
+    /// `validate_time_qd1_feasible` rejected a constrained time-block iterate
+    /// that the inequality-constrained active-set Newton solver considered
+    /// feasible. The solver only guarantees primal feasibility to
+    /// `ACTIVE_SET_PRIMAL_FEASIBILITY_TOL` in the *scaled* constraint-row units
+    /// produced by `time_derivative_guard_constraints` (row scale
+    /// `max(||design_row||, |guard - offset|, 1)`). On a design row with a
+    /// large norm, a scaled slack of ~1e-8 maps to a raw `qd1` shortfall of
+    /// ~1e-5 below the 1e-6 guard — exactly the overshoot in the issue. The
+    /// validator must accept that boundary iterate while still rejecting a
+    /// genuine monotonicity divergence.
+    #[test]
+    fn validate_time_qd1_accepts_scaled_boundary_overshoot_rejects_real_violation() {
+        let guard = 1e-6_f64;
+
+        // Boundary case: design row norm ~6000, so the solver's 1e-8 scaled
+        // primal tolerance permits a raw qd1 shortfall of ~6e-5 below the guard.
+        let deriv_coeff = 6000.0_f64;
+        let family = make_time_guard_family(deriv_coeff, 0.0);
+        // Choose beta so qd1 = guard - 6e-5 (raw overshoot ~6e-5, as observed).
+        let target_qd1 = guard - 6e-5;
+        let beta = array![target_qd1 / deriv_coeff];
+        // Confirm the fixture actually reproduces the issue's regime: the raw
+        // qd1 trips the historic 256·eps guard band (so the *old* validator
+        // would have rejected this iterate and aborted the whole fit).
+        assert!(
+            super::survival_derivative_guard_violated(target_qd1, guard),
+            "fixture must reproduce the sub-guard raw overshoot the old validator rejected",
+        );
+        // Scaled violation = 6e-5 / max(6000, |guard|, 1) = 1e-8, below the
+        // solver-consistent feasibility band, so the iterate must be accepted.
+        family
+            .validate_time_qd1_feasible(&beta, "proposed")
+            .expect("solver-feasible boundary iterate must be accepted");
+
+        // Genuine violation: unit-scale row, qd1 driven far below the guard.
+        let bad_family = make_time_guard_family(1.0, 0.0);
+        let bad_beta = array![-0.5]; // qd1 = -0.5, scaled violation ~0.5 >> band
+        let err = bad_family
+            .validate_time_qd1_feasible(&bad_beta, "proposed")
+            .expect_err("a true monotonicity divergence must still hard-error");
+        assert!(
+            err.contains("violates monotonicity"),
+            "expected a monotonicity error, got: {err}",
+        );
+    }
 }
