@@ -9121,6 +9121,95 @@ mod tests {
     }
 
     #[test]
+    fn aux_compass_skips_continuation_prewarm_with_interior_seed() {
+        // Regression for #392 (and the structural defect shared with
+        // #375/#369): the transformation / latent survival baseline-θ
+        // optimizer builds an `AuxiliaryGradientFree` problem whose
+        // gradient/full-eval closure is "unreachable by construction"
+        // (it answers only `eval_cost`). The magic-by-default continuation
+        // pre-warm walks ρ via `ValueAndGradient`; if it ran on this path
+        // it would route straight into that error stub and reject the
+        // single seed, yielding "no candidate seeds passed outer startup
+        // validation". The seed loop must therefore skip the pre-warm
+        // whenever the plan dispatches to `Solver::CompassSearch`.
+        //
+        // This models the failing shape faithfully: dim=2 (weibull/gompertz
+        // α,λ), a *seed interior to the bounds* (bounds = seed ± 6, exactly
+        // as `optimize_survival_baseline_config` builds them) so the
+        // pre-warm's oversmoothing ρ₀ does NOT collapse to the seed — i.e.
+        // the pre-warm would genuinely execute and hit the stub if the
+        // guard were absent. The eval closure carries the exact
+        // "unreachable by construction" message the baseline aux optimizer
+        // installs and flips a flag when touched; the test asserts both
+        // that the run converges and that the stub was never invoked.
+        let gradient_touched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seed = array![0.5, -0.3];
+        let lower = seed.mapv(|v| v - 6.0);
+        let upper = seed.mapv(|v| v + 6.0);
+        let problem = OuterProblem::new(2)
+            .with_solver_class(SolverClass::AuxiliaryGradientFree)
+            .with_tolerance(1e-4)
+            .with_max_iter(400)
+            .with_bounds(lower, upper)
+            .with_initial_rho(seed.clone())
+            .with_seed_config(crate::seeding::SeedConfig {
+                max_seeds: 1,
+                seed_budget: 1,
+                num_auxiliary_trailing: 2,
+                ..Default::default()
+            });
+        let target = seed.clone();
+        let mut obj = problem.build_objective(
+            (),
+            move |_: &mut (), theta: &Array1<f64>| {
+                // Strictly convex bowl centered at the seed: compass search
+                // certifies stationarity by contracting its step below tol.
+                Ok((theta - &target).mapv(|v| v * v).sum())
+            },
+            {
+                let gradient_touched = Arc::clone(&gradient_touched);
+                move |_: &mut (),
+                      _: &Array1<f64>|
+                      -> Result<OuterEval, EstimationError> {
+                    gradient_touched.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Err(EstimationError::InvalidInput(
+                        "baseline aux optimizer: CompassSearch dispatch only calls eval_cost; \
+                         eval(gradient) is unreachable by construction"
+                            .to_string(),
+                    ))
+                }
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
+        let result = problem
+            .run(&mut obj, "workflow survival transformation baseline")
+            .expect(
+                "interior-seed aux CompassSearch must converge without touching \
+                 the unreachable gradient closure (the continuation pre-warm \
+                 must be skipped for the gradient-free solver class)",
+            );
+        assert_eq!(result.plan_used.solver, Solver::CompassSearch);
+        assert!(
+            result.converged,
+            "aux CompassSearch should converge on the convex baseline bowl",
+        );
+        assert!(
+            !gradient_touched.load(std::sync::atomic::Ordering::SeqCst),
+            "the 'unreachable by construction' gradient closure must never be \
+             invoked on the CompassSearch path — the continuation pre-warm \
+             skip guard is the fix for #392",
+        );
+        // Direct search lands within one step-tol contraction of the bowl
+        // minimum (the seed); the surface there is essentially zero.
+        assert!(
+            result.final_value < 1e-3,
+            "final cost {} should be near the bowl minimum",
+            result.final_value,
+        );
+    }
+
+    #[test]
     fn run_arc_projects_seed_before_seed_validation_eval() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let mut seed_config = crate::seeding::SeedConfig::default();
