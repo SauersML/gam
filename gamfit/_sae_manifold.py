@@ -231,12 +231,29 @@ class ManifoldSAE:
         return np.asarray(payload["atoms"][k]["on_atom_coords_t"], dtype=float)
 
     def per_atom_active_set(self, X: Any, threshold: float | None = None) -> np.ndarray:
-        _as_2d_float(X, "X")
-        return self.assignments >= (0.5 if threshold is None else float(threshold))
+        """Per-token active atom set ``(N, K)`` boolean mask for ``X``.
+
+        On training ``X`` (matched bit-exactly) the cached fit assignments are
+        thresholded without re-solving; otherwise the frozen-decoder OOS solve
+        is run on ``X`` and its converged assignments are thresholded."""
+        x = _as_2d_float(X, "X")
+        cut = 0.5 if threshold is None else float(threshold)
+        if x.shape == self.training_data.shape and np.allclose(x, self.training_data):
+            return self.assignments >= cut
+        payload = self._oos_payload(x)
+        return np.asarray(payload["assignments_z"], dtype=float) >= cut
 
     def per_atom_latent_for(self, X: Any) -> list[np.ndarray]:
-        _as_2d_float(X, "X")
-        return [c.copy() for c in self.coords]
+        """Per-atom on-manifold coordinates ``[(N, d_k), ...]`` for ``X``.
+
+        On training ``X`` (matched bit-exactly) the cached fit coordinates are
+        returned; otherwise the frozen-decoder OOS solve is run on ``X`` and its
+        converged per-atom coordinates are returned."""
+        x = _as_2d_float(X, "X")
+        if x.shape == self.training_data.shape and np.allclose(x, self.training_data):
+            return [c.copy() for c in self.coords]
+        payload = self._oos_payload(x)
+        return [np.asarray(atom["on_atom_coords_t"], dtype=float) for atom in payload["atoms"]]
 
     def get_decoder(self) -> list[np.ndarray]:
         return [b.copy() for b in self.decoder_blocks]
