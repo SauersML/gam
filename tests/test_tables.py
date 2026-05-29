@@ -15,6 +15,52 @@ pytest = cast(_Pytest, import_module("pytest"))
 from gamfit._tables import normalize_table, restore_output_table
 
 
+def test_normalize_table_dict_of_numpy_float64_arrays_renders_native_numbers() -> None:
+    # Regression for #387: a dict of numpy float64 arrays must stringify to
+    # bare numeric text ("-3.0"), not the NumPy 2.x scalar repr
+    # ("np.float64(-3.0)") which the Rust core misreads as a categorical level.
+    np = pytest.importorskip("numpy")
+
+    x = np.array([-3.0, 0.5, 2.25], dtype=np.float64)
+    y = np.array([1.0, -0.25, 3.5], dtype=np.float64)
+
+    headers_np, rows_np, kind = normalize_table({"x": x, "y": y})
+
+    assert kind == "mapping"
+    assert headers_np == ["x", "y"]
+    # No cell may carry the numpy type name; every cell must be a plain number.
+    for row in rows_np:
+        for cell in row:
+            assert "np.float64" not in cell
+            float(cell)  # must round-trip as a real number
+
+    # Equivalent dict of Python-float lists must produce identical output.
+    headers_list, rows_list, _ = normalize_table(
+        {"x": x.tolist(), "y": y.tolist()}
+    )
+    assert headers_np == headers_list
+    assert rows_np == rows_list
+
+
+def test_normalize_table_numpy_float16_and_int_scalars_render_natively() -> None:
+    # float16 also subclasses float with a type-named repr in NumPy 2.x;
+    # numpy integers must render as bare integers, not "np.int64(3)".
+    np = pytest.importorskip("numpy")
+
+    _, rows, _ = normalize_table(
+        {
+            "h": np.array([2.5, -1.0], dtype=np.float16),
+            "i": np.array([3, -7], dtype=np.int64),
+        }
+    )
+
+    flat = [cell for row in rows for cell in row]
+    assert all("np." not in cell for cell in flat)
+    assert {rows[0][1], rows[1][1]} == {"3", "-7"}
+    for cell in flat:
+        float(cell)
+
+
 def test_normalize_table_rejects_zero_row_mapping() -> None:
     with pytest.raises(ValueError, match="table data cannot be empty"):
         normalize_table({"x": [], "y": []})
