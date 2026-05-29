@@ -2898,18 +2898,33 @@ impl SaeManifoldTerm {
         // the Arrow-Schur solver can use it via `sys.htbeta_matvec`.
         {
             let kron = Arc::new(SaeKroneckerRows::new(p, kron_a_phi, kron_jac));
-            sys.set_row_htbeta_operator(move |row_idx, x, out| {
-                // Apply J_β^(row_idx) · x → out using the Kronecker form.
-                // x may or may not be contiguous; collect into a plain Vec
-                // only when a contiguous slice is not available.
-                let out_slice = out.as_slice_mut().expect("out is always standard-layout");
-                if let Some(xs) = x.as_slice() {
-                    kron.apply_jbeta(row_idx, xs, out_slice);
-                } else {
-                    let x_vec: Vec<f64> = x.iter().copied().collect();
-                    kron.apply_jbeta(row_idx, &x_vec, out_slice);
-                }
-            });
+            let kron_t = Arc::clone(&kron);
+            sys.set_row_htbeta_operator(
+                move |row_idx, x, out| {
+                    // Apply J_β^(row_idx) · x → out using the Kronecker form.
+                    // x may or may not be contiguous; collect into a plain Vec
+                    // only when a contiguous slice is not available.
+                    let out_slice = out.as_slice_mut().expect("out is always standard-layout");
+                    if let Some(xs) = x.as_slice() {
+                        kron.apply_jbeta(row_idx, xs, out_slice);
+                    } else {
+                        let x_vec: Vec<f64> = x.iter().copied().collect();
+                        kron.apply_jbeta(row_idx, &x_vec, out_slice);
+                    }
+                },
+                move |row_idx, v, out| {
+                    // Accumulate H_βt^(row_idx) · v → out via the sparse scatter
+                    // adjoint over the row's active atoms (O(m_i · p)). `out` is
+                    // the length-K β accumulator; `scatter_jbeta_t` adds into it.
+                    let out_slice = out.as_slice_mut().expect("out is always standard-layout");
+                    if let Some(vs) = v.as_slice() {
+                        kron_t.scatter_jbeta_t(row_idx, vs, out_slice);
+                    } else {
+                        let v_vec: Vec<f64> = v.iter().copied().collect();
+                        kron_t.scatter_jbeta_t(row_idx, &v_vec, out_slice);
+                    }
+                },
+            );
         }
         let mut beta_penalty_written = false;
         if let Some(registry) = analytic_penalties {
