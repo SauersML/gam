@@ -116,6 +116,34 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Free runner disk space
+        # ubuntu-latest / ubuntu-22.04 ship with ~14 GB free on /. On
+        # x86_64-unknown-linux-gnu we additionally install the NVIDIA CUDA
+        # Toolkit (~5–6 GB unpacked) and then run `cargo build --release`
+        # against this dep graph (faer, burn, bevy_reflect, ndarray,
+        # nalgebra, arrow, parquet, cudarc, …). The combined footprint has
+        # been exhausting the disk during link, surfacing as
+        # `System.IO.IOException: No space left on device` from the runner's
+        # diagnostic log writer (which kills the whole job, not just the
+        # build step). Wiping these preinstalled toolchains (.NET, Android
+        # SDK, GHC, CodeQL, Boost) frees ~30 GB up-front so the CUDA install
+        # and release link have headroom. Each `rm` is `|| true`-guarded so
+        # a future runner image that drops one of these paths doesn't break
+        # the step. Linux-only — macOS/Windows runners have a different
+        # filesystem layout and don't share this pressure point.
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -uo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo rm -rf "${AGENT_TOOLSDIRECTORY:-}" || true
+          df -h /
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
         with:
