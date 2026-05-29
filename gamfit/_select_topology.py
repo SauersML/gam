@@ -731,11 +731,31 @@ def _extract_float_field(fit_obj: Any, keys: tuple[str, ...]) -> float | None:
 
 def _summary_payload(fit_obj: Any) -> Mapping[str, Any] | None:
     summary = getattr(fit_obj, "summary", None)
-    if callable(summary):
-        summary_obj = summary()
-        payload = getattr(summary_obj, "payload", summary_obj)
-        if isinstance(payload, Mapping):
-            return payload
+    if not callable(summary):
+        return None
+    summary_obj = summary()
+    payload = getattr(summary_obj, "payload", summary_obj)
+    if isinstance(payload, Mapping):
+        return payload
+    # ``Model.summary()`` returns a ``gamfit._summary.Summary`` — a frozen
+    # dataclass that duck-types the mapping protocol (``__getitem__`` /
+    # ``__contains__`` / ``__iter__`` / ``.get`` / ``.to_dict``) but is not a
+    # ``collections.abc.Mapping`` instance. Gating on ``isinstance(..., Mapping)``
+    # would silently discard the entire summary and break downstream scoring
+    # (``_basis_size`` raising "could not determine fitted basis size"). Flatten
+    # it through its public ``to_dict`` so every key the engine emits is visible.
+    to_dict = getattr(payload, "to_dict", None)
+    if callable(to_dict):
+        flattened = to_dict()
+        if isinstance(flattened, Mapping):
+            return flattened
+    # Fall back to the mapping protocol directly for any future summary type
+    # that iterates keys + supports subscripting but lacks ``to_dict``.
+    if hasattr(payload, "get") and hasattr(payload, "__iter__"):
+        try:
+            return {str(key): payload[key] for key in payload}
+        except (TypeError, KeyError):
+            return None
     return None
 
 
