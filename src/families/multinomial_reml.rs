@@ -53,7 +53,7 @@
 //! deterministically via the per-block `gauge_priority` listed below.
 
 use crate::families::custom_family::{
-    BlockWorkingSet, CustomFamily, ExactNewtonJointGradientEvaluation,
+    AdditiveBlockJacobian, BlockWorkingSet, CustomFamily, ExactNewtonJointGradientEvaluation,
     ExactNewtonJointHessianWorkspace, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
     PenaltyMatrix,
 };
@@ -250,7 +250,18 @@ impl MultinomialFamily {
         (0..m)
             .map(|a| {
                 let priority = 100u8.saturating_add(u8::try_from(m - a).unwrap_or(u8::MAX));
-                ParameterBlockSpec {
+                // Each active class drives a *separate* softmax channel
+                // `η_a = X β_a`. The K−1 blocks share the identical design `X`,
+                // but they are **not** gauge-redundant aliases: the true joint
+                // Jacobian is block-diagonal `blkdiag(X, …, X)` with full rank
+                // `(K−1)·P`. Supplying an `AdditiveBlockJacobian` that places
+                // block `a`'s design in its own output channel routes
+                // canonicalisation through the channel-aware identifiability
+                // audit (one output per class). Without it the flat audit
+                // assembles `[X | X | … | X]` over the same N rows, mistakes the
+                // repeated columns for aliases, and strips every block past
+                // `class_0` to width 0 — the failure in #363.
+                let mut spec = ParameterBlockSpec {
                     name: format!("class_{a}"),
                     design: DesignMatrix::Dense(DenseDesignMatrix::from(self.design.clone())),
                     offset: Array1::<f64>::zeros(self.design.nrows()),
@@ -262,7 +273,13 @@ impl MultinomialFamily {
                     jacobian_callback: None,
                     stacked_design: None,
                     stacked_offset: None,
-                }
+                };
+                spec.jacobian_callback = Some(Arc::new(AdditiveBlockJacobian {
+                    design: (*self.design).clone(),
+                    own_output: a,
+                    n_family_outputs: m,
+                }));
+                spec
             })
             .collect()
     }
