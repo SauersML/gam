@@ -79,6 +79,10 @@ jobs:
           PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Stream the full agent transcript to the Actions log in real time.
+          # (Public repo: GitHub masks registered secrets; this step also holds
+          # CARGO/PYPI publish tokens, which stay masked as ${{ secrets.* }}.)
+          show_full_output: true
           claude_args: >-
             --model claude-opus-4-8
             --dangerously-skip-permissions
