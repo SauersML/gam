@@ -79,6 +79,12 @@ class ManifoldSAE:
     _duchon_centers: list[np.ndarray | None]
     alpha: float = 1.0
     learnable_alpha: bool = False
+    tau: float = 0.5
+    sparsity_strength: float = 1.0
+    smoothness: float = 1.0
+    learning_rate: float = 0.04
+    max_iter: int = 50
+    random_state: int = 0
 
     def __repr__(self) -> str:
         d_atom = int(self.coords[0].shape[1]) if self.coords else 0
@@ -91,7 +97,7 @@ class ManifoldSAE:
         )
 
     @classmethod
-    def from_payload(cls, x: np.ndarray, payload: Mapping[str, Any], topology: str, assignment: str, penalties: list[str], alpha: float = 1.0, learnable_alpha: bool = False) -> "ManifoldSAE":
+    def from_payload(cls, x: np.ndarray, payload: Mapping[str, Any], topology: str, assignment: str, penalties: list[str], alpha: float = 1.0, learnable_alpha: bool = False, *, tau: float = 0.5, sparsity_strength: float = 1.0, smoothness: float = 1.0, learning_rate: float = 0.04, max_iter: int = 50, random_state: int = 0) -> "ManifoldSAE":
         plans = list(payload.get("atom_plans", []))
         atoms = [SaeManifoldAtomFit(
             basis=str(atom.get("basis_kind", "")),
@@ -123,20 +129,25 @@ class ManifoldSAE:
             _basis_kinds=kinds, _atom_dims=dims, _basis_sizes=sizes,
             _n_harmonics=nharm, _duchon_centers=centers,
             alpha=float(alpha), learnable_alpha=bool(learnable_alpha),
+            tau=float(tau), sparsity_strength=float(sparsity_strength),
+            smoothness=float(smoothness), learning_rate=float(learning_rate),
+            max_iter=int(max_iter), random_state=int(random_state),
         )
 
     def reconstruct(self, X: Any) -> np.ndarray:
         x = _as_2d_float(X, "X")
         if x.shape == self.training_data.shape and np.allclose(x, self.training_data):
             return self.fitted.copy()
-        kind = "ibp_map" if self.assignment in {"ibp", "ibp_map"} else ("jumprelu" if self.assignment == "gated" else self.assignment)
+        kind = _canonical_assignment(self.assignment, "assignment")
         return np.asarray(rust_module().sae_manifold_predict_oos(
             np.ascontiguousarray(x), list(self._basis_kinds), list(self._atom_dims),
             [np.ascontiguousarray(b) for b in self.decoder_blocks],
             [None if c is None else np.ascontiguousarray(c) for c in self._duchon_centers],
             [(int(h) if k in {"periodic", "torus"} else None) for k, h in zip(self._basis_kinds, self._n_harmonics)],
-            alpha=1.0, tau=0.5, assignment_kind=str(kind),
-            sparsity_strength=1.0, smoothness=1.0, max_iter=50, learning_rate=0.04, random_state=0,
+            alpha=float(self.alpha), tau=float(self.tau), assignment_kind=str(kind),
+            sparsity_strength=float(self.sparsity_strength), smoothness=float(self.smoothness),
+            max_iter=int(self.max_iter), learning_rate=float(self.learning_rate),
+            random_state=int(self.random_state),
         ), dtype=float)
 
     def predict(self, X: Any) -> np.ndarray:
@@ -183,6 +194,12 @@ class ManifoldSAE:
             "assignment": self.assignment,
             "alpha": float(self.alpha),
             "learnable_alpha": bool(self.learnable_alpha),
+            "tau": float(self.tau),
+            "sparsity_strength": float(self.sparsity_strength),
+            "smoothness": float(self.smoothness),
+            "learning_rate": float(self.learning_rate),
+            "max_iter": int(self.max_iter),
+            "random_state": int(self.random_state),
             "primitive_names": list(self.primitive_names),
             "basis_specs": list(self.basis_specs),
             "reml_score": float(self.reml_score),
@@ -265,6 +282,12 @@ class ManifoldSAE:
             _duchon_centers=centers,
             alpha=float(payload.get("alpha", 1.0)),
             learnable_alpha=bool(payload.get("learnable_alpha", False)),
+            tau=float(payload["tau"]),
+            sparsity_strength=float(payload["sparsity_strength"]),
+            smoothness=float(payload["smoothness"]),
+            learning_rate=float(payload["learning_rate"]),
+            max_iter=int(payload["max_iter"]),
+            random_state=int(payload["random_state"]),
         )
 
     @classmethod
@@ -507,6 +530,9 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     return ManifoldSAE.from_payload(
         x, payload_dict, resolved_topology, assignment, penalties,
         alpha=float(alpha_value), learnable_alpha=bool(alpha == "auto"),
+        tau=float(tau), sparsity_strength=float(sparsity), smoothness=float(smoothness),
+        learning_rate=float(effective_lr), max_iter=int(max_iter_total),
+        random_state=int(random_state),
     )
 
 
