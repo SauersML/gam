@@ -6247,22 +6247,75 @@ impl SurvivalMarginalSlopeFamily {
             .into());
         }
         let guard = self.derivative_guard;
-        let mut worst_qd1 = f64::INFINITY;
+        // The monotonicity guard `qd1 = design·beta + offset >= guard` is enforced
+        // through `time_linear_constraints`, which the inequality-constrained
+        // active-set Newton solver satisfies only to its primal-feasibility
+        // tolerance measured in the *scaled* constraint-row coordinate system.
+        // `time_derivative_guard_constraints` normalizes each row by
+        // `scale = max(||design_row||, |guard - offset|, 1)`, so a scaled slack
+        // of `ACTIVE_SET_PRIMAL_FEASIBILITY_TOL` corresponds to a raw `qd1`
+        // shortfall of up to `ACTIVE_SET_PRIMAL_FEASIBILITY_TOL * scale_row`.
+        // Validating the raw `qd1` against a band of only `256·eps` therefore
+        // demands ~9 orders of magnitude more precision than the solver that
+        // produced `beta` can deliver, and spuriously rejects iterates that sit
+        // exactly on the feasible boundary. The feasibility check here must use
+        // the same scaling the constraint builder applied so that "the solver
+        // calls this feasible" and "this validator calls this feasible" coincide.
+        let derivative_dense = self.design_derivative_exit.to_dense_cow();
+        let mut worst_scaled_violation = 0.0_f64;
         let mut worst_row = 0usize;
+        let mut worst_qd1 = f64::INFINITY;
+        let mut worst_scale = 1.0_f64;
         for row in 0..n_rows {
             let offset = self.derivative_offset_exit[row];
             let qd1 = qd_design[row] + offset;
-            if qd1 < worst_qd1 {
-                worst_qd1 = qd1;
-                worst_row = row;
+            if !qd1.is_finite() || !offset.is_finite() {
+                return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                    reason: format!(
+                        "survival marginal-slope time-block {label} produced non-finite baseline \
+                         derivative at row {row}: qd1={qd1:.3e}, offset={offset:.3e}"
+                    ),
+                }
+                .into());
+            }
+            // Per-row normalization identical to the constraint builder.
+            let mut row_norm_sq = 0.0_f64;
+            for col in 0..derivative_dense.ncols() {
+                let v = derivative_dense[[row, col]];
+                row_norm_sq += v * v;
+            }
+            let row_norm = row_norm_sq.sqrt();
+            let rhs = guard - offset;
+            let scale = row_norm.max(rhs.abs()).max(1.0);
+            // Scaled violation = max(0, (guard - qd1) / scale); zero rows of the
+            // design contribute no constraint (the bound is then carried by the
+            // offset alone and checked at constraint-build time), so they cannot
+            // be repaired by `beta` and are excluded from the scaled metric.
+            let shortfall = guard - qd1;
+            if shortfall > 0.0 && row_norm_sq > 1e-24 {
+                let scaled = shortfall / scale;
+                if scaled > worst_scaled_violation {
+                    worst_scaled_violation = scaled;
+                    worst_row = row;
+                    worst_qd1 = qd1;
+                    worst_scale = scale;
+                }
             }
         }
-        if survival_derivative_guard_violated(worst_qd1, guard) {
+        // A safety factor of 4 absorbs accumulation of the solver's per-row
+        // tolerance and the small projection drift in the unconstrained
+        // re-evaluation of `qd1` here versus the scaled constraint residual;
+        // it stays far below any value that would admit a genuine monotonicity
+        // violation (which is O(1e-3..1e0) when the fit truly diverges).
+        let feasibility_band = 4.0 * crate::pirls::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL;
+        if worst_scaled_violation > feasibility_band {
             return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
                 reason: format!(
                     "survival marginal-slope time-block {label} beta violates monotonicity at row {worst_row}: \
-                     qd1={worst_qd1:.3e} < guard={guard:.3e}; the derivative guard must be represented \
-                     in time_linear_constraints, not repaired by post-update projection"
+                     qd1={worst_qd1:.3e} < guard={guard:.3e} (scaled violation {worst_scaled_violation:.3e} \
+                     exceeds solver feasibility band {feasibility_band:.3e}; row scale {worst_scale:.3e}); \
+                     the derivative guard must be represented in time_linear_constraints, not repaired by \
+                     post-update projection"
                 ),
             }
             .into());
