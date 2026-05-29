@@ -10058,6 +10058,13 @@ fn sae_periodic_basis_size(n_harmonics: usize) -> Result<usize, String> {
 /// multiple of the L2-cache estimate so a chunk's basis stays hot. The chunk is
 /// clamped to `[1, n_obs]` and to at least a small floor so the per-chunk
 /// reduced-Schur amortizes its `O(M² p + K³_reduced)` overhead.
+///
+/// Exposed to Python as a read-only diagnostic so callers (and the LLM-scale
+/// streaming demo) can inspect the exact dispatch decision and chunk size the
+/// fit will follow for a given `(n_obs, total_basis, k_atoms, d_max)` without
+/// running it. It carries no tunable knobs — the plan is fully derived from the
+/// problem size and the `GpuRuntime` memory budget.
+#[pyfunction]
 fn sae_streaming_plan(
     n_obs: usize,
     total_basis: usize,
@@ -22365,6 +22372,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sae_manifold_fit_minimal, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_predict_oos, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_reconstruction_r2, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_streaming_plan, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_assignment_summary, module)?)?;
     module.add_function(wrap_pyfunction!(gated_sae_decode, module)?)?;
     module.add_function(wrap_pyfunction!(interchange_decode_forward, module)?)?;
