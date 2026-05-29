@@ -24391,7 +24391,26 @@ fn predict_columns(
                 gam::predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
             mean_interval_method: gam::predict::MeanIntervalMethod::TransformEta,
             includeobservation_interval: false,
-            apply_bias_correction: true,
+            // Issue #398: the point prediction must be a property of the model and
+            // the inputs, never of whether an interval was requested. The plain
+            // branch below (`predict_plugin_response`) reports the plug-in
+            // linear predictor η = Xβ̂ (+offset). With `apply_bias_correction:
+            // true` the uncertainty branch instead recentred η by the
+            // smoothing-shrinkage correction X·H⁻¹Sβ̂, so `mean` and
+            // `linear_predictor` silently shifted the moment a caller asked for
+            // an interval — contradicting the documented contract that
+            // `interval` only *adds* std_error/mean_lower/mean_upper columns.
+            // The recentred estimate is also empirically worse against truth
+            // (it trades bias for variance and overshoots at the domain
+            // boundary), and it is internally inconsistent with the link-wiggle
+            // uncertainty path, which never bias-corrects. Bias-aware *coverage*
+            // is already supplied by the smoothing-corrected covariance
+            // (`ConditionalPlusSmoothingPreferred`); recentring the point
+            // estimate is neither standard (mgcv reports the plug-in mean) nor
+            // wanted here. Disabling it makes this branch report the same
+            // plug-in point estimate as the plain path while still widening the
+            // interval for smoothing uncertainty.
+            apply_bias_correction: false,
             ..gam::predict::PredictUncertaintyOptions::default()
         };
         let prediction = predictor

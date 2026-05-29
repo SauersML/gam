@@ -494,6 +494,103 @@ def test_predict_rejects_schema_mismatch() -> None:
         )
 
 
+def test_predict_point_estimate_is_invariant_to_interval_request() -> None:
+    """Issue #398: ``predict(data)`` must equal ``predict(data, interval=...)``.
+
+    The point prediction is a property of the model and the inputs, never of
+    whether the caller asked for an uncertainty band. Requesting an interval
+    may only *add* the ``std_error`` / ``mean_lower`` / ``mean_upper`` columns;
+    it must not move ``mean`` or ``linear_predictor``. Before the fix the
+    interval branch silently enabled the smoothing-shrinkage bias correction
+    (``apply_bias_correction``), recentring η by ``X·H⁻¹Sβ̂`` so the reported
+    point estimate shifted the moment an interval was requested.
+
+    The shift is checked across several families/links (identity-link Gaussian
+    is the cleanest: there is no link nonlinearity to justify any correction),
+    and on identity-link Gaussian the un-shifted plug-in estimate is also the
+    one that matches ground truth.
+    """
+    rng = np.random.default_rng(11)
+    n = 600
+    x = rng.uniform(-3.0, 3.0, n)
+    xt = np.linspace(-3.0, 3.0, 80)
+
+    cases = []
+
+    # Gaussian / identity link: y = sin(x) + noise.
+    y_gauss = np.sin(x) + rng.normal(0.0, 0.3, n)
+    cases.append(
+        (
+            "gaussian",
+            {"x": x.tolist(), "y": y_gauss.tolist()},
+            "gaussian",
+            np.sin(xt),
+        )
+    )
+
+    # Gamma / log link: strictly positive mean that bends under the link.
+    mu_gamma = np.exp(0.5 + 0.4 * np.sin(x))
+    y_gamma = rng.gamma(shape=8.0, scale=mu_gamma / 8.0)
+    cases.append(
+        ("gamma", {"x": x.tolist(), "y": y_gamma.tolist()}, "gamma", None)
+    )
+
+    # Poisson / log link.
+    y_pois = rng.poisson(np.exp(0.3 + 0.5 * np.sin(x))).astype(float)
+    cases.append(
+        ("poisson", {"x": x.tolist(), "y": y_pois.tolist()}, "poisson", None)
+    )
+
+    # Binomial / logit link.
+    p_bin = 1.0 / (1.0 + np.exp(-(0.5 * np.sin(x))))
+    y_bin = rng.binomial(1, p_bin).astype(float)
+    cases.append(
+        ("binomial", {"x": x.tolist(), "y": y_bin.tolist()}, "binomial", None)
+    )
+
+    grid = {"x": xt.tolist()}
+    for name, df, family, truth in cases:
+        model = gamfit.fit(df, "y ~ s(x)", family=family)
+
+        plain = np.asarray(model.predict(grid), dtype=float)
+        tab = model.predict(grid, interval=0.95)
+        interval_mean = np.asarray(tab["mean"], dtype=float)
+        interval_lp = np.asarray(tab["linear_predictor"], dtype=float)
+        plain_tab = model.predict(grid, return_type="dict")
+        plain_lp = np.asarray(plain_tab["linear_predictor"], dtype=float)
+
+        # The point estimate must not depend on whether an interval was asked
+        # for: both ``mean`` and ``linear_predictor`` agree to floating-point
+        # round-off, not merely "close".
+        np.testing.assert_allclose(
+            interval_mean,
+            plain,
+            atol=1e-9,
+            rtol=0.0,
+            err_msg=f"{name}: interval mean diverged from plain predict",
+        )
+        np.testing.assert_allclose(
+            interval_lp,
+            plain_lp,
+            atol=1e-9,
+            rtol=0.0,
+            err_msg=f"{name}: interval linear_predictor diverged from plain",
+        )
+
+        # The reported mean must remain the centre of (i.e. inside) the band.
+        lower = np.asarray(tab["mean_lower"], dtype=float)
+        upper = np.asarray(tab["mean_upper"], dtype=float)
+        assert np.all(lower <= interval_mean + 1e-9)
+        assert np.all(interval_mean <= upper + 1e-9)
+        assert np.all(np.asarray(tab["std_error"], dtype=float) > 0.0)
+
+        # On identity-link Gaussian, the (now un-shifted) plug-in estimate is
+        # the one that tracks the truth; a recentred estimate measurably
+        # degrades the fit, so this also guards against re-enabling the shift.
+        if truth is not None:
+            assert np.mean((plain - truth) ** 2) < 1e-3
+
+
 def test_predict_can_passthrough_id_column() -> None:
     model = gamfit.fit(training_rows(), "y ~ x")
 
