@@ -11049,6 +11049,15 @@ fn sae_build_atom_plans(
 /// [`sae_manifold_fit`]. Returns the same payload dict with one extra key,
 /// `"atom_plans"`, holding the per-atom basis spec so OOS prediction can
 /// rebuild the design without going through Python.
+///
+/// Warm starts (issue #357): `initial_logits` (N, K) and `initial_coords`
+/// (K, N, D_max) are optional caller-supplied seeds for the assignment logits
+/// and the per-atom on-manifold coordinates. When supplied they replace the
+/// internal PCA seed coords / zero-jitter logit init, so an amortized encoder
+/// can predict `(a_init, t_init)` and have the joint solver refine them for a
+/// bounded `max_iter` steps. The basis *design* (Duchon centers, harmonic
+/// counts) is still derived from the PCA seed so the warm coordinates are
+/// evaluated against the same atom geometry the unconstrained fit would build.
 #[pyfunction(signature = (
     z,
     atom_basis,
@@ -11068,6 +11077,8 @@ fn sae_build_atom_plans(
     analytic_penalties = None,
     random_state = 0,
     top_k = None,
+    initial_logits = None,
+    initial_coords = None,
 ))]
 fn sae_manifold_fit_minimal<'py>(
     py: Python<'py>,
@@ -11089,6 +11100,8 @@ fn sae_manifold_fit_minimal<'py>(
     analytic_penalties: Option<String>,
     random_state: u64,
     top_k: Option<usize>,
+    initial_logits: Option<PyReadonlyArray2<'py, f64>>,
+    initial_coords: Option<PyReadonlyArray3<'py, f64>>,
 ) -> PyResult<Py<PyDict>> {
     let z_view = z.as_array();
     let (n_obs, _p_out) = z_view.dim();
@@ -11130,8 +11143,50 @@ fn sae_manifold_fit_minimal<'py>(
         random_state,
     )
     .map_err(py_value_error)?;
+    // The optimizer's per-atom latent dimension is `plan.latent_dim`, not the
+    // user-supplied `atom_dim` (periodic atoms carry a harmonic count there).
+    let plan_latent_dim: Vec<usize> = plans.iter().map(|plan| plan.latent_dim).collect();
+    // Warm-start coordinates (issue #357). When the caller supplies
+    // `initial_coords` (an amortized encoder's predicted on-manifold `t`), use
+    // them as the Newton start and as the point at which the basis stacks are
+    // first evaluated; otherwise fall back to the PCA seed. The basis *design*
+    // (`plans`) is always built from the PCA seed so the atom geometry matches
+    // the cold-start fit. Shape must be `(K, N, D_max)` with `D_max` covering
+    // every atom's `plan.latent_dim`.
+    let start_coords: Array3<f64> = match &initial_coords {
+        Some(arr) => {
+            let view = arr.as_array();
+            let shape = view.shape();
+            if shape.len() != 3 {
+                return Err(py_value_error(
+                    "sae_manifold_fit_minimal: initial_coords must be a rank-3 (K, N, D_max) array"
+                        .to_string(),
+                ));
+            }
+            if shape[0] != k_atoms || shape[1] != n_obs {
+                return Err(py_value_error(format!(
+                    "sae_manifold_fit_minimal: initial_coords must start with (K, N)=({k_atoms}, {n_obs}); got {shape:?}"
+                )));
+            }
+            let max_dim = *shape.get(2).unwrap_or(&0);
+            for (atom_idx, &d) in plan_latent_dim.iter().enumerate() {
+                if d > max_dim {
+                    return Err(py_value_error(format!(
+                        "sae_manifold_fit_minimal: initial_coords D_max={max_dim} is too small for atom {atom_idx} latent_dim={d}"
+                    )));
+                }
+            }
+            if !view.iter().all(|v| v.is_finite()) {
+                return Err(py_value_error(
+                    "sae_manifold_fit_minimal: initial_coords contains non-finite values".into(),
+                ));
+            }
+            view.to_owned()
+        }
+        None => seed_coords.clone(),
+    };
     let (basis_values, basis_jacobian, smooth_penalties, basis_sizes, _coord_blocks) =
-        sae_build_padded_basis_stacks(&plans, seed_coords.view(), n_obs).map_err(py_value_error)?;
+        sae_build_padded_basis_stacks(&plans, start_coords.view(), n_obs).map_err(py_value_error)?;
     // JumpReLU gates strictly on `logit > threshold` (threshold = 0.0 in the
     // production inner driver). Zero-initialised logits would leave every
     // gate closed at step 0, making the data-fit Jacobian, the sparsity
@@ -11141,18 +11196,44 @@ fn sae_manifold_fit_minimal<'py>(
     // the fit can learn which atoms to prune. Softmax (translation-invariant)
     // and IBP-MAP (uses sigmoid prior with stick-breaking) are unaffected by
     // a uniform logit shift, so zero remains the natural init for those.
-    let mut initial_logits = if assignment_kind == "jumprelu" {
-        Array2::<f64>::from_elem((n_obs, k_atoms), 1.0)
-    } else {
-        Array2::<f64>::zeros((n_obs, k_atoms))
+    // Warm-start logits (issue #357): a caller-supplied `(N, K)` assignment
+    // logit seed (from an amortized encoder) replaces the cold-start init.
+    // When absent we fall back to the documented zero / JumpReLU-positive init
+    // plus the seed-keyed jitter below.
+    let warm_logits: Option<Array2<f64>> = match &initial_logits {
+        Some(arr) => {
+            let view = arr.as_array();
+            if view.dim() != (n_obs, k_atoms) {
+                return Err(py_value_error(format!(
+                    "sae_manifold_fit_minimal: initial_logits must be ({n_obs}, {k_atoms}); got {:?}",
+                    view.dim()
+                )));
+            }
+            if !view.iter().all(|v| v.is_finite()) {
+                return Err(py_value_error(
+                    "sae_manifold_fit_minimal: initial_logits contains non-finite values".into(),
+                ));
+            }
+            Some(view.to_owned())
+        }
+        None => None,
+    };
+    let logits_are_cold = warm_logits.is_none();
+    let mut initial_logits = match warm_logits {
+        Some(logits) => logits,
+        None if assignment_kind == "jumprelu" => Array2::<f64>::from_elem((n_obs, k_atoms), 1.0),
+        None => Array2::<f64>::zeros((n_obs, k_atoms)),
     };
     // Wire `random_state` into the optimizer init: jitter the initial
     // assignment logits with a tiny, seed-keyed deterministic perturbation
     // so different seeds explore different Newton trajectories (issue #178).
     // The jitter is uniform in `±SAE_RANDOM_STATE_LOGIT_JITTER` and uses the
     // same Lehmer LCG pattern as the Duchon-center picker, keyed by
-    // `random_state`. Fixed seeds still produce bit-identical fits.
-    if n_obs > 0 && k_atoms > 0 {
+    // `random_state`. Fixed seeds still produce bit-identical fits. A
+    // warm-started logit seed is left untouched: the encoder's prediction is
+    // the requested starting point and the bounded refinement must begin
+    // exactly there.
+    if n_obs > 0 && k_atoms > 0 && logits_are_cold {
         const SAE_RANDOM_STATE_LOGIT_JITTER: f64 = 1.0e-3;
         let mut state = random_state
             .wrapping_mul(6364136223846793005)
@@ -11183,11 +11264,10 @@ fn sae_manifold_fit_minimal<'py>(
         tau,
     )
     .map_err(py_value_error)?;
-    // The optimizer's latent dimension per atom must match `plan.latent_dim`,
-    // not the user-supplied `atom_dim` — for periodic atoms `atom_dim` carries
-    // a harmonic count, not a coord-block width. Periodic atoms have
-    // `latent_dim == 1`; only the per-atom planning step knows that.
-    let effective_atom_dim: Vec<usize> = plans.iter().map(|plan| plan.latent_dim).collect();
+    // `plan_latent_dim` (computed above) is the optimizer's per-atom latent
+    // dimension — `plan.latent_dim`, not the user-supplied `atom_dim` (periodic
+    // atoms carry a harmonic count there; their `latent_dim == 1`).
+    let effective_atom_dim: Vec<usize> = plan_latent_dim.clone();
     // Thread the per-atom Duchon centers into the inner driver so its
     // `DuchonCoordinateEvaluator` can re-evaluate `Phi(t)` / `dPhi/dt` at each
     // updated latent coordinate instead of freezing the seed snapshot.
@@ -11205,7 +11285,7 @@ fn sae_manifold_fit_minimal<'py>(
         decoder_coefficients.view(),
         smooth_penalties.view(),
         initial_logits.view(),
-        seed_coords.view(),
+        start_coords.view(),
         alpha,
         tau,
         learnable_alpha,
@@ -11254,10 +11334,19 @@ fn sae_manifold_fit_minimal<'py>(
     Ok(result_dict)
 }
 
-/// Out-of-sample reconstruction: same Newton driver as the fit path, with the
+/// Out-of-sample inference: same Newton driver as the fit path, with the
 /// trained decoder blocks held frozen across iterations. `decoder_blocks` is
 /// a per-atom list of `(M_k, p)` arrays; `duchon_centers` is `Some` only for
 /// non-periodic atoms; `n_harmonics_list` is `Some` only for periodic atoms.
+///
+/// Returns the same full payload dict as the fit path (issue #357): the
+/// converged per-token assignments `assignments_z` (N, K), per-atom
+/// on-manifold coordinates `on_atom_coords_t`, gating logits, and the
+/// reconstruction `fitted`. Downstream supervised heads consume the OOS
+/// assignments directly, and the amortized-encoder loop reads the converged
+/// coordinates as distillation targets. `initial_logits` (N, K) and
+/// `initial_coords` (K, N, D_max) optionally warm-start the OOS refinement
+/// from an encoder's per-token prediction.
 #[pyfunction(signature = (
     x_new,
     atom_basis,
@@ -11274,6 +11363,8 @@ fn sae_manifold_fit_minimal<'py>(
     learning_rate = 0.04,
     ridge_ext_coord = 1.0e-6,
     ridge_beta = 1.0e-6,
+    initial_logits = None,
+    initial_coords = None,
 ))]
 fn sae_manifold_predict_oos<'py>(
     py: Python<'py>,
@@ -11292,7 +11383,9 @@ fn sae_manifold_predict_oos<'py>(
     learning_rate: f64,
     ridge_ext_coord: f64,
     ridge_beta: f64,
-) -> PyResult<Py<PyArray2<f64>>> {
+    initial_logits: Option<PyReadonlyArray2<'py, f64>>,
+    initial_coords: Option<PyReadonlyArray3<'py, f64>>,
+) -> PyResult<Py<PyDict>> {
     let x_view = x_new.as_array();
     let (n_obs, p_out) = x_view.dim();
     let k_atoms = atom_basis.len();
@@ -11404,8 +11497,44 @@ fn sae_manifold_predict_oos<'py>(
             }
         }
     }
+    // Warm-start coordinates (issue #357): an amortized encoder's predicted
+    // per-token on-manifold `t` seeds the OOS Newton refinement. When absent
+    // the PCA seed of `x_new` is the cold start. Layout `(K, N, D_max)` with
+    // `D_max` covering every atom's `atom_dim`.
+    let start_coords: Array3<f64> = match &initial_coords {
+        Some(arr) => {
+            let view = arr.as_array();
+            let shape = view.shape();
+            if shape.len() != 3 {
+                return Err(py_value_error(
+                    "sae_manifold_predict_oos: initial_coords must be a rank-3 (K, N, D_max) array"
+                        .to_string(),
+                ));
+            }
+            if shape[0] != k_atoms || shape[1] != n_obs {
+                return Err(py_value_error(format!(
+                    "sae_manifold_predict_oos: initial_coords must start with (K, N)=({k_atoms}, {n_obs}); got {shape:?}"
+                )));
+            }
+            let max_dim = *shape.get(2).unwrap_or(&0);
+            for (atom_idx, &d) in atom_dim.iter().enumerate() {
+                if d > max_dim {
+                    return Err(py_value_error(format!(
+                        "sae_manifold_predict_oos: initial_coords D_max={max_dim} is too small for atom {atom_idx} atom_dim={d}"
+                    )));
+                }
+            }
+            if !view.iter().all(|v| v.is_finite()) {
+                return Err(py_value_error(
+                    "sae_manifold_predict_oos: initial_coords contains non-finite values".into(),
+                ));
+            }
+            view.to_owned()
+        }
+        None => seed_coords.clone(),
+    };
     let (basis_values, basis_jacobian, smooth_penalties, basis_sizes, _coord_blocks) =
-        sae_build_padded_basis_stacks(&plans, seed_coords.view(), n_obs).map_err(py_value_error)?;
+        sae_build_padded_basis_stacks(&plans, start_coords.view(), n_obs).map_err(py_value_error)?;
     let m_max = basis_sizes.iter().copied().max().unwrap_or(1).max(1);
     // Pad trained decoder blocks into (K, M_max, p)
     let mut decoder_coefficients = Array3::<f64>::zeros((k_atoms, m_max, p_out));
@@ -11435,17 +11564,40 @@ fn sae_manifold_predict_oos<'py>(
             .slice_mut(s![atom_idx, 0..m_k, 0..p_out])
             .assign(&block.slice(s![0..m_k, 0..p_out]));
     }
-    let mut initial_logits = Array2::<f64>::zeros((n_obs, k_atoms));
-    if k_atoms == 1 && assignment_kind == "ibp_map" {
-        for row in 0..n_obs {
-            initial_logits[[row, 0]] = 4.0;
+    let initial_logits = match &initial_logits {
+        Some(arr) => {
+            let view = arr.as_array();
+            if view.dim() != (n_obs, k_atoms) {
+                return Err(py_value_error(format!(
+                    "sae_manifold_predict_oos: initial_logits must be ({n_obs}, {k_atoms}); got {:?}",
+                    view.dim()
+                )));
+            }
+            if !view.iter().all(|v| v.is_finite()) {
+                return Err(py_value_error(
+                    "sae_manifold_predict_oos: initial_logits contains non-finite values".into(),
+                ));
+            }
+            view.to_owned()
         }
-    }
+        None => {
+            let mut logits = Array2::<f64>::zeros((n_obs, k_atoms));
+            if k_atoms == 1 && assignment_kind == "ibp_map" {
+                for row in 0..n_obs {
+                    logits[[row, 0]] = 4.0;
+                }
+            }
+            logits
+        }
+    };
     // Mirror the fit path: re-evaluate each Duchon atom's basis at the OOS
     // coordinates the Newton loop produces, using the trained centers.
     let atom_centers: Vec<Option<Array2<f64>>> =
         plans.iter().map(|plan| plan.duchon_centers.clone()).collect();
-    let result_dict = sae_manifold_fit_inner(
+    // Return the full inner payload (issue #357): converged `assignments_z`,
+    // per-atom `on_atom_coords_t`, `logits`, and `fitted`. The supervised head
+    // reads OOS assignments; the amortized encoder reads converged coords.
+    sae_manifold_fit_inner(
         py,
         x_view,
         &atom_basis,
@@ -11457,7 +11609,7 @@ fn sae_manifold_predict_oos<'py>(
         decoder_coefficients.view(),
         smooth_penalties.view(),
         initial_logits.view(),
-        seed_coords.view(),
+        start_coords.view(),
         alpha,
         tau,
         false,
@@ -11472,13 +11624,7 @@ fn sae_manifold_predict_oos<'py>(
         None,
         None,
         None,
-    )?;
-    let bound = result_dict.bind(py);
-    let fitted_any = bound.get_item("fitted")?.ok_or_else(|| {
-        py_value_error("sae_manifold_predict_oos: inner fit missing fitted".into())
-    })?;
-    let fitted_arr: Py<PyArray2<f64>> = fitted_any.extract()?;
-    Ok(fitted_arr)
+    )
 }
 
 /// Coefficient of determination R^2 = 1 - SSR / SST for a fitted SAE-manifold

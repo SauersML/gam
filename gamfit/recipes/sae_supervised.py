@@ -14,12 +14,11 @@ Every numerical step delegates to a Rust kernel: SAE fit, R² scoring,
 GLM solve, prediction. This module only sequences those calls and
 shapes the inputs / outputs. No new math lives here.
 
-Out-of-sample assignment recomputation (needed for prediction on truly
-new ``X``) is not yet exposed by the Rust OOS predict pyfunction — see
-``predict()`` for the explicit deferred-feature error and the matching
-issue note in the module-level docstring of
-``gamfit/_sae_manifold.py``. Prediction on the original training ``X``
-reuses the fitted assignments and is fully supported.
+Out-of-sample prediction on genuinely new ``X`` is fully supported
+(issue #357): the Rust OOS predict path now returns the converged
+per-token assignments, which ``predict()`` feeds into the GLM head via
+:meth:`ManifoldSAE.encode`. Prediction on the original training ``X``
+reuses the cached fit assignments without re-solving.
 """
 
 from __future__ import annotations
@@ -90,32 +89,20 @@ class SaeSupervisedFit:
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Predict the response for ``X``.
 
-        Currently supported: the original training ``X`` (matched by
-        shape + bit-equality against the SAE's stored training data).
-        In that case the cached training assignments are reused and the
-        GLM head is invoked directly — no OOS assignment recomputation.
-
-        For genuinely new ``X``, this raises :class:`NotImplementedError`
-        with a pointer to the Rust kernel work needed to expose OOS
-        assignments. The recipe stays principled: no Python-side
-        re-derivation of the SAE encoder.
+        On the original training ``X`` (matched by shape + bit-equality
+        against the SAE's stored training data) the cached fit assignments
+        are reused. On genuinely new ``X`` the SAE's frozen-decoder OOS
+        solve recomputes the per-token assignments via
+        :meth:`ManifoldSAE.encode` (Rust kernel ``sae_manifold_predict_oos``,
+        issue #357); those latents are fed straight into the GLM head. No
+        Python-side re-derivation of the SAE encoder.
         """
         X_arr = np.asarray(X, dtype=np.float64)
         if X_arr.ndim != 2:
             raise ValueError(f"predict expects a 2D X, got shape {X_arr.shape}")
-        training = self.sae.training_data
-        if X_arr.shape == training.shape and np.array_equal(X_arr, training):
-            latents = self.sae.assignments
-            table = _assignments_to_table(latents, self.latent_names)
-            return np.asarray(self.model.predict(table), dtype=np.float64)
-        raise NotImplementedError(
-            "sae_supervised.predict on a fresh X requires OOS SAE assignments; "
-            "the Rust kernel sae_manifold_predict_oos currently returns only "
-            "reconstructions, not the assignment latents needed by the GLM "
-            "head. File an issue against the Rust SAE module to expose "
-            "assignments from the OOS predict path; do not re-derive them in "
-            "Python."
-        )
+        latents = np.asarray(self.sae.encode(X_arr), dtype=np.float64)
+        table = _assignments_to_table(latents, self.latent_names)
+        return np.asarray(self.model.predict(table), dtype=np.float64)
 
 
 def _validate_supervised_mask(mask: Any, n: int) -> np.ndarray:
