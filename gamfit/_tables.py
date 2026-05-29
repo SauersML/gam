@@ -153,7 +153,7 @@ def response_column_name(formula: str) -> str | None:
 
 
 def mapping_table_columns(data: Mapping[Any, Any]) -> dict[str, list[Any]]:
-    columns = {str(key): list(value) for key, value in data.items()}
+    columns = {str(key): vector_values(value) for key, value in data.items()}
     validate_column_lengths(columns)
     return columns
 
@@ -236,10 +236,18 @@ def stringify_cell(value: Any) -> str:
         return "1" if value else "0"
     if value is None:
         raise ValueError("table cells cannot be None")
-    if isinstance(value, (int, float)):
+    if isinstance(value, int):
+        # bool is handled above; covers Python int and any int subclass
+        # (e.g. numpy integers) so the rendered text is always a bare integer.
+        return repr(int(value))
+    if isinstance(value, float):
         if value != value:
             raise ValueError("table cells cannot be NaN")
-        return repr(value)
+        # float subclasses (e.g. numpy.float64) render via repr() with the
+        # type name in NumPy 2.x ("np.float64(-3.0)"), which the Rust core
+        # cannot parse and so misclassifies the column as categorical.
+        # Normalize through the canonical Python float first.
+        return repr(float(value))
     text = str(value)
     if not text:
         raise ValueError("table cells cannot be empty strings")
@@ -297,6 +305,15 @@ def vector_values(values: Any) -> list[Any]:
         return result
     if isinstance(values, Mapping):
         raise TypeError("target values must be a vector, not a mapping")
+    # pandas/polars/pyarrow columns (and other array-likes) expose tolist /
+    # to_list / to_pylist; prefer those so we get native Python scalars rather
+    # than library-specific scalar objects whose repr is not numeric-parseable.
+    for method_name in ("tolist", "to_list", "to_pylist"):
+        method = getattr(values, method_name, None)
+        if callable(method) and not isinstance(values, (str, bytes, bytearray)):
+            converted = method()
+            if isinstance(converted, list):
+                return converted
     if isinstance(values, Sequence) and not isinstance(values, (str, bytes, bytearray)):
         return list(values)
     raise TypeError("target values must be a 1D array-like sequence")
