@@ -3418,8 +3418,10 @@ mod tests {
         let marg_dqd1 = Array2::<f64>::zeros((n, 1));
         // No logslope columns.
         let log_dg = Array2::<f64>::zeros((n, 0));
-        let time_partition = vec![0..1usize];
-        let marg_partition = vec![0..1usize];
+        let mut time_partition: Vec<std::ops::Range<usize>> = Vec::with_capacity(1);
+        time_partition.push(0..1);
+        let mut marg_partition: Vec<std::ops::Range<usize>> = Vec::with_capacity(1);
+        marg_partition.push(0..1);
         let log_partition: Vec<std::ops::Range<usize>> = Vec::new();
 
         // Pass 1: structural identity row Hessian. q0/q1/qd1/g all weighted

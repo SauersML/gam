@@ -179,7 +179,7 @@ fn rigid_outputs(
         let eta1 = q1[i] * c + s * gi * z[i];
         let chi1 = c;
         let d1 = c;
-        out[0 * n + i] = eta0;
+        out[i] = eta0;
         out[1 * n + i] = eta1;
         out[2 * n + i] = chi1.ln();
         out[3 * n + i] = d1.ln();

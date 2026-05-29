@@ -18223,7 +18223,7 @@ impl crate::custom_family::BlockEffectiveJacobian for LogslopeFlexBlockJacobian 
 
             for j in 0..p {
                 let x_ij = self.design[[i, j]];
-                jac[[0 * n + i, j]] = cu_eta0_g * x_ij;
+                jac[[i, j]] = cu_eta0_g * x_ij;
                 jac[[1 * n + i, j]] = cu_eta1_g * x_ij;
                 jac[[2 * n + i, j]] = cu_logchi1_g * x_ij;
                 jac[[3 * n + i, j]] = cu_logd1_g * x_ij;
@@ -18317,7 +18317,7 @@ impl crate::custom_family::BlockEffectiveJacobian for MarginalFlexBlockJacobian 
                 // ∂log_qd1/∂β_m[k] = dqd1 / qd1
                 let dlogqd1 = if qd1 > 0.0 { dqd1 / qd1 } else { 0.0 };
 
-                jac[[0 * n + i, k]] = deta0;
+                jac[[i, k]] = deta0;
                 jac[[1 * n + i, k]] = deta1;
                 jac[[2 * n + i, k]] = dlogchi1;
                 jac[[3 * n + i, k]] = dlogd1;
@@ -18407,7 +18407,7 @@ impl crate::custom_family::BlockEffectiveJacobian for TimeFlexBlockJacobian {
                 let dq1_logphi = -q1 * dq1;
                 let dlogqd1 = if qd1 > 0.0 { dqd1 / qd1 } else { 0.0 };
 
-                jac[[0 * n + i, k]] = deta0;
+                jac[[i, k]] = deta0;
                 jac[[1 * n + i, k]] = deta1;
                 jac[[2 * n + i, k]] = dlogchi1;
                 jac[[3 * n + i, k]] = dlogd1;
@@ -18485,7 +18485,7 @@ impl crate::custom_family::BlockEffectiveJacobian for ScoreWarpFlexBlockJacobian
                 };
                 // rows 4 and 5 (q1_logphi, log_qd1) are zero: q1, qd1 do not depend on β_h
 
-                jac[[0 * n + i, k]] = deta0;
+                jac[[i, k]] = deta0;
                 jac[[1 * n + i, k]] = deta1;
                 jac[[2 * n + i, k]] = dlogchi1;
                 jac[[3 * n + i, k]] = dlogd1;
@@ -18557,7 +18557,7 @@ impl crate::custom_family::BlockEffectiveJacobian for LinkDevFlexBlockJacobian {
                     0.0
                 };
 
-                jac[[0 * n + i, k]] = deta0;
+                jac[[i, k]] = deta0;
                 jac[[1 * n + i, k]] = deta1;
                 jac[[2 * n + i, k]] = dlogchi1;
                 jac[[3 * n + i, k]] = dlogd1;
@@ -27846,7 +27846,7 @@ mod tests {
                         row, &primary, qg.q1, primary.q1, a1, g, d1, beta_h, beta_w, false,
                     )
                     .unwrap();
-                out[0 * n + row] = entry.eta;
+                out[row] = entry.eta;
                 out[1 * n + row] = exit.eta;
                 out[2 * n + row] = exit.chi.ln();
                 out[3 * n + row] = exit.d.ln();
@@ -27921,7 +27921,7 @@ mod tests {
                         row, &primary, qg.q1, primary.q1, a1, g, d1, beta_h, beta_w, false,
                     )
                     .unwrap();
-                out[0 * n + row] = entry.eta;
+                out[row] = entry.eta;
                 out[1 * n + row] = exit.eta;
                 out[2 * n + row] = exit.chi.ln();
                 out[3 * n + row] = exit.d.ln();
