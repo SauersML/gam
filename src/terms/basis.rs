@@ -3501,11 +3501,22 @@ impl RadialScalarKind {
                 //   dim = 1 (φ = r³):  q = 3r → 0, but t = 3/r → ∞.
                 //   dim = 2 (φ = r² log r): q = 2 log r + 1 → −∞.
                 //   dim = 3 (φ = −r):  q = −1/r → −∞.
-                // None of these has a finite (q, t) pair at the collision
-                // (and for dim ∈ {2, 3} the gradient direction is itself
-                // ill-defined). Surface the degeneracy rather than emit
-                // silent zeros that would smuggle a wrong gradient through
-                // the chain rule.
+                // None of these has a finite (q, t) pair at the collision.
+                // This raw jet is consumed by the *input-coordinate* gradient
+                // ∂φ/∂x_a = q·(x_a − c_a) (see `design_gradient_wrt_t` and
+                // `input_loc_derivatives`), whose value at x = c is a genuine
+                // 0·∞ indeterminacy — for dim ∈ {2, 3} even the limiting
+                // gradient direction is ill-defined (φ has a cusp/cone at the
+                // center). Surface the degeneracy here rather than emit silent
+                // zeros that would smuggle a wrong input gradient downstream.
+                //
+                // The *length-scale* (ψ = log κ) derivative is a different
+                // chain rule: there q and t flow downstream multiplied by the
+                // squared axis component s_a = (x_a − c_a)² (total s_0 = r²),
+                // which vanishes at the collision, so dφ/dψ and d²φ/dψ² both
+                // have finite limits (0). That path must NOT error — it calls
+                // `eval_scale_design_triplet`, which returns those finite
+                // limits at a collision instead of failing here.
                 if r < 1e-14 {
                     return Err(BasisError::DegenerateAtCollision {
                         kernel: "ThinPlate",
@@ -3531,6 +3542,41 @@ impl RadialScalarKind {
                 Ok((phi, q, t))
             }
         }
+    }
+
+    /// Radial jet `(φ, q, t)` for **length-scale (ψ = log κ) derivative**
+    /// construction. Identical to [`eval_design_triplet`] away from a center
+    /// collision, but at a collision (`r → 0`) it returns the *finite*
+    /// chain-rule limit instead of surfacing `DegenerateAtCollision`.
+    ///
+    /// Why this is correct (and why it differs from `eval_design_triplet`):
+    /// the ψ-derivative operator forms
+    ///   dφ/dψ_a      = q · s_a + c · φ
+    ///   d²φ/(dψ_a dψ_b) = t · s_a · s_b + 2 q · s_a · 1[a=b]
+    ///                     + c (…) + c² φ
+    /// where `s_a = w_a (x_a − c_a)²` is a *squared* axis component and
+    /// `c = raw_psi_isotropic_share`. At a collision every `s_a → 0`, and for
+    /// each supported radial kernel `q · r²  = φ'(r) · r → 0` and
+    /// `t · r⁴ + 2 q · r² = φ''(r) r² + φ'(r) r → 0`, so the design
+    /// ψ-derivative and its Hessian tend to 0 regardless of how `q`, `t`
+    /// individually diverge. Returning `(φ(0), 0, 0)` reproduces those limits
+    /// exactly: `0 · s_a = 0` matches `lim q · s_a`, and `c` is 0 for the only
+    /// kernel (thin-plate) whose `eval_design_triplet` would otherwise error,
+    /// so the φ term drops out.
+    ///
+    /// Kernels whose `eval_design_triplet` is already finite at `r = 0`
+    /// (Matérn at smooth ν, smooth Duchon) are delegated unchanged so their
+    /// exact numeric behavior is preserved.
+    pub(crate) fn eval_scale_design_triplet(&self, r: f64) -> Result<(f64, f64, f64), BasisError> {
+        if r < 1e-14
+            && matches!(self, RadialScalarKind::ThinPlate { .. })
+        {
+            // φ(0) = 0 for every supported TPS order, and both ψ-derivative
+            // products carry a vanishing s_a factor, so (0, 0, 0) is the exact
+            // collision limit for the scale chain rule.
+            return Ok((0.0, 0.0, 0.0));
+        }
+        self.eval_design_triplet(r)
     }
 
     #[inline]
@@ -4404,7 +4450,7 @@ impl StreamingRadialState {
                     let h = unsafe { self.data.uget((i, a)) - self.centers.uget((j, a)) }; // SAFETY: bounds per the comment immediately above
                     r2 += metric_weights[a] * h * h;
                 }
-                match self.radial_kind.eval_design_triplet(r2.sqrt()) {
+                match self.radial_kind.eval_scale_design_triplet(r2.sqrt()) {
                     Ok((pv, qv, tv)) => {
                         phi[row_off + j] = pv;
                         q[row_off + j] = qv;
@@ -4462,11 +4508,11 @@ impl StreamingRadialState {
         match &self.axis_mode {
             StreamingAxisMode::PerAxis { metric_weights } => {
                 let r2: f64 = (0..metric_weights.len()).map(|a| s_buf[a]).sum();
-                self.radial_kind.eval_design_triplet(r2.sqrt())
+                self.radial_kind.eval_scale_design_triplet(r2.sqrt())
             }
             StreamingAxisMode::ScalarTotal { .. } => {
                 let r2 = s_buf[0];
-                self.radial_kind.eval_design_triplet(r2.sqrt())
+                self.radial_kind.eval_scale_design_triplet(r2.sqrt())
             }
         }
     }
@@ -7135,7 +7181,7 @@ fn build_aniso_design_psi_derivatives_shared(
                         cb[a] = centers[[j, a]];
                     }
                     let (r, sv) = aniso_distance_and_components(&drb, &cb, eta);
-                    let (phi, q, t) = match radial_kind.eval_design_triplet(r) {
+                    let (phi, q, t) = match radial_kind.eval_scale_design_triplet(r) {
                         Ok(p) => p,
                         Err(_) => {
                             ef.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -7308,7 +7354,7 @@ fn build_scalar_design_psi_derivatives_shared(
                             stable_euclidean_norm((0..dim).map(|a| data[[i, a]] - centers[[j, a]]));
                         (r, r * r)
                     };
-                    let (phi, q, t) = match radial_kind.eval_design_triplet(r) {
+                    let (phi, q, t) = match radial_kind.eval_scale_design_triplet(r) {
                         Ok(p) => p,
                         Err(_) => {
                             ef.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -28904,6 +28950,98 @@ mod tests {
     /// centers-extraction match arms.
     fn expected_duchon_metadata_for_centers() -> ! {
         panic!("expected Duchon metadata for centers extraction")
+    }
+
+    /// Issue #386: the length-scale (ψ) derivative jet for a thin-plate kernel
+    /// must be finite at a center collision (`r → 0`). The raw radial scalars
+    /// q = φ'/r and t = (φ'' − q)/r² diverge there, but the scale chain rule
+    /// multiplies them by the squared axis component s = r² → 0, so the design
+    /// ψ-derivative and its Hessian both tend to 0. `eval_scale_design_triplet`
+    /// returns that finite limit instead of erroring.
+    #[test]
+    fn thin_plate_scale_design_triplet_finite_at_collision() {
+        for dim in [1usize, 2, 3, 4, 5] {
+            for &length_scale in &[1.0_f64, 2.5, 0.3] {
+                let kind = RadialScalarKind::ThinPlate { length_scale, dim };
+
+                // At an exact collision the scale jet is the finite limit
+                // (φ(0), 0, 0) = (0, 0, 0) for every supported TPS order.
+                let (phi0, q0, t0) = kind
+                    .eval_scale_design_triplet(0.0)
+                    .expect("scale jet must be finite at a thin-plate collision");
+                assert!(
+                    phi0.is_finite() && q0.is_finite() && t0.is_finite(),
+                    "dim={dim} ℓ={length_scale}: scale jet at r=0 must be finite, got ({phi0}, {q0}, {t0})"
+                );
+                assert_eq!((phi0, q0, t0), (0.0, 0.0, 0.0));
+
+                // The raw `eval_design_triplet` (input-coordinate gradient path)
+                // must keep surfacing the degeneracy — that gradient is a
+                // genuine 0·∞ indeterminacy at the center.
+                assert!(
+                    matches!(
+                        kind.eval_design_triplet(0.0),
+                        Err(BasisError::DegenerateAtCollision { .. })
+                    ),
+                    "dim={dim}: input-coordinate jet must still error at the collision"
+                );
+
+                // (0, 0, 0) is the *continuous* limit, not an arbitrary clamp:
+                // approaching the collision, the actual scale-derivative
+                // products dφ/dψ = q·r² and d²φ/dψ² = t·r⁴ + 2q·r² shrink to 0.
+                let scale_products = |r: f64| -> (f64, f64) {
+                    let (_, q, t) = kind
+                        .eval_scale_design_triplet(r)
+                        .expect("scale jet finite away from collision");
+                    let r2 = r * r;
+                    ((q * r2).abs(), (t * r2 * r2 + 2.0 * q * r2).abs())
+                };
+                let (d1_far, d2_far) = scale_products(1e-4);
+                let (d1_near, d2_near) = scale_products(1e-10);
+                for v in [d1_far, d2_far, d1_near, d2_near] {
+                    assert!(
+                        v.is_finite(),
+                        "dim={dim} ℓ={length_scale}: scale-derivative products must stay finite"
+                    );
+                }
+                assert!(
+                    d1_near < d1_far && d2_near <= d2_far,
+                    "dim={dim} ℓ={length_scale}: scale derivatives must shrink toward the collision \
+                     (dφ/dψ {d1_far}→{d1_near}, d²φ/dψ² {d2_far}→{d2_near})"
+                );
+                assert!(
+                    d1_near < 1e-6 && d2_near < 1e-6,
+                    "dim={dim} ℓ={length_scale}: scale derivatives should approach 0 at the collision \
+                     (dφ/dψ={d1_near}, d²φ/dψ²={d2_near})"
+                );
+
+                // Away from a collision the scale jet equals the raw jet.
+                let r = 0.37_f64;
+                assert_eq!(
+                    kind.eval_scale_design_triplet(r).unwrap(),
+                    kind.eval_design_triplet(r).unwrap(),
+                    "dim={dim} ℓ={length_scale}: scale and raw jets must agree away from collision"
+                );
+            }
+        }
+    }
+
+    /// Kernels that are already finite at `r = 0` (Matérn at a smooth ν) are
+    /// delegated unchanged by `eval_scale_design_triplet`, so their exact
+    /// numeric behavior is preserved.
+    #[test]
+    fn smooth_kernel_scale_design_triplet_delegates_unchanged() {
+        let kind = RadialScalarKind::Matern {
+            length_scale: 1.3,
+            nu: MaternNu::FiveHalves,
+        };
+        for &r in &[0.0_f64, 1e-15, 1e-9, 0.5, 2.0] {
+            assert_eq!(
+                kind.eval_scale_design_triplet(r).unwrap(),
+                kind.eval_design_triplet(r).unwrap(),
+                "Matérn ν=5/2 scale jet must delegate unchanged at r={r}"
+            );
+        }
     }
 
     /// Issue #247: the SAE Duchon atom's forward design and its derivative jet
