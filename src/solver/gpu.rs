@@ -44,13 +44,20 @@ impl fmt::Display for Device {
     }
 }
 
+/// Resolved solver-device policy, encoded as `u8`:
+/// `0` = **Auto** (the default) — derive from the `GpuRuntime` probe: use the
+/// GPU iff a usable CUDA device was detected; `1` = forced Cuda; `2` = forced
+/// Cpu. Leaving it unset (Auto) makes GPU selection magic-by-default on CUDA
+/// hosts, with no env var or flag — a CPU host transparently stays on CPU.
+/// `configure_device` sets the forced states for callers that must pin a device
+/// (benchmarks, CPU-only deployments, tests).
 static DEVICE: AtomicU8 = AtomicU8::new(0);
 
 pub fn configure_device(device: Device) {
     DEVICE.store(
         match device {
-            Device::Cpu => 0,
             Device::Cuda => 1,
+            Device::Cpu => 2,
         },
         Ordering::Relaxed,
     );
@@ -60,7 +67,19 @@ pub fn configure_device(device: Device) {
 pub fn selected_device() -> Device {
     match DEVICE.load(Ordering::Relaxed) {
         1 => Device::Cuda,
-        _ => Device::Cpu,
+        2 => Device::Cpu,
+        // Auto (default): use the GPU iff the runtime probe found a usable
+        // CUDA device. `GpuRuntime::global()` caches its result in a OnceLock,
+        // so this is a cheap atomic load after the first probe; the probe is
+        // rayon-free, so reaching here from inside a parallel section cannot
+        // deadlock.
+        _ => {
+            if crate::gpu::GpuRuntime::global().is_some() {
+                Device::Cuda
+            } else {
+                Device::Cpu
+            }
+        }
     }
 }
 
