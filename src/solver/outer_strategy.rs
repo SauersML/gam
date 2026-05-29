@@ -1298,9 +1298,27 @@ pub fn plan(cap: &OuterCapability) -> OuterPlan {
             solver: S::Bfgs,
             hessian_source: H::BfgsApprox,
         },
-        // No analytic gradient: emit a BFGS plan so the error surfaces with
-        // context rather than as a panic on an unmatched arm. The runner will
-        // reject this path because it requires an analytic gradient.
+        // No analytic gradient AND no analytic Hessian, with the EFS/HybridEFS
+        // fixed-point lane ruled out above (small `n_params`, or
+        // `fixed_point_available == false`). This is a genuinely cost-only
+        // objective — e.g. the SAE-manifold REML criterion at small ρ
+        // (`n_params ≤ SMALL_OUTER_BFGS_MAX_PARAMS`), which answers only
+        // `eval_cost`. Routing it to BFGS here is a dead end: BFGS needs a
+        // gradient the objective cannot supply, so the runner rejects the
+        // plan and the fit has no working primary. Select the derivative-free
+        // direct search, which drives purely on `eval_cost` and is exactly the
+        // method `plan_with_class(AuxiliaryGradientFree)` already promotes for
+        // the survival/inverse-link baseline θ; here it is the PRIMARY plan
+        // for any no-gradient/no-Hessian objective the EFS lane did not claim.
+        (Unavailable, Unavailable) => OuterPlan {
+            solver: S::CompassSearch,
+            hessian_source: H::BfgsApprox,
+        },
+        // No analytic gradient but a Hessian *is* declared — a contradictory
+        // capability (an exact Hessian with no exact gradient). Emit a BFGS
+        // plan so the error surfaces with context rather than as a panic on an
+        // unmatched arm; the runner rejects it because BFGS requires the
+        // analytic gradient this capability claims is absent.
         (Unavailable, _) => OuterPlan {
             solver: S::Bfgs,
             hessian_source: H::BfgsApprox,
@@ -6678,6 +6696,69 @@ mod tests {
     }
 
     #[test]
+    fn plan_cost_only_few_params_selects_compass_search() {
+        // No analytic gradient, no analytic Hessian, few params, no
+        // fixed-point lane: a genuinely cost-only objective (the SAE-manifold
+        // REML criterion at small ρ). The primary plan must be CompassSearch
+        // (derivative-free, eval_cost-only), NOT Bfgs — Bfgs would be rejected
+        // by the runner for needing a gradient the objective cannot supply,
+        // leaving the fit with no working primary.
+        let cap = OuterCapability {
+            gradient: Derivative::Unavailable,
+            hessian: DeclaredHessianForm::Unavailable,
+            n_params: 5,
+            psi_dim: 0,
+            fixed_point_available: false,
+            barrier_config: None,
+            prefer_gradient_only: false,
+            disable_fixed_point: false,
+        };
+        let p = plan(&cap);
+        assert_eq!(p.solver, Solver::CompassSearch);
+    }
+
+    #[test]
+    fn plan_cost_only_many_params_with_fixed_point_still_efs() {
+        // The cost-only CompassSearch route must NOT disturb v2's EFS
+        // selection: with the fixed-point lane eligible (many params,
+        // fixed_point_available), a no-gradient/no-Hessian objective still
+        // gets Efs, not CompassSearch.
+        let cap = OuterCapability {
+            gradient: Derivative::Unavailable,
+            hessian: DeclaredHessianForm::Unavailable,
+            n_params: 20,
+            psi_dim: 0,
+            fixed_point_available: true,
+            barrier_config: None,
+            prefer_gradient_only: false,
+            disable_fixed_point: false,
+        };
+        let p = plan(&cap);
+        assert_eq!(p.solver, Solver::Efs);
+        assert_eq!(p.hessian_source, HessianSource::EfsFixedPoint);
+    }
+
+    #[test]
+    fn plan_no_gradient_with_declared_hessian_stays_bfgs() {
+        // Contradictory capability (Hessian declared but no gradient) is NOT
+        // the cost-only case and must keep the Bfgs reject-with-context path,
+        // not silently become CompassSearch.
+        let cap = OuterCapability {
+            gradient: Derivative::Unavailable,
+            hessian: DeclaredHessianForm::Either,
+            n_params: 4,
+            psi_dim: 0,
+            fixed_point_available: false,
+            barrier_config: None,
+            prefer_gradient_only: false,
+            disable_fixed_point: false,
+        };
+        let p = plan(&cap);
+        assert_eq!(p.solver, Solver::Bfgs);
+        assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
+    }
+
+    #[test]
     fn plan_boundary_8_params_uses_bfgs() {
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
@@ -8994,9 +9075,11 @@ mod tests {
 
     #[test]
     fn plan_with_class_primary_is_identical_to_plan_for_unavailable_grad() {
-        // Unavailable-grad capability must still route to BFGS for the
-        // primary class (the runner will then hard-error on the missing
-        // analytic gradient — that behavior is tested elsewhere).
+        // `plan_with_class(Primary)` must delegate to `plan()` verbatim. For a
+        // cost-only (gradient+Hessian Unavailable, no fixed-point) capability
+        // that now means CompassSearch under both — the Primary class no longer
+        // diverges from `plan()`. The point of this test is the *identity*, not
+        // the specific solver.
         let cap = aux_cap_unavailable(3);
         assert_eq!(plan_with_class(&cap, SolverClass::Primary), plan(&cap));
     }
