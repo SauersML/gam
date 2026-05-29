@@ -27,9 +27,13 @@ def to_numpy_f64(value: torch.Tensor) -> Any:
     if not isinstance(value, torch.Tensor):
         raise TypeError(f"expected torch.Tensor, got {type(value).__name__}")
     tensor = value.detach()
+    # Move host first, *then* cast dtype. A fused ``.to(device="cpu",
+    # dtype=float64)`` makes PyTorch satisfy the float64 cast on the source
+    # device, and MPS has no float64 — so it raises instead of just moving to
+    # CPU and casting there. Splitting the ops keeps every accelerator working.
     if tensor.device.type != "cpu":
-        tensor = tensor.to(device="cpu", dtype=_tc.float64)
-    elif tensor.dtype != _tc.float64:
+        tensor = tensor.to(device="cpu")
+    if tensor.dtype != _tc.float64:
         tensor = tensor.to(dtype=_tc.float64)
     if not tensor.is_contiguous():
         tensor = tensor.contiguous()
