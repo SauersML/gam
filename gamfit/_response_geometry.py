@@ -231,11 +231,10 @@ class SharedGaussianRemlTangentFit:
 
     def summary(self) -> dict[str, Any]:
         return {
-            "model_class": "shared-gaussian-reml",
-            "lambda": float(self.fit["lambda"]),
-            "rho": float(self.fit["rho"]),
+            "model_class": "joint-tangent-gaussian-reml",
             "reml_score": float(self.fit["reml_score"]),
-            "edf": float(self.fit["edf"]),
+            "lambdas": self.fit["lambdas"].tolist(),
+            "edf": self.fit["edf"].tolist(),
             "sigma2": self.fit["sigma2"].tolist(),
             "template": self.template_model.summary(),
         }
@@ -420,17 +419,13 @@ def _fit_shared_tangent_reml(
         fisher_rao_w,
     )
     out = dict(payload)
-    for key in (
-        "coefficients",
-        "fitted",
-        "sigma2",
-        "lambda",
-        "rho",
-        "reml_score",
-        "edf",
-    ):
+    for key in ("coefficients", "fitted", "sigma2", "lambdas", "edf"):
         if key in out:
             out[key] = np.asarray(out[key], dtype=float)
+    if "reml_score" in out:
+        out["reml_score"] = float(out["reml_score"])
     if str(payload.get("status", "ok")) != "ok":
-        raise ValueError(f"shared Gaussian REML failed with status={payload.get('status')!r}")
+        raise ValueError(
+            f"joint tangent Gaussian REML failed with status={payload.get('status')!r}"
+        )
     return out
