@@ -767,6 +767,35 @@ mod tests {
     }
 
     #[test]
+    fn sphere_aliases_all_dispatch_to_intrinsic_s2_basis() {
+        // Regression for #383: `s2(lat, lon)` must build the same intrinsic
+        // S² (sphere) basis as `sphere()`/`sos()`/`spherical()`. Previously the
+        // `s2` arm returned a Smooth without `type=sphere`, so it silently fell
+        // back to a generic Euclidean 2-D smooth and diverged in the
+        // spatial-kappa optimizer. All four aliases must be byte-for-byte
+        // equivalent in their dispatch (vars + `type=sphere`).
+        for alias in ["sphere", "sos", "spherical", "s2"] {
+            let parsed = parse_formula(&format!("y ~ {alias}(lat, lon)"))
+                .unwrap_or_else(|e| panic!("parse {alias}: {e}"));
+            match &parsed.terms[0] {
+                super::ParsedTerm::Smooth { vars, options, .. } => {
+                    assert_eq!(
+                        vars,
+                        &vec!["lat".to_string(), "lon".to_string()],
+                        "{alias} should keep (lat, lon) as its variables"
+                    );
+                    assert_eq!(
+                        options.get("type").map(String::as_str),
+                        Some("sphere"),
+                        "{alias} must dispatch to the intrinsic sphere basis (type=sphere)"
+                    );
+                }
+                other => panic!("expected sphere smooth term for {alias}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn parses_function_callwithnamed_and_positional_args() {
         let call = parse_function_call("s(log(x + 1), type=\"duchon\", centers=12)").expect("call");
         assert_eq!(call.name, "s");
@@ -2276,30 +2305,23 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                     options,
                 });
             }
-            "sphere" | "sos" | "spherical" => {
+            "sphere" | "sos" | "spherical" | "s2" => {
+                // `s2()` is an alias for the intrinsic S² (sphere) smooth, just
+                // like `sphere()`/`sos()`/`spherical()`. All four share the
+                // Wahba/harmonic sphere basis, so they must dispatch through
+                // the identical `type=sphere` route; otherwise `s2()` would
+                // silently fall back to a generic Euclidean 2-D smooth over
+                // (lat, lon) and diverge in the spatial-kappa optimizer.
                 if vars.len() != 2 {
                     return Err(FormulaDslError::InvalidArgument {
                         reason: format!(
-                            "sphere()/sos() expects exactly two variables: latitude and longitude; got {} in {raw}",
+                            "{name}() expects exactly two variables: latitude and longitude; got {} in {raw}",
                             vars.len()
                         ),
                     }
                     .into());
                 }
                 options.insert("type".to_string(), "sphere".to_string());
-                return Ok(ParsedTerm::Smooth {
-                    label: raw.to_string(),
-                    vars,
-                    kind: SmoothKind::S,
-                    options,
-                });
-            }
-            "s2" => {
-                if vars.len() != 2 {
-                    return Err(format!(
-                        "s2() expects exactly two variables (lat, lon): {raw}"
-                    ));
-                }
                 return Ok(ParsedTerm::Smooth {
                     label: raw.to_string(),
                     vars,
