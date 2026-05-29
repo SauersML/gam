@@ -1623,10 +1623,9 @@ mod cuda {
         relative_tolerance: f64,
     ) -> Result<Array1<f64>, ArrowSchurGpuFailure> {
         let k = rhs_beta.len();
-        let runtime = crate::gpu::linalg::route_through_gpu(
-            crate::gpu::linalg::DispatchOp::Gemv { m: k, k },
-        )
-        .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let runtime =
+            crate::gpu::linalg::route_through_gpu(crate::gpu::linalg::DispatchOp::Gemv { m: k, k })
+                .ok_or(ArrowSchurGpuFailure::Unavailable)?;
         let stream = crate::gpu::runtime::cuda_context_for(runtime.device.ordinal)
             .and_then(|ctx| ctx.new_stream().ok())
             .ok_or(ArrowSchurGpuFailure::Unavailable)?;

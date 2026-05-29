@@ -19,7 +19,7 @@
 //!   dropped, so this is the regression guard for it. Do not relax it.
 
 use gam::geometry::poincare::{tangent_decode_backward, tangent_decode_forward};
-use ndarray::{arr2, Array2, ArrayView2};
+use ndarray::{Array2, ArrayView2, arr2};
 
 const CURVATURE: f64 = -1.0; // unit-curvature ball: radius ~1.
 
@@ -27,11 +27,7 @@ const CURVATURE: f64 = -1.0; // unit-curvature ball: radius ~1.
 fn objective(atoms: &Array2<f64>, gates: &Array2<f64>, g: ArrayView2<'_, f64>) -> f64 {
     let (x_hat, _cache) = tangent_decode_forward(atoms.view(), gates.view(), CURVATURE)
         .expect("forward decode should succeed");
-    x_hat
-        .iter()
-        .zip(g.iter())
-        .map(|(xi, gi)| xi * gi)
-        .sum()
+    x_hat.iter().zip(g.iter()).map(|(xi, gi)| xi * gi).sum()
 }
 
 /// Central finite difference of `objective` w.r.t. one entry of `target`,
@@ -108,7 +104,10 @@ fn poincare_decode_backward_annihilates_radial_gradient_for_clamped_atom() {
     // outward along its own direction cannot change the clamped projection.
     // We seed it along a non-axis direction so the annihilation is a genuine
     // vector condition, not a coordinate coincidence.
-    let dir = [3.0_f64.recip().sqrt() * 2.0, 3.0_f64.recip().sqrt() * 2.0_f64.sqrt()];
+    let dir = [
+        3.0_f64.recip().sqrt() * 2.0,
+        3.0_f64.recip().sqrt() * 2.0_f64.sqrt(),
+    ];
     // |dir| chosen > 1 so the atom is outside the radius-~1 ball.
     let atoms = arr2(&[[dir[0] * 2.0, dir[1] * 2.0]]); // clearly outside
     let gates = arr2(&[[1.0]]); // batch = 1, F = 1

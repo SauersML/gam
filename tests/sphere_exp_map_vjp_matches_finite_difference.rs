@@ -12,7 +12,7 @@
 //! the small-`theta` Taylor branch.
 
 use gam::{RiemannianManifold, SphereManifold};
-use ndarray::{arr1, Array1, ArrayView1};
+use ndarray::{Array1, ArrayView1, arr1};
 
 /// Scalar objective `<g, exp_p(v)>` whose gradients the VJP reproduces.
 fn objective(

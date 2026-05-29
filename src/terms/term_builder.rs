@@ -2739,8 +2739,8 @@ mod tests {
         );
         let col_map = ds.column_map();
 
-        let parsed = parse_formula("y ~ s(x, shape=monotone_increasing)")
-            .expect("parse monotone smooth");
+        let parsed =
+            parse_formula("y ~ s(x, shape=monotone_increasing)").expect("parse monotone smooth");
         let mut notes = Vec::new();
         let terms = build_termspec(
             &parsed.terms,

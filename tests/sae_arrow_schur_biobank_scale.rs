@@ -336,10 +336,18 @@ fn data_fit_beta_hessian_kronecker_matches_dense_reference() {
     let beta_dim = f.term.beta_dim();
     let beta_offsets = f.term.beta_offsets();
     let assignments = f.term.assignment.assignments();
-    let basis_values: Vec<ndarray::Array2<f64>> =
-        f.term.atoms.iter().map(|a| a.basis_values.clone()).collect();
-    let smooth_penalties: Vec<ndarray::Array2<f64>> =
-        f.term.atoms.iter().map(|a| a.smooth_penalty.clone()).collect();
+    let basis_values: Vec<ndarray::Array2<f64>> = f
+        .term
+        .atoms
+        .iter()
+        .map(|a| a.basis_values.clone())
+        .collect();
+    let smooth_penalties: Vec<ndarray::Array2<f64>> = f
+        .term
+        .atoms
+        .iter()
+        .map(|a| a.smooth_penalty.clone())
+        .collect();
 
     let sys = f
         .term

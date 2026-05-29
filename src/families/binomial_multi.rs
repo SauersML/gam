@@ -358,8 +358,7 @@ pub fn fit_penalized_binomial_multi(
                     }
                     eta_trial[row] = v;
                 }
-                let ll =
-                    binomial_log_lik_column(eta_trial.view(), y_col.view(), row_weights);
+                let ll = binomial_log_lik_column(eta_trial.view(), y_col.view(), row_weights);
                 let mut pen = 0.0_f64;
                 if lambda_a != 0.0 {
                     let mut quad = 0.0_f64;
@@ -397,8 +396,7 @@ pub fn fit_penalized_binomial_multi(
             let mut accepted_beta_a = propose_beta(alpha);
             let mut new_objective = evaluate_objective(&accepted_beta_a);
             let mut backtrack = 0_usize;
-            while (!new_objective.is_finite()
-                || new_objective > last_objective_a + 1.0e-12)
+            while (!new_objective.is_finite() || new_objective > last_objective_a + 1.0e-12)
                 && backtrack < 8
             {
                 alpha *= 0.5;
@@ -490,12 +488,15 @@ mod tests {
         let n = 12;
         let p = 2;
         let k = 2;
-        let design = Array2::<f64>::from_shape_fn((n, p), |(i, j)| {
-            if j == 0 { 1.0 } else { ((i + 1) as f64).sin() }
-        });
-        let y = Array2::<f64>::from_shape_fn((n, k), |(i, a)| {
-            if (i + a) % 2 == 0 { 1.0 } else { 0.0 }
-        });
+        let design =
+            Array2::<f64>::from_shape_fn(
+                (n, p),
+                |(i, j)| {
+                    if j == 0 { 1.0 } else { ((i + 1) as f64).sin() }
+                },
+            );
+        let y =
+            Array2::<f64>::from_shape_fn((n, k), |(i, a)| if (i + a) % 2 == 0 { 1.0 } else { 0.0 });
         let penalty = Array2::<f64>::eye(p);
         let lambdas = Array1::<f64>::from_elem(k, 0.5);
         (design, y, penalty, lambdas)

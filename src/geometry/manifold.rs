@@ -476,7 +476,7 @@ pub(crate) fn cholesky_spd(a: &Array2<f64>) -> GeometryResult<Array2<f64>> {
 
 #[cfg(test)]
 mod jacobi_tests {
-    use super::{jacobi_symmetric, GeometryError};
+    use super::{GeometryError, jacobi_symmetric};
     use ndarray::Array2;
 
     /// A large-norm SPD matrix has off-diagonal residuals after

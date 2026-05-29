@@ -188,8 +188,16 @@ fn reduce_in_chunks(
 #[test]
 fn streaming_reduction_matches_in_core_single_chunk() {
     // K = 6, N = 240 so multiple chunk splittings are non-trivial.
-    let (mut term, target, rho) =
-        build_term(6, 4, 1, 240, 2, AssignmentMode::softmax(1.0), 6, 0xC0FFEE_1234);
+    let (mut term, target, rho) = build_term(
+        6,
+        4,
+        1,
+        240,
+        2,
+        AssignmentMode::softmax(1.0),
+        6,
+        0xC0FFEE_1234,
+    );
     let sys = term
         .assemble_arrow_schur(target.view(), &rho, None)
         .unwrap_or_else(|e| panic!("assemble_arrow_schur failed: {e}"));
@@ -255,8 +263,7 @@ fn per_token_block_dim_is_independent_of_k_at_fixed_active() {
 
     let mut per_row_dims_at_k: Vec<Vec<usize>> = Vec::new();
     for k_atoms in [16usize, 32, 64] {
-        let (mut term, target, rho) =
-            build_term(k_atoms, 4, d, n, 2, mode, n_active, 0xBEEF_5678);
+        let (mut term, target, rho) = build_term(k_atoms, 4, d, n, 2, mode, n_active, 0xBEEF_5678);
         let sys = term
             .assemble_arrow_schur(target.view(), &rho, None)
             .unwrap_or_else(|e| panic!("assemble_arrow_schur failed at K={k_atoms}: {e}"));
@@ -299,14 +306,21 @@ fn per_token_block_dim_is_independent_of_k_at_fixed_active() {
 fn gpu_reduced_beta_solve_matches_cpu_when_available() {
     // Assemble a small system and form the reduced `(S, rhs)` on the host; the
     // GPU and CPU reduced solves must agree on the same inputs.
-    let (mut term, target, rho) =
-        build_term(8, 4, 1, 200, 2, AssignmentMode::softmax(1.0), 8, 0x5EED_9012);
+    let (mut term, target, rho) = build_term(
+        8,
+        4,
+        1,
+        200,
+        2,
+        AssignmentMode::softmax(1.0),
+        8,
+        0x5EED_9012,
+    );
     let sys = term
         .assemble_arrow_schur(target.view(), &rho, None)
         .unwrap_or_else(|e| panic!("assemble_arrow_schur failed: {e}"));
     let options = ArrowSolveOptions::automatic(sys.k);
-    let (s_acc, rhs_acc) =
-        reduce_in_chunks(&sys, sys.rows.len(), 1e-4, 1e-4, &options);
+    let (s_acc, rhs_acc) = reduce_in_chunks(&sys, sys.rows.len(), 1e-4, 1e-4, &options);
 
     // Symmetrize `S` the way the streaming solver does before factoring, so the
     // device PCG and the host solve see the identical operator.
