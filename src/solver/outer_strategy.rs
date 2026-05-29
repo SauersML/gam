@@ -9251,9 +9251,7 @@ mod tests {
             },
             {
                 let gradient_touched = Arc::clone(&gradient_touched);
-                move |_: &mut (),
-                      _: &Array1<f64>|
-                      -> Result<OuterEval, EstimationError> {
+                move |_: &mut (), _: &Array1<f64>| -> Result<OuterEval, EstimationError> {
                     gradient_touched.store(true, std::sync::atomic::Ordering::SeqCst);
                     Err(EstimationError::InvalidInput(
                         "baseline aux optimizer: CompassSearch dispatch only calls eval_cost; \

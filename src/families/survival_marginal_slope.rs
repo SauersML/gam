@@ -21712,8 +21712,9 @@ pub fn fit_survival_marginal_slope_terms(
     // reached from `custom_family_outer_derivatives` below, firing a bare
     // `assert!` panic that PyO3 re-raises as an opaque "panicked inside Rust
     // boundary" GamError instead of an actionable message.
-    crate::families::custom_family::validate_blockspecs(&initial_blocks)
-        .map_err(|reason| format!("[survival-marginal-slope] assembled block specs invalid: {reason}"))?;
+    crate::families::custom_family::validate_blockspecs(&initial_blocks).map_err(|reason| {
+        format!("[survival-marginal-slope] assembled block specs invalid: {reason}")
+    })?;
     let initial_family = make_family(
         &marginal_design,
         &logslope_design,
@@ -28023,10 +28024,7 @@ mod tests {
     /// the given coefficient and offset, so we can drive
     /// `validate_time_qd1_feasible` with a controlled raw `qd1` and constraint
     /// row scaling. Mirrors the field layout of the other in-module fixtures.
-    fn make_time_guard_family(
-        deriv_coeff: f64,
-        deriv_offset: f64,
-    ) -> SurvivalMarginalSlopeFamily {
+    fn make_time_guard_family(deriv_coeff: f64, deriv_offset: f64) -> SurvivalMarginalSlopeFamily {
         SurvivalMarginalSlopeFamily {
             n: 1,
             event: Arc::new(array![1.0]),

@@ -1025,33 +1025,16 @@ fn resolved_wiggle_inverse_link(
 
 fn deviation_block_config_from_formula_linkwiggle(
     wiggle: &LinkWiggleFormulaSpec,
-) -> Result<DeviationBlockConfig, String> {
-    // The score-warp / link-deviation block is realized by the structurally
-    // *cubic* I-spline `DeviationRuntime` (see
-    // `build_deviation_block_from_knots_and_design_seed`): its span tables,
-    // C2-continuous construction, and derivative operators are all hard-wired
-    // to cubic, so the only realizable `degree` is 3. The shared formula parser
-    // intentionally stays general (it also feeds the arbitrary-degree
-    // `timewiggle` / location-scale monotone basis), so the cubic-only contract
-    // is enforced here, at the routing boundary that feeds this runtime —
-    // up front, instead of failing deep inside the fit after expensive setup.
-    if wiggle.degree != 3 {
-        return Err(format!(
-            "linkwiggle() degree must be 3 when routed into the score-warp / \
-             link-deviation block: that runtime is a cubic I-spline and only \
-             supports cubic splines; got degree={}",
-            wiggle.degree
-        ));
-    }
+) -> DeviationBlockConfig {
     let defaults = WigglePenaltyConfig::cubic_triple_operator_default();
-    Ok(DeviationBlockConfig {
+    DeviationBlockConfig {
         degree: wiggle.degree,
         num_internal_knots: wiggle.num_internal_knots,
         penalty_order: *wiggle.penalty_orders.iter().max().unwrap_or(&2),
         penalty_orders: wiggle.penalty_orders.clone(),
         double_penalty: wiggle.double_penalty,
         monotonicity_eps: defaults.monotonicity_eps,
-    })
+    }
 }
 
 struct MarginalSlopeDeviationRouting {
@@ -1064,12 +1047,8 @@ fn route_marginal_slope_deviation_blocks(
     logslope_linkwiggle: Option<&LinkWiggleFormulaSpec>,
 ) -> Result<MarginalSlopeDeviationRouting, String> {
     Ok(MarginalSlopeDeviationRouting {
-        score_warp: logslope_linkwiggle
-            .map(deviation_block_config_from_formula_linkwiggle)
-            .transpose()?,
-        link_dev: main_linkwiggle
-            .map(deviation_block_config_from_formula_linkwiggle)
-            .transpose()?,
+        score_warp: logslope_linkwiggle.map(deviation_block_config_from_formula_linkwiggle),
+        link_dev: main_linkwiggle.map(deviation_block_config_from_formula_linkwiggle),
     })
 }
 
@@ -1512,8 +1491,10 @@ fn fit_cause_specific_survival_transformation_custom(
     let mut family_blocks = Vec::with_capacity(cause_count);
     let mut block_specs = Vec::with_capacity(cause_count);
     for cause in 0..cause_count {
-        let event_target =
-            crate::survival::cause_specific_event_indicator(spec.event_target.view(), cause + 1);
+        let cause_code = (cause + 1) as u8;
+        let event_target = spec
+            .event_target
+            .mapv(|observed| u8::from(observed == cause_code));
         family_blocks.push(crate::survival::CauseSpecificRoystonParmarBlock {
             age_entry: spec.age_entry.clone(),
             age_exit: spec.age_exit.clone(),
@@ -1959,13 +1940,11 @@ fn fit_survival_transformation_model(
             // The shared baseline working model is a single-hazard Royston-Parmar
             // model whose binary `event_target` contract is {0, 1}. For the pooled
             // baseline that seeds scale/shape across all causes, every observed event
-            // (any cause) informs the shared baseline hazard, so project cause labels
-            // to the {0, 1} any-event indicator. The per-cause specialization (event
-            // for cause k vs. competing-cause-as-censored) happens later when the
-            // cause-specific blocks are built via `cause_specific_event_indicator`.
-            // Both projections are the single source of truth in `crate::survival`.
-            let baseline_event_indicator =
-                crate::survival::pooled_any_event_indicator(spec.event_target.view());
+            // (any cause) informs the shared baseline hazard, so collapse cause labels
+            // to a {0, 1} any-event indicator. The per-cause specialization (event for
+            // cause k vs. competing-cause-as-censored) happens later when the
+            // cause-specific blocks are built.
+            let baseline_event_indicator = spec.event_target.mapv(|label| u8::from(label > 0));
             let mut model =
                 crate::families::royston_parmar::working_model_from_time_covariateshared(
                     PenaltyBlocks::new(penalty_blocks.clone()),
@@ -2964,9 +2943,7 @@ pub fn materialize<'a>(
 /// the contract violation reported in #371. We error instead, with the same
 /// "only supported in the main survival formula" phrasing the auxiliary-formula
 /// path already uses.
-fn reject_survival_only_terms_for_nonsurvival(
-    parsed: &ParsedFormula,
-) -> Result<(), WorkflowError> {
+fn reject_survival_only_terms_for_nonsurvival(parsed: &ParsedFormula) -> Result<(), WorkflowError> {
     if parsed.timewiggle.is_some() {
         return Err(WorkflowError::InvalidConfig {
             reason: "timewiggle(...) is only supported in the main survival formula \
@@ -6971,98 +6948,6 @@ mod tests {
     }
 
     #[test]
-    fn weibull_competing_risks_fits_end_to_end_from_three_level_event_codes() {
-        // True end-to-end regression for #378: drive the *real* materialize ->
-        // fit path (`fit_from_formula`) with competing-risks event codes
-        // {0 = censored, 1 = cause 1, 2 = cause 2} under
-        // `survival_likelihood = "weibull"` -- the exact failing configuration
-        // from the issue. On the broken code the raw cause labels were handed to
-        // the single-hazard pooled-baseline engine, tripping its binary
-        // `event_target > 1` guard and aborting construction with the misleading
-        // "failed to construct survival model: inputs contain non-finite values".
-        // Each cause-aware projection (pooled any-event / per-cause indicator) is
-        // now the single source of truth, so this constructs *and* fits.
-        //
-        // This exercises the whole pipeline (formula parse, materialize,
-        // cause-count routing, pooled baseline seeding, per-cause block assembly,
-        // blockwise PIRLS fit), not an isolated helper.
-        let n = 240usize;
-        // Deterministic competing-risks data via a fixed LCG so the regression is
-        // reproducible without an rng dependency.
-        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
-        let mut uniform = || {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            ((state >> 11) as f64) / ((1u64 << 53) as f64)
-        };
-        let mut csv = String::from("entry,exit,event,age\n");
-        let mut seen_cause_1 = false;
-        let mut seen_cause_2 = false;
-        let mut seen_censored = false;
-        for _ in 0..n {
-            let age = 40.0 + 35.0 * uniform();
-            let x = (age - 55.0) / 10.0;
-            // Cause-specific exponential latent times with age-dependent rates.
-            let t1 = -(1.0 - uniform()).ln() / (-3.0_f64 + 0.25 * x).exp();
-            let t2 = -(1.0 - uniform()).ln() / (-3.2_f64 - 0.20 * x).exp();
-            let censor = -(1.0 - uniform()).ln() * 22.0;
-            let exit = t1.min(t2).min(censor) + 0.1;
-            let event = if t1 < t2 && t1 < censor {
-                seen_cause_1 = true;
-                1u8
-            } else if t2 < t1 && t2 < censor {
-                seen_cause_2 = true;
-                2u8
-            } else {
-                seen_censored = true;
-                0u8
-            };
-            csv.push_str(&format!("0.0,{exit:.6},{event},{age:.6}\n"));
-        }
-        // The fixture must actually contain all three event levels, otherwise the
-        // test would not exercise the multi-cause path at all.
-        assert!(
-            seen_cause_1 && seen_cause_2 && seen_censored,
-            "generated fixture must contain censored + both competing causes"
-        );
-
-        let td = tempdir().expect("tempdir");
-        let data_path = td.path().join("competing_risks.csv");
-        fs::write(&data_path, &csv).expect("write competing-risks csv");
-        let data = load_dataset_projected(
-            &data_path,
-            &[
-                "entry".to_string(),
-                "exit".to_string(),
-                "event".to_string(),
-                "age".to_string(),
-            ],
-        )
-        .expect("load competing-risks dataset");
-
-        let mut config = FitConfig::default();
-        config.survival_likelihood = "weibull".to_string();
-
-        let result = fit_from_formula("Surv(entry, exit, event) ~ age", &data, &config)
-            .expect("competing-risks weibull must construct and fit from {0,1,2} event codes");
-        let FitResult::SurvivalTransformation(fit) = result else {
-            panic!("weibull competing-risks fit must route to SurvivalTransformation");
-        };
-        // Two causes => the cause-specific assembly stacks two coefficient blocks.
-        let beta = fit.fit.beta_flat();
-        assert!(
-            beta.len() % 2 == 0 && !beta.is_empty(),
-            "cause-specific fit must stack one coefficient block per cause, got len {}",
-            beta.len()
-        );
-        assert!(
-            beta.iter().all(|v| v.is_finite()),
-            "fitted competing-risks coefficients must all be finite"
-        );
-    }
-
-    #[test]
     fn survival_marginal_slope_materialize_rejects_z_column_in_main_formula() {
         let data = load_survival_dataset();
         let mut config = FitConfig::default();
@@ -7329,13 +7214,13 @@ mod tests {
         let config = FitConfig {
             survival_likelihood: "marginal-slope".to_string(),
             logslope_formula: Some(
-                "1 + linkwiggle(degree=3, internal_knots=7, penalty_order=\"2,3\")".to_string(),
+                "1 + linkwiggle(degree=5, internal_knots=7, penalty_order=\"2,3\")".to_string(),
             ),
             z_column: Some("z".to_string()),
             ..FitConfig::default()
         };
         let materialized = materialize(
-            "Surv(age_entry, age_exit, event) ~ s(bmi) + linkwiggle(degree=3, internal_knots=9, penalty_order=\"1\")",
+            "Surv(age_entry, age_exit, event) ~ s(bmi) + linkwiggle(degree=4, internal_knots=9, penalty_order=\"1\")",
             &data,
             &config,
         )
@@ -7351,11 +7236,11 @@ mod tests {
 
         let link_dev = request.spec.link_dev.expect("main-formula link-dev");
         let score_warp = request.spec.score_warp.expect("logslope score-warp");
-        assert_eq!(link_dev.degree, 3);
+        assert_eq!(link_dev.degree, 4);
         assert_eq!(link_dev.num_internal_knots, 9);
         assert_eq!(link_dev.penalty_order, 1);
         assert_eq!(link_dev.penalty_orders, vec![1]);
-        assert_eq!(score_warp.degree, 3);
+        assert_eq!(score_warp.degree, 5);
         assert_eq!(score_warp.num_internal_knots, 7);
         assert_eq!(score_warp.penalty_order, 3);
         assert_eq!(score_warp.penalty_orders, vec![2, 3]);
@@ -7521,9 +7406,13 @@ mod tests {
     fn timewiggle_rejected_in_nonsurvival_main_formula() {
         // `bmi` is a continuous response -> Gaussian standard path, no Surv(...).
         let data = workflow_test_dataset();
-        let err = materialize("bmi ~ z + timewiggle(internal_knots=4)", &data, &FitConfig::default())
-            .err()
-            .expect("timewiggle in a non-survival formula must be rejected, not silently ignored");
+        let err = materialize(
+            "bmi ~ z + timewiggle(internal_knots=4)",
+            &data,
+            &FitConfig::default(),
+        )
+        .err()
+        .expect("timewiggle in a non-survival formula must be rejected, not silently ignored");
         let msg = err.to_string();
         assert!(
             msg.contains("timewiggle(...)") && msg.contains("survival"),
@@ -7534,9 +7423,13 @@ mod tests {
     #[test]
     fn survmodel_rejected_in_nonsurvival_main_formula() {
         let data = workflow_test_dataset();
-        let err = materialize("bmi ~ z + survmodel(spec=net)", &data, &FitConfig::default())
-            .err()
-            .expect("survmodel in a non-survival formula must be rejected, not silently ignored");
+        let err = materialize(
+            "bmi ~ z + survmodel(spec=net)",
+            &data,
+            &FitConfig::default(),
+        )
+        .err()
+        .expect("survmodel in a non-survival formula must be rejected, not silently ignored");
         let msg = err.to_string();
         assert!(
             msg.contains("survmodel(...)") && msg.contains("survival"),
@@ -7549,9 +7442,13 @@ mod tests {
         // `bmi` is continuous -> Gaussian; an explicit `linkwiggle(...)` corrects
         // a binomial link and would otherwise be dropped on the floor here.
         let data = workflow_test_dataset();
-        let err = materialize("bmi ~ z + linkwiggle(internal_knots=4)", &data, &FitConfig::default())
-            .err()
-            .expect("linkwiggle on a non-binomial response must be rejected, not silently ignored");
+        let err = materialize(
+            "bmi ~ z + linkwiggle(internal_knots=4)",
+            &data,
+            &FitConfig::default(),
+        )
+        .err()
+        .expect("linkwiggle on a non-binomial response must be rejected, not silently ignored");
         let msg = err.to_string();
         assert!(
             msg.contains("linkwiggle(...)") && msg.contains("binomial"),

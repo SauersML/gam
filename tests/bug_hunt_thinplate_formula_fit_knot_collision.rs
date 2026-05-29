@@ -93,9 +93,7 @@ fn thinplate_formula_fit_succeeds_on_ordinary_2d_data() {
     // This currently returns Err with the radial-collision message described
     // in the module docs. A working thin-plate fit returns Ok.
     let result = fit_from_formula("y ~ thinplate(x1, x2)", &data, &cfg).unwrap_or_else(|e| {
-        panic!(
-            "thinplate(x1, x2) failed to fit ordinary 2-D data (matern/duchon fit it fine): {e}"
-        )
+        panic!("thinplate(x1, x2) failed to fit ordinary 2-D data (matern/duchon fit it fine): {e}")
     });
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard fit for thinplate(x1, x2)");
@@ -128,10 +126,7 @@ fn thinplate_formula_fit_succeeds_on_ordinary_2d_data() {
         "thinplate predictions must all be finite"
     );
 
-    let span = pred
-        .iter()
-        .cloned()
-        .fold(f64::NEG_INFINITY, f64::max)
+    let span = pred.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
         - pred.iter().cloned().fold(f64::INFINITY, f64::min);
     assert!(
         span > 0.05,

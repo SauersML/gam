@@ -44,10 +44,7 @@ fn sae_manifold_p_greater_than_d_does_not_panic() {
     let mut z = Array2::<f64>::zeros((n, p));
     let mut true_phase = Array2::<f64>::zeros((n, 1));
     // Deterministic Wᵀ ∈ ℝ^{2×p}; arbitrary, but fixed.
-    let w_loadings: [[f64; 5]; 2] = [
-        [0.7, -0.3, 0.4, 0.1, -0.5],
-        [0.2, 0.6, -0.4, 0.3, 0.1],
-    ];
+    let w_loadings: [[f64; 5]; 2] = [[0.7, -0.3, 0.4, 0.1, -0.5], [0.2, 0.6, -0.4, 0.3, 0.1]];
     for i in 0..n {
         let t = (i as f64 + 0.5) / (n as f64); // ∈ (0, 1)
         true_phase[[i, 0]] = t;

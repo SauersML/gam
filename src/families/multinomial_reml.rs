@@ -1156,10 +1156,9 @@ mod tests {
         let design = Arc::new(Array2::<f64>::from_shape_fn((n_obs, p), |(i, j)| {
             0.7 * ((i as f64 + 1.0) * 0.31 + (j as f64) * 0.53).sin() - 0.2 * (j as f64)
         }));
-        let penalty = Arc::new(Array2::<f64>::from_shape_fn(
-            (p, p),
-            |(i, j)| if i == j { 1.0 } else { 0.0 },
-        ));
+        let penalty = Arc::new(Array2::<f64>::from_shape_fn((p, p), |(i, j)| {
+            if i == j { 1.0 } else { 0.0 }
+        }));
         MultinomialFamily::new(y, weights, k, design, penalty, 0)
             .expect("family_with_weights must construct")
     }
@@ -1415,7 +1414,8 @@ mod tests {
             .expect("diagonal some");
         for idx in 0..total {
             assert_eq!(
-                diag[idx], dense[[idx, idx]],
+                diag[idx],
+                dense[[idx, idx]],
                 "matrix-free diagonal entry {idx} must equal dense diagonal bit-for-bit"
             );
         }
@@ -1450,8 +1450,14 @@ mod tests {
         let hv = ws.hessian_matvec(&v).expect("matvec").expect("matvec some");
 
         let eps = 1.0e-6;
-        let g_plus = neglogl_grad(&family, &states_at_betas(&family, &perturb(&betas, &v, eps)));
-        let g_minus = neglogl_grad(&family, &states_at_betas(&family, &perturb(&betas, &v, -eps)));
+        let g_plus = neglogl_grad(
+            &family,
+            &states_at_betas(&family, &perturb(&betas, &v, eps)),
+        );
+        let g_minus = neglogl_grad(
+            &family,
+            &states_at_betas(&family, &perturb(&betas, &v, -eps)),
+        );
         let mut max_abs = 0.0_f64;
         let mut scale = 1.0e-300_f64;
         for idx in 0..total {

@@ -12764,8 +12764,9 @@ mod tests {
         // or logslope (score-warp) slot, since both feed the cubic runtime.
         let parsed_main = parse_formula("y ~ x + linkwiggle(degree=4, internal_knots=9)")
             .expect("main formula parses");
-        let err = super::route_marginal_slope_deviation_blocks(parsed_main.linkwiggle.as_ref(), None)
-            .expect_err("non-cubic main linkwiggle must be rejected at routing");
+        let err =
+            super::route_marginal_slope_deviation_blocks(parsed_main.linkwiggle.as_ref(), None)
+                .expect_err("non-cubic main linkwiggle must be rejected at routing");
         assert!(err.contains("degree must be 3"), "got: {err}");
 
         let (_, parsed_logslope) = parse_matching_auxiliary_formula(
@@ -12774,8 +12775,9 @@ mod tests {
             "--logslope-formula",
         )
         .expect("logslope formula parses");
-        let err = super::route_marginal_slope_deviation_blocks(None, parsed_logslope.linkwiggle.as_ref())
-            .expect_err("non-cubic logslope linkwiggle must be rejected at routing");
+        let err =
+            super::route_marginal_slope_deviation_blocks(None, parsed_logslope.linkwiggle.as_ref())
+                .expect_err("non-cubic logslope linkwiggle must be rejected at routing");
         assert!(err.contains("degree must be 3"), "got: {err}");
     }
 
