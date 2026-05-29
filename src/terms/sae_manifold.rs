@@ -2093,6 +2093,27 @@ impl SaeManifoldTerm {
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
     ) -> Result<SaeManifoldLoss, String> {
+        self.loss_scaled(target, rho, 1.0)
+    }
+
+    /// Penalized objective with a `penalty_scale` applied to the β-tier
+    /// (decoder smoothness) penalty, mirroring
+    /// [`Self::assemble_arrow_schur_scaled`]. The streaming line search sums
+    /// per-chunk `loss_scaled(..., n_chunk / N)` so that the global smoothness
+    /// penalty is counted exactly once across a pass while the per-row data,
+    /// assignment-prior, and ARD terms sum naturally. `penalty_scale == 1.0`
+    /// recovers the full-batch objective.
+    pub fn loss_scaled(
+        &self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        penalty_scale: f64,
+    ) -> Result<SaeManifoldLoss, String> {
+        if !(penalty_scale.is_finite() && penalty_scale > 0.0) {
+            return Err(format!(
+                "SaeManifoldTerm::loss_scaled: penalty_scale must be finite and positive; got {penalty_scale}"
+            ));
+        }
         if target.dim() != (self.n_obs(), self.output_dim()) {
             return Err(format!(
                 "SaeManifoldTerm::loss: Z must be ({}, {}); got {:?}",
@@ -2110,7 +2131,7 @@ impl SaeManifoldTerm {
             }
         }
         let assignment_sparsity = assignment_prior_value(&self.assignment, rho);
-        let smoothness = self.decoder_smoothness_value(rho.lambda_smooth());
+        let smoothness = penalty_scale * self.decoder_smoothness_value(rho.lambda_smooth());
         let ard = self.ard_value(rho)?;
         Ok(SaeManifoldLoss {
             data_fit,
@@ -2171,12 +2192,45 @@ impl SaeManifoldTerm {
     }
 
     /// Assemble the enlarged `(logits, t)` row-local Arrow-Schur system.
+    ///
+    /// Full-batch entry point: a single chunk covering all rows, with the
+    /// β-tier penalties (decoder smoothness, ARD, analytic β penalties) carrying
+    /// their full strength. The streaming driver calls
+    /// [`Self::assemble_arrow_schur_scaled`] directly with a `penalty_scale`
+    /// equal to the minibatch fraction `n_chunk / N`, so that the sum of the
+    /// per-chunk β-tier contributions over a full pass reconstructs exactly the
+    /// single global β penalty (the smoothness/ARD/β terms are functions of `B`
+    /// and the global coordinates, not of the chunk's rows).
     pub fn assemble_arrow_schur(
         &mut self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
         analytic_penalties: Option<&AnalyticPenaltyRegistry>,
     ) -> Result<ArrowSchurSystem, String> {
+        self.assemble_arrow_schur_scaled(target, rho, analytic_penalties, 1.0)
+    }
+
+    /// Assemble the row-local Arrow-Schur system with a `penalty_scale` applied
+    /// to the β-tier (decoder smoothness, ARD prior, analytic β penalties).
+    ///
+    /// `penalty_scale == 1.0` recovers the full-batch assembly. The streaming
+    /// driver passes the minibatch fraction `n_chunk / N` so that the β-tier
+    /// reduced-Schur and gradient contributions of the chunks sum to exactly one
+    /// global copy across a full pass (data-fit, assignment-prior, and per-row
+    /// coord/logit analytic terms are *not* scaled — they are genuine per-row
+    /// sums).
+    pub fn assemble_arrow_schur_scaled(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        analytic_penalties: Option<&AnalyticPenaltyRegistry>,
+        penalty_scale: f64,
+    ) -> Result<ArrowSchurSystem, String> {
+        if !(penalty_scale.is_finite() && penalty_scale > 0.0) {
+            return Err(format!(
+                "SaeManifoldTerm::assemble_arrow_schur_scaled: penalty_scale must be finite and positive; got {penalty_scale}"
+            ));
+        }
         if target.dim() != (self.n_obs(), self.output_dim()) {
             return Err(format!(
                 "SaeManifoldTerm::assemble_arrow_schur: Z must be ({}, {}); got {:?}",
@@ -2199,7 +2253,10 @@ impl SaeManifoldTerm {
         let beta_dim = self.beta_dim();
         let beta_offsets = self.beta_offsets();
         let coord_offsets = self.assignment.coord_offsets();
-        let lambda_smooth = rho.lambda_smooth();
+        // β-tier decoder smoothness is a global (B-only) penalty; under a
+        // minibatch pass it is scaled by the chunk fraction so the per-chunk
+        // contributions sum to one global copy.
+        let lambda_smooth = rho.lambda_smooth() * penalty_scale;
         let (assignment_grad, assignment_hdiag) =
             assignment_prior_grad_hdiag(&self.assignment, rho)?;
 
@@ -2458,6 +2515,10 @@ impl SaeManifoldTerm {
                     }
                     let row_t = coord.row(row);
                     for axis in 0..d {
+                        // ARD on coords is a genuine per-row prior (each row
+                        // contributes 0.5·α·t_row²), so it is NOT minibatch-
+                        // scaled — the per-chunk row sums already reconstruct
+                        // the full ‖t‖² across a pass.
                         let alpha = rho.log_ard[k][axis].exp();
                         block.gt[starts[j] + axis] += alpha * row_t[axis];
                         block.htt[[starts[j] + axis, starts[j] + axis]] += alpha;
@@ -2625,7 +2686,7 @@ impl SaeManifoldTerm {
             self.validate_analytic_penalty_registry(registry)
                 .map_err(|err| format!("SaeManifoldTerm::assemble_arrow_schur: {err}"))?;
             beta_penalty_written = self
-                .add_sae_analytic_penalty_contributions(&mut sys, registry)
+                .add_sae_analytic_penalty_contributions(&mut sys, registry, penalty_scale)
                 .map_err(|err| format!("SaeManifoldTerm::assemble_arrow_schur: {err}"))?;
         }
         // Wire per-atom β block ranges so the Jacobi preconditioner builds one
@@ -2764,6 +2825,7 @@ impl SaeManifoldTerm {
         &self,
         sys: &mut ArrowSchurSystem,
         registry: &AnalyticPenaltyRegistry,
+        penalty_scale: f64,
     ) -> Result<bool, ArrowSchurError> {
         let rho_global = Array1::<f64>::zeros(registry.total_rho_count());
         let layout = registry.rho_layout();
@@ -2911,7 +2973,15 @@ impl SaeManifoldTerm {
                     }
                 }
                 PenaltyTier::Beta => {
-                    self.add_sae_beta_penalty(sys, penalty, beta.view(), rho_local);
+                    // β-tier analytic penalties are global (B-only); minibatch-
+                    // scaled so per-chunk sums reconstruct one global copy.
+                    self.add_sae_beta_penalty(
+                        sys,
+                        penalty,
+                        beta.view(),
+                        rho_local,
+                        penalty_scale,
+                    );
                     beta_penalty_written = true;
                 }
                 PenaltyTier::Rho => {}
@@ -2990,6 +3060,7 @@ impl SaeManifoldTerm {
         penalty: &AnalyticPenaltyKind,
         target_beta: ArrayView1<'_, f64>,
         rho_local: ArrayView1<'_, f64>,
+        penalty_scale: f64,
     ) {
         // MechanismSparsityPenalty is a group-lasso over a single
         // (latent_dim, p) decoder matrix and indexes its target via
@@ -3015,18 +3086,26 @@ impl SaeManifoldTerm {
                     range: start..end,
                     latent_dim: Some(m),
                 };
-                self.add_sae_mech_sparsity_atom(sys, &per_atom, target_beta, rho_local, start, end);
+                self.add_sae_mech_sparsity_atom(
+                    sys,
+                    &per_atom,
+                    target_beta,
+                    rho_local,
+                    start,
+                    end,
+                    penalty_scale,
+                );
             }
             return;
         }
         let k = self.beta_dim();
         let grad = penalty.grad_target(target_beta, rho_local);
         for j in 0..k {
-            sys.gb[j] += grad[j];
+            sys.gb[j] += penalty_scale * grad[j];
         }
         if let Some(diag) = penalty.hessian_diag(target_beta, rho_local) {
             for j in 0..k {
-                sys.hbb[[j, j]] += diag[j];
+                sys.hbb[[j, j]] += penalty_scale * diag[j];
             }
             return;
         }
@@ -3036,7 +3115,7 @@ impl SaeManifoldTerm {
             probe[j] = 1.0;
             let hv = penalty.hvp(target_beta, rho_local, probe.view());
             for i in 0..k {
-                sys.hbb[[i, j]] += hv[i];
+                sys.hbb[[i, j]] += penalty_scale * hv[i];
             }
         }
     }
@@ -3056,10 +3135,11 @@ impl SaeManifoldTerm {
         rho_local: ArrayView1<'_, f64>,
         start: usize,
         end: usize,
+        penalty_scale: f64,
     ) {
         let grad = per_atom.grad_target(target_beta, rho_local);
         for j in start..end {
-            sys.gb[j] += grad[j];
+            sys.gb[j] += penalty_scale * grad[j];
         }
         let k = self.beta_dim();
         let mut probe = Array1::<f64>::zeros(k);
@@ -3068,7 +3148,7 @@ impl SaeManifoldTerm {
             probe[j] = 1.0;
             let hv = per_atom.hvp(target_beta, rho_local, probe.view());
             for i in start..end {
-                sys.hbb[[i, j]] += hv[i];
+                sys.hbb[[i, j]] += penalty_scale * hv[i];
             }
         }
     }
@@ -3300,52 +3380,17 @@ impl SaeManifoldTerm {
         // singular (its Cholesky will fail or produce garbage steps), which is
         // surfaced as an immediate fatal error. Near-rank-deficient columns are
         // logged as INFO so callers can see which atoms are weakly identified.
+        //
+        // The check is performed chunk-aware through the per-atom Gram
+        // accumulator: the full-batch path is the single-chunk special case.
+        // `D_k`'s singular spectrum equals `√spec(G_k)` with
+        // `G_k = D_kᵀ D_k`, so accumulating `G_k` over the whole design and
+        // taking its eigenvalues reproduces the former pivoted-QR rank exactly
+        // while never retaining an `(N × M_k)` design.
         {
-            let n = self.n_obs();
-            let assignments = self.assignment.assignments();
-            for (atom_idx, atom) in self.atoms.iter().enumerate() {
-                let m = atom.basis_size();
-                if m == 0 {
-                    continue;
-                }
-                let assign_col = assignments.column(atom_idx);
-                // D_k = diag(a_·k) · Φ_k, shape (n, M_k).
-                let mut design = atom.basis_values.clone();
-                for row in 0..n {
-                    let a_k = assign_col[row];
-                    for col in 0..m {
-                        design[[row, col]] *= a_k;
-                    }
-                }
-                let diag = crate::solver::identifiability_audit::block_pivoted_qr_diagonal(&design)
-                    .map_err(|e| {
-                        format!(
-                            "SaeManifoldTerm::run_joint_fit_arrow_schur: pre-fit decoder audit \
-                             (atom '{}'): pivoted QR failed: {e}",
-                            atom.name,
-                        )
-                    })?;
-                let rank = crate::solver::identifiability_audit::count_rank(&diag, n, m);
-                if rank < m {
-                    let dropped = m - rank;
-                    if rank == 0 {
-                        return Err(format!(
-                            "SaeManifoldTerm::run_joint_fit_arrow_schur: pre-fit identifiability \
-                             audit: decoder atom '{}' has rank-0 weighted design (n={n}, M_k={m}); \
-                             all assignment weights vanish or the basis is degenerate, so the \
-                             Arrow-Schur Newton system for this block is singular",
-                            atom.name,
-                        ));
-                    }
-                    log::info!(
-                        "[SAE-AUDIT] run_joint_fit_arrow_schur: decoder atom '{}' weighted design \
-                         is rank-deficient (rank={rank}/{m}, {dropped} weakly-identified \
-                         column(s), n={n}); the Arrow-Schur ridge will regularise the deficient \
-                         directions",
-                        atom.name,
-                    );
-                }
-            }
+            let mut grams = self.empty_decoder_gram_accumulator();
+            self.accumulate_decoder_gram(&mut grams);
+            self.finalize_decoder_identifiability_audit(&grams, self.n_obs())?;
         }
         for _ in 0..max_iter {
             self.advance_temperature_schedule()?;
@@ -3455,6 +3500,620 @@ impl SaeManifoldTerm {
         }
         self.update_ard_reml(rho)?;
         self.loss(target, rho)
+    }
+
+    /// Allocate one zero `(M_k × M_k)` Gram accumulator per atom for the
+    /// chunk-aware decoder identifiability audit.
+    fn empty_decoder_gram_accumulator(&self) -> Vec<Array2<f64>> {
+        self.atoms
+            .iter()
+            .map(|atom| {
+                let m = atom.basis_size();
+                Array2::<f64>::zeros((m, m))
+            })
+            .collect()
+    }
+
+    /// Accumulate this term's (chunk's) contribution to the per-atom weighted
+    /// design Gram `G_k += D_kᵀ D_k`, with `D_k = diag(a_·k)·Φ_k`.
+    ///
+    /// `grams[k]` must be `(M_k × M_k)`. Streaming callers invoke this once per
+    /// chunk against the freshly materialized chunk term; the full-batch path
+    /// invokes it once against `self`. The Gram is symmetric and channel-free
+    /// (the `p`-fold output replication is carried by the `⊗ I_p` Kronecker
+    /// structure, so it adds no rank information), so accumulating `Φ` weighted
+    /// by the per-row assignment exactly reproduces the data-fit decoder block
+    /// curvature `G_k` that `assemble_arrow_schur` installs.
+    fn accumulate_decoder_gram(&self, grams: &mut [Array2<f64>]) {
+        let n = self.n_obs();
+        let assignments = self.assignment.assignments();
+        for (atom_idx, atom) in self.atoms.iter().enumerate() {
+            let m = atom.basis_size();
+            if m == 0 {
+                continue;
+            }
+            let assign_col = assignments.column(atom_idx);
+            let gram = &mut grams[atom_idx];
+            // G_k += Σ_row a_row² · φ_row φ_rowᵀ. Hoist the weighted row into a
+            // scratch vector so the rank-1 update is one O(M²) pass per row.
+            let mut weighted = vec![0.0_f64; m];
+            for row in 0..n {
+                let a_k = assign_col[row];
+                if a_k == 0.0 {
+                    continue;
+                }
+                for col in 0..m {
+                    weighted[col] = a_k * atom.basis_values[[row, col]];
+                }
+                for i in 0..m {
+                    let wi = weighted[i];
+                    if wi == 0.0 {
+                        continue;
+                    }
+                    for j in 0..m {
+                        gram[[i, j]] += wi * weighted[j];
+                    }
+                }
+            }
+        }
+    }
+
+    /// Decide rank-deficiency of each accumulated decoder Gram and surface the
+    /// same fatal / INFO contract as the former pivoted-QR audit.
+    fn finalize_decoder_identifiability_audit(
+        &self,
+        grams: &[Array2<f64>],
+        n_total: usize,
+    ) -> Result<(), String> {
+        for (atom_idx, atom) in self.atoms.iter().enumerate() {
+            let m = atom.basis_size();
+            if m == 0 {
+                continue;
+            }
+            let rank = crate::solver::identifiability_audit::rank_of_gram(&grams[atom_idx], n_total)
+                .map_err(|e| {
+                    format!(
+                        "SaeManifoldTerm: pre-fit decoder audit (atom '{}'): \
+                         Gram eigendecomposition failed: {e}",
+                        atom.name,
+                    )
+                })?;
+            if rank < m {
+                let dropped = m - rank;
+                if rank == 0 {
+                    return Err(format!(
+                        "SaeManifoldTerm: pre-fit identifiability audit: decoder atom '{}' has \
+                         rank-0 weighted design (n={n_total}, M_k={m}); all assignment weights \
+                         vanish or the basis is degenerate, so the Arrow-Schur Newton system for \
+                         this block is singular",
+                        atom.name,
+                    ));
+                }
+                log::info!(
+                    "[SAE-AUDIT] decoder atom '{}' weighted design is rank-deficient \
+                     (rank={rank}/{m}, {dropped} weakly-identified column(s), n={n_total}); the \
+                     Arrow-Schur ridge will regularise the deficient directions",
+                    atom.name,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Materialize a row-chunk `[start, end)` of this term as a standalone
+    /// `SaeManifoldTerm`, recomputing `(basis_values, basis_jacobian)` on demand
+    /// from the persisted decoder + atom geometry and the caller-supplied
+    /// per-chunk `(logits, coords)`.
+    ///
+    /// The streaming joint fit NEVER persists the `(N × M)` basis or `(N × K)`
+    /// logit buffers. Instead, for each chunk the caller re-seeds the chunk's
+    /// latent state (the SAE PCA seed restricted to the chunk's `Z` rows for the
+    /// coordinates, and the chunk's gating logits) and this constructor rebuilds
+    /// a small `n_chunk`-row term whose atoms share the global decoder
+    /// coefficients (`B_k`), smoothness penalties, and basis evaluators with
+    /// `self`. Each atom's basis is re-evaluated at the chunk coordinates via
+    /// its `basis_evaluator`, so the chunk term is exactly the restriction of
+    /// the global model to those rows.
+    ///
+    /// Errors if any atom lacks a basis evaluator (a streaming fit must be able
+    /// to re-evaluate `Φ(t)` at the per-chunk coordinates) or if the supplied
+    /// shapes disagree with the term's atom layout.
+    pub fn materialize_chunk(
+        &self,
+        chunk_logits: Array2<f64>,
+        chunk_coords: Vec<Array2<f64>>,
+    ) -> Result<SaeManifoldTerm, String> {
+        let k_atoms = self.k_atoms();
+        if chunk_logits.ncols() != k_atoms {
+            return Err(format!(
+                "SaeManifoldTerm::materialize_chunk: chunk_logits has {} cols but K={k_atoms}",
+                chunk_logits.ncols()
+            ));
+        }
+        if chunk_coords.len() != k_atoms {
+            return Err(format!(
+                "SaeManifoldTerm::materialize_chunk: chunk_coords has {} atoms but K={k_atoms}",
+                chunk_coords.len()
+            ));
+        }
+        let n_chunk = chunk_logits.nrows();
+        let p = self.output_dim();
+        let mut atoms = Vec::with_capacity(k_atoms);
+        for (atom_idx, atom) in self.atoms.iter().enumerate() {
+            let coords = &chunk_coords[atom_idx];
+            if coords.nrows() != n_chunk || coords.ncols() != atom.latent_dim {
+                return Err(format!(
+                    "SaeManifoldTerm::materialize_chunk: atom {atom_idx} coords shape {:?} != ({n_chunk}, {})",
+                    coords.dim(),
+                    atom.latent_dim
+                ));
+            }
+            let evaluator = atom.basis_evaluator.as_ref().ok_or_else(|| {
+                format!(
+                    "SaeManifoldTerm::materialize_chunk: atom '{}' has no basis evaluator; a \
+                     streaming fit must re-evaluate Φ(t) at each chunk's coordinates",
+                    atom.name
+                )
+            })?;
+            let (phi, jet) = evaluator.evaluate(coords.view())?;
+            let m = atom.basis_size();
+            if phi.dim() != (n_chunk, m) {
+                return Err(format!(
+                    "SaeManifoldTerm::materialize_chunk: atom '{}' evaluator returned Φ {:?}, expected ({n_chunk}, {m})",
+                    atom.name,
+                    phi.dim()
+                ));
+            }
+            if jet.dim() != (n_chunk, m, atom.latent_dim) {
+                return Err(format!(
+                    "SaeManifoldTerm::materialize_chunk: atom '{}' evaluator returned jet {:?}, expected ({n_chunk}, {m}, {})",
+                    atom.name,
+                    jet.dim(),
+                    atom.latent_dim
+                ));
+            }
+            let mut chunk_atom = SaeManifoldAtom::new(
+                atom.name.clone(),
+                atom.basis_kind.clone(),
+                atom.latent_dim,
+                phi,
+                jet,
+                atom.decoder_coefficients.clone(),
+                atom.smooth_penalty.clone(),
+            )?;
+            chunk_atom.basis_evaluator = atom.basis_evaluator.clone();
+            chunk_atom.basis_second_jet = atom.basis_second_jet.clone();
+            atoms.push(chunk_atom);
+        }
+        if p != self.output_dim() {
+            return Err("SaeManifoldTerm::materialize_chunk: output dim drift".to_string());
+        }
+        // Rebuild the assignment from the chunk's logits + coords, preserving
+        // each atom's latent manifold and the global assignment mode.
+        let coord_values: Vec<LatentCoordValues> = chunk_coords
+            .iter()
+            .zip(self.assignment.coords.iter())
+            .map(|(c, src)| {
+                LatentCoordValues::from_matrix_with_manifold(
+                    c.view(),
+                    LatentIdMode::None,
+                    src.manifold().clone(),
+                )
+            })
+            .collect();
+        let assignment = SaeAssignment::with_mode(chunk_logits, coord_values, self.assignment.mode)?;
+        let mut term = SaeManifoldTerm::new(atoms, assignment)?;
+        // The temperature schedule is global outer state; the chunk term is
+        // assembled at the schedule's current temperature, which the caller
+        // already baked into `self.assignment.mode` before materializing.
+        term.temperature_schedule = self.temperature_schedule.clone();
+        Ok(term)
+    }
+
+    /// Streaming / minibatch joint fit: refine the shared decoder coefficients
+    /// `B_k` (and the ARD ρ axes) by sweeping the rows in chunks of
+    /// `chunk_size`, accumulating the reduced Schur system over the shared β
+    /// online, and NEVER materializing the `(N × M)` / `(N × K)` per-row
+    /// buffers.
+    ///
+    /// For each outer iteration:
+    ///
+    /// 1. Each chunk `[start, end)` re-seeds its per-row latent state from the
+    ///    chunk's `Z` slice (`chunk_init` supplies `(logits, coords)` — the SAE
+    ///    PCA seed restricted to the chunk), materializes a small chunk term via
+    ///    [`Self::materialize_chunk`], and assembles its Arrow-Schur system with
+    ///    the β-tier penalties scaled by the chunk fraction `n_chunk / N` (so
+    ///    they sum to exactly one global copy across the pass).
+    /// 2. The chunk's reduced contribution `H_βt(H_tt)⁻¹H_tβ` and `H_βt(H_tt)⁻¹g_t`
+    ///    are accumulated into a single global [`StreamingArrowSchur`] over β,
+    ///    consuming each chunk's Kronecker `htbeta_matvec` procedurally.
+    /// 3. After one full pass, the global reduced system is solved for `Δβ` with
+    ///    the same LM ridge escalation as the full-batch driver, and a streaming
+    ///    Armijo line search on `Δβ` accepts the step against the summed
+    ///    per-chunk loss.
+    /// 4. ARD ρ is refreshed online from the accumulated `Σ‖t‖²` and row count.
+    ///
+    /// Only the global decoder coefficients persist across chunks and outer
+    /// iterations; the per-row `(logits, coords)` are re-seeded each pass and
+    /// discarded. `self`'s own per-row buffers are left untouched — the fitted
+    /// decoder is written back into `self`'s atoms.
+    pub fn run_joint_fit_arrow_schur_streaming<F>(
+        &mut self,
+        n_total: usize,
+        chunk_size: usize,
+        rho: &mut SaeManifoldRho,
+        analytic_penalties: Option<&AnalyticPenaltyRegistry>,
+        max_iter: usize,
+        step_size: f64,
+        ridge_ext_coord: f64,
+        ridge_beta: f64,
+        mut chunk_init: F,
+    ) -> Result<SaeManifoldLoss, String>
+    where
+        F: FnMut(usize, usize) -> Result<(Array2<f64>, Vec<Array2<f64>>, Array2<f64>), String>,
+    {
+        if !(step_size.is_finite() && step_size > 0.0) {
+            return Err(format!(
+                "SaeManifoldTerm::run_joint_fit_arrow_schur_streaming: step_size must be finite and positive; got {step_size}"
+            ));
+        }
+        if chunk_size == 0 {
+            return Err("SaeManifoldTerm::run_joint_fit_arrow_schur_streaming: chunk_size must be positive".to_string());
+        }
+        if n_total == 0 {
+            return Err("SaeManifoldTerm::run_joint_fit_arrow_schur_streaming: n_total must be positive".to_string());
+        }
+        let beta_dim = self.beta_dim();
+
+        // ── Chunk-aware pre-fit decoder identifiability audit ───────────────
+        {
+            let mut grams = self.empty_decoder_gram_accumulator();
+            let mut start = 0usize;
+            while start < n_total {
+                let end = (start + chunk_size).min(n_total);
+                let (logits, coords, _z_chunk) = chunk_init(start, end)?;
+                let chunk = self.materialize_chunk(logits, coords)?;
+                chunk.accumulate_decoder_gram(&mut grams);
+                start = end;
+            }
+            self.finalize_decoder_identifiability_audit(&grams, n_total)?;
+        }
+
+        let mut last_loss = SaeManifoldLoss {
+            data_fit: 0.0,
+            assignment_sparsity: 0.0,
+            smoothness: 0.0,
+            ard: 0.0,
+        };
+        for _ in 0..max_iter {
+            self.advance_temperature_schedule()?;
+            // ── Pass 1: accumulate the global reduced Schur over β online. ──
+            let options = ArrowSolveOptions::automatic(beta_dim);
+            let mut s_acc = Array2::<f64>::zeros((beta_dim, beta_dim));
+            let mut rhs_acc = Array1::<f64>::zeros(beta_dim);
+            let mut gb_acc = Array1::<f64>::zeros(beta_dim);
+            // ARD online sufficient statistics: Σ t² per atom/axis.
+            let mut ard_sumsq: Vec<Array1<f64>> = self
+                .assignment
+                .coords
+                .iter()
+                .map(|c| Array1::<f64>::zeros(c.latent_dim()))
+                .collect();
+            let mut pre_step_total = 0.0_f64;
+            // Retain only the per-chunk row ranges so the line search can
+            // re-materialize each chunk by re-invoking `chunk_init` at trial β
+            // values. The chunk's `(logits, coords, Z)` are re-provided by the
+            // seeder each time — never retained — so the pass stays O(Σ M_k²)
+            // in memory rather than O(N · M) / O(N · K).
+            let mut chunk_ranges: Vec<(usize, usize)> = Vec::new();
+            let mut start = 0usize;
+            while start < n_total {
+                let end = (start + chunk_size).min(n_total);
+                let n_chunk = end - start;
+                let penalty_scale = n_chunk as f64 / n_total as f64;
+                let (logits, coords, z_chunk) = chunk_init(start, end)?;
+                if z_chunk.dim() != (n_chunk, self.output_dim()) {
+                    return Err(format!(
+                        "SaeManifoldTerm::run_joint_fit_arrow_schur_streaming: chunk [{start}, {end}) \
+                         Z slice shape {:?} != ({n_chunk}, {})",
+                        z_chunk.dim(),
+                        self.output_dim()
+                    ));
+                }
+                let mut chunk = self.materialize_chunk(logits, coords)?;
+                chunk_ranges.push((start, end));
+                // Accumulate ARD sufficient statistics from the chunk coords.
+                for (atom_idx, coord) in chunk.assignment.coords.iter().enumerate() {
+                    let d = coord.latent_dim();
+                    for row in 0..coord.n_obs() {
+                        let row_t = coord.row(row);
+                        for axis in 0..d {
+                            ard_sumsq[atom_idx][axis] += row_t[axis] * row_t[axis];
+                        }
+                    }
+                }
+                pre_step_total += chunk
+                    .loss_scaled(z_chunk.view(), rho, penalty_scale)?
+                    .total();
+                let sys = chunk
+                    .assemble_arrow_schur_scaled(z_chunk.view(), rho, analytic_penalties, penalty_scale)
+                    .map_err(|err| {
+                        format!("SaeManifoldTerm::run_joint_fit_arrow_schur_streaming: {err}")
+                    })?;
+                // Accumulate the chunk's data-fit β gradient (its g_β already
+                // carries the minibatch-scaled β-penalty gradient).
+                for j in 0..beta_dim {
+                    gb_acc[j] += sys.gb[j];
+                }
+                Self::accumulate_chunk_reduced_schur(
+                    &sys,
+                    ridge_ext_coord,
+                    &options,
+                    &mut s_acc,
+                    &mut rhs_acc,
+                )?;
+                start = end;
+            }
+            // The β-block penalty `H_ββ + ridge_β·I` is global (B-only) and must
+            // be added exactly once. Form it from a one-row probe term so the
+            // structured penalty op (smoothness `λS ⊗ I_p`, analytic β) is
+            // counted at full strength, not minibatch-scaled.
+            self.add_global_beta_penalty(&mut s_acc, &mut gb_acc, rho, analytic_penalties, ridge_beta)?;
+            for j in 0..beta_dim {
+                rhs_acc[j] -= gb_acc[j];
+            }
+            symmetrize_streaming_lower_to_upper(&mut s_acc);
+            // ── Solve the global reduced β system with LM ridge escalation. ──
+            let delta_beta = solve_streaming_reduced_beta(
+                &s_acc,
+                &rhs_acc,
+                ridge_beta,
+                &options,
+            )
+            .map_err(|err| {
+                format!("SaeManifoldTerm::run_joint_fit_arrow_schur_streaming: {err}")
+            })?;
+            // ── Streaming Armijo line search on Δβ. ──
+            let beta0 = self.flatten_beta();
+            let mut grad_dot_step = 0.0_f64;
+            for j in 0..beta_dim {
+                grad_dot_step += gb_acc[j] * delta_beta[j];
+            }
+            let directional_decrease = -grad_dot_step;
+            if !(pre_step_total.is_finite()
+                && directional_decrease.is_finite()
+                && directional_decrease > 0.0)
+            {
+                // No descent direction available; ARD refresh + stop.
+                self.update_ard_reml_from_sumsq(rho, &ard_sumsq, n_total);
+                last_loss = self.streaming_loss(&chunk_ranges, rho, n_total, &mut chunk_init)?;
+                break;
+            }
+            let mut trial_step = step_size;
+            let mut accepted_loss: Option<SaeManifoldLoss> = None;
+            for _ in 0..=SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS {
+                let mut trial_beta = beta0.clone();
+                for j in 0..beta_dim {
+                    trial_beta[j] += trial_step * delta_beta[j];
+                }
+                self.set_flat_beta(trial_beta.view())?;
+                let trial_loss = self.streaming_loss(&chunk_ranges, rho, n_total, &mut chunk_init)?;
+                let trial_total = trial_loss.total();
+                let armijo_bound =
+                    pre_step_total - SAE_MANIFOLD_ARMIJO_C1 * trial_step * directional_decrease;
+                if trial_total.is_finite() && trial_total <= armijo_bound {
+                    accepted_loss = Some(trial_loss);
+                    break;
+                }
+                trial_step *= 0.5;
+            }
+            match accepted_loss {
+                Some(loss) => {
+                    self.update_ard_reml_from_sumsq(rho, &ard_sumsq, n_total);
+                    last_loss = loss;
+                }
+                None => {
+                    // Restore the pre-step β and refresh ARD before stopping.
+                    self.set_flat_beta(beta0.view())?;
+                    self.update_ard_reml_from_sumsq(rho, &ard_sumsq, n_total);
+                    last_loss = self.streaming_loss(&chunk_ranges, rho, n_total, &mut chunk_init)?;
+                    break;
+                }
+            }
+        }
+        Ok(last_loss)
+    }
+
+    /// Accumulate one chunk system's reduced Schur contribution into the shared
+    /// `(β × β)` accumulator and reduced RHS, consuming the chunk's Kronecker
+    /// `htbeta_matvec` procedurally via [`StreamingArrowSchur`].
+    fn accumulate_chunk_reduced_schur(
+        sys: &ArrowSchurSystem,
+        ridge_ext_coord: f64,
+        options: &ArrowSolveOptions,
+        s_acc: &mut Array2<f64>,
+        rhs_acc: &mut Array1<f64>,
+    ) -> Result<(), String> {
+        // One streaming accumulator per chunk, with a zero β-block so the
+        // contribution is purely the chunk's `−Σ_i H_βt(H_tt)⁻¹H_tβ` and
+        // `+Σ_i H_βt(H_tt)⁻¹g_t`; the global β penalty is added once by the
+        // caller. The chunk is processed as a single internal block.
+        let k = sys.k;
+        let chunk_n = sys.rows.len();
+        let mut streaming = StreamingArrowSchur::from_system(sys, chunk_n.max(1));
+        // Zero the β-block so only the per-row reduction is accumulated.
+        streaming.set_beta_block_zero();
+        streaming.reset_accumulator(0.0).map_err(|e| e.to_string())?;
+        streaming
+            .accumulate_chunk(0, chunk_n, ridge_ext_coord, options.mode)
+            .map_err(|e| e.to_string())?;
+        let (contrib_s, contrib_rhs) = streaming.take_accumulators();
+        for i in 0..k {
+            rhs_acc[i] += contrib_rhs[i];
+            for j in 0..k {
+                s_acc[[i, j]] += contrib_s[[i, j]];
+            }
+        }
+        Ok(())
+    }
+
+    /// Add the global decoder β penalty `H_ββ + ridge_β·I` (decoder smoothness
+    /// `λS ⊗ I_p` plus any analytic β penalty) and its gradient exactly once.
+    ///
+    /// Assembled at full strength (`penalty_scale = 1.0`) from a single-row
+    /// probe term that shares `self`'s atom geometry: the β-penalty operator
+    /// depends only on the decoder coefficients, smoothness penalties, and ρ —
+    /// not on the rows — so a one-row term reproduces it exactly while keeping
+    /// the assembly cost `O(M² p)`.
+    fn add_global_beta_penalty(
+        &self,
+        s_acc: &mut Array2<f64>,
+        gb_acc: &mut Array1<f64>,
+        rho: &SaeManifoldRho,
+        analytic_penalties: Option<&AnalyticPenaltyRegistry>,
+        ridge_beta: f64,
+    ) -> Result<(), String> {
+        let beta_dim = self.beta_dim();
+        let probe = self.single_row_probe_term()?;
+        let mut probe = probe;
+        let z = Array2::<f64>::zeros((1, self.output_dim()));
+        let sys = probe
+            .assemble_arrow_schur(z.view(), rho, analytic_penalties)
+            .map_err(|err| {
+                format!("SaeManifoldTerm::add_global_beta_penalty: {err}")
+            })?;
+        let penalty_op = sys.effective_penalty_op();
+        let mut e_j = Array1::<f64>::zeros(beta_dim);
+        let mut col = Array1::<f64>::zeros(beta_dim);
+        for j in 0..beta_dim {
+            e_j.fill(0.0);
+            e_j[j] = 1.0;
+            col.fill(0.0);
+            penalty_op.matvec(
+                e_j.as_slice().expect("contiguous"),
+                col.as_slice_mut().expect("contiguous"),
+            );
+            for i in 0..beta_dim {
+                s_acc[[i, j]] += col[i];
+            }
+            s_acc[[j, j]] += ridge_beta;
+        }
+        // The probe's `g_β` is the global β-penalty gradient (its one synthetic
+        // row contributes a data-fit term against a zero target; subtract that
+        // data-fit gradient out by re-deriving the penalty-only gradient from
+        // the penalty op acting on the current β).
+        let beta_now = self.flatten_beta();
+        let mut pen_grad = Array1::<f64>::zeros(beta_dim);
+        penalty_op.matvec(
+            beta_now.as_slice().expect("contiguous"),
+            pen_grad.as_slice_mut().expect("contiguous"),
+        );
+        for j in 0..beta_dim {
+            gb_acc[j] += pen_grad[j];
+        }
+        Ok(())
+    }
+
+    /// Build a one-row probe term sharing this term's atom geometry, used to
+    /// reproduce the global β-penalty operator without retaining any rows.
+    fn single_row_probe_term(&self) -> Result<SaeManifoldTerm, String> {
+        let k_atoms = self.k_atoms();
+        let mut atoms = Vec::with_capacity(k_atoms);
+        for atom in &self.atoms {
+            let m = atom.basis_size();
+            let phi = Array2::<f64>::zeros((1, m));
+            let jet = Array3::<f64>::zeros((1, m, atom.latent_dim));
+            let mut probe_atom = SaeManifoldAtom::new(
+                atom.name.clone(),
+                atom.basis_kind.clone(),
+                atom.latent_dim,
+                phi,
+                jet,
+                atom.decoder_coefficients.clone(),
+                atom.smooth_penalty.clone(),
+            )?;
+            probe_atom.basis_evaluator = atom.basis_evaluator.clone();
+            probe_atom.basis_second_jet = atom.basis_second_jet.clone();
+            atoms.push(probe_atom);
+        }
+        let logits = Array2::<f64>::zeros((1, k_atoms));
+        let coords: Vec<LatentCoordValues> = self
+            .assignment
+            .coords
+            .iter()
+            .map(|c| {
+                LatentCoordValues::from_matrix_with_manifold(
+                    Array2::<f64>::zeros((1, c.latent_dim())).view(),
+                    LatentIdMode::None,
+                    c.manifold().clone(),
+                )
+            })
+            .collect();
+        let assignment = SaeAssignment::with_mode(logits, coords, self.assignment.mode)?;
+        SaeManifoldTerm::new(atoms, assignment)
+    }
+
+    /// Streaming total loss: sum of the minibatch-scaled per-chunk losses at the
+    /// current β, re-materializing each chunk from a fresh re-seed via
+    /// `chunk_init`. The β-penalty terms are scaled by the chunk fraction so the
+    /// global smoothness penalty is counted once across the pass.
+    fn streaming_loss<F>(
+        &self,
+        chunk_ranges: &[(usize, usize)],
+        rho: &SaeManifoldRho,
+        n_total: usize,
+        chunk_init: &mut F,
+    ) -> Result<SaeManifoldLoss, String>
+    where
+        F: FnMut(usize, usize) -> Result<(Array2<f64>, Vec<Array2<f64>>, Array2<f64>), String>,
+    {
+        let mut data_fit = 0.0_f64;
+        let mut assignment_sparsity = 0.0_f64;
+        let mut smoothness = 0.0_f64;
+        let mut ard = 0.0_f64;
+        for &(start, end) in chunk_ranges {
+            let n_chunk = end - start;
+            let penalty_scale = n_chunk as f64 / n_total as f64;
+            let (logits, coords, z_chunk) = chunk_init(start, end)?;
+            let chunk = self.materialize_chunk(logits, coords)?;
+            let loss = chunk.loss_scaled(z_chunk.view(), rho, penalty_scale)?;
+            data_fit += loss.data_fit;
+            assignment_sparsity += loss.assignment_sparsity;
+            smoothness += loss.smoothness;
+            ard += loss.ard;
+        }
+        Ok(SaeManifoldLoss {
+            data_fit,
+            assignment_sparsity,
+            smoothness,
+            ard,
+        })
+    }
+
+    /// REML ARD update from accumulated `Σ t²` sufficient statistics, mirroring
+    /// [`Self::update_ard_reml`] but driven by the streaming pass's online
+    /// accumulator instead of a retained coordinate matrix.
+    fn update_ard_reml_from_sumsq(
+        &self,
+        rho: &mut SaeManifoldRho,
+        sumsq: &[Array1<f64>],
+        n_total: usize,
+    ) {
+        let n = n_total as f64;
+        for (atom_idx, coord) in self.assignment.coords.iter().enumerate() {
+            let d = coord.latent_dim();
+            if atom_idx >= sumsq.len() || rho.log_ard[atom_idx].len() != d {
+                continue;
+            }
+            for axis in 0..d {
+                let sq = sumsq[atom_idx][axis];
+                if sq < 1.0e-10 {
+                    continue;
+                }
+                let alpha = n / sq;
+                rho.log_ard[atom_idx][axis] = alpha.ln().clamp(-8.0, 16.0);
+            }
+        }
     }
 
     pub fn run_single_external_basis_refresh_step_arrow_schur(
