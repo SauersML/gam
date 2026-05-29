@@ -404,11 +404,14 @@ pub fn compile_with_dual_metric(
         let m_compiled = match m_h_inner_opt.as_ref() {
             Some(m) => {
                 let m_kept = fast_ab(m, &t_inner);
-                debug_assert_eq!(
-                    m_kept.nrows(),
-                    anchor_h.ncols(),
-                    "anchor correction must be indexed by kept anchor directions"
-                );
+                if m_kept.nrows() != anchor_h.ncols() {
+                    return Err(CompilerError::DimensionMismatch(format!(
+                        "anchor correction must be indexed by kept anchor directions: \
+                         m_kept has {} rows but anchor_h has {} columns",
+                        m_kept.nrows(),
+                        anchor_h.ncols()
+                    )));
+                }
                 let g_raw = fast_atb(&raw_anchor_h, &raw_anchor_h);
                 let z_rhs = fast_atb(&raw_anchor_h, &anchor_h);
                 let z = solve_psd_system(&g_raw, &z_rhs)?;
