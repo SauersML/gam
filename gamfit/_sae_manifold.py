@@ -374,8 +374,9 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     *basis functions* (M_k) and the groups still index the ``p_out`` output
     features. The penalty drives basis-function-aligned feature groups to
     zero, encouraging each basis function to load on a single feature
-    cluster. Only ``k_atoms=1`` is supported — multi-atom SAEs would require
-    a stride-aware per-atom view that does not exist yet.
+    cluster. Multi-atom (``k_atoms >= 2``) SAEs are supported: the Rust
+    ``add_sae_beta_penalty`` dispatches the group-lasso per atom, rebuilding
+    the penalty target to each atom's ``(M_k, p_out)`` decoder block (#240).
     """
     src = Z if Z is not None else X
     if src is None:
@@ -503,7 +504,6 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         block_orthogonality_weight=block_orthogonality_weight,
         d_max=max(dims),
         p_out=int(x.shape[1]),
-        k_atoms=k_atoms,
     )
     # `top_k = 0` (legacy sentinel) and `None` both disable top-k gating;
     # anything in `[1, k_atoms]` is forwarded to the Rust driver, which
@@ -568,7 +568,6 @@ def _build_analytic_penalties_payload(
     block_orthogonality_weight: float,
     d_max: int,
     p_out: int,
-    k_atoms: int,
 ) -> str | None:
     """Translate the SAE regularizer knobs into the analytic-penalty JSON
     payload consumed by ``sae_manifold_fit_minimal``.
@@ -577,21 +576,13 @@ def _build_analytic_penalties_payload(
     ``ard_per_atom``, ``isometry_weight``, and ``block_orthogonality_weight``
     target the row-block driver ("t" latent block).
     ``decoder_feature_sparsity_groups`` targets the decoder coefficient
-    block ("beta" latent block, shape ``(M, p_out)`` for ``k_atoms == 1``)
-    and group-lassoes ``p_out`` features in rows of the per-basis-function
-    decoder matrix.
+    block ("beta" latent block) and group-lassoes ``p_out`` features in rows
+    of the per-basis-function decoder matrix. For ``k_atoms >= 2`` the Rust
+    ``add_sae_beta_penalty`` dispatches the group-lasso per atom, rebuilding
+    the penalty target to each atom's ``(M_k, p_out)`` decoder block, so the
+    concatenated ``flatten_beta`` layout with distinct ``M_k`` is handled
+    natively (#240).
     """
-    if decoder_feature_sparsity_groups is not None and int(k_atoms) != 1:
-        # The "beta" latent block in `sae_manifold_fit_inner` (FFI) only
-        # exists for k_atoms == 1, because `flatten_beta` concatenates
-        # per-atom (M_k, p_out) blocks with possibly distinct M_k and no
-        # single (latent_dim, p_features) reshape covers all of them.
-        raise NotImplementedError(
-            "sae_manifold_fit: decoder_feature_sparsity_groups is currently "
-            f"only supported for k_atoms == 1; got k_atoms={int(k_atoms)}. "
-            "Multi-atom decoder group-lasso requires a stride-aware "
-            "per-atom target view in `src/terms/sae_manifold.rs`."
-        )
     items: list[dict[str, Any]] = []
     if bool(ard_per_atom):
         _require_sae_row_block_penalty("ard", "ard_per_atom")
