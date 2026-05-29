@@ -311,6 +311,94 @@ fn hbb_shape_matches_beta_dim() {
 }
 
 // ---------------------------------------------------------------------------
+// Block-diagonal data-fit β-Hessian reduction must match the dense reference.
+//
+// The data-fit Gauss-Newton β-Hessian `Jβᵀ Jβ` is block-diagonal across the
+// `p` output channels and identical per channel, so the assembler now stores
+// it as a single `(M_total × M_total)` block `G` installed as `G ⊗ I_p`
+// (a `KroneckerPenaltyOp`) inside the composite penalty operator, rather than
+// materialising the dense `(K·M·p)²` `sys.hbb`. This test pins that the
+// structured operator's dense form exactly reproduces the dense reference
+// (data-fit GN + decoder smoothness), assembled independently here.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn data_fit_beta_hessian_kronecker_matches_dense_reference() {
+    let k_atoms = 8usize;
+    let m = 4usize;
+    let d = 1usize;
+    let n = 500usize;
+    let p = 2usize;
+    let mut f = build_fixture(k_atoms, m, d, n, p, AssignmentMode::softmax(1.0));
+    let lambda_smooth = f.rho.lambda_smooth();
+
+    // Snapshot per-atom static data needed to build the dense reference.
+    let beta_dim = f.term.beta_dim();
+    let beta_offsets = f.term.beta_offsets();
+    let assignments = f.term.assignment.assignments();
+    let basis_values: Vec<ndarray::Array2<f64>> =
+        f.term.atoms.iter().map(|a| a.basis_values.clone()).collect();
+    let smooth_penalties: Vec<ndarray::Array2<f64>> =
+        f.term.atoms.iter().map(|a| a.smooth_penalty.clone()).collect();
+
+    let sys = f
+        .term
+        .assemble_arrow_schur(f.target.view(), &f.rho, None)
+        .unwrap_or_else(|e| panic!("assemble_arrow_schur failed: {e}"));
+
+    // Dense reference β-Hessian = data-fit GN outer products + decoder
+    // smoothness, indexed exactly as the flat β layout β[off + col*p + oc].
+    let mut reference = Array2::<f64>::zeros((beta_dim, beta_dim));
+    for row in 0..n {
+        // Per-row support: (global β base, a_k·φ_k[col]).
+        let mut a_phi: Vec<(usize, f64)> = Vec::new();
+        for atom_idx in 0..k_atoms {
+            let off = beta_offsets[atom_idx];
+            let a_k = assignments[[row, atom_idx]];
+            for col in 0..m {
+                a_phi.push((off + col * p, a_k * basis_values[atom_idx][[row, col]]));
+            }
+        }
+        for &(base_i, ji) in &a_phi {
+            for &(base_j, jj) in &a_phi {
+                for oc in 0..p {
+                    reference[[base_i + oc, base_j + oc]] += ji * jj;
+                }
+            }
+        }
+    }
+    for atom_idx in 0..k_atoms {
+        let off = beta_offsets[atom_idx];
+        let s = &smooth_penalties[atom_idx];
+        for i in 0..m {
+            for j in 0..m {
+                let s_ij = 0.5 * (s[[i, j]] + s[[j, i]]) * lambda_smooth;
+                for oc in 0..p {
+                    reference[[off + i * p + oc, off + j * p + oc]] += s_ij;
+                }
+            }
+        }
+    }
+
+    let actual = sys.effective_penalty_op().to_dense();
+    assert_eq!(
+        actual.dim(),
+        (beta_dim, beta_dim),
+        "penalty op dense shape mismatch"
+    );
+    let mut max_abs = 0.0_f64;
+    for a in 0..beta_dim {
+        for b in 0..beta_dim {
+            max_abs = max_abs.max((actual[[a, b]] - reference[[a, b]]).abs());
+        }
+    }
+    assert!(
+        max_abs < 1e-9,
+        "structured penalty op dense form deviates from dense reference: max|Δ|={max_abs:.3e}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Row block dimension probe: confirms q = K*(1+d) layout
 // ---------------------------------------------------------------------------
 

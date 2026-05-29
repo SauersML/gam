@@ -1807,6 +1807,26 @@ pub struct SaeManifoldTerm {
     last_row_layout: Option<SaeRowLayout>,
 }
 
+/// Snapshot of exactly the mutable term state that an `apply_newton_step` +
+/// `loss` line-search trial perturbs: per-atom decoder coefficients and the
+/// `refresh_basis`-rebuilt basis evaluations (`basis_values`, `basis_jacobian`),
+/// plus the assignment logits and latent coordinates.
+///
+/// Static fields (atom names, basis kinds, smoothness penalties, basis-evaluator
+/// `Arc`s, assignment mode, temperature schedule, `last_row_layout`) are *not*
+/// snapshotted: they are invariant across an inner Newton line search, so the
+/// previous `self.clone()` per halving re-copied them needlessly. Cloning only
+/// the mutated arrays keeps the `O(N·M·d)` `basis_jacobian` copy off the
+/// per-halving hot path (one snapshot before the search, one restore per
+/// rejected trial) instead of firing it on every Armijo backtrack.
+#[derive(Debug)]
+struct SaeManifoldMutableState {
+    /// Per-atom `(basis_values, basis_jacobian, decoder_coefficients)`.
+    atoms: Vec<(Array2<f64>, Array3<f64>, Array2<f64>)>,
+    logits: Array2<f64>,
+    coords: Vec<LatentCoordValues>,
+}
+
 impl SaeManifoldTerm {
     #[must_use = "build error must be handled"]
     pub fn new(atoms: Vec<SaeManifoldAtom>, assignment: SaeAssignment) -> Result<Self, String> {
@@ -2100,21 +2120,17 @@ impl SaeManifoldTerm {
     }
 
     fn decoder_smoothness_value(&self, lambda_smooth: f64) -> f64 {
-        let p = self.output_dim();
+        // Smoothness penalty value is `0.5·λ·Σ_oc B[:,oc]ᵀ S B[:,oc]`. Form the
+        // `S·B` matrix product once per atom (O(M²·p)) and reduce against `B`
+        // with a single O(M·p) Hadamard sum, instead of the previous
+        // four-factor multiply-accumulate inside an `O(M²·p)` triple loop.
+        // The quadratic form only sees the symmetric part of `S`, so reusing
+        // the raw (un-symmetrised) `smooth_penalty` here is numerically
+        // identical to the symmetrised assembly form.
         let mut acc = 0.0;
         for atom in &self.atoms {
-            let m = atom.basis_size();
-            for out_col in 0..p {
-                for i in 0..m {
-                    for j in 0..m {
-                        acc += 0.5
-                            * lambda_smooth
-                            * atom.decoder_coefficients[[i, out_col]]
-                            * atom.smooth_penalty[[i, j]]
-                            * atom.decoder_coefficients[[j, out_col]];
-                    }
-                }
-            }
+            let sb = atom.smooth_penalty.dot(&atom.decoder_coefficients);
+            acc += 0.5 * lambda_smooth * (&atom.decoder_coefficients * &sb).sum();
         }
         acc
     }
@@ -2277,6 +2293,19 @@ impl SaeManifoldTerm {
         let mut fitted = Array1::<f64>::zeros(p);
         let mut error = Array1::<f64>::zeros(p);
         let mut local_jac = Array2::<f64>::zeros((q, p));
+        // Data-fit Gauss-Newton β-Hessian is block-diagonal across the `p`
+        // output channels and identical in each: with the flat β layout
+        // `β[μ·p + oc] = B[μ, oc]` (μ enumerating (atom, basis_col)) the GN
+        // outer product `Jβᵀ Jβ` couples only equal `oc`, with the same
+        // `(M_total × M_total)` block `G[μ, μ'] = Σ_rows (a_k φ_k[m])(a_{k'} φ_{k'}[m'])`
+        // for every channel. So `H_data = G ⊗ I_p`. We accumulate the single
+        // `M_total × M_total` block `g_data` here and install it as one
+        // `KroneckerPenaltyOp` after the loop, instead of materialising the
+        // dense `(K·p)²` `sys.hbb`. The `μ` index of an `a_phi` entry whose
+        // global β base is `beta_base` is `beta_base / p` (every `beta_offset`
+        // and the `basis_col·p` stride are multiples of `p`).
+        let m_total: usize = self.atoms.iter().map(|a| a.basis_size()).sum();
+        let mut g_data = Array2::<f64>::zeros((m_total, m_total));
         // Stick-breaking prior for IBP-MAP depends only on (k_atoms, alpha)
         // which are constant across rows; precompute once.
         let ibp_prior_vec = match self.assignment.mode {
@@ -2485,14 +2514,21 @@ impl SaeManifoldTerm {
                     // (e.g. assignment exactly zeroed by JumpReLU).
                     continue;
                 }
+                // Data-fit GN β-Hessian: accumulate the channel-independent
+                // `(M_total × M_total)` block `G` once per `(i, j)` pair (the
+                // `out_col` dimension is carried by `I_p` in the Kronecker op),
+                // instead of the previous `p` dense writes into `sys.hbb`.
+                let mu_i = beta_base_i / p;
+                for &(beta_base_j, j_beta_j) in a_phi.iter() {
+                    let mu_j = beta_base_j / p;
+                    g_data[[mu_i, mu_j]] += j_beta_i * j_beta_j;
+                }
                 for out_col in 0..p {
                     let beta_idx = beta_base_i + out_col;
                     sys.gb[beta_idx] += j_beta_i * error[out_col];
                     // No htbeta write — the Kronecker matvec handles this.
-                    for &(beta_base_j, j_beta_j) in a_phi.iter() {
-                        let beta_j = beta_base_j + out_col;
-                        sys.hbb[[beta_idx, beta_j]] += j_beta_i * j_beta_j;
-                    }
+                    // No dense hbb write — the `G ⊗ I_p` Kronecker op installed
+                    // after the loop carries the data-fit GN β-Hessian.
                 }
             }
             // Save per-row Kronecker data for htbeta_matvec construction.
@@ -2524,10 +2560,21 @@ impl SaeManifoldTerm {
             let manifold = self.ext_coord_manifold();
             if !manifold.is_euclidean() {
                 let ext = self.ext_coord_matrix();
+                // Hoist the per-row temporaries out of the loop: `t_buf` holds
+                // the row's ext-coord vector, `jac_mat` the row's (q × p) local
+                // Jacobian, and `projected` the in-place projection target.
+                // Previously each row reallocated `t_i_owned`, a `to_owned()`
+                // copy of the Jacobian view, and a fresh `(q × p)` projection
+                // output; all three are now reused across rows.
+                let mut t_buf = vec![0.0_f64; q];
                 let mut jac_mat = Array2::<f64>::zeros((q, p));
+                let mut projected = Array2::<f64>::zeros((q, p));
                 for row_idx in 0..n {
-                    let t_i_owned: Vec<f64> = ext.row(row_idx).iter().copied().collect();
-                    let t_i = ArrayView1::from(t_i_owned.as_slice());
+                    let ext_row = ext.row(row_idx);
+                    for (slot, &v) in t_buf.iter_mut().zip(ext_row.iter()) {
+                        *slot = v;
+                    }
+                    let t_i = ArrayView1::from(t_buf.as_slice());
                     let jac_flat = &mut kron_jac[row_idx];
                     let q_row = jac_flat.len() / p;
                     for c in 0..q_row {
@@ -2535,9 +2582,11 @@ impl SaeManifoldTerm {
                             jac_mat[[c, j]] = jac_flat[c * p + j];
                         }
                     }
-                    let jac_view = jac_mat.slice(ndarray::s![..q_row, ..]).to_owned();
-                    let projected =
-                        manifold.project_matrix_columns_to_tangent(t_i, jac_view.view());
+                    manifold.project_matrix_columns_to_tangent_into(
+                        t_i,
+                        jac_mat.slice(ndarray::s![..q_row, ..]),
+                        projected.slice_mut(ndarray::s![..q_row, ..]),
+                    );
                     for c in 0..q_row {
                         for j in 0..p {
                             jac_flat[c * p + j] = projected[[c, j]];
@@ -2567,6 +2616,7 @@ impl SaeManifoldTerm {
                 }
             });
         }
+        let mut beta_penalty_written = false;
         if let Some(registry) = analytic_penalties {
             // Upfront validation: refuse penalty kinds the SAE row layout
             // cannot host, and refuse mixed-d row-block configurations.
@@ -2574,7 +2624,8 @@ impl SaeManifoldTerm {
             // "unsupported penalty" fallthrough, no K-gating.
             self.validate_analytic_penalty_registry(registry)
                 .map_err(|err| format!("SaeManifoldTerm::assemble_arrow_schur: {err}"))?;
-            self.add_sae_analytic_penalty_contributions(&mut sys, registry)
+            beta_penalty_written = self
+                .add_sae_analytic_penalty_contributions(&mut sys, registry)
                 .map_err(|err| format!("SaeManifoldTerm::assemble_arrow_schur: {err}"))?;
         }
         // Wire per-atom β block ranges so the Jacobi preconditioner builds one
@@ -2583,11 +2634,25 @@ impl SaeManifoldTerm {
         // `[beta_offsets[k] .. beta_offsets[k] + basis_size[k] * p_out]`.
         sys.set_block_offsets(self.beta_block_offsets());
         // Install the composite BetaPenaltyOp (#296): smoothness contributions
-        // via per-atom KroneckerPenaltyOp (avoid dense K×K materialisation) plus
-        // the data-Gauss-Newton outer products accumulated in sys.hbb.
+        // via per-atom KroneckerPenaltyOp (avoid dense K×K materialisation), the
+        // data-fit Gauss-Newton β-Hessian as the structured `G ⊗ I_p`
+        // KroneckerPenaltyOp (block-diagonal across the `p` output channels,
+        // identical per channel), plus — only when a Beta-tier analytic penalty
+        // was written — the dense `sys.hbb` residual contribution. When no beta
+        // penalty fired, `sys.hbb` is all-zero and the dense `(K·p)²` operator
+        // is skipped entirely.
         {
+            let identity_p = Array2::<f64>::eye(p);
             let mut ops: Vec<Arc<dyn BetaPenaltyOp>> = smooth_ops;
-            ops.push(Arc::new(DensePenaltyOp(sys.hbb.clone())));
+            ops.push(Arc::new(KroneckerPenaltyOp {
+                factor_a: g_data,
+                factor_b: identity_p,
+                global_offset: 0,
+                k: beta_dim,
+            }));
+            if beta_penalty_written {
+                ops.push(Arc::new(DensePenaltyOp(sys.hbb.clone())));
+            }
             sys.set_penalty_op(Arc::new(CompositePenaltyOp { k: beta_dim, ops }));
         }
         // Store the active-set layout for `apply_newton_step`.
@@ -2672,15 +2737,20 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
+    /// Returns `true` when a Beta-tier analytic penalty was accumulated into
+    /// the dense `sys.hbb` block (so the caller knows to wrap it in a
+    /// `DensePenaltyOp`); `false` leaves `sys.hbb` all-zero and lets the
+    /// caller skip the dense `(K·p)²` operator entirely.
     fn add_sae_analytic_penalty_contributions(
         &self,
         sys: &mut ArrowSchurSystem,
         registry: &AnalyticPenaltyRegistry,
-    ) -> Result<(), ArrowSchurError> {
+    ) -> Result<bool, ArrowSchurError> {
         let rho_global = Array1::<f64>::zeros(registry.total_rho_count());
         let layout = registry.rho_layout();
         let logits_flat = flat_logits(self.assignment.logits.view());
         let beta = self.flatten_beta();
+        let mut beta_penalty_written = false;
         for (penalty, (rho_slice, tier, name)) in registry.penalties.iter().zip(layout.iter()) {
             let rho_local = rho_global.slice(s![rho_slice.clone()]);
             match tier {
@@ -2823,11 +2893,12 @@ impl SaeManifoldTerm {
                 }
                 PenaltyTier::Beta => {
                     self.add_sae_beta_penalty(sys, penalty, beta.view(), rho_local);
+                    beta_penalty_written = true;
                 }
                 PenaltyTier::Rho => {}
             }
         }
-        Ok(())
+        Ok(beta_penalty_written)
     }
 
     fn add_sae_logit_penalty(
@@ -2960,6 +3031,44 @@ impl SaeManifoldTerm {
         step_size: f64,
     ) -> Result<(), String> {
         self.apply_newton_step_impl(delta_ext_coord, delta_beta, step_size, false)
+    }
+
+    /// Capture the mutable state perturbed by an `apply_newton_step` +
+    /// `loss` line-search trial (decoder coefficients, basis evaluations,
+    /// assignment logits, latent coordinates). See
+    /// [`SaeManifoldMutableState`].
+    fn snapshot_mutable_state(&self) -> SaeManifoldMutableState {
+        let atoms = self
+            .atoms
+            .iter()
+            .map(|atom| {
+                (
+                    atom.basis_values.clone(),
+                    atom.basis_jacobian.clone(),
+                    atom.decoder_coefficients.clone(),
+                )
+            })
+            .collect();
+        SaeManifoldMutableState {
+            atoms,
+            logits: self.assignment.logits.clone(),
+            coords: self.assignment.coords.clone(),
+        }
+    }
+
+    /// Restore the mutable state captured by [`Self::snapshot_mutable_state`].
+    /// Assigns into the existing arrays in place so the restore reuses the
+    /// already-allocated buffers rather than reallocating per trial.
+    fn restore_mutable_state(&mut self, snapshot: &SaeManifoldMutableState) {
+        for (atom, (basis_values, basis_jacobian, decoder)) in
+            self.atoms.iter_mut().zip(snapshot.atoms.iter())
+        {
+            atom.basis_values.assign(basis_values);
+            atom.basis_jacobian.assign(basis_jacobian);
+            atom.decoder_coefficients.assign(decoder);
+        }
+        self.assignment.logits.assign(&snapshot.logits);
+        self.assignment.coords.clone_from(&snapshot.coords);
     }
 
     fn apply_newton_step_impl(
@@ -3169,19 +3278,35 @@ impl SaeManifoldTerm {
                 delta_ext_coord.view(),
                 delta_beta.view(),
             );
-            let snapshot = self.clone();
+            // Snapshot only the state that `apply_newton_step` + `loss`
+            // perturb (decoder coefficients, basis evaluations, assignment
+            // logits/coords) once before the line search. Each rejected trial
+            // restores from this snapshot in place; the static atom metadata,
+            // smoothness penalties and basis-evaluator `Arc`s are never
+            // re-cloned. This replaces the per-halving full `self.clone()`,
+            // whose dominant cost was copying the `O(N·M·d)` `basis_jacobian`
+            // and `O(N·M)` `basis_values` on every backtrack.
+            let snapshot = self.snapshot_mutable_state();
             if !(pre_step_total.is_finite()
                 && directional_decrease.is_finite()
                 && directional_decrease > 0.0)
             {
-                *self = snapshot;
+                // Pre-step state is unperturbed here; restore is a no-op but
+                // keeps the invariant explicit.
+                self.restore_mutable_state(&snapshot);
                 break;
             }
 
             let mut trial_step_size = step_size;
             let mut accepted = false;
-            for _ in 0..=SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS {
-                *self = snapshot.clone();
+            for halving in 0..=SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS {
+                if halving > 0 {
+                    // Reset to the pre-step state before re-applying at the
+                    // halved step. The first trial starts from the pre-step
+                    // state already, so the restore is only needed after a
+                    // rejected trial mutated `self`.
+                    self.restore_mutable_state(&snapshot);
+                }
                 let trial_result = self
                     .apply_newton_step(delta_ext_coord.view(), delta_beta.view(), trial_step_size)
                     .and_then(|()| self.loss(target, rho));
@@ -3197,7 +3322,7 @@ impl SaeManifoldTerm {
                 trial_step_size *= 0.5;
             }
             if !accepted {
-                *self = snapshot;
+                self.restore_mutable_state(&snapshot);
                 break;
             }
         }
@@ -4072,6 +4197,76 @@ mod tests {
             jet[[row, 2, 0]] = -2.0 * std::f64::consts::PI * angle.sin();
         }
         (phi, jet)
+    }
+
+    /// `snapshot_mutable_state` / `restore_mutable_state` (the in-place
+    /// line-search save/restore that replaced the per-halving full
+    /// `self.clone()`) must restore exactly the state an `apply_newton_step`
+    /// trial perturbs: decoder coefficients, the `refresh_basis`-rebuilt
+    /// basis evaluations, assignment logits, and latent coordinates. Pins
+    /// item-1 of the SAE hot-path CPU-perf refactor.
+    #[test]
+    fn snapshot_restore_round_trips_mutated_state() {
+        let coords0 = array![[0.05], [0.20], [0.55], [0.80]];
+        let (phi0, jet0) = periodic_basis(&coords0);
+        let atom = SaeManifoldAtom::new(
+            "periodic",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi0,
+            jet0,
+            array![[0.2], [-0.3], [0.4]],
+            Array2::<f64>::eye(3),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((4, 1)),
+            vec![coords0],
+            vec![LatentManifold::Circle { period: 1.0 }],
+            AssignmentMode::ibp_map(0.7, 1.0, true),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+
+        // Capture pre-step state, then apply a non-trivial Newton step that
+        // refreshes the basis (changing basis_values/jacobian, decoder
+        // coefficients, logits, and coords).
+        let snapshot = term.snapshot_mutable_state();
+        let pre_basis = term.atoms[0].basis_values.clone();
+        let pre_jet = term.atoms[0].basis_jacobian.clone();
+        let pre_decoder = term.atoms[0].decoder_coefficients.clone();
+        let pre_logits = term.assignment.logits.clone();
+        let pre_coords = term.assignment.coords[0].as_matrix();
+
+        let q = term.assignment.row_block_dim();
+        let beta_dim = term.beta_dim();
+        let delta_ext = Array1::<f64>::from_elem(4 * q, 0.3);
+        let delta_beta = Array1::<f64>::from_elem(beta_dim, -0.4);
+        term.apply_newton_step(delta_ext.view(), delta_beta.view(), 1.0)
+            .unwrap();
+
+        // Something must actually have changed, else the test is vacuous.
+        assert!(
+            (&term.atoms[0].basis_values - &pre_basis)
+                .mapv(f64::abs)
+                .sum()
+                > 1e-9
+                || (&term.atoms[0].decoder_coefficients - &pre_decoder)
+                    .mapv(f64::abs)
+                    .sum()
+                    > 1e-9,
+            "apply_newton_step did not perturb the snapshotted state"
+        );
+
+        // Restore and confirm every snapshotted field matches the pre-step
+        // values bit-for-bit.
+        term.restore_mutable_state(&snapshot);
+        assert_eq!(term.atoms[0].basis_values, pre_basis);
+        assert_eq!(term.atoms[0].basis_jacobian, pre_jet);
+        assert_eq!(term.atoms[0].decoder_coefficients, pre_decoder);
+        assert_eq!(term.assignment.logits, pre_logits);
+        assert_eq!(term.assignment.coords[0].as_matrix(), pre_coords);
     }
 
     #[test]
