@@ -76,7 +76,8 @@ fn spec_with_callback(
         initial_beta: None,
         gauge_priority: 100,
         jacobian_callback: Some(cb),
-        audit_design: None,
+        stacked_design: None,
+        stacked_offset: None,
     }
 }
 
@@ -109,7 +110,8 @@ fn flat_audit_flags_fatal_on_shared_raw_columns() {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         }
     };
 

@@ -198,7 +198,8 @@ fn exact_newton_pseudo_laplace_rhogradient_matches_num_dual_band() {
         initial_beta: Some(array![0.0]),
         gauge_priority: 100,
         jacobian_callback: None,
-        audit_design: None,
+        stacked_design: None,
+        stacked_offset: None,
     };
     let derivative_blocks = vec![Vec::<CustomFamilyBlockPsiDerivative>::new()];
     let options = BlockwiseFitOptions {
@@ -262,7 +263,8 @@ fn exact_newton_pseudo_laplace_psigradient_matches_num_dual_band() {
         initial_beta: Some(array![0.0]),
         gauge_priority: 100,
         jacobian_callback: None,
-        audit_design: None,
+        stacked_design: None,
+        stacked_offset: None,
     };
     let deriv = CustomFamilyBlockPsiDerivative::new(
         Some(0),

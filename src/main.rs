@@ -9981,19 +9981,20 @@ mod tests {
     use super::{
         BlockRole, BoundedCoefficientPriorSpec, CliFirthValidation, DataSchema,
         FAMILY_GAUSSIAN_LOCATION_SCALE, FamilyArg, FittedFamily, LikelihoodSpec, LinkChoice,
-        LinkMode, MODEL_VERSION, ModelKind, ResidualDistribution, ResponseFamily, SavedFitSummary,
-        SavedModel, SurvivalArgs, SurvivalBaselineTarget, SurvivalLikelihoodMode,
-        SurvivalTimeBasisConfig, build_survival_time_basis, classify_cli_error,
-        collect_hierarchical_smooth_overlapwarnings, collect_linear_smooth_overlapwarnings,
-        collect_spatial_smooth_usagewarnings, compact_fit_result_for_batch,
-        compact_saved_multiblock_fit_result, compute_probit_q0_from_eta, core_saved_fit_result,
-        covariance_from_model, effectivelinkwiggle_formulaspec, exact_kernel,
-        fit_result_from_external, load_dataset_projected, parse_formula, parse_link_choice,
-        parse_matching_auxiliary_formula, parse_surv_response, parse_survival_inverse_link,
-        parse_survival_time_basis_config, predict_gam, prepend_id_column_to_prediction_csv,
-        required_columns_for_fit, resolve_family, summarizewiggle_domain,
-        validate_cli_firth_configuration, write_gaussian_location_scale_prediction_csv,
-        write_prediction_csv, write_survival_binary_prediction_csv, write_survival_prediction_csv,
+        LinkMode, MODEL_VERSION, ModelKind, ResidualDistribution, ResponseColumnKind,
+        ResponseFamily, SavedFitSummary, SavedModel, SurvivalArgs, SurvivalBaselineTarget,
+        SurvivalLikelihoodMode, SurvivalTimeBasisConfig, build_survival_time_basis,
+        classify_cli_error, collect_hierarchical_smooth_overlapwarnings,
+        collect_linear_smooth_overlapwarnings, collect_spatial_smooth_usagewarnings,
+        compact_fit_result_for_batch, compact_saved_multiblock_fit_result,
+        compute_probit_q0_from_eta, core_saved_fit_result, covariance_from_model,
+        effectivelinkwiggle_formulaspec, exact_kernel, fit_result_from_external,
+        load_dataset_projected, parse_formula, parse_link_choice, parse_matching_auxiliary_formula,
+        parse_surv_response, parse_survival_inverse_link, parse_survival_time_basis_config,
+        predict_gam, prepend_id_column_to_prediction_csv, required_columns_for_fit, resolve_family,
+        summarizewiggle_domain, validate_cli_firth_configuration,
+        write_gaussian_location_scale_prediction_csv, write_prediction_csv,
+        write_survival_binary_prediction_csv, write_survival_prediction_csv,
     };
     use super::{
         Cli, Command, CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg, run_fit,
@@ -13134,7 +13135,7 @@ mod tests {
             &gam::resource::ResourcePolicy::default_library(),
         )
         .expect_err("Duchon double_penalty should be rejected");
-        assert!(err.contains("does not support double_penalty"));
+        assert!(err.to_string().contains("does not support double_penalty"));
         assert!(inference_notes.is_empty());
     }
 

@@ -22,9 +22,10 @@
 //! anything was exactly the case that crashed. This test pins the binding case
 //! to a fit that succeeds and respects the bound.
 
+use gam::estimate::BlockRole;
 use gam::inference::data::EncodedDataset;
 use gam::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
-use gam::{BlockRole, FitConfig, FitResult, fit_model, materialize};
+use gam::{FitConfig, FitResult, fit_model, materialize};
 use ndarray::Array2;
 
 /// Noiseless dataset whose unconstrained slope is strictly negative.
@@ -124,10 +125,7 @@ fn assert_lower_bound_binds_without_panic(formula: &str) {
         .iter()
         .cloned()
         .fold(f64::NEG_INFINITY, f64::max)
-        - fitted_values
-            .iter()
-            .cloned()
-            .fold(f64::INFINITY, f64::min);
+        - fitted_values.iter().cloned().fold(f64::INFINITY, f64::min);
     assert!(
         fitted_spread < 1.0,
         "binding min=0 bound should flatten the fit (spread ≪ 12); got spread {fitted_spread} for '{formula}'"

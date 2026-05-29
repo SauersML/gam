@@ -10,9 +10,7 @@
 //! Interpretability." arXiv:2501.18823, 2025 — eq. 3 for the per-axis STE.
 
 use gam::terms::PsiSlice;
-use gam::terms::analytic_penalties::{
-    AnalyticPenalty, JumpReLUPenalty, jumprelu_gate_value_grad,
-};
+use gam::terms::analytic_penalties::{AnalyticPenalty, JumpReLUPenalty};
 use ndarray::Array1;
 
 fn build(thresholds: Vec<f64>, weight: f64, eps: f64, n_obs: usize) -> JumpReLUPenalty {

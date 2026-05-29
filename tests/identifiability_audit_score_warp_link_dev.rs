@@ -58,7 +58,8 @@ fn spec(name: &str, design: Array2<f64>, gauge_priority: u8) -> ParameterBlockSp
         initial_beta: None,
         gauge_priority,
         jacobian_callback: None,
-        audit_design: None,
+        stacked_design: None,
+        stacked_offset: None,
     }
 }
 

@@ -2,6 +2,7 @@ use faer::Side;
 use gam::alo::{AloInput, compute_alo_diagnostics_from_pirls, compute_alo_from_input};
 use gam::construction::CanonicalPenalty;
 use gam::faer_ndarray::{FaerArrayView, FaerColView, factorize_symmetricwith_fallback, fast_ata};
+use gam::matrix::{PsdWeightsView, SignedWeightsView};
 use gam::pirls::{self, PenaltyConfig, PirlsConfig, PirlsProblem};
 use gam::types::{
     GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, LogSmoothingParamsView,
@@ -238,8 +239,8 @@ fn alo_solve_setup_rejects_non_square_dense_hessian_instead_of_workaround() {
     let input = AloInput {
         design: &design,
         penalized_hessian: &bad_hessian,
-        hessian_weights: &hessian_weights,
-        score_weights: &score_weights,
+        hessian_weights: SignedWeightsView::from_array(&hessian_weights),
+        score_weights: PsdWeightsView::try_from_array(&score_weights).expect("psd weights"),
         working_response: &working_response,
         eta: &eta,
         offset: &offset,

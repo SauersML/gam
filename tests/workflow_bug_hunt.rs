@@ -1,7 +1,7 @@
 use gam::inference::data::EncodedDataset;
 use gam::inference::formula_dsl::parse_link_choice;
 use gam::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
-use gam::types::{InverseLink, ResponseFamily, StandardLink};
+use gam::types::{InverseLink, ResponseColumnKind, ResponseFamily, StandardLink};
 use gam::{FitConfig, FitRequest, materialize, resolve_family};
 use ndarray::{Array2, array};
 
@@ -31,8 +31,15 @@ fn tiny_binary_dataset() -> EncodedDataset {
 #[test]
 fn resolve_family_accepts_binomial_logit_with_underscore_alias() {
     let y = array![0.0, 1.0, 1.0, 0.0];
-    let resolved = resolve_family(Some("binomial_logit"), None, None, y.view())
-        .expect("binomial_logit should be recognized as a supported family alias");
+    let resolved = resolve_family(
+        Some("binomial_logit"),
+        None,
+        None,
+        y.view(),
+        ResponseColumnKind::Numeric,
+        "y",
+    )
+    .expect("binomial_logit should be recognized as a supported family alias");
     assert_eq!(
         resolved.response,
         ResponseFamily::Binomial,
@@ -58,10 +65,15 @@ fn resolve_family_binomial_with_explicit_link_overrides_default_logit() {
         let link_choice = parse_link_choice(Some(link_name), false)
             .expect("link should parse")
             .expect("link choice should not be None when raw was provided");
-        let resolved = resolve_family(Some("binomial"), None, Some(&link_choice), y.view())
-            .unwrap_or_else(|err| {
-                panic!("binomial + link={link_name} should be accepted, got: {err}")
-            });
+        let resolved = resolve_family(
+            Some("binomial"),
+            None,
+            Some(&link_choice),
+            y.view(),
+            ResponseColumnKind::Numeric,
+            "y",
+        )
+        .unwrap_or_else(|err| panic!("binomial + link={link_name} should be accepted, got: {err}"));
         assert_eq!(resolved.response, ResponseFamily::Binomial);
         assert_eq!(resolved.link, InverseLink::Standard(expected));
     }
@@ -71,8 +83,15 @@ fn resolve_family_binomial_with_explicit_link_overrides_default_logit() {
 fn resolve_family_accepts_tweedie() {
     // GitHub issue #158: family='tweedie' must be a recognized family.
     let y = array![0.0, 1.0, 2.0, 0.0, 3.5, 0.0];
-    let resolved = resolve_family(Some("tweedie"), None, None, y.view())
-        .expect("tweedie family should be recognized");
+    let resolved = resolve_family(
+        Some("tweedie"),
+        None,
+        None,
+        y.view(),
+        ResponseColumnKind::Numeric,
+        "y",
+    )
+    .expect("tweedie family should be recognized");
     match resolved.response {
         ResponseFamily::Tweedie { p } => {
             assert!(
@@ -88,9 +107,15 @@ fn resolve_family_accepts_tweedie() {
 #[test]
 fn resolve_family_rejects_unknown_family_names() {
     let y = array![0.0, 1.0, 1.0, 0.0];
-    let err = resolve_family(Some("definitely-not-a-family"), None, None, y.view()).expect_err(
-        "unknown family names should return an error instead of being silently coerced",
-    );
+    let err = resolve_family(
+        Some("definitely-not-a-family"),
+        None,
+        None,
+        y.view(),
+        ResponseColumnKind::Numeric,
+        "y",
+    )
+    .expect_err("unknown family names should return an error instead of being silently coerced");
     assert!(
         err.contains("unknown family"),
         "unknown family error should include plain-language context"

@@ -806,7 +806,10 @@ mod tests {
         // identity, so `from_lorentz(to_lorentz(y)) == y` exactly.
         let y = array![0.2, -0.15, 0.05];
         let z = to_lorentz(y.view(), -1.0).expect("to_lorentz");
-        assert!(z.iter().all(|v| v.is_finite()), "lorentz image must be finite");
+        assert!(
+            z.iter().all(|v| v.is_finite()),
+            "lorentz image must be finite"
+        );
         let back = from_lorentz(z.view(), -1.0).expect("from_lorentz");
         for i in 0..y.len() {
             assert!(
@@ -1101,7 +1104,7 @@ mod tests {
         // Regression for #354: a large tangent must not saturate ONTO the ball
         // boundary. `tanh(s)` rounds to exactly 1.0 for s ≳ 19, so the
         // unclamped map would land |x| == 1; the clamp keeps it interior.
-        for curvature in [-1.0, -0.25, -4.0] {
+        for curvature in [-1.0_f64, -0.25, -4.0] {
             let sqrt_negc = (-curvature).sqrt();
             let max_norm = (1.0 - BOUNDARY_EPS) / sqrt_negc;
             let v = array![1.0e3, -5.0e2, 2.0e2, 7.0e1];
@@ -1130,7 +1133,7 @@ mod tests {
         // Companion regression for #354 on the Lorentz path: large tangents
         // must not overflow cosh/sinh to inf (which becomes NaN downstream),
         // and the round-tripped ball point must stay strictly interior.
-        for curvature in [-1.0, -0.25, -4.0] {
+        for curvature in [-1.0_f64, -0.25, -4.0] {
             let sqrt_negc = (-curvature).sqrt();
             // Spatial tangent with norm ~1e3 — far past both the tanh-1.0
             // saturation (s ≳ 19) and the cosh/sinh overflow (s ≳ 710) regimes.
@@ -1174,7 +1177,10 @@ mod tests {
         let x_l = lorentz_decode_forward(atoms.view(), gates.view(), curvature).expect("lorentz");
         for x in [&x_p, &x_l] {
             for b in 0..x.dim().0 {
-                let norm = (0..x.dim().1).map(|i| x[[b, i]] * x[[b, i]]).sum::<f64>().sqrt();
+                let norm = (0..x.dim().1)
+                    .map(|i| x[[b, i]] * x[[b, i]])
+                    .sum::<f64>()
+                    .sqrt();
                 assert!(
                     norm.is_finite() && norm <= 1.0 - BOUNDARY_EPS + 1.0e-12,
                     "decode row {b} must be strictly interior, got norm {norm}"
