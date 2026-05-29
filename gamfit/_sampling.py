@@ -286,7 +286,12 @@ class PosteriorSamples:
 
     def save(self, path: str | Path) -> str:
         import numpy as np
+        # numpy.savez appends ".npz" unless the target already carries that
+        # suffix. Mirror that rule here so the returned path is the file that
+        # actually lands on disk and so load(save(p)) round-trips for any p.
         out = Path(path)
+        if out.suffix != ".npz":
+            out = out.with_name(out.name + ".npz")
         md = {"coefficient_names": list(self.coefficient_names), "method": self.method,
               "model_class": self.model_class, "family_kind": self.family_kind, "config": self.config.to_dict()}
         np.savez(out, samples=np.asarray(self.samples, dtype=float),
@@ -299,7 +304,15 @@ class PosteriorSamples:
     @classmethod
     def load(cls, path: str | Path) -> "PosteriorSamples":
         import numpy as np
-        npz = np.load(Path(path), allow_pickle=True)
+        # Tolerate the numpy ".npz" auto-suffix: a path written by save() with
+        # no explicit extension lives on disk at "<path>.npz". Resolve to the
+        # file that exists so load() accepts both the literal and suffixed form.
+        target = Path(path)
+        if not target.exists() and target.suffix != ".npz":
+            suffixed = target.with_name(target.name + ".npz")
+            if suffixed.exists():
+                target = suffixed
+        npz = np.load(target, allow_pickle=True)
         md = json.loads(str(npz["metadata"].item()))
         samples = np.asarray(npz["samples"], dtype=float)
         nc = int(samples.shape[1])
