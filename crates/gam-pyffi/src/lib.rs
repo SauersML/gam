@@ -1094,6 +1094,7 @@ fn estimation_error_to_pyerr(err: EstimationError) -> PyErr {
         EstimationError::CalibratorTrainingFailed(_) => CalibratorError::new_err(message),
         EstimationError::InvalidSpecification(_) => InvalidSpecificationError::new_err(message),
         EstimationError::PredictionError => PredictionError::new_err(message),
+        EstimationError::CustomFamily(_) => CustomFamilyError::new_err(message),
     }
 }
 
@@ -9276,6 +9277,11 @@ fn build_sae_basis_evaluators(
             SaeAtomBasisKind::Sphere => {
                 return Err(format!(
                     "build_sae_basis_evaluators: Sphere atom {k} requires latent_dim == 2 and basis size {SAE_SPHERE_BASIS_SIZE}; got dim={d}, m={m}"
+                ));
+            }
+            SaeAtomBasisKind::Torus => {
+                return Err(format!(
+                    "build_sae_basis_evaluators: Torus atom {k} requires latent_dim >= 1; got dim={d}, m={m}"
                 ));
             }
         };
@@ -22758,7 +22764,7 @@ fn term_builder_error_to_pyerr(err: gam::terms::term_builder::TermBuilderError) 
 }
 
 fn corrected_covariance_error_to_pyerr(
-    err: gam::solver::reml::unified::CorrectedCovarianceError,
+    err: gam::solver::CorrectedCovarianceError,
 ) -> PyErr {
     CorrectedCovarianceError::new_err(err.to_string())
 }
@@ -22975,10 +22981,10 @@ fn fit_dataset_impl(
             let standard_result = match fit_result {
                 FitResult::Standard(standard_result) => standard_result,
                 _ => {
-                    return Err(
-                        "python binding expected the standard workflow to return a standard fit result"
+                    return Err(gam::WorkflowError::SchemaMismatch {
+                        reason: "python binding expected the standard workflow to return a standard fit result"
                             .to_string(),
-                    );
+                    });
                 }
             };
             let saved_fit = standard_result.fit.clone();
@@ -23000,10 +23006,10 @@ fn fit_dataset_impl(
             let tn_result = match fit_result {
                 FitResult::TransformationNormal(result) => result,
                 _ => {
-                    return Err(
-                        "python binding expected the transformation-normal workflow to return a transformation-normal fit result"
+                    return Err(gam::WorkflowError::SchemaMismatch {
+                        reason: "python binding expected the transformation-normal workflow to return a transformation-normal fit result"
                             .to_string(),
-                    );
+                    });
                 }
             };
             build_transformation_normal_ffi_payload(formula, &dataset, &fit_config, tn_result)?
@@ -23015,10 +23021,10 @@ fn fit_dataset_impl(
             let ms_result = match fit_result {
                 FitResult::BernoulliMarginalSlope(result) => result,
                 _ => {
-                    return Err(
-                        "python binding expected the bernoulli marginal-slope workflow to return a marginal-slope fit result"
+                    return Err(gam::WorkflowError::SchemaMismatch {
+                        reason: "python binding expected the bernoulli marginal-slope workflow to return a marginal-slope fit result"
                             .to_string(),
-                    );
+                    });
                 }
             };
             build_bernoulli_marginal_slope_ffi_payload(
@@ -23036,10 +23042,10 @@ fn fit_dataset_impl(
             let ms_result = match fit_result {
                 FitResult::SurvivalMarginalSlope(result) => result,
                 _ => {
-                    return Err(
-                        "python binding expected the survival marginal-slope workflow to return a survival marginal-slope fit result"
+                    return Err(gam::WorkflowError::SchemaMismatch {
+                        reason: "python binding expected the survival marginal-slope workflow to return a survival marginal-slope fit result"
                             .to_string(),
-                    );
+                    });
                 }
             };
             build_survival_marginal_slope_ffi_payload(
@@ -23055,10 +23061,10 @@ fn fit_dataset_impl(
             let ls_result = match fit_result {
                 FitResult::GaussianLocationScale(result) => result,
                 _ => {
-                    return Err(
-                        "python binding expected the gaussian location-scale workflow to return a gaussian location-scale fit result"
+                    return Err(gam::WorkflowError::SchemaMismatch {
+                        reason: "python binding expected the gaussian location-scale workflow to return a gaussian location-scale fit result"
                             .to_string(),
-                    );
+                    });
                 }
             };
             build_gaussian_location_scale_ffi_payload(
@@ -23076,10 +23082,10 @@ fn fit_dataset_impl(
             let ls_result = match fit_result {
                 FitResult::BinomialLocationScale(result) => result,
                 _ => {
-                    return Err(
-                        "python binding expected the binomial location-scale workflow to return a binomial location-scale fit result"
+                    return Err(gam::WorkflowError::SchemaMismatch {
+                        reason: "python binding expected the binomial location-scale workflow to return a binomial location-scale fit result"
                             .to_string(),
-                    );
+                    });
                 }
             };
             build_binomial_location_scale_ffi_payload(
@@ -23097,10 +23103,10 @@ fn fit_dataset_impl(
             let ls_result = match fit_result {
                 FitResult::SurvivalLocationScale(result) => result,
                 _ => {
-                    return Err(
-                        "python binding expected the survival location-scale workflow to return a survival location-scale fit result"
+                    return Err(gam::WorkflowError::SchemaMismatch {
+                        reason: "python binding expected the survival location-scale workflow to return a survival location-scale fit result"
                             .to_string(),
-                    );
+                    });
                 }
             };
             build_survival_location_scale_ffi_payload(
@@ -23116,10 +23122,10 @@ fn fit_dataset_impl(
             let rp_result = match fit_result {
                 FitResult::SurvivalTransformation(result) => result,
                 _ => {
-                    return Err(
-                        "python binding expected the survival transformation workflow to return a survival transformation fit result"
+                    return Err(gam::WorkflowError::SchemaMismatch {
+                        reason: "python binding expected the survival transformation workflow to return a survival transformation fit result"
                             .to_string(),
-                    );
+                    });
                 }
             };
             build_survival_transformation_ffi_payload(formula, &dataset, &fit_config, rp_result)?
@@ -23130,10 +23136,10 @@ fn fit_dataset_impl(
             let lat_result = match fit_result {
                 FitResult::LatentSurvival(result) => result,
                 _ => {
-                    return Err(
-                        "python binding expected the latent survival workflow to return a latent survival fit result"
+                    return Err(gam::WorkflowError::SchemaMismatch {
+                        reason: "python binding expected the latent survival workflow to return a latent survival fit result"
                             .to_string(),
-                    );
+                    });
                 }
             };
             build_latent_survival_ffi_payload(formula, &dataset, &fit_config, frailty, lat_result)?
@@ -23144,10 +23150,10 @@ fn fit_dataset_impl(
             let lat_result = match fit_result {
                 FitResult::LatentBinary(result) => result,
                 _ => {
-                    return Err(
-                        "python binding expected the latent binary workflow to return a latent binary fit result"
+                    return Err(gam::WorkflowError::SchemaMismatch {
+                        reason: "python binding expected the latent binary workflow to return a latent binary fit result"
                             .to_string(),
-                    );
+                    });
                 }
             };
             build_latent_binary_ffi_payload(formula, &dataset, &fit_config, frailty, lat_result)?
@@ -23155,7 +23161,9 @@ fn fit_dataset_impl(
     };
     payload.group_metadata = fit_config.group_metadata.clone();
     let model = FittedModel::from_payload(payload);
-    serde_json::to_vec(&model).map_err(|err| format!("failed to serialize model: {err}"))
+    serde_json::to_vec(&model).map_err(|err| gam::WorkflowError::IntegrationFailed {
+        reason: format!("failed to serialize model: {err}"),
+    })
 }
 
 fn load_model_impl(model_bytes: &[u8]) -> Result<FittedModel, String> {
@@ -27242,7 +27250,7 @@ fn jumprelu_gate_value_grad<'py>(
 fn gumbel_schedule_tau(schedule: &Bound<'_, PyDict>, iter: usize) -> PyResult<f64> {
     let parsed = gumbel_temperature_schedule_from_pydict(Some(schedule))
         .map_err(py_value_error)?
-        .ok_or_else(|| py_value_error("gumbel_schedule_tau requires a schedule descriptor"))?;
+        .ok_or_else(|| py_value_error("gumbel_schedule_tau requires a schedule descriptor".to_string()))?;
     Ok(parsed.current_tau(iter))
 }
 
