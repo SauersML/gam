@@ -1719,14 +1719,24 @@ impl SaeManifoldLoss {
     }
 }
 
-/// Per-row active-set layout for sparse SAE assignment modes (JumpReLU).
+/// Per-row active-set layout for sparse SAE assignment (any mode).
 ///
-/// When the assignment is sparse, only a subset of `K` atoms are active per
-/// observation.  The Arrow-Schur row block for observation `i` has dim
+/// When the assignment is sparse — structurally (JumpReLU gate) or
+/// effectively (softmax / IBP-MAP at large `K`, where the assignment mass
+/// concentrates on a small support) — only a subset of `K` atoms are active
+/// per observation.  The Arrow-Schur row block for observation `i` has dim
 /// `q_active_i = |active_atoms_i| + Σ_{k ∈ active_i} d_k` rather than
 /// `q = K + Σ_k d_k`.  This struct records which atoms are active per row
 /// and maps compressed block positions back to full-q positions so that
 /// `apply_newton_step` can unpack the compact `delta_t` from the solve.
+///
+/// For JumpReLU the active set is exactly the gated support
+/// (`a_{n,k} ≠ 0`), so the compact solve is identity to the dense solve.
+/// For softmax / IBP-MAP the active set is the union of a top-`k_active_cap`
+/// truncation and a magnitude cutoff on `a_{n,k}`; this is only enabled when
+/// `K` is large enough that the dense `(m_total · p)²` data Gram would not
+/// fit the host / device working-set budget, and the dropped atoms carry
+/// `O(a_{n,k}²)` curvature that is negligible by construction of the cutoff.
 #[derive(Debug, Clone)]
 pub struct SaeRowLayout {
     /// `active_atoms[row]` — sorted indices of active atoms for that row.
@@ -1741,7 +1751,8 @@ pub struct SaeRowLayout {
 }
 
 impl SaeRowLayout {
-    fn new(
+    /// JumpReLU structural active set: atoms with `logit > threshold`.
+    fn from_jumprelu(
         n: usize,
         k_atoms: usize,
         threshold: f64,
@@ -1749,20 +1760,75 @@ impl SaeRowLayout {
         coord_dims: Vec<usize>,
         coord_offsets_full: Vec<usize>,
     ) -> Self {
-        let mut active_atoms = Vec::with_capacity(n);
-        let mut coord_starts_all = Vec::with_capacity(n);
+        let mut per_row = Vec::with_capacity(n);
         for row in 0..n {
             let row_logits = logits.row(row);
             let active: Vec<usize> = (0..k_atoms)
                 .filter(|&k| row_logits[k] > threshold)
                 .collect();
+            per_row.push(active);
+        }
+        Self::from_active_atoms(per_row, coord_dims, coord_offsets_full)
+    }
+
+    /// Mode-agnostic effective active set for dense-weight modes (softmax /
+    /// IBP-MAP) at large `K`: keep, per row, the top-`k_active_cap` atoms by
+    /// `|a_{n,k}|` whose magnitude also exceeds `cutoff`.
+    ///
+    /// `assignments[row]` is the dense length-`K` assignment vector `a_{n,·}`.
+    /// The active set is always non-empty (the single largest-magnitude atom is
+    /// retained even if below `cutoff`) so every row keeps a valid block.
+    fn from_dense_weights(
+        assignments: &[Array1<f64>],
+        k_active_cap: usize,
+        cutoff: f64,
+        coord_dims: Vec<usize>,
+        coord_offsets_full: Vec<usize>,
+    ) -> Self {
+        let cap = k_active_cap.max(1);
+        let mut per_row = Vec::with_capacity(assignments.len());
+        for a in assignments {
+            let k = a.len();
+            // Rank atoms by descending |a_k|; keep those above cutoff, capped.
+            let mut idx: Vec<usize> = (0..k).collect();
+            idx.sort_by(|&i, &j| {
+                a[j].abs()
+                    .partial_cmp(&a[i].abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut active: Vec<usize> = idx
+                .iter()
+                .copied()
+                .take(cap)
+                .filter(|&k_idx| a[k_idx].abs() > cutoff)
+                .collect();
+            if active.is_empty() {
+                // Retain the single largest-magnitude atom so the row block is
+                // never empty (a degenerate empty block would zero the row).
+                if let Some(&top) = idx.first() {
+                    active.push(top);
+                }
+            }
+            active.sort_unstable();
+            per_row.push(active);
+        }
+        Self::from_active_atoms(per_row, coord_dims, coord_offsets_full)
+    }
+
+    /// Build from explicit per-row active-atom index lists.
+    fn from_active_atoms(
+        active_atoms: Vec<Vec<usize>>,
+        coord_dims: Vec<usize>,
+        coord_offsets_full: Vec<usize>,
+    ) -> Self {
+        let mut coord_starts_all = Vec::with_capacity(active_atoms.len());
+        for active in &active_atoms {
             let mut starts = Vec::with_capacity(active.len());
             let mut cursor = active.len();
-            for &k in &active {
+            for &k in active {
                 starts.push(cursor);
                 cursor += coord_dims[k];
             }
-            active_atoms.push(active);
             coord_starts_all.push(starts);
         }
         Self {
@@ -2021,6 +2087,66 @@ impl SaeManifoldTerm {
             cursor += width;
         }
         Arc::from(ranges.into_boxed_slice())
+    }
+
+    /// Decide whether the sparse per-row active-set layout is engaged for the
+    /// dense-weight assignment modes (softmax / IBP-MAP), and if so derive the
+    /// per-row active-atom cap and magnitude cutoff.
+    ///
+    /// The decision is auto-derived from the problem size and the
+    /// device/host working-set budget — never a CLI flag or kwarg. JumpReLU is
+    /// not handled here (it always uses its structural gate via
+    /// [`SaeRowLayout::from_jumprelu`]). The dense Gauss-Newton data Gram `G`
+    /// is `(m_total × m_total)` f64; if its dense form fits the budget we keep
+    /// the exact full-support solve (every atom active per row), so small-`K`
+    /// problems are bit-for-bit unchanged. Above that, we cap each row to the
+    /// `k_active` atoms that make the *sparse* Gram fit the same budget, with a
+    /// relative magnitude cutoff that drops assignment mass contributing
+    /// negligible `O(a²)` curvature.
+    ///
+    /// Returns `Some((k_active_cap, cutoff))` to engage sparsity, or `None` to
+    /// keep the dense full-support layout.
+    fn sparse_active_plan(&self) -> Option<(usize, f64)> {
+        const BYTES_PER_F64: usize = 8;
+        // Host in-core ceiling for the dense Gram on a CPU-only build, mirroring
+        // the streaming dispatcher's host budget (`sae_streaming_plan`).
+        const HOST_GRAM_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
+        // Relative magnitude cutoff: assignment mass below this fraction of the
+        // row's peak `|a_k|` enters the Gram only as `O(a²)` curvature and is
+        // dropped. Chosen so dropped terms are ~1e-6 of the peak self-coupling.
+        const RELATIVE_CUTOFF: f64 = 1.0e-3;
+
+        let k_atoms = self.k_atoms();
+        if k_atoms <= 1 {
+            return None;
+        }
+        let p = self.output_dim();
+        let m_total: usize = self.atoms.iter().map(|a| a.basis_size()).sum();
+        // Dense data Gram footprint: (m_total · m_total) f64.
+        let dense_gram_bytes = m_total.saturating_mul(m_total).saturating_mul(BYTES_PER_F64);
+
+        let budget = match crate::gpu::runtime::GpuRuntime::global() {
+            // Allow up to one quarter of the device budget for the dense Gram,
+            // matching the streaming dispatcher's in-core fraction.
+            Some(rt) => rt.memory_budget_bytes / 4,
+            None => HOST_GRAM_BYTES,
+        };
+        if dense_gram_bytes <= budget {
+            return None;
+        }
+
+        // Sparse Gram footprint scales with the per-row active basis count
+        // `k_active · m_atom`. Solve for the largest `k_active` whose sparse
+        // Gram `(k_active · m_atom)²` still fits the budget.
+        let m_atom = (m_total as f64 / k_atoms as f64).max(1.0);
+        let max_active_basis = ((budget as f64 / BYTES_PER_F64 as f64).sqrt() / m_atom).floor();
+        let k_active_cap = (max_active_basis as usize).clamp(1, k_atoms);
+        // p does not enter the Gram dimension (it is carried by the `⊗ I_p`
+        // structure), but a degenerate `p == 0` term has no decoder columns.
+        if p == 0 {
+            return None;
+        }
+        Some((k_active_cap, RELATIVE_CUTOFF))
     }
 
     pub fn flatten_beta(&self) -> Array1<f64> {
