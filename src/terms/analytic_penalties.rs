@@ -6327,6 +6327,32 @@ impl BlockOrthogonalityPenalty {
         out
     }
 
+    /// `out[li, ri] = Σ_n a[n, left[li]] · b[n, right[ri]]` — two-argument
+    /// cross-gram used to assemble the directional derivative of `C_{gh}` in
+    /// direction `v`:  `∂_v C_{gh}[gi, hi] = Σ_n {v[n, axes_g[gi]] · t[n, axes_h[hi]] + t[n, axes_g[gi]] · v[n, axes_h[hi]]}`.
+    /// The `cross_gram` helper (single-input self-product) was previously
+    /// (mis)used for both terms, but `cross_gram(v, h, g) + cross_gram(t, h, g)`
+    /// is the unrelated quantity `(v⊗v) + (t⊗t)`, not `(v⊗t) + (t⊗v)`.
+    fn mixed_cross_gram(
+        a: ArrayView2<'_, f64>,
+        b: ArrayView2<'_, f64>,
+        left: &[usize],
+        right: &[usize],
+    ) -> Array2<f64> {
+        assert_eq!(a.nrows(), b.nrows(), "mixed_cross_gram row mismatch");
+        let mut out = Array2::<f64>::zeros((left.len(), right.len()));
+        for (li, &al) in left.iter().enumerate() {
+            for (ri, &br) in right.iter().enumerate() {
+                let mut s = 0.0;
+                for n in 0..a.nrows() {
+                    s += a[[n, al]] * b[[n, br]];
+                }
+                out[[li, ri]] = s;
+            }
+        }
+        out
+    }
+
     fn add_right_times_cross(
         out: &mut Array2<f64>,
         right: ArrayView2<'_, f64>,
@@ -6369,12 +6395,26 @@ impl BlockOrthogonalityPenalty {
                 let c_hg = cross[h][g]
                     .as_ref()
                     .expect("between-block cross Gram must be precomputed");
+                // Linear contribution: w · Σ_b C_{g,h}[i,b] · v[n, axes_h[b]] —
+                // the C-direct piece of d/dv (∂P/∂t).
                 Self::add_right_times_cross(&mut out, v, group_g, group_h, c_hg.view(), weight);
 
-                let v_h_t_g = Self::cross_gram(v, group_h, group_g);
-                let t_h_v_g = Self::cross_gram(t, group_h, group_g);
-                let mut d_c_hg = v_h_t_g;
-                d_c_hg += &t_h_v_g;
+                // Directional derivative of C_{hg} in direction v:
+                //   ∂_v C_{hg}[hi, gi] = Σ_n {v[n, axes_h[hi]] · t[n, axes_g[gi]]
+                //                            + t[n, axes_h[hi]] · v[n, axes_g[gi]]}
+                // = MixedCross(v, t, h, g) + MixedCross(t, v, h, g).
+                // The earlier formulation used `cross_gram(v, h, g) +
+                // cross_gram(t, h, g)`, which is `(v⊗v) + (t⊗t)` — quadratic in v
+                // (resp. independent of v) and unrelated to the JVP. The bug made
+                // the Hessian non-symmetric (it added a fixed `(t⊗t)`-driven term
+                // to every column), violated the gradient/Hessian consistency
+                // check that REML's spectral solve relies on, and the sibling
+                // `OrthogonalityPenalty::hvp_with_precomputed_m` already uses the
+                // correct `v_c · t_b + t_c · v_b` mixed pattern.
+                let dv_h_g = Self::mixed_cross_gram(v, t, group_h, group_g);
+                let tv_h_g = Self::mixed_cross_gram(t, v, group_h, group_g);
+                let mut d_c_hg = dv_h_g;
+                d_c_hg += &tv_h_g;
                 Self::add_right_times_cross(&mut out, t, group_g, group_h, d_c_hg.view(), weight);
             }
         }
