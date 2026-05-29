@@ -99,6 +99,46 @@ def test_survival_transformation_is_reachable_from_fit() -> None:
     assert np.all(np.asarray(pred.survival, dtype=float) > 0.0)
 
 
+def test_transformation_survival_parameter_count_is_independent_of_n() -> None:
+    # Regression for issue #385: the transformation likelihood (the CLI/auto
+    # default survival mode) must carry a *fixed-size* baseline+covariate basis,
+    # not one free coefficient per observation row. The released 0.1.135 build
+    # allocated `n + 13` coefficients — an O(n) parameterization that forced an
+    # n-wide dense design, O(n^2) memory, and a hard densify-refusal past ~5k
+    # rows. The fixed model has p = p_time_basis + p_covariate, which is a small
+    # constant independent of n.
+    #
+    # We fit at two materially different sample sizes and demand:
+    #   (1) the coefficient count is *identical* across n (scale invariance), and
+    #   (2) it is far below n (no per-observation block).
+    counts = {}
+    for n in (300, 1500):
+        model = gamfit.fit(
+            make_weibull(n),
+            "Surv(entry, exit, event) ~ age",
+            survival_likelihood="transformation",
+        )
+        coefs = model.summary().coefficients
+        counts[n] = len(coefs)
+
+    assert counts[300] == counts[1500], (
+        "transformation survival coefficient count must not depend on n "
+        f"(issue #385: per-observation block regression): {counts}"
+    )
+    # The fixed model is the default 8-internal-knot I-spline baseline (~10
+    # columns) plus the single `age` covariate. Allow generous headroom for
+    # basis/intercept bookkeeping, but it must be a small constant — and in
+    # particular must be far below n, not the `n + 13` of the buggy build.
+    fixed_count = counts[300]
+    assert fixed_count < 64, (
+        "transformation survival baseline must be a fixed-size basis, not "
+        f"O(n) per-observation parameters (issue #385): got {fixed_count}"
+    )
+    assert fixed_count < 300, (
+        f"coefficient count {fixed_count} grew with n=300 (issue #385)"
+    )
+
+
 def test_joint_competing_risks_survival_is_reachable_from_fit() -> None:
     train = make_competing_risks()
     validation = gamfit.validate_formula(
