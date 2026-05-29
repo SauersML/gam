@@ -65,7 +65,11 @@ fn max_abs_diff(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
         .fold(0.0_f64, f64::max)
 }
 
-fn check_case(p: Array1<f64>, v: Array1<f64>, g: Array1<f64>, label: &str) {
+/// Returns the max-abs deviation of the analytic VJP from the central finite
+/// difference, as `(err_tangent, err_point)`. The caller asserts on these so
+/// the assertion lives directly in each `#[test]` (the build's ban-checker
+/// rejects a test whose only verification hides inside a helper).
+fn vjp_fd_errors(p: Array1<f64>, v: Array1<f64>, g: Array1<f64>) -> (f64, f64) {
     let manifold = SphereManifold::new(2); // 2-sphere in R^3
 
     let (grad_p, grad_v) = manifold
@@ -75,17 +79,7 @@ fn check_case(p: Array1<f64>, v: Array1<f64>, g: Array1<f64>, label: &str) {
     let fd_v = fd_grad(&manifold, &v, g.view(), false, &p, &v);
     let fd_p = fd_grad(&manifold, &p, g.view(), true, &p, &v);
 
-    let err_v = max_abs_diff(&grad_v, &fd_v);
-    let err_p = max_abs_diff(&grad_p, &fd_p);
-
-    assert!(
-        err_v < 1.0e-6,
-        "[{label}] analytic grad_v disagrees with finite difference (max abs err {err_v:.3e}).\n  analytic = {grad_v:?}\n  fd       = {fd_v:?}"
-    );
-    assert!(
-        err_p < 1.0e-6,
-        "[{label}] analytic grad_p disagrees with finite difference (max abs err {err_p:.3e}).\n  analytic = {grad_p:?}\n  fd       = {fd_p:?}"
-    );
+    (max_abs_diff(&grad_v, &fd_v), max_abs_diff(&grad_p, &fd_p))
 }
 
 #[test]
@@ -94,7 +88,15 @@ fn sphere_exp_map_vjp_matches_finite_difference_unit_point() {
     let p = arr1(&[0.6, -0.8, 0.0]); // |p| = 1
     let v = arr1(&[0.15, 0.10, -0.30]); // arbitrary ambient tangent input
     let g = arr1(&[0.7, -0.2, 0.5]); // arbitrary cotangent
-    check_case(p, v, g, "unit-p");
+    let (err_v, err_p) = vjp_fd_errors(p, v, g);
+    assert!(
+        err_v < 1.0e-6,
+        "unit-p analytic grad_v vs finite difference: max abs err {err_v:.3e}"
+    );
+    assert!(
+        err_p < 1.0e-6,
+        "unit-p analytic grad_p vs finite difference: max abs err {err_p:.3e}"
+    );
 }
 
 #[test]
@@ -106,7 +108,15 @@ fn sphere_exp_map_vjp_matches_finite_difference_nonunit_point() {
     let p = arr1(&[0.2, -0.4, 0.5]); // |p|^2 = 0.45 != 1
     let v = arr1(&[0.25, 0.10, -0.20]);
     let g = arr1(&[-0.3, 0.6, 0.4]);
-    check_case(p, v, g, "nonunit-p");
+    let (err_v, err_p) = vjp_fd_errors(p, v, g);
+    assert!(
+        err_v < 1.0e-6,
+        "nonunit-p analytic grad_v vs finite difference: max abs err {err_v:.3e}"
+    );
+    assert!(
+        err_p < 1.0e-6,
+        "nonunit-p analytic grad_p vs finite difference: max abs err {err_p:.3e}"
+    );
 }
 
 #[test]
