@@ -1103,7 +1103,7 @@ pub(crate) use install_flex::FlexCompileOutcome;
 
 // pub(crate) re-exports for internal callers:
 pub(crate) use block_specs::push_deviation_aux_blockspecs;
-pub use block_specs::{BmsFamilyScalars, BmsLogslopeJacobian, BmsMarginalJacobian};
+pub use block_specs::{BmsLogslopeJacobian, BmsMarginalJacobian};
 pub(crate) use family::{
     BernoulliMarginalLinkMap, bernoulli_marginal_link_map,
     build_link_deviation_block_from_knots_design_seed_and_weights,
