@@ -3268,7 +3268,17 @@ impl SaeManifoldTerm {
         let sys = self
             .assemble_arrow_schur(target, rho, registry)
             .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?;
-        let options = ArrowSolveOptions::direct();
+        // Evidence-only factorization: the Newton step (Δt, Δβ) is discarded
+        // and only the factor cache is consumed — the exact undamped log-det
+        // and the selected-inverse traces. As ρ sweeps to extremes (e.g. a
+        // wide ARD-α sweep), H_tt is genuinely PD but can be ill-conditioned
+        // (κ large); the standard Direct guard rejects that to protect
+        // Newton-step accuracy, but the log-det is exact from diag(L)
+        // regardless of κ and the traces only need the (PD) factor. So
+        // tolerate the ill-conditioning rejection here (a genuine non-PD pivot
+        // still errors). The cache stays undamped at ridge=0, so
+        // `arrow_log_det_from_cache` remains exact.
+        let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
         let (delta_t, delta_beta, cache): (Array1<f64>, Array1<f64>, ArrowFactorCache) =
             solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options)
                 .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?;
