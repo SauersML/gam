@@ -11627,8 +11627,13 @@ fn sae_manifold_predict_oos<'py>(
     )
 }
 
-/// Coefficient of determination R^2 = 1 - SSR / SST for a fitted SAE-manifold
-/// reconstruction. Pure-Rust closed-form so the Python wrapper is one FFI call.
+/// Global coefficient of determination
+/// R^2 = 1 - (Σ_ij (y_ij - ŷ_ij)²) / (Σ_ij (y_ij - mean_j)²)
+/// for a fitted SAE-manifold reconstruction, where `mean_j` is the per-column
+/// mean of the observed matrix. Both SSR and SST are summed across all rows and
+/// columns, so this returns a single scalar (a global metric), not a vector of
+/// per-column R² values. Pure-Rust closed-form so the Python wrapper is one FFI
+/// call.
 #[pyfunction]
 fn sae_manifold_reconstruction_r2(
     observed: PyReadonlyArray2<'_, f64>,
