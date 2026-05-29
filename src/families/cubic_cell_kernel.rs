@@ -3040,6 +3040,48 @@ fn exp_neg_half_square(x: f64) -> f64 {
     }
 }
 
+/// Zeroth truncated standard-normal moment `T_0(a, b) = ∫_a^b e^(−z²/2) dz
+/// = √(2π)·(Φ(b) − Φ(a))`, evaluated without catastrophic cancellation in
+/// either tail.
+///
+/// Writing `T_0 = √(π/2)·[erf(b/√2) − erf(a/√2)]`, the naive form collapses
+/// to `0.0` whenever both endpoints lie in the *same* far tail: `erf`
+/// saturates at the IEEE-754 values `±1.0` for `|x| ≳ 8.3·√2`, so the
+/// difference of two saturated values is exactly zero even though the
+/// integral is a strictly positive number well inside the f64 normal range
+/// (e.g. `∫_{-12}^{-10} ≈ 1.9e-23`). The fix is to reduce the erf difference
+/// to complementary tail probabilities — `statrs::erfc` evaluates these with
+/// a dedicated tail series, *not* as `1 − erf` — and to pick, by the sign of
+/// the endpoints, the algebraically-equivalent form whose terms do not
+/// cancel against one another:
+///
+/// ```text
+/// both ≥ 0 (upper tail):  erf(b/√2) − erf(a/√2) = erfc(a/√2) − erfc(b/√2)
+/// both ≤ 0 (lower tail):  erf(b/√2) − erf(a/√2) = erfc(−b/√2) − erfc(−a/√2)
+/// straddling zero:        erf(b/√2) − erf(a/√2) = 2 − erfc(b/√2) − erfc(−a/√2)
+/// ```
+///
+/// In each branch every `erfc` argument is `≥ 0`, so the terms are small
+/// positive tail values (or an O(1) constant minus two values `≤ 1`); no
+/// large quantities cancel and full f64 precision survives down to the
+/// underflow boundary in either tail. Infinite endpoints fall out via the
+/// `erfc` limits (`erfc(+∞)=0`, `erfc(−∞)=2`) with no special casing.
+fn truncated_gaussian_zeroth_moment(a: f64, b: f64) -> f64 {
+    let inv_sqrt2 = 1.0 / std::f64::consts::SQRT_2;
+    let za = a * inv_sqrt2;
+    let zb = b * inv_sqrt2;
+    let erfc = statrs::function::erf::erfc;
+    let erf_diff = if za >= 0.0 {
+        erfc(za) - erfc(zb)
+    } else if zb <= 0.0 {
+        erfc(-zb) - erfc(-za)
+    } else {
+        2.0 - erfc(zb) - erfc(-za)
+    };
+    // √(2π)·½ = √(π/2).
+    (std::f64::consts::PI / 2.0).sqrt() * erf_diff
+}
+
 /// Fill `out[0..=max_degree]` with the raw truncated standard-normal moments
 ///
 /// ```text
@@ -3065,14 +3107,7 @@ fn fill_truncated_gaussian_moments(a: f64, b: f64, out: &mut [f64]) {
     if out.is_empty() {
         return;
     }
-    let cdf = |x: f64| -> f64 {
-        if x.is_infinite() {
-            if x.is_sign_positive() { 1.0 } else { 0.0 }
-        } else {
-            0.5 * (1.0 + statrs::function::erf::erf(x / std::f64::consts::SQRT_2))
-        }
-    };
-    out[0] = (2.0 * std::f64::consts::PI).sqrt() * (cdf(b) - cdf(a));
+    out[0] = truncated_gaussian_zeroth_moment(a, b);
     if out.len() == 1 {
         return;
     }
