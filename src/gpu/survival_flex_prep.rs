@@ -10,8 +10,7 @@
 //!   `SurvivalMarginalSlopeFamily::denested_cell_primary_fixed_partials`
 //!   (`src/families/survival_marginal_slope.rs:6218`).
 //!
-//! Layout of the device output mirrors the audit doc
-//! `docs/survival_prep_port_audit.md`:
+//! Layout of the device output:
 //!
 //! ```text
 //!   cells     : Vec<f64>  // flat 18·n_cells doubles (cell ⨁ score_span ⨁ link_span)

@@ -1,8 +1,6 @@
 //! Survival marginal-slope concrete impls for the family-agnostic
 //! identifiability compiler (`crate::families::identifiability_compiler`).
 //!
-//! Phase 2 architecture: `docs/identifiability_compiler.md` §1, §2.
-//!
 //! Survival's row primary state is the 4-vector `u_i = (q0, q1, qd1, g)`,
 //! so `K = 4`. The row Hessian is the 4×4 second-derivative block of the
 //! per-row neg-log-likelihood kernel `row_primary_closed_form` at a pilot

@@ -28,7 +28,7 @@ use crate::gamlss::{
 use crate::hmc::{
     FamilyNutsInputs, GlmFlatInputs, LinkWiggleSplineArtifacts, NutsConfig, NutsFamily, NutsResult,
     SurvivalFlatInputs, explicit_fit_hessian_for_whitening, run_link_wiggle_nuts_sampling,
-    run_nuts_sampling_flattened_family, run_survival_nuts_sampling_flattened,
+    run_nuts_sampling_flattened_family, run_survival_nuts_sampling_flattened, validate_nuts_config,
 };
 use crate::inference::formula_dsl::{LinkWiggleFormulaSpec, parse_formula};
 use crate::inference::model::{
@@ -191,6 +191,15 @@ pub fn sample_saved_model(
     training_headers: Option<&Vec<String>>,
     cfg: &NutsConfig,
 ) -> Result<NutsResult, String> {
+    // Issue #399: degenerate draw/chain counts (`samples=0` / `chains=0`, and
+    // the `samples < 4` counts the split-R-hat engine path cannot handle) must
+    // surface as one typed `InvalidConfig` error before any sampler runs —
+    // identically across *every* model class. Validating here, at the single
+    // public dispatch point, guarantees that the NUTS path, the auto-selected
+    // Pólya-Gamma Gibbs path, and the Laplace-Gaussian fallback all reject the
+    // same inputs the same way (previously the fallback silently accepted them
+    // via `.max(1)` while NUTS errored — a divergent contract on one API).
+    validate_nuts_config(cfg).map_err(String::from)?;
     let likelihood = likelihood_spec_for_saved_model(model)?;
     match model.predict_model_class() {
         PredictModelClass::Survival => {
@@ -257,6 +266,11 @@ pub fn laplace_gaussian_fallback(
     rationale: &'static str,
 ) -> Result<NutsResult, String> {
     use crate::inference::dispersion_cov::DispersionExt as _;
+    // Defense in depth: this is `pub`, so guard the same degenerate
+    // draw/chain counts the NUTS / PG paths reject (issue #399) rather than
+    // papering over `n_chains == 0` / `n_samples == 0` with `.max(1)`, which
+    // would silently fabricate draws the caller never asked for.
+    validate_nuts_config(cfg).map_err(String::from)?;
     let fit = fit_result_from_saved_model_for_prediction(model)?;
     let mode = fit.beta.clone();
     let p = mode.len();
@@ -293,21 +307,21 @@ pub fn laplace_gaussian_fallback(
     })?;
     let l = chol.lower_triangular();
 
-    let n_total = cfg.n_samples.saturating_mul(cfg.n_chains).max(1);
+    // `validate_nuts_config` above guarantees `n_chains >= 1` and
+    // `n_samples >= 4`, so the draw grid is always non-empty and densely
+    // filled — no `.max(1)` clamping or bounds guard is needed.
+    let n_total = cfg.n_samples.saturating_mul(cfg.n_chains);
     let mut samples = Array2::<f64>::zeros((n_total, p));
     let mut eps = Array1::<f64>::zeros(p);
     let mut delta = Array1::<f64>::zeros(p);
-    for chain in 0..cfg.n_chains.max(1) {
+    for chain in 0..cfg.n_chains {
         let mut rng = rand::rngs::StdRng::seed_from_u64(chain_stream_seed(
             cfg.seed,
             chain,
             0xA0B7_6C5D_E431_298F,
         ));
-        for draw in 0..cfg.n_samples.max(1) {
-            let k = chain * cfg.n_samples.max(1) + draw;
-            if k >= n_total {
-                break;
-            }
+        for draw in 0..cfg.n_samples {
+            let k = chain * cfg.n_samples + draw;
             for i in 0..p {
                 eps[i] = sample_standard_normal(&mut rng);
             }

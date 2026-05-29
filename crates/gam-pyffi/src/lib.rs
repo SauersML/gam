@@ -31669,6 +31669,130 @@ mod tests {
         assert_eq!(MODEL_VERSION, MODEL_PAYLOAD_VERSION);
     }
 
+    /// Builds a deterministic formula-table dataset for the shared-tangent
+    /// Gaussian REML path with two unpenalized parametric columns plus one
+    /// smooth: `~ x + z + s(w)` over `D = 2` outputs.
+    fn shared_tangent_formula_table() -> (Vec<String>, Vec<Vec<String>>, Array2<f64>) {
+        let n = 80usize;
+        let headers = vec!["x".to_string(), "z".to_string(), "w".to_string()];
+        let mut rows = Vec::with_capacity(n);
+        let mut y = Array2::<f64>::zeros((n, 2));
+        for row in 0..n {
+            let t = (row as f64 - 39.5) / 20.0;
+            let x = (0.7 * t).sin() + 0.05 * t;
+            let z = (1.1 * t).cos() - 0.1 * t * t;
+            let w = t;
+            rows.push(vec![format!("{x}"), format!("{z}"), format!("{w}")]);
+            // Two distinct tangent signals: each a parametric trend plus a
+            // genuinely wiggly component that the smooth must absorb.
+            y[[row, 0]] = 0.4 * x - 0.3 * z + 0.6 * (1.8 * w).sin() + 0.02 * t;
+            y[[row, 1]] = -0.2 * x + 0.5 * z + 0.4 * (2.3 * w).cos() - 0.03 * t;
+        }
+        (headers, rows, y)
+    }
+
+    /// Regression for issue #381 adversarial review (flaw #2): the per-output
+    /// residual-variance denominator must count the FULL effective df of each
+    /// tangent coordinate's columns — unpenalized columns (intercept + the
+    /// parametric `x`, `z`) included — matching the canonical Gaussian scale
+    /// `n - edf_total`. The pre-fix denominator used only the penalized
+    /// `edf_by_block`, overstating residual df by the unpenalized count and
+    /// biasing sigma2 low.
+    #[test]
+    fn shared_tangent_sigma2_counts_unpenalized_columns() {
+        let (headers, rows, y) = shared_tangent_formula_table();
+        let fit = gaussian_reml_fit_formula_table_impl(
+            headers,
+            rows,
+            "~ x + z + s(w)".to_string(),
+            y.view(),
+            None,
+            None,
+        )
+        .expect("shared-tangent REML must fit ~ x + z + s(w)");
+
+        let d = y.ncols();
+        let n = y.nrows() as f64;
+        assert_eq!(fit.sigma2.len(), d);
+        assert_eq!(fit.edf.nrows(), d);
+        assert!(fit.lambdas.iter().all(|v| v.is_finite()));
+        assert!(fit.edf.iter().all(|v| v.is_finite() && *v >= 0.0));
+
+        // `~ x + z + s(w)` has exactly three unpenalized columns per output:
+        // the intercept plus the two parametric terms `x` and `z`. The smooth
+        // `s(w)` is fully penalized, so each coordinate's effective df is
+        //   edf_output = 3 (unpenalized) + Σ_block edf_by_block.
+        const UNPENALIZED_COLS: f64 = 3.0;
+        for output in 0..d {
+            let penalized_edf: f64 = fit.edf.row(output).iter().sum();
+            let edf_output = UNPENALIZED_COLS + penalized_edf;
+            let mut ss = 0.0;
+            for row in 0..y.nrows() {
+                let resid = y[[row, output]] - fit.fitted[[row, output]];
+                ss += resid * resid;
+            }
+            let expected = ss / (n - edf_output);
+            assert!(
+                (fit.sigma2[output] - expected).abs() <= 1.0e-9 * expected.max(1.0),
+                "sigma2[{output}] = {} but residual scale with full effective df is {expected} \
+                 (edf_output = {edf_output}, penalized_edf = {penalized_edf})",
+                fit.sigma2[output]
+            );
+            // The buggy denominator omitted the unpenalized columns; pinning the
+            // strict gap guards against a regression back to it.
+            let buggy = ss / (n - penalized_edf);
+            assert!(
+                fit.sigma2[output] > buggy * (1.0 + 1.0e-9),
+                "sigma2[{output}] = {} must exceed the unpenalized-omitting estimate {buggy}",
+                fit.sigma2[output]
+            );
+        }
+    }
+
+    /// Regression for issue #381 adversarial review (flaws #1/#3): per-output
+    /// λ/edf diagnostics must be reported per tangent coordinate in a
+    /// well-formed `(D, M)` grid. Each coordinate replicates the same penalty
+    /// structure, so when no block canonicalizes away the grid is fully finite
+    /// and every coordinate carries the same number of active smoothing
+    /// parameters. (The fix also length-checks the canonical-compacted
+    /// `lambdas`/`edf_by_block` against the surviving-block count so a dropped
+    /// rank-0 block can never silently misalign the stride.)
+    #[test]
+    fn shared_tangent_lambda_edf_grid_is_per_coordinate() {
+        let (headers, rows, y) = shared_tangent_formula_table();
+        let fit = gaussian_reml_fit_formula_table_impl(
+            headers,
+            rows,
+            "~ x + z + s(w)".to_string(),
+            y.view(),
+            None,
+            None,
+        )
+        .expect("shared-tangent REML must fit ~ x + z + s(w)");
+
+        let d = y.ncols();
+        assert_eq!(fit.lambdas.nrows(), d);
+        assert_eq!(fit.edf.nrows(), d);
+        assert_eq!(fit.lambdas.ncols(), fit.edf.ncols());
+        assert!(
+            fit.lambdas.ncols() >= 2,
+            "an s() smooth expands to >= 2 blocks"
+        );
+        assert!(
+            fit.lambdas.iter().all(|v| v.is_finite()),
+            "no grid cell may be NaN-padded by an off-the-end stride"
+        );
+        // Every tangent coordinate fits the identical replicated design, so
+        // each row must carry the same count of active (nonzero-λ) blocks.
+        let active_per_row: Vec<usize> = (0..d)
+            .map(|output| fit.lambdas.row(output).iter().filter(|v| **v > 0.0).count())
+            .collect();
+        assert!(
+            active_per_row.iter().all(|c| *c == active_per_row[0]),
+            "per-coordinate active-block counts diverged: {active_per_row:?}"
+        );
+    }
+
     #[test]
     fn load_model_rejects_payload_version_mismatch() {
         let model = FittedModel::from_payload(FittedModelPayload::new(

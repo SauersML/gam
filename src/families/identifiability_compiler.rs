@@ -10,8 +10,6 @@
 //! emits a [`CompiledBlock`] per stage. A post-walk column-pivoted QR
 //! audit on the joint primary-state design deterministically drops
 //! trailing pivots from the latest block when joint rank is lost.
-//!
-//! Phase 2 architecture: `docs/identifiability_compiler.md`.
 
 use std::sync::Arc;
 
@@ -1173,7 +1171,7 @@ mod tests {
 
     /// Convenience: wrap a dense `(n × p)` block design as a `K=1`
     /// row-Jacobian operator. Used by tests; production families ship their
-    /// own concrete operators per `docs/identifiability_compiler.md` §1.
+    /// own concrete operators.
     struct DenseScalarOperator {
         design: Array2<f64>,
     }
