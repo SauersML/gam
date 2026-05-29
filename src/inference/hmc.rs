@@ -2346,11 +2346,101 @@ mod tests {
     }
 
     #[test]
-    fn run_nuts_sampling_rejects_zero_or_single_chain() {
-        // Issue #399: `chains=0` produced an empty initial-position vector and
-        // panicked in `ndarray::stack`; a single chain leaves the between-chain
-        // variance in the split-R-hat diagnostic undefined. Both must be
+    fn polya_gamma_gibbs_rejects_degenerate_counts_but_accepts_single_chain() {
+        // Issue #399 (missed path): the canonical unit-weight Bernoulli-logit
+        // GAM auto-selects the hand-rolled Pólya-Gamma Gibbs sampler, NOT the
+        // general-mcmc NUTS engine. Pre-fix that path never validated
+        // n_samples/n_chains, so `chains=0` / `samples=0` silently returned a
+        // degenerate empty `(0, p)` posterior instead of the typed error the
+        // NUTS path raised — a divergent contract on one public API. Assert PG
+        // now rejects the degenerate counts up front, and (mirroring NUTS)
+        // still accepts a single chain.
+        let x = array![[1.0], [1.0], [1.0], [1.0]];
+        let y = array![1.0, 0.0, 1.0, 0.0];
+        let weights = array![1.0, 1.0, 1.0, 1.0];
+        let penalty = array![[0.25]];
+        let mode = array![0.0];
+
+        let zero_chain_cfg = NutsConfig {
+            n_samples: 20,
+            nwarmup: 10,
+            n_chains: 0,
+            target_accept: 0.8,
+            seed: 7,
+        };
+        let err = super::run_logit_polya_gamma_gibbs(
+            x.view(),
+            y.view(),
+            weights.view(),
+            penalty.view(),
+            mode.view(),
+            &zero_chain_cfg,
+        )
+        .expect_err("PG Gibbs must reject zero chains up front, not return an empty posterior");
+        assert!(
+            err.contains("n_chains must be >= 1"),
+            "PG n_chains=0 gave unexpected error: {err}"
+        );
+
+        let zero_sample_cfg = NutsConfig {
+            n_samples: 0,
+            nwarmup: 10,
+            n_chains: 2,
+            target_accept: 0.8,
+            seed: 7,
+        };
+        let err = super::run_logit_polya_gamma_gibbs(
+            x.view(),
+            y.view(),
+            weights.view(),
+            penalty.view(),
+            mode.view(),
+            &zero_sample_cfg,
+        )
+        .expect_err("PG Gibbs must reject zero samples up front, not return an empty posterior");
+        assert!(
+            err.contains("n_samples must be >= 4"),
+            "PG n_samples=0 gave unexpected error: {err}"
+        );
+
+        let single_chain_cfg = NutsConfig {
+            n_samples: 20,
+            nwarmup: 10,
+            n_chains: 1,
+            target_accept: 0.8,
+            seed: 7,
+        };
+        let result = super::run_logit_polya_gamma_gibbs(
+            x.view(),
+            y.view(),
+            weights.view(),
+            penalty.view(),
+            mode.view(),
+            &single_chain_cfg,
+        )
+        .expect("PG Gibbs must accept a single chain and return draws");
+        assert_eq!(
+            result.samples.nrows(),
+            20,
+            "single-chain PG run should return all 20 requested draws"
+        );
+    }
+
+    #[test]
+    fn run_nuts_sampling_rejects_zero_chains_but_accepts_single_chain() {
+        // Issue #399: only `chains=0` is degenerate — it produces an empty
+        // initial-position vector and panics in `ndarray::stack`, so it must be
         // rejected up front with a typed error.
+        //
+        // A *single* chain, by contrast, is a supported, tested configuration
+        // (`tests/test_sample_seed_is_reproducible.py`,
+        // `tests/test_posterior_save_no_extension_roundtrip.py`,
+        // `tests/test_penalty_sampling_survival_diagnostics_regressions.py` all
+        // sample with `chains=1`): the engine splits each chain in half, so one
+        // chain still yields the two split-chains the R-hat path needs, and
+        // `compute_split_rhat_and_ess` early-returns gracefully for
+        // `n_chains < 2`. The original #399 fix wrongly raised the floor to 2
+        // and regressed those tests; this asserts `chains=1` *returns draws*.
         let x = array![[1.0], [1.0], [1.0]];
         let y = array![0.5, -0.5, 1.0];
         let weights = array![1.0, 1.0, 1.0];
@@ -2358,35 +2448,58 @@ mod tests {
         let mode = array![0.0];
         let hessian = array![[1.25]];
 
-        for bad_chains in [0usize, 1] {
-            let cfg = NutsConfig {
-                n_samples: 50,
-                nwarmup: 10,
-                n_chains: bad_chains,
-                target_accept: 0.8,
-                seed: 222,
-            };
+        let zero_chain_cfg = NutsConfig {
+            n_samples: 50,
+            nwarmup: 10,
+            n_chains: 0,
+            target_accept: 0.8,
+            seed: 222,
+        };
+        let err = super::run_nuts_sampling(
+            x.view(),
+            y.view(),
+            weights.view(),
+            penalty.view(),
+            mode.view(),
+            hessian.view(),
+            NutsFamily::Gaussian,
+            1.0,
+            crate::estimate::Dispersion::Known(1.0),
+            false,
+            &zero_chain_cfg,
+        )
+        .expect_err("zero chains must be rejected before sampling");
+        assert!(
+            err.contains("n_chains must be >= 1"),
+            "n_chains=0 gave unexpected error: {err}"
+        );
 
-            let err = super::run_nuts_sampling(
-                x.view(),
-                y.view(),
-                weights.view(),
-                penalty.view(),
-                mode.view(),
-                hessian.view(),
-                NutsFamily::Gaussian,
-                1.0,
-                crate::estimate::Dispersion::Known(1.0),
-                false,
-                &cfg,
-            )
-            .expect_err("too-few chains must be rejected before sampling");
-
-            assert!(
-                err.contains("n_chains must be >= 2"),
-                "n_chains={bad_chains} gave unexpected error: {err}"
-            );
-        }
+        let single_chain_cfg = NutsConfig {
+            n_samples: 50,
+            nwarmup: 10,
+            n_chains: 1,
+            target_accept: 0.8,
+            seed: 222,
+        };
+        let result = super::run_nuts_sampling(
+            x.view(),
+            y.view(),
+            weights.view(),
+            penalty.view(),
+            mode.view(),
+            hessian.view(),
+            NutsFamily::Gaussian,
+            1.0,
+            crate::estimate::Dispersion::Known(1.0),
+            false,
+            &single_chain_cfg,
+        )
+        .expect("a single chain is a supported configuration and must return draws");
+        assert_eq!(
+            result.samples.nrows(),
+            50,
+            "single-chain run should return all 50 requested draws"
+        );
     }
 
     #[test]
