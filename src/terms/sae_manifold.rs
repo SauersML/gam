@@ -41,6 +41,16 @@ use crate::terms::analytic_penalties::{
 };
 use crate::terms::latent_coord::{LatentCoordValues, LatentIdMode, LatentManifold};
 
+use crate::linalg::faer_ndarray::FaerEigh;
+use crate::solver::arrow_schur::{ArrowFactorCache, solve_arrow_newton_step_with_options};
+use crate::solver::estimate::EstimationError;
+use crate::solver::evidence::arrow_log_det_from_cache;
+use crate::solver::outer_strategy::{
+    DeclaredHessianForm, Derivative, HessianResult, OuterCapability, OuterEval, OuterObjective,
+    SeedOutcome,
+};
+use faer::Side;
+
 const SAE_MANIFOLD_ARMIJO_C1: f64 = 1.0e-4;
 const SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS: usize = 12;
 
@@ -1541,6 +1551,61 @@ impl SaeManifoldRho {
 
     pub fn lambda_smooth(&self) -> f64 {
         self.log_lambda_smooth.exp()
+    }
+
+    /// Flatten ρ into the contiguous outer-coordinate vector the generic
+    /// `OuterObjective` engine optimises over.
+    ///
+    /// Layout: `[log_lambda_sparse, log_lambda_smooth, <ARD>]`, where the
+    /// ARD tail concatenates each atom `k`'s per-axis `log_ard[k][j]` in
+    /// atom order, axis `j` in `0..d_k`. [`Self::from_flat`] is the exact
+    /// inverse and reads the per-atom dims from `self`.
+    pub fn to_flat(&self) -> Array1<f64> {
+        let ard_len: usize = self.log_ard.iter().map(|a| a.len()).sum();
+        let mut out = Array1::<f64>::zeros(2 + ard_len);
+        out[0] = self.log_lambda_sparse;
+        out[1] = self.log_lambda_smooth;
+        let mut cursor = 2usize;
+        for axis in &self.log_ard {
+            for &v in axis.iter() {
+                out[cursor] = v;
+                cursor += 1;
+            }
+        }
+        out
+    }
+
+    /// Rebuild a ρ with this ρ's per-atom ARD dimensions from a flat
+    /// outer-coordinate vector produced by [`Self::to_flat`].
+    ///
+    /// The per-atom dims are taken from `&self` (the ARD layout is a fixed
+    /// property of the term shape; the engine only moves the values). The
+    /// flat vector must have length `2 + Σ_k d_k`.
+    pub fn from_flat(&self, flat: ArrayView1<'_, f64>) -> SaeManifoldRho {
+        let ard_len: usize = self.log_ard.iter().map(|a| a.len()).sum();
+        assert_eq!(
+            flat.len(),
+            2 + ard_len,
+            "SaeManifoldRho::from_flat: flat length {} != 2 + Σ d_k = {}",
+            flat.len(),
+            2 + ard_len
+        );
+        let mut log_ard = Vec::with_capacity(self.log_ard.len());
+        let mut cursor = 2usize;
+        for axis in &self.log_ard {
+            let d = axis.len();
+            let mut block = Array1::<f64>::zeros(d);
+            for (j, slot) in block.iter_mut().enumerate() {
+                *slot = flat[cursor + j];
+            }
+            cursor += d;
+            log_ard.push(block);
+        }
+        SaeManifoldRho {
+            log_lambda_sparse: flat[0],
+            log_lambda_smooth: flat[1],
+            log_ard,
+        }
     }
 }
 
@@ -3056,6 +3121,140 @@ impl SaeManifoldTerm {
         sys.apply_riemannian_latent_geometry(&latent);
     }
 
+    /// Numerical rank of a symmetric matrix: the count of eigenvalues
+    /// exceeding `tol · max_eig`, with `tol = 1e-9` (the conventional
+    /// relative spectral cutoff used elsewhere in the codebase).
+    ///
+    /// Used to count the penalised dimension of each atom's `smooth_penalty`
+    /// `S_k` so the REML criterion's `−½·p·rank(S)·log λ_smooth` Occam term
+    /// uses the *effective* penalty rank rather than the ambient basis size
+    /// (a thin-plate / B-spline penalty has a non-trivial null space).
+    fn symmetric_rank(s: &Array2<f64>) -> Result<usize, String> {
+        let m = s.ncols();
+        if m == 0 {
+            return Ok(0);
+        }
+        // Symmetrise defensively — `smooth_penalty` is conceptually symmetric
+        // but may be stored with tiny asymmetry from assembly arithmetic.
+        let mut sym = Array2::<f64>::zeros((m, m));
+        for i in 0..m {
+            for j in 0..m {
+                sym[[i, j]] = 0.5 * (s[[i, j]] + s[[j, i]]);
+            }
+        }
+        let (evals, _evecs) = sym
+            .eigh(Side::Lower)
+            .map_err(|e| format!("SaeManifoldTerm::symmetric_rank: eigh failed: {e}"))?;
+        let max_eig = evals.iter().fold(0.0_f64, |acc, &v| acc.max(v));
+        if !(max_eig > 0.0) {
+            return Ok(0);
+        }
+        let tol = 1.0e-9 * max_eig;
+        Ok(evals.iter().filter(|&&v| v > tol).count())
+    }
+
+    /// True REML criterion for the SAE term at a FIXED ρ.
+    ///
+    /// Runs the inner `(t, β)` arrow-Schur Newton solve to convergence at the
+    /// supplied ρ (with NO in-loop ARD update — ρ is owned by the engine),
+    /// then forms the Laplace/REML cost
+    ///
+    /// ```text
+    /// V(ρ) = ℓ_pen(t̂, β̂; ρ) + ½ log|H(t̂, β̂; ρ)|
+    ///        − ½ · p · (Σ_k rank S_k) · log λ_smooth
+    /// ```
+    ///
+    /// where `ℓ_pen = loss.total()` is the penalised objective at the inner
+    /// optimum and `½ log|H|` is the Laplace normaliser. `H` is the joint
+    /// `(t, β)` Hessian assembled by the arrow-Schur system; its `H_tt` block
+    /// carries `α = exp(log_ard)` on its diagonal, so as α grows `½ log|H|`
+    /// rises while the `−½·n·log α` already inside `loss.ard` falls — their
+    /// balance IS the effective-dof term that the deleted `α = n/‖t‖²` rule
+    /// dropped, which is why the criterion needs no clamp to stay finite on a
+    /// collapsing axis.
+    ///
+    /// The final `−½·p·rank(S)·log λ_smooth` term is the smoothing-penalty
+    /// normaliser `−½ log|λ S|_+` restricted to its ρ-dependent part: `S_k` is
+    /// shared across all `p` decoder output channels (the `⊗ I_p` Kronecker
+    /// structure), so `log|λ S|_+ = p·rank(S)·log λ + p·log|S|_+`, and the
+    /// `½ p·log|S|_+` piece is ρ-independent. ALL ρ-independent additive
+    /// constants (the `2π` Laplace constant, the base `½ p·log|S|_+` penalty
+    /// logdet, the assignment-prior normaliser) are DROPPED here: they shift
+    /// `V` by a constant and do not affect the ρ-argmin the engine seeks.
+    ///
+    /// Returns `(V, loss)` so the engine can both rank ρ and surface the inner
+    /// loss breakdown.
+    pub fn reml_criterion(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        registry: Option<&AnalyticPenaltyRegistry>,
+        inner_max_iter: usize,
+        learning_rate: f64,
+        ridge_ext_coord: f64,
+        ridge_beta: f64,
+    ) -> Result<(f64, SaeManifoldLoss), String> {
+        // 1. Run the inner (t, β) Newton solve to convergence at FIXED ρ.
+        //    `run_joint_fit_arrow_schur` no longer touches ρ.
+        let mut rho_fixed = rho.clone();
+        let loss = self.run_joint_fit_arrow_schur(
+            target,
+            &mut rho_fixed,
+            registry,
+            inner_max_iter,
+            learning_rate,
+            ridge_ext_coord,
+            ridge_beta,
+        )?;
+
+        // 2. One final UNDAMPED assemble + factor to obtain the converged
+        //    joint Hessian log-determinant. We force ridge = 0 and the dense
+        //    `Direct` Schur mode so `arrow_log_det_from_cache` returns the
+        //    exact `log|H| = Σ_i log|H_tt^(i)| + log|Schur_β|` (it rejects
+        //    damped factors and InexactPCG caches, which have no dense Schur
+        //    factor). This is the same evidence convention the main GAM REML
+        //    path uses.
+        let sys = self
+            .assemble_arrow_schur(target, rho, registry)
+            .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?;
+        let options = ArrowSolveOptions::direct();
+        let (delta_t, delta_beta, cache): (Array1<f64>, Array1<f64>, ArrowFactorCache) =
+            solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options)
+                .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?;
+        // The Laplace normaliser ½log|H| is only the correct REML criterion at
+        // the inner optimum (t̂, β̂). The undamped Newton step computed here is
+        // the natural KKT residual of that solve: a step whose magnitude
+        // dwarfs the iterate means the inner loop did not converge at this ρ
+        // and the log-det would be evaluated off the manifold. Surface that as
+        // a recoverable error rather than returning a meaningless criterion.
+        let step_norm_sq: f64 = delta_t.iter().map(|&v| v * v).sum::<f64>()
+            + delta_beta.iter().map(|&v| v * v).sum::<f64>();
+        if !step_norm_sq.is_finite() {
+            return Err(format!(
+                "SaeManifoldTerm::reml_criterion: undamped Newton residual is non-finite at \
+                 the inner optimum (‖Δ‖²={step_norm_sq}); the joint Hessian factorisation is \
+                 degenerate at this ρ"
+            ));
+        }
+        let log_det = arrow_log_det_from_cache(&cache).ok_or_else(|| {
+            "SaeManifoldTerm::reml_criterion: arrow_log_det_from_cache returned None at \
+             ridge=0 Direct mode (no dense Schur factor); the joint Hessian log-det is \
+             required for the Laplace normaliser"
+                .to_string()
+        })?;
+
+        // 3. Smoothing-penalty Occam term: −½·p·(Σ_k rank S_k)·log λ_smooth.
+        let p_out = self.output_dim() as f64;
+        let mut smooth_rank_total = 0usize;
+        for atom in &self.atoms {
+            smooth_rank_total += Self::symmetric_rank(&atom.smooth_penalty)?;
+        }
+        let occam = 0.5 * p_out * (smooth_rank_total as f64) * rho.log_lambda_smooth;
+
+        let v = loss.total() + 0.5 * log_det - occam;
+        Ok((v, loss))
+    }
+
     /// Returns `true` when a Beta-tier analytic penalty was accumulated into
     /// the dense `sys.hbb` block (so the caller knows to wrap it in a
     /// `DensePenaltyOp`); `false` leaves `sys.hbb` all-zero and lets the
@@ -4314,6 +4513,169 @@ impl SaeManifoldTerm {
             ));
         }
         (assignment, ard)
+    }
+}
+
+/// Outer REML objective for the SAE-manifold term.
+///
+/// Routes the SAE's smoothing hyperparameters ρ
+/// (`log_lambda_sparse`, `log_lambda_smooth`, per-atom/axis `log_ard`)
+/// through the *one* generic [`OuterObjective`] engine + cascade that the
+/// main GAM REML path uses, instead of the SAE's deleted forked
+/// `update_ard_reml` fixed-point rule. Each outer eval runs the inner
+/// `(t, β)` arrow-Schur Newton solve at the engine's current ρ and returns
+/// the true REML criterion (see [`SaeManifoldTerm::reml_criterion`]).
+///
+/// The SAE's outer coordinates ρ are all penalty-like / τ (precisions and
+/// log-smoothing-strengths), so `psi_dim = 0`: there are no design-moving
+/// (ψ) coordinates. No analytic outer gradient/Hessian is exposed yet
+/// (task v2 wires the selected-inverse block-trace ρ-gradient), so this
+/// is a cost-only objective and the engine routes it to a derivative-free /
+/// finite-difference outer strategy per the planner.
+pub struct SaeManifoldOuterObjective {
+    term: SaeManifoldTerm,
+    /// Pristine term to restore from on `reset` (multi-start baseline).
+    baseline_term: SaeManifoldTerm,
+    target: Array2<f64>,
+    registry: Option<AnalyticPenaltyRegistry>,
+    /// ρ template carrying the per-atom ARD dims; `from_flat` reads its
+    /// layout. Updated to each evaluated ρ so `into_fitted` can report the
+    /// last ρ the engine settled on.
+    current_rho: SaeManifoldRho,
+    /// Pristine ρ to restore from on `reset`.
+    baseline_rho: SaeManifoldRho,
+    inner_max_iter: usize,
+    learning_rate: f64,
+    ridge_ext_coord: f64,
+    ridge_beta: f64,
+    /// Last inner loss breakdown observed (for `into_fitted`).
+    last_loss: Option<SaeManifoldLoss>,
+    /// Optional warm-start β slot. When the cache / continuation walk seeds a
+    /// β, the next inner solve opens from it instead of cold.
+    seeded_beta: Option<Array1<f64>>,
+}
+
+impl SaeManifoldOuterObjective {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        term: SaeManifoldTerm,
+        target: Array2<f64>,
+        registry: Option<AnalyticPenaltyRegistry>,
+        init_rho: SaeManifoldRho,
+        inner_max_iter: usize,
+        learning_rate: f64,
+        ridge_ext_coord: f64,
+        ridge_beta: f64,
+    ) -> Self {
+        let baseline_term = term.clone();
+        let baseline_rho = init_rho.clone();
+        Self {
+            term,
+            baseline_term,
+            target,
+            registry,
+            current_rho: init_rho,
+            baseline_rho,
+            inner_max_iter,
+            learning_rate,
+            ridge_ext_coord,
+            ridge_beta,
+            last_loss: None,
+            seeded_beta: None,
+        }
+    }
+
+    /// Consume the objective, returning the inner-fitted term, the last ρ the
+    /// engine evaluated, and the inner loss breakdown at that ρ.
+    pub fn into_fitted(self) -> (SaeManifoldTerm, SaeManifoldRho, SaeManifoldLoss) {
+        let loss = self.last_loss.unwrap_or_else(|| SaeManifoldLoss {
+            data_fit: 0.0,
+            assignment_sparsity: 0.0,
+            smoothness: 0.0,
+            ard: 0.0,
+        });
+        (self.term, self.current_rho, loss)
+    }
+
+    /// Shared cost path: evaluate the REML criterion at `rho_flat`, updating
+    /// the cached ρ / loss and (optionally) priming the inner solve from a
+    /// seeded β. Returns `(cost, β̂)`.
+    fn evaluate(&mut self, rho_flat: ArrayView1<'_, f64>) -> Result<(f64, Array1<f64>), String> {
+        let rho = self.baseline_rho.from_flat(rho_flat);
+        if let Some(beta) = self.seeded_beta.take() {
+            // Warm-start the inner decoder coefficients before the solve.
+            if beta.len() == self.term.beta_dim() {
+                self.term.set_flat_beta(beta.view())?;
+            }
+        }
+        let (cost, loss) = self.term.reml_criterion(
+            self.target.view(),
+            &rho,
+            self.registry.as_ref(),
+            self.inner_max_iter,
+            self.learning_rate,
+            self.ridge_ext_coord,
+            self.ridge_beta,
+        )?;
+        self.current_rho = rho;
+        self.last_loss = Some(loss);
+        let beta_hat = self.term.flatten_beta();
+        Ok((cost, beta_hat))
+    }
+}
+
+impl OuterObjective for SaeManifoldOuterObjective {
+    fn capability(&self) -> OuterCapability {
+        OuterCapability {
+            gradient: Derivative::Unavailable,
+            hessian: DeclaredHessianForm::Unavailable,
+            n_params: self.baseline_rho.to_flat().len(),
+            // ρ are all penalty-like / τ coordinates: precisions and
+            // log-smoothing strengths. No design-moving ψ coordinates.
+            psi_dim: 0,
+            fixed_point_available: false,
+            barrier_config: None,
+            prefer_gradient_only: false,
+            disable_fixed_point: false,
+        }
+    }
+
+    fn eval_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
+        self.evaluate(rho.view())
+            .map(|(cost, _beta)| cost)
+            .map_err(EstimationError::RemlOptimizationFailed)
+    }
+
+    fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
+        let n_params = self.baseline_rho.to_flat().len();
+        let (cost, beta_hat) = self
+            .evaluate(rho.view())
+            .map_err(EstimationError::RemlOptimizationFailed)?;
+        Ok(OuterEval {
+            cost,
+            gradient: Array1::zeros(n_params),
+            hessian: HessianResult::Unavailable,
+            inner_beta_hint: Some(beta_hat),
+        })
+    }
+
+    fn reset(&mut self) {
+        self.term = self.baseline_term.clone();
+        self.current_rho = self.baseline_rho.clone();
+        self.last_loss = None;
+        self.seeded_beta = None;
+    }
+
+    fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
+        if beta.len() != self.term.beta_dim() {
+            return Err(EstimationError::RemlOptimizationFailed(format!(
+                "SaeManifoldOuterObjective::seed_inner_state: β length {} != decoder dim {}",
+                beta.len(),
+                self.term.beta_dim()
+            )));
+        }
+        self.seeded_beta = Some(beta.clone());
+        Ok(SeedOutcome::Installed)
     }
 }
 
