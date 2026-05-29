@@ -823,42 +823,199 @@ impl SaeBasisSecondJet for AffineCoordinateEvaluator {
     }
 }
 
-/// Static basis evaluator: returns a frozen `(Phi, dPhi/dt)` snapshot regardless
-/// of the supplied coordinates. Lets the multi-step Newton loop compose for
-/// basis kinds whose true refresh routine is not yet wired in Rust — the
-/// Newton step still updates logits, coordinates, and decoder β while the
-/// basis design remains the caller-provided snapshot.
+/// Scale-free Duchon atom evaluator for the SAE-manifold Newton loop.
+///
+/// Recomputes the radial+polynomial design `Φ(t)` and its first/second
+/// input-location jets at arbitrary latent coordinates against a fixed set of
+/// `centers` and Duchon null-space `order`. The column layout — the
+/// kernel block `Φ_radial(t)·Z` followed by the polynomial block `P(t)`,
+/// both carrying the same scalar kernel amplification `α` — matches
+/// [`crate::basis::build_duchon_basis`] under the SAE atom's spec
+/// (`length_scale = None`, `power = 0`, no identifiability transform). The
+/// forward design and the jet are produced from a single core entry point
+/// ([`crate::basis::duchon_sae_atom_basis_with_jet`]) so they always agree on
+/// column count and scaling — the exact contract issue #247 pinned.
 #[derive(Debug, Clone)]
-pub struct StaticBasisEvaluator {
-    pub phi: Array2<f64>,
-    pub jet: Array3<f64>,
+pub struct DuchonCoordinateEvaluator {
+    pub centers: Array2<f64>,
+    pub order: crate::basis::DuchonNullspaceOrder,
 }
 
-impl StaticBasisEvaluator {
-    pub fn new(phi: Array2<f64>, jet: Array3<f64>) -> Result<Self, String> {
-        let (n, m) = phi.dim();
-        let jet_dim = jet.dim();
-        if jet_dim.0 != n || jet_dim.1 != m {
-            return Err(format!(
-                "StaticBasisEvaluator: jet shape {:?} incompatible with phi shape {:?}",
-                jet_dim,
-                phi.dim()
-            ));
+impl DuchonCoordinateEvaluator {
+    /// Build from the atom's centers and Duchon `m` (`m = 1` → constant
+    /// null space, `m = 2` → constant+linear, `m = k+1` → degree-`k`).
+    pub fn new(centers: Array2<f64>, m: usize) -> Result<Self, String> {
+        if centers.ncols() == 0 {
+            return Err("DuchonCoordinateEvaluator: centers must have at least one column".into());
         }
-        Ok(Self { phi, jet })
+        if m == 0 {
+            return Err("DuchonCoordinateEvaluator: Duchon m must be at least 1".into());
+        }
+        let order = match m {
+            1 => crate::basis::DuchonNullspaceOrder::Zero,
+            2 => crate::basis::DuchonNullspaceOrder::Linear,
+            other => crate::basis::DuchonNullspaceOrder::Degree(other - 1),
+        };
+        Ok(Self { centers, order })
     }
 }
 
-impl SaeBasisEvaluator for StaticBasisEvaluator {
+impl SaeBasisEvaluator for DuchonCoordinateEvaluator {
+    fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
+        Some(<Self as SaeBasisSecondJet>::second_jet(self, coords))
+    }
+
     fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
-        if coords.nrows() != self.phi.nrows() {
+        if coords.ncols() != self.centers.ncols() {
             return Err(format!(
-                "StaticBasisEvaluator expected {} rows, got {}",
-                self.phi.nrows(),
-                coords.nrows()
+                "DuchonCoordinateEvaluator: expected latent_dim {}, got {}",
+                self.centers.ncols(),
+                coords.ncols()
             ));
         }
-        Ok((self.phi.clone(), self.jet.clone()))
+        crate::basis::duchon_sae_atom_basis_with_jet(coords, self.centers.view(), self.order)
+            .map_err(|err| err.to_string())
+    }
+}
+
+impl SaeBasisSecondJet for DuchonCoordinateEvaluator {
+    fn second_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array4<f64>, String> {
+        if coords.ncols() != self.centers.ncols() {
+            return Err(format!(
+                "DuchonCoordinateEvaluator::second_jet: expected latent_dim {}, got {}",
+                self.centers.ncols(),
+                coords.ncols()
+            ));
+        }
+        crate::basis::duchon_sae_atom_second_jet(coords, self.centers.view(), self.order)
+            .map_err(|err| err.to_string())
+    }
+}
+
+/// Flat Euclidean tangent-patch evaluator for the SAE-manifold Newton loop.
+///
+/// The basis is the set of monomials of total degree ≤ `max_degree` in the
+/// atom's latent coordinates (a zero-curvature polynomial expansion, distinct
+/// from the thin-plate Duchon kernel). It recomputes the monomial design and
+/// its first/second derivatives at arbitrary coordinates, so the inner Newton
+/// latent update stays consistent with the deployed design.
+#[derive(Debug, Clone)]
+pub struct EuclideanPatchEvaluator {
+    pub latent_dim: usize,
+    pub max_degree: usize,
+}
+
+impl EuclideanPatchEvaluator {
+    pub fn new(latent_dim: usize, max_degree: usize) -> Result<Self, String> {
+        if latent_dim == 0 {
+            return Err("EuclideanPatchEvaluator: latent_dim must be positive".into());
+        }
+        Ok(Self {
+            latent_dim,
+            max_degree,
+        })
+    }
+
+    fn order(&self) -> crate::basis::DuchonNullspaceOrder {
+        match self.max_degree {
+            0 => crate::basis::DuchonNullspaceOrder::Zero,
+            1 => crate::basis::DuchonNullspaceOrder::Linear,
+            k => crate::basis::DuchonNullspaceOrder::Degree(k),
+        }
+    }
+}
+
+impl SaeBasisEvaluator for EuclideanPatchEvaluator {
+    fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
+        Some(<Self as SaeBasisSecondJet>::second_jet(self, coords))
+    }
+
+    fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
+        if coords.ncols() != self.latent_dim {
+            return Err(format!(
+                "EuclideanPatchEvaluator: expected latent_dim {}, got {}",
+                self.latent_dim,
+                coords.ncols()
+            ));
+        }
+        let exponents = crate::basis::monomial_exponents(self.latent_dim, self.max_degree);
+        let n = coords.nrows();
+        let m = exponents.len();
+        let mut phi = Array2::<f64>::zeros((n, m));
+        for (col, alpha) in exponents.iter().enumerate() {
+            for row in 0..n {
+                let mut value = 1.0_f64;
+                for (axis, &exp) in alpha.iter().enumerate() {
+                    if exp != 0 {
+                        value *= coords[[row, axis]].powi(exp as i32);
+                    }
+                }
+                phi[[row, col]] = value;
+            }
+        }
+        let jet = crate::basis::duchon_polynomial_first_derivative_nd(coords, self.order());
+        if jet.shape() != [n, m, self.latent_dim] {
+            return Err(format!(
+                "EuclideanPatchEvaluator: monomial jet shape {:?} disagrees with ({n}, {m}, {})",
+                jet.shape(),
+                self.latent_dim
+            ));
+        }
+        Ok((phi, jet))
+    }
+}
+
+impl SaeBasisSecondJet for EuclideanPatchEvaluator {
+    fn second_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array4<f64>, String> {
+        if coords.ncols() != self.latent_dim {
+            return Err(format!(
+                "EuclideanPatchEvaluator::second_jet: expected latent_dim {}, got {}",
+                self.latent_dim,
+                coords.ncols()
+            ));
+        }
+        let exponents = crate::basis::monomial_exponents(self.latent_dim, self.max_degree);
+        let n = coords.nrows();
+        let m = exponents.len();
+        let d = self.latent_dim;
+        let mut hess = Array4::<f64>::zeros((n, m, d, d));
+        for (col, alpha) in exponents.iter().enumerate() {
+            for a in 0..d {
+                if alpha[a] == 0 {
+                    continue;
+                }
+                for c in 0..d {
+                    if a != c && alpha[c] == 0 {
+                        continue;
+                    }
+                    let lead = if a == c {
+                        (alpha[a] as f64) * (alpha[a].saturating_sub(1) as f64)
+                    } else {
+                        (alpha[a] as f64) * (alpha[c] as f64)
+                    };
+                    if lead == 0.0 {
+                        continue;
+                    }
+                    for row in 0..n {
+                        let mut value = lead;
+                        for axis in 0..d {
+                            let mut exp = alpha[axis];
+                            if axis == a {
+                                exp = exp.saturating_sub(1);
+                            }
+                            if axis == c {
+                                exp = exp.saturating_sub(1);
+                            }
+                            if exp != 0 {
+                                value *= coords[[row, axis]].powi(exp as i32);
+                            }
+                        }
+                        hess[[row, col, a, c]] = value;
+                    }
+                }
+            }
+        }
+        Ok(hess)
     }
 }
 
@@ -4434,6 +4591,98 @@ mod tests {
         let evaluator = TorusHarmonicEvaluator::new(2, 3).unwrap();
         assert!(evaluator.basis_size() > 0);
         assert_second_jet_matches_central_difference(&evaluator, torus_coords, 1.0e-5)?;
+        Ok(())
+    }
+
+    /// Issue #247: the Duchon coordinate evaluator must return a forward design
+    /// and a derivative jet with *matching column counts* — the original bug
+    /// was a radial-only design paired with a radial+polynomial jet (or vice
+    /// versa), which the consumer rejected as a "design/jet column mismatch".
+    #[test]
+    fn duchon_coordinate_evaluator_phi_and_jet_share_column_count() {
+        for (d, centers) in [
+            (
+                1usize,
+                array![[-1.0], [-0.4], [0.1], [0.6], [1.2], [1.9]],
+            ),
+            (
+                2usize,
+                array![
+                    [-1.0, -0.8],
+                    [-0.3, 0.4],
+                    [0.2, -0.5],
+                    [0.7, 0.9],
+                    [1.1, -0.2],
+                    [1.6, 0.6],
+                ],
+            ),
+        ] {
+            let evaluator = DuchonCoordinateEvaluator::new(centers, 2).unwrap();
+            let coords = match d {
+                1 => array![[-0.5], [0.0], [0.3], [0.8]],
+                _ => array![[-0.5, 0.2], [0.0, -0.3], [0.3, 0.7], [0.8, -0.1]],
+            };
+            let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+            assert_eq!(
+                phi.ncols(),
+                jet.shape()[1],
+                "Duchon d={d}: Phi has {} columns but jet has {}",
+                phi.ncols(),
+                jet.shape()[1]
+            );
+            assert_eq!(jet.shape()[0], coords.nrows());
+            assert_eq!(jet.shape()[2], d);
+        }
+    }
+
+    /// The Duchon evaluator's analytic first jet must equal the finite
+    /// difference of its own forward design — i.e. `dPhi/dt` is the true
+    /// derivative of `Phi(t)`, with no stray amplification/column mismatch.
+    #[test]
+    fn duchon_coordinate_evaluator_jacobian_matches_fd() {
+        let centers = array![
+            [-1.0, -0.8],
+            [-0.3, 0.4],
+            [0.2, -0.5],
+            [0.7, 0.9],
+            [1.1, -0.2],
+            [1.6, 0.6],
+        ];
+        let evaluator = DuchonCoordinateEvaluator::new(centers, 2).unwrap();
+        // Keep probe points away from any center so the radial kernel is smooth.
+        let coords = array![[-0.5, 0.2], [0.05, -0.35], [0.45, 0.75], [1.3, 0.1]];
+        assert_jacobian_matches_central_difference(&evaluator, coords, 1.0e-4);
+    }
+
+    /// The Duchon evaluator's analytic second jet must match the FD of its
+    /// (FD-validated) first jet.
+    #[test]
+    fn duchon_coordinate_evaluator_second_jet_matches_fd() -> Result<(), String> {
+        let centers = array![
+            [-1.0, -0.8],
+            [-0.3, 0.4],
+            [0.2, -0.5],
+            [0.7, 0.9],
+            [1.1, -0.2],
+            [1.6, 0.6],
+        ];
+        let evaluator = DuchonCoordinateEvaluator::new(centers, 2).unwrap();
+        let coords = array![[-0.5, 0.2], [0.05, -0.35], [0.45, 0.75], [1.3, 0.1]];
+        assert_second_jet_matches_central_difference(&evaluator, coords, 1.0e-4)?;
+        Ok(())
+    }
+
+    /// The Euclidean tangent-patch evaluator's monomial design and its
+    /// first/second jets must be mutually consistent under finite differences.
+    #[test]
+    fn euclidean_patch_evaluator_jets_match_fd() -> Result<(), String> {
+        let evaluator = EuclideanPatchEvaluator::new(2, 2).unwrap();
+        let coords = array![[0.0, -1.0], [3.5, 0.25], [-0.75, 1.2], [0.4, 0.9]];
+        assert_jacobian_matches_central_difference(&evaluator, coords.clone(), 1.0e-6);
+        assert_second_jet_matches_central_difference(&evaluator, coords, 1.0e-5)?;
+        // The degree-2 patch in d=2 has columns {1, x, y, x², xy, y²}.
+        let (phi, _jet) = evaluator.evaluate(array![[0.0, 0.0]].view())?;
+        assert_eq!(phi.ncols(), 6);
         Ok(())
     }
 

@@ -98,9 +98,9 @@ use gam::terms::interchange_decoder::{
 };
 use gam::terms::latent_coord::{AuxPriorFamily, aux_prior_targets};
 use gam::terms::sae_manifold::{
-    AssignmentMode, GumbelTemperatureSchedule, PeriodicHarmonicEvaluator, SaeAtomBasisKind,
-    SaeBasisEvaluator, SaeManifoldRho, ScheduleKind, SphereChartEvaluator, StaticBasisEvaluator,
-    TorusHarmonicEvaluator, term_from_padded_blocks_with_mode,
+    AssignmentMode, DuchonCoordinateEvaluator, EuclideanPatchEvaluator, GumbelTemperatureSchedule,
+    PeriodicHarmonicEvaluator, SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldRho, ScheduleKind,
+    SphereChartEvaluator, TorusHarmonicEvaluator, term_from_padded_blocks_with_mode,
 };
 use gam::terms::skip_transcoder::{
     SkipTranscoderRemlInputs, skip_transcoder_reml_metrics as skip_transcoder_reml_metrics_core,
@@ -9124,6 +9124,13 @@ fn sae_atom_basis_kind_from_str(value: &str) -> SaeAtomBasisKind {
 const SAE_DEFAULT_TORUS_HARMONICS: usize = 3;
 /// Sphere chart basis size (lat/lon ⇒ `[1, x, y, z, xy, yz, xz]`).
 const SAE_SPHERE_BASIS_SIZE: usize = 7;
+/// Duchon `m` for SAE-manifold atoms (constant + linear null space). The full
+/// operator-penalty triplet is resolved per-dimension from this `m` via
+/// [`resolve_duchon_hybrid_config`].
+const SAE_DUCHON_ATOM_M: usize = 2;
+/// Maximum total monomial degree for a Euclidean tangent-patch SAE atom
+/// (`{1, t_a, t_a t_b}` at degree 2).
+const SAE_EUCLIDEAN_PATCH_MAX_DEGREE: usize = 2;
 
 fn gumbel_temperature_schedule_from_pydict(
     schedule: Option<&Bound<'_, PyDict>>,
@@ -9193,27 +9200,33 @@ fn gumbel_temperature_schedule_from_pydict(
 /// Build per-atom Rust basis evaluators so the Newton loop can refresh
 /// `Phi_k` and `dPhi_k/dt` between steps without bouncing back to Python.
 ///
-/// `Periodic` atoms with `latent_dim == 1` are served by an analytic harmonic
-/// evaluator. Other kinds (Duchon, Sphere, EuclideanPatch, Precomputed, or
-/// higher-dimensional Periodic) currently fall back to a frozen snapshot of
-/// the caller-supplied design, which keeps the multi-step loop well-defined
-/// while leaving logits / coords / β free to move.
+/// Every supported kind has a concrete analytic evaluator: `Periodic`
+/// (`latent_dim == 1`) → harmonic, `Sphere` (`latent_dim == 2`) → chart,
+/// `Torus` → tensor harmonic, `Duchon` → radial+polynomial coordinate
+/// evaluator (requires the atom's centers in `atom_centers`), and
+/// `EuclideanPatch` → monomial patch. A `Precomputed` atom — or a kind whose
+/// refresh metadata is missing (e.g. a Duchon atom with no centers) — has no
+/// way to re-evaluate `Phi(t)` at updated coordinates, so construction errors
+/// rather than freezing a stale snapshot.
 fn build_sae_basis_evaluators(
     basis_kinds: &[SaeAtomBasisKind],
     basis_sizes: &[usize],
     atom_dim: &[usize],
     coord_blocks: &[Array2<f64>],
-    basis_values: ArrayView3<'_, f64>,
-    basis_jacobian: ArrayView4<'_, f64>,
-    n_obs: usize,
+    atom_centers: &[Option<Array2<f64>>],
 ) -> Result<Vec<Option<Arc<dyn SaeBasisEvaluator>>>, String> {
     let k_atoms = basis_kinds.len();
-    if atom_dim.len() != k_atoms || basis_sizes.len() != k_atoms || coord_blocks.len() != k_atoms {
+    if atom_dim.len() != k_atoms
+        || basis_sizes.len() != k_atoms
+        || coord_blocks.len() != k_atoms
+        || atom_centers.len() != k_atoms
+    {
         return Err(format!(
-            "build_sae_basis_evaluators: K-length metadata mismatch (kinds={k_atoms}, dims={}, sizes={}, coords={})",
+            "build_sae_basis_evaluators: K-length metadata mismatch (kinds={k_atoms}, dims={}, sizes={}, coords={}, centers={})",
             atom_dim.len(),
             basis_sizes.len(),
-            coord_blocks.len()
+            coord_blocks.len(),
+            atom_centers.len()
         ));
     }
     let mut out: Vec<Option<Arc<dyn SaeBasisEvaluator>>> = Vec::with_capacity(k_atoms);
@@ -9233,10 +9246,37 @@ fn build_sae_basis_evaluators(
                 let h = (axis_m - 1) / 2;
                 Arc::new(TorusHarmonicEvaluator::new(d, h)?)
             }
-            _ => {
-                let phi = basis_values.slice(s![k, 0..n_obs, 0..m]).to_owned();
-                let jet = basis_jacobian.slice(s![k, 0..n_obs, 0..m, 0..d]).to_owned();
-                Arc::new(StaticBasisEvaluator::new(phi, jet)?)
+            SaeAtomBasisKind::Duchon => {
+                let centers = atom_centers[k].as_ref().ok_or_else(|| {
+                    format!(
+                        "build_sae_basis_evaluators: Duchon atom {k} cannot refresh its basis without centers; \
+                         build the atom through the SAE auto path so its Duchon centers are threaded in"
+                    )
+                })?;
+                Arc::new(DuchonCoordinateEvaluator::new(
+                    centers.clone(),
+                    SAE_DUCHON_ATOM_M,
+                )?)
+            }
+            SaeAtomBasisKind::EuclideanPatch => {
+                Arc::new(EuclideanPatchEvaluator::new(d, SAE_EUCLIDEAN_PATCH_MAX_DEGREE)?)
+            }
+            SaeAtomBasisKind::Precomputed(label) => {
+                return Err(format!(
+                    "build_sae_basis_evaluators: atom {k} basis {label:?} is precomputed and has no \
+                     analytic refresh routine; the inner Newton latent update requires a basis kind \
+                     that can re-evaluate Phi(t)/dPhi/dt at updated coordinates"
+                ));
+            }
+            SaeAtomBasisKind::Periodic => {
+                return Err(format!(
+                    "build_sae_basis_evaluators: Periodic atom {k} requires latent_dim == 1 and odd basis size; got dim={d}, m={m}"
+                ));
+            }
+            SaeAtomBasisKind::Sphere => {
+                return Err(format!(
+                    "build_sae_basis_evaluators: Sphere atom {k} requires latent_dim == 2 and basis size {SAE_SPHERE_BASIS_SIZE}; got dim={d}, m={m}"
+                ));
             }
         };
         out.push(Some(evaluator));
@@ -9247,10 +9287,14 @@ fn build_sae_basis_evaluators(
 /// Fit a SAE-manifold term end-to-end in Rust: up to `max_iter` Newton steps
 /// per λ_smooth candidate, refreshing `Phi` and `dPhi/dt` between steps via
 /// the per-atom [`SaeBasisEvaluator`] (analytic harmonic for `Periodic`
-/// atoms with `latent_dim == 1`; frozen snapshot fallback otherwise). The
-/// inner loop terminates early when the relative change in the penalized
-/// objective drops below `1e-6`. `lambda_grid` evaluates candidate smoothness
-/// lambdas in Rust and the best evidence-proxy wins.
+/// `latent_dim == 1`, chart for `Sphere`, tensor harmonic for `Torus`; the
+/// radial+polynomial Duchon and monomial Euclidean evaluators refresh from the
+/// auto path that threads their metadata). This precomputed-basis entry point
+/// carries no Duchon centers, so a Duchon/precomputed atom here errors instead
+/// of freezing the seed snapshot. The inner loop terminates early when the
+/// relative change in the penalized objective drops below `1e-6`.
+/// `lambda_grid` evaluates candidate smoothness lambdas in Rust and the best
+/// evidence-proxy wins.
 #[pyfunction(signature = (
     z,
     atom_basis,
@@ -9304,11 +9348,19 @@ fn sae_manifold_fit<'py>(
     analytic_penalties: Option<String>,
     top_k: Option<usize>,
 ) -> PyResult<Py<PyDict>> {
+    // The precomputed-basis entry point carries no Duchon centers / kernel
+    // metadata, so any basis kind whose refresh needs them cannot re-evaluate
+    // `Phi(t)` at updated coordinates. Pass empty per-atom centers; the
+    // evaluator builder errors for such kinds (rather than silently freezing
+    // the seed snapshot). Kinds with an analytic, centers-free basis
+    // (periodic, sphere, torus) refresh as usual.
+    let atom_centers: Vec<Option<Array2<f64>>> = vec![None; atom_basis.len()];
     sae_manifold_fit_inner(
         py,
         z.as_array(),
         &atom_basis,
         atom_dim,
+        &atom_centers,
         basis_values.as_array(),
         basis_jacobian.as_array(),
         basis_sizes,
@@ -9338,6 +9390,7 @@ fn sae_manifold_fit_inner<'py>(
     z_view: ArrayView2<'_, f64>,
     atom_basis: &[String],
     atom_dim: Vec<usize>,
+    atom_centers: &[Option<Array2<f64>>],
     basis_values: ArrayView3<'_, f64>,
     basis_jacobian: ArrayView4<'_, f64>,
     basis_sizes: Vec<usize>,
@@ -9565,16 +9618,15 @@ fn sae_manifold_fit_inner<'py>(
             )));
         }
     };
-    let evaluators = build_sae_basis_evaluators(
-        &basis_kinds,
-        &basis_sizes,
-        &atom_dim,
-        &coord_blocks,
-        basis_values,
-        basis_jacobian,
-        n_obs,
-    )
-    .map_err(py_value_error)?;
+    if atom_centers.len() != k_atoms {
+        return Err(py_value_error(format!(
+            "sae_manifold_fit: atom_centers length {} must equal K={k_atoms}",
+            atom_centers.len()
+        )));
+    }
+    let evaluators =
+        build_sae_basis_evaluators(&basis_kinds, &basis_sizes, &atom_dim, &coord_blocks, atom_centers)
+            .map_err(py_value_error)?;
     let mut base_term = term_from_padded_blocks_with_mode(
         n_obs,
         p_out,
@@ -10437,7 +10489,7 @@ fn sae_build_duchon_atom(
     // nullspace=Linear` violated that for d ∈ {1, 2, 3} (issue #246). Routing
     // through `resolve_duchon_hybrid_config(..., max_op=2)` auto-picks the
     // smallest valid `s` so the build always produces a Primary penalty.
-    let m: usize = 2;
+    let m: usize = SAE_DUCHON_ATOM_M;
     let dim = centers.ncols();
     let cfg = resolve_duchon_hybrid_config(dim, m, None, None, None, /* max_op = */ 2)
         .map_err(|err| err.to_string())?;
@@ -10453,18 +10505,11 @@ fn sae_build_duchon_atom(
         periodic: None,
         boundary: OneDimensionalBoundary::Open,
     };
-    let built = if pts.nrows() == 0 {
-        let probe_pts = Array2::<f64>::zeros((1, pts.ncols()));
-        build_duchon_basis(probe_pts.view(), &spec).map_err(|err| err.to_string())?
-    } else {
-        build_duchon_basis(pts, &spec).map_err(|err| err.to_string())?
-    };
-    let built_phi = built.design.to_dense();
-    let phi = if pts.nrows() == 0 {
-        Array2::<f64>::zeros((0, built_phi.ncols()))
-    } else {
-        built_phi
-    };
+    // The penalty matrix is the only piece sourced from the full builder; the
+    // design `Phi` and its input-location jet come from the single
+    // amplification-consistent core entry point so the seed atom matches the
+    // `DuchonCoordinateEvaluator` refresh bit-for-bit (issue #247).
+    let built = build_duchon_basis(centers, &spec).map_err(|err| err.to_string())?;
     let primary_idx = built
         .penaltyinfo
         .iter()
@@ -10480,24 +10525,18 @@ fn sae_build_duchon_atom(
             )
         })?
         .clone();
-    let effective_nullspace = pyffi_duchon_effective_nullspace_order(centers, requested_nullspace);
-    let radial_transform = pyffi_duchon_kernel_constraint_nullspace(centers, effective_nullspace)
-        .map_err(|err| err.to_string())?;
-    let radial_first = duchon_radial_first_derivative_nd(pts, centers, None, effective_nullspace)
-        .map_err(|err| err.to_string())?;
-    let radial_jet = radial_input_location_jet(pts, centers, radial_first.view())
-        .map_err(|err| err.to_string())?;
-    let poly_jet = duchon_polynomial_first_derivative_nd(pts, effective_nullspace);
-    let n_rows = pts.nrows();
-    let dim = pts.ncols();
-    let n_kernel = radial_transform.ncols();
-    let n_poly = poly_jet.shape()[1];
-    let mut jet = Array3::<f64>::zeros((n_rows, n_kernel + n_poly, dim));
-    for axis in 0..dim {
-        let projected = radial_jet.index_axis(Axis(2), axis).dot(&radial_transform);
-        jet.slice_mut(s![.., ..n_kernel, axis]).assign(&projected);
-    }
-    jet.slice_mut(s![.., n_kernel.., ..]).assign(&poly_jet);
+    let evaluator = DuchonCoordinateEvaluator::new(centers.to_owned(), m)?;
+    let (phi, jet) = if pts.nrows() == 0 {
+        let probe = Array2::<f64>::zeros((1, pts.ncols()));
+        let (probe_phi, _probe_jet) = evaluator.evaluate(probe.view())?;
+        let cols = probe_phi.ncols();
+        (
+            Array2::<f64>::zeros((0, cols)),
+            Array3::<f64>::zeros((0, cols, dim)),
+        )
+    } else {
+        evaluator.evaluate(pts)?
+    };
     if phi.ncols() != jet.shape()[1] {
         return Err(format!(
             "sae_build_duchon_atom: phi/jet column mismatch {} vs {}",
@@ -10524,31 +10563,21 @@ fn sae_build_euclidean_atom(
     pts: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
 ) -> Result<(Array2<f64>, Array3<f64>, Array2<f64>), String> {
-    const EUCLIDEAN_PATCH_MAX_DEGREE: usize = 2;
     let dim = centers.ncols();
-    let nullspace = if EUCLIDEAN_PATCH_MAX_DEGREE == 0 {
-        DuchonNullspaceOrder::Zero
-    } else if EUCLIDEAN_PATCH_MAX_DEGREE == 1 {
-        DuchonNullspaceOrder::Linear
-    } else {
-        DuchonNullspaceOrder::Degree(EUCLIDEAN_PATCH_MAX_DEGREE)
-    };
-    let exponents = monomial_exponents(dim, EUCLIDEAN_PATCH_MAX_DEGREE);
+    let exponents = monomial_exponents(dim, SAE_EUCLIDEAN_PATCH_MAX_DEGREE);
     let n_basis = exponents.len();
-    let n_rows = pts.nrows();
-    let mut phi = Array2::<f64>::zeros((n_rows, n_basis));
-    for (col, alpha) in exponents.iter().enumerate() {
-        for row in 0..n_rows {
-            let mut value = 1.0_f64;
-            for (axis, &exp) in alpha.iter().enumerate() {
-                if exp != 0 {
-                    value *= pts[[row, axis]].powi(exp as i32);
-                }
-            }
-            phi[[row, col]] = value;
-        }
-    }
-    let jet = duchon_polynomial_first_derivative_nd(pts, nullspace);
+    // The design `Phi` and its jet come from the same evaluator the inner
+    // Newton loop refreshes against, so the seed atom and every refresh share
+    // one monomial layout.
+    let evaluator = EuclideanPatchEvaluator::new(dim, SAE_EUCLIDEAN_PATCH_MAX_DEGREE)?;
+    let (phi, jet) = if pts.nrows() == 0 {
+        (
+            Array2::<f64>::zeros((0, n_basis)),
+            Array3::<f64>::zeros((0, n_basis, dim)),
+        )
+    } else {
+        evaluator.evaluate(pts)?
+    };
     if jet.shape()[1] != n_basis {
         return Err(format!(
             "sae_build_euclidean_atom: monomial/jet column mismatch {} vs {}",
@@ -10846,14 +10875,12 @@ fn sae_build_atom_plans(
                 // a periodic basis selects the *number of harmonics* in the
                 // truncated Fourier expansion (basis size `2·n_harmonics + 1`),
                 // not a latent-space dimensionality. Setting
-                // `latent_dim = atom_dim` would force
-                // `build_sae_basis_evaluators` to fall back to the frozen
-                // `StaticBasisEvaluator` snapshot (the analytic
+                // `latent_dim = atom_dim` would make
+                // `build_sae_basis_evaluators` reject the atom (the analytic
                 // `PeriodicHarmonicEvaluator` requires `latent_dim == 1`),
-                // killing Phi-refresh between Newton steps and collapsing the
-                // fit to a degenerate null solution. Bind the optimizer-visible
-                // latent dimension to 1 and route the user's `d_atom` into the
-                // harmonic count.
+                // since there is no longer a frozen-snapshot fallback. Bind the
+                // optimizer-visible latent dimension to 1 and route the user's
+                // `d_atom` into the harmonic count.
                 let n_harmonics = d.max(1);
                 let basis_size = sae_periodic_basis_size(n_harmonics)?;
                 plans.push(SaeAtomBuildPlan {
@@ -11095,11 +11122,17 @@ fn sae_manifold_fit_auto<'py>(
     // a harmonic count, not a coord-block width. Periodic atoms have
     // `latent_dim == 1`; only the per-atom planning step knows that.
     let effective_atom_dim: Vec<usize> = plans.iter().map(|plan| plan.latent_dim).collect();
+    // Thread the per-atom Duchon centers into the inner driver so its
+    // `DuchonCoordinateEvaluator` can re-evaluate `Phi(t)` / `dPhi/dt` at each
+    // updated latent coordinate instead of freezing the seed snapshot.
+    let atom_centers: Vec<Option<Array2<f64>>> =
+        plans.iter().map(|plan| plan.duchon_centers.clone()).collect();
     let result_dict = sae_manifold_fit_inner(
         py,
         z_view,
         &atom_basis,
         effective_atom_dim,
+        &atom_centers,
         basis_values.view(),
         basis_jacobian.view(),
         basis_sizes.clone(),
@@ -11344,11 +11377,16 @@ fn sae_manifold_predict_oos<'py>(
             initial_logits[[row, 0]] = 4.0;
         }
     }
+    // Mirror the fit path: re-evaluate each Duchon atom's basis at the OOS
+    // coordinates the Newton loop produces, using the trained centers.
+    let atom_centers: Vec<Option<Array2<f64>>> =
+        plans.iter().map(|plan| plan.duchon_centers.clone()).collect();
     let result_dict = sae_manifold_fit_inner(
         py,
         x_view,
         &atom_basis,
         atom_dim,
+        &atom_centers,
         basis_values.view(),
         basis_jacobian.view(),
         basis_sizes,
