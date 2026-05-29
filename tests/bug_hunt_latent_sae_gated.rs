@@ -1,10 +1,11 @@
+use gam::solver::outer_strategy::OuterObjective;
 use gam::terms::gated_decoder::GatedSAEDecoder;
 use gam::terms::latent_coord::{LatentCoordValues, LatentIdMode};
 use gam::terms::sae_manifold::{
-    AssignmentMode, GumbelTemperatureSchedule, SaeAssignment, SaeManifoldAtom, SaeManifoldRho,
-    SaeManifoldTerm, ScheduleKind,
+    AssignmentMode, GumbelTemperatureSchedule, SaeAssignment, SaeManifoldAtom,
+    SaeManifoldOuterObjective, SaeManifoldRho, SaeManifoldTerm, ScheduleKind,
 };
-use ndarray::{Array2, Array3, array};
+use ndarray::{Array1, Array2, Array3, array};
 
 #[test]
 fn latent_coord_assignment_decode_roundtrip_matches_dictionary_atom() {
@@ -236,6 +237,74 @@ fn reml_criterion_has_interior_minimum_in_log_lambda_smooth() {
          (validating the −½·rank·logλ Occam term's presence and sign); got \
          argmin={argmin} (monotone to an endpoint means the term is missing or \
          wrong-signed)"
+    );
+}
+
+#[test]
+fn efs_ard_fixed_point_recovers_cost_criterion_argmin_and_stays_finite() {
+    // Build a small single-atom SAE with a 2-axis latent. Axis 1 is driven
+    // near collapse (‖t‖²→~0) to exercise the posterior-variance term. The EFS
+    // Fellner-Schall/Mackay fixed point α_new = n/(‖t‖²+tr(H⁻¹)) must:
+    //   (a) converge to a FINITE α on the collapsing axis (no clamp), and
+    //   (b) agree with the α that minimizes the v1 cost criterion.
+    let coords = array![[1.0, 1.0e-5], [3.0, -1.0e-5], [-2.0, 1.0e-5], [0.5, -1.0e-5]];
+    let target = array![[0.4], [1.1], [-0.7], [0.2]];
+    let term = build_collapse_probe_term(coords);
+
+    let init_rho = SaeManifoldRho::new(0.0, 0.0, vec![array![0.0, 0.0]]);
+    let mut obj = SaeManifoldOuterObjective::new(
+        term.clone(),
+        target.clone(),
+        None,
+        init_rho.clone(),
+        3,
+        1.0,
+        1.0e-6,
+        1.0e-6,
+    );
+
+    // Iterate the EFS fixed point: rho_new = rho + steps (additive in log
+    // space = multiplicative FS). Converge when the step norm is tiny.
+    let mut rho_flat = init_rho.to_flat();
+    let mut converged_log_alpha1 = f64::NAN;
+    for _ in 0..60 {
+        let efs = obj.eval_efs(&rho_flat).expect("EFS eval should succeed");
+        assert_eq!(efs.steps.len(), rho_flat.len());
+        let mut step_norm = 0.0_f64;
+        for (i, s) in efs.steps.iter().enumerate() {
+            assert!(s.is_finite(), "EFS step[{i}]={s} must be finite (no α blow-up)");
+            rho_flat[i] += s;
+            step_norm += s * s;
+        }
+        // index 3 = atom 0, axis 1 (layout [sparse, smooth, axis0, axis1]).
+        converged_log_alpha1 = rho_flat[3];
+        assert!(
+            converged_log_alpha1.is_finite() && converged_log_alpha1 < 30.0,
+            "EFS α on the collapsing axis must stay finite (no clamp); got log α={converged_log_alpha1}"
+        );
+        if step_norm.sqrt() < 1.0e-8 {
+            break;
+        }
+    }
+
+    // Cross-check: the EFS-converged α minimizes the v1 cost criterion. Sweep
+    // log α on axis 1 with all other ρ at the EFS optimum and confirm the
+    // criterion at the EFS α is no worse than its neighbours (interior min).
+    let mut crit_term = term;
+    let cost_at = |t: &mut SaeManifoldTerm, la1: f64| -> f64 {
+        let rho = SaeManifoldRho::new(rho_flat[0], rho_flat[1], vec![array![rho_flat[2], la1]]);
+        t.reml_criterion(target.view(), &rho, None, 3, 1.0, 1.0e-6, 1.0e-6)
+            .expect("criterion should evaluate")
+            .0
+    };
+    let v_star = cost_at(&mut crit_term, converged_log_alpha1);
+    let v_lo = cost_at(&mut crit_term, converged_log_alpha1 - 1.0);
+    let v_hi = cost_at(&mut crit_term, converged_log_alpha1 + 1.0);
+    assert!(
+        v_star <= v_lo + 1.0e-6 && v_star <= v_hi + 1.0e-6,
+        "EFS fixed-point α must sit at (or below) the v1 cost-criterion minimum: \
+         V(α*)={v_star}, V(α*/e)={v_lo}, V(α*·e)={v_hi} — the FS step and the exact \
+         criterion must agree at the optimum"
     );
 }
 

@@ -46,8 +46,8 @@ use crate::solver::arrow_schur::{ArrowFactorCache, solve_arrow_newton_step_with_
 use crate::solver::estimate::EstimationError;
 use crate::solver::evidence::arrow_log_det_from_cache;
 use crate::solver::outer_strategy::{
-    DeclaredHessianForm, Derivative, HessianResult, OuterCapability, OuterEval, OuterObjective,
-    SeedOutcome,
+    DeclaredHessianForm, Derivative, EfsEval, HessianResult, OuterCapability, OuterEval,
+    OuterObjective, SeedOutcome,
 };
 use faer::Side;
 
@@ -3194,6 +3194,34 @@ impl SaeManifoldTerm {
         ridge_ext_coord: f64,
         ridge_beta: f64,
     ) -> Result<(f64, SaeManifoldLoss), String> {
+        let (v, loss, _cache) = self.reml_criterion_with_cache(
+            target,
+            rho,
+            registry,
+            inner_max_iter,
+            learning_rate,
+            ridge_ext_coord,
+            ridge_beta,
+        )?;
+        Ok((v, loss))
+    }
+
+    /// As [`Self::reml_criterion`], but also returns the converged undamped
+    /// `ArrowFactorCache` so callers (the EFS fixed-point step) can read the
+    /// selected-inverse traces `(H⁻¹)_tt` / `(H⁻¹)_ββ` without re-factoring.
+    /// The cache is the single shared O(K³) Direct factor; both the
+    /// log-determinant criterion and the Fellner-Schall ρ-step consume it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reml_criterion_with_cache(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        registry: Option<&AnalyticPenaltyRegistry>,
+        inner_max_iter: usize,
+        learning_rate: f64,
+        ridge_ext_coord: f64,
+        ridge_beta: f64,
+    ) -> Result<(f64, SaeManifoldLoss, ArrowFactorCache), String> {
         // 1. Run the inner (t, β) Newton solve to convergence at FIXED ρ.
         //    `run_joint_fit_arrow_schur` no longer touches ρ.
         let mut rho_fixed = rho.clone();
@@ -3252,7 +3280,7 @@ impl SaeManifoldTerm {
         let occam = 0.5 * p_out * (smooth_rank_total as f64) * rho.log_lambda_smooth;
 
         let v = loss.total() + 0.5 * log_det - occam;
-        Ok((v, loss))
+        Ok((v, loss, cache))
     }
 
     /// Per-atom, per-axis coordinate sum-of-squares `‖t_kj‖² = Σ_i t_{i,k,j}²`.
@@ -4775,6 +4803,111 @@ impl SaeManifoldOuterObjective {
         let beta_hat = self.term.flatten_beta();
         Ok((cost, beta_hat))
     }
+
+    /// Fellner-Schall / Mackay multiplicative fixed-point step on ρ at
+    /// `rho_flat`. Runs the inner `(t, β)` solve to convergence at fixed ρ
+    /// (sharing the single Direct factor with the REML criterion), then
+    /// returns `(cost, additive-log-steps, β̂)`.
+    ///
+    /// All ρ coords are log-quantities, so the engine's additive step
+    /// `rho_new = rho + step` IS the multiplicative FS update. Per coord:
+    /// - ARD axis (k,j): `α_new = n / (‖t_kj‖² + tr_kj(H⁻¹))`,
+    ///   `step = ln α_new − log_ard[k][j]`. The `tr_kj(H⁻¹)` posterior
+    ///   variance (from the selected-inverse latent diagonal) is exactly the
+    ///   term the deleted `α=n/‖t‖²` rule dropped, so α cannot collapse on a
+    ///   degenerate axis: as `‖t‖²→0`, `tr_kj(H⁻¹)→1/α` bounds the
+    ///   denominator and the fixed point has a finite root.
+    /// - λ_smooth: `λ_new = [p·Σ_k rank S_k − tr(S_β⁻¹ M)] / βᵀ(⊕S_k⊗I_p)β`
+    ///   (Wood-Fasiolo EFS), `step = ln λ_new − log_lambda_smooth`.
+    /// - λ_sparse: 0.0 — the assignment-sparsity priors (softmax entropy,
+    ///   gated L1, IBP) are non-quadratic, so no Gaussian-logdet FS fixed
+    ///   point exists; it stays cost-driven (the cascade still moves it via
+    ///   the cost path when EFS is not the active lane for that coord).
+    fn efs_step(&mut self, rho_flat: ArrayView1<'_, f64>) -> Result<EfsEval, String> {
+        let rho = self.baseline_rho.from_flat(rho_flat);
+        if let Some(beta) = self.seeded_beta.take()
+            && beta.len() == self.term.beta_dim()
+        {
+            self.term.set_flat_beta(beta.view())?;
+        }
+        let (cost, loss, cache) = self.term.reml_criterion_with_cache(
+            self.target.view(),
+            &rho,
+            self.registry.as_ref(),
+            self.inner_max_iter,
+            self.learning_rate,
+            self.ridge_ext_coord,
+            self.ridge_beta,
+        )?;
+        self.current_rho = rho.clone();
+        self.last_loss = Some(loss);
+
+        let n_obs = self.term.n_obs() as f64;
+        let sumsq = self.term.ard_coord_sumsq();
+        let traces = self
+            .term
+            .ard_inverse_traces(&cache)
+            .map_err(|e| format!("SaeManifoldOuterObjective::efs_step: ARD traces: {e}"))?;
+
+        // Build the flat step vector in `to_flat` layout:
+        // [0]=log_lambda_sparse, [1]=log_lambda_smooth, then per-atom axes.
+        let n_params = rho.to_flat().len();
+        let mut steps = vec![0.0_f64; n_params];
+
+        // λ_sparse (index 0): non-quadratic prior → no FS fixed point. Step 0.
+        steps[0] = 0.0;
+
+        // λ_smooth (index 1): Wood-Fasiolo EFS multiplicative update.
+        let lambda_smooth = rho.lambda_smooth();
+        let p_out = self.term.output_dim() as f64;
+        let mut smooth_rank_total = 0usize;
+        for atom in &self.term.atoms {
+            smooth_rank_total += SaeManifoldTerm::symmetric_rank(&atom.smooth_penalty)?;
+        }
+        let rank_total = p_out * (smooth_rank_total as f64);
+        let quad = self.term.decoder_smoothness_quadratic_form();
+        let eff_dof = self
+            .term
+            .decoder_smoothness_effective_dof(&cache, lambda_smooth)
+            .map_err(|e| format!("SaeManifoldOuterObjective::efs_step: smooth dof: {e}"))?;
+        // λ_new = (penalty_rank − effective_dof) / penalty_energy. The
+        // numerator is the unpenalised-direction count; guard the FS ratio
+        // against a vanishing penalty energy or a non-positive numerator
+        // (which can occur transiently far from the optimum) by holding
+        // λ_smooth fixed (step 0) — the cost path still moves it then.
+        if quad > 0.0 && rank_total - eff_dof > 0.0 && lambda_smooth > 0.0 {
+            let lambda_new = (rank_total - eff_dof) / quad;
+            if lambda_new.is_finite() && lambda_new > 0.0 {
+                steps[1] = lambda_new.ln() - rho.log_lambda_smooth;
+            }
+        }
+
+        // ARD axes (indices 2..): Mackay fixed point with posterior variance.
+        let mut cursor = 2usize;
+        for (k, axis_logard) in rho.log_ard.iter().enumerate() {
+            let d = axis_logard.len();
+            for j in 0..d {
+                let denom = sumsq[k][j] + traces[k][j];
+                if denom > 0.0 {
+                    let alpha_new = n_obs / denom;
+                    if alpha_new.is_finite() && alpha_new > 0.0 {
+                        steps[cursor + j] = alpha_new.ln() - axis_logard[j];
+                    }
+                }
+            }
+            cursor += d;
+        }
+
+        let beta_hat = self.term.flatten_beta();
+        Ok(EfsEval {
+            cost,
+            steps,
+            beta: Some(beta_hat),
+            psi_gradient: None,
+            psi_indices: None,
+            inner_hessian_scale: None,
+        })
+    }
 }
 
 impl OuterObjective for SaeManifoldOuterObjective {
@@ -4786,7 +4919,12 @@ impl OuterObjective for SaeManifoldOuterObjective {
             // ρ are all penalty-like / τ coordinates: precisions and
             // log-smoothing strengths. No design-moving ψ coordinates.
             psi_dim: 0,
-            fixed_point_available: false,
+            // EFS fixed-point lane is the right driver for these penalty-like
+            // coords: the multiplicative Fellner-Schall/Mackay step is O(1)
+            // selected-inverse trace per outer iter, vs the cost-only path's
+            // O(K³) dense Schur per cost eval × many derivative-free evals —
+            // intractable at biobank K. `eval_efs` implements it.
+            fixed_point_available: true,
             barrier_config: None,
             prefer_gradient_only: false,
             disable_fixed_point: false,
@@ -4810,6 +4948,11 @@ impl OuterObjective for SaeManifoldOuterObjective {
             hessian: HessianResult::Unavailable,
             inner_beta_hint: Some(beta_hat),
         })
+    }
+
+    fn eval_efs(&mut self, rho: &Array1<f64>) -> Result<EfsEval, EstimationError> {
+        self.efs_step(rho.view())
+            .map_err(EstimationError::RemlOptimizationFailed)
     }
 
     fn reset(&mut self) {
