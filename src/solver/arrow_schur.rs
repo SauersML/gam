@@ -1767,6 +1767,7 @@ impl ArrowSchurSystem {
             hbb: Array2::<f64>::zeros((0, 0)),
             hbb_matvec: Some(matvec_arc),
             htbeta_matvec: None,
+            htbeta_transpose_matvec: None,
             hbb_diag: Some(diag),
             gb: Array1::<f64>::zeros(k),
             d,
