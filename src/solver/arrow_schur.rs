@@ -497,6 +497,175 @@ impl BetaPenaltyOp for KroneckerPenaltyOp {
     }
 }
 
+/// One co-occurring atom-pair block of a block-sparse left factor `A`.
+///
+/// `data` is the dense `(m_i × m_j)` coupling between the basis columns of
+/// atom `i` (rows, starting at left-factor offset `row_off`) and atom `j`
+/// (columns, starting at `col_off`). Both offsets are in *left-factor* (`A`)
+/// coordinates, i.e. `μ`-space, not β-space.
+#[derive(Debug, Clone)]
+pub struct SparseGBlock {
+    /// Left-factor (`μ`-space) row offset = `beta_offset[atom_i] / p`.
+    pub row_off: usize,
+    /// Left-factor (`μ`-space) column offset = `beta_offset[atom_j] / p`.
+    pub col_off: usize,
+    /// Dense `(m_i × m_j)` coupling block.
+    pub data: Array2<f64>,
+}
+
+/// Block-sparse Kronecker penalty `P = A ⊗ I_p` where the left factor `A`
+/// (dimension `dim_a × dim_a` in `μ`-space) is stored only on its non-empty
+/// co-occurring atom-pair blocks rather than as a dense `(dim_a × dim_a)`
+/// matrix.
+///
+/// This is the sparse-atom (`K = 100K`) replacement for wrapping the dense
+/// data-fit Gauss-Newton Gram `G` (`m_total × m_total`) in a
+/// [`KroneckerPenaltyOp`]: with per-row active sets of size `k_active ≪ K`,
+/// only the `(atom, atom')` pairs that co-occur in some row contribute a
+/// non-zero `(m_i × m_j)` block, so the storage and every matvec/diagonal
+/// pass cost `O(Σ_pairs m_i m_j · p)` instead of `O((m_total · p)²)`.
+///
+/// The β index of left-factor coordinate `μ` and output channel `oc` is
+/// `μ · p + oc` (the same `μ`-major / `oc`-minor layout the dense
+/// `KroneckerPenaltyOp { factor_b: I_p }` uses), so this op is a drop-in
+/// structured replacement: with the full dense pair set it reproduces the
+/// dense operator exactly.
+pub struct SparseBlockKroneckerPenaltyOp {
+    /// Right-factor identity dimension `p` (number of decoder output channels).
+    pub p: usize,
+    /// Left-factor dimension `dim_a` in `μ`-space (= `m_total`).
+    pub dim_a: usize,
+    /// Full β dimension `K = dim_a · p`.
+    pub k: usize,
+    /// Non-empty `(atom_i, atom_j)` coupling blocks of `A`.
+    pub blocks: Vec<SparseGBlock>,
+}
+
+impl BetaPenaltyOp for SparseBlockKroneckerPenaltyOp {
+    fn dim(&self) -> usize {
+        self.k
+    }
+
+    fn matvec(&self, x: &[f64], y: &mut [f64]) {
+        let p = self.p;
+        for blk in &self.blocks {
+            let (m_i, m_j) = blk.data.dim();
+            for li in 0..m_i {
+                let gi_base = (blk.row_off + li) * p;
+                for lj in 0..m_j {
+                    let a_ij = blk.data[[li, lj]];
+                    if a_ij == 0.0 {
+                        continue;
+                    }
+                    let gj_base = (blk.col_off + lj) * p;
+                    for oc in 0..p {
+                        y[gi_base + oc] += a_ij * x[gj_base + oc];
+                    }
+                }
+            }
+        }
+    }
+
+    fn gradient(&self, beta: &[f64], out: &mut [f64]) {
+        self.matvec(beta, out);
+    }
+
+    fn diagonal(&self, diag: &mut [f64]) {
+        let p = self.p;
+        for blk in &self.blocks {
+            // Only on-diagonal `A` blocks (row_off == col_off) carry diagonal
+            // mass; their `(li, li)` entries map to `(row_off+li)·p + oc`.
+            if blk.row_off != blk.col_off {
+                continue;
+            }
+            let (m_i, m_j) = blk.data.dim();
+            let m = m_i.min(m_j);
+            for li in 0..m {
+                let a_ii = blk.data[[li, li]];
+                let gi_base = (blk.row_off + li) * p;
+                for oc in 0..p {
+                    diag[gi_base + oc] += a_ii;
+                }
+            }
+        }
+    }
+
+    fn block(&self, id: BetaBlockId, offsets: &[Range<usize>], out: &mut Array2<f64>) {
+        let range = &offsets[id.0];
+        let b = range.end - range.start;
+        let p = self.p;
+        for blk in &self.blocks {
+            let (m_i, m_j) = blk.data.dim();
+            let row_start = blk.row_off * p;
+            let row_end = (blk.row_off + m_i) * p;
+            let col_start = blk.col_off * p;
+            let col_end = (blk.col_off + m_j) * p;
+            if row_end <= range.start
+                || row_start >= range.end
+                || col_end <= range.start
+                || col_start >= range.end
+            {
+                continue;
+            }
+            for bi in 0..b {
+                let gi = range.start + bi;
+                if gi < row_start || gi >= row_end {
+                    continue;
+                }
+                let li = (gi - row_start) / p;
+                let oc_i = (gi - row_start) % p;
+                for bj in 0..b {
+                    let gj = range.start + bj;
+                    if gj < col_start || gj >= col_end {
+                        continue;
+                    }
+                    let oc_j = (gj - col_start) % p;
+                    if oc_i != oc_j {
+                        continue;
+                    }
+                    let lj = (gj - col_start) / p;
+                    out[[bi, bj]] += blk.data[[li, lj]];
+                }
+            }
+        }
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        let p = self.p;
+        let mut out = Array2::<f64>::zeros((self.k, self.k));
+        for blk in &self.blocks {
+            let (m_i, m_j) = blk.data.dim();
+            for li in 0..m_i {
+                let gi_base = (blk.row_off + li) * p;
+                for lj in 0..m_j {
+                    let a_ij = blk.data[[li, lj]];
+                    if a_ij == 0.0 {
+                        continue;
+                    }
+                    let gj_base = (blk.col_off + lj) * p;
+                    for oc in 0..p {
+                        out[[gi_base + oc, gj_base + oc]] += a_ij;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn fingerprint(&self, hasher: &mut Fingerprinter) {
+        hasher.write_str("sparse-block-kronecker-penalty-op-v1");
+        hasher.write_usize(self.p);
+        hasher.write_usize(self.dim_a);
+        hasher.write_usize(self.k);
+        hasher.write_usize(self.blocks.len());
+        for blk in &self.blocks {
+            hasher.write_usize(blk.row_off);
+            hasher.write_usize(blk.col_off);
+            write_array2_fingerprint(hasher, &blk.data);
+        }
+    }
+}
+
 /// Composite penalty: sum of multiple `BetaPenaltyOp` operators.
 pub struct CompositePenaltyOp {
     /// Full β dimension `K`.
@@ -4983,6 +5152,112 @@ fn lower_triangular_solve_matrix(l: &Array2<f64>, b: &Array2<f64>) -> Array2<f64
 mod tests {
     use super::*;
     use ndarray::array;
+
+    /// `SparseBlockKroneckerPenaltyOp` must reproduce the dense
+    /// `KroneckerPenaltyOp { factor_a: G, factor_b: I_p }` on every interface
+    /// (matvec, gradient, diagonal, to_dense) when the sparse block set covers
+    /// the same `(atom, atom')` couplings — this is the equivalence that makes
+    /// the sparse op a drop-in replacement for the dense data Gram.
+    #[test]
+    fn sparse_block_kronecker_matches_dense_kronecker() {
+        // Two atoms: atom 0 has m_0 = 2 basis cols (μ offset 0), atom 1 has
+        // m_1 = 3 (μ offset 2). p = 2 output channels ⇒ dim_a = 5, k = 10.
+        let p = 2usize;
+        let dim_a = 5usize;
+        let k = dim_a * p;
+        // Dense G (5×5) with non-zero (0,0), (0,1), (1,0), (1,1) atom blocks.
+        let g_dense = array![
+            [3.0_f64, 0.5, 0.2, -0.1, 0.0],
+            [0.5, 4.0, 0.0, 0.3, 0.1],
+            [0.2, 0.0, 2.0, 0.4, -0.2],
+            [-0.1, 0.3, 0.4, 5.0, 0.6],
+            [0.0, 0.1, -0.2, 0.6, 1.5],
+        ];
+        let dense = KroneckerPenaltyOp {
+            factor_a: g_dense.clone(),
+            factor_b: Array2::<f64>::eye(p),
+            global_offset: 0,
+            k,
+        };
+        // Sparse: atom 0 block = G[0..2, 0..2], cross blocks G[0..2,2..5] and
+        // its transpose, atom 1 block = G[2..5, 2..5].
+        let block_00 = g_dense.slice(ndarray::s![0..2, 0..2]).to_owned();
+        let block_01 = g_dense.slice(ndarray::s![0..2, 2..5]).to_owned();
+        let block_10 = g_dense.slice(ndarray::s![2..5, 0..2]).to_owned();
+        let block_11 = g_dense.slice(ndarray::s![2..5, 2..5]).to_owned();
+        let sparse = SparseBlockKroneckerPenaltyOp {
+            p,
+            dim_a,
+            k,
+            blocks: vec![
+                SparseGBlock { row_off: 0, col_off: 0, data: block_00 },
+                SparseGBlock { row_off: 0, col_off: 2, data: block_01 },
+                SparseGBlock { row_off: 2, col_off: 0, data: block_10 },
+                SparseGBlock { row_off: 2, col_off: 2, data: block_11 },
+            ],
+        };
+
+        // to_dense parity.
+        let d_dense = dense.to_dense();
+        let d_sparse = sparse.to_dense();
+        for i in 0..k {
+            for j in 0..k {
+                assert!(
+                    (d_dense[[i, j]] - d_sparse[[i, j]]).abs() < 1e-12,
+                    "to_dense mismatch at ({i},{j}): {} vs {}",
+                    d_dense[[i, j]],
+                    d_sparse[[i, j]]
+                );
+            }
+        }
+
+        // matvec / gradient parity on an arbitrary vector.
+        let x: Vec<f64> = (0..k).map(|i| 0.1 * (i as f64) - 0.3).collect();
+        let mut y_dense = vec![0.0_f64; k];
+        let mut y_sparse = vec![0.0_f64; k];
+        dense.matvec(&x, &mut y_dense);
+        sparse.matvec(&x, &mut y_sparse);
+        for i in 0..k {
+            assert!(
+                (y_dense[i] - y_sparse[i]).abs() < 1e-12,
+                "matvec mismatch at {i}: {} vs {}",
+                y_dense[i],
+                y_sparse[i]
+            );
+        }
+
+        // diagonal parity.
+        let mut diag_dense = vec![0.0_f64; k];
+        let mut diag_sparse = vec![0.0_f64; k];
+        dense.diagonal(&mut diag_dense);
+        sparse.diagonal(&mut diag_sparse);
+        for i in 0..k {
+            assert!(
+                (diag_dense[i] - diag_sparse[i]).abs() < 1e-12,
+                "diagonal mismatch at {i}: {} vs {}",
+                diag_dense[i],
+                diag_sparse[i]
+            );
+        }
+
+        // block parity: probe the per-atom β block ranges.
+        let offsets = [0..(2 * p), (2 * p)..k];
+        for id in 0..offsets.len() {
+            let b = offsets[id].end - offsets[id].start;
+            let mut blk_dense = Array2::<f64>::zeros((b, b));
+            let mut blk_sparse = Array2::<f64>::zeros((b, b));
+            dense.block(BetaBlockId(id), &offsets, &mut blk_dense);
+            sparse.block(BetaBlockId(id), &offsets, &mut blk_sparse);
+            for i in 0..b {
+                for j in 0..b {
+                    assert!(
+                        (blk_dense[[i, j]] - blk_sparse[[i, j]]).abs() < 1e-12,
+                        "block {id} mismatch at ({i},{j})"
+                    );
+                }
+            }
+        }
+    }
 
     /// Verify the arrow-Schur solve against a small dense reference.
     /// Build the joint bordered system as a single dense (K + N·d)² matrix,
