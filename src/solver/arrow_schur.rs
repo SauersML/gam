@@ -3271,6 +3271,102 @@ impl ArrowFactorCache {
         }
         out
     }
+
+    /// Diagonal of the latent (`t`-block) of the *full* bordered-arrow
+    /// inverse `(H⁻¹)_tt`, in `delta_t` layout (length [`Self::delta_t_len`]).
+    ///
+    /// For the bordered arrow Hessian
+    /// `H = [[A, B], [Bᵀ, H_ββ]]` with `A = H_tt` (block-diagonal per row,
+    /// `A_i = H_tt^(i)`) and `B = H_tβ`, the standard block-inverse identity
+    /// gives the `t`-block
+    /// `(H⁻¹)_tt = A⁻¹ + A⁻¹ B S⁻¹ Bᵀ A⁻¹`, where
+    /// `S = H_ββ − Bᵀ A⁻¹ B` is the Schur complement on `β`. Because `A` is
+    /// block-diagonal, the `(i, j)` diagonal entry of `(H⁻¹)_tt` is computed
+    /// purely from row `i`'s factor and cross-block:
+    ///
+    /// ```text
+    /// a    = A_i⁻¹ e_j                       (chol_solve on the per-row factor)
+    /// [A_i⁻¹]_{jj} = a[j]
+    /// w    = B_iᵀ a = H_βt^(i) a             (a K-vector)
+    /// z    = S⁻¹ w                           (chol_solve on the Schur factor)
+    /// diag = a[j] + w · z
+    /// ```
+    ///
+    /// The UNDAMPED per-row factors ([`Self::undamped_factor`]) are used so
+    /// the result is the inverse of the *true* `H_tt`, not the LM-damped
+    /// `H_tt + ridge_t·I` — same rationale the IFT predictor docstring gives
+    /// at the top of this struct.
+    ///
+    /// # Consuming the diagonal as a per-(atom, axis) trace
+    ///
+    /// `(H⁻¹)_tt` is the latent covariance block. The selected-inverse trace
+    /// for a contiguous group of latent coordinates (e.g. one atom's rows, or
+    /// one axis across rows) is simply the sum of the returned diagonal entries
+    /// over those `row_offsets[i] + j` indices — no off-diagonal terms are
+    /// needed for the trace `tr[(H⁻¹)_tt · D]` against a diagonal selector `D`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArrowSchurError::SchurFactorFailed`] when this cache has no
+    /// dense Schur factor or no usable `H_βt` coupling — i.e. it was produced
+    /// by an [`ArrowSolverMode::InexactPCG`] solve (no dense `K × K` factor) or
+    /// by a `Disabled` `htbeta` cache. The selected-inverse block-trace is not
+    /// yet supported for the matrix-free PCG mode; that branch needs a separate
+    /// Lanczos/Hutchinson estimator.
+    pub fn latent_block_inverse_diagonal(&self) -> Result<Array1<f64>, ArrowSchurError> {
+        let Some(schur_factor) = self.schur_factor.as_ref() else {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: "latent_block_inverse_diagonal requires a dense Schur factor; \
+                         the InexactPCG mode does not form one"
+                    .to_string(),
+            });
+        };
+        if !self.htbeta_available() {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: "latent_block_inverse_diagonal requires the H_tβ coupling, \
+                         but this cache's htbeta is Disabled"
+                    .to_string(),
+            });
+        }
+        let n = self.undamped_factor_count();
+        let total_len = self.delta_t_len();
+        let mut out = Array1::<f64>::zeros(total_len);
+        // Per-row scratch, sized to the max latent dim / K.
+        let mut e_j = Array1::<f64>::zeros(self.d);
+        let mut w = Array1::<f64>::zeros(self.k);
+        for i in 0..n {
+            let di = self.row_dims[i];
+            let row_base = self.row_offsets[i];
+            let factor = self.undamped_factor(i);
+            for j in 0..di {
+                // a = A_i⁻¹ e_j.
+                for c in 0..di {
+                    e_j[c] = 0.0;
+                }
+                e_j[j] = 1.0;
+                let e_j_slice = e_j.slice(ndarray::s![..di]).to_owned();
+                let a = chol_solve_vector(factor, &e_j_slice);
+                // w = H_βt^(i) a (a K-vector); accumulator must start zeroed.
+                w.fill(0.0);
+                if !self.apply_htbeta_row_transpose(i, a.view(), &mut w, None) {
+                    return Err(ArrowSchurError::SchurFactorFailed {
+                        reason: format!(
+                            "latent_block_inverse_diagonal: H_βt^({i}) apply failed \
+                             (htbeta cache could not supply row {i})"
+                        ),
+                    });
+                }
+                // z = S⁻¹ w; correction = w · z.
+                let z = chol_solve_vector(schur_factor, &w);
+                let mut corr = 0.0_f64;
+                for c in 0..self.k {
+                    corr += w[c] * z[c];
+                }
+                out[row_base + j] = a[j] + corr;
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Schur-eliminate the per-row latent block and solve with an explicit BA
@@ -5569,5 +5665,95 @@ mod tests {
         for v in delta_t.iter().chain(delta_beta.iter()) {
             assert!(v.is_finite(), "recovered step must be finite: {v}");
         }
+    }
+
+    /// `latent_block_inverse_diagonal` must reproduce the `t`-block diagonal of
+    /// the dense bordered-arrow inverse `(H⁻¹)_tt` to machine precision.
+    ///
+    /// Build a small `(N=3, d=2, K=2)` arrow system, factor it through the
+    /// real solve to obtain an [`ArrowFactorCache`], then assemble the full
+    /// dense `(N·d + K) × (N·d + K)` Hessian from the same per-row blocks,
+    /// invert it via dense Cholesky, and compare diagonals.
+    #[test]
+    fn latent_block_inverse_diagonal_matches_dense() {
+        let n = 3usize;
+        let d = 2usize;
+        let k = 2usize;
+        let mut sys = ArrowSchurSystem::new(n, d, k);
+
+        // Distinct, well-conditioned per-row blocks and cross-blocks.
+        sys.rows[0].htt = array![[4.0_f64, 0.5], [0.5, 3.0]];
+        sys.rows[0].htbeta = array![[1.0_f64, 0.2], [-0.3, 0.7]];
+        sys.rows[1].htt = array![[5.0_f64, -0.4], [-0.4, 2.5]];
+        sys.rows[1].htbeta = array![[0.6_f64, -0.1], [0.4, 0.9]];
+        sys.rows[2].htt = array![[3.5_f64, 0.2], [0.2, 4.5]];
+        sys.rows[2].htbeta = array![[-0.2_f64, 0.5], [0.8, -0.6]];
+        for row in sys.rows.iter_mut() {
+            row.gt = array![0.0_f64, 0.0];
+        }
+        // SPD shared block; the full bordered H must stay PD.
+        sys.hbb = array![[12.0_f64, 0.7], [0.7, 10.0]];
+        sys.gb = array![0.0_f64, 0.0];
+
+        let options = ArrowSolveOptions::direct();
+        let (_delta_t, _delta_beta, cache) =
+            solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options)
+                .expect("direct arrow solve should factor this SPD system");
+
+        // Assemble the dense bordered-arrow Hessian H (t-coords first, then β).
+        let dim = n * d + k;
+        let mut h = Array2::<f64>::zeros((dim, dim));
+        for i in 0..n {
+            let base = i * d;
+            // H_tt^(i) block.
+            for r in 0..d {
+                for c in 0..d {
+                    h[[base + r, base + c]] = sys.rows[i].htt[[r, c]];
+                }
+            }
+            // H_tβ^(i) (d×K) and its transpose into the β border.
+            for r in 0..d {
+                for c in 0..k {
+                    let v = sys.rows[i].htbeta[[r, c]];
+                    h[[base + r, n * d + c]] = v;
+                    h[[n * d + c, base + r]] = v;
+                }
+            }
+        }
+        // H_ββ.
+        for r in 0..k {
+            for c in 0..k {
+                h[[n * d + r, n * d + c]] = sys.hbb[[r, c]];
+            }
+        }
+
+        // Dense inverse via Cholesky against the identity.
+        let l = cholesky_lower(&h).expect("assembled bordered H must be SPD");
+        let h_inv = chol_solve_matrix(&l, &Array2::<f64>::eye(dim));
+
+        let diag = cache
+            .latent_block_inverse_diagonal()
+            .expect("dense Schur cache must support the selected-inverse diagonal");
+        assert_eq!(diag.len(), n * d);
+        for i in 0..n {
+            for j in 0..d {
+                let idx = i * d + j; // homogeneous system ⇒ row_offsets[i] == i*d.
+                let expected = h_inv[[idx, idx]];
+                let got = diag[idx];
+                assert!(
+                    (got - expected).abs() < 1e-9,
+                    "row {i} axis {j}: selected-inverse diag {got} vs dense {expected}"
+                );
+            }
+        }
+
+        // The per-(atom, axis) trace is a sum over the relevant indices; e.g.
+        // tr[(H⁻¹)_tt] over all latent coords equals the dense t-block trace.
+        let trace_selected: f64 = diag.iter().sum();
+        let trace_dense: f64 = (0..n * d).map(|idx| h_inv[[idx, idx]]).sum();
+        assert!(
+            (trace_selected - trace_dense).abs() < 1e-9,
+            "full latent trace {trace_selected} vs dense {trace_dense}"
+        );
     }
 }
