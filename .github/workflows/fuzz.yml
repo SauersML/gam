@@ -42,7 +42,21 @@ jobs:
           python-version: "3.11"
 
       - name: Install Python deps
-        run: pip install numpy pandas scikit-learn lifelines
+        run: pip install --upgrade pip "maturin>=1.7,<2" numpy pandas scikit-learn lifelines
+
+      - name: Build and install gamfit (maturin)
+        # `bench/fuzz_vs_mgcv.py` imports the project's own `gamfit` Python
+        # package (`gamfit._binding.rust_module`) for its scoring helpers, so
+        # the fuzzer aborts at `ModuleNotFoundError: No module named 'gamfit'`
+        # unless the maturin-built wheel is installed alongside the CLI build
+        # that powers `_ensure_rust_binary`. Build into `dist/` and install
+        # the wheel directly so the fuzzer can `import gamfit`.
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          maturin build --release -i python3 -o dist
+          pip install --force-reinstall dist/*.whl
 
       - name: Set up R
         uses: ./.github/actions/setup-bench-r
