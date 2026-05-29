@@ -120,9 +120,13 @@ pub trait AnchorRowEvaluator: Send + Sync {
 pub struct CompiledBlock {
     /// Orthogonal-complement reparam matrix `V ∈ R^{p × p'}` (right-selector).
     pub t_lw: Array2<f64>,
-    /// Residualised anchor correction `M·V ∈ R^{d × p'}` at the compiled
-    /// width: the row contribution is `(C(x)·V − A(x)·(M·V))·β`. `None`
-    /// for the first block in the ordering. Synonymous with `r_lw`.
+    /// Residualised anchor correction `M ∈ R^{d_raw × p'}` at the compiled
+    /// width, expressed in *raw* cumulative-anchor-column coordinates: `d_raw`
+    /// is the sum of the raw column counts of every prior block, NOT the
+    /// (possibly smaller) count of kept anchor directions. The predict-time
+    /// row contribution is `(C(x)·V − A_raw(x)·M)·β`, where `A_raw(x)` is the
+    /// raw anchor evaluation. `None` for the first block in the ordering.
+    /// Synonymous with `r_lw`.
     pub anchor_correction: Option<Array2<f64>>,
     /// Residualised reparam `R_b = M_b · V_b` — what the residualised row
     /// evaluator uses to subtract the anchor portion. `None` for the first
@@ -306,6 +310,15 @@ pub fn compile_with_dual_metric(
     let mut compiled: Vec<CompiledBlock> = Vec::with_capacity(operators.len());
     let mut anchor_h: Array2<f64> = Array2::zeros((n * k, 0));
     let mut anchor_s: Array2<f64> = Array2::zeros((n * k, 0));
+    // Cumulative *raw* (un-residualised) curvature-scaled anchor: the
+    // horizontal stack of `sqrt(H)·J_b` for every block already walked,
+    // keeping one column per raw block column. Where `anchor_h` carries the
+    // residualised, kept-direction anchor (its width shrinks whenever a block
+    // sheds an aliased column), this matrix keeps the full raw column count so
+    // the emitted `anchor_correction` can be expressed in raw-anchor-column
+    // coordinates — exactly the basis the predict-time subtraction
+    // `A_raw(x)·M` evaluates against. See the `M_raw` derivation below.
+    let mut raw_anchor_h: Array2<f64> = Array2::zeros((n * k, 0));
 
     for idx in 0..operators.len() {
         let w_h = &scaled_h[idx];
@@ -368,15 +381,52 @@ pub fn compile_with_dual_metric(
         anchor_s = concat_cols(&anchor_s, &residual_s_v);
 
         // Compiled anchor correction lives in the curvature metric — the
-        // predict-time row contribution is `(C(x) · V − A(x) · (M·V))·β`,
-        // where the subtraction makes residuals H-orthogonal at training.
-        let m_compiled = m_h_inner_opt.as_ref().map(|m| fast_ab(m, &t_inner));
+        // predict-time row contribution is `(C(x) · V − A(x) · M)·β`, where
+        // the subtraction makes residuals H-orthogonal at training and `A(x)`
+        // is the *raw* anchor evaluation (one column per raw anchor column).
+        //
+        // `m_h_inner_opt · t_inner` (call it `M_kept`) lives in the
+        // *kept-direction* anchor coordinates of `anchor_h`: its row count is
+        // `anchor_h.ncols()`, which equals the raw anchor width only when no
+        // upstream block shed an aliased column. The predict path multiplies
+        // by the raw anchor matrix `A_raw`, so we must re-express `M_kept` in
+        // raw-anchor-column coordinates.
+        //
+        // `anchor_h` and `raw_anchor_h` span the same column space in the
+        // curvature metric (the residualisation/rotation only drops directions
+        // that lie inside that span), so there is an exact `Z` with
+        // `raw_anchor_h · Z = anchor_h`. Then
+        //   `anchor_h · M_kept = raw_anchor_h · (Z · M_kept)`,
+        // and the raw-coordinate correction is `M_raw = Z · M_kept`, with row
+        // count `raw_anchor_h.ncols()` = the sum of raw anchor block widths.
+        // `Z = (raw_anchor_hᵀ raw_anchor_h)⁺ raw_anchor_hᵀ anchor_h` is the
+        // metric-exact least-squares change of basis (`solve_psd_system`).
+        let m_compiled = match m_h_inner_opt.as_ref() {
+            Some(m) => {
+                let m_kept = fast_ab(m, &t_inner);
+                debug_assert_eq!(
+                    m_kept.nrows(),
+                    anchor_h.ncols(),
+                    "anchor correction must be indexed by kept anchor directions"
+                );
+                let g_raw = fast_atb(&raw_anchor_h, &raw_anchor_h);
+                let z_rhs = fast_atb(&raw_anchor_h, &anchor_h);
+                let z = solve_psd_system(&g_raw, &z_rhs)?;
+                Some(fast_ab(&z, &m_kept))
+            }
+            None => None,
+        };
         compiled.push(CompiledBlock {
             t_lw: v,
             anchor_correction: m_compiled.clone(),
             r_lw: m_compiled,
             anchor_evaluator: None,
         });
+
+        // Append this block's raw curvature-scaled columns to the raw anchor
+        // accumulator so the *next* block's `M_raw` is expressed against the
+        // full raw column set of all blocks walked so far.
+        raw_anchor_h = concat_cols(&raw_anchor_h, w_h);
     }
 
     // Joint-design audit on the curvature-scaled cumulative anchor: the
