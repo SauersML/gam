@@ -134,6 +134,16 @@ pub type SharedBetaMatvec =
     Arc<dyn for<'a> Fn(ArrayView1<'a, f64>, &mut Array1<f64>) + Send + Sync>;
 pub type RowHtbetaMatvec =
     Arc<dyn for<'a> Fn(usize, ArrayView1<'a, f64>, &mut Array1<f64>) + Send + Sync>;
+/// Row-local matrix-free transpose multiply `out += H_βt^(i) · v` (length `K`).
+///
+/// This is the adjoint of [`RowHtbetaMatvec`]: it scatters a per-row latent
+/// vector `v` (length `d_i`) back into the shared β gradient, **adding** its
+/// contribution to `out`. For the SAE Kronecker form this is the sparse
+/// `scatter_jbeta_t` over the row's active atoms — `O(m_i · p)` per row, the
+/// per-row sparse apply that replaces the `O(K)` column-probe in the GPU and
+/// streaming Schur matvec.
+pub type RowHtbetaTransposeMatvec =
+    Arc<dyn for<'a> Fn(usize, ArrayView1<'a, f64>, &mut Array1<f64>) + Send + Sync>;
 pub type StreamingArrowRowBuilder =
     Arc<dyn Fn(usize) -> Result<ArrowRowBlock, ArrowSchurError> + Send + Sync>;
 
@@ -1621,6 +1631,15 @@ pub struct ArrowSchurSystem {
     /// `sys_htbeta_materialize_row`.  Factor caches retain the operator for
     /// IFT/evidence consumers as before.
     pub htbeta_matvec: Option<RowHtbetaMatvec>,
+    /// Optional row-local matrix-free transpose multiply `out += H_βt^(i) · v`.
+    ///
+    /// The sparse adjoint of [`Self::htbeta_matvec`]. When present, the
+    /// reduced-Schur matvec applies `H_βt^(i)` directly (sparse `scatter`)
+    /// instead of probing the forward operator against `K` basis vectors. This
+    /// is the per-row sparse apply that lifts the `O(K)` column-probe in the
+    /// GPU PCG and streaming Schur paths to `O(m_i · p)` per row. Installed in
+    /// lock-step with `htbeta_matvec` by [`Self::set_row_htbeta_operator`].
+    pub htbeta_transpose_matvec: Option<RowHtbetaTransposeMatvec>,
     /// Optional diagonal of the matrix-free shared block, used by the
     /// Schur-Jacobi preconditioner in the Agarwal-style PCG path.
     pub hbb_diag: Option<Array1<f64>>,
@@ -1696,6 +1715,7 @@ impl ArrowSchurSystem {
             hbb: Array2::<f64>::zeros((k, k)),
             hbb_matvec: None,
             htbeta_matvec: None,
+            htbeta_transpose_matvec: None,
             hbb_diag: None,
             gb: Array1::<f64>::zeros(k),
             d,
@@ -1790,6 +1810,7 @@ impl ArrowSchurSystem {
             hbb: Array2::<f64>::zeros((k, k)),
             hbb_matvec: None,
             htbeta_matvec: None,
+            htbeta_transpose_matvec: None,
             hbb_diag: None,
             gb: Array1::<f64>::zeros(k),
             d: max_d,
@@ -1857,22 +1878,28 @@ impl ArrowSchurSystem {
         self.refresh_row_hessian_fingerprint();
     }
 
-    /// Install a matrix-free per-row cross-block operator.
+    /// Install a matrix-free per-row cross-block operator and its sparse
+    /// adjoint.
     ///
-    /// The closure must write `out = H_tβ^(row) x` for `out.len() == d` and
-    /// `x.len() == K`.
+    /// `forward` must write `out = H_tβ^(row) x` for `out.len() == d` and
+    /// `x.len() == K`. `transpose` must **add** `H_βt^(row) v` into `out` for
+    /// `out.len() == K` and `v.len() == d` (the sparse `scatter` adjoint).
     ///
-    /// When installed, the operator is used both during the Newton solve
+    /// When installed, the forward operator is used during the Newton solve
     /// (inside `reduced_rhs_beta`, `schur_matvec`, back-substitution, and
     /// `JacobiPreconditioner` construction) and afterwards by IFT/evidence
     /// predictors.  Per-row `htbeta` slabs in `ArrowRowBlock` may be left
     /// zero-sized when this operator is installed — all inner-Schur paths route
-    /// through the matvec instead of indexing the dense block.
-    pub fn set_row_htbeta_operator<F>(&mut self, matvec: F)
+    /// through the matvec instead of indexing the dense block. The transpose
+    /// operator lets the reduced-Schur matvec apply `H_βt^(row)` directly
+    /// (`O(m_i · p)`) instead of probing `forward` against `K` basis vectors.
+    pub fn set_row_htbeta_operator<F, T>(&mut self, forward: F, transpose: T)
     where
         F: for<'a> Fn(usize, ArrayView1<'a, f64>, &mut Array1<f64>) + Send + Sync + 'static,
+        T: for<'a> Fn(usize, ArrayView1<'a, f64>, &mut Array1<f64>) + Send + Sync + 'static,
     {
-        self.htbeta_matvec = Some(Arc::new(matvec));
+        self.htbeta_matvec = Some(Arc::new(forward));
+        self.htbeta_transpose_matvec = Some(Arc::new(transpose));
         self.refresh_row_hessian_fingerprint();
     }
 
@@ -2296,6 +2323,13 @@ pub struct StreamingArrowSchur {
     /// cross-block, matching the Kronecker / matrix-free assembly path. When
     /// `None` (legacy dense BA callers), the per-row `row.htbeta` slab is used.
     htbeta_matvec: Option<RowHtbetaMatvec>,
+    /// Sparse adjoint of `htbeta_matvec`. When present, `row_htbeta` rebuilds
+    /// the dense `(d_i × K)` cross-block by probing the transpose with `d_i`
+    /// basis vectors — `O(d_i · m_i · p)` total, vs the `O(K · m_i · p)` cost
+    /// of probing the forward operator with `K` basis vectors. Since
+    /// `d_i ≪ K`, this is the per-row sparse apply that replaces the `O(K)`
+    /// column-probe in the streaming reduced-Schur accumulation.
+    htbeta_transpose_matvec: Option<RowHtbetaTransposeMatvec>,
 }
 
 impl std::fmt::Debug for StreamingArrowSchur {
@@ -2337,6 +2371,7 @@ impl StreamingArrowSchur {
             gb,
             row_builder,
             htbeta_matvec: None,
+            htbeta_transpose_matvec: None,
         }
     }
 
@@ -2387,14 +2422,39 @@ impl StreamingArrowSchur {
             chunk_size,
         );
         streaming.htbeta_matvec = htbeta_matvec;
+        streaming.htbeta_transpose_matvec = sys.htbeta_transpose_matvec.clone();
         streaming
     }
 
-    /// Build the `(di × k)` cross-block for `row_idx` on demand. When a
-    /// procedural `htbeta_matvec` is installed, probes its `k` standard basis
-    /// vectors (the Kronecker gather costs `O(m_i · p)` per probe, far below a
-    /// dense `(di · K)` retain). Otherwise clones the dense `row.htbeta` slab.
+    /// Build the `(di × k)` cross-block for `row_idx` on demand.
+    ///
+    /// When the sparse transpose adjoint is installed, probes it with `di`
+    /// standard basis vectors — each yields a full `K`-row of `H_βt^(i)`
+    /// (i.e. a row of the `(di × k)` block) via the sparse scatter, for
+    /// `O(di · m_i · p)` total, far below the `O(K · m_i · p)` cost of probing
+    /// the forward operator with `K` basis vectors when `di ≪ K`.
+    ///
+    /// When only the forward operator is installed (no adjoint), falls back to
+    /// the `k`-column forward probe. Otherwise clones the dense `row.htbeta`
+    /// slab.
     fn row_htbeta(&self, row_idx: usize, row: &ArrowRowBlock, di: usize) -> Array2<f64> {
+        if let Some(op_t) = self.htbeta_transpose_matvec.as_ref() {
+            // Probe the adjoint: for each latent index c, scatter e_c to obtain
+            // row c of the (di × k) block.
+            let mut mat = Array2::<f64>::zeros((di, self.k));
+            let mut e_c = Array1::<f64>::zeros(di);
+            let mut beta_row = Array1::<f64>::zeros(self.k);
+            for c in 0..di {
+                e_c.fill(0.0);
+                e_c[c] = 1.0;
+                beta_row.fill(0.0);
+                op_t(row_idx, e_c.view(), &mut beta_row);
+                for a in 0..self.k {
+                    mat[[c, a]] = beta_row[a];
+                }
+            }
+            return mat;
+        }
         match self.htbeta_matvec.as_ref() {
             Some(op) => {
                 let mut mat = Array2::<f64>::zeros((di, self.k));
@@ -3906,6 +3966,29 @@ pub fn solve_streaming_reduced_beta(
         if proximal_ridge > 0.0 {
             for j in 0..schur.nrows() {
                 schur[[j, j]] += proximal_ridge;
+            }
+        }
+        // Reduced K-system on device: Jacobi-preconditioned CG over the dense
+        // symmetric `S`. The `O(K²)` `S·p` matvec runs device-side; only the
+        // K-vectors cross the boundary per CG iteration. This is the dominant
+        // cost of the streaming SAE joint fit at `K = 100K`. Any device-side
+        // failure (`Unavailable`, non-PD Jacobi diagonal) falls through to the
+        // CPU `solve_dense_reduced_system`, which then drives the same proximal
+        // ridge escalation. A genuine device PD failure is non-recoverable for
+        // this attempt's `schur`, so we let the CPU path re-confirm and escalate.
+        if crate::gpu::runtime::GpuRuntime::is_available() {
+            match crate::gpu::arrow_schur::solve_reduced_beta_pcg(
+                &schur,
+                rhs_beta,
+                options.trust_region.max_iterations,
+                options.trust_region.steihaug_relative_tolerance,
+            ) {
+                Ok(delta_beta) => return Ok(delta_beta),
+                Err(crate::gpu::arrow_schur::ArrowSchurGpuFailure::Unavailable) => {}
+                Err(_) => {
+                    // Device declined this `schur` (e.g. non-PD Jacobi diag);
+                    // let the CPU path confirm and escalate the proximal ridge.
+                }
             }
         }
         match solve_dense_reduced_system(&schur, rhs_beta, options, None) {

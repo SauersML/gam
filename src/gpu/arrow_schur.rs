@@ -241,25 +241,27 @@ pub fn solve_arrow_newton_step_fused_force(
 /// factor failed at the requested `ridge_t`; the outer LM escalation should
 /// bump `ridge_t` and retry.
 ///
-/// # Composition with #286
+/// # Composition with the matrix-free SAE Kronecker operator
 ///
-/// When `sys.htbeta_matvec` is set (CPU matrix-free H_tβ from issue #286),
-/// the dense `H_tβ` slabs are absent and this function returns
-/// `GpuRequiresDenseSystem` — the row-procedural GPU H_tβ kernel that lifts
-/// this restriction is the remaining Part-B deliverable once the SAE Kronecker
-/// kernel (#293) lands.
+/// When `sys.htbeta_matvec` is set (matrix-free `H_tβ` Kronecker operator),
+/// the dense `H_tβ` slabs are absent — the dense forward kernel above cannot
+/// run, and at `K = 100K` the dense `Y_i = L_i^{-1} H_tβ^(i)` (`d × K` per row)
+/// could not be materialised anyway. Instead, `build_row_procedural_matvec`
+/// returns a row-procedural Schur matvec: per row it gathers
+/// `v_i = H_tβ^(i)·x` through the forward operator (sparse `O(m_i · p)`),
+/// solves `(H_tt^(i) + ρ_t·I)^{-1} v_i` through a pre-computed per-row Cholesky
+/// factor, and scatters `H_βt^(i)·w_i` through the sparse transpose operator
+/// (`O(m_i · p)`, replacing the old `O(K)` column-probe). This is the
+/// row-procedural `a_ik · Φ_k[i,m]` Kronecker apply over the active atoms only.
 pub fn gpu_schur_matvec_backend(
     sys: &ArrowSchurSystem,
     ridge_t: f64,
     ridge_beta: f64,
 ) -> Result<crate::solver::arrow_schur::GpuSchurMatvec, ArrowSchurGpuFailure> {
-    // Matrix-free H_tβ operators cannot be consumed by the dense forward kernel.
-    // Return GpuRequiresDenseSystem so the caller knows to stay on CPU PCG.
+    // Matrix-free H_tβ operator present: drive the row-procedural sparse
+    // Kronecker apply (active atoms only) instead of the dense forward kernel.
     if sys.htbeta_matvec.is_some() {
-        return Err(ArrowSchurGpuFailure::GpuRequiresDenseSystem {
-            had_hbb_matvec: sys.hbb_matvec.is_some(),
-            had_htbeta_matvec: true,
-        });
+        return build_row_procedural_matvec(sys, ridge_t, ridge_beta);
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -275,6 +277,180 @@ pub fn gpu_schur_matvec_backend(
     #[cfg(target_os = "linux")]
     {
         cuda::build_schur_matvec_backend(sys, ridge_t, ridge_beta)
+    }
+}
+
+/// Build a row-procedural reduced-Schur matvec for matrix-free SAE Kronecker
+/// systems, eliminating the per-row latent block via cached per-row Cholesky
+/// factors and applying the cross-block through the sparse forward/transpose
+/// Kronecker operators (active atoms only).
+///
+/// The returned closure evaluates
+/// `S·x = (H_ββ + ρ_β·I)·x − Σ_i H_βt^(i) (H_tt^(i) + ρ_t·I)^{-1} H_tβ^(i)·x`,
+/// the same reduced Schur complement the dense path forms, but never
+/// materialises the `d × K` cross-block `H_tβ^(i)`: the forward operator
+/// (`out = H_tβ^(i)·x`) and transpose operator (`out += H_βt^(i)·v`) are the
+/// sparse Kronecker gather/scatter from `SaeKroneckerRows`. The per-row factor
+/// of `H_tt^(i) + ρ_t·I` is computed once when the closure is built and reused
+/// across every CG iteration.
+///
+/// Returns `RidgeBumpRequired` if a per-row block is not positive definite at
+/// the requested `ridge_t`; the outer LM escalation bumps `ridge_t` and retries.
+fn build_row_procedural_matvec(
+    sys: &ArrowSchurSystem,
+    ridge_t: f64,
+    ridge_beta: f64,
+) -> Result<crate::solver::arrow_schur::GpuSchurMatvec, ArrowSchurGpuFailure> {
+    use crate::solver::arrow_schur::BetaPenaltyOp;
+    use std::sync::Arc;
+    let n = sys.rows.len();
+    let k = sys.k;
+    let forward = sys
+        .htbeta_matvec
+        .clone()
+        .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+    let transpose = sys.htbeta_transpose_matvec.clone().ok_or_else(|| {
+        // A forward operator without its sparse adjoint cannot be applied
+        // row-procedurally; this is a wiring error, surfaced as a Schur failure
+        // so the caller routes to the dense CPU path rather than misreporting a
+        // numerical bump.
+        ArrowSchurGpuFailure::SchurFactorFailed {
+            reason: "row-procedural Schur matvec requires htbeta_transpose_matvec; \
+                     forward operator installed without its sparse adjoint"
+                .to_string(),
+        }
+    })?;
+
+    // Pre-factor each per-row block H_tt^(i) + ρ_t·I = L_i L_iᵀ on the host.
+    // The blocks are tiny (d_i ≲ 32) and the dense cross-block slabs are
+    // absent, so there is no device forward-kernel work to amortise here; the
+    // GPU win is the reduced K-system solve in `solve_reduced_beta_pcg`.
+    let mut factors: Vec<Array2<f64>> = Vec::with_capacity(n);
+    for (i, row) in sys.rows.iter().enumerate() {
+        let di = row.htt.nrows();
+        if row.htt.ncols() != di || row.gt.len() != di {
+            return Err(ArrowSchurGpuFailure::SchurFactorFailed {
+                reason: format!("row {i}: malformed H_tt block {:?}", row.htt.dim()),
+            });
+        }
+        let mut block = row.htt.clone();
+        for r in 0..di {
+            block[[r, r]] += ridge_t;
+        }
+        let factor = cholesky_lower_host(block.view()).ok_or_else(|| {
+            let scale = row
+                .htt
+                .diag()
+                .iter()
+                .map(|v| v.abs())
+                .fold(0.0_f64, f64::max)
+                .max(1.0);
+            ArrowSchurGpuFailure::RidgeBumpRequired {
+                row: i,
+                bump: scale * f64::EPSILON.sqrt() * 1024.0,
+            }
+        })?;
+        factors.push(factor);
+    }
+
+    // The SAE-manifold β-Hessian lives in the structured penalty operator
+    // (data-fit Gauss-Newton `G ⊗ I_p` + smoothness Kronecker blocks + any
+    // dense analytic-β residual), NOT in the dense `hbb` accumulator — for
+    // matrix-free systems `hbb` is zero/absent. Capture the effective penalty
+    // operator so `H_ββ·x` matches the CPU `schur_matvec` path exactly. The
+    // operator's `matvec` adds (`y += P x`), so seed `out` from the ridge term.
+    let penalty_op = sys.effective_penalty_op();
+    let row_dims: Vec<usize> = sys.rows.iter().map(|row| row.htt.nrows()).collect();
+
+    let closure: crate::solver::arrow_schur::GpuSchurMatvec =
+        Arc::new(move |x: &Array1<f64>, out: &mut Array1<f64>| {
+            assert_eq!(x.len(), k, "row-procedural matvec: x.len() != k");
+            assert_eq!(out.len(), k, "row-procedural matvec: out.len() != k");
+
+            // (H_ββ + ρ_β·I)·x into out. Seed with the ridge term, then add the
+            // structured penalty-side product (penalty_op.matvec is additive).
+            {
+                let x_slice = x.as_slice().expect("x must be contiguous");
+                let out_slice = out.as_slice_mut().expect("out must be contiguous");
+                for a in 0..k {
+                    out_slice[a] = ridge_beta * x_slice[a];
+                }
+                penalty_op.matvec(x_slice, out_slice);
+            }
+
+            // out -= Σ_i H_βt^(i) (H_tt^(i) + ρ_t·I)^{-1} H_tβ^(i)·x.
+            let mut neg = Array1::<f64>::zeros(k);
+            for i in 0..n {
+                let di = row_dims[i];
+                // v_i = H_tβ^(i)·x (sparse Kronecker gather, length d_i).
+                let mut v_i = Array1::<f64>::zeros(di);
+                forward(i, x.view(), &mut v_i);
+                // w_i = (H_tt^(i) + ρ_t·I)^{-1} v_i via L_i L_iᵀ.
+                let w_i = solve_cholesky_lower_host(factors[i].view(), v_i.view());
+                // neg += H_βt^(i)·w_i (sparse scatter); subtract once at the end.
+                transpose(i, w_i.view(), &mut neg);
+            }
+            for a in 0..k {
+                out[a] -= neg[a];
+            }
+        });
+
+    Ok(closure)
+}
+
+/// Solve the reduced shared β-system `S·δβ = r` fully on device with a
+/// Jacobi-preconditioned conjugate-gradient (Steihaug truncated-CG) loop.
+///
+/// `S` is the already-reduced symmetric positive-definite `K × K` Schur
+/// complement the streaming SAE joint fit accumulates across minibatches
+/// (`StreamingArrowSchur::take_accumulators` summed over chunks, with the
+/// global β ridge folded in). The per-row latent blocks have already been
+/// eliminated into `S` on the host streaming path; the device's job is the
+/// dense `K`-dimensional solve, which is the dominant cost at `K = 100K`.
+///
+/// The dense `S·p` matvec runs on device via cuBLAS `Dgemv` (the `O(K²)` term
+/// that dwarfs the `O(K)` host-side CG scalar recurrences), and the Jacobi
+/// preconditioner uses `diag(S)` extracted once on the host after a single
+/// `dtoh` of the diagonal. Only the `K`-vectors `p` and `S·p` cross the
+/// host↔device boundary per CG iteration.
+///
+/// Returns `Err(ArrowSchurGpuFailure::Unavailable)` when CUDA is unavailable
+/// or the workload is below the dispatch policy; the caller then runs the CPU
+/// reduced-β solve. Returns `Err(ArrowSchurGpuFailure::SchurFactorFailed)`
+/// when `S` carries a non-positive Jacobi diagonal (caller escalates the
+/// proximal ridge).
+pub fn solve_reduced_beta_pcg(
+    s_acc: &Array2<f64>,
+    rhs_beta: &Array1<f64>,
+    max_iterations: usize,
+    relative_tolerance: f64,
+) -> Result<Array1<f64>, ArrowSchurGpuFailure> {
+    let k = rhs_beta.len();
+    if s_acc.dim() != (k, k) {
+        return Err(ArrowSchurGpuFailure::SchurFactorFailed {
+            reason: format!(
+                "reduced-β GPU PCG requires a square (k×k) Schur block; got {:?} for k={k}",
+                s_acc.dim()
+            ),
+        });
+    }
+    if k == 0 {
+        return Err(ArrowSchurGpuFailure::Unavailable);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        if relative_tolerance.is_nan() || max_iterations == 0 {
+            return Err(ArrowSchurGpuFailure::SchurFactorFailed {
+                reason: "reduced-β GPU PCG: invalid CG controls".to_string(),
+            });
+        }
+        Err(ArrowSchurGpuFailure::Unavailable)
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        cuda::solve_reduced_beta_pcg(s_acc, rhs_beta, max_iterations, relative_tolerance)
     }
 }
 
@@ -1424,6 +1600,137 @@ mod cuda {
             });
 
         Ok(closure)
+    }
+
+    /// Jacobi-preconditioned conjugate-gradient solve of the dense reduced
+    /// β-system `S·δβ = r` fully on device.
+    ///
+    /// `S` (`k × k`, symmetric positive definite) and `r` (`k`) are uploaded
+    /// once. Each CG iteration evaluates `S·p` via cuBLAS `Dgemv` device-side
+    /// (the `O(k²)` cost that dominates at `k = 100K`), downloads the `k`-vector
+    /// result, and runs the scalar CG recurrences on the host (the `O(k)` dot
+    /// products and `axpy`s are negligible beside the matvec). The Jacobi
+    /// preconditioner `M^{-1} = diag(S)^{-1}` is extracted once from a single
+    /// diagonal `dtoh`.
+    ///
+    /// Returns `Unavailable` when the workload is below the GEMV dispatch
+    /// policy or no CUDA context is reachable, and `SchurFactorFailed` when the
+    /// Jacobi diagonal is not strictly positive (an indefinite reduced system
+    /// the caller escalates with a proximal ridge).
+    pub(super) fn solve_reduced_beta_pcg(
+        s_acc: &ndarray::Array2<f64>,
+        rhs_beta: &Array1<f64>,
+        max_iterations: usize,
+        relative_tolerance: f64,
+    ) -> Result<Array1<f64>, ArrowSchurGpuFailure> {
+        let k = rhs_beta.len();
+        let runtime = crate::gpu::linalg::route_through_gpu(
+            crate::gpu::linalg::DispatchOp::Gemv { m: k, k },
+        )
+        .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let stream = crate::gpu::runtime::cuda_context_for(runtime.device.ordinal)
+            .and_then(|ctx| ctx.new_stream().ok())
+            .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let blas = CudaBlas::new(stream.clone()).map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+
+        // Jacobi diagonal from S; must be strictly positive for SPD.
+        let mut inv_diag = vec![0.0_f64; k];
+        for j in 0..k {
+            let djj = s_acc[[j, j]];
+            if !(djj > 0.0) {
+                return Err(ArrowSchurGpuFailure::SchurFactorFailed {
+                    reason: format!(
+                        "reduced-β GPU PCG: Jacobi diagonal S[{j},{j}]={djj:e} not positive"
+                    ),
+                });
+            }
+            inv_diag[j] = 1.0 / djj;
+        }
+
+        // Upload S column-major (S[row,col] at col*k + row).
+        let mut s_host = vec![0.0_f64; k * k];
+        for col in 0..k {
+            for row in 0..k {
+                s_host[col * k + row] = s_acc[[row, col]];
+            }
+        }
+        let s_dev = stream
+            .clone_htod(&s_host)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+
+        // Steihaug truncated-CG with Jacobi preconditioner, host scalar
+        // recurrences and a device `S·p` matvec. The streaming reduced solve
+        // uses an unbounded trust region (pure CG to tolerance).
+        let rhs_norm = rhs_beta.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if rhs_norm == 0.0 {
+            return Ok(Array1::<f64>::zeros(k));
+        }
+        let tol = (relative_tolerance.max(0.0) * rhs_norm).max(1e-12);
+
+        let mut x = vec![0.0_f64; k];
+        let mut r: Vec<f64> = rhs_beta.iter().copied().collect();
+        let mut z: Vec<f64> = (0..k).map(|j| inv_diag[j] * r[j]).collect();
+        let mut p = z.clone();
+        let mut rz: f64 = r.iter().zip(&z).map(|(a, b)| a * b).sum();
+        let mut p_dev = stream
+            .clone_htod(&p)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let mut sp_dev = stream
+            .alloc_zeros::<f64>(k)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+
+        let max_iters = max_iterations.max(1);
+        for _ in 0..max_iters {
+            // sp = S · p (device GEMV, S column-major k×k, op = N).
+            stream
+                .memcpy_htod(&p, &mut p_dev)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            let gemv_cfg = GemvConfig::<f64> {
+                trans: cublasOperation_t::CUBLAS_OP_N,
+                m: to_i32(k).ok_or(ArrowSchurGpuFailure::Unavailable)?,
+                n: to_i32(k).ok_or(ArrowSchurGpuFailure::Unavailable)?,
+                alpha: 1.0,
+                lda: to_i32(k).ok_or(ArrowSchurGpuFailure::Unavailable)?,
+                incx: 1,
+                beta: 0.0,
+                incy: 1,
+            };
+            // SAFETY: s_dev is k×k column-major, p_dev / sp_dev length k.
+            unsafe { blas.gemv(gemv_cfg, &s_dev, &p_dev, &mut sp_dev) }
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            let sp = stream
+                .clone_dtoh(&sp_dev)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+
+            let p_sp: f64 = p.iter().zip(&sp).map(|(a, b)| a * b).sum();
+            if !(p_sp > 0.0) {
+                // Non-positive curvature on a (proximal-ridged) SPD system means
+                // numerical breakdown; surface so the caller escalates.
+                return Err(ArrowSchurGpuFailure::SchurFactorFailed {
+                    reason: format!("reduced-β GPU PCG: non-positive curvature pᵀSp={p_sp:e}"),
+                });
+            }
+            let alpha = rz / p_sp;
+            for j in 0..k {
+                x[j] += alpha * p[j];
+                r[j] -= alpha * sp[j];
+            }
+            let r_norm = r.iter().map(|v| v * v).sum::<f64>().sqrt();
+            if r_norm <= tol {
+                break;
+            }
+            for j in 0..k {
+                z[j] = inv_diag[j] * r[j];
+            }
+            let rz_new: f64 = r.iter().zip(&z).map(|(a, b)| a * b).sum();
+            let beta = rz_new / rz;
+            for j in 0..k {
+                p[j] = z[j] + beta * p[j];
+            }
+            rz = rz_new;
+        }
+
+        Ok(Array1::from_vec(x))
     }
 }
 
