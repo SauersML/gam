@@ -77,8 +77,7 @@ pub mod resource;
 pub mod solver;
 mod span;
 pub mod terms;
-#[cfg(test)]
-mod test_support;
+pub mod test_support;
 pub mod types;
 pub mod util;
 
