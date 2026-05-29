@@ -79,7 +79,8 @@ fn build_two_block_specs() -> (Vec<ParameterBlockSpec>, Vec<usize>) {
         initial_beta: None,
         gauge_priority: 100,
         jacobian_callback: None,
-        audit_design: None,
+        stacked_design: None,
+        stacked_offset: None,
     };
     let spec_b = ParameterBlockSpec {
         name: "block_b".to_string(),
@@ -91,7 +92,8 @@ fn build_two_block_specs() -> (Vec<ParameterBlockSpec>, Vec<usize>) {
         initial_beta: None,
         gauge_priority: 100,
         jacobian_callback: None,
-        audit_design: None,
+        stacked_design: None,
+        stacked_offset: None,
     };
     let col_offsets = vec![0usize, 2, 3];
     (vec![spec_a, spec_b], col_offsets)
@@ -204,7 +206,8 @@ fn canonicalize_clean_model_with_penalties_passes_map_check() {
         initial_beta: None,
         gauge_priority: 100,
         jacobian_callback: None,
-        audit_design: None,
+        stacked_design: None,
+        stacked_offset: None,
     };
     let spec_b = ParameterBlockSpec {
         name: "block_b".to_string(),
@@ -216,7 +219,8 @@ fn canonicalize_clean_model_with_penalties_passes_map_check() {
         initial_beta: None,
         gauge_priority: 100,
         jacobian_callback: None,
-        audit_design: None,
+        stacked_design: None,
+        stacked_offset: None,
     };
 
     let result = canonicalize_for_identifiability(&[spec_a, spec_b]);

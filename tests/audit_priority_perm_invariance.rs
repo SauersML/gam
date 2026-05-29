@@ -45,7 +45,8 @@ fn spec_with_priority(name: &str, design: Array2<f64>, priority: u8) -> Paramete
         initial_beta: None,
         gauge_priority: priority,
         jacobian_callback: None,
-        audit_design: None,
+        stacked_design: None,
+        stacked_offset: None,
     }
 }
 

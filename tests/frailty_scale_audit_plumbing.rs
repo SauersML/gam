@@ -91,7 +91,8 @@ fn make_logslope_spec(design: &Array2<f64>, z: &[f64], s_f: f64) -> ParameterBlo
         initial_beta: None,
         gauge_priority: 120,
         jacobian_callback: Some(jac_cb),
-        audit_design: None,
+        stacked_design: None,
+        stacked_offset: None,
     }
 }
 
@@ -107,7 +108,8 @@ fn make_marginal_spec(design: &Array2<f64>) -> ParameterBlockSpec {
         initial_beta: None,
         gauge_priority: 150,
         jacobian_callback: None,
-        audit_design: None,
+        stacked_design: None,
+        stacked_offset: None,
     }
 }
 

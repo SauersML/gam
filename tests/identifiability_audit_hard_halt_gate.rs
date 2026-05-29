@@ -44,7 +44,8 @@ mod common {
             initial_beta: None,
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         }
     }
 
@@ -282,7 +283,8 @@ fn cross_block_alias_with_distinct_priorities_is_not_fatal() {
             initial_beta: None,
             gauge_priority: priority,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         }
     };
 
@@ -367,7 +369,8 @@ fn cross_block_alias_with_distinct_priorities_is_not_fatal() {
                 design: std::sync::Arc::new(logslope.clone()),
                 eta_scaling: z_scaling,
             })),
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         };
         let specs_with_z_scaling = [
             make_spec("time_surface", time, 200),

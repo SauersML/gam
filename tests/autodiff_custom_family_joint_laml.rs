@@ -427,7 +427,8 @@ fn exact_joint_quadratic_lamlgradient_matches_three_autodiff_engines() {
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         },
         ParameterBlockSpec {
             name: "aux".to_string(),
@@ -439,7 +440,8 @@ fn exact_joint_quadratic_lamlgradient_matches_three_autodiff_engines() {
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         },
     ];
     let derivative_blocks = vec![
@@ -516,7 +518,8 @@ fn exact_joint_quadratic_lamlgradient_respects_active_constraint_tangent_space()
         initial_beta: Some(array![lower]),
         gauge_priority: 100,
         jacobian_callback: None,
-        audit_design: None,
+        stacked_design: None,
+        stacked_offset: None,
     }];
     let derivative_blocks = vec![Vec::<CustomFamilyBlockPsiDerivative>::new()];
     let options = BlockwiseFitOptions {
@@ -592,7 +595,8 @@ fn exact_joint_quadratic_lamlgradient_requires_joint_stationarity() {
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         },
         ParameterBlockSpec {
             name: "aux".to_string(),
@@ -604,7 +608,8 @@ fn exact_joint_quadratic_lamlgradient_requires_joint_stationarity() {
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         },
     ];
     let derivative_blocks = vec![
@@ -688,7 +693,8 @@ fn exact_joint_quadratic_lamlhessian_matches_gradient_finite_difference() {
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         },
         ParameterBlockSpec {
             name: "aux".to_string(),
@@ -700,7 +706,8 @@ fn exact_joint_quadratic_lamlhessian_matches_gradient_finite_difference() {
             initial_beta: Some(array![0.0]),
             gauge_priority: 100,
             jacobian_callback: None,
-            audit_design: None,
+            stacked_design: None,
+            stacked_offset: None,
         },
     ];
     let derivative_blocks = vec![

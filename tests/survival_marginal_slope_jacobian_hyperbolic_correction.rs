@@ -485,7 +485,8 @@ fn make_spec_from_dense(name: &str, phi: Array2<f64>) -> ParameterBlockSpec {
         initial_beta: None,
         gauge_priority: 100,
         jacobian_callback: None,
-        audit_design: None,
+        stacked_design: None,
+        stacked_offset: None,
     }
 }
 
@@ -516,7 +517,8 @@ fn make_logslope_spec(
         initial_beta: None,
         gauge_priority: 120,
         jacobian_callback: Some(cb),
-        audit_design: None,
+        stacked_design: None,
+        stacked_offset: None,
     }
 }
 
@@ -1005,7 +1007,8 @@ fn time_and_marginal_blocks_at_zero_beta_have_trivial_scaling() {
             design: Arc::new(data.phi_time.clone()),
             eta_scaling: scaling,
         })),
-        audit_design: None,
+        stacked_design: None,
+        stacked_offset: None,
     };
 
     // Effective Jacobian via spec.effective_jacobian_at (RowScaledJacobian with scaling=1).
@@ -1064,7 +1067,8 @@ fn time_and_marginal_blocks_at_zero_beta_have_trivial_scaling() {
             design: Arc::new(data.phi_marg.clone()),
             eta_scaling: sf_z_arc,
         })),
-        audit_design: None,
+        stacked_design: None,
+        stacked_offset: None,
     };
     let marg_state = FamilyLinearizationState {
         beta: &beta_zero,

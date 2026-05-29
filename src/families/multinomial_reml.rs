@@ -81,7 +81,7 @@ use std::sync::Arc;
 /// * `penalty.dim() == (P, P)` (symmetric, PSD).
 ///
 /// All four are validated by [`MultinomialFamily::new`].
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct MultinomialFamily {
     /// One-hot response matrix `Y ∈ ℝ^{N × K}` (label-smoothed rows accepted;
     /// row sums need only be finite). Column `K − 1` is the reference class.
@@ -305,10 +305,7 @@ impl MultinomialFamily {
     /// the current `η`. Centralises the softmax-driven kernel so every
     /// downstream assembly (gradient, dense Hessian, directional derivative)
     /// reads from the same source.
-    fn evaluate_row_kernels(
-        &self,
-        eta: ArrayView2<'_, f64>,
-    ) -> (f64, Array3<f64>, Array2<f64>) {
+    fn evaluate_row_kernels(&self, eta: ArrayView2<'_, f64>) -> (f64, Array3<f64>, Array2<f64>) {
         let log_lik = self.likelihood.log_lik(eta, self.y_one_hot.view());
         // hess_block returns w_n · (δ_ab p_a − p_a p_b) (i.e. the canonical
         // observed = Fisher information block under the logit link).
@@ -567,17 +564,11 @@ impl MultinomialFamily {
             //                   − dp_v_a dp_u_b − p_a ddp_b )
             for a in 0..m {
                 let pa = probs_full[[row, a]];
-                out[[row, a, a]] = w
-                    * (ddp[a]
-                        - 2.0 * ddp[a] * pa
-                        - 2.0 * dp_u[a] * dp_v[a]);
+                out[[row, a, a]] = w * (ddp[a] - 2.0 * ddp[a] * pa - 2.0 * dp_u[a] * dp_v[a]);
                 for b in (a + 1)..m {
                     let pb = probs_full[[row, b]];
-                    let off = w
-                        * (-(ddp[a] * pb
-                            + dp_u[a] * dp_v[b]
-                            + dp_v[a] * dp_u[b]
-                            + pa * ddp[b]));
+                    let off =
+                        w * (-(ddp[a] * pb + dp_u[a] * dp_v[b] + dp_v[a] * dp_u[b] + pa * ddp[b]));
                     out[[row, a, b]] = off;
                     out[[row, b, a]] = off;
                 }
@@ -1026,7 +1017,8 @@ mod tests {
         // Distinct per-class β so η, and hence the Fisher block, is non-uniform.
         let block_states: Vec<ParameterBlockState> = (0..m)
             .map(|a| {
-                let beta = Array1::<f64>::from_shape_fn(p, |i| 0.3 * ((a + 1) as f64) - 0.1 * (i as f64));
+                let beta =
+                    Array1::<f64>::from_shape_fn(p, |i| 0.3 * ((a + 1) as f64) - 0.1 * (i as f64));
                 let eta = Array1::<f64>::from_shape_fn(n, |row| {
                     (0..p).map(|i| design[[row, i]] * beta[i]).sum()
                 });
@@ -1045,7 +1037,11 @@ mod tests {
         // Several probe directions, including a unit vector per coordinate.
         for seed in 0..(m * p) {
             let v = Array1::<f64>::from_shape_fn(m * p, |i| {
-                if i == seed { 1.0 } else { 0.07 * ((i + 1) as f64).cos() }
+                if i == seed {
+                    1.0
+                } else {
+                    0.07 * ((i + 1) as f64).cos()
+                }
             });
             let mf = ws
                 .hessian_matvec(&v)
@@ -1094,8 +1090,7 @@ mod tests {
         let w = Array1::<f64>::ones(n);
         let x = Arc::new(Array2::<f64>::ones((n, 1)));
         let s = Arc::new(Array2::<f64>::zeros((1, 1)));
-        let err =
-            MultinomialFamily::new(y, w, 1, x, s, 0).expect_err("K = 1 must be rejected");
+        let err = MultinomialFamily::new(y, w, 1, x, s, 0).expect_err("K = 1 must be rejected");
         assert!(err.contains("K"));
     }
 }

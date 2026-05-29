@@ -3,6 +3,7 @@ use gam::inference::quadrature::{
     QuadratureContext, cloglog_ghq_value, integrated_family_moments_jet,
 };
 use gam::inference::smooth_test::{SmoothTestInput, SmoothTestScale, wood_smooth_test};
+use gam::matrix::{PsdWeightsView, SignedWeightsView};
 use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, StandardLink};
 use ndarray::{Array1, Array2, array};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
@@ -63,8 +64,8 @@ fn alo_residual_matches_closed_form_identity_link() {
     let input = AloInput {
         design: &x,
         penalized_hessian: &h,
-        hessian_weights: &w,
-        score_weights: &w,
+        hessian_weights: SignedWeightsView::from_array(&w),
+        score_weights: PsdWeightsView::try_from_array(&w).expect("psd weights"),
         working_response: &z,
         eta: &eta,
         offset: &offset,
@@ -101,8 +102,8 @@ fn alo_respects_family_and_robust_weights() {
     let input = AloInput {
         design: &x,
         penalized_hessian: &h,
-        hessian_weights: &w_h,
-        score_weights: &w_s,
+        hessian_weights: SignedWeightsView::from_array(&w_h),
+        score_weights: PsdWeightsView::try_from_array(&w_s).expect("psd weights"),
         working_response: &z,
         eta: &eta,
         offset: &offset,
