@@ -72,6 +72,7 @@ class ManifoldSAE:
     training_mean: np.ndarray
     training_data: np.ndarray
     low_level: SaeManifoldFitResult
+    low_level_logits: np.ndarray
     _basis_kinds: list[str]
     _atom_dims: list[int]
     _basis_sizes: list[int]
@@ -109,6 +110,7 @@ class ManifoldSAE:
         ) for atom in payload["atoms"]]
         fitted = np.asarray(payload["fitted"], dtype=float)
         assigns = np.asarray(payload["assignments_z"], dtype=float)
+        logits = np.asarray(payload["logits"], dtype=float)
         coords = [atom.coords.copy() for atom in atoms]
         score = float(payload["reml_score"])
         chosen_k = int(payload["chosen_k"]) if "chosen_k" in payload else len(atoms)
@@ -126,6 +128,7 @@ class ManifoldSAE:
             basis_specs=kinds, reml_score=score,
             reconstruction_r2=float(rust_module().sae_manifold_reconstruction_r2(x, fitted)),
             training_mean=x.mean(axis=0), training_data=x.copy(), low_level=low,
+            low_level_logits=logits,
             _basis_kinds=kinds, _atom_dims=dims, _basis_sizes=sizes,
             _n_harmonics=nharm, _duchon_centers=centers,
             alpha=float(alpha), learnable_alpha=bool(learnable_alpha),
@@ -134,12 +137,19 @@ class ManifoldSAE:
             max_iter=int(max_iter), random_state=int(random_state),
         )
 
-    def reconstruct(self, X: Any) -> np.ndarray:
+    def _oos_payload(self, X: Any, *, t_init: Any = None, a_init: Any = None) -> dict[str, Any]:
+        """Run the frozen-decoder OOS Newton solve on ``X`` and return the full
+        payload dict (``assignments_z``, per-atom ``on_atom_coords_t``,
+        ``logits``, ``fitted``).
+
+        Optional ``t_init`` (K, N, D_max) and ``a_init`` (N, K) warm-start the
+        refinement from an amortized encoder's per-token prediction (#357).
+        """
         x = _as_2d_float(X, "X")
-        if x.shape == self.training_data.shape and np.allclose(x, self.training_data):
-            return self.fitted.copy()
         kind = _canonical_assignment(self.assignment, "assignment")
-        return np.asarray(rust_module().sae_manifold_predict_oos(
+        logits_init = None if a_init is None else np.ascontiguousarray(np.asarray(a_init, dtype=float))
+        coords_init = None if t_init is None else np.ascontiguousarray(np.asarray(t_init, dtype=float))
+        payload = rust_module().sae_manifold_predict_oos(
             np.ascontiguousarray(x), list(self._basis_kinds), list(self._atom_dims),
             [np.ascontiguousarray(b) for b in self.decoder_blocks],
             [None if c is None else np.ascontiguousarray(c) for c in self._duchon_centers],
@@ -147,10 +157,78 @@ class ManifoldSAE:
             alpha=float(self.alpha), tau=float(self.tau), assignment_kind=str(kind),
             sparsity_strength=float(self.sparsity_strength), smoothness=float(self.smoothness),
             max_iter=int(self.max_iter), learning_rate=float(self.learning_rate),
-        ), dtype=float)
+            initial_logits=logits_init, initial_coords=coords_init,
+        )
+        return dict(payload)
+
+    def reconstruct(self, X: Any, *, t_init: Any = None, a_init: Any = None) -> np.ndarray:
+        x = _as_2d_float(X, "X")
+        if t_init is None and a_init is None and x.shape == self.training_data.shape and np.allclose(x, self.training_data):
+            return self.fitted.copy()
+        payload = self._oos_payload(x, t_init=t_init, a_init=a_init)
+        return np.asarray(payload["fitted"], dtype=float)
 
     def predict(self, X: Any) -> np.ndarray:
         return self.reconstruct(X)
+
+    def encode(self, X: Any, *, t_init: Any = None, a_init: Any = None) -> np.ndarray:
+        """Out-of-sample per-token assignments ``a*`` of shape ``(N, K)``.
+
+        Runs the frozen-decoder OOS solve on ``X`` and returns the converged
+        assignment matrix. On training ``X`` (matched bit-exactly) the cached
+        fit assignments are returned without re-solving. ``t_init`` / ``a_init``
+        warm-start the refinement (#357)."""
+        x = _as_2d_float(X, "X")
+        if t_init is None and a_init is None and x.shape == self.training_data.shape and np.allclose(x, self.training_data):
+            return self.assignments.copy()
+        payload = self._oos_payload(x, t_init=t_init, a_init=a_init)
+        return np.asarray(payload["assignments_z"], dtype=float)
+
+    def converged_latents(self, X: Any | None = None, *, t_init: Any = None, a_init: Any = None) -> dict[str, Any]:
+        """Converged supervision targets for an amortized encoder (#357).
+
+        Returns ``{"coords": list[(N, d_k) ndarray], "assignments": (N, K)
+        ndarray, "logits": (N, K) ndarray, "fitted": (N, p) ndarray}`` — the
+        per-atom on-manifold coordinates ``t*`` and the assignments / gate
+        ``a*`` the joint solver converged to. With ``X is None`` (or training
+        ``X``) the stored training-fit latents are returned; otherwise the OOS
+        solve is run on ``X``, optionally warm-started from ``t_init`` /
+        ``a_init``."""
+        x = None if X is None else _as_2d_float(X, "X")
+        use_training = (
+            t_init is None and a_init is None
+            and (x is None or (x.shape == self.training_data.shape and np.allclose(x, self.training_data)))
+        )
+        if use_training:
+            return {
+                "coords": [c.copy() for c in self.coords],
+                "assignments": self.assignments.copy(),
+                "logits": self.low_level_logits.copy(),
+                "fitted": self.fitted.copy(),
+            }
+        payload = self._oos_payload(x, t_init=t_init, a_init=a_init)
+        return {
+            "coords": [np.asarray(atom["on_atom_coords_t"], dtype=float) for atom in payload["atoms"]],
+            "assignments": np.asarray(payload["assignments_z"], dtype=float),
+            "logits": np.asarray(payload["logits"], dtype=float),
+            "fitted": np.asarray(payload["fitted"], dtype=float),
+        }
+
+    def project(self, X: Any, atom_k: int) -> np.ndarray:
+        """Standalone per-atom projection ``project(x, atom_k) -> t`` (#357).
+
+        Maps each ambient point in ``X`` to its on-manifold coordinate for atom
+        ``atom_k`` under the trained decoder, via the same frozen-decoder OOS
+        solve. Returns the ``(N, d_k)`` coordinate block for that atom — the
+        minimal teacher signal for an encoder's coordinate head."""
+        k = int(atom_k)
+        if k < 0 or k >= len(self.atoms):
+            raise IndexError(f"atom_k={atom_k} out of range for K={len(self.atoms)} atoms")
+        x = _as_2d_float(X, "X")
+        if x.shape == self.training_data.shape and np.allclose(x, self.training_data):
+            return self.coords[k].copy()
+        payload = self._oos_payload(x)
+        return np.asarray(payload["atoms"][k]["on_atom_coords_t"], dtype=float)
 
     def per_atom_active_set(self, X: Any, threshold: float | None = None) -> np.ndarray:
         _as_2d_float(X, "X")
@@ -207,6 +285,7 @@ class ManifoldSAE:
             "training_data": self.training_data.tolist(),
             "fitted": self.fitted.tolist(),
             "assignments": self.assignments.tolist(),
+            "logits": self.low_level_logits.tolist(),
             "coords": [c.tolist() for c in self.coords],
             "decoder_blocks": [b.tolist() for b in self.decoder_blocks],
             "atoms": [
@@ -249,6 +328,7 @@ class ManifoldSAE:
         ]
         fitted = np.asarray(payload["fitted"], dtype=float)
         assigns = np.asarray(payload["assignments"], dtype=float)
+        logits = np.asarray(payload["logits"], dtype=float)
         coords = [np.asarray(c, dtype=float) for c in payload["coords"]]
         decoder_blocks = [np.asarray(b, dtype=float) for b in payload["decoder_blocks"]]
         score = float(payload["reml_score"])
@@ -274,6 +354,7 @@ class ManifoldSAE:
             training_mean=np.asarray(payload["training_mean"], dtype=float),
             training_data=np.asarray(payload["training_data"], dtype=float),
             low_level=low,
+            low_level_logits=logits,
             _basis_kinds=list(payload["basis_kinds"]),
             _atom_dims=[int(d) for d in payload["atom_dims"]],
             _basis_sizes=[int(s) for s in payload["basis_sizes"]],
@@ -362,7 +443,8 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
                      Z: Any = None, sparsity_weight: float = 1.0, smoothness_weight: float = 1.0,
                      alpha: float | str = 1.0, learning_rate: float | None = None, random_state: int = 0,
                      block_orthogonality_weight: float = 0.0,
-                     top_k: int | None = None, **kwargs: Any) -> ManifoldSAE:
+                     top_k: int | None = None, t_init: Any = None, a_init: Any = None,
+                     **kwargs: Any) -> ManifoldSAE:
     """Fit an SAE-manifold model.
 
     ``decoder_feature_sparsity_groups`` was previously named
@@ -377,6 +459,18 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     cluster. Multi-atom (``k_atoms >= 2``) SAEs are supported: the Rust
     ``add_sae_beta_penalty`` dispatches the group-lasso per atom, rebuilding
     the penalty target to each atom's ``(M_k, p_out)`` decoder block (#240).
+
+    Inputs and warm starts (issue #357). ``X`` / ``Z`` are *aliases* for the
+    response data matrix the SAE reconstructs — ``Z`` is **not** a warm start;
+    it is simply the named-argument form of the data. To warm-start the joint
+    solve from an amortized encoder's per-token prediction, pass ``a_init``
+    (assignment logits, shape ``(N, K)``) and/or ``t_init`` (on-manifold
+    coordinates, shape ``(K, N, D_max)`` with ``D_max >= max(atom_dim)``). With
+    a small ``n_iter`` the solver runs a bounded refinement of those seeds,
+    enabling the "encoder predicts -> solver refines -> distill the gap" loop.
+    The converged supervision targets ``t*`` / ``a*`` are read back via
+    :meth:`ManifoldSAE.converged_latents`, :meth:`ManifoldSAE.encode`, and the
+    standalone per-atom :meth:`ManifoldSAE.project`.
     """
     src = Z if Z is not None else X
     if src is None:
@@ -511,6 +605,33 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     # recomputes `fitted` from the projected distribution. The Rust kernel
     # owns the hard top-k contract end to end — there is no Python-side mask.
     top_k_arg = int(top_k) if (top_k is not None and int(top_k) > 0) else None
+    # Warm starts (issue #357): `a_init` (N, K) seeds the assignment logits and
+    # `t_init` (K, N, D_max) seeds the per-atom on-manifold coordinates, so an
+    # amortized encoder can predict `(a_init, t_init)` and have the joint solver
+    # refine them for a bounded `n_iter` steps. Both are optional and validated
+    # eagerly here against (N, K) / (K, N, D_max) where D_max = max(dims).
+    d_max = max(dims)
+    logits_init = None
+    if a_init is not None:
+        logits_init = np.ascontiguousarray(np.asarray(a_init, dtype=np.float64))
+        if logits_init.shape != (n_obs, k_atoms):
+            raise ValueError(
+                f"sae_manifold_fit: a_init must have shape (N, K)=({n_obs}, {k_atoms}); "
+                f"got {logits_init.shape}"
+            )
+    coords_init = None
+    if t_init is not None:
+        coords_init = np.ascontiguousarray(np.asarray(t_init, dtype=np.float64))
+        if coords_init.ndim != 3 or coords_init.shape[0] != k_atoms or coords_init.shape[1] != n_obs:
+            raise ValueError(
+                f"sae_manifold_fit: t_init must have shape (K, N, D_max)=({k_atoms}, {n_obs}, >={d_max}); "
+                f"got {coords_init.shape}"
+            )
+        if coords_init.shape[2] < d_max:
+            raise ValueError(
+                f"sae_manifold_fit: t_init D_max={coords_init.shape[2]} is too small for "
+                f"max atom dim {d_max}"
+            )
     payload = rust_module().sae_manifold_fit_minimal(
         np.ascontiguousarray(x),
         [str(b) for b in bases],
@@ -527,6 +648,8 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         analytic_penalties=analytic_penalties_json,
         random_state=int(random_state),
         top_k=top_k_arg,
+        initial_logits=logits_init,
+        initial_coords=coords_init,
     )
     payload_dict = dict(payload)
     return ManifoldSAE.from_payload(
