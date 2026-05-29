@@ -1340,6 +1340,73 @@ pub fn pull_back_penalty_through_t(
     PenaltyMatrix::Dense(sym)
 }
 
+/// Pull a single raw block-local [`BlockwisePenalty`] back through the
+/// block's own diagonal reparameterisation `V_b` (the `(b, b)` block of
+/// the triangular T), producing a per-block-width compiled penalty.
+///
+/// The penalty's `local` is `pen.col_range.len()` square and covers a
+/// sub-region of the raw block at offset `pen.col_range.start` (which is
+/// block-local, i.e. relative to the block's first raw column). It is
+/// embedded into the full raw block width `v_block.nrows()` at that
+/// offset, then pulled back as `V_bᵀ · embed(S) · V_b`, giving a
+/// `(w_b_compiled × w_b_compiled)` symmetric `PenaltyMatrix::Dense`
+/// where `w_b_compiled == v_block.ncols()`.
+///
+/// This is the penalty contract a per-block `ParameterBlockSpec`
+/// requires: each block's penalty acts on that block's own compiled
+/// coordinate `θ_b`. The cross-block residualisation `R_{a→b}` carried
+/// in T's strict-upper triangle is absorbed into the *design* columns
+/// (the residualised emitted design `C_b V_b − A_{<b} R_b`), not into
+/// the penalty — exactly as the sibling per-block compile path
+/// [`apply_survival_parametric_compile_to_designs`] does via
+/// [`pull_back_penalties`]. Pulling the penalty back through the full
+/// joint T instead would yield a `(p_compiled × p_compiled)` dense
+/// matrix that cannot live in a single block's `penalties` slot and
+/// would violate the `p_b × p_b` block-spec validation.
+pub fn pull_back_blockwise_penalty_through_block_v(
+    pen: &crate::terms::smooth::BlockwisePenalty,
+    v_block: &Array2<f64>,
+) -> Result<PenaltyMatrix, String> {
+    let raw_p = v_block.nrows();
+    let compiled_p = v_block.ncols();
+    let block_p = pen.col_range.len();
+    let embed_start = pen.col_range.start;
+    let embed_end = pen.col_range.end;
+    if embed_end > raw_p {
+        return Err(format!(
+            "pull_back_blockwise_penalty_through_block_v: penalty col_range {embed_start}..{embed_end} \
+             exceeds block raw width {raw_p}"
+        ));
+    }
+    if pen.local.nrows() != block_p || pen.local.ncols() != block_p {
+        return Err(format!(
+            "pull_back_blockwise_penalty_through_block_v: penalty local is {}x{} but col_range \
+             width is {block_p}",
+            pen.local.nrows(),
+            pen.local.ncols(),
+        ));
+    }
+    let mut embedded = Array2::<f64>::zeros((raw_p, raw_p));
+    if block_p > 0 {
+        let mut dst = embedded.slice_mut(ndarray::s![embed_start..embed_end, embed_start..embed_end]);
+        for i in 0..block_p {
+            for j in 0..block_p {
+                dst[[i, j]] = pen.local[[i, j]];
+            }
+        }
+    }
+    // V_bᵀ · embed(S) · V_b → (compiled_p × compiled_p).
+    let temp = embedded.dot(v_block);
+    let pulled = v_block.t().dot(&temp);
+    let mut sym = Array2::<f64>::zeros((compiled_p, compiled_p));
+    for i in 0..compiled_p {
+        for j in 0..compiled_p {
+            sym[[i, j]] = 0.5 * (pulled[[i, j]] + pulled[[j, i]]);
+        }
+    }
+    Ok(PenaltyMatrix::Dense(sym))
+}
+
 /// Per-term-aware compiled designs + penalties + block-diagonal V
 /// matrices for the result-time β lift. The construction site swaps
 /// raw designs/penalties for these compiled versions before building
@@ -1662,16 +1729,11 @@ impl SmgsLiftViaT {
 /// parametric block designs (time/marginal/logslope). Slices the
 /// per-block diagonal of T into `V_b = T[raw_range_b, compiled_range_b]`
 /// (shape `p_b_raw × w_b_compiled`), wraps each channel's raw design via
-/// [`wrap_design_with_transform`], and pulls each per-term penalty back
-/// through the FULL triangular T via [`pull_back_penalty_through_t`] so
-/// cross-block coupling stored in T's off-diagonal slots feeds into the
-/// joint compiled-coord penalty.
-///
-/// The `*_partition` arguments describe the per-term sub-partition of
-/// each channel's raw column range (e.g. multiple marginal smooth terms
-/// each owning a contiguous slice of the marginal block's raw cols).
-/// They are used only to embed each input [`BlockwisePenalty`] into the
-/// joint raw width at the correct offset before pullback.
+/// [`wrap_design_with_transform`], and pulls each block's penalties back
+/// through that block's OWN `V_b` via
+/// [`pull_back_blockwise_penalty_through_block_v`], producing
+/// per-block-width `(w_b_compiled × w_b_compiled)` penalties — the shape
+/// a per-block `ParameterBlockSpec.penalties` slot requires.
 ///
 /// `map.raw_block_ranges` must equal three contiguous ranges in the
 /// order Time → Marginal → Logslope (matching the input designs).
@@ -1683,12 +1745,13 @@ impl SmgsLiftViaT {
 /// - `marginal_penalties` / `logslope_penalties` likewise — local to
 ///   their own channel's raw width.
 ///
-/// The pullback adds the channel's raw offset to each penalty's
-/// `col_range.start` before embedding into the joint raw width, so a
-/// marginal penalty with `col_range = 0..p_marg` is embedded at rows
-/// `p_time..(p_time + p_marg)` of the (raw_total × raw_total) embedded
-/// matrix, then pulled back through T to give a joint-width
-/// `(compiled_total × compiled_total)` Dense PenaltyMatrix.
+/// Each penalty's block-local `col_range` is embedded into the block's
+/// raw width and pulled back as `V_bᵀ S_b V_b`. The cross-block
+/// residualisation `R_{a→b}` carried in T's strict-upper triangle is
+/// absorbed into the residualised *design* columns, not the penalty, so
+/// the per-block penalty model stays exact for the highest-priority
+/// block (time, no anchor → `R = []`) and matches the sibling per-block
+/// compile path for the rest.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_compiled_map_to_designs(
     map: &crate::families::identifiability_compiler::CompiledMap,
@@ -1756,15 +1819,35 @@ pub fn apply_compiled_map_to_designs(
     let marg_out = wrap_design_with_transform(marginal_design, &v_marg, "compiled-map: marginal")?;
     let log_out = wrap_design_with_transform(logslope_design, &v_log, "compiled-map: logslope")?;
 
-    let time_offset = time_raw.start;
-    let marg_offset = marg_raw.start;
-    let log_offset = log_raw.start;
-
+    // Pull each block's penalties back through that block's OWN diagonal
+    // reparameterisation V_b (= the (b, b) block of T). This produces a
+    // per-block-width `(w_b_compiled × w_b_compiled)` penalty — the only
+    // shape a per-block `ParameterBlockSpec.penalties` slot accepts.
+    //
+    // The block-local penalty `V_bᵀ S_b V_b` is the correct per-block
+    // penalty: in raw coords the model penalises `γ_bᵀ S_b γ_b` on block
+    // b's own coefficients, and under the residualised reparameterisation
+    // the cross-block carry `R_{a→b}` lives entirely in the *design*
+    // columns (`C_b V_b − A_{<b} R_b`), not in the penalty. This matches
+    // the sibling per-block compile path
+    // (`apply_survival_parametric_compile_to_designs` → `pull_back_penalties`).
+    //
+    // Pulling penalties back through the full joint triangular T instead
+    // (`pull_back_penalty_through_t`) yields a `(p_compiled × p_compiled)`
+    // dense matrix whose off-diagonal couples θ_b to earlier blocks' θ_a;
+    // jamming that joint-width matrix into a single block's `penalties`
+    // produced the `block 0 penalty 0 must be 12x12, got 17x17` mismatch
+    // that surfaced as the `assert_valid_blockspecs` FFI panic.
     let pull_set = |pens: &[crate::terms::smooth::BlockwisePenalty],
-                    anchor_offset: usize|
-     -> Vec<PenaltyMatrix> {
+                    v_block: &Array2<f64>,
+                    channel: &str|
+     -> Result<Vec<PenaltyMatrix>, String> {
         pens.iter()
-            .map(|p| pull_back_penalty_through_t(p, anchor_offset, t))
+            .map(|p| {
+                pull_back_blockwise_penalty_through_block_v(p, v_block).map_err(|e| {
+                    format!("apply_compiled_map_to_designs: {channel} penalty pullback: {e}")
+                })
+            })
             .collect()
     };
 
@@ -1774,9 +1857,9 @@ pub fn apply_compiled_map_to_designs(
         time_design_derivative_exit: time_deriv_out,
         marginal_design: marg_out,
         logslope_design: log_out,
-        time_penalties: pull_set(time_penalties, time_offset),
-        marginal_penalties: pull_set(marginal_penalties, marg_offset),
-        logslope_penalties: pull_set(logslope_penalties, log_offset),
+        time_penalties: pull_set(time_penalties, &v_time, "time")?,
+        marginal_penalties: pull_set(marginal_penalties, &v_marg, "marginal")?,
+        logslope_penalties: pull_set(logslope_penalties, &v_log, "logslope")?,
         t_full: t.clone(),
     })
 }
@@ -1940,10 +2023,13 @@ pub struct CompiledSurvivalDesignsVMExact {
     pub time_design_derivative_exit: DesignMatrix,
     pub marginal_design: DesignMatrix,
     pub logslope_design: DesignMatrix,
-    /// Per-term penalties, each pulled back through the full triangular
-    /// T. The result is a full-width `PenaltyMatrix::Dense` (joint
-    /// p_compiled × p_compiled) — cross-block coupling can be nonzero
-    /// when `R_{a→b}` is nonzero.
+    /// Per-block penalties, each pulled back through that block's OWN
+    /// diagonal reparameterisation `V_b` as `V_bᵀ S_b V_b`. The result
+    /// is a per-block-width `PenaltyMatrix::Dense`
+    /// (`w_b_compiled × w_b_compiled`) — the shape a per-block
+    /// `ParameterBlockSpec.penalties` slot requires. Cross-block
+    /// residualisation `R_{a→b}` is carried by the residualised design
+    /// columns, not the penalty.
     pub time_penalties: Vec<PenaltyMatrix>,
     pub marginal_penalties: Vec<PenaltyMatrix>,
     pub logslope_penalties: Vec<PenaltyMatrix>,

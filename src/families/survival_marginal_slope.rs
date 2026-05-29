@@ -21335,13 +21335,18 @@ pub fn fit_survival_marginal_slope_terms(
             ),
         ];
         // V+M-exact cutover: when the active cutover fired, the
-        // `*_penalties_vm` side bindings carry the full-width Dense
-        // penalty matrices pulled back through the triangular T (T^T S
-        // T). Substitute them in for each block's per-block-converted
-        // Blockwise penalties so the inner solver sees the exact
-        // compiled-coord penalties. The penalty count is invariant
-        // under the pullback so cursor accounting based on
-        // `design.penalties.len()` (raw widths) still matches.
+        // `*_penalties_vm` side bindings carry per-block-width Dense
+        // penalty matrices pulled back through each block's OWN diagonal
+        // reparameterisation V_b (V_bᵀ S_b V_b), sized
+        // `w_b_compiled × w_b_compiled`. Substitute them in for each
+        // block's per-block-converted Blockwise penalties so the inner
+        // solver sees the exact compiled-coord penalties. The penalty
+        // count is invariant under the pullback so cursor accounting based
+        // on `design.penalties.len()` (raw widths) still matches. The
+        // cross-block residualisation R_{a→b} is carried by the
+        // residualised compiled *design* columns, not the penalty, so
+        // each block's penalty stays per-block-width — matching the
+        // `ParameterBlockSpec` p_b × p_b validation contract.
         if let Some(ref pens) = time_penalties_vm {
             blocks[0].penalties = pens.clone();
         }
@@ -21630,6 +21635,17 @@ pub fn fit_survival_marginal_slope_terms(
         &logslope_design,
         FlexActivation::On,
     )?;
+    // Validate the assembled block specs at the construction boundary so any
+    // design/penalty width inconsistency (e.g. a compiled-map penalty that
+    // does not match its block's reduced compiled width) surfaces here as a
+    // clean typed error string. Without this, the inconsistency would only be
+    // caught by the internal `assert_valid_blockspecs` invariant guards inside
+    // the capability-query hooks (`outer_hyper_hessian_dense_available`, …)
+    // reached from `custom_family_outer_derivatives` below, firing a bare
+    // `assert!` panic that PyO3 re-raises as an opaque "panicked inside Rust
+    // boundary" GamError instead of an actionable message.
+    crate::families::custom_family::validate_blockspecs(&initial_blocks)
+        .map_err(|reason| format!("[survival-marginal-slope] assembled block specs invalid: {reason}"))?;
     let initial_family = make_family(
         &marginal_design,
         &logslope_design,
