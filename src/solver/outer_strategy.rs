@@ -4083,6 +4083,14 @@ enum CompassSearchOutcome {
     },
 }
 
+/// Initial step length for the auxiliary coordinate compass search, in
+/// θ-space (log-scale baseline/inverse-link parameters). A step of 1.0
+/// corresponds to a factor-`e` move per coordinate — large enough to escape
+/// a poor seed, small enough that `ceil(log2(1.0 / tolerance))` contractions
+/// certify stationarity within a bounded poll budget. The dispatch sizes its
+/// poll budget against this value, so they must stay in sync.
+const COMPASS_INIT_STEP: f64 = 1.0;
+
 /// Coordinate compass search with bound clamping.
 ///
 /// Why this method is correct for derivative-free aux optimization:
@@ -5439,33 +5447,49 @@ fn run_outer_with_plan(
         // seed; route the underlying InnerFailure through the same
         // SeedRejection accounting any other pre-validation rejection
         // would take, then continue to the next seed.
-        let prewarm_start = std::time::Instant::now();
-        match crate::solver::estimate::reml::continuation::prime_outer_seed(
-            obj,
-            seed,
-            &bounds_template.1,
-        ) {
-            Ok(summary) => {
-                // Skip the log line on collapse — that's the
-                // zero-overhead easy-fit case and a log per seed would
-                // be noise. Anything else is a real anneal worth
-                // surfacing so biobank-scale runs are diagnosable.
-                if !summary.collapsed {
-                    log::info!(
-                        "[OUTER] {context}: continuation pre-warm seed {seed_idx} steps={} elapsed={:.3}s",
-                        summary.steps_accepted,
-                        prewarm_start.elapsed().as_secs_f64(),
-                    );
+        //
+        // The pre-warm is a warm-start for gradient-bearing PIRLS-inner
+        // REML objectives: it walks ρ via `eval_with_order(_, ValueAndGradient)`
+        // and carries the converged inner β forward through each step's
+        // `inner_beta_hint`. The derivative-free `Solver::CompassSearch`
+        // auxiliary path (survival/inverse-link baseline θ) has neither
+        // precondition — by contract it answers only `eval_cost` (its
+        // `eval`/`eval_with_order` closure is "unreachable by construction")
+        // and it carries no inner-β slot across probes. Running the pre-warm
+        // there would route straight into that error stub and reject every
+        // seed, so skip it: the direct search starts from `seed` directly,
+        // exactly as its dispatch (`Solver::CompassSearch` arm below) expects.
+        if the_plan.solver != Solver::CompassSearch {
+            let prewarm_start = std::time::Instant::now();
+            match crate::solver::estimate::reml::continuation::prime_outer_seed(
+                obj,
+                seed,
+                &bounds_template.1,
+            ) {
+                Ok(summary) => {
+                    // Skip the log line on collapse — that's the
+                    // zero-overhead easy-fit case and a log per seed would
+                    // be noise. Anything else is a real anneal worth
+                    // surfacing so biobank-scale runs are diagnosable.
+                    if !summary.collapsed {
+                        log::info!(
+                            "[OUTER] {context}: continuation pre-warm seed {seed_idx} steps={} elapsed={:.3}s",
+                            summary.steps_accepted,
+                            prewarm_start.elapsed().as_secs_f64(),
+                        );
+                    }
                 }
-            }
-            Err(cf) => {
-                let msg = format!(
-                    "continuation pre-warm refused before seed eval: {}",
-                    cf.message()
-                );
-                log::warn!("[OUTER] {context}: rejecting seed {seed_idx} (continuation): {msg}");
-                rejection_reasons.push((seed_idx, "validation", msg));
-                continue 'seed_attempts;
+                Err(cf) => {
+                    let msg = format!(
+                        "continuation pre-warm refused before seed eval: {}",
+                        cf.message()
+                    );
+                    log::warn!(
+                        "[OUTER] {context}: rejecting seed {seed_idx} (continuation): {msg}"
+                    );
+                    rejection_reasons.push((seed_idx, "validation", msg));
+                    continue 'seed_attempts;
+                }
             }
         }
         let t_seed_start = std::time::Instant::now();
@@ -6235,7 +6259,7 @@ fn run_outer_with_plan(
             Solver::CompassSearch => {
                 // Aux direct-search: uses cost values only, never queries
                 // gradient or Hessian. config.tolerance is the step-length
-                // floor, config.max_iter is the total-poll budget.
+                // floor, config.max_iter is the requested poll budget.
                 let projected_seed = project_to_bounds(seed, Some(&bounds_template));
                 let seed_cost = obj.eval_cost(&projected_seed).map_err(|err| {
                     EstimationError::RemlOptimizationFailed(format!(
@@ -6253,15 +6277,41 @@ fn run_outer_with_plan(
                 started_seeds += 1;
                 seed_slot = started_seeds;
                 let (lo, hi) = &bounds_template;
+                // A compass search only emits its first-order stationarity
+                // certificate (Kolda-Lewis-Torczon Thm 3.3) once the step
+                // length contracts below `tolerance`. Starting from
+                // `COMPASS_INIT_STEP`, that takes
+                // `ceil(log2(init_step / tolerance))` non-improving sweeps,
+                // and each sweep polls all `2·dim` coordinate directions
+                // before halving. A poll budget below that contraction cost
+                // can therefore *never* reach the certificate: the search
+                // always returns `BudgetExhausted`, which survival/inverse-
+                // link callers turn into a hard "did not converge" error —
+                // even on perfectly well-posed data. (This is exactly what
+                // sank the survival non-linear-baseline path once the
+                // continuation-pre-warm gate above let it run at all.) Floor
+                // the budget at the contraction cost plus an equal allowance
+                // for improving (descent) moves, so the search can both
+                // descend to the optimum and certify it. A caller asking for
+                // more via `max_iter` still wins; this only raises budgets
+                // that are too small to be self-consistent.
+                let dim = projected_seed.len().max(1);
+                let contraction_sweeps = (COMPASS_INIT_STEP / config.tolerance)
+                    .log2()
+                    .ceil()
+                    .max(1.0) as usize;
+                let contraction_polls = contraction_sweeps.saturating_mul(2 * dim);
+                let certification_budget = contraction_polls.saturating_mul(2);
+                let max_polls = config.max_iter.max(certification_budget);
                 let outcome = compass_search_outer(
                     obj,
                     projected_seed,
                     seed_cost,
                     lo.view(),
                     hi.view(),
-                    1.0,
+                    COMPASS_INIT_STEP,
                     config.tolerance,
-                    config.max_iter,
+                    max_polls,
                 );
                 match outcome {
                     CompassSearchOutcome::Converged { point, cost, polls } => Ok(OuterResult {
@@ -6279,7 +6329,7 @@ fn run_outer_with_plan(
                     CompassSearchOutcome::BudgetExhausted { point, cost, polls } => {
                         log::warn!(
                             "[OUTER warning] {context}: compass search exhausted max_polls={} at best_cost={:.6e}",
-                            config.max_iter,
+                            max_polls,
                             cost,
                         );
                         Ok(OuterResult {
