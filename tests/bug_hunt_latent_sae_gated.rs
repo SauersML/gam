@@ -161,15 +161,21 @@ fn reml_criterion_keeps_alpha_finite_on_collapsing_axis() {
         [0.5, -1.0e-6]
     ];
     let target = array![[0.4], [1.1], [-0.7], [0.2]];
-    let mut term = build_collapse_probe_term(coords);
+    let base_term = build_collapse_probe_term(coords);
 
     let log_alpha_grid = [-6.0_f64, -2.0, 0.0, 2.0, 6.0, 10.0, 16.0];
     let mut best = (f64::INFINITY, f64::NAN);
     for &la in &log_alpha_grid {
+        // Fresh term per grid point: reml_criterion runs the inner (t,β) fit
+        // IN PLACE, so reusing one term would make each evaluation start from
+        // the previous α's fitted state (path-dependent, monotone drift). The
+        // criterion is a function of ρ from a FIXED initial state, so each
+        // sweep point must start from the same baseline.
+        let mut term = base_term.clone();
         // Axis 0 keeps a mild prior; axis 1 (the collapsing one) is swept.
         let rho = SaeManifoldRho::new(0.0, 0.0, vec![array![0.0, la]]);
         let (v, _loss) = term
-            .reml_criterion(target.view(), &rho, None, 3, 1.0, 1.0e-6, 1.0e-6)
+            .reml_criterion(target.view(), &rho, None, 50, 1.0, 1.0e-6, 1.0e-6)
             .expect("criterion should evaluate");
         assert!(
             v.is_finite(),
@@ -223,15 +229,22 @@ fn reml_criterion_has_interior_minimum_in_log_lambda_smooth() {
         array![[1.0, -1.0], [-1.0, 1.0]],
     )
     .expect("atom should build");
-    let mut term = SaeManifoldTerm::new(vec![atom], assignment).expect("term should build");
+    let base_term = SaeManifoldTerm::new(vec![atom], assignment).expect("term should build");
     let target = array![[0.4], [1.1], [-0.7], [0.9], [-1.0], [0.3]];
 
     let log_lambda_grid = [-8.0_f64, -4.0, -1.0, 1.0, 4.0, 8.0, 12.0];
     let mut best = (f64::INFINITY, f64::NAN);
     for &ll in &log_lambda_grid {
+        // Fresh term per grid point — reml_criterion fits (t,β) in place, so a
+        // shared term would carry the previous λ's fit forward and make the
+        // sweep path-dependent (monotone), masking the true interior optimum.
+        // Run the inner fit to convergence (50 iters) so loss.total() and
+        // ½log|H| reflect the genuine λ-conditioned penalised optimum the REML
+        // criterion is defined at.
+        let mut term = base_term.clone();
         let rho = SaeManifoldRho::new(0.0, ll, vec![array![0.0]]);
         let (v, _loss) = term
-            .reml_criterion(target.view(), &rho, None, 3, 1.0, 1.0e-6, 1.0e-6)
+            .reml_criterion(target.view(), &rho, None, 50, 1.0, 1.0e-6, 1.0e-6)
             .expect("criterion should evaluate");
         assert!(
             v.is_finite(),
@@ -273,7 +286,7 @@ fn efs_ard_fixed_point_recovers_cost_criterion_argmin_and_stays_finite() {
         target.clone(),
         None,
         init_rho.clone(),
-        3,
+        50,
         1.0,
         1.0e-6,
         1.0e-6,
@@ -309,16 +322,20 @@ fn efs_ard_fixed_point_recovers_cost_criterion_argmin_and_stays_finite() {
     // Cross-check: the EFS-converged α minimizes the v1 cost criterion. Sweep
     // log α on axis 1 with all other ρ at the EFS optimum and confirm the
     // criterion at the EFS α is no worse than its neighbours (interior min).
-    let mut crit_term = term;
-    let cost_at = |t: &mut SaeManifoldTerm, la1: f64| -> f64 {
+    // Each cost_at call clones a FRESH term from the baseline — reml_criterion
+    // fits (t,β) in place, so a shared term would make the three probes
+    // path-dependent. Inner fit runs to convergence (50 iters).
+    let base_term = term;
+    let cost_at = |la1: f64| -> f64 {
+        let mut t = base_term.clone();
         let rho = SaeManifoldRho::new(rho_flat[0], rho_flat[1], vec![array![rho_flat[2], la1]]);
-        t.reml_criterion(target.view(), &rho, None, 3, 1.0, 1.0e-6, 1.0e-6)
+        t.reml_criterion(target.view(), &rho, None, 50, 1.0, 1.0e-6, 1.0e-6)
             .expect("criterion should evaluate")
             .0
     };
-    let v_star = cost_at(&mut crit_term, converged_log_alpha1);
-    let v_lo = cost_at(&mut crit_term, converged_log_alpha1 - 1.0);
-    let v_hi = cost_at(&mut crit_term, converged_log_alpha1 + 1.0);
+    let v_star = cost_at(converged_log_alpha1);
+    let v_lo = cost_at(converged_log_alpha1 - 1.0);
+    let v_hi = cost_at(converged_log_alpha1 + 1.0);
     assert!(
         v_star <= v_lo + 1.0e-6 && v_star <= v_hi + 1.0e-6,
         "EFS fixed-point α must sit at (or below) the v1 cost-criterion minimum: \

@@ -56,7 +56,7 @@ fn auc(scores: &[f64], labels: &[f64]) -> f64 {
     let sum_ranks_pos: f64 = ranks
         .iter()
         .zip(labels)
-        .filter(|(_, &y)| y > 0.5)
+        .filter(|(_, y)| **y > 0.5)
         .map(|(r, _)| *r)
         .sum();
     (sum_ranks_pos - n_pos * (n_pos + 1.0) / 2.0) / (n_pos * n_neg)
