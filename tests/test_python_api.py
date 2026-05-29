@@ -401,6 +401,64 @@ def test_sklearn_classifier_roundtrip() -> None:
     )
 
 
+def test_sklearn_classifier_string_labels_roundtrip() -> None:
+    """Regression for issue #389: GAMClassifier hardcoded classes_=[0,1] and
+    never encoded y, silently mispredicting any non-{0,1} label space.
+
+    Pre-fix: classes_ == [0, 1] and predict returns 0/1, so accuracy against
+    string labels is 0.0 on every fold; here we assert the post-fix behaviour
+    that classes_ reflects the observed labels and predict round-trips them.
+    """
+    rng = np.random.default_rng(0)
+    n = 200
+    x = rng.uniform(-2.0, 2.0, n)
+    y_int = (rng.uniform(size=n) < 1.0 / (1.0 + np.exp(-x))).astype(int)
+    y_str = np.where(y_int == 1, "pos", "neg")
+    X = pd.DataFrame({"x1": x})
+
+    clf = GAMClassifier(formula="y ~ s(x1)", family="binomial").fit(X, y_str)
+    assert clf.classes_.tolist() == ["neg", "pos"], (
+        f"classes_ must reflect observed labels; got {clf.classes_!r}"
+    )
+    predicted = np.asarray(clf.predict(X))
+    assert set(np.unique(predicted)).issubset({"neg", "pos"}), (
+        f"predict must return labels from classes_; got {np.unique(predicted)!r}"
+    )
+    # In-sample accuracy on this logistic problem should clear chance by a
+    # wide margin once the labels are encoded correctly; pre-fix the
+    # comparison is between '0/1' ints and 'pos/neg' strings, so accuracy is 0.
+    accuracy = float((predicted == y_str).mean())
+    assert accuracy > 0.7, (
+        f"GAMClassifier in-sample accuracy on string labels = {accuracy:.3f}; "
+        "must clear 0.7 once labels are encoded (pre-fix was 0.0)."
+    )
+
+
+def test_sklearn_classifier_pm1_labels_roundtrip() -> None:
+    """{-1, +1} integer labels must work the same as string labels — both
+    were silently mispredicted before the encoder fix."""
+    rng = np.random.default_rng(1)
+    n = 200
+    x = rng.uniform(-2.0, 2.0, n)
+    y01 = (rng.uniform(size=n) < 1.0 / (1.0 + np.exp(-x))).astype(int)
+    y_pm = np.where(y01 == 1, 1, -1).astype(int)
+    X = pd.DataFrame({"x1": x})
+
+    clf = GAMClassifier(formula="y ~ s(x1)", family="binomial").fit(X, y_pm)
+    assert clf.classes_.tolist() == [-1, 1], (
+        f"classes_ must reflect observed labels; got {clf.classes_!r}"
+    )
+    predicted = np.asarray(clf.predict(X))
+    assert set(np.unique(predicted)).issubset({-1, 1}), (
+        f"predict must return labels from classes_; got {np.unique(predicted)!r}"
+    )
+    accuracy = float((predicted == y_pm).mean())
+    assert accuracy > 0.7, (
+        f"GAMClassifier in-sample accuracy on {{-1, +1}} labels = "
+        f"{accuracy:.3f}; must clear 0.7 once labels are encoded."
+    )
+
+
 def test_predict_rejects_schema_mismatch() -> None:
     model = gamfit.fit(training_rows(), "y ~ x")
 
