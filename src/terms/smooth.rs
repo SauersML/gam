@@ -13035,6 +13035,27 @@ fn fit_score(fit: &UnifiedFitResult) -> f64 {
     }
 }
 
+/// Classify an outer-evaluation error as a *recoverable trial-point
+/// infeasibility* versus a genuine fatal failure.
+///
+/// The spatial-κ / anisotropy outer optimizer probes a sequence of trial
+/// hyperparameters. At an extreme trial point the realized kernel design or
+/// its ψ-derivatives may simply be non-constructible — e.g. a learned
+/// per-axis log-scale stretches the anisotropic distance `r = |Λh|` until the
+/// Duchon polyharmonic blocks `r^(2m−d)` overflow, or a degenerate metric
+/// collapses two centers onto a non-C² collision. Those points lie outside
+/// the model's feasible domain; the principled response is to treat them like
+/// the cost-only path already does (objective `+∞`) so the line-search /
+/// trust-region solver retreats, rather than aborting the entire REML fit.
+///
+/// A `BasisError` is exactly this class: it means "the basis/design cannot be
+/// built at this hyperparameter". Everything else (PIRLS divergence wired to a
+/// distinct variant, layout/topology invariants, over-parameterization) stays
+/// fatal so genuine bugs are never masked.
+fn is_recoverable_trial_point_error(err: &EstimationError) -> bool {
+    matches!(err, EstimationError::BasisError(_))
+}
+
 fn require_successful_spatial_optimization_result<T>(
     initial_score: f64,
     result: Result<Option<(T, f64)>, EstimationError>,
@@ -15576,6 +15597,20 @@ fn try_exact_joint_spatial_aniso_optimization(
                 hessian: hess,
                 inner_beta_hint: None,
             }),
+            // A trial hyperparameter at which the anisotropic kernel design /
+            // ψ-derivatives are non-constructible is an infeasible point, not
+            // a fatal error: the gradient/Hessian path must retreat exactly as
+            // the cost-only path (which already returns +∞) does. Returning
+            // `OuterEval::infeasible` keeps the two paths symmetric so a single
+            // bad probe — e.g. an anisotropy that overflows the Duchon radial
+            // kernel — no longer aborts the whole REML optimization.
+            Err(err) if is_recoverable_trial_point_error(&err) => {
+                log::debug!(
+                    "[spatial-aniso-joint] trial point infeasible (kernel design \
+                     not constructible at theta={theta:?}): {err}; retreating",
+                );
+                Ok(OuterEval::infeasible(theta_dim))
+            }
             Err(err) => Err(err),
         }
     };
@@ -15929,6 +15964,18 @@ fn try_exact_joint_spatial_isotropic_optimization(
                 hessian: hess,
                 inner_beta_hint: None,
             }),
+            // Mirror the anisotropic path: a trial κ at which the kernel design
+            // / ψ-derivatives cannot be constructed is an infeasible point, so
+            // the gradient/Hessian path retreats (`+∞`) rather than aborting the
+            // whole REML fit. Keeps the gradient path symmetric with the
+            // cost-only path, which already maps the same error to `+∞`.
+            Err(err) if is_recoverable_trial_point_error(&err) => {
+                log::debug!(
+                    "[spatial-iso-joint] trial point infeasible (kernel design \
+                     not constructible at theta={theta:?}): {err}; retreating",
+                );
+                Ok(OuterEval::infeasible(theta_dim))
+            }
             Err(err) => Err(err),
         }
     };
