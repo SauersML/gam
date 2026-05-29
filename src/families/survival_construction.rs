@@ -662,19 +662,27 @@ where
     let target = initial.target;
     let lower = seed.mapv(|v| v - 6.0);
     let upper = seed.mapv(|v| v + 6.0);
-    // CompassSearch on a 3-dim baseline (α, λ, γ) at tol=1e-4 on a smooth REML
-    // surface converges in well under 60 probes; previously this was 240, which
-    // protected against essentially nothing useful while letting pathological
-    // fits eat ~50× the time they should. Every probe runs a complete inner
-    // BFGS over the smoothing log-λ from cold start (no ρ warm-start across
-    // probes), so probe count is the dominant per-fit cost for the
-    // location-scale + non-linear baseline path that lacks the analytic
-    // baseline gradient the marginal-slope path has at
+    // CompassSearch over the small baseline θ (2-dim weibull/gompertz α,λ;
+    // 3-dim gompertz-makeham α,λ,γ) at tol=1e-4 on a smooth REML surface.
+    // Every probe runs a complete inner BFGS over the smoothing log-λ from
+    // cold start (no ρ warm-start across probes), so probe count is the
+    // dominant per-fit cost for this non-linear-baseline path, which lacks
+    // the analytic baseline gradient the marginal-slope path has at
     // `optimize_survival_baseline_config_with_gradient`.
+    //
+    // We do NOT pin a magic poll cap here. A direct search can only certify
+    // first-order stationarity once its step contracts below tol, which from
+    // init_step=1.0 takes ceil(log2(1/tol))·2·dim polls (≈56 for dim=2, ≈84
+    // for dim=3) — so any fixed cap below that (the prior `60`) made dim≥2
+    // baselines report spurious non-convergence. The CompassSearch dispatch
+    // now floors the budget at that contraction cost plus a descent
+    // allowance, so it is correct for every dim; `max_iter` here is only an
+    // upper request, kept generous so genuinely hard surfaces can take the
+    // descent steps they need before certifying.
     let problem = OuterProblem::new(dim)
         .with_solver_class(SolverClass::AuxiliaryGradientFree)
         .with_tolerance(1e-4)
-        .with_max_iter(60)
+        .with_max_iter(400)
         .with_bounds(lower, upper)
         .with_initial_rho(seed.clone())
         .with_seed_config(crate::seeding::SeedConfig {
