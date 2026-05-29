@@ -4449,6 +4449,10 @@ const PREFERRED_PREDICTION_COLUMNS: &[&str] = &[
     "std_error",
     "mean_lower",
     "mean_upper",
+    // Issue #365: location-scale / GAMLSS families emit the fitted per-row
+    // distribution scale (e.g. Gaussian σ) so the learned `noise_formula`
+    // function is retrievable from Python; ordered after the mean columns.
+    "noise_scale",
 ];
 
 struct OrderedPredictionColumnEntries(Vec<(String, serde_json::Value)>);
@@ -13439,6 +13443,39 @@ fn gaussian_reml_fit_formula_table_impl(
         ));
     }
 
+    // The general REML driver canonicalizes the penalty list before fitting and
+    // SILENTLY DROPS any block whose local matrix has numerical rank 0 (or a
+    // ridge with non-positive scale): see
+    // `construction::canonicalize_penalty_specs`. The surviving penalties are
+    // compacted, so `fit.lambdas` / `inference.edf_by_block` are reported in
+    // canonical-compacted order — NOT in `s_list` order. A rigid
+    // `output * m + block` stride would therefore misalign per-coordinate λ/edf
+    // across tangent coordinates whenever any block canonicalizes away.
+    //
+    // Recover the canonical→`s_list` mapping by replaying the exact same
+    // per-spec canonicalization the solver ran. `s_list` was built in
+    // `for output { for block }` order, so entry `i` originates from tangent
+    // coordinate `i / m`, formula block `i % m`. We record, for each surviving
+    // canonical position, its origin `(output, block)` and its penalty rank
+    // (needed to partition the joint effective df into per-coordinate shares).
+    let specs: Vec<gam::estimate::PenaltySpec> = s_list
+        .iter()
+        .map(gam::estimate::PenaltySpec::from_blockwise_ref)
+        .collect();
+    let mut survivor_origin: Vec<(usize, usize, f64)> = Vec::with_capacity(s_list.len());
+    for (i, spec) in specs.iter().enumerate() {
+        if let Some(canonical) = gam::construction::canonicalize_penalty_spec(
+            spec,
+            p_total,
+            i,
+            "shared_tangent_gaussian_reml",
+        )
+        .map_err(|err| err.to_string())?
+        {
+            survivor_origin.push((i / m, i % m, canonical.rank() as f64));
+        }
+    }
+
     // Unpack per-output coefficients and recover the unwhitened fitted tangent
     // values, residual variance, and per-coordinate smoothing diagnostics.
     let mut coefficients = Array2::<f64>::zeros((k, d));
@@ -13449,7 +13486,6 @@ fn gaussian_reml_fit_formula_table_impl(
         }
     }
     let fitted = x.dot(&coefficients);
-    let mut sigma2 = Array1::<f64>::zeros(d);
     let mut weight_sum = 0.0;
     for row in 0..n {
         weight_sum += weights[row];
@@ -13458,30 +13494,56 @@ fn gaussian_reml_fit_formula_table_impl(
         .inference
         .as_ref()
         .map(|inf| inf.edf_by_block.clone())
-        .unwrap_or_else(|| vec![0.0; s_list.len()]);
+        .unwrap_or_else(|| vec![0.0; survivor_origin.len()]);
+    if fit.lambdas.len() != survivor_origin.len() || edf_by_block.len() != survivor_origin.len() {
+        return Err(format!(
+            "shared-tangent Gaussian REML smoothing-diagnostic length mismatch: solver reported \
+             {} lambdas and {} edf entries but {} penalty blocks survived canonicalization",
+            fit.lambdas.len(),
+            edf_by_block.len(),
+            survivor_origin.len()
+        ));
+    }
+
+    // Scatter the canonical-order λ/edf back into the `(D, M)` grid by origin.
+    // A block dropped during canonicalization (numerical rank 0) carries no
+    // smoothing parameter and contributes zero effective df, so its grid cell
+    // is left at 0 — never NaN-padded by a stride that ran off the end.
     let mut edf = Array2::<f64>::zeros((d, m));
+    let mut lambdas = Array2::<f64>::zeros((d, m));
+    // Per-output penalized-block rank and effective df, used to partition the
+    // joint effective df into per-coordinate residual-variance denominators.
+    let mut penalized_rank = vec![0.0_f64; d];
+    let mut penalized_edf = vec![0.0_f64; d];
+    for (canonical_pos, &(output, block, rank)) in survivor_origin.iter().enumerate() {
+        let edf_value = edf_by_block[canonical_pos];
+        edf[[output, block]] = edf_value;
+        lambdas[[output, block]] = fit.lambdas[canonical_pos];
+        penalized_rank[output] += rank;
+        penalized_edf[output] += edf_value;
+    }
+
+    // Per-coordinate residual scale uses the canonical Gaussian denominator
+    // `n - edf_output`, where `edf_output` is the FULL effective df owned by
+    // that coordinate's `k` columns — unpenalized columns (intercept,
+    // parametric terms) each count 1, penalized columns count their bounded
+    // edf. This mirrors `n - edf_total` in the core Gaussian scale
+    // (`smooth.rs`) and `n - k` in the sibling closed-form multi-output path:
+    //   edf_output = (k - penalized_rank_output) + penalized_edf_output
+    // i.e. the `penalized_rank` columns shrink to `penalized_edf` df while the
+    // remaining `k - penalized_rank` columns are unpenalized and count fully.
+    // Omitting the `(k - penalized_rank)` unpenalized term (as the prior code
+    // did) overstates residual df and biases sigma2 low.
+    let mut sigma2 = Array1::<f64>::zeros(d);
     for output in 0..d {
-        let mut output_edf = 0.0;
-        for block in 0..m {
-            let idx = output * m + block;
-            let value = edf_by_block.get(idx).copied().unwrap_or(0.0);
-            edf[[output, block]] = value;
-            output_edf += value;
-        }
-        let denom = (weight_sum - output_edf).max(1.0);
+        let edf_output = (k as f64 - penalized_rank[output]) + penalized_edf[output];
+        let denom = (weight_sum - edf_output).max(1.0);
         let mut ss = 0.0;
         for row in 0..n {
             let resid = y[[row, output]] - fitted[[row, output]];
             ss += weights[row] * resid * resid;
         }
         sigma2[output] = ss / denom;
-    }
-    let mut lambdas = Array2::<f64>::zeros((d, m));
-    for output in 0..d {
-        for block in 0..m {
-            let idx = output * m + block;
-            lambdas[[output, block]] = fit.lambdas.get(idx).copied().unwrap_or(f64::NAN);
-        }
     }
 
     Ok(TangentRemlMultiResult {
@@ -24340,6 +24402,23 @@ fn predict_columns(
         columns.insert("mean".to_string(), prediction.mean.to_vec());
     }
 
+    // Issue #365 (secondary defect): location-scale / GAMLSS families fit a
+    // per-observation distribution scale (e.g. Gaussian `sigma = exp(noise η)`)
+    // that was previously unreachable from Python — `predict_columns` only ever
+    // emitted the location block (`mean` / `linear_predictor`), so a user could
+    // fit a smooth `noise_formula` but never retrieve the scale function it
+    // learned. The scale is a model property independent of the uncertainty
+    // knob, so it is emitted in both branches. Families without a response-side
+    // scale (single-block GLMs, binomial location-scale, survival, …) return
+    // `None` from `predict_noise_scale` and contribute no column, leaving the
+    // standard prediction schema untouched.
+    if let Some(noise_scale) = predictor
+        .predict_noise_scale(&predict_input)
+        .map_err(|err| format!("noise-scale prediction failed: {err}"))?
+    {
+        columns.insert("noise_scale".to_string(), noise_scale.to_vec());
+    }
+
     Ok(columns)
 }
 
@@ -24360,16 +24439,12 @@ fn columns_to_array(columns: BTreeMap<String, Vec<f64>>) -> Result<Array2<f64>, 
 }
 
 fn ordered_prediction_column_values(columns: &BTreeMap<String, Vec<f64>>) -> Vec<Vec<f64>> {
-    let preferred = [
-        "linear_predictor",
-        "mean",
-        "std_error",
-        "mean_lower",
-        "mean_upper",
-    ];
+    // Single source of truth for the user-facing column order; the numpy
+    // (Array2) path and the Python dict path (`ordered_prediction_columns`)
+    // must agree, so both read `PREFERRED_PREDICTION_COLUMNS`.
     let mut out = Vec::<Vec<f64>>::new();
     let mut seen = BTreeSet::<&str>::new();
-    for key in preferred {
+    for key in PREFERRED_PREDICTION_COLUMNS.iter().copied() {
         if let Some(values) = columns.get(key) {
             out.push(values.clone());
             seen.insert(key);
@@ -29668,6 +29743,56 @@ mod batch_tests {
             );
         }
         assert_eq!(fitted[[1, 2, 0]], 0.0);
+    }
+
+    #[test]
+    fn ordered_prediction_columns_places_noise_scale_after_mean_columns() {
+        // Issue #365 (secondary defect): the fitted location-scale `noise_scale`
+        // must be a first-class prediction column reachable from Python and
+        // ordered with the other model outputs, not appended arbitrarily after
+        // user/id columns. A location-scale prediction emits the standard mean
+        // columns plus `noise_scale`; the ordered schema must interleave it
+        // right after `mean_upper` (the last preferred mean column) and keep any
+        // non-preferred extras behind the preferred block.
+        let columns_json = r#"{
+            "mean_upper": [2.0],
+            "noise_scale": [0.7],
+            "linear_predictor": [1.0],
+            "row_id": [42.0],
+            "mean": [1.1],
+            "std_error": [0.2],
+            "mean_lower": [0.1]
+        }"#;
+        let ordered_json =
+            ordered_prediction_columns(columns_json).expect("ordering must succeed");
+        // `ordered_prediction_columns` serialises keys in emission order via the
+        // manual `ordered_json_object_string` writer, so the textual byte order
+        // of the `"key":` tokens is the authoritative column order (round-trip
+        // through serde_json::Value would re-sort and lose it).
+        let expected = [
+            "linear_predictor",
+            "mean",
+            "std_error",
+            "mean_lower",
+            "mean_upper",
+            "noise_scale",
+            "row_id",
+        ];
+        let positions: Vec<usize> = expected
+            .iter()
+            .map(|key| {
+                ordered_json
+                    .find(&format!("\"{key}\":"))
+                    .unwrap_or_else(|| panic!("emitted JSON must contain key {key}: {ordered_json}"))
+            })
+            .collect();
+        for w in positions.windows(2) {
+            assert!(
+                w[0] < w[1],
+                "noise_scale must be ordered immediately after the mean columns and \
+                 before non-preferred extras; got JSON {ordered_json}"
+            );
+        }
     }
 
     #[test]

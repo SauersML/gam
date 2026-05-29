@@ -27158,6 +27158,92 @@ mod tests {
         assert_eq!(fit.fit.block_states.len(), 2);
     }
 
+    /// Issue #365 (primary symptom): a *homoscedastic* Gaussian fit with a
+    /// smooth `noise_formula` must NOT degrade the mean fit. The released
+    /// repro fed `y = 1 + 0.7x + sin(x) + N(0, σ²)` with constant σ to a model
+    /// carrying a smooth mean *and* a smooth log-σ block and got a mean RMSE of
+    /// ~1.5 (the predicted mean range collapsed inward toward the grand mean),
+    /// versus ~0.03 for a plain GAM. A smooth scale block that is free to
+    /// wiggle can absorb mean-residual structure into the variance, which lets
+    /// the joint REML over-smooth the mean block. This test pins the headline
+    /// contract directly: adding the smooth scale block to homoscedastic data
+    /// must leave the recovered mean tracking the truth, not flattened.
+    ///
+    /// It is deterministic (LCG uniforms pushed through the probit to draw the
+    /// Gaussian residuals) and exercises the real end-to-end two-block joint
+    /// solve, not a synthetic linear-algebra stub. A mean-flattening regression
+    /// (the #365 failure mode) drives the RMSE far above the asserted bound.
+    #[test]
+    fn gaussian_location_scale_smooth_noise_homoscedastic_recovers_mean() {
+        let n = 300usize;
+        // Deterministic LCG -> uniform(0,1); probit gives standard-normal draws.
+        let mut lcg: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next_unit = || {
+            lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            // Top 53 bits -> (0,1), nudged off the open-interval endpoints so
+            // the probit stays finite.
+            let bits = (lcg >> 11) as f64 / ((1u64 << 53) as f64);
+            bits.clamp(1.0e-6, 1.0 - 1.0e-6)
+        };
+
+        // x uniform on [-3, 3] (matches the released repro grid).
+        let mut data = Array2::<f64>::zeros((n, 1));
+        let mut xs = Vec::with_capacity(n);
+        for i in 0..n {
+            let x = -3.0 + 6.0 * next_unit();
+            data[[i, 0]] = x;
+            xs.push(x);
+        }
+        let true_mean: Vec<f64> = xs.iter().map(|&x| 1.0 + 0.7 * x + x.sin()).collect();
+        // Constant true scale: the data are homoscedastic (het = 0).
+        let true_sigma = (-0.5_f64).exp();
+        let y = Array1::from_iter((0..n).map(|i| {
+            let z = standard_normal_quantile(next_unit()).expect("finite probit draw");
+            true_mean[i] + true_sigma * z
+        }));
+        let weights = Array1::from_elem(n, 1.0);
+
+        let spec = GaussianLocationScaleTermSpec {
+            y,
+            weights,
+            // Smooth mean AND smooth log-σ block: this is the exact
+            // configuration that broke in #365 (linear noise terms were fine).
+            meanspec: simple_matern_term_collection(&[0], 0.6),
+            log_sigmaspec: simple_matern_term_collection(&[0], 0.6),
+            mean_offset: Array1::zeros(n),
+            log_sigma_offset: Array1::zeros(n),
+        };
+        let fit = fit_gaussian_location_scale_terms(
+            data.view(),
+            spec,
+            &spatial_fit_smoke_options(),
+            &spatial_kappa_options(),
+        )
+        .expect("gaussian location-scale smooth-noise homoscedastic fit");
+
+        // The mean block (BLOCK_MU = 0) carries identity-link η = predicted mean
+        // (mean_offset is zero), so its state η is the fitted mean directly.
+        let mean_eta = &fit.fit.block_states[GaussianLocationScaleFamily::BLOCK_MU].eta;
+        assert_eq!(mean_eta.len(), n);
+        let mut sq_err = 0.0;
+        for i in 0..n {
+            let d = mean_eta[i] - true_mean[i];
+            sq_err += d * d;
+        }
+        let mean_rmse = (sq_err / n as f64).sqrt();
+
+        // A correctly converged mean tracks the truth to well within the noise
+        // scale; the #365 collapse-to-grand-mean failure produces RMSE ~1.5.
+        // The bound below is far below that failure level yet comfortably above
+        // any honest small-n sampling/penalty bias, so it fails the bug and
+        // passes the fix without being a tautology.
+        assert!(
+            mean_rmse < 0.5,
+            "smooth noise_formula degraded the homoscedastic mean fit (issue #365): \
+             mean RMSE = {mean_rmse:.4} (expected < 0.5; the regression produced ~1.5)"
+        );
+    }
+
     #[test]
     fn binomial_location_scale_termswith_matern_spatial_blocks_fit_finitely() {
         let n = 36usize;
