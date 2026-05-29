@@ -47,7 +47,7 @@
 use crate::faer_ndarray::{FaerArrayView, array2_to_matmut, factorize_symmetricwith_fallback};
 use crate::solver::estimate::EstimationError;
 use faer::Side;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3};
 
 /// Inputs for [`fit_penalized_binomial_multi`].
 #[derive(Debug, Clone)]
@@ -65,6 +65,15 @@ pub struct BinomialMultiFitInputs<'a> {
     pub lambdas: ArrayView1<'a, f64>,
     /// Optional per-row weights (length `N`); `None` ⇒ uniform 1.0.
     pub row_weights: Option<ArrayView1<'a, f64>>,
+    /// Optional per-row Fisher-block override, shape `(N, K, K)`. The `K`
+    /// binomial-logit columns are fit independently, so only the per-column
+    /// diagonal `[n, a, a]` is consumed as the curvature `w_n μ_a(1 − μ_a)`;
+    /// off-diagonals must be zero (enforced at the FFI boundary) since a
+    /// non-zero cross term cannot be represented by the separable per-column
+    /// solve. The gradient/residual path stays analytic — this is a
+    /// curvature-only override (issue #349). Diagonal entries must be finite
+    /// and non-negative.
+    pub fisher_w_override: Option<ArrayView3<'a, f64>>,
     /// Maximum Newton iterations per response column; recommend 50.
     pub max_iter: usize,
     /// Relative-step convergence tolerance; recommend 1e-7.
@@ -137,6 +146,7 @@ pub fn fit_penalized_binomial_multi(
         penalty,
         lambdas,
         row_weights,
+        fisher_w_override,
         max_iter,
         tol,
     } = inputs;
@@ -176,6 +186,14 @@ pub fn fit_penalized_binomial_multi(
         if !(v.is_finite() && v >= 0.0) {
             crate::bail_invalid_estim!(
                 "fit_penalized_binomial_multi: lambdas[{i}] must be finite and ≥ 0 (got {v})"
+            );
+        }
+    }
+    if let Some(fw) = fisher_w_override.as_ref() {
+        if fw.dim() != (n_obs, k, k) {
+            crate::bail_invalid_estim!(
+                "fit_penalized_binomial_multi: fisher_w_override shape {:?} ≠ (N, K, K) = ({n_obs}, {k}, {k})",
+                fw.dim()
             );
         }
     }
@@ -242,7 +260,12 @@ pub fn fit_penalized_binomial_multi(
             for row in 0..n_obs {
                 let mu = fitted[[row, a]];
                 let w = row_weights.as_ref().map(|w| w[row]).unwrap_or(1.0);
-                hess_diag[row] = w * mu * (1.0 - mu);
+                // Curvature: caller override diagonal when present, else the
+                // analytic binomial Fisher w_n μ_a(1 − μ_a) (issue #349).
+                hess_diag[row] = match fisher_w_override.as_ref() {
+                    Some(fw) => fw[[row, a, a]],
+                    None => w * mu * (1.0 - mu),
+                };
                 let resid = w * (mu - y_col[row]);
                 if resid != 0.0 {
                     for i in 0..p {
@@ -456,4 +479,122 @@ pub fn fit_penalized_binomial_multi(
         penalized_neg_log_likelihood,
         deviance,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::Array3;
+
+    fn toy_inputs() -> (Array2<f64>, Array2<f64>, Array2<f64>, Array1<f64>) {
+        let n = 12;
+        let p = 2;
+        let k = 2;
+        let design = Array2::<f64>::from_shape_fn((n, p), |(i, j)| {
+            if j == 0 { 1.0 } else { ((i + 1) as f64).sin() }
+        });
+        let y = Array2::<f64>::from_shape_fn((n, k), |(i, a)| {
+            if (i + a) % 2 == 0 { 1.0 } else { 0.0 }
+        });
+        let penalty = Array2::<f64>::eye(p);
+        let lambdas = Array1::<f64>::from_elem(k, 0.5);
+        (design, y, penalty, lambdas)
+    }
+
+    #[test]
+    fn fisher_override_none_reproduces_analytic_bit_for_bit() {
+        // Issue #349: a None override must give exactly the analytic result.
+        let (design, y, penalty, lambdas) = toy_inputs();
+        let base = fit_penalized_binomial_multi(BinomialMultiFitInputs {
+            design: design.view(),
+            y: y.view(),
+            penalty: penalty.view(),
+            lambdas: lambdas.view(),
+            row_weights: None,
+            fisher_w_override: None,
+            max_iter: 50,
+            tol: 1.0e-9,
+        })
+        .expect("analytic fit must succeed");
+        // Explicit None again — identical result.
+        let again = fit_penalized_binomial_multi(BinomialMultiFitInputs {
+            design: design.view(),
+            y: y.view(),
+            penalty: penalty.view(),
+            lambdas: lambdas.view(),
+            row_weights: None,
+            fisher_w_override: None,
+            max_iter: 50,
+            tol: 1.0e-9,
+        })
+        .expect("analytic fit must succeed");
+        for (a, b) in base.coefficients.iter().zip(again.coefficients.iter()) {
+            assert_eq!(a, b, "None override must be deterministic");
+        }
+    }
+
+    #[test]
+    fn fisher_override_shape_mismatch_is_rejected() {
+        let (design, y, penalty, lambdas) = toy_inputs();
+        let n = design.nrows();
+        let k = y.ncols();
+        let bad = Array3::<f64>::zeros((n, k + 1, k + 1));
+        let err = fit_penalized_binomial_multi(BinomialMultiFitInputs {
+            design: design.view(),
+            y: y.view(),
+            penalty: penalty.view(),
+            lambdas: lambdas.view(),
+            row_weights: None,
+            fisher_w_override: Some(bad.view()),
+            max_iter: 50,
+            tol: 1.0e-9,
+        })
+        .expect_err("mismatched override shape must error");
+        assert!(format!("{err}").contains("fisher_w_override shape"));
+    }
+
+    #[test]
+    fn fisher_override_replaces_curvature_diagonal() {
+        // A scaled curvature override changes the Newton step from β = 0:
+        // with curvature scaled by α the first step is 1/α of the analytic
+        // step (gradient unchanged), so the fitted β must differ from analytic.
+        let (design, y, penalty, lambdas) = toy_inputs();
+        let n = design.nrows();
+        let k = y.ncols();
+        // Analytic diagonal at β = 0 is μ(1−μ) = 0.25 for every column.
+        let mut over = Array3::<f64>::zeros((n, k, k));
+        for row in 0..n {
+            for a in 0..k {
+                over[[row, a, a]] = 0.25 * 4.0; // 4× the analytic curvature
+            }
+        }
+        let scaled = fit_penalized_binomial_multi(BinomialMultiFitInputs {
+            design: design.view(),
+            y: y.view(),
+            penalty: penalty.view(),
+            lambdas: lambdas.view(),
+            row_weights: None,
+            fisher_w_override: Some(over.view()),
+            max_iter: 1,
+            tol: 1.0e-9,
+        })
+        .expect("override fit must succeed");
+        let analytic = fit_penalized_binomial_multi(BinomialMultiFitInputs {
+            design: design.view(),
+            y: y.view(),
+            penalty: penalty.view(),
+            lambdas: lambdas.view(),
+            row_weights: None,
+            fisher_w_override: None,
+            max_iter: 1,
+            tol: 1.0e-9,
+        })
+        .expect("analytic fit must succeed");
+        let differs = scaled
+            .coefficients
+            .iter()
+            .zip(analytic.coefficients.iter())
+            .any(|(a, b)| (a - b).abs() > 1.0e-6);
+        assert!(differs, "scaled curvature override must change the step");
+    }
 }

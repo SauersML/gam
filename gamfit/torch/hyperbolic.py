@@ -77,15 +77,20 @@ class _PoincareTangentDecode(torch.autograd.Function):
         rust = rust_module()
         atoms_np = _np_f64(atoms)
         gates_np = _np_f64(gates)
-        x_hat_np, atoms_proj_np, v_np, tangents_np = rust.poincare_tangent_decode_forward(
-            atoms_np, gates_np, float(curvature)
-        )
+        (
+            x_hat_np,
+            atoms_proj_np,
+            v_np,
+            tangents_np,
+            proj_scale_np,
+        ) = rust.poincare_tangent_decode_forward(atoms_np, gates_np, float(curvature))
         ctx.curvature = float(curvature)
         ctx.save_for_backward(
             torch.from_numpy(np.ascontiguousarray(atoms_proj_np)),
             torch.from_numpy(np.ascontiguousarray(gates_np)),
             torch.from_numpy(np.ascontiguousarray(v_np)),
             torch.from_numpy(np.ascontiguousarray(tangents_np)),
+            torch.from_numpy(np.ascontiguousarray(proj_scale_np)),
         )
         ctx.atoms_dtype = atoms.dtype
         ctx.gates_dtype = gates.dtype
@@ -96,13 +101,14 @@ class _PoincareTangentDecode(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_x_hat: torch.Tensor):
         rust = rust_module()
-        atoms_p, gates, v, tangents = ctx.saved_tensors
+        atoms_p, gates, v, tangents, proj_scale = ctx.saved_tensors
         grad_np = _np_f64(grad_x_hat)
         grad_gates_np, grad_atoms_np = rust.poincare_tangent_decode_backward(
             np.ascontiguousarray(atoms_p.numpy()),
             np.ascontiguousarray(gates.numpy()),
             np.ascontiguousarray(v.numpy()),
             np.ascontiguousarray(tangents.numpy()),
+            np.ascontiguousarray(proj_scale.numpy()),
             grad_np,
             ctx.curvature,
         )
@@ -142,15 +148,20 @@ class _PoincareLorentzDecode(torch.autograd.Function):
         gates_np = _np_f64(gates)
         x_hat_np = rust.poincare_lorentz_decode_forward(atoms_np, gates_np, float(curvature))
         # Cache Poincaré forward state for the analytic backward.
-        _, atoms_proj_np, v_np, tangents_np = rust.poincare_tangent_decode_forward(
-            atoms_np, gates_np, float(curvature)
-        )
+        (
+            _,
+            atoms_proj_np,
+            v_np,
+            tangents_np,
+            proj_scale_np,
+        ) = rust.poincare_tangent_decode_forward(atoms_np, gates_np, float(curvature))
         ctx.curvature = float(curvature)
         ctx.save_for_backward(
             torch.from_numpy(np.ascontiguousarray(atoms_proj_np)),
             torch.from_numpy(np.ascontiguousarray(gates_np)),
             torch.from_numpy(np.ascontiguousarray(v_np)),
             torch.from_numpy(np.ascontiguousarray(tangents_np)),
+            torch.from_numpy(np.ascontiguousarray(proj_scale_np)),
         )
         ctx.atoms_dtype = atoms.dtype
         ctx.gates_dtype = gates.dtype
@@ -161,13 +172,14 @@ class _PoincareLorentzDecode(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_x_hat: torch.Tensor):
         rust = rust_module()
-        atoms_p, gates, v, tangents = ctx.saved_tensors
+        atoms_p, gates, v, tangents, proj_scale = ctx.saved_tensors
         grad_np = _np_f64(grad_x_hat)
         grad_gates_np, grad_atoms_np = rust.poincare_lorentz_decode_backward(
             np.ascontiguousarray(atoms_p.numpy()),
             np.ascontiguousarray(gates.numpy()),
             np.ascontiguousarray(v.numpy()),
             np.ascontiguousarray(tangents.numpy()),
+            np.ascontiguousarray(proj_scale.numpy()),
             grad_np,
             ctx.curvature,
         )

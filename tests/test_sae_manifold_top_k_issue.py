@@ -1,13 +1,12 @@
-"""RED tests pinning the top_k / target_k contract for SAE manifold fits.
+"""Tests pinning the top_k / target_k contract for SAE manifold fits.
 
-Currently:
-- ``gamfit/_binding.py`` accepts ``top_k`` then discards it with ``del top_k``.
-- ``gamfit.torch.manifold_sae.ManifoldSAE.fit`` ignores ``cfg.sparsity.target_k``.
-- Rust ``sae_manifold_fit_auto`` has no ``top_k`` parameter.
+The Rust ``sae_manifold_fit_minimal`` ``#[pyfunction]`` takes ``top_k`` and
+owns the hard per-row top-k projection end to end; ``gamfit/_sae_manifold.py``
+forwards it unconditionally and ``gamfit.torch.manifold_sae.ManifoldSAE.fit``
+honours ``cfg.sparsity.target_k``.
 
-Either path should produce assignments where at most ``top_k`` atoms are
-active per row, or reject the parameter loudly. Silently dropping it is
-the bug these tests pin.
+Each path must produce assignments where at most ``top_k`` atoms are active
+per row. Silently dropping the parameter is the regression these tests guard.
 """
 
 from __future__ import annotations

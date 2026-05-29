@@ -13,6 +13,10 @@ pub enum GeometryError {
     },
     InvalidPoint(&'static str),
     Singular(&'static str),
+    /// A manifold primitive has no implementation for this manifold and must
+    /// not silently fall back to a wrong default (e.g. a curved-manifold VJP
+    /// for which no closed form is wired up yet).
+    Unsupported(&'static str),
 }
 
 impl fmt::Display for GeometryError {
@@ -25,6 +29,7 @@ impl fmt::Display for GeometryError {
             } => write!(f, "{context} expected length {expected}, got {got}"),
             Self::InvalidPoint(message) => write!(f, "invalid manifold point: {message}"),
             Self::Singular(message) => write!(f, "singular geometry operation: {message}"),
+            Self::Unsupported(message) => write!(f, "unsupported geometry operation: {message}"),
         }
     }
 }
@@ -96,6 +101,35 @@ pub trait RiemannianManifold: Send + Sync {
         tangent_vec: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
         self.exp_map(point, tangent_vec)
+    }
+
+    /// Vector–Jacobian product of the ambient map `exp_p(v)`.
+    ///
+    /// Given a cotangent `grad_output` w.r.t. the ambient output of
+    /// [`exp_map`](Self::exp_map), return `(grad_point, grad_tangent)`, the
+    /// pullbacks w.r.t. the base point `p` and the (raw, unprojected) tangent
+    /// input `v`. This is the analytic backward used by reverse-mode autodiff
+    /// wrappers (e.g. the Python `torch.autograd.Function` around
+    /// `manifold_exp_map`); it must never be the silent straight-through
+    /// identity for a curved manifold.
+    ///
+    /// The default is the exact VJP for *flat* manifolds, where
+    /// `exp_p(v) = p + v` in ambient coordinates and so both Jacobians are the
+    /// identity (Euclidean, Circle, Torus, and products thereof). Curved
+    /// manifolds **must** override this with their analytic Jacobi-field VJP;
+    /// a manifold without a closed form must override it to return an error
+    /// rather than inherit the wrong identity default.
+    fn exp_map_vjp(
+        &self,
+        point: ArrayView1<'_, f64>,
+        tangent_vec: ArrayView1<'_, f64>,
+        grad_output: ArrayView1<'_, f64>,
+    ) -> GeometryResult<(Array1<f64>, Array1<f64>)> {
+        let m = self.ambient_dim();
+        check_len("exp_map_vjp point", point.len(), m)?;
+        check_len("exp_map_vjp tangent", tangent_vec.len(), m)?;
+        check_len("exp_map_vjp grad_output", grad_output.len(), m)?;
+        Ok((grad_output.to_owned(), grad_output.to_owned()))
     }
 }
 
@@ -305,6 +339,26 @@ pub(crate) fn jacobi_symmetric(a: &Array2<f64>) -> GeometryResult<(Array1<f64>, 
     let mut d = sym(a);
     let mut v = identity(n);
     let max_iter = 64 * n.max(1) * n.max(1);
+    // Relative convergence threshold: the largest off-diagonal magnitude must
+    // fall to `1e-13 * ||A||_F`. A fixed absolute `1e-13` is meaningless for
+    // matrices whose scale is far from unity (a well-scaled large-norm matrix
+    // could never reach it; a tiny-norm matrix would "converge" trivially),
+    // and silently returning the partially-diagonalized state after exhausting
+    // `max_iter` hides genuine non-convergence (e.g. clustered/degenerate
+    // spectra that stall the classical sweep). The Frobenius norm is invariant
+    // under the orthogonal Jacobi rotations, so it is computed once from the
+    // symmetrized input.
+    let frob_norm = {
+        let mut acc = 0.0;
+        for i in 0..n {
+            for j in 0..n {
+                acc += d[[i, j]] * d[[i, j]];
+            }
+        }
+        acc.sqrt()
+    };
+    let threshold = 1.0e-13 * frob_norm;
+    let mut converged = false;
     for _ in 0..max_iter {
         let mut p = 0usize;
         let mut q = 0usize;
@@ -319,7 +373,10 @@ pub(crate) fn jacobi_symmetric(a: &Array2<f64>) -> GeometryResult<(Array1<f64>, 
                 }
             }
         }
-        if best < 1.0e-13 {
+        // `best <= threshold` (rather than `<`) makes the exactly-diagonal and
+        // zero-norm cases (`best == threshold == 0`) converge immediately.
+        if best <= threshold {
+            converged = true;
             break;
         }
         let tau = (d[[q, q]] - d[[p, p]]) / (2.0 * d[[p, q]]);
@@ -344,6 +401,11 @@ pub(crate) fn jacobi_symmetric(a: &Array2<f64>) -> GeometryResult<(Array1<f64>, 
             v[[k, p]] = c * vkp - s * vkq;
             v[[k, q]] = s * vkp + c * vkq;
         }
+    }
+    if !converged {
+        return Err(GeometryError::Singular(
+            "Jacobi eigensolver did not converge within max_iter (off-diagonal mass above 1e-13 * Frobenius norm)",
+        ));
     }
     let mut evals = Array1::<f64>::zeros(n);
     for i in 0..n {
@@ -410,4 +472,118 @@ pub(crate) fn cholesky_spd(a: &Array2<f64>) -> GeometryResult<Array2<f64>> {
         }
     }
     Ok(l)
+}
+
+#[cfg(test)]
+mod jacobi_tests {
+    use super::{jacobi_symmetric, GeometryError};
+    use ndarray::Array2;
+
+    /// A large-norm SPD matrix has off-diagonal residuals after
+    /// diagonalization that scale with `||A||_F`, so they sit far above the
+    /// old *absolute* `1e-13` cutoff even when the decomposition is, in fact,
+    /// fully converged. The relative threshold (`1e-13 * ||A||_F`) recognizes
+    /// convergence here and returns the correct spectrum instead of grinding
+    /// through `max_iter` sweeps and silently returning a partial diagonal.
+    #[test]
+    fn jacobi_converges_on_large_norm_spd() {
+        // Q diag(1e8, 2e8, 3e8) Qᵀ for an orthogonal Q built from a planar
+        // rotation in the (0,1) plane; eigenvalues are huge so the matrix
+        // norm is ~1e8 and any absolute 1e-13 off-diagonal test is hopeless.
+        let theta = 0.7_f64;
+        let (c, s) = (theta.cos(), theta.sin());
+        let mut q = Array2::<f64>::eye(3);
+        q[[0, 0]] = c;
+        q[[0, 1]] = -s;
+        q[[1, 0]] = s;
+        q[[1, 1]] = c;
+        let lambda = [1.0e8_f64, 2.0e8, 3.0e8];
+        let mut diag = Array2::<f64>::zeros((3, 3));
+        for i in 0..3 {
+            diag[[i, i]] = lambda[i];
+        }
+        let a = q.dot(&diag).dot(&q.t());
+
+        let (evals, evecs) = jacobi_symmetric(&a).expect("large-norm SPD must converge");
+        let mut sorted: Vec<f64> = evals.to_vec();
+        sorted.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        for (got, want) in sorted.iter().zip(lambda.iter()) {
+            assert!(
+                (got - want).abs() <= 1.0e-6 * want,
+                "eigenvalue mismatch: got {got}, want {want}"
+            );
+        }
+        // V diag(evals) Vᵀ must reconstruct A (relative to its scale).
+        let mut diag_e = Array2::<f64>::zeros((3, 3));
+        for i in 0..3 {
+            diag_e[[i, i]] = evals[i];
+        }
+        let recon = evecs.dot(&diag_e).dot(&evecs.t());
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!(
+                    (recon[[i, j]] - a[[i, j]]).abs() <= 1.0e-6 * 3.0e8,
+                    "reconstruction mismatch at ({i},{j})"
+                );
+            }
+        }
+    }
+
+    /// A clustered/degenerate spectrum (two coincident eigenvalues) must still
+    /// converge and reproduce the multiplicity. This guards against the
+    /// relative threshold being so tight that ordinary near-degenerate SPD
+    /// inputs trip the new non-convergence error.
+    #[test]
+    fn jacobi_handles_clustered_spectrum() {
+        // diag(5, 5, 1) rotated in the (0,2) plane; the degenerate pair stays
+        // degenerate under rotation.
+        let theta = 0.4_f64;
+        let (c, s) = (theta.cos(), theta.sin());
+        let mut q = Array2::<f64>::eye(3);
+        q[[0, 0]] = c;
+        q[[0, 2]] = -s;
+        q[[2, 0]] = s;
+        q[[2, 2]] = c;
+        let lambda = [5.0_f64, 5.0, 1.0];
+        let mut diag = Array2::<f64>::zeros((3, 3));
+        for i in 0..3 {
+            diag[[i, i]] = lambda[i];
+        }
+        let a = q.dot(&diag).dot(&q.t());
+
+        let (evals, evecs) = jacobi_symmetric(&a).expect("clustered SPD must converge");
+        let mut sorted: Vec<f64> = evals.to_vec();
+        sorted.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        assert!((sorted[0] - 1.0).abs() <= 1.0e-12);
+        assert!((sorted[1] - 5.0).abs() <= 1.0e-12);
+        assert!((sorted[2] - 5.0).abs() <= 1.0e-12);
+        // Eigenvectors must remain orthonormal even across the degenerate pair.
+        let gram = evecs.t().dot(&evecs);
+        for i in 0..3 {
+            for j in 0..3 {
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (gram[[i, j]] - want).abs() <= 1.0e-12,
+                    "eigenvectors not orthonormal at ({i},{j})"
+                );
+            }
+        }
+    }
+
+    /// Non-convergence must now surface as `GeometryError::Singular` instead
+    /// of a silently-returned partial diagonal. A symmetric input carrying a
+    /// non-finite off-diagonal can never drive the largest off-diagonal
+    /// magnitude below `1e-13 * ||A||_F` (the norm itself is non-finite), so
+    /// the sweep exhausts `max_iter` and the solver must error rather than
+    /// hand back the un-diagonalized matrix's diagonal.
+    #[test]
+    fn jacobi_errors_on_non_convergence() {
+        let mut a = Array2::<f64>::eye(3);
+        a[[0, 1]] = f64::NAN;
+        a[[1, 0]] = f64::NAN;
+        match jacobi_symmetric(&a) {
+            Err(GeometryError::Singular(_)) => {}
+            other => panic!("expected Singular non-convergence error, got {other:?}"),
+        }
+    }
 }

@@ -1,16 +1,13 @@
-"""RED test for bug J: SAE manifold fake Rust modules use old method names.
+"""Contract: SAE manifold fake Rust modules expose the production method name.
 
-Production `gamfit/_sae_manifold.py:432` calls
-`rust_module().sae_manifold_fit_minimal(...)`. The fakes in
+Production `gamfit/_sae_manifold.py` calls
+`rust_module().sae_manifold_fit_minimal(...)` directly (the Rust
+`#[pyfunction]` is named `sae_manifold_fit_minimal`; there is no alias
+layer). The fakes in
 `tests/test_sae_manifold_softmax_dispatch.py::_FakeRustModule` and
-`tests/test_sae_manifold_ibp_refresh.py::_FakeRustModule` only expose
-`sae_manifold_fit` (and `sae_manifold_fit_ibp`). They never wire
-`sae_manifold_fit_minimal` (nor the `sae_manifold_fit_auto` underlying that the
-real bridge would alias from).
-
-Production callsite: `gamfit/_sae_manifold.py:432`.
-Bridge alias install: `gamfit/_binding.py:45-107` — only triggers if the module
-exposes `sae_manifold_fit_auto`.
+`tests/test_sae_manifold_ibp_refresh.py::_FakeRustModule` must therefore wire
+`sae_manifold_fit_minimal` with the real signature for the bridge to drive
+them.
 """
 from __future__ import annotations
 
@@ -42,7 +39,7 @@ def test_fake_rust_module_exposes_sae_manifold_fit_minimal(path: Path) -> None:
     fake = mod._FakeRustModule()
     assert hasattr(fake, "sae_manifold_fit_minimal"), (
         f"{path.name}::_FakeRustModule must expose `sae_manifold_fit_minimal` "
-        f"(production gamfit/_sae_manifold.py:432 calls it). Currently exposes: "
+        f"(production gamfit/_sae_manifold.py calls it). Currently exposes: "
         f"{sorted(n for n in dir(fake) if not n.startswith('_'))}."
     )
 

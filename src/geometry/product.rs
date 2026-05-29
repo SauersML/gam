@@ -68,6 +68,39 @@ impl RiemannianManifold for ProductManifold {
         Ok(out)
     }
 
+    fn exp_map_vjp(
+        &self,
+        point: ArrayView1<'_, f64>,
+        tangent_vec: ArrayView1<'_, f64>,
+        grad_output: ArrayView1<'_, f64>,
+    ) -> GeometryResult<(Array1<f64>, Array1<f64>)> {
+        let ambient = self.ambient_dim();
+        check_len("Product exp_map_vjp point", point.len(), ambient)?;
+        check_len("Product exp_map_vjp tangent", tangent_vec.len(), ambient)?;
+        check_len("Product exp_map_vjp grad", grad_output.len(), ambient)?;
+        // exp on a product acts block-wise, so its Jacobian is block-diagonal:
+        // dispatch each component's analytic VJP on its own slice. A Sphere
+        // (or any curved factor) thus uses its real backward, never the flat
+        // identity; a factor with no closed form propagates its error.
+        let mut grad_point = Array1::<f64>::zeros(ambient);
+        let mut grad_tangent = Array1::<f64>::zeros(ambient);
+        let mut off = 0usize;
+        for component in &self.components {
+            let m = component.ambient_dim();
+            let (gp, gt) = component.exp_map_vjp(
+                point.slice(s![off..off + m]),
+                tangent_vec.slice(s![off..off + m]),
+                grad_output.slice(s![off..off + m]),
+            )?;
+            for i in 0..m {
+                grad_point[off + i] = gp[i];
+                grad_tangent[off + i] = gt[i];
+            }
+            off += m;
+        }
+        Ok((grad_point, grad_tangent))
+    }
+
     fn log_map(
         &self,
         p_from: ArrayView1<'_, f64>,

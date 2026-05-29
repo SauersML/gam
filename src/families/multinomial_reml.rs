@@ -771,10 +771,11 @@ impl CustomFamily for MultinomialFamily {
         block_specs: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
         assert!(block_specs.len() <= isize::MAX as usize);
-        // Freeze the softmax probabilities at the current β once. They are
-        // constant across every `hessian_matvec` / `hessian_diagonal` call the
-        // PCG solver issues against this workspace, so computing them here
-        // amortises the per-row softmax over the whole inner solve.
+        // Freeze the per-row softmax probabilities once at construction: the
+        // Fisher block H_{n,a,b} = w_n (δ_ab p_a − p_a p_b) is constant in the
+        // matvec direction v, so every PCG H·v contraction reuses these probs
+        // rather than re-running the softmax (matrix-free, O(N·K·P) per matvec
+        // with no dense (M·P)² assembly — issue #347).
         let eta = self.collect_eta_matrix(block_states)?;
         let probs = self.row_probabilities(eta.view());
         Ok(Some(Arc::new(MultinomialHessianWorkspace {
@@ -822,10 +823,10 @@ impl CustomFamily for MultinomialFamily {
 struct MultinomialHessianWorkspace {
     family: MultinomialFamily,
     block_states: Vec<ParameterBlockState>,
-    /// Cached `(N, K)` softmax probabilities at the frozen β, computed once at
-    /// workspace construction. Constant in `v`, so every matrix-free
-    /// `hessian_matvec` / `hessian_diagonal` reads from here rather than
-    /// re-evaluating the per-row softmax.
+    /// Per-row softmax probabilities `(N, K)` (including the reference column
+    /// at index `K − 1`), frozen at the construction `β`. The Fisher block is
+    /// a function of these alone, so the matrix-free `H·v` contraction reuses
+    /// them across every PCG iteration (issue #347).
     probs: Array2<f64>,
 }
 
@@ -1023,6 +1024,72 @@ mod tests {
     fn beta_flat_dim_equals_active_classes_times_p() {
         let family = toy_family(3, 5, 4);
         assert_eq!(family.beta_flat_dim(), 3 * 5);
+    }
+
+    #[test]
+    fn matrix_free_matvec_matches_dense_hessian_dot() {
+        // Issue #347: the matrix-free H·v contraction must equal the dense
+        // Hessian times v to floating tolerance, at a non-trivial β so the
+        // softmax is away from the uniform point.
+        let family = toy_family(7, 3, 4);
+        let p = family.design.ncols();
+        let m = family.active_classes();
+        let n = family.weights.len();
+        let design = family.design.view();
+        // Distinct per-class β so η, and hence the Fisher block, is non-uniform.
+        let block_states: Vec<ParameterBlockState> = (0..m)
+            .map(|a| {
+                let beta = Array1::<f64>::from_shape_fn(p, |i| 0.3 * ((a + 1) as f64) - 0.1 * (i as f64));
+                let eta = Array1::<f64>::from_shape_fn(n, |row| {
+                    (0..p).map(|i| design[[row, i]] * beta[i]).sum()
+                });
+                ParameterBlockState { beta, eta }
+            })
+            .collect();
+        let specs = family.build_block_specs();
+        let ws = family
+            .exact_newton_joint_hessian_workspace(&block_states, &specs)
+            .expect("workspace build must succeed")
+            .expect("workspace must be present");
+        let dense = family
+            .exact_newton_joint_hessian(&block_states)
+            .expect("dense Hessian must build")
+            .expect("dense Hessian must be present");
+        // Several probe directions, including a unit vector per coordinate.
+        for seed in 0..(m * p) {
+            let v = Array1::<f64>::from_shape_fn(m * p, |i| {
+                if i == seed { 1.0 } else { 0.07 * ((i + 1) as f64).cos() }
+            });
+            let mf = ws
+                .hessian_matvec(&v)
+                .expect("matvec must succeed")
+                .expect("matvec must be present");
+            let dv = dense.dot(&v);
+            for (a, b) in mf.iter().zip(dv.iter()) {
+                assert!(
+                    (a - b).abs() < 1.0e-9,
+                    "matrix-free matvec {a} != dense {b}"
+                );
+            }
+            // hessian_matvec_into must agree with the owned form.
+            let mut into = Array1::<f64>::from_elem(m * p, f64::NAN);
+            let wrote = ws
+                .hessian_matvec_into(&v, &mut into)
+                .expect("matvec_into must succeed");
+            assert!(wrote, "matvec_into must report it wrote");
+            for (a, b) in into.iter().zip(mf.iter()) {
+                assert!((a - b).abs() < 1.0e-12, "matvec_into {a} != matvec {b}");
+            }
+        }
+        // Diagonal must equal the dense diagonal.
+        let mf_diag = ws
+            .hessian_diagonal()
+            .expect("diagonal must succeed")
+            .expect("diagonal must be present");
+        let dense_diag = dense.diag();
+        for (a, b) in mf_diag.iter().zip(dense_diag.iter()) {
+            assert!((a - b).abs() < 1.0e-9, "matrix-free diag {a} != dense {b}");
+        }
     }
 
     #[test]

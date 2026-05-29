@@ -75,7 +75,7 @@ use crate::terms::smooth::{
 use crate::terms::term_builder::resolve_role_col;
 use crate::types::ResponseColumnKind;
 use faer::Side;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -100,6 +100,15 @@ pub struct MultinomialFitInputs<'a> {
     pub lambdas: ArrayView1<'a, f64>,
     /// Optional per-row weights (length `N`); `None` ⇒ uniform 1.0.
     pub row_weights: Option<ArrayView1<'a, f64>>,
+    /// Optional per-row Fisher-block override, shape `(N, K-1, K-1)` in the
+    /// active-class gauge (the reference class `K-1` is dropped). When `Some`,
+    /// each Newton step uses this block as the curvature `W` in place of the
+    /// analytic softmax Fisher `w_n (δ_ab p_a − p_a p_b)`; the gradient/residual
+    /// path stays analytic, so this is a curvature-only override (the
+    /// research escape-hatch for latent multinomial fits, issue #349). Each
+    /// per-row block must be symmetric, PSD, and finite — preconditions the
+    /// FFI boundary discharges before constructing this view.
+    pub fisher_w_override: Option<ArrayView3<'a, f64>>,
     /// Maximum Newton iterations; recommend 50.
     pub max_iter: usize,
     /// Relative-step convergence tolerance; recommend 1e-7.
@@ -143,6 +152,7 @@ pub fn fit_penalized_multinomial(
         penalty,
         lambdas,
         row_weights,
+        fisher_w_override,
         max_iter,
         tol,
     } = inputs;
@@ -183,6 +193,14 @@ pub fn fit_penalized_multinomial(
         if !(v.is_finite() && v >= 0.0) {
             crate::bail_invalid_estim!(
                 "fit_penalized_multinomial: lambdas[{i}] must be finite and ≥ 0 (got {v})"
+            );
+        }
+    }
+    if let Some(fw) = fisher_w_override.as_ref() {
+        if fw.dim() != (n_obs, m, m) {
+            crate::bail_invalid_estim!(
+                "fit_penalized_multinomial: fisher_w_override shape {:?} ≠ (N, K-1, K-1) = ({n_obs}, {m}, {m})",
+                fw.dim()
             );
         }
     }
@@ -261,7 +279,21 @@ pub fn fit_penalized_multinomial(
         // The Hessian block is multiplied by w_n already (the likelihood
         // factors row weights into `hess_block`), so we pass `None` for the
         // row_weights argument of `dense_block_xtwx` to avoid double-counting.
-        let fisher_blocks = likelihood.hess_block(eta.view(), y_one_hot);
+        // Curvature: either the caller-supplied per-row Fisher-block override
+        // (issue #349 research escape-hatch — curvature only) or the analytic
+        // softmax Fisher block. The gradient/residual path below stays
+        // analytic in both cases, matching the old override-replaces-Fisher
+        // semantics.
+        let analytic_fisher = fisher_w_override
+            .as_ref()
+            .map_or_else(|| Some(likelihood.hess_block(eta.view(), y_one_hot)), |_| None);
+        let fisher_blocks = match fisher_w_override.as_ref() {
+            Some(fw) => *fw,
+            None => analytic_fisher
+                .as_ref()
+                .expect("analytic Fisher computed when no override")
+                .view(),
+        };
         let grad_eta_logl = likelihood.grad_eta(eta.view(), y_one_hot);
         // residual = p − y = −(y − p) = −grad_eta(log L). The pyffi reference
         // and the dense_block_xtwy contract both want the multinomial
@@ -269,7 +301,7 @@ pub fn fit_penalized_multinomial(
         // already returns `w_n (y − p)`, so the residual is `−grad_eta`.
         let residual_active = grad_eta_logl.mapv(|v| -v);
 
-        let mut hessian = dense_block_xtwx(design, fisher_blocks.view(), None)?;
+        let mut hessian = dense_block_xtwx(design, fisher_blocks, None)?;
         if hessian.nrows() != beta_flat_dim || hessian.ncols() != beta_flat_dim {
             crate::bail_invalid_estim!(
                 "fit_penalized_multinomial: assembled Hessian shape {:?} ≠ ({beta_flat_dim}, {beta_flat_dim})",
@@ -826,20 +858,14 @@ pub fn fit_penalized_multinomial_formula(
         .map(|info| info.edf_by_block.clone());
     let coefficients_flat: Vec<f64> = coefficients_active.iter().copied().collect();
 
-    // Unpenalized deviance recomputed from the converged probabilities so
-    // the saved-model number matches the legacy fixed-λ path's contract.
-    let likelihood = MultinomialLogitLikelihood::with_classes(k)?;
-    let mut eta = Array2::<f64>::zeros((n_obs, m));
-    for a in 0..m {
-        for row in 0..n_obs {
-            let mut v = 0.0_f64;
-            for i in 0..p_per_class {
-                v += design_arc[[row, i]] * coefficients_active[[i, a]];
-            }
-            eta[[row, a]] = v;
-        }
-    }
-    let deviance = -2.0 * likelihood.log_lik(eta.view(), y_one_hot.view());
+    // Unpenalized deviance read directly from the converged unpenalized
+    // log-likelihood the rho-prior driver already computed (issue #348):
+    // MultinomialFamily::evaluate sets FamilyEvaluation.log_likelihood =
+    // log_lik(η, y) with no penalty term, and that value flows unchanged into
+    // UnifiedFitResult.log_likelihood. This reproduces the legacy fixed-λ
+    // path's `deviance = -2 · log_lik` contract bit-for-bit, so the previous
+    // row-by-row η = Xβ rebuild and softmax recompute were pure dead work.
+    let deviance = -2.0 * fit.log_likelihood;
 
     Ok(MultinomialSavedModel {
         formula: formula.to_string(),
@@ -884,4 +910,119 @@ pub fn predict_multinomial_formula(
         );
     }
     Ok(model.predict_probabilities(x_dense.view()))
+}
+
+#[cfg(test)]
+mod fisher_override_tests {
+    use super::*;
+    use ndarray::Array3;
+
+    fn toy() -> (Array2<f64>, Array2<f64>, Array2<f64>, Array1<f64>) {
+        let n = 15;
+        let p = 2;
+        let k = 3;
+        let design = Array2::<f64>::from_shape_fn((n, p), |(i, j)| {
+            if j == 0 { 1.0 } else { ((i + 2) as f64).cos() }
+        });
+        let mut y = Array2::<f64>::zeros((n, k));
+        for i in 0..n {
+            y[[i, i % k]] = 1.0;
+        }
+        let penalty = Array2::<f64>::eye(p);
+        let lambdas = Array1::<f64>::from_elem(k - 1, 0.5);
+        (design, y, penalty, lambdas)
+    }
+
+    #[test]
+    fn fisher_override_none_reproduces_analytic() {
+        // Issue #349: None override is exactly the analytic fit.
+        let (design, y, penalty, lambdas) = toy();
+        let mk = |over: Option<ndarray::ArrayView3<'_, f64>>| {
+            fit_penalized_multinomial(MultinomialFitInputs {
+                design: design.view(),
+                y_one_hot: y.view(),
+                penalty: penalty.view(),
+                lambdas: lambdas.view(),
+                row_weights: None,
+                fisher_w_override: over,
+                max_iter: 50,
+                tol: 1.0e-9,
+            })
+            .expect("fit must succeed")
+        };
+        let a = mk(None);
+        let b = mk(None);
+        for (x, z) in a.coefficients_active.iter().zip(b.coefficients_active.iter()) {
+            assert_eq!(x, z);
+        }
+    }
+
+    #[test]
+    fn fisher_override_wrong_shape_is_rejected() {
+        let (design, y, penalty, lambdas) = toy();
+        let n = design.nrows();
+        let m = y.ncols(); // K, not K-1 — deliberately wrong
+        let bad = Array3::<f64>::zeros((n, m, m));
+        let err = fit_penalized_multinomial(MultinomialFitInputs {
+            design: design.view(),
+            y_one_hot: y.view(),
+            penalty: penalty.view(),
+            lambdas: lambdas.view(),
+            row_weights: None,
+            fisher_w_override: Some(bad.view()),
+            max_iter: 50,
+            tol: 1.0e-9,
+        })
+        .expect_err("wrong active-block shape must error");
+        assert!(format!("{err}").contains("fisher_w_override shape"));
+    }
+
+    #[test]
+    fn scaled_fisher_override_changes_first_step() {
+        // Curvature scaled by 4× shrinks the first Newton step relative to the
+        // analytic fit, so a single-iteration fit must differ.
+        let (design, y, penalty, lambdas) = toy();
+        let n = design.nrows();
+        let m = y.ncols() - 1;
+        // Analytic block at β = 0: p_a = 1/K = 1/3, so diag = p_a(1−p_a),
+        // off-diag = −p_a p_b. Scale that exact block by 4.
+        let pk = 1.0 / (y.ncols() as f64);
+        let mut over = Array3::<f64>::zeros((n, m, m));
+        for row in 0..n {
+            for a in 0..m {
+                for b in 0..m {
+                    let analytic = if a == b { pk * (1.0 - pk) } else { -pk * pk };
+                    over[[row, a, b]] = 4.0 * analytic;
+                }
+            }
+        }
+        let scaled = fit_penalized_multinomial(MultinomialFitInputs {
+            design: design.view(),
+            y_one_hot: y.view(),
+            penalty: penalty.view(),
+            lambdas: lambdas.view(),
+            row_weights: None,
+            fisher_w_override: Some(over.view()),
+            max_iter: 1,
+            tol: 1.0e-9,
+        })
+        .expect("override fit must succeed");
+        let analytic = fit_penalized_multinomial(MultinomialFitInputs {
+            design: design.view(),
+            y_one_hot: y.view(),
+            penalty: penalty.view(),
+            lambdas: lambdas.view(),
+            row_weights: None,
+            fisher_w_override: None,
+            max_iter: 1,
+            tol: 1.0e-9,
+        })
+        .expect("analytic fit must succeed");
+        let differs = scaled
+            .coefficients_active
+            .iter()
+            .zip(analytic.coefficients_active.iter())
+            .any(|(a, b)| (a - b).abs() > 1.0e-6);
+        assert!(differs, "scaled curvature must change the first step");
+    }
 }

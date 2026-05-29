@@ -533,9 +533,11 @@ fn row_bernoulli_probit(input: RowInput, mode: CurvatureMode) -> RowOutput {
 #[inline]
 fn row_bernoulli_cloglog(input: RowInput, mode: CurvatureMode) -> RowOutput {
     let (eta_c, clamped) = clamp_eta(input.eta);
-    // μ = 1 − exp(−exp(η)); numerically stable via expm1.
+    // μ = 1 − exp(−exp(η)); numerically stable via expm1 to preserve precision
+    // in the deep negative tail (η ≲ -36) where `1 - exp(-exp(η))` would
+    // catastrophically cancel to 0.
     let inner = eta_c.exp();
-    let mu_raw = 1.0 - (-inner).exp();
+    let mu_raw = -(-inner).exp_m1();
     let mu_low = mu_raw < MU_FLOOR_BERNOULLI;
     let mu_high = mu_raw > 1.0 - MU_FLOOR_BERNOULLI;
     let mu = mu_raw.clamp(MU_FLOOR_BERNOULLI, 1.0 - MU_FLOOR_BERNOULLI);
@@ -1786,7 +1788,9 @@ fn bernoulli_cloglog_body(curvature: CurvatureMode) -> String {
     format!(
         r#"{tag}    double eta_c = clamp_eta(eta_i, &flags);
     double inner = exp(eta_c);
-    double mu_raw = 1.0 - exp(-inner);
+    // μ = 1 − exp(−exp(η)); use -expm1(-inner) to avoid catastrophic
+    // cancellation in the deep negative tail (η ≲ -36).
+    double mu_raw = -expm1(-inner);
     if (mu_raw < 1e-12 || mu_raw > 1.0 - 1e-12) flags |= 0x2u;
     double mu = fmin(fmax(mu_raw, 1e-12), 1.0 - 1e-12);
     double dmu_deta = inner * (1.0 - mu_raw);

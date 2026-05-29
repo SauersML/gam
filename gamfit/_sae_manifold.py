@@ -72,6 +72,7 @@ class ManifoldSAE:
     training_mean: np.ndarray
     training_data: np.ndarray
     low_level: SaeManifoldFitResult
+    low_level_logits: np.ndarray
     _basis_kinds: list[str]
     _atom_dims: list[int]
     _basis_sizes: list[int]
@@ -79,6 +80,12 @@ class ManifoldSAE:
     _duchon_centers: list[np.ndarray | None]
     alpha: float = 1.0
     learnable_alpha: bool = False
+    tau: float = 0.5
+    sparsity_strength: float = 1.0
+    smoothness: float = 1.0
+    learning_rate: float = 0.04
+    max_iter: int = 50
+    random_state: int = 0
 
     def __repr__(self) -> str:
         d_atom = int(self.coords[0].shape[1]) if self.coords else 0
@@ -91,7 +98,7 @@ class ManifoldSAE:
         )
 
     @classmethod
-    def from_payload(cls, x: np.ndarray, payload: Mapping[str, Any], topology: str, assignment: str, penalties: list[str], alpha: float = 1.0, learnable_alpha: bool = False) -> "ManifoldSAE":
+    def from_payload(cls, x: np.ndarray, payload: Mapping[str, Any], topology: str, assignment: str, penalties: list[str], alpha: float = 1.0, learnable_alpha: bool = False, *, tau: float = 0.5, sparsity_strength: float = 1.0, smoothness: float = 1.0, learning_rate: float = 0.04, max_iter: int = 50, random_state: int = 0) -> "ManifoldSAE":
         plans = list(payload.get("atom_plans", []))
         atoms = [SaeManifoldAtomFit(
             basis=str(atom.get("basis_kind", "")),
@@ -103,6 +110,7 @@ class ManifoldSAE:
         ) for atom in payload["atoms"]]
         fitted = np.asarray(payload["fitted"], dtype=float)
         assigns = np.asarray(payload["assignments_z"], dtype=float)
+        logits = np.asarray(payload["logits"], dtype=float)
         coords = [atom.coords.copy() for atom in atoms]
         score = float(payload["reml_score"])
         chosen_k = int(payload["chosen_k"]) if "chosen_k" in payload else len(atoms)
@@ -120,35 +128,132 @@ class ManifoldSAE:
             basis_specs=kinds, reml_score=score,
             reconstruction_r2=float(rust_module().sae_manifold_reconstruction_r2(x, fitted)),
             training_mean=x.mean(axis=0), training_data=x.copy(), low_level=low,
+            low_level_logits=logits,
             _basis_kinds=kinds, _atom_dims=dims, _basis_sizes=sizes,
             _n_harmonics=nharm, _duchon_centers=centers,
             alpha=float(alpha), learnable_alpha=bool(learnable_alpha),
+            tau=float(tau), sparsity_strength=float(sparsity_strength),
+            smoothness=float(smoothness), learning_rate=float(learning_rate),
+            max_iter=int(max_iter), random_state=int(random_state),
         )
 
-    def reconstruct(self, X: Any) -> np.ndarray:
+    def _oos_payload(self, X: Any, *, t_init: Any = None, a_init: Any = None) -> dict[str, Any]:
+        """Run the frozen-decoder OOS Newton solve on ``X`` and return the full
+        payload dict (``assignments_z``, per-atom ``on_atom_coords_t``,
+        ``logits``, ``fitted``).
+
+        Optional ``t_init`` (K, N, D_max) and ``a_init`` (N, K) warm-start the
+        refinement from an amortized encoder's per-token prediction (#357).
+        """
         x = _as_2d_float(X, "X")
-        if x.shape == self.training_data.shape and np.allclose(x, self.training_data):
-            return self.fitted.copy()
-        kind = "ibp_map" if self.assignment in {"ibp", "ibp_map"} else ("jumprelu" if self.assignment == "gated" else self.assignment)
-        return np.asarray(rust_module().sae_manifold_predict_oos(
+        kind = _canonical_assignment(self.assignment, "assignment")
+        logits_init = None if a_init is None else np.ascontiguousarray(np.asarray(a_init, dtype=float))
+        coords_init = None if t_init is None else np.ascontiguousarray(np.asarray(t_init, dtype=float))
+        payload = rust_module().sae_manifold_predict_oos(
             np.ascontiguousarray(x), list(self._basis_kinds), list(self._atom_dims),
             [np.ascontiguousarray(b) for b in self.decoder_blocks],
             [None if c is None else np.ascontiguousarray(c) for c in self._duchon_centers],
             [(int(h) if k in {"periodic", "torus"} else None) for k, h in zip(self._basis_kinds, self._n_harmonics)],
-            alpha=1.0, tau=0.5, assignment_kind=str(kind),
-            sparsity_strength=1.0, smoothness=1.0, max_iter=50, learning_rate=0.04, random_state=0,
-        ), dtype=float)
+            alpha=float(self.alpha), tau=float(self.tau), assignment_kind=str(kind),
+            sparsity_strength=float(self.sparsity_strength), smoothness=float(self.smoothness),
+            max_iter=int(self.max_iter), learning_rate=float(self.learning_rate),
+            initial_logits=logits_init, initial_coords=coords_init,
+        )
+        return dict(payload)
+
+    def reconstruct(self, X: Any, *, t_init: Any = None, a_init: Any = None) -> np.ndarray:
+        x = _as_2d_float(X, "X")
+        if t_init is None and a_init is None and x.shape == self.training_data.shape and np.allclose(x, self.training_data):
+            return self.fitted.copy()
+        payload = self._oos_payload(x, t_init=t_init, a_init=a_init)
+        return np.asarray(payload["fitted"], dtype=float)
 
     def predict(self, X: Any) -> np.ndarray:
         return self.reconstruct(X)
 
+    def encode(self, X: Any, *, t_init: Any = None, a_init: Any = None) -> np.ndarray:
+        """Out-of-sample per-token assignments ``a*`` of shape ``(N, K)``.
+
+        Runs the frozen-decoder OOS solve on ``X`` and returns the converged
+        assignment matrix. On training ``X`` (matched bit-exactly) the cached
+        fit assignments are returned without re-solving. ``t_init`` / ``a_init``
+        warm-start the refinement (#357)."""
+        x = _as_2d_float(X, "X")
+        if t_init is None and a_init is None and x.shape == self.training_data.shape and np.allclose(x, self.training_data):
+            return self.assignments.copy()
+        payload = self._oos_payload(x, t_init=t_init, a_init=a_init)
+        return np.asarray(payload["assignments_z"], dtype=float)
+
+    def converged_latents(self, X: Any | None = None, *, t_init: Any = None, a_init: Any = None) -> dict[str, Any]:
+        """Converged supervision targets for an amortized encoder (#357).
+
+        Returns ``{"coords": list[(N, d_k) ndarray], "assignments": (N, K)
+        ndarray, "logits": (N, K) ndarray, "fitted": (N, p) ndarray}`` — the
+        per-atom on-manifold coordinates ``t*`` and the assignments / gate
+        ``a*`` the joint solver converged to. With ``X is None`` (or training
+        ``X``) the stored training-fit latents are returned; otherwise the OOS
+        solve is run on ``X``, optionally warm-started from ``t_init`` /
+        ``a_init``."""
+        x = None if X is None else _as_2d_float(X, "X")
+        use_training = (
+            t_init is None and a_init is None
+            and (x is None or (x.shape == self.training_data.shape and np.allclose(x, self.training_data)))
+        )
+        if use_training:
+            return {
+                "coords": [c.copy() for c in self.coords],
+                "assignments": self.assignments.copy(),
+                "logits": self.low_level_logits.copy(),
+                "fitted": self.fitted.copy(),
+            }
+        payload = self._oos_payload(x, t_init=t_init, a_init=a_init)
+        return {
+            "coords": [np.asarray(atom["on_atom_coords_t"], dtype=float) for atom in payload["atoms"]],
+            "assignments": np.asarray(payload["assignments_z"], dtype=float),
+            "logits": np.asarray(payload["logits"], dtype=float),
+            "fitted": np.asarray(payload["fitted"], dtype=float),
+        }
+
+    def project(self, X: Any, atom_k: int) -> np.ndarray:
+        """Standalone per-atom projection ``project(x, atom_k) -> t`` (#357).
+
+        Maps each ambient point in ``X`` to its on-manifold coordinate for atom
+        ``atom_k`` under the trained decoder, via the same frozen-decoder OOS
+        solve. Returns the ``(N, d_k)`` coordinate block for that atom — the
+        minimal teacher signal for an encoder's coordinate head."""
+        k = int(atom_k)
+        if k < 0 or k >= len(self.atoms):
+            raise IndexError(f"atom_k={atom_k} out of range for K={len(self.atoms)} atoms")
+        x = _as_2d_float(X, "X")
+        if x.shape == self.training_data.shape and np.allclose(x, self.training_data):
+            return self.coords[k].copy()
+        payload = self._oos_payload(x)
+        return np.asarray(payload["atoms"][k]["on_atom_coords_t"], dtype=float)
+
     def per_atom_active_set(self, X: Any, threshold: float | None = None) -> np.ndarray:
-        _as_2d_float(X, "X")
-        return self.assignments >= (0.5 if threshold is None else float(threshold))
+        """Per-token active atom set ``(N, K)`` boolean mask for ``X``.
+
+        On training ``X`` (matched bit-exactly) the cached fit assignments are
+        thresholded without re-solving; otherwise the frozen-decoder OOS solve
+        is run on ``X`` and its converged assignments are thresholded."""
+        x = _as_2d_float(X, "X")
+        cut = 0.5 if threshold is None else float(threshold)
+        if x.shape == self.training_data.shape and np.allclose(x, self.training_data):
+            return self.assignments >= cut
+        payload = self._oos_payload(x)
+        return np.asarray(payload["assignments_z"], dtype=float) >= cut
 
     def per_atom_latent_for(self, X: Any) -> list[np.ndarray]:
-        _as_2d_float(X, "X")
-        return [c.copy() for c in self.coords]
+        """Per-atom on-manifold coordinates ``[(N, d_k), ...]`` for ``X``.
+
+        On training ``X`` (matched bit-exactly) the cached fit coordinates are
+        returned; otherwise the frozen-decoder OOS solve is run on ``X`` and its
+        converged per-atom coordinates are returned."""
+        x = _as_2d_float(X, "X")
+        if x.shape == self.training_data.shape and np.allclose(x, self.training_data):
+            return [c.copy() for c in self.coords]
+        payload = self._oos_payload(x)
+        return [np.asarray(atom["on_atom_coords_t"], dtype=float) for atom in payload["atoms"]]
 
     def get_decoder(self) -> list[np.ndarray]:
         return [b.copy() for b in self.decoder_blocks]
@@ -183,6 +288,12 @@ class ManifoldSAE:
             "assignment": self.assignment,
             "alpha": float(self.alpha),
             "learnable_alpha": bool(self.learnable_alpha),
+            "tau": float(self.tau),
+            "sparsity_strength": float(self.sparsity_strength),
+            "smoothness": float(self.smoothness),
+            "learning_rate": float(self.learning_rate),
+            "max_iter": int(self.max_iter),
+            "random_state": int(self.random_state),
             "primitive_names": list(self.primitive_names),
             "basis_specs": list(self.basis_specs),
             "reml_score": float(self.reml_score),
@@ -191,6 +302,7 @@ class ManifoldSAE:
             "training_data": self.training_data.tolist(),
             "fitted": self.fitted.tolist(),
             "assignments": self.assignments.tolist(),
+            "logits": self.low_level_logits.tolist(),
             "coords": [c.tolist() for c in self.coords],
             "decoder_blocks": [b.tolist() for b in self.decoder_blocks],
             "atoms": [
@@ -233,6 +345,7 @@ class ManifoldSAE:
         ]
         fitted = np.asarray(payload["fitted"], dtype=float)
         assigns = np.asarray(payload["assignments"], dtype=float)
+        logits = np.asarray(payload["logits"], dtype=float)
         coords = [np.asarray(c, dtype=float) for c in payload["coords"]]
         decoder_blocks = [np.asarray(b, dtype=float) for b in payload["decoder_blocks"]]
         score = float(payload["reml_score"])
@@ -258,6 +371,7 @@ class ManifoldSAE:
             training_mean=np.asarray(payload["training_mean"], dtype=float),
             training_data=np.asarray(payload["training_data"], dtype=float),
             low_level=low,
+            low_level_logits=logits,
             _basis_kinds=list(payload["basis_kinds"]),
             _atom_dims=[int(d) for d in payload["atom_dims"]],
             _basis_sizes=[int(s) for s in payload["basis_sizes"]],
@@ -265,6 +379,12 @@ class ManifoldSAE:
             _duchon_centers=centers,
             alpha=float(payload.get("alpha", 1.0)),
             learnable_alpha=bool(payload.get("learnable_alpha", False)),
+            tau=float(payload["tau"]),
+            sparsity_strength=float(payload["sparsity_strength"]),
+            smoothness=float(payload["smoothness"]),
+            learning_rate=float(payload["learning_rate"]),
+            max_iter=int(payload["max_iter"]),
+            random_state=int(payload["random_state"]),
         )
 
     @classmethod
@@ -312,6 +432,11 @@ class GumbelTemperatureSchedule:
             out["steps"] = int(self.steps)
         return out
 
+    def current_tau(self, iter_count: int) -> float:
+        """Temperature at ``iter_count``, evaluated by the Rust
+        ``GumbelTemperatureSchedule`` so the decay arithmetic has one home."""
+        return float(rust_module().gumbel_schedule_tau(self.to_rust_descriptor(), int(iter_count)))
+
 
 def gumbel_geometric_schedule(tau_start: float, tau_min: float, rate: float, iter_count: int = 0) -> GumbelTemperatureSchedule:
     return GumbelTemperatureSchedule(tau_start, tau_min, "geometric", rate=rate, iter_count=iter_count)
@@ -335,7 +460,8 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
                      Z: Any = None, sparsity_weight: float = 1.0, smoothness_weight: float = 1.0,
                      alpha: float | str = 1.0, learning_rate: float | None = None, random_state: int = 0,
                      block_orthogonality_weight: float = 0.0,
-                     top_k: int | None = None, **kwargs: Any) -> ManifoldSAE:
+                     top_k: int | None = None, t_init: Any = None, a_init: Any = None,
+                     **kwargs: Any) -> ManifoldSAE:
     """Fit an SAE-manifold model.
 
     ``decoder_feature_sparsity_groups`` was previously named
@@ -347,8 +473,21 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     *basis functions* (M_k) and the groups still index the ``p_out`` output
     features. The penalty drives basis-function-aligned feature groups to
     zero, encouraging each basis function to load on a single feature
-    cluster. Only ``k_atoms=1`` is supported — multi-atom SAEs would require
-    a stride-aware per-atom view that does not exist yet.
+    cluster. Multi-atom (``k_atoms >= 2``) SAEs are supported: the Rust
+    ``add_sae_beta_penalty`` dispatches the group-lasso per atom, rebuilding
+    the penalty target to each atom's ``(M_k, p_out)`` decoder block (#240).
+
+    Inputs and warm starts (issue #357). ``X`` / ``Z`` are *aliases* for the
+    response data matrix the SAE reconstructs — ``Z`` is **not** a warm start;
+    it is simply the named-argument form of the data. To warm-start the joint
+    solve from an amortized encoder's per-token prediction, pass ``a_init``
+    (assignment logits, shape ``(N, K)``) and/or ``t_init`` (on-manifold
+    coordinates, shape ``(K, N, D_max)`` with ``D_max >= max(atom_dim)``). With
+    a small ``n_iter`` the solver runs a bounded refinement of those seeds,
+    enabling the "encoder predicts -> solver refines -> distill the gap" loop.
+    The converged supervision targets ``t*`` / ``a*`` are read back via
+    :meth:`ManifoldSAE.converged_latents`, :meth:`ManifoldSAE.encode`, and the
+    standalone per-atom :meth:`ManifoldSAE.project`.
     """
     src = Z if Z is not None else X
     if src is None:
@@ -463,7 +602,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     penalties = [n for n, ok in (("IsometryPenalty", isometry_weight > 0.0), ("ARDPenalty", ard_per_atom),
         ("MechanismSparsityPenalty", decoder_feature_sparsity_groups is not None),
         ("BlockOrthogonalityPenalty", block_orthogonality_weight > 0.0)) if ok]
-    # Build the analytic-penalty registry payload that `sae_manifold_fit_auto`
+    # Build the analytic-penalty registry payload that `sae_manifold_fit_minimal`
     # passes into `run_joint_fit_arrow_schur`. The four user-facing knobs map
     # to descriptors targeting the SAE latent block "t" (shape (n_obs, d_max)
     # where d_max = max(atom_dim) — matches the registry latent built in
@@ -476,33 +615,89 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         block_orthogonality_weight=block_orthogonality_weight,
         d_max=max(dims),
         p_out=int(x.shape[1]),
-        k_atoms=k_atoms,
     )
+    # `top_k = 0` (legacy sentinel) and `None` both disable top-k gating;
+    # anything in `[1, k_atoms]` is forwarded to the Rust driver, which
+    # projects the final assignments onto a per-row top-k support and
+    # recomputes `fitted` from the projected distribution. The Rust kernel
+    # owns the hard top-k contract end to end — there is no Python-side mask.
+    top_k_arg = int(top_k) if (top_k is not None and int(top_k) > 0) else None
+    # Warm starts (issue #357): `a_init` (N, K) seeds the assignment logits and
+    # `t_init` (K, N, D_max) seeds the per-atom on-manifold coordinates, so an
+    # amortized encoder can predict `(a_init, t_init)` and have the joint solver
+    # refine them for a bounded `n_iter` steps. Both are optional and validated
+    # eagerly here against (N, K) / (K, N, D_max) where D_max = max(dims).
+    d_max = max(dims)
+    logits_init = None
+    if a_init is not None:
+        logits_init = np.ascontiguousarray(np.asarray(a_init, dtype=np.float64))
+        if logits_init.shape != (n_obs, k_atoms):
+            raise ValueError(
+                f"sae_manifold_fit: a_init must have shape (N, K)=({n_obs}, {k_atoms}); "
+                f"got {logits_init.shape}"
+            )
+    coords_init = None
+    if t_init is not None:
+        coords_init = np.ascontiguousarray(np.asarray(t_init, dtype=np.float64))
+        if coords_init.ndim != 3 or coords_init.shape[0] != k_atoms or coords_init.shape[1] != n_obs:
+            raise ValueError(
+                f"sae_manifold_fit: t_init must have shape (K, N, D_max)=({k_atoms}, {n_obs}, >={d_max}); "
+                f"got {coords_init.shape}"
+            )
+        if coords_init.shape[2] < d_max:
+            raise ValueError(
+                f"sae_manifold_fit: t_init D_max={coords_init.shape[2]} is too small for "
+                f"max atom dim {d_max}"
+            )
     payload = rust_module().sae_manifold_fit_minimal(
         np.ascontiguousarray(x),
-        int(k_atoms),
         [str(b) for b in bases],
         [int(d) for d in dims],
-        str(kind),
         float(alpha_value),
         float(tau),
         bool(alpha == "auto"),
-        float(sparsity),
-        float(smoothness),
-        int(max_iter_total),
-        float(effective_lr),
-        int(random_state),
-        int(top_k) if top_k is not None else 0,
+        str(kind),
+        sparsity_strength=float(sparsity),
+        smoothness=float(smoothness),
+        max_iter=int(max_iter_total),
+        learning_rate=float(effective_lr),
         gumbel_schedule=_schedule_payload(gumbel_schedule),
         analytic_penalties=analytic_penalties_json,
+        random_state=int(random_state),
+        top_k=top_k_arg,
+        initial_logits=logits_init,
+        initial_coords=coords_init,
     )
     payload_dict = dict(payload)
-    if top_k is not None and int(top_k) > 0 and int(top_k) < k_atoms:
-        _apply_top_k_mask(payload_dict, int(top_k))
     return ManifoldSAE.from_payload(
         x, payload_dict, resolved_topology, assignment, penalties,
         alpha=float(alpha_value), learnable_alpha=bool(alpha == "auto"),
+        tau=float(tau), sparsity_strength=float(sparsity), smoothness=float(smoothness),
+        learning_rate=float(effective_lr), max_iter=int(max_iter_total),
+        random_state=int(random_state),
     )
+
+
+def _require_sae_row_block_penalty(kind: str, kwarg: str) -> None:
+    """Refuse a SAE row-block penalty the running extension does not advertise.
+
+    The compiled extension reports the row-block penalty kinds it supports via
+    ``build_info()["sae_row_block_penalties"]`` (kept in lockstep with the Rust
+    ``sae_penalty_is_row_block_supported`` matcher). A stale binary that predates
+    a given penalty either omits the key entirely or lists a subset; forwarding
+    the descriptor anyway would surface as a cryptic internal Schur-Cholesky
+    error. Detect the mismatch here and raise a clear ``NotImplementedError``
+    naming the user-facing kwarg (issue #338).
+    """
+    supported = rust_module().build_info().get("sae_row_block_penalties", [])
+    if kind not in supported:
+        raise NotImplementedError(
+            f"sae_manifold_fit: {kwarg} requires SAE row-block penalty "
+            f"'{kind}', which the installed gam-pyffi extension does not "
+            "advertise (it predates row-block support for this penalty). "
+            f"Upgrade gamfit to a build that supports '{kind}', or pass "
+            f"{kwarg}=0.0 to disable it."
+        )
 
 
 def _build_analytic_penalties_payload(
@@ -513,39 +708,35 @@ def _build_analytic_penalties_payload(
     block_orthogonality_weight: float,
     d_max: int,
     p_out: int,
-    k_atoms: int,
 ) -> str | None:
     """Translate the SAE regularizer knobs into the analytic-penalty JSON
-    payload consumed by ``sae_manifold_fit_auto``.
+    payload consumed by ``sae_manifold_fit_minimal``.
 
     All five knobs now route through ``src/terms/sae_manifold.rs``.
     ``ard_per_atom``, ``isometry_weight``, and ``block_orthogonality_weight``
     target the row-block driver ("t" latent block).
     ``decoder_feature_sparsity_groups`` targets the decoder coefficient
-    block ("beta" latent block, shape ``(M, p_out)`` for ``k_atoms == 1``)
-    and group-lassoes ``p_out`` features in rows of the per-basis-function
-    decoder matrix.
+    block ("beta" latent block) and group-lassoes ``p_out`` features in rows
+    of the per-basis-function decoder matrix. For ``k_atoms >= 2`` the Rust
+    ``add_sae_beta_penalty`` dispatches the group-lasso per atom, rebuilding
+    the penalty target to each atom's ``(M_k, p_out)`` decoder block, so the
+    concatenated ``flatten_beta`` layout with distinct ``M_k`` is handled
+    natively (#240).
     """
-    if decoder_feature_sparsity_groups is not None and int(k_atoms) != 1:
-        # The "beta" latent block in `sae_manifold_fit_inner` (FFI) only
-        # exists for k_atoms == 1, because `flatten_beta` concatenates
-        # per-atom (M_k, p_out) blocks with possibly distinct M_k and no
-        # single (latent_dim, p_features) reshape covers all of them.
-        raise NotImplementedError(
-            "sae_manifold_fit: decoder_feature_sparsity_groups is currently "
-            f"only supported for k_atoms == 1; got k_atoms={int(k_atoms)}. "
-            "Multi-atom decoder group-lasso requires a stride-aware "
-            "per-atom target view in `src/terms/sae_manifold.rs`."
-        )
     items: list[dict[str, Any]] = []
     if bool(ard_per_atom):
+        _require_sae_row_block_penalty("ard", "ard_per_atom")
         items.append({"kind": "ard", "target": "t"})
     if isometry_weight is not None and float(isometry_weight) > 0.0:
+        _require_sae_row_block_penalty("isometry", "isometry_weight")
         items.append({"kind": "isometry", "target": "t"})
     if (
         block_orthogonality_weight is not None
         and float(block_orthogonality_weight) > 0.0
     ):
+        _require_sae_row_block_penalty(
+            "block_orthogonality", "block_orthogonality_weight"
+        )
         # The latent block "t" is (n_obs, d_max). BlockOrth requires ≥2
         # groups that partition contiguous axes from 0 — split into
         # singletons so each axis is in its own group, which is the most
@@ -598,32 +789,6 @@ def _build_analytic_penalties_payload(
     if not items:
         return None
     return json.dumps(items)
-
-
-def _apply_top_k_mask(payload: dict, top_k: int) -> None:
-    """Zero out all but the top-k assignments per row.
-
-    The Rust kernel does not yet enforce hard top-k selection internally;
-    the closed-form solver returns dense softmax/IBP probabilities. Apply
-    the constraint in Python so the user-facing assignment matrix honours
-    ``top_k``. Per-atom ``assignments_z`` slices and the global
-    ``assignments_z`` matrix stay consistent after masking.
-    """
-    A = np.asarray(payload["assignments_z"], dtype=float)
-    if A.ndim != 2 or A.shape[1] <= top_k:
-        return
-    keep = np.argpartition(-A, top_k - 1, axis=1)[:, :top_k]
-    mask = np.zeros_like(A)
-    rows = np.arange(A.shape[0])[:, None]
-    mask[rows, keep] = 1.0
-    A_masked = A * mask
-    payload["assignments_z"] = A_masked
-    new_atoms = []
-    for j, atom in enumerate(payload.get("atoms", [])):
-        atom_copy = dict(atom)
-        atom_copy["assignments_z"] = A_masked[:, j]
-        new_atoms.append(atom_copy)
-    payload["atoms"] = new_atoms
 
 
 def _as_2d_float(value: Any, name: str) -> np.ndarray:

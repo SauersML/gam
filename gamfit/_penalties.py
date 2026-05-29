@@ -287,7 +287,7 @@ def _penalty_value_grad_via_rust(
     original_shape = t_array.shape
     flat = t_array.reshape(-1)
     latents_json, penalties_json = _penalty_latents_and_descriptor(wrapper, t_array)
-    value, grad_target, _grad_rho = eval_fn(
+    value, grad_target, _grad_rho, _grad_jac = eval_fn(
         latents_json,
         penalties_json,
         flat,

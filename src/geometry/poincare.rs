@@ -58,6 +58,29 @@ pub const BOUNDARY_EPS: f64 = 1.0e-5;
 /// not a degeneracy — they are the well-defined identity case.
 pub const ORIGIN_EPS: f64 = 1.0e-15;
 
+/// Largest radial exp-map argument `s = sqrt(k)|v|` worth evaluating
+/// hyperbolic functions at. Above this, `tanh(s)` is already
+/// `1 - BOUNDARY_EPS` in f64 (and `cosh`/`sinh` would eventually overflow to
+/// `inf` near `s ≈ 710`), so the Lorentz lift caps `s` here to stay finite
+/// while landing on the same clamped boundary as the Poincaré path. Derived
+/// from [`BOUNDARY_EPS`] — no magic literal: `atanh(1 - BOUNDARY_EPS) ≈ 6.1`.
+const EXP_SATURATION_CAP: f64 = {
+    // `atanh` is not const-evaluable; the cap is fixed by BOUNDARY_EPS as
+    // `atanh(1 - BOUNDARY_EPS)` and is pinned by
+    // `exp_saturation_cap_matches_boundary_eps`.
+    6.1030338227611125
+};
+
+/// Poincaré exp radial coefficient `tanh(s)/s` with the open-ball boundary
+/// clamp baked in. Because `sqrt(k)|exp_0(v)| = tanh(s)`, clamping `tanh(s)`
+/// to `1 - BOUNDARY_EPS` makes the output norm exactly `max_norm`, i.e.
+/// strictly interior and consistent with [`project_into_ball`]. Callers must
+/// guard `s > ORIGIN_EPS` before calling (norms at/under the origin floor
+/// short-circuit to the identity), so no divide-by-zero is introduced.
+fn exp_coeff(s: f64) -> f64 {
+    (s.tanh().min(1.0 - BOUNDARY_EPS)) / s
+}
+
 fn require_negative_curvature(curvature: f64) -> GeometryResult<f64> {
     if !(curvature < 0.0) || !curvature.is_finite() {
         return Err(GeometryError::InvalidPoint(
@@ -202,7 +225,7 @@ pub fn exp_origin(v: ArrayView1<'_, f64>, curvature: f64) -> GeometryResult<Arra
         return Ok(out);
     }
     let s = sqrt_negc * norm;
-    let coeff = s.tanh() / s;
+    let coeff = exp_coeff(s);
     for x in out.iter_mut() {
         *x *= coeff;
     }
@@ -225,6 +248,11 @@ pub struct TangentDecodeCache {
     pub v: Array2<f64>,
     /// Atom positions used (after ball projection), shape `(F, d)`.
     pub atoms_projected: Array2<f64>,
+    /// Per-atom radial ball-projection factor `s_f = min(1, max_norm/|a_raw|)`,
+    /// shape `(F,)`. `s_f == 1` for atoms that were already inside the ball;
+    /// `s_f < 1` marks the atoms that were clamped and so carry a non-identity
+    /// projection Jacobian in [`tangent_decode_backward`] step 4.
+    pub proj_scale: Array1<f64>,
     /// Gate matrix used, shape `(batch, F)`.
     pub gates: Array2<f64>,
     /// Curvature used.
@@ -250,15 +278,23 @@ fn check_atoms_shape(atoms: ArrayView2<'_, f64>, gates: ArrayView2<'_, f64>) -> 
 }
 
 /// Project every atom into the ball, then take `log_0` row-wise.
+///
+/// Returns `(projected, tangents, proj_scale)` where `proj_scale[f]` is the
+/// radial ball-projection factor `s_f = min(1, max_norm / |a_raw_f|)` that was
+/// applied to atom `f`. `s_f == 1` means the raw atom was already inside the
+/// ball (projection is the identity); `s_f < 1` means it was clamped and the
+/// projection Jacobian is non-trivial — [`tangent_decode_backward`] needs
+/// `s_f` to chain the gradient back to the *raw* atom storage.
 fn project_and_log(
     atoms: ArrayView2<'_, f64>,
     curvature: f64,
-) -> GeometryResult<(Array2<f64>, Array2<f64>)> {
+) -> GeometryResult<(Array2<f64>, Array2<f64>, Array1<f64>)> {
     let sqrt_negc = require_negative_curvature(curvature)?;
     let max_norm = (1.0 - BOUNDARY_EPS) / sqrt_negc;
     let (f_atoms, d) = atoms.dim();
     let mut projected = Array2::<f64>::zeros((f_atoms, d));
     let mut tangents = Array2::<f64>::zeros((f_atoms, d));
+    let mut proj_scale = Array1::<f64>::ones(f_atoms);
     for f in 0..f_atoms {
         let row = atoms.row(f);
         let nrm = row.iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -267,6 +303,7 @@ fn project_and_log(
         } else {
             1.0
         };
+        proj_scale[f] = scale;
         for i in 0..d {
             projected[[f, i]] = row[i] * scale;
         }
@@ -284,7 +321,7 @@ fn project_and_log(
             tangents[[f, i]] = coeff * projected[[f, i]];
         }
     }
-    Ok((projected, tangents))
+    Ok((projected, tangents, proj_scale))
 }
 
 /// Forward pass for the Poincaré tangent-space-at-origin decoder.
@@ -298,7 +335,7 @@ pub fn tangent_decode_forward(
 ) -> GeometryResult<(Array2<f64>, TangentDecodeCache)> {
     check_atoms_shape(atoms, gates)?;
     let sqrt_negc = require_negative_curvature(curvature)?;
-    let (projected, tangents) = project_and_log(atoms, curvature)?;
+    let (projected, tangents, proj_scale) = project_and_log(atoms, curvature)?;
     let v = gates.dot(&tangents);
     let (batch, d) = v.dim();
     let mut x_hat = Array2::<f64>::zeros((batch, d));
@@ -309,7 +346,7 @@ pub fn tangent_decode_forward(
             continue;
         }
         let s = sqrt_negc * nrm;
-        let coeff = s.tanh() / s;
+        let coeff = exp_coeff(s);
         for i in 0..d {
             x_hat[[b, i]] = coeff * v[[b, i]];
         }
@@ -318,6 +355,7 @@ pub fn tangent_decode_forward(
         tangents,
         v,
         atoms_projected: projected,
+        proj_scale,
         gates: gates.to_owned(),
         curvature,
     };
@@ -433,22 +471,44 @@ pub fn tangent_decode_backward(
         }
     }
 
-    // Step 4: optional chain rule through the radial ball projection
-    // a_proj = a * min(1, max_norm / |a|). For atoms that were strictly
-    // inside, the projection is the identity and we are done. For atoms
-    // outside, a_proj = (max_norm / |a|) * a, whose Jacobian is
+    // Step 4: chain rule through the radial ball projection
+    // a_proj = a_raw * s_f, with s_f = min(1, max_norm / |a_raw|).
     //
-    //   ∂a_proj_i/∂a_j = (max_norm / |a|) (δ_{ij} - a_i a_j / |a|^2).
+    // For atoms that were strictly inside (s_f == 1) the projection is the
+    // identity and grad_a_raw == grad_a_proj. For atoms that were clamped
+    // (s_f < 1), a_proj = (max_norm / |a_raw|) a_raw, whose Jacobian is
     //
-    // We compare original atoms (not available here) — but `cache.atoms_projected`
-    // is exactly the post-projection value the gradient was computed on, and
-    // for the Python wrapper the parameter is the *raw* atom storage. The
-    // projection is only fired in pathological cases; we pass through the
-    // gradient unchanged here so that the optimiser still moves atoms back
-    // toward the interior (the projection is idempotent so this is the
-    // correct "use the projected gradient" semantics; documented at the
-    // call site).
-    let grad_atoms = grad_atoms_proj;
+    //   ∂a_proj_i/∂a_raw_j = s_f (δ_{ij} - â_i â_j),   â = a_raw / |a_raw|.
+    //
+    // Since a_proj is parallel to a_raw, â = a_proj / |a_proj|, and the
+    // transpose-applied VJP is grad_a_raw = s_f (I - â âᵀ) grad_a_proj. The
+    // radial component of grad_a_proj is annihilated (moving the raw atom
+    // radially outward does not change the clamped projection) — exactly the
+    // missing factor the previous pass-through dropped.
+    let mut grad_atoms = grad_atoms_proj;
+    for f in 0..n_atoms {
+        let s_f = cache.proj_scale[f];
+        if s_f >= 1.0 {
+            continue;
+        }
+        let a_row = cache.atoms_projected.row(f);
+        let a_norm_sq: f64 = (0..d).map(|i| a_row[i] * a_row[i]).sum();
+        if a_norm_sq <= ORIGIN_EPS * ORIGIN_EPS {
+            // Clamp toward the origin cannot fire with a zero-norm projection;
+            // nothing radial to remove.
+            for j in 0..d {
+                grad_atoms[[f, j]] *= s_f;
+            }
+            continue;
+        }
+        // â âᵀ projector onto the radial direction.
+        let g_row: Vec<f64> = (0..d).map(|j| grad_atoms[[f, j]]).collect();
+        let g_dot_a: f64 = (0..d).map(|i| g_row[i] * a_row[i]).sum();
+        let radial_coeff = g_dot_a / a_norm_sq;
+        for j in 0..d {
+            grad_atoms[[f, j]] = s_f * (g_row[j] - radial_coeff * a_row[j]);
+        }
+    }
 
     Ok((grad_gates, grad_atoms))
 }
@@ -462,19 +522,30 @@ pub fn tangent_decode_backward(
 /// Rescale `y -> sqrt(k) y` so `|ŷ| < 1`, apply the unit-curvature
 /// projection, then divide by `sqrt(k)` to land on the hyperboloid of
 /// curvature `c = -k`. The output is `(x_0, x_s)` packed as `(d+1)`-vector.
+///
+/// The input is first run through [`project_into_ball`] so the boundary-
+/// vanishing denominator `1 - |ŷ|^2` is bounded below by `~2·BOUNDARY_EPS`.
+/// A point on (or outside) the ideal boundary would otherwise drive the
+/// denominator to the `ORIGIN_EPS` floor (`1e-15`) and blow the output up by
+/// `~1e15`; projecting first keeps the map well-conditioned and makes the
+/// `from_lorentz ∘ to_lorentz` round-trip equal `project_into_ball(y)`.
 pub fn to_lorentz(y: ArrayView1<'_, f64>, curvature: f64) -> GeometryResult<Array1<f64>> {
     let sqrt_negc = require_negative_curvature(curvature)?;
     let d = y.len();
     if d == 0 {
         return Err(GeometryError::InvalidPoint("to_lorentz requires d >= 1"));
     }
-    let yhat_sq: f64 = y.iter().map(|v| (sqrt_negc * v).powi(2)).sum();
-    let denom = (1.0 - yhat_sq).max(ORIGIN_EPS);
+    let y_proj = project_into_ball(y, curvature)?;
+    let yhat_sq: f64 = y_proj.iter().map(|v| (sqrt_negc * v).powi(2)).sum();
+    // After `project_into_ball`, `sqrt(k)|y| <= 1 - BOUNDARY_EPS`, so
+    // `1 - yhat_sq >= 2·BOUNDARY_EPS - BOUNDARY_EPS^2 > 0`; the floor is a
+    // defensive no-op held at `BOUNDARY_EPS` (never the `1e15` `ORIGIN_EPS`).
+    let denom = (1.0 - yhat_sq).max(BOUNDARY_EPS);
     let z0 = (1.0 + yhat_sq) / denom;
     let mut out = Array1::<f64>::zeros(d + 1);
     out[0] = z0 / sqrt_negc;
     for i in 0..d {
-        out[i + 1] = (2.0 * sqrt_negc * y[i] / denom) / sqrt_negc;
+        out[i + 1] = (2.0 * sqrt_negc * y_proj[i] / denom) / sqrt_negc;
     }
     Ok(out)
 }
@@ -495,7 +566,12 @@ pub fn from_lorentz(x: ArrayView1<'_, f64>, curvature: f64) -> GeometryResult<Ar
         let xs_scaled = x[i + 1] * sqrt_negc;
         out[i] = (xs_scaled / denom) / sqrt_negc;
     }
-    Ok(out)
+    // Symmetric with `to_lorentz`, which projects its input into the ball:
+    // enforce the open-ball invariant `sqrt(k)|out| <= 1 - BOUNDARY_EPS` here
+    // too. `tanh(s/2)` saturates to exactly 1.0 for large hyperboloid points,
+    // which would land `out` ON the ideal boundary; the projection nudges it
+    // strictly interior so every `from_lorentz` consumer is boundary-safe.
+    project_into_ball(out.view(), curvature)
 }
 
 /// Lorentz log at the origin `o = (1/sqrt(k), 0, ..., 0)`.
@@ -538,9 +614,22 @@ pub fn lorentz_exp_origin(
     let norm_sq: f64 = v_spatial.iter().map(|x| x * x).sum();
     let norm = norm_sq.sqrt().max(ORIGIN_EPS);
     let s = sqrt_negc * norm;
+    // Cap the argument fed to `cosh`/`sinh`. For `s` beyond ~710 these
+    // overflow to `inf`, giving an `inf/(inf+1) = NaN` ball point downstream;
+    // mathematically the hyperboloid point's spatial/temporal ratio is
+    // `tanh(s) -> 1`, so capping at `EXP_SATURATION_CAP` (where `tanh` already
+    // reads `1 - BOUNDARY_EPS` in f64) keeps the lift finite and lands on the
+    // same clamped boundary the Poincaré path produces. `from_lorentz` then
+    // projects strictly interior, so the composed decode never NaNs.
+    let s_eval = s.min(EXP_SATURATION_CAP);
     let mut out = Array1::<f64>::zeros(d + 1);
-    out[0] = s.cosh() / sqrt_negc;
-    let coeff = s.sinh() / s;
+    out[0] = s_eval.cosh() / sqrt_negc;
+    // Radial scaling stays in the original (uncapped) tangent direction: the
+    // spatial part is `(sinh(s_eval)/s) * v`, i.e. the capped hyperbolic
+    // magnitude distributed along `v`. `from_lorentz`'s ratio depends only on
+    // `cosh`/`sinh` of `s_eval`, so the cap and projection together fix the
+    // output norm at `max_norm` exactly as the Poincaré path does.
+    let coeff = s_eval.sinh() / s;
     for i in 0..d {
         out[i + 1] = coeff * v_spatial[i];
     }
@@ -712,6 +801,50 @@ mod tests {
     }
 
     #[test]
+    fn lorentz_round_trip_interior_point() {
+        // For a point strictly inside the ball, `project_into_ball` is the
+        // identity, so `from_lorentz(to_lorentz(y)) == y` exactly.
+        let y = array![0.2, -0.15, 0.05];
+        let z = to_lorentz(y.view(), -1.0).expect("to_lorentz");
+        assert!(z.iter().all(|v| v.is_finite()), "lorentz image must be finite");
+        let back = from_lorentz(z.view(), -1.0).expect("from_lorentz");
+        for i in 0..y.len() {
+            assert!(
+                (back[i] - y[i]).abs() < 1.0e-12,
+                "round trip mismatch at {i}: {} vs {}",
+                back[i],
+                y[i]
+            );
+        }
+    }
+
+    #[test]
+    fn lorentz_round_trip_near_boundary_equals_projection() {
+        // A point on/outside the ideal boundary must not blow up: the
+        // composition equals `project_into_ball(y)` (the boundary clamp),
+        // and the intermediate hyperboloid point stays finite.
+        for curvature in [-1.0, -0.25, -4.0] {
+            let y = array![1.5, 0.0, 0.0];
+            let z = to_lorentz(y.view(), curvature).expect("to_lorentz");
+            assert!(
+                z.iter().all(|v| v.is_finite()),
+                "boundary point must yield a finite hyperboloid image, got {z:?}"
+            );
+            let back = from_lorentz(z.view(), curvature).expect("from_lorentz");
+            let expected = project_into_ball(y.view(), curvature).expect("project");
+            for i in 0..y.len() {
+                assert!(
+                    (back[i] - expected[i]).abs() < 1.0e-9,
+                    "near-boundary round trip must equal projection at {i} \
+                     (curvature {curvature}): {} vs {}",
+                    back[i],
+                    expected[i]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn tangent_decode_collapses_to_linear_in_small_input_limit() {
         // For very small atoms and gates the tangent decoder must be
         // ε-close to the Euclidean linear mixing z @ atoms.
@@ -812,6 +945,74 @@ mod tests {
     }
 
     #[test]
+    fn tangent_backward_includes_ball_projection_jacobian() {
+        // Atom 0 starts strictly OUTSIDE the unit ball (|a| ≈ 2.24 > 1 for
+        // curvature -1) so `project_into_ball` clamps it. The backward must
+        // then chain grad through the radial projection a_proj = s·a_raw,
+        // i.e. left-multiply by s·(I - â âᵀ). Finite-differencing the forward
+        // w.r.t. the *raw* atom storage is the only correct guardrail: the
+        // forward consumes raw atoms and re-projects internally, so the FD
+        // gradient is exactly the projected gradient.
+        let atoms = array![[2.0, 1.0], [-0.03, 0.04]];
+        let gates = array![[0.7, -0.5], [0.2, 0.9]];
+        let (x_hat, cache) =
+            tangent_decode_forward(atoms.view(), gates.view(), -1.0).expect("forward");
+        // Atom 0 must have actually been clamped (s_0 < 1); otherwise this
+        // test would silently exercise the identity branch and prove nothing.
+        assert!(
+            cache.proj_scale[0] < 1.0,
+            "atom 0 should have been clamped, got proj_scale {}",
+            cache.proj_scale[0]
+        );
+        assert!(
+            (cache.proj_scale[1] - 1.0).abs() < 1.0e-12,
+            "atom 1 should be interior (proj_scale == 1), got {}",
+            cache.proj_scale[1]
+        );
+
+        let mut grad_x = Array2::<f64>::zeros(x_hat.dim());
+        for i in 0..x_hat.dim().0 {
+            for j in 0..x_hat.dim().1 {
+                grad_x[[i, j]] = 2.0 * x_hat[[i, j]];
+            }
+        }
+        let (_grad_gates, grad_atoms) =
+            tangent_decode_backward(&cache, grad_x.view()).expect("backward");
+
+        let eps = 1.0e-6;
+        // Finite-difference BOTH raw components of the clamped atom 0.
+        for comp in 0..2usize {
+            let mut atoms_p = atoms.clone();
+            atoms_p[[0, comp]] += eps;
+            let (x_p, _) = tangent_decode_forward(atoms_p.view(), gates.view(), -1.0).unwrap();
+            let mut atoms_m = atoms.clone();
+            atoms_m[[0, comp]] -= eps;
+            let (x_m, _) = tangent_decode_forward(atoms_m.view(), gates.view(), -1.0).unwrap();
+            let lp: f64 = x_p.iter().map(|v| v * v).sum();
+            let lm: f64 = x_m.iter().map(|v| v * v).sum();
+            let fd = (lp - lm) / (2.0 * eps);
+            assert!(
+                (fd - grad_atoms[[0, comp]]).abs() < 1.0e-5,
+                "clamped-atom grad comp {comp}: analytic {} vs FD {}",
+                grad_atoms[[0, comp]],
+                fd
+            );
+        }
+
+        // The radial component of the analytic gradient on the clamped atom
+        // must be (numerically) annihilated: moving the raw atom further out
+        // radially does not change its projection, so the projected gradient
+        // is orthogonal to â. Verify directly.
+        let a0 = cache.atoms_projected.row(0);
+        let a0_norm = (a0[0] * a0[0] + a0[1] * a0[1]).sqrt();
+        let radial = (grad_atoms[[0, 0]] * a0[0] + grad_atoms[[0, 1]] * a0[1]) / a0_norm;
+        assert!(
+            radial.abs() < 1.0e-8,
+            "clamped-atom gradient should have ~zero radial component, got {radial}"
+        );
+    }
+
+    #[test]
     fn lorentz_backward_matches_finite_difference_of_lorentz_forward() {
         // Same tolerance as the Poincaré FD test, but the FD probes the
         // Lorentz forward (`lorentz_decode_forward`) rather than the
@@ -882,6 +1083,104 @@ mod tests {
             grad_atoms[[1, 0]],
             fd_atom
         );
+    }
+
+    #[test]
+    fn exp_saturation_cap_matches_boundary_eps() {
+        // The named cap must equal `atanh(1 - BOUNDARY_EPS)` so the Lorentz
+        // lift caps exactly where `tanh` first reads `1 - BOUNDARY_EPS` in f64.
+        let expected = (1.0 - BOUNDARY_EPS).atanh();
+        assert!(
+            (EXP_SATURATION_CAP - expected).abs() < 1.0e-12,
+            "cap {EXP_SATURATION_CAP} vs atanh(1-eps) {expected}"
+        );
+    }
+
+    #[test]
+    fn exp_origin_large_tangent_stays_strictly_interior() {
+        // Regression for #354: a large tangent must not saturate ONTO the ball
+        // boundary. `tanh(s)` rounds to exactly 1.0 for s ≳ 19, so the
+        // unclamped map would land |x| == 1; the clamp keeps it interior.
+        for curvature in [-1.0_f64, -0.25, -4.0] {
+            let sqrt_negc = (-curvature).sqrt();
+            let max_norm = (1.0 - BOUNDARY_EPS) / sqrt_negc;
+            let v = array![1.0e3, -5.0e2, 2.0e2, 7.0e1];
+            let x = exp_origin(v.view(), curvature).expect("exp");
+            assert!(x.iter().all(|q| q.is_finite()), "exp must be finite: {x:?}");
+            let norm = x.iter().map(|q| q * q).sum::<f64>().sqrt();
+            assert!(
+                sqrt_negc * norm <= 1.0 - BOUNDARY_EPS + 1.0e-12,
+                "exp must stay strictly interior (curvature {curvature}): \
+                 sqrt(k)|x| = {}",
+                sqrt_negc * norm
+            );
+            assert!(
+                (norm - max_norm).abs() < 1.0e-9,
+                "saturated exp must sit at max_norm {max_norm}, got {norm}"
+            );
+            // log/distance must remain finite for the clamped point.
+            let origin = Array1::<f64>::zeros(x.len());
+            let dist = poincare_distance(origin.view(), x.view(), curvature).expect("dist");
+            assert!(dist.is_finite(), "distance must be finite, got {dist}");
+        }
+    }
+
+    #[test]
+    fn lorentz_exp_origin_large_tangent_is_finite_and_interior() {
+        // Companion regression for #354 on the Lorentz path: large tangents
+        // must not overflow cosh/sinh to inf (which becomes NaN downstream),
+        // and the round-tripped ball point must stay strictly interior.
+        for curvature in [-1.0_f64, -0.25, -4.0] {
+            let sqrt_negc = (-curvature).sqrt();
+            // Spatial tangent with norm ~1e3 — far past both the tanh-1.0
+            // saturation (s ≳ 19) and the cosh/sinh overflow (s ≳ 710) regimes.
+            let v = array![1.0e3, -5.0e2, 2.0e2];
+            let x_h = lorentz_exp_origin(v.view(), curvature).expect("lorentz exp");
+            assert!(
+                x_h.iter().all(|q| q.is_finite()),
+                "lorentz hyperboloid point must be finite, got {x_h:?}"
+            );
+            let y = from_lorentz(x_h.view(), curvature).expect("from_lorentz");
+            assert!(
+                y.iter().all(|q| q.is_finite()),
+                "ball point must be finite, got {y:?}"
+            );
+            let norm = y.iter().map(|q| q * q).sum::<f64>().sqrt();
+            assert!(
+                sqrt_negc * norm <= 1.0 - BOUNDARY_EPS + 1.0e-12,
+                "lorentz decode must stay strictly interior (curvature \
+                 {curvature}): sqrt(k)|y| = {}",
+                sqrt_negc * norm
+            );
+        }
+    }
+
+    #[test]
+    fn decode_large_gates_stay_strictly_interior_both_paths() {
+        // End-to-end #354 repro analog: large gates drive a large aggregated
+        // tangent. Both the Poincaré and Lorentz decoders must return points
+        // strictly inside the ball (not on the boundary).
+        let atoms = array![
+            [0.3, 0.1, -0.2, 0.05, 0.0, 0.1],
+            [-0.1, 0.2, 0.05, -0.15, 0.1, 0.0],
+            [0.05, -0.05, 0.2, 0.1, -0.1, 0.15],
+            [0.1, 0.1, -0.1, 0.2, 0.05, -0.05],
+        ];
+        let gates = Array2::<f64>::from_elem((3, 4), 1.0e3);
+        let curvature = -1.0;
+
+        let (x_p, _) =
+            tangent_decode_forward(atoms.view(), gates.view(), curvature).expect("poincare");
+        let x_l = lorentz_decode_forward(atoms.view(), gates.view(), curvature).expect("lorentz");
+        for x in [&x_p, &x_l] {
+            for b in 0..x.dim().0 {
+                let norm = (0..x.dim().1).map(|i| x[[b, i]] * x[[b, i]]).sum::<f64>().sqrt();
+                assert!(
+                    norm.is_finite() && norm <= 1.0 - BOUNDARY_EPS + 1.0e-12,
+                    "decode row {b} must be strictly interior, got norm {norm}"
+                );
+            }
+        }
     }
 
     #[test]

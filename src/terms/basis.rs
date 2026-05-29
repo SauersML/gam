@@ -17,7 +17,8 @@ use faer::Side;
 use faer::sparse::{SparseColMat, Triplet};
 use ndarray::parallel::prelude::*;
 use ndarray::{
-    Array, Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Axis, s,
+    Array, Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2,
+    Axis, s,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -21188,6 +21189,316 @@ pub fn duchon_polynomial_first_derivative_nd(
     out
 }
 
+/// Per-`(row, center)` input-location jet of a radial kernel from its scalar
+/// first derivative `φ'(r)`.
+///
+/// `phi_r[n, k] = φ'(r_{nk})`. The full gradient w.r.t. the latent input is
+///
+/// ```text
+/// ∂Φ_{n,k}/∂t_{n,a} = φ'(r_{nk}) · (t_{n,a} − c_{k,a}) / r_{nk}.
+/// ```
+///
+/// At a collision (`r ≤ 1e-12`) the gradient is the zero vector — the radial
+/// kernel has a stationary point at the center, so every axis derivative
+/// vanishes there. Output shape `(n_rows, n_centers, dim)`.
+pub fn radial_input_location_jet_nd(
+    t: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    phi_r: ArrayView2<'_, f64>,
+) -> Result<Array3<f64>, BasisError> {
+    let n_rows = t.nrows();
+    let n_centers = centers.nrows();
+    let dim = t.ncols();
+    if phi_r.dim() != (n_rows, n_centers) {
+        crate::bail_dim_basis!(
+            "radial_input_location_jet_nd: phi_r shape {:?} != ({n_rows}, {n_centers})",
+            phi_r.dim()
+        );
+    }
+    if centers.ncols() != dim {
+        crate::bail_dim_basis!(
+            "radial_input_location_jet_nd: t has {dim} cols but centers have {}",
+            centers.ncols()
+        );
+    }
+    let mut out = Array3::<f64>::zeros((n_rows, n_centers, dim));
+    for n in 0..n_rows {
+        for k in 0..n_centers {
+            let mut r2 = 0.0_f64;
+            for a in 0..dim {
+                let delta = t[[n, a]] - centers[[k, a]];
+                r2 += delta * delta;
+            }
+            let r = r2.sqrt();
+            if r <= 1.0e-12 {
+                continue;
+            }
+            let scale = phi_r[[n, k]] / r;
+            for a in 0..dim {
+                out[[n, k, a]] = scale * (t[[n, a]] - centers[[k, a]]);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Forward design and input-location first jet of the scale-free Duchon atom
+/// used by the SAE-manifold path, recomputed self-consistently at arbitrary
+/// latent coordinates `t`.
+///
+/// The column layout matches [`build_duchon_basis`] under the SAE atom's spec
+/// (`length_scale = None`, `power = 0`, no identifiability transform): the
+/// kernel block `Φ_radial(t) · Z` (where `Z = null(P_centersᵀ)` is the
+/// polynomial-constraint null space) followed by the polynomial block
+/// `P(t)`. Both blocks of `Φ` **and** the matching blocks of the jet carry
+/// the identical scalar kernel amplification `α` that
+/// [`build_duchon_basis`] applies, so the returned `(Φ, ∂Φ/∂t)` pair is a
+/// true jet — i.e. the kernel block of the jet is exactly the `t`-derivative
+/// of the kernel block of `Φ`, with no stray `α` mismatch (the precise
+/// failure mode of issue #247: a forward design and derivative jet built from
+/// inconsistent scalings/column counts).
+///
+/// `t` is `(n_rows, dim)`, `centers` is `(n_centers, dim)`. Returns
+/// `(Φ, jet)` with `Φ` shape `(n_rows, n_kernel + n_poly)` and `jet` shape
+/// `(n_rows, n_kernel + n_poly, dim)`.
+pub fn duchon_sae_atom_basis_with_jet(
+    t: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    nullspace_order: DuchonNullspaceOrder,
+) -> Result<(Array2<f64>, Array3<f64>), BasisError> {
+    let dim = centers.ncols();
+    if dim == 0 {
+        crate::bail_invalid_basis!(
+            "duchon_sae_atom_basis_with_jet: centers must have at least one column"
+        );
+    }
+    if t.ncols() != dim {
+        crate::bail_dim_basis!(
+            "duchon_sae_atom_basis_with_jet: t has {} cols but centers have {dim}",
+            t.ncols()
+        );
+    }
+    let effective_order = duchon_effective_nullspace_order(centers, nullspace_order);
+    let p_order = duchon_p_from_nullspace_order(effective_order);
+    let s_order: f64 = 0.0;
+
+    // Polynomial-constraint null space `Z` (same construction as the design).
+    let poly_block_centers = polynomial_block_from_order(centers, effective_order);
+    let z = kernel_constraint_nullspace_from_matrix(poly_block_centers.view())?;
+    let n_kernel = z.ncols();
+
+    // Scalar kernel amplification `α`, identical to the value the design path
+    // applies (pure scale-free polyharmonic block).
+    let pure_poly_coeff =
+        PolyharmonicBlockCoeff::new(pure_duchon_block_order(p_order, s_order), dim);
+    let kernel_amp = duchon_kernel_amplification(
+        centers,
+        None,
+        p_order,
+        duchon_power_to_usize(s_order),
+        dim,
+        None,
+        None,
+        Some(&pure_poly_coeff),
+    );
+
+    // Forward radial kernel block `(Φ_radial · α) · Z`.
+    let n_rows = t.nrows();
+    let n_centers = centers.nrows();
+    let mut radial_value = Array2::<f64>::zeros((n_rows, n_centers));
+    for n in 0..n_rows {
+        for k in 0..n_centers {
+            let r = euclidean_distance_rows(t, n, centers, k);
+            radial_value[[n, k]] = pure_poly_coeff.eval(r) * kernel_amp;
+        }
+    }
+    let kernel_design = fast_ab(&radial_value, &z);
+
+    // Polynomial forward block `P(t)`.
+    let poly_design = polynomial_block_from_order(t, effective_order);
+    let n_poly = poly_design.ncols();
+
+    let mut phi = Array2::<f64>::zeros((n_rows, n_kernel + n_poly));
+    phi.slice_mut(s![.., ..n_kernel]).assign(&kernel_design);
+    if n_poly > 0 {
+        phi.slice_mut(s![.., n_kernel..]).assign(&poly_design);
+    }
+
+    // Input-location first jet, scaled by the *same* `α` on the kernel block.
+    let radial_first = duchon_radial_first_derivative_nd(t, centers, None, effective_order)?;
+    let radial_jet = radial_input_location_jet_nd(t, centers, radial_first.view())?;
+    let poly_jet = duchon_polynomial_first_derivative_nd(t, effective_order);
+    if poly_jet.shape()[1] != n_poly {
+        crate::bail_dim_basis!(
+            "duchon_sae_atom_basis_with_jet: polynomial jet has {} columns but design has {n_poly}",
+            poly_jet.shape()[1]
+        );
+    }
+    let mut jet = Array3::<f64>::zeros((n_rows, n_kernel + n_poly, dim));
+    for axis in 0..dim {
+        let projected = radial_jet.index_axis(Axis(2), axis).dot(&z);
+        let mut block = jet.slice_mut(s![.., ..n_kernel, axis]);
+        block.assign(&projected);
+        block *= kernel_amp;
+    }
+    jet.slice_mut(s![.., n_kernel.., ..]).assign(&poly_jet);
+
+    Ok((phi, jet))
+}
+
+/// Second input-location jet of the scale-free Duchon SAE atom (the analytic
+/// Hessian `∂²Φ / ∂t_a ∂t_c`), consistent with
+/// [`duchon_sae_atom_basis_with_jet`] column-for-column and `α`-for-`α`.
+///
+/// The kernel block uses the standard radial Hessian decomposition
+///
+/// ```text
+/// ∂²φ/∂t_a∂t_c = (φ'(r)/r) δ_ac + (φ''(r) − φ'(r)/r) (t−c)_a (t−c)_c / r²,
+/// ```
+///
+/// projected through `Z` and scaled by `α`; the polynomial block carries the
+/// monomial Hessian. Output shape `(n_rows, n_kernel + n_poly, dim, dim)`.
+pub fn duchon_sae_atom_second_jet(
+    t: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    nullspace_order: DuchonNullspaceOrder,
+) -> Result<Array4<f64>, BasisError> {
+    let dim = centers.ncols();
+    if dim == 0 {
+        crate::bail_invalid_basis!(
+            "duchon_sae_atom_second_jet: centers must have at least one column"
+        );
+    }
+    if t.ncols() != dim {
+        crate::bail_dim_basis!(
+            "duchon_sae_atom_second_jet: t has {} cols but centers have {dim}",
+            t.ncols()
+        );
+    }
+    let effective_order = duchon_effective_nullspace_order(centers, nullspace_order);
+    let p_order = duchon_p_from_nullspace_order(effective_order);
+    let s_order: f64 = 0.0;
+
+    let poly_block_centers = polynomial_block_from_order(centers, effective_order);
+    let z = kernel_constraint_nullspace_from_matrix(poly_block_centers.view())?;
+    let n_kernel = z.ncols();
+
+    let pure_poly_coeff =
+        PolyharmonicBlockCoeff::new(pure_duchon_block_order(p_order, s_order), dim);
+    let kernel_amp = duchon_kernel_amplification(
+        centers,
+        None,
+        p_order,
+        duchon_power_to_usize(s_order),
+        dim,
+        None,
+        None,
+        Some(&pure_poly_coeff),
+    );
+
+    let n_rows = t.nrows();
+    let n_centers = centers.nrows();
+    let radial_first = duchon_radial_first_derivative_nd(t, centers, None, effective_order)?;
+    let radial_second = duchon_radial_second_derivative_nd(t, centers, None, effective_order)?;
+
+    let poly_block_t_cols = polynomial_block_from_order(t, effective_order).ncols();
+
+    // Radial Hessian per (row, center, a, c), scaled by α, then projected
+    // through Z over the center axis.
+    let mut radial_hess = Array4::<f64>::zeros((n_rows, n_centers, dim, dim));
+    for n in 0..n_rows {
+        for k in 0..n_centers {
+            let mut r2 = 0.0_f64;
+            for a in 0..dim {
+                let delta = t[[n, a]] - centers[[k, a]];
+                r2 += delta * delta;
+            }
+            let r = r2.sqrt();
+            let phi_r = radial_first[[n, k]];
+            let phi_rr = radial_second[[n, k]];
+            if r <= 1.0e-12 {
+                // Isotropic collision limit `φ''(0) δ_ac`.
+                for a in 0..dim {
+                    radial_hess[[n, k, a, a]] = phi_rr * kernel_amp;
+                }
+                continue;
+            }
+            let q = phi_r / r;
+            let s_scalar = (phi_rr - q) / r2;
+            for a in 0..dim {
+                let da = t[[n, a]] - centers[[k, a]];
+                for c in 0..dim {
+                    let dc = t[[n, c]] - centers[[k, c]];
+                    let mut value = s_scalar * da * dc;
+                    if a == c {
+                        value += q;
+                    }
+                    radial_hess[[n, k, a, c]] = value * kernel_amp;
+                }
+            }
+        }
+    }
+
+    let mut out = Array4::<f64>::zeros((n_rows, n_kernel + poly_block_t_cols, dim, dim));
+    for a in 0..dim {
+        for c in 0..dim {
+            let slab = radial_hess.slice(s![.., .., a, c]);
+            let projected = slab.dot(&z);
+            out.slice_mut(s![.., ..n_kernel, a, c]).assign(&projected);
+        }
+    }
+
+    // Polynomial Hessian block.
+    let exponents = monomial_exponents(dim, match effective_order {
+        DuchonNullspaceOrder::Zero => 0,
+        DuchonNullspaceOrder::Linear => 1,
+        DuchonNullspaceOrder::Degree(k) => k,
+    });
+    if exponents.len() != poly_block_t_cols {
+        crate::bail_dim_basis!(
+            "duchon_sae_atom_second_jet: monomial count {} != polynomial block columns {poly_block_t_cols}",
+            exponents.len()
+        );
+    }
+    for (col, alpha) in exponents.iter().enumerate() {
+        for a in 0..dim {
+            for c in 0..dim {
+                // ∂²(Π t_i^{α_i}) / ∂t_a ∂t_c.
+                for row in 0..n_rows {
+                    let coeff_a = alpha[a];
+                    if coeff_a == 0 {
+                        continue;
+                    }
+                    let coeff_c = if a == c { alpha[c].saturating_sub(1) } else { alpha[c] };
+                    if a != c && coeff_c == 0 {
+                        continue;
+                    }
+                    let lead = (coeff_a as f64) * (coeff_c as f64);
+                    if lead == 0.0 {
+                        continue;
+                    }
+                    let mut value = lead;
+                    for axis in 0..dim {
+                        let mut exp = alpha[axis];
+                        if axis == a {
+                            exp = exp.saturating_sub(1);
+                        }
+                        if axis == c {
+                            exp = exp.saturating_sub(1);
+                        }
+                        if exp != 0 {
+                            value *= t[[row, axis]].powi(exp as i32);
+                        }
+                    }
+                    out[[row, n_kernel + col, a, c]] = value;
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 /// N-D Matérn radial first-derivative `φ'(r)` evaluated for every
 /// `(row, center)` pair.
 ///
@@ -28586,6 +28897,101 @@ mod tests {
     /// centers-extraction match arms.
     fn expected_duchon_metadata_for_centers() -> ! {
         panic!("expected Duchon metadata for centers extraction")
+    }
+
+    /// Issue #247: the SAE Duchon atom's forward design and its derivative jet
+    /// must share an identical column layout, and the forward design must match
+    /// the full `build_duchon_basis` design bit-for-bit (so the seed atom and
+    /// the `DuchonCoordinateEvaluator` refresh agree at iteration 0). Pinned
+    /// for d ∈ {1, 2, 3}, the dims the issue called out.
+    #[test]
+    fn duchon_sae_atom_basis_matches_build_duchon_design() {
+        let cases: Vec<Array2<f64>> = vec![
+            array![[-1.0], [-0.4], [0.1], [0.6], [1.2], [1.9]],
+            array![
+                [-1.0, -0.8],
+                [-0.3, 0.4],
+                [0.2, -0.5],
+                [0.7, 0.9],
+                [1.1, -0.2],
+                [1.6, 0.6],
+            ],
+            array![
+                [-1.0, -0.8, 0.3],
+                [-0.3, 0.4, -0.6],
+                [0.2, -0.5, 0.1],
+                [0.7, 0.9, -0.2],
+                [1.1, -0.2, 0.8],
+                [1.6, 0.6, -0.4],
+                [-0.7, 0.1, 0.5],
+                [0.4, -0.9, -0.1],
+            ],
+        ];
+        for centers in cases {
+            let d = centers.ncols();
+            let order = DuchonNullspaceOrder::Linear;
+            let spec = DuchonBasisSpec {
+                center_strategy: CenterStrategy::UserProvided(centers.clone()),
+                length_scale: None,
+                power: 0.0,
+                nullspace_order: order,
+                identifiability: SpatialIdentifiability::None,
+                aniso_log_scales: None,
+                operator_penalties: Default::default(),
+                periodic: None,
+                boundary: OneDimensionalBoundary::Open,
+            };
+            // Probe points distinct from the centers.
+            let t = match d {
+                1 => array![[-0.5], [0.05], [0.45], [1.3]],
+                2 => array![[-0.5, 0.2], [0.05, -0.35], [0.45, 0.75], [1.3, 0.1]],
+                _ => array![
+                    [-0.5, 0.2, 0.1],
+                    [0.05, -0.35, 0.4],
+                    [0.45, 0.75, -0.3],
+                    [1.3, 0.1, 0.2],
+                ],
+            };
+            let built = build_duchon_basis(t.view(), &spec).expect("build_duchon_basis");
+            let reference = built.design.to_dense();
+            let (phi, jet) = duchon_sae_atom_basis_with_jet(t.view(), centers.view(), order)
+                .expect("duchon_sae_atom_basis_with_jet");
+
+            assert_eq!(
+                phi.ncols(),
+                jet.shape()[1],
+                "d={d}: Phi cols {} != jet cols {}",
+                phi.ncols(),
+                jet.shape()[1]
+            );
+            assert_eq!(phi.dim(), reference.dim(), "d={d}: design shape mismatch");
+            for ((r, c), &value) in phi.indexed_iter() {
+                assert_abs_diff_eq!(value, reference[[r, c]], epsilon = 1e-9);
+            }
+
+            // The analytic jet equals the central difference of the forward
+            // design — no stray amplification factor on the kernel block.
+            let eps = 1e-6;
+            for axis in 0..d {
+                let mut plus = t.clone();
+                let mut minus = t.clone();
+                for row in 0..t.nrows() {
+                    plus[[row, axis]] += eps;
+                    minus[[row, axis]] -= eps;
+                }
+                let (phi_plus, _) =
+                    duchon_sae_atom_basis_with_jet(plus.view(), centers.view(), order).unwrap();
+                let (phi_minus, _) =
+                    duchon_sae_atom_basis_with_jet(minus.view(), centers.view(), order).unwrap();
+                for row in 0..t.nrows() {
+                    for col in 0..phi.ncols() {
+                        let fd = (phi_plus[[row, col]] - phi_minus[[row, col]]) / (2.0 * eps);
+                        let analytic = jet[[row, col, axis]];
+                        assert_abs_diff_eq!(analytic, fd, epsilon = 1e-4);
+                    }
+                }
+            }
+        }
     }
 
     fn evaluate_splines_at_point(x: f64, degree: usize, knots: ArrayView1<f64>) -> Array1<f64> {

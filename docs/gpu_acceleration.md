@@ -42,10 +42,6 @@ Host-to-device copies use cudarc pinned allocations and a CUDA stream. The curre
 
 The production solve keeps Hessian assembly, factorization, master weights, and REML traces in `f64` to preserve CPU parity. The GPU dispatch policy currently defaults mixed precision to `Off`, and the solver boundary uses `f64` before any Cholesky or evidence derivative is evaluated.
 
-## Expected Speedups
-
-On biobank-shaped dense fits (`N=100k`, `p=2k`), the dominant PIRLS cost is `X'WX`; cuBLAS `Dgemm` is expected to be 10-18x faster than the CPU reference loop once data is resident. Dense REML logdet and batched score solves are expected to be 8-14x faster for `p=2k`. Arrow-Schur speedup depends on latent dimension and row-block density; the direct dense path is expected to be 6-12x faster at `N=100k`, `d=2`, `K=2k`.
-
 ## Benchmarks
 
 The CUDA comparison harnesses live under `bench/cargo_benches/`:

@@ -8160,14 +8160,29 @@ impl<'a> RemlState<'a> {
         nullspace_dim: f64,
         hessian_logdet_correction: f64,
         penalty_subspace_trace: Option<std::sync::Arc<super::unified::PenaltySubspaceTrace>>,
+        free_basis: Option<&Array2<f64>>,
     ) -> super::assembly::InnerAssembly<'static> {
+        // When a linear-inequality active set reduces the inner solve to the
+        // free subspace `β = z β_f`, the penalty coordinates must be restricted
+        // onto the same subspace so each `coord.dim()` matches the reduced
+        // `beta.len()` that `InnerSolutionBuilder::build` asserts. The Hessian
+        // operator and `e_for_logdet` are already projected by the caller; this
+        // moves the penalty roots in lockstep (`R_k → R_k z`).
+        let penalty_coords = match free_basis {
+            Some(z) => self
+                .build_penalty_coords()
+                .iter()
+                .map(|coord| coord.project_into_subspace(z))
+                .collect(),
+            None => self.build_penalty_coords(),
+        };
         super::assembly::InnerAssembly {
             log_likelihood: ctx.log_likelihood,
             penalty_quadratic: pirls_result.stable_penalty_term,
             beta,
             n_observations: self.y.len(),
             hessian_op,
-            penalty_coords: self.build_penalty_coords(),
+            penalty_coords,
             penalty_logdet,
             dispersion: ctx.dispersion,
             rho_curvature_scale: 1.0,
@@ -8405,6 +8420,7 @@ impl<'a> RemlState<'a> {
             nullspace_dim,
             hessian_logdet_correction,
             penalty_subspace_trace,
+            free_basis_opt.as_ref(),
         ))
     }
 
@@ -8495,6 +8511,7 @@ impl<'a> RemlState<'a> {
             penalty_logdet,
             nullspace_dim,
             0.0,
+            None,
             None,
         ))
     }
@@ -8762,6 +8779,7 @@ impl<'a> RemlState<'a> {
             nullspace_dim,
             hessian_logdet_correction,
             penalty_subspace_trace,
+            None,
         ))
     }
 
