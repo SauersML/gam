@@ -18020,7 +18020,7 @@ fn rg_rho_impl(group: &str, g: ArrayViewD<'_, f64>) -> Result<ArrayD<f64>, Strin
             out_shape.push(2);
             let flat = Array1::from_vec(g.iter().copied().collect());
             rg_rho_so2_impl(flat.view())
-                .into_shape(IxDyn(&out_shape))
+                .into_shape_with_order(IxDyn(&out_shape))
                 .map_err(|err| format!("failed to reshape SO(2) representation: {err}"))
         }
         "SO3" => {
@@ -18031,13 +18031,13 @@ fn rg_rho_impl(group: &str, g: ArrayViewD<'_, f64>) -> Result<ArrayD<f64>, Strin
             let n = g.len() / 3;
             let flat = g
                 .to_owned()
-                .into_shape((n, 3))
+                .into_shape_with_order((n, 3))
                 .map_err(|err| format!("failed to flatten SO(3) representation input: {err}"))?;
             let mut out_shape = shape[..shape.len() - 1].to_vec();
             out_shape.push(3);
             out_shape.push(3);
             rg_rho_so3_impl(flat.view())?
-                .into_shape(IxDyn(&out_shape))
+                .into_shape_with_order(IxDyn(&out_shape))
                 .map_err(|err| format!("failed to reshape SO(3) representation: {err}"))
         }
         "R1" => {
@@ -18718,7 +18718,7 @@ fn equivariant_gauge_companion_loss<'py>(
     })
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "EuclideanManifold")]
+#[pyclass(module = "gam_pyffi._rust", name = "EuclideanManifold", skip_from_py_object)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct EuclideanManifold {
     #[pyo3(get, set)]
@@ -18748,7 +18748,7 @@ impl EuclideanManifold {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "CircleManifold")]
+#[pyclass(module = "gam_pyffi._rust", name = "CircleManifold", skip_from_py_object)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CircleManifold {}
 
@@ -18774,7 +18774,7 @@ impl CircleManifold {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "SphereManifold")]
+#[pyclass(module = "gam_pyffi._rust", name = "SphereManifold", skip_from_py_object)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SphereManifold {
     #[pyo3(get, set)]
@@ -18804,7 +18804,7 @@ impl SphereManifold {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "TorusManifold")]
+#[pyclass(module = "gam_pyffi._rust", name = "TorusManifold", skip_from_py_object)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TorusManifold {
     #[pyo3(get, set)]
@@ -18834,7 +18834,7 @@ impl TorusManifold {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "GrassmannManifold")]
+#[pyclass(module = "gam_pyffi._rust", name = "GrassmannManifold", skip_from_py_object)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct GrassmannManifold {
     #[pyo3(get, set)]
@@ -18867,7 +18867,7 @@ impl GrassmannManifold {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "StiefelManifold")]
+#[pyclass(module = "gam_pyffi._rust", name = "StiefelManifold", skip_from_py_object)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StiefelManifold {
     #[pyo3(get, set)]
@@ -18900,7 +18900,7 @@ impl StiefelManifold {
     }
 }
 
-#[pyclass(module = "gam_pyffi._rust", name = "SpdManifold")]
+#[pyclass(module = "gam_pyffi._rust", name = "SpdManifold", skip_from_py_object)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SpdManifold {
     #[pyo3(get, set)]
@@ -19427,7 +19427,7 @@ fn topk_weight_schedule_descriptor(
             bound.call_method0("to_rust_descriptor")?.unbind().into(),
         ));
     }
-    if let Ok(mapping) = bound.downcast::<PyDict>() {
+    if let Ok(mapping) = bound.cast::<PyDict>() {
         return Ok(Some(mapping.copy()?.unbind().into()));
     }
     Err(PyTypeError::new_err(
@@ -21154,7 +21154,7 @@ fn mechanism_weight_schedule_descriptor(py: Python<'_>, schedule: &PyObject) -> 
     if schedule.hasattr("to_rust_descriptor")? {
         return Ok(schedule.call_method0("to_rust_descriptor")?.unbind());
     }
-    if schedule.downcast::<PyDict>().is_ok() {
+    if schedule.cast::<PyDict>().is_ok() {
         return Ok(schedule.clone().unbind());
     }
     Err(PyTypeError::new_err(
@@ -21391,7 +21391,7 @@ fn sheaf_extract_edges(edges: &Bound<'_, PyAny>) -> PyResult<Vec<(usize, usize)>
 }
 
 fn sheaf_extract_array2(obj: &Bound<'_, PyAny>, label: &str) -> PyResult<Array2<f64>> {
-    let arr = obj.downcast::<PyArray2<f64>>().map_err(|_| {
+    let arr = obj.cast::<PyArray2<f64>>().map_err(|_| {
         PyTypeError::new_err(format!(
             "SheafConsistencyPenalty: {label} must be a 2-D numpy.ndarray of float64"
         ))
@@ -21414,7 +21414,7 @@ fn sheaf_extract_restrictions(
             )
         })?;
         // Try direct 2-D array first → single-restriction edge.
-        if item.downcast::<PyArray2<f64>>().is_ok() {
+        if item.cast::<PyArray2<f64>>().is_ok() {
             let r = sheaf_extract_array2(&item, &format!("restriction_ops[{e}]"))?;
             out.push(CoreEdgeRestriction::single(r));
             continue;
