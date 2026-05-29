@@ -1,0 +1,155 @@
+name: Reference Quality Suite
+
+# End-to-end quality tests that benchmark gam against the MATURE, STANDARD tool
+# for each capability (mgcv, gamlss, survival, flexsurv, VGAM, scam, lme4,
+# cmprsk, mlt/tram, scikit-learn, statsmodels, pyGAM, lifelines, scikit-survival,
+# properscoring, geomstats, ...). These live in tests/quality_vs_*.rs and use the
+# Rust reference harness (src/test_support/reference.rs), which shells out to R /
+# Python. A missing reference dependency is a HARD failure (no skipping) — so
+# this job provisions the full reference stack.
+#
+# Philosophy: a test whose assertion FAILS because gam genuinely diverges from
+# the mature reference is an honest, useful measurement, not something to paper
+# over. This job therefore RUNS every quality test and reports a pass/fail/
+# compile-error table, but does not gate the pipeline red on assertion failures.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "tests/quality_vs_*.rs"
+      - "src/test_support/reference.rs"
+      - ".github/workflows/reference-quality.yml"
+  workflow_dispatch: {}
+
+concurrency:
+  group: reference-quality-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  reference-quality:
+    name: Reference quality vs mature tools
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Free runner disk space
+        run: |
+          set -uo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo rm -rf "${AGENT_TOOLSDIRECTORY:-}" || true
+          df -h /
+
+      - name: Install Rust 1.93.0
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up R
+        uses: ./.github/actions/setup-bench-r
+
+      - name: Install R reference packages
+        shell: bash
+        run: |
+          set -uo pipefail
+          # Posit Public Package Manager serves Linux binaries -> fast installs.
+          Rscript -e '
+            options(repos = c(CRAN = "https://packagemanager.posit.co/cran/__linux__/jammy/latest"))
+            pkgs <- c("mgcv","survival","gamlss","gamlss.dist","gamlss.cens",
+                      "flexsurv","VGAM","nnet","MASS","ordinal","betareg",
+                      "scam","splines2","cmprsk","lme4","nlme","fields","gss",
+                      "quantreg","mlt","tram","basefun","loo","jsonlite")
+            for (p in pkgs) if (!requireNamespace(p, quietly=TRUE))
+              try(install.packages(p), silent=TRUE)
+            cat("installed R packages:\n")
+            for (p in pkgs) cat(sprintf("  %-14s %s\n", p, requireNamespace(p, quietly=TRUE)))
+          '
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python reference libraries
+        shell: bash
+        run: |
+          set -uo pipefail
+          python -m pip install --upgrade pip
+          # Core (must succeed); heavy/optional ones best-effort so one failure
+          # does not block the rest.
+          pip install numpy pandas scipy scikit-learn statsmodels
+          pip install pygam lifelines scikit-survival properscoring || true
+          pip install geomstats GPy || true
+          pip install numpyro arviz || true
+          python -c "import numpy,scipy,sklearn,statsmodels,pandas; print('core python refs ok')"
+
+      - name: Verify R stack loads
+        shell: bash
+        run: |
+          set -uo pipefail
+          Rscript -e 'for (p in c("mgcv","gamlss","survival")) library(p, character.only=TRUE); cat("R core refs ok\n")'
+
+      - name: Build quality tests
+        shell: bash
+        run: |
+          set -uo pipefail
+          mapfile -t files < <(ls tests/quality_vs_*.rs 2>/dev/null | xargs -n1 basename | sed 's/\.rs$//')
+          echo "found ${#files[@]} quality test target(s)"
+          for t in "${files[@]}"; do
+            echo "::group::compile $t"
+            cargo test --test "$t" --no-run 2>&1 | tail -40 || echo "COMPILE_FAIL $t"
+            echo "::endgroup::"
+          done
+
+      - name: Run quality suite (assertion failures tolerated, reported)
+        shell: bash
+        run: |
+          set -uo pipefail
+          mapfile -t files < <(ls tests/quality_vs_*.rs 2>/dev/null | xargs -n1 basename | sed 's/\.rs$//')
+          pass=0; fail=0; cerr=0
+          declare -a fail_list cerr_list
+          for t in "${files[@]}"; do
+            echo "::group::run $t"
+            if ! cargo test --test "$t" --no-run >/dev/null 2>&1; then
+              echo "COMPILE ERROR: $t"; cerr=$((cerr+1)); cerr_list+=("$t")
+              echo "::endgroup::"; continue
+            fi
+            if cargo test --test "$t" -- --nocapture 2>&1 | tee "/tmp/$t.log"; then
+              pass=$((pass+1))
+            else
+              fail=$((fail+1)); fail_list+=("$t")
+            fi
+            echo "::endgroup::"
+          done
+          {
+            echo "## Reference quality suite"
+            echo ""
+            echo "| outcome | count |"
+            echo "|---|---|"
+            echo "| matched mature tool (pass) | $pass |"
+            echo "| diverged (assertion fail) | $fail |"
+            echo "| compile error | $cerr |"
+            echo ""
+            if [ "${#fail_list[@]}" -gt 0 ]; then
+              echo "### Diverged from reference"; printf '%s\n' "${fail_list[@]/#/- }"; echo ""
+            fi
+            if [ "${#cerr_list[@]}" -gt 0 ]; then
+              echo "### Compile errors (test breakage to fix)"; printf '%s\n' "${cerr_list[@]/#/- }"; echo ""
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "pass=$pass diverged=$fail compile_errors=$cerr"
+          # Informational job: assertion-level divergences are honest findings,
+          # not pipeline failures. (Compile errors are surfaced in the summary.)
+          exit 0
