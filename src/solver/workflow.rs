@@ -1907,6 +1907,16 @@ fn fit_survival_transformation_model(
             let dense_time_exit = prepared.time_design_exit.to_dense();
             let dense_time_derivative = prepared.time_design_derivative.to_dense();
             let event_competing = Array1::<u8>::zeros(spec.event_target.len());
+            // `spec.event_target` carries *cause labels* (0 = censored, k = cause k).
+            // The shared baseline working model is a single-hazard Royston-Parmar
+            // model whose binary `event_target` contract is {0, 1}. For the pooled
+            // baseline that seeds scale/shape across all causes, every observed event
+            // (any cause) informs the shared baseline hazard, so collapse cause labels
+            // to a {0, 1} any-event indicator. The per-cause specialization (event for
+            // cause k vs. competing-cause-as-censored) happens later when the
+            // cause-specific blocks are built.
+            let baseline_event_indicator =
+                spec.event_target.mapv(|label| u8::from(label > 0));
             let mut model =
                 crate::families::royston_parmar::working_model_from_time_covariateshared(
                     PenaltyBlocks::new(penalty_blocks.clone()),
@@ -1915,7 +1925,7 @@ fn fit_survival_transformation_model(
                     crate::families::royston_parmar::RoystonParmarSharedTimeCovariateInputs {
                         age_entry: spec.age_entry.view(),
                         age_exit: spec.age_exit.view(),
-                        event_target: spec.event_target.view(),
+                        event_target: baseline_event_indicator.view(),
                         event_competing: event_competing.view(),
                         weights: spec.weights.view(),
                         time_entry: dense_time_entry.view(),
