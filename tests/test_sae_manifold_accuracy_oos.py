@@ -246,3 +246,56 @@ def test_curved_sphere_atom_on_sphere_data():
         f"if this is below threshold the sphere-chart basis or its "
         f"jacobian is wrong."
     )
+
+
+def test_sae_manifold_oos_reconstruction_idempotence():
+    """OOS prediction is a pure function of (input data, trained atoms,
+    frozen hyperparameters): the Rust OOS solver uses fixed initialization,
+    a deterministic Newton optimizer (Arrow-Schur + Armijo, no RNG), and
+    frozen decoder weights. Calling ``reconstruct`` repeatedly on the same
+    held-out matrix must therefore return bit-exactly identical arrays.
+
+    ``test_oos_uses_fit_time_hyperparameters`` validates this indirectly via
+    a serialize/deserialize round-trip; this test asserts the invariant
+    directly — three identical OOS calls in a row — and also confirms the
+    input matrix is not mutated in place by the FFI.
+    """
+    z_full, _ = _circle_data(n=400, p=64, noise=0.04, seed=11)
+    z_train = z_full[:200]
+    z_test = z_full[200:]
+
+    fit = gamfit.sae_manifold_fit(
+        Z=z_train,
+        n_atoms=1,
+        atom_basis="periodic",
+        atom_dim=2,
+        assignment_prior="ibp_map",
+        max_iter=40,
+        learning_rate=0.04,
+        random_state=0,
+    )
+
+    z_test_guard = z_test.copy()
+    outputs = [fit.reconstruct(z_test) for _ in range(3)]
+
+    for r in outputs:
+        assert np.all(np.isfinite(r)), "OOS reconstruction produced NaN/Inf"
+
+    # All three calls must agree bit-exactly (no RNG, no mutable state).
+    np.testing.assert_array_equal(
+        outputs[0],
+        outputs[1],
+        err_msg="OOS reconstruct is not idempotent: call 1 != call 2",
+    )
+    np.testing.assert_array_equal(
+        outputs[0],
+        outputs[2],
+        err_msg="OOS reconstruct is not idempotent: call 1 != call 3",
+    )
+
+    # The OOS input must not be mutated in place by the FFI round-trip.
+    np.testing.assert_array_equal(
+        z_test,
+        z_test_guard,
+        err_msg="reconstruct mutated its input array in place",
+    )
