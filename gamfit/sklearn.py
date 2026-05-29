@@ -188,9 +188,12 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
     """scikit-learn-compatible binary classifier wrapping :func:`gamfit.fit`.
 
     Same construction and ``fit`` semantics as :class:`GAMRegressor` (see that
-    class for parameter documentation). Predictions interpret the model's
-    mean as the probability of the positive class; classes are fixed to
-    ``[0, 1]`` and :meth:`predict` returns the highest-probability class.
+    class for parameter documentation). The supplied ``y`` may be any binary
+    label vector (strings, ``{-1, +1}``, ``{1, 2}``, integer ``{0, 1}``, …);
+    the wrapper records the observed classes in ``classes_`` (sorted, as
+    sklearn requires) and label-encodes the positive class — i.e.
+    ``classes_[1]`` — to ``1`` before fitting the binomial GAM. ``predict``
+    returns labels drawn from ``classes_``.
 
     Examples
     --------
@@ -214,15 +217,96 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
         Returns
         -------
         GAMClassifier
-            Fitted estimator (``self``) with ``classes_`` set to ``[0, 1]``.
+            Fitted estimator (``self``) with ``classes_`` reflecting the
+            observed labels (sorted ascending; the positive class is
+            ``classes_[1]``).
 
         Examples
         --------
         >>> GAMClassifier(formula="y ~ s(x)", family="binomial").fit(df, y="y")
         """
-        fitted = self._fit_model(X, y)
-        self.classes_ = np.asarray([0, 1])
+        labels = self._resolve_target_labels(X, y)
+        classes = np.unique(labels)
+        if classes.size != 2:
+            raise ValueError(
+                "GAMClassifier requires exactly two observed classes; "
+                f"got {classes.size}: {classes!r}"
+            )
+        # Positive class is the second sorted label, matching the convention
+        # used by sklearn's LabelEncoder and LogisticRegression.
+        positive = classes[1]
+        encoded = np.where(labels == positive, 1, 0).astype(int)
+        encoded_X, encoded_y = self._inject_encoded_target(X, y, encoded)
+        fitted = self._fit_model(encoded_X, encoded_y)
+        self.classes_ = classes
         return fitted
+
+    def _resolve_target_labels(self, X: Any, y: Any) -> np.ndarray:
+        """Return the observed target as a 1-D numpy array of original labels.
+
+        Handles the three supported input shapes (array-like ``y``, string
+        column name ``y``, and ``y=None`` with the formula carrying the target
+        name) without coercing dtype so string and integer labels both survive.
+        """
+        if isinstance(y, str):
+            columns, _ = table_columns(X)
+            if y not in columns:
+                raise KeyError(
+                    f"GAMClassifier.fit: target column {y!r} not in input table"
+                )
+            return np.asarray(columns[y])
+        if y is None:
+            rust = rust_module()
+            columns, _ = table_columns(X)
+            _, _, target_name = rust.sklearn_fit_metadata(
+                list(columns), self.formula, None, True,
+            )
+            if target_name not in columns:
+                raise KeyError(
+                    "GAMClassifier.fit: formula-derived target column "
+                    f"{target_name!r} not in input table"
+                )
+            return np.asarray(columns[target_name])
+        arr = np.asarray(y)
+        if arr.ndim != 1:
+            raise ValueError(
+                f"GAMClassifier.fit: y must be 1-D; got shape {arr.shape}"
+            )
+        return arr
+
+    def _inject_encoded_target(
+        self,
+        X: Any,
+        y: Any,
+        encoded: np.ndarray,
+    ) -> tuple[Any, Any]:
+        """Splice the encoded ``{0,1}`` target back into the data carrier.
+
+        For array-style ``y`` we simply pass the encoded vector through;
+        ``_prepare_fit_input``'s array branch then re-attaches it via
+        :func:`attach_target` under the formula's target name. For the
+        column-name and ``None`` cases the original target lives inside
+        ``X``; we copy the table to a dict-of-lists carrier (mirroring the
+        ``"dict"`` kind the rest of the FFI already accepts), overwrite
+        the target column with the encoded values, and hand the rewritten
+        carrier back with ``y=None`` so ``_prepare_fit_input`` will read
+        the encoded column directly from the formula.
+        """
+        if not isinstance(y, str) and y is not None:
+            return X, encoded
+        columns, _ = table_columns(X)
+        if isinstance(y, str):
+            target_name = y
+        else:
+            rust = rust_module()
+            _, _, target_name = rust.sklearn_fit_metadata(
+                list(columns), self.formula, None, True,
+            )
+        new_columns: dict[str, list[Any]] = {
+            name: list(values) for name, values in columns.items()
+        }
+        new_columns[target_name] = encoded.tolist()
+        return new_columns, None
 
     def predict_proba(self, X: Any) -> np.ndarray:
         """Predict class probabilities for each row in ``X``.
@@ -250,7 +334,7 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
         return np.column_stack([negative, positive])
 
     def predict(self, X: Any) -> np.ndarray:
-        """Predict the highest-probability binary class label.
+        """Predict the highest-probability class label drawn from ``classes_``.
 
         Parameters
         ----------
@@ -260,7 +344,9 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
         Returns
         -------
         numpy.ndarray
-            One-dimensional integer array of class labels (``0`` or ``1``).
+            One-dimensional array of class labels, one per input row. The
+            dtype matches ``classes_`` — strings, ``{-1, +1}`` ints, or
+            ``{0, 1}`` ints all round-trip.
 
         Examples
         --------
