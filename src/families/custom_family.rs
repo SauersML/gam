@@ -12183,6 +12183,13 @@ struct JointSpectralNewtonStep {
     lambda_min_positive: f64,
     nullity: usize,
     rank_tol: f64,
+    /// Number of eigen-directions whose curvature was negative (beyond the
+    /// rank cutoff) and was reflected to `|λ|` to form a modified-Newton
+    /// descent step. Zero for a genuinely positive-semidefinite model.
+    reflected_negative_modes: usize,
+    /// Most negative eigenvalue encountered (≤ 0); `0.0` when the model was
+    /// positive-semidefinite within the rank cutoff.
+    most_negative_eigenvalue: f64,
 }
 
 fn solve_joint_newton_step_on_spectral_range(
@@ -12209,6 +12216,8 @@ fn solve_joint_newton_step_on_spectral_range(
             lambda_min_positive: f64::INFINITY,
             nullity: 0,
             rank_tol,
+            reflected_negative_modes: 0,
+            most_negative_eigenvalue: 0.0,
         });
     }
 
@@ -12226,6 +12235,8 @@ fn solve_joint_newton_step_on_spectral_range(
                 lambda_min_positive: f64::INFINITY,
                 nullity: p,
                 rank_tol,
+                reflected_negative_modes: 0,
+                most_negative_eigenvalue: 0.0,
             });
         }
         return Err(format!(
@@ -12242,7 +12253,25 @@ fn solve_joint_newton_step_on_spectral_range(
     let mut lambda_min_positive = f64::INFINITY;
     let mut nullity = 0usize;
     let mut most_negative = 0.0_f64;
+    let mut reflected_negative_modes = 0usize;
 
+    // Spectral modified-Newton step. The penalized inner Hessian is positive
+    // semidefinite for canonical single-block GLMs (Xᵀ W X + Sλ with W ≥ 0),
+    // so the reflection branch below is a no-op there. For two-block GAMLSS /
+    // location-scale likelihoods the *observed* joint Hessian is genuinely
+    // indefinite away from the optimum (the cross block 2κm and the κ'(a−n)
+    // piece of the scale curvature are residual-linear and mean-zero, so a
+    // single negative residual fluctuation tips an eigenvalue negative at
+    // small/medium n). Erroring out there aborts an otherwise well-posed fit;
+    // instead we reflect each negative eigenvalue to |λ| (Gill–Murray–Wright /
+    // Greenstadt eigenvalue modification). On a direction u_k with curvature
+    // λ_k < 0 the modified step component is (u_kᵀ rhs / |λ_k|) u_k, so the
+    // assembled δ satisfies (∇L − Sβ)·δ = Σ_k (u_kᵀ rhs)²/|λ_k| > 0, i.e. δ is
+    // a strict descent direction for the penalized objective. The downstream
+    // trust-region globalization (full-objective accept/reject + gradient
+    // fallback) then validates the actual decrease, so no curvature guarantee
+    // is weakened — an indefinite model yields a safe descent step rather than
+    // a hard failure, and a PSD model still gets the exact Newton step.
     for k in 0..p {
         let lambda = evals[k];
         let u_k = evecs.column(k);
@@ -12252,24 +12281,28 @@ fn solve_joint_newton_step_on_spectral_range(
             null_rhs_inf = null_rhs_inf.max(component.abs());
             continue;
         }
-        if lambda < 0.0 {
+        let curvature = if lambda < 0.0 {
             most_negative = most_negative.min(lambda);
-            continue;
-        }
+            reflected_negative_modes += 1;
+            lambda.abs()
+        } else {
+            lambda
+        };
         range_rhs_inf = range_rhs_inf.max(component.abs());
-        lambda_min_positive = lambda_min_positive.min(lambda);
-        let scale = component / lambda;
+        lambda_min_positive = lambda_min_positive.min(curvature);
+        let scale = component / curvature;
         for i in 0..p {
             delta[i] += scale * u_k[i];
         }
     }
 
-    if most_negative < -cutoff {
-        return Err(format!(
-            "joint Newton model-space error: reduced penalized Hessian is indefinite \
-             (λ_min={most_negative:.3e}, cutoff={cutoff:.3e}); exact Newton requires a \
-             positive-semidefinite quadratic model in the free space"
-        ));
+    if reflected_negative_modes > 0 {
+        log::debug!(
+            "[PIRLS/joint-Newton] modified-Newton reflection: {reflected}/{p} indefinite \
+             modes reflected to |λ| (λ_min={most_negative:.3e}, cutoff={cutoff:.3e}); \
+             step is a descent direction validated by the trust-region accept/reject test",
+            reflected = reflected_negative_modes,
+        );
     }
     if null_rhs_inf > null_tol {
         // Reaching this branch means the canonical-gauge identifiability
@@ -12307,6 +12340,8 @@ fn solve_joint_newton_step_on_spectral_range(
         lambda_min_positive,
         nullity,
         rank_tol,
+        reflected_negative_modes,
+        most_negative_eigenvalue: most_negative,
     })
 }
 
@@ -13882,6 +13917,17 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             residual_tol_for_solve,
                         )?;
                         spectral_nullity_for_step = spectral_step.nullity;
+                        if spectral_step.reflected_negative_modes > 0 {
+                            log::info!(
+                                "[PIRLS/joint-Newton] cycle {cycle:>3} | indefinite inner \
+                                 Hessian: reflected {}/{} negative-curvature modes to |λ| \
+                                 (λ_min={:.3e}); proceeding with modified-Newton descent step \
+                                 under trust-region globalization",
+                                spectral_step.reflected_negative_modes,
+                                total_p,
+                                spectral_step.most_negative_eigenvalue,
+                            );
+                        }
                         if spectral_step.nullity > 0 {
                             log::debug!(
                                 "[PIRLS/joint-Newton] spectral reduced solve: nullity@{:.0e}={}/{} \
@@ -29617,6 +29663,42 @@ mod tests {
             residual.iter().all(|v| v.abs() <= 1.0e-12),
             "range RHS should satisfy Hδ = rhs, residual={residual:?}"
         );
+    }
+
+    #[test]
+    fn spectral_joint_newton_step_reflects_indefinite_curvature_to_descent_step() {
+        // Genuinely indefinite penalized inner Hessian: eigenvalues +4 (along
+        // [1,0]) and −1 (along [0,1]). This is the structural situation a
+        // two-block Gaussian location-scale joint Newton hits away from the
+        // optimum at small/medium n, where the residual-linear cross/scale
+        // curvature tips an eigenvalue negative. The exact-Newton inner solve
+        // must NOT abort here (issue #365): it must reflect the negative
+        // eigenvalue to |λ| and return a modified-Newton descent step that the
+        // trust region then globalizes.
+        let h = array![[4.0, 0.0], [0.0, -1.0]];
+        let rhs = array![8.0, 3.0];
+        let step = solve_joint_newton_step_on_spectral_range(&h, &rhs, 1.0e-10, 1.0e-12)
+            .expect("indefinite model must yield a modified-Newton step, not an error");
+
+        // Exactly one negative-curvature mode was reflected.
+        assert_eq!(step.reflected_negative_modes, 1);
+        assert!(step.most_negative_eigenvalue < 0.0);
+
+        // Greenstadt reflection: δ = (rhsᵀu₀/|λ₀|)u₀ + (rhsᵀu₁/|λ₁|)u₁ with the
+        // negative eigenvalue replaced by its magnitude.
+        // u₀=[1,0] λ₀=+4 -> 8/4 = 2; u₁=[0,1] λ₁=−1 -> reflected to +1 -> 3/1 = 3.
+        assert_relative_eq!(step.delta[0], 2.0, epsilon = 1.0e-12);
+        assert_relative_eq!(step.delta[1], 3.0, epsilon = 1.0e-12);
+
+        // The returned step is a strict descent direction for the penalized
+        // objective whose negative gradient is `rhs`: the directional
+        // derivative −rhs·δ must be strictly negative, i.e. rhs·δ > 0.
+        let directional = rhs.dot(&step.delta);
+        assert!(
+            directional > 0.0,
+            "reflected step must be a descent direction (rhs·δ={directional} must be > 0)"
+        );
+        assert!(step.delta.iter().all(|v| v.is_finite()));
     }
 
     #[test]
