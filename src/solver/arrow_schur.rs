@@ -106,6 +106,16 @@ use crate::terms::latent_coord::{LatentCoordValues, LatentManifold};
 const DIRECT_SOLVE_MAX_K: usize = 2_000;
 const DEFAULT_PCG_MAX_ITERATIONS: usize = 200;
 const DEFAULT_PCG_RELATIVE_TOLERANCE: f64 = 1e-4;
+/// Absolute floor on the Steihaug-CG residual stopping threshold.
+///
+/// The native PCG criterion is purely relative: `tol = rel_tol · ‖rhs‖`. When
+/// `‖rhs‖` is tiny (degenerate / near-stationary reduced systems) this product
+/// can fall below the roundoff resolution of `metric_norm` (~1e-15 for f64),
+/// so the loop would "converge" on floating-point noise rather than a genuinely
+/// accurate solution. Floor the threshold at 1e-14: above machine epsilon
+/// (~2.2e-16) yet below any practical single-iteration residual reduction, so
+/// well-scaled problems are unaffected while degenerate ones stop cleanly.
+const PCG_ABSOLUTE_TOLERANCE_FLOOR: f64 = 1e-14;
 const DEFAULT_TRUST_REGION_RADIUS: f64 = f64::INFINITY;
 pub const DEFAULT_PROXIMAL_INITIAL_RIDGE: f64 = 1e-8;
 pub const DEFAULT_PROXIMAL_RIDGE_GROWTH: f64 = 10.0;
@@ -1007,6 +1017,47 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
     }
 }
 
+/// Diagonal-ratio condition-number proxy for an SPD matrix from its lower
+/// Cholesky factor `L` (where `A = L Lᵀ`):
+///     κ(A) ≈ (max_i L_ii / min_i L_ii)².
+///
+/// (Golub & Van Loan, "Matrix Computations" 4th ed., §4.2.4 — the ratio of
+/// diagonal entries of the Cholesky factor bounds the 2-norm condition number
+/// of the SPD matrix.) Returns `f64::INFINITY` when the factor has a
+/// non-positive or non-finite diagonal pivot, which the callers treat as a
+/// hard ill-conditioning signal.
+fn cholesky_factor_kappa_estimate(factor: &Array2<f64>) -> f64 {
+    let d = factor.nrows();
+    let mut min_diag = f64::INFINITY;
+    let mut max_diag = 0.0_f64;
+    for a in 0..d {
+        let v = factor[[a, a]];
+        if v < min_diag {
+            min_diag = v;
+        }
+        if v > max_diag {
+            max_diag = v;
+        }
+    }
+    if min_diag > 0.0 && max_diag.is_finite() {
+        let ratio = max_diag / min_diag;
+        ratio * ratio
+    } else {
+        f64::INFINITY
+    }
+}
+
+/// Near-singularity condition-number ceiling for double precision at dimension
+/// `dim`: κ_max = 1 / (sqrt(DBL_EPS) · max(dim, 1)).
+///
+/// Classic Higham rule (Higham, "Accuracy and Stability of Numerical
+/// Algorithms" 2nd ed., §10.1): a system is treated as numerically
+/// rank-deficient once κ · ε approaches 1/sqrt(ε), scaled by problem dimension.
+fn safe_spd_kappa_max(dim: usize) -> f64 {
+    let d_scale = (dim as f64).max(1.0);
+    1.0 / (f64::EPSILON.sqrt() * d_scale)
+}
+
 fn factor_one_row(
     row: &ArrowRowBlock,
     ridge_t: f64,
@@ -1056,44 +1107,14 @@ fn factor_one_row(
     // the outer Cholesky on S succeed. Treat that case as functionally
     // equivalent to a PSD failure so LM escalation lifts ridge_t.
     //
-    // Diagonal-ratio condition-number proxy: for a Cholesky factor L,
-    //     κ(L Lᵀ) ≈ (max_i L_ii / min_i L_ii)².
-    // (Golub & Van Loan, "Matrix Computations" 4th ed., §4.2.4 — the
-    // ratio of diagonal entries of the Cholesky factor bounds the
-    // 2-norm condition number of the SPD matrix.)
-    //
-    // Near-singularity threshold for double precision at dimension d:
-    //     κ_max = 1 / (sqrt(DBL_EPS) · max(d, 1)).
-    // This is the classic Higham (Higham, "Accuracy and Stability of
-    // Numerical Algorithms" 2nd ed., §10.1) rule: a system is treated
-    // as numerically rank-deficient once κ · ε approaches 1/sqrt(ε),
-    // scaled by problem dimension.
-    let mut min_diag = f64::INFINITY;
-    let mut max_diag = 0.0_f64;
-    for a in 0..d {
-        let v = factor[[a, a]];
-        if v < min_diag {
-            min_diag = v;
-        }
-        if v > max_diag {
-            max_diag = v;
-        }
-    }
-    if min_diag > 0.0 && max_diag.is_finite() {
-        let ratio = max_diag / min_diag;
-        let kappa_est = ratio * ratio;
-        let d_scale = (d as f64).max(1.0);
-        let kappa_max = 1.0 / (f64::EPSILON.sqrt() * d_scale);
-        if !kappa_est.is_finite() || kappa_est > kappa_max {
-            return Err(ArrowSchurError::PerRowFactorIllConditioned {
-                row: row_idx,
-                kappa_estimate: kappa_est,
-            });
-        }
-    } else {
+    // Diagonal-ratio condition-number proxy κ(L Lᵀ) ≈ (max L_ii / min L_ii)²,
+    // compared against the dimension-scaled Higham near-singularity ceiling.
+    // See `cholesky_factor_kappa_estimate` / `safe_spd_kappa_max`.
+    let kappa_est = cholesky_factor_kappa_estimate(&factor);
+    if !kappa_est.is_finite() || kappa_est > safe_spd_kappa_max(d) {
         return Err(ArrowSchurError::PerRowFactorIllConditioned {
             row: row_idx,
-            kappa_estimate: f64::INFINITY,
+            kappa_estimate: kappa_est,
         });
     }
     Ok(factor)
@@ -3064,9 +3085,16 @@ pub fn solve_arrow_newton_step_core(
 /// geometrically grow a `proximal_ridge` on top of the caller-supplied
 /// `ridge_t` / `ridge_beta` and retry, exactly as the Ceres-style proximal
 /// correction the Newton driver in `run_joint_fit_arrow_schur` does around
-/// `solve`. Non-factorization failures (PCG divergence, adaptive-correction
-/// exhaustion) surface immediately because they are not recoverable by
-/// shifting the diagonal.
+/// `solve`. Adaptive-correction exhaustion surfaces immediately because it is
+/// not recoverable by shifting the diagonal.
+///
+/// A `PcgFailed` is likewise treated as recoverable: when the inexact-PCG
+/// path stalls (all preconditioner tiers hit `MaxIter`, negative curvature on
+/// an unbounded solve, or a non-PD preconditioned residual), shifting the
+/// diagonal improves both conditioning and curvature, so a ridge bump is the
+/// right response. Only `AdaptiveCorrectionFailed` surfaces immediately, since
+/// it is an option-validation / line-search failure that a ridge shift cannot
+/// repair.
 ///
 /// Returns `(Δt, Δβ, PcgDiagnostics)` from `solve_arrow_newton_step_core`,
 /// computed with the smallest escalated ridge that produced a successful factor.
@@ -3094,6 +3122,7 @@ pub fn solve_with_lm_escalation_inner(
                     ArrowSchurError::PerRowFactorFailed { .. }
                         | ArrowSchurError::PerRowFactorIllConditioned { .. }
                         | ArrowSchurError::SchurFactorFailed { .. }
+                        | ArrowSchurError::PcgFailed { .. }
                 );
                 last_err = Some(err);
                 if !recoverable {
@@ -3569,6 +3598,30 @@ fn solve_dense_reduced_system(
 ) -> Result<(Array1<f64>, Option<Array2<f64>>, PcgDiagnostics), ArrowSchurError> {
     let factor =
         cholesky_lower(schur).map_err(|e| ArrowSchurError::SchurFactorFailed { reason: e })?;
+    // Ill-conditioned-but-PD Schur guard. The per-row factor checks reject
+    // any single barely-PD H_tt^(i) block, but the reduced Schur complement
+    //     S = H_ββ + ridge_β·I − Σ_i H_tβ^(i)ᵀ (H_tt^(i))⁻¹ H_tβ^(i)
+    // accumulates the (H_tt^(i))⁻¹ contributions of every row in finite
+    // precision. With many weak-but-admissible rows those terms can sum to a
+    // Schur matrix whose Cholesky succeeds yet whose condition number is far
+    // past the safe inversion regime, so `chol_solve_vector` yields an
+    // inaccurate Δβ that is silently propagated to the Newton step. Apply the
+    // same diagonal-ratio κ proxy used per-row to the reduced factor and treat
+    // an over-threshold estimate as a Schur-stability failure: `SchurFactorFailed`
+    // is already recoverable in `solve_with_lm_escalation_inner`, so this lifts
+    // `ridge_beta` and re-forms a better-conditioned Schur. This guard is
+    // exclusive to the dense Direct / SqrtBA path (the only caller of this
+    // function); the inexact-PCG path tolerates higher κ(S) and is unaffected.
+    let schur_kappa = cholesky_factor_kappa_estimate(&factor);
+    if !schur_kappa.is_finite() || schur_kappa > safe_spd_kappa_max(schur.nrows()) {
+        return Err(ArrowSchurError::SchurFactorFailed {
+            reason: format!(
+                "reduced Schur complement Cholesky succeeded but is ill-conditioned \
+                 (kappa_estimate={schur_kappa:e}); accumulated per-row \
+                 (H_tt)⁻¹ contamination would yield an inaccurate Δβ"
+            ),
+        });
+    }
     let direct = chol_solve_vector(&factor, rhs_beta);
     if step_inside_trust_region(direct.view(), options.trust_region.radius, metric_weights) {
         return Ok((direct, Some(factor), PcgDiagnostics::default()));
@@ -4353,7 +4406,7 @@ fn steihaug_pcg_auto<B: BatchedBlockSolver>(
     }
     let schwarz =
         AdditiveSchwarzPreconditioner::from_arrow_schur(sys, htt_factors, ridge_beta, backend, 1)?;
-    run_pcg_with_preconditioner(
+    let (x2, diag2) = run_pcg_with_preconditioner(
         sys,
         htt_factors,
         ridge_beta,
@@ -4364,7 +4417,25 @@ fn steihaug_pcg_auto<B: BatchedBlockSolver>(
         backend,
         gpu_matvec,
         metric_weights,
-    )
+    )?;
+    // All three preconditioner tiers (Jacobi -> ClusterJacobi ->
+    // AdditiveSchwarz) exhausted their iteration budget without driving the
+    // residual below tolerance. Returning the truncated AdditiveSchwarz iterate
+    // as `Ok` would feed an arbitrarily-large-residual step into the Newton
+    // driver, where the PCG diagnostics are discarded. Surface a recoverable
+    // failure instead so `solve_with_lm_escalation_inner` escalates the
+    // proximal ridge: better conditioning is precisely what a stalled PCG on
+    // an ill-conditioned reduced system needs.
+    if diag2.stopping_reason == PcgStopReason::MaxIter {
+        return Err(ArrowSchurError::PcgFailed {
+            reason: format!(
+                "Schur PCG exhausted all preconditioner tiers (Jacobi, ClusterJacobi, \
+                 AdditiveSchwarz) at MaxIter; final relative residual = {:e}",
+                diag2.final_relative_residual
+            ),
+        });
+    }
+    Ok((x2, diag2))
 }
 
 /// Run Steihaug-CG with a generic preconditioner closure.
@@ -4470,7 +4541,7 @@ where
     if rhs_norm == 0.0 {
         return Ok((Array1::<f64>::zeros(n), PcgDiagnostics::default()));
     }
-    let tol = relative_tolerance.max(0.0) * rhs_norm;
+    let tol = (relative_tolerance.max(0.0) * rhs_norm).max(PCG_ABSOLUTE_TOLERANCE_FLOOR);
     let mut x = Array1::<f64>::zeros(n);
     let mut r = rhs.clone();
     let mut z = apply_preconditioner(&r);
