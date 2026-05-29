@@ -1888,6 +1888,36 @@ pub(crate) fn count_rank(singular_values: &[f64], n: usize, p: usize) -> usize {
     singular_values.iter().filter(|&&v| v > tol).count()
 }
 
+/// Numerical rank of a design `D` (with `n_total` rows and `p` columns) given
+/// only its accumulated `(p × p)` Gram matrix `G = Dᵀ D`.
+///
+/// The streaming SAE fit never materializes the full `(N × M_k)` weighted
+/// design `D_k = diag(a_·k)·Φ_k`; it accumulates `G_k = D_kᵀ D_k` online across
+/// row chunks. The singular values of `D` are the square roots of the
+/// eigenvalues of `G` (`G = V diag(σ²) Vᵀ`), so the same RRQR rank tolerance
+/// that [`count_rank`] applies to QR pivots applies to `√λ`. This lets the
+/// pre-fit decoder identifiability audit run chunk-by-chunk with `O(M_k²)`
+/// state instead of an `O(N · M_k)` design retain.
+///
+/// Negative eigenvalues from finite-precision accumulation are clamped to zero
+/// before the square root. Returns the count of singular values above the
+/// tolerance, identical in convention to [`count_rank`].
+pub(crate) fn rank_of_gram(gram: &Array2<f64>, n_total: usize) -> Result<usize, EstimationError> {
+    let p = gram.ncols();
+    if p == 0 {
+        return Ok(0);
+    }
+    let (evals, _evecs) = gram
+        .eigh(Side::Lower)
+        .map_err(EstimationError::EigendecompositionFailed)?;
+    let mut singular: Vec<f64> = evals
+        .iter()
+        .map(|&lambda| lambda.max(0.0).sqrt())
+        .collect();
+    singular.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(count_rank(&singular, n_total, p))
+}
+
 /// Error produced when the MAP uniqueness condition
 /// `ker(J^T W J) ∩ ker(S) = {0}` is violated.
 ///
