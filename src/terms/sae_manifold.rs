@@ -4118,14 +4118,15 @@ pub fn refresh_isometry_caches_from_atom(
 }
 
 /// Walk an [`AnalyticPenaltyRegistry`] and refresh every Isometry penalty
-/// whose `target` aligns with a SAE atom's latent block. The alignment rule
-/// is the simplest correct one: the penalty's `target.latent_dim` must equal
-/// the atom's `latent_dim` AND the penalty's `p_out` must equal the atom's
-/// decoder column count `p`. With a single SAE atom and a single isometry
-/// penalty in the registry (the common case wired by `solver/workflow.rs`),
-/// this rule pairs them unambiguously. Multi-atom configurations should
-/// install one isometry penalty per atom; this helper picks the first
-/// matching atom for each.
+/// against the SAE atom it owns. The alignment rule is positional within each
+/// `(latent_dim, p_out)` signature: the penalty's `target.latent_dim` must
+/// equal the atom's `latent_dim` AND the penalty's `p_out` must equal the
+/// atom's decoder column count `p`. Multi-atom configurations install one
+/// isometry penalty per atom, so the *k*-th isometry penalty matching a given
+/// signature is paired with the *k*-th atom matching that same signature. This
+/// reduces to the unambiguous single-atom/single-penalty case wired by
+/// `solver/workflow.rs`, and never collapses multiple penalties onto the first
+/// matching atom (which would leave every later atom's coords un-refreshed).
 ///
 /// Returns the number of penalties that got both caches populated (i.e. the
 /// number of atoms whose `basis_second_jet` slot holds a
@@ -4143,6 +4144,12 @@ pub fn refresh_isometry_caches_from_term(
         ));
     }
     let mut refreshed_with_second = 0usize;
+    // Per-signature cursor: how many atoms matching a given (latent_dim, p_out)
+    // have already been consumed by earlier isometry penalties. Pairing the
+    // k-th penalty of a signature with the k-th atom of that signature gives a
+    // stable one-to-one mapping for multi-atom configs.
+    let mut consumed_per_signature: std::collections::HashMap<(usize, usize), usize> =
+        std::collections::HashMap::new();
     for entry in registry.penalties.iter() {
         let AnalyticPenaltyKind::Isometry(p) = entry else {
             continue;
@@ -4150,13 +4157,29 @@ pub fn refresh_isometry_caches_from_term(
         let Some(p_latent_dim) = p.target.latent_dim else {
             continue;
         };
-        let Some((atom_idx, atom)) = term.atoms.iter().enumerate().find(|(_, atom)| {
-            atom.latent_dim == p_latent_dim
+        let signature = (p_latent_dim, p.p_out);
+        let already_consumed = consumed_per_signature.entry(signature).or_insert(0);
+        // Advance to the (already_consumed)-th atom matching this signature.
+        let mut seen = 0usize;
+        let mut paired: Option<usize> = None;
+        for (atom_idx, atom) in term.atoms.iter().enumerate() {
+            let matches = atom.latent_dim == p_latent_dim
                 && atom.decoder_coefficients.ncols() == p.p_out
-                && atom.basis_evaluator.is_some()
-        }) else {
+                && atom.basis_evaluator.is_some();
+            if !matches {
+                continue;
+            }
+            if seen == *already_consumed {
+                paired = Some(atom_idx);
+                break;
+            }
+            seen += 1;
+        }
+        let Some(atom_idx) = paired else {
             continue;
         };
+        *already_consumed += 1;
+        let atom = &term.atoms[atom_idx];
         let coords = coords_per_atom[atom_idx].view();
         if refresh_isometry_caches_from_atom(p, atom, coords)? {
             refreshed_with_second += 1;
@@ -5597,6 +5620,136 @@ mod tests {
         assert_isometry_wiring_matches_fd(
             Arc::new(TorusHarmonicEvaluator::new(2, 2).unwrap()),
             array![[0.13, 0.42], [0.66, 0.19], [0.88, 0.55]],
+        );
+    }
+
+    /// Multi-atom isometry pairing regression.
+    ///
+    /// Two SAE atoms share the same `(latent_dim, p_out)` signature but live
+    /// on different coordinate blocks. The registry holds one isometry penalty
+    /// per atom. The previous `find()` first-match logic paired *both*
+    /// penalties to atom 0, so atom 1's coords were never installed into the
+    /// second penalty's Jacobian cache — silently mislabeling the second
+    /// atom's geometry as the first's. The positional pairing must instead
+    /// refresh penalty `i` against atom `i`.
+    ///
+    /// We pin this by computing, independently, the Jacobian cache each atom
+    /// would produce in isolation, then asserting that after
+    /// `refresh_isometry_caches_from_term` the two registry penalties carry
+    /// *distinct* caches matching their *own* atoms.
+    #[test]
+    fn refresh_isometry_caches_pairs_each_penalty_to_its_own_atom() {
+        let latent_dim = 1usize;
+        let p_out = 3usize;
+        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(5).unwrap());
+
+        // Distinct coords per atom so the cached Jacobians must differ.
+        let coords0 = array![[0.05], [0.20], [0.55], [0.80]];
+        let coords1 = array![[0.13], [0.41], [0.62], [0.91]];
+
+        let build_atom = |name: &str, coords: &Array2<f64>, seed: f64| {
+            let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+            let m = phi.ncols();
+            let mut decoder = Array2::<f64>::zeros((m, p_out));
+            for i in 0..m {
+                for j in 0..p_out {
+                    let x = (i as f64) * 0.371 + (j as f64) * 0.193 + seed;
+                    decoder[[i, j]] = (x.sin() * 0.9) + 0.1 * ((i + j) as f64).cos();
+                }
+            }
+            let smooth = Array2::<f64>::eye(m);
+            SaeManifoldAtom::new(
+                name,
+                SaeAtomBasisKind::Periodic,
+                latent_dim,
+                phi,
+                jet,
+                decoder,
+                smooth,
+            )
+            .unwrap()
+            .with_basis_second_jet(evaluator.clone() as Arc<dyn SaeBasisSecondJet>)
+        };
+
+        let atom0 = build_atom("atom0", &coords0, 0.5);
+        let atom1 = build_atom("atom1", &coords1, 1.7);
+
+        // Independent ground-truth caches: refresh a standalone penalty
+        // against each atom in isolation.
+        let slice0 = PsiSlice::full(coords0.nrows() * latent_dim, Some(latent_dim));
+        let control0 = IsometryPenalty::new_euclidean(slice0, p_out);
+        refresh_isometry_caches_from_atom(&control0, &atom0, coords0.view()).unwrap();
+        let expected0 = control0
+            .jacobian_cache()
+            .expect("control penalty 0 must have a Jacobian cache");
+
+        let slice1 = PsiSlice::full(coords1.nrows() * latent_dim, Some(latent_dim));
+        let control1 = IsometryPenalty::new_euclidean(slice1, p_out);
+        refresh_isometry_caches_from_atom(&control1, &atom1, coords1.view()).unwrap();
+        let expected1 = control1
+            .jacobian_cache()
+            .expect("control penalty 1 must have a Jacobian cache");
+
+        // The two atoms genuinely differ, else the test is vacuous.
+        assert_ne!(
+            *expected0, *expected1,
+            "atom 0 and atom 1 must produce distinct Jacobian caches"
+        );
+
+        // Build the term and a registry with one isometry penalty per atom.
+        let logits = Array2::<f64>::zeros((coords0.nrows(), 2));
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            logits,
+            vec![coords0.clone(), coords1.clone()],
+            vec![
+                LatentManifold::Circle { period: 1.0 },
+                LatentManifold::Circle { period: 1.0 },
+            ],
+            AssignmentMode::ibp_map(0.7, 1.0, true),
+        )
+        .unwrap();
+        let term = SaeManifoldTerm::new(vec![atom0, atom1], assignment).unwrap();
+
+        let mut registry = AnalyticPenaltyRegistry::new();
+        let pslice0 = PsiSlice::full(coords0.nrows() * latent_dim, Some(latent_dim));
+        let pslice1 = PsiSlice::full(coords1.nrows() * latent_dim, Some(latent_dim));
+        registry.push(AnalyticPenaltyKind::Isometry(Arc::new(
+            IsometryPenalty::new_euclidean(pslice0, p_out),
+        )));
+        registry.push(AnalyticPenaltyKind::Isometry(Arc::new(
+            IsometryPenalty::new_euclidean(pslice1, p_out),
+        )));
+
+        let coords_per_atom = vec![coords0.clone(), coords1.clone()];
+        let refreshed =
+            refresh_isometry_caches_from_term(&registry, &term, &coords_per_atom).unwrap();
+        assert_eq!(refreshed, 2, "both penalties should install second caches");
+
+        let cache0 = match &registry.penalties[0] {
+            AnalyticPenaltyKind::Isometry(p) => p
+                .jacobian_cache()
+                .expect("penalty 0 cache must be populated"),
+            _ => panic!("expected isometry penalty at index 0"),
+        };
+        let cache1 = match &registry.penalties[1] {
+            AnalyticPenaltyKind::Isometry(p) => p
+                .jacobian_cache()
+                .expect("penalty 1 cache must be populated"),
+            _ => panic!("expected isometry penalty at index 1"),
+        };
+
+        // Penalty i must carry atom i's cache — not both atom 0's.
+        assert_eq!(
+            *cache0, *expected0,
+            "penalty 0 must be refreshed against atom 0"
+        );
+        assert_eq!(
+            *cache1, *expected1,
+            "penalty 1 must be refreshed against atom 1 (regression: old find() paired it to atom 0)"
+        );
+        assert_ne!(
+            *cache0, *cache1,
+            "the two penalties must not collapse onto the same atom"
         );
     }
 }
