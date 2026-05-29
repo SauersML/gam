@@ -216,7 +216,7 @@ def _DuchonRustFn_apply(
     class _Fn(torch.autograd.Function):
         @staticmethod
         def forward(ctx: Any, pts: Any) -> Any:
-            pts_np = pts.detach().to(dtype=torch.float64).cpu().numpy()
+            pts_np = pts.detach().cpu().to(dtype=torch.float64).numpy()
             basis_np = _api.duchon_basis(pts_np, centers, **kwargs)
             basis = torch.as_tensor(basis_np, dtype=pts.dtype, device=pts.device)
             ctx.save_for_backward(pts)
@@ -260,7 +260,7 @@ def _RadialJetFn_apply(
         def forward(ctx: Any, pts: Any) -> Any:
             import numpy as np
 
-            pts_np = pts.detach().to(dtype=torch.float64).cpu().numpy()
+            pts_np = pts.detach().cpu().to(dtype=torch.float64).numpy()
             ctrs_np = resolve_centers(pts_np)
             phi_r = radial_first(pts_np, ctrs_np)  # (B, K)
             diffs = pts_np[:, None, :] - ctrs_np[None, :, :]  # (B, K, d)
@@ -278,7 +278,7 @@ def _RadialJetFn_apply(
 
             (grad_jet,) = grads  # (B, K, d)
             (pts,) = ctx.saved_tensors
-            pts_np = pts.detach().to(dtype=torch.float64).cpu().numpy()
+            pts_np = pts.detach().cpu().to(dtype=torch.float64).numpy()
             ctrs_np = resolve_centers(pts_np)
             phi_r = radial_first(pts_np, ctrs_np)
             phi_rr = radial_second(pts_np, ctrs_np)
@@ -393,7 +393,7 @@ def _MaternRustFn_apply(
         def forward(ctx: Any, pts: Any) -> Any:
             import numpy as np
 
-            pts_np = pts.detach().to(dtype=torch.float64).cpu().numpy()
+            pts_np = pts.detach().cpu().to(dtype=torch.float64).numpy()
             ctrs_np = _resolve_centers_np(pts_np)
             basis_np = _api.matern_basis(
                 pts_np,

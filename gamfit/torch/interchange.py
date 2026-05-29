@@ -30,12 +30,18 @@ from .._binding import rust_module
 _VALID_SWAP_MODES: Final[frozenset[str]] = frozenset({"scalar_mask"})
 
 
+def _as_f64_cpu(t: torch.Tensor) -> np.ndarray:
+    # Move host first, then cast: a fused ``.to(dtype=float64, device="cpu")``
+    # forces the float64 cast on the source device, which MPS cannot do.
+    return np.ascontiguousarray(t.detach().cpu().to(dtype=torch.float64).numpy())
+
+
 def _as_f64_2d(t: torch.Tensor) -> np.ndarray:
-    return np.ascontiguousarray(t.detach().to(dtype=torch.float64, device="cpu").numpy())
+    return _as_f64_cpu(t)
 
 
 def _as_f64_1d(t: torch.Tensor) -> np.ndarray:
-    return np.ascontiguousarray(t.detach().to(dtype=torch.float64, device="cpu").numpy())
+    return _as_f64_cpu(t)
 
 
 def _as_bool_1d(t: torch.Tensor) -> np.ndarray:
