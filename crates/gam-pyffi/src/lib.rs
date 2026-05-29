@@ -5233,7 +5233,25 @@ fn gaussian_reml_fit_formula_table<'py>(
             fisher_values.as_ref().map(|w| w.view()),
         )
     })?;
-    gaussian_reml_result_to_pydict(py, result)
+    tangent_reml_result_to_pydict(py, result)
+}
+
+fn tangent_reml_result_to_pydict<'py>(
+    py: Python<'py>,
+    fit: TangentRemlMultiResult,
+) -> PyResult<Py<PyDict>> {
+    let finite = fit.reml_score.is_finite()
+        && fit.coefficients.iter().all(|value| value.is_finite())
+        && fit.lambdas.iter().all(|value| value.is_finite());
+    let out = PyDict::new(py);
+    out.set_item("status", if finite { "ok" } else { "diverged" })?;
+    out.set_item("reml_score", fit.reml_score)?;
+    out.set_item("coefficients", fit.coefficients.into_pyarray(py))?;
+    out.set_item("fitted", fit.fitted.into_pyarray(py))?;
+    out.set_item("sigma2", fit.sigma2.into_pyarray(py))?;
+    out.set_item("lambdas", fit.lambdas.into_pyarray(py))?;
+    out.set_item("edf", fit.edf.into_pyarray(py))?;
+    Ok(out.unbind())
 }
 
 /// Multi-block Gaussian REML forward fit with per-smooth λ_k.
@@ -12903,15 +12921,6 @@ fn glm_reml_fit_latent_backward<'py>(
     Ok(out.unbind())
 }
 
-fn gaussian_reml_result_to_pydict<'py>(
-    py: Python<'py>,
-    fit: gam::gaussian_reml::GaussianRemlMultiResult,
-) -> PyResult<Py<PyDict>> {
-    let out = PyDict::new(py);
-    set_ok_gaussian_reml_items(py, &out, fit)?;
-    Ok(out.unbind())
-}
-
 fn set_ok_gaussian_reml_items<'py>(
     py: Python<'py>,
     out: &Bound<'py, PyDict>,
@@ -13292,6 +13301,32 @@ struct BatchedPositionGaussianRemlBackwardResult {
     grad_by: Option<Array1<f64>>,
 }
 
+/// Shared-tangent multi-output Gaussian REML fit.
+///
+/// One full Gaussian GAM is fitted per tangent coordinate (matching the
+/// documented `response_geometry` contract: "one scalar Gaussian GAM is fitted
+/// for each tangent coordinate"), but all coordinates are estimated jointly so
+/// that an optional cross-coordinate Fisher-Rao precision metric can couple
+/// their residuals. The fit routes through the *general* multi-penalty REML
+/// driver (`fit_gamwith_heuristic_lambdas`) — the very solver `gamfit.fit`
+/// uses — so smooth terms (`s()`, `te()`, `duchon()`, ...) that expand to
+/// several penalty blocks (wiggle + null-space ridge) are fully supported.
+/// Each tangent coordinate carries its own per-block smoothing parameters.
+struct TangentRemlMultiResult {
+    /// Per-output coefficients, shape `(K, D)`.
+    coefficients: Array2<f64>,
+    /// Per-output fitted tangent values `X · β_d`, shape `(N, D)`.
+    fitted: Array2<f64>,
+    /// Per-output residual variance, length `D`.
+    sigma2: Array1<f64>,
+    /// Per-output, per-block fitted smoothing parameters, shape `(D, M)`.
+    lambdas: Array2<f64>,
+    /// Per-output, per-block effective degrees of freedom, shape `(D, M)`.
+    edf: Array2<f64>,
+    /// Joint REML score (summed over coordinates).
+    reml_score: f64,
+}
+
 fn gaussian_reml_fit_formula_table_impl(
     headers: Vec<String>,
     rows: Vec<Vec<String>>,
@@ -13299,7 +13334,7 @@ fn gaussian_reml_fit_formula_table_impl(
     y: ArrayView2<'_, f64>,
     config_json: Option<&str>,
     fisher_rao_w: Option<ArrayView3<'_, f64>>,
-) -> Result<gam::gaussian_reml::GaussianRemlMultiResult, String> {
+) -> Result<TangentRemlMultiResult, String> {
     let dataset = dataset_with_inferred_schema(headers, rows)?;
     let mut fit_config = parse_fit_config(config_json)?;
     fit_config.family = Some("gaussian".to_string());
@@ -13309,182 +13344,250 @@ fn gaussian_reml_fit_formula_table_impl(
         FitRequest::Standard(request) => request,
         _ => {
             return Err(
-                "closed-form Gaussian REML formula fitting requires a standard Gaussian formula"
+                "shared-tangent Gaussian REML fitting requires a standard Gaussian formula"
                     .to_string(),
             );
         }
     };
     if !standard.family.is_gaussian_identity() {
-        return Err(
-            "closed-form Gaussian REML formula fitting requires Gaussian identity".to_string(),
-        );
+        return Err("shared-tangent Gaussian REML fitting requires Gaussian identity".to_string());
     }
     if standard.wiggle.is_some() {
         return Err(
-            "closed-form Gaussian REML formula fitting does not support link wiggle".to_string(),
+            "shared-tangent Gaussian REML fitting does not support link wiggle".to_string(),
         );
     }
     if standard.offset.iter().any(|value| value.abs() > 0.0) {
-        return Err(
-            "closed-form Gaussian REML formula fitting does not support offsets".to_string(),
-        );
+        return Err("shared-tangent Gaussian REML fitting does not support offsets".to_string());
     }
     let design = gam::smooth::build_term_collection_design(standard.data.view(), &standard.spec)
         .map_err(|err| format!("failed to build formula design matrix: {err}"))?;
     let x = design
         .design
-        .try_to_dense_by_chunks("closed_form_gaussian_reml_formula design")?;
-    if y.nrows() != x.nrows() {
-        return Err(format!(
-            "closed-form Gaussian REML response row mismatch: formula design has {} rows but Y has {}",
-            x.nrows(),
-            y.nrows()
-        ));
-    }
-    if design.penalties.len() != 1 {
-        return Err(format!(
-            "closed-form Gaussian REML formula fitting requires exactly one smoothing penalty; got {}",
-            design.penalties.len()
-        ));
-    }
-    let penalty = global_penalty_from_block(x.ncols(), &design.penalties[0])?;
-    if let Some(w) = fisher_rao_w {
-        return gaussian_reml_formula_table_dense_fisher(
-            x.view(),
-            y,
-            penalty.view(),
-            standard.weights.view(),
-            w,
-        );
-    }
-    gam::gaussian_reml::gaussian_reml_multi_closed_form(
-        x.view(),
-        y,
-        penalty.view(),
-        Some(standard.weights.view()),
-        None,
-    )
-    .map_err(|err| err.to_string())
-}
-
-fn gaussian_reml_formula_table_dense_fisher(
-    x: ArrayView2<'_, f64>,
-    y: ArrayView2<'_, f64>,
-    penalty: ArrayView2<'_, f64>,
-    weights: ArrayView1<'_, f64>,
-    fisher_w: ArrayView3<'_, f64>,
-) -> Result<gam::gaussian_reml::GaussianRemlMultiResult, String> {
+        .try_to_dense_by_chunks("shared_tangent_gaussian_reml design")?;
     let n = x.nrows();
     let k = x.ncols();
-    let p_out = y.ncols();
     if y.nrows() != n {
         return Err(format!(
-            "dense Fisher formula response row mismatch: formula design has {n} rows but Y has {}",
+            "shared-tangent Gaussian REML response row mismatch: formula design has {} rows but Y has {}",
+            n,
             y.nrows()
         ));
     }
-    validate_dense_fisher_w(n, p_out, fisher_w)?;
+    let d = y.ncols();
+    if d == 0 {
+        return Err("shared-tangent Gaussian REML requires at least one tangent output".to_string());
+    }
+    if k == 0 {
+        return Err(
+            "shared-tangent Gaussian REML requires a design with at least one column".to_string(),
+        );
+    }
+    if y.iter().any(|value| !value.is_finite()) {
+        return Err("shared-tangent Gaussian REML response must be finite".to_string());
+    }
+
+    let weights = standard.weights.view();
     if weights.len() != n {
         return Err(format!(
-            "dense Fisher formula weight length mismatch: expected {n}, got {}",
+            "shared-tangent Gaussian REML weight length mismatch: expected {n}, got {}",
             weights.len()
         ));
     }
     if weights.iter().any(|v| !v.is_finite() || *v < 0.0) {
-        return Err("dense Fisher formula weights must be finite and non-negative".to_string());
+        return Err("shared-tangent Gaussian REML weights must be finite and non-negative".to_string());
+    }
+    if let Some(w) = fisher_rao_w.as_ref() {
+        validate_dense_fisher_w(n, d, *w)?;
     }
 
-    let mut x_weighted = Array2::<f64>::zeros((n * p_out, k * p_out));
-    let mut y_weighted = Array2::<f64>::zeros((n * p_out, 1));
+    // Build the joint block-diagonal multi-output system. Tangent coordinate
+    // (output) `o` owns coefficient columns `o*K .. (o+1)*K`. Each observation
+    // contributes `D` stacked rows indexed by a metric axis; the per-row
+    // whitening factor `L Lᵀ = W_row · diag(weight)` couples the coordinate
+    // blocks across outputs. Without a Fisher-Rao metric `L = sqrt(weight)·I`,
+    // which decouples the system into `D` independent per-coordinate GAMs — the
+    // documented behaviour.
+    let p_total = k * d;
+    let mut joint_x = Array2::<f64>::zeros((n * d, p_total));
+    let mut joint_y = Array1::<f64>::zeros(n * d);
     for row in 0..n {
-        let mut block = fisher_w.slice(s![row, .., ..]).to_owned();
-        for a in 0..p_out {
-            for b in (a + 1)..p_out {
-                let avg = 0.5 * (block[[a, b]] + block[[b, a]]);
-                block[[a, b]] = avg;
-                block[[b, a]] = avg;
-            }
-        }
-        let lower = block
-            .cholesky(Side::Lower)
-            .map_err(|err| {
-                format!("fisher_rao_w row {row} must be positive-definite for dense REML: {err}")
-            })?
-            .lower_triangular();
         let scale = weights[row].sqrt();
-        for metric_axis in 0..p_out {
-            let stacked_row = row * p_out + metric_axis;
+        // Lower-triangular whitening factor `L` (D×D) with `L Lᵀ = metric`.
+        let lower: Array2<f64> = match fisher_rao_w.as_ref() {
+            Some(w) => {
+                let mut block = w.slice(s![row, .., ..]).to_owned();
+                for a in 0..d {
+                    for b in (a + 1)..d {
+                        let avg = 0.5 * (block[[a, b]] + block[[b, a]]);
+                        block[[a, b]] = avg;
+                        block[[b, a]] = avg;
+                    }
+                }
+                block
+                    .cholesky(Side::Lower)
+                    .map_err(|err| {
+                        format!(
+                            "fisher_rao_w row {row} must be positive-definite for shared-tangent REML: {err}"
+                        )
+                    })?
+                    .lower_triangular()
+            }
+            None => {
+                let mut id = Array2::<f64>::zeros((d, d));
+                for axis in 0..d {
+                    id[[axis, axis]] = 1.0;
+                }
+                id
+            }
+        };
+        for metric_axis in 0..d {
+            let stacked_row = row * d + metric_axis;
             let mut y_value = 0.0;
-            for output in 0..p_out {
+            for output in 0..d {
                 let l_t = scale * lower[[output, metric_axis]];
+                if l_t == 0.0 {
+                    continue;
+                }
                 y_value += l_t * y[[row, output]];
                 let col_offset = output * k;
                 for col in 0..k {
-                    x_weighted[[stacked_row, col_offset + col]] = l_t * x[[row, col]];
+                    joint_x[[stacked_row, col_offset + col]] = l_t * x[[row, col]];
                 }
             }
-            y_weighted[[stacked_row, 0]] = y_value;
+            joint_y[stacked_row] = y_value;
         }
     }
 
-    let mut block_penalty = Array2::<f64>::zeros((k * p_out, k * p_out));
-    for output in 0..p_out {
+    // Replicate every formula penalty block once per output, shifted into that
+    // output's coefficient sub-range. Each replicated block gets its own λ, so
+    // the general REML driver estimates per-coordinate, per-smooth smoothing
+    // parameters — exactly one scalar GAM's worth of penalties per coordinate.
+    let m = design.penalties.len();
+    let mut s_list: Vec<gam::smooth::BlockwisePenalty> = Vec::with_capacity(m * d);
+    for output in 0..d {
         let offset = output * k;
-        for row in 0..k {
-            for col in 0..k {
-                block_penalty[[offset + row, offset + col]] = penalty[[row, col]];
+        for penalty in &design.penalties {
+            if penalty.col_range.start > penalty.col_range.end
+                || penalty.col_range.end > k
+                || penalty.col_range.len() != penalty.local.nrows()
+                || penalty.col_range.len() != penalty.local.ncols()
+            {
+                return Err(format!(
+                    "formula penalty range {:?} is incompatible with design width {k}",
+                    penalty.col_range
+                ));
             }
+            let shifted = (offset + penalty.col_range.start)..(offset + penalty.col_range.end);
+            s_list.push(gam::smooth::BlockwisePenalty::new(
+                shifted,
+                penalty.local.clone(),
+            ));
         }
     }
-    let mut fit = gam::gaussian_reml::gaussian_reml_multi_closed_form(
-        x_weighted.view(),
-        y_weighted.view(),
-        block_penalty.view(),
+    if s_list.is_empty() {
+        return Err(
+            "shared-tangent Gaussian REML requires at least one smoothing penalty (a purely \
+             parametric RHS is fitted directly without REML)"
+                .to_string(),
+        );
+    }
+
+    let offset_zero = Array1::<f64>::zeros(n * d);
+    let joint_weights = Array1::<f64>::ones(n * d);
+    let opts = gam::estimate::FitOptions {
+        latent_cloglog: None,
+        mixture_link: None,
+        optimize_mixture: false,
+        sas_link: None,
+        optimize_sas: false,
+        compute_inference: true,
+        max_iter: 200,
+        tol: 1.0e-9,
+        nullspace_dims: vec![0; s_list.len()],
+        linear_constraints: None,
+        firth_bias_reduction: false,
+        adaptive_regularization: None,
+        penalty_shrinkage_floor: None,
+        rho_prior: Default::default(),
+        kronecker_penalty_system: None,
+        kronecker_factored: None,
+    };
+    let fit = gam::estimate::fit_gamwith_heuristic_lambdas(
+        joint_x,
+        joint_y.view(),
+        joint_weights.view(),
+        offset_zero.view(),
+        &s_list,
         None,
-        None,
+        LikelihoodSpec::new(
+            ResponseFamily::Gaussian,
+            InverseLink::Standard(StandardLink::Identity),
+        ),
+        &opts,
     )
     .map_err(|err| err.to_string())?;
 
-    let mut coefficients = Array2::<f64>::zeros((k, p_out));
-    for output in 0..p_out {
+    if fit.beta.len() != p_total {
+        return Err(format!(
+            "shared-tangent Gaussian REML produced {} coefficients, expected {p_total}",
+            fit.beta.len()
+        ));
+    }
+
+    // Unpack per-output coefficients and recover the unwhitened fitted tangent
+    // values, residual variance, and per-coordinate smoothing diagnostics.
+    let mut coefficients = Array2::<f64>::zeros((k, d));
+    for output in 0..d {
+        let offset = output * k;
         for col in 0..k {
-            coefficients[[col, output]] = fit.coefficients[[output * k + col, 0]];
+            coefficients[[col, output]] = fit.beta[offset + col];
         }
     }
     let fitted = x.dot(&coefficients);
-    let denom = n.saturating_sub(k).max(1) as f64;
-    let mut sigma2 = Array1::<f64>::zeros(p_out);
+    let mut sigma2 = Array1::<f64>::zeros(d);
+    let mut weight_sum = 0.0;
     for row in 0..n {
-        for output in 0..p_out {
+        weight_sum += weights[row];
+    }
+    let edf_by_block = fit
+        .inference
+        .as_ref()
+        .map(|inf| inf.edf_by_block.clone())
+        .unwrap_or_else(|| vec![0.0; s_list.len()]);
+    let mut edf = Array2::<f64>::zeros((d, m));
+    for output in 0..d {
+        let mut output_edf = 0.0;
+        for block in 0..m {
+            let idx = output * m + block;
+            let value = edf_by_block.get(idx).copied().unwrap_or(0.0);
+            edf[[output, block]] = value;
+            output_edf += value;
+        }
+        let denom = (weight_sum - output_edf).max(1.0);
+        let mut ss = 0.0;
+        for row in 0..n {
             let resid = y[[row, output]] - fitted[[row, output]];
-            sigma2[output] += weights[row] * resid * resid;
+            ss += weights[row] * resid * resid;
+        }
+        sigma2[output] = ss / denom;
+    }
+    let mut lambdas = Array2::<f64>::zeros((d, m));
+    for output in 0..d {
+        for block in 0..m {
+            let idx = output * m + block;
+            lambdas[[output, block]] = fit.lambdas.get(idx).copied().unwrap_or(f64::NAN);
         }
     }
-    sigma2.mapv_inplace(|v| v / denom);
-    fit.coefficients = coefficients;
-    fit.fitted = fitted;
-    fit.sigma2 = sigma2;
-    Ok(fit)
-}
 
-fn global_penalty_from_block(
-    p: usize,
-    penalty: &gam::smooth::BlockwisePenalty,
-) -> Result<Array2<f64>, String> {
-    if penalty.col_range.start > penalty.col_range.end
-        || penalty.col_range.end > p
-        || penalty.col_range.len() != penalty.local.nrows()
-        || penalty.col_range.len() != penalty.local.ncols()
-    {
-        return Err(format!(
-            "formula penalty range {:?} is incompatible with design width {p}",
-            penalty.col_range
-        ));
-    }
-    let mut out = Array2::<f64>::zeros((p, p));
-    out.slice_mut(s![penalty.col_range.clone(), penalty.col_range.clone()])
-        .assign(&penalty.local);
-    Ok(out)
+    Ok(TangentRemlMultiResult {
+        coefficients,
+        fitted,
+        sigma2,
+        lambdas,
+        edf,
+        reml_score: fit.reml_score,
+    })
 }
 
 fn gaussian_reml_fit_batched_impl(
