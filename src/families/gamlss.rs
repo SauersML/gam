@@ -4264,9 +4264,20 @@ fn binomial_neglog_q_derivatives_logit_closed_form(y: f64, weight: f64, q: f64) 
         let eq = q.exp();
         eq / (1.0 + eq)
     };
+    // Clamp `p` AND its complement `1 - p` separately so that the
+    // saturated-boundary product `p_var * one_minus_p_var` equals the
+    // mathematical `MIN_PROB · (1 − MIN_PROB)` exactly. Recomputing
+    // `1 - p_var` after clamping `p` would catastrophically cancel near the
+    // boundary (e.g. `1 - (1 − 1e-10)` yields `1.0000000827e-10`, not the
+    // intended `1e-10`), inflating the variance by ~8e-18 — small in
+    // absolute terms but enough to corrupt the Fisher information used by
+    // the GAMLSS exact-Newton step in the deep tail.
     let p_var = p.clamp(MIN_PROB, 1.0 - MIN_PROB);
-    let s = p_var * (1.0 - p_var);
-    // For extreme |q|, s underflows gracefully to 0, which is correct.
+    let one_minus_p_var = (1.0 - p).clamp(MIN_PROB, 1.0 - MIN_PROB);
+    let s = p_var * one_minus_p_var;
+    // For extreme |q|, s settles at the clamped floor `MIN_PROB·(1−MIN_PROB)`
+    // — never below — so the second-order Newton block stays bounded away
+    // from zero curvature on saturated rows.
 
     let m1 = weight * (p - y);
     let m2 = weight * s;
@@ -4294,8 +4305,12 @@ fn binomial_neglog_q_fourth_derivative_logit_closed_form(x: f64, weight: f64, q:
         let eq = q.exp();
         eq / (1.0 + eq)
     };
+    // Same cancellation-free `p · (1 − p)` form as
+    // `binomial_neglog_q_derivatives_logit_closed_form` above — see the
+    // note there.
     let p_var = p.clamp(MIN_PROB, 1.0 - MIN_PROB);
-    let s = p_var * (1.0 - p_var);
+    let one_minus_p_var = (1.0 - p).clamp(MIN_PROB, 1.0 - MIN_PROB);
+    let s = p_var * one_minus_p_var;
     weight * s * (1.0 - 6.0 * s)
 }
 
