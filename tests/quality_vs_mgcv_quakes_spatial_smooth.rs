@@ -1,0 +1,222 @@
+//! End-to-end quality: gam's 2-D spatial thin-plate smooth must PREDICT
+//! earthquake magnitude from geographic location (and focal depth) on held-out
+//! data at least as well as mgcv — the mature, standard GAM implementation and
+//! the canonical tool for spatial smoothing `s(long, lat, bs="tp")`.
+//!
+//! Data: the classic Fiji earthquakes dataset (`quakes`, 1000 events recorded by
+//! the Harvard PDE seismic network near Fiji). Each row is one seismic event with
+//! its epicentre longitude/latitude, focal `depth` (km) and Richter `mag`nitude.
+//! Source CSV (no auth, direct download):
+//!   https://vincentarelbundock.github.io/Rdatasets/csv/datasets/quakes.csv
+//!
+//! Realistic use-case: a geostatistical regression of event magnitude on a
+//! smooth spatial surface plus a smooth depth effect,
+//!   `mag ~ s(long, lat, bs="tp") + s(depth)` (Gaussian / identity link).
+//! The Fiji subduction zone produces a spatially structured magnitude field, so
+//! an isotropic thin-plate surface over (long, lat) is the textbook smoother and
+//! mgcv is the textbook reference.
+//!
+//! There is no known ground-truth surface (real data), so objective quality is
+//! out-of-sample predictive accuracy:
+//!
+//!   PRIMARY (objective, tool-free): held-out coefficient of determination
+//!     `test_R2 >= 0.20`. The spatial+depth smooth genuinely explains held-out
+//!     magnitude variance, comfortably above the constant-mean predictor (R2=0).
+//!     The bar is modest because earthquake magnitude is noisy and only partly
+//!     determined by location/depth, yet a correct spatial smooth clears it while
+//!     a broken one (degenerate surface ~ mean predictor) would not.
+//!
+//!   BASELINE (match-or-beat): mgcv fits the SAME training rows and predicts the
+//!     SAME held-out rows; gam's held-out RMSE must be no worse than
+//!     `mgcv_test_rmse * 1.10`. mgcv is an accuracy baseline to match-or-beat,
+//!     NEVER a fitted target to reproduce.
+
+use gam::matrix::LinearOperator;
+use gam::smooth::build_term_collection_design;
+use gam::test_support::reference::{Column, rmse, run_r};
+use gam::{
+    FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema,
+};
+use ndarray::Array2;
+use std::path::Path;
+
+const QUAKES_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/quakes.csv");
+
+/// Coefficient of determination of `pred` against observed `truth`, relative to
+/// the mean predictor: `1 - SS_res / SS_tot`. R2 = 1 is perfect, R2 = 0 matches
+/// predicting the held-out mean, R2 < 0 is worse than the mean.
+fn r2(pred: &[f64], truth: &[f64]) -> f64 {
+    assert_eq!(pred.len(), truth.len(), "r2 length mismatch");
+    let n = truth.len() as f64;
+    let mean = truth.iter().sum::<f64>() / n;
+    let ss_res: f64 = pred.iter().zip(truth).map(|(p, t)| (t - p) * (t - p)).sum();
+    let ss_tot: f64 = truth.iter().map(|t| (t - mean) * (t - mean)).sum();
+    1.0 - ss_res / ss_tot.max(1e-300)
+}
+
+/// Right-pad `v` with its last value (or 0.0 when empty) to length `len`, so a
+/// short test-row column can ride along inside the (longer) training data.frame
+/// handed to the reference body. Only the first `v.len()` entries are read back.
+fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
+    assert!(
+        v.len() <= len,
+        "pad target {len} shorter than source {}",
+        v.len()
+    );
+    let fill = v.last().copied().unwrap_or(0.0);
+    let mut out = v.to_vec();
+    out.resize(len, fill);
+    out
+}
+
+#[test]
+fn gam_spatial_smooth_predicts_quakes_better_than_baseline() {
+    init_parallelism();
+
+    // ---- load the Fiji earthquakes dataset (long, lat, depth -> mag) -------
+    let ds = load_csvwith_inferred_schema(Path::new(QUAKES_CSV)).expect("load quakes.csv");
+    let col = ds.column_map();
+    let long_idx = col["long"];
+    let lat_idx = col["lat"];
+    let depth_idx = col["depth"];
+    let mag_idx = col["mag"];
+    let long: Vec<f64> = ds.values.column(long_idx).to_vec();
+    let lat: Vec<f64> = ds.values.column(lat_idx).to_vec();
+    let depth: Vec<f64> = ds.values.column(depth_idx).to_vec();
+    let mag: Vec<f64> = ds.values.column(mag_idx).to_vec();
+    let n = mag.len();
+    assert!(n > 900, "quakes should have ~1000 rows, got {n}");
+
+    // ---- deterministic train/test split: every 5th row is held out --------
+    let is_test = |i: usize| i % 5 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    assert!(
+        train_rows.len() > 700 && test_rows.len() > 150,
+        "split sizes: train={} test={}",
+        train_rows.len(),
+        test_rows.len()
+    );
+
+    let train_long: Vec<f64> = train_rows.iter().map(|&i| long[i]).collect();
+    let train_lat: Vec<f64> = train_rows.iter().map(|&i| lat[i]).collect();
+    let train_depth: Vec<f64> = train_rows.iter().map(|&i| depth[i]).collect();
+    let train_mag: Vec<f64> = train_rows.iter().map(|&i| mag[i]).collect();
+    let test_long: Vec<f64> = test_rows.iter().map(|&i| long[i]).collect();
+    let test_lat: Vec<f64> = test_rows.iter().map(|&i| lat[i]).collect();
+    let test_depth: Vec<f64> = test_rows.iter().map(|&i| depth[i]).collect();
+    let test_mag: Vec<f64> = test_rows.iter().map(|&i| mag[i]).collect();
+
+    // Build a training-only dataset by sub-setting the encoded rows; headers,
+    // schema and column kinds are unchanged, so the formula resolves identically.
+    let p = ds.headers.len();
+    let mut train_values = Array2::<f64>::zeros((train_rows.len(), p));
+    for (out_row, &src_row) in train_rows.iter().enumerate() {
+        for c in 0..p {
+            train_values[[out_row, c]] = ds.values[[src_row, c]];
+        }
+    }
+    let mut train_ds = ds.clone();
+    train_ds.values = train_values;
+
+    // ---- fit gam on TRAIN: mag ~ s(long, lat, bs="tp") + s(depth), REML ----
+    // The two-variable `s(long, lat, bs="tp")` routes through the isotropic
+    // thin-plate radial kernel (the direct analogue of mgcv's spatial smooth),
+    // with an additive 1-D smooth of focal depth.
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula(
+        "mag ~ s(long, lat, bs=\"tp\") + s(depth)",
+        &train_ds,
+        &cfg,
+    )
+    .expect("gam fit");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected a standard GAM fit for a gaussian spatial smooth");
+    };
+    let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
+
+    // gam predictions at the held-out points: rebuild the design from the frozen
+    // spec (identity link => design*beta = predicted mean).
+    let mut test_grid = Array2::<f64>::zeros((test_rows.len(), p));
+    for i in 0..test_rows.len() {
+        test_grid[[i, long_idx]] = test_long[i];
+        test_grid[[i, lat_idx]] = test_lat[i];
+        test_grid[[i, depth_idx]] = test_depth[i];
+    }
+    let test_design = build_term_collection_design(test_grid.view(), &fit.resolvedspec)
+        .expect("rebuild spatial design at held-out points");
+    let gam_test_pred: Vec<f64> = test_design.design.apply(&fit.fit.beta).to_vec();
+
+    // ---- fit the SAME model on TRAIN with mgcv, predict the SAME TEST ------
+    // The harness exposes one data.frame per call, so the held-out predictor
+    // columns ride along padded to the training length and are sliced back to
+    // the first `k = test_n` rows inside R.
+    let r = run_r(
+        &[
+            Column::new("long", &train_long),
+            Column::new("lat", &train_lat),
+            Column::new("depth", &train_depth),
+            Column::new("mag", &train_mag),
+            Column::new("test_long", &pad_to(&test_long, train_long.len())),
+            Column::new("test_lat", &pad_to(&test_lat, train_long.len())),
+            Column::new("test_depth", &pad_to(&test_depth, train_long.len())),
+            Column::new("test_n", &vec![test_rows.len() as f64; train_long.len()]),
+        ],
+        r#"
+        suppressPackageStartupMessages(library(mgcv))
+        m <- gam(mag ~ s(long, lat, bs = "tp") + s(depth), data = df, method = "REML")
+        k <- df$test_n[1]
+        newd <- data.frame(
+            long = df$test_long[1:k],
+            lat = df$test_lat[1:k],
+            depth = df$test_depth[1:k]
+        )
+        emit("test_pred", as.numeric(predict(m, newdata = newd)))
+        emit("edf", sum(m$edf))
+        "#,
+    );
+    let mgcv_test_pred = r.vector("test_pred");
+    let mgcv_edf = r.scalar("edf");
+    assert_eq!(
+        mgcv_test_pred.len(),
+        test_rows.len(),
+        "mgcv held-out prediction length mismatch"
+    );
+
+    // ---- objective metrics on gam's OWN predictions ------------------------
+    let gam_test_r2 = r2(&gam_test_pred, &test_mag);
+    let gam_test_rmse = rmse(&gam_test_pred, &test_mag);
+    let mgcv_test_rmse = rmse(mgcv_test_pred, &test_mag);
+
+    eprintln!(
+        "quakes s(long,lat)+s(depth) held-out: n_train={} n_test={} \
+         gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} gam_test_R2={gam_test_r2:.4} \
+         gam_test_rmse={gam_test_rmse:.4} mgcv_test_rmse={mgcv_test_rmse:.4}",
+        train_rows.len(),
+        test_rows.len(),
+    );
+
+    // ---- PRIMARY objective assertion: gam predicts the held-out signal -----
+    // Fiji-zone magnitude is noisy and only partly explained by location/depth,
+    // so the absolute bar is modest; R2 >= 0.20 is well above the constant-mean
+    // baseline (0) and a degenerate (over-/under-smoothed) surface would miss it.
+    assert!(
+        gam_test_r2 >= 0.20,
+        "gam's held-out predictive R2 too low: {gam_test_r2:.4} (< 0.20)"
+    );
+
+    // ---- BASELINE (match-or-beat): no worse than mgcv on held-out RMSE -----
+    assert!(
+        gam_test_rmse <= mgcv_test_rmse * 1.10,
+        "gam held-out RMSE {gam_test_rmse:.4} exceeds mgcv {mgcv_test_rmse:.4} * 1.10"
+    );
+
+    // ---- complexity sanity: edf in a signal-appropriate range (not matched) -
+    assert!(
+        gam_edf > 2.0 && gam_edf < 60.0,
+        "gam effective dof out of sane range: {gam_edf:.3}"
+    );
+}
