@@ -1435,6 +1435,96 @@ impl AnalyticPenalty for IsometryPenalty {
         self.hvp_with_precomputed_state(&state, rho, v)
     }
 
+    /// PSD majorizer-vector product `B_GN(target; ρ) v` for the **nonconvex**
+    /// isometry penalty.
+    ///
+    /// `P_iso = (μ/2) Σ_n ‖g_n − g^ref_n‖²_F` is a nonlinear least-squares
+    /// objective in the latent coords `t` through `g_n(t) = J_nᵀ W J_n`. Its
+    /// exact Hessian (the [`Self::hvp`] above) carries an indefinite
+    /// residual·curvature term `(g − g^ref)·B_{ab,cd}` whose `B` needs the
+    /// **third** decoder jet `K = ∂³φ/∂t³`. For every basis that does not
+    /// supply `K` (i.e. everything except the radial-Duchon source) that exact
+    /// `hvp` returns the zero vector, which would leave the Arrow-Schur
+    /// Newton/PIRLS curvature block with no isometry contribution at all.
+    ///
+    /// The Gauss-Newton block drops the residual term and keeps only
+    ///   `(B_GN)_{cd} = μ Σ_{a,b} (∂g_{ab}/∂t_c)(∂g_{ab}/∂t_d)`,
+    /// with `∂g_{ab}/∂t_c = H_{a,c}ᵀ W J_b + J_aᵀ W H_{b,c}`. This is PSD by
+    /// construction (a sum of rank-1 outer products `(∂g/∂t)(∂g/∂t)ᵀ`), equals
+    /// the exact Hessian as the residual `g − g^ref → 0`, and needs only the
+    /// first jet `J` and the second jet `H` — both cached for any basis with an
+    /// analytic second jet (sphere, circle, torus, …). The curvature block must
+    /// stay positive-definite for the inner solve, so the GN block is the
+    /// *correct* operator here regardless of whether `K` happens to be
+    /// available; mirroring the other nonconvex penalties (sparsity, JumpReLU)
+    /// that override the majorizer rather than handing back an indefinite
+    /// Hessian.
+    fn psd_majorizer_hvp(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+        v: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        let d = self
+            .target
+            .latent_dim
+            .expect("IsometryPenalty requires latent_dim on its PsiSlice");
+        let n_obs = target.len() / d;
+        if !self.has_jacobian_cache("psd_majorizer_hvp")
+            || !self.has_jacobian_second_source("psd_majorizer_hvp")
+        {
+            return Array1::<f64>::zeros(v.len());
+        }
+        let Some(jac2) = self.jacobian_second(target, n_obs, d) else {
+            return Array1::<f64>::zeros(v.len());
+        };
+        let p = self.p_out;
+        let mu = self.scalar_weight * rho[self.rho_index].exp();
+        let mut out = Array1::<f64>::zeros(v.len());
+        for n in 0..n_obs {
+            let Some(wj) = self.weighted_jacobian_row(n, d) else {
+                return Array1::<f64>::zeros(v.len());
+            };
+            // s_{ab} = Σ_c (∂g_{ab}/∂t_c) v_c — the directional derivative of
+            // the pullback metric entry g_{ab} along v at row n.
+            let mut sg = Array2::<f64>::zeros((d, d));
+            for a in 0..d {
+                for b in 0..d {
+                    let mut s = 0.0;
+                    for c in 0..d {
+                        let vc = v[n * d + c];
+                        if vc == 0.0 {
+                            continue;
+                        }
+                        let mut dg_c = 0.0;
+                        for i in 0..p {
+                            dg_c += jac2[[n, (i * d + a) * d + c]] * wj[[i, b]];
+                            dg_c += wj[[i, a]] * jac2[[n, (i * d + b) * d + c]];
+                        }
+                        s += dg_c * vc;
+                    }
+                    sg[[a, b]] = s;
+                }
+            }
+            // (B_GN v)_c = μ Σ_{a,b} (∂g_{ab}/∂t_c) · s_{ab}.
+            for c in 0..d {
+                let mut acc = 0.0;
+                for a in 0..d {
+                    for b in 0..d {
+                        let mut dg_c = 0.0;
+                        for i in 0..p {
+                            dg_c += jac2[[n, (i * d + a) * d + c]] * wj[[i, b]];
+                            dg_c += wj[[i, a]] * jac2[[n, (i * d + b) * d + c]];
+                        }
+                        acc += dg_c * sg[[a, b]];
+                    }
+                }
+                out[n * d + c] = mu * acc;
+            }
+        }
+        out
+    }
+
     fn grad_rho(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
         // P(ρ) = ½ μ · S, where S is the (ρ-independent) Frobenius sum and
         // μ = exp(ρ_iso). So ∂P/∂ρ_iso = P.
@@ -8222,6 +8312,133 @@ mod tests {
         assert!((h[2] - 2.0).abs() < 1e-12);
         assert!((h[1] - 3.0).abs() < 1e-12);
         assert!((h[3] - 3.0).abs() < 1e-12);
+    }
+
+    /// Deterministic `(n_obs=3, p=4, d=2)` first/second decoder jets for the
+    /// isometry Gauss-Newton majorizer tests. `J` is `(n_obs, p*d)` indexed
+    /// `J[n, i*d+a]`; `H` is `(n_obs, p*d*d)` indexed `H[n, (i*d+a)*d+c]`,
+    /// symmetric in `(a, c)` as a genuine second derivative must be.
+    fn isometry_gn_fixture() -> (usize, usize, usize, Arc<Array2<f64>>, Arc<Array2<f64>>) {
+        let (n_obs, p, d) = (3usize, 4usize, 2usize);
+        let mut j = Array2::<f64>::zeros((n_obs, p * d));
+        for n in 0..n_obs {
+            for i in 0..p {
+                for a in 0..d {
+                    j[[n, i * d + a]] = 0.7 + 0.31 * (n as f64) - 0.23 * (i as f64)
+                        + 0.17 * (a as f64)
+                        + 0.05 * ((n * p + i) as f64);
+                }
+            }
+        }
+        let mut h = Array2::<f64>::zeros((n_obs, p * d * d));
+        for n in 0..n_obs {
+            for i in 0..p {
+                for a in 0..d {
+                    for c in 0..d {
+                        // Symmetric in (a, c): depends only on a+c and a·c.
+                        let s = (a + c) as f64;
+                        let pr = (a * c) as f64;
+                        h[[n, (i * d + a) * d + c]] =
+                            0.13 * (n as f64 + 1.0) + 0.09 * (i as f64) + 0.21 * s - 0.04 * pr;
+                    }
+                }
+            }
+        }
+        (n_obs, p, d, Arc::new(j), Arc::new(h))
+    }
+
+    /// The isometry penalty is a nonconvex least-squares objective, so its
+    /// curvature contribution to the Arrow-Schur inner solve is the
+    /// Gauss-Newton majorizer `B_GN`, not the indefinite exact Hessian. This
+    /// pins the two structural invariants the inner solve relies on: `B_GN` is
+    /// symmetric and positive-semidefinite, built from only the first and
+    /// second decoder jets (no third jet `K`).
+    #[test]
+    fn isometry_gn_majorizer_is_psd_and_symmetric() {
+        let (n_obs, p, d, j, h) = isometry_gn_fixture();
+        let n = n_obs * d;
+        let target = PsiSlice::full(n, Some(d));
+        let pen = IsometryPenalty::new_euclidean(target, p);
+        pen.refresh_caches(Some(j), Some(h));
+        // psd_majorizer_hvp reads the cached jets, so t only sets n_obs.
+        let t = Array1::<f64>::zeros(n);
+        let rho = array![0.0_f64];
+
+        // Symmetry: assemble the dense operator column-by-column via unit probes.
+        let mut bmat = Array2::<f64>::zeros((n, n));
+        for k in 0..n {
+            let mut e = Array1::<f64>::zeros(n);
+            e[k] = 1.0;
+            let col = pen.psd_majorizer_hvp(t.view(), rho.view(), e.view());
+            for r in 0..n {
+                bmat[[r, k]] = col[r];
+            }
+        }
+        for r in 0..n {
+            for c in 0..n {
+                assert_abs_diff_eq!(bmat[[r, c]], bmat[[c, r]], epsilon = 1e-12);
+            }
+        }
+
+        // PSD: vᵀ B v ≥ 0 for a spread of probe directions.
+        let probes = [
+            array![0.4_f64, -1.1, 0.7, 0.3, -0.5, 0.9],
+            array![1.0_f64, 1.0, 1.0, 1.0, 1.0, 1.0],
+            array![-2.3_f64, 0.6, -0.1, 1.4, 0.8, -1.7],
+            array![0.0_f64, 0.0, 3.2, -0.4, 0.0, 0.5],
+        ];
+        for v in &probes {
+            let bv = pen.psd_majorizer_hvp(t.view(), rho.view(), v.view());
+            let quad = v.dot(&bv);
+            assert!(
+                quad >= -1e-9,
+                "isometry GN majorizer must be PSD; got vᵀBv = {quad:.3e}"
+            );
+        }
+    }
+
+    /// As the residual `g − g_ref → 0` the exact Hessian collapses onto its
+    /// Gauss-Newton block. Pinning the reference metric to the model's own
+    /// pullback metric drives the residual to exactly zero, so the exact `hvp`
+    /// (which here also has a — zero — third jet so its state assembles) must
+    /// agree bit-for-bit with the `B_GN` majorizer.
+    #[test]
+    fn isometry_gn_majorizer_matches_exact_hvp_at_zero_residual() {
+        let (n_obs, p, d, j, h) = isometry_gn_fixture();
+        let n = n_obs * d;
+        let target = PsiSlice::full(n, Some(d));
+
+        // Stage caches on a scratch penalty to read the pullback metric g(t),
+        // then pin the reference to it (residual g − g_ref ≡ 0).
+        let scratch = IsometryPenalty::new_euclidean(target.clone(), p);
+        scratch.refresh_caches(Some(j.clone()), Some(h.clone()));
+        let g = scratch
+            .pullback_metric(d)
+            .expect("pullback metric available once J is cached");
+
+        // A zero third jet lets the exact hvp_state assemble (it requires a
+        // third-derivative source) while contributing nothing to the result.
+        let k_zero = Arc::new(ndarray::Array3::<f64>::zeros((n_obs, p, d * d * d)));
+        let pen = IsometryPenalty::new_euclidean(target, p)
+            .with_reference(IsometryReference::UserSupplied(Arc::new(g)))
+            .with_third_decoder_derivative(k_zero);
+        pen.refresh_caches(Some(j), Some(h));
+
+        let t = Array1::<f64>::zeros(n);
+        let rho = array![0.0_f64];
+        let probes = [
+            array![0.4_f64, -1.1, 0.7, 0.3, -0.5, 0.9],
+            array![-2.3_f64, 0.6, -0.1, 1.4, 0.8, -1.7],
+        ];
+        for v in &probes {
+            let exact = pen.hvp(t.view(), rho.view(), v.view());
+            let gn = pen.psd_majorizer_hvp(t.view(), rho.view(), v.view());
+            for i in 0..n {
+                assert_abs_diff_eq!(exact[i], gn[i], epsilon = 1e-12);
+            }
+            // Guard against a vacuous all-zero "match".
+            assert!(gn.iter().any(|x| x.abs() > 1e-9));
+        }
     }
 
     /// Build the canonical JumpReLU sweep fixture: a logit grid that straddles
