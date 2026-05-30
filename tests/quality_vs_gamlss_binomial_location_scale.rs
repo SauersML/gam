@@ -68,6 +68,14 @@ use gam::{
 use ndarray::Array2;
 use std::path::Path;
 
+/// Standard logistic sigmoid `1 / (1 + exp(-q))`. Both test arms reconstruct
+/// the success probability `P̂(x) = expit(q)` where `q = -t / σ` is the
+/// composed-link latent logit. Lifted to a free function so the synthetic and
+/// real-data arms share the same definition.
+fn expit(q: f64) -> f64 {
+    1.0 / (1.0 + (-q).exp())
+}
+
 #[test]
 fn gam_binomial_location_scale_logit_p_matches_mgcv_binomial() {
     init_parallelism();
@@ -111,7 +119,6 @@ fn gam_binomial_location_scale_logit_p_matches_mgcv_binomial() {
 
     let t_true = |xi: f64| 1.0 + 0.5 * (pi * xi).sin();
     let s_true = |xi: f64| 0.5 + 0.2 * (pi * xi).sin();
-    let expit = |e: f64| 1.0 / (1.0 + (-e).exp());
     // Bernoulli outcome from the latent logistic: success when a uniform draw
     // falls under the per-row probability expit(t + s·z).
     let y: Vec<f64> = (0..n)
