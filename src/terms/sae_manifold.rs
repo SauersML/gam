@@ -6961,6 +6961,83 @@ mod tests {
         Ok(())
     }
 
+    /// The analytic third jet `T[n,m,a,c,e] = ∂³Φ_m/∂t_a∂t_c∂t_e` must equal the
+    /// central difference of the analytic (already FD-validated) second jet along
+    /// the trailing axis, and be fully symmetric across its three trailing axes.
+    /// This validates the closed-form `K` providers added for the exact isometry
+    /// Hessian (#458) against an independent numerical derivative — the third-jet
+    /// analogue of `assert_second_jet_matches_central_difference`. A
+    /// magnitude-scaled tolerance is used because the harmonic third derivatives
+    /// scale like `freq³` (≈ thousands for the higher harmonics), so a pure
+    /// absolute bound would be meaningless at the top of the range.
+    fn assert_third_jet_matches_central_difference<E: SaeBasisThirdJet>(
+        evaluator: &E,
+        coords: Array2<f64>,
+        abs_tol: f64,
+        rel_tol: f64,
+    ) -> Result<(), String> {
+        let epsilon = 1.0e-4;
+        let third = evaluator.third_jet(coords.view())?;
+        let second = evaluator.second_jet(coords.view())?;
+        let (n_rows, n_basis, latent_dim, ld_b, ld_c) = third.dim();
+        assert_eq!(latent_dim, ld_b);
+        assert_eq!(latent_dim, ld_c);
+        assert_eq!((n_rows, n_basis, latent_dim, latent_dim), second.dim());
+        for row in 0..n_rows {
+            for axis_e in 0..latent_dim {
+                let mut plus = coords.clone();
+                let mut minus = coords.clone();
+                plus[[row, axis_e]] += epsilon;
+                minus[[row, axis_e]] -= epsilon;
+                let second_plus = evaluator.second_jet(plus.view())?;
+                let second_minus = evaluator.second_jet(minus.view())?;
+                for basis in 0..n_basis {
+                    for axis_a in 0..latent_dim {
+                        for axis_c in 0..latent_dim {
+                            let fd = (second_plus[[row, basis, axis_a, axis_c]]
+                                - second_minus[[row, basis, axis_a, axis_c]])
+                                / (2.0 * epsilon);
+                            let analytic = third[[row, basis, axis_a, axis_c, axis_e]];
+                            let error = (analytic - fd).abs();
+                            let threshold = abs_tol + rel_tol * analytic.abs().max(fd.abs());
+                            assert!(
+                                error <= threshold,
+                                "row={row} basis={basis} a={axis_a} c={axis_c} e={axis_e}: \
+                                 analytic={analytic:.12e}, fd={fd:.12e}, error={error:.6e}, \
+                                 threshold={threshold:.6e}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // Full symmetry across the three trailing derivative axes (mixed partials
+        // commute), so every permutation of `(a, c, e)` must agree.
+        for row in 0..n_rows {
+            for basis in 0..n_basis {
+                for a in 0..latent_dim {
+                    for b in 0..latent_dim {
+                        for c in 0..latent_dim {
+                            let reference = third[[row, basis, a, b, c]];
+                            for perm in [[a, c, b], [b, a, c], [b, c, a], [c, a, b], [c, b, a]] {
+                                let permuted = third[[row, basis, perm[0], perm[1], perm[2]]];
+                                assert!(
+                                    (reference - permuted).abs() <= 1.0e-10,
+                                    "third_jet not symmetric: row={row} basis={basis} \
+                                     ({a},{b},{c})={reference:.6e} vs ({},{},{})={permuted:.6e}",
+                                    perm[0],
+                                    perm[1],
+                                    perm[2]
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn isometry_periodic_second_jet_matches_fd() -> Result<(), String> {
         assert_second_jet_matches_central_difference(
@@ -6986,6 +7063,40 @@ mod tests {
         let evaluator = TorusHarmonicEvaluator::new(2, 3).unwrap();
         assert!(evaluator.basis_size() > 0);
         assert_second_jet_matches_central_difference(&evaluator, torus_coords, 1.0e-5)?;
+        Ok(())
+    }
+
+    #[test]
+    fn isometry_periodic_third_jet_matches_fd() -> Result<(), String> {
+        assert_third_jet_matches_central_difference(
+            &PeriodicHarmonicEvaluator::new(7).unwrap(),
+            array![[-0.37], [0.0], [0.125], [0.41]],
+            1.0e-6,
+            1.0e-5,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn isometry_sphere_third_jet_matches_fd() -> Result<(), String> {
+        // Interior of `(-π/2, π/2)` for lat so the chart chain factor is active —
+        // that is where the third-order curvature term carries information.
+        let sphere_coords = array![[-0.7, -1.2], [-0.25, 0.0], [0.35, 0.9], [0.8, 2.1]];
+        assert_third_jet_matches_central_difference(
+            &SphereChartEvaluator,
+            sphere_coords,
+            1.0e-6,
+            1.0e-5,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn isometry_torus_third_jet_matches_fd() -> Result<(), String> {
+        let torus_coords = array![[0.1, 0.7], [0.42, 0.0], [0.95, 0.33], [0.5, 0.5]];
+        let evaluator = TorusHarmonicEvaluator::new(2, 3).unwrap();
+        assert!(evaluator.basis_size() > 0);
+        assert_third_jet_matches_central_difference(&evaluator, torus_coords, 1.0e-6, 1.0e-5)?;
         Ok(())
     }
 
