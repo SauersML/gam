@@ -8292,10 +8292,19 @@ fn latent_multi_output_fit_to_pydict<'py>(
             y.ncols()
         )));
     }
-    if y.iter().any(|v| !v.is_finite()) {
-        return Err(py_value_error(
-            "multi-output GLM latent response must be finite".to_string(),
-        ));
+    // Both supported families (binomial-logit and softmax multinomial-logit)
+    // consume probability-valued targets: the per-entry binomial term
+    // y log μ + (1 − y) log(1 − μ) and the softmax cross-entropy − Σ y_a log μ_a
+    // are bounded log-likelihoods only when every observed entry lies in [0, 1].
+    // A finite-but-out-of-range entry (e.g. y = 2) makes the objective unbounded
+    // in η, so reject it before calling the solver.
+    for ((n, a), &v) in y.indexed_iter() {
+        if !(v.is_finite() && (0.0..=1.0).contains(&v)) {
+            return Err(py_value_error(format!(
+                "multi-output GLM latent response must be a probability in [0,1]; \
+                 got y[{n},{a}] = {v}"
+            )));
+        }
     }
     let row_weights = latent_row_weights(n_obs, weights).map_err(py_value_error)?;
     let lambda = init_lambda.unwrap_or(1.0);

@@ -56,8 +56,10 @@ pub struct BinomialMultiFitInputs<'a> {
     /// all response columns).
     pub design: ArrayView2<'a, f64>,
     /// Multi-column binomial response `Y ∈ ℝ^{N×K}`. Each column is treated
-    /// as an independent binomial-logit response; entries are typically in
-    /// `[0, 1]` (proportions / soft labels are permitted).
+    /// as an independent binomial-logit response, so every entry must be a
+    /// binomial proportion in `[0, 1]` (hard `{0, 1}` Bernoulli labels and soft
+    /// proportions / probabilities alike). Entries outside `[0, 1]` are
+    /// rejected because the per-entry log-likelihood is then unbounded in `η`.
     pub y: ArrayView2<'a, f64>,
     /// Shared smoothing penalty `S ∈ ℝ^{P×P}` (symmetric, PSD).
     pub penalty: ArrayView2<'a, f64>,
@@ -213,9 +215,14 @@ pub fn fit_penalized_binomial_multi(
         }
     }
     for ((i, j), &v) in y.indexed_iter() {
-        if !v.is_finite() {
+        // The per-entry objective y log μ + (1 − y) log(1 − μ) is the binomial
+        // (Bernoulli / proportion) log-likelihood only when 0 ≤ y ≤ 1. Outside
+        // that range it is unbounded above in η (e.g. y = 2 gives
+        // 2η − log(1 + e^η) → ∞), so a finite-but-invalid entry would make the
+        // stated likelihood not a binomial likelihood at all. Reject it here.
+        if !(v.is_finite() && (0.0..=1.0).contains(&v)) {
             crate::bail_invalid_estim!(
-                "fit_penalized_binomial_multi: y[{i},{j}] must be finite (got {v})"
+                "fit_penalized_binomial_multi: y[{i},{j}] must be a binomial proportion in [0,1] (got {v})"
             );
         }
     }
@@ -532,6 +539,43 @@ mod tests {
         for (a, b) in base.coefficients.iter().zip(again.coefficients.iter()) {
             assert_eq!(a, b, "None override must be deterministic");
         }
+    }
+
+    #[test]
+    fn out_of_range_response_is_rejected() {
+        // Issue #452: a finite but invalid entry (y = 2) makes the per-entry
+        // binomial log-likelihood unbounded in η, so it must be rejected rather
+        // than silently fit. The same guard covers negative entries.
+        let (design, y, penalty, lambdas) = toy_inputs();
+        let mut bad = y.clone();
+        bad[[0, 0]] = 2.0;
+        let err = fit_penalized_binomial_multi(BinomialMultiFitInputs {
+            design: design.view(),
+            y: bad.view(),
+            penalty: penalty.view(),
+            lambdas: lambdas.view(),
+            row_weights: None,
+            fisher_w_override: None,
+            max_iter: 50,
+            tol: 1.0e-9,
+        })
+        .expect_err("out-of-range response must error");
+        assert!(format!("{err}").contains("binomial proportion in [0,1]"));
+
+        let mut neg = y.clone();
+        neg[[1, 1]] = -0.5;
+        let err = fit_penalized_binomial_multi(BinomialMultiFitInputs {
+            design: design.view(),
+            y: neg.view(),
+            penalty: penalty.view(),
+            lambdas: lambdas.view(),
+            row_weights: None,
+            fisher_w_override: None,
+            max_iter: 50,
+            tol: 1.0e-9,
+        })
+        .expect_err("negative response must error");
+        assert!(format!("{err}").contains("binomial proportion in [0,1]"));
     }
 
     #[test]

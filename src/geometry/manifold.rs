@@ -193,6 +193,30 @@ pub(crate) fn norm(a: ArrayView1<'_, f64>) -> f64 {
     dot(a, a).sqrt()
 }
 
+/// Metric inner product `aᵀ G b` for a (symmetric) metric tensor `G`.
+///
+/// For a manifold whose `metric_tensor` is the ambient identity this reduces
+/// to the Euclidean `dot`; for one with a genuine Riemannian metric (e.g. the
+/// affine-invariant SPD metric) it evaluates the correct geometric inner
+/// product on the tangent space.
+pub(crate) fn quad_form(
+    g: ArrayView2<'_, f64>,
+    a: ArrayView1<'_, f64>,
+    b: ArrayView1<'_, f64>,
+) -> f64 {
+    let n = a.len();
+    assert_eq!(g.nrows(), n);
+    assert_eq!(g.ncols(), b.len());
+    let mut out = 0.0;
+    for i in 0..n {
+        let ai = a[i];
+        for j in 0..b.len() {
+            out += ai * g[[i, j]] * b[j];
+        }
+    }
+    out
+}
+
 pub(crate) fn identity(n: usize) -> Array2<f64> {
     let mut out = Array2::<f64>::zeros((n, n));
     for i in 0..n {
@@ -443,6 +467,57 @@ pub(crate) fn spectral_map_symmetric(
         diag[[i, i]] = f(evals[i])?;
     }
     Ok(evecs.dot(&diag).dot(&evecs.t()))
+}
+
+/// Dense matrix exponential `exp(A)` via scaling-and-squaring with a truncated
+/// Taylor series. The Frobenius norm of `A` is driven below 1/2 by repeated
+/// halving (`A → A / 2^s`), where Taylor converges rapidly and stably; the
+/// result is then squared `s` times. With the scaled norm `< 1/2`, a degree-12
+/// Taylor tail is bounded by `‖A_s‖^{13} / 13! · 1/(1 - ‖A_s‖)`, so the fixed
+/// degree reaches full f64 precision. This is the standard, exact algorithm; no
+/// eigendecomposition is assumed (the inputs here are the non-normal
+/// canonical-metric block matrices on Stiefel, which are skew-like but not
+/// symmetric, so `spectral_map_*` does not apply).
+pub(crate) fn matrix_exp(a: &Array2<f64>) -> GeometryResult<Array2<f64>> {
+    let n = a.nrows();
+    if n != a.ncols() {
+        return Err(GeometryError::InvalidPoint(
+            "matrix exponential requires square input",
+        ));
+    }
+    if !a.iter().all(|v| v.is_finite()) {
+        return Err(GeometryError::InvalidPoint(
+            "matrix exponential requires finite entries",
+        ));
+    }
+    // Frobenius norm; choose the squaring count so the scaled matrix has norm
+    // below 1/2, comfortably inside the Taylor radius for a degree-12 series.
+    let mut frob = 0.0;
+    for v in a.iter() {
+        frob += v * v;
+    }
+    let frob = frob.sqrt();
+    let squarings = if frob > 0.5 {
+        (frob / 0.5).log2().ceil() as i32
+    } else {
+        0
+    };
+    let scale = 2.0_f64.powi(squarings);
+    let a_scaled = a / scale;
+
+    // exp(A_scaled) = sum_{k>=0} A_scaled^k / k! by term recurrence:
+    //   term_k = term_{k-1} · A_scaled / k.
+    let mut result = identity(n);
+    let mut term = identity(n);
+    for k in 1..=12 {
+        term = term.dot(&a_scaled) / (k as f64);
+        result = result + &term;
+    }
+    // exp(A) = exp(A_scaled)^{2^squarings}.
+    for _ in 0..squarings {
+        result = result.dot(&result);
+    }
+    Ok(result)
 }
 
 pub(crate) fn cholesky_spd(a: &Array2<f64>) -> GeometryResult<Array2<f64>> {

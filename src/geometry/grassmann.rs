@@ -141,6 +141,7 @@ impl RiemannianManifold for GrassmannManifold {
         point_along: ArrayView2<'_, f64>,
         vec: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
+        check_len("Grassmann path width", point_along.ncols(), self.ambient_dim())?;
         check_len(
             "Grassmann transported vector",
             vec.len(),
@@ -149,7 +150,47 @@ impl RiemannianManifold for GrassmannManifold {
         if point_along.nrows() == 0 {
             return Ok(vec.to_owned());
         }
-        self.project_tangent(point_along.row(point_along.nrows() - 1), vec)
+        if point_along.nrows() == 1 {
+            // A degenerate one-point path is the identity geodesic; the vector
+            // stays in the tangent space at that single point.
+            return self.project_tangent(point_along.row(0), vec);
+        }
+        // Levi-Civita parallel transport along the canonical Grassmann geodesic
+        // from `from` to `to`. Endpoint projection (the previous implementation)
+        // is *not* parallel transport: it can collapse the norm to zero (e.g.
+        // transporting e₂ from e₁ to e₂ in Gr(1,n) projects e₂ - e₂(e₂ᵀe₂) = 0).
+        //
+        // The geodesic is determined by its initial direction Δ = Log_Y(Z),
+        // whose thin SVD Δ = U Σ Vᵀ (U: n×k orthonormal, Σ: k×k diagonal of
+        // principal angles, V: k×k orthogonal) gives the closed-form transport
+        // operator of Edelman–Arias–Smith (1998, eq. 2.66) at unit time:
+        //
+        //   τ(H) = ( -Y V sin(Σ) Uᵀ + U cos(Σ) Uᵀ + (I - U Uᵀ) ) H,
+        //
+        // which preserves the canonical (Frobenius) inner product and maps the
+        // horizontal tangent space at Y to the horizontal tangent space at Z.
+        // At k=1 this is exactly the sphere/ℝPⁿ transport: e₂ ↦ -e₁ along the
+        // quarter great circle from e₁ to e₂.
+        let from = point_along.row(0);
+        let to = point_along.row(point_along.nrows() - 1);
+        let y = from_flat(from, self.n, self.k)?;
+        let direction = from_flat(self.log_map(from, to)?.view(), self.n, self.k)?;
+        let (u, sigma, v) = self.compact_svd_from_tangent(&direction)?;
+        let h = from_flat(self.project_tangent(from, vec)?.view(), self.n, self.k)?;
+
+        let mut cos_d = Array2::<f64>::zeros((self.k, self.k));
+        let mut sin_d = Array2::<f64>::zeros((self.k, self.k));
+        for i in 0..self.k {
+            cos_d[[i, i]] = sigma[i].cos();
+            sin_d[[i, i]] = sigma[i].sin();
+        }
+        // Coordinates of H in the U-frame: ut_h = Uᵀ H (k×k).
+        let ut_h = u.t().dot(&h);
+        // Geodesic-aligned components: -Y V sin(Σ) Uᵀ H + U cos(Σ) Uᵀ H.
+        let aligned = u.dot(&cos_d).dot(&ut_h) - y.dot(&v).dot(&sin_d).dot(&ut_h);
+        // Component of H orthogonal to the geodesic 2-plane: (I - U Uᵀ) H.
+        let orthogonal = &h - &u.dot(&ut_h);
+        Ok(flatten(&(aligned + orthogonal)))
     }
 
     fn metric_tensor(&self, point: ArrayView1<'_, f64>) -> GeometryResult<Array2<f64>> {
@@ -182,7 +223,61 @@ impl RiemannianManifold for GrassmannManifold {
             tangent_pair.1.len(),
             self.ambient_dim(),
         )?;
-        Ok(0.0)
+        // Grassmann sectional curvature for the canonical (Frobenius) metric.
+        // Gr(k,n) = O(n)/(O(k)×O(n-k)) is a symmetric space, so the curvature
+        // of horizontal tangents X, Y (PᵀX = PᵀY = 0, viewed as n×k matrices)
+        // is R(X,Y)Z = -[[Ω(X),Ω(Y)],Ω(Z)] in the embedding into 𝔬(n). Working
+        // out the brackets gives, with the Gram matrices Gxx=XᵀX, Gyy=YᵀY,
+        // Gxy=XᵀY, Gyx=YᵀX,
+        //
+        //   ⟨R(X,Y)Y, X⟩ = tr(Gxx·Gyy) + ‖Gxy‖²_F - 2·tr(Gyx·Gyx),
+        //
+        // and the sectional curvature divides by the area of the 2-plane,
+        // ⟨X,X⟩⟨Y,Y⟩ - ⟨X,Y⟩² with ⟨·,·⟩ = tr(·ᵀ·). The previous constant 0.0
+        // is only correct for a flat manifold; Grassmannians are not flat
+        // (Gr(1,n) = ℝPⁿ has constant sectional curvature 1, recovered here).
+        let x = from_flat(self.project_tangent(point, tangent_pair.0)?.view(), self.n, self.k)?;
+        let y = from_flat(self.project_tangent(point, tangent_pair.1)?.view(), self.n, self.k)?;
+        let gxx = x.t().dot(&x);
+        let gyy = y.t().dot(&y);
+        let gxy = x.t().dot(&y);
+        let gyx = y.t().dot(&x);
+        let trace_product = |a: &Array2<f64>, b: &Array2<f64>| -> f64 {
+            let mut acc = 0.0;
+            for i in 0..self.k {
+                for j in 0..self.k {
+                    acc += a[[i, j]] * b[[j, i]];
+                }
+            }
+            acc
+        };
+        let frob_sq = |a: &Array2<f64>| -> f64 {
+            let mut acc = 0.0;
+            for value in a.iter() {
+                acc += value * value;
+            }
+            acc
+        };
+        let numerator = trace_product(&gxx, &gyy) + frob_sq(&gxy) - 2.0 * trace_product(&gyx, &gyx);
+        // Frobenius inner products: tr(Gxx) = ⟨X,X⟩, tr(Gyy) = ⟨Y,Y⟩,
+        // tr(Gxy) = ⟨X,Y⟩.
+        let trace = |a: &Array2<f64>| -> f64 {
+            let mut acc = 0.0;
+            for i in 0..self.k {
+                acc += a[[i, i]];
+            }
+            acc
+        };
+        let xx = trace(&gxx);
+        let yy = trace(&gyy);
+        let xy = trace(&gxy);
+        let denom = xx * yy - xy * xy;
+        if denom.abs() <= 1.0e-14 {
+            return Err(GeometryError::Singular(
+                "Grassmann sectional curvature plane is degenerate",
+            ));
+        }
+        Ok(numerator / denom)
     }
 
     fn project_tangent(

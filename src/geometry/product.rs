@@ -1,6 +1,8 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 
-use crate::geometry::manifold::{GeometryResult, RiemannianManifold, check_len};
+use crate::geometry::manifold::{
+    GEOMETRY_EPS, GeometryError, GeometryResult, RiemannianManifold, check_len, quad_form,
+};
 
 pub struct ProductManifold {
     components: Vec<Box<dyn RiemannianManifold>>,
@@ -207,7 +209,66 @@ impl RiemannianManifold for ProductManifold {
             tangent_pair.1.len(),
             self.ambient_dim(),
         )?;
-        Ok(0.0)
+        // A Riemannian product M = ∏_r M_r carries the block-diagonal product
+        // metric g = ⊕_r g_r and the block-diagonal curvature tensor
+        // R = ⊕_r R_r (mixed-factor components vanish). For tangent vectors
+        // U = (U_r), V = (V_r) the curvature numerator and the Gram denominator
+        // therefore split across factors:
+        //
+        //   ⟨R(U,V)V,U⟩ = Σ_r ⟨R_r(U_r,V_r)V_r,U_r⟩_r,
+        //   |U|²|V|² − ⟨U,V⟩² with |·|, ⟨·,·⟩ the product metric.
+        //
+        // Each factor exposes its sectional curvature K_r, from which the
+        // factor curvature numerator is recovered as
+        //   num_r = K_r · (|U_r|²_r|V_r|²_r − ⟨U_r,V_r⟩²_r),
+        // using that factor's own metric g_r (SphereManifold returns K_r = 1,
+        // EuclideanManifold 0, and SpdManifold its affine-invariant value).
+        // The product metric inner products are the sums of the per-factor
+        // ones; the whole product's curvature is then
+        //   K_M(U,V) = (Σ_r num_r) / (|U|²|V|² − ⟨U,V⟩²).
+        let (u, v) = tangent_pair;
+        let mut numerator = 0.0;
+        let mut uu_total = 0.0;
+        let mut vv_total = 0.0;
+        let mut uv_total = 0.0;
+        let mut off = 0usize;
+        for component in &self.components {
+            let m = component.ambient_dim();
+            let u_r = u.slice(s![off..off + m]);
+            let v_r = v.slice(s![off..off + m]);
+            // Inner products under the factor's own metric g_r; this is the
+            // ambient identity for Sphere/Euclidean/etc. and the
+            // affine-invariant metric for SPD, so the Gram terms are computed
+            // consistently with each factor's curvature definition.
+            let g_r = component.metric_tensor(point.slice(s![off..off + m]))?;
+            let uu_r = quad_form(g_r.view(), u_r, u_r);
+            let vv_r = quad_form(g_r.view(), v_r, v_r);
+            let uv_r = quad_form(g_r.view(), u_r, v_r);
+            let gram_r = uu_r * vv_r - uv_r * uv_r;
+            // Skip factors whose tangent pair spans no area (collinear or zero
+            // within this factor): their curvature numerator is identically
+            // zero, and calling the factor's `sectional_curvature` on a
+            // degenerate plane may legitimately error (e.g. SPD), so a zero
+            // contribution must not be allowed to abort the product as a whole.
+            if gram_r > GEOMETRY_EPS {
+                let k_r = component.sectional_curvature(
+                    point.slice(s![off..off + m]),
+                    (u_r, v_r),
+                )?;
+                numerator += k_r * gram_r;
+            }
+            uu_total += uu_r;
+            vv_total += vv_r;
+            uv_total += uv_r;
+            off += m;
+        }
+        let denom = uu_total * vv_total - uv_total * uv_total;
+        if denom <= GEOMETRY_EPS {
+            return Err(GeometryError::Singular(
+                "Product sectional curvature plane is degenerate",
+            ));
+        }
+        Ok(numerator / denom)
     }
 
     fn project_tangent(
