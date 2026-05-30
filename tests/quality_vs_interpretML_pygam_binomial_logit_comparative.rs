@@ -23,16 +23,19 @@
 //!     4 complementary folds and predicts the held-out fold, so all three see
 //!     the SAME train/test partition on the SAME `y ~ s(pc1,k=5)+s(pc2,k=5)`
 //!     additive structure.
-//!   * We report each engine's mean hold-out AUC over the 5 folds, the spread
-//!     σ across the three engines' means, and assert gam lies inside
-//!     mean ± 1.5σ AND that all three means agree to within 0.02 AUC.
+//!   * We report each engine's mean hold-out AUC over the 5 folds and assert
+//!     (1) gam lies inside the band defined by the TWO MATURE REFERENCES only
+//!     (EBM/pyGAM midpoint ± [half their gap + 0.015 AUC]) — a band gam can
+//!     genuinely fall outside, unlike a symmetric ±kσ band over a triplet which
+//!     is vacuous (any of three points lies within √2σ of their own mean) — AND
+//!     (2) all three means agree to within 0.02 AUC.
 //!
 //! A failure here is a real finding: it means gam's smoothing-parameter choice
 //! generalizes materially differently from two mature additive learners. The
 //! bound is NOT loosened to hide that — 0.02 AUC is the spec tolerance and the
-//! ±1.5σ band is the standard "not an outlier among three" criterion.
+//! reference band is anchored on the references (never on gam itself).
 
-use gam::smooth::build_term_collection_design;
+use gam::smooth::{build_term_collection_design, freeze_term_collection_from_design};
 use gam::matrix::LinearOperator;
 use gam::test_support::reference::{Column, run_python};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
@@ -154,13 +157,26 @@ fn gam_ebm_pygam_binomial_logit_holdout_agreement() {
             panic!("binomial(logit) GAM with smooths should be a Standard fit");
         };
 
+        // FREEZE the trained spec against the trained design before predicting.
+        // `StandardFitResult::resolvedspec` is the *unfrozen* spec: its smooth
+        // knots/centers, joint-null absorption rotation, and identifiability
+        // transform are still data-derived. Rebuilding a design from it on the
+        // held-out rows would re-plan those artifacts from the TEST data,
+        // yielding a basis that does not correspond to the trained `beta` and
+        // therefore a meaningless eta. The canonical predict path
+        // (`build_predict_input_for_model_inner`) builds the predict design from
+        // the spec produced by `freeze_term_collection_from_design`; we do the
+        // same so the held-out basis reuses the training-time knots/rotation.
+        let frozenspec = freeze_term_collection_from_design(&fit.resolvedspec, &fit.design)
+            .unwrap_or_else(|e| panic!("freeze gam fold {f} spec failed: {e:?}"));
+
         // Rebuild the frozen design at the held-out test rows -> eta -> prob.
         let mut grid = Array2::<f64>::zeros((test_rows.len(), ds.headers.len()));
         for (out_r, &src_r) in test_rows.iter().enumerate() {
             grid[[out_r, pc1_idx]] = pc1[src_r];
             grid[[out_r, pc2_idx]] = pc2[src_r];
         }
-        let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
+        let design = build_term_collection_design(grid.view(), &frozenspec)
             .expect("rebuild gam design at held-out test rows");
         let eta: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
         let prob: Vec<f64> = eta.iter().map(|&e| inv_logit(e)).collect();
@@ -237,10 +253,20 @@ emit("pygam_mean_auc", [float(np.mean(pygam_auc))])
     let means = [gam_mean_auc, ebm_mean_auc, pygam_mean_auc];
     let grand_mean = means.iter().sum::<f64>() / 3.0;
     let sigma_across = pop_std(&means);
-    // ±1.5σ band around the three-engine mean (the standard "not an outlier"
-    // criterion for a triplet). max_pairwise is the worst disagreement.
-    let lo = grand_mean - 1.5 * sigma_across;
-    let hi = grand_mean + 1.5 * sigma_across;
+    // gam is the engine under test, so its "not an outlier" band must be built
+    // from the TWO MATURE REFERENCES ONLY (EBM, pyGAM) -- never from a set that
+    // includes gam's own mean. A symmetric ±kσ band around the mean of all
+    // three is mathematically vacuous for a triplet: any of three points lies
+    // within √2·σ ≈ 1.414σ of their own mean by construction, so a ±1.5σ test
+    // can NEVER fire. Instead we anchor on the references' midpoint and widen by
+    // (a) the references' own disagreement and (b) a fixed 0.015 AUC margin (the
+    // hold-out sampling slack at ~130 test rows/fold). gam CAN fall outside this
+    // band, so the assertion is real.
+    let ref_mid = 0.5 * (ebm_mean_auc + pygam_mean_auc);
+    let ref_gap = (ebm_mean_auc - pygam_mean_auc).abs();
+    let ref_halfwidth = 0.5 * ref_gap + 0.015;
+    let lo = ref_mid - ref_halfwidth;
+    let hi = ref_mid + ref_halfwidth;
     let max_pairwise = {
         let mut m = 0.0f64;
         for i in 0..3 {
@@ -257,18 +283,19 @@ emit("pygam_mean_auc", [float(np.mean(pygam_auc))])
          EBM folds={ebm_fold_auc:?} mean={ebm_mean_auc:.4} | \
          pyGAM folds={pygam_fold_auc:?} mean={pygam_mean_auc:.4} | \
          grand_mean={grand_mean:.4} sigma_across={sigma_across:.4} \
-         band=[{lo:.4},{hi:.4}] max_pairwise={max_pairwise:.4}"
+         ref_band=[{lo:.4},{hi:.4}] max_pairwise={max_pairwise:.4}"
     );
 
-    // (1) gam must not be an outlier: its mean hold-out AUC lies inside the
-    // ±1.5σ band of the three engines. With three reasonable additive learners
-    // on the same split this is the honest "gam generalizes like the field"
-    // test; falling outside means REML lambda-selection systematically over- or
-    // under-smooths relative to EBM boosting / pyGAM GCV.
+    // (1) gam must not be an outlier RELATIVE TO THE TWO MATURE REFERENCES: its
+    // mean hold-out AUC lies inside the EBM/pyGAM reference band. With two
+    // independent additive learners (EBM boosting, pyGAM GCV) bracketing the
+    // honest range on the same split, this is the real "gam generalizes like the
+    // field" test; falling outside means REML lambda-selection systematically
+    // over- or under-smooths relative to both references.
     assert!(
         gam_mean_auc >= lo && gam_mean_auc <= hi,
-        "gam is an outlier in hold-out AUC: gam={gam_mean_auc:.4} not in ±1.5σ band [{lo:.4},{hi:.4}] \
-         (EBM={ebm_mean_auc:.4}, pyGAM={pygam_mean_auc:.4})"
+        "gam is an outlier in hold-out AUC: gam={gam_mean_auc:.4} not in EBM/pyGAM reference band \
+         [{lo:.4},{hi:.4}] (EBM={ebm_mean_auc:.4}, pyGAM={pygam_mean_auc:.4})"
     );
 
     // (2) All three engines must agree to within 0.02 AUC (the spec tolerance):

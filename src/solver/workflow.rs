@@ -3085,7 +3085,6 @@ pub fn resolve_family(
     family: Option<&str>,
     negative_binomial_theta: Option<f64>,
     link_choice: Option<&LinkChoice>,
-    sas_linkspec: Option<&SasLinkSpec>,
     y: ArrayView1<'_, f64>,
     y_kind: ResponseColumnKind,
     response_name: &str,
@@ -3326,26 +3325,25 @@ pub fn resolve_family(
                     InverseLink::Standard(StandardLink::CLogLog),
                 ),
                 LinkFunction::Sas => {
-                    // Carry the caller-supplied SAS initial state (epsilon,
-                    // log_delta) when present so the CLI path embeds the user's
-                    // `link(sas_init=...)` exactly; absent an override the
-                    // canonical zero seed is used (the value the link-parameter
-                    // optimizer would start from anyway).
-                    let init = sas_linkspec.copied().unwrap_or(SasLinkSpec {
+                    // The SAS initial state (epsilon, log_delta) is carried into
+                    // the fit through `FitOptions.sas_link`, not the family spec:
+                    // the standard path's `effective_sas_link_for_family` rebuilds
+                    // the inverse link from that option, overriding whatever the
+                    // family embeds here. The canonical zero seed is therefore the
+                    // correct, link-only placeholder for family resolution.
+                    let state = state_from_sasspec(SasLinkSpec {
                         initial_epsilon: 0.0,
                         initial_log_delta: 0.0,
-                    });
-                    let state = state_from_sasspec(init)
-                        .map_err(|err| format!("SAS link initial state: {err}"))?;
+                    })
+                    .map_err(|err| format!("SAS link initial state: {err}"))?;
                     LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Sas(state))
                 }
                 LinkFunction::BetaLogistic => {
-                    let init = sas_linkspec.copied().unwrap_or(SasLinkSpec {
+                    let state = state_from_beta_logisticspec(SasLinkSpec {
                         initial_epsilon: 0.0,
                         initial_log_delta: 0.0,
-                    });
-                    let state = state_from_beta_logisticspec(init)
-                        .map_err(|err| format!("Beta-Logistic link initial state: {err}"))?;
+                    })
+                    .map_err(|err| format!("Beta-Logistic link initial state: {err}"))?;
                     LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::BetaLogistic(state))
                 }
             }
@@ -5395,7 +5393,6 @@ fn materialize_standard<'a>(
         config.family.as_deref(),
         config.negative_binomial_theta,
         link_choice.as_ref(),
-        None,
         y.view(),
         y_kind,
         &parsed.response,
@@ -6785,7 +6782,6 @@ fn materialize_location_scale<'a>(
         config.family.as_deref(),
         config.negative_binomial_theta,
         link_choice.as_ref(),
-        None,
         y.view(),
         y_kind,
         &parsed.response,

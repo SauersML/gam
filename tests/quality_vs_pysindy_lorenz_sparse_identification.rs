@@ -17,9 +17,9 @@
 //! To eliminate every confound we do NOT let either engine build its own
 //! library or estimate its own derivatives: we construct ONE library matrix and
 //! ONE analytic-derivative matrix in Rust and hand the *identical bytes* to both
-//! `sindy_stlsq_solve` and PySINDy (via PySINDy's `CustomLibrary` of identity
-//! functions over the seven precomputed feature columns, with derivatives passed
-//! through `x_dot`). The only thing under test is the STLSQ fixed point.
+//! `sindy_stlsq_solve` and PySINDy's bare `STLSQ` optimizer (the precomputed
+//! library matrix Θ is passed as `x`, the analytic derivatives Ẋ as `y`). The
+//! only thing under test is the STLSQ fixed point.
 //!
 //! Library (7 terms, in fixed column order): [1, x, y, z, x*y, x*z, y*z].
 //! This is exactly the span needed to represent Lorenz-63:
@@ -44,8 +44,19 @@ const N: usize = 2000;
 const DT: f64 = 0.002;
 
 // STLSQ hyperparameters — identical for both engines.
+//
+// Ridge `λ = 0`: with exact analytic derivatives and the exact spanning library
+// the *unregularized* least-squares solution on the recovered support IS the
+// true Lorenz matrix to machine precision (the spurious off-support columns have
+// OLS coefficients ~1e-12, far below THRESHOLD). Any λ > 0 would bias every
+// coefficient by O(λ) ≈ 1e-3 away from truth (verified: λ=0.05 ⇒ max|Δ|≈1e-3),
+// which would falsify the "matches truth to machine precision" claim below AND,
+// because gam refits all output columns on the shared *union* active set while
+// PySINDy refits each target on its own per-column support, would make the two
+// engines' ridge-coupled solves disagree by O(λ) too. At λ=0 the OLS solve
+// decouples per column, so gam, PySINDy, and the truth all coincide to ~1e-12.
 const THRESHOLD: f64 = 0.1;
-const RIDGE_LAM: f64 = 0.05;
+const RIDGE_LAM: f64 = 0.0;
 const MAX_ROUNDS: usize = 20;
 
 /// Lorenz-63 right-hand side: returns (dx/dt, dy/dt, dz/dt) analytically.
@@ -166,10 +177,10 @@ fn gam_sindy_matches_pysindy_on_lorenz63() {
         .collect(); // column-major: [dx terms..., dy terms..., dz terms...]
 
     // ---- PySINDy STLSQ on the identical precomputed library + derivatives --
-    // We feed PySINDy the precomputed feature columns as the *measurement
-    // matrix* and a CustomLibrary of identity functions so its feature matrix
-    // equals our Θ verbatim. Derivatives are supplied via x_dot, so PySINDy
-    // does nothing but run STLSQ on the identical (Θ, Ẋ) — apples to apples.
+    // We feed PySINDy's bare STLSQ optimizer the precomputed feature matrix Θ
+    // directly as `x` and the analytic derivatives Ẋ directly as `y`. There is
+    // no feature library and no derivative estimation in the loop: the optimizer
+    // runs STLSQ on the identical (Θ, Ẋ) bytes handed to gam — apples to apples.
     let cols = [
         Column::new("f_one", &f_one),
         Column::new("f_x", &f_x),
@@ -186,8 +197,6 @@ fn gam_sindy_matches_pysindy_on_lorenz63() {
     let body = format!(
         r#"
 import numpy as np
-import pysindy as ps
-from pysindy.feature_library import CustomLibrary
 from pysindy.optimizers import STLSQ
 
 # Identical 7-term library bytes, in the same column order as the Rust Theta.
@@ -200,22 +209,18 @@ Xdot = np.column_stack([
     df["ddx"].to_numpy(), df["ddy"].to_numpy(), df["ddz"].to_numpy(),
 ])
 
-# CustomLibrary of identity maps: feature matrix == Theta exactly (no bias
-# term added; include_bias would duplicate our f_one column).
-ident = [lambda c: c]
-names = [lambda c: c]
-lib = CustomLibrary(library_functions=ident, function_names=names,
-                    include_bias=False)
-
 # STLSQ with the SAME threshold and ridge alpha as gam. alpha is the L2
-# (ridge) weight on the active set in both implementations.
+# (ridge) weight on the active set in both implementations: sklearn's
+# Ridge(alpha) inside STLSQ solves (ThetaᵀTheta + alpha·I) w = Thetaᵀy, exactly
+# gam's ridge_diag_solve convention. normalize_columns=False so the columns are
+# the verbatim Theta bytes (gam does not column-normalize either).
 opt = STLSQ(threshold={threshold}, alpha={ridge}, max_iter={max_iter},
             normalize_columns=False)
 
-# Fit the bare optimizer on (Theta, Xdot): pysindy's SINDy wrapper would also
-# build/own the library + derivatives, which we deliberately bypass so the
-# only thing exercised is the STLSQ fixed point on identical inputs.
-lib.fit(Theta)
+# Fit the bare optimizer directly on (Theta, Xdot): pysindy's SINDy wrapper
+# would build/own the library + estimate derivatives, which we deliberately
+# bypass so the only thing exercised is the STLSQ fixed point on inputs that are
+# byte-identical to the ones handed to gam.
 opt.fit(Theta, Xdot)
 
 # opt.coef_ is (n_targets, n_features) = (3, 7). gam stores (7, 3) and we
