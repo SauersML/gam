@@ -330,16 +330,23 @@ fn linear_function_receives_nonzero_tension_but_zero_stiffness() {
          unpenalized side block."
     );
 
-    // Curvature still ignores the linear part: a linear map is exactly flat.
+    // Curvature still ignores the linear part: a linear map is exactly flat,
+    // and the constrained kernel columns are orthogonal to the affine span, so
+    // c_lin carries essentially no kernel curvature. Reference scale is the
+    // stiffness operator's own magnitude (it is Frobenius-normalized), so no
+    // exactly-representable quadratic is needed for a pure-linear probe.
     if let Some(stiffness) = built.stiffness.as_ref() {
         let stiffness_energy = quad(stiffness, &c_lin);
-        // Compare against a quadratic's stiffness for scale.
-        let c_quad = coeff_for_target(&built.design, &quadratic_target(&data), "quadratic");
-        let quad_stiffness = quad(stiffness, &c_quad).max(1.0);
+        let stiffness_scale = stiffness
+            .diag()
+            .iter()
+            .cloned()
+            .fold(0.0_f64, f64::max)
+            .max(1e-12);
         assert!(
-            stiffness_energy <= 1e-6 * quad_stiffness,
+            stiffness_energy <= 1e-6 * stiffness_scale,
             "a linear function must have ~zero STIFFNESS: {stiffness_energy:.3e} \
-             vs quadratic {quad_stiffness:.3e}"
+             vs stiffness operator scale {stiffness_scale:.3e}"
         );
     }
 }
