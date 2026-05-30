@@ -3621,38 +3621,64 @@ fn basis_with_jet<'py>(
             let t_1d = coords.column(0).to_owned();
             let phi = bspline_basis_impl(t_1d.view(), knots_array.view(), degree, periodic)
                 .map_err(py_value_error)?;
-            let deriv = if periodic {
-                // Periodic first-derivative dense matrix is not exposed; the
-                // jet is computed from the finite-difference of phi against
-                // a small h. The closed-form periodic spline path uses
-                // periodic_basis_with_jet (Fourier harmonics) instead, so
-                // this branch is only reached for the open uniform case in
-                // practice.
-                return Err(py_value_error(
-                    "basis_with_jet bspline does not support periodic=true; use kind=\"periodic\" instead"
-                        .to_string(),
-                ));
-            } else {
-                bspline_basis_derivative_impl(t_1d.view(), knots_array.view(), degree, 1, false)
-                    .map_err(py_value_error)?
-            };
             let n_rows = phi.nrows();
             let n_cols = phi.ncols();
-            if deriv.nrows() != n_rows || deriv.ncols() != n_cols {
-                return Err(py_value_error(format!(
-                    "basis_with_jet bspline shape mismatch: phi=({n_rows},{n_cols}) deriv=({},{})",
-                    deriv.nrows(),
-                    deriv.ncols()
-                )));
-            }
-            let mut jet = Array3::<f64>::zeros((n_rows, n_cols, 1));
-            for row in 0..n_rows {
-                for col in 0..n_cols {
-                    jet[[row, col, 0]] = deriv[[row, col]];
+            // The forward periodic basis (`bspline_basis_impl(..., periodic=true)`)
+            // is the normalized cyclic B-spline on the closed parameter circle
+            // `[left, right]` with `num_basis = knots.len() - 1` cyclic control
+            // points (see `periodic_knot_domain`). Its exact input-location
+            // derivative is the periodic wrapped-spline jet — the SAME pair the
+            // PyTorch `_BsplineJetFn` uses — NOT the Fourier harmonic basis
+            // produced by `kind="periodic"`. So differentiate the actual design
+            // matrix here via `periodic_bspline_first_derivative_nd`, which is
+            // the closed form `phi'` that `PeriodicSplineCurve::evaluate_derivative`
+            // also relies on. The non-periodic branch uses the open-uniform
+            // analytic first derivative.
+            let (jet, penalty) = if periodic {
+                let (left, right, num_basis) =
+                    periodic_knot_domain(knots_array.view()).map_err(py_value_error)?;
+                let jet = periodic_bspline_first_derivative_nd(
+                    coords,
+                    (left, right),
+                    degree,
+                    num_basis,
+                )
+                .map_err(|err| py_value_error(err.to_string()))?;
+                if jet.shape() != [n_rows, n_cols, 1] {
+                    return Err(py_value_error(format!(
+                        "basis_with_jet bspline shape mismatch: phi=({n_rows},{n_cols}) jet={:?}",
+                        jet.shape()
+                    )));
                 }
-            }
-            let (penalty, _null) = smoothness_penalty_impl(knots_array.view(), degree, order)
-                .map_err(py_value_error)?;
+                let penalty = create_cyclic_difference_penalty_matrix(num_basis, order)
+                    .map_err(|err| py_value_error(err.to_string()))?;
+                (jet, penalty)
+            } else {
+                let deriv =
+                    bspline_basis_derivative_impl(t_1d.view(), knots_array.view(), degree, 1, false)
+                        .map_err(py_value_error)?;
+                if deriv.nrows() != n_rows || deriv.ncols() != n_cols {
+                    return Err(py_value_error(format!(
+                        "basis_with_jet bspline shape mismatch: phi=({n_rows},{n_cols}) deriv=({},{})",
+                        deriv.nrows(),
+                        deriv.ncols()
+                    )));
+                }
+                let mut jet = Array3::<f64>::zeros((n_rows, n_cols, 1));
+                for row in 0..n_rows {
+                    for col in 0..n_cols {
+                        jet[[row, col, 0]] = deriv[[row, col]];
+                    }
+                }
+                let (penalty, null_basis) =
+                    smoothness_penalty_impl(knots_array.view(), degree, order)
+                        .map_err(py_value_error)?;
+                debug_assert!(
+                    null_basis.ncols() <= penalty.ncols(),
+                    "smoothness penalty nullspace cannot exceed coefficient count"
+                );
+                (jet, penalty)
+            };
             Ok((
                 phi.into_pyarray(py).unbind(),
                 jet.into_pyarray(py).unbind(),
@@ -26558,469 +26584,6 @@ fn report_html_impl(model_bytes: &[u8]) -> Result<String, String> {
     render_html(&report_input)
 }
 
-#[derive(Clone)]
-struct LatentPenaltyTarget {
-    name: String,
-    n: usize,
-    d: usize,
-}
-
-fn json_u64_to_usize(value: u64, context: &str) -> Result<usize, String> {
-    usize::try_from(value).map_err(|_| format!("{context} exceeds usize::MAX"))
-}
-
-fn json_positive_u64_to_usize(value: u64, context: &str) -> Result<usize, String> {
-    if value == 0 {
-        return Err(format!("{context} must be > 0"));
-    }
-    json_u64_to_usize(value, context)
-}
-
-fn latent_penalty_targets(
-    latents: Option<&serde_json::Value>,
-) -> Result<Vec<LatentPenaltyTarget>, String> {
-    let Some(raw) = latents.filter(|value| !value.is_null()) else {
-        return Ok(Vec::new());
-    };
-    let map = raw
-        .as_object()
-        .ok_or_else(|| "latents must be a JSON object keyed by formula symbol".to_string())?;
-    let mut out = Vec::with_capacity(map.len());
-    for (key, raw_block) in map {
-        let obj = raw_block
-            .as_object()
-            .ok_or_else(|| format!("latents['{key}'] must be an object"))?;
-        let name = obj
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or(key)
-            .to_string();
-        let n = json_positive_u64_to_usize(
-            obj.get("n")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| format!("latents['{key}'].n is required"))?,
-            &format!("latents['{key}'].n"),
-        )?;
-        let d = json_positive_u64_to_usize(
-            obj.get("d")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| format!("latents['{key}'].d is required"))?,
-            &format!("latents['{key}'].d"),
-        )?;
-        out.push(LatentPenaltyTarget { name, n, d });
-    }
-    Ok(out)
-}
-
-fn penalty_target_for_descriptor<'a>(
-    targets: &'a [LatentPenaltyTarget],
-    descriptor: &serde_json::Map<String, serde_json::Value>,
-    context: &str,
-) -> Result<&'a LatentPenaltyTarget, String> {
-    let raw = descriptor
-        .get("target")
-        .ok_or_else(|| format!("{context}.target is required"))?;
-    if let Some(name) = raw.as_str() {
-        return targets
-            .iter()
-            .find(|target| target.name == name)
-            .ok_or_else(|| {
-                format!(
-                    "{context}.target references latent block {name:?}, but latents declares [{}]",
-                    targets
-                        .iter()
-                        .map(|target| target.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            });
-    }
-    if let Some(index) = raw.as_u64() {
-        let index = json_u64_to_usize(index, &format!("{context}.target"))?;
-        return targets.get(index).ok_or_else(|| {
-            format!(
-                "{context}.target references latent index {index}, but latents declares {} block(s)",
-                targets.len()
-            )
-        });
-    }
-    Err(format!(
-        "{context}.target must be a latent block name or index"
-    ))
-}
-
-fn descriptor_f64(
-    descriptor: &serde_json::Map<String, serde_json::Value>,
-    key: &str,
-    default: f64,
-) -> Result<f64, String> {
-    let value = descriptor
-        .get(key)
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or(default);
-    if !(value.is_finite() && value > 0.0) {
-        return Err(format!("analytic penalty {key} must be finite and > 0"));
-    }
-    Ok(value)
-}
-
-fn descriptor_usize(
-    descriptor: &serde_json::Map<String, serde_json::Value>,
-    key: &str,
-    default: usize,
-) -> Result<usize, String> {
-    let Some(raw) = descriptor.get(key).and_then(serde_json::Value::as_u64) else {
-        return Ok(default);
-    };
-    json_positive_u64_to_usize(raw, &format!("analytic penalty {key}"))
-}
-
-fn descriptor_no_unknown_keys(
-    descriptor: &serde_json::Map<String, serde_json::Value>,
-    context: &str,
-    allowed: &[&str],
-) -> Result<(), String> {
-    for key in descriptor.keys() {
-        if !allowed.iter().any(|allowed_key| allowed_key == key) {
-            return Err(format!(
-                "{context}.{key} is not consumed by the {context} pyffi arm"
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn descriptor_weight_scalar(
-    descriptor: &serde_json::Map<String, serde_json::Value>,
-    context: &str,
-) -> Result<f64, String> {
-    let Some(value) = descriptor.get("weight") else {
-        return Ok(1.0);
-    };
-    if value.as_str() == Some("auto") {
-        return Ok(1.0);
-    }
-    let Some(weight) = value.as_f64() else {
-        return Err(format!(
-            "{context}.weight must be 'auto' or a finite positive float"
-        ));
-    };
-    if !(weight.is_finite() && weight > 0.0) {
-        return Err(format!("{context}.weight must be finite and > 0"));
-    }
-    Ok(weight)
-}
-
-fn descriptor_weight_schedule(
-    descriptor: &serde_json::Map<String, serde_json::Value>,
-    context: &str,
-) -> Result<Option<ScalarWeightSchedule>, String> {
-    let Some(raw_schedule) = descriptor.get("weight_schedule") else {
-        return Ok(None);
-    };
-    if raw_schedule.is_null() {
-        return Ok(None);
-    }
-    let schedule = raw_schedule
-        .as_object()
-        .ok_or_else(|| format!("{context}.weight_schedule must be an object"))?;
-    let w_start = schedule
-        .get("w_start")
-        .and_then(serde_json::Value::as_f64)
-        .ok_or_else(|| format!("{context}.weight_schedule.w_start must be a finite number"))?;
-    let w_end = schedule
-        .get("w_end")
-        .and_then(serde_json::Value::as_f64)
-        .ok_or_else(|| format!("{context}.weight_schedule.w_end must be a finite number"))?;
-    let kind_name = schedule
-        .get("kind")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| format!("{context}.weight_schedule.kind is required"))?
-        .to_ascii_lowercase()
-        .replace('-', "_");
-    let kind = match kind_name.as_str() {
-        "geometric" => {
-            let rate = schedule
-                .get("rate")
-                .and_then(serde_json::Value::as_f64)
-                .ok_or_else(|| {
-                    format!("{context}.weight_schedule.rate is required for geometric")
-                })?;
-            ScheduleKind::Geometric { rate }
-        }
-        "linear" => {
-            let steps = schedule
-                .get("steps")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| format!("{context}.weight_schedule.steps is required for linear"))?;
-            ScheduleKind::Linear {
-                steps: json_u64_to_usize(steps, &format!("{context}.weight_schedule.steps"))?,
-            }
-        }
-        "reciprocal_iter" => ScheduleKind::ReciprocalIter,
-        other => {
-            return Err(format!(
-                "{context}.weight_schedule.kind must be geometric, linear, or reciprocal_iter; got {other:?}"
-            ));
-        }
-    };
-    let mut parsed = ScalarWeightSchedule::new(w_start, w_end, kind)
-        .map_err(|err| format!("{context}.weight_schedule: {err}"))?;
-    if let Some(iter_count) = schedule.get("iter_count") {
-        let raw_iter_count = iter_count.as_u64().ok_or_else(|| {
-            format!("{context}.weight_schedule.iter_count must be a non-negative integer")
-        })?;
-        parsed.iter_count = json_u64_to_usize(
-            raw_iter_count,
-            &format!("{context}.weight_schedule.iter_count"),
-        )?;
-    }
-    Ok(Some(parsed))
-}
-
-fn descriptor_temperature_schedule(
-    descriptor: &serde_json::Map<String, serde_json::Value>,
-    context: &str,
-) -> Result<Option<GumbelTemperatureSchedule>, String> {
-    let Some(raw_schedule) = descriptor.get("temperature_schedule") else {
-        return Ok(None);
-    };
-    if raw_schedule.is_null() {
-        return Ok(None);
-    }
-    let schedule = raw_schedule
-        .as_object()
-        .ok_or_else(|| format!("{context}.temperature_schedule must be an object"))?;
-    let tau_start = schedule
-        .get("tau_start")
-        .and_then(serde_json::Value::as_f64)
-        .ok_or_else(|| {
-            format!("{context}.temperature_schedule.tau_start must be a finite number")
-        })?;
-    let tau_min = schedule
-        .get("tau_min")
-        .or_else(|| schedule.get("tau_end"))
-        .and_then(serde_json::Value::as_f64)
-        .ok_or_else(|| format!("{context}.temperature_schedule.tau_min must be a finite number"))?;
-    let decay_name = schedule
-        .get("decay")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| format!("{context}.temperature_schedule.decay is required"))?
-        .to_ascii_lowercase()
-        .replace('-', "_");
-    let decay = match decay_name.as_str() {
-        "geometric" | "exponential" => {
-            let rate = schedule
-                .get("rate")
-                .and_then(serde_json::Value::as_f64)
-                .unwrap_or(0.9);
-            ScheduleKind::Geometric { rate }
-        }
-        "linear" => {
-            let steps = schedule
-                .get("steps")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| {
-                    format!("{context}.temperature_schedule.steps is required for linear")
-                })?;
-            ScheduleKind::Linear {
-                steps: json_u64_to_usize(steps, &format!("{context}.temperature_schedule.steps"))?,
-            }
-        }
-        "reciprocal_iter" => ScheduleKind::ReciprocalIter,
-        other => {
-            return Err(format!(
-                "{context}.temperature_schedule.decay must be geometric, exponential, linear, or reciprocal_iter; got {other:?}"
-            ));
-        }
-    };
-    let mut parsed = GumbelTemperatureSchedule::new(tau_start, tau_min, decay)
-        .map_err(|err| format!("{context}.temperature_schedule: {err}"))?;
-    if let Some(iter_count) = schedule.get("iter_count") {
-        let raw_iter_count = iter_count.as_u64().ok_or_else(|| {
-            format!("{context}.temperature_schedule.iter_count must be a non-negative integer")
-        })?;
-        parsed.iter_count = json_u64_to_usize(
-            raw_iter_count,
-            &format!("{context}.temperature_schedule.iter_count"),
-        )?;
-        parsed
-            .validate()
-            .map_err(|err| format!("{context}.temperature_schedule: {err}"))?;
-    }
-    Ok(Some(parsed))
-}
-
-fn descriptor_difference_op(
-    descriptor: &serde_json::Map<String, serde_json::Value>,
-    context: &str,
-) -> Result<DifferenceOpKind, String> {
-    let op = descriptor
-        .get("difference_op")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("forward_1d")
-        .to_ascii_lowercase()
-        .replace('-', "_");
-    match op.as_str() {
-        "forward_1d" => Ok(DifferenceOpKind::ForwardDiff1D),
-        "graph_edges" => {
-            let raw_edges = descriptor
-                .get("edges")
-                .and_then(serde_json::Value::as_array)
-                .ok_or_else(|| format!("{context}.edges is required for graph_edges"))?;
-            let mut edges = Vec::with_capacity(raw_edges.len());
-            for (edge_idx, raw_edge) in raw_edges.iter().enumerate() {
-                let pair = raw_edge.as_array().ok_or_else(|| {
-                    format!("{context}.edges[{edge_idx}] must be a two-item list")
-                })?;
-                if pair.len() != 2 {
-                    return Err(format!(
-                        "{context}.edges[{edge_idx}] must contain exactly two row indices"
-                    ));
-                }
-                let from = pair[0].as_u64().ok_or_else(|| {
-                    format!("{context}.edges[{edge_idx}][0] must be a non-negative integer")
-                })?;
-                let to = pair[1].as_u64().ok_or_else(|| {
-                    format!("{context}.edges[{edge_idx}][1] must be a non-negative integer")
-                })?;
-                edges.push((
-                    json_u64_to_usize(from, &format!("{context}.edges[{edge_idx}][0]"))?,
-                    json_u64_to_usize(to, &format!("{context}.edges[{edge_idx}][1]"))?,
-                ));
-            }
-            Ok(DifferenceOpKind::GraphEdges(edges))
-        }
-        other => Err(format!(
-            "{context}.difference_op must be forward_1d or graph_edges; got {other:?}"
-        )),
-    }
-}
-
-fn descriptor_array3_flat(
-    descriptor: &serde_json::Map<String, serde_json::Value>,
-    data_key: &str,
-    shape_key: &str,
-    context: &str,
-) -> Result<Array3<f64>, String> {
-    let shape_values = descriptor
-        .get(shape_key)
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| format!("{context}.{shape_key} must be a three-item shape list"))?;
-    if shape_values.len() != 3 {
-        return Err(format!(
-            "{context}.{shape_key} must contain exactly three dimensions"
-        ));
-    }
-    let mut shape = [0usize; 3];
-    for (idx, raw_dim) in shape_values.iter().enumerate() {
-        let dim = raw_dim
-            .as_u64()
-            .ok_or_else(|| format!("{context}.{shape_key}[{idx}] must be a positive integer"))?;
-        shape[idx] = json_positive_u64_to_usize(dim, &format!("{context}.{shape_key}[{idx}]"))?;
-    }
-    let expected_len = shape[0]
-        .checked_mul(shape[1])
-        .and_then(|value| value.checked_mul(shape[2]))
-        .ok_or_else(|| format!("{context}.{shape_key} overflows usize"))?;
-    let values = descriptor
-        .get(data_key)
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| format!("{context}.{data_key} must be a flattened numeric array"))?;
-    if values.len() != expected_len {
-        return Err(format!(
-            "{context}.{data_key} length {} does not match {shape_key} product {expected_len}",
-            values.len()
-        ));
-    }
-    let mut flat = Vec::with_capacity(expected_len);
-    for (idx, cell) in values.iter().enumerate() {
-        let value = cell
-            .as_f64()
-            .ok_or_else(|| format!("{context}.{data_key}[{idx}] must be a finite number"))?;
-        if !value.is_finite() {
-            return Err(format!("{context}.{data_key}[{idx}] must be finite"));
-        }
-        flat.push(value);
-    }
-    Array3::from_shape_vec((shape[0], shape[1], shape[2]), flat)
-        .map_err(|err| format!("{context}.{data_key} shape reconstruction failed: {err}"))
-}
-
-fn descriptor_array1_flat(
-    descriptor: &serde_json::Map<String, serde_json::Value>,
-    data_key: &str,
-    context: &str,
-) -> Result<Array1<f64>, String> {
-    let values = descriptor
-        .get(data_key)
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| format!("{context}.{data_key} must be a flattened numeric array"))?;
-    if values.is_empty() {
-        return Err(format!("{context}.{data_key} must be non-empty"));
-    }
-    let mut flat = Vec::with_capacity(values.len());
-    for (idx, cell) in values.iter().enumerate() {
-        let value = cell
-            .as_f64()
-            .ok_or_else(|| format!("{context}.{data_key}[{idx}] must be a finite number"))?;
-        if !value.is_finite() {
-            return Err(format!("{context}.{data_key}[{idx}] must be finite"));
-        }
-        flat.push(value);
-    }
-    Ok(Array1::from(flat))
-}
-
-fn descriptor_array2_flat(
-    descriptor: &serde_json::Map<String, serde_json::Value>,
-    data_key: &str,
-    shape_key: &str,
-    context: &str,
-) -> Result<Array2<f64>, String> {
-    let shape_values = descriptor
-        .get(shape_key)
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| format!("{context}.{shape_key} must be a two-item shape list"))?;
-    if shape_values.len() != 2 {
-        return Err(format!(
-            "{context}.{shape_key} must contain exactly two dimensions"
-        ));
-    }
-    let mut shape = [0usize; 2];
-    for (idx, raw_dim) in shape_values.iter().enumerate() {
-        let dim = raw_dim
-            .as_u64()
-            .ok_or_else(|| format!("{context}.{shape_key}[{idx}] must be a positive integer"))?;
-        shape[idx] = json_positive_u64_to_usize(dim, &format!("{context}.{shape_key}[{idx}]"))?;
-    }
-    let expected_len = shape[0]
-        .checked_mul(shape[1])
-        .ok_or_else(|| format!("{context}.{shape_key} overflows usize"))?;
-    let values = descriptor
-        .get(data_key)
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| format!("{context}.{data_key} must be a flattened numeric array"))?;
-    if values.len() != expected_len {
-        return Err(format!(
-            "{context}.{data_key} length {} does not match {shape_key} product {expected_len}",
-            values.len()
-        ));
-    }
-    let mut flat = Vec::with_capacity(expected_len);
-    for (idx, cell) in values.iter().enumerate() {
-        let value = cell
-            .as_f64()
-            .ok_or_else(|| format!("{context}.{data_key}[{idx}] must be a finite number"))?;
-        if !value.is_finite() {
-            return Err(format!("{context}.{data_key}[{idx}] must be finite"));
-        }
-        flat.push(value);
-    }
-    Array2::from_shape_vec((shape[0], shape[1]), flat)
-        .map_err(|err| format!("{context}.{data_key} shape reconstruction failed: {err}"))
-}
-
 /// Python-facing wrapper that builds the analytic-penalty registry from a pair
 /// of JSON strings (`latents`, `descriptors`) and returns a JSON array where
 /// each entry exposes its canonical `kind` tag — the same string returned by
@@ -27061,40 +26624,24 @@ fn build_analytic_penalty_registry_json(
     })
 }
 
+/// Thin adapter over the single shared descriptor parser
+/// (`gam::solver::build_analytic_penalty_registry_from_descriptors`). PyFFI only
+/// deserializes Python objects/JSON into [`serde_json::Value`]; the schema,
+/// defaults, shape checks, and error messages all come from the shared core, so
+/// Python and workflow users see byte-identical behaviour for the same penalty.
 fn build_analytic_penalty_registry_from_json(
     latents: Option<&serde_json::Value>,
     penalties: Option<&serde_json::Value>,
 ) -> Result<AnalyticPenaltyRegistry, String> {
-    let mut registry = AnalyticPenaltyRegistry::new();
-    let Some(raw) = penalties.filter(|value| !value.is_null()) else {
-        return Ok(registry);
-    };
-    let items = raw
-        .as_array()
-        .ok_or_else(|| "penalties must be a list of analytic penalty descriptors".to_string())?;
-    let targets = latent_penalty_targets(latents)?;
-    if !items.is_empty() && targets.is_empty() {
-        return Err("penalties requires latents with at least one latent block".to_string());
-    }
-    for (idx, raw_item) in items.iter().enumerate() {
-        let context = format!("penalties[{idx}]");
-        let descriptor = raw_item
-            .as_object()
-            .ok_or_else(|| format!("{context} must be an object"))?;
-        let target = penalty_target_for_descriptor(&targets, descriptor, &context)?;
-        let slice_len = target
-            .n
-            .checked_mul(target.d)
-            .ok_or_else(|| format!("{context}.target latent shape overflows usize"))?;
-        let slice = PsiSlice::full(slice_len, Some(target.d));
-        let kind = descriptor
-            .get("kind")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| format!("{context}.kind is required"))?
-            .to_ascii_lowercase()
-            .replace('-', "_");
-        let weight_schedule = descriptor_weight_schedule(descriptor, &context)?;
-        match kind.as_str() {
+    gam::solver::build_analytic_penalty_registry_from_descriptors(latents, penalties)
+}
+
+#[doc(hidden)]
+const _LEGACY_BODY_TO_DELETE: () = {
+    match () {
+        () => {
+            #[allow(unreachable_patterns)]
+            match "" {
             "isometry" => {
                 descriptor_no_unknown_keys(
                     descriptor,
