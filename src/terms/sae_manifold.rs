@@ -6659,7 +6659,11 @@ mod tests {
         )
         .unwrap();
         let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
-        let mut rho = SaeManifoldRho::new(0.0, -4.0, vec![Array1::<f64>::zeros(1)]);
+        // ARD log-precision is per-axis (length == atom latent dim), not a
+        // single scalar — see `SaeManifoldRho::to_flat` / `from_flat` and
+        // the validation in `negative_log_ard_prior` (`ARD rho atom k has
+        // len ... but atom dim is d`).
+        let mut rho = SaeManifoldRho::new(0.0, -4.0, vec![Array1::<f64>::zeros(d)]);
         let ridge = 1.0e-6;
         for _ in 0..10 {
             let loss = term
