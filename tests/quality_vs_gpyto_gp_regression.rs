@@ -50,11 +50,42 @@ use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+    load_csvwith_inferred_schema,
 };
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
+use std::path::Path;
+
+/// Canonical lidar benchmark (range -> logratio). Source: Sigrist (1994) lidar
+/// experiment, distributed with R packages `SemiPar`/`gamair` and reused across
+/// the smoothing literature; vendored here at `bench/datasets/lidar.csv`.
+const LIDAR_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/lidar.csv");
+
+/// Coefficient of determination of `pred` against observed `truth`, relative to
+/// the held-out mean predictor: `1 - SS_res / SS_tot`. R2 = 1 is perfect, R2 = 0
+/// matches predicting the test mean, R2 < 0 is worse than that constant.
+fn r2(pred: &[f64], truth: &[f64]) -> f64 {
+    assert_eq!(pred.len(), truth.len(), "r2 length mismatch");
+    let n = truth.len() as f64;
+    let mean = truth.iter().sum::<f64>() / n;
+    let ss_res: f64 = pred.iter().zip(truth).map(|(p, t)| (t - p) * (t - p)).sum();
+    let ss_tot: f64 = truth.iter().map(|t| (t - mean) * (t - mean)).sum();
+    1.0 - ss_res / ss_tot.max(1e-300)
+}
+
+/// Right-pad `v` with its last value (or 0.0 when empty) to length `len`, so a
+/// short test-length vector can ride along as a column of the otherwise
+/// train-length reference data.frame. Only the first `v.len()` entries are read
+/// back inside the reference body.
+fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
+    assert!(v.len() <= len, "pad target {len} shorter than source {}", v.len());
+    let fill = v.last().copied().unwrap_or(0.0);
+    let mut out = v.to_vec();
+    out.resize(len, fill);
+    out
+}
 
 /// Fraction of grid points at which the noise-free truth `f(x)` lies inside the
 /// symmetric band `[mean(x) − half(x), mean(x) + half(x)]`. Objective empirical
@@ -251,5 +282,189 @@ emit("grid_std", std)
     assert!(
         (coverage - 0.95).abs() <= 0.10,
         "gam 95% credible band miscalibrated against truth: empirical coverage={coverage:.3} (nominal 0.95)"
+    );
+}
+
+#[test]
+fn gam_gp_regression_recovers_truth_on_real_data() {
+    // REAL-DATA ARM of the Matérn-5/2 GP regression capability. On the lidar
+    // benchmark the generating function is UNKNOWN, so objective quality is
+    // measured as OUT-OF-SAMPLE predictive accuracy, not recovery of a synthetic
+    // truth: we make a deterministic train/test split (every 4th row held out),
+    // fit gam's `matern(range, nu=2.5)` GP smooth on TRAIN only, predict the SAME
+    // held-out rows that an exact GPyTorch Matérn-5/2 GP predicts from the SAME
+    // training rows, and assert:
+    //
+    //   PRIMARY (objective, tool-free): held-out coefficient of determination
+    //     `test_R2 >= 0.55` — the GP smooth genuinely explains held-out variance,
+    //     well above the constant test-mean predictor (R2 = 0).
+    //
+    //   BASELINE (match-or-beat): gam's held-out RMSE must be no worse than
+    //     `gpytorch_test_rmse * 1.10`. GPyTorch is a strong baseline to match or
+    //     beat on the SAME accuracy metric, never an output to replicate.
+    init_parallelism();
+
+    // ---- load the canonical lidar dataset (range -> logratio) ----------------
+    let ds = load_csvwith_inferred_schema(Path::new(LIDAR_CSV)).expect("load lidar.csv");
+    let col = ds.column_map();
+    let range_idx = col["range"];
+    let logratio_idx = col["logratio"];
+    let range: Vec<f64> = ds.values.column(range_idx).to_vec();
+    let logratio: Vec<f64> = ds.values.column(logratio_idx).to_vec();
+    let n = range.len();
+    assert!(n > 100, "lidar should have ~221 rows, got {n}");
+
+    // ---- deterministic train/test split: every 4th row held out -------------
+    let is_test = |i: usize| i % 4 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    assert!(
+        train_rows.len() > 100 && test_rows.len() > 30,
+        "split sizes: train={} test={}",
+        train_rows.len(),
+        test_rows.len()
+    );
+
+    let train_range: Vec<f64> = train_rows.iter().map(|&i| range[i]).collect();
+    let train_logratio: Vec<f64> = train_rows.iter().map(|&i| logratio[i]).collect();
+    let test_range: Vec<f64> = test_rows.iter().map(|&i| range[i]).collect();
+    let test_logratio: Vec<f64> = test_rows.iter().map(|&i| logratio[i]).collect();
+
+    // Build a training-only encoded dataset by sub-setting the encoded rows;
+    // headers, schema, and column kinds are unchanged, so the formula resolves
+    // identically to the full-data fit.
+    let p = ds.headers.len();
+    let mut train_values = Array2::<f64>::zeros((train_rows.len(), p));
+    for (out_row, &src_row) in train_rows.iter().enumerate() {
+        for c in 0..p {
+            train_values[[out_row, c]] = ds.values[[src_row, c]];
+        }
+    }
+    let mut train_ds = ds.clone();
+    train_ds.values = train_values;
+
+    // ---- fit gam on TRAIN: logratio ~ matern(range, nu=2.5, k=30), REML ------
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula("logratio ~ matern(range, nu=2.5, k=30)", &train_ds, &cfg)
+        .expect("gam matern fit on lidar train");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected a standard Gaussian GAM fit for matern() GP smooth on lidar");
+    };
+
+    // gam predictions at the held-out `range` points: rebuild the frozen-spec
+    // design (identity link => design*beta = predicted mean).
+    let mut test_grid = Array2::<f64>::zeros((test_rows.len(), p));
+    for (i, &r) in test_range.iter().enumerate() {
+        test_grid[[i, range_idx]] = r;
+    }
+    let test_design = build_term_collection_design(test_grid.view(), &fit.resolvedspec)
+        .expect("rebuild matern design at held-out lidar points");
+    let gam_test_pred: Vec<f64> = test_design.design.apply(&fit.fit.beta).to_vec();
+    assert_eq!(
+        gam_test_pred.len(),
+        test_rows.len(),
+        "gam held-out prediction length mismatch"
+    );
+
+    // ---- fit the SAME train rows with GPyTorch, predict the SAME test rows ---
+    // Exact Matérn-5/2 GP, hyperparameters by Adam on the exact log marginal
+    // likelihood; predict the LATENT mean at the held-out range points. Every
+    // Column handed to one run_python call is train-length: the test range rides
+    // along right-padded, and only its first `test_n` entries are read back.
+    let py = run_python(
+        &[
+            Column::new("range", &train_range),
+            Column::new("logratio", &train_logratio),
+            Column::new("test_range", &pad_to(&test_range, train_range.len())),
+            Column::new("test_n", &vec![test_range.len() as f64; train_range.len()]),
+        ],
+        r#"
+import torch, gpytorch
+torch.manual_seed(0)
+
+k = int(round(float(np.asarray(df["test_n"])[0])))
+xt = torch.as_tensor(np.asarray(df["range"], dtype=float), dtype=torch.float64)
+yt = torch.as_tensor(np.asarray(df["logratio"], dtype=float), dtype=torch.float64)
+xtest = torch.as_tensor(np.asarray(df["test_range"], dtype=float)[:k], dtype=torch.float64)
+
+# Standardize the input for numerically well-conditioned length-scale learning;
+# the GP posterior mean is invariant to this affine reparameterization.
+xm, xs = xt.mean(), xt.std()
+xt_s = (xt - xm) / xs
+xtest_s = (xtest - xm) / xs
+
+class ExactGP(gpytorch.models.ExactGP):
+    def __init__(self, tx, ty, lik):
+        super().__init__(tx, ty, lik)
+        self.mean_module = gpytorch.means.ConstantMean()
+        self.covar_module = gpytorch.kernels.ScaleKernel(
+            gpytorch.kernels.MaternKernel(nu=2.5))
+    def forward(self, x):
+        return gpytorch.distributions.MultivariateNormal(
+            self.mean_module(x), self.covar_module(x))
+
+lik = gpytorch.likelihoods.GaussianLikelihood()
+model = ExactGP(xt_s, yt, lik)
+model.double(); lik.double()
+
+model.train(); lik.train()
+opt = torch.optim.Adam(model.parameters(), lr=0.05)
+mll = gpytorch.mlls.ExactMarginalLogLikelihood(lik, model)
+for _ in range(500):
+    opt.zero_grad()
+    out = model(xt_s)
+    loss = -mll(out, yt)
+    loss.backward()
+    opt.step()
+
+model.eval(); lik.eval()
+with torch.no_grad(), gpytorch.settings.fast_pred_var(False):
+    f = model(xtest_s)
+    pred = f.mean.numpy()
+
+emit("test_pred", pred)
+"#,
+    );
+    let gpt_test_pred = py.vector("test_pred");
+    assert_eq!(
+        gpt_test_pred.len(),
+        test_rows.len(),
+        "GPyTorch held-out prediction length mismatch"
+    );
+
+    // ---- objective held-out metrics on gam's OWN predictions -----------------
+    let gam_test_r2 = r2(&gam_test_pred, &test_logratio);
+    let gam_test_rmse = rmse(&gam_test_pred, &test_logratio);
+    let gpt_test_rmse = rmse(gpt_test_pred, &test_logratio);
+
+    // Context-only diagnostic (NOT asserted): closeness of the two held-out
+    // prediction vectors. Matching a peer tool's noisy fit proves nothing.
+    let rel_to_ref = relative_l2(&gam_test_pred, gpt_test_pred);
+
+    eprintln!(
+        "lidar matern(range,nu=2.5,k=30) held-out: n_train={} n_test={} \
+         gam_test_R2={gam_test_r2:.4} gam_test_rmse={gam_test_rmse:.4} \
+         gpt_test_rmse={gpt_test_rmse:.4} | context-only rel_l2_to_gpt={rel_to_ref:.4}",
+        train_rows.len(),
+        test_rows.len(),
+    );
+
+    // ---- PRIMARY objective assertion: gam predicts the held-out signal -------
+    // The lidar mean function is strongly nonlinear with a clear signal; a
+    // competent Matérn GP explains well over half the held-out variance. R2 >=
+    // 0.55 is far above the constant-mean baseline (0) and catches under/over-
+    // smoothing of the GP length-scale.
+    assert!(
+        gam_test_r2 >= 0.55,
+        "gam GP held-out predictive R2 too low: {gam_test_r2:.4} (< 0.55)"
+    );
+
+    // ---- BASELINE (match-or-beat): no worse than GPyTorch on held-out RMSE ---
+    assert!(
+        gam_test_rmse <= gpt_test_rmse * 1.10,
+        "gam held-out RMSE {gam_test_rmse:.4} exceeds GPyTorch baseline {gpt_test_rmse:.4} * 1.10"
     );
 }

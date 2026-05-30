@@ -39,7 +39,9 @@ use gam::families::gamlss::GaussianLocationScaleFamily;
 use gam::matrix::DesignMatrix;
 use gam::resource::ResourcePolicy;
 use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
+use gam::load_csvwith_inferred_schema;
 use ndarray::{Array1, Array2};
+use std::path::Path;
 
 const N: usize = 180;
 const N_GRID: usize = 50;
@@ -99,6 +101,18 @@ fn eval_grid() -> Vec<f64> {
 /// data-dependent centering — are identical for fitting and for prediction;
 /// we then split the rows. Returns `(train_spec_design, grid_design)`.
 fn pspline_block(name: &str, x_all: &[f64]) -> (ParameterBlockSpec, Array2<f64>) {
+    pspline_block_split(name, x_all, N)
+}
+
+/// Same as [`pspline_block`] but with an explicit train-row count `n_train`
+/// (the first `n_train` rows of `x_all` are the fitting rows; the remainder are
+/// held-out / grid rows whose design is returned for prediction). The synthetic
+/// arm uses `n_train = N`; the real-data arm uses its own deterministic split.
+fn pspline_block_split(
+    name: &str,
+    x_all: &[f64],
+    n_train: usize,
+) -> (ParameterBlockSpec, Array2<f64>) {
     let x_arr = Array1::from_vec(x_all.to_vec());
     let lo = x_all.iter().cloned().fold(f64::INFINITY, f64::min);
     let hi = x_all.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -153,13 +167,13 @@ fn pspline_block(name: &str, x_all: &[f64]) -> (ParameterBlockSpec, Array2<f64>)
     }
     let n_pen = penalties.len();
 
-    let train = full.slice(ndarray::s![0..N, ..]).to_owned();
-    let grid = full.slice(ndarray::s![N.., ..]).to_owned();
+    let train = full.slice(ndarray::s![0..n_train, ..]).to_owned();
+    let grid = full.slice(ndarray::s![n_train.., ..]).to_owned();
 
     let block = ParameterBlockSpec {
         name: name.to_string(),
         design: DesignMatrix::from(train),
-        offset: Array1::zeros(N),
+        offset: Array1::zeros(n_train),
         penalties,
         nullspace_dims,
         initial_log_lambdas: Array1::zeros(n_pen),
@@ -348,5 +362,179 @@ fn gam_custom_family_location_scale_matches_gamlss() {
     assert!(
         gam_log_sigma_err <= gamlss_log_sigma_err * 1.10,
         "gam's log σ recovery worse than gamlss: gam={gam_log_sigma_err:.4} gamlss={gamlss_log_sigma_err:.4}"
+    );
+}
+
+/// Mean per-observation Gaussian negative log-likelihood (full constants
+/// included, so it is comparable across engines): for each held-out point,
+/// `½·log(2π) + log σ_i + ½ (y_i − μ_i)² / σ_i²`, averaged over the set. This is
+/// the natural objective-quality score for a *distributional* fit on real data
+/// where the truth is unknown: it rewards a model whose predicted MEAN and
+/// predicted SCALE are both right, and (unlike a mean-only RMSE) it penalizes a
+/// model that nails μ but mis-estimates the heteroscedastic σ envelope.
+fn mean_gaussian_nll(y: &[f64], mu: &[f64], sigma: &[f64]) -> f64 {
+    assert_eq!(y.len(), mu.len(), "nll length mismatch (mu)");
+    assert_eq!(y.len(), sigma.len(), "nll length mismatch (sigma)");
+    let half_log_2pi = 0.5 * (2.0 * std::f64::consts::PI).ln();
+    let total: f64 = y
+        .iter()
+        .zip(mu)
+        .zip(sigma)
+        .map(|((&yi, &mi), &si)| {
+            let r = yi - mi;
+            half_log_2pi + si.ln() + 0.5 * r * r / (si * si)
+        })
+        .sum();
+    total / y.len() as f64
+}
+
+#[test]
+fn gam_custom_family_location_scale_matches_gamlss_on_real_data() {
+    gam::init_parallelism();
+
+    // ---- real data: gagurine (Age -> GAG) ---------------------------------
+    // SOURCE: the `gagurine` dataset from R's MASS package (Venables & Ripley,
+    // *Modern Applied Statistics with S*); 314 children, urinary
+    // glycosaminoglycan (GAG) concentration vs Age in years. GAG falls steeply
+    // with Age and its spread shrinks markedly with Age — a textbook
+    // heteroscedastic series, so a Gaussian *location-scale* model (smooth μ AND
+    // smooth log σ over Age) is the right tool and a mean-only smooth is not.
+    let csv = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/gagurine.csv");
+    let ds = load_csvwith_inferred_schema(Path::new(csv)).expect("load gagurine.csv");
+    let col = ds.column_map();
+    let age_idx = col["Age"];
+    let gag_idx = col["GAG"];
+    let age_full: Vec<f64> = ds.values.column(age_idx).to_vec();
+    let gag_full: Vec<f64> = ds.values.column(gag_idx).to_vec();
+    let n_all = age_full.len();
+    assert!(n_all > 300, "gagurine should have ~314 rows, got {n_all}");
+
+    // ---- deterministic train/test split: every 4th row held out -----------
+    // Identical row sets, in identical order, go to gam and to gamlss.
+    let is_test = |i: usize| i % 4 == 0;
+    let train_rows: Vec<usize> = (0..n_all).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n_all).filter(|&i| is_test(i)).collect();
+    let n_train = train_rows.len();
+    let n_test = test_rows.len();
+    assert!(
+        n_train > 200 && n_test > 60,
+        "split sizes: train={n_train} test={n_test}"
+    );
+
+    let train_age: Vec<f64> = train_rows.iter().map(|&i| age_full[i]).collect();
+    let train_gag: Vec<f64> = train_rows.iter().map(|&i| gag_full[i]).collect();
+    let test_age: Vec<f64> = test_rows.iter().map(|&i| age_full[i]).collect();
+    let test_gag: Vec<f64> = test_rows.iter().map(|&i| gag_full[i]).collect();
+
+    // x_all = [train ; test] so the data-dependent basis columns and centering
+    // are shared between fitting and prediction; we then split the rows.
+    let mut x_all = train_age.clone();
+    x_all.extend_from_slice(&test_age);
+
+    // ---- gam: two-block Gaussian location-scale custom family, fit on TRAIN -
+    let (spec_mu, test_mu) = pspline_block_split("mu", &x_all, n_train);
+    let (spec_sigma, test_sigma) = pspline_block_split("log_sigma", &x_all, n_train);
+    let specs = vec![spec_mu, spec_sigma];
+
+    let y_arr = Array1::from_vec(train_gag.clone());
+    let family = GaussianLocationScaleFamily {
+        y: y_arr,
+        weights: Array1::ones(n_train),
+        mu_design: Some(specs[GaussianLocationScaleFamily::BLOCK_MU].design.clone()),
+        log_sigma_design: Some(
+            specs[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA]
+                .design
+                .clone(),
+        ),
+        policy: ResourcePolicy::default_library(),
+        cached_row_scalars: std::sync::RwLock::new(None),
+    };
+
+    let options = BlockwiseFitOptions {
+        compute_covariance: false,
+        ..BlockwiseFitOptions::default()
+    };
+    let fit = fit_custom_family(&family, &specs, &options).expect("gam location-scale fit (real)");
+    assert!(
+        fit.outer_converged,
+        "gam location-scale outer optimization did not converge (real)"
+    );
+
+    let beta_mu = &fit.block_states[GaussianLocationScaleFamily::BLOCK_MU].beta;
+    let beta_ls = &fit.block_states[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA].beta;
+
+    // Held-out predictions: μ via identity link, σ via exp(log-σ predictor).
+    let gam_mu_test: Vec<f64> = test_mu.dot(beta_mu).to_vec();
+    let gam_sigma_test: Vec<f64> = test_sigma.dot(beta_ls).mapv(f64::exp).to_vec();
+
+    // ---- gamlss: the mature distributional-regression BASELINE, same split -
+    // One run, all columns equal length (n_train): the test rows ride along as
+    // parallel padded columns and are sliced back inside R, so gam and gamlss
+    // predict the identical held-out rows in the identical order.
+    let pad = |v: &[f64]| -> Vec<f64> {
+        let fill = v.last().copied().unwrap_or(0.0);
+        let mut out = v.to_vec();
+        out.resize(n_train, fill);
+        out
+    };
+    let r = run_r(
+        &[
+            Column::new("Age", &train_age),
+            Column::new("GAG", &train_gag),
+            Column::new("test_Age", &pad(&test_age)),
+            Column::new("test_n", &vec![n_test as f64; n_train]),
+        ],
+        r#"
+        suppressPackageStartupMessages(library(gamlss))
+        ctrl <- gamlss.control(trace = FALSE)
+        m <- gamlss(GAG ~ pb(Age), sigma.fo = ~ pb(Age), family = NO(),
+                    data = df, control = ctrl)
+        k <- df$test_n[1]
+        nd <- data.frame(Age = df$test_Age[1:k])
+        mu_g  <- as.numeric(predict(m, what = "mu",    newdata = nd, type = "response", data = df))
+        sig_g <- as.numeric(predict(m, what = "sigma", newdata = nd, type = "response", data = df))
+        emit("mu_test", mu_g)
+        emit("sigma_test", sig_g)
+        "#,
+    );
+    let gamlss_mu_test = r.vector("mu_test");
+    let gamlss_sigma_test = r.vector("sigma_test");
+    assert_eq!(gamlss_mu_test.len(), n_test, "gamlss mu test length");
+    assert_eq!(gamlss_sigma_test.len(), n_test, "gamlss sigma test length");
+
+    // ---- OBJECTIVE metric: held-out Gaussian NLL (lower is better) ---------
+    let gam_nll = mean_gaussian_nll(&test_gag, &gam_mu_test, &gam_sigma_test);
+    let gamlss_nll = mean_gaussian_nll(&test_gag, gamlss_mu_test, gamlss_sigma_test);
+
+    // Context only (never gates): how close gam's predicted mean sits to gamlss.
+    let rel_mu = relative_l2(&gam_mu_test, gamlss_mu_test);
+    let gam_mu_rmse = rmse(&gam_mu_test, &test_gag);
+
+    eprintln!(
+        "gagurine location-scale held-out: n_train={n_train} n_test={n_test} \
+         gam_nll={gam_nll:.4} gamlss_nll={gamlss_nll:.4} gam_mu_rmse={gam_mu_rmse:.4} \
+         (ctx: rel_l2_mu_vs_gamlss={rel_mu:.4})"
+    );
+
+    // (1) ABSOLUTE objective bar — gam must be a genuinely good distributional
+    // predictor on the held-out rows. A naive homoscedastic mean-only model on
+    // gagurine (constant σ ≈ 9, marginal mean ≈ 13) scores a per-point Gaussian
+    // NLL near ½log(2π·81)+½ ≈ 3.7. By modelling BOTH the falling mean AND the
+    // shrinking scale, a correct location-scale fit drops well below that; 3.3
+    // nats/obs is a conservative bar that a model with a mis-assembled
+    // off-diagonal Hessian (μ and σ blocks fighting each other) cannot reach.
+    assert!(
+        gam_nll < 3.3,
+        "gam held-out Gaussian NLL too high: {gam_nll:.4} (>= 3.3 nats/obs)"
+    );
+
+    // (2) MATCH-OR-BEAT the mature reference on that SAME held-out NLL. gamlss
+    // is fit on the identical training rows and scored on the identical held-out
+    // rows; gam's mean NLL must be no worse than gamlss's by more than 0.05
+    // nats/obs. This is an out-of-sample accuracy comparison, not reproduction
+    // of gamlss's in-sample curve.
+    assert!(
+        gam_nll <= gamlss_nll + 0.05,
+        "gam's held-out NLL worse than gamlss: gam={gam_nll:.4} gamlss={gamlss_nll:.4}"
     );
 }

@@ -50,8 +50,16 @@ use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, rmse, run_python, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+    load_csvwith_inferred_schema,
 };
 use ndarray::Array2;
+use std::path::Path;
+
+/// GAG-in-urine vs Age in 314 children. SOURCE: R package MASS, dataset
+/// `gagurine` (Venables & Ripley, MASS), exported verbatim to CSV. GAG
+/// concentration falls sharply with Age and its dispersion shrinks with Age —
+/// a textbook heteroscedastic Gaussian relationship, hence a location-scale fit.
+const GAGURINE_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/gagurine.csv");
 
 /// Standard-normal CDF via the error function (Abramowitz & Stegun 7.1.26
 /// rational approximation of erf, |error| < 1.5e-7) — plain Rust so the CRPS
@@ -355,5 +363,195 @@ fn gam_gaussian_location_scale_crps_matches_gamlss() {
         crps_ratio <= 1.05,
         "gam held-out mean CRPS materially worse than the gamlss baseline: ratio={crps_ratio:.4} \
          (gam={gam_mean_crps_rust:.5}, gamlss={gamlss_mean_crps:.5})"
+    );
+}
+
+/// REAL-DATA arm of the SAME capability (Gaussian location-scale predictive
+/// calibration scored by CRPS), on `gagurine` (Age -> GAG, heteroscedastic).
+///
+/// Because this is real data the true generating law is UNKNOWN, so there is no
+/// oracle floor and no truth-recovery assertion. Instead the objective gate is
+/// purely held-out and tool-free:
+///
+///   PRIMARY (absolute, tool-free): on a fixed every-4th-row held-out split,
+///     gam's mean CRPS of its issued Gaussian predictive law N(mu, sigma) must
+///     be no worse than a generous ABSOLUTE bar. The bar is anchored to the
+///     held-out response scale: a degenerate forecaster that always reports the
+///     marginal N(mean(GAG_train), sd(GAG_train)) incurs a mean CRPS of order
+///     `sd(GAG)` (~6 for this data); a smooth heteroscedastic fit must beat
+///     that comfortably. We assert gam_mean_crps <= 0.55 * sd(GAG_test), a hard
+///     absolute number independent of any reference tool.
+///
+///   BASELINE (match-or-beat): the mature gamlss NO() location-scale model fits
+///     the SAME train rows and predicts the SAME held-out rows; gam's mean CRPS
+///     must satisfy gam <= gamlss * 1.10. gamlss is a baseline to match-or-beat,
+///     never an output to replicate.
+///
+/// Both CRPS quantities are recomputed in plain Rust with the closed-form
+/// Gaussian CRPS above so the PASS/FAIL gate never routes through a reference.
+#[test]
+fn gam_gaussian_location_scale_crps_matches_gamlss_on_real_data() {
+    init_parallelism();
+
+    // ---- load gagurine (Age -> GAG) ---------------------------------------
+    let ds = load_csvwith_inferred_schema(Path::new(GAGURINE_CSV)).expect("load gagurine.csv");
+    let col = ds.column_map();
+    let age_idx = col["Age"];
+    let gag_idx = col["GAG"];
+    let age_all: Vec<f64> = ds.values.column(age_idx).to_vec();
+    let gag_all: Vec<f64> = ds.values.column(gag_idx).to_vec();
+    let n = age_all.len();
+    assert!(n > 250, "gagurine should have ~314 rows, got {n}");
+
+    // ---- deterministic train/test split: every 4th row is held out --------
+    let is_test = |i: usize| i % 4 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    let n_train = train_rows.len();
+    let n_test = test_rows.len();
+    assert!(
+        n_train > 150 && n_test > 50,
+        "split sizes: train={n_train} test={n_test}"
+    );
+
+    let age_train: Vec<f64> = train_rows.iter().map(|&i| age_all[i]).collect();
+    let gag_train: Vec<f64> = train_rows.iter().map(|&i| gag_all[i]).collect();
+    let age_test: Vec<f64> = test_rows.iter().map(|&i| age_all[i]).collect();
+    let gag_test: Vec<f64> = test_rows.iter().map(|&i| gag_all[i]).collect();
+
+    // ---- fit gam on the TRAIN rows ----------------------------------------
+    // mu ~ s(Age); log-sigma ~ 1 + s(Age) — the dispersion also varies with Age.
+    let headers: Vec<String> = vec!["Age".to_string(), "GAG".to_string()];
+    let train_records: Vec<csv::StringRecord> = (0..n_train)
+        .map(|i| {
+            csv::StringRecord::from(vec![
+                format!("{:.17e}", age_train[i]),
+                format!("{:.17e}", gag_train[i]),
+            ])
+        })
+        .collect();
+    let train_ds =
+        encode_recordswith_inferred_schema(headers, train_records).expect("encode gagurine train");
+    let tcol = train_ds.column_map();
+    let t_age_idx = tcol["Age"];
+    let ncols = train_ds.headers.len();
+
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        noise_formula: Some("1 + s(Age)".to_string()),
+        ..FitConfig::default()
+    };
+    let result =
+        fit_from_formula("GAG ~ s(Age)", &train_ds, &cfg).expect("gam location-scale fit on gagurine");
+    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult { fit, .. }) = result else {
+        panic!("expected a Gaussian location-scale fit");
+    };
+
+    let beta_location = fit
+        .fit
+        .block_by_role(BlockRole::Location)
+        .expect("location (mean) block present")
+        .beta
+        .clone();
+    let beta_scale = fit
+        .fit
+        .block_by_role(BlockRole::Scale)
+        .expect("scale (log-sigma) block present")
+        .beta
+        .clone();
+
+    // ---- predict gam's (mu, sigma) on the held-out TEST rows --------------
+    let mut test_grid = Array2::<f64>::zeros((n_test, ncols));
+    for i in 0..n_test {
+        test_grid[[i, t_age_idx]] = age_test[i];
+    }
+    let mean_design = build_term_collection_design(test_grid.view(), &fit.meanspec_resolved)
+        .expect("rebuild mean design at test points");
+    let scale_design = build_term_collection_design(test_grid.view(), &fit.noisespec_resolved)
+        .expect("rebuild log-sigma design at test points");
+
+    let gam_mu: Vec<f64> = mean_design.design.apply(&beta_location).to_vec();
+    let gam_eta_sigma: Vec<f64> = scale_design.design.apply(&beta_scale).to_vec();
+    let gam_sigma: Vec<f64> = gam_eta_sigma
+        .iter()
+        .map(|&e| LOGB_SIGMA_FLOOR + e.exp())
+        .collect();
+    assert_eq!(gam_mu.len(), n_test);
+    assert_eq!(gam_sigma.len(), n_test);
+
+    // ---- fit gamlss on the SAME train rows, predict the SAME test rows ----
+    // A per-row train flag is sent so gamlss subsets to exactly gam's train set;
+    // EVERY column in this single call is full length n (no length mixing).
+    let train_flag: Vec<f64> = (0..n)
+        .map(|i| if is_test(i) { 0.0 } else { 1.0 })
+        .collect();
+
+    let r = run_r(
+        &[
+            Column::new("Age", &age_all),
+            Column::new("GAG", &gag_all),
+            Column::new("train", &train_flag),
+        ],
+        r#"
+        suppressPackageStartupMessages(library(gamlss))
+        suppressPackageStartupMessages(library(scoringrules))
+        tr <- df[df$train > 0.5, ]
+        te <- df[df$train < 0.5, ]
+        m <- gamlss(GAG ~ pb(Age), sigma.formula = ~ pb(Age), family = NO(),
+                    data = tr, control = gamlss.control(trace = FALSE))
+        nd <- data.frame(Age = te$Age)
+        mu <- as.numeric(predict(m, what = "mu", newdata = nd, type = "response"))
+        sigma <- as.numeric(predict(m, what = "sigma", newdata = nd, type = "response"))
+        crps <- as.numeric(crps_norm(te$GAG, mean = mu, sd = sigma))
+        emit("mu", mu)
+        emit("sigma", sigma)
+        emit("crps", crps)
+        "#,
+    );
+    let gamlss_crps = r.vector("crps");
+    assert_eq!(
+        gamlss_crps.len(),
+        n_test,
+        "gamlss crps test length mismatch"
+    );
+
+    // ---- OBJECTIVE METRIC: held-out mean CRPS, recomputed in plain Rust ----
+    let gam_mean_crps: f64 = (0..n_test)
+        .map(|i| crps_gaussian(gag_test[i], gam_mu[i], gam_sigma[i]))
+        .sum::<f64>()
+        / n_test as f64;
+    let gamlss_mean_crps: f64 = gamlss_crps.iter().sum::<f64>() / n_test as f64;
+    let crps_ratio = gam_mean_crps / gamlss_mean_crps;
+
+    // Held-out response scale: the absolute bar is anchored to sd(GAG_test).
+    let mean_test = gag_test.iter().sum::<f64>() / n_test as f64;
+    let var_test = gag_test
+        .iter()
+        .map(|&g| (g - mean_test) * (g - mean_test))
+        .sum::<f64>()
+        / n_test as f64;
+    let sd_test = var_test.sqrt();
+    let crps_floor_bar = 0.55 * sd_test;
+
+    eprintln!(
+        "gagurine loc-scale held-out CRPS: n_train={n_train} n_test={n_test} \
+         gam_mean_crps={gam_mean_crps:.5} sd(GAG_test)={sd_test:.4} bar={crps_floor_bar:.4} \
+         | baseline gamlss: mean_crps={gamlss_mean_crps:.5} ratio={crps_ratio:.4}"
+    );
+
+    // PRIMARY (absolute, tool-free): gam's predictive law scores well below the
+    // response-scale-anchored bar — far better than the marginal forecaster.
+    assert!(
+        gam_mean_crps <= crps_floor_bar,
+        "gam held-out mean CRPS above absolute bar: gam={gam_mean_crps:.5} \
+         bar={crps_floor_bar:.4} (= 0.55 * sd(GAG_test)={sd_test:.4})"
+    );
+
+    // BASELINE (match-or-beat): gam must not be materially worse than mature
+    // gamlss on the SAME objective metric, same rows.
+    assert!(
+        crps_ratio <= 1.10,
+        "gam held-out mean CRPS materially worse than the gamlss baseline: ratio={crps_ratio:.4} \
+         (gam={gam_mean_crps:.5}, gamlss={gamlss_mean_crps:.5})"
     );
 }

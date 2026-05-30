@@ -222,3 +222,172 @@ fn gam_pspline_generalizes_on_lidar() {
         "gam effective complexity out of range: edf = {gam_edf:.3} (expected 1 < edf < 15)"
     );
 }
+
+/// Second real-data arm exercising the SAME cubic p-spline (`s(range, bs='ps')`)
+/// capability on the canonical `lidar` smoothing benchmark, under a DIFFERENT
+/// deterministic holdout and a DIFFERENT objective lens.
+///
+/// Dataset SOURCE: the classic LIDAR (light-detection-and-ranging) smoothing
+/// benchmark of Sigrist (1994), distributed with the SemiPar R package
+/// (`data(lidar)`); `range` is the distance traveled before light is reflected
+/// back to source, `logratio` is the log ratio of received light from two
+/// laser sources. Real measurements: there is no analytic ground-truth curve,
+/// so objective quality is purely out-of-sample predictive accuracy.
+///
+/// Holdout (distinct from the every-5th split above so the two arms are NOT
+/// redundant): every 4th row by index is held out. The p-spline is fit on the
+/// training rows ONLY and used to predict the held-out `range`. Objective bars
+/// asserted on gam's OWN predictions:
+///   1. ABSOLUTE held-out accuracy: test RMSE <= 0.08 logratio units. The
+///      observed lidar noise floor is ~0.05-0.07; an RMSE under 0.08 means gam
+///      tracks the latent curve to within roughly the irreducible noise and is
+///      a tool-free correctness claim (a flat-mean predictor scores ~0.18).
+///   2. MATCH-OR-BEAT mgcv (the mature canonical p-spline, fit on the identical
+///      training rows, predicting the identical held-out rows): gam's held-out
+///      RMSE <= mgcv's held-out RMSE * 1.10. mgcv is a baseline to match-or-beat
+///      on accuracy, never an output to reproduce.
+/// We also assert test R^2 >= 0.55 as a generalization floor; the in-sample
+/// rel_l2 vs mgcv is printed for context only and is NOT a pass criterion.
+#[test]
+fn gam_pspline_generalizes_on_lidar_on_real_data() {
+    init_parallelism();
+
+    // ---- load the canonical lidar dataset (range -> logratio) -------------
+    let ds = load_csvwith_inferred_schema(Path::new(LIDAR_CSV)).expect("load lidar.csv");
+    let col = ds.column_map();
+    let range_idx = col["range"];
+    let logratio_idx = col["logratio"];
+    let range: Vec<f64> = ds.values.column(range_idx).to_vec();
+    let logratio: Vec<f64> = ds.values.column(logratio_idx).to_vec();
+    let n = range.len();
+    assert!(n > 100, "lidar should have ~221 rows, got {n}");
+
+    // ---- deterministic train/test split: every 4th row is held out -------
+    // Index-based, no RNG; identical rows in identical order go to gam and mgcv.
+    let test_mask: Vec<bool> = (0..n).map(|i| i % 4 == 0).collect();
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !test_mask[i]).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| test_mask[i]).collect();
+    let n_train = train_rows.len();
+    let n_test = test_rows.len();
+    assert!(
+        n_train > 100 && n_test > 40,
+        "split should leave a healthy train/test partition: train={n_train} test={n_test}"
+    );
+
+    let range_train: Vec<f64> = train_rows.iter().map(|&i| range[i]).collect();
+    let logratio_train: Vec<f64> = train_rows.iter().map(|&i| logratio[i]).collect();
+    let range_test: Vec<f64> = test_rows.iter().map(|&i| range[i]).collect();
+    let logratio_test: Vec<f64> = test_rows.iter().map(|&i| logratio[i]).collect();
+
+    // ---- build a TRAIN-ONLY dataset for gam -------------------------------
+    let mut train_values = Array2::<f64>::zeros((n_train, ds.headers.len()));
+    for (new_row, &orig) in train_rows.iter().enumerate() {
+        train_values.row_mut(new_row).assign(&ds.values.row(orig));
+    }
+    let train_ds = EncodedDataset {
+        headers: ds.headers.clone(),
+        values: train_values,
+        schema: ds.schema.clone(),
+        column_kinds: ds.column_kinds.clone(),
+    };
+
+    // ---- fit with gam on TRAIN ONLY: logratio ~ s(range, bs='ps', k=15) ---
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula("logratio ~ s(range, bs='ps', k=15)", &train_ds, &cfg)
+        .expect("gam p-spline fit on training rows");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected a standard GAM fit for a gaussian p-spline smooth");
+    };
+    let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
+
+    // gam's OWN out-of-sample predictions at the held-out `range`.
+    let mut test_grid = Array2::<f64>::zeros((n_test, ds.headers.len()));
+    for (i, &r) in range_test.iter().enumerate() {
+        test_grid[[i, range_idx]] = r;
+    }
+    let test_design = build_term_collection_design(test_grid.view(), &fit.resolvedspec)
+        .expect("rebuild design at held-out points");
+    let gam_test_pred: Vec<f64> = test_design.design.apply(&fit.fit.beta).to_vec();
+
+    // gam in-sample fit on the training grid (context only).
+    let mut train_grid = Array2::<f64>::zeros((n_train, ds.headers.len()));
+    for (i, &r) in range_train.iter().enumerate() {
+        train_grid[[i, range_idx]] = r;
+    }
+    let train_design = build_term_collection_design(train_grid.view(), &fit.resolvedspec)
+        .expect("rebuild design at training points");
+    let gam_train_fit: Vec<f64> = train_design.design.apply(&fit.fit.beta).to_vec();
+
+    // ---- fit the SAME model with mgcv on the SAME train rows --------------
+    let r = run_r(
+        &[
+            Column::new("range_train", &range_train),
+            Column::new("logratio_train", &logratio_train),
+            Column::new("range_test", &range_test),
+        ],
+        r#"
+        suppressPackageStartupMessages(library(mgcv))
+        tr <- data.frame(range = range_train, logratio = logratio_train)
+        te <- data.frame(range = range_test)
+        m <- gam(logratio ~ s(range, bs = "ps", k = 15, m = c(2, 2)), data = tr, method = "REML")
+        emit("test_pred", as.numeric(predict(m, newdata = te)))
+        emit("train_fit", as.numeric(fitted(m)))
+        emit("edf", sum(m$edf))
+        "#,
+    );
+    let mgcv_test_pred = r.vector("test_pred");
+    let mgcv_train_fit = r.vector("train_fit");
+    let mgcv_edf = r.scalar("edf");
+    assert_eq!(
+        mgcv_test_pred.len(),
+        n_test,
+        "mgcv held-out prediction length mismatch"
+    );
+    assert_eq!(
+        mgcv_train_fit.len(),
+        n_train,
+        "mgcv training-fit length mismatch"
+    );
+
+    // ---- objective held-out metrics on gam's OWN predictions --------------
+    let gam_test_r2 = r2(&gam_test_pred, &logratio_test);
+    let gam_test_rmse = rmse_pair(&gam_test_pred, &logratio_test);
+    let mgcv_test_rmse = rmse_pair(mgcv_test_pred, &logratio_test);
+
+    // Context only (NOT a pass criterion).
+    let train_rel = relative_l2(&gam_train_fit, mgcv_train_fit);
+    let test_rel = relative_l2(&gam_test_pred, mgcv_test_pred);
+    eprintln!(
+        "lidar(every-4th) s(range, bs='ps', k=15) held-out: n_train={n_train} n_test={n_test} \
+         gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} \
+         gam_test_R2={gam_test_r2:.4} gam_test_rmse={gam_test_rmse:.4} \
+         mgcv_test_rmse={mgcv_test_rmse:.4} train_rel_l2={train_rel:.4} test_rel_l2={test_rel:.4}"
+    );
+
+    // ---- assertions: OBJECTIVE predictive quality -------------------------
+    // (1) ABSOLUTE held-out accuracy bar (tool-free): RMSE within the lidar
+    //     noise floor. A flat-mean predictor scores ~0.18, so <= 0.08 is a
+    //     strong, real generalization claim.
+    assert!(
+        gam_test_rmse <= 0.08,
+        "gam held-out RMSE {gam_test_rmse:.4} exceeds the absolute lidar accuracy bar (0.08)"
+    );
+    // (2) generalization floor on explained held-out variance.
+    assert!(
+        gam_test_r2 >= 0.55,
+        "gam p-spline does not generalize on held-out lidar: test R^2 = {gam_test_r2:.4} (need >= 0.55)"
+    );
+    // (3) MATCH-OR-BEAT the mature baseline on out-of-sample RMSE.
+    assert!(
+        gam_test_rmse <= mgcv_test_rmse * 1.10,
+        "gam held-out RMSE {gam_test_rmse:.4} exceeds mgcv {mgcv_test_rmse:.4} by > 10%"
+    );
+    // (4) sane complexity (NOT edf-matching).
+    assert!(
+        gam_edf > 1.0 && gam_edf < 15.0,
+        "gam effective complexity out of range: edf = {gam_edf:.3} (expected 1 < edf < 15)"
+    );
+}

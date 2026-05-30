@@ -46,9 +46,11 @@ use gam::solver::estimate::BlockRole;
 use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+    load_csvwith_inferred_schema,
 };
 use ndarray::{Array1, Array2};
 use std::f64::consts::PI;
+use std::path::Path;
 
 /// True mean function on the circle.
 fn true_mu(x: f64) -> f64 {
@@ -291,5 +293,307 @@ fn gam_cyclic_location_scale_recovers_truth() {
         gam_log_sigma_rmse <= 1.10 * gamlss_log_sigma_rmse,
         "gam log-sigma recovery worse than gamlss: gam={gam_log_sigma_rmse:.4} > 1.10*gamlss={:.4}",
         gamlss_log_sigma_rmse
+    );
+}
+
+// ===========================================================================
+// REAL-DATA ARM
+// ===========================================================================
+//
+// Same gam capability (Gaussian location-scale with a CYCLIC smooth in BOTH
+// the mean mu(month) and the log-scale log sigma(month)) exercised on a real,
+// strongly periodic, heteroscedastic series. On real data the truth is
+// unknown, so the assertions are OUT-OF-SAMPLE predictive quality, not
+// truth recovery.
+//
+// Dataset SOURCE: `nottem` — average monthly air temperatures (deg F) at
+// Nottingham Castle, Jan 1920 .. Dec 1939, 240 observations. Shipped with base
+// R's `datasets` package (`datasets::nottem`); the classic seasonal-decomposition
+// teaching series (Anderson 1976, "Time Series Analysis and Forecasting").
+// Vendored here as bench/datasets/nottem_monthly_temp.csv with columns
+// year, month (1..12), temp.
+//
+// The seasonal mean cycle is very strong (summer ~60F, winter ~38F) and the
+// month-to-month spread is itself seasonal (mild months vary more than the
+// settled deep-winter / mid-summer months), so month -> temp is a textbook
+// periodic, heteroscedastic location-scale problem. Because month is circular
+// (December 12 abuts January 1) the natural smooth is cyclic with the periodic
+// boundary halfway outside the 1..12 integer grid, i.e. the period spans
+// [0.5, 12.5].
+
+/// Per-point Gaussian negative log-likelihood of held-out observations under a
+/// predicted (mean, sigma) for each row: the natural objective score for a
+/// heteroscedastic location-scale predictor (it rewards calibrated sigma, not
+/// just an accurate mean). Lower is better.
+fn gaussian_nll(mean: &[f64], sigma: &[f64], truth: &[f64]) -> f64 {
+    assert_eq!(mean.len(), truth.len(), "nll mean/truth length mismatch");
+    assert_eq!(sigma.len(), truth.len(), "nll sigma/truth length mismatch");
+    let half_log_2pi = 0.5 * (2.0 * PI).ln();
+    let n = truth.len() as f64;
+    let total: f64 = mean
+        .iter()
+        .zip(sigma.iter())
+        .zip(truth.iter())
+        .map(|((&m, &s), &y)| {
+            assert!(s > 0.0, "predicted sigma must be positive, got {s}");
+            let z = (y - m) / s;
+            half_log_2pi + s.ln() + 0.5 * z * z
+        })
+        .sum();
+    total / n
+}
+
+/// Coefficient of determination of `pred` vs observed `truth`, mean baseline.
+fn held_out_r2(pred: &[f64], truth: &[f64]) -> f64 {
+    assert_eq!(pred.len(), truth.len(), "r2 length mismatch");
+    let n = truth.len() as f64;
+    let mean = truth.iter().sum::<f64>() / n;
+    let ss_res: f64 = pred.iter().zip(truth).map(|(p, t)| (t - p) * (t - p)).sum();
+    let ss_tot: f64 = truth.iter().map(|t| (t - mean) * (t - mean)).sum();
+    1.0 - ss_res / ss_tot.max(1e-300)
+}
+
+/// Population standard deviation (divide by n), replicating gam's fit-time
+/// `response_scale = sample_std(y).max(1e-6)` so the test reconstructs sigma
+/// and the rescaled mean in response (deg F) units exactly as the saved model
+/// would. Defined inline because `sample_std` is private to the binary crate.
+fn population_std(v: &[f64]) -> f64 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    let n = v.len() as f64;
+    let mean = v.iter().sum::<f64>() / n;
+    let var = v.iter().map(|&x| (x - mean) * (x - mean)).sum::<f64>() / n.max(1.0);
+    var.max(0.0).sqrt()
+}
+
+/// Right-pad `v` with its last value (or 0.0 when empty) to length `len`, so a
+/// short test column can ride along inside the equal-length reference
+/// data.frame. Only the first `v.len()` entries are read back in the R body.
+fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
+    assert!(
+        v.len() <= len,
+        "pad target {len} shorter than source {}",
+        v.len()
+    );
+    let fill = v.last().copied().unwrap_or(0.0);
+    let mut out = v.to_vec();
+    out.resize(len, fill);
+    out
+}
+
+#[test]
+fn gam_cyclic_location_scale_recovers_truth_on_real_data() {
+    init_parallelism();
+
+    // ---- load the real Nottingham monthly-temperature series --------------
+    const NOTTEM_CSV: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/bench/datasets/nottem_monthly_temp.csv"
+    );
+    let ds = load_csvwith_inferred_schema(Path::new(NOTTEM_CSV)).expect("load nottem_monthly_temp.csv");
+    let col = ds.column_map();
+    let month_idx = col["month"];
+    let temp_idx = col["temp"];
+    let month: Vec<f64> = ds.values.column(month_idx).to_vec();
+    let temp: Vec<f64> = ds.values.column(temp_idx).to_vec();
+    let n = month.len();
+    assert!(n > 200, "nottem should have 240 rows, got {n}");
+
+    // ---- deterministic train/test split: every 5th row held out ----------
+    // Months 1..12 cycle every 12 rows, so stride 5 keeps all 12 months in
+    // both folds (5 and 12 are coprime).
+    let is_test = |i: usize| i % 5 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    assert!(
+        train_rows.len() > 150 && test_rows.len() > 40,
+        "split sizes: train={} test={}",
+        train_rows.len(),
+        test_rows.len()
+    );
+
+    let train_month: Vec<f64> = train_rows.iter().map(|&i| month[i]).collect();
+    let train_temp: Vec<f64> = train_rows.iter().map(|&i| temp[i]).collect();
+    let test_month: Vec<f64> = test_rows.iter().map(|&i| month[i]).collect();
+    let test_temp: Vec<f64> = test_rows.iter().map(|&i| temp[i]).collect();
+
+    // Build a training-only dataset by sub-setting the encoded rows; headers,
+    // schema and column kinds are unchanged, so the formula resolves identically.
+    let p = ds.headers.len();
+    let mut train_values = Array2::<f64>::zeros((train_rows.len(), p));
+    for (out_row, &src_row) in train_rows.iter().enumerate() {
+        for c in 0..p {
+            train_values[[out_row, c]] = ds.values[[src_row, c]];
+        }
+    }
+    let mut train_ds = ds.clone();
+    train_ds.values = train_values;
+
+    // ---- fit gam on TRAIN: Gaussian location-scale, cyclic in BOTH blocks --
+    // Period pinned to [0.5, 12.5] so the cyclic boundary lands halfway between
+    // December (12) and January (1) — the natural seam of a monthly calendar —
+    // and matches the `knots = c(0.5, 12.5)` we hand mgcv inside gamlss below.
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        noise_formula: Some("1 + s(month, bs='cc', period_start=0.5, period_end=12.5)".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula(
+        "temp ~ s(month, bs='cc', period_start=0.5, period_end=12.5)",
+        &train_ds,
+        &cfg,
+    )
+    .expect("gam cyclic location-scale fit on nottem");
+    let FitResult::GaussianLocationScale(fit) = result else {
+        panic!("expected a GaussianLocationScale fit for a Gaussian noise_formula model");
+    };
+
+    let beta_mu = fit
+        .fit
+        .fit
+        .block_by_role(BlockRole::Location)
+        .expect("location-scale fit carries a Location (mu) block")
+        .beta
+        .clone();
+    let beta_noise = fit
+        .fit
+        .fit
+        .block_by_role(BlockRole::Scale)
+        .expect("location-scale fit carries a Scale (log-sigma) block")
+        .beta
+        .clone();
+    assert!(
+        beta_noise.len() >= 2,
+        "cyclic noise_formula must materialize a multi-coefficient scale basis, got {}",
+        beta_noise.len()
+    );
+
+    // gam stores its blockwise betas in INTERNAL units (it fits y / response_scale
+    // with response_scale = sample_std(y_train)). Reconstruct response-unit
+    // predictions exactly as the saved model does:
+    //   mu_response    = (X_mu @ beta_mu) * response_scale          (Location scaled)
+    //   sigma_response = logb_sigma(X_noise @ beta_noise) * response_scale
+    let response_scale = population_std(&train_temp).max(1e-6);
+
+    // ---- gam predictions at the HELD-OUT months ---------------------------
+    let mut test_grid = Array2::<f64>::zeros((test_rows.len(), p));
+    for (i, &mo) in test_month.iter().enumerate() {
+        test_grid[[i, month_idx]] = mo;
+    }
+    let mean_design = build_term_collection_design(test_grid.view(), &fit.fit.meanspec_resolved)
+        .expect("rebuild mean design at held-out months");
+    let noise_design = build_term_collection_design(test_grid.view(), &fit.fit.noisespec_resolved)
+        .expect("rebuild noise design at held-out months");
+    assert_eq!(
+        mean_design.design.ncols(),
+        beta_mu.len(),
+        "mean design columns must match mu coefficient count"
+    );
+    assert_eq!(
+        noise_design.design.ncols(),
+        beta_noise.len(),
+        "noise design columns must match log-sigma coefficient count"
+    );
+
+    let gam_test_mean: Vec<f64> = mean_design
+        .design
+        .apply(&beta_mu)
+        .iter()
+        .map(|&m| m * response_scale)
+        .collect();
+    let eta_noise: Array1<f64> = noise_design.design.apply(&beta_noise);
+    let gam_test_sigma: Vec<f64> = eta_noise
+        .iter()
+        .map(|&e| logb_sigma_from_eta_scalar(e) * response_scale)
+        .collect();
+
+    // ---- fit the SAME model on TRAIN with gamlss, predict the SAME TEST ----
+    // family = NO() (normal, identity mu, log sigma); mu and sigma each get a
+    // cyclic cubic smooth via mgcv's ga(~ s(month, bs="cc")), cyclic knots pinned
+    // to [0.5, 12.5] to match gam's explicit period. We pass the training rows
+    // plus the held-out months padded into a parallel column (the harness exposes
+    // one equal-length data.frame per call) and predict on the first `test_n`.
+    let r = run_r(
+        &[
+            Column::new("month", &train_month),
+            Column::new("temp", &train_temp),
+            Column::new("test_month", &pad_to(&test_month, train_month.len())),
+            Column::new("test_n", &vec![test_month.len() as f64; train_month.len()]),
+        ],
+        r#"
+        suppressPackageStartupMessages(library(gamlss))
+        suppressPackageStartupMessages(library(gamlss.add))
+        kn <- list(month = c(0.5, 12.5))
+        m <- gamlss(
+            temp ~ ga(~ s(month, bs = "cc"), control = list(knots = kn)),
+            sigma.formula = ~ ga(~ s(month, bs = "cc"), control = list(knots = kn)),
+            family = NO(),
+            control = gamlss.control(n.cyc = 200, trace = FALSE)
+        )
+        k <- df$test_n[1]
+        nd <- data.frame(month = df$test_month[1:k])
+        mu <- as.numeric(predict(m, what = "mu", newdata = nd, type = "response", data = df))
+        ls <- as.numeric(predict(m, what = "sigma", newdata = nd, type = "link", data = df))
+        emit("mu", mu)
+        emit("log_sigma", ls)
+        "#,
+    );
+    let gamlss_mean = r.vector("mu").to_vec();
+    // NO() uses a log link on sigma, so the link-scale sigma predictor is exactly
+    // log(sigma): exponentiate to get gamlss's held-out response-unit sigma.
+    let gamlss_sigma: Vec<f64> = r.vector("log_sigma").iter().map(|&v| v.exp()).collect();
+    assert_eq!(gamlss_mean.len(), test_rows.len(), "gamlss mu length mismatch");
+    assert_eq!(gamlss_sigma.len(), test_rows.len(), "gamlss sigma length mismatch");
+
+    // ---- objective held-out metrics ---------------------------------------
+    let gam_nll = gaussian_nll(&gam_test_mean, &gam_test_sigma, &test_temp);
+    let gamlss_nll = gaussian_nll(&gamlss_mean, &gamlss_sigma, &test_temp);
+    let gam_r2 = held_out_r2(&gam_test_mean, &test_temp);
+
+    // Context-only diagnostic: gam-vs-gamlss agreement of the held-out mean and
+    // sigma curves. NOT a pass criterion.
+    let mean_rel = relative_l2(&gam_test_mean, &gamlss_mean);
+    let sigma_rel = relative_l2(&gam_test_sigma, &gamlss_sigma);
+
+    eprintln!(
+        "nottem cyclic location-scale held-out: n_train={} n_test={} \
+         response_scale={response_scale:.4} gam_nll={gam_nll:.4} gamlss_nll={gamlss_nll:.4} \
+         gam_test_R2={gam_r2:.4} (context: mean_rel_l2={mean_rel:.4} sigma_rel_l2={sigma_rel:.4}) \
+         beta_mu={} beta_sigma={}",
+        train_rows.len(),
+        test_rows.len(),
+        beta_mu.len(),
+        beta_noise.len(),
+    );
+
+    // ---- PRIMARY (objective, tool-free): calibrated held-out density -------
+    // The held-out per-point Gaussian NLL scores BOTH the mean and the sigma
+    // calibration. A competent location-scale fit of this series resolves the
+    // seasonal mean to a few deg F and predicts a residual spread of ~2..4 F,
+    // giving NLL ~ 0.5*log(2*pi) + log(sigma) + 0.5 ~ 2.3. We require NLL <= 3.2:
+    // comfortably below the homoscedastic constant-mean baseline (sd(temp) ~ 8 F
+    // => NLL ~ 0.5*log(2*pi) + log(8) + 0.5 ~ 3.5) while leaving ample headroom.
+    assert!(
+        gam_nll <= 3.2,
+        "gam held-out Gaussian NLL too high: {gam_nll:.4} (> 3.2)"
+    );
+
+    // ---- PRIMARY (objective): the cyclic mean explains held-out variance ---
+    // The seasonal cycle is overwhelmingly strong, so a faithful cyclic mean
+    // smooth explains the vast majority of held-out variance.
+    assert!(
+        gam_r2 >= 0.90,
+        "gam held-out mean R2 too low: {gam_r2:.4} (< 0.90)"
+    );
+
+    // ---- BASELINE (match-or-beat): no worse than gamlss on held-out NLL ----
+    // gamlss is the mature distributional-regression baseline fed the IDENTICAL
+    // train/test rows and the SAME cyclic basis; NLL is a log-scale score, so an
+    // additive 0.10-nat slack is the principled match-or-beat margin (gamlss is a
+    // floor to match-or-beat on predictive density, never a fit to reproduce).
+    assert!(
+        gam_nll <= gamlss_nll + 0.10,
+        "gam held-out NLL {gam_nll:.4} worse than gamlss {gamlss_nll:.4} + 0.10"
     );
 }

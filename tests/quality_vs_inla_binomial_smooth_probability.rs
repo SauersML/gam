@@ -54,6 +54,7 @@ use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+    load_csvwith_inferred_schema,
 };
 use ndarray::Array2;
 use rand::SeedableRng;
@@ -62,6 +63,7 @@ use rand_distr::{Distribution, Uniform};
 use std::path::Path;
 
 const HABERMAN_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/haberman.csv");
+const PROSTATE_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/prostate.csv");
 
 fn invlogit(eta: f64) -> f64 {
     1.0 / (1.0 + (-eta).exp())
@@ -307,5 +309,277 @@ fn gam_binomial_smooth_recovers_true_probability() {
         coverage >= 0.80,
         "gam's +/-2SD probability band under-covers the true curve: \
          coverage={coverage:.3} (floor 0.80)"
+    );
+}
+
+/// Area under the ROC curve for predicted probabilities `prob` against binary
+/// labels `y` (1.0 = positive). Computed via the rank-sum (Mann-Whitney U)
+/// identity with explicit tie handling: AUC = (sum of ranks of positives -
+/// n_pos*(n_pos+1)/2) / (n_pos*n_neg), using average ranks for tied scores.
+/// AUC = 1.0 is perfect ranking, 0.5 is chance.
+fn auc(prob: &[f64], y: &[f64]) -> f64 {
+    assert_eq!(prob.len(), y.len(), "auc length mismatch");
+    let n = prob.len();
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.sort_by(|&a, &b| prob[a].partial_cmp(&prob[b]).expect("auc: NaN probability"));
+    // Assign average ranks (1-based) to handle ties in the score.
+    let mut ranks = vec![0.0_f64; n];
+    let mut i = 0usize;
+    while i < n {
+        let mut j = i + 1;
+        while j < n && prob[idx[j]] == prob[idx[i]] {
+            j += 1;
+        }
+        // ranks i..j (0-based positions) share the average rank.
+        let avg = ((i + 1) + j) as f64 / 2.0; // mean of 1-based ranks i+1..=j
+        for k in i..j {
+            ranks[idx[k]] = avg;
+        }
+        i = j;
+    }
+    let mut sum_rank_pos = 0.0;
+    let mut n_pos = 0.0;
+    for r in 0..n {
+        if y[r] > 0.5 {
+            sum_rank_pos += ranks[r];
+            n_pos += 1.0;
+        }
+    }
+    let n_neg = n as f64 - n_pos;
+    assert!(
+        n_pos > 0.0 && n_neg > 0.0,
+        "auc needs both classes present"
+    );
+    (sum_rank_pos - n_pos * (n_pos + 1.0) / 2.0) / (n_pos * n_neg)
+}
+
+/// Mean binary cross-entropy (log-loss) of predicted probabilities against
+/// labels, with probabilities clamped away from {0,1} so a confidently-wrong
+/// point cannot produce an infinite penalty. Lower is better.
+fn log_loss(prob: &[f64], y: &[f64]) -> f64 {
+    assert_eq!(prob.len(), y.len(), "log_loss length mismatch");
+    const EPS: f64 = 1e-12;
+    let mut acc = 0.0;
+    for (p, t) in prob.iter().zip(y) {
+        let pc = p.clamp(EPS, 1.0 - EPS);
+        acc += -(t * pc.ln() + (1.0 - t) * (1.0 - pc).ln());
+    }
+    acc / prob.len() as f64
+}
+
+/// REAL-DATA ARM (truth unknown => objective held-out metric, no curve to
+/// recover). The synthetic test above proves gam recovers a KNOWN latent
+/// probability; this companion proves the SAME binomial penalized-smooth
+/// capability generalizes out-of-sample on a real classification dataset, with
+/// R-INLA as the mature match-or-beat baseline (never a target to reproduce).
+///
+/// Data. `bench/datasets/prostate.csv` (n = 654): two principal-component
+/// covariates `pc1`, `pc2` and a balanced binary outcome `y` (318 zeros / 336
+/// ones). Source: the prostate-cancer genotype PCA benchmark shipped in
+/// `bench/datasets/` for gam's classification suite.
+///
+/// Protocol. Deterministic split (every 4th row held out), fit
+/// `y ~ s(pc1) + s(pc2)` binomial/logit by REML on the training rows only,
+/// predict the held-out rows on the probability scale, and assert OBJECTIVE
+/// held-out metrics computed in plain Rust:
+///   PRIMARY (tool-free): held-out AUC >= 0.80 — the additive smooth genuinely
+///     separates the classes well above chance (0.5).
+///   BASELINE (match-or-beat): R-INLA fits the SAME training rows (rw2 smooths
+///     of pc1, pc2) and predicts the SAME held-out rows; gam's held-out log-loss
+///     must be no worse than `inla_test_logloss + 0.02` (a small absolute margin
+///     on mean cross-entropy).
+/// The identical train/test rows in identical order go to BOTH engines via an
+/// `is_train` mask column, so there is zero data-split skew.
+#[test]
+fn gam_binomial_smooth_recovers_true_probability_on_real_data() {
+    init_parallelism();
+
+    // ---- load the real prostate classification dataset --------------------
+    let ds = load_csvwith_inferred_schema(Path::new(PROSTATE_CSV)).expect("load prostate.csv");
+    let col = ds.column_map();
+    let pc1_idx = col["pc1"];
+    let pc2_idx = col["pc2"];
+    let y_idx = col["y"];
+    let pc1: Vec<f64> = ds.values.column(pc1_idx).to_vec();
+    let pc2: Vec<f64> = ds.values.column(pc2_idx).to_vec();
+    let yall: Vec<f64> = ds.values.column(y_idx).to_vec();
+    let n = pc1.len();
+    assert!(n > 500, "prostate should have ~654 rows, got {n}");
+    let pos: usize = yall.iter().filter(|&&v| v > 0.5).count();
+    assert!(
+        pos > 200 && pos < n - 200,
+        "prostate response degenerate: {pos}/{n} positive"
+    );
+
+    // ---- deterministic train/test split: every 4th row held out ----------
+    let is_test = |i: usize| i % 4 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    assert!(
+        train_rows.len() > 400 && test_rows.len() > 100,
+        "split sizes: train={} test={}",
+        train_rows.len(),
+        test_rows.len()
+    );
+    // Both classes must survive in each split or AUC/log-loss are ill-posed.
+    let train_pos = train_rows.iter().filter(|&&i| yall[i] > 0.5).count();
+    let test_pos = test_rows.iter().filter(|&&i| yall[i] > 0.5).count();
+    assert!(
+        train_pos > 50 && train_pos < train_rows.len() - 50,
+        "train split single-class: {train_pos}/{}",
+        train_rows.len()
+    );
+    assert!(
+        test_pos > 20 && test_pos < test_rows.len() - 20,
+        "test split single-class: {test_pos}/{}",
+        test_rows.len()
+    );
+
+    let test_y: Vec<f64> = test_rows.iter().map(|&i| yall[i]).collect();
+
+    // Training-only dataset: sub-set the encoded rows (headers/schema/kinds
+    // unchanged, so the formula resolves identically).
+    let p = ds.headers.len();
+    let mut train_values = Array2::<f64>::zeros((train_rows.len(), p));
+    for (out_row, &src_row) in train_rows.iter().enumerate() {
+        for c in 0..p {
+            train_values[[out_row, c]] = ds.values[[src_row, c]];
+        }
+    }
+    let mut train_ds = ds.clone();
+    train_ds.values = train_values;
+
+    // ---- fit gam on TRAIN: y ~ s(pc1) + s(pc2), binomial/logit, REML ------
+    let cfg = FitConfig {
+        family: Some("binomial".to_string()),
+        link: Some("logit".to_string()),
+        ..FitConfig::default()
+    };
+    let result =
+        fit_from_formula("y ~ s(pc1) + s(pc2)", &train_ds, &cfg).expect("gam binomial 2-smooth fit");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected a standard GAM fit for binomial/logit s(pc1)+s(pc2)");
+    };
+    let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
+
+    // gam predicted probabilities at held-out points: rebuild the frozen design
+    // at the test covariates; with the logit link, design*beta IS eta.
+    let mut test_grid = Array2::<f64>::zeros((test_rows.len(), p));
+    for (i, &src_row) in test_rows.iter().enumerate() {
+        test_grid[[i, pc1_idx]] = pc1[src_row];
+        test_grid[[i, pc2_idx]] = pc2[src_row];
+    }
+    let test_design = build_term_collection_design(test_grid.view(), &fit.resolvedspec)
+        .expect("rebuild s(pc1)+s(pc2) design at held-out points");
+    let gam_test_eta = test_design.design.apply(&fit.fit.beta);
+    assert_eq!(gam_test_eta.len(), test_rows.len(), "gam eta length mismatch");
+    let gam_test_prob: Vec<f64> = gam_test_eta.iter().map(|&e| invlogit(e)).collect();
+
+    // ---- fit the SAME train rows with R-INLA, predict the SAME test rows ---
+    // One data.frame carries every row (train + test) in identical order with an
+    // is_train {0,1} mask; INLA's likelihood sees only the training response
+    // (test y set to NA), and control.predictor returns the posterior fitted
+    // probability for the held-out rows. rw2 needs an integer node index per
+    // covariate, built on the pooled sorted-unique grid so train and test land on
+    // a common smooth. INLA is the incumbent baseline scored on the SAME metric.
+    let pc1_all: Vec<f64> = train_rows
+        .iter()
+        .chain(test_rows.iter())
+        .map(|&i| pc1[i])
+        .collect();
+    let pc2_all: Vec<f64> = train_rows
+        .iter()
+        .chain(test_rows.iter())
+        .map(|&i| pc2[i])
+        .collect();
+    // Response with test entries blanked to NA (encoded as a sentinel; the R body
+    // restores NA from the mask) and the train/test mask, all same length.
+    let y_train_or_zero: Vec<f64> = train_rows
+        .iter()
+        .map(|&i| yall[i])
+        .chain(test_rows.iter().map(|_| 0.0))
+        .collect();
+    let is_train: Vec<f64> = train_rows
+        .iter()
+        .map(|_| 1.0)
+        .chain(test_rows.iter().map(|_| 0.0))
+        .collect();
+    let m = pc1_all.len();
+    assert_eq!(m, train_rows.len() + test_rows.len(), "pooled length mismatch");
+
+    let r = run_r(
+        &[
+            Column::new("pc1", &pc1_all),
+            Column::new("pc2", &pc2_all),
+            Column::new("yraw", &y_train_or_zero),
+            Column::new("is_train", &is_train),
+        ],
+        r#"
+        suppressPackageStartupMessages(library(INLA))
+        # Blank the held-out response so INLA's likelihood uses only training rows
+        # while still producing posterior fitted probabilities for the test rows.
+        df$y <- ifelse(df$is_train > 0.5, df$yraw, NA)
+        # rw2 smooths need an integer node index per covariate on a common grid
+        # spanning train+test, so held-out points sit on the same fitted curve.
+        df$i1 <- as.integer(factor(df$pc1, levels = sort(unique(df$pc1))))
+        df$i2 <- as.integer(factor(df$pc2, levels = sort(unique(df$pc2))))
+        m <- inla(
+            y ~ -1 + f(i1, model = "rw2", scale.model = TRUE, constr = TRUE)
+                   + f(i2, model = "rw2", scale.model = TRUE, constr = TRUE) + 1,
+            family = "binomial",
+            data = df,
+            Ntrials = rep(1, nrow(df)),
+            control.predictor = list(compute = TRUE, link = 1),
+            control.compute = list(config = TRUE)
+        )
+        fv <- m$summary.fitted.values$mean[seq_len(nrow(df))]
+        emit("test_prob", as.numeric(fv[df$is_train < 0.5]))
+        "#,
+    );
+    let inla_test_prob = r.vector("test_prob");
+    assert_eq!(
+        inla_test_prob.len(),
+        test_rows.len(),
+        "INLA held-out probability length mismatch"
+    );
+
+    // ---- objective held-out metrics (plain Rust) --------------------------
+    let gam_auc = auc(&gam_test_prob, &test_y);
+    let gam_logloss = log_loss(&gam_test_prob, &test_y);
+    let inla_logloss = log_loss(inla_test_prob, &test_y);
+
+    // Context only (NOT a pass criterion): closeness of the two probability fits.
+    let rel_vs_inla = relative_l2(&gam_test_prob, inla_test_prob);
+
+    eprintln!(
+        "prostate s(pc1)+s(pc2) binomial/logit held-out: n_train={} n_test={} \
+         gam_edf={gam_edf:.3}\n  \
+         gam_test_AUC={gam_auc:.4}  log-loss: gam={gam_logloss:.4} inla={inla_logloss:.4}  \
+         [context only] rel_l2(gam,inla)={rel_vs_inla:.4}",
+        train_rows.len(),
+        test_rows.len(),
+    );
+
+    // ---- PRIMARY objective assertion: gam separates the held-out classes ---
+    // pc1/pc2 carry real class signal; a competent additive smooth ranks
+    // held-out positives above negatives far better than chance. AUC >= 0.80 is
+    // well above 0.5 and would catch an under/over-smoothed or mis-linked fit.
+    assert!(
+        gam_auc >= 0.80,
+        "gam's held-out AUC too low: {gam_auc:.4} (< 0.80)"
+    );
+
+    // ---- BASELINE (match-or-beat): no worse than INLA on held-out log-loss --
+    // gam may not be meaningfully less calibrated than the incumbent on the same
+    // held-out rows; a 0.02-nat absolute slack absorbs benign approximation gaps.
+    assert!(
+        gam_logloss <= inla_logloss + 0.02,
+        "gam held-out log-loss {gam_logloss:.4} exceeds INLA {inla_logloss:.4} + 0.02"
+    );
+
+    // ---- complexity sanity: edf in a signal-appropriate range (not matched) -
+    assert!(
+        gam_edf > 1.0 && gam_edf < 40.0,
+        "gam effective dof out of sane range: {gam_edf:.3}"
     );
 }

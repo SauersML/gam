@@ -34,12 +34,21 @@ use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+    load_csvwith_inferred_schema,
 };
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Poisson, Uniform};
 use std::f64::consts::PI;
+use std::path::Path;
+
+// Real-data source: the `badhealth` dataset from the R `COUNT` package
+// (Hilbe, J.M., "Negative Binomial Regression", 2nd ed., Cambridge Univ. Press,
+// 2011). 1127 German health-survey respondents; `numvisit` is the number of
+// physician visits, `badh` a self-rated bad-health indicator (0/1), `age` in
+// years. Vendored at bench/datasets/badhealth.csv.
+const BADHEALTH_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/badhealth.csv");
 
 #[test]
 fn gam_poisson_2d_recovers_true_log_mean_surface() {
@@ -233,4 +242,197 @@ emit("te_edf", [float(ten.statistics_["edof"])])
         gam_te_edf > 1.0 && gam_te_edf < 36.0,
         "tensor edf outside the signal-appropriate range (1, 36): {gam_te_edf:.3}"
     );
+}
+
+/// Mean Poisson (unit) deviance of predicted means `mu` against observed counts
+/// `y`: `(2/n) * sum[ y*log(y/mu) - (y - mu) ]` (the `y*log(y/mu)` term is taken
+/// as 0 when `y == 0`). This is the natural held-out goodness-of-fit metric for
+/// count data — the Poisson analog of RMSE — and is computed in plain Rust so it
+/// is identical for gam and the reference. Smaller is better.
+fn poisson_mean_deviance(mu: &[f64], y: &[f64]) -> f64 {
+    assert_eq!(mu.len(), y.len(), "poisson_mean_deviance length mismatch");
+    let n = y.len() as f64;
+    let mut s = 0.0;
+    for (&m, &yi) in mu.iter().zip(y) {
+        let m = m.max(1e-12);
+        let term = if yi > 0.0 { yi * (yi / m).ln() } else { 0.0 };
+        s += term - (yi - m);
+    }
+    2.0 * s / n.max(1.0)
+}
+
+/// Real-data arm of the 2-D Poisson smooth-shape capability. The `badhealth`
+/// survey (real counts of physician visits) has no known truth, so we assert
+/// OBJECTIVE held-out predictive quality of a 2-D `te(age, badh)` Poisson smooth:
+///
+///   PRIMARY (objective, tool-free): held-out mean Poisson deviance must sit
+///     below the deviance of the intercept-only (training-mean) predictor — the
+///     2-D smooth genuinely improves count prediction on unseen rows.
+///
+///   BASELINE (match-or-beat): pyGAM's PoissonGAM(te(0,1)) is fit on the IDENTICAL
+///     training rows and predicts the IDENTICAL held-out rows; gam's held-out
+///     deviance must be no worse than pyGAM's by more than 10%. pyGAM is a
+///     yardstick on the SAME metric, never a fit to reproduce.
+#[test]
+fn gam_poisson_2d_recovers_true_log_mean_surface_on_real_data() {
+    init_parallelism();
+
+    // ---- load badhealth (age, badh -> numvisit count) ----------------------
+    let ds = load_csvwith_inferred_schema(Path::new(BADHEALTH_CSV)).expect("load badhealth.csv");
+    let col = ds.column_map();
+    let age_idx = col["age"];
+    let badh_idx = col["badh"];
+    let numvisit_idx = col["numvisit"];
+    let age: Vec<f64> = ds.values.column(age_idx).to_vec();
+    let badh: Vec<f64> = ds.values.column(badh_idx).to_vec();
+    let numvisit: Vec<f64> = ds.values.column(numvisit_idx).to_vec();
+    let n = age.len();
+    assert!(n > 1000, "badhealth should have ~1127 rows, got {n}");
+
+    // ---- deterministic train/test split: every 4th row is held out ---------
+    let is_test = |i: usize| i % 4 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    assert!(
+        train_rows.len() > 700 && test_rows.len() > 250,
+        "split sizes: train={} test={}",
+        train_rows.len(),
+        test_rows.len()
+    );
+
+    let train_age: Vec<f64> = train_rows.iter().map(|&i| age[i]).collect();
+    let train_badh: Vec<f64> = train_rows.iter().map(|&i| badh[i]).collect();
+    let train_numvisit: Vec<f64> = train_rows.iter().map(|&i| numvisit[i]).collect();
+    let test_age: Vec<f64> = test_rows.iter().map(|&i| age[i]).collect();
+    let test_badh: Vec<f64> = test_rows.iter().map(|&i| badh[i]).collect();
+    let test_numvisit: Vec<f64> = test_rows.iter().map(|&i| numvisit[i]).collect();
+
+    // Training-only dataset by row-subsetting the encoded values; headers,
+    // schema and column kinds are unchanged, so the formula resolves identically.
+    let p = ds.headers.len();
+    let mut train_values = Array2::<f64>::zeros((train_rows.len(), p));
+    for (out_row, &src_row) in train_rows.iter().enumerate() {
+        for c in 0..p {
+            train_values[[out_row, c]] = ds.values[[src_row, c]];
+        }
+    }
+    let mut train_ds = ds.clone();
+    train_ds.values = train_values;
+
+    // ---- fit gam on TRAIN: numvisit ~ te(age, badh), Poisson/log, REML -----
+    let cfg = FitConfig {
+        family: Some("poisson".to_string()),
+        ..FitConfig::default()
+    };
+    let result =
+        fit_from_formula("numvisit ~ te(age, badh)", &train_ds, &cfg).expect("gam poisson te fit");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected a standard GAM fit for the 2-D Poisson real-data model");
+    };
+    let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
+
+    // gam predictions at held-out (age, badh): rebuild the frozen design and
+    // apply exp() to the linear predictor (log link => mu = exp(design*beta)).
+    let mut test_grid = Array2::<f64>::zeros((test_rows.len(), p));
+    for i in 0..test_rows.len() {
+        test_grid[[i, age_idx]] = test_age[i];
+        test_grid[[i, badh_idx]] = test_badh[i];
+    }
+    let test_design = build_term_collection_design(test_grid.view(), &fit.resolvedspec)
+        .expect("rebuild design at held-out points");
+    let gam_test_eta: Vec<f64> = test_design.design.apply(&fit.fit.beta).to_vec();
+    let gam_test_mu: Vec<f64> = gam_test_eta.iter().map(|e| e.exp()).collect();
+
+    // ---- fit the SAME model on TRAIN with pyGAM, predict the SAME TEST ------
+    // One run_python call exposes ONE equal-length data.frame, so we ride the
+    // test columns alongside the train columns (right-padded to train length)
+    // plus the test count, and read back only the first test_n predictions.
+    let train_len = train_rows.len();
+    let py = run_python(
+        &[
+            Column::new("age", &train_age),
+            Column::new("badh", &train_badh),
+            Column::new("numvisit", &train_numvisit),
+            Column::new("test_age", &pad_to(&test_age, train_len)),
+            Column::new("test_badh", &pad_to(&test_badh, train_len)),
+            Column::new("test_n", &vec![test_rows.len() as f64; train_len]),
+        ],
+        r#"
+from pygam import PoissonGAM, te
+Xtr = np.column_stack([
+    np.asarray(df["age"], dtype=float),
+    np.asarray(df["badh"], dtype=float),
+])
+ytr = np.asarray(df["numvisit"], dtype=float)
+k = int(np.asarray(df["test_n"])[0])
+Xte = np.column_stack([
+    np.asarray(df["test_age"], dtype=float)[:k],
+    np.asarray(df["test_badh"], dtype=float)[:k],
+])
+m = PoissonGAM(te(0, 1)).fit(Xtr, ytr)
+emit("test_mu", np.asarray(m.predict_mu(Xte), dtype=float))
+emit("edf", [float(m.statistics_["edof"])])
+"#,
+    );
+    let pygam_test_mu = py.vector("test_mu");
+    let pygam_edf = py.scalar("edf");
+    assert_eq!(
+        pygam_test_mu.len(),
+        test_rows.len(),
+        "pyGAM held-out prediction length mismatch"
+    );
+
+    // ---- OBJECTIVE held-out metric: mean Poisson deviance ------------------
+    let gam_test_dev = poisson_mean_deviance(&gam_test_mu, &test_numvisit);
+    let pygam_test_dev = poisson_mean_deviance(pygam_test_mu, &test_numvisit);
+
+    // Intercept-only baseline: predict the training mean count for every held-out
+    // row. A useful 2-D smooth must beat this constant predictor.
+    let train_mean = train_numvisit.iter().sum::<f64>() / train_len.max(1) as f64;
+    let null_mu = vec![train_mean; test_rows.len()];
+    let null_test_dev = poisson_mean_deviance(&null_mu, &test_numvisit);
+
+    // Context-only (NOT pass/fail): closeness of gam's vs pyGAM's held-out means.
+    let mu_rel = relative_l2(&gam_test_mu, pygam_test_mu);
+    let mu_corr = pearson(&gam_test_mu, pygam_test_mu);
+
+    eprintln!(
+        "badhealth te(age,badh) held-out: n_train={train_len} n_test={} gam_edf={gam_edf:.3} \
+         pygam_edf={pygam_edf:.3} gam_dev={gam_test_dev:.4} pygam_dev={pygam_test_dev:.4} \
+         null_dev={null_test_dev:.4} [context: rel_l2(gam,pygam)={mu_rel:.4} pearson={mu_corr:.5}]",
+        test_rows.len(),
+    );
+
+    // ---- PRIMARY objective assertion: beat the constant-mean predictor -----
+    assert!(
+        gam_test_dev < null_test_dev,
+        "2-D Poisson smooth does not beat the intercept-only predictor on held-out \
+         deviance: gam_dev={gam_test_dev:.4} >= null_dev={null_test_dev:.4}"
+    );
+
+    // ---- BASELINE (match-or-beat): no worse than pyGAM on held-out deviance -
+    assert!(
+        gam_test_dev <= pygam_test_dev * 1.10,
+        "2-D Poisson: gam's held-out deviance exceeds pyGAM's by >10%: \
+         gam_dev={gam_test_dev:.4} pygam_dev={pygam_test_dev:.4}"
+    );
+
+    // ---- STRUCTURE: edf in a sane, signal-appropriate range (not matched) ---
+    // A real 2-D surface must use more than a flat line (edf > 1) yet far less
+    // than the full tensor basis (~k*k), falsifying a collapsed or saturated fit.
+    assert!(
+        gam_edf > 1.0 && gam_edf < 30.0,
+        "real-data 2-D edf outside the signal-appropriate range (1, 30): {gam_edf:.3}"
+    );
+}
+
+/// Right-pad `v` with its last value (or 0.0 when empty) to length `len`, so the
+/// held-out test columns can ride along in the single reference data.frame; only
+/// the first `v.len()` entries are read back inside the Python body.
+fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
+    assert!(v.len() <= len, "pad target {len} shorter than source {}", v.len());
+    let fill = v.last().copied().unwrap_or(0.0);
+    let mut out = v.to_vec();
+    out.resize(len, fill);
+    out
 }

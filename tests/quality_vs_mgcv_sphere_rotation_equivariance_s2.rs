@@ -43,8 +43,10 @@ use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+    load_csvwith_inferred_schema,
 };
 use ndarray::Array2;
+use std::path::Path;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
@@ -321,4 +323,255 @@ fn gam_sphere_smooth_is_rotation_equivariant_and_recovers_truth() {
         "gam recovers the S² truth worse than the mgcv bs=\"sos\" baseline: \
          gam_rmse={gam_truth_rmse:.4} > 1.10 · mgcv_rmse={mgcv_truth_rmse:.4}"
     );
+}
+
+/// Coefficient of determination of `pred` against observed `truth` relative to
+/// the mean predictor: `1 − SS_res/SS_tot`. R² = 1 perfect, 0 = constant-mean,
+/// < 0 worse than the mean. Used as the held-out absolute accuracy bar on real
+/// data, where no closed-form truth exists.
+fn r2(pred: &[f64], truth: &[f64]) -> f64 {
+    assert_eq!(pred.len(), truth.len(), "r2 length mismatch");
+    let n = truth.len() as f64;
+    let mean = truth.iter().sum::<f64>() / n;
+    let ss_res: f64 = pred.iter().zip(truth).map(|(p, t)| (t - p) * (t - p)).sum();
+    let ss_tot: f64 = truth.iter().map(|t| (t - mean) * (t - mean)).sum();
+    1.0 - ss_res / ss_tot.max(1e-300)
+}
+
+/// Real-data arm of the S² rotation-equivariance test. SAME gam capability
+/// (`sphere(lat, lon, method=harmonic)`), but on a real geospatial dataset with
+/// no known generating function, so the assertions are OBJECTIVE held-out
+/// accuracy plus the intrinsic rotation-equivariance axiom.
+///
+/// Dataset SOURCE: `bench/datasets/global_major_city_temp.csv` — annual mean
+/// near-surface air temperature (°C) at 100 major world cities, keyed by their
+/// geographic latitude/longitude in degrees. Temperature on Earth's surface is
+/// a genuine scalar field on S² (driven by latitude, continentality, altitude),
+/// which is exactly what a spherical smooth should model. There is no ground
+/// truth, so we measure out-of-sample predictive accuracy.
+///
+/// PRIMARY (intrinsic axiom, tool-free): rotation equivariance. We refit the
+/// SAME harmonic sphere model in a frame rotated by a fixed SO(3) element and
+/// evaluate the rotated fit at the rotated grid; `max|g(p) − g_R(Rp)|` must stay
+/// far below the temperature signal scale (~30 °C span), certifying the basis is
+/// intrinsically defined on the manifold and not on a frame-dependent (lat,lon)
+/// chart that the 180° rotation drags across the poles and the ±180° seam.
+///
+/// HELD-OUT ACCURACY (objective): a deterministic split (every 4th row held out)
+/// fits gam on train and predicts test; we assert an ABSOLUTE held-out R² bar
+/// AND gam ≥ mgcv `bs="sos"` − margin on held-out RMSE. mgcv is a baseline to
+/// match-or-beat, never an output to reproduce.
+#[test]
+fn gam_sphere_smooth_is_rotation_equivariant_and_recovers_truth_on_real_data() {
+    init_parallelism();
+
+    // ---- load the real global city temperature dataset (lat, lon -> temp) --
+    const TEMP_CSV: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/bench/datasets/global_major_city_temp.csv"
+    );
+    let ds = load_csvwith_inferred_schema(Path::new(TEMP_CSV)).expect("load global_major_city_temp.csv");
+    let col = ds.column_map();
+    let lat_idx = col["lat"];
+    let lon_idx = col["lon"];
+    let temp_idx = col["temp"];
+    let lat: Vec<f64> = ds.values.column(lat_idx).to_vec();
+    let lon: Vec<f64> = ds.values.column(lon_idx).to_vec();
+    let temp: Vec<f64> = ds.values.column(temp_idx).to_vec();
+    let n = lat.len();
+    assert!(n >= 90, "global_major_city_temp should have ~100 rows, got {n}");
+
+    // ---- deterministic train/test split: every 4th row held out -----------
+    let is_test = |i: usize| i % 4 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    assert!(
+        train_rows.len() > 60 && test_rows.len() > 20,
+        "split sizes: train={} test={}",
+        train_rows.len(),
+        test_rows.len()
+    );
+
+    let train_lat: Vec<f64> = train_rows.iter().map(|&i| lat[i]).collect();
+    let train_lon: Vec<f64> = train_rows.iter().map(|&i| lon[i]).collect();
+    let train_temp: Vec<f64> = train_rows.iter().map(|&i| temp[i]).collect();
+    let test_lat: Vec<f64> = test_rows.iter().map(|&i| lat[i]).collect();
+    let test_lon: Vec<f64> = test_rows.iter().map(|&i| lon[i]).collect();
+    let test_temp: Vec<f64> = test_rows.iter().map(|&i| temp[i]).collect();
+
+    // ---- fit gam on TRAIN: temp ~ sphere(lat, lon, harmonic) --------------
+    // Reuse the same training-frame dataset (lat, lon, temp) the synthetic arm
+    // builds, so the identical formula resolves. `fit_and_eval` rebuilds the
+    // frozen design at arbitrary (lat, lon) eval points and returns the fitted
+    // surface there; with the identity link that is the predicted mean.
+    let train_ds = make_temp_dataset(&train_lat, &train_lon, &train_temp);
+    let (gam_test_pred, gam_edf) = fit_and_eval(&train_ds, &test_lat, &test_lon);
+    assert_eq!(
+        gam_test_pred.len(),
+        test_rows.len(),
+        "gam held-out prediction length mismatch"
+    );
+
+    // ---- PRIMARY: intrinsic rotation equivariance on the REAL fit ----------
+    // R_y(180°) = diag(-1, 1, -1): drags every city across the poles and the
+    // ±180° longitude seam in the (lat,lon) chart. Refit the SAME model in the
+    // rotated frame and evaluate at the rotated eval grid; an intrinsic harmonic
+    // basis recovers the original surface, a frame-dependent one cannot.
+    let rmat: [[f64; 3]; 3] = [[-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0]];
+    let mut train_lat_rot = Vec::with_capacity(train_rows.len());
+    let mut train_lon_rot = Vec::with_capacity(train_rows.len());
+    for i in 0..train_rows.len() {
+        let p = latlon_to_xyz(train_lat[i], train_lon[i]);
+        let (la, lo) = xyz_to_latlon(rotate(&rmat, p));
+        train_lat_rot.push(la);
+        train_lon_rot.push(lo);
+    }
+    let train_ds_rot = make_temp_dataset(&train_lat_rot, &train_lon_rot, &train_temp);
+
+    // A dense equivariance grid away from the poles (lat=±90 is the chart
+    // singularity), evaluated in the original frame and at its rotated image.
+    let mut eval_lats = Vec::new();
+    let mut eval_lons = Vec::new();
+    for i in 0..12 {
+        let la = -75.0 + 150.0 * (i as f64) / 11.0;
+        for j in 0..12 {
+            let lo = -170.0 + 340.0 * (j as f64) / 11.0;
+            eval_lats.push(la);
+            eval_lons.push(lo);
+        }
+    }
+    let mut eval_lats_rot = Vec::with_capacity(eval_lats.len());
+    let mut eval_lons_rot = Vec::with_capacity(eval_lats.len());
+    for k in 0..eval_lats.len() {
+        let p = latlon_to_xyz(eval_lats[k], eval_lons[k]);
+        let (la, lo) = xyz_to_latlon(rotate(&rmat, p));
+        eval_lats_rot.push(la);
+        eval_lons_rot.push(lo);
+    }
+    let (fit_orig_at_p, edf_orig) = fit_and_eval(&train_ds, &eval_lats, &eval_lons);
+    let (fit_rot_at_rp, edf_rot) = fit_and_eval(&train_ds_rot, &eval_lats_rot, &eval_lons_rot);
+    let equiv_max_abs = fit_orig_at_p
+        .iter()
+        .zip(&fit_rot_at_rp)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f64, f64::max);
+
+    // ---- BASELINE: mgcv bs="sos" on the SAME train, predict the SAME test --
+    // The reference harness exposes one data.frame per call and requires every
+    // column to share a length, so the (shorter) held-out coordinates ride along
+    // padded to the training length and only their first `test_n` entries are
+    // read back inside R — byte-identical to the rows gam predicted.
+    let r = run_r(
+        &[
+            Column::new("lat", &train_lat),
+            Column::new("lon", &train_lon),
+            Column::new("temp", &train_temp),
+            Column::new("test_lat", &pad_to(&test_lat, train_lat.len())),
+            Column::new("test_lon", &pad_to(&test_lon, train_lat.len())),
+            Column::new("test_n", &vec![test_lat.len() as f64; train_lat.len()]),
+        ],
+        r#"
+        suppressPackageStartupMessages(library(mgcv))
+        train <- data.frame(lat = df$lat, lon = df$lon, temp = df$temp)
+        m <- gam(temp ~ s(lat, lon, bs = "sos", k = 25), data = train, method = "REML")
+        k <- df$test_n[1]
+        ev <- data.frame(lat = df$test_lat[1:k], lon = df$test_lon[1:k])
+        emit("test_pred", as.numeric(predict(m, newdata = ev)))
+        emit("edf", sum(m$edf))
+        "#,
+    );
+    let mgcv_test_pred = r.vector("test_pred");
+    let mgcv_edf = r.scalar("edf");
+    assert_eq!(
+        mgcv_test_pred.len(),
+        test_rows.len(),
+        "mgcv held-out prediction length mismatch"
+    );
+
+    // ---- objective held-out metrics on gam's OWN predictions ---------------
+    let gam_test_r2 = r2(&gam_test_pred, &test_temp);
+    let gam_test_rmse = rmse(&gam_test_pred, &test_temp);
+    let mgcv_test_rmse = rmse(mgcv_test_pred, &test_temp);
+    let temp_span = temp.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+        - temp.iter().cloned().fold(f64::INFINITY, f64::min);
+
+    eprintln!(
+        "[s2-real] n_train={} n_test={} gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} \
+         gam_test_R2={gam_test_r2:.4} gam_test_rmse={gam_test_rmse:.4} \
+         mgcv_test_rmse={mgcv_test_rmse:.4} temp_span={temp_span:.2} | \
+         equivariance: edf_orig={edf_orig:.3} edf_rot={edf_rot:.3} max|g(p)-g_R(Rp)|={equiv_max_abs:.3e}",
+        train_rows.len(),
+        test_rows.len(),
+    );
+
+    // ---- PRIMARY (intrinsic axiom): rotation equivariance ------------------
+    // Surface temperature spans ~30 °C across the 100 cities, so a frame
+    // dependent (lat,lon) basis dragged across the poles and seam by this 180°
+    // rotation produces O(°C) gaps. The harmonic space is exactly SO(3)-closed
+    // and the Laplace-Beltrami penalty rotation-invariant, so the two refits
+    // solve the same penalized REML problem in rotated frames; the residual is
+    // bounded by REML convergence (tol 1e-6) and basis round-off, far below the
+    // signal scale. Real (noisier, non-uniformly sampled) data makes the two
+    // REML runs converge less tightly than the synthetic arm, so the bound is a
+    // looser 1e-1 °C — still ~300× below the 30 °C breakage scale of a genuine
+    // frame dependence.
+    assert!(
+        equiv_max_abs < 1e-1,
+        "gam's intrinsic S² smooth is NOT rotation-equivariant on real data: \
+         max|g(p) - g_R(Rp)| = {equiv_max_abs:.3e} (bound 1e-1, temp span ~{temp_span:.1})"
+    );
+
+    // ---- HELD-OUT (objective absolute bar): gam explains held-out variance -
+    // Temperature on the sphere is dominated by a smooth latitudinal gradient a
+    // competent spherical smooth captures, so it must beat the constant-mean
+    // predictor (R²=0) by a wide margin on the held-out cities. R² ≥ 0.50 is far
+    // above 0 yet leaves headroom for the genuine continental/altitude residual
+    // a 100-city sample cannot resolve.
+    assert!(
+        gam_test_r2 >= 0.50,
+        "gam's held-out predictive R² too low on real temperature data: \
+         {gam_test_r2:.4} (< 0.50)"
+    );
+
+    // ---- BASELINE (match-or-beat): no worse than mgcv sos on held-out RMSE -
+    assert!(
+        gam_test_rmse <= mgcv_test_rmse * 1.10,
+        "gam held-out RMSE {gam_test_rmse:.4} exceeds mgcv bs=\"sos\" \
+         {mgcv_test_rmse:.4} * 1.10 on real temperature data"
+    );
+
+    // ---- complexity sanity: edf in a signal-appropriate range (not matched) -
+    assert!(
+        gam_edf > 1.0 && gam_edf < 24.0,
+        "gam effective dof out of sane range: {gam_edf:.3}"
+    );
+}
+
+/// Build an `EncodedDataset` with columns `lat`, `lon`, `y` (degrees / °C) from
+/// real-data train rows. The response column is named `y` so the SAME formula
+/// `y ~ sphere(lat, lon, method=harmonic, max_degree=4)` that `fit_and_eval`
+/// fits in the synthetic arm resolves unchanged here — the real city
+/// temperatures (°C) are simply carried in `y`.
+fn make_temp_dataset(lats: &[f64], lons: &[f64], temps: &[f64]) -> gam::data::EncodedDataset {
+    let headers = ["lat", "lon", "y"].into_iter().map(String::from).collect();
+    let mut rows = Vec::with_capacity(lats.len());
+    for i in 0..lats.len() {
+        rows.push(StringRecord::from(vec![
+            lats[i].to_string(),
+            lons[i].to_string(),
+            temps[i].to_string(),
+        ]));
+    }
+    encode_recordswith_inferred_schema(headers, rows).expect("encode real temperature dataset")
+}
+
+/// Right-pad `v` with its last value (or 0.0 when empty) to length `len`, so the
+/// shorter held-out coordinates can ride along in the reference data.frame; only
+/// the first `v.len()` entries are read back inside the R body.
+fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
+    assert!(v.len() <= len, "pad target {len} shorter than source {}", v.len());
+    let fill = v.last().copied().unwrap_or(0.0);
+    let mut out = v.to_vec();
+    out.resize(len, fill);
+    out
 }

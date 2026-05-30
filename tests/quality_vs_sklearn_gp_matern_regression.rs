@@ -35,11 +35,44 @@ use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+    load_csvwith_inferred_schema,
 };
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
+use std::path::Path;
+
+/// Real lidar benchmark (range -> logratio), used by the real-data arm below.
+/// SOURCE: Sigrist (1994) light-detection-and-ranging experiment, distributed as
+/// `SemiPar::lidar` in R; mirrored into this repo at bench/datasets/lidar.csv.
+const LIDAR_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/lidar.csv");
+
+/// Coefficient of determination of `pred` vs observed `truth`, relative to the
+/// mean predictor: `1 - SS_res / SS_tot`. R2 = 1 perfect, 0 = constant-mean.
+fn r2(pred: &[f64], truth: &[f64]) -> f64 {
+    assert_eq!(pred.len(), truth.len(), "r2 length mismatch");
+    let n = truth.len() as f64;
+    let mean = truth.iter().sum::<f64>() / n;
+    let ss_res: f64 = pred.iter().zip(truth).map(|(p, t)| (t - p) * (t - p)).sum();
+    let ss_tot: f64 = truth.iter().map(|t| (t - mean) * (t - mean)).sum();
+    1.0 - ss_res / ss_tot.max(1e-300)
+}
+
+/// Right-pad `v` with its last value (or 0.0 when empty) to length `len`, so a
+/// test-length vector can ride along inside a train-length reference data.frame.
+/// Only the first `v.len()` entries are read back inside the Python body.
+fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
+    assert!(
+        v.len() <= len,
+        "pad target {len} shorter than source {}",
+        v.len()
+    );
+    let fill = v.last().copied().unwrap_or(0.0);
+    let mut out = v.to_vec();
+    out.resize(len, fill);
+    out
+}
 
 #[test]
 fn gam_matern_gp_recovers_truth_and_beats_sklearn() {
@@ -194,5 +227,159 @@ emit("edf", np.trace(S))
         gam_rmse_truth <= sk_rmse_truth * 1.10,
         "gam matern GP is less accurate than sklearn GPR at recovering the truth: \
          rmse(gam, truth)={gam_rmse_truth:.4} > 1.10 × rmse(sklearn, truth)={sk_rmse_truth:.4}"
+    );
+}
+
+/// REAL-DATA arm: the SAME ν = 5/2 Matérn-GP capability exercised on real lidar
+/// measurements (range -> logratio) instead of a synthetic known-truth function.
+///
+/// On real data the truth is unknown, so quality is OUT-OF-SAMPLE predictive
+/// accuracy, not denoising-to-a-formula. We make a deterministic train/test
+/// split (every 4th row held out), fit `logratio ~ matern(range, nu=2.5)` by
+/// REML on the training rows only, predict the held-out rows, and assert
+/// OBJECTIVE metrics on gam's OWN held-out predictions:
+///
+///   PRIMARY (objective, tool-free): held-out coefficient of determination
+///     `test_R2 >= 0.55` — the Matérn GP genuinely explains held-out variance,
+///     well above the constant-mean predictor (R2 = 0). lidar's signal is
+///     strongly nonlinear; under/over-smoothing would trip this.
+///
+///   MATCH-OR-BEAT (accuracy baseline, NOT a "same-as" claim): sklearn's exact
+///     ν = 5/2 GaussianProcessRegressor fits the SAME training rows and predicts
+///     the SAME held-out rows; gam's held-out RMSE must be no worse than
+///     `sklearn_test_rmse * 1.10`. sklearn is the mature exact-GP baseline to
+///     match-or-beat on accuracy, never a fitted target to reproduce.
+#[test]
+fn gam_matern_gp_recovers_truth_and_beats_sklearn_on_real_data() {
+    init_parallelism();
+
+    // ---- load the canonical lidar dataset (range -> logratio) -------------
+    let ds = load_csvwith_inferred_schema(Path::new(LIDAR_CSV)).expect("load lidar.csv");
+    let col = ds.column_map();
+    let range_idx = col["range"];
+    let logratio_idx = col["logratio"];
+    let range: Vec<f64> = ds.values.column(range_idx).to_vec();
+    let logratio: Vec<f64> = ds.values.column(logratio_idx).to_vec();
+    let n = range.len();
+    assert!(n > 100, "lidar should have ~221 rows, got {n}");
+
+    // ---- deterministic train/test split: every 4th row is held out -------
+    let is_test = |i: usize| i % 4 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    assert!(
+        train_rows.len() > 100 && test_rows.len() > 30,
+        "split sizes: train={} test={}",
+        train_rows.len(),
+        test_rows.len()
+    );
+
+    let train_range: Vec<f64> = train_rows.iter().map(|&i| range[i]).collect();
+    let train_logratio: Vec<f64> = train_rows.iter().map(|&i| logratio[i]).collect();
+    let test_range: Vec<f64> = test_rows.iter().map(|&i| range[i]).collect();
+    let test_logratio: Vec<f64> = test_rows.iter().map(|&i| logratio[i]).collect();
+
+    // Build a training-only dataset by sub-setting the encoded rows; headers,
+    // schema, and column kinds are unchanged, so the formula resolves identically.
+    let p = ds.headers.len();
+    let mut train_values = Array2::<f64>::zeros((train_rows.len(), p));
+    for (out_row, &src_row) in train_rows.iter().enumerate() {
+        for c in 0..p {
+            train_values[[out_row, c]] = ds.values[[src_row, c]];
+        }
+    }
+    let mut train_ds = ds.clone();
+    train_ds.values = train_values;
+
+    // ---- fit gam on TRAIN: logratio ~ matern(range, nu=2.5, k=25), REML ----
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula("logratio ~ matern(range, nu=2.5, k=25)", &train_ds, &cfg)
+        .expect("gam matern GP fit on lidar train");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected a standard Gaussian GAM fit for matern() GP smooth on lidar");
+    };
+    let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
+
+    // gam predictions at the held-out `range` points: rebuild the design from
+    // the frozen spec (identity link => design*beta = predicted mean).
+    let mut test_grid = Array2::<f64>::zeros((test_rows.len(), p));
+    for (i, &r) in test_range.iter().enumerate() {
+        test_grid[[i, range_idx]] = r;
+    }
+    let test_design = build_term_collection_design(test_grid.view(), &fit.resolvedspec)
+        .expect("rebuild matern GP design at held-out lidar points");
+    let gam_test_pred: Vec<f64> = test_design.design.apply(&fit.fit.beta).to_vec();
+
+    // ---- fit the SAME data with sklearn exact GPR, predict the SAME TEST ---
+    // Identical train rows (range/logratio) in identical order; the test-range
+    // points ride along right-padded to train length, with `test_n` recording
+    // how many leading entries are real. sklearn maximizes the log marginal
+    // likelihood (its default) to pick length-scale, amplitude, and noise.
+    let r = run_python(
+        &[
+            Column::new("range", &train_range),
+            Column::new("logratio", &train_logratio),
+            Column::new("test_range", &pad_to(&test_range, train_range.len())),
+            Column::new(
+                "test_n",
+                &vec![test_range.len() as f64; train_range.len()],
+            ),
+        ],
+        r#"
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import Matern, ConstantKernel, WhiteKernel
+
+x = np.asarray(df["range"], dtype=float).reshape(-1, 1)
+y = np.asarray(df["logratio"], dtype=float).reshape(-1)
+k = int(np.asarray(df["test_n"], dtype=float)[0])
+xg = np.asarray(df["test_range"], dtype=float)[:k].reshape(-1, 1)
+
+kernel = (ConstantKernel(1.0, (1e-3, 1e3))
+          * Matern(length_scale=50.0, length_scale_bounds=(1e-1, 1e4), nu=2.5)
+          + WhiteKernel(noise_level=0.01, noise_level_bounds=(1e-6, 1e1)))
+gp = GaussianProcessRegressor(kernel=kernel, normalize_y=True, n_restarts_optimizer=8,
+                              random_state=0)
+gp.fit(x, y)
+emit("test_pred", gp.predict(xg))
+"#,
+    );
+    let sk_test_pred = r.vector("test_pred");
+    assert_eq!(
+        sk_test_pred.len(),
+        test_rows.len(),
+        "sklearn held-out prediction length mismatch"
+    );
+
+    // ---- objective metrics on gam's OWN held-out predictions --------------
+    let gam_test_r2 = r2(&gam_test_pred, &test_logratio);
+    let gam_test_rmse = rmse(&gam_test_pred, &test_logratio);
+    let sk_test_rmse = rmse(sk_test_pred, &test_logratio);
+
+    eprintln!(
+        "lidar matern(range,nu=2.5,k=25) held-out: n_train={} n_test={} gam_edf={gam_edf:.3} \
+         gam_test_R2={gam_test_r2:.4} gam_test_rmse={gam_test_rmse:.4} \
+         sklearn_test_rmse={sk_test_rmse:.4}",
+        train_rows.len(),
+        test_rows.len(),
+    );
+
+    // ---- PRIMARY objective assertion: gam predicts the held-out signal -----
+    // lidar's range->logratio curve is strongly nonlinear with a clear signal;
+    // a competent ν = 5/2 GP explains well over half the held-out variance.
+    // R2 >= 0.55 is far above the constant-mean baseline (0).
+    assert!(
+        gam_test_r2 >= 0.55,
+        "gam matern GP held-out predictive R2 too low: {gam_test_r2:.4} (< 0.55)"
+    );
+
+    // ---- MATCH-OR-BEAT: no worse than sklearn exact GPR on held-out RMSE ----
+    // Accuracy comparison on real held-out data, NOT a "gam reproduces sklearn"
+    // claim — we never assert the two fitted functions are close.
+    assert!(
+        gam_test_rmse <= sk_test_rmse * 1.10,
+        "gam matern GP held-out RMSE {gam_test_rmse:.4} exceeds sklearn {sk_test_rmse:.4} * 1.10"
     );
 }

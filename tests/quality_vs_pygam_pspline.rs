@@ -179,3 +179,158 @@ emit("test_pred", gam.predict(Xte))
          gam_rmse={gam_rmse:.4} > 1.10 * pygam_rmse={pygam_rmse:.4}"
     );
 }
+
+/// Second real-data arm on the SAME p-spline capability, but stressing it with a
+/// HARDER, structurally different split: instead of interleaving every 4th row
+/// (which hands the smoother neighbours on both sides of every test point), this
+/// holds out a CONTIGUOUS interior BLOCK of the `range` axis (the middle 20% of
+/// the sorted-by-`range` rows). The smoother must therefore INTERPOLATE across a
+/// gap it saw no data inside — a genuinely harder generalization task that an
+/// over-flexible or wrong-penalty p-spline would fail (it would wiggle through
+/// the gap). The objective metric is, again, held-out predictive accuracy on
+/// gam's OWN predictions, with pyGAM as a match-or-beat baseline on the SAME gap.
+///
+/// Dataset SOURCE: `bench/datasets/lidar.csv` — the canonical LIDAR benchmark
+/// (range of the emitted laser light -> log ratio of received light), from
+/// Sigrist (1994) / Ruppert, Wand & Carroll, "Semiparametric Regression" (2003).
+///
+/// OBJECTIVE METRIC asserted:
+///   1. interpolation R^2 over the held-out interior gap >= 0.80, and
+///   2. gam_gap_RMSE <= pygam_gap_RMSE * 1.10 (match-or-beat the mature tool on
+///      the identical gap).
+#[test]
+fn gam_pspline_held_out_accuracy_beats_pygam_on_lidar_on_real_data() {
+    init_parallelism();
+
+    // ---- load lidar and sort rows by `range` so the held-out block is a true
+    //      contiguous interval of the predictor axis ------------------------
+    let ds = load_csvwith_inferred_schema(Path::new(LIDAR_CSV)).expect("load lidar.csv");
+    let col = ds.column_map();
+    let range_raw: Vec<f64> = ds.values.column(col["range"]).to_vec();
+    let logratio_raw: Vec<f64> = ds.values.column(col["logratio"]).to_vec();
+    let n = range_raw.len();
+    assert!(n > 100, "lidar should have ~221 rows, got {n}");
+
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        range_raw[a]
+            .partial_cmp(&range_raw[b])
+            .expect("range has no NaN to break the sort")
+    });
+    let range: Vec<f64> = order.iter().map(|&i| range_raw[i]).collect();
+    let logratio: Vec<f64> = order.iter().map(|&i| logratio_raw[i]).collect();
+
+    // ---- deterministic contiguous interior-block hold-out -----------------
+    // Hold out the middle 20% of the sorted rows as an INTERIOR gap (rows in
+    // [lo, hi)); everything outside the gap trains. Fixed by index, no RNG, so
+    // the identical rows in the identical order go to gam and to pyGAM.
+    let lo = (n as f64 * 0.40) as usize;
+    let hi = (n as f64 * 0.60) as usize;
+    assert!(lo < hi && hi <= n, "bad gap bounds: lo={lo} hi={hi} n={n}");
+
+    let mut tr_range = Vec::new();
+    let mut tr_logratio = Vec::new();
+    let mut te_range = Vec::new();
+    let mut te_logratio = Vec::new();
+    for i in 0..n {
+        if i >= lo && i < hi {
+            te_range.push(range[i]);
+            te_logratio.push(logratio[i]);
+        } else {
+            tr_range.push(range[i]);
+            tr_logratio.push(logratio[i]);
+        }
+    }
+    let n_test = te_range.len();
+    assert!(
+        n_test > 20 && tr_range.len() > 100,
+        "split sizes: train={} test={}",
+        tr_range.len(),
+        n_test
+    );
+
+    // ---- fit gam on TRAIN only: logratio ~ s(range, bs="ps", k=15) --------
+    let train_ds = train_dataset(&tr_range, &tr_logratio);
+    let train_col = train_ds.column_map();
+    let train_range_idx = train_col["range"];
+    let train_ncols = train_ds.headers.len();
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula("logratio ~ s(range, bs=\"ps\", k=15)", &train_ds, &cfg)
+        .expect("gam p-spline fit on train (interior-gap split)");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected a standard GAM fit for a Gaussian p-spline smooth");
+    };
+
+    // gam predictions over the held-out interior gap (identity link => mean).
+    let mut test_grid = Array2::<f64>::zeros((n_test, train_ncols));
+    for (i, &r) in te_range.iter().enumerate() {
+        test_grid[[i, train_range_idx]] = r;
+    }
+    let design = build_term_collection_design(test_grid.view(), &fit.resolvedspec)
+        .expect("rebuild p-spline design over the interior gap");
+    let gam_test_pred: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
+
+    // ---- pyGAM on the SAME train rows, predict the SAME interior gap ------
+    let py = run_python(
+        &[
+            Column::new("tr_range", &tr_range),
+            Column::new("tr_logratio", &tr_logratio),
+            Column::new("te_range", &te_range),
+        ],
+        r#"
+from pygam import LinearGAM, s
+Xtr = np.asarray(df["tr_range"], dtype=float).reshape(-1, 1)
+ytr = np.asarray(df["tr_logratio"], dtype=float)
+Xte = np.asarray(df["te_range"], dtype=float).reshape(-1, 1)
+gam = LinearGAM(s(0, n_splines=15)).gridsearch(Xtr, ytr, progress=False)
+emit("test_pred", gam.predict(Xte))
+"#,
+    );
+    let pygam_test_pred = py.vector("test_pred");
+    assert_eq!(
+        pygam_test_pred.len(),
+        n_test,
+        "pyGAM interior-gap prediction length mismatch"
+    );
+
+    // ---- objective interpolation metrics on gam's OWN predictions ---------
+    let gam_rmse = rmse(&gam_test_pred, &te_logratio);
+    let pygam_rmse = rmse(pygam_test_pred, &te_logratio);
+
+    let ybar: f64 = te_logratio.iter().sum::<f64>() / n_test as f64;
+    let ss_tot: f64 = te_logratio.iter().map(|y| (y - ybar) * (y - ybar)).sum();
+    let ss_res: f64 = gam_test_pred
+        .iter()
+        .zip(&te_logratio)
+        .map(|(p, y)| (p - y) * (p - y))
+        .sum();
+    let gam_r2 = 1.0 - ss_res / ss_tot.max(1e-300);
+
+    // Context only (NOT a pass criterion): tracking of pyGAM over the gap.
+    let rel_vs_pygam = relative_l2(&gam_test_pred, pygam_test_pred);
+    eprintln!(
+        "lidar s(range,bs=ps,k=15) INTERIOR-GAP: n_test={n_test} \
+         gam_r2={gam_r2:.4} gam_rmse={gam_rmse:.4} pygam_rmse={pygam_rmse:.4} \
+         rel_l2_vs_pygam={rel_vs_pygam:.4}"
+    );
+
+    // PRIMARY: the p-spline interpolates the unseen interior interval — it
+    // explains the bulk of the gap variance from data lying ONLY on either side
+    // of it. A correct degree-3 / 2nd-difference p-spline clears 0.80; a
+    // wrong-order or over-flexible smoother would wander through the gap.
+    assert!(
+        gam_r2 >= 0.80,
+        "gam p-spline interior-gap R^2 too low: {gam_r2:.4} (rmse={gam_rmse:.4})"
+    );
+
+    // MATCH-OR-BEAT: gam interpolates the gap at least as well as the mature
+    // pyGAM baseline, within a 10% RMSE margin.
+    assert!(
+        gam_rmse <= pygam_rmse * 1.10,
+        "gam interpolates the gap worse than pyGAM: \
+         gam_rmse={gam_rmse:.4} > 1.10 * pygam_rmse={pygam_rmse:.4}"
+    );
+}

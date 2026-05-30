@@ -46,6 +46,10 @@ use ndarray::{Array2, s};
 use std::path::Path;
 
 const LIDAR_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/lidar.csv");
+// Source: R `datasets::quakes` (Harvard PRIM-H earthquake catalogue, locations
+// near Fiji, 1964 onward), shipped here as bench/datasets/quakes.csv with
+// columns rownames,lat,long,depth,mag,stations (n = 1000).
+const QUAKES_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/quakes.csv");
 
 /// Out-of-sample coefficient of determination `R^2 = 1 - SS_res/SS_tot`, with
 /// `SS_tot` taken about the TEST-set mean. A model that predicts the held-out
@@ -245,6 +249,229 @@ fn gam_rw2_pspline_predicts_held_out_at_least_as_well_as_inla() {
     assert!(
         gam_rmse <= 1.10 * inla_rmse,
         "gam predicts the held-out rows worse than INLA: \
+         gam_rmse={gam_rmse:.5} > 1.10 * inla_rmse={:.5} (inla_rmse={inla_rmse:.5})",
+        1.10 * inla_rmse
+    );
+}
+
+/// REAL-DATA arm: the same penalized-smoothness capability (a 2-D thin-plate
+/// spatial smooth, the planar twin of the 1-D RW2 p-spline above), exercised on
+/// the `quakes` earthquake catalogue and scored by **held-out predictive
+/// accuracy** with **R-INLA's SPDE** spatial model demoted to a match-or-beat
+/// baseline.
+///
+/// ## What this test asserts (objective metric)
+///
+/// `quakes` (n = 1000, near Fiji) has no known ground-truth surface, so the
+/// honest quality claim is predictive: does gam's 2-D smooth of magnitude over
+/// geographic location generalize to quakes it never saw? We make a fully
+/// deterministic train/test split (every 5th row, by original file order, is
+/// held out), fit `mag ~ s(long, lat, bs='tp')` on the training rows only,
+/// predict the held-out rows from the frozen smooth, and assert
+///
+///   1. an **absolute held-out accuracy bar**: out-of-sample
+///      `R^2 = 1 - SS_res/SS_tot >= 0.20` on the test rows. Earthquake
+///      magnitude varies smoothly but noisily with subduction-zone geometry;
+///      a spatial smooth that has learned that structure (rather than the grand
+///      mean) clears this comfortably while predicting the constant mean scores
+///      0. This PRIMARY claim stands alone without any reference tool.
+///
+///   2. a **match-or-beat against R-INLA's SPDE** on the same held-out rows:
+///      gam's out-of-sample RMSE must be within 10% of INLA's,
+///      `gam_rmse <= 1.10 * inla_rmse`. INLA's stochastic-PDE Matern field
+///      (`inla.spde2.pcmatern` on a Delaunay mesh of the training locations) is
+///      the best-in-class continuous spatial-smoothing engine and the 2-D
+///      continuous analog of gam's thin-plate basis; it is fit to the IDENTICAL
+///      training rows and asked to predict the IDENTICAL held-out longitudes /
+///      latitudes. We assert gam predicts unseen quakes at least as accurately
+///      as INLA, not that gam reproduces INLA's fitted surface.
+///
+/// A failing assertion because gam genuinely predicts worse than the bar (or
+/// worse than INLA) is a real finding, not a reason to weaken the bound.
+#[test]
+fn gam_rw2_pspline_predicts_held_out_at_least_as_well_as_inla_on_real_data() {
+    init_parallelism();
+
+    // ---- load the quakes catalogue (long, lat -> mag spatial 2-D) ---------
+    let ds = load_csvwith_inferred_schema(Path::new(QUAKES_CSV)).expect("load quakes.csv");
+    let col = ds.column_map();
+    let long_idx = col["long"];
+    let lat_idx = col["lat"];
+    let mag_idx = col["mag"];
+    let long: Vec<f64> = ds.values.column(long_idx).to_vec();
+    let lat: Vec<f64> = ds.values.column(lat_idx).to_vec();
+    let mag: Vec<f64> = ds.values.column(mag_idx).to_vec();
+    let n = long.len();
+    assert!(n > 500, "quakes should have ~1000 rows, got {n}");
+
+    // ---- deterministic train/test split: every 5th row held out ----------
+    // Original file order; row r is a test point iff r % 5 == 2. Fully
+    // deterministic (no RNG), so the split is reproducible and identical for
+    // gam and INLA.
+    let mut train_rows: Vec<usize> = Vec::new();
+    let mut test_rows: Vec<usize> = Vec::new();
+    for r in 0..n {
+        if r % 5 == 2 {
+            test_rows.push(r);
+        } else {
+            train_rows.push(r);
+        }
+    }
+    assert!(
+        test_rows.len() > 150 && train_rows.len() > 600,
+        "split sizes look wrong: {} train / {} test",
+        train_rows.len(),
+        test_rows.len()
+    );
+
+    let train_long: Vec<f64> = train_rows.iter().map(|&i| long[i]).collect();
+    let train_lat: Vec<f64> = train_rows.iter().map(|&i| lat[i]).collect();
+    let train_mag: Vec<f64> = train_rows.iter().map(|&i| mag[i]).collect();
+    let test_long: Vec<f64> = test_rows.iter().map(|&i| long[i]).collect();
+    let test_lat: Vec<f64> = test_rows.iter().map(|&i| lat[i]).collect();
+    let test_mag: Vec<f64> = test_rows.iter().map(|&i| mag[i]).collect();
+
+    // Training-only dataset: row-subset the encoded values; schema/headers/
+    // column-kinds are unchanged so the formula resolves identically.
+    let p = ds.headers.len();
+    let mut train_values = Array2::<f64>::zeros((train_rows.len(), p));
+    for (out_row, &in_row) in train_rows.iter().enumerate() {
+        train_values
+            .slice_mut(s![out_row, ..])
+            .assign(&ds.values.slice(s![in_row, ..]));
+    }
+    let mut train_ds = ds.clone();
+    train_ds.values = train_values;
+
+    // ---- fit gam on TRAIN: mag ~ s(long, lat, bs='tp'), REML --------------
+    // A 2-D thin-plate regression spline over geographic location: the planar,
+    // isotropic analog of the 1-D RW2 smoothness penalty, with REML selecting
+    // the smoothing parameter by marginal likelihood.
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula("mag ~ s(long, lat, bs='tp')", &train_ds, &cfg)
+        .expect("gam 2-D thin-plate spatial fit on training rows");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected a standard GAM fit for a gaussian 2-D thin-plate smooth");
+    };
+
+    // ---- gam predictions at the held-out TEST rows ------------------------
+    // Rebuild the design from the frozen spec at the test (long, lat); identity
+    // link => predicted mean is X_test * beta.
+    let mut test_grid = Array2::<f64>::zeros((test_rows.len(), p));
+    for i in 0..test_rows.len() {
+        test_grid[[i, long_idx]] = test_long[i];
+        test_grid[[i, lat_idx]] = test_lat[i];
+    }
+    let test_design = build_term_collection_design(test_grid.view(), &fit.resolvedspec)
+        .expect("rebuild 2-D design at held-out test points");
+    let gam_test_pred: Vec<f64> = test_design.design.apply(&fit.fit.beta).to_vec();
+    assert_eq!(
+        gam_test_pred.len(),
+        test_rows.len(),
+        "gam test prediction length mismatch"
+    );
+
+    // ---- fit the SAME training data with R-INLA's SPDE, predict the test --
+    // inla.spde2.pcmatern on a Delaunay mesh of the TRAINING locations: a
+    // continuous Gaussian-Markov random field (Matern via the stochastic PDE),
+    // the 2-D continuous twin of gam's thin-plate basis. We stack train+test
+    // into one frame with test responses NA; the test rows carry no likelihood,
+    // so the field is estimated from TRAINING rows only and INLA's posterior-
+    // mean fitted value at an NA row is its held-out prediction there.
+    let n_train = train_long.len();
+    let n_test = test_long.len();
+    let mut all_long = train_long.clone();
+    all_long.extend_from_slice(&test_long);
+    let mut all_lat = train_lat.clone();
+    all_lat.extend_from_slice(&test_lat);
+    let mut all_mag = train_mag.clone();
+    all_mag.extend(std::iter::repeat_n(f64::NAN, n_test));
+    let mut is_test = vec![0.0_f64; n_train];
+    is_test.extend(std::iter::repeat_n(1.0_f64, n_test));
+
+    let r = run_r(
+        &[
+            Column::new("long", &all_long),
+            Column::new("lat", &all_lat),
+            Column::new("mag", &all_mag),
+            Column::new("is_test", &is_test),
+        ],
+        r#"
+        suppressPackageStartupMessages(library(INLA))
+        # Mesh over the TRAINING locations only (test rows are predicted via the
+        # projector, never used to build the mesh or estimate the field).
+        train <- df[df$is_test == 0, ]
+        test  <- df[df$is_test == 1, ]
+        loc.train <- cbind(train$long, train$lat)
+        loc.test  <- cbind(test$long,  test$lat)
+        mesh <- inla.mesh.2d(loc = loc.train,
+                             max.edge = c(0.75, 3),
+                             cutoff = 0.3)
+        spde <- inla.spde2.pcmatern(mesh = mesh,
+                                    prior.range = c(1, 0.5),
+                                    prior.sigma = c(1, 0.5))
+        A.train <- inla.spde.make.A(mesh = mesh, loc = loc.train)
+        A.test  <- inla.spde.make.A(mesh = mesh, loc = loc.test)
+        s.index <- inla.spde.make.index(name = "spatial", n.spde = spde$n.spde)
+        stk.train <- inla.stack(
+          data = list(mag = train$mag),
+          A = list(A.train, 1),
+          effects = list(c(s.index, list(intercept = 1)), list()),
+          tag = "train")
+        stk.test <- inla.stack(
+          data = list(mag = rep(NA, nrow(test))),
+          A = list(A.test, 1),
+          effects = list(c(s.index, list(intercept = 1)), list()),
+          tag = "test")
+        stk <- inla.stack(stk.train, stk.test)
+        form <- mag ~ -1 + intercept + f(spatial, model = spde)
+        m <- inla(form, data = inla.stack.data(stk), family = "gaussian",
+                  control.predictor = list(A = inla.stack.A(stk), compute = TRUE))
+        idx.test <- inla.stack.index(stk, tag = "test")$data
+        pred <- m$summary.fitted.values$mean[idx.test]
+        # Emitted in the SAME order the test rows were appended, so they align
+        # element-wise with gam_test_pred / test_mag.
+        emit("inla_test_pred", as.numeric(pred))
+        "#,
+    );
+    let inla_test_pred = r.vector("inla_test_pred");
+    assert_eq!(
+        inla_test_pred.len(),
+        test_rows.len(),
+        "INLA SPDE held-out prediction length mismatch"
+    );
+
+    // ---- objective held-out metrics ---------------------------------------
+    let gam_r2 = held_out_r2(&gam_test_pred, &test_mag);
+    let gam_rmse = rmse(&gam_test_pred, &test_mag);
+    let inla_r2 = held_out_r2(inla_test_pred, &test_mag);
+    let inla_rmse = rmse(inla_test_pred, &test_mag);
+    // Context only — agreement with INLA is NOT a pass criterion.
+    let rel_pred = relative_l2(&gam_test_pred, inla_test_pred);
+
+    eprintln!(
+        "quakes 2-D spatial held-out: n={n} train={n_train} test={n_test} \
+         gam_R2={gam_r2:.4} gam_rmse={gam_rmse:.5} \
+         inla_R2={inla_r2:.4} inla_rmse={inla_rmse:.5} \
+         (context) rel_l2(gam_pred,inla_pred)={rel_pred:.4}"
+    );
+
+    // PRIMARY: absolute out-of-sample accuracy bar. A spatial smooth that has
+    // learned the subduction-zone magnitude structure (not the grand mean)
+    // clears this floor; a degenerate fit falls below it.
+    assert!(
+        gam_r2 >= 0.20,
+        "gam 2-D spatial smooth does not generalize: held-out R^2={gam_r2:.4} < 0.20 bar"
+    );
+
+    // MATCH-OR-BEAT: gam must predict the held-out rows at least as accurately
+    // as INLA's SPDE (within 10% on RMSE), on the identical split.
+    assert!(
+        gam_rmse <= 1.10 * inla_rmse,
+        "gam predicts the held-out quakes worse than INLA SPDE: \
          gam_rmse={gam_rmse:.5} > 1.10 * inla_rmse={:.5} (inla_rmse={inla_rmse:.5})",
         1.10 * inla_rmse
     );

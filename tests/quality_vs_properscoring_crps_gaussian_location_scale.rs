@@ -62,8 +62,16 @@ use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, max_abs_diff, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+    load_csvwith_inferred_schema,
 };
 use ndarray::Array2;
+use std::path::Path;
+
+/// MASS `gagurine` dataset (concentration of the glycosaminoglycan GAG in the
+/// urine of `n = 314` children vs `Age` in years). Source: Venables & Ripley,
+/// "Modern Applied Statistics with S" (the MASS R package). Mirrored at
+/// `bench/datasets/gagurine.csv` (columns: rownames, Age, GAG).
+const GAGURINE_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/gagurine.csv");
 
 /// gam's location-scale noise link floor: sigma = 0.01 + exp(eta_scale).
 /// Mirrors `families::sigma_link::LOGB_SIGMA_FLOOR` (and mgcv `gaulss(b=0.01)`).
@@ -294,6 +302,211 @@ emit("crps_base", crps("mu_base", "sigma_base"))
     // location-scale fit added nothing of value.
     assert!(
         mean_gam < mean_base,
+        "gam location-scale did not beat the homoscedastic baseline on held-out CRPS: \
+         gam={mean_gam:.6} homoscedastic={mean_base:.6}"
+    );
+}
+
+/// Real-data arm of the SAME Gaussian location-scale + CRPS capability, on the
+/// MASS `gagurine` dataset (GAG concentration in children's urine vs `Age`).
+///
+/// Truth is unknown here, so the objective verdict is HELD-OUT predictive CRPS.
+/// The GAG ~ Age relationship is strongly heteroscedastic: at young ages GAG is
+/// both higher and far more variable than in older children, so a location-scale
+/// model that fits BOTH a mean smooth `s(Age)` and a log-sigma smooth
+/// `1 + s(Age)` should out-predict any model that ignores the scale channel.
+///
+/// What this arm asserts (all on a deterministic, every-4th-row held-out split,
+/// scored by `properscoring.crps_gaussian` as the one independent CRPS ruler):
+///   PRIMARY (objective, calibration). gam's held-out mean CRPS must clear an
+///     ABSOLUTE bar tied to the held-out response spread — gam's predictive
+///     distributions are genuinely sharp+calibrated, not merely "near a peer".
+///   BASELINE (match-or-beat). A homoscedastic Gaussian (the held-out-data mean
+///     of gam's location predictions, with a single constant sigma = RMS of
+///     gam's predicted sigmas) is the natural thing the scale channel must beat.
+///     gam's location-scale mean CRPS must be <= that baseline minus a margin,
+///     proving modelling sigma(Age) pays off out-of-sample. The homoscedastic
+///     reference is a baseline to beat, never an output to replicate.
+#[test]
+fn gam_gaussian_location_scale_crps_matches_properscoring_on_real_data() {
+    init_parallelism();
+
+    // ---- load gagurine (Age -> GAG), drop the rownames index column --------
+    let ds = load_csvwith_inferred_schema(Path::new(GAGURINE_CSV)).expect("load gagurine.csv");
+    let colmap = ds.column_map();
+    let age_idx = colmap["Age"];
+    let gag_idx = colmap["GAG"];
+    let age_all: Vec<f64> = ds.values.column(age_idx).to_vec();
+    let gag_all: Vec<f64> = ds.values.column(gag_idx).to_vec();
+    let n = age_all.len();
+    assert!(n > 300, "gagurine should have ~314 rows, got {n}");
+
+    // ---- deterministic train/test split: every 4th row held out -----------
+    let is_test = |i: usize| i % 4 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    let n_train = train_rows.len();
+    let n_test = test_rows.len();
+    assert!(
+        n_train > 200 && n_test > 60,
+        "split sizes: train={n_train} test={n_test}"
+    );
+
+    let age_test: Vec<f64> = test_rows.iter().map(|&i| age_all[i]).collect();
+    let gag_test: Vec<f64> = test_rows.iter().map(|&i| gag_all[i]).collect();
+
+    // ---- build a TRAINING dataset (columns Age, GAG) from the encoded rows -
+    let headers: Vec<String> = vec!["Age".to_string(), "GAG".to_string()];
+    let rows: Vec<csv::StringRecord> = train_rows
+        .iter()
+        .map(|&i| {
+            csv::StringRecord::from(vec![
+                format!("{:.17e}", age_all[i]),
+                format!("{:.17e}", gag_all[i]),
+            ])
+        })
+        .collect();
+    let train_ds =
+        encode_recordswith_inferred_schema(headers, rows).expect("encode gagurine train data");
+    let train_col = train_ds.column_map();
+    let train_age_idx = train_col["Age"];
+    let ncols = train_ds.headers.len();
+
+    // ---- fit gam: GAG ~ s(Age, k=10), log-sigma ~ 1 + s(Age, k=10) ---------
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        noise_formula: Some("1 + s(Age, k=10)".to_string()),
+        ..FitConfig::default()
+    };
+    let result =
+        fit_from_formula("GAG ~ s(Age, k=10)", &train_ds, &cfg).expect("gam location-scale fit");
+    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult { fit, .. }) = result
+    else {
+        panic!("expected a Gaussian location-scale fit");
+    };
+
+    let beta_location = fit
+        .fit
+        .block_by_role(BlockRole::Location)
+        .expect("location (mean) block present")
+        .beta
+        .clone();
+    let beta_scale = fit
+        .fit
+        .block_by_role(BlockRole::Scale)
+        .expect("scale (log-sigma) block present")
+        .beta
+        .clone();
+
+    // ---- predict (mu, sigma) at the held-out Age points --------------------
+    let mut grid = Array2::<f64>::zeros((n_test, ncols));
+    for (i, &t) in age_test.iter().enumerate() {
+        grid[[i, train_age_idx]] = t;
+    }
+    let mean_design = build_term_collection_design(grid.view(), &fit.meanspec_resolved)
+        .expect("rebuild mean design at test points");
+    let scale_design = build_term_collection_design(grid.view(), &fit.noisespec_resolved)
+        .expect("rebuild log-sigma design at test points");
+
+    let mu_test: Vec<f64> = mean_design.design.apply(&beta_location).to_vec();
+    let eta_sigma_test: Vec<f64> = scale_design.design.apply(&beta_scale).to_vec();
+    let sigma_test: Vec<f64> = eta_sigma_test
+        .iter()
+        .map(|&e| LOGB_SIGMA_FLOOR + e.exp())
+        .collect();
+
+    assert_eq!(mu_test.len(), n_test);
+    assert_eq!(sigma_test.len(), n_test);
+    for &s in &sigma_test {
+        assert!(
+            s > 0.0 && s.is_finite(),
+            "predicted sigma must be positive/finite: {s}"
+        );
+    }
+
+    // ---- HOMOSCEDASTIC baseline: gam's mean predictions, but a single ------
+    // constant sigma = RMS of gam's predicted sigmas. This isolates the value
+    // of the SCALE channel: same locations, scale knowledge thrown away.
+    let sigma_const = {
+        let ms: f64 = sigma_test.iter().map(|s| s * s).sum::<f64>() / n_test as f64;
+        ms.sqrt()
+    };
+    let mu_base: Vec<f64> = mu_test.clone();
+    let sigma_base: Vec<f64> = vec![sigma_const; n_test];
+
+    // ---- diagnostic: gam's own-backend CRPS at the held-out (y, mu, sigma) -
+    let gam_crps_self: Vec<f64> = (0..n_test)
+        .map(|i| gam_crps_gaussian(gag_test[i], mu_test[i], sigma_test[i]))
+        .collect();
+
+    // ---- properscoring scores gam + the homoscedastic baseline on one ruler
+    let ref_py = run_python(
+        &[
+            Column::new("y_test", &gag_test),
+            Column::new("mu_gam", &mu_test),
+            Column::new("sigma_gam", &sigma_test),
+            Column::new("mu_base", &mu_base),
+            Column::new("sigma_base", &sigma_base),
+        ],
+        r#"
+import properscoring as ps
+y = np.asarray(df["y_test"], dtype=float)
+def crps(mu, sig):
+    return ps.crps_gaussian(y,
+                            mu=np.asarray(df[mu], dtype=float),
+                            sig=np.asarray(df[sig], dtype=float))
+emit("crps_gam", crps("mu_gam", "sigma_gam"))
+emit("crps_base", crps("mu_base", "sigma_base"))
+"#,
+    );
+    let ps_crps_gam = ref_py.vector("crps_gam");
+    let ps_crps_base = ref_py.vector("crps_base");
+    assert_eq!(ps_crps_gam.len(), n_test, "properscoring gam CRPS length");
+    assert_eq!(ps_crps_base.len(), n_test, "properscoring baseline CRPS length");
+
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    let mean_gam = mean(ps_crps_gam);
+    let mean_base = mean(ps_crps_base);
+
+    // Held-out response spread sets the ABSOLUTE calibration bar. The
+    // information-free predictor is the MARGINAL Gaussian N(mean(y), sd(y)) — it
+    // knows nothing about Age. Its expected CRPS, for y itself drawn ~ N(m, s),
+    // is exactly E[CRPS(N(0,1), Z)] * sd(y) with Z ~ N(0,1), and that constant is
+    // the closed form 1/sqrt(pi) = 0.5641895835. A genuinely informative
+    // location-scale fit must come in well under that marginal-predictor score.
+    let y_mean = mean(&gag_test);
+    let y_sd = {
+        let ss: f64 = gag_test.iter().map(|v| (v - y_mean) * (v - y_mean)).sum();
+        (ss / n_test as f64).sqrt()
+    };
+    let crps_naive = 0.564_189_583_547_756_3 * y_sd; // E[CRPS(N(0,1), Z)] = 1/sqrt(pi)
+
+    let mean_gam_self = mean(&gam_crps_self);
+    let self_vs_ps = max_abs_diff(&gam_crps_self, ps_crps_gam);
+
+    eprintln!(
+        "gagurine GAG~s(Age) location-scale held-out: n_train={n_train} n_test={n_test} \
+         mean_crps(gam)={mean_gam:.6} mean_crps(homoscedastic)={mean_base:.6} \
+         sigma_const={sigma_const:.4} y_sd={y_sd:.4} crps_naive={crps_naive:.4} \
+         | diagnostic gam_self_crps={mean_gam_self:.6} self_vs_ps_maxabs={self_vs_ps:.3e}"
+    );
+
+    // PRIMARY — absolute held-out calibration. gam's mean CRPS must beat the
+    // information-free predictor (constant mean + marginal sd) by a clear margin:
+    // it has learned a sharp, calibrated Age-conditional law, not the marginal.
+    assert!(
+        mean_gam <= 0.75 * crps_naive,
+        "gam held-out mean CRPS not sharp vs the information-free predictor: \
+         gam={mean_gam:.6} crps_naive={crps_naive:.6} (bar=0.75*crps_naive={:.6})",
+        0.75 * crps_naive
+    );
+
+    // BASELINE — beat the homoscedastic model. Modelling sigma(Age) must pay off
+    // out-of-sample: gam's location-scale CRPS must beat the same-mean,
+    // constant-sigma Gaussian by a margin. If not, the log-sigma smooth is dead
+    // weight on this real, heteroscedastic dataset.
+    assert!(
+        mean_gam <= mean_base - 1e-3 * crps_naive,
         "gam location-scale did not beat the homoscedastic baseline on held-out CRPS: \
          gam={mean_gam:.6} homoscedastic={mean_base:.6}"
     );

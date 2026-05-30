@@ -42,6 +42,7 @@ use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_pytho
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::io::Write;
+use std::path::Path;
 
 #[test]
 fn gam_logistic_1d_shape_matches_pygam_on_logit_scale() {
@@ -232,5 +233,238 @@ emit("edf", [float(gam.statistics_["edof"])])
         gam_err <= pygam_err * 1.10,
         "gam's truth-recovery error exceeds pyGAM's by >10%: \
          gam={gam_err:.4} pygam={pygam_err:.4}"
+    );
+}
+
+/// Held-out AUC (rank statistic = P(score_pos > score_neg)) of `score` against
+/// binary `label`, computed in plain Rust via the Mann-Whitney U identity with
+/// average ranks for ties. 1.0 is perfect separation, 0.5 is chance.
+fn auc(score: &[f64], label: &[f64]) -> f64 {
+    assert_eq!(score.len(), label.len(), "auc length mismatch");
+    let n = score.len();
+    // Rank the scores (1-based), averaging ranks within tied groups.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| score[a].partial_cmp(&score[b]).expect("auc: NaN score"));
+    let mut ranks = vec![0.0f64; n];
+    let mut i = 0usize;
+    while i < n {
+        let mut j = i + 1;
+        while j < n && score[order[j]] == score[order[i]] {
+            j += 1;
+        }
+        // tied block order[i..j] gets the average of ranks (i+1)..=j
+        let avg = ((i + 1 + j) as f64) / 2.0;
+        for &o in &order[i..j] {
+            ranks[o] = avg;
+        }
+        i = j;
+    }
+    let n_pos = label.iter().filter(|&&v| v > 0.5).count();
+    let n_neg = n - n_pos;
+    assert!(
+        n_pos > 0 && n_neg > 0,
+        "auc needs both classes present (pos={n_pos} neg={n_neg})"
+    );
+    let sum_ranks_pos: f64 = (0..n).filter(|&k| label[k] > 0.5).map(|k| ranks[k]).sum();
+    let u_pos = sum_ranks_pos - (n_pos as f64) * (n_pos as f64 + 1.0) / 2.0;
+    u_pos / (n_pos as f64 * n_neg as f64)
+}
+
+/// Mean binomial log-loss (negative log-likelihood per observation), with
+/// probabilities clipped off the open-interval boundary so the log is finite.
+fn log_loss(prob: &[f64], label: &[f64]) -> f64 {
+    assert_eq!(prob.len(), label.len(), "log_loss length mismatch");
+    let n = prob.len() as f64;
+    let s: f64 = prob
+        .iter()
+        .zip(label)
+        .map(|(&p, &y)| {
+            let p = p.clamp(1e-12, 1.0 - 1e-12);
+            -(y * p.ln() + (1.0 - y) * (1.0 - p).ln())
+        })
+        .sum();
+    s / n.max(1.0)
+}
+
+/// End-to-end quality on REAL data: gam's 1-D binomial(logit) smooth must
+/// PREDICT a held-out binary outcome well — measured by objective held-out AUC
+/// and log-loss — and match-or-beat pyGAM's `LogisticGAM` on the SAME metrics.
+///
+/// Dataset SOURCE: `bench/datasets/prostate.csv` — a binary prostate-cancer
+/// outcome `y` with continuous predictors `pc1`, `pc2` (principal-component
+/// scores). This arm exercises the SAME capability as the synthetic test above
+/// (a single 1-D penalized binomial/logit smooth, here `y ~ s(pc1)`), but on
+/// real data with NO known ground truth, so the quality claim is out-of-sample
+/// predictive accuracy rather than truth recovery.
+#[test]
+fn gam_logistic_1d_shape_matches_pygam_on_logit_scale_on_real_data() {
+    init_parallelism();
+
+    // ---- load the real prostate dataset (pc1 -> binary y) -----------------
+    let ds = load_csvwith_inferred_schema(Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/bench/datasets/prostate.csv"
+    )))
+    .expect("load prostate.csv");
+    let col = ds.column_map();
+    let pc1_idx = col["pc1"];
+    let y_idx = col["y"];
+    let pc1: Vec<f64> = ds.values.column(pc1_idx).to_vec();
+    let yv: Vec<f64> = ds.values.column(y_idx).to_vec();
+    let n = pc1.len();
+    assert!(n > 400, "prostate should have ~654 rows, got {n}");
+
+    // ---- deterministic train/test split: every 4th row held out ----------
+    let is_test = |i: usize| i % 4 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    assert!(
+        train_rows.len() > 300 && test_rows.len() > 100,
+        "split sizes: train={} test={}",
+        train_rows.len(),
+        test_rows.len()
+    );
+
+    let train_pc1: Vec<f64> = train_rows.iter().map(|&i| pc1[i]).collect();
+    let train_y: Vec<f64> = train_rows.iter().map(|&i| yv[i]).collect();
+    let test_pc1: Vec<f64> = test_rows.iter().map(|&i| pc1[i]).collect();
+    let test_y: Vec<f64> = test_rows.iter().map(|&i| yv[i]).collect();
+    // Both classes must be present in both splits for AUC/log-loss to be sound.
+    let train_pos = train_y.iter().filter(|&&v| v > 0.5).count();
+    let test_pos = test_y.iter().filter(|&&v| v > 0.5).count();
+    assert!(
+        train_pos > 10
+            && train_pos < train_y.len() - 10
+            && test_pos > 10
+            && test_pos < test_y.len() - 10,
+        "both classes must appear in each split: train_pos={train_pos}/{} test_pos={test_pos}/{}",
+        train_y.len(),
+        test_y.len()
+    );
+
+    // Build a training-only dataset by sub-setting the encoded rows; headers,
+    // schema and column kinds are unchanged, so the formula resolves identically.
+    let p = ds.headers.len();
+    let mut train_values = Array2::<f64>::zeros((train_rows.len(), p));
+    for (out_row, &src_row) in train_rows.iter().enumerate() {
+        for c in 0..p {
+            train_values[[out_row, c]] = ds.values[[src_row, c]];
+        }
+    }
+    let mut train_ds = ds.clone();
+    train_ds.values = train_values;
+
+    // ---- fit gam on TRAIN: y ~ s(pc1), binomial / logit / REML ------------
+    let cfg = FitConfig {
+        family: Some("binomial".to_string()),
+        link: Some("logit".to_string()),
+        ..FitConfig::default()
+    };
+    let result =
+        fit_from_formula("y ~ s(pc1, k=10)", &train_ds, &cfg).expect("gam binomial(logit) fit");
+    let FitResult::Standard(fit) = result else {
+        panic!("binomial(logit) 1-D smooth should be a Standard GAM fit");
+    };
+    let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
+
+    // gam predictions at the held-out pc1 points: rebuild the design from the
+    // frozen spec, apply beta to get the logit-scale eta, then squash to prob.
+    let mut test_grid = Array2::<f64>::zeros((test_rows.len(), p));
+    for (i, &v) in test_pc1.iter().enumerate() {
+        test_grid[[i, pc1_idx]] = v;
+    }
+    let test_design = build_term_collection_design(test_grid.view(), &fit.resolvedspec)
+        .expect("rebuild design at held-out points");
+    let gam_test_eta: Vec<f64> = test_design.design.apply(&fit.fit.beta).to_vec();
+    let gam_test_prob: Vec<f64> = gam_test_eta
+        .iter()
+        .map(|&e| 1.0 / (1.0 + (-e).exp()))
+        .collect();
+    assert_eq!(gam_test_prob.len(), test_rows.len());
+
+    // ---- fit the SAME model on TRAIN with pyGAM, predict the SAME TEST -----
+    // One run_python call exposes a single equal-length data.frame, so train and
+    // test columns must share a length: we pass train pc1/y plus the test pc1
+    // (and test count) padded into parallel train-length columns; pyGAM reads
+    // only the first `test_n` entries of the test column back.
+    let pad_to = |v: &[f64], len: usize| -> Vec<f64> {
+        let fill = v.last().copied().unwrap_or(0.0);
+        let mut out = v.to_vec();
+        out.resize(len, fill);
+        out
+    };
+    let py = run_python(
+        &[
+            Column::new("pc1", &train_pc1),
+            Column::new("y", &train_y),
+            Column::new("test_pc1", &pad_to(&test_pc1, train_pc1.len())),
+            Column::new(
+                "test_n",
+                &vec![test_pc1.len() as f64; train_pc1.len()],
+            ),
+        ],
+        r#"
+from pygam import LogisticGAM, s
+X = np.asarray(df["pc1"], dtype=float).reshape(-1, 1)
+yv = np.asarray(df["y"], dtype=float)
+k = int(np.asarray(df["test_n"], dtype=float)[0])
+Xt = np.asarray(df["test_pc1"], dtype=float)[:k].reshape(-1, 1)
+gam = LogisticGAM(s(0, n_splines=10)).fit(X, yv)
+mu = np.asarray(gam.predict_mu(Xt), dtype=float)
+emit("test_prob", mu)
+emit("edf", [float(gam.statistics_["edof"])])
+"#,
+    );
+    let pygam_test_prob = py.vector("test_prob");
+    let pygam_edf = py.scalar("edf");
+    assert_eq!(
+        pygam_test_prob.len(),
+        test_rows.len(),
+        "pyGAM held-out prediction length mismatch"
+    );
+
+    // ---- OBJECTIVE held-out metrics on gam's OWN predictions --------------
+    let gam_auc = auc(&gam_test_prob, &test_y);
+    let gam_ll = log_loss(&gam_test_prob, &test_y);
+    let pygam_auc = auc(pygam_test_prob, &test_y);
+    let pygam_ll = log_loss(pygam_test_prob, &test_y);
+
+    eprintln!(
+        "prostate s(pc1,k=10) held-out: n_train={} n_test={} gam_edf={gam_edf:.3} \
+         pygam_edf={pygam_edf:.3} gam_auc={gam_auc:.4} pygam_auc={pygam_auc:.4} \
+         gam_logloss={gam_ll:.4} pygam_logloss={pygam_ll:.4}",
+        train_rows.len(),
+        test_rows.len(),
+    );
+
+    // ---- PRIMARY objective assertion: gam discriminates held-out classes ---
+    // pc1 is a PC score predictive of the prostate outcome; a competent 1-D
+    // binomial smooth must rank held-out positives above negatives well beyond
+    // chance (AUC = 0.5). AUC >= 0.70 is a substantive separation bar that a
+    // flat/wrong fit (AUC ~ 0.5) cannot pass, while staying honest about the
+    // intrinsic noise of a single PC predictor on a binary outcome.
+    assert!(
+        gam_auc >= 0.70,
+        "gam's held-out AUC too low: {gam_auc:.4} (< 0.70)"
+    );
+
+    // ---- BASELINE (match-or-beat) on the SAME held-out metrics -------------
+    // pyGAM's LogisticGAM is the mature baseline; gam must be no worse on AUC by
+    // more than a 0.02 absolute margin, and no worse on log-loss by more than a
+    // 10% margin. pyGAM is a competitor to beat on objective accuracy, never a
+    // fitted target to reproduce.
+    assert!(
+        gam_auc >= pygam_auc - 0.02,
+        "gam held-out AUC {gam_auc:.4} worse than pyGAM {pygam_auc:.4} by > 0.02"
+    );
+    assert!(
+        gam_ll <= pygam_ll * 1.10,
+        "gam held-out log-loss {gam_ll:.4} exceeds pyGAM {pygam_ll:.4} * 1.10"
+    );
+
+    // ---- complexity sanity: edf in a signal-appropriate range (not matched) -
+    assert!(
+        gam_edf > 1.0 && gam_edf < 30.0,
+        "gam effective dof out of sane range: {gam_edf:.3}"
     );
 }

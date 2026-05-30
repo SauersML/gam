@@ -37,8 +37,10 @@ use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+    load_csvwith_inferred_schema,
 };
 use ndarray::Array2;
+use std::path::Path;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
@@ -263,6 +265,271 @@ fn gam_factor_smooth_random_slope_matches_lme4() {
         gam_slope_rmse <= lmer_slope_rmse * 1.10,
         "gam slope recovery worse than lme4: gam={gam_slope_rmse:.5} > 1.10·lmer={:.5}",
         lmer_slope_rmse * 1.10
+    );
+}
+
+// =============================================================================
+// REAL-DATA ARM
+// =============================================================================
+//
+// The synthetic #[test] above is the accuracy proof: it asserts truth recovery
+// against a known random-slope DGP. This second #[test] exercises the SAME gam
+// capability — the factor-smooth random slope `fs(Days, Subject)` — on REAL
+// data, where the truth is unknown, so the pass criterion is OBJECTIVE held-out
+// predictive accuracy instead of truth recovery.
+//
+// Dataset: `sleepstudy` (lme4's canonical random-slope benchmark). Reaction
+// time (ms) on a psychomotor-vigilance task for 18 subjects measured over 10
+// consecutive days of sleep deprivation (Days 0..9, 10 rows per subject, n=180).
+// Each subject has their own intercept AND their own rate of slowing per day —
+// the textbook correlated random intercept + slope, modeled by lmer as
+// `Reaction ~ Days + (Days | Subject)` and by gam as `Reaction ~ fs(Days, Subject)`.
+// SOURCE: lme4 R package (`data(sleepstudy)`); Belenky et al. (2003),
+//   "Patterns of performance degradation ... during sleep restriction",
+//   J. Sleep Res. 12(1):1-12. Vendored at bench/datasets/sleepstudy.csv.
+//
+// DETERMINISTIC SPLIT: for every subject, Days 0..6 are TRAIN and Days 7,8,9 are
+// the held-out TEST block (fixed by day index, identical for every subject and
+// for both engines). Predicting the late, most-deprived days from the early-day
+// trend is exactly the random SLOPE quantity at work: a subject whose reaction
+// time degrades fast must have its per-subject slope recovered to extrapolate
+// well. A model that over-shrinks the slope variance toward the population mean
+// would predict the late days poorly and fail the held-out bar.
+//
+//   PRIMARY (objective, tool-free): held-out R^2 >= 0.55 — gam's per-subject
+//     random-slope fit explains well over half the held-out Reaction variance,
+//     far above the constant-mean predictor (R^2 = 0).
+//   BASELINE (match-or-beat): lme4::lmer fits the SAME train rows and predicts
+//     the SAME held-out rows; gam's held-out RMSE must be no worse than
+//     `lmer_test_rmse * 1.10`. lme4 is the mature baseline to match-or-beat on
+//     accuracy, never an output to replicate.
+
+const SLEEPSTUDY_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/sleepstudy.csv");
+
+/// Coefficient of determination of `pred` against observed `truth`, relative to
+/// the held-out mean predictor: `1 - SS_res / SS_tot`. R2 = 1 perfect, 0 matches
+/// predicting the held-out mean, < 0 worse than the mean.
+fn r2(pred: &[f64], truth: &[f64]) -> f64 {
+    assert_eq!(pred.len(), truth.len(), "r2 length mismatch");
+    let n = truth.len() as f64;
+    let mean = truth.iter().sum::<f64>() / n;
+    let ss_res: f64 = pred.iter().zip(truth).map(|(p, t)| (t - p) * (t - p)).sum();
+    let ss_tot: f64 = truth.iter().map(|t| (t - mean) * (t - mean)).sum();
+    1.0 - ss_res / ss_tot.max(1e-300)
+}
+
+#[test]
+fn gam_factor_smooth_random_slope_matches_lme4_on_real_data() {
+    init_parallelism();
+
+    // ---- load the real sleepstudy dataset (Days, Subject -> Reaction) -------
+    let ds = load_csvwith_inferred_schema(Path::new(SLEEPSTUDY_CSV)).expect("load sleepstudy.csv");
+    let col = ds.column_map();
+    let days_idx = col["Days"];
+    let subject_idx = col["Subject"];
+    let reaction_idx = col["Reaction"];
+    let days_all: Vec<f64> = ds.values.column(days_idx).to_vec();
+    let reaction_all: Vec<f64> = ds.values.column(reaction_idx).to_vec();
+    // Subject IDs (308, 309, ...) parse as f64, so the loader infers them as a
+    // Continuous column. `fs(Days, Subject)` needs a Categorical factor, so we
+    // read the raw integer subject id back out and re-emit it below as a
+    // non-numeric label ("s308"), exactly like the synthetic arm prefixes "g".
+    let subject_raw: Vec<f64> = ds.values.column(subject_idx).to_vec();
+    let n = days_all.len();
+    assert_eq!(n, 180, "sleepstudy should have 18 subjects x 10 days = 180 rows, got {n}");
+
+    // Sorted unique subject ids; the sorted position is the categorical level
+    // index gam will assign, because we emit the training records subject-by-
+    // subject in this order and the encoder assigns level indices in first-
+    // appearance order.
+    let mut subjects: Vec<i64> = subject_raw.iter().map(|&s| s.round() as i64).collect();
+    subjects.sort_unstable();
+    subjects.dedup();
+    let n_subjects = subjects.len();
+    assert_eq!(n_subjects, 18, "sleepstudy should have 18 subjects, got {n_subjects}");
+
+    // ---- deterministic split: Days 0..6 TRAIN, Days 7,8,9 held-out TEST -----
+    // Identical rows in identical order to gam and lme4 (we build the row lists
+    // once and reuse them for both). The split is purely a function of the day
+    // index, so it is fully reproducible and shared across engines.
+    let is_test_day = |d: f64| d.round() as i64 >= 7;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test_day(days_all[i])).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test_day(days_all[i])).collect();
+    assert_eq!(train_rows.len(), 18 * 7, "train should be 18 subjects x 7 days");
+    assert_eq!(test_rows.len(), 18 * 3, "test should be 18 subjects x 3 days");
+
+    // ---- build a CATEGORICAL-Subject training dataset for gam ---------------
+    // Emit records grouped by sorted subject so subject `subjects[k]` is first
+    // seen at its block and is assigned categorical level index `k`. Within each
+    // subject the rows are its TRAIN days in ascending day order.
+    let headers = vec![
+        "Days".to_string(),
+        "Subject".to_string(),
+        "Reaction".to_string(),
+    ];
+    let mut train_records: Vec<StringRecord> = Vec::with_capacity(train_rows.len());
+    for &sid in subjects.iter() {
+        // Gather this subject's training rows, ordered by day.
+        let mut subj_rows: Vec<usize> = train_rows
+            .iter()
+            .copied()
+            .filter(|&i| subject_raw[i].round() as i64 == sid)
+            .collect();
+        subj_rows.sort_by(|&a, &b| days_all[a].partial_cmp(&days_all[b]).expect("finite day"));
+        for i in subj_rows {
+            train_records.push(StringRecord::from(vec![
+                days_all[i].to_string(),
+                format!("s{sid}"),
+                reaction_all[i].to_string(),
+            ]));
+        }
+    }
+    assert_eq!(train_records.len(), train_rows.len(), "train record count");
+    let train_ds = encode_recordswith_inferred_schema(headers, train_records)
+        .expect("encode categorical-Subject sleepstudy train set");
+    let tcol = train_ds.column_map();
+    let t_days_idx = tcol["Days"];
+    let t_subject_idx = tcol["Subject"];
+
+    // ---- fit gam on TRAIN: Reaction ~ fs(Days, Subject), REML ---------------
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let result =
+        fit_from_formula("Reaction ~ fs(Days, Subject)", &train_ds, &cfg).expect("gam fs fit");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected a standard GAM fit for a gaussian factor-smooth");
+    };
+    let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
+
+    // ---- canonical held-out evaluation grid: (subject, day) in one order ----
+    // Built ONCE in sorted-subject / ascending-day order, then used to drive
+    // BOTH gam's design rebuild and lme4's prediction frame, and to slice the
+    // observed held-out Reaction. This guarantees identical test rows in the
+    // same order for every engine and the metrics.
+    let mut grid_days: Vec<f64> = Vec::with_capacity(test_rows.len());
+    let mut grid_subject_id: Vec<i64> = Vec::with_capacity(test_rows.len());
+    let mut grid_level: Vec<usize> = Vec::with_capacity(test_rows.len());
+    let mut grid_truth: Vec<f64> = Vec::with_capacity(test_rows.len());
+    for (level, &sid) in subjects.iter().enumerate() {
+        let mut subj_test: Vec<usize> = test_rows
+            .iter()
+            .copied()
+            .filter(|&i| subject_raw[i].round() as i64 == sid)
+            .collect();
+        subj_test.sort_by(|&a, &b| days_all[a].partial_cmp(&days_all[b]).expect("finite day"));
+        for i in subj_test {
+            grid_days.push(days_all[i]);
+            grid_subject_id.push(sid);
+            grid_level.push(level);
+            grid_truth.push(reaction_all[i]);
+        }
+    }
+    let grid_len = grid_days.len();
+    assert_eq!(grid_len, test_rows.len(), "eval grid length");
+
+    // gam predictions at the held-out (subject, day) points: the factor column
+    // carries the encoded level index so each row is evaluated against ITS OWN
+    // subject's smooth block; identity link => design*beta = predicted mean.
+    let mut grid = Array2::<f64>::zeros((grid_len, train_ds.headers.len()));
+    for r in 0..grid_len {
+        grid[[r, t_days_idx]] = grid_days[r];
+        grid[[r, t_subject_idx]] = grid_level[r] as f64;
+    }
+    let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
+        .expect("rebuild design at held-out grid");
+    let gam_test_pred: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
+    assert_eq!(gam_test_pred.len(), grid_len, "gam prediction length mismatch");
+
+    // ---- fit the SAME model on TRAIN with lme4, predict the SAME TEST -------
+    // One run_r call, all columns equal length: we pass the TRAIN rows (Days,
+    // Subject, Reaction) plus the held-out grid (test_days, test_subject)
+    // right-padded to the train length, and a test_n count. lmer fits on the
+    // train rows and predicts the first test_n entries of the padded grid.
+    let train_days: Vec<f64> = train_rows.iter().map(|&i| days_all[i]).collect();
+    let train_subject: Vec<f64> =
+        train_rows.iter().map(|&i| subject_raw[i].round()).collect();
+    let train_reaction: Vec<f64> = train_rows.iter().map(|&i| reaction_all[i]).collect();
+    let m_train = train_days.len();
+    let test_days_padded = pad_to(&grid_days, m_train);
+    let grid_subject_f: Vec<f64> = grid_subject_id.iter().map(|&s| s as f64).collect();
+    let test_subject_padded = pad_to(&grid_subject_f, m_train);
+
+    let r = run_r(
+        &[
+            Column::new("Days", &train_days),
+            Column::new("Subject", &train_subject),
+            Column::new("Reaction", &train_reaction),
+            Column::new("test_days", &test_days_padded),
+            Column::new("test_subject", &test_subject_padded),
+            Column::new("test_n", &vec![grid_len as f64; m_train]),
+        ],
+        r#"
+        suppressPackageStartupMessages(library(lme4))
+        df$Subject <- factor(as.integer(round(df$Subject)))
+        m <- lmer(Reaction ~ 1 + Days + (Days | Subject), data = df,
+                  control = lmerControl(check.conv.singular = "ignore"))
+        k <- df$test_n[1]
+        newd <- data.frame(
+          Days    = df$test_days[1:k],
+          Subject = factor(as.integer(round(df$test_subject[1:k])),
+                           levels = levels(df$Subject))
+        )
+        emit("test_pred", as.numeric(predict(m, newdata = newd)))
+        "#,
+    );
+    let lmer_test_pred = r.vector("test_pred");
+    assert_eq!(
+        lmer_test_pred.len(),
+        grid_len,
+        "lmer held-out prediction length mismatch"
+    );
+
+    // ---- objective held-out metrics on each engine's OWN predictions --------
+    let gam_test_r2 = r2(&gam_test_pred, &grid_truth);
+    let gam_test_rmse = rmse(&gam_test_pred, &grid_truth);
+    let lmer_test_rmse = rmse(lmer_test_pred, &grid_truth);
+
+    // gam-vs-lmer agreement: printed for context only, NOT a pass criterion.
+    let pred_corr = pearson(&gam_test_pred, lmer_test_pred);
+
+    eprintln!(
+        "sleepstudy fs(Days,Subject) held-out (Days 7-9): n_train={} n_test={grid_len} \
+         subjects={n_subjects} gam_edf={gam_edf:.3}\n  \
+         held-out  gam_R2={gam_test_r2:.4} gam_rmse={gam_test_rmse:.4} \
+         lmer_rmse={lmer_test_rmse:.4}\n  \
+         [context only] gam-vs-lmer pearson(test_pred)={pred_corr:.4}",
+        train_rows.len(),
+    );
+
+    // ---- PRIMARY objective assertion: gam predicts held-out Reaction --------
+    // The per-subject slope is a strong, real signal in sleepstudy (reaction
+    // time rises roughly linearly with sleep-deprivation day, at a subject-
+    // specific rate). A model that genuinely recovers each subject's random
+    // slope extrapolates the late days well and explains well over half the
+    // held-out variance. R2 >= 0.55 is far above the constant-mean baseline (0)
+    // and would catch a collapse of the per-subject slope heterogeneity.
+    assert!(
+        gam_test_r2 >= 0.55,
+        "gam held-out R2 too low on sleepstudy: {gam_test_r2:.4} (< 0.55)"
+    );
+
+    // ---- BASELINE (match-or-beat): no worse than lme4 on held-out RMSE ------
+    // lme4 (Reaction ~ Days + (Days | Subject)) is the mature mixed-model
+    // reference; gam's held-out RMSE must be no worse than 1.10x lme4's on the
+    // SAME held-out rows. A match-or-beat baseline, never a target to replicate.
+    assert!(
+        gam_test_rmse <= lmer_test_rmse * 1.10,
+        "gam held-out RMSE {gam_test_rmse:.4} exceeds lme4 {lmer_test_rmse:.4} * 1.10"
+    );
+
+    // ---- complexity sanity: edf in a signal-appropriate range (not matched) -
+    // 18 subjects each contributing a (near-linear) per-subject trend plus a
+    // population trend; the random-slope edf should sit well inside (1, n_train).
+    assert!(
+        gam_edf > 2.0 && gam_edf < train_rows.len() as f64,
+        "gam effective dof out of sane range: {gam_edf:.3}"
     );
 }
 

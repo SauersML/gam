@@ -32,11 +32,12 @@
 //! `rel_l2` between the two centers is printed for context but never asserted.
 
 use gam::test_support::reference::{Column, relative_l2, run_python};
-use gam::{RiemannianManifold, SpdManifold};
+use gam::{RiemannianManifold, SpdManifold, load_csvwith_inferred_schema};
 use ndarray::{Array1, Array2, ArrayView1};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, StandardNormal};
+use std::path::Path;
 
 const N: usize = 4; // 4x4 SPD matrices
 const M: usize = 10; // number of samples
@@ -279,5 +280,334 @@ emit("mean", 0.5 * (P + P.T).reshape(-1))
         "gam fails to match-or-beat the reference on the Fréchet objective: \
          V(P_gam)={v_gam:.6e} > V(P_ref)*(1+1e-9)={:.6e}",
         v_ref * (1.0 + 1e-9)
+    );
+}
+
+// ===========================================================================
+// REAL-DATA ARM
+// ===========================================================================
+//
+// Dataset SOURCE: the classic Leptograpsus "crabs" morphometrics table
+// (Campbell & Mahon 1974; distributed as `MASS::crabs` in R, vendored here at
+// `bench/datasets/crabs.csv`). 200 rows, 5 continuous body measurements
+// (FL, RW, CL, CW, BD in mm) and two 2-level factors `sp` (species B/O) and
+// `sex` (M/F) — exactly 4 groups of 50.
+//
+// The SAME gam capability the synthetic arm proves (affine-invariant SPD
+// exp/log → Riemannian center of mass) is exercised here on real covariance
+// structure: each crab group's 5×5 sample covariance of the body measurements
+// is a genuine SPD matrix, and the four group covariances live on the SPD
+// manifold. We hold out half of every group, build the four 5×5 SPD covariances
+// from the TRAIN halves, take gam's Fréchet (Karcher) mean of those four, and
+// measure how well that train-only center predicts the four HELD-OUT group
+// covariances under the affine-invariant metric.
+//
+// OBJECTIVE held-out metric (truth unknown on real data):
+//   V_test(P) = (1/G) Σ_g d²(P, C_test_g)  — mean squared geodesic distance from
+//   the center P to each group's TEST-half covariance, all distances via gam.
+//
+//   PRIMARY (absolute, tool-free bar): gam's train-only center must predict the
+//   held-out covariances strictly better than the two naive baselines on this
+//   SAME metric — below V_test at the Euclidean (entrywise) mean of the train
+//   covariances and below V_test at every individual train-group covariance.
+//   This is an honest generalization claim: the Riemannian center transfers to
+//   unseen samples of the same groups.
+//
+//   BASELINE (match-or-beat): a scipy/NumPy re-implementation computes its own
+//   Fréchet mean from the IDENTICAL train covariances; gam's held-out
+//   V_test(P_gam) must be ≤ V_test(P_ref) + margin. The mature tool is a
+//   baseline to match, never an output to copy.
+
+const SPD_DIM: usize = 5; // FL, RW, CL, CW, BD
+const N_GROUPS: usize = 4; // species × sex
+const REAL_ITERS: usize = 200; // fixed-point iterations (gam and reference share this)
+
+/// Sample covariance (population-normalized by `rows.len()`, then a tiny ridge
+/// added to the diagonal) of the selected `rows` over the `SPD_DIM` measurement
+/// columns `meas[d]` (each a full-length column indexed by absolute row id).
+/// Returns a flat row-major `SPD_DIM*SPD_DIM` vector. The ridge keeps the
+/// matrix safely SPD for both engines' Cholesky/eigendecompositions.
+fn group_covariance_flat(meas: &[Vec<f64>; SPD_DIM], rows: &[usize]) -> Array1<f64> {
+    let m = rows.len() as f64;
+    assert!(m > SPD_DIM as f64, "need more rows than dims for an SPD covariance");
+    let mut mean = [0.0f64; SPD_DIM];
+    for d in 0..SPD_DIM {
+        let s: f64 = rows.iter().map(|&r| meas[d][r]).sum();
+        mean[d] = s / m;
+    }
+    let mut cov = Array2::<f64>::zeros((SPD_DIM, SPD_DIM));
+    for &r in rows {
+        let mut centered = [0.0f64; SPD_DIM];
+        for d in 0..SPD_DIM {
+            centered[d] = meas[d][r] - mean[d];
+        }
+        for i in 0..SPD_DIM {
+            for j in 0..SPD_DIM {
+                cov[[i, j]] += centered[i] * centered[j];
+            }
+        }
+    }
+    cov /= m;
+    for i in 0..SPD_DIM {
+        cov[[i, i]] += 1e-6;
+    }
+    // Defensive symmetrization, then row-major flatten for gam's flat API.
+    let cov = symmetrize(&cov);
+    Array1::from_iter(cov.iter().copied())
+}
+
+/// Karcher-mean fixed point of `samples` (flat `SPD_DIM*SPD_DIM` vectors) at base
+/// point `init`, using gam's `exp_map`/`log_map`. Dimension-parameterized twin
+/// of the synthetic `gam_frechet_mean` so the synthetic arm stays untouched.
+fn gam_frechet_mean_dim(spd: &SpdManifold, samples: &[Array1<f64>], init: &Array1<f64>) -> Array1<f64> {
+    let dim2 = SPD_DIM * SPD_DIM;
+    let mut p = init.clone();
+    for _ in 0..REAL_ITERS {
+        let mut acc = Array1::<f64>::zeros(dim2);
+        for x in samples {
+            let lg = spd.log_map(p.view(), x.view()).expect("gam log_map (real)");
+            acc += &lg;
+        }
+        acc /= samples.len() as f64;
+        p = spd.exp_map(p.view(), acc.view()).expect("gam exp_map (real)");
+    }
+    p
+}
+
+/// Squared affine-invariant distance via gam (tangent from `log_map`, squared
+/// metric norm `vᵀ G(P) v` from `metric_tensor`). Dimension-agnostic — reuses
+/// gam at whatever ambient size `p`/`x` carry.
+fn gam_sq_dist_any(spd: &SpdManifold, p: ArrayView1<f64>, x: ArrayView1<f64>) -> f64 {
+    let v = spd.log_map(p, x).expect("gam log_map for real distance");
+    let g = spd.metric_tensor(p).expect("gam metric_tensor (real)");
+    let gv = g.dot(&v);
+    v.dot(&gv)
+}
+
+/// Held-out dispersion `V_test(P) = (1/G) Σ_g d²(P, C_test_g)` via gam.
+fn gam_dispersion_any(spd: &SpdManifold, p: ArrayView1<f64>, samples: &[Array1<f64>]) -> f64 {
+    let s: f64 = samples.iter().map(|x| gam_sq_dist_any(spd, p, x.view())).sum();
+    s / samples.len() as f64
+}
+
+#[test]
+fn spd_frechet_mean_is_the_riemannian_center_of_mass_on_real_data() {
+    // ---- load the real crabs morphometrics table --------------------------
+    let ds = load_csvwith_inferred_schema(Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/bench/datasets/crabs.csv"
+    )))
+    .expect("load crabs.csv");
+    let col = ds.column_map();
+    let n = ds.values.nrows();
+    assert_eq!(n, 200, "crabs should have 200 rows, got {n}");
+
+    // Five continuous body measurements (full-length columns, absolute-row idx).
+    let meas_names = ["FL", "RW", "CL", "CW", "BD"];
+    let meas: [Vec<f64>; SPD_DIM] = std::array::from_fn(|d| {
+        let idx = col[meas_names[d]];
+        ds.values.column(idx).to_vec()
+    });
+    // The two 2-level factors are stored as integer level codes; group =
+    // sp_code*2 + sex_code gives the four species×sex groups, recovered
+    // row-aligned from the dataset itself (no reliance on row ordering).
+    let sp_idx = col["sp"];
+    let sex_idx = col["sex"];
+    let sp_code: Vec<f64> = ds.values.column(sp_idx).to_vec();
+    let sex_code: Vec<f64> = ds.values.column(sex_idx).to_vec();
+    let group_of = |r: usize| -> usize {
+        (sp_code[r].round() as usize) * 2 + (sex_code[r].round() as usize)
+    };
+
+    // ---- deterministic train/test split: even row-index in a group = train,
+    // odd = test. Done per group so both halves of every group are populated.
+    let mut train_rows: Vec<Vec<usize>> = vec![Vec::new(); N_GROUPS];
+    let mut test_rows: Vec<Vec<usize>> = vec![Vec::new(); N_GROUPS];
+    {
+        let mut seen = [0usize; N_GROUPS];
+        for r in 0..n {
+            let g = group_of(r);
+            assert!(g < N_GROUPS, "unexpected crab group code {g}");
+            if seen[g] % 2 == 0 {
+                train_rows[g].push(r);
+            } else {
+                test_rows[g].push(r);
+            }
+            seen[g] += 1;
+        }
+    }
+    for g in 0..N_GROUPS {
+        assert!(
+            train_rows[g].len() >= 20 && test_rows[g].len() >= 20,
+            "crab group {g} split too small: train={} test={}",
+            train_rows[g].len(),
+            test_rows[g].len()
+        );
+    }
+
+    // ---- four TRAIN and four TEST 5×5 SPD group covariances ----------------
+    let train_cov: Vec<Array1<f64>> = (0..N_GROUPS)
+        .map(|g| group_covariance_flat(&meas, &train_rows[g]))
+        .collect();
+    let test_cov: Vec<Array1<f64>> = (0..N_GROUPS)
+        .map(|g| group_covariance_flat(&meas, &test_rows[g]))
+        .collect();
+
+    // ---- gam: Karcher mean of the four TRAIN covariances -------------------
+    let spd = SpdManifold::new(SPD_DIM);
+    let p = gam_frechet_mean_dim(&spd, &train_cov, &train_cov[0]);
+
+    // sanity: gam's center is a genuine stationary point on TRAIN — residual
+    // Riemannian gradient (tangent mean) vanishes in the affine-invariant norm.
+    let dim2 = SPD_DIM * SPD_DIM;
+    let mut tangent_mean = Array1::<f64>::zeros(dim2);
+    for x in &train_cov {
+        tangent_mean += &spd.log_map(p.view(), x.view()).expect("gam log_map (real grad)");
+    }
+    tangent_mean /= N_GROUPS as f64;
+    let grad_sq = gam_sq_dist_any(&spd, p.view(), p.view()); // 0 baseline; see below
+    assert!(grad_sq.abs() < 1e-12, "self-distance must be zero");
+    let g_at_p = spd.metric_tensor(p.view()).expect("gam metric_tensor (real grad)");
+    let grad_norm = tangent_mean.dot(&g_at_p.dot(&tangent_mean)).sqrt();
+    assert!(
+        grad_norm < 1e-6,
+        "gam's real-data SPD center is not a Fréchet stationary point: residual \
+         Riemannian gradient norm {grad_norm:.3e} (>=1e-6)"
+    );
+
+    // ---- PRIMARY objective: held-out dispersion of gam's train-only center -
+    let v_test_gam = gam_dispersion_any(&spd, p.view(), &test_cov);
+
+    // Baseline 1: Euclidean (entrywise) mean of the TRAIN covariances — an SPD
+    // point that is the WRONG center under the affine-invariant metric.
+    let mut euclid = Array1::<f64>::zeros(dim2);
+    for x in &train_cov {
+        euclid += x;
+    }
+    euclid /= N_GROUPS as f64;
+    let v_test_euclid = gam_dispersion_any(&spd, euclid.view(), &test_cov);
+
+    eprintln!(
+        "crabs SPD Fréchet (5x5, G={N_GROUPS}, {REAL_ITERS} iters): grad_norm={grad_norm:.3e} \
+         V_test(P_gam)={v_test_gam:.6e} V_test(euclid)={v_test_euclid:.6e}"
+    );
+
+    assert!(
+        v_test_gam < v_test_euclid,
+        "gam's Riemannian center does not beat the Euclidean mean on HELD-OUT \
+         dispersion: V_test(P_gam)={v_test_gam:.6e} not below \
+         V_test(euclid)={v_test_euclid:.6e}"
+    );
+    for (g, x) in train_cov.iter().enumerate() {
+        let v_at_train = gam_dispersion_any(&spd, x.view(), &test_cov);
+        assert!(
+            v_test_gam < v_at_train,
+            "gam's center does not predict held-out covariances better than \
+             train group {g}'s own covariance: V_test(P_gam)={v_test_gam:.6e} \
+             not below V_test(train_cov[{g}])={v_at_train:.6e}"
+        );
+    }
+    // Absolute numeric bar: a real, finite, well-conditioned center.
+    assert!(
+        v_test_gam.is_finite() && v_test_gam > 0.0 && v_test_gam < 5.0,
+        "held-out dispersion V_test(P_gam)={v_test_gam:.6e} outside the sane \
+         absolute range (0, 5)"
+    );
+
+    // ---- BASELINE (match-or-beat): scipy/NumPy Fréchet mean on the SAME
+    // TRAIN covariances, evaluated on the SAME TEST covariances. Pass all eight
+    // 5×5 matrices as 4-length columns (one per group; train_* and test_*),
+    // every column equal length = N_GROUPS, in identical group order.
+    let mut cols_owned: Vec<(String, Vec<f64>)> = Vec::new();
+    for k in 0..dim2 {
+        let train_k: Vec<f64> = (0..N_GROUPS).map(|g| train_cov[g][k]).collect();
+        let test_k: Vec<f64> = (0..N_GROUPS).map(|g| test_cov[g][k]).collect();
+        cols_owned.push((format!("tr{k}"), train_k));
+        cols_owned.push((format!("te{k}"), test_k));
+    }
+    let cols: Vec<Column<'_>> = cols_owned
+        .iter()
+        .map(|(name, data)| Column::new(name.as_str(), data.as_slice()))
+        .collect();
+
+    let body = format!(
+        r#"
+D = {D}
+G = {G}
+ITERS = {ITERS}
+KMAX = D * D - 1
+
+def build(prefix):
+    mats = []
+    for g in range(G):
+        flatrow = [float(df["%s%d" % (prefix, k)][g]) for k in range(D * D)]
+        A = np.asarray(flatrow, dtype=float).reshape(D, D)
+        mats.append(0.5 * (A + A.T))
+    return mats
+
+train = build("tr")
+test = build("te")
+
+def sym_eig_map(P, f):
+    w, V = np.linalg.eigh(0.5 * (P + P.T))
+    return (V * f(w)) @ V.T
+
+def spd_log(P, Q):
+    sp = sym_eig_map(P, np.sqrt)
+    isp = sym_eig_map(P, lambda x: 1.0 / np.sqrt(x))
+    mid = isp @ Q @ isp
+    return sp @ sym_eig_map(mid, np.log) @ sp
+
+def spd_exp(P, U):
+    sp = sym_eig_map(P, np.sqrt)
+    isp = sym_eig_map(P, lambda x: 1.0 / np.sqrt(x))
+    mid = isp @ U @ isp
+    mid = 0.5 * (mid + mid.T)
+    return sp @ sym_eig_map(mid, np.exp) @ sp
+
+def sq_dist(P, Q):
+    # affine-invariant squared distance = sum(log(eig(isqrt(P) Q isqrt(P)))**2)
+    isp = sym_eig_map(P, lambda x: 1.0 / np.sqrt(x))
+    mid = isp @ Q @ isp
+    w = np.linalg.eigvalsh(0.5 * (mid + mid.T))
+    return float(np.sum(np.log(w) ** 2))
+
+# Fréchet mean of the TRAIN covariances (identical recursion to gam).
+P = train[0].copy()
+for _ in range(ITERS):
+    acc = np.zeros((D, D))
+    for X in train:
+        acc = acc + spd_log(P, X)
+    acc = acc / G
+    P = spd_exp(P, acc)
+
+# Held-out dispersion of the reference center against the TEST covariances.
+v_test_ref = sum(sq_dist(P, C) for C in test) / G
+emit("mean", 0.5 * (P + P.T).reshape(-1))
+emit("v_test_ref", [v_test_ref])
+"#,
+        D = SPD_DIM,
+        G = N_GROUPS,
+        ITERS = REAL_ITERS,
+    );
+
+    let r = run_python(&cols, &body);
+    let scipy_mean = r.vector("mean");
+    assert_eq!(scipy_mean.len(), dim2, "reference real mean length mismatch");
+    let v_test_ref = r.scalar("v_test_ref");
+
+    // Context-only: closeness of the two centers (never asserted).
+    let gam_flat: Vec<f64> = p.to_vec();
+    let rel = relative_l2(&gam_flat, scipy_mean);
+    eprintln!(
+        "crabs SPD center rel_l2(gam, numpy-reimpl)={rel:.3e} (context only); \
+         V_test(P_ref)={v_test_ref:.6e}"
+    );
+
+    assert!(
+        v_test_gam <= v_test_ref + 1e-9,
+        "gam fails to match-or-beat the reference on the HELD-OUT Fréchet \
+         objective: V_test(P_gam)={v_test_gam:.6e} > V_test(P_ref)+1e-9={:.6e}",
+        v_test_ref + 1e-9
     );
 }

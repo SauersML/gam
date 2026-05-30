@@ -292,6 +292,197 @@ emit("coef1", [float(clf1.coef_[0, 0]), float(clf1.intercept_[0])])
     );
 }
 
+/// Binary cross-entropy (log-loss) of probability scores against 0/1 labels,
+/// averaged over the held-out cases. Probabilities are clamped away from {0,1}
+/// so a single confident miss cannot send the metric to +inf — the standard
+/// numerically-stable log-loss. Lower is better; the constant base rate gives
+/// the entropy of the label distribution as a reference ceiling.
+fn log_loss(probs: &[f64], labels: &[f64]) -> f64 {
+    assert_eq!(probs.len(), labels.len(), "log_loss length mismatch");
+    let eps = 1e-15;
+    let s: f64 = probs
+        .iter()
+        .zip(labels)
+        .map(|(&p, &y)| {
+            let pc = p.clamp(eps, 1.0 - eps);
+            -(y * pc.ln() + (1.0 - y) * (1.0 - pc).ln())
+        })
+        .sum();
+    s / probs.len() as f64
+}
+
+/// SECOND real-data arm exercising the SAME gam capability — penalized
+/// Binomial(logit) GAM smooths — on the real `prostate.csv` binary outcome,
+/// but pinned to a DIFFERENT objective metric than the AUC arm above:
+/// held-out **log-loss** (mean binary cross-entropy). Log-loss is a strictly
+/// proper scoring rule, so it grades probability *calibration*, not just rank
+/// order: a model that ranks held-out cases well (good AUC) but emits
+/// over/under-confident probabilities (e.g. a broken link inversion or a
+/// mis-scaled penalty) is penalized here even when its AUC looks fine. The
+/// link inversion `1/(1+exp(-eta))` is applied by us on gam's own linear
+/// predictor at the held-out rows.
+///
+/// Dataset SOURCE: `bench/datasets/prostate.csv` (pc1, pc2 -> binary y), the
+/// same real prostate principal-component features used by the AUC arm.
+///
+/// Objective metric asserted (real data => truth unknown):
+///   (1) absolute bar — gam held-out log-loss <= 0.62 (below the ~0.69 nats
+///       entropy of a near-balanced coin, i.e. gam beats the no-skill base
+///       rate by a real margin), and
+///   (2) match-or-beat — gam log-loss <= best_ref + 0.02 against the best of
+///       mgcv (penalized binomial GAM) and scikit-learn LogisticRegression on
+///       the IDENTICAL train/test split. Lower is better, so the slack is on
+///       the high side. The reference tools are baselines, never targets to
+///       reproduce.
+#[test]
+fn gam_binomial_logit_generalizes_on_heldout_prostate_on_real_data() {
+    init_parallelism();
+
+    // ---- load the real prostate binary outcome (y ~ pc1, pc2) -------------
+    let ds = load_csvwith_inferred_schema(Path::new(PROSTATE_CSV)).expect("load prostate.csv");
+    let col = ds.column_map();
+    let pc1_idx = col["pc1"];
+    let pc2_idx = col["pc2"];
+    let y_idx = col["y"];
+    let pc1: Vec<f64> = ds.values.column(pc1_idx).to_vec();
+    let pc2: Vec<f64> = ds.values.column(pc2_idx).to_vec();
+    let y: Vec<f64> = ds.values.column(y_idx).to_vec();
+    let n = pc1.len();
+    assert!(n > 600, "prostate should have ~654 rows, got {n}");
+    for &yi in &y {
+        assert!(yi == 0.0 || yi == 1.0, "y must be binary 0/1, saw {yi}");
+    }
+
+    // ---- deterministic train/test split (every 4th row -> test) -----------
+    // Identical fixed, RNG-free split as the AUC arm: rows with index % 4 == 0
+    // are held out for evaluation, the rest train. The SAME train/test rows in
+    // the SAME order are handed to gam and to both reference tools.
+    let test_rows: Vec<usize> = (0..n).filter(|i| i % 4 == 0).collect();
+    let train_rows: Vec<usize> = (0..n).filter(|i| i % 4 != 0).collect();
+    let y_test: Vec<f64> = test_rows.iter().map(|&i| y[i]).collect();
+    let pc1_train: Vec<f64> = train_rows.iter().map(|&i| pc1[i]).collect();
+    let pc2_train: Vec<f64> = train_rows.iter().map(|&i| pc2[i]).collect();
+    let y_train: Vec<f64> = train_rows.iter().map(|&i| y[i]).collect();
+    let pc1_test: Vec<f64> = test_rows.iter().map(|&i| pc1[i]).collect();
+    let pc2_test: Vec<f64> = test_rows.iter().map(|&i| pc2[i]).collect();
+    let ntest = test_rows.len();
+    {
+        let n_pos = y_test.iter().filter(|&&v| v > 0.5).count();
+        assert!(
+            n_pos > 0 && n_pos < y_test.len(),
+            "held-out test set must contain both classes (pos={n_pos}, n={ntest})"
+        );
+    }
+
+    let cfg = FitConfig {
+        family: Some("binomial".to_string()),
+        link: Some("logit".to_string()),
+        ..FitConfig::default()
+    };
+
+    // ---- (A) gam smooth binomial-logit fit on TRAIN, predict TEST ---------
+    let ds_train = subset_rows(&ds, &train_rows);
+    let result =
+        fit_from_formula("y ~ s(pc1, k=5) + s(pc2, k=5)", &ds_train, &cfg).expect("gam fit");
+    let FitResult::Standard(fit) = result else {
+        panic!("binomial(logit) GLM with smooths should be a Standard fit");
+    };
+    let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
+
+    // Rebuild the design at the HELD-OUT test rows, apply beta -> eta, then
+    // invert the logit link ourselves to get held-out fitted probabilities.
+    let mut grid = Array2::<f64>::zeros((ntest, ds.headers.len()));
+    for (r, &i) in test_rows.iter().enumerate() {
+        grid[[r, pc1_idx]] = pc1[i];
+        grid[[r, pc2_idx]] = pc2[i];
+    }
+    let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
+        .expect("rebuild design at held-out test points");
+    let gam_eta: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
+    let gam_prob: Vec<f64> = gam_eta.iter().map(|&e| inv_logit(e)).collect();
+    assert_eq!(gam_prob.len(), ntest, "gam held-out probability length");
+
+    // ---- (B) mgcv smooth baseline: fit TRAIN, predict TEST ----------------
+    let r = run_r(
+        &[
+            Column::new("pc1", &pc1_train),
+            Column::new("pc2", &pc2_train),
+            Column::new("y", &y_train),
+            Column::new("pc1_te", &pad_to(&pc1_test, train_rows.len())),
+            Column::new("pc2_te", &pad_to(&pc2_test, train_rows.len())),
+            Column::new("ntest", &vec![ntest as f64; train_rows.len()]),
+        ],
+        r#"
+        suppressPackageStartupMessages(library(mgcv))
+        m <- gam(y ~ s(pc1, k=5) + s(pc2, k=5), data = df,
+                 family = binomial(link="logit"), method = "REML")
+        ntest <- as.integer(df$ntest[1])
+        newd <- data.frame(pc1 = df$pc1_te[1:ntest], pc2 = df$pc2_te[1:ntest])
+        emit("prob", as.numeric(predict(m, newdata = newd, type = "response")))
+        "#,
+    );
+    let mgcv_prob = r.vector("prob");
+    assert_eq!(mgcv_prob.len(), ntest, "mgcv held-out probability length");
+
+    // ---- (C) scikit-learn baseline: fit TRAIN, predict TEST ---------------
+    let sk = run_python(
+        &[
+            Column::new("pc1", &pc1_train),
+            Column::new("pc2", &pc2_train),
+            Column::new("y", &y_train),
+            Column::new("pc1_te", &pad_to(&pc1_test, train_rows.len())),
+            Column::new("pc2_te", &pad_to(&pc2_test, train_rows.len())),
+            Column::new("ntest", &vec![ntest as f64; train_rows.len()]),
+        ],
+        r#"
+from sklearn.linear_model import LogisticRegression
+ntest = int(np.asarray(df["ntest"])[0])
+Xtr = np.column_stack([np.asarray(df["pc1"], float), np.asarray(df["pc2"], float)])
+ytr = np.asarray(df["y"], float)
+Xte = np.column_stack([np.asarray(df["pc1_te"], float)[:ntest],
+                       np.asarray(df["pc2_te"], float)[:ntest]])
+clf = LogisticRegression(penalty=None, solver="lbfgs", max_iter=10000)
+clf.fit(Xtr, ytr)
+emit("prob", clf.predict_proba(Xte)[:, 1])
+"#,
+    );
+    let sk_prob = sk.vector("prob");
+    assert_eq!(sk_prob.len(), ntest, "sklearn held-out probability length");
+
+    // ---- objective metric: held-out log-loss (mean binary cross-entropy) --
+    let gam_ll = log_loss(&gam_prob, &y_test);
+    let mgcv_ll = log_loss(mgcv_prob, &y_test);
+    let sk_ll = log_loss(sk_prob, &y_test);
+    let best_ref = mgcv_ll.min(sk_ll); // lower log-loss is better
+    // Context only — NOT a pass criterion.
+    let rel_mgcv = relative_l2(&gam_prob, mgcv_prob);
+    let gam_auc_ctx = auc(&gam_prob, &y_test);
+
+    eprintln!(
+        "prostate binomial(logit) HELD-OUT log-loss (n_train={} n_test={ntest}): \
+         gam_edf={gam_edf:.3} | held-out log-loss gam={gam_ll:.4} mgcv={mgcv_ll:.4} \
+         sklearn={sk_ll:.4} (best_ref={best_ref:.4}) | context: AUC(gam)={gam_auc_ctx:.4} \
+         prob_rel_l2(gam,mgcv)={rel_mgcv:.4}",
+        train_rows.len()
+    );
+
+    // (1) PRIMARY objective claim — gam's held-out probabilities are well
+    // calibrated: mean cross-entropy clears an absolute ceiling well below the
+    // ~0.69 nats no-skill base-rate entropy of this near-balanced outcome.
+    assert!(
+        gam_ll <= 0.62,
+        "gam held-out log-loss above objective bar: {gam_ll:.4} > 0.62"
+    );
+
+    // (2) Match-or-beat the best mature baseline on the SAME split. Lower is
+    // better, so gam's log-loss may exceed the best reference by at most 0.02.
+    assert!(
+        gam_ll <= best_ref + 0.02,
+        "gam held-out log-loss trails best baseline: gam={gam_ll:.4} \
+         best_ref={best_ref:.4} (mgcv={mgcv_ll:.4} sklearn={sk_ll:.4})"
+    );
+}
+
 /// Pad a vector to `len` by repeating its last value (or 0.0 if empty). Used to
 /// ship a short test-row column alongside longer train-row columns through the
 /// single-`data.frame` harness; the reference body slices back to the true

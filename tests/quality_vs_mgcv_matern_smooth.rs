@@ -31,11 +31,13 @@ use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+    load_csvwith_inferred_schema,
 };
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
+use std::path::Path;
 
 #[test]
 fn gam_matern_smooth_recovers_truth() {
@@ -159,5 +161,205 @@ fn gam_matern_smooth_recovers_truth() {
         rmse_gam <= rmse_mgcv * 1.10,
         "matern recovery worse than mgcv baseline: rmse(gam, truth)={rmse_gam:.4} > 1.10 * rmse(mgcv, truth)={:.4}",
         rmse_mgcv * 1.10
+    );
+}
+
+// Source: the `quakes` dataset (1000 seismic events near Fiji, 1964), shipped by
+// base R (`datasets::quakes`) and exported here to bench/datasets/quakes.csv.
+// Columns: lat, long, depth, mag, stations. We model earthquake magnitude as a
+// 2-D Matérn ν=5/2 spatial smooth over (long, lat).
+const QUAKES_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/quakes.csv");
+
+/// Coefficient of determination of `pred` against observed `truth` relative to
+/// the mean predictor: `1 - SS_res / SS_tot`. R2 = 1 is perfect, 0 matches
+/// predicting the held-out mean, < 0 is worse than the mean.
+fn r2(pred: &[f64], truth: &[f64]) -> f64 {
+    assert_eq!(pred.len(), truth.len(), "r2 length mismatch");
+    let n = truth.len() as f64;
+    let mean = truth.iter().sum::<f64>() / n;
+    let ss_res: f64 = pred.iter().zip(truth).map(|(p, t)| (t - p) * (t - p)).sum();
+    let ss_tot: f64 = truth.iter().map(|t| (t - mean) * (t - mean)).sum();
+    1.0 - ss_res / ss_tot.max(1e-300)
+}
+
+/// Right-pad `v` with its last value (or 0.0 when empty) to length `len`, so a
+/// test-length vector can ride along a train-length reference data.frame. Only
+/// the first `v.len()` entries are read back inside the R body — every Column in
+/// one `run_r` call must share one length.
+fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
+    assert!(
+        v.len() <= len,
+        "pad target {len} shorter than source {}",
+        v.len()
+    );
+    let fill = v.last().copied().unwrap_or(0.0);
+    let mut out = v.to_vec();
+    out.resize(len, fill);
+    out
+}
+
+/// REAL-DATA arm: the SAME 2-D Matérn ν=5/2 spatial-smooth capability, exercised
+/// on `quakes` (Fiji earthquakes). The truth is unknown on real data, so quality
+/// is OUT-OF-SAMPLE predictive accuracy of the spatial surface, not truth
+/// recovery:
+///
+///   PRIMARY (objective, tool-free): held-out coefficient of determination
+///     `test_R2 >= 0.10` — the (long, lat) Matérn surface genuinely explains
+///     held-out magnitude variance above the constant-mean predictor (R2 = 0).
+///     Magnitude is only weakly spatially structured, so the bar is modest but
+///     strictly positive: a degenerate/over-smoothed surface scores ~0.
+///
+///   BASELINE (match-or-beat): mgcv (the mature GAM standard) fits the SAME
+///     training rows with the SAME 2-D GP smooth (`s(long, lat, bs="gp", m=4)`,
+///     ν=5/2) and predicts the SAME held-out rows; gam's held-out RMSE must be no
+///     worse than `mgcv_test_rmse * 1.10`. mgcv is a baseline to match-or-beat on
+///     the SAME held-out metric, never a fitted target to replicate.
+#[test]
+fn gam_matern_smooth_recovers_truth_on_real_data() {
+    init_parallelism();
+
+    // ---- load the quakes dataset (long, lat -> mag) -----------------------
+    let ds = load_csvwith_inferred_schema(Path::new(QUAKES_CSV)).expect("load quakes.csv");
+    let col = ds.column_map();
+    let long_idx = col["long"];
+    let lat_idx = col["lat"];
+    let mag_idx = col["mag"];
+    let long: Vec<f64> = ds.values.column(long_idx).to_vec();
+    let lat: Vec<f64> = ds.values.column(lat_idx).to_vec();
+    let mag: Vec<f64> = ds.values.column(mag_idx).to_vec();
+    let n = long.len();
+    assert!(n > 900, "quakes should have ~1000 rows, got {n}");
+
+    // ---- deterministic train/test split: every 5th row held out ----------
+    let is_test = |i: usize| i % 5 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    assert!(
+        train_rows.len() > 600 && test_rows.len() > 150,
+        "split sizes: train={} test={}",
+        train_rows.len(),
+        test_rows.len()
+    );
+
+    let train_long: Vec<f64> = train_rows.iter().map(|&i| long[i]).collect();
+    let train_lat: Vec<f64> = train_rows.iter().map(|&i| lat[i]).collect();
+    let train_mag: Vec<f64> = train_rows.iter().map(|&i| mag[i]).collect();
+    let test_long: Vec<f64> = test_rows.iter().map(|&i| long[i]).collect();
+    let test_lat: Vec<f64> = test_rows.iter().map(|&i| lat[i]).collect();
+    let test_mag: Vec<f64> = test_rows.iter().map(|&i| mag[i]).collect();
+
+    // Build a training-only encoded dataset by sub-setting the encoded rows;
+    // headers, schema, and column kinds are unchanged, so the formula resolves
+    // identically to the full-data fit.
+    let p = ds.headers.len();
+    let mut train_values = Array2::<f64>::zeros((train_rows.len(), p));
+    for (out_row, &src_row) in train_rows.iter().enumerate() {
+        for c in 0..p {
+            train_values[[out_row, c]] = ds.values[[src_row, c]];
+        }
+    }
+    let mut train_ds = ds.clone();
+    train_ds.values = train_values;
+
+    // ---- fit gam on TRAIN: mag ~ matern(long, lat, nu=2.5, k=60), REML ----
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula("mag ~ matern(long, lat, nu=2.5, k=60)", &train_ds, &cfg)
+        .expect("gam 2-D matern fit on quakes train");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected a standard Gaussian GAM fit for 2-D matern() spatial smooth");
+    };
+    let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
+
+    // gam predictions at the held-out (long, lat) points: rebuild the frozen-spec
+    // design (identity link => design*beta = predicted mean). Both spatial
+    // columns must be filled at their schema column indices.
+    let mut test_grid = Array2::<f64>::zeros((test_rows.len(), p));
+    for i in 0..test_rows.len() {
+        test_grid[[i, long_idx]] = test_long[i];
+        test_grid[[i, lat_idx]] = test_lat[i];
+    }
+    let test_design = build_term_collection_design(test_grid.view(), &fit.resolvedspec)
+        .expect("rebuild 2-D matern design at held-out quakes points");
+    let gam_test_pred: Vec<f64> = test_design.design.apply(&fit.fit.beta).to_vec();
+    assert_eq!(
+        gam_test_pred.len(),
+        test_rows.len(),
+        "gam held-out prediction length mismatch"
+    );
+
+    // ---- fit the SAME train rows with mgcv, predict the SAME test rows ----
+    // bs="gp" with m=4 selects the Matérn ν=5/2 correlation function (the first
+    // m entry is the correlation-function index; 4 == Matérn 5/2), matching gam's
+    // matern(long, lat, nu=2.5). REML selects the smoothing parameters. Every
+    // Column in this single run_r call is train-length: the test coordinates ride
+    // along right-padded, and only their first `test_n` entries are read back.
+    let r = run_r(
+        &[
+            Column::new("long", &train_long),
+            Column::new("lat", &train_lat),
+            Column::new("mag", &train_mag),
+            Column::new("test_long", &pad_to(&test_long, train_long.len())),
+            Column::new("test_lat", &pad_to(&test_lat, train_long.len())),
+            Column::new("test_n", &vec![test_rows.len() as f64; train_long.len()]),
+        ],
+        r#"
+        suppressPackageStartupMessages(library(mgcv))
+        # All columns arrive train-length and all-finite; fit on (long, lat, mag),
+        # predict on the first test_n rows of the test coordinate columns.
+        fit_df <- data.frame(long = df$long, lat = df$lat, mag = df$mag)
+        m <- gam(mag ~ s(long, lat, bs = "gp", k = 60, m = 4),
+                 data = fit_df, method = "REML")
+        k <- as.integer(df$test_n[1])
+        newd <- data.frame(long = df$test_long[1:k], lat = df$test_lat[1:k])
+        emit("test_pred", as.numeric(predict(m, newdata = newd)))
+        emit("edf", sum(m$edf))
+        "#,
+    );
+    let mgcv_test_pred = r.vector("test_pred");
+    let mgcv_edf = r.scalar("edf");
+    assert_eq!(
+        mgcv_test_pred.len(),
+        test_rows.len(),
+        "mgcv held-out prediction length mismatch"
+    );
+
+    // ---- objective metrics on gam's OWN held-out predictions --------------
+    let gam_test_r2 = r2(&gam_test_pred, &test_mag);
+    let gam_test_rmse = rmse(&gam_test_pred, &test_mag);
+    let mgcv_test_rmse = rmse(mgcv_test_pred, &test_mag);
+    // Context only (NOT a pass criterion): how close gam's surface is to mgcv's.
+    let rel_to_mgcv = relative_l2(&gam_test_pred, mgcv_test_pred);
+
+    eprintln!(
+        "quakes matern(long,lat,nu=2.5) held-out: n_train={} n_test={} \
+         gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} gam_test_R2={gam_test_r2:.4} \
+         gam_test_rmse={gam_test_rmse:.4} mgcv_test_rmse={mgcv_test_rmse:.4} \
+         (context: held-out rel_l2 vs mgcv={rel_to_mgcv:.4})",
+        train_rows.len(),
+        test_rows.len(),
+    );
+
+    // ---- PRIMARY objective assertion: gam predicts the held-out surface ----
+    // Earthquake magnitude is only weakly spatially structured, so the bar is
+    // modest but strictly positive: a faithful 2-D Matérn surface explains real
+    // held-out variance, while a degenerate/over-smoothed fit collapses to ~0.
+    assert!(
+        gam_test_r2 >= 0.10,
+        "gam's held-out spatial R2 too low: {gam_test_r2:.4} (< 0.10)"
+    );
+
+    // ---- BASELINE (match-or-beat): no worse than mgcv on held-out RMSE -----
+    assert!(
+        gam_test_rmse <= mgcv_test_rmse * 1.10,
+        "gam held-out RMSE {gam_test_rmse:.4} exceeds mgcv {mgcv_test_rmse:.4} * 1.10"
+    );
+
+    // ---- complexity sanity: spatial edf in a sane range (not matched) ------
+    assert!(
+        gam_edf > 1.0 && gam_edf < 60.0,
+        "gam effective dof out of sane range: {gam_edf:.3}"
     );
 }

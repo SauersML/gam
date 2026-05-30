@@ -56,11 +56,17 @@
 //! sampling-noise bar (or materially worse than mgcv).
 
 use gam::estimate::BlockRole;
+use gam::families::sigma_link::exp_sigma_inverse_from_eta_scalar;
 use gam::gamlss::BinomialLocationScaleFitResult;
+use gam::matrix::LinearOperator;
+use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, relative_l2, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+    load_csvwith_inferred_schema,
 };
+use ndarray::Array2;
+use std::path::Path;
 
 #[test]
 fn gam_binomial_location_scale_logit_p_matches_mgcv_binomial() {
@@ -299,4 +305,256 @@ fn gam_binomial_location_scale_logit_p_matches_mgcv_binomial() {
         "gam recovers the true probability worse than mgcv: \
          gam_prob_rmse={gam_rmse:.5} > 1.10 * mgcv_prob_rmse={ref_rmse:.5}"
     );
+}
+
+/// Held-out area under the ROC curve of `score` against binary `truth`, by the
+/// Mann–Whitney U identity AUC = P(score_pos > score_neg) (ties count ½). A
+/// rank-based, threshold-free, monotone-invariant accuracy measure — exactly the
+/// right objective for a real binary dataset whose generative truth is unknown.
+fn auc(score: &[f64], truth: &[f64]) -> f64 {
+    assert_eq!(score.len(), truth.len(), "auc length mismatch");
+    let mut concordant = 0.0_f64;
+    let mut pairs = 0.0_f64;
+    for i in 0..truth.len() {
+        for j in 0..truth.len() {
+            if truth[i] > 0.5 && truth[j] < 0.5 {
+                pairs += 1.0;
+                if score[i] > score[j] {
+                    concordant += 1.0;
+                } else if (score[i] - score[j]).abs() <= f64::EPSILON {
+                    concordant += 0.5;
+                }
+            }
+        }
+    }
+    assert!(pairs > 0.0, "auc needs both classes present in truth");
+    concordant / pairs
+}
+
+/// Mean binomial (Bernoulli) negative log-likelihood — the held-out log-loss, a
+/// strictly proper scoring rule for calibrated probabilities. Probabilities are
+/// clamped off {0,1} so a single confident miss cannot make the metric infinite.
+fn log_loss(prob: &[f64], truth: &[f64]) -> f64 {
+    assert_eq!(prob.len(), truth.len(), "log_loss length mismatch");
+    let mut acc = 0.0_f64;
+    for (p, y) in prob.iter().zip(truth) {
+        let pc = p.clamp(1e-12, 1.0 - 1e-12);
+        acc += -(y * pc.ln() + (1.0 - y) * (1.0 - pc).ln());
+    }
+    acc / prob.len() as f64
+}
+
+#[test]
+fn gam_binomial_location_scale_logit_p_matches_mgcv_binomial_on_real_data() {
+    init_parallelism();
+
+    // ---- real data: prostate.csv (pc1, pc2 -> binary y) --------------------
+    // SOURCE: gam's bench dataset bench/datasets/prostate.csv — two principal
+    // components (pc1, pc2) of a prostate-cancer feature matrix and a binary
+    // outcome y in {0,1}. 654 rows, near-balanced classes. There is NO known
+    // ground-truth probability surface for real data, so quality is measured as
+    // OUT-OF-SAMPLE predictive accuracy on a deterministic held-out split, not by
+    // recovering a recipe. gam's composed-link binomial location-scale fit (latent
+    // threshold t(pc1,pc2) AND log-sigma η_ls(pc1,pc2), fit jointly) produces an
+    // identifiable success probability P̂ = expit(-t/σ) = expit(-t·exp(-η_ls)); we
+    // rebuild that on held-out rows and score it against the observed labels.
+    let ds = load_csvwith_inferred_schema(Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/bench/datasets/prostate.csv"
+    )))
+    .expect("load prostate.csv");
+    let col = ds.column_map();
+    let pc1_idx = col["pc1"];
+    let pc2_idx = col["pc2"];
+    let y_idx = col["y"];
+    let pc1: Vec<f64> = ds.values.column(pc1_idx).to_vec();
+    let pc2: Vec<f64> = ds.values.column(pc2_idx).to_vec();
+    let y_all: Vec<f64> = ds.values.column(y_idx).to_vec();
+    let n = pc1.len();
+    assert!(n > 600, "prostate should have ~654 rows, got {n}");
+
+    // ---- deterministic train/test split: every 4th row is held out --------
+    let is_test = |i: usize| i % 4 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    assert!(
+        train_rows.len() > 400 && test_rows.len() > 100,
+        "split sizes: train={} test={}",
+        train_rows.len(),
+        test_rows.len()
+    );
+
+    let train_pc1: Vec<f64> = train_rows.iter().map(|&i| pc1[i]).collect();
+    let train_pc2: Vec<f64> = train_rows.iter().map(|&i| pc2[i]).collect();
+    let train_y: Vec<f64> = train_rows.iter().map(|&i| y_all[i]).collect();
+    let test_pc1: Vec<f64> = test_rows.iter().map(|&i| pc1[i]).collect();
+    let test_pc2: Vec<f64> = test_rows.iter().map(|&i| pc2[i]).collect();
+    let test_y: Vec<f64> = test_rows.iter().map(|&i| y_all[i]).collect();
+
+    // Both held-out classes must be present for AUC to be defined.
+    let test_pos: f64 = test_y.iter().sum();
+    assert!(
+        test_pos > 20.0 && test_pos < (test_rows.len() as f64 - 20.0),
+        "degenerate held-out labels: {test_pos} positives of {}",
+        test_rows.len()
+    );
+
+    // Training-only dataset by sub-setting encoded rows; schema/headers unchanged
+    // so the formula resolves identically.
+    let p = ds.headers.len();
+    let mut train_values = Array2::<f64>::zeros((train_rows.len(), p));
+    for (out_row, &src_row) in train_rows.iter().enumerate() {
+        for c in 0..p {
+            train_values[[out_row, c]] = ds.values[[src_row, c]];
+        }
+    }
+    let mut train_ds = ds.clone();
+    train_ds.values = train_values;
+
+    // ---- fit gam on TRAIN: threshold ~ s(pc1)+s(pc2), log-sigma ~ same ------
+    let cfg = FitConfig {
+        family: Some("binomial".to_string()),
+        noise_formula: Some("1 + s(pc1, bs='tp') + s(pc2, bs='tp')".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula("y ~ s(pc1, bs='tp') + s(pc2, bs='tp')", &train_ds, &cfg)
+        .expect("gam binomial location-scale fit on prostate train");
+    let FitResult::BinomialLocationScale(BinomialLocationScaleFitResult { fit, .. }) = result
+    else {
+        panic!("expected a binomial location-scale fit");
+    };
+
+    // Joint solver must carry both a Threshold and a (multi-coefficient) Scale block.
+    let scale_block = fit
+        .fit
+        .block_by_role(BlockRole::Scale)
+        .expect("binomial location-scale fit must carry a Scale (log-sigma) block");
+    assert!(
+        fit.fit.block_by_role(BlockRole::Threshold).is_some(),
+        "binomial location-scale fit must carry a Threshold block"
+    );
+    assert!(
+        scale_block.beta.len() >= 2,
+        "smooth noise_formula must materialize a multi-coefficient log-sigma basis, got {}",
+        scale_block.beta.len()
+    );
+
+    // ---- gam held-out prediction ------------------------------------------
+    // Rebuild the threshold and log-sigma designs at the TEST rows from the frozen
+    // resolved specs, apply each block's converged beta to get the held-out
+    // η_t and η_ls, then form the identifiable logit P = -t/σ = -t·exp(-η_ls) and
+    // P̂ = expit(logit P). block_states[0] is the threshold block (matches
+    // meanspec_resolved), block_states[1] is the log-sigma block (matches
+    // noisespec_resolved) — verified in src/families/gamlss.rs.
+    let mut test_grid = Array2::<f64>::zeros((test_rows.len(), p));
+    for i in 0..test_rows.len() {
+        test_grid[[i, pc1_idx]] = test_pc1[i];
+        test_grid[[i, pc2_idx]] = test_pc2[i];
+    }
+    let test_t_design = build_term_collection_design(test_grid.view(), &fit.meanspec_resolved)
+        .expect("rebuild threshold design at held-out points");
+    let test_ls_design = build_term_collection_design(test_grid.view(), &fit.noisespec_resolved)
+        .expect("rebuild log-sigma design at held-out points");
+    let eta_t_test: Vec<f64> = test_t_design
+        .design
+        .apply(&fit.fit.block_states[0].beta)
+        .to_vec();
+    let eta_ls_test: Vec<f64> = test_ls_design
+        .design
+        .apply(&fit.fit.block_states[1].beta)
+        .to_vec();
+    assert_eq!(eta_t_test.len(), test_rows.len(), "threshold test eta length");
+    assert_eq!(eta_ls_test.len(), test_rows.len(), "log-sigma test eta length");
+
+    let gam_test_logit_p: Vec<f64> = (0..test_rows.len())
+        .map(|i| -eta_t_test[i] * exp_sigma_inverse_from_eta_scalar(eta_ls_test[i]))
+        .collect();
+    let gam_test_p: Vec<f64> = gam_test_logit_p.iter().map(|&q| expit(q)).collect();
+
+    // ---- mgcv baseline: SAME train rows, predict the SAME held-out rows ----
+    // mgcv has no composed-link latent-rescaling binary family, so its plain
+    // penalized binomial GAM y ~ s(pc1)+s(pc2) is the mature match-or-beat
+    // BASELINE for the identifiable success probability (see module doc). One
+    // run_r call: train columns + the held-out pc1/pc2 padded to train length and
+    // a row-count scalar so only the first k test rows are read back.
+    let k = test_rows.len();
+    let train_len = train_rows.len();
+    let r = run_r(
+        &[
+            Column::new("pc1", &train_pc1),
+            Column::new("pc2", &train_pc2),
+            Column::new("y", &train_y),
+            Column::new("test_pc1", &pad_to(&test_pc1, train_len)),
+            Column::new("test_pc2", &pad_to(&test_pc2, train_len)),
+            Column::new("test_n", &vec![k as f64; train_len]),
+        ],
+        r#"
+        suppressPackageStartupMessages(library(mgcv))
+        m <- gam(y ~ s(pc1) + s(pc2), family = binomial, method = "REML", data = df)
+        k <- df$test_n[1]
+        newd <- data.frame(pc1 = df$test_pc1[1:k], pc2 = df$test_pc2[1:k])
+        emit("test_p", as.numeric(predict(m, newdata = newd, type = "response")))
+    "#,
+    );
+    let ref_test_p = r.vector("test_p");
+    assert_eq!(ref_test_p.len(), k, "mgcv held-out prediction length mismatch");
+
+    // ---- OBJECTIVE held-out metrics (computed in plain Rust) ---------------
+    let gam_auc = auc(&gam_test_p, &test_y);
+    let ref_auc = auc(ref_test_p, &test_y);
+    let gam_ll = log_loss(&gam_test_p, &test_y);
+    let ref_ll = log_loss(ref_test_p, &test_y);
+
+    // Diagnostics ONLY (not pass/fail): agreement of the two engines' held-out
+    // probabilities. Matching a peer tool is never a quality claim.
+    let rel_p = relative_l2(&gam_test_p, ref_test_p);
+    let corr_p = pearson(&gam_test_p, ref_test_p);
+
+    eprintln!(
+        "prostate binomial location-scale held-out: n_train={train_len} n_test={k} \
+         gam_auc={gam_auc:.4} mgcv_auc={ref_auc:.4} \
+         gam_logloss={gam_ll:.4} mgcv_logloss={ref_ll:.4} \
+         (diag vs mgcv: rel_l2={rel_p:.4} pearson={corr_p:.4})"
+    );
+
+    // ---- PRIMARY objective assertion: gam discriminates on held-out data ---
+    // pc1/pc2 carry real signal for y; a competent binary fit clears AUC 0.75 out
+    // of sample, far above the chance level of 0.5. Below that bar the composed
+    // -link inverse / joint two-block solve is mis-reconstructing the probability.
+    assert!(
+        gam_test_p.iter().all(|p| p.is_finite() && (0.0..=1.0).contains(p)),
+        "gam held-out probabilities must be valid in [0,1]"
+    );
+    assert!(
+        gam_auc >= 0.75,
+        "gam held-out AUC too low: {gam_auc:.4} (< 0.75)"
+    );
+
+    // ---- BASELINE (match-or-beat): no worse than mgcv on the SAME metrics --
+    // gam's held-out AUC at least mgcv's minus a 0.02 slack, and its log-loss no
+    // worse than mgcv's by >10%. mgcv is the mature baseline to match-or-beat on
+    // accuracy, never an output to replicate.
+    assert!(
+        gam_auc >= ref_auc - 0.02,
+        "gam held-out AUC {gam_auc:.4} worse than mgcv {ref_auc:.4} (slack 0.02)"
+    );
+    assert!(
+        gam_ll <= ref_ll * 1.10,
+        "gam held-out log-loss {gam_ll:.4} exceeds mgcv {ref_ll:.4} * 1.10"
+    );
+}
+
+/// Right-pad `v` with its last value (0.0 when empty) to length `len`, so the
+/// held-out predictors can ride along as full-length columns of the reference
+/// data.frame. Only the first `v.len()` entries are read back inside the R body.
+fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
+    assert!(
+        v.len() <= len,
+        "pad target {len} shorter than source {}",
+        v.len()
+    );
+    let fill = v.last().copied().unwrap_or(0.0);
+    let mut out = v.to_vec();
+    out.resize(len, fill);
+    out
 }

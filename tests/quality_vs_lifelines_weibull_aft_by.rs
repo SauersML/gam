@@ -61,11 +61,13 @@ use gam::survival_construction::evaluate_survival_baseline;
 use gam::test_support::reference::{Column, relative_l2, rmse, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+    load_csvwith_inferred_schema,
 };
 use ndarray::{Array2, s};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Exp, Normal, Weibull};
+use std::path::Path;
 
 const N_PER_GROUP: usize = 100;
 const SEED: u64 = 20260529;
@@ -385,5 +387,270 @@ emit("surv", surv_rows)
         gam_rmse_truth <= life_rmse_truth * 1.10,
         "gam less accurate than lifelines vs truth: gam RMSE={gam_rmse_truth:.4}, lifelines RMSE={life_rmse_truth:.4} (1.10x={:.4})",
         life_rmse_truth * 1.10
+    );
+}
+
+// ===========================================================================
+// REAL-DATA ARM
+// ===========================================================================
+//
+// Dataset SOURCE: the Veterans' Administration lung-cancer randomized trial
+// (`veteran` in the R `survival` package; Kalbfleisch & Prentice, "The
+// Statistical Analysis of Failure Time Data"). 137 patients, columns
+// `time` (days), `status` (1=death, 0=censored — 9 censored), the numeric
+// covariate `karno` (Karnofsky performance score, the dominant prognostic
+// signal) and the four-level factor `celltype`
+// (squamous / smallcell / adeno / large), shipped at
+// `bench/datasets/veteran_lung.csv`.
+//
+// This arm exercises the SAME gam capability as the synthetic test above —
+// a parametric **Weibull AFT** survival fit with a **by-FACTOR smooth**
+// covariate effect, `s(karno, by=celltype)`, giving each cell type its own
+// karnofsky→risk curve over a shared Weibull baseline cumulative hazard.
+//
+// Because this is real data the data-generating survival surface is UNKNOWN,
+// so RMSE-to-truth is not computable. The objective, tool-free quality metric
+// is therefore the **held-out concordance index** (Harrell's C): a fixed,
+// deterministic train/test split, fit gam on train, score the held-out
+// patients by gam's OWN covariate log-cumulative-hazard risk, and assert how
+// well that risk ranking agrees with the observed (time, event) ordering.
+// Higher covariate log-cumulative-hazard ⇒ higher hazard ⇒ shorter survival,
+// so a well-fit model gives a high C-index (0.5 = random, 1.0 = perfect).
+//   PRIMARY (objective): held-out C-index >= 0.62 — well above the 0.5 random
+//     baseline for a ~30-patient held-out set; a broken by-factor fit (wrong
+//     karnofsky sign, collapsed cell-type strata) would not clear it.
+//   BASELINE (match-or-beat): lifelines.WeibullAFTFitter, the mature standard
+//     parametric-AFT reference, is fit on the SAME train rows and scored on
+//     the SAME held-out patients (by predicted expected survival time, which
+//     it turns into its own C-index via lifelines.utils.concordance_index);
+//     gam's held-out C must be no worse than lifelines' C minus a 0.03 margin.
+//     lifelines is a yardstick to match-or-beat on the identical held-out
+//     metric, never a fitted output to reproduce.
+
+/// Harrell's concordance index for survival risk scores. `risk[i]` is monotone
+/// INCREASING in hazard (higher risk ⇒ shorter expected survival). A pair
+/// `(i, j)` is comparable when the earlier observed time belongs to an event;
+/// it is concordant when that earlier-failing subject also carries the higher
+/// risk. Risk ties on a comparable pair count as half-concordant. Returns the
+/// fraction of comparable pairs that are concordant (0.5 = random ordering).
+fn concordance_index(risk: &[f64], time: &[f64], event: &[f64]) -> f64 {
+    assert_eq!(risk.len(), time.len(), "concordance: risk/time length mismatch");
+    assert_eq!(time.len(), event.len(), "concordance: time/event length mismatch");
+    let n = risk.len();
+    let mut concordant = 0.0_f64;
+    let mut comparable = 0.0_f64;
+    for i in 0..n {
+        for j in (i + 1)..n {
+            // Identify the earlier-failing member of the pair; the pair is only
+            // comparable when that earlier observed time is an actual event.
+            let (early, late) = if time[i] < time[j] {
+                (i, j)
+            } else if time[j] < time[i] {
+                (j, i)
+            } else {
+                // Equal observed times carry no usable ordering information.
+                continue;
+            };
+            if event[early] != 1.0 {
+                continue;
+            }
+            comparable += 1.0;
+            if risk[early] > risk[late] {
+                concordant += 1.0;
+            } else if risk[early] == risk[late] {
+                concordant += 0.5;
+            }
+        }
+    }
+    assert!(
+        comparable > 0.0,
+        "no comparable survival pairs — degenerate held-out set"
+    );
+    concordant / comparable
+}
+
+#[test]
+fn gam_weibull_aft_by_factor_recovers_true_survival_on_real_data() {
+    init_parallelism();
+
+    // ---- load the real Veterans' lung-cancer trial ------------------------
+    let ds = load_csvwith_inferred_schema(Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/bench/datasets/veteran_lung.csv"
+    )))
+    .expect("load veteran_lung.csv");
+    let col = ds.column_map();
+    let time_idx = col["time"];
+    let status_idx = col["status"];
+    let karno_idx = col["karno"];
+    let celltype_idx = col["celltype"];
+
+    let time: Vec<f64> = ds.values.column(time_idx).to_vec();
+    let status: Vec<f64> = ds.values.column(status_idx).to_vec();
+    let karno: Vec<f64> = ds.values.column(karno_idx).to_vec();
+    // `celltype` is a string column, so schema inference encodes it as a single
+    // Categorical code column (level codes by first appearance:
+    // squamous=0, smallcell=1, adeno=2, large=3). That categorical kind is what
+    // makes `s(karno, by=celltype)` expand into the per-level by-FACTOR smooth
+    // this test validates (one karnofsky curve per cell type + a treatment-coded
+    // factor main effect), exactly as in the synthetic arm.
+    let celltype: Vec<f64> = ds.values.column(celltype_idx).to_vec();
+    let n = time.len();
+    assert!(n > 120, "veteran_lung should have ~137 rows, got {n}");
+
+    // ---- deterministic train/test split: every 4th row held out ----------
+    let is_test = |i: usize| i % 4 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    assert!(
+        train_rows.len() > 90 && test_rows.len() > 30,
+        "split sizes: train={} test={}",
+        train_rows.len(),
+        test_rows.len()
+    );
+
+    // Build a training-only dataset by sub-setting the encoded rows; headers,
+    // schema and column kinds are unchanged, so the formula resolves identically
+    // (the categorical level table lives in the schema, not the row values).
+    let p = ds.headers.len();
+    let mut train_values = Array2::<f64>::zeros((train_rows.len(), p));
+    for (out_row, &src_row) in train_rows.iter().enumerate() {
+        for c in 0..p {
+            train_values[[out_row, c]] = ds.values[[src_row, c]];
+        }
+    }
+    let mut train_ds = ds.clone();
+    train_ds.values = train_values;
+
+    // ---- fit gam on TRAIN: Weibull AFT + by-factor smooth on karno --------
+    let cfg = FitConfig {
+        survival_likelihood: "weibull".to_string(),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula(
+        "Surv(time, status) ~ karno + s(karno, by=celltype) + survmodel(spec=\"transformation\", distribution=\"weibull\")",
+        &train_ds,
+        &cfg,
+    )
+    .expect("gam Weibull-AFT by-factor fit on veteran_lung train rows");
+    let FitResult::SurvivalTransformation(fit) = result else {
+        panic!("expected a SurvivalTransformation fit for survival_likelihood=weibull");
+    };
+
+    // ---- score the held-out patients by gam's OWN covariate risk ----------
+    // The covariate block adds `cov_eta = design(karno, celltype)·cov_beta` to
+    // the shared log-cumulative-hazard, so `cov_eta` IS the per-patient log-risk
+    // (monotone increasing in hazard). Rebuild the covariate design at the
+    // held-out rows from the frozen spec — no baseline evaluation is needed for
+    // a ranking metric, since every patient shares the same baseline H0(t).
+    let cov_start = fit.time_base_ncols;
+    let beta = &fit.fit.beta;
+    assert!(
+        beta.len() > cov_start,
+        "expected covariate coefficients after the {cov_start} time columns, got beta.len()={}",
+        beta.len()
+    );
+    let cov_beta = beta.slice(s![cov_start..]).to_owned();
+
+    let mut test_grid = Array2::<f64>::zeros((test_rows.len(), p));
+    for (out_row, &src_row) in test_rows.iter().enumerate() {
+        for c in 0..p {
+            test_grid[[out_row, c]] = ds.values[[src_row, c]];
+        }
+    }
+    let test_design = build_term_collection_design(test_grid.view(), &fit.resolvedspec)
+        .expect("rebuild covariate design at held-out rows");
+    let test_dense = test_design.design.to_dense();
+    assert_eq!(
+        test_dense.ncols(),
+        cov_beta.len(),
+        "held-out covariate design width must match the covariate coefficient slice"
+    );
+    let gam_risk: Vec<f64> = (0..test_rows.len())
+        .map(|r| test_dense.row(r).dot(&cov_beta))
+        .collect();
+
+    let test_time: Vec<f64> = test_rows.iter().map(|&i| time[i]).collect();
+    let test_status: Vec<f64> = test_rows.iter().map(|&i| status[i]).collect();
+    let gam_c = concordance_index(&gam_risk, &test_time, &test_status);
+
+    // ---- fit the SAME model on TRAIN with lifelines, score the SAME TEST ---
+    // One run_python call, all columns the SAME length (full n): a per-row
+    // `is_train` mask separates the fit rows from the held-out rows so we never
+    // mix train-length and test-length columns. lifelines fits on the masked
+    // train rows and scores the held-out rows by predicted EXPECTED survival
+    // time, then forms its own held-out C-index (lifelines orients C so that
+    // higher predicted survival ⇒ lower risk). Held to the identical metric.
+    let is_train: Vec<f64> = (0..n)
+        .map(|i| if is_test(i) { 0.0 } else { 1.0 })
+        .collect();
+    let py = run_python(
+        &[
+            Column::new("time", &time),
+            Column::new("status", &status),
+            Column::new("karno", &karno),
+            Column::new("celltype", &celltype),
+            Column::new("is_train", &is_train),
+        ],
+        r#"
+import numpy as np
+import pandas as pd
+from lifelines import WeibullAFTFitter
+from lifelines.utils import concordance_index
+
+frame = pd.DataFrame({
+    "time": np.asarray(df["time"], dtype=float),
+    "status": np.asarray(df["status"], dtype=float),
+    "karno": np.asarray(df["karno"], dtype=float),
+    "celltype": np.asarray(df["celltype"], dtype=float).astype(int),
+    "is_train": np.asarray(df["is_train"], dtype=float),
+})
+
+# Treatment-coded indicators for the 4-level cell type plus karno and its
+# per-celltype interaction: the parametric-AFT analogue of karno + s(karno,
+# by=celltype). Drop level 0 (squamous) as the reference to keep the design
+# full rank, matching gam's treatment-coded by-factor expansion.
+for lev in (1, 2, 3):
+    frame[f"ct{lev}"] = (frame["celltype"] == lev).astype(float)
+    frame[f"karno_ct{lev}"] = frame["karno"] * frame[f"ct{lev}"]
+
+feat = ["karno", "ct1", "ct2", "ct3", "karno_ct1", "karno_ct2", "karno_ct3"]
+train = frame[frame["is_train"] == 1.0].reset_index(drop=True)
+test = frame[frame["is_train"] == 0.0].reset_index(drop=True)
+
+aft = WeibullAFTFitter(penalizer=0.01)
+aft.fit(train[feat + ["time", "status"]], duration_col="time", event_col="status")
+
+# Higher predicted expected survival time => lower risk; concordance_index
+# expects predicted scores that increase with survival, so pass expectations.
+pred_exp = aft.predict_expectation(test[feat]).to_numpy().reshape(-1)
+c = concordance_index(test["time"].to_numpy(), pred_exp, test["status"].to_numpy())
+emit("cindex", [float(c)])
+"#,
+    );
+    let life_c = py.scalar("cindex");
+
+    let cens_frac = 1.0 - status.iter().sum::<f64>() / n as f64;
+    eprintln!(
+        "veteran_lung weibull-AFT by-factor held-out: n={n} n_train={} n_test={} \
+         censoring={cens_frac:.2}\n  \
+         held-out C-index: gam={gam_c:.4} lifelines={life_c:.4}",
+        train_rows.len(),
+        test_rows.len(),
+    );
+
+    // ---- PRIMARY objective assertion: gam ranks held-out risk well --------
+    // C-index >= 0.62 is well above the 0.5 random-ranking baseline for a small
+    // held-out set; a broken by-factor fit (wrong karnofsky sign, collapsed
+    // cell-type strata) would not clear it.
+    assert!(
+        gam_c >= 0.62,
+        "gam's held-out concordance too low: {gam_c:.4} (< 0.62)"
+    );
+
+    // ---- BASELINE (match-or-beat): no worse than lifelines on held-out C ---
+    assert!(
+        gam_c >= life_c - 0.03,
+        "gam less concordant than lifelines on held-out data: gam C={gam_c:.4}, lifelines C={life_c:.4} (margin 0.03)"
     );
 }

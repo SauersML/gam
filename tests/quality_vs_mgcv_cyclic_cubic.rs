@@ -35,12 +35,49 @@ use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+    load_csvwith_inferred_schema,
 };
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal};
 use std::f64::consts::PI;
+use std::path::Path;
+
+/// Real monthly-temperature series, `nottem` from R's `datasets` package
+/// (average air temperature at Nottingham Castle, 1920-1939, in degrees F),
+/// reshaped to one row per (year, month). Source: R `datasets::nottem`.
+const NOTTEM_CSV: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/bench/datasets/nottem_monthly_temp.csv"
+);
+
+/// Coefficient of determination of `pred` against observed `truth`, relative to
+/// the mean predictor: `1 - SS_res / SS_tot`. R2 = 1 is perfect, R2 = 0 matches
+/// predicting the held-out mean, R2 < 0 is worse than the mean.
+fn r2(pred: &[f64], truth: &[f64]) -> f64 {
+    assert_eq!(pred.len(), truth.len(), "r2 length mismatch");
+    let n = truth.len() as f64;
+    let mean = truth.iter().sum::<f64>() / n;
+    let ss_res: f64 = pred.iter().zip(truth).map(|(p, t)| (t - p) * (t - p)).sum();
+    let ss_tot: f64 = truth.iter().map(|t| (t - mean) * (t - mean)).sum();
+    1.0 - ss_res / ss_tot.max(1e-300)
+}
+
+/// Right-pad `v` with its last value (or 0.0 when empty) to length `len`, so it
+/// can ride along as a column of the reference data.frame of train length. Only
+/// the first `v.len()` entries are read back inside the R body.
+fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
+    assert!(
+        v.len() <= len,
+        "pad target {len} shorter than source {}",
+        v.len()
+    );
+    let fill = v.last().copied().unwrap_or(0.0);
+    let mut out = v.to_vec();
+    out.resize(len, fill);
+    out
+}
 
 #[test]
 fn gam_cyclic_cubic_matches_mgcv_on_sine() {
@@ -169,5 +206,179 @@ fn gam_cyclic_cubic_matches_mgcv_on_sine() {
     assert!(
         wrap_gap < 1e-6,
         "cyclic wrap not enforced: |fit(0) - fit(2π)| = {wrap_gap:.3e}"
+    );
+}
+
+/// REAL-DATA arm of the cyclic-cubic capability: the SAME `cc()` periodic
+/// smooth, now exercised on `nottem` monthly temperatures (no known truth).
+///
+/// The annual temperature cycle is the textbook periodic signal: month 1..=12
+/// wraps back to month 1 the next year, so `temp ~ cc(month)` must capture a
+/// smooth seasonal curve that genuinely PREDICTS held-out months — not merely
+/// reproduce mgcv's in-sample fit.
+///
+/// We make a deterministic train/test split (every 4th row held out), fit a
+/// cyclic cubic spline by REML on the training rows only, predict the held-out
+/// rows, and assert OBJECTIVE metrics on gam's OWN predictions:
+///
+///   PRIMARY (objective, tool-free): held-out coefficient of determination
+///     `test_R2 >= 0.85` — the seasonal cycle dominates the variance, so a
+///     competent periodic smoother explains the vast majority of held-out
+///     variation, far above the constant-mean predictor (R2 = 0).
+///
+///   BASELINE (match-or-beat): mgcv `bs="cc"` fits the SAME training rows and
+///     predicts the SAME held-out rows; gam's held-out RMSE must be no worse
+///     than `mgcv_test_rmse * 1.10`. mgcv is a baseline to match-or-beat on
+///     accuracy, NOT a fitted target to reproduce.
+///
+///   STRUCTURE — periodic seam continuity: gam's fitted curve wraps exactly,
+///     `fit(month=1) == fit(month=13)` to 1e-6, the defining cyclic property.
+#[test]
+fn gam_cyclic_cubic_matches_mgcv_on_sine_on_real_data() {
+    init_parallelism();
+
+    // ---- load real monthly temperatures: month (1..12) -> temp ------------
+    let ds = load_csvwith_inferred_schema(Path::new(NOTTEM_CSV)).expect("load nottem csv");
+    let col = ds.column_map();
+    let month_idx = col["month"];
+    let temp_idx = col["temp"];
+    let month: Vec<f64> = ds.values.column(month_idx).to_vec();
+    let temp: Vec<f64> = ds.values.column(temp_idx).to_vec();
+    let n = month.len();
+    assert!(n > 200, "nottem should have ~240 rows, got {n}");
+
+    // ---- deterministic train/test split: every 4th row is held out -------
+    let is_test = |i: usize| i % 4 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    assert!(
+        train_rows.len() > 150 && test_rows.len() > 50,
+        "split sizes: train={} test={}",
+        train_rows.len(),
+        test_rows.len()
+    );
+
+    let train_month: Vec<f64> = train_rows.iter().map(|&i| month[i]).collect();
+    let train_temp: Vec<f64> = train_rows.iter().map(|&i| temp[i]).collect();
+    let test_month: Vec<f64> = test_rows.iter().map(|&i| month[i]).collect();
+    let test_temp: Vec<f64> = test_rows.iter().map(|&i| temp[i]).collect();
+
+    // Build a training-only dataset by sub-setting the encoded rows; headers,
+    // schema and column kinds are unchanged, so the formula resolves identically.
+    let p = ds.headers.len();
+    let mut train_values = Array2::<f64>::zeros((train_rows.len(), p));
+    for (out_row, &src_row) in train_rows.iter().enumerate() {
+        for c in 0..p {
+            train_values[[out_row, c]] = ds.values[[src_row, c]];
+        }
+    }
+    let mut train_ds = ds.clone();
+    train_ds.values = train_values;
+
+    // ---- fit gam on TRAIN: temp ~ cc(month, k=12, period 1..13), REML ------
+    // The period spans month=1 to month=13 (== month 1 of the next cycle), so
+    // the cyclic basis wraps December back onto January. The DSL parses option
+    // values as plain f64 literals, so the period bounds are numeric literals.
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let formula = "temp ~ cc(month, k=12, period_start=1, period_end=13)";
+    let result = fit_from_formula(formula, &train_ds, &cfg).expect("gam cyclic fit on nottem");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected a standard GAM fit for a gaussian cyclic smooth");
+    };
+    let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
+
+    // gam predictions at the held-out months: rebuild the design from the
+    // frozen spec (identity link => design*beta = predicted mean). Append the
+    // seam pair (month=1, month=13) so we can verify the wrap on gam's own fit.
+    let n_test = test_rows.len();
+    let mut pred_grid = Array2::<f64>::zeros((n_test + 2, p));
+    for (i, &m) in test_month.iter().enumerate() {
+        pred_grid[[i, month_idx]] = m;
+    }
+    pred_grid[[n_test, month_idx]] = 1.0;
+    pred_grid[[n_test + 1, month_idx]] = 13.0;
+    let pred_design = build_term_collection_design(pred_grid.view(), &fit.resolvedspec)
+        .expect("rebuild design at held-out + seam points");
+    let gam_pred_all: Vec<f64> = pred_design.design.apply(&fit.fit.beta).to_vec();
+    let gam_test_pred = &gam_pred_all[..n_test];
+    let wrap_gap = (gam_pred_all[n_test] - gam_pred_all[n_test + 1]).abs();
+
+    // ---- fit the SAME model on TRAIN with mgcv bs="cc", predict TEST -------
+    // One data.frame per call: train month/temp plus the test months padded into
+    // a parallel column (only the first `test_n` entries are read back).
+    let train_r = run_r(
+        &[
+            Column::new("month", &train_month),
+            Column::new("temp", &train_temp),
+            Column::new("test_month", &pad_to(&test_month, train_month.len())),
+            Column::new("test_n", &vec![n_test as f64; train_month.len()]),
+        ],
+        r#"
+        suppressPackageStartupMessages(library(mgcv))
+        m <- gam(temp ~ s(month, bs = "cc", k = 12), data = df, method = "REML",
+                 knots = list(month = c(1, 13)))
+        emit("edf", sum(m$edf))
+        k <- df$test_n[1]
+        newd <- data.frame(month = df$test_month[1:k])
+        emit("test_pred", as.numeric(predict(m, newdata = newd)))
+        emit("fitted", as.numeric(fitted(m)))
+        "#,
+    );
+    let mgcv_edf = train_r.scalar("edf");
+    let mgcv_test_pred = train_r.vector("test_pred");
+    let mgcv_train_fitted = train_r.vector("fitted").to_vec();
+    assert_eq!(
+        mgcv_test_pred.len(),
+        n_test,
+        "mgcv held-out prediction length mismatch"
+    );
+
+    // ---- objective metrics on gam's OWN predictions -----------------------
+    let gam_test_r2 = r2(gam_test_pred, &test_temp);
+    let gam_test_rmse = rmse(gam_test_pred, &test_temp);
+    let mgcv_test_rmse = rmse(mgcv_test_pred, &test_temp);
+
+    // Context-only diagnostic: closeness of gam's in-sample fit vs mgcv's. NOT
+    // a pass criterion.
+    let mut gam_train_grid = Array2::<f64>::zeros((train_rows.len(), p));
+    for (i, &m) in train_month.iter().enumerate() {
+        gam_train_grid[[i, month_idx]] = m;
+    }
+    let gam_train_design = build_term_collection_design(gam_train_grid.view(), &fit.resolvedspec)
+        .expect("rebuild design at training points");
+    let gam_train_fitted: Vec<f64> = gam_train_design.design.apply(&fit.fit.beta).to_vec();
+    let insample_rel = relative_l2(&gam_train_fitted, &mgcv_train_fitted);
+
+    eprintln!(
+        "nottem cc(month) held-out: n_train={} n_test={} gam_edf={gam_edf:.3} \
+         mgcv_edf={mgcv_edf:.3} gam_test_R2={gam_test_r2:.4} \
+         gam_test_rmse={gam_test_rmse:.4} mgcv_test_rmse={mgcv_test_rmse:.4} \
+         wrap_gap={wrap_gap:.3e} (context: in-sample rel_l2 vs mgcv={insample_rel:.4})",
+        train_rows.len(),
+        n_test,
+    );
+
+    // ---- PRIMARY objective assertion: gam predicts the seasonal cycle ------
+    // The annual temperature cycle dominates the variance; a competent periodic
+    // smoother explains the bulk of held-out variation. R2 >= 0.85 is far above
+    // the constant-mean baseline (0) and would catch under/over-smoothing.
+    assert!(
+        gam_test_r2 >= 0.85,
+        "gam's held-out predictive R2 too low: {gam_test_r2:.4} (< 0.85)"
+    );
+
+    // ---- BASELINE (match-or-beat): no worse than mgcv on held-out RMSE -----
+    assert!(
+        gam_test_rmse <= mgcv_test_rmse * 1.10,
+        "gam held-out RMSE {gam_test_rmse:.4} exceeds mgcv {mgcv_test_rmse:.4} * 1.10"
+    );
+
+    // ---- STRUCTURE — periodic seam continuity on gam's OWN fit -------------
+    assert!(
+        wrap_gap < 1e-6,
+        "cyclic wrap not enforced on real data: |fit(month=1) - fit(month=13)| = {wrap_gap:.3e}"
     );
 }

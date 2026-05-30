@@ -54,6 +54,17 @@ use std::path::Path;
 
 const CIRRHOSIS_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/cirrhosis.csv");
 
+// SOURCE: `survival::veteran` (Veterans' Administration lung-cancer trial), the
+// canonical right-censored survival dataset, distributed here as
+// `bench/datasets/veteran_lung.csv` (n=137; columns trt, celltype, time, status,
+// karno, diagtime, age, prior). We model survival `time` (days) with the death
+// indicator `status` and the continuous Karnofsky performance score `karno` —
+// the dominant prognostic covariate in this trial — under the same
+// Royston-Parmar flexible-parametric (smooth-baseline) proportional-hazards
+// structure as the cirrhosis arm above.
+const VETERAN_LUNG_CSV: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/veteran_lung.csv");
+
 // Royston-Parmar flexible-parametric spline flexibility. gam's transformation
 // time basis uses a monotone I-spline on log(t); flexsurv uses a natural cubic
 // spline on log(t) with `k` internal knots. We match the interior-knot count so
@@ -366,6 +377,196 @@ fn gam_rp_spline_holdout_concordance_matches_or_beats_flexsurvspline_on_cirrhosi
     // (2) Match-or-beat the canonical Royston-Parmar tool on the SAME held-out
     //     metric: gam must rank unseen-subject risk at least as well as flexsurv,
     //     within a 0.02 concordance margin.
+    assert!(
+        gam_c >= flex_c - 0.02,
+        "gam held-out concordance trails flexsurv by more than 0.02: \
+         gam_C={gam_c:.4} flex_C={flex_c:.4}"
+    );
+}
+
+/// Parse `veteran_lung.csv` into numeric `(time, status, karno)` rows in file
+/// order. `time` is survival time in days, `status` is the death indicator
+/// (1 = death, 0 = right-censored), and `karno` is the continuous Karnofsky
+/// performance score (10..100). No missing values exist in this dataset.
+fn load_veteran_lung() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let file = File::open(Path::new(VETERAN_LUNG_CSV)).expect("open veteran_lung.csv");
+    let mut lines = BufReader::new(file).lines();
+    let header = lines
+        .next()
+        .expect("veteran_lung header line")
+        .expect("read veteran_lung header");
+    let cols: Vec<&str> = header.trim().split(',').collect();
+    let idx = |name: &str| {
+        cols.iter()
+            .position(|c| *c == name)
+            .unwrap_or_else(|| panic!("veteran_lung.csv missing column {name}"))
+    };
+    let i_time = idx("time");
+    let i_status = idx("status");
+    let i_karno = idx("karno");
+
+    let (mut time, mut status, mut karno) = (Vec::new(), Vec::new(), Vec::new());
+    for line in lines {
+        let line = line.expect("read veteran_lung row");
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = line.split(',').collect();
+        let t: f64 = f[i_time].parse().expect("parse time");
+        let s: f64 = f[i_status].parse().expect("parse status");
+        let k: f64 = f[i_karno].parse().expect("parse karno");
+        time.push(t);
+        status.push(s);
+        karno.push(k);
+    }
+    (time, status, karno)
+}
+
+#[test]
+fn gam_rp_spline_holdout_concordance_matches_or_beats_flexsurvspline_on_cirrhosis_on_real_data() {
+    init_parallelism();
+
+    // ---- load identical real data; deterministic train/test split ---------
+    // Veterans' Administration lung-cancer trial (survival::veteran), n=137.
+    let (time, status, karno) = load_veteran_lung();
+    let n = time.len();
+    assert!(n > 120, "veteran_lung should have ~137 rows, got {n}");
+
+    // Same deterministic stride split as the cirrhosis arm: every 4th row (in
+    // file order) is the untouched held-out test set; the rest train. No RNG.
+    let test_mask: Vec<bool> = (0..n).map(|i| i % TEST_STRIDE == 0).collect();
+    let train_time: Vec<f64> = (0..n).filter(|&i| !test_mask[i]).map(|i| time[i]).collect();
+    let train_status: Vec<f64> = (0..n).filter(|&i| !test_mask[i]).map(|i| status[i]).collect();
+    let train_karno: Vec<f64> = (0..n).filter(|&i| !test_mask[i]).map(|i| karno[i]).collect();
+    let test_time: Vec<f64> = (0..n).filter(|&i| test_mask[i]).map(|i| time[i]).collect();
+    let test_status: Vec<f64> = (0..n).filter(|&i| test_mask[i]).map(|i| status[i]).collect();
+    let test_karno: Vec<f64> = (0..n).filter(|&i| test_mask[i]).map(|i| karno[i]).collect();
+
+    let n_train = train_time.len();
+    let n_test = test_time.len();
+    assert!(
+        n_train > 90 && n_test > 25,
+        "split sizes off: {n_train}/{n_test}"
+    );
+    let train_events: usize = train_status.iter().filter(|&&e| e == 1.0).count();
+    let test_events: usize = test_status.iter().filter(|&&e| e == 1.0).count();
+    assert!(train_events > 80, "expected >80 train deaths, got {train_events}");
+    assert!(test_events > 20, "expected >20 test deaths, got {test_events}");
+
+    // Encode the TRAIN survival frame for gam. The same train rows in the same
+    // order feed flexsurv below; test rows are never shown to either fitter.
+    let headers = ["time", "event", "karno"]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>();
+    let rows: Vec<StringRecord> = (0..n_train)
+        .map(|i| {
+            StringRecord::from(vec![
+                format!("{:.17e}", train_time[i]),
+                format!("{:.1}", train_status[i]),
+                format!("{:.17e}", train_karno[i]),
+            ])
+        })
+        .collect();
+    let ds =
+        encode_recordswith_inferred_schema(headers, rows).expect("encode veteran train frame");
+
+    // ---- fit gam on TRAIN: Royston-Parmar flexible-parametric baseline ----
+    // Smooth (monotone I-spline) log-cumulative-hazard baseline shape on log(t)
+    // plus a proportional karno effect — exactly the capability the synthetic
+    // arm proves, now exercised on real censored data.
+    let cfg = FitConfig {
+        survival_likelihood: "transformation".to_string(),
+        time_basis: "ispline".to_string(),
+        time_degree: 3,
+        time_num_internal_knots: N_INTERNAL_KNOTS,
+        ..FitConfig::default()
+    };
+    let result =
+        fit_from_formula("Surv(time, event) ~ karno", &ds, &cfg).expect("gam RP-spline fit");
+    let FitResult::SurvivalTransformation(fit) = result else {
+        panic!("expected a survival-transformation (Royston-Parmar) fit result");
+    };
+
+    let beta = &fit.fit.beta;
+    let p_time = fit.time_base_ncols;
+    assert!(
+        p_time > 0 && p_time < beta.len(),
+        "RP time block should be a strict prefix of beta: p_time={p_time}, p={}",
+        beta.len()
+    );
+    let beta_cov = beta.slice(ndarray::s![p_time..]).to_owned();
+
+    // ---- gam risk score on the HELD-OUT test rows -------------------------
+    // PH model: covariate linear predictor c(karno)·β_cov is a monotone risk
+    // score (larger ⇒ larger log Λ at every t ⇒ smaller S). Rebuild the
+    // covariate design at each test karno from the frozen spec so column order
+    // matches β_cov, then dot with β_cov.
+    let karno_idx = ds.column_map()["karno"];
+    let gam_risk_test: Vec<f64> = test_karno
+        .iter()
+        .map(|&k| {
+            let mut grid = Array2::<f64>::zeros((1, ds.headers.len()));
+            grid[[0, karno_idx]] = k;
+            let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
+                .expect("rebuild covariate design at a test karno");
+            assert_eq!(
+                design.design.ncols(),
+                beta_cov.len(),
+                "covariate design width must equal β_cov length"
+            );
+            design.design.apply(&beta_cov).to_vec()[0]
+        })
+        .collect();
+
+    let gam_c = harrell_c_index(&test_time, &test_status, &gam_risk_test);
+
+    // ---- fit the SAME model with flexsurv on the SAME TRAIN rows ----------
+    // scale="hazard" => Royston-Parmar log-cumulative-hazard spline; k interior
+    // knots match gam's interior-knot count. We pull the fitted karno slope to
+    // build flexsurv's risk score on the held-out test karno values.
+    let r = run_r(
+        &[
+            Column::new("time", &train_time),
+            Column::new("event", &train_status),
+            Column::new("karno", &train_karno),
+        ],
+        &format!(
+            r#"
+            suppressPackageStartupMessages(library(flexsurv))
+            m <- flexsurvspline(Surv(time, event) ~ karno, data = df,
+                                k = {k}, scale = "hazard")
+            beta_karno <- unname(coef(m)["karno"])
+            emit("beta_karno", beta_karno)
+            "#,
+            k = N_INTERNAL_KNOTS,
+        ),
+    );
+    let flex_beta_karno = r.scalar("beta_karno");
+
+    // flexsurv risk score on the SAME held-out test karno values: PH model,
+    // risk ∝ beta_karno * karno (a positive affine rescale is monotone, so the
+    // common baseline term is irrelevant to concordance).
+    let flex_risk_test: Vec<f64> = test_karno.iter().map(|&k| flex_beta_karno * k).collect();
+    let flex_c = harrell_c_index(&test_time, &test_status, &flex_risk_test);
+
+    eprintln!(
+        "veteran_lung RP-spline held-out concordance: n_train={n_train} n_test={n_test} \
+         test_events={test_events} gam_C={gam_c:.4} flex_C={flex_c:.4} \
+         flex_beta_karno={flex_beta_karno:.5}"
+    );
+
+    // ---- OBJECTIVE assertions ---------------------------------------------
+    // (1) Absolute out-of-sample discrimination bar. Karnofsky score is a strong
+    //     prognostic marker, so a model that captures real signal must clear
+    //     0.55 on subjects it never saw (0.5 is the no-information coin flip).
+    assert!(
+        gam_c >= 0.55,
+        "gam held-out concordance below the objective bar: gam_C={gam_c:.4} (< 0.55)"
+    );
+    // (2) Match-or-beat the canonical Royston-Parmar tool on the SAME held-out
+    //     metric, within a 0.02 concordance margin.
     assert!(
         gam_c >= flex_c - 0.02,
         "gam held-out concordance trails flexsurv by more than 0.02: \

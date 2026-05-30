@@ -46,11 +46,13 @@ use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+    load_csvwith_inferred_schema,
 };
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
+use std::path::Path;
 
 const N_GROUPS: usize = 5;
 const PER_GROUP: usize = 60;
@@ -299,5 +301,218 @@ fn gam_random_intercept_by_smooth_recovers_truth() {
     assert!(
         gam_var_err <= 1.10 * lme4_var_err.max(1e-6),
         "gam residual variance is less accurate than the lme4 baseline vs truth: gam_err={gam_var_err:.5} > 1.10·{lme4_var_err:.5}"
+    );
+}
+
+// ===========================================================================
+// REAL-DATA ARM (truth unknown ⇒ held-out predictive accuracy is the metric).
+//
+// Dataset SOURCE: `lme4::sleepstudy` (Belenky et al. 2003, sleep-deprivation
+// reaction-time study), shipped as `bench/datasets/sleepstudy.csv`. 18 subjects
+// × 10 days (Days 0..9), response `Reaction` (ms). The canonical model is a
+// per-subject intercept AND per-subject Day trajectory — exactly the gam
+// capability under test: shared smooth + by-group smooth + random intercept.
+//
+// On this real data the true mean is unknown, so we assert OBJECTIVE held-out
+// predictive accuracy with a deterministic split: for every subject, Days 2 and
+// 7 are held out (2 of 10 rows ⇒ 36 test rows, 144 train rows). Each subject
+// therefore appears in BOTH train and test, so its random intercept and its
+// by-subject smooth are estimable from training rows and usable to predict the
+// held-out rows.
+//
+//   PRIMARY (objective, tool-free): held-out coefficient of determination
+//     `test_R2 >= 0.70`. Sleepstudy reaction times are dominated by large,
+//     subject-specific levels and roughly linear Day trajectories; a model that
+//     partitions level (random intercept) from trajectory (by-subject smooth)
+//     explains the great majority of held-out variance — far above the
+//     constant-mean predictor (R2 = 0) and above a single-pooled-line fit.
+//
+//   BASELINE (match-or-beat): `lme4::lmer(Reaction ~ Days + (Days | Subject))`
+//     — the mature random-intercept + random-slope standard — is fit on the
+//     SAME training rows and predicts the SAME held-out rows. gam's held-out
+//     RMSE must be no worse than `lme4_test_rmse * 1.10`. lme4 is the accuracy
+//     bar to match-or-beat, never an output to reproduce.
+
+const SLEEPSTUDY_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/sleepstudy.csv");
+
+/// Coefficient of determination of `pred` against observed `truth` relative to
+/// the mean predictor: `1 - SS_res/SS_tot`. R2=1 perfect, R2=0 matches the
+/// held-out mean, R2<0 is worse than the mean.
+fn held_out_r2(pred: &[f64], truth: &[f64]) -> f64 {
+    assert_eq!(pred.len(), truth.len(), "r2 length mismatch");
+    let n = truth.len() as f64;
+    let mean = truth.iter().sum::<f64>() / n;
+    let ss_res: f64 = pred.iter().zip(truth).map(|(p, t)| (t - p) * (t - p)).sum();
+    let ss_tot: f64 = truth.iter().map(|t| (t - mean) * (t - mean)).sum();
+    1.0 - ss_res / ss_tot.max(1e-300)
+}
+
+#[test]
+fn gam_random_intercept_by_smooth_recovers_truth_on_real_data() {
+    init_parallelism();
+
+    // ---- load the real sleepstudy data (Reaction, Days, Subject) ----------
+    let ds_raw = load_csvwith_inferred_schema(Path::new(SLEEPSTUDY_CSV)).expect("load sleepstudy.csv");
+    let col = ds_raw.column_map();
+    let reaction_idx = col["Reaction"];
+    let days_idx = col["Days"];
+    let subject_idx = col["Subject"];
+    let reaction: Vec<f64> = ds_raw.values.column(reaction_idx).to_vec();
+    let days: Vec<f64> = ds_raw.values.column(days_idx).to_vec();
+    let subject_raw: Vec<f64> = ds_raw.values.column(subject_idx).to_vec();
+    let n_all = reaction.len();
+    assert_eq!(n_all, 180, "sleepstudy should have 180 rows, got {n_all}");
+
+    // ---- deterministic split: hold out Days 2 and 7 within every subject ---
+    // Each subject keeps 8 training days and contributes 2 held-out days, so its
+    // intercept and by-subject trajectory are estimable on TRAIN and predictable
+    // on TEST. Days are integers 0..9 stored as f64; round defensively.
+    let is_test = |i: usize| {
+        let d = days[i].round() as i64;
+        d == 2 || d == 7
+    };
+    let train_rows: Vec<usize> = (0..n_all).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n_all).filter(|&i| is_test(i)).collect();
+    assert_eq!(train_rows.len(), 144, "train size");
+    assert_eq!(test_rows.len(), 36, "test size");
+
+    // ---- assign each subject a stable encoded level code (sorted order) -----
+    // gam needs `Subject` categorical for the by-subject smooth + random
+    // intercept; the raw CSV column is numeric, so we re-encode Subject as string
+    // labels. Emitting records subject-blocked in SORTED subject order makes the
+    // first-appearance level code equal the subject's rank, so the design built
+    // at the held-out rows can address each subject by that same code.
+    let mut subjects_sorted: Vec<i64> = subject_raw.iter().map(|s| s.round() as i64).collect();
+    subjects_sorted.sort_unstable();
+    subjects_sorted.dedup();
+    let n_subjects = subjects_sorted.len();
+    assert_eq!(n_subjects, 18, "sleepstudy has 18 subjects, got {n_subjects}");
+    let subject_code = |sid: i64| -> usize {
+        subjects_sorted
+            .iter()
+            .position(|&s| s == sid)
+            .expect("subject in sorted list")
+    };
+
+    // ---- build the gam TRAIN dataset: Subject as categorical string label ---
+    // Records are emitted subject-block by subject-block (sorted), train rows
+    // only, so encoded Subject code == subject rank == subject_code(sid).
+    let headers = vec![
+        "Reaction".to_string(),
+        "Days".to_string(),
+        "Subject".to_string(),
+    ];
+    let mut train_records = Vec::<StringRecord>::with_capacity(train_rows.len());
+    for &sid in &subjects_sorted {
+        for &i in &train_rows {
+            if subject_raw[i].round() as i64 == sid {
+                train_records.push(StringRecord::from(vec![
+                    format!("{}", reaction[i]),
+                    format!("{}", days[i]),
+                    format!("s{sid}"),
+                ]));
+            }
+        }
+    }
+    assert_eq!(train_records.len(), train_rows.len(), "train record count");
+    let train_ds = encode_recordswith_inferred_schema(headers, train_records)
+        .expect("encode sleepstudy train dataset");
+    let tcol = train_ds.column_map();
+    let t_days_idx = tcol["Days"];
+    let t_subject_idx = tcol["Subject"];
+
+    // ---- fit gam on TRAIN: Reaction ~ s(Days) + s(Days, by=Subject) + group(Subject) ----
+    // Shared Day smooth + per-subject Day deviation + per-subject random
+    // intercept — the assigned capability, identical in structure to the
+    // synthetic arm's `y ~ s(x) + s(x, by=g) + group(g)`.
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula(
+        "Reaction ~ s(Days) + s(Days, by=Subject) + group(Subject)",
+        &train_ds,
+        &cfg,
+    )
+    .expect("gam combined fit on sleepstudy train");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected a standard GAM fit for the sleepstudy RE + by-smooth combination");
+    };
+
+    // ---- gam predictions at the held-out rows -----------------------------
+    // Rebuild the frozen design at the test (Days, Subject-code) and apply beta
+    // (identity link ⇒ design*beta = predicted mean). Each test row carries its
+    // own subject code, so it is evaluated against its own by-subject smooth AND
+    // its own random intercept.
+    let p = train_ds.headers.len();
+    let mut test_grid = Array2::<f64>::zeros((test_rows.len(), p));
+    for (out_row, &i) in test_rows.iter().enumerate() {
+        let code = subject_code(subject_raw[i].round() as i64);
+        test_grid[[out_row, t_days_idx]] = days[i];
+        test_grid[[out_row, t_subject_idx]] = code as f64;
+    }
+    let test_design = build_term_collection_design(test_grid.view(), &fit.resolvedspec)
+        .expect("rebuild gam design at held-out sleepstudy rows");
+    let gam_test_pred: Vec<f64> = test_design.design.apply(&fit.fit.beta).to_vec();
+    assert_eq!(gam_test_pred.len(), test_rows.len(), "gam test pred length");
+
+    let test_reaction: Vec<f64> = test_rows.iter().map(|&i| reaction[i]).collect();
+
+    // ---- lme4 baseline: fit Reaction ~ Days + (Days | Subject) on TRAIN, ---
+    // predict the SAME held-out rows. All columns in one run_r call must share
+    // length, so we pass full-length Reaction/Days/Subject plus an `is_train`
+    // 0/1 mask; the R body splits, fits on train, and predicts the test subset.
+    let reaction_full: Vec<f64> = reaction.clone();
+    let days_full: Vec<f64> = days.clone();
+    let subject_full: Vec<f64> = subject_raw.clone();
+    let is_train_mask: Vec<f64> = (0..n_all)
+        .map(|i| if is_test(i) { 0.0 } else { 1.0 })
+        .collect();
+    let r_lme4 = run_r(
+        &[
+            Column::new("Reaction", &reaction_full),
+            Column::new("Days", &days_full),
+            Column::new("Subject", &subject_full),
+            Column::new("is_train", &is_train_mask),
+        ],
+        r#"
+        suppressPackageStartupMessages(library(lme4))
+        df$Subject <- factor(df$Subject)
+        tr <- df[df$is_train == 1, ]
+        te <- df[df$is_train == 0, ]
+        m <- lmer(Reaction ~ Days + (Days | Subject), data = tr, REML = TRUE)
+        emit("test_pred", as.numeric(predict(m, newdata = te)))
+        "#,
+    );
+    let lme4_test_pred = r_lme4.vector("test_pred");
+    assert_eq!(
+        lme4_test_pred.len(),
+        test_rows.len(),
+        "lme4 held-out prediction length mismatch"
+    );
+
+    // ---- OBJECTIVE held-out metrics on gam's OWN predictions ---------------
+    let gam_test_r2 = held_out_r2(&gam_test_pred, &test_reaction);
+    let gam_test_rmse = rmse(&gam_test_pred, &test_reaction);
+    let lme4_test_rmse = rmse(lme4_test_pred, &test_reaction);
+
+    eprintln!(
+        "sleepstudy held-out: n_train={} n_test={} subjects={n_subjects} \
+         gam_test_R2={gam_test_r2:.4} gam_test_rmse={gam_test_rmse:.4} \
+         lme4_test_rmse={lme4_test_rmse:.4}",
+        train_rows.len(),
+        test_rows.len(),
+    );
+
+    // ---- PRIMARY objective assertion: gam predicts held-out reaction times --
+    assert!(
+        gam_test_r2 >= 0.70,
+        "gam's held-out predictive R2 too low: {gam_test_r2:.4} (< 0.70)"
+    );
+
+    // ---- BASELINE (match-or-beat): no worse than lme4 on held-out RMSE ------
+    assert!(
+        gam_test_rmse <= lme4_test_rmse * 1.10,
+        "gam held-out RMSE {gam_test_rmse:.4} exceeds lme4 {lme4_test_rmse:.4} * 1.10"
     );
 }

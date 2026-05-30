@@ -44,12 +44,19 @@ use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, relative_l2, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+    load_csvwith_inferred_schema,
 };
 use ndarray::Array2;
 use std::fs;
 use std::path::Path;
 
 const BONE_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/bone.csv");
+// Source: Veterans' Administration lung-cancer trial, Kalbfleisch & Prentice
+// (1980); shipped as `survival::veteran` in R. Columns used here: time
+// (survival days), status (1 = death, 0 = censored), karno (Karnofsky
+// performance score, the dataset's dominant continuous prognostic covariate),
+// age (years). n = 137.
+const VETERAN_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/veteran_lung.csv");
 
 /// Harrell's concordance index for a risk score (higher score = higher risk =
 /// expected-earlier failure). Over all orderable pairs where the earlier event
@@ -330,5 +337,194 @@ fn gam_weibull_survival_objective_quality_on_bone() {
     assert!(
         gam_c >= flexsurv_c - 0.02,
         "gam concordance trails flexsurv beyond margin: gam_C={gam_c:.4} flexsurv_C={flexsurv_c:.4}"
+    );
+}
+
+#[test]
+fn gam_weibull_survival_objective_quality_on_bone_on_real_data() {
+    // Real-data arm of the parametric-Weibull survival quality test. The
+    // synthetic/known-truth proof lives in
+    // `gam_weibull_survival_objective_quality_on_bone`; here we exercise the
+    // SAME capability (`survival_likelihood = "weibull"`, the linear `[1, log t]`
+    // Royston-Parmar net model) on a LARGER real dataset with no ground truth,
+    // and assert OBJECTIVE held-out predictive discrimination — never a flexsurv
+    // reproduction.
+    //
+    // Dataset: Veterans' Administration lung-cancer trial (`survival::veteran`).
+    // Model: Surv(time, status) ~ karno + age. Karnofsky score is the dataset's
+    // dominant prognostic covariate; age is a weaker covariate. Both enter
+    // linearly and are fed as IDENTICAL numeric columns to gam and flexsurv.
+    //
+    // OBJECTIVE METRIC: Harrell's concordance (C-index) of gam's predicted PH
+    // risk score r(x) = γ·x evaluated on a HELD-OUT test split (rows where
+    // i % 4 == 0), against the held-out (time, status) order. We assert an
+    // ABSOLUTE bar C >= 0.60 (well above the 0.5 coin flip) AND match-or-beat
+    // vs a flexsurv Weibull AFT fit on the IDENTICAL train rows, scored on the
+    // IDENTICAL test rows: C_gam >= C_flexsurv - 0.03.
+    init_parallelism();
+
+    // ---- load the real Veteran lung-cancer dataset ------------------------
+    let ds = load_csvwith_inferred_schema(Path::new(VETERAN_CSV)).expect("load veteran_lung.csv");
+    let col = ds.column_map();
+    let time_idx = col["time"];
+    let status_idx = col["status"];
+    let karno_idx = col["karno"];
+    let age_idx = col["age"];
+    let time: Vec<f64> = ds.values.column(time_idx).to_vec();
+    let status: Vec<f64> = ds.values.column(status_idx).to_vec();
+    let karno: Vec<f64> = ds.values.column(karno_idx).to_vec();
+    let age: Vec<f64> = ds.values.column(age_idx).to_vec();
+    let n = time.len();
+    assert_eq!(n, 137, "veteran_lung.csv should have 137 data rows, got {n}");
+    assert!(
+        status.iter().all(|&s| s == 0.0 || s == 1.0),
+        "veteran status must be 0/1"
+    );
+    assert!(
+        status.iter().any(|&s| s == 0.0) && status.iter().any(|&s| s == 1.0),
+        "both censored and event observations must be present"
+    );
+
+    // ---- deterministic train/test split: every 4th row held out ----------
+    let is_test = |i: usize| i % 4 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    assert!(
+        train_rows.len() > 90 && test_rows.len() > 25,
+        "split sizes: train={} test={}",
+        train_rows.len(),
+        test_rows.len()
+    );
+
+    let train_time: Vec<f64> = train_rows.iter().map(|&i| time[i]).collect();
+    let train_status: Vec<f64> = train_rows.iter().map(|&i| status[i]).collect();
+    let train_karno: Vec<f64> = train_rows.iter().map(|&i| karno[i]).collect();
+    let train_age: Vec<f64> = train_rows.iter().map(|&i| age[i]).collect();
+    let test_time: Vec<f64> = test_rows.iter().map(|&i| time[i]).collect();
+    let test_status: Vec<f64> = test_rows.iter().map(|&i| status[i]).collect();
+    let test_karno: Vec<f64> = test_rows.iter().map(|&i| karno[i]).collect();
+    let test_age: Vec<f64> = test_rows.iter().map(|&i| age[i]).collect();
+
+    // ---- fit gam on TRAIN: Surv(time, status) ~ karno + age, Weibull ------
+    // Encode the training rows as their own dataset so the formula resolves on
+    // exactly the same numeric columns we hand to flexsurv.
+    let headers = vec![
+        "time".to_string(),
+        "status".to_string(),
+        "karno".to_string(),
+        "age".to_string(),
+    ];
+    let rows: Vec<StringRecord> = (0..train_rows.len())
+        .map(|i| {
+            StringRecord::from(vec![
+                format!("{:.17e}", train_time[i]),
+                format!("{:.1}", train_status[i]),
+                format!("{:.17e}", train_karno[i]),
+                format!("{:.17e}", train_age[i]),
+            ])
+        })
+        .collect();
+    let train_data =
+        encode_recordswith_inferred_schema(headers, rows).expect("encode veteran train data");
+
+    let cfg = FitConfig {
+        survival_likelihood: "weibull".to_string(),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula("Surv(time, status) ~ karno + age", &train_data, &cfg)
+        .expect("gam Weibull fit on veteran train");
+    let FitResult::SurvivalTransformation(fit) = result else {
+        panic!("expected a SurvivalTransformation fit result for survival_likelihood=weibull");
+    };
+
+    let beta = &fit.fit.beta;
+    let p_time = fit.time_base_ncols;
+    assert_eq!(
+        p_time, 2,
+        "Weibull linear time basis must have 2 columns, got {p_time}"
+    );
+    assert!(
+        p_time < beta.len(),
+        "Weibull time block must be a strict prefix of beta: p_time={p_time}, p={}",
+        beta.len()
+    );
+
+    // Covariate linear predictor r(x) = γ·x, rebuilt from the frozen spec so the
+    // column order/coding match `beta` exactly. The shared Weibull baseline
+    // shape makes this covariate contribution the time-invariant PH risk score.
+    let beta_cov = beta.slice(ndarray::s![p_time..]).to_owned();
+    let train_col = train_data.column_map();
+    let g_karno_idx = train_col["karno"];
+    let g_age_idx = train_col["age"];
+    let cov_eta = |karno_val: f64, age_val: f64| -> f64 {
+        let mut grid = Array2::<f64>::zeros((1, train_data.headers.len()));
+        grid[[0, g_karno_idx]] = karno_val;
+        grid[[0, g_age_idx]] = age_val;
+        let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
+            .expect("rebuild covariate design");
+        assert_eq!(
+            design.design.ncols(),
+            beta_cov.len(),
+            "covariate design width must equal β_cov length"
+        );
+        design.design.apply(&beta_cov).to_vec()[0]
+    };
+
+    // gam's HELD-OUT predicted risk scores.
+    let gam_risk: Vec<f64> = (0..test_rows.len())
+        .map(|i| cov_eta(test_karno[i], test_age[i]))
+        .collect();
+    let gam_c = concordance(&test_time, &test_status, &gam_risk);
+
+    // ---- baseline: flexsurvreg(dist="weibull") on the SAME train rows ------
+    // Fit on train, then form each TEST subject's PH risk score from flexsurv's
+    // AFT coefficients via the exact Weibull map log-HR = -shape * alpha_AFT,
+    // and score concordance on the IDENTICAL held-out (time, status) order. We
+    // pass train- and test-length columns in separate calls so every Column in
+    // a single run_r call is equal length (train length here; the test scores
+    // are emitted from a test data.frame built inside R from emitted coeffs).
+    let r_fit = run_r(
+        &[
+            Column::new("time", &train_time),
+            Column::new("status", &train_status),
+            Column::new("karno", &train_karno),
+            Column::new("age", &train_age),
+        ],
+        r#"
+        suppressPackageStartupMessages(library(flexsurv))
+        fs <- flexsurvreg(Surv(time, status) ~ karno + age, data = df, dist = "weibull")
+        shape <- as.numeric(fs$res["shape", "est"])
+        a_karno <- as.numeric(coef(fs)[["karno"]])
+        a_age <- as.numeric(coef(fs)[["age"]])
+        # Time-invariant PH log-hazard-ratio per covariate: -shape * alpha_AFT.
+        emit("ph_karno", -shape * a_karno)
+        emit("ph_age", -shape * a_age)
+        "#,
+    );
+    let ph_karno = r_fit.scalar("ph_karno");
+    let ph_age = r_fit.scalar("ph_age");
+    // flexsurv's held-out PH risk score on the SAME test rows, in plain Rust.
+    let flexsurv_risk: Vec<f64> = (0..test_rows.len())
+        .map(|i| ph_karno * test_karno[i] + ph_age * test_age[i])
+        .collect();
+    let flexsurv_c = concordance(&test_time, &test_status, &flexsurv_risk);
+
+    eprintln!(
+        "veteran Weibull OBJECTIVE held-out: n_train={} n_test={} gam_C={gam_c:.4} \
+         flexsurv_C={flexsurv_c:.4}",
+        train_rows.len(),
+        test_rows.len(),
+    );
+
+    // ---- PRIMARY objective assertion: held-out discrimination -------------
+    assert!(
+        gam_c >= 0.60,
+        "gam Weibull held-out discrimination too low: concordance C={gam_c:.4} < 0.60"
+    );
+    // ---- BASELINE (match-or-beat): vs flexsurv on the SAME held-out metric -
+    assert!(
+        gam_c >= flexsurv_c - 0.03,
+        "gam held-out concordance trails flexsurv beyond margin: \
+         gam_C={gam_c:.4} flexsurv_C={flexsurv_c:.4}"
     );
 }

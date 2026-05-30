@@ -223,3 +223,174 @@ fn gam_smooth_predicts_heldout_lidar_at_least_as_well_as_inla() {
         1.10 * inla_test_rmse
     );
 }
+
+/// Real-data arm: POSTERIOR-MEAN RECOVERY of gam's Gaussian smooth on the
+/// canonical `lidar` benchmark, against R-INLA as a match-or-beat baseline.
+///
+/// The function above already exercises lidar with a range-sorted, every-5th-row
+/// stride split. This second arm complements it with an INDEPENDENT deterministic
+/// partition (every 4th row by native file order) and frames the claim explicitly
+/// as posterior-mean recovery: gam's posterior mean of the latent smooth, sampled
+/// at unseen `range` values, must recover the held-out signal in absolute terms
+/// and must do so at least as accurately as R-INLA's posterior mean of the same
+/// structural latent-Gaussian smooth fit to the identical training rows.
+///
+/// Data SOURCE: the canonical `lidar` smoothing benchmark (range -> logratio,
+/// n = 221), shipped at `bench/datasets/lidar.csv` and used unmodified by both
+/// engines. There is no known ground-truth function, so the objective metric is
+/// out-of-sample predictive accuracy of the posterior mean.
+///
+///   PRIMARY (objective, tool-free): held-out posterior-mean R^2 >= 0.55 — the
+///     posterior mean genuinely recovers the latent lidar signal on unseen rows.
+///   BASELINE (match-or-beat): gam's held-out posterior-mean RMSE <= 1.10 *
+///     R-INLA's held-out posterior-mean RMSE on the SAME split. R-INLA is a
+///     baseline to match-or-beat, never an output to replicate.
+#[test]
+fn gam_smooth_predicts_heldout_lidar_at_least_as_well_as_inla_on_real_data() {
+    init_parallelism();
+
+    // ---- load the canonical lidar dataset (range -> logratio) -------------
+    let ds = load_csvwith_inferred_schema(Path::new(LIDAR_CSV)).expect("load lidar.csv");
+    let col = ds.column_map();
+    let range_idx = col["range"];
+    let logratio_idx = col["logratio"];
+    let n = ds.values.nrows();
+    assert!(n > 100, "lidar should have ~221 rows, got {n}");
+
+    // ---- independent deterministic split: every 4th row (native order) ----
+    // Distinct from the range-sorted stride-5 split above, so this arm is not a
+    // duplicate evaluation. Seedless and reproducible.
+    let is_test = |i: usize| i % 4 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    let n_train = train_rows.len();
+    let n_test = test_rows.len();
+    assert!(
+        n_train > 100 && n_test > 30,
+        "split sizes: train={n_train} test={n_test}"
+    );
+
+    let test_range: Vec<f64> = test_rows.iter().map(|&i| ds.values[[i, range_idx]]).collect();
+    let test_y: Vec<f64> = test_rows.iter().map(|&i| ds.values[[i, logratio_idx]]).collect();
+
+    // ---- fit gam on the TRAINING rows only --------------------------------
+    let mut train_ds = ds.clone();
+    let mut train_vals = Array2::<f64>::zeros((n_train, ds.headers.len()));
+    for (new_i, &row) in train_rows.iter().enumerate() {
+        for c in 0..ds.headers.len() {
+            train_vals[[new_i, c]] = ds.values[[row, c]];
+        }
+    }
+    train_ds.values = train_vals;
+
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let result =
+        fit_from_formula("logratio ~ s(range, bs='tp')", &train_ds, &cfg).expect("gam fit");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected a standard GAM fit");
+    };
+
+    // gam's posterior-mean prediction at the held-out `range` values: rebuild the
+    // frozen design at the test points (identity link => design*beta = posterior
+    // mean of the latent smooth).
+    let mut grid = Array2::<f64>::zeros((n_test, ds.headers.len()));
+    for (i, &r) in test_range.iter().enumerate() {
+        grid[[i, range_idx]] = r;
+    }
+    let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
+        .expect("rebuild design at held-out points");
+    let gam_pred: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
+    assert_eq!(gam_pred.len(), n_test, "gam prediction length");
+
+    // ---- R-INLA baseline: same structural smooth, same split -------------
+    // Build a full-length data frame in NATIVE file order with a per-row latent
+    // index 1..N. Held-out (test) rows enter with y = NA so INLA's posterior mean
+    // of the linear predictor at those indices is a genuine out-of-sample
+    // posterior-mean prediction. Every column passed in this single call is
+    // length N; the 1-based held-out positions ride along as `testpos`, padded
+    // with NA by read.csv and recovered inside R.
+    let order_logratio: Vec<f64> = (0..n)
+        .map(|i| {
+            if is_test(i) {
+                f64::NAN // held out from the INLA fit
+            } else {
+                ds.values[[i, logratio_idx]]
+            }
+        })
+        .collect();
+    let full_range: Vec<f64> = (0..n).map(|i| ds.values[[i, range_idx]]).collect();
+    let mut test_positions: Vec<f64> = (0..n).filter(|&i| is_test(i)).map(|i| (i + 1) as f64).collect();
+    assert_eq!(test_positions.len(), n_test, "INLA test-position count");
+    // Pad testpos to length N so all columns in this run_r call are equal length.
+    test_positions.resize(n, f64::NAN);
+
+    let r = run_r(
+        &[
+            Column::new("frange", &full_range),
+            Column::new("flogratio", &order_logratio),
+            Column::new("testpos", &test_positions),
+        ],
+        r#"
+        suppressPackageStartupMessages(library(INLA))
+        # df columns (all length N): frange (native order), flogratio (y with NA
+        # at held-out rows), testpos (1-based held-out positions, NA-padded).
+        testpos <- df$testpos[!is.na(df$testpos)]
+        N <- nrow(df)
+        dat <- data.frame(y = df$flogratio, idx = seq_len(N))
+        m <- inla(
+            y ~ f(idx, model = "rw2", scale.model = TRUE, constr = TRUE),
+            family = "gaussian",
+            data = dat,
+            control.predictor = list(compute = TRUE),
+            control.compute = list(config = FALSE)
+        )
+        # Posterior mean of the linear predictor at the held-out indices.
+        fv <- m$summary.fitted.values$mean
+        emit("pred", fv[testpos])
+        "#,
+    );
+    let inla_pred = r.vector("pred");
+    assert_eq!(inla_pred.len(), n_test, "INLA prediction length mismatch");
+
+    // ---- objective posterior-mean recovery metrics (plain Rust) ----------
+    let y_bar = test_y.iter().sum::<f64>() / (n_test as f64);
+    let ss_tot: f64 = test_y.iter().map(|y| (y - y_bar) * (y - y_bar)).sum();
+    let ss_res: f64 = test_y
+        .iter()
+        .zip(gam_pred.iter())
+        .map(|(y, p)| (y - p) * (y - p))
+        .sum();
+    let gam_test_r2 = 1.0 - ss_res / ss_tot.max(1e-300);
+    let gam_test_rmse = rmse(&gam_pred, &test_y);
+    let inla_test_rmse = rmse(inla_pred, &test_y);
+
+    // Context only (NOT a pass criterion): closeness of the two posterior means.
+    let pred_rel_l2 = relative_l2(&gam_pred, inla_pred);
+
+    eprintln!(
+        "lidar posterior-mean recovery (every-4th split): n_train={n_train} n_test={n_test} \
+         gam_test_R2={gam_test_r2:.4} gam_test_RMSE={gam_test_rmse:.4} \
+         inla_test_RMSE={inla_test_rmse:.4} rmse_ratio={:.4} \
+         pred_rel_l2(gam,inla)={pred_rel_l2:.4}",
+        gam_test_rmse / inla_test_rmse.max(1e-300),
+    );
+
+    // (1) ABSOLUTE quality: the posterior mean recovers the held-out signal.
+    assert!(
+        gam_test_r2 >= 0.55,
+        "gam held-out posterior-mean R^2 too low: {gam_test_r2:.4} (bound 0.55) — \
+         the posterior mean does not recover unseen lidar points"
+    );
+
+    // (2) MATCH-OR-BEAT R-INLA on held-out posterior-mean RMSE.
+    assert!(
+        gam_test_rmse <= 1.10 * inla_test_rmse,
+        "gam held-out posterior-mean RMSE {gam_test_rmse:.4} exceeds 1.10 * INLA \
+         RMSE {inla_test_rmse:.4} (= {:.4}) — gam recovers unseen lidar points \
+         worse than the mature Bayesian smoother",
+        1.10 * inla_test_rmse
+    );
+}

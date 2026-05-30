@@ -44,11 +44,39 @@
 //! normalized independent Gamma(1,1) variates) and a fixed Exp(1) weight vector.
 
 use gam::geometry::simplex::simplex_frechet_mean;
+use gam::load_csvwith_inferred_schema;
 use gam::test_support::reference::{Column, relative_l2, run_python, run_r};
 use ndarray::{Array2, ArrayView1};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Exp, Gamma};
+use std::path::Path;
+
+/// Real compositional benchmark: AFM (Na2O+K2O / FeO / MgO) of 23 Skye lava
+/// flows. Source: Aitchison, J. (1986) *The Statistical Analysis of
+/// Compositional Data*, dataset shipped as `compositions::SkyeAFM` and used
+/// throughout the compositional-data literature. Local copy:
+/// `bench/datasets/skye_afm_lavas.csv` (columns `A`,`F`,`M`; integer parts that
+/// closure normalizes onto the 2-simplex).
+const SKYE_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/skye_afm_lavas.csv");
+
+/// Mean squared Aitchison distance of held-out compositions `points` (N x D,
+/// already strictly positive) to a fixed center `mu`. This is the *held-out*
+/// value of the per-point Fréchet objective `(1/N) sum_i d_A(x_i, mu)^2`: the
+/// out-of-sample generalization error of a candidate barycenter. Lower is
+/// better; minimized over `mu` by the population Aitchison mean.
+fn mean_sq_aitchison(points: &Array2<f64>, mu: &[f64]) -> f64 {
+    let (n, d) = points.dim();
+    let clr_mu = clr(mu);
+    let mut acc = 0.0_f64;
+    for i in 0..n {
+        let row: Vec<f64> = (0..d).map(|c| points[[i, c]]).collect();
+        let clr_x = clr(&row);
+        let sq: f64 = (0..d).map(|k| (clr_x[k] - clr_mu[k]).powi(2)).sum();
+        acc += sq;
+    }
+    acc / n.max(1) as f64
+}
 
 /// Centered-log-ratio coordinates of a strictly-positive composition row.
 /// `clr(p)_k = ln p_k - mean_j ln p_j`. Aitchison distance is the Euclidean
@@ -297,6 +325,174 @@ emit("py_unweighted", g)
     assert!(
         f_gam_w <= f_r_w + tol_w,
         "gam weighted mean must be at-least-as-good as the Aitchison log-space weighted mean baseline: F(gam)={f_gam_w:.6e} > F(R)={f_r_w:.6e}"
+    );
+}
+
+/// Real-data arm: the Aitchison barycenter is a *predictor of central tendency*
+/// for compositions, so on real data (no ground-truth function) its objective
+/// quality is its OUT-OF-SAMPLE fit. We split the 23 Skye AFM lavas
+/// deterministically into train/test (every 3rd flow held out), estimate the
+/// center on TRAIN only with gam, and assert OBJECTIVE held-out quality on gam's
+/// OWN output:
+///
+///   PRIMARY (tool-free):
+///     * First-order optimality on TRAIN: gam's center is a stationary point of
+///       the training Fréchet objective (||grad F|| at round-off). This is the
+///       defining axiom of the Fréchet mean and is intrinsic to gam's result.
+///     * Held-out generalization bar: the mean squared Aitchison distance of the
+///       HELD-OUT lavas to gam's TRAIN center beats the trivial barycenter (the
+///       equal-parts center 1/D, i.e. clr = 0) by a wide margin — gam's center
+///       genuinely captures the compositional location of unseen flows.
+///
+///   BASELINE (match-or-beat): scipy.stats.gmean and R compositions::mean fit the
+///     SAME TRAIN rows; gam's HELD-OUT mean squared Aitchison distance must be no
+///     worse than the best baseline + round-off tol. The mature tools are
+///     baselines on the held-out objective, never an output to replicate.
+#[test]
+fn frechet_mean_is_the_aitchison_barycenter_on_real_data() {
+    // ---- load the real Skye AFM lava compositions --------------------------
+    let ds = load_csvwith_inferred_schema(Path::new(SKYE_CSV)).expect("load skye_afm_lavas.csv");
+    let col = ds.column_map();
+    let a_idx = col["A"];
+    let f_idx = col["F"];
+    let m_idx = col["M"];
+    let a: Vec<f64> = ds.values.column(a_idx).to_vec();
+    let f: Vec<f64> = ds.values.column(f_idx).to_vec();
+    let m: Vec<f64> = ds.values.column(m_idx).to_vec();
+    let n = a.len();
+    assert!(n >= 20, "skye AFM should have ~23 flows, got {n}");
+    const D: usize = 3;
+
+    // ---- deterministic split: every 3rd flow held out ----------------------
+    let is_test = |i: usize| i % 3 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    assert!(
+        train_rows.len() >= 12 && test_rows.len() >= 6,
+        "split sizes: train={} test={}",
+        train_rows.len(),
+        test_rows.len()
+    );
+
+    // closure-normalized rows (parts -> simplex) for train and test, identical
+    // ordering shared with the baselines below.
+    let close_row = |i: usize| {
+        let s = a[i] + f[i] + m[i];
+        [a[i] / s, f[i] / s, m[i] / s]
+    };
+    let mut train_pts = Array2::<f64>::zeros((train_rows.len(), D));
+    for (r, &i) in train_rows.iter().enumerate() {
+        let c = close_row(i);
+        for k in 0..D {
+            train_pts[[r, k]] = c[k];
+        }
+    }
+    let mut test_pts = Array2::<f64>::zeros((test_rows.len(), D));
+    for (r, &i) in test_rows.iter().enumerate() {
+        let c = close_row(i);
+        for k in 0..D {
+            test_pts[[r, k]] = c[k];
+        }
+    }
+
+    // raw (un-closed) train parts as the columns shared with R / Python, so the
+    // baselines apply their OWN closure to exactly the same train rows.
+    let train_a: Vec<f64> = train_rows.iter().map(|&i| a[i]).collect();
+    let train_f: Vec<f64> = train_rows.iter().map(|&i| f[i]).collect();
+    let train_m: Vec<f64> = train_rows.iter().map(|&i| m[i]).collect();
+
+    // ---- gam: estimate the (unweighted) barycenter on TRAIN ----------------
+    let gam_center = simplex_frechet_mean(train_pts.view(), None).expect("gam train center");
+    assert_eq!(gam_center.len(), D);
+    let s: f64 = gam_center.iter().sum();
+    assert!(
+        (s - 1.0).abs() < 1e-12 && gam_center.iter().all(|&v| v > 0.0 && v.is_finite()),
+        "gam center must lie on the open simplex: {gam_center:?} (sum={s:.3e})"
+    );
+
+    // ---- PRIMARY 1: first-order optimality on TRAIN ------------------------
+    let train_w = vec![1.0_f64 / train_rows.len() as f64; train_rows.len()];
+    let grad = frechet_gradient_norm(&train_pts, &train_w, &gam_center);
+    assert!(
+        grad < 1e-10,
+        "gam train center is not stationary for the Aitchison Fréchet objective: ||grad F||={grad:.3e}"
+    );
+
+    // ---- baseline: scipy.stats.gmean on the SAME train rows ----------------
+    let py = run_python(
+        &[
+            Column::new("A", &train_a),
+            Column::new("F", &train_f),
+            Column::new("M", &train_m),
+        ],
+        r#"
+from scipy.stats import gmean
+X = np.column_stack([df["A"], df["F"], df["M"]])
+X = X / X.sum(axis=1, keepdims=True)
+g = gmean(X, axis=0)
+g = g / g.sum()
+emit("py_center", g)
+        "#,
+    );
+    let py_center = py.vector("py_center");
+    assert_eq!(py_center.len(), D, "scipy center length");
+
+    // ---- baseline: R compositions::mean(acomp()) on the SAME train rows ----
+    let r = run_r(
+        &[
+            Column::new("A", &train_a),
+            Column::new("F", &train_f),
+            Column::new("M", &train_m),
+        ],
+        r#"
+        suppressPackageStartupMessages(library(compositions))
+        X <- as.matrix(df[, c("A","F","M")])
+        ac <- acomp(X)
+        mu <- as.numeric(mean(ac))
+        mu <- mu / sum(mu)
+        emit("r_center", mu)
+        "#,
+    );
+    let r_center = r.vector("r_center");
+    assert_eq!(r_center.len(), D, "R center length");
+
+    // ---- OBJECTIVE: held-out mean squared Aitchison distance ---------------
+    let gam_heldout = mean_sq_aitchison(&test_pts, &gam_center);
+    let py_heldout = mean_sq_aitchison(&test_pts, py_center);
+    let r_heldout = mean_sq_aitchison(&test_pts, r_center);
+    // Trivial reference: the equal-parts center (clr = 0), i.e. predicting "no
+    // compositional signal". The skye lavas are strongly off-center, so a real
+    // barycenter must beat this by a wide margin.
+    let uniform_center = vec![1.0_f64 / D as f64; D];
+    let trivial_heldout = mean_sq_aitchison(&test_pts, &uniform_center);
+
+    // context only: how close the baselines land to gam's center.
+    let rel_py = relative_l2(&gam_center, py_center);
+    let rel_r = relative_l2(&gam_center, r_center);
+    eprintln!(
+        "skye AFM held-out mean sq Aitchison dist (lower=better): \
+         gam={gam_heldout:.6e} scipy={py_heldout:.6e} R={r_heldout:.6e} trivial={trivial_heldout:.6e}; \
+         center rel_l2 vs scipy={rel_py:.3e} vs R={rel_r:.3e} (n_train={} n_test={})",
+        train_rows.len(),
+        test_rows.len()
+    );
+
+    // ---- PRIMARY 2: absolute held-out generalization bar -------------------
+    // gam's TRAIN center must explain the held-out flows far better than the
+    // equal-parts (no-signal) center.
+    assert!(
+        gam_heldout < 0.5 * trivial_heldout,
+        "gam's held-out mean sq Aitchison distance {gam_heldout:.6e} fails to beat the trivial \
+         equal-parts center {trivial_heldout:.6e} by 2x"
+    );
+
+    // ---- BASELINE (match-or-beat) on the SAME held-out objective -----------
+    let best_baseline = py_heldout.min(r_heldout);
+    let tol = 1e-9 * best_baseline.max(1.0);
+    assert!(
+        gam_heldout <= best_baseline + tol,
+        "gam's held-out mean sq Aitchison distance {gam_heldout:.6e} must be no worse than the \
+         best mature baseline {best_baseline:.6e} (scipy={py_heldout:.6e}, R={r_heldout:.6e})"
     );
 }
 

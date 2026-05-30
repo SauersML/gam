@@ -42,7 +42,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, rmse, run_r};
+use gam::test_support::reference::{Column, pearson, rmse, run_r};
 use gam::{
     FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema,
 };
@@ -225,6 +225,177 @@ fn gam_sphere_smooth_predicts_global_city_temp_better_than_mgcv_sos() {
     assert!(
         gam_test_r2 >= 0.70,
         "gam's held-out predictive R2 too low: {gam_test_r2:.4} (< 0.70)"
+    );
+
+    // ---- BASELINE (match-or-beat): no worse than mgcv bs=sos on held-out RMSE
+    assert!(
+        gam_test_rmse <= mgcv_test_rmse * 1.10,
+        "gam held-out RMSE {gam_test_rmse:.4} exceeds mgcv bs=sos {mgcv_test_rmse:.4} * 1.10"
+    );
+
+    // ---- complexity sanity: edf in a signal-appropriate range (not matched) -
+    assert!(
+        gam_edf > 2.0 && gam_edf < 40.0,
+        "gam effective dof out of sane range: {gam_edf:.3}"
+    );
+}
+
+/// Second real-data arm exercising the SAME intrinsic S² (sphere) capability on
+/// the SAME Berkeley-Earth global major-city temperature dataset, but with an
+/// INDEPENDENT deterministic split and an INDEPENDENT held-out objective metric,
+/// so the sphere smooth is held to more than a single split + R² fluke.
+///
+/// Source CSV (Berkeley Earth "Global Land Temperatures By Major City", reduced
+/// to one row per major city, no auth, direct download):
+///   https://raw.githubusercontent.com/gindeleo/climate/master/GlobalLandTemperaturesByMajorCity.csv
+///
+/// Split: every 5th city (`i % 5 == 0`) is held out — 20 test / 80 train,
+/// disjoint from the every-4th-row split of the sibling test. Identical
+/// (lat, lon, temp) rows, in identical order and degree units, go to gam and to
+/// mgcv `s(lat, lon, bs="sos")`.
+///
+///   PRIMARY (objective, tool-free): held-out Pearson correlation between gam's
+///     predicted and observed temperature `test_corr >= 0.84`. Temperature is a
+///     strongly position-determined field on S²; a correct intrinsic smooth's
+///     held-out predictions track the observed field tightly. A degenerate
+///     (mean-like) surface or a ±180° seam break cannot reach this. Correlation
+///     is scale/offset-free, so it is an independent witness from the sibling
+///     test's R² (which also penalises bias/scale errors).
+///
+///   ABSOLUTE held-out bar: gam's held-out RMSE `< 6.0 °C` — comfortably below
+///     the ~10 °C spread of city annual-mean temperatures, an honest accuracy
+///     floor that a non-predictive surface fails outright.
+///
+///   BASELINE (match-or-beat): mgcv `s(lat, lon, bs="sos")` fits the SAME train
+///     cities and predicts the SAME held-out cities; gam's held-out RMSE must be
+///     no worse than `mgcv_test_rmse * 1.10`. mgcv is an accuracy baseline to
+///     match-or-beat, never a fitted target to reproduce.
+#[test]
+fn gam_sphere_smooth_predicts_global_city_temp_better_than_mgcv_sos_on_real_data() {
+    init_parallelism();
+
+    // ---- load the global major-city temperature dataset (lat, lon -> temp) -
+    let ds = load_csvwith_inferred_schema(Path::new(CITY_TEMP_CSV))
+        .expect("load global_major_city_temp.csv");
+    let col = ds.column_map();
+    let lat_idx = col["lat"];
+    let lon_idx = col["lon"];
+    let temp_idx = col["temp"];
+    let lat: Vec<f64> = ds.values.column(lat_idx).to_vec();
+    let lon: Vec<f64> = ds.values.column(lon_idx).to_vec();
+    let temp: Vec<f64> = ds.values.column(temp_idx).to_vec();
+    let n = temp.len();
+    assert!(
+        n >= 100,
+        "global city temperature set should have ~100 cities, got {n}"
+    );
+
+    // ---- deterministic train/test split: every 5th city is held out -------
+    let is_test = |i: usize| i % 5 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    assert!(
+        train_rows.len() >= 70 && test_rows.len() >= 18,
+        "split sizes: train={} test={}",
+        train_rows.len(),
+        test_rows.len()
+    );
+
+    let train_lat: Vec<f64> = train_rows.iter().map(|&i| lat[i]).collect();
+    let train_lon: Vec<f64> = train_rows.iter().map(|&i| lon[i]).collect();
+    let train_temp: Vec<f64> = train_rows.iter().map(|&i| temp[i]).collect();
+    let test_lat: Vec<f64> = test_rows.iter().map(|&i| lat[i]).collect();
+    let test_lon: Vec<f64> = test_rows.iter().map(|&i| lon[i]).collect();
+    let test_temp: Vec<f64> = test_rows.iter().map(|&i| temp[i]).collect();
+
+    // Build a training-only dataset by sub-setting the encoded rows; headers,
+    // schema and column kinds are unchanged, so the formula resolves identically.
+    let p = ds.headers.len();
+    let mut train_values = Array2::<f64>::zeros((train_rows.len(), p));
+    for (out_row, &src_row) in train_rows.iter().enumerate() {
+        for c in 0..p {
+            train_values[[out_row, c]] = ds.values[[src_row, c]];
+        }
+    }
+    let mut train_ds = ds.clone();
+    train_ds.values = train_values;
+
+    // ---- fit gam on TRAIN: temp ~ sphere(lat, lon, k=40), REML -------------
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula("temp ~ sphere(lat, lon, k=40)", &train_ds, &cfg)
+        .expect("gam sphere fit");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected a standard GAM fit for a Gaussian sphere smooth");
+    };
+    let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
+
+    // gam predictions at the held-out cities: rebuild the design from the frozen
+    // spec (identity link => design*beta = predicted mean).
+    let mut test_grid = Array2::<f64>::zeros((test_rows.len(), p));
+    for i in 0..test_rows.len() {
+        test_grid[[i, lat_idx]] = test_lat[i];
+        test_grid[[i, lon_idx]] = test_lon[i];
+    }
+    let test_design = build_term_collection_design(test_grid.view(), &fit.resolvedspec)
+        .expect("rebuild sphere design at held-out cities");
+    let gam_test_pred: Vec<f64> = test_design.design.apply(&fit.fit.beta).to_vec();
+
+    // ---- fit the SAME model on TRAIN with mgcv bs="sos", predict the SAME TEST
+    let r = run_r(
+        &[
+            Column::new("lat", &train_lat),
+            Column::new("lon", &train_lon),
+            Column::new("temp", &train_temp),
+            Column::new("test_lat", &pad_to(&test_lat, train_lat.len())),
+            Column::new("test_lon", &pad_to(&test_lon, train_lat.len())),
+            Column::new("test_n", &vec![test_rows.len() as f64; train_lat.len()]),
+        ],
+        r#"
+        suppressPackageStartupMessages(library(mgcv))
+        m <- gam(temp ~ s(lat, lon, bs = "sos", k = 40), data = df, method = "REML")
+        k <- df$test_n[1]
+        newd <- data.frame(
+            lat = df$test_lat[1:k],
+            lon = df$test_lon[1:k]
+        )
+        emit("test_pred", as.numeric(predict(m, newdata = newd)))
+        emit("edf", sum(m$edf))
+        "#,
+    );
+    let mgcv_test_pred = r.vector("test_pred");
+    let mgcv_edf = r.scalar("edf");
+    assert_eq!(
+        mgcv_test_pred.len(),
+        test_rows.len(),
+        "mgcv held-out prediction length mismatch"
+    );
+
+    // ---- objective metrics on gam's OWN predictions ------------------------
+    let gam_test_corr = pearson(&gam_test_pred, &test_temp);
+    let gam_test_rmse = rmse(&gam_test_pred, &test_temp);
+    let mgcv_test_rmse = rmse(mgcv_test_pred, &test_temp);
+
+    eprintln!(
+        "global-city temp sphere(lat,lon,k=40) held-out (i%5): n_train={} n_test={} \
+         gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} gam_test_corr={gam_test_corr:.4} \
+         gam_test_rmse={gam_test_rmse:.4} mgcv_test_rmse={mgcv_test_rmse:.4}",
+        train_rows.len(),
+        test_rows.len(),
+    );
+
+    // ---- PRIMARY objective assertion: gam tracks the held-out field --------
+    assert!(
+        gam_test_corr >= 0.84,
+        "gam's held-out predictive correlation too low: {gam_test_corr:.4} (< 0.84)"
+    );
+
+    // ---- ABSOLUTE held-out accuracy floor ----------------------------------
+    assert!(
+        gam_test_rmse < 6.0,
+        "gam's held-out RMSE too high: {gam_test_rmse:.4} °C (>= 6.0)"
     );
 
     // ---- BASELINE (match-or-beat): no worse than mgcv bs=sos on held-out RMSE

@@ -42,6 +42,9 @@ use gam::families::multinomial::{MultinomialFitInputs, fit_penalized_multinomial
 use gam::init_parallelism;
 use gam::test_support::reference::{Column, relative_l2, run_python};
 use ndarray::{Array1, Array2};
+use std::path::Path;
+
+const PENGUINS_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/penguins.csv");
 
 const N: usize = 300;
 const N_TRAIN: usize = 200; // first 200 rows train, last 100 rows held out.
@@ -333,5 +336,324 @@ emit("probs", probs_gam.reshape(-1))        # row-major flat
         gam_log_loss <= sm_log_loss + 0.005,
         "gam held-out log-loss {gam_log_loss:.5} is worse than statsmodels \
          MNLogit {sm_log_loss:.5} by more than the 0.005-nat margin"
+    );
+}
+
+// ===========================================================================
+// REAL-DATA ARM — same multinomial-logit (softmax) capability on the Palmer
+// Penguins dataset (3 species classes from 3 morphology covariates).
+//
+// Dataset SOURCE: Palmer Penguins (Gorman, Williams & Fraser 2014, PLoS ONE
+// 9(3):e90081, doi:10.1371/journal.pone.0090081), distributed as the R
+// `palmerpenguins` package and vendored here at bench/datasets/penguins.csv
+// (columns: rownames, species, island, bill_length_mm, bill_depth_mm,
+// flipper_length_mm, body_mass_g, sex, year).
+//
+// On REAL data the ground-truth class-membership function is unknown, so the
+// objective bar is OUT-OF-SAMPLE predictive quality of the probabilistic
+// classifier:
+//   PRIMARY (absolute, tool-free): held-out top-1 classification ACCURACY
+//     >= 0.90. Penguin species are very well separated by bill + flipper
+//     morphology, so a correctly-fit softmax classifies almost all held-out
+//     birds; a broken fit (wrong likelihood, divergent Newton, mis-coded
+//     classes) would fall far below this.
+//   MATCH-OR-BEAT (baseline): statsmodels MNLogit is fit on the IDENTICAL
+//     train rows and scored on the IDENTICAL test rows; gam's held-out mean
+//     multiclass log-loss must be no worse than statsmodels' + a small margin.
+//     statsmodels is a quality baseline on an objective metric, never a fitted
+//     target to reproduce.
+// ===========================================================================
+
+const PENGUIN_K: usize = 3; // Adelie, Chinstrap, Gentoo
+const PENGUIN_P: usize = 4; // intercept + 3 standardized covariates
+
+/// Top-1 accuracy of a row-major `(m, K)` probability matrix against the true
+/// held-out class labels: fraction of rows whose argmax-probability class is
+/// the observed class.
+fn top1_accuracy(probs_flat: &[f64], labels: &[usize], k: usize) -> f64 {
+    let m = labels.len();
+    assert_eq!(probs_flat.len(), m * k, "accuracy probs length mismatch");
+    let mut correct = 0usize;
+    for (i, &y) in labels.iter().enumerate() {
+        let row = &probs_flat[i * k..(i + 1) * k];
+        let mut best = 0usize;
+        for c in 1..k {
+            if row[c] > row[best] {
+                best = c;
+            }
+        }
+        if best == y {
+            correct += 1;
+        }
+    }
+    correct as f64 / m as f64
+}
+
+/// Softmax probabilities for one standardized covariate row under a `(P, K-1)`
+/// active-class coefficient matrix (reference class `K-1` has `η ≡ 0`), used to
+/// score gam's fitted coefficients on held-out rows.
+fn softmax_row_p(coef: &Array2<f64>, xrow: &[f64; PENGUIN_P]) -> [f64; PENGUIN_K] {
+    let mut eta = [0.0_f64; PENGUIN_K];
+    for a in 0..PENGUIN_K - 1 {
+        let mut e = 0.0;
+        for p in 0..PENGUIN_P {
+            e += coef[[p, a]] * xrow[p];
+        }
+        eta[a] = e;
+    }
+    let max_eta = eta.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let mut probs = [0.0_f64; PENGUIN_K];
+    let mut denom = 0.0_f64;
+    for c in 0..PENGUIN_K {
+        probs[c] = (eta[c] - max_eta).exp();
+        denom += probs[c];
+    }
+    for c in 0..PENGUIN_K {
+        probs[c] /= denom;
+    }
+    probs
+}
+
+#[test]
+fn multinomial_logit_recovers_true_softmax_and_beats_statsmodels_on_real_data() {
+    init_parallelism();
+
+    // ---- load + clean the Palmer Penguins CSV ----------------------------
+    // We parse the raw CSV directly (rather than the encoded dataset) so the
+    // string `species` label and the float covariates are under explicit
+    // control and rows with any missing measurement are dropped — the same
+    // complete-case handling statsmodels uses below.
+    let raw = std::fs::read_to_string(Path::new(PENGUINS_CSV)).expect("read penguins.csv");
+    let mut lines = raw.lines();
+    let header = lines.next().expect("penguins header line");
+    let cols: Vec<&str> = header.split(',').collect();
+    let idx = |name: &str| {
+        cols.iter()
+            .position(|c| *c == name)
+            .unwrap_or_else(|| panic!("penguins.csv missing column {name:?}"))
+    };
+    let i_species = idx("species");
+    let i_bill = idx("bill_length_mm");
+    let i_flipper = idx("flipper_length_mm");
+    let i_mass = idx("body_mass_g");
+
+    // gam class coding: 0=Adelie, 1=Chinstrap, 2=Gentoo (class K-1=Gentoo is
+    // the softmax reference). statsmodels codes its category 0 as baseline; we
+    // relabel below so the two tools share a gauge for scoring statsmodels.
+    let species_label = |s: &str| -> usize {
+        match s {
+            "Adelie" => 0,
+            "Chinstrap" => 1,
+            "Gentoo" => 2,
+            other => panic!("unexpected penguin species {other:?}"),
+        }
+    };
+
+    let mut bill: Vec<f64> = Vec::new();
+    let mut flipper: Vec<f64> = Vec::new();
+    let mut mass: Vec<f64> = Vec::new();
+    let mut label: Vec<usize> = Vec::new();
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = line.split(',').collect();
+        let (b, fl, ms) = (
+            f[i_bill].trim().parse::<f64>(),
+            f[i_flipper].trim().parse::<f64>(),
+            f[i_mass].trim().parse::<f64>(),
+        );
+        // Complete-case: skip any row with a missing/non-numeric measurement.
+        let (Ok(b), Ok(fl), Ok(ms)) = (b, fl, ms) else {
+            continue;
+        };
+        bill.push(b);
+        flipper.push(fl);
+        mass.push(ms);
+        label.push(species_label(f[i_species].trim()));
+    }
+    let n = label.len();
+    assert!(
+        n > 300,
+        "expected ~333 complete penguin rows, got {n}"
+    );
+
+    // ---- standardize the covariates (zero mean, unit sd) ------------------
+    // Standardizing keeps the multinomial Newton solve well-conditioned and
+    // matches what we hand to statsmodels, so neither tool is advantaged.
+    let standardize = |v: &[f64]| -> Vec<f64> {
+        let nn = v.len() as f64;
+        let mean = v.iter().sum::<f64>() / nn;
+        let var = v.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / nn;
+        let sd = var.sqrt().max(1e-12);
+        v.iter().map(|x| (x - mean) / sd).collect()
+    };
+    let bill_s = standardize(&bill);
+    let flipper_s = standardize(&flipper);
+    let mass_s = standardize(&mass);
+
+    // ---- deterministic train / test split: every 4th row held out --------
+    let is_test = |i: usize| i % 4 == 0;
+    let train_idx: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_idx: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    let n_train = train_idx.len();
+    let n_test = test_idx.len();
+    assert!(
+        n_train > 200 && n_test > 60,
+        "penguin split sizes: train={n_train} test={n_test}"
+    );
+
+    // ---- gam: fit the softmax GLM on the TRAIN rows -----------------------
+    let mut design = Array2::<f64>::zeros((n_train, PENGUIN_P));
+    let mut y_one_hot = Array2::<f64>::zeros((n_train, PENGUIN_K));
+    for (r, &i) in train_idx.iter().enumerate() {
+        design[[r, 0]] = 1.0;
+        design[[r, 1]] = bill_s[i];
+        design[[r, 2]] = flipper_s[i];
+        design[[r, 3]] = mass_s[i];
+        y_one_hot[[r, label[i]]] = 1.0;
+    }
+    // Zero penalty ⇒ unpenalized multinomial MLE on the linear design.
+    let penalty = Array2::<f64>::zeros((PENGUIN_P, PENGUIN_P));
+    let lambdas = Array1::<f64>::zeros(PENGUIN_K - 1);
+
+    let out = fit_penalized_multinomial(MultinomialFitInputs {
+        design: design.view(),
+        y_one_hot: y_one_hot.view(),
+        penalty: penalty.view(),
+        lambdas: lambdas.view(),
+        row_weights: None,
+        fisher_w_override: None,
+        max_iter: 100,
+        tol: 1e-10,
+    })
+    .expect("gam multinomial fit on penguins");
+    assert!(
+        out.converged,
+        "gam multinomial Newton solve did not converge on penguins in 100 iters"
+    );
+    let gam_coef = out.coefficients_active.clone();
+
+    // ---- predict held-out class probabilities with gam --------------------
+    let mut gam_probs_flat = Vec::with_capacity(n_test * PENGUIN_K);
+    let mut test_labels = Vec::with_capacity(n_test);
+    for &i in &test_idx {
+        let xrow = [1.0, bill_s[i], flipper_s[i], mass_s[i]];
+        let gp = softmax_row_p(&gam_coef, &xrow);
+        for c in 0..PENGUIN_K {
+            gam_probs_flat.push(gp[c]);
+        }
+        test_labels.push(label[i]);
+    }
+
+    let gam_acc = top1_accuracy(&gam_probs_flat, &test_labels, PENGUIN_K);
+    let gam_log_loss = mean_log_loss(&gam_probs_flat, &test_labels, PENGUIN_K);
+
+    // ---- statsmodels MNLogit on the IDENTICAL train split -----------------
+    // Stack train rows first, then test rows (byte-identical order to gam); the
+    // Python body slices by `ntrain`. statsmodels codes category 0 as baseline
+    // and gam fixes class K-1=Gentoo; we relabel (Gentoo->0) so they share a
+    // gauge, then reorder statsmodels' predicted columns back to gam order.
+    let mut stack_bill = Vec::with_capacity(n);
+    let mut stack_flipper = Vec::with_capacity(n);
+    let mut stack_mass = Vec::with_capacity(n);
+    let mut stack_y = Vec::with_capacity(n);
+    for &i in train_idx.iter().chain(test_idx.iter()) {
+        stack_bill.push(bill_s[i]);
+        stack_flipper.push(flipper_s[i]);
+        stack_mass.push(mass_s[i]);
+        // Relabel so gam's reference class K-1=2 becomes statsmodels baseline 0:
+        // 2->0, 0->1, 1->2  ==  (label + 1) % K.
+        stack_y.push(((label[i] + 1) % PENGUIN_K) as f64);
+    }
+    let ntrain_f = vec![n_train as f64; n];
+
+    let r = run_python(
+        &[
+            Column::new("bill", &stack_bill),
+            Column::new("flipper", &stack_flipper),
+            Column::new("mass", &stack_mass),
+            Column::new("y", &stack_y),
+            Column::new("ntrain", &ntrain_f),
+        ],
+        r#"
+import numpy as np
+import statsmodels.api as sm
+
+ntr = int(df["ntrain"][0])
+X = np.column_stack([df["bill"], df["flipper"], df["mass"]])
+Xc = sm.add_constant(X, prepend=True)  # column 0 = intercept
+y = np.asarray(df["y"], dtype=int)
+
+Xtr, Xte = Xc[:ntr], Xc[ntr:]
+ytr = y[:ntr]
+
+model = sm.MNLogit(ytr, Xtr)
+res = model.fit(method="newton", maxiter=200, gtol=1e-10, disp=0)
+
+# Predicted held-out probabilities: (n_test, K) in statsmodels category order
+# 0,1,2 = gam classes 2,0,1. Reorder columns back to gam order 0,1,2.
+probs_sm = np.asarray(res.predict(Xte))   # (n_test, K), sm-category order
+gam_order = [1, 2, 0]                       # sm col for gam class j
+probs_gam = probs_sm[:, gam_order]          # (n_test, K) in gam order
+emit("probs", probs_gam.reshape(-1))        # row-major flat
+"#,
+    );
+
+    let sm_probs = r.vector("probs");
+    assert_eq!(
+        sm_probs.len(),
+        n_test * PENGUIN_K,
+        "statsmodels penguin held-out probs length mismatch"
+    );
+    let sm_log_loss = mean_log_loss(sm_probs, &test_labels, PENGUIN_K);
+    let sm_acc = top1_accuracy(sm_probs, &test_labels, PENGUIN_K);
+
+    // Context only (NOT a pass criterion): closeness of gam's held-out
+    // probability matrix to statsmodels'.
+    let prob_rel_vs_sm = relative_l2(&gam_probs_flat, sm_probs);
+
+    eprintln!(
+        "penguins multinomial held-out: n_train={n_train} n_test={n_test} K={PENGUIN_K} \
+         gam_iters={} gam_acc={gam_acc:.4} sm_acc={sm_acc:.4} \
+         gam_logloss={gam_log_loss:.5} sm_logloss={sm_log_loss:.5} \
+         prob_rel_l2_vs_sm={prob_rel_vs_sm:.5}",
+        out.iterations
+    );
+
+    // ---- structural calibration: gam predicts a valid simplex -------------
+    for i in 0..n_test {
+        let mut row_sum = 0.0;
+        for c in 0..PENGUIN_K {
+            let p = gam_probs_flat[i * PENGUIN_K + c];
+            assert!(
+                (0.0..=1.0).contains(&p),
+                "gam penguin held-out prob out of [0,1]: row {i} class {c} = {p}"
+            );
+            row_sum += p;
+        }
+        assert!(
+            (row_sum - 1.0).abs() < 1e-9,
+            "gam penguin held-out probabilities for row {i} sum to {row_sum}, not 1"
+        );
+    }
+
+    // ---- PRIMARY objective assertion: held-out top-1 accuracy -------------
+    // Penguin species separate cleanly in bill+flipper+mass space; a correctly
+    // fit softmax classifies almost every held-out bird. 0.90 is far above the
+    // majority-class baseline (~0.44 Adelie) and would catch a broken fit.
+    assert!(
+        gam_acc >= 0.90,
+        "gam held-out penguin accuracy too low: {gam_acc:.4} (< 0.90)"
+    );
+
+    // ---- MATCH-OR-BEAT statsmodels on held-out log-loss -------------------
+    // gam must be at least as predictive as the mature reference, within a tiny
+    // float/optimizer margin. statsmodels is a baseline on an objective metric,
+    // never a correctness oracle.
+    assert!(
+        gam_log_loss <= sm_log_loss + 0.01,
+        "gam held-out penguin log-loss {gam_log_loss:.5} is worse than statsmodels \
+         MNLogit {sm_log_loss:.5} by more than the 0.01-nat margin"
     );
 }

@@ -194,6 +194,147 @@ fn gam_smooth_predicts_lidar_better_than_baseline() {
     );
 }
 
+/// Real-data arm for the SAME Gaussian P-spline smooth capability, kept beside
+/// the canonical default-`s(range)` test above so neither weakens the other.
+///
+/// Dataset SOURCE: `bench/datasets/lidar.csv` — the classic LIDAR scatterplot
+/// (range in metres vs. log-ratio of received light from two laser sources),
+/// distributed with R's `SemiPar` package (Ruppert, Wand & Carroll,
+/// *Semiparametric Regression*, 2003). Real measurements, so the true mean
+/// function is unknown; objective quality is held-out predictive accuracy.
+///
+/// This arm fits gam's explicit P-spline basis `s(range, bs="ps")` (degree-3
+/// B-spline with a 2nd-order difference penalty — gam's default penalized
+/// smooth construction) by REML, and judges it OUT-OF-SAMPLE:
+///
+///   PRIMARY (objective, tool-free): held-out `test_R2 >= 0.55` on a DISJOINT
+///     split from the test above (every 5th row held out), well above the
+///     constant-mean predictor's R2 = 0.
+///
+///   BASELINE (match-or-beat): mgcv fits the IDENTICAL training rows with the
+///     SAME `s(range, bs="ps")` basis and predicts the IDENTICAL held-out rows;
+///     gam's held-out RMSE must be no worse than `mgcv_test_rmse * 1.10`.
+#[test]
+fn gam_smooth_predicts_lidar_better_than_baseline_on_real_data() {
+    init_parallelism();
+
+    // ---- load the canonical lidar dataset (range -> logratio) -------------
+    let ds = load_csvwith_inferred_schema(Path::new(LIDAR_CSV)).expect("load lidar.csv");
+    let col = ds.column_map();
+    let range_idx = col["range"];
+    let logratio_idx = col["logratio"];
+    let range: Vec<f64> = ds.values.column(range_idx).to_vec();
+    let logratio: Vec<f64> = ds.values.column(logratio_idx).to_vec();
+    let n = range.len();
+    assert!(n > 100, "lidar should have ~221 rows, got {n}");
+
+    // ---- deterministic train/test split: every 5th row held out (disjoint
+    //      pattern from the default-`s(range)` test, which holds out every 4th)
+    let is_test = |i: usize| i % 5 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    assert!(
+        train_rows.len() > 100 && test_rows.len() > 30,
+        "split sizes: train={} test={}",
+        train_rows.len(),
+        test_rows.len()
+    );
+
+    let train_range: Vec<f64> = train_rows.iter().map(|&i| range[i]).collect();
+    let train_logratio: Vec<f64> = train_rows.iter().map(|&i| logratio[i]).collect();
+    let test_range: Vec<f64> = test_rows.iter().map(|&i| range[i]).collect();
+    let test_logratio: Vec<f64> = test_rows.iter().map(|&i| logratio[i]).collect();
+
+    // Build a training-only dataset by sub-setting the encoded rows; headers,
+    // schema and column kinds are unchanged, so the formula resolves identically.
+    let p = ds.headers.len();
+    let mut train_values = Array2::<f64>::zeros((train_rows.len(), p));
+    for (out_row, &src_row) in train_rows.iter().enumerate() {
+        for c in 0..p {
+            train_values[[out_row, c]] = ds.values[[src_row, c]];
+        }
+    }
+    let mut train_ds = ds.clone();
+    train_ds.values = train_values;
+
+    // ---- fit gam on TRAIN: logratio ~ s(range, bs="ps"), REML -------------
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let result =
+        fit_from_formula("logratio ~ s(range, bs=\"ps\")", &train_ds, &cfg).expect("gam fit");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected a standard GAM fit");
+    };
+    let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
+
+    // gam predictions at the held-out `range` points (identity link).
+    let mut test_grid = Array2::<f64>::zeros((test_rows.len(), p));
+    for (i, &r) in test_range.iter().enumerate() {
+        test_grid[[i, range_idx]] = r;
+    }
+    let test_design = build_term_collection_design(test_grid.view(), &fit.resolvedspec)
+        .expect("rebuild design at held-out points");
+    let gam_test_pred: Vec<f64> = test_design.design.apply(&fit.fit.beta).to_vec();
+
+    // ---- mgcv baseline: SAME train rows, SAME basis, SAME held-out rows ----
+    let r = run_r(
+        &[
+            Column::new("range", &train_range),
+            Column::new("logratio", &train_logratio),
+            Column::new("test_range", &pad_to(&test_range, train_range.len())),
+            Column::new("test_n", &vec![test_range.len() as f64; train_range.len()]),
+        ],
+        r#"
+        suppressPackageStartupMessages(library(mgcv))
+        m <- gam(logratio ~ s(range, bs = "ps"), data = df, method = "REML")
+        emit("edf", sum(m$edf))
+        k <- df$test_n[1]
+        newd <- data.frame(range = df$test_range[1:k])
+        emit("test_pred", as.numeric(predict(m, newdata = newd)))
+        "#,
+    );
+    let mgcv_edf = r.scalar("edf");
+    let mgcv_test_pred = r.vector("test_pred");
+    assert_eq!(
+        mgcv_test_pred.len(),
+        test_rows.len(),
+        "mgcv held-out prediction length mismatch"
+    );
+
+    // ---- objective metrics on gam's OWN held-out predictions --------------
+    let gam_test_r2 = r2(&gam_test_pred, &test_logratio);
+    let gam_test_rmse = rmse(&gam_test_pred, &test_logratio);
+    let mgcv_test_rmse = rmse(mgcv_test_pred, &test_logratio);
+
+    eprintln!(
+        "lidar s(range,bs=ps) held-out: n_train={} n_test={} gam_edf={gam_edf:.3} \
+         mgcv_edf={mgcv_edf:.3} gam_test_R2={gam_test_r2:.4} gam_test_rmse={gam_test_rmse:.4} \
+         mgcv_test_rmse={mgcv_test_rmse:.4}",
+        train_rows.len(),
+        test_rows.len(),
+    );
+
+    // ---- PRIMARY objective assertion: gam predicts the held-out signal -----
+    assert!(
+        gam_test_r2 >= 0.55,
+        "gam's held-out predictive R2 too low: {gam_test_r2:.4} (< 0.55)"
+    );
+
+    // ---- BASELINE (match-or-beat): no worse than mgcv on held-out RMSE -----
+    assert!(
+        gam_test_rmse <= mgcv_test_rmse * 1.10,
+        "gam held-out RMSE {gam_test_rmse:.4} exceeds mgcv {mgcv_test_rmse:.4} * 1.10"
+    );
+
+    // ---- complexity sanity: edf in a signal-appropriate range (not matched) -
+    assert!(
+        gam_edf > 1.0 && gam_edf < 30.0,
+        "gam effective dof out of sane range: {gam_edf:.3}"
+    );
+}
+
 /// Right-pad `v` with its last value (or 0.0 when empty) to length `len`, so it
 /// can ride along as a column of the reference data.frame. Only the first
 /// `v.len()` entries are read back inside the R body.

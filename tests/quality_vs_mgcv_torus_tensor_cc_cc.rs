@@ -44,12 +44,35 @@ use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+    load_csvwith_inferred_schema,
 };
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal};
 use std::f64::consts::TAU;
+use std::path::Path;
+
+/// Bike-sharing torus dataset. SOURCE: UCI Bike Sharing Dataset (Fanaee-T &
+/// Gama, 2013), aggregated to a (season-day-of-year, hour-of-day) torus grid:
+/// `season` = day-of-year center in [0, 365), `hour` in [0, 24), `log_count` =
+/// log1p(mean hourly rental count) over the cell, `n_obs` = cell sample count.
+/// Both axes are intrinsically cyclic (day-of-year wraps at 365, hour-of-day
+/// wraps at 24), making this the real-data analog of the doubly-periodic torus.
+const BIKE_TORUS_CSV: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/bike_sharing_torus.csv");
+
+/// Coefficient of determination of `pred` vs observed `truth` relative to the
+/// constant-mean predictor: `1 - SS_res / SS_tot`. R2 = 1 perfect, 0 = mean,
+/// < 0 worse than the mean. Computed in plain Rust (no tool involved).
+fn r2(pred: &[f64], truth: &[f64]) -> f64 {
+    assert_eq!(pred.len(), truth.len(), "r2 length mismatch");
+    let n = truth.len() as f64;
+    let mean = truth.iter().sum::<f64>() / n;
+    let ss_res: f64 = pred.iter().zip(truth).map(|(p, t)| (t - p) * (t - p)).sum();
+    let ss_tot: f64 = truth.iter().map(|t| (t - mean) * (t - mean)).sum();
+    1.0 - ss_res / ss_tot.max(1e-300)
+}
 
 /// The exact analytic surface the data is sampled from. Truth recovery is
 /// measured against this, not against any fitted tool output.
@@ -274,4 +297,183 @@ fn gam_torus_tensor_cc_cc_recovers_truth_and_wraps_at_both_seams() {
         phi_seam_gap < 1e-6,
         "φ-seam not closed: max |f(θ,0) - f(θ,2π)| = {phi_seam_gap:.3e}"
     );
+}
+
+/// Real-data arm of the same doubly-periodic (cc×cc) torus-tensor capability.
+///
+/// Real data => the ground-truth surface is unknown, so quality is judged by
+/// OUT-OF-SAMPLE prediction, never by reproducing a peer tool's fit. The bike
+/// -sharing demand surface is a genuine torus: rental volume varies smoothly
+/// and PERIODICALLY across both the day-of-year (`season`, wraps at 365) and
+/// the hour-of-day (`hour`, wraps at 24). We fit gam's
+/// `te(season, hour, boundary=['periodic','periodic'], period=[365, 24])` on a
+/// deterministic train split and assert OBJECTIVE held-out metrics on gam's own
+/// predictions:
+///
+///   PRIMARY (objective, tool-free): held-out coefficient of determination
+///     `test_R2 >= 0.80` — the doubly-periodic surface explains the vast
+///     majority of held-out variance, far above the constant-mean baseline (0).
+///
+///   BASELINE (match-or-beat): mgcv `te(bs=c("cc","cc"))` — the mature standard
+///     torus smoother — fits the SAME training rows and predicts the SAME
+///     held-out rows; gam's held-out RMSE must be no worse than
+///     `mgcv_test_rmse * 1.10`. mgcv is an accuracy baseline, never a target.
+#[test]
+fn gam_torus_tensor_cc_cc_recovers_truth_and_wraps_at_both_seams_on_real_data() {
+    init_parallelism();
+
+    // ---- load the bike-sharing torus dataset (season, hour -> log_count) ----
+    let ds = load_csvwith_inferred_schema(Path::new(BIKE_TORUS_CSV))
+        .expect("load bike_sharing_torus.csv");
+    let col = ds.column_map();
+    let season_idx = col["season"];
+    let hour_idx = col["hour"];
+    let logcount_idx = col["log_count"];
+    let season: Vec<f64> = ds.values.column(season_idx).to_vec();
+    let hour: Vec<f64> = ds.values.column(hour_idx).to_vec();
+    let log_count: Vec<f64> = ds.values.column(logcount_idx).to_vec();
+    let n = season.len();
+    assert!(n > 1000, "bike torus should have ~1752 rows, got {n}");
+
+    // ---- deterministic train/test split: every 5th row held out -----------
+    let is_test = |i: usize| i % 5 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    assert!(
+        train_rows.len() > 1000 && test_rows.len() > 300,
+        "split sizes: train={} test={}",
+        train_rows.len(),
+        test_rows.len()
+    );
+
+    let train_season: Vec<f64> = train_rows.iter().map(|&i| season[i]).collect();
+    let train_hour: Vec<f64> = train_rows.iter().map(|&i| hour[i]).collect();
+    let train_logcount: Vec<f64> = train_rows.iter().map(|&i| log_count[i]).collect();
+    let test_season: Vec<f64> = test_rows.iter().map(|&i| season[i]).collect();
+    let test_hour: Vec<f64> = test_rows.iter().map(|&i| hour[i]).collect();
+    let test_logcount: Vec<f64> = test_rows.iter().map(|&i| log_count[i]).collect();
+
+    // Build a training-only dataset by sub-setting the encoded rows; headers,
+    // schema and column kinds are unchanged so the formula resolves identically.
+    let p = ds.headers.len();
+    let mut train_values = Array2::<f64>::zeros((train_rows.len(), p));
+    for (out_row, &src_row) in train_rows.iter().enumerate() {
+        for c in 0..p {
+            train_values[[out_row, c]] = ds.values[[src_row, c]];
+        }
+    }
+    let mut train_ds = ds.clone();
+    train_ds.values = train_values;
+
+    // ---- fit gam on TRAIN: doubly-periodic tensor, REML --------------------
+    // boundary=['periodic','periodic'] + period=[365, 24] is gam's analog of
+    // mgcv's te(bs=c('cc','cc')): cyclic margins on the day-of-year and
+    // hour-of-day circles, tensor-producted on the torus.
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let formula =
+        "log_count ~ te(season, hour, boundary=['periodic','periodic'], period=[365, 24], k=8)";
+    let result = fit_from_formula(formula, &train_ds, &cfg).expect("gam torus tensor fit");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected a standard GAM fit for the bike-torus tensor smooth");
+    };
+    let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
+
+    // gam predictions at the held-out (season, hour) points: rebuild the design
+    // from the frozen spec (identity link => design·beta = predicted mean).
+    let mut test_grid = Array2::<f64>::zeros((test_rows.len(), p));
+    for i in 0..test_rows.len() {
+        test_grid[[i, season_idx]] = test_season[i];
+        test_grid[[i, hour_idx]] = test_hour[i];
+    }
+    let test_design = build_term_collection_design(test_grid.view(), &fit.resolvedspec)
+        .expect("rebuild design at held-out points");
+    let gam_test_pred: Vec<f64> = test_design.design.apply(&fit.fit.beta).to_vec();
+
+    // ---- fit the SAME model on TRAIN with mgcv, predict the SAME TEST -------
+    // One data.frame per call: train season/hour/log_count plus the test
+    // season/hour padded to train length and read back only over the first k
+    // rows. mgcv gets explicit cyclic knot ranges [0, period] per margin so its
+    // cyclic closure matches the data support.
+    let r = run_r(
+        &[
+            Column::new("season", &train_season),
+            Column::new("hour", &train_hour),
+            Column::new("log_count", &train_logcount),
+            Column::new("test_season", &pad_to(&test_season, train_season.len())),
+            Column::new("test_hour", &pad_to(&test_hour, train_hour.len())),
+            Column::new("test_n", &vec![test_rows.len() as f64; train_season.len()]),
+        ],
+        r#"
+        suppressPackageStartupMessages(library(mgcv))
+        m <- gam(log_count ~ te(season, hour, bs = c("cc", "cc"), k = c(8, 8)),
+                 data = df, method = "REML",
+                 knots = list(season = c(0, 365), hour = c(0, 24)))
+        k <- df$test_n[1]
+        newd <- data.frame(season = df$test_season[1:k], hour = df$test_hour[1:k])
+        emit("test_pred", as.numeric(predict(m, newdata = newd)))
+        emit("edf", sum(m$edf))
+        "#,
+    );
+    let mgcv_test_pred = r.vector("test_pred");
+    let mgcv_edf = r.scalar("edf");
+    assert_eq!(
+        mgcv_test_pred.len(),
+        test_rows.len(),
+        "mgcv held-out prediction length mismatch"
+    );
+
+    // ---- objective metrics on gam's OWN held-out predictions ---------------
+    let gam_test_r2 = r2(&gam_test_pred, &test_logcount);
+    let gam_test_rmse = rmse(&gam_test_pred, &test_logcount);
+    let mgcv_test_rmse = rmse(mgcv_test_pred, &test_logcount);
+    // Context-only: closeness of the two held-out prediction vectors (NOT a gate).
+    let rel_gam_vs_mgcv = relative_l2(&gam_test_pred, mgcv_test_pred);
+
+    eprintln!(
+        "bike torus te(cc,cc) held-out: n_train={} n_test={} gam_edf={gam_edf:.3} \
+         mgcv_edf={mgcv_edf:.3} gam_test_R2={gam_test_r2:.4} gam_test_rmse={gam_test_rmse:.4} \
+         mgcv_test_rmse={mgcv_test_rmse:.4} (context: rel_l2 vs mgcv={rel_gam_vs_mgcv:.4})",
+        train_rows.len(),
+        test_rows.len(),
+    );
+
+    // ---- PRIMARY objective assertion: gam predicts the held-out signal -----
+    // The bike demand surface has a strong, smooth, doubly-periodic structure
+    // (daily commute peaks × seasonal trend); a competent torus smoother
+    // explains the large majority of held-out variance. R2 >= 0.80 is well
+    // above the constant-mean baseline (0) and catches under/over-smoothing.
+    assert!(
+        gam_test_r2 >= 0.80,
+        "gam's held-out predictive R2 too low: {gam_test_r2:.4} (< 0.80)"
+    );
+
+    // ---- BASELINE (match-or-beat): no worse than mgcv on held-out RMSE -----
+    assert!(
+        gam_test_rmse <= mgcv_test_rmse * 1.10,
+        "gam held-out RMSE {gam_test_rmse:.4} exceeds mgcv {mgcv_test_rmse:.4} * 1.10"
+    );
+
+    // ---- complexity sanity: genuinely wiggly yet below the k=8×8 cap -------
+    assert!(
+        gam_edf > 4.0 && gam_edf < 60.0,
+        "gam effective dof out of sane range for this torus surface: {gam_edf:.3}"
+    );
+}
+
+/// Right-pad `v` with its last value (or 0.0 when empty) to length `len`, so a
+/// test-length vector can ride along as a column of a train-length reference
+/// data.frame. Only the first `v.len()` entries are read back inside the R body.
+fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
+    assert!(
+        v.len() <= len,
+        "pad target {len} shorter than source {}",
+        v.len()
+    );
+    let fill = v.last().copied().unwrap_or(0.0);
+    let mut out = v.to_vec();
+    out.resize(len, fill);
+    out
 }

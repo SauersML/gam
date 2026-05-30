@@ -40,8 +40,36 @@
 //! Both engines are fed byte-identical data.
 
 use gam::geometry::simplex::simplex_frechet_mean;
+use gam::load_csvwith_inferred_schema;
 use gam::test_support::reference::{Column, max_abs_diff, run_python};
 use ndarray::Array2;
+use std::path::Path;
+
+/// AFM volcanic-rock compositions from the Isle of Skye (Aitchison 1986, the
+/// canonical reference dataset for the additive log-ratio; shipped as
+/// `skye_afm_lavas.csv`). Each row is an (A=alkali, F=FeO, M=MgO) composition.
+const SKYE_AFM_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/skye_afm_lavas.csv");
+
+/// Additive log-ratio (ALR) coordinates of a composition with the LAST part as
+/// the common reference: `alr(x)_j = ln(x_j / x_D)` for `j = 0..D-1`. This is
+/// the bijection from the (D-1)-simplex to `R^{D-1}` underlying compositional
+/// regression; squared Euclidean distance in ALR space is the (oblique) ALR
+/// metric the geometric-mean identity is expressed in.
+fn alr(x: &[f64]) -> Vec<f64> {
+    let d = x.len();
+    let denom = x[d - 1].ln();
+    x[..d - 1].iter().map(|v| v.ln() - denom).collect()
+}
+
+/// Invert ALR back to a closed composition: append a 0 reference coordinate,
+/// exponentiate, and close. `alr_inv(alr(x)) == x` for any strictly positive
+/// composition `x`.
+fn alr_inv(coords: &[f64]) -> Vec<f64> {
+    let mut raw: Vec<f64> = coords.iter().map(|c| c.exp()).collect();
+    raw.push(1.0);
+    let total: f64 = raw.iter().sum();
+    raw.iter().map(|v| v / total).collect()
+}
 
 /// Closure of a single composition row: divide by its total so it sums to 1.
 fn close_row(parts: &[f64]) -> Vec<f64> {
@@ -308,5 +336,202 @@ emit("mean", g)
     assert!(
         equiv_dev < 1e-12,
         "gam Fréchet mean violates Aitchison perturbation-equivariance: dev={equiv_dev:.3e}"
+    );
+}
+
+/// Real-data arm: gam's compositional geometric mean on the canonical Skye AFM
+/// lavas (Aitchison 1986), exercising the SAME `simplex_frechet_mean` capability
+/// the synthetic test above proves on known-truth data. Real data => the true
+/// centre is unknown, so we assert OBJECTIVE held-out quality instead of recovery:
+///
+///   PRIMARY (ALR-transform correctness + geometric-mean identity, tool-free):
+///     gam's centroid on the TRAIN rows must satisfy the defining ALR identity —
+///     its additive-log-ratio coordinates equal the column-wise mean of the train
+///     rows' ALR coordinates — and round-trip exactly through `alr`/`alr_inv`.
+///     This is an exact mathematical property of the compositional geometric mean.
+///
+///   PREDICTIVE (objective, tool-free): treating gam's TRAIN centroid as a
+///     constant predictor of held-out compositions, its mean squared Aitchison
+///     (clr) distance to the TEST rows must clear an absolute bar AND beat the
+///     arithmetic (closure-of-mean-parts) centroid — the natural but
+///     geometrically WRONG centre — on that SAME held-out metric.
+///
+///   BASELINE (match-or-beat): SciPy's `closure(gmean(train))` is fed the
+///     byte-identical TRAIN rows; gam's held-out mean-sq-Aitchison risk must be no
+///     worse than SciPy's * (1 + tiny). SciPy is a baseline to match-or-beat on
+///     the objective, never a fitted target to reproduce.
+#[test]
+fn simplex_geometric_mean_minimizes_aitchison_frechet_objective_on_real_data() {
+    // ---- load the canonical Skye AFM lavas (A, F, M strictly positive) -----
+    let ds = load_csvwith_inferred_schema(Path::new(SKYE_AFM_CSV)).expect("load skye_afm_lavas.csv");
+    let col = ds.column_map();
+    let a_idx = col["A"];
+    let f_idx = col["F"];
+    let m_idx = col["M"];
+    let a_col: Vec<f64> = ds.values.column(a_idx).to_vec();
+    let f_col: Vec<f64> = ds.values.column(f_idx).to_vec();
+    let m_col: Vec<f64> = ds.values.column(m_idx).to_vec();
+    let n = a_col.len();
+    assert!(n >= 20, "skye AFM should have ~23 rows, got {n}");
+
+    let nparts = 3usize;
+    // Closed AFM compositions (parts sum to 1), one [A, F, M] row each. Every
+    // part is strictly positive in this dataset, so the log-ratios are defined.
+    let rows: Vec<[f64; 3]> = (0..n)
+        .map(|i| {
+            let raw = [a_col[i], f_col[i], m_col[i]];
+            let total: f64 = raw.iter().sum();
+            assert!(
+                raw.iter().all(|&v| v > 0.0) && total > 0.0,
+                "AFM row {i} is not strictly positive: {raw:?}"
+            );
+            [raw[0] / total, raw[1] / total, raw[2] / total]
+        })
+        .collect();
+
+    // ---- deterministic train/test split: every 3rd row held out -----------
+    let is_test = |i: usize| i % 3 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    assert!(
+        train_rows.len() >= 12 && test_rows.len() >= 6,
+        "split sizes: train={} test={}",
+        train_rows.len(),
+        test_rows.len()
+    );
+
+    // Train compositions: matrix for gam, and per-part columns (TRAIN length) for
+    // the reference harness — byte-identical numbers, same order.
+    let mut train_mat = Array2::<f64>::zeros((train_rows.len(), nparts));
+    let mut a_tr = Vec::with_capacity(train_rows.len());
+    let mut f_tr = Vec::with_capacity(train_rows.len());
+    let mut m_tr = Vec::with_capacity(train_rows.len());
+    for (out_row, &src) in train_rows.iter().enumerate() {
+        let r = rows[src];
+        for j in 0..nparts {
+            train_mat[[out_row, j]] = r[j];
+        }
+        a_tr.push(r[0]);
+        f_tr.push(r[1]);
+        m_tr.push(r[2]);
+    }
+
+    // ---- gam: compositional geometric (Fréchet) mean on TRAIN -------------
+    let gam_mean = simplex_frechet_mean(train_mat.view(), None).expect("gam simplex Fréchet mean");
+    assert_eq!(gam_mean.len(), nparts, "Fréchet mean must have one part per column");
+
+    // ---- (PRIMARY) ALR-transform correctness + geometric-mean identity -----
+    // The compositional geometric mean's ALR coordinates equal the arithmetic
+    // mean of the train rows' ALR coordinates: alr(g) = mean_i alr(x_i). This is
+    // an exact identity (alr is a log-linear map and g is the closure of the
+    // column-wise geometric mean). It both validates the alr transform and
+    // certifies gam returned the geometric mean.
+    let mut alr_bar = vec![0.0_f64; nparts - 1];
+    for &src in &train_rows {
+        let coords = alr(&rows[src]);
+        for j in 0..nparts - 1 {
+            alr_bar[j] += coords[j];
+        }
+    }
+    for v in alr_bar.iter_mut() {
+        *v /= train_rows.len() as f64;
+    }
+    let alr_gam = alr(&gam_mean);
+    let alr_identity_dev = max_abs_diff(&alr_gam, &alr_bar);
+    assert!(
+        alr_identity_dev < 1e-12,
+        "ALR geometric-mean identity broken: alr(gam_mean)={alr_gam:?} vs \
+         mean_i alr(x_i)={alr_bar:?} dev={alr_identity_dev:.3e}"
+    );
+    // alr round-trip: alr_inv(alr_bar) reconstructs gam's centroid exactly.
+    let reconstructed = alr_inv(&alr_bar);
+    let roundtrip_dev = max_abs_diff(&reconstructed, &gam_mean);
+    assert!(
+        roundtrip_dev < 1e-12,
+        "ALR inverse failed to reconstruct the geometric mean: dev={roundtrip_dev:.3e}"
+    );
+
+    // ---- held-out predictive risk of the TRAIN centroid -------------------
+    // The centroid predicts every held-out composition; its quality is the mean
+    // squared Aitchison (clr) distance to the TEST rows. Computed in plain Rust.
+    let test_comps: Vec<[f64; 3]> = test_rows.iter().map(|&i| rows[i]).collect();
+    let heldout_risk = |centre: &[f64]| -> f64 {
+        let s: f64 = test_comps.iter().map(|r| aitchison_sq(centre, r)).sum();
+        s / test_comps.len() as f64
+    };
+    let gam_heldout = heldout_risk(&gam_mean);
+
+    // Arithmetic centroid of the TRAIN parts: the natural but geometrically WRONG
+    // centre for Aitchison data. gam's geometric mean must predict the held-out
+    // compositions strictly better than it.
+    let mut arith = vec![0.0_f64; nparts];
+    for &src in &train_rows {
+        for j in 0..nparts {
+            arith[j] += rows[src][j];
+        }
+    }
+    let arith = close_row(&arith);
+    let arith_heldout = heldout_risk(&arith);
+
+    // ---- SciPy baseline: closure(gmean(TRAIN)) on byte-identical rows ------
+    let r = run_python(
+        &[
+            Column::new("A", &a_tr),
+            Column::new("F", &f_tr),
+            Column::new("M", &m_tr),
+        ],
+        r#"
+from scipy.stats import gmean
+X = np.column_stack([df["A"], df["F"], df["M"]])
+g = gmean(X, axis=0)          # exact column-wise geometric mean of TRAIN
+g = g / g.sum()               # closure -> valid composition (sums to 1)
+emit("mean", g)
+"#,
+    );
+    let scipy_mean = r.vector("mean");
+    assert_eq!(scipy_mean.len(), nparts, "scipy mean length mismatch");
+    let scipy_heldout = heldout_risk(scipy_mean);
+    let coord_dev = max_abs_diff(&gam_mean, scipy_mean);
+
+    eprintln!(
+        "skye AFM held-out: n={n} n_train={} n_test={} gam_mean={gam_mean:?} \
+         alr_identity_dev={alr_identity_dev:.3e} roundtrip_dev={roundtrip_dev:.3e} \
+         gam_heldout={gam_heldout:.6e} arith_heldout={arith_heldout:.6e} \
+         scipy_heldout={scipy_heldout:.6e} coord_dev_vs_scipy={coord_dev:.3e}",
+        train_rows.len(),
+        test_rows.len(),
+    );
+
+    // ---- ABSOLUTE objective bar -------------------------------------------
+    // The AFM trend is real and compact in Aitchison space; the geometric centre
+    // sits within mean squared clr-distance 1.0 of the held-out lavas (the parts
+    // span well under one e-fold of spread). A degenerate centre would blow past
+    // this.
+    assert!(
+        gam_heldout.is_finite() && gam_heldout >= 0.0,
+        "gam held-out Aitchison risk is not a valid value: {gam_heldout}"
+    );
+    assert!(
+        gam_heldout < 1.0,
+        "gam held-out Aitchison risk too high: {gam_heldout:.6e} (>= 1.0)"
+    );
+
+    // ---- DISCRIMINATION: beat the geometrically wrong arithmetic centre ----
+    assert!(
+        gam_heldout < arith_heldout,
+        "geometric mean did not predict held-out lavas better than the arithmetic \
+         centroid (test cannot discriminate the correct centre): \
+         gam={gam_heldout:.6e} arith={arith_heldout:.6e}"
+    );
+
+    // ---- BASELINE (match-or-beat) on the SAME held-out metric -------------
+    // gam must be at least as good a held-out predictor as SciPy's mature closed
+    // form. Both sit at the analytic geometric mean, so the risks coincide to
+    // floating point; the slack guards rounding and would catch any genuine
+    // shortfall in gam's centroid.
+    assert!(
+        gam_heldout <= scipy_heldout * (1.0 + 1e-9) + 1e-15,
+        "gam held-out Aitchison risk worse than the SciPy baseline: \
+         gam={gam_heldout:.6e} > scipy={scipy_heldout:.6e}"
     );
 }

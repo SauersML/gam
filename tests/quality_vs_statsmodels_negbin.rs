@@ -48,11 +48,13 @@ use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, relative_l2, rmse, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+    load_csvwith_inferred_schema,
 };
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Gamma, Poisson, Uniform};
+use std::path::Path;
 
 const N: usize = 220;
 const THETA: f64 = 2.0;
@@ -217,5 +219,301 @@ emit("mu", mu)
     assert!(
         (0.8..1.2).contains(&chi2_over_n),
         "Pearson chi2/n (NB variance) outside (0.8,1.2): {chi2_over_n:.3}"
+    );
+}
+
+const BADHEALTH_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/badhealth.csv");
+
+/// NB deviance per observation under the NB2 law with size `theta`:
+/// `d_i = 2*[ y*log(y/mu) - (y+theta)*log((y+theta)/(mu+theta)) ]` (the `y*log`
+/// term is 0 at `y=0`). This is the standard saturated-vs-fitted log-likelihood
+/// deviance for `Var(mu) = mu + mu^2/theta`; lower is a better held-out fit.
+fn nb_deviance_per_obs(y: f64, mu: f64, theta: f64) -> f64 {
+    let mu = mu.max(1e-12);
+    let t1 = if y > 0.0 { y * (y / mu).ln() } else { 0.0 };
+    let t2 = (y + theta) * ((y + theta) / (mu + theta)).ln();
+    2.0 * (t1 - t2)
+}
+
+/// Mean NB deviance over a held-out set.
+fn mean_nb_deviance(y: &[f64], mu: &[f64], theta: f64) -> f64 {
+    assert_eq!(y.len(), mu.len(), "nb deviance length mismatch");
+    let s: f64 = y
+        .iter()
+        .zip(mu)
+        .map(|(&yi, &mui)| nb_deviance_per_obs(yi, mui, theta))
+        .sum();
+    s / y.len().max(1) as f64
+}
+
+/// REAL-DATA ARM — same capability (penalized NB-log smooth + linear term,
+/// theta-dependent overdispersion) on a real overdispersed count dataset where
+/// the truth is unknown, so quality is OBJECTIVE held-out predictive accuracy.
+///
+/// Dataset: `badhealth` (German health-care utilization), the canonical gamlss
+/// count-regression benchmark. SOURCE: R package `gamlss.data` / Winkelmann &
+/// Boes, shipped at `bench/datasets/badhealth.csv` with columns
+/// `numvisit` (doctor visits in the quarter, the count response),
+/// `badh` (self-rated bad health, 0/1), `age` (years). The marginal
+/// variance-to-mean ratio is ~5, so the data is strongly overdispersed —
+/// Poisson is badly misspecified and a negative-binomial mean+overdispersion
+/// model is required.
+///
+/// Capability exercised (identical to the synthetic arm): `family=
+/// "negative-binomial"` with a fixed `theta`, log link, and the feature combo
+/// `numvisit ~ s(age, k=8) + linear(badh)` (penalized smooth + parametric
+/// linear term). `theta` is unknown for real data, so we set it from the TRAIN
+/// rows by method of moments (`theta = mu^2 / (var - mu)`) and hand the SAME
+/// fixed `theta` to gam and to statsmodels — a fair, shared dispersion.
+///
+/// Split: deterministic, every 4th row held out (fixed index, identical row
+/// order fed to gam and to statsmodels).
+///
+/// OBJECTIVE METRIC (held-out, tool-free):
+///   PRIMARY accuracy: mean held-out NB deviance of gam's predicted means must
+///     clear an ABSOLUTE bar `<= 0.85`. The intercept-only (constant-mean) NB
+///     predictor scores ~0.87 on this split, so beating 0.85 proves the
+///     s(age)+badh structure genuinely improves out-of-sample mean prediction.
+///   PRIMARY overdispersion: the TRAIN Pearson statistic under the NB variance
+///     `V(mu)=mu+mu^2/theta`, `chi2/n`, lands in `(0.6, 1.4)`. Recomputed under
+///     the POISSON variance `V(mu)=mu` it must exceed `2.0` — i.e. ignoring
+///     theta would massively under-fit the spread. This is the direct
+///     overdispersion-recovery claim.
+///   BASELINE (match-or-beat): statsmodels fits the SAME NB-log model
+///     (8-df cubic B-spline of age + badh + intercept, same fixed theta) on the
+///     SAME train rows and predicts the SAME held-out rows; gam's held-out mean
+///     NB deviance must be `<= sm_deviance * 1.10`. statsmodels is a yardstick
+///     on the same held-out objective, never an output to replicate.
+#[test]
+fn gam_negbin_matches_statsmodels_overdispersed_counts_on_real_data() {
+    init_parallelism();
+
+    // ---- load badhealth: numvisit (count) ~ s(age) + badh -----------------
+    let ds = load_csvwith_inferred_schema(Path::new(BADHEALTH_CSV)).expect("load badhealth.csv");
+    let col = ds.column_map();
+    let age_idx = col["age"];
+    let badh_idx = col["badh"];
+    let numvisit_idx = col["numvisit"];
+    let age: Vec<f64> = ds.values.column(age_idx).to_vec();
+    let badh: Vec<f64> = ds.values.column(badh_idx).to_vec();
+    let numvisit: Vec<f64> = ds.values.column(numvisit_idx).to_vec();
+    let n = age.len();
+    assert!(n > 1000, "badhealth should have ~1127 rows, got {n}");
+
+    // ---- deterministic train/test split: every 4th row held out ----------
+    let is_test = |i: usize| i % 4 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    assert!(
+        train_rows.len() > 700 && test_rows.len() > 200,
+        "split sizes: train={} test={}",
+        train_rows.len(),
+        test_rows.len()
+    );
+
+    let train_age: Vec<f64> = train_rows.iter().map(|&i| age[i]).collect();
+    let train_badh: Vec<f64> = train_rows.iter().map(|&i| badh[i]).collect();
+    let train_numvisit: Vec<f64> = train_rows.iter().map(|&i| numvisit[i]).collect();
+    let test_age: Vec<f64> = test_rows.iter().map(|&i| age[i]).collect();
+    let test_badh: Vec<f64> = test_rows.iter().map(|&i| badh[i]).collect();
+    let test_numvisit: Vec<f64> = test_rows.iter().map(|&i| numvisit[i]).collect();
+
+    // ---- fixed overdispersion from TRAIN by method of moments -------------
+    // NB2: Var = mu + mu^2/theta  =>  theta = mu^2 / (Var - mu). Estimated on
+    // train counts only (test stays untouched), then handed identically to gam
+    // and statsmodels so both share the same dispersion assumption.
+    let n_tr = train_numvisit.len() as f64;
+    let mu_tr = train_numvisit.iter().sum::<f64>() / n_tr;
+    let var_tr =
+        train_numvisit.iter().map(|&v| (v - mu_tr) * (v - mu_tr)).sum::<f64>() / (n_tr - 1.0);
+    let theta = mu_tr * mu_tr / (var_tr - mu_tr);
+    assert!(
+        theta.is_finite() && theta > 0.0,
+        "train MoM theta must be finite and positive (overdispersed data): theta={theta}"
+    );
+
+    // Training-only dataset: sub-set the encoded rows; headers/schema/kinds are
+    // unchanged so the formula resolves identically.
+    let p = ds.headers.len();
+    let mut train_values = Array2::<f64>::zeros((train_rows.len(), p));
+    for (out_row, &src_row) in train_rows.iter().enumerate() {
+        for c in 0..p {
+            train_values[[out_row, c]] = ds.values[[src_row, c]];
+        }
+    }
+    let mut train_ds = ds.clone();
+    train_ds.values = train_values;
+
+    // ---- fit gam on TRAIN: numvisit ~ s(age, k=8) + linear(badh), NB-log --
+    let cfg = FitConfig {
+        family: Some("negative-binomial".to_string()),
+        negative_binomial_theta: Some(theta),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula("numvisit ~ s(age, k=8) + linear(badh)", &train_ds, &cfg)
+        .expect("gam negbin fit on badhealth train");
+    let FitResult::Standard(fit) = result else {
+        panic!("negative-binomial GLM should produce a Standard fit");
+    };
+    let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
+
+    // gam predicted means at the held-out rows: rebuild the frozen design,
+    // apply beta for the log-link predictor, exp() to means.
+    let mut test_grid = Array2::<f64>::zeros((test_rows.len(), p));
+    for (i, &row) in test_rows.iter().enumerate() {
+        test_grid[[i, age_idx]] = age[row];
+        test_grid[[i, badh_idx]] = badh[row];
+    }
+    let test_design = build_term_collection_design(test_grid.view(), &fit.resolvedspec)
+        .expect("rebuild design at held-out points");
+    let gam_test_eta = test_design.design.apply(&fit.fit.beta);
+    let gam_test_mu: Vec<f64> = gam_test_eta.iter().map(|e| e.exp()).collect();
+
+    // gam fitted means at the TRAIN rows (for the overdispersion claim).
+    let mut train_grid = Array2::<f64>::zeros((train_rows.len(), p));
+    for (i, &row) in train_rows.iter().enumerate() {
+        train_grid[[i, age_idx]] = age[row];
+        train_grid[[i, badh_idx]] = badh[row];
+    }
+    let train_design = build_term_collection_design(train_grid.view(), &fit.resolvedspec)
+        .expect("rebuild design at training points");
+    let gam_train_eta = train_design.design.apply(&fit.fit.beta);
+    let gam_train_mu: Vec<f64> = gam_train_eta.iter().map(|e| e.exp()).collect();
+
+    // ---- fit the SAME NB-log model with statsmodels (mature baseline) -----
+    // 8-df cubic B-spline of age (mirrors s(age, k=8)) + badh + intercept,
+    // dispersion alpha = 1/theta held fixed. Train rows fit; test rows predicted.
+    // Within ONE python call every column is train-length; the test rows ride
+    // along right-padded and only the first `test_n` entries are read back.
+    let pad_to = |v: &[f64], len: usize| -> Vec<f64> {
+        assert!(v.len() <= len, "pad target {len} shorter than source {}", v.len());
+        let fill = v.last().copied().unwrap_or(0.0);
+        let mut out = v.to_vec();
+        out.resize(len, fill);
+        out
+    };
+    let tr_len = train_age.len();
+    let r = run_python(
+        &[
+            Column::new("age", &train_age),
+            Column::new("badh", &train_badh),
+            Column::new("numvisit", &train_numvisit),
+            Column::new("test_age", &pad_to(&test_age, tr_len)),
+            Column::new("test_badh", &pad_to(&test_badh, tr_len)),
+            Column::new("test_n", &vec![test_age.len() as f64; tr_len]),
+            Column::new("theta", &vec![theta; tr_len]),
+        ],
+        r#"
+import numpy as np
+import statsmodels.api as sm
+from patsy import dmatrix
+
+theta = float(np.asarray(df["theta"])[0])
+k = int(round(float(np.asarray(df["test_n"])[0])))
+
+age = np.asarray(df["age"], dtype=float)
+badh = np.asarray(df["badh"], dtype=float)
+y = np.asarray(df["numvisit"], dtype=float)
+test_age = np.asarray(df["test_age"], dtype=float)[:k]
+test_badh = np.asarray(df["test_badh"], dtype=float)[:k]
+
+# Build the train spline and re-evaluate the SAME basis at the test ages so the
+# spline knots/columns match between fit and prediction (mirrors s(age, k=8)).
+train_dm = dmatrix("bs(age, df=8, degree=3, include_intercept=False)",
+                   {"age": age}, return_type="dataframe")
+test_spl = np.asarray(dmatrix(train_dm.design_info,
+                              {"age": test_age}, return_type="dataframe"))
+train_spl = np.asarray(train_dm)
+
+Xtr = np.column_stack([np.ones_like(age), train_spl, badh])
+Xte = np.column_stack([np.ones(k), test_spl, test_badh])
+
+fam = sm.families.NegativeBinomial(alpha=1.0 / theta)  # alpha = 1/theta
+m = sm.GLM(y, Xtr, family=fam).fit()
+mu_te = np.asarray(m.predict(Xte), dtype=float)
+emit("test_mu", mu_te)
+"#,
+    );
+    let sm_test_mu = r.vector("test_mu");
+    assert_eq!(
+        sm_test_mu.len(),
+        test_rows.len(),
+        "statsmodels held-out prediction length mismatch"
+    );
+
+    // ---- objective held-out metrics on gam's OWN predictions --------------
+    let gam_test_dev = mean_nb_deviance(&test_numvisit, &gam_test_mu, theta);
+    let sm_test_dev = mean_nb_deviance(&test_numvisit, sm_test_mu, theta);
+
+    // Intercept-only (constant train-mean) held-out NB deviance, for context.
+    let null_mu = vec![mu_tr; test_rows.len()];
+    let null_test_dev = mean_nb_deviance(&test_numvisit, &null_mu, theta);
+
+    // Overdispersion: TRAIN Pearson chi2/n under the NB variance vs under the
+    // (wrong) Poisson variance. The NB statistic should sit near 1; the Poisson
+    // one blows up because the data is ~5x overdispersed.
+    let chi2_nb: f64 = train_numvisit
+        .iter()
+        .zip(&gam_train_mu)
+        .map(|(&yi, &mui)| {
+            let var = mui + mui * mui / theta;
+            let d = yi - mui;
+            d * d / var.max(1e-12)
+        })
+        .sum::<f64>()
+        / train_numvisit.len() as f64;
+    let chi2_pois: f64 = train_numvisit
+        .iter()
+        .zip(&gam_train_mu)
+        .map(|(&yi, &mui)| {
+            let d = yi - mui;
+            d * d / mui.max(1e-12)
+        })
+        .sum::<f64>()
+        / train_numvisit.len() as f64;
+
+    let rel_l2_vs_sm = relative_l2(&gam_test_mu, sm_test_mu);
+    eprintln!(
+        "badhealth numvisit~s(age,k=8)+linear(badh) NB-log held-out: \
+         n_train={} n_test={} theta(MoM)={theta:.4} gam_edf={gam_edf:.3} \
+         gam_test_dev={gam_test_dev:.4} sm_test_dev={sm_test_dev:.4} null_test_dev={null_test_dev:.4} \
+         train_chi2/n(NB)={chi2_nb:.3} train_chi2/n(Poisson)={chi2_pois:.3} \
+         rel_l2(gam,sm)={rel_l2_vs_sm:.4} (context only)",
+        train_rows.len(),
+        test_rows.len(),
+    );
+
+    // (1) PRIMARY accuracy: held-out mean NB deviance below the constant-mean
+    // null (~0.87 on this split). 0.85 is an absolute, tool-free bar that gam's
+    // s(age)+badh structure must clear to prove it predicts the held-out counts.
+    assert!(
+        gam_test_dev <= 0.85,
+        "gam held-out mean NB deviance too high: {gam_test_dev:.4} (>= 0.85; null≈{null_test_dev:.4})"
+    );
+
+    // (2) PRIMARY overdispersion recovery: the NB-variance Pearson statistic is
+    // O(1) while the Poisson-variance one explodes — i.e. gam's theta-dependent
+    // variance captures the spread that a Poisson fit would miss entirely.
+    assert!(
+        (0.6..1.4).contains(&chi2_nb),
+        "train Pearson chi2/n under NB variance outside (0.6,1.4): {chi2_nb:.3}"
+    );
+    assert!(
+        chi2_pois > 2.0,
+        "Poisson-variance Pearson chi2/n should expose overdispersion (>2.0): {chi2_pois:.3}"
+    );
+
+    // (3) BASELINE (match-or-beat, SAME held-out objective): gam's held-out NB
+    // deviance is no worse than statsmodels' (lower deviance is better), within
+    // a 10% margin. statsmodels is a yardstick, never an output to reproduce.
+    assert!(
+        gam_test_dev <= sm_test_dev * 1.10,
+        "gam held-out NB deviance {gam_test_dev:.4} exceeds statsmodels {sm_test_dev:.4} * 1.10"
+    );
+
+    // complexity sanity: a smooth of age plus one linear term has modest edf.
+    assert!(
+        gam_edf > 1.0 && gam_edf < 30.0,
+        "gam effective dof out of sane range: {gam_edf:.3}"
     );
 }
