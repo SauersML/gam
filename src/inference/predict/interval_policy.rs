@@ -574,10 +574,7 @@ pub fn predict_posterior_mean_generic<T: PredictionTransform>(
         .eta_se
         .unwrap_or_else(|| Array1::zeros(state.eta.len()));
     let policy = transform.response_jacobian_rows(PredictPass::PosteriorMean);
-    let mean_se = state
-        .mean_se
-        .clone()
-        .unwrap_or_else(|| eta_se.clone());
+    let mean_se = state.mean_se.clone().unwrap_or_else(|| eta_se.clone());
     let response_map = move |eta: &Array1<f64>| transform.response(eta);
     let mut result = PredictPosteriorMeanResult {
         eta: state.eta,

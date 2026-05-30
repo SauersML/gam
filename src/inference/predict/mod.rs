@@ -3265,8 +3265,7 @@ impl PredictionTransform for BernoulliMarginalSlopePredictor {
                 })
             }
             PredictPass::PosteriorMean => {
-                let strategy =
-                    strategy_for_family(self.likelihood_family(), Some(&self.base_link));
+                let strategy = strategy_for_family(self.likelihood_family(), Some(&self.base_link));
                 let quadctx = crate::quadrature::QuadratureContext::new();
                 let mean = Array1::from_iter(
                     eta.iter()
@@ -4302,10 +4301,10 @@ impl SurvivalPredictor {
 impl SurvivalPredictor {
     /// Threshold and log-sigma linear predictors, validating that the noise
     /// design / offset are present.
-    fn linear_predictors(
+    fn linear_predictors<'a>(
         &self,
-        input: &PredictInput,
-    ) -> Result<(Array1<f64>, Array1<f64>, &DesignMatrix), EstimationError> {
+        input: &'a PredictInput,
+    ) -> Result<(Array1<f64>, Array1<f64>, &'a DesignMatrix), EstimationError> {
         let eta_threshold = input.design.dot(&self.beta_threshold) + &input.offset;
         let design_noise = input.design_noise.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput(
