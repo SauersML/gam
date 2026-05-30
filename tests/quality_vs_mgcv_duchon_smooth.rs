@@ -20,20 +20,22 @@
 //! is no longer a pass criterion: matching another tool's fit proves nothing
 //! about correctness — recovering the truth does.
 //!
-//! Reference: `mgcv::gam(y ~ s(x, bs="ds", k=20, m=c(2,0)), method="REML")`.
-//! mgcv's `bs="ds"` is the canonical Duchon/thin-plate-with-Duchon-penalty
-//! basis; for `bs="ds"` the pair `m=c(m1,m2)` sets `m1` = order of the squared
-//! derivative penalty `‖D^{m1} f‖²` and `m2` = the extra radial-kernel power.
-//! `m=c(2,0)` is the standard 1-D cubic-spline-equivalent Duchon smoother:
-//! penalize second derivatives, with a degree-1 (linear) polynomial null space.
+//! THE OBJECT UNDER TEST. gam's redesigned non-periodic Euclidean Duchon is a
+//! structural amplitude/slope/curvature smoother on the cubic (`r³`)
+//! polyharmonic basis: an affine (`Linear`, p=2) polynomial null space and the
+//! default spectral power `s = (d−1)/2`, which in 1D gives `s = 0` and the cubic
+//! `r³` kernel (`2(p+s)−d = 3`). We therefore test the DEFAULT `duchon(x, k=20)`
+//! — the magic cubic smoother — rather than a hand-set seminorm order. This is
+//! the object users actually get.
 //!
-//! The matching gam knob is `order=1`. In gam the Duchon seminorm is `‖D^m f‖²`
-//! with `m = order + 1` (see `DuchonNullspaceOrder` in `src/terms/basis.rs`:
-//! `Zero → m=1`, `Linear → m=2`, `Degree(k) → m=k+1`), and `order=1` selects the
-//! `Linear` variant, i.e. `m=2`, with a degree-1 polynomial null space — exactly
-//! mgcv's `m=c(2,0)`. (gam `order=2` would be `Degree(2)`, i.e. Duchon `m=3`,
-//! penalizing third derivatives — a *different* smoother; this test deliberately
-//! does NOT use it.) Both fit `k=20` basis functions on the same grid.
+//! BASELINE COMPARATOR: `mgcv::gam(y ~ s(x, bs="ds", k=20, m=c(2,0)),
+//! method="REML")`. mgcv's `bs="ds"` is the canonical Duchon basis; for
+//! `bs="ds"` the pair `m=c(m1,m2)` sets `m1` = order of the squared-derivative
+//! penalty `‖D^{m1} f‖²` and `m2` = the extra radial-kernel power. `m=c(2,0)` is
+//! the standard 1-D cubic-spline-equivalent Duchon smoother (penalize second
+//! derivatives, degree-1 polynomial null space) — the mature analogue of gam's
+//! default cubic structural smoother in 1D, and the right "match-or-beat on
+//! truth recovery" reference. Both fit `k=20` basis functions on the same grid.
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
@@ -74,15 +76,15 @@ fn gam_duchon_1d_matches_mgcv_ds() {
     let col = ds.column_map();
     let x_idx = col["x"];
 
-    // ---- fit with gam: y ~ duchon(x, k=20, order=1), REML ------------------
-    // order=1 => Linear null space => Duchon m=2 (penalize 2nd derivatives),
-    // the exact analogue of mgcv's bs="ds", m=c(2,0). REML is gam's default.
+    // ---- fit with gam: y ~ duchon(x, k=20), REML --------------------------
+    // The default (no order=/power=) is the structural cubic smoother: affine
+    // null space + power s=(d-1)/2 = 0 in 1D => cubic r^3 kernel, the analogue
+    // of mgcv's bs="ds", m=c(2,0). REML is gam's default.
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result =
-        fit_from_formula("y ~ duchon(x, k=20, order=1)", &ds, &cfg).expect("gam duchon fit");
+    let result = fit_from_formula("y ~ duchon(x, k=20)", &ds, &cfg).expect("gam duchon fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for a gaussian Duchon smooth");
     };
