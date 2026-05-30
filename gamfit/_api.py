@@ -18,7 +18,7 @@ from ._cuda import cuda_subprocess_library_dirs as _cuda_subprocess_library_dirs
 from ._cuda import format_cuda_diagnostics as _format_cuda_diagnostics
 from ._exceptions import map_exception
 from ._model import Model
-from ._reml_common import check_forward_state
+from ._reml_common import check_forward_state, coerce_grad_payload
 from ._response_geometry import ResponseGeometryModel, fit_response_geometry
 from ._tables import normalize_table
 from ._validation import FormulaValidation
@@ -2165,8 +2165,6 @@ def gaussian_reml_fit_backward(
     by_start_col: int = 0,
 ) -> dict[str, Any]:
     """Run the analytic VJP for ``gaussian_reml_fit`` outputs."""
-    import numpy as np
-
     if forward_state is not None:
         check_forward_state(forward_state, name="gaussian_reml_fit_backward")
     try:
@@ -2189,11 +2187,7 @@ def gaussian_reml_fit_backward(
         )
     except Exception as exc:
         raise map_exception(exc) from exc
-    result = dict(out)
-    for key in ("grad_x", "grad_y", "grad_penalty", "grad_weights", "grad_by"):
-        if result.get(key) is not None:
-            result[key] = np.asarray(result[key], dtype=float)
-    return result
+    return coerce_grad_payload(out)
 
 
 def gaussian_reml_fit_batched(
@@ -2244,8 +2238,6 @@ def gaussian_reml_fit_batched_backward(
     by_start_col: int = 0,
 ) -> dict[str, Any]:
     """Run packed ragged analytic VJPs for ``gaussian_reml_fit_batched``."""
-    import numpy as np
-
     if forward_state is not None:
         check_forward_state(forward_state, name="gaussian_reml_fit_batched_backward")
     offsets = _index_vector(row_offsets, "row_offsets")
@@ -2271,11 +2263,45 @@ def gaussian_reml_fit_batched_backward(
         )
     except Exception as exc:
         raise map_exception(exc) from exc
-    result = dict(out)
-    for key in ("grad_x", "grad_y", "grad_penalty", "grad_weights", "grad_by"):
-        if result.get(key) is not None:
-            result[key] = np.asarray(result[key], dtype=float)
-    return result
+    return coerce_grad_payload(out)
+
+
+def _resolve_position_basis_inputs(
+    t: Any,
+    basis_kind: str | None,
+    knots_or_centers: Any,
+    penalty: Any | None,
+    *,
+    basis: str | None,
+    basis_order: int | None,
+    periodic: bool,
+) -> tuple[str, str, int, Any, Any, Any]:
+    """Resolve the shared position-basis FFI inputs for every positions face.
+
+    All four position-based Gaussian REML entrypoints (forward / backward /
+    batched / batched-backward) opened with this identical preamble. Returns
+    ``(display_kind, effective_kind, order, t_np, knots_np, penalty_np)``.
+    """
+    display_kind = str(
+        basis if basis is not None else basis_kind if basis_kind is not None else "bspline"
+    )
+    effective_kind, order, _ = _normalize_position_basis(display_kind, basis_order)
+    t_np = _numeric_vector(t, "t")
+    knots_np = _resolve_basis_locations(
+        knots_or_centers,
+        t_np,
+        basis_kind=effective_kind,
+        label="knots_or_centers",
+        degree=order,
+    )
+    penalty_np = _resolve_position_penalty(
+        penalty,
+        knots_np,
+        basis_kind=display_kind,
+        basis_order=order,
+        periodic=periodic,
+    )
+    return display_kind, effective_kind, order, t_np, knots_np, penalty_np
 
 
 def gaussian_reml_fit_positions(
@@ -2303,24 +2329,16 @@ def gaussian_reml_fit_positions(
     """
     import numpy as np
 
-    display_kind = str(
-        basis if basis is not None else basis_kind if basis_kind is not None else "bspline"
-    )
-    effective_kind, order, _ = _normalize_position_basis(display_kind, basis_order)
-    t_np = _numeric_vector(t, "t")
-    knots_np = _resolve_basis_locations(
-        knots_or_centers,
-        t_np,
-        basis_kind=effective_kind,
-        label="knots_or_centers",
-        degree=order,
-    )
-    penalty_np = _resolve_position_penalty(
-        penalty,
-        knots_np,
-        basis_kind=display_kind,
-        basis_order=order,
-        periodic=periodic,
+    display_kind, effective_kind, order, t_np, knots_np, penalty_np = (
+        _resolve_position_basis_inputs(
+            t,
+            basis_kind,
+            knots_or_centers,
+            penalty,
+            basis=basis,
+            basis_order=basis_order,
+            periodic=periodic,
+        )
     )
     try:
         out = rust_module().gaussian_reml_fit_positions(
@@ -2377,26 +2395,16 @@ def gaussian_reml_fit_positions_backward(
     ``knots_or_centers`` and ``penalty`` accept the same auto-derived
     defaults as :func:`gaussian_reml_fit_positions`.
     """
-    import numpy as np
-
-    display_kind = str(
-        basis if basis is not None else basis_kind if basis_kind is not None else "bspline"
-    )
-    effective_kind, order, _ = _normalize_position_basis(display_kind, basis_order)
-    t_np = _numeric_vector(t, "t")
-    knots_np = _resolve_basis_locations(
-        knots_or_centers,
-        t_np,
-        basis_kind=effective_kind,
-        label="knots_or_centers",
-        degree=order,
-    )
-    penalty_np = _resolve_position_penalty(
-        penalty,
-        knots_np,
-        basis_kind=display_kind,
-        basis_order=order,
-        periodic=periodic,
+    display_kind, effective_kind, order, t_np, knots_np, penalty_np = (
+        _resolve_position_basis_inputs(
+            t,
+            basis_kind,
+            knots_or_centers,
+            penalty,
+            basis=basis,
+            basis_order=basis_order,
+            periodic=periodic,
+        )
     )
     try:
         out = rust_module().gaussian_reml_fit_positions_backward(
@@ -2423,11 +2431,7 @@ def gaussian_reml_fit_positions_backward(
         )
     except Exception as exc:
         raise map_exception(exc) from exc
-    result = dict(out)
-    for key in ("grad_t", "grad_y", "grad_penalty", "grad_weights", "grad_by"):
-        if result.get(key) is not None:
-            result[key] = np.asarray(result[key], dtype=float)
-    return result
+    return coerce_grad_payload(out, design_grad_key="grad_t")
 
 
 def gaussian_reml_fit_positions_batched(
@@ -2455,24 +2459,16 @@ def gaussian_reml_fit_positions_batched(
     """
     import numpy as np
 
-    display_kind = str(
-        basis if basis is not None else basis_kind if basis_kind is not None else "bspline"
-    )
-    effective_kind, order, _ = _normalize_position_basis(display_kind, basis_order)
-    t_np = _numeric_vector(t, "t")
-    knots_np = _resolve_basis_locations(
-        knots_or_centers,
-        t_np,
-        basis_kind=effective_kind,
-        label="knots_or_centers",
-        degree=order,
-    )
-    penalty_np = _resolve_position_penalty(
-        penalty,
-        knots_np,
-        basis_kind=display_kind,
-        basis_order=order,
-        periodic=periodic,
+    display_kind, effective_kind, order, t_np, knots_np, penalty_np = (
+        _resolve_position_basis_inputs(
+            t,
+            basis_kind,
+            knots_or_centers,
+            penalty,
+            basis=basis,
+            basis_order=basis_order,
+            periodic=periodic,
+        )
     )
     try:
         out = rust_module().gaussian_reml_fit_positions_batched(
@@ -2531,28 +2527,18 @@ def gaussian_reml_fit_positions_batched_backward(
     ``knots_or_centers`` and ``penalty`` accept the same auto-derived
     defaults as :func:`gaussian_reml_fit_positions_batched`.
     """
-    import numpy as np
-
     offsets = _index_vector(row_offsets, "row_offsets")
     batch = int(offsets.size - 1)
-    display_kind = str(
-        basis if basis is not None else basis_kind if basis_kind is not None else "bspline"
-    )
-    effective_kind, order, _ = _normalize_position_basis(display_kind, basis_order)
-    t_np = _numeric_vector(t, "t")
-    knots_np = _resolve_basis_locations(
-        knots_or_centers,
-        t_np,
-        basis_kind=effective_kind,
-        label="knots_or_centers",
-        degree=order,
-    )
-    penalty_np = _resolve_position_penalty(
-        penalty,
-        knots_np,
-        basis_kind=display_kind,
-        basis_order=order,
-        periodic=periodic,
+    display_kind, effective_kind, order, t_np, knots_np, penalty_np = (
+        _resolve_position_basis_inputs(
+            t,
+            basis_kind,
+            knots_or_centers,
+            penalty,
+            basis=basis,
+            basis_order=basis_order,
+            periodic=periodic,
+        )
     )
     try:
         out = rust_module().gaussian_reml_fit_positions_batched_backward(
@@ -2580,11 +2566,7 @@ def gaussian_reml_fit_positions_batched_backward(
         )
     except Exception as exc:
         raise map_exception(exc) from exc
-    result = dict(out)
-    for key in ("grad_t", "grad_y", "grad_penalty", "grad_weights", "grad_by"):
-        if result.get(key) is not None:
-            result[key] = np.asarray(result[key], dtype=float)
-    return result
+    return coerce_grad_payload(out, design_grad_key="grad_t")
 
 
 def gaussian_reml_fit_latent(
@@ -3379,11 +3361,7 @@ def gaussian_reml_fit_with_constraints_backward(
         raise
     except Exception as exc:
         raise map_exception(exc) from exc
-    result = dict(out)
-    for key in ("grad_x", "grad_y", "grad_penalty", "grad_weights"):
-        if result.get(key) is not None:
-            result[key] = np.asarray(result[key], dtype=float)
-    return result
+    return coerce_grad_payload(out)
 
 
 def _coerce_gaussian_reml_payload(payload: Any, np: Any) -> dict[str, Any]:
