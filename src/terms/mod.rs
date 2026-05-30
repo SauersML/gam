@@ -15,6 +15,7 @@ pub mod layout;
 pub mod matern_gradient;
 pub mod penalties;
 pub mod penalty_op;
+pub mod posterior_snr_weights;
 pub mod sae_manifold;
 pub mod sheaf;
 pub mod skip_transcoder;
