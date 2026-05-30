@@ -2741,11 +2741,14 @@ mod tests {
 
     #[test]
     fn validate_rejects_non_monotone_offsets() {
+        // `minimal_inputs` hard-codes `n_rows = 1`, so the CSR-style row
+        // pointer length is `n + 1 = 2`. Pin both `offsets[1] = total_cells`
+        // and `cell_c0.len() = total_cells = 2` from `make_buffers(2, …)`,
+        // then violate monotonicity by setting `offsets[0] > offsets[1]`;
+        // every length / per-cell-count check is satisfied so the only
+        // failure mode left is the monotonicity guard.
         let mut buffers = make_buffers(2, 4, 1, 1);
-        // Keep `cell_offsets.len() == n + 1` AND keep
-        // `offsets[n] == total_cells == cell_c0.len()`, so the only check
-        // that can fail is monotonicity (offsets[0] > offsets[1]).
-        buffers.cell_offsets = vec![5, 3, 2];
+        buffers.cell_offsets = vec![5, 2];
         let inputs = minimal_inputs(&buffers);
         let err = inputs
             .validate()

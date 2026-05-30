@@ -263,13 +263,14 @@ emit("nonzero", (xi != 0.0).reshape(-1, order="F").astype(float))
     //   dy: +rho at x(row1), -1 at y(row2), -1 at x*z(row5)
     //   dz: -beta at z(row3), +1 at x*y(row4)
     let mut true_xi = [0.0f64; P * 3];
-    true_xi[0 * P + 1] = -SIGMA; // dx : x
-    true_xi[0 * P + 2] = SIGMA; // dx : y
-    true_xi[1 * P + 1] = RHO; // dy : x
-    true_xi[1 * P + 2] = -1.0; // dy : y
-    true_xi[1 * P + 5] = -1.0; // dy : x*z
-    true_xi[2 * P + 3] = -BETA; // dz : z
-    true_xi[2 * P + 4] = 1.0; // dz : x*y
+    let idx = |deriv: usize, term: usize| deriv * P + term;
+    true_xi[idx(0, 1)] = -SIGMA; // dx : x
+    true_xi[idx(0, 2)] = SIGMA; // dx : y
+    true_xi[idx(1, 1)] = RHO; // dy : x
+    true_xi[idx(1, 2)] = -1.0; // dy : y
+    true_xi[idx(1, 5)] = -1.0; // dy : x*z
+    true_xi[idx(2, 3)] = -BETA; // dz : z
+    true_xi[idx(2, 4)] = 1.0; // dz : x*y
     let gam_vs_true = max_abs_diff(&gam_xi, &true_xi);
     let py_vs_true = max_abs_diff(py_xi, &true_xi);
 

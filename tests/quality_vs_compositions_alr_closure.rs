@@ -50,7 +50,7 @@ fn simplex_frechet_mean_matches_compositions_closed_geometric_mean() {
     for i in 0..n {
         let t = (i as f64 + 1.0) / (n as f64); // (0, 1]
         // Four distinct, always-positive coordinate generators.
-        let c0 = 2.0 + 1.5 * (6.2831853 * t).sin().abs() + 0.3 * t;
+        let c0 = 2.0 + 1.5 * (std::f64::consts::TAU * t).sin().abs() + 0.3 * t;
         let c1 = 1.0 + 0.8 * (3.0 * t + 0.5).cos().abs() + 0.7 * t * t;
         let c2 = 0.5 + 1.2 * ((i % 7) as f64) / 7.0 + 0.4 * (1.0 - t);
         let c3 = 0.25 + 0.9 * ((i % 5) as f64 + 1.0) / 5.0 + 0.2 * t;

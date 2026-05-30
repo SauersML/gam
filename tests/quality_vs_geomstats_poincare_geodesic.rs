@@ -96,8 +96,8 @@ fn poincare_geodesic_matches_geomstats_to_float_ulp() {
         // ---- columns: one per coordinate, identical values to Python -------
         // Flattened row-major (pair, coord); the Python side reshapes to (N, d).
         let mut columns: Vec<Column<'_>> = Vec::with_capacity(2 * dim);
-        let mut a_cols: Vec<Vec<f64>> = vec![Vec::with_capacity(N_PAIRS); dim];
-        let mut b_cols: Vec<Vec<f64>> = vec![Vec::with_capacity(N_PAIRS); dim];
+        let mut a_cols: Vec<Vec<f64>> = (0..dim).map(|_| Vec::with_capacity(N_PAIRS)).collect();
+        let mut b_cols: Vec<Vec<f64>> = (0..dim).map(|_| Vec::with_capacity(N_PAIRS)).collect();
         for p in 0..N_PAIRS {
             for j in 0..dim {
                 a_cols[j].push(a[p * dim + j]);

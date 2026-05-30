@@ -736,7 +736,7 @@ fn parse_call_pair(call: Pair<'_, Rule>) -> Result<FunctionCallSpec, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CallArgSpec, parse_formula, parse_formula_dsl, parse_function_call,
+        CallArgSpec, ParsedTerm, parse_formula, parse_formula_dsl, parse_function_call,
         parse_linkwiggle_formulaspec, parsed_terms_reference_column,
         validate_marginal_slope_z_column_exclusion,
     };
@@ -883,10 +883,71 @@ mod tests {
 
     #[test]
     fn parse_formula_rejects_unsupported_top_level_rhs_expressions() {
-        for formula in ["y ~ x - z", "y ~ -x", "y ~ x / z", "y ~ (x)", "y ~ x - 1"] {
+        // Binary `-`, unary `-`, bare parens, and `-1` intercept removal are
+        // not supported as top-level RHS expressions; they must surface
+        // through the bare-identifier check in `parse_term` with the same
+        // diagnostic. WR operators `:`, `*`, `/`, and `^` are intentionally
+        // supported by `expand_wr_term` and are exercised by
+        // `parse_formula_supports_wr_slash_nesting` /
+        // `parse_formula_supports_wr_star_crossing`; they must NOT appear in
+        // this list.
+        for formula in ["y ~ x - z", "y ~ -x", "y ~ (x)", "y ~ x - 1"] {
             let err = parse_formula(formula).expect_err("expected formula parse failure");
             assert!(err.to_string().contains("unsupported top-level RHS term"));
         }
+    }
+
+    /// Wilkinson-Rogers `a/b` (nesting) is documented and implemented by
+    /// `expand_wr_term` to yield `{a, a:b}`. This test pins that contract end
+    /// to end so a regression in either the grammar's `mul_op = { "*" | "/" }`
+    /// branch or in `expand_expr`'s `Rule::product` handling surfaces here
+    /// instead of slipping into a silent re-interpretation as a rejection.
+    #[test]
+    fn parse_formula_supports_wr_slash_nesting() {
+        let parsed = parse_formula("y ~ x / z").expect("`/` is supported as WR nesting");
+        assert_eq!(parsed.response, "y");
+        assert_eq!(parsed.terms.len(), 2);
+        let names: Vec<String> = parsed
+            .terms
+            .iter()
+            .map(|t| match t {
+                ParsedTerm::Linear { name, .. } => format!("Linear({name})"),
+                ParsedTerm::Interaction { vars } => format!("Interaction({})", vars.join(":")),
+                other => format!("Other({other:?})"),
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec!["Linear(x)".to_string(), "Interaction(x:z)".to_string()]
+        );
+    }
+
+    /// Wilkinson-Rogers `a*b` (crossing) is documented and implemented by
+    /// `expand_wr_term` to yield `{a, b, a:b}`. Pin the contract so a future
+    /// refactor of `mul_op` / `Rule::product` handling cannot silently change
+    /// the set of model terms.
+    #[test]
+    fn parse_formula_supports_wr_star_crossing() {
+        let parsed = parse_formula("y ~ x * z").expect("`*` is supported as WR crossing");
+        assert_eq!(parsed.response, "y");
+        assert_eq!(parsed.terms.len(), 3);
+        let names: Vec<String> = parsed
+            .terms
+            .iter()
+            .map(|t| match t {
+                ParsedTerm::Linear { name, .. } => format!("Linear({name})"),
+                ParsedTerm::Interaction { vars } => format!("Interaction({})", vars.join(":")),
+                other => format!("Other({other:?})"),
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "Linear(x)".to_string(),
+                "Linear(z)".to_string(),
+                "Interaction(x:z)".to_string(),
+            ]
+        );
     }
 
     #[test]

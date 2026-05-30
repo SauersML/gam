@@ -18468,9 +18468,21 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
 }
 
 fn normalize_outer_eval_error_detail(error: &str) -> &str {
-    error
+    // Any `String` round-tripped through `CustomFamilyError::From<String>`
+    // gets re-wrapped as `InvalidInput { context: "custom-family string
+    // boundary", … }`, which `Display`s as `custom-family invalid input
+    // in custom-family string boundary: <reason>`. Strip that "boundary"
+    // wrapper first, then the historical bare `custom-family invalid
+    // input: ` form, so the `last objective error: …` summary surfaces
+    // the inner reason root cause once — not the doubly-wrapped form
+    // that masked the synthetic-failure marker the outer-objective error
+    // contract pins.
+    let stripped = error
+        .strip_prefix("custom-family invalid input in custom-family string boundary: ")
+        .unwrap_or(error);
+    stripped
         .strip_prefix("custom-family invalid input: ")
-        .unwrap_or(error)
+        .unwrap_or(stripped)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
