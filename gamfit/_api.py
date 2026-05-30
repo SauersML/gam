@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, overload
+from typing import Any, NamedTuple, overload
 
 from ._binding import RustExtensionUnavailableError, extension_status, rust_module
 from ._cuda import cuda_diagnostics as _cuda_diagnostics
@@ -1506,13 +1506,13 @@ def bspline_basis(
     if degree_i < 0:
         raise ValueError(f"degree must be non-negative, got {degree}")
     t_np = _numeric_vector(t, "t")
-    knots_np = _resolve_knots(knots, t_np, label="knots", degree=degree_i)
+    knots_np, eff_degree, _shrunk = _resolve_knots(knots, t_np, label="knots", degree=degree_i)
     try:
         return np.asarray(
             rust_module().bspline_basis(
                 t_np,
                 knots_np,
-                degree_i,
+                eff_degree,
                 bool(periodic),
             ),
             dtype=float,
@@ -1542,13 +1542,13 @@ def bspline_basis_derivative(
     if order_i < 0:
         raise ValueError(f"order must be non-negative, got {order}")
     t_np = _numeric_vector(t, "t")
-    knots_np = _resolve_knots(knots, t_np, label="knots", degree=degree_i)
+    knots_np, eff_degree, _shrunk = _resolve_knots(knots, t_np, label="knots", degree=degree_i)
     try:
         return np.asarray(
             rust_module().bspline_basis_derivative(
                 t_np,
                 knots_np,
-                degree_i,
+                eff_degree,
                 order_i,
                 bool(periodic),
             ),
@@ -2287,21 +2287,25 @@ def _resolve_position_basis_inputs(
     )
     effective_kind, order, _ = _normalize_position_basis(display_kind, basis_order)
     t_np = _numeric_vector(t, "t")
-    knots_np = _resolve_basis_locations(
+    knots_np, eff_order, _shrunk = _resolve_basis_locations(
         knots_or_centers,
         t_np,
         basis_kind=effective_kind,
         label="knots_or_centers",
         degree=order,
     )
+    # Auto-knot derivation may downgrade the degree for small n (#340); the
+    # resolved knot vector is clamped for ``eff_order``, so the penalty and the
+    # downstream FFI basis build must both use the effective order to stay
+    # consistent with it.
     penalty_np = _resolve_position_penalty(
         penalty,
         knots_np,
         basis_kind=display_kind,
-        basis_order=order,
+        basis_order=eff_order,
         periodic=periodic,
     )
-    return display_kind, effective_kind, order, t_np, knots_np, penalty_np
+    return display_kind, effective_kind, eff_order, t_np, knots_np, penalty_np
 
 
 def gaussian_reml_fit_positions(
@@ -3508,33 +3512,63 @@ def _resolve_centers(centers: Any, t_arr: Any, *, label: str = "centers") -> Any
     return _numeric_vector(centers, label)
 
 
+class _ResolvedBasisLocations(NamedTuple):
+    """Outcome of resolving a basis-location argument (knots or centers).
+
+    ``order`` is the spline *degree* (B-spline) or *m*-order (Duchon) that the
+    ``locations`` vector was actually built for. For auto-derived B-spline
+    knots it can differ from the requested degree: the Rust engine auto-shrinks
+    cubic → quadratic → linear when ``n`` is too small (issue #340), and the
+    clamped knot vector then carries boundary multiplicity ``order + 1``.
+    Evaluating it with any other degree fails ("insufficient knots") or breaks
+    the partition-of-unity, so callers MUST use this effective ``order`` for
+    every downstream basis/penalty build rather than the requested one.
+
+    ``shrunk`` is ``True`` iff the auto-shrink reduced the requested
+    ``(degree, num_internal_knots)``.
+    """
+
+    locations: Any
+    order: int
+    shrunk: bool
+
+
 def _resolve_knots(
     knots: Any,
     t_arr: Any,
     *,
     label: str = "knots",
     degree: int = 3,
-) -> Any:
-    """Coerce ``knots`` (None / int / array) into a 1D float64 array.
+) -> _ResolvedBasisLocations:
+    """Coerce ``knots`` (None / int / array) into a resolved knot vector.
 
-    Auto-derivation delegates to the Rust ``auto_knots_1d`` FFI export.
+    Auto-derivation delegates to the Rust ``auto_knots_1d`` FFI export, which
+    returns ``(knots, effective_degree, num_internal_knots, shrunk)`` (issue
+    #340). We surface the knot vector together with the **effective** degree so
+    the auto-shrink decision stays consistent with downstream evaluation; the
+    explicit-array path passes the requested degree straight through unshrunk.
     """
     degree_i = int(degree)
     if degree_i < 0:
         raise ValueError(f"{label}: degree must be non-negative, got {degree}")
-    if knots is None:
-        return _numpy_module().asarray(
-            rust_module().auto_knots_1d(t_arr, int(_DEFAULT_BASIS_K), degree_i),
-            dtype=float,
+    if knots is None or (isinstance(knots, int) and not isinstance(knots, bool)):
+        if knots is None:
+            requested_internal = int(_DEFAULT_BASIS_K)
+        else:
+            if knots < 0:
+                raise ValueError(
+                    f"{label}: integer interior-knot count must be >= 0, got {knots}"
+                )
+            requested_internal = int(knots)
+        knot_vec, eff_degree, _eff_internal, shrunk = rust_module().auto_knots_1d(
+            t_arr, requested_internal, degree_i
         )
-    if isinstance(knots, int) and not isinstance(knots, bool):
-        if knots < 0:
-            raise ValueError(f"{label}: integer interior-knot count must be >= 0, got {knots}")
-        return _numpy_module().asarray(
-            rust_module().auto_knots_1d(t_arr, int(knots), degree_i),
-            dtype=float,
+        return _ResolvedBasisLocations(
+            _numpy_module().asarray(knot_vec, dtype=float),
+            int(eff_degree),
+            bool(shrunk),
         )
-    return _numeric_vector(knots, label)
+    return _ResolvedBasisLocations(_numeric_vector(knots, label), degree_i, False)
 
 
 def _numpy_module() -> Any:
@@ -3551,7 +3585,7 @@ def _resolve_basis_locations(
     basis_kind: str,
     label: str = "knots_or_centers",
     degree: int = 3,
-) -> Any:
+) -> _ResolvedBasisLocations:
     """Resolve the basis-location argument for kind-dispatched primitives.
 
     Mirrors :func:`_resolve_centers` for ``basis_kind == "duchon"`` and
@@ -3559,7 +3593,11 @@ def _resolve_basis_locations(
     """
     kind = str(basis_kind).strip().lower().replace("_", "").replace("-", "")
     if kind in {"duchon", "duchonspline"}:
-        return _resolve_centers(arg, t_arr, label=label)
+        # Duchon centers carry no degree concept and are never auto-shrunk, so
+        # the requested order passes straight through.
+        return _ResolvedBasisLocations(
+            _resolve_centers(arg, t_arr, label=label), int(degree), False
+        )
     return _resolve_knots(arg, t_arr, label=label, degree=degree)
 
 
