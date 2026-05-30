@@ -68,8 +68,10 @@ use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+    load_csvwith_inferred_schema,
 };
 use ndarray::Array2;
+use std::path::Path;
 
 /// Monte-Carlo CRPS for one observed time `t_obs` against a predictive sample
 /// `y` (the spec's two-sum estimator). `O(M^2)` but `M=1000` keeps it cheap.
@@ -404,6 +406,326 @@ emit("sigma", [float(np.exp(sigma_params["Intercept"]))])
         gam_crps <= ref_crps * 1.05,
         "gam CRPS does not match-or-beat the lifelines baseline: gam {gam_crps:.5} \
          > 1.05 * ref {ref_crps:.5}"
+    );
+}
+
+/// REAL-DATA ARM. Same capability (lognormal location-scale AFT predictive
+/// calibration via held-out CRPS) exercised on the classic **Veterans'
+/// Administration lung-cancer trial** survival dataset, where the truth is
+/// UNKNOWN — so the pass criterion is purely out-of-sample predictive quality.
+///
+/// Source: `bench/datasets/veteran_lung.csv`, the canonical `survival::veteran`
+/// data shipped with R's `survival` package (Kalbfleisch & Prentice, "The
+/// Statistical Analysis of Failure Time Data"). Columns: `time` (survival days),
+/// `status` (1 = death observed, 0 = right-censored), `karno` (Karnofsky
+/// performance score, the dominant prognostic covariate), `age` (years), plus
+/// trt/celltype/diagtime/prior. n = 137, ~7% censoring.
+///
+/// We make a deterministic train/test split (every 4th row held out, fixed
+/// index), fit gam's lognormal AFT `Surv(time, status) ~ karno + s(age, ...)` on
+/// the training rows only, and predict the held-out rows. Because the true
+/// data-generating distribution is unknown, calibration is scored by Monte-Carlo
+/// CRPS of the predictive LogNormal against the held-out OBSERVED event times
+/// (test rows with status == 1; censored test rows carry no exact outcome to
+/// score against, so they are excluded from the proper score). Two OBJECTIVE
+/// bounds, no "match lifelines' numbers" criterion:
+///
+///   PRIMARY (objective, tool-free): the covariate-aware fit must beat the
+///     intercept-only lognormal baseline ("the oracle one can build with no
+///     covariates") on held-out CRPS — `gam_crps <= baseline_crps * 0.97`. A
+///     model whose covariates do not improve the proper score over a constant
+///     predictor has not learned anything generalizable.
+///
+///   BASELINE (match-or-beat): lifelines' `LogNormalAFTFitter`, fit on the SAME
+///     training rows (with a cubic basis in age to chase the smooth) and scored
+///     on the SAME held-out observed times with the SAME shared Monte-Carlo
+///     deviates, is a baseline to match-or-beat: `gam_crps <= ref_crps * 1.05`.
+#[test]
+fn gam_lognormal_aft_crps_calibration_matches_lifelines_on_real_data() {
+    init_parallelism();
+
+    // ---- load the real Veterans' lung-cancer survival data ------------------
+    let ds = load_csvwith_inferred_schema(Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/bench/datasets/veteran_lung.csv"
+    )))
+    .expect("load veteran_lung.csv");
+    let col = ds.column_map();
+    let time_idx = col["time"];
+    let status_idx = col["status"];
+    let karno_idx = col["karno"];
+    let age_idx = col["age"];
+    let p = ds.headers.len();
+
+    let time_all: Vec<f64> = ds.values.column(time_idx).to_vec();
+    let status_all: Vec<f64> = ds.values.column(status_idx).to_vec();
+    let karno_all: Vec<f64> = ds.values.column(karno_idx).to_vec();
+    let age_all: Vec<f64> = ds.values.column(age_idx).to_vec();
+    let n = time_all.len();
+    assert!(n > 120, "veteran_lung should have 137 rows, got {n}");
+
+    // ---- deterministic train/test split: every 4th row held out ------------
+    let is_test = |i: usize| i % 4 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    assert!(
+        train_rows.len() > 90 && test_rows.len() > 25,
+        "split sizes: train={} test={}",
+        train_rows.len(),
+        test_rows.len()
+    );
+
+    // Training-row columns (handed to lifelines verbatim, same order as gam).
+    let train_time: Vec<f64> = train_rows.iter().map(|&i| time_all[i]).collect();
+    let train_status: Vec<f64> = train_rows.iter().map(|&i| status_all[i]).collect();
+    let train_karno: Vec<f64> = train_rows.iter().map(|&i| karno_all[i]).collect();
+    let train_age: Vec<f64> = train_rows.iter().map(|&i| age_all[i]).collect();
+
+    // Held-out test-row covariates / outcomes (gam and the metric read these).
+    let test_time: Vec<f64> = test_rows.iter().map(|&i| time_all[i]).collect();
+    let test_status: Vec<f64> = test_rows.iter().map(|&i| status_all[i]).collect();
+    let test_karno: Vec<f64> = test_rows.iter().map(|&i| karno_all[i]).collect();
+    let test_age: Vec<f64> = test_rows.iter().map(|&i| age_all[i]).collect();
+
+    // Observed (uncensored) held-out events: the only rows with an exact time to
+    // score the proper CRPS against. There must be enough of them to be a real
+    // calibration test (veteran is ~7% censored, so nearly all qualify).
+    let test_observed: Vec<usize> = (0..test_rows.len())
+        .filter(|&i| test_status[i] > 0.5)
+        .collect();
+    assert!(
+        test_observed.len() > 20,
+        "too few observed held-out events to score CRPS: {} of {}",
+        test_observed.len(),
+        test_rows.len()
+    );
+
+    // Build a training-only dataset by sub-setting the encoded rows; headers,
+    // schema and column kinds are unchanged so the formula resolves identically.
+    let mut train_values = Array2::<f64>::zeros((train_rows.len(), p));
+    for (out_row, &src_row) in train_rows.iter().enumerate() {
+        for c in 0..p {
+            train_values[[out_row, c]] = ds.values[[src_row, c]];
+        }
+    }
+    let mut train_ds = ds.clone();
+    train_ds.values = train_values;
+
+    // ---- fit gam on TRAIN: lognormal location-scale AFT with s(age) --------
+    let cfg = FitConfig {
+        survival_likelihood: "location-scale".to_string(),
+        survival_distribution: "gaussian".to_string(),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula(
+        r#"Surv(time, status) ~ karno + s(age, bs="tp", k=5)"#,
+        &train_ds,
+        &cfg,
+    )
+    .expect("gam lognormal location-scale AFT fit on veteran train");
+    let FitResult::SurvivalLocationScale(fit) = result else {
+        panic!("expected a survival location-scale fit result");
+    };
+    let unified = &fit.fit.fit;
+    assert!(
+        unified.outer_converged,
+        "gam veteran lognormal-AFT outer optimizer did not converge: iters={} grad_norm={:?}",
+        unified.outer_iterations, unified.outer_gradient_norm
+    );
+
+    let beta_location = unified.beta_threshold();
+    let beta_log_sigma = unified.beta_log_sigma();
+    assert!(
+        beta_location
+            .iter()
+            .chain(beta_log_sigma.iter())
+            .all(|v| v.is_finite()),
+        "non-finite gam location / log-sigma coefficients"
+    );
+
+    // gam location mu_gam at the HELD-OUT test points: rebuild the frozen
+    // location (threshold) design from `resolved_thresholdspec` and apply the
+    // converged location coefficients (same rebuild pattern as the synthetic arm).
+    let mut test_grid = Array2::<f64>::zeros((test_rows.len(), p));
+    for (i, &row) in test_rows.iter().enumerate() {
+        test_grid[[i, karno_idx]] = karno_all[row];
+        test_grid[[i, age_idx]] = age_all[row];
+    }
+    let loc_design = build_term_collection_design(test_grid.view(), &fit.fit.resolved_thresholdspec)
+        .expect("rebuild location (threshold) design at held-out points");
+    let gam_mu_test: Vec<f64> = loc_design.design.apply(&beta_location).to_vec();
+    assert_eq!(gam_mu_test.len(), test_rows.len());
+
+    // Constant log-scale channel: sigma = exp(eta_ls) (no noise_formula).
+    let ls_design = build_term_collection_design(test_grid.view(), &fit.fit.resolved_log_sigmaspec)
+        .expect("rebuild log-sigma design at held-out points");
+    let gam_eta_ls: Vec<f64> = ls_design.design.apply(&beta_log_sigma).to_vec();
+    assert!(
+        gam_eta_ls.iter().all(|&v| (v - gam_eta_ls[0]).abs() < 1e-9),
+        "expected a constant (covariate-independent) log-scale channel, got {gam_eta_ls:?}"
+    );
+    let gam_sigma = gam_eta_ls[0].exp();
+
+    // gam's location uses a learned monotone time-warp h(t), so its absolute
+    // level differs from log-time by an unknown additive gauge constant. We
+    // calibrate that single offset on the TRAINING observed events (matching
+    // gam's predicted location to the realized log-times in the mean), then
+    // apply it to the held-out predictions — a one-parameter re-gauge estimated
+    // only on train, never on the test outcomes being scored.
+    let mut train_grid = Array2::<f64>::zeros((train_rows.len(), p));
+    for (i, &row) in train_rows.iter().enumerate() {
+        train_grid[[i, karno_idx]] = karno_all[row];
+        train_grid[[i, age_idx]] = age_all[row];
+    }
+    let train_loc_design =
+        build_term_collection_design(train_grid.view(), &fit.fit.resolved_thresholdspec)
+            .expect("rebuild location design at training points");
+    let gam_mu_train: Vec<f64> = train_loc_design.design.apply(&beta_location).to_vec();
+    let train_obs: Vec<usize> = (0..train_rows.len())
+        .filter(|&i| train_status[i] > 0.5)
+        .collect();
+    let train_logt_mean =
+        train_obs.iter().map(|&i| train_time[i].ln()).sum::<f64>() / train_obs.len() as f64;
+    let train_mu_mean = train_obs.iter().map(|&i| gam_mu_train[i]).sum::<f64>() / train_obs.len() as f64;
+    let gam_offset = train_mu_mean - train_logt_mean;
+    let gam_mu_test_anchored: Vec<f64> = gam_mu_test.iter().map(|&mu| mu - gam_offset).collect();
+
+    // ---- shared common-random-number Monte-Carlo deviates ------------------
+    let m_mc = 1000usize;
+    let mut mc_rng = NumpyMt19937::new(987654321);
+    let mc_eps: Vec<f64> = (0..m_mc).map(|_| mc_rng.next_standard_normal()).collect();
+
+    // ---- intercept-only lognormal baseline (the no-covariate "oracle") -----
+    // Fit a constant location + scale on the training observed log-times; this
+    // is the best a model with NO covariates can do, and gam must beat it.
+    let base_mu = train_logt_mean;
+    let base_var = train_obs
+        .iter()
+        .map(|&i| {
+            let d = train_time[i].ln() - train_logt_mean;
+            d * d
+        })
+        .sum::<f64>()
+        / train_obs.len() as f64;
+    let base_sigma = base_var.sqrt();
+
+    // ---- fit the SAME train rows with lifelines.LogNormalAFTFitter ---------
+    // Identical (time, status, karno, age) training columns handed over as one
+    // data.frame; lifelines is log-LINEAR, so it gets a cubic basis in age to
+    // chase the smooth. It emits the per-TEST-row location mu_i and the constant
+    // scale so the SAME Rust CRPS estimator with the SAME shared eps scores it.
+    // Within this single call every column is TRAIN length; the held-out test
+    // covariates ride along right-padded and only the first k entries are read.
+    let pad_to = |v: &[f64], len: usize| -> Vec<f64> {
+        let fill = v.last().copied().unwrap_or(0.0);
+        let mut out = v.to_vec();
+        out.resize(len, fill);
+        out
+    };
+    let ntr = train_rows.len();
+    let body = r#"
+import numpy as np
+import pandas as pd
+from lifelines import LogNormalAFTFitter
+
+frame = pd.DataFrame({
+    "time": np.asarray(df["time"], dtype=float),
+    "status": np.asarray(df["status"], dtype=float),
+    "karno": np.asarray(df["karno"], dtype=float),
+    "age": np.asarray(df["age"], dtype=float),
+})
+frame["age2"] = frame["age"] ** 2
+frame["age3"] = frame["age"] ** 3
+aft = LogNormalAFTFitter(penalizer=1e-4)
+aft.fit(frame, duration_col="time", event_col="status",
+        formula="karno + age + age2 + age3")
+
+# Per-test-row location mu_i. For a LogNormal AFT the median time is exp(mu_i),
+# so mu_i = log(predict_median). Using lifelines' own prediction API (rather
+# than reconstructing the design from string-labeled params) is robust to the
+# formula-engine's coefficient naming across versions.
+k = int(df["test_n"].to_numpy()[0])
+ta = np.asarray(df["test_age"], dtype=float)[:k]
+test_frame = pd.DataFrame({
+    "karno": np.asarray(df["test_karno"], dtype=float)[:k],
+    "age": ta,
+    "age2": ta ** 2,
+    "age3": ta ** 3,
+})
+median = np.asarray(aft.predict_median(test_frame), dtype=float).reshape(-1)
+emit("mu", np.log(median))
+
+# Constant scale: sigma = exp(sigma_ intercept on the log scale).
+sigma_params = aft.params_.loc["sigma_"]
+emit("sigma", [float(np.exp(sigma_params["Intercept"]))])
+"#;
+    let r = run_python(
+        &[
+            Column::new("time", &train_time),
+            Column::new("status", &train_status),
+            Column::new("karno", &train_karno),
+            Column::new("age", &train_age),
+            Column::new("test_karno", &pad_to(&test_karno, ntr)),
+            Column::new("test_age", &pad_to(&test_age, ntr)),
+            Column::new("test_n", &vec![test_rows.len() as f64; ntr]),
+        ],
+        body,
+    );
+    let ref_mu = r.vector("mu");
+    let ref_sigma = r.scalar("sigma");
+    assert_eq!(
+        ref_mu.len(),
+        test_rows.len(),
+        "lifelines held-out mu length mismatch"
+    );
+
+    // ---- Monte-Carlo CRPS on the held-out OBSERVED events ------------------
+    // Shared eps for gam, lifelines, and the intercept-only baseline (common
+    // random numbers), scored against the realized test event times.
+    let mut gam_crps_sum = 0.0;
+    let mut ref_crps_sum = 0.0;
+    let mut base_crps_sum = 0.0;
+    let mut gam_y = vec![0.0f64; m_mc];
+    let mut ref_y = vec![0.0f64; m_mc];
+    let mut base_y = vec![0.0f64; m_mc];
+    for &i in &test_observed {
+        let gmu = gam_mu_test_anchored[i];
+        let rmu = ref_mu[i];
+        for (j, &e) in mc_eps.iter().enumerate() {
+            gam_y[j] = (gmu + gam_sigma * e).exp();
+            ref_y[j] = (rmu + ref_sigma * e).exp();
+            base_y[j] = (base_mu + base_sigma * e).exp();
+        }
+        let t_obs = test_time[i];
+        gam_crps_sum += crps_sample(t_obs, &gam_y);
+        ref_crps_sum += crps_sample(t_obs, &ref_y);
+        base_crps_sum += crps_sample(t_obs, &base_y);
+    }
+    let n_obs = test_observed.len() as f64;
+    let gam_crps = gam_crps_sum / n_obs;
+    let ref_crps = ref_crps_sum / n_obs;
+    let base_crps = base_crps_sum / n_obs;
+
+    eprintln!(
+        "veteran lognormal-AFT held-out CRPS: n_train={ntr} n_test={} n_obs={} \
+         gam_sigma={gam_sigma:.4} ref_sigma={ref_sigma:.4} base_sigma={base_sigma:.4} \
+         gam_crps={gam_crps:.4} ref_crps={ref_crps:.4} base_crps={base_crps:.4}",
+        test_rows.len(),
+        test_observed.len(),
+    );
+
+    // ---- PRIMARY objective: beat the no-covariate lognormal baseline -------
+    assert!(
+        gam_crps <= base_crps * 0.97,
+        "gam covariate fit did not improve held-out CRPS over the intercept-only \
+         baseline: gam {gam_crps:.4} > 0.97 * base {base_crps:.4}"
+    );
+
+    // ---- BASELINE (match-or-beat): no worse than lifelines on held-out CRPS -
+    assert!(
+        gam_crps <= ref_crps * 1.05,
+        "gam held-out CRPS does not match-or-beat the lifelines baseline: \
+         gam {gam_crps:.4} > 1.05 * ref {ref_crps:.4}"
     );
 }
 

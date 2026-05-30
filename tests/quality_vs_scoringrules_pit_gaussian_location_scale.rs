@@ -53,11 +53,13 @@ use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::solver::estimate::BlockRole;
-use gam::test_support::reference::{Column, max_abs_diff, run_python};
+use gam::test_support::reference::{Column, max_abs_diff, run_python, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+    load_csvwith_inferred_schema,
 };
 use ndarray::Array2;
+use std::path::Path;
 
 /// gam's sigma link offset (`sigma = LOGB_SIGMA_FLOOR + exp(eta_scale)`), the
 /// same offset-exponential scale link used throughout gam's Gaussian
@@ -324,4 +326,220 @@ emit("bin_counts", counts.astype(float))
         "held-out PIT is not uniform => gam's location-scale fit is mis-calibrated: \
          KS(gam)={ks_gam:.4} (bound 0.15), scipy p={ks_pvalue:.4}"
     );
+}
+
+/// Real-data arm of the PIT calibration proof.
+///
+/// SOURCE: `gagurine` from the R `MASS` package (Venables & Ripley, *Modern
+/// Applied Statistics with S*). 314 rows of children's urinary GAG
+/// (glycosaminoglycan) concentration vs `Age` (years). GAG falls sharply with
+/// age AND its spread shrinks markedly with age — textbook heteroscedasticity,
+/// so a *location-scale* model is genuinely required. There is no known truth
+/// function, so quality is judged by held-out calibration, exactly as the
+/// synthetic arm above but on real, messy data.
+///
+/// OBJECTIVE METRIC: the Kolmogorov-Smirnov distance `D = sup_u |F_n(u) - u|`
+/// between gam's OWN held-out PIT values `u_i = Phi((y_i - mu_i)/sigma_i)` and
+/// `Uniform(0,1)`, computed here in plain Rust. A model that mis-fits the
+/// declining mean or fails to track the shrinking variance produces a
+/// non-uniform PIT and a large `D`.
+///
+///   PRIMARY (objective, tool-free): held-out `D < 0.115`. With 79 hold-out
+///     points the asymptotic 5% KS critical value is `~1.358/sqrt(79)=0.153`;
+///     0.115 sits comfortably inside it, so a mis-calibrated (over/under-
+///     dispersed or biased) fit fails. This references no other tool.
+///
+///   BASELINE (match-or-beat): `gamlss` (the mature distributional-regression
+///     standard) fits the SAME training rows with `NO()` (Normal, identity
+///     mean, log sigma) and predicts the SAME held-out rows; we compute gamlss's
+///     held-out PIT KS the SAME way and require `D_gam <= D_gamlss + 0.03`. gamlss
+///     is a baseline to match-or-beat on calibration, never a fit to reproduce.
+#[test]
+fn gam_location_scale_pit_is_calibrated_on_holdout_on_real_data() {
+    init_parallelism();
+
+    // ---- load the real gagurine dataset (Age -> GAG) -----------------------
+    let csv = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/gagurine.csv");
+    let ds = load_csvwith_inferred_schema(Path::new(csv)).expect("load gagurine.csv");
+    let col = ds.column_map();
+    let age_idx = col["Age"];
+    let gag_idx = col["GAG"];
+    let age: Vec<f64> = ds.values.column(age_idx).to_vec();
+    let gag: Vec<f64> = ds.values.column(gag_idx).to_vec();
+    let n = age.len();
+    assert!(n > 300, "gagurine should have ~314 rows, got {n}");
+
+    // ---- deterministic train/test split: every 4th row held out -----------
+    let is_test = |i: usize| i % 4 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    let n_test = test_rows.len();
+    assert!(
+        train_rows.len() > 200 && n_test > 60,
+        "split sizes: train={} test={}",
+        train_rows.len(),
+        n_test
+    );
+
+    let train_age: Vec<f64> = train_rows.iter().map(|&i| age[i]).collect();
+    let train_gag: Vec<f64> = train_rows.iter().map(|&i| gag[i]).collect();
+    let test_age: Vec<f64> = test_rows.iter().map(|&i| age[i]).collect();
+    let test_gag: Vec<f64> = test_rows.iter().map(|&i| gag[i]).collect();
+
+    // ---- fit gam on the TRAIN rows only ------------------------------------
+    // Build a training-only dataset by sub-setting the encoded rows; headers,
+    // schema and column kinds are unchanged so the formula resolves identically.
+    let p = ds.headers.len();
+    let mut train_values = Array2::<f64>::zeros((train_rows.len(), p));
+    for (out_row, &src_row) in train_rows.iter().enumerate() {
+        for c in 0..p {
+            train_values[[out_row, c]] = ds.values[[src_row, c]];
+        }
+    }
+    let mut train_ds = ds.clone();
+    train_ds.values = train_values;
+
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        noise_formula: Some("1 + s(Age, k=8)".to_string()),
+        ..FitConfig::default()
+    };
+    let result =
+        fit_from_formula("GAG ~ s(Age, k=8)", &train_ds, &cfg).expect("gam location-scale fit");
+    let FitResult::GaussianLocationScale(fit) = result else {
+        panic!("expected a GaussianLocationScale fit for a Gaussian noise_formula model");
+    };
+
+    let mean_block = fit
+        .fit
+        .fit
+        .block_by_role(BlockRole::Location)
+        .expect("location-scale fit must carry a Location (mean) block");
+    let beta_mean = mean_block.beta.clone();
+    let scale_block = fit
+        .fit
+        .fit
+        .block_by_role(BlockRole::Scale)
+        .expect("smooth noise_formula must carry a Scale (log-sigma) block");
+    let beta_scale = scale_block.beta.clone();
+    assert!(
+        beta_scale.len() >= 2,
+        "noise_formula `1 + s(Age, k=8)` must materialize a multi-coefficient scale basis, got {}",
+        beta_scale.len()
+    );
+
+    // ---- predict mu and sigma at the held-out Age (frozen specs) -----------
+    let mut grid = Array2::<f64>::zeros((n_test, p));
+    for (row, &a) in test_age.iter().enumerate() {
+        grid[[row, age_idx]] = a;
+    }
+    let mean_design = build_term_collection_design(grid.view(), &fit.fit.meanspec_resolved)
+        .expect("rebuild mean design at hold-out Age");
+    let noise_design = build_term_collection_design(grid.view(), &fit.fit.noisespec_resolved)
+        .expect("rebuild noise design at hold-out Age");
+    assert_eq!(
+        mean_design.design.ncols(),
+        beta_mean.len(),
+        "hold-out mean design columns ({}) must match mean coefficient count ({})",
+        mean_design.design.ncols(),
+        beta_mean.len()
+    );
+    assert_eq!(
+        noise_design.design.ncols(),
+        beta_scale.len(),
+        "hold-out noise design columns ({}) must match scale coefficient count ({})",
+        noise_design.design.ncols(),
+        beta_scale.len()
+    );
+
+    let mu: Vec<f64> = mean_design.design.apply(&beta_mean).to_vec();
+    let eta_scale = noise_design.design.apply(&beta_scale);
+    let sigma: Vec<f64> = eta_scale
+        .iter()
+        .map(|&e| LOGB_SIGMA_FLOOR + e.exp())
+        .collect();
+    assert!(
+        sigma.iter().all(|&s| s > 0.0 && s.is_finite()),
+        "predicted sigma must be positive and finite"
+    );
+
+    // ---- gam's PIT on its own held-out predictions, KS to U(0,1) in Rust ---
+    let pit: Vec<f64> = (0..n_test)
+        .map(|i| standard_normal_cdf((test_gag[i] - mu[i]) / sigma[i]))
+        .collect();
+    let ks_gam = ks_distance_to_uniform(&pit);
+
+    // ---- gamlss baseline: SAME train rows, predict SAME held-out rows ------
+    // gamlss returns mu/sigma on the held-out Age; we compute its held-out PIT
+    // and KS the SAME way in Rust so the comparison is apples-to-apples. To keep
+    // every Column in one run_r call equal length we predict inside R from a
+    // separate newdata built from a parallel test column padded to train length.
+    let r = run_r(
+        &[
+            Column::new("Age", &train_age),
+            Column::new("GAG", &train_gag),
+            Column::new("test_Age", &pad_to(&test_age, train_age.len())),
+            Column::new("test_n", &vec![n_test as f64; train_age.len()]),
+        ],
+        r#"
+        suppressPackageStartupMessages(library(gamlss))
+        ctrl <- gamlss.control(trace = FALSE)
+        train <- data.frame(Age = df$Age, GAG = df$GAG)
+        m <- gamlss(GAG ~ pb(Age), sigma.fo = ~ pb(Age), family = NO(),
+                    data = train, control = ctrl)
+        k <- df$test_n[1]
+        nd <- data.frame(Age = df$test_Age[1:k])
+        mu_g  <- as.numeric(predict(m, what = "mu",    newdata = nd, type = "response", data = train))
+        sig_g <- as.numeric(predict(m, what = "sigma", newdata = nd, type = "response", data = train))
+        emit("mu_test", mu_g)
+        emit("sigma_test", sig_g)
+        "#,
+    );
+    let gamlss_mu = r.vector("mu_test");
+    let gamlss_sigma = r.vector("sigma_test");
+    assert_eq!(gamlss_mu.len(), n_test, "gamlss mu test length mismatch");
+    assert_eq!(
+        gamlss_sigma.len(),
+        n_test,
+        "gamlss sigma test length mismatch"
+    );
+    let gamlss_pit: Vec<f64> = (0..n_test)
+        .map(|i| standard_normal_cdf((test_gag[i] - gamlss_mu[i]) / gamlss_sigma[i]))
+        .collect();
+    let ks_gamlss = ks_distance_to_uniform(&gamlss_pit);
+
+    eprintln!(
+        "gagurine PIT calibration (gaussian location-scale, held-out n={n_test}): \
+         ks_gam={ks_gam:.4} ks_gamlss={ks_gamlss:.4}"
+    );
+
+    // ---- PRIMARY objective assertion: gam's held-out PIT ~ U(0,1) ----------
+    // 79 hold-out points => 5% KS critical value ~1.358/sqrt(79)=0.153; 0.115 is
+    // well inside it, so a mis-calibrated fit on this real heteroscedastic data
+    // fails. References no other tool.
+    assert!(
+        ks_gam < 0.115,
+        "held-out PIT on gagurine is not uniform => gam mis-calibrated: KS(gam)={ks_gam:.4} (bound 0.115)"
+    );
+
+    // ---- BASELINE (match-or-beat): no worse than gamlss on the same metric -
+    assert!(
+        ks_gam <= ks_gamlss + 0.03,
+        "gam held-out PIT KS {ks_gam:.4} exceeds gamlss {ks_gamlss:.4} + 0.03"
+    );
+}
+
+/// Right-pad `v` with its last value (or 0.0 when empty) to length `len`, so a
+/// test-length column can ride along inside a train-length reference
+/// data.frame; only the first `v.len()` entries are read back in the R body.
+fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
+    assert!(
+        v.len() <= len,
+        "pad target {len} shorter than source {}",
+        v.len()
+    );
+    let fill = v.last().copied().unwrap_or(0.0);
+    let mut out = v.to_vec();
+    out.resize(len, fill);
+    out
 }

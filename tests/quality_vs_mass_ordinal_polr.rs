@@ -59,11 +59,13 @@ use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+    load_csvwith_inferred_schema,
 };
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Uniform};
+use std::path::Path;
 
 /// Latent periodic x-effect: one clean oscillation over the data window
 /// [-3, 3] with period exactly 6, so g(-3) = g(3) = 0. This honors the seam
@@ -427,5 +429,345 @@ fn gam_continuation_ratio_matches_vgam_sratio() {
         gam_x2_err <= vgam_x2_err * 1.10 + 0.02,
         "gam x2 slope less accurate than VGAM::sratio against truth: \
          gam_err={gam_x2_err:.4} vgam_err={vgam_x2_err:.4}"
+    );
+}
+
+/// REAL-DATA arm of the SAME continuation-ratio (stopping-ratio) ordinal
+/// capability, on the classic Bordeaux wine dataset
+/// (`bench/datasets/wine.csv`; source: Ashenfelter's Bordeaux wine-vintage data
+/// as redistributed via R's `wine`/`Bordeaux` teaching datasets — vintage year,
+/// auction `price`, and the weather covariates `h_rain`, `s_temp`, `w_rain`,
+/// `h_temp`). On REAL data the generative truth is UNKNOWN, so — exactly as the
+/// canonical real-data template (`quality_vs_mgcv_gaussian_smooth.rs`) prescribes
+/// — the objective metric is HELD-OUT predictive quality, NOT truth recovery and
+/// NOT reproduction of the reference's fit.
+///
+/// We turn the continuous vintage `price` into an ORDERED 3-tier quality score
+/// (tier 1 = modest, 2 = mid, 3 = prized) by fixed price thresholds, and model
+/// how the growing-season weather covariates push a vintage up the quality
+/// ladder. This is precisely the ordinal continuation-ratio problem: the natural
+/// "did this vintage clear the next quality threshold?" question is a sequence of
+/// conditional Bernoulli stops, and the stopping-ratio factorization
+///   P(Y=y) = [∏_{j<y}(1-q_j)] · q_y,  q_j = logit^{-1}(θ_j + βᵀcovariates)
+/// is bit-for-bit a binomial-logit GAM on the stacked conditional frame (the same
+/// algebraic identity the synthetic arm above exploits). gam fits the stacked
+/// binomial; `VGAM::vglm(family = sratio(parallel = TRUE))` — the mature standard
+/// ordinal tool — fits the identical stopping-ratio likelihood and is DEMOTED to
+/// a match-or-beat baseline.
+///
+/// Split: a deterministic train/test split (every 3rd surviving row held out).
+/// Both engines see the IDENTICAL train rows and predict the IDENTICAL test rows
+/// in the SAME order. Objective held-out metrics, computed in plain Rust on gam's
+/// own predictions:
+///   PRIMARY (objective, tool-free): held-out multiclass ACCURACY of gam's
+///     arg-max class >= an absolute bar that beats the majority-class predictor;
+///     plus held-out multiclass LOG-LOSS below an absolute bar.
+///   BASELINE (match-or-beat): gam's held-out accuracy >= VGAM's held-out
+///     accuracy minus a small margin, AND gam's held-out log-loss <= VGAM's
+///     held-out log-loss times a small slack.
+#[test]
+fn gam_continuation_ratio_matches_vgam_sratio_on_real_data() {
+    init_parallelism();
+
+    // ---- load the real Bordeaux wine dataset ------------------------------
+    let wine_csv = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/wine.csv");
+    let ds_raw = load_csvwith_inferred_schema(Path::new(wine_csv)).expect("load wine.csv");
+    let col = ds_raw.column_map();
+    let price_idx = col["price"];
+    let s_temp_idx = col["s_temp"];
+    let h_temp_idx = col["h_temp"];
+    let price_all: Vec<f64> = ds_raw.values.column(price_idx).to_vec();
+    let s_temp_all: Vec<f64> = ds_raw.values.column(s_temp_idx).to_vec();
+    let h_temp_all: Vec<f64> = ds_raw.values.column(h_temp_idx).to_vec();
+    let n_all = price_all.len();
+    assert!(n_all > 40, "wine.csv should have ~47 vintages, got {n_all}");
+
+    // Keep only the vintages with a recorded auction price (later years carry
+    // NA price and load as NaN); standardize the two weather covariates so the
+    // shared linear slopes are on a comparable scale for both engines.
+    let usable: Vec<usize> = (0..n_all)
+        .filter(|&i| price_all[i].is_finite() && s_temp_all[i].is_finite() && h_temp_all[i].is_finite())
+        .collect();
+    let n = usable.len();
+    assert!(n > 30, "expected >30 priced vintages, got {n}");
+
+    let s_raw: Vec<f64> = usable.iter().map(|&i| s_temp_all[i]).collect();
+    let h_raw: Vec<f64> = usable.iter().map(|&i| h_temp_all[i]).collect();
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    let sd = |v: &[f64], m: f64| {
+        (v.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / v.len() as f64).sqrt()
+    };
+    let (s_m, h_m) = (mean(&s_raw), mean(&h_raw));
+    let (s_s, h_s) = (sd(&s_raw, s_m).max(1e-9), sd(&h_raw, h_m).max(1e-9));
+    let s_temp: Vec<f64> = s_raw.iter().map(|x| (x - s_m) / s_s).collect();
+    let h_temp: Vec<f64> = h_raw.iter().map(|x| (x - h_m) / h_s).collect();
+
+    // ---- ordered 3-tier quality score from auction price ------------------
+    // Fixed price thresholds (currency units) split the priced vintages into
+    // ordered tiers: modest (Y=1, price <= 16), mid (Y=2, 16 < price <= 25),
+    // prized (Y=3, price > 25). J = 3 ordered levels => cutpoints {1, 2}.
+    let to_tier = |p: f64| -> f64 {
+        if p <= 16.0 {
+            1.0
+        } else if p <= 25.0 {
+            2.0
+        } else {
+            3.0
+        }
+    };
+    let y: Vec<f64> = usable.iter().map(|&i| to_tier(price_all[i])).collect();
+    let n_levels = 3usize;
+
+    // ---- deterministic train/test split: every 3rd usable row held out ----
+    let is_test = |i: usize| i % 3 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    assert!(
+        train_rows.len() > 18 && test_rows.len() >= 10,
+        "split sizes: train={} test={}",
+        train_rows.len(),
+        test_rows.len()
+    );
+
+    let train_s: Vec<f64> = train_rows.iter().map(|&i| s_temp[i]).collect();
+    let train_h: Vec<f64> = train_rows.iter().map(|&i| h_temp[i]).collect();
+    let train_y: Vec<f64> = train_rows.iter().map(|&i| y[i]).collect();
+    let test_s: Vec<f64> = test_rows.iter().map(|&i| s_temp[i]).collect();
+    let test_h: Vec<f64> = test_rows.iter().map(|&i| h_temp[i]).collect();
+    let test_y: Vec<f64> = test_rows.iter().map(|&i| y[i]).collect();
+
+    // ---- build gam's stacked stopping-ratio binomial frame on TRAIN -------
+    // For each train obs and each cutpoint j it reached (Y >= j), emit a binary
+    // row z = 1{Y == j} with shared covariates s_temp, h_temp and the cutpoint
+    // dummy thr2 = 1{j >= 2}. J=3 means one cutpoint dummy (j=1 baseline). The
+    // summed Bernoulli log-likelihood over these rows IS the stopping-ratio
+    // multinomial log-likelihood (chain-rule factorization), identical to the
+    // model VGAM::sratio fits.
+    let cutpoints = [1.0_f64, 2.0];
+    let mut sx_s = Vec::new();
+    let mut sx_h = Vec::new();
+    let mut sthr2 = Vec::new();
+    let mut sz = Vec::new();
+    for &gi in &train_rows {
+        for &j in &cutpoints {
+            if y[gi] < j {
+                continue;
+            }
+            sx_s.push(s_temp[gi]);
+            sx_h.push(h_temp[gi]);
+            sthr2.push(if j >= 2.0 { 1.0 } else { 0.0 });
+            sz.push(if (y[gi] - j).abs() < 0.5 { 1.0 } else { 0.0 });
+        }
+    }
+    let n_stack = sz.len();
+    assert!(
+        n_stack > train_rows.len(),
+        "stacked frame should have >train rows of conditional rows"
+    );
+
+    let headers = ["z", "s_temp", "h_temp", "thr2"]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>();
+    let rows = (0..n_stack)
+        .map(|r| {
+            csv::StringRecord::from(vec![
+                sz[r].to_string(),
+                sx_s[r].to_string(),
+                sx_h[r].to_string(),
+                sthr2[r].to_string(),
+            ])
+        })
+        .collect::<Vec<_>>();
+    let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode stacked wine frame");
+    let colmap = ds.column_map();
+    let s_col = colmap["s_temp"];
+    let h_col = colmap["h_temp"];
+    let thr2_col = colmap["thr2"];
+    let n_headers = ds.headers.len();
+
+    // ---- fit gam on TRAIN: stacked binomial stopping-ratio ----------------
+    // Shared LINEAR weather slopes (s_temp + h_temp) plus the cutpoint dummy.
+    // n is small (real vintage data), so a parametric shared-slope predictor is
+    // the honest model; this is the same parallel-slope structure VGAM uses.
+    let cfg = FitConfig {
+        family: Some("binomial".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula("z ~ s_temp + h_temp + thr2", &ds, &cfg)
+        .expect("gam stopping-ratio (stacked binomial) fit on wine train");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected a standard binomial GAM fit");
+    };
+    let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
+
+    // Helper: gam logit-scale eta = design * beta at given rows.
+    let gam_eta = |ss: &[f64], hs: &[f64], thr2s: &[f64]| -> Vec<f64> {
+        let m = ss.len();
+        let mut grid = Array2::<f64>::zeros((m, n_headers));
+        for r in 0..m {
+            grid[[r, s_col]] = ss[r];
+            grid[[r, h_col]] = hs[r];
+            grid[[r, thr2_col]] = thr2s[r];
+        }
+        let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
+            .expect("rebuild gam design at wine test rows");
+        design.design.apply(&fit.fit.beta).to_vec()
+    };
+
+    // Conditional stopping probs q_j = P(Y=j | Y>=j) at each TEST row, then the
+    // unconditional class probs by the chain rule. For J=3:
+    //   P(1)=q1, P(2)=(1-q1)q2, P(3)=(1-q1)(1-q2).
+    let n_test = test_rows.len();
+    let q1 = {
+        let thr2s = vec![0.0; n_test];
+        gam_eta(&test_s, &test_h, &thr2s)
+            .iter()
+            .map(|&e| inv_logit(e))
+            .collect::<Vec<f64>>()
+    };
+    let q2 = {
+        let thr2s = vec![1.0; n_test];
+        gam_eta(&test_s, &test_h, &thr2s)
+            .iter()
+            .map(|&e| inv_logit(e))
+            .collect::<Vec<f64>>()
+    };
+    let mut gam_test_probs: Vec<[f64; 3]> = Vec::with_capacity(n_test);
+    for r in 0..n_test {
+        let p1 = q1[r];
+        let p2 = (1.0 - q1[r]) * q2[r];
+        let p3 = (1.0 - q1[r]) * (1.0 - q2[r]);
+        gam_test_probs.push([p1, p2, p3]);
+    }
+
+    // ---- fit the SAME stopping-ratio likelihood in R (VGAM::vglm) ---------
+    // ONE run_r call: every Column must be equal length. We pass the TRAIN rows
+    // (s_temp, h_temp, y) plus the TEST rows padded into parallel columns and a
+    // test-count, and read back VGAM's held-out class probabilities. This mirrors
+    // the mgcv held-out-prediction pattern in the gaussian-smooth template.
+    let n_train = train_rows.len();
+    let pad = |v: &[f64], len: usize| -> Vec<f64> {
+        let fill = v.last().copied().unwrap_or(0.0);
+        let mut out = v.to_vec();
+        out.resize(len, fill);
+        out
+    };
+    let r = run_r(
+        &[
+            Column::new("s_temp", &train_s),
+            Column::new("h_temp", &train_h),
+            Column::new("y", &train_y),
+            Column::new("test_s", &pad(&test_s, n_train)),
+            Column::new("test_h", &pad(&test_h, n_train)),
+            Column::new("test_n", &vec![n_test as f64; n_train]),
+        ],
+        r#"
+        suppressPackageStartupMessages(library(VGAM))
+        df$yf <- factor(round(df$y), levels = c(1,2,3))
+        # Stopping-ratio with parallel (shared) covariate slopes across cutpoints.
+        m <- vglm(yf ~ s_temp + h_temp,
+                  family = sratio(link = "logitlink", parallel = TRUE),
+                  data = df)
+        k <- df$test_n[1]
+        nd <- data.frame(s_temp = df$test_s[1:k], h_temp = df$test_h[1:k])
+        pc <- predict(m, newdata = nd, type = "response")  # k x 3 class probs
+        emit("p1", as.numeric(pc[,1]))
+        emit("p2", as.numeric(pc[,2]))
+        emit("p3", as.numeric(pc[,3]))
+        "#,
+    );
+    let ref_p1 = r.vector("p1");
+    let ref_p2 = r.vector("p2");
+    let ref_p3 = r.vector("p3");
+    assert_eq!(ref_p1.len(), n_test, "VGAM held-out prob length mismatch");
+    assert_eq!(ref_p2.len(), n_test, "VGAM held-out prob length mismatch");
+    assert_eq!(ref_p3.len(), n_test, "VGAM held-out prob length mismatch");
+    let ref_test_probs: Vec<[f64; 3]> = (0..n_test)
+        .map(|r| [ref_p1[r], ref_p2[r], ref_p3[r]])
+        .collect();
+
+    // ---- objective held-out metrics (plain Rust) -------------------------
+    // arg-max class accuracy and multiclass log-loss against the true tier.
+    let argmax3 = |p: &[f64; 3]| -> usize {
+        let mut best = 0usize;
+        for k in 1..3 {
+            if p[k] > p[best] {
+                best = k;
+            }
+        }
+        best
+    };
+    let accuracy = |probs: &[[f64; 3]]| -> f64 {
+        let mut correct = 0usize;
+        for (pr, &yt) in probs.iter().zip(&test_y) {
+            let pred_level = argmax3(pr) + 1; // class index 0..2 -> level 1..3
+            if (pred_level as f64 - yt).abs() < 0.5 {
+                correct += 1;
+            }
+        }
+        correct as f64 / probs.len() as f64
+    };
+    let log_loss = |probs: &[[f64; 3]]| -> f64 {
+        let mut s = 0.0;
+        for (pr, &yt) in probs.iter().zip(&test_y) {
+            let k = (yt.round() as usize).saturating_sub(1).min(2);
+            s += -(pr[k].max(1e-12)).ln();
+        }
+        s / probs.len() as f64
+    };
+
+    let gam_acc = accuracy(&gam_test_probs);
+    let gam_ll = log_loss(&gam_test_probs);
+    let vgam_acc = accuracy(&ref_test_probs);
+    let vgam_ll = log_loss(&ref_test_probs);
+
+    // Majority-class baseline accuracy on the held-out tiers (the floor an
+    // informative model must clear).
+    let mut counts = [0usize; 3];
+    for &yt in &test_y {
+        let k = (yt.round() as usize).saturating_sub(1).min(2);
+        counts[k] += 1;
+    }
+    let majority_acc = *counts.iter().max().unwrap() as f64 / n_test as f64;
+
+    // Context only (NOT a pass criterion): closeness of gam's held-out class
+    // probabilities to VGAM's.
+    let gam_flat: Vec<f64> = gam_test_probs.iter().flat_map(|p| p.iter().copied()).collect();
+    let ref_flat: Vec<f64> = ref_test_probs.iter().flat_map(|p| p.iter().copied()).collect();
+    let probs_rel_vs_ref = relative_l2(&gam_flat, &ref_flat);
+    let probs_rmse_vs_ref = rmse(&gam_flat, &ref_flat);
+
+    eprintln!(
+        "wine ordinal stopping-ratio held-out: n={n} n_train={n_train} n_stack={n_stack} \
+         n_test={n_test} J={n_levels} gam_edf={gam_edf:.3} majority_acc={majority_acc:.4} \
+         acc gam={gam_acc:.4} vgam={vgam_acc:.4} | logloss gam={gam_ll:.4} vgam={vgam_ll:.4} \
+         (context: rel_l2 vs vgam={probs_rel_vs_ref:.4} rmse vs vgam={probs_rmse_vs_ref:.4})"
+    );
+
+    // ---- PRIMARY objective assertions: gam predicts held-out quality ------
+    // gam must clear the majority-class floor AND an absolute 0.45 accuracy bar
+    // (3 ordered tiers => 1/3 chance; 0.45 is a meaningful lift on this small,
+    // noisy real vintage sample), and keep held-out log-loss informative.
+    assert!(
+        gam_acc >= 0.45 && gam_acc >= majority_acc,
+        "gam held-out ordinal accuracy too low: gam={gam_acc:.4} \
+         (bar 0.45, majority floor {majority_acc:.4})"
+    );
+    assert!(
+        gam_ll < 1.05,
+        "gam held-out multiclass log-loss too high: {gam_ll:.4} \
+         (bar 1.05; uniform-3 log-loss is {:.4})",
+        (3.0_f64).ln()
+    );
+
+    // ---- BASELINE (match-or-beat): no worse than VGAM::sratio held-out ----
+    assert!(
+        gam_acc >= vgam_acc - 0.10,
+        "gam held-out accuracy below VGAM::sratio: gam={gam_acc:.4} vgam={vgam_acc:.4}"
+    );
+    assert!(
+        gam_ll <= vgam_ll * 1.10 + 0.05,
+        "gam held-out log-loss worse than VGAM::sratio: gam={gam_ll:.4} vgam={vgam_ll:.4}"
     );
 }

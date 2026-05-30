@@ -39,10 +39,14 @@ use gam::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, FamilyEvaluation, ParameterBlockSpec,
     ParameterBlockState,
 };
-use gam::init_parallelism;
-use gam::matrix::{DenseDesignMatrix, DesignMatrix};
+use gam::matrix::{DenseDesignMatrix, DesignMatrix, LinearOperator};
+use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, relative_l2, run_python};
+use gam::{
+    FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema,
+};
 use ndarray::{Array1, Array2};
+use std::path::Path;
 
 /// Poisson likelihood with the identity link `μ = η`.
 ///
@@ -384,4 +388,223 @@ emit("mu_full", mu_full)
         rmse_gam_truth <= rmse_sm_truth * 1.10,
         "gam truth-RMSE worse than statsmodels by >10%: gam={rmse_gam_truth:.4} sm={rmse_sm_truth:.4}"
     );
+}
+
+/// Path to the `badhealth` count dataset shipped with the benches.
+///
+/// SOURCE: the `badhealth` data frame from the R package **COUNT** (Hilbe,
+/// J.M., *Negative Binomial Regression*, 2nd ed., Cambridge University Press,
+/// 2011), distributed under GPL-2. n=1127 German Socioeconomic Panel
+/// respondents. Columns: `numvisit` = number of physician visits in a quarter
+/// (the count response), `badh` = self-reported bad-health indicator (0/1),
+/// `age` = age in years.
+const BADHEALTH_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/badhealth.csv");
+
+/// Real-data arm for the SAME count-GAM capability the synthetic test proves:
+/// a Poisson regression of a count response on a smooth of a continuous
+/// covariate plus a categorical/binary main effect, with a multiplicative
+/// (log) mean. On real data the generating function is unknown, so we assert
+/// OBJECTIVE *held-out predictive* quality rather than truth recovery:
+///
+///   PRIMARY (tool-free, objective): a deterministic 75/25 train/test split
+///     (every 4th row held out). gam fits `numvisit ~ s(age) + badh` on the
+///     train rows under Poisson(log), predicts the held-out rows, and we assert
+///     the held-out **mean Poisson deviance** is below an absolute bar. For
+///     these doctor-visit counts the data are over-dispersed (Var ≫ mean), so a
+///     well-fit Poisson mean-model lands its per-row deviance well below the
+///     constant-mean (intercept-only) null deviance; the bar is set against that
+///     null so a broken link/design/PIRLS that does no better than the global
+///     mean cannot pass.
+///
+///   BASELINE (match-or-beat): statsmodels fits the SAME Poisson(log) model —
+///     a penalized cubic B-spline smooth of `age` (GCV-selected penalty) plus a
+///     linear `badh` term, via `GLMGam` — on the IDENTICAL train rows and
+///     predicts the IDENTICAL held-out rows. gam's held-out mean deviance must
+///     be no worse than statsmodels' plus a small margin. statsmodels is a
+///     baseline to beat on the held-out metric, never an output to replicate.
+///
+/// The mean log-link prediction is `μ̂ = exp(X·β̂)`; the held-out design is
+/// rebuilt from gam's frozen spec via `build_term_collection_design`.
+#[test]
+fn custom_poisson_identity_link_recovers_truth_and_predicts_on_real_data() {
+    init_parallelism();
+
+    // ---- load the real badhealth count dataset (age, badh -> numvisit) ------
+    let ds = load_csvwith_inferred_schema(Path::new(BADHEALTH_CSV)).expect("load badhealth.csv");
+    let col = ds.column_map();
+    let age_idx = col["age"];
+    let badh_idx = col["badh"];
+    let numvisit_idx = col["numvisit"];
+    let age: Vec<f64> = ds.values.column(age_idx).to_vec();
+    let badh: Vec<f64> = ds.values.column(badh_idx).to_vec();
+    let numvisit: Vec<f64> = ds.values.column(numvisit_idx).to_vec();
+    let n = age.len();
+    assert!(n > 1000, "badhealth should have ~1127 rows, got {n}");
+
+    // ---- deterministic 75/25 train/test split: every 4th row held out -------
+    let is_test = |i: usize| -> bool { i % 4 == 0 };
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    let n_train = train_rows.len();
+    let n_test = test_rows.len();
+    assert!(
+        n_train > 700 && n_test > 200,
+        "split sizes: train={n_train} test={n_test}"
+    );
+
+    // Held-out covariates / response (same rows, same order, for both engines).
+    let train_age: Vec<f64> = train_rows.iter().map(|&i| age[i]).collect();
+    let train_badh: Vec<f64> = train_rows.iter().map(|&i| badh[i]).collect();
+    let train_numvisit: Vec<f64> = train_rows.iter().map(|&i| numvisit[i]).collect();
+    let test_age: Vec<f64> = test_rows.iter().map(|&i| age[i]).collect();
+    let test_badh: Vec<f64> = test_rows.iter().map(|&i| badh[i]).collect();
+    let test_numvisit: Vec<f64> = test_rows.iter().map(|&i| numvisit[i]).collect();
+
+    // Train-only encoded dataset (headers/schema unchanged ⇒ formula resolves
+    // identically). Subset the encoded value matrix by the train row indices.
+    let pcols = ds.headers.len();
+    let mut train_values = Array2::<f64>::zeros((n_train, pcols));
+    for (out_row, &src_row) in train_rows.iter().enumerate() {
+        for c in 0..pcols {
+            train_values[[out_row, c]] = ds.values[[src_row, c]];
+        }
+    }
+    let mut train_ds = ds.clone();
+    train_ds.values = train_values;
+
+    // ---- fit gam on TRAIN: numvisit ~ s(age) + badh, Poisson(log), REML -----
+    let cfg = FitConfig {
+        family: Some("poisson".to_string()),
+        ..FitConfig::default()
+    };
+    let result =
+        fit_from_formula("numvisit ~ s(age) + badh", &train_ds, &cfg).expect("gam poisson fit");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected a standard GAM fit for the Poisson(log) family");
+    };
+    let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
+
+    // gam held-out predictions: rebuild the frozen design at the test rows;
+    // for a log link design*beta is the linear predictor, so μ̂ = exp(η̂).
+    let mut test_grid = Array2::<f64>::zeros((n_test, pcols));
+    for i in 0..n_test {
+        test_grid[[i, age_idx]] = test_age[i];
+        test_grid[[i, badh_idx]] = test_badh[i];
+    }
+    let test_design = build_term_collection_design(test_grid.view(), &fit.resolvedspec)
+        .expect("rebuild design at held-out points");
+    let gam_test_eta: Vec<f64> = test_design.design.apply(&fit.fit.beta).to_vec();
+    let gam_test_mu: Vec<f64> = gam_test_eta.iter().map(|e| e.exp()).collect();
+
+    // OBJECTIVE metric: held-out mean Poisson deviance on gam's own preds.
+    let dev_gam_test = mean_poisson_deviance(&test_numvisit, &gam_test_mu);
+
+    // Null (intercept-only) held-out deviance: predict the constant train mean
+    // for every test row. This is the tool-free floor a real mean-model must
+    // beat — a degenerate fit that learns nothing matches this and fails the bar.
+    let mean_train: f64 = train_numvisit.iter().sum::<f64>() / n_train as f64;
+    let null_mu: Vec<f64> = vec![mean_train; n_test];
+    let dev_null_test = mean_poisson_deviance(&test_numvisit, &null_mu);
+
+    // ---- fit the SAME Poisson(log) model with statsmodels (baseline) --------
+    // GLMGam: a penalized cubic B-spline smooth of `age` (df=10, GCV-selected
+    // penalty) plus a linear `badh` main effect, Poisson(Log). It is fit on the
+    // train rows and predicts the held-out rows from byte-identical data. Every
+    // Column in this one call is train-length except the explicitly test-length
+    // prediction inputs, which we pad to train length and slice back by `test_n`.
+    let r = run_python(
+        &[
+            Column::new("age", &train_age),
+            Column::new("badh", &train_badh),
+            Column::new("numvisit", &train_numvisit),
+            Column::new("test_age", &pad_to(&test_age, n_train)),
+            Column::new("test_badh", &pad_to(&test_badh, n_train)),
+            Column::new("test_n", &vec![n_test as f64; n_train]),
+        ],
+        r#"
+import numpy as np
+import statsmodels.api as sm
+from statsmodels.gam.api import GLMGam, BSplines
+
+age  = np.asarray(df["age"],  dtype=float)
+badh = np.asarray(df["badh"], dtype=float)
+y    = np.asarray(df["numvisit"], dtype=float)
+
+k = int(np.asarray(df["test_n"], dtype=float)[0])
+test_age  = np.asarray(df["test_age"],  dtype=float)[:k]
+test_badh = np.asarray(df["test_badh"], dtype=float)[:k]
+
+# Penalized cubic B-spline smooth of age; linear badh enters as an exog_smoother
+# covariate handled outside the spline basis.
+bs = BSplines(age.reshape(-1, 1), df=[10], degree=[3])
+exog = sm.add_constant(badh.reshape(-1, 1))
+fam = sm.families.Poisson(link=sm.families.links.Log())
+g = GLMGam(y, exog=exog, smoother=bs, alpha=[1.0], family=fam)
+alpha_opt, _ = g.select_penweight()
+g = GLMGam(y, exog=exog, smoother=bs, alpha=alpha_opt, family=fam)
+res = g.fit()
+
+# Predict held-out rows: pass the test exog (constant + badh) and the raw test
+# smoother covariate (age); GLMGam rebuilds the spline basis internally.
+test_exog = sm.add_constant(test_badh.reshape(-1, 1), has_constant="add")
+mu_test = np.asarray(res.predict(exog=test_exog, exog_smooth=test_age.reshape(-1, 1)),
+                     dtype=float)
+emit("mu_test", mu_test)
+"#,
+    );
+    let mu_sm_test = r.vector("mu_test");
+    assert_eq!(mu_sm_test.len(), n_test, "statsmodels held-out pred length");
+    let dev_sm_test = mean_poisson_deviance(&test_numvisit, mu_sm_test);
+
+    // Context only: relative closeness of the two held-out mean vectors (NOT a
+    // pass criterion — matching a peer tool's predictions is not a quality claim).
+    let rel_mu = relative_l2(&gam_test_mu, mu_sm_test);
+
+    eprintln!(
+        "badhealth numvisit ~ s(age)+badh Poisson(log) held-out: \
+         n_train={n_train} n_test={n_test} gam_edf={gam_edf:.3}\n  \
+         held-out mean deviance: gam={dev_gam_test:.4} statsmodels={dev_sm_test:.4} \
+         null(intercept-only)={dev_null_test:.4}\n  \
+         (context only) rel_l2(mu, statsmodels) = {rel_mu:.5}"
+    );
+
+    // ---- PRIMARY objective assertion: beat the constant-mean predictor ------
+    // A real Poisson mean-model that has learned the age/health structure must
+    // achieve a held-out mean deviance comfortably below the intercept-only null.
+    // We require at least a 5% reduction — a broken link/design/PIRLS that learns
+    // nothing sits at (or above) the null and fails.
+    assert!(
+        dev_gam_test <= 0.95 * dev_null_test,
+        "gam held-out mean Poisson deviance {dev_gam_test:.4} does not beat the \
+         intercept-only null {dev_null_test:.4} by >=5%"
+    );
+
+    // ---- BASELINE (match-or-beat): no worse than statsmodels on held-out -----
+    // gam's held-out deviance must not exceed statsmodels' by more than a small
+    // margin on the SAME held-out rows and SAME metric.
+    assert!(
+        dev_gam_test <= dev_sm_test + 0.05,
+        "gam held-out deviance worse than statsmodels: gam={dev_gam_test:.4} sm={dev_sm_test:.4}"
+    );
+
+    // ---- complexity sanity: edf in a sensible range (not matched) -----------
+    assert!(
+        gam_edf > 1.0 && gam_edf < 30.0,
+        "gam effective dof out of sane range: {gam_edf:.3}"
+    );
+}
+
+/// Right-pad `v` with its last value (or 0.0 when empty) to length `len` so a
+/// test-length prediction input can ride along inside a train-length reference
+/// `data.frame`; only the first `v.len()` entries are read back by the body.
+fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
+    assert!(
+        v.len() <= len,
+        "pad target {len} shorter than source {}",
+        v.len()
+    );
+    let fill = v.last().copied().unwrap_or(0.0);
+    let mut out = v.to_vec();
+    out.resize(len, fill);
+    out
 }

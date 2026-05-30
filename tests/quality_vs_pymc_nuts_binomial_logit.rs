@@ -38,7 +38,14 @@ use gam::{
 };
 use ndarray::{Array1, Array2};
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// prostate.csv source: the `prostate` PCA-feature benchmark shipped in
+/// `bench/datasets/` (two leading principal-component scores `pc1`, `pc2` and a
+/// binary outcome `y`). Real data => no known latent truth, so the new arm
+/// asserts OBJECTIVE held-out classification quality (log-loss + AUC) and a
+/// match-or-beat against a PyMC-NUTS baseline fit on the identical design.
+const PROSTATE_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/prostate.csv");
 
 /// Deterministic splitmix64 stream → uniform(0,1). Keeps the synthetic data
 /// fully reproducible with no external RNG crate, so gam and PyMC see byte-for
@@ -387,5 +394,378 @@ emit("rhat_max", [float(np.nanmax(rhat))])
     assert!(
         (gam_coverage - 0.90).abs() <= 0.10,
         "gam 90% credible intervals are miscalibrated against truth: empirical coverage={gam_coverage:.3} (nominal 0.90)"
+    );
+}
+
+/// Mean binary cross-entropy (log-loss) of predicted probabilities `p` against
+/// 0/1 labels `y`. Lower is better; the constant base-rate predictor sits at the
+/// label entropy, so a model that beats it is genuinely informative. Clamped
+/// away from {0,1} so a single confident miss cannot send the metric to +inf.
+fn log_loss(p: &[f64], y: &[f64]) -> f64 {
+    assert_eq!(p.len(), y.len(), "log_loss length mismatch");
+    let eps = 1e-12;
+    let s: f64 = p
+        .iter()
+        .zip(y)
+        .map(|(&pi, &yi)| {
+            let pc = pi.clamp(eps, 1.0 - eps);
+            -(yi * pc.ln() + (1.0 - yi) * (1.0 - pc).ln())
+        })
+        .sum();
+    s / p.len().max(1) as f64
+}
+
+/// Area under the ROC curve via the Mann-Whitney U statistic (average rank of
+/// the positive scores). 0.5 is chance, 1.0 is perfect ranking. Handles ties by
+/// assigning the mean rank within each tie group.
+fn auc(score: &[f64], y: &[f64]) -> f64 {
+    assert_eq!(score.len(), y.len(), "auc length mismatch");
+    let n = score.len();
+    let n_pos = y.iter().filter(|&&v| v > 0.5).count();
+    let n_neg = n - n_pos;
+    assert!(n_pos > 0 && n_neg > 0, "auc needs both classes");
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.sort_by(|&a, &b| score[a].partial_cmp(&score[b]).expect("finite scores"));
+    // Fractional ranks (1-based), averaging within ties.
+    let mut ranks = vec![0.0f64; n];
+    let mut i = 0usize;
+    while i < n {
+        let mut j = i + 1;
+        while j < n && score[idx[j]] == score[idx[i]] {
+            j += 1;
+        }
+        let avg_rank = ((i + 1) + j) as f64 / 2.0; // mean of ranks (i+1)..=j
+        for k in i..j {
+            ranks[idx[k]] = avg_rank;
+        }
+        i = j;
+    }
+    let sum_pos_ranks: f64 = (0..n).filter(|&k| y[k] > 0.5).map(|k| ranks[k]).sum();
+    let u = sum_pos_ranks - (n_pos * (n_pos + 1)) as f64 / 2.0;
+    u / (n_pos as f64 * n_neg as f64)
+}
+
+/// REAL-DATA arm of the same gam capability (penalized binomial-logit smooth +
+/// NUTS posterior). The synthetic test above proves truth-recovery + calibration
+/// on a known latent function; here we exercise the identical machinery on real
+/// `prostate` data where the truth is unknown, so quality is measured purely by
+/// OBJECTIVE held-out classification accuracy:
+///
+///   PRIMARY (objective, tool-free): on a deterministic held-out split, gam's
+///     posterior-mean predicted probabilities beat the base-rate predictor by a
+///     comfortable margin on held-out log-loss, and rank the held-out positives
+///     above the negatives with AUC >= 0.65.
+///
+///   BASELINE (match-or-beat): a PyMC NUTS run on the IDENTICAL train design and
+///     penalty precision predicts the SAME held-out rows; gam's held-out
+///     log-loss must be no worse than PyMC's by more than 5%. PyMC is the mature
+///     baseline to match-or-beat, never a fitted target to replicate.
+#[test]
+fn gam_nuts_binomial_logit_recovers_truth_and_is_calibrated_on_real_data() {
+    init_parallelism();
+
+    // ---- load the real prostate benchmark: (pc1, pc2) -> binary y -----------
+    let ds = load_csvwith_inferred_schema(Path::new(PROSTATE_CSV)).expect("load prostate.csv");
+    let col = ds.column_map();
+    let pc1_idx = col["pc1"];
+    let pc2_idx = col["pc2"];
+    let y_idx = col["y"];
+    let pc1: Vec<f64> = ds.values.column(pc1_idx).to_vec();
+    let pc2: Vec<f64> = ds.values.column(pc2_idx).to_vec();
+    let y_all: Vec<f64> = ds.values.column(y_idx).to_vec();
+    let n_all = pc1.len();
+    assert!(n_all > 400, "prostate should have ~654 rows, got {n_all}");
+
+    // ---- deterministic train/test split: every 4th row held out ------------
+    let is_test = |i: usize| i % 4 == 0;
+    let train_rows: Vec<usize> = (0..n_all).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n_all).filter(|&i| is_test(i)).collect();
+    let n_train = train_rows.len();
+    let n_test = test_rows.len();
+    assert!(
+        n_train > 300 && n_test > 100,
+        "split sizes: train={n_train} test={n_test}"
+    );
+    // Both classes must be present in train and test or the metrics degenerate.
+    let train_pos = train_rows.iter().filter(|&&i| y_all[i] > 0.5).count();
+    let test_pos = test_rows.iter().filter(|&&i| y_all[i] > 0.5).count();
+    assert!(
+        train_pos > 20 && train_pos < n_train - 20 && test_pos > 20 && test_pos < n_test - 20,
+        "need both classes in both splits: train_pos={train_pos}/{n_train} test_pos={test_pos}/{n_test}"
+    );
+
+    let train_pc1: Vec<f64> = train_rows.iter().map(|&i| pc1[i]).collect();
+    let train_pc2: Vec<f64> = train_rows.iter().map(|&i| pc2[i]).collect();
+    let train_y: Vec<f64> = train_rows.iter().map(|&i| y_all[i]).collect();
+    let test_pc1: Vec<f64> = test_rows.iter().map(|&i| pc1[i]).collect();
+    let test_pc2: Vec<f64> = test_rows.iter().map(|&i| pc2[i]).collect();
+    let test_y: Vec<f64> = test_rows.iter().map(|&i| y_all[i]).collect();
+
+    // Training-only dataset: subset the encoded rows; headers/schema/kinds are
+    // unchanged so the formula resolves identically (same pattern as the mgcv
+    // Gaussian real-data template).
+    let p_cols = ds.headers.len();
+    let mut train_values = Array2::<f64>::zeros((n_train, p_cols));
+    for (out_row, &src_row) in train_rows.iter().enumerate() {
+        for c in 0..p_cols {
+            train_values[[out_row, c]] = ds.values[[src_row, c]];
+        }
+    }
+    let mut train_ds = ds.clone();
+    train_ds.values = train_values;
+
+    // ---- fit y ~ s(pc1) + s(pc2) on TRAIN with gam (binomial / logit), REML --
+    let cfg = FitConfig {
+        family: Some("binomial".to_string()),
+        ..FitConfig::default()
+    };
+    let result =
+        fit_from_formula("y ~ s(pc1) + s(pc2)", &train_ds, &cfg).expect("gam binomial fit");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected a standard GAM fit for binomial logit");
+    };
+
+    // Rebuild the TRAIN design (identity coordinates → exact basis gam fitted on)
+    // and the TEST design from the same frozen spec, so posterior draws of β map
+    // straight to η on both splits.
+    let mut train_grid = Array2::<f64>::zeros((n_train, p_cols));
+    for (i, (&a, &b)) in train_pc1.iter().zip(&train_pc2).enumerate() {
+        train_grid[[i, pc1_idx]] = a;
+        train_grid[[i, pc2_idx]] = b;
+    }
+    let train_design = build_term_collection_design(train_grid.view(), &fit.resolvedspec)
+        .expect("rebuild training design");
+    let x_train = train_design.design.to_dense();
+    let p = x_train.ncols();
+    assert_eq!(x_train.nrows(), n_train, "train design row count mismatch");
+
+    let mut test_grid = Array2::<f64>::zeros((n_test, p_cols));
+    for (i, (&a, &b)) in test_pc1.iter().zip(&test_pc2).enumerate() {
+        test_grid[[i, pc1_idx]] = a;
+        test_grid[[i, pc2_idx]] = b;
+    }
+    let test_design = build_term_collection_design(test_grid.view(), &fit.resolvedspec)
+        .expect("rebuild held-out design");
+    let x_test = test_design.design.to_dense();
+    assert_eq!(x_test.nrows(), n_test, "test design row count mismatch");
+    assert_eq!(x_test.ncols(), p, "test design coeff dim mismatch");
+
+    // Full penalty precision S = Σ_k λ_k S_k from gam's OWN per-block penalties
+    // and REML-selected λ — the exact Gaussian prior precision gam's NUTS targets
+    // and the same precision handed to the PyMC baseline.
+    let lambdas = fit.fit.lambdas.as_slice().expect("contiguous lambdas");
+    assert_eq!(
+        lambdas.len(),
+        train_design.penalties.len(),
+        "lambda count must match penalty block count"
+    );
+    let mut s_total = Array2::<f64>::zeros((p, p));
+    for (bp, &lam) in train_design.penalties.iter().zip(lambdas) {
+        let r = bp.col_range.clone();
+        assert_eq!(bp.local.nrows(), r.len(), "penalty block shape mismatch");
+        for (li, gi) in r.clone().enumerate() {
+            for (lj, gj) in r.clone().enumerate() {
+                s_total[[gi, gj]] += lam * bp.local[[li, lj]];
+            }
+        }
+    }
+
+    // ---- build an in-memory SavedModel and draw gam's NUTS posterior --------
+    let frozenspec = freeze_term_collection_from_design(&fit.resolvedspec, &train_design)
+        .expect("freeze resolved term spec");
+    let mut payload = FittedModelPayload::new(
+        1,
+        "y ~ s(pc1) + s(pc2)".to_string(),
+        ModelKind::Standard,
+        FittedFamily::Standard {
+            likelihood: LikelihoodSpec::binomial_logit(),
+            link: Some(StandardLink::Logit),
+            latent_cloglog_state: None,
+            mixture_state: None,
+            sas_state: None,
+        },
+        "binomial".to_string(),
+    );
+    payload.fit_result = Some(fit.fit.clone());
+    payload.unified = Some(fit.fit.clone());
+    payload.data_schema = Some(train_ds.schema.clone());
+    payload.resolved_termspec = Some(frozenspec);
+    payload.set_training_feature_metadata(train_ds.headers.clone(), train_ds.feature_ranges());
+    let model = FittedModel::from_payload(payload);
+    assert!(
+        model.require_data_schema().is_ok(),
+        "saved model must carry a usable schema"
+    );
+
+    let train_col = train_ds.column_map();
+    let adaptive = NutsConfig::for_dimension(p);
+    let nuts_cfg = NutsConfig {
+        n_samples: 1500,
+        nwarmup: 1500,
+        n_chains: 4,
+        seed: 42,
+        ..adaptive
+    };
+    let nuts = sample_saved_model(
+        &model,
+        train_ds.values.view(),
+        &train_col,
+        model.training_headers.as_ref(),
+        &nuts_cfg,
+    )
+    .expect("gam NUTS sampling");
+    assert_eq!(nuts.samples.ncols(), p, "posterior coeff dim mismatch");
+    assert!(nuts.rhat < 1.1, "gam NUTS did not converge: rhat={:.4}", nuts.rhat);
+
+    // Posterior-mean predicted probability on the held-out rows: average the
+    // inverse-logit of η = X_test β over all draws (posterior predictive mean of
+    // the success probability, the Bayes-optimal point prediction under log-loss).
+    let ndraw = nuts.samples.nrows();
+    let mut prob_sum = vec![0.0f64; n_test];
+    let mut beta_draw = Array1::<f64>::zeros(p);
+    for d in 0..ndraw {
+        for j in 0..p {
+            beta_draw[j] = nuts.samples[[d, j]];
+        }
+        let eta = x_test.dot(&beta_draw);
+        for i in 0..n_test {
+            prob_sum[i] += inv_logit(eta[i]);
+        }
+    }
+    let gam_prob: Vec<f64> = prob_sum.iter().map(|&s| s / ndraw as f64).collect();
+
+    // PRIMARY objective metrics on gam's OWN held-out predictions.
+    let gam_logloss = log_loss(&gam_prob, &test_y);
+    let gam_auc = auc(&gam_prob, &test_y);
+
+    // Base-rate predictor: constant train positive rate. Its held-out log-loss is
+    // the no-skill bar gam must clear by a margin.
+    let base_rate = train_pos as f64 / n_train as f64;
+    let base_prob = vec![base_rate; n_test];
+    let base_logloss = log_loss(&base_prob, &test_y);
+
+    // ---- PyMC BASELINE: same train design X, same penalty S, same data, seed 42
+    // Predict the SAME held-out rows (X_test injected) and report posterior-mean
+    // probabilities, then we score its held-out log-loss with the SAME Rust metric.
+    let mut xtr_flat = Vec::with_capacity(n_train * p);
+    for i in 0..n_train {
+        for j in 0..p {
+            xtr_flat.push(x_train[[i, j]]);
+        }
+    }
+    let mut xte_flat = Vec::with_capacity(n_test * p);
+    for i in 0..n_test {
+        for j in 0..p {
+            xte_flat.push(x_test[[i, j]]);
+        }
+    }
+    let mut s_flat = Vec::with_capacity(p * p);
+    for i in 0..p {
+        for j in 0..p {
+            s_flat.push(s_total[[i, j]]);
+        }
+    }
+    let shape = vec![n_train as f64, n_test as f64, p as f64];
+
+    // Only the train-length response rides as a dataframe column; the design
+    // matrices and penalty are injected as literal arrays and reshaped in-body
+    // (keeps every Column equal length per the harness contract).
+    let py = run_python(
+        &[Column::new("y", &train_y)],
+        &format!(
+            r#"
+import numpy as np
+import pymc as pm
+import arviz as az
+
+n_train = {n_train}
+n_test = {n_test}
+p = {p}
+y = np.asarray(df["y"], dtype=float).reshape(-1)
+Xtr = np.array({xtr_flat:?}, dtype=float).reshape(n_train, p)
+Xte = np.array({xte_flat:?}, dtype=float).reshape(n_test, p)
+S = np.array({s_flat:?}, dtype=float).reshape(p, p)
+_shape = {shape:?}
+assert int(_shape[0]) == n_train and int(_shape[1]) == n_test and int(_shape[2]) == p
+
+# Flat (improper) prior on beta + Gaussian smoothing penalty as a Potential
+# reproduces exactly the density gam's NUTS targets on the SAME train design.
+with pm.Model() as model:
+    beta = pm.Flat("beta", shape=p)
+    eta = pm.math.dot(Xtr, beta)
+    pm.Potential("smooth_penalty", -0.5 * pm.math.dot(beta, pm.math.dot(S, beta)))
+    pm.Bernoulli("obs", logit_p=eta, observed=y)
+    idata = pm.sample(
+        draws=1500,
+        tune=1500,
+        chains=4,
+        cores=1,
+        random_seed=42,
+        target_accept=0.9,
+        progressbar=False,
+        compute_convergence_checks=False,
+    )
+
+beta_draws = idata.posterior["beta"].stack(sample=("chain", "draw")).values  # (p, S)
+eta_te = Xte @ beta_draws  # (n_test, S)
+prob_te = 1.0 / (1.0 + np.exp(-eta_te))
+prob_mean = prob_te.mean(axis=1)  # posterior-mean held-out probability
+emit("ref_prob_test", prob_mean)
+
+# R-hat only to confirm the BASELINE converged (so match-or-beat is fair).
+rhat = az.rhat(idata)["beta"].values
+emit("rhat_max", [float(np.nanmax(rhat))])
+"#,
+            n_train = n_train,
+            n_test = n_test,
+            p = p,
+            xtr_flat = xtr_flat,
+            xte_flat = xte_flat,
+            s_flat = s_flat,
+            shape = shape,
+        ),
+    );
+
+    let pymc_prob = py.vector("ref_prob_test").to_vec();
+    assert_eq!(
+        pymc_prob.len(),
+        n_test,
+        "PyMC held-out prediction length mismatch"
+    );
+    let pymc_rhat = py.scalar("rhat_max");
+    let pymc_logloss = log_loss(&pymc_prob, &test_y);
+
+    eprintln!(
+        "pymc-nuts binomial logit REAL prostate (objective): n_train={n_train} n_test={n_test} p={p} ndraw={ndraw}\n\
+         gam_rhat={:.4} pymc_rhat={pymc_rhat:.4}\n\
+         held-out log-loss: gam={gam_logloss:.4} pymc(baseline)={pymc_logloss:.4} base_rate={base_logloss:.4}\n\
+         held-out AUC: gam={gam_auc:.4}",
+        nuts.rhat
+    );
+
+    // (0) Baseline convergence gate — a non-converged baseline makes match-or-beat
+    //     unfair (gam's own R-hat is already asserted above).
+    assert!(
+        pymc_rhat < 1.1,
+        "PyMC baseline did not converge (comparison would be unfair): rhat={pymc_rhat:.4}"
+    );
+
+    // (A) PRIMARY objective: gam beats the no-skill base-rate predictor on held-out
+    //     log-loss by a clear margin, and ranks held-out positives above negatives.
+    assert!(
+        gam_logloss <= base_logloss - 0.02,
+        "gam held-out log-loss {gam_logloss:.4} fails to beat base-rate {base_logloss:.4} by 0.02"
+    );
+    assert!(
+        gam_auc >= 0.65,
+        "gam held-out AUC too low: {gam_auc:.4} (< 0.65)"
+    );
+
+    // (B) BASELINE match-or-beat on the SAME objective metric: gam's held-out
+    //     log-loss is no worse than PyMC's by more than 5%. PyMC is the mature
+    //     baseline, not a target to replicate.
+    assert!(
+        gam_logloss <= pymc_logloss * 1.05,
+        "gam held-out log-loss {gam_logloss:.4} worse than PyMC baseline {pymc_logloss:.4} * 1.05"
     );
 }

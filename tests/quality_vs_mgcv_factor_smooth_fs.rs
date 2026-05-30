@@ -31,11 +31,13 @@ use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+    load_csvwith_inferred_schema,
 };
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
+use std::path::Path;
 
 const N: usize = 400;
 const N_GROUPS: usize = 4;
@@ -254,4 +256,250 @@ fn gam_factor_smooth_fs_recovers_truth() {
         "gam less accurate than mgcv at recovering truth: gam_rmse={gam_truth_rmse:.4} > 1.10*mgcv_rmse={:.4}",
         mgcv_truth_rmse * 1.10
     );
+}
+
+// ============================================================================
+// REAL-DATA ARM
+// ============================================================================
+//
+// Dataset SOURCE: the classic `sleepstudy` data from the R `lme4` package
+// (Belenky et al. 2003 sleep-deprivation study; 18 subjects, average reaction
+// time on a psychomotor-vigilance task measured daily over 10 days of
+// restricted sleep). Shipped here as `bench/datasets/sleepstudy.csv` with
+// columns `Reaction` (ms), `Days` (0..9), `Subject` (id). Reaction time drifts
+// upward with sleep deprivation but the slope and baseline differ subject to
+// subject — exactly the per-group-curve structure the factor smooth
+// `s(Days, Subject, bs="fs")` is built for: one shared marginal smooth in Days
+// replicated per subject, with a shared smoothing parameter shrinking the
+// per-subject deviations toward the population curve.
+//
+// Truth is unknown on real data, so quality is OUT-OF-SAMPLE predictive
+// accuracy. We hold out two days per subject (Days 3 and 8, fixed indices),
+// fit the per-subject smooth on the remaining 8 days/subject, predict the
+// held-out days, and assert OBJECTIVE held-out metrics on gam's OWN
+// predictions:
+//
+//   PRIMARY (objective, tool-free): held-out R^2 >= 0.55. The fs model must
+//     explain held-out reaction-time variance well above the global-mean
+//     predictor (R^2 = 0) — i.e. it genuinely recovers each subject's distinct
+//     drift, not just the grand mean.
+//
+//   BASELINE (match-or-beat): mgcv fits the IDENTICAL train rows with
+//     `gam(Reaction ~ s(Days, Subject, bs="fs"), method="REML")` and predicts
+//     the IDENTICAL held-out rows; gam's held-out RMSE must be no worse than
+//     mgcv_test_rmse * 1.10. mgcv is the mature baseline to match-or-beat, not
+//     an output to replicate.
+
+const SLEEPSTUDY_CSV: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/sleepstudy.csv");
+
+/// Coefficient of determination of `pred` vs observed `truth`, relative to the
+/// mean predictor: `1 - SS_res/SS_tot`. R^2 = 1 perfect, 0 = grand-mean, < 0
+/// worse than the mean.
+fn held_out_r2(pred: &[f64], truth: &[f64]) -> f64 {
+    assert_eq!(pred.len(), truth.len(), "r2 length mismatch");
+    let n = truth.len() as f64;
+    let mean = truth.iter().sum::<f64>() / n;
+    let ss_res: f64 = pred.iter().zip(truth).map(|(p, t)| (t - p) * (t - p)).sum();
+    let ss_tot: f64 = truth.iter().map(|t| (t - mean) * (t - mean)).sum();
+    1.0 - ss_res / ss_tot.max(1e-300)
+}
+
+#[test]
+fn gam_factor_smooth_fs_recovers_truth_on_real_data() {
+    init_parallelism();
+
+    // ---- load the real sleepstudy dataset (Days, Subject -> Reaction) -----
+    let ds = load_csvwith_inferred_schema(Path::new(SLEEPSTUDY_CSV)).expect("load sleepstudy.csv");
+    let col = ds.column_map();
+    let days_idx = col["Days"];
+    let subject_idx = col["Subject"];
+    let reaction_idx = col["Reaction"];
+    // `Subject` parses as all-numeric, so CSV inference codes it as a continuous
+    // column; the fs term needs it as a FACTOR. We read the raw values here and
+    // re-encode Subject as a string label ("S<id>") below so mgcv and gam see
+    // the IDENTICAL factor — the numbers themselves are the untouched real data.
+    let days: Vec<f64> = ds.values.column(days_idx).to_vec();
+    let subject_raw: Vec<f64> = ds.values.column(subject_idx).to_vec();
+    let reaction: Vec<f64> = ds.values.column(reaction_idx).to_vec();
+    let n = days.len();
+    assert!(n > 150, "sleepstudy should have 180 rows, got {n}");
+
+    let subject_label: Vec<String> = subject_raw
+        .iter()
+        .map(|&s| format!("S{}", s.round() as i64))
+        .collect();
+
+    // ---- deterministic train/test split: hold out Days 3 and 8 -------------
+    // Every subject is measured on Days 0..9; holding out two interior days per
+    // subject keeps each subject well-populated in train (8 days) while forcing
+    // the model to PREDICT (interpolate) the missing days from the subject's own
+    // curve plus the shared population trend.
+    let is_test = |i: usize| {
+        let d = days[i].round() as i64;
+        d == 3 || d == 8
+    };
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    assert!(
+        train_rows.len() > 130 && test_rows.len() > 30,
+        "split sizes: train={} test={}",
+        train_rows.len(),
+        test_rows.len()
+    );
+
+    // ---- build the TRAIN dataset with Subject as a categorical factor ------
+    let headers = vec![
+        "Days".to_string(),
+        "Subject".to_string(),
+        "Reaction".to_string(),
+    ];
+    let train_records: Vec<StringRecord> = train_rows
+        .iter()
+        .map(|&i| {
+            StringRecord::from(vec![
+                days[i].to_string(),
+                subject_label[i].clone(),
+                reaction[i].to_string(),
+            ])
+        })
+        .collect();
+    let train_ds = encode_recordswith_inferred_schema(headers, train_records)
+        .expect("encode sleepstudy train data");
+    let train_col = train_ds.column_map();
+    let t_days_idx = train_col["Days"];
+    let t_subject_idx = train_col["Subject"];
+
+    // Map each subject label to the integer level code the encoder assigned (by
+    // first-appearance order in the train rows), so the prediction grid can put
+    // the matching code in the Subject column for every held-out row.
+    let mut subject_code: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    for (out_row, &src_row) in train_rows.iter().enumerate() {
+        let code = train_ds.values[[out_row, t_subject_idx]];
+        subject_code
+            .entry(subject_label[src_row].clone())
+            .or_insert(code);
+    }
+
+    // ---- fit gam on TRAIN: Reaction ~ s(Days, Subject, bs="fs"), REML ------
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula("Reaction ~ s(Days, Subject, bs=\"fs\")", &train_ds, &cfg)
+        .expect("gam sleepstudy factor-smooth fit");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected a standard GAM fit for a gaussian factor smooth");
+    };
+    let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
+
+    // ---- gam predictions at the held-out (Days, Subject) rows --------------
+    let p = train_ds.headers.len();
+    let mut test_grid = Array2::<f64>::zeros((test_rows.len(), p));
+    for (out_row, &src_row) in test_rows.iter().enumerate() {
+        let code = *subject_code
+            .get(&subject_label[src_row])
+            .expect("held-out subject seen in train");
+        test_grid[[out_row, t_days_idx]] = days[src_row];
+        test_grid[[out_row, t_subject_idx]] = code;
+    }
+    let test_design = build_term_collection_design(test_grid.view(), &fit.resolvedspec)
+        .expect("rebuild factor-smooth design at held-out rows");
+    let gam_test_pred: Vec<f64> = test_design.design.apply(&fit.fit.beta).to_vec();
+    assert_eq!(gam_test_pred.len(), test_rows.len(), "gam held-out length");
+
+    let test_reaction: Vec<f64> = test_rows.iter().map(|&i| reaction[i]).collect();
+
+    // ---- fit the SAME model on TRAIN with mgcv, predict the SAME TEST ------
+    // One run_r call exposes one data.frame, and every column must be equal
+    // length, so we ride the (shorter) held-out columns along as right-padded
+    // parallel columns and read back only their first `test_n` entries inside R.
+    let train_days: Vec<f64> = train_rows.iter().map(|&i| days[i]).collect();
+    let train_subject: Vec<f64> = train_rows.iter().map(|&i| subject_raw[i]).collect();
+    let train_reaction: Vec<f64> = train_rows.iter().map(|&i| reaction[i]).collect();
+    let test_days: Vec<f64> = test_rows.iter().map(|&i| days[i]).collect();
+    let test_subject: Vec<f64> = test_rows.iter().map(|&i| subject_raw[i]).collect();
+    let train_len = train_rows.len();
+
+    let r = run_r(
+        &[
+            Column::new("Days", &train_days),
+            Column::new("Subject", &train_subject),
+            Column::new("Reaction", &train_reaction),
+            Column::new("test_Days", &pad_to(&test_days, train_len)),
+            Column::new("test_Subject", &pad_to(&test_subject, train_len)),
+            Column::new("test_n", &vec![test_rows.len() as f64; train_len]),
+        ],
+        r#"
+        suppressPackageStartupMessages(library(mgcv))
+        df$Subject <- factor(df$Subject)
+        m <- gam(Reaction ~ s(Days, Subject, bs = "fs"), data = df, method = "REML")
+        k <- df$test_n[1]
+        newd <- data.frame(
+          Days = df$test_Days[1:k],
+          Subject = factor(df$test_Subject[1:k], levels = levels(df$Subject))
+        )
+        emit("test_pred", as.numeric(predict(m, newdata = newd)))
+        emit("edf", sum(m$edf))
+        "#,
+    );
+    let mgcv_test_pred = r.vector("test_pred");
+    let mgcv_edf = r.scalar("edf");
+    assert_eq!(
+        mgcv_test_pred.len(),
+        test_rows.len(),
+        "mgcv held-out prediction length mismatch"
+    );
+
+    // ---- objective metrics on gam's OWN held-out predictions ---------------
+    let gam_test_r2 = held_out_r2(&gam_test_pred, &test_reaction);
+    let gam_test_rmse = rmse(&gam_test_pred, &test_reaction);
+    let mgcv_test_rmse = rmse(mgcv_test_pred, &test_reaction);
+    // Context only (NOT a pass criterion): closeness of the two held-out fits.
+    let rel_to_mgcv = relative_l2(&gam_test_pred, mgcv_test_pred);
+
+    eprintln!(
+        "[fs-real] sleepstudy s(Days,Subject,bs=fs) held-out: n_train={train_len} \
+         n_test={} gam_test_R2={gam_test_r2:.4} gam_test_rmse={gam_test_rmse:.4} \
+         mgcv_test_rmse={mgcv_test_rmse:.4} gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} \
+         (context: rel_l2 vs mgcv={rel_to_mgcv:.4})",
+        test_rows.len(),
+    );
+
+    // ---- PRIMARY objective assertion: gam predicts the held-out signal -----
+    // Reaction time has a clear per-subject upward drift; recovering each
+    // subject's curve explains well over half the held-out variance. R^2 >= 0.55
+    // is far above the grand-mean baseline (0) and would catch a collapsed fit
+    // that ignored the per-subject structure.
+    assert!(
+        gam_test_r2 >= 0.55,
+        "gam's held-out predictive R2 too low on sleepstudy: {gam_test_r2:.4} (< 0.55)"
+    );
+
+    // ---- BASELINE (match-or-beat): no worse than mgcv on held-out RMSE -----
+    assert!(
+        gam_test_rmse <= mgcv_test_rmse * 1.10,
+        "gam held-out RMSE {gam_test_rmse:.4} exceeds mgcv {mgcv_test_rmse:.4} * 1.10"
+    );
+
+    // ---- complexity sanity: edf in a signal-appropriate range (not matched) -
+    assert!(
+        gam_edf > 1.0 && gam_edf < 120.0,
+        "gam effective dof out of sane range: {gam_edf:.3}"
+    );
+}
+
+/// Right-pad `v` with its last value (or 0.0 when empty) to length `len`, so it
+/// can ride along as a column of the reference data.frame. Only the first
+/// `v.len()` entries are read back inside the R body.
+fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
+    assert!(
+        v.len() <= len,
+        "pad target {len} shorter than source {}",
+        v.len()
+    );
+    let fill = v.last().copied().unwrap_or(0.0);
+    let mut out = v.to_vec();
+    out.resize(len, fill);
+    out
 }

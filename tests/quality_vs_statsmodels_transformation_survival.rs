@@ -53,8 +53,10 @@ use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+    load_csvwith_inferred_schema,
 };
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, s};
+use std::path::Path;
 
 /// Deterministic, dependency-free PRNG (SplitMix64) so the synthetic data is
 /// reproducible bit-for-bit and fed IDENTICALLY to gam and to scipy.
@@ -444,5 +446,286 @@ emit("converged", [1.0 if res.success else 0.0])
         gam_rmse_truth <= scipy_rmse_truth * 1.10,
         "gam is less accurate than the scipy Weibull-AFT MLE baseline: \
          gam_RMSE_to_truth={gam_rmse_truth:.5} > scipy_RMSE_to_truth={scipy_rmse_truth:.5} * 1.10"
+    );
+}
+
+// ===========================================================================
+// REAL-DATA ARM
+// ===========================================================================
+//
+// Dataset SOURCE: the Veterans' Administration lung-cancer randomized trial
+// (`veteran` in the R `survival` package; Kalbfleisch & Prentice, "The
+// Statistical Analysis of Failure Time Data", 1980). 137 patients, columns
+// `time` (survival days), `status` (1=death, 0=right-censored — 9 censored),
+// the numeric covariates `karno` (Karnofsky performance score, the dominant
+// prognostic signal), `age`, and `diagtime` (months from diagnosis to entry),
+// shipped at `bench/datasets/veteran_lung.csv`.
+//
+// This arm exercises the SAME gam capability as the synthetic test above —
+// a parametric **Weibull transformation (AFT) survival model** with LINEAR
+// covariate effects over a shared Weibull baseline cumulative hazard
+// (`Surv(time, status) ~ karno + age + diagtime`, the real-data analogue of
+// the synthetic `x1 + x2`). Both fits put the covariates into the same shared
+// log-cumulative-hazard, so the covariate block `cov_eta = design(x)·cov_beta`
+// IS the per-patient log-risk (monotone increasing in hazard).
+//
+// Because this is real data the data-generating survival surface is UNKNOWN,
+// so RMSE-to-truth is not computable. The objective, tool-free quality metric
+// is therefore the **held-out concordance index** (Harrell's C): a fixed,
+// deterministic train/test split (every 4th row held out), fit gam on train,
+// score the held-out patients by gam's OWN covariate log-cumulative-hazard
+// risk, and assert how well that risk ranking agrees with the observed
+// (time, event) ordering. Higher covariate log-cumulative-hazard ⇒ higher
+// hazard ⇒ shorter survival, so a well-fit model gives a high C-index
+// (0.5 = random, 1.0 = perfect).
+//   PRIMARY (objective): held-out C-index >= 0.62 — well above the 0.5
+//     random-ranking baseline for a ~34-patient held-out set; a degenerate or
+//     wrong-sign covariate fit would not clear it.
+//   BASELINE (match-or-beat): statsmodels' `PHReg` (the mature, standard
+//     statsmodels survival regression — a Cox proportional-hazards model) is
+//     fit on the SAME train rows and scored on the SAME held-out patients by
+//     its linear predictor (monotone in hazard), turned into the IDENTICAL
+//     held-out C-index in plain Rust. gam's held-out C must be no worse than
+//     statsmodels' C minus a 0.03 margin. statsmodels is a yardstick to
+//     match-or-beat on the identical metric, never a fitted output to copy.
+
+/// Harrell's concordance index for survival risk scores. `risk[i]` is monotone
+/// INCREASING in hazard (higher risk ⇒ shorter expected survival). A pair
+/// `(i, j)` is comparable when the earlier observed time belongs to an event;
+/// it is concordant when that earlier-failing subject also carries the higher
+/// risk. Risk ties on a comparable pair count as half-concordant. Returns the
+/// fraction of comparable pairs that are concordant (0.5 = random ordering).
+fn concordance_index(risk: &[f64], time: &[f64], event: &[f64]) -> f64 {
+    assert_eq!(risk.len(), time.len(), "concordance: risk/time length mismatch");
+    assert_eq!(time.len(), event.len(), "concordance: time/event length mismatch");
+    let n = risk.len();
+    let mut concordant = 0.0_f64;
+    let mut comparable = 0.0_f64;
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let (early, late) = if time[i] < time[j] {
+                (i, j)
+            } else if time[j] < time[i] {
+                (j, i)
+            } else {
+                continue;
+            };
+            if event[early] != 1.0 {
+                continue;
+            }
+            comparable += 1.0;
+            if risk[early] > risk[late] {
+                concordant += 1.0;
+            } else if risk[early] == risk[late] {
+                concordant += 0.5;
+            }
+        }
+    }
+    assert!(
+        comparable > 0.0,
+        "no comparable survival pairs — degenerate held-out set"
+    );
+    concordant / comparable
+}
+
+#[test]
+fn gam_transformation_survival_prediction_grid_matches_scipy_on_real_data() {
+    init_parallelism();
+
+    // ---- load the real Veterans' lung-cancer trial ------------------------
+    let ds = load_csvwith_inferred_schema(Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/bench/datasets/veteran_lung.csv"
+    )))
+    .expect("load veteran_lung.csv");
+    let col = ds.column_map();
+    let time_idx = col["time"];
+    let status_idx = col["status"];
+    let karno_idx = col["karno"];
+    let age_idx = col["age"];
+    let diagtime_idx = col["diagtime"];
+
+    let time: Vec<f64> = ds.values.column(time_idx).to_vec();
+    let status: Vec<f64> = ds.values.column(status_idx).to_vec();
+    let karno: Vec<f64> = ds.values.column(karno_idx).to_vec();
+    let age: Vec<f64> = ds.values.column(age_idx).to_vec();
+    let diagtime: Vec<f64> = ds.values.column(diagtime_idx).to_vec();
+    let n = time.len();
+    assert!(n > 120, "veteran_lung should have ~137 rows, got {n}");
+    assert!(
+        time.iter().all(|&v| v.is_finite() && v > 0.0),
+        "all survival times must be positive and finite"
+    );
+
+    // ---- deterministic train/test split: every 4th row held out ----------
+    let is_test = |i: usize| i % 4 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    assert!(
+        train_rows.len() > 90 && test_rows.len() > 30,
+        "split sizes: train={} test={}",
+        train_rows.len(),
+        test_rows.len()
+    );
+
+    // Build a training-only dataset by sub-setting the encoded rows; headers,
+    // schema and column kinds are unchanged, so the formula resolves identically.
+    let p = ds.headers.len();
+    let mut train_values = Array2::<f64>::zeros((train_rows.len(), p));
+    for (out_row, &src_row) in train_rows.iter().enumerate() {
+        for c in 0..p {
+            train_values[[out_row, c]] = ds.values[[src_row, c]];
+        }
+    }
+    let mut train_ds = ds.clone();
+    train_ds.values = train_values;
+
+    // ---- fit gam on TRAIN: Weibull transformation AFT, linear covariates --
+    // Same capability as the synthetic arm (parametric Weibull transformation
+    // model, linear covariate block over a shared log-cumulative-hazard); only
+    // the covariate set changes to the real prognostic factors.
+    let cfg = FitConfig {
+        survival_likelihood: "weibull".to_string(),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula(
+        "Surv(time, status) ~ karno + age + diagtime + survmodel(spec=\"transformation\", distribution=\"weibull\")",
+        &train_ds,
+        &cfg,
+    )
+    .expect("gam Weibull transformation AFT fit on veteran_lung train rows");
+    let FitResult::SurvivalTransformation(fit) = result else {
+        panic!("expected a SurvivalTransformation fit for survival_likelihood=weibull");
+    };
+    assert_eq!(
+        fit.baseline_cfg.target,
+        SurvivalBaselineTarget::Weibull,
+        "gam must report a fitted Weibull baseline"
+    );
+
+    // ---- score the held-out patients by gam's OWN covariate risk ----------
+    // The covariate block adds `cov_eta = design(x)·cov_beta` to the shared
+    // log-cumulative-hazard, so `cov_eta` IS the per-patient log-risk (monotone
+    // increasing in hazard). Every patient shares the same baseline H0(t), so
+    // the covariate predictor alone ranks risk — no baseline evaluation needed.
+    let cov_start = fit.time_base_ncols;
+    let beta = &fit.fit.beta;
+    assert!(
+        beta.len() > cov_start,
+        "expected covariate coefficients after the {cov_start} time columns, got beta.len()={}",
+        beta.len()
+    );
+    let cov_beta = beta.slice(s![cov_start..]).to_owned();
+
+    let mut test_grid = Array2::<f64>::zeros((test_rows.len(), p));
+    for (out_row, &src_row) in test_rows.iter().enumerate() {
+        for c in 0..p {
+            test_grid[[out_row, c]] = ds.values[[src_row, c]];
+        }
+    }
+    let test_design = build_term_collection_design(test_grid.view(), &fit.resolvedspec)
+        .expect("rebuild covariate design at held-out rows");
+    let test_dense = test_design.design.to_dense();
+    assert_eq!(
+        test_dense.ncols(),
+        cov_beta.len(),
+        "held-out covariate design width must match the covariate coefficient slice"
+    );
+    let gam_risk: Vec<f64> = (0..test_rows.len())
+        .map(|r| test_dense.row(r).dot(&cov_beta))
+        .collect();
+
+    let test_time: Vec<f64> = test_rows.iter().map(|&i| time[i]).collect();
+    let test_status: Vec<f64> = test_rows.iter().map(|&i| status[i]).collect();
+    let gam_c = concordance_index(&gam_risk, &test_time, &test_status);
+
+    // ---- fit the SAME data with statsmodels PHReg, score the SAME TEST -----
+    // One run_python call, all columns the SAME length (full n): a per-row
+    // `is_train` mask separates the fit rows from the held-out rows so we never
+    // mix train-length and test-length columns. statsmodels' PHReg (Cox PH) is
+    // fit on the masked train rows; we emit its held-out linear predictor
+    // (monotone in hazard) on the held-out rows in the SAME order and turn it
+    // into the IDENTICAL Rust concordance metric. The test rows ride back in a
+    // padded `sm_risk` column whose first `n_test` entries are the real scores.
+    let is_train: Vec<f64> = (0..n)
+        .map(|i| if is_test(i) { 0.0 } else { 1.0 })
+        .collect();
+    let py = run_python(
+        &[
+            Column::new("time", &time),
+            Column::new("status", &status),
+            Column::new("karno", &karno),
+            Column::new("age", &age),
+            Column::new("diagtime", &diagtime),
+            Column::new("is_train", &is_train),
+        ],
+        r#"
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+
+frame = pd.DataFrame({
+    "time": np.asarray(df["time"], dtype=float),
+    "status": np.asarray(df["status"], dtype=float),
+    "karno": np.asarray(df["karno"], dtype=float),
+    "age": np.asarray(df["age"], dtype=float),
+    "diagtime": np.asarray(df["diagtime"], dtype=float),
+    "is_train": np.asarray(df["is_train"], dtype=float),
+})
+feat = ["karno", "age", "diagtime"]
+train = frame[frame["is_train"] == 1.0].reset_index(drop=True)
+test = frame[frame["is_train"] == 0.0].reset_index(drop=True)
+
+# Cox proportional-hazards regression (statsmodels' mature survival model).
+mod = sm.PHReg(train["time"].to_numpy(),
+               train[feat].to_numpy(),
+               status=train["status"].to_numpy())
+res = mod.fit()
+
+# Held-out linear predictor x·beta: monotone INCREASING in hazard, exactly the
+# orientation of gam's covariate log-cumulative-hazard risk score. Emitted in
+# held-out row order; the Rust side computes the same Harrell C.
+sm_risk = test[feat].to_numpy() @ np.asarray(res.params, dtype=float)
+emit("sm_risk", sm_risk.reshape(-1))
+emit("converged", [1.0 if bool(res.converged) else 0.0])
+"#,
+    );
+    let sm_risk = py.vector("sm_risk");
+    let sm_converged = py.scalar("converged");
+    assert_eq!(
+        sm_converged, 1.0,
+        "statsmodels PHReg must converge for the baseline to be valid"
+    );
+    assert_eq!(
+        sm_risk.len(),
+        test_rows.len(),
+        "statsmodels held-out risk length mismatch: gam={} sm={}",
+        test_rows.len(),
+        sm_risk.len()
+    );
+    let sm_c = concordance_index(sm_risk, &test_time, &test_status);
+
+    let cens_frac = 1.0 - status.iter().sum::<f64>() / n as f64;
+    eprintln!(
+        "veteran_lung weibull-transformation AFT held-out: n={n} n_train={} n_test={} \
+         censoring={cens_frac:.2}\n  \
+         held-out C-index: gam={gam_c:.4} statsmodels(PHReg)={sm_c:.4}",
+        train_rows.len(),
+        test_rows.len(),
+    );
+
+    // ---- PRIMARY objective assertion: gam ranks held-out risk well --------
+    // C-index >= 0.62 is well above the 0.5 random-ranking baseline for a small
+    // held-out set; a degenerate or wrong-sign covariate fit would not clear it.
+    assert!(
+        gam_c >= 0.62,
+        "gam's held-out concordance too low: {gam_c:.4} (< 0.62)"
+    );
+
+    // ---- BASELINE (match-or-beat): no worse than statsmodels on held-out C -
+    assert!(
+        gam_c >= sm_c - 0.03,
+        "gam less concordant than statsmodels PHReg on held-out data: \
+         gam C={gam_c:.4}, statsmodels C={sm_c:.4} (margin 0.03)"
     );
 }

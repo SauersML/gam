@@ -31,7 +31,7 @@
 //! [0,1], truth f(θ,z)=sin(2θ)·(1+z), Gaussian noise σ=0.03 from a fixed seed.
 //! The identical (θ,z,y) rows are handed to both gam and mgcv.
 
-use csv::StringRecord;
+use csv::{ReaderBuilder, StringRecord};
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
@@ -43,6 +43,7 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal};
 use std::f64::consts::TAU;
+use std::path::Path;
 
 /// Closed-form cylinder truth f(θ,z) = sin(2θ)·(1+z).
 fn truth(theta: f64, z: f64) -> f64 {
@@ -282,4 +283,267 @@ fn gam_cylinder_tensor_cc_ps_recovers_truth_and_mixes_boundaries() {
          |f(π/4,1)-f(π/4,0)|={gam_z_endpoint_gap:.4} vs truth span={truth_z_span:.4} \
          (err={gam_z_span_err:.4}); a value near 0 means z wrongly wrapped"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Real-data arm: the SAME cylinder (cyclic-linear) tensor capability on a
+// genuine measured surface, where the truth function is UNKNOWN, so the proof
+// of quality is held-out PREDICTION, not recovery of a closed form.
+// ---------------------------------------------------------------------------
+//
+// Dataset SOURCE: mgcv's `sza` data frame, shipped here as
+// `bench/datasets/solar_zenith_angle.csv` (columns latitude, month, tst, sza).
+// It tabulates the solar zenith angle (degrees from vertical) at four latitudes
+// for each calendar month across true solar time of day. The natural smooth
+// surface is SZA over the (time-of-year, time-of-day) cylinder:
+//   * MONTH is genuinely PERIODIC — December wraps back to January (a circle of
+//     period 365 days, mapped to day-of-year so the seam is exercised).
+//   * TIME OF DAY is NON-periodic over the daylit support: the table only spans
+//     the hours the sun is up, so tst is a clamped (linear/ps) margin, exactly
+//     the cylinder asymmetry this basis exists to express.
+// This is the IDENTICAL gam capability the synthetic arm above proves correct
+// (`te(cyclic, clamped)` ≡ mgcv `te(bs=c("cc","ps"))`), now stressed on real,
+// noisy, irregular measurements at a single latitude.
+//
+// OBJECTIVE METRIC (truth unknown ⇒ measured by generalization):
+//   PRIMARY  : held-out coefficient of determination test_R2 ≥ 0.97 — the
+//              diurnal/seasonal SZA surface is strong and smooth, so a correct
+//              cyclic-linear tensor must explain almost all held-out variance,
+//              far above the constant-mean predictor (R2 = 0).
+//   BASELINE : gam's held-out RMSE ≤ mgcv `te(bs=c("cc","ps"))` held-out RMSE
+//              × 1.10 on the SAME train/test rows — mgcv is the mature
+//              match-or-beat yardstick, never a fitted target to copy.
+
+const SZA_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/solar_zenith_angle.csv");
+
+/// Coefficient of determination of `pred` vs observed `truth` relative to the
+/// mean predictor: `1 - SS_res/SS_tot`. R2 = 1 perfect, 0 = constant-mean.
+fn r2(pred: &[f64], truth: &[f64]) -> f64 {
+    assert_eq!(pred.len(), truth.len(), "r2 length mismatch");
+    let n = truth.len() as f64;
+    let mean = truth.iter().sum::<f64>() / n;
+    let ss_res: f64 = pred.iter().zip(truth).map(|(p, t)| (t - p) * (t - p)).sum();
+    let ss_tot: f64 = truth.iter().map(|t| (t - mean) * (t - mean)).sum();
+    1.0 - ss_res / ss_tot.max(1e-300)
+}
+
+/// Mid-month day-of-year on the [0,365] cyclic axis (Jan→15, Dec→349). Returns
+/// `None` for an unrecognized month token so a malformed row fails loudly.
+fn month_to_doy(m: &str) -> Option<f64> {
+    // Cumulative days before each month (non-leap) + ~15 to land mid-month.
+    let (before, len) = match m {
+        "jan" => (0.0, 31.0),
+        "feb" => (31.0, 28.0),
+        "mar" => (59.0, 31.0),
+        "apr" => (90.0, 30.0),
+        "may" => (120.0, 31.0),
+        "jun" => (151.0, 30.0),
+        "jul" => (181.0, 31.0),
+        "aug" => (212.0, 31.0),
+        "sep" => (243.0, 30.0),
+        "oct" => (273.0, 31.0),
+        "nov" => (304.0, 30.0),
+        "dec" => (334.0, 31.0),
+        _ => return None,
+    };
+    Some(before + len / 2.0)
+}
+
+/// Parse mgcv's true-solar-time token (e.g. "0430") into decimal hours on
+/// [0,24]: "0430" -> 4.5. Returns `None` for an unparsable token.
+fn tst_to_hours(t: &str) -> Option<f64> {
+    let t = t.trim();
+    if t.len() != 4 {
+        return None;
+    }
+    let hh: f64 = t[0..2].parse().ok()?;
+    let mm: f64 = t[2..4].parse().ok()?;
+    Some(hh + mm / 60.0)
+}
+
+#[test]
+fn gam_cylinder_tensor_cc_ps_recovers_truth_and_mixes_boundaries_on_real_data() {
+    init_parallelism();
+
+    // ---- load + clean the raw sza table -----------------------------------
+    // The CSV mixes a string month name, a "HHMM" time token, and many NA sza
+    // entries (night, sun below horizon). Parse into clean numeric columns and
+    // keep one latitude (20°) so the surface is a single (doy, tst) cylinder.
+    let mut rdr = ReaderBuilder::new()
+        .has_headers(true)
+        .from_path(Path::new(SZA_CSV))
+        .expect("open solar_zenith_angle.csv");
+
+    let mut doy: Vec<f64> = Vec::new();
+    let mut tst_h: Vec<f64> = Vec::new();
+    let mut sza: Vec<f64> = Vec::new();
+    for rec in rdr.records() {
+        let rec = rec.expect("read sza row");
+        // columns: rownames, latitude, month, tst, sza
+        let lat: f64 = rec.get(1).expect("latitude").trim().parse().expect("parse latitude");
+        if (lat - 20.0).abs() > 1e-9 {
+            continue; // single latitude => one clean (doy, tst) surface
+        }
+        let month_tok = rec.get(2).expect("month");
+        let tst_tok = rec.get(3).expect("tst");
+        let sza_tok = rec.get(4).expect("sza").trim();
+        if sza_tok.is_empty() {
+            continue; // night / sun-down: no zenith angle measured
+        }
+        let d = month_to_doy(month_tok.trim()).expect("recognized month token");
+        let h = tst_to_hours(tst_tok).expect("parsable tst token");
+        let s: f64 = sza_tok.parse().expect("parse sza");
+        doy.push(d);
+        tst_h.push(h);
+        sza.push(s);
+    }
+    let n = sza.len();
+    assert!(
+        n > 120,
+        "expected ~150 daylit sza rows at latitude 20, got {n}"
+    );
+
+    // ---- deterministic train/test split: every 4th row is held out --------
+    let is_test = |i: usize| i % 4 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    assert!(
+        train_rows.len() > 80 && test_rows.len() > 25,
+        "split sizes: train={} test={}",
+        train_rows.len(),
+        test_rows.len()
+    );
+
+    let train_doy: Vec<f64> = train_rows.iter().map(|&i| doy[i]).collect();
+    let train_tst: Vec<f64> = train_rows.iter().map(|&i| tst_h[i]).collect();
+    let train_sza: Vec<f64> = train_rows.iter().map(|&i| sza[i]).collect();
+    let test_doy: Vec<f64> = test_rows.iter().map(|&i| doy[i]).collect();
+    let test_tst: Vec<f64> = test_rows.iter().map(|&i| tst_h[i]).collect();
+    let test_sza: Vec<f64> = test_rows.iter().map(|&i| sza[i]).collect();
+
+    // ---- fit gam on TRAIN: cyclic-linear cylinder tensor, REML ------------
+    // doy is the cyclic (period 365) margin; tst is the clamped, non-periodic
+    // margin — gam's exact analog of mgcv te(bs=c("cc","ps")).
+    let headers = ["doy", "tst", "sza"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let rows: Vec<StringRecord> = (0..train_rows.len())
+        .map(|r| {
+            StringRecord::from(vec![
+                train_doy[r].to_string(),
+                train_tst[r].to_string(),
+                train_sza[r].to_string(),
+            ])
+        })
+        .collect();
+    let train_ds = encode_recordswith_inferred_schema(headers, rows).expect("encode sza train");
+    let col = train_ds.column_map();
+    let doy_idx = col["doy"];
+    let tst_idx = col["tst"];
+    let p = train_ds.headers.len();
+
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let formula = "sza ~ te(doy, tst, boundary=['periodic','clamped'], period=[365.0, None], k=8)";
+    let result = fit_from_formula(formula, &train_ds, &cfg).expect("gam sza cylinder fit");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected a standard GAM fit for the sza cylinder tensor smooth");
+    };
+    let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
+
+    // gam predictions at the held-out (doy, tst) rows: rebuild design from the
+    // frozen spec (identity link => design·beta = predicted mean).
+    let mut test_grid = Array2::<f64>::zeros((test_rows.len(), p));
+    for i in 0..test_rows.len() {
+        test_grid[[i, doy_idx]] = test_doy[i];
+        test_grid[[i, tst_idx]] = test_tst[i];
+    }
+    let test_design = build_term_collection_design(test_grid.view(), &fit.resolvedspec)
+        .expect("rebuild sza design at held-out points");
+    let gam_test_pred: Vec<f64> = test_design.design.apply(&fit.fit.beta).to_vec();
+
+    // ---- fit the SAME model on TRAIN with mgcv, predict the SAME TEST ------
+    // The harness exposes one data.frame per call and every column must be the
+    // same length, so the test rows ride along right-padded; only the first
+    // `test_n` entries are read back inside R.
+    let r = run_r(
+        &[
+            Column::new("doy", &train_doy),
+            Column::new("tst", &train_tst),
+            Column::new("sza", &train_sza),
+            Column::new("test_doy", &pad_to(&test_doy, train_doy.len())),
+            Column::new("test_tst", &pad_to(&test_tst, train_doy.len())),
+            Column::new("test_n", &vec![test_doy.len() as f64; train_doy.len()]),
+        ],
+        r#"
+        suppressPackageStartupMessages(library(mgcv))
+        m <- gam(sza ~ te(doy, tst, bs = c("cc", "ps"), k = c(8, 8)),
+                 data = df, method = "REML",
+                 knots = list(doy = c(0, 365)))
+        emit("edf", sum(m$edf))
+        k <- df$test_n[1]
+        newd <- data.frame(doy = df$test_doy[1:k], tst = df$test_tst[1:k])
+        emit("test_pred", as.numeric(predict(m, newdata = newd)))
+        "#,
+    );
+    let mgcv_test_pred = r.vector("test_pred");
+    let mgcv_edf = r.scalar("edf");
+    assert_eq!(
+        mgcv_test_pred.len(),
+        test_rows.len(),
+        "mgcv held-out prediction length mismatch"
+    );
+
+    // ---- objective metrics on gam's OWN held-out predictions --------------
+    let gam_test_r2 = r2(&gam_test_pred, &test_sza);
+    let gam_test_rmse = rmse(&gam_test_pred, &test_sza);
+    let mgcv_test_rmse = rmse(mgcv_test_pred, &test_sza);
+    // Context-only closeness to mgcv on the held-out rows (printed, NOT asserted).
+    let rel_to_mgcv = relative_l2(&gam_test_pred, mgcv_test_pred);
+
+    eprintln!(
+        "sza te(cc,ps) held-out: n_train={} n_test={} gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} \
+         gam_test_R2={gam_test_r2:.4} gam_test_rmse={gam_test_rmse:.4} \
+         mgcv_test_rmse={mgcv_test_rmse:.4} (context rel_l2 vs mgcv={rel_to_mgcv:.4})",
+        train_rows.len(),
+        test_rows.len(),
+    );
+
+    // ---- PRIMARY: gam predicts the held-out SZA surface -------------------
+    // The diurnal+seasonal zenith-angle surface is strong, smooth and low-noise;
+    // a correct cyclic-linear tensor explains almost all held-out variance.
+    assert!(
+        gam_test_r2 >= 0.97,
+        "gam's held-out SZA R2 too low: {gam_test_r2:.4} (< 0.97)"
+    );
+
+    // ---- BASELINE (match-or-beat): no worse than mgcv on held-out RMSE ----
+    assert!(
+        gam_test_rmse <= mgcv_test_rmse * 1.10,
+        "gam held-out RMSE {gam_test_rmse:.4} exceeds mgcv {mgcv_test_rmse:.4} * 1.10"
+    );
+
+    // ---- complexity sanity: edf in a signal-appropriate range (not matched) -
+    assert!(
+        gam_edf > 2.0 && gam_edf < 60.0,
+        "gam effective dof out of sane range: {gam_edf:.3}"
+    );
+}
+
+/// Right-pad `v` with its last value (or 0.0 when empty) to length `len`, so it
+/// can ride along as a column of the reference data.frame. Only the first
+/// `v.len()` entries are read back inside the R body.
+fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
+    assert!(
+        v.len() <= len,
+        "pad target {len} shorter than source {}",
+        v.len()
+    );
+    let fill = v.last().copied().unwrap_or(0.0);
+    let mut out = v.to_vec();
+    out.resize(len, fill);
+    out
 }

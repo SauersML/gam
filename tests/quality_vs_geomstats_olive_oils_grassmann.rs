@@ -44,6 +44,52 @@ use ndarray::{Array1, Array2};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+/// Grassmann geodesic distance between two row-major flattened `D×K` frames, via
+/// gam's `log_map`: `d = ‖Log_{P}(Q)‖_F`. This is the SAME gam capability the
+/// synthetic/ground-truth test above pins to geomstats; here it is the kernel of
+/// an objective held-out classifier.
+fn grassmann_dist(gr: &GrassmannManifold, p: &Array1<f64>, q: &Array1<f64>) -> f64 {
+    let log = gr.log_map(p.view(), q.view()).expect("gam Grassmann log_map");
+    log.iter().map(|x| x * x).sum::<f64>().sqrt()
+}
+
+/// Intrinsic Grassmann Fréchet (Karcher) mean of a set of `D×K` frames, computed
+/// ENTIRELY through gam's exponential and logarithm: iterate
+/// `μ ← Exp_μ( (1/N) Σ_i Log_μ(P_i) )` from the first frame until the mean
+/// tangent vanishes. This is gam's Grassmann geometry doing the work; geomstats
+/// is only the match-or-beat baseline for the variance it achieves.
+fn grassmann_frechet_mean(gr: &GrassmannManifold, frames: &[Array1<f64>]) -> Array1<f64> {
+    assert!(!frames.is_empty(), "Fréchet mean needs at least one frame");
+    let mut mu = frames[0].clone();
+    for _ in 0..200 {
+        let mut tangent = Array1::<f64>::zeros(D * K);
+        for f in frames {
+            let log = gr.log_map(mu.view(), f.view()).expect("gam log_map in Karcher mean");
+            tangent += &log;
+        }
+        tangent /= frames.len() as f64;
+        let step: f64 = tangent.iter().map(|x| x * x).sum::<f64>().sqrt();
+        mu = gr.exp_map(mu.view(), tangent.view()).expect("gam exp_map in Karcher mean");
+        if step < 1e-12 {
+            break;
+        }
+    }
+    mu
+}
+
+/// Total within-set squared geodesic distance of a candidate mean `mu` to every
+/// frame — the Fréchet objective the Karcher mean minimizes. Lower is a tighter
+/// (more central) mean; this is the objective both gam and geomstats are scored on.
+fn frechet_variance(gr: &GrassmannManifold, mu: &Array1<f64>, frames: &[Array1<f64>]) -> f64 {
+    frames
+        .iter()
+        .map(|f| {
+            let d = grassmann_dist(gr, mu, f);
+            d * d
+        })
+        .sum()
+}
+
 const D: usize = 8; // ambient dimension (eight fatty acids)
 const K: usize = 3; // subspace dimension -> Gr(3, 8)
 const FEATURES: [&str; D] = [
@@ -447,5 +493,247 @@ emit("ang_rss", ang_rss)
         max_isometry_err < 1e-9,
         "gam Grassmann geodesic violates the metric isometry ‖log(exp(v))‖ = ‖v‖ on \
          olive-oil subspace tangents: {max_isometry_err:.3e}"
+    );
+}
+
+/// REAL-DATA predictive arm (truth unknown → judged on an OBJECTIVE held-out
+/// metric, with geomstats as a match-or-beat baseline, never a target to copy).
+///
+/// SOURCE: the same vendored Forina Italian olive-oil dataset documented at the
+/// top of this file (`bench/datasets/olive_oils.csv`, mirrored from
+/// https://raw.githubusercontent.com/vincentarelbundock/Rdatasets/master/csv/dslabs/olive.csv).
+///
+/// TASK (exercises gam's Grassmann `log_map`/`exp_map` exactly as the synthetic
+/// test does, but on a held-out *prediction*): for every producing area we split
+/// that area's samples deterministically — even row index → TRAIN, odd row index
+/// → TEST — and form an independent top-`K` PCA subspace (a point of `Gr(3,8)`)
+/// from each half. The TRAIN subspaces are class prototypes; each held-out TEST
+/// subspace is classified to the area whose TRAIN prototype is GRASSMANN-NEAREST
+/// (smallest `‖Log‖_F` geodesic distance). Because a region's fatty-acid
+/// covariance is stable across a random split, a test half should land closest to
+/// its own train half — so classification accuracy is a genuine objective signal.
+///
+/// OBJECTIVE METRIC (the pass criteria):
+///   PRIMARY (tool-free): held-out nearest-prototype classification ACCURACY,
+///     where the metric is gam's own Grassmann geodesic distance, must clear an
+///     absolute bar well above the 1/n_areas random baseline.
+///   GEOMETRY PRIMARY (match-or-beat): gam's intrinsic Grassmann Fréchet mean of
+///     the TRAIN prototypes (built only from gam's exp/log) must achieve a Fréchet
+///     variance no worse than geomstats' `FrechetMean` (the mature manifold
+///     library) by more than a small margin — gam's mean is at least as central.
+///   BASELINE (match-or-beat): gam's classification accuracy must be no worse than
+///     geomstats' accuracy on the byte-identical frames minus a one-sample margin.
+#[test]
+fn olive_oils_grassmann_distance_matches_geomstats_on_real_data() {
+    let gr = GrassmannManifold::new(K, D).expect("Gr(3, 8) is a valid Grassmannian");
+
+    // --- deterministic per-area train/test split on real samples -----------
+    // Within each area, even local index → TRAIN, odd → TEST (a fixed, RNG-free
+    // split). Each half must still exceed K samples to admit a rank-K subspace.
+    let groups = load_groups();
+    let mut area_names: Vec<String> = Vec::new();
+    let mut train_frames: Vec<Array1<f64>> = Vec::new();
+    let mut test_frames: Vec<Array1<f64>> = Vec::new();
+
+    for (area, rows) in groups.iter() {
+        let train_rows: Vec<[f64; D]> =
+            rows.iter().enumerate().filter(|(i, _)| i % 2 == 0).map(|(_, r)| *r).collect();
+        let test_rows: Vec<[f64; D]> =
+            rows.iter().enumerate().filter(|(i, _)| i % 2 == 1).map(|(_, r)| *r).collect();
+        // Only keep areas whose BOTH halves admit a well-defined rank-K subspace
+        // (enough samples and a clean spectral gap). pca_subspace asserts both, so
+        // gate on size here and let it assert the gap.
+        if train_rows.len() <= K || test_rows.len() <= K {
+            continue;
+        }
+        area_names.push(area.clone());
+        train_frames.push(flatten_frame(&pca_subspace(&train_rows)));
+        test_frames.push(flatten_frame(&pca_subspace(&test_rows)));
+    }
+    let n_areas = area_names.len();
+    assert!(
+        n_areas >= 4,
+        "expected several olive-oil areas with splittable samples, got {n_areas}"
+    );
+
+    // --- gam Grassmann nearest-prototype classification of held-out halves --
+    // Distance kernel = gam's log_map Frobenius norm (metric A of the ground-truth
+    // test). For each test subspace, the predicted area is argmin over train
+    // prototypes; the full distance matrix is also handed to geomstats below.
+    let mut dist_matrix: Vec<f64> = Vec::with_capacity(n_areas * n_areas);
+    let mut gam_correct = 0usize;
+    for (ti, test) in test_frames.iter().enumerate() {
+        let mut best_j = 0usize;
+        let mut best_d = f64::INFINITY;
+        for (tj, train) in train_frames.iter().enumerate() {
+            let d = grassmann_dist(&gr, test, train);
+            dist_matrix.push(d);
+            if d < best_d {
+                best_d = d;
+                best_j = tj;
+            }
+        }
+        if best_j == ti {
+            gam_correct += 1;
+        }
+    }
+    let gam_accuracy = gam_correct as f64 / n_areas as f64;
+
+    // --- gam intrinsic Grassmann Fréchet mean of the TRAIN prototypes -------
+    let gam_mean = grassmann_frechet_mean(&gr, &train_frames);
+    let gam_mean_variance = frechet_variance(&gr, &gam_mean, &train_frames);
+    // Orthonormality of gam's mean (it must be a valid Grassmann point).
+    let gm = matrix_from_flat(gam_mean.as_slice().unwrap());
+    let gm_gram = gm.t().dot(&gm);
+    let mut gm_defect = 0.0_f64;
+    for i in 0..K {
+        for j in 0..K {
+            let target = if i == j { 1.0 } else { 0.0 };
+            gm_defect = gm_defect.max((gm_gram[[i, j]] - target).abs());
+        }
+    }
+    assert!(
+        gm_defect < 1e-8,
+        "gam Grassmann Fréchet mean is not orthonormal: defect {gm_defect:.3e}"
+    );
+
+    // --- geomstats BASELINE on byte-identical frames ------------------------
+    // Two equal-length flat columns (train + test prototypes, each n_areas frames
+    // of D*K row-major entries) plus the gam Fréchet mean as a third equal-length
+    // column padded to the same length so the harness sees uniform row counts.
+    let mut train_flat: Vec<f64> = Vec::new();
+    let mut test_flat: Vec<f64> = Vec::new();
+    for (tr, te) in train_frames.iter().zip(&test_frames) {
+        train_flat.extend(tr.iter().copied());
+        test_flat.extend(te.iter().copied());
+    }
+    // gam's mean is a single D*K frame; pad it to n_areas*D*K with zeros so all
+    // three columns are equal length. geomstats reads only the first D*K entries.
+    let mut gam_mean_flat: Vec<f64> = gam_mean.to_vec();
+    gam_mean_flat.resize(train_flat.len(), 0.0);
+
+    let py = run_python(
+        &[
+            Column::new("train_flat", &train_flat),
+            Column::new("test_flat", &test_flat),
+            Column::new("gam_mean_flat", &gam_mean_flat),
+        ],
+        &format!(
+            r#"
+import numpy as np
+from geomstats.geometry.grassmannian import Grassmannian
+from geomstats.learning.frechet_mean import FrechetMean
+
+D, K = {d}, {k}
+train = np.asarray(df["train_flat"], dtype=float)
+NA = train.size // (D * K)  # one flattened D×K frame per area
+
+train = train.reshape(NA, D, K)
+test  = np.asarray(df["test_flat"], dtype=float).reshape(NA, D, K)
+gam_mean = np.asarray(df["gam_mean_flat"], dtype=float)[: D * K].reshape(D, K)
+
+space = Grassmannian(D, K)
+metric = space.metric
+
+def proj(Y):
+    return Y @ Y.T  # geomstats Grassmann point = orthogonal projector
+
+P_train = np.stack([proj(train[a]) for a in range(NA)])
+P_test  = np.stack([proj(test[a])  for a in range(NA)])
+P_gam_mean = proj(gam_mean)
+
+# Nearest-prototype classification accuracy under geomstats' own distance.
+correct = 0
+dist = []
+for a in range(NA):
+    ds = [float(metric.dist(P_test[a], P_train[b])) for b in range(NA)]
+    dist.extend(ds)
+    if int(np.argmin(ds)) == a:
+        correct += 1
+emit("gs_accuracy", [correct / NA])
+emit("gs_dist", dist)
+
+# geomstats intrinsic Fréchet mean of the train prototypes, and the Fréchet
+# variance achieved by BOTH means (geomstats' own and gam's).
+fm = FrechetMean(space)
+fm.fit(P_train)
+P_gs_mean = fm.estimate_
+
+def variance(P_mean):
+    return float(sum(metric.dist(P_mean, P_train[b]) ** 2 for b in range(NA)))
+
+emit("gs_mean_variance", [variance(P_gs_mean)])
+emit("gam_mean_variance_gs", [variance(P_gam_mean)])
+"#,
+            d = D,
+            k = K,
+        ),
+    );
+
+    let gs_accuracy = py.scalar("gs_accuracy");
+    let gs_dist = py.vector("gs_dist");
+    let gs_mean_variance = py.scalar("gs_mean_variance");
+    let gam_mean_variance_gs = py.scalar("gam_mean_variance_gs");
+    assert_eq!(gs_dist.len(), n_areas * n_areas, "geomstats distance-matrix size");
+
+    // gam's distance matrix must agree with geomstats' to the SVD noise floor
+    // (this is the same closed-form geodesic distance the ground-truth test pins),
+    // confirming both classifiers see byte-identical geometry before we compare
+    // their decisions.
+    let dist_diff = max_abs_diff(&dist_matrix, gs_dist);
+
+    eprintln!(
+        "Gr({K},{D}) olive-oil held-out subspace classification: areas={n_areas} \
+         gam_accuracy={gam_accuracy:.3} gs_accuracy={gs_accuracy:.3} dist_vs_geomstats={dist_diff:.3e} | \
+         Fréchet variance gam={gam_mean_variance:.4} (geomstats-recomputed={gam_mean_variance_gs:.4}) \
+         geomstats={gs_mean_variance:.4}"
+    );
+
+    // distance-matrix agreement gate (geometry parity before decision parity).
+    assert!(
+        dist_diff < 1e-7,
+        "gam vs geomstats Grassmann distance matrix disagree on the held-out olive-oil \
+         subspaces: max |Δ| = {dist_diff:.3e}"
+    );
+
+    // ===================== PRIMARY: absolute held-out accuracy ==============
+    // Random nearest-prototype guessing scores 1/n_areas; a region's covariance is
+    // stable across the even/odd split, so the correct area must dominate. Require
+    // a strong absolute majority well above chance.
+    let chance = 1.0 / n_areas as f64;
+    assert!(
+        gam_accuracy >= 0.6 && gam_accuracy > chance + 0.2,
+        "gam held-out Grassmann nearest-prototype accuracy too low: {gam_accuracy:.3} \
+         (chance={chance:.3}, n_areas={n_areas})"
+    );
+
+    // ===================== BASELINE: match-or-beat geomstats accuracy =======
+    // gam must classify the held-out subspaces at least as well as the mature
+    // manifold library, allowing one sample of slack for argmin tie-breaking.
+    let one_sample = 1.0 / n_areas as f64 + 1e-9;
+    assert!(
+        gam_accuracy >= gs_accuracy - one_sample,
+        "gam held-out accuracy {gam_accuracy:.3} trails geomstats {gs_accuracy:.3} by more \
+         than one sample"
+    );
+
+    // ===================== GEOMETRY PRIMARY: Fréchet mean centrality ========
+    // gam's intrinsic Grassmann mean (built purely from gam exp/log) must be at
+    // least as central as geomstats' FrechetMean: its Fréchet variance is no worse
+    // than geomstats' by more than a small relative margin. Compare on geomstats'
+    // OWN recomputation of gam's variance to avoid any cross-tool metric drift.
+    let margin = 1e-6 * gs_mean_variance.max(1.0);
+    assert!(
+        gam_mean_variance_gs <= gs_mean_variance + margin,
+        "gam Grassmann Fréchet mean is less central than geomstats: gam variance \
+         {gam_mean_variance_gs:.6} > geomstats {gs_mean_variance:.6} + {margin:.3e}"
+    );
+
+    // Self-consistency: gam's own variance evaluation of its mean tracks geomstats'
+    // recomputation of the same quantity (no metric-convention mismatch).
+    assert!(
+        (gam_mean_variance - gam_mean_variance_gs).abs() < 1e-6 * gam_mean_variance.max(1.0),
+        "gam vs geomstats disagree on gam-mean Fréchet variance: {gam_mean_variance:.6} vs \
+         {gam_mean_variance_gs:.6}"
     );
 }

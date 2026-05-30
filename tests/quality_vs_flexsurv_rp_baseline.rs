@@ -52,6 +52,7 @@ use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, relative_l2, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+    load_csvwith_inferred_schema,
 };
 use ndarray::Array2;
 use std::fs::File;
@@ -402,6 +403,248 @@ fn gam_rp_baseline_holdout_concordance_matches_or_beats_flexsurvspline_on_bone()
     // Same metric, same train rows, same held-out subjects: gam's ranking quality
     // must be at least the mature reference's, up to a small tolerance for the
     // legitimate basis/knot difference between the two engines.
+    assert!(
+        gam_c >= flex_c - 0.05,
+        "gam's held-out concordance {gam_c:.4} trails flexsurv {flex_c:.4} by more than \
+         the basis-difference margin (0.05): gam ranks unseen survival worse than the reference"
+    );
+}
+
+// ===========================================================================
+// REAL-DATA ARM
+// ===========================================================================
+//
+// Same gam capability (the Royston-Parmar net-survival flexible-parametric
+// baseline), now exercised on a real, non-synthetic clinical survival dataset
+// where the truth is unknown. Because there is no ground-truth function to
+// recover, the OBJECTIVE metric is again held-out Harrell's concordance: fit
+// gam's RP model on the TRAIN rows, score the identical held-out TEST rows, and
+// require (PRIMARY) gam's held-out C to clear a bar strictly above chance, and
+// (BASELINE-TO-BEAT) gam's held-out C to be at least flexsurvspline's minus a
+// small basis-difference margin on that SAME metric.
+//
+// Data SOURCE: `veteran_lung.csv` — the Veterans' Administration lung-cancer
+// randomized trial (137 subjects), the canonical `veteran` dataset shipped with
+// R's `survival` package (Kalbfleisch & Prentice, "The Statistical Analysis of
+// Failure Time Data"). Columns used: `time` = survival time in days,
+// `status` = death indicator (1 = died, 0 = right-censored), `karno` =
+// Karnofsky performance score (0-100; higher = healthier, a strong continuous
+// prognostic factor). The PH covariate is the continuous `karno` score, so the
+// fitted model has the same linear-PH-on-log-Λ structure as the synthetic arm
+// above. Split is fixed (even original-row index ⇒ train, odd ⇒ test) so gam
+// and flexsurv see byte-identical train and test subsets.
+
+const VETERAN_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/veteran_lung.csv");
+
+#[test]
+fn gam_rp_baseline_holdout_concordance_matches_or_beats_flexsurvspline_on_bone_on_real_data() {
+    init_parallelism();
+
+    // ---- load the real veteran lung-cancer survival data --------------------
+    let raw = load_csvwith_inferred_schema(Path::new(VETERAN_CSV)).expect("load veteran_lung.csv");
+    let col = raw.column_map();
+    let time_idx = col["time"];
+    let status_idx = col["status"];
+    let karno_idx = col["karno"];
+    let time: Vec<f64> = raw.values.column(time_idx).to_vec();
+    let event: Vec<f64> = raw.values.column(status_idx).to_vec();
+    let karno: Vec<f64> = raw.values.column(karno_idx).to_vec();
+    let n = time.len();
+    assert!(n > 120, "veteran should have ~137 rows, got {n}");
+    let n_events: usize = event.iter().filter(|&&e| e == 1.0).count();
+    assert!(
+        n_events >= 100,
+        "veteran is mostly uncensored; expected many deaths, got {n_events}"
+    );
+    // karno is a genuine continuous prognostic score spanning a wide range.
+    let karno_min = karno.iter().cloned().fold(f64::INFINITY, f64::min);
+    let karno_max = karno.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    assert!(
+        karno_max - karno_min > 50.0,
+        "karno score should span a wide range: [{karno_min}, {karno_max}]"
+    );
+
+    // Standardize karno so the spline-time and covariate blocks are on a
+    // comparable numeric scale (a monotone affine reparametrization; it leaves
+    // the PH ordering, and hence concordance, unchanged for both engines). The
+    // identical standardized values are written to gam and to flexsurv.
+    let karno_mean = karno.iter().sum::<f64>() / n as f64;
+    let karno_sd = {
+        let v = karno
+            .iter()
+            .map(|k| (k - karno_mean) * (k - karno_mean))
+            .sum::<f64>()
+            / (n as f64 - 1.0);
+        v.sqrt().max(1e-12)
+    };
+    let karno_z: Vec<f64> = karno.iter().map(|k| (k - karno_mean) / karno_sd).collect();
+
+    // ---- deterministic split: even original-row index -> train, odd -> test -
+    let train_idx: Vec<usize> = (0..n).filter(|i| i % 2 == 0).collect();
+    let test_idx: Vec<usize> = (0..n).filter(|i| i % 2 == 1).collect();
+    assert!(
+        train_idx.len() >= 50 && test_idx.len() >= 50,
+        "split too small: train={} test={}",
+        train_idx.len(),
+        test_idx.len()
+    );
+    let test_events: usize = test_idx.iter().filter(|&&i| event[i] == 1.0).count();
+    assert!(
+        test_events >= 20,
+        "held-out set needs events to score concordance, got {test_events}"
+    );
+
+    let pick = |src: &[f64], idx: &[usize]| -> Vec<f64> { idx.iter().map(|&i| src[i]).collect() };
+    let (train_time, train_event, train_karno) = (
+        pick(&time, &train_idx),
+        pick(&event, &train_idx),
+        pick(&karno_z, &train_idx),
+    );
+    let (test_time, test_event, test_karno) = (
+        pick(&time, &test_idx),
+        pick(&event, &test_idx),
+        pick(&karno_z, &test_idx),
+    );
+    let n_train = train_idx.len();
+
+    // ---- encode the numeric TRAIN survival frame for gam --------------------
+    let headers = ["t", "event", "karno"]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>();
+    let rows: Vec<StringRecord> = (0..n_train)
+        .map(|i| {
+            StringRecord::from(vec![
+                format!("{:.17e}", train_time[i]),
+                format!("{:.1}", train_event[i]),
+                format!("{:.17e}", train_karno[i]),
+            ])
+        })
+        .collect();
+    let ds =
+        encode_recordswith_inferred_schema(headers, rows).expect("encode veteran train frame");
+
+    // ---- fit gam on TRAIN: Royston-Parmar net-survival baseline + linear cov -
+    let cfg = FitConfig {
+        survival_likelihood: "transformation".to_string(),
+        time_basis: "ispline".to_string(),
+        time_degree: TIME_DEGREE,
+        time_num_internal_knots: N_INTERNAL_KNOTS,
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula("Surv(t, event) ~ karno + survmodel(spec=net)", &ds, &cfg)
+        .expect("gam RP-baseline net-survival fit on veteran");
+    let FitResult::SurvivalTransformation(fit) = result else {
+        panic!("expected a survival-transformation (Royston-Parmar) fit result");
+    };
+
+    let beta = &fit.fit.beta;
+    let p_time = fit.time_base_ncols;
+    assert!(
+        p_time > 0 && p_time < beta.len(),
+        "RP time block should be a strict prefix of beta: p_time={p_time}, p={}",
+        beta.len()
+    );
+    let beta_cov = beta.slice(ndarray::s![p_time..]).to_owned();
+
+    // PH covariate linear predictor η = c(karno)·β_cov rebuilt from the frozen
+    // spec; under PH the baseline log-Λ is shared, so η alone is a sufficient
+    // relative-risk score for ranking held-out survival.
+    let karno_col = ds.column_map()["karno"];
+    let cov_eta = |karno_val: f64| -> f64 {
+        let mut grid = Array2::<f64>::zeros((1, ds.headers.len()));
+        grid[[0, karno_col]] = karno_val;
+        let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
+            .expect("rebuild covariate design");
+        assert_eq!(
+            design.design.ncols(),
+            beta_cov.len(),
+            "covariate design width must equal β_cov length"
+        );
+        design.design.apply(&beta_cov).to_vec()[0]
+    };
+
+    let gam_risk: Vec<f64> = (0..test_idx.len())
+        .map(|i| cov_eta(test_karno[i]))
+        .collect();
+    let gam_c = concordance(&test_time, &test_event, &gam_risk);
+    assert!(
+        gam_c.is_finite(),
+        "gam held-out concordance is undefined (no comparable pairs)"
+    );
+
+    // Context only (NOT a pass criterion): gam's fitted karno slope. Higher
+    // Karnofsky (healthier) should LOWER hazard, so we expect β_karno < 0.
+    let gam_beta_karno = cov_eta(1.0) - cov_eta(0.0);
+
+    // ---- fit the SAME model with flexsurv on the SAME TRAIN rows, score TEST --
+    let train_flag: Vec<f64> = (0..n)
+        .map(|i| if i % 2 == 0 { 1.0 } else { 0.0 })
+        .collect();
+    let ref_time = {
+        let mut sorted = time.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).expect("finite times"));
+        sorted[sorted.len() / 2]
+    };
+    let r = run_r(
+        &[
+            Column::new("t", &time),
+            Column::new("event", &event),
+            Column::new("karno", &karno_z),
+            Column::new("train", &train_flag),
+        ],
+        &format!(
+            r#"
+            suppressPackageStartupMessages(library(flexsurv))
+            tr <- df[df$train == 1, ]
+            te <- df[df$train == 0, ]
+            m <- flexsurvspline(Surv(t, event) ~ karno, data = tr,
+                                k = {k}, scale = "hazard")
+            emit("beta_karno", as.numeric(coef(m)["karno"]))
+            nd <- data.frame(karno = te$karno)
+            ch <- summary(m, newdata = nd, type = "cumhaz", t = c({ref_time}), ci = FALSE)
+            risk <- sapply(ch, function(s) log(s$est[1]))
+            emit("risk", as.numeric(risk))
+            "#,
+            k = N_INTERNAL_KNOTS,
+            ref_time = format!("{ref_time:.10e}"),
+        ),
+    );
+    let flex_beta_karno = r.scalar("beta_karno");
+    let flex_risk = r.vector("risk");
+    assert_eq!(
+        flex_risk.len(),
+        test_idx.len(),
+        "flexsurv emitted {} held-out risk scores, expected {}",
+        flex_risk.len(),
+        test_idx.len()
+    );
+    let flex_c = concordance(&test_time, &test_event, flex_risk);
+    assert!(
+        flex_c.is_finite(),
+        "flexsurv baseline concordance is undefined (no comparable pairs)"
+    );
+
+    let rel_beta = relative_l2(&[gam_beta_karno], &[flex_beta_karno]);
+    eprintln!(
+        "veteran RP-baseline held-out concordance: n={n} (train={n_train} test={} test_events={test_events}) \
+         gam_C={gam_c:.4} flex_C={flex_c:.4} | context: gam_beta_karno={gam_beta_karno:.4} \
+         flex_beta_karno={flex_beta_karno:.4} rel_l2(beta_karno)={rel_beta:.4}",
+        test_idx.len()
+    );
+
+    // ---- OBJECTIVE assertion 1 (PRIMARY): gam ranks unseen survival ----------
+    // Karnofsky score is a strong, well-established prognostic factor in the
+    // veteran trial, and the held-out set is large (~68 subjects, >=20 events),
+    // so a competent ranker clears a bar comfortably above chance. C >= 0.58 is
+    // a genuine signal on real data, far from the 0.5 coin flip.
+    assert!(
+        gam_c >= 0.58,
+        "gam's held-out concordance {gam_c:.4} is no better than chance — the fitted \
+         Royston-Parmar model does not rank unseen veteran survival ordering"
+    );
+
+    // ---- OBJECTIVE assertion 2 (BASELINE-TO-BEAT): match-or-beat flexsurv -----
     assert!(
         gam_c >= flex_c - 0.05,
         "gam's held-out concordance {gam_c:.4} trails flexsurv {flex_c:.4} by more than \

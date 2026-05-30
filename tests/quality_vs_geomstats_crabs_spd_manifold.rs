@@ -419,3 +419,212 @@ emit("gam_mean_grad_norm", [float(metric.norm(grad, G))])
          gradient norm in geomstats' affine-invariant metric = {gs_grad_norm:.3e} (>=1e-7)"
     );
 }
+
+const N_TRAIN_PER_GROUP: usize = 35; // first 35 of each group's 50 crabs -> TRAIN
+const N_TEST_PER_GROUP: usize = 15; //  last 15 of each group's 50 crabs -> TEST
+
+/// `argmin_j d(point, refs[j])` under gam's affine-invariant SPD geodesic
+/// distance — a nearest-centroid classifier in the curved SPD geometry.
+fn gam_nearest(spd: &SpdManifold, point: &Array1<f64>, refs: &[Array1<f64>]) -> usize {
+    let mut best = 0usize;
+    let mut best_d2 = f64::INFINITY;
+    for (j, r) in refs.iter().enumerate() {
+        let d2 = gam_sq_dist(spd, point.view(), r.view());
+        if d2 < best_d2 {
+            best_d2 = d2;
+            best = j;
+        }
+    }
+    best
+}
+
+/// REAL-DATA arm of the SPD manifold capability. The synthetic ground-truth in
+/// the companion test proves gam's `exp`/`log`/`metric` are mathematically exact;
+/// this arm proves the SAME affine-invariant geometry does objective predictive
+/// WORK on held-out real covariances, with geomstats as a match-or-beat baseline.
+///
+/// Source data: MASS::crabs (same file/columns as the companion test),
+///   https://raw.githubusercontent.com/vincentarelbundock/Rdatasets/master/csv/MASS/crabs.csv
+///
+/// Task — held-out nearest-centroid classification in SPD(5): each of the four
+/// species×sex groups (50 crabs) is split deterministically into the FIRST 35
+/// (train) and LAST 15 (test) rows. From the train rows we build four "centroid"
+/// SPD covariances; from the test rows we build four held-out SPD covariances —
+/// the test covariances are formed from rows that never touched the centroids.
+/// Each held-out covariance is then classified to the train centroid that is
+/// CLOSEST under gam's affine-invariant geodesic distance. Because covariance
+/// STRUCTURE is the group signature, a correct curved-space distance recovers
+/// every group, so the objective held-out metric is multiclass ACCURACY.
+///
+///   PRIMARY (objective, tool-free): held-out 4-way classification accuracy
+///     `gam_acc == 1.0` (all four held-out group covariances land on their own
+///     train centroid). A wrong P^{1/2} conjugation or exp/log defect distorts
+///     the distances and misroutes a group, dropping accuracy below 1.
+///
+///   BASELINE (match-or-beat): geomstats classifies the IDENTICAL train/test
+///     covariances with ITS `SPDAffineMetric.dist`; gam's accuracy must satisfy
+///     `gam_acc >= geomstats_acc` (no margin needed — accuracy is integral and
+///     geomstats is the mature standard, never a target to merely echo). We also
+///     assert the full 4×4 held-out (test→train) distance matrix matches
+///     geomstats to LAPACK precision, so the classification agreement is earned
+///     by correct geometry, not a lucky tie-break.
+#[test]
+fn crabs_group_covariances_match_geomstats_spd_geometry_on_real_data() {
+    let rows = load_crabs();
+    // Per-group rows in load order; split FIRST 35 train / LAST 15 test.
+    let mut train_rows: Vec<Vec<[f64; P]>> = (0..M).map(|_| Vec::new()).collect();
+    let mut test_rows: Vec<Vec<[f64; P]>> = (0..M).map(|_| Vec::new()).collect();
+    let mut seen = [0usize; M];
+    for (g, meas) in &rows {
+        let k = seen[*g];
+        if k < N_TRAIN_PER_GROUP {
+            train_rows[*g].push(*meas);
+        } else {
+            test_rows[*g].push(*meas);
+        }
+        seen[*g] += 1;
+    }
+    for g in 0..M {
+        assert_eq!(
+            train_rows[g].len(),
+            N_TRAIN_PER_GROUP,
+            "group {g} train split size"
+        );
+        assert_eq!(
+            test_rows[g].len(),
+            N_TEST_PER_GROUP,
+            "group {g} test split size"
+        );
+    }
+
+    // SPD covariances: four train centroids, four held-out test points. Same
+    // unbiased (ddof=1) estimator on both sides; n>p keeps every block full-rank.
+    let train_covs: Vec<Array1<f64>> = train_rows
+        .iter()
+        .map(|rs| flat(&sample_covariance(rs)))
+        .collect();
+    let test_covs: Vec<Array1<f64>> = test_rows
+        .iter()
+        .map(|rs| flat(&sample_covariance(rs)))
+        .collect();
+
+    let spd = SpdManifold::new(P);
+
+    // ---- gam: held-out test→train distance matrix + classification ---------
+    let mut gam_dist = vec![0.0_f64; M * M]; // row = test group, col = train centroid
+    for ti in 0..M {
+        for tj in 0..M {
+            let d2 = gam_sq_dist(&spd, test_covs[ti].view(), train_covs[tj].view());
+            gam_dist[ti * M + tj] = d2.max(0.0).sqrt();
+        }
+    }
+    let mut gam_correct = 0usize;
+    for ti in 0..M {
+        if gam_nearest(&spd, &test_covs[ti], &train_covs) == ti {
+            gam_correct += 1;
+        }
+    }
+    let gam_acc = gam_correct as f64 / M as f64;
+
+    // ---- geomstats BASELINE on the IDENTICAL train/test rows ---------------
+    // Hand Python the 200 raw measurements plus the per-row group id AND an
+    // is_train mask (1.0 = train, 0.0 = test) — every column the same length,
+    // so geomstats reconstructs the EXACT same four train and four test
+    // covariances, the same affine-invariant distance matrix, and the same
+    // nearest-centroid classification.
+    let n_rows = rows.len();
+    let gid: Vec<f64> = rows.iter().map(|(g, _)| *g as f64).collect();
+    let mut is_train: Vec<f64> = Vec::with_capacity(n_rows);
+    let mut seen2 = [0usize; M];
+    for (g, _) in &rows {
+        let k = seen2[*g];
+        is_train.push(if k < N_TRAIN_PER_GROUP { 1.0 } else { 0.0 });
+        seen2[*g] += 1;
+    }
+    let mut meas_cols: Vec<Vec<f64>> = (0..P).map(|_| Vec::with_capacity(n_rows)).collect();
+    for (_, m) in &rows {
+        for k in 0..P {
+            meas_cols[k].push(m[k]);
+        }
+    }
+    let meas_names = ["FL", "RW", "CL", "CW", "BD"];
+    let mut cols: Vec<Column<'_>> = vec![
+        Column::new("gid", &gid),
+        Column::new("is_train", &is_train),
+    ];
+    for (k, name) in meas_names.iter().enumerate() {
+        cols.push(Column::new(name, &meas_cols[k]));
+    }
+
+    let body = format!(
+        r#"
+import numpy as np
+from geomstats.geometry.spd_matrices import SPDMatrices, SPDAffineMetric
+
+P, M = {p}, {m}
+names = ["FL", "RW", "CL", "CW", "BD"]
+gid = np.asarray(df["gid"], dtype=float).round().astype(int)
+is_train = np.asarray(df["is_train"], dtype=float).round().astype(int)
+X = np.column_stack([np.asarray(df[n], dtype=float) for n in names])  # (200, P)
+
+def cov(mask):
+    C = np.cov(X[mask].T, ddof=1)
+    return 0.5 * (C + C.T)
+
+train = np.asarray([cov((gid == g) & (is_train == 1)) for g in range(M)])
+test = np.asarray([cov((gid == g) & (is_train == 0)) for g in range(M)])
+
+space = SPDMatrices(P)
+space.equip_with_metric(SPDAffineMetric)
+metric = space.metric
+
+D = np.zeros((M, M))  # row = test group, col = train centroid
+for ti in range(M):
+    for tj in range(M):
+        D[ti, tj] = float(metric.dist(test[ti], train[tj]))
+emit("dist", D.reshape(-1))
+
+correct = sum(1 for ti in range(M) if int(np.argmin(D[ti])) == ti)
+emit("acc", [correct / M])
+"#,
+        p = P,
+        m = M,
+    );
+
+    let r = run_python(&cols, &body);
+    let ref_dist = r.vector("dist");
+    let gs_acc = r.scalar("acc");
+    assert_eq!(ref_dist.len(), M * M, "geomstats held-out distance matrix size");
+
+    let dist_err = max_abs_diff(&gam_dist, ref_dist);
+
+    eprintln!(
+        "SPD(5) crabs HELD-OUT classify (train {N_TRAIN_PER_GROUP}/group, test \
+         {N_TEST_PER_GROUP}/group) | gam_acc={gam_acc:.3} geomstats_acc={gs_acc:.3} \
+         test_to_train_dist_max_abs={dist_err:.3e}"
+    );
+
+    // ---- PRIMARY objective assertion: perfect held-out recovery ------------
+    assert!(
+        (gam_acc - 1.0).abs() < 1e-12,
+        "gam SPD nearest-centroid misclassifies a held-out crab-group covariance: \
+         held-out accuracy {gam_acc:.3} (< 1.0)"
+    );
+
+    // ---- BASELINE (match-or-beat): no worse than geomstats -----------------
+    assert!(
+        gam_acc >= gs_acc - 1e-12,
+        "gam held-out SPD classification accuracy {gam_acc:.3} is below the \
+         geomstats baseline {gs_acc:.3}"
+    );
+
+    // ---- the agreement is EARNED by correct geometry, not a tie-break ------
+    // The affine-invariant geodesic distance is a closed form; gam must match
+    // geomstats' eigendecomposition value on these O(10)-scale covariances to
+    // LAPACK precision. 1e-8 absolute sits well above the f64 noise floor.
+    assert!(
+        dist_err < 1e-8,
+        "gam SPD affine-invariant held-out distance matrix disagrees with \
+         geomstats: max |Δd| = {dist_err:.3e} (>=1e-8)"
+    );
+}

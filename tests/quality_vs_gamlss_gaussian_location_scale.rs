@@ -43,8 +43,10 @@ use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+    load_csvwith_inferred_schema,
 };
 use ndarray::Array2;
+use std::path::Path;
 
 /// gam's location-scale noise link floor: sigma = 0.01 + exp(eta_scale).
 /// Mirrors `families::sigma_link::LOGB_SIGMA_FLOOR` (and mgcv `gaulss(b=0.01)`).
@@ -275,5 +277,262 @@ fn gam_gaussian_location_scale_matches_gamlss() {
         "gam log-sigma recovery worse than gamlss: gam={gam_rmse_log_sigma:.5} \
          > 1.10*gamlss={:.5}",
         1.10 * gamlss_rmse_log_sigma
+    );
+}
+
+/// Held-out Gaussian negative log-likelihood: the natural OBJECTIVE quality
+/// metric for a *location-scale* fit, because it scores BOTH the predicted mean
+/// AND the predicted sigma at each test point. For mu_i, sigma_i, y_i it is the
+/// per-observation `-log N(y_i | mu_i, sigma_i^2)` averaged over the test set:
+///   0.5*log(2*pi) + log(sigma_i) + 0.5*((y_i - mu_i)/sigma_i)^2.
+/// A model that gets the heteroscedastic envelope right (small sigma where the
+/// data are tight, large sigma where they scatter) earns a lower mean NLL than
+/// one that predicts the mean equally well but pretends the noise is constant.
+fn mean_gaussian_nll(mu: &[f64], sigma: &[f64], y: &[f64]) -> f64 {
+    assert_eq!(mu.len(), sigma.len(), "nll mu/sigma length mismatch");
+    assert_eq!(mu.len(), y.len(), "nll mu/y length mismatch");
+    let half_log_2pi = 0.5 * (2.0 * std::f64::consts::PI).ln();
+    let n = mu.len() as f64;
+    let s: f64 = (0..mu.len())
+        .map(|i| {
+            let sd = sigma[i].max(1e-12);
+            let z = (y[i] - mu[i]) / sd;
+            half_log_2pi + sd.ln() + 0.5 * z * z
+        })
+        .sum();
+    s / n
+}
+
+/// Coefficient of determination of the predicted MEAN against observed `truth`,
+/// relative to the constant-mean predictor: `1 - SS_res / SS_tot`.
+fn r2(pred: &[f64], truth: &[f64]) -> f64 {
+    assert_eq!(pred.len(), truth.len(), "r2 length mismatch");
+    let n = truth.len() as f64;
+    let mean = truth.iter().sum::<f64>() / n;
+    let ss_res: f64 = pred.iter().zip(truth).map(|(p, t)| (t - p) * (t - p)).sum();
+    let ss_tot: f64 = truth.iter().map(|t| (t - mean) * (t - mean)).sum();
+    1.0 - ss_res / ss_tot.max(1e-300)
+}
+
+/// REAL-DATA arm of the SAME capability (Gaussian location-scale: smooth mean +
+/// smooth log-sigma fit jointly). Truth is UNKNOWN on real data, so the proof of
+/// quality is OUT-OF-SAMPLE predictive accuracy of BOTH moments, scored by
+/// held-out Gaussian NLL and held-out mean-R^2.
+///
+/// Dataset SOURCE: `gagurine` from the R package `MASS` (Venables & Ripley,
+/// *Modern Applied Statistics with S*), shipped here as bench/datasets/gagurine.csv.
+/// Columns: Age (years, 0..~17.7) and GAG (urinary concentration of
+/// glycosaminoglycan). GAG is high and very scattered in infancy and decays to a
+/// low, tight level in the teens — a textbook heteroscedastic mean+scale problem
+/// (this is the worked location-scale example in MASS itself).
+///
+/// PRIMARY (objective, tool-free): on the held-out rows,
+///   * the predicted mean explains held-out variance well above the constant
+///     predictor (test mean-R^2 >= 0.55), and
+///   * the joint location-scale predictive density beats a strong constant-sigma
+///     reference: gam's held-out mean Gaussian NLL is below an absolute bar.
+/// BASELINE (match-or-beat): gamlss(NO()) with the SAME pb() mean and pb()
+///   sigma smooths fits the SAME training rows and predicts the SAME held-out
+///   rows; gam's held-out NLL must be no worse than gamlss's by more than 5%.
+#[test]
+fn gam_gaussian_location_scale_matches_gamlss_on_real_data() {
+    init_parallelism();
+
+    // ---- load the real gagurine dataset (Age -> GAG) ----------------------
+    let ds = load_csvwith_inferred_schema(Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/bench/datasets/gagurine.csv"
+    )))
+    .expect("load gagurine.csv");
+    let col = ds.column_map();
+    let age_idx = col["Age"];
+    let gag_idx = col["GAG"];
+    let age_all: Vec<f64> = ds.values.column(age_idx).to_vec();
+    let gag_all: Vec<f64> = ds.values.column(gag_idx).to_vec();
+    let n = age_all.len();
+    assert!(n > 300, "gagurine should have ~314 rows, got {n}");
+
+    // ---- deterministic train/test split: every 4th row held out ----------
+    let is_test = |i: usize| i % 4 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    assert!(
+        train_rows.len() > 200 && test_rows.len() > 60,
+        "split sizes: train={} test={}",
+        train_rows.len(),
+        test_rows.len()
+    );
+
+    let train_age: Vec<f64> = train_rows.iter().map(|&i| age_all[i]).collect();
+    let train_gag: Vec<f64> = train_rows.iter().map(|&i| gag_all[i]).collect();
+    let test_age: Vec<f64> = test_rows.iter().map(|&i| age_all[i]).collect();
+    let test_gag: Vec<f64> = test_rows.iter().map(|&i| gag_all[i]).collect();
+
+    // Build a training-only dataset by sub-setting the encoded rows; headers,
+    // schema and column kinds are unchanged, so the formula resolves identically.
+    let p = ds.headers.len();
+    let mut train_values = Array2::<f64>::zeros((train_rows.len(), p));
+    for (out_row, &src_row) in train_rows.iter().enumerate() {
+        for c in 0..p {
+            train_values[[out_row, c]] = ds.values[[src_row, c]];
+        }
+    }
+    let mut train_ds = ds.clone();
+    train_ds.values = train_values;
+
+    // ---- fit gam on TRAIN: mu ~ s(Age), log-sigma ~ 1 + s(Age) -----------
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        noise_formula: Some("1 + s(Age, bs='tp')".to_string()),
+        ..FitConfig::default()
+    };
+    let result =
+        fit_from_formula("GAG ~ s(Age, bs='tp')", &train_ds, &cfg).expect("gam location-scale fit");
+    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult { fit, .. }) = result
+    else {
+        panic!("expected a Gaussian location-scale fit");
+    };
+
+    let beta_location = fit
+        .fit
+        .block_by_role(BlockRole::Location)
+        .expect("location (mean) block present")
+        .beta
+        .clone();
+    let beta_scale = fit
+        .fit
+        .block_by_role(BlockRole::Scale)
+        .expect("scale (log-sigma) block present")
+        .beta
+        .clone();
+
+    // ---- gam predictions at the held-out Age points (mean AND sigma) ------
+    let mut test_grid = Array2::<f64>::zeros((test_rows.len(), p));
+    for (i, &a) in test_age.iter().enumerate() {
+        test_grid[[i, age_idx]] = a;
+    }
+    let mean_design_test = build_term_collection_design(test_grid.view(), &fit.meanspec_resolved)
+        .expect("rebuild mean design at held-out points");
+    let scale_design_test = build_term_collection_design(test_grid.view(), &fit.noisespec_resolved)
+        .expect("rebuild log-sigma design at held-out points");
+    let gam_test_mu: Vec<f64> = mean_design_test.design.apply(&beta_location).to_vec();
+    let gam_test_eta_sigma: Vec<f64> = scale_design_test.design.apply(&beta_scale).to_vec();
+    let gam_test_sigma: Vec<f64> = gam_test_eta_sigma
+        .iter()
+        .map(|&e| LOGB_SIGMA_FLOOR + e.exp())
+        .collect();
+    assert_eq!(gam_test_mu.len(), test_rows.len());
+    assert_eq!(gam_test_sigma.len(), test_rows.len());
+
+    // ---- fit the SAME model on TRAIN with gamlss, predict the SAME TEST ---
+    // gamlss(NO()) with pb() mean and pb() sigma smooths. We pad the test Age
+    // into parallel columns (length = train length) so a SINGLE run_r call sees
+    // equal-length columns; the body reads back only the first `test_n` entries
+    // and predicts mu/sigma on those held-out rows via predict.gamlss(type=...).
+    let train_len = train_age.len();
+    let test_age_padded = {
+        let mut v = test_age.clone();
+        let fill = v.last().copied().unwrap_or(0.0);
+        v.resize(train_len, fill);
+        v
+    };
+    let r = run_r(
+        &[
+            Column::new("Age", &train_age),
+            Column::new("GAG", &train_gag),
+            Column::new("test_Age", &test_age_padded),
+            Column::new("test_n", &vec![test_age.len() as f64; train_len]),
+        ],
+        r#"
+        suppressPackageStartupMessages(library(gamlss))
+        m <- gamlss(GAG ~ pb(Age), sigma.formula = ~ pb(Age), family = NO(),
+                    data = df, control = gamlss.control(trace = FALSE))
+        k <- df$test_n[1]
+        newd <- data.frame(Age = df$test_Age[1:k])
+        mu <- predict(m, what = "mu", newdata = newd, type = "response", data = df)
+        sigma <- predict(m, what = "sigma", newdata = newd, type = "response", data = df)
+        emit("mu", as.numeric(mu))
+        emit("sigma", as.numeric(sigma))
+        "#,
+    );
+    let gamlss_test_mu = r.vector("mu");
+    let gamlss_test_sigma = r.vector("sigma");
+    assert_eq!(
+        gamlss_test_mu.len(),
+        test_rows.len(),
+        "gamlss held-out mu length mismatch"
+    );
+    assert_eq!(
+        gamlss_test_sigma.len(),
+        test_rows.len(),
+        "gamlss held-out sigma length mismatch"
+    );
+
+    // ---- OBJECTIVE held-out metrics on gam's OWN predictions --------------
+    let gam_test_r2 = r2(&gam_test_mu, &test_gag);
+    let gam_test_nll = mean_gaussian_nll(&gam_test_mu, &gam_test_sigma, &test_gag);
+    let gamlss_test_nll = mean_gaussian_nll(gamlss_test_mu, gamlss_test_sigma, &test_gag);
+
+    // A constant-sigma reference (mean smooth right, but homoscedastic noise set
+    // to the training residual sd around gam's own mean): the location-scale fit
+    // must beat THIS to justify modelling the scale at all. Context + a guard.
+    let train_sd_const = {
+        let mut train_grid = Array2::<f64>::zeros((train_len, p));
+        for (i, &a) in train_age.iter().enumerate() {
+            train_grid[[i, age_idx]] = a;
+        }
+        let mean_design_train =
+            build_term_collection_design(train_grid.view(), &fit.meanspec_resolved)
+                .expect("rebuild mean design at training points");
+        let mu_train: Vec<f64> = mean_design_train.design.apply(&beta_location).to_vec();
+        let ss: f64 = (0..train_len)
+            .map(|i| (train_gag[i] - mu_train[i]).powi(2))
+            .sum();
+        (ss / train_len as f64).sqrt()
+    };
+    let const_sigma_vec = vec![train_sd_const; test_rows.len()];
+    let const_sigma_nll = mean_gaussian_nll(&gam_test_mu, &const_sigma_vec, &test_gag);
+
+    eprintln!(
+        "gagurine location-scale held-out: n_train={} n_test={} \
+         gam_test_R2(mu)={gam_test_r2:.4} gam_test_NLL={gam_test_nll:.4} \
+         gamlss_test_NLL={gamlss_test_nll:.4} const_sigma_NLL={const_sigma_nll:.4} \
+         (train_resid_sd={train_sd_const:.4})",
+        train_rows.len(),
+        test_rows.len(),
+    );
+
+    // ---- PRIMARY #1: gam's MEAN predicts the held-out signal --------------
+    // GAG has a strong monotone-ish decay in Age; a competent mean smooth must
+    // explain well over half the held-out variance (R^2 = 0 is constant-mean).
+    assert!(
+        gam_test_r2 >= 0.55,
+        "gam held-out mean-R^2 too low: {gam_test_r2:.4} (< 0.55)"
+    );
+
+    // ---- PRIMARY #2: the JOINT location-scale density is genuinely good ----
+    // Absolute bar on the held-out mean Gaussian NLL. GAG ranges ~2..50 with
+    // strong heteroscedasticity; a per-point NLL under 4.0 nats reflects a
+    // well-calibrated mean+sigma predictive density on real data.
+    assert!(
+        gam_test_nll < 4.0,
+        "gam held-out Gaussian NLL too high: {gam_test_nll:.4} (>= 4.0)"
+    );
+
+    // ---- PRIMARY #3: modelling the SCALE actually helps -------------------
+    // The heteroscedastic fit must beat a constant-sigma predictor that shares
+    // gam's own mean; otherwise the second smooth earned nothing.
+    assert!(
+        gam_test_nll < const_sigma_nll,
+        "location-scale NLL {gam_test_nll:.4} did not beat constant-sigma {const_sigma_nll:.4}"
+    );
+
+    // ---- BASELINE (match-or-beat): no worse than gamlss on held-out NLL ----
+    // gamlss(NO()) is the mature distributional-regression engine; matching its
+    // noisy fitted output proves nothing, but gam must not predict the held-out
+    // joint density worse than it by more than 5%.
+    assert!(
+        gam_test_nll <= 1.05 * gamlss_test_nll,
+        "gam held-out NLL {gam_test_nll:.4} worse than gamlss {gamlss_test_nll:.4} by >5%"
     );
 }

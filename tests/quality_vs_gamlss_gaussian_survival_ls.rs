@@ -72,8 +72,10 @@ use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+    load_csvwith_inferred_schema,
 };
 use ndarray::Array2;
+use std::path::Path;
 
 #[test]
 fn gam_gaussian_survival_location_scale_matches_gamlss() {
@@ -332,4 +334,281 @@ fn gam_gaussian_survival_location_scale_matches_gamlss() {
         "gam log-scale recovery worse than gamlss baseline: \
          rmse(gam)={gam_err_lsig:.4} > 1.10 * rmse(gamlss)={ref_err_lsig:.4}"
     );
+}
+
+/// Harrell's concordance index (C-index) for a *higher-is-longer-survival*
+/// risk score against right-censored survival outcomes. For every comparable
+/// pair (one subject's event time is known to be strictly shorter than the
+/// other's — i.e. the shorter one had an observed event), the pair is
+/// concordant when the shorter-surviving subject received the lower score.
+/// Ties in the score count as half. C = 0.5 is random ordering; 1.0 is a
+/// perfect ranking of survival times. This is the standard objective accuracy
+/// metric for survival models and needs no reference tool to compute.
+fn concordance(score: &[f64], time: &[f64], event: &[f64]) -> f64 {
+    assert_eq!(score.len(), time.len(), "concordance length mismatch");
+    assert_eq!(score.len(), event.len(), "concordance length mismatch");
+    let n = score.len();
+    let mut concordant = 0.0_f64;
+    let mut comparable = 0.0_f64;
+    for i in 0..n {
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            // i is the subject whose survival is known to be the shorter of the
+            // pair: i had an observed event at time[i] < time[j]. (When time[j]
+            // is censored we still know j outlived i; when time[j] is an event
+            // strictly later, likewise.) Only such ordered pairs are comparable.
+            if event[i] > 0.5 && time[i] < time[j] {
+                comparable += 1.0;
+                // Higher score == longer predicted survival, so the
+                // shorter-surviving i should score below the longer-surviving j.
+                if score[i] < score[j] {
+                    concordant += 1.0;
+                } else if (score[i] - score[j]).abs() == 0.0 {
+                    concordant += 0.5;
+                }
+            }
+        }
+    }
+    assert!(comparable > 0.0, "no comparable survival pairs");
+    concordant / comparable
+}
+
+/// Real-data arm of the same survival location-scale (Gaussian-residual AFT)
+/// capability. SOURCE: UCI "Heart Failure Clinical Records" dataset
+/// (Chicco & Jurman, BMC Med. Inform. Decis. Mak. 2020;20:16), 299 patients,
+/// `bench/datasets/heart_failure_clinical_records_dataset.csv`. `time` is the
+/// follow-up period in days and `DEATH_EVENT` the death indicator
+/// (1 = observed death, 0 = right-censored at last follow-up); the remaining
+/// columns are clinical covariates.
+///
+/// Truth is unknown on real data, so we assert OBJECTIVE held-out predictive
+/// accuracy, not truth recovery: a deterministic train/test split (every 4th
+/// row held out), fit gam's survival location-scale AFT on the training rows,
+/// predict the held-out rows' AFT *location* `eta_t(x)` (which is monotone in
+/// predicted survival), and score it with Harrell's concordance index against
+/// the held-out (time, event) outcomes.
+///
+///   PRIMARY (objective, tool-free): held-out C-index >= 0.62 — gam ranks
+///     held-out survival meaningfully better than chance (0.5).
+///   BASELINE (match-or-beat): gamlss NOrc (the same mature Gaussian-AFT
+///     reference, fit on the IDENTICAL training rows and scored on the IDENTICAL
+///     held-out rows) — gam's held-out C-index must be no worse than
+///     `gamlss_cindex - 0.03`. gamlss is the accuracy bar, never the target.
+#[test]
+fn gam_gaussian_survival_location_scale_matches_gamlss_on_real_data() {
+    init_parallelism();
+
+    const HF_CSV: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/bench/datasets/heart_failure_clinical_records_dataset.csv"
+    );
+    let ds = load_csvwith_inferred_schema(Path::new(HF_CSV)).expect("load heart failure csv");
+    let col = ds.column_map();
+    let time_idx = col["time"];
+    let event_idx = col["DEATH_EVENT"];
+    let age_idx = col["age"];
+    let ef_idx = col["ejection_fraction"];
+    let screat_idx = col["serum_creatinine"];
+    let ssod_idx = col["serum_sodium"];
+
+    let time_all: Vec<f64> = ds.values.column(time_idx).to_vec();
+    let event_all: Vec<f64> = ds.values.column(event_idx).to_vec();
+    let age_all: Vec<f64> = ds.values.column(age_idx).to_vec();
+    let ef_all: Vec<f64> = ds.values.column(ef_idx).to_vec();
+    let screat_all: Vec<f64> = ds.values.column(screat_idx).to_vec();
+    let ssod_all: Vec<f64> = ds.values.column(ssod_idx).to_vec();
+    let n = time_all.len();
+    assert!(n > 250, "heart failure should have ~299 rows, got {n}");
+
+    // ---- deterministic train/test split: every 4th row held out -----------
+    let is_test = |i: usize| i % 4 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    assert!(
+        train_rows.len() > 200 && test_rows.len() > 60,
+        "split sizes: train={} test={}",
+        train_rows.len(),
+        test_rows.len()
+    );
+
+    // Build a training-only dataset by sub-setting the encoded rows; headers,
+    // schema and column kinds are unchanged, so the formula resolves identically.
+    let p = ds.headers.len();
+    let mut train_values = Array2::<f64>::zeros((train_rows.len(), p));
+    for (out_row, &src_row) in train_rows.iter().enumerate() {
+        for c in 0..p {
+            train_values[[out_row, c]] = ds.values[[src_row, c]];
+        }
+    }
+    let mut train_ds = ds.clone();
+    train_ds.values = train_values;
+
+    // ---- fit gam on TRAIN: Gaussian-residual AFT location-scale ------------
+    // Location  eta_t   ~ smooth age + smooth ejection_fraction + smooth
+    //                     serum_creatinine + smooth serum_sodium.
+    // Log-scale eta_ls  ~ smooth ejection_fraction (dispersion most plausibly
+    //                     varies with cardiac output).
+    let cfg = FitConfig {
+        survival_likelihood: "location-scale".to_string(),
+        survival_distribution: "gaussian".to_string(),
+        noise_formula: Some("s(ejection_fraction, k=4)".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula(
+        "Surv(time, DEATH_EVENT) ~ s(age, k=5) + s(ejection_fraction, k=5) \
+         + s(serum_creatinine, k=5) + s(serum_sodium, k=5)",
+        &train_ds,
+        &cfg,
+    )
+    .expect("gam survival location-scale fit on heart failure train");
+    let FitResult::SurvivalLocationScale(fit) = result else {
+        panic!("expected a survival location-scale fit result");
+    };
+    let unified = &fit.fit.fit;
+    assert!(
+        unified.outer_converged,
+        "gam real-data survival location-scale outer optimizer did not converge: \
+         iters={} grad_norm={:?}",
+        unified.outer_iterations, unified.outer_gradient_norm
+    );
+    let beta_location = unified.beta_threshold();
+    assert!(
+        beta_location.iter().all(|v| v.is_finite()),
+        "non-finite gam location coefficients on real data"
+    );
+
+    // ---- gam's AFT location at the held-out rows ---------------------------
+    // eta_t(x) is the AFT location (monotone in predicted survival), so it is a
+    // higher-is-longer-survival risk score. Rebuild the frozen location design
+    // at the test covariates and apply the converged location coefficients.
+    let mut test_grid = Array2::<f64>::zeros((test_rows.len(), p));
+    for (out_row, &src_row) in test_rows.iter().enumerate() {
+        for c in 0..p {
+            test_grid[[out_row, c]] = ds.values[[src_row, c]];
+        }
+    }
+    let loc_design = build_term_collection_design(test_grid.view(), &fit.fit.resolved_thresholdspec)
+        .expect("rebuild location (threshold) design at held-out rows");
+    let gam_test_score: Vec<f64> = loc_design.design.apply(&beta_location).to_vec();
+    assert_eq!(gam_test_score.len(), test_rows.len());
+
+    // Held-out outcomes (identical rows/order for gam, gamlss, and scoring).
+    let test_time: Vec<f64> = test_rows.iter().map(|&i| time_all[i]).collect();
+    let test_event: Vec<f64> = test_rows.iter().map(|&i| event_all[i]).collect();
+
+    // ---- fit the SAME model on TRAIN with gamlss NOrc, predict the SAME TEST -
+    // Normal AFT on log(time) with smooth covariates in mu (location) and a
+    // smooth in log sigma; right-censoring via gamlss.cens (gen.cens(NO,
+    // type="right") -> NOrc, response Surv(log t, event)). predict mu on the
+    // held-out rows -> the AFT location, a higher-is-longer-survival score
+    // directly comparable to gam's. Train- and test-length vectors must not be
+    // mixed in one call, so the test covariates ride along as padded columns
+    // and only their first `test_n` entries are read back.
+    let m_train = train_rows.len();
+    let train_time: Vec<f64> = train_rows.iter().map(|&i| time_all[i]).collect();
+    let train_event: Vec<f64> = train_rows.iter().map(|&i| event_all[i]).collect();
+    let train_age: Vec<f64> = train_rows.iter().map(|&i| age_all[i]).collect();
+    let train_ef: Vec<f64> = train_rows.iter().map(|&i| ef_all[i]).collect();
+    let train_screat: Vec<f64> = train_rows.iter().map(|&i| screat_all[i]).collect();
+    let train_ssod: Vec<f64> = train_rows.iter().map(|&i| ssod_all[i]).collect();
+    let test_age: Vec<f64> = test_rows.iter().map(|&i| age_all[i]).collect();
+    let test_ef: Vec<f64> = test_rows.iter().map(|&i| ef_all[i]).collect();
+    let test_screat: Vec<f64> = test_rows.iter().map(|&i| screat_all[i]).collect();
+    let test_ssod: Vec<f64> = test_rows.iter().map(|&i| ssod_all[i]).collect();
+
+    let r = run_r(
+        &[
+            Column::new("time", &train_time),
+            Column::new("event", &train_event),
+            Column::new("age", &train_age),
+            Column::new("ejection_fraction", &train_ef),
+            Column::new("serum_creatinine", &train_screat),
+            Column::new("serum_sodium", &train_ssod),
+            Column::new("test_age", &pad_to(&test_age, m_train)),
+            Column::new("test_ef", &pad_to(&test_ef, m_train)),
+            Column::new("test_screat", &pad_to(&test_screat, m_train)),
+            Column::new("test_ssod", &pad_to(&test_ssod, m_train)),
+            Column::new("test_n", &vec![test_rows.len() as f64; m_train]),
+        ],
+        r#"
+        suppressPackageStartupMessages(library(gamlss))
+        suppressPackageStartupMessages(library(gamlss.cens))
+        suppressPackageStartupMessages(library(survival))
+        gen.cens(NO, type = "right")
+        df$logt <- log(df$time)
+        df$surv <- Surv(df$logt, df$event)
+        m <- gamlss(surv ~ pb(age) + pb(ejection_fraction) + pb(serum_creatinine) + pb(serum_sodium),
+                    sigma.formula = ~ pb(ejection_fraction), family = NOrc,
+                    data = df, control = gamlss.control(trace = FALSE, n.cyc = 200))
+        k <- df$test_n[1]
+        nd <- data.frame(age = df$test_age[1:k],
+                         ejection_fraction = df$test_ef[1:k],
+                         serum_creatinine = df$test_screat[1:k],
+                         serum_sodium = df$test_ssod[1:k])
+        mu <- predict(m, what = "mu", newdata = nd, type = "response")
+        emit("mu", as.numeric(mu))
+        "#,
+    );
+    let gamlss_score = r.vector("mu");
+    assert_eq!(
+        gamlss_score.len(),
+        test_rows.len(),
+        "gamlss held-out mu length mismatch"
+    );
+
+    // ---- OBJECTIVE held-out accuracy: concordance on identical test rows ----
+    let gam_cindex = concordance(&gam_test_score, &test_time, &test_event);
+    let gamlss_cindex = concordance(gamlss_score, &test_time, &test_event);
+
+    // Context only (NOT a pass criterion): closeness of the two score rankings.
+    let rel_vs_gamlss = relative_l2(
+        &{
+            let mu = gam_test_score.iter().sum::<f64>() / gam_test_score.len() as f64;
+            gam_test_score.iter().map(|&z| z - mu).collect::<Vec<_>>()
+        },
+        &{
+            let mu = gamlss_score.iter().sum::<f64>() / gamlss_score.len() as f64;
+            gamlss_score.iter().map(|&z| z - mu).collect::<Vec<_>>()
+        },
+    );
+
+    eprintln!(
+        "heart-failure survival LS held-out: n_train={m_train} n_test={} \
+         gam_cindex={gam_cindex:.4} gamlss_cindex={gamlss_cindex:.4} \
+         (context: centered-score rel_l2 vs gamlss={rel_vs_gamlss:.4})",
+        test_rows.len()
+    );
+
+    // ---- PRIMARY objective assertion: gam ranks held-out survival ----------
+    // 0.5 is chance ordering; clinical covariates carry real prognostic signal,
+    // so a competent AFT must clear 0.62 on the held-out fold.
+    assert!(
+        gam_cindex >= 0.62,
+        "gam's held-out concordance too low: {gam_cindex:.4} (< 0.62)"
+    );
+
+    // ---- BASELINE (match-or-beat): no worse than gamlss on the SAME C-index -
+    assert!(
+        gam_cindex >= gamlss_cindex - 0.03,
+        "gam held-out concordance {gam_cindex:.4} worse than gamlss \
+         {gamlss_cindex:.4} - 0.03"
+    );
+}
+
+/// Right-pad `v` with its last value (or 0.0 when empty) to length `len`, so
+/// the held-out test covariates can ride along as columns of the training
+/// data.frame handed to the reference body. Only the first `v.len()` entries
+/// are read back inside the R body (indexed by `test_n`).
+fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
+    assert!(
+        v.len() <= len,
+        "pad target {len} shorter than source {}",
+        v.len()
+    );
+    let fill = v.last().copied().unwrap_or(0.0);
+    let mut out = v.to_vec();
+    out.resize(len, fill);
+    out
 }

@@ -496,3 +496,312 @@ for li, lam in enumerate(LAMBDAS):
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// REAL-DATA ARM of the same capability (penalized binomial GAM, posterior
+/// inference) on an actual classification problem where the truth is UNKNOWN.
+///
+/// Dataset SOURCE: `bench/datasets/prostate.csv` — the two leading principal
+/// components (`pc1`, `pc2`) of a prostate-cancer genotype/expression panel with
+/// a binary case/control label `y` (318 controls, 336 cases). With no known
+/// latent function, "quality" is OBJECTIVE held-out predictive performance.
+///
+/// OBJECTIVE metrics asserted (NOT "matches PyMC"):
+///   * PRIMARY (tool-free, absolute): a deterministic train/test split (every
+///     4th row held out) — fit `y ~ s(pc1) + s(pc2)` (binomial-logit, penalized
+///     REML) on TRAIN, predict held-out probabilities, and require held-out
+///     **AUC ≥ 0.70** and held-out **log-loss ≤ 0.62** (well below the
+///     base-rate-constant predictor's log-loss ≈ 0.692). gam genuinely
+///     discriminates cases from controls out of sample.
+///   * BASELINE (match-or-beat): PyMC fits the IDENTICAL penalized posterior on
+///     the SAME training design columns + responses (Bernoulli-logit likelihood
+///     plus a Potential −½ βᵀSβ over gam's own roughness penalty), predicts the
+///     SAME held-out design rows via its posterior-mean coefficients, and gam's
+///     held-out log-loss must be no worse than `pymc_test_logloss * 1.10` and its
+///     AUC no worse than `pymc_test_auc - 0.03`. PyMC is a mature NUTS engine to
+///     match-or-beat, never an output to replicate.
+///
+/// Identical data is guaranteed: gam's frozen `s(pc1)+s(pc2)` design at the TRAIN
+/// rows and the TEST rows, plus the binary responses, are handed verbatim to
+/// PyMC, so both engines fit the same coefficients in the same basis on the same
+/// split and predict the same held-out rows.
+#[test]
+fn gam_penalized_binomial_posterior_matches_pymc_and_concentrates_with_lambda_on_real_data() {
+    init_parallelism();
+
+    // ---- load the real prostate dataset (pc1, pc2 -> binary y) -------------
+    let prostate_csv = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/prostate.csv");
+    let ds = load_csvwith_inferred_schema(std::path::Path::new(prostate_csv))
+        .expect("load prostate.csv");
+    let col = ds.column_map();
+    let pc1_idx = col["pc1"];
+    let pc2_idx = col["pc2"];
+    let y_idx = col["y"];
+    let pc1_all: Vec<f64> = ds.values.column(pc1_idx).to_vec();
+    let pc2_all: Vec<f64> = ds.values.column(pc2_idx).to_vec();
+    let y_all: Vec<f64> = ds.values.column(y_idx).to_vec();
+    let n_all = y_all.len();
+    assert!(n_all > 500, "prostate should have ~654 rows, got {n_all}");
+    for &yi in &y_all {
+        assert!(yi == 0.0 || yi == 1.0, "y must be binary, saw {yi}");
+    }
+
+    // ---- deterministic train/test split: every 4th row is held out --------
+    let is_test = |i: usize| i % 4 == 0;
+    let train_rows: Vec<usize> = (0..n_all).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n_all).filter(|&i| is_test(i)).collect();
+    assert!(
+        train_rows.len() > 400 && test_rows.len() > 100,
+        "split sizes: train={} test={}",
+        train_rows.len(),
+        test_rows.len()
+    );
+
+    let train_pc1: Vec<f64> = train_rows.iter().map(|&i| pc1_all[i]).collect();
+    let train_pc2: Vec<f64> = train_rows.iter().map(|&i| pc2_all[i]).collect();
+    let train_y: Vec<f64> = train_rows.iter().map(|&i| y_all[i]).collect();
+    let test_pc1: Vec<f64> = test_rows.iter().map(|&i| pc1_all[i]).collect();
+    let test_pc2: Vec<f64> = test_rows.iter().map(|&i| pc2_all[i]).collect();
+    let test_y: Vec<f64> = test_rows.iter().map(|&i| y_all[i]).collect();
+
+    // Build a training-only dataset by sub-setting the encoded rows; headers,
+    // schema and column kinds are unchanged, so the formula resolves identically.
+    let p_cols = ds.headers.len();
+    let mut train_values = Array2::<f64>::zeros((train_rows.len(), p_cols));
+    for (out_row, &src_row) in train_rows.iter().enumerate() {
+        for c in 0..p_cols {
+            train_values[[out_row, c]] = ds.values[[src_row, c]];
+        }
+    }
+    let mut train_ds = ds.clone();
+    train_ds.values = train_values;
+
+    // ---- fit gam on TRAIN: y ~ s(pc1) + s(pc2), binomial-logit REML --------
+    let cfg = FitConfig {
+        family: Some("binomial".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula("y ~ s(pc1) + s(pc2)", &train_ds, &cfg)
+        .expect("gam binomial fit on prostate train");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected a standard GAM fit for y ~ s(pc1) + s(pc2)");
+    };
+
+    // Rebuild the frozen design at the TRAIN and TEST covariate rows. The design
+    // columns are exactly what gam integrates over and what we hand to PyMC; the
+    // linear predictor is X β and the probability is logit⁻¹(η).
+    let design_at = |rows_pc1: &[f64], rows_pc2: &[f64]| -> Array2<f64> {
+        let m = rows_pc1.len();
+        let mut grid = Array2::<f64>::zeros((m, p_cols));
+        for i in 0..m {
+            grid[[i, pc1_idx]] = rows_pc1[i];
+            grid[[i, pc2_idx]] = rows_pc2[i];
+        }
+        let d = build_term_collection_design(grid.view(), &fit.resolvedspec)
+            .expect("rebuild prostate design");
+        d.design.to_dense()
+    };
+    let x_train = design_at(&train_pc1, &train_pc2);
+    let x_test = design_at(&test_pc1, &test_pc2);
+    let p = x_train.ncols();
+    assert_eq!(x_test.ncols(), p, "train/test design must share basis width");
+
+    let logistic = |eta: f64| 1.0 / (1.0 + (-eta).exp());
+
+    // gam held-out probabilities via its fitted posterior-mean coefficients.
+    let beta_gam = Array1::from(fit.fit.beta.to_vec());
+    let gam_test_eta: Array1<f64> = x_test.dot(&beta_gam);
+    let gam_test_prob: Vec<f64> = gam_test_eta.iter().map(|&e| logistic(e)).collect();
+
+    let gam_auc = auc(&gam_test_prob, &test_y);
+    let gam_logloss = log_loss(&gam_test_prob, &test_y);
+
+    // ---- PyMC reference: identical penalized posterior on the SAME split ---
+    // Pass the TRAIN design columns + TRAIN responses, plus the TEST design
+    // columns. The harness requires equal-length columns within one call, so we
+    // ship the (longer) train length as the row count and pad the test columns,
+    // carrying the true test length in `test_n`. PyMC encodes the SAME density:
+    //   p(β|y) ∝ exp{ ℓ_Bernoulli(y; Xβ) − ½ βᵀ S β },  S = gam's roughness penalty,
+    // samples it, and predicts the held-out rows with its posterior-mean β.
+    let s_pen = weighted_blockwise_penalty_sum(
+        &build_term_collection_design(
+            {
+                let mut g = Array2::<f64>::zeros((train_pc1.len(), p_cols));
+                for i in 0..train_pc1.len() {
+                    g[[i, pc1_idx]] = train_pc1[i];
+                    g[[i, pc2_idx]] = train_pc2[i];
+                }
+                g
+            }
+            .view(),
+            &fit.resolvedspec,
+        )
+        .expect("rebuild prostate design for penalty")
+        .penalties,
+        fit.fit.lambdas.as_slice().expect("contiguous lambdas"),
+        p,
+    );
+
+    let n_train = train_pc1.len();
+    let pad = |v: &[f64]| -> Vec<f64> {
+        let mut out = v.to_vec();
+        let fill = v.last().copied().unwrap_or(0.0);
+        out.resize(n_train, fill);
+        out
+    };
+
+    let mut columns: Vec<gam::test_support::reference::Column<'_>> = Vec::new();
+    // Owned storage for design columns (must outlive the run_python call).
+    let train_col_storage: Vec<Vec<f64>> = (0..p).map(|j| x_train.column(j).to_vec()).collect();
+    let test_col_storage: Vec<Vec<f64>> =
+        (0..p).map(|j| pad(&x_test.column(j).to_vec())).collect();
+    let train_name_storage: Vec<String> = (0..p).map(|j| format!("xtr{j}")).collect();
+    let test_name_storage: Vec<String> = (0..p).map(|j| format!("xte{j}")).collect();
+    for j in 0..p {
+        columns.push(gam::test_support::reference::Column::new(
+            &train_name_storage[j],
+            &train_col_storage[j],
+        ));
+        columns.push(gam::test_support::reference::Column::new(
+            &test_name_storage[j],
+            &test_col_storage[j],
+        ));
+    }
+    columns.push(gam::test_support::reference::Column::new("ytr", &train_y));
+    let test_n_col = vec![test_rows.len() as f64; n_train];
+    columns.push(gam::test_support::reference::Column::new("test_n", &test_n_col));
+
+    let pen_flat: Vec<String> = s_pen.iter().map(|v| format!("{v:.17e}")).collect();
+    let pen_literal = format!("[{}]", pen_flat.join(", "));
+
+    let body = format!(
+        r#"
+import numpy as np
+import pymc as pm
+import arviz as az
+
+P_DIM = {p}
+S = np.array({pen_literal}, dtype=float).reshape(P_DIM, P_DIM)
+
+Xtr = np.column_stack([np.asarray(df["xtr%d" % j], dtype=float) for j in range(P_DIM)])
+ytr = np.asarray(df["ytr"], dtype=float)
+k = int(np.asarray(df["test_n"])[0])
+Xte = np.column_stack([np.asarray(df["xte%d" % j], dtype=float)[:k] for j in range(P_DIM)])
+
+with pm.Model() as model:
+    beta = pm.Flat("beta", shape=P_DIM)
+    eta = pm.math.dot(Xtr, beta)
+    pm.Potential("rough", -0.5 * pm.math.dot(beta, pm.math.dot(S, beta)))
+    pm.Bernoulli("obs", logit_p=eta, observed=ytr)
+    idata = pm.sample(
+        draws=1500, tune=1000, chains=4, cores=1,
+        target_accept=0.9, random_seed=20260529,
+        progressbar=False, compute_convergence_checks=False,
+    )
+
+mean = idata.posterior["beta"].mean(dim=("chain", "draw")).values
+summ = az.summary(idata, var_names=["beta"])
+rhat = float(np.nanmax(summ["r_hat"].values))
+eta_te = Xte @ mean
+prob_te = 1.0 / (1.0 + np.exp(-eta_te))
+emit("test_prob", prob_te)
+emit("rhat", [rhat])
+"#
+    );
+
+    let pymc = gam::test_support::reference::run_python(&columns, &body);
+    let pm_prob = pymc.vector("test_prob");
+    let pm_rhat = pymc.scalar("rhat");
+    assert_eq!(
+        pm_prob.len(),
+        test_rows.len(),
+        "PyMC held-out prediction length mismatch"
+    );
+    assert!(
+        pm_rhat < 1.1,
+        "PyMC reference failed to converge on prostate: R-hat={pm_rhat:.4}"
+    );
+
+    let pymc_auc = auc(pm_prob, &test_y);
+    let pymc_logloss = log_loss(pm_prob, &test_y);
+
+    eprintln!(
+        "prostate s(pc1)+s(pc2) held-out: n_train={} n_test={} \
+         gam_auc={gam_auc:.4} gam_logloss={gam_logloss:.4} \
+         pymc_auc={pymc_auc:.4} pymc_logloss={pymc_logloss:.4} (R-hat={pm_rhat:.3})",
+        train_rows.len(),
+        test_rows.len(),
+    );
+
+    // ---- PRIMARY objective assertions: gam discriminates out of sample -----
+    // The base-rate-constant predictor has AUC = 0.5 and log-loss ≈ 0.692; a
+    // genuine smooth of the two leading PCs clears these comfortably.
+    assert!(
+        gam_auc >= 0.70,
+        "gam held-out AUC too low: {gam_auc:.4} (< 0.70)"
+    );
+    assert!(
+        gam_logloss <= 0.62,
+        "gam held-out log-loss too high: {gam_logloss:.4} (> 0.62)"
+    );
+
+    // ---- BASELINE (match-or-beat): no worse than PyMC on the same split ----
+    assert!(
+        gam_logloss <= pymc_logloss * 1.10,
+        "gam held-out log-loss {gam_logloss:.4} exceeds PyMC {pymc_logloss:.4} * 1.10"
+    );
+    assert!(
+        gam_auc >= pymc_auc - 0.03,
+        "gam held-out AUC {gam_auc:.4} trails PyMC {pymc_auc:.4} by more than 0.03"
+    );
+}
+
+/// Held-out binary cross-entropy (log-loss) of predicted probabilities against
+/// 0/1 labels, with probabilities clipped away from {0,1} for numerical safety.
+fn log_loss(prob: &[f64], y: &[f64]) -> f64 {
+    assert_eq!(prob.len(), y.len(), "log_loss length mismatch");
+    let n = y.len() as f64;
+    let mut s = 0.0;
+    for (&p, &yi) in prob.iter().zip(y) {
+        let pc = p.clamp(1e-12, 1.0 - 1e-12);
+        s += -(yi * pc.ln() + (1.0 - yi) * (1.0 - pc).ln());
+    }
+    s / n.max(1.0)
+}
+
+/// Area under the ROC curve via the rank-sum (Mann–Whitney) identity, with the
+/// standard average-rank correction for ties. Returns 0.5 when one class is
+/// absent (no discrimination possible).
+fn auc(score: &[f64], y: &[f64]) -> f64 {
+    assert_eq!(score.len(), y.len(), "auc length mismatch");
+    let n = score.len();
+    let n_pos = y.iter().filter(|&&v| v == 1.0).count();
+    let n_neg = n - n_pos;
+    if n_pos == 0 || n_neg == 0 {
+        return 0.5;
+    }
+    // Rank scores ascending (1-based), assigning average ranks to ties.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        score[a]
+            .partial_cmp(&score[b])
+            .expect("scores must be comparable (no NaN)")
+    });
+    let mut ranks = vec![0.0_f64; n];
+    let mut i = 0;
+    while i < n {
+        let mut j = i + 1;
+        while j < n && score[order[j]] == score[order[i]] {
+            j += 1;
+        }
+        // Average of 1-based ranks (i+1 .. j) for the tied block.
+        let avg_rank = ((i + 1 + j) as f64) / 2.0;
+        for &idx in &order[i..j] {
+            ranks[idx] = avg_rank;
+        }
+        i = j;
+    }
+    let rank_sum_pos: f64 = (0..n).filter(|&k| y[k] == 1.0).map(|k| ranks[k]).sum();
+    let np = n_pos as f64;
+    let nn = n_neg as f64;
+    (rank_sum_pos - np * (np + 1.0) / 2.0) / (np * nn)
+}

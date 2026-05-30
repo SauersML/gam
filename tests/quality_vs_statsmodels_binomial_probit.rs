@@ -37,12 +37,14 @@ use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+    load_csvwith_inferred_schema,
 };
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Uniform};
 use statrs::distribution::{ContinuousCDF, Normal};
+use std::path::Path;
 
 const N: usize = 250;
 const SEED: u64 = 789;
@@ -217,4 +219,253 @@ emit("mu_logit", fit_mean(sm.families.links.Logit()))
         "gam 'probit' recovers truth no better than a wrong-link (logit) fit — link dispatch is \
          suspect: rmse(gam)={gam_err:.4} vs rmse(sm_logit)={sm_logit_err:.4}"
     );
+}
+
+// ===========================================================================
+// REAL-DATA ARM
+// ===========================================================================
+//
+// DATASET SOURCE: bench/datasets/prostate.csv — the prostate-cancer screening
+// dataset (binary outcome `y` against two principal-component predictors `pc1`,
+// `pc2`), 654 rows, classes roughly balanced (318 zeros / 336 ones). It ships
+// in the repo's bench corpus.
+//
+// On REAL data the data-generating function is UNKNOWN, so we cannot assert
+// truth recovery. Instead we assert OBJECTIVE held-out classification quality:
+// a deterministic train/test split (every 4th row held out), fit gam on the
+// training rows only, predict the probit mean Phi(eta) on the held-out rows,
+// and assert
+//   PRIMARY (objective, tool-free): held-out ROC AUC >= 0.70 — gam's fitted
+//     probability genuinely discriminates the held-out classes, well above the
+//     0.5 coin-flip floor.
+//   BASELINE (match-or-beat): statsmodels GLM(Binomial(probit)) on the SAME
+//     2-df-per-PC cubic-spline model, fit on the SAME training rows, predicts
+//     the SAME held-out rows. gam's held-out log-loss must be no worse than
+//     statsmodels' log-loss within a 5% margin (lower log-loss is better), and
+//     gam's held-out AUC must be no worse than statsmodels' AUC minus 0.02.
+// statsmodels is a baseline to match-or-beat, never an output to replicate.
+
+/// ROC AUC of scores `score` against binary labels `label` (0/1), computed as
+/// the Mann–Whitney U statistic: the fraction of positive/negative pairs in
+/// which the positive's score exceeds the negative's, ties counting as 0.5.
+fn roc_auc(score: &[f64], label: &[f64]) -> f64 {
+    assert_eq!(score.len(), label.len(), "auc length mismatch");
+    // Clean O(n^2) pairwise count (n is a few hundred held-out rows).
+    let mut concordant = 0.0_f64;
+    let mut npos = 0.0_f64;
+    let mut nneg = 0.0_f64;
+    for (i, &li) in label.iter().enumerate() {
+        if li > 0.5 {
+            npos += 1.0;
+        } else {
+            nneg += 1.0;
+        }
+        for (j, &lj) in label.iter().enumerate() {
+            if li > 0.5 && lj < 0.5 {
+                let si = score[i];
+                let sj = score[j];
+                concordant += if si > sj {
+                    1.0
+                } else if (si - sj).abs() <= f64::EPSILON {
+                    0.5
+                } else {
+                    0.0
+                };
+            }
+        }
+    }
+    assert!(
+        npos > 0.0 && nneg > 0.0,
+        "AUC undefined: held-out set has a single class (npos={npos}, nneg={nneg})"
+    );
+    concordant / (npos * nneg)
+}
+
+/// Mean binary cross-entropy (log-loss) of predicted probabilities `prob`
+/// against 0/1 labels `label`, with probabilities clamped away from 0/1 to keep
+/// the logarithm finite. Lower is better.
+fn log_loss(prob: &[f64], label: &[f64]) -> f64 {
+    assert_eq!(prob.len(), label.len(), "log_loss length mismatch");
+    let eps = 1e-12;
+    let s: f64 = prob
+        .iter()
+        .zip(label)
+        .map(|(&p, &y)| {
+            let p = p.clamp(eps, 1.0 - eps);
+            -(y * p.ln() + (1.0 - y) * (1.0 - p).ln())
+        })
+        .sum();
+    s / prob.len().max(1) as f64
+}
+
+#[test]
+fn gam_binomial_probit_recovers_truth_on_real_data() {
+    init_parallelism();
+
+    // ---- load the real prostate dataset (pc1, pc2 -> binary y) ------------
+    let csv = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/prostate.csv");
+    let ds = load_csvwith_inferred_schema(Path::new(csv)).expect("load prostate.csv");
+    let col = ds.column_map();
+    let pc1_idx = col["pc1"];
+    let pc2_idx = col["pc2"];
+    let y_idx = col["y"];
+    let pc1: Vec<f64> = ds.values.column(pc1_idx).to_vec();
+    let pc2: Vec<f64> = ds.values.column(pc2_idx).to_vec();
+    let y: Vec<f64> = ds.values.column(y_idx).to_vec();
+    let n = pc1.len();
+    assert!(n > 600, "prostate should have ~654 rows, got {n}");
+
+    // ---- deterministic train/test split: every 4th row held out ----------
+    let is_test = |i: usize| i % 4 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    assert!(
+        train_rows.len() > 400 && test_rows.len() > 100,
+        "split sizes: train={} test={}",
+        train_rows.len(),
+        test_rows.len()
+    );
+
+    let train_pc1: Vec<f64> = train_rows.iter().map(|&i| pc1[i]).collect();
+    let train_pc2: Vec<f64> = train_rows.iter().map(|&i| pc2[i]).collect();
+    let train_y: Vec<f64> = train_rows.iter().map(|&i| y[i]).collect();
+    let test_pc1: Vec<f64> = test_rows.iter().map(|&i| pc1[i]).collect();
+    let test_pc2: Vec<f64> = test_rows.iter().map(|&i| pc2[i]).collect();
+    let test_y: Vec<f64> = test_rows.iter().map(|&i| y[i]).collect();
+
+    // Build a training-only dataset by sub-setting encoded rows; headers,
+    // schema and column kinds are unchanged, so the formula resolves identically.
+    let p = ds.headers.len();
+    let mut train_values = Array2::<f64>::zeros((train_rows.len(), p));
+    for (out_row, &src_row) in train_rows.iter().enumerate() {
+        for c in 0..p {
+            train_values[[out_row, c]] = ds.values[[src_row, c]];
+        }
+    }
+    let mut train_ds = ds.clone();
+    train_ds.values = train_values;
+
+    // ---- fit gam on TRAIN: y ~ s(pc1,k=4)+s(pc2,k=4), Binomial(probit) ----
+    let cfg = FitConfig {
+        family: Some("binomial-probit".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula("y ~ s(pc1, k=4) + s(pc2, k=4)", &train_ds, &cfg)
+        .expect("gam probit fit on prostate train");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected a standard GAM fit for binomial-probit on real data");
+    };
+    let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
+
+    // gam predictions at the held-out points: rebuild the design from the
+    // frozen spec; design*beta == eta, then mu = Phi(eta) (probit inverse link).
+    let std_normal = Normal::new(0.0, 1.0).expect("standard normal");
+    let mut test_grid = Array2::<f64>::zeros((test_rows.len(), p));
+    for i in 0..test_rows.len() {
+        test_grid[[i, pc1_idx]] = test_pc1[i];
+        test_grid[[i, pc2_idx]] = test_pc2[i];
+    }
+    let test_design = build_term_collection_design(test_grid.view(), &fit.resolvedspec)
+        .expect("rebuild design at held-out points");
+    let gam_test_eta: Vec<f64> = test_design.design.apply(&fit.fit.beta).to_vec();
+    let gam_test_mu: Vec<f64> = gam_test_eta.iter().map(|&e| std_normal.cdf(e)).collect();
+
+    // ---- fit the SAME model on TRAIN with statsmodels, predict SAME TEST ---
+    // statsmodels GLM(Binomial(probit)) with cubic regression splines of each
+    // PC (`cr(., df=4)`, matching gam's two k=4 smooths). One run_python call:
+    // every Column is TRAIN length, the held-out rows ride along padded to the
+    // train length plus an integer count, and only the first `test_n` of the
+    // padded columns are read back. No mixing of train/test lengths in a column.
+    let nz = train_pc1.len();
+    let test_n = test_rows.len();
+    let test_pc1_pad = pad_to(&test_pc1, nz);
+    let test_pc2_pad = pad_to(&test_pc2, nz);
+    let test_n_col = vec![test_n as f64; nz];
+    let r = run_python(
+        &[
+            Column::new("pc1", &train_pc1),
+            Column::new("pc2", &train_pc2),
+            Column::new("y", &train_y),
+            Column::new("test_pc1", &test_pc1_pad),
+            Column::new("test_pc2", &test_pc2_pad),
+            Column::new("test_n", &test_n_col),
+        ],
+        r#"
+import numpy as np
+import pandas as pd
+import statsmodels.formula.api as smf
+import statsmodels.api as sm
+
+k = int(df["test_n"][0])
+train = pd.DataFrame({"pc1": df["pc1"], "pc2": df["pc2"], "y": df["y"]})
+newd = pd.DataFrame({
+    "pc1": np.asarray(df["test_pc1"])[:k],
+    "pc2": np.asarray(df["test_pc2"])[:k],
+})
+model = smf.glm(
+    "y ~ cr(pc1, df=4) + cr(pc2, df=4)",
+    data=train,
+    family=sm.families.Binomial(link=sm.families.links.Probit()),
+)
+res = model.fit()
+emit("test_mu", np.asarray(res.predict(newd), dtype=float))
+"#,
+    );
+    let sm_test_mu = r.vector("test_mu");
+    assert_eq!(
+        sm_test_mu.len(),
+        test_n,
+        "statsmodels held-out prediction length mismatch"
+    );
+
+    // ---- OBJECTIVE held-out classification metrics ------------------------
+    let gam_auc = roc_auc(&gam_test_mu, &test_y);
+    let sm_auc = roc_auc(sm_test_mu, &test_y);
+    let gam_ll = log_loss(&gam_test_mu, &test_y);
+    let sm_ll = log_loss(sm_test_mu, &test_y);
+
+    eprintln!(
+        "prostate probit s(pc1,k=4)+s(pc2,k=4) held-out: n_train={nz} n_test={test_n} \
+         gam_edf={gam_edf:.3} gam_auc={gam_auc:.4} sm_auc={sm_auc:.4} \
+         gam_logloss={gam_ll:.4} sm_logloss={sm_ll:.4}"
+    );
+
+    // ---- PRIMARY objective assertion: gam discriminates the held-out classes
+    assert!(
+        gam_auc >= 0.70,
+        "gam held-out AUC too low: {gam_auc:.4} (< 0.70 — barely above the 0.5 coin-flip floor)"
+    );
+
+    // ---- BASELINE (match-or-beat): no worse than statsmodels on held-out ----
+    // log-loss within a 5% margin (lower is better) and AUC within 0.02 (higher
+    // is better). statsmodels is the mature accuracy baseline, not a target.
+    assert!(
+        gam_ll <= sm_ll * 1.05,
+        "gam held-out log-loss {gam_ll:.4} exceeds statsmodels {sm_ll:.4} * 1.05"
+    );
+    assert!(
+        gam_auc >= sm_auc - 0.02,
+        "gam held-out AUC {gam_auc:.4} is worse than statsmodels {sm_auc:.4} by more than 0.02"
+    );
+
+    // ---- complexity sanity: edf in a signal-appropriate range (not matched) -
+    assert!(
+        gam_edf > 1.0 && gam_edf < 12.0,
+        "gam effective dof out of sane range: {gam_edf:.3}"
+    );
+}
+
+/// Right-pad `v` with its last value (or 0.0 when empty) to length `len`, so the
+/// held-out predictors can ride along as columns of the reference data.frame at
+/// the training length; only the first `v.len()` entries are read back.
+fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
+    assert!(
+        v.len() <= len,
+        "pad target {len} shorter than source {}",
+        v.len()
+    );
+    let fill = v.last().copied().unwrap_or(0.0);
+    let mut out = v.to_vec();
+    out.resize(len, fill);
+    out
 }

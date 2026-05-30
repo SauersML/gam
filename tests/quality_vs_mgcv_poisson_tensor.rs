@@ -40,11 +40,19 @@ use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+    load_csvwith_inferred_schema,
 };
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Poisson};
+use std::path::Path;
+
+// Real-data source: the `badhealth` count dataset shipped with the R package
+// COUNT (Hilbe), redistributed here as bench/datasets/badhealth.csv. Each row is
+// a survey respondent: `numvisit` = number of doctor visits (count response),
+// `age` (years), `badh` = self-reported bad-health indicator (0/1).
+const BADHEALTH_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/badhealth.csv");
 
 /// Deterministic 15×20 Poisson surface (n=300): x on an even grid over [0,2π],
 /// z on an even grid over [-1,1], log-mean eta = 0.8 + 0.3*sin(x) + 0.2*z^2,
@@ -196,5 +204,202 @@ fn gam_poisson_tensor_recovers_true_mean_surface() {
         gam_edf > 1.0 && gam_edf < 35.0,
         "Poisson+te() effective degrees of freedom outside the sane range \
          (1, 35): gam_edf={gam_edf:.3}"
+    );
+}
+
+/// Mean Poisson deviance of a count predictor: the held-out goodness-of-fit
+/// metric for a log-link count model.
+///   dev_i = 2 * ( y_i * log(y_i / mu_i) - (y_i - mu_i) ),   y log y := 0 at y=0.
+/// Lower is better; 0 is a perfect fit. We assert an ABSOLUTE bar on this and a
+/// match-or-beat margin against mgcv on the SAME held-out rows.
+fn poisson_deviance(pred_mean: &[f64], obs: &[f64]) -> f64 {
+    assert_eq!(pred_mean.len(), obs.len(), "poisson_deviance length mismatch");
+    let n = obs.len() as f64;
+    let mut s = 0.0;
+    for (&mu, &y) in pred_mean.iter().zip(obs) {
+        let mu = mu.max(1e-12);
+        let ylogymu = if y > 0.0 { y * (y / mu).ln() } else { 0.0 };
+        s += 2.0 * (ylogymu - (y - mu));
+    }
+    s / n.max(1.0)
+}
+
+/// Right-pad `v` with its last value (or 0.0 when empty) to length `len`, so a
+/// test-length column can ride along inside a train-length reference data.frame.
+/// Only the first `v.len()` entries are read back inside the R body.
+fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
+    assert!(
+        v.len() <= len,
+        "pad target {len} shorter than source {}",
+        v.len()
+    );
+    let fill = v.last().copied().unwrap_or(0.0);
+    let mut out = v.to_vec();
+    out.resize(len, fill);
+    out
+}
+
+/// REAL-DATA arm of the SAME capability (Poisson(log) × tensor-product te()),
+/// exercised on the `badhealth` count survey instead of a known-truth surface.
+///
+/// On real data the truth is unknown, so quality is OBJECTIVE held-out
+/// predictive fit, not truth recovery and not tool matching. We fit
+///     numvisit ~ te(age, badh)
+/// (Poisson log link, REML) on a deterministic train split, predict the held-out
+/// rows, and assert two things on gam's OWN held-out predictions:
+///
+///   PRIMARY (absolute, tool-free): held-out mean Poisson deviance below a fixed
+///     bar that a sensible count model clears but the intercept-only (predict the
+///     train mean) model does not. The intercept-only deviance is computed in
+///     plain Rust and the bar sits comfortably under it, so passing proves gam's
+///     te(age, badh) surface genuinely improves held-out count fit.
+///
+///   BASELINE (match-or-beat): mgcv fits the SAME training rows and predicts the
+///     SAME held-out rows; gam's held-out deviance must be no worse than
+///     `mgcv_dev * 1.10`. mgcv is a peer baseline to match-or-beat, never a
+///     target to reproduce.
+#[test]
+fn gam_poisson_tensor_recovers_true_mean_surface_on_real_data() {
+    init_parallelism();
+
+    // ---- load the real badhealth count dataset ----------------------------
+    let ds = load_csvwith_inferred_schema(Path::new(BADHEALTH_CSV)).expect("load badhealth.csv");
+    let col = ds.column_map();
+    let age_idx = col["age"];
+    let badh_idx = col["badh"];
+    let numvisit_idx = col["numvisit"];
+    let age: Vec<f64> = ds.values.column(age_idx).to_vec();
+    let badh: Vec<f64> = ds.values.column(badh_idx).to_vec();
+    let numvisit: Vec<f64> = ds.values.column(numvisit_idx).to_vec();
+    let n = age.len();
+    assert!(n > 1000, "badhealth should have ~1127 rows, got {n}");
+
+    // ---- deterministic train/test split: every 4th row is held out --------
+    let is_test = |i: usize| i % 4 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    assert!(
+        train_rows.len() > 700 && test_rows.len() > 250,
+        "split sizes: train={} test={}",
+        train_rows.len(),
+        test_rows.len()
+    );
+
+    let train_age: Vec<f64> = train_rows.iter().map(|&i| age[i]).collect();
+    let train_badh: Vec<f64> = train_rows.iter().map(|&i| badh[i]).collect();
+    let train_numvisit: Vec<f64> = train_rows.iter().map(|&i| numvisit[i]).collect();
+    let test_age: Vec<f64> = test_rows.iter().map(|&i| age[i]).collect();
+    let test_badh: Vec<f64> = test_rows.iter().map(|&i| badh[i]).collect();
+    let test_numvisit: Vec<f64> = test_rows.iter().map(|&i| numvisit[i]).collect();
+
+    // Build a training-only dataset by sub-setting the encoded rows; headers,
+    // schema and column kinds are unchanged, so the formula resolves identically.
+    let p = ds.headers.len();
+    let mut train_values = Array2::<f64>::zeros((train_rows.len(), p));
+    for (out_row, &src_row) in train_rows.iter().enumerate() {
+        for c in 0..p {
+            train_values[[out_row, c]] = ds.values[[src_row, c]];
+        }
+    }
+    let mut train_ds = ds.clone();
+    train_ds.values = train_values;
+
+    // ---- fit gam on TRAIN: numvisit ~ te(age, badh), poisson(log), REML ----
+    let cfg = FitConfig {
+        family: Some("poisson".to_string()),
+        ..FitConfig::default()
+    };
+    let result =
+        fit_from_formula("numvisit ~ te(age, badh)", &train_ds, &cfg).expect("gam poisson te fit");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected a standard GAM fit for poisson(log) + te() on real data");
+    };
+    let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
+
+    // gam held-out means: rebuild the tensor design at the test (age, badh),
+    // mean = exp(design * beta) under the log link.
+    let mut test_grid = Array2::<f64>::zeros((test_rows.len(), p));
+    for (i, &row) in test_rows.iter().enumerate() {
+        test_grid[[i, age_idx]] = age[row];
+        test_grid[[i, badh_idx]] = badh[row];
+    }
+    let test_design = build_term_collection_design(test_grid.view(), &fit.resolvedspec)
+        .expect("rebuild tensor design at held-out points");
+    let gam_test_eta = test_design.design.apply(&fit.fit.beta);
+    let gam_test_mean: Vec<f64> = gam_test_eta.iter().map(|e| e.exp()).collect();
+
+    // ---- fit the SAME model on TRAIN with mgcv, predict the SAME TEST ------
+    // bs="ps" margins match gam's te() construction (cubic B-spline + 2nd-order
+    // penalty). The test columns ride along padded; only the first k are read.
+    let r = run_r(
+        &[
+            Column::new("age", &train_age),
+            Column::new("badh", &train_badh),
+            Column::new("numvisit", &train_numvisit),
+            Column::new("test_age", &pad_to(&test_age, train_age.len())),
+            Column::new("test_badh", &pad_to(&test_badh, train_age.len())),
+            Column::new("test_n", &vec![test_age.len() as f64; train_age.len()]),
+        ],
+        r#"
+        suppressPackageStartupMessages(library(mgcv))
+        m <- gam(numvisit ~ te(age, badh, bs = "ps"), data = df,
+                 family = poisson(link = "log"), method = "REML")
+        emit("edf", sum(m$edf))
+        k <- df$test_n[1]
+        newd <- data.frame(age = df$test_age[1:k], badh = df$test_badh[1:k])
+        emit("test_pred", as.numeric(predict(m, newdata = newd, type = "response")))
+        "#,
+    );
+    let mgcv_test_mean = r.vector("test_pred");
+    let mgcv_edf = r.scalar("edf");
+    assert_eq!(
+        mgcv_test_mean.len(),
+        test_rows.len(),
+        "mgcv held-out prediction length mismatch"
+    );
+
+    // ---- OBJECTIVE held-out metric: mean Poisson deviance ------------------
+    let gam_dev = poisson_deviance(&gam_test_mean, &test_numvisit);
+    let mgcv_dev = poisson_deviance(mgcv_test_mean, &test_numvisit);
+
+    // Intercept-only baseline: predict every held-out row with the TRAIN mean
+    // count. Its held-out deviance is the "no covariate information" reference a
+    // real model must beat; computed in plain Rust, no tool involved.
+    let train_mean = train_numvisit.iter().sum::<f64>() / train_numvisit.len() as f64;
+    let null_pred = vec![train_mean; test_rows.len()];
+    let null_dev = poisson_deviance(&null_pred, &test_numvisit);
+
+    eprintln!(
+        "badhealth te(age,badh) held-out: n_train={} n_test={} gam_edf={gam_edf:.3} \
+         mgcv_edf={mgcv_edf:.3} gam_dev={gam_dev:.4} mgcv_dev={mgcv_dev:.4} \
+         null_dev={null_dev:.4}",
+        train_rows.len(),
+        test_rows.len(),
+    );
+
+    // ---- PRIMARY objective assertion: gam beats the null model with margin --
+    // A fixed absolute bar that sits below the intercept-only deviance: the
+    // covariate surface must add real held-out predictive value. We also assert
+    // the model strictly improves on the null by a clear margin.
+    assert!(
+        gam_dev < null_dev * 0.97,
+        "gam te(age,badh) held-out deviance {gam_dev:.4} did not beat the \
+         intercept-only null {null_dev:.4} by a 3% margin"
+    );
+    assert!(
+        gam_dev <= 2.55,
+        "gam te(age,badh) held-out mean Poisson deviance too high: {gam_dev:.4} (> 2.55)"
+    );
+
+    // ---- BASELINE (match-or-beat): no worse than mgcv on held-out deviance --
+    assert!(
+        gam_dev <= mgcv_dev * 1.10,
+        "gam held-out deviance {gam_dev:.4} exceeds mgcv {mgcv_dev:.4} * 1.10"
+    );
+
+    // ---- complexity sanity: edf in a sane range (not matched to mgcv) -------
+    assert!(
+        gam_edf > 1.0 && gam_edf < 35.0,
+        "gam effective dof out of sane range: {gam_edf:.3}"
     );
 }

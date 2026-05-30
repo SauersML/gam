@@ -60,10 +60,14 @@ use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+    load_csvwith_inferred_schema,
 };
 use ndarray::Array2;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::path::Path;
+
+const VETERAN_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/veteran_lung.csv");
 
 const HF_CSV: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -507,6 +511,397 @@ fn gam_survival_frailty_random_intercept_matches_inla() {
     // below that. edf_total strictly below (time_cols + 1 fixed-x + full RE
     // block) confirms gam is regularizing the frailty.
     let unshrunk_ceiling = time_cols as f64 + 1.0 + (N_GROUPS as f64);
+    assert!(
+        edf_total < unshrunk_ceiling,
+        "frailty block is not shrinking: edf_total={edf_total:.3} >= unshrunk ceiling {unshrunk_ceiling:.3}"
+    );
+}
+
+/// REAL-DATA ARM of the random-intercept survival-frailty capability.
+///
+/// Same gam capability as `gam_survival_frailty_random_intercept_matches_inla`
+/// (transformation/net survival likelihood + monotone I-spline baseline on
+/// log-time + a ridge-penalized random-effect frailty block on a grouping
+/// factor), exercised on a DIFFERENT real clinical dataset so the accuracy claim
+/// generalizes beyond one cohort.
+///
+/// Dataset SOURCE: the Veterans' Administration lung-cancer trial of Kalbfleisch
+/// & Prentice (1980), "The Statistical Analysis of Failure Time Data" — shipped
+/// as `survival::veteran` in R and committed here as
+/// `bench/datasets/veteran_lung.csv` (n = 137 men with advanced inoperable lung
+/// cancer; columns: trt, celltype, time (days), status, karno (Karnofsky
+/// performance score 0-100), diagtime, age, prior). Tumor histology `celltype`
+/// (squamous / smallcell / adeno / large) is the natural risk-class factor a
+/// frailty model groups patients by; the Karnofsky performance score `karno`
+/// (standardized) is the strongest single fixed prognostic covariate.
+///
+/// OBJECTIVE METRIC ASSERTED (pass/fail): held-out PROPORTIONAL-HAZARDS
+/// DISCRIMINATION. gam is fit on a deterministic train split, its covariate+RE
+/// linear predictor `eta_cov` (monotone in the hazard under the net model) is
+/// evaluated on the held-out test rows, and Harrell's concordance `C` between
+/// that risk and the held-out (time, status) outcome must clear an ABSOLUTE bar
+/// `C >= 0.60` (real, above-chance discrimination; Karnofsky score is a famously
+/// strong predictor in this cohort) AND match-or-beat the R-INLA Weibull-PH
+/// frailty baseline on the SAME metric and rows: `C_gam >= C_inla - 0.02`. INLA
+/// is a baseline on the objective metric, never a fitted-output target. The
+/// same baseline-survival STRUCTURE axioms (H0 finite/positive/monotone, S0 in
+/// [0,1] non-increasing) and the sub-linear-edf SHRINKAGE SIGNATURE are also
+/// asserted. A failing assertion from genuine under-discrimination is acceptable
+/// and must NOT be papered over by loosening a bound.
+#[test]
+fn gam_survival_frailty_random_intercept_matches_inla_on_real_data() {
+    init_parallelism();
+
+    // Four tumor-histology classes; the frailty (and INLA's iid effect) span all.
+    const N_CELL: usize = 4;
+
+    // ---- load the real veteran lung-cancer trial -----------------------------
+    let ds = load_csvwith_inferred_schema(Path::new(VETERAN_CSV)).expect("load veteran_lung.csv");
+    let col = ds.column_map();
+    let time_idx = col["time"];
+    let status_idx = col["status"];
+    let karno_idx = col["karno"];
+    // `celltype` is a string factor; the inferred-schema encoder stores its level
+    // code in the numeric matrix. We read raw celltype strings from the CSV to
+    // build a stable, name-keyed class index (independent of encoder level order)
+    // so gam and INLA agree on which class each subject belongs to.
+    let file = File::open(VETERAN_CSV).expect("open veteran_lung csv");
+    let mut lines = BufReader::new(file).lines();
+    let header = lines.next().expect("header line").expect("read header");
+    let hcols: Vec<&str> = header.split(',').collect();
+    let celltype_col = hcols
+        .iter()
+        .position(|c| *c == "celltype")
+        .expect("celltype column");
+    let mut celltype_str = Vec::<String>::new();
+    for line in lines {
+        let line = line.expect("read data line");
+        if line.trim().is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = line.split(',').collect();
+        celltype_str.push(f[celltype_col].to_string());
+    }
+
+    let time: Vec<f64> = ds.values.column(time_idx).to_vec();
+    let event: Vec<f64> = ds.values.column(status_idx).to_vec();
+    let karno: Vec<f64> = ds.values.column(karno_idx).to_vec();
+    let n = time.len();
+    assert_eq!(
+        celltype_str.len(),
+        n,
+        "raw celltype rows {} must match encoded rows {n}",
+        celltype_str.len()
+    );
+    assert_eq!(n, 137, "veteran_lung should have 137 rows, got {n}");
+
+    // Map celltype names -> stable class index 0..N_CELL in first-appearance
+    // order, and also a numeric 1-based code for INLA's iid factor.
+    let mut class_names = Vec::<String>::new();
+    let cell_class: Vec<usize> = celltype_str
+        .iter()
+        .map(|name| {
+            if let Some(p) = class_names.iter().position(|c| c == name) {
+                p
+            } else {
+                class_names.push(name.clone());
+                class_names.len() - 1
+            }
+        })
+        .collect();
+    assert_eq!(
+        class_names.len(),
+        N_CELL,
+        "veteran has {N_CELL} histology classes, found {}: {class_names:?}",
+        class_names.len()
+    );
+    let mut class_counts = [0usize; N_CELL];
+    for &c in &cell_class {
+        class_counts[c] += 1;
+    }
+    assert!(
+        class_counts.iter().all(|&c| c >= 20),
+        "each histology class needs >=20 patients for a stable frailty: {class_counts:?}"
+    );
+    let cell_code1: Vec<f64> = cell_class.iter().map(|&c| (c + 1) as f64).collect();
+
+    let event_rate: f64 = event.iter().sum::<f64>() / n as f64;
+    assert!(
+        event_rate >= 0.8,
+        "veteran is lightly censored; event rate should be high, got {event_rate:.3}"
+    );
+
+    // Standardize the Karnofsky score so the fixed slope is on a common scale.
+    let karno_mean = karno.iter().sum::<f64>() / n as f64;
+    let karno_sd =
+        (karno.iter().map(|k| (k - karno_mean).powi(2)).sum::<f64>() / (n as f64 - 1.0)).sqrt();
+    let x: Vec<f64> = karno.iter().map(|k| (k - karno_mean) / karno_sd).collect();
+
+    // ---- deterministic train/test split: every 4th row held out -------------
+    let is_test: Vec<bool> = (0..n).map(|i| i % 4 == 0).collect();
+    let train_idx: Vec<usize> = (0..n).filter(|&i| !is_test[i]).collect();
+    let test_idx: Vec<usize> = (0..n).filter(|&i| is_test[i]).collect();
+    assert!(
+        train_idx.len() > 95 && test_idx.len() >= 30,
+        "split sizes off: train={} test={}",
+        train_idx.len(),
+        test_idx.len()
+    );
+    let train_events: f64 = train_idx.iter().map(|&i| event[i]).sum();
+    let test_events: f64 = test_idx.iter().map(|&i| event[i]).sum();
+    assert!(
+        train_events >= 40.0 && test_events >= 15.0,
+        "need observed events in both splits: train_events={train_events} test_events={test_events}"
+    );
+    // Every histology class must appear in TRAIN so its frailty level is learnable.
+    let mut train_class_counts = [0usize; N_CELL];
+    for &i in &train_idx {
+        train_class_counts[cell_class[i]] += 1;
+    }
+    assert!(
+        train_class_counts.iter().all(|&c| c >= 5),
+        "each histology class needs training rows to estimate its frailty: {train_class_counts:?}"
+    );
+
+    // ---- fit gam on the TRAIN rows: transformation/net survival + RE frailty -
+    let headers = vec![
+        "time".to_string(),
+        "event".to_string(),
+        "x".to_string(),
+        "group".to_string(),
+    ];
+    let train_rows: Vec<StringRecord> = train_idx
+        .iter()
+        .map(|&i| {
+            StringRecord::from(vec![
+                time[i].to_string(),
+                event[i].to_string(),
+                x[i].to_string(),
+                format!("cell{}", cell_class[i]),
+            ])
+        })
+        .collect();
+    let data = encode_recordswith_inferred_schema(headers, train_rows)
+        .expect("encode train frailty survival data");
+    let dcol = data.column_map();
+    let x_idx = dcol["x"];
+    let group_idx = dcol["group"];
+
+    let cfg = FitConfig {
+        survival_likelihood: "transformation".to_string(),
+        time_basis: "ispline".to_string(),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula(
+        "Surv(time, event) ~ x + s(group, bs='re') + survmodel(spec=\"net\")",
+        &data,
+        &cfg,
+    )
+    .expect("gam transformation frailty fit");
+    let FitResult::SurvivalTransformation(fit) = result else {
+        panic!(
+            "expected a SurvivalTransformation fit result for survival_likelihood=transformation"
+        );
+    };
+    assert_eq!(
+        fit.likelihood_mode,
+        SurvivalLikelihoodMode::Transformation,
+        "gam must fit the transformation (net) survival likelihood"
+    );
+
+    let beta = &fit.fit.beta;
+    let time_cols = fit.time_base_ncols;
+    assert!(
+        beta.len() > time_cols,
+        "beta must carry covariate/RE columns beyond the {time_cols} time-basis columns; beta.len()={}",
+        beta.len()
+    );
+    let cov_beta = beta.slice(ndarray::s![time_cols..]).to_owned();
+
+    // Map each encoded group level back to its histology class.
+    let group_encoded: Vec<f64> = data.values.column(group_idx).to_vec();
+    let mut level_to_class = vec![usize::MAX; N_CELL];
+    let mut class_to_level = vec![usize::MAX; N_CELL];
+    for (row, &train_i) in train_idx.iter().enumerate() {
+        let level = group_encoded[row].round() as usize;
+        assert!(level < N_CELL, "encoded group level {level} out of range");
+        level_to_class[level] = cell_class[train_i];
+        class_to_level[cell_class[train_i]] = level;
+    }
+    assert!(
+        level_to_class.iter().all(|&c| c != usize::MAX)
+            && class_to_level.iter().all(|&l| l != usize::MAX),
+        "every histology class must map to an encoded level (each appears in TRAIN): {level_to_class:?}"
+    );
+
+    // ---- gam's held-out PH risk score on the TEST rows ----------------------
+    let mut test_design_in = Array2::<f64>::zeros((test_idx.len(), data.headers.len()));
+    for (row, &i) in test_idx.iter().enumerate() {
+        test_design_in[[row, x_idx]] = x[i];
+        test_design_in[[row, group_idx]] = class_to_level[cell_class[i]] as f64;
+    }
+    let test_design = build_term_collection_design(test_design_in.view(), &fit.resolvedspec)
+        .expect("build covariate+RE design at TEST rows");
+    assert_eq!(
+        test_design.design.ncols(),
+        cov_beta.len(),
+        "covariate+RE design width must match the covariate-coefficient block"
+    );
+    let gam_risk: Vec<f64> = test_design.design.apply(&cov_beta).to_vec();
+    assert_eq!(gam_risk.len(), test_idx.len());
+
+    let test_time: Vec<f64> = test_idx.iter().map(|&i| time[i]).collect();
+    let test_event: Vec<f64> = test_idx.iter().map(|&i| event[i]).collect();
+    let gam_c = harrell_concordance(&gam_risk, &test_time, &test_event);
+
+    // ---- per-class frailty (context diagnostic only) ------------------------
+    let mut anchor = Array2::<f64>::zeros((N_CELL, data.headers.len()));
+    for level in 0..N_CELL {
+        anchor[[level, x_idx]] = 0.0;
+        anchor[[level, group_idx]] = level as f64;
+    }
+    let anchor_design = build_term_collection_design(anchor.view(), &fit.resolvedspec)
+        .expect("rebuild covariate+RE design at class anchors");
+    let eta_by_level: Vec<f64> = anchor_design.design.apply(&cov_beta).to_vec();
+    let mut gam_frailty_by_class = vec![0.0_f64; N_CELL];
+    for level in 0..N_CELL {
+        gam_frailty_by_class[level_to_class[level]] = eta_by_level[level];
+    }
+    let gam_mean = gam_frailty_by_class.iter().sum::<f64>() / N_CELL as f64;
+    let gam_frailty: Vec<f64> = gam_frailty_by_class.iter().map(|v| v - gam_mean).collect();
+
+    // ---- shrinkage-signature edf -------------------------------------------
+    let edf_total = fit.fit.edf_total().expect("gam reports total edf");
+    let edf_blocks = fit.fit.edf_by_block();
+    assert!(
+        !edf_blocks.is_empty(),
+        "gam must report per-block edf for the penalized frailty fit"
+    );
+
+    // ---- baseline cumulative hazard on a shared time grid (structure) -------
+    let t_lo = time.iter().cloned().fold(f64::INFINITY, f64::min).max(1.0);
+    let t_hi = time.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    assert!(t_hi > t_lo, "follow-up grid must be non-degenerate");
+    let grid_n = 24usize;
+    let t_grid: Vec<f64> = (0..grid_n)
+        .map(|k| t_lo + (t_hi - t_lo) * (k as f64) / ((grid_n - 1) as f64))
+        .collect();
+    let gam_h0: Vec<f64> = baseline_cumulative_hazard(&fit, &t_grid);
+    assert_eq!(gam_h0.len(), grid_n);
+    assert!(
+        gam_h0.iter().all(|v| v.is_finite() && *v > 0.0),
+        "baseline cumulative hazard must be finite and positive: {gam_h0:?}"
+    );
+    assert!(
+        gam_h0.windows(2).all(|w| w[1] + 1e-9 >= w[0]),
+        "baseline cumulative hazard must be monotone non-decreasing: {gam_h0:?}"
+    );
+    let s0: Vec<f64> = gam_h0.iter().map(|h| (-h).exp()).collect();
+    assert!(
+        s0.iter().all(|s| (0.0..=1.0).contains(s)),
+        "baseline survival S0(t)=exp(-H0) must lie in [0,1]: {s0:?}"
+    );
+    assert!(
+        s0.windows(2).all(|w| w[1] <= w[0] + 1e-9),
+        "baseline survival must be non-increasing: {s0:?}"
+    );
+    let t_grid_csv = t_grid
+        .iter()
+        .map(|v| format!("{v:.17e}"))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    // ---- fit the SAME TRAIN rows with R-INLA (the match-or-beat baseline) ----
+    let train_time: Vec<f64> = train_idx.iter().map(|&i| time[i]).collect();
+    let train_event: Vec<f64> = train_idx.iter().map(|&i| event[i]).collect();
+    let train_x: Vec<f64> = train_idx.iter().map(|&i| x[i]).collect();
+    let train_group1: Vec<f64> = train_idx.iter().map(|&i| cell_code1[i]).collect();
+    let r = run_r(
+        &[
+            Column::new("time", &train_time),
+            Column::new("event", &train_event),
+            Column::new("x", &train_x),
+            Column::new("group", &train_group1),
+        ],
+        &format!(
+            r#"
+            suppressPackageStartupMessages(library(INLA))
+            df$group <- as.integer(round(df$group))
+            form <- inla.surv(time, event) ~ 1 + x + f(group, model = "iid")
+            r <- inla(form, family = "weibullsurv", data = df,
+                      control.compute = list(dic = TRUE, waic = TRUE),
+                      control.inla = list(strategy = "laplace"))
+            fr <- r$summary.random$group$mean
+            emit("frailty", as.numeric(fr))
+            slope <- r$summary.fixed["x", "mean"]
+            emit("slope", as.numeric(slope))
+            alpha <- r$summary.hyperpar["alpha parameter for weibullsurv", "mean"]
+            b0 <- r$summary.fixed["(Intercept)", "mean"]
+            tg <- c({t_grid_csv})
+            H0 <- exp(b0) * tg^alpha
+            emit("H0", as.numeric(H0))
+            emit("waic", r$waic$waic)
+            "#
+        ),
+    );
+    let inla_frailty = r.vector("frailty");
+    let inla_slope = r.scalar("slope");
+    let inla_h0 = r.vector("H0");
+    let inla_waic = r.scalar("waic");
+    assert_eq!(
+        inla_frailty.len(),
+        N_CELL,
+        "INLA returned {} frailty levels, expected {N_CELL}",
+        inla_frailty.len()
+    );
+    assert_eq!(inla_h0.len(), grid_n, "INLA H0 grid length mismatch");
+
+    // INLA's held-out PH risk on TEST rows; iid levels are in numeric code order
+    // 1..K, i.e. frailty[c] for histology class c.
+    let inla_risk: Vec<f64> = test_idx
+        .iter()
+        .map(|&i| inla_slope * x[i] + inla_frailty[cell_class[i]])
+        .collect();
+    let inla_c = harrell_concordance(&inla_risk, &test_time, &test_event);
+
+    // ---- context-only diagnostics ------------------------------------------
+    let inla_mean = inla_frailty.iter().sum::<f64>() / N_CELL as f64;
+    let inla_frailty_c: Vec<f64> = inla_frailty.iter().map(|v| v - inla_mean).collect();
+    let frailty_rmse = rmse(&gam_frailty, &inla_frailty_c);
+    let frailty_corr = pearson(&gam_frailty, &inla_frailty_c);
+    let h0_corr = pearson(&gam_h0, inla_h0);
+
+    eprintln!(
+        "veteran frailty survival (held-out): n={n} train={} test={} classes={N_CELL} \
+         event_rate={event_rate:.3} counts={class_counts:?} edf_total={edf_total:.3} \
+         edf_blocks={edf_blocks:?} gam_C={gam_c:.4} inla_C={inla_c:.4} \
+         [context-only] frailty_rmse={frailty_rmse:.4} frailty_pearson={frailty_corr:.4} \
+         H0_pearson={h0_corr:.4} INLA_waic={inla_waic:.2}\n  classes={class_names:?}\n  \
+         gam_frailty={gam_frailty:?}\n  inla_frailty={inla_frailty_c:?}",
+        train_idx.len(),
+        test_idx.len()
+    );
+
+    // (1) PRIMARY OBJECTIVE: held-out concordance clears an absolute bar. The
+    // Karnofsky performance score is a famously strong prognostic covariate in
+    // this cohort, so a competent PH frailty model discriminates well above
+    // chance; C >= 0.60 is a principled floor (0.5 is random) and is gam's OWN
+    // held-out predictive quality, not agreement with any tool.
+    assert!(
+        gam_c >= 0.60,
+        "gam under-discriminates held-out survival: C={gam_c:.4} (absolute bar 0.60)"
+    );
+    // (1b) MATCH-OR-BEAT: gam discriminates held-out risk at least as well as the
+    // R-INLA baseline (within a 0.02 estimation-noise margin).
+    assert!(
+        gam_c >= inla_c - 0.02,
+        "gam loses to INLA on held-out discrimination: gam_C={gam_c:.4} inla_C={inla_c:.4} (margin 0.02)"
+    );
+    // (2) STRUCTURE axioms on H0/S0 are asserted above.
+    // (3) SHRINKAGE SIGNATURE: the REML-selected RE frailty spends a sub-linear
+    // effective dimension below the unshrunk ceiling (time basis + fixed x + full
+    // per-class block).
+    let unshrunk_ceiling = time_cols as f64 + 1.0 + (N_CELL as f64);
     assert!(
         edf_total < unshrunk_ceiling,
         "frailty block is not shrinking: edf_total={edf_total:.3} >= unshrunk ceiling {unshrunk_ceiling:.3}"
