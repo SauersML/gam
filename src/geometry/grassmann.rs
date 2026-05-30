@@ -4,6 +4,7 @@ use crate::geometry::manifold::{
     GEOMETRY_EPS, GeometryError, GeometryResult, RiemannianManifold, check_len, dot, flatten,
     from_flat, identity, inverse, jacobi_symmetric, qr_thin, zero_christoffel,
 };
+use crate::geometry::sphere::SphereManifold;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrassmannManifold {
@@ -19,6 +20,23 @@ impl GrassmannManifold {
     fn orthonormalize(&self, y: &Array2<f64>) -> Array2<f64> {
         let (q, _) = qr_thin(y);
         q
+    }
+
+    /// For `k == 1` the Grassmannian `Gr(1, n)` is real projective space
+    /// `ℝP^{n-1}`, whose orientation double cover is the unit sphere
+    /// `S^{n-1}` (a single unit column is a point of the sphere, and the flat
+    /// ambient coordinates coincide). Within the injectivity radius `π/2` the
+    /// two share the same geodesics, exponential, logarithm, parallel
+    /// transport, and (constant `+1`) sectional curvature, so we reuse the
+    /// [`SphereManifold`] formulas — exactly as `St(n, 1)` does in
+    /// [`StiefelManifold`](crate::geometry::stiefel::StiefelManifold). This is
+    /// essential at the principal-angle-`π/2` cut-locus boundary, where the
+    /// `(YᵀZ)⁻¹` form used by the general-`k` `log_map` is singular but the
+    /// sphere logarithm (denominator `1 + Y·Z`) is well defined, so e.g.
+    /// transporting `e₂` from `e₁` to `e₂` correctly yields `-e₁` instead of
+    /// failing.
+    fn as_sphere(&self) -> Option<SphereManifold> {
+        (self.k == 1).then(|| SphereManifold::new(self.n - 1))
     }
 
     fn compact_svd_from_tangent(
@@ -87,6 +105,9 @@ impl RiemannianManifold for GrassmannManifold {
         point: ArrayView1<'_, f64>,
         tangent_vec: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
+        if let Some(sphere) = self.as_sphere() {
+            return sphere.exp_map(point, tangent_vec);
+        }
         let y = from_flat(point, self.n, self.k)?;
         let tangent = from_flat(
             self.project_tangent(point, tangent_vec)?.view(),
@@ -109,6 +130,9 @@ impl RiemannianManifold for GrassmannManifold {
         p_from: ArrayView1<'_, f64>,
         p_to: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
+        if let Some(sphere) = self.as_sphere() {
+            return sphere.log_map(p_from, p_to);
+        }
         let y = from_flat(p_from, self.n, self.k)?;
         let z = from_flat(p_to, self.n, self.k)?;
         let yt_z = y.t().dot(&z);
@@ -141,6 +165,9 @@ impl RiemannianManifold for GrassmannManifold {
         point_along: ArrayView2<'_, f64>,
         vec: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
+        if let Some(sphere) = self.as_sphere() {
+            return sphere.parallel_transport(point_along, vec);
+        }
         check_len("Grassmann path width", point_along.ncols(), self.ambient_dim())?;
         check_len(
             "Grassmann transported vector",
@@ -158,7 +185,9 @@ impl RiemannianManifold for GrassmannManifold {
         // Levi-Civita parallel transport along the canonical Grassmann geodesic
         // from `from` to `to`. Endpoint projection (the previous implementation)
         // is *not* parallel transport: it can collapse the norm to zero (e.g.
-        // transporting e₂ from e₁ to e₂ in Gr(1,n) projects e₂ - e₂(e₂ᵀe₂) = 0).
+        // transporting e₂ from e₁ to e₂ in Gr(1,n) projects e₂ - e₂(e₂ᵀe₂) = 0;
+        // that k=1 case is handled by the `as_sphere` delegation above, whose
+        // `1 + Y·Z` denominator stays well defined at the π/2 cut locus).
         //
         // The geodesic is determined by its initial direction Δ = Log_Y(Z),
         // whose thin SVD Δ = U Σ Vᵀ (U: n×k orthonormal, Σ: k×k diagonal of
@@ -169,8 +198,6 @@ impl RiemannianManifold for GrassmannManifold {
         //
         // which preserves the canonical (Frobenius) inner product and maps the
         // horizontal tangent space at Y to the horizontal tangent space at Z.
-        // At k=1 this is exactly the sphere/ℝPⁿ transport: e₂ ↦ -e₁ along the
-        // quarter great circle from e₁ to e₂.
         let from = point_along.row(0);
         let to = point_along.row(point_along.nrows() - 1);
         let y = from_flat(from, self.n, self.k)?;
@@ -212,6 +239,9 @@ impl RiemannianManifold for GrassmannManifold {
         point: ArrayView1<'_, f64>,
         tangent_pair: (ArrayView1<'_, f64>, ArrayView1<'_, f64>),
     ) -> GeometryResult<f64> {
+        if let Some(sphere) = self.as_sphere() {
+            return sphere.sectional_curvature(point, tangent_pair);
+        }
         check_len("Grassmann curvature point", point.len(), self.ambient_dim())?;
         check_len(
             "Grassmann curvature tangent u",
@@ -233,9 +263,13 @@ impl RiemannianManifold for GrassmannManifold {
         //   ⟨R(X,Y)Y, X⟩ = tr(Gxx·Gyy) + ‖Gxy‖²_F - 2·tr(Gyx·Gyx),
         //
         // and the sectional curvature divides by the area of the 2-plane,
-        // ⟨X,X⟩⟨Y,Y⟩ - ⟨X,Y⟩² with ⟨·,·⟩ = tr(·ᵀ·). The previous constant 0.0
-        // is only correct for a flat manifold; Grassmannians are not flat
-        // (Gr(1,n) = ℝPⁿ has constant sectional curvature 1, recovered here).
+        // ⟨X,X⟩⟨Y,Y⟩ - ⟨X,Y⟩² with ⟨·,·⟩ = tr(·ᵀ·). This expression matches the
+        // projector-model curvature tensor R(a,b)c = [[a,b],c] (verified against
+        // geomstats across Gr(2,4), Gr(2,5), Gr(3,7)); for Gr(2,4) it ranges over
+        // [0, 2] as expected, so the manifold is not constant-curvature for k ≥ 2.
+        // The previous constant 0.0 is only correct for a flat manifold, which
+        // Grassmannians are not. The k = 1 case (Gr(1,n) = ℝP^{n-1}, constant
+        // sectional curvature +1) is delegated to `as_sphere` above.
         let x = from_flat(self.project_tangent(point, tangent_pair.0)?.view(), self.n, self.k)?;
         let y = from_flat(self.project_tangent(point, tangent_pair.1)?.view(), self.n, self.k)?;
         let gxx = x.t().dot(&x);
@@ -311,6 +345,9 @@ impl RiemannianManifold for GrassmannManifold {
         tangent_vec: ArrayView1<'_, f64>,
         grad_output: ArrayView1<'_, f64>,
     ) -> GeometryResult<(Array1<f64>, Array1<f64>)> {
+        if let Some(sphere) = self.as_sphere() {
+            return sphere.exp_map_vjp(point, tangent_vec, grad_output);
+        }
         let m = self.ambient_dim();
         check_len("Grassmann exp_map_vjp point", point.len(), m)?;
         check_len("Grassmann exp_map_vjp tangent", tangent_vec.len(), m)?;
