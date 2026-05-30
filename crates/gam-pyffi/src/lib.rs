@@ -82,8 +82,8 @@ use gam::terms::basis::{
     build_spherical_spline_basis, build_thin_plate_penalty_matrix, create_basis,
     create_cyclic_difference_penalty_matrix, create_difference_penalty_matrix,
     duchon_nullspace_dimension, duchon_polynomial_first_derivative_nd,
-    duchon_radial_first_derivative_nd, duchon_radial_second_derivative_nd,
-    evaluate_bspline_basis_scalar, matern_radial_first_derivative_nd,
+    duchon_radial_first_derivative_nd, evaluate_bspline_basis_scalar,
+    matern_radial_first_derivative_nd,
     matern_radial_second_derivative_nd, monomial_exponents, periodic_bspline_first_derivative_nd,
     resolve_duchon_orders, select_spherical_farthest_point_centers, sphere_first_derivative_nd,
 };
@@ -135,8 +135,8 @@ use ndarray::{
     ArrayViewD, Axis, IxDyn, s,
 };
 use numpy::{
-    IntoPyArray, PyArray1, PyArray2, PyArray3, PyArrayDyn, PyArrayMethods, PyReadonlyArray1,
-    PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArray4, PyReadonlyArrayDyn,
+    IntoPyArray, PyArray1, PyArray2, PyArray3, PyArray4, PyArrayDyn, PyArrayMethods,
+    PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, PyReadonlyArray4, PyReadonlyArrayDyn,
 };
 use pyo3::IntoPyObjectExt;
 type PyObject = pyo3::Py<pyo3::PyAny>;
@@ -3311,6 +3311,113 @@ fn duchon_basis_with_jet<'py>(
     ))
 }
 
+/// Forward Duchon design **and** its analytic input-location first and second
+/// jets, all built from the *same* resolved spec the `duchon_basis` forward
+/// uses. This is the autograd companion the Python `Duchon` descriptor needs:
+/// the returned jets are the exact derivatives of the built design
+/// `X(x) = [α·K(x,C)·Z, P(x)]` — including the polynomial-constraint null-space
+/// projection `Z`, the appended polynomial nullspace columns `P(x)`, the kernel
+/// amplification `α`, the hybrid length-scale / power spectrum, and the
+/// periodic chord embedding — not the raw centerwise radial kernel.
+///
+/// Returns `(Φ, J, H)` with `Φ` shape `(N, M)`, `J` shape `(N, M, d)`, and
+/// `H` shape `(N, M, d, d)`, where `M = n_kernel + n_poly`. The keyword
+/// surface and resolution policy are identical to [`duchon_basis`] so the
+/// forward block of `Φ` is bit-equal to a standalone `duchon_basis` call.
+#[pyfunction(signature = (
+    points,
+    centers,
+    m = 2,
+    periodic_per_axis = None,
+    length_scale = None,
+    nullspace_order = None,
+    power = None,
+))]
+fn duchon_basis_with_jets<'py>(
+    py: Python<'py>,
+    points: PyReadonlyArray2<'py, f64>,
+    centers: PyReadonlyArray2<'py, f64>,
+    m: usize,
+    periodic_per_axis: Option<Vec<bool>>,
+    length_scale: Option<f64>,
+    nullspace_order: Option<&str>,
+    power: Option<f64>,
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray3<f64>>, Py<PyArray4<f64>>)> {
+    if m == 0 {
+        return Err(py_value_error("Duchon m must be at least 1".to_string()));
+    }
+    let pts = points.as_array();
+    let ctrs = centers.as_array();
+    if pts.ncols() != ctrs.ncols() {
+        return Err(py_value_error(format!(
+            "points has d={} but centers has d={}",
+            pts.ncols(),
+            ctrs.ncols()
+        )));
+    }
+    if pts.iter().any(|value| !value.is_finite()) || ctrs.iter().any(|value| !value.is_finite()) {
+        return Err(py_value_error(
+            "duchon_basis_with_jets requires finite points and centers".to_string(),
+        ));
+    }
+    let d = pts.ncols();
+    let periodic_flags = periodic_per_axis.unwrap_or_else(|| vec![false; d]);
+    if periodic_flags.len() != d {
+        return Err(py_value_error(format!(
+            "periodic_per_axis must have length d={}, got {}",
+            d,
+            periodic_flags.len()
+        )));
+    }
+
+    // Resolve the (nullspace_order, power) pair exactly as the basis-only
+    // `duchon_basis` forward does (`max_op = 0`): the returned jets must
+    // differentiate the *same* matrix the forward builds.
+    let cfg = resolve_duchon_hybrid_config(
+        d,
+        m,
+        length_scale,
+        nullspace_order,
+        power,
+        /* max_op = */ 0,
+    )?;
+
+    // Periods for periodic axes: auto-derived as (max − min) over centers,
+    // matching `build_duchon_basis_mixed_periodicity_auto`'s `periods = None`
+    // policy; non-periodic axes carry an unused placeholder.
+    let mut periods = vec![1.0_f64; d];
+    for (j, &per) in periodic_flags.iter().enumerate() {
+        if per {
+            let col = ctrs.column(j);
+            let left = col.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+            let right = col.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+            if !left.is_finite() || !right.is_finite() || left >= right {
+                return Err(py_value_error(format!(
+                    "duchon_basis_with_jets: periodic axis {j} has degenerate center span [{left}, {right}]"
+                )));
+            }
+            periods[j] = right - left;
+        }
+    }
+
+    let (phi, jet, hess) = gam::basis::build_duchon_basis_design_and_jets(
+        pts,
+        ctrs,
+        cfg.length_scale,
+        cfg.power,
+        cfg.nullspace_order,
+        &periodic_flags,
+        &periods,
+    )
+    .map_err(|err| py_value_error(err.to_string()))?;
+
+    Ok((
+        phi.into_pyarray(py).unbind(),
+        jet.into_pyarray(py).unbind(),
+        hess.into_pyarray(py).unbind(),
+    ))
+}
+
 /// Evaluate the Matérn kernel basis design matrix at `points` against `centers`.
 ///
 /// `points` is `(N, d)`, `centers` is `(K, d)`. `nu` accepted as `"1/2"`,
@@ -4269,7 +4376,7 @@ fn require_finite_matrix(name: &str, matrix: &ArrayView2<'_, f64>) -> PyResult<(
     Ok(())
 }
 
-#[pyfunction(signature = (y_out, y_hat, z, w_dec, lambda_sparse, skip_u = None, skip_v = None))]
+#[pyfunction(signature = (y_out, y_hat, z, w_dec, lambda_sparse, skip_u = None, skip_proj = None))]
 fn skip_transcoder_reml_metrics<'py>(
     py: Python<'py>,
     y_out: PyReadonlyArray2<'py, f64>,
@@ -4278,7 +4385,7 @@ fn skip_transcoder_reml_metrics<'py>(
     w_dec: PyReadonlyArray2<'py, f64>,
     lambda_sparse: f64,
     skip_u: Option<PyReadonlyArray2<'py, f64>>,
-    skip_v: Option<PyReadonlyArray2<'py, f64>>,
+    skip_proj: Option<PyReadonlyArray2<'py, f64>>,
 ) -> PyResult<Py<PyDict>> {
     if !(lambda_sparse.is_finite() && lambda_sparse > 0.0) {
         return Err(py_value_error(format!(
@@ -4291,7 +4398,7 @@ fn skip_transcoder_reml_metrics<'py>(
     let z = z.as_array();
     let w_dec = w_dec.as_array();
     let skip_u_view = skip_u.as_ref().map(|value| value.as_array());
-    let skip_v_view = skip_v.as_ref().map(|value| value.as_array());
+    let skip_proj_view = skip_proj.as_ref().map(|value| value.as_array());
 
     require_finite_matrix("y_out", &y_out)?;
     require_finite_matrix("y_hat", &y_hat)?;
@@ -4300,8 +4407,8 @@ fn skip_transcoder_reml_metrics<'py>(
     if let Some(skip_u) = skip_u_view.as_ref() {
         require_finite_matrix("skip_u", skip_u)?;
     }
-    if let Some(skip_v) = skip_v_view.as_ref() {
-        require_finite_matrix("skip_v", skip_v)?;
+    if let Some(skip_proj) = skip_proj_view.as_ref() {
+        require_finite_matrix("skip_proj", skip_proj)?;
     }
 
     let (n_rows, out_dim) = y_out.dim();
@@ -4331,26 +4438,49 @@ fn skip_transcoder_reml_metrics<'py>(
             w_dec.ncols()
         )));
     }
-    if let Some(skip_u) = skip_u_view.as_ref() {
-        if skip_u.nrows() != out_dim {
-            return Err(py_value_error(format!(
-                "skip_u row mismatch: expected {out_dim}, got {}",
-                skip_u.nrows()
-            )));
-        }
-        if let Some(skip_v) = skip_v_view.as_ref() {
-            if skip_v.ncols() != skip_u.ncols() {
+    // The skip bypass enters the prediction only through the products
+    // `XV = x_in · skip_V` (passed as `skip_proj`) and `U = skip_u`. The
+    // gauge-invariant score requires *both*: `skip_proj` supplies the skip's
+    // data-dependent activation columns and `skip_u` its output loadings.
+    // Reject any partial specification at this boundary rather than silently
+    // dropping a factor and scoring a different object.
+    match (skip_u_view.as_ref(), skip_proj_view.as_ref()) {
+        (Some(skip_u), Some(skip_proj)) => {
+            if skip_u.nrows() != out_dim {
                 return Err(py_value_error(format!(
-                    "skip_v rank mismatch: expected {} columns, got {}",
+                    "skip_u row mismatch: expected {out_dim}, got {}",
+                    skip_u.nrows()
+                )));
+            }
+            if skip_proj.nrows() != n_rows {
+                return Err(py_value_error(format!(
+                    "skip_proj row mismatch: expected {n_rows}, got {}",
+                    skip_proj.nrows()
+                )));
+            }
+            if skip_proj.ncols() != skip_u.ncols() {
+                return Err(py_value_error(format!(
+                    "skip rank mismatch: skip_u has {} columns but skip_proj has {}",
                     skip_u.ncols(),
-                    skip_v.ncols()
+                    skip_proj.ncols()
                 )));
             }
         }
-    } else if skip_v_view.is_some() {
-        return Err(py_value_error(
-            "skip_v was provided without skip_u".to_string(),
-        ));
+        (Some(_), None) => {
+            return Err(py_value_error(
+                "skip_u was provided without skip_proj (= x_in · skip_V); \
+                 both factors are required to score the skip bypass"
+                    .to_string(),
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(py_value_error(
+                "skip_proj was provided without skip_u; both factors are \
+                 required to score the skip bypass"
+                    .to_string(),
+            ));
+        }
+        (None, None) => {}
     }
 
     let metrics = skip_transcoder_reml_metrics_core(SkipTranscoderRemlInputs {
@@ -4359,6 +4489,7 @@ fn skip_transcoder_reml_metrics<'py>(
         z,
         w_dec,
         lambda_sparse,
+        skip_proj: skip_proj_view,
         skip_u: skip_u_view,
     })
     .map_err(py_value_error)?;
@@ -17234,53 +17365,6 @@ fn thread3_cliff_gradient_magnitude<'py>(
 // `t` instead of at the anisotropy / log-kappa.
 // =========================================================================
 
-/// `φ'(r_{n,k})` for the Duchon kernel at every `(row, center)` pair.
-/// Returns `(n_rows, n_centers)`. Multiply by `(t − c)/r` at the call site
-/// to get the per-row gradient — or use
-/// [`crate::terms::latent_coord::LatentCoordValues::design_gradient_wrt_t`].
-#[pyfunction(signature = (t, centers, length_scale = None, m = 2))]
-fn duchon_input_location_first_derivative<'py>(
-    py: Python<'py>,
-    t: PyReadonlyArray2<'py, f64>,
-    centers: PyReadonlyArray2<'py, f64>,
-    length_scale: Option<f64>,
-    m: usize,
-) -> PyResult<Py<PyArray2<f64>>> {
-    if m == 0 {
-        return Err(py_value_error(
-            "duchon_input_location_first_derivative: m must be >= 1".to_string(),
-        ));
-    }
-    let nullspace_order = duchon_nullspace_from_m(m);
-    let out = duchon_radial_first_derivative_nd(
-        t.as_array(),
-        centers.as_array(),
-        length_scale,
-        nullspace_order,
-    )
-    .map_err(|err| py_value_error(err.to_string()))?;
-    Ok(out.into_pyarray(py).unbind())
-}
-
-/// `(N, n_poly, d)` jet of the Duchon polynomial-nullspace tail (closed-form
-/// monomial derivatives). Column ordering matches the
-/// `monomial_basis_block` enumeration used by the Duchon design builder.
-#[pyfunction(signature = (t, m = 2))]
-fn duchon_polynomial_input_location_first_derivative<'py>(
-    py: Python<'py>,
-    t: PyReadonlyArray2<'py, f64>,
-    m: usize,
-) -> PyResult<Py<PyArray3<f64>>> {
-    if m == 0 {
-        return Err(py_value_error(
-            "duchon_polynomial_input_location_first_derivative: m must be >= 1".to_string(),
-        ));
-    }
-    let nullspace_order = duchon_nullspace_from_m(m);
-    let jet = duchon_polynomial_first_derivative_nd(t.as_array(), nullspace_order);
-    Ok(jet.into_pyarray(py).unbind())
-}
-
 /// `φ'(r_{n,k})` for the Matérn kernel at every `(row, center)` pair.
 /// Returns `(n_rows, n_centers)`. `nu` accepted: `"1/2"`, `"3/2"`, `"5/2"`,
 /// `"7/2"`, `"9/2"` (any whitespace stripped).
@@ -17334,34 +17418,6 @@ fn matern_input_location_second_derivative<'py>(
         centers.as_array(),
         length_scale,
         nu_parsed,
-    )
-    .map_err(|err| py_value_error(err.to_string()))?;
-    Ok(out.into_pyarray(py).unbind())
-}
-
-/// `φ''(r_{n,k})` for the Duchon kernel at every `(row, center)` pair.
-/// Companion to `duchon_input_location_first_derivative`; combine with
-/// `φ'(r)` and the axis ratios `u = (t − c)/r` at the call site to assemble
-/// the input-location Hessian.
-#[pyfunction(signature = (t, centers, length_scale = None, m = 2))]
-fn duchon_input_location_second_derivative<'py>(
-    py: Python<'py>,
-    t: PyReadonlyArray2<'py, f64>,
-    centers: PyReadonlyArray2<'py, f64>,
-    length_scale: Option<f64>,
-    m: usize,
-) -> PyResult<Py<PyArray2<f64>>> {
-    if m == 0 {
-        return Err(py_value_error(
-            "duchon_input_location_second_derivative: m must be >= 1".to_string(),
-        ));
-    }
-    let nullspace_order = duchon_nullspace_from_m(m);
-    let out = duchon_radial_second_derivative_nd(
-        t.as_array(),
-        centers.as_array(),
-        length_scale,
-        nullspace_order,
     )
     .map_err(|err| py_value_error(err.to_string()))?;
     Ok(out.into_pyarray(py).unbind())
@@ -22436,6 +22492,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(periodic_basis_with_jet, module)?)?;
     module.add_function(wrap_pyfunction!(periodic_spline_curve_basis, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_basis_with_jet, module)?)?;
+    module.add_function(wrap_pyfunction!(duchon_basis_with_jets, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_basis, module)?)?;
     module.add_function(wrap_pyfunction!(matern_basis, module)?)?;
     module.add_function(wrap_pyfunction!(smoothness_penalty, module)?)?;
@@ -22644,24 +22701,18 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(synthetic_geo_latlon_response, module)?)?;
     module.add_function(wrap_pyfunction!(thread3_cliff_gradient_magnitude, module)?)?;
     // LatentCoord input-location derivative helpers (one per basis kind).
-    module.add_function(wrap_pyfunction!(
-        duchon_input_location_first_derivative,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        duchon_polynomial_input_location_first_derivative,
-        module
-    )?)?;
+    // The Duchon descriptor differentiates the *built* design (kernel-nullspace
+    // projection + polynomial columns + amplification) via `duchon_basis_with_jets`,
+    // not the raw centerwise radial kernel, so no Duchon raw-radial FFI is
+    // registered here. The Matérn descriptor pairs the raw radial scalars with
+    // the closed-form axis ratio in Python (no nullspace projection / polynomial
+    // tail for that basis), so it keeps its raw-radial helpers.
     module.add_function(wrap_pyfunction!(
         matern_input_location_first_derivative,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
         matern_input_location_second_derivative,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        duchon_input_location_second_derivative,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(matern_basis_gradient_streaming, module)?)?;
