@@ -22501,6 +22501,238 @@ mod tests {
         assert_eq!(slices.total, 1 + 2 + 3 + link_runtime.basis_dim());
     }
 
+    // ── Single-source block-layout parity (#428) ─────────────────────────
+    //
+    // `HessBlock` + `BlockHessianAccumulator::block_view` are the one place
+    // the 5×5 block layout and its transpose relationships live. Every
+    // assembler (`to_dense`, `diagonal`, operator `mul_vec`, operator
+    // `bilinear`) is driven by them. These tests pin that machinery against a
+    // *separately hand-written* fifteen-block scatter so a layout or
+    // transpose regression in the shared helpers cannot hide behind itself.
+
+    /// Build contiguous block slices for the given per-block widths. A flex
+    /// block with width 0 is absent (`None`) and consumes no coordinates,
+    /// exactly mirroring how `block_slices` lays out optional deviation blocks.
+    fn parity_make_slices(pt: usize, pm: usize, pg: usize, ph: usize, pw: usize) -> BlockSlices {
+        let mut cursor = 0usize;
+        let mut take = |n: usize| {
+            let r = cursor..cursor + n;
+            cursor += n;
+            r
+        };
+        let time = take(pt);
+        let marginal = take(pm);
+        let logslope = take(pg);
+        let score_warp = (ph > 0).then(|| take(ph));
+        let link_dev = (pw > 0).then(|| take(pw));
+        let total = cursor;
+        BlockSlices {
+            time,
+            marginal,
+            logslope,
+            score_warp,
+            link_dev,
+            total,
+        }
+    }
+
+    /// A genuinely-symmetric block (diagonal blocks of a Hessian are symmetric
+    /// by construction), with a per-block `tag` so cross-block contamination
+    /// is detectable.
+    fn parity_sym(n: usize, tag: f64) -> Array2<f64> {
+        Array2::from_shape_fn((n, n), |(i, j)| {
+            tag + (i as f64 + j as f64) * 0.5 + (i as f64) * (j as f64) * 0.0625
+        })
+    }
+
+    /// A general (non-symmetric) off-diagonal block, distinct per `tag` and
+    /// deliberately asymmetric in (i, j) so a missing/extra transpose shows up.
+    fn parity_gen(rows: usize, cols: usize, tag: f64) -> Array2<f64> {
+        Array2::from_shape_fn((rows, cols), |(i, j)| {
+            tag + (i as f64) * 0.5 + (j as f64) * 0.125
+        })
+    }
+
+    fn parity_filled_accumulator(
+        pt: usize,
+        pm: usize,
+        pg: usize,
+        ph: usize,
+        pw: usize,
+    ) -> BlockHessianAccumulator {
+        BlockHessianAccumulator {
+            h_tt: parity_sym(pt, 1.0),
+            h_mm: parity_sym(pm, 2.0),
+            h_gg: parity_sym(pg, 3.0),
+            h_hh: parity_sym(ph, 4.0),
+            h_ww: parity_sym(pw, 5.0),
+            h_tm: parity_gen(pt, pm, 10.0),
+            h_tg: parity_gen(pt, pg, 11.0),
+            h_th: parity_gen(pt, ph, 12.0),
+            h_tw: parity_gen(pt, pw, 13.0),
+            h_mg: parity_gen(pm, pg, 14.0),
+            h_mh: parity_gen(pm, ph, 15.0),
+            h_mw: parity_gen(pm, pw, 16.0),
+            h_gh: parity_gen(pg, ph, 17.0),
+            h_gw: parity_gen(pg, pw, 18.0),
+            h_hw: parity_gen(ph, pw, 19.0),
+        }
+    }
+
+    /// Independent dense oracle: scatter the fifteen stored blocks by hand,
+    /// placing each off-diagonal block in its upper position and its explicit
+    /// transpose in the mirror position. Deliberately avoids `block_view`,
+    /// `range_of`, and `for_each_offdiagonal_pair`.
+    fn parity_reference_dense(acc: &BlockHessianAccumulator, sl: &BlockSlices) -> Array2<f64> {
+        let mut out = Array2::zeros((sl.total, sl.total));
+        out.slice_mut(s![sl.time.clone(), sl.time.clone()])
+            .assign(&acc.h_tt);
+        out.slice_mut(s![sl.marginal.clone(), sl.marginal.clone()])
+            .assign(&acc.h_mm);
+        out.slice_mut(s![sl.logslope.clone(), sl.logslope.clone()])
+            .assign(&acc.h_gg);
+        if let Some(h) = &sl.score_warp {
+            out.slice_mut(s![h.clone(), h.clone()]).assign(&acc.h_hh);
+        }
+        if let Some(w) = &sl.link_dev {
+            out.slice_mut(s![w.clone(), w.clone()]).assign(&acc.h_ww);
+        }
+        let mut place = |r: std::ops::Range<usize>,
+                         c: std::ops::Range<usize>,
+                         m: ArrayView2<'_, f64>| {
+            out.slice_mut(s![r.clone(), c.clone()]).assign(&m);
+            out.slice_mut(s![c, r]).assign(&m.t());
+        };
+        place(sl.time.clone(), sl.marginal.clone(), acc.h_tm.view());
+        place(sl.time.clone(), sl.logslope.clone(), acc.h_tg.view());
+        place(sl.marginal.clone(), sl.logslope.clone(), acc.h_mg.view());
+        if let Some(h) = &sl.score_warp {
+            place(sl.time.clone(), h.clone(), acc.h_th.view());
+            place(sl.marginal.clone(), h.clone(), acc.h_mh.view());
+            place(sl.logslope.clone(), h.clone(), acc.h_gh.view());
+        }
+        if let Some(w) = &sl.link_dev {
+            place(sl.time.clone(), w.clone(), acc.h_tw.view());
+            place(sl.marginal.clone(), w.clone(), acc.h_mw.view());
+            place(sl.logslope.clone(), w.clone(), acc.h_gw.view());
+        }
+        if let (Some(h), Some(w)) = (&sl.score_warp, &sl.link_dev) {
+            place(h.clone(), w.clone(), acc.h_hw.view());
+        }
+        out
+    }
+
+    const PARITY_LAYOUTS: [(usize, usize, usize, usize, usize); 4] = [
+        (2, 3, 2, 4, 3), // full: both flex blocks present
+        (2, 3, 2, 0, 0), // rigid: no flex blocks
+        (2, 3, 2, 4, 0), // score-warp only
+        (2, 3, 2, 0, 3), // link-deviation only
+    ];
+
+    #[test]
+    fn block_to_dense_matches_hand_scatter_bit_exact() {
+        for (pt, pm, pg, ph, pw) in PARITY_LAYOUTS {
+            let sl = parity_make_slices(pt, pm, pg, ph, pw);
+            let acc = parity_filled_accumulator(pt, pm, pg, ph, pw);
+            let got = acc.to_dense(&sl);
+            let want = parity_reference_dense(&acc, &sl);
+            assert_eq!(
+                got, want,
+                "to_dense diverged from hand scatter for layout {:?}",
+                (pt, pm, pg, ph, pw)
+            );
+        }
+    }
+
+    #[test]
+    fn block_diagonal_matches_dense_diagonal_bit_exact() {
+        for (pt, pm, pg, ph, pw) in PARITY_LAYOUTS {
+            let sl = parity_make_slices(pt, pm, pg, ph, pw);
+            let acc = parity_filled_accumulator(pt, pm, pg, ph, pw);
+            let got = acc.diagonal(&sl);
+            let want = parity_reference_dense(&acc, &sl).diag().to_owned();
+            assert_eq!(
+                got, want,
+                "diagonal diverged from dense diagonal for layout {:?}",
+                (pt, pm, pg, ph, pw)
+            );
+        }
+    }
+
+    #[test]
+    fn block_operator_matvec_matches_dense_gemv() {
+        for (pt, pm, pg, ph, pw) in PARITY_LAYOUTS {
+            let sl = parity_make_slices(pt, pm, pg, ph, pw);
+            let acc = parity_filled_accumulator(pt, pm, pg, ph, pw);
+            let dense = parity_reference_dense(&acc, &sl);
+            let v = Array1::from_shape_fn(sl.total, |i| (i as f64 * 0.37).sin());
+            let op = acc.into_operator(sl.clone());
+            let got = op.mul_vec(&v);
+            let want = dense.dot(&v);
+            assert_relative_eq!(
+                got.as_slice().unwrap(),
+                want.as_slice().unwrap(),
+                max_relative = 1e-12,
+                epsilon = 1e-12
+            );
+        }
+    }
+
+    #[test]
+    fn block_operator_bilinear_matches_dense_quadratic_form() {
+        for (pt, pm, pg, ph, pw) in PARITY_LAYOUTS {
+            let sl = parity_make_slices(pt, pm, pg, ph, pw);
+            let acc = parity_filled_accumulator(pt, pm, pg, ph, pw);
+            let dense = parity_reference_dense(&acc, &sl);
+            let v = Array1::from_shape_fn(sl.total, |i| (i as f64 * 0.37).sin());
+            let u = Array1::from_shape_fn(sl.total, |i| (i as f64 * 0.53).cos());
+            let want = v.dot(&dense.dot(&u));
+            let op = acc.into_operator(sl.clone());
+            let got = op.bilinear(&v, &u);
+            assert_relative_eq!(got, want, max_relative = 1e-12, epsilon = 1e-12);
+        }
+    }
+
+    #[test]
+    fn block_operator_dense_matches_accumulator_dense_bit_exact() {
+        for (pt, pm, pg, ph, pw) in PARITY_LAYOUTS {
+            let sl = parity_make_slices(pt, pm, pg, ph, pw);
+            let acc = parity_filled_accumulator(pt, pm, pg, ph, pw);
+            let direct = acc.to_dense(&sl);
+            let op = acc.into_operator(sl.clone());
+            let via_op = op.to_dense();
+            assert_eq!(
+                direct, via_op,
+                "operator to_dense diverged from accumulator to_dense for layout {:?}",
+                (pt, pm, pg, ph, pw)
+            );
+        }
+    }
+
+    #[test]
+    fn block_view_is_transpose_symmetric_across_present_pairs() {
+        for (pt, pm, pg, ph, pw) in PARITY_LAYOUTS {
+            let sl = parity_make_slices(pt, pm, pg, ph, pw);
+            let acc = parity_filled_accumulator(pt, pm, pg, ph, pw);
+            for a in HessBlock::ALL {
+                if sl.range_of(a).is_none() {
+                    continue;
+                }
+                for b in HessBlock::ALL {
+                    if sl.range_of(b).is_none() {
+                        continue;
+                    }
+                    let ab = acc.block_view(a, b).to_owned();
+                    let ba_t = acc.block_view(b, a).t().to_owned();
+                    assert_eq!(
+                        ab, ba_t,
+                        "block_view({a:?},{b:?}) != block_view({b:?},{a:?})^T"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn exact_flex_row_matches_rigid_closed_form_without_deviations() {
         let family = SurvivalMarginalSlopeFamily {
