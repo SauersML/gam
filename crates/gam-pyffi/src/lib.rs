@@ -10767,15 +10767,16 @@ fn sae_build_duchon_atom(
     pts: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
 ) -> Result<(Array2<f64>, Array3<f64>, Array2<f64>), String> {
-    // The `DuchonCoordinateEvaluator` evaluates the *pure* scale-free
-    // polyharmonic basis (`length_scale = None`, `power = 0`) at the resolved
-    // nullspace order, so the matching smoothness penalty is the scale-free
-    // curvature seminorm `∫|∇^(p) f|²` (the kernel reproducing norm), which
-    // `build_duchon_basis` emits as `PenaltySource::OperatorStiffness` — the
-    // same block `duchon_function_norm_penalty` selects. The mass and tension
-    // terms reintroduce a finite reversion length through `∫f²` / `∫|∇f|²`,
-    // exactly the Type-A behaviour the polyharmonic basis is chosen to avoid,
-    // so only the top-order curvature term is requested here.
+    // The `DuchonCoordinateEvaluator` evaluates the structural cubic (r^3)
+    // basis (`length_scale = None`, `power = 0`) at the resolved nullspace
+    // order, so the matching smoothness penalty is the curvature (data-jet)
+    // block, which `build_duchon_basis` emits as
+    // `PenaltySource::OperatorStiffness` — the same block
+    // `duchon_function_norm_penalty` selects. The mass and tension data-jet
+    // candidates penalize amplitude / slope energy and reintroduce a finite
+    // reversion length, exactly the Type-A behaviour the structural smoother
+    // is chosen to avoid, so only the top-order curvature term is requested
+    // here.
     //
     // The nullspace order and power MUST match the evaluator (`power = 0`,
     // order = `duchon_nullspace_from_m(m)`); the D2 collocation inequality
