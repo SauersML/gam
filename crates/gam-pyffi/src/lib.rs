@@ -73,6 +73,7 @@ use gam::smooth::{
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
     freeze_term_collection_from_design,
 };
+use gam::solver::build_analytic_penalty_registry_from_descriptors as build_analytic_penalty_registry_from_json;
 use gam::solver::reml_compare::{RemlCandidate, compare_reml_fits as compare_reml_fits_core};
 use gam::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
 use gam::terms::basis::{
@@ -26608,18 +26609,6 @@ fn build_analytic_penalty_registry_json(
             "failed to serialize analytic penalty registry json: {err}"
         ))
     })
-}
-
-/// Thin adapter over the single shared descriptor parser
-/// (`gam::solver::build_analytic_penalty_registry_from_descriptors`). PyFFI only
-/// deserializes Python objects/JSON into [`serde_json::Value`]; the schema,
-/// defaults, shape checks, and error messages all come from the shared core, so
-/// Python and workflow users see byte-identical behaviour for the same penalty.
-fn build_analytic_penalty_registry_from_json(
-    latents: Option<&serde_json::Value>,
-    penalties: Option<&serde_json::Value>,
-) -> Result<AnalyticPenaltyRegistry, String> {
-    gam::solver::build_analytic_penalty_registry_from_descriptors(latents, penalties)
 }
 
 /// Convert a JSON-sourced `u64` into a positive `usize`, rejecting zero and

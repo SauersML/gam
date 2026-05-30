@@ -1285,14 +1285,13 @@ fn descriptor_axis_groups(
 mod tests {
     //! Parity / schema-lock tests for the single shared descriptor parser.
     //!
-    //! Both the in-process workflow pipeline
-    //! (`solver::workflow::build_standard_latent_analytic_penalty_registry`) and
-    //! the Python FFI (`gam-pyffi::build_analytic_penalty_registry_from_json`)
-    //! are now thin adapters over
-    //! [`build_analytic_penalty_registry_from_descriptors`]. Exercising the
-    //! shared parser here therefore pins one schema, one set of defaults, one
-    //! set of shape checks, and one set of error messages for every caller — no
-    //! entry point can drift away from these without breaking the suite.
+    //! Both the in-process workflow pipeline (`solver::workflow`) and the Python
+    //! FFI (`gam-pyffi`) call
+    //! [`build_analytic_penalty_registry_from_descriptors`] directly — no entry
+    //! point owns its own copy of the schema. Exercising the shared parser here
+    //! therefore pins one schema, one set of defaults, one set of shape checks,
+    //! and one set of error messages for every caller — no entry point can drift
+    //! away from these without breaking the suite.
 
     use super::build_analytic_penalty_registry_from_descriptors;
     use serde_json::json;
