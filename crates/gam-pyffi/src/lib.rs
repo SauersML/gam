@@ -3668,7 +3668,7 @@ fn basis_with_jet<'py>(
                 let (penalty, null_basis) =
                     smoothness_penalty_impl(knots_array.view(), degree, order)
                         .map_err(py_value_error)?;
-                debug_assert!(
+                assert!(
                     null_basis.ncols() <= penalty.ncols(),
                     "smoothness penalty nullspace cannot exceed coefficient count"
                 );

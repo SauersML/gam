@@ -178,8 +178,12 @@ impl VectorLikelihood for BinomialMultiLikelihood {
         out
     }
 
-    /// Per-output diagonal curvature `w_n μ_{n,a} (1 − μ_{n,a})`.
-    fn hess_diag(&self, eta: ArrayView2<'_, f64>, _y: ArrayView2<'_, f64>) -> Array2<f64> {
+    /// Per-output diagonal curvature `w_n μ_{n,a} (1 − μ_{n,a})`. The Fisher
+    /// information of independent Bernoulli outputs is `y`-independent; `y` is
+    /// read only to assert the target shape matches `eta`, as in the sibling
+    /// [`VectorLikelihood`] implementations.
+    fn hess_diag(&self, eta: ArrayView2<'_, f64>, y: ArrayView2<'_, f64>) -> Array2<f64> {
+        assert_eq!(eta.dim(), y.dim(), "y must match eta shape (N, K)");
         let (n, k) = eta.dim();
         let mut out = Array2::<f64>::zeros((n, k));
         for row in 0..n {

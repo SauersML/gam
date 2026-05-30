@@ -159,11 +159,7 @@ impl CustomFamily for BetaLogitCustomFamily {
             w22[i] = -(d2_bb * s2 * s2 + d_lb * sp2);
         }
 
-        debug_assert_eq!(
-            block_states[0].eta.len(),
-            n,
-            "block 0 eta length must equal n"
-        );
+        assert_eq!(block_states[0].eta.len(), n, "block 0 eta length must equal n");
 
         // Block gradients Xᵀ score and block observed-information Xᵀ diag(w) X.
         let g1 = self.design0_transpose_dot(&score1);
@@ -264,13 +260,13 @@ fn design_from_covariate(covariate: &[f64]) -> Array2<f64> {
 
 fn build_design0() -> Array2<f64> {
     let (x1, x2) = synthetic_covariates();
-    debug_assert_eq!(x1.len(), x2.len());
+    assert_eq!(x1.len(), x2.len());
     design_from_covariate(&x1)
 }
 
 fn build_design1() -> Array2<f64> {
     let (x1, x2) = synthetic_covariates();
-    debug_assert_eq!(x1.len(), x2.len());
+    assert_eq!(x1.len(), x2.len());
     design_from_covariate(&x2)
 }
 
