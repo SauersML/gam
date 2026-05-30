@@ -1946,7 +1946,16 @@ def duchon_function_norm_penalty(
     nullspace_order: str | None = None,
     power: float | None = None,
 ) -> Any:
-    """Duchon m-spline RKHS / function-norm penalty matrix.
+    """Single-λ smoothness penalty matrix for the cubic (r³) Duchon basis.
+
+    This returns ONE ``(K × K)`` SPD penalty for the cubic polyharmonic basis
+    on ``centers`` — convenient when you need a single REML ``λ`` for a
+    manually built radial-basis design. It is **not** the classical Duchon
+    native seminorm, and it is **not** the structural smoother the formula API
+    (:class:`gamfit.smooth.Duchon`, ``basis_kind="duchon"``) fits. That object
+    penalizes amplitude, slope, and curvature with three *separate* REML
+    ``λ``s and only frees the global mean; to get it, use the formula smooth
+    rather than feeding this single matrix back as a penalty.
 
     Parameters
     ----------
@@ -1954,7 +1963,8 @@ def duchon_function_norm_penalty(
         Control points. Shape ``(K,)`` or ``(K, 1)`` for 1D, or ``(K, d)``
         for d-dimensional centers.
     m : int, default 2
-        Spline order.
+        Spline ORDER — selects the unpenalized polynomial nullspace, not the
+        spectral power ``s``.
     periodic_per_axis : sequence of bool of length d, optional
         Per-axis periodicity. ``d=1`` uses the Bernoulli-Green Gram on
         the circle; ``d ≥ 2`` with any periodic axis uses the multi-D
@@ -3636,20 +3646,25 @@ def _resolve_position_penalty(
     basis_order: int,
     periodic: bool,
 ) -> Any:
-    """Resolve the canonical penalty for position-based REML helpers.
+    """Resolve the canonical single-λ penalty for position-based REML helpers.
 
-    Picking a basis chooses the penalty by default — pairing a basis with
-    the wrong penalty is not a recognised statistical object. Power users
-    can override with an explicit matrix in ``penalty``; the string-form
-    ``penalty="function-norm" | "triple-operator" | "difference"`` selects
+    These helpers fit ONE smoothing ``λ`` against a position-indexed design,
+    so each basis maps to a single SPD penalty matrix. Power users can
+    override with an explicit matrix in ``penalty``; the string form selects
     a non-default canonical penalty for the same basis.
 
-    Basis → default penalty:
+    Basis → default single-λ penalty:
 
-    * ``"duchon"``               → function-norm (RKHS semi-norm ``∫(f^{(m)})² dx``)
-    * ``"duchon_multipenalty"``  → triple-operator (mass + tension + stiffness)
-    * ``"thinplate"`` (1D ``t``) → 1D thin-plate ≡ cubic smoothing spline ≡ Duchon ``m=2`` function-norm
-    * ``"bspline"``              → P-spline 2nd-difference coefficient penalty
+    * ``"duchon"``  → single-λ smoothness penalty for the cubic basis
+      (:func:`duchon_function_norm_penalty`). This is the convenience single-λ
+      object, **not** the multi-λ structural smoother. For the amplitude/slope/
+      curvature smoother with three separate REML ``λ``s — the object the
+      formula API and :class:`gamfit.smooth.Duchon` fit — use the formula
+      smooth; there is no way to express three independent ``λ``s through this
+      single-penalty position helper.
+    * ``"thinplate"`` (1D ``t``) → 1D thin-plate ≡ cubic smoothing spline,
+      routed through the cubic-basis single-λ penalty at ``m=2``.
+    * ``"bspline"``  → P-spline 2nd-difference coefficient penalty.
     """
     if isinstance(penalty, str):
         penalty_kind = str(penalty).strip().lower().replace("_", "-")
