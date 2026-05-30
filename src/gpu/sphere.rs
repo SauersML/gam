@@ -1267,12 +1267,18 @@ mod sphere_gpu_tests {
                 + xyz[3 * i + 2] * xyz[3 * i + 2];
             assert!((nrm2 - 1.0).abs() < 1e-15, "row {i} not unit norm: {nrm2}");
         }
-        // Equator @ lon=0 → (1, 0, 0).
+        // Row 0 = equator @ lon=0 → (1, 0, 0).
         assert!((xyz[0] - 1.0).abs() < 1e-15);
-        // North pole → (0, 0, 1).
-        assert!((xyz[5] - 1.0).abs() > 0.5);
-        assert!((xyz[5]).abs() < 1e-15);
+        assert!(xyz[1].abs() < 1e-15);
+        assert!(xyz[2].abs() < 1e-15);
+        // Row 1 = north pole (lat=90, lon=0) → (0, 0, 1).
+        assert!(xyz[3].abs() < 1e-15);
+        assert!(xyz[4].abs() < 1e-15);
+        assert!((xyz[5] - 1.0).abs() < 1e-15);
+        // Row 2 = equator @ lon=90 → (0, 1, 0).
+        assert!(xyz[6].abs() < 1e-15);
         assert!((xyz[7] - 1.0).abs() < 1e-15);
+        assert!(xyz[8].abs() < 1e-15);
     }
 
     #[test]
