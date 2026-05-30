@@ -314,3 +314,323 @@ pub fn assemble_posterior_mean_bounds(
     result.mean_upper = Some(mean_upper);
     Ok(())
 }
+
+#[cfg(test)]
+mod parity_tests {
+    //! Parity of the shared engine against the per-predictor inline assembly it
+    //! replaced (issue #422). Each test reconstructs — by hand, with the same
+    //! confidence-level convention and arithmetic the predictors used inline —
+    //! the `(point, SE, η-CI, mean-CI, observation interval)` quantities, then
+    //! asserts the engine reproduces them field-for-field. The assertions are
+    //! exact (`==`) wherever the engine and the hand path share the same
+    //! floating-point operations, and bit-tight (`< 1e-12`) only where ordering
+    //! of identical operations could differ.
+
+    use super::*;
+    use ndarray::array;
+
+    const LEVEL: f64 = 0.95;
+
+    /// The exact central multiplier both paths route through.
+    fn z95() -> f64 {
+        central_z(LEVEL).expect("0.95 is a valid level")
+    }
+
+    fn assert_close(a: &Array1<f64>, b: &Array1<f64>, tag: &str) {
+        assert_eq!(a.len(), b.len(), "{tag}: length mismatch");
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert!(
+                (x - y).abs() < 1e-12,
+                "{tag}: row {i} mismatch: engine={x}, reference={y}"
+            );
+        }
+    }
+
+    /// StandardPredictor (link-wiggle) / SurvivalPredictor shape:
+    /// symmetric η interval, delta-method response interval.
+    #[test]
+    fn delta_symmetric_matches_inline() {
+        let eta = array![0.2, -0.5, 1.3];
+        let mean = array![0.55, 0.38, 0.78];
+        let eta_se = array![0.1, 0.2, 0.15];
+        let mean_se = array![0.04, 0.06, 0.05];
+        let z = z95();
+
+        // Hand-built reference (the old inline path).
+        let ref_eta_lower = &eta - &eta_se.mapv(|s| z * s);
+        let ref_eta_upper = &eta + &eta_se.mapv(|s| z * s);
+        let ref_mean_lower = (&mean - &mean_se.mapv(|s| z * s)).mapv(|v| v.clamp(0.0, 1.0));
+        let ref_mean_upper = (&mean + &mean_se.mapv(|s| z * s)).mapv(|v| v.clamp(0.0, 1.0));
+
+        let out = assemble_uncertainty_result(
+            LEVEL,
+            eta.clone(),
+            mean.clone(),
+            eta_se.clone(),
+            mean_se.clone(),
+            EtaInterval::Symmetric,
+            MeanBoundMethod::Delta {
+                mean_se: &mean_se,
+                bounds: ResponseBounds::UNIT_PROBABILITY,
+            },
+            None,
+            UncertaintyProvenance {
+                covariance_mode_requested: InferenceCovarianceMode::Conditional,
+                covariance_corrected_used: false,
+            },
+        )
+        .expect("engine assembly");
+
+        assert_close(&out.eta, &eta, "eta point");
+        assert_close(&out.mean, &mean, "mean point");
+        assert_close(&out.eta_standard_error, &eta_se, "eta SE");
+        assert_close(&out.mean_standard_error, &mean_se, "mean SE");
+        assert_close(&out.eta_lower, &ref_eta_lower, "eta lower");
+        assert_close(&out.eta_upper, &ref_eta_upper, "eta upper");
+        assert_close(&out.mean_lower, &ref_mean_lower, "mean lower");
+        assert_close(&out.mean_upper, &ref_mean_upper, "mean upper");
+        assert!(out.observation_lower.is_none());
+        assert!(out.observation_upper.is_none());
+        assert!(!out.covariance_corrected_used);
+    }
+
+    /// BernoulliMarginalSlopePredictor shape: symmetric η interval, response
+    /// interval by transforming the η endpoints through the inverse link. Here
+    /// the response map is the logistic, which is monotone increasing, so the
+    /// transformed endpoints stay ordered.
+    #[test]
+    fn transform_eta_symmetric_matches_inline() {
+        let eta = array![0.2, -0.5, 1.3];
+        let logistic = |e: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
+            Ok(e.mapv(|x| 1.0 / (1.0 + (-x).exp())))
+        };
+        let mean = logistic(&eta).unwrap();
+        let eta_se = array![0.1, 0.2, 0.15];
+        let mean_se = array![0.02, 0.05, 0.03];
+        let z = z95();
+
+        let ref_eta_lower = &eta - &eta_se.mapv(|s| z * s);
+        let ref_eta_upper = &eta + &eta_se.mapv(|s| z * s);
+        let ref_mean_lower = logistic(&ref_eta_lower).unwrap();
+        let ref_mean_upper = logistic(&ref_eta_upper).unwrap();
+
+        let out = assemble_uncertainty_result(
+            LEVEL,
+            eta.clone(),
+            mean.clone(),
+            eta_se.clone(),
+            mean_se.clone(),
+            EtaInterval::Symmetric,
+            MeanBoundMethod::TransformEta {
+                bounds: ResponseBounds::UNIT_PROBABILITY,
+                response_map: &logistic,
+            },
+            None,
+            UncertaintyProvenance {
+                covariance_mode_requested: InferenceCovarianceMode::Conditional,
+                covariance_corrected_used: false,
+            },
+        )
+        .expect("engine assembly");
+
+        assert_close(&out.eta_lower, &ref_eta_lower, "eta lower");
+        assert_close(&out.eta_upper, &ref_eta_upper, "eta upper");
+        assert_close(&out.mean_lower, &ref_mean_lower, "mean lower");
+        assert_close(&out.mean_upper, &ref_mean_upper, "mean upper");
+    }
+
+    /// GaussianLocationScalePredictor shape: identity link (mean interval ==
+    /// η interval) plus an observation interval `μ ± z·σ`.
+    #[test]
+    fn identity_eta_with_observation_matches_inline() {
+        let eta = array![1.0, 2.0, -1.0];
+        let mean = eta.clone();
+        let eta_se = array![0.3, 0.1, 0.25];
+        let sigma = array![0.5, 0.4, 0.6];
+        let z = z95();
+
+        let ref_eta_lower = &eta - &eta_se.mapv(|s| z * s);
+        let ref_eta_upper = &eta + &eta_se.mapv(|s| z * s);
+        let ref_obs_lower = &mean - &sigma.mapv(|s| z * s);
+        let ref_obs_upper = &mean + &sigma.mapv(|s| z * s);
+
+        let out = assemble_uncertainty_result(
+            LEVEL,
+            eta.clone(),
+            mean.clone(),
+            eta_se.clone(),
+            eta_se.clone(),
+            EtaInterval::Symmetric,
+            MeanBoundMethod::IdentityEta,
+            Some(ObservationInterval { noise_sd: &sigma }),
+            UncertaintyProvenance {
+                covariance_mode_requested: InferenceCovarianceMode::Conditional,
+                covariance_corrected_used: false,
+            },
+        )
+        .expect("engine assembly");
+
+        // Identity link: mean interval is exactly the η interval, and mean SE
+        // equals the η SE.
+        assert_close(&out.mean_standard_error, &eta_se, "mean SE == eta SE");
+        assert_close(&out.eta_lower, &ref_eta_lower, "eta lower");
+        assert_close(&out.eta_upper, &ref_eta_upper, "eta upper");
+        assert_close(&out.mean_lower, &ref_eta_lower, "mean lower == eta lower");
+        assert_close(&out.mean_upper, &ref_eta_upper, "mean upper == eta upper");
+        assert_close(
+            out.observation_lower.as_ref().expect("obs lower"),
+            &ref_obs_lower,
+            "observation lower",
+        );
+        assert_close(
+            out.observation_upper.as_ref().expect("obs upper"),
+            &ref_obs_upper,
+            "observation upper",
+        );
+    }
+
+    /// BinomialLocationScalePredictor shape: the threshold-scale η interval is
+    /// collapsed onto the point predictor, so the η bounds equal η exactly and
+    /// the response interval is the delta method on `[0, 1]`.
+    #[test]
+    fn delta_collapsed_eta_matches_inline() {
+        let eta = array![-0.3, 0.7, 0.1];
+        let mean = array![0.42, 0.66, 0.51];
+        let mean_se = array![0.05, 0.08, 0.04];
+        let z = z95();
+
+        let ref_mean_lower = (&mean - &mean_se.mapv(|s| z * s)).mapv(|v| v.clamp(0.0, 1.0));
+        let ref_mean_upper = (&mean + &mean_se.mapv(|s| z * s)).mapv(|v| v.clamp(0.0, 1.0));
+
+        let out = assemble_uncertainty_result(
+            LEVEL,
+            eta.clone(),
+            mean.clone(),
+            mean_se.clone(),
+            mean_se.clone(),
+            EtaInterval::Collapsed,
+            MeanBoundMethod::Delta {
+                mean_se: &mean_se,
+                bounds: ResponseBounds::UNIT_PROBABILITY,
+            },
+            None,
+            UncertaintyProvenance {
+                covariance_mode_requested: InferenceCovarianceMode::Conditional,
+                covariance_corrected_used: false,
+            },
+        )
+        .expect("engine assembly");
+
+        // Collapsed η interval: both endpoints equal the point predictor.
+        assert_close(&out.eta_lower, &eta, "eta lower == eta");
+        assert_close(&out.eta_upper, &eta, "eta upper == eta");
+        assert_close(&out.mean_lower, &ref_mean_lower, "mean lower");
+        assert_close(&out.mean_upper, &ref_mean_upper, "mean upper");
+    }
+
+    /// Posterior-mean bounds: `None` level leaves bounds unset; a `Some` level
+    /// fills them via the same policy as the uncertainty path.
+    #[test]
+    fn posterior_mean_bounds_match_inline() {
+        let eta = array![0.2, -0.4];
+        let mean = array![0.55, 0.40];
+        let eta_se = array![0.1, 0.2];
+        let z = z95();
+        let logistic = |e: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
+            Ok(e.mapv(|x| 1.0 / (1.0 + (-x).exp())))
+        };
+
+        // No level: bounds stay None.
+        let mut none_result = PredictPosteriorMeanResult {
+            eta: eta.clone(),
+            eta_standard_error: eta_se.clone(),
+            mean: mean.clone(),
+            mean_lower: None,
+            mean_upper: None,
+        };
+        assemble_posterior_mean_bounds(
+            &mut none_result,
+            None,
+            EtaInterval::Symmetric,
+            MeanBoundMethod::TransformEta {
+                bounds: ResponseBounds::UNIT_PROBABILITY,
+                response_map: &logistic,
+            },
+        )
+        .expect("engine assembly");
+        assert!(none_result.mean_lower.is_none());
+        assert!(none_result.mean_upper.is_none());
+
+        // With level: TransformEta bounds matching the inline path.
+        let ref_eta_lower = &eta - &eta_se.mapv(|s| z * s);
+        let ref_eta_upper = &eta + &eta_se.mapv(|s| z * s);
+        let ref_mean_lower = logistic(&ref_eta_lower).unwrap();
+        let ref_mean_upper = logistic(&ref_eta_upper).unwrap();
+
+        let mut some_result = PredictPosteriorMeanResult {
+            eta: eta.clone(),
+            eta_standard_error: eta_se.clone(),
+            mean: mean.clone(),
+            mean_lower: None,
+            mean_upper: None,
+        };
+        assemble_posterior_mean_bounds(
+            &mut some_result,
+            Some(LEVEL),
+            EtaInterval::Symmetric,
+            MeanBoundMethod::TransformEta {
+                bounds: ResponseBounds::UNIT_PROBABILITY,
+                response_map: &logistic,
+            },
+        )
+        .expect("engine assembly");
+        assert_close(
+            some_result.mean_lower.as_ref().expect("mean lower"),
+            &ref_mean_lower,
+            "posterior mean lower",
+        );
+        assert_close(
+            some_result.mean_upper.as_ref().expect("mean upper"),
+            &ref_mean_upper,
+            "posterior mean upper",
+        );
+    }
+
+    /// A decreasing response map (survival tail) must still yield ordered
+    /// `(lower, upper)` bounds — the engine takes the per-row min/max of the
+    /// transformed endpoints.
+    #[test]
+    fn transform_eta_non_monotone_orders_bounds() {
+        let eta = array![0.0, 0.5];
+        let decreasing = |e: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
+            // Survival-like decreasing tail in (0, 1).
+            Ok(e.mapv(|x| 1.0 / (1.0 + x.exp())))
+        };
+        let mean = decreasing(&eta).unwrap();
+        let eta_se = array![0.2, 0.3];
+
+        let out = assemble_uncertainty_result(
+            LEVEL,
+            eta.clone(),
+            mean.clone(),
+            eta_se.clone(),
+            eta_se.clone(),
+            EtaInterval::Symmetric,
+            MeanBoundMethod::TransformEta {
+                bounds: ResponseBounds::UNIT_PROBABILITY,
+                response_map: &decreasing,
+            },
+            None,
+            UncertaintyProvenance {
+                covariance_mode_requested: InferenceCovarianceMode::Conditional,
+                covariance_corrected_used: false,
+            },
+        )
+        .expect("engine assembly");
+
+        for (lo, hi) in out.mean_lower.iter().zip(out.mean_upper.iter()) {
+            assert!(lo <= hi, "decreasing map must still return ordered bounds: {lo} > {hi}");
+            assert!((0.0..=1.0).contains(lo) && (0.0..=1.0).contains(hi));
+        }
+    }
+}

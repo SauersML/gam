@@ -18,8 +18,7 @@ use crate::inference::model::{
 };
 use crate::inference::predict::interval_policy::{
     EtaInterval, MeanBoundMethod, ObservationInterval, ResponseBounds, UncertaintyProvenance,
-    assemble_posterior_mean_bounds, assemble_uncertainty_result, mean_bounds, symmetric_interval,
-    validated_central_z,
+    assemble_posterior_mean_bounds, assemble_uncertainty_result,
 };
 use crate::inference::predict::linalg::{
     PredictionCovarianceBackend, design_row_chunk, prediction_chunk_rows,
@@ -3718,8 +3717,6 @@ impl PredictableModel for BinomialLocationScalePredictor {
     ) -> Result<PredictUncertaintyResult, EstimationError> {
         assert!(std::mem::size_of_val(fit_result) > 0);
         let pred = self.predict_with_uncertainty(input)?;
-        let z = validated_central_z(options.confidence_level)?;
-
         let mean_se = pred
             .mean_se
             .as_ref()
@@ -3728,35 +3725,27 @@ impl PredictableModel for BinomialLocationScalePredictor {
 
         // Binomial LS response is a probability already evaluated
         // post-transformation, so the response interval is the delta-method
-        // μ ± z·SE(μ) clamped to [0, 1].
-        let (mean_lower, mean_upper) = mean_bounds(
-            &pred.eta,
-            &pred.eta,
-            &pred.mean,
-            z,
+        // μ ± z·SE(μ) clamped to [0, 1]. The threshold-scale η interval is not
+        // directly meaningful for response inference, so it is collapsed onto
+        // the point predictor and the response-scale SE is reported as the
+        // primary uncertainty measure (both eta and mean SE).
+        assemble_uncertainty_result(
+            options.confidence_level,
+            pred.eta,
+            pred.mean,
+            mean_se.clone(),
+            mean_se.clone(),
+            EtaInterval::Collapsed,
             MeanBoundMethod::Delta {
                 mean_se: &mean_se,
                 bounds: ResponseBounds::UNIT_PROBABILITY,
             },
-        )?;
-
-        // For binomial LS, eta intervals on the threshold predictor are not
-        // directly meaningful for response-scale inference. Provide the
-        // response-scale SE as the primary uncertainty measure.
-        Ok(PredictUncertaintyResult {
-            eta: pred.eta.clone(),
-            mean: pred.mean.clone(),
-            eta_standard_error: mean_se.clone(),
-            mean_standard_error: mean_se,
-            eta_lower: pred.eta.clone(),
-            eta_upper: pred.eta,
-            mean_lower,
-            mean_upper,
-            observation_lower: None,
-            observation_upper: None,
-            covariance_mode_requested: options.covariance_mode,
-            covariance_corrected_used: false,
-        })
+            None,
+            UncertaintyProvenance {
+                covariance_mode_requested: options.covariance_mode,
+                covariance_corrected_used: false,
+            },
+        )
     }
 
     fn predict_posterior_mean(
@@ -3994,30 +3983,26 @@ impl PredictableModel for BinomialLocationScalePredictor {
             out
         };
         // Binomial location-scale eta_se is response-scale (dprob/dθ chain
-        // rule), so bounds are mean ± z·se clamped to [0, 1].
-        let (mean_lower, mean_upper) = if let Some(level) = confidence_level {
-            let z = validated_central_z(level)?;
-            let (lower, upper) = mean_bounds(
-                &eta,
-                &eta,
-                &mean,
-                z,
-                MeanBoundMethod::Delta {
-                    mean_se: &eta_se,
-                    bounds: ResponseBounds::UNIT_PROBABILITY,
-                },
-            )?;
-            (Some(lower), Some(upper))
-        } else {
-            (None, None)
-        };
-        Ok(PredictPosteriorMeanResult {
+        // rule), so bounds are mean ± z·se clamped to [0, 1]. The threshold-scale
+        // η interval is not meaningful, so it is collapsed onto the point
+        // predictor and uncertainty flows through the delta-method response SE.
+        let mut result = PredictPosteriorMeanResult {
             eta,
-            eta_standard_error: eta_se,
+            eta_standard_error: eta_se.clone(),
             mean,
-            mean_lower,
-            mean_upper,
-        })
+            mean_lower: None,
+            mean_upper: None,
+        };
+        assemble_posterior_mean_bounds(
+            &mut result,
+            confidence_level,
+            EtaInterval::Collapsed,
+            MeanBoundMethod::Delta {
+                mean_se: &eta_se,
+                bounds: ResponseBounds::UNIT_PROBABILITY,
+            },
+        )?;
+        Ok(result)
     }
 
     fn n_blocks(&self) -> usize {
@@ -4278,47 +4263,37 @@ impl PredictableModel for SurvivalPredictor {
     ) -> Result<PredictUncertaintyResult, EstimationError> {
         assert!(std::mem::size_of_val(fit_result) > 0);
         let pred = self.predict_with_uncertainty(input)?;
-        let z = validated_central_z(options.confidence_level)?;
 
-        let eta_se = pred.eta_se.as_ref().ok_or_else(|| {
+        let eta_se = pred.eta_se.ok_or_else(|| {
             EstimationError::InvalidInput(
                 "Survival full uncertainty requires covariance (eta_se unavailable)".to_string(),
             )
         })?;
-        let mean_se = pred.mean_se.as_ref().ok_or_else(|| {
+        let mean_se = pred.mean_se.ok_or_else(|| {
             EstimationError::InvalidInput(
                 "Survival full uncertainty requires covariance (mean_se unavailable)".to_string(),
             )
         })?;
 
-        let (eta_lower, eta_upper) = symmetric_interval(&pred.eta, eta_se, z);
         // Survival tail is a probability; the delta-method response interval is
         // μ ± z·SE(μ) clamped to [0, 1].
-        let (mean_lower, mean_upper) = mean_bounds(
-            &eta_lower,
-            &eta_upper,
-            &pred.mean,
-            z,
+        assemble_uncertainty_result(
+            options.confidence_level,
+            pred.eta,
+            pred.mean,
+            eta_se,
+            mean_se.clone(),
+            EtaInterval::Symmetric,
             MeanBoundMethod::Delta {
-                mean_se,
+                mean_se: &mean_se,
                 bounds: ResponseBounds::UNIT_PROBABILITY,
             },
-        )?;
-
-        Ok(PredictUncertaintyResult {
-            eta: pred.eta,
-            mean: pred.mean,
-            eta_standard_error: eta_se.clone(),
-            mean_standard_error: mean_se.clone(),
-            eta_lower,
-            eta_upper,
-            mean_lower,
-            mean_upper,
-            observation_lower: None,
-            observation_upper: None,
-            covariance_mode_requested: options.covariance_mode,
-            covariance_corrected_used: false,
-        })
+            None,
+            UncertaintyProvenance {
+                covariance_mode_requested: options.covariance_mode,
+                covariance_corrected_used: false,
+            },
+        )
     }
 
     fn predict_posterior_mean(
@@ -4397,29 +4372,26 @@ impl PredictableModel for SurvivalPredictor {
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         );
-        let (mean_lower, mean_upper) = if let Some(level) = confidence_level {
-            let z = validated_central_z(level)?;
-            let (lo, hi) = mean_bounds(
-                &eta_threshold,
-                &eta_threshold,
-                &mean,
-                z,
-                MeanBoundMethod::Delta {
-                    mean_se: &eta_se,
-                    bounds: ResponseBounds::UNIT_PROBABILITY,
-                },
-            )?;
-            (Some(lo), Some(hi))
-        } else {
-            (None, None)
-        };
-        Ok(PredictPosteriorMeanResult {
+        // The threshold-scale η interval is not directly meaningful on the
+        // survival-probability scale, so it is collapsed onto the point
+        // predictor and uncertainty flows through the delta-method response SE.
+        let mut result = PredictPosteriorMeanResult {
             eta: eta_threshold,
-            eta_standard_error: eta_se,
+            eta_standard_error: eta_se.clone(),
             mean,
-            mean_lower,
-            mean_upper,
-        })
+            mean_lower: None,
+            mean_upper: None,
+        };
+        assemble_posterior_mean_bounds(
+            &mut result,
+            confidence_level,
+            EtaInterval::Collapsed,
+            MeanBoundMethod::Delta {
+                mean_se: &eta_se,
+                bounds: ResponseBounds::UNIT_PROBABILITY,
+            },
+        )?;
+        Ok(result)
     }
 
     fn n_blocks(&self) -> usize {
@@ -4479,23 +4451,25 @@ impl PredictableModel for TransformationNormalPredictor {
         fit: &UnifiedFitResult,
         options: &PredictUncertaintyOptions,
     ) -> Result<PredictUncertaintyResult, EstimationError> {
+        // The conditional transformation maps directly onto the offset `h`; the
+        // standard error is zero (the η endpoints coincide with `h`), so the
+        // engine's identity-η path reproduces `eta = mean = bounds = h`.
         let h = input.offset.clone();
-        let n = h.len();
-        let zeros = Array1::zeros(n);
-        Ok(PredictUncertaintyResult {
-            eta: h.clone(),
-            mean: h.clone(),
-            eta_standard_error: zeros.clone(),
-            mean_standard_error: zeros,
-            eta_lower: h.clone(),
-            eta_upper: h.clone(),
-            mean_lower: h.clone(),
-            mean_upper: h,
-            observation_lower: None,
-            observation_upper: None,
-            covariance_mode_requested: options.covariance_mode,
-            covariance_corrected_used: fit.covariance_corrected.is_some(),
-        })
+        let zeros = Array1::zeros(h.len());
+        assemble_uncertainty_result(
+            options.confidence_level,
+            h.clone(),
+            h,
+            zeros.clone(),
+            zeros,
+            EtaInterval::Symmetric,
+            MeanBoundMethod::IdentityEta,
+            None,
+            UncertaintyProvenance {
+                covariance_mode_requested: options.covariance_mode,
+                covariance_corrected_used: fit.covariance_corrected.is_some(),
+            },
+        )
     }
 
     fn predict_posterior_mean(
@@ -4508,18 +4482,23 @@ impl PredictableModel for TransformationNormalPredictor {
         let n = h.len();
         let has_fit_covariance =
             fit.covariance_corrected.is_some() || fit.covariance_conditional.is_some();
-        let (mean_lower, mean_upper) = if confidence_level.is_some() && has_fit_covariance {
-            (Some(h.clone()), Some(h.clone()))
-        } else {
-            (None, None)
-        };
-        Ok(PredictPosteriorMeanResult {
+        // Bounds are only defined once a fit covariance exists; the SE is zero,
+        // so the engine's identity-η path collapses the bounds onto `h`.
+        let bound_level = has_fit_covariance.then_some(confidence_level).flatten();
+        let mut result = PredictPosteriorMeanResult {
             eta: h.clone(),
             eta_standard_error: Array1::zeros(n),
             mean: h,
-            mean_lower,
-            mean_upper,
-        })
+            mean_lower: None,
+            mean_upper: None,
+        };
+        assemble_posterior_mean_bounds(
+            &mut result,
+            bound_level,
+            EtaInterval::Symmetric,
+            MeanBoundMethod::IdentityEta,
+        )?;
+        Ok(result)
     }
 
     fn n_blocks(&self) -> usize {
@@ -4606,28 +4585,20 @@ pub fn enrich_posterior_mean_bounds(
     family: crate::types::LikelihoodSpec,
     link_kind: Option<&InverseLink>,
 ) -> Result<(), EstimationError> {
-    let z = validated_central_z(confidence_level)?;
-    let (eta_lower, eta_upper) = symmetric_interval(&result.eta, &result.eta_standard_error, z);
-
     let spec = spec_from_family_link(family, link_kind);
     // TransformEta bounds: transform the η endpoints through the inverse link,
     // handle non-monotone transforms, and clamp to the family support. The
-    // shared policy engine owns this construction so it cannot drift from the
+    // shared engine owns this construction so it cannot drift from the
     // per-predictor interval paths.
-    let (mean_lower, mean_upper) = mean_bounds(
-        &eta_lower,
-        &eta_upper,
-        &result.mean,
-        z,
+    assemble_posterior_mean_bounds(
+        result,
+        Some(confidence_level),
+        EtaInterval::Symmetric,
         MeanBoundMethod::TransformEta {
             bounds: ResponseBounds::for_family(&spec.response),
             response_map: &|eta: &Array1<f64>| apply_family_inverse_link(eta, &spec),
         },
-    )?;
-
-    result.mean_lower = Some(mean_lower);
-    result.mean_upper = Some(mean_upper);
-    Ok(())
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
