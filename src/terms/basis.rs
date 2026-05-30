@@ -30062,7 +30062,14 @@ mod tests {
     /// This can be used to cross-validate the iterative implementation in evaluate_splines_at_point.
     fn evaluate_bspline(x: f64, knots: &Array1<f64>, i: usize, degree: usize) -> f64 {
         let last_knot = *knots.last().expect("knot vector should be non-empty");
-        if (x - last_knot).abs() < 1e-12 {
+        // Snap to partition-of-unity convention only at the exact right
+        // endpoint. The fuzzy 1e-12 tolerance previously here swallowed
+        // queries at `right.next_down()` (~2.22e-16 below the endpoint),
+        // collapsing the *left-limit* evaluations that
+        // `one_sided_derivative_eval_point` uses for derivative reference
+        // computations. The degree-0 recursion otherwise correctly
+        // returns zero at strictly-interior x in [knots[i], knots[i+1]).
+        if x == last_knot {
             let num_basis = knots.len() - degree - 1;
             return if i + 1 == num_basis { 1.0 } else { 0.0 };
         }
