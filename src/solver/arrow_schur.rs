@@ -4512,13 +4512,16 @@ impl JacobiPreconditioner {
         backend: &B,
     ) -> Result<Self, ArrowSchurError> {
         let block_offsets = &sys.block_offsets;
-        let mut blocks = Vec::with_capacity(block_offsets.len());
 
+        // Initialise every b×b Schur sub-block from H_ββ + ridge·I via
+        // penalty_block_add (#296): routes to penalty_op or falls back to
+        // hbb / hbb_diag inline without Arc-clone per loop iteration. These are
+        // the block-diagonal restrictions of the reduced Schur complement; the
+        // per-row cross-block contributions are accumulated in the row sweep
+        // below.
+        let mut schur_blocks: Vec<Array2<f64>> = Vec::with_capacity(block_offsets.len());
         for (block_idx, range) in block_offsets.iter().enumerate() {
             let b = range.end - range.start;
-            // Initialise the b×b Schur sub-block from H_ββ + ridge·I via
-            // penalty_block_add (#296): routes to penalty_op or falls back to
-            // hbb / hbb_diag inline without Arc-clone per loop iteration.
             let mut schur_block = Array2::<f64>::zeros((b, b));
             sys.penalty_block_add(
                 BetaBlockId(block_idx),
@@ -4528,15 +4531,26 @@ impl JacobiPreconditioner {
             for bi in 0..b {
                 schur_block[[bi, bi]] += ridge_beta;
             }
-            // Subtract Schur contributions:
-            // S_kk -= H_βt_k^(i) (H_tt^(i))^{-1} H_tβ_k^(i)
-            //
-            // Materialize the per-row (di, k) cross-block once and slice out
-            // the b-column submatrix.  sys_htbeta_materialize_row handles the
-            // Kronecker / htbeta_matvec path transparently.
-            for (i, row) in sys.rows.iter().enumerate() {
-                let di = sys.row_dims[i];
-                let htbeta_full = sys_htbeta_materialize_row(sys, i, row);
+            schur_blocks.push(schur_block);
+        }
+
+        // Subtract Schur contributions:
+        // S_kk -= H_βt_k^(i) (H_tt^(i))^{-1} H_tβ_k^(i)
+        //
+        // Materialize each row's (d_i × K) cross-block ONCE and scatter its
+        // contribution into every block-diagonal sub-block — mirroring the
+        // row-outer structure of `build_dense_schur_direct`. The previous
+        // block-outer form re-materialized every row for each β-block
+        // (O(n_blocks · n · K) probes); for the matrix-free softmax cross-block
+        // each materialize is itself O(K²), so that nesting made the
+        // preconditioner build quadratically more expensive than the direct
+        // dense Schur it preconditions. sys_htbeta_materialize_row handles the
+        // Kronecker / htbeta_matvec path transparently.
+        for (i, row) in sys.rows.iter().enumerate() {
+            let di = sys.row_dims[i];
+            let htbeta_full = sys_htbeta_materialize_row(sys, i, row);
+            for (block_idx, range) in block_offsets.iter().enumerate() {
+                let b = range.end - range.start;
                 let mut solved_cols = Array2::<f64>::zeros((di, b));
                 for bj in 0..b {
                     let gj = range.start + bj;
@@ -4546,6 +4560,7 @@ impl JacobiPreconditioner {
                         solved_cols[[c, bj]] = solved[c];
                     }
                 }
+                let schur_block = &mut schur_blocks[block_idx];
                 for bi in 0..b {
                     let gi = range.start + bi;
                     for bj in 0..b {
@@ -4557,10 +4572,17 @@ impl JacobiPreconditioner {
                     }
                 }
             }
-            // Attempt Cholesky (LLT) factorization.
+        }
+
+        // Factor each accumulated block: LLT, with scalar-diagonal fallback for
+        // a block that comes out non-PD at this ridge.
+        let mut blocks = Vec::with_capacity(block_offsets.len());
+        for (block_idx, range) in block_offsets.iter().enumerate() {
+            let b = range.end - range.start;
+            let schur_block = &schur_blocks[block_idx];
             let factor_opt = {
                 use faer::Side;
-                let view = FaerArrayView::new(&schur_block);
+                let view = FaerArrayView::new(schur_block);
                 FaerLlt::new(view.as_ref(), Side::Lower).ok()
             };
             if let Some(llt) = factor_opt {
