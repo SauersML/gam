@@ -3701,24 +3701,23 @@ fn resolve_survival_marginal_slope_base_link(
 /// guard, optional baseline time-wiggle augmentation — so the assembly lives
 /// here once and the CLI consumes it through a thin re-export rather than
 /// reconstructing the same decision tree.
-pub(crate) struct PreparedSurvivalTimeStack {
-    pub(crate) eta_offset_entry: Array1<f64>,
-    pub(crate) eta_offset_exit: Array1<f64>,
-    pub(crate) derivative_offset_exit: Array1<f64>,
-    pub(crate) unloaded_mass_entry: Array1<f64>,
-    pub(crate) unloaded_mass_exit: Array1<f64>,
-    pub(crate) unloaded_hazard_exit: Array1<f64>,
-    pub(crate) time_design_entry: crate::matrix::DesignMatrix,
-    pub(crate) time_design_exit: crate::matrix::DesignMatrix,
-    pub(crate) time_design_derivative_exit: crate::matrix::DesignMatrix,
-    pub(crate) time_penalties: Vec<Array2<f64>>,
-    pub(crate) time_nullspace_dims: Vec<usize>,
-    pub(crate) timewiggle_build:
-        Option<crate::families::survival_construction::SurvivalTimeWiggleBuild>,
-    pub(crate) timewiggle_block: Option<TimeWiggleBlockInput>,
+pub struct PreparedSurvivalTimeStack {
+    pub eta_offset_entry: Array1<f64>,
+    pub eta_offset_exit: Array1<f64>,
+    pub derivative_offset_exit: Array1<f64>,
+    pub unloaded_mass_entry: Array1<f64>,
+    pub unloaded_mass_exit: Array1<f64>,
+    pub unloaded_hazard_exit: Array1<f64>,
+    pub time_design_entry: crate::matrix::DesignMatrix,
+    pub time_design_exit: crate::matrix::DesignMatrix,
+    pub time_design_derivative_exit: crate::matrix::DesignMatrix,
+    pub time_penalties: Vec<Array2<f64>>,
+    pub time_nullspace_dims: Vec<usize>,
+    pub timewiggle_build: Option<crate::families::survival_construction::SurvivalTimeWiggleBuild>,
+    pub timewiggle_block: Option<TimeWiggleBlockInput>,
 }
 
-pub(crate) fn prepare_survival_time_stack(
+pub fn prepare_survival_time_stack(
     age_entry: &Array1<f64>,
     age_exit: &Array1<f64>,
     baseline_cfg: &crate::families::survival_construction::SurvivalBaselineConfig,

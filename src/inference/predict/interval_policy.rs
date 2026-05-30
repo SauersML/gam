@@ -20,9 +20,10 @@
 //! delegates the policy to the helpers below, so interval/posterior-mean
 //! behaviour cannot drift between families.
 
-use crate::estimate::EstimationError;
+use crate::estimate::{EstimationError, UnifiedFitResult};
 use crate::inference::predict::{
-    InferenceCovarianceMode, PredictPosteriorMeanResult, PredictUncertaintyResult,
+    InferenceCovarianceMode, PredictInput, PredictPosteriorMeanResult, PredictResult,
+    PredictUncertaintyOptions, PredictUncertaintyResult, PredictionWithSE,
 };
 use crate::types::ResponseFamily;
 use ndarray::Array1;
@@ -316,6 +317,310 @@ pub fn assemble_posterior_mean_bounds(
     result.mean_lower = Some(mean_lower);
     result.mean_upper = Some(mean_upper);
     Ok(())
+}
+
+/// Which of the two interval-producing pipelines a [`PredictionTransform`] is
+/// being driven through.
+///
+/// A few families compute their response point and standard errors differently
+/// in the two passes (notably the threshold-scale probability families, whose
+/// posterior mean is a bivariate Gauss–Hermite integral rather than the plug-in
+/// delta evaluation used for full uncertainty). The pass is threaded into
+/// [`PredictionTransform::linear_state`] and
+/// [`PredictionTransform::response_jacobian_rows`] so the family can branch its
+/// numerics and its interval policy while the assembly stays unified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PredictPass {
+    /// `predict_full_uncertainty`: η/μ point + η- and mean-scale SEs, with the
+    /// η interval reported on the response scale per the family's policy.
+    FullUncertainty,
+    /// `predict_posterior_mean`: coefficient-uncertainty-integrated response
+    /// mean with optional response-scale confidence bounds.
+    PosteriorMean,
+}
+
+/// How a transform forms the *response-scale* confidence interval from the
+/// η-scale state. This is the per-family policy split the predictors used to
+/// inline directly into [`assemble_uncertainty_result`] / [`mean_bounds`]; a
+/// [`PredictionTransform`] now declares it once and the generic drivers thread
+/// it through both the full-uncertainty and posterior-mean pipelines.
+pub enum ResponseInterval {
+    /// Transform the η endpoints `η ± z·SE(η)` through [`PredictionTransform::response`]
+    /// (non-monotone safe), then clamp to [`PredictionTransform::bounds`].
+    /// Used by families whose response is a smooth inverse-link image of η
+    /// (standard link-wiggle, Bernoulli marginal-slope).
+    TransformEta,
+    /// Identity link: the response equals the linear predictor, so the response
+    /// interval is exactly the η interval (Gaussian location-scale, PIT).
+    IdentityEta,
+    /// Delta method `μ ± z·SE(μ)` clamped to [`PredictionTransform::bounds`],
+    /// with the η interval collapsed onto the point predictor. Used by
+    /// threshold-scale probability families whose η interval is not directly
+    /// meaningful on the response scale (binomial location-scale, survival
+    /// tail).
+    CollapsedDelta,
+    /// Delta method `μ ± z·SE(μ)` clamped to [`PredictionTransform::bounds`]
+    /// with a symmetric η interval retained. Used by families that report a
+    /// genuine η interval *and* a response-scale delta SE (survival full
+    /// uncertainty).
+    SymmetricDelta,
+}
+
+/// The η-scale state a [`PredictionTransform`] produces for one prediction
+/// batch: the linear predictor, its response-scale image, and (when a
+/// covariance is available) the η- and mean-scale standard errors.
+///
+/// Each predictor computes these via whatever bespoke gradient backend its
+/// parameterisation requires (dense matvec, link-wiggle chain rule, projected
+/// two-block covariance, bivariate GHQ). The generic drivers below consume the
+/// finished arrays and own the *policy* layer — interval construction, support
+/// clamping, and result assembly — so that layer cannot drift between families.
+pub struct LinearState {
+    /// Linear predictor η.
+    pub eta: Array1<f64>,
+    /// Response-scale prediction μ = T(η).
+    pub mean: Array1<f64>,
+    /// Standard error of η (delta-method base). `None` when no covariance.
+    pub eta_se: Option<Array1<f64>>,
+    /// Standard error of μ (delta-method, response scale). `None` when no
+    /// covariance.
+    pub mean_se: Option<Array1<f64>>,
+}
+
+/// Family-specific supplier for the shared predict pipeline.
+///
+/// A predictor implements this trait to describe *only* the parts that differ
+/// between families:
+///
+///   * [`linear_state`](PredictionTransform::linear_state) — the η-scale
+///     predictor, its response image, and the standard errors, computed with
+///     the predictor's own gradient backend (issue #422 keeps these bespoke;
+///     they are genuine numerics, not boilerplate);
+///   * [`response`](PredictionTransform::response) — the response map μ = T(η),
+///     used to transform η-interval endpoints onto the response scale;
+///   * [`response_jacobian_rows`](PredictionTransform::response_jacobian_rows) —
+///     whether the mean SE supplied by `linear_state` is consumed via the
+///     delta method or is the η SE itself (identity link);
+///   * [`bounds`](PredictionTransform::bounds) — the response-scale support
+///     clamp;
+///   * [`response_interval`](PredictionTransform::response_interval) — which
+///     [`ResponseInterval`] policy maps the η interval onto the response scale;
+///   * [`observation_noise`](PredictionTransform::observation_noise) — the
+///     optional response-scale observation-noise σ.
+///
+/// Everything else — confidence-level validation, η/mean interval construction,
+/// support clamping, observation intervals, and result-struct assembly — lives
+/// in the generic drivers [`predict_full_uncertainty_generic`] and
+/// [`predict_posterior_mean_generic`], so the pipeline is one source of truth.
+pub trait PredictionTransform {
+    /// The fit-free point state: η, μ, and the covariance-derived standard
+    /// errors (`None` when no predictor covariance is available). This is the
+    /// state behind the point-prediction drivers
+    /// [`predict_plugin_response_generic`] and [`predict_with_uncertainty_generic`],
+    /// and the default source for the full-uncertainty pass of
+    /// [`linear_state`](PredictionTransform::linear_state).
+    fn point_state(&self, input: &PredictInput) -> Result<LinearState, EstimationError>;
+
+    /// Compute η, μ, and the standard errors for the requested `pass`. `fit`
+    /// carries the posterior covariance / penalized Hessian some predictors
+    /// need.
+    ///
+    /// The default services the full-uncertainty pass from the fit-free
+    /// [`point_state`](PredictionTransform::point_state); predictors whose
+    /// posterior-mean (or fit-backed full-uncertainty) numerics differ override
+    /// this and branch on `pass`.
+    fn linear_state(
+        &self,
+        input: &PredictInput,
+        fit: &UnifiedFitResult,
+        pass: PredictPass,
+    ) -> Result<LinearState, EstimationError> {
+        assert!(std::mem::size_of_val(fit) > 0);
+        match pass {
+            PredictPass::FullUncertainty => self.point_state(input),
+            PredictPass::PosteriorMean => Err(EstimationError::InvalidInput(
+                "this transform does not implement the posterior-mean pass".to_string(),
+            )),
+        }
+    }
+
+    /// Response map μ = T(η), used to transform η-interval endpoints onto the
+    /// response scale (non-monotone safe via [`transform_eta_interval`]).
+    fn response(&self, eta: &Array1<f64>) -> Result<Array1<f64>, EstimationError>;
+
+    /// Which [`ResponseInterval`] policy maps the η interval onto the response
+    /// scale for `pass`. This is the policy mirror of supplying explicit
+    /// response-scale Jacobian rows to the SE backend vs. transforming η
+    /// endpoints; it selects between the `Delta`/`TransformEta`/`IdentityEta`
+    /// arms and the collapsed/symmetric η interval.
+    fn response_jacobian_rows(&self, pass: PredictPass) -> ResponseInterval;
+
+    /// Response-scale support `[lo, hi]` clamp.
+    fn bounds(&self) -> ResponseBounds;
+
+    /// Optional response-scale observation-noise σ for the requested batch.
+    /// `None` (the default) for families without an observation-scale noise
+    /// term. Only consulted by the full-uncertainty driver and only when the
+    /// caller requested observation intervals.
+    fn observation_noise(
+        &self,
+        input: &PredictInput,
+    ) -> Result<Option<Array1<f64>>, EstimationError> {
+        assert!(std::mem::size_of_val(input) > 0);
+        Ok(None)
+    }
+
+    /// Whether the assembled full-uncertainty result should record that a
+    /// smoothing-corrected covariance was used. Most predictors quantify
+    /// uncertainty from the conditional covariance only and report `false`;
+    /// the transformation-normal predictor inherits the flag from the fit.
+    fn covariance_corrected_used(&self, fit: &UnifiedFitResult) -> bool {
+        assert!(std::mem::size_of_val(fit) > 0);
+        false
+    }
+}
+
+/// Build the [`MeanBoundMethod`] selected by a transform's [`ResponseInterval`]
+/// policy, borrowing the response closure / mean SE as needed.
+fn mean_bound_method_for<'a, T: PredictionTransform>(
+    transform: &'a T,
+    policy: &ResponseInterval,
+    response_map: &'a (dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError> + 'a),
+    mean_se: &'a Array1<f64>,
+) -> MeanBoundMethod<'a> {
+    match policy {
+        ResponseInterval::TransformEta => MeanBoundMethod::TransformEta {
+            bounds: transform.bounds(),
+            response_map,
+        },
+        ResponseInterval::IdentityEta => MeanBoundMethod::IdentityEta,
+        ResponseInterval::CollapsedDelta | ResponseInterval::SymmetricDelta => {
+            MeanBoundMethod::Delta {
+                mean_se,
+                bounds: transform.bounds(),
+            }
+        }
+    }
+}
+
+/// The η-interval policy implied by a [`ResponseInterval`].
+fn eta_interval_for(policy: &ResponseInterval) -> EtaInterval {
+    match policy {
+        ResponseInterval::CollapsedDelta => EtaInterval::Collapsed,
+        ResponseInterval::TransformEta
+        | ResponseInterval::IdentityEta
+        | ResponseInterval::SymmetricDelta => EtaInterval::Symmetric,
+    }
+}
+
+/// The single full-uncertainty driver. Runs the predict pipeline once for any
+/// [`PredictionTransform`]: compute the η-scale state, require its standard
+/// errors, attach the optional observation interval, and assemble the result
+/// through [`assemble_uncertainty_result`].
+pub fn predict_full_uncertainty_generic<T: PredictionTransform>(
+    transform: &T,
+    input: &PredictInput,
+    fit: &UnifiedFitResult,
+    options: &PredictUncertaintyOptions,
+) -> Result<PredictUncertaintyResult, EstimationError> {
+    let state = transform.linear_state(input, fit, PredictPass::FullUncertainty)?;
+    let eta_se = state.eta_se.ok_or_else(|| {
+        EstimationError::InvalidInput(
+            "full uncertainty requires covariance (eta_se unavailable)".to_string(),
+        )
+    })?;
+    let mean_se = state.mean_se.ok_or_else(|| {
+        EstimationError::InvalidInput(
+            "full uncertainty requires covariance (mean_se unavailable)".to_string(),
+        )
+    })?;
+    let policy = transform.response_jacobian_rows(PredictPass::FullUncertainty);
+    let response_map = move |eta: &Array1<f64>| transform.response(eta);
+    let observation = if options.includeobservation_interval {
+        transform.observation_noise(input)?
+    } else {
+        None
+    };
+    assemble_uncertainty_result(
+        options.confidence_level,
+        state.eta,
+        state.mean,
+        eta_se,
+        mean_se.clone(),
+        eta_interval_for(&policy),
+        mean_bound_method_for(transform, &policy, &response_map, &mean_se),
+        observation
+            .as_ref()
+            .map(|noise_sd| ObservationInterval { noise_sd }),
+        UncertaintyProvenance {
+            covariance_mode_requested: options.covariance_mode,
+            covariance_corrected_used: transform.covariance_corrected_used(fit),
+        },
+    )
+}
+
+/// The single posterior-mean driver. Runs the predict pipeline once for any
+/// [`PredictionTransform`]: compute the η-scale state and attach response-scale
+/// confidence bounds (when a level is supplied) through
+/// [`assemble_posterior_mean_bounds`].
+pub fn predict_posterior_mean_generic<T: PredictionTransform>(
+    transform: &T,
+    input: &PredictInput,
+    fit: &UnifiedFitResult,
+    confidence_level: Option<f64>,
+) -> Result<PredictPosteriorMeanResult, EstimationError> {
+    let state = transform.linear_state(input, fit, PredictPass::PosteriorMean)?;
+    let eta_se = state
+        .eta_se
+        .unwrap_or_else(|| Array1::zeros(state.eta.len()));
+    let policy = transform.response_jacobian_rows(PredictPass::PosteriorMean);
+    let mean_se = state
+        .mean_se
+        .clone()
+        .unwrap_or_else(|| eta_se.clone());
+    let response_map = move |eta: &Array1<f64>| transform.response(eta);
+    let mut result = PredictPosteriorMeanResult {
+        eta: state.eta,
+        eta_standard_error: eta_se,
+        mean: state.mean,
+        mean_lower: None,
+        mean_upper: None,
+    };
+    assemble_posterior_mean_bounds(
+        &mut result,
+        confidence_level,
+        eta_interval_for(&policy),
+        mean_bound_method_for(transform, &policy, &response_map, &mean_se),
+    )?;
+    Ok(result)
+}
+
+/// The single plug-in response driver: the transform's fit-free point state,
+/// keeping only η and μ.
+pub fn predict_plugin_response_generic<T: PredictionTransform>(
+    transform: &T,
+    input: &PredictInput,
+) -> Result<PredictResult, EstimationError> {
+    let state = transform.point_state(input)?;
+    Ok(PredictResult {
+        eta: state.eta,
+        mean: state.mean,
+    })
+}
+
+/// The single point-with-SE driver: the transform's fit-free point state,
+/// carrying the (optional) η/mean standard errors through unchanged.
+pub fn predict_with_uncertainty_generic<T: PredictionTransform>(
+    transform: &T,
+    input: &PredictInput,
+) -> Result<PredictionWithSE, EstimationError> {
+    let state = transform.point_state(input)?;
+    Ok(PredictionWithSE {
+        eta: state.eta,
+        mean: state.mean,
+        eta_se: state.eta_se,
+        mean_se: state.mean_se,
+    })
 }
 
 #[cfg(test)]
