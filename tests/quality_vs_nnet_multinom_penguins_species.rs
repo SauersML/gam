@@ -336,7 +336,7 @@ fn gam_multinomial_classifies_penguin_species_at_least_as_well_as_nnet() {
     let prob_rel_vs_nnet = relative_l2(&gam_probs_flat, nn_probs);
 
     eprintln!(
-        "penguin species multinomial: n_train={} n_test={} K={K} \
+        "penguin species multinomial: n_train={} n_test={n_test} K={K} \
          gam_acc={gam_acc:.4} nnet_acc={nn_acc:.4} \
          gam_logloss={gam_log_loss:.5} nnet_logloss={nn_log_loss:.5} \
          prob_rel_l2_vs_nnet(context)={prob_rel_vs_nnet:.4} \
