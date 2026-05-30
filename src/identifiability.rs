@@ -257,9 +257,15 @@ pub fn piecewise_linear_eval(
     let mut out = Array2::<f64>::zeros((n, d));
     let step = (u_max - u_min) / (k - 1) as f64;
     for (row, &val) in u.iter().enumerate() {
-        let pos = ((val - u_min) / step).clamp(0.0, (k - 1) as f64 - 1e-12);
-        let lo = pos.floor() as usize;
-        let hi = (lo + 1).min(k - 1);
+        // Clamp `pos` to the exact endpoint `(k-1)`, not `(k-1) - 1e-12`,
+        // so `val = u_max` evaluates to exactly `coeffs[k-1, col]` instead
+        // of `coeffs[k-1, col] + 1e-12 · (coeffs[k-2, col] − coeffs[k-1,
+        // col])`. The historical `1e-12` shift was there to keep `lo + 1`
+        // in range, but capping `lo` at `k − 2` achieves the same
+        // structural guarantee without perturbing the endpoint value.
+        let pos = ((val - u_min) / step).clamp(0.0, (k - 1) as f64);
+        let lo = (pos.floor() as usize).min(k - 2);
+        let hi = lo + 1;
         let frac = pos - lo as f64;
         for col in 0..d {
             out[[row, col]] = coeffs[[lo, col]] * (1.0 - frac) + coeffs[[hi, col]] * frac;
@@ -783,18 +789,26 @@ mod tests {
     /// Build a `(n, d)` `(mean, scale)` pair whose stacked signature
     /// `[μ ‖ log σ]` has full rank `2d` (so it satisfies the Khemakhem
     /// Theorem 1 precondition baked into `ConditionalPriorIvae::new`).
+    ///
+    /// Each per-column function is given a distinct *frequency* (not a
+    /// shared frequency with a column-dependent phase) so the resulting
+    /// `2d` columns are genuinely linearly independent. `sin(ω·t + φ)`
+    /// with a shared `ω` lives in the 2-dimensional span of `{sin(ω t),
+    /// cos(ω t)}`, so the earlier `sin(0.7t + 0.3c)` / `cos(0.5t + 0.9c)`
+    /// fixture only ever produced rank `≤ 4`, no matter how many `d`
+    /// columns it built. Distinct frequencies push each column into its
+    /// own subspace, so for `n ≥ 2d + 1` the SVD of `[μ ‖ log σ]` has
+    /// `2d` non-trivial singular values.
     fn ivae_precondition_pair(n: usize, d: usize) -> (Array2<f64>, Array2<f64>) {
         assert!(n >= 2 * d + 1, "need at least 2d+1 rows");
         let mut mean = Array2::<f64>::zeros((n, d));
         let mut scale = Array2::<f64>::from_elem((n, d), 1.0);
         for r in 0..n {
-            let t = r as f64;
+            let t = r as f64 / (n as f64 - 1.0);
             for c in 0..d {
-                let k = c as f64;
-                // sin/cos with distinct phases makes the 2d columns linearly
-                // independent for any reasonably-sized n ≥ 2d+1.
-                mean[[r, c]] = (0.7 * t + 0.3 * k).sin();
-                scale[[r, c]] = (0.4 * (0.5 * t + 0.9 * k).cos()).exp();
+                let omega = (c + 1) as f64;
+                mean[[r, c]] = (std::f64::consts::PI * omega * t).sin();
+                scale[[r, c]] = (0.4 * (std::f64::consts::PI * omega * t).cos()).exp();
             }
         }
         (mean, scale)
