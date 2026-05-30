@@ -34,7 +34,7 @@ jobs:
   reference-quality:
     name: Reference quality vs mature tools
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 300
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -124,12 +124,13 @@ jobs:
         run: |
           set -uo pipefail
           mapfile -t files < <(ls tests/quality_vs_*.rs 2>/dev/null | xargs -n1 basename | sed 's/\.rs$//')
-          echo "found ${#files[@]} quality test target(s)"
-          for t in "${files[@]}"; do
-            echo "::group::compile $t"
-            cargo test --test "$t" --no-run 2>&1 | tail -40 || echo "COMPILE_FAIL $t"
-            echo "::endgroup::"
-          done
+          echo "building ${#files[@]} quality test target(s) in ONE invocation (parallel codegen)"
+          # A single multi---test invocation links all binaries in one cargo run
+          # with parallel codegen — vastly faster than linking each separately in
+          # a loop (which previously dominated wall-clock and risked the timeout).
+          args=(); for t in "${files[@]}"; do args+=(--test "$t"); done
+          cargo test --no-run "${args[@]}" 2>&1 | tail -120 \
+            || echo "build reported compile errors; the run step classifies per target"
 
       - name: Run quality suite (assertion failures tolerated, reported)
         shell: bash
@@ -141,14 +142,14 @@ jobs:
           cerr_list=()
           for t in "${files[@]}"; do
             echo "::group::run $t"
-            if ! cargo test --test "$t" --no-run >/dev/null 2>&1; then
-              echo "COMPILE ERROR: $t"; cerr=$((cerr+1)); cerr_list+=("$t")
-              echo "::endgroup::"; continue
-            fi
-            if cargo test --test "$t" -- --nocapture 2>&1 | tee "/tmp/$t.log"; then
-              pass=$((pass+1))
+            # Binaries are already built above; this just executes (and rebuilds
+            # only if stale). Classify compile errors from the captured log.
+            if cargo test --test "$t" -- --nocapture > "/tmp/$t.log" 2>&1; then
+              pass=$((pass+1)); tail -20 "/tmp/$t.log"
+            elif grep -qE 'could not compile|^error\[|^error:' "/tmp/$t.log"; then
+              echo "COMPILE ERROR: $t"; cerr=$((cerr+1)); cerr_list+=("$t"); tail -20 "/tmp/$t.log"
             else
-              fail=$((fail+1)); fail_list+=("$t")
+              fail=$((fail+1)); fail_list+=("$t"); tail -25 "/tmp/$t.log"
             fi
             echo "::endgroup::"
           done
