@@ -69,15 +69,23 @@ pub trait PgRng {
 
 /// Standard-normal CDF `Φ(x)`.
 ///
-/// Uses `statrs`' `Normal::standard()` so it is bit-identical to the
-/// production CPU posterior path (which evaluated the tail mass through the
-/// same `statrs` CDF), while the device `std_normal_cdf` evaluates the
-/// equivalent `½·erfc(-x/√2)`; the two agree to within a ULP, which the
-/// GPU/CPU parity gate enforces.
+/// Evaluates `½·erfc(-x/√2)` through `libm::erfc` — the SunOS msun
+/// implementation, which is accurate to within a ULP across the entire real
+/// line. The same `½·erfc(-x/√2)` identity backs the device
+/// `std_normal_cdf` JIT under `gpu::polya_gamma` (CUDA's `erfcf`/`erfc` is
+/// itself derived from the msun implementation), so CPU and GPU posterior
+/// callers see bit-identical tail masses.
+///
+/// `statrs::distribution::Normal::cdf` and `statrs::function::erf::erfc`
+/// share a rational-approximation core with a `~10⁻¹¹` precision floor in
+/// the bulk; routing the saddle-point tail-mass evaluator
+/// `exponential_tail_mass` through that floor would have spoiled
+/// `Φ(η ≈ ±1)` digits the GPU oracle considers correct and broken the
+/// GPU/CPU parity gate.
 #[inline]
 pub fn std_normal_cdf(x: f64) -> f64 {
-    use statrs::distribution::{ContinuousCDF, Normal};
-    Normal::standard().cdf(x)
+    let inv_sqrt2 = 1.0 / std::f64::consts::SQRT_2;
+    0.5 * libm::erfc(-x * inv_sqrt2)
 }
 
 /// Exponential-tail acceptance mass for the proposal mixture (PSW 2013 §2;

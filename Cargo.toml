@@ -70,6 +70,7 @@ ratatui = "0.30.0"
 crossterm = "0.29.0"
 rand_distr = "0.6.0"
 statrs = "0.18.0"
+libm = "0.2.16"
 pest = "2.8.6"
 pest_derive = "2.8.6"
 arrow = { version = "54", default-features = false, features = ["ffi"] }
