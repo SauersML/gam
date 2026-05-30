@@ -27721,7 +27721,7 @@ mod tests {
         // Per-pair base offsets keep the diagonal blocks symmetric (required
         // for a valid Hessian) while making the off-diagonal blocks distinct
         // and asymmetric, so `to_dense` must place each transpose correctly.
-        let mut sym = |m: &mut Array2<f64>, base: f64| {
+        let sym = |m: &mut Array2<f64>, base: f64| {
             let (r, c) = m.dim();
             for i in 0..r {
                 for j in 0..c {
@@ -27734,7 +27734,7 @@ mod tests {
         sym(&mut acc.h_gg, 3.0);
         sym(&mut acc.h_hh, 4.0);
         sym(&mut acc.h_ww, 5.0);
-        let mut rect = |m: &mut Array2<f64>, base: f64| {
+        let rect = |m: &mut Array2<f64>, base: f64| {
             let (r, c) = m.dim();
             for i in 0..r {
                 for j in 0..c {

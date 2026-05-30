@@ -1514,31 +1514,10 @@ mod tests {
         }
     }
 
-    /// Mock `AnchorRowEvaluator` for §10 test #5: a fixed design matrix.
-    struct MockAnchorEvaluator {
-        rows: Array2<f64>,
-    }
-
-    impl AnchorRowEvaluator for MockAnchorEvaluator {
-        fn anchor_rows(&self, predict_arg: &Array1<f64>) -> Result<Array2<f64>, String> {
-            assert_eq!(
-                predict_arg.len(),
-                self.rows.nrows(),
-                "MockAnchorEvaluator: predict_arg length {} must match stored rows {}",
-                predict_arg.len(),
-                self.rows.nrows(),
-            );
-            Ok(self.rows.clone())
-        }
-        fn ncols(&self) -> usize {
-            self.rows.ncols()
-        }
-    }
-
     /// §10 test #5: regression test for the deleted FlexEvaluation skip
-    /// bug. A flex anchor (represented by a `MockAnchorEvaluator`) must
-    /// receive the same residualisation as a parametric anchor of the
-    /// same column span.
+    /// bug. A flex anchor (represented by a dense scalar operator with the
+    /// same column span as the parametric reference) must receive the same
+    /// residualisation as the parametric anchor.
     #[test]
     fn compile_flex_anchor_is_first_class() {
         let n = 60;
