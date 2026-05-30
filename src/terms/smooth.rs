@@ -22691,7 +22691,17 @@ mod tests {
         let fit_opts = FitOptions {
             compute_inference: false,
             max_iter: 200,
-            tol: 1e-12,
+            // This test certifies that `debug_full_h` is deterministic at a
+            // fixed θ; it needs the inner PIRLS to converge so a Hessian is
+            // returned. The binomial-probit Duchon fit's stationarity residual
+            // floors at ‖g‖≈2e-6 (the LM-ridge noise floor), so a sub-floor
+            // request such as 1e-12 can never be certified and surfaces as
+            // `PirlsDidNotConverge`. 1e-6 is the standard GLM convergence
+            // tolerance and clears the floor with margin (the scale-invariant
+            // KKT bound certifies at ‖g‖ < 1e-6·√n·√p ≈ 2.8e-5). 1e-12 only
+            // ever "passed" because the near-stationary band silently carried a
+            // 1e-6 floor, since removed.
+            tol: 1e-6,
             penalty_shrinkage_floor: None,
             ..FitOptions::default()
         };
