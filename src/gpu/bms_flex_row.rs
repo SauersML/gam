@@ -2053,25 +2053,19 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
     })
 }
 
-/// Which partial kernel the joint-β partial+reduce engine drives, and whether
-/// it consumes a direction vector `d_v`.
-///
-/// Every consumer of [`run_bms_flex_row_partial_reduce`] reduces an
-/// `n`-row pullback into a single `[1, p_total]` joint-β image via the same
-/// `bms_flex_row_hvp_reduce` kernel; the only points of variation are the
-/// partial-kernel name and whether `d_v` participates. The host-vs-device
-/// output decision is *not* part of the mode — it lives in the thin adapters
-/// (`launch_bms_flex_row_hvp_into_device` keeps the result on-stream; the
-/// `_hvp` / `_diagonal` adapters synchronize + download). Keeping that out of
-/// the engine means the on-stream PCG hot path and the host-returning paths
-/// share one launch-argument list with no copy-back coupling.
+/// Which partial kernel the joint-β engine drives, whether it consumes a
+/// direction vector `d_v`, and where the reduced `[1, p_total]` image lands.
+/// All three points of variation are encoded here so the public entry points
+/// stay thin wrappers over one launch helper.
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy)]
 enum BmsFlexRowLaunchMode {
-    /// `bms_flex_row_hvp_partial`: applies `H · v` per row. Binds `d_v`.
-    Hvp,
-    /// `bms_flex_row_diag_partial`: extracts `diag(H)` per row. No `d_v`.
-    Diagonal,
+    /// `bms_flex_row_hvp_partial`, `H · v` per row, result left on-stream.
+    HvpDeviceOut,
+    /// `bms_flex_row_hvp_partial`, `H · v` per row, result downloaded to host.
+    HvpHostOut,
+    /// `bms_flex_row_diag_partial`, `diag(H)` per row, downloaded to host.
+    DiagonalHostOut,
 }
 
 #[cfg(target_os = "linux")]
@@ -2079,8 +2073,10 @@ impl BmsFlexRowLaunchMode {
     /// Name of the partial kernel this mode loads from the HVP module.
     fn partial_kernel_name(self) -> &'static str {
         match self {
-            BmsFlexRowLaunchMode::Hvp => "bms_flex_row_hvp_partial",
-            BmsFlexRowLaunchMode::Diagonal => "bms_flex_row_diag_partial",
+            BmsFlexRowLaunchMode::HvpDeviceOut | BmsFlexRowLaunchMode::HvpHostOut => {
+                "bms_flex_row_hvp_partial"
+            }
+            BmsFlexRowLaunchMode::DiagonalHostOut => "bms_flex_row_diag_partial",
         }
     }
 }
@@ -2130,20 +2126,19 @@ impl PreparedBmsFlexRowLaunchArgs {
     }
 }
 
-/// Shared partial+reduce engine behind [`launch_bms_flex_row_hvp_into_device`],
-/// [`launch_bms_flex_row_hvp`], and [`launch_bms_flex_row_diagonal`].
+/// Shared partial+reduce engine behind every joint-β launcher.
 ///
 /// Allocates the `[num_chunks, p_total]` partial buffer, loads the mode's
 /// partial kernel plus the common `bms_flex_row_hvp_reduce`, builds both
 /// launch configs from a single [`PreparedBmsFlexRowLaunchArgs`], launches the
-/// partial kernel (binding `d_v` only for [`BmsFlexRowLaunchMode::Hvp`]), and
-/// launches the reduction into caller-supplied `d_out`.
+/// partial kernel (binding `d_v` only for the HVP modes), and launches the
+/// reduction into caller-supplied `d_out`.
 ///
-/// **No** `synchronize()` or DtoH is performed — the caller decides whether to
-/// keep the result on-stream (device-resident PCG hot path) or sync + download
-/// it to the host. `ctx` is a short error-context tag woven into every
-/// `DriverCallFailed` reason so failures stay attributable to the originating
-/// adapter.
+/// **No** `synchronize()` or DtoH is performed here — the surrounding helper
+/// decides whether to keep the result on-stream (device-resident PCG hot path)
+/// or sync + download it to the host. `ctx` is a short error-context tag woven
+/// into every `DriverCallFailed` reason so failures stay attributable to the
+/// originating entry point.
 #[cfg(target_os = "linux")]
 fn run_bms_flex_row_partial_reduce(
     storage: &DeviceResidentRowHess,
@@ -2240,6 +2235,63 @@ fn run_bms_flex_row_partial_reduce(
     Ok(())
 }
 
+/// Host-returning joint-β launcher shared by [`launch_bms_flex_row_hvp`]
+/// ([`BmsFlexRowLaunchMode::HvpHostOut`]) and [`launch_bms_flex_row_diagonal`]
+/// ([`BmsFlexRowLaunchMode::DiagonalHostOut`]).
+///
+/// Probes the backend, allocates the `p_total`-double output on its stream,
+/// optionally uploads a host direction `v` (HVP modes; `None` for the diagonal
+/// mode, which takes no direction), runs the shared partial+reduce engine, then
+/// synchronizes and downloads the reduced image to a host `Vec<f64>`. `ctx`
+/// tags every `DriverCallFailed` reason with the originating entry point.
+#[cfg(target_os = "linux")]
+fn launch_bms_flex_row_host(
+    storage: &DeviceResidentRowHess,
+    mode: BmsFlexRowLaunchMode,
+    v: Option<&[f64]>,
+    ctx: &str,
+) -> Result<Vec<f64>, GpuError> {
+    let p_total = storage.block.p_total;
+    if let Some(v) = v {
+        if v.len() != p_total {
+            return Err(GpuError::DriverCallFailed {
+                reason: format!("bms_flex_row {ctx}: v.len()={} != p_total={p_total}", v.len()),
+            });
+        }
+    }
+
+    let backend = HvpKernelBackend::probe()?;
+    let stream = backend.stream.clone();
+
+    let d_v = match v {
+        Some(v) => Some(stream.clone_htod(v).map_err(|err| {
+            GpuError::DriverCallFailed {
+                reason: format!("bms_flex_row {ctx} upload v: {err}"),
+            }
+        })?),
+        None => None,
+    };
+    let mut d_out =
+        stream
+            .alloc_zeros::<f64>(p_total)
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("bms_flex_row {ctx} alloc out: {err}"),
+            })?;
+
+    run_bms_flex_row_partial_reduce(storage, mode, d_v.as_ref(), &mut d_out, ctx)?;
+
+    stream
+        .synchronize()
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row {ctx} synchronize: {err}"),
+        })?;
+    stream
+        .clone_dtoh(&d_out)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row {ctx} download out: {err}"),
+        })
+}
+
 /// Device-output HVP. Runs `bms_flex_row_hvp_partial(_packed)` +
 /// `bms_flex_row_hvp_reduce` on the storage's stream against caller-supplied
 /// device-resident `d_v` (length `p_total` doubles), writing the result into
@@ -2280,7 +2332,7 @@ pub(crate) fn launch_bms_flex_row_hvp_into_device(
     // chain device kernels against the result.
     run_bms_flex_row_partial_reduce(
         storage,
-        BmsFlexRowLaunchMode::Hvp,
+        BmsFlexRowLaunchMode::HvpDeviceOut,
         Some(d_v),
         d_out,
         "hvp_into_device",
@@ -2294,49 +2346,7 @@ pub(crate) fn launch_bms_flex_row_hvp(
     storage: &DeviceResidentRowHess,
     v: &[f64],
 ) -> Result<Vec<f64>, GpuError> {
-    if v.len() != storage.block.p_total {
-        return Err(GpuError::DriverCallFailed {
-            reason: format!(
-                "bms_flex_row hvp: v.len()={} != p_total={}",
-                v.len(),
-                storage.block.p_total
-            ),
-        });
-    }
-    let backend = HvpKernelBackend::probe()?;
-    let stream = backend.stream.clone();
-    let p_total = storage.block.p_total;
-
-    let d_v = stream
-        .clone_htod(v)
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("bms_flex_row hvp upload v: {err}"),
-        })?;
-    let mut d_out =
-        stream
-            .alloc_zeros::<f64>(p_total)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("bms_flex_row hvp alloc out: {err}"),
-            })?;
-
-    run_bms_flex_row_partial_reduce(
-        storage,
-        BmsFlexRowLaunchMode::Hvp,
-        Some(&d_v),
-        &mut d_out,
-        "hvp",
-    )?;
-
-    stream
-        .synchronize()
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("bms_flex_row hvp synchronize: {err}"),
-        })?;
-    stream
-        .clone_dtoh(&d_out)
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("bms_flex_row hvp download out: {err}"),
-        })
+    launch_bms_flex_row_host(storage, BmsFlexRowLaunchMode::HvpHostOut, Some(v), "hvp")
 }
 
 /// Launch the device-resident diagonal kernel. Returns the host-side joint
@@ -2345,35 +2355,7 @@ pub(crate) fn launch_bms_flex_row_hvp(
 pub(crate) fn launch_bms_flex_row_diagonal(
     storage: &DeviceResidentRowHess,
 ) -> Result<Vec<f64>, GpuError> {
-    let backend = HvpKernelBackend::probe()?;
-    let stream = backend.stream.clone();
-    let p_total = storage.block.p_total;
-
-    let mut d_out =
-        stream
-            .alloc_zeros::<f64>(p_total)
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: format!("bms_flex_row diag alloc out: {err}"),
-            })?;
-
-    run_bms_flex_row_partial_reduce(
-        storage,
-        BmsFlexRowLaunchMode::Diagonal,
-        None,
-        &mut d_out,
-        "diag",
-    )?;
-
-    stream
-        .synchronize()
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("bms_flex_row diag synchronize: {err}"),
-        })?;
-    stream
-        .clone_dtoh(&d_out)
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("bms_flex_row diag download out: {err}"),
-        })
+    launch_bms_flex_row_host(storage, BmsFlexRowLaunchMode::DiagonalHostOut, None, "diag")
 }
 
 /// Block 9 Phase 6 — hard cap on `p_total` for the dense joint-Hessian

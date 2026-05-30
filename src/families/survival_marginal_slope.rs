@@ -29,7 +29,7 @@ use crate::families::gamlss::{ParameterBlockInput, monotone_wiggle_basis_with_de
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::marginal_slope_shared::{
     CoeffSupport, DirectionalScaleJets, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView,
-    add_optional_matrix, add_optional_vector, add_scaled_coeff4, add_two_surface_psi_outer,
+    add_optional_matrix, add_optional_vector, add_two_surface_psi_outer,
     build_denested_partition_cells as shared_denested_partition_cells, chunked_row_reduction,
     directional_obj_grad_hess, eval_coeff4_at, is_sigma_aux_index as shared_is_sigma_aux_index,
     observed_denested_cell_partials as shared_observed_denested_cell_partials, outer_row_indices,
@@ -8705,150 +8705,6 @@ impl SurvivalMarginalSlopeFamily {
         }
     }
 
-    #[inline]
-    fn primary_param_supported(&self, primary: &FlexPrimarySlices, idx: usize) -> bool {
-        idx == primary.g
-            || primary
-                .h
-                .as_ref()
-                .map(|range| range.contains(&idx))
-                .unwrap_or(false)
-            || primary
-                .w
-                .as_ref()
-                .map(|range| range.contains(&idx))
-                .unwrap_or(false)
-    }
-
-    fn cell_directional_coeff_family(
-        &self,
-        primary: &FlexPrimarySlices,
-        family: &[[f64; 4]],
-        dir: &Array1<f64>,
-    ) -> [f64; 4] {
-        let mut out = [0.0; 4];
-        add_scaled_coeff4(&mut out, &family[primary.g], dir[primary.g]);
-        if let Some(h_range) = primary.h.as_ref() {
-            for idx in h_range.clone() {
-                add_scaled_coeff4(&mut out, &family[idx], dir[idx]);
-            }
-        }
-        if let Some(w_range) = primary.w.as_ref() {
-            for idx in w_range.clone() {
-                add_scaled_coeff4(&mut out, &family[idx], dir[idx]);
-            }
-        }
-        out
-    }
-
-    fn cell_mixed_directional_from_b_family(
-        &self,
-        primary: &FlexPrimarySlices,
-        family: &[[f64; 4]],
-        dir_u: &Array1<f64>,
-        dir_v: &Array1<f64>,
-    ) -> [f64; 4] {
-        let mut out = [0.0; 4];
-        add_scaled_coeff4(
-            &mut out,
-            &family[primary.g],
-            dir_u[primary.g] * dir_v[primary.g],
-        );
-        if let Some(h_range) = primary.h.as_ref() {
-            for idx in h_range.clone() {
-                add_scaled_coeff4(
-                    &mut out,
-                    &family[idx],
-                    dir_u[primary.g] * dir_v[idx] + dir_v[primary.g] * dir_u[idx],
-                );
-            }
-        }
-        if let Some(w_range) = primary.w.as_ref() {
-            for idx in w_range.clone() {
-                add_scaled_coeff4(
-                    &mut out,
-                    &family[idx],
-                    dir_u[primary.g] * dir_v[idx] + dir_v[primary.g] * dir_u[idx],
-                );
-            }
-        }
-        out
-    }
-
-    fn cell_param_directional_from_b_family(
-        &self,
-        primary: &FlexPrimarySlices,
-        family: &[[f64; 4]],
-        param: usize,
-        dir: &Array1<f64>,
-    ) -> [f64; 4] {
-        if param == primary.g {
-            return self.cell_directional_coeff_family(primary, family, dir);
-        }
-        if self.primary_param_supported(primary, param) {
-            return scale_coeff4(family[param], dir[primary.g]);
-        }
-        [0.0; 4]
-    }
-
-    fn cell_param_mixed_from_bb_family(
-        &self,
-        primary: &FlexPrimarySlices,
-        family: &[[f64; 4]],
-        param: usize,
-        dir_u: &Array1<f64>,
-        dir_v: &Array1<f64>,
-    ) -> [f64; 4] {
-        if param == primary.g {
-            return self.cell_mixed_directional_from_b_family(primary, family, dir_u, dir_v);
-        }
-        if self.primary_param_supported(primary, param) {
-            return scale_coeff4(family[param], dir_u[primary.g] * dir_v[primary.g]);
-        }
-        [0.0; 4]
-    }
-
-    fn cell_pair_directional_from_bb_family(
-        &self,
-        primary: &FlexPrimarySlices,
-        family: &[[f64; 4]],
-        u: usize,
-        v: usize,
-        dir: &Array1<f64>,
-    ) -> [f64; 4] {
-        if u == primary.g && v == primary.g {
-            return self.cell_directional_coeff_family(primary, family, dir);
-        }
-        if u == primary.g && self.primary_param_supported(primary, v) {
-            return scale_coeff4(family[v], dir[primary.g]);
-        }
-        if v == primary.g && self.primary_param_supported(primary, u) {
-            return scale_coeff4(family[u], dir[primary.g]);
-        }
-        [0.0; 4]
-    }
-
-    fn cell_pair_mixed_from_bbb_family(
-        &self,
-        primary: &FlexPrimarySlices,
-        family: &[[f64; 4]],
-        u: usize,
-        v: usize,
-        dir_u: &Array1<f64>,
-        dir_v: &Array1<f64>,
-    ) -> [f64; 4] {
-        if u == primary.g && v == primary.g {
-            return self.cell_mixed_directional_from_b_family(primary, family, dir_u, dir_v);
-        }
-        if u == primary.g && self.primary_param_supported(primary, v) {
-            return scale_coeff4(family[v], dir_u[primary.g] * dir_v[primary.g]);
-        }
-        if v == primary.g && self.primary_param_supported(primary, u) {
-            return scale_coeff4(family[u], dir_u[primary.g] * dir_v[primary.g]);
-        }
-        [0.0; 4]
-    }
-
     /// Directional derivative of the fixed eta second partial r_uv w.r.t.
     /// a contraction direction.  Only (g,g), (g,h), (g,w) entries are nonzero.
     fn observed_fixed_eta_second_partial_dir(
@@ -10759,6 +10615,21 @@ impl SurvivalMarginalSlopeFamily {
             }
         }
 
+        let primary_view = SparsePrimaryCoeffJetView::new(
+            primary.g,
+            primary.h.as_ref(),
+            primary.w.as_ref(),
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
         let d_uv_uv_cell_accums = cached
             .cells
             .iter()
@@ -10769,26 +10640,46 @@ impl SurvivalMarginalSlopeFamily {
                 let fx = &ce.fixed;
                 let eta_base = [cell.c0, cell.c1, cell.c2, cell.c3];
 
-                let coeff_dir1 = self.cell_directional_coeff_family(primary, &fx.coeff_u, dir1);
-                let coeff_dir2 = self.cell_directional_coeff_family(primary, &fx.coeff_u, dir2);
-                let coeff_dir12 =
-                    self.cell_mixed_directional_from_b_family(primary, &fx.coeff_bu, dir1, dir2);
-                let coeff_a_dir1 = self.cell_directional_coeff_family(primary, &fx.coeff_au, dir1);
-                let coeff_a_dir2 = self.cell_directional_coeff_family(primary, &fx.coeff_au, dir2);
-                let coeff_a_dir12 =
-                    self.cell_mixed_directional_from_b_family(primary, &fx.coeff_abu, dir1, dir2);
+                let coeff_dir1 =
+                    primary_view.directional_family(&fx.coeff_u, dir1, COEFF_SUPPORT_GHW);
+                let coeff_dir2 =
+                    primary_view.directional_family(&fx.coeff_u, dir2, COEFF_SUPPORT_GHW);
+                let coeff_dir12 = primary_view.mixed_directional_from_b_family(
+                    &fx.coeff_bu,
+                    dir1,
+                    dir2,
+                    COEFF_SUPPORT_GHW,
+                );
+                let coeff_a_dir1 =
+                    primary_view.directional_family(&fx.coeff_au, dir1, COEFF_SUPPORT_GHW);
+                let coeff_a_dir2 =
+                    primary_view.directional_family(&fx.coeff_au, dir2, COEFF_SUPPORT_GHW);
+                let coeff_a_dir12 = primary_view.mixed_directional_from_b_family(
+                    &fx.coeff_abu,
+                    dir1,
+                    dir2,
+                    COEFF_SUPPORT_GHW,
+                );
                 let coeff_aa_dir1 =
-                    self.cell_directional_coeff_family(primary, &fx.coeff_aau, dir1);
+                    primary_view.directional_family(&fx.coeff_aau, dir1, COEFF_SUPPORT_GHW);
                 let coeff_aa_dir2 =
-                    self.cell_directional_coeff_family(primary, &fx.coeff_aau, dir2);
-                let coeff_aa_dir12 =
-                    self.cell_mixed_directional_from_b_family(primary, &fx.coeff_aabu, dir1, dir2);
+                    primary_view.directional_family(&fx.coeff_aau, dir2, COEFF_SUPPORT_GHW);
+                let coeff_aa_dir12 = primary_view.mixed_directional_from_b_family(
+                    &fx.coeff_aabu,
+                    dir1,
+                    dir2,
+                    COEFF_SUPPORT_GHW,
+                );
                 let coeff_aaa_dir1 =
-                    self.cell_directional_coeff_family(primary, &fx.coeff_aaau, dir1);
+                    primary_view.directional_family(&fx.coeff_aaau, dir1, COEFF_SUPPORT_GHW);
                 let coeff_aaa_dir2 =
-                    self.cell_directional_coeff_family(primary, &fx.coeff_aaau, dir2);
-                let coeff_aaa_dir12 =
-                    self.cell_mixed_directional_from_b_family(primary, &fx.coeff_aabu, dir1, dir2);
+                    primary_view.directional_family(&fx.coeff_aaau, dir2, COEFF_SUPPORT_GHW);
+                let coeff_aaa_dir12 = primary_view.mixed_directional_from_b_family(
+                    &fx.coeff_aabu,
+                    dir1,
+                    dir2,
+                    COEFF_SUPPORT_GHW,
+                );
 
                 let eta_poly_jet = coeff4_composite_bilinear(
                     &eta_base,
@@ -10841,33 +10732,62 @@ impl SurvivalMarginalSlopeFamily {
                 let mut coeff_au_fixed_jets = Vec::with_capacity(p);
                 let mut coeff_aau_fixed_jets = Vec::with_capacity(p);
                 for u in 0..p {
-                    let coeff_u_dir1 =
-                        self.cell_param_directional_from_b_family(primary, &fx.coeff_bu, u, dir1);
-                    let coeff_u_dir2 =
-                        self.cell_param_directional_from_b_family(primary, &fx.coeff_bu, u, dir2);
-                    let coeff_u_dir12 =
-                        self.cell_param_mixed_from_bb_family(primary, &fx.coeff_bbu, u, dir1, dir2);
-                    let coeff_au_dir1 =
-                        self.cell_param_directional_from_b_family(primary, &fx.coeff_abu, u, dir1);
-                    let coeff_au_dir2 =
-                        self.cell_param_directional_from_b_family(primary, &fx.coeff_abu, u, dir2);
-                    let coeff_au_dir12 = self.cell_param_mixed_from_bb_family(
-                        primary,
-                        &fx.coeff_abbu,
+                    let coeff_u_dir1 = primary_view.param_directional_from_b_family(
+                        &fx.coeff_bu,
                         u,
                         dir1,
-                        dir2,
+                        COEFF_SUPPORT_GHW,
                     );
-                    let coeff_aau_dir1 =
-                        self.cell_param_directional_from_b_family(primary, &fx.coeff_aabu, u, dir1);
-                    let coeff_aau_dir2 =
-                        self.cell_param_directional_from_b_family(primary, &fx.coeff_aabu, u, dir2);
-                    let coeff_aau_dir12 = self.cell_param_mixed_from_bb_family(
-                        primary,
+                    let coeff_u_dir2 = primary_view.param_directional_from_b_family(
+                        &fx.coeff_bu,
+                        u,
+                        dir2,
+                        COEFF_SUPPORT_GHW,
+                    );
+                    let coeff_u_dir12 = primary_view.param_mixed_from_bb_family(
+                        &fx.coeff_bbu,
+                        u,
+                        dir1,
+                        dir2,
+                        COEFF_SUPPORT_GHW,
+                    );
+                    let coeff_au_dir1 = primary_view.param_directional_from_b_family(
+                        &fx.coeff_abu,
+                        u,
+                        dir1,
+                        COEFF_SUPPORT_GHW,
+                    );
+                    let coeff_au_dir2 = primary_view.param_directional_from_b_family(
+                        &fx.coeff_abu,
+                        u,
+                        dir2,
+                        COEFF_SUPPORT_GHW,
+                    );
+                    let coeff_au_dir12 = primary_view.param_mixed_from_bb_family(
                         &fx.coeff_abbu,
                         u,
                         dir1,
                         dir2,
+                        COEFF_SUPPORT_GHW,
+                    );
+                    let coeff_aau_dir1 = primary_view.param_directional_from_b_family(
+                        &fx.coeff_aabu,
+                        u,
+                        dir1,
+                        COEFF_SUPPORT_GHW,
+                    );
+                    let coeff_aau_dir2 = primary_view.param_directional_from_b_family(
+                        &fx.coeff_aabu,
+                        u,
+                        dir2,
+                        COEFF_SUPPORT_GHW,
+                    );
+                    let coeff_aau_dir12 = primary_view.param_mixed_from_bb_family(
+                        &fx.coeff_abbu,
+                        u,
+                        dir1,
+                        dir2,
+                        COEFF_SUPPORT_GHW,
                     );
 
                     let coeff_u_fixed_jet = coeff4_fixed_bilinear(
@@ -10912,52 +10832,52 @@ impl SurvivalMarginalSlopeFamily {
                         let a_u_prod = a_u_jets[u].mul(&a_u_jets[v]);
                         let r_uv_fixed_jet = coeff4_fixed_bilinear(
                             &self.cell_pair_second_coeff(primary, &fx.coeff_bu, u, v),
-                            &self.cell_pair_directional_from_bb_family(
-                                primary,
+                            &primary_view.pair_directional_from_bb_family(
                                 &fx.coeff_bbu,
                                 u,
                                 v,
                                 dir1,
+                                COEFF_SUPPORT_GHW,
                             ),
-                            &self.cell_pair_directional_from_bb_family(
-                                primary,
+                            &primary_view.pair_directional_from_bb_family(
                                 &fx.coeff_bbu,
                                 u,
                                 v,
                                 dir2,
+                                COEFF_SUPPORT_GHW,
                             ),
-                            &self.cell_pair_mixed_from_bbb_family(
-                                primary,
+                            &primary_view.pair_mixed_from_bbb_family(
                                 &fx.coeff_bbbu,
                                 u,
                                 v,
                                 dir1,
                                 dir2,
+                                COEFF_SUPPORT_GHW,
                             ),
                         );
                         let chi_uv_fixed_jet = coeff4_fixed_bilinear(
                             &self.cell_pair_third_coeff_a(primary, &fx.coeff_abu, u, v),
-                            &self.cell_pair_directional_from_bb_family(
-                                primary,
+                            &primary_view.pair_directional_from_bb_family(
                                 &fx.coeff_abbu,
                                 u,
                                 v,
                                 dir1,
+                                COEFF_SUPPORT_GHW,
                             ),
-                            &self.cell_pair_directional_from_bb_family(
-                                primary,
+                            &primary_view.pair_directional_from_bb_family(
                                 &fx.coeff_abbu,
                                 u,
                                 v,
                                 dir2,
+                                COEFF_SUPPORT_GHW,
                             ),
-                            &self.cell_pair_mixed_from_bbb_family(
-                                primary,
+                            &primary_view.pair_mixed_from_bbb_family(
                                 &fx.coeff_bbbu,
                                 u,
                                 v,
                                 dir1,
                                 dir2,
+                                COEFF_SUPPORT_GHW,
                             ),
                         );
 
