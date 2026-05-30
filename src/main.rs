@@ -12980,11 +12980,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_duchon_power_defaults_to_two() {
+    fn parse_duchon_power_defaults_to_cubic_rule_placeholder() {
+        // The parser-level default is the cubic-rule spectral power 1.5 (an
+        // f64), not the old integer 2. The dimension-aware (d-1)/2 resolution
+        // happens later in `build_smooth_basis`; the bare option parser, lacking
+        // column context, hands back the canonical 1.5 placeholder.
         let options = BTreeMap::new();
         assert_eq!(
             parse_duchon_power(&options).expect("default Duchon power"),
-            2
+            1.5
         );
     }
 
@@ -12992,7 +12996,22 @@ mod tests {
     fn parse_duchon_power_prefers_explicit_power() {
         let mut options = BTreeMap::new();
         options.insert("power".to_string(), "0".to_string());
-        assert_eq!(parse_duchon_power(&options).expect("power should parse"), 0);
+        assert_eq!(
+            parse_duchon_power(&options).expect("power should parse"),
+            0.0
+        );
+    }
+
+    #[test]
+    fn parse_duchon_power_accepts_fractional_power() {
+        // The redesign threads fractional spectral powers through as f64; an
+        // explicit half-integer must parse verbatim, not get rounded.
+        let mut options = BTreeMap::new();
+        options.insert("power".to_string(), "0.5".to_string());
+        assert_eq!(
+            parse_duchon_power(&options).expect("fractional power should parse"),
+            0.5
+        );
     }
 
     #[test]
@@ -13004,11 +13023,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_duchon_power_rejects_negative_power() {
+        // The f64 path admits any non-negative number; negatives are rejected
+        // (there is no longer an integer-only constraint to lean on).
+        let mut options = BTreeMap::new();
+        options.insert("power".to_string(), "-1".to_string());
+        let err = parse_duchon_power(&options).expect_err("negative power should fail");
+        assert!(err.contains("invalid Duchon power"));
+    }
+
+    #[test]
     fn parse_duchon_power_rejects_duchon_nu_alias() {
         let mut options = BTreeMap::new();
         options.insert("nu".to_string(), "5/2".to_string());
         let err = parse_duchon_power(&options).expect_err("duchon nu alias should fail");
-        assert!(err.contains("Duchon smooths use power=<integer>"));
+        assert!(err.contains("Duchon smooths use power=<number>"));
     }
 
     #[test]
@@ -13017,7 +13046,7 @@ mod tests {
         options.insert("power".to_string(), "0".to_string());
         options.insert("nu".to_string(), "5/2".to_string());
         let err = parse_duchon_power(&options).expect_err("conflict should fail");
-        assert!(err.contains("Duchon smooths use power=<integer>"));
+        assert!(err.contains("Duchon smooths use power=<number>"));
     }
 
     #[test]
