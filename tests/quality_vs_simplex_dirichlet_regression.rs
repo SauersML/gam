@@ -429,7 +429,7 @@ fn gam_dirichlet_regression_recovers_truth() {
     // the objective target is the resulting closed mean composition and
     // log-concentration evaluated on the identical dense grid.
     let true_eta_grid: Vec<Vec<f64>> = {
-        let mut stacks = vec![Vec::with_capacity(N_GRID); K];
+        let mut stacks: Vec<Vec<f64>> = (0..K).map(|_| Vec::with_capacity(N_GRID)).collect();
         for &xg in &grid {
             let e = true_eta(xg);
             for k in 0..K {
