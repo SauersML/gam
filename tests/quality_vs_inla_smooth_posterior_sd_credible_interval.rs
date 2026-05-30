@@ -105,7 +105,11 @@ fn gam_posterior_sd_and_credible_interval_match_inla() {
         .expect("rebuild design at training points");
     let d_dense = design.design.to_dense();
     assert_eq!(d_dense.nrows(), n, "design row count must match n");
-    assert_eq!(d_dense.ncols(), p, "design col count must match coefficient count");
+    assert_eq!(
+        d_dense.ncols(),
+        p,
+        "design col count must match coefficient count"
+    );
 
     // gam posterior mean, pointwise SD, and 95% CI width at each training point.
     let gam_mean: Vec<f64> = design.design.apply(beta).to_vec();
@@ -182,7 +186,11 @@ fn gam_posterior_sd_and_credible_interval_match_inla() {
     let inla_lo = r.vector("lo");
     let inla_hi = r.vector("hi");
     assert_eq!(inla_sd.len(), n, "INLA posterior-SD length must equal n");
-    assert_eq!(inla_mean.len(), n, "INLA posterior-mean length must equal n");
+    assert_eq!(
+        inla_mean.len(),
+        n,
+        "INLA posterior-mean length must equal n"
+    );
 
     let inla_ci_width: Vec<f64> = inla_hi
         .iter()

@@ -30,7 +30,9 @@
 //! path. Because gam and gamlss use different bases + different λ selectors,
 //! the bounds are calibrated to the cross-package floor (see the asserts).
 
-use gam::basis::{BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, build_bspline_basis_1d};
+use gam::basis::{
+    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, build_bspline_basis_1d,
+};
 use gam::custom_family::{
     BlockwiseFitOptions, ParameterBlockSpec, PenaltyMatrix, fit_custom_family,
 };

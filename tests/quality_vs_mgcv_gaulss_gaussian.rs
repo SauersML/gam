@@ -64,9 +64,7 @@ use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::solver::estimate::BlockRole;
 use gam::test_support::reference::{Column, relative_l2, run_r};
-use gam::{
-    FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema,
-};
+use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::path::Path;
 
@@ -205,7 +203,11 @@ fn gam_gaulss_linear_mean_smooth_sigma_matches_mgcv_on_lidar() {
     let mgcv_mu = r.vector("mu");
     let mgcv_log_sigma = r.vector("log_sigma");
     assert_eq!(mgcv_mu.len(), grid_n, "mgcv mu length mismatch");
-    assert_eq!(mgcv_log_sigma.len(), grid_n, "mgcv log_sigma length mismatch");
+    assert_eq!(
+        mgcv_log_sigma.len(),
+        grid_n,
+        "mgcv log_sigma length mismatch"
+    );
 
     // ---- compare on the grid ----------------------------------------------
     let mu_rel = relative_l2(&gam_mu, mgcv_mu);

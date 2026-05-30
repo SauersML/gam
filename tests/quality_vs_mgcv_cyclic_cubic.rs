@@ -77,7 +77,9 @@ fn gam_cyclic_cubic_matches_mgcv_on_sine() {
     // Evaluate gam's fitted function on a dense grid over one period [0, 2π).
     // We also append the seam point t=2π so we can verify the wrap directly.
     let grid_n = 200usize;
-    let mut grid_t: Vec<f64> = (0..grid_n).map(|i| period * i as f64 / grid_n as f64).collect();
+    let mut grid_t: Vec<f64> = (0..grid_n)
+        .map(|i| period * i as f64 / grid_n as f64)
+        .collect();
     grid_t.push(period); // last entry is exactly one period after grid_t[0]==0
 
     let mut design_pts = Array2::<f64>::zeros((grid_t.len(), ds.headers.len()));
@@ -112,7 +114,11 @@ fn gam_cyclic_cubic_matches_mgcv_on_sine() {
     );
     let mgcv_fitted = r.vector("fitted");
     let mgcv_edf = r.scalar("edf");
-    assert_eq!(mgcv_fitted.len(), grid_n, "mgcv grid prediction length mismatch");
+    assert_eq!(
+        mgcv_fitted.len(),
+        grid_n,
+        "mgcv grid prediction length mismatch"
+    );
 
     // ---- compare -----------------------------------------------------------
     let rel = relative_l2(gam_grid_fit, mgcv_fitted);

@@ -30,9 +30,7 @@
 use gam::matrix::LinearOperator;
 use gam::smooth::{build_term_collection_design, freeze_term_collection_from_design};
 use gam::test_support::reference::{Column, pearson, relative_l2, run_r};
-use gam::{
-    FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema,
-};
+use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::io::Write as _;
 use std::path::Path;
@@ -131,16 +129,15 @@ fn gam_sphere_matches_mgcv_sos_on_geographic_surface() {
     let mut next_normal = || {
         // Box–Muller from a 64-bit LCG (numerical-recipes constants).
         let mut u = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((state >> 11) as f64 + 1.0) / ((1u64 << 53) as f64 + 1.0)
         };
         let (u1, u2) = (u(), u());
         (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
     };
-    let y: Vec<f64> = truth
-        .iter()
-        .map(|t| t + noise_sd * next_normal())
-        .collect();
+    let y: Vec<f64> = truth.iter().map(|t| t + noise_sd * next_normal()).collect();
 
     // ---- fit with gam: y ~ sphere(lat, lon, k=30), REML --------------------
     // Write the identical (lat, lon, y) triples to a temp CSV and load through
@@ -164,8 +161,7 @@ fn gam_sphere_matches_mgcv_sos_on_geographic_surface() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result =
-        fit_from_formula("y ~ sphere(lat, lon, k=30)", &ds, &cfg).expect("gam sphere fit");
+    let result = fit_from_formula("y ~ sphere(lat, lon, k=30)", &ds, &cfg).expect("gam sphere fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for a Gaussian sphere smooth");
     };

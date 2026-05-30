@@ -156,7 +156,10 @@ fn gam_gaussian_survival_location_scale_matches_gamlss() {
     let beta_location = unified.beta_threshold();
     let beta_log_sigma = unified.beta_log_sigma();
     assert!(
-        beta_location.iter().chain(beta_log_sigma.iter()).all(|v| v.is_finite()),
+        beta_location
+            .iter()
+            .chain(beta_log_sigma.iter())
+            .all(|v| v.is_finite()),
         "non-finite gam location / log-sigma coefficients"
     );
 
@@ -223,7 +226,11 @@ fn gam_gaussian_survival_location_scale_matches_gamlss() {
     let gamlss_mu = r.vector("mu");
     let gamlss_sigma = r.vector("sigma");
     assert_eq!(gamlss_mu.len(), grid_n, "gamlss mu grid length mismatch");
-    assert_eq!(gamlss_sigma.len(), grid_n, "gamlss sigma grid length mismatch");
+    assert_eq!(
+        gamlss_sigma.len(),
+        grid_n,
+        "gamlss sigma grid length mismatch"
+    );
     let gamlss_log_sigma: Vec<f64> = gamlss_sigma.iter().map(|&s| s.ln()).collect();
 
     // ---- compare the recovered x-dependence (gauge-free: mean-centered) ----

@@ -135,7 +135,8 @@ fn multinomial_stored_deviance_matches_independent_softmax_recompute() {
     // Replay the SAME data through the public predict path: this rebuilds the
     // design from the frozen termspec and evaluates softmax(X·β̂) afresh from
     // the stored coefficients — no shared state with the value gam stored.
-    let probs = predict_multinomial_formula(&model, &ds).expect("multinomial predict probabilities");
+    let probs =
+        predict_multinomial_formula(&model, &ds).expect("multinomial predict probabilities");
     assert_eq!(probs.dim(), (n, model.class_levels.len()), "probs shape");
 
     // Map each row's realized label to gam's own class column index, so the
@@ -148,7 +149,12 @@ fn multinomial_stored_deviance_matches_independent_softmax_recompute() {
             .class_levels
             .iter()
             .position(|lvl| lvl == label)
-            .unwrap_or_else(|| panic!("label {label:?} not among class levels {:?}", model.class_levels))
+            .unwrap_or_else(|| {
+                panic!(
+                    "label {label:?} not among class levels {:?}",
+                    model.class_levels
+                )
+            })
     };
 
     // deviance = -2 · Σ_i log p̂(y_i | x_i), summed exactly the way the

@@ -46,8 +46,8 @@ use gam::inference::model::{
     SavedLatentZNormalization, load_survival_time_basis_config_from_model,
 };
 use gam::inference::model_payload_builders::{
-    BernoulliMarginalSlopeInputs, LocationScaleInputs, LocationScaleResponse, LocationScaleWiggle,
-    LatentWindowInputs, SavedModelSourceMetadata, SurvivalLocationScaleInputs,
+    BernoulliMarginalSlopeInputs, LatentWindowInputs, LocationScaleInputs, LocationScaleResponse,
+    LocationScaleWiggle, SavedModelSourceMetadata, SurvivalLocationScaleInputs,
     SurvivalMarginalSlopeInputs, SurvivalTimewiggle, SurvivalTimewiggleBeta,
     SurvivalTransformationInputs, TransformationNormalInputs,
     assemble_bernoulli_marginal_slope_payload, assemble_latent_window_payload,
@@ -4870,7 +4870,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 SurvivalTimewiggle {
                     degree: w.degree,
                     knots: w.knots.to_vec(),
-                    penalty_orders: effective_timewiggle.as_ref().map(|cfg| cfg.penalty_orders.clone()),
+                    penalty_orders: effective_timewiggle
+                        .as_ref()
+                        .map(|cfg| cfg.penalty_orders.clone()),
                     double_penalty: effective_timewiggle.as_ref().map(|cfg| cfg.double_penalty),
                     beta: SurvivalTimewiggleBeta::Single(beta),
                 }
@@ -5205,12 +5207,16 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             // Source-specific work: freeze the term collections from their
             // designs and snapshot the time basis. The semantic payload is
             // assembled by the same shared core the FFI uses.
-            let resolved_marginalspec =
-                freeze_term_collection_from_design(&fit.marginalspec_resolved, &fit.marginal_design)
-                    .map_err(|e| e.to_string())?;
-            let resolved_logslopespec =
-                freeze_term_collection_from_design(&fit.logslopespec_resolved, &fit.logslope_design)
-                    .map_err(|e| e.to_string())?;
+            let resolved_marginalspec = freeze_term_collection_from_design(
+                &fit.marginalspec_resolved,
+                &fit.marginal_design,
+            )
+            .map_err(|e| e.to_string())?;
+            let resolved_logslopespec = freeze_term_collection_from_design(
+                &fit.logslopespec_resolved,
+                &fit.logslope_design,
+            )
+            .map_err(|e| e.to_string())?;
             let payload = assemble_survival_marginal_slope_payload(
                 SurvivalMarginalSlopeInputs {
                     formula,
@@ -5625,23 +5631,25 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             // single shared timewiggle block; cause_count > 1 guarantees the
             // block exists). The shared core then assembles the canonical
             // payload exactly as the FFI does.
-            let timewiggle =
-                fit.baseline_timewiggle
-                    .as_ref()
-                    .zip(fit.fit.blocks.first())
-                    .map(|(timewiggle, block)| {
-                        let start = fit.time_base_ncols;
-                        let end = start + timewiggle.ncols;
-                        SurvivalTimewiggle {
-                            degree: timewiggle.degree,
-                            knots: timewiggle.knots.to_vec(),
-                            penalty_orders: effective_timewiggle
-                                .as_ref()
-                                .map(|cfg| cfg.penalty_orders.clone()),
-                            double_penalty: effective_timewiggle.as_ref().map(|cfg| cfg.double_penalty),
-                            beta: SurvivalTimewiggleBeta::Single(block.beta.slice(s![start..end]).to_vec()),
-                        }
-                    });
+            let timewiggle = fit
+                .baseline_timewiggle
+                .as_ref()
+                .zip(fit.fit.blocks.first())
+                .map(|(timewiggle, block)| {
+                    let start = fit.time_base_ncols;
+                    let end = start + timewiggle.ncols;
+                    SurvivalTimewiggle {
+                        degree: timewiggle.degree,
+                        knots: timewiggle.knots.to_vec(),
+                        penalty_orders: effective_timewiggle
+                            .as_ref()
+                            .map(|cfg| cfg.penalty_orders.clone()),
+                        double_penalty: effective_timewiggle.as_ref().map(|cfg| cfg.double_penalty),
+                        beta: SurvivalTimewiggleBeta::Single(
+                            block.beta.slice(s![start..end]).to_vec(),
+                        ),
+                    }
+                });
             let payload = assemble_survival_transformation_payload(
                 SurvivalTransformationInputs {
                     formula,
@@ -6055,7 +6063,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             SurvivalTimewiggle {
                 degree: w.degree,
                 knots: w.knots.to_vec(),
-                penalty_orders: effective_timewiggle.as_ref().map(|cfg| cfg.penalty_orders.clone()),
+                penalty_orders: effective_timewiggle
+                    .as_ref()
+                    .map(|cfg| cfg.penalty_orders.clone()),
                 double_penalty: effective_timewiggle.as_ref().map(|cfg| cfg.double_penalty),
                 beta: SurvivalTimewiggleBeta::Single(beta.slice(s![start..end]).to_vec()),
             }
@@ -9671,12 +9681,11 @@ mod tests {
         compute_probit_q0_from_eta, core_saved_fit_result, covariance_from_model,
         effectivelinkwiggle_formulaspec, exact_kernel, family_arg_canonical_name,
         fit_result_from_external, load_dataset_projected, parse_formula, parse_link_choice,
-        parse_matching_auxiliary_formula,
-        parse_surv_response, parse_survival_inverse_link, parse_survival_time_basis_config,
-        predict_gam, prepend_id_column_to_prediction_csv, required_columns_for_fit, resolve_family,
-        summarizewiggle_domain, validate_cli_firth_configuration,
-        write_gaussian_location_scale_prediction_csv, write_prediction_csv,
-        write_survival_binary_prediction_csv, write_survival_prediction_csv,
+        parse_matching_auxiliary_formula, parse_surv_response, parse_survival_inverse_link,
+        parse_survival_time_basis_config, predict_gam, prepend_id_column_to_prediction_csv,
+        required_columns_for_fit, resolve_family, summarizewiggle_domain,
+        validate_cli_firth_configuration, write_gaussian_location_scale_prediction_csv,
+        write_prediction_csv, write_survival_binary_prediction_csv, write_survival_prediction_csv,
     };
     use super::{
         Cli, Command, CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg, run_fit,
@@ -10478,14 +10487,7 @@ mod tests {
         ];
 
         for (arg, nb_theta, link_choice, y, y_kind) in cases {
-            let cli = resolve_family(
-                arg,
-                nb_theta,
-                link_choice.clone(),
-                y.view(),
-                y_kind,
-                "y",
-            );
+            let cli = resolve_family(arg, nb_theta, link_choice.clone(), y.view(), y_kind, "y");
             let canonical = gam::resolve_family(
                 family_arg_canonical_name(arg),
                 nb_theta,
@@ -12883,7 +12885,9 @@ mod tests {
         for json in [&mut cli_json, &mut ffi_json] {
             // Field names are kebab-case under the payload's
             // `#[serde(rename_all = "kebab-case")]`.
-            let obj = json.as_object_mut().expect("payload serializes to an object");
+            let obj = json
+                .as_object_mut()
+                .expect("payload serializes to an object");
             obj.remove("training-feature-ranges");
             obj.remove("offset-column");
             obj.remove("noise-offset-column");

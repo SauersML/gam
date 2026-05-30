@@ -7442,9 +7442,9 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             // dense-materialization fallback probes the PSD majorizer too — never
             // the (possibly indefinite) exact Hessian. For convex penalties the
             // majorizer equals the exact HVP, so this is exact for them.
-            let col =
-                self.penalty
-                    .psd_majorizer_hvp(self.target.view(), self.rho.view(), e.view());
+            let col = self
+                .penalty
+                .psd_majorizer_hvp(self.target.view(), self.rho.view(), e.view());
             for i in 0..n {
                 m[[i, j]] = col[i];
             }
@@ -8220,7 +8220,14 @@ mod tests {
     /// each per-axis scaled threshold so the gate `g = σ((z − τ)/ε)` sweeps both
     /// sides of its inflection `g = ½`, where the true Hessian
     /// `wτ·g(1−g)(1−2g)/ε²` changes sign.
-    fn jumprelu_sweep_fixture() -> (JumpReLUPenalty, Array1<f64>, Array1<f64>, [f64; 2], f64, f64) {
+    fn jumprelu_sweep_fixture() -> (
+        JumpReLUPenalty,
+        Array1<f64>,
+        Array1<f64>,
+        [f64; 2],
+        f64,
+        f64,
+    ) {
         let thresholds = array![0.25_f64, 0.8];
         let rho = array![0.0_f64, 1.5_f64.ln()];
         let eps = 0.04_f64;
@@ -8279,8 +8286,7 @@ mod tests {
 
     #[test]
     fn jumprelu_hvp_diagonal_matches_hessian_diag() {
-        let (pen, target_values, rho, _scaled_thresholds, _eps, _weight) =
-            jumprelu_sweep_fixture();
+        let (pen, target_values, rho, _scaled_thresholds, _eps, _weight) = jumprelu_sweep_fixture();
         // `hvp` and `hessian_diag` are the SAME true operator; probing `hvp`
         // with unit vectors must reproduce `hessian_diag` exactly.
         let diag = pen

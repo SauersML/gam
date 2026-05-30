@@ -81,7 +81,10 @@ fn gam_nuts_binomial_logit_matches_pymc() {
     }
     // Both classes must be present or the logit posterior is degenerate.
     let n_pos = y.iter().filter(|&&v| v > 0.5).count();
-    assert!(n_pos > 10 && n_pos < n - 10, "need both classes: n_pos={n_pos}");
+    assert!(
+        n_pos > 10 && n_pos < n - 10,
+        "need both classes: n_pos={n_pos}"
+    );
 
     // ---- write a temp CSV and load it through gam's standard loader ---------
     let mut csv_path: PathBuf = std::env::temp_dir();
@@ -181,8 +184,14 @@ fn gam_nuts_binomial_logit_matches_pymc() {
         seed: 42,
         ..adaptive
     };
-    let nuts = sample_saved_model(&model, ds.values.view(), &col, model.training_headers.as_ref(), &nuts_cfg)
-        .expect("gam NUTS sampling");
+    let nuts = sample_saved_model(
+        &model,
+        ds.values.view(),
+        &col,
+        model.training_headers.as_ref(),
+        &nuts_cfg,
+    )
+    .expect("gam NUTS sampling");
     assert_eq!(nuts.samples.ncols(), p, "posterior coeff dim mismatch");
 
     // Posterior of η = X β at the training points, draw by draw.

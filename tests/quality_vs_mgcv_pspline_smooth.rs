@@ -54,8 +54,8 @@ fn gam_pspline_matches_mgcv_on_lidar() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result =
-        fit_from_formula("logratio ~ s(range, bs='ps', k=15)", &ds, &cfg).expect("gam p-spline fit");
+    let result = fit_from_formula("logratio ~ s(range, bs='ps', k=15)", &ds, &cfg)
+        .expect("gam p-spline fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for a gaussian p-spline smooth");
     };

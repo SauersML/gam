@@ -301,8 +301,11 @@ fn gam_tensor_baseline_stratified_matches_lifelines_coxph() {
         let members: Vec<usize> = (0..n).filter(|&i| sex[i] == g).collect();
         let m = members.len() as f64;
         for (ti, &te) in time_eta.iter().enumerate() {
-            let mean_h: f64 =
-                members.iter().map(|&i| (te + cov_eta[i]).exp()).sum::<f64>() / m;
+            let mean_h: f64 = members
+                .iter()
+                .map(|&i| (te + cov_eta[i]).exp())
+                .sum::<f64>()
+                / m;
             gam_log_cumhaz.push(mean_h.ln());
             // Marginal survival at the risk-difference time = mean S over rows.
             if (TIMES[ti] - RISK_DIFF_TIME).abs() < 1e-9 {

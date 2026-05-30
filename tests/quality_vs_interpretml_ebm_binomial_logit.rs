@@ -65,7 +65,11 @@ fn deviance_terms(prob: &[f64], y: &[f64]) -> Vec<f64> {
 
 /// Brier score: mean squared error on the probability scale.
 fn brier(prob: &[f64], y: &[f64]) -> f64 {
-    let s: f64 = prob.iter().zip(y).map(|(&p, &yi)| (p - yi) * (p - yi)).sum();
+    let s: f64 = prob
+        .iter()
+        .zip(y)
+        .map(|(&p, &yi)| (p - yi) * (p - yi))
+        .sum();
     s / prob.len().max(1) as f64
 }
 

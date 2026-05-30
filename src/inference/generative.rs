@@ -391,10 +391,9 @@ mod tests {
             (NoiseModel::Gaussian { sigma: sa }, NoiseModel::Gaussian { sigma: sb }) => sa == sb,
             (NoiseModel::Poisson, NoiseModel::Poisson) => true,
             (NoiseModel::Bernoulli, NoiseModel::Bernoulli) => true,
-            (
-                NoiseModel::Tweedie { p: pa, phi: pha },
-                NoiseModel::Tweedie { p: pb, phi: phb },
-            ) => pa == pb && pha == phb,
+            (NoiseModel::Tweedie { p: pa, phi: pha }, NoiseModel::Tweedie { p: pb, phi: phb }) => {
+                pa == pb && pha == phb
+            }
             (
                 NoiseModel::NegativeBinomial { theta: ta },
                 NoiseModel::NegativeBinomial { theta: tb },
@@ -424,7 +423,11 @@ mod tests {
                     sigma: Array1::from_elem(nobs, 0.7),
                 },
             ),
-            (LikelihoodSpec::binomial_logit(), None, NoiseModel::Bernoulli),
+            (
+                LikelihoodSpec::binomial_logit(),
+                None,
+                NoiseModel::Bernoulli,
+            ),
             (LikelihoodSpec::poisson_log(), None, NoiseModel::Poisson),
             (
                 LikelihoodSpec::tweedie_log(1.4),
@@ -476,7 +479,11 @@ mod tests {
         let spec = LikelihoodSpec::royston_parmar();
         let mean = Array1::from_elem(3, 0.0_f64);
         assert!(NoiseModel::from_likelihood(&spec, 3, None).is_err());
-        assert!(strategy_for_spec(&spec).simulate_noise(&mean, None).is_err());
+        assert!(
+            strategy_for_spec(&spec)
+                .simulate_noise(&mean, None)
+                .is_err()
+        );
     }
 
     /// Invalid / missing dispersion is rejected the same way regardless of
@@ -488,7 +495,11 @@ mod tests {
         // Gaussian sigma missing.
         let gauss = LikelihoodSpec::gaussian_identity();
         assert!(NoiseModel::from_likelihood(&gauss, 4, None).is_err());
-        assert!(strategy_for_spec(&gauss).simulate_noise(&mean, None).is_err());
+        assert!(
+            strategy_for_spec(&gauss)
+                .simulate_noise(&mean, None)
+                .is_err()
+        );
 
         // Tweedie power outside (1, 2).
         let bad_tweedie = LikelihoodSpec::tweedie_log(2.5);

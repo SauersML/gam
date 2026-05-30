@@ -94,11 +94,7 @@ fn gam_multinomial_matches_statsmodels_mnlogit() {
     let headers = vec!["y".to_string(), "x1".to_string(), "x2".to_string()];
     let rows = (0..N)
         .map(|i| {
-            csv::StringRecord::from(vec![
-                y[i].to_string(),
-                x1[i].to_string(),
-                x2[i].to_string(),
-            ])
+            csv::StringRecord::from(vec![y[i].to_string(), x1[i].to_string(), x2[i].to_string()])
         })
         .collect::<Vec<_>>();
     let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode dataset");
@@ -123,14 +119,19 @@ fn gam_multinomial_matches_statsmodels_mnlogit() {
     let n = design.nrows();
     let p = design.ncols();
     assert_eq!(n, N, "design row count");
-    assert!(p >= 3, "expect intercept + x1 + >=1 smooth column, got P={p}");
+    assert!(
+        p >= 3,
+        "expect intercept + x1 + >=1 smooth column, got P={p}"
+    );
 
     // Shared P x P smooth penalty: assemble the smooth's blockwise local penalty
     // into the global coordinate frame (intercept + x1 blocks are unpenalized).
     let mut penalty = Array2::<f64>::zeros((p, p));
     for blk in &fit.design.penalties {
         let r = blk.col_range.clone();
-        penalty.slice_mut(s![r.clone(), r.clone()]).assign(&blk.local);
+        penalty
+            .slice_mut(s![r.clone(), r.clone()])
+            .assign(&blk.local);
     }
 
     // One-hot response Y (N x J).
@@ -195,7 +196,10 @@ emit("nclass", [probs.shape[1]])
     );
     let r = run_python(&cols, &py_body);
     let nclass = r.scalar("nclass") as usize;
-    assert_eq!(nclass, J, "statsmodels recovered {nclass} classes, expected {J}");
+    assert_eq!(
+        nclass, J,
+        "statsmodels recovered {nclass} classes, expected {J}"
+    );
     let ref_flat = r.vector("probs");
     assert_eq!(ref_flat.len(), n * J, "reference prob matrix size mismatch");
 
@@ -224,7 +228,10 @@ emit("nclass", [probs.shape[1]])
     // L2-relative and max-abs on the full class-probability simplex.
     let class_rel_l2 = relative_l2(&gam_flat, ref_flat);
     let class_max_abs = max_abs_diff(&gam_flat, ref_flat);
-    let worst_cum = max_cum_diff_per_level.iter().cloned().fold(0.0f64, f64::max);
+    let worst_cum = max_cum_diff_per_level
+        .iter()
+        .cloned()
+        .fold(0.0f64, f64::max);
 
     eprintln!(
         "multinomial vs statsmodels MNLogit: n={n} J={J} P={p} \

@@ -9,9 +9,7 @@ use crate::quadrature::{
     normal_expectation_1d_adaptive, normal_expectation_1d_adaptive_pair,
     probit_posterior_meanvariance, survival_posterior_mean, survival_posterior_meanvariance,
 };
-use crate::types::{
-    InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, StandardLink,
-};
+use crate::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, StandardLink};
 use ndarray::{Array1, ArrayView1};
 
 /// Runtime family behavior carrier built from a `LikelihoodSpec` (response

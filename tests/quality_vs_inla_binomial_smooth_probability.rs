@@ -260,7 +260,11 @@ fn gam_binomial_smooth_probability_matches_inla() {
     );
     let inla_prob = r.vector("prob");
     let inla_prob_sd = r.vector("prob_sd");
-    assert_eq!(inla_prob.len(), n, "INLA fitted-probability length mismatch");
+    assert_eq!(
+        inla_prob.len(),
+        n,
+        "INLA fitted-probability length mismatch"
+    );
     assert_eq!(inla_prob_sd.len(), n, "INLA fitted-SD length mismatch");
 
     // ---- compare on the probability scale ---------------------------------

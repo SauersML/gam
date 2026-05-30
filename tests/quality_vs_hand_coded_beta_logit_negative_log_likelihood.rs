@@ -73,9 +73,7 @@ fn trigamma(mut x: f64) -> f64 {
     let inv = 1.0 / x;
     let inv2 = inv * inv;
     // ψ'(x) ≈ 1/x + 1/(2x²) + 1/(6x³) − 1/(30x⁵) + 1/(42x⁷) − …
-    acc + inv
-        + 0.5 * inv2
-        + inv * inv2 * (1.0 / 6.0 - inv2 * (1.0 / 30.0 - inv2 / 42.0))
+    acc + inv + 0.5 * inv2 + inv * inv2 * (1.0 / 6.0 - inv2 * (1.0 / 30.0 - inv2 / 42.0))
 }
 
 /// Row negative log-likelihood of Beta(α, β) at observation y, with
@@ -119,7 +117,10 @@ struct BetaLogitCustomFamily {
 impl CustomFamily for BetaLogitCustomFamily {
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 2 {
-            return Err(format!("BetaLogit needs 2 blocks, got {}", block_states.len()));
+            return Err(format!(
+                "BetaLogit needs 2 blocks, got {}",
+                block_states.len()
+            ));
         }
         let eta1 = &block_states[0].eta + &self.alpha_offset;
         let eta2 = &block_states[1].eta + &self.beta_offset;
@@ -158,7 +159,11 @@ impl CustomFamily for BetaLogitCustomFamily {
             w22[i] = -(d2_bb * s2 * s2 + d_lb * sp2);
         }
 
-        debug_assert_eq!(block_states[0].eta.len(), n, "block 0 eta length must equal n");
+        debug_assert_eq!(
+            block_states[0].eta.len(),
+            n,
+            "block 0 eta length must equal n"
+        );
 
         // Block gradients Xᵀ score and block observed-information Xᵀ diag(w) X.
         let g1 = self.design0_transpose_dot(&score1);
@@ -220,9 +225,7 @@ impl CustomFamily for BetaLogitCustomFamily {
         joint.slice_mut(ndarray::s![0..p0, 0..p0]).assign(&h11);
         joint.slice_mut(ndarray::s![p0.., p0..]).assign(&h22);
         joint.slice_mut(ndarray::s![0..p0, p0..]).assign(&h12);
-        joint
-            .slice_mut(ndarray::s![p0.., 0..p0])
-            .assign(&h12.t());
+        joint.slice_mut(ndarray::s![p0.., 0..p0]).assign(&h12.t());
         Ok(Some(joint))
     }
 }
@@ -409,7 +412,9 @@ fn beta_logit_custom_family_nll_and_jacobian_match_r_and_finite_differences() {
     let eta2: Vec<f64> = design1.dot(&b_beta).iter().copied().collect();
 
     // gam-side row NLL + analytic Jacobian using the family's own arithmetic.
-    let gam_nll: Vec<f64> = (0..N).map(|i| beta_row_nll(eta1[i], eta2[i], y[i])).collect();
+    let gam_nll: Vec<f64> = (0..N)
+        .map(|i| beta_row_nll(eta1[i], eta2[i], y[i]))
+        .collect();
 
     // ── oracle 1: hand-coded base R (lbeta, digamma) on the SAME η ──────────
     let r = run_r(
@@ -428,7 +433,12 @@ fn beta_logit_custom_family_nll_and_jacobian_match_r_and_finite_differences() {
         "#,
     );
     let r_nll = r.vector("nll");
-    assert_eq!(r_nll.len(), N, "R returned {} NLLs, expected {N}", r_nll.len());
+    assert_eq!(
+        r_nll.len(),
+        N,
+        "R returned {} NLLs, expected {N}",
+        r_nll.len()
+    );
 
     let nll_max_abs = gam_nll
         .iter()

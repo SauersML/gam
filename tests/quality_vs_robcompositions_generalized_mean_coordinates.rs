@@ -197,7 +197,13 @@ fn gam_simplex_frechet_mean_matches_compositions_aitchison_center() {
     // precision is the principled bound (1e-10), not a loose tolerance.
     eprintln!(
         "Aitchison center: gam=[{:.6},{:.6},{:.6}] compositions=[{:.6},{:.6},{:.6}] max_abs={:.3e}",
-        gam_mean[0], gam_mean[1], gam_mean[2], ref_center[0], ref_center[1], ref_center[2], center_err
+        gam_mean[0],
+        gam_mean[1],
+        gam_mean[2],
+        ref_center[0],
+        ref_center[1],
+        ref_center[2],
+        center_err
     );
     assert!(
         center_err < 1e-10,
@@ -277,7 +283,10 @@ fn gam_simplex_frechet_mean_matches_compositions_aitchison_center() {
 
     // ===== Assertion 5: output lies on the closed simplex ====================
     let sum: f64 = gam_mean.iter().sum();
-    eprintln!("simplex closure: sum={sum:.15} min={:.3e}", gam_mean.iter().cloned().fold(f64::INFINITY, f64::min));
+    eprintln!(
+        "simplex closure: sum={sum:.15} min={:.3e}",
+        gam_mean.iter().cloned().fold(f64::INFINITY, f64::min)
+    );
     assert!(
         (sum - 1.0).abs() < 1e-12 && gam_mean.iter().all(|&v| v > 0.0),
         "gam mean is not a valid closed composition: sum={sum}"

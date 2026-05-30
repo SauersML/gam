@@ -38,7 +38,9 @@ use gam::gamlss::GaussianLocationScaleFitResult;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_r};
-use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism};
+use gam::{
+    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+};
 use ndarray::Array2;
 
 /// gam's location-scale noise link floor: sigma = 0.01 + exp(eta_scale).
@@ -64,7 +66,9 @@ fn gam_gaussian_location_scale_matches_gamlss() {
     let mut state: u64 = 42;
     let mut next_unit = || -> f64 {
         // Numerical Recipes LCG; take the high bits for a uniform in [0,1).
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((state >> 11) as f64) / ((1u64 << 53) as f64)
     };
     let mut x: Vec<f64> = (0..n).map(|_| next_unit()).collect();
@@ -84,7 +88,9 @@ fn gam_gaussian_location_scale_matches_gamlss() {
 
     let mu_true = |t: f64| (two_pi * t).sin();
     let sigma_true = |t: f64| 0.1 + 0.2 * (two_pi * t).sin();
-    let y: Vec<f64> = (0..n).map(|i| mu_true(x[i]) + sigma_true(x[i]) * z[i]).collect();
+    let y: Vec<f64> = (0..n)
+        .map(|i| mu_true(x[i]) + sigma_true(x[i]) * z[i])
+        .collect();
 
     // ---- build the dataset (column 0 = x, column 1 = y) --------------------
     let headers: Vec<String> = vec!["x".to_string(), "y".to_string()];
@@ -102,9 +108,9 @@ fn gam_gaussian_location_scale_matches_gamlss() {
         noise_formula: Some("1 + s(x, bs='tp')".to_string()),
         ..FitConfig::default()
     };
-    let result =
-        fit_from_formula("y ~ s(x, bs='tp')", &ds, &cfg).expect("gam location-scale fit");
-    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult { fit, .. }) = result else {
+    let result = fit_from_formula("y ~ s(x, bs='tp')", &ds, &cfg).expect("gam location-scale fit");
+    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult { fit, .. }) = result
+    else {
         panic!("expected a Gaussian location-scale fit");
     };
 
@@ -183,7 +189,11 @@ fn gam_gaussian_location_scale_matches_gamlss() {
     let gamlss_mu = r.vector("mu");
     let gamlss_sigma = r.vector("sigma");
     assert_eq!(gamlss_mu.len(), grid_n, "gamlss mu grid length mismatch");
-    assert_eq!(gamlss_sigma.len(), grid_n, "gamlss sigma grid length mismatch");
+    assert_eq!(
+        gamlss_sigma.len(),
+        grid_n,
+        "gamlss sigma grid length mismatch"
+    );
     let gamlss_log_sigma: Vec<f64> = gamlss_sigma.iter().map(|&s| s.ln()).collect();
 
     // ---- compare the recovered smooth shapes on the grid -------------------

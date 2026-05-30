@@ -35,6 +35,7 @@
 //! interval (the exact analogue of mgcv's `se.fit`), so the comparison is
 //! apples-to-apples.
 
+use csv::StringRecord;
 use gam::estimate::{
     InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
     predict_gamwith_uncertainty,
@@ -44,7 +45,6 @@ use gam::types::LikelihoodSpec;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::{Array1, Array2};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -96,7 +96,8 @@ fn gam_confidence_interval_coverage_is_uniform_vs_mgcv_se_fit() {
 
     for rep in 0..N_REPLICATES {
         // Deterministic per-replicate seed derived from the base seed.
-        let mut rng = StdRng::seed_from_u64(BASE_SEED.wrapping_mul(1_000_003).wrapping_add(rep as u64));
+        let mut rng =
+            StdRng::seed_from_u64(BASE_SEED.wrapping_mul(1_000_003).wrapping_add(rep as u64));
         let unif = Uniform::new(0.0_f64, 1.0).expect("uniform [0,1]");
         let noise = Normal::new(0.0, NOISE_SD).expect("normal noise");
 
@@ -129,7 +130,8 @@ fn gam_confidence_interval_coverage_is_uniform_vs_mgcv_se_fit() {
             family: Some("gaussian".to_string()),
             ..FitConfig::default()
         };
-        let result = fit_from_formula("y ~ s(x, k=12)", &ds, &cfg).expect("gam gaussian smooth fit");
+        let result =
+            fit_from_formula("y ~ s(x, k=12)", &ds, &cfg).expect("gam gaussian smooth fit");
         let FitResult::Standard(fit) = result else {
             panic!("expected a standard GAM fit for y ~ s(x, k=12)");
         };
@@ -175,7 +177,11 @@ fn gam_confidence_interval_coverage_is_uniform_vs_mgcv_se_fit() {
         .expect("gam conditional-covariance interval prediction");
 
         // Score: is the TRUE eta inside [eta_lower, eta_upper] at each grid point?
-        assert_eq!(pred.eta_lower.len(), N_GRID, "gam eta_lower length mismatch");
+        assert_eq!(
+            pred.eta_lower.len(),
+            N_GRID,
+            "gam eta_lower length mismatch"
+        );
         for g in 0..N_GRID {
             let lo = pred.eta_lower[g];
             let hi = pred.eta_upper[g];
@@ -232,7 +238,11 @@ fn gam_confidence_interval_coverage_is_uniform_vs_mgcv_se_fit() {
         ),
     );
     let mgcv_cov = r.vector("mgcv_cov");
-    assert_eq!(mgcv_cov.len(), N_BINS, "mgcv must report one coverage per bin");
+    assert_eq!(
+        mgcv_cov.len(),
+        N_BINS,
+        "mgcv must report one coverage per bin"
+    );
 
     // ---- gam per-bin coverage ---------------------------------------------
     let gam_cov: Vec<f64> = (0..N_BINS)
@@ -259,9 +269,7 @@ fn gam_confidence_interval_coverage_is_uniform_vs_mgcv_se_fit() {
     eprintln!(
         "  gam  (min, mean, max) = ({gam_min:.3}, {gam_mean:.3}, {gam_max:.3})  range={gam_range:.3}"
     );
-    eprintln!(
-        "  mgcv (min, mean, max) = ({mgcv_min:.3}, {mgcv_mean:.3}, {mgcv_max:.3})"
-    );
+    eprintln!("  mgcv (min, mean, max) = ({mgcv_min:.3}, {mgcv_mean:.3}, {mgcv_max:.3})");
 
     // ---- principled, un-weakened bound: track the mature comparator -------
     // The load-bearing assertion is *agreement with mgcv*, bin by bin, on the

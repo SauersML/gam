@@ -251,10 +251,8 @@ impl RiemannianManifold for ProductManifold {
             // degenerate plane may legitimately error (e.g. SPD), so a zero
             // contribution must not be allowed to abort the product as a whole.
             if gram_r > GEOMETRY_EPS {
-                let k_r = component.sectional_curvature(
-                    point.slice(s![off..off + m]),
-                    (u_r, v_r),
-                )?;
+                let k_r =
+                    component.sectional_curvature(point.slice(s![off..off + m]), (u_r, v_r))?;
                 numerator += k_r * gram_r;
             }
             uu_total += uu_r;

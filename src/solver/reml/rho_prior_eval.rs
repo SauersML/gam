@@ -213,10 +213,7 @@ mod tests {
         let rho = Array1::from_vec(vec![-0.5, 0.25, 1.5]);
         let priors = vec![
             RhoPrior::Flat,
-            RhoPrior::Normal {
-                mean: 0.2,
-                sd: 0.8,
-            },
+            RhoPrior::Normal { mean: 0.2, sd: 0.8 },
             RhoPrior::GammaPrecision {
                 shape: 2.0,
                 rate: 0.5,
@@ -238,8 +235,8 @@ mod tests {
             // valid: the policy only changes the malformed branch.
             let hard = evaluate(prior, &rho, InvalidPriorPolicy::HardError)
                 .expect("valid prior must not error under HardError");
-            let sat = evaluate(prior, &rho, InvalidPriorPolicy::Saturate)
-                .expect("Saturate never errors");
+            let sat =
+                evaluate(prior, &rho, InvalidPriorPolicy::Saturate).expect("Saturate never errors");
             approx(hard.cost, sat.cost);
             assert_eq!(hard.gradient, sat.gradient);
             assert_eq!(hard.hessian, sat.hessian);

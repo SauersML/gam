@@ -35,11 +35,11 @@
 //! bound is NOT loosened to hide that — 0.02 AUC is the spec tolerance and the
 //! reference band is anchored on the references (never on gam itself).
 
-use gam::smooth::{build_term_collection_design, freeze_term_collection_from_design};
+use gam::inference::data::EncodedDataset;
 use gam::matrix::LinearOperator;
+use gam::smooth::{build_term_collection_design, freeze_term_collection_from_design};
 use gam::test_support::reference::{Column, run_python};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
-use gam::inference::data::EncodedDataset;
 use ndarray::Array2;
 use std::path::Path;
 
@@ -74,7 +74,10 @@ fn auc(scores: &[f64], labels: &[f64]) -> f64 {
     }
     let n_pos: f64 = labels.iter().filter(|&&y| y > 0.5).count() as f64;
     let n_neg = labels.len() as f64 - n_pos;
-    assert!(n_pos > 0.0 && n_neg > 0.0, "AUC needs both classes present in the test fold");
+    assert!(
+        n_pos > 0.0 && n_neg > 0.0,
+        "AUC needs both classes present in the test fold"
+    );
     let sum_ranks_pos: f64 = ranks
         .iter()
         .zip(labels)
@@ -91,9 +94,7 @@ fn subset_dataset(full: &EncodedDataset, rows: &[usize]) -> EncodedDataset {
     let p = full.headers.len();
     let mut values = Array2::<f64>::zeros((rows.len(), p));
     for (out_r, &src_r) in rows.iter().enumerate() {
-        values
-            .row_mut(out_r)
-            .assign(&full.values.row(src_r));
+        values.row_mut(out_r).assign(&full.values.row(src_r));
     }
     EncodedDataset {
         headers: full.headers.clone(),
@@ -148,7 +149,10 @@ fn gam_ebm_pygam_binomial_logit_holdout_agreement() {
     for f in 0..N_FOLDS {
         let train_rows: Vec<usize> = (0..n).filter(|&i| fold_of[i] != f).collect();
         let test_rows: Vec<usize> = (0..n).filter(|&i| fold_of[i] == f).collect();
-        assert!(!train_rows.is_empty() && !test_rows.is_empty(), "empty fold {f}");
+        assert!(
+            !train_rows.is_empty() && !test_rows.is_empty(),
+            "empty fold {f}"
+        );
 
         let train_ds = subset_dataset(&ds, &train_rows);
         let result = fit_from_formula("y ~ s(pc1, k=5) + s(pc2, k=5)", &train_ds, &cfg)
@@ -245,7 +249,11 @@ emit("pygam_mean_auc", [float(np.mean(pygam_auc))])
     let ebm_mean_auc = py.scalar("ebm_mean_auc");
     let pygam_mean_auc = py.scalar("pygam_mean_auc");
     assert_eq!(ebm_fold_auc.len(), N_FOLDS, "EBM emitted wrong fold count");
-    assert_eq!(pygam_fold_auc.len(), N_FOLDS, "pyGAM emitted wrong fold count");
+    assert_eq!(
+        pygam_fold_auc.len(),
+        N_FOLDS,
+        "pyGAM emitted wrong fold count"
+    );
 
     // ===================================================================
     // Three-way comparison.

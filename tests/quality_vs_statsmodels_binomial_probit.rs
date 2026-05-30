@@ -35,13 +35,13 @@
 //!     a strict separation that only holds if gam genuinely used the probit
 //!     inverse link.
 
+use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, relative_l2, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -152,8 +152,16 @@ emit("mu_logit", fit_mean(sm.families.links.Logit()))
     let r = run_python(&[Column::new("x1", &x1), Column::new("y", &y)], &body);
     let sm_mu_probit = r.vector("mu_probit");
     let sm_mu_logit = r.vector("mu_logit");
-    assert_eq!(sm_mu_probit.len(), NGRID, "statsmodels probit mean length mismatch");
-    assert_eq!(sm_mu_logit.len(), NGRID, "statsmodels logit mean length mismatch");
+    assert_eq!(
+        sm_mu_probit.len(),
+        NGRID,
+        "statsmodels probit mean length mismatch"
+    );
+    assert_eq!(
+        sm_mu_logit.len(),
+        NGRID,
+        "statsmodels logit mean length mismatch"
+    );
 
     // ---- compare on the fitted probability curve --------------------------
     let corr = pearson(&gam_mu, sm_mu_probit);
@@ -170,7 +178,10 @@ emit("mu_logit", fit_mean(sm.families.links.Logit()))
     // is the REML penalty + differing cubic-basis convention on a 3-df smooth,
     // which moves the fitted probabilities by at most a few percent of their
     // spread. So the curves must be near-collinear and L2-close.
-    assert!(corr > 0.99, "gam probit mean not collinear with statsmodels: pearson={corr:.5}");
+    assert!(
+        corr > 0.99,
+        "gam probit mean not collinear with statsmodels: pearson={corr:.5}"
+    );
     assert!(
         rel_probit < 0.05,
         "gam probit mean curve diverges from statsmodels probit: rel_l2={rel_probit:.4}"

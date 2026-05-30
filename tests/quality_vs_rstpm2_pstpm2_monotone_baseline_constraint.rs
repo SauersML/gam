@@ -51,6 +51,7 @@
 //! cumulative-hazard shape and the monotone guarantee holds on data with a
 //! steeply curved truth.
 
+use csv::StringRecord;
 use gam::families::survival_construction::{
     SurvivalTimeBasisConfig, evaluate_survival_time_basis_row,
     resolved_survival_time_basis_config_from_build,
@@ -62,7 +63,6 @@ use gam::{
     FitConfig, FitResult, SurvivalTransformationFitResult, encode_recordswith_inferred_schema,
     fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array2;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -171,12 +171,8 @@ fn gam_penalized_baseline_is_monotone_and_matches_pstpm2_on_cirrhosis() {
         time_num_internal_knots: N_INTERNAL_KNOTS,
         ..FitConfig::default()
     };
-    let result = fit_from_formula(
-        "Surv(time, event) ~ age_c + survmodel(spec=net)",
-        &ds,
-        &cfg,
-    )
-    .expect("gam penalized RP-baseline net-survival fit");
+    let result = fit_from_formula("Surv(time, event) ~ age_c + survmodel(spec=net)", &ds, &cfg)
+        .expect("gam penalized RP-baseline net-survival fit");
     let FitResult::SurvivalTransformation(fit) = result else {
         panic!("expected a survival-transformation (Royston-Parmar) fit result");
     };

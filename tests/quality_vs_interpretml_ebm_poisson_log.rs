@@ -97,7 +97,9 @@ fn gam_poisson_log_matches_interpretml_ebm() {
 
     // Deterministic 70/30 split by row index: every 10th-and-beyond-7 row is
     // test. fold[i] == 1.0 means TEST, 0.0 means TRAIN — handed verbatim to EBM.
-    let fold: Vec<f64> = (0..N).map(|i| if i % 10 >= 7 { 1.0 } else { 0.0 }).collect();
+    let fold: Vec<f64> = (0..N)
+        .map(|i| if i % 10 >= 7 { 1.0 } else { 0.0 })
+        .collect();
     let train_idx: Vec<usize> = (0..N).filter(|&i| fold[i] == 0.0).collect();
     let test_idx: Vec<usize> = (0..N).filter(|&i| fold[i] == 1.0).collect();
     assert!(
@@ -114,13 +116,7 @@ fn gam_poisson_log_matches_interpretml_ebm() {
         .collect();
     let rows: Vec<StringRecord> = train_idx
         .iter()
-        .map(|&i| {
-            StringRecord::from(vec![
-                x1[i].to_string(),
-                x2[i].to_string(),
-                y[i].to_string(),
-            ])
-        })
+        .map(|&i| StringRecord::from(vec![x1[i].to_string(), x2[i].to_string(), y[i].to_string()]))
         .collect();
     let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode train dataset");
     let col = ds.column_map();

@@ -90,8 +90,10 @@ fn gam_beta_logistic_link_matches_vgam_beta_parameterization() {
         initial_log_delta: log_delta,
     })
     .expect("construct true beta-logistic state");
-    let true_spec =
-        LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::BetaLogistic(true_state));
+    let true_spec = LikelihoodSpec::new(
+        ResponseFamily::Binomial,
+        InverseLink::BetaLogistic(true_state),
+    );
 
     let mut x1 = Vec::<f64>::with_capacity(N);
     let mut x2 = Vec::<f64>::with_capacity(N);

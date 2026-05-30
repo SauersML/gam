@@ -52,6 +52,7 @@ use crate::smooth::{
 use crate::solver::latent_cache::LatentRetractionRegistry;
 use crate::solver::riemannian_retraction::{ProductRetraction, RetractionKind};
 use crate::survival::PenaltyBlock;
+use crate::terms::AnalyticPenaltyRegistry;
 use crate::terms::latent_coord::{
     AuxPriorFamily, AuxPriorStrength, LatentCoordValues, LatentIdMode, LatentManifold,
 };
@@ -1214,9 +1215,7 @@ trait LocationScaleWorkflowAdapter {
     type Result;
 
     /// Lower the borrowed request into the family-agnostic workflow parts.
-    fn into_parts<'a>(
-        request: Self::Request<'a>,
-    ) -> LocationScaleWorkflowParts<'a, Self::Spec>;
+    fn into_parts<'a>(request: Self::Request<'a>) -> LocationScaleWorkflowParts<'a, Self::Spec>;
 
     /// Pilot fit on the bare (non-wiggle) spec, used to seed the wiggle-basis
     /// selector. This is the first work the wiggle path performs, so any
@@ -1316,9 +1315,7 @@ impl LocationScaleWorkflowAdapter for GaussianLocationScaleWorkflow {
     type Request<'a> = GaussianLocationScaleFitRequest<'a>;
     type Result = GaussianLocationScaleFitResult;
 
-    fn into_parts<'a>(
-        request: Self::Request<'a>,
-    ) -> LocationScaleWorkflowParts<'a, Self::Spec> {
+    fn into_parts<'a>(request: Self::Request<'a>) -> LocationScaleWorkflowParts<'a, Self::Spec> {
         LocationScaleWorkflowParts {
             data: request.data,
             spec: request.spec,
@@ -1419,9 +1416,7 @@ impl LocationScaleWorkflowAdapter for BinomialLocationScaleWorkflow {
     type Request<'a> = BinomialLocationScaleFitRequest<'a>;
     type Result = BinomialLocationScaleFitResult;
 
-    fn into_parts<'a>(
-        request: Self::Request<'a>,
-    ) -> LocationScaleWorkflowParts<'a, Self::Spec> {
+    fn into_parts<'a>(request: Self::Request<'a>) -> LocationScaleWorkflowParts<'a, Self::Spec> {
         LocationScaleWorkflowParts {
             data: request.data,
             spec: request.spec,
@@ -6880,11 +6875,7 @@ mod tests {
         }
     }
 
-    fn assert_block_states_match(
-        label: &str,
-        lhs: &UnifiedFitResult,
-        rhs: &UnifiedFitResult,
-    ) {
+    fn assert_block_states_match(label: &str, lhs: &UnifiedFitResult, rhs: &UnifiedFitResult) {
         assert_eq!(
             lhs.block_states.len(),
             rhs.block_states.len(),
@@ -7048,7 +7039,11 @@ mod tests {
             ref_solved.wiggle_knots.len(),
             "gaussian wiggle knot count must match the reference refit"
         );
-        for (k, (&ek, &rk)) in engine_knots.iter().zip(ref_solved.wiggle_knots.iter()).enumerate() {
+        for (k, (&ek, &rk)) in engine_knots
+            .iter()
+            .zip(ref_solved.wiggle_knots.iter())
+            .enumerate()
+        {
             assert!(
                 (ek - rk).abs() <= 1e-12 * (1.0 + rk.abs()),
                 "gaussian wiggle knot {k} diverged: engine {ek:.17e} vs reference {rk:.17e}"
@@ -7056,7 +7051,12 @@ mod tests {
         }
         // `beta_link_wiggle` is block 2 of the refit; the engine must extract it
         // exactly as the reference would read it off the same fit.
-        let ref_beta_link_wiggle = ref_solved.fit.fit.block_states.get(2).map(|b| b.beta.to_vec());
+        let ref_beta_link_wiggle = ref_solved
+            .fit
+            .fit
+            .block_states
+            .get(2)
+            .map(|b| b.beta.to_vec());
         assert_beta_link_wiggle_match(
             "gaussian",
             &engine_wiggle.beta_link_wiggle,
@@ -7170,13 +7170,22 @@ mod tests {
             ref_solved.wiggle_knots.len(),
             "binomial wiggle knot count must match the reference refit"
         );
-        for (k, (&ek, &rk)) in engine_knots.iter().zip(ref_solved.wiggle_knots.iter()).enumerate() {
+        for (k, (&ek, &rk)) in engine_knots
+            .iter()
+            .zip(ref_solved.wiggle_knots.iter())
+            .enumerate()
+        {
             assert!(
                 (ek - rk).abs() <= 1e-12 * (1.0 + rk.abs()),
                 "binomial wiggle knot {k} diverged: engine {ek:.17e} vs reference {rk:.17e}"
             );
         }
-        let ref_beta_link_wiggle = ref_solved.fit.fit.block_states.get(2).map(|b| b.beta.to_vec());
+        let ref_beta_link_wiggle = ref_solved
+            .fit
+            .fit
+            .block_states
+            .get(2)
+            .map(|b| b.beta.to_vec());
         assert_beta_link_wiggle_match(
             "binomial",
             &engine_wiggle.beta_link_wiggle,

@@ -5323,9 +5323,8 @@ fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifoldRho) -> f
     // logit) so the assembled H_tt is PD. See
     // `SAE_LOGIT_IDENTIFIABILITY_PRECISION`. Applied for all K and all modes;
     // it is the only assignment-prior term when `k_atoms() == 1`.
-    let identifiability: f64 = 0.5
-        * SAE_LOGIT_IDENTIFIABILITY_PRECISION
-        * target.iter().map(|&l| l * l).sum::<f64>();
+    let identifiability: f64 =
+        0.5 * SAE_LOGIT_IDENTIFIABILITY_PRECISION * target.iter().map(|&l| l * l).sum::<f64>();
     if assignment.k_atoms() == 1 {
         return identifiability;
     }
@@ -6346,12 +6345,12 @@ mod tests {
         // A mix of interior and clamp-saturated (|lat| >= π/2) latitudes,
         // including the exact boundary, which the gate treats as saturated.
         let coords = array![
-            [-1.2, -2.4],         // interior
-            [0.35, 0.9],          // interior
+            [-1.2, -2.4],                         // interior
+            [0.35, 0.9],                          // interior
             [std::f64::consts::FRAC_PI_2, 0.4],   // upper boundary (saturated)
             [-std::f64::consts::FRAC_PI_2, -1.1], // lower boundary (saturated)
-            [2.3, 0.7],           // beyond upper clamp (saturated)
-            [-3.0, 1.9],          // beyond lower clamp (saturated)
+            [2.3, 0.7],                           // beyond upper clamp (saturated)
+            [-3.0, 1.9],                          // beyond lower clamp (saturated)
         ];
 
         // The core evaluator adapter must be bit-identical to the shared engine
@@ -6365,8 +6364,8 @@ mod tests {
         for row in 0..coords.nrows() {
             let raw_lat = coords[[row, 0]];
             let lon = coords[[row, 1]];
-            let saturated = !(raw_lat > -std::f64::consts::FRAC_PI_2
-                && raw_lat < std::f64::consts::FRAC_PI_2);
+            let saturated =
+                !(raw_lat > -std::f64::consts::FRAC_PI_2 && raw_lat < std::f64::consts::FRAC_PI_2);
 
             let lat = raw_lat.clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
             let clat = lat.cos();

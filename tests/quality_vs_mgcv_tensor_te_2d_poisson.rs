@@ -50,7 +50,9 @@ fn gam_tensor_te_2d_poisson_matches_mgcv() {
         let zi = u.sample(&mut rng);
         let eta = (PI * xi).sin() * (PI * zi).cos(); // true log-mean
         let lambda = eta.exp().max(1e-12);
-        let draw: f64 = Poisson::new(lambda).expect("valid Poisson rate").sample(&mut rng);
+        let draw: f64 = Poisson::new(lambda)
+            .expect("valid Poisson rate")
+            .sample(&mut rng);
         x.push(xi);
         z.push(zi);
         count.push(draw);

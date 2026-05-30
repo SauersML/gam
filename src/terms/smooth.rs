@@ -1919,8 +1919,8 @@ fn realize_coefficient_groups(
         .collect::<Result<Vec<_>, BasisError>>()?;
     // Carrier-agnostic policy: unique non-empty labels, acyclic hierarchy,
     // child ⊆ parent, interior == union of children.
-    let hierarchy = ResolvedGroupHierarchy::build(resolved_groups)
-        .map_err(BasisError::InvalidInput)?;
+    let hierarchy =
+        ResolvedGroupHierarchy::build(resolved_groups).map_err(BasisError::InvalidInput)?;
 
     let mut penalty_specs: Vec<PenaltySpec> = design
         .penalties
@@ -10938,8 +10938,8 @@ impl SpatialAdaptiveExactFamily {
             AdaptiveComponent::Curvature => {
                 let group = cache.dimension * cache.dimension;
                 let d2_u = cache.d2.dot(&direction_local);
-                let direction_blocks = collocationhessian_blocks(&d2_u, cache.dimension)
-                    .map_err(|e| e.to_string())?;
+                let direction_blocks =
+                    collocationhessian_blocks(&d2_u, cache.dimension).map_err(|e| e.to_string())?;
                 let curv = &state.curvature;
                 let blocks = match drift {
                     HyperDriftKind::Rho => curv.directionalhessian_blocks(&direction_blocks),
@@ -27005,106 +27005,105 @@ mod tests {
         let range = cache.coeff_global_range.clone();
 
         // Independent reference assembly for one (component, kind) parts triple.
-        let reference_parts =
-            |component: AdaptiveComponent,
-             kind: HyperDerivativeKind|
-             -> (f64, Array1<f64>, Array2<f64>) {
-                let (objective, grad_local, hess_local) = match component {
-                    AdaptiveComponent::Magnitude => {
-                        let lambda = params.lambda[0];
-                        let mag = &state.magnitude;
-                        let (obj, gc, hd) = match kind {
-                            HyperDerivativeKind::Rho => (
-                                mag.penalty_value(),
-                                mag.betagradient_coeff(),
-                                mag.betahessian_diag(),
-                            ),
-                            HyperDerivativeKind::LogEpsilonFirst => (
-                                mag.log_epsilon_gradient_terms().sum(),
-                                mag.log_epsilon_betagradient_coeff(),
-                                mag.log_epsilon_betahessian_diag(),
-                            ),
-                            HyperDerivativeKind::LogEpsilonSecond => (
-                                mag.log_epsilon_hessian_terms().sum(),
-                                mag.log_epsilon_beta_mixed_second_coeff(),
-                                mag.log_epsilon_betahessian_second_diag(),
-                            ),
-                        };
-                        (
-                            lambda * obj,
-                            lambda * scalar_operatorgradient(&cache.d0, &gc),
-                            lambda * scalar_operatorhessian(&cache.d0, &hd),
-                        )
-                    }
-                    AdaptiveComponent::Gradient => {
-                        let lambda = params.lambda[1];
-                        let grad = &state.gradient;
-                        let (obj, gb, hb) = match kind {
-                            HyperDerivativeKind::Rho => (
-                                grad.penalty_value(),
-                                grad.betagradient_blocks(),
-                                grad.betahessian_blocks(),
-                            ),
-                            HyperDerivativeKind::LogEpsilonFirst => (
-                                grad.log_epsilon_gradient_terms().sum(),
-                                grad.log_epsilon_betagradient_blocks(),
-                                grad.log_epsilon_betahessian_blocks(),
-                            ),
-                            HyperDerivativeKind::LogEpsilonSecond => (
-                                grad.log_epsilon_hessian_terms().sum(),
-                                grad.log_epsilon_beta_mixed_second_blocks(),
-                                grad.log_epsilon_betahessian_second_blocks(),
-                            ),
-                        };
-                        (
-                            lambda * obj,
-                            lambda
-                                * grouped_operatorgradient(&cache.d1, cache.dimension, &gb)
-                                    .expect("grouped gradient"),
-                            lambda
-                                * grouped_operatorhessian(&cache.d1, cache.dimension, &hb)
-                                    .expect("grouped hessian"),
-                        )
-                    }
-                    AdaptiveComponent::Curvature => {
-                        let lambda = params.lambda[2];
-                        let group = cache.dimension * cache.dimension;
-                        let curv = &state.curvature;
-                        let (obj, gb, hb) = match kind {
-                            HyperDerivativeKind::Rho => (
-                                curv.penalty_value(),
-                                curv.betagradient_blocks(),
-                                curv.betahessian_blocks(),
-                            ),
-                            HyperDerivativeKind::LogEpsilonFirst => (
-                                curv.log_epsilon_gradient_terms().sum(),
-                                curv.log_epsilon_betagradient_blocks(),
-                                curv.log_epsilon_betahessian_blocks(),
-                            ),
-                            HyperDerivativeKind::LogEpsilonSecond => (
-                                curv.log_epsilon_hessian_terms().sum(),
-                                curv.log_epsilon_beta_mixed_second_blocks(),
-                                curv.log_epsilon_betahessian_second_blocks(),
-                            ),
-                        };
-                        (
-                            lambda * obj,
-                            lambda
-                                * grouped_operatorgradient(&cache.d2, group, &gb)
-                                    .expect("grouped gradient"),
-                            lambda
-                                * grouped_operatorhessian(&cache.d2, group, &hb)
-                                    .expect("grouped hessian"),
-                        )
-                    }
-                };
-                let mut grad = Array1::<f64>::zeros(p);
-                grad.slice_mut(s![range.clone()]).assign(&grad_local);
-                let mut hess = Array2::<f64>::zeros((p, p));
-                hess.slice_mut(s![range.clone(), range.clone()])
-                    .assign(&hess_local);
-                (objective, grad, hess)
+        let reference_parts = |component: AdaptiveComponent,
+                               kind: HyperDerivativeKind|
+         -> (f64, Array1<f64>, Array2<f64>) {
+            let (objective, grad_local, hess_local) = match component {
+                AdaptiveComponent::Magnitude => {
+                    let lambda = params.lambda[0];
+                    let mag = &state.magnitude;
+                    let (obj, gc, hd) = match kind {
+                        HyperDerivativeKind::Rho => (
+                            mag.penalty_value(),
+                            mag.betagradient_coeff(),
+                            mag.betahessian_diag(),
+                        ),
+                        HyperDerivativeKind::LogEpsilonFirst => (
+                            mag.log_epsilon_gradient_terms().sum(),
+                            mag.log_epsilon_betagradient_coeff(),
+                            mag.log_epsilon_betahessian_diag(),
+                        ),
+                        HyperDerivativeKind::LogEpsilonSecond => (
+                            mag.log_epsilon_hessian_terms().sum(),
+                            mag.log_epsilon_beta_mixed_second_coeff(),
+                            mag.log_epsilon_betahessian_second_diag(),
+                        ),
+                    };
+                    (
+                        lambda * obj,
+                        lambda * scalar_operatorgradient(&cache.d0, &gc),
+                        lambda * scalar_operatorhessian(&cache.d0, &hd),
+                    )
+                }
+                AdaptiveComponent::Gradient => {
+                    let lambda = params.lambda[1];
+                    let grad = &state.gradient;
+                    let (obj, gb, hb) = match kind {
+                        HyperDerivativeKind::Rho => (
+                            grad.penalty_value(),
+                            grad.betagradient_blocks(),
+                            grad.betahessian_blocks(),
+                        ),
+                        HyperDerivativeKind::LogEpsilonFirst => (
+                            grad.log_epsilon_gradient_terms().sum(),
+                            grad.log_epsilon_betagradient_blocks(),
+                            grad.log_epsilon_betahessian_blocks(),
+                        ),
+                        HyperDerivativeKind::LogEpsilonSecond => (
+                            grad.log_epsilon_hessian_terms().sum(),
+                            grad.log_epsilon_beta_mixed_second_blocks(),
+                            grad.log_epsilon_betahessian_second_blocks(),
+                        ),
+                    };
+                    (
+                        lambda * obj,
+                        lambda
+                            * grouped_operatorgradient(&cache.d1, cache.dimension, &gb)
+                                .expect("grouped gradient"),
+                        lambda
+                            * grouped_operatorhessian(&cache.d1, cache.dimension, &hb)
+                                .expect("grouped hessian"),
+                    )
+                }
+                AdaptiveComponent::Curvature => {
+                    let lambda = params.lambda[2];
+                    let group = cache.dimension * cache.dimension;
+                    let curv = &state.curvature;
+                    let (obj, gb, hb) = match kind {
+                        HyperDerivativeKind::Rho => (
+                            curv.penalty_value(),
+                            curv.betagradient_blocks(),
+                            curv.betahessian_blocks(),
+                        ),
+                        HyperDerivativeKind::LogEpsilonFirst => (
+                            curv.log_epsilon_gradient_terms().sum(),
+                            curv.log_epsilon_betagradient_blocks(),
+                            curv.log_epsilon_betahessian_blocks(),
+                        ),
+                        HyperDerivativeKind::LogEpsilonSecond => (
+                            curv.log_epsilon_hessian_terms().sum(),
+                            curv.log_epsilon_beta_mixed_second_blocks(),
+                            curv.log_epsilon_betahessian_second_blocks(),
+                        ),
+                    };
+                    (
+                        lambda * obj,
+                        lambda
+                            * grouped_operatorgradient(&cache.d2, group, &gb)
+                                .expect("grouped gradient"),
+                        lambda
+                            * grouped_operatorhessian(&cache.d2, group, &hb)
+                                .expect("grouped hessian"),
+                    )
+                }
             };
+            let mut grad = Array1::<f64>::zeros(p);
+            grad.slice_mut(s![range.clone()]).assign(&grad_local);
+            let mut hess = Array2::<f64>::zeros((p, p));
+            hess.slice_mut(s![range.clone(), range.clone()])
+                .assign(&hess_local);
+            (objective, grad, hess)
+        };
 
         let components = [
             AdaptiveComponent::Magnitude,
@@ -27127,8 +27126,14 @@ mod tests {
                     obj_new, obj_ref,
                     "objective mismatch for {component:?}/{kind:?}"
                 );
-                assert_eq!(grad_new, grad_ref, "gradient mismatch for {component:?}/{kind:?}");
-                assert_eq!(hess_new, hess_ref, "hessian mismatch for {component:?}/{kind:?}");
+                assert_eq!(
+                    grad_new, grad_ref,
+                    "gradient mismatch for {component:?}/{kind:?}"
+                );
+                assert_eq!(
+                    hess_new, hess_ref,
+                    "hessian mismatch for {component:?}/{kind:?}"
+                );
             }
         }
 
@@ -27140,56 +27145,58 @@ mod tests {
             }
             d
         };
-        let reference_drift = |component: AdaptiveComponent, drift: HyperDriftKind| -> Array2<f64> {
-            let direction_local = direction.slice(s![range.clone()]);
-            let local = match component {
-                AdaptiveComponent::Magnitude => {
-                    let d0_u = cache.d0.dot(&direction_local);
-                    let mag = &state.magnitude;
-                    let diag = match drift {
-                        HyperDriftKind::Rho => mag.directionalhessian_diag(&d0_u),
-                        HyperDriftKind::LogEpsilon => {
-                            mag.log_epsilon_betahessian_directional_diag(&d0_u)
-                        }
-                    };
-                    params.lambda[0] * scalar_operatorhessian(&cache.d0, &diag)
-                }
-                AdaptiveComponent::Gradient => {
-                    let d1_u = cache.d1.dot(&direction_local);
-                    let blocks_in = collocationgradient_blocks(&d1_u, cache.dimension)
-                        .expect("collocation gradient blocks");
-                    let grad = &state.gradient;
-                    let blocks = match drift {
-                        HyperDriftKind::Rho => grad.directionalhessian_blocks(&blocks_in),
-                        HyperDriftKind::LogEpsilon => {
-                            grad.log_epsilon_betahessian_directional_blocks(&blocks_in)
-                        }
-                    };
-                    params.lambda[1]
-                        * grouped_operatorhessian(&cache.d1, cache.dimension, &blocks)
-                            .expect("grouped hessian")
-                }
-                AdaptiveComponent::Curvature => {
-                    let group = cache.dimension * cache.dimension;
-                    let d2_u = cache.d2.dot(&direction_local);
-                    let blocks_in = collocationhessian_blocks(&d2_u, cache.dimension)
-                        .expect("collocation hessian blocks");
-                    let curv = &state.curvature;
-                    let blocks = match drift {
-                        HyperDriftKind::Rho => curv.directionalhessian_blocks(&blocks_in),
-                        HyperDriftKind::LogEpsilon => {
-                            curv.log_epsilon_betahessian_directional_blocks(&blocks_in)
-                        }
-                    };
-                    params.lambda[2]
-                        * grouped_operatorhessian(&cache.d2, group, &blocks)
-                            .expect("grouped hessian")
-                }
+        let reference_drift =
+            |component: AdaptiveComponent, drift: HyperDriftKind| -> Array2<f64> {
+                let direction_local = direction.slice(s![range.clone()]);
+                let local = match component {
+                    AdaptiveComponent::Magnitude => {
+                        let d0_u = cache.d0.dot(&direction_local);
+                        let mag = &state.magnitude;
+                        let diag = match drift {
+                            HyperDriftKind::Rho => mag.directionalhessian_diag(&d0_u),
+                            HyperDriftKind::LogEpsilon => {
+                                mag.log_epsilon_betahessian_directional_diag(&d0_u)
+                            }
+                        };
+                        params.lambda[0] * scalar_operatorhessian(&cache.d0, &diag)
+                    }
+                    AdaptiveComponent::Gradient => {
+                        let d1_u = cache.d1.dot(&direction_local);
+                        let blocks_in = collocationgradient_blocks(&d1_u, cache.dimension)
+                            .expect("collocation gradient blocks");
+                        let grad = &state.gradient;
+                        let blocks = match drift {
+                            HyperDriftKind::Rho => grad.directionalhessian_blocks(&blocks_in),
+                            HyperDriftKind::LogEpsilon => {
+                                grad.log_epsilon_betahessian_directional_blocks(&blocks_in)
+                            }
+                        };
+                        params.lambda[1]
+                            * grouped_operatorhessian(&cache.d1, cache.dimension, &blocks)
+                                .expect("grouped hessian")
+                    }
+                    AdaptiveComponent::Curvature => {
+                        let group = cache.dimension * cache.dimension;
+                        let d2_u = cache.d2.dot(&direction_local);
+                        let blocks_in = collocationhessian_blocks(&d2_u, cache.dimension)
+                            .expect("collocation hessian blocks");
+                        let curv = &state.curvature;
+                        let blocks = match drift {
+                            HyperDriftKind::Rho => curv.directionalhessian_blocks(&blocks_in),
+                            HyperDriftKind::LogEpsilon => {
+                                curv.log_epsilon_betahessian_directional_blocks(&blocks_in)
+                            }
+                        };
+                        params.lambda[2]
+                            * grouped_operatorhessian(&cache.d2, group, &blocks)
+                                .expect("grouped hessian")
+                    }
+                };
+                let mut out = Array2::<f64>::zeros((p, p));
+                out.slice_mut(s![range.clone(), range.clone()])
+                    .assign(&local);
+                out
             };
-            let mut out = Array2::<f64>::zeros((p, p));
-            out.slice_mut(s![range.clone(), range.clone()]).assign(&local);
-            out
-        };
 
         for &component in &components {
             for &drift in &[HyperDriftKind::Rho, HyperDriftKind::LogEpsilon] {
@@ -27209,9 +27216,18 @@ mod tests {
         // spec equals the `Rho` block eval; on a shared `log epsilon` spec it
         // equals the summed `LogEpsilonFirst` blocks.
         for (kind, component) in [
-            (SpatialAdaptiveHyperKind::LogLambdaMagnitude, AdaptiveComponent::Magnitude),
-            (SpatialAdaptiveHyperKind::LogLambdaGradient, AdaptiveComponent::Gradient),
-            (SpatialAdaptiveHyperKind::LogLambdaCurvature, AdaptiveComponent::Curvature),
+            (
+                SpatialAdaptiveHyperKind::LogLambdaMagnitude,
+                AdaptiveComponent::Magnitude,
+            ),
+            (
+                SpatialAdaptiveHyperKind::LogLambdaGradient,
+                AdaptiveComponent::Gradient,
+            ),
+            (
+                SpatialAdaptiveHyperKind::LogLambdaCurvature,
+                AdaptiveComponent::Curvature,
+            ),
         ] {
             let hyper = SpatialAdaptiveHyperSpec {
                 cache_index: 0,
@@ -27220,16 +27236,26 @@ mod tests {
             let (obj_disp, grad_disp, hess_disp) = family
                 .adaptive_hyper_parts(&eval, hyper)
                 .expect("hyper parts");
-            let (obj_ref, grad_ref, hess_ref) = reference_parts(component, HyperDerivativeKind::Rho);
+            let (obj_ref, grad_ref, hess_ref) =
+                reference_parts(component, HyperDerivativeKind::Rho);
             assert_eq!(obj_disp, obj_ref);
             assert_eq!(grad_disp, grad_ref);
             assert_eq!(hess_disp, hess_ref);
         }
 
         for (kind, component) in [
-            (SpatialAdaptiveHyperKind::LogEpsilonMagnitude, AdaptiveComponent::Magnitude),
-            (SpatialAdaptiveHyperKind::LogEpsilonGradient, AdaptiveComponent::Gradient),
-            (SpatialAdaptiveHyperKind::LogEpsilonCurvature, AdaptiveComponent::Curvature),
+            (
+                SpatialAdaptiveHyperKind::LogEpsilonMagnitude,
+                AdaptiveComponent::Magnitude,
+            ),
+            (
+                SpatialAdaptiveHyperKind::LogEpsilonGradient,
+                AdaptiveComponent::Gradient,
+            ),
+            (
+                SpatialAdaptiveHyperKind::LogEpsilonCurvature,
+                AdaptiveComponent::Curvature,
+            ),
         ] {
             let hyper = SpatialAdaptiveHyperSpec {
                 cache_index: 0,

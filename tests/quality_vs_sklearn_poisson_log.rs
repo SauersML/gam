@@ -72,13 +72,7 @@ fn gam_poisson_log_matches_statsmodels_glm() {
     // ---- fit with gam: y ~ s(x1, k=5) + s(x2, k=5), Poisson(log), REML ------
     let headers = ["x1", "x2", "y"].into_iter().map(String::from).collect();
     let rows: Vec<StringRecord> = (0..N)
-        .map(|i| {
-            StringRecord::from(vec![
-                x1[i].to_string(),
-                x2[i].to_string(),
-                y[i].to_string(),
-            ])
-        })
+        .map(|i| StringRecord::from(vec![x1[i].to_string(), x2[i].to_string(), y[i].to_string()]))
         .collect();
     let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode poisson dataset");
     let col = ds.column_map();
@@ -89,7 +83,8 @@ fn gam_poisson_log_matches_statsmodels_glm() {
         family: Some("poisson".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ s(x1, k=5) + s(x2, k=5)", &ds, &cfg).expect("gam poisson fit");
+    let result =
+        fit_from_formula("y ~ s(x1, k=5) + s(x2, k=5)", &ds, &cfg).expect("gam poisson fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for the Poisson(log) family");
     };

@@ -31,9 +31,9 @@ use gam::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, FamilyEvaluation, ParameterBlockSpec,
     ParameterBlockState,
 };
+use gam::init_parallelism;
 use gam::matrix::{DenseDesignMatrix, DesignMatrix};
 use gam::test_support::reference::{Column, pearson, relative_l2, run_python};
-use gam::init_parallelism;
 use ndarray::{Array1, Array2};
 
 /// Poisson likelihood with the identity link `μ = η`.
@@ -114,7 +114,9 @@ fn custom_poisson_identity_link_matches_statsmodels() {
     let n = 200usize;
     let mut state: u64 = 0x9E3779B97F4A7C15;
     let mut next_u01 = || {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         // top 53 bits -> (0,1)
         ((state >> 11) as f64 + 0.5) / (1u64 << 53) as f64
     };
@@ -191,7 +193,12 @@ fn custom_poisson_identity_link_matches_statsmodels() {
         gam::custom_family::fit_custom_family(&family, std::slice::from_ref(&spec), &options)
             .expect("gam custom Poisson-identity fit");
     let beta_gam: Vec<f64> = result.blocks[0].beta.to_vec();
-    assert_eq!(beta_gam.len(), p, "gam returned {} coeffs, expected {p}", beta_gam.len());
+    assert_eq!(
+        beta_gam.len(),
+        p,
+        "gam returned {} coeffs, expected {p}",
+        beta_gam.len()
+    );
 
     // Fitted means under the identity link: μ = X·β.
     let beta_gam_arr = Array1::from(beta_gam.clone());
@@ -231,7 +238,12 @@ emit("deviance", [float(res.deviance)])
     let fitted_sm = r.vector("fitted");
     let dev_sm = r.scalar("deviance");
 
-    assert_eq!(beta_sm.len(), p, "statsmodels returned {} coeffs", beta_sm.len());
+    assert_eq!(
+        beta_sm.len(),
+        p,
+        "statsmodels returned {} coeffs",
+        beta_sm.len()
+    );
     assert_eq!(fitted_sm.len(), n, "statsmodels fitted length mismatch");
 
     // ---- compare -----------------------------------------------------------

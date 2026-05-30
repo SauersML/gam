@@ -66,8 +66,12 @@ fn gam_alo_eta_tilde_matches_loo_psis_on_lidar() {
 
     // ALO leave-one-out linear predictor. For Gaussian-identity, eta_tilde_i is
     // the predicted MEAN for observation i when that observation is held out.
-    let alo = compute_alo_diagnostics_from_fit(&fit.fit, ds.values.column(logratio_idx), LinkFunction::Identity)
-        .expect("gam ALO diagnostics");
+    let alo = compute_alo_diagnostics_from_fit(
+        &fit.fit,
+        ds.values.column(logratio_idx),
+        LinkFunction::Identity,
+    )
+    .expect("gam ALO diagnostics");
     let eta_tilde: Vec<f64> = alo.eta_tilde.to_vec();
     assert_eq!(eta_tilde.len(), n, "ALO eta_tilde length mismatch");
 
@@ -83,7 +87,10 @@ fn gam_alo_eta_tilde_matches_loo_psis_on_lidar() {
         .map(|(y, m)| (y - m) * (y - m))
         .sum();
     let phi = rss / ((n as f64) - edf).max(1.0);
-    assert!(phi.is_finite() && phi > 0.0, "gam scale must be positive finite");
+    assert!(
+        phi.is_finite() && phi > 0.0,
+        "gam scale must be positive finite"
+    );
 
     // Pointwise Gaussian LOO log-likelihood implied by ALO's eta_tilde:
     //   L_i = -0.5*ln(2*pi*phi) - 0.5*(y_i - eta_tilde_i)^2 / phi.
@@ -157,7 +164,11 @@ fn gam_alo_eta_tilde_matches_loo_psis_on_lidar() {
 
     let loglik_loo_exact = r.vector("loglik_loo_exact");
     let elpd_loo = r.vector("elpd_loo");
-    assert_eq!(loglik_loo_exact.len(), n, "exact-LOO loglik length mismatch");
+    assert_eq!(
+        loglik_loo_exact.len(),
+        n,
+        "exact-LOO loglik length mismatch"
+    );
     assert_eq!(elpd_loo.len(), n, "PSIS elpd length mismatch");
 
     // ---- metric 1: Pearson of pointwise LOO log-likelihood ----------------
@@ -215,7 +226,10 @@ fn gam_alo_eta_tilde_matches_loo_psis_on_lidar() {
     // genuine O(v_i/phi) PSIS-vs-conditional difference, tight enough that a
     // real divergence in eta_tilde (which moves the residual term, the dominant
     // contribution) blows straight through it.
-    assert!(loglik_spread > 1.0, "loglik spread should be O(1+): {loglik_spread:.5}");
+    assert!(
+        loglik_spread > 1.0,
+        "loglik spread should be O(1+): {loglik_spread:.5}"
+    );
     assert!(
         elpd_rmse < 0.1 * loglik_spread,
         "ALO loglik vs loo PSIS-LOO elpd_loo diverge in level: \

@@ -192,7 +192,11 @@ fn gam_penalized_binomial_posterior_matches_pymc_and_concentrates_with_lambda() 
     let csv_path = dir.join("data.csv");
     std::fs::write(&csv_path, &records).expect("write synthetic csv");
     let ds = load_csvwith_inferred_schema(&csv_path).expect("load synthetic csv");
-    assert_eq!(ds.values.nrows(), n, "loader must preserve every synthetic row");
+    assert_eq!(
+        ds.values.nrows(),
+        n,
+        "loader must preserve every synthetic row"
+    );
 
     // ---- fit gam once to materialise the s(x) basis + roughness penalty ----
     let cfg = FitConfig {
@@ -220,7 +224,11 @@ fn gam_penalized_binomial_posterior_matches_pymc_and_concentrates_with_lambda() 
         (5..=20).contains(&p),
         "s(x) default basis should give a modest coefficient count, got p={p}"
     );
-    assert_eq!(design.penalties.len(), 1, "s(x) should yield one penalty block");
+    assert_eq!(
+        design.penalties.len(),
+        1,
+        "s(x) should yield one penalty block"
+    );
 
     // Identify the penalized subspace: columns whose diagonal penalty weight is
     // non-trivial. These are the "high-order" / roughness-bearing coefficients

@@ -172,10 +172,7 @@ fn lognormal_hazard_multiplier_marginal_loglik_matches_r_quadrature() {
     //   event   : L = h_0 * E[exp(U) * exp(-M*exp(U))]
     // statmod::gauss.quad.prob(dist="normal") supplies the (node,weight) rule for
     // E[g(U)] under N(mu,sigma); 128 nodes drives the quadrature error to ~1e-13.
-    let cols = [
-        Column::new("M", &cum_hazard),
-        Column::new("event", &events),
-    ];
+    let cols = [Column::new("M", &cum_hazard), Column::new("event", &events)];
     let r = run_r(
         &cols,
         r#"

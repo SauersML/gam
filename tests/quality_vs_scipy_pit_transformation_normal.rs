@@ -31,7 +31,9 @@
 //! or its derivative basis is inconsistent — all real bugs, never a loosened bound.
 
 use gam::smooth::TermCollectionDesign;
-use gam::terms::basis::{BasisOptions, Dense, KnotSource, create_basis, create_ispline_derivative_dense};
+use gam::terms::basis::{
+    BasisOptions, Dense, KnotSource, create_basis, create_ispline_derivative_dense,
+};
 use gam::test_support::reference::{Column, run_python};
 use gam::transformation_normal::{TRANSFORMATION_MONOTONICITY_EPS, TransformationNormalFitResult};
 use gam::{
@@ -154,8 +156,8 @@ fn reconstruct_transform(
     let shape_val = raw_val_arc.as_ref().dot(resp_transform);
 
     // Response derivative basis: [0, M_1(y)·T, ...].
-    let raw_deriv =
-        create_ispline_derivative_dense(y_arr.view(), &resp_knots, degree, 1).expect("M-spline basis");
+    let raw_deriv = create_ispline_derivative_dense(y_arr.view(), &resp_knots, degree, 1)
+        .expect("M-spline basis");
     let shape_deriv = raw_deriv.dot(resp_transform);
 
     // Finite-support endpoint bases (constant column = 1; shape part is 0 at the

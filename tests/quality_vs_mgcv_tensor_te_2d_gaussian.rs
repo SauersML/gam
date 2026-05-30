@@ -32,13 +32,13 @@
 //! bounds below is a real bug in gam's tensor-product construction, not a
 //! tolerance artifact.
 
+use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, relative_l2, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array2;
 
 #[test]
@@ -57,8 +57,8 @@ fn gam_te_2d_smooth_matches_mgcv_on_separable_grid() {
         for j in 0..G {
             let xi = i as f64 / (G as f64 - 1.0);
             let zj = j as f64 / (G as f64 - 1.0);
-            let f = (3.0 * std::f64::consts::PI * xi).sin()
-                * (3.0 * std::f64::consts::PI * zj).cos();
+            let f =
+                (3.0 * std::f64::consts::PI * xi).sin() * (3.0 * std::f64::consts::PI * zj).cos();
             x.push(xi);
             z.push(zj);
             y.push(f);
@@ -68,13 +68,7 @@ fn gam_te_2d_smooth_matches_mgcv_on_separable_grid() {
     // ---- fit with gam: y ~ te(x, z, k=8), REML ----------------------------
     let headers = ["x", "z", "y"].into_iter().map(String::from).collect();
     let rows: Vec<StringRecord> = (0..n)
-        .map(|r| {
-            StringRecord::from(vec![
-                x[r].to_string(),
-                z[r].to_string(),
-                y[r].to_string(),
-            ])
-        })
+        .map(|r| StringRecord::from(vec![x[r].to_string(), z[r].to_string(), y[r].to_string()]))
         .collect();
     let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode tensor dataset");
     let col = ds.column_map();

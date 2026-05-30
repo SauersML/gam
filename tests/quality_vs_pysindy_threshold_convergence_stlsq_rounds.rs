@@ -60,9 +60,17 @@ fn rhs(s: [f64; 3]) -> [f64; 3] {
 
 fn rk4_step(s: [f64; 3], dt: f64) -> [f64; 3] {
     let k1 = rhs(s);
-    let s2 = [s[0] + 0.5 * dt * k1[0], s[1] + 0.5 * dt * k1[1], s[2] + 0.5 * dt * k1[2]];
+    let s2 = [
+        s[0] + 0.5 * dt * k1[0],
+        s[1] + 0.5 * dt * k1[1],
+        s[2] + 0.5 * dt * k1[2],
+    ];
     let k2 = rhs(s2);
-    let s3 = [s[0] + 0.5 * dt * k2[0], s[1] + 0.5 * dt * k2[1], s[2] + 0.5 * dt * k2[2]];
+    let s3 = [
+        s[0] + 0.5 * dt * k2[0],
+        s[1] + 0.5 * dt * k2[1],
+        s[2] + 0.5 * dt * k2[2],
+    ];
     let k3 = rhs(s3);
     let s4 = [s[0] + dt * k3[0], s[1] + dt * k3[1], s[2] + dt * k3[2]];
     let k4 = rhs(s4);
@@ -82,7 +90,9 @@ fn stlsq_threshold_convergence_matches_pysindy() {
     // to gam (as ndarray) and pysindy (as CSV columns) — no divergence.
     let mut seed = 42u64;
     let mut unit = || {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((seed >> 33) as f64) / ((1u64 << 31) as f64) - 1.0 // in [-1, 1)
     };
     let mut s = [unit(), unit(), unit()];
@@ -226,8 +236,16 @@ emit("mask", mask_all)
     let py_card = ref_res.vector("card");
     let py_mask = ref_res.vector("mask");
     let py_rounds = ref_res.vector("rounds");
-    assert_eq!(py_card.len(), TOLS.len(), "pysindy must report one cardinality per tol");
-    assert_eq!(py_mask.len(), TOLS.len() * p * dd, "pysindy mask layout mismatch");
+    assert_eq!(
+        py_card.len(),
+        TOLS.len(),
+        "pysindy must report one cardinality per tol"
+    );
+    assert_eq!(
+        py_mask.len(),
+        TOLS.len() * p * dd,
+        "pysindy mask layout mismatch"
+    );
 
     for (ti, &tol) in TOLS.iter().enumerate() {
         eprintln!(
@@ -276,12 +294,18 @@ emit("mask", mask_all)
         assert!(
             gam_card[ti] <= gam_card[ti - 1],
             "gam support cardinality must not grow as tol loosens: tol {} -> {} gave {} -> {}",
-            TOLS[ti - 1], TOLS[ti], gam_card[ti - 1], gam_card[ti]
+            TOLS[ti - 1],
+            TOLS[ti],
+            gam_card[ti - 1],
+            gam_card[ti]
         );
         assert!(
             gam_rounds[ti] <= gam_rounds[ti - 1] + 1,
             "gam rounds should not increase as tol loosens: tol {} -> {} gave {} -> {}",
-            TOLS[ti - 1], TOLS[ti], gam_rounds[ti - 1], gam_rounds[ti]
+            TOLS[ti - 1],
+            TOLS[ti],
+            gam_rounds[ti - 1],
+            gam_rounds[ti]
         );
     }
 

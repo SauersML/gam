@@ -30,13 +30,13 @@
 //! sphere-smoothing tool ecosystem (no integrated rotation-equivariant GAM
 //! reference exists) is itself part of the finding documented here.
 
+use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, relative_l2, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -48,11 +48,7 @@ use rand_distr::{Distribution, Normal, Uniform};
 fn latlon_to_xyz(lat_deg: f64, lon_deg: f64) -> [f64; 3] {
     let lat = lat_deg.to_radians();
     let lon = lon_deg.to_radians();
-    [
-        lat.cos() * lon.cos(),
-        lat.cos() * lon.sin(),
-        lat.sin(),
-    ]
+    [lat.cos() * lon.cos(), lat.cos() * lon.sin(), lat.sin()]
 }
 
 /// Unit vector on S² → geographic (lat, lon) in degrees, inverse of the map

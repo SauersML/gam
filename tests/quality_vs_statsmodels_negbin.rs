@@ -39,11 +39,13 @@
 //!      agree. A model that ignored theta (e.g. plain Poisson variance) would
 //!      drive this far above 1.2.
 
+use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, run_python};
-use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism};
-use csv::StringRecord;
+use gam::{
+    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+};
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -104,8 +106,7 @@ fn gam_negbin_matches_statsmodels_overdispersed_counts() {
         negative_binomial_theta: Some(THETA),
         ..FitConfig::default()
     };
-    let result =
-        fit_from_formula("y ~ s(x, k=5) + linear(z)", &ds, &cfg).expect("gam negbin fit");
+    let result = fit_from_formula("y ~ s(x, k=5) + linear(z)", &ds, &cfg).expect("gam negbin fit");
     let FitResult::Standard(fit) = result else {
         panic!("negative-binomial GLM should produce a Standard fit");
     };

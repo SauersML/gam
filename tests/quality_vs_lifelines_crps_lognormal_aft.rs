@@ -45,13 +45,13 @@
 //! (mu_i, sigma_i) correlation check is gauge-invariant for correlation (an
 //! additive constant cannot change Pearson r), so it uses gam's raw location.
 
+use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array2;
 
 /// Monte-Carlo CRPS for one observed time `t_obs` against a predictive sample
@@ -173,14 +173,16 @@ fn gam_lognormal_aft_crps_calibration_matches_lifelines() {
         train_grid[[i, x_idx]] = x[i];
         train_grid[[i, z_idx]] = z[i];
     }
-    let loc_design = build_term_collection_design(train_grid.view(), &fit.fit.resolved_thresholdspec)
-        .expect("rebuild location (threshold) design at training points");
+    let loc_design =
+        build_term_collection_design(train_grid.view(), &fit.fit.resolved_thresholdspec)
+            .expect("rebuild location (threshold) design at training points");
     let gam_mu_train: Vec<f64> = loc_design.design.apply(&beta_location).to_vec();
     assert_eq!(gam_mu_train.len(), n);
 
     // Constant log-scale channel: sigma = exp(eta_ls) (intercept-only).
-    let ls_design = build_term_collection_design(train_grid.view(), &fit.fit.resolved_log_sigmaspec)
-        .expect("rebuild log-sigma design at training points");
+    let ls_design =
+        build_term_collection_design(train_grid.view(), &fit.fit.resolved_log_sigmaspec)
+            .expect("rebuild log-sigma design at training points");
     let gam_eta_ls: Vec<f64> = ls_design.design.apply(&beta_log_sigma).to_vec();
     assert!(
         gam_eta_ls.iter().all(|&v| (v - gam_eta_ls[0]).abs() < 1e-9),
@@ -419,7 +421,10 @@ fn solve5(mut a: [[f64; 5]; 5], mut b: [f64; 5]) -> [f64; 5] {
         a.swap(col, piv);
         b.swap(col, piv);
         let d = a[col][col];
-        assert!(d.abs() > 1e-12, "singular 5x5 system recovering lifelines mu");
+        assert!(
+            d.abs() > 1e-12,
+            "singular 5x5 system recovering lifelines mu"
+        );
         for r in (col + 1)..5 {
             let f = a[r][col] / d;
             for c in col..5 {

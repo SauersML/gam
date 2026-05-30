@@ -60,6 +60,7 @@
 //! censoring; observed `t = min(T, C)`, `event = 1{T ≤ C}`. The identical
 //! `(t, event, x)` rows feed gam and the scam reference.
 
+use csv::StringRecord;
 use gam::families::survival_construction::{
     SurvivalTimeBasisConfig, evaluate_survival_time_basis_row,
     resolved_survival_time_basis_config_from_build,
@@ -70,7 +71,6 @@ use gam::test_support::reference::{Column, pearson, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array2;
 
 /// Deterministic standard-normal stream (Box–Muller on a fixed 64-bit LCG).
@@ -181,8 +181,12 @@ fn gam_monotone_baseline_matches_scam_mpi() {
         time_num_internal_knots: 6,
         ..FitConfig::default()
     };
-    let result = fit_from_formula("Surv(t, event) ~ s(x, bs='tp') + survmodel(spec=net)", &ds, &cfg)
-        .expect("gam monotone-baseline net-survival fit");
+    let result = fit_from_formula(
+        "Surv(t, event) ~ s(x, bs='tp') + survmodel(spec=net)",
+        &ds,
+        &cfg,
+    )
+    .expect("gam monotone-baseline net-survival fit");
     let FitResult::SurvivalTransformation(fit) = result else {
         panic!("expected a survival-transformation (Royston-Parmar) fit result");
     };
@@ -301,8 +305,16 @@ fn gam_monotone_baseline_matches_scam_mpi() {
     );
     let scam_mpi = r.vector("mpi");
     let scam_ps = r.vector("ps");
-    assert_eq!(scam_mpi.len(), grid_times.len(), "scam mpi grid length mismatch");
-    assert_eq!(scam_ps.len(), grid_times.len(), "scam ps grid length mismatch");
+    assert_eq!(
+        scam_mpi.len(),
+        grid_times.len(),
+        "scam mpi grid length mismatch"
+    );
+    assert_eq!(
+        scam_ps.len(),
+        grid_times.len(),
+        "scam ps grid length mismatch"
+    );
 
     // ---- assertion 2: the monotonicity constraint is not a no-op ----------
     // scam's monotone (mpi) and unconstrained (ps) fits of the same log Λ̂ data

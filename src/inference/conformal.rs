@@ -149,7 +149,11 @@ mod tests {
         // Doubling every scale halves every score, so q̂ halves.
         let doubled = vec![2.0_f64; 9];
         let halved = conformal_scale_multiplier(&residuals, &doubled, 0.2).unwrap();
-        assert!((halved - base / 2.0).abs() < 1e-12, "{halved} vs {}", base / 2.0);
+        assert!(
+            (halved - base / 2.0).abs() < 1e-12,
+            "{halved} vs {}",
+            base / 2.0
+        );
         // Doubling every residual doubles every score, so q̂ doubles.
         let big: Vec<f64> = residuals.iter().map(|r| 2.0 * r).collect();
         let doubled_q = conformal_scale_multiplier(&big, &unit, 0.2).unwrap();

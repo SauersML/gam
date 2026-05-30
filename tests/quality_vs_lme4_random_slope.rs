@@ -24,13 +24,13 @@
 //! issue, so the bounds are tight and grounded in the math: r > 0.98 on the
 //! group×point prediction grid and r > 0.95 on the per-group slopes.
 
+use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -104,7 +104,8 @@ fn gam_factor_smooth_random_slope_matches_lme4() {
             ])
         })
         .collect();
-    let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode random-slope dataset");
+    let ds =
+        encode_recordswith_inferred_schema(headers, rows).expect("encode random-slope dataset");
     let col = ds.column_map();
     let x_idx = col["x"];
     let g_idx = col["g"];
@@ -180,7 +181,11 @@ fn gam_factor_smooth_random_slope_matches_lme4() {
     );
     let lmer_pred = r.vector("pred");
     let lmer_slope = r.vector("slope");
-    assert_eq!(lmer_pred.len(), grid_len, "lmer prediction grid length mismatch");
+    assert_eq!(
+        lmer_pred.len(),
+        grid_len,
+        "lmer prediction grid length mismatch"
+    );
     assert_eq!(lmer_slope.len(), N_GROUPS, "lmer slope count mismatch");
 
     // ---- compare ----------------------------------------------------------

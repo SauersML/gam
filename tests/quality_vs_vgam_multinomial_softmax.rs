@@ -122,7 +122,10 @@ fn gam_multinomial_softmax_matches_vgam() {
     let label = |code: usize| format!("c{code}");
 
     // ---- fit with gam: y ~ s(x1) + s(x2) + x3, multinomial driver ----------
-    let headers: Vec<String> = ["x1", "x2", "x3", "y"].iter().map(|s| s.to_string()).collect();
+    let headers: Vec<String> = ["x1", "x2", "x3", "y"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let rows: Vec<StringRecord> = (0..N)
         .map(|i| {
             StringRecord::from(vec![
@@ -137,9 +140,14 @@ fn gam_multinomial_softmax_matches_vgam() {
 
     let cfg = FitConfig::default();
     // init_lambda=1.0 warm-start; the REML/LAML outer loop selects per-class λ.
-    let model = fit_penalized_multinomial_formula(&ds, "y ~ s(x1) + s(x2) + x3", &cfg, 1.0, 50, 1e-8)
-        .expect("gam multinomial fit");
-    assert_eq!(model.class_levels.len(), K, "gam should recover K=3 classes");
+    let model =
+        fit_penalized_multinomial_formula(&ds, "y ~ s(x1) + s(x2) + x3", &cfg, 1.0, 50, 1e-8)
+            .expect("gam multinomial fit");
+    assert_eq!(
+        model.class_levels.len(),
+        K,
+        "gam should recover K=3 classes"
+    );
 
     // gam fitted probabilities at the training rows (predict reuses the frozen
     // training basis/penalty — no refit). Columns follow `model.class_levels`.
@@ -226,10 +234,7 @@ fn gam_multinomial_softmax_matches_vgam() {
         }
         let corr_k = pearson(&gk, &vk);
         worst_class_pearson = worst_class_pearson.min(corr_k);
-        eprintln!(
-            "class {} ({}): pearson={corr_k:.5}",
-            k, gam_levels[k]
-        );
+        eprintln!("class {} ({}): pearson={corr_k:.5}", k, gam_levels[k]);
         overall_gam.extend_from_slice(&gk);
         overall_vg.extend_from_slice(&vk);
     }

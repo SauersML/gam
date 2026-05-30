@@ -43,9 +43,7 @@ use gam::predict::{
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, max_abs_diff, relative_l2, run_r};
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
-use gam::{
-    FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema,
-};
+use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array1;
 use std::path::Path;
 
@@ -92,8 +90,10 @@ fn response_scale_se_matches_mgcv_under_identity_link() {
     // Response-scale SE via the delta method. Gaussian identity link => the
     // inverse-link Jacobian is exactly 1, so this must equal the eta-scale SE.
     let offset = Array1::<f64>::zeros(n);
-    let gaussian_identity =
-        LikelihoodSpec::new(ResponseFamily::Gaussian, InverseLink::Standard(StandardLink::Identity));
+    let gaussian_identity = LikelihoodSpec::new(
+        ResponseFamily::Gaussian,
+        InverseLink::Standard(StandardLink::Identity),
+    );
     let pred = predict_gamwith_uncertainty(
         dense,
         fit.fit.beta.view(),

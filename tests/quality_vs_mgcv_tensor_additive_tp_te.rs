@@ -33,13 +33,13 @@
 //! We compare the quantity that matters for an additive model: the total fitted
 //! mean (sum of all blocks + intercept) evaluated on the training points.
 
+use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, relative_l2, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array2;
 use std::f64::consts::PI;
 
@@ -112,12 +112,8 @@ fn gam_additive_tp_plus_te_matches_mgcv() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula(
-        "y ~ s(x1, x2, bs=\"tp\", k=10) + te(z, w, k=6)",
-        &ds,
-        &cfg,
-    )
-    .expect("gam additive tp+te fit");
+    let result = fit_from_formula("y ~ s(x1, x2, bs=\"tp\", k=10) + te(z, w, k=6)", &ds, &cfg)
+        .expect("gam additive tp+te fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for an additive gaussian tp+te model");
     };

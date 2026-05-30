@@ -68,7 +68,10 @@ fn gam_additive_matches_statsmodels_gam() {
         .collect();
 
     // gam dataset (header order: x1, x2, x3, y).
-    let headers: Vec<String> = ["x1", "x2", "x3", "y"].into_iter().map(String::from).collect();
+    let headers: Vec<String> = ["x1", "x2", "x3", "y"]
+        .into_iter()
+        .map(String::from)
+        .collect();
     let rows: Vec<StringRecord> = (0..N)
         .map(|i| {
             StringRecord::from(vec![
@@ -274,9 +277,18 @@ emit("part_x3", Bx3 @ b3)
     // a term that is over/under-smoothed, mis-parameterised, or contaminated by
     // a neighbouring term (the classic multi-smooth identifiability bug) would
     // drop well below this. The cyclic term is the most basis-sensitive.
-    assert!(p1 > 0.95, "p-spline term s(x1) disagrees with statsmodels: pearson={p1:.4}");
-    assert!(p2 > 0.95, "cyclic term cc(x2) disagrees with statsmodels: pearson={p2:.4}");
-    assert!(p3 > 0.95, "matern term matern(x3) disagrees with statsmodels: pearson={p3:.4}");
+    assert!(
+        p1 > 0.95,
+        "p-spline term s(x1) disagrees with statsmodels: pearson={p1:.4}"
+    );
+    assert!(
+        p2 > 0.95,
+        "cyclic term cc(x2) disagrees with statsmodels: pearson={p2:.4}"
+    );
+    assert!(
+        p3 > 0.95,
+        "matern term matern(x3) disagrees with statsmodels: pearson={p3:.4}"
+    );
 
     // (4) Total PENALIZED effective degrees of freedom: gam's edf_total vs the
     // trace of statsmodels' penalized smoother hat matrix (res.edf). Both are

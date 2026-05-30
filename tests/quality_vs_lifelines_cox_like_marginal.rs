@@ -78,8 +78,10 @@ use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith
 use ndarray::{Array1, Array2};
 use std::path::Path;
 
-const HEART_CSV: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/heart_failure_clinical_records_dataset.csv");
+const HEART_CSV: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/bench/datasets/heart_failure_clinical_records_dataset.csv"
+);
 
 /// Cumulative hazard of the probit survival index: Λ = −log Φ(−η). Computed via
 /// the numerically-stable log-CDF of the standard normal so the deep tail does
@@ -217,8 +219,9 @@ fn gam_marginal_slope_hazard_ratio_matches_lifelines_coxph() {
         let g = fit.baseline_slope + logslope_eta_at(ef_value);
         let z_std = (ef_value - z_mean) / z_sd;
         // q = 0 at the time anchor: η = q·c + probit_scale·g·z_std = probit_scale·g·z_std.
-        let eta = survival_marginal_slope_vector_eta(0.0, &[z_std], &[g], &covariance, probit_scale)
-            .expect("gam marginal-slope index at the time anchor");
+        let eta =
+            survival_marginal_slope_vector_eta(0.0, &[z_std], &[g], &covariance, probit_scale)
+                .expect("gam marginal-slope index at the time anchor");
         cumulative_hazard_from_eta(eta)
     };
     let cum_ref = gam_cum_at(ef_ref);
@@ -231,8 +234,7 @@ fn gam_marginal_slope_hazard_ratio_matches_lifelines_coxph() {
     // gam's effective EF log-hazard-ratio slope (secondary diagnostic): the
     // local d log Λ / d EF near the reference, in per-EF-unit terms.
     let h = 1.0_f64;
-    let gam_slope =
-        ((gam_cum_at(ef_ref + h)).ln() - (gam_cum_at(ef_ref - h)).ln()) / (2.0 * h);
+    let gam_slope = ((gam_cum_at(ef_ref + h)).ln() - (gam_cum_at(ef_ref - h)).ln()) / (2.0 * h);
 
     // ---- fit the SAME data with lifelines.CoxPHFitter (mature reference) ----
     // Cox partial likelihood with the identical continuous EF covariate plus SEX

@@ -67,7 +67,10 @@ fn gam_gamma_log_matches_statsmodels() {
         z.push(zi);
         y.push(yi);
     }
-    assert!(y.iter().all(|&v| v > 0.0), "Gamma outcomes must be positive");
+    assert!(
+        y.iter().all(|&v| v > 0.0),
+        "Gamma outcomes must be positive"
+    );
 
     // ---- encode for gam ---------------------------------------------------
     let headers: Vec<String> = ["y", "x", "z"].into_iter().map(String::from).collect();
@@ -84,8 +87,7 @@ fn gam_gamma_log_matches_statsmodels() {
         family: Some("gamma".to_string()),
         ..FitConfig::default()
     };
-    let result =
-        fit_from_formula("y ~ s(x, k=5) + s(z, k=4)", &ds, &cfg).expect("gam gamma fit");
+    let result = fit_from_formula("y ~ s(x, k=5) + s(z, k=4)", &ds, &cfg).expect("gam gamma fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for Gamma(log)");
     };

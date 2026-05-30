@@ -171,9 +171,11 @@ mod tests {
 
     #[test]
     fn weights_live_on_the_simplex() {
-        let pred =
-            Array2::from_shape_vec((4, 3), vec![0.5, 0.3, 0.2, 0.4, 0.4, 0.2, 0.6, 0.1, 0.3, 0.2, 0.5, 0.3])
-                .unwrap();
+        let pred = Array2::from_shape_vec(
+            (4, 3),
+            vec![0.5, 0.3, 0.2, 0.4, 0.4, 0.2, 0.6, 0.1, 0.3, 0.2, 0.5, 0.3],
+        )
+        .unwrap();
         let w = stacking_weights(pred.view(), 500, 1e-12).unwrap();
         assert!((w.sum() - 1.0).abs() < 1e-10);
         assert!(w.iter().all(|&v| v >= 0.0));

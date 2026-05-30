@@ -150,11 +150,7 @@ fn alo_matches_brute_force_loo_on_poisson_log_tensor() {
     let headers = ["x1", "x2", "y"].into_iter().map(String::from).collect();
     let rows = (0..n)
         .map(|i| {
-            csv::StringRecord::from(vec![
-                x1[i].to_string(),
-                x2[i].to_string(),
-                y[i].to_string(),
-            ])
+            csv::StringRecord::from(vec![x1[i].to_string(), x2[i].to_string(), y[i].to_string()])
         })
         .collect::<Vec<_>>();
     let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode poisson dataset");

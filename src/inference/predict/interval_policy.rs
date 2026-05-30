@@ -214,7 +214,12 @@ pub enum EtaInterval {
 }
 
 impl EtaInterval {
-    fn endpoints(&self, eta: &Array1<f64>, eta_se: &Array1<f64>, z: f64) -> (Array1<f64>, Array1<f64>) {
+    fn endpoints(
+        &self,
+        eta: &Array1<f64>,
+        eta_se: &Array1<f64>,
+        z: f64,
+    ) -> (Array1<f64>, Array1<f64>) {
         match self {
             EtaInterval::Symmetric => symmetric_interval(eta, eta_se, z),
             EtaInterval::Collapsed => (eta.clone(), eta.clone()),
@@ -306,10 +311,8 @@ pub fn assemble_posterior_mean_bounds(
         return Ok(());
     };
     let z = validated_central_z(level)?;
-    let (eta_lower, eta_upper) =
-        eta_interval.endpoints(&result.eta, &result.eta_standard_error, z);
-    let (mean_lower, mean_upper) =
-        mean_bounds(&eta_lower, &eta_upper, &result.mean, z, method)?;
+    let (eta_lower, eta_upper) = eta_interval.endpoints(&result.eta, &result.eta_standard_error, z);
+    let (mean_lower, mean_upper) = mean_bounds(&eta_lower, &eta_upper, &result.mean, z, method)?;
     result.mean_lower = Some(mean_lower);
     result.mean_upper = Some(mean_upper);
     Ok(())
@@ -629,7 +632,10 @@ mod parity_tests {
         .expect("engine assembly");
 
         for (lo, hi) in out.mean_lower.iter().zip(out.mean_upper.iter()) {
-            assert!(lo <= hi, "decreasing map must still return ordered bounds: {lo} > {hi}");
+            assert!(
+                lo <= hi,
+                "decreasing map must still return ordered bounds: {lo} > {hi}"
+            );
             assert!((0.0..=1.0).contains(lo) && (0.0..=1.0).contains(hi));
         }
     }

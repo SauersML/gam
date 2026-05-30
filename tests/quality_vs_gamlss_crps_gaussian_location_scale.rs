@@ -46,7 +46,9 @@ use gam::gamlss::GaussianLocationScaleFitResult;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, relative_l2, run_python, run_r};
-use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism};
+use gam::{
+    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+};
 use ndarray::Array2;
 
 /// gam's location-scale noise link floor: sigma = 0.01 + exp(eta_scale).
@@ -68,7 +70,9 @@ fn gam_gaussian_location_scale_crps_matches_gamlss() {
     let mut state: u64 = 9999;
     let mut next_unit = || -> f64 {
         // Numerical Recipes LCG; high bits give a uniform in [0,1).
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((state >> 11) as f64) / ((1u64 << 53) as f64)
     };
 
@@ -117,8 +121,7 @@ fn gam_gaussian_location_scale_crps_matches_gamlss() {
             ])
         })
         .collect();
-    let ds = encode_recordswith_inferred_schema(headers, train_rows)
-        .expect("encode training data");
+    let ds = encode_recordswith_inferred_schema(headers, train_rows).expect("encode training data");
     let col = ds.column_map();
     let x_idx = col["x"];
     let z_idx = col["z"];
@@ -129,9 +132,10 @@ fn gam_gaussian_location_scale_crps_matches_gamlss() {
         noise_formula: Some("1 + s(x, k=7)".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ s(x, k=7) + s(z, k=5)", &ds, &cfg)
-        .expect("gam location-scale fit");
-    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult { fit, .. }) = result else {
+    let result =
+        fit_from_formula("y ~ s(x, k=7) + s(z, k=5)", &ds, &cfg).expect("gam location-scale fit");
+    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult { fit, .. }) = result
+    else {
         panic!("expected a Gaussian location-scale fit");
     };
 
@@ -176,7 +180,9 @@ fn gam_gaussian_location_scale_crps_matches_gamlss() {
     // rows, and score with scoringrules::crps_norm in R. The full (x, z, y) and
     // a per-row `train` flag are sent so gamlss subsets to exactly the rows gam
     // trained on; the model is `y ~ pb(x) + pb(z)`, sigma.formula = ~ pb(x).
-    let train_flag: Vec<f64> = (0..n).map(|i| if i < n_train { 1.0 } else { 0.0 }).collect();
+    let train_flag: Vec<f64> = (0..n)
+        .map(|i| if i < n_train { 1.0 } else { 0.0 })
+        .collect();
 
     let r = run_r(
         &[
@@ -206,8 +212,16 @@ fn gam_gaussian_location_scale_crps_matches_gamlss() {
     let gamlss_sigma = r.vector("sigma");
     let gamlss_crps = r.vector("crps");
     assert_eq!(gamlss_mu.len(), n_test, "gamlss mu test length mismatch");
-    assert_eq!(gamlss_sigma.len(), n_test, "gamlss sigma test length mismatch");
-    assert_eq!(gamlss_crps.len(), n_test, "gamlss crps test length mismatch");
+    assert_eq!(
+        gamlss_sigma.len(),
+        n_test,
+        "gamlss sigma test length mismatch"
+    );
+    assert_eq!(
+        gamlss_crps.len(),
+        n_test,
+        "gamlss crps test length mismatch"
+    );
     let gamlss_log_sigma: Vec<f64> = gamlss_sigma.iter().map(|&s| s.ln()).collect();
 
     // ---- score gam's predictive distribution with the SAME proper scoring

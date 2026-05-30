@@ -7,10 +7,10 @@ use crate::custom_family::{
     ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
     ExactNewtonOuterCurvature, FamilyChannelHessian, FamilyEvaluation, ParameterBlockSpec,
-    ParameterBlockState, PenaltyMatrix, PsiDesignMap,
-    build_rowwise_kronecker_psi_operator, evaluate_custom_family_joint_hyper,
-    evaluate_custom_family_joint_hyper_efs, first_psi_linear_map, fit_custom_family,
-    resolve_custom_family_x_psi_map, shared_dense_arc, weighted_crossprod_psi_maps,
+    ParameterBlockState, PenaltyMatrix, PsiDesignMap, build_rowwise_kronecker_psi_operator,
+    evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs,
+    first_psi_linear_map, fit_custom_family, resolve_custom_family_x_psi_map, shared_dense_arc,
+    weighted_crossprod_psi_maps,
 };
 use crate::solver::estimate::reml::unified::{DenseMatrixHyperOperator, HyperOperator};
 
@@ -30,18 +30,18 @@ use crate::families::scale_design::{
 };
 use crate::families::sigma_link::{EXP_NEG_STABLE_MAX_ARG, exp_sigma_inverse_from_eta_scalar};
 use crate::families::survival::{OffsetChannelCurvatures, OffsetChannelResiduals};
+use crate::families::survival_time_constraints::{
+    FeasibilityTolerance, GuardConstraintFailure, GuardConstraintPolicy, GuardPolicy,
+    build_time_derivative_guard_constraints,
+};
 use crate::matrix::{
-    BlockDesignOperator, DenseDesignMatrix, DesignBlock, DesignMatrix,
-    MultiChannelOperator, RowwiseKroneckerOperator, SymmetricMatrix,
+    BlockDesignOperator, DenseDesignMatrix, DesignBlock, DesignMatrix, MultiChannelOperator,
+    RowwiseKroneckerOperator, SymmetricMatrix,
 };
 use crate::mixture_link::{
     component_inverse_link_jet, inverse_link_jet_for_inverse_link,
     inverse_link_pdffourth_derivative_for_inverse_link,
     inverse_link_pdfthird_derivative_for_inverse_link,
-};
-use crate::families::survival_time_constraints::{
-    build_time_derivative_guard_constraints, FeasibilityTolerance, GuardConstraintFailure,
-    GuardConstraintPolicy, GuardPolicy,
 };
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::erfcx_nonnegative;
@@ -11016,8 +11016,14 @@ mod tests {
 
         let psi_dim = shared.len();
         for (axis, (a, b)) in shared.iter().zip(survival.iter()).enumerate() {
-            assert_eq!(a.penalty_index, b.penalty_index, "penalty_index axis {axis}");
-            assert_eq!(a.implicit_axis, b.implicit_axis, "implicit_axis axis {axis}");
+            assert_eq!(
+                a.penalty_index, b.penalty_index,
+                "penalty_index axis {axis}"
+            );
+            assert_eq!(
+                a.implicit_axis, b.implicit_axis,
+                "implicit_axis axis {axis}"
+            );
             assert_eq!(
                 a.implicit_group_id, b.implicit_group_id,
                 "implicit_group_id axis {axis}"
@@ -11056,7 +11062,9 @@ mod tests {
                         );
                         let nd = op_a.n_data();
                         let v: Array1<f64> = (0..nd)
-                            .map(|r| 0.2 - 0.05 * (r as f64) + 0.13 * ((r + probe_axis) as f64).sin())
+                            .map(|r| {
+                                0.2 - 0.05 * (r as f64) + 0.13 * ((r + probe_axis) as f64).sin()
+                            })
                             .collect();
                         let tr_a = op_a
                             .transpose_mul(probe_axis, &v.view())

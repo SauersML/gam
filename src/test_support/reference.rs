@@ -85,13 +85,21 @@ fn unique_scratch_dir(tag: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut dir = std::env::temp_dir();
-    dir.push(format!("gam_reference_{}_{}_{}", tag, std::process::id(), n));
+    dir.push(format!(
+        "gam_reference_{}_{}_{}",
+        tag,
+        std::process::id(),
+        n
+    ));
     std::fs::create_dir_all(&dir).expect("create reference scratch dir");
     dir
 }
 
 fn write_columns_csv(path: &std::path::Path, columns: &[Column<'_>]) {
-    assert!(!columns.is_empty(), "reference run needs at least one column");
+    assert!(
+        !columns.is_empty(),
+        "reference run needs at least one column"
+    );
     let nrows = columns[0].data.len();
     for c in columns {
         assert_eq!(

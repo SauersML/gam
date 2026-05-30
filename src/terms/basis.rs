@@ -20990,7 +20990,11 @@ fn duchon_radial_jets_nd(
         crate::bail_invalid_basis!("{caller}: centers must have at least one column");
     }
     if t.ncols() != dim {
-        crate::bail_invalid_basis!("{caller}: t has {} cols but centers have {}", t.ncols(), dim);
+        crate::bail_invalid_basis!(
+            "{caller}: t has {} cols but centers have {}",
+            t.ncols(),
+            dim
+        );
     }
     assert!(
         (1..=3).contains(&max_order),
@@ -21593,15 +21597,8 @@ pub fn duchon_sae_atom_second_jet(
     // `(n_rows, n_kernel·d²)` output places output `i`, multi-index `(a,c)` at
     // column `i·d² + (a·d + c)`, including the `φ''(0) δ_ac` collision limit.
     let coeffs = &z * kernel_amp;
-    let flat = radial_basis_cartesian_derivative(
-        2,
-        t,
-        centers,
-        coeffs.view(),
-        None,
-        effective_order,
-        0,
-    )?;
+    let flat =
+        radial_basis_cartesian_derivative(2, t, centers, coeffs.view(), None, effective_order, 0)?;
 
     let mut out = Array4::<f64>::zeros((n_rows, n_kernel + poly_block_t_cols, dim, dim));
     for n in 0..n_rows {
@@ -21864,11 +21861,7 @@ pub fn build_duchon_basis_design_and_jets(
                     //   δ_a'' = −(π/P) sin(π·raw/P)
                     let p = periods[a];
                     let theta = pi * raw / p;
-                    (
-                        (p / pi) * theta.sin(),
-                        theta.cos(),
-                        -(pi / p) * theta.sin(),
-                    )
+                    ((p / pi) * theta.sin(), theta.cos(), -(pi / p) * theta.sin())
                 } else {
                     (raw, 1.0, 0.0)
                 };
@@ -21907,9 +21900,13 @@ pub fn build_duchon_basis_design_and_jets(
     let n_poly = poly_design.ncols();
 
     let mut phi_design = Array2::<f64>::zeros((n_rows, n_kernel + n_poly));
-    phi_design.slice_mut(s![.., ..n_kernel]).assign(&kernel_design);
+    phi_design
+        .slice_mut(s![.., ..n_kernel])
+        .assign(&kernel_design);
     if n_poly > 0 {
-        phi_design.slice_mut(s![.., n_kernel..]).assign(&poly_design);
+        phi_design
+            .slice_mut(s![.., n_kernel..])
+            .assign(&poly_design);
     }
 
     // -------------------------------------------------- radial input-location
@@ -22164,7 +22161,11 @@ pub fn matern_radial_second_derivative_nd(
 ///
 /// `None` (or a 1-D problem, where the centred contrast is a no-op) yields the
 /// isotropic all-ones metric.
-fn matern_metric_weights(centers: ArrayView2<'_, f64>, dim: usize, aniso: Option<&[f64]>) -> Vec<f64> {
+fn matern_metric_weights(
+    centers: ArrayView2<'_, f64>,
+    dim: usize,
+    aniso: Option<&[f64]>,
+) -> Vec<f64> {
     match maybe_initialize_aniso_contrasts(centers, aniso) {
         Some(psi) => psi.iter().map(|&v| (2.0 * v).exp()).collect(),
         None => vec![1.0; dim],
@@ -35881,12 +35882,7 @@ mod tests {
         let n_centers = centers.nrows();
         let n_rows = t.nrows();
         let p_out = 2usize;
-        let coeffs = array![
-            [1.10, -0.40],
-            [-0.25, 0.70],
-            [0.60, 0.15],
-            [0.05, -0.90],
-        ];
+        let coeffs = array![[1.10, -0.40], [-0.25, 0.70], [0.60, 0.15], [0.05, -0.90],];
         let length_scale = Some(0.8_f64);
         let nullspace_order = DuchonNullspaceOrder::Linear;
         // Hybrid spectral order s = power: with p = 1 (Linear) and d = 3 the

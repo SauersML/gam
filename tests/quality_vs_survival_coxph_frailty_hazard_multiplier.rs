@@ -56,6 +56,7 @@
 //! A failing assertion because gam genuinely diverges from coxph is acceptable
 //! and must NOT be papered over by loosening a bound or editing gam source.
 
+use csv::StringRecord;
 use gam::families::lognormal_kernel::{FrailtySpec, HazardLoading};
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
@@ -63,7 +64,6 @@ use gam::test_support::reference::{Column, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array2;
 
 const N_GROUPS: usize = 12;
@@ -186,7 +186,8 @@ fn gam_hazard_multiplier_frailty_matches_coxph_frailty() {
             ])
         })
         .collect();
-    let data = encode_recordswith_inferred_schema(headers, rows).expect("encode frailty survival data");
+    let data =
+        encode_recordswith_inferred_schema(headers, rows).expect("encode frailty survival data");
     let col = data.column_map();
     let x_idx = col["x"];
 

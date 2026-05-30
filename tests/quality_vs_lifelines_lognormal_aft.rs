@@ -77,9 +77,8 @@ fn erfc(x: f64) -> f64 {
                         + t * (-0.18628806
                             + t * (0.27886807
                                 + t * (-1.13520398
-                                    + t * (1.48851587
-                                        + t * (-0.82215223 + t * 0.17087277)))))))))
-        .exp();
+                                    + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))))
+            .exp();
     if x >= 0.0 { ans } else { 2.0 - ans }
 }
 
@@ -194,14 +193,16 @@ fn gam_lognormal_aft_interaction_matches_lifelines() {
         combo_grid[[i, x0_idx]] = c0;
         combo_grid[[i, x1_idx]] = c1;
     }
-    let loc_design = build_term_collection_design(combo_grid.view(), &fit.fit.resolved_thresholdspec)
-        .expect("rebuild location (threshold) design at covariate combos");
+    let loc_design =
+        build_term_collection_design(combo_grid.view(), &fit.fit.resolved_thresholdspec)
+            .expect("rebuild location (threshold) design at covariate combos");
     let gam_mu_combo: Vec<f64> = loc_design.design.apply(&beta_location).to_vec();
     assert_eq!(gam_mu_combo.len(), combos.len());
 
     // Constant log-scale channel: sigma = exp(eta_ls) at any x (intercept-only).
-    let ls_design = build_term_collection_design(combo_grid.view(), &fit.fit.resolved_log_sigmaspec)
-        .expect("rebuild log-sigma design at covariate combos");
+    let ls_design =
+        build_term_collection_design(combo_grid.view(), &fit.fit.resolved_log_sigmaspec)
+            .expect("rebuild log-sigma design at covariate combos");
     let gam_eta_ls: Vec<f64> = ls_design.design.apply(&beta_log_sigma).to_vec();
     let gam_sigma = gam_eta_ls[0].exp();
     assert!(

@@ -60,7 +60,10 @@ fn validate(deriv: &[f64], deriv_var: &[f64], epsilon: f64) -> Result<(), Estima
 }
 
 /// Magnitude-only adaptive weights `w_k = 1 / sqrt((D_k β̂)² + ε²)`.
-pub fn magnitude_adaptive_weights(deriv: &[f64], epsilon: f64) -> Result<Vec<f64>, EstimationError> {
+pub fn magnitude_adaptive_weights(
+    deriv: &[f64],
+    epsilon: f64,
+) -> Result<Vec<f64>, EstimationError> {
     if !(epsilon.is_finite() && epsilon > 0.0) {
         return Err(EstimationError::InvalidInput(format!(
             "magnitude weights: epsilon must be finite and positive; got {epsilon}"

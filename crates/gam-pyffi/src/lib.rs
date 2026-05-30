@@ -3631,13 +3631,9 @@ fn basis_with_jet<'py>(
             let (jet, penalty) = if periodic {
                 let (left, right, num_basis) =
                     periodic_knot_domain(knots_array.view()).map_err(py_value_error)?;
-                let jet = periodic_bspline_first_derivative_nd(
-                    coords,
-                    (left, right),
-                    degree,
-                    num_basis,
-                )
-                .map_err(|err| py_value_error(err.to_string()))?;
+                let jet =
+                    periodic_bspline_first_derivative_nd(coords, (left, right), degree, num_basis)
+                        .map_err(|err| py_value_error(err.to_string()))?;
                 if jet.shape() != [n_rows, n_cols, 1] {
                     return Err(py_value_error(format!(
                         "basis_with_jet bspline shape mismatch: phi=({n_rows},{n_cols}) jet={:?}",
@@ -3648,9 +3644,14 @@ fn basis_with_jet<'py>(
                     .map_err(|err| py_value_error(err.to_string()))?;
                 (jet, penalty)
             } else {
-                let deriv =
-                    bspline_basis_derivative_impl(t_1d.view(), knots_array.view(), degree, 1, false)
-                        .map_err(py_value_error)?;
+                let deriv = bspline_basis_derivative_impl(
+                    t_1d.view(),
+                    knots_array.view(),
+                    degree,
+                    1,
+                    false,
+                )
+                .map_err(py_value_error)?;
                 if deriv.nrows() != n_rows || deriv.ncols() != n_cols {
                     return Err(py_value_error(format!(
                         "basis_with_jet bspline shape mismatch: phi=({n_rows},{n_cols}) deriv=({},{})",
@@ -5186,8 +5187,11 @@ fn gaussian_reml_fit<'py>(
     let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
     let by_values = by.as_ref().map(|b| b.as_array().to_owned());
     let result = detach_py_result(py, "gaussian_reml_fit", move || {
-        let gated_x =
-            gate_design_for_forward(x_values.view(), by_values.as_ref().map(|b| b.view()), by_start_col)?;
+        let gated_x = gate_design_for_forward(
+            x_values.view(),
+            by_values.as_ref().map(|b| b.view()),
+            by_start_col,
+        )?;
         let fit_x = gated_x.as_ref().map_or(x_values.view(), |g| g.view());
         match gaussian_reml_multi_closed_form_with_cache(
             fit_x,
@@ -5768,17 +5772,23 @@ fn gaussian_reml_fit_blocks_orthogonal_forward<'py>(
         .map(|penalty| penalty.as_array().to_owned())
         .collect::<Vec<_>>();
     let y_owned = y.as_array().to_owned();
-    let weights_owned = weights.as_ref().map(|weights| weights.as_array().to_owned());
+    let weights_owned = weights
+        .as_ref()
+        .map(|weights| weights.as_array().to_owned());
     let init_owned = init_rhos.as_ref().map(|rhos| rhos.as_array().to_vec());
-    let fit = detach_estimation_result(py, "gaussian_reml_fit_blocks_orthogonal_forward", move || {
-        gaussian_reml_blocks_orthogonal_shared_scale(
-            &designs_owned,
-            &penalties_owned,
-            y_owned.view(),
-            weights_owned.as_ref().map(|weights| weights.view()),
-            init_owned.as_deref(),
-        )
-    })?;
+    let fit = detach_estimation_result(
+        py,
+        "gaussian_reml_fit_blocks_orthogonal_forward",
+        move || {
+            gaussian_reml_blocks_orthogonal_shared_scale(
+                &designs_owned,
+                &penalties_owned,
+                y_owned.view(),
+                weights_owned.as_ref().map(|weights| weights.view()),
+                init_owned.as_deref(),
+            )
+        },
+    )?;
     let out = PyDict::new(py);
     let coef_list = PyList::empty(py);
     for coef in fit.coefficients {
@@ -6911,8 +6921,11 @@ fn gaussian_reml_fit_batched<'py>(
     let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
     let by_values = by.as_ref().map(|b| b.as_array().to_owned());
     let result = detach_py_result(py, "gaussian_reml_fit_batched", move || {
-        let gated_x =
-            gate_design_for_forward(x_values.view(), by_values.as_ref().map(|b| b.view()), by_start_col)?;
+        let gated_x = gate_design_for_forward(
+            x_values.view(),
+            by_values.as_ref().map(|b| b.view()),
+            by_start_col,
+        )?;
         let fit_x = gated_x.as_ref().map_or(x_values.view(), |g| g.view());
         gaussian_reml_fit_batched_impl(
             fit_x,
@@ -26621,7 +26634,6 @@ fn json_positive_u64_to_usize(value: u64, context: &str) -> Result<usize, String
     usize::try_from(value).map_err(|_| format!("{context} exceeds usize::MAX"))
 }
 
-
 #[pyfunction(signature = (latents_json, penalties_json))]
 fn register_analytic_penalties(latents_json: &str, penalties_json: &str) -> PyResult<String> {
     let latents: serde_json::Value = serde_json::from_str(latents_json)
@@ -29994,7 +30006,12 @@ fn build_survival_location_scale_ffi_payload(
             fitted_inverse_link: fitted_inverse_link.clone(),
             linkwiggle_degree: ls_result.wiggle_degree,
             linkwiggle_knots: ls_result.wiggle_knots.as_ref().map(|k| k.to_vec()),
-            beta_link_wiggle: ls_result.fit.fit.beta_link_wiggle().as_ref().map(|b| b.to_vec()),
+            beta_link_wiggle: ls_result
+                .fit
+                .fit
+                .beta_link_wiggle()
+                .as_ref()
+                .map(|b| b.to_vec()),
             baseline_timewiggle: None,
             survival_entry: entryname,
             survival_exit: exitname,

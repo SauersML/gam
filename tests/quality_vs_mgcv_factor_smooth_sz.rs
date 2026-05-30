@@ -106,8 +106,7 @@ fn gam_factor_smooth_sz_matches_mgcv() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result =
-        fit_from_formula("y ~ s(group, x, bs=\"sz\")", &ds, &cfg).expect("gam sz fit");
+    let result = fit_from_formula("y ~ s(group, x, bs=\"sz\")", &ds, &cfg).expect("gam sz fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for the sz factor smooth");
     };
@@ -150,8 +149,7 @@ fn gam_factor_smooth_sz_matches_mgcv() {
         }
     }
     let constraint_max = sum_dev.iter().map(|v| v.abs()).fold(0.0, f64::max);
-    let constraint_rms =
-        (sum_dev.iter().map(|v| v * v).sum::<f64>() / grid_m as f64).sqrt();
+    let constraint_rms = (sum_dev.iter().map(|v| v * v).sum::<f64>() / grid_m as f64).sqrt();
 
     // ---- fit the SAME model with mgcv (the mature reference) ---------------
     // mgcv requires the grouping variable to be a factor for bs="sz"; build it

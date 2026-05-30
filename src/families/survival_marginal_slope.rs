@@ -46,8 +46,8 @@ use crate::families::survival_location_scale::{
     TimeBlockInput, TimeWiggleBlockInput, project_onto_linear_constraints,
 };
 use crate::families::survival_time_constraints::{
-    build_time_derivative_guard_constraints, FeasibilityTolerance, GuardConstraintFailure,
-    GuardConstraintPolicy, GuardPolicy,
+    FeasibilityTolerance, GuardConstraintFailure, GuardConstraintPolicy, GuardPolicy,
+    build_time_derivative_guard_constraints,
 };
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
@@ -5063,12 +5063,7 @@ impl SurvivalMarginalSlopeFamily {
                     &[zero, &row_dir],
                     &scales,
                     |dirs, scale| {
-                        self.row_neglog_directional_with_scale_jet(
-                            row,
-                            block_states,
-                            dirs,
-                            scale,
-                        )
+                        self.row_neglog_directional_with_scale_jet(row, block_states, dirs, scale)
                     },
                 )?;
                 let mut grad = terms.grad;
@@ -12952,9 +12947,7 @@ impl SurvivalMarginalSlopeFamily {
                 d_beta_flat,
                 options,
             )?
-            .map(|(acc, slices)| {
-                Arc::new(acc.into_operator(slices)) as Arc<dyn HyperOperator>
-            }))
+            .map(|(acc, slices)| Arc::new(acc.into_operator(slices)) as Arc<dyn HyperOperator>))
     }
 
     fn exact_newton_joint_hessian_operator(
@@ -27831,8 +27824,7 @@ mod tests {
         // what the operator-variant directional path returns).
         let v: Array1<f64> =
             Array1::from_iter((0..slices.total).map(|k| 0.7 + (k as f64) * 0.31 - 0.05 * k as f64));
-        let u: Array1<f64> =
-            Array1::from_iter((0..slices.total).map(|k| -1.3 + (k as f64) * 0.17));
+        let u: Array1<f64> = Array1::from_iter((0..slices.total).map(|k| -1.3 + (k as f64) * 0.17));
         let mv = op.mul_vec(&v);
         let dense_mv = dense.dot(&v);
         for k in 0..slices.total {

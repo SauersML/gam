@@ -57,6 +57,7 @@
 //! to both engines). Treatment is coded `auto = 1`, `allo = 0`. The same
 //! `(t, d, trt, x)` rows feed gam and flexsurv.
 
+use csv::StringRecord;
 use gam::families::survival_construction::{
     SurvivalTimeBasisConfig, evaluate_survival_time_basis_row,
     resolved_survival_time_basis_config_from_build,
@@ -67,7 +68,6 @@ use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array2;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -164,7 +164,10 @@ fn gam_rp_baseline_coefficients_match_flexsurvspline_on_bone() {
     let n = time.len();
     assert!(n >= 20, "bone should have ~23 rows, got {n}");
     let n_events: usize = event.iter().filter(|&&e| e == 1.0).count();
-    assert!(n_events >= 8, "expected the bone relapse events, got {n_events}");
+    assert!(
+        n_events >= 8,
+        "expected the bone relapse events, got {n_events}"
+    );
     // The dataset is balanced allo/auto by construction; confirm both arms are
     // represented so the treatment effect is identifiable.
     let n_auto: usize = trt.iter().filter(|&&g| g == 1.0).count();

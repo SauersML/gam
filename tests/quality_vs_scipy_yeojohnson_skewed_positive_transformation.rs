@@ -47,11 +47,11 @@
 //! monotonicity property gam must satisfy, and report an RMSE diagnostic on the
 //! standardized-score grid. We never weaken these and never edit gam to pass.
 
+use csv::StringRecord;
 use gam::test_support::reference::{Column, pearson, rmse, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 
 /// Deterministic, dependency-free PRNG (SplitMix64) so the synthetic
 /// positive-skewed sample is reproducible bit-for-bit and handed IDENTICALLY to

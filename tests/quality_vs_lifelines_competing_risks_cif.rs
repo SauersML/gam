@@ -54,6 +54,7 @@
 //! and never edit gam to pass — a genuine divergence failing here is useful and
 //! would point at a real bug rather than the (bounded) scheme mismatch.
 
+use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::survival::assemble_competing_risks_cif;
@@ -61,7 +62,6 @@ use gam::test_support::reference::{Column, max_abs_diff, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::{Array2, Array3};
 use std::fs;
 use std::path::Path;
@@ -101,7 +101,9 @@ fn cause_cumulative_hazard(
     let result = fit_from_formula("Surv(N_Days, event) ~ s(Age, bs='tp')", &data, &cfg)
         .unwrap_or_else(|e| panic!("gam Weibull cause-specific fit for {cause_label} failed: {e}"));
     let FitResult::SurvivalTransformation(fit) = result else {
-        panic!("expected a SurvivalTransformation fit for survival_likelihood=weibull ({cause_label})");
+        panic!(
+            "expected a SurvivalTransformation fit for survival_likelihood=weibull ({cause_label})"
+        );
     };
 
     let scale = fit
@@ -144,7 +146,11 @@ fn cause_cumulative_hazard(
     );
     let cov_beta = beta.slice(ndarray::s![fit.time_base_ncols..]).to_owned();
     let eta = design.design.apply(&cov_beta);
-    assert_eq!(eta.len(), n, "covariate eta length mismatch ({cause_label})");
+    assert_eq!(
+        eta.len(),
+        n,
+        "covariate eta length mismatch ({cause_label})"
+    );
 
     // H_k(t | x_i) on the shared grid.
     let mut h = Array2::<f64>::zeros((n, grid.len()));
@@ -177,7 +183,10 @@ fn gam_competing_risks_cif_matches_lifelines_aalen_johansen_on_cirrhosis() {
     let mut event_code: Vec<f64> = Vec::new();
     for (i, line) in raw.lines().enumerate() {
         if i == 0 {
-            assert!(line.starts_with("ID,N_Days,Status,"), "unexpected header: {line}");
+            assert!(
+                line.starts_with("ID,N_Days,Status,"),
+                "unexpected header: {line}"
+            );
             continue;
         }
         let f: Vec<&str> = line.split(',').collect();
@@ -296,7 +305,11 @@ emit("cif_tx", cif_on_grid(2))
     let aj_cif_death = r.vector("cif_death");
     let aj_cif_tx = r.vector("cif_tx");
     assert_eq!(aj_cif_death.len(), grid.len(), "AJ death CIF grid mismatch");
-    assert_eq!(aj_cif_tx.len(), grid.len(), "AJ transplant CIF grid mismatch");
+    assert_eq!(
+        aj_cif_tx.len(),
+        grid.len(),
+        "AJ transplant CIF grid mismatch"
+    );
 
     // ---- compare ----------------------------------------------------------
     let diff_death = max_abs_diff(&gam_cif_death, aj_cif_death);

@@ -238,7 +238,12 @@ fn gaussian_profile_bic(theta: &Array2<f64>, dz: &Array2<f64>, xi: &Array2<f64>)
     let n_f = n as f64;
     let mut bic = 0.0;
     for c in 0..d {
-        let rss: f64 = resid.column(c).iter().map(|&v| v * v).sum::<f64>().max(1.0e-300);
+        let rss: f64 = resid
+            .column(c)
+            .iter()
+            .map(|&v| v * v)
+            .sum::<f64>()
+            .max(1.0e-300);
         let k = xi.column(c).iter().filter(|&&v| v != 0.0).count() as f64;
         bic += n_f * (rss / n_f).ln() + k * n_f.ln();
     }

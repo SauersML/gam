@@ -315,12 +315,9 @@ mod tests {
         assert_eq!(err, "coefficient group 'g' contains no coefficients");
 
         // Unknown parent reference.
-        let err = ResolvedGroupHierarchy::build(vec![group::<usize>(
-            "g",
-            Some("missing"),
-            [0usize],
-        )])
-        .unwrap_err();
+        let err =
+            ResolvedGroupHierarchy::build(vec![group::<usize>("g", Some("missing"), [0usize])])
+                .unwrap_err();
         assert_eq!(
             err,
             "coefficient group hierarchy references unknown group 'missing'"
