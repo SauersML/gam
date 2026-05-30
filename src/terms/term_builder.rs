@@ -16,7 +16,7 @@ use crate::basis::{
     MaternNu, OneDimensionalBoundary, SpatialIdentifiability, SphereMethod, SphereWahbaKernel,
     SphericalSplineBasisSpec, ThinPlateBasisSpec, auto_spatial_center_strategy,
     default_num_centers, default_spatial_center_strategy, default_spherical_harmonic_degree,
-    plan_spatial_basis, resolve_duchon_orders,
+    plan_spatial_basis,
 };
 use crate::inference::data::{DataError, EncodedDataset as Dataset};
 use crate::inference::formula_dsl::{
@@ -1723,73 +1723,34 @@ pub fn build_smooth_basis(
             }
             let requested_nullspace_order = parse_duchon_order(options)?;
             let length_scale = option_f64_strict(options, "length_scale")?;
-            // Resolve `(nullspace_order, power)` against the joint constraints
-            // (operator collocation + scale-free CPD). Explicit power keeps the
-            // user's nullspace as-is (validator will reject inconsistent combos);
-            // the policy path may auto-escalate the nullspace order in scale-free mode
-            // when CPD requires a richer polynomial absorption space.
+            // Resolve `(nullspace_order, power)`. The default (magic) path is a
+            // structural amplitude/slope/curvature smoother: an affine (`Linear`)
+            // polynomial nullspace and spectral power `s = (d - 1)/2`, giving the
+            // cubic kernel `r^3` in 1D. There is no nullspace-order escalation —
+            // the structural cubic smoother is well-defined for every dimension.
+            //
+            // Explicit `power=...` honors the user's value verbatim against their
+            // requested nullspace order; the kernel validator emits a precise
+            // diagnostic for any inadmissible combination. In the scale-free
+            // (non-hybrid) regime fractional powers are admitted and threaded as
+            // `f64`. The hybrid Duchon-Matérn kernel (`length_scale=Some`) is
+            // restricted to integer powers.
             let (nullspace_order, power) = match parse_duchon_power_policy(options)? {
                 DuchonPowerPolicy::Explicit(req_power) => {
-                    // Honor the user's nullspace_order, but auto-escalate
-                    // explicit power when it sits below the minimum needed
-                    // for the active operator-penalty triple
-                    // (mass + tension + stiffness ⇒ D2 collocation requires
-                    // 2(p+s) > d+2). Without this escalation the basis
-                    // builder later rejects the user's combination with an
-                    // opaque "Duchon D2 collocation requires …" diagnostic
-                    // even though the requested kernel exists — the user's
-                    // power was simply too low for the *operator* derivative
-                    // order, not for the kernel itself. Only escalate when
-                    // CPD does not also force a different nullspace order;
-                    // when CPD bumps the nullspace, the explicit power is
-                    // bound to the user-requested order, so leave it alone
-                    // and let the kernel validator emit a precise
-                    // diagnostic for that combination.
-                    let (resolved_nullspace, min_admissible_power) = resolve_duchon_orders(
-                        cols.len(),
-                        requested_nullspace_order,
-                        2,
-                        length_scale,
-                    );
-                    let final_power = if resolved_nullspace == requested_nullspace_order {
-                        req_power.max(min_admissible_power)
-                    } else {
-                        req_power
-                    };
-                    if final_power != req_power {
-                        inference_notes.push(format!(
-                            "Note: explicit Duchon power={} is below the minimum admissible \
-                             power={} for D2 (stiffness) collocation at dimension={}, \
-                             nullspace_order={:?} (requires 2(p+s) > d+2). Auto-escalated \
-                             to power={} so all three Duchon operator penalties (mass, \
-                             tension, stiffness) remain active.",
+                    if length_scale.is_some() && req_power.fract() != 0.0 {
+                        return Err(TermBuilderError::incompatible_config(format!(
+                            "hybrid Duchon-Matern smooth '{}' (length_scale=...) requires an integer power, got power={}; \
+                             drop length_scale to use the scale-free structural kernel with a fractional power.",
+                            vars.join(", "),
                             req_power,
-                            min_admissible_power,
-                            cols.len(),
-                            requested_nullspace_order,
-                            final_power,
-                        ));
+                        ))
+                        .to_string());
                     }
-                    (requested_nullspace_order, final_power)
+                    (requested_nullspace_order, req_power)
                 }
                 DuchonPowerPolicy::MinimumAdmissibleForTripleOperator => {
-                    let resolved = resolve_duchon_orders(
-                        cols.len(),
-                        requested_nullspace_order,
-                        2,
-                        length_scale,
-                    );
-                    if resolved.0 != requested_nullspace_order {
-                        inference_notes.push(format!(
-                            "Note: scale-free Duchon CPD against polynomial nullspace requires order ≥ {:?} \
-                             at dimension {} (Wendland 8.17, 2s < d); auto-escalated from {:?}. \
-                             Specify length_scale=... to use the hybrid Duchon-Matern kernel.",
-                            resolved.0,
-                            cols.len(),
-                            requested_nullspace_order,
-                        ));
-                    }
-                    resolved
+                    // Magic cubic rule: affine nullspace, spectral power s = (d-1)/2.
+                    (DuchonNullspaceOrder::Linear, (cols.len() as f64 - 1.0) / 2.0)
                 }
             };
             let plan = plan_spatial_basis(
@@ -1843,7 +1804,7 @@ pub fn build_smooth_basis(
                     center_strategy,
                     periodic: parse_periodic_axes_option(options, cols.len())?,
                     length_scale,
-                    power: power as f64,
+                    power,
                     nullspace_order,
                     identifiability: parse_spatial_identifiability(options)
                         .map_err(|e| e.to_string())?,
@@ -2495,7 +2456,7 @@ fn unsupported_matern_nu_message(raw: &str) -> String {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum DuchonPowerPolicy {
-    Explicit(usize),
+    Explicit(f64),
     MinimumAdmissibleForTripleOperator,
 }
 
@@ -2504,27 +2465,37 @@ pub fn parse_duchon_power_policy(
 ) -> Result<DuchonPowerPolicy, String> {
     if let Some(raw_nu) = options.get("nu") {
         return Err(TermBuilderError::incompatible_config(format!(
-            "Duchon smooths use power=<integer>, not nu='{}'. Use power=0, power=1, etc.",
+            "Duchon smooths use power=<number>, not nu='{}'. Use power=1.5, power=2, etc.",
             raw_nu
         ))
         .to_string());
     }
     match options.get("power") {
-        Some(raw) => raw.parse::<usize>().map(DuchonPowerPolicy::Explicit).map_err(|err| {
-            TermBuilderError::invalid_option(format!(
-                "invalid Duchon power '{}'; expected a non-negative integer such as power=0 or power=1: {}",
-                raw, err
-            ))
-            .to_string()
-        }),
+        Some(raw) => {
+            let value = raw.parse::<f64>().map_err(|err| {
+                TermBuilderError::invalid_option(format!(
+                    "invalid Duchon power '{}'; expected a non-negative number such as power=1.5 or power=2: {}",
+                    raw, err
+                ))
+                .to_string()
+            })?;
+            if !value.is_finite() || value < 0.0 {
+                return Err(TermBuilderError::invalid_option(format!(
+                    "invalid Duchon power '{}'; expected a finite non-negative number such as power=1.5 or power=2",
+                    raw
+                ))
+                .to_string());
+            }
+            Ok(DuchonPowerPolicy::Explicit(value))
+        }
         None => Ok(DuchonPowerPolicy::MinimumAdmissibleForTripleOperator),
     }
 }
 
-pub fn parse_duchon_power(options: &BTreeMap<String, String>) -> Result<usize, String> {
+pub fn parse_duchon_power(options: &BTreeMap<String, String>) -> Result<f64, String> {
     match parse_duchon_power_policy(options)? {
         DuchonPowerPolicy::Explicit(power) => Ok(power),
-        DuchonPowerPolicy::MinimumAdmissibleForTripleOperator => Ok(2),
+        DuchonPowerPolicy::MinimumAdmissibleForTripleOperator => Ok(1.5),
     }
 }
 
