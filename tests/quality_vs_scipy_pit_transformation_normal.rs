@@ -249,12 +249,7 @@ fn transformation_normal_pit_is_uniform_on_bounded_support() {
         panic!("expected a TransformationNormal fit result");
     };
 
-    let edf = tn
-        .fit
-        .inference
-        .as_ref()
-        .and_then(|inf| inf.edf_total())
-        .unwrap_or(f64::NAN);
+    let edf = tn.fit.edf_total().unwrap_or(f64::NAN);
 
     // Dense covariate design at the training rows (n × p_cov).
     let cov_design: &TermCollectionDesign = &tn.covariate_design;

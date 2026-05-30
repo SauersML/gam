@@ -1,10 +1,14 @@
 """Differentiable basis, penalty, and closed-form ridge primitives for torch.
 
 These wrappers mirror the NumPy entry points in :mod:`gamfit._api`.
-``bspline_basis`` carries an analytic backward with respect to ``t`` through
-a :class:`torch.autograd.Function` subclass. The Duchon, derivative,
-penalty, and closed-form ridge paths are forward-only and produced via the
-detach-cast-call-numpy-wrap path in :mod:`gamfit.torch._coerce`.
+``bspline_basis`` and ``duchon_basis`` carry an analytic backward with
+respect to their evaluation locations through :class:`torch.autograd.Function`
+subclasses (the Duchon backward contracts the upstream cotangent with the
+input-location jets of the *built* design from the Rust
+``duchon_basis_with_jets`` kernel, and supports second-order autograd). The
+derivative, penalty, and closed-form ridge paths are forward-only and
+produced via the detach-cast-call-numpy-wrap path in
+:mod:`gamfit.torch._coerce`.
 """
 
 from __future__ import annotations
@@ -135,13 +139,53 @@ class _BsplineJetFn(torch.autograd.Function):
         return grad_t, None, None, None
 
 
-class _DuchonBasisFn(torch.autograd.Function):
-    """Autograd Function evaluating the Rust multi-dim Duchon basis.
+def _duchon_basis_kwargs(
+    m: int,
+    length_scale: float | None,
+    periodic_per_axis: tuple[bool, ...] | None,
+) -> dict[str, Any]:
+    """Assemble the spec kwargs passed to the Rust Duchon forward / jet calls.
 
-    Forward-only with respect to ``points``: the multi-dim derivative basis
-    is not yet exposed by the Rust binding, so backward returns ``None`` for
-    every input. Callers needing gradients through ``points`` should compose
-    with autograd-supported primitives upstream.
+    Kept in one place so that the forward design and its analytic jets are
+    always resolved from a bit-identical spec (nullspace order, power,
+    length-scale, periodic chord embedding, amplification).
+    """
+    kwargs: dict[str, Any] = {"m": int(m)}
+    if periodic_per_axis is not None:
+        kwargs["periodic_per_axis"] = tuple(bool(p) for p in periodic_per_axis)
+    if length_scale is not None:
+        kwargs["length_scale"] = float(length_scale)
+    return kwargs
+
+
+def _duchon_design_jets(
+    pts_np: Any, ctrs_np: Any, kwargs: dict[str, Any]
+) -> tuple[Any, Any, Any]:
+    """Forward design, first jet ``(B, M, d)``, second jet ``(B, M, d, d)``.
+
+    A single Rust ``duchon_basis_with_jets`` call so all three are built from
+    the *same* resolved spec — the jets are the exact input-location
+    derivatives of the returned built design (not of the raw radial kernel).
+    """
+    import numpy as np
+
+    phi_np, jet_np, hess_np = _api.rust_module().duchon_basis_with_jets(
+        pts_np, ctrs_np, **kwargs
+    )
+    return (
+        np.asarray(phi_np, dtype=float),
+        np.asarray(jet_np, dtype=float),
+        np.asarray(hess_np, dtype=float),
+    )
+
+
+class _DuchonJetFn(torch.autograd.Function):
+    """Input-location first jet ``∂X/∂x`` of the built Duchon design.
+
+    Forward returns ``(B, M, d)``. Backward contracts the upstream cotangent
+    with the Rust second jet (Hessian) ``∂²X/∂x∂xᵀ`` so that a second
+    autograd pass — the descriptor's ``hessian`` (autograd of ``jacobian``) —
+    is exact rather than finite-differenced.
     """
 
     @staticmethod
@@ -150,20 +194,91 @@ class _DuchonBasisFn(torch.autograd.Function):
         points: torch.Tensor,
         centers: torch.Tensor,
         m: int,
+        length_scale: float | None,
         periodic_per_axis: tuple[bool, ...] | None,
     ) -> torch.Tensor:
         pts_np = to_numpy_f64(points)
-        centers_np = to_numpy_f64(centers)
-        basis_np = _api.duchon_basis(
-            pts_np, centers_np, m=m, periodic_per_axis=periodic_per_axis,
+        ctrs_np = to_numpy_f64(centers)
+        kwargs = _duchon_basis_kwargs(m, length_scale, periodic_per_axis)
+        _phi, jet_np, _hess = _duchon_design_jets(pts_np, ctrs_np, kwargs)
+        ctx.save_for_backward(points, centers)
+        ctx.m = int(m)
+        ctx.length_scale = length_scale
+        ctx.periodic_per_axis = periodic_per_axis
+        return from_numpy_like(jet_np, points)
+
+    @staticmethod
+    def backward(
+        ctx: Any, *grad_outputs: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None, None, None]:
+        (grad_jet,) = grad_outputs  # (B, M, d)
+        points, centers = ctx.saved_tensors
+        pts_np = to_numpy_f64(points)
+        ctrs_np = to_numpy_f64(centers)
+        kwargs = _duchon_basis_kwargs(
+            ctx.m, ctx.length_scale, ctx.periodic_per_axis
         )
+        _phi, _jet, hess_np = _duchon_design_jets(pts_np, ctrs_np, kwargs)
+        hess = from_numpy_like(hess_np, points)
+        grad_pts = torch.einsum(
+            "bmj,bmij->bi", grad_jet.to(dtype=hess.dtype), hess
+        )
+        return grad_pts, None, None, None, None
+
+
+class _DuchonBasisFn(torch.autograd.Function):
+    """Autograd Function evaluating the Rust multi-dim Duchon basis.
+
+    The Rust Duchon *forward* design is **not** the raw centerwise radial
+    kernel ``K(x, C)``; it is the built design
+
+    ``X(x) = [ α · K(x, C) · Z ,  P(x) ]``,
+
+    where ``Z = null(P(C)ᵀ)`` is the polynomial-constraint null space,
+    ``P(x)`` the appended monomial nullspace columns, and ``α`` the kernel
+    amplification factor. Backward differentiates **that** matrix,
+    column-for-column, by contracting the upstream cotangent with the
+    analytic first jet ``∂X/∂x`` from :func:`duchon_basis_with_jets`. The jet
+    is routed through :class:`_DuchonJetFn` so that ``torch.autograd.grad`` of
+    the Jacobian — the input-location Hessian — is itself well-defined via the
+    Rust second jet. Gradients with respect to ``points`` are exact and
+    analytic; ``centers`` and the structural spec carry no gradient.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        points: torch.Tensor,
+        centers: torch.Tensor,
+        m: int,
+        length_scale: float | None,
+        periodic_per_axis: tuple[bool, ...] | None,
+    ) -> torch.Tensor:
+        pts_np = to_numpy_f64(points)
+        ctrs_np = to_numpy_f64(centers)
+        kwargs = _duchon_basis_kwargs(m, length_scale, periodic_per_axis)
+        basis_np = _api.duchon_basis(pts_np, ctrs_np, **kwargs)
+        ctx.save_for_backward(points, centers)
+        ctx.m = int(m)
+        ctx.length_scale = length_scale
+        ctx.periodic_per_axis = periodic_per_axis
         return from_numpy_like(basis_np, points)
 
     @staticmethod
     def backward(
         ctx: Any, *grad_outputs: torch.Tensor
-    ) -> tuple[None, None, None, None]:
-        return None, None, None, None
+    ) -> tuple[torch.Tensor, None, None, None, None]:
+        (grad_basis,) = grad_outputs  # (B, M)
+        points, centers = ctx.saved_tensors
+        # Jet is autograd-tracked through ``points`` so a second backward
+        # (input-location Hessian) routes through ``_DuchonJetFn.backward``.
+        jet = cast(Callable[..., torch.Tensor], _DuchonJetFn.apply)(
+            points, centers, ctx.m, ctx.length_scale, ctx.periodic_per_axis
+        )  # (B, M, d)
+        grad_pts = torch.einsum(
+            "bm,bmj->bj", grad_basis.to(dtype=jet.dtype), jet
+        )
+        return grad_pts, None, None, None, None
 
 
 def bspline_basis(
@@ -248,6 +363,7 @@ def duchon_basis(
     centers: Any = None,
     *,
     m: int = 2,
+    length_scale: float | None = None,
     periodic_per_axis: tuple[bool, ...] | None = None,
 ) -> torch.Tensor:
     """Evaluate the Duchon m-spline basis at ``points``.
@@ -255,17 +371,28 @@ def duchon_basis(
     Multi-dimensional: ``points`` is ``(N, d)``, ``centers`` is ``(K, d)``.
     For 1D, pass shape ``(N,)`` or ``(N, 1)`` — auto-promoted.
 
+    This is the canonical, differentiable Torch entry point for the Duchon
+    basis. Gradients with respect to ``points`` are exact and analytic: the
+    backward contracts the upstream cotangent with the input-location first
+    jet of the *built* design from the Rust ``duchon_basis_with_jets`` kernel,
+    and a second autograd pass (the input-location Hessian) routes through the
+    Rust second jet. ``centers`` and the structural spec carry no gradient.
+
     Parameters
     ----------
     points : torch.Tensor
         Evaluation locations, shape ``(N, d)`` or ``(N,)`` for d=1.
-        Treated as structural: no gradient is propagated through
-        ``points``.
+        Differentiable input.
     centers : torch.Tensor or int or None
         Center locations, shape ``(K, d)``. Auto-derived from ``points``
-        for d=1 if None or an int.
+        for d=1 if None or an int. Treated as structural — no gradient is
+        propagated through ``centers``.
     m : int, optional
         Duchon smoothness order. Default ``2``.
+    length_scale : positive float or None, optional
+        ``None`` (default) selects the scale-free pure Duchon spectrum; a
+        positive value enables the hybrid (Matérn-blended) spectrum. Routed
+        verbatim to the Rust forward and jet calls.
     periodic_per_axis : sequence of bool of length d, optional.
         Currently only d=1 supports periodicity.
 
@@ -294,7 +421,8 @@ def duchon_basis(
             )
     apply = cast(Callable[..., torch.Tensor], _DuchonBasisFn.apply)
     periodic_tuple = None if periodic_per_axis is None else tuple(bool(p) for p in periodic_per_axis)
-    return apply(points, centers_t, int(m), periodic_tuple)
+    ls = None if length_scale is None else float(length_scale)
+    return apply(points, centers_t, int(m), ls, periodic_tuple)
 
 
 def sphere_basis(

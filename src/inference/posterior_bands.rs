@@ -123,3 +123,105 @@ pub fn posterior_eta_bands(
         family_kind: family_kind.to_string(),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::quantile::quantile_from_sorted;
+    use ndarray::Array2;
+
+    /// Parity / regression test pinning the *single* posterior eta-band
+    /// engine to its documented semantics, so future interval-logic fixes
+    /// land here and nowhere else.
+    ///
+    /// Two contracts are asserted against an independent hand computation:
+    ///
+    ///   1. Link-scale credible bounds are the shared numpy-`linear`
+    ///      quantile (`util::quantile::quantile_from_sorted`) of the
+    ///      per-row eta draws — *not* a normal-approximation interval.
+    ///   2. The response-scale point estimate is `E[g^{-1}(eta)]` (mean of
+    ///      inverse-link draws), *not* `g^{-1}(E[eta])`. Under a strictly
+    ///      convex inverse link the two differ by Jensen's inequality, and
+    ///      this asymmetric column makes that difference observable.
+    #[test]
+    fn eta_bands_match_shared_quantile_and_response_mean_semantics() {
+        // Column 0: symmetric draws. Column 1: deliberately skewed so the
+        // mean of exp(eta) sits strictly above exp(mean(eta)).
+        let eta = Array2::from_shape_vec(
+            (5, 2),
+            vec![
+                -2.0, 0.0, //
+                -1.0, 0.5, //
+                0.0, 1.0, //
+                1.0, 1.5, //
+                2.0, 4.0, //
+            ],
+        )
+        .expect("shape");
+        let level = 0.80; // alpha = 0.10 each tail
+        let alpha = (1.0 - level) / 2.0;
+
+        let (eta_mean, eta_lower, eta_upper, mean, _mean_lower, _mean_upper) =
+            eta_bands_from_matrix(eta.view(), "log", level).expect("bands");
+
+        for j in 0..2 {
+            let mut col: Vec<f64> = (0..5).map(|k| eta[[k, j]]).collect();
+            let inv_n = 1.0 / 5.0;
+            let mean_eta: f64 = col.iter().sum::<f64>() * inv_n;
+            assert!(
+                (eta_mean[j] - mean_eta).abs() < 1e-12,
+                "eta mean mismatch col {j}"
+            );
+
+            // Response-scale point estimate = mean of inverse-link draws.
+            let resp_mean: f64 = col.iter().map(|e| e.exp()).sum::<f64>() * inv_n;
+            assert!(
+                (mean[j] - resp_mean).abs() < 1e-12,
+                "response mean must be E[g^-1(eta)] for col {j}"
+            );
+
+            col.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+            let lo = quantile_from_sorted(&col, alpha);
+            let hi = quantile_from_sorted(&col, 1.0 - alpha);
+            assert!(
+                (eta_lower[j] - lo).abs() < 1e-12,
+                "lower band must be shared linear quantile col {j}"
+            );
+            assert!(
+                (eta_upper[j] - hi).abs() < 1e-12,
+                "upper band must be shared linear quantile col {j}"
+            );
+        }
+
+        // Jensen gap is real and oriented: for the skewed column the
+        // response mean strictly exceeds g^{-1}(mean(eta)).
+        let mean_eta_col1: f64 = (0..5).map(|k| eta[[k, 1]]).sum::<f64>() / 5.0;
+        assert!(
+            mean[1] > mean_eta_col1.exp() + 1e-9,
+            "E[exp(eta)] must exceed exp(E[eta]) for the convex link"
+        );
+    }
+
+    /// Empty draws degrade to all-zero bands without panicking, matching
+    /// the documented graceful-degradation contract.
+    #[test]
+    fn empty_draws_yield_zero_bands() {
+        let eta = Array2::<f64>::zeros((0, 3));
+        let (eta_mean, eta_lower, eta_upper, mean, mean_lower, mean_upper) =
+            eta_bands_from_matrix(eta.view(), "identity", 0.95).expect("bands");
+        for v in [
+            &eta_mean, &eta_lower, &eta_upper, &mean, &mean_lower, &mean_upper,
+        ] {
+            assert_eq!(v.len(), 3);
+            assert!(v.iter().all(|x| *x == 0.0));
+        }
+    }
+
+    /// Levels outside (0, 1) are rejected rather than silently clamped.
+    #[test]
+    fn level_must_lie_in_open_unit_interval() {
+        let eta = Array2::<f64>::zeros((4, 2));
+        assert!(eta_bands_from_matrix(eta.view(), "identity", 0.0).is_err());
+        assert!(eta_bands_from_matrix(eta.view(), "identity", 1.0).is_err());
+    }
+}

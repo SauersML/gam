@@ -6,8 +6,10 @@
 //! smoothing parameters `λ_a` (length `K`) scale `S` independently for each
 //! response. Because the Fisher information has no cross-column coupling
 //! (`H_{n,a,b} = δ_{ab} · w_n · μ_{n,a} (1 − μ_{n,a})`), the joint penalized
-//! Hessian decouples into `K` block-diagonal `P × P` systems and each
-//! response is fitted by its own damped Newton loop.
+//! Hessian is block-diagonal in the `K` `P × P` per-response systems; the
+//! shared [`crate::families::penalized_vector_glm`] engine factors that
+//! block-diagonal Hessian in a single coupled damped-Newton loop, which is
+//! mathematically identical to `K` independent per-column solves.
 //!
 //! # Fit problem
 //!
@@ -27,8 +29,10 @@
 //!
 //! followed by a backtracking line search on `F` (full step first, halve up
 //! to 8 times) so monotone descent is enforced even when the quadratic
-//! model overshoots near saturation. Convergence is the same
-//! relative-step criterion as `fit_penalized_multinomial`.
+//! model overshoots near saturation. This is precisely the shared
+//! [`crate::families::penalized_vector_glm`] scaffold; this module supplies
+//! only the row-diagonal binomial Fisher block, residual, and log-likelihood
+//! via [`BinomialMultiLikelihood`].
 //!
 //! # Relation to the multi-class softmax driver
 //!
@@ -38,16 +42,21 @@
 //! probability vector per row. This driver is the right entry when the
 //! user has `K` independent binary marginals sharing a smooth basis (e.g.
 //! multi-label classification, multi-trait penalised logistic regression
-//! on a Duchon latent design).
+//! on a Duchon latent design). Both families are thin Fisher-block adapters
+//! over the same `penalized_vector_glm` engine: the only difference is that
+//! the softmax block is dense across outputs while these binomial columns are
+//! row-diagonal.
 //!
 //! The function-boundary contract mirrors `fit_penalized_multinomial` so
 //! the two are interchangeable at the FFI layer: same input arity, same
 //! convergence semantics, same `(N, K)` fitted-probability output.
 
-use crate::faer_ndarray::{FaerArrayView, array2_to_matmut, factorize_symmetricwith_fallback};
+use crate::families::penalized_vector_glm::{
+    PenalizedVectorGlmInputs, fit_penalized_vector_glm,
+};
+use crate::families::vector_response::VectorLikelihood;
 use crate::solver::estimate::EstimationError;
-use faer::Side;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3};
+use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3};
 
 /// Inputs for [`fit_penalized_binomial_multi`].
 #[derive(Debug, Clone)]
@@ -89,13 +98,13 @@ pub struct BinomialMultiFitOutputs {
     pub coefficients: Array2<f64>,
     /// Fitted probabilities `μ_{n,a} = σ((X β_a)_n)`, shape `(N, K)`.
     pub fitted_probabilities: Array2<f64>,
-    /// Total Newton iterations summed across all `K` response columns. For a
-    /// per-column breakdown, callers can inspect `iterations_per_response`.
+    /// Number of joint Newton iterations executed (including the final step
+    /// that satisfied the tolerance). The `K` columns share the design and
+    /// are fitted by a single coupled damped-Newton loop over the
+    /// block-diagonal penalized Hessian, so there is one iteration count for
+    /// the whole solve.
     pub iterations: usize,
-    /// Per-response Newton iteration count, length `K`.
-    pub iterations_per_response: Vec<usize>,
-    /// `true` if every column satisfied the relative-step test before
-    /// `max_iter`. `false` if any column exhausted the budget.
+    /// `true` if the relative-step test was satisfied before `max_iter`.
     pub converged: bool,
     /// Penalized negative log-likelihood at the returned `β̂`:
     /// `−log L(β̂) + ½ Σ_a λ_a · β̂_aᵀ S β̂_a`.
@@ -117,24 +126,89 @@ fn sigmoid_stable(eta: f64) -> f64 {
     }
 }
 
-/// Penalized binomial log-likelihood contribution for one response column.
-/// Returns `Σ_n w_n [ y_n log μ_n + (1 − y_n) log(1 − μ_n) ]`, clamping
-/// `μ_n` to `[1e-12, 1 − 1e-12]` so the closed-form expression remains
-/// finite when β drives a row deeply into saturation during a tentative
-/// Newton step (the surrounding line search rejects such steps).
-fn binomial_log_lik_column(
-    eta_col: ArrayView1<'_, f64>,
-    y_col: ArrayView1<'_, f64>,
-    row_weights: Option<ArrayView1<'_, f64>>,
-) -> f64 {
-    let mut acc = 0.0_f64;
-    for (i, &eta_i) in eta_col.iter().enumerate() {
-        let mu = sigmoid_stable(eta_i).clamp(1.0e-12, 1.0 - 1.0e-12);
-        let y = y_col[i];
-        let w = row_weights.as_ref().map(|w| w[i]).unwrap_or(1.0);
-        acc += w * (y * mu.ln() + (1.0 - y) * (1.0 - mu).ln());
+/// Row-diagonal multi-output binomial-logit likelihood adapter for the shared
+/// [`crate::families::penalized_vector_glm`] engine.
+///
+/// The `K` response columns are mutually independent binomial-logit marginals
+/// sharing the design `X`, so the per-row Fisher block is **diagonal across
+/// outputs**: `H_{n,a,b} = δ_{ab} · w_n · μ_{n,a} (1 − μ_{n,a})`. The engine
+/// works in `η = X β` space with `μ_{n,a} = σ(η_{n,a})`; this adapter supplies
+/// the log-likelihood, the residual gradient `w_n (y_a − μ_a)`, and that
+/// row-diagonal block.
+struct BinomialMultiLikelihood {
+    /// Optional per-row weights (length N), or `None` for uniform 1.0.
+    row_weights: Option<Array1<f64>>,
+}
+
+impl BinomialMultiLikelihood {
+    #[inline]
+    fn row_weight(&self, n: usize) -> f64 {
+        self.row_weights.as_ref().map_or(1.0, |w| w[n])
     }
-    acc
+}
+
+impl VectorLikelihood for BinomialMultiLikelihood {
+    /// `Σ_n Σ_a w_n [ y_{n,a} log μ_{n,a} + (1 − y_{n,a}) log(1 − μ_{n,a}) ]`,
+    /// clamping `μ` to `[1e-12, 1 − 1e-12]` so the closed-form expression stays
+    /// finite when β drives a row deeply into saturation during a tentative
+    /// Newton step (the surrounding line search rejects such steps).
+    fn log_lik(&self, eta: ArrayView2<'_, f64>, y: ArrayView2<'_, f64>) -> f64 {
+        let (n, k) = eta.dim();
+        let mut acc = 0.0_f64;
+        for row in 0..n {
+            let w = self.row_weight(row);
+            for a in 0..k {
+                let mu = sigmoid_stable(eta[[row, a]]).clamp(1.0e-12, 1.0 - 1.0e-12);
+                let yv = y[[row, a]];
+                acc += w * (yv * mu.ln() + (1.0 - yv) * (1.0 - mu).ln());
+            }
+        }
+        acc
+    }
+
+    /// `∂ log L / ∂η_{n,a} = w_n (y_{n,a} − μ_{n,a})`.
+    fn grad_eta(&self, eta: ArrayView2<'_, f64>, y: ArrayView2<'_, f64>) -> Array2<f64> {
+        let (n, k) = eta.dim();
+        let mut out = Array2::<f64>::zeros((n, k));
+        for row in 0..n {
+            let w = self.row_weight(row);
+            for a in 0..k {
+                let mu = sigmoid_stable(eta[[row, a]]);
+                out[[row, a]] = w * (y[[row, a]] - mu);
+            }
+        }
+        out
+    }
+
+    /// Per-output diagonal curvature `w_n μ_{n,a} (1 − μ_{n,a})`.
+    fn hess_diag(&self, eta: ArrayView2<'_, f64>, _y: ArrayView2<'_, f64>) -> Array2<f64> {
+        let (n, k) = eta.dim();
+        let mut out = Array2::<f64>::zeros((n, k));
+        for row in 0..n {
+            let w = self.row_weight(row);
+            for a in 0..k {
+                let mu = sigmoid_stable(eta[[row, a]]);
+                out[[row, a]] = w * mu * (1.0 - mu);
+            }
+        }
+        out
+    }
+
+    /// Row-diagonal Fisher block `H_{n,a,b} = δ_{ab} · w_n μ_{n,a}(1 − μ_{n,a})`.
+    /// The independent columns have no cross-output coupling, so the off-diagonal
+    /// entries are identically zero; lifting [`Self::hess_diag`] onto the per-row
+    /// diagonal (the [`VectorLikelihood`] default) is exact here.
+    fn hess_block(&self, eta: ArrayView2<'_, f64>, y: ArrayView2<'_, f64>) -> Array3<f64> {
+        let diag = self.hess_diag(eta, y);
+        let (n, k) = diag.dim();
+        let mut out = Array3::<f64>::zeros((n, k, k));
+        for row in 0..n {
+            for a in 0..k {
+                out[[row, a, a]] = diag[[row, a]];
+            }
+        }
+        out
+    }
 }
 
 /// Fit `K` independent penalized binomial-logit GLMs sharing the design `X`
@@ -153,14 +227,15 @@ pub fn fit_penalized_binomial_multi(
         tol,
     } = inputs;
 
-    // ────────────────────────────── shape checks ──────────────────────────
+    // ──────────────────────── family-specific validation ───────────────────
+    // The engine re-validates the shared geometry (nonempty design, penalty
+    // shape, λ finiteness/non-negativity, override `(N, M, M)` shape, finite
+    // design), but the binomial family owns three preconditions the generic
+    // scaffold cannot know: the response must be a `[0, 1]` proportion, the
+    // optional row weights must be finite and non-negative, and the optional
+    // curvature override must be **row-diagonal** (independent columns carry no
+    // cross-output coupling, so a non-zero off-diagonal cannot be represented).
     let n_obs = design.nrows();
-    let p = design.ncols();
-    if n_obs == 0 || p == 0 {
-        crate::bail_invalid_estim!(
-            "fit_penalized_binomial_multi: design must be nonempty (got {n_obs}x{p})"
-        );
-    }
     let (y_rows, k) = y.dim();
     if y_rows != n_obs {
         crate::bail_invalid_estim!(
@@ -178,25 +253,24 @@ pub fn fit_penalized_binomial_multi(
             lambdas.len()
         );
     }
-    if penalty.dim() != (p, p) {
-        crate::bail_invalid_estim!(
-            "fit_penalized_binomial_multi: penalty shape {:?} ≠ (P, P) = ({p}, {p})",
-            penalty.dim()
-        );
-    }
-    for (i, &v) in lambdas.iter().enumerate() {
-        if !(v.is_finite() && v >= 0.0) {
-            crate::bail_invalid_estim!(
-                "fit_penalized_binomial_multi: lambdas[{i}] must be finite and ≥ 0 (got {v})"
-            );
-        }
-    }
     if let Some(fw) = fisher_w_override.as_ref() {
         if fw.dim() != (n_obs, k, k) {
             crate::bail_invalid_estim!(
                 "fit_penalized_binomial_multi: fisher_w_override shape {:?} ≠ (N, K, K) = ({n_obs}, {k}, {k})",
                 fw.dim()
             );
+        }
+        // Independent binomial columns have a strictly row-diagonal Fisher
+        // block; a non-zero cross term `[n, a, b]` (a ≠ b) cannot be the
+        // curvature of a separable per-column objective, so reject it rather
+        // than silently couple the columns through the shared dense solve.
+        for ((n_idx, a, b), &v) in fw.indexed_iter() {
+            if a != b && v != 0.0 {
+                crate::bail_invalid_estim!(
+                    "fit_penalized_binomial_multi: fisher_w_override[{n_idx},{a},{b}] must be zero \
+                     (independent columns have a row-diagonal Fisher block); got {v}"
+                );
+            }
         }
     }
     if let Some(w) = row_weights.as_ref() {
@@ -226,263 +300,35 @@ pub fn fit_penalized_binomial_multi(
             );
         }
     }
-    for ((i, j), &v) in design.indexed_iter() {
-        if !v.is_finite() {
-            crate::bail_invalid_estim!(
-                "fit_penalized_binomial_multi: design[{i},{j}] must be finite (got {v})"
-            );
-        }
-    }
 
-    // ────────────────────────── Newton iteration ──────────────────────────
-    let mut beta = Array2::<f64>::zeros((p, k));
-    let mut eta = Array2::<f64>::zeros((n_obs, k));
-    let mut fitted = Array2::<f64>::zeros((n_obs, k));
-    let mut iterations_per_response = vec![0_usize; k];
-    let mut all_converged = true;
+    // ─────────────────── shared penalized vector-GLM solve ─────────────────
+    let likelihood = BinomialMultiLikelihood {
+        row_weights: row_weights.map(|w| w.to_owned()),
+    };
+    let fit = fit_penalized_vector_glm(
+        PenalizedVectorGlmInputs {
+            design,
+            y,
+            penalty,
+            lambdas,
+            fisher_w_override,
+            max_iter,
+            tol,
+        },
+        &likelihood,
+        "fit_penalized_binomial_multi",
+    )?;
 
-    for a in 0..k {
-        let lambda_a = lambdas[a];
-        let y_col = y.column(a);
-        let mut converged_a = false;
-        let mut last_objective_a = f64::INFINITY;
-
-        for iter in 0..max_iter {
-            iterations_per_response[a] = iter + 1;
-
-            // η_a = X β_a; μ_a = σ(η_a).
-            for row in 0..n_obs {
-                let mut eta_val = 0.0_f64;
-                for i in 0..p {
-                    eta_val += design[[row, i]] * beta[[i, a]];
-                }
-                eta[[row, a]] = eta_val;
-                fitted[[row, a]] = sigmoid_stable(eta_val);
-            }
-
-            // Working weights diag(w_n μ_n (1 − μ_n)) and gradient
-            // contribution Xᵀ diag(w_n)(μ_n − y_n).
-            let mut hess_diag = Array1::<f64>::zeros(n_obs);
-            let mut grad = Array1::<f64>::zeros(p);
-            for row in 0..n_obs {
-                let mu = fitted[[row, a]];
-                let w = row_weights.as_ref().map(|w| w[row]).unwrap_or(1.0);
-                // Curvature: caller override diagonal when present, else the
-                // analytic binomial Fisher w_n μ_a(1 − μ_a) (issue #349).
-                hess_diag[row] = match fisher_w_override.as_ref() {
-                    Some(fw) => fw[[row, a, a]],
-                    None => w * mu * (1.0 - mu),
-                };
-                let resid = w * (mu - y_col[row]);
-                if resid != 0.0 {
-                    for i in 0..p {
-                        grad[i] += design[[row, i]] * resid;
-                    }
-                }
-            }
-
-            // Penalty gradient λ_a S β_a.
-            if lambda_a != 0.0 {
-                let beta_col = beta.column(a);
-                for i in 0..p {
-                    let mut s_beta_i = 0.0_f64;
-                    for j in 0..p {
-                        s_beta_i += penalty[[i, j]] * beta_col[j];
-                    }
-                    grad[i] += lambda_a * s_beta_i;
-                }
-            }
-
-            // Penalized Hessian Xᵀ diag(w_n μ_n (1 − μ_n)) X + λ_a S.
-            let mut hessian = Array2::<f64>::zeros((p, p));
-            for row in 0..n_obs {
-                let w = hess_diag[row];
-                if w == 0.0 {
-                    continue;
-                }
-                for i in 0..p {
-                    let xi = design[[row, i]];
-                    if xi == 0.0 {
-                        continue;
-                    }
-                    let scaled = w * xi;
-                    for j in 0..p {
-                        hessian[[i, j]] += scaled * design[[row, j]];
-                    }
-                }
-            }
-            if lambda_a != 0.0 {
-                for i in 0..p {
-                    for j in 0..p {
-                        hessian[[i, j]] += lambda_a * penalty[[i, j]];
-                    }
-                }
-            }
-            // Symmetrise to discharge accumulated rounding asymmetry.
-            for i in 0..p {
-                for j in (i + 1)..p {
-                    let avg = 0.5 * (hessian[[i, j]] + hessian[[j, i]]);
-                    hessian[[i, j]] = avg;
-                    hessian[[j, i]] = avg;
-                }
-            }
-
-            // δ = − H^{-1} grad.
-            let factor = factorize_symmetricwith_fallback(
-                FaerArrayView::new(&hessian).as_ref(),
-                Side::Lower,
-            )
-            .map_err(|err| {
-                EstimationError::InvalidInput(format!(
-                    "fit_penalized_binomial_multi: Hessian factorization failed at response {a}, iter {iter}: {err}"
-                ))
-            })?;
-            let mut rhs = Array2::<f64>::zeros((p, 1));
-            for i in 0..p {
-                rhs[[i, 0]] = -grad[i];
-            }
-            {
-                let rhs_view = array2_to_matmut(&mut rhs);
-                factor.solve_in_place(rhs_view);
-            }
-            let mut delta = Array1::<f64>::zeros(p);
-            for i in 0..p {
-                delta[i] = rhs[[i, 0]];
-            }
-            if delta.iter().any(|v| !v.is_finite()) {
-                crate::bail_invalid_estim!(
-                    "fit_penalized_binomial_multi: Newton step is non-finite at response {a}, iter {iter}"
-                );
-            }
-
-            // Penalized objective evaluator at a trial β_a.
-            let evaluate_objective = |beta_trial_col: &Array1<f64>| -> f64 {
-                let mut eta_trial = Array1::<f64>::zeros(n_obs);
-                for row in 0..n_obs {
-                    let mut v = 0.0_f64;
-                    for i in 0..p {
-                        v += design[[row, i]] * beta_trial_col[i];
-                    }
-                    eta_trial[row] = v;
-                }
-                let ll = binomial_log_lik_column(eta_trial.view(), y_col.view(), row_weights);
-                let mut pen = 0.0_f64;
-                if lambda_a != 0.0 {
-                    let mut quad = 0.0_f64;
-                    for i in 0..p {
-                        let mut s_beta_i = 0.0_f64;
-                        for j in 0..p {
-                            s_beta_i += penalty[[i, j]] * beta_trial_col[j];
-                        }
-                        quad += beta_trial_col[i] * s_beta_i;
-                    }
-                    pen = 0.5 * lambda_a * quad;
-                }
-                -ll + pen
-            };
-
-            if iter == 0 {
-                let beta_init: Array1<f64> = beta.column(a).to_owned();
-                last_objective_a = evaluate_objective(&beta_init);
-                if !last_objective_a.is_finite() {
-                    crate::bail_invalid_estim!(
-                        "fit_penalized_binomial_multi: non-finite objective at response {a}, β = 0"
-                    );
-                }
-            }
-
-            // Backtracking line search; up to 8 halvings.
-            let propose_beta = |alpha: f64| -> Array1<f64> {
-                let mut out: Array1<f64> = beta.column(a).to_owned();
-                for i in 0..p {
-                    out[i] += alpha * delta[i];
-                }
-                out
-            };
-            let mut alpha = 1.0_f64;
-            let mut accepted_beta_a = propose_beta(alpha);
-            let mut new_objective = evaluate_objective(&accepted_beta_a);
-            let mut backtrack = 0_usize;
-            while (!new_objective.is_finite() || new_objective > last_objective_a + 1.0e-12)
-                && backtrack < 8
-            {
-                alpha *= 0.5;
-                accepted_beta_a = propose_beta(alpha);
-                new_objective = evaluate_objective(&accepted_beta_a);
-                backtrack += 1;
-            }
-
-            // Relative-step convergence test.
-            let mut step_norm_sq = 0.0_f64;
-            let mut beta_norm_sq = 0.0_f64;
-            for i in 0..p {
-                let d = accepted_beta_a[i] - beta[[i, a]];
-                step_norm_sq += d * d;
-                let v = accepted_beta_a[i];
-                beta_norm_sq += v * v;
-            }
-            for i in 0..p {
-                beta[[i, a]] = accepted_beta_a[i];
-            }
-            last_objective_a = new_objective;
-
-            let step_norm = step_norm_sq.sqrt();
-            let beta_norm = beta_norm_sq.sqrt();
-            if step_norm <= tol * (1.0 + beta_norm) {
-                converged_a = true;
-                break;
-            }
-        }
-        if !converged_a {
-            all_converged = false;
-        }
-    }
-
-    // ──────────────────────────── post-process ────────────────────────────
-    // Recompute η, μ from final β̂ and tally the penalized objective.
-    for a in 0..k {
-        for row in 0..n_obs {
-            let mut v = 0.0_f64;
-            for i in 0..p {
-                v += design[[row, i]] * beta[[i, a]];
-            }
-            eta[[row, a]] = v;
-            fitted[[row, a]] = sigmoid_stable(v);
-        }
-    }
-    let mut log_lik = 0.0_f64;
-    for a in 0..k {
-        log_lik += binomial_log_lik_column(eta.column(a), y.column(a), row_weights);
-    }
-    let mut pen = 0.0_f64;
-    for a in 0..k {
-        let la = lambdas[a];
-        if la == 0.0 {
-            continue;
-        }
-        let beta_col = beta.column(a);
-        let mut quad = 0.0_f64;
-        for i in 0..p {
-            let mut s_beta_i = 0.0_f64;
-            for j in 0..p {
-                s_beta_i += penalty[[i, j]] * beta_col[j];
-            }
-            quad += beta_col[i] * s_beta_i;
-        }
-        pen += 0.5 * la * quad;
-    }
-    let penalized_neg_log_likelihood = -log_lik + pen;
-    let deviance = -2.0 * log_lik;
-    let iterations: usize = iterations_per_response.iter().sum();
+    // η → μ = σ(η) is the binomial inverse link applied column-wise.
+    let fitted = fit.eta.mapv(sigmoid_stable);
 
     Ok(BinomialMultiFitOutputs {
-        coefficients: beta,
+        coefficients: fit.coefficients,
         fitted_probabilities: fitted,
-        iterations,
-        iterations_per_response,
-        converged: all_converged,
-        penalized_neg_log_likelihood,
-        deviance,
+        iterations: fit.iterations,
+        converged: fit.converged,
+        penalized_neg_log_likelihood: -fit.log_likelihood + fit.penalty_term,
+        deviance: -2.0 * fit.log_likelihood,
     })
 }
 

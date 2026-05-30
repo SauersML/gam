@@ -42,7 +42,6 @@
 //! A failing assertion means gam's transformation / smooth-covariate pathway truly
 //! diverges from the mature reference; we never weaken the bound or edit gam.
 
-use gam::matrix::LinearOperator;
 use gam::smooth::TermCollectionDesign;
 use gam::terms::basis::{BasisOptions, Dense, KnotSource, create_basis, create_ispline_derivative_dense};
 use gam::test_support::reference::{Column, pearson, relative_l2, run_r};
@@ -249,7 +248,7 @@ fn gam_smooth_transformation_matches_r_tram_on_heart_failure() {
         .fit
         .inference
         .as_ref()
-        .and_then(|inf| inf.edf_total())
+        .map(|inf| inf.edf_total)
         .expect("gam reports total edf");
 
     // ---- age grid for the conditional-mean / smooth-effect comparison -------
@@ -349,7 +348,7 @@ fn gam_smooth_transformation_matches_r_tram_on_heart_failure() {
             # Predict ns() basis at the grid ages using the TRAINING spline (same
             # knots), then form the conditional mean E[Y|age] by numeric quadrature
             # of the fitted density on a shared y-grid, exactly as gam does.
-            spg <- predict(sp, newdata = ag)
+            spg <- predict(sp, newx = ag)
             gdat <- as.data.frame(spg)
             colnames(gdat) <- spcols
 

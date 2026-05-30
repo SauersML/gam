@@ -1093,72 +1093,39 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
         let primary_dim = 2usize;
         let zero = Array1::<f64>::zeros(primary_dim);
-        let objective = if second_sigma {
-            let scale = self.sigma_scale_jet(2, &[1, 2], &[3])?;
-            self.row_neglog_directional_with_scale_jet(
-                row,
-                block_states,
-                &[zero.clone(), zero.clone()],
-                &scale,
-            )?
+        // The leading prefix is the fixed number of zero primary directions the
+        // log-sigma hyperderivative differentiates *through*: one for the first
+        // log-sigma derivative, two for the second. The shared sweep appends the
+        // unit primary directions for grad/hess on top of this prefix.
+        let (leading, scales): (Vec<&Array1<f64>>, DirectionalScaleJets) = if second_sigma {
+            (
+                vec![&zero, &zero],
+                DirectionalScaleJets {
+                    obj: Some(self.sigma_scale_jet(2, &[1, 2], &[3])?),
+                    grad: self.sigma_scale_jet(3, &[1, 2], &[3])?,
+                    hess: self.sigma_scale_jet(4, &[1, 2], &[3])?,
+                },
+            )
         } else {
-            let scale = self.sigma_scale_jet(1, &[1], &[])?;
-            self.row_neglog_directional_with_scale_jet(row, block_states, &[zero.clone()], &scale)?
+            (
+                vec![&zero],
+                DirectionalScaleJets {
+                    obj: Some(self.sigma_scale_jet(1, &[1], &[])?),
+                    grad: self.sigma_scale_jet(2, &[1], &[])?,
+                    hess: self.sigma_scale_jet(3, &[1], &[])?,
+                },
+            )
         };
-
-        let mut grad = Array1::<f64>::zeros(primary_dim);
-        for a in 0..primary_dim {
-            let mut da = Array1::<f64>::zeros(primary_dim);
-            da[a] = 1.0;
-            grad[a] = if second_sigma {
-                let scale = self.sigma_scale_jet(3, &[1, 2], &[3])?;
-                self.row_neglog_directional_with_scale_jet(
-                    row,
-                    block_states,
-                    &[zero.clone(), zero.clone(), da],
-                    &scale,
-                )?
-            } else {
-                let scale = self.sigma_scale_jet(2, &[1], &[])?;
-                self.row_neglog_directional_with_scale_jet(
-                    row,
-                    block_states,
-                    &[zero.clone(), da],
-                    &scale,
-                )?
-            };
-        }
-
-        let mut hess = Array2::<f64>::zeros((primary_dim, primary_dim));
-        for a in 0..primary_dim {
-            let mut da = Array1::<f64>::zeros(primary_dim);
-            da[a] = 1.0;
-            for b in a..primary_dim {
-                let mut db = Array1::<f64>::zeros(primary_dim);
-                db[b] = 1.0;
-                let value = if second_sigma {
-                    let scale = self.sigma_scale_jet(4, &[1, 2], &[3])?;
-                    self.row_neglog_directional_with_scale_jet(
-                        row,
-                        block_states,
-                        &[zero.clone(), zero.clone(), da.clone(), db],
-                        &scale,
-                    )?
-                } else {
-                    let scale = self.sigma_scale_jet(3, &[1], &[])?;
-                    self.row_neglog_directional_with_scale_jet(
-                        row,
-                        block_states,
-                        &[zero.clone(), da.clone(), db],
-                        &scale,
-                    )?
-                };
-                hess[[a, b]] = value;
-                hess[[b, a]] = value;
-            }
-        }
-
-        Ok((objective, grad, hess))
+        let terms = directional_obj_grad_hess(
+            primary_dim,
+            &leading,
+            &scales,
+            |dirs, scale| {
+                let owned: Vec<Array1<f64>> = dirs.iter().map(|d| (*d).clone()).collect();
+                self.row_neglog_directional_with_scale_jet(row, block_states, &owned, scale)
+            },
+        )?;
+        Ok((terms.objective, terms.grad, terms.hess))
     }
 
     pub(super) fn accumulate_rigid_sigma_pullback(

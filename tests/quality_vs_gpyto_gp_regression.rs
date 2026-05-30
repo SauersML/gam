@@ -6,9 +6,8 @@
 //! log marginal likelihood over the kernel hyperparameters (length-scale, output
 //! scale) and the Gaussian observation noise. gam's `matern(x, nu=2.5, k=30)`
 //! basis is a finite-rank realization of the same Matérn-5/2 kernel whose
-//! smoothing is selected by REML — i.e. both engines target the *same* marginal
-//! likelihood landscape. Agreement therefore validates four independent pieces of
-//! gam's GP machinery at once:
+//! smoothing is selected by REML. Agreement therefore validates three independent
+//! pieces of gam's GP machinery at once:
 //!
 //!   1. **Fitted posterior mean** on a dense grid — relative L2 < 0.06 (scale-free,
 //!      tight). The synthetic response carries both a smooth oscillation
@@ -20,14 +19,24 @@
 //!      is computed by the SAME routine on both fitted curves, so it compares the
 //!      recovered smoothness scale rather than two engines' internal
 //!      parameterizations: |gam_ρ − gptorch_ρ| / mean < 15%.
-//!   3. **Predictive uncertainty bands** — gam's 95% credible-interval half-width
-//!      `1.96·sqrt(diag(X Vb Xᵀ))` vs GPyTorch's posterior predictive std must
+//!   3. **Latent-function uncertainty bands** — gam's 95% credible-interval
+//!      half-width `1.96·sqrt(diag(X Vb Xᵀ))` (uncertainty of the smooth mean
+//!      function) vs GPyTorch's latent-function posterior std `model(xg).stddev`
+//!      (NOT the noisy-observation std `lik(model(xg))`, which would add σ²) must
 //!      track in shape across the grid: Pearson correlation > 0.92.
-//!   4. **Log marginal likelihood** — gam's REML score vs GPyTorch's exact LML
-//!      must agree to within 5% on the log scale.
 //!
-//! A real divergence in any of these is a real bug in gam's Matérn kernel or its
-//! marginal-likelihood derivation; we do NOT weaken the bounds to hide it.
+//! We deliberately do NOT cross-assert a raw log-marginal-likelihood number: gam's
+//! `reml_score` is the *restricted* (REML) profile criterion — it marginalizes the
+//! Matérn nullspace, uses the restricted dof ν = n − M, and carries the profiled-
+//! out-scale constant ½ν(1+ln 2π σ̂²) — whereas GPyTorch's `ExactMarginalLogLikelihood`
+//! is the *full* ML log-evidence with a free noise variance and a constant mean.
+//! Those two objectives differ by an O(½n) additive constant and a nullspace
+//! log-determinant, so a "5% match" would be comparing structurally different
+//! quantities (and any agreement would be coincidental). We instead compare only
+//! quantities computed identically on both fitted models.
+//!
+//! A real divergence in any of the three assertions is a real bug in gam's Matérn
+//! kernel or its smoothing selection; we do NOT weaken the bounds to hide it.
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
@@ -109,12 +118,6 @@ fn gam_gp_regression_matches_gpytorch() {
         panic!("expected a standard Gaussian GAM fit for matern() GP smooth");
     };
 
-    // gam's complete REML/LAML objective is its (negative) log marginal
-    // likelihood surrogate; GPyTorch reports +LML. Compare on a common sign:
-    // gam stores reml_score as a value minimized by the outer loop, so the GP
-    // log marginal likelihood gam implies is −reml_score.
-    let gam_lml = -fit.fit.reml_score;
-
     // ---- shared dense 250-point evaluation grid (interior of [-2, 2]) --------
     let grid_n = 250usize;
     let (lo, hi) = (-1.95_f64, 1.95_f64);
@@ -155,9 +158,9 @@ fn gam_gp_regression_matches_gpytorch() {
 
     // ---- fit the SAME data with GPyTorch (exact GP, Matérn-5/2 kernel) -------
     // Maximize the exact log marginal likelihood over length-scale, output scale,
-    // and Gaussian noise via Adam, then evaluate the posterior predictive mean and
-    // std on the identical grid. GPyTorch is the modern reference for exact GP
-    // inference, so its fitted mean / uncertainty / LML are the ground truth here.
+    // and Gaussian noise via Adam, then evaluate the latent-function posterior mean
+    // and std on the identical grid. GPyTorch is the modern reference for exact GP
+    // inference, so its fitted mean and uncertainty are the ground truth here.
     let py = run_python(
         &[
             Column::new("x", &x),
@@ -196,24 +199,24 @@ for _ in range(400):
     loss.backward()
     opt.step()
 
-# Exact log marginal likelihood at the optimum (sum over n observations:
-# ExactMarginalLogLikelihood returns a per-datum mean, so multiply by n).
+# Latent-function posterior on the shared grid at the fitted optimum. We use
+# model(xg) (the latent GP f), NOT lik(model(xg)) (a new noisy observation):
+# gam's band 1.96*sqrt(diag(X Vb X^T)) is the uncertainty of the smooth/mean
+# FUNCTION, so the matching GPyTorch quantity is the latent-function std, not
+# the observation-predictive std (which adds the noise variance sigma^2 and
+# would compare a different quantity).
 model.eval(); lik.eval()
 with torch.no_grad(), gpytorch.settings.fast_pred_var(False):
-    out_train = model(xt)
-    lml = mll(out_train, yt).item() * yt.numel()
-    pred = lik(model(xg))
-    mean = pred.mean.numpy()
-    std = pred.stddev.numpy()
+    f = model(xg)
+    mean = f.mean.numpy()
+    std = f.stddev.numpy()
 
 emit("grid_fit", mean)
 emit("grid_std", std)
-emit("lml", [lml])
 "#,
     );
     let gpt_grid = py.vector("grid_fit");
     let gpt_std = py.vector("grid_std");
-    let gpt_lml = py.scalar("lml");
     assert_eq!(gpt_grid.len(), grid_n, "GPyTorch grid mean length mismatch");
     assert_eq!(gpt_std.len(), grid_n, "GPyTorch grid std length mismatch");
 
@@ -224,12 +227,11 @@ emit("lml", [lml])
     // Predictive-uncertainty SHAPE: gam half-width vs GPyTorch posterior std.
     let band_corr = pearson(&gam_band, gpt_std);
     let rho_rel = (gam_rho - gpt_rho).abs() / (0.5 * (gam_rho + gpt_rho)).max(1e-12);
-    let lml_rel = (gam_lml - gpt_lml).abs() / gpt_lml.abs().max(1e-12);
 
     eprintln!(
         "gp matern(x,nu=2.5,k=30) vs GPyTorch exact GP: n={n} grid={grid_n} \
          rel_l2={rel:.4} rho_gam={gam_rho:.4} rho_gpt={gpt_rho:.4} rho_rel={rho_rel:.4} \
-         band_pearson={band_corr:.4} lml_gam={gam_lml:.2} lml_gpt={gpt_lml:.2} lml_rel={lml_rel:.4}"
+         band_pearson={band_corr:.4}"
     );
 
     // 1. Fitted posterior mean: both engines fit the identical Matérn-5/2 GP on
@@ -255,13 +257,5 @@ emit("lml", [lml])
     assert!(
         band_corr > 0.92,
         "predictive uncertainty bands disagree in shape: pearson={band_corr:.4}"
-    );
-
-    // 4. Log marginal likelihood: both engines target the same marginal
-    //    likelihood, so their optimized log-evidence must agree to 5% on the log
-    //    scale. A larger gap means a different objective is being optimized.
-    assert!(
-        lml_rel < 0.05,
-        "log marginal likelihood disagrees: gam={gam_lml:.2} gpt={gpt_lml:.2} (rel={lml_rel:.4})"
     );
 }

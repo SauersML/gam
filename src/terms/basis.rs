@@ -20456,6 +20456,47 @@ fn duchon_kernel_amplification(
     }
 }
 
+/// Scalar kernel amplification `α` that [`build_duchon_basis`] applies to the
+/// pure scale-free polyharmonic Duchon kernel block (`length_scale = None`,
+/// `power = 0`, no anisotropy) for the given requested null-space `order`.
+///
+/// This is the exact factor the forward design multiplies into `K(t,C)` before
+/// the null-space projection `Z`, so any derivative path that differentiates
+/// that forward design (e.g. the `duchon_basis_with_jet` FFI, which builds its
+/// forward via [`build_duchon_basis`] with these same parameters) must scale
+/// its raw radial jet by the identical `α`. Returning it from the Rust core —
+/// rather than recomputing the amplification probe in a wrapper — keeps the
+/// derivative bit-for-bit consistent with the forward and avoids duplicating
+/// the spectral-normalization math outside this module.
+///
+/// The requested `order` is internally degraded via
+/// [`duchon_effective_nullspace_order`] exactly as the forward builder does, so
+/// the polyharmonic order `p` used by the amplification probe matches.
+pub fn duchon_pure_kernel_amplification(
+    centers: ArrayView2<'_, f64>,
+    order: DuchonNullspaceOrder,
+) -> f64 {
+    let dim = centers.ncols();
+    if dim == 0 || centers.nrows() == 0 {
+        return 1.0;
+    }
+    let effective_order = duchon_effective_nullspace_order(centers, order);
+    let p_order = duchon_p_from_nullspace_order(effective_order);
+    let s_order: f64 = 0.0;
+    let pure_poly_coeff =
+        PolyharmonicBlockCoeff::new(pure_duchon_block_order(p_order, s_order), dim);
+    duchon_kernel_amplification(
+        centers,
+        None,
+        p_order,
+        duchon_power_to_usize(s_order),
+        dim,
+        None,
+        None,
+        Some(&pure_poly_coeff),
+    )
+}
+
 fn build_duchon_basis_designwithworkspace(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
@@ -22003,6 +22044,187 @@ pub fn matern_radial_second_derivative_nd(
             let (_phi, _phi_r, phi_rr, _ratio) =
                 matern_kernel_radial_tripletwith_safe_ratio(r, length_scale, nu)?;
             out[[n, k]] = phi_rr;
+        }
+    }
+    Ok(out)
+}
+
+/// Resolve the per-axis metric weights `w_a = exp(2·ψ_a)` that the Matérn
+/// forward design (`build_matern_basis` → `StreamingMaternEvaluator` /
+/// `ChunkedKernelDesignOperator`) applies, **bit-for-bit**.
+///
+/// The forward path centres the supplied anisotropy log-scales through
+/// [`maybe_initialize_aniso_contrasts`] (subtract the mean, zero tiny
+/// residuals; auto-initialise from center geometry only when every entry is
+/// the zero default) and then squares `exp(ψ_a)`. Replicating that exact
+/// transform here is what lets the input-location jet/Hessian differentiate
+/// the *same* function the forward evaluates under anisotropy.
+///
+/// `None` (or a 1-D problem, where the centred contrast is a no-op) yields the
+/// isotropic all-ones metric.
+fn matern_metric_weights(centers: ArrayView2<'_, f64>, dim: usize, aniso: Option<&[f64]>) -> Vec<f64> {
+    match maybe_initialize_aniso_contrasts(centers, aniso) {
+        Some(psi) => psi.iter().map(|&v| (2.0 * v).exp()).collect(),
+        None => vec![1.0; dim],
+    }
+}
+
+/// N-D Matérn input-location **jet** `∂Φ/∂t` under the anisotropic metric.
+///
+/// Returns an `(n_rows, n_centers, dim)` tensor whose `(n, k, a)` entry is the
+/// exact partial derivative of the (un-projected) kernel value
+/// `Φ_{n,k} = φ(r_A)` w.r.t. the input coordinate `t_{n,a}`, where the
+/// anisotropic radius is `r_A = √(Σ_b w_b (t_b − c_b)²)` with the forward
+/// metric weights `w_b` from [`matern_metric_weights`]:
+///
+/// ```text
+/// ∂Φ_{n,k}/∂t_{n,a} = φ'(r_A) · w_a (t_{n,a} − c_{k,a}) / r_A.
+/// ```
+///
+/// At `r_A = 0` the kernel is at a smooth maximum and the jet is exactly `0`.
+/// This is the metric-aware analogue of pairing
+/// [`matern_radial_first_derivative_nd`] with `(t − c)/r`; combining the two
+/// isotropic helpers ignores `w_a` and therefore differentiates a *different*
+/// function whenever anisotropy is active (issue #437).
+pub fn matern_input_location_jet_nd(
+    t: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    length_scale: f64,
+    nu: MaternNu,
+    aniso_log_scales: Option<&[f64]>,
+) -> Result<Array3<f64>, BasisError> {
+    let n_rows = t.nrows();
+    let n_centers = centers.nrows();
+    let dim = centers.ncols();
+    if dim == 0 {
+        crate::bail_invalid_basis!(
+            "matern_input_location_jet_nd: centers must have at least one column".into(),
+        );
+    }
+    if t.ncols() != dim {
+        crate::bail_invalid_basis!(
+            "matern_input_location_jet_nd: t has {} cols but centers have {}",
+            t.ncols(),
+            dim
+        );
+    }
+    if let Some(eta) = aniso_log_scales
+        && eta.len() != dim
+    {
+        crate::bail_invalid_basis!(
+            "matern_input_location_jet_nd: aniso_log_scales len {} != dim {}",
+            eta.len(),
+            dim
+        );
+    }
+    let weights = matern_metric_weights(centers, dim, aniso_log_scales);
+    let mut out = Array3::<f64>::zeros((n_rows, n_centers, dim));
+    for n in 0..n_rows {
+        for k in 0..n_centers {
+            let mut r2 = 0.0_f64;
+            for a in 0..dim {
+                let h = t[[n, a]] - centers[[k, a]];
+                r2 += weights[a] * h * h;
+            }
+            let r = r2.sqrt();
+            if r <= 0.0 {
+                continue;
+            }
+            let (_phi, phi_r, _phi_rr, _ratio) =
+                matern_kernel_radial_tripletwith_safe_ratio(r, length_scale, nu)?;
+            let scale = phi_r / r;
+            for a in 0..dim {
+                let h = t[[n, a]] - centers[[k, a]];
+                out[[n, k, a]] = scale * weights[a] * h;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// N-D Matérn input-location **Hessian** `∂²Φ/∂t∂tᵀ` under the anisotropic
+/// metric.
+///
+/// Returns an `(n_rows, n_centers, dim, dim)` tensor whose `(n, k, a, c)`
+/// entry is the exact second partial of `Φ_{n,k} = φ(r_A)` (same `r_A` and
+/// forward metric weights `w` as [`matern_input_location_jet_nd`]):
+///
+/// ```text
+/// H_{ac} = φ''(r_A) · (w_a h_a / r_A)(w_c h_c / r_A)
+///        + (φ'(r_A)/r_A) · (w_a δ_{ac} − w_a h_a w_c h_c / r_A²),
+/// ```
+/// with `h = t − c`. At `r_A = 0` the smooth limit collapses to the diagonal
+/// `(φ'/r)|_0 · w_a δ_{ac}` (the regularized ratio from
+/// [`matern_kernel_radial_tripletwith_safe_ratio`], which equals `φ''(0)` for
+/// ν ≥ 3/2 and carries the genuine ν = 1/2 singularity floor).
+pub fn matern_input_location_hessian_nd(
+    t: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    length_scale: f64,
+    nu: MaternNu,
+    aniso_log_scales: Option<&[f64]>,
+) -> Result<Array4<f64>, BasisError> {
+    let n_rows = t.nrows();
+    let n_centers = centers.nrows();
+    let dim = centers.ncols();
+    if dim == 0 {
+        crate::bail_invalid_basis!(
+            "matern_input_location_hessian_nd: centers must have at least one column".into(),
+        );
+    }
+    if t.ncols() != dim {
+        crate::bail_invalid_basis!(
+            "matern_input_location_hessian_nd: t has {} cols but centers have {}",
+            t.ncols(),
+            dim
+        );
+    }
+    if let Some(eta) = aniso_log_scales
+        && eta.len() != dim
+    {
+        crate::bail_invalid_basis!(
+            "matern_input_location_hessian_nd: aniso_log_scales len {} != dim {}",
+            eta.len(),
+            dim
+        );
+    }
+    let weights = matern_metric_weights(centers, dim, aniso_log_scales);
+    let mut out = Array4::<f64>::zeros((n_rows, n_centers, dim, dim));
+    for n in 0..n_rows {
+        for k in 0..n_centers {
+            let mut r2 = 0.0_f64;
+            for a in 0..dim {
+                let h = t[[n, a]] - centers[[k, a]];
+                r2 += weights[a] * h * h;
+            }
+            let r = r2.sqrt();
+            let (_phi, phi_r, phi_rr, phi_r_over_r) =
+                matern_kernel_radial_tripletwith_safe_ratio(r, length_scale, nu)?;
+            if r <= 0.0 {
+                // Smooth collision limit: gradient component `w_a h_a / r` → 0,
+                // so only the diagonal `(φ'/r)·w_a` term survives.
+                for a in 0..dim {
+                    out[[n, k, a, a]] = phi_r_over_r * weights[a];
+                }
+                continue;
+            }
+            let q = phi_r / r; // = φ'(r)/r at this r > 0.
+            let inv_r2 = 1.0 / r2;
+            for a in 0..dim {
+                let ga = weights[a] * (t[[n, a]] - centers[[k, a]]); // W h, component a
+                for c in 0..dim {
+                    let gc = weights[c] * (t[[n, c]] - centers[[k, c]]);
+                    // φ''(r)·(W h/r)_a (W h/r)_c
+                    let mut value = phi_rr * (ga / r) * (gc / r);
+                    // (φ'/r)·(−w_a h_a w_c h_c / r²)
+                    value -= q * ga * gc * inv_r2;
+                    if a == c {
+                        // (φ'/r)·w_a δ_ac
+                        value += q * weights[a];
+                    }
+                    out[[n, k, a, c]] = value;
+                }
+            }
         }
     }
     Ok(out)

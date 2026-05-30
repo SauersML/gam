@@ -119,17 +119,27 @@ fn gam_gp_likelihood_ranking_matches_gpgp() {
     let full_n = 200usize;
     let (x_full, y_full) = make_data(full_n);
 
-    // Fixed, reproducible subsets: nested prefixes of decreasing size plus the
-    // full set. Sizes chosen to give a spread of Δ values for a meaningful
-    // correlation while keeping each fit well-posed for a k=15 Matérn basis.
-    let subset_sizes = [200usize, 170, 140, 110, 90];
+    // Fixed, reproducible subsets: DISJOINT contiguous windows drawn from
+    // different offsets of the sorted series (plus the full set). Nested
+    // prefixes would make Δ rise monotonically with n, so a high Pearson could
+    // be explained by the trivial "more data ⇒ larger |Δ|" trend rather than by
+    // kernel-basis fidelity — the bound would then assert almost nothing.
+    // Independent windows over different x-ranges de-correlate that trend, so
+    // the contrast Δ varies for genuinely different reasons across subsets and
+    // the correlation test actually probes whether gam's Matérn basis tracks the
+    // exact-GP contrast. Each window is contiguous in the sorted x (a GP needs
+    // spatially coherent observations) and long enough to keep a k=15 Matérn
+    // basis well-posed. Windows: [0,90), [40,150), [90,200), [20,190), [0,200).
+    let subset_windows: [(usize, usize); 5] =
+        [(0, 90), (40, 150), (90, 200), (20, 190), (0, 200)];
 
-    let mut gam_delta = Vec::with_capacity(subset_sizes.len());
-    let mut gpgp_delta = Vec::with_capacity(subset_sizes.len());
+    let mut gam_delta = Vec::with_capacity(subset_windows.len());
+    let mut gpgp_delta = Vec::with_capacity(subset_windows.len());
 
-    for &m in subset_sizes.iter() {
-        let xs = &x_full[..m];
-        let ys = &y_full[..m];
+    for &(lo, hi) in subset_windows.iter() {
+        let m = hi - lo;
+        let xs = &x_full[lo..hi];
+        let ys = &y_full[lo..hi];
 
         // gam: Δ = ℓ(1.5) − ℓ(0.5).
         let gam_ll_05 = gam_matern_loglik(xs, ys, 0.5);
@@ -149,9 +159,11 @@ fn gam_gp_likelihood_ranking_matches_gpgp() {
             yv   <- as.numeric(df$y)
             Xc   <- matrix(1.0, nrow = length(yv), ncol = 1)  # intercept only
             n    <- length(yv)
-            ord  <- order_maxmin(locs)
-            NN   <- find_ordered_nn(locs[ord, , drop = FALSE], m = n - 1L)  # exact
 
+            # fit_model(reorder = TRUE) performs its own max-min ordering and
+            # builds the neighbour array internally; with m_seq = n - 1 the
+            # Vecchia conditioning set is the full history, so the returned
+            # loglik is the EXACT GP marginal log-likelihood (no approximation).
             fit_ll <- function(cov) {
               f <- fit_model(y = yv, locs = locs, X = Xc,
                              covfun_name = cov, m_seq = c(n - 1L),
@@ -277,18 +289,18 @@ fn gam_gp_likelihood_ranking_matches_gpgp() {
                           m = ntr - 1L, reorder = TRUE)
         mu <- as.numeric(pr)
 
-        # Predictive sd from the fitted covariance: cond_sim gives draws; instead
-        # use the marginal noise+signal sd implied by the fitted params away from
-        # observations. GpGp stores covparms = c(variance, range, nugget); the
-        # marginal predictive sd at test sites (well separated from train under a
-        # rough exponential kernel) is ~ sqrt(variance * nugget + variance). We
-        # use the conditional predictive sd via cond_sim Monte Carlo for honesty.
+        # Conditional predictive sd at the test sites via cond_sim Monte Carlo:
+        # the per-site sd of nsims posterior draws is the honest predictive sd
+        # (it folds in both posterior-mean uncertainty and the nugget). The
+        # finite/positive guard below only fires on a degenerate draw; it falls
+        # back to the fitted marginal sd sqrt(variance + nugget), where
+        # covparms = c(variance, range, nugget).
         cp <- m$covparms
         draws <- cond_sim(fit = m, locs_pred = locs_te, X_pred = Xte,
                           y_obs = y_tr, locs_obs = locs_tr, X_obs = Xtr,
                           m = ntr - 1L, reorder = TRUE, nsims = 200)
         sdv <- apply(draws, 1, sd)
-        sdv[!is.finite(sdv) | sdv <= 0] <- sqrt(cp[1] * cp[3] + 1e-8)
+        sdv[!is.finite(sdv) | sdv <= 0] <- sqrt(cp[1] * (1 + cp[3]) + 1e-8)
 
         half <- 0.5 * log(2 * pi)
         ls <- mean(half + log(sdv) + 0.5 * (y_te - mu)^2 / (sdv^2))

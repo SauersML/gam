@@ -46,6 +46,7 @@ mod convergence;
 mod damping;
 mod edf;
 mod gpu_dispatch;
+mod log_link_working_state;
 mod loop_driver;
 mod penalty;
 mod pls_solver;
@@ -3687,6 +3688,22 @@ fn write_identityworking_state(
     }
 }
 
+/// Poisson log-link kernel: `V(mu) = mu`, so the Fisher weight is `prior * mu`
+/// and the canonical-link curvature buffers both equal the working weight.
+struct PoissonLogKernel;
+
+impl log_link_working_state::LogLinkWorkingKernel for PoissonLogKernel {
+    #[inline]
+    fn raw_weight(&self, _y: f64, mu: f64, prior_weight: f64) -> f64 {
+        prior_weight * mu
+    }
+
+    #[inline]
+    fn curvature_terms(&self, _y: f64, _mu: f64, raw_weight: f64) -> (f64, f64) {
+        (raw_weight, raw_weight)
+    }
+}
+
 /// Working state for Poisson with a log link.
 #[inline]
 fn write_poisson_log_working_state(
@@ -3698,88 +3715,46 @@ fn write_poisson_log_working_state(
     z: &mut Array1<f64>,
     derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
 ) {
-    const MIN_MU: f64 = 1e-10;
-    const MIN_WEIGHT: f64 = 1e-12;
-    if let Some(derivs) = derivatives {
-        let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
-        let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
-        let z_s = z.as_slice_mut().expect("z must be contiguous");
-        let dmu_s = derivs
-            .dmu_deta
-            .as_slice_mut()
-            .expect("dmu_deta must be contiguous");
-        let d2_s = derivs
-            .d2mu_deta2
-            .as_slice_mut()
-            .expect("d2mu_deta2 must be contiguous");
-        let d3_s = derivs
-            .d3mu_deta3
-            .as_slice_mut()
-            .expect("d3mu_deta3 must be contiguous");
-        let c_s = derivs.c.as_slice_mut().expect("c must be contiguous");
-        let d_s = derivs.d.as_slice_mut().expect("d must be contiguous");
-        mu_s.par_iter_mut()
-            .zip(weights_s.par_iter_mut())
-            .zip(z_s.par_iter_mut())
-            .zip(dmu_s.par_iter_mut())
-            .zip(d2_s.par_iter_mut())
-            .zip(d3_s.par_iter_mut())
-            .zip(c_s.par_iter_mut())
-            .zip(d_s.par_iter_mut())
-            .enumerate()
-            .for_each(
-                |(i, (((((((mu_o, w_o), z_o), dmu_o), d2_o), d3_o), c_o), d_o))| {
-                    let eta_raw = eta[i];
-                    let eta_i = eta_raw.clamp(-700.0, 700.0);
-                    let mu_i = eta_i.exp().max(MIN_MU);
-                    *mu_o = mu_i;
-                    let raw_weight = priorweights[i].max(0.0) * mu_i;
-                    let floor_active = raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
-                    *w_o = if raw_weight > 0.0 {
-                        raw_weight.max(MIN_WEIGHT)
-                    } else {
-                        0.0
-                    };
-                    *z_o = eta_i + (y[i] - mu_i) / mu_i;
-                    *dmu_o = mu_i;
-                    *d2_o = mu_i;
-                    *d3_o = mu_i;
-                    if floor_active || eta_raw != eta_i {
-                        *c_o = 0.0;
-                        *d_o = 0.0;
-                    } else {
-                        *c_o = raw_weight;
-                        *d_o = raw_weight;
-                    }
-                },
-            );
-    } else {
-        let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
-        let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
-        let z_s = z.as_slice_mut().expect("z must be contiguous");
-        mu_s.par_iter_mut()
-            .zip(weights_s.par_iter_mut())
-            .zip(z_s.par_iter_mut())
-            .enumerate()
-            .for_each(|(i, ((mu_o, w_o), z_o))| {
-                let eta_i = eta[i].clamp(-700.0, 700.0);
-                let mu_i = eta_i.exp().max(MIN_MU);
-                *mu_o = mu_i;
-                let raw_weight = priorweights[i].max(0.0) * mu_i;
-                *w_o = if raw_weight > 0.0 {
-                    raw_weight.max(MIN_WEIGHT)
-                } else {
-                    0.0
-                };
-                *z_o = eta_i + (y[i] - mu_i) / mu_i;
-            });
+    log_link_working_state::write_log_link_working_state(
+        &PoissonLogKernel,
+        y,
+        eta,
+        priorweights,
+        mu,
+        weights,
+        z,
+        derivatives,
+    )
+    .expect("Poisson log-link kernel has no validation that can fail");
+}
+
+/// Gamma(shape = k) log-link kernel.
+///
+/// With `mu = exp(eta)` and `V(mu) = mu^2`, the Fisher weight is the
+/// prior/sample weight scaled by the fixed Gamma shape, independent of `eta`;
+/// the weight is therefore written unfloored and the curvature buffers vanish.
+struct GammaLogKernel {
+    shape: f64,
+}
+
+impl log_link_working_state::LogLinkWorkingKernel for GammaLogKernel {
+    #[inline]
+    fn raw_weight(&self, _y: f64, _mu: f64, prior_weight: f64) -> f64 {
+        prior_weight * self.shape
+    }
+
+    #[inline]
+    fn curvature_terms(&self, _y: f64, _mu: f64, _raw_weight: f64) -> (f64, f64) {
+        (0.0, 0.0)
+    }
+
+    #[inline]
+    fn floor_weight(&self) -> bool {
+        false
     }
 }
 
 /// Working state for Gamma(shape = k) with a log link.
-///
-/// With `mu = exp(eta)` and `V(mu) = mu^2`, the Fisher weight is the
-/// prior/sample weight scaled by the fixed Gamma shape, independent of `eta`.
 #[inline]
 fn write_gamma_log_working_state(
     y: ArrayView1<f64>,
@@ -3791,64 +3766,17 @@ fn write_gamma_log_working_state(
     z: &mut Array1<f64>,
     derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
 ) {
-    const MIN_MU: f64 = 1e-10;
-    if let Some(derivs) = derivatives {
-        let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
-        let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
-        let z_s = z.as_slice_mut().expect("z must be contiguous");
-        let dmu_s = derivs
-            .dmu_deta
-            .as_slice_mut()
-            .expect("dmu_deta must be contiguous");
-        let d2_s = derivs
-            .d2mu_deta2
-            .as_slice_mut()
-            .expect("d2mu_deta2 must be contiguous");
-        let d3_s = derivs
-            .d3mu_deta3
-            .as_slice_mut()
-            .expect("d3mu_deta3 must be contiguous");
-        let c_s = derivs.c.as_slice_mut().expect("c must be contiguous");
-        let d_s = derivs.d.as_slice_mut().expect("d must be contiguous");
-        mu_s.par_iter_mut()
-            .zip(weights_s.par_iter_mut())
-            .zip(z_s.par_iter_mut())
-            .zip(dmu_s.par_iter_mut())
-            .zip(d2_s.par_iter_mut())
-            .zip(d3_s.par_iter_mut())
-            .zip(c_s.par_iter_mut())
-            .zip(d_s.par_iter_mut())
-            .enumerate()
-            .for_each(
-                |(i, (((((((mu_o, w_o), z_o), dmu_o), d2_o), d3_o), c_o), d_o))| {
-                    let eta_i = eta[i].clamp(-700.0, 700.0);
-                    let mu_i = eta_i.exp().max(MIN_MU);
-                    *mu_o = mu_i;
-                    *w_o = priorweights[i].max(0.0) * shape;
-                    *z_o = eta_i + (y[i] - mu_i) / mu_i;
-                    *dmu_o = mu_i;
-                    *d2_o = mu_i;
-                    *d3_o = mu_i;
-                    *c_o = 0.0;
-                    *d_o = 0.0;
-                },
-            );
-    } else {
-        let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
-        let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
-        let z_s = z.as_slice_mut().expect("z must be contiguous");
-        mu_s.par_iter_mut()
-            .zip(weights_s.par_iter_mut())
-            .zip(z_s.par_iter_mut())
-            .enumerate()
-            .for_each(|(i, ((mu_o, w_o), z_o))| {
-                let eta_i = eta[i].clamp(-700.0, 700.0);
-                let mu_i = eta_i.exp().max(MIN_MU);
-                *mu_o = mu_i;
-                *w_o = priorweights[i].max(0.0) * shape;
-                *z_o = eta_i + (y[i] - mu_i) / mu_i;
-            });
-    }
+    log_link_working_state::write_log_link_working_state(
+        &GammaLogKernel { shape },
+        y,
+        eta,
+        priorweights,
+        mu,
+        weights,
+        z,
+        derivatives,
+    )
+    .expect("Gamma log-link kernel has no validation that can fail");
 }
 
 pub const BETA_MU_EPS: f64 = 1.0e-12;
@@ -4013,10 +3941,63 @@ fn beta_logit_working_curvature_eta_derivatives(
     (c, d)
 }
 
-/// Working state for Tweedie with a log link.
+/// Tweedie log-link kernel.
 ///
-/// With `mu = exp(eta)`, `V(mu) = phi * mu^p`, and `g'(mu) = 1 / mu`,
-/// the Fisher working weight is `mu^(2-p) / phi`, scaled by prior weight.
+/// With `mu = exp(eta)`, `V(mu) = phi * mu^p`, and `g'(mu) = 1 / mu`, the Fisher
+/// working weight is `mu^(2-p) / phi`, scaled by prior weight. The `mu`-jet must
+/// be zeroed when `eta` is clamped because the fractional power makes the local
+/// jet unreliable there. Parameter ranges and responses are validated up front.
+struct TweedieLogKernel {
+    p: f64,
+    phi: f64,
+    exponent: f64,
+}
+
+impl log_link_working_state::LogLinkWorkingKernel for TweedieLogKernel {
+    #[inline]
+    fn validate(
+        &self,
+        y: ArrayView1<f64>,
+        priorweights: ArrayView1<f64>,
+    ) -> Result<(), EstimationError> {
+        if !is_valid_tweedie_power(self.p) {
+            crate::bail_invalid_estim!(
+                "Tweedie variance power must be finite and strictly between 1 and 2; got {p}",
+                p = self.p
+            );
+        }
+        if !(self.phi.is_finite() && self.phi > 0.0) {
+            crate::bail_invalid_estim!(
+                "Tweedie dispersion phi must be finite and > 0; got {phi}",
+                phi = self.phi
+            );
+        }
+        validate_tweedie_responses(&y, &priorweights)
+    }
+
+    #[inline]
+    fn raw_weight(&self, _y: f64, mu: f64, prior_weight: f64) -> f64 {
+        // `mu` is already floored like Poisson/Gamma for the log-link working
+        // response; the helper adds the deeper deviance-scale floor needed
+        // specifically by the Tweedie fractional power.
+        prior_weight * tweedie_log_weight_mu_power(mu, self.p) / self.phi
+    }
+
+    #[inline]
+    fn curvature_terms(&self, _y: f64, _mu: f64, raw_weight: f64) -> (f64, f64) {
+        (
+            self.exponent * raw_weight,
+            self.exponent * self.exponent * raw_weight,
+        )
+    }
+
+    #[inline]
+    fn zero_mu_jet_on_clamp(&self) -> bool {
+        true
+    }
+}
+
+/// Working state for Tweedie with a log link.
 #[inline]
 fn write_tweedie_log_working_state(
     y: ArrayView1<f64>,
@@ -4029,114 +4010,71 @@ fn write_tweedie_log_working_state(
     z: &mut Array1<f64>,
     derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
 ) -> Result<(), EstimationError> {
-    const MIN_MU: f64 = 1e-10;
-    const MIN_WEIGHT: f64 = 1e-12;
-    if !is_valid_tweedie_power(p) {
-        crate::bail_invalid_estim!(
-            "Tweedie variance power must be finite and strictly between 1 and 2; got {p}"
-        );
-    }
-    if !(phi.is_finite() && phi > 0.0) {
-        crate::bail_invalid_estim!("Tweedie dispersion phi must be finite and > 0; got {phi}");
-    }
-    validate_tweedie_responses(&y, &priorweights)?;
-    let exponent = 2.0 - p;
-    if let Some(derivs) = derivatives {
-        let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
-        let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
-        let z_s = z.as_slice_mut().expect("z must be contiguous");
-        let dmu_s = derivs
-            .dmu_deta
-            .as_slice_mut()
-            .expect("dmu_deta must be contiguous");
-        let d2_s = derivs
-            .d2mu_deta2
-            .as_slice_mut()
-            .expect("d2mu_deta2 must be contiguous");
-        let d3_s = derivs
-            .d3mu_deta3
-            .as_slice_mut()
-            .expect("d3mu_deta3 must be contiguous");
-        let c_s = derivs.c.as_slice_mut().expect("c must be contiguous");
-        let d_s = derivs.d.as_slice_mut().expect("d must be contiguous");
-        mu_s.par_iter_mut()
-            .zip(weights_s.par_iter_mut())
-            .zip(z_s.par_iter_mut())
-            .zip(dmu_s.par_iter_mut())
-            .zip(d2_s.par_iter_mut())
-            .zip(d3_s.par_iter_mut())
-            .zip(c_s.par_iter_mut())
-            .zip(d_s.par_iter_mut())
-            .enumerate()
-            .for_each(
-                |(i, (((((((mu_o, w_o), z_o), dmu_o), d2_o), d3_o), c_o), d_o))| {
-                    let eta_raw = eta[i];
-                    let eta_i = eta_raw.clamp(-700.0, 700.0);
-                    let clamp_active = eta_raw != eta_i;
-                    let mu_i = eta_i.exp().max(MIN_MU);
-                    *mu_o = mu_i;
-                    // `mu_i` is already floored like Poisson/Gamma for the log-link
-                    // working response; the helper adds the deeper deviance-scale
-                    // floor needed specifically by the Tweedie fractional power.
-                    let raw_weight =
-                        priorweights[i].max(0.0) * tweedie_log_weight_mu_power(mu_i, p) / phi;
-                    let floor_active = raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
-                    *w_o = if raw_weight > 0.0 {
-                        raw_weight.max(MIN_WEIGHT)
-                    } else {
-                        0.0
-                    };
-                    *z_o = eta_i + (y[i] - mu_i) / mu_i;
-                    if clamp_active {
-                        *dmu_o = 0.0;
-                        *d2_o = 0.0;
-                        *d3_o = 0.0;
-                    } else {
-                        *dmu_o = mu_i;
-                        *d2_o = mu_i;
-                        *d3_o = mu_i;
-                    }
-                    if floor_active || clamp_active {
-                        *c_o = 0.0;
-                        *d_o = 0.0;
-                    } else {
-                        *c_o = exponent * raw_weight;
-                        *d_o = exponent * exponent * raw_weight;
-                    }
-                },
+    log_link_working_state::write_log_link_working_state(
+        &TweedieLogKernel {
+            p,
+            phi,
+            exponent: 2.0 - p,
+        },
+        y,
+        eta,
+        priorweights,
+        mu,
+        weights,
+        z,
+        derivatives,
+    )
+}
+
+/// Negative-binomial log-link kernel with fixed `theta`.
+///
+/// The size parameter is treated as a fixed hyperparameter for this GLM stack;
+/// no theta profiling or REML update is performed here. The Fisher weight is
+/// `mu * theta / (theta + mu)`, written in the numerically-stable branch form
+/// that avoids cancellation for very small or very large `mu / theta`.
+struct NegativeBinomialLogKernel {
+    theta: f64,
+}
+
+impl log_link_working_state::LogLinkWorkingKernel for NegativeBinomialLogKernel {
+    #[inline]
+    fn validate(
+        &self,
+        y: ArrayView1<f64>,
+        priorweights: ArrayView1<f64>,
+    ) -> Result<(), EstimationError> {
+        if !valid_negbin_theta(self.theta) {
+            crate::bail_invalid_estim!(
+                "negative-binomial theta must be finite and > 0; got {theta}",
+                theta = self.theta
             );
-    } else {
-        let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
-        let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
-        let z_s = z.as_slice_mut().expect("z must be contiguous");
-        mu_s.par_iter_mut()
-            .zip(weights_s.par_iter_mut())
-            .zip(z_s.par_iter_mut())
-            .enumerate()
-            .for_each(|(i, ((mu_o, w_o), z_o))| {
-                let eta_i = eta[i].clamp(-700.0, 700.0);
-                let mu_i = eta_i.exp().max(MIN_MU);
-                *mu_o = mu_i;
-                // `mu_i` is already floored like Poisson/Gamma for the log-link
-                // working response; the helper adds the deeper deviance-scale
-                // floor needed specifically by the Tweedie fractional power.
-                let raw_weight =
-                    priorweights[i].max(0.0) * tweedie_log_weight_mu_power(mu_i, p) / phi;
-                *w_o = if raw_weight > 0.0 {
-                    raw_weight.max(MIN_WEIGHT)
-                } else {
-                    0.0
-                };
-                *z_o = eta_i + (y[i] - mu_i) / mu_i;
-            });
+        }
+        validate_count_responses(&y, &priorweights, "negative-binomial")
     }
-    Ok(())
+
+    #[inline]
+    fn raw_weight(&self, _y: f64, mu: f64, prior_weight: f64) -> f64 {
+        let theta = self.theta;
+        let negbin_weight = if theta > mu {
+            mu / (1.0 + mu / theta)
+        } else {
+            theta / (1.0 + theta / mu)
+        };
+        prior_weight * negbin_weight
+    }
+
+    #[inline]
+    fn curvature_terms(&self, _y: f64, mu: f64, raw_weight: f64) -> (f64, f64) {
+        let theta = self.theta;
+        let denom = theta + mu;
+        (
+            raw_weight * theta / denom,
+            raw_weight * theta * (theta - mu) / (denom * denom),
+        )
+    }
 }
 
 /// Working state for NB(mu, theta) with a log link and fixed theta.
-///
-/// The size parameter is treated as a fixed hyperparameter for this GLM stack;
-/// no theta profiling or REML update is performed here.
 #[inline]
 fn write_negative_binomial_log_working_state(
     y: ArrayView1<f64>,
@@ -4148,98 +4086,16 @@ fn write_negative_binomial_log_working_state(
     z: &mut Array1<f64>,
     derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
 ) -> Result<(), EstimationError> {
-    const MIN_MU: f64 = 1e-10;
-    const MIN_WEIGHT: f64 = 1e-12;
-    if !valid_negbin_theta(theta) {
-        crate::bail_invalid_estim!("negative-binomial theta must be finite and > 0; got {theta}");
-    }
-    validate_count_responses(&y, &priorweights, "negative-binomial")?;
-    if let Some(derivs) = derivatives {
-        let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
-        let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
-        let z_s = z.as_slice_mut().expect("z must be contiguous");
-        let dmu_s = derivs
-            .dmu_deta
-            .as_slice_mut()
-            .expect("dmu_deta must be contiguous");
-        let d2_s = derivs
-            .d2mu_deta2
-            .as_slice_mut()
-            .expect("d2mu_deta2 must be contiguous");
-        let d3_s = derivs
-            .d3mu_deta3
-            .as_slice_mut()
-            .expect("d3mu_deta3 must be contiguous");
-        let c_s = derivs.c.as_slice_mut().expect("c must be contiguous");
-        let d_s = derivs.d.as_slice_mut().expect("d must be contiguous");
-        mu_s.par_iter_mut()
-            .zip(weights_s.par_iter_mut())
-            .zip(z_s.par_iter_mut())
-            .zip(dmu_s.par_iter_mut())
-            .zip(d2_s.par_iter_mut())
-            .zip(d3_s.par_iter_mut())
-            .zip(c_s.par_iter_mut())
-            .zip(d_s.par_iter_mut())
-            .enumerate()
-            .for_each(
-                |(i, (((((((mu_o, w_o), z_o), dmu_o), d2_o), d3_o), c_o), d_o))| {
-                    let eta_raw = eta[i];
-                    let eta_i = eta_raw.clamp(-700.0, 700.0);
-                    let mu_i = eta_i.exp().max(MIN_MU);
-                    let denom = theta + mu_i;
-                    let negbin_weight = if theta > mu_i {
-                        mu_i / (1.0 + mu_i / theta)
-                    } else {
-                        theta / (1.0 + theta / mu_i)
-                    };
-                    let raw_weight = priorweights[i].max(0.0) * negbin_weight;
-                    let floor_active = raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
-                    *mu_o = mu_i;
-                    *w_o = if raw_weight > 0.0 {
-                        raw_weight.max(MIN_WEIGHT)
-                    } else {
-                        0.0
-                    };
-                    *z_o = eta_i + (y[i] - mu_i) / mu_i;
-                    *dmu_o = mu_i;
-                    *d2_o = mu_i;
-                    *d3_o = mu_i;
-                    if floor_active || eta_raw != eta_i {
-                        *c_o = 0.0;
-                        *d_o = 0.0;
-                    } else {
-                        *c_o = raw_weight * theta / denom;
-                        *d_o = raw_weight * theta * (theta - mu_i) / (denom * denom);
-                    }
-                },
-            );
-    } else {
-        let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
-        let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
-        let z_s = z.as_slice_mut().expect("z must be contiguous");
-        mu_s.par_iter_mut()
-            .zip(weights_s.par_iter_mut())
-            .zip(z_s.par_iter_mut())
-            .enumerate()
-            .for_each(|(i, ((mu_o, w_o), z_o))| {
-                let eta_i = eta[i].clamp(-700.0, 700.0);
-                let mu_i = eta_i.exp().max(MIN_MU);
-                let negbin_weight = if theta > mu_i {
-                    mu_i / (1.0 + mu_i / theta)
-                } else {
-                    theta / (1.0 + theta / mu_i)
-                };
-                let raw_weight = priorweights[i].max(0.0) * negbin_weight;
-                *mu_o = mu_i;
-                *w_o = if raw_weight > 0.0 {
-                    raw_weight.max(MIN_WEIGHT)
-                } else {
-                    0.0
-                };
-                *z_o = eta_i + (y[i] - mu_i) / mu_i;
-            });
-    }
-    Ok(())
+    log_link_working_state::write_log_link_working_state(
+        &NegativeBinomialLogKernel { theta },
+        y,
+        eta,
+        priorweights,
+        mu,
+        weights,
+        z,
+        derivatives,
+    )
 }
 
 /// Working state for Beta(mu * phi, (1 - mu) * phi) with a logit link.

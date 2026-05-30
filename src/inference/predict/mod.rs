@@ -1,4 +1,5 @@
 pub mod input;
+pub mod interval_policy;
 pub mod linalg;
 
 use crate::estimate::{BlockRole, EstimationError, FittedLinkState, UnifiedFitResult};
@@ -14,6 +15,9 @@ use crate::families::strategy::{
 };
 use crate::inference::model::{
     SavedCompiledFlexBlock, SavedLatentZNormalization, SavedLinkWiggleRuntime,
+};
+use crate::inference::predict::interval_policy::{
+    MeanBoundMethod, ResponseBounds, mean_bounds, symmetric_interval, validated_central_z,
 };
 use crate::inference::predict::linalg::{
     PredictionCovarianceBackend, design_row_chunk, prediction_chunk_rows,
@@ -913,26 +917,19 @@ impl PredictableModel for StandardPredictor {
                 "standard link-wiggle uncertainty requires covariance".to_string(),
             )
         })?;
-        let z = crate::probability::standard_normal_quantile(0.5 + options.confidence_level * 0.5)
-            .map_err(EstimationError::InvalidInput)?;
-        let eta_z_se = eta_se.mapv(|s| z * s);
-        let mean_z_se = mean_se.mapv(|s| z * s);
-        let eta_lower = &pred.eta - &eta_z_se;
-        let eta_upper = &pred.eta + &eta_z_se;
-        let mut mean_lower = &pred.mean - &mean_z_se;
-        let mut mean_upper = &pred.mean + &mean_z_se;
+        let z = validated_central_z(options.confidence_level)?;
+        let (eta_lower, eta_upper) = symmetric_interval(&pred.eta, &eta_se, z);
         let spec = spec_from_family_link(self.family.clone(), self.link_kind.as_ref());
-        let (lo, hi) = match spec.response {
-            ResponseFamily::Gaussian => (f64::NEG_INFINITY, f64::INFINITY),
-            ResponseFamily::Poisson
-            | ResponseFamily::Tweedie { .. }
-            | ResponseFamily::NegativeBinomial { .. }
-            | ResponseFamily::Gamma => (0.0, f64::INFINITY),
-            ResponseFamily::Beta { .. } => (1e-10, 1.0 - 1e-10),
-            ResponseFamily::Binomial | ResponseFamily::RoystonParmar => (1e-10, 1.0 - 1e-10),
-        };
-        mean_lower.mapv_inplace(|v| v.clamp(lo, hi));
-        mean_upper.mapv_inplace(|v| v.clamp(lo, hi));
+        let (mean_lower, mean_upper) = mean_bounds(
+            &eta_lower,
+            &eta_upper,
+            &pred.mean,
+            z,
+            MeanBoundMethod::Delta {
+                mean_se: &mean_se,
+                bounds: ResponseBounds::for_family(&spec.response),
+            },
+        )?;
         Ok(PredictUncertaintyResult {
             eta: pred.eta,
             mean: pred.mean,

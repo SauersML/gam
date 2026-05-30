@@ -10,7 +10,7 @@ use crate::quadrature::{
     probit_posterior_meanvariance, survival_posterior_mean, survival_posterior_meanvariance,
 };
 use crate::types::{
-    InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, StandardLink, is_valid_tweedie_power,
+    InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, StandardLink,
 };
 use ndarray::{Array1, ArrayView1};
 
@@ -198,45 +198,6 @@ where
     (m1, (m2 - m1 * m1).max(0.0))
 }
 
-#[inline]
-fn require_noise_parameter(
-    spec: &LikelihoodSpec,
-    parameter_name: &str,
-    value: Option<f64>,
-) -> Result<f64, EstimationError> {
-    let value = value.ok_or_else(|| {
-        EstimationError::InvalidInput(format!(
-            "{} generative sampling requires fitted {parameter_name}",
-            spec.pretty_name()
-        ))
-    })?;
-    if value.is_finite() {
-        Ok(value)
-    } else {
-        Err(EstimationError::InvalidInput(format!(
-            "{} generative sampling requires finite {parameter_name}; got {value}",
-            spec.pretty_name()
-        )))
-    }
-}
-
-#[inline]
-fn require_positive_noise_parameter(
-    spec: &LikelihoodSpec,
-    parameter_name: &str,
-    value: Option<f64>,
-) -> Result<f64, EstimationError> {
-    let value = require_noise_parameter(spec, parameter_name, value)?;
-    if value > 0.0 {
-        Ok(value)
-    } else {
-        Err(EstimationError::InvalidInput(format!(
-            "{} generative sampling requires {parameter_name} > 0; got {value}",
-            spec.pretty_name()
-        )))
-    }
-}
-
 impl FamilyStrategy for ResolvedFamilyStrategy {
     fn name(&self) -> &'static str {
         self.spec.name()
@@ -418,62 +379,11 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
         mean: &Array1<f64>,
         gaussian_scale: Option<f64>,
     ) -> Result<NoiseModel, EstimationError> {
-        match &self.spec.response {
-            ResponseFamily::Gaussian => {
-                let sigma = require_noise_parameter(&self.spec, "Gaussian sigma", gaussian_scale)?;
-                if sigma < 0.0 {
-                    crate::bail_invalid_estim!(
-                        "Gaussian Identity generative sampling requires Gaussian sigma >= 0; got {sigma}"
-                    );
-                }
-                Ok(NoiseModel::Gaussian {
-                    sigma: Array1::from_elem(mean.len(), sigma),
-                })
-            }
-            ResponseFamily::Binomial => Ok(NoiseModel::Bernoulli),
-            ResponseFamily::Poisson => Ok(NoiseModel::Poisson),
-            ResponseFamily::Tweedie { p } => {
-                let p = *p;
-                if !is_valid_tweedie_power(p) {
-                    crate::bail_invalid_estim!(
-                        "Tweedie variance power must be finite and strictly between 1 and 2; got {p}"
-                    );
-                }
-                Ok(NoiseModel::Tweedie {
-                    p,
-                    phi: require_positive_noise_parameter(
-                        &self.spec,
-                        "Tweedie dispersion phi",
-                        gaussian_scale,
-                    )?,
-                })
-            }
-            ResponseFamily::NegativeBinomial { theta } => {
-                let theta = *theta;
-                if !(theta.is_finite() && theta > 0.0) {
-                    crate::bail_invalid_estim!(
-                        "negative-binomial theta must be finite and > 0; got {theta}"
-                    );
-                }
-                Ok(NoiseModel::NegativeBinomial { theta })
-            }
-            ResponseFamily::Beta { phi } => {
-                let phi = *phi;
-                if !(phi.is_finite() && phi > 0.0) {
-                    crate::bail_invalid_estim!(
-                        "beta-regression phi must be finite and > 0; got {phi}"
-                    );
-                }
-                Ok(NoiseModel::Beta { phi })
-            }
-            ResponseFamily::Gamma => Ok(NoiseModel::Gamma {
-                shape: require_positive_noise_parameter(&self.spec, "Gamma shape", gaussian_scale)?,
-            }),
-            ResponseFamily::RoystonParmar => Err(EstimationError::InvalidInput(
-                "RoystonParmar generative sampling is not exposed via generic family strategy"
-                    .to_string(),
-            )),
-        }
+        // Thin adapter over the single canonical likelihood -> noise-model
+        // mapping shared with generative inference, so simulation and
+        // inference can never disagree on supported likelihoods or how
+        // dispersion parameters are interpreted.
+        NoiseModel::from_likelihood(&self.spec, mean.len(), gaussian_scale)
     }
 
     fn integrated_moments(

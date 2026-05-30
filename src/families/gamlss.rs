@@ -20,6 +20,7 @@ use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::{
     fast_ab, fast_atv, fast_av, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y,
 };
+use crate::families::location_scale_engine::build_location_scale_exact_joint_setup;
 use crate::families::scale_design::{
     build_scale_deviation_operator, build_scale_deviation_transform_design,
 };
@@ -1315,14 +1316,10 @@ fn build_two_block_exact_joint_setup(
     rho0_override: Option<&Array1<f64>>,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> ExactJointHyperSetup {
-    // Exact-joint setup stores the spatial tail in log(kappa), not log(length_scale).
-    let mean_terms = spatial_length_scale_term_indices(meanspec);
-    let noise_terms = spatial_length_scale_term_indices(noisespec);
+    // GAMLSS-specific part: assemble the rho seed in [mean | noise | extra]
+    // penalty order, honoring a caller override when it matches the layout.
     let rho_dim = mean_penalties + noise_penalties + extra_rho0.len();
     let mut rho0vec = Array1::<f64>::zeros(rho_dim);
-    let rho_lower = Array1::<f64>::from_elem(rho_dim, -12.0);
-    let rho_upper = Array1::<f64>::from_elem(rho_dim, 12.0);
-
     if let Some(rho0) = rho0_override.filter(|rho0| rho0.len() == rho_dim) {
         rho0vec.assign(rho0);
     } else {
@@ -1331,73 +1328,9 @@ fn build_two_block_exact_joint_setup(
         }
     }
 
-    // Use aniso-aware initialization: each aniso term gets d ψ entries.
-    // Re-seed ψ from data geometry when the spec does not pin a length_scale.
-    let mean_kappa =
-        SpatialLogKappaCoords::from_length_scales_aniso(meanspec, &mean_terms, kappa_options)
-            .reseed_from_data(data, meanspec, &mean_terms, kappa_options);
-    let noise_kappa =
-        SpatialLogKappaCoords::from_length_scales_aniso(noisespec, &noise_terms, kappa_options)
-            .reseed_from_data(data, noisespec, &noise_terms, kappa_options);
-
-    // Concatenate mean and noise ψ values and dims.
-    let mut all_values = mean_kappa.as_array().to_vec();
-    all_values.extend(noise_kappa.as_array().iter());
-    let mean_dims = mean_kappa.dims_per_term().to_vec();
-    let noise_dims = noise_kappa.dims_per_term().to_vec();
-    let mut all_dims = mean_dims.clone();
-    all_dims.extend(noise_dims.iter().copied());
-
-    let log_kappa0 =
-        SpatialLogKappaCoords::new_with_dims(Array1::from_vec(all_values), all_dims.clone());
-    // Bounds: concatenate per-block data-aware bounds in the same order.
-    let mean_lower = SpatialLogKappaCoords::lower_bounds_aniso_from_data(
-        data,
-        meanspec,
-        &mean_terms,
-        &mean_dims,
-        kappa_options,
-    );
-    let noise_lower = SpatialLogKappaCoords::lower_bounds_aniso_from_data(
-        data,
-        noisespec,
-        &noise_terms,
-        &noise_dims,
-        kappa_options,
-    );
-    let mut lower_vals = mean_lower.as_array().to_vec();
-    lower_vals.extend(noise_lower.as_array().iter());
-    let log_kappa_lower =
-        SpatialLogKappaCoords::new_with_dims(Array1::from_vec(lower_vals), all_dims.clone());
-    let mean_upper = SpatialLogKappaCoords::upper_bounds_aniso_from_data(
-        data,
-        meanspec,
-        &mean_terms,
-        &mean_dims,
-        kappa_options,
-    );
-    let noise_upper = SpatialLogKappaCoords::upper_bounds_aniso_from_data(
-        data,
-        noisespec,
-        &noise_terms,
-        &noise_dims,
-        kappa_options,
-    );
-    let mut upper_vals = mean_upper.as_array().to_vec();
-    upper_vals.extend(noise_upper.as_array().iter());
-    let log_kappa_upper =
-        SpatialLogKappaCoords::new_with_dims(Array1::from_vec(upper_vals), all_dims);
-    // Project seed onto bounds; spec.length_scale is a hint, not a constraint.
-    let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
-
-    ExactJointHyperSetup::new(
-        rho0vec,
-        rho_lower,
-        rho_upper,
-        log_kappa0,
-        log_kappa_lower,
-        log_kappa_upper,
-    )
+    // Generic part: per-block log(kappa) seed/bounds and exact-joint assembly,
+    // with the two linear predictors (mean, noise) in theta order.
+    build_location_scale_exact_joint_setup(data, &[meanspec, noisespec], rho0vec, kappa_options)
 }
 
 pub(crate) fn solve_penalizedweighted_projection(

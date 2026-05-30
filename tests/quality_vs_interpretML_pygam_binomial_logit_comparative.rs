@@ -37,7 +37,7 @@ use gam::matrix::LinearOperator;
 use gam::test_support::reference::{Column, run_python};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use gam::inference::data::EncodedDataset;
-use ndarray::{Array2, Axis};
+use ndarray::Array2;
 use std::path::Path;
 
 const PROSTATE_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/prostate.csv");
@@ -202,8 +202,12 @@ for f in range(n_folds):
     Xtr, ytr = X[tr], yv[tr]
     Xte, yte = X[te], yv[te]
 
-    # InterpretML EBM: additive shape-function classifier (deterministic seed).
-    ebm = ExplainableBoostingClassifier(random_state=0)
+    # InterpretML EBM: PURELY additive shape-function classifier. interactions=0
+    # disables EBM's default automatic pairwise (pc1 x pc2) term so the model is
+    # the SAME additive structure s(pc1) + s(pc2) that gam and pyGAM fit -- an
+    # interaction-bearing EBM would not be the additive comparator this test
+    # claims to benchmark. Deterministic seed for reproducibility.
+    ebm = ExplainableBoostingClassifier(interactions=0, random_state=0)
     ebm.fit(Xtr, ytr)
     p_ebm = ebm.predict_proba(Xte)[:, 1]
     ebm_auc.append(float(roc_auc_score(yte, p_ebm)))

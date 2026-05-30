@@ -20,6 +20,7 @@ mod firth;
 pub(super) mod hyper;
 mod inner_strategy;
 pub(crate) mod penalty_logdet;
+pub(crate) mod rho_prior_eval;
 pub(crate) mod runtime;
 mod trace;
 pub(crate) mod unified;
