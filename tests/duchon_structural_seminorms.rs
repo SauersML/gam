@@ -64,7 +64,10 @@ fn duchon_spec(k: usize, order: DuchonNullspaceOrder) -> DuchonBasisSpec {
         center_strategy: CenterStrategy::FarthestPoint { num_centers: k },
         periodic: None,
         length_scale: None,
-        power: 1.0,
+        // d=2 cubic default s=(d-1)/2=0.5: satisfies CPD (2s<d) and yields the
+        // r^3 kernel, whose Hessian is finite at the center self-pairs the
+        // data-jet penalty evaluates (r^2 log r at power=0 would diverge there).
+        power: 0.5,
         nullspace_order: order,
         // No extra intercept centering: we want the affine columns present in
         // the raw design so constant / linear targets are exactly representable.
