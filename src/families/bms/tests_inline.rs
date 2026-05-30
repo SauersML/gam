@@ -42,7 +42,7 @@ mod tests {
             logslope_design: empty_design,
             latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: None,
-            base_link: InverseLink::Standard(crate::types::StandardLink::Logit),
+            base_link: InverseLink::Standard(crate::types::StandardLink::Probit),
             score_warp: None,
             link_dev: None,
             policy: crate::resource::ResourcePolicy::default_library(),
@@ -63,8 +63,16 @@ mod tests {
     }
 
     fn dummy_blockspec(p: usize, n_rows: usize) -> ParameterBlockSpec {
+        // Block names must be unique across a single `validate_blockspecs`
+        // call (the family layer keys coefficient labels by name). Tests
+        // commonly build `vec![dummy_blockspec(...), dummy_blockspec(...)]`,
+        // so the helper draws a fresh suffix from a per-process counter
+        // rather than hard-coding "dummy".
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let idx = SEQ.fetch_add(1, Ordering::Relaxed);
         ParameterBlockSpec {
-            name: "dummy".to_string(),
+            name: format!("dummy_{idx}"),
             design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::<f64>::zeros((n_rows, p)),
             )),

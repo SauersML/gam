@@ -82,7 +82,7 @@ pub fn exp_sigma_eta_for_sigma_scalar(sigma: f64) -> f64 {
     );
     assert!(
         sigma > 0.0,
-        "exp sigma inverse link requires positive sigma: sigma={sigma}"
+        "exp sigma inverse link: sigma must be positive (got sigma={sigma})"
     );
     sigma.ln()
 }
@@ -240,7 +240,7 @@ pub fn logb_sigma_eta_for_sigma_scalar(sigma: f64) -> f64 {
     );
     assert!(
         sigma > LOGB_SIGMA_FLOOR,
-        "logb sigma inverse link requires sigma above floor: sigma={sigma}, floor={LOGB_SIGMA_FLOOR}"
+        "logb sigma inverse link: sigma must exceed LOGB_SIGMA_FLOOR (got sigma={sigma}, floor={LOGB_SIGMA_FLOOR})"
     );
     (sigma - LOGB_SIGMA_FLOOR).ln()
 }
