@@ -3904,6 +3904,229 @@ mod tests {
         ]
     }
 
+    // --- shared latent-interval validation engine: parity / contract tests ---
+
+    use crate::families::survival_location_scale::TimeBlockMonotonicity;
+
+    /// Minimal, structurally valid `TimeBlockInput` for `n` rows and `p_time`
+    /// columns, used to exercise the shared validation driver without standing
+    /// up a full term-collection design.
+    fn validation_time_block(n: usize, p_time: usize) -> TimeBlockInput {
+        let design = |fill: f64| {
+            DesignMatrix::Dense(DenseDesignMatrix::from(Array2::from_elem((n, p_time), fill)))
+        };
+        TimeBlockInput {
+            design_entry: design(0.1),
+            design_exit: design(0.2),
+            design_derivative_exit: design(0.3),
+            offset_entry: Array1::zeros(n),
+            offset_exit: Array1::zeros(n),
+            derivative_offset_exit: Array1::zeros(n),
+            time_monotonicity: TimeBlockMonotonicity::EnforcedByCoordinateCone,
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: None,
+            initial_beta: None,
+        }
+    }
+
+    fn empty_meanspec() -> TermCollectionSpec {
+        TermCollectionSpec {
+            linear_terms: Vec::new(),
+            random_effect_terms: Vec::new(),
+            smooth_terms: Vec::new(),
+        }
+    }
+
+    /// A valid two-row latent-survival term spec (one exact event under loaded
+    /// hazard, one right-censored row).
+    fn valid_survival_spec(n: usize, p_time: usize) -> LatentSurvivalTermSpec {
+        LatentSurvivalTermSpec {
+            age_entry: Array1::zeros(n),
+            age_exit: Array1::from_elem(n, 1.0),
+            event_target: Array1::from_shape_fn(n, |i| (i % 2) as u8),
+            weights: Array1::from_elem(n, 1.0),
+            derivative_guard: 0.0,
+            time_block: validation_time_block(n, p_time),
+            unloaded_mass_entry: Array1::from_elem(n, 0.01),
+            unloaded_mass_exit: Array1::from_elem(n, 0.05),
+            unloaded_hazard_exit: Array1::from_elem(n, 0.02),
+            meanspec: empty_meanspec(),
+            mean_offset: Array1::zeros(n),
+        }
+    }
+
+    /// A valid latent-binary term spec mirroring `valid_survival_spec` but
+    /// without the per-row unloaded hazard.
+    fn valid_binary_spec(n: usize, p_time: usize) -> LatentBinaryTermSpec {
+        LatentBinaryTermSpec {
+            age_entry: Array1::zeros(n),
+            age_exit: Array1::from_elem(n, 1.0),
+            event_target: Array1::from_shape_fn(n, |i| (i % 2) as u8),
+            weights: Array1::from_elem(n, 1.0),
+            derivative_guard: 0.0,
+            time_block: validation_time_block(n, p_time),
+            unloaded_mass_entry: Array1::from_elem(n, 0.01),
+            unloaded_mass_exit: Array1::from_elem(n, 0.05),
+            meanspec: empty_meanspec(),
+            mean_offset: Array1::zeros(n),
+        }
+    }
+
+    fn loaded_frailty() -> FrailtySpec {
+        FrailtySpec::HazardMultiplier {
+            sigma_fixed: Some(0.3),
+            loading: HazardLoading::LoadedVsUnloaded,
+        }
+    }
+
+    /// Both adapters route through the shared `validate_latent_interval_inputs`
+    /// engine, but each must still emit its own context prefix and (for the
+    /// size-mismatch / unloaded-decomposition diagnostics) the hazard-aware vs
+    /// mass-only message variant. This pins the byte-for-byte contract the
+    /// unification had to preserve, the property the issue's "old vs new
+    /// validation errors" parity test guards.
+    #[test]
+    fn latent_interval_validation_parity_across_models() {
+        let n = 2;
+        let p_time = 2;
+        let data = Array2::<f64>::zeros((n, 3));
+
+        // 1. A clean spec validates and round-trips the resolved sigma.
+        //    Survival keeps the (possibly learnable) Option; binary unwraps to
+        //    the fixed scalar.
+        let surv_sigma = validate_latent_survival_inputs(
+            data.view(),
+            &valid_survival_spec(n, p_time),
+            &loaded_frailty(),
+        )
+        .expect("valid survival spec must validate");
+        assert_eq!(surv_sigma, Some(0.3));
+        let bin_sigma =
+            validate_latent_binary_inputs(data.view(), &valid_binary_spec(n, p_time), &loaded_frailty())
+                .expect("valid binary spec must validate");
+        assert_eq!(bin_sigma, 0.3);
+
+        // 2. Empty data: shared driver, per-model context prefix.
+        let empty = Array2::<f64>::zeros((0, 3));
+        let surv_empty = validate_latent_survival_inputs(
+            empty.view(),
+            &valid_survival_spec(n, p_time),
+            &loaded_frailty(),
+        )
+        .expect_err("empty data must be rejected");
+        assert_eq!(
+            surv_empty.to_string(),
+            "latent-survival requires a non-empty dataset"
+        );
+        let bin_empty =
+            validate_latent_binary_inputs(empty.view(), &valid_binary_spec(n, p_time), &loaded_frailty())
+                .expect_err("empty data must be rejected");
+        assert_eq!(
+            bin_empty.to_string(),
+            "latent-binary requires a non-empty dataset"
+        );
+
+        // 3. Size mismatch: survival's message carries `unloaded_hazard=`,
+        //    binary's does not. This is the one shape that distinguishes the
+        //    two row views feeding the shared driver.
+        let mut surv_bad = valid_survival_spec(n, p_time);
+        surv_bad.weights = Array1::from_elem(n + 1, 1.0);
+        let surv_size = validate_latent_survival_inputs(data.view(), &surv_bad, &loaded_frailty())
+            .expect_err("size mismatch must be rejected");
+        let surv_msg = surv_size.to_string();
+        assert!(
+            surv_msg.starts_with("latent-survival size mismatch")
+                && surv_msg.contains("unloaded_hazard="),
+            "survival size-mismatch message must include unloaded_hazard: {surv_msg}"
+        );
+        let mut bin_bad = valid_binary_spec(n, p_time);
+        bin_bad.weights = Array1::from_elem(n + 1, 1.0);
+        let bin_size = validate_latent_binary_inputs(data.view(), &bin_bad, &loaded_frailty())
+            .expect_err("size mismatch must be rejected");
+        let bin_msg = bin_size.to_string();
+        assert!(
+            bin_msg.starts_with("latent-binary size mismatch") && !bin_msg.contains("unloaded_hazard"),
+            "binary size-mismatch message must omit unloaded_hazard: {bin_msg}"
+        );
+
+        // 4. Invalid unloaded decomposition: survival reports `exit_hazard=`,
+        //    binary reports only the two masses.
+        let mut surv_neg_hazard = valid_survival_spec(n, p_time);
+        surv_neg_hazard.unloaded_hazard_exit[0] = -1.0;
+        let surv_decomp =
+            validate_latent_survival_inputs(data.view(), &surv_neg_hazard, &loaded_frailty())
+                .expect_err("negative unloaded hazard must be rejected");
+        assert_eq!(
+            surv_decomp.to_string(),
+            "latent-survival row 1 has invalid unloaded hazard decomposition: entry_mass=0.01, exit_mass=0.05, exit_hazard=-1"
+        );
+        let mut bin_bad_mass = valid_binary_spec(n, p_time);
+        bin_bad_mass.unloaded_mass_exit[0] = 0.0; // exit < entry
+        let bin_decomp =
+            validate_latent_binary_inputs(data.view(), &bin_bad_mass, &loaded_frailty())
+                .expect_err("non-monotone unloaded mass must be rejected");
+        assert_eq!(
+            bin_decomp.to_string(),
+            "latent-binary row 1 has invalid unloaded mass decomposition: entry_mass=0.01, exit_mass=0"
+        );
+
+        // 5. Per-row interval/event/weight diagnostics share one engine, so an
+        //    identical invalid input yields identical (modulo prefix) text.
+        let mut surv_event = valid_survival_spec(n, p_time);
+        surv_event.event_target[1] = 7;
+        let surv_event_err =
+            validate_latent_survival_inputs(data.view(), &surv_event, &loaded_frailty())
+                .expect_err("invalid event target must be rejected");
+        assert_eq!(
+            surv_event_err.to_string(),
+            "latent-survival row 2 has invalid event target 7; expected 0 or 1"
+        );
+        let mut bin_event = valid_binary_spec(n, p_time);
+        bin_event.event_target[1] = 7;
+        let bin_event_err =
+            validate_latent_binary_inputs(data.view(), &bin_event, &loaded_frailty())
+                .expect_err("invalid event target must be rejected");
+        assert_eq!(
+            bin_event_err.to_string(),
+            "latent-binary row 2 has invalid event target 7; expected 0 or 1"
+        );
+
+        // 6. Frailty policy divergence: survival accepts a learnable scale
+        //    (`sigma_fixed = None` ⇒ `Ok(None)`), binary rejects it.
+        let learnable = FrailtySpec::HazardMultiplier {
+            sigma_fixed: None,
+            loading: HazardLoading::LoadedVsUnloaded,
+        };
+        let surv_learnable =
+            validate_latent_survival_inputs(data.view(), &valid_survival_spec(n, p_time), &learnable)
+                .expect("survival accepts a learnable latent scale");
+        assert_eq!(surv_learnable, None);
+        let bin_learnable =
+            validate_latent_binary_inputs(data.view(), &valid_binary_spec(n, p_time), &learnable)
+                .expect_err("binary requires a fixed latent scale");
+        assert_eq!(
+            bin_learnable.to_string(),
+            "latent-binary currently requires a fixed hazard-multiplier sigma"
+        );
+
+        // 7. The time-block shape check is owned by the shared driver: a
+        //    column-count mismatch is reported with the per-model prefix.
+        let mut surv_time_bad = valid_survival_spec(n, p_time);
+        surv_time_bad.time_block.design_entry = DesignMatrix::Dense(DenseDesignMatrix::from(
+            Array2::from_elem((n, p_time + 1), 0.1),
+        ));
+        let surv_time_err =
+            validate_latent_survival_inputs(data.view(), &surv_time_bad, &loaded_frailty())
+                .expect_err("time block column mismatch must be rejected");
+        assert!(
+            surv_time_err
+                .to_string()
+                .starts_with("latent-survival time block column mismatch"),
+            "unexpected survival time-block message: {surv_time_err}"
+        );
+    }
+
     #[test]
     fn latent_survival_coefficient_cost_uses_joint_coupled_formula() {
         // `evaluate_exact_newton_joint_dense` builds a fully dense joint

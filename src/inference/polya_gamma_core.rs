@@ -221,10 +221,6 @@ pub fn draw_pg1<R: PgRng + ?Sized>(rng: &mut R, tilt: f64) -> f64 {
 // CUDA constant rendering — device source is generated from `constants`
 // ────────────────────────────────────────────────────────────────────────
 
-/// `FRAC_2_PI = 2/π` as a host literal, exposed so the rendered CUDA `#define`
-/// list and the host code agree on the branch threshold to the bit.
-pub const FRAC_2_PI_CONST: f64 = FRAC_2_PI;
-
 /// Render the `#define` block of `PG(1, c)` constants for the embedded CUDA
 /// source. The device kernel `#include`s these definitions textually, so every
 /// numeric literal the device uses for the Devroye math originates from the

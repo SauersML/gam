@@ -157,74 +157,6 @@ def duchon_evaluate(spec: Any, coords: Any) -> Any:
     )
 
 
-def _RadialJetFn_apply(
-    points: Any,
-    resolve_centers: Any,
-    radial_first: Any,
-    radial_second: Any,
-) -> Any:
-    """Autograd-aware radial-kernel input-location jet ``φ'(r)·(t−c)/r``.
-
-    Forward returns the per-row jet ``(B, K, d)``. Backward assembles the
-    Hessian contraction analytically:
-
-    ``H[b, k, i, j] = φ''(r) u_i u_j + (φ'(r)/r) (δ_ij − u_i u_j)``,
-    ``u = (t − c)/r``.
-
-    Routing the jet through this Function makes
-    :meth:`gamfit.BasisDescriptor.hessian` work via the generic autograd
-    path for both Duchon and Matérn descriptors.
-    """
-    torch = _torch()
-
-    class _JetFn(torch.autograd.Function):
-        @staticmethod
-        def forward(ctx: Any, pts: Any) -> Any:
-            import numpy as np
-
-            pts_np = pts.detach().cpu().to(dtype=torch.float64).numpy()
-            ctrs_np = resolve_centers(pts_np)
-            phi_r = radial_first(pts_np, ctrs_np)  # (B, K)
-            diffs = pts_np[:, None, :] - ctrs_np[None, :, :]  # (B, K, d)
-            r2 = (diffs * diffs).sum(axis=-1)
-            r_safe = np.sqrt(r2 + 1e-300)
-            axis_ratio = diffs / r_safe[..., None]
-            jet_np = phi_r[..., None] * axis_ratio
-            jet = torch.as_tensor(jet_np, dtype=pts.dtype, device=pts.device)
-            ctx.save_for_backward(pts)
-            return jet
-
-        @staticmethod
-        def backward(ctx: Any, *grads: Any) -> Any:
-            import numpy as np
-
-            (grad_jet,) = grads  # (B, K, d)
-            (pts,) = ctx.saved_tensors
-            pts_np = pts.detach().cpu().to(dtype=torch.float64).numpy()
-            ctrs_np = resolve_centers(pts_np)
-            phi_r = radial_first(pts_np, ctrs_np)
-            phi_rr = radial_second(pts_np, ctrs_np)
-            diffs = pts_np[:, None, :] - ctrs_np[None, :, :]
-            r2 = (diffs * diffs).sum(axis=-1)
-            r = np.sqrt(r2)
-            r_safe = np.where(r > 0.0, r, 1.0)
-            phi_r_over_r = np.where(r > 0.0, phi_r / r_safe, phi_rr)
-            u = np.where(r[..., None] > 0.0, diffs / r_safe[..., None], 0.0)
-            d = u.shape[-1]
-            uu = u[..., :, None] * u[..., None, :]  # (B, K, d, d)
-            eye = np.eye(d, dtype=float)
-            H = phi_rr[..., None, None] * uu + phi_r_over_r[..., None, None] * (
-                eye - uu
-            )
-            H_t = torch.as_tensor(H, dtype=pts.dtype, device=pts.device)
-            grad_pts = torch.einsum(
-                "bkj,bkij->bi", grad_jet.to(dtype=H_t.dtype), H_t
-            )
-            return grad_pts
-
-    return _JetFn.apply(points)
-
-
 # ---------------------------------------------------------------------------
 # Matern descriptor evaluator
 # ---------------------------------------------------------------------------
@@ -236,10 +168,14 @@ def matern_evaluate(spec: Any, coords: Any) -> Any:
     Forward and backward both route through Rust:
 
     * forward: :func:`gamfit._api.matern_basis` (Rust ``matern_basis``);
-    * backward: :func:`rust_module.matern_input_location_first_derivative`
-      returns the radial derivative ``φ'(r)``, which we combine with the
-      closed-form axis ratio ``(t − c) / r`` (standard tensor algebra,
-      not kernel math) to assemble the per-axis jet.
+    * backward: :func:`rust_module.matern_input_location_first_jet` returns the
+      full per-axis jet ``∂Φ/∂t`` under the *anisotropic* metric
+      ``r_A = √(Σ_a w_a (t_a − c_a)²)`` (same centred-contrast weights the
+      forward applies), and :func:`rust_module.matern_input_location_hessian`
+      returns the metric-aware input-location Hessian for second-order
+      autograd. All kernel math (metric weights, ``φ'``/``φ''``, the
+      diagonal-plus-rank-1 assembly) lives in Rust; Python only contracts the
+      returned tensors with upstream gradients.
     """
     if spec.centers is None:
         raise ValueError("Matern.evaluate: centers must be provided")

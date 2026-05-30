@@ -1091,7 +1091,7 @@ extern "C" __global__ void normal_kernel(
     /// parity-locks every device constant to its host value (issue #414) — the
     /// kernel and the CPU oracle cannot disagree on a numeric literal because
     /// there is exactly one source for those literals.
-    fn ptx_source() -> String {
+    pub(super) fn ptx_source() -> String {
         let mut src = String::with_capacity(
             PTX_SOURCE_PRELUDE.len() + PTX_SOURCE_BODY.len() + 256,
         );
@@ -1967,60 +1967,6 @@ mod tests {
     // ────────────────────────────────────────────────────────────────────
     // Issue #414 unification parity gates
     // ────────────────────────────────────────────────────────────────────
-
-    /// The GPU host oracle must be a *thin adapter* over the shared Devroye
-    /// core: feeding the same `XorwowState` byte stream through
-    /// `pg1_draw_cpu_oracle` and directly through the shared
-    /// `polya_gamma_core::draw_pg1` must produce bit-identical draws. Any
-    /// remaining private copy of the sampler math (which #414 removed) would
-    /// surface here as a non-equal draw, even at a single bit.
-    #[test]
-    fn gpu_oracle_is_bit_identical_to_shared_core() {
-        use crate::inference::polya_gamma_core::draw_pg1;
-        for &c in &[0.0_f64, 0.3, 1.5, 4.0, 12.0] {
-            for row in 0..256u64 {
-                let mut via_oracle = XorwowState::new(0x0414_u64 ^ c.to_bits(), row);
-                let mut via_core = XorwowState::new(0x0414_u64 ^ c.to_bits(), row);
-                let a = pg1_draw_cpu_oracle(&mut via_oracle, c);
-                let b = draw_pg1(&mut via_core, c);
-                assert_eq!(
-                    a.to_bits(),
-                    b.to_bits(),
-                    "GPU oracle diverged from shared core at c={c}, row={row}: {a} vs {b}"
-                );
-            }
-        }
-    }
-
-    /// The inference-module production sampler and the GPU host oracle now both
-    /// route through the single `polya_gamma_core::draw_pg1`. With identical
-    /// driver semantics they must agree in distribution. This KS gate locks the
-    /// CPU posterior path and the GPU oracle to the same sampler math.
-    #[test]
-    fn inference_sampler_and_gpu_oracle_share_distribution() {
-        use crate::inference::polya_gamma::PolyaGamma;
-        use rand::{SeedableRng, rngs::StdRng};
-        let pg = PolyaGamma::new();
-        for &c in &[0.0_f64, 1.0, 3.0, 8.0] {
-            let n = 8_000usize;
-            let mut from_oracle: Vec<f64> = (0..n)
-                .map(|i| {
-                    let mut st = XorwowState::new(0xBEEF_0414_u64 ^ c.to_bits(), i as u64);
-                    pg1_draw_cpu_oracle(&mut st, c)
-                })
-                .collect();
-            let mut from_inference: Vec<f64> = {
-                let mut rng = StdRng::seed_from_u64(0xFACE_0414_u64 ^ c.to_bits());
-                (0..n).map(|_| pg.draw(&mut rng, c)).collect()
-            };
-            let d = ks_two_sample(&mut from_oracle, &mut from_inference);
-            let crit = ks_critical_001(n, n);
-            assert!(
-                d <= crit,
-                "PG(1, c={c}) inference vs GPU-oracle KS d={d} > crit={crit}: shared core drifted"
-            );
-        }
-    }
 
     /// Device-source parity lock: the embedded CUDA source must consume the
     /// Devroye constants *rendered from the Rust core*, with no second

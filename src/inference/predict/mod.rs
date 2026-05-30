@@ -3214,12 +3214,18 @@ impl PredictableModel for BernoulliMarginalSlopePredictor {
     ) -> Result<PredictUncertaintyResult, EstimationError> {
         let plugin = self.predict_plugin_response(input)?;
         let eta_se = self.eta_standard_error(input, fit)?;
-        let zcrit = standard_normal_quantile(0.5 + options.confidence_level * 0.5)
-            .map_err(EstimationError::InvalidInput)?;
-        let eta_lower = &plugin.eta - &eta_se.mapv(|s| zcrit * s);
-        let eta_upper = &plugin.eta + &eta_se.mapv(|s| zcrit * s);
-        let mean_lower = self.mean_from_eta(&eta_lower)?;
-        let mean_upper = self.mean_from_eta(&eta_upper)?;
+        let zcrit = validated_central_z(options.confidence_level)?;
+        let (eta_lower, eta_upper) = symmetric_interval(&plugin.eta, &eta_se, zcrit);
+        let (mean_lower, mean_upper) = mean_bounds(
+            &eta_lower,
+            &eta_upper,
+            &plugin.mean,
+            zcrit,
+            MeanBoundMethod::TransformEta {
+                bounds: ResponseBounds::for_family(&self.likelihood_family().response),
+                response_map: &|eta: &Array1<f64>| self.mean_from_eta(eta),
+            },
+        )?;
         let mean_se = eta_se.clone() * self.mean_derivative_from_eta(&plugin.eta)?;
         Ok(PredictUncertaintyResult {
             eta: plugin.eta,
@@ -3256,14 +3262,19 @@ impl PredictableModel for BernoulliMarginalSlopePredictor {
                 .collect::<Result<Vec<_>, _>>()?,
         );
         let (mean_lower, mean_upper) = if let Some(level) = confidence_level {
-            let z = standard_normal_quantile(0.5 + 0.5 * level)
-                .map_err(EstimationError::InvalidInput)?;
-            let eta_lower = &plugin.eta - &eta_se.mapv(|s| z * s);
-            let eta_upper = &plugin.eta + &eta_se.mapv(|s| z * s);
-            (
-                Some(self.mean_from_eta(&eta_lower)?),
-                Some(self.mean_from_eta(&eta_upper)?),
-            )
+            let z = validated_central_z(level)?;
+            let (eta_lower, eta_upper) = symmetric_interval(&plugin.eta, &eta_se, z);
+            let (lower, upper) = mean_bounds(
+                &eta_lower,
+                &eta_upper,
+                &mean,
+                z,
+                MeanBoundMethod::TransformEta {
+                    bounds: ResponseBounds::for_family(&self.likelihood_family().response),
+                    response_map: &|eta: &Array1<f64>| self.mean_from_eta(eta),
+                },
+            )?;
+            (Some(lower), Some(upper))
         } else {
             (None, None)
         };
@@ -3481,20 +3492,25 @@ impl PredictableModel for GaussianLocationScalePredictor {
         })?;
         let sigma = self.compute_sigma(design_noise, input.offset_noise.as_ref())?;
         let eta_se = self.eta_standard_error(input, fit, pred.eta.len())?;
-        let z = crate::probability::standard_normal_quantile(0.5 + options.confidence_level * 0.5)
-            .map_err(EstimationError::InvalidInput)?;
-        let z_se = eta_se.mapv(|s| z * s);
-        let eta_lower = &pred.eta - &z_se;
-        let eta_upper = &pred.eta + &z_se;
+        let z = validated_central_z(options.confidence_level)?;
+        let (eta_lower, eta_upper) = symmetric_interval(&pred.eta, &eta_se, z);
+        // Identity link: the response interval is exactly the η interval.
+        let (mean_lower, mean_upper) = mean_bounds(
+            &eta_lower,
+            &eta_upper,
+            &pred.mean,
+            z,
+            MeanBoundMethod::IdentityEta,
+        )?;
         Ok(PredictUncertaintyResult {
             eta: pred.eta.clone(),
             mean: pred.mean.clone(),
             eta_standard_error: eta_se.clone(),
             mean_standard_error: eta_se.clone(),
-            eta_lower: eta_lower.clone(),
-            eta_upper: eta_upper.clone(),
-            mean_lower: eta_lower,
-            mean_upper: eta_upper,
+            eta_lower,
+            eta_upper,
+            mean_lower,
+            mean_upper,
             observation_lower: options
                 .includeobservation_interval
                 .then(|| &pred.mean - &sigma.mapv(|s| z * s)),
@@ -3516,10 +3532,9 @@ impl PredictableModel for GaussianLocationScalePredictor {
         let eta_se = self.eta_standard_error(input, fit, result.eta.len())?;
         // Gaussian identity link: mean == eta, so bounds are eta ± z·se.
         let (mean_lower, mean_upper) = if let Some(level) = confidence_level {
-            let z = standard_normal_quantile(0.5 + 0.5 * level)
-                .map_err(EstimationError::InvalidInput)?;
-            let z_se = eta_se.mapv(|s| z * s);
-            (Some(&result.eta - &z_se), Some(&result.eta + &z_se))
+            let z = validated_central_z(level)?;
+            let (lower, upper) = symmetric_interval(&result.eta, &eta_se, z);
+            (Some(lower), Some(upper))
         } else {
             (None, None)
         };
@@ -3736,8 +3751,7 @@ impl PredictableModel for BinomialLocationScalePredictor {
     ) -> Result<PredictUncertaintyResult, EstimationError> {
         assert!(std::mem::size_of_val(fit_result) > 0);
         let pred = self.predict_with_uncertainty(input)?;
-        let z = standard_normal_quantile(0.5 + options.confidence_level * 0.5)
-            .map_err(EstimationError::InvalidInput)?;
+        let z = validated_central_z(options.confidence_level)?;
 
         let mean_se = pred
             .mean_se
@@ -3745,11 +3759,19 @@ impl PredictableModel for BinomialLocationScalePredictor {
             .cloned()
             .unwrap_or_else(|| Array1::zeros(pred.mean.len()));
 
-        let mut mean_lower = &pred.mean - &mean_se.mapv(|s| z * s);
-        let mut mean_upper = &pred.mean + &mean_se.mapv(|s| z * s);
-        // Clamp probabilities to [0, 1].
-        mean_lower.mapv_inplace(|v| v.clamp(0.0, 1.0));
-        mean_upper.mapv_inplace(|v| v.clamp(0.0, 1.0));
+        // Binomial LS response is a probability already evaluated
+        // post-transformation, so the response interval is the delta-method
+        // μ ± z·SE(μ) clamped to [0, 1].
+        let (mean_lower, mean_upper) = mean_bounds(
+            &pred.eta,
+            &pred.eta,
+            &pred.mean,
+            z,
+            MeanBoundMethod::Delta {
+                mean_se: &mean_se,
+                bounds: ResponseBounds::UNIT_PROBABILITY,
+            },
+        )?;
 
         // For binomial LS, eta intervals on the threshold predictor are not
         // directly meaningful for response-scale inference. Provide the
@@ -4007,12 +4029,18 @@ impl PredictableModel for BinomialLocationScalePredictor {
         // Binomial location-scale eta_se is response-scale (dprob/dθ chain
         // rule), so bounds are mean ± z·se clamped to [0, 1].
         let (mean_lower, mean_upper) = if let Some(level) = confidence_level {
-            let z = standard_normal_quantile(0.5 + 0.5 * level)
-                .map_err(EstimationError::InvalidInput)?;
-            (
-                Some((&mean - &eta_se.mapv(|s| z * s)).mapv(|v| v.clamp(0.0, 1.0))),
-                Some((&mean + &eta_se.mapv(|s| z * s)).mapv(|v| v.clamp(0.0, 1.0))),
-            )
+            let z = validated_central_z(level)?;
+            let (lower, upper) = mean_bounds(
+                &eta,
+                &eta,
+                &mean,
+                z,
+                MeanBoundMethod::Delta {
+                    mean_se: &eta_se,
+                    bounds: ResponseBounds::UNIT_PROBABILITY,
+                },
+            )?;
+            (Some(lower), Some(upper))
         } else {
             (None, None)
         };
@@ -4283,8 +4311,7 @@ impl PredictableModel for SurvivalPredictor {
     ) -> Result<PredictUncertaintyResult, EstimationError> {
         assert!(std::mem::size_of_val(fit_result) > 0);
         let pred = self.predict_with_uncertainty(input)?;
-        let z = crate::probability::standard_normal_quantile(0.5 + options.confidence_level * 0.5)
-            .map_err(EstimationError::InvalidInput)?;
+        let z = validated_central_z(options.confidence_level)?;
 
         let eta_se = pred.eta_se.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput(
@@ -4297,15 +4324,19 @@ impl PredictableModel for SurvivalPredictor {
             )
         })?;
 
-        let eta_z_se = eta_se.mapv(|s| z * s);
-        let mean_z_se = mean_se.mapv(|s| z * s);
-        let eta_lower = &pred.eta - &eta_z_se;
-        let eta_upper = &pred.eta + &eta_z_se;
-        let mut mean_lower = &pred.mean - &mean_z_se;
-        let mut mean_upper = &pred.mean + &mean_z_se;
-        // Clamp survival probabilities to [0, 1].
-        mean_lower.mapv_inplace(|v| v.clamp(0.0, 1.0));
-        mean_upper.mapv_inplace(|v| v.clamp(0.0, 1.0));
+        let (eta_lower, eta_upper) = symmetric_interval(&pred.eta, eta_se, z);
+        // Survival tail is a probability; the delta-method response interval is
+        // μ ± z·SE(μ) clamped to [0, 1].
+        let (mean_lower, mean_upper) = mean_bounds(
+            &eta_lower,
+            &eta_upper,
+            &pred.mean,
+            z,
+            MeanBoundMethod::Delta {
+                mean_se,
+                bounds: ResponseBounds::UNIT_PROBABILITY,
+            },
+        )?;
 
         Ok(PredictUncertaintyResult {
             eta: pred.eta,
@@ -4400,9 +4431,17 @@ impl PredictableModel for SurvivalPredictor {
                 .collect::<Result<Vec<_>, _>>()?,
         );
         let (mean_lower, mean_upper) = if let Some(level) = confidence_level {
-            let z = crate::probability::standard_normal_quantile(0.5 + 0.5 * level).unwrap_or(1.96);
-            let lo = (&mean - &eta_se.mapv(|s| z * s)).mapv(|v| v.clamp(0.0, 1.0));
-            let hi = (&mean + &eta_se.mapv(|s| z * s)).mapv(|v| v.clamp(0.0, 1.0));
+            let z = validated_central_z(level)?;
+            let (lo, hi) = mean_bounds(
+                &eta_threshold,
+                &eta_threshold,
+                &mean,
+                z,
+                MeanBoundMethod::Delta {
+                    mean_se: &eta_se,
+                    bounds: ResponseBounds::UNIT_PROBABILITY,
+                },
+            )?;
             (Some(lo), Some(hi))
         } else {
             (None, None)
