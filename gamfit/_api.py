@@ -1902,39 +1902,6 @@ def periodic_spline_curve_basis(
     return np.asarray(basis, dtype=float), np.asarray(penalty, dtype=float)
 
 
-def _duchon_operator_penalties(
-    centers: Any,
-    *,
-    m: int = 2,
-    periodic: bool = False,
-    period: float | None = None,
-) -> tuple[Any, Any, Any]:
-    """Internal Duchon operator penalty constructor."""
-    import numpy as np
-
-    m_i = int(m)
-    if m_i < 1:
-        raise ValueError(f"m must be at least 1, got {m}")
-    if period is not None and (
-        not math.isfinite(float(period)) or float(period) <= 0.0
-    ):
-        raise ValueError("period must be finite and > 0")
-    try:
-        mass, tension, stiffness = rust_module().duchon_operator_penalties(
-            _numeric_vector(centers, "centers"),
-            m_i,
-            bool(periodic),
-            None if period is None else float(period),
-        )
-    except Exception as exc:
-        raise map_exception(exc) from exc
-    return (
-        np.asarray(mass, dtype=float),
-        np.asarray(tension, dtype=float),
-        np.asarray(stiffness, dtype=float),
-    )
-
-
 def duchon_function_norm_penalty(
     centers: Any,
     *,
@@ -3674,7 +3641,7 @@ def _resolve_position_penalty(
     if isinstance(penalty, str) or penalty is None:
         kind = str(basis_kind).strip().lower().replace("_", "").replace("-", "")
         if kind in {"duchon", "duchonspline"}:
-            if penalty_kind in {None, "function-norm", "functionnorm", "rkhs"}:
+            if penalty_kind in {None, "function-norm", "functionnorm", "rkhs", "smoothness"}:
                 return duchon_function_norm_penalty(
                     knots_or_centers,
                     m=int(basis_order),
@@ -3682,29 +3649,27 @@ def _resolve_position_penalty(
                     period=None,
                 )
             if penalty_kind in {"triple-operator", "tripleoperator", "operator"}:
-                mass, tension, stiffness = _duchon_operator_penalties(
-                    knots_or_centers,
-                    m=int(basis_order),
-                    periodic=False,
-                    period=None,
+                raise ValueError(
+                    "the triple-operator (amplitude + slope + curvature) penalty has THREE "
+                    "independent REML smoothing parameters and cannot be collapsed into the "
+                    "single-λ position helper. Fit it through the formula API "
+                    "(gamfit.smooth.Duchon / basis_kind='duchon'), which routes each operator "
+                    "to its own λ."
                 )
-                return mass + tension + stiffness
             raise ValueError(f"unsupported Duchon penalty {penalty!r}")
         if kind in {"duchonmultipenalty", "duchontripleoperator"}:
-            # The triple-operator basis carries the additive sum of mass +
-            # tension + stiffness as its default single-λ penalty. The proper
-            # multi-λ entry point is the ``smoothing="adam"`` route, which
-            # accepts a length-3 ``log_lambda`` tensor and routes gradients
-            # through each component individually.
-            if penalty_kind not in {None, "triple-operator", "tripleoperator", "operator"}:
-                raise ValueError(f"unsupported duchon_multipenalty penalty {penalty!r}")
-            mass, tension, stiffness = _duchon_operator_penalties(
-                knots_or_centers,
-                m=int(basis_order),
-                periodic=False,
-                period=None,
+            # The amplitude/slope/curvature smoother has THREE independent REML
+            # smoothing parameters; summing the three operators into one matrix
+            # here would force them to share a single λ, which is a different
+            # (and weaker) object than the structural smoother. The position
+            # helper only carries one λ, so there is no faithful single-matrix
+            # representation — route the user to the formula smooth instead.
+            raise ValueError(
+                "basis_kind='duchon_multipenalty' is the multi-λ amplitude/slope/curvature "
+                "smoother and cannot be expressed as a single position-helper penalty. Fit it "
+                "through the formula API (gamfit.smooth.Duchon / basis_kind='duchon'), which "
+                "gives each operator its own REML λ."
             )
-            return mass + tension + stiffness
         if kind in {"bspline", "spline"}:
             if penalty_kind not in {None, "coefficient-difference", "coefficientdifference", "difference"}:
                 raise ValueError(f"unsupported B-spline penalty {penalty!r}")
@@ -3737,8 +3702,10 @@ def _normalize_position_basis(
 
     * ``thinplate`` (1D positions): an alias for Duchon ``m=2`` — the cubic
       smoothing spline is the canonical 1D thin-plate spline.
-    * ``duchon_multipenalty``: same engine basis as ``duchon`` (``m=2``);
-      the difference is the penalty (triple-operator vs function-norm).
+
+    ``duchon_multipenalty`` is rejected here: the amplitude/slope/curvature
+    smoother carries three independent REML ``λ``s and has no single-λ
+    position-helper form — fit it through the formula API instead.
     """
     raw = str(basis_kind)
     kind = raw.strip().lower().replace("_", "").replace("-", "")
@@ -3746,11 +3713,11 @@ def _normalize_position_basis(
         order = 2 if basis_order is None else int(basis_order)
         return ("duchon", order, raw)
     if kind in {"duchonmultipenalty", "duchontripleoperator"}:
-        # Engine sees a plain Duchon basis; the penalty (triple-operator
-        # combined) is constructed by `_resolve_position_penalty` from the
-        # display_kind.
-        order = 2 if basis_order is None else int(basis_order)
-        return ("duchon", order, raw)
+        raise ValueError(
+            "basis_kind='duchon_multipenalty' is the multi-λ amplitude/slope/curvature "
+            "smoother and has no single-λ position-helper representation. Fit it through the "
+            "formula API (gamfit.smooth.Duchon / basis_kind='duchon')."
+        )
     return (raw, _position_basis_order(raw, basis_order), raw)
 
 
