@@ -6010,6 +6010,12 @@ pub fn term_from_padded_blocks_with_mode(
 ///   `J[n, i, a] = ∂Z_{n,i} / ∂t_{n,a} = Σ_m dPhi[n, m, a] · B[m, i]`.
 /// * `H ∈ ℝ^{n_obs × (p · d · d)}`, flattened as `H[n, (i*d + a)*d + c]` —
 ///   `H[n, i, a, c] = ∂J[n, i, a] / ∂t_{n, c} = Σ_m d²Phi[n, m, a, c] · B[m, i]`.
+/// * `K`, an `Array3` of shape `(n_obs, p, d·d·d)` with last axis packed
+///   `((a·d + c)·d + e)` — `K[n, i, a, c, e] = ∂³Z_{n,i} / ∂t_a ∂t_c ∂t_e =
+///   Σ_m d³Phi[n, m, a, c, e] · B[m, i]`. Installed via the new third-jet slot
+///   whenever the base evaluator's `third_jet_dyn` yields a jet AND the penalty
+///   carries no `duchon_radial_source`. This is the residual-curvature source
+///   for the exact isometry `hvp`.
 ///
 /// Returns `Ok(true)` when both caches were installed (i.e. the atom was
 /// built via [`SaeManifoldAtom::with_basis_second_jet`], so its
@@ -6104,8 +6110,54 @@ pub fn refresh_isometry_caches_from_atom(
         None
     };
 
+    // Third jet K[n, i, ((a·d + c)·d + e)] = Σ_m d³Phi[n, m, a, c, e] · B[m, i]
+    // feeds the residual-curvature term of the exact isometry Hessian
+    //   B_{ab,cd} = K_{a,cd}^T W J_b + H_{a,c}^T W H_{b,d}
+    //             + H_{a,d}^T W H_{b,c} + J_a^T W K_{b,cd}.
+    // Sourced from the base evaluator's object-safe `third_jet_dyn` forwarder
+    // (analytic override for sphere/circle/torus/affine/euclidean, otherwise a
+    // central difference of the second jet). Installed only when the penalty
+    // has no `duchon_radial_source` — a Duchon penalty already carries its own
+    // analytic third source and `jacobian_third` would shadow it with this
+    // cache. Always written (Some or None) so a stale K from a prior outer step
+    // never survives a refresh.
+    let jac3_opt = if penalty.duchon_radial_source.is_none() {
+        match evaluator.third_jet_dyn(coords) {
+            Some(third) => {
+                let t3 = third?;
+                if t3.dim() != (n_obs, m, d, d, d) {
+                    return Err(format!(
+                        "refresh_isometry_caches_from_atom: evaluator third jet has shape {:?}, expected ({n_obs}, {m}, {d}, {d}, {d})",
+                        t3.dim()
+                    ));
+                }
+                let mut jac3 = Array3::<f64>::zeros((n_obs, p, d * d * d));
+                for n in 0..n_obs {
+                    for i in 0..p {
+                        for a in 0..d {
+                            for c in 0..d {
+                                for e in 0..d {
+                                    let mut acc = 0.0;
+                                    for mm in 0..m {
+                                        acc += t3[[n, mm, a, c, e]] * b[[mm, i]];
+                                    }
+                                    jac3[[n, i, ((a * d) + c) * d + e]] = acc;
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(Arc::new(jac3))
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
     let installed = jac2_opt.is_some();
     penalty.refresh_caches(Some(Arc::new(jac)), jac2_opt);
+    penalty.set_third_decoder_derivative(jac3_opt);
     Ok(installed)
 }
 
