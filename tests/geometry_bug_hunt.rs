@@ -61,7 +61,7 @@ fn spd_affine_metric_tensor_should_be_symmetric() {
 
 #[test]
 fn grassmann_retract_should_be_right_orthogonally_invariant() {
-    let m = GrassmannManifold::new(2, 4);
+    let m = GrassmannManifold::new(2, 4).unwrap();
     let y = array![1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
     let xi = array![0.0, 0.0, 0.0, 0.0, 0.2, -0.1, -0.1, 0.2];
     let r = array![0.0, -1.0, 1.0, 0.0];
@@ -96,7 +96,7 @@ fn grassmann_retract_should_be_right_orthogonally_invariant() {
 
 #[test]
 fn stiefel_tangent_projection_should_satisfy_skew_constraint() {
-    let m = StiefelManifold::new(2, 4);
+    let m = StiefelManifold::new(2, 4).unwrap();
     let y = array![1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
     let z = array![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
     let pz = m.project_tangent(y.view(), z.view()).unwrap();
@@ -300,7 +300,7 @@ fn sphere_exp_map_vjp_matches_finite_difference() {
 // route through `GeometryError::Unsupported`.
 #[test]
 fn closed_form_less_manifolds_refuse_exp_map_vjp() {
-    let gr = GrassmannManifold::new(1, 3);
+    let gr = GrassmannManifold::new(1, 3).unwrap();
     let p = array![1.0, 0.0, 0.0];
     let v = array![0.0, 0.2, 0.1];
     let g = array![0.3, -0.4, 0.5];
@@ -313,7 +313,7 @@ fn closed_form_less_manifolds_refuse_exp_map_vjp() {
     // geodesic backward (St(n, 1) = S^{n-1} now correctly delegates to the
     // sphere, which *does* have an analytic VJP, so it is no longer the
     // closed-form-less case to test here).
-    let st = StiefelManifold::new(2, 4);
+    let st = StiefelManifold::new(2, 4).unwrap();
     let p_st = array![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
     let v_st = array![0.0, 0.1, 0.2, 0.3, 0.0, 0.0, 0.4, 0.5];
     let g_st = array![0.3, -0.4, 0.5, 0.1, -0.2, 0.6, 0.7, -0.8];

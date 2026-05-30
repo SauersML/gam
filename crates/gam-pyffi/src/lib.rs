@@ -100,7 +100,8 @@ use gam::terms::latent_coord::{AuxPriorFamily, aux_prior_targets};
 use gam::terms::sae_manifold::{
     AssignmentMode, DuchonCoordinateEvaluator, EuclideanPatchEvaluator, GumbelTemperatureSchedule,
     PeriodicHarmonicEvaluator, SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldRho, ScheduleKind,
-    SphereChartEvaluator, TorusHarmonicEvaluator, term_from_padded_blocks_with_mode,
+    SphereChartEvaluator, TorusHarmonicEvaluator, sphere_chart_basis_jet,
+    term_from_padded_blocks_with_mode, SPHERE_CHART_PENALTY_DIAGONAL,
 };
 use gam::terms::skip_transcoder::{
     SkipTranscoderRemlInputs, skip_transcoder_reml_metrics as skip_transcoder_reml_metrics_core,
@@ -4207,56 +4208,15 @@ fn sphere_chart_basis_with_jet<'py>(
     py: Python<'py>,
     t: PyReadonlyArray2<'py, f64>,
 ) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray3<f64>>, Py<PyArray2<f64>>)> {
+    // The chart-local sphere basis, its lat/lon jet, and the saturated-latitude
+    // `chain_lat` gating all live in the core SAE path; this helper only routes
+    // the caller's coordinates through that single source of truth and converts
+    // the returned arrays into Python-facing buffers. Keeping the math in one
+    // place is what prevents the core and PyFFI derivatives from drifting.
     let coords = t.as_array();
-    if coords.ncols() != 2 {
-        return Err(py_value_error(format!(
-            "sphere_chart_basis_with_jet expects t of shape (N, 2) [lat, lon]; got d={}",
-            coords.ncols()
-        )));
-    }
-
-    let n = coords.nrows();
-    let mut phi = Array2::<f64>::zeros((n, 7));
-    let mut jet = Array3::<f64>::zeros((n, 7, 2));
-    for row in 0..n {
-        let lat = coords[[row, 0]].clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
-        let lon = coords[[row, 1]];
-        let clat = lat.cos();
-        let slat = lat.sin();
-        let clon = lon.cos();
-        let slon = lon.sin();
-
-        let x = clat * clon;
-        let y = clat * slon;
-        let z = slat;
-        phi[[row, 0]] = 1.0;
-        phi[[row, 1]] = x;
-        phi[[row, 2]] = y;
-        phi[[row, 3]] = z;
-        phi[[row, 4]] = x * y;
-        phi[[row, 5]] = y * z;
-        phi[[row, 6]] = x * z;
-
-        let dx_dlat = -slat * clon;
-        let dx_dlon = -clat * slon;
-        let dy_dlat = -slat * slon;
-        let dy_dlon = clat * clon;
-        let dz_dlat = clat;
-
-        jet[[row, 1, 0]] = dx_dlat;
-        jet[[row, 1, 1]] = dx_dlon;
-        jet[[row, 2, 0]] = dy_dlat;
-        jet[[row, 2, 1]] = dy_dlon;
-        jet[[row, 3, 0]] = dz_dlat;
-        jet[[row, 4, 0]] = dx_dlat * y + x * dy_dlat;
-        jet[[row, 4, 1]] = dx_dlon * y + x * dy_dlon;
-        jet[[row, 5, 0]] = dy_dlat * z + y * dz_dlat;
-        jet[[row, 5, 1]] = dy_dlon * z;
-        jet[[row, 6, 0]] = dx_dlat * z + x * dz_dlat;
-        jet[[row, 6, 1]] = dx_dlon * z;
-    }
-
-    let penalty = Array2::from_diag(&Array1::from_vec(vec![1e-8, 1.0, 1.0, 1.0, 4.0, 4.0, 4.0]));
+    let (phi, jet) =
+        sphere_chart_basis_jet(coords).map_err(|err| py_value_error(err.to_string()))?;
+    let penalty = Array2::from_diag(&Array1::from_vec(SPHERE_CHART_PENALTY_DIAGONAL.to_vec()));
     Ok((
         phi.into_pyarray(py).unbind(),
         jet.into_pyarray(py).unbind(),
@@ -19093,6 +19053,22 @@ impl TorusManifold {
     }
 }
 
+/// Validate the `1 <= k <= n` domain shared by the constrained-frame
+/// manifolds `Gr(k, n)` (k-dimensional subspaces of R^n) and `St(n, k)`
+/// (k-frames in R^n). Both exist only on this domain: with `k > n` there is
+/// no k-dimensional subspace / no k orthonormal columns in R^n, and the
+/// dimension formulas (`k(n-k)` resp. `nk - k(k+1)/2`) cease to describe a
+/// frame manifold. Rejecting here keeps every Python-visible Grassmann/Stiefel
+/// object inside its domain, mirroring the Rust-core constructors.
+fn validate_frame_domain(name: &str, k: i64, n: i64) -> PyResult<()> {
+    if k < 1 || n < 1 || k > n {
+        return Err(py_value_error(format!(
+            "{name} requires 1 <= k <= n (got k={k}, n={n})"
+        )));
+    }
+    Ok(())
+}
+
 #[pyclass(
     module = "gam_pyffi._rust",
     name = "GrassmannManifold",
@@ -19100,17 +19076,36 @@ impl TorusManifold {
 )]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct GrassmannManifold {
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     k: i64,
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     n: i64,
 }
 
 #[pymethods]
 impl GrassmannManifold {
     #[new]
-    fn new(k: i64, n: i64) -> Self {
-        Self { k, n }
+    fn new(k: i64, n: i64) -> PyResult<Self> {
+        validate_frame_domain("GrassmannManifold", k, n)?;
+        Ok(Self { k, n })
+    }
+
+    /// Set the subspace dimension `k`, rejecting any value that would leave the
+    /// `1 <= k <= n` domain for the current ambient dimension `n`.
+    #[setter]
+    fn set_k(&mut self, k: i64) -> PyResult<()> {
+        validate_frame_domain("GrassmannManifold", k, self.n)?;
+        self.k = k;
+        Ok(())
+    }
+
+    /// Set the ambient dimension `n`, rejecting any value that would leave the
+    /// `1 <= k <= n` domain for the current subspace dimension `k`.
+    #[setter]
+    fn set_n(&mut self, n: i64) -> PyResult<()> {
+        validate_frame_domain("GrassmannManifold", self.k, n)?;
+        self.n = n;
+        Ok(())
     }
 
     fn __repr__(&self) -> String {
@@ -19137,17 +19132,36 @@ impl GrassmannManifold {
 )]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct StiefelManifold {
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     k: i64,
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     n: i64,
 }
 
 #[pymethods]
 impl StiefelManifold {
     #[new]
-    fn new(k: i64, n: i64) -> Self {
-        Self { k, n }
+    fn new(k: i64, n: i64) -> PyResult<Self> {
+        validate_frame_domain("StiefelManifold", k, n)?;
+        Ok(Self { k, n })
+    }
+
+    /// Set the number of frame columns `k`, rejecting any value that would
+    /// leave the `1 <= k <= n` domain for the current ambient dimension `n`.
+    #[setter]
+    fn set_k(&mut self, k: i64) -> PyResult<()> {
+        validate_frame_domain("StiefelManifold", k, self.n)?;
+        self.k = k;
+        Ok(())
+    }
+
+    /// Set the ambient dimension `n`, rejecting any value that would leave the
+    /// `1 <= k <= n` domain for the current frame-column count `k`.
+    #[setter]
+    fn set_n(&mut self, n: i64) -> PyResult<()> {
+        validate_frame_domain("StiefelManifold", self.k, n)?;
+        self.n = n;
+        Ok(())
     }
 
     fn __repr__(&self) -> String {
@@ -28165,10 +28179,15 @@ fn parse_manifold_kind(value: &serde_json::Value) -> Result<gam::geometry::Manif
                 .get("n")
                 .and_then(serde_json::Value::as_u64)
                 .ok_or_else(|| "grassmann manifold requires n".to_string())?;
-            Ok(gam::geometry::ManifoldSpec::Grassmann {
-                k: json_positive_u64_to_usize(k, "grassmann.k")?,
-                n: json_positive_u64_to_usize(n, "grassmann.n")?,
-            })
+            let k = json_positive_u64_to_usize(k, "grassmann.k")?;
+            let n = json_positive_u64_to_usize(n, "grassmann.n")?;
+            if k > n {
+                return Err(format!(
+                    "grassmann manifold requires k <= n (got k={k}, n={n}): \
+                     Gr(k, n) is the set of k-dimensional subspaces of R^n"
+                ));
+            }
+            Ok(gam::geometry::ManifoldSpec::Grassmann { k, n })
         }
         "stiefel" => {
             let k = obj
@@ -28179,10 +28198,15 @@ fn parse_manifold_kind(value: &serde_json::Value) -> Result<gam::geometry::Manif
                 .get("n")
                 .and_then(serde_json::Value::as_u64)
                 .ok_or_else(|| "stiefel manifold requires n".to_string())?;
-            Ok(gam::geometry::ManifoldSpec::Stiefel {
-                k: json_positive_u64_to_usize(k, "stiefel.k")?,
-                n: json_positive_u64_to_usize(n, "stiefel.n")?,
-            })
+            let k = json_positive_u64_to_usize(k, "stiefel.k")?;
+            let n = json_positive_u64_to_usize(n, "stiefel.n")?;
+            if k > n {
+                return Err(format!(
+                    "stiefel manifold requires k <= n (got k={k}, n={n}): \
+                     St(n, k) is the set of k-frames (orthonormal columns) in R^n"
+                ));
+            }
+            Ok(gam::geometry::ManifoldSpec::Stiefel { k, n })
         }
         "spd" => {
             let n = obj
@@ -28219,7 +28243,9 @@ fn riemannian_retract<'py>(
     let value: serde_json::Value = serde_json::from_str(manifold_json)
         .map_err(|err| py_value_error(format!("invalid manifold json: {err}")))?;
     let kind = parse_manifold_kind(&value).map_err(py_value_error)?;
-    let manifold = kind.build();
+    let manifold = kind
+        .build()
+        .map_err(|err| py_value_error(err.to_string()))?;
     let p = points.as_array();
     let d = delta.as_array();
     if p.dim() != d.dim() {
@@ -28263,7 +28289,9 @@ fn manifold_exp_map<'py>(
     let value: serde_json::Value = serde_json::from_str(manifold_json)
         .map_err(|err| py_value_error(format!("invalid manifold json: {err}")))?;
     let kind = parse_manifold_kind(&value).map_err(py_value_error)?;
-    let manifold = kind.build();
+    let manifold = kind
+        .build()
+        .map_err(|err| py_value_error(err.to_string()))?;
     let p = points.as_array();
     let v = vecs.as_array();
     if p.dim() != v.dim() {
@@ -28313,7 +28341,9 @@ fn manifold_exp_map_vjp<'py>(
     let value: serde_json::Value = serde_json::from_str(manifold_json)
         .map_err(|err| py_value_error(format!("invalid manifold json: {err}")))?;
     let kind = parse_manifold_kind(&value).map_err(py_value_error)?;
-    let manifold = kind.build();
+    let manifold = kind
+        .build()
+        .map_err(|err| py_value_error(err.to_string()))?;
     let p = points.as_array();
     let v = vecs.as_array();
     let g = grad_output.as_array();
@@ -28364,7 +28394,9 @@ fn manifold_log_map<'py>(
     let value: serde_json::Value = serde_json::from_str(manifold_json)
         .map_err(|err| py_value_error(format!("invalid manifold json: {err}")))?;
     let kind = parse_manifold_kind(&value).map_err(py_value_error)?;
-    let manifold = kind.build();
+    let manifold = kind
+        .build()
+        .map_err(|err| py_value_error(err.to_string()))?;
     let p = p_from.as_array();
     let q = p_to.as_array();
     if p.dim() != q.dim() {
@@ -28401,7 +28433,9 @@ fn manifold_metric_tensor<'py>(
     let value: serde_json::Value = serde_json::from_str(manifold_json)
         .map_err(|err| py_value_error(format!("invalid manifold json: {err}")))?;
     let kind = parse_manifold_kind(&value).map_err(py_value_error)?;
-    let manifold = kind.build();
+    let manifold = kind
+        .build()
+        .map_err(|err| py_value_error(err.to_string()))?;
     let p = point.as_array();
     if p.len() != manifold.ambient_dim() {
         return Err(py_value_error(format!(
@@ -28422,7 +28456,9 @@ fn manifold_dimension(manifold_json: &str) -> PyResult<usize> {
     let value: serde_json::Value = serde_json::from_str(manifold_json)
         .map_err(|err| py_value_error(format!("invalid manifold json: {err}")))?;
     let kind = parse_manifold_kind(&value).map_err(py_value_error)?;
-    let manifold = kind.build();
+    let manifold = kind
+        .build()
+        .map_err(|err| py_value_error(err.to_string()))?;
     Ok(manifold.dim())
 }
 
@@ -28432,7 +28468,9 @@ fn manifold_ambient_dimension(manifold_json: &str) -> PyResult<usize> {
     let value: serde_json::Value = serde_json::from_str(manifold_json)
         .map_err(|err| py_value_error(format!("invalid manifold json: {err}")))?;
     let kind = parse_manifold_kind(&value).map_err(py_value_error)?;
-    let manifold = kind.build();
+    let manifold = kind
+        .build()
+        .map_err(|err| py_value_error(err.to_string()))?;
     Ok(manifold.ambient_dim())
 }
 
