@@ -26,13 +26,14 @@
 //! there is no transitional shim.
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{CudaBackendParts, probe_cuda_backend};
+pub(crate) use linux::probe_cuda_backend;
 
 #[cfg(target_os = "linux")]
 mod linux {
     use crate::gpu::device::GpuCapability;
     use crate::gpu::error::GpuError;
     use crate::gpu::runtime::{GpuRuntime, cuda_context_for};
+    use crate::gpu_err;
     use cudarc::driver::{CudaContext, CudaStream};
     use std::sync::Arc;
 

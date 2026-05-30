@@ -16,7 +16,6 @@ use gam::families::bernoulli_marginal_slope::{
     BernoulliMarginalSlopeTermSpec, DeviationBlockConfig, DeviationRuntime, LatentMeasureKind,
     LatentZPolicy,
 };
-use gam::families::cubic_cell_kernel as exact_kernel;
 use gam::families::latent_survival::latent_hazard_loading;
 use gam::families::scale_design::{
     build_scale_deviation_operator, build_scale_deviation_transform_design,
@@ -42,7 +41,7 @@ use gam::inference::formula_dsl::{
 };
 use gam::inference::model::{
     ColumnKindTag, DataSchema, FittedFamily, FittedModel as SavedModel, FittedModelPayload,
-    MODEL_PAYLOAD_VERSION, ModelKind, PredictModelClass, SavedCompiledFlexBlock,
+    MODEL_PAYLOAD_VERSION, ModelKind, PredictModelClass,
     SavedLatentZNormalization, load_survival_time_basis_config_from_model,
 };
 use gam::inference::model_payload_builders::{
@@ -9550,7 +9549,7 @@ mod tests {
         collect_linear_smooth_overlapwarnings, collect_spatial_smooth_usagewarnings,
         compact_fit_result_for_batch, compact_saved_multiblock_fit_result,
         compute_probit_q0_from_eta, core_saved_fit_result, covariance_from_model,
-        effectivelinkwiggle_formulaspec, exact_kernel, family_arg_canonical_name,
+        effectivelinkwiggle_formulaspec, family_arg_canonical_name,
         fit_result_from_external, load_dataset_projected, parse_formula, parse_link_choice,
         parse_matching_auxiliary_formula, parse_surv_response, parse_survival_inverse_link,
         parse_survival_time_basis_config, predict_gam, prepend_id_column_to_prediction_csv,
@@ -9571,6 +9570,7 @@ mod tests {
         SpatialIdentifiability, ThinPlateBasisSpec, create_basis,
     };
     use gam::bernoulli_marginal_slope::LatentMeasureKind;
+    use gam::families::cubic_cell_kernel as exact_kernel;
     use gam::estimate::{
         ExternalOptimResult, FitGeometry, FitInference, FittedBlock, FittedLinkState,
         UnifiedFitResultParts,
@@ -9750,7 +9750,7 @@ mod tests {
     }
 
     mod saved_survival_marginal_slope_test_support {
-        use super::super::exact_kernel;
+        use super::exact_kernel;
         use super::{Array1, SavedCompiledFlexBlock};
         use gam::families::marginal_slope_shared::{probit_frailty_scale, scale_coeff4};
         use gam::probability::normal_cdf;

@@ -28,12 +28,14 @@ use crate::families::survival_location_scale::{
 };
 use crate::families::transformation_normal::TransformationNormalFamily;
 use crate::inference::model::{
-    DataSchema, FittedFamily, FittedModelPayload, LikelihoodSpec, MODEL_PAYLOAD_VERSION, ModelKind,
+    DataSchema, FittedFamily, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
     SavedAnchorComponent, SavedAnchorKind, SavedCompiledFlexBlock, SavedLatentZNormalization,
     TransformationScoreCalibration,
 };
 use crate::smooth::TermCollectionSpec;
-use crate::types::{InverseLink, ResponseFamily, StandardLink, inverse_link_to_binomial_spec};
+use crate::types::{
+    InverseLink, LikelihoodSpec, ResponseFamily, StandardLink, inverse_link_to_binomial_spec,
+};
 
 /// Family tag persisted for Bernoulli marginal-slope saved models.
 const FAMILY_BERNOULLI_MARGINAL_SLOPE: &str = "bernoulli-marginal-slope";

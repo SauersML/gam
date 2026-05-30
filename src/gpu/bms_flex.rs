@@ -30,8 +30,6 @@ use super::error::GpuError;
 #[cfg(target_os = "linux")]
 use super::error::GpuResultExt;
 use super::{GpuDecision, GpuKernel, decide};
-#[cfg(target_os = "linux")]
-use crate::gpu_err;
 
 use super::bms_flex_row::{
     BmsFlexRowKernelInputs, BmsFlexRowKernelOutputs, launch_bms_flex_row_kernel,

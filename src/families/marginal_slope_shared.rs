@@ -151,25 +151,24 @@ where
         da
     };
 
+    let units: Vec<Array1<f64>> = (0..primary_dim).map(unit).collect();
+
     let mut grad = Array1::<f64>::zeros(primary_dim);
     let mut dirs: Vec<&Array1<f64>> = Vec::with_capacity(leading.len() + 2);
     for a in 0..primary_dim {
-        let da = unit(a);
         dirs.clear();
         dirs.extend_from_slice(leading);
-        dirs.push(&da);
+        dirs.push(&units[a]);
         grad[a] = eval(&dirs, &scales.grad)?;
     }
 
     let mut hess = Array2::<f64>::zeros((primary_dim, primary_dim));
     for a in 0..primary_dim {
-        let da = unit(a);
         for b in a..primary_dim {
-            let db = unit(b);
             dirs.clear();
             dirs.extend_from_slice(leading);
-            dirs.push(&da);
-            dirs.push(&db);
+            dirs.push(&units[a]);
+            dirs.push(&units[b]);
             let value = eval(&dirs, &scales.hess)?;
             hess[[a, b]] = value;
             hess[[b, a]] = value;

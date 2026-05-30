@@ -603,8 +603,8 @@ fn block_orthogonal_eval(
     let scaled_penalty = penalty * lambda;
     let hessian = canonicalize_penalty((gram + &scaled_penalty).view());
     let chol = gaussian_reml_cholesky_lower(hessian)?;
-    let beta = chol.solve_mat(rhs);
-    let solved_penalty = chol.solve_mat(&scaled_penalty);
+    let beta = solve_spd_from_lower_factor(&chol, rhs)?;
+    let solved_penalty = solve_spd_from_lower_factor(&chol, &scaled_penalty)?;
     let logdet = 2.0 * chol.diag().iter().map(|value| value.ln()).sum::<f64>();
     let trace = (0..solved_penalty.nrows())
         .map(|i| solved_penalty[[i, i]])
@@ -613,7 +613,7 @@ fn block_orthogonal_eval(
     let fitted_energy = (rhs * &beta).sum_axis(Axis(0));
     let p_beta = scaled_penalty.dot(&beta);
     let penalty_energy = (&beta * &p_beta).sum_axis(Axis(0));
-    let solved_p_beta = chol.solve_mat(&p_beta);
+    let solved_p_beta = solve_spd_from_lower_factor(&chol, &p_beta)?;
     let curvature_energy = (&p_beta * &solved_p_beta).sum_axis(Axis(0));
     Ok(BlockOrthogonalEval {
         beta,
@@ -861,7 +861,7 @@ pub fn gaussian_reml_blocks_orthogonal_shared_scale(
         .collect::<Vec<_>>();
     let mut fitted = Array2::<f64>::zeros((n, d));
     for (design, coef) in designs.iter().zip(coefficients.iter()) {
-        fitted += &fast_ab(design.view(), coef.view());
+        fitted += &fast_ab(&design.view(), &coef.view());
     }
     let mut explained = Array1::<f64>::zeros(d);
     for eval in evals.iter() {
@@ -2972,6 +2972,17 @@ fn solve_lower_triangular_matrix(
         }
     }
     Ok(out)
+}
+
+/// Solve the SPD system `L Lᵀ X = rhs` for `X` given the lower Cholesky factor
+/// `L` (as returned by [`gaussian_reml_cholesky_lower`]): a forward solve
+/// against `L` followed by a back solve against `Lᵀ`.
+fn solve_spd_from_lower_factor(
+    lower: &Array2<f64>,
+    rhs: &Array2<f64>,
+) -> Result<Array2<f64>, EstimationError> {
+    let forward = solve_lower_triangular_matrix(lower, rhs)?;
+    solve_upper_triangular_matrix(&lower.t().to_owned(), &forward)
 }
 
 fn solve_upper_triangular_matrix(
