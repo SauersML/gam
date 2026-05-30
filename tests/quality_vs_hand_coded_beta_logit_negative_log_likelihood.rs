@@ -159,7 +159,11 @@ impl CustomFamily for BetaLogitCustomFamily {
             w22[i] = -(d2_bb * s2 * s2 + d_lb * sp2);
         }
 
-        assert_eq!(block_states[0].eta.len(), n, "block 0 eta length must equal n");
+        assert_eq!(
+            block_states[0].eta.len(),
+            n,
+            "block 0 eta length must equal n"
+        );
 
         // Block gradients Xᵀ score and block observed-information Xᵀ diag(w) X.
         let g1 = self.design0_transpose_dot(&score1);
