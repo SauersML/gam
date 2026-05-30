@@ -216,7 +216,7 @@ emit("xi", flat)
         for j in 0..p {
             let true_on = xi_true[(j, c)] != 0.0;
             let gam_on = gam_xi[(j, c)] != 0.0;
-            if gam_on != true_on {
+            if true_on != gam_on {
                 support_errors += 1;
                 eprintln!(
                     "support error at (j={j}, c={c}): truth_nonzero={true_on} \

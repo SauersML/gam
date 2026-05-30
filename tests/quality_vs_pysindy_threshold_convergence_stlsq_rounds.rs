@@ -290,7 +290,7 @@ emit("coef", coef_all)
     assert_eq!(
         fine_card,
         true_support.len(),
-        "tol={}: gam support cardinality {fine_card} != true {} (exact recovery required)",
+        "tol={}: gam support cardinality {fine_card} vs true {} (exact recovery required)",
         TOLS[fine],
         true_support.len()
     );
