@@ -69,7 +69,7 @@ fn gam_random_intercept_matches_lme4() {
     let mut rows = Vec::<StringRecord>::with_capacity(n);
     for grp in 0..N_GROUPS {
         for _ in 0..PER_GROUP {
-            let xi = ux.sample(&mut rng);
+            let xi: f64 = ux.sample(&mut rng);
             let yi = two_pi * xi.sin() + MU_G[grp] + noise.sample(&mut rng);
             x.push(xi);
             y.push(yi);

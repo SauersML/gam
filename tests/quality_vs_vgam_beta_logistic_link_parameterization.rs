@@ -52,11 +52,6 @@ const N: usize = 400;
 const TRUE_DELTA: f64 = 1.2;
 const TRUE_EPSILON: f64 = 0.15;
 
-#[inline]
-fn logistic(eta: f64) -> f64 {
-    1.0 / (1.0 + (-eta).exp())
-}
-
 #[test]
 fn gam_beta_logistic_link_matches_vgam_beta_parameterization() {
     init_parallelism();

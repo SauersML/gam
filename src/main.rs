@@ -10356,7 +10356,14 @@ mod tests {
         ];
 
         for (arg, nb_theta, link_choice, y, y_kind) in cases {
-            let cli = resolve_family(arg, nb_theta, link_choice.clone(), y.view(), y_kind, "y");
+            let cli = resolve_family(
+                arg,
+                nb_theta,
+                link_choice.clone(),
+                y.view(),
+                y_kind.clone(),
+                "y",
+            );
             let canonical = gam::resolve_family(
                 family_arg_canonical_name(arg),
                 nb_theta,
