@@ -83,7 +83,7 @@ use gam::terms::basis::{
     create_cyclic_difference_penalty_matrix, create_difference_penalty_matrix,
     duchon_nullspace_dimension, duchon_polynomial_first_derivative_nd,
     duchon_pure_kernel_amplification, duchon_radial_first_derivative_nd,
-    evaluate_bspline_basis_scalar,
+    duchon_sae_atom_basis_with_jet, evaluate_bspline_basis_scalar,
     matern_input_location_hessian_nd, matern_input_location_jet_nd,
     matern_radial_first_derivative_nd, monomial_exponents, periodic_bspline_first_derivative_nd,
     resolve_duchon_orders, select_spherical_farthest_point_centers, sphere_first_derivative_nd,
@@ -3258,8 +3258,24 @@ fn duchon_basis_with_jet<'py>(
         periodic: None,
         boundary: OneDimensionalBoundary::Open,
     };
+    // The pure scale-free Duchon design (`power = 0`, `length_scale = None`)
+    // and its analytic input-location first jet are built *together* by the
+    // single Rust-core helper `duchon_sae_atom_basis_with_jet`. Building both
+    // from one constraint null space `Z` and one kernel amplification `α`
+    // guarantees the returned jet is the exact `t`-derivative of the returned
+    // `Φ` column-for-column (`J_kernel = α·K'(t,C)·Z`, polynomial columns
+    // carrying their own monomial derivative and no amplification) — there is
+    // no second, independently-scaled forward pipeline that could drift out of
+    // lockstep on the amplification, the null-space basis, or the polynomial
+    // column ordering. This is the model the issue prescribes.
+    let (phi, jet) = duchon_sae_atom_basis_with_jet(pts, ctrs, requested_nullspace)
+        .map_err(|err| py_value_error(err.to_string()))?;
+
+    // The penalty matrix `S = Zᵀ K_CC Z` is the conditionally-PD penalty of the
+    // *same* basis. It comes from the forward builder over the identical spec,
+    // which uses the same `Z` and `α` as the helper above, so `S` is the
+    // penalty of exactly the `Φ` returned here.
     let built = build_duchon_basis(pts, &spec).map_err(|err| py_value_error(err.to_string()))?;
-    let phi = built.design.to_dense();
     let primary_idx = built
         .penaltyinfo
         .iter()
@@ -3268,36 +3284,6 @@ fn duchon_basis_with_jet<'py>(
             py_value_error("duchon_basis_with_jet: primary penalty was not built".to_string())
         })?;
     let penalty = built.penalties[primary_idx].clone();
-
-    let effective_nullspace = pyffi_duchon_effective_nullspace_order(ctrs, requested_nullspace);
-    let radial_transform = pyffi_duchon_kernel_constraint_nullspace(ctrs, effective_nullspace)
-        .map_err(py_value_error)?;
-    let radial_first = duchon_radial_first_derivative_nd(pts, ctrs, None, effective_nullspace)
-        .map_err(|err| py_value_error(err.to_string()))?;
-    let radial_jet =
-        radial_input_location_jet(pts, ctrs, radial_first.view()).map_err(py_value_error)?;
-    let poly_jet = duchon_polynomial_first_derivative_nd(pts, effective_nullspace);
-
-    // Scalar kernel amplification `α` — identical to the value the forward
-    // `build_duchon_basis` design applies to the pure polyharmonic kernel
-    // block above (`power = 0`, `length_scale = None`). The forward block is
-    // `α·K(t,C)·Z`, so its input-location derivative is `α·K'(t,C)·Z`; the raw
-    // radial jet must be scaled by the same `α`. The appended polynomial
-    // columns carry no amplification, matching the forward.
-    let kernel_amp = duchon_pure_kernel_amplification(ctrs, requested_nullspace);
-
-    let n_rows = pts.nrows();
-    let dim = pts.ncols();
-    let n_kernel = radial_transform.ncols();
-    let n_poly = poly_jet.shape()[1];
-    let mut jet = Array3::<f64>::zeros((n_rows, n_kernel + n_poly, dim));
-    for axis in 0..dim {
-        let projected = radial_jet.index_axis(Axis(2), axis).dot(&radial_transform);
-        let mut block = jet.slice_mut(s![.., ..n_kernel, axis]);
-        block.assign(&projected);
-        block *= kernel_amp;
-    }
-    jet.slice_mut(s![.., n_kernel.., ..]).assign(&poly_jet);
 
     if phi.ncols() != jet.shape()[1] {
         return Err(py_value_error(format!(
