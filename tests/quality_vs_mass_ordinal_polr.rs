@@ -205,7 +205,9 @@ fn gam_continuation_ratio_matches_vgam_sratio() {
     // Conditional stopping probabilities q_j = P(Y = j | Y >= j | x, x2=0) for
     // j = 1,2,3 over the grid, then assemble unconditional class probabilities
     // by the chain rule.
-    let mut gam_q = vec![Vec::with_capacity(n_grid); cutpoints.len()];
+    let mut gam_q: Vec<Vec<f64>> = (0..cutpoints.len())
+        .map(|_| Vec::with_capacity(n_grid))
+        .collect();
     for (jdx, &j) in cutpoints.iter().enumerate() {
         let thr2 = if j >= 2.0 { 1.0 } else { 0.0 };
         let thr3 = if j >= 3.0 { 1.0 } else { 0.0 };
@@ -220,7 +222,7 @@ fn gam_continuation_ratio_matches_vgam_sratio() {
     }
     // Per-level class probabilities P(Y = j) via the stopping-ratio chain rule:
     //   P(1) = q1, P(2) = (1-q1)q2, P(3) = (1-q1)(1-q2)q3, P(4) = ∏(1-q_j).
-    let mut gam_class = vec![Vec::with_capacity(n_grid); 4];
+    let mut gam_class: Vec<Vec<f64>> = (0..4).map(|_| Vec::with_capacity(n_grid)).collect();
     for g in 0..n_grid {
         let q1 = gam_q[0][g];
         let q2 = gam_q[1][g];
@@ -231,7 +233,9 @@ fn gam_continuation_ratio_matches_vgam_sratio() {
         gam_class[3].push((1.0 - q1) * (1.0 - q2) * (1.0 - q3));
     }
     // Cumulative probabilities P(Y <= j) for j = 1,2,3 (running sums).
-    let mut gam_cum = vec![Vec::with_capacity(n_grid); cutpoints.len()];
+    let mut gam_cum: Vec<Vec<f64>> = (0..cutpoints.len())
+        .map(|_| Vec::with_capacity(n_grid))
+        .collect();
     for g in 0..n_grid {
         let c1 = gam_class[0][g];
         let c2 = c1 + gam_class[1][g];
