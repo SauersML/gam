@@ -8339,11 +8339,55 @@ mod root_cause_tests {
             beta: &Coefficients,
             curvature: HessianCurvatureKind,
         ) -> Result<WorkingState, EstimationError> {
+            // Production firth `update_candidate` evaluates the candidate
+            // through `update_with_curvature` (with Firth temporarily disabled)
+            // rather than via a separate cheap screen: since the candidate
+            // screening split landed, the firth accepted-state re-evaluation is
+            // folded into this single call instead of running as a distinct
+            // post-acceptance phase. Mirror that here so the injected
+            // candidate-evaluation failure actually surfaces through the LM
+            // loop, which must bound the retries instead of looping or silently
+            // accepting a non-stationary state.
             self.candidate_screen_calls += 1;
-            let mut state = test_working_state(beta, curvature);
-            state.deviance = 0.5;
-            state.gradient = array![0.5];
-            Ok(state)
+            self.update_with_curvature(beta, curvature)
+        }
+    }
+
+    #[derive(Default)]
+    struct FirthPermanentCandidateErrorModel {
+        current_state_calls: usize,
+        candidate_state_calls: usize,
+        candidate_screen_calls: usize,
+    }
+
+    impl WorkingModel for FirthPermanentCandidateErrorModel {
+        fn update(&mut self, beta: &Coefficients) -> Result<WorkingState, EstimationError> {
+            self.update_with_curvature(beta, HessianCurvatureKind::Fisher)
+        }
+
+        fn update_with_curvature(
+            &mut self,
+            beta: &Coefficients,
+            curvature: HessianCurvatureKind,
+        ) -> Result<WorkingState, EstimationError> {
+            if beta.as_ref()[0].abs() < 1e-12 {
+                self.current_state_calls += 1;
+                Ok(test_working_state(beta, curvature))
+            } else {
+                self.candidate_state_calls += 1;
+                Err(EstimationError::InvalidSpecification(
+                    "permanent firth breakdown re-evaluating accepted candidate".to_string(),
+                ))
+            }
+        }
+
+        fn update_candidate(
+            &mut self,
+            beta: &Coefficients,
+            curvature: HessianCurvatureKind,
+        ) -> Result<WorkingState, EstimationError> {
+            self.candidate_screen_calls += 1;
+            self.update_with_curvature(beta, curvature)
         }
     }
 
@@ -8921,6 +8965,61 @@ mod root_cause_tests {
         assert_eq!(
             model.candidate_state_calls, options.max_step_halving,
             "Firth accepted-state reevaluation must stop at the configured LM retry budget"
+        );
+    }
+
+    #[test]
+    fn firth_permanent_candidate_error_propagates_without_lm_retries() {
+        // Complement to `firth_candidate_reevaluation_respects_lm_retry_budget`
+        // from the opposite angle: a *non-retriable* Firth candidate-evaluation
+        // failure (a structural breakdown, not a numerical overflow) must
+        // surface immediately as its original error, without the LM loop
+        // spending a single damping retry on it. This guards the
+        // retriable/non-retriable split for the Firth path that routes its
+        // candidate evaluation through `update_candidate`.
+        let mut model = FirthPermanentCandidateErrorModel::default();
+        let options = WorkingModelPirlsOptions {
+            max_iterations: 1,
+            convergence_tolerance: 1e-8,
+            adaptive_kkt_tolerance: None,
+            max_step_halving: 5,
+            min_step_size: 0.0,
+            firth_bias_reduction: true,
+            coefficient_lower_bounds: None,
+            linear_constraints: None,
+            initial_lm_lambda: None,
+            geodesic_acceleration: false,
+            arrow_schur: None,
+        };
+
+        let err = match runworking_model_pirls(
+            &mut model,
+            Coefficients::new(array![0.0]),
+            &options,
+            |_| {},
+        ) {
+            Ok(_) => panic!("permanent Firth candidate failures should surface immediately"),
+            Err(err) => err,
+        };
+
+        match err {
+            EstimationError::InvalidSpecification(message) => {
+                assert!(
+                    message.contains("permanent firth breakdown"),
+                    "expected the original permanent-failure error, got {message}"
+                );
+            }
+            other => panic!("expected InvalidSpecification, got {other:?}"),
+        }
+
+        assert_eq!(model.current_state_calls, 1);
+        assert_eq!(
+            model.candidate_screen_calls, 1,
+            "a non-retriable Firth candidate failure must not be re-screened"
+        );
+        assert_eq!(
+            model.candidate_state_calls, 1,
+            "a non-retriable Firth candidate failure must not consume LM retries"
         );
     }
 
