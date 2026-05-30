@@ -11,8 +11,9 @@
 //! curvature terms, and two numerical policies (whether the weight is floored at
 //! `MIN_WEIGHT`, and whether the `mu`-jet is zeroed when `eta` is clamped).
 
-use super::WorkingDerivativeBuffersMut;
+use super::{WorkingDerivativeBuffersMut, standard_inverse_link_jet};
 use crate::estimate::EstimationError;
+use crate::types::InverseLink;
 use ndarray::{Array1, ArrayView1};
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
 
@@ -176,4 +177,80 @@ pub(super) fn write_log_link_working_state<K: LogLinkWorkingKernel>(
             });
     }
     Ok(())
+}
+
+/// Shared log-link outer-derivative writer for the η-curvature carriers.
+///
+/// The exact-outer-derivative path needs, per row, the working-curvature
+/// carriers `c = dW/dη`, `d = d²W/dη²` and the inverse-link jet
+/// (`dmu/deta`, `d²mu/deta²`, `d³mu/deta³`) — but no `mu`/`weights`/`z`. The
+/// weight rule and the `(c, d)` curvature are exactly the same per-family
+/// functions the working-state engine uses, so this routes them through the
+/// identical [`LogLinkWorkingKernel`] instead of re-deriving them inline.
+///
+/// `kernel.validate` is invoked with empty views so its parameter-range checks
+/// (Tweedie power/phi, negative-binomial theta) still fire while the response
+/// validation — which has no `y` to inspect on this path — is skipped.
+pub(super) fn write_log_link_eta_curvature<K: LogLinkWorkingKernel>(
+    kernel: &K,
+    inverse_link: &InverseLink,
+    eta: &Array1<f64>,
+    priorweights: ArrayView1<f64>,
+    buffers: WorkingDerivativeBuffersMut<'_>,
+) -> Result<(), EstimationError> {
+    // Run the kernel's parameter-range validation only; the response loop in
+    // `validate` is a no-op over these empty views, which is correct here since
+    // the outer-derivative path has no `y` to inspect.
+    const EMPTY: &[f64] = &[];
+    kernel.validate(ArrayView1::from(EMPTY), ArrayView1::from(EMPTY))?;
+    let floor_weight = kernel.floor_weight();
+    let zero_mu_jet_on_clamp = kernel.zero_mu_jet_on_clamp();
+    let c_s = buffers.c.as_slice_mut().expect("c must be contiguous");
+    let d_s = buffers.d.as_slice_mut().expect("d must be contiguous");
+    let dmu_s = buffers
+        .dmu_deta
+        .as_slice_mut()
+        .expect("dmu_deta must be contiguous");
+    let d2_s = buffers
+        .d2mu_deta2
+        .as_slice_mut()
+        .expect("d2mu_deta2 must be contiguous");
+    let d3_s = buffers
+        .d3mu_deta3
+        .as_slice_mut()
+        .expect("d3mu_deta3 must be contiguous");
+    c_s.par_iter_mut()
+        .zip(d_s.par_iter_mut())
+        .zip(dmu_s.par_iter_mut())
+        .zip(d2_s.par_iter_mut())
+        .zip(d3_s.par_iter_mut())
+        .enumerate()
+        .try_for_each(
+            |(i, ((((c_o, d_o), dmu_o), d2_o), d3_o))| -> Result<(), EstimationError> {
+                let eta_raw = eta[i];
+                let eta_used = eta_raw.clamp(-ETA_CLAMP, ETA_CLAMP);
+                let clamp_active = eta_raw != eta_used;
+                let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
+                let raw_weight = kernel.raw_weight(0.0, jet.mu, priorweights[i].max(0.0));
+                let floor_active = floor_weight && raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
+                if clamp_active || floor_active {
+                    *c_o = 0.0;
+                    *d_o = 0.0;
+                } else {
+                    let (c_i, d_i) = kernel.curvature_terms(0.0, jet.mu, raw_weight);
+                    *c_o = c_i;
+                    *d_o = d_i;
+                }
+                if zero_mu_jet_on_clamp && clamp_active {
+                    *dmu_o = 0.0;
+                    *d2_o = 0.0;
+                    *d3_o = 0.0;
+                } else {
+                    *dmu_o = jet.d1;
+                    *d2_o = jet.d2;
+                    *d3_o = jet.d3;
+                }
+                Ok(())
+            },
+        )
 }

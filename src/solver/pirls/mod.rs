@@ -4812,160 +4812,55 @@ pub(crate) fn computeworkingweight_derivatives_from_eta(
             dmu_deta.fill(1.0);
         }
         ResponseFamily::Poisson => {
-            const MIN_WEIGHT: f64 = 1e-12;
-            // Per-row independent: jet/weight depend only on eta[i] and
-            // priorweights[i]. Parallel write into the five output slices
-            // matches the `update_glmvectors` pattern. `try_for_each` keeps
-            // first-error semantics from the prior `?` early return.
-            let c_s = c.as_slice_mut().expect("c must be contiguous");
-            let d_s = d.as_slice_mut().expect("d must be contiguous");
-            let dmu_s = dmu_deta
-                .as_slice_mut()
-                .expect("dmu_deta must be contiguous");
-            let d2_s = d2mu_deta2
-                .as_slice_mut()
-                .expect("d2mu_deta2 must be contiguous");
-            let d3_s = d3mu_deta3
-                .as_slice_mut()
-                .expect("d3mu_deta3 must be contiguous");
-            c_s.par_iter_mut()
-                .zip(d_s.par_iter_mut())
-                .zip(dmu_s.par_iter_mut())
-                .zip(d2_s.par_iter_mut())
-                .zip(d3_s.par_iter_mut())
-                .enumerate()
-                .try_for_each(
-                    |(i, ((((c_o, d_o), dmu_o), d2_o), d3_o))| -> Result<(), EstimationError> {
-                        let eta_used = eta[i].clamp(-700.0, 700.0);
-                        let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
-                        let raw_weight = priorweights[i].max(0.0) * jet.mu;
-                        let floor_active = raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
-                        if eta[i] != eta_used || floor_active {
-                            *c_o = 0.0;
-                            *d_o = 0.0;
-                        } else {
-                            *c_o = raw_weight;
-                            *d_o = raw_weight;
-                        }
-                        *dmu_o = jet.d1;
-                        *d2_o = jet.d2;
-                        *d3_o = jet.d3;
-                        Ok(())
-                    },
-                )?;
+            log_link_working_state::write_log_link_eta_curvature(
+                &PoissonLogKernel,
+                inverse_link,
+                eta,
+                priorweights,
+                WorkingDerivativeBuffersMut {
+                    c: &mut c,
+                    d: &mut d,
+                    dmu_deta: &mut dmu_deta,
+                    d2mu_deta2: &mut d2mu_deta2,
+                    d3mu_deta3: &mut d3mu_deta3,
+                },
+            )?;
         }
         ResponseFamily::Tweedie { p } => {
             let p = *p;
-            const MIN_WEIGHT: f64 = 1e-12;
-            if !is_valid_tweedie_power(p) {
-                crate::bail_invalid_estim!(
-                    "Tweedie variance power must be finite and strictly between 1 and 2; got {p}"
-                );
-            }
-            let exponent = 2.0 - p;
             let phi = fixed_glm_dispersion(likelihood);
-            if !(phi.is_finite() && phi > 0.0) {
-                crate::bail_invalid_estim!(
-                    "Tweedie dispersion phi must be finite and > 0; got {phi}"
-                );
-            }
-            let c_s = c.as_slice_mut().expect("c must be contiguous");
-            let d_s = d.as_slice_mut().expect("d must be contiguous");
-            let dmu_s = dmu_deta
-                .as_slice_mut()
-                .expect("dmu_deta must be contiguous");
-            let d2_s = d2mu_deta2
-                .as_slice_mut()
-                .expect("d2mu_deta2 must be contiguous");
-            let d3_s = d3mu_deta3
-                .as_slice_mut()
-                .expect("d3mu_deta3 must be contiguous");
-            c_s.par_iter_mut()
-                .zip(d_s.par_iter_mut())
-                .zip(dmu_s.par_iter_mut())
-                .zip(d2_s.par_iter_mut())
-                .zip(d3_s.par_iter_mut())
-                .enumerate()
-                .try_for_each(
-                    |(i, ((((c_o, d_o), dmu_o), d2_o), d3_o))| -> Result<(), EstimationError> {
-                        let eta_raw = eta[i];
-                        let eta_used = eta_raw.clamp(-700.0, 700.0);
-                        let clamp_active = eta_raw != eta_used;
-                        let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
-                        let raw_weight =
-                            priorweights[i].max(0.0) * tweedie_log_weight_mu_power(jet.mu, p) / phi;
-                        let floor_active = raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
-                        if clamp_active || floor_active {
-                            *c_o = 0.0;
-                            *d_o = 0.0;
-                        } else {
-                            *c_o = exponent * raw_weight;
-                            *d_o = exponent * exponent * raw_weight;
-                        }
-                        if clamp_active {
-                            *dmu_o = 0.0;
-                            *d2_o = 0.0;
-                            *d3_o = 0.0;
-                        } else {
-                            *dmu_o = jet.d1;
-                            *d2_o = jet.d2;
-                            *d3_o = jet.d3;
-                        }
-                        Ok(())
-                    },
-                )?;
+            log_link_working_state::write_log_link_eta_curvature(
+                &TweedieLogKernel {
+                    p,
+                    phi,
+                    exponent: 2.0 - p,
+                },
+                inverse_link,
+                eta,
+                priorweights,
+                WorkingDerivativeBuffersMut {
+                    c: &mut c,
+                    d: &mut d,
+                    dmu_deta: &mut dmu_deta,
+                    d2mu_deta2: &mut d2mu_deta2,
+                    d3mu_deta3: &mut d3mu_deta3,
+                },
+            )?;
         }
         ResponseFamily::NegativeBinomial { theta } => {
-            let theta = *theta;
-            const MIN_WEIGHT: f64 = 1e-12;
-            if !valid_negbin_theta(theta) {
-                crate::bail_invalid_estim!(
-                    "negative-binomial theta must be finite and > 0; got {theta}"
-                );
-            }
-            let c_s = c.as_slice_mut().expect("c must be contiguous");
-            let d_s = d.as_slice_mut().expect("d must be contiguous");
-            let dmu_s = dmu_deta
-                .as_slice_mut()
-                .expect("dmu_deta must be contiguous");
-            let d2_s = d2mu_deta2
-                .as_slice_mut()
-                .expect("d2mu_deta2 must be contiguous");
-            let d3_s = d3mu_deta3
-                .as_slice_mut()
-                .expect("d3mu_deta3 must be contiguous");
-            c_s.par_iter_mut()
-                .zip(d_s.par_iter_mut())
-                .zip(dmu_s.par_iter_mut())
-                .zip(d2_s.par_iter_mut())
-                .zip(d3_s.par_iter_mut())
-                .enumerate()
-                .try_for_each(
-                    |(i, ((((c_o, d_o), dmu_o), d2_o), d3_o))| -> Result<(), EstimationError> {
-                        let eta_raw = eta[i];
-                        let eta_used = eta_raw.clamp(-700.0, 700.0);
-                        let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
-                        let denom = theta + jet.mu;
-                        let negbin_weight = if theta > jet.mu {
-                            jet.mu / (1.0 + jet.mu / theta)
-                        } else {
-                            theta / (1.0 + theta / jet.mu)
-                        };
-                        let raw_weight = priorweights[i].max(0.0) * negbin_weight;
-                        let floor_active = raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
-                        if eta_raw != eta_used || floor_active {
-                            *c_o = 0.0;
-                            *d_o = 0.0;
-                        } else {
-                            *c_o = raw_weight * theta / denom;
-                            *d_o = raw_weight * theta * (theta - jet.mu) / (denom * denom);
-                        }
-                        *dmu_o = jet.d1;
-                        *d2_o = jet.d2;
-                        *d3_o = jet.d3;
-                        Ok(())
-                    },
-                )?;
+            log_link_working_state::write_log_link_eta_curvature(
+                &NegativeBinomialLogKernel { theta: *theta },
+                inverse_link,
+                eta,
+                priorweights,
+                WorkingDerivativeBuffersMut {
+                    c: &mut c,
+                    d: &mut d,
+                    dmu_deta: &mut dmu_deta,
+                    d2mu_deta2: &mut d2mu_deta2,
+                    d3mu_deta3: &mut d3mu_deta3,
+                },
+            )?;
         }
         ResponseFamily::Beta { phi } => {
             let phi = *phi;
@@ -5024,30 +4919,22 @@ pub(crate) fn computeworkingweight_derivatives_from_eta(
                 });
         }
         ResponseFamily::Gamma => {
-            let dmu_s = dmu_deta
-                .as_slice_mut()
-                .expect("dmu_deta must be contiguous");
-            let d2_s = d2mu_deta2
-                .as_slice_mut()
-                .expect("d2mu_deta2 must be contiguous");
-            let d3_s = d3mu_deta3
-                .as_slice_mut()
-                .expect("d3mu_deta3 must be contiguous");
-            dmu_s
-                .par_iter_mut()
-                .zip(d2_s.par_iter_mut())
-                .zip(d3_s.par_iter_mut())
-                .enumerate()
-                .try_for_each(
-                    |(i, ((dmu_o, d2_o), d3_o))| -> Result<(), EstimationError> {
-                        let jet =
-                            standard_inverse_link_jet(inverse_link, eta[i].clamp(-700.0, 700.0))?;
-                        *dmu_o = jet.d1;
-                        *d2_o = jet.d2;
-                        *d3_o = jet.d3;
-                        Ok(())
-                    },
-                )?;
+            // The Gamma log-link Fisher weight is independent of η, so the
+            // working-curvature carriers `c`/`d` vanish identically (the kernel
+            // returns `(0, 0)`); only the link jet is written here.
+            log_link_working_state::write_log_link_eta_curvature(
+                &GammaLogKernel { shape: 1.0 },
+                inverse_link,
+                eta,
+                priorweights,
+                WorkingDerivativeBuffersMut {
+                    c: &mut c,
+                    d: &mut d,
+                    dmu_deta: &mut dmu_deta,
+                    d2mu_deta2: &mut d2mu_deta2,
+                    d3mu_deta3: &mut d3mu_deta3,
+                },
+            )?;
         }
         ResponseFamily::Binomial => {
             let link = inverse_link.link_function();

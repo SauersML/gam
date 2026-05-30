@@ -797,6 +797,69 @@ where
     survival_baseline_config_from_theta(target, &result.rho)
 }
 
+/// Shared engine for the two derivative-carrying baseline-config optimizers.
+///
+/// Both `…_with_gradient_only` and `…_with_gradient` route an objective that
+/// returns a fully-populated [`OuterEval`](crate::solver::outer_strategy::OuterEval)
+/// (cost + analytic gradient, optionally + analytic Hessian) for a given
+/// config. Everything downstream of that — the `Rc<RefCell>` sharing that lets
+/// the same user closure back both the `cost_fn` and `eval_fn`, the θ→config
+/// conversion, and deriving the scalar `cost_fn` from the eval result — is
+/// identical, so it lives here once. The contract-specific axis is only which
+/// `HessianResult` the objective embeds, which the wrapper has already encoded
+/// in the returned `OuterEval`, so this helper is contract-agnostic beyond the
+/// `contract` it forwards to [`run_baseline_theta_optimizer`].
+fn run_baseline_theta_optimizer_with_eval<F>(
+    initial: &SurvivalBaselineConfig,
+    context: &str,
+    contract: BaselineDerivativeContract,
+    objective: F,
+) -> Result<SurvivalBaselineConfig, String>
+where
+    F: FnMut(
+        &SurvivalBaselineConfig,
+    ) -> Result<crate::solver::outer_strategy::OuterEval, String>,
+{
+    let target = initial.target;
+    let engine_context = context.to_string();
+    let objective = std::rc::Rc::new(std::cell::RefCell::new(objective));
+    let eval_at = move |obj: &std::rc::Rc<
+        std::cell::RefCell<F>,
+    >,
+                        theta: &Array1<f64>|
+          -> Result<crate::solver::outer_strategy::OuterEval, crate::estimate::EstimationError> {
+        let cfg = survival_baseline_config_from_theta(target, theta)
+            .map_err(crate::estimate::EstimationError::InvalidInput)?;
+        let eval = obj.borrow_mut()(&cfg).map_err(crate::estimate::EstimationError::InvalidInput)?;
+        if eval.gradient.len() != theta.len() {
+            return Err(crate::estimate::EstimationError::InvalidInput(format!(
+                "{engine_context}: baseline gradient dimension mismatch: got {}, expected {}",
+                eval.gradient.len(),
+                theta.len()
+            )));
+        }
+        if let crate::solver::outer_strategy::HessianResult::Analytic(ref h) = eval.hessian {
+            if h.nrows() != theta.len() || h.ncols() != theta.len() {
+                return Err(crate::estimate::EstimationError::InvalidInput(format!(
+                    "{engine_context}: baseline Hessian dimension mismatch: got {}x{}, expected {}x{}",
+                    h.nrows(),
+                    h.ncols(),
+                    theta.len(),
+                    theta.len()
+                )));
+            }
+        }
+        Ok(eval)
+    };
+    let cost_objective = std::rc::Rc::clone(&objective);
+    let cost_eval = eval_at.clone();
+    let cost_fn = move |_: &mut (), theta: &Array1<f64>| {
+        cost_eval(&cost_objective, theta).map(|eval| eval.cost)
+    };
+    let eval_fn = move |_: &mut (), theta: &Array1<f64>| eval_at(&objective, theta);
+    run_baseline_theta_optimizer(initial, context, contract, cost_fn, eval_fn)
+}
+
 /// Cost-only outer baseline-config optimizer. Thin adapter over
 /// [`run_baseline_theta_optimizer`] under the
 /// [`BaselineDerivativeContract::CostOnly`] contract: it wraps the
@@ -852,58 +915,25 @@ where
 pub fn optimize_survival_baseline_config_with_gradient_only<F>(
     initial: &SurvivalBaselineConfig,
     context: &str,
-    objective: F,
+    mut objective: F,
 ) -> Result<SurvivalBaselineConfig, String>
 where
     F: FnMut(&SurvivalBaselineConfig) -> Result<(f64, Array1<f64>), String>,
 {
     use crate::solver::outer_strategy::{HessianResult, OuterEval};
-    let target = initial.target;
-    let engine_context = context.to_string();
-    let objective = std::rc::Rc::new(std::cell::RefCell::new(objective));
-    let cost_objective = std::rc::Rc::clone(&objective);
-    let cost_context = engine_context.clone();
-    let cost_fn = move |_: &mut (), theta: &Array1<f64>| {
-        let cfg = survival_baseline_config_from_theta(target, theta)
-            .map_err(crate::estimate::EstimationError::InvalidInput)?;
-        let (cost, gradient) = cost_objective.borrow_mut()(&cfg)
-            .map_err(crate::estimate::EstimationError::InvalidInput)?;
-        if gradient.len() != theta.len() {
-            return Err(crate::estimate::EstimationError::InvalidInput(format!(
-                "{cost_context}: baseline gradient dimension mismatch: got {}, expected {}",
-                gradient.len(),
-                theta.len()
-            )));
-        }
-        Ok(cost)
-    };
-    let eval_objective = std::rc::Rc::clone(&objective);
-    let eval_context = engine_context.clone();
-    let eval_fn = move |_: &mut (), theta: &Array1<f64>| {
-        let cfg = survival_baseline_config_from_theta(target, theta)
-            .map_err(crate::estimate::EstimationError::InvalidInput)?;
-        let (cost, gradient) = eval_objective.borrow_mut()(&cfg)
-            .map_err(crate::estimate::EstimationError::InvalidInput)?;
-        if gradient.len() != theta.len() {
-            return Err(crate::estimate::EstimationError::InvalidInput(format!(
-                "{eval_context}: baseline gradient dimension mismatch: got {}, expected {}",
-                gradient.len(),
-                theta.len()
-            )));
-        }
-        Ok(OuterEval {
-            cost,
-            gradient,
-            hessian: HessianResult::Unavailable,
-            inner_beta_hint: None,
-        })
-    };
-    run_baseline_theta_optimizer(
+    run_baseline_theta_optimizer_with_eval(
         initial,
-        &engine_context,
+        context,
         BaselineDerivativeContract::GradientOnly,
-        cost_fn,
-        eval_fn,
+        move |cfg| {
+            let (cost, gradient) = objective(cfg)?;
+            Ok(OuterEval {
+                cost,
+                gradient,
+                hessian: HessianResult::Unavailable,
+                inner_beta_hint: None,
+            })
+        },
     )
 }
 
@@ -914,76 +944,25 @@ where
 pub fn optimize_survival_baseline_config_with_gradient<F>(
     initial: &SurvivalBaselineConfig,
     context: &str,
-    objective: F,
+    mut objective: F,
 ) -> Result<SurvivalBaselineConfig, String>
 where
     F: FnMut(&SurvivalBaselineConfig) -> Result<(f64, Array1<f64>, Array2<f64>), String>,
 {
     use crate::solver::outer_strategy::{HessianResult, OuterEval};
-    let target = initial.target;
-    let engine_context = context.to_string();
-    let objective = std::rc::Rc::new(std::cell::RefCell::new(objective));
-    let cost_objective = std::rc::Rc::clone(&objective);
-    let cost_context = engine_context.clone();
-    let cost_fn = move |_: &mut (), theta: &Array1<f64>| {
-        let cfg = survival_baseline_config_from_theta(target, theta)
-            .map_err(crate::estimate::EstimationError::InvalidInput)?;
-        let (cost, gradient, hessian) = cost_objective.borrow_mut()(&cfg)
-            .map_err(crate::estimate::EstimationError::InvalidInput)?;
-        if gradient.len() != theta.len() {
-            return Err(crate::estimate::EstimationError::InvalidInput(format!(
-                "{cost_context}: baseline gradient dimension mismatch: got {}, expected {}",
-                gradient.len(),
-                theta.len()
-            )));
-        }
-        if hessian.nrows() != theta.len() || hessian.ncols() != theta.len() {
-            return Err(crate::estimate::EstimationError::InvalidInput(format!(
-                "{cost_context}: baseline Hessian dimension mismatch: got {}x{}, expected {}x{}",
-                hessian.nrows(),
-                hessian.ncols(),
-                theta.len(),
-                theta.len()
-            )));
-        }
-        Ok(cost)
-    };
-    let eval_objective = std::rc::Rc::clone(&objective);
-    let eval_context = engine_context.clone();
-    let eval_fn = move |_: &mut (), theta: &Array1<f64>| {
-        let cfg = survival_baseline_config_from_theta(target, theta)
-            .map_err(crate::estimate::EstimationError::InvalidInput)?;
-        let (cost, gradient, hessian) = eval_objective.borrow_mut()(&cfg)
-            .map_err(crate::estimate::EstimationError::InvalidInput)?;
-        if gradient.len() != theta.len() {
-            return Err(crate::estimate::EstimationError::InvalidInput(format!(
-                "{eval_context}: baseline gradient dimension mismatch: got {}, expected {}",
-                gradient.len(),
-                theta.len()
-            )));
-        }
-        if hessian.nrows() != theta.len() || hessian.ncols() != theta.len() {
-            return Err(crate::estimate::EstimationError::InvalidInput(format!(
-                "{eval_context}: baseline Hessian dimension mismatch: got {}x{}, expected {}x{}",
-                hessian.nrows(),
-                hessian.ncols(),
-                theta.len(),
-                theta.len()
-            )));
-        }
-        Ok(OuterEval {
-            cost,
-            gradient,
-            hessian: HessianResult::Analytic(hessian),
-            inner_beta_hint: None,
-        })
-    };
-    run_baseline_theta_optimizer(
+    run_baseline_theta_optimizer_with_eval(
         initial,
-        &engine_context,
+        context,
         BaselineDerivativeContract::GradientHessian,
-        cost_fn,
-        eval_fn,
+        move |cfg| {
+            let (cost, gradient, hessian) = objective(cfg)?;
+            Ok(OuterEval {
+                cost,
+                gradient,
+                hessian: HessianResult::Analytic(hessian),
+                inner_beta_hint: None,
+            })
+        },
     )
 }
 
