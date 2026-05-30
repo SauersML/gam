@@ -26,7 +26,9 @@
 //! bordered Hessian in that layout and hands it to
 //! [`crate::solver::arrow_schur::ArrowSchurSystem`].
 
-use ndarray::{Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayView3, ArrayView4, s};
+use ndarray::{
+    Array1, Array2, Array3, Array4, Array5, ArrayView1, ArrayView2, ArrayView3, ArrayView4, s,
+};
 use std::sync::Arc;
 
 use crate::solver::arrow_schur::{
@@ -283,6 +285,86 @@ pub trait SaeBasisEvaluator: Send + Sync + std::fmt::Debug {
     fn second_jet_dyn(&self, _coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
         None
     }
+
+    /// Object-safe forwarder to the basis third jet
+    /// `T[n, m, a, c, e] = ∂³Φ_m / ∂t_a ∂t_c ∂t_e`, for callers holding
+    /// `&dyn SaeBasisEvaluator` / `Arc<dyn SaeBasisSecondJet>`. The exact
+    /// isometry Hessian (`IsometryPenalty::hvp`) needs the *decoder* third jet
+    /// `K = Σ_m T[..,m,..]·B[m,:]` for its residual·curvature term; without it
+    /// that exact Hessian silently drops the residual and collapses to
+    /// Gauss-Newton (issue #458).
+    ///
+    /// The default recovers `T` numerically by central-differencing the
+    /// analytic second jet [`Self::second_jet_dyn`] — so *any* basis that
+    /// exposes a closed-form Hessian also exposes a (numerically exact) third
+    /// jet, and the exact isometry Hessian is never silently wrong. Bases with
+    /// a closed-form third jet ([`SaeBasisThirdJet`]) override this for the
+    /// exact, allocation-light fast path. Returns `None` only when the basis
+    /// has no analytic second jet either (so there is nothing to differentiate).
+    fn third_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array5<f64>, String>> {
+        third_jet_central_difference(self, coords)
+    }
+}
+
+/// Numerically-exact basis third jet from a central difference of the analytic
+/// second jet. Used as the [`SaeBasisEvaluator::third_jet_dyn`] default for
+/// bases that supply `H` but not a closed-form `K`. Returns `None` when the
+/// basis exposes no analytic second jet.
+///
+/// `T[n, m, a, c, e] ≈ (H(t + h e_e)[n,m,a,c] − H(t − h e_e)[n,m,a,c]) / (2h)`,
+/// symmetrized over the trailing axis pair so the result inherits the exact
+/// `(a, c)` symmetry of `H` regardless of finite-difference noise.
+fn third_jet_central_difference(
+    evaluator: &(impl SaeBasisEvaluator + ?Sized),
+    coords: ArrayView2<'_, f64>,
+) -> Option<Result<Array5<f64>, String>> {
+    let base = match evaluator.second_jet_dyn(coords)? {
+        Ok(h) => h,
+        Err(err) => return Some(Err(err)),
+    };
+    let (n, m, d, d2) = base.dim();
+    if d != d2 {
+        return Some(Err(format!(
+            "third_jet_central_difference: second jet trailing dims disagree ({d} vs {d2})"
+        )));
+    }
+    let mut t3 = Array5::<f64>::zeros((n, m, d, d, d));
+    // Step scaled to the coordinate magnitude so the central difference keeps
+    // ~10 significant digits across the latent range without underflowing on
+    // coords near the origin.
+    for e in 0..d {
+        let mut plus = coords.to_owned();
+        let mut minus = coords.to_owned();
+        let mut max_abs = 0.0_f64;
+        for row in 0..n {
+            max_abs = max_abs.max(coords[[row, e]].abs());
+        }
+        let step = 1e-5 * (1.0 + max_abs);
+        for row in 0..n {
+            plus[[row, e]] += step;
+            minus[[row, e]] -= step;
+        }
+        let h_plus = match evaluator.second_jet_dyn(plus.view())? {
+            Ok(h) => h,
+            Err(err) => return Some(Err(err)),
+        };
+        let h_minus = match evaluator.second_jet_dyn(minus.view())? {
+            Ok(h) => h,
+            Err(err) => return Some(Err(err)),
+        };
+        let inv = 0.5 / step;
+        for row in 0..n {
+            for col in 0..m {
+                for a in 0..d {
+                    for c in 0..d {
+                        let deriv = (h_plus[[row, col, a, c]] - h_minus[[row, col, a, c]]) * inv;
+                        t3[[row, col, a, c, e]] = deriv;
+                    }
+                }
+            }
+        }
+    }
+    Some(Ok(t3))
 }
 
 /// Bases that expose an analytic second jet
@@ -299,6 +381,24 @@ pub trait SaeBasisEvaluator: Send + Sync + std::fmt::Debug {
 /// `None`.
 pub trait SaeBasisSecondJet: SaeBasisEvaluator {
     fn second_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array4<f64>, String>;
+}
+
+/// Bases that expose an analytic third jet
+/// `T[n, m, a, c, e] = ∂³Φ_m[n] / (∂t_{n,a} ∂t_{n,c} ∂t_{n,e})`,
+/// shape `(n_rows, n_basis, latent_dim, latent_dim, latent_dim)`.
+///
+/// The exact isometry Hessian (`IsometryPenalty::hvp`) needs the third decoder
+/// jet `K = ∂³φ/∂t³ = Σ_m T[..,m,..] · B[m, :]` for its residual·curvature term
+/// `B_{ab,cd} = K_{a,cd}ᵀ W J_b + H_{a,c}ᵀ W H_{b,d} + H_{a,d}ᵀ W H_{b,c}
+/// + J_aᵀ W K_{b,cd}`. Bases that supply a closed-form `H` (the
+/// [`SaeBasisSecondJet`] super-bound) but not `K` leave that exact Hessian
+/// silently dropping the residual term; this trait closes that gap for the
+/// curved analytic bases (sphere chart, periodic harmonic, torus harmonic,
+/// Euclidean monomial) and the trivially-zero affine basis. The Duchon basis
+/// keeps its existing radial-source lazy `K` path and does not implement this
+/// trait. The full third jet is symmetric in its three trailing axes.
+pub trait SaeBasisThirdJet: SaeBasisSecondJet {
+    fn third_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array5<f64>, String>;
 }
 
 /// Periodic harmonic basis evaluator for a single-dimensional circle latent.
@@ -325,6 +425,10 @@ impl PeriodicHarmonicEvaluator {
 impl SaeBasisEvaluator for PeriodicHarmonicEvaluator {
     fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
         Some(<Self as SaeBasisSecondJet>::second_jet(self, coords))
+    }
+
+    fn third_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array5<f64>, String>> {
+        Some(<Self as SaeBasisThirdJet>::third_jet(self, coords))
     }
 
     fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
@@ -392,6 +496,42 @@ impl SaeBasisSecondJet for PeriodicHarmonicEvaluator {
             }
         }
         Ok(h)
+    }
+}
+
+impl SaeBasisThirdJet for PeriodicHarmonicEvaluator {
+    /// Third derivative of the 1-D Fourier basis on the unit circle.
+    ///
+    /// For `Phi = [1, sin(2π h t), cos(2π h t), …]` the chain of derivatives is
+    /// `sin → ωc → −ω²s → −ω³c` and `cos → −ωs → −ω²c → ω³s`, so the third
+    /// derivative is `[0, −(2π h)³ cos(…), +(2π h)³ sin(…), …]`.
+    fn third_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array5<f64>, String> {
+        let n = coords.nrows();
+        let d = coords.ncols();
+        if d != 1 {
+            return Err(format!(
+                "PeriodicHarmonicEvaluator::third_jet: expected latent_dim == 1, got {d}"
+            ));
+        }
+        let m = self.num_basis;
+        let num_harmonics = (m - 1) / 2;
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let mut t3 = Array5::<f64>::zeros((n, m, 1, 1, 1));
+        for row in 0..n {
+            let t = coords[[row, 0]];
+            for k in 1..=num_harmonics {
+                let freq = two_pi * (k as f64);
+                let freq3 = freq * freq * freq;
+                let angle = freq * t;
+                let s = angle.sin();
+                let c = angle.cos();
+                let s_idx = 2 * k - 1;
+                let c_idx = 2 * k;
+                t3[[row, s_idx, 0, 0, 0]] = -freq3 * c;
+                t3[[row, c_idx, 0, 0, 0]] = freq3 * s;
+            }
+        }
+        Ok(t3)
     }
 }
 
@@ -529,6 +669,10 @@ impl SaeBasisEvaluator for SphereChartEvaluator {
         Some(<Self as SaeBasisSecondJet>::second_jet(self, coords))
     }
 
+    fn third_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array5<f64>, String>> {
+        Some(<Self as SaeBasisThirdJet>::third_jet(self, coords))
+    }
+
     fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
         sphere_chart_basis_jet(coords)
     }
@@ -621,6 +765,109 @@ impl SaeBasisSecondJet for SphereChartEvaluator {
     }
 }
 
+impl SaeBasisThirdJet for SphereChartEvaluator {
+    /// Third derivative of the 7-column lat/lon sphere chart basis
+    /// `[1, x, y, z, xy, yz, xz]`.
+    ///
+    /// Each Cartesian coordinate is *separable* in (lat, lon):
+    /// `x = cos(lat) cos(lon)`, `y = cos(lat) sin(lon)`, `z = sin(lat)·1`. A
+    /// separable coordinate's mixed derivative is the product of the per-axis
+    /// derivative of the right order, so it is fully described by two
+    /// length-4 derivative tables (orders 0..3) — one per axis. The lat table
+    /// carries the clamp chain factor `a = 1{lat ∈ (−π/2, π/2)}` on every
+    /// order ≥ 1; `a` is idempotent (`a² = a`), so products of lat-derivatives
+    /// keep it correctly. Outside the interior `a = 0` zeroes every term that
+    /// touches a lat-derivative, matching the constant-in-raw-lat clamp.
+    ///
+    /// The bilinear columns `xy, yz, xz` are products of two separable
+    /// coordinates; their third derivative is the symmetric triple-Leibniz sum
+    /// over the `2³` ways to route the three derivative operators to the two
+    /// factors. This is the order-3 generalization of the `pair` Leibniz used
+    /// in [`SaeBasisSecondJet::second_jet`], so the two stay structurally
+    /// identical and a finite difference of `second_jet` pins it.
+    fn third_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array5<f64>, String> {
+        if coords.ncols() != 2 {
+            return Err(format!(
+                "SphereChartEvaluator::third_jet expects latent_dim == 2, got {}",
+                coords.ncols()
+            ));
+        }
+        let n = coords.nrows();
+        let mut t3 = Array5::<f64>::zeros((n, 7, 2, 2, 2));
+        // Derivative of a separable coordinate along axes `ax` (each 0 = lat,
+        // 1 = lon): product of the lat table at order `#lat` and the lon table
+        // at order `#lon`.
+        let single = |lat: &[f64; 4], lon: &[f64; 4], ax: [usize; 3]| -> f64 {
+            let n_lat = ax.iter().filter(|&&q| q == 0).count();
+            lat[n_lat] * lon[3 - n_lat]
+        };
+        // Third derivative of a product of two separable coordinates: sum over
+        // all 2³ routings of the three operators to factor f vs g (Leibniz).
+        let product = |f_lat: &[f64; 4],
+                       f_lon: &[f64; 4],
+                       g_lat: &[f64; 4],
+                       g_lon: &[f64; 4],
+                       ax: [usize; 3]|
+         -> f64 {
+            let mut acc = 0.0;
+            for mask in 0u8..8 {
+                let (mut f_lat_n, mut f_lon_n, mut g_lat_n, mut g_lon_n) = (0, 0, 0, 0);
+                for (i, &axis) in ax.iter().enumerate() {
+                    let to_f = (mask >> i) & 1 == 1;
+                    match (to_f, axis == 0) {
+                        (true, true) => f_lat_n += 1,
+                        (true, false) => f_lon_n += 1,
+                        (false, true) => g_lat_n += 1,
+                        (false, false) => g_lon_n += 1,
+                    }
+                }
+                acc += f_lat[f_lat_n] * f_lon[f_lon_n] * g_lat[g_lat_n] * g_lon[g_lon_n];
+            }
+            acc
+        };
+        for row in 0..n {
+            let raw_lat = coords[[row, 0]];
+            let lat = raw_lat.clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
+            let lat_active =
+                raw_lat > -std::f64::consts::FRAC_PI_2 && raw_lat < std::f64::consts::FRAC_PI_2;
+            let a = if lat_active { 1.0 } else { 0.0 };
+            let lon = coords[[row, 1]];
+            let clat = lat.cos();
+            let slat = lat.sin();
+            let clon = lon.cos();
+            let slon = lon.sin();
+            // Per-axis derivative tables, orders 0..3. Lat tables carry the
+            // clamp chain factor on every order ≥ 1.
+            let cos_lat = [clat, -slat * a, -clat * a, slat * a];
+            let sin_lat = [slat, clat * a, -slat * a, -clat * a];
+            let cos_lon = [clon, -slon, -clon, slon];
+            let sin_lon = [slon, clon, -slon, -clon];
+            let const_lon = [1.0, 0.0, 0.0, 0.0];
+            // x = cos(lat)cos(lon), y = cos(lat)sin(lon), z = sin(lat).
+            let (x_lat, x_lon) = (&cos_lat, &cos_lon);
+            let (y_lat, y_lon) = (&cos_lat, &sin_lon);
+            let (z_lat, z_lon) = (&sin_lat, &const_lon);
+            for axis_a in 0..2 {
+                for axis_b in 0..2 {
+                    for axis_c in 0..2 {
+                        let ax = [axis_a, axis_b, axis_c];
+                        t3[[row, 1, axis_a, axis_b, axis_c]] = single(x_lat, x_lon, ax);
+                        t3[[row, 2, axis_a, axis_b, axis_c]] = single(y_lat, y_lon, ax);
+                        t3[[row, 3, axis_a, axis_b, axis_c]] = single(z_lat, z_lon, ax);
+                        t3[[row, 4, axis_a, axis_b, axis_c]] =
+                            product(x_lat, x_lon, y_lat, y_lon, ax);
+                        t3[[row, 5, axis_a, axis_b, axis_c]] =
+                            product(y_lat, y_lon, z_lat, z_lon, ax);
+                        t3[[row, 6, axis_a, axis_b, axis_c]] =
+                            product(x_lat, x_lon, z_lat, z_lon, ax);
+                    }
+                }
+            }
+        }
+        Ok(t3)
+    }
+}
+
 /// Tensor-product periodic harmonic evaluator for a `d`-dimensional torus
 /// `T^d = (S^1)^d`. The basis is the tensor product over each axis of the
 /// 1-D circle basis
@@ -668,6 +915,10 @@ impl TorusHarmonicEvaluator {
 impl SaeBasisEvaluator for TorusHarmonicEvaluator {
     fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
         Some(<Self as SaeBasisSecondJet>::second_jet(self, coords))
+    }
+
+    fn third_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array5<f64>, String>> {
+        Some(<Self as SaeBasisThirdJet>::third_jet(self, coords))
     }
 
     fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
@@ -824,6 +1075,87 @@ impl SaeBasisSecondJet for TorusHarmonicEvaluator {
     }
 }
 
+impl SaeBasisThirdJet for TorusHarmonicEvaluator {
+    /// Third derivative of the tensor-product torus basis.
+    ///
+    /// Each basis function factors as `Φ_flat = Π_axis f_axis(t_axis)`, so its
+    /// third derivative `∂³Φ / ∂t_a ∂t_b ∂t_c` is the product, over every
+    /// axis, of `f_axis` differentiated as many times as that axis appears in
+    /// `{a, b, c}` (0..3). Per axis the basis is `[1, sin(2π h t),
+    /// cos(2π h t), …]`, whose order-3 derivative is `[0, −(2π h)³ cos(…),
+    /// +(2π h)³ sin(…), …]`. This is the order-3 sibling of
+    /// [`SaeBasisSecondJet::second_jet`].
+    fn third_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array5<f64>, String> {
+        let d = self.latent_dim;
+        if coords.ncols() != d {
+            return Err(format!(
+                "TorusHarmonicEvaluator::third_jet expects latent_dim == {d}, got {}",
+                coords.ncols()
+            ));
+        }
+        let n = coords.nrows();
+        let axis_m = self.axis_basis_size();
+        let m = self.basis_size();
+        let h_max = self.num_harmonics;
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let mut t3 = Array5::<f64>::zeros((n, m, d, d, d));
+        // Per-axis derivative tables indexed [axis][order 0..3][column].
+        let mut deriv_axis = vec![vec![vec![0.0_f64; axis_m]; 4]; d];
+        for row in 0..n {
+            for axis in 0..d {
+                let t = coords[[row, axis]];
+                for order in 0..4 {
+                    deriv_axis[axis][order][0] = 0.0;
+                }
+                deriv_axis[axis][0][0] = 1.0;
+                for k in 1..=h_max {
+                    let freq = two_pi * (k as f64);
+                    let freq2 = freq * freq;
+                    let freq3 = freq2 * freq;
+                    let angle = freq * t;
+                    let s = angle.sin();
+                    let c = angle.cos();
+                    let s_idx = 2 * k - 1;
+                    let c_idx = 2 * k;
+                    deriv_axis[axis][0][s_idx] = s;
+                    deriv_axis[axis][0][c_idx] = c;
+                    deriv_axis[axis][1][s_idx] = freq * c;
+                    deriv_axis[axis][1][c_idx] = -freq * s;
+                    deriv_axis[axis][2][s_idx] = -freq2 * s;
+                    deriv_axis[axis][2][c_idx] = -freq2 * c;
+                    deriv_axis[axis][3][s_idx] = -freq3 * c;
+                    deriv_axis[axis][3][c_idx] = freq3 * s;
+                }
+            }
+            let mut idx = vec![0usize; d];
+            for flat in 0..m {
+                for axis_a in 0..d {
+                    for axis_b in 0..d {
+                        for axis_c in 0..d {
+                            let mut prod = 1.0_f64;
+                            for axis in 0..d {
+                                let order = (axis == axis_a) as usize
+                                    + (axis == axis_b) as usize
+                                    + (axis == axis_c) as usize;
+                                prod *= deriv_axis[axis][order][idx[axis]];
+                            }
+                            t3[[row, flat, axis_a, axis_b, axis_c]] = prod;
+                        }
+                    }
+                }
+                for axis in (0..d).rev() {
+                    idx[axis] += 1;
+                    if idx[axis] < axis_m {
+                        break;
+                    }
+                    idx[axis] = 0;
+                }
+            }
+        }
+        Ok(t3)
+    }
+}
+
 /// Affine Euclidean/Duchon fallback for the minimal fit entrypoint.
 #[derive(Debug, Clone)]
 pub struct AffineCoordinateEvaluator {
@@ -839,6 +1171,10 @@ impl AffineCoordinateEvaluator {
 impl SaeBasisEvaluator for AffineCoordinateEvaluator {
     fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
         Some(<Self as SaeBasisSecondJet>::second_jet(self, coords))
+    }
+
+    fn third_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array5<f64>, String>> {
+        Some(<Self as SaeBasisThirdJet>::third_jet(self, coords))
     }
 
     fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
@@ -882,6 +1218,24 @@ impl SaeBasisSecondJet for AffineCoordinateEvaluator {
         let m = self.latent_dim + 1;
         let d = self.latent_dim;
         Ok(Array4::<f64>::zeros((n, m, d, d)))
+    }
+}
+
+impl SaeBasisThirdJet for AffineCoordinateEvaluator {
+    /// Third derivative of the affine basis `[1, t_1, …, t_d]`. Every column is
+    /// at most linear, so all third derivatives vanish identically.
+    fn third_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array5<f64>, String> {
+        if coords.ncols() != self.latent_dim {
+            return Err(format!(
+                "AffineCoordinateEvaluator::third_jet: expected latent_dim {}, got {}",
+                self.latent_dim,
+                coords.ncols()
+            ));
+        }
+        let n = coords.nrows();
+        let m = self.latent_dim + 1;
+        let d = self.latent_dim;
+        Ok(Array5::<f64>::zeros((n, m, d, d, d)))
     }
 }
 
@@ -992,6 +1346,10 @@ impl SaeBasisEvaluator for EuclideanPatchEvaluator {
         Some(<Self as SaeBasisSecondJet>::second_jet(self, coords))
     }
 
+    fn third_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array5<f64>, String>> {
+        Some(<Self as SaeBasisThirdJet>::third_jet(self, coords))
+    }
+
     fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
         if coords.ncols() != self.latent_dim {
             return Err(format!(
@@ -1078,6 +1436,73 @@ impl SaeBasisSecondJet for EuclideanPatchEvaluator {
             }
         }
         Ok(hess)
+    }
+}
+
+impl SaeBasisThirdJet for EuclideanPatchEvaluator {
+    /// Third derivative of the monomial basis `Φ_α = Π_axis t_axis^{α_axis}`.
+    ///
+    /// Differentiating axis `j` a total of `k_j` times (where `k_j` is how
+    /// often axis `j` appears in `{a, b, c}`) contracts that factor to
+    /// `falling(α_j, k_j) · t_j^{α_j − k_j}`, with `falling(α, k) = α(α−1)…
+    /// (α−k+1)` and the term vanishing whenever `α_j < k_j`.
+    fn third_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array5<f64>, String> {
+        if coords.ncols() != self.latent_dim {
+            return Err(format!(
+                "EuclideanPatchEvaluator::third_jet: expected latent_dim {}, got {}",
+                self.latent_dim,
+                coords.ncols()
+            ));
+        }
+        let exponents = crate::basis::monomial_exponents(self.latent_dim, self.max_degree);
+        let n = coords.nrows();
+        let m = exponents.len();
+        let d = self.latent_dim;
+        let mut t3 = Array5::<f64>::zeros((n, m, d, d, d));
+        let falling = |alpha: usize, k: usize| -> f64 {
+            let mut acc = 1.0_f64;
+            for j in 0..k {
+                acc *= (alpha as f64) - (j as f64);
+            }
+            acc
+        };
+        for (col, alpha) in exponents.iter().enumerate() {
+            for a in 0..d {
+                if alpha[a] == 0 {
+                    continue;
+                }
+                for b in 0..d {
+                    for c in 0..d {
+                        // Per-axis differentiation order in this (a, b, c) cell.
+                        let mut order = vec![0usize; d];
+                        order[a] += 1;
+                        order[b] += 1;
+                        order[c] += 1;
+                        if (0..d).any(|axis| order[axis] > alpha[axis]) {
+                            continue;
+                        }
+                        let mut lead = 1.0_f64;
+                        for axis in 0..d {
+                            lead *= falling(alpha[axis], order[axis]);
+                        }
+                        if lead == 0.0 {
+                            continue;
+                        }
+                        for row in 0..n {
+                            let mut value = lead;
+                            for axis in 0..d {
+                                let exp = alpha[axis] - order[axis];
+                                if exp != 0 {
+                                    value *= coords[[row, axis]].powi(exp as i32);
+                                }
+                            }
+                            t3[[row, col, a, b, c]] = value;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(t3)
     }
 }
 
