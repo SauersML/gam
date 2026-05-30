@@ -3207,33 +3207,24 @@ impl PredictableModel for BernoulliMarginalSlopePredictor {
     ) -> Result<PredictUncertaintyResult, EstimationError> {
         let plugin = self.predict_plugin_response(input)?;
         let eta_se = self.eta_standard_error(input, fit)?;
-        let zcrit = validated_central_z(options.confidence_level)?;
-        let (eta_lower, eta_upper) = symmetric_interval(&plugin.eta, &eta_se, zcrit);
-        let (mean_lower, mean_upper) = mean_bounds(
-            &eta_lower,
-            &eta_upper,
-            &plugin.mean,
-            zcrit,
+        let mean_se = eta_se.clone() * self.mean_derivative_from_eta(&plugin.eta)?;
+        assemble_uncertainty_result(
+            options.confidence_level,
+            plugin.eta,
+            plugin.mean,
+            eta_se,
+            mean_se,
+            EtaInterval::Symmetric,
             MeanBoundMethod::TransformEta {
                 bounds: ResponseBounds::for_family(&self.likelihood_family().response),
                 response_map: &|eta: &Array1<f64>| self.mean_from_eta(eta),
             },
-        )?;
-        let mean_se = eta_se.clone() * self.mean_derivative_from_eta(&plugin.eta)?;
-        Ok(PredictUncertaintyResult {
-            eta: plugin.eta,
-            mean: plugin.mean,
-            eta_standard_error: eta_se.clone(),
-            mean_standard_error: mean_se,
-            eta_lower,
-            eta_upper,
-            mean_lower,
-            mean_upper,
-            observation_lower: None,
-            observation_upper: None,
-            covariance_mode_requested: options.covariance_mode,
-            covariance_corrected_used: false,
-        })
+            None,
+            UncertaintyProvenance {
+                covariance_mode_requested: options.covariance_mode,
+                covariance_corrected_used: false,
+            },
+        )
     }
 
     fn predict_posterior_mean(
@@ -3254,30 +3245,23 @@ impl PredictableModel for BernoulliMarginalSlopePredictor {
                 .map(|(&eta, &se)| strategy.posterior_mean(&quadctx, eta, se))
                 .collect::<Result<Vec<_>, _>>()?,
         );
-        let (mean_lower, mean_upper) = if let Some(level) = confidence_level {
-            let z = validated_central_z(level)?;
-            let (eta_lower, eta_upper) = symmetric_interval(&plugin.eta, &eta_se, z);
-            let (lower, upper) = mean_bounds(
-                &eta_lower,
-                &eta_upper,
-                &mean,
-                z,
-                MeanBoundMethod::TransformEta {
-                    bounds: ResponseBounds::for_family(&self.likelihood_family().response),
-                    response_map: &|eta: &Array1<f64>| self.mean_from_eta(eta),
-                },
-            )?;
-            (Some(lower), Some(upper))
-        } else {
-            (None, None)
-        };
-        Ok(PredictPosteriorMeanResult {
+        let mut result = PredictPosteriorMeanResult {
             eta: plugin.eta,
             eta_standard_error: eta_se,
             mean,
-            mean_lower,
-            mean_upper,
-        })
+            mean_lower: None,
+            mean_upper: None,
+        };
+        assemble_posterior_mean_bounds(
+            &mut result,
+            confidence_level,
+            EtaInterval::Symmetric,
+            MeanBoundMethod::TransformEta {
+                bounds: ResponseBounds::for_family(&self.likelihood_family().response),
+                response_map: &|eta: &Array1<f64>| self.mean_from_eta(eta),
+            },
+        )?;
+        Ok(result)
     }
 
     fn n_blocks(&self) -> usize {
@@ -3485,34 +3469,24 @@ impl PredictableModel for GaussianLocationScalePredictor {
         })?;
         let sigma = self.compute_sigma(design_noise, input.offset_noise.as_ref())?;
         let eta_se = self.eta_standard_error(input, fit, pred.eta.len())?;
-        let z = validated_central_z(options.confidence_level)?;
-        let (eta_lower, eta_upper) = symmetric_interval(&pred.eta, &eta_se, z);
-        // Identity link: the response interval is exactly the η interval.
-        let (mean_lower, mean_upper) = mean_bounds(
-            &eta_lower,
-            &eta_upper,
-            &pred.mean,
-            z,
+        // Identity link: mean == eta, so the mean interval is exactly the η
+        // interval and the mean SE equals the η SE.
+        assemble_uncertainty_result(
+            options.confidence_level,
+            pred.eta,
+            pred.mean,
+            eta_se.clone(),
+            eta_se,
+            EtaInterval::Symmetric,
             MeanBoundMethod::IdentityEta,
-        )?;
-        Ok(PredictUncertaintyResult {
-            eta: pred.eta.clone(),
-            mean: pred.mean.clone(),
-            eta_standard_error: eta_se.clone(),
-            mean_standard_error: eta_se.clone(),
-            eta_lower,
-            eta_upper,
-            mean_lower,
-            mean_upper,
-            observation_lower: options
+            options
                 .includeobservation_interval
-                .then(|| &pred.mean - &sigma.mapv(|s| z * s)),
-            observation_upper: options
-                .includeobservation_interval
-                .then(|| &pred.mean + &sigma.mapv(|s| z * s)),
-            covariance_mode_requested: options.covariance_mode,
-            covariance_corrected_used: false,
-        })
+                .then_some(ObservationInterval { noise_sd: &sigma }),
+            UncertaintyProvenance {
+                covariance_mode_requested: options.covariance_mode,
+                covariance_corrected_used: false,
+            },
+        )
     }
 
     fn predict_posterior_mean(
@@ -3521,23 +3495,23 @@ impl PredictableModel for GaussianLocationScalePredictor {
         fit: &UnifiedFitResult,
         confidence_level: Option<f64>,
     ) -> Result<PredictPosteriorMeanResult, EstimationError> {
-        let result = self.predict_plugin_response(input)?;
-        let eta_se = self.eta_standard_error(input, fit, result.eta.len())?;
+        let plugin = self.predict_plugin_response(input)?;
+        let eta_se = self.eta_standard_error(input, fit, plugin.eta.len())?;
         // Gaussian identity link: mean == eta, so bounds are eta ± z·se.
-        let (mean_lower, mean_upper) = if let Some(level) = confidence_level {
-            let z = validated_central_z(level)?;
-            let (lower, upper) = symmetric_interval(&result.eta, &eta_se, z);
-            (Some(lower), Some(upper))
-        } else {
-            (None, None)
-        };
-        Ok(PredictPosteriorMeanResult {
-            eta: result.eta,
+        let mut result = PredictPosteriorMeanResult {
+            eta: plugin.eta,
             eta_standard_error: eta_se,
-            mean: result.mean,
-            mean_lower,
-            mean_upper,
-        })
+            mean: plugin.mean,
+            mean_lower: None,
+            mean_upper: None,
+        };
+        assemble_posterior_mean_bounds(
+            &mut result,
+            confidence_level,
+            EtaInterval::Symmetric,
+            MeanBoundMethod::IdentityEta,
+        )?;
+        Ok(result)
     }
 
     fn n_blocks(&self) -> usize {
