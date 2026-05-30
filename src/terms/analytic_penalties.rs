@@ -7507,9 +7507,14 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
         let mut e = Array1::<f64>::zeros(n);
         for j in 0..n {
             e[j] = 1.0;
-            let col = self
-                .penalty
-                .hvp(self.target.view(), self.rho.view(), e.view());
+            // `FrozenAnalyticPenaltyOp` is the PSD Newton / PIRLS / preconditioner
+            // curvature operator (its `matvec` uses `psd_majorizer_hvp`), so the
+            // dense-materialization fallback probes the PSD majorizer too — never
+            // the (possibly indefinite) exact Hessian. For convex penalties the
+            // majorizer equals the exact HVP, so this is exact for them.
+            let col =
+                self.penalty
+                    .psd_majorizer_hvp(self.target.view(), self.rho.view(), e.view());
             for i in 0..n {
                 m[[i, j]] = col[i];
             }
@@ -7567,9 +7572,11 @@ impl FrozenAnalyticPenaltyOp {
         let mut e = Array1::<f64>::zeros(n);
         for i in 0..n {
             e[i] = 1.0;
+            // PSD curvature operator: probe the PSD majorizer (exact for convex
+            // penalties), mirroring `matvec` and the dense fallback above.
             let h = self
                 .penalty
-                .hvp(self.target.view(), self.rho.view(), e.view());
+                .psd_majorizer_hvp(self.target.view(), self.rho.view(), e.view());
             d[i] = h[i];
             e[i] = 0.0;
         }
@@ -8378,6 +8385,126 @@ mod tests {
                 "JumpReLU psd_majorizer_diag must be finite and PSD at index {idx}; entry={entry}"
             );
             assert_abs_diff_eq!(entry, expected, epsilon = 1e-12);
+        }
+    }
+
+    #[test]
+    fn log_sparsity_hessian_is_exact_true_second_derivative() {
+        // Log sparsifier  P(x) = λ·log(1 + x²/δ²),  P'(x) = 2λx/(δ²+x²).
+        // The EXACT second derivative is
+        //   P''(x) = 2λ(δ² − x²)/(δ² + x²)²,
+        // which is NEGATIVE for |x| > δ (Log is nonconvex). `hessian_diag`
+        // and `hvp` must return this genuine (indefinite) Hessian — never the
+        // positive IRLS majorizer 2λ/(δ²+x²). This guards against the operator
+        // confusion in issue #444.
+        let delta = 0.5_f64;
+        let weight = 1.3_f64;
+        let log_lambda = 0.2_f64;
+        let lambda = weight * log_lambda.exp();
+        let d2 = delta * delta;
+        let pen = {
+            let mut p = SparsityPenalty::log(PenaltyTier::Psi, delta).expect("valid log sparsity");
+            p.weight = weight;
+            p
+        };
+        // Sweep across |x| < δ (positive curvature) and |x| > δ (negative).
+        let target = array![0.0_f64, 0.25, 0.5, 1.0, 2.0, -2.0, -0.1];
+        let rho = array![log_lambda];
+
+        let diag = pen
+            .hessian_diag(target.view(), rho.view())
+            .expect("log sparsity exposes an analytic diagonal Hessian");
+        let mut saw_negative = false;
+        for (i, &x) in target.iter().enumerate() {
+            let denom = d2 + x * x;
+            let expected = 2.0 * lambda * (d2 - x * x) / (denom * denom);
+            assert_abs_diff_eq!(diag[i], expected, epsilon = 1e-12);
+            // `hvp` probed with eᵢ must reproduce the same diagonal entry: the
+            // two are the SAME true operator.
+            let mut e_i = Array1::<f64>::zeros(target.len());
+            e_i[i] = 1.0;
+            let hv_i = pen.hvp(target.view(), rho.view(), e_i.view());
+            assert_abs_diff_eq!(hv_i[i], expected, epsilon = 1e-12);
+            if diag[i] < 0.0 {
+                saw_negative = true;
+            }
+        }
+        assert!(
+            saw_negative,
+            "true log-sparsity Hessian must go negative once |x| > δ"
+        );
+    }
+
+    #[test]
+    fn log_sparsity_hessian_diag_matches_central_difference_of_gradient() {
+        // The exact Hessian must EXACTLY differentiate `grad_target`. A tight
+        // central difference of the analytic gradient pins the closed-form
+        // diagonal (and so would catch any regression to the majorizer, whose
+        // sign disagrees with the gradient's slope for |x| > δ).
+        let delta = 0.7_f64;
+        let weight = 0.9_f64;
+        let log_lambda = -0.3_f64;
+        let pen = {
+            let mut p = SparsityPenalty::log(PenaltyTier::Psi, delta).expect("valid log sparsity");
+            p.weight = weight;
+            p
+        };
+        let target = array![0.0_f64, 0.3, 0.7, 1.5, -1.8];
+        let rho = array![log_lambda];
+        let diag = pen
+            .hessian_diag(target.view(), rho.view())
+            .expect("log sparsity exposes an analytic diagonal Hessian");
+        let h = 1e-6_f64;
+        for i in 0..target.len() {
+            let mut tp = target.clone();
+            let mut tm = target.clone();
+            tp[i] += h;
+            tm[i] -= h;
+            let gp = pen.grad_target(tp.view(), rho.view());
+            let gm = pen.grad_target(tm.view(), rho.view());
+            let fd = (gp[i] - gm[i]) / (2.0 * h);
+            assert_abs_diff_eq!(diag[i], fd, epsilon = 1e-5);
+        }
+    }
+
+    #[test]
+    fn log_sparsity_psd_majorizer_diag_is_distinct_positive_operator() {
+        // The PSD majorizer is a DIFFERENT operator from the exact Hessian:
+        //   B(x) = 2λ/(δ²+x²) ⪰ 0,  agreeing with the exact Hessian only at
+        //   x = 0 and strictly dominating it elsewhere. The Newton / PIRLS
+        //   curvature block consumes this, not `hessian_diag`.
+        let delta = 0.5_f64;
+        let weight = 1.3_f64;
+        let log_lambda = 0.2_f64;
+        let lambda = weight * log_lambda.exp();
+        let d2 = delta * delta;
+        let pen = {
+            let mut p = SparsityPenalty::log(PenaltyTier::Psi, delta).expect("valid log sparsity");
+            p.weight = weight;
+            p
+        };
+        let target = array![0.0_f64, 0.25, 0.5, 1.0, 2.0, -2.0, -0.1];
+        let rho = array![log_lambda];
+        let maj = pen
+            .psd_majorizer_diag(target.view(), rho.view())
+            .expect("log sparsity exposes a PSD diagonal majorizer");
+        let exact = pen
+            .hessian_diag(target.view(), rho.view())
+            .expect("log sparsity exposes an analytic diagonal Hessian");
+        for (i, &x) in target.iter().enumerate() {
+            let expected = 2.0 * lambda / (d2 + x * x);
+            assert_abs_diff_eq!(maj[i], expected, epsilon = 1e-12);
+            assert!(
+                maj[i] >= 0.0,
+                "log-sparsity majorizer must be PSD at index {i}; entry={}",
+                maj[i]
+            );
+            // Majorizer dominates the exact Hessian everywhere, with equality
+            // only at x = 0.
+            assert!(maj[i] + 1e-12 >= exact[i]);
+            if x == 0.0 {
+                assert_abs_diff_eq!(maj[i], exact[i], epsilon = 1e-12);
+            }
         }
     }
 

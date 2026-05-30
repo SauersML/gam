@@ -3678,7 +3678,13 @@ impl SaeManifoldTerm {
                 sys.rows[row].gt[atom] += grad[row * k + atom];
             }
         }
-        if let Some(diag) = penalty.hessian_diag(target, rho_local) {
+        // The ArrowSchur `htt` block is the Newton / PIRLS curvature operator and
+        // must stay PSD. Nonconvex sparsifiers (log, JumpReLU) have an indefinite
+        // true Hessian, so we accumulate the PSD majorizer here — never the exact
+        // `hessian_diag`, which goes negative and would destroy the solve's
+        // positive-definiteness. Convex penalties' majorizer equals their exact
+        // Hessian, so this is exact for them.
+        if let Some(diag) = penalty.psd_majorizer_diag(target, rho_local) {
             for row in 0..n {
                 for atom in 0..k {
                     sys.rows[row].htt[[atom, atom]] += diag[row * k + atom];
@@ -3704,7 +3710,10 @@ impl SaeManifoldTerm {
                 sys.rows[row].gt[off + axis] += grad[row * d + axis];
             }
         }
-        if let Some(diag) = penalty.hessian_diag(target, rho_local) {
+        // `htt` is the PSD Newton / PIRLS curvature block: accumulate the PSD
+        // majorizer (exact for convex penalties), not the indefinite exact
+        // Hessian, for the same reason as `add_sae_logit_penalty` above.
+        if let Some(diag) = penalty.psd_majorizer_diag(target, rho_local) {
             for row in 0..n {
                 for axis in 0..d {
                     sys.rows[row].htt[[off + axis, off + axis]] += diag[row * d + axis];
@@ -3718,7 +3727,7 @@ impl SaeManifoldTerm {
             for row in 0..n {
                 probe[row * d + axis] = 1.0;
             }
-            let hv = penalty.hvp(target, rho_local, probe.view());
+            let hv = penalty.psd_majorizer_hvp(target, rho_local, probe.view());
             for row in 0..n {
                 for b in 0..d {
                     sys.rows[row].htt[[off + b, off + axis]] += hv[row * d + b];
@@ -3776,7 +3785,10 @@ impl SaeManifoldTerm {
         for j in 0..k {
             sys.gb[j] += penalty_scale * grad[j];
         }
-        if let Some(diag) = penalty.hessian_diag(target_beta, rho_local) {
+        // `hbb` is the PSD Newton / PIRLS curvature block for the β tier:
+        // accumulate the PSD majorizer (exact for convex penalties), not the
+        // indefinite exact Hessian, so the solve stays positive-definite.
+        if let Some(diag) = penalty.psd_majorizer_diag(target_beta, rho_local) {
             for j in 0..k {
                 sys.hbb[[j, j]] += penalty_scale * diag[j];
             }
@@ -3786,7 +3798,7 @@ impl SaeManifoldTerm {
         for j in 0..k {
             probe.fill(0.0);
             probe[j] = 1.0;
-            let hv = penalty.hvp(target_beta, rho_local, probe.view());
+            let hv = penalty.psd_majorizer_hvp(target_beta, rho_local, probe.view());
             for i in 0..k {
                 sys.hbb[[i, j]] += penalty_scale * hv[i];
             }
@@ -3819,7 +3831,12 @@ impl SaeManifoldTerm {
         for j in start..end {
             probe.fill(0.0);
             probe[j] = 1.0;
-            let hv = per_atom.hvp(target_beta, rho_local, probe.view());
+            // `hbb` is the PSD Newton / PIRLS curvature block, so probe the PSD
+            // majorizer. The group-lasso Hessian `factor·(I − ŵŵᵀ)/‖w‖` is
+            // already PSD, so its majorizer equals the exact Hessian (the trait
+            // default delegates), but we use the majorizer name to honor the
+            // curvature-block contract uniformly with the other SAE penalties.
+            let hv = per_atom.psd_majorizer_hvp(target_beta, rho_local, probe.view());
             for i in start..end {
                 sys.hbb[[i, j]] += penalty_scale * hv[i];
             }
