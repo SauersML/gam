@@ -3,7 +3,7 @@
 //! Riemannian-manifold primitives.
 //!
 //! Both `gam::geometry::poincare::poincare_distance` and
-//! `geomstats.geometry.hyperbolic.PoincareBall(dim).metric.dist` evaluate the
+//! `geomstats.geometry.poincare_ball.PoincareBall(dim).metric.dist` evaluate the
 //! *same* closed-form arccosh geodesic distance on the open Poincaré ball with
 //! sectional curvature `c = -1`:
 //!
@@ -18,8 +18,10 @@
 //! distance-formula bug, not statistical noise.
 //!
 //! Identical data is fed to both engines via the shared CSV harness: a
-//! fixed-seed batch of 50 point pairs sampled strictly interior to
-//! `[-0.99, 0.99]^d` for `d ∈ {2, 4, 8}`.
+//! fixed-seed batch of 50 point pairs for `d ∈ {2, 4, 8}`, each point sampled
+//! in `[-0.99, 0.99]^d` then rescaled to norm ≤ 0.9 so it lies strictly inside
+//! the open unit ball (where the arccosh formula is defined). The rescaled
+//! vectors are the byte-identical data evaluated by gam and written to the CSV.
 
 use gam::geometry::poincare::poincare_distance;
 use gam::test_support::reference::{Column, max_abs_diff, relative_l2, run_python};
@@ -41,12 +43,32 @@ fn splitmix_uniform(state: &mut u64, lo: f64, hi: f64) -> f64 {
 
 #[test]
 fn poincare_geodesic_matches_geomstats_to_float_ulp() {
-    // Strictly interior box: |coord| <= 0.99 keeps every point well inside the
-    // open unit ball so the (1 - |x|^2) denominators are bounded away from 0
-    // and both engines stay in the smooth interior of the arccosh formula.
+    // The Poincare ball is the OPEN unit ball: every point must satisfy
+    // |x| < 1, otherwise (1 - |x|^2) flips sign and the arccosh distance is
+    // undefined. A per-coordinate box like [-0.99, 0.99]^d does NOT enforce
+    // this (already |x|^2 up to 1.96 at d=2, up to 7.84 at d=8). We therefore
+    // sample a raw direction in the box and rescale each point to a fixed
+    // radius MAX_RADIUS < 1, which keeps both engines strictly inside the
+    // smooth interior of the arccosh formula and (1 - |x|^2) bounded away
+    // from 0. The rescaled vectors are exactly what gam evaluates and exactly
+    // what is written to the CSV, so both engines see byte-identical data.
     const N_PAIRS: usize = 50;
-    const INTERIOR: f64 = 0.99;
+    const BOX: f64 = 0.99;
+    const MAX_RADIUS: f64 = 0.9;
     const CURVATURE: f64 = -1.0;
+
+    // Rescale each consecutive `dim`-vector to have norm <= MAX_RADIUS.
+    fn clamp_into_ball(flat: &mut [f64], dim: usize) {
+        for chunk in flat.chunks_mut(dim) {
+            let norm = chunk.iter().map(|x| x * x).sum::<f64>().sqrt();
+            if norm > MAX_RADIUS {
+                let scale = MAX_RADIUS / norm;
+                for x in chunk.iter_mut() {
+                    *x *= scale;
+                }
+            }
+        }
+    }
 
     for &dim in &[2usize, 4, 8] {
         // ---- fixed-seed point pairs (identical bytes to both engines) ------
@@ -54,11 +76,13 @@ fn poincare_geodesic_matches_geomstats_to_float_ulp() {
         let mut a = vec![0.0f64; N_PAIRS * dim];
         let mut b = vec![0.0f64; N_PAIRS * dim];
         for v in a.iter_mut() {
-            *v = splitmix_uniform(&mut rng, -INTERIOR, INTERIOR);
+            *v = splitmix_uniform(&mut rng, -BOX, BOX);
         }
         for v in b.iter_mut() {
-            *v = splitmix_uniform(&mut rng, -INTERIOR, INTERIOR);
+            *v = splitmix_uniform(&mut rng, -BOX, BOX);
         }
+        clamp_into_ball(&mut a, dim);
+        clamp_into_ball(&mut b, dim);
 
         // ---- gam: closed-form Riemannian distance per pair -----------------
         let gam_dist: Vec<f64> = (0..N_PAIRS)
@@ -91,13 +115,17 @@ fn poincare_geodesic_matches_geomstats_to_float_ulp() {
         let body = format!(
             r#"
 import numpy as np
-from geomstats.geometry.hyperbolic import Hyperbolic
+from geomstats.geometry.poincare_ball import PoincareBall
 dim = {dim}
 acols = [df["a%d" % j] for j in range(dim)]
 bcols = [df["b%d" % j] for j in range(dim)]
 A = np.column_stack([np.asarray(c, dtype=float) for c in acols])
 B = np.column_stack([np.asarray(c, dtype=float) for c in bcols])
-ball = Hyperbolic(dim=dim, default_coords_type="ball")
+# Canonical mature comparator: curvature -1 Poincare ball of dimension `dim`
+# (points are dim-vectors in the open unit ball). PoincareBall attaches its
+# PoincareBallMetric in __init__; .metric.dist is the closed-form arccosh
+# geodesic distance d(a,b)=arccosh(1 + 2|a-b|^2/((1-|a|^2)(1-|b|^2))).
+ball = PoincareBall(dim)
 d = np.array([float(ball.metric.dist(A[i], B[i])) for i in range(A.shape[0])])
 emit("dist", d)
 "#
