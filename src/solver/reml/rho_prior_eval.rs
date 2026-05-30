@@ -29,6 +29,31 @@
 use crate::types::RhoPrior;
 use ndarray::{Array1, Array2};
 
+/// Calibrated exponential rate `θ = −ln(tail_prob) / upper` of a
+/// penalized-complexity prior, from the tail statement `P(d > upper) =
+/// tail_prob` on the distance scale `d = exp(-ρ/2)`. Caller must validate the
+/// hyperparameters first; with `0 < tail_prob < 1` and `upper > 0` the result
+/// is finite and strictly positive.
+pub(crate) fn pc_prior_rate(upper: f64, tail_prob: f64) -> f64 {
+    -tail_prob.ln() / upper
+}
+
+/// Negative-log penalized-complexity prior contribution and its first/second
+/// derivatives in the log-precision `r`, for calibrated rate `θ`. The objective
+/// is minimized, so this returns the cost (up to the ρ-independent additive
+/// constant `−ln(θ/2)`), gradient and Hessian:
+///
+/// ```text
+/// cost = r/2 + θ exp(-r/2),  grad = 1/2 − (θ/2) exp(-r/2),  hess = (θ/4) exp(-r/2).
+/// ```
+///
+/// The curvature is strictly positive (`θ > 0`), so the contribution is convex
+/// and always supplies usable outer-Hessian information.
+pub(crate) fn pc_prior_terms(theta: f64, r: f64) -> (f64, f64, f64) {
+    let e = (-0.5 * r).exp();
+    (0.5 * r + theta * e, 0.5 - 0.5 * theta * e, 0.25 * theta * e)
+}
+
 /// What a caller wants done when the configured prior is malformed (e.g. a
 /// `Normal` with non-positive `sd`, a `GammaPrecision` with non-positive
 /// `shape`, an `Independent` whose length disagrees with `ρ`, or a nested
@@ -104,6 +129,20 @@ fn scalar_terms(prior: &RhoPrior, r: f64, context: &str) -> Result<(f64, f64, f6
                 *rate * lambda,
             ))
         }
+        RhoPrior::PenalizedComplexity { upper, tail_prob } => {
+            if !upper.is_finite() || *upper <= 0.0 {
+                return Err(RhoPriorError::constraint_violation(format!(
+                    "{context} penalized-complexity prior requires a finite upper > 0"
+                )));
+            }
+            if !tail_prob.is_finite() || *tail_prob <= 0.0 || *tail_prob >= 1.0 {
+                return Err(RhoPriorError::constraint_violation(format!(
+                    "{context} penalized-complexity prior requires tail probability in (0, 1)"
+                )));
+            }
+            let theta = pc_prior_rate(*upper, *tail_prob);
+            Ok(pc_prior_terms(theta, r))
+        }
         RhoPrior::Independent(_) => Err(RhoPriorError::constraint_violation(format!(
             "{context} must be a scalar rho prior, not a nested Independent prior"
         ))),
@@ -151,7 +190,9 @@ fn evaluate_strict(prior: &RhoPrior, rho: &Array1<f64>) -> Result<RhoPriorEval, 
             gradient: Array1::zeros(len),
             hessian: None,
         }),
-        RhoPrior::Normal { .. } | RhoPrior::GammaPrecision { .. } => {
+        RhoPrior::Normal { .. }
+        | RhoPrior::GammaPrecision { .. }
+        | RhoPrior::PenalizedComplexity { .. } => {
             let mut cost = 0.0;
             let mut gradient = Array1::<f64>::zeros(len);
             let mut hessian = Array2::<f64>::zeros((len, len));
@@ -210,13 +251,17 @@ mod tests {
     /// duplicate call sites relied on.
     #[test]
     fn cost_grad_hess_parity_across_valid_priors() {
-        let rho = Array1::from_vec(vec![-0.5, 0.25, 1.5]);
+        let rho = Array1::from_vec(vec![-0.5, 0.25, 1.5, 0.7]);
         let priors = vec![
             RhoPrior::Flat,
             RhoPrior::Normal { mean: 0.2, sd: 0.8 },
             RhoPrior::GammaPrecision {
                 shape: 2.0,
                 rate: 0.5,
+            },
+            RhoPrior::PenalizedComplexity {
+                upper: 0.5,
+                tail_prob: 0.05,
             },
             RhoPrior::Independent(vec![
                 RhoPrior::Flat,
@@ -227,6 +272,10 @@ mod tests {
                 RhoPrior::GammaPrecision {
                     shape: 1.5,
                     rate: 0.0,
+                },
+                RhoPrior::PenalizedComplexity {
+                    upper: 1.2,
+                    tail_prob: 0.01,
                 },
             ]),
         ];
@@ -241,30 +290,29 @@ mod tests {
             assert_eq!(hard.gradient, sat.gradient);
             assert_eq!(hard.hessian, sat.hessian);
 
-            // Finite-difference check of gradient and (diagonal) Hessian.
-            let eps = 1e-6;
+            // Finite-difference check of gradient and (diagonal) Hessian. The
+            // gradient uses a small step; the Hessian needs a larger one
+            // because a central second difference amplifies roundoff like
+            // macheps/h² — the optimal step is ≈ macheps^¼ ≈ 1e-4.
             let base = evaluate(prior, &rho, InvalidPriorPolicy::HardError).unwrap();
+            let cost_at = |k: usize, delta: f64| -> f64 {
+                let mut r = rho.clone();
+                r[k] += delta;
+                evaluate(prior, &r, InvalidPriorPolicy::HardError).unwrap().cost
+            };
+            let (h_grad, h_hess) = (1e-6, 1e-4);
             for k in 0..rho.len() {
-                let mut rp = rho.clone();
-                rp[k] += eps;
-                let mut rm = rho.clone();
-                rm[k] -= eps;
-                let cp = evaluate(prior, &rp, InvalidPriorPolicy::HardError)
-                    .unwrap()
-                    .cost;
-                let cm = evaluate(prior, &rm, InvalidPriorPolicy::HardError)
-                    .unwrap()
-                    .cost;
-                let fd_grad = (cp - cm) / (2.0 * eps);
+                let fd_grad = (cost_at(k, h_grad) - cost_at(k, -h_grad)) / (2.0 * h_grad);
                 assert!(
                     (fd_grad - base.gradient[k]).abs() <= 1e-5,
                     "gradient mismatch at {k}: fd {fd_grad} vs {}",
                     base.gradient[k]
                 );
-                let fd_hess = (cp - 2.0 * base.cost + cm) / (eps * eps);
+                let fd_hess =
+                    (cost_at(k, h_hess) - 2.0 * base.cost + cost_at(k, -h_hess)) / (h_hess * h_hess);
                 let analytic_hess = base.hessian.as_ref().map_or(0.0, |h| h[[k, k]]);
                 assert!(
-                    (fd_hess - analytic_hess).abs() <= 1e-3,
+                    (fd_hess - analytic_hess).abs() <= 1e-4,
                     "hessian mismatch at {k}: fd {fd_hess} vs {analytic_hess}"
                 );
             }
@@ -304,5 +352,155 @@ mod tests {
             evaluate(&nested, &rho, InvalidPriorPolicy::HardError),
             Err(RhoPriorError::ConstraintViolation { .. })
         ));
+    }
+
+    // ---- Penalized-complexity prior ---------------------------------------
+
+    /// Normalized PC-prior log-density on ρ (includes the additive constant
+    /// `ln(θ/2)` the optimizer cost drops). `log p(ρ) = ln(θ/2) − ρ/2 − θ
+    /// exp(−ρ/2)`, the change-of-variables image of `d ~ Exp(θ)` under
+    /// `d = exp(−ρ/2)`.
+    fn pc_log_pdf(upper: f64, tail_prob: f64, r: f64) -> f64 {
+        let theta = pc_prior_rate(upper, tail_prob);
+        (0.5 * theta).ln() - 0.5 * r - theta * (-0.5 * r).exp()
+    }
+
+    #[test]
+    fn pc_rate_calibrates_to_tail_statement() {
+        // θ = −ln(α)/U solves P(d > U) = exp(−θU) = α exactly.
+        for &(upper, alpha) in &[(0.5_f64, 0.05_f64), (1.2, 0.01), (3.0, 0.25)] {
+            let theta = pc_prior_rate(upper, alpha);
+            let tail = (-theta * upper).exp();
+            assert!(
+                (tail - alpha).abs() < 1e-12,
+                "P(d>U)={tail} vs α={alpha} (U={upper})"
+            );
+        }
+    }
+
+    #[test]
+    fn pc_density_integrates_to_one_and_matches_tail() {
+        // Trapezoidal integration of the normalized ρ-density. d = exp(−ρ/2)
+        // ranges over (0, ∞); the density decays at both ends, so a wide grid
+        // captures essentially all the mass.
+        let upper = 0.5_f64;
+        let alpha = 0.05_f64;
+        let (lo, hi, n) = (-60.0_f64, 80.0_f64, 2_000_000usize);
+        let h = (hi - lo) / n as f64;
+        // ρ < −2 ln U  ⇔  exp(−ρ/2) > U  ⇔  d > U: the tail region.
+        let tail_boundary = -2.0 * upper.ln();
+        let mut total = 0.0;
+        let mut tail = 0.0;
+        for i in 0..=n {
+            let r = lo + i as f64 * h;
+            let w = if i == 0 || i == n { 0.5 } else { 1.0 };
+            let p = pc_log_pdf(upper, alpha, r).exp();
+            total += w * p;
+            if r <= tail_boundary {
+                tail += w * p;
+            }
+        }
+        total *= h;
+        tail *= h;
+        assert!((total - 1.0).abs() < 1e-4, "∫ p(ρ) dρ = {total}");
+        // P(d > U) recovered from the ρ-density must equal the calibration α.
+        assert!((tail - alpha).abs() < 1e-3, "P(d>U) = {tail} vs α = {alpha}");
+    }
+
+    #[test]
+    fn pc_terms_are_negative_log_density_derivatives() {
+        // cost = −log p (up to the dropped constant); grad/hess are its ρ
+        // derivatives, cross-checked against a finite difference of pc_log_pdf.
+        let (upper, alpha) = (0.8_f64, 0.02_f64);
+        let theta = pc_prior_rate(upper, alpha);
+        // Small step for the first derivative; larger step for the second,
+        // whose central difference amplifies roundoff like macheps/h².
+        let (h1, h2) = (1e-6, 1e-4);
+        for &r in &[-2.0_f64, -0.3, 0.0, 1.7, 4.0] {
+            let (cost, grad, hess) = pc_prior_terms(theta, r);
+            // cost + log p(ρ) is the ρ-independent constant ln(θ/2).
+            approx(cost + pc_log_pdf(upper, alpha, r), (0.5 * theta).ln());
+            // grad = −d/dρ log p  (FD on the log-density).
+            let dlp = (pc_log_pdf(upper, alpha, r + h1) - pc_log_pdf(upper, alpha, r - h1))
+                / (2.0 * h1);
+            let neg_dlp = -dlp;
+            assert!((grad - neg_dlp).abs() < 1e-5, "grad {grad} vs {neg_dlp} at r={r}");
+            // hess = −d²/dρ² log p (FD), and is strictly positive (convex).
+            let d2lp = (pc_log_pdf(upper, alpha, r + h2) - 2.0 * pc_log_pdf(upper, alpha, r)
+                + pc_log_pdf(upper, alpha, r - h2))
+                / (h2 * h2);
+            let neg_d2lp = -d2lp;
+            assert!((hess - neg_d2lp).abs() < 1e-4, "hess {hess} vs {neg_d2lp} at r={r}");
+            assert!(hess > 0.0, "PC curvature must be positive, got {hess}");
+        }
+    }
+
+    #[test]
+    fn pc_prior_pulls_toward_simpler_model() {
+        // The simpler (base) model is more smoothing: larger ρ ⇒ larger
+        // precision λ = exp(ρ) ⇒ the penalized component collapses. The PC cost
+        // must therefore make *under*-smoothing (small ρ, wiggly) more expensive
+        // than over-smoothing of the same magnitude — an asymmetric, convex
+        // bowl whose gradient at the base side is bounded by 1/2.
+        let prior = RhoPrior::PenalizedComplexity {
+            upper: 1.0,
+            tail_prob: 0.05,
+        };
+        let cost = |r: f64| {
+            evaluate(&prior, &Array1::from_vec(vec![r]), InvalidPriorPolicy::HardError)
+                .unwrap()
+                .cost
+        };
+        // Wiggly (ρ = −4) is penalized far more than smooth (ρ = +4).
+        assert!(
+            cost(-4.0) > cost(4.0),
+            "under-smoothing must cost more: {} vs {}",
+            cost(-4.0),
+            cost(4.0)
+        );
+        // As ρ → +∞ the cost grows only linearly (slope 1/2): a gentle pull, not
+        // a wall — the data can still buy complexity.
+        let g_far = evaluate(
+            &prior,
+            &Array1::from_vec(vec![25.0]),
+            InvalidPriorPolicy::HardError,
+        )
+        .unwrap()
+        .gradient[0];
+        assert!((g_far - 0.5).abs() < 1e-3, "far over-smoothing slope {g_far}");
+    }
+
+    #[test]
+    fn pc_prior_rejects_invalid_hyperparameters() {
+        let rho = Array1::from_vec(vec![0.0]);
+        for bad in [
+            RhoPrior::PenalizedComplexity {
+                upper: 0.0,
+                tail_prob: 0.05,
+            },
+            RhoPrior::PenalizedComplexity {
+                upper: -1.0,
+                tail_prob: 0.05,
+            },
+            RhoPrior::PenalizedComplexity {
+                upper: 1.0,
+                tail_prob: 0.0,
+            },
+            RhoPrior::PenalizedComplexity {
+                upper: 1.0,
+                tail_prob: 1.0,
+            },
+            RhoPrior::PenalizedComplexity {
+                upper: 1.0,
+                tail_prob: f64::NAN,
+            },
+        ] {
+            assert!(matches!(
+                evaluate(&bad, &rho, InvalidPriorPolicy::HardError),
+                Err(RhoPriorError::ConstraintViolation { .. })
+            ));
+            let sat = evaluate(&bad, &rho, InvalidPriorPolicy::Saturate).unwrap();
+            assert!(sat.cost.is_infinite() && sat.cost > 0.0);
+        }
     }
 }
