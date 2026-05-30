@@ -14826,55 +14826,39 @@ fn try_exact_joint_spatial_length_scale_optimization(
     let upper = setup.upper();
 
     // ───────────────────────────────────────────────────────────────────────
-    //  Anisotropic analytic path: when any term has d > 1 axes, use the
-    //  unified REML evaluator with ext_coords for joint [ρ, ψ] optimization.
-    //
-    //  The key advantage: analytic gradient + Hessian w.r.t. ψ_a via the
-    //  AnisoBasisPsiDerivatives → DirectionalHyperParam → HyperCoord pipeline,
-    //  giving Newton/BFGS quadratic convergence on the anisotropy parameters.
+    //  Both coordinate kinds drive the SAME exact joint optimizer
+    //  (`run_exact_joint_spatial_optimization`): the unified REML evaluator with
+    //  ext_coords for joint [ρ, ψ] optimization, with analytic gradient +
+    //  Hessian flowing through the
+    //  AnisoBasisPsiDerivatives / SpatialPsiDerivative → DirectionalHyperParam →
+    //  HyperCoord pipeline for Newton/BFGS quadratic convergence. The only
+    //  difference is the coordinate kind: anisotropic carries one ψ per axis per
+    //  term, isotropic one log-κ per term. `outer_strategy` handles the
+    //  centralized degradation path when the analytic Hessian is unavailable.
     // ───────────────────────────────────────────────────────────────────────
-    let (theta_star, joint_final_value) = if use_aniso {
-        try_exact_joint_spatial_aniso_optimization(
-            data,
-            y,
-            weights,
-            offset,
-            resolvedspec,
-            &best.design,
-            family.clone(),
-            options,
-            spatial_terms,
-            &dims_per_term,
-            &theta0,
-            &lower,
-            &upper,
-            rho_dim,
-            kappa_options,
-        )?
+    let kind = if use_aniso {
+        SpatialHyperKind::Anisotropic
     } else {
-        // Isotropic analytic path: use the unified REML evaluator with
-        // ext_coords for joint [ρ, κ] optimization via BFGS, analogous to
-        // the anisotropic path but with a single κ per spatial term.
-        // outer_strategy handles the centralized degradation path when the
-        // analytic Hessian is unavailable.
-        try_exact_joint_spatial_isotropic_optimization(
-            data,
-            y,
-            weights,
-            offset,
-            resolvedspec,
-            &best.design,
-            family.clone(),
-            options,
-            spatial_terms,
-            &dims_per_term,
-            &theta0,
-            &lower,
-            &upper,
-            rho_dim,
-            kappa_options,
-        )?
+        SpatialHyperKind::Isotropic
     };
+    let (theta_star, joint_final_value) = run_exact_joint_spatial_optimization(
+        kind,
+        data,
+        y,
+        weights,
+        offset,
+        resolvedspec,
+        &best.design,
+        family.clone(),
+        options,
+        spatial_terms,
+        &dims_per_term,
+        &theta0,
+        &lower,
+        &upper,
+        rho_dim,
+        kappa_options,
+    )?;
 
     let baseline_score = fit_score(&best.fit);
     let baseline_result = FittedTermCollectionWithSpec {
@@ -14929,27 +14913,228 @@ fn try_exact_joint_spatial_length_scale_optimization(
     Ok(Some(optimized_result))
 }
 
-/// Joint [ρ, ψ] optimization for anisotropic spatial terms using analytic
-/// derivatives through the unified REML evaluator.
+/// Coordinate kind for the exact joint spatial hyperparameter optimizer.
+///
+/// Anisotropic and isotropic spatial terms drive the *same* joint `[ρ, ψ]`
+/// optimizer: identical outer-Hessian policy, identical
+/// `ExternalJointHyperEvaluator` wiring, identical multistart problem, identical
+/// convergence processing, and an identical `eval_full / eval_efs / eval_cost`
+/// inner loop that routes ψ through `try_build_spatial_log_kappa_hyper_dirs`.
+/// The only difference is the coordinate *kind*: the anisotropic path carries
+/// one log-scale coordinate per axis per term (ψ_a) while the isotropic path
+/// carries one log-κ coordinate per term. The kind selects diagnostic labels
+/// only — the numerics are shared verbatim.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SpatialHyperKind {
+    Anisotropic,
+    Isotropic,
+}
+
+impl SpatialHyperKind {
+    /// Stable diagnostic prefix used in every `log::*` line and as the
+    /// `ExternalJointHyperEvaluator` / cost-only label root.
+    fn label(self) -> &'static str {
+        match self {
+            SpatialHyperKind::Anisotropic => "spatial-aniso-joint",
+            SpatialHyperKind::Isotropic => "spatial-iso-joint",
+        }
+    }
+
+    /// Human-readable adjective for error strings ("anisotropic" / "isotropic").
+    fn adjective(self) -> &'static str {
+        match self {
+            SpatialHyperKind::Anisotropic => "anisotropic",
+            SpatialHyperKind::Isotropic => "isotropic",
+        }
+    }
+
+    /// Name of the directional coordinate being optimized ("psi" / "kappa"),
+    /// used only in hyper-direction construction error messages.
+    fn coord_name(self) -> &'static str {
+        match self {
+            SpatialHyperKind::Anisotropic => "psi",
+            SpatialHyperKind::Isotropic => "kappa",
+        }
+    }
+}
+
+/// Shared context for the exact joint spatial optimizer's closures. Holds the
+/// realized-design cache and the joint REML evaluator, plus the coordinate
+/// `kind` whose only effect is the diagnostic label routed into the cost-only
+/// evaluation path. The `eval_full / eval_efs / eval_cost` methods are the
+/// single source of truth for both anisotropic and isotropic spatial terms.
+struct SpatialJointContext<'d> {
+    data: ArrayView2<'d, f64>,
+    rho_dim: usize,
+    kind: SpatialHyperKind,
+    cache: SingleBlockExactJointDesignCache<'d>,
+    evaluator: crate::estimate::ExternalJointHyperEvaluator<'d>,
+}
+
+impl<'d> SpatialJointContext<'d> {
+    /// Full evaluation on the current realized design + hyper_dirs.
+    fn eval_full(
+        &mut self,
+        theta: &Array1<f64>,
+        order: crate::solver::outer_strategy::OuterEvalOrder,
+        analytic_outer_hessian_available: bool,
+    ) -> Result<
+        (
+            f64,
+            Array1<f64>,
+            crate::solver::outer_strategy::HessianResult,
+        ),
+        EstimationError,
+    > {
+        use crate::solver::outer_strategy::OuterEvalOrder;
+        let allow_second_order = matches!(order, OuterEvalOrder::ValueGradientHessian)
+            && analytic_outer_hessian_available;
+        if let Some(eval) = self.cache.memoized_eval(theta) {
+            let cached_satisfies_order = !allow_second_order || eval.2.is_analytic();
+            if cached_satisfies_order {
+                return Ok(eval);
+            }
+        }
+        self.cache
+            .ensure_theta(theta)
+            .map_err(EstimationError::InvalidInput)?;
+        let kind = self.kind;
+        let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
+            self.data,
+            self.cache.spec(),
+            self.cache.design(),
+            &self.cache.spatial_terms,
+        )?
+        .ok_or_else(|| {
+            EstimationError::InvalidInput(format!(
+                "failed to build {} hyper_dirs at current {}",
+                kind.adjective(),
+                kind.coord_name(),
+            ))
+        })?;
+
+        let design_revision = Some(self.cache.design_revision());
+        let eval = evaluate_joint_reml_outer_eval_at_theta(
+            &mut self.evaluator,
+            self.cache.design(),
+            theta,
+            self.rho_dim,
+            hyper_dirs,
+            None,
+            if allow_second_order {
+                order
+            } else {
+                OuterEvalOrder::ValueAndGradient
+            },
+            design_revision,
+        );
+        if let Ok(ref value) = eval {
+            self.cache.store_eval(value.clone());
+        }
+        eval
+    }
+
+    fn eval_efs(
+        &mut self,
+        theta: &Array1<f64>,
+    ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
+        self.cache
+            .ensure_theta(theta)
+            .map_err(EstimationError::InvalidInput)?;
+        let kind = self.kind;
+        let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
+            self.data,
+            self.cache.spec(),
+            self.cache.design(),
+            &self.cache.spatial_terms,
+        )?
+        .ok_or_else(|| {
+            EstimationError::InvalidInput(format!(
+                "failed to build {} hyper_dirs for exact-joint EFS",
+                kind.adjective(),
+            ))
+        })?;
+        let design_revision = Some(self.cache.design_revision());
+        evaluate_joint_reml_efs_at_theta(
+            &mut self.evaluator,
+            self.cache.design(),
+            theta,
+            self.rho_dim,
+            hyper_dirs,
+            None,
+            design_revision,
+        )
+    }
+
+    /// Cost-only evaluation. BFGS line-search probes route through the
+    /// evaluator's true value-only path so they neither construct
+    /// `try_build_spatial_log_kappa_hyper_dirs` nor assemble a gradient that
+    /// the line search will discard. Split-borrow on `self.cache` +
+    /// `self.evaluator` matches the pattern already used by `eval_full`.
+    fn eval_cost(&mut self, theta: &Array1<f64>) -> f64 {
+        if let Some(cost) = self.cache.memoized_cost(theta) {
+            return cost;
+        }
+        if self.cache.ensure_theta(theta).is_err() {
+            return f64::INFINITY;
+        }
+        let design_revision = Some(self.cache.design_revision());
+        let cost_label = self.kind.label();
+        let result = {
+            let design = self.cache.design();
+            self.evaluator.evaluate_cost_only(
+                &design.design,
+                &design.penalties,
+                &design.nullspace_dims,
+                design.linear_constraints.clone(),
+                theta,
+                self.rho_dim,
+                None,
+                cost_label,
+                design_revision,
+            )
+        };
+        match result {
+            Ok(cost) => {
+                self.cache.store_cost(cost);
+                cost
+            }
+            Err(_) => f64::INFINITY,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.cache.current_theta = None;
+        self.cache.last_cost = None;
+        self.cache.last_eval = None;
+    }
+}
+
+/// Exact joint `[ρ, ψ]` optimization for spatial terms using analytic
+/// derivatives through the unified REML evaluator. This is the single shared
+/// engine for both the anisotropic and isotropic coordinate kinds (selected by
+/// `kind`).
 ///
 /// At each outer iteration, the frozen term topology is reused and only the
 /// spatial realized blocks affected by the current ψ are refreshed before the
 /// unified evaluator returns cost + gradient + Hessian for the full
 /// θ = [ρ, ψ] vector. The ψ derivatives flow through:
 ///
-///   `AnisoBasisPsiDerivatives` → `SpatialPsiDerivative` → `DirectionalHyperParam`
+///   `AnisoBasisPsiDerivatives` / `SpatialPsiDerivative` → `DirectionalHyperParam`
 ///     → `build_tau_unified_objects` → `HyperCoord` ext_coords → unified evaluator
 ///
-/// This is the analytic anisotropic path, giving Newton/BFGS quadratic convergence on the
+/// This gives Newton/BFGS quadratic convergence on the length-scale /
 /// anisotropy parameters while jointly optimizing the smoothing parameters.
 ///
-/// The ψ_a are parameterized as unconstrained log-scale coordinates. The
-/// decomposition into isotropic scale (ψ̄ = mean(ψ_a)) and anisotropy
-/// (η_a = ψ_a − ψ̄, with Ση_a = 0) happens only on writeback via
-/// `SpatialLogKappaCoords::apply_tospec`. The all-ones direction in ψ-space
-/// is NOT a gauge direction — it controls the identifiable isotropic scale
-/// κ = exp(ψ̄). No sum-to-zero constraint is enforced during optimization.
-fn try_exact_joint_spatial_aniso_optimization(
+/// The ψ coordinates are parameterized as unconstrained log-scales. For the
+/// anisotropic kind the decomposition into isotropic scale (ψ̄ = mean(ψ_a)) and
+/// anisotropy (η_a = ψ_a − ψ̄, with Ση_a = 0) happens only on writeback via
+/// `SpatialLogKappaCoords::apply_tospec`; the all-ones direction in ψ-space is
+/// NOT a gauge direction — it controls the identifiable isotropic scale
+/// κ = exp(ψ̄). The isotropic kind carries one log-κ coordinate per term. In
+/// neither case is a sum-to-zero constraint enforced during optimization.
+fn run_exact_joint_spatial_optimization(
+    kind: SpatialHyperKind,
     data: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
     weights: ArrayView1<'_, f64>,
@@ -14966,6 +15151,7 @@ fn try_exact_joint_spatial_aniso_optimization(
     rho_dim: usize,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<(Array1<f64>, f64), EstimationError> {
+    let label = kind.label();
     // Use bounds and design metadata for validation.
     assert!(
         lower.len() == theta0.len() && upper.len() == theta0.len(),
@@ -14985,176 +15171,39 @@ fn try_exact_joint_spatial_aniso_optimization(
     };
 
     let theta_dim = theta0.len();
-    let psi_dim = theta_dim - rho_dim;
+    // Directional-coordinate dimension: psi-per-axis (anisotropic) or
+    // kappa-per-term (isotropic). The numerics below are identical either way.
+    let coord_dim = theta_dim - rho_dim;
     // Capability is declared solely from derivative coverage, not from
     // problem size. The unified REML evaluator now exposes exact matrix-free
     // outer Hessian operators for the costly third/fourth-derivative
-    // contractions used by anisotropic spatial ψ coordinates; its internal
+    // contractions used by spatial ψ coordinates; its internal
     // `(n, p, K)` work model chooses `HessianResult::Operator` at biobank
     // scale and the dense analytic matrix only below that crossover. Keeping
     // `Derivative::Analytic` here preserves ARC / trust-region-CG second-order
-    // optimization for `n > 50_000` and `ψ_dim > 30` instead of forcing the
+    // optimization for `n > 50_000` and `coord_dim > 30` instead of forcing the
     // obsolete HybridEFS compatibility path.
     let analytic_outer_hessian_available =
         exact_joint_spatial_outer_hessian_available(&family, baseline_design);
     if !analytic_outer_hessian_available {
         log::info!(
-            "[spatial-aniso-joint] analytic outer Hessian unavailable for family/design; routing without second-order geometry (psi_dim={psi_dim})"
+            "[{label}] analytic outer Hessian unavailable for family/design; routing without second-order geometry (coord_dim={coord_dim})"
         );
     }
     let prefer_gradient_only = false;
 
     log::trace!(
-        "[spatial-aniso-joint] starting analytic optimization: rho_dim={}, psi_dim={}, dims_per_term={:?}",
+        "[{}] starting analytic optimization: rho_dim={}, coord_dim={}, dims_per_term={:?}",
+        label,
         rho_dim,
-        psi_dim,
+        coord_dim,
         dims_per_term,
     );
 
-    // Shared context for the optimization closures. Holds immutable references
-    // to data/spec/options and the realized-design cache.
-    struct AnisoJointContext<'d> {
-        data: ArrayView2<'d, f64>,
-        rho_dim: usize,
-        cache: SingleBlockExactJointDesignCache<'d>,
-        evaluator: crate::estimate::ExternalJointHyperEvaluator<'d>,
-    }
-
-    impl<'d> AnisoJointContext<'d> {
-        /// Full evaluation on the current realized design + hyper_dirs.
-        fn eval_full(
-            &mut self,
-            theta: &Array1<f64>,
-            order: OuterEvalOrder,
-            analytic_outer_hessian_available: bool,
-        ) -> Result<
-            (
-                f64,
-                Array1<f64>,
-                crate::solver::outer_strategy::HessianResult,
-            ),
-            EstimationError,
-        > {
-            let allow_second_order = matches!(order, OuterEvalOrder::ValueGradientHessian)
-                && analytic_outer_hessian_available;
-            if let Some(eval) = self.cache.memoized_eval(theta) {
-                let cached_satisfies_order = !allow_second_order || eval.2.is_analytic();
-                if cached_satisfies_order {
-                    return Ok(eval);
-                }
-            }
-            self.cache
-                .ensure_theta(theta)
-                .map_err(EstimationError::InvalidInput)?;
-            let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
-                self.data,
-                self.cache.spec(),
-                self.cache.design(),
-                &self.cache.spatial_terms,
-            )?
-            .ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "failed to build aniso hyper_dirs at current psi".to_string(),
-                )
-            })?;
-
-            let design_revision = Some(self.cache.design_revision());
-            let eval = evaluate_joint_reml_outer_eval_at_theta(
-                &mut self.evaluator,
-                self.cache.design(),
-                theta,
-                self.rho_dim,
-                hyper_dirs,
-                None,
-                if allow_second_order {
-                    order
-                } else {
-                    OuterEvalOrder::ValueAndGradient
-                },
-                design_revision,
-            );
-            if let Ok(ref value) = eval {
-                self.cache.store_eval(value.clone());
-            }
-            eval
-        }
-
-        fn eval_efs(
-            &mut self,
-            theta: &Array1<f64>,
-        ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
-            self.cache
-                .ensure_theta(theta)
-                .map_err(EstimationError::InvalidInput)?;
-            let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
-                self.data,
-                self.cache.spec(),
-                self.cache.design(),
-                &self.cache.spatial_terms,
-            )?
-            .ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "failed to build aniso hyper_dirs for exact-joint EFS".to_string(),
-                )
-            })?;
-            let design_revision = Some(self.cache.design_revision());
-            evaluate_joint_reml_efs_at_theta(
-                &mut self.evaluator,
-                self.cache.design(),
-                theta,
-                self.rho_dim,
-                hyper_dirs,
-                None,
-                design_revision,
-            )
-        }
-
-        /// Cost-only evaluation. BFGS line-search probes route through the
-        /// evaluator's true value-only path so they neither construct
-        /// `try_build_spatial_log_kappa_hyper_dirs` nor assemble a gradient
-        /// that the line search will discard. Split-borrow on `self.cache`
-        /// + `self.evaluator` matches the pattern already used by `eval_full`.
-        fn eval_cost(&mut self, theta: &Array1<f64>) -> f64 {
-            if let Some(cost) = self.cache.memoized_cost(theta) {
-                return cost;
-            }
-            if self.cache.ensure_theta(theta).is_err() {
-                return f64::INFINITY;
-            }
-            let design_revision = Some(self.cache.design_revision());
-            let result = {
-                let design = self.cache.design();
-                self.evaluator.evaluate_cost_only(
-                    &design.design,
-                    &design.penalties,
-                    &design.nullspace_dims,
-                    design.linear_constraints.clone(),
-                    theta,
-                    self.rho_dim,
-                    None,
-                    "spatial-aniso-joint cost-only",
-                    design_revision,
-                )
-            };
-            match result {
-                Ok(cost) => {
-                    self.cache.store_cost(cost);
-                    cost
-                }
-                Err(_) => f64::INFINITY,
-            }
-        }
-
-        fn reset(&mut self) {
-            self.cache.current_theta = None;
-            self.cache.last_cost = None;
-            self.cache.last_eval = None;
-        }
-    }
-
-    let mut ctx = AnisoJointContext {
+    let mut ctx = SpatialJointContext {
         data,
         rho_dim,
+        kind,
         cache: SingleBlockExactJointDesignCache::new(
             data,
             resolvedspec.clone(),
@@ -15171,7 +15220,7 @@ fn try_exact_joint_spatial_aniso_optimization(
             offset,
             &baseline_design.penalties,
             &external_opts_for_design(&family, baseline_design, options),
-            "spatial-aniso-joint",
+            label,
         )?,
     };
 
@@ -15180,7 +15229,7 @@ fn try_exact_joint_spatial_aniso_optimization(
         lower,
         upper,
         rho_dim,
-        psi_dim,
+        coord_dim,
         theta_dim,
         Derivative::Analytic,
         if analytic_outer_hessian_available {
@@ -15205,7 +15254,7 @@ fn try_exact_joint_spatial_aniso_optimization(
         None,
     );
 
-    let eval_outer = |ctx: &mut &mut AnisoJointContext<'_>,
+    let eval_outer = |ctx: &mut &mut SpatialJointContext<'_>,
                       theta: &Array1<f64>,
                       order: OuterEvalOrder|
      -> Result<OuterEval, EstimationError> {
@@ -15216,7 +15265,7 @@ fn try_exact_joint_spatial_aniso_optimization(
                 hessian: hess,
                 inner_beta_hint: None,
             }),
-            // A trial hyperparameter at which the anisotropic kernel design /
+            // A trial hyperparameter at which the spatial kernel design /
             // ψ-derivatives are non-constructible is an infeasible point, not
             // a fatal error: the gradient/Hessian path must retreat exactly as
             // the cost-only path (which already returns +∞) does. Returning
@@ -15225,7 +15274,7 @@ fn try_exact_joint_spatial_aniso_optimization(
             // kernel — no longer aborts the whole REML optimization.
             Err(err) if is_recoverable_trial_point_error(&err) => {
                 log::debug!(
-                    "[spatial-aniso-joint] trial point infeasible (kernel design \
+                    "[{label}] trial point infeasible (kernel design \
                      not constructible at theta={theta:?}): {err}; retreating",
                 );
                 Ok(OuterEval::infeasible(theta_dim))
@@ -15236,8 +15285,8 @@ fn try_exact_joint_spatial_aniso_optimization(
 
     let mut obj = problem.build_objective_with_eval_order(
         &mut ctx,
-        |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| Ok(ctx.eval_cost(theta)),
-        |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| {
+        |ctx: &mut &mut SpatialJointContext<'_>, theta: &Array1<f64>| Ok(ctx.eval_cost(theta)),
+        |ctx: &mut &mut SpatialJointContext<'_>, theta: &Array1<f64>| {
             eval_outer(
                 ctx,
                 theta,
@@ -15248,18 +15297,23 @@ fn try_exact_joint_spatial_aniso_optimization(
                 },
             )
         },
-        |ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>, order: OuterEvalOrder| {
+        |ctx: &mut &mut SpatialJointContext<'_>, theta: &Array1<f64>, order: OuterEvalOrder| {
             eval_outer(ctx, theta, order)
         },
-        Some(|ctx: &mut &mut AnisoJointContext<'_>| {
+        Some(|ctx: &mut &mut SpatialJointContext<'_>| {
             ctx.reset();
         }),
-        Some(|ctx: &mut &mut AnisoJointContext<'_>, theta: &Array1<f64>| ctx.eval_efs(theta)),
+        Some(|ctx: &mut &mut SpatialJointContext<'_>, theta: &Array1<f64>| ctx.eval_efs(theta)),
     );
 
-    let result = problem.run(&mut obj, "aniso-psi joint REML").map_err(|e| {
+    let run_label = match kind {
+        SpatialHyperKind::Anisotropic => "aniso-psi joint REML",
+        SpatialHyperKind::Isotropic => "iso-kappa joint REML",
+    };
+    let result = problem.run(&mut obj, run_label).map_err(|e| {
         EstimationError::InvalidInput(format!(
-            "anisotropic analytic optimization failed after exhausting strategy fallbacks: {e}"
+            "{} analytic optimization failed after exhausting strategy fallbacks: {e}",
+            kind.adjective(),
         ))
     })?;
     if !result.converged {
@@ -15279,10 +15333,11 @@ fn try_exact_joint_spatial_aniso_optimization(
             .filter(|v| v.is_finite() && *v <= rel_to_cost_threshold)
         {
             log::info!(
-                "[spatial-aniso-joint] outer optimization hit max_iter={} but \
+                "[{}] outer optimization hit max_iter={} but \
                  projected gradient norm {:.3e} ≤ τ·(1+|f|) = {:.3e} \
                  (τ={:.3e}, |f|={:.3e}); accepting iterate under the mgcv-style \
                  relative-to-cost REML convergence criterion.",
+                label,
                 result.iterations,
                 final_grad,
                 rel_to_cost_threshold,
@@ -15291,7 +15346,8 @@ fn try_exact_joint_spatial_aniso_optimization(
             );
         } else {
             crate::bail_invalid_estim!(
-                "anisotropic analytic optimization did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
+                "{} analytic optimization did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
+                kind.adjective(),
                 result.iterations,
                 result.final_value,
                 result.final_grad_norm_report(),
@@ -15299,377 +15355,17 @@ fn try_exact_joint_spatial_aniso_optimization(
         }
     }
     log::trace!(
-        "[spatial-aniso-joint] converged in {} iterations, final_value={:.6e}, grad_norm={}",
+        "[{}] converged in {} iterations, final_value={:.6e}, grad_norm={}",
+        label,
         result.iterations,
         result.final_value,
         result.final_grad_norm_report(),
     );
     // No sum-to-zero enforcement needed: ψ coordinates are unconstrained during
-    // optimization. The decomposition into (ψ̄, η) happens in apply_tospec.
+    // optimization. For the anisotropic kind the decomposition into (ψ̄, η)
+    // happens later in apply_tospec.
     let theta_star = result.rho;
     Ok((theta_star, result.final_value))
-}
-
-/// Joint [ρ, κ] optimization for isotropic spatial terms using analytic
-/// derivatives through the unified REML evaluator.
-///
-/// This is the isotropic counterpart of the anisotropic exact spatial path.
-/// Each spatial term contributes one log-κ coordinate, and the joint outer
-/// optimization runs directly on `[ρ, κ]` while reusing the frozen term
-/// topology and refreshing only the spatial realized blocks touched by κ.
-/// The gradient and Hessian for log-κ flow through the same
-/// directional-hyperparameter pipeline used elsewhere:
-///
-///   `SpatialPsiDerivative` → `DirectionalHyperParam` → `HyperCoord` ext_coords
-///     → unified REML evaluator
-/// This gives BFGS/Newton quadratic convergence on the length-scale parameters.
-fn try_exact_joint_spatial_isotropic_optimization(
-    data: ArrayView2<'_, f64>,
-    y: ArrayView1<'_, f64>,
-    weights: ArrayView1<'_, f64>,
-    offset: ArrayView1<'_, f64>,
-    resolvedspec: &TermCollectionSpec,
-    baseline_design: &TermCollectionDesign,
-    family: LikelihoodSpec,
-    options: &FitOptions,
-    spatial_terms: &[usize],
-    dims_per_term: &[usize],
-    theta0: &Array1<f64>,
-    lower: &Array1<f64>,
-    upper: &Array1<f64>,
-    rho_dim: usize,
-    kappa_options: &SpatialLengthScaleOptimizationOptions,
-) -> Result<(Array1<f64>, f64), EstimationError> {
-    assert!(
-        lower.len() == theta0.len() && upper.len() == theta0.len(),
-        "spatial hyperparameter bounds must match theta length: lower_len={}, upper_len={}, theta_len={}",
-        lower.len(),
-        upper.len(),
-        theta0.len()
-    );
-    assert!(
-        baseline_design.smooth.terms.len() >= spatial_terms.len(),
-        "baseline design must have at least one smooth term per spatial term: baseline_terms={}, spatial_terms={}",
-        baseline_design.smooth.terms.len(),
-        spatial_terms.len()
-    );
-    use crate::solver::outer_strategy::{
-        DeclaredHessianForm, Derivative, OuterEval, OuterEvalOrder,
-    };
-
-    let theta_dim = theta0.len();
-    let kappa_dim = theta_dim - rho_dim;
-    // The unified REML evaluator now exposes exact dense or matrix-free
-    // outer-Hessian geometry for spatial κ coordinates.  Capability is
-    // independent of `(n, kappa_dim)`: large problems are represented by
-    // `HessianResult::Operator` and routed through ARC's HVP trust-region
-    // path instead of being downgraded to HybridEFS.
-    let analytic_outer_hessian_available =
-        exact_joint_spatial_outer_hessian_available(&family, baseline_design);
-    let prefer_gradient_only = false;
-
-    log::trace!(
-        "[spatial-iso-joint] starting analytic optimization: rho_dim={}, kappa_dim={}, dims_per_term={:?}",
-        rho_dim,
-        kappa_dim,
-        dims_per_term,
-    );
-
-    struct IsoJointContext<'d> {
-        data: ArrayView2<'d, f64>,
-        rho_dim: usize,
-        cache: SingleBlockExactJointDesignCache<'d>,
-        evaluator: crate::estimate::ExternalJointHyperEvaluator<'d>,
-    }
-
-    impl<'d> IsoJointContext<'d> {
-        /// Full evaluation on the current realized design + hyper_dirs.
-        fn eval_full(
-            &mut self,
-            theta: &Array1<f64>,
-            order: OuterEvalOrder,
-            analytic_outer_hessian_available: bool,
-        ) -> Result<
-            (
-                f64,
-                Array1<f64>,
-                crate::solver::outer_strategy::HessianResult,
-            ),
-            EstimationError,
-        > {
-            let allow_second_order = matches!(order, OuterEvalOrder::ValueGradientHessian)
-                && analytic_outer_hessian_available;
-            if let Some(eval) = self.cache.memoized_eval(theta) {
-                let cached_satisfies_order = !allow_second_order || eval.2.is_analytic();
-                if cached_satisfies_order {
-                    return Ok(eval);
-                }
-            }
-            self.cache
-                .ensure_theta(theta)
-                .map_err(EstimationError::InvalidInput)?;
-            let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
-                self.data,
-                self.cache.spec(),
-                self.cache.design(),
-                &self.cache.spatial_terms,
-            )?
-            .ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "failed to build isotropic hyper_dirs at current kappa".to_string(),
-                )
-            })?;
-
-            let design_revision = Some(self.cache.design_revision());
-            let eval = evaluate_joint_reml_outer_eval_at_theta(
-                &mut self.evaluator,
-                self.cache.design(),
-                theta,
-                self.rho_dim,
-                hyper_dirs,
-                None,
-                if allow_second_order {
-                    order
-                } else {
-                    OuterEvalOrder::ValueAndGradient
-                },
-                design_revision,
-            );
-            if let Ok(ref value) = eval {
-                self.cache.store_eval(value.clone());
-            }
-            eval
-        }
-
-        fn eval_efs(
-            &mut self,
-            theta: &Array1<f64>,
-        ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
-            self.cache
-                .ensure_theta(theta)
-                .map_err(EstimationError::InvalidInput)?;
-            let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
-                self.data,
-                self.cache.spec(),
-                self.cache.design(),
-                &self.cache.spatial_terms,
-            )?
-            .ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "failed to build isotropic hyper_dirs for exact-joint EFS".to_string(),
-                )
-            })?;
-            let design_revision = Some(self.cache.design_revision());
-            evaluate_joint_reml_efs_at_theta(
-                &mut self.evaluator,
-                self.cache.design(),
-                theta,
-                self.rho_dim,
-                hyper_dirs,
-                None,
-                design_revision,
-            )
-        }
-
-        /// Cost-only evaluation. BFGS line-search probes only need the cost,
-        /// not the gradient or Hessian. The previous implementation called
-        /// `eval_full(.., ValueAndGradient, ..)`, which built the full
-        /// `try_build_spatial_log_kappa_hyper_dirs` set and then assembled a
-        /// gradient that was thrown away — turning every probe into a full
-        /// `(V, ∇V)` evaluation. Here we route through the evaluator's true
-        /// value-only path (`evaluate_cost_only`), which skips both the
-        /// hyper-direction construction and the gradient assembly.
-        ///
-        /// The split borrow on `self.cache` (immutable, for the design)
-        /// and `self.evaluator` (mutable) is the same disjoint-field
-        /// pattern already used by `eval_full` above.
-        fn eval_cost(&mut self, theta: &Array1<f64>) -> f64 {
-            if let Some(cost) = self.cache.memoized_cost(theta) {
-                return cost;
-            }
-            if self.cache.ensure_theta(theta).is_err() {
-                return f64::INFINITY;
-            }
-            let design_revision = Some(self.cache.design_revision());
-            let result = {
-                let design = self.cache.design();
-                self.evaluator.evaluate_cost_only(
-                    &design.design,
-                    &design.penalties,
-                    &design.nullspace_dims,
-                    design.linear_constraints.clone(),
-                    theta,
-                    self.rho_dim,
-                    None,
-                    "spatial-iso-joint cost-only",
-                    design_revision,
-                )
-            };
-            match result {
-                Ok(cost) => {
-                    self.cache.store_cost(cost);
-                    cost
-                }
-                Err(_) => f64::INFINITY,
-            }
-        }
-
-        fn reset(&mut self) {
-            self.cache.current_theta = None;
-            self.cache.last_cost = None;
-            self.cache.last_eval = None;
-        }
-    }
-
-    let mut ctx = IsoJointContext {
-        data,
-        rho_dim,
-        cache: SingleBlockExactJointDesignCache::new(
-            data,
-            resolvedspec.clone(),
-            baseline_design.clone(),
-            spatial_terms.to_vec(),
-            rho_dim,
-            dims_per_term.to_vec(),
-        )
-        .map_err(EstimationError::InvalidInput)?,
-        evaluator: crate::estimate::ExternalJointHyperEvaluator::new(
-            y,
-            weights,
-            &baseline_design.design,
-            offset,
-            &baseline_design.penalties,
-            &external_opts_for_design(&family, baseline_design, options),
-            "spatial-iso-joint",
-        )?,
-    };
-
-    let problem = exact_joint_multistart_outer_problem(
-        theta0,
-        lower,
-        upper,
-        rho_dim,
-        kappa_dim,
-        theta_dim,
-        Derivative::Analytic,
-        if analytic_outer_hessian_available {
-            DeclaredHessianForm::Either
-        } else {
-            DeclaredHessianForm::Unavailable
-        },
-        prefer_gradient_only,
-        // Single-block spatial path: penalty-like rho + spatial psi.
-        // EFS/HybridEFS remain eligible; the Wood-Fasiolo PSD structure holds
-        // for single-block families with β-independent joint H_L.
-        false,
-        seed_risk_profile_for_likelihood_family(&family),
-        kappa_options.rel_tol.max(1e-6),
-        kappa_options.max_outer_iter.max(1),
-        // Rho-axis cap: log-λ natural step ≈ 5.
-        Some(5.0),
-        // Psi-axis cap: kappa scale needs ~ln 2 per iter.
-        Some(kappa_options.log_step.clamp(0.25, 1.0)),
-        None,
-    );
-
-    let eval_outer = |ctx: &mut &mut IsoJointContext<'_>,
-                      theta: &Array1<f64>,
-                      order: OuterEvalOrder|
-     -> Result<OuterEval, EstimationError> {
-        match ctx.eval_full(theta, order, analytic_outer_hessian_available) {
-            Ok((cost, grad, hess)) => Ok(OuterEval {
-                cost,
-                gradient: grad,
-                hessian: hess,
-                inner_beta_hint: None,
-            }),
-            // Mirror the anisotropic path: a trial κ at which the kernel design
-            // / ψ-derivatives cannot be constructed is an infeasible point, so
-            // the gradient/Hessian path retreats (`+∞`) rather than aborting the
-            // whole REML fit. Keeps the gradient path symmetric with the
-            // cost-only path, which already maps the same error to `+∞`.
-            Err(err) if is_recoverable_trial_point_error(&err) => {
-                log::debug!(
-                    "[spatial-iso-joint] trial point infeasible (kernel design \
-                     not constructible at theta={theta:?}): {err}; retreating",
-                );
-                Ok(OuterEval::infeasible(theta_dim))
-            }
-            Err(err) => Err(err),
-        }
-    };
-
-    let mut obj = problem.build_objective_with_eval_order(
-        &mut ctx,
-        |ctx: &mut &mut IsoJointContext<'_>, theta: &Array1<f64>| Ok(ctx.eval_cost(theta)),
-        |ctx: &mut &mut IsoJointContext<'_>, theta: &Array1<f64>| {
-            eval_outer(
-                ctx,
-                theta,
-                if analytic_outer_hessian_available {
-                    OuterEvalOrder::ValueGradientHessian
-                } else {
-                    OuterEvalOrder::ValueAndGradient
-                },
-            )
-        },
-        |ctx: &mut &mut IsoJointContext<'_>, theta: &Array1<f64>, order: OuterEvalOrder| {
-            eval_outer(ctx, theta, order)
-        },
-        Some(|ctx: &mut &mut IsoJointContext<'_>| {
-            ctx.reset();
-        }),
-        Some(|ctx: &mut &mut IsoJointContext<'_>, theta: &Array1<f64>| ctx.eval_efs(theta)),
-    );
-
-    let result = problem.run(&mut obj, "iso-kappa joint REML").map_err(|e| {
-        EstimationError::InvalidInput(format!(
-            "isotropic analytic optimization failed after exhausting strategy fallbacks: {e}"
-        ))
-    })?;
-    if !result.converged {
-        // Mirror `fit_term_collectionwith_exact_spatial_adaptive_regularization`
-        // (commit 0267d082): the strict absolute-floor gradient criterion is too
-        // tight when the outer Hessian carries a near-null direction (η-anchor
-        // drift, ill-conditioned operator-collocation Gram, etc.) — the iterate
-        // settles into a flat valley with ‖g‖_proj at numerical-noise scale
-        // (~1e-5 for cost ~1e1 in double precision) which is above the 1e-6
-        // absolute floor but well below the textbook mgcv `magic` REML rule
-        // ‖g‖_proj ≤ τ·(1 + |f|). Accept the iterate under the rel-to-cost
-        // form when the absolute form has timed out; divergent runs (‖g‖
-        // large relative to |f|) still surface as errors.
-        let rel_to_cost_threshold = options.tol * (1.0_f64 + result.final_value.abs());
-        if let Some(final_grad) = result
-            .final_grad_norm
-            .filter(|v| v.is_finite() && *v <= rel_to_cost_threshold)
-        {
-            log::info!(
-                "[spatial-iso-joint] outer optimization hit max_iter={} but \
-                 projected gradient norm {:.3e} ≤ τ·(1+|f|) = {:.3e} \
-                 (τ={:.3e}, |f|={:.3e}); accepting iterate under the mgcv-style \
-                 relative-to-cost REML convergence criterion.",
-                result.iterations,
-                final_grad,
-                rel_to_cost_threshold,
-                options.tol,
-                result.final_value.abs(),
-            );
-        } else {
-            crate::bail_invalid_estim!(
-                "isotropic analytic optimization did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
-                result.iterations,
-                result.final_value,
-                result.final_grad_norm_report(),
-            );
-        }
-    }
-    log::trace!(
-        "[spatial-iso-joint] converged in {} iterations, final_value={:.6e}, grad_norm={}",
-        result.iterations,
-        result.final_value,
-        result.final_grad_norm_report(),
-    );
-    Ok((result.rho, result.final_value))
 }
 
 fn set_spatial_length_scale(
@@ -22247,6 +21943,169 @@ mod tests {
             pass,
             "Gaussian Identity FD failed; worst_psi_rel={worst:.3e}\n  {}",
             violations.join("\n  ")
+        );
+    }
+
+    /// Parity test for the unified exact-spatial joint optimizer (issue #427).
+    ///
+    /// Before unification, anisotropic and isotropic spatial joint optimization
+    /// were two near-identical functions that differed only in diagnostic
+    /// labels. The shared engine `run_exact_joint_spatial_optimization` now
+    /// drives both, selected by `SpatialHyperKind`. For a 1-D spatial term the
+    /// two coordinate kinds are mathematically identical — `dims_per_term ==
+    /// [1]`, so each carries exactly one log-scale coordinate per term and both
+    /// route the same θ through `try_build_spatial_log_kappa_hyper_dirs`. The
+    /// converged hyperparameters and certified REML cost must therefore agree to
+    /// numerical round-off when the engine is invoked under either kind with
+    /// identical inputs. Any divergence would mean the kind discriminator leaked
+    /// into the numerics rather than staying confined to labels.
+    #[test]
+    fn exact_spatial_joint_engine_aniso_iso_parity_1d() {
+        let n = 80usize;
+        let mut data = Array2::<f64>::zeros((n, 1));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = t;
+            let eta = 1.4 * (2.0 * std::f64::consts::PI * t).sin() + 0.5 * (t - 0.5);
+            y[i] = eta + 0.7 * (3.7 * (i as f64) + 1.0).sin();
+        }
+        let weights = Array1::<f64>::ones(n);
+        let offset = Array1::<f64>::zeros(n);
+        let family = LikelihoodSpec::gaussian_identity();
+
+        // 1-D Duchon term: a single log-scale axis (dims_per_term == [1]), the
+        // shared geometry across both coordinate kinds.
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "parity_1d".to_string(),
+                basis: SmoothBasisSpec::Duchon {
+                    feature_cols: vec![0],
+                    spec: DuchonBasisSpec {
+                        periodic: None,
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+                        length_scale: Some(1.0),
+                        power: 1.0,
+                        nullspace_order: DuchonNullspaceOrder::Linear,
+                        identifiability: SpatialIdentifiability::default(),
+                        aniso_log_scales: None,
+                        operator_penalties: DuchonOperatorPenaltySpec::default(),
+                        boundary: OneDimensionalBoundary::Open,
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+                joint_null_rotation: None,
+            }],
+        };
+        let fit_opts = FitOptions {
+            compute_inference: false,
+            max_iter: 200,
+            tol: 1e-12,
+            penalty_shrinkage_floor: None,
+            ..FitOptions::default()
+        };
+
+        let design = build_term_collection_design(data.view(), &spec).expect("design");
+        let frozen = freeze_term_collection_from_design(&spec, &design).expect("freeze");
+        let frozen_design =
+            build_term_collection_design(data.view(), &frozen).expect("frozen design");
+        let spatial_terms = spatial_length_scale_term_indices(&frozen);
+        assert_eq!(spatial_terms.len(), 1, "expect a single spatial term");
+        let dims_per_term = spatial_dims_per_term(&frozen, &spatial_terms);
+        assert_eq!(dims_per_term, vec![1], "expect one log-scale axis");
+        let rho_dim = frozen_design.penalties.len();
+        assert!(rho_dim >= 1, "expect at least one penalty block");
+
+        // Construct the joint setup exactly as the production caller does,
+        // shared verbatim between the two engine invocations so that any
+        // difference in the result can only come from the coordinate kind.
+        const JOINT_RHO_BOUND: f64 = 12.0;
+        let kappa_options = SpatialLengthScaleOptimizationOptions::default();
+        let log_kappa0 =
+            SpatialLogKappaCoords::from_length_scales(&frozen, &spatial_terms, &kappa_options);
+        let log_kappa_lower = SpatialLogKappaCoords::lower_bounds_from_data(
+            data.view(),
+            &frozen,
+            &spatial_terms,
+            &kappa_options,
+        );
+        let log_kappa_upper = SpatialLogKappaCoords::upper_bounds_from_data(
+            data.view(),
+            &frozen,
+            &spatial_terms,
+            &kappa_options,
+        );
+        let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
+        let setup = ExactJointHyperSetup::new(
+            Array1::<f64>::zeros(rho_dim), // log λ seed (λ = 1)
+            Array1::<f64>::from_elem(rho_dim, -JOINT_RHO_BOUND),
+            Array1::<f64>::from_elem(rho_dim, JOINT_RHO_BOUND),
+            log_kappa0,
+            log_kappa_lower,
+            log_kappa_upper,
+        );
+        let theta0 = setup.theta0();
+        let lower = setup.lower();
+        let upper = setup.upper();
+
+        let run = |kind: SpatialHyperKind| -> (Array1<f64>, f64) {
+            run_exact_joint_spatial_optimization(
+                kind,
+                data.view(),
+                y.view(),
+                weights.view(),
+                offset.view(),
+                &frozen,
+                &frozen_design,
+                family.clone(),
+                &fit_opts,
+                &spatial_terms,
+                &dims_per_term,
+                &theta0,
+                &lower,
+                &upper,
+                rho_dim,
+                &kappa_options,
+            )
+            .expect("exact joint spatial optimization")
+        };
+
+        let (theta_aniso, value_aniso) = run(SpatialHyperKind::Anisotropic);
+        let (theta_iso, value_iso) = run(SpatialHyperKind::Isotropic);
+
+        assert_eq!(
+            theta_aniso.len(),
+            theta_iso.len(),
+            "converged θ dimension must match across coordinate kinds"
+        );
+        // In 1-D the two kinds are numerically identical: the only difference is
+        // diagnostic labels, so converged hyperparameters and the certified REML
+        // cost must agree to round-off. No tolerance weakening — this is an
+        // equality, not an approximation.
+        for j in 0..theta_aniso.len() {
+            let diff = (theta_aniso[j] - theta_iso[j]).abs();
+            assert!(
+                diff <= 1e-9 * (1.0 + theta_aniso[j].abs()),
+                "θ[{j}] differs across kinds: aniso={:+.12e} iso={:+.12e} diff={:.3e}",
+                theta_aniso[j],
+                theta_iso[j],
+                diff,
+            );
+        }
+        let value_diff = (value_aniso - value_iso).abs();
+        assert!(
+            value_diff <= 1e-9 * (1.0 + value_aniso.abs()),
+            "final REML value differs across kinds: aniso={:+.12e} iso={:+.12e} diff={:.3e}",
+            value_aniso,
+            value_iso,
+            value_diff,
+        );
+        assert!(
+            value_aniso.is_finite() && value_iso.is_finite(),
+            "both kinds must produce a finite certified REML cost"
         );
     }
 
