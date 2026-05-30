@@ -22,15 +22,19 @@ on:
       - ".github/workflows/reference-quality.yml"
   workflow_dispatch: {}
 
+# Do NOT cancel an in-progress run when a new push lands: this job is a slow
+# (full R+Python stack install + ~130 test-binary builds) match-vs-diverge
+# DASHBOARD, not a fast gate. Cancelling on every push means it never reaches
+# the "Run quality suite" summary. Let each run finish; newer pushes queue.
 concurrency:
   group: reference-quality-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   reference-quality:
     name: Reference quality vs mature tools
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     steps:
       - name: Checkout
         uses: actions/checkout@v5
