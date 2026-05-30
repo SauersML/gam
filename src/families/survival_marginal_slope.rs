@@ -2312,21 +2312,7 @@ impl BlockHessianAccumulator {
 
     fn into_operator(self, slices: BlockSlices) -> BlockHessianOperator {
         BlockHessianOperator {
-            h_tt: self.h_tt,
-            h_mm: self.h_mm,
-            h_gg: self.h_gg,
-            h_hh: self.h_hh,
-            h_ww: self.h_ww,
-            h_tm: self.h_tm,
-            h_tg: self.h_tg,
-            h_th: self.h_th,
-            h_tw: self.h_tw,
-            h_mg: self.h_mg,
-            h_mh: self.h_mh,
-            h_mw: self.h_mw,
-            h_gh: self.h_gh,
-            h_gw: self.h_gw,
-            h_hw: self.h_hw,
+            blocks: self,
             slices,
         }
     }
@@ -2988,22 +2974,15 @@ impl BlockHessianAccumulator {
 /// Block-structured HyperOperator for survival marginal-slope psi Hessians.
 /// Stores the full 5-block exact joint Hessian layout and performs matvec
 /// blockwise instead of materializing dense p×p structure in the outer path.
+/// `HyperOperator` view over a populated [`BlockHessianAccumulator`].
+///
+/// The operator owns the *same* block storage as the dense path — there is
+/// no second copy of the 15 cross-block matrices and no second block-layout
+/// implementation. The matvec/bilinear here and `to_dense` (which simply
+/// scatters via [`BlockHessianAccumulator::to_dense`]) are guaranteed to be
+/// consistent because they read one accumulator through one `BlockSlices`.
 struct BlockHessianOperator {
-    h_tt: Array2<f64>,
-    h_mm: Array2<f64>,
-    h_gg: Array2<f64>,
-    h_hh: Array2<f64>,
-    h_ww: Array2<f64>,
-    h_tm: Array2<f64>,
-    h_tg: Array2<f64>,
-    h_th: Array2<f64>,
-    h_tw: Array2<f64>,
-    h_mg: Array2<f64>,
-    h_mh: Array2<f64>,
-    h_mw: Array2<f64>,
-    h_gh: Array2<f64>,
-    h_gw: Array2<f64>,
-    h_hw: Array2<f64>,
+    blocks: BlockHessianAccumulator,
     slices: BlockSlices,
 }
 
@@ -3038,62 +3017,63 @@ impl HyperOperator for BlockHessianOperator {
             .link_dev
             .as_ref()
             .map(|range| v.slice(s![range.clone()]));
+        let b = &self.blocks;
         out.fill(0.0);
         {
             let mut o_t = out.slice_mut(s![self.slices.time.clone()]);
-            o_t += &self.h_tt.dot(&v_t);
-            o_t += &self.h_tm.dot(&v_m);
-            o_t += &self.h_tg.dot(&v_g);
+            o_t += &b.h_tt.dot(&v_t);
+            o_t += &b.h_tm.dot(&v_m);
+            o_t += &b.h_tg.dot(&v_g);
             if let Some(v_h) = v_h.as_ref() {
-                o_t += &self.h_th.dot(v_h);
+                o_t += &b.h_th.dot(v_h);
             }
             if let Some(v_w) = v_w.as_ref() {
-                o_t += &self.h_tw.dot(v_w);
+                o_t += &b.h_tw.dot(v_w);
             }
         }
         {
             let mut o_m = out.slice_mut(s![self.slices.marginal.clone()]);
-            o_m += &self.h_tm.t().dot(&v_t);
-            o_m += &self.h_mm.dot(&v_m);
-            o_m += &self.h_mg.dot(&v_g);
+            o_m += &b.h_tm.t().dot(&v_t);
+            o_m += &b.h_mm.dot(&v_m);
+            o_m += &b.h_mg.dot(&v_g);
             if let Some(v_h) = v_h.as_ref() {
-                o_m += &self.h_mh.dot(v_h);
+                o_m += &b.h_mh.dot(v_h);
             }
             if let Some(v_w) = v_w.as_ref() {
-                o_m += &self.h_mw.dot(v_w);
+                o_m += &b.h_mw.dot(v_w);
             }
         }
         {
             let mut o_g = out.slice_mut(s![self.slices.logslope.clone()]);
-            o_g += &self.h_tg.t().dot(&v_t);
-            o_g += &self.h_mg.t().dot(&v_m);
-            o_g += &self.h_gg.dot(&v_g);
+            o_g += &b.h_tg.t().dot(&v_t);
+            o_g += &b.h_mg.t().dot(&v_m);
+            o_g += &b.h_gg.dot(&v_g);
             if let Some(v_h) = v_h.as_ref() {
-                o_g += &self.h_gh.dot(v_h);
+                o_g += &b.h_gh.dot(v_h);
             }
             if let Some(v_w) = v_w.as_ref() {
-                o_g += &self.h_gw.dot(v_w);
+                o_g += &b.h_gw.dot(v_w);
             }
         }
         if let (Some(range), Some(v_h)) = (self.slices.score_warp.as_ref(), v_h.as_ref()) {
             let mut o_h = out.slice_mut(s![range.clone()]);
-            o_h += &self.h_th.t().dot(&v_t);
-            o_h += &self.h_mh.t().dot(&v_m);
-            o_h += &self.h_gh.t().dot(&v_g);
-            o_h += &self.h_hh.dot(v_h);
+            o_h += &b.h_th.t().dot(&v_t);
+            o_h += &b.h_mh.t().dot(&v_m);
+            o_h += &b.h_gh.t().dot(&v_g);
+            o_h += &b.h_hh.dot(v_h);
             if let Some(v_w) = v_w.as_ref() {
-                o_h += &self.h_hw.dot(v_w);
+                o_h += &b.h_hw.dot(v_w);
             }
         }
         if let (Some(range), Some(v_w)) = (self.slices.link_dev.as_ref(), v_w.as_ref()) {
             let mut o_w = out.slice_mut(s![range.clone()]);
-            o_w += &self.h_tw.t().dot(&v_t);
-            o_w += &self.h_mw.t().dot(&v_m);
-            o_w += &self.h_gw.t().dot(&v_g);
+            o_w += &b.h_tw.t().dot(&v_t);
+            o_w += &b.h_mw.t().dot(&v_m);
+            o_w += &b.h_gw.t().dot(&v_g);
             if let Some(v_h) = v_h.as_ref() {
-                o_w += &self.h_hw.t().dot(v_h);
+                o_w += &b.h_hw.t().dot(v_h);
             }
-            o_w += &self.h_ww.dot(v_w);
+            o_w += &b.h_ww.dot(v_w);
         }
     }
 
@@ -3124,124 +3104,52 @@ impl HyperOperator for BlockHessianOperator {
             .link_dev
             .as_ref()
             .map(|range| u.slice(s![range.clone()]));
-        let mut total = v_t.dot(&self.h_tt.dot(&u_t));
-        total += v_m.dot(&self.h_mm.dot(&u_m));
-        total += v_g.dot(&self.h_gg.dot(&u_g));
+        let b = &self.blocks;
+        let mut total = v_t.dot(&b.h_tt.dot(&u_t));
+        total += v_m.dot(&b.h_mm.dot(&u_m));
+        total += v_g.dot(&b.h_gg.dot(&u_g));
         if let (Some(v_h), Some(u_h)) = (v_h.as_ref(), u_h.as_ref()) {
-            total += v_h.dot(&self.h_hh.dot(u_h));
+            total += v_h.dot(&b.h_hh.dot(u_h));
         }
         if let (Some(v_w), Some(u_w)) = (v_w.as_ref(), u_w.as_ref()) {
-            total += v_w.dot(&self.h_ww.dot(u_w));
+            total += v_w.dot(&b.h_ww.dot(u_w));
         }
-        total += v_t.dot(&self.h_tm.dot(&u_m));
-        total += v_m.dot(&self.h_tm.t().dot(&u_t));
-        total += v_t.dot(&self.h_tg.dot(&u_g));
-        total += v_g.dot(&self.h_tg.t().dot(&u_t));
-        total += v_m.dot(&self.h_mg.dot(&u_g));
-        total += v_g.dot(&self.h_mg.t().dot(&u_m));
+        total += v_t.dot(&b.h_tm.dot(&u_m));
+        total += v_m.dot(&b.h_tm.t().dot(&u_t));
+        total += v_t.dot(&b.h_tg.dot(&u_g));
+        total += v_g.dot(&b.h_tg.t().dot(&u_t));
+        total += v_m.dot(&b.h_mg.dot(&u_g));
+        total += v_g.dot(&b.h_mg.t().dot(&u_m));
         if let (Some(v_h), Some(u_h)) = (v_h.as_ref(), u_h.as_ref()) {
-            total += v_t.dot(&self.h_th.dot(u_h));
-            total += v_h.dot(&self.h_th.t().dot(&u_t));
-            total += v_m.dot(&self.h_mh.dot(u_h));
-            total += v_h.dot(&self.h_mh.t().dot(&u_m));
-            total += v_g.dot(&self.h_gh.dot(u_h));
-            total += v_h.dot(&self.h_gh.t().dot(&u_g));
+            total += v_t.dot(&b.h_th.dot(u_h));
+            total += v_h.dot(&b.h_th.t().dot(&u_t));
+            total += v_m.dot(&b.h_mh.dot(u_h));
+            total += v_h.dot(&b.h_mh.t().dot(&u_m));
+            total += v_g.dot(&b.h_gh.dot(u_h));
+            total += v_h.dot(&b.h_gh.t().dot(&u_g));
         }
         if let (Some(v_w), Some(u_w)) = (v_w.as_ref(), u_w.as_ref()) {
-            total += v_t.dot(&self.h_tw.dot(u_w));
-            total += v_w.dot(&self.h_tw.t().dot(&u_t));
-            total += v_m.dot(&self.h_mw.dot(u_w));
-            total += v_w.dot(&self.h_mw.t().dot(&u_m));
-            total += v_g.dot(&self.h_gw.dot(u_w));
-            total += v_w.dot(&self.h_gw.t().dot(&u_g));
+            total += v_t.dot(&b.h_tw.dot(u_w));
+            total += v_w.dot(&b.h_tw.t().dot(&u_t));
+            total += v_m.dot(&b.h_mw.dot(u_w));
+            total += v_w.dot(&b.h_mw.t().dot(&u_m));
+            total += v_g.dot(&b.h_gw.dot(u_w));
+            total += v_w.dot(&b.h_gw.t().dot(&u_g));
         }
         if let ((Some(v_h), Some(u_w)), (Some(v_w), Some(u_h))) =
             ((v_h.as_ref(), u_w.as_ref()), (v_w.as_ref(), u_h.as_ref()))
         {
-            total += v_h.dot(&self.h_hw.dot(u_w));
-            total += v_w.dot(&self.h_hw.t().dot(u_h));
+            total += v_h.dot(&b.h_hw.dot(u_w));
+            total += v_w.dot(&b.h_hw.t().dot(u_h));
         }
         total
     }
 
     fn to_dense(&self) -> Array2<f64> {
-        let mut out = Array2::zeros((self.slices.total, self.slices.total));
-        out.slice_mut(s![self.slices.time.clone(), self.slices.time.clone()])
-            .assign(&self.h_tt);
-        out.slice_mut(s![
-            self.slices.marginal.clone(),
-            self.slices.marginal.clone()
-        ])
-        .assign(&self.h_mm);
-        out.slice_mut(s![
-            self.slices.logslope.clone(),
-            self.slices.logslope.clone()
-        ])
-        .assign(&self.h_gg);
-        if let Some(range) = self.slices.score_warp.as_ref() {
-            out.slice_mut(s![range.clone(), range.clone()])
-                .assign(&self.h_hh);
-        }
-        if let Some(range) = self.slices.link_dev.as_ref() {
-            out.slice_mut(s![range.clone(), range.clone()])
-                .assign(&self.h_ww);
-        }
-        out.slice_mut(s![self.slices.time.clone(), self.slices.marginal.clone()])
-            .assign(&self.h_tm);
-        out.slice_mut(s![self.slices.marginal.clone(), self.slices.time.clone()])
-            .assign(&self.h_tm.t());
-        out.slice_mut(s![self.slices.time.clone(), self.slices.logslope.clone()])
-            .assign(&self.h_tg);
-        out.slice_mut(s![self.slices.logslope.clone(), self.slices.time.clone()])
-            .assign(&self.h_tg.t());
-        out.slice_mut(s![
-            self.slices.marginal.clone(),
-            self.slices.logslope.clone()
-        ])
-        .assign(&self.h_mg);
-        out.slice_mut(s![
-            self.slices.logslope.clone(),
-            self.slices.marginal.clone()
-        ])
-        .assign(&self.h_mg.t());
-        if let Some(range) = self.slices.score_warp.as_ref() {
-            out.slice_mut(s![self.slices.time.clone(), range.clone()])
-                .assign(&self.h_th);
-            out.slice_mut(s![range.clone(), self.slices.time.clone()])
-                .assign(&self.h_th.t());
-            out.slice_mut(s![self.slices.marginal.clone(), range.clone()])
-                .assign(&self.h_mh);
-            out.slice_mut(s![range.clone(), self.slices.marginal.clone()])
-                .assign(&self.h_mh.t());
-            out.slice_mut(s![self.slices.logslope.clone(), range.clone()])
-                .assign(&self.h_gh);
-            out.slice_mut(s![range.clone(), self.slices.logslope.clone()])
-                .assign(&self.h_gh.t());
-        }
-        if let Some(range) = self.slices.link_dev.as_ref() {
-            out.slice_mut(s![self.slices.time.clone(), range.clone()])
-                .assign(&self.h_tw);
-            out.slice_mut(s![range.clone(), self.slices.time.clone()])
-                .assign(&self.h_tw.t());
-            out.slice_mut(s![self.slices.marginal.clone(), range.clone()])
-                .assign(&self.h_mw);
-            out.slice_mut(s![range.clone(), self.slices.marginal.clone()])
-                .assign(&self.h_mw.t());
-            out.slice_mut(s![self.slices.logslope.clone(), range.clone()])
-                .assign(&self.h_gw);
-            out.slice_mut(s![range.clone(), self.slices.logslope.clone()])
-                .assign(&self.h_gw.t());
-        }
-        if let (Some(h_range), Some(w_range)) = (
-            self.slices.score_warp.as_ref(),
-            self.slices.link_dev.as_ref(),
-        ) {
-            out.slice_mut(s![h_range.clone(), w_range.clone()])
-                .assign(&self.h_hw);
-            out.slice_mut(s![w_range.clone(), h_range.clone()])
-                .assign(&self.h_hw.t());
-        }
-        out
+        // Single block-layout source of truth: the operator densifies through
+        // exactly the same scatter the dense path uses, so the dense and
+        // operator Hessians are bit-identical by construction.
+        self.blocks.to_dense(&self.slices)
     }
 
     fn is_implicit(&self) -> bool {
@@ -12877,14 +12785,19 @@ impl SurvivalMarginalSlopeFamily {
     /// `options.outer_score_subsample` is `Some`, only the masked rows are
     /// visited and the accumulator uses per-row Horvitz-Thompson
     /// inverse-inclusion weights before being densified.
-    pub(crate) fn psi_hessian_directional_derivative_with_options(
+    /// Shared engine for the per-ψ Hessian directional derivative. Runs the
+    /// per-row accumulation once and returns the populated block-Hessian
+    /// accumulator together with its block slices; the dense and operator
+    /// public variants are thin adapters that scatter or wrap this single
+    /// accumulator, so the dense and operator paths can never disagree.
+    fn psi_hessian_directional_derivative_accumulator(
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
         options: &BlockwiseFitOptions,
-    ) -> Result<Option<Array2<f64>>, String> {
+    ) -> Result<Option<(BlockHessianAccumulator, BlockSlices)>, String> {
         let flex_active = self.effective_flex_active(block_states)?;
         let flex_primary = flex_active.then(|| flex_primary_slices(self));
         let slices = block_slices(self, block_states);
@@ -13070,7 +12983,32 @@ impl SurvivalMarginalSlopeFamily {
             },
         )?;
 
-        Ok(Some(acc.to_dense(&slices)))
+        Ok(Some((acc, slices)))
+    }
+
+    /// Outer-aware variant of `psi_hessian_directional_derivative` that
+    /// returns the dense block Hessian directional derivative. When
+    /// `options.outer_score_subsample` is `Some`, only the masked rows are
+    /// visited and the accumulator uses per-row Horvitz-Thompson
+    /// inverse-inclusion weights before being densified. Thin adapter over
+    /// [`Self::psi_hessian_directional_derivative_accumulator`].
+    pub(crate) fn psi_hessian_directional_derivative_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<Array2<f64>>, String> {
+        Ok(self
+            .psi_hessian_directional_derivative_accumulator(
+                block_states,
+                derivative_blocks,
+                psi_index,
+                d_beta_flat,
+                options,
+            )?
+            .map(|(acc, slices)| acc.to_dense(&slices)))
     }
 
     /// Outer-aware operator builder for the per-ψ Hessian directional
@@ -13086,192 +13024,17 @@ impl SurvivalMarginalSlopeFamily {
         d_beta_flat: &Array1<f64>,
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
-        let flex_active = self.effective_flex_active(block_states)?;
-        let flex_primary = flex_active.then(|| flex_primary_slices(self));
-        let slices = block_slices(self, block_states);
-        let Some((block_idx, local_idx, p_psi, psi_label)) =
-            self.psi_block_info(derivative_blocks, psi_index)?
-        else {
-            return Ok(None);
-        };
-        let deriv = &derivative_blocks[block_idx][local_idx];
-        let loading = if let Some(primary) = flex_primary.as_ref() {
-            spatial_block_primary_loading_flex(primary, block_idx)?
-        } else {
-            spatial_block_primary_loading(block_idx)?
-        };
-        let beta_psi = match block_idx {
-            1 => &block_states[1].beta,
-            _ => &block_states[2].beta,
-        };
-        let d_beta_block = match block_idx {
-            1 => d_beta_flat.slice(s![slices.marginal.clone()]),
-            _ => d_beta_flat.slice(s![slices.logslope.clone()]),
-        };
-
-        let timewiggle_active = self.flex_timewiggle_active();
-        let timewiggle_psi = timewiggle_active && block_idx == 1;
-
-        let p_t = slices.time.len();
-        let p_m = slices.marginal.len();
-        let p_g = slices.logslope.len();
-        let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
-        let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
-
-        // Build the psi design map once; rowwise calls use direct row_vector(row).
-        let policy = crate::resource::ResourcePolicy::default_library();
-        let psi_map = crate::families::custom_family::resolve_custom_family_x_psi_map(
-            deriv,
-            self.n,
-            p_psi,
-            0..self.n,
-            psi_label,
-            &policy,
-        )?;
-
-        let row_iter = outer_row_indices(options, self.n).to_vec();
-        let row_weights = outer_row_weights_by_index(options, self.n);
-        // Process fixed row chunks in parallel and merge local cross-block
-        // accumulators in row-chunk order for deterministic timewiggle assembly.
-        let acc = chunked_row_reduction(
-            row_iter.as_slice(),
-            || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
-            |row, acc| -> Result<(), String> {
-                let psi_row = psi_map
-                    .row_vector(row)
-                    .map_err(|e| format!("survival rowwise psi map: {e}"))?;
-
-                let q_geom = if timewiggle_active {
-                    Some(self.row_dynamic_q_geometry(row, block_states)?)
-                } else {
-                    None
-                };
-
-                let psi_lift = if timewiggle_psi {
-                    Some(self.timewiggle_marginal_psi_row_lift(
-                        row,
-                        block_states,
-                        flex_primary.as_ref(),
-                        &psi_row,
-                        beta_psi,
-                    )?)
-                } else {
-                    None
-                };
-
-                let psi_dir = if let Some(lift) = psi_lift.as_ref() {
-                    lift.dir.clone()
-                } else if let Some(primary) = flex_primary.as_ref() {
-                    primary_direction_from_psi_row_flex(primary, block_idx, &psi_row, beta_psi)
-                } else {
-                    primary_direction_from_psi_row(block_idx, &psi_row, beta_psi)
-                };
-                let psi_action = if psi_lift.is_some() {
-                    self.timewiggle_psi_action(
-                        row,
-                        block_states,
-                        &slices,
-                        flex_primary.as_ref(),
-                        &psi_row,
-                        beta_psi,
-                        d_beta_flat,
-                    )?
-                } else if let Some(primary) = flex_primary.as_ref() {
-                    primary_psi_action_from_psi_row_flex(primary, block_idx, &psi_row, d_beta_block)
-                } else {
-                    primary_psi_action_from_psi_row(block_idx, &psi_row, d_beta_block)
-                };
-                let row_dir = self.row_primary_direction_from_flat_dynamic(
-                    row,
-                    block_states,
-                    &slices,
-                    d_beta_flat,
-                )?;
-                let q_geom_lazy;
-                let mut h_pi = if let Some(primary) = flex_primary.as_ref() {
-                    let q_ref = match q_geom.as_ref() {
-                        Some(q) => q,
-                        None => {
-                            q_geom_lazy = self.row_dynamic_q_geometry(row, block_states)?;
-                            &q_geom_lazy
-                        }
-                    };
-                    self.compute_row_flex_primary_gradient_hessian_exact(
-                        row,
-                        block_states,
-                        q_ref,
-                        primary,
-                    )?
-                    .2
-                } else {
-                    self.compute_row_primary_gradient_hessian_uncached(row, block_states)?
-                        .2
-                };
-                let w = row_weights[row];
-                if w != 1.0 {
-                    h_pi.mapv_inplace(|v| v * w);
-                }
-                let mut third_beta =
-                    self.row_primary_third_contracted_general(row, block_states, &row_dir)?;
-                let mut fourth = self.row_primary_fourth_contracted_general(
-                    row,
-                    block_states,
-                    &row_dir,
-                    &psi_dir,
-                )?;
-                if w != 1.0 {
-                    third_beta.mapv_inplace(|v| v * w);
-                    fourth.mapv_inplace(|v| v * w);
-                }
-
-                let right_primary = third_beta.t().dot(&loading);
-                if let Some(q) = q_geom.as_ref() {
-                    acc.add_rank1_psi_cross_with_q_geometry(
-                        self,
-                        row,
-                        q,
-                        block_idx,
-                        &psi_row,
-                        &right_primary,
-                    )?;
-                } else {
-                    acc.add_rank1_psi_cross(self, row, block_idx, &psi_row, &right_primary)?;
-                }
-                if let Some(q) = q_geom.as_ref() {
-                    let zero_grad = Array1::zeros(fourth.nrows());
-                    acc.add_pullback_with_q_geometry(self, row, q, &zero_grad, &fourth)?;
-                } else {
-                    acc.add_pullback(self, row, &fourth)?;
-                }
-                let mut third_action =
-                    self.row_primary_third_contracted_general(row, block_states, &psi_action)?;
-                if w != 1.0 {
-                    third_action.mapv_inplace(|v| v * w);
-                }
-                if let Some(q) = q_geom.as_ref() {
-                    let zero_grad = Array1::zeros(third_action.nrows());
-                    acc.add_pullback_with_q_geometry(self, row, q, &zero_grad, &third_action)?;
-                } else {
-                    acc.add_pullback(self, row, &third_action)?;
-                }
-                if let Some(lift) = psi_lift.as_ref() {
-                    let q = q_geom.as_ref().unwrap();
-                    acc.add_timewiggle_psi_u_cross(self, row, q, lift, &third_beta)?;
-                    let second_pullback_weight = third_beta.dot(&psi_dir) + h_pi.dot(&psi_action);
-                    acc.add_second_pullback_weighted(q, &second_pullback_weight);
-                    let kappa_weight = h_pi.dot(&row_dir);
-                    acc.add_timewiggle_psi_kappa_alpha(self, lift, &kappa_weight);
-                }
-                Ok(())
-            },
-            |total, chunk| {
-                total.add(&chunk);
-            },
-        )?;
-
-        Ok(Some(
-            Arc::new(acc.into_operator(slices)) as Arc<dyn HyperOperator>
-        ))
+        Ok(self
+            .psi_hessian_directional_derivative_accumulator(
+                block_states,
+                derivative_blocks,
+                psi_index,
+                d_beta_flat,
+                options,
+            )?
+            .map(|(acc, slices)| {
+                Arc::new(acc.into_operator(slices)) as Arc<dyn HyperOperator>
+            }))
     }
 
     fn exact_newton_joint_hessian_operator(
@@ -28028,5 +27791,142 @@ mod tests {
             err.contains("violates monotonicity"),
             "expected a monotonicity error, got: {err}",
         );
+    }
+
+    /// Fill every one of the 15 cross-block matrices of a
+    /// `BlockHessianAccumulator` with distinct, deterministic values keyed by
+    /// (block-pair, local-row, local-col) so that a transposed or mis-placed
+    /// block is impossible to miss in the dense/operator parity assertions.
+    fn fill_block_hessian_accumulator(
+        p_t: usize,
+        p_m: usize,
+        p_g: usize,
+        p_h: usize,
+        p_w: usize,
+    ) -> BlockHessianAccumulator {
+        let mut acc = BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w);
+        // Per-pair base offsets keep the diagonal blocks symmetric (required
+        // for a valid Hessian) while making the off-diagonal blocks distinct
+        // and asymmetric, so `to_dense` must place each transpose correctly.
+        let mut sym = |m: &mut Array2<f64>, base: f64| {
+            let (r, c) = m.dim();
+            for i in 0..r {
+                for j in 0..c {
+                    m[[i, j]] = base + (i.min(j) as f64) * 0.5 + (i.max(j) as f64) * 0.25;
+                }
+            }
+        };
+        sym(&mut acc.h_tt, 1.0);
+        sym(&mut acc.h_mm, 2.0);
+        sym(&mut acc.h_gg, 3.0);
+        sym(&mut acc.h_hh, 4.0);
+        sym(&mut acc.h_ww, 5.0);
+        let mut rect = |m: &mut Array2<f64>, base: f64| {
+            let (r, c) = m.dim();
+            for i in 0..r {
+                for j in 0..c {
+                    m[[i, j]] = base + (i as f64) * 1.0 + (j as f64) * 0.1;
+                }
+            }
+        };
+        rect(&mut acc.h_tm, 10.0);
+        rect(&mut acc.h_tg, 20.0);
+        rect(&mut acc.h_th, 30.0);
+        rect(&mut acc.h_tw, 40.0);
+        rect(&mut acc.h_mg, 50.0);
+        rect(&mut acc.h_mh, 60.0);
+        rect(&mut acc.h_mw, 70.0);
+        rect(&mut acc.h_gh, 80.0);
+        rect(&mut acc.h_gw, 90.0);
+        rect(&mut acc.h_hw, 100.0);
+        acc
+    }
+
+    fn full_block_slices(
+        p_t: usize,
+        p_m: usize,
+        p_g: usize,
+        p_h: usize,
+        p_w: usize,
+    ) -> BlockSlices {
+        let time = 0..p_t;
+        let marginal = time.end..time.end + p_m;
+        let logslope = marginal.end..marginal.end + p_g;
+        let score_warp = logslope.end..logslope.end + p_h;
+        let link_dev = score_warp.end..score_warp.end + p_w;
+        let total = link_dev.end;
+        BlockSlices {
+            time,
+            marginal,
+            logslope,
+            score_warp: Some(score_warp),
+            link_dev: Some(link_dev),
+            total,
+        }
+    }
+
+    /// Parity guard for issue #428: the dense and operator block-Hessian
+    /// assembly are now one storage abstraction with a single scatter, so
+    /// `BlockHessianOperator` (the operator wrapping the accumulator) must
+    /// agree *exactly* with the dense scatter — to_dense, matvec, and the
+    /// bilinear form — across the full five-block layout (time, marginal,
+    /// logslope, score_warp, link_dev) that the directional-derivative path
+    /// produces. Any future reintroduction of a second, divergent block
+    /// layout would break this test.
+    #[test]
+    fn block_hessian_dense_operator_parity_all_five_blocks() {
+        let (p_t, p_m, p_g, p_h, p_w) = (3usize, 2, 2, 3, 2);
+        let slices = full_block_slices(p_t, p_m, p_g, p_h, p_w);
+        let acc = fill_block_hessian_accumulator(p_t, p_m, p_g, p_h, p_w);
+
+        // The dense reference scatter (single source of truth).
+        let dense = acc.to_dense(&slices);
+        assert_eq!(dense.dim(), (slices.total, slices.total));
+
+        // The full block Hessian must be symmetric: each off-diagonal block
+        // appears with its transpose at the mirrored location.
+        for i in 0..slices.total {
+            for j in 0..slices.total {
+                assert_relative_eq!(dense[[i, j]], dense[[j, i]], max_relative = 1e-12);
+            }
+        }
+
+        // Operator densification must equal the dense scatter bit-for-bit:
+        // both now route through `BlockHessianAccumulator::to_dense`.
+        let op = acc.into_operator(slices.clone());
+        let op_dense = op.to_dense();
+        assert_eq!(op_dense.dim(), dense.dim());
+        for i in 0..slices.total {
+            for j in 0..slices.total {
+                assert_eq!(
+                    op_dense[[i, j]],
+                    dense[[i, j]],
+                    "operator/dense mismatch at ({i}, {j})",
+                );
+            }
+        }
+
+        // Matvec parity: operator.mul_vec(v) == dense.dot(v) for arbitrary v,
+        // including the directional-derivative use (the operator is exactly
+        // what the operator-variant directional path returns).
+        let v: Array1<f64> =
+            Array1::from_iter((0..slices.total).map(|k| 0.7 + (k as f64) * 0.31 - 0.05 * k as f64));
+        let u: Array1<f64> =
+            Array1::from_iter((0..slices.total).map(|k| -1.3 + (k as f64) * 0.17));
+        let mv = op.mul_vec(&v);
+        let dense_mv = dense.dot(&v);
+        for k in 0..slices.total {
+            assert_relative_eq!(mv[k], dense_mv[k], max_relative = 1e-12);
+        }
+        // The view-based matvec must match the owned one exactly.
+        let mv_view = op.mul_vec_view(v.view());
+        for k in 0..slices.total {
+            assert_eq!(mv_view[k], mv[k]);
+        }
+
+        // Bilinear parity: operator.bilinear(v, u) == vᵀ · dense · u.
+        let bil = op.bilinear(&v, &u);
+        let dense_bil = v.dot(&dense.dot(&u));
+        assert_relative_eq!(bil, dense_bil, max_relative = 1e-12);
     }
 }
