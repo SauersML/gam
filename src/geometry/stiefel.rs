@@ -177,9 +177,53 @@ impl RiemannianManifold for StiefelManifold {
         ))
     }
 
+    /// Gram matrix of the **canonical metric**
+    /// `⟨Δ₁, Δ₂⟩ = tr(Δ₁ᵀ(I − ½YYᵀ)Δ₂)`, expressed in the flattened ambient
+    /// basis so that `quad_form(G, vec(Δ₁), vec(Δ₂))` reproduces this inner
+    /// product. This is the *same* metric whose geodesic is implemented by
+    /// [`exp_map`](Self::exp_map); returning the embedded/Euclidean identity
+    /// here would contradict the geodesic for `k ≥ 2` (the two metrics differ
+    /// off the `YᵀΔ = 0` subspace).
+    ///
+    /// With the row-major flatten `vec(Δ)[i·k + j] = Δ[i, j]`
+    /// (see [`flatten`](crate::geometry::manifold)), the metric factorizes as
+    /// the Kronecker product `(I − ½YYᵀ) ⊗ I_k`: entry `M[i, p]` of the n×n
+    /// matrix `M = I − ½YYᵀ` scales the `k×k` identity block coupling rows `i`
+    /// and `p`, i.e. `G[i·k + j, p·k + q] = M[i, p] · δ_{j, q}`.
+    ///
+    /// For `k == 1` the Stiefel manifold is the unit sphere; dispatch to
+    /// [`SphereManifold`], whose embedded metric coincides with the canonical
+    /// metric on the (one-dimensional-codimension) tangent space `YᵀΔ = 0` and
+    /// whose [`exp_map`](SphereManifold::exp_map) is likewise the genuine
+    /// Riemannian exponential, so metric and geodesic remain consistent.
     fn metric_tensor(&self, point: ArrayView1<'_, f64>) -> GeometryResult<Array2<f64>> {
-        check_len("Stiefel metric point", point.len(), self.ambient_dim())?;
-        Ok(identity(self.ambient_dim()))
+        if let Some(sphere) = self.as_sphere() {
+            return sphere.metric_tensor(point);
+        }
+        let y = from_flat(point, self.n, self.k)?;
+        // M = I_n − ½ Y Yᵀ (n×n, symmetric positive definite for Yᵀ Y = I_k).
+        let mut m = identity(self.n);
+        for i in 0..self.n {
+            for p in 0..self.n {
+                let mut yyt = 0.0;
+                for s in 0..self.k {
+                    yyt += y[[i, s]] * y[[p, s]];
+                }
+                m[[i, p]] -= 0.5 * yyt;
+            }
+        }
+        // G = M ⊗ I_k in the row-major flattened basis.
+        let ambient = self.ambient_dim();
+        let mut g = Array2::<f64>::zeros((ambient, ambient));
+        for i in 0..self.n {
+            for p in 0..self.n {
+                let block = m[[i, p]];
+                for j in 0..self.k {
+                    g[[i * self.k + j, p * self.k + j]] = block;
+                }
+            }
+        }
+        Ok(g)
     }
 
     fn christoffel_symbols(&self, point: ArrayView1<'_, f64>) -> GeometryResult<Vec<Array2<f64>>> {
