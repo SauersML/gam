@@ -5451,10 +5451,70 @@ pub(crate) fn wrap_spatial_implicit_psi_operator(
     )
 }
 
+/// Per-block transform applied by the shared spatial-ψ derivative engine.
+///
+/// The engine (see [`build_block_spatial_psi_derivatives_with_transform`]) owns
+/// the policy of *which* spatial length-scale terms become ψ-derivative blocks,
+/// how their embedded design/penalty matrices and implicit operators are
+/// assembled, and how anisotropic cross-axis rows are wired. Family modules that
+/// need a coordinate change applied uniformly to every assembled block — e.g. a
+/// time-varying survival covariate that tensorizes each spatial design row
+/// against a time basis — invert the dependency by *providing a transform* here
+/// instead of re-implementing the assembly loop.
+///
+/// All three hooks default to the identity, so the canonical (untransformed)
+/// path is just [`build_block_spatial_psi_derivatives`].
+pub(crate) trait SpatialPsiBlockTransform {
+    /// Transform an assembled implicit ψ-derivative operator (already embedded
+    /// into the full coefficient space). The default returns it unchanged.
+    fn transform_operator(
+        &self,
+        op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
+    ) -> Result<Arc<dyn CustomFamilyPsiDerivativeOperator>, String> {
+        Ok(op)
+    }
+
+    /// Transform a materialized (already embedded) design block. Default: identity.
+    fn transform_design(&self, design: Array2<f64>) -> Array2<f64> {
+        design
+    }
+
+    /// Transform a materialized (already embedded) penalty block. Default: identity.
+    fn transform_penalty(&self, penalty: Array2<f64>) -> Array2<f64> {
+        penalty
+    }
+}
+
+/// The canonical no-op transform: blocks are emitted exactly as assembled.
+pub(crate) struct IdentitySpatialPsiBlockTransform;
+
+impl SpatialPsiBlockTransform for IdentitySpatialPsiBlockTransform {}
+
 pub(crate) fn build_block_spatial_psi_derivatives(
     data: ndarray::ArrayView2<'_, f64>,
     resolvedspec: &TermCollectionSpec,
     design: &TermCollectionDesign,
+) -> Result<Option<Vec<CustomFamilyBlockPsiDerivative>>, String> {
+    build_block_spatial_psi_derivatives_with_transform(
+        data,
+        resolvedspec,
+        design,
+        &IdentitySpatialPsiBlockTransform,
+    )
+}
+
+/// Shared exact-derivative / spatial-ψ engine.
+///
+/// Builds the per-axis [`CustomFamilyBlockPsiDerivative`] blocks for every
+/// spatial length-scale term, threading every materialized design/penalty matrix
+/// and every assembled implicit operator through `transform`. Family modules
+/// consume this engine and supply a [`SpatialPsiBlockTransform`] rather than
+/// duplicating the block-assembly, cross-axis, and operator-embedding logic.
+pub(crate) fn build_block_spatial_psi_derivatives_with_transform(
+    data: ndarray::ArrayView2<'_, f64>,
+    resolvedspec: &TermCollectionSpec,
+    design: &TermCollectionDesign,
+    transform: &dyn SpatialPsiBlockTransform,
 ) -> Result<Option<Vec<CustomFamilyBlockPsiDerivative>>, String> {
     let spatial_terms = spatial_length_scale_term_indices(resolvedspec);
     let Some(info_list) =
@@ -5495,15 +5555,20 @@ pub(crate) fn build_block_spatial_psi_derivatives(
             } else {
                 None
             };
-            let design_operator = implicit_operator.or(dense_operator);
+            let design_operator = implicit_operator
+                .or(dense_operator)
+                .map(|op| transform.transform_operator(op))
+                .transpose()?;
             let materialize_dense_design =
                 !info.x_psi_local.is_empty() && design_operator.is_none();
             let embed_design = |local: &Array2<f64>| -> Array2<f64> {
-                if local.ncols() == 0 || local.nrows() == 0 {
-                    return Array2::<f64>::zeros((local.nrows(), info.total_p));
-                }
-                EmbeddedColumnBlock::new(local, info.global_range.clone(), info.total_p)
-                    .materialize()
+                let embedded = if local.ncols() == 0 || local.nrows() == 0 {
+                    Array2::<f64>::zeros((local.nrows(), info.total_p))
+                } else {
+                    EmbeddedColumnBlock::new(local, info.global_range.clone(), info.total_p)
+                        .materialize()
+                };
+                transform.transform_design(embedded)
             };
             let x_full = if materialize_dense_design {
                 embed_design(&info.x_psi_local)
@@ -5512,11 +5577,13 @@ pub(crate) fn build_block_spatial_psi_derivatives(
             };
             let penalty_indices = info.penalty_indices.clone();
             let embed_penalty = |local: &Array2<f64>| -> Array2<f64> {
-                if local.nrows() == 0 || local.ncols() == 0 {
-                    return Array2::<f64>::zeros((info.total_p, info.total_p));
-                }
-                EmbeddedSquareBlock::new(local, info.global_range.clone(), info.total_p)
-                    .materialize()
+                let embedded = if local.nrows() == 0 || local.ncols() == 0 {
+                    Array2::<f64>::zeros((info.total_p, info.total_p))
+                } else {
+                    EmbeddedSquareBlock::new(local, info.global_range.clone(), info.total_p)
+                        .materialize()
+                };
+                transform.transform_penalty(embedded)
             };
             let s_components: Vec<(usize, Array2<f64>)> = info
                 .penalty_indices

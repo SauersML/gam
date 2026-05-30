@@ -49,3 +49,8 @@ pub use estimate::reml::unified::BarrierConfig;
 /// covariance-correction error type without reaching through the private
 /// `estimate::reml::unified` path.
 pub use estimate::reml::unified::CorrectedCovarianceError;
+/// Re-exported for the Python bindings (`gam-pyffi`), which build their
+/// analytic-penalty registry through the single shared descriptor parser that
+/// also serves the in-process workflow pipeline. Exposed here so PyFFI can name
+/// it without the (crate-private) `workflow` module being publicly reachable.
+pub use workflow::descriptors::build_analytic_penalty_registry_from_descriptors;

@@ -45,10 +45,13 @@
 //!      Both maximize a partial/marginal likelihood on identical data, so the
 //!      covariate effect on the hazard scale must agree to optimizer + quadrature
 //!      tolerance (~0.05 at n ≈ 100).
-//!   2. Frailty variance: `|gam.latent_sd² − R.θ| / max(R.θ, 1e-3) ≤ 0.15`. Both
-//!      target the same marginal likelihood and the same variance component;
-//!      15% absorbs the lognormal-vs-gamma distributional difference and finite-n
-//!      variation without weakening (a real divergence is larger).
+//!   2. Frailty multiplier-variance: `|Var(exp(U_g)) − R.θ| / max(R.θ, 1e-3) ≤ 0.15`,
+//!      where Var(exp(U_g)) = (exp(σ²)−1)·exp(σ²) is gam's lognormal multiplier
+//!      variance on the SAME scale as coxph's gamma θ. Both target the same
+//!      marginal likelihood and the same multiplier-variance dispersion; 15%
+//!      absorbs the residual lognormal-vs-gamma shape difference (matched mean and
+//!      variance, differing skew/tail) and finite-n variation without weakening
+//!      (a real divergence is larger).
 //!
 //! A failing assertion because gam genuinely diverges from coxph is acceptable
 //! and must NOT be papered over by loosening a bound or editing gam source.
@@ -277,9 +280,12 @@ fn gam_hazard_multiplier_frailty_matches_coxph_frailty() {
     eprintln!(
         "coxph(frailty) vs gam HazardMultiplier: n={n} m_groups={N_GROUPS} events={n_events} \
          | beta_x: gam={gam_beta_x:.4} R={r_coef_x:.4} |diff|={beta_abs:.4} (true={TRUE_BETA}) \
-         | frailty_var: gam={gam_frailty_var:.4} (sd={gam_latent_sd:.4}) R={r_frailty_var:.4} \
-         rel={var_rel:.4} (true_var={:.4})",
-        TRUE_FRAILTY_SD * TRUE_FRAILTY_SD
+         | mult_var: gam={gam_frailty_var:.4} (sd={gam_latent_sd:.4}) R={r_frailty_var:.4} \
+         rel={var_rel:.4} (true_mult_var={:.4})",
+        {
+            let true_log_var = TRUE_FRAILTY_SD * TRUE_FRAILTY_SD;
+            (true_log_var.exp() - 1.0) * true_log_var.exp()
+        }
     );
 
     // Bound 1: PH log-HR agreement (L-infinity on the hazard scale).

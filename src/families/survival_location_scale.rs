@@ -7,11 +7,10 @@ use crate::custom_family::{
     ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
     ExactNewtonOuterCurvature, FamilyChannelHessian, FamilyEvaluation, ParameterBlockSpec,
-    ParameterBlockState, PenaltyMatrix, PsiDesignMap, build_embedded_dense_psi_operator,
+    ParameterBlockState, PenaltyMatrix, PsiDesignMap,
     build_rowwise_kronecker_psi_operator, evaluate_custom_family_joint_hyper,
     evaluate_custom_family_joint_hyper_efs, first_psi_linear_map, fit_custom_family,
     resolve_custom_family_x_psi_map, shared_dense_arc, weighted_crossprod_psi_maps,
-    wrap_spatial_implicit_psi_operator,
 };
 use crate::solver::estimate::reml::unified::{DenseMatrixHyperOperator, HyperOperator};
 
@@ -32,8 +31,8 @@ use crate::families::scale_design::{
 use crate::families::sigma_link::{EXP_NEG_STABLE_MAX_ARG, exp_sigma_inverse_from_eta_scalar};
 use crate::families::survival::{OffsetChannelCurvatures, OffsetChannelResiduals};
 use crate::matrix::{
-    BlockDesignOperator, DenseDesignMatrix, DesignBlock, DesignMatrix, EmbeddedColumnBlock,
-    EmbeddedSquareBlock, MultiChannelOperator, RowwiseKroneckerOperator, SymmetricMatrix,
+    BlockDesignOperator, DenseDesignMatrix, DesignBlock, DesignMatrix,
+    MultiChannelOperator, RowwiseKroneckerOperator, SymmetricMatrix,
 };
 use crate::mixture_link::{
     component_inverse_link_jet, inverse_link_jet_for_inverse_link,
@@ -51,7 +50,7 @@ use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
     freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint,
-    spatial_length_scale_term_indices, try_build_spatial_log_kappa_derivativeinfo_list,
+    spatial_length_scale_term_indices,
 };
 use crate::solver::estimate::UnifiedFitResult;
 use crate::solver::estimate::{
@@ -63,7 +62,6 @@ use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use rayon::slice::ParallelSliceMut;
 use statrs::function::erf::erfc;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 const SURVIVAL_ROW_PARALLEL_THRESHOLD: usize = 256;
@@ -3663,296 +3661,91 @@ fn build_survival_covariate_block_from_design(
     }
 }
 
+/// Survival time-varying tensorization adapter for the shared spatial-ψ engine.
+///
+/// A time-dependent survival covariate represents each spatial design row as the
+/// rowwise-Kronecker of the (spatial) base row against three time bases — exit,
+/// entry, and the exit-time derivative — stacked vertically, while each spatial
+/// penalty is Kronecker-multiplied against the time identity. This is a *uniform*
+/// coordinate change applied to every block the shared engine assembles, so we
+/// invert the dependency: the engine owns the spatial-ψ block construction and
+/// this adapter only supplies the tensorization via [`SpatialPsiBlockTransform`].
+struct SurvivalTimeVaryingPsiTransform {
+    time_basis_entry: Array2<f64>,
+    time_basis_exit: Array2<f64>,
+    time_basis_derivative_exit: Array2<f64>,
+}
+
+impl crate::custom_family::SpatialPsiBlockTransform for SurvivalTimeVaryingPsiTransform {
+    fn transform_operator(
+        &self,
+        op: Arc<dyn crate::custom_family::CustomFamilyPsiDerivativeOperator>,
+    ) -> Result<Arc<dyn crate::custom_family::CustomFamilyPsiDerivativeOperator>, String> {
+        build_rowwise_kronecker_psi_operator(
+            op,
+            vec![
+                shared_dense_arc(&self.time_basis_exit),
+                shared_dense_arc(&self.time_basis_entry),
+                shared_dense_arc(&self.time_basis_derivative_exit),
+            ],
+        )
+    }
+
+    fn transform_design(&self, base: Array2<f64>) -> Array2<f64> {
+        let base_dm = DesignMatrix::Dense(DenseDesignMatrix::from(base));
+        let exit_cow = rowwise_kronecker(&base_dm, &self.time_basis_exit).to_dense_cow();
+        let entry_cow = rowwise_kronecker(&base_dm, &self.time_basis_entry).to_dense_cow();
+        let deriv_cow =
+            rowwise_kronecker(&base_dm, &self.time_basis_derivative_exit).to_dense_cow();
+        let n = exit_cow.nrows();
+        let p = exit_cow.ncols();
+        let mut stacked = Array2::<f64>::zeros((3 * n, p));
+        stacked.slice_mut(s![0..n, ..]).assign(&*exit_cow);
+        stacked.slice_mut(s![n..2 * n, ..]).assign(&*entry_cow);
+        stacked.slice_mut(s![2 * n..3 * n, ..]).assign(&*deriv_cow);
+        stacked
+    }
+
+    fn transform_penalty(&self, base: Array2<f64>) -> Array2<f64> {
+        let i_time = Array2::<f64>::eye(self.time_basis_exit.ncols());
+        kronecker_product(&base, &i_time)
+    }
+}
+
+/// Survival covariate spatial-ψ derivatives: a thin adapter over the shared
+/// exact-derivative engine [`build_block_spatial_psi_derivatives_with_transform`].
+/// The `Static` template emits blocks unchanged; the `TimeVarying` template
+/// supplies a [`SurvivalTimeVaryingPsiTransform`] so the same engine produces the
+/// time-tensorized blocks without re-implementing block assembly.
 fn build_survival_covariate_block_psi_derivatives(
     data: ndarray::ArrayView2<'_, f64>,
     resolvedspec: &TermCollectionSpec,
     design: &TermCollectionDesign,
     template: &SurvivalCovariateTermBlockTemplate,
 ) -> Result<Option<Vec<CustomFamilyBlockPsiDerivative>>, String> {
-    let spatial_terms = spatial_length_scale_term_indices(resolvedspec);
-    let Some(info_list) =
-        try_build_spatial_log_kappa_derivativeinfo_list(data, resolvedspec, design, &spatial_terms)
-            .map_err(|e| e.to_string())?
-    else {
-        return Ok(None);
-    };
-    let psi_dim = info_list.len();
-    let axis_lookup: HashMap<(usize, usize), usize> = info_list
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, info)| {
-            info.aniso_group_id
-                .map(|gid| ((gid, info.implicit_axis), idx))
-        })
-        .collect();
-    Ok(Some(
-        info_list
-            .into_iter()
-            .enumerate()
-            .map(
-                |(psi_idx, info)| -> Result<CustomFamilyBlockPsiDerivative, String> {
-                    let penalty_indices = info.penalty_indices.clone();
-                    let embed_design = |local: &Array2<f64>| {
-                        EmbeddedColumnBlock::new(local, info.global_range.clone(), info.total_p)
-                            .materialize()
-                    };
-                    let embed_penalty = |local: &Array2<f64>| {
-                        EmbeddedSquareBlock::new(local, info.global_range.clone(), info.total_p)
-                            .materialize()
-                    };
-                    match template {
-                        SurvivalCovariateTermBlockTemplate::Static => {
-                            let implicit_operator = info.implicit_operator.as_ref().map(|op| {
-                                wrap_spatial_implicit_psi_operator(
-                                    Arc::clone(op),
-                                    info.global_range.clone(),
-                                    info.total_p,
-                                )
-                            });
-                            let dense_operator =
-                                if implicit_operator.is_none() && !info.x_psi_local.is_empty() {
-                                    Some(build_embedded_dense_psi_operator(
-                                        &info.x_psi_local,
-                                        &info.x_psi_psi_local,
-                                        info.aniso_cross_designs.as_ref(),
-                                        info.global_range.clone(),
-                                        info.total_p,
-                                        info.implicit_axis,
-                                    )?)
-                                } else {
-                                    None
-                                };
-                            let design_operator = implicit_operator.or(dense_operator);
-                            let materialize_dense_design =
-                                !info.x_psi_local.is_empty() && design_operator.is_none();
-                            let x_full = if !materialize_dense_design {
-                                Array2::<f64>::zeros((0, 0))
-                            } else {
-                                embed_design(&info.x_psi_local)
-                            };
-                            let s_components: Vec<(usize, Array2<f64>)> = info
-                                .penalty_indices
-                                .iter()
-                                .copied()
-                                .zip(info.s_psi_components_local.iter().map(embed_penalty))
-                                .collect();
-                            let x_psi_psi = if !materialize_dense_design {
-                                None
-                            } else {
-                                let mut rows =
-                                    vec![
-                                        Array2::<f64>::zeros((x_full.nrows(), x_full.ncols()));
-                                        psi_dim
-                                    ];
-                                rows[psi_idx] = embed_design(&info.x_psi_psi_local);
-                                if let (Some(gid), Some(cross_designs)) =
-                                    (info.aniso_group_id, info.aniso_cross_designs.as_ref())
-                                {
-                                    for (axis_j, local) in cross_designs {
-                                        if let Some(&global_j) = axis_lookup.get(&(gid, *axis_j)) {
-                                            rows[global_j] = embed_design(local);
-                                        }
-                                    }
-                                }
-                                Some(rows)
-                            };
-                            let mut s_psi_psi_components =
-                                vec![Vec::<(usize, Array2<f64>)>::new(); psi_dim];
-                            s_psi_psi_components[psi_idx] = penalty_indices
-                                .iter()
-                                .copied()
-                                .zip(info.s_psi_psi_components_local.iter().map(embed_penalty))
-                                .collect();
-                            if let (Some(gid), Some(cross_penalty_provider)) = (
-                                info.aniso_group_id,
-                                info.aniso_cross_penalty_provider.as_ref(),
-                            ) {
-                                for ((group_id, axis_j), global_j) in &axis_lookup {
-                                    if *group_id != gid || *axis_j == info.implicit_axis {
-                                        continue;
-                                    }
-                                    let local_components = cross_penalty_provider(*axis_j)
-                                        .map_err(|err| err.to_string())?;
-                                    if local_components.is_empty() {
-                                        continue;
-                                    }
-                                    s_psi_psi_components[*global_j] = penalty_indices
-                                        .iter()
-                                        .copied()
-                                        .zip(local_components.iter().map(embed_penalty))
-                                        .collect();
-                                }
-                            }
-                            Ok(CustomFamilyBlockPsiDerivative {
-                                penalty_index: Some(info.penalty_index),
-                                x_psi: x_full,
-                                s_psi: Array2::<f64>::zeros((0, 0)),
-                                s_psi_components: Some(s_components),
-                                s_psi_penalty_components: None,
-                                x_psi_psi,
-                                s_psi_psi: None,
-                                s_psi_psi_components: Some(s_psi_psi_components),
-                                s_psi_psi_penalty_components: None,
-                                implicit_operator: design_operator,
-                                implicit_axis: info.implicit_axis,
-                                implicit_group_id: info.aniso_group_id,
-                            })
-                        }
-                        SurvivalCovariateTermBlockTemplate::TimeVarying {
-                            time_basis_entry,
-                            time_basis_exit,
-                            time_basis_derivative_exit,
-                            ..
-                        } => {
-                            let tensorize_design = |base: &Array2<f64>| {
-                                let base_dm = DesignMatrix::Dense(
-                                    crate::matrix::DenseDesignMatrix::from(base.clone()),
-                                );
-                                let exit_dm = rowwise_kronecker(&base_dm, time_basis_exit);
-                                let exit_cow = exit_dm.to_dense_cow();
-                                let entry_dm = rowwise_kronecker(&base_dm, time_basis_entry);
-                                let entry_cow = entry_dm.to_dense_cow();
-                                let deriv_dm =
-                                    rowwise_kronecker(&base_dm, time_basis_derivative_exit);
-                                let deriv_cow = deriv_dm.to_dense_cow();
-                                let n = exit_cow.nrows();
-                                let p = exit_cow.ncols();
-                                let mut stacked = Array2::<f64>::zeros((3 * n, p));
-                                stacked.slice_mut(s![0..n, ..]).assign(&*exit_cow);
-                                stacked.slice_mut(s![n..2 * n, ..]).assign(&*entry_cow);
-                                stacked.slice_mut(s![2 * n..3 * n, ..]).assign(&*deriv_cow);
-                                stacked
-                            };
-                            let i_time = Array2::<f64>::eye(time_basis_exit.ncols());
-                            let tensorize_penalty =
-                                |base: &Array2<f64>| kronecker_product(base, &i_time);
-                            let base_operator = if let Some(op) = info.implicit_operator.as_ref() {
-                                Some(wrap_spatial_implicit_psi_operator(
-                                    Arc::clone(op),
-                                    info.global_range.clone(),
-                                    info.total_p,
-                                ))
-                            } else if !info.x_psi_local.is_empty() {
-                                Some(build_embedded_dense_psi_operator(
-                                    &info.x_psi_local,
-                                    &info.x_psi_psi_local,
-                                    info.aniso_cross_designs.as_ref(),
-                                    info.global_range.clone(),
-                                    info.total_p,
-                                    info.implicit_axis,
-                                )?)
-                            } else {
-                                None
-                            };
-                            let implicit_operator = base_operator
-                                .as_ref()
-                                .map(|op| {
-                                    build_rowwise_kronecker_psi_operator(
-                                        Arc::clone(op),
-                                        vec![
-                                            shared_dense_arc(time_basis_exit),
-                                            shared_dense_arc(time_basis_entry),
-                                            shared_dense_arc(time_basis_derivative_exit),
-                                        ],
-                                    )
-                                })
-                                .transpose()?;
-                            let materialize_dense_design =
-                                !info.x_psi_local.is_empty() && implicit_operator.is_none();
-                            let x_psi = if !materialize_dense_design {
-                                Array2::<f64>::zeros((0, 0))
-                            } else {
-                                tensorize_design(&embed_design(&info.x_psi_local))
-                            };
-                            let s_components: Vec<(usize, Array2<f64>)> = info
-                                .penalty_indices
-                                .iter()
-                                .copied()
-                                .zip(
-                                    info.s_psi_components_local
-                                        .iter()
-                                        .map(embed_penalty)
-                                        .map(|full| tensorize_penalty(&full)),
-                                )
-                                .collect();
-                            let x_psi_psi = if !materialize_dense_design {
-                                None
-                            } else {
-                                let mut rows =
-                                    vec![
-                                        Array2::<f64>::zeros((x_psi.nrows(), x_psi.ncols()));
-                                        psi_dim
-                                    ];
-                                rows[psi_idx] =
-                                    tensorize_design(&embed_design(&info.x_psi_psi_local));
-                                if let (Some(gid), Some(cross_designs)) =
-                                    (info.aniso_group_id, info.aniso_cross_designs.as_ref())
-                                {
-                                    for (axis_j, local) in cross_designs {
-                                        if let Some(&global_j) = axis_lookup.get(&(gid, *axis_j)) {
-                                            rows[global_j] = tensorize_design(&embed_design(local));
-                                        }
-                                    }
-                                }
-                                Some(rows)
-                            };
-                            let mut s_psi_psi_components =
-                                vec![Vec::<(usize, Array2<f64>)>::new(); psi_dim];
-                            s_psi_psi_components[psi_idx] = penalty_indices
-                                .iter()
-                                .copied()
-                                .zip(
-                                    info.s_psi_psi_components_local
-                                        .iter()
-                                        .map(embed_penalty)
-                                        .map(|full| tensorize_penalty(&full)),
-                                )
-                                .collect();
-                            if let (Some(gid), Some(cross_penalty_provider)) = (
-                                info.aniso_group_id,
-                                info.aniso_cross_penalty_provider.as_ref(),
-                            ) {
-                                for ((group_id, axis_j), global_j) in &axis_lookup {
-                                    if *group_id != gid || *axis_j == info.implicit_axis {
-                                        continue;
-                                    }
-                                    let local_components = cross_penalty_provider(*axis_j)
-                                        .map_err(|err| err.to_string())?;
-                                    if local_components.is_empty() {
-                                        continue;
-                                    }
-                                    s_psi_psi_components[*global_j] = penalty_indices
-                                        .iter()
-                                        .copied()
-                                        .zip(
-                                            local_components
-                                                .iter()
-                                                .map(embed_penalty)
-                                                .map(|full| tensorize_penalty(&full)),
-                                        )
-                                        .collect();
-                                }
-                            }
-                            Ok(CustomFamilyBlockPsiDerivative {
-                                penalty_index: Some(info.penalty_index),
-                                x_psi,
-                                s_psi: Array2::<f64>::zeros((0, 0)),
-                                s_psi_components: Some(s_components),
-                                s_psi_penalty_components: None,
-                                x_psi_psi,
-                                s_psi_psi: None,
-                                s_psi_psi_components: Some(s_psi_psi_components),
-                                s_psi_psi_penalty_components: None,
-                                implicit_operator,
-                                implicit_axis: info.implicit_axis,
-                                implicit_group_id: info.aniso_group_id,
-                            })
-                        }
-                    }
-                },
+    match template {
+        SurvivalCovariateTermBlockTemplate::Static => {
+            crate::custom_family::build_block_spatial_psi_derivatives(data, resolvedspec, design)
+        }
+        SurvivalCovariateTermBlockTemplate::TimeVarying {
+            time_basis_entry,
+            time_basis_exit,
+            time_basis_derivative_exit,
+            ..
+        } => {
+            let transform = SurvivalTimeVaryingPsiTransform {
+                time_basis_entry: time_basis_entry.clone(),
+                time_basis_exit: time_basis_exit.clone(),
+                time_basis_derivative_exit: time_basis_derivative_exit.clone(),
+            };
+            crate::custom_family::build_block_spatial_psi_derivatives_with_transform(
+                data,
+                resolvedspec,
+                design,
+                &transform,
             )
-            .collect::<Result<Vec<_>, _>>()?,
-    ))
+        }
+    }
 }
 
 fn survival_psi_derivatives_support_exact_joint_hessian(
@@ -11143,6 +10936,144 @@ mod tests {
             SparseColMat::try_new_from_triplets(dense.nrows(), dense.ncols(), &triplets)
                 .expect("build sparse design"),
         )
+    }
+
+    /// Parity test for issue #410: the survival covariate spatial-ψ derivative
+    /// blocks (`Static` template) are produced by the *shared* exact-derivative
+    /// engine, not a survival-local re-implementation. A custom/built-in family
+    /// and the survival family with identical anisotropic-Matérn specs must
+    /// therefore yield bit-identical ψ-derivative blocks — design embedding,
+    /// penalty components, anisotropic cross-rows, and implicit-operator action.
+    #[test]
+    fn survival_static_spatial_psi_blocks_match_shared_engine() {
+        use crate::basis::{CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu};
+        use crate::smooth::{ShapeConstraint, SmoothBasisSpec, SmoothTermSpec};
+
+        let n = 12usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            let x0 = i as f64 / (n as f64 - 1.0);
+            let x1 = (0.41 * i as f64).sin() + 0.15 * x0;
+            data[[i, 0]] = x0;
+            data[[i, 1]] = x1;
+        }
+
+        let spec = TermCollectionSpec {
+            linear_terms: Vec::new(),
+            random_effect_terms: Vec::new(),
+            smooth_terms: vec![SmoothTermSpec {
+                name: "spatial".to_string(),
+                basis: SmoothBasisSpec::Matern {
+                    feature_cols: vec![0, 1],
+                    spec: MaternBasisSpec {
+                        periodic: None,
+                        center_strategy: CenterStrategy::EqualMass { num_centers: 6 },
+                        length_scale: 0.7,
+                        nu: MaternNu::ThreeHalves,
+                        include_intercept: false,
+                        double_penalty: false,
+                        identifiability: MaternIdentifiability::CenterSumToZero,
+                        aniso_log_scales: Some(vec![0.0, 0.0]),
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+                joint_null_rotation: None,
+            }],
+        };
+
+        let base_design =
+            build_term_collection_design(data.view(), &spec).expect("build base spatial design");
+        let resolvedspec = freeze_term_collection_from_design(&spec, &base_design)
+            .expect("freeze spatial term spec");
+        let resolved_design = build_term_collection_design(data.view(), &resolvedspec)
+            .expect("rebuild frozen spatial design");
+
+        // Built-in / canonical path: the shared exact-derivative engine.
+        let shared = crate::custom_family::build_block_spatial_psi_derivatives(
+            data.view(),
+            &resolvedspec,
+            &resolved_design,
+        )
+        .expect("shared engine spatial psi derivatives")
+        .expect("anisotropic spatial derivative rows from shared engine");
+
+        // Survival consumer path: the Static adapter must delegate to the same engine.
+        let survival = build_survival_covariate_block_psi_derivatives(
+            data.view(),
+            &resolvedspec,
+            &resolved_design,
+            &SurvivalCovariateTermBlockTemplate::Static,
+        )
+        .expect("survival static spatial psi derivatives")
+        .expect("anisotropic spatial derivative rows from survival adapter");
+
+        assert_eq!(
+            shared.len(),
+            survival.len(),
+            "shared engine and survival adapter must emit the same number of ψ blocks"
+        );
+
+        let psi_dim = shared.len();
+        for (axis, (a, b)) in shared.iter().zip(survival.iter()).enumerate() {
+            assert_eq!(a.penalty_index, b.penalty_index, "penalty_index axis {axis}");
+            assert_eq!(a.implicit_axis, b.implicit_axis, "implicit_axis axis {axis}");
+            assert_eq!(
+                a.implicit_group_id, b.implicit_group_id,
+                "implicit_group_id axis {axis}"
+            );
+            assert_eq!(a.x_psi, b.x_psi, "x_psi axis {axis}");
+            assert_eq!(
+                a.s_psi_components, b.s_psi_components,
+                "s_psi_components axis {axis}"
+            );
+            assert_eq!(a.x_psi_psi, b.x_psi_psi, "x_psi_psi axis {axis}");
+            assert_eq!(
+                a.s_psi_psi_components, b.s_psi_psi_components,
+                "s_psi_psi_components axis {axis}"
+            );
+
+            // Implicit-operator action parity: identical embedding and identical
+            // forward/transpose maps on deterministic probe vectors.
+            match (a.implicit_operator.as_ref(), b.implicit_operator.as_ref()) {
+                (Some(op_a), Some(op_b)) => {
+                    assert_eq!(op_a.n_data(), op_b.n_data(), "operator n_data axis {axis}");
+                    assert_eq!(op_a.p_out(), op_b.p_out(), "operator p_out axis {axis}");
+                    let p = op_a.p_out();
+                    let u: Array1<f64> = (0..p)
+                        .map(|j| 0.3 + 0.11 * (j as f64) - 0.07 * ((axis + j) as f64).cos())
+                        .collect();
+                    for probe_axis in 0..psi_dim {
+                        let fwd_a = op_a
+                            .forward_mul(probe_axis, &u.view())
+                            .expect("shared forward_mul");
+                        let fwd_b = op_b
+                            .forward_mul(probe_axis, &u.view())
+                            .expect("survival forward_mul");
+                        assert_eq!(
+                            fwd_a, fwd_b,
+                            "forward_mul mismatch block {axis} probe-axis {probe_axis}"
+                        );
+                        let nd = op_a.n_data();
+                        let v: Array1<f64> = (0..nd)
+                            .map(|r| 0.2 - 0.05 * (r as f64) + 0.13 * ((r + probe_axis) as f64).sin())
+                            .collect();
+                        let tr_a = op_a
+                            .transpose_mul(probe_axis, &v.view())
+                            .expect("shared transpose_mul");
+                        let tr_b = op_b
+                            .transpose_mul(probe_axis, &v.view())
+                            .expect("survival transpose_mul");
+                        assert_eq!(
+                            tr_a, tr_b,
+                            "transpose_mul mismatch block {axis} probe-axis {probe_axis}"
+                        );
+                    }
+                }
+                (None, None) => {}
+                _ => panic!("implicit_operator presence diverged at axis {axis}"),
+            }
+        }
     }
 
     fn test_link_wiggle_metadata(beta_link_wiggle: &Array1<f64>) -> (Array1<f64>, usize) {
