@@ -313,10 +313,6 @@ fn gam_poisson_log_matches_interpretml_ebm_on_real_data() {
         test_rows.len()
     );
 
-    let train_age: Vec<f64> = train_rows.iter().map(|&i| age[i]).collect();
-    let train_badh: Vec<f64> = train_rows.iter().map(|&i| badh[i]).collect();
-    let test_age: Vec<f64> = test_rows.iter().map(|&i| age[i]).collect();
-    let test_badh: Vec<f64> = test_rows.iter().map(|&i| badh[i]).collect();
     let test_numvisit: Vec<f64> = test_rows.iter().map(|&i| numvisit[i]).collect();
 
     // Build a training-only dataset by sub-setting the encoded rows; headers,
