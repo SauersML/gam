@@ -383,7 +383,7 @@ fn gam_dirichlet_regression_matches_dirichletreg() {
     let body = format!(
         r#"
         suppressPackageStartupMessages(library(DirichletReg))
-        Y <- DR_data(cbind({p0}, {p1}, {p2}))
+        Y <- DR_data(cbind(df${p0}, df${p1}, df${p2}))
         m <- DirichletReg(Y ~ -1 + {rhs}, data = df)
         # Common model: one coefficient vector per simplex part, in part order.
         co <- coef(m)
