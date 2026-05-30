@@ -2277,11 +2277,9 @@ mod pirls_row_gpu_tests {
             let family = PirlsRowFamily::BernoulliLogit;
             let curvature = CurvatureMode::Fisher;
             let backend = PirlsRowBackend::probe().expect("backend probe on CUDA host");
-            let runtime =
-                super::super::runtime::GpuRuntime::global().expect("GPU runtime available");
-            let ctx = super::super::runtime::cuda_context_for(runtime.selected_device().ordinal)
-                .expect("ctx");
-            let stream = ctx.default_stream();
+            let stream = super::super::backend_probe::probe_cuda_backend("pirls_row")
+                .expect("shared backend probe")
+                .stream;
 
             let mut eta_dev = stream.alloc_zeros::<f64>(n).expect("eta");
             let mut y_dev = stream.alloc_zeros::<f64>(n).expect("y");
@@ -2389,11 +2387,9 @@ mod pirls_row_gpu_tests {
             let family = PirlsRowFamily::GaussianIdentity;
             let curvature = CurvatureMode::Fisher;
             let backend = PirlsRowBackend::probe().expect("backend probe on CUDA host");
-            let runtime =
-                super::super::runtime::GpuRuntime::global().expect("GPU runtime available");
-            let ctx = super::super::runtime::cuda_context_for(runtime.selected_device().ordinal)
-                .expect("ctx");
-            let stream = ctx.default_stream();
+            let stream = super::super::backend_probe::probe_cuda_backend("pirls_row")
+                .expect("shared backend probe")
+                .stream;
 
             let mut eta_dev = stream.alloc_zeros::<f64>(n).expect("eta");
             let mut y_dev = stream.alloc_zeros::<f64>(n).expect("y");
@@ -2673,11 +2669,9 @@ mod pirls_row_gpu_tests {
             let etas = [-3.0_f64, -0.5, 0.0, 0.5, 3.0, 10.0, -10.0, 1.5];
             let n = etas.len();
             let backend = PirlsRowBackend::probe().expect("backend probe on CUDA host");
-            let runtime = super::super::runtime::GpuRuntime::global()
-                .expect("GPU runtime available when probe succeeded");
-            let ctx = super::super::runtime::cuda_context_for(runtime.selected_device().ordinal)
-                .expect("ctx for selected device");
-            let stream = ctx.default_stream();
+            let stream = super::super::backend_probe::probe_cuda_backend("pirls_row")
+                .expect("shared backend probe")
+                .stream;
 
             for &family in PirlsRowFamily::ALL.iter() {
                 let ys: Vec<f64> = match family {
@@ -2824,11 +2818,9 @@ mod pirls_row_gpu_tests {
                 .collect();
 
             let backend = PirlsRowBackend::probe().expect("backend probe on CUDA host");
-            let runtime = super::super::runtime::GpuRuntime::global()
-                .expect("GPU runtime available when probe succeeded");
-            let ctx = super::super::runtime::cuda_context_for(runtime.selected_device().ordinal)
-                .expect("ctx for selected device");
-            let stream = ctx.default_stream();
+            let stream = super::super::backend_probe::probe_cuda_backend("pirls_row")
+                .expect("shared backend probe")
+                .stream;
 
             for &family in PirlsRowFamily::ALL.iter() {
                 let ys: Vec<f64> = match family {
@@ -2952,11 +2944,9 @@ mod pirls_row_gpu_tests {
                 .collect();
 
             let backend = PirlsRowBackend::probe().expect("backend probe on CUDA host");
-            let runtime = super::super::runtime::GpuRuntime::global()
-                .expect("GPU runtime available when probe succeeded");
-            let ctx = super::super::runtime::cuda_context_for(runtime.selected_device().ordinal)
-                .expect("ctx for selected device");
-            let stream = ctx.default_stream();
+            let stream = super::super::backend_probe::probe_cuda_backend("pirls_row")
+                .expect("shared backend probe")
+                .stream;
 
             const TOL: f64 = 1.0e-9;
 
@@ -3101,11 +3091,9 @@ mod pirls_row_gpu_tests {
             let curvature = CurvatureMode::Fisher;
 
             let backend = PirlsRowBackend::probe().expect("backend probe on CUDA host");
-            let runtime =
-                super::super::runtime::GpuRuntime::global().expect("GPU runtime available");
-            let ctx = super::super::runtime::cuda_context_for(runtime.selected_device().ordinal)
-                .expect("ctx");
-            let stream = ctx.default_stream();
+            let stream = super::super::backend_probe::probe_cuda_backend("pirls_row")
+                .expect("shared backend probe")
+                .stream;
 
             // η grid + per-family in-domain response vectors. Mirrors
             // `gpu_observed_parity_end_to_end_n1000` so the two tests

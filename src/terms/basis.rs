@@ -21582,54 +21582,35 @@ pub fn duchon_sae_atom_second_jet(
     );
 
     let n_rows = t.nrows();
-    let n_centers = centers.nrows();
-    let radial_first = duchon_radial_first_derivative_nd(t, centers, None, effective_order, 0)?;
-    let radial_second = duchon_radial_second_derivative_nd(t, centers, None, effective_order, 0)?;
 
     let poly_block_t_cols = polynomial_block_from_order(t, effective_order).ncols();
 
-    // Radial Hessian per (row, center, a, c), scaled by α, then projected
-    // through Z over the center axis.
-    let mut radial_hess = Array4::<f64>::zeros((n_rows, n_centers, dim, dim));
-    for n in 0..n_rows {
-        for k in 0..n_centers {
-            let mut r2 = 0.0_f64;
-            for a in 0..dim {
-                let delta = t[[n, a]] - centers[[k, a]];
-                r2 += delta * delta;
-            }
-            let r = r2.sqrt();
-            let phi_r = radial_first[[n, k]];
-            let phi_rr = radial_second[[n, k]];
-            if r <= 1.0e-12 {
-                // Isotropic collision limit `φ''(0) δ_ac`.
-                for a in 0..dim {
-                    radial_hess[[n, k, a, a]] = phi_rr * kernel_amp;
-                }
-                continue;
-            }
-            let q = phi_r / r;
-            let s_scalar = (phi_rr - q) / r2;
-            for a in 0..dim {
-                let da = t[[n, a]] - centers[[k, a]];
-                for c in 0..dim {
-                    let dc = t[[n, c]] - centers[[k, c]];
-                    let mut value = s_scalar * da * dc;
-                    if a == c {
-                        value += q;
-                    }
-                    radial_hess[[n, k, a, c]] = value * kernel_amp;
-                }
-            }
-        }
-    }
+    // Kernel-block Cartesian Hessian `∂²Φ/∂t_a∂t_c`, projected through `Z` and
+    // scaled by `α`, via the shared radial→Cartesian engine. Folding `α` into
+    // the per-center coefficient matrix `Z` (so `coeffs = α·Z`, shape
+    // `(n_centers, n_kernel)`) makes the shared helper emit the already-
+    // amplified, already-projected kernel Hessian directly: its flat
+    // `(n_rows, n_kernel·d²)` output places output `i`, multi-index `(a,c)` at
+    // column `i·d² + (a·d + c)`, including the `φ''(0) δ_ac` collision limit.
+    let coeffs = &z * kernel_amp;
+    let flat = radial_basis_cartesian_derivative(
+        2,
+        t,
+        centers,
+        coeffs.view(),
+        None,
+        effective_order,
+        0,
+    )?;
 
     let mut out = Array4::<f64>::zeros((n_rows, n_kernel + poly_block_t_cols, dim, dim));
-    for a in 0..dim {
-        for c in 0..dim {
-            let slab = radial_hess.slice(s![.., .., a, c]);
-            let projected = slab.dot(&z);
-            out.slice_mut(s![.., ..n_kernel, a, c]).assign(&projected);
+    for n in 0..n_rows {
+        for i in 0..n_kernel {
+            for a in 0..dim {
+                for c in 0..dim {
+                    out[[n, i, a, c]] = flat[[n, i * dim * dim + a * dim + c]];
+                }
+            }
         }
     }
 

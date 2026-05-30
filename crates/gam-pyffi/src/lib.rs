@@ -1,7 +1,7 @@
 use csv::StringRecord;
 use faer::Side;
 use gam::basis::create_duchon_basis_1d_derivative_dense;
-use gam::bernoulli_marginal_slope::{BernoulliMarginalSlopeFitResult, LatentMeasureKind};
+use gam::bernoulli_marginal_slope::BernoulliMarginalSlopeFitResult;
 use gam::estimate::{
     BlockRole, EstimationError, ExternalOptimOptions,
     optimize_external_designwith_heuristic_lambdas, saved_latent_cloglog_state_from_fit,
@@ -14,9 +14,6 @@ use gam::faer_ndarray::{
 use gam::families::inverse_link::apply_inverse_link_vec;
 use gam::families::scale_design::{build_scale_deviation_transform, infer_non_intercept_start};
 use gam::families::survival_construction::{SavedSurvivalTimeBasis, survival_likelihood_modename};
-use gam::families::survival_location_scale::{
-    ResidualDistribution, residual_distribution_from_inverse_link,
-};
 use gam::families::survival_predict::{
     apply_inverse_link_state_to_fit_result, fit_result_from_saved_model_for_prediction,
 };
@@ -54,9 +51,14 @@ use gam::inference::model::{
     SavedLatentZNormalization, SchemaColumn, append_deployment_extension_columns,
 };
 use gam::inference::model_payload_builders::{
-    BernoulliMarginalSlopeInputs, SavedModelSourceMetadata, TransformationNormalInputs,
-    assemble_bernoulli_marginal_slope_payload, assemble_transformation_normal_payload,
-    serialize_anchored_deviation_runtime,
+    BernoulliMarginalSlopeInputs, LatentWindowInputs, LocationScaleInputs, LocationScaleResponse,
+    LocationScaleWiggle, SavedModelSourceMetadata, SurvivalLocationScaleInputs,
+    SurvivalMarginalSlopeInputs, SurvivalTimewiggle, SurvivalTimewiggleBeta,
+    SurvivalTransformationInputs, TransformationNormalInputs,
+    assemble_bernoulli_marginal_slope_payload, assemble_latent_window_payload,
+    assemble_location_scale_payload, assemble_survival_location_scale_payload,
+    assemble_survival_marginal_slope_payload, assemble_survival_transformation_payload,
+    assemble_transformation_normal_payload,
 };
 use gam::inference::posterior_bands::{self, PosteriorPredictBandsPayload};
 use gam::inference::predict::input::build_predict_input_for_model;
@@ -119,7 +121,6 @@ use gam::terms::{
     SheafConsistencyPenalty as CoreSheafConsistencyPenalty, StreamingMaternBasisGradientEvaluator,
 };
 use gam::transformation_normal::TransformationNormalFitResult;
-use gam::types::inverse_link_to_binomial_spec;
 use gam::types::{
     InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoPrior, StandardLink,
 };
@@ -29548,64 +29549,44 @@ fn build_survival_marginal_slope_ffi_payload(
         )),
     )?;
 
-    let mut payload = FittedModelPayload::new(
-        MODEL_VERSION,
-        formula,
-        ModelKind::Survival,
-        FittedFamily::Survival {
-            likelihood: LikelihoodSpec::new(
-                ResponseFamily::RoystonParmar,
-                InverseLink::Standard(StandardLink::Identity),
-            ),
-            survival_likelihood: Some("marginal-slope".to_string()),
-            survival_distribution: Some(ResidualDistribution::Gaussian),
+    // Thin adapter over the shared core assembler. The FFI's source-specific
+    // work is re-deriving the survival response columns, baseline config, and
+    // time basis from the formula + FitConfig and freezing its term collections
+    // from their designs; the semantic payload is assembled by the same core
+    // path the CLI uses, so the two save routes produce identical contracts.
+    Ok(assemble_survival_marginal_slope_payload(
+        SurvivalMarginalSlopeInputs {
+            formula,
+            data_schema: dataset.schema.clone(),
+            fit_result: ms_result.fit,
             frailty,
+            survival_entry: entryname,
+            survival_exit: exitname,
+            survival_event: eventname,
+            survivalspec: "net".to_string(),
+            baseline_cfg,
+            time_basis: SavedSurvivalTimeBasis::from_build(&time_build, time_anchor),
+            ridge_lambda: fit_config.ridge_lambda,
+            survival_likelihood_label: survival_likelihood_modename(likelihood_mode).to_string(),
+            resolved_marginalspec: frozen_marginal,
+            resolved_logslopespec: frozen_logslope,
+            logslope_formula,
+            z_column,
+            latent_z_normalization: SavedLatentZNormalization {
+                mean: ms_result.z_normalization.mean,
+                sd: ms_result.z_normalization.sd,
+            },
+            baseline_logslope: ms_result.baseline_slope,
+            score_warp_runtime: ms_result.score_warp_runtime.as_ref(),
+            link_dev_runtime: ms_result.link_dev_runtime.as_ref(),
         },
-        "royston-parmar".to_string(),
-    );
-    payload.unified = Some(ms_result.fit.clone());
-    payload.fit_result = Some(ms_result.fit);
-    payload.data_schema = Some(dataset.schema.clone());
-    payload.survival_entry = entryname;
-    payload.survival_exit = Some(exitname);
-    payload.survival_event = Some(eventname);
-    payload.survivalspec = Some("net".to_string());
-    payload.survival_baseline_target =
-        Some(survival_baseline_targetname(baseline_cfg.target).to_string());
-    payload.survival_baseline_scale = baseline_cfg.scale;
-    payload.survival_baseline_shape = baseline_cfg.shape;
-    payload.survival_baseline_rate = baseline_cfg.rate;
-    payload.survival_baseline_makeham = baseline_cfg.makeham;
-    payload.apply_survival_time_basis(&SavedSurvivalTimeBasis::from_build(
-        &time_build,
-        time_anchor,
-    ));
-    payload.survivalridge_lambda = Some(fit_config.ridge_lambda);
-    payload.survival_likelihood = Some(survival_likelihood_modename(likelihood_mode).to_string());
-    payload.survival_distribution = Some(ResidualDistribution::Gaussian);
-    payload.link = Some(InverseLink::Standard(StandardLink::Probit));
-    payload.training_headers = Some(dataset.headers.clone());
-    payload.resolved_termspec = Some(frozen_marginal);
-    payload.resolved_termspec_logslope = Some(frozen_logslope);
-    payload.formula_logslope = Some(logslope_formula);
-    payload.z_column = Some(z_column);
-    payload.latent_z_normalization = Some(SavedLatentZNormalization {
-        mean: ms_result.z_normalization.mean,
-        sd: ms_result.z_normalization.sd,
-    });
-    payload.latent_measure = Some(LatentMeasureKind::StandardNormal);
-    payload.logslope_baseline = Some(ms_result.baseline_slope);
-    payload.score_warp_runtime = ms_result
-        .score_warp_runtime
-        .as_ref()
-        .map(serialize_anchored_deviation_runtime);
-    payload.link_deviation_runtime = ms_result
-        .link_dev_runtime
-        .as_ref()
-        .map(serialize_anchored_deviation_runtime);
-    payload.offset_column = fit_config.offset_column.clone();
-    payload.noise_offset_column = fit_config.noise_offset_column.clone();
-    Ok(payload)
+        SavedModelSourceMetadata {
+            training_headers: dataset.headers.clone(),
+            training_feature_ranges: Some(dataset.feature_ranges()),
+            offset_column: fit_config.offset_column.clone(),
+            noise_offset_column: fit_config.noise_offset_column.clone(),
+        },
+    ))
 }
 
 fn build_survival_transformation_ffi_payload(
@@ -29614,9 +29595,7 @@ fn build_survival_transformation_ffi_payload(
     fit_config: &FitConfig,
     rp_result: gam::SurvivalTransformationFitResult,
 ) -> Result<FittedModelPayload, String> {
-    use gam::families::survival_construction::{
-        survival_baseline_targetname, survival_likelihood_modename,
-    };
+    use gam::families::survival_construction::survival_likelihood_modename;
     use ndarray::s;
 
     let parsed = parse_formula(&formula)
@@ -29625,89 +29604,81 @@ fn build_survival_transformation_ffi_payload(
         .ok_or_else(|| "survival transformation FFI requires Surv(...) response".to_string())?;
     let likelihood_label = survival_likelihood_modename(rp_result.likelihood_mode).to_string();
 
-    let mut payload = FittedModelPayload::new(
-        MODEL_VERSION,
-        formula,
-        ModelKind::Survival,
-        FittedFamily::Survival {
-            likelihood: LikelihoodSpec::new(
-                ResponseFamily::RoystonParmar,
-                InverseLink::Standard(StandardLink::Identity),
-            ),
-            survival_likelihood: Some(likelihood_label.clone()),
-            survival_distribution: None,
-            frailty: gam::families::lognormal_kernel::FrailtySpec::None,
-        },
-        "royston-parmar".to_string(),
-    );
-    payload.unified = Some(rp_result.fit.clone());
-    payload.fit_result = Some(rp_result.fit.clone());
-    payload.data_schema = Some(dataset.schema.clone());
-    payload.survival_entry = entryname;
-    payload.survival_exit = Some(exitname);
-    payload.survival_event = Some(eventname);
     let cause_count = rp_result.fit.blocks.len().max(1);
     let is_joint_cause_specific = cause_count > 1;
-    payload.survivalspec = Some(if is_joint_cause_specific {
-        "cause-specific".to_string()
-    } else {
-        "net".to_string()
-    });
-    if is_joint_cause_specific {
-        payload.survival_cause_count = Some(cause_count);
-        payload.survival_endpoint_names = Some(
-            (1..=cause_count)
-                .map(|idx| format!("cause_{idx}"))
-                .collect(),
-        );
-    }
-    payload.survival_baseline_target =
-        Some(survival_baseline_targetname(rp_result.baseline_cfg.target).to_string());
-    payload.survival_baseline_scale = rp_result.baseline_cfg.scale;
-    payload.survival_baseline_shape = rp_result.baseline_cfg.shape;
-    payload.survival_baseline_rate = rp_result.baseline_cfg.rate;
-    payload.survival_baseline_makeham = rp_result.baseline_cfg.makeham;
-    payload.apply_survival_time_basis(&rp_result.time_basis);
-    payload.survivalridge_lambda = Some(fit_config.ridge_lambda);
-    payload.survival_likelihood = Some(likelihood_label);
-    if let Some(timewiggle) = rp_result.baseline_timewiggle.as_ref() {
-        payload.baseline_timewiggle_degree = Some(timewiggle.degree);
-        payload.baseline_timewiggle_knots = Some(timewiggle.knots.to_vec());
-        payload.baseline_timewiggle_penalty_orders = parsed
-            .timewiggle
-            .as_ref()
-            .map(|cfg| cfg.penalty_orders.clone());
-        payload.baseline_timewiggle_double_penalty =
-            parsed.timewiggle.as_ref().map(|cfg| cfg.double_penalty);
-        let start = rp_result.time_base_ncols;
-        let end = start + timewiggle.ncols;
-        if is_joint_cause_specific {
-            let mut by_cause = Vec::with_capacity(cause_count);
-            for (cause_idx, block) in rp_result.fit.blocks.iter().enumerate() {
-                if block.beta.len() < end {
+
+    // Source-specific work: extract the baseline-timewiggle coefficients from
+    // the differently-shaped fit struct (one block for net, one per cause for
+    // joint cause-specific). The canonical payload is then assembled by the same
+    // shared core the CLI uses.
+    let timewiggle = rp_result
+        .baseline_timewiggle
+        .as_ref()
+        .map(|timewiggle| -> Result<SurvivalTimewiggle, String> {
+            let start = rp_result.time_base_ncols;
+            let end = start + timewiggle.ncols;
+            let beta = if is_joint_cause_specific {
+                let mut by_cause = Vec::with_capacity(cause_count);
+                for (cause_idx, block) in rp_result.fit.blocks.iter().enumerate() {
+                    if block.beta.len() < end {
+                        return Err(format!(
+                            "joint cause-specific survival timewiggle beta mismatch for cause {}: beta has {}, needs {end}",
+                            cause_idx + 1,
+                            block.beta.len()
+                        ));
+                    }
+                    by_cause.push(block.beta.slice(s![start..end]).to_vec());
+                }
+                SurvivalTimewiggleBeta::ByCause(by_cause)
+            } else {
+                let beta = &rp_result.fit.beta;
+                if beta.len() < end {
                     return Err(format!(
-                        "joint cause-specific survival timewiggle beta mismatch for cause {}: beta has {}, needs {end}",
-                        cause_idx + 1,
-                        block.beta.len()
+                        "survival transformation timewiggle beta mismatch: beta has {}, needs {end}",
+                        beta.len()
                     ));
                 }
-                by_cause.push(block.beta.slice(s![start..end]).to_vec());
-            }
-            payload.beta_baseline_timewiggle_by_cause = Some(by_cause);
-        } else {
-            let beta = &rp_result.fit.beta;
-            if beta.len() < end {
-                return Err(format!(
-                    "survival transformation timewiggle beta mismatch: beta has {}, needs {end}",
-                    beta.len()
-                ));
-            }
-            payload.beta_baseline_timewiggle = Some(beta.slice(s![start..end]).to_vec());
-        }
-    }
-    payload.training_headers = Some(dataset.headers.clone());
-    payload.resolved_termspec = Some(rp_result.resolvedspec);
-    payload.offset_column = fit_config.offset_column.clone();
+                SurvivalTimewiggleBeta::Single(beta.slice(s![start..end]).to_vec())
+            };
+            Ok(SurvivalTimewiggle {
+                degree: timewiggle.degree,
+                knots: timewiggle.knots.to_vec(),
+                penalty_orders: parsed.timewiggle.as_ref().map(|cfg| cfg.penalty_orders.clone()),
+                double_penalty: parsed.timewiggle.as_ref().map(|cfg| cfg.double_penalty),
+                beta,
+            })
+        })
+        .transpose()?;
+
+    let payload = assemble_survival_transformation_payload(
+        SurvivalTransformationInputs {
+            formula,
+            data_schema: dataset.schema.clone(),
+            fit_result: rp_result.fit.clone(),
+            survival_entry: entryname,
+            survival_exit: exitname,
+            survival_event: eventname,
+            survivalspec: if is_joint_cause_specific {
+                "cause-specific".to_string()
+            } else {
+                "net".to_string()
+            },
+            cause_count: is_joint_cause_specific.then_some(cause_count),
+            baseline_cfg: rp_result.baseline_cfg.clone(),
+            time_basis: rp_result.time_basis.clone(),
+            ridge_lambda: fit_config.ridge_lambda,
+            survival_likelihood_label: likelihood_label,
+            resolved_termspec: rp_result.resolvedspec,
+            survival_beta_time: None,
+            timewiggle,
+        },
+        SavedModelSourceMetadata {
+            training_headers: dataset.headers.clone(),
+            training_feature_ranges: Some(dataset.feature_ranges()),
+            offset_column: fit_config.offset_column.clone(),
+            noise_offset_column: None,
+        },
+    );
     Ok(payload)
 }
 
@@ -29738,46 +29709,55 @@ fn build_gaussian_location_scale_ffi_payload(
     let scale_beta = fit
         .block_by_role(BlockRole::Scale)
         .map(|block| block.beta.to_vec());
-    let wiggle_meta = match (
+    let wiggle = location_scale_wiggle_from_parts(
         ls_result.wiggle_knots,
         ls_result.wiggle_degree,
         ls_result.beta_link_wiggle,
-    ) {
-        (Some(knots), Some(degree), Some(beta)) => Some((knots, degree, beta)),
-        _ => None,
-    };
+    );
 
-    let mut payload = FittedModelPayload::new(
-        MODEL_VERSION,
-        formula,
-        ModelKind::LocationScale,
-        FittedFamily::LocationScale {
-            likelihood: LikelihoodSpec::new(
-                ResponseFamily::Gaussian,
-                InverseLink::Standard(StandardLink::Identity),
-            ),
+    // Thin adapter over the shared core assembler; the FFI freezes the mean and
+    // noise specs from their designs and reads offset columns from the
+    // FitConfig. See `assemble_location_scale_payload`.
+    assemble_location_scale_payload(
+        LocationScaleInputs {
+            formula,
+            data_schema: dataset.schema.clone(),
+            noise_formula,
+            resolved_termspec: frozen_meanspec,
+            resolved_termspec_noise: frozen_noisespec,
+            fit_result: fit,
+            beta_noise: scale_beta,
+            wiggle,
+        },
+        LocationScaleResponse::Gaussian {
+            response_scale,
             base_link: None,
         },
-        "gaussian-location-scale".to_string(),
-    );
-    payload.unified = Some(fit.clone());
-    payload.fit_result = Some(fit);
-    payload.data_schema = Some(dataset.schema.clone());
-    payload.link = Some(InverseLink::Standard(StandardLink::Identity));
-    payload.formula_noise = Some(noise_formula);
-    payload.beta_noise = scale_beta;
-    payload.gaussian_response_scale = Some(response_scale);
-    payload.training_headers = Some(dataset.headers.clone());
-    payload.resolved_termspec = Some(frozen_meanspec);
-    payload.resolved_termspec_noise = Some(frozen_noisespec);
-    payload.offset_column = fit_config.offset_column.clone();
-    payload.noise_offset_column = fit_config.noise_offset_column.clone();
-    if let Some((knots, degree, beta_link_wiggle)) = wiggle_meta {
-        payload.linkwiggle_knots = Some(knots.to_vec());
-        payload.linkwiggle_degree = Some(degree);
-        payload.beta_link_wiggle = Some(beta_link_wiggle);
+        SavedModelSourceMetadata {
+            training_headers: dataset.headers.clone(),
+            training_feature_ranges: Some(dataset.feature_ranges()),
+            offset_column: fit_config.offset_column.clone(),
+            noise_offset_column: fit_config.noise_offset_column.clone(),
+        },
+    )
+}
+
+/// Map the optional `(knots, degree, beta)` link-wiggle parts a location-scale
+/// fit may produce into the shared [`LocationScaleWiggle`] form. All three are
+/// present together or not at all.
+fn location_scale_wiggle_from_parts(
+    knots: Option<Array1<f64>>,
+    degree: Option<usize>,
+    beta_link_wiggle: Option<Vec<f64>>,
+) -> Option<LocationScaleWiggle> {
+    match (knots, degree, beta_link_wiggle) {
+        (Some(knots), Some(degree), Some(beta_link_wiggle)) => Some(LocationScaleWiggle {
+            knots: knots.to_vec(),
+            degree,
+            beta_link_wiggle,
+        }),
+        _ => None,
     }
-    Ok(payload)
 }
 
 fn build_binomial_location_scale_ffi_payload(
@@ -29828,59 +29808,38 @@ fn build_binomial_location_scale_ffi_payload(
     let scale_beta = fit
         .block_by_role(BlockRole::Scale)
         .map(|block| block.beta.to_vec());
-    let wiggle_meta = match (
+    let wiggle = location_scale_wiggle_from_parts(
         ls_result.wiggle_knots,
         ls_result.wiggle_degree,
         ls_result.beta_link_wiggle,
-    ) {
-        (Some(knots), Some(degree), Some(beta)) => Some((knots, degree, beta)),
-        _ => None,
-    };
+    );
 
-    let location_scale_likelihood = inverse_link_to_binomial_spec(&link_kind).map_err(|e| {
-        format!(
-            "failed to resolve LikelihoodSpec for binomial location-scale link {:?}: {e}",
-            link_kind
-        )
-    })?;
-    let mut payload = FittedModelPayload::new(
-        MODEL_VERSION,
-        formula,
-        ModelKind::LocationScale,
-        FittedFamily::LocationScale {
-            likelihood: location_scale_likelihood,
-            base_link: Some(link_kind.clone()),
+    // Thin adapter over the shared core assembler; the FFI freezes the threshold
+    // and noise specs from their designs, encodes the binomial noise
+    // scale-deviation transform, and reads offset columns from the FitConfig.
+    // See `assemble_location_scale_payload`.
+    assemble_location_scale_payload(
+        LocationScaleInputs {
+            formula,
+            data_schema: dataset.schema.clone(),
+            noise_formula,
+            resolved_termspec: frozen_meanspec,
+            resolved_termspec_noise: frozen_noisespec,
+            fit_result: fit,
+            beta_noise: scale_beta,
+            wiggle,
         },
-        "binomial-location-scale".to_string(),
-    );
-    payload.unified = Some(fit.clone());
-    payload.fit_result = Some(fit);
-    payload.data_schema = Some(dataset.schema.clone());
-    payload.link = Some(link_kind.clone());
-    payload.formula_noise = Some(noise_formula);
-    payload.beta_noise = scale_beta;
-    payload.noise_projection = Some(
-        binomial_noise_transform
-            .projection_coef
-            .rows()
-            .into_iter()
-            .map(|row| row.to_vec())
-            .collect(),
-    );
-    payload.noise_center = Some(binomial_noise_transform.weighted_column_mean.to_vec());
-    payload.noise_scale = Some(binomial_noise_transform.rescale.to_vec());
-    payload.noise_non_intercept_start = Some(binomial_noise_transform.non_intercept_start);
-    payload.training_headers = Some(dataset.headers.clone());
-    payload.resolved_termspec = Some(frozen_meanspec);
-    payload.resolved_termspec_noise = Some(frozen_noisespec);
-    payload.offset_column = fit_config.offset_column.clone();
-    payload.noise_offset_column = fit_config.noise_offset_column.clone();
-    if let Some((knots, degree, beta_link_wiggle)) = wiggle_meta {
-        payload.linkwiggle_knots = Some(knots.to_vec());
-        payload.linkwiggle_degree = Some(degree);
-        payload.beta_link_wiggle = Some(beta_link_wiggle);
-    }
-    Ok(payload)
+        LocationScaleResponse::Binomial {
+            link: link_kind,
+            noise_transform: &binomial_noise_transform,
+        },
+        SavedModelSourceMetadata {
+            training_headers: dataset.headers.clone(),
+            training_feature_ranges: Some(dataset.feature_ranges()),
+            offset_column: fit_config.offset_column.clone(),
+            noise_offset_column: fit_config.noise_offset_column.clone(),
+        },
+    )
 }
 
 fn build_survival_location_scale_ffi_payload(
@@ -30023,82 +29982,54 @@ fn build_survival_location_scale_ffi_payload(
     )
     .map_err(|err| format!("failed to encode survival noise transform: {err}"))?;
 
-    let mut payload = FittedModelPayload::new(
-        MODEL_VERSION,
-        formula,
-        ModelKind::Survival,
-        FittedFamily::Survival {
-            likelihood: LikelihoodSpec::new(
-                ResponseFamily::RoystonParmar,
-                InverseLink::Standard(StandardLink::Identity),
-            ),
-            survival_likelihood: Some(survival_likelihood_modename(likelihood_mode).to_string()),
-            survival_distribution: residual_distribution_from_inverse_link(&fitted_inverse_link),
-            frailty: gam::families::lognormal_kernel::FrailtySpec::None,
+    let resolved_thresholdspec = freeze_term_collection_from_design(
+        &ls_result.fit.resolved_thresholdspec,
+        &ls_result.fit.threshold_design,
+    )
+    .map_err(|err| err.to_string())?;
+    let resolved_log_sigmaspec = freeze_term_collection_from_design(
+        &ls_result.fit.resolved_log_sigmaspec,
+        &ls_result.fit.log_sigma_design,
+    )
+    .map_err(|err| err.to_string())?;
+
+    // Thin adapter over the shared core assembler. The FFI's source-specific
+    // work above re-derives the survival metadata, compacts the fit result with
+    // the fitted link state, and re-encodes the noise scale-deviation transform;
+    // the canonical payload is assembled by the same path the CLI uses.
+    Ok(assemble_survival_location_scale_payload(
+        SurvivalLocationScaleInputs {
+            formula,
+            data_schema: dataset.schema.clone(),
+            fit_result,
+            fitted_inverse_link: fitted_inverse_link.clone(),
+            linkwiggle_degree: ls_result.wiggle_degree,
+            linkwiggle_knots: ls_result.wiggle_knots.as_ref().map(|k| k.to_vec()),
+            beta_link_wiggle: ls_result.fit.fit.beta_link_wiggle().as_ref().map(|b| b.to_vec()),
+            baseline_timewiggle: None,
+            survival_entry: entryname,
+            survival_exit: exitname,
+            survival_event: eventname,
+            survivalspec: "net".to_string(),
+            baseline_cfg,
+            time_basis: SavedSurvivalTimeBasis::from_build(&time_build, time_anchor),
+            ridge_lambda: fit_config.ridge_lambda,
+            survival_likelihood_label: survival_likelihood_modename(likelihood_mode).to_string(),
+            formula_noise: None,
+            survival_beta_time: ls_result.fit.fit.beta_time().to_vec(),
+            survival_beta_threshold: ls_result.fit.fit.beta_threshold().to_vec(),
+            survival_beta_log_sigma: ls_result.fit.fit.beta_log_sigma().to_vec(),
+            noise_transform: &survival_noise_transform,
+            resolved_thresholdspec,
+            resolved_log_sigmaspec,
         },
-        "royston-parmar".to_string(),
-    );
-    payload.unified = Some(fit_result.clone());
-    payload.fit_result = Some(fit_result);
-    payload.data_schema = Some(dataset.schema.clone());
-    payload.link = Some(fitted_inverse_link.clone());
-    payload.linkwiggle_degree = ls_result.wiggle_degree;
-    payload.beta_link_wiggle = ls_result
-        .fit
-        .fit
-        .beta_link_wiggle()
-        .as_ref()
-        .map(|b| b.to_vec());
-    payload.linkwiggle_knots = ls_result.wiggle_knots.as_ref().map(|k| k.to_vec());
-    payload.survival_entry = entryname;
-    payload.survival_exit = Some(exitname);
-    payload.survival_event = Some(eventname);
-    payload.survivalspec = Some("net".to_string());
-    payload.survival_baseline_target =
-        Some(survival_baseline_targetname(baseline_cfg.target).to_string());
-    payload.survival_baseline_scale = baseline_cfg.scale;
-    payload.survival_baseline_shape = baseline_cfg.shape;
-    payload.survival_baseline_rate = baseline_cfg.rate;
-    payload.survival_baseline_makeham = baseline_cfg.makeham;
-    payload.apply_survival_time_basis(&SavedSurvivalTimeBasis::from_build(
-        &time_build,
-        time_anchor,
-    ));
-    payload.survivalridge_lambda = Some(fit_config.ridge_lambda);
-    payload.survival_likelihood = Some(survival_likelihood_modename(likelihood_mode).to_string());
-    payload.survival_beta_time = Some(ls_result.fit.fit.beta_time().to_vec());
-    payload.survival_beta_threshold = Some(ls_result.fit.fit.beta_threshold().to_vec());
-    payload.survival_beta_log_sigma = Some(ls_result.fit.fit.beta_log_sigma().to_vec());
-    payload.survival_noise_projection = Some(
-        survival_noise_transform
-            .projection_coef
-            .rows()
-            .into_iter()
-            .map(|row| row.to_vec())
-            .collect(),
-    );
-    payload.survival_noise_center = Some(survival_noise_transform.weighted_column_mean.to_vec());
-    payload.survival_noise_scale = Some(survival_noise_transform.rescale.to_vec());
-    payload.survival_noise_non_intercept_start = Some(survival_noise_transform.non_intercept_start);
-    payload.survival_distribution = residual_distribution_from_inverse_link(&fitted_inverse_link);
-    payload.training_headers = Some(dataset.headers.clone());
-    payload.resolved_termspec = Some(
-        freeze_term_collection_from_design(
-            &ls_result.fit.resolved_thresholdspec,
-            &ls_result.fit.threshold_design,
-        )
-        .map_err(|err| err.to_string())?,
-    );
-    payload.resolved_termspec_noise = Some(
-        freeze_term_collection_from_design(
-            &ls_result.fit.resolved_log_sigmaspec,
-            &ls_result.fit.log_sigma_design,
-        )
-        .map_err(|err| err.to_string())?,
-    );
-    payload.offset_column = fit_config.offset_column.clone();
-    payload.noise_offset_column = fit_config.noise_offset_column.clone();
-    Ok(payload)
+        SavedModelSourceMetadata {
+            training_headers: dataset.headers.clone(),
+            training_feature_ranges: Some(dataset.feature_ranges()),
+            offset_column: fit_config.offset_column.clone(),
+            noise_offset_column: fit_config.noise_offset_column.clone(),
+        },
+    ))
 }
 
 fn build_latent_survival_ffi_payload(
@@ -30155,7 +30086,6 @@ fn build_latent_window_ffi_payload(
     use gam::families::survival_construction::{
         build_survival_time_basis, parse_survival_baseline_config,
         parse_survival_time_basis_config, resolve_survival_time_anchor_value,
-        survival_baseline_targetname,
     };
 
     let parsed = gam::inference::formula_dsl::parse_formula(&formula).map_err(|err| {
@@ -30251,41 +30181,34 @@ fn build_latent_window_ffi_payload(
         "latent-binary".to_string()
     };
 
-    let mut payload = FittedModelPayload::new(
-        MODEL_VERSION,
-        formula,
-        ModelKind::Survival,
-        saved_family,
-        model_class_label,
-    );
-    payload.unified = Some(fit.clone());
-    payload.fit_result = Some(fit.clone());
-    payload.data_schema = Some(dataset.schema.clone());
-    payload.survival_entry = entryname;
-    payload.survival_exit = Some(exitname);
-    payload.survival_event = Some(eventname);
-    payload.survivalspec = Some("net".to_string());
-    payload.survival_baseline_target =
-        Some(survival_baseline_targetname(baseline_cfg.target).to_string());
-    payload.survival_baseline_scale = baseline_cfg.scale;
-    payload.survival_baseline_shape = baseline_cfg.shape;
-    payload.survival_baseline_rate = baseline_cfg.rate;
-    payload.survival_baseline_makeham = baseline_cfg.makeham;
-    payload.apply_survival_time_basis(&SavedSurvivalTimeBasis::from_build(
-        &time_build,
-        time_anchor,
-    ));
-    payload.survival_likelihood = Some(likelihood_label);
-    payload.survival_beta_time = Some(fit.beta_time().to_vec());
-    payload.survivalridge_lambda = Some(fit_config.ridge_lambda);
-    payload.training_headers = Some(dataset.headers.clone());
-    payload.resolved_termspec = Some(
-        freeze_term_collection_from_design(&resolvedspec, &cov_design)
-            .map_err(|err| err.to_string())?,
-    );
-    payload.offset_column = fit_config.offset_column.clone();
-    payload.noise_offset_column = fit_config.noise_offset_column.clone();
-    Ok(payload)
+    let beta_time = fit.beta_time().to_vec();
+    let resolved_termspec = freeze_term_collection_from_design(&resolvedspec, &cov_design)
+        .map_err(|err| err.to_string())?;
+
+    Ok(assemble_latent_window_payload(
+        LatentWindowInputs {
+            formula,
+            data_schema: dataset.schema.clone(),
+            fit_result: fit,
+            family: saved_family,
+            model_class_label,
+            likelihood_label,
+            survival_entry: entryname,
+            survival_exit: exitname,
+            survival_event: eventname,
+            baseline_cfg,
+            time_basis: SavedSurvivalTimeBasis::from_build(&time_build, time_anchor),
+            ridge_lambda: fit_config.ridge_lambda,
+            beta_time,
+            resolved_termspec,
+        },
+        SavedModelSourceMetadata {
+            training_headers: dataset.headers.clone(),
+            training_feature_ranges: Some(dataset.feature_ranges()),
+            offset_column: fit_config.offset_column.clone(),
+            noise_offset_column: fit_config.noise_offset_column.clone(),
+        },
+    ))
 }
 
 fn predict_table_survival(
