@@ -227,7 +227,7 @@ fn gam_nuts_binomial_logit_recovers_truth_and_is_calibrated() {
     // Posterior of η = X β at the training points: keep ALL draws per point so we
     // can form the posterior mean AND pointwise credible intervals for coverage.
     let ndraw = nuts.samples.nrows();
-    let mut eta_draws: Vec<Vec<f64>> = vec![Vec::with_capacity(ndraw); n];
+    let mut eta_draws: Vec<Vec<f64>> = (0..n).map(|_| Vec::with_capacity(ndraw)).collect();
     let mut beta_draw = Array1::<f64>::zeros(p);
     for d in 0..ndraw {
         for j in 0..p {
