@@ -22898,7 +22898,7 @@ fn build_periodic_duchon_basis_1d(
             centers,
             length_scale: spec.length_scale,
             periodic: Some(vec![Some(period)]),
-            power: spec.power_as_usize(),
+            power: spec.power,
             nullspace_order: effective_nullspace_order,
             identifiability_transform,
             input_scales: None,

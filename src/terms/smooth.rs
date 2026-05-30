@@ -4159,7 +4159,7 @@ fn build_shape_constraint_design_1d(
                 periodic: None,
                 center_strategy: crate::basis::CenterStrategy::UserProvided(centers.clone()),
                 length_scale: *length_scale,
-                power: *power as f64,
+                power: *power,
                 nullspace_order: *nullspace_order,
                 identifiability: identifiability_transform
                     .as_ref()
@@ -9002,7 +9002,7 @@ fn extract_spatial_operator_runtime_caches(
                             centers.view(),
                             None,
                             *length_scale,
-                            *power as f64,
+                            *power,
                             *nullspace_order,
                             aniso_log_scales.as_deref(),
                             identifiability_transform.as_ref().map(|z| z.view()),
@@ -13414,7 +13414,7 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
             latent.clone(),
             std::sync::Arc::new(centers.clone()),
             *length_scale,
-            *power as f64,
+            *power,
             *nullspace_order,
             identifiability_transform.clone(),
         )
@@ -15748,7 +15748,7 @@ pub fn freeze_term_collection_from_design(
                             centers.clone(),
                         ),
                         length_scale: *length_scale,
-                        power: *power as f64,
+                        power: *power,
                         nullspace_order: *nullspace_order,
                         identifiability,
                         aniso_log_scales: meta_aniso.clone(),
@@ -15825,7 +15825,7 @@ pub fn freeze_term_collection_from_design(
             ) => {
                 s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
                 s.length_scale = *length_scale;
-                s.power = *power as f64;
+                s.power = *power;
                 s.nullspace_order = *nullspace_order;
                 s.identifiability = match identifiability_transform {
                     Some(z) => SpatialIdentifiability::FrozenTransform {
