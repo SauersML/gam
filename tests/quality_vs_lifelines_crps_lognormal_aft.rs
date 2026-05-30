@@ -387,6 +387,20 @@ emit("sigma", [float(np.exp(sigma_params["Intercept"]))])
         "location (mu) surface diverges from lifelines across the (x,z) grid: \
          pearson={mu_grid_corr:.5}"
     );
+    //  * constant log-scale sigma relative gap <= 0.05. CRPS already folds sigma
+    //    into the predictive spread, but the scale channel is the second half of
+    //    the (mu, sigma) calibration the spec measures, so it gets its own
+    //    gauge-free assertion. Both engines estimate one constant lognormal scale
+    //    under the SAME right-censored likelihood; 0.05 is the established bound
+    //    for constant-scale lognormal estimation in the sibling AFT tests (scale
+    //    estimation is intrinsically noisier than the location, so a tighter bound
+    //    would over-assert; a looser one would let a mis-estimated spread slip
+    //    through even when CRPS happens to cancel).
+    assert!(
+        sigma_rel <= 0.05,
+        "lognormal scale sigma diverges from lifelines: gam_sigma={gam_sigma:.4} \
+         ref_sigma={ref_sigma:.4} rel={sigma_rel:.4}"
+    );
 }
 
 /// Solve a 5x5 linear system `a * x = b` by Gaussian elimination with partial
