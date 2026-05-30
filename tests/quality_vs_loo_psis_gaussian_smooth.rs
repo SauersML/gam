@@ -17,34 +17,28 @@
 //!      Pearson correlation. ALO is a one-fit analytic approximation to this
 //!      n-fit brute-force quantity; tight correlation is the whole claim.
 //!
-//!   2. Does ALO agree with `loo`'s PSIS-LOO *relative importance weights*? We
+//!   2. Does ALO agree with `loo`'s PSIS-LOO *pointwise predictive density*? We
 //!      build mgcv's Gaussian posterior over the smooth (coefficients ~ N(beta,
 //!      Vp)), form the S x n pointwise loglik matrix, and let `loo::loo()`
-//!      compute the standardized PSIS importance ratios (the per-point relative
-//!      LOO weight `exp(loglik_loo_i - loglik_i)` after Pareto smoothing,
-//!      normalized to the unit simplex). We compare those against the same
-//!      standardized ratios derived from ALO's `eta_tilde`. If ALO's predictor
-//!      diverged, these weights would diverge too — they are the diagnostic
-//!      proxy the `loo` package exists to compute.
+//!      compute the Pareto-smoothed per-point LOO log predictive density
+//!      `elpd_loo_i`. That `elpd_loo_i` is exactly the same quantity ALO's
+//!      `alo_loglik_i` estimates — the leave-one-out pointwise log-likelihood —
+//!      so we compare the two vectors DIRECTLY (no lossy softmax/simplex
+//!      re-standardization that would collapse the additive log-density scale).
+//!      PSIS adds a small posterior-predictive-variance term that ALO's
+//!      conditional closed form omits, so we test (a) shape via Pearson and (b)
+//!      level via RMSE with a bound that admits only that O(v_i) gap.
 //!
 //! A real divergence here is a real bug in ALO; the bounds are not weakened to
 //! make gam pass.
 
 use gam::inference::alo::compute_alo_diagnostics_from_fit;
-use gam::test_support::reference::{Column, pearson, run_r};
+use gam::test_support::reference::{Column, pearson, rmse, run_r};
 use gam::types::LinkFunction;
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use std::path::Path;
 
 const LIDAR_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/lidar.csv");
-
-/// Mean-absolute difference between two equal-length vectors (the metric for
-/// the standardized PSIS weights).
-fn mae(a: &[f64], b: &[f64]) -> f64 {
-    assert_eq!(a.len(), b.len(), "mae length mismatch");
-    let s: f64 = a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum();
-    s / a.len().max(1) as f64
-}
 
 #[test]
 fn gam_alo_eta_tilde_matches_loo_psis_on_lidar() {
@@ -171,26 +165,30 @@ fn gam_alo_eta_tilde_matches_loo_psis_on_lidar() {
     // closed form on both sides, so this isolates eta_tilde fidelity.
     let corr = pearson(&alo_loglik, loglik_loo_exact);
 
-    // ---- metric 2: MAE of standardized PSIS-LOO importance weights --------
-    // The `loo` object's per-point relative importance is the softmax of the
-    // pointwise PSIS-LOO predictive log-density (elpd_loo): a unit-simplex
-    // weight vector that says how much each point contributes to the LOO score.
-    // We compare that to the SAME standardization of ALO's exact-form pointwise
-    // LOO loglik. If ALO's eta_tilde diverged from the LOO predictor, these
-    // standardized importance ratios would diverge.
-    let softmax = |v: &[f64]| -> Vec<f64> {
-        let m = v.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let exps: Vec<f64> = v.iter().map(|x| (x - m).exp()).collect();
-        let z: f64 = exps.iter().sum();
-        exps.into_iter().map(|e| e / z).collect()
+    // ---- metric 2: ALO loglik vs loo's PSIS-LOO pointwise log-density ------
+    // `loo`'s `elpd_loo_i` and ALO's `alo_loglik_i` are the SAME object — the
+    // per-point leave-one-out log predictive density — so we compare them
+    // directly. Two scale-aware metrics: Pearson isolates shape (immune to the
+    // constant `-0.5*ln(2*pi*phi)` offset both share), and RMSE bounds the
+    // level gap. PSIS marginalizes the posterior, so each elpd_loo_i carries an
+    // extra `-0.5*v_i/phi`-style posterior-predictive-variance term (v_i =
+    // x_i Vp x_i^T) that ALO's conditional closed form omits; that term is the
+    // only admissible discrepancy, and it is small relative to the loglik
+    // spread driven by the residuals.
+    let elpd_pearson = pearson(&alo_loglik, elpd_loo);
+    let elpd_rmse = rmse(&alo_loglik, elpd_loo);
+    // Spread of the loglik vector itself, so the RMSE bound is judged against
+    // the scale of the quantity being compared rather than an absolute guess.
+    let loglik_spread = {
+        let mn = alo_loglik.iter().copied().fold(f64::INFINITY, f64::min);
+        let mx = alo_loglik.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        mx - mn
     };
-    let w_loo = softmax(elpd_loo);
-    let w_alo = softmax(&alo_loglik);
-    let weight_mae = mae(&w_alo, &w_loo);
 
     eprintln!(
         "lidar ALO vs loo/PSIS: n={n} edf={edf:.3} phi={phi:.5} \
-         loglik_pearson={corr:.5} weight_mae={weight_mae:.5}"
+         loglik_pearson={corr:.5} elpd_pearson={elpd_pearson:.5} \
+         elpd_rmse={elpd_rmse:.5} loglik_spread={loglik_spread:.5}"
     );
 
     // ALO is a single-fit analytic approximation to the n-refit exact LOO
@@ -203,12 +201,24 @@ fn gam_alo_eta_tilde_matches_loo_psis_on_lidar() {
         corr > 0.995,
         "ALO pointwise LOO loglik must track exact brute-force LOO: pearson={corr:.5}"
     );
-    // Standardized PSIS importance weights live on the unit simplex (they sum to
-    // 1 over n=221 points, so a uniform weight is ~0.0045). MAE < 0.02 means the
-    // per-point relative-importance disagreement is a small fraction of the
-    // weight scale — tight enough that an ALO predictor error would break it.
+    // Shape: ALO's pointwise LOO loglik and loo's PSIS elpd_loo are the same
+    // per-point predictive density; once the shared constant offset is removed
+    // they must track essentially perfectly. The residual-driven term dominates
+    // both, so a real eta_tilde error would decorrelate them.
     assert!(
-        weight_mae < 0.02,
-        "ALO vs loo PSIS standardized importance weights diverge: mae={weight_mae:.5}"
+        elpd_pearson > 0.99,
+        "ALO loglik must track loo PSIS-LOO elpd_loo in shape: pearson={elpd_pearson:.5}"
+    );
+    // Level: the only admissible gap is PSIS's posterior-predictive-variance
+    // term, which is small versus the loglik spread. Require the per-point RMSE
+    // to be well under a tenth of that spread — loose enough to admit the
+    // genuine O(v_i/phi) PSIS-vs-conditional difference, tight enough that a
+    // real divergence in eta_tilde (which moves the residual term, the dominant
+    // contribution) blows straight through it.
+    assert!(loglik_spread > 1.0, "loglik spread should be O(1+): {loglik_spread:.5}");
+    assert!(
+        elpd_rmse < 0.1 * loglik_spread,
+        "ALO loglik vs loo PSIS-LOO elpd_loo diverge in level: \
+         rmse={elpd_rmse:.5} spread={loglik_spread:.5}"
     );
 }
