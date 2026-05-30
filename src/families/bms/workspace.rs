@@ -5,6 +5,97 @@ use super::hessian_paths::*;
 use super::row_kernel::*;
 use super::*;
 
+/// Fill one deviation-basis column of the *score-warp* coefficient jet.
+///
+/// Shared body of the many `for_each_deviation_basis_cubic_at` visitor
+/// closures over a score (`h_range`) deviation basis: the value coefficient
+/// scales the local cubic by the slope `b`, and the `b`-partial scales it by
+/// `1.0`. Identical across every score-warp call site (cell-loop and observed,
+/// gradient / trace / trace-gradient / batched), which only differ in the
+/// target arrays and the label string passed to the iterator.
+#[inline]
+fn fill_score_basis_cell_coeff_jet(
+    idx: usize,
+    basis_span: super::exact_kernel::LocalSpanCubic,
+    b: f64,
+    scale: f64,
+    c0: &mut [[f64; 4]],
+    cb: &mut [[f64; 4]],
+) {
+    c0[idx] = scale_coeff4(
+        super::exact_kernel::score_basis_cell_coefficients(basis_span, b),
+        scale,
+    );
+    cb[idx] = scale_coeff4(
+        super::exact_kernel::score_basis_cell_coefficients(basis_span, 1.0),
+        scale,
+    );
+}
+
+/// Fill one deviation-basis column of the *link-wiggle* coefficient jet to
+/// first order only (value plus the `a`/`b`-partials).
+///
+/// Gradient-path counterpart of [`fill_link_basis_cell_coeff_jet`]: identical
+/// up to the first `a`/`b`-partials, used where the second partials are not
+/// required. Shared, unconditional body across the gradient call sites that
+/// only differ in target arrays and the iterator label string.
+#[inline]
+fn fill_link_basis_cell_coeff_gradient(
+    idx: usize,
+    basis_span: super::exact_kernel::LocalSpanCubic,
+    a: f64,
+    b: f64,
+    scale: f64,
+    c0: &mut [[f64; 4]],
+    ca: &mut [[f64; 4]],
+    cb: &mut [[f64; 4]],
+) {
+    c0[idx] = scale_coeff4(
+        super::exact_kernel::link_basis_cell_coefficients(basis_span, a, b),
+        scale,
+    );
+    let (dc_aw_raw, dc_bw_raw) =
+        super::exact_kernel::link_basis_cell_coefficient_partials(basis_span, a, b);
+    ca[idx] = scale_coeff4(dc_aw_raw, scale);
+    cb[idx] = scale_coeff4(dc_bw_raw, scale);
+}
+
+/// Fill one deviation-basis column of the *link-wiggle* coefficient jet.
+///
+/// Shared body of the many `for_each_deviation_basis_cubic_at` visitor
+/// closures over a link (`w_range`) deviation basis: value, the two first
+/// `a`/`b`-partials, and the three second `aa`/`ab`/`bb`-partials, each scaled
+/// by `scale`. Identical across every link-wiggle call site, which only differ
+/// in the target arrays and the iterator label string.
+#[inline]
+fn fill_link_basis_cell_coeff_jet(
+    idx: usize,
+    basis_span: super::exact_kernel::LocalSpanCubic,
+    a: f64,
+    b: f64,
+    scale: f64,
+    c0: &mut [[f64; 4]],
+    ca: &mut [[f64; 4]],
+    cb: &mut [[f64; 4]],
+    caa: &mut [[f64; 4]],
+    cab: &mut [[f64; 4]],
+    cbb: &mut [[f64; 4]],
+) {
+    c0[idx] = scale_coeff4(
+        super::exact_kernel::link_basis_cell_coefficients(basis_span, a, b),
+        scale,
+    );
+    let (dc_aw_raw, dc_bw_raw) =
+        super::exact_kernel::link_basis_cell_coefficient_partials(basis_span, a, b);
+    let (dc_aaw_raw, dc_abw_raw, dc_bbw_raw) =
+        super::exact_kernel::link_basis_cell_second_partials(basis_span, a, b);
+    ca[idx] = scale_coeff4(dc_aw_raw, scale);
+    cb[idx] = scale_coeff4(dc_bw_raw, scale);
+    caa[idx] = scale_coeff4(dc_aaw_raw, scale);
+    cab[idx] = scale_coeff4(dc_abw_raw, scale);
+    cbb[idx] = scale_coeff4(dc_bbw_raw, scale);
+}
+
 impl BernoulliMarginalSlopeFamily {
     #[inline]
     pub(super) fn probit_frailty_scale(&self) -> f64 {
@@ -3283,13 +3374,13 @@ impl BernoulliMarginalSlopeFamily {
                         z_mid,
                         "score-warp",
                         |_, idx, basis_span| {
-                            coeff_u[idx] = scale_coeff4(
-                                exact::score_basis_cell_coefficients(basis_span, b),
+                            fill_score_basis_cell_coeff_jet(
+                                idx,
+                                basis_span,
+                                b,
                                 scale,
-                            );
-                            coeff_bu[idx] = scale_coeff4(
-                                exact::score_basis_cell_coefficients(basis_span, 1.0),
-                                scale,
+                                &mut coeff_u,
+                                &mut coeff_bu,
                             );
                             Ok(())
                         },
@@ -3302,14 +3393,16 @@ impl BernoulliMarginalSlopeFamily {
                         u_mid,
                         "link-wiggle",
                         |_, idx, basis_span| {
-                            coeff_u[idx] = scale_coeff4(
-                                exact::link_basis_cell_coefficients(basis_span, a, b),
+                            fill_link_basis_cell_coeff_gradient(
+                                idx,
+                                basis_span,
+                                a,
+                                b,
                                 scale,
+                                &mut coeff_u,
+                                &mut coeff_au,
+                                &mut coeff_bu,
                             );
-                            let (dc_aw_raw, dc_bw_raw) =
-                                exact::link_basis_cell_coefficient_partials(basis_span, a, b);
-                            coeff_au[idx] = scale_coeff4(dc_aw_raw, scale);
-                            coeff_bu[idx] = scale_coeff4(dc_bw_raw, scale);
                             Ok(())
                         },
                     )?;
@@ -3411,13 +3504,13 @@ impl BernoulliMarginalSlopeFamily {
                     z_obs,
                     "score-warp observed",
                     |_, idx, basis_span| {
-                        g_u_fixed[idx] = scale_coeff4(
-                            exact::score_basis_cell_coefficients(basis_span, b),
+                        fill_score_basis_cell_coeff_jet(
+                            idx,
+                            basis_span,
+                            b,
                             scale,
-                        );
-                        g_bu_fixed[idx] = scale_coeff4(
-                            exact::score_basis_cell_coefficients(basis_span, 1.0),
-                            scale,
+                            &mut g_u_fixed,
+                            &mut g_bu_fixed,
                         );
                         Ok(())
                     },
@@ -3430,14 +3523,16 @@ impl BernoulliMarginalSlopeFamily {
                     u_obs,
                     "link-wiggle observed",
                     |_, idx, basis_span| {
-                        g_u_fixed[idx] = scale_coeff4(
-                            exact::link_basis_cell_coefficients(basis_span, a, b),
+                        fill_link_basis_cell_coeff_gradient(
+                            idx,
+                            basis_span,
+                            a,
+                            b,
                             scale,
+                            &mut g_u_fixed,
+                            &mut g_au_fixed,
+                            &mut g_bu_fixed,
                         );
-                        let (dc_aw_raw, dc_bw_raw) =
-                            exact::link_basis_cell_coefficient_partials(basis_span, a, b);
-                        g_au_fixed[idx] = scale_coeff4(dc_aw_raw, scale);
-                        g_bu_fixed[idx] = scale_coeff4(dc_bw_raw, scale);
                         Ok(())
                     },
                 )?;
@@ -4771,10 +4866,14 @@ impl BernoulliMarginalSlopeFamily {
                 z_obs,
                 "score-warp observed",
                 |_, idx, basis_span| {
-                    g_u_fixed[idx] =
-                        scale_coeff4(exact::score_basis_cell_coefficients(basis_span, b), scale);
-                    g_bu_fixed[idx] =
-                        scale_coeff4(exact::score_basis_cell_coefficients(basis_span, 1.0), scale);
+                    fill_score_basis_cell_coeff_jet(
+                        idx,
+                        basis_span,
+                        b,
+                        scale,
+                        &mut g_u_fixed,
+                        &mut g_bu_fixed,
+                    );
                     Ok(())
                 },
             )?;
@@ -4786,12 +4885,16 @@ impl BernoulliMarginalSlopeFamily {
                 u_obs,
                 "link-wiggle observed",
                 |_, idx, basis_span| {
-                    g_u_fixed[idx] =
-                        scale_coeff4(exact::link_basis_cell_coefficients(basis_span, a, b), scale);
-                    let (dc_aw_raw, dc_bw_raw) =
-                        exact::link_basis_cell_coefficient_partials(basis_span, a, b);
-                    g_au_fixed[idx] = scale_coeff4(dc_aw_raw, scale);
-                    g_bu_fixed[idx] = scale_coeff4(dc_bw_raw, scale);
+                    fill_link_basis_cell_coeff_gradient(
+                        idx,
+                        basis_span,
+                        a,
+                        b,
+                        scale,
+                        &mut g_u_fixed,
+                        &mut g_au_fixed,
+                        &mut g_bu_fixed,
+                    );
                     Ok(())
                 },
             )?;
@@ -5105,13 +5208,13 @@ impl BernoulliMarginalSlopeFamily {
                     z_mid,
                     "score-warp third-direction",
                     |_, idx, basis_span| {
-                        coeff_u[idx] = scale_coeff4(
-                            exact::score_basis_cell_coefficients(basis_span, b),
+                        fill_score_basis_cell_coeff_jet(
+                            idx,
+                            basis_span,
+                            b,
                             scale,
-                        );
-                        coeff_bu[idx] = scale_coeff4(
-                            exact::score_basis_cell_coefficients(basis_span, 1.0),
-                            scale,
+                            &mut coeff_u,
+                            &mut coeff_bu,
                         );
                         Ok(())
                     },
@@ -5125,19 +5228,19 @@ impl BernoulliMarginalSlopeFamily {
                     u_mid,
                     "link-wiggle third-direction",
                     |_, idx, basis_span| {
-                        coeff_u[idx] = scale_coeff4(
-                            exact::link_basis_cell_coefficients(basis_span, a, b),
+                        fill_link_basis_cell_coeff_jet(
+                            idx,
+                            basis_span,
+                            a,
+                            b,
                             scale,
+                            &mut coeff_u,
+                            &mut coeff_au,
+                            &mut coeff_bu,
+                            &mut coeff_aau,
+                            &mut coeff_abu,
+                            &mut coeff_bbu,
                         );
-                        let (dc_aw_raw, dc_bw_raw) =
-                            exact::link_basis_cell_coefficient_partials(basis_span, a, b);
-                        let (dc_aaw_raw, dc_abw_raw, dc_bbw_raw) =
-                            exact::link_basis_cell_second_partials(basis_span, a, b);
-                        coeff_au[idx] = scale_coeff4(dc_aw_raw, scale);
-                        coeff_bu[idx] = scale_coeff4(dc_bw_raw, scale);
-                        coeff_aau[idx] = scale_coeff4(dc_aaw_raw, scale);
-                        coeff_abu[idx] = scale_coeff4(dc_abw_raw, scale);
-                        coeff_bbu[idx] = scale_coeff4(dc_bbw_raw, scale);
                         Ok(())
                     },
                 )?;
@@ -5341,10 +5444,14 @@ impl BernoulliMarginalSlopeFamily {
                 z_obs,
                 "score-warp third-direction observed",
                 |_, idx, basis_span| {
-                    g_u_fixed[idx] =
-                        scale_coeff4(exact::score_basis_cell_coefficients(basis_span, b), scale);
-                    g_bu_fixed[idx] =
-                        scale_coeff4(exact::score_basis_cell_coefficients(basis_span, 1.0), scale);
+                    fill_score_basis_cell_coeff_jet(
+                        idx,
+                        basis_span,
+                        b,
+                        scale,
+                        &mut g_u_fixed,
+                        &mut g_bu_fixed,
+                    );
                     Ok(())
                 },
             )?;
@@ -5357,17 +5464,19 @@ impl BernoulliMarginalSlopeFamily {
                 u_obs,
                 "link-wiggle third-direction observed",
                 |_, idx, basis_span| {
-                    g_u_fixed[idx] =
-                        scale_coeff4(exact::link_basis_cell_coefficients(basis_span, a, b), scale);
-                    let (dc_aw_raw, dc_bw_raw) =
-                        exact::link_basis_cell_coefficient_partials(basis_span, a, b);
-                    let (dc_aaw_raw, dc_abw_raw, dc_bbw_raw) =
-                        exact::link_basis_cell_second_partials(basis_span, a, b);
-                    g_au_fixed[idx] = scale_coeff4(dc_aw_raw, scale);
-                    g_bu_fixed[idx] = scale_coeff4(dc_bw_raw, scale);
-                    g_aau_fixed[idx] = scale_coeff4(dc_aaw_raw, scale);
-                    g_abu_fixed[idx] = scale_coeff4(dc_abw_raw, scale);
-                    g_bbu_fixed[idx] = scale_coeff4(dc_bbw_raw, scale);
+                    fill_link_basis_cell_coeff_jet(
+                        idx,
+                        basis_span,
+                        a,
+                        b,
+                        scale,
+                        &mut g_u_fixed,
+                        &mut g_au_fixed,
+                        &mut g_bu_fixed,
+                        &mut g_aau_fixed,
+                        &mut g_abu_fixed,
+                        &mut g_bbu_fixed,
+                    );
                     Ok(())
                 },
             )?;
@@ -5838,13 +5947,13 @@ impl BernoulliMarginalSlopeFamily {
                     z_mid,
                     "score-warp trace-gradient base",
                     |_, idx, basis_span| {
-                        coeff_u[idx] = scale_coeff4(
-                            exact::score_basis_cell_coefficients(basis_span, b),
+                        fill_score_basis_cell_coeff_jet(
+                            idx,
+                            basis_span,
+                            b,
                             scale,
-                        );
-                        coeff_bu[idx] = scale_coeff4(
-                            exact::score_basis_cell_coefficients(basis_span, 1.0),
-                            scale,
+                            &mut coeff_u,
+                            &mut coeff_bu,
                         );
                         Ok(())
                     },
@@ -5858,19 +5967,19 @@ impl BernoulliMarginalSlopeFamily {
                     u_mid,
                     "link-wiggle trace-gradient base",
                     |_, idx, basis_span| {
-                        coeff_u[idx] = scale_coeff4(
-                            exact::link_basis_cell_coefficients(basis_span, a, b),
+                        fill_link_basis_cell_coeff_jet(
+                            idx,
+                            basis_span,
+                            a,
+                            b,
                             scale,
+                            &mut coeff_u,
+                            &mut coeff_au,
+                            &mut coeff_bu,
+                            &mut coeff_aau,
+                            &mut coeff_abu,
+                            &mut coeff_bbu,
                         );
-                        let (dc_aw_raw, dc_bw_raw) =
-                            exact::link_basis_cell_coefficient_partials(basis_span, a, b);
-                        let (dc_aaw_raw, dc_abw_raw, dc_bbw_raw) =
-                            exact::link_basis_cell_second_partials(basis_span, a, b);
-                        coeff_au[idx] = scale_coeff4(dc_aw_raw, scale);
-                        coeff_bu[idx] = scale_coeff4(dc_bw_raw, scale);
-                        coeff_aau[idx] = scale_coeff4(dc_aaw_raw, scale);
-                        coeff_abu[idx] = scale_coeff4(dc_abw_raw, scale);
-                        coeff_bbu[idx] = scale_coeff4(dc_bbw_raw, scale);
                         Ok(())
                     },
                 )?;
@@ -5975,10 +6084,14 @@ impl BernoulliMarginalSlopeFamily {
                 z_obs,
                 "score-warp trace-gradient observed",
                 |_, idx, basis_span| {
-                    g_u_fixed[idx] =
-                        scale_coeff4(exact::score_basis_cell_coefficients(basis_span, b), scale);
-                    g_bu_fixed[idx] =
-                        scale_coeff4(exact::score_basis_cell_coefficients(basis_span, 1.0), scale);
+                    fill_score_basis_cell_coeff_jet(
+                        idx,
+                        basis_span,
+                        b,
+                        scale,
+                        &mut g_u_fixed,
+                        &mut g_bu_fixed,
+                    );
                     Ok(())
                 },
             )?;
@@ -5991,17 +6104,19 @@ impl BernoulliMarginalSlopeFamily {
                 u_obs,
                 "link-wiggle trace-gradient observed",
                 |_, idx, basis_span| {
-                    g_u_fixed[idx] =
-                        scale_coeff4(exact::link_basis_cell_coefficients(basis_span, a, b), scale);
-                    let (dc_aw_raw, dc_bw_raw) =
-                        exact::link_basis_cell_coefficient_partials(basis_span, a, b);
-                    let (dc_aaw_raw, dc_abw_raw, dc_bbw_raw) =
-                        exact::link_basis_cell_second_partials(basis_span, a, b);
-                    g_au_fixed[idx] = scale_coeff4(dc_aw_raw, scale);
-                    g_bu_fixed[idx] = scale_coeff4(dc_bw_raw, scale);
-                    g_aau_fixed[idx] = scale_coeff4(dc_aaw_raw, scale);
-                    g_abu_fixed[idx] = scale_coeff4(dc_abw_raw, scale);
-                    g_bbu_fixed[idx] = scale_coeff4(dc_bbw_raw, scale);
+                    fill_link_basis_cell_coeff_jet(
+                        idx,
+                        basis_span,
+                        a,
+                        b,
+                        scale,
+                        &mut g_u_fixed,
+                        &mut g_au_fixed,
+                        &mut g_bu_fixed,
+                        &mut g_aau_fixed,
+                        &mut g_abu_fixed,
+                        &mut g_bbu_fixed,
+                    );
                     Ok(())
                 },
             )?;
@@ -6259,13 +6374,13 @@ impl BernoulliMarginalSlopeFamily {
                     z_mid,
                     "score-warp trace-gradient adjoint",
                     |_, idx, basis_span| {
-                        coeff_u[idx] = scale_coeff4(
-                            exact::score_basis_cell_coefficients(basis_span, b),
+                        fill_score_basis_cell_coeff_jet(
+                            idx,
+                            basis_span,
+                            b,
                             scale,
-                        );
-                        coeff_bu[idx] = scale_coeff4(
-                            exact::score_basis_cell_coefficients(basis_span, 1.0),
-                            scale,
+                            &mut coeff_u,
+                            &mut coeff_bu,
                         );
                         Ok(())
                     },
@@ -6279,19 +6394,19 @@ impl BernoulliMarginalSlopeFamily {
                     u_mid,
                     "link-wiggle trace-gradient adjoint",
                     |_, idx, basis_span| {
-                        coeff_u[idx] = scale_coeff4(
-                            exact::link_basis_cell_coefficients(basis_span, a, b),
+                        fill_link_basis_cell_coeff_jet(
+                            idx,
+                            basis_span,
+                            a,
+                            b,
                             scale,
+                            &mut coeff_u,
+                            &mut coeff_au,
+                            &mut coeff_bu,
+                            &mut coeff_aau,
+                            &mut coeff_abu,
+                            &mut coeff_bbu,
                         );
-                        let (dc_aw_raw, dc_bw_raw) =
-                            exact::link_basis_cell_coefficient_partials(basis_span, a, b);
-                        let (dc_aaw_raw, dc_abw_raw, dc_bbw_raw) =
-                            exact::link_basis_cell_second_partials(basis_span, a, b);
-                        coeff_au[idx] = scale_coeff4(dc_aw_raw, scale);
-                        coeff_bu[idx] = scale_coeff4(dc_bw_raw, scale);
-                        coeff_aau[idx] = scale_coeff4(dc_aaw_raw, scale);
-                        coeff_abu[idx] = scale_coeff4(dc_abw_raw, scale);
-                        coeff_bbu[idx] = scale_coeff4(dc_bbw_raw, scale);
                         Ok(())
                     },
                 )?;
@@ -6440,125 +6555,43 @@ impl BernoulliMarginalSlopeFamily {
         Ok(Array1::from_vec(direction_adjoint))
     }
 
-    pub(super) fn row_primary_third_trace_many_with_moments(
-        &self,
-        row: usize,
-        block_states: &[ParameterBlockState],
-        cache: &BernoulliMarginalSlopeExactEvalCache,
-        row_ctx: &BernoulliMarginalSlopeRowExactContext,
+    /// Accumulate the per-cell primary third-order Newton-assembly moments for
+    /// a batched directional contraction.
+    ///
+    /// Shared inner `for entry in cells { … }` loop of
+    /// [`Self::row_primary_third_trace_many_with_moments`] and
+    /// [`Self::row_primary_third_contracted_many_with_moments`]: both walk the
+    /// same denested cells, build the same sparse coefficient jet, and add the
+    /// same first/second/third cell-moment derivatives into the `f_*`
+    /// accumulators. The two call sites previously inlined byte-identical
+    /// copies differing only in the diagnostic `score_label` / `link_label`
+    /// strings threaded into the deviation-basis iterators.
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_primary_third_cell_moments(
+        cells: &[CachedDenestedCellMoments],
+        a: f64,
+        b: f64,
+        scale: f64,
+        r: usize,
+        h_range: Option<&std::ops::Range<usize>>,
+        w_range: Option<&std::ops::Range<usize>>,
+        score_runtime: Option<&DeviationRuntime>,
+        link_runtime: Option<&DeviationRuntime>,
+        zero_family: &[[f64; 4]],
         row_dirs: &[Array1<f64>],
-        gram: &[f64],
-    ) -> Result<Vec<f64>, String> {
-        let primary = &cache.primary;
-        let r = primary.total;
-        if row_dirs.is_empty() {
-            return Ok(Vec::new());
-        }
-        if gram.len() != r * r {
-            return Err(format!(
-                "bernoulli marginal-slope row trace gram length {} != {}",
-                gram.len(),
-                r * r
-            ));
-        }
-        if let Some((idx, dir)) = row_dirs.iter().enumerate().find(|(_, dir)| dir.len() != r) {
-            return Err(format!(
-                "bernoulli marginal-slope row trace direction {idx} length {} != {r}",
-                dir.len()
-            ));
-        }
-
-        if row_dirs.len() > 1 {
-            let trace_gradient = self.row_primary_third_trace_gradient_with_moments(
-                row,
-                block_states,
-                cache,
-                row_ctx,
-                gram,
-            )?;
-            let traces = row_dirs
-                .iter()
-                .map(|dir| trace_gradient.dot(dir))
-                .collect::<Vec<_>>();
-            return Ok(traces);
-        }
-
-        if !self.effective_flex_active(block_states)? {
-            let t = self.rigid_third_full_cached(block_states, cache, row)?;
-            let mut traces = vec![0.0; row_dirs.len()];
-            for (dir_idx, dir) in row_dirs.iter().enumerate() {
-                let m = contract_third_full(t, dir[0], dir[1]);
-                traces[dir_idx] = m[0][0] * gram[0]
-                    + m[0][1] * gram[1]
-                    + m[1][0] * gram[r]
-                    + m[1][1] * gram[r + 1];
-            }
-            return Ok(traces);
-        }
-        if !row_ctx.intercept.is_finite() || !row_ctx.m_a.is_finite() || row_ctx.m_a <= 0.0 {
-            return Err(
-                "non-finite flexible row context in batched third-order trace contraction"
-                    .to_string(),
-            );
-        }
-        let point = self.primary_point_from_block_states(row, block_states, primary)?;
-        let (q, b, beta_h_owned, beta_w_owned) = self.primary_point_components(&point, primary);
-        let beta_h = beta_h_owned.as_ref();
-        let beta_w = beta_w_owned.as_ref();
-        let a = row_ctx.intercept;
-
-        if let Some(grid) = self.latent_measure.empirical_grid_for_training_row(row)? {
-            let mut traces = vec![0.0; row_dirs.len()];
-            for (dir_idx, dir) in row_dirs.iter().enumerate() {
-                let third = self.empirical_flex_row_third_contracted_recompute(
-                    row, primary, q, b, beta_h, beta_w, row_ctx, dir, &grid,
-                )?;
-                traces[dir_idx] = Self::row_primary_trace_contract(&third, gram);
-            }
-            return Ok(traces);
-        }
-
+        score_label: &str,
+        link_label: &str,
+        f_a: &mut f64,
+        f_aa: &mut f64,
+        f_u: &mut Array1<f64>,
+        f_au: &mut Array1<f64>,
+        f_uv: &mut Array2<f64>,
+        f_a_dir: &mut [f64],
+        f_aa_dir: &mut [f64],
+        f_au_dir: &mut [f64],
+        f_uv_dir: &mut [f64],
+    ) -> Result<(), String> {
         use super::exact_kernel as exact;
-
-        let marginal = self.marginal_link_map(q)?;
-        let h_range = primary.h.as_ref();
-        let w_range = primary.w.as_ref();
-        let score_runtime = self.score_warp.as_ref();
-        let link_runtime = self.link_dev.as_ref();
-        let scale = self.probit_frailty_scale();
-        let zero_family = vec![[0.0; 4]; r];
-        let n_dirs = row_dirs.len();
-
-        let mut f_a = 0.0;
-        let mut f_aa = 0.0;
-        let mut f_u = Array1::<f64>::zeros(r);
-        let mut f_au = Array1::<f64>::zeros(r);
-        let mut f_uv = Array2::<f64>::zeros((r, r));
-        let mut f_a_dir = vec![0.0; n_dirs];
-        let mut f_aa_dir = vec![0.0; n_dirs];
-        let mut f_au_dir = vec![0.0; n_dirs * r];
-        let mut f_uv_dir = vec![0.0; n_dirs * r * r];
-
-        let owned_cells;
-        let cells: &[CachedDenestedCellMoments] = if let Some(cached) = self
-            .bundle_for_degree(block_states, cache, 15)?
-            .and_then(|bundle| bundle.row(row, 15))
-        {
-            cached
-        } else {
-            let partitions = self.denested_partition_cells(a, b, beta_h, beta_w)?;
-            owned_cells = partitions
-                .into_iter()
-                .map(|partition_cell| {
-                    self.evaluate_cell_derivative_moments_lru(partition_cell.cell, 15)
-                        .map(|state| CachedDenestedCellMoments {
-                            partition_cell,
-                            state,
-                        })
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            &owned_cells
-        };
 
         for entry in cells {
             let partition_cell = entry.partition_cell;
@@ -6608,15 +6641,15 @@ impl BernoulliMarginalSlopeFamily {
                     runtime,
                     h_range,
                     z_mid,
-                    "score-warp batched third-trace direction",
+                    score_label,
                     |_, idx, basis_span| {
-                        coeff_u[idx] = scale_coeff4(
-                            exact::score_basis_cell_coefficients(basis_span, b),
+                        fill_score_basis_cell_coeff_jet(
+                            idx,
+                            basis_span,
+                            b,
                             scale,
-                        );
-                        coeff_bu[idx] = scale_coeff4(
-                            exact::score_basis_cell_coefficients(basis_span, 1.0),
-                            scale,
+                            &mut coeff_u,
+                            &mut coeff_bu,
                         );
                         Ok(())
                     },
@@ -6628,21 +6661,21 @@ impl BernoulliMarginalSlopeFamily {
                     runtime,
                     w_range,
                     u_mid,
-                    "link-wiggle batched third-trace direction",
+                    link_label,
                     |_, idx, basis_span| {
-                        coeff_u[idx] = scale_coeff4(
-                            exact::link_basis_cell_coefficients(basis_span, a, b),
+                        fill_link_basis_cell_coeff_jet(
+                            idx,
+                            basis_span,
+                            a,
+                            b,
                             scale,
+                            &mut coeff_u,
+                            &mut coeff_au,
+                            &mut coeff_bu,
+                            &mut coeff_aau,
+                            &mut coeff_abu,
+                            &mut coeff_bbu,
                         );
-                        let (dc_aw_raw, dc_bw_raw) =
-                            exact::link_basis_cell_coefficient_partials(basis_span, a, b);
-                        let (dc_aaw_raw, dc_abw_raw, dc_bbw_raw) =
-                            exact::link_basis_cell_second_partials(basis_span, a, b);
-                        coeff_au[idx] = scale_coeff4(dc_aw_raw, scale);
-                        coeff_bu[idx] = scale_coeff4(dc_bw_raw, scale);
-                        coeff_aau[idx] = scale_coeff4(dc_aaw_raw, scale);
-                        coeff_abu[idx] = scale_coeff4(dc_abw_raw, scale);
-                        coeff_bbu[idx] = scale_coeff4(dc_bbw_raw, scale);
                         Ok(())
                     },
                 )?;
@@ -6658,14 +6691,14 @@ impl BernoulliMarginalSlopeFamily {
                 &coeff_aau,
                 &coeff_abu,
                 &coeff_bbu,
-                &zero_family,
-                &zero_family,
-                &zero_family,
-                &zero_family,
+                zero_family,
+                zero_family,
+                zero_family,
+                zero_family,
             );
 
-            f_a += exact::cell_first_derivative_from_moments(&dc_da, &state.moments)?;
-            f_aa += exact::cell_second_derivative_from_moments(
+            *f_a += exact::cell_first_derivative_from_moments(&dc_da, &state.moments)?;
+            *f_aa += exact::cell_second_derivative_from_moments(
                 cell,
                 &dc_da,
                 &dc_da,
@@ -6795,6 +6828,152 @@ impl BernoulliMarginalSlopeFamily {
             }
         }
 
+        Ok(())
+    }
+
+    pub(super) fn row_primary_third_trace_many_with_moments(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+        row_ctx: &BernoulliMarginalSlopeRowExactContext,
+        row_dirs: &[Array1<f64>],
+        gram: &[f64],
+    ) -> Result<Vec<f64>, String> {
+        let primary = &cache.primary;
+        let r = primary.total;
+        if row_dirs.is_empty() {
+            return Ok(Vec::new());
+        }
+        if gram.len() != r * r {
+            return Err(format!(
+                "bernoulli marginal-slope row trace gram length {} != {}",
+                gram.len(),
+                r * r
+            ));
+        }
+        if let Some((idx, dir)) = row_dirs.iter().enumerate().find(|(_, dir)| dir.len() != r) {
+            return Err(format!(
+                "bernoulli marginal-slope row trace direction {idx} length {} != {r}",
+                dir.len()
+            ));
+        }
+
+        if row_dirs.len() > 1 {
+            let trace_gradient = self.row_primary_third_trace_gradient_with_moments(
+                row,
+                block_states,
+                cache,
+                row_ctx,
+                gram,
+            )?;
+            let traces = row_dirs
+                .iter()
+                .map(|dir| trace_gradient.dot(dir))
+                .collect::<Vec<_>>();
+            return Ok(traces);
+        }
+
+        if !self.effective_flex_active(block_states)? {
+            let t = self.rigid_third_full_cached(block_states, cache, row)?;
+            let mut traces = vec![0.0; row_dirs.len()];
+            for (dir_idx, dir) in row_dirs.iter().enumerate() {
+                let m = contract_third_full(t, dir[0], dir[1]);
+                traces[dir_idx] = m[0][0] * gram[0]
+                    + m[0][1] * gram[1]
+                    + m[1][0] * gram[r]
+                    + m[1][1] * gram[r + 1];
+            }
+            return Ok(traces);
+        }
+        if !row_ctx.intercept.is_finite() || !row_ctx.m_a.is_finite() || row_ctx.m_a <= 0.0 {
+            return Err(
+                "non-finite flexible row context in batched third-order trace contraction"
+                    .to_string(),
+            );
+        }
+        let point = self.primary_point_from_block_states(row, block_states, primary)?;
+        let (q, b, beta_h_owned, beta_w_owned) = self.primary_point_components(&point, primary);
+        let beta_h = beta_h_owned.as_ref();
+        let beta_w = beta_w_owned.as_ref();
+        let a = row_ctx.intercept;
+
+        if let Some(grid) = self.latent_measure.empirical_grid_for_training_row(row)? {
+            let mut traces = vec![0.0; row_dirs.len()];
+            for (dir_idx, dir) in row_dirs.iter().enumerate() {
+                let third = self.empirical_flex_row_third_contracted_recompute(
+                    row, primary, q, b, beta_h, beta_w, row_ctx, dir, &grid,
+                )?;
+                traces[dir_idx] = Self::row_primary_trace_contract(&third, gram);
+            }
+            return Ok(traces);
+        }
+
+        let marginal = self.marginal_link_map(q)?;
+        let h_range = primary.h.as_ref();
+        let w_range = primary.w.as_ref();
+        let score_runtime = self.score_warp.as_ref();
+        let link_runtime = self.link_dev.as_ref();
+        let scale = self.probit_frailty_scale();
+        let zero_family = vec![[0.0; 4]; r];
+        let n_dirs = row_dirs.len();
+
+        let mut f_a = 0.0;
+        let mut f_aa = 0.0;
+        let mut f_u = Array1::<f64>::zeros(r);
+        let mut f_au = Array1::<f64>::zeros(r);
+        let mut f_uv = Array2::<f64>::zeros((r, r));
+        let mut f_a_dir = vec![0.0; n_dirs];
+        let mut f_aa_dir = vec![0.0; n_dirs];
+        let mut f_au_dir = vec![0.0; n_dirs * r];
+        let mut f_uv_dir = vec![0.0; n_dirs * r * r];
+
+        let owned_cells;
+        let cells: &[CachedDenestedCellMoments] = if let Some(cached) = self
+            .bundle_for_degree(block_states, cache, 15)?
+            .and_then(|bundle| bundle.row(row, 15))
+        {
+            cached
+        } else {
+            let partitions = self.denested_partition_cells(a, b, beta_h, beta_w)?;
+            owned_cells = partitions
+                .into_iter()
+                .map(|partition_cell| {
+                    self.evaluate_cell_derivative_moments_lru(partition_cell.cell, 15)
+                        .map(|state| CachedDenestedCellMoments {
+                            partition_cell,
+                            state,
+                        })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            &owned_cells
+        };
+
+        Self::accumulate_primary_third_cell_moments(
+            cells,
+            a,
+            b,
+            scale,
+            r,
+            h_range,
+            w_range,
+            score_runtime,
+            link_runtime,
+            &zero_family,
+            row_dirs,
+            "score-warp batched third-trace direction",
+            "link-wiggle batched third-trace direction",
+            &mut f_a,
+            &mut f_aa,
+            &mut f_u,
+            &mut f_au,
+            &mut f_uv,
+            &mut f_a_dir,
+            &mut f_aa_dir,
+            &mut f_au_dir,
+            &mut f_uv_dir,
+        )?;
+
         f_u[0] = -marginal.mu1;
         f_uv[[0, 0]] = -marginal.mu2;
 
@@ -6840,10 +7019,14 @@ impl BernoulliMarginalSlopeFamily {
                 z_obs,
                 "score-warp batched third-trace observed",
                 |_, idx, basis_span| {
-                    g_u_fixed[idx] =
-                        scale_coeff4(exact::score_basis_cell_coefficients(basis_span, b), scale);
-                    g_bu_fixed[idx] =
-                        scale_coeff4(exact::score_basis_cell_coefficients(basis_span, 1.0), scale);
+                    fill_score_basis_cell_coeff_jet(
+                        idx,
+                        basis_span,
+                        b,
+                        scale,
+                        &mut g_u_fixed,
+                        &mut g_bu_fixed,
+                    );
                     Ok(())
                 },
             )?;
@@ -6856,17 +7039,19 @@ impl BernoulliMarginalSlopeFamily {
                 u_obs,
                 "link-wiggle batched third-trace observed",
                 |_, idx, basis_span| {
-                    g_u_fixed[idx] =
-                        scale_coeff4(exact::link_basis_cell_coefficients(basis_span, a, b), scale);
-                    let (dc_aw_raw, dc_bw_raw) =
-                        exact::link_basis_cell_coefficient_partials(basis_span, a, b);
-                    let (dc_aaw_raw, dc_abw_raw, dc_bbw_raw) =
-                        exact::link_basis_cell_second_partials(basis_span, a, b);
-                    g_au_fixed[idx] = scale_coeff4(dc_aw_raw, scale);
-                    g_bu_fixed[idx] = scale_coeff4(dc_bw_raw, scale);
-                    g_aau_fixed[idx] = scale_coeff4(dc_aaw_raw, scale);
-                    g_abu_fixed[idx] = scale_coeff4(dc_abw_raw, scale);
-                    g_bbu_fixed[idx] = scale_coeff4(dc_bbw_raw, scale);
+                    fill_link_basis_cell_coeff_jet(
+                        idx,
+                        basis_span,
+                        a,
+                        b,
+                        scale,
+                        &mut g_u_fixed,
+                        &mut g_au_fixed,
+                        &mut g_bu_fixed,
+                        &mut g_aau_fixed,
+                        &mut g_abu_fixed,
+                        &mut g_bbu_fixed,
+                    );
                     Ok(())
                 },
             )?;
@@ -7177,13 +7362,13 @@ impl BernoulliMarginalSlopeFamily {
                     z_mid,
                     "score-warp fourth-direction",
                     |_, idx, basis_span| {
-                        coeff_u[idx] = scale_coeff4(
-                            exact::score_basis_cell_coefficients(basis_span, b),
+                        fill_score_basis_cell_coeff_jet(
+                            idx,
+                            basis_span,
+                            b,
                             scale,
-                        );
-                        coeff_bu[idx] = scale_coeff4(
-                            exact::score_basis_cell_coefficients(basis_span, 1.0),
-                            scale,
+                            &mut coeff_u,
+                            &mut coeff_bu,
                         );
                         Ok(())
                     },
@@ -7197,21 +7382,21 @@ impl BernoulliMarginalSlopeFamily {
                     u_mid,
                     "link-wiggle fourth-direction",
                     |_, idx, basis_span| {
-                        coeff_u[idx] = scale_coeff4(
-                            exact::link_basis_cell_coefficients(basis_span, a, b),
+                        fill_link_basis_cell_coeff_jet(
+                            idx,
+                            basis_span,
+                            a,
+                            b,
                             scale,
+                            &mut coeff_u,
+                            &mut coeff_au,
+                            &mut coeff_bu,
+                            &mut coeff_aau,
+                            &mut coeff_abu,
+                            &mut coeff_bbu,
                         );
-                        let (dc_aw_raw, dc_bw_raw) =
-                            exact::link_basis_cell_coefficient_partials(basis_span, a, b);
-                        let (dc_aaw_raw, dc_abw_raw, dc_bbw_raw) =
-                            exact::link_basis_cell_second_partials(basis_span, a, b);
                         let (dc_aaaw, dc_aabw, dc_abbw, dc_bbbw) =
                             exact::link_basis_cell_third_partials(basis_span);
-                        coeff_au[idx] = scale_coeff4(dc_aw_raw, scale);
-                        coeff_bu[idx] = scale_coeff4(dc_bw_raw, scale);
-                        coeff_aau[idx] = scale_coeff4(dc_aaw_raw, scale);
-                        coeff_abu[idx] = scale_coeff4(dc_abw_raw, scale);
-                        coeff_bbu[idx] = scale_coeff4(dc_bbw_raw, scale);
                         coeff_aaau[idx] = scale_coeff4(dc_aaaw, scale);
                         coeff_aabu[idx] = scale_coeff4(dc_aabw, scale);
                         coeff_abbu[idx] = scale_coeff4(dc_abbw, scale);
@@ -7651,10 +7836,14 @@ impl BernoulliMarginalSlopeFamily {
                 z_obs,
                 "score-warp fourth-direction observed",
                 |_, idx, basis_span| {
-                    g_u_fixed[idx] =
-                        scale_coeff4(exact::score_basis_cell_coefficients(basis_span, b), scale);
-                    g_bu_fixed[idx] =
-                        scale_coeff4(exact::score_basis_cell_coefficients(basis_span, 1.0), scale);
+                    fill_score_basis_cell_coeff_jet(
+                        idx,
+                        basis_span,
+                        b,
+                        scale,
+                        &mut g_u_fixed,
+                        &mut g_bu_fixed,
+                    );
                     Ok(())
                 },
             )?;
@@ -7666,19 +7855,21 @@ impl BernoulliMarginalSlopeFamily {
                 u_obs,
                 "link-wiggle fourth-direction observed",
                 |_, idx, basis_span| {
-                    g_u_fixed[idx] =
-                        scale_coeff4(exact::link_basis_cell_coefficients(basis_span, a, b), scale);
-                    let (dc_aw_raw, dc_bw_raw) =
-                        exact::link_basis_cell_coefficient_partials(basis_span, a, b);
-                    let (dc_aaw_raw, dc_abw_raw, dc_bbw_raw) =
-                        exact::link_basis_cell_second_partials(basis_span, a, b);
+                    fill_link_basis_cell_coeff_jet(
+                        idx,
+                        basis_span,
+                        a,
+                        b,
+                        scale,
+                        &mut g_u_fixed,
+                        &mut g_au_fixed,
+                        &mut g_bu_fixed,
+                        &mut g_aau_fixed,
+                        &mut g_abu_fixed,
+                        &mut g_bbu_fixed,
+                    );
                     let (dc_aaaw, dc_aabw, dc_abbw, dc_bbbw) =
                         exact::link_basis_cell_third_partials(basis_span);
-                    g_au_fixed[idx] = scale_coeff4(dc_aw_raw, scale);
-                    g_bu_fixed[idx] = scale_coeff4(dc_bw_raw, scale);
-                    g_aau_fixed[idx] = scale_coeff4(dc_aaw_raw, scale);
-                    g_abu_fixed[idx] = scale_coeff4(dc_abw_raw, scale);
-                    g_bbu_fixed[idx] = scale_coeff4(dc_bbw_raw, scale);
                     g_aaau_fixed[idx] = scale_coeff4(dc_aaaw, scale);
                     g_aabu_fixed[idx] = scale_coeff4(dc_aabw, scale);
                     g_abbu_fixed[idx] = scale_coeff4(dc_abbw, scale);
@@ -12843,8 +13034,6 @@ impl BernoulliMarginalSlopeFamily {
                 .collect();
         }
 
-        use super::exact_kernel as exact;
-
         let a = row_ctx.intercept;
         let marginal = self.marginal_link_map(q)?;
         let h_range = primary.h.as_ref();
@@ -12886,240 +13075,30 @@ impl BernoulliMarginalSlopeFamily {
             &owned_cells
         };
 
-        for entry in cells {
-            let partition_cell = entry.partition_cell;
-            let cell = partition_cell.cell;
-            let z_mid = exact::interval_probe_point(cell.left, cell.right)?;
-            let u_mid = a + b * z_mid;
-            let state = &entry.state;
-
-            let (dc_da_raw, dc_db_raw) = exact::denested_cell_coefficient_partials(
-                partition_cell.score_span,
-                partition_cell.link_span,
-                a,
-                b,
-            );
-            let (dc_daa_raw, dc_dab_raw, dc_dbb_raw) = exact::denested_cell_second_partials(
-                partition_cell.score_span,
-                partition_cell.link_span,
-                a,
-                b,
-            );
-            let denested_third = exact::denested_cell_third_partials(partition_cell.link_span);
-            let dc_da = scale_coeff4(dc_da_raw, scale);
-            let dc_db = scale_coeff4(dc_db_raw, scale);
-            let dc_daa = scale_coeff4(dc_daa_raw, scale);
-            let dc_dab = scale_coeff4(dc_dab_raw, scale);
-            let dc_dbb = scale_coeff4(dc_dbb_raw, scale);
-            let dc_daab = scale_coeff4(denested_third.1, scale);
-            let dc_dabb = scale_coeff4(denested_third.2, scale);
-            let dc_dbbb = scale_coeff4(denested_third.3, scale);
-
-            let mut coeff_u = vec![[0.0; 4]; r];
-            let mut coeff_au = vec![[0.0; 4]; r];
-            let mut coeff_bu = vec![[0.0; 4]; r];
-            let mut coeff_aau = vec![[0.0; 4]; r];
-            let mut coeff_abu = vec![[0.0; 4]; r];
-            let mut coeff_bbu = vec![[0.0; 4]; r];
-
-            coeff_u[1] = dc_db;
-            coeff_au[1] = dc_dab;
-            coeff_bu[1] = dc_dbb;
-            coeff_aau[1] = dc_daab;
-            coeff_abu[1] = dc_dabb;
-            coeff_bbu[1] = dc_dbbb;
-
-            if let (Some(h_range), Some(runtime)) = (h_range, score_runtime) {
-                Self::for_each_deviation_basis_cubic_at(
-                    runtime,
-                    h_range,
-                    z_mid,
-                    "score-warp batched third direction",
-                    |_, idx, basis_span| {
-                        coeff_u[idx] = scale_coeff4(
-                            exact::score_basis_cell_coefficients(basis_span, b),
-                            scale,
-                        );
-                        coeff_bu[idx] = scale_coeff4(
-                            exact::score_basis_cell_coefficients(basis_span, 1.0),
-                            scale,
-                        );
-                        Ok(())
-                    },
-                )?;
-            }
-
-            if let (Some(w_range), Some(runtime)) = (w_range, link_runtime) {
-                Self::for_each_deviation_basis_cubic_at(
-                    runtime,
-                    w_range,
-                    u_mid,
-                    "link-wiggle batched third direction",
-                    |_, idx, basis_span| {
-                        coeff_u[idx] = scale_coeff4(
-                            exact::link_basis_cell_coefficients(basis_span, a, b),
-                            scale,
-                        );
-                        let (dc_aw_raw, dc_bw_raw) =
-                            exact::link_basis_cell_coefficient_partials(basis_span, a, b);
-                        let (dc_aaw_raw, dc_abw_raw, dc_bbw_raw) =
-                            exact::link_basis_cell_second_partials(basis_span, a, b);
-                        coeff_au[idx] = scale_coeff4(dc_aw_raw, scale);
-                        coeff_bu[idx] = scale_coeff4(dc_bw_raw, scale);
-                        coeff_aau[idx] = scale_coeff4(dc_aaw_raw, scale);
-                        coeff_abu[idx] = scale_coeff4(dc_abw_raw, scale);
-                        coeff_bbu[idx] = scale_coeff4(dc_bbw_raw, scale);
-                        Ok(())
-                    },
-                )?;
-            }
-
-            let coeff_jet = SparsePrimaryCoeffJetView::new(
-                1,
-                h_range,
-                w_range,
-                &coeff_u,
-                &coeff_au,
-                &coeff_bu,
-                &coeff_aau,
-                &coeff_abu,
-                &coeff_bbu,
-                &zero_family,
-                &zero_family,
-                &zero_family,
-                &zero_family,
-            );
-
-            f_a += exact::cell_first_derivative_from_moments(&dc_da, &state.moments)?;
-            f_aa += exact::cell_second_derivative_from_moments(
-                cell,
-                &dc_da,
-                &dc_da,
-                &dc_daa,
-                &state.moments,
-            )?;
-            for u in 1..r {
-                f_u[u] +=
-                    exact::cell_first_derivative_from_moments(&coeff_jet.first[u], &state.moments)?;
-                f_au[u] += exact::cell_second_derivative_from_moments(
-                    cell,
-                    &dc_da,
-                    &coeff_jet.first[u],
-                    &coeff_jet.a_first[u],
-                    &state.moments,
-                )?;
-            }
-            for u in 1..r {
-                for v in u..r {
-                    let second_coeff =
-                        coeff_jet.pair_from_b_family(coeff_jet.b_first, u, v, COEFF_SUPPORT_BHW);
-                    let val = exact::cell_second_derivative_from_moments(
-                        cell,
-                        &coeff_jet.first[u],
-                        &coeff_jet.first[v],
-                        &second_coeff,
-                        &state.moments,
-                    )?;
-                    f_uv[[u, v]] += val;
-                    if u != v {
-                        f_uv[[v, u]] += val;
-                    }
-                }
-            }
-
-            for (dir_idx, dir) in row_dirs.iter().enumerate() {
-                let coeff_dir =
-                    coeff_jet.directional_family(coeff_jet.first, dir, COEFF_SUPPORT_BHW);
-                let coeff_a_dir =
-                    coeff_jet.directional_family(coeff_jet.a_first, dir, COEFF_SUPPORT_BW);
-                let coeff_aa_dir =
-                    coeff_jet.directional_family(coeff_jet.aa_first, dir, COEFF_SUPPORT_BW);
-
-                f_a_dir[dir_idx] += exact::cell_second_derivative_from_moments(
-                    cell,
-                    &dc_da,
-                    &coeff_dir,
-                    &coeff_a_dir,
-                    &state.moments,
-                )?;
-                f_aa_dir[dir_idx] += exact::cell_third_derivative_from_moments(
-                    cell,
-                    &dc_da,
-                    &dc_da,
-                    &coeff_dir,
-                    &dc_daa,
-                    &coeff_a_dir,
-                    &coeff_a_dir,
-                    &coeff_aa_dir,
-                    &state.moments,
-                )?;
-
-                let mut coeff_u_dir = vec![[0.0; 4]; r];
-                let mut coeff_au_dir = vec![[0.0; 4]; r];
-                for u in 1..r {
-                    coeff_u_dir[u] = coeff_jet.param_directional_from_b_family(
-                        coeff_jet.b_first,
-                        u,
-                        dir,
-                        COEFF_SUPPORT_BHW,
-                    );
-                    coeff_au_dir[u] = coeff_jet.param_directional_from_b_family(
-                        coeff_jet.ab_first,
-                        u,
-                        dir,
-                        COEFF_SUPPORT_BW,
-                    );
-                }
-
-                for u in 1..r {
-                    f_au_dir[dir_idx * r + u] += exact::cell_third_derivative_from_moments(
-                        cell,
-                        &dc_da,
-                        &coeff_jet.first[u],
-                        &coeff_dir,
-                        &coeff_jet.a_first[u],
-                        &coeff_a_dir,
-                        &coeff_u_dir[u],
-                        &coeff_au_dir[u],
-                        &state.moments,
-                    )?;
-                }
-
-                let dir_base = dir_idx * r * r;
-                for u in 1..r {
-                    for v in u..r {
-                        let second_coeff = coeff_jet.pair_from_b_family(
-                            coeff_jet.b_first,
-                            u,
-                            v,
-                            COEFF_SUPPORT_BHW,
-                        );
-                        let third_coeff = coeff_jet.pair_directional_from_bb_family(
-                            coeff_jet.bb_first,
-                            u,
-                            v,
-                            dir,
-                            COEFF_SUPPORT_BW,
-                        );
-                        let dir_val = exact::cell_third_derivative_from_moments(
-                            cell,
-                            &coeff_jet.first[u],
-                            &coeff_jet.first[v],
-                            &coeff_dir,
-                            &second_coeff,
-                            &coeff_u_dir[u],
-                            &coeff_u_dir[v],
-                            &third_coeff,
-                            &state.moments,
-                        )?;
-                        f_uv_dir[dir_base + u * r + v] += dir_val;
-                        if u != v {
-                            f_uv_dir[dir_base + v * r + u] += dir_val;
-                        }
-                    }
-                }
-            }
-        }
+        Self::accumulate_primary_third_cell_moments(
+            cells,
+            a,
+            b,
+            scale,
+            r,
+            h_range,
+            w_range,
+            score_runtime,
+            link_runtime,
+            &zero_family,
+            row_dirs,
+            "score-warp batched third direction",
+            "link-wiggle batched third direction",
+            &mut f_a,
+            &mut f_aa,
+            &mut f_u,
+            &mut f_au,
+            &mut f_uv,
+            &mut f_a_dir,
+            &mut f_aa_dir,
+            &mut f_au_dir,
+            &mut f_uv_dir,
+        )?;
 
         f_u[0] = -marginal.mu1;
         f_uv[[0, 0]] = -marginal.mu2;
@@ -13166,10 +13145,14 @@ impl BernoulliMarginalSlopeFamily {
                 z_obs,
                 "score-warp batched third observed",
                 |_, idx, basis_span| {
-                    g_u_fixed[idx] =
-                        scale_coeff4(exact::score_basis_cell_coefficients(basis_span, b), scale);
-                    g_bu_fixed[idx] =
-                        scale_coeff4(exact::score_basis_cell_coefficients(basis_span, 1.0), scale);
+                    fill_score_basis_cell_coeff_jet(
+                        idx,
+                        basis_span,
+                        b,
+                        scale,
+                        &mut g_u_fixed,
+                        &mut g_bu_fixed,
+                    );
                     Ok(())
                 },
             )?;
@@ -13182,17 +13165,19 @@ impl BernoulliMarginalSlopeFamily {
                 u_obs,
                 "link-wiggle batched third observed",
                 |_, idx, basis_span| {
-                    g_u_fixed[idx] =
-                        scale_coeff4(exact::link_basis_cell_coefficients(basis_span, a, b), scale);
-                    let (dc_aw_raw, dc_bw_raw) =
-                        exact::link_basis_cell_coefficient_partials(basis_span, a, b);
-                    let (dc_aaw_raw, dc_abw_raw, dc_bbw_raw) =
-                        exact::link_basis_cell_second_partials(basis_span, a, b);
-                    g_au_fixed[idx] = scale_coeff4(dc_aw_raw, scale);
-                    g_bu_fixed[idx] = scale_coeff4(dc_bw_raw, scale);
-                    g_aau_fixed[idx] = scale_coeff4(dc_aaw_raw, scale);
-                    g_abu_fixed[idx] = scale_coeff4(dc_abw_raw, scale);
-                    g_bbu_fixed[idx] = scale_coeff4(dc_bbw_raw, scale);
+                    fill_link_basis_cell_coeff_jet(
+                        idx,
+                        basis_span,
+                        a,
+                        b,
+                        scale,
+                        &mut g_u_fixed,
+                        &mut g_au_fixed,
+                        &mut g_bu_fixed,
+                        &mut g_aau_fixed,
+                        &mut g_abu_fixed,
+                        &mut g_bbu_fixed,
+                    );
                     Ok(())
                 },
             )?;

@@ -16404,6 +16404,34 @@ struct BorrowedJointDerivProvider<'a> {
         Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>>,
 }
 
+/// Shared `(term1, term2)` second-derivative correction assembly used by both
+/// the borrowed and owned joint derivative providers. `compute_dh` supplies the
+/// drift derivative `D_β H[u_kl]` (term1) and `compute_d2h` the mixed second
+/// derivative `D²_β H[−v_l, −v_k]` (term2); the two are fused into a single
+/// `CompositeHyperOperator`. Returns `None` as soon as either term is absent.
+fn joint_second_derivative_correction_result(
+    compute_dh: &dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
+    compute_d2h: &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
+    v_k: &Array1<f64>,
+    v_l: &Array1<f64>,
+    u_kl: &Array1<f64>,
+) -> Result<Option<DriftDerivResult>, String> {
+    let Some(term1) = compute_dh(u_kl)? else {
+        return Ok(None);
+    };
+    let neg_v_k = -v_k;
+    let neg_v_l = -v_l;
+    let Some(term2) = compute_d2h(&neg_v_l, &neg_v_k)? else {
+        return Ok(None);
+    };
+    let op = crate::solver::estimate::reml::unified::CompositeHyperOperator {
+        dense: None,
+        operators: vec![term1.into_operator(), term2.into_operator()],
+        dim_hint: u_kl.len(),
+    };
+    Ok(Some(DriftDerivResult::Operator(Arc::new(op))))
+}
+
 impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
     fn hessian_derivative_correction(
         &self,
@@ -16458,20 +16486,13 @@ impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
         v_l: &Array1<f64>,
         u_kl: &Array1<f64>,
     ) -> Result<Option<DriftDerivResult>, String> {
-        let Some(term1) = (self.compute_dh)(u_kl)? else {
-            return Ok(None);
-        };
-        let neg_v_k = -v_k;
-        let neg_v_l = -v_l;
-        let Some(term2) = (self.compute_d2h)(&neg_v_l, &neg_v_k)? else {
-            return Ok(None);
-        };
-        let op = crate::solver::estimate::reml::unified::CompositeHyperOperator {
-            dense: None,
-            operators: vec![term1.into_operator(), term2.into_operator()],
-            dim_hint: u_kl.len(),
-        };
-        Ok(Some(DriftDerivResult::Operator(Arc::new(op))))
+        joint_second_derivative_correction_result(
+            self.compute_dh,
+            self.compute_d2h,
+            v_k,
+            v_l,
+            u_kl,
+        )
     }
 
     fn hessian_second_derivative_corrections_result(
@@ -16608,20 +16629,13 @@ impl HessianDerivativeProvider for OwnedJointDerivProvider {
         v_l: &Array1<f64>,
         u_kl: &Array1<f64>,
     ) -> Result<Option<DriftDerivResult>, String> {
-        let Some(term1) = (self.compute_dh)(u_kl)? else {
-            return Ok(None);
-        };
-        let neg_v_k = -v_k;
-        let neg_v_l = -v_l;
-        let Some(term2) = (self.compute_d2h)(&neg_v_l, &neg_v_k)? else {
-            return Ok(None);
-        };
-        let op = crate::solver::estimate::reml::unified::CompositeHyperOperator {
-            dense: None,
-            operators: vec![term1.into_operator(), term2.into_operator()],
-            dim_hint: u_kl.len(),
-        };
-        Ok(Some(DriftDerivResult::Operator(Arc::new(op))))
+        joint_second_derivative_correction_result(
+            &*self.compute_dh,
+            &*self.compute_d2h,
+            v_k,
+            v_l,
+            u_kl,
+        )
     }
 
     fn hessian_second_derivative_corrections_result(
@@ -26963,10 +26977,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn outer_lamlgradient_diagonal_binomial_location_scale_matchesfd() {
-        let n = 8usize;
-        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
+    /// Shared probit binomial-location-scale outer-derivative test fixture:
+    /// builds the (threshold, log_sigma) block specs, family, penalty counts,
+    /// and outer options that every `outer_laml*_binomial_location_scale_*`
+    /// finite-difference test constructs identically apart from `y` and the
+    /// two block initial betas.
+    fn binomial_location_scale_outer_fixture(
+        y: Array1<f64>,
+        threshold_initial_beta: f64,
+        log_sigma_initial_beta: f64,
+    ) -> (
+        BinomialLocationScaleFamily,
+        Vec<ParameterBlockSpec>,
+        Vec<usize>,
+        BlockwiseFitOptions,
+    ) {
+        let n = y.len();
         let weights = Array1::from_elem(n, 1.0);
         let thresholdspec = ParameterBlockSpec {
             name: "threshold".to_string(),
@@ -26978,7 +27004,7 @@ mod tests {
             penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
-            initial_beta: Some(array![0.0]),
+            initial_beta: Some(array![threshold_initial_beta]),
             gauge_priority: 100,
             jacobian_callback: None,
             stacked_design: None,
@@ -26994,7 +27020,7 @@ mod tests {
             penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
             nullspace_dims: vec![],
             initial_log_lambdas: array![0.0],
-            initial_beta: Some(array![0.0]),
+            initial_beta: Some(array![log_sigma_initial_beta]),
             gauge_priority: 100,
             jacobian_callback: None,
             stacked_design: None,
@@ -27012,13 +27038,21 @@ mod tests {
         };
         let specs = vec![thresholdspec, log_sigmaspec];
         let penalty_counts = vec![1usize, 1usize];
-        let rho = array![0.0, 0.0];
         let options = BlockwiseFitOptions {
             use_remlobjective: true,
             ridge_floor: 1e-10,
             outer_max_iter: 1,
             ..BlockwiseFitOptions::default()
         };
+        (family, specs, penalty_counts, options)
+    }
+
+    #[test]
+    fn outer_lamlgradient_diagonal_binomial_location_scale_matchesfd() {
+        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
+        let (family, specs, penalty_counts, options) =
+            binomial_location_scale_outer_fixture(y, 0.0, 0.0);
+        let rho = array![0.0, 0.0];
 
         let (f0, g0, _) =
             outerobjective_andgradient(&family, &specs, &options, &penalty_counts, &rho, None)
@@ -27077,60 +27111,10 @@ mod tests {
 
     #[test]
     fn outer_lamlgradient_diagonal_binomial_location_scale_hard_case_matchesfd() {
-        let n = 9usize;
         let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
-        let weights = Array1::from_elem(n, 1.0);
-        let thresholdspec = ParameterBlockSpec {
-            name: "threshold".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
-                (n, 1),
-                1.0,
-            ))),
-            offset: Array1::zeros(n),
-            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
-            nullspace_dims: vec![],
-            initial_log_lambdas: array![0.0],
-            initial_beta: Some(array![0.2]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let log_sigmaspec = ParameterBlockSpec {
-            name: "log_sigma".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
-                (n, 1),
-                1.0,
-            ))),
-            offset: Array1::zeros(n),
-            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
-            nullspace_dims: vec![],
-            initial_log_lambdas: array![0.0],
-            initial_beta: Some(array![-0.1]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let threshold_design = thresholdspec.design.clone();
-        let log_sigma_design = log_sigmaspec.design.clone();
-        let family = BinomialLocationScaleFamily {
-            y,
-            weights,
-            link_kind: crate::types::InverseLink::Standard(crate::types::StandardLink::Probit),
-            threshold_design: Some(threshold_design),
-            log_sigma_design: Some(log_sigma_design),
-            policy: crate::resource::ResourcePolicy::default_library(),
-        };
-        let specs = vec![thresholdspec, log_sigmaspec];
-        let penalty_counts = vec![1usize, 1usize];
+        let (family, specs, penalty_counts, options) =
+            binomial_location_scale_outer_fixture(y, 0.2, -0.1);
         let rho = array![0.15, -0.25];
-        let options = BlockwiseFitOptions {
-            use_remlobjective: true,
-            ridge_floor: 1e-10,
-            outer_max_iter: 1,
-            ..BlockwiseFitOptions::default()
-        };
 
         let (f0, g0, _) =
             outerobjective_andgradient(&family, &specs, &options, &penalty_counts, &rho, None)
@@ -27189,7 +27173,6 @@ mod tests {
 
     #[test]
     fn outer_lamlhessian_joint_exact_binomial_location_scale_matchesfd() {
-        let n = 10usize;
         // Asymmetric y (6 ones / 4 zeros). A balanced 5/5 vector forces
         // β̂_threshold = 0 by probit-link symmetry, which makes the joint
         // observed Hessian block-diagonal in (threshold, log_sigma) at the
@@ -27199,58 +27182,9 @@ mod tests {
         // β̂_threshold ≠ 0, coupling the (β_0, β_1) blocks through the
         // observed-information weights and making all four entries validatable.
         let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0]);
-        let weights = Array1::from_elem(n, 1.0);
-        let thresholdspec = ParameterBlockSpec {
-            name: "threshold".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
-                (n, 1),
-                1.0,
-            ))),
-            offset: Array1::zeros(n),
-            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
-            nullspace_dims: vec![],
-            initial_log_lambdas: array![0.0],
-            initial_beta: Some(array![0.15]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let log_sigmaspec = ParameterBlockSpec {
-            name: "log_sigma".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
-                (n, 1),
-                1.0,
-            ))),
-            offset: Array1::zeros(n),
-            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
-            nullspace_dims: vec![],
-            initial_log_lambdas: array![0.0],
-            initial_beta: Some(array![-0.05]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let threshold_design = thresholdspec.design.clone();
-        let log_sigma_design = log_sigmaspec.design.clone();
-        let family = BinomialLocationScaleFamily {
-            y,
-            weights,
-            link_kind: crate::types::InverseLink::Standard(crate::types::StandardLink::Probit),
-            threshold_design: Some(threshold_design),
-            log_sigma_design: Some(log_sigma_design),
-            policy: crate::resource::ResourcePolicy::default_library(),
-        };
-        let specs = vec![thresholdspec, log_sigmaspec];
-        let penalty_counts = vec![1usize, 1usize];
+        let (family, specs, penalty_counts, options) =
+            binomial_location_scale_outer_fixture(y, 0.15, -0.05);
         let rho = array![0.1, -0.2];
-        let options = BlockwiseFitOptions {
-            use_remlobjective: true,
-            ridge_floor: 1e-10,
-            outer_max_iter: 1,
-            ..BlockwiseFitOptions::default()
-        };
 
         let (_, _, h0_opt, _) = super::test_support::outerobjectivegradienthessian(
             &family,
@@ -27385,60 +27319,10 @@ mod tests {
 
     #[test]
     fn outer_lamlhessian_joint_exact_binomial_location_scale_hard_case_matchesfd() {
-        let n = 9usize;
         let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
-        let weights = Array1::from_elem(n, 1.0);
-        let thresholdspec = ParameterBlockSpec {
-            name: "threshold".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
-                (n, 1),
-                1.0,
-            ))),
-            offset: Array1::zeros(n),
-            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
-            nullspace_dims: vec![],
-            initial_log_lambdas: array![0.0],
-            initial_beta: Some(array![0.2]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let log_sigmaspec = ParameterBlockSpec {
-            name: "log_sigma".to_string(),
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
-                (n, 1),
-                1.0,
-            ))),
-            offset: Array1::zeros(n),
-            penalties: vec![PenaltyMatrix::Dense(Array2::eye(1))],
-            nullspace_dims: vec![],
-            initial_log_lambdas: array![0.0],
-            initial_beta: Some(array![-0.1]),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
-        let threshold_design = thresholdspec.design.clone();
-        let log_sigma_design = log_sigmaspec.design.clone();
-        let family = BinomialLocationScaleFamily {
-            y,
-            weights,
-            link_kind: crate::types::InverseLink::Standard(crate::types::StandardLink::Probit),
-            threshold_design: Some(threshold_design),
-            log_sigma_design: Some(log_sigma_design),
-            policy: crate::resource::ResourcePolicy::default_library(),
-        };
-        let specs = vec![thresholdspec, log_sigmaspec];
-        let penalty_counts = vec![1usize, 1usize];
+        let (family, specs, penalty_counts, options) =
+            binomial_location_scale_outer_fixture(y, 0.2, -0.1);
         let rho = array![0.15, -0.25];
-        let options = BlockwiseFitOptions {
-            use_remlobjective: true,
-            ridge_floor: 1e-10,
-            outer_max_iter: 1,
-            ..BlockwiseFitOptions::default()
-        };
 
         let (_, _, h0_opt, _) = super::test_support::outerobjectivegradienthessian(
             &family,

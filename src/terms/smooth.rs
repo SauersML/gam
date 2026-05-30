@@ -14112,6 +14112,61 @@ fn has_aniso_terms(resolvedspec: &TermCollectionSpec, spatial_terms: &[usize]) -
     })
 }
 
+/// Emits the `theta`-keyed memoization accessors shared verbatim by the
+/// single-block and n-block exact-joint design caches. Both carry the same
+/// `current_theta` / `last_cost` / `last_eval` fields, so the cost/eval
+/// lookups and the `store_eval` writer are identical; this macro is the single
+/// source so the two inherent impls cannot drift.
+macro_rules! impl_exact_joint_theta_memo {
+    () => {
+        fn memoized_cost(&self, theta: &Array1<f64>) -> Option<f64> {
+            if self
+                .current_theta
+                .as_ref()
+                .is_some_and(|cached| theta_values_match(cached, theta))
+            {
+                self.last_eval
+                    .as_ref()
+                    .map(|cached| cached.0)
+                    .or(self.last_cost)
+            } else {
+                None
+            }
+        }
+
+        fn memoized_eval(
+            &self,
+            theta: &Array1<f64>,
+        ) -> Option<(
+            f64,
+            Array1<f64>,
+            crate::solver::outer_strategy::HessianResult,
+        )> {
+            if self
+                .current_theta
+                .as_ref()
+                .is_some_and(|cached| theta_values_match(cached, theta))
+            {
+                self.last_eval.clone()
+            } else {
+                None
+            }
+        }
+
+        fn store_eval(
+            &mut self,
+            eval: (
+                f64,
+                Array1<f64>,
+                crate::solver::outer_strategy::HessianResult,
+            ),
+        ) {
+            self.last_cost = Some(eval.0);
+            self.last_eval = Some(eval);
+        }
+    };
+}
+
 #[derive(Debug)]
 struct SingleBlockExactJointDesignCache<'d> {
     realizer: FrozenTermCollectionIncrementalRealizer<'d>,
@@ -14178,51 +14233,7 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
         Ok(())
     }
 
-    fn memoized_cost(&self, theta: &Array1<f64>) -> Option<f64> {
-        if self
-            .current_theta
-            .as_ref()
-            .is_some_and(|cached| theta_values_match(cached, theta))
-        {
-            self.last_eval
-                .as_ref()
-                .map(|cached| cached.0)
-                .or(self.last_cost)
-        } else {
-            None
-        }
-    }
-
-    fn memoized_eval(
-        &self,
-        theta: &Array1<f64>,
-    ) -> Option<(
-        f64,
-        Array1<f64>,
-        crate::solver::outer_strategy::HessianResult,
-    )> {
-        if self
-            .current_theta
-            .as_ref()
-            .is_some_and(|cached| theta_values_match(cached, theta))
-        {
-            self.last_eval.clone()
-        } else {
-            None
-        }
-    }
-
-    fn store_eval(
-        &mut self,
-        eval: (
-            f64,
-            Array1<f64>,
-            crate::solver::outer_strategy::HessianResult,
-        ),
-    ) {
-        self.last_cost = Some(eval.0);
-        self.last_eval = Some(eval);
-    }
+    impl_exact_joint_theta_memo!();
 
     fn store_cost(&mut self, cost: f64) {
         self.last_cost = Some(cost);
@@ -17143,51 +17154,7 @@ impl<'d> ExactJointDesignCache<'d> {
         Ok(())
     }
 
-    fn memoized_cost(&self, theta: &Array1<f64>) -> Option<f64> {
-        if self
-            .current_theta
-            .as_ref()
-            .is_some_and(|cached| theta_values_match(cached, theta))
-        {
-            self.last_eval
-                .as_ref()
-                .map(|cached| cached.0)
-                .or(self.last_cost)
-        } else {
-            None
-        }
-    }
-
-    fn memoized_eval(
-        &self,
-        theta: &Array1<f64>,
-    ) -> Option<(
-        f64,
-        Array1<f64>,
-        crate::solver::outer_strategy::HessianResult,
-    )> {
-        if self
-            .current_theta
-            .as_ref()
-            .is_some_and(|cached| theta_values_match(cached, theta))
-        {
-            self.last_eval.clone()
-        } else {
-            None
-        }
-    }
-
-    fn store_eval(
-        &mut self,
-        eval: (
-            f64,
-            Array1<f64>,
-            crate::solver::outer_strategy::HessianResult,
-        ),
-    ) {
-        self.last_cost = Some(eval.0);
-        self.last_eval = Some(eval);
-    }
+    impl_exact_joint_theta_memo!();
 
     /// Cache a cost-only result. Called after `ensure_theta(theta)` for
     /// line-search probes that pay only for the cost evaluation. We
@@ -21271,6 +21238,73 @@ mod tests {
         assert!(residualvs_full < 1e-8);
     }
 
+    /// Runs a Gaussian baseline fit and the two-outer-iteration spatial
+    /// length-scale optimization for a single Matérn term, then asserts the
+    /// optimized score is monotone-non-worse and that the resolved term froze
+    /// its centers / identifiability transform with a finite in-range length
+    /// scale. Shared verbatim between the 2- and 3-feature Matérn monotone
+    /// pins, which differ only in their data generation, term dimensionality,
+    /// and seed length scale.
+    fn assert_matern_spatial_length_scale_optimization_monotone(
+        data: ArrayView2<'_, f64>,
+        y: &Array1<f64>,
+        weights: &Array1<f64>,
+        offset: &Array1<f64>,
+        spec: &TermCollectionSpec,
+        fit_opts: &FitOptions,
+    ) {
+        let baseline = fit_term_collection_forspec(
+            data,
+            y.view(),
+            weights.view(),
+            offset.view(),
+            spec,
+            LikelihoodSpec::gaussian_identity(),
+            fit_opts,
+        )
+        .expect("baseline fit should succeed");
+        let baseline_score = fit_score(&baseline.fit);
+
+        let optimized = fit_term_collectionwith_spatial_length_scale_optimization(
+            data,
+            y.clone(),
+            weights.clone(),
+            offset.clone(),
+            spec,
+            LikelihoodSpec::gaussian_identity(),
+            fit_opts,
+            &SpatialLengthScaleOptimizationOptions {
+                max_outer_iter: 2,
+                rel_tol: 1e-5,
+                pilot_subsample_threshold: 0,
+                ..SpatialLengthScaleOptimizationOptions::default()
+            },
+        )
+        .expect("optimized fit should succeed");
+        let optimized_score = fit_score(&optimized.fit);
+        assert!(optimized_score <= baseline_score + 1e-10);
+
+        let ls = match &optimized.resolvedspec.smooth_terms[0].basis {
+            SmoothBasisSpec::Matern { spec, .. } => spec.length_scale,
+            _ => panic!("expected Matérn term"),
+        };
+        assert!(ls.is_finite() && (1e-3..=1e3).contains(&ls));
+
+        match &optimized.resolvedspec.smooth_terms[0].basis {
+            SmoothBasisSpec::Matern { spec, .. } => {
+                assert!(matches!(
+                    spec.center_strategy,
+                    CenterStrategy::UserProvided(_)
+                ));
+                assert!(matches!(
+                    spec.identifiability,
+                    MaternIdentifiability::FrozenTransform { .. }
+                ));
+            }
+            _ => panic!("expected Matérn term"),
+        }
+    }
+
     #[test]
     fn spatial_length_scale_optimization_monotone_improves_or_keeps_score_for_matern_two_feature() {
         let n = 60usize;
@@ -21317,111 +21351,38 @@ mod tests {
         let weights = Array1::ones(n);
         let offset = Array1::zeros(n);
 
-        let baseline = fit_term_collection_forspec(
+        assert_matern_spatial_length_scale_optimization_monotone(
             data.view(),
-            y.view(),
-            weights.view(),
-            offset.view(),
+            &y,
+            &weights,
+            &offset,
             &spec,
-            LikelihoodSpec::gaussian_identity(),
             &fit_opts,
-        )
-        .expect("baseline fit should succeed");
-        let baseline_score = fit_score(&baseline.fit);
-
-        let optimized = fit_term_collectionwith_spatial_length_scale_optimization(
-            data.view(),
-            y.clone(),
-            weights.clone(),
-            offset.clone(),
-            &spec,
-            LikelihoodSpec::gaussian_identity(),
-            &fit_opts,
-            &SpatialLengthScaleOptimizationOptions {
-                max_outer_iter: 2,
-                rel_tol: 1e-5,
-                pilot_subsample_threshold: 0,
-                ..SpatialLengthScaleOptimizationOptions::default()
-            },
-        )
-        .expect("optimized fit should succeed");
-        let optimized_score = fit_score(&optimized.fit);
-        assert!(optimized_score <= baseline_score + 1e-10);
-
-        let ls = match &optimized.resolvedspec.smooth_terms[0].basis {
-            SmoothBasisSpec::Matern { spec, .. } => spec.length_scale,
-            _ => panic!("expected Matérn term"),
-        };
-        assert!(ls.is_finite() && (1e-3..=1e3).contains(&ls));
-
-        match &optimized.resolvedspec.smooth_terms[0].basis {
-            SmoothBasisSpec::Matern { spec, .. } => {
-                assert!(matches!(
-                    spec.center_strategy,
-                    CenterStrategy::UserProvided(_)
-                ));
-                assert!(matches!(
-                    spec.identifiability,
-                    MaternIdentifiability::FrozenTransform { .. }
-                ));
-            }
-            _ => panic!("expected Matérn term"),
-        }
+        );
     }
 
-    #[test]
-    fn exact_joint_two_block_spatial_length_scale_freezes_matern_centers() {
-        let n = 40usize;
-        let mut data = Array2::<f64>::zeros((n, 2));
-        for i in 0..n {
-            let x0 = i as f64 / (n as f64 - 1.0);
-            let x1 = (i as f64 * 0.21).sin();
-            data[[i, 0]] = x0;
-            data[[i, 1]] = x1;
-        }
-
-        let matern_term = |name: &str, length_scale: f64| SmoothTermSpec {
-            name: name.to_string(),
-            basis: SmoothBasisSpec::Matern {
-                feature_cols: vec![0, 1],
-                spec: MaternBasisSpec {
-                    periodic: None,
-                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
-                    length_scale,
-                    nu: MaternNu::FiveHalves,
-                    include_intercept: false,
-                    double_penalty: true,
-                    identifiability: MaternIdentifiability::CenterSumToZero,
-                    aniso_log_scales: None,
-                },
-                input_scales: None,
-            },
-            shape: ShapeConstraint::None,
-            joint_null_rotation: None,
-        };
-
-        let meanspec = TermCollectionSpec {
-            linear_terms: vec![],
-            random_effect_terms: vec![],
-            smooth_terms: vec![matern_term("mean_matern", 0.8)],
-        };
-        let noisespec = TermCollectionSpec {
-            linear_terms: vec![],
-            random_effect_terms: vec![],
-            smooth_terms: vec![matern_term("noise_matern", 1.1)],
-        };
-
+    /// Drives a two-block exact-joint κ optimization with the canonical
+    /// zero-work test closures (cost = total design ncols + penalty count;
+    /// flat gradient/Hessian; trivial EFS) and returns the resolved result.
+    /// Shared verbatim across the Matérn- and Duchon-freezing pins; only the
+    /// final `.expect` diagnostic differs, passed via `expect_msg`.
+    fn run_two_block_exact_joint_optimize(
+        data: ArrayView2<'_, f64>,
+        meanspec: &TermCollectionSpec,
+        noisespec: &TermCollectionSpec,
+        expect_msg: &str,
+    ) -> SpatialLengthScaleOptimizationResult<f64> {
         let kappa_options = SpatialLengthScaleOptimizationOptions {
             max_outer_iter: 1,
             rel_tol: 1e-6,
             pilot_subsample_threshold: 0,
             ..SpatialLengthScaleOptimizationOptions::default()
         };
-        let joint_setup = two_block_exact_joint_hyper_setup(&meanspec, &noisespec, &kappa_options);
+        let joint_setup = two_block_exact_joint_hyper_setup(meanspec, noisespec, &kappa_options);
         let theta_dim = joint_setup.theta0().len();
 
-        let mean_terms = spatial_length_scale_term_indices(&meanspec);
-        let noise_terms = spatial_length_scale_term_indices(&noisespec);
+        let mean_terms = spatial_length_scale_term_indices(meanspec);
+        let noise_terms = spatial_length_scale_term_indices(noisespec);
         let policy = crate::families::custom_family::OuterDerivativePolicy {
             capability: crate::families::custom_family::ExactOuterDerivativeOrder::Second,
             predicted_hessian_work: 0,
@@ -21431,8 +21392,8 @@ mod tests {
             // moot. Keep `false` as the safe default.
             subsample_capable: false,
         };
-        let solved = optimize_spatial_length_scale_exact_joint(
-            data.view(),
+        optimize_spatial_length_scale_exact_joint(
+            data,
             &[meanspec.clone(), noisespec.clone()],
             &[mean_terms, noise_terms],
             &kappa_options,
@@ -21485,7 +21446,57 @@ mod tests {
             },
             |_beta: &Array1<f64>| Ok(()),
         )
-        .expect("exact joint two-block κ optimization should succeed");
+        .expect(expect_msg)
+    }
+
+    #[test]
+    fn exact_joint_two_block_spatial_length_scale_freezes_matern_centers() {
+        let n = 40usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            let x0 = i as f64 / (n as f64 - 1.0);
+            let x1 = (i as f64 * 0.21).sin();
+            data[[i, 0]] = x0;
+            data[[i, 1]] = x1;
+        }
+
+        let matern_term = |name: &str, length_scale: f64| SmoothTermSpec {
+            name: name.to_string(),
+            basis: SmoothBasisSpec::Matern {
+                feature_cols: vec![0, 1],
+                spec: MaternBasisSpec {
+                    periodic: None,
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+                    length_scale,
+                    nu: MaternNu::FiveHalves,
+                    include_intercept: false,
+                    double_penalty: true,
+                    identifiability: MaternIdentifiability::CenterSumToZero,
+                    aniso_log_scales: None,
+                },
+                input_scales: None,
+            },
+            shape: ShapeConstraint::None,
+            joint_null_rotation: None,
+        };
+
+        let meanspec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![matern_term("mean_matern", 0.8)],
+        };
+        let noisespec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![matern_term("noise_matern", 1.1)],
+        };
+
+        let solved = run_two_block_exact_joint_optimize(
+            data.view(),
+            &meanspec,
+            &noisespec,
+            "exact joint two-block κ optimization should succeed",
+        );
 
         for resolved in [&solved.resolved_specs[0], &solved.resolved_specs[1]] {
             match &resolved.smooth_terms[0].basis {
@@ -22173,22 +22184,26 @@ mod tests {
         );
     }
 
-    /// Architectural pin: for the iso-κ Duchon ψ-axis under BinomialProbit,
-    /// the penalty-subspace projection (`solution.penalty_subspace_trace =
-    /// Some(...)`) must be *active* AND must change the trace by an order of
-    /// magnitude relative to the full-space `G_ε(H)` kernel.
-    ///
-    /// Specifically:
-    ///   * `unprojected_tr ≈ tr(G_ε(H) · op_total)`
-    ///     ≫ `production_tr ≈ tr_projected(...)` in magnitude.
-    ///   * `production_tr ≈ ∂log|H|/∂ψ` (FD truth).
-    ///
-    /// If either invariant breaks, the cost identity for Duchon ψ silently
-    /// drifts and the joint-gradient test (and any downstream optimizer) is
-    /// solving the wrong problem. This test exists to make the projection's
-    /// role legible: it captures the mechanism, not just the outcome.
-    #[test]
-    fn iso_kappa_duchon_penalty_subspace_projection_pins_trace() {
+    /// Owned 1-D Duchon BinomialProbit setup shared verbatim across the
+    /// `duchon_probit_*` mechanism pins. Holds only non-self-referential
+    /// owners; each test constructs its own `external_opts` / cache /
+    /// evaluator inline (the borrow-entangled, per-test-labelled parts).
+    struct DuchonProbitSetup {
+        data: Array2<f64>,
+        y: Array1<f64>,
+        weights: Array1<f64>,
+        offset: Array1<f64>,
+        frozen: TermCollectionSpec,
+        frozen_design: TermCollectionDesign,
+        spatial_terms: Vec<usize>,
+        dims_per_term: Vec<usize>,
+        rho_dim: usize,
+        psi_dim: usize,
+    }
+
+    /// Builds the verbatim 1-D Duchon BinomialProbit data + frozen design used
+    /// by the ψ-trace / per-row / PIRLS-determinism mechanism pins.
+    fn build_duchon_probit_setup() -> DuchonProbitSetup {
         let n = 80usize;
         let mut data = Array2::<f64>::zeros((n, 1));
         let mut y = Array1::<f64>::zeros(n);
@@ -22228,13 +22243,6 @@ mod tests {
                 joint_null_rotation: None,
             }],
         };
-        let fit_opts = FitOptions {
-            compute_inference: false,
-            max_iter: 200,
-            tol: 1e-12,
-            penalty_shrinkage_floor: None,
-            ..FitOptions::default()
-        };
         let design = build_term_collection_design(data.view(), &spec).expect("design");
         let frozen = freeze_term_collection_from_design(&spec, &design).expect("freeze");
         let frozen_design =
@@ -22243,6 +22251,55 @@ mod tests {
         let dims_per_term = spatial_dims_per_term(&frozen, &spatial_terms);
         let rho_dim = frozen_design.penalties.len();
         let psi_dim: usize = dims_per_term.iter().sum();
+        DuchonProbitSetup {
+            data,
+            y,
+            weights,
+            offset,
+            frozen,
+            frozen_design,
+            spatial_terms,
+            dims_per_term,
+            rho_dim,
+            psi_dim,
+        }
+    }
+
+    /// Architectural pin: for the iso-κ Duchon ψ-axis under BinomialProbit,
+    /// the penalty-subspace projection (`solution.penalty_subspace_trace =
+    /// Some(...)`) must be *active* AND must change the trace by an order of
+    /// magnitude relative to the full-space `G_ε(H)` kernel.
+    ///
+    /// Specifically:
+    ///   * `unprojected_tr ≈ tr(G_ε(H) · op_total)`
+    ///     ≫ `production_tr ≈ tr_projected(...)` in magnitude.
+    ///   * `production_tr ≈ ∂log|H|/∂ψ` (FD truth).
+    ///
+    /// If either invariant breaks, the cost identity for Duchon ψ silently
+    /// drifts and the joint-gradient test (and any downstream optimizer) is
+    /// solving the wrong problem. This test exists to make the projection's
+    /// role legible: it captures the mechanism, not just the outcome.
+    #[test]
+    fn iso_kappa_duchon_penalty_subspace_projection_pins_trace() {
+        let DuchonProbitSetup {
+            data,
+            y,
+            weights,
+            offset,
+            frozen,
+            frozen_design,
+            spatial_terms,
+            dims_per_term,
+            rho_dim,
+            psi_dim,
+        } = build_duchon_probit_setup();
+        let fit_opts = FitOptions {
+            compute_inference: false,
+            max_iter: 200,
+            tol: 1e-12,
+            penalty_shrinkage_floor: None,
+            ..FitOptions::default()
+        };
 
         let external_opts = external_opts_for_design(
             &LikelihoodSpec::binomial_probit(),
@@ -22407,45 +22464,18 @@ mod tests {
     /// If they don't match: the IFT formula or v_ψ is wrong.
     #[test]
     fn duchon_probit_per_row_dnu_dpsi_fd_vs_analytic() {
-        let n = 80usize;
-        let mut data = Array2::<f64>::zeros((n, 1));
-        let mut y = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let t = i as f64 / (n as f64 - 1.0);
-            data[[i, 0]] = t;
-            let eta = 1.4 * (2.0 * std::f64::consts::PI * t).sin() + 0.5 * (t - 0.5);
-            y[i] = if eta + 0.7 * (3.7 * (i as f64) + 1.0).sin() > 0.0 {
-                1.0
-            } else {
-                0.0
-            };
-        }
-        let weights = Array1::ones(n);
-        let offset = Array1::zeros(n);
-        let spec = TermCollectionSpec {
-            linear_terms: vec![],
-            random_effect_terms: vec![],
-            smooth_terms: vec![SmoothTermSpec {
-                name: "duchon_1d".to_string(),
-                basis: SmoothBasisSpec::Duchon {
-                    feature_cols: vec![0],
-                    spec: DuchonBasisSpec {
-                        periodic: None,
-                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
-                        length_scale: Some(1.0),
-                        power: 1.0,
-                        nullspace_order: DuchonNullspaceOrder::Linear,
-                        identifiability: SpatialIdentifiability::default(),
-                        aniso_log_scales: None,
-                        operator_penalties: DuchonOperatorPenaltySpec::default(),
-                        boundary: OneDimensionalBoundary::Open,
-                    },
-                    input_scales: None,
-                },
-                shape: ShapeConstraint::None,
-                joint_null_rotation: None,
-            }],
-        };
+        let DuchonProbitSetup {
+            data,
+            y,
+            weights,
+            offset,
+            frozen,
+            frozen_design,
+            spatial_terms,
+            dims_per_term,
+            rho_dim,
+            psi_dim,
+        } = build_duchon_probit_setup();
         let fit_opts = FitOptions {
             compute_inference: false,
             max_iter: 200,
@@ -22453,14 +22483,6 @@ mod tests {
             penalty_shrinkage_floor: None,
             ..FitOptions::default()
         };
-        let design = build_term_collection_design(data.view(), &spec).expect("design");
-        let frozen = freeze_term_collection_from_design(&spec, &design).expect("freeze");
-        let frozen_design =
-            build_term_collection_design(data.view(), &frozen).expect("frozen design");
-        let spatial_terms = spatial_length_scale_term_indices(&frozen);
-        let dims_per_term = spatial_dims_per_term(&frozen, &spatial_terms);
-        let rho_dim = frozen_design.penalties.len();
-        let psi_dim: usize = dims_per_term.iter().sum();
 
         let external_opts = external_opts_for_design(
             &LikelihoodSpec::binomial_probit(),
@@ -22649,45 +22671,18 @@ mod tests {
     /// 1e-6 relative band catches that while tolerating the latter.
     #[test]
     fn duchon_probit_pirls_determinism_at_zero() {
-        let n = 80usize;
-        let mut data = Array2::<f64>::zeros((n, 1));
-        let mut y = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let t = i as f64 / (n as f64 - 1.0);
-            data[[i, 0]] = t;
-            let eta = 1.4 * (2.0 * std::f64::consts::PI * t).sin() + 0.5 * (t - 0.5);
-            y[i] = if eta + 0.7 * (3.7 * (i as f64) + 1.0).sin() > 0.0 {
-                1.0
-            } else {
-                0.0
-            };
-        }
-        let weights = Array1::ones(n);
-        let offset = Array1::zeros(n);
-        let spec = TermCollectionSpec {
-            linear_terms: vec![],
-            random_effect_terms: vec![],
-            smooth_terms: vec![SmoothTermSpec {
-                name: "duchon_1d".to_string(),
-                basis: SmoothBasisSpec::Duchon {
-                    feature_cols: vec![0],
-                    spec: DuchonBasisSpec {
-                        periodic: None,
-                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
-                        length_scale: Some(1.0),
-                        power: 1.0,
-                        nullspace_order: DuchonNullspaceOrder::Linear,
-                        identifiability: SpatialIdentifiability::default(),
-                        aniso_log_scales: None,
-                        operator_penalties: DuchonOperatorPenaltySpec::default(),
-                        boundary: OneDimensionalBoundary::Open,
-                    },
-                    input_scales: None,
-                },
-                shape: ShapeConstraint::None,
-                joint_null_rotation: None,
-            }],
-        };
+        let DuchonProbitSetup {
+            data,
+            y,
+            weights,
+            offset,
+            frozen,
+            frozen_design,
+            spatial_terms,
+            dims_per_term,
+            rho_dim,
+            psi_dim,
+        } = build_duchon_probit_setup();
         let fit_opts = FitOptions {
             compute_inference: false,
             max_iter: 200,
@@ -22705,14 +22700,6 @@ mod tests {
             penalty_shrinkage_floor: None,
             ..FitOptions::default()
         };
-        let design = build_term_collection_design(data.view(), &spec).expect("design");
-        let frozen = freeze_term_collection_from_design(&spec, &design).expect("freeze");
-        let frozen_design =
-            build_term_collection_design(data.view(), &frozen).expect("frozen design");
-        let spatial_terms = spatial_length_scale_term_indices(&frozen);
-        let dims_per_term = spatial_dims_per_term(&frozen, &spatial_terms);
-        let rho_dim = frozen_design.penalties.len();
-        let psi_dim: usize = dims_per_term.iter().sum();
 
         let external_opts = external_opts_for_design(
             &LikelihoodSpec::binomial_probit(),
@@ -24252,56 +24239,14 @@ mod tests {
         let weights = Array1::ones(n);
         let offset = Array1::zeros(n);
 
-        let baseline = fit_term_collection_forspec(
+        assert_matern_spatial_length_scale_optimization_monotone(
             data.view(),
-            y.view(),
-            weights.view(),
-            offset.view(),
+            &y,
+            &weights,
+            &offset,
             &spec,
-            LikelihoodSpec::gaussian_identity(),
             &fit_opts,
-        )
-        .expect("baseline fit should succeed");
-        let baseline_score = fit_score(&baseline.fit);
-
-        let optimized = fit_term_collectionwith_spatial_length_scale_optimization(
-            data.view(),
-            y.clone(),
-            weights.clone(),
-            offset.clone(),
-            &spec,
-            LikelihoodSpec::gaussian_identity(),
-            &fit_opts,
-            &SpatialLengthScaleOptimizationOptions {
-                max_outer_iter: 2,
-                rel_tol: 1e-5,
-                pilot_subsample_threshold: 0,
-                ..SpatialLengthScaleOptimizationOptions::default()
-            },
-        )
-        .expect("optimized fit should succeed");
-        let optimized_score = fit_score(&optimized.fit);
-        assert!(optimized_score <= baseline_score + 1e-10);
-
-        let ls = match &optimized.resolvedspec.smooth_terms[0].basis {
-            SmoothBasisSpec::Matern { spec, .. } => spec.length_scale,
-            _ => panic!("expected Matérn term"),
-        };
-        assert!(ls.is_finite() && (1e-3..=1e3).contains(&ls));
-
-        match &optimized.resolvedspec.smooth_terms[0].basis {
-            SmoothBasisSpec::Matern { spec, .. } => {
-                assert!(matches!(
-                    spec.center_strategy,
-                    CenterStrategy::UserProvided(_)
-                ));
-                assert!(matches!(
-                    spec.identifiability,
-                    MaternIdentifiability::FrozenTransform { .. }
-                ));
-            }
-            _ => panic!("expected Matérn term"),
-        }
+        );
     }
 
     #[test]
@@ -25150,81 +25095,12 @@ mod tests {
             smooth_terms: vec![duchon_term("noise_duchon", 1.1)],
         };
 
-        let kappa_options = SpatialLengthScaleOptimizationOptions {
-            max_outer_iter: 1,
-            rel_tol: 1e-6,
-            pilot_subsample_threshold: 0,
-            ..SpatialLengthScaleOptimizationOptions::default()
-        };
-        let joint_setup = two_block_exact_joint_hyper_setup(&meanspec, &noisespec, &kappa_options);
-        let theta_dim = joint_setup.theta0().len();
-
-        let mean_terms = spatial_length_scale_term_indices(&meanspec);
-        let noise_terms = spatial_length_scale_term_indices(&noisespec);
-        let policy = crate::families::custom_family::OuterDerivativePolicy {
-            capability: crate::families::custom_family::ExactOuterDerivativeOrder::Second,
-            predicted_hessian_work: 0,
-            predicted_gradient_work: 0,
-            // Test-style construction with zero predicted work — these
-            // paths never engage staged-κ, so the capability bit is
-            // moot. Keep `false` as the safe default.
-            subsample_capable: false,
-        };
-        let solved = optimize_spatial_length_scale_exact_joint(
+        let solved = run_two_block_exact_joint_optimize(
             data.view(),
-            &[meanspec.clone(), noisespec.clone()],
-            &[mean_terms, noise_terms],
-            &kappa_options,
-            &joint_setup,
-            crate::seeding::SeedRiskProfile::Gaussian,
-            true,
-            true,
-            false,
-            None,
-            policy,
-            |theta, specs, designs| {
-                assert_eq!(theta.len(), theta_dim);
-                assert_eq!(specs.len(), 2);
-                Ok(designs[0].design.ncols() as f64
-                    + designs[1].design.ncols() as f64
-                    + designs[0].penalties.len() as f64
-                    + designs[1].penalties.len() as f64)
-            },
-            |theta, specs, designs, eval_mode, _| {
-                assert_eq!(theta.len(), theta_dim);
-                assert_eq!(specs.len(), 2);
-                assert!(!designs.is_empty());
-                Ok((
-                    0.0,
-                    Array1::zeros(theta_dim),
-                    if matches!(
-                        eval_mode,
-                        crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian
-                    ) {
-                        crate::solver::outer_strategy::HessianResult::Analytic(Array2::zeros((
-                            theta_dim, theta_dim,
-                        )))
-                    } else {
-                        crate::solver::outer_strategy::HessianResult::Unavailable
-                    },
-                ))
-            },
-            |theta, specs, designs| {
-                assert_eq!(theta.len(), theta_dim);
-                assert_eq!(specs.len(), 2);
-                assert!(!designs.is_empty());
-                Ok(crate::solver::outer_strategy::EfsEval {
-                    cost: 0.0,
-                    steps: vec![0.0; theta_dim],
-                    beta: None,
-                    psi_gradient: None,
-                    psi_indices: None,
-                    inner_hessian_scale: None,
-                })
-            },
-            |_beta: &Array1<f64>| Ok(()),
-        )
-        .expect("exact joint two-block spatial length-scale optimization should succeed");
+            &meanspec,
+            &noisespec,
+            "exact joint two-block spatial length-scale optimization should succeed",
+        );
 
         for resolved in [&solved.resolved_specs[0], &solved.resolved_specs[1]] {
             match &resolved.smooth_terms[0].basis {
@@ -26132,6 +26008,83 @@ mod tests {
         }
     }
 
+    /// Builds the shared spatial-adaptive joint-hyper evaluation scaffolding
+    /// (hyperspecs, the zero-ψ derivative blocks, the `base_family` with empty
+    /// adaptive params, and the single `eta` block spec) from a Gaussian
+    /// baseline fit. Shared verbatim across the FD-gradient and
+    /// gradient-lambda-profile pins; the per-test outer-loop cycle counts and
+    /// θ probing stay at each call site.
+    fn build_spatial_adaptive_joint_hyper_scaffold(
+        baseline: &FittedTermCollection,
+        runtime_caches: &[SpatialOperatorRuntimeCache],
+        y: &Array1<f64>,
+        n: usize,
+    ) -> (
+        SpatialAdaptiveExactFamily,
+        ParameterBlockSpec,
+        Vec<Vec<CustomFamilyBlockPsiDerivative>>,
+    ) {
+        let hyperspecs = build_spatial_adaptive_hyperspecs(runtime_caches.len());
+        let zero_psi_op: std::sync::Arc<
+            dyn crate::custom_family::CustomFamilyPsiDerivativeOperator,
+        > = std::sync::Arc::new(crate::custom_family::ZeroPsiDerivativeOperator::new(
+            baseline.design.design.nrows(),
+            baseline.design.design.ncols(),
+        ));
+        let derivative_blocks = vec![
+            hyperspecs
+                .iter()
+                .map(|_| CustomFamilyBlockPsiDerivative {
+                    penalty_index: None,
+                    x_psi: Array2::<f64>::zeros((0, 0)),
+                    s_psi: Array2::<f64>::zeros((0, 0)),
+                    s_psi_components: None,
+                    s_psi_penalty_components: None,
+                    x_psi_psi: None,
+                    s_psi_psi: None,
+                    s_psi_psi_components: None,
+                    s_psi_psi_penalty_components: None,
+                    implicit_operator: Some(std::sync::Arc::clone(&zero_psi_op)),
+                    implicit_axis: 0,
+                    implicit_group_id: None,
+                })
+                .collect::<Vec<_>>(),
+        ];
+        let base_family = SpatialAdaptiveExactFamily {
+            family: LikelihoodSpec::gaussian_identity(),
+            latent_cloglog_state: None,
+            mixture_link_state: None,
+            sas_link_state: None,
+            y: Arc::new(y.clone()),
+            weights: Arc::new(Array1::ones(n)),
+            design: baseline.design.design.to_dense_arc(),
+            offset: Arc::new(Array1::zeros(n)),
+            linear_constraints: baseline.design.linear_constraints.clone(),
+            runtime_caches: Arc::new(runtime_caches.to_vec()),
+            adaptive_params: Vec::new(),
+            fixed_quadratichessian: Arc::new(Array2::<f64>::zeros((
+                baseline.design.design.ncols(),
+                baseline.design.design.ncols(),
+            ))),
+            hyperspecs: Arc::new(hyperspecs),
+            exact_eval_cache: Arc::new(Mutex::new(None)),
+        };
+        let blockspec = ParameterBlockSpec {
+            name: "eta".to_string(),
+            design: baseline.design.design.clone(),
+            offset: Array1::zeros(n),
+            penalties: vec![],
+            nullspace_dims: vec![],
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: Some(baseline.fit.beta.clone()),
+            gauge_priority: 100,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        };
+        (base_family, blockspec, derivative_blocks)
+    }
+
     #[test]
     fn exact_spatial_adaptive_joint_hypergradient_matches_finite_difference() {
         let n = 36usize;
@@ -26193,64 +26146,8 @@ mod tests {
             adaptive_opts.min_epsilon,
         )
         .expect("initial epsilons");
-        let hyperspecs = build_spatial_adaptive_hyperspecs(runtime_caches.len());
-        let zero_psi_op: std::sync::Arc<
-            dyn crate::custom_family::CustomFamilyPsiDerivativeOperator,
-        > = std::sync::Arc::new(crate::custom_family::ZeroPsiDerivativeOperator::new(
-            baseline.design.design.nrows(),
-            baseline.design.design.ncols(),
-        ));
-        let derivative_blocks = vec![
-            hyperspecs
-                .iter()
-                .map(|_| CustomFamilyBlockPsiDerivative {
-                    penalty_index: None,
-                    x_psi: Array2::<f64>::zeros((0, 0)),
-                    s_psi: Array2::<f64>::zeros((0, 0)),
-                    s_psi_components: None,
-                    s_psi_penalty_components: None,
-                    x_psi_psi: None,
-                    s_psi_psi: None,
-                    s_psi_psi_components: None,
-                    s_psi_psi_penalty_components: None,
-                    implicit_operator: Some(std::sync::Arc::clone(&zero_psi_op)),
-                    implicit_axis: 0,
-                    implicit_group_id: None,
-                })
-                .collect::<Vec<_>>(),
-        ];
-        let base_family = SpatialAdaptiveExactFamily {
-            family: LikelihoodSpec::gaussian_identity(),
-            latent_cloglog_state: None,
-            mixture_link_state: None,
-            sas_link_state: None,
-            y: Arc::new(y.clone()),
-            weights: Arc::new(Array1::ones(n)),
-            design: baseline.design.design.to_dense_arc(),
-            offset: Arc::new(Array1::zeros(n)),
-            linear_constraints: baseline.design.linear_constraints.clone(),
-            runtime_caches: Arc::new(runtime_caches.clone()),
-            adaptive_params: Vec::new(),
-            fixed_quadratichessian: Arc::new(Array2::<f64>::zeros((
-                baseline.design.design.ncols(),
-                baseline.design.design.ncols(),
-            ))),
-            hyperspecs: Arc::new(hyperspecs),
-            exact_eval_cache: Arc::new(Mutex::new(None)),
-        };
-        let blockspec = ParameterBlockSpec {
-            name: "eta".to_string(),
-            design: baseline.design.design.clone(),
-            offset: Array1::zeros(n),
-            penalties: vec![],
-            nullspace_dims: vec![],
-            initial_log_lambdas: Array1::zeros(0),
-            initial_beta: Some(baseline.fit.beta.clone()),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
+        let (base_family, blockspec, derivative_blocks) =
+            build_spatial_adaptive_joint_hyper_scaffold(&baseline, &runtime_caches, &y, n);
         let outer_opts = BlockwiseFitOptions {
             inner_max_cycles: 30,
             inner_tol: 1e-6,
@@ -26403,64 +26300,8 @@ mod tests {
         let (eps_0, eps_g, eps_c) =
             compute_initial_epsilons(&baseline.fit.beta, &runtime_caches, 1e-8)
                 .expect("initial epsilons");
-        let hyperspecs = build_spatial_adaptive_hyperspecs(runtime_caches.len());
-        let zero_psi_op: std::sync::Arc<
-            dyn crate::custom_family::CustomFamilyPsiDerivativeOperator,
-        > = std::sync::Arc::new(crate::custom_family::ZeroPsiDerivativeOperator::new(
-            baseline.design.design.nrows(),
-            baseline.design.design.ncols(),
-        ));
-        let derivative_blocks = vec![
-            hyperspecs
-                .iter()
-                .map(|_| CustomFamilyBlockPsiDerivative {
-                    penalty_index: None,
-                    x_psi: Array2::<f64>::zeros((0, 0)),
-                    s_psi: Array2::<f64>::zeros((0, 0)),
-                    s_psi_components: None,
-                    s_psi_penalty_components: None,
-                    x_psi_psi: None,
-                    s_psi_psi: None,
-                    s_psi_psi_components: None,
-                    s_psi_psi_penalty_components: None,
-                    implicit_operator: Some(std::sync::Arc::clone(&zero_psi_op)),
-                    implicit_axis: 0,
-                    implicit_group_id: None,
-                })
-                .collect::<Vec<_>>(),
-        ];
-        let base_family = SpatialAdaptiveExactFamily {
-            family: LikelihoodSpec::gaussian_identity(),
-            latent_cloglog_state: None,
-            mixture_link_state: None,
-            sas_link_state: None,
-            y: Arc::new(y.clone()),
-            weights: Arc::new(Array1::ones(n)),
-            design: baseline.design.design.to_dense_arc(),
-            offset: Arc::new(Array1::zeros(n)),
-            linear_constraints: baseline.design.linear_constraints.clone(),
-            runtime_caches: Arc::new(runtime_caches.clone()),
-            adaptive_params: Vec::new(),
-            fixed_quadratichessian: Arc::new(Array2::<f64>::zeros((
-                baseline.design.design.ncols(),
-                baseline.design.design.ncols(),
-            ))),
-            hyperspecs: Arc::new(hyperspecs),
-            exact_eval_cache: Arc::new(Mutex::new(None)),
-        };
-        let blockspec = ParameterBlockSpec {
-            name: "eta".to_string(),
-            design: baseline.design.design.clone(),
-            offset: Array1::zeros(n),
-            penalties: vec![],
-            nullspace_dims: vec![],
-            initial_log_lambdas: Array1::zeros(0),
-            initial_beta: Some(baseline.fit.beta.clone()),
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        };
+        let (base_family, blockspec, derivative_blocks) =
+            build_spatial_adaptive_joint_hyper_scaffold(&baseline, &runtime_caches, &y, n);
         let outer_opts = BlockwiseFitOptions {
             inner_max_cycles: 20,
             inner_tol: 1e-6,
@@ -27224,64 +27065,60 @@ mod tests {
         // Dispatch-surface parity: the public entry points must route to the
         // same engine output. `adaptive_hyper_parts` on a per-term `log lambda`
         // spec equals the `Rho` block eval; on a shared `log epsilon` spec it
-        // equals the summed `LogEpsilonFirst` blocks.
-        for (kind, component) in [
-            (
-                SpatialAdaptiveHyperKind::LogLambdaMagnitude,
-                AdaptiveComponent::Magnitude,
-            ),
-            (
-                SpatialAdaptiveHyperKind::LogLambdaGradient,
-                AdaptiveComponent::Gradient,
-            ),
-            (
-                SpatialAdaptiveHyperKind::LogLambdaCurvature,
-                AdaptiveComponent::Curvature,
-            ),
-        ] {
-            let hyper = SpatialAdaptiveHyperSpec {
-                cache_index: 0,
-                kind,
-            };
-            let (obj_disp, grad_disp, hess_disp) = family
-                .adaptive_hyper_parts(&eval, hyper)
-                .expect("hyper parts");
-            let (obj_ref, grad_ref, hess_ref) =
-                reference_parts(component, HyperDerivativeKind::Rho);
-            assert_eq!(obj_disp, obj_ref);
-            assert_eq!(grad_disp, grad_ref);
-            assert_eq!(hess_disp, hess_ref);
-        }
+        // equals the summed `LogEpsilonFirst` blocks (single cache ⇒ the shared
+        // sum is the single block's first-order `log epsilon` eval).
+        let check_dispatch_parity = |specs: [(SpatialAdaptiveHyperKind, AdaptiveComponent); 3],
+                                     deriv_kind: HyperDerivativeKind| {
+            for (kind, component) in specs {
+                let hyper = SpatialAdaptiveHyperSpec {
+                    cache_index: 0,
+                    kind,
+                };
+                let (obj_disp, grad_disp, hess_disp) = family
+                    .adaptive_hyper_parts(&eval, hyper)
+                    .expect("hyper parts");
+                let (obj_ref, grad_ref, hess_ref) = reference_parts(component, deriv_kind);
+                assert_eq!(obj_disp, obj_ref);
+                assert_eq!(grad_disp, grad_ref);
+                assert_eq!(hess_disp, hess_ref);
+            }
+        };
 
-        for (kind, component) in [
-            (
-                SpatialAdaptiveHyperKind::LogEpsilonMagnitude,
-                AdaptiveComponent::Magnitude,
-            ),
-            (
-                SpatialAdaptiveHyperKind::LogEpsilonGradient,
-                AdaptiveComponent::Gradient,
-            ),
-            (
-                SpatialAdaptiveHyperKind::LogEpsilonCurvature,
-                AdaptiveComponent::Curvature,
-            ),
-        ] {
-            let hyper = SpatialAdaptiveHyperSpec {
-                cache_index: 0,
-                kind,
-            };
-            // Single cache, so the shared sum equals the single block's
-            // first-order `log epsilon` eval.
-            let (obj_disp, grad_disp, hess_disp) = family
-                .adaptive_hyper_parts(&eval, hyper)
-                .expect("hyper parts");
-            let (obj_ref, grad_ref, hess_ref) =
-                reference_parts(component, HyperDerivativeKind::LogEpsilonFirst);
-            assert_eq!(obj_disp, obj_ref);
-            assert_eq!(grad_disp, grad_ref);
-            assert_eq!(hess_disp, hess_ref);
-        }
+        check_dispatch_parity(
+            [
+                (
+                    SpatialAdaptiveHyperKind::LogLambdaMagnitude,
+                    AdaptiveComponent::Magnitude,
+                ),
+                (
+                    SpatialAdaptiveHyperKind::LogLambdaGradient,
+                    AdaptiveComponent::Gradient,
+                ),
+                (
+                    SpatialAdaptiveHyperKind::LogLambdaCurvature,
+                    AdaptiveComponent::Curvature,
+                ),
+            ],
+            HyperDerivativeKind::Rho,
+        );
+
+        check_dispatch_parity(
+            [
+                (
+                    SpatialAdaptiveHyperKind::LogEpsilonMagnitude,
+                    AdaptiveComponent::Magnitude,
+                ),
+                (
+                    SpatialAdaptiveHyperKind::LogEpsilonGradient,
+                    AdaptiveComponent::Gradient,
+                ),
+                (
+                    SpatialAdaptiveHyperKind::LogEpsilonCurvature,
+                    AdaptiveComponent::Curvature,
+                ),
+            ],
+            HyperDerivativeKind::LogEpsilonFirst,
+        );
     }
 
     #[test]
