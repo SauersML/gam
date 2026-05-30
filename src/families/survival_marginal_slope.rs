@@ -710,6 +710,55 @@ struct BlockSlices {
     total: usize,
 }
 
+/// Identifies one coefficient block of the survival marginal-slope joint
+/// Hessian. The discriminant order *is* the coordinate layout order
+/// (`time | marginal | logslope | score_warp? | link_dev?`), so it doubles as
+/// the upper-triangle ordering used to pick the stored half of each symmetric
+/// off-diagonal block. `ScoreWarp` and `LinkDev` are optional: they are absent
+/// from the layout unless the corresponding flex deviation block is active.
+///
+/// This enum and [`BlockHessianAccumulator::block_view`] are the single source
+/// of truth for the block layout. Every Hessian read-out (dense scatter,
+/// matvec, bilinear form, diagonal extraction) is driven by them rather than
+/// re-listing the fifteen blocks and their transpose relationships by hand, so
+/// a layout change lands in exactly one place.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum HessBlock {
+    Time,
+    Marginal,
+    Logslope,
+    ScoreWarp,
+    LinkDev,
+}
+
+impl HessBlock {
+    /// Blocks in canonical coordinate-layout order. Iterating this array is how
+    /// every assembler visits blocks; the order fixes floating-point
+    /// accumulation order in the matvec / bilinear paths.
+    const ALL: [HessBlock; 5] = [
+        HessBlock::Time,
+        HessBlock::Marginal,
+        HessBlock::Logslope,
+        HessBlock::ScoreWarp,
+        HessBlock::LinkDev,
+    ];
+}
+
+impl BlockSlices {
+    /// Coordinate range occupied by `block`, or `None` when the (optional)
+    /// flex block is inactive. `time`/`marginal`/`logslope` are always present.
+    #[inline]
+    fn range_of(&self, block: HessBlock) -> Option<std::ops::Range<usize>> {
+        match block {
+            HessBlock::Time => Some(self.time.clone()),
+            HessBlock::Marginal => Some(self.marginal.clone()),
+            HessBlock::Logslope => Some(self.logslope.clone()),
+            HessBlock::ScoreWarp => self.score_warp.clone(),
+            HessBlock::LinkDev => self.link_dev.clone(),
+        }
+    }
+}
+
 fn block_slices(
     family: &SurvivalMarginalSlopeFamily,
     block_states: &[ParameterBlockState],
@@ -2242,71 +2291,91 @@ impl BlockHessianAccumulator {
         );
     }
 
+    /// Returns the `(row, col)` block of the symmetric joint Hessian as a view
+    /// into the stored half, transposing on the fly when the requested pair is
+    /// below the diagonal.
+    ///
+    /// This is the single source of truth for the block layout: it is the only
+    /// place that maps a block pair onto one of the fifteen stored matrices and
+    /// decides whether a transpose is needed. The match is exhaustive over all
+    /// 5×5 pairs, so adding a block produces a hard compile error here rather
+    /// than a silent gap in one assembler. Diagonal blocks are symmetric by
+    /// construction and returned untransposed.
+    #[inline]
+    fn block_view(&self, row: HessBlock, col: HessBlock) -> ArrayView2<'_, f64> {
+        use HessBlock::*;
+        match (row, col) {
+            (Time, Time) => self.h_tt.view(),
+            (Marginal, Marginal) => self.h_mm.view(),
+            (Logslope, Logslope) => self.h_gg.view(),
+            (ScoreWarp, ScoreWarp) => self.h_hh.view(),
+            (LinkDev, LinkDev) => self.h_ww.view(),
+
+            (Time, Marginal) => self.h_tm.view(),
+            (Marginal, Time) => self.h_tm.t(),
+            (Time, Logslope) => self.h_tg.view(),
+            (Logslope, Time) => self.h_tg.t(),
+            (Time, ScoreWarp) => self.h_th.view(),
+            (ScoreWarp, Time) => self.h_th.t(),
+            (Time, LinkDev) => self.h_tw.view(),
+            (LinkDev, Time) => self.h_tw.t(),
+
+            (Marginal, Logslope) => self.h_mg.view(),
+            (Logslope, Marginal) => self.h_mg.t(),
+            (Marginal, ScoreWarp) => self.h_mh.view(),
+            (ScoreWarp, Marginal) => self.h_mh.t(),
+            (Marginal, LinkDev) => self.h_mw.view(),
+            (LinkDev, Marginal) => self.h_mw.t(),
+
+            (Logslope, ScoreWarp) => self.h_gh.view(),
+            (ScoreWarp, Logslope) => self.h_gh.t(),
+            (Logslope, LinkDev) => self.h_gw.view(),
+            (LinkDev, Logslope) => self.h_gw.t(),
+
+            (ScoreWarp, LinkDev) => self.h_hw.view(),
+            (LinkDev, ScoreWarp) => self.h_hw.t(),
+        }
+    }
+
+    /// Visits the present off-diagonal block pairs `(lo, hi)` in column-major
+    /// upper-triangle order (`hi` outermost), skipping pairs whose blocks are
+    /// inactive. This fixes the off-diagonal traversal order shared by
+    /// [`Self::to_dense`] and [`BlockHessianOperator::bilinear`].
+    #[inline]
+    fn for_each_offdiagonal_pair(
+        slices: &BlockSlices,
+        mut visit: impl FnMut(HessBlock, std::ops::Range<usize>, HessBlock, std::ops::Range<usize>),
+    ) {
+        for hi_idx in 1..HessBlock::ALL.len() {
+            let hi = HessBlock::ALL[hi_idx];
+            let Some(r_hi) = slices.range_of(hi) else {
+                continue;
+            };
+            for &lo in &HessBlock::ALL[..hi_idx] {
+                let Some(r_lo) = slices.range_of(lo) else {
+                    continue;
+                };
+                visit(lo, r_lo, hi, r_hi.clone());
+            }
+        }
+    }
+
     /// Assemble into a dense p×p matrix.
     fn to_dense(&self, slices: &BlockSlices) -> Array2<f64> {
         let mut out = Array2::zeros((slices.total, slices.total));
-        out.slice_mut(s![slices.time.clone(), slices.time.clone()])
-            .assign(&self.h_tt);
-        out.slice_mut(s![slices.marginal.clone(), slices.marginal.clone()])
-            .assign(&self.h_mm);
-        out.slice_mut(s![slices.logslope.clone(), slices.logslope.clone()])
-            .assign(&self.h_gg);
-        if let Some(range) = slices.score_warp.as_ref() {
-            out.slice_mut(s![range.clone(), range.clone()])
-                .assign(&self.h_hh);
+        for block in HessBlock::ALL {
+            let Some(range) = slices.range_of(block) else {
+                continue;
+            };
+            out.slice_mut(s![range.clone(), range])
+                .assign(&self.block_view(block, block));
         }
-        if let Some(range) = slices.link_dev.as_ref() {
-            out.slice_mut(s![range.clone(), range.clone()])
-                .assign(&self.h_ww);
-        }
-        out.slice_mut(s![slices.time.clone(), slices.marginal.clone()])
-            .assign(&self.h_tm);
-        out.slice_mut(s![slices.marginal.clone(), slices.time.clone()])
-            .assign(&self.h_tm.t());
-        out.slice_mut(s![slices.time.clone(), slices.logslope.clone()])
-            .assign(&self.h_tg);
-        out.slice_mut(s![slices.logslope.clone(), slices.time.clone()])
-            .assign(&self.h_tg.t());
-        out.slice_mut(s![slices.marginal.clone(), slices.logslope.clone()])
-            .assign(&self.h_mg);
-        out.slice_mut(s![slices.logslope.clone(), slices.marginal.clone()])
-            .assign(&self.h_mg.t());
-        if let Some(range) = slices.score_warp.as_ref() {
-            out.slice_mut(s![slices.time.clone(), range.clone()])
-                .assign(&self.h_th);
-            out.slice_mut(s![range.clone(), slices.time.clone()])
-                .assign(&self.h_th.t());
-            out.slice_mut(s![slices.marginal.clone(), range.clone()])
-                .assign(&self.h_mh);
-            out.slice_mut(s![range.clone(), slices.marginal.clone()])
-                .assign(&self.h_mh.t());
-            out.slice_mut(s![slices.logslope.clone(), range.clone()])
-                .assign(&self.h_gh);
-            out.slice_mut(s![range.clone(), slices.logslope.clone()])
-                .assign(&self.h_gh.t());
-        }
-        if let Some(range) = slices.link_dev.as_ref() {
-            out.slice_mut(s![slices.time.clone(), range.clone()])
-                .assign(&self.h_tw);
-            out.slice_mut(s![range.clone(), slices.time.clone()])
-                .assign(&self.h_tw.t());
-            out.slice_mut(s![slices.marginal.clone(), range.clone()])
-                .assign(&self.h_mw);
-            out.slice_mut(s![range.clone(), slices.marginal.clone()])
-                .assign(&self.h_mw.t());
-            out.slice_mut(s![slices.logslope.clone(), range.clone()])
-                .assign(&self.h_gw);
-            out.slice_mut(s![range.clone(), slices.logslope.clone()])
-                .assign(&self.h_gw.t());
-        }
-        if let (Some(h_range), Some(w_range)) =
-            (slices.score_warp.as_ref(), slices.link_dev.as_ref())
-        {
-            out.slice_mut(s![h_range.clone(), w_range.clone()])
-                .assign(&self.h_hw);
-            out.slice_mut(s![w_range.clone(), h_range.clone()])
-                .assign(&self.h_hw.t());
-        }
+        Self::for_each_offdiagonal_pair(slices, |lo, r_lo, hi, r_hi| {
+            out.slice_mut(s![r_lo.clone(), r_hi.clone()])
+                .assign(&self.block_view(lo, hi));
+            out.slice_mut(s![r_hi, r_lo])
+                .assign(&self.block_view(hi, lo));
+        });
         out
     }
 
@@ -2337,17 +2406,12 @@ impl BlockHessianAccumulator {
 
     fn diagonal(&self, slices: &BlockSlices) -> Array1<f64> {
         let mut out = Array1::zeros(slices.total);
-        out.slice_mut(s![slices.time.clone()])
-            .assign(&self.h_tt.diag());
-        out.slice_mut(s![slices.marginal.clone()])
-            .assign(&self.h_mm.diag());
-        out.slice_mut(s![slices.logslope.clone()])
-            .assign(&self.h_gg.diag());
-        if let Some(range) = slices.score_warp.as_ref() {
-            out.slice_mut(s![range.clone()]).assign(&self.h_hh.diag());
-        }
-        if let Some(range) = slices.link_dev.as_ref() {
-            out.slice_mut(s![range.clone()]).assign(&self.h_ww.diag());
+        for block in HessBlock::ALL {
+            let Some(range) = slices.range_of(block) else {
+                continue;
+            };
+            out.slice_mut(s![range])
+                .assign(&self.block_view(block, block).diag());
         }
         out
     }
@@ -3004,144 +3068,51 @@ impl HyperOperator for BlockHessianOperator {
     }
 
     fn mul_vec_into(&self, v: ArrayView1<'_, f64>, mut out: ArrayViewMut1<'_, f64>) {
-        let v_t = v.slice(s![self.slices.time.clone()]);
-        let v_m = v.slice(s![self.slices.marginal.clone()]);
-        let v_g = v.slice(s![self.slices.logslope.clone()]);
-        let v_h = self
-            .slices
-            .score_warp
-            .as_ref()
-            .map(|range| v.slice(s![range.clone()]));
-        let v_w = self
-            .slices
-            .link_dev
-            .as_ref()
-            .map(|range| v.slice(s![range.clone()]));
         let b = &self.blocks;
+        let slices = &self.slices;
         out.fill(0.0);
-        {
-            let mut o_t = out.slice_mut(s![self.slices.time.clone()]);
-            o_t += &b.h_tt.dot(&v_t);
-            o_t += &b.h_tm.dot(&v_m);
-            o_t += &b.h_tg.dot(&v_g);
-            if let Some(v_h) = v_h.as_ref() {
-                o_t += &b.h_th.dot(v_h);
+        // Full symmetric block matvec, organised row-block by row-block. The
+        // block layout and transpose handling live entirely in `block_view`;
+        // the `HessBlock::ALL` order fixes the per-output accumulation order so
+        // the result is bit-identical to the previous hand-written scatter.
+        for row in HessBlock::ALL {
+            let Some(r_row) = slices.range_of(row) else {
+                continue;
+            };
+            let mut o_row = out.slice_mut(s![r_row]);
+            for col in HessBlock::ALL {
+                let Some(r_col) = slices.range_of(col) else {
+                    continue;
+                };
+                o_row += &b.block_view(row, col).dot(&v.slice(s![r_col]));
             }
-            if let Some(v_w) = v_w.as_ref() {
-                o_t += &b.h_tw.dot(v_w);
-            }
-        }
-        {
-            let mut o_m = out.slice_mut(s![self.slices.marginal.clone()]);
-            o_m += &b.h_tm.t().dot(&v_t);
-            o_m += &b.h_mm.dot(&v_m);
-            o_m += &b.h_mg.dot(&v_g);
-            if let Some(v_h) = v_h.as_ref() {
-                o_m += &b.h_mh.dot(v_h);
-            }
-            if let Some(v_w) = v_w.as_ref() {
-                o_m += &b.h_mw.dot(v_w);
-            }
-        }
-        {
-            let mut o_g = out.slice_mut(s![self.slices.logslope.clone()]);
-            o_g += &b.h_tg.t().dot(&v_t);
-            o_g += &b.h_mg.t().dot(&v_m);
-            o_g += &b.h_gg.dot(&v_g);
-            if let Some(v_h) = v_h.as_ref() {
-                o_g += &b.h_gh.dot(v_h);
-            }
-            if let Some(v_w) = v_w.as_ref() {
-                o_g += &b.h_gw.dot(v_w);
-            }
-        }
-        if let (Some(range), Some(v_h)) = (self.slices.score_warp.as_ref(), v_h.as_ref()) {
-            let mut o_h = out.slice_mut(s![range.clone()]);
-            o_h += &b.h_th.t().dot(&v_t);
-            o_h += &b.h_mh.t().dot(&v_m);
-            o_h += &b.h_gh.t().dot(&v_g);
-            o_h += &b.h_hh.dot(v_h);
-            if let Some(v_w) = v_w.as_ref() {
-                o_h += &b.h_hw.dot(v_w);
-            }
-        }
-        if let (Some(range), Some(v_w)) = (self.slices.link_dev.as_ref(), v_w.as_ref()) {
-            let mut o_w = out.slice_mut(s![range.clone()]);
-            o_w += &b.h_tw.t().dot(&v_t);
-            o_w += &b.h_mw.t().dot(&v_m);
-            o_w += &b.h_gw.t().dot(&v_g);
-            if let Some(v_h) = v_h.as_ref() {
-                o_w += &b.h_hw.t().dot(v_h);
-            }
-            o_w += &b.h_ww.dot(v_w);
         }
     }
 
     fn bilinear(&self, v: &Array1<f64>, u: &Array1<f64>) -> f64 {
-        let v_t = v.slice(s![self.slices.time.clone()]);
-        let v_m = v.slice(s![self.slices.marginal.clone()]);
-        let v_g = v.slice(s![self.slices.logslope.clone()]);
-        let v_h = self
-            .slices
-            .score_warp
-            .as_ref()
-            .map(|range| v.slice(s![range.clone()]));
-        let v_w = self
-            .slices
-            .link_dev
-            .as_ref()
-            .map(|range| v.slice(s![range.clone()]));
-        let u_t = u.slice(s![self.slices.time.clone()]);
-        let u_m = u.slice(s![self.slices.marginal.clone()]);
-        let u_g = u.slice(s![self.slices.logslope.clone()]);
-        let u_h = self
-            .slices
-            .score_warp
-            .as_ref()
-            .map(|range| u.slice(s![range.clone()]));
-        let u_w = self
-            .slices
-            .link_dev
-            .as_ref()
-            .map(|range| u.slice(s![range.clone()]));
         let b = &self.blocks;
-        let mut total = v_t.dot(&b.h_tt.dot(&u_t));
-        total += v_m.dot(&b.h_mm.dot(&u_m));
-        total += v_g.dot(&b.h_gg.dot(&u_g));
-        if let (Some(v_h), Some(u_h)) = (v_h.as_ref(), u_h.as_ref()) {
-            total += v_h.dot(&b.h_hh.dot(u_h));
+        let slices = &self.slices;
+        // vᵀ H u over the same single-source block layout as `mul_vec_into`.
+        // Diagonal blocks first, then each off-diagonal pair contributes both
+        // vₗₒ·Hₗₒ,ₕᵢ·uₕᵢ and vₕᵢ·Hₕᵢ,ₗₒ·uₗₒ — preserving the previous summation
+        // order so the scalar is bit-identical.
+        let mut total = 0.0;
+        for block in HessBlock::ALL {
+            let Some(range) = slices.range_of(block) else {
+                continue;
+            };
+            let v_i = v.slice(s![range.clone()]);
+            let u_i = u.slice(s![range]);
+            total += v_i.dot(&b.block_view(block, block).dot(&u_i));
         }
-        if let (Some(v_w), Some(u_w)) = (v_w.as_ref(), u_w.as_ref()) {
-            total += v_w.dot(&b.h_ww.dot(u_w));
-        }
-        total += v_t.dot(&b.h_tm.dot(&u_m));
-        total += v_m.dot(&b.h_tm.t().dot(&u_t));
-        total += v_t.dot(&b.h_tg.dot(&u_g));
-        total += v_g.dot(&b.h_tg.t().dot(&u_t));
-        total += v_m.dot(&b.h_mg.dot(&u_g));
-        total += v_g.dot(&b.h_mg.t().dot(&u_m));
-        if let (Some(v_h), Some(u_h)) = (v_h.as_ref(), u_h.as_ref()) {
-            total += v_t.dot(&b.h_th.dot(u_h));
-            total += v_h.dot(&b.h_th.t().dot(&u_t));
-            total += v_m.dot(&b.h_mh.dot(u_h));
-            total += v_h.dot(&b.h_mh.t().dot(&u_m));
-            total += v_g.dot(&b.h_gh.dot(u_h));
-            total += v_h.dot(&b.h_gh.t().dot(&u_g));
-        }
-        if let (Some(v_w), Some(u_w)) = (v_w.as_ref(), u_w.as_ref()) {
-            total += v_t.dot(&b.h_tw.dot(u_w));
-            total += v_w.dot(&b.h_tw.t().dot(&u_t));
-            total += v_m.dot(&b.h_mw.dot(u_w));
-            total += v_w.dot(&b.h_mw.t().dot(&u_m));
-            total += v_g.dot(&b.h_gw.dot(u_w));
-            total += v_w.dot(&b.h_gw.t().dot(&u_g));
-        }
-        if let ((Some(v_h), Some(u_w)), (Some(v_w), Some(u_h))) =
-            ((v_h.as_ref(), u_w.as_ref()), (v_w.as_ref(), u_h.as_ref()))
-        {
-            total += v_h.dot(&b.h_hw.dot(u_w));
-            total += v_w.dot(&b.h_hw.t().dot(u_h));
-        }
+        BlockHessianAccumulator::for_each_offdiagonal_pair(slices, |lo, r_lo, hi, r_hi| {
+            let v_lo = v.slice(s![r_lo.clone()]);
+            let u_lo = u.slice(s![r_lo]);
+            let v_hi = v.slice(s![r_hi.clone()]);
+            let u_hi = u.slice(s![r_hi]);
+            total += v_lo.dot(&b.block_view(lo, hi).dot(&u_hi));
+            total += v_hi.dot(&b.block_view(hi, lo).dot(&u_lo));
+        });
         total
     }
 
