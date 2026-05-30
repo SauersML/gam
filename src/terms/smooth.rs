@@ -1503,6 +1503,9 @@ pub enum CoefficientGroupPrior {
     Flat,
     NormalLogPrecision { mean: f64, sd: f64 },
     GammaPrecision { shape: f64, rate: f64 },
+    /// Penalized-complexity prior calibrated by `P(exp(-ρ/2) > upper) =
+    /// tail_prob`; see [`crate::types::RhoPrior::PenalizedComplexity`].
+    PenalizedComplexity { upper: f64, tail_prob: f64 },
 }
 
 impl CoefficientGroupPrior {
@@ -1512,6 +1515,9 @@ impl CoefficientGroupPrior {
             Self::NormalLogPrecision { mean, sd } => crate::types::RhoPrior::Normal { mean, sd },
             Self::GammaPrecision { shape, rate } => {
                 crate::types::RhoPrior::GammaPrecision { shape, rate }
+            }
+            Self::PenalizedComplexity { upper, tail_prob } => {
+                crate::types::RhoPrior::PenalizedComplexity { upper, tail_prob }
             }
         }
     }
@@ -1534,6 +1540,9 @@ impl CoefficientGroupPrior {
             }
             Self::GammaPrecision { shape, rate } => {
                 validate_gamma_precision_prior(context, shape, rate)
+            }
+            Self::PenalizedComplexity { upper, tail_prob } => {
+                validate_penalized_complexity_prior(context, upper, tail_prob)
             }
         }
     }
@@ -1607,6 +1616,24 @@ fn validate_gamma_precision_prior(label: &str, shape: f64, rate: f64) -> Result<
     if !rate.is_finite() || rate < 0.0 {
         crate::bail_invalid_basis!(
             "Gamma precision hyperprior for penalty block '{label}' requires rate >= 0, got {rate}"
+        );
+    }
+    Ok::<(), _>(())
+}
+
+fn validate_penalized_complexity_prior(
+    label: &str,
+    upper: f64,
+    tail_prob: f64,
+) -> Result<(), BasisError> {
+    if !upper.is_finite() || upper <= 0.0 {
+        crate::bail_invalid_basis!(
+            "Penalized-complexity hyperprior for '{label}' requires upper > 0, got {upper}"
+        );
+    }
+    if !tail_prob.is_finite() || tail_prob <= 0.0 || tail_prob >= 1.0 {
+        crate::bail_invalid_basis!(
+            "Penalized-complexity hyperprior for '{label}' requires tail probability in (0, 1), got {tail_prob}"
         );
     }
     Ok::<(), _>(())
@@ -1702,6 +1729,9 @@ fn validate_rho_prior_coordinate(
         }
         crate::types::RhoPrior::GammaPrecision { shape, rate } => {
             validate_gamma_precision_prior(context, *shape, *rate)
+        }
+        crate::types::RhoPrior::PenalizedComplexity { upper, tail_prob } => {
+            validate_penalized_complexity_prior(context, *upper, *tail_prob)
         }
         crate::types::RhoPrior::Independent(_) => Err(BasisError::InvalidInput(format!(
             "{context} must be a scalar rho prior, not a nested Independent prior"

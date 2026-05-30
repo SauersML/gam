@@ -830,6 +830,9 @@ pub enum CoefficientGroupPrior {
     Flat,
     NormalLogPrecision { mean: f64, sd: f64 },
     GammaPrecision { shape: f64, rate: f64 },
+    /// Penalized-complexity prior calibrated by `P(exp(-ρ/2) > upper) =
+    /// tail_prob`; see [`crate::types::RhoPrior::PenalizedComplexity`].
+    PenalizedComplexity { upper: f64, tail_prob: f64 },
 }
 
 impl CoefficientGroupPrior {
@@ -839,6 +842,9 @@ impl CoefficientGroupPrior {
             Self::NormalLogPrecision { mean, sd } => crate::types::RhoPrior::Normal { mean, sd },
             Self::GammaPrecision { shape, rate } => {
                 crate::types::RhoPrior::GammaPrecision { shape, rate }
+            }
+            Self::PenalizedComplexity { upper, tail_prob } => {
+                crate::types::RhoPrior::PenalizedComplexity { upper, tail_prob }
             }
         }
     }
@@ -858,6 +864,9 @@ impl CoefficientGroupPrior {
                     ));
                 }
                 Ok(())
+            }
+            Self::PenalizedComplexity { upper, tail_prob } => {
+                validate_penalized_complexity_prior(context, upper, tail_prob)
             }
             Self::GammaPrecision { shape, rate } => {
                 if !shape.is_finite() || shape <= 0.0 {
@@ -990,11 +999,34 @@ fn validate_group_rho_prior_coordinate(
             }
             Ok(())
         }
+        crate::types::RhoPrior::PenalizedComplexity { upper, tail_prob } => {
+            validate_penalized_complexity_prior(context, *upper, *tail_prob)
+        }
         crate::types::RhoPrior::Independent(_) => Err(CustomFamilyError::ConstraintViolation {
             reason: format!("{context} must be a scalar rho prior, not a nested Independent prior"),
         }
         .into()),
     }
+}
+
+/// Shared validation of penalized-complexity hyperparameters: `upper` finite and
+/// strictly positive, `tail_prob` a probability in the open interval `(0, 1)`.
+fn validate_penalized_complexity_prior(
+    context: &str,
+    upper: f64,
+    tail_prob: f64,
+) -> Result<(), String> {
+    if !upper.is_finite() || upper <= 0.0 {
+        return Err(format!(
+            "{context} penalized-complexity prior requires upper > 0, got {upper}"
+        ));
+    }
+    if !tail_prob.is_finite() || tail_prob <= 0.0 || tail_prob >= 1.0 {
+        return Err(format!(
+            "{context} penalized-complexity prior requires tail probability in (0, 1), got {tail_prob}"
+        ));
+    }
+    Ok(())
 }
 
 fn expand_custom_group_base_prior(

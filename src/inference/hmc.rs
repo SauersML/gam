@@ -5858,6 +5858,19 @@ impl JointBetaRhoPosterior {
                     grad_rho[k] += (*shape - 1.0) - *rate * lambda;
                 }
             }
+            RhoPrior::PenalizedComplexity { upper, tail_prob } => {
+                if !pc_prior_params_valid(*upper, *tail_prob) {
+                    out_grad.fill(0.0);
+                    return f64::NEG_INFINITY;
+                }
+                let theta = -tail_prob.ln() / *upper;
+                for k in 0..n_rho {
+                    // log p(ρ) = const − ρ/2 − θ exp(−ρ/2).
+                    let e = (-0.5 * rho[k]).exp();
+                    rho_prior += -0.5 * rho[k] - theta * e;
+                    grad_rho[k] += -0.5 + 0.5 * theta * e;
+                }
+            }
             RhoPrior::Independent(priors) => {
                 if priors.len() != n_rho {
                     out_grad.fill(0.0);
@@ -5876,6 +5889,16 @@ impl JointBetaRhoPosterior {
                             let lambda = rho[k].exp();
                             rho_prior += (*shape - 1.0) * rho[k] - *rate * lambda;
                             grad_rho[k] += (*shape - 1.0) - *rate * lambda;
+                        }
+                        RhoPrior::PenalizedComplexity { upper, tail_prob } => {
+                            if !pc_prior_params_valid(*upper, *tail_prob) {
+                                out_grad.fill(0.0);
+                                return f64::NEG_INFINITY;
+                            }
+                            let theta = -tail_prob.ln() / *upper;
+                            let e = (-0.5 * rho[k]).exp();
+                            rho_prior += -0.5 * rho[k] - theta * e;
+                            grad_rho[k] += -0.5 + 0.5 * theta * e;
                         }
                         RhoPrior::Independent(_) => {
                             out_grad.fill(0.0);
@@ -5907,6 +5930,15 @@ impl JointBetaRhoPosterior {
 
         logp
     }
+}
+
+/// Penalized-complexity hyperparameters are usable iff `upper` is finite and
+/// strictly positive and `tail_prob` is a probability in the open `(0, 1)`.
+/// Mirrors the validation in the shared `rho_prior_eval` engine; an invalid
+/// configuration repels the sampler (`-∞` potential) rather than producing a
+/// non-finite gradient.
+fn pc_prior_params_valid(upper: f64, tail_prob: f64) -> bool {
+    upper.is_finite() && upper > 0.0 && tail_prob.is_finite() && tail_prob > 0.0 && tail_prob < 1.0
 }
 
 impl HamiltonianTarget<Array1<f64>> for JointBetaRhoPosterior {

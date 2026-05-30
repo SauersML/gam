@@ -289,6 +289,37 @@ pub enum RhoPrior {
         shape: f64,
         rate: f64,
     },
+    /// Penalized-complexity (PC) prior on the smoothing parameter
+    /// (Simpson, Rue, Riebler, Martins, Sørbye, *Statistical Science* 2017).
+    ///
+    /// A PC prior fixes a *base* model (here the infinitely-smooth limit, where
+    /// the penalized component collapses to its null space) and puts an
+    /// exponential prior on the distance away from it. For a Gaussian smooth
+    /// with precision `λ = exp(ρ)` the relevant distance is the marginal
+    /// standard-deviation scale `d = λ^{-1/2} = exp(-ρ/2)`, and a constant-rate
+    /// penalization `p(d) = θ exp(-θ d)` induces the closed-form log-prior
+    ///
+    /// ```text
+    /// log p(ρ) = ln(θ/2) − ρ/2 − θ exp(−ρ/2).
+    /// ```
+    ///
+    /// The rate `θ` is calibrated by the single interpretable tail statement
+    /// `P(d > upper) = tail_prob`, i.e. `θ = −ln(tail_prob) / upper`. The prior
+    /// is reparameterization-invariant and shrinks toward the simpler model
+    /// (an exponential wall against under-smoothing, only a gentle linear pull
+    /// toward over-smoothing), which is exactly the Occam behaviour wanted for
+    /// high-variance flexible components. The REML/LAML objective is minimized,
+    /// so this contributes `ρ/2 + θ exp(−ρ/2)` (up to an additive constant) to
+    /// the cost, with gradient `1/2 − (θ/2) exp(−ρ/2)` and (always positive)
+    /// curvature `(θ/4) exp(−ρ/2)`.
+    PenalizedComplexity {
+        /// Upper bound `U` on the distance scale `d = exp(-ρ/2)` (the marginal
+        /// SD scale of the penalized component) in the tail statement
+        /// `P(d > U) = tail_prob`. Must be finite and strictly positive.
+        upper: f64,
+        /// Tail probability `α` in `P(d > U) = α`. Must satisfy `0 < α < 1`.
+        tail_prob: f64,
+    },
     /// Coordinate-specific priors for models whose smoothing parameters do
     /// not share one prior family, such as nested coefficient groups.
     Independent(Vec<RhoPrior>),
