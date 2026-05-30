@@ -4370,7 +4370,15 @@ fn build_periodic_fourier_margin(
     if has_nyquist_cos && q > 1 {
         penalty[[q - 1, q - 1]] = (harmonics as f64).powi(2 * order);
     }
-    let knots = Array1::linspace(0.0, period, q + 1);
+    // The Fourier margin has no B-spline knots; this vector is a placeholder
+    // that downstream code (the tensor freeze) treats as carrying the periodic
+    // control-site count in its *length* and the domain start in `[0]`. Its
+    // length MUST equal the basis column count `q` (= `basis.ncols()`): the
+    // freeze records `num_basis = knots.len()` and the predict-time rebuild
+    // re-derives `q` columns from it, so a `q + 1`-length vector reconstructs
+    // one extra column per periodic axis and breaks the frozen identifiability
+    // transform (issue #498).
+    let knots = Array1::linspace(0.0, period, q);
     Ok((basis, penalty, knots))
 }
 
