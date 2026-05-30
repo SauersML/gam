@@ -92,6 +92,7 @@ pub fn rho_marginalized_variances(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ndarray::Array2;
 
     // Diagonal H_ββ = diag(1 + λ s_i) (orthonormal design, XᵀWX = I; diagonal
     // penalty S = diag(s)). Then H⁻¹ and β are closed-form, so we can check the
