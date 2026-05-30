@@ -1,4 +1,4 @@
-# Scaling `gamfit.torch.fit` — joint vs independent additive REML
+# Scaling `gamfit.torch.fit` — joint vs shared-scale block REML
 
 This page documents the `mode` argument to `gamfit.torch.fit()` and
 when to use which.
@@ -28,21 +28,30 @@ Cost: `O((Σ_k M_k)³)` per inner Cholesky, `O(F³)` per outer Newton step.
 Feasible for `F ≲ 64`. Infeasible past `F ≳ 1000` — the inner Hessian
 becomes a `(Σ_k M_k)²` dense matrix.
 
-### Per-atom independent REML
-For each smooth k, run a separate single-smooth REML fit. Each atom gets
-its own `λ_k` chosen independently of the others. Per-atom fitted
-contributions are summed.
+### Shared-scale block-orthogonal REML
+For each smooth k, build the by-modulated block and solve its coefficient
+problem locally, but select the `λ_k` values against one additive residual
+quadratic shared across all blocks:
+
+```text
+q_d = y_d' W y_d - sum_k b_{kd}' K_k^{-1} b_{kd}
+```
+
+This is the exact additive REML objective when the modulated block designs
+are W-orthogonal. It fixes the old private-scale independent loop, where
+each atom fit the full response with its own residual quadratic and the
+scores were summed.
 
 Cost: `O(Σ_k M_k³)` — linear in F for fixed per-smooth width. Multi-output
-`D > 1` supported natively because the underlying single-smooth REML
-primitive supports it.
+`D > 1` is supported with one λ per smooth and one profiled residual scale
+per output column.
 
-Mathematical caveat: per-atom λ_k are treated as independent. Under
-**TopK sparse gating in an SAE** — where most atoms are zero per row, so
-per-atom designs are effectively orthogonal in expectation — this is the
-*correct* algorithm. For genuinely overlapping smooths over the same
-predictor space (e.g. a multi-term GAM on the same covariate), the joint
-fit is statistically more efficient, but only computable at moderate F.
+Mathematical caveat: this path assumes the realized by-modulated block
+cross-Grams are negligible. Under **TopK sparse gating in an SAE** this is
+often a good approximation, and when supports are disjoint it is exact. For
+genuinely overlapping smooths over the same predictor space (e.g. a
+multi-term GAM on the same covariate), the joint fit is statistically more
+efficient, but only computable at moderate F.
 
 ### Auto threshold
 
@@ -51,16 +60,17 @@ fit is statistically more efficient, but only computable at moderate F.
 - `F ≤ 64` (the `_AUTO_MODE_F_THRESHOLD` constant), and
 - `D == 1` (the multi-block backward currently rejects D > 1).
 
-Otherwise routes to `"independent"`. The threshold is conservative —
-joint is feasible up to ~F=256 in many setups, but the user benefits
-more from independence (and from multi-output support) past F=64.
+Otherwise routes to `"independent"`, whose implementation is the
+shared-scale block-orthogonal estimator. The threshold is conservative:
+joint is feasible up to ~F=256 in many setups, but the user benefits more
+from linear block scaling and multi-output support past F=64.
 
 ## Large-F use: sparse-atom training at F=100K
 
 At very large F with TopK-gated per-atom designs, `mode="independent"`
-is the appropriate choice unconditionally: the per-atom REML problems
-decouple, autograd flows through each analytic VJP independently, and
-memory stays linear in F. A representative architecture is:
+uses the shared-scale block estimator: the coefficient problems decouple,
+the residual scale remains global, autograd flows through the differentiable
+block solves, and memory stays linear in F. A representative architecture is:
 
 ```python
 codes = encoder(x)               # (B, F)
@@ -80,25 +90,24 @@ loss = ((recon - x) ** 2).mean()
 loss.backward()                  # gradient flows through TopK amplitudes
 ```
 
-Autograd is preserved through every per-atom REML's analytic VJP to the
-modulated designs and differentiable inputs. With the current Duchon torch
-basis, `points` are structural (the basis is forward-only with respect to
-positions), so encoder gradients in the example above flow through the
-TopK `by` amplitudes; use a differentiable basis path if you need coordinate
+Autograd is preserved through the shared-scale block solves to the modulated
+designs and differentiable inputs. With the current Duchon torch basis,
+`points` are structural (the basis is forward-only with respect to
+positions), so encoder gradients in the example above flow through the TopK
+`by` amplitudes; use a differentiable basis path if you need coordinate
 gradients.
 
 ## Future work: sparse joint REML
 
-The truly right algorithm at F=100K with TopK gating is **sparse joint
-REML** — under K=8 active per token with F=100K, the joint inner Hessian
-is 99.99% block-diagonal in expectation. A sparse Cholesky on this
-structure would give back the per-smooth-λ joint statistics (improving
-over independent's per-atom independence assumption) while remaining
-linear in F.
+The next algorithmic step at F=100K with real coactivation overlap is
+**coactivation-graph joint REML**. Under K=8 active per token with F=100K,
+the joint inner Hessian is sparse in the active-pair graph. Sparse/block
+Cholesky on that structure would recover joint competition inside
+coactivation components while keeping the profiled residual scale global.
 
-gamfit's REML driver currently uses a dense Cholesky and doesn't exploit
-the sparsity. Adding sparse-aware joint REML is a future workstream;
-until then, `mode="independent"` is the right answer at SAE scale.
+gamfit's exact joint Torch REML driver currently uses a dense Cholesky and
+doesn't exploit this sparsity. Until sparse-aware joint REML lands,
+`mode="independent"` is the scalable shared-scale orthogonal approximation.
 
 ## Non-Gaussian LAML
 

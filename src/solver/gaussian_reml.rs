@@ -222,6 +222,16 @@ pub struct GaussianRemlMultiBatchProblem<'a> {
     pub init_rho: Option<f64>,
 }
 
+#[derive(Clone, Debug)]
+pub struct GaussianRemlBlockOrthogonalResult {
+    pub coefficients: Vec<Array2<f64>>,
+    pub fitted: Array2<f64>,
+    pub lambdas: Array1<f64>,
+    pub log_lambdas: Array1<f64>,
+    pub reml_score: f64,
+    pub edf: Array1<f64>,
+}
+
 #[derive(Clone)]
 struct GaussianRemlPrepared {
     cache: GaussianRemlEigenCache,
@@ -536,6 +546,347 @@ pub fn gaussian_reml_multi_closed_form_batch<'a>(
         })
         .collect();
     fits.into_iter().collect()
+}
+
+struct BlockOrthogonalEval {
+    beta: Array2<f64>,
+    logdet: f64,
+    trace: f64,
+    trace_pair: f64,
+    fitted_energy: Array1<f64>,
+    penalty_energy: Array1<f64>,
+    curvature_energy: Array1<f64>,
+    edf: f64,
+}
+
+fn trace_product_dense(left: ArrayView2<'_, f64>, right: ArrayView2<'_, f64>) -> f64 {
+    let mut value = 0.0;
+    for i in 0..left.nrows() {
+        for j in 0..left.ncols() {
+            value += left[[i, j]] * right[[j, i]];
+        }
+    }
+    value
+}
+
+fn block_penalty_rank_logdet(penalty: ArrayView2<'_, f64>) -> Result<(usize, f64), EstimationError> {
+    let eigs = penalty
+        .to_owned()
+        .eigh(Side::Lower)
+        .map_err(|_| EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        })?
+        .0;
+    let max_abs = eigs.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
+    let tol = (EIGEN_REL_TOL * max_abs).max(1.0e-14);
+    let mut rank = 0_usize;
+    let mut logdet = 0.0;
+    for eig in eigs.iter().copied() {
+        if eig > tol {
+            rank += 1;
+            logdet += eig.ln();
+        }
+    }
+    Ok((rank, logdet))
+}
+
+fn block_orthogonal_eval(
+    gram: &Array2<f64>,
+    rhs: &Array2<f64>,
+    penalty: &Array2<f64>,
+    rho: f64,
+) -> Result<BlockOrthogonalEval, EstimationError> {
+    let lambda = rho.exp();
+    validate_initial_lambda(lambda)?;
+    let scaled_penalty = penalty * lambda;
+    let hessian = canonicalize_penalty((gram + &scaled_penalty).view());
+    let chol = gaussian_reml_cholesky_lower(hessian)?;
+    let beta = chol.solve_mat(rhs);
+    let solved_penalty = chol.solve_mat(&scaled_penalty);
+    let logdet = 2.0 * chol.diag().iter().map(|value| value.ln()).sum::<f64>();
+    let trace = (0..solved_penalty.nrows())
+        .map(|i| solved_penalty[[i, i]])
+        .sum::<f64>();
+    let trace_pair = trace_product_dense(solved_penalty.view(), solved_penalty.view());
+    let fitted_energy = (rhs * &beta).sum_axis(Axis(0));
+    let p_beta = scaled_penalty.dot(&beta);
+    let penalty_energy = (&beta * &p_beta).sum_axis(Axis(0));
+    let solved_p_beta = chol.solve_mat(&p_beta);
+    let curvature_energy = (&p_beta * &solved_p_beta).sum_axis(Axis(0));
+    Ok(BlockOrthogonalEval {
+        beta,
+        logdet,
+        trace,
+        trace_pair,
+        fitted_energy,
+        penalty_energy,
+        curvature_energy,
+        edf: penalty.nrows() as f64 - trace,
+    })
+}
+
+fn block_orthogonal_scale_objective(
+    eval: &BlockOrthogonalEval,
+    rho: f64,
+    scale_precision: ArrayView1<'_, f64>,
+    rank: usize,
+) -> f64 {
+    let d = scale_precision.len() as f64;
+    let fit_term = scale_precision
+        .iter()
+        .zip(eval.fitted_energy.iter())
+        .map(|(scale, energy)| scale * energy)
+        .sum::<f64>();
+    0.5 * d * eval.logdet - 0.5 * fit_term - 0.5 * d * (rank as f64) * rho
+}
+
+fn solve_block_orthogonal_rho(
+    gram: &Array2<f64>,
+    rhs: &Array2<f64>,
+    penalty: &Array2<f64>,
+    rho0: f64,
+    scale_precision: ArrayView1<'_, f64>,
+    rank: usize,
+    max_iter: usize,
+) -> Result<(f64, BlockOrthogonalEval), EstimationError> {
+    let mut rho = rho0;
+    let d = rhs.ncols() as f64;
+    let mut current = block_orthogonal_eval(gram, rhs, penalty, rho)?;
+    for _ in 0..max_iter {
+        let grad = 0.5 * d * (current.trace - rank as f64)
+            + 0.5
+                * scale_precision
+                    .iter()
+                    .zip(current.penalty_energy.iter())
+                    .map(|(scale, energy)| scale * energy)
+                    .sum::<f64>();
+        let hess = 0.5 * d * (current.trace - current.trace_pair)
+            + 0.5
+                * scale_precision
+                    .iter()
+                    .zip(current.penalty_energy.iter().zip(current.curvature_energy.iter()))
+                    .map(|(scale, (energy, curvature))| scale * (energy - 2.0 * curvature))
+                    .sum::<f64>();
+        if !(grad.is_finite() && hess.is_finite()) {
+            return Err(EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            });
+        }
+        let hess_safe = if hess.abs() > 1.0e-10 {
+            hess
+        } else if hess >= 0.0 {
+            1.0e-10
+        } else {
+            -1.0e-10
+        };
+        let step = (grad / hess_safe).clamp(-2.0, 2.0);
+        let mut best_rho = rho;
+        let mut best_eval = current;
+        let mut best_phi =
+            block_orthogonal_scale_objective(&best_eval, best_rho, scale_precision, rank);
+        let descent = grad.signum();
+        for candidate_rho in [
+            rho - step,
+            rho - 0.5 * step,
+            rho - 0.25 * step,
+            rho - descent,
+            rho - 0.25 * descent,
+        ] {
+            let candidate_eval = block_orthogonal_eval(gram, rhs, penalty, candidate_rho)?;
+            let candidate_phi = block_orthogonal_scale_objective(
+                &candidate_eval,
+                candidate_rho,
+                scale_precision,
+                rank,
+            );
+            if candidate_phi < best_phi {
+                best_rho = candidate_rho;
+                best_eval = candidate_eval;
+                best_phi = candidate_phi;
+            }
+        }
+        let delta = (best_rho - rho).abs();
+        rho = best_rho;
+        current = best_eval;
+        if delta < 1.0e-12 || step.abs() < 1.0e-7 {
+            break;
+        }
+    }
+    Ok((rho, current))
+}
+
+pub fn gaussian_reml_blocks_orthogonal_shared_scale(
+    designs: &[Array2<f64>],
+    penalties: &[Array2<f64>],
+    y: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    init_rhos: Option<&[f64]>,
+) -> Result<GaussianRemlBlockOrthogonalResult, EstimationError> {
+    if designs.is_empty() {
+        crate::bail_invalid_estim!("block-orthogonal Gaussian REML requires at least one block");
+    }
+    if designs.len() != penalties.len() {
+        crate::bail_invalid_estim!(
+            "block-orthogonal Gaussian REML block mismatch: {} designs, {} penalties",
+            designs.len(),
+            penalties.len()
+        );
+    }
+    let n = y.nrows();
+    let d = y.ncols();
+    if d == 0 {
+        crate::bail_invalid_estim!("block-orthogonal Gaussian REML requires at least one output");
+    }
+    if y.iter().any(|value| !value.is_finite()) {
+        crate::bail_invalid_estim!("block-orthogonal Gaussian REML response must be finite");
+    }
+    let weight = gaussian_reml_weights(n, weights)?;
+    if let Some(rhos) = init_rhos {
+        if rhos.len() != designs.len() {
+            crate::bail_invalid_estim!(
+                "block-orthogonal Gaussian REML init_rhos length mismatch: expected {}, got {}",
+                designs.len(),
+                rhos.len()
+            );
+        }
+        if rhos.iter().any(|value| !value.is_finite()) {
+            crate::bail_invalid_estim!("block-orthogonal Gaussian REML init_rhos must be finite");
+        }
+    }
+
+    let mut ywy = Array1::<f64>::zeros(d);
+    for row in 0..n {
+        for output in 0..d {
+            ywy[output] += weight[row] * y[[row, output]] * y[[row, output]];
+        }
+    }
+    let mut grams = Vec::with_capacity(designs.len());
+    let mut rhs_blocks = Vec::with_capacity(designs.len());
+    let mut penalties_owned = Vec::with_capacity(penalties.len());
+    let mut ranks = Vec::with_capacity(penalties.len());
+    let mut penalty_logdets = Vec::with_capacity(penalties.len());
+    let mut nullity_total = 0_usize;
+    for (block, (design, penalty)) in designs.iter().zip(penalties.iter()).enumerate() {
+        let penalty_owned = canonicalize_penalty(penalty.view());
+        validate_gaussian_reml_design(design.view(), penalty_owned.view(), Some(weight.view()))?;
+        if design.nrows() != n {
+            crate::bail_invalid_estim!(
+                "block-orthogonal Gaussian REML designs[{block}] has {} rows, expected {n}",
+                design.nrows()
+            );
+        }
+        let gram = dense_xt_diag_x(design.view(), weight.view());
+        let rhs = dense_xt_diag_y(design.view(), weight.view(), y);
+        let (rank, logdet) = block_penalty_rank_logdet(penalty_owned.view())?;
+        nullity_total += penalty_owned.nrows().saturating_sub(rank);
+        grams.push(canonicalize_penalty(gram.view()));
+        rhs_blocks.push(rhs);
+        penalties_owned.push(penalty_owned);
+        ranks.push(rank);
+        penalty_logdets.push(logdet);
+    }
+    if n <= nullity_total {
+        crate::bail_invalid_estim!(
+            "block-orthogonal Gaussian REML requires n > total penalty nullity; got n={n}, nullity={nullity_total}"
+        );
+    }
+    let nu = (n - nullity_total) as f64;
+    let mut rhos = match init_rhos {
+        Some(values) => Array1::from_vec(values.to_vec()),
+        None => Array1::zeros(designs.len()),
+    };
+    let mut scale_precision = ywy.mapv(|value| nu / value.max(MIN_DEVIANCE));
+    let mut evals = Vec::new();
+    for _ in 0..40 {
+        evals.clear();
+        for block in 0..designs.len() {
+            let (rho, eval) = solve_block_orthogonal_rho(
+                &grams[block],
+                &rhs_blocks[block],
+                &penalties_owned[block],
+                rhos[block],
+                scale_precision.view(),
+                ranks[block],
+                32,
+            )?;
+            rhos[block] = rho;
+            evals.push(eval);
+        }
+        let mut explained = Array1::<f64>::zeros(d);
+        for eval in evals.iter() {
+            explained += &eval.fitted_energy;
+        }
+        let q = &ywy - &explained;
+        if q.iter().any(|value| !value.is_finite() || *value <= 0.0) {
+            return Err(EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            });
+        }
+        let next_scale = q.mapv(|value| nu / value);
+        let scale_step = next_scale
+            .iter()
+            .zip(scale_precision.iter())
+            .map(|(next, old)| (next.ln() - old.ln()).abs())
+            .fold(0.0_f64, f64::max);
+        scale_precision = next_scale;
+        if scale_step < 1.0e-7 {
+            break;
+        }
+    }
+    evals.clear();
+    for block in 0..designs.len() {
+        let (rho, eval) = solve_block_orthogonal_rho(
+            &grams[block],
+            &rhs_blocks[block],
+            &penalties_owned[block],
+            rhos[block],
+            scale_precision.view(),
+            ranks[block],
+            16,
+        )?;
+        rhos[block] = rho;
+        evals.push(eval);
+    }
+
+    let coefficients = evals
+        .iter()
+        .map(|eval| eval.beta.clone())
+        .collect::<Vec<_>>();
+    let mut fitted = Array2::<f64>::zeros((n, d));
+    for (design, coef) in designs.iter().zip(coefficients.iter()) {
+        fitted += &fast_ab(design.view(), coef.view());
+    }
+    let mut explained = Array1::<f64>::zeros(d);
+    for eval in evals.iter() {
+        explained += &eval.fitted_energy;
+    }
+    let q = &ywy - &explained;
+    if q.iter().any(|value| !value.is_finite() || *value <= 0.0) {
+        return Err(EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        });
+    }
+    let lambdas = rhos.mapv(f64::exp);
+    let edf = Array1::from_iter(evals.iter().map(|eval| eval.edf));
+    let logdet_term = evals
+        .iter()
+        .enumerate()
+        .map(|(block, eval)| {
+            eval.logdet - penalty_logdets[block] - (ranks[block] as f64) * rhos[block]
+        })
+        .sum::<f64>();
+    let scale_term = q
+        .iter()
+        .map(|value| nu * (1.0 + (2.0 * std::f64::consts::PI * value / nu).ln()))
+        .sum::<f64>();
+    Ok(GaussianRemlBlockOrthogonalResult {
+        coefficients,
+        fitted,
+        lambdas,
+        log_lambdas: rhos,
+        reml_score: 0.5 * (d as f64) * logdet_term + 0.5 * scale_term,
+        edf,
+    })
 }
 
 fn gaussian_reml_multi_closed_form_from_parts(

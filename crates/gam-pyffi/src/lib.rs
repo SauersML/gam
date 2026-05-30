@@ -25,8 +25,8 @@ use gam::families::survival_predict::{
 use gam::gamlss::{BinomialLocationScaleFitResult, GaussianLocationScaleFitResult};
 use gam::gaussian_reml::{
     GaussianRemlMultiBackwardProblem, build_gaussian_reml_eigen_cache_batched,
-    gaussian_reml_free_b_score, gaussian_reml_multi_closed_form_backward,
-    gaussian_reml_multi_closed_form_backward_batch,
+    gaussian_reml_blocks_orthogonal_shared_scale, gaussian_reml_free_b_score,
+    gaussian_reml_multi_closed_form_backward, gaussian_reml_multi_closed_form_backward_batch,
     gaussian_reml_multi_closed_form_backward_from_fit, gaussian_reml_multi_closed_form_with_cache,
 };
 use gam::geometry::manifold::GeometryError as EngineGeometryError;
@@ -5752,6 +5752,49 @@ fn trace_product(left: ArrayView2<'_, f64>, right: ArrayView2<'_, f64>) -> f64 {
         }
     }
     value
+}
+
+#[pyfunction(signature = (designs, penalties, y, weights = None, init_rhos = None))]
+fn gaussian_reml_fit_blocks_orthogonal_forward<'py>(
+    py: Python<'py>,
+    designs: Vec<PyReadonlyArray2<'py, f64>>,
+    penalties: Vec<PyReadonlyArray2<'py, f64>>,
+    y: PyReadonlyArray2<'py, f64>,
+    weights: Option<PyReadonlyArray1<'py, f64>>,
+    init_rhos: Option<PyReadonlyArray1<'py, f64>>,
+) -> PyResult<Py<PyDict>> {
+    let designs_owned = designs
+        .iter()
+        .map(|design| design.as_array().to_owned())
+        .collect::<Vec<_>>();
+    let penalties_owned = penalties
+        .iter()
+        .map(|penalty| penalty.as_array().to_owned())
+        .collect::<Vec<_>>();
+    let y_owned = y.as_array().to_owned();
+    let weights_owned = weights.as_ref().map(|weights| weights.as_array().to_owned());
+    let init_owned = init_rhos.as_ref().map(|rhos| rhos.as_array().to_vec());
+    let fit = detach_estimation_result(py, "gaussian_reml_fit_blocks_orthogonal_forward", move || {
+        gaussian_reml_blocks_orthogonal_shared_scale(
+            &designs_owned,
+            &penalties_owned,
+            y_owned.view(),
+            weights_owned.as_ref().map(|weights| weights.view()),
+            init_owned.as_deref(),
+        )
+    })?;
+    let out = PyDict::new(py);
+    let coef_list = PyList::empty(py);
+    for coef in fit.coefficients {
+        coef_list.append(coef.into_pyarray(py))?;
+    }
+    out.set_item("coefficients", coef_list)?;
+    out.set_item("fitted", fit.fitted.into_pyarray(py))?;
+    out.set_item("lambdas", fit.lambdas.into_pyarray(py))?;
+    out.set_item("log_lambdas", fit.log_lambdas.into_pyarray(py))?;
+    out.set_item("reml_score", fit.reml_score)?;
+    out.set_item("edf", fit.edf.into_pyarray(py))?;
+    Ok(out.unbind())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -22610,6 +22653,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_backward, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_formula_table, module)?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_blocks_forward, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        gaussian_reml_fit_blocks_orthogonal_forward,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_blocks_backward, module)?)?;
     module.add_function(wrap_pyfunction!(
         gaussian_reml_fit_with_constraints_forward,

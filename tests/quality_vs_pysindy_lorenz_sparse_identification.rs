@@ -310,9 +310,11 @@ emit("nonzero", (xi != 0.0).reshape(-1, order="F").astype(float))
         "gam and pysindy STLSQ must agree on the sparse support element-wise"
     );
 
-    // (3) Coefficient agreement: two correct STLSQ solves of the same ridge
-    //     normal equations on identical data differ only by linear-algebra
-    //     rounding. 1e-6 is tight enough to catch a real coefficient bug while
+    // (3) Coefficient agreement: at λ=0 both engines solve the same OLS normal
+    //     equations on the same recovered support, so they differ only by
+    //     linear-algebra rounding (~1e-12 in practice). 1e-6 is tight enough to
+    //     catch a real coefficient bug — e.g. the O(1e-3) drift a stray ridge
+    //     term or a transposed/mis-scaled solve would introduce — while
     //     tolerating Cholesky-vs-pysindy-solver floating-point differences.
     assert!(
         coef_max_abs < 1.0e-6,

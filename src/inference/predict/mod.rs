@@ -5473,10 +5473,9 @@ where
     };
 
     let spec = &likelihood;
-    if let Some((lo, hi)) = spec.response.mean_clamp_bounds() {
-        mean_lower.mapv_inplace(|v| v.clamp(lo, hi));
-        mean_upper.mapv_inplace(|v| v.clamp(lo, hi));
-    }
+    let response_bounds = ResponseBounds::for_family(&spec.response);
+    response_bounds.clamp_in_place(&mut mean_lower);
+    response_bounds.clamp_in_place(&mut mean_upper);
 
     let (observation_lower, observation_upper) = if options.includeobservation_interval {
         let response_observation_bounds = |response_var: Array1<f64>| {

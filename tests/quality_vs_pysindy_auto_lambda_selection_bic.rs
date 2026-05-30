@@ -111,16 +111,24 @@ fn gam_sindy_auto_lambda_matches_pysindy_bic() {
     // Flatten Θ (row-major, n×P) and Ẋ (n×D) into wire columns; Python rebuilds
     // both matrices and runs pysindy.STLSQ at each grid point, scoring with the
     // same Gaussian profile-likelihood BIC gam uses.
-    let theta_flat: Vec<f64> = theta.iter().copied().collect();
-    let dz_flat: Vec<f64> = dz.iter().copied().collect();
+    let theta_flat_raw: Vec<f64> = theta.iter().copied().collect();
+    let dz_flat_raw: Vec<f64> = dz.iter().copied().collect();
     let shape: Vec<f64> = vec![n as f64, P as f64, D as f64, TOL, MAX_ROUNDS as f64];
+
+    // The CSV bridge demands every wire column share one row count. The three
+    // payloads have different natural lengths (Θ is n·P, Ẋ is n·D, meta is 5),
+    // so pad each to the common maximum with NaN; Python slices each back to its
+    // true length (n·P, n·D, first 5) before use, so the padding is inert.
+    let wire_len = theta_flat_raw.len().max(dz_flat_raw.len()).max(shape.len());
+    let theta_flat = pad_to(&theta_flat_raw, wire_len);
+    let dz_flat = pad_to(&dz_flat_raw, wire_len);
+    let meta = pad_to(&shape, wire_len);
 
     let r = run_python(
         &[
             Column::new("theta_flat", &theta_flat),
             Column::new("dz_flat", &dz_flat),
-            // `shape` is shorter than the others; pad with NaN to equal length.
-            Column::new("meta", &pad_to(&shape, theta_flat.len())),
+            Column::new("meta", &meta),
         ],
         r#"
 import numpy as np
@@ -155,8 +163,12 @@ best_xi = None
 for lam in grid:
     # pysindy STLSQ: `threshold` is the hard cutoff (gam's tol), `alpha` is the
     # ridge weight (gam's lam). `fit(Theta, Xdot)` returns coef_ as (d, p).
+    # unbias=False so pysindy KEEPS the ridge in its active-set refit, exactly
+    # like gam's `ridge_diag_solve` (gam never does the OLS de-biasing pass that
+    # pysindy applies by default); this makes the coefficient comparison a true
+    # head-to-head of the same estimator, not ridge-vs-OLS.
     opt = STLSQ(threshold=tol, alpha=lam, max_iter=max_rounds,
-                normalize_columns=False, fit_intercept=False)
+                normalize_columns=False, fit_intercept=False, unbias=False)
     opt.fit(Theta, Xdot)
     Xi = np.asarray(opt.coef_).T  # -> (p, d)
     score = bic(Theta, Xdot, Xi)

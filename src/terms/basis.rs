@@ -26389,6 +26389,166 @@ fn create_ispline_dense(
     Ok(out)
 }
 
+/// Reusable scratch arena for the shared B-spline higher-derivative recurrence.
+///
+/// The derivative recursion
+/// `B^{(m)}_{degree} = degree · (B^{(m-1)}_{degree-1}/Δ_left − B^{(m-1)}_{degree-1}/Δ_right)`
+/// peels one order and one degree per level until it bottoms out in the first
+/// derivative (which itself is evaluated from the plain degree-`d` basis).
+/// Each level needs one lower-order output buffer; the base case additionally
+/// needs a plain-basis buffer and a [`internal::BsplineScratch`]. This arena
+/// owns that whole chain so a tight evaluation loop can amortise the
+/// allocations across many points. Buffers grow on demand and are reused.
+#[derive(Default)]
+pub struct BsplineDerivativeWorkspace {
+    /// Lower-order derivative buffers, one per recursion level (`chain[depth]`
+    /// holds the order-`m-1` derivative consumed by the order-`m` step).
+    chain: Vec<Vec<f64>>,
+    /// Plain (non-derivative) basis buffer for the order-1 base case.
+    lower_basis: Vec<f64>,
+    /// Cox–de Boor scratch for the order-1 base case.
+    lower_scratch: internal::BsplineScratch,
+}
+
+impl BsplineDerivativeWorkspace {
+    /// Creates an empty workspace; buffers are sized lazily on first use.
+    #[inline]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns a level-`depth` lower-order buffer of length `len`, zero-filled,
+    /// growing the chain and the buffer in place as needed.
+    #[inline]
+    fn chain_buffer(&mut self, depth: usize, len: usize) -> &mut [f64] {
+        if self.chain.len() <= depth {
+            self.chain.resize_with(depth + 1, Vec::new);
+        }
+        let buf = &mut self.chain[depth];
+        if buf.len() != len {
+            buf.resize(len, 0.0);
+        }
+        for v in buf.iter_mut() {
+            *v = 0.0;
+        }
+        buf
+    }
+}
+
+/// Shared engine for B-spline derivatives of order `derivative_order ≥ 1`.
+///
+/// Implements the single de-Boor derivative recurrence
+/// `B^{(m)}_{i,degree}(x) = degree · ( B^{(m-1)}_{i,degree-1}(x)/(t_{i+degree}−t_i)
+///                                    − B^{(m-1)}_{i+1,degree-1}(x)/(t_{i+degree+1}−t_{i+1}) )`
+/// recursively: order `m` is obtained from order `m−1` on degree `degree−1`,
+/// bottoming out at order 1, which delegates to
+/// [`evaluate_bspline_derivative_scalar_into`]. The order-2/3/4 public entry
+/// points are thin adapters over this function — the recurrence body lives here
+/// exactly once.
+///
+/// `depth` is the recursion level used to pick a distinct reusable buffer in
+/// `workspace`; top-level callers pass `0`.
+///
+/// Returns derivatives in the raw spline basis. If a model uses an
+/// identifiability/constrained basis `BZ`, the caller must apply that same
+/// constraint transform in derivative space.
+fn evaluate_bspline_derivative_recurrence_into(
+    derivative_order: usize,
+    x: f64,
+    knot_vector: ArrayView1<f64>,
+    degree: usize,
+    out: &mut [f64],
+    workspace: &mut BsplineDerivativeWorkspace,
+    depth: usize,
+) -> Result<(), BasisError> {
+    if degree < derivative_order {
+        return Err(BasisError::InsufficientDegreeForDerivative {
+            degree,
+            derivative_order,
+            minimum_degree: derivative_order,
+        });
+    }
+
+    // Order 1 is the base case: it is computed directly from the plain
+    // degree-`degree` basis rather than from a lower-order derivative.
+    if derivative_order <= 1 {
+        let num_basis_lower = knot_vector.len().saturating_sub(degree);
+        if workspace.lower_basis.len() < num_basis_lower {
+            workspace.lower_basis.resize(num_basis_lower, 0.0);
+        }
+        return evaluate_bspline_derivative_scalar_into(
+            x,
+            knot_vector,
+            degree,
+            out,
+            &mut workspace.lower_basis,
+            &mut workspace.lower_scratch,
+        );
+    }
+
+    validate_knots_for_degree(knot_vector, degree)?;
+
+    let num_basis = knot_vector.len() - degree - 1;
+    if out.len() != num_basis {
+        return Err(BasisError::InvalidKnotVector(format!(
+            "Output buffer length {} does not match number of basis functions {}",
+            out.len(),
+            num_basis
+        )));
+    }
+    if num_basis > 0 {
+        let left = knot_vector[degree];
+        let right = knot_vector[num_basis];
+        if x < left || x > right {
+            out.fill(0.0);
+            return Ok(());
+        }
+    }
+
+    // Evaluate the order-(m-1) derivative on degree-1 into this level's buffer.
+    // Length matches `num_basis` of the degree-(degree-1) basis:
+    // `knot_vector.len() - (degree - 1) - 1 = knot_vector.len() - degree`.
+    let num_basis_lower = knot_vector.len() - degree;
+
+    // Move this level's buffer out of the workspace so the recursive call (which
+    // needs `&mut workspace` for deeper levels and the base-case scratch) cannot
+    // alias it; swap it back afterwards to preserve buffer reuse across points.
+    workspace.chain_buffer(depth, num_basis_lower);
+    let mut lower = std::mem::take(&mut workspace.chain[depth]);
+
+    let recurse = evaluate_bspline_derivative_recurrence_into(
+        derivative_order - 1,
+        x,
+        knot_vector,
+        degree - 1,
+        &mut lower,
+        workspace,
+        depth + 1,
+    );
+    workspace.chain[depth] = lower;
+    recurse?;
+
+    let lower = &workspace.chain[depth];
+    let k = degree as f64;
+    for i in 0..num_basis {
+        let denom1 = knot_vector[i + degree] - knot_vector[i];
+        let denom2 = knot_vector[i + degree + 1] - knot_vector[i + 1];
+        let term1 = if denom1.abs() > 1e-12 {
+            k * lower[i] / denom1
+        } else {
+            0.0
+        };
+        let term2 = if denom2.abs() > 1e-12 {
+            k * lower[i + 1] / denom2
+        } else {
+            0.0
+        };
+        out[i] = term1 - term2;
+    }
+
+    Ok(())
+}
+
 /// Evaluates B-spline second derivatives at a single scalar point `x` into a provided buffer.
 ///
 /// Uses the derivative recursion:

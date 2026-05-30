@@ -43,8 +43,9 @@ from ._dispatch import (
 from ._reml import (
     AdditiveRemlOutput,
     GaussianRemlOutput,
+    _gaussian_reml_fit_blocks_orthogonal,
     gaussian_reml_fit,
-    gaussian_reml_fit_additive,
+    gaussian_reml_fit_blocks,
     gaussian_reml_fit_with_constraints,
 )
 
@@ -508,70 +509,59 @@ def _fit_independent(
     weights_f64: torch.Tensor | None,
     init_lambdas: torch.Tensor | None,
 ) -> FitResult:
-    """Per-atom independent REML — F separate single-smooth REML fits.
+    """Scalable block-orthogonal additive REML with shared residual scale.
 
-    For each smooth k: build (design_k, penalty_k) and call the single-smooth
-    REML primitive. Each atom gets its own λ_k chosen independently. Per-atom
-    fitted contributions are summed into the joint ``fitted``. Lambdas and
-    EDFs are stacked per smooth.
+    The coefficient solves remain per-block, but λ_k are selected against the
+    additive residual quadratic shared by all blocks and all output columns.
+    This is exact when the by-modulated block designs are W-orthogonal and is
+    the large-F replacement for the old loop of private single-smooth REML
+    fits.
 
     Complexity: ``O(F · M_k³)`` for the inner Cholesky vs ``O((F · M_k)³)``
     for the joint additive path. This is the production path for
     SAE-scale work where F ≫ 64.
 
-    Multi-output ``response`` shape ``(N, D)`` is supported natively because
-    the single-smooth primitive supports it; D > 1 in mode="joint" is
-    currently rejected by the multi-block backward (use independent mode
-    if you need D > 1 + F > 1).
-
-    Mathematical caveat: per-atom independent fits treat λ_k as
-    independent. Under TopK sparse gating in an SAE (where most atoms are
-    zero per row, so per-atom designs are effectively orthogonal in
-    expectation), this is the right algorithm. For genuinely overlapping
-    smooths over the same predictor space, the joint additive fit is
-    statistically more efficient — but only computable at moderate F.
+    Multi-output ``response`` shape ``(N, D)`` is supported with one λ per
+    block and one profiled residual scale per output column.
     """
     F = len(smooths_list)
-    coefficients: list[torch.Tensor] = []
-    fitted_total: torch.Tensor | None = None
-    lambdas: list[torch.Tensor] = []
-    edfs: list[torch.Tensor] = []
-    reml_total: torch.Tensor | None = None
-
-    init_lam_seq: Sequence[float] | None = None
+    designs: list[torch.Tensor] = []
+    penalties: list[torch.Tensor] = []
     if init_lambdas is not None:
         init_lam_arr = init_lambdas.detach().reshape(-1)
         if init_lam_arr.numel() != F:
             raise ValueError(
                 f"init_lambdas must have length F={F}; got {init_lam_arr.numel()}"
             )
-        init_lam_seq = [float(v) for v in init_lam_arr]
+        init_log_lambdas = torch.log(
+            init_lambdas.to(torch.float64).reshape(-1).clamp_min(1.0e-300)
+        )
+    else:
+        init_log_lambdas = None
 
-    for k, (smooth, pts) in enumerate(zip(smooths_list, points_list)):
+    for smooth, pts in zip(smooths_list, points_list):
         design, penalty = _build_design_penalty(smooth, pts)
         design = design.to(torch.float64)
         penalty = penalty.to(torch.float64)
         by_t = _smooth_by_tensor(smooth, design)
-        init_lam_k = init_lam_seq[k] if init_lam_seq is not None else None
-        out_k: GaussianRemlOutput = gaussian_reml_fit(
-            design, response_f64, penalty,
-            weights=weights_f64, by=by_t, init_lambda=init_lam_k,
-        )
-        coefficients.append(out_k.coefficients)
-        fitted_k = out_k.fitted
-        fitted_total = fitted_k if fitted_total is None else fitted_total + fitted_k
-        lambdas.append(out_k.lam.reshape(()))
-        edfs.append(out_k.edf.reshape(()))
-        score_k = out_k.reml_score.reshape(())
-        reml_total = score_k if reml_total is None else reml_total + score_k
+        if by_t is not None:
+            design = design * by_t.to(torch.float64).unsqueeze(1)
+        designs.append(design)
+        penalties.append(penalty)
 
-    assert fitted_total is not None and reml_total is not None
+    out = _gaussian_reml_fit_blocks_orthogonal(
+        designs,
+        penalties,
+        response_f64,
+        weights=weights_f64,
+        init_log_lambdas=init_log_lambdas,
+    )
     return FitResult(
-        coefficients=coefficients,
-        fitted=fitted_total,
-        lambdas=torch.stack(lambdas),
-        reml_score=reml_total,
-        edf=torch.stack(edfs),
+        coefficients=list(out.coefficients),
+        fitted=out.fitted,
+        lambdas=out.lambdas,
+        reml_score=out.reml_score,
+        edf=out.edf,
         smooths=smooths_list,
     )
 
@@ -610,19 +600,17 @@ def fit(
           design ``Z = [Z_1 | ... | Z_F]``. Inner Cholesky cost is
           ``O((F · M_k)³)`` — feasible for F ≲ 64, infeasible at
           F ≳ 1000. Currently single-output only (D = 1).
-        * ``"independent"`` — F separate single-smooth REML fits.
-          Per-atom λ chosen independently. Cost is ``O(F · M_k³)`` —
-          scales linearly in F, the production path for SAE-scale work.
-          Supports multi-output D > 1 natively.
+        * ``"independent"`` — scalable block-orthogonal additive REML.
+          Coefficient solves are per smooth, but all λ_k share the additive
+          profiled residual scale. Cost is ``O(F · M_k³)`` and it supports
+          multi-output D > 1 with one λ per smooth.
         * ``"auto"`` (default) — routes to ``"joint"`` if
           ``F ≤ 64`` and ``D == 1``, else to ``"independent"``.
 
-        Mathematical caveat for ``"independent"``: per-atom λ_k are
-        treated as independent. Under TopK gating in an SAE (where most
-        atoms are zero per row), this is the right algorithm. For
-        genuinely overlapping smooths on the same predictor, joint
-        additive is statistically more efficient — but only computable
-        at moderate F.
+        Mathematical caveat for ``"independent"``: this is exact when the
+        by-modulated block designs are W-orthogonal. For genuinely
+        overlapping smooths on the same predictor, joint additive REML is
+        statistically tighter but only computable at moderate F.
 
     Returns
     -------
@@ -755,18 +743,25 @@ def fit(
         penalties.append(penalty)
         bys.append(_smooth_by_tensor(s, design))
 
-    init_lam = float(init_lambdas[0]) if init_lambdas is not None else None
-    # `gaussian_reml_fit_additive` routes single-response (D == 1, F > 1)
-    # to the multi-block per-smooth-λ Rust path automatically; multi-output
-    # responses (D > 1) use the closed-form block-diagonal kernel because
-    # the multi-block driver is single-response.
-    add_out: AdditiveRemlOutput = gaussian_reml_fit_additive(
-        designs=designs,
-        response=response_f64,
-        penalties=penalties,
-        bys=bys,
+    modulated: list[torch.Tensor] = []
+    for design, by_t in zip(designs, bys):
+        modulated.append(design * by_t.unsqueeze(1) if by_t is not None else design)
+    init_log_lambdas = None
+    if init_lambdas is not None:
+        init_lam_arr = init_lambdas.to(torch.float64).reshape(-1)
+        if init_lam_arr.numel() != F:
+            raise ValueError(
+                f"init_lambdas must have length F={F}; got {init_lam_arr.numel()}"
+            )
+        init_log_lambdas = torch.log(init_lam_arr.clamp_min(1.0e-300))
+    # ``mode='joint'`` reaches here only for D == 1. Preserve the full
+    # vector warm start instead of collapsing to init_lambdas[0].
+    add_out: AdditiveRemlOutput = gaussian_reml_fit_blocks(
+        modulated,
+        penalties,
+        response_f64,
         weights=weights_f64,
-        init_lambda=init_lam,
+        init_log_lambdas=init_log_lambdas,
     )
     return FitResult(
         coefficients=list(add_out.coefficients),

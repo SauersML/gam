@@ -12,11 +12,12 @@ from ..smooth import Smooth
 
 FitMode = Literal["joint", "independent", "auto"]
 
-# F-threshold below which mode="auto" uses joint additive REML and above
-# which it falls back to per-atom independent REML. Joint scales as
-# O((F * M_k)^3) for the inner Cholesky; independent scales as
-# O(F * M_k^3). At F approx 64 with typical M_k approx 8-16, joint is still
-# comfortable; at F approx 1024+ it becomes infeasible.
+# F-threshold below which mode="auto" uses exact dense joint additive REML
+# and above which it falls back to the shared-scale block-orthogonal
+# additive estimator. Joint scales as O((F * M_k)^3) for the inner
+# Cholesky; the block path scales as O(F * M_k^3). At F approx 64 with
+# typical M_k approx 8-16, joint is still comfortable; at F approx 1024+
+# it becomes infeasible.
 _AUTO_MODE_F_THRESHOLD = 64
 
 

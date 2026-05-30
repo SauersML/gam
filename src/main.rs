@@ -1235,7 +1235,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         args.family,
         args.negative_binomial_theta,
         link_choice.clone(),
-        sas_linkspec.as_ref(),
         y.view(),
         y_kind,
         &parsed.response,

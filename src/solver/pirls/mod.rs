@@ -6080,8 +6080,8 @@ pub fn calculate_deviance(
     priorweights: ArrayView1<f64>,
 ) -> f64 {
     const EPS: f64 = 1e-8;
-    // Match the μ floor used by PIRLS log-link working-state writers
-    // (`MIN_MU = 1e-10` in update_working_state_*_log) so deviance / weights
+    // Match the μ floor used by the shared PIRLS log-link working-state engine
+    // (`MIN_MU = 1e-10` in `log_link_working_state`) so deviance / weights
     // stay self-consistent when the linear predictor saturates.
     const MU_FLOOR: f64 = 1e-10;
     match &likelihood.spec.response {
