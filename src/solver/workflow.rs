@@ -55,7 +55,6 @@ use crate::survival::PenaltyBlock;
 use crate::terms::latent_coord::{
     AuxPriorFamily, AuxPriorStrength, LatentCoordValues, LatentIdMode, LatentManifold,
 };
-use crate::terms::AnalyticPenaltyRegistry;
 use crate::types::{
     InverseLink, LatentCLogLogState, LikelihoodSpec, LinkFunction, MixtureLinkSpec,
     ResponseColumnKind, ResponseFamily, SasLinkSpec, StandardLink, WigglePenaltyConfig,
@@ -3930,18 +3929,6 @@ struct LatentSpec {
     explicit_none_mode: bool,
 }
 
-/// Thin adapter over the shared descriptor parser
-/// ([`descriptors::build_analytic_penalty_registry_from_descriptors`]). The
-/// in-process workflow pipeline and the Python FFI build their analytic-penalty
-/// registries through the exact same parser, so accepted JSON, defaults, shape
-/// checks, and error messages are identical for every caller.
-fn build_standard_latent_analytic_penalty_registry(
-    latents: Option<&JsonValue>,
-    penalties: Option<&JsonValue>,
-) -> Result<AnalyticPenaltyRegistry, String> {
-    descriptors::build_analytic_penalty_registry_from_descriptors(latents, penalties)
-}
-
 fn json_array2(value: &JsonValue, context: &str) -> Result<Array2<f64>, String> {
     let rows = value
         .as_array()
@@ -4481,7 +4468,7 @@ fn prepare_standard_latent_coord(
     config: &FitConfig,
 ) -> Result<Option<(Dataset, ParsedFormula, StandardLatentCoordConfig)>, String> {
     let specs = parse_latent_specs(config.latents.as_ref())?;
-    let analytic_penalties = build_standard_latent_analytic_penalty_registry(
+    let analytic_penalties = descriptors::build_analytic_penalty_registry_from_descriptors(
         config.latents.as_ref(),
         config.analytic_penalties.as_ref(),
     )?;
