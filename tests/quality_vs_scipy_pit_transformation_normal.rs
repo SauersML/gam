@@ -70,7 +70,10 @@ impl SplitMix64 {
     }
     /// One Gamma(shape, 1) draw via Marsaglia-Tsang (shape >= 1 used here).
     fn next_gamma(&mut self, shape: f64) -> f64 {
-        debug_assert!(shape >= 1.0);
+        assert!(
+            shape >= 1.0,
+            "Marsaglia-Tsang Gamma sampler requires shape >= 1.0; got {shape}"
+        );
         let d = shape - 1.0 / 3.0;
         let c = 1.0 / (9.0 * d).sqrt();
         loop {
