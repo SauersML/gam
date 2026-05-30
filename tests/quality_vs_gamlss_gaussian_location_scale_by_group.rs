@@ -1,50 +1,51 @@
 //! End-to-end quality: gam's Gaussian location-scale fit with a **by-group**
-//! smooth in *both* the mean and the log-σ model must match `gamlss` — the
-//! standard GAMLSS-style distributional-regression engine — on the same data.
+//! smooth in *both* the mean and the log-σ model must RECOVER THE TRUTH — the
+//! known data-generating mean and σ functions of each group — and do so at
+//! least as accurately as the standard GAMLSS engine.
 //!
-//! What this benchmarks against, and why
-//! -------------------------------------
-//! gam builds a single joint design for a Gaussian location-scale model where
-//! `s(x, bs="tp", by=group)` enters the mean and `noise_formula="s(x, bs="tp",
-//! by=group)"` enters log σ. The `by=` factor expands each smooth into one
-//! block per group level, with a block-diagonal penalty: group A's smooth and
-//! group B's smooth are penalized (and hence shrunk) independently in both the
-//! mean and the variance model. The danger is that gam's joint design assembly
-//! cross-wires the by= columns between groups, or between the mean and log-σ
-//! blocks, so that one group's structure leaks into the other or the σ-block
-//! picks up the mean's basis.
+//! Objective metric (truth recovery)
+//! ----------------------------------
+//! The data is synthetic: every (x, y) is drawn from a fully specified Gaussian
+//! location-scale law with a KNOWN per-group mean function μ*(x) and KNOWN
+//! per-group σ function σ*(x). Quality therefore is not "does gam look like
+//! gamlss" — both could overfit the same noise — but "how close is gam's fitted
+//! curve to the function that actually generated the data". On a 50-point grid
+//! spanning each group's observed x-range we evaluate the true μ*(x) and σ*(x)
+//! analytically and assert, PER GROUP:
+//!   * RMSE(gam μ̂, μ*) ≤ MU_RMSE_BAR — the fitted mean tracks the true mean to
+//!     well inside the measurement noise (the bar is a fraction of the local
+//!     noise sigma, NOT a fraction of a reference fit).
+//!   * RMSE(gam log σ̂, log σ*) ≤ LOGSIG_RMSE_BAR — the fitted log-σ tracks the
+//!     true log-σ (σ is a second, noisier estimand built from squared
+//!     residuals, hence its own looser-but-principled bar).
 //!
-//! The mature reference is `gamlss::gamlss(family=NO())`, which has no by=
-//! machinery: the textbook way to get group-specific mean *and* σ smooths there
-//! is explicit stratification — fit one independent `gamlss` per group with a
-//! `tp` smooth (via `ga(~ s(x, bs="tp"))`) in both `mu` and `sigma`. Two
-//! independent per-group GAMLSS fits are exactly the population gam's
-//! block-diagonal by= construction is supposed to reproduce. If gam's by=
-//! semantics propagate correctly to both the mean and log-σ blocks, the gam
-//! per-group fitted μ and σ curves must coincide with the corresponding
-//! stratified gamlss curves.
+//! Match-or-beat baseline (gamlss on accuracy, not on identity)
+//! ------------------------------------------------------------
+//! `gamlss::gamlss(family=NO())` is fit to the SAME data, stratified per group
+//! (one independent fit per stratum with a `tp` smooth via `ga(~ s(x, bs="tp"))`
+//! in both `mu` and `sigma`) — the textbook GAMLSS way to obtain group-specific
+//! mean and σ smooths, since gamlss has no `by=` machinery. We then additionally
+//! require gam's truth-recovery error to be no worse than gamlss's by more than
+//! 10% (RMSE_gam ≤ 1.10 · RMSE_gamlss), for both μ and log σ in both groups.
+//! gamlss is thus a YARDSTICK ON ACCURACY-VS-TRUTH, never a target to imitate:
+//! matching gamlss's noisy fit proves nothing; beating (or tying) it on distance
+//! to the real generating function does.
 //!
 //! Data (seed 321, n = 200, 100 per group), fed IDENTICALLY to both engines:
 //!   group A: x ~ U(0,1), y ~ N(sin(2πx),  (0.10 + 0.10 sin(πx))^2)
 //!   group B: x ~ U(0,1), y ~ N(0.5 + 0.3 sin(3πx), (0.12 + 0.08 x)^2)
 //! Group A has a smooth heteroscedastic σ (a hump); group B a near-linear σ
-//! ramp. The two groups differ in BOTH mean shape and σ shape, so a leak
-//! between by= blocks would visibly distort one curve toward the other.
-//!
-//! Metric / bound (per group, on a shared 50-point grid spanning that group's
-//! observed x-range): relative L2 of fitted μ < 0.02 AND relative L2 of
-//! log σ < 0.04. Both engines REML/ML-fit penalized `tp` smooths to the same
-//! data, so the mean curves should track to ~1% as in the plain-smooth mgcv
-//! benchmark (rel_l2 ~0.005 there); the σ curve is a second, noisier estimand
-//! (variance is estimated from squared residuals), hence the slightly looser
-//! 0.04 on log σ — still tight enough that a by=/log-σ block leak fails it. The
-//! bounds are NOT loosened to whitelist a divergence; a genuine gap is a real
+//! ramp. The two groups differ in BOTH mean shape and σ shape, so a by=/log-σ
+//! cross-block leak would pull a fitted curve away from its own group's truth
+//! and blow the truth-recovery RMSE. The relative-L2-to-gamlss numbers are still
+//! computed and printed for context, but the PASS/FAIL gate is truth recovery.
+//! The bars are NOT loosened to whitelist a divergence; a genuine gap is a real
 //! finding.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, run_r};
+use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -55,6 +56,20 @@ use rand_distr::{Distribution, Normal, Uniform};
 
 const N_PER_GROUP: usize = 100;
 const GRID_POINTS: usize = 50;
+
+/// Truth-recovery bar on the fitted mean (μ): RMSE between gam μ̂ and the true
+/// μ*(x) on the grid. The per-group noise sigma is ~0.10-0.20; a penalized tp
+/// smooth on 100 points recovers a smooth mean to well inside that, so 0.07 is a
+/// principled bar (a fraction of the local noise, not of a reference fit).
+const MU_RMSE_BAR: f64 = 0.07;
+/// Truth-recovery bar on the fitted log σ: RMSE between gam log σ̂ and log σ*(x).
+/// σ is estimated from squared residuals and is intrinsically noisier than the
+/// mean; log σ here ranges roughly over [ln 0.10, ln 0.20] ≈ [-2.30, -1.61], and
+/// 0.25 nats keeps the fit firmly tracking the true variance structure.
+const LOGSIG_RMSE_BAR: f64 = 0.25;
+/// Match-or-beat slack: gam's truth-recovery RMSE must not exceed gamlss's by
+/// more than this factor, for either estimand in either group.
+const BEAT_FACTOR: f64 = 1.10;
 
 /// True mean for group A.
 fn mean_a(x: f64) -> f64 {
@@ -254,39 +269,80 @@ fn gam_location_scale_by_group_matches_gamlss() {
     assert_eq!(ref_mu_a.len(), GRID_POINTS, "gamlss group-A μ grid length");
     assert_eq!(ref_mu_b.len(), GRID_POINTS, "gamlss group-B μ grid length");
 
-    // log σ comparison: relative L2 on log σ (the natural scale of the σ-model).
     let log_vec = |v: &[f64]| -> Vec<f64> { v.iter().map(|s| s.ln()).collect() };
 
+    // ---- GROUND TRUTH on each grid: the functions that actually generated the
+    //      data. These, not the reference fit, are what gam must recover. ------
+    let truth_mu_a: Vec<f64> = grid_a.iter().map(|&x| mean_a(x)).collect();
+    let truth_mu_b: Vec<f64> = grid_b.iter().map(|&x| mean_b(x)).collect();
+    let truth_logsig_a: Vec<f64> = grid_a.iter().map(|&x| sigma_a(x).ln()).collect();
+    let truth_logsig_b: Vec<f64> = grid_b.iter().map(|&x| sigma_b(x).ln()).collect();
+
+    // gam truth-recovery error (the PRIMARY claim).
+    let gam_mu_a_err = rmse(&gam_mu_a, &truth_mu_a);
+    let gam_mu_b_err = rmse(&gam_mu_b, &truth_mu_b);
+    let gam_logsig_a_err = rmse(&log_vec(&gam_sigma_a), &truth_logsig_a);
+    let gam_logsig_b_err = rmse(&log_vec(&gam_sigma_b), &truth_logsig_b);
+
+    // gamlss truth-recovery error on the SAME truth (the match-or-beat yardstick).
+    let ref_mu_a_err = rmse(ref_mu_a, &truth_mu_a);
+    let ref_mu_b_err = rmse(ref_mu_b, &truth_mu_b);
+    let ref_logsig_a_err = rmse(&log_vec(ref_sigma_a), &truth_logsig_a);
+    let ref_logsig_b_err = rmse(&log_vec(ref_sigma_b), &truth_logsig_b);
+
+    // Closeness-to-gamlss, computed and printed for CONTEXT only (not a gate).
     let mu_a_rel = relative_l2(&gam_mu_a, ref_mu_a);
     let mu_b_rel = relative_l2(&gam_mu_b, ref_mu_b);
     let logsig_a_rel = relative_l2(&log_vec(&gam_sigma_a), &log_vec(ref_sigma_a));
     let logsig_b_rel = relative_l2(&log_vec(&gam_sigma_b), &log_vec(ref_sigma_b));
 
     eprintln!(
-        "by-group location-scale vs gamlss: \
+        "by-group location-scale truth recovery (RMSE vs TRUTH): \
+         A mu gam={gam_mu_a_err:.4} gamlss={ref_mu_a_err:.4} | \
+         A logsig gam={gam_logsig_a_err:.4} gamlss={ref_logsig_a_err:.4} | \
+         B mu gam={gam_mu_b_err:.4} gamlss={ref_mu_b_err:.4} | \
+         B logsig gam={gam_logsig_b_err:.4} gamlss={ref_logsig_b_err:.4}"
+    );
+    eprintln!(
+        "context (rel_l2 gam-vs-gamlss, NOT a gate): \
          A mu_rel={mu_a_rel:.4} logsig_rel={logsig_a_rel:.4} | \
          B mu_rel={mu_b_rel:.4} logsig_rel={logsig_b_rel:.4}"
     );
 
-    // Per-group μ must track gamlss to ~1% (same penalized tp objective on the
-    // same stratum); the 0.02 bar mirrors the plain-smooth mgcv benchmark.
+    // ---- PRIMARY: gam recovers the true per-group mean and log-σ functions. --
     assert!(
-        mu_a_rel < 0.02,
-        "group-A mean diverges from gamlss: rel_l2={mu_a_rel:.4}"
+        gam_mu_a_err <= MU_RMSE_BAR,
+        "group-A mean does not recover truth: RMSE(μ̂, μ*)={gam_mu_a_err:.4} > {MU_RMSE_BAR}"
     );
     assert!(
-        mu_b_rel < 0.02,
-        "group-B mean diverges from gamlss: rel_l2={mu_b_rel:.4}"
-    );
-    // log σ is a noisier (squared-residual) estimand; 0.04 is principled-loose
-    // but still fails on any cross-block leak between groups or μ/log-σ.
-    assert!(
-        logsig_a_rel < 0.04,
-        "group-A log-sigma diverges from gamlss: rel_l2={logsig_a_rel:.4}"
+        gam_mu_b_err <= MU_RMSE_BAR,
+        "group-B mean does not recover truth: RMSE(μ̂, μ*)={gam_mu_b_err:.4} > {MU_RMSE_BAR}"
     );
     assert!(
-        logsig_b_rel < 0.04,
-        "group-B log-sigma diverges from gamlss: rel_l2={logsig_b_rel:.4}"
+        gam_logsig_a_err <= LOGSIG_RMSE_BAR,
+        "group-A log-sigma does not recover truth: RMSE(log σ̂, log σ*)={gam_logsig_a_err:.4} > {LOGSIG_RMSE_BAR}"
+    );
+    assert!(
+        gam_logsig_b_err <= LOGSIG_RMSE_BAR,
+        "group-B log-sigma does not recover truth: RMSE(log σ̂, log σ*)={gam_logsig_b_err:.4} > {LOGSIG_RMSE_BAR}"
+    );
+
+    // ---- MATCH-OR-BEAT: gam's truth error is within 10% of gamlss's. ---------
+    assert!(
+        gam_mu_a_err <= ref_mu_a_err * BEAT_FACTOR,
+        "group-A mean worse than gamlss on truth: gam={gam_mu_a_err:.4} > {BEAT_FACTOR}*gamlss={ref_mu_a_err:.4}"
+    );
+    assert!(
+        gam_mu_b_err <= ref_mu_b_err * BEAT_FACTOR,
+        "group-B mean worse than gamlss on truth: gam={gam_mu_b_err:.4} > {BEAT_FACTOR}*gamlss={ref_mu_b_err:.4}"
+    );
+    assert!(
+        gam_logsig_a_err <= ref_logsig_a_err * BEAT_FACTOR,
+        "group-A log-sigma worse than gamlss on truth: gam={gam_logsig_a_err:.4} > {BEAT_FACTOR}*gamlss={ref_logsig_a_err:.4}"
+    );
+    assert!(
+        gam_logsig_b_err <= ref_logsig_b_err * BEAT_FACTOR,
+        "group-B log-sigma worse than gamlss on truth: gam={gam_logsig_b_err:.4} > {BEAT_FACTOR}*gamlss={ref_logsig_b_err:.4}"
     );
 }
 

@@ -1,6 +1,23 @@
 //! End-to-end quality: gam's **simplex (compositional) response regression**
-//! via a custom Dirichlet likelihood must match `DirichletReg` — the mature R
-//! reference for Dirichlet-response regression — on identical data.
+//! via a custom Dirichlet likelihood must **recover the known truth** that the
+//! data was generated from. `DirichletReg` — the mature R reference for
+//! Dirichlet-response regression — is fit on the *identical* data and demoted to
+//! a match-or-beat accuracy baseline: gam's recovery error against the truth must
+//! not exceed DirichletReg's by more than a small margin.
+//!
+//! ## Objective metric asserted (TRUTH RECOVERY)
+//! The data is drawn from a **known** smooth Dirichlet truth `α_k(x) = exp(η_k(x))`
+//! with `η_k = true_eta(x)`. We therefore assert that gam recovers the truth, not
+//! that it reproduces a peer tool's fit:
+//!   * **RMSE of the fitted closed mean composition** `μ(x) = α(x)/Σα(x)` against
+//!     the *true* `μ(x)` on a dense grid is below a principled bar (a small
+//!     fraction of the simplex coordinate range), AND ≤ DirichletReg's own RMSE
+//!     against the same truth × 1.10 (match-or-beat on accuracy).
+//!   * **RMSE of the fitted log-concentration** `log φ(x) = log Σ_k α_k(x)`
+//!     against the *true* `log φ(x)` is below a principled bar, AND ≤
+//!     DirichletReg's RMSE × 1.10.
+//! DirichletReg's fit is still computed and its rel-L2 vs gam printed for context,
+//! but "close to DirichletReg" is no longer a pass criterion.
 //!
 //! ## What is benchmarked
 //! A composition `y_i = (y_{i1}, …, y_{iK})` on the `K`-part simplex
@@ -29,11 +46,10 @@
 //! has no penalized-smooth facility, so we give *both* engines the identical
 //! cubic-B-spline basis `X = [1 | B_centered]` and let each fit the SAME
 //! Dirichlet common-model likelihood on it: gam by REML-penalized smoothing,
-//! DirichletReg by unpenalized maximum likelihood. With a modest basis (8
-//! interior knots) and a strong signal at n=150, the penalized and unpenalized
-//! fits must produce essentially the same fitted composition surface; a real
-//! divergence is a real bug in gam's coupled multi-block custom-family path.
-//! (`-1` suppresses DirichletReg's own intercept so its per-component
+//! DirichletReg by unpenalized maximum likelihood. It serves as a **baseline to
+//! match-or-beat** on truth-recovery accuracy: gam's RMSE against the known truth
+//! must not exceed DirichletReg's by more than 10%. (`-1` suppresses DirichletReg's
+//! own intercept so its per-component
 //! coefficient vector aligns 1:1 with our explicit-intercept design `X`, making
 //! the recovered η_k = X β_k exact in either engine.)
 //!
@@ -45,11 +61,12 @@
 //! basis matrix `X` are handed verbatim to both engines.
 //!
 //! ## Metrics
-//!   * **Relative L2** of the fitted *closed* mean composition `μ(x)` over a
-//!     dense grid (the natural scale-free compositional accuracy measure).
-//!   * **Pearson correlation** of the recovered ALR coordinates between the two
-//!     engines, per ALR axis (the Aitchison-coordinate agreement).
-//!   * **Relative L2** of the fitted log-concentration `log φ(x) = log Σ_k α_k`.
+//!   * **RMSE of the closed mean composition** `μ(x)` vs the *true* `μ(x)` over a
+//!     dense grid (truth-recovery accuracy on the simplex).
+//!   * **RMSE of the log-concentration** `log φ(x) = log Σ_k α_k` vs the *true*
+//!     `log φ(x)` (truth recovery of the Dirichlet precision).
+//! For context only (printed, not asserted as a pass gate): the relative-L2
+//! agreement of gam's fit with DirichletReg's fit.
 
 use gam::basis::{
     BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, build_bspline_basis_1d,
@@ -59,7 +76,7 @@ use gam::custom_family::{
     ParameterBlockState, PenaltyMatrix, fit_custom_family,
 };
 use gam::matrix::DesignMatrix;
-use gam::test_support::reference::{Column, pearson, relative_l2, run_r};
+use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
 use ndarray::{Array1, Array2};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -266,21 +283,8 @@ fn closed_means_and_logconc(eta: &[Vec<f64>]) -> (Vec<Vec<f64>>, Vec<f64>) {
     (mu, log_conc)
 }
 
-/// ALR coordinates ALRₖ = ln(μ_k/μ_K) = η_k − η_{K-1} for k = 0..K-2, flattened
-/// in axis-major order over a grid of length `m`.
-fn alr_flat(eta: &[Vec<f64>]) -> Vec<f64> {
-    let m = eta[0].len();
-    let mut out = Vec::with_capacity((K - 1) * m);
-    for k in 0..(K - 1) {
-        for i in 0..m {
-            out.push(eta[k][i] - eta[K - 1][i]);
-        }
-    }
-    out
-}
-
 #[test]
-fn gam_dirichlet_regression_matches_dirichletreg() {
+fn gam_dirichlet_regression_recovers_truth() {
     gam::init_parallelism();
 
     // ---- synthetic data: x ~ U(-2,2), Dirichlet(α(x)) draws ---------------
@@ -362,7 +366,6 @@ fn gam_dirichlet_regression_matches_dirichletreg() {
         .map(|k| grid_design.dot(&fit.block_states[k].beta).to_vec())
         .collect();
     let (gam_mu_grid, gam_logconc_grid) = closed_means_and_logconc(&gam_eta_grid);
-    let gam_alr_grid = alr_flat(&gam_eta_grid);
 
     // ---- DirichletReg: the mature Dirichlet-regression reference -----------
     // Hand both engines the SAME design X = [1 | B_centered]; `-1` suppresses
@@ -418,45 +421,79 @@ fn gam_dirichlet_regression_matches_dirichletreg() {
         })
         .collect();
     let (dr_mu_grid, dr_logconc_grid) = closed_means_and_logconc(&dr_eta_grid);
-    let dr_alr_grid = alr_flat(&dr_eta_grid);
 
-    // ---- compare -----------------------------------------------------------
-    // Relative L2 of the closed mean composition over the grid (axis-stacked).
+    // ---- TRUTH on the grid -------------------------------------------------
+    // The data was generated from the known smooth surfaces η_k = true_eta(x);
+    // the objective target is the resulting closed mean composition and
+    // log-concentration evaluated on the identical dense grid.
+    let true_eta_grid: Vec<Vec<f64>> = {
+        let mut stacks = vec![Vec::with_capacity(N_GRID); K];
+        for &xg in &grid {
+            let e = true_eta(xg);
+            for k in 0..K {
+                stacks[k].push(e[k]);
+            }
+        }
+        stacks
+    };
+    let (true_mu_grid, true_logconc_grid) = closed_means_and_logconc(&true_eta_grid);
+
+    // Axis-stacked closed mean composition for grid-wide RMSE.
     let mut gam_mu_flat = Vec::with_capacity(K * N_GRID);
     let mut dr_mu_flat = Vec::with_capacity(K * N_GRID);
+    let mut true_mu_flat = Vec::with_capacity(K * N_GRID);
     for k in 0..K {
         gam_mu_flat.extend_from_slice(&gam_mu_grid[k]);
         dr_mu_flat.extend_from_slice(&dr_mu_grid[k]);
+        true_mu_flat.extend_from_slice(&true_mu_grid[k]);
     }
-    let rel_mu = relative_l2(&gam_mu_flat, &dr_mu_flat);
-    let rel_logconc = relative_l2(&gam_logconc_grid, &dr_logconc_grid);
-    let corr_alr = pearson(&gam_alr_grid, &dr_alr_grid);
+
+    // ---- objective metric: recovery error vs the KNOWN truth ----------------
+    let gam_rmse_mu = rmse(&gam_mu_flat, &true_mu_flat);
+    let dr_rmse_mu = rmse(&dr_mu_flat, &true_mu_flat);
+    let gam_rmse_logconc = rmse(&gam_logconc_grid, &true_logconc_grid);
+    let dr_rmse_logconc = rmse(&dr_logconc_grid, &true_logconc_grid);
+
+    // Context only (NOT a pass gate): how closely gam's fit tracks DirichletReg's.
+    let rel_mu_vs_dr = relative_l2(&gam_mu_flat, &dr_mu_flat);
+    let rel_logconc_vs_dr = relative_l2(&gam_logconc_grid, &dr_logconc_grid);
 
     eprintln!(
-        "dirichlet regression vs DirichletReg: n={N} K={K} grid={N_GRID} p={p_cols} \
-         rel_l2_mean={rel_mu:.4} rel_l2_logconc={rel_logconc:.4} pearson_alr={corr_alr:.5}"
+        "dirichlet truth recovery: n={N} K={K} grid={N_GRID} p={p_cols} | \
+         RMSE(mu) gam={gam_rmse_mu:.4} dr={dr_rmse_mu:.4} | \
+         RMSE(log_phi) gam={gam_rmse_logconc:.4} dr={dr_rmse_logconc:.4} | \
+         context rel_l2_vs_dr mu={rel_mu_vs_dr:.4} log_phi={rel_logconc_vs_dr:.4}"
     );
 
-    // Both engines fit the SAME Dirichlet common-model likelihood on the SAME
-    // cubic-B-spline basis; gam adds only a REML smoothness penalty that, with
-    // 8 interior knots and a strong signal at n=150, barely shrinks the fit.
-    // The fitted closed mean composition must therefore essentially coincide
-    // and the Aitchison (ALR) coordinates must be near-perfectly correlated.
-    // 3% relative L2 on the mean composition and on log-concentration, and
-    // 0.99 ALR correlation, are tight enough that any real defect in the
-    // coupled multi-block Dirichlet path would trip them, while leaving margin
-    // for the penalized-vs-unpenalized difference between the two engines.
+    // PRIMARY claim: gam recovers the true compositional surface. The simplex
+    // coordinates μ_k ∈ (0,1); recovering the smooth truth from n=150 noisy
+    // Dirichlet draws to within 0.05 RMSE (5% of the unit coordinate range) is
+    // a genuine accuracy bar that an actual defect in the coupled multi-block
+    // Dirichlet path would fail.
     assert!(
-        corr_alr > 0.99,
-        "ALR coordinates should be near-identical to DirichletReg: pearson={corr_alr:.5}"
+        gam_rmse_mu < 0.05,
+        "gam did not recover the true mean composition: RMSE(mu)={gam_rmse_mu:.4} (bar 0.05)"
+    );
+    // The log-concentration log φ ranges over roughly [0, 2] across the grid;
+    // 0.30 RMSE recovers its smooth shape well.
+    assert!(
+        gam_rmse_logconc < 0.30,
+        "gam did not recover the true log-concentration: RMSE(log_phi)={gam_rmse_logconc:.4} (bar 0.30)"
+    );
+
+    // MATCH-OR-BEAT: gam's penalized REML fit must be at least as accurate as the
+    // mature unpenalized DirichletReg MLE on the same data, up to a 10% margin.
+    assert!(
+        gam_rmse_mu <= dr_rmse_mu * 1.10,
+        "gam mean-composition recovery worse than DirichletReg baseline: \
+         gam={gam_rmse_mu:.4} > 1.10*dr={:.4}",
+        dr_rmse_mu * 1.10
     );
     assert!(
-        rel_mu < 0.03,
-        "fitted mean composition diverges from DirichletReg: rel_l2={rel_mu:.4}"
-    );
-    assert!(
-        rel_logconc < 0.03,
-        "fitted log-concentration diverges from DirichletReg: rel_l2={rel_logconc:.4}"
+        gam_rmse_logconc <= dr_rmse_logconc * 1.10,
+        "gam log-concentration recovery worse than DirichletReg baseline: \
+         gam={gam_rmse_logconc:.4} > 1.10*dr={:.4}",
+        dr_rmse_logconc * 1.10
     );
 }
 

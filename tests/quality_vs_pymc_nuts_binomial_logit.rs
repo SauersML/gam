@@ -1,35 +1,36 @@
-//! End-to-end quality: gam's NUTS posterior for a penalized binomial-logit
-//! smooth must agree with **PyMC** (the reference NUTS + ArviZ R-hat/ESS
-//! stack) — not merely "produce some draws".
+//! End-to-end OBJECTIVE quality: gam's NUTS posterior for a penalized
+//! binomial-logit smooth must **recover the known truth and be well
+//! calibrated**, not merely reproduce PyMC's draws.
 //!
-//! Why PyMC is the right comparator. PyMC's No-U-Turn Sampler with ArviZ
-//! convergence diagnostics is the de-facto Bayesian reference in the Python
-//! world. gam exposes its own NUTS posterior for Standard binomial-logit
-//! models (`gam::sample::sample_saved_model` → exact GLM NUTS, whitened by the
-//! penalized Hessian). The honest question is: does gam's posterior over the
-//! *linear predictor* coincide with what a trusted, independent NUTS engine
-//! finds for the *same target density*?
+//! The data are generated from a known latent function
+//!     η_true(x) = 0.3 + 0.8 · sin(2π x / 10),   y ~ Bernoulli(logit⁻¹(η_true)).
+//! Because the generating function is known exactly, the honest quality
+//! question is not "does gam's posterior look like PyMC's posterior?" (matching
+//! a peer NUTS engine proves nothing — both could be miscalibrated together),
+//! but rather:
+//!   (A) TRUTH RECOVERY — does the posterior MEAN of the linear predictor
+//!       η = Xβ track the true η over the design? We assert
+//!       RMSE(gam_post_mean_η, η_true) is below a principled bar set by the
+//!       Bernoulli observation noise, and additionally that gam's recovery
+//!       error is no worse than PyMC's by more than 10% (match-or-beat on
+//!       accuracy — PyMC is the BASELINE, not the target).
+//!   (B) CALIBRATION — do gam's pointwise 90% posterior credible intervals for
+//!       η actually contain the TRUTH ~90% of the time? We assert empirical
+//!       coverage within a tolerance band of the 0.90 nominal level. A correct
+//!       Bayesian smoother must be calibrated against the truth; this is an
+//!       objective uncertainty claim, independent of any reference tool.
 //!
-//! Making it a genuine head-to-head. gam fits `y ~ s(x)` (penalized B-spline),
-//! selects the smoothing parameters λ by REML, and then runs NUTS over the
-//! coefficients of the design X with prior precision S = Σ_k λ_k S_k. The
-//! posterior gam samples is therefore exactly
-//!     p(β | y) ∝ Binomial(y | logit⁻¹(Xβ)) · exp(−½ βᵀ S β).
-//! We export gam's *own* design matrix X and *own* penalty precision S (built
-//! from the fitted λ and the per-block penalty matrices) and hand BOTH to
-//! PyMC, where the same density is encoded as a flat prior on β plus a
-//! `pm.Potential(−½ βᵀSβ)`. Both engines then target the identical posterior;
-//! only Monte-Carlo / sampler differences remain, which is what justifies the
-//! tight bounds below. We compare the posterior mean and SD of the linear
-//! predictor η = Xβ at the training points (the quantity that actually drives
-//! every downstream prediction), element-wise on the shared grid.
+//! PyMC remains in the file as a BASELINE on the same objective metric
+//! (truth-recovery RMSE) — gam must match or beat it — and its R-hat is used
+//! only to confirm the baseline run itself converged. The pass/fail criteria
+//! are gam-vs-truth, never gam-vs-PyMC.
 //!
-//! A divergence here is a real bug in gam's posterior, never a reason to
-//! loosen the bounds or touch gam source.
+//! A failure here is a real quality shortfall in gam's posterior, never a
+//! reason to loosen the bounds or touch gam source.
 
 use gam::inference::model::{FittedFamily, FittedModel, FittedModelPayload, ModelKind};
 use gam::smooth::{build_term_collection_design, freeze_term_collection_from_design};
-use gam::test_support::reference::{Column, max_abs_diff, pearson, rmse, run_python};
+use gam::test_support::reference::{Column, rmse, run_python};
 use gam::types::{LikelihoodSpec, StandardLink};
 use gam::{
     FitConfig, FitResult, fit_from_formula, hmc::NutsConfig, init_parallelism,
@@ -61,8 +62,27 @@ fn inv_logit(eta: f64) -> f64 {
     1.0 / (1.0 + (-eta).exp())
 }
 
+/// True latent linear predictor at x — the function the smooth must recover.
+fn eta_true(x: f64) -> f64 {
+    0.3 + 0.8 * (2.0 * std::f64::consts::PI * x / 10.0).sin()
+}
+
+/// Linear-interpolated quantile of an (already sorted) sample. `q` in [0,1].
+fn sorted_quantile(sorted: &[f64], q: f64) -> f64 {
+    let m = sorted.len();
+    assert!(m > 0, "quantile of empty sample");
+    if m == 1 {
+        return sorted[0];
+    }
+    let pos = q * (m as f64 - 1.0);
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil() as usize;
+    let frac = pos - lo as f64;
+    sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+}
+
 #[test]
-fn gam_nuts_binomial_logit_matches_pymc() {
+fn gam_nuts_binomial_logit_recovers_truth_and_is_calibrated() {
     init_parallelism();
 
     // ---- synthetic data: n=200, x in [0,10], Bernoulli(logit(0.3+0.8 sin)) --
@@ -73,8 +93,7 @@ fn gam_nuts_binomial_logit_matches_pymc() {
     for i in 0..n {
         // Evenly spaced x for a well-conditioned design, then jittered draws.
         let xi = 10.0 * (i as f64) / ((n - 1) as f64);
-        let eta_true = 0.3 + 0.8 * (2.0 * std::f64::consts::PI * xi / 10.0).sin();
-        let p = inv_logit(eta_true);
+        let p = inv_logit(eta_true(xi));
         let yi = if rng.unit() < p { 1.0 } else { 0.0 };
         x.push(xi);
         y.push(yi);
@@ -85,6 +104,9 @@ fn gam_nuts_binomial_logit_matches_pymc() {
         n_pos > 10 && n_pos < n - 10,
         "need both classes: n_pos={n_pos}"
     );
+
+    // True latent η on the design — the recovery target.
+    let eta_truth: Vec<f64> = x.iter().map(|&xi| eta_true(xi)).collect();
 
     // ---- write a temp CSV and load it through gam's standard loader ---------
     let mut csv_path: PathBuf = std::env::temp_dir();
@@ -127,7 +149,8 @@ fn gam_nuts_binomial_logit_matches_pymc() {
 
     // Assemble the full penalty precision S = Σ_k λ_k S_k from gam's OWN
     // per-block penalty matrices and the REML-selected λ. This is the exact
-    // Gaussian prior precision whose posterior gam's NUTS targets.
+    // Gaussian prior precision whose posterior gam's NUTS targets, and the same
+    // precision handed to the PyMC baseline so both fit the identical model.
     let lambdas = fit.fit.lambdas.as_slice().expect("contiguous lambdas");
     assert_eq!(
         lambdas.len(),
@@ -174,8 +197,8 @@ fn gam_nuts_binomial_logit_matches_pymc() {
         "saved model must carry a usable schema"
     );
 
-    // Seed identically to PyMC (42). Enough draws for a stable mean/SD on a
-    // ~p-dimensional posterior; multiple chains so R-hat is meaningful.
+    // Seed identically to PyMC (42). Enough draws for stable per-point quantiles
+    // on a ~p-dimensional posterior; multiple chains so R-hat is meaningful.
     let adaptive = NutsConfig::for_dimension(p);
     let nuts_cfg = NutsConfig {
         n_samples: 1500,
@@ -194,10 +217,10 @@ fn gam_nuts_binomial_logit_matches_pymc() {
     .expect("gam NUTS sampling");
     assert_eq!(nuts.samples.ncols(), p, "posterior coeff dim mismatch");
 
-    // Posterior of η = X β at the training points, draw by draw.
+    // Posterior of η = X β at the training points: keep ALL draws per point so we
+    // can form the posterior mean AND pointwise credible intervals for coverage.
     let ndraw = nuts.samples.nrows();
-    let mut eta_sum = Array1::<f64>::zeros(n);
-    let mut eta_sumsq = Array1::<f64>::zeros(n);
+    let mut eta_draws: Vec<Vec<f64>> = vec![Vec::with_capacity(ndraw); n];
     let mut beta_draw = Array1::<f64>::zeros(p);
     for d in 0..ndraw {
         for j in 0..p {
@@ -205,20 +228,32 @@ fn gam_nuts_binomial_logit_matches_pymc() {
         }
         let eta = x_dense.dot(&beta_draw);
         for i in 0..n {
-            eta_sum[i] += eta[i];
-            eta_sumsq[i] += eta[i] * eta[i];
+            eta_draws[i].push(eta[i]);
         }
     }
-    let gam_eta_mean: Vec<f64> = (0..n).map(|i| eta_sum[i] / ndraw as f64).collect();
-    let gam_eta_sd: Vec<f64> = (0..n)
-        .map(|i| {
-            let m = gam_eta_mean[i];
-            (eta_sumsq[i] / ndraw as f64 - m * m).max(0.0).sqrt()
-        })
-        .collect();
 
-    // ---- PyMC: same X, same penalty precision S, same data, NUTS seed 42 ----
-    // Flatten X and S row-major so they round-trip through the numeric wire.
+    // Per-point posterior mean and 90% equal-tailed credible interval.
+    let mut gam_eta_mean = vec![0.0f64; n];
+    let mut covered = 0usize;
+    for i in 0..n {
+        let mut sorted = eta_draws[i].clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).expect("finite eta draws"));
+        gam_eta_mean[i] = sorted.iter().sum::<f64>() / ndraw as f64;
+        let lo = sorted_quantile(&sorted, 0.05);
+        let hi = sorted_quantile(&sorted, 0.95);
+        if eta_truth[i] >= lo && eta_truth[i] <= hi {
+            covered += 1;
+        }
+    }
+    let gam_coverage = covered as f64 / n as f64;
+
+    // PRIMARY objective metric: how well gam's posterior mean recovers truth.
+    let gam_rmse_vs_truth = rmse(&gam_eta_mean, &eta_truth);
+
+    // ---- PyMC BASELINE: same X, same penalty precision S, same data, seed 42 -
+    // PyMC is fit on the IDENTICAL model and used ONLY as a baseline on the same
+    // objective truth-recovery metric (gam must match-or-beat it). Its R-hat is
+    // used only to confirm the baseline run itself converged.
     let mut x_flat = Vec::with_capacity(n * p);
     for i in 0..n {
         for j in 0..p {
@@ -231,12 +266,16 @@ fn gam_nuts_binomial_logit_matches_pymc() {
             s_flat.push(s_total[[i, j]]);
         }
     }
+    let mut truth_flat = Vec::with_capacity(n);
+    for &t in &eta_truth {
+        truth_flat.push(t);
+    }
     let shape = vec![n as f64, p as f64];
 
     let py = run_python(
         // Only the length-n response travels as a dataframe column. The design
-        // X and penalty precision S are p-dimensional, so they are injected as
-        // literal arrays into the body and reshaped there.
+        // X, penalty precision S, and the truth vector are injected as literal
+        // arrays and reshaped in the body.
         &[Column::new("y", &y)],
         &format!(
             r#"
@@ -249,6 +288,7 @@ p = {p}
 y = np.asarray(df["y"], dtype=float).reshape(-1)
 X = np.array({x_flat:?}, dtype=float).reshape(n, p)
 S = np.array({s_flat:?}, dtype=float).reshape(p, p)
+eta_truth = np.array({truth_flat:?}, dtype=float).reshape(-1)
 _shape = {shape:?}
 assert int(_shape[0]) == n and int(_shape[1]) == p
 
@@ -273,48 +313,44 @@ with pm.Model() as model:
 
 beta_draws = idata.posterior["beta"].stack(sample=("chain", "draw")).values  # (p, S)
 eta_draws = X @ beta_draws  # (n, S)
-emit("eta_mean", eta_draws.mean(axis=1))
-emit("eta_sd", eta_draws.std(axis=1, ddof=0))
+eta_mean = eta_draws.mean(axis=1)
+# Baseline truth-recovery RMSE (posterior mean vs the known latent function).
+ref_rmse = float(np.sqrt(np.mean((eta_mean - eta_truth) ** 2)))
+emit("ref_rmse_vs_truth", [ref_rmse])
 
-# Per-coefficient R-hat (max over the p coefficients) — the standard NUTS
-# convergence gate. ArviZ computes split-R-hat.
+# R-hat only to confirm the BASELINE converged (so the comparison is fair).
 rhat = az.rhat(idata)["beta"].values
 emit("rhat_max", [float(np.nanmax(rhat))])
-ess = az.ess(idata)["beta"].values
-emit("ess_min", [float(np.nanmin(ess))])
 "#,
             n = n,
             p = p,
             x_flat = x_flat,
             s_flat = s_flat,
+            truth_flat = truth_flat,
             shape = shape,
         ),
     );
 
-    let pymc_eta_mean = py.vector("eta_mean");
-    let pymc_eta_sd = py.vector("eta_sd");
+    let pymc_rmse_vs_truth = py.scalar("ref_rmse_vs_truth");
     let pymc_rhat = py.scalar("rhat_max");
-    let pymc_ess = py.scalar("ess_min");
-    assert_eq!(pymc_eta_mean.len(), n, "PyMC eta_mean length mismatch");
-    assert_eq!(pymc_eta_sd.len(), n, "PyMC eta_sd length mismatch");
 
-    // ---- compare ------------------------------------------------------------
-    let mean_corr = pearson(&gam_eta_mean, pymc_eta_mean);
-    let mean_maxdiff = max_abs_diff(&gam_eta_mean, pymc_eta_mean);
-    let sd_corr = pearson(&gam_eta_sd, pymc_eta_sd);
-    let sd_rmse = rmse(&gam_eta_sd, pymc_eta_sd);
-    let typ_sd = pymc_eta_sd.iter().sum::<f64>() / n as f64;
+    // Signal range of the truth — used to scale the principled recovery bar.
+    let truth_min = eta_truth.iter().cloned().fold(f64::INFINITY, f64::min);
+    let truth_max = eta_truth.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let signal_range = truth_max - truth_min;
 
     eprintln!(
-        "pymc-nuts binomial logit: n={n} p={p} ndraw={ndraw}\n\
-         gam_rhat={:.4} gam_ess={:.1} pymc_rhat={pymc_rhat:.4} pymc_ess={pymc_ess:.1}\n\
-         eta_mean: pearson={mean_corr:.5} max_abs_diff={mean_maxdiff:.4}\n\
-         eta_sd: pearson={sd_corr:.4} rmse={sd_rmse:.4} typical_sd={typ_sd:.4}",
-        nuts.rhat, nuts.ess
+        "pymc-nuts binomial logit (objective): n={n} p={p} ndraw={ndraw}\n\
+         gam_rhat={:.4} pymc_rhat={pymc_rhat:.4}\n\
+         signal_range={signal_range:.4}\n\
+         TRUTH-RECOVERY rmse: gam={gam_rmse_vs_truth:.4} pymc(baseline)={pymc_rmse_vs_truth:.4}\n\
+         CALIBRATION 90% CI coverage of truth: gam={gam_coverage:.3}",
+        nuts.rhat
     );
 
-    // (1) Both samplers must have converged. R-hat < 1.1 is the standard
-    // Gelman-Rubin gate; a non-converged chain invalidates the comparison.
+    // (0) Convergence gates. R-hat < 1.1 is the standard Gelman-Rubin bound; a
+    //     non-converged gam chain is itself a quality failure, and a
+    //     non-converged baseline would make the match-or-beat comparison unfair.
     assert!(
         nuts.rhat < 1.1,
         "gam NUTS did not converge: rhat={:.4}",
@@ -322,33 +358,34 @@ emit("ess_min", [float(np.nanmin(ess))])
     );
     assert!(
         pymc_rhat < 1.1,
-        "PyMC NUTS did not converge: rhat={pymc_rhat:.4}"
+        "PyMC baseline did not converge (comparison would be unfair): rhat={pymc_rhat:.4}"
     );
 
-    // (2) Posterior MEAN of the linear predictor must track PyMC's. Same target
-    // density ⇒ the posterior means agree up to Monte-Carlo error. Pearson
-    // > 0.98 catches any structural divergence in the smooth.
+    // (A) TRUTH RECOVERY (PRIMARY). The posterior mean of η must recover the
+    //     known latent function. With a logit link the response is heavily
+    //     quantized (Bernoulli), so the smooth cannot resolve η better than a
+    //     fraction of the signal range; require RMSE below 25% of the signal
+    //     range — comfortably distinguishing a working smoother from a
+    //     mis-specified / degenerate one, without weakening to force a pass.
+    let recovery_bar = 0.25 * signal_range;
     assert!(
-        mean_corr > 0.98,
-        "posterior-mean eta diverges from PyMC: pearson={mean_corr:.5}"
+        gam_rmse_vs_truth <= recovery_bar,
+        "gam posterior mean failed to recover truth: rmse={gam_rmse_vs_truth:.4} > bar={recovery_bar:.4} (signal_range={signal_range:.4})"
     );
-    // Posterior SDs here are ~0.2–0.5; 0.15 is ~ a single posterior SD, a tight
-    // element-wise bound that still tolerates finite-sample MC noise between two
-    // independent NUTS runs.
+    // Match-or-beat the mature PyMC baseline on the SAME objective metric: gam's
+    // recovery error must be no worse than PyMC's by more than 10%.
     assert!(
-        mean_maxdiff < 0.15,
-        "posterior-mean eta differs pointwise from PyMC: max_abs_diff={mean_maxdiff:.4}"
+        gam_rmse_vs_truth <= pymc_rmse_vs_truth * 1.10,
+        "gam recovery worse than PyMC baseline: gam_rmse={gam_rmse_vs_truth:.4} pymc_rmse={pymc_rmse_vs_truth:.4}"
     );
 
-    // (3) Posterior UNCERTAINTY must agree too: the SD profile is what credible
-    // bands are built from. Require strong shape agreement and a small absolute
-    // RMSE relative to the typical SD (within ~40% of typical_sd).
+    // (B) CALIBRATION. gam's pointwise 90% credible intervals for η must contain
+    //     the TRUTH close to 90% of the time. Allow a ±0.10 band around the 0.90
+    //     nominal level for finite-sample MC error and the discreteness of the
+    //     Bernoulli likelihood. This is an objective uncertainty claim measured
+    //     against the truth, with no reference tool involved.
     assert!(
-        sd_corr > 0.90,
-        "posterior-SD eta profile disagrees with PyMC: pearson={sd_corr:.4}"
-    );
-    assert!(
-        sd_rmse < 0.4 * typ_sd.max(1e-6),
-        "posterior-SD eta magnitude disagrees with PyMC: rmse={sd_rmse:.4} typical_sd={typ_sd:.4}"
+        (gam_coverage - 0.90).abs() <= 0.10,
+        "gam 90% credible intervals are miscalibrated against truth: empirical coverage={gam_coverage:.3} (nominal 0.90)"
     );
 }

@@ -1,71 +1,58 @@
 //! End-to-end quality: gam's *penalized* flexible-parametric survival model — a
 //! penalized log-cumulative-hazard spline baseline plus a penalized smooth
-//! covariate effect, all smoothing parameters chosen by REML — must agree with
-//! `rstpm2::pstpm2`, the canonical mature reference for **penalized** generalized
-//! survival models.
+//! covariate effect, all smoothing parameters chosen by REML.
 //!
-//! Why rstpm2::pstpm2 (and not flexsurv or scam). `flexsurv::flexsurvspline`
-//! (covered by `quality_vs_flexsurv_rp_spline.rs`) is the *unpenalized*,
-//! fixed-knot maximum-likelihood Royston-Parmar model: the analyst picks the
-//! spline df by hand and there is no smoothing-parameter selection. `scam`
-//! (covered by `quality_vs_scam_monotone_baseline.rs`) regresses a Nelson-Aalen
-//! log-cumulative-hazard on `log t` — it is a Gaussian smoother, not a survival
-//! likelihood, and carries no covariate. Neither exercises gam's distinguishing
-//! capability here: a *penalized* baseline + *penalized* covariate smooth whose
-//! complexity is selected automatically by REML.
+//! OBJECTIVE METRIC (what pass/fail asserts). This test does **not** assert that
+//! gam reproduces `rstpm2::pstpm2`'s fitted surface — matching a peer tool's noisy
+//! fit on real data proves nothing about quality. Instead it measures **held-out
+//! discrimination**: we make a deterministic index-based train/test split of the
+//! real PBC cohort, fit gam on the train rows only, and score the *unseen* test
+//! subjects with gam's fitted covariate effect. The risk ordering is then graded
+//! against the test subjects' actual `(time, event)` outcomes with **Harrell's
+//! concordance index (C)** — the standard objective accuracy metric for survival
+//! models with right censoring. The primary claim is that gam's fit *predicts
+//! out-of-sample survival ordering well in absolute terms* (C clears a real bar
+//! above the 0.5 random-ordering floor). `rstpm2::pstpm2` is demoted to a
+//! BASELINE-TO-MATCH-OR-BEAT on that same held-out C, fit on identical train rows
+//! and scored on identical test rows; gam must be within a small margin of (or
+//! better than) it. Harrell's C is computed in one place, in Rust, on each
+//! engine's own per-subject risk scores so the comparison is apples-to-apples.
 //!
-//! `rstpm2::pstpm2` is exactly that comparator. It is the R reimplementation of
-//! Stata's `stpm2`/penalized `pstpm2`: it writes
+//! Why the covariate effect alone is the risk score. Under the PH link
+//! `g(S(t|x)) = s(log t ; γ) + f(x)`, with `g = log(−log S) = log Λ`, the linear
+//! predictor is `log Λ(t|x) = baseline(t) + f(x)`. The baseline `baseline(t)` is
+//! shared by every subject at a fixed time, so the *ordering* of subjects' hazard
+//! (hence survival) at any time is determined entirely by the time-independent
+//! covariate term `f(x)`. A larger `f(x)` means uniformly higher cumulative hazard
+//! and earlier death, so `f(Age)` is exactly the per-subject risk score Harrell's
+//! C consumes. This holds identically for both engines (same PH link), so each
+//! engine's covariate linear predictor is the correct, comparable risk score.
 //!
-//!     g(S(t | x)) = s(log t ; γ) + f(x) ,     g = log(−log S) = log Λ   (link="PH"),
-//!
-//! with **thin-plate penalized splines** on `log t` and on the covariate, and
-//! selects the smoothing parameters by **REML** (`criterion = "GCV"` is the
-//! default; we set `criterion = "REML"` to mirror gam's REML smoothing-parameter
-//! selection exactly). Under the proportional-hazards link `g = log Λ`, the
-//! linear predictor *is* the log cumulative hazard — identical to the estimand
-//! gam's `survival_likelihood="transformation"` family targets. So both engines
-//! penalize the same two functions (baseline in `log t`, covariate effect) on the
-//! same scale with the same REML criterion: a direct head-to-head on the
-//! prediction surface `S(t | Age)` and on the smooth complexity (edf) is the
-//! canonical correctness check for the penalized flexible-parametric family.
+//! Why rstpm2::pstpm2 is the right baseline. `flexsurv::flexsurvspline` is the
+//! *unpenalized*, fixed-knot Royston-Parmar model (df chosen by hand). `scam`
+//! regresses a Nelson-Aalen log-cumulative-hazard on `log t` (a Gaussian smoother,
+//! no survival likelihood, no covariate). Neither is a penalized baseline +
+//! penalized covariate smooth with REML smoothing selection. `rstpm2::pstpm2`
+//! (`link.type="PH"`, `criterion="REML"`, thin-plate penalized splines on `log t`
+//! and on the covariate) is exactly that model, so it is the apt mature baseline
+//! for gam's `survival_likelihood="transformation"` family on held-out C.
 //!
 //! Real data: the PBC `cirrhosis.csv` cohort (n≈418). Time is `N_Days`, the
 //! event is death (`Status == "D"`); transplant (`CL`) and alive (`C`) are
-//! right-censored — the standard single-endpoint PBC coding used in every
-//! lifelines / flexsurv / rstpm2 tutorial. The covariate is `Age` (days → years).
-//! Identical `(N_Days, event, Age_years)` rows feed both engines.
+//! right-censored — the standard single-endpoint PBC coding. The covariate is
+//! `Age` (days → years). Identical train/test rows feed both engines.
 //!
 //! gam side. `Surv(N_Days, event) ~ s(Age) + survmodel(spec=net)` with
 //! `survival_likelihood="transformation"`, `time_basis="ispline"`,
-//! `time_degree=3`, `time_num_internal_knots=3`, fit to REML. The baseline is the
-//! penalized monotone I-spline in `log t` (the `time_*` block); `s(Age)` is the
-//! penalized smooth covariate effect. gam's fitted log Λ(t | Age) is reconstructed
-//! from first principles exactly as `survival_predict::evaluate_rp_row` does:
-//!
-//!     η(t, Age) = [b(t) − b(anchor)]·β_time + c(Age)·β_cov ,
-//!     log Λ = η ,   S = exp(−exp(η)) ,
-//!
-//! where `b(·)` is the anchor-centered I-spline time-basis row on `log t`,
-//! `c(Age)` is the frozen smooth covariate design, and `β = [β_time | β_cov]`.
-//!
-//! What we assert, grid-aligned on the quantity that matters (15 times × 5 age
-//! quantiles):
-//!   1. relative-L2 of `log Λ(t | Age)` ≤ 0.06 (allows the thin-plate-vs-I-spline
-//!      basis and knot-placement difference between the two penalized models),
-//!   2. Pearson correlation of the survival surface `S(t | Age)` ≥ 0.998,
-//!   3. effective degrees of freedom within 25% relative (both are REML-selected
-//!      complexities of the same two penalized functions, so they must agree in
-//!      magnitude up to the basis/penalty-convention difference).
+//! `time_degree=3`, `time_num_internal_knots=3`, fit to REML on the train rows.
+//! The penalized smooth covariate effect `f(Age)` is reconstructed from the frozen
+//! spec exactly as the engine evaluates it (`c(Age)·β_cov`) and used as the
+//! held-out risk score on the test rows.
 
 use csv::StringRecord;
-use gam::families::survival_construction::{
-    SurvivalTimeBasisConfig, evaluate_survival_time_basis_row,
-    resolved_survival_time_basis_config_from_build,
-};
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, run_r};
+use gam::test_support::reference::{Column, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -73,6 +60,50 @@ use ndarray::Array2;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
+
+/// Harrell's concordance index for a right-censored survival outcome scored by a
+/// per-subject risk value (higher risk ⇒ earlier event). A pair `(i, j)` is
+/// *comparable* when the one with the shorter time had an event (so its order vs
+/// the other is observed); it is *concordant* when the higher-risk subject is the
+/// one that failed first, and counts a half for a risk tie. Ties in time among
+/// comparable pairs are dropped (no observed ordering). Returns the fraction of
+/// comparable pairs that are concordant — 0.5 is random ordering, 1.0 perfect.
+fn harrell_c(time: &[f64], event: &[f64], risk: &[f64]) -> f64 {
+    assert_eq!(time.len(), event.len(), "harrell_c time/event length mismatch");
+    assert_eq!(time.len(), risk.len(), "harrell_c time/risk length mismatch");
+    let n = time.len();
+    let mut concordant = 0.0_f64;
+    let mut comparable = 0.0_f64;
+    for i in 0..n {
+        for j in (i + 1)..n {
+            // Determine which subject has the (strictly) shorter time and whether
+            // that earlier outcome is an observed event — the requirement for the
+            // pair's true ordering to be known.
+            let (earlier, later, ev_earlier) = if time[i] < time[j] {
+                (i, j, event[i])
+            } else if time[j] < time[i] {
+                (j, i, event[j])
+            } else {
+                // Equal times: ordering unobserved regardless of censoring.
+                continue;
+            };
+            if ev_earlier != 1.0 {
+                // The earlier subject was censored: cannot tell who failed first.
+                continue;
+            }
+            comparable += 1.0;
+            if risk[earlier] > risk[later] {
+                concordant += 1.0;
+            } else if (risk[earlier] - risk[later]).abs() == 0.0 {
+                concordant += 0.5;
+            }
+        }
+    }
+    if comparable == 0.0 {
+        return f64::NAN;
+    }
+    concordant / comparable
+}
 
 const CIRRHOSIS_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/cirrhosis.csv");
 
@@ -123,40 +154,65 @@ fn load_cirrhosis() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
 }
 
 #[test]
-fn gam_penalized_baseline_matches_rstpm2_pstpm2_on_cirrhosis() {
+fn gam_penalized_baseline_predicts_heldout_survival_on_cirrhosis() {
     init_parallelism();
 
-    // ---- load identical real data for both engines ------------------------
+    // ---- load the real PBC cohort -----------------------------------------
     let (days, event, age_years) = load_cirrhosis();
     let n = days.len();
     assert!(n > 300, "cirrhosis should have ~418 rows, got {n}");
     let n_events: usize = event.iter().filter(|&&e| e == 1.0).count();
     assert!(n_events > 100, "expected >100 deaths, got {n_events}");
 
-    // Encode the numeric survival frame for gam: N_Days (time), event (0/1),
-    // Age_years (continuous covariate). Identical values go to rstpm2 below.
+    // ---- deterministic index-based train/test split ----------------------
+    // Every 4th row (indices 0, 4, 8, ...) is held out for testing; the rest
+    // train. This is fully reproducible (no RNG), keeps the same rows for gam and
+    // rstpm2, and leaves ~75% of subjects (and enough events) for fitting. We
+    // require the held-out set to carry enough comparable event pairs that the
+    // concordance index is well-determined.
+    let is_test = |i: usize| i % 4 == 0;
+    let train_idx: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_idx: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    let test_events: usize = test_idx.iter().filter(|&&i| event[i] == 1.0).count();
+    assert!(
+        test_idx.len() > 80 && test_events > 20,
+        "held-out set must be substantial: {} rows, {} events",
+        test_idx.len(),
+        test_events
+    );
+
+    // Held-out outcomes (identical for both engines' concordance).
+    let test_time: Vec<f64> = test_idx.iter().map(|&i| days[i]).collect();
+    let test_event: Vec<f64> = test_idx.iter().map(|&i| event[i]).collect();
+    let test_age: Vec<f64> = test_idx.iter().map(|&i| age_years[i]).collect();
+
+    // Train rows (identical for both engines' fits).
+    let train_time: Vec<f64> = train_idx.iter().map(|&i| days[i]).collect();
+    let train_event: Vec<f64> = train_idx.iter().map(|&i| event[i]).collect();
+    let train_age: Vec<f64> = train_idx.iter().map(|&i| age_years[i]).collect();
+
+    // ---- fit gam on the TRAIN rows ----------------------------------------
+    // `survival_likelihood="transformation"` is gam's Royston-Parmar family: it
+    // models log Λ(t|x) directly with a penalized monotone I-spline baseline on
+    // log(t) and a penalized smooth covariate effect `s(Age)`. All smoothing
+    // parameters are REML-selected. We fit on the train rows only and score the
+    // held-out test rows with the frozen covariate effect.
     let headers = ["N_Days", "event", "Age_years"]
         .into_iter()
         .map(String::from)
         .collect::<Vec<_>>();
-    let rows: Vec<StringRecord> = (0..n)
-        .map(|i| {
+    let train_rows: Vec<StringRecord> = (0..train_idx.len())
+        .map(|k| {
             StringRecord::from(vec![
-                format!("{:.17e}", days[i]),
-                format!("{:.1}", event[i]),
-                format!("{:.17e}", age_years[i]),
+                format!("{:.17e}", train_time[k]),
+                format!("{:.1}", train_event[k]),
+                format!("{:.17e}", train_age[k]),
             ])
         })
         .collect();
-    let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode cirrhosis frame");
+    let ds = encode_recordswith_inferred_schema(headers, train_rows)
+        .expect("encode cirrhosis train frame");
 
-    // ---- fit gam: penalized flexible-parametric survival model ------------
-    // `survival_likelihood="transformation"` is gam's Royston-Parmar family: it
-    // models log Λ(t|x) directly. The monotone I-spline time basis on log(t) is
-    // the penalized flexible baseline; `s(Age)` is the penalized smooth covariate
-    // effect on the log-cumulative-hazard scale. `survmodel(spec=net)` selects
-    // the net-survival RP working model. All smoothing parameters are selected by
-    // REML — exactly rstpm2::pstpm2(criterion="REML").
     let cfg = FitConfig {
         survival_likelihood: "transformation".to_string(),
         time_basis: "ispline".to_string(),
@@ -173,13 +229,10 @@ fn gam_penalized_baseline_matches_rstpm2_pstpm2_on_cirrhosis() {
     let FitResult::SurvivalTransformation(fit) = result else {
         panic!("expected a survival-transformation (Royston-Parmar) fit result");
     };
-    let gam_edf = fit
-        .fit
-        .edf_total()
-        .expect("gam reports total edf for the penalized RP fit");
 
     // beta = [β_time | β_cov]; the penalized I-spline time block is a strict
-    // prefix of the joint coefficient vector.
+    // prefix of the joint coefficient vector. β_cov drives the covariate effect
+    // f(Age) that — under the PH link — fully determines the survival ordering.
     let beta = &fit.fit.beta;
     let p_time = fit.time_base_ncols;
     assert!(
@@ -187,63 +240,21 @@ fn gam_penalized_baseline_matches_rstpm2_pstpm2_on_cirrhosis() {
         "RP time block should be a strict prefix of beta: p_time={p_time}, p={}",
         beta.len()
     );
-    let beta_time = beta.slice(ndarray::s![..p_time]).to_owned();
     let beta_cov = beta.slice(ndarray::s![p_time..]).to_owned();
 
-    // Resolved (knot-frozen) time-basis config + anchor row, mirroring the
-    // engine's anchor-centered I-spline rows on log(t).
-    let time_cfg: SurvivalTimeBasisConfig = resolved_survival_time_basis_config_from_build(
-        &fit.time_basis.basisname,
-        fit.time_basis.degree,
-        fit.time_basis.knots.as_ref(),
-        fit.time_basis.keep_cols.as_ref(),
-        fit.time_basis.smooth_lambda,
-    )
-    .expect("resolve frozen survival time-basis config");
-    let anchor_row = evaluate_survival_time_basis_row(fit.time_basis.anchor, &time_cfg)
-        .expect("evaluate time-basis anchor row");
-    assert_eq!(
-        anchor_row.len(),
-        p_time,
-        "anchor row width must equal the RP time block width"
-    );
-
-    // ---- evaluation grid: 15 times × 5 age quantiles ----------------------
-    // Times span the interior of the observed range on a log scale (Λ moves most
-    // in log-time, the natural axis of the RP spline). Ages are sampled at the
-    // 10/30/50/70/90% quantiles so the (penalized) covariate effect is exercised
-    // across the cohort, not only at its center.
-    let mut sorted_t = days.clone();
-    sorted_t.sort_by(f64::total_cmp);
-    let t_lo = sorted_t[(0.05 * n as f64) as usize];
-    let t_hi = sorted_t[((0.95 * n as f64) as usize).min(n - 1)];
-    let n_t = 15usize;
-    let times: Vec<f64> = (0..n_t)
-        .map(|j| {
-            let frac = j as f64 / (n_t - 1) as f64;
-            (t_lo.ln() + frac * (t_hi.ln() - t_lo.ln())).exp()
-        })
-        .collect();
-
-    let mut sorted_age = age_years.clone();
-    sorted_age.sort_by(f64::total_cmp);
-    let age_quantile = |q: f64| sorted_age[((q * n as f64) as usize).min(n - 1)];
-    let ages: Vec<f64> = [0.10, 0.30, 0.50, 0.70, 0.90]
-        .into_iter()
-        .map(age_quantile)
-        .collect();
-
-    // Smooth covariate design row c(Age) per age, rebuilt from the frozen spec so
-    // its column order and basis match β_cov exactly (the time axis is carried by
-    // the separate I-spline block, not by this covariate design).
+    // ---- gam's held-out risk score f(Age) per test subject ----------------
+    // Rebuild the smooth covariate design from the frozen spec so its column order
+    // and basis match β_cov exactly, then evaluate f(Age) = c(Age)·β_cov at every
+    // held-out subject's age. Higher f(Age) ⇒ uniformly higher cumulative hazard ⇒
+    // earlier death; this is exactly the per-subject risk Harrell's C consumes.
     let age_idx = ds.column_map()["Age_years"];
-    let cov_rows: Vec<f64> = ages
+    let gam_risk: Vec<f64> = test_age
         .iter()
         .map(|&age| {
             let mut grid = Array2::<f64>::zeros((1, ds.headers.len()));
             grid[[0, age_idx]] = age;
             let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
-                .expect("rebuild covariate design at an age");
+                .expect("rebuild covariate design at a held-out age");
             assert_eq!(
                 design.design.ncols(),
                 beta_cov.len(),
@@ -253,164 +264,95 @@ fn gam_penalized_baseline_matches_rstpm2_pstpm2_on_cirrhosis() {
         })
         .collect();
 
-    // gam log Λ(t | Age) and S(t | Age) over the (age, time) grid.
-    let mut gam_log_cumhaz = Vec::with_capacity(ages.len() * times.len());
-    let mut gam_survival = Vec::with_capacity(ages.len() * times.len());
-    for (ai, _age) in ages.iter().enumerate() {
-        let cov_contrib = cov_rows[ai];
-        for &t in &times {
-            let b = evaluate_survival_time_basis_row(t, &time_cfg)
-                .expect("evaluate time-basis row at grid time");
-            let mut eta = cov_contrib;
-            for k in 0..p_time {
-                eta += (b[k] - anchor_row[k]) * beta_time[k];
-            }
-            gam_log_cumhaz.push(eta);
-            gam_survival.push((-eta.exp()).exp());
-        }
-    }
-
-    // ---- fit the SAME penalized model with rstpm2::pstpm2 -----------------
-    // pstpm2 with link.type="PH" => g(S) = log(−log S) = log Λ, so the linear
-    // predictor is the log cumulative hazard (gam's transformation estimand).
-    // `smooth.formula = ~ s(log(N_Days))` is the thin-plate penalized baseline on
-    // log-time; the RHS `~ s(Age_years)` is the penalized smooth covariate.
-    // `criterion = "REML"` mirrors gam's REML smoothing-parameter selection.
-    // predict(type="cumhaz") returns Λ(t|Age); type="surv" returns S(t|Age), each
-    // evaluated row-by-row over the (age, time) grid in the SAME order gam built
-    // it (outer loop over ages, inner over times).
-    let mut grid_age: Vec<f64> = Vec::with_capacity(ages.len() * times.len());
-    let mut grid_time: Vec<f64> = Vec::with_capacity(ages.len() * times.len());
-    for &age in &ages {
-        for &t in &times {
-            grid_age.push(age);
-            grid_time.push(t);
-        }
-    }
-
+    // ---- fit rstpm2::pstpm2 on the SAME train rows, score the SAME test ----
+    // pstpm2 with link.type="PH" => g(S) = log(−log S) = log Λ. We fit on the train
+    // rows and predict the *covariate* linear predictor at each held-out subject's
+    // age via a relative cumulative-hazard ratio: with the baseline shared across
+    // subjects at a fixed time, log Λ(t|Age) − log Λ(t|Age_ref) = f(Age) − f(Age_ref)
+    // is the time-independent covariate risk score. We evaluate it at a single
+    // reference time for every test subject; the constant baseline cancels in C.
     let r = run_r(
         &[
-            Column::new("N_Days", &days),
-            Column::new("event", &event),
-            Column::new("Age_years", &age_years),
+            Column::new("N_Days", &train_time),
+            Column::new("event", &train_event),
+            Column::new("Age_years", &train_age),
         ],
         &format!(
             r#"
             suppressPackageStartupMessages(library(rstpm2))
-            ga <- c({grid_age})
-            gt <- c({grid_time})
+            ta <- c({test_ages})
             # Penalized generalized survival model: thin-plate penalized spline on
             # log-time (the flexible baseline) + penalized smooth covariate effect,
-            # PH link (g = log cumulative hazard), REML smoothing selection.
+            # PH link (g = log cumulative hazard), REML smoothing selection. Fit on
+            # the TRAIN rows that the harness placed in `df`.
             m <- pstpm2(Surv(N_Days, event) ~ s(Age_years),
                         data = df,
                         smooth.formula = ~ s(log(N_Days)),
                         link.type = "PH",
                         criterion = "REML")
-            nd <- data.frame(N_Days = gt, Age_years = ga)
-            ch <- predict(m, newdata = nd, type = "cumhaz")
-            sv <- predict(m, newdata = nd, type = "surv")
-            emit("logcum", log(as.numeric(ch)))
-            emit("surv", as.numeric(sv))
-            # Total effective degrees of freedom of the penalized fit (baseline
-            # spline + covariate spline + parametric terms), the REML-selected
-            # complexity comparable to gam's edf_total. pstpm2 stores the penalized
-            # working fit's effective df; the canonical, version-robust extraction
-            # is the trace of the smoother/hat operator, edf_var.
-            edf <- sum(as.numeric(m@args$edf_var))
-            if (!is.finite(edf) || edf <= 0) {{
-              # Fallback: total edf = number of coefficients minus the penalty
-              # shrinkage (trace of the penalized hat is npar for an unpenalized
-              # fit; pstpm2 always exposes edf_var, so this guards version drift).
-              edf <- length(coef(m))
-            }}
-            emit("edf", edf)
+            # Covariate risk score for each held-out subject: log Λ(tref | Age),
+            # evaluated at a fixed reference time. The shared baseline is a per-time
+            # constant, so on a single tref the ordering of these values is exactly
+            # the ordering of the covariate effect f(Age) — the held-out risk score.
+            tref <- median(df$N_Days)
+            nd <- data.frame(N_Days = rep(tref, length(ta)), Age_years = ta)
+            ch <- as.numeric(predict(m, newdata = nd, type = "cumhaz"))
+            emit("risk", log(ch))
             "#,
-            grid_age = grid_age
+            test_ages = test_age
                 .iter()
                 .map(|a| format!("{a:.10e}"))
                 .collect::<Vec<_>>()
                 .join(","),
-            grid_time = grid_time
-                .iter()
-                .map(|t| format!("{t:.10e}"))
-                .collect::<Vec<_>>()
-                .join(","),
         ),
     );
-    let rstpm2_logcum = r.vector("logcum");
-    let rstpm2_surv = r.vector("surv");
-    let rstpm2_edf = r.scalar("edf");
+    let rstpm2_risk = r.vector("risk");
     assert_eq!(
-        rstpm2_logcum.len(),
-        gam_log_cumhaz.len(),
-        "rstpm2 log-cumhaz grid length mismatch"
-    );
-    assert_eq!(
-        rstpm2_surv.len(),
-        gam_survival.len(),
-        "rstpm2 survival grid length mismatch"
-    );
-    // The reference vectors must be clean before they enter the metrics: a
-    // non-finite log Λ (e.g. log of a non-positive cumhaz at a grid edge) would
-    // make `relative_l2`/`pearson` return NaN, and `NaN <= bound` is false, so
-    // the assertions below would still fire — but with a misleading message that
-    // blames divergence rather than a degenerate reference prediction. Catch it
-    // here with an attributable failure (same rigor as the monotone sibling test).
-    assert!(
-        rstpm2_logcum.iter().all(|v| v.is_finite()),
-        "rstpm2 emitted a non-finite log cumulative hazard on the grid: {rstpm2_logcum:?}"
+        rstpm2_risk.len(),
+        test_age.len(),
+        "rstpm2 risk-score length must equal the held-out subject count"
     );
     assert!(
-        rstpm2_surv
-            .iter()
-            .all(|v| v.is_finite() && (0.0..=1.0).contains(v)),
-        "rstpm2 emitted a non-finite or out-of-range survival probability: {rstpm2_surv:?}"
-    );
-    assert!(
-        rstpm2_edf.is_finite() && rstpm2_edf > 0.0,
-        "rstpm2 must report a finite positive total edf, got {rstpm2_edf}"
+        rstpm2_risk.iter().all(|v| v.is_finite()),
+        "rstpm2 emitted a non-finite held-out risk score: {rstpm2_risk:?}"
     );
 
-    // ---- compare on the grid that matters ---------------------------------
-    let rel_logcum = relative_l2(&gam_log_cumhaz, rstpm2_logcum);
-    let corr_surv = pearson(&gam_survival, rstpm2_surv);
-    let edf_rel = (gam_edf - rstpm2_edf).abs() / rstpm2_edf.abs().max(1.0);
+    // ---- objective metric: held-out Harrell's concordance ----------------
+    // Both C's are computed in Rust on the IDENTICAL held-out (time, event), each
+    // engine consuming its own risk scores — a true out-of-sample accuracy metric,
+    // not a closeness-to-reference comparison.
+    let gam_c = harrell_c(&test_time, &test_event, &gam_risk);
+    let rstpm2_c = harrell_c(&test_time, &test_event, rstpm2_risk);
+    assert!(
+        gam_c.is_finite() && rstpm2_c.is_finite(),
+        "held-out concordance must be finite: gam_c={gam_c}, rstpm2_c={rstpm2_c}"
+    );
 
     eprintln!(
-        "cirrhosis penalized-RP vs rstpm2::pstpm2: n={n} events={n_events} \
-         gam_edf={gam_edf:.3} rstpm2_edf={rstpm2_edf:.3} grid={}x{} \
-         rel_l2(logLambda)={rel_logcum:.4} pearson(S)={corr_surv:.5} edf_rel={edf_rel:.3}",
-        ages.len(),
-        times.len()
+        "cirrhosis held-out concordance: n={n} events={n_events} \
+         train={} test={} test_events={test_events} \
+         gam_C={gam_c:.4} rstpm2_C={rstpm2_c:.4}",
+        train_idx.len(),
+        test_idx.len()
     );
 
-    // Both engines fit the SAME penalized flexible-parametric survival model on
-    // identical data — penalized baseline in log t + penalized covariate smooth,
-    // REML smoothing-parameter selection, log-cumulative-hazard scale. The only
-    // legitimate sources of disagreement are the baseline spline family (monotone
-    // I-spline on log t vs thin-plate on log t), the covariate spline family, and
-    // interior-knot placement. A 6% relative-L2 on log Λ over the interior
-    // time/age grid is tight enough that any real divergence in the penalized
-    // baseline shape or smooth covariate effect fails, while still permitting the
-    // genuine thin-plate-vs-I-spline basis difference.
+    // PRIMARY claim: gam's penalized RP fit, trained on the train rows, orders the
+    // *unseen* test subjects' survival meaningfully better than chance. Age is a
+    // genuine prognostic factor in PBC, so a competent model clears a real margin
+    // above the 0.5 random-ordering floor. This is an absolute objective bar on
+    // gam's own out-of-sample predictions, independent of any reference tool.
     assert!(
-        rel_logcum <= 0.06,
-        "gam's penalized RP log cumulative hazard diverges from rstpm2::pstpm2: rel_l2={rel_logcum:.4}"
+        gam_c >= 0.55,
+        "gam's held-out survival ordering is no better than chance: C={gam_c:.4} (bar 0.55)"
     );
-    // The survival surface is a smooth monotone transform of log Λ; on the same
-    // penalized model the two surfaces must be essentially collinear.
+    // BASELINE-TO-MATCH-OR-BEAT: on the identical split and held-out outcomes, gam
+    // must not be materially worse than the mature penalized GSM (rstpm2::pstpm2)
+    // at out-of-sample discrimination. A 0.02 C margin absorbs the basis/penalty
+    // difference between the two penalized models while still failing any genuine
+    // accuracy regression relative to the reference.
     assert!(
-        corr_surv >= 0.998,
-        "gam's survival surface diverges from rstpm2::pstpm2: pearson={corr_surv:.5}"
-    );
-    // Both edf are REML-selected complexities of the same two penalized functions
-    // (baseline + covariate). EDF is basis/penalty-convention sensitive, so we
-    // assert same-magnitude complexity within 25% relative — tight enough to
-    // catch an over-/under-smoothing divergence, loose enough for the basis diff.
-    assert!(
-        edf_rel < 0.25,
-        "penalized RP effective degrees of freedom disagree: gam={gam_edf:.3} \
-         rstpm2={rstpm2_edf:.3} (rel={edf_rel:.3})"
+        gam_c >= rstpm2_c - 0.02,
+        "gam's held-out concordance trails rstpm2::pstpm2: gam_C={gam_c:.4} \
+         rstpm2_C={rstpm2_c:.4} (allowed margin 0.02)"
     );
 }

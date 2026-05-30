@@ -1,10 +1,25 @@
 //! End-to-end quality: gam's *survival* location-scale family (a smooth
 //! location AND a smooth log-scale, with a flexible monotone time baseline and
-//! a Gaussian residual) must recover the same two x-dependent surfaces that
-//! `gamlss` — the de-facto standard R package for distributional /
-//! location-scale regression — recovers on the *identical* right-censored data.
+//! a Gaussian residual) must RECOVER THE TRUE two x-dependent surfaces baked
+//! into the synthetic right-censored data — not merely reproduce whatever
+//! `gamlss` happens to fit.
 //!
-//! Why gamlss (family = NO) is the right reference. gam's survival
+//! OBJECTIVE METRIC ASSERTED (truth recovery). The data is generated from a
+//! known recipe, so both x-dependent channels have a closed-form truth (in the
+//! gauge-free, mean-centered space that the unknown time-axis baseline leaves
+//! invariant):
+//!   * LOCATION truth: the AFT location tracks the Weibull log-scale, whose
+//!     x-dependent part is `0.3 * sin(2*pi*x)`. Centered over the grid this is
+//!     the location signal gam must recover.
+//!   * LOG-SCALE truth: the residual spread is multiplied by
+//!     `scale_envelope(x) = 1 + 0.4*cos(2*pi*x)`, so the x-dependent part of the
+//!     log-sigma channel is `log(1 + 0.4*cos(2*pi*x))`, centered over the grid.
+//! The PRIMARY claim is `RMSE(gam_centered_fit, centered_truth)` is below a
+//! principled bar on each channel. gamlss is DEMOTED to a baseline-to-beat:
+//! gam's truth-recovery error must be no worse than gamlss's error * 1.10 on the
+//! SAME truth (match-or-beat on accuracy), never "gam reproduces gamlss".
+//!
+//! Why gamlss (family = NO) is the right baseline. gam's survival
 //! location-scale model with a Gaussian residual is, structurally, an
 //! accelerated-failure-time (AFT) model: reading the predictor assembly in
 //! `families::survival_location_scale` (see `survival_location_scale_response_
@@ -18,27 +33,24 @@
 //! AFT on the `h(t)`-warped clock. gamlss with `family = NO()` fits the
 //! analogous normal AFT on `log(t)` with a smooth mean `mu(x)` and a smooth
 //! `log sigma(x)`; right-censoring is handled with `gamlss.cens` (`gen.cens(NO,
-//! type = "right")` → family `NOrc`, response `Surv(log t, event)`).
+//! type = "right")` → family `NOrc`, response `Surv(log t, event)`). It is the
+//! mature distributional-regression standard, so it is the natural yardstick for
+//! "is gam at least as accurate as the field's best tool?"
 //!
 //! The cross-feature combination this pins down (which single-channel survival
 //! tests never exercise): survival x smooth-covariate-in-location x
 //! smooth-covariate-in-scale, fit jointly. The data has *strong x-dependence in
 //! both channels* (the Weibull scale, hence the AFT location, moves with
-//! sin(2*pi*x); we also induce a smooth scale signal). We feed the byte-identical
-//! (x, exit, event) rows to both engines and compare the recovered smooth shapes
-//! on a 20-point x-grid.
+//! sin(2*pi*x); a cos(2*pi*x) envelope drives the dispersion). We feed the
+//! byte-identical (x, exit, event) rows to both engines and compare each one's
+//! recovered smooth, on a 20-point x-grid, against the KNOWN generating signal.
 //!
-//! What is and is NOT directly comparable. gam learns the time transform `h(t)`
-//! flexibly while gamlss fixes it at `log(t)`; the two baselines therefore
-//! differ by an unknown smooth (approximately affine over the bulk) reparametri-
-//! zation of the time axis. The *shape* of the x-dependence — how the location
-//! and the log-scale move with x — is the engine-agnostic invariant, so we
-//! compare the mean-centered location surface and the mean-centered log-scale
-//! surface (the baseline-induced additive offset removed) by relative L2 and by
-//! Pearson correlation. This is the honest quantity: it measures whether gam's
-//! two-channel smooth recovery and its `noise_formula` (log-scale) smoothing
-//! converge to the same functional dependence gamlss finds, without pretending
-//! the two engines share a time-axis gauge they do not.
+//! Gauge handling. gam learns the time transform `h(t)` flexibly while gamlss
+//! fixes it at `log(t)`; the two baselines differ by an additive offset per
+//! channel. The closed-form truth is itself only identified up to that additive
+//! offset, so we mean-center fit, baseline, and truth on the grid before scoring
+//! — the comparison is then a clean accuracy test against the generating signal,
+//! not a shared-gauge artifact.
 //!
 //! gam-side specifics verified against the source:
 //!   * The in-Rust survival location-scale path is selected by
@@ -57,7 +69,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, run_r};
+use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -233,86 +245,91 @@ fn gam_gaussian_survival_location_scale_matches_gamlss() {
     );
     let gamlss_log_sigma: Vec<f64> = gamlss_sigma.iter().map(|&s| s.ln()).collect();
 
-    // ---- compare the recovered x-dependence (gauge-free: mean-centered) ----
-    // gam learns the time transform h(t); gamlss fixes it at log(t). The two
-    // baselines differ by an additive offset on each channel, so center both
-    // surfaces before comparing the x-dependent shape.
+    // ---- KNOWN generating truth on the grid (gauge-free: mean-centered) ----
+    // The recipe fixes both x-dependent surfaces in closed form:
+    //   * AFT location  <- Weibull log-scale x-part:        0.3*sin(2*pi*x)
+    //   * AFT log-sigma <- dispersion envelope x-part:  log(1 + 0.4*cos(2*pi*x))
+    // gam's flexible h(t) and gamlss's fixed log(t) each add an unknown per-
+    // channel offset, and the truth itself is only identified up to that offset,
+    // so we mean-center everything on the grid before scoring against the truth.
     let center = |v: &[f64]| -> Vec<f64> {
         let m = v.iter().sum::<f64>() / v.len() as f64;
         v.iter().map(|&z| z - m).collect()
     };
+    let truth_location: Vec<f64> = grid_x.iter().map(|&xi| 0.3 * (two_pi * xi).sin()).collect();
+    let truth_log_sigma: Vec<f64> = grid_x
+        .iter()
+        .map(|&xi| (1.0 + 0.4 * (two_pi * xi).cos()).ln())
+        .collect();
+
     let gam_loc_c = center(&gam_location);
     let gam_lsig_c = center(&gam_log_sigma);
     let ref_loc_c = center(gamlss_mu);
     let ref_lsig_c = center(&gamlss_log_sigma);
+    let truth_loc_c = center(&truth_location);
+    let truth_lsig_c = center(&truth_log_sigma);
 
-    let rel_loc = relative_l2(&gam_loc_c, &ref_loc_c);
-    let rel_lsig = relative_l2(&gam_lsig_c, &ref_lsig_c);
-    let corr_loc = pearson(&gam_loc_c, &ref_loc_c);
-    let corr_lsig = pearson(&gam_lsig_c, &ref_lsig_c);
+    // Truth-recovery error (PRIMARY metric) for gam and for the gamlss baseline.
+    let gam_err_loc = rmse(&gam_loc_c, &truth_loc_c);
+    let gam_err_lsig = rmse(&gam_lsig_c, &truth_lsig_c);
+    let ref_err_loc = rmse(&ref_loc_c, &truth_loc_c);
+    let ref_err_lsig = rmse(&ref_lsig_c, &truth_lsig_c);
+
+    // Context only (NOT a pass criterion): how close gam sits to the gamlss fit.
+    let rel_loc_vs_ref = relative_l2(&gam_loc_c, &ref_loc_c);
+    let rel_lsig_vs_ref = relative_l2(&gam_lsig_c, &ref_lsig_c);
 
     eprintln!(
-        "survival location-scale vs gamlss NOrc: n={n} grid={grid_n} \
-         rel_l2(loc)={rel_loc:.4} rel_l2(log sigma)={rel_lsig:.4} \
-         pearson(loc)={corr_loc:.5} pearson(log sigma)={corr_lsig:.5}"
+        "survival location-scale truth recovery: n={n} grid={grid_n} \
+         rmse_loc(gam)={gam_err_loc:.4} rmse_loc(gamlss)={ref_err_loc:.4} \
+         rmse_logsig(gam)={gam_err_lsig:.4} rmse_logsig(gamlss)={ref_err_lsig:.4} \
+         [context rel_l2(loc vs gamlss)={rel_loc_vs_ref:.4} \
+         rel_l2(log sigma vs gamlss)={rel_lsig_vs_ref:.4}]"
     );
 
-    // Guard against a vacuous pass: the data injects a strong sin(2*pi*x) signal
-    // into the AFT location and a weaker cos(2*pi*x) signal into the log-scale, so
-    // BOTH centered reference surfaces must carry real x-dependence. If gamlss
-    // returned a near-flat surface the correlation/rel_l2 below would compare
-    // noise and assert nothing; an RMS amplitude floor makes the test bite.
-    let rms = |v: &[f64]| -> f64 { (v.iter().map(|z| z * z).sum::<f64>() / v.len() as f64).sqrt() };
+    // ---- PRIMARY assertion: gam recovers the true x-dependence -------------
+    // The two channels are NOT equally identifiable, so the absolute bars differ
+    // and are tied to the generating signal's own amplitude on the grid:
+    //
+    //   * LOCATION is the dominant first-moment signal: 0.3*sin(2*pi*x), whose
+    //     centered RMS amplitude over the grid is ~0.21. Estimated sharply by a
+    //     k=6 smooth from n=200 (70% observed) draws, so we require the recovery
+    //     error to be a small fraction of that amplitude: rmse(loc) <= 0.06
+    //     (~28% of signal RMS). Bigger than that means gam failed to recover the
+    //     true location curve, not a gauge artifact.
+    //
+    //   * LOG-SCALE is a second-moment effect: log(1 + 0.4*cos(2*pi*x)), centered
+    //     RMS amplitude ~0.29, seen only through the spread of right-censored
+    //     draws — the hardest thing in distributional regression to pin down. A
+    //     k=4 smooth on n=200 censored points recovers the shape but with more
+    //     variance, so a wider absolute bar rmse(log sigma) <= 0.15 (~half the
+    //     signal RMS) is the principled accuracy floor here.
+    let loc_bar = 0.06;
+    let lsig_bar = 0.15;
     assert!(
-        rms(&ref_loc_c) > 0.05,
-        "gamlss recovered a near-flat location surface (rms={:.4}); test would be vacuous",
-        rms(&ref_loc_c)
+        gam_err_loc <= loc_bar,
+        "gam failed to recover the true AFT location 0.3*sin(2*pi*x): \
+         rmse(loc)={gam_err_loc:.4} > {loc_bar}"
     );
     assert!(
-        rms(&ref_lsig_c) > 0.02,
-        "gamlss recovered a near-flat log-scale surface (rms={:.4}); test would be vacuous",
-        rms(&ref_lsig_c)
+        gam_err_lsig <= lsig_bar,
+        "gam failed to recover the true log-scale log(1+0.4*cos(2*pi*x)): \
+         rmse(log sigma)={gam_err_lsig:.4} > {lsig_bar}"
     );
 
-    // Both engines recover the same Gaussian-AFT location and log-scale
-    // x-dependence; only the time-axis gauge differs (gam's flexible h(t) vs
-    // gamlss's fixed log t), which the mean-centering removes.
-    //
-    // The two channels are NOT equally identifiable, so they get distinct,
-    // separately-justified bounds (a single shared bound would be unjustified):
-    //
-    //   * LOCATION carries the dominant first-moment signal (0.3*sin(2*pi*x) in
-    //     the Weibull scale -> the AFT mean), which both engines estimate sharply.
-    //     We require near-identical shape, pearson(loc) >= 0.99, and a tight
-    //     amplitude match, rel_l2(loc) <= 0.05. The residual gap above an ideal
-    //     ~0.005 single-smooth mgcv bound is the genuine model difference: gam's
-    //     learned monotone h(t) vs gamlss's fixed log t bends the location only
-    //     mildly (the warp is ~affine over the bulk), not a tolerance artifact.
-    //
-    //   * LOG-SCALE is a second-moment effect (0.4*cos(2*pi*x) dispersion) seen
-    //     only through the spread of n=200 *right-censored* draws, the hardest
-    //     thing in distributional regression to pin down. The shape must still
-    //     track, pearson(log sigma) >= 0.95, but the amplitude is allowed a wider
-    //     rel_l2(log sigma) <= 0.20 because gam's Gaussian-residual-on-h(t)
-    //     variance and gamlss's NO-on-log-t variance legitimately differ in scale
-    //     while agreeing on where dispersion rises and falls in x.
-    //
-    // Exceeding any of these is a real divergence of gam's two-channel survival
-    // solver / noise-formula smoothing from the GAMLSS standard, not slack.
+    // ---- SECONDARY assertion: match-or-beat the gamlss baseline ------------
+    // On the IDENTICAL data and the SAME known truth, gam's recovery error must
+    // be no worse than the mature GAMLSS tool's, within a 10% tolerance. This
+    // demotes gamlss from "the thing gam must reproduce" to "the accuracy bar gam
+    // must match or beat" — a real quality claim, not a same-as-peer claim.
     assert!(
-        corr_loc >= 0.99,
-        "location surface shape diverges from gamlss: pearson(loc)={corr_loc:.5}"
+        gam_err_loc <= ref_err_loc * 1.10,
+        "gam location recovery worse than gamlss baseline: \
+         rmse(gam)={gam_err_loc:.4} > 1.10 * rmse(gamlss)={ref_err_loc:.4}"
     );
     assert!(
-        rel_loc <= 0.05,
-        "location surface diverges from gamlss: rel_l2(loc)={rel_loc:.4}"
-    );
-    assert!(
-        corr_lsig >= 0.95,
-        "log-scale surface shape diverges from gamlss: pearson(log sigma)={corr_lsig:.5}"
-    );
-    assert!(
-        rel_lsig <= 0.20,
-        "log-scale surface diverges from gamlss: rel_l2(log sigma)={rel_lsig:.4}"
+        gam_err_lsig <= ref_err_lsig * 1.10,
+        "gam log-scale recovery worse than gamlss baseline: \
+         rmse(gam)={gam_err_lsig:.4} > 1.10 * rmse(gamlss)={ref_err_lsig:.4}"
     );
 }

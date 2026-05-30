@@ -1,35 +1,48 @@
-//! End-to-end quality: gam's Gaussian *location-scale* predictive distribution,
-//! scored by the **continuous ranked probability score (CRPS)**, must agree with
-//! `properscoring.crps_gaussian` — the canonical Python CRPS library, whose
-//! `crps_gaussian` implements the closed-form normal CRPS analytically.
+//! End-to-end quality: gam's Gaussian *location-scale* predictive distribution
+//! is judged by its **held-out continuous ranked probability score (CRPS)** — a
+//! strictly-proper scoring rule that rewards a predictive distribution for being
+//! both calibrated and sharp. This test asserts gam's OBJECTIVE distributional
+//! quality on held-out data, not that gam reproduces any reference tool's fit.
 //!
-//! Why this comparator. CRPS is the standard strictly-proper scoring rule for
-//! probabilistic (distributional) regression: it rewards a predictive
-//! distribution that is both sharp and calibrated. For a Gaussian predictive
-//! `N(mu, sigma^2)` it has the exact closed form
+//! Objective metric asserted (CRPS is "lower is better"):
+//!   1. NEAR-OPTIMALITY vs the ORACLE. The data are generated from a *known*
+//!      heteroscedastic law `y ~ N(mu_true(x), sigma_true(x)^2)`. The smallest
+//!      achievable expected CRPS is the ORACLE CRPS — the score of the true
+//!      data-generating distribution `N(mu_true, sigma_true)`, the irreducible
+//!      floor no estimator can beat in expectation. We assert gam's held-out mean
+//!      CRPS is within a principled multiple of that floor: it has actually
+//!      learned the right location-scale law, not merely "agreed with a peer".
+//!   2. MATCH-OR-BEAT a HOMOSCEDASTIC baseline. A model that fits the mean but
+//!      ignores the scale channel (constant sigma = RMS of the true sigmas) is
+//!      the natural thing gam's location-scale machinery must beat. We assert
+//!      gam's held-out mean CRPS is strictly below that baseline — proving the
+//!      log-sigma smooth earns its keep on out-of-sample data.
+//!
+//! Role of `properscoring`. CRPS for a Gaussian `N(mu, sigma^2)` at observation
+//! `y` has the exact closed form
 //!
 //!     CRPS(N(mu, sigma), y) = sigma * [ w*(2*Phi(w) - 1) + 2*phi(w) - 1/sqrt(pi) ],
 //!     w = (y - mu) / sigma,
 //!
-//! where `Phi`/`phi` are the standard normal CDF/PDF. `properscoring.crps_gaussian`
-//! evaluates exactly this expression. gam itself does not expose a CRPS routine,
-//! but it *does* expose the building blocks of its predictive distribution —
-//! `gam::inference::probability::{normal_cdf, normal_pdf}` (the very Phi/phi,
-//! backed by `statrs::erfc`, that gam uses for Gaussian inference internally).
-//! So this test scores gam's location-scale prediction with the *same* canonical
-//! closed form, computed from gam's *own* probability primitives, and checks it
-//! against properscoring's independent computation at the *identical* (mu, sigma).
+//! and `properscoring.crps_gaussian` evaluates exactly this analytic quantity.
+//! Here properscoring is used as the GROUND-TRUTH SCORING ENGINE: it scores all
+//! three predictive distributions (gam's, the oracle's, the homoscedastic
+//! baseline's) at the identical held-out (y, x), so the three CRPS numbers are
+//! directly comparable on one independent, trusted ruler. gam is judged by where
+//! its number lands relative to the oracle floor and the baseline — not by
+//! whether it equals properscoring's recomputation of its own formula.
+//!
+//! For context we also recompute gam's CRPS from gam's OWN standard-normal CDF/PDF
+//! primitives (`gam::inference::probability::{normal_cdf, normal_pdf}`, backed by
+//! `statrs::erfc`) and `eprintln!` the cross-backend gap; that is diagnostic only
+//! and is never a pass/fail criterion.
 //!
 //! What it verifies. The synthetic data is heteroscedastic (both mu(x) and
 //! sigma(x) move with x), so gam must exercise *both* smooth channels — the mean
 //! `s(x, k=8)` and the log-sigma `1 + s(x, k=8)` — to produce sensible predictive
 //! distributions. We fit on 100 training rows, predict (mu, sigma) on a held-out
-//! 50-row test set, and feed those held-out (mu, sigma) plus the held-out y to
-//! properscoring. The held-out split isolates *generalization* calibration from
-//! training-set overfitting. Because both sides evaluate the identical analytic
-//! formula at the identical (mu, sigma, y), exact agreement is mathematically
-//! guaranteed; any element-wise divergence signals a transcription / linking bug
-//! in how gam wires its predictive (mu, sigma) — not a statistical disagreement.
+//! 50-row test set, and score generalization. The contiguous-tail split isolates
+//! held-out calibration from training-set overfitting.
 //!
 //! gam-side API (pinned by reading the source):
 //!   * `fit_from_formula(.., FitConfig{ noise_formula: Some(..), .. })` produces a
@@ -57,10 +70,11 @@ use ndarray::Array2;
 const LOGB_SIGMA_FLOOR: f64 = 0.01;
 
 /// Closed-form CRPS of a Gaussian predictive `N(mu, sigma)` at observation `y`,
-/// computed from gam's OWN standard-normal CDF/PDF primitives. This is the exact
-/// expression `properscoring.crps_gaussian` evaluates; computing it here from
-/// gam's `normal_cdf`/`normal_pdf` is what makes the comparison a check on gam's
-/// predictive plumbing rather than on a re-derived scoring formula.
+/// computed from gam's OWN standard-normal CDF/PDF primitives. Used here only to
+/// `eprintln!` a diagnostic cross-backend gap against `properscoring.crps_gaussian`
+/// (gam's `statrs::erfc` vs scipy/numpy erf); it is NOT part of any pass/fail
+/// assertion. The objective quality verdict is rendered by properscoring scoring
+/// gam, the oracle, and the homoscedastic baseline on one common ruler.
 fn gam_crps_gaussian(y: f64, mu: f64, sigma: f64) -> f64 {
     const INV_SQRT_PI: f64 = 0.564_189_583_547_756_3; // 1 / sqrt(pi)
     let w = (y - mu) / sigma;
@@ -187,62 +201,100 @@ fn gam_gaussian_location_scale_crps_matches_properscoring() {
         );
     }
 
-    // ---- gam-side CRPS via gam's own normal_cdf / normal_pdf ---------------
-    let gam_crps: Vec<f64> = (0..n_test)
+    // ---- ORACLE predictive: the true data-generating distribution ----------
+    // N(mu_true(x_test), sigma_true(x_test)). Its expected CRPS is the irreducible
+    // floor; no estimator can beat it in expectation. This is the optimality
+    // yardstick for gam's distributional fit.
+    let mu_oracle: Vec<f64> = x_test.iter().map(|&t| mu_true(t)).collect();
+    let sigma_oracle: Vec<f64> = x_test.iter().map(|&t| sigma_true(t).max(LOGB_SIGMA_FLOOR)).collect();
+
+    // ---- HOMOSCEDASTIC baseline: right mean, scale channel switched off -----
+    // Same true mean, but a single constant sigma = RMS of the true sigmas (the
+    // best constant-variance Gaussian for these data). This is the natural model
+    // gam's location-scale machinery must out-score on held-out CRPS to justify
+    // fitting the log-sigma smooth at all.
+    let sigma_const = {
+        let ms: f64 =
+            x_test.iter().map(|&t| sigma_true(t).powi(2)).sum::<f64>() / n_test as f64;
+        ms.sqrt()
+    };
+    let mu_base: Vec<f64> = mu_oracle.clone();
+    let sigma_base: Vec<f64> = vec![sigma_const; n_test];
+
+    // ---- gam-side CRPS via gam's own normal_cdf / normal_pdf (diagnostic) ---
+    let gam_crps_self: Vec<f64> = (0..n_test)
         .map(|i| gam_crps_gaussian(y_test[i], mu_test[i], sigma_test[i]))
         .collect();
 
-    // ---- properscoring: independent CRPS at the IDENTICAL (y, mu, sigma) ---
+    // ---- properscoring as the GROUND-TRUTH scorer for all three predictives -
+    // One independent, trusted CRPS ruler scores gam, the oracle, and the
+    // homoscedastic baseline at the IDENTICAL held-out (y, x); the three returned
+    // means are directly comparable.
     let ref_py = run_python(
         &[
             Column::new("y_test", y_test),
-            Column::new("mu_test", &mu_test),
-            Column::new("sigma_test", &sigma_test),
+            Column::new("mu_gam", &mu_test),
+            Column::new("sigma_gam", &sigma_test),
+            Column::new("mu_oracle", &mu_oracle),
+            Column::new("sigma_oracle", &sigma_oracle),
+            Column::new("mu_base", &mu_base),
+            Column::new("sigma_base", &sigma_base),
         ],
         r#"
 import properscoring as ps
-crps = ps.crps_gaussian(np.asarray(df["y_test"], dtype=float),
-                        mu=np.asarray(df["mu_test"], dtype=float),
-                        sig=np.asarray(df["sigma_test"], dtype=float))
-emit("crps", np.asarray(crps, dtype=float))
+y = np.asarray(df["y_test"], dtype=float)
+def crps(mu, sig):
+    return ps.crps_gaussian(y,
+                            mu=np.asarray(df[mu], dtype=float),
+                            sig=np.asarray(df[sig], dtype=float))
+emit("crps_gam", crps("mu_gam", "sigma_gam"))
+emit("crps_oracle", crps("mu_oracle", "sigma_oracle"))
+emit("crps_base", crps("mu_base", "sigma_base"))
 "#,
     );
-    let ps_crps = ref_py.vector("crps");
-    assert_eq!(ps_crps.len(), n_test, "properscoring CRPS length mismatch");
+    let ps_crps_gam = ref_py.vector("crps_gam");
+    let ps_crps_oracle = ref_py.vector("crps_oracle");
+    let ps_crps_base = ref_py.vector("crps_base");
+    assert_eq!(ps_crps_gam.len(), n_test, "properscoring gam CRPS length");
+    assert_eq!(ps_crps_oracle.len(), n_test, "properscoring oracle CRPS length");
+    assert_eq!(ps_crps_base.len(), n_test, "properscoring baseline CRPS length");
 
-    // ---- compare element-wise and in aggregate ----------------------------
-    let max_rel = (0..n_test)
-        .map(|i| (gam_crps[i] - ps_crps[i]).abs() / ps_crps[i].abs().max(1e-12))
-        .fold(0.0_f64, f64::max);
-    let abs_diff = max_abs_diff(&gam_crps, ps_crps);
-    let mean_gam = gam_crps.iter().sum::<f64>() / n_test as f64;
-    let mean_ps = ps_crps.iter().sum::<f64>() / n_test as f64;
-    let mean_diff = (mean_gam - mean_ps).abs();
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    let mean_gam = mean(ps_crps_gam);
+    let mean_oracle = mean(ps_crps_oracle);
+    let mean_base = mean(ps_crps_base);
+
+    // Diagnostic only: cross-backend agreement of gam's own CRPS vs properscoring,
+    // at the identical (y, mu, sigma). Never a pass/fail criterion.
+    let mean_gam_self = mean(&gam_crps_self);
+    let self_vs_ps = max_abs_diff(&gam_crps_self, ps_crps_gam);
 
     eprintln!(
-        "crps gaussian vs properscoring: n_train={n_train} n_test={n_test} \
-         max_rel={max_rel:.3e} max_abs={abs_diff:.3e} \
-         mean_crps(gam)={mean_gam:.6} mean_crps(ps)={mean_ps:.6} mean_diff={mean_diff:.3e}"
+        "crps location-scale held-out: n_train={n_train} n_test={n_test} \
+         mean_crps(gam)={mean_gam:.6} mean_crps(oracle)={mean_oracle:.6} \
+         mean_crps(homoscedastic)={mean_base:.6} sigma_const={sigma_const:.4} \
+         | diagnostic gam_self_crps={mean_gam_self:.6} self_vs_ps_maxabs={self_vs_ps:.3e}"
     );
 
-    // Both sides evaluate the identical closed-form Gaussian CRPS at the identical
-    // (y, mu, sigma); the only freedom is the floating-point erf/erfc backend
-    // (gam: statrs::erfc; properscoring: scipy/numpy), each near machine epsilon.
-    // The per-observation relative gap is therefore ~1e-12 in practice, so a 1e-9
-    // relative bound is principled — tight enough that ANY transcription/linking
-    // error in gam's predictive (mu, sigma) blows past it, yet a few hundred ulps
-    // of headroom over the genuine cross-backend erf disagreement.
+    // OBJECTIVE 1 — near-optimality. gam's held-out mean CRPS must be within a
+    // principled multiple of the irreducible oracle floor. With both smooth
+    // channels fit on 100 rows the realized ratio is comfortably under 1.25; a
+    // larger gap means gam's predictive distribution is mis-calibrated or
+    // over/under-dispersed, i.e. a genuine quality shortfall.
     assert!(
-        max_rel < 1e-9,
-        "per-observation Gaussian CRPS diverges from properscoring: max_rel={max_rel:.3e}"
+        mean_gam <= 1.25 * mean_oracle,
+        "gam held-out mean CRPS not near the oracle floor: \
+         gam={mean_gam:.6} oracle={mean_oracle:.6} ratio={:.3} (bar=1.25)",
+        mean_gam / mean_oracle
     );
-    // The aggregate (mean) CRPS is the headline calibration number; with identical
-    // inputs and formula the per-element abs diffs are ~1e-13, so the mean diff is
-    // ~1e-13 and must match to within 1e-9 absolute. A larger gap is not a
-    // statistical disagreement but a sign that gam mis-wired mu/sigma into the
-    // predictive distribution (wrong link, wrong block, wrong floor).
+
+    // OBJECTIVE 2 — beat the homoscedastic baseline. Modelling the scale channel
+    // must pay off out-of-sample: gam's mean CRPS must be strictly below that of
+    // the best constant-sigma Gaussian. If gam cannot beat ignoring sigma(x), the
+    // location-scale fit added nothing of value.
     assert!(
-        mean_diff < 1e-9,
-        "mean hold-out CRPS disagrees with properscoring: gam={mean_gam:.8} ps={mean_ps:.8} diff={mean_diff:.3e}"
+        mean_gam < mean_base,
+        "gam location-scale did not beat the homoscedastic baseline on held-out CRPS: \
+         gam={mean_gam:.6} homoscedastic={mean_base:.6}"
     );
 }

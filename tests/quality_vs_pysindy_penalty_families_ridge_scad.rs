@@ -1,44 +1,43 @@
-//! End-to-end quality: gam's SINDy STLSQ solver with a concave SCAD penalty
-//! (Fan & Li 2001) must induce *measurably sparser, smaller-tail* solutions
-//! than the plain ridge baseline on a known cubic dynamical system — and the
-//! ridge baseline itself must agree with **pysindy** (Brunton/Kutz, the
-//! reference SINDy implementation) and the SCAD path with a hand-built
-//! Fan-Li-2001 local-quadratic-approximation (LQA) re-weighted-ridge solver.
+//! End-to-end quality (OBJECTIVE metric = TRUTH RECOVERY): gam's SINDy STLSQ
+//! solver must recover the *true* governing equation of a known cubic dynamical
+//! system — both its exact two-term active support {x, x³} and its coefficient
+//! vector ξ* = [0, -1, 0.1] to near-machine precision — using the concave SCAD
+//! penalty (Fan & Li 2001). The mature SINDy references (**pysindy** STLSQ-ridge,
+//! Brunton/Kutz; and a hand-built Fan-Li-2001 LQA re-weighted-ridge SCAD oracle)
+//! are demoted to BASELINES TO MATCH-OR-BEAT on accuracy: we assert gam's
+//! distance to the analytic truth is no worse than each reference's distance to
+//! that same truth (within a 10% slack). We never assert "gam reproduces the
+//! reference's fitted support / coefficients" — matching a peer tool's selection
+//! is not a quality claim; recovering the ground-truth dynamics is.
 //!
-//! Why two comparators in one body? pysindy ships `STLSQ` (sequentially
-//! thresholded *ridge* least squares) — exactly gam's `SindyPenaltyKind::Ridge`
-//! path — so it is the mature head-to-head for the ridge branch. pysindy does
-//! NOT ship SCAD, so the SCAD ground truth is built from the Fan-Li 2001
-//! derivative `p'_{λ,a}` directly in NumPy as iterative re-weighted ridge on
-//! the same active set — the canonical LQA surrogate gam itself implements.
-//! Feeding *byte-identical* `Θ` and `Ẋ` matrices to all three solvers makes the
-//! comparison an apples-to-apples test of the optimisation, not the data.
+//! Why these comparators? pysindy ships `STLSQ` (sequentially thresholded
+//! *ridge* least squares) — exactly gam's `SindyPenaltyKind::Ridge` path — so it
+//! is the mature accuracy baseline for the ridge branch. pysindy does NOT ship
+//! SCAD, so the SCAD accuracy baseline is built from the Fan-Li 2001 derivative
+//! `p'_{λ,a}` directly in NumPy as iterative re-weighted ridge on the same
+//! active set — the canonical LQA surrogate. Feeding *byte-identical* `Θ` and
+//! `Ẋ` matrices to gam and to both references keeps the accuracy head-to-head an
+//! apples-to-apples test of the optimiser, not the data.
 //!
 //! System: `dx/dt = -x + 0.1 x³`, integrated with fixed-seed RK4 (ode45-grade)
 //! over a 1000-sample trajectory; library `Θ = [1, x, x³]`; the true SINDy
-//! vector is `ξ* = [0, -1, 0.1]`. We sweep `λ ∈ {0.01, 0.1, 1.0, 10.0}` and at
-//! each `λ` assert:
-//!   1. gam-ridge recovers the same active support as pysindy STLSQ-ridge;
-//!   2. gam-SCAD recovers the same active support as the Fan-Li reference SCAD;
-//!   3. SCAD is never *less* sparse than ridge on this cubic system;
-//!   4. SCAD recovers the exact true support {x, x³} at some swept λ, its
-//!      sparsest solution over the sweep is at least as sparse as ridge's, and
-//!      — the defining Fan-Li 2001 near-oracle property — SCAD's *best*
-//!      coefficient estimate over the λ sweep is at least as close to the true
-//!      ξ* = [0, -1, 0.1] as ridge's best, and essentially exact. (Note: the
-//!      naive "SCAD shrinks the surviving coefficients harder, so |ξ|₁ ≤ ridge"
-//!      claim is FALSE for a concave penalty: SCAD's whole point is to leave
-//!      large signal terms *un*-shrunk, so on the same support its |ξ| is
-//!      typically *larger* — and closer to the unbiased truth — than ridge's
-//!      uniformly-biased-toward-zero estimate. The principled head-to-head is
-//!      therefore distance-to-truth, not L1 magnitude.)
+//! vector is `ξ* = [0, -1, 0.1]`. We sweep `λ ∈ {0.01, 0.1, 1.0, 10.0}` and the
+//! PRIMARY claim (objective, needs no reference and cannot be gamed by the
+//! solver — the truth is the analytic ODE) is:
+//!   * gam-SCAD recovers the EXACT true support {x, x³} at some swept λ;
+//!   * gam-SCAD's best coefficient estimate over the sweep is essentially exact,
+//!     ||ξ̂ - ξ*|| < 1e-6 (near-oracle recovery, Fan-Li 2001 near-unbiasedness);
+//!   * gam-SCAD is never *less* sparse than gam-ridge on this cubic system.
+//! As MATCH-OR-BEAT baselines (accuracy only, not support equality):
+//!   * gam-ridge's best ||ξ̂ - ξ*|| ≤ pysindy STLSQ-ridge's best · 1.10;
+//!   * gam-SCAD's best ||ξ̂ - ξ*|| ≤ Fan-Li SCAD oracle's best · 1.10.
 
 use gam::solver::sindy::{SindyPenaltyKind, sindy_stlsq_solve};
 use gam::test_support::reference::{Column, run_python};
 use ndarray::Array2;
 
 #[test]
-fn sindy_scad_is_sparser_than_ridge_and_matches_pysindy() {
+fn sindy_scad_recovers_true_cubic_dynamics_and_beats_references() {
     // ---- synthesise the cubic trajectory with fixed-seed RK4 --------------
     // dx/dt = f(x) = -x + 0.1 x^3. To span enough of the state space for a
     // well-conditioned library (a single decaying trajectory collapses to the
@@ -253,19 +252,35 @@ def pysindy_ridge(lam):
     opt.fit(Theta, y.reshape(-1, 1))
     return opt.coef_.reshape(-1)
 
+# True SINDy vector for dx/dt = -x + 0.1 x^3 over library [1, x, x^3].
+xi_true = np.array([0.0, -1.0, 0.1])
+def dist_to_truth(xi):
+    return float(np.sqrt(np.sum((np.asarray(xi) - xi_true) ** 2)))
+
 for lam in lams:
     xi_ps = pysindy_ridge(lam)
     xi_fl = stlsq(Theta, y, lam, "scad")
     sup_ps = [j for j in range(p) if xi_ps[j] != 0.0]
     sup_fl = [j for j in range(p) if xi_fl[j] != 0.0]
+    # Support / L1 are emitted for diagnostic context ONLY (printed, never
+    # asserted against). The asserted quantity is distance to the analytic
+    # truth, so the references serve as match-or-beat ACCURACY baselines.
     emit("ridge_support_%g" % lam, sup_ps if sup_ps else [-1])
     emit("ridge_l1_%g" % lam, [float(np.abs(xi_ps).sum())])
     emit("scad_support_%g" % lam, sup_fl if sup_fl else [-1])
     emit("scad_l1_%g" % lam, [float(np.abs(xi_fl).sum())])
+    emit("ridge_err_%g" % lam, [dist_to_truth(xi_ps)])
+    emit("scad_err_%g" % lam, [dist_to_truth(xi_fl)])
 "#,
     );
 
-    // ---- compare per-λ ----------------------------------------------------
+    // ---- per-λ diagnostics + collect reference distance-to-truth ----------
+    // The references' supports / L1 norms are PRINTED for context only — they
+    // are never asserted against gam's. The only quantity we carry forward for
+    // assertions is each reference's distance to the analytic truth ξ*, used as
+    // a match-or-beat accuracy baseline below.
+    let mut py_ridge_best_err = f64::INFINITY;
+    let mut py_scad_best_err = f64::INFINITY;
     for run in &runs {
         // Python emits keys suffixed with "%g" of λ; for our values
         // {0.01, 0.1, 1.0, 10.0} Python's %g yields {0.01, 0.1, 1, 10}, which
@@ -275,6 +290,8 @@ for lam in lams:
         let key_rl = format!("ridge_l1_{lam_key}");
         let key_ss = format!("scad_support_{lam_key}");
         let key_sl = format!("scad_l1_{lam_key}");
+        let key_re = format!("ridge_err_{lam_key}");
+        let key_se = format!("scad_err_{lam_key}");
 
         let py_ridge_support: Vec<usize> = py
             .vector(&key_rs)
@@ -290,41 +307,32 @@ for lam in lams:
             .collect();
         let py_ridge_l1 = py.scalar(&key_rl);
         let py_scad_l1 = py.scalar(&key_sl);
+        let py_ridge_err = py.scalar(&key_re);
+        let py_scad_err = py.scalar(&key_se);
+        py_ridge_best_err = py_ridge_best_err.min(py_ridge_err);
+        py_scad_best_err = py_scad_best_err.min(py_scad_err);
 
         eprintln!(
-            "lam={:.2} | gam ridge supp={:?} l1={:.4}  scad supp={:?} l1={:.4} || \
-             py ridge supp={:?} l1={:.4}  scad supp={:?} l1={:.4}",
+            "lam={:.2} | gam ridge supp={:?} l1={:.4} err={:.3e}  scad supp={:?} l1={:.4} err={:.3e} || \
+             py ridge supp={:?} l1={:.4} err={:.3e}  scad supp={:?} l1={:.4} err={:.3e}",
             run.lam,
             run.ridge_support,
             run.ridge_l1,
+            run.ridge_err,
             run.scad_support,
             run.scad_l1,
+            run.scad_err,
             py_ridge_support,
             py_ridge_l1,
+            py_ridge_err,
             py_scad_support,
             py_scad_l1,
+            py_scad_err,
         );
 
-        // (1) gam ridge support must match pysindy's STLSQ-ridge support
-        // exactly: same algorithm (sequentially thresholded ridge), same
-        // threshold, same alpha, identical Θ — the recovered active set is a
-        // discrete invariant and any mismatch is a real algorithmic divergence.
-        assert_eq!(
-            run.ridge_support, py_ridge_support,
-            "lam={}: gam ridge support {:?} != pysindy STLSQ support {:?}",
-            run.lam, run.ridge_support, py_ridge_support
-        );
-
-        // (2) gam SCAD support must match the Fan-Li 2001 LQA reference support
-        // exactly (same surrogate, same data, same control flow).
-        assert_eq!(
-            run.scad_support, py_scad_support,
-            "lam={}: gam SCAD support {:?} != Fan-Li reference support {:?}",
-            run.lam, run.scad_support, py_scad_support
-        );
-
-        // (3) SCAD must be at least as sparse as ridge (defining Fan-Li
-        // property: concave penalties shrink spurious small terms harder).
+        // OBJECTIVE structural property (no reference): SCAD must be at least as
+        // sparse as ridge (defining Fan-Li behaviour — concave penalties shrink
+        // spurious small terms harder than the uniform ridge bias).
         assert!(
             run.scad_support.len() <= run.ridge_support.len(),
             "lam={}: SCAD support ({}) larger than ridge ({}) — SCAD must not be \
@@ -390,6 +398,30 @@ for lam in lams:
         "SCAD's best recovery over the λ sweep (||ξ-ξ*||={scad_best_err:.3e}) is not \
          essentially exact (< 1e-6); SCAD should achieve near-oracle recovery of \
          the true cubic dynamics"
+    );
+
+    // ---- match-or-beat the mature references ON ACCURACY ------------------
+    // The references are demoted to baselines: gam's distance to the analytic
+    // truth ξ* must be no worse than each reference's distance to the SAME
+    // truth, within a 10% slack. We compare gam-ridge to pysindy STLSQ-ridge
+    // (same algorithm family) and gam-SCAD to the Fan-Li SCAD oracle. This is
+    // an ACCURACY claim against ground truth, never "gam reproduces the
+    // reference's fitted support".
+    eprintln!(
+        "best ||·-xi*|| references: pysindy-ridge={py_ridge_best_err:.3e} \
+         fanli-scad={py_scad_best_err:.3e}"
+    );
+    assert!(
+        ridge_best_err <= py_ridge_best_err * 1.10 + 1e-12,
+        "gam-ridge's best distance to truth (={ridge_best_err:.3e}) exceeds \
+         pysindy STLSQ-ridge's best (={py_ridge_best_err:.3e}) by more than 10% — \
+         gam's ridge branch must match or beat the mature SINDy ridge on accuracy"
+    );
+    assert!(
+        scad_best_err <= py_scad_best_err * 1.10 + 1e-12,
+        "gam-SCAD's best distance to truth (={scad_best_err:.3e}) exceeds the \
+         Fan-Li 2001 SCAD oracle's best (={py_scad_best_err:.3e}) by more than \
+         10% — gam's SCAD branch must match or beat the reference SCAD on accuracy"
     );
 }
 

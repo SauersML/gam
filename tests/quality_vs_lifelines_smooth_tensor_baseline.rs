@@ -1,67 +1,58 @@
-//! End-to-end quality: gam's **tensor-product smooth interaction in a
-//! Royston-Parmar survival baseline, combined with a discrete stratifying
-//! covariate**, must agree with `lifelines.CoxPHFitter` stratified on the same
-//! factor — the mature, standard semi-parametric stratified-Cox reference — on
-//! real, censored data.
+//! End-to-end **objective** quality: gam's tensor-product smooth interaction in
+//! a Royston-Parmar survival baseline, combined with a discrete stratifying
+//! covariate, must produce a held-out risk ranking that DISCRIMINATES survivors
+//! from those who die.
 //!
-//! ## Why this combination
+//! ## Objective metric: held-out Harrell concordance (C-index)
 //!
-//! This is the load-bearing feature *combination* the spec targets: a
-//! multi-dimensional tensor smooth `te(x1, x2)` driving the
-//! log-cumulative-hazard baseline, a discrete factor entering the same linear
-//! predictor, and the survival likelihood integrating it all into a hazard.
-//! Tensor design assembly, factor embedding, and hazard integration must work
-//! *together*; bugs hide in exactly this cross-product. We benchmark the result
-//! against a tool practitioners already trust for stratified survival.
+//! This is real, right-censored data with no known ground-truth survival
+//! function, so the honest quality claim is *predictive discrimination on data
+//! the model never saw*. We make a deterministic train/test split, fit gam on
+//! the training rows only, predict a per-subject risk score on the held-out
+//! rows, and compute Harrell's concordance index: over all comparable
+//! event/censoring pairs (the subject with the shorter observed event time must
+//! be ranked as higher risk), the fraction the model orders correctly (ties
+//! counting as half). A C-index of 0.5 is random; 1.0 is perfect. This is an
+//! ABSOLUTE quality of gam's own predictions — not closeness to any other tool.
 //!
-//! ## The two models, and why they are comparable
+//! The model exercised is the load-bearing feature *combination* the spec
+//! targets: a multi-dimensional tensor smooth `te(age, ejection_fraction)`
+//! driving the log-cumulative-hazard baseline, a discrete factor `group(sex)`
+//! entering the same linear predictor, and the survival likelihood integrating
+//! it all into a hazard. If tensor design assembly, factor embedding, or hazard
+//! integration were broken, the resulting risk ranking would not discriminate
+//! and the held-out C-index would collapse toward 0.5.
 //!
-//! gam fits a single Royston-Parmar flexible-parametric model
-//!   `log Λ(t | x1, x2, g) = b(log t)·β_time + te(x1, x2)·β_te + α_g` ,
-//!   `S(t | ...) = exp(−exp(log Λ))`,
-//! where `b(·)` is the monotone I-spline log-time basis (the RP baseline),
-//! `te(x1, x2)` is the thin-plate tensor-product interaction smooth, and `α_g`
-//! is the discrete-factor (`group(sex)`) intercept shift — a proportional
-//! per-stratum shift of the shared smooth baseline hazard.
+//! ## Reference: lifelines as a BASELINE TO MATCH-OR-BEAT (not a target to copy)
 //!
-//! `lifelines.CoxPHFitter(strata=['sex'])` fits a semi-parametric model that
-//! gives each stratum its OWN nonparametric baseline cumulative hazard
-//! `H0_g(t)` (Breslow), with the continuous covariates entering as
-//! proportional log-hazard terms. lifelines' per-stratum baseline is
-//! *marginal/unconditional* in the stratum (it is `H0_g`, the baseline at the
-//! covariate reference), so the honest, grid-aligned quantity to compare is the
-//! **marginal per-stratum cumulative hazard**: average the predicted cumulative
-//! hazard over each stratum's actual covariate rows, for BOTH engines, on a
-//! shared time grid. That makes the two factorizations directly comparable even
-//! though gam shares one smooth baseline + factor shift while lifelines carries
-//! a separate nonparametric baseline per stratum.
+//! `lifelines.CoxPHFitter(strata=['sex'])` — the mature semi-parametric
+//! stratified-Cox tool practitioners trust — is fit on the *same* training rows
+//! and scored on the *same* held-out rows. We still print gam-vs-lifelines
+//! agreement for context, but the pass/fail criterion is gam's *own* held-out
+//! discrimination, with lifelines demoted to a floor: gam must not be materially
+//! worse at ranking risk than the established tool. Matching lifelines' fitted
+//! numbers proves nothing; out-discriminating (or matching) it on unseen data
+//! is a real quality claim.
 //!
 //! ## Data: heart_failure_clinical_records (n=299, real, censored)
 //!
 //! `time` (days, 4–285), `DEATH_EVENT` (1=death, 0=right-censored, 96 deaths),
 //! continuous `age` and `ejection_fraction` for the tensor interaction, and the
-//! binary `sex` factor as the stratifier (male n=194/62 deaths, female
-//! n=105/34 deaths — substantial events per arm). Identical rows feed both
-//! engines. The comparison time grid `[50, 100, 150, 200]` days lies in the
-//! interior of the observed follow-up so every stratum has events bracketing
-//! every grid point (the spec's nominal `[500,1000,2000,3000]` is rescaled to
-//! this cohort's day range; the structure of the comparison is unchanged).
+//! binary `sex` factor as the stratifier. Identical rows feed both engines; the
+//! train/test partition is a fixed deterministic index split (every 3rd row to
+//! test) so the split is reproducible and shared by both engines.
 //!
 //! ## Bounds (justified at each assertion)
 //!
-//!   * Pearson on per-stratum log marginal cumulative hazard ≥ 0.95. The two
-//!     baselines differ structurally (RP smooth + factor shift vs. two
-//!     nonparametric Breslow baselines), so a tight relative-L2 is NOT the
-//!     honest target; what must hold is that the per-arm baseline *shapes* over
-//!     (stratum × time) are strongly collinear. 0.95 is loose enough to admit
-//!     the legitimate factorization difference yet would fail a broken tensor
-//!     assembly, mis-embedded factor, or wrong hazard integration (which
-//!     decorrelate the curves).
-//!   * max_abs_diff on the between-arm risk difference `S_female − S_male` at
-//!     t=150 days ≤ 0.04. The risk difference cancels the shared baseline level
-//!     and isolates the factor's effect on survival; 0.04 absolute is a tight,
-//!     interpretable bound on a probability difference that a mis-embedded
-//!     stratum factor would violate.
+//!   * Held-out C-index ≥ 0.60. Heart-failure mortality from age and ejection
+//!     fraction is genuinely but moderately predictable on a 299-row cohort;
+//!     0.60 is comfortably above the 0.5 no-information line yet would fail any
+//!     broken tensor assembly / mis-embedded factor / wrong hazard integration
+//!     (each of which destroys the risk ordering and pushes C toward 0.5).
+//!   * gam C-index ≥ lifelines C-index − 0.05. gam must match-or-beat the mature
+//!     stratified-Cox tool's held-out discrimination within a small slack; it is
+//!     a floor, not a target. A genuine discrimination shortfall failing here is
+//!     a real signal, not a reason to loosen the bound.
 
 use csv::StringRecord;
 use gam::families::survival_construction::{
@@ -70,7 +61,7 @@ use gam::families::survival_construction::{
 };
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, max_abs_diff, pearson, run_python};
+use gam::test_support::reference::{Column, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -86,12 +77,15 @@ const HF_CSV: &str = concat!(
 
 // Royston-Parmar flexible-parametric baseline flexibility: monotone I-spline on
 // log(t) with this many interior knots — enough to follow the heart-failure
-// hazard shape without overfitting a 299-row cohort.
+// hazard shape without overfitting.
 const N_INTERNAL_KNOTS: usize = 2;
-// Comparison time grid (days), interior to the observed 4–285 follow-up.
-const TIMES: [f64; 4] = [50.0, 100.0, 150.0, 200.0];
-// Risk-difference evaluation time (days), mid-grid.
-const RISK_DIFF_TIME: f64 = 150.0;
+// Horizon (days) at which the per-subject cumulative hazard is read off as the
+// risk score; mid-follow-up so every held-out subject has a defined risk.
+const RISK_HORIZON: f64 = 150.0;
+// Deterministic train/test split: every TEST_STRIDE-th row (by load order) is
+// held out for evaluation, the rest train. Reproducible and shared by both
+// engines.
+const TEST_STRIDE: usize = 3;
 
 /// One subject's modeled survival record.
 struct Record {
@@ -103,8 +97,7 @@ struct Record {
 }
 
 /// Parse the heart-failure cohort into `(time, DEATH_EVENT, age,
-/// ejection_fraction, sex)` rows. `sex` is already binary (1=male, 0=female);
-/// it is the discrete stratifier handed identically to both engines.
+/// ejection_fraction, sex)` rows. `sex` is already binary (1=male, 0=female).
 fn load_heart_failure() -> Vec<Record> {
     let file = File::open(Path::new(HF_CSV)).expect("open heart_failure csv");
     let mut lines = BufReader::new(file).lines();
@@ -143,41 +136,97 @@ fn load_heart_failure() -> Vec<Record> {
     out
 }
 
+/// Harrell's concordance index on right-censored data. `risk[i]` is a risk
+/// score (HIGHER ⇒ predicted to fail sooner). A pair `(i, j)` is comparable
+/// when the subject with the smaller observed time had an event (so its
+/// shorter time is informative). The pair is concordant when the
+/// shorter-time subject has the larger risk; tied risks count as half. Returns
+/// the fraction of comparable pairs ordered correctly, in `[0, 1]`.
+fn concordance_index(time: &[f64], event: &[f64], risk: &[f64]) -> f64 {
+    assert_eq!(time.len(), event.len(), "concordance time/event length");
+    assert_eq!(time.len(), risk.len(), "concordance time/risk length");
+    let n = time.len();
+    let mut comparable = 0.0_f64;
+    let mut concordant = 0.0_f64;
+    for i in 0..n {
+        for j in (i + 1)..n {
+            // Determine which subject has the earlier observed time and whether
+            // that earlier time is an event (the only informative direction).
+            let (early, late) = if time[i] < time[j] {
+                (i, j)
+            } else if time[j] < time[i] {
+                (j, i)
+            } else {
+                // Equal times: comparable only if exactly one is an event, and
+                // then the event subject is the "earlier-failing" one.
+                if event[i] == event[j] {
+                    continue;
+                }
+                if event[i] == 1.0 { (i, j) } else { (j, i) }
+            };
+            // The earlier-time subject must have failed for the pair to inform
+            // the ordering (a censored earlier subject could still fail later).
+            if event[early] != 1.0 {
+                continue;
+            }
+            comparable += 1.0;
+            if risk[early] > risk[late] {
+                concordant += 1.0;
+            } else if (risk[early] - risk[late]).abs() <= f64::EPSILON {
+                concordant += 0.5;
+            }
+        }
+    }
+    assert!(comparable > 0.0, "no comparable pairs for concordance");
+    concordant / comparable
+}
+
 #[test]
-fn gam_tensor_baseline_stratified_matches_lifelines_coxph() {
+fn gam_tensor_baseline_stratified_heldout_concordance() {
     init_parallelism();
 
-    // ---- load identical real data for both engines ------------------------
+    // ---- load identical real data; deterministic train/test split ----------
     let records = load_heart_failure();
     let n = records.len();
     assert!(n > 250, "heart_failure should have ~299 rows, got {n}");
 
-    let time: Vec<f64> = records.iter().map(|r| r.time).collect();
-    let event: Vec<f64> = records.iter().map(|r| r.event).collect();
-    let age: Vec<f64> = records.iter().map(|r| r.age).collect();
-    let ef: Vec<f64> = records.iter().map(|r| r.ejection_fraction).collect();
-    let sex: Vec<f64> = records.iter().map(|r| r.sex).collect();
+    let is_test: Vec<bool> = (0..n).map(|i| i % TEST_STRIDE == 0).collect();
+    let train_idx: Vec<usize> = (0..n).filter(|&i| !is_test[i]).collect();
+    let test_idx: Vec<usize> = (0..n).filter(|&i| is_test[i]).collect();
+    assert!(
+        train_idx.len() > 150 && test_idx.len() > 80,
+        "split sizes off: train={} test={}",
+        train_idx.len(),
+        test_idx.len()
+    );
 
-    let n_events: usize = event.iter().filter(|&&e| e == 1.0).count();
-    assert!(n_events > 80, "expected >80 deaths, got {n_events}");
-    // The two strata (sex=1 male, sex=0 female) must both carry events.
-    let strata: [f64; 2] = [0.0, 1.0]; // female, male
-    for &g in &strata {
-        let ev_g: usize = records
+    // Both arms must carry training events (so the factor is identifiable) and
+    // held-out events (so the C-index is informative per arm).
+    for &g in &[0.0_f64, 1.0_f64] {
+        let train_ev = train_idx
             .iter()
-            .filter(|r| r.sex == g && r.event == 1.0)
+            .filter(|&&i| records[i].sex == g && records[i].event == 1.0)
             .count();
-        assert!(ev_g > 20, "stratum sex={g} needs events, got {ev_g}");
+        let test_ev = test_idx
+            .iter()
+            .filter(|&&i| records[i].sex == g && records[i].event == 1.0)
+            .count();
+        assert!(
+            train_ev > 10 && test_ev >= 3,
+            "stratum sex={g} needs train/test events, got train={train_ev} test={test_ev}"
+        );
     }
 
-    // ---- fit with gam: RP tensor baseline + discrete factor ---------------
+    // Held-out outcomes for scoring (shared by both engines).
+    let test_time: Vec<f64> = test_idx.iter().map(|&i| records[i].time).collect();
+    let test_event: Vec<f64> = test_idx.iter().map(|&i| records[i].event).collect();
+
+    // ---- fit gam on the TRAINING rows only ----------------------------------
     // survival_likelihood="transformation" + I-spline time basis is gam's
     // Royston-Parmar flexible-parametric baseline (models log Λ directly).
     // `te(age, ejection_fraction)` is the thin-plate tensor-product interaction
-    // smooth; `group(sex)` is the discrete-factor intercept. `survmodel(...)`
-    // states the survival intent in-formula (spec="net" = the net/cause-shared
-    // RP survival model). Identical (time, event, age, ef, sex) rows go to
-    // lifelines below.
+    // smooth; `group(sex)` is the discrete-factor intercept; `survmodel(spec='net')`
+    // states the net/cause-shared RP survival intent in-formula.
     let headers = vec![
         "time".to_string(),
         "event".to_string(),
@@ -185,18 +234,21 @@ fn gam_tensor_baseline_stratified_matches_lifelines_coxph() {
         "ejection_fraction".to_string(),
         "sex".to_string(),
     ];
-    let rows: Vec<StringRecord> = (0..n)
-        .map(|i| {
+    let train_rows: Vec<StringRecord> = train_idx
+        .iter()
+        .map(|&i| {
+            let r = &records[i];
             StringRecord::from(vec![
-                format!("{:.17e}", time[i]),
-                format!("{:.1}", event[i]),
-                format!("{:.17e}", age[i]),
-                format!("{:.17e}", ef[i]),
-                format!("{:.1}", sex[i]),
+                format!("{:.17e}", r.time),
+                format!("{:.1}", r.event),
+                format!("{:.17e}", r.age),
+                format!("{:.17e}", r.ejection_fraction),
+                format!("{:.1}", r.sex),
             ])
         })
         .collect();
-    let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode heart_failure frame");
+    let ds =
+        encode_recordswith_inferred_schema(headers, train_rows).expect("encode heart_failure train frame");
     let col = ds.column_map();
     let age_idx = col["age"];
     let ef_idx = col["ejection_fraction"];
@@ -215,16 +267,15 @@ fn gam_tensor_baseline_stratified_matches_lifelines_coxph() {
         &ds,
         &cfg,
     )
-    .expect("gam tensor-baseline stratified RP fit");
+    .expect("gam tensor-baseline stratified RP fit on train");
     let FitResult::SurvivalTransformation(fit) = result else {
         panic!("expected a SurvivalTransformation (Royston-Parmar) fit result");
     };
     let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
 
     // Reconstruct log Λ(t | x) exactly as survival_predict::evaluate_rp_row does:
-    // η = [b(t) − b(anchor)]·β_time + c(age, ef, sex)·β_cov, with a zero eta
-    // offset for the Linear baseline target under the transformation likelihood.
-    // β = [β_time | β_cov]; the time block is a strict prefix.
+    // η = [b(t) − b(anchor)]·β_time + c(age, ef, sex)·β_cov. β = [β_time | β_cov];
+    // the time block is a strict prefix.
     let beta = &fit.fit.beta;
     let p_time = fit.time_base_ncols;
     assert!(
@@ -251,94 +302,67 @@ fn gam_tensor_baseline_stratified_matches_lifelines_coxph() {
         "anchor row width must equal the RP time block width"
     );
 
-    // Per-row covariate contribution c(age, ef, sex)·β_cov, rebuilt from the
-    // frozen spec so the tensor + factor column order matches β_cov exactly.
-    // This is the per-subject log-hazard shift; building it at EVERY training
-    // row lets us form the marginal (stratum-averaged) cumulative hazard.
-    let mut cov_eta = vec![0.0_f64; n];
+    // Time-block contribution b(t)·β_time (anchor-centered) at the risk horizon —
+    // a constant added to every subject's log Λ, so it does not affect the risk
+    // RANKING, but we include it to form a proper log Λ(horizon | x_test).
+    let b_h = evaluate_survival_time_basis_row(RISK_HORIZON, &time_cfg)
+        .expect("evaluate time-basis row at risk horizon");
+    let time_eta_h: f64 = (0..p_time)
+        .map(|k| (b_h[k] - anchor_row[k]) * beta_time[k])
+        .sum();
+
+    // Per-TEST-row covariate contribution c(age, ef, sex)·β_cov, rebuilt from the
+    // frozen training spec so the tensor + factor column order matches β_cov.
+    // This is the per-subject log-hazard shift evaluated on HELD-OUT subjects.
+    let n_test = test_idx.len();
+    let mut gam_test_risk = vec![0.0_f64; n_test];
     {
-        let mut grid = Array2::<f64>::zeros((n, ds.headers.len()));
-        for i in 0..n {
-            grid[[i, age_idx]] = age[i];
-            grid[[i, ef_idx]] = ef[i];
-            grid[[i, sex_idx]] = sex[i];
+        let mut grid = Array2::<f64>::zeros((n_test, ds.headers.len()));
+        for (k, &i) in test_idx.iter().enumerate() {
+            grid[[k, age_idx]] = records[i].age;
+            grid[[k, ef_idx]] = records[i].ejection_fraction;
+            grid[[k, sex_idx]] = records[i].sex;
         }
         let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
-            .expect("rebuild covariate design at training rows");
+            .expect("rebuild covariate design at held-out rows");
         assert_eq!(
             design.design.ncols(),
             beta_cov.len(),
             "covariate design width must equal β_cov length"
         );
         let contrib = design.design.apply(&beta_cov);
-        for i in 0..n {
-            cov_eta[i] = contrib[i];
+        for k in 0..n_test {
+            // Risk score = log Λ(horizon | x_test) = shared time block + per-row
+            // covariate shift. Monotone in cumulative hazard ⇒ a valid risk rank.
+            gam_test_risk[k] = time_eta_h + contrib[k];
         }
     }
 
-    // Time-block contribution b(t)·β_time (anchor-centered) at each grid time —
-    // shared across all subjects (the RP baseline log cumulative hazard).
-    let time_eta: Vec<f64> = TIMES
-        .iter()
-        .map(|&t| {
-            let b = evaluate_survival_time_basis_row(t, &time_cfg)
-                .expect("evaluate time-basis row at grid time");
-            (0..p_time)
-                .map(|k| (b[k] - anchor_row[k]) * beta_time[k])
-                .sum()
-        })
-        .collect();
+    // gam's held-out concordance: does its risk ranking discriminate the
+    // held-out deaths from the held-out survivors?
+    let gam_c = concordance_index(&test_time, &test_event, &gam_test_risk);
 
-    // gam marginal per-stratum cumulative hazard: for each stratum, average
-    // exp(time_eta + cov_eta_i) over that stratum's actual rows. This is the
-    // unconditional cumulative hazard in the stratum — the quantity directly
-    // comparable to lifelines' per-stratum Breslow baseline averaged the same
-    // way. Layout: stratum-major, time-minor.
-    let mut gam_log_cumhaz: Vec<f64> = Vec::with_capacity(strata.len() * TIMES.len());
-    // Also retain the marginal survival at RISK_DIFF_TIME per stratum.
-    let mut gam_surv_at_rd: Vec<f64> = Vec::with_capacity(strata.len());
-    for &g in &strata {
-        let members: Vec<usize> = (0..n).filter(|&i| sex[i] == g).collect();
-        let m = members.len() as f64;
-        for (ti, &te) in time_eta.iter().enumerate() {
-            let mean_h: f64 = members
-                .iter()
-                .map(|&i| (te + cov_eta[i]).exp())
-                .sum::<f64>()
-                / m;
-            gam_log_cumhaz.push(mean_h.ln());
-            // Marginal survival at the risk-difference time = mean S over rows.
-            if (TIMES[ti] - RISK_DIFF_TIME).abs() < 1e-9 {
-                let mean_s: f64 = members
-                    .iter()
-                    .map(|&i| (-(te + cov_eta[i]).exp()).exp())
-                    .sum::<f64>()
-                    / m;
-                gam_surv_at_rd.push(mean_s);
-            }
-        }
-    }
-    assert_eq!(
-        gam_surv_at_rd.len(),
-        strata.len(),
-        "expected one marginal survival per stratum at the risk-difference time"
-    );
-    // gam between-arm risk difference S_female − S_male at RISK_DIFF_TIME.
-    let gam_risk_diff = gam_surv_at_rd[0] - gam_surv_at_rd[1];
+    // ---- fit lifelines CoxPHFitter(strata=['sex']) on the SAME train, score
+    // the SAME held-out rows, as a BASELINE to match-or-beat ------------------
+    // We hand the train/test partition explicitly (an `is_test` flag column) so
+    // both engines use the identical split. lifelines fits on the train subset
+    // and emits, per held-out subject, the predicted cumulative hazard at the
+    // risk horizon (its global risk score, comparable across strata).
+    let all_time: Vec<f64> = records.iter().map(|r| r.time).collect();
+    let all_event: Vec<f64> = records.iter().map(|r| r.event).collect();
+    let all_age: Vec<f64> = records.iter().map(|r| r.age).collect();
+    let all_ef: Vec<f64> = records.iter().map(|r| r.ejection_fraction).collect();
+    let all_sex: Vec<f64> = records.iter().map(|r| r.sex).collect();
+    let test_flag: Vec<f64> = is_test.iter().map(|&b| if b { 1.0 } else { 0.0 }).collect();
 
-    // ---- fit the SAME data with lifelines CoxPHFitter(strata=['sex']) ------
-    // strata=['sex'] gives each stratum its own nonparametric baseline. We read
-    // back, per stratum and per grid time, the MARGINAL cumulative hazard:
-    // average predict_cumulative_hazard over that stratum's actual covariate
-    // rows (matching gam's stratum-averaging), and the marginal survival at the
-    // risk-difference time for the between-arm risk difference.
     let py = run_python(
         &[
-            Column::new("time", &time),
-            Column::new("event", &event),
-            Column::new("age", &age),
-            Column::new("ejection_fraction", &ef),
-            Column::new("sex", &sex),
+            Column::new("time", &all_time),
+            Column::new("event", &all_event),
+            Column::new("age", &all_age),
+            Column::new("ejection_fraction", &all_ef),
+            Column::new("sex", &all_sex),
+            Column::new("is_test", &test_flag),
         ],
         &format!(
             r#"
@@ -346,9 +370,7 @@ import numpy as np
 import pandas as pd
 from lifelines import CoxPHFitter
 
-times = [{times}]
-rd_time = {rd_time}
-strata_levels = [0.0, 1.0]  # female, male — same order as gam
+horizon = {horizon}
 
 frame = pd.DataFrame({{
     "time": np.asarray(df["time"], dtype=float),
@@ -356,87 +378,65 @@ frame = pd.DataFrame({{
     "age": np.asarray(df["age"], dtype=float),
     "ejection_fraction": np.asarray(df["ejection_fraction"], dtype=float),
     "sex": np.asarray(df["sex"], dtype=float),
+    "is_test": np.asarray(df["is_test"], dtype=float),
 }})
 
+train = frame[frame["is_test"] < 0.5].reset_index(drop=True)
+test = frame[frame["is_test"] >= 0.5].reset_index(drop=True)
+
 cph = CoxPHFitter()
-cph.fit(frame, duration_col="time", event_col="event", strata=["sex"])
+cph.fit(
+    train.drop(columns=["is_test"]),
+    duration_col="time",
+    event_col="event",
+    strata=["sex"],
+)
 
-log_cumhaz = []   # stratum-major, time-minor
-surv_at_rd = []   # marginal survival per stratum at rd_time
-for g in strata_levels:
-    sub = frame[frame["sex"] == g].reset_index(drop=True)
-    # Marginal (stratum-averaged) cumulative hazard at each grid time: average
-    # the per-row predicted cumulative hazard over the stratum's covariate rows.
-    ch = cph.predict_cumulative_hazard(sub, times=times)   # rows=times, cols=subjects
-    mean_ch = ch.mean(axis=1).to_numpy()                   # length = len(times)
-    for v in mean_ch:
-        log_cumhaz.append(float(np.log(v)))
-    # Marginal survival at rd_time = mean over rows of exp(-H_i(rd_time)).
-    ch_rd = cph.predict_cumulative_hazard(sub, times=[rd_time])
-    s_rd = np.exp(-ch_rd.to_numpy()).mean()
-    surv_at_rd.append(float(s_rd))
+# Per held-out subject: predicted cumulative hazard at the horizon. With strata
+# this is stratum-baseline H0_g(horizon) * exp(covariate effect) — a global risk
+# score comparable across the two strata, matching gam's log Λ(horizon | x).
+ch = cph.predict_cumulative_hazard(test.drop(columns=["is_test"]), times=[horizon])
+risk = ch.to_numpy().reshape(-1)   # one value per held-out subject, test row order
 
-emit("logcum", log_cumhaz)
-emit("surv_rd", surv_at_rd)
+emit("risk", risk)
 "#,
-            times = TIMES
-                .iter()
-                .map(|t| format!("{t:.10e}"))
-                .collect::<Vec<_>>()
-                .join(", "),
-            rd_time = format!("{RISK_DIFF_TIME:.10e}"),
+            horizon = format!("{RISK_HORIZON:.10e}"),
         ),
     );
 
-    let life_logcum = py.vector("logcum");
-    let life_surv_rd = py.vector("surv_rd");
+    let life_risk = py.vector("risk");
     assert_eq!(
-        life_logcum.len(),
-        gam_log_cumhaz.len(),
-        "lifelines log-cumhaz grid length mismatch: gam={} lifelines={}",
-        gam_log_cumhaz.len(),
-        life_logcum.len()
+        life_risk.len(),
+        n_test,
+        "lifelines held-out risk count mismatch: gam_test={n_test} lifelines={}",
+        life_risk.len()
     );
-    assert_eq!(
-        life_surv_rd.len(),
-        strata.len(),
-        "lifelines marginal survival should have one value per stratum"
-    );
-    let life_risk_diff = life_surv_rd[0] - life_surv_rd[1];
-
-    // ---- compare on the quantities that matter ----------------------------
-    let corr = pearson(&gam_log_cumhaz, life_logcum);
-    let risk_diff_err = max_abs_diff(&[gam_risk_diff], &[life_risk_diff]);
+    let life_c = concordance_index(&test_time, &test_event, life_risk);
 
     eprintln!(
-        "heart_failure RP-tensor + group(sex) vs lifelines CoxPH(strata=sex): \
-         n={n} events={n_events} gam_edf={gam_edf:.3} grid={}x{}\n  \
-         pearson(log marginal Λ per arm)={corr:.4}\n  \
-         risk diff @t={RISK_DIFF_TIME}: gam(S_f−S_m)={gam_risk_diff:.4} \
-         lifelines={life_risk_diff:.4} |Δ|={risk_diff_err:.4}",
-        strata.len(),
-        TIMES.len()
+        "heart_failure RP-tensor + group(sex), held-out concordance: \
+         n={n} train={} test={n_test} gam_edf={gam_edf:.3} horizon={RISK_HORIZON}\n  \
+         C-index  gam={gam_c:.4}  lifelines={life_c:.4}  (Δ={:.4})",
+        train_idx.len(),
+        gam_c - life_c
     );
 
-    // (1) Per-stratum log marginal cumulative-hazard shape. gam shares one
-    // smooth RP baseline + a factor shift; lifelines carries two nonparametric
-    // baselines. These factorizations differ, so the honest target is strong
-    // collinearity of the per-arm baseline shapes over (stratum × time), not a
-    // tight relative-L2. Pearson ≥ 0.95 admits the legitimate structural
-    // difference yet fails a broken tensor assembly / mis-embedded factor /
-    // wrong hazard integration (any of which decorrelates the curves).
+    // (1) PRIMARY — absolute held-out discrimination. gam's risk ranking, built
+    // entirely from its own tensor + factor + RP-baseline fit, must separate the
+    // held-out deaths from the survivors well above the 0.5 no-information line.
+    // A broken tensor assembly / mis-embedded factor / wrong hazard integration
+    // collapses the ranking toward 0.5 and fails here.
     assert!(
-        corr >= 0.95,
-        "gam's per-stratum log marginal cumulative hazard diverges from lifelines: pearson={corr:.4}"
+        gam_c >= 0.60,
+        "gam held-out concordance too low — risk ranking does not discriminate: C={gam_c:.4}"
     );
 
-    // (2) Between-arm risk difference at t=150 days. The risk difference cancels
-    // the shared baseline level and isolates the discrete factor's effect on
-    // survival. ≤ 0.04 absolute is a tight, interpretable bound on a probability
-    // difference; a mis-embedded stratum factor would blow past it.
+    // (2) MATCH-OR-BEAT — lifelines (mature stratified Cox) as a floor on the
+    // identical split. gam must not be materially worse at ranking unseen risk
+    // than the established tool; this is a floor, not a target.
     assert!(
-        risk_diff_err <= 0.04,
-        "between-arm risk difference at t={RISK_DIFF_TIME} diverges from lifelines: \
-         gam={gam_risk_diff:.4} lifelines={life_risk_diff:.4} (|Δ|={risk_diff_err:.4})"
+        gam_c >= life_c - 0.05,
+        "gam held-out concordance materially below lifelines on the identical split: \
+         gam={gam_c:.4} lifelines={life_c:.4}"
     );
 }

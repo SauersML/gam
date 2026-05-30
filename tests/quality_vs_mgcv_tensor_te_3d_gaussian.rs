@@ -1,6 +1,16 @@
 //! End-to-end quality: gam's **3-D tensor product smooth** `te(x1, x2, x3)`
-//! must match `mgcv` — the mature, standard GAM implementation — on the same
-//! data, not merely "run without panicking".
+//! must RECOVER a known non-additive surface — not merely reproduce another
+//! tool's fitted output.
+//!
+//! OBJECTIVE METRIC ASSERTED: truth recovery. The grid is generated noise-free
+//! from a closed-form surface `f(x1,x2,x3)`, so the true mean at every training
+//! point is known exactly. The primary pass criterion is
+//!   RMSE(gam_fitted, f) <= 0.5% of the truth's signal range,
+//! i.e. gam reconstructs the surface to a tiny fraction of its amplitude. `mgcv`
+//! is fit on the identical data and demoted to a BASELINE TO MATCH-OR-BEAT on
+//! that same accuracy metric: gam's recovery RMSE must be no worse than 1.10x
+//! mgcv's. We never assert "gam == mgcv's fit"; matching a peer tool's noisy
+//! output is not a quality claim. (We still print rel_l2 vs mgcv for context.)
 //!
 //! 3-D tensor products are the gateway to higher-dimensional smoothing. They
 //! are algebraically identical to 2-D tensors but stress dimension-handling
@@ -11,42 +21,36 @@
 //! the wrong axis would all corrupt the 3-D fit while a lower-dimensional smooth
 //! could still limp along.
 //!
-//! We fit a deterministic 8x8x6 grid over [0,1]^3 whose mean surface is the
-//! genuinely non-additive function
+//! The mean surface is the genuinely non-additive function
 //!   f(x1,x2,x3) = 0.5*sin(2*pi*x1) + 0.3*cos(2*pi*x2) + 0.2*x3
 //!               + 0.4*sin(2*pi*x1)*x2*x3
-//! with both gam and `mgcv::gam(y ~ te(x1,x2,x3,k=5), method="REML")` and assert
-//! the two fitted surfaces agree pointwise on the training grid. The
-//! `sin(2*pi*x1)*x2*x3` cross term lives in the pure tensor-interaction space
-//! that an additive model cannot represent, so recovering it actually exercises
-//! the Kronecker-product interaction blocks — the part of the 3-D construction a
-//! purely additive truth would leave untested.
-//!
-//! Both engines REML-fit the same penalized tensor-product objective on the
-//! same data, so their fitted surfaces must essentially coincide. The bound
-//! `relative_l2 < 0.03` is principled: it is only modestly looser than the
-//! ~0.005 a 1-D smooth achieves vs mgcv, leaving room for legitimate
-//! basis/null-space-convention differences in the 3-D tensor construction
-//! while still flagging any real Kronecker/penalty/centering bug (which would
-//! push rel_l2 well above 0.1).
+//! The `sin(2*pi*x1)*x2*x3` cross term lives in the pure tensor-interaction
+//! space that an additive model cannot represent, so recovering it to within
+//! the RMSE bar actually exercises the Kronecker-product interaction blocks —
+//! the part of the 3-D construction a purely additive truth would leave
+//! untested. A dropped margin, wrong Kronecker order, or interaction block
+//! centered on the wrong axis would fail to reconstruct the cross term and blow
+//! the recovery RMSE far past the bar.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, run_r};
+use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
 use ndarray::Array2;
 
 #[test]
-fn gam_te_3d_matches_mgcv_gaussian() {
+fn gam_te_3d_recovers_nonadditive_surface() {
     init_parallelism();
 
     // ---- deterministic 8x8x6 grid over [0,1]^3, non-additive mean surface --
-    // No random noise: the comparison is between the two REML-penalized fits of
-    // an identical, fully reproducible design, so any divergence is attributable
-    // to the smoother itself, not to sampling variation.
+    // No random noise: y IS the known truth f(x1,x2,x3) at every grid point, so
+    // a fitted value is a direct estimate of the truth and RMSE(fit, y) is the
+    // surface-recovery error. The penalty must lie nearly dormant here (the
+    // signal is smooth and noise-free), so a correct 3-D tensor interpolates the
+    // truth to a tiny fraction of its amplitude.
     let (nx1, nx2, nx3) = (8usize, 8usize, 6usize);
     let n = nx1 * nx2 * nx3;
     assert_eq!(n, 384, "grid must be 8x8x6 = 384 points");
@@ -105,7 +109,6 @@ fn gam_te_3d_matches_mgcv_gaussian() {
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for a gaussian te() smooth");
     };
-    let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
 
     // gam fitted values at the training grid: rebuild the design from the frozen
     // spec at the observed (x1,x2,x3) (identity link => design*beta = mean).
@@ -131,38 +134,51 @@ fn gam_te_3d_matches_mgcv_gaussian() {
         suppressPackageStartupMessages(library(mgcv))
         m <- gam(y ~ te(x1, x2, x3, k = 5), data = df, method = "REML")
         emit("fitted", as.numeric(fitted(m)))
-        emit("edf", sum(m$edf))
         "#,
     );
     let mgcv_fitted = r.vector("fitted");
-    let mgcv_edf = r.scalar("edf");
     assert_eq!(mgcv_fitted.len(), n, "mgcv fitted length mismatch");
 
-    // ---- compare ----------------------------------------------------------
-    let rel = relative_l2(&gam_fitted, mgcv_fitted);
-    let corr = pearson(&gam_fitted, mgcv_fitted);
-    let edf_rel = (gam_edf - mgcv_edf).abs() / mgcv_edf.abs().max(1.0);
+    // ---- OBJECTIVE METRIC: truth recovery ---------------------------------
+    // `y` is the noise-free truth f(x1,x2,x3) itself, so RMSE(fit, y) is the
+    // surface-reconstruction error of each engine.
+    let signal_range = y
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max)
+        - y.iter().copied().fold(f64::INFINITY, f64::min);
+    let gam_rmse = rmse(&gam_fitted, &y);
+    let mgcv_rmse = rmse(mgcv_fitted, &y);
+
+    // Context only (NOT a pass criterion): how close gam's fit is to mgcv's.
+    let rel_vs_mgcv = relative_l2(&gam_fitted, mgcv_fitted);
     eprintln!(
-        "te(x1,x2,x3,k=5): n={n} gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} \
-         rel_l2={rel:.4} pearson={corr:.5} edf_rel={edf_rel:.3}"
+        "te(x1,x2,x3,k=5): n={n} signal_range={signal_range:.4} \
+         gam_rmse={gam_rmse:.5} mgcv_rmse={mgcv_rmse:.5} \
+         gam_rmse/range={:.5} rel_l2_vs_mgcv={rel_vs_mgcv:.4}",
+        gam_rmse / signal_range
     );
 
-    // A real 3-D tensor must track mgcv's fitted surface almost exactly: the
-    // two engines minimize the same REML objective on identical data, and the
-    // smooth non-additive truth is comfortably representable by k=5 cubic
-    // margins so both interpolate it rather than fighting noise. Pearson near 1
-    // confirms the recovered surface shape (including the x1:x2:x3 interaction);
-    // rel_l2 < 0.03 confirms the amplitude/centering. A dropped margin, wrong
-    // Kronecker order, or an interaction block centered on the wrong axis would
-    // fail to recover the cross term and blow rel_l2 far past 0.1, so this bound
-    // asserts something real while tolerating only convention-level basis
-    // differences (cf. the ~0.005 a 1-D smooth achieves vs mgcv).
+    // PRIMARY claim: gam reconstructs the non-additive truth. With a noise-free,
+    // smooth signal comfortably representable by k=5 cubic margins, a correct
+    // 3-D tensor interpolates the surface to well under 0.5% of its amplitude.
+    // The x1:x2:x3 cross term is unrepresentable additively, so clearing this
+    // bar means the Kronecker interaction blocks are constructed, penalized and
+    // centered correctly; any dropped margin / wrong Kronecker order would leave
+    // the cross term unrecovered and push this RMSE far past the bar.
+    let recovery_bar = 0.005 * signal_range;
     assert!(
-        corr > 0.999,
-        "3-D tensor surfaces should be near-identical to mgcv: pearson={corr:.5}"
+        gam_rmse <= recovery_bar,
+        "gam fails to recover the 3-D tensor surface: rmse={gam_rmse:.5} > bar={recovery_bar:.5} \
+         (0.5% of signal_range={signal_range:.4})"
     );
+
+    // SECONDARY claim: match-or-beat the mature reference ON ACCURACY. gam's
+    // recovery error must be no worse than 1.10x mgcv's on the identical data.
     assert!(
-        rel < 0.03,
-        "3-D tensor fit diverges from mgcv: rel_l2={rel:.4}"
+        gam_rmse <= mgcv_rmse * 1.10,
+        "gam's surface-recovery error must match-or-beat mgcv: \
+         gam_rmse={gam_rmse:.5} > 1.10 * mgcv_rmse={:.5}",
+        mgcv_rmse * 1.10
     );
 }

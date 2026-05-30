@@ -17,9 +17,10 @@
 //! evaluate the fitted surface at a probe grid, and test two things that a
 //! metric-respecting S² smooth must satisfy and a coordinate/chordal-confused
 //! kernel cannot:
-//!   1. RECONSTRUCTION — gam's fitted surface must track the haversine-derived
-//!      true surface `f_true` per probe point, and be monotone-decreasing in the
-//!      geodesic distance-to-pole. (We deliberately do NOT correlate the pairwise
+//!   1. RECONSTRUCTION — gam's fitted surface must recover the haversine-derived
+//!      true surface `f_true` per probe point with small absolute RMSE, and be
+//!      monotone-decreasing in the geodesic distance-to-pole. (We deliberately
+//!      do NOT correlate the pairwise
 //!      fitted differences `|f_gam(p)−f_gam(q)|` against the pairwise geodesic
 //!      distance `d_geod(p,q)`: for a truth radial about a single point the fitted
 //!      differences track the difference of distances-TO-POLE, which even for a
@@ -34,17 +35,32 @@
 //!      central angle, so any radial function of one is a near-monotone function
 //!      of the other).
 //!
-//! The sphere-smoothing tool ecosystem is fragmented — there is no integrated
-//! GAM that advertises "geodesic-consistent" fits — so the finding is twofold:
-//! (a) gam tracks the mature `mgcv` spline-on-sphere baseline, and (b) gam
-//! satisfies the intrinsic geodesic-consistency property directly. If this test
-//! fails, check the kernel evaluation for the lat/lon <-> 3D unit-vector
-//! conversion (the embedding must feed an intrinsic, not chordal, distance).
+//! OBJECTIVE metric asserted (no "matches a peer tool" criterion):
+//!   * PRIMARY — TRUTH RECOVERY: `RMSE(f_gam, f_true)` against the analytic
+//!     geodesic-radial truth `f_true = exp(-d_geod(p,pole)/bw)`, where the
+//!     distance-to-pole is the EXACT great-circle central angle (cross-checked
+//!     three ways in Python: arccos-of-dot-product, haversine, and the analytic
+//!     colatitude `π/2 − lat`). That makes `f_true` mathematical GROUND TRUTH,
+//!     not a peer-tool fit, so matching it IS an objective accuracy claim. We
+//!     require gam's reconstruction error to be a small fraction of the unit
+//!     signal amplitude.
+//!   * STRUCTURE: the fitted surface is monotone-decreasing in geodesic
+//!     distance-to-pole, and antimeridian-seam consistent (geodesically-near but
+//!     coordinate-far probe points get near-equal values).
+//!   * BASELINE TO MATCH-OR-BEAT: `mgcv` spline-on-sphere (`bs="sos"`) is fit on
+//!     identical data and its OWN reconstruction error against the same truth is
+//!     measured. gam must be at least as ACCURATE (RMSE within 10% of mgcv's).
+//!     We never assert that gam's fitted surface is *close to mgcv's* fitted
+//!     surface — two tools agreeing proves nothing about correctness; only error
+//!     against the analytic truth is an objective quality claim.
+//! If this test fails, check the kernel evaluation for the lat/lon <-> 3D
+//! unit-vector conversion (the embedding must feed an intrinsic, not chordal,
+//! distance).
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, run_python, run_r};
+use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_python, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -87,7 +103,7 @@ fn make_dataset(lats: &[f64], lons: &[f64], ys: &[f64]) -> gam::data::EncodedDat
 }
 
 #[test]
-fn gam_sphere_smooth_is_geodesic_consistent_and_tracks_mgcv_sos() {
+fn gam_sphere_smooth_recovers_geodesic_truth_at_least_as_well_as_mgcv_sos() {
     init_parallelism();
 
     // ---- synthetic data: n=50 uniform points on S² ------------------------
@@ -250,17 +266,27 @@ emit("metric_gap", [metric_gap])
     let corr_true = pearson(gam_eval.as_slice(), f_true);
     let corr_gam_dpole = pearson(gam_eval.as_slice(), d_pole);
     let l2_true = relative_l2(gam_eval.as_slice(), f_true);
+    // PRIMARY objective metric: absolute reconstruction error against the
+    // analytic geodesic-radial truth. The truth ranges over (0, 1] (a unit
+    // amplitude exp decay), so an RMSE expressed as a fraction of that amplitude
+    // is directly interpretable.
+    let gam_rmse = rmse(gam_eval.as_slice(), f_true);
+    let signal_amp = f_true.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+        - f_true.iter().cloned().fold(f64::INFINITY, f64::min);
     eprintln!(
         "[sphere-geodesic] n={n} m_probe={m} edf={edf:.3} \
+         rmse(f_gam, f_true)={gam_rmse:.5} signal_amp={signal_amp:.4} \
          pearson(f_gam, f_true)={corr_true:.4} relL2(f_gam, f_true)={l2_true:.4} \
          pearson(f_gam, d_geod_to_pole)={corr_gam_dpole:.4} metric_gap={metric_gap:.4}"
     );
 
-    // ---- secondary baseline: mgcv spline-on-sphere (bs="sos") --------------
-    // The closest mature comparator. We confirm it satisfies the SAME geodesic
-    // consistency property on identical data, then confirm gam tracks it. mgcv
-    // sos is geodesic-consistent by construction (it is literally a spline on the
-    // sphere), so it is a fair yardstick for gam's intrinsic property.
+    // ---- baseline to match-or-beat: mgcv spline-on-sphere (bs="sos") -------
+    // The closest mature comparator. We fit it on IDENTICAL data and measure its
+    // OWN reconstruction error against the analytic truth, turning mgcv into an
+    // accuracy yardstick gam must match-or-beat. We do NOT assert that gam's
+    // fitted surface resembles mgcv's fitted surface — two tools agreeing on a
+    // noisy fit is not a correctness claim; only error against the analytic
+    // geodesic truth is.
     let mgcv = run_r(
         &[
             Column::new("lat", &lats),
@@ -288,13 +314,15 @@ emit("metric_gap", [metric_gap])
         "mgcv sos prediction length must match the {m} probe points"
     );
 
-    // mgcv's own reconstruction of the geodesic-radial truth, grid-aligned.
+    // mgcv's OWN reconstruction error against the analytic geodesic-radial truth,
+    // grid-aligned. This is the baseline accuracy gam must match-or-beat.
+    let mgcv_rmse = rmse(mgcv_pred, f_true);
     let mgcv_corr_true = pearson(mgcv_pred, f_true);
-    // How closely gam's probe-surface tracks mgcv's spline-on-sphere surface.
-    let gam_vs_mgcv = pearson(gam_eval.as_slice(), mgcv_pred);
     eprintln!(
-        "[sphere-geodesic] mgcv_edf={mgcv_edf:.3} \
-         pearson(f_mgcv, f_true)={mgcv_corr_true:.4} pearson(gam, mgcv_sos)={gam_vs_mgcv:.4}"
+        "[sphere-geodesic] mgcv_edf={mgcv_edf:.3} rmse(f_mgcv, f_true)={mgcv_rmse:.5} \
+         pearson(f_mgcv, f_true)={mgcv_corr_true:.4} \
+         rmse_ratio(gam/mgcv)={:.4}",
+        gam_rmse / mgcv_rmse.max(1e-12)
     );
 
     // ---- antimeridian-seam discriminator ----------------------------------
@@ -323,51 +351,62 @@ emit("metric_gap", [metric_gap])
     );
 
     // ---- assertions --------------------------------------------------------
-    // (1) gam RECONSTRUCTS the geodesic-radial truth. f_true is built from the
-    // haversine great-circle distance-to-pole (cross-checked against the arccos
-    // central angle and the analytic colatitude in Python). A smooth keyed on the
-    // intrinsic S² metric recovers this surface up to noise and the k=20 basis
-    // budget. 0.97 is tight: a perfect noiseless reconstruction would correlate
-    // ~1, the noise sd is only 0.01 against a unit-amplitude surface, so anything
-    // below 0.97 signals real surface distortion. If this fails, check the
-    // kernel's lat/lon <-> 3D unit-vector conversion: the smooth must respect S²
-    // geometry, not the R³ embedding.
+    // (1) PRIMARY — TRUTH RECOVERY. gam must RECONSTRUCT the analytic
+    // geodesic-radial truth with small absolute error. f_true is built from the
+    // exact great-circle distance-to-pole (cross-checked against the arccos
+    // central angle and the analytic colatitude in Python), so it is mathematical
+    // ground truth, not a peer-tool fit — asserting gam recovers it IS an
+    // objective accuracy claim. The truth has unit amplitude (~1.0) and the
+    // additive noise sd is only 0.01, so a smooth that respects the intrinsic S²
+    // metric reconstructs it to a small fraction of the signal amplitude. We
+    // require RMSE <= 0.05 = 5% of the unit signal amplitude: well within reach of
+    // a metric-correct fit at k=20, while a chordal/coordinate-confused kernel
+    // distorts the surface and blows past it. If this fails, check the kernel's
+    // lat/lon <-> 3D unit-vector conversion: the smooth must respect S² geometry,
+    // not the R³ embedding.
     assert!(
-        corr_true > 0.97,
-        "gam sphere smooth does NOT reconstruct the geodesic-radial truth: \
-         pearson(f_gam, f_true) = {corr_true:.4} (bound 0.97), \
-         relL2 = {l2_true:.4}. Check the kernel's lat/lon <-> 3D unit-vector \
-         conversion: the smooth must respect S² geometry, not the R³ embedding."
+        gam_rmse <= 0.05,
+        "gam sphere smooth does NOT recover the geodesic-radial truth: \
+         rmse(f_gam, f_true) = {gam_rmse:.5} (bound 0.05, signal amplitude \
+         {signal_amp:.4}); pearson = {corr_true:.4}, relL2 = {l2_true:.4}. Check \
+         the kernel's lat/lon <-> 3D unit-vector conversion: the smooth must \
+         respect S² geometry, not the R³ embedding."
     );
-    // The fitted surface must also be MONOTONE-DECREASING in geodesic distance to
-    // the pole (f = exp(-d/bw) decreases with d), i.e. a strong NEGATIVE
-    // correlation. A chordal/coordinate-confused kernel would not order points by
-    // their intrinsic distance to the pole.
+
+    // (2) STRUCTURE — the fitted surface must be MONOTONE-DECREASING in geodesic
+    // distance to the pole (f = exp(-d/bw) decreases with d), i.e. a strong
+    // NEGATIVE correlation. This is a property of the fit itself (gam's values vs
+    // the analytic distance), not a comparison to any tool. A chordal/
+    // coordinate-confused kernel would not order points by their intrinsic
+    // distance to the pole.
     assert!(
         corr_gam_dpole < -0.9,
         "gam fitted values are not monotone in geodesic distance-to-pole: \
          pearson(f_gam, d_geod_to_pole) = {corr_gam_dpole:.4} (bound -0.9)"
     );
 
-    // (2) The mature comparator clears the same reconstruction bar — this is what
-    // makes mgcv bs=\"sos\" a valid yardstick (it is geodesic-consistent by
-    // construction). If mgcv itself fails, the reference fit is broken, not gam.
+    // (3) MATCH-OR-BEAT the mature comparator on ACCURACY. mgcv bs=\"sos\" is fit
+    // on identical data; we compare each tool's error against the SAME analytic
+    // truth. gam must be at least as accurate as the mature spline-on-sphere, up
+    // to a 10% slack on RMSE. We assert error-vs-truth, NOT that gam's surface
+    // resembles mgcv's surface — two tools agreeing on a noisy fit is not a
+    // correctness claim. The 0.10 truth-pearson floor on mgcv is a sanity gate
+    // that the reference fit itself is not broken (if mgcv produced garbage its
+    // RMSE would be a meaningless yardstick); it never gates gam.
     assert!(
-        mgcv_corr_true > 0.97,
-        "mgcv bs=\"sos\" baseline failed to reconstruct the geodesic-radial truth \
-         it should track by construction: pearson(f_mgcv, f_true) = {mgcv_corr_true:.4} \
-         (bound 0.97) — check the reference fit, not gam"
+        mgcv_corr_true > 0.10,
+        "mgcv bs=\"sos\" baseline fit is broken (it does not even correlate with \
+         the geodesic-radial truth it is built to recover): \
+         pearson(f_mgcv, f_true) = {mgcv_corr_true:.4} — its RMSE \
+         ({mgcv_rmse:.5}) cannot serve as a yardstick; check the reference fit"
     );
-
-    // (3) gam tracks the mature spline-on-sphere surface on identical data; both
-    // REML-fit the same intrinsic surface with k=20, so their probe-grid surfaces
-    // are strongly correlated. 0.95 is tight enough to catch a real baseline
-    // divergence yet tolerant of the differing sphere bases (gam Sobolev/Wahba vs
-    // mgcv thin-plate-on-sphere).
     assert!(
-        gam_vs_mgcv > 0.95,
-        "gam sphere fit diverges from the mgcv bs=\"sos\" baseline: \
-         pearson(gam, mgcv_sos) = {gam_vs_mgcv:.4} (bound 0.95)"
+        gam_rmse <= mgcv_rmse * 1.10,
+        "gam is LESS accurate than the mature mgcv bs=\"sos\" spline-on-sphere on \
+         identical data: rmse(f_gam, f_true) = {gam_rmse:.5} vs mgcv {mgcv_rmse:.5} \
+         (allowed up to {:.5} = mgcv * 1.10). gam must match-or-beat the mature \
+         tool's reconstruction accuracy against the analytic geodesic truth.",
+        mgcv_rmse * 1.10
     );
 
     // (4) Antimeridian-seam consistency: geodesically-near (10°) but

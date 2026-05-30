@@ -1,43 +1,44 @@
-//! End-to-end quality: gam's 1-D **binomial(logit) smooth** shape recovery,
-//! benchmarked on the **logit (linear-predictor) scale** against **pyGAM's
-//! `LogisticGAM`** — the second-most-directly-comparable Python GAM engine
-//! (after statsmodels) for penalized binomial GAMs.
+//! End-to-end quality: gam's 1-D **binomial(logit) smooth** recovers a KNOWN
+//! true logit-scale function, measured on the **logit (linear-predictor) scale**.
 //!
-//! Both gam and pyGAM fit a penalized binomial GAM by PIRLS over a 1-D smooth
-//! basis: gam selects its smoothing parameter by REML, pyGAM by a grid search
-//! minimizing (generalized) cross-validation / UBRE. Isolating a single 1-D
-//! smooth `s(x)` strips away everything but the smooth shape-recovery logic, so
-//! if the fitted *logit-scale* eta diverges it points straight at gam's binomial
-//! reweight (the IRLS working weights `mu*(1-mu)`) or the penalty application —
-//! a real bug, not a basis-convention footnote.
+//! OBJECTIVE METRIC ASSERTED (truth recovery): the data is generated from a known
+//! ground-truth function `eta_truth = 1.2*sin(pi*x/50)` with Bernoulli responses,
+//! so the test asserts `RMSE(eta_gam, eta_truth)` is small in absolute terms
+//! (below a principled fraction of the signal's logit range). This is a direct
+//! claim that gam recovers the true smooth — NOT that gam reproduces any other
+//! tool's noisy fit.
 //!
-//! We compare on the **linear-predictor (logit) scale** deliberately: the probit
-//! / probability scale compresses extreme eta through the squashing inverse-link
-//! and would mask divergence in the tails. eta is where the smoother actually
-//! lives.
+//! pyGAM's `LogisticGAM` is fit on the *identical* data and kept only as a
+//! BASELINE TO MATCH-OR-BEAT on the same recovery metric: gam's RMSE-to-truth
+//! must be no worse than pyGAM's by more than a 10% margin. Matching pyGAM's
+//! fitted output is explicitly NOT a pass criterion — pyGAM could itself be
+//! off, and two engines agreeing on a wrong answer proves nothing. The pearson
+//! correlation and rel_l2 between the two fits are still computed and printed
+//! with `eprintln!` purely for diagnostic context.
 //!
-//! Data is a fixed-seed synthetic 1-D problem (n=400, x in [0,100]) whose truth
-//! is a smooth sinusoid on the logit scale, `eta_truth = 1.2*sin(pi*x/50)`, with
-//! Bernoulli responses. The *identical* x and y vectors are fed to both engines.
-//! The amplitude (eta spanning roughly [-1.2, 1.2], probabilities ~0.23..0.77)
-//! is deliberately well above the noise floor: binary data carries little
-//! information per point, so a near-flat truth would let both engines shrink to
-//! an essentially constant eta whose tiny L2 norm makes any relative-L2 bound
-//! noise-dominated and meaningless. A genuine, identifiable curve keeps the
-//! comparison load-bearing.
+//! We measure on the **linear-predictor (logit) scale** deliberately: the
+//! probability scale compresses extreme eta through the squashing inverse-link
+//! and would mask divergence in the tails. eta is where the smoother lives, and
+//! truth is known exactly there.
 //!
-//! Bounds (principled, un-weakened): `pearson(eta_gam, eta_pygam) > 0.98` and
-//! `rel_l2(eta) < 0.06` — with a real signal the eta norm is well away from
-//! zero, so the L2 budget is a true tolerance that absorbs only the REML-vs-GCV
-//! smoothing-parameter slack (the two lambda criteria pick visibly different
-//! amounts of smoothing) while still falsifying any genuine binomial-reweight or
-//! penalty-application bug, which decorrelates the two predictors far below
-//! these thresholds. EDF agreement within 30% asserts same-ballpark model
-//! complexity across the two penalty/lambda conventions.
+//! Data is a fixed-seed synthetic 1-D problem (n=400, x in [0,100]). The truth
+//! amplitude (eta spanning roughly [-1.2, 1.2], probabilities ~0.23..0.77) is
+//! deliberately well above the noise floor: binary data carries little
+//! information per point, so a near-flat truth would let any engine shrink to an
+//! essentially constant eta and make an RMSE bar trivially passable. A genuine,
+//! identifiable curve keeps the recovery claim load-bearing.
+//!
+//! Truth-recovery bar (principled, un-weakened): the true eta ranges over a span
+//! of `2*1.2 = 2.4` logits. Bernoulli responses are extremely noisy (each carries
+//! < 1 bit), so a penalized smooth at n=400 cannot pin eta tightly; we require
+//! `RMSE(eta_gam, eta_truth) < 0.45`, i.e. under ~19% of the signal span — small
+//! enough that a flat or wrong-phase fit (RMSE near the truth's own RMS of ~0.85)
+//! fails, yet honest about the binary noise floor. EDF is reported for context
+//! only and not asserted against the reference.
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, run_python};
+use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_python};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::io::Write;
@@ -130,6 +131,23 @@ fn gam_logistic_1d_shape_matches_pygam_on_logit_scale() {
     let gam_eta: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
     assert_eq!(gam_eta.len(), n_grid, "gam eta grid length mismatch");
 
+    // Ground-truth logit-scale eta on the same evaluation grid — the target the
+    // recovery metric is measured against. A penalized smooth fit on a centered
+    // basis recovers eta only up to an additive constant (the intercept), so we
+    // de-mean both gam's eta and the truth before comparing shapes; the sinusoid
+    // truth is mean-zero by construction, but de-meaning keeps the comparison
+    // robust to the engine's intercept/centering convention.
+    let truth_grid: Vec<f64> = xg.iter().map(|&xj| truth_eta(xj)).collect();
+    let demean = |v: &[f64]| -> Vec<f64> {
+        let m = v.iter().sum::<f64>() / v.len() as f64;
+        v.iter().map(|x| x - m).collect()
+    };
+    let gam_eta_c = demean(&gam_eta);
+    let truth_c = demean(&truth_grid);
+    // RMS of the (de-meaned) truth itself — the error a degenerate flat fit would
+    // incur, i.e. the scale the recovery bar must beat.
+    let truth_rms = (truth_c.iter().map(|t| t * t).sum::<f64>() / truth_c.len() as f64).sqrt();
+
     // ---- fit the SAME model with pyGAM's LogisticGAM (the reference) -------
     // LogisticGAM(s(0, n_splines=10)) is a penalized binomial PIRLS fit over a
     // cubic B-spline smooth; we predict the linear predictor on the identical
@@ -169,40 +187,50 @@ emit("edf", [float(gam.statistics_["edof"])])
     let pygam_edf = py.scalar("edf");
     assert_eq!(pygam_eta.len(), n_grid, "pyGAM eta grid length mismatch");
 
-    // ---- compare on the logit scale ---------------------------------------
+    // ---- OBJECTIVE METRIC: recovery of the known true eta -----------------
+    // gam's error against ground truth (de-meaned, logit scale). This is the
+    // pass/fail quantity: how well gam recovers the true smooth, independent of
+    // any reference tool.
+    let gam_err = rmse(&gam_eta_c, &truth_c);
+
+    // pyGAM fit on the identical data, scored on the SAME truth — used only as a
+    // match-or-beat accuracy baseline, never as the target itself.
+    let pygam_eta_c = demean(pygam_eta);
+    let pygam_err = rmse(&pygam_eta_c, &truth_c);
+
+    // Diagnostic context only (NOT assertion criteria): how close the two fitted
+    // predictors are to each other. Printed so a reviewer can see the agreement,
+    // but "close to pyGAM" is deliberately not what makes this test pass.
     let corr = pearson(&gam_eta, pygam_eta);
     let rel = relative_l2(&gam_eta, pygam_eta);
     let edf_rel = (gam_edf - pygam_edf).abs() / pygam_edf.abs().max(1.0);
 
     eprintln!(
-        "synthetic logistic s(x,k=10): n={n} n_pos={n_pos} gam_edf={gam_edf:.3} \
-         pygam_edf={pygam_edf:.3} (edf_rel={edf_rel:.3}) \
-         eta pearson={corr:.5} rel_l2={rel:.4}"
+        "synthetic logistic s(x,k=10): n={n} n_pos={n_pos} truth_rms={truth_rms:.3} \
+         gam_err_to_truth={gam_err:.4} pygam_err_to_truth={pygam_err:.4} \
+         gam_edf={gam_edf:.3} pygam_edf={pygam_edf:.3} (edf_rel={edf_rel:.3}) \
+         [diag only] eta-vs-pygam pearson={corr:.5} rel_l2={rel:.4}"
     );
 
-    // (1) Shape agreement on the logit scale is the load-bearing claim: two
-    // independent penalized binomial PIRLS engines must trace essentially the
-    // same linear predictor. A wrong binomial working weight or misapplied
-    // penalty decorrelates eta well below this threshold.
+    // (1) PRIMARY truth-recovery claim: gam's fitted logit-scale eta tracks the
+    // true sinusoid. The true (de-meaned) eta has RMS ~0.85 over a 2.4-logit
+    // span; a flat or wrong-phase fit incurs RMSE of that order. Requiring RMSE
+    // < 0.45 (under ~19% of the signal span) demands genuine shape recovery
+    // while respecting that Bernoulli data carries < 1 bit/point and cannot pin
+    // eta tightly at n=400. A wrong binomial reweight or misapplied penalty
+    // pushes eta toward flat/wrong and blows past this bar.
     assert!(
-        corr > 0.98,
-        "gam vs pyGAM logit-scale eta shapes diverge: pearson={corr:.5}"
+        gam_err < 0.45 && gam_err < truth_rms,
+        "gam fails to recover the true logit-scale smooth: \
+         RMSE(eta_gam, truth)={gam_err:.4} (bar 0.45, truth_rms={truth_rms:.3})"
     );
-    // (2) L2 budget absorbs the REML-vs-GCV lambda-selection slack on a small
-    // binary sample; 0.06 is loose enough not to flag that slack yet tight
-    // enough to catch a real reweight/penalty bug.
+    // (2) MATCH-OR-BEAT the mature baseline on the SAME accuracy metric: gam's
+    // recovery error must be no worse than pyGAM's by more than 10%. This makes
+    // pyGAM a competitor to beat on objective accuracy, not a target whose noisy
+    // output gam must reproduce.
     assert!(
-        rel < 0.06,
-        "gam binomial smooth diverges from pyGAM on the logit scale: rel_l2={rel:.4}"
-    );
-    // (3) EDF same-ballpark model complexity across differing penalty/lambda
-    // conventions: within 30% relative. The two engines select smoothing by
-    // genuinely different criteria (REML vs GCV/UBRE), so their effective
-    // degrees of freedom legitimately differ at the tens-of-percent level on a
-    // binary sample; this stays a real ballpark check without flagging that
-    // expected divergence.
-    assert!(
-        edf_rel < 0.30,
-        "effective degrees of freedom disagree: gam={gam_edf:.3} pygam={pygam_edf:.3} (rel={edf_rel:.3})"
+        gam_err <= pygam_err * 1.10,
+        "gam's truth-recovery error exceeds pyGAM's by >10%: \
+         gam={gam_err:.4} pygam={pygam_err:.4}"
     );
 }

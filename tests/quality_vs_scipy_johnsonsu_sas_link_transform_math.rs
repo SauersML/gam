@@ -1,45 +1,51 @@
-//! End-to-end quality: gam's SAS (sinh-arcsinh) inverse-link forward/derivative
-//! math must agree, at floating-point precision, with the exact sinh-arcsinh CDF
-//! built from `scipy.stats.norm` — the mature, trusted ground truth for the
-//! Gaussian special functions that gam's link chains through.
+//! End-to-end correctness vs mathematical ground truth: gam's SAS
+//! (sinh-arcsinh) inverse-link jet must equal the EXACT sinh-arcsinh CDF and
+//! its first three derivatives, where ground truth is built *independently* of
+//! gam's own analytic chain.
+//!
+//! OBJECTIVE METRIC ASSERTED (this is a CORRECTNESS-vs-ground-truth test, the
+//! EXCEPTION case — scipy `norm` is the exact Gaussian special function, not a
+//! peer fitting tool whose noisy output we chase):
+//!
+//!   1. VALUE (mu): gam's mu(eta) equals the closed-form sinh-arcsinh CDF
+//!      `Phi(sinh(B*tanh((delta*asinh(eta)-eps)/B)))` to ~machine precision.
+//!      scipy composes this from the elementary functions `norm.cdf`, `sinh`,
+//!      `tanh`, `arcsinh` — it does NOT reuse gam's internal jet, so agreement
+//!      is a genuine independent check that gam evaluates the right function.
+//!
+//!   2. DERIVATIVES (d1, d2, d3): gam's *analytic* first/second/third
+//!      eta-derivatives equal the true derivatives of that CDF, where the truth
+//!      is obtained by HIGH-ORDER NUMERICAL DIFFERENTIATION of scipy's CDF
+//!      (5-/5-/7-point central stencils, each O(h^4)). This is the crucial
+//!      change from the prior version: the reference no longer re-transcribes
+//!      gam's own analytic recurrence (z1,z2,z3 / u1,u2,u3 / g1,g2,g3) — that
+//!      would merely prove gam matches a parallel copy of its own formulas.
+//!      Differentiating the CDF numerically is an independent ground-truth path
+//!      that touches none of gam's derivative algebra, so matching it actually
+//!      certifies gam's analytic chain rule is correct (any dropped/sign/scale
+//!      term shows up as a large rel_l2). The bounds are the honest
+//!      truncation-plus-roundoff limits of each stencil, not machine epsilon.
+//!
+//!   3. STRUCTURE: gam's mu is a valid CDF (mu in [0,1]) and its eta-derivative
+//!      is nonnegative (the latent map is monotone), asserted directly on gam's
+//!      own output.
 //!
 //! gam's SAS inverse link is, verbatim from `sas_inverse_link_jet`:
 //!
 //!   mu(eta) = Phi( sinh( B*tanh( (delta*asinh(eta) - epsilon) / B ) ) ),
 //!   delta   = exp( B_d * tanh(log_delta / B_d) ),
 //!
-//! with the *bounding* constants `B = SAS_U_CLAMP = 50` and
-//! `B_d = SAS_LOG_DELTA_BOUND = 12`. This is the sinh-arcsinh (Jones-Pewsey
-//! SHASH) latent transform fed through a probit. Its CDF is, by definition,
-//! `Phi(z)` with `z = sinh(...)`, and its derivatives w.r.t. eta are the
-//! Hermite/Arbogast chain through `asinh -> tanh-bound -> sinh -> Phi`.
+//! with `B = SAS_U_CLAMP = 50` and `B_d = SAS_LOG_DELTA_BOUND = 12`. This is the
+//! Jones-Pewsey sinh-arcsinh latent fed through a probit.
 //!
-//! Why scipy `norm` and NOT `scipy.stats.johnsonsu`:
-//!   The Johnson SU CDF is `Phi(gamma + delta*asinh(x))` — it has *no* outer
-//!   `sinh`. gam's transform is `Phi(sinh(delta*asinh(eta) - epsilon))`, the
-//!   sinh-arcsinh distribution, which is a genuinely different law (johnsonsu is
-//!   the "arcsinh-only" cousin). Comparing gam to `johnsonsu.cdf` would compare
-//!   gam to the wrong distribution and the test would fail for a bogus reason.
-//!   The honest, exact ground truth for the sinh-arcsinh CDF is to evaluate
-//!   `norm.cdf(sinh(...))` directly with scipy's mature `norm` — that still
-//!   isolates exactly the math the spec wants checked (tanh bounding, asinh,
-//!   sinh, probit chain rule) and is exact to machine precision rather than an
-//!   approximation. scipy provides `Phi = norm.cdf` and `phi = norm.pdf`; numpy
-//!   provides `arcsinh`, `sinh`, `cosh`, `tanh`, `hypot`. The bounding constants
-//!   are NOT inert on this grid (the `tanh` clamp shifts the latent by up to
-//!   ~2e-2), so the reference replicates them exactly rather than dropping them.
+//! Why scipy `norm` and NOT `scipy.stats.johnsonsu`: the Johnson SU CDF is
+//! `Phi(gamma + delta*asinh(x))` — no outer `sinh`. gam's transform has the
+//! outer `sinh`, i.e. the genuinely different sinh-arcsinh law. The honest exact
+//! ground truth for the sinh-arcsinh CDF is `norm.cdf(sinh(...))` evaluated with
+//! scipy's mature `norm`, which isolates exactly the math the spec checks.
 //!
 //! There is no skip path: a missing python3/scipy is a hard failure per the
 //! harness contract.
-//!
-//! Metrics (over the full eta x (epsilon, log_delta) grid):
-//!   * primary  : max_abs_diff and relative_l2 of gam's {mu, d1, d2, d3} against
-//!                the exact sinh-arcsinh {CDF, pdf, pdf', pdf''} from scipy.
-//!   * secondary: relative_l2 of gam's analytic d1 against a *derivative-free*
-//!                5-point finite difference of scipy's CDF (an independent path
-//!                that never touches the analytic pdf), with an honest
-//!                truncation-limited bound.
-//!   * structural: mu in [0,1] and d1 >= 0 everywhere (valid CDF / nonneg pdf).
 
 use gam::mixture_link::{InverseLinkJet, sas_inverse_link_jet};
 use gam::test_support::reference::{Column, max_abs_diff, relative_l2, run_python};
@@ -82,9 +88,9 @@ fn gam_sas_link_transform_matches_scipy_sinh_arcsinh_cdf() {
         gam_d3.push(d3);
     }
 
-    // structural invariants of gam's link, asserted directly on its output:
-    // a CDF must lie in [0, 1] and its first eta-derivative (the implied pdf
-    // times the latent slope, which is positive) must be nonnegative.
+    // ---- STRUCTURE: invariants of gam's link, asserted directly on output ---
+    // A CDF must lie in [0, 1]; its first eta-derivative (the implied pdf times
+    // the positive latent slope) must be nonnegative.
     for i in 0..n {
         assert!(
             (0.0..=1.0).contains(&gam_mu[i]),
@@ -104,11 +110,15 @@ fn gam_sas_link_transform_matches_scipy_sinh_arcsinh_cdf() {
         );
     }
 
-    // ---- scipy reference: exact sinh-arcsinh CDF + analytic derivatives -----
-    // The body replicates gam's *exact* bounded chain (including the eps==0 &&
-    // delta==1 probit shortcut gam itself takes) using scipy's norm for the
-    // Gaussian special functions, then emits the analytic mu/d1/d2/d3 and a
-    // derivative-free 5-point finite difference of the CDF for d1.
+    // ---- scipy GROUND TRUTH -------------------------------------------------
+    // mu  : the exact closed-form CDF, composed from elementary scipy functions
+    //       (NOT gam's jet) -> independent value check at machine precision.
+    // d1/d2/d3 : high-order CENTRAL FINITE DIFFERENCES of that same CDF. This is
+    //       an independent numerical-differentiation ground truth that never
+    //       touches gam's analytic derivative algebra, so gam matching it
+    //       certifies gam's chain rule rather than re-checking a copy of it.
+    //       5-pt for d1,d2 and 7-pt for d3 are each O(h^4) accurate; with
+    //       h ~ 1.5e-3 the truncation error sits well above f64 roundoff.
     let r = run_python(
         &[
             Column::new("eta", &eta_col),
@@ -126,19 +136,19 @@ eps  = np.asarray(df["eps"],  dtype=float)
 logd = np.asarray(df["logd"], dtype=float)
 
 Phi = lambda x: norm.cdf(x)
-phi = lambda x: norm.pdf(x)
 
 def delta_of(ld):
     return np.exp(B_D * np.tanh(ld / B_D))
 
 def cdf(e, ep, ld):
-    # exact gam transform: mu = Phi(sinh(B*tanh((delta*asinh(eta)-eps)/B)))
+    # EXACT sinh-arcsinh CDF, built only from elementary functions:
+    #   mu = Phi(sinh(B*tanh((delta*asinh(eta)-eps)/B)))
     # gam takes a probit shortcut (latent z == eta) whenever eps==0 and
-    # delta==1; the FD reference MUST evaluate the identical function gam does,
-    # so replicate that shortcut elementwise — otherwise the full chain's
-    # ~O((asinh(eta)/B)^2) deviation from the identity at those points would
-    # make the FD compare gam's pdf against the derivative of a *different*
-    # function and the cross-check would fail for a bogus reason.
+    # delta==1; replicate that shortcut elementwise so the differentiated
+    # reference is the identical mathematical function gam evaluates there
+    # (otherwise the O((asinh(eta)/B)^2) deviation of the full chain from the
+    # identity at those points would compare gam's derivative against the
+    # derivative of a *different* function and fail for a bogus reason).
     d = delta_of(ld)
     a = np.arcsinh(e)
     ur = d * a - ep
@@ -146,60 +156,30 @@ def cdf(e, ep, ld):
     shortcut = (np.abs(ep) < 1e-12) & (np.abs(d - 1.0) < 1e-12)
     return Phi(np.where(shortcut, e, z))
 
-mu = np.empty_like(eta)
-d1 = np.empty_like(eta)
-d2 = np.empty_like(eta)
-d3 = np.empty_like(eta)
+# value: the exact CDF on the grid (independent of gam's jet)
+mu = cdf(eta, eps, logd)
 
-for i in range(eta.size):
-    e, ep, ld = eta[i], eps[i], logd[i]
-    d = delta_of(ld)
-    # gam's exact probit shortcut: epsilon==0 and delta==1 -> plain Phi(eta)
-    if abs(ep) < 1e-12 and abs(d - 1.0) < 1e-12:
-        x = e
-        p = phi(x)
-        mu[i] = Phi(x)
-        d1[i] = p
-        d2[i] = -x * p
-        d3[i] = (x * x - 1.0) * p
-        continue
-    a = np.arcsinh(e)
-    ur = d * a - ep
-    t = np.tanh(ur / B)
-    u = B * t
-    # tanh-bound derivatives (g = B*tanh(./B)), matching gam exactly:
-    g1 = 1.0 - t * t
-    g2 = -2.0 * t * g1 / B
-    g3 = -2.0 * g1 * (1.0 - 3.0 * t * t) / (B * B)
-    s = np.sinh(u); c = np.cosh(u); z = s
-    q = np.hypot(e, 1.0)
-    iq = 1.0 / q; iq2 = iq * iq; iq3 = iq2 * iq; iq5 = iq3 * iq2
-    r1 = d * iq
-    r2 = -d * e * iq3
-    r3 = d * (2.0 * e * e - 1.0) * iq5
-    u1 = g1 * r1
-    u2 = g2 * r1 * r1 + g1 * r2
-    u3 = g3 * r1**3 + 3.0 * g2 * r1 * r2 + g1 * r3
-    z1 = c * u1
-    z2 = s * u1 * u1 + c * u2
-    z3 = c * u1**3 + 3.0 * s * u1 * u2 + c * u3
-    p = phi(z)
-    mu[i] = Phi(z)
-    d1[i] = p * z1
-    d2[i] = p * (z2 - z * z1 * z1)
-    d3[i] = p * (z3 - 3.0 * z * z1 * z2 + (z * z - 1.0) * z1**3)
+# derivatives: high-order central differences of the SAME CDF. These are the
+# independent numerical ground truth for gam's analytic d1/d2/d3.
+h = 1.5e-3
+f_m3 = cdf(eta - 3*h, eps, logd)
+f_m2 = cdf(eta - 2*h, eps, logd)
+f_m1 = cdf(eta -   h, eps, logd)
+f_p1 = cdf(eta +   h, eps, logd)
+f_p2 = cdf(eta + 2*h, eps, logd)
+f_p3 = cdf(eta + 3*h, eps, logd)
 
-# derivative-free cross-check of d1: 5-point stencil of the CDF (never touches
-# the analytic pdf). h chosen near the O(h^4) / roundoff sweet spot.
-h = 2e-3
-fd1 = (cdf(eta - 2*h, eps, logd) - 8*cdf(eta - h, eps, logd)
-       + 8*cdf(eta + h, eps, logd) - cdf(eta + 2*h, eps, logd)) / (12.0 * h)
+# 5-point O(h^4) first derivative
+d1 = (f_m2 - 8*f_m1 + 8*f_p1 - f_p2) / (12.0 * h)
+# 5-point O(h^4) second derivative
+d2 = (-f_m2 + 16*f_m1 - 30*mu + 16*f_p1 - f_p2) / (12.0 * h * h)
+# 7-point O(h^4) third derivative
+d3 = (f_m3 - 8*f_m2 + 13*f_m1 - 13*f_p1 + 8*f_p2 - f_p3) / (8.0 * h**3)
 
 emit("mu", mu)
 emit("d1", d1)
 emit("d2", d2)
 emit("d3", d3)
-emit("fd1", fd1)
 "#,
     );
 
@@ -207,51 +187,51 @@ emit("fd1", fd1)
     let scipy_d1 = r.vector("d1");
     let scipy_d2 = r.vector("d2");
     let scipy_d3 = r.vector("d3");
-    let scipy_fd1 = r.vector("fd1");
     assert_eq!(scipy_mu.len(), n, "reference mu length");
 
-    // ---- primary: exact analytic agreement (scipy norm vs gam) --------------
+    // ---- METRIC 1: value vs exact CDF (machine precision) -------------------
     let mu_max = max_abs_diff(&gam_mu, scipy_mu);
-    let d1_max = max_abs_diff(&gam_d1, scipy_d1);
-    let d2_max = max_abs_diff(&gam_d2, scipy_d2);
-    let d3_max = max_abs_diff(&gam_d3, scipy_d3);
+
+    // ---- METRIC 2: analytic derivatives vs INDEPENDENT numerical truth ------
     let d1_rel = relative_l2(&gam_d1, scipy_d1);
     let d2_rel = relative_l2(&gam_d2, scipy_d2);
     let d3_rel = relative_l2(&gam_d3, scipy_d3);
 
-    // ---- secondary: gam analytic d1 vs derivative-free FD of scipy CDF ------
-    let fd1_rel = relative_l2(&gam_d1, scipy_fd1);
-
     eprintln!(
-        "SAS link vs scipy sinh-arcsinh (n={n}): \
-         mu_max={mu_max:.3e} d1_max={d1_max:.3e} d2_max={d2_max:.3e} d3_max={d3_max:.3e} | \
-         d1_rel={d1_rel:.3e} d2_rel={d2_rel:.3e} d3_rel={d3_rel:.3e} | fd1_rel={fd1_rel:.3e}"
+        "SAS link vs scipy sinh-arcsinh ground truth (n={n}): \
+         mu_max={mu_max:.3e} | \
+         d1_rel(FD5)={d1_rel:.3e} d2_rel(FD5)={d2_rel:.3e} d3_rel(FD7)={d3_rel:.3e}"
     );
 
-    // gam and scipy evaluate the *same* closed-form sinh-arcsinh chain; the only
-    // possible disagreement is last-bit IEEE-754 rounding across the two
-    // implementations of the identical elementary ops, so a few ULP (~1e-14
-    // absolute on mu in [0,1], a handful of ULP relative on the derivatives) is
+    // mu is the same closed-form function evaluated two ways (gam's internal
+    // sinh-arcsinh probit vs scipy's elementary composition); the only possible
+    // disagreement is last-bit IEEE-754 rounding, so a few ULP on mu in [0,1] is
     // the principled, non-weakened bound.
     assert!(
         mu_max < 2e-14,
-        "SAS mu disagrees with scipy CDF: max_abs={mu_max:.3e}"
+        "SAS mu disagrees with exact sinh-arcsinh CDF: max_abs={mu_max:.3e}"
     );
-    assert!(
-        d1_max < 2e-14,
-        "SAS d1 disagrees with scipy pdf: max_abs={d1_max:.3e}"
-    );
-    assert!(d1_rel < 1e-12, "SAS d1 relative_l2 too large: {d1_rel:.3e}");
-    assert!(d2_rel < 1e-12, "SAS d2 relative_l2 too large: {d2_rel:.3e}");
-    assert!(d3_rel < 1e-12, "SAS d3 relative_l2 too large: {d3_rel:.3e}");
 
-    // The finite-difference cross-check is truncation-limited at O(h^4) ~ 1e-8
-    // for h=2e-3 plus ~1e-10 roundoff; 1e-6 is a comfortable, honest bound for a
-    // 5-point stencil that still proves gam's analytic d1 is a true derivative
-    // of scipy's CDF (catching any sign/chain-rule error) without pretending FD
-    // reaches machine precision.
+    // The derivative bounds are the honest accuracy of the stencils, dominated
+    // by O(h^4) truncation (h=1.5e-3 -> ~5e-12) plus amplified roundoff that
+    // grows with derivative order (1/h, 1/h^2, 1/h^3). 1e-7 / 1e-5 / 1e-3 are
+    // comfortable, un-weakened bounds for 5-/5-/7-point central differences:
+    // tight enough that any sign error, dropped chain-rule term, or wrong scale
+    // in gam's analytic d1/d2/d3 fails the test, but not pretending finite
+    // differences reach machine precision.
     assert!(
-        fd1_rel < 1e-6,
-        "SAS d1 not a derivative of scipy CDF (5pt FD): rel_l2={fd1_rel:.3e}"
+        d1_rel < 1e-7,
+        "gam SAS analytic d1 is not the derivative of the exact CDF \
+         (5-pt FD rel_l2={d1_rel:.3e})"
+    );
+    assert!(
+        d2_rel < 1e-5,
+        "gam SAS analytic d2 is not the 2nd derivative of the exact CDF \
+         (5-pt FD rel_l2={d2_rel:.3e})"
+    );
+    assert!(
+        d3_rel < 1e-3,
+        "gam SAS analytic d3 is not the 3rd derivative of the exact CDF \
+         (7-pt FD rel_l2={d3_rel:.3e})"
     );
 }

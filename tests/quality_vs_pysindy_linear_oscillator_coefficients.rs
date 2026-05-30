@@ -1,36 +1,43 @@
-//! End-to-end quality: gam's SINDy STLSQ coefficient recovery must match
-//! `pysindy` — the de-facto reference implementation of Sparse Identification of
-//! Nonlinear Dynamics (Brunton, Proctor & Kutz, PNAS 2016) — on a known linear
-//! ODE.
+//! End-to-end quality: gam's SINDy STLSQ must RECOVER THE TRUE governing
+//! equations of a known linear ODE — the objective task SINDy exists to perform
+//! (Brunton, Proctor & Kutz, PNAS 2016).
 //!
-//! We benchmark `gam::solver::sindy::sindy_stlsq_solve` against
-//! `pysindy.optimizers.STLSQ` (the canonical SINDy optimizer). The system is the
-//! damped harmonic oscillator
+//! The system is the damped harmonic oscillator
 //!
 //!     d(x)/dt = v
 //!     d(v)/dt = -2 ζ ω₀ v - ω₀² x          (ζ = 0.1, ω₀ = 2 rad/s)
 //!
 //! integrated by fixed-step RK4 (dt = 0.01, 1500 rows, fixed initial condition),
 //! with state derivatives recovered numerically by centered finite differences.
-//! Both engines receive the IDENTICAL feature library Θ = [1, x, v] and the
-//! IDENTICAL numeric-derivative target Ẋ = [d(x)/dt, d(v)/dt], and both run with
-//! ridge weight λ = 0 (pure least squares) and threshold tol = 0.01. They
-//! therefore solve the same sequential-thresholded least-squares problem and
-//! must agree.
+//! Because the data is generated from a KNOWN sparse coefficient matrix, the
+//! correct answer is mathematical ground truth, not another tool's opinion:
 //!
-//! A linear ODE has a single ground-truth sparse coefficient matrix, so this is
-//! the cleanest possible SINDy test. We assert:
-//!   1. exact agreement of the recovered sparsity pattern (support), and
-//!   2. tight relative-L2 agreement of the coefficient matrices.
-//! Because both engines solve the same thresholded normal equations, a real
-//! divergence is a real bug in gam's STLSQ numerics — not a modeling choice.
+//!     Xi_true[:,0] = [0, 0, 1]            (d(x)/dt = v)
+//!     Xi_true[:,1] = [0, -ω₀², -2ζω₀] = [0, -4.0, -0.4]   (d(v)/dt)
+//!
+//! OBJECTIVE METRIC ASSERTED (truth recovery):
+//!   1. gam recovers the EXACT true support — every true-nonzero term is kept and
+//!      every true-zero term is thresholded to exactly zero (correct sparse model
+//!      structure: the equation discovery succeeded).
+//!   2. The recovered nonzero coefficients match ground truth to a tight absolute
+//!      bound (max |Xi_gam − Xi_true| <= 5e-3). The only error sources are the
+//!      O(dt²) centered-difference truncation and float round-off; the bound is
+//!      far below the smallest true coefficient magnitude (0.4), so it is a
+//!      genuine accuracy claim, not a vacuous one.
+//!
+//! BASELINE TO MATCH-OR-BEAT: `pysindy.optimizers.STLSQ` — the canonical SINDy
+//! optimizer — is fit on the IDENTICAL Θ and Ẋ. We additionally require gam's
+//! recovery error against ground truth to be no worse than pysindy's by more than
+//! 10%. This demotes pysindy from "the answer" to a peer accuracy baseline:
+//! agreeing with pysindy proves nothing on its own; recovering the true physics
+//! at least as accurately as the reference does is the quality claim.
 
 use gam::solver::sindy::{SindyPenaltyKind, sindy_stlsq_solve};
 use gam::test_support::reference::{Column, relative_l2, run_python};
 use ndarray::Array2;
 
 #[test]
-fn gam_sindy_stlsq_matches_pysindy_on_damped_oscillator() {
+fn gam_sindy_stlsq_recovers_true_oscillator_equations() {
     // ---- ground-truth physical constants ---------------------------------
     let zeta = 0.1_f64; // damping ratio
     let omega0 = 2.0_f64; // natural frequency [rad/s]
@@ -192,32 +199,69 @@ emit("xi", flat)
         py_xi[(2, 1)],
     );
 
-    // ---- (1) support agreement: same nonzero pattern ---------------------
-    // Both engines hard-threshold at tol, so the surviving support must be bit
-    // identical. The true support is {(2,0)} and {(1,1),(2,1)}.
-    let mut support_mismatch = 0usize;
+    // ---- GROUND TRUTH: the exact coefficient matrix the data was built from --
+    // d(x)/dt = v             -> [0, 0, 1]
+    // d(v)/dt = -ω₀² x - 2ζω₀ v -> [0, -ω₀², -2ζω₀] = [0, -4.0, -0.4]
+    let mut xi_true = Array2::<f64>::zeros((p, d));
+    xi_true[(2, 0)] = 1.0; // v term in dx/dt
+    xi_true[(1, 1)] = -(omega0 * omega0); // x term in dv/dt
+    xi_true[(2, 1)] = -2.0 * zeta * omega0; // v term in dv/dt
+
+    // ---- (1) TRUTH RECOVERY: gam must discover the EXACT true support --------
+    // The discovered model is correct only if every true-nonzero term survives
+    // thresholding and every true-zero term is driven to exactly zero. This is
+    // the structural quality claim: SINDy recovered the right governing terms.
+    let mut support_errors = 0usize;
     for c in 0..d {
         for j in 0..p {
+            let true_on = xi_true[(j, c)] != 0.0;
             let gam_on = gam_xi[(j, c)] != 0.0;
-            let py_on = py_xi[(j, c)].abs() >= tol; // pysindy zeros below threshold
-            if gam_on != py_on {
-                support_mismatch += 1;
+            if gam_on != true_on {
+                support_errors += 1;
                 eprintln!(
-                    "support mismatch at (j={j}, c={c}): gam={} (={:.3e}) pysindy={} (={:.3e})",
-                    gam_on,
+                    "support error at (j={j}, c={c}): truth_nonzero={true_on} \
+                     gam_nonzero={gam_on} (gam={:.3e}, truth={:.3e})",
                     gam_xi[(j, c)],
-                    py_on,
-                    py_xi[(j, c)],
+                    xi_true[(j, c)],
                 );
             }
         }
     }
     assert_eq!(
-        support_mismatch, 0,
-        "gam and pysindy must recover the identical sparsity pattern (both threshold at {tol})",
+        support_errors, 0,
+        "gam SINDy did not recover the true sparse equation structure \
+         (true support: dx/dt={{v}}, dv/dt={{x,v}})",
     );
 
-    // ---- (2) coefficient agreement: relative L2 over the 6-entry matrix ---
+    // ---- (2) TRUTH RECOVERY: recovered coefficients match ground truth -------
+    // Max absolute deviation from the analytic coefficients. The only error is
+    // O(dt²) finite-difference truncation plus float round-off; 5e-3 is far below
+    // the smallest true coefficient (0.4), so this is a non-vacuous accuracy bar.
+    let mut gam_truth_err = 0.0_f64;
+    for c in 0..d {
+        for j in 0..p {
+            gam_truth_err = gam_truth_err.max((gam_xi[(j, c)] - xi_true[(j, c)]).abs());
+        }
+    }
+    eprintln!("gam max|Xi - truth| = {gam_truth_err:.3e}");
+    assert!(
+        gam_truth_err <= 5.0e-3,
+        "gam SINDy coefficients diverge from ground truth: max|Xi - truth| = {gam_truth_err:.3e} \
+         (bound 5e-3)",
+    );
+
+    // ---- (3) MATCH-OR-BEAT the pysindy baseline ON RECOVERY ACCURACY ---------
+    // pysindy is a peer baseline, not the answer: we require gam's error against
+    // the TRUE physics to be no worse than pysindy's by more than 10%.
+    let mut py_truth_err = 0.0_f64;
+    for c in 0..d {
+        for j in 0..p {
+            py_truth_err = py_truth_err.max((py_xi[(j, c)] - xi_true[(j, c)]).abs());
+        }
+    }
+    eprintln!("pysindy max|Xi - truth| = {py_truth_err:.3e}");
+
+    // For context only (NOT a pass criterion): how close the two fits are.
     let gam_vec: Vec<f64> = (0..d)
         .flat_map(|c| (0..p).map(move |j| (j, c)))
         .map(|(j, c)| gam_xi[(j, c)])
@@ -226,16 +270,14 @@ emit("xi", flat)
         .flat_map(|c| (0..p).map(move |j| (j, c)))
         .map(|(j, c)| py_xi[(j, c)])
         .collect();
-    let rel = relative_l2(&gam_vec, &py_vec);
-    eprintln!("coefficient relative L2 (gam vs pysindy) = {rel:.3e}");
+    eprintln!(
+        "context only: coefficient relative L2 (gam vs pysindy) = {:.3e}",
+        relative_l2(&gam_vec, &py_vec)
+    );
 
-    // Both engines solve the same thresholded least-squares problem on the same
-    // matrices; the only differences are inner linear-algebra paths (gam:
-    // Cholesky normal equations; pysindy: lstsq). On this well-conditioned 3-
-    // column system that is round-off, so 1e-3 relative L2 is a tight,
-    // non-vacuous bound (the coefficients themselves are O(0.4-4)).
     assert!(
-        rel < 1.0e-3,
-        "gam SINDy coefficients diverge from pysindy: relative L2 = {rel:.3e} (bound 1e-3)",
+        gam_truth_err <= py_truth_err * 1.10 + 1.0e-12,
+        "gam must recover the true physics at least as accurately as pysindy: \
+         gam_err={gam_truth_err:.3e} > 1.10 * pysindy_err ({py_truth_err:.3e})",
     );
 }

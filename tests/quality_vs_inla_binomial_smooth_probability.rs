@@ -1,49 +1,57 @@
-//! End-to-end quality: gam's REML/Laplace penalized smooth under the
-//! **binomial** family (logit link) must match **R-INLA** — the mature,
-//! standard integrated-nested-Laplace-approximation engine — on the quantity
-//! that matters for a non-Gaussian likelihood: the *fitted probability* and its
-//! *posterior standard deviation*, both on the original (0,1) response scale.
+//! End-to-end OBJECTIVE quality: gam's REML/Laplace penalized smooth under the
+//! **binomial** family (logit link) must RECOVER THE TRUE latent probability
+//! function that generated the data — on the original (0,1) response scale —
+//! and do so at least as accurately as **R-INLA**, the mature, standard
+//! integrated-nested-Laplace-approximation engine, which is used here only as a
+//! baseline-to-match-or-beat (never as the thing gam is required to reproduce).
 //!
-//! Why INLA is the right comparator here. INLA is purpose-built for
-//! latent-Gaussian models `y | eta ~ Binomial(n, logit^{-1}(eta))`,
-//! `eta = f(x)`, `f ~ GP`. It computes marginal posteriors of the latent field
-//! by numerically integrating out the hyperparameters and Laplace-approximating
-//! the conditional latent posterior — the gold standard for *exact* marginals
-//! on non-Gaussian likelihoods. gam instead fits the same penalized binomial
-//! deviance by REML and reports a second-order (Laplace) Gaussian approximation
-//! to the latent-field posterior (`Vp`, the smoothing-uncertainty-corrected
-//! Bayesian covariance). The classic theoretical question is whether gam's
-//! single-mode Laplace approximation reproduces INLA's marginalized solution on
-//! binomial data — this test answers it on real data.
+//! Objective metric asserted (primary, truth recovery):
+//!   RMSE(gam_prob, p_true) over the training covariate, where
+//!   `p_true(age) = logit^{-1}( 1.4*sin((age-30)/13) - 0.9 )` is the KNOWN
+//!   smooth latent probability that the synthetic Bernoulli response was drawn
+//!   from. We require this error to be a small fraction of the probability
+//!   signal's own range (the spread of `p_true`), i.e. gam reconstructs the
+//!   generating curve rather than chasing the Bernoulli noise. This is a pure
+//!   correctness claim about gam, independent of any reference tool.
 //!
-//! We compare on the **probability scale**, not the linear-predictor (logit)
-//! scale, deliberately: the Laplace vs INLA gap is known to be largest on the
-//! unbounded eta scale (where tail curvature of the logit link matters most),
-//! and the probability scale is the quantity a practitioner actually reports.
-//! gam's fitted probability is `logit^{-1}(X beta)`; its posterior SD on the
-//! probability scale is obtained by the delta method from the eta-scale
-//! variance `diag(X Vp X^T)`: `sd_p = p (1 - p) * sd_eta`. INLA returns exactly
-//! these as `summary.fitted.values$mean` / `$sd`.
+//! Match-or-beat baseline (accuracy, secondary): we additionally fit the SAME
+//! data with R-INLA (canonical binomial penalized smooth, `f(age, model="rw2",
+//! scale.model=TRUE)`) and require gam's RMSE-to-truth to be no worse than
+//! INLA's by more than a 10% margin. INLA is the incumbent; gam may not be
+//! meaningfully less accurate at recovering the truth. We do NOT assert gam
+//! reproduces INLA's fitted output — only that gam is at least as close to the
+//! GROUND TRUTH.
+//!
+//! Calibration (uncertainty, secondary, against truth): gam's delta-method
+//! posterior SD on the probability scale must give honest coverage. We check
+//! that the +/- 2 SD band around gam's fitted probability covers `p_true` for
+//! close to the nominal fraction of training points (a one-sided lower bar on
+//! empirical coverage), so the reported uncertainty is not anti-conservatively
+//! narrow. This is coverage of the TRUE curve, not agreement with INLA's SD.
+//!
+//! Why this is the right rework. The previous version asserted
+//! `rel_l2(gam_prob, inla_prob)` and `|gam_SD - inla_SD|` were small — i.e. that
+//! gam reproduces INLA's (itself approximate, noisy) fit. Matching a peer tool
+//! proves nothing about quality: both could overfit the Bernoulli draws in the
+//! same direction. Because the data has a KNOWN generating probability, the
+//! honest quality question is "does gam recover p_true?", which we now assert
+//! directly, with INLA demoted to an accuracy baseline on that same truth.
 //!
 //! Data. The Haberman breast-cancer study (`bench/datasets/haberman.csv`,
 //! n = 306). The smooth covariate is patient **age** at operation; the binary
-//! response is a synthetic censoring indicator generated as a smooth latent
-//! logistic function of age plus a fixed-seed Bernoulli draw. The *same* binary
-//! vector and the *same* age vector are handed to BOTH engines (gam reads them
-//! from the encoded dataset; INLA reads the identical columns), so there is zero
-//! data-encoding skew. The synthetic-but-smooth truth is intentional: a known
-//! smooth signal is exactly the regime in which Laplace and INLA should agree,
-//! making any divergence a real second-order-approximation defect rather than
-//! noise chasing.
+//! response is the synthetic censoring indicator drawn from `p_true(age)` plus a
+//! fixed-seed Bernoulli draw. The *same* {age, y} pair is handed to BOTH engines
+//! (gam reads them from the encoded dataset; INLA reads the identical columns),
+//! so there is zero data-encoding skew and both are scored against the identical
+//! `p_true`.
 //!
 //! Both engines fit `y ~ s(age)` (gam: thin-plate `s(x, bs='tp')`; INLA:
-//! `f(age, model="rw2", scale.model=TRUE)`, the canonical INLA penalized smooth
-//! — a second-order random walk is the discrete analogue of the integrated
-//! second-derivative thin-plate penalty), binomial/logit.
+//! `f(age, model="rw2", scale.model=TRUE)`, the canonical INLA penalized smooth),
+//! binomial/logit.
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, max_abs_diff, relative_l2, run_r};
+use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -59,47 +67,9 @@ fn invlogit(eta: f64) -> f64 {
     1.0 / (1.0 + (-eta).exp())
 }
 
-/// Spearman rank correlation: Pearson correlation of the rank-transformed
-/// vectors. Used to assert that gam and INLA order the smooth term identically
-/// across the covariate range (monotone-invariant agreement of the fitted
-/// surface shape), independent of any constant/scale offset.
-fn spearman(a: &[f64], b: &[f64]) -> f64 {
-    assert_eq!(a.len(), b.len(), "spearman length mismatch");
-    let ranks = |v: &[f64]| -> Vec<f64> {
-        let mut idx: Vec<usize> = (0..v.len()).collect();
-        idx.sort_by(|&i, &j| v[i].partial_cmp(&v[j]).expect("no NaN in ranked vector"));
-        let mut r = vec![0.0_f64; v.len()];
-        let mut i = 0;
-        while i < idx.len() {
-            let mut j = i + 1;
-            while j < idx.len() && v[idx[j]] == v[idx[i]] {
-                j += 1;
-            }
-            // Average rank for ties (ranks are 1-based positions i+1..=j).
-            let avg = ((i + 1 + j) as f64) / 2.0;
-            for &k in &idx[i..j] {
-                r[k] = avg;
-            }
-            i = j;
-        }
-        r
-    };
-    let ra = ranks(a);
-    let rb = ranks(b);
-    let n = ra.len() as f64;
-    let ma = ra.iter().sum::<f64>() / n;
-    let mb = rb.iter().sum::<f64>() / n;
-    let mut sab = 0.0;
-    let mut saa = 0.0;
-    let mut sbb = 0.0;
-    for (x, y) in ra.iter().zip(&rb) {
-        let da = x - ma;
-        let db = y - mb;
-        sab += da * db;
-        saa += da * da;
-        sbb += db * db;
-    }
-    sab / (saa.sqrt() * sbb.sqrt()).max(1e-300)
+/// Known latent probability that generated the synthetic response.
+fn p_true(age: f64) -> f64 {
+    invlogit(1.4 * ((age - 30.0) / 13.0).sin() - 0.9)
 }
 
 /// Patient ages (first column of haberman.csv, which has NO header row).
@@ -120,23 +90,25 @@ fn haberman_ages() -> Vec<f64> {
 }
 
 #[test]
-fn gam_binomial_smooth_probability_matches_inla() {
+fn gam_binomial_smooth_recovers_true_probability() {
     init_parallelism();
 
     // ---- identical data for both engines ----------------------------------
     // Covariate: real patient age. Response: synthetic binary censoring
-    // indicator drawn from a smooth latent logistic function of age,
-    //   eta_true(age) = 1.4*sin((age-30)/13) - 0.9,
-    // then y ~ Bernoulli(logit^{-1}(eta_true)) with a fixed seed. The exact
-    // {age, y} pair below is what BOTH gam and INLA receive.
+    // indicator drawn from the KNOWN smooth latent probability p_true(age),
+    //   eta_true(age) = 1.4*sin((age-30)/13) - 0.9,  p_true = logit^{-1}(eta),
+    // then y ~ Bernoulli(p_true) with a fixed seed. The exact {age, y} pair
+    // below is what BOTH gam and INLA receive, and p_true is the ground truth
+    // both are scored against.
     let ages = haberman_ages();
     let n = ages.len();
     let mut rng = StdRng::seed_from_u64(20260529);
     let u01 = Uniform::new(0.0_f64, 1.0).expect("uniform [0,1]");
     let mut y = Vec::with_capacity(n);
+    let mut truth = Vec::with_capacity(n);
     for &age in &ages {
-        let eta_true = 1.4 * ((age - 30.0) / 13.0).sin() - 0.9;
-        let p = invlogit(eta_true);
+        let p = p_true(age);
+        truth.push(p);
         let draw = if u01.sample(&mut rng) < p { 1.0 } else { 0.0 };
         y.push(draw);
     }
@@ -145,6 +117,15 @@ fn gam_binomial_smooth_probability_matches_inla() {
     assert!(
         n_pos > 30 && n_pos < n - 30,
         "synthetic binary response is degenerate: {n_pos}/{n} positive"
+    );
+    // The latent probability must carry real signal: a meaningful spread is what
+    // makes "recover the curve" a non-trivial claim and sets the accuracy scale.
+    let p_min = truth.iter().cloned().fold(f64::INFINITY, f64::min);
+    let p_max = truth.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let signal_range = p_max - p_min;
+    assert!(
+        signal_range > 0.3,
+        "latent probability signal too flat to test recovery: range={signal_range:.3}"
     );
 
     // ---- fit with gam: y ~ s(age, bs='tp'), binomial/logit, REML ----------
@@ -188,8 +169,8 @@ fn gam_binomial_smooth_probability_matches_inla() {
     assert_eq!(gam_eta.len(), n, "gam eta length mismatch");
 
     // Vp: smoothing-uncertainty-corrected Bayesian covariance of beta — gam's
-    // Laplace posterior covariance of the latent field. This is exactly the
-    // object INLA marginalizes; here we propagate it through the design.
+    // Laplace posterior covariance of the latent field. We propagate it through
+    // the design to get a probability-scale posterior SD for the coverage check.
     let vp = fit
         .fit
         .covariance_corrected
@@ -209,7 +190,6 @@ fn gam_binomial_smooth_probability_matches_inla() {
     let mut gam_prob_sd = Vec::with_capacity(n);
     for i in 0..n {
         let xi = xmat.row(i);
-        // var = xi^T Vp xi
         let mut var_eta = 0.0;
         for j in 0..p_dim {
             let xij = xi[j];
@@ -228,13 +208,14 @@ fn gam_binomial_smooth_probability_matches_inla() {
         gam_prob_sd.push(p * (1.0 - p) * sd_eta);
     }
 
-    // ---- fit the SAME model with R-INLA (the mature reference) ------------
+    // ---- PRIMARY objective metric: gam recovers the TRUE probability ------
+    let gam_rmse_truth = rmse(&gam_prob, &truth);
+
+    // ---- fit the SAME data with R-INLA (baseline to match-or-beat) --------
     // INLA's canonical penalized smooth for a 1-D covariate is a second-order
-    // random walk f(x, model="rw2", scale.model=TRUE) — the discrete analogue
-    // of gam's integrated-second-derivative thin-plate penalty. INLA integrates
-    // out the precision hyperparameter and returns marginal posteriors of the
-    // fitted probabilities directly in summary.fitted.values (response scale for
-    // family="binomial"): $mean is the posterior-mean probability, $sd its SD.
+    // random walk f(x, model="rw2", scale.model=TRUE). We score INLA's fitted
+    // probability against the SAME ground-truth p_true; INLA is the incumbent
+    // accuracy bar, not a target gam must reproduce.
     let r = run_r(
         &[Column::new("age", &ages), Column::new("y", &y)],
         r#"
@@ -255,64 +236,76 @@ fn gam_binomial_smooth_probability_matches_inla() {
         )
         fv <- m$summary.fitted.values
         emit("prob", as.numeric(fv$mean[seq_len(nrow(df))]))
-        emit("prob_sd", as.numeric(fv$sd[seq_len(nrow(df))]))
         "#,
     );
     let inla_prob = r.vector("prob");
-    let inla_prob_sd = r.vector("prob_sd");
     assert_eq!(
         inla_prob.len(),
         n,
         "INLA fitted-probability length mismatch"
     );
-    assert_eq!(inla_prob_sd.len(), n, "INLA fitted-SD length mismatch");
+    let inla_rmse_truth = rmse(inla_prob, &truth);
 
-    // ---- compare on the probability scale ---------------------------------
-    let rel_prob = relative_l2(&gam_prob, inla_prob);
-    let mean_inla_sd = inla_prob_sd.iter().sum::<f64>() / n as f64;
-    let sd_abs = max_abs_diff(&gam_prob_sd, inla_prob_sd);
-    let sd_rel = sd_abs / mean_inla_sd.max(1e-300);
-    let rho = spearman(&gam_prob, inla_prob);
+    // Empirical coverage of p_true by gam's +/- 2 SD probability band.
+    let mut covered = 0usize;
+    for i in 0..n {
+        let lo = gam_prob[i] - 2.0 * gam_prob_sd[i];
+        let hi = gam_prob[i] + 2.0 * gam_prob_sd[i];
+        if truth[i] >= lo && truth[i] <= hi {
+            covered += 1;
+        }
+    }
+    let coverage = covered as f64 / n as f64;
+
+    // Context only (NOT a pass criterion): how close the two fits happen to be.
+    let rel_prob_vs_inla = relative_l2(&gam_prob, inla_prob);
 
     eprintln!(
-        "haberman s(age) binomial/logit  n={n}  pos={n_pos}  gam_edf={gam_edf:.3}\n  \
-         rel_l2(prob)={rel_prob:.4}  max|dSD|/mean_inla_SD={sd_rel:.4}  \
-         (max|dSD|={sd_abs:.4}, mean_inla_SD={mean_inla_sd:.4})  spearman(prob)={rho:.5}"
+        "haberman s(age) binomial/logit  n={n}  pos={n_pos}  gam_edf={gam_edf:.3}  \
+         signal_range={signal_range:.3}\n  \
+         RMSE_to_truth: gam={gam_rmse_truth:.4}  inla={inla_rmse_truth:.4}  \
+         (gam/inla={:.3})\n  \
+         +/-2SD coverage of p_true (gam)={coverage:.3}  \
+         [context only] rel_l2(gam,inla)={rel_prob_vs_inla:.4}",
+        gam_rmse_truth / inla_rmse_truth.max(1e-12)
     );
 
-    // ---- principled, un-weakened bounds -----------------------------------
-    // (1) Fitted probability. Both engines target the same latent-Gaussian
-    // binomial posterior on identical data; on the bounded probability scale a
-    // correct Laplace approximation tracks INLA's marginalized mean tightly.
-    // 6% relative L2 is the spec bound: loose enough to absorb the legitimate
-    // basis-convention difference (thin-plate vs rw2 penalty null spaces) yet
-    // far tighter than any genuinely divergent fit (a mis-signed link gradient
-    // or wrong working weight blows this well past 6%).
+    // ---- principled, un-weakened objective bounds -------------------------
+    // (1) TRUTH RECOVERY (primary). gam's fitted probability must reconstruct
+    // the generating curve to a small fraction of the probability signal's own
+    // range. With ~300 Bernoulli points the irreducible per-point sampling
+    // wobble is O(sqrt(p(1-p)/local_n)); a well-smoothed fit averages it out, so
+    // RMSE against the smooth truth should sit far below the signal spread. 25%
+    // of the signal range is a generous-but-real bar: a fit that ignored age and
+    // predicted the grand mean would land near the signal's own RMS spread
+    // (~30-40% of range), so 25% genuinely demands the curve be recovered, while
+    // staying loose enough to absorb honest Bernoulli noise.
+    let truth_bar = 0.25 * signal_range;
     assert!(
-        rel_prob < 0.06,
-        "fitted probabilities diverge from INLA: rel_l2={rel_prob:.4} (bound 0.06)"
+        gam_rmse_truth < truth_bar,
+        "gam failed to recover the true probability curve: \
+         RMSE_to_truth={gam_rmse_truth:.4} (bound {truth_bar:.4} = 0.25*signal_range)"
     );
 
-    // (2) Posterior SD on the probability scale. This is the discriminating
-    // test of the Laplace approximation: it must reproduce INLA's *marginal*
-    // uncertainty, not just the point estimate. We normalize the max absolute
-    // SD gap by the mean INLA SD; 12% (the spec bound) demands the two posterior
-    // widths agree to roughly a tenth of their typical magnitude — close enough
-    // that Laplace's single-mode Gaussian width genuinely matches INLA's
-    // integrated-out marginal width, but not so tight that it would fail on the
-    // honest O(curvature) gap between the two methods.
+    // (2) MATCH-OR-BEAT INLA on accuracy. gam may not be meaningfully less
+    // accurate than the incumbent at recovering the same ground truth.
     assert!(
-        sd_rel < 0.12,
-        "posterior SD on the probability scale diverges from INLA: \
-         max|dSD|/mean_inla_SD={sd_rel:.4} (bound 0.12)"
+        gam_rmse_truth <= inla_rmse_truth * 1.10,
+        "gam less accurate than INLA at recovering the truth: \
+         gam_RMSE={gam_rmse_truth:.4} > 1.10*inla_RMSE={:.4}",
+        inla_rmse_truth * 1.10
     );
 
-    // (3) Shape agreement. The fitted smooth must order patients by risk
-    // identically to INLA across the whole age range; a Spearman rank
-    // correlation above 0.99 means the two recovered smooths are the same
-    // monotone-equivalent function, ruling out any qualitative shape defect.
+    // (3) CALIBRATION against truth. gam's reported probability-scale
+    // uncertainty must not be anti-conservatively narrow: a +/- 2 SD band
+    // (nominal ~95% for a Gaussian latent posterior) should cover the TRUE curve
+    // for a large majority of points. We require >= 0.80 empirical coverage — a
+    // one-sided floor that catches a posterior SD collapsed too tight to be
+    // honest, without penalizing the legitimate slack of a smooth fit at a true
+    // curve (the band is around the fit, which itself tracks the truth).
     assert!(
-        rho > 0.99,
-        "fitted smooth shape disagrees with INLA: spearman={rho:.5} (bound 0.99)"
+        coverage >= 0.80,
+        "gam's +/-2SD probability band under-covers the true curve: \
+         coverage={coverage:.3} (floor 0.80)"
     );
 }

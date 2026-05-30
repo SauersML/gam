@@ -1,30 +1,35 @@
 //! End-to-end quality: gam's Gaussian location-scale fit must be *calibrated*
 //! on held-out data, judged by the Probability Integral Transform (PIT).
 //!
-//! Reference / comparator
-//! ----------------------
+//! OBJECTIVE METRIC THIS TEST ASSERTS
+//! ----------------------------------
+//! The pass/fail criterion is the **Kolmogorov-Smirnov distance between gam's
+//! own held-out PIT values and `Uniform(0,1)`**, `D = sup_u |F_n(u) - u|`,
+//! computed in this test from gam's predictions (sorted-PIT vs the identity
+//! line). This is an intrinsic property of gam's predictive distribution — it
+//! does NOT reference any other tool's fit. A flexible location-scale model that
+//! over-smooths the mean, mis-estimates the variance, or overfits the training
+//! data skews the held-out PIT histogram (peaks => over-dispersion, valleys =>
+//! under-dispersion, U-shape => biased mean), inflating `D`. We fit on 130
+//! points, hold out 70, and judge calibration purely on the hold-out — the
+//! regime where overfitting actually shows up.
+//!
 //! The PIT of a continuous predictive distribution `F` is `u = F(y)`; under a
 //! correctly calibrated model `u ~ Uniform(0,1)`. For a Gaussian location-scale
-//! predictor this is `u_i = Phi((y_i - mu_i) / sigma_i)`. This is exactly the
-//! quantity `scoringrules` (and the wider forecast-verification literature)
-//! calls the PIT. `scoringrules` itself ships an *ensemble* PIT estimator; the
-//! unambiguous parametric ground truth for a Normal predictive is the analytic
-//! normal CDF, so we cross-check gam's PIT against `scipy.stats.norm.cdf`
-//! (bit-for-bit the function `scoringrules` would evaluate for a Normal). The
-//! Python side recomputes `u_i` from the *same* held-out `y`, `mu`, `sigma`
-//! that gam produced; if gam's own PIT computation drifts from the reference
-//! CDF that is a real bug. We then assert the *intrinsic* calibration property
-//! gam must satisfy on its own predictions: the held-out PIT values are uniform.
+//! predictor this is `u_i = Phi((y_i - mu_i) / sigma_i)` — exactly the quantity
+//! `scoringrules` and the wider forecast-verification literature call the PIT.
 //!
-//! Why this is the honest test
-//! ---------------------------
-//! Calibration is not tied to any one tool: a flexible location-scale fit that
-//! over-smooths the mean, mis-estimates the variance, or overfits the training
-//! data will skew the held-out PIT histogram (peaks => over-dispersion,
-//! valleys => under-dispersion, U-shape => biased mean). We fit on 130 points,
-//! hold out 70, and judge calibration purely on the hold-out — the regime where
-//! overfitting actually shows up. A one-sample Kolmogorov-Smirnov test of the
-//! 70 hold-out PIT values against `U(0,1)` gives a principled bound.
+//! Role of the reference (GROUND TRUTH, not a peer-fit to reproduce)
+//! -----------------------------------------------------------------
+//! The parametric PIT of a Normal predictive is the *analytic* normal CDF, an
+//! exact mathematical quantity. `scipy.stats.norm.cdf` evaluates it exactly, so
+//! we use it as mathematical ground truth to confirm gam's own A&S `erf`-based
+//! PIT computation is correct (`pit_max_diff < 1e-6`). scipy's `kstest` is also
+//! computed and printed, but only as an independent cross-check that our Rust KS
+//! statistic equals the authoritative implementation — the PASS/FAIL bound is on
+//! the KS distance we compute from gam's predictions, never on a number scipy
+//! reports about a fit. We do NOT assert "gam matches some reference tool's
+//! fitted mu/sigma": matching a peer fit proves nothing about calibration.
 //!
 //! Data
 //! ----
@@ -32,17 +37,17 @@
 //!   `y ~ N(sin(2*pi*x) + cos(pi*x), (0.15 + 0.25*sin(pi*x))^2)`, seed 5050.
 //! The mean wiggles and the noise sd varies with `x`, so a *location-scale*
 //! model is genuinely required for calibration; a fixed-variance fit would fail.
-//! The identical `x`/`y` table is fed to gam; the identical held-out `y`,
-//! `mu`, `sigma` are fed to Python.
+//! The identical held-out `y`, `mu`, `sigma` gam produced are fed to Python for
+//! the ground-truth CDF cross-check.
 //!
 //! Bound (principled, NOT loosened)
 //! --------------------------------
 //! Under correct calibration each PIT `u_i ~ U(0,1)`, so the empirical CDF of
 //! the 70 hold-out values tracks the identity line. The KS statistic
-//! `D = sup|F_n(u) - u|` has 5% one-sided critical value `~ 1.358/sqrt(70) =
-//! 0.162` for n=70 (asymptotic Kolmogorov). We require `D < 0.15`, slightly
-//! INSIDE that critical value, so a model whose hold-out PIT is non-uniform at
-//! the 5% level fails. This asserts real calibration, not a vacuous range check.
+//! `D = sup|F_n(u) - u|` has 5% critical value `~ 1.358/sqrt(70) = 0.162` for
+//! n=70 (asymptotic Kolmogorov). We require `D < 0.15`, INSIDE that critical
+//! value, so a model whose hold-out PIT is non-uniform at the 5% level fails.
+//! This asserts real calibration, not a vacuous range check.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
@@ -75,6 +80,29 @@ fn standard_normal_cdf(z: f64) -> f64 {
             * t
             * (-x * x).exp();
     0.5 * (1.0 + sign * y)
+}
+
+/// One-sample Kolmogorov-Smirnov distance of `samples` against `Uniform(0,1)`:
+/// `D = sup_u |F_n(u) - u|`. With the sorted samples `u_(1) <= ... <= u_(n)` the
+/// supremum is attained at a sample point, so
+/// `D = max_i max( i/n - u_(i),  u_(i) - (i-1)/n )`. Computed here in plain Rust
+/// from gam's OWN held-out PIT values so the calibration pass/fail does not
+/// depend on any reference tool reporting a statistic; scipy's `kstest` is used
+/// only as an independent cross-check that this matches the standard
+/// implementation.
+fn ks_distance_to_uniform(samples: &[f64]) -> f64 {
+    let n = samples.len();
+    assert!(n > 0, "KS distance needs at least one sample");
+    let mut sorted: Vec<f64> = samples.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).expect("PIT values must be finite for KS sort"));
+    let nf = n as f64;
+    let mut d = 0.0_f64;
+    for (i, &u) in sorted.iter().enumerate() {
+        let upper = (i as f64 + 1.0) / nf - u; // F_n just above u_(i) minus u
+        let lower = u - (i as f64) / nf; // u minus F_n just below u_(i)
+        d = d.max(upper).max(lower);
+    }
+    d
 }
 
 #[test]
@@ -210,11 +238,16 @@ fn gam_location_scale_pit_is_calibrated_on_holdout() {
         .map(|i| standard_normal_cdf((holdout_y[i] - mu[i]) / sigma[i]))
         .collect();
 
-    // ---- reference: recompute the SAME parametric PIT (scipy norm.cdf) -----
-    // scoringrules' PIT for a Normal predictive is exactly the normal CDF; we
-    // feed the identical held-out y, mu, sigma and assert gam's PIT matches the
-    // analytic reference, then take the KS statistic against U(0,1) from the
-    // authoritative SciPy implementation.
+    // ---- OBJECTIVE calibration metric: KS distance of gam's PIT to U(0,1) --
+    // Computed here in Rust from gam's own held-out PIT values; this is the
+    // pass/fail number, independent of any reference tool.
+    let ks_gam = ks_distance_to_uniform(&pit);
+
+    // ---- ground-truth cross-check: analytic normal CDF (scipy norm.cdf) ----
+    // The parametric PIT of a Normal predictive IS the analytic normal CDF (an
+    // exact mathematical quantity), so scipy is mathematical ground truth for
+    // gam's A&S erf-based PIT, not a peer fit we reproduce. We also recompute KS
+    // via scipy's authoritative `kstest` purely to confirm our Rust statistic.
     let py = run_python(
         &[
             Column::new("y_hold", &holdout_y),
@@ -257,25 +290,38 @@ emit("bin_counts", counts.astype(float))
 
     eprintln!(
         "PIT calibration (gaussian location-scale, hold-out n={grid_n}): \
-         ks_stat={ks_stat:.4} ks_pvalue={ks_pvalue:.4} pit_vs_scipy_max_diff={pit_max_diff:.2e}"
+         ks_gam(rust)={ks_gam:.4} ks_scipy={ks_stat:.4} ks_pvalue={ks_pvalue:.4} \
+         pit_vs_scipy_max_diff={pit_max_diff:.2e}"
     );
     eprintln!("PIT histogram (10 equiprobable bins, expect ~7 each): {bin_counts:?}");
 
-    // gam's own PIT must equal the reference parametric PIT (cross-check that
-    // gam evaluates the transform correctly, independent of calibration).
+    // GROUND-TRUTH correctness (exception: analytic normal CDF is exact math):
+    // gam's own PIT must equal the analytic normal CDF to within the A&S erf
+    // approximation error (~1.5e-7). This proves gam evaluates the transform
+    // correctly; it is a correctness-vs-ground-truth check, not "same fit as a
+    // peer tool".
     assert!(
         pit_max_diff < 1e-6,
-        "gam's PIT diverges from the analytic reference (scipy norm.cdf): \
+        "gam's PIT diverges from the analytic normal CDF (scipy norm.cdf): \
          max|diff|={pit_max_diff:.2e} (bound 1e-6, A&S erf error ~1.5e-7)"
     );
 
-    // INTRINSIC calibration property: held-out PIT ~ U(0,1). KS statistic must
-    // sit inside the 5% one-sided critical value (~1.358/sqrt(70)=0.162); 0.15
-    // is a principled bound a mis-calibrated (over/under-dispersed or biased)
-    // location-scale fit would violate.
+    // CROSS-CHECK: our Rust KS distance must agree with scipy's authoritative
+    // `kstest` statistic (same definition, computed two ways). This guards the
+    // metric implementation; it is not the calibration pass criterion.
     assert!(
-        ks_stat < 0.15,
+        (ks_gam - ks_stat).abs() < 1e-6,
+        "Rust KS distance disagrees with scipy.kstest: rust={ks_gam:.8} scipy={ks_stat:.8}"
+    );
+
+    // PRIMARY OBJECTIVE ASSERTION — INTRINSIC calibration of gam's predictions:
+    // gam's held-out PIT ~ U(0,1). The KS distance (computed in Rust from gam's
+    // own predictions) must sit inside the 5% critical value
+    // (~1.358/sqrt(70)=0.162); 0.15 is a principled bound a mis-calibrated
+    // (over/under-dispersed or biased) location-scale fit would violate.
+    assert!(
+        ks_gam < 0.15,
         "held-out PIT is not uniform => gam's location-scale fit is mis-calibrated: \
-         KS={ks_stat:.4} (bound 0.15), p={ks_pvalue:.4}"
+         KS(gam)={ks_gam:.4} (bound 0.15), scipy p={ks_pvalue:.4}"
     );
 }

@@ -1,63 +1,54 @@
-//! End-to-end quality: gam's monotone-constrained survival baseline cumulative
-//! hazard must agree with `scam::scam(..., bs = "mpi")` — the mature, standard
-//! reference for *shape-constrained* (monotone-increasing) additive smooths — on
-//! identical synthetic survival data.
+//! End-to-end quality: gam's monotone-constrained survival baseline must
+//! RECOVER THE KNOWN ANALYTIC TRUTH of the data-generating process. The pass
+//! criterion is an OBJECTIVE accuracy bar — RMSE between gam's fitted baseline
+//! `log Λ(t | x=0)` and the closed-form truth — not closeness to any tool's
+//! fitted output. `scam::scam(..., bs = "mpi")` (the mature, standard reference
+//! for shape-constrained monotone P-splines) is fit on the SAME estimand and
+//! demoted to a BASELINE-TO-MATCH-OR-BEAT on that same truth-recovery RMSE.
 //!
-//! Why scam (not mgcv): `scam` is the canonical R implementation of
-//! shape-constrained P-splines. `bs = "mpi"` fits a Monotone-increasing
-//! P-spline by enforcing non-negative coefficient *increments* on an SCOP-spline
-//! (an I-spline-style basis), which is exactly the constraint gam imposes on its
-//! survival baseline: the Royston-Parmar net-survival working model
-//! (`survmodel(spec=net)`) builds the baseline as a monotone I-spline in
-//! `log t` and enforces structural monotonicity `dη / d log t ≥ 0` on the time
-//! block (`set_structural_monotonicity`, lower-bounding the I-spline
-//! coefficients at 0). Both engines therefore estimate the *same* estimand — a
-//! monotone-increasing function of `log t` — under the *same* inequality
-//! constraint. mgcv has no monotone basis, so it cannot serve as the reference
-//! for this capability; scam is the textbook choice.
-//!
-//! The shared estimand. Under an exponential baseline `λ₀(t) = 0.08` with a
-//! log-linear covariate effect, the conditional cumulative hazard is
+//! The known truth. The data are generated from an exponential baseline
+//! `λ₀(t) = 0.08` with a log-linear covariate effect, so the conditional
+//! cumulative hazard is exactly
 //!
 //!     Λ(t | x) = 0.08 · t · exp(0.4 · x),   so   log Λ(t | x=0) = log(0.08) + log t,
 //!
-//! a strictly increasing function of `log t`. gam recovers `log Λ(t | x=0)`
-//! from its I-spline baseline (covariate held at x=0). scam fits the *marginal*
-//! curve: we form the Nelson–Aalen estimate of the marginal cumulative hazard
-//! `Λ̂(tⱼ)` (averaged over the empirical `x` distribution) at the event times,
-//! take `log Λ̂`, and regress it on `log t` with `bs = "mpi"`. The two are NOT
-//! the same function — marginalizing `exp(0.4·x)` over `x ~ N(0,1)` shifts the
-//! level and mildly bends the marginal hazard relative to the conditional-at-x=0
-//! baseline — but both are *monotone-increasing in `log t`* with the same
-//! dominant log-linear shape, so they are near-collinear on a `log t` grid.
-//! We therefore compare them with the affine-invariant Pearson correlation
-//! (which absorbs the marginal-vs-baseline level/scale offset and isolates the
-//! shared monotone shape), pointwise on a common `log t` grid.
+//! a strictly increasing AFFINE function of `log t` with intercept `log(0.08)`
+//! and slope exactly 1. This is the analytic ground truth gam's I-spline
+//! baseline (covariate held at x=0) must reproduce.
+//!
+//! Putting scam on the SAME estimand. gam's baseline is the CONDITIONAL hazard
+//! at `x = 0`. A marginal Nelson–Aalen curve (averaged over `x ~ N(0,1)`)
+//! targets a DIFFERENT function, so comparing to it would not be a truth-recovery
+//! test. We therefore have scam recover the same conditional-at-x=0 estimand: a
+//! Cox proportional-hazards fit gives the Breslow baseline cumulative hazard
+//! `Λ̂₀(t)` (the cumulative hazard of the reference subject `x = 0`), and scam
+//! regresses `log Λ̂₀` on `log t` under the monotone-increasing constraint
+//! (`bs = "mpi"`). Both engines then estimate `log Λ(t | x=0)` and are scored
+//! against the SAME closed-form truth `log(0.08) + log t`.
+//!
+//! Why scam (not mgcv) as the baseline: `scam` is the canonical R
+//! implementation of shape-constrained P-splines; `bs = "mpi"` fits a
+//! monotone-increasing SCOP-spline, exactly the inequality gam imposes on its
+//! survival baseline (`survmodel(spec=net)` builds a structural monotone
+//! I-spline in `log t` with `dη/dlog t ≥ 0`). mgcv has no monotone basis, so
+//! scam is the textbook match-or-beat comparator for this capability.
 //!
 //! What we assert, on the quantities that matter:
-//!   1. gam's fitted baseline is genuinely monotone: the finite-difference
-//!      derivative of `log Λ(t | x=0)` on the time grid [1, 10, 50, 100] is
-//!      ≥ -1e-6 at every step (the structural I-spline constraint must hold).
-//!   2. the monotone target is well-posed: on this cleanly log-linear
-//!      Nelson–Aalen `log Λ̂` (an exponential-baseline cumulative hazard is
-//!      smoothly monotone-increasing in `log t`), scam's unconstrained P-spline
-//!      (`bs = "ps"`) fit is itself already monotone, so its `mpi` fit must
-//!      *agree* with it — RMSE ≤ 0.05 on the grid. This confirms the reference
-//!      data is a genuine monotone target (the `mpi` constraint is correctly
-//!      slack, not fighting the data) and so is a trustworthy comparator for
-//!      assertion 3. Demanding the constraint be *active* here would be wrong:
-//!      the estimand is monotone by construction, so a binding constraint would
-//!      signal corrupted reference data, not a feature.
-//!   3. gam's monotone baseline tracks scam's monotone `mpi` smooth: Pearson
-//!      correlation of the two `log Λ` curves on the common `log t` grid ≥ 0.97.
-//!      Both are monotone fits whose shape is dominated by the same log-linear
-//!      `log t` trend, so they must be near-collinear up to the affine
-//!      marginal-vs-baseline offset that Pearson discards; 0.97 is tight enough
-//!      to catch a real divergence in gam's I-spline assembly / inequality solve
-//!      (a flat, non-monotone, or wrongly-curved baseline drops correlation well
-//!      below it), yet leaves room for the genuine basis/estimand difference
-//!      (gam's I-spline likelihood fit of `log Λ(t|x=0)` vs scam's Gaussian
-//!      SCOP-spline regression of the marginal `log Λ̂`).
+//!   1. STRUCTURE — gam's fitted baseline is genuinely monotone: the
+//!      finite-difference derivative of `log Λ(t | x=0)` across the increasing
+//!      time grid [1, 10, 50, 100] is ≥ -1e-6 at every step (the structural
+//!      I-spline constraint must hold; log t increases on the grid).
+//!   2. TRUTH RECOVERY (PRIMARY) — gam's fitted baseline reproduces the analytic
+//!      truth: RMSE(gam's `log Λ(t|x=0)`, `log(0.08) + log t`) on the grid is
+//!      ≤ 0.35 (in log-cumulative-hazard units; the truth spans ~4.6 over the
+//!      grid, so this is < 8% of the signal range — a genuine accuracy bar set
+//!      by the estimation noise of an n=400, ~30%-censored sample, NOT by the
+//!      reference).
+//!   3. MATCH-OR-BEAT (baseline) — gam recovers the truth at least as accurately
+//!      as the mature reference: RMSE(gam, truth) ≤ RMSE(scam_mpi, truth) · 1.10.
+//!      scam is fit on the IDENTICAL conditional-at-x=0 estimand (Cox-Breslow
+//!      baseline) and scored against the SAME truth, so this is an accuracy
+//!      comparison, not a "reproduce scam's output" claim.
 //!
 //! Data: n = 400 synthetic subjects, fixed seed 3141. `x ~ N(0,1)` (deterministic
 //! Box–Muller on a fixed LCG), event time `T ~ Exp(rate = 0.08·exp(0.4·x))`,
@@ -72,7 +63,7 @@ use gam::families::survival_construction::{
 };
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, rmse, run_r};
+use gam::test_support::reference::{Column, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -119,7 +110,7 @@ fn fixed_seed_uniforms(n: usize, seed: u64) -> Vec<f64> {
 }
 
 #[test]
-fn gam_monotone_baseline_matches_scam_mpi() {
+fn gam_monotone_baseline_recovers_log_cumhaz_truth() {
     init_parallelism();
 
     // ---- synthesize identical survival data for both engines --------------
@@ -271,11 +262,23 @@ fn gam_monotone_baseline_matches_scam_mpi() {
         );
     }
 
-    // ---- fit the SAME estimand with scam (the mature reference) -----------
-    // scam regresses the Nelson–Aalen log cumulative hazard on log t under a
-    // monotone-increasing constraint (bs="mpi") and, for the roughness check,
-    // an unconstrained P-spline (bs="ps"). It emits both fitted log-Λ curves on
-    // the common log-time grid so they are pointwise comparable to gam's.
+    // ---- analytic ground truth: log Λ(t | x=0) = log(0.08) + log t --------
+    // This is the closed-form conditional log-cumulative-hazard of the
+    // data-generating exponential baseline at the reference subject x=0. It is
+    // the function gam's I-spline baseline (and the reference) must recover.
+    let truth_log_cumhaz: Vec<f64> = grid_times
+        .iter()
+        .map(|&t| LAMBDA0.ln() + t.ln())
+        .collect();
+
+    // ---- fit the SAME conditional-at-x=0 estimand with scam (baseline) ----
+    // gam's baseline is the CONDITIONAL hazard at x=0, so the reference must
+    // target the same function. A Cox proportional-hazards fit yields the
+    // Breslow baseline cumulative hazard Λ̂₀(t) — the cumulative hazard of the
+    // reference subject x=0 — and scam regresses log Λ̂₀ on log t under the
+    // monotone-increasing constraint (bs="mpi"). It emits the fitted baseline
+    // log-Λ curve on the common log-time grid, scored against the SAME truth as
+    // gam (NOT against gam's output).
     let r = run_r(
         &[
             Column::new("t", &time),
@@ -286,20 +289,17 @@ fn gam_monotone_baseline_matches_scam_mpi() {
             r#"
             suppressPackageStartupMessages(library(survival))
             suppressPackageStartupMessages(library(scam))
-            # Marginal Nelson-Aalen cumulative hazard at the event times.
-            na <- survfit(Surv(t, event) ~ 1, data = df)
-            cumhaz <- na$cumhaz
-            keep <- cumhaz > 0
-            tt <- na$time[keep]
-            lch <- log(cumhaz[keep])
+            # Cox PH; Breslow baseline cumulative hazard for the reference x=0.
+            cox <- coxph(Surv(t, event) ~ x, data = df, ties = "breslow")
+            bh  <- basehaz(cox, centered = FALSE)   # H0(t) at x=0
+            keep <- bh$hazard > 0
+            tt  <- bh$time[keep]
+            lch <- log(bh$hazard[keep])
             fit_df <- data.frame(logt = log(tt), lch = lch)
-            # Monotone-increasing SCOP-spline (the reference constraint) and an
-            # unconstrained P-spline on the same data.
+            # Monotone-increasing SCOP-spline on the conditional-at-x=0 baseline.
             m_mpi <- scam(lch ~ s(logt, k = 10, bs = "mpi"), data = fit_df)
-            m_ps  <- scam(lch ~ s(logt, k = 10, bs = "ps"),  data = fit_df)
             grid <- data.frame(logt = log(c({grid})))
             emit("mpi", as.numeric(predict(m_mpi, newdata = grid)))
-            emit("ps",  as.numeric(predict(m_ps,  newdata = grid)))
             "#,
             grid = grid_times
                 .iter()
@@ -309,52 +309,39 @@ fn gam_monotone_baseline_matches_scam_mpi() {
         ),
     );
     let scam_mpi = r.vector("mpi");
-    let scam_ps = r.vector("ps");
     assert_eq!(
         scam_mpi.len(),
         grid_times.len(),
         "scam mpi grid length mismatch"
     );
-    assert_eq!(
-        scam_ps.len(),
-        grid_times.len(),
-        "scam ps grid length mismatch"
-    );
 
-    // ---- assertion 2: the monotone target is well-posed -------------------
-    // The Nelson–Aalen log Λ̂ of an exponential baseline is smoothly
-    // monotone-increasing in log t, so scam's unconstrained P-spline (ps) fit is
-    // itself already monotone and its monotone (mpi) fit must agree with it.
-    // Their RMSE on the grid must be small, confirming the mpi constraint is
-    // correctly slack on a genuine monotone target — i.e. the reference is
-    // trustworthy for assertion 3, not fighting non-monotone noise.
-    let rmse_constraint = rmse(scam_mpi, scam_ps);
+    // ---- assertion 2 (PRIMARY): gam recovers the analytic truth -----------
+    // OBJECTIVE accuracy metric: RMSE between gam's fitted baseline and the
+    // closed-form log Λ(t|x=0). This is the quality claim — gam reproduces the
+    // data-generating function, independent of any reference tool.
+    let gam_rmse_truth = rmse(&gam_log_cumhaz, &truth_log_cumhaz);
 
-    // ---- assertion 3: gam's monotone baseline tracks scam's mpi smooth ----
-    let corr = pearson(&gam_log_cumhaz, scam_mpi);
+    // ---- assertion 3 (baseline): match-or-beat scam on the SAME truth -----
+    let scam_rmse_truth = rmse(scam_mpi, &truth_log_cumhaz);
 
     eprintln!(
-        "monotone baseline vs scam mpi: n={n} events={n_events} cens={cens_frac:.3} \
+        "monotone baseline truth recovery: n={n} events={n_events} cens={cens_frac:.3} \
          p_time={p_time} grid=[1,10,50,100] \
-         gam_logLambda={gam_log_cumhaz:?} scam_mpi={scam_mpi:?} scam_ps={scam_ps:?} \
-         rmse(mpi,ps)={rmse_constraint:.4} pearson(gam,mpi)={corr:.5}"
+         gam_logLambda={gam_log_cumhaz:?} truth={truth_log_cumhaz:?} scam_mpi={scam_mpi:?} \
+         rmse(gam,truth)={gam_rmse_truth:.4} rmse(scam,truth)={scam_rmse_truth:.4}"
     );
 
-    // Bound: log Λ spans ~4.3 units across the grid; 0.05 RMSE is ~1% of that
-    // range, so requiring mpi/ps to agree within it confirms the constraint is
-    // slack on this monotone target without demanding bit-identical fits.
+    // PRIMARY: the truth spans ~4.6 log-units across [1,100]; 0.35 RMSE is < 8%
+    // of that range — a genuine accuracy bar for an n=400, ~30%-censored sample,
+    // set by estimation noise, not by the reference.
     assert!(
-        rmse_constraint <= 0.05,
-        "monotone target is ill-posed: scam mpi/ps disagree by rmse(mpi,ps)={rmse_constraint:.4} > 0.05, so the constraint is fighting non-monotone reference data"
+        gam_rmse_truth <= 0.35,
+        "gam monotone baseline fails to recover log Λ(t|x=0) truth: rmse(gam,truth)={gam_rmse_truth:.4} > 0.35 (truth {truth_log_cumhaz:?}, gam {gam_log_cumhaz:?})"
     );
-    // gam (I-spline likelihood fit of log Λ(t|x=0)) and scam (mpi regression on
-    // the marginal log Λ̂) fit related but distinct monotone curves whose shape
-    // is dominated by the same log-linear log-t trend; Pearson discards the
-    // affine marginal-vs-baseline offset and isolates that shared shape, so the
-    // two must be near-collinear on the grid. 0.97 catches a real divergence in
-    // gam's I-spline/inequality solve while tolerating the basis/estimand gap.
+    // BASELINE: gam must recover the truth at least as accurately as the mature
+    // monotone reference (within 10%), both scored against the same closed form.
     assert!(
-        corr >= 0.97,
-        "gam monotone baseline diverges from scam mpi smooth: pearson={corr:.5} < 0.97"
+        gam_rmse_truth <= scam_rmse_truth * 1.10,
+        "gam less accurate than scam on truth recovery: rmse(gam,truth)={gam_rmse_truth:.4} > 1.10 * rmse(scam,truth)={scam_rmse_truth:.4}"
     );
 }

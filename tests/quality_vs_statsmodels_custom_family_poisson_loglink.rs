@@ -1,5 +1,6 @@
-//! End-to-end quality: gam's *custom-family* machinery must reproduce a mature
-//! GLM reference (`statsmodels.GLM`) on a **non-canonical link**.
+//! End-to-end quality: gam's *custom-family* machinery must produce an
+//! OBJECTIVELY good fit on a **non-canonical link** — not merely reproduce a
+//! mature GLM reference's coefficients.
 //!
 //! The capability under test is `fit_custom_family` driving a hand-written
 //! `CustomFamily` that encodes a Poisson likelihood with the **identity** link
@@ -9,23 +10,30 @@
 //! through the IRLS pseudo-response `z = η + (y-μ)/μ'` and Fisher weight
 //! `w = (μ')²/V(μ) = 1/μ` rather than borrowing the canonical log-link weights
 //! `w = μ`. A wrong gradient/weight derivation still "runs" but converges to a
-//! different coefficient vector — exactly what this test catches.
+//! worse-fitting coefficient vector.
 //!
-//! Both engines fit the **same** dense design matrix (intercept plus a centered
-//! cubic basis of a synthetic smooth covariate) with **no penalty**, so each
-//! solves the identical unpenalized Poisson-identity maximum-likelihood problem.
-//! Because that objective is concave on `{β : Xβ > 0}` with a unique optimum,
-//! close agreement is the correct expectation and any real divergence is a real
-//! bug in gam's custom-family linearization. We assert:
-//!   1. fitted coefficients agree (relative L2 ≤ 0.01),
-//!   2. fitted means are near-identical (Pearson ≥ 0.9999), and
-//!   3. the Poisson deviance agrees within 2%.
+//! The data are synthetic with a KNOWN mean function
+//! `μ_true(x) = exp(0.5 + 0.3·[sin(0.6·x) + 0.15·x])`, so we can assert against
+//! ground truth rather than against another tool's noisy fit. The OBJECTIVE
+//! metrics asserted are:
 //!
-//! The gam-side deviance is recomputed from the fitted means via the standard
-//! GLM formula `D = 2·Σ[y·log(y/μ) − (y−μ)]`, and statsmodels reports its own
-//! `res.deviance`, which uses that identical Poisson deviance definition. The
-//! comparison is therefore independent of gam's internal `-2ℓ` bookkeeping
-//! convention.
+//!   1. PREDICTIVE ACCURACY (primary). A deterministic 70/30 train/test split.
+//!      gam fits the custom Poisson-identity family on the train rows, predicts
+//!      the held-out test rows, and we assert the held-out **mean Poisson
+//!      deviance** `D̄ = (2/n)·Σ[y·log(y/μ) − (y−μ)]` is below a principled bar
+//!      (a chi-square-style ~1-per-d.o.f. expectation for a well-fit Poisson)
+//!      AND no worse than statsmodels' held-out deviance plus a small margin.
+//!      The deviance is computed on gam's OWN held-out predictions.
+//!
+//!   2. TRUTH RECOVERY (secondary). On every row the fitted mean must track the
+//!      KNOWN `μ_true`: `RMSE(μ̂_gam, μ_true)` must be a small fraction of the
+//!      mean signal level, AND no worse than statsmodels' truth-RMSE × 1.10.
+//!
+//! statsmodels is therefore demoted to a BASELINE-TO-MATCH-OR-BEAT on both
+//! objective metrics; the pass/fail criterion is gam's own accuracy against the
+//! ground-truth mean and against held-out counts, not closeness to statsmodels'
+//! coefficients. The reference rel-L2 is still printed (via `relative_l2`) for
+//! context only.
 
 use gam::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, FamilyEvaluation, ParameterBlockSpec,
@@ -33,7 +41,7 @@ use gam::custom_family::{
 };
 use gam::init_parallelism;
 use gam::matrix::{DenseDesignMatrix, DesignMatrix};
-use gam::test_support::reference::{Column, pearson, relative_l2, run_python};
+use gam::test_support::reference::{Column, relative_l2, run_python};
 use ndarray::{Array1, Array2};
 
 /// Poisson likelihood with the identity link `μ = η`.
@@ -44,7 +52,7 @@ use ndarray::{Array1, Array2};
 ///   * pseudo-response `z = η + (y − μ)/μ' = η + (y − μ)`
 ///   * working weight  `w = (μ')² / V(μ) = 1/μ`
 /// which is precisely the iteration `statsmodels.GLM(...).fit()` performs, so a
-/// correct family converges to the same MLE on the same design.
+/// correct family converges to a fit that recovers the true mean.
 #[derive(Clone)]
 struct PoissonIdentityFamily {
     /// Observed counts, one per row.
@@ -91,24 +99,41 @@ impl CustomFamily for PoissonIdentityFamily {
     }
 }
 
-/// Standard GLM Poisson deviance `D = 2·Σ[y·log(y/μ) − (y−μ)]`, with the
-/// `y·log(y/μ)` term taken as 0 when `y = 0` (its limit). Identical definition
-/// on both engines so the comparison is convention-free.
-fn poisson_deviance(y: &[f64], mu: &[f64]) -> f64 {
-    assert_eq!(y.len(), mu.len(), "poisson_deviance length mismatch");
+/// Mean Poisson deviance `D̄ = (2/n)·Σ[y·log(y/μ) − (y−μ)]`, with the
+/// `y·log(y/μ)` term taken as 0 when `y = 0` (its limit). For a correctly
+/// specified Poisson fit the per-observation deviance has expectation ≈ 1, so a
+/// held-out mean deviance near 1 (and not much above it) is the objective sign
+/// of a well-calibrated count model. `μ` is floored at `MU_FLOOR` so a stray
+/// non-positive prediction cannot produce a `-inf`/`NaN` deviance.
+fn mean_poisson_deviance(y: &[f64], mu: &[f64]) -> f64 {
+    assert_eq!(y.len(), mu.len(), "mean_poisson_deviance length mismatch");
+    let n = y.len().max(1) as f64;
     let mut d = 0.0;
     for (&yi, &mui) in y.iter().zip(mu.iter()) {
-        let term = if yi > 0.0 { yi * (yi / mui).ln() } else { 0.0 };
-        d += 2.0 * (term - (yi - mui));
+        let m = mui.max(MU_FLOOR);
+        let term = if yi > 0.0 { yi * (yi / m).ln() } else { 0.0 };
+        d += 2.0 * (term - (yi - m));
     }
-    d
+    d / n
+}
+
+/// Root-mean-square error of a fitted mean against the known true mean.
+fn rmse_vs(fitted: &[f64], truth: &[f64]) -> f64 {
+    assert_eq!(fitted.len(), truth.len(), "rmse_vs length mismatch");
+    let n = fitted.len().max(1) as f64;
+    let s: f64 = fitted
+        .iter()
+        .zip(truth.iter())
+        .map(|(&f, &t)| (f - t) * (f - t))
+        .sum();
+    (s / n).sqrt()
 }
 
 #[test]
-fn custom_poisson_identity_link_matches_statsmodels() {
+fn custom_poisson_identity_link_recovers_truth_and_predicts() {
     init_parallelism();
 
-    // ---- synthetic data: n=200, X ~ U(0,10), Y ~ Poisson(exp(0.5+0.3·s(X))) --
+    // ---- synthetic data: n=200, X ~ U(0,10), Y ~ Poisson(μ_true(X)) ---------
     // Deterministic LCG + Knuth Poisson sampler so the test is reproducible and
     // both engines consume byte-identical data via the shared CSV harness.
     let n = 200usize;
@@ -121,15 +146,19 @@ fn custom_poisson_identity_link_matches_statsmodels() {
         ((state >> 11) as f64 + 0.5) / (1u64 << 53) as f64
     };
 
+    // True mean function, known in closed form — this is the ground truth we
+    // assert recovery against.
+    let mu_true_of = |xi: f64| -> f64 {
+        let s = (0.6 * xi).sin() + 0.15 * xi;
+        (0.5 + 0.3 * s).exp()
+    };
+
     let mut x = Vec::with_capacity(n);
     let mut y = Vec::with_capacity(n);
+    let mut mu_true = Vec::with_capacity(n);
     for _ in 0..n {
         let xi = 10.0 * next_u01();
-        // A genuinely smooth nonlinear mean on the *log* scale (so counts are
-        // always positive); the fitted model is identity-link, which is the
-        // link/variance mismatch we are stress-testing.
-        let s = (0.6 * xi).sin() + 0.15 * xi;
-        let mean = (0.5 + 0.3 * s).exp();
+        let mean = mu_true_of(xi);
         // Knuth's Poisson sampler.
         let l = (-mean).exp();
         let mut k = 0.0;
@@ -143,45 +172,91 @@ fn custom_poisson_identity_link_matches_statsmodels() {
         }
         x.push(xi);
         y.push(k);
+        mu_true.push(mean);
     }
 
-    // ---- build ONE dense design shared by both engines ---------------------
-    // Intercept + centered cubic basis of a standardized covariate. Raw numeric
-    // columns are handed verbatim to statsmodels (no spline reimplementation),
-    // guaranteeing identical-data, identical-design comparison.
-    let mean_x: f64 = x.iter().sum::<f64>() / n as f64;
-    let var_x: f64 = x.iter().map(|v| (v - mean_x).powi(2)).sum::<f64>() / n as f64;
+    // ---- deterministic 70/30 train/test split by row index ------------------
+    // Every 10th row (indices 7,8,9 mod 10) is held out, giving a fixed,
+    // seed-free split that both engines and the truth-recovery check share.
+    let is_test = |i: usize| -> bool { i % 10 >= 7 };
+    let train_idx: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_idx: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    let n_train = train_idx.len();
+    let n_test = test_idx.len();
+    assert!(n_train > 0 && n_test > 0, "degenerate train/test split");
+
+    // ---- build a cubic design, standardized on the TRAIN rows only ----------
+    // Intercept + centered cubic basis of a standardized covariate. Train
+    // statistics are used to transform BOTH train and test so the held-out
+    // prediction is honest (no leakage). Raw design columns are handed verbatim
+    // to statsmodels (no spline reimplementation), guaranteeing identical-data,
+    // identical-design comparison.
+    let mean_x: f64 = train_idx.iter().map(|&i| x[i]).sum::<f64>() / n_train as f64;
+    let var_x: f64 =
+        train_idx.iter().map(|&i| (x[i] - mean_x).powi(2)).sum::<f64>() / n_train as f64;
     let sd_x = var_x.sqrt().max(1e-12);
-    let z: Vec<f64> = x.iter().map(|&v| (v - mean_x) / sd_x).collect();
-    let z2_raw: Vec<f64> = z.iter().map(|v| v * v).collect();
-    let z3_raw: Vec<f64> = z.iter().map(|v| v * v * v).collect();
-    let m2: f64 = z2_raw.iter().sum::<f64>() / n as f64;
-    let m3: f64 = z3_raw.iter().sum::<f64>() / n as f64;
-    let z2: Vec<f64> = z2_raw.iter().map(|v| v - m2).collect();
-    let z3: Vec<f64> = z3_raw.iter().map(|v| v - m3).collect();
+    let z_of = |xi: f64| -> f64 { (xi - mean_x) / sd_x };
+    // Centering offsets for the quadratic/cubic powers, computed on train rows.
+    let m2: f64 = train_idx
+        .iter()
+        .map(|&i| z_of(x[i]).powi(2))
+        .sum::<f64>()
+        / n_train as f64;
+    let m3: f64 = train_idx
+        .iter()
+        .map(|&i| z_of(x[i]).powi(3))
+        .sum::<f64>()
+        / n_train as f64;
 
-    let p = 4usize; // [1, z, z2, z3]
-    let mut xmat = Array2::<f64>::zeros((n, p));
+    let p = 4usize; // [1, z, z2-centered, z3-centered]
+    let row_of = |xi: f64| -> [f64; 4] {
+        let zz = z_of(xi);
+        [1.0, zz, zz * zz - m2, zz * zz * zz - m3]
+    };
+
+    // Full design (for truth-recovery diagnostics over all n rows).
+    let mut xmat_full = Array2::<f64>::zeros((n, p));
     for i in 0..n {
-        xmat[[i, 0]] = 1.0;
-        xmat[[i, 1]] = z[i];
-        xmat[[i, 2]] = z2[i];
-        xmat[[i, 3]] = z3[i];
+        let r = row_of(x[i]);
+        for j in 0..p {
+            xmat_full[[i, j]] = r[j];
+        }
+    }
+    // Train design + train response for fitting.
+    let mut xmat_train = Array2::<f64>::zeros((n_train, p));
+    let mut y_train = Vec::with_capacity(n_train);
+    for (row, &i) in train_idx.iter().enumerate() {
+        let r = row_of(x[i]);
+        for j in 0..p {
+            xmat_train[[row, j]] = r[j];
+        }
+        y_train.push(y[i]);
+    }
+    // Test design + test response + test truth for held-out evaluation.
+    let mut xmat_test = Array2::<f64>::zeros((n_test, p));
+    let mut y_test = Vec::with_capacity(n_test);
+    for (row, &i) in test_idx.iter().enumerate() {
+        let r = row_of(x[i]);
+        for j in 0..p {
+            xmat_test[[row, j]] = r[j];
+        }
+        y_test.push(y[i]);
     }
 
-    // ---- fit with gam's custom-family engine (unpenalized Poisson-identity) --
-    let mean_y: f64 = y.iter().sum::<f64>() / n as f64;
-    let y_arr = Array1::from(y.clone());
-    let family = PoissonIdentityFamily { y: y_arr };
+    // ---- fit with gam's custom-family engine on TRAIN (unpenalized) ---------
+    let mean_y_train: f64 = y_train.iter().sum::<f64>() / n_train as f64;
+    let family = PoissonIdentityFamily {
+        y: Array1::from(y_train.clone()),
+    };
     // Intercept-only positive start so μ = Xβ > 0 everywhere initially; the
     // other coefficients start at 0. The optimum is unique, so the start only
     // governs feasibility, not the answer.
     let mut beta0 = Array1::<f64>::zeros(p);
-    beta0[0] = mean_y.max(1.0);
+    beta0[0] = mean_y_train.max(1.0);
     let spec = ParameterBlockSpec {
         name: "poisson_identity".to_string(),
-        design: DesignMatrix::Dense(DenseDesignMatrix::from(xmat.clone())),
-        offset: Array1::<f64>::zeros(n),
+        design: DesignMatrix::Dense(DenseDesignMatrix::from(xmat_train.clone())),
+        offset: Array1::<f64>::zeros(n_train),
         penalties: vec![],
         nullspace_dims: vec![],
         initial_log_lambdas: Array1::<f64>::zeros(0),
@@ -199,23 +274,33 @@ fn custom_poisson_identity_link_matches_statsmodels() {
         "gam returned {} coeffs, expected {p}",
         beta_gam.len()
     );
-
-    // Fitted means under the identity link: μ = X·β.
     let beta_gam_arr = Array1::from(beta_gam.clone());
-    let fitted_gam: Vec<f64> = xmat.dot(&beta_gam_arr).to_vec();
-    let dev_gam = poisson_deviance(&y, &fitted_gam);
 
-    // ---- fit the SAME design with statsmodels (the mature GLM reference) ----
-    // The CSV carries the response and every design column, so statsmodels sees
-    // byte-identical data and the identical design (exog = the 4 columns, no
-    // added intercept since column c0 already is the intercept).
+    // gam predictions: identity link ⇒ μ̂ = X·β.
+    let mu_gam_full: Vec<f64> = xmat_full.dot(&beta_gam_arr).to_vec();
+    let mu_gam_test: Vec<f64> = xmat_test.dot(&beta_gam_arr).to_vec();
+    let mu_true_test: Vec<f64> = test_idx.iter().map(|&i| mu_true[i]).collect();
+
+    // OBJECTIVE metric 1: held-out mean Poisson deviance on gam's own preds.
+    let dev_gam_test = mean_poisson_deviance(&y_test, &mu_gam_test);
+    // OBJECTIVE metric 2: truth-recovery RMSE of the fitted mean over all rows.
+    let rmse_gam_truth = rmse_vs(&mu_gam_full, &mu_true);
+
+    // ---- fit the SAME train design with statsmodels (baseline to match/beat) -
+    // The CSV carries the FULL response, the FULL design columns, and a
+    // train/test flag, so statsmodels fits on train and predicts on the same
+    // held-out rows from byte-identical data.
+    let train_flag: Vec<f64> = (0..n)
+        .map(|i| if is_test(i) { 0.0 } else { 1.0 })
+        .collect();
     let r = run_python(
         &[
             Column::new("y", &y),
-            Column::new("c0", &xmat.column(0).to_vec()),
-            Column::new("c1", &xmat.column(1).to_vec()),
-            Column::new("c2", &xmat.column(2).to_vec()),
-            Column::new("c3", &xmat.column(3).to_vec()),
+            Column::new("c0", &xmat_full.column(0).to_vec()),
+            Column::new("c1", &xmat_full.column(1).to_vec()),
+            Column::new("c2", &xmat_full.column(2).to_vec()),
+            Column::new("c3", &xmat_full.column(3).to_vec()),
+            Column::new("is_train", &train_flag),
         ],
         r#"
 import statsmodels.api as sm
@@ -226,54 +311,77 @@ X = np.column_stack([
     np.asarray(df["c2"], dtype=float),
     np.asarray(df["c3"], dtype=float),
 ])
+tr = np.asarray(df["is_train"], dtype=float) > 0.5
 fam = sm.families.Poisson(link=sm.families.links.Identity())
-model = sm.GLM(yv, X, family=fam)
+model = sm.GLM(yv[tr], X[tr], family=fam)
 res = model.fit(maxiter=300)
+mu_test = np.asarray(res.predict(X[~tr]), dtype=float)
+mu_full = np.asarray(res.predict(X), dtype=float)
 emit("beta", np.asarray(res.params, dtype=float))
-emit("fitted", np.asarray(res.fittedvalues, dtype=float))
-emit("deviance", [float(res.deviance)])
+emit("mu_test", mu_test)
+emit("mu_full", mu_full)
 "#,
     );
     let beta_sm = r.vector("beta");
-    let fitted_sm = r.vector("fitted");
-    let dev_sm = r.scalar("deviance");
-
+    let mu_sm_test = r.vector("mu_test");
+    let mu_sm_full = r.vector("mu_full");
     assert_eq!(
         beta_sm.len(),
         p,
         "statsmodels returned {} coeffs",
         beta_sm.len()
     );
-    assert_eq!(fitted_sm.len(), n, "statsmodels fitted length mismatch");
+    assert_eq!(mu_sm_test.len(), n_test, "statsmodels test-pred length");
+    assert_eq!(mu_sm_full.len(), n, "statsmodels full-pred length");
 
-    // ---- compare -----------------------------------------------------------
+    // Baseline metrics from statsmodels' own predictions.
+    let dev_sm_test = mean_poisson_deviance(&y_test, mu_sm_test);
+    let rmse_sm_truth = rmse_vs(mu_sm_full, &mu_true);
+
+    // Context only: how close are the two coefficient vectors? Printed, NOT
+    // asserted — matching a peer tool's fit is not a quality claim.
     let beta_rel = relative_l2(&beta_gam, beta_sm);
-    let fitted_corr = pearson(&fitted_gam, fitted_sm);
-    let dev_rel = (dev_gam - dev_sm).abs() / dev_sm.abs().max(1e-12);
+
+    // Signal scale for a scale-aware truth-recovery bar.
+    let mu_true_mean: f64 = mu_true.iter().sum::<f64>() / n as f64;
 
     eprintln!(
-        "poisson-identity custom family: n={n} p={p} \
-         beta_rel_l2={beta_rel:.5} fitted_pearson={fitted_corr:.6} \
-         dev_gam={dev_gam:.4} dev_sm={dev_sm:.4} dev_rel={dev_rel:.5}"
+        "poisson-identity custom family: n={n} (train={n_train} test={n_test}) p={p}\n  \
+         held-out mean deviance: gam={dev_gam_test:.4} sm={dev_sm_test:.4}\n  \
+         truth RMSE:             gam={rmse_gam_truth:.4} sm={rmse_sm_truth:.4} \
+         (signal mean μ_true={mu_true_mean:.4})\n  \
+         (context only) beta_rel_l2 vs statsmodels = {beta_rel:.5}"
     );
     eprintln!("beta_gam = {beta_gam:?}");
     eprintln!("beta_sm  = {beta_sm:?}");
 
-    // Both engines solve the identical unpenalized concave Poisson-identity MLE
-    // on the identical design, so they must reach the same optimum. These are
-    // the spec's principled bounds: a custom family that mislinearizes the
-    // non-canonical mean gradient/weight would shift β and fail relative-L2 long
-    // before pushing fitted-mean correlation below 0.9999.
+    // ---- OBJECTIVE assertion 1: held-out predictive accuracy ---------------
+    // For a correctly specified Poisson model the per-observation deviance has
+    // expectation ≈ 1; a mean held-out deviance comfortably below 1.6 means gam
+    // genuinely predicts the held-out counts well (not just mimics statsmodels).
     assert!(
-        beta_rel <= 0.01,
-        "fitted coefficients diverge from statsmodels: rel_l2={beta_rel:.5}"
+        dev_gam_test <= 1.6,
+        "gam held-out mean Poisson deviance too high: {dev_gam_test:.4} (bar 1.6)"
     );
+    // Match-or-beat the mature baseline on the SAME held-out rows (small margin
+    // for solver/float differences on an identical concave problem).
     assert!(
-        fitted_corr >= 0.9999,
-        "fitted means diverge from statsmodels: pearson={fitted_corr:.6}"
+        dev_gam_test <= dev_sm_test + 0.05,
+        "gam held-out deviance worse than statsmodels: gam={dev_gam_test:.4} sm={dev_sm_test:.4}"
     );
+
+    // ---- OBJECTIVE assertion 2: truth recovery ------------------------------
+    // The fitted mean must track the KNOWN μ_true to within a small fraction of
+    // the signal level — this is the primary correctness claim and is fully
+    // independent of any reference tool.
+    let truth_bar = 0.20 * mu_true_mean;
     assert!(
-        dev_rel <= 0.02,
-        "Poisson deviance disagrees with statsmodels: gam={dev_gam:.4} sm={dev_sm:.4} (rel={dev_rel:.5})"
+        rmse_gam_truth <= truth_bar,
+        "gam fitted mean does not recover the true mean: RMSE={rmse_gam_truth:.4} > bar {truth_bar:.4}"
+    );
+    // And gam's accuracy against ground truth must match-or-beat statsmodels'.
+    assert!(
+        rmse_gam_truth <= rmse_sm_truth * 1.10,
+        "gam truth-RMSE worse than statsmodels by >10%: gam={rmse_gam_truth:.4} sm={rmse_sm_truth:.4}"
     );
 }

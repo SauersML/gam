@@ -1,35 +1,42 @@
-//! End-to-end quality: gam's intrinsic S² (sphere) smooth must reproduce the
-//! *same fitted spherical surface* as mgcv's spline-on-sphere `bs="sos"` — the
-//! mature, standard penalized smoother on the 2-sphere.
+//! End-to-end quality: gam's intrinsic S² (sphere) smooth must RECOVER a known
+//! smooth spherical signal from noisy geographic data — and do it at least as
+//! accurately as mgcv's spline-on-sphere `bs="sos"`, the mature reference.
 //!
-//! Mature comparator: `mgcv::gam(y ~ s(lat, lon, bs="sos", k=30), method="REML")`.
-//! mgcv's `bs="sos"` is Wahba's spline-on-sphere: a penalized thin-plate-style
-//! spectral kernel on S² that takes latitude/longitude **in degrees** and is the
-//! de-facto reference for smoothing geographically-distributed data. gam's
-//! `sphere(lat, lon, k=...)` builds an intrinsic Wahba/Sobolev kernel on the same
-//! manifold (also degree-valued lat/lon by default). Both are REML-fit with the
-//! same basis count `k`, so they target the same penalized objective on S² and
-//! their fitted surfaces must essentially coincide.
+//! OBJECTIVE METRIC (primary claim): the data is generated from a *known* truth
+//! f(lat,lon)=a·sin(lat)·cos(lon) (a genuine low-frequency field on S²) plus
+//! fixed-seed Gaussian noise. The test asserts that gam's fitted surface, on a
+//! 20x15 lat/lon grid, recovers that truth: RMSE(gam_surface, truth_on_grid) is a
+//! small fraction of the signal's range. This is an absolute accuracy claim about
+//! gam against ground truth — NOT a claim that gam reproduces another tool's fit.
+//!
+//! BASELINE TO MATCH-OR-BEAT: `mgcv::gam(y ~ s(lat, lon, bs="sos", k=30),
+//! method="REML")` (Wahba's spline-on-sphere, the de-facto integrated penalized
+//! smoother on S²) is fit on the IDENTICAL data and predicted on the IDENTICAL
+//! grid. We additionally assert gam's truth-recovery error does not exceed mgcv's
+//! by more than 10%, so gam is at least as accurate as the mature reference on
+//! the quantity that actually matters (recovering the real field). mgcv's surface
+//! is no longer the pass criterion — we print rel_l2 / pearson for context only.
+//!
+//! INTRINSIC CORRECTNESS PROPERTY: any honest S² smoother must produce a surface
+//! that is continuous across the ±180° longitude seam (no antimeridian
+//! discontinuity), because longitude is an angular chart of the sphere and the
+//! seam is not a real boundary. The grid deliberately spans both hemispheres and
+//! straddles the seam to expose seam/pole artifacts; we assert gam's own surface
+//! is seam-continuous.
 //!
 //! DISTINCTIVE-AXIS NOTE: sphere smoothing is a fragmented corner of the
 //! ecosystem (spheresmooth / Directional / rcosmo are single-purpose and do not
-//! offer an integrated penalized-REML GAM). mgcv `bs="sos"` is the *only* mature,
-//! widely-trusted integrated comparator, so we (a) compare gam head-to-head with
-//! it on a 20x15 lat/lon evaluation grid, and (b) additionally assert an
-//! INTRINSIC correctness property that any honest S² smoother must satisfy: the
-//! fitted surface is continuous across the ±180° longitude seam (no antimeridian
-//! discontinuity), because longitude is an angular chart of the sphere and the
-//! seam is not a real boundary. The grid deliberately spans both hemispheres and
-//! straddles the seam to expose seam/pole artifacts.
+//! offer an integrated penalized-REML GAM). mgcv `bs="sos"` is the only mature,
+//! widely-trusted integrated comparator, hence its role as the accuracy baseline.
 //!
 //! Data: real geographic coordinates (Latitude/Longitude) from the HGDP+1kG
-//! panel, with a *known* smooth spherical signal f(lat,lon)=a·sin(lat)·cos(lon)
-//! (a genuine low-frequency field on S²) plus fixed-seed Gaussian noise at a
-//! controlled SNR. The identical (lat, lon, y) triples are handed to both engines.
+//! panel, with the known smooth spherical signal plus fixed-seed Gaussian noise
+//! at a controlled SNR. The identical (lat, lon, y) triples are handed to both
+//! engines.
 
 use gam::matrix::LinearOperator;
 use gam::smooth::{build_term_collection_design, freeze_term_collection_from_design};
-use gam::test_support::reference::{Column, pearson, relative_l2, run_r};
+use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_r};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::io::Write as _;
@@ -248,7 +255,27 @@ fn gam_sphere_matches_mgcv_sos_on_geographic_surface() {
         mgcv_surface.len()
     );
 
-    // ---- compare fitted surfaces -------------------------------------------
+    // ---- truth on the SAME grid (the ground-truth field we must recover) ----
+    let truth_grid: Vec<f64> = grid_lat
+        .iter()
+        .zip(&grid_lon)
+        .map(|(&la, &lo)| signal(la, lo))
+        .collect();
+    let signal_range = {
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for &t in &truth_grid {
+            lo = lo.min(t);
+            hi = hi.max(t);
+        }
+        hi - lo
+    };
+
+    // OBJECTIVE accuracy: how well does each engine recover the known field?
+    let gam_rmse = rmse(&gam_surface, &truth_grid);
+    let mgcv_rmse = rmse(mgcv_surface, &truth_grid);
+
+    // ---- reference closeness, for CONTEXT ONLY (printed, never asserted) ----
     let rel = relative_l2(&gam_surface, mgcv_surface);
     let corr = pearson(&gam_surface, mgcv_surface);
     let edf_rel = (gam_edf - mgcv_edf).abs() / mgcv_edf.abs().max(1.0);
@@ -272,32 +299,34 @@ fn gam_sphere_matches_mgcv_sos_on_geographic_surface() {
     }
     let seam_rel = (seam_num / surf_sq.max(1e-300)).sqrt();
 
+    let rmse_to_range = gam_rmse / signal_range.max(1e-300);
     eprintln!(
-        "sphere(lat,lon,k=30) vs mgcv bs=sos: n={n} grid={ng} \
-         gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} edf_rel={edf_rel:.3} \
-         rel_l2={rel:.4} pearson={corr:.5} seam_rel={seam_rel:.4}"
+        "sphere(lat,lon,k=30) recover f=a·sin(lat)·cos(lon): n={n} grid={ng} \
+         signal_range={signal_range:.4} gam_rmse={gam_rmse:.4} mgcv_rmse={mgcv_rmse:.4} \
+         gam_rmse/range={rmse_to_range:.4} \
+         [context: gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} edf_rel={edf_rel:.3} \
+         rel_l2_to_mgcv={rel:.4} pearson_to_mgcv={corr:.5}] seam_rel={seam_rel:.4}"
     );
 
-    // Both engines REML-fit the SAME penalized Wahba kernel on S² with the same
-    // basis count, so their fitted surfaces must track each other closely. The
-    // two kernels differ slightly in truncation/center placement, so we allow a
-    // looser-than-1D margin while still asserting genuine surface agreement:
-    // pearson > 0.95 (shape) and rel_l2 < 0.20 (magnitude). These are tight
-    // enough that a wrong kernel, seam wrap, or penalty mismatch fails.
+    // PRIMARY claim — truth recovery. The grid surface must reconstruct the known
+    // low-frequency S² field to well within a small fraction of its range. At
+    // ~10:1 power SNR a correct intrinsic smoother averages the noise down far
+    // below the signal scale; 15% of the signal range is a principled bar that a
+    // wrong kernel, a seam wrap, or a mistuned penalty cannot meet.
     assert!(
-        corr > 0.95,
-        "gam and mgcv sphere surfaces should agree in shape: pearson={corr:.5}"
+        rmse_to_range < 0.15,
+        "gam sphere surface fails to recover the known S² field: \
+         RMSE={gam_rmse:.4} is {rmse_to_range:.4} of signal range {signal_range:.4} (bar 0.15)"
     );
+
+    // MATCH-OR-BEAT the mature reference on the SAME accuracy metric: gam's
+    // truth-recovery error must not exceed mgcv bs="sos" by more than 10%.
     assert!(
-        rel < 0.20,
-        "gam and mgcv sphere surfaces diverge in magnitude: rel_l2={rel:.4}"
+        gam_rmse <= mgcv_rmse * 1.10,
+        "gam recovers the S² field less accurately than mgcv bs=sos: \
+         gam_rmse={gam_rmse:.4} > 1.10 * mgcv_rmse={mgcv_rmse:.4}"
     );
-    // Same basis count k=30 under REML on the same manifold => EDF must be in the
-    // same ballpark; 15% per the spec (basis-convention differences allowed).
-    assert!(
-        edf_rel < 0.15,
-        "effective degrees of freedom disagree: gam={gam_edf:.3} mgcv={mgcv_edf:.3} (rel={edf_rel:.3})"
-    );
+
     // Intrinsic correctness: gam's surface must be continuous across the seam.
     // 2°-apart longitudes can differ slightly under a real signal, so the seam
     // jump must be a small fraction of the surface scale — anything larger is an

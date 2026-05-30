@@ -1,18 +1,31 @@
-//! Empirical confidence-interval coverage of gam's penalized-smooth uncertainty,
-//! benchmarked head-to-head against `mgcv` — the mature, standard GAM
-//! implementation whose `predict(..., se.fit = TRUE)` is the field-standard way
-//! to get pointwise standard errors for a smooth.
+//! OBJECTIVE METRIC ASSERTED: across-replicate empirical coverage of gam's
+//! penalized-smooth 90% confidence band, measured against the KNOWN true mean
+//! function `eta(x) = sin(6*pi*x)` — NOT against any reference tool's intervals.
+//! This is a calibration test: a correctly-constructed 90% interval on the
+//! regression function must contain the true `eta` at ~90% of (replicate,
+//! evaluation-point) pairs (the frequentist coverage property of Bayesian/
+//! penalized smooth intervals; Nychka 1988, Marra & Wood 2012). The pass/fail
+//! criterion is gam's own coverage landing inside the nominal window
+//! [0.85, 0.95] (0.90 +/- 0.05) — an absolute, self-contained calibration claim
+//! that does not reference mgcv at all.
 //!
-//! Why this is the right comparator: mgcv's default prediction covariance is the
-//! Bayesian/penalized covariance `Vp` (Wood 2017, §6.10), which propagates the
-//! smoothing-penalty shrinkage into the reported SE. gam exposes the exact same
-//! object as its smoothing-corrected coefficient covariance (`Vp`,
-//! `beta_covariance_corrected`). A confidence interval built from `Vp` has a
-//! frequency-coverage interpretation across replicate datasets: for a 90%
-//! nominal interval on the regression function, the band should contain the true
-//! mean `eta(x) = sin(6*pi*x)` at roughly 90% of (replicate, evaluation-point)
-//! pairs. This is the across-replicate coverage property mgcv's Bayesian
-//! intervals are designed to satisfy (Nychka 1988; Marra & Wood 2012).
+//! gam's coverage is built entirely from gam's own smoothing-parameter-corrected
+//! coefficient covariance `Vp` (`beta_covariance_corrected`), which propagates
+//! the smoothing-penalty shrinkage into the reported SE (the same statistical
+//! object mgcv's `predict(se.fit = TRUE)` uses by default — Wood 2017 §6.10 — but
+//! here we compute everything ourselves from gam's matrices). SE at an evaluation
+//! point `x_i` is `sqrt(s_i^T Vp s_i)` for the design row `s_i` (identity link =>
+//! predictor == mean).
+//!
+//! ROLE OF mgcv: BASELINE TO MATCH-OR-BEAT ON CALIBRATION, never a "gam ==
+//! mgcv" target. mgcv is fit on the IDENTICAL data and its own coverage measured
+//! the same way. We additionally require gam's *calibration error*
+//! |coverage - 0.90| to be no worse than mgcv's by more than a small margin, so
+//! the mature field-standard interval is a floor on quality — but gam passing or
+//! failing is decided by gam's own distance to nominal, not by reproducing
+//! mgcv's (itself noisy) fitted SEs. Matching mgcv's intervals would prove
+//! nothing; achieving nominal coverage of the true function proves the SEs are
+//! honest.
 //!
 //! Design of the experiment (identical data fed to both engines):
 //!   * One fixed design `x` (n = 500, U[0,1], seed 42) shared by every replicate
@@ -28,24 +41,15 @@
 //!     path and is NOT contaminated by gam's optional boundary or OOD variance
 //!     inflation — both of which are switched off here (we read the covariance
 //!     directly and build the band ourselves, so no correction is applied).
-//!   * gam SE at an evaluation point `x_i` is `sqrt(s_i^T Vp s_i)` where `s_i` is
-//!     the design row at `x_i` (identity link => the predictor equals the mean),
-//!     exactly the quadratic form mgcv evaluates internally for `se.fit`.
 //!
-//! Metric / bound: empirical coverage = fraction of (replicate, eval-point) pairs
-//! whose 90% CI contains the TRUE `eta`. Under correct CI construction this is
-//! ~0.90. We require gam's coverage to land in [0.85, 0.95] (nominal 0.90 +/-
-//! 0.05). Too low => SE underestimates (e.g. ignores smoothing-penalty variance);
-//! too high => SE overestimates. The window is tight enough that a systematic SE
-//! bias of more than ~half a nominal-level point is rejected, yet wide enough to
-//! absorb Monte-Carlo error. The 50 eval points within one replicate share the
-//! same fitted curve and the same noise draw, so they are strongly correlated;
-//! the effective sample size for the coverage rate is therefore on the order of
-//! the 100 replicates, not the 5000 (replicate, point) pairs. The between-
-//! replicate s.e. of the coverage estimate is ~0.005-0.01, so the +/-0.05 window
-//! is several s.e. wide — loose enough to never fail on noise, tight enough that
-//! a systematic SE bias of half a nominal point is rejected. mgcv's own coverage
-//! on the identical data is reported alongside as the calibration reference.
+//! Why the window is principled: the 50 eval points within one replicate share
+//! the same fitted curve and noise draw, so they are strongly correlated; the
+//! effective sample size for the coverage rate is on the order of the 100
+//! replicates, not the 5000 pairs. The between-replicate s.e. of the coverage
+//! estimate is ~0.005-0.01, so the +/-0.05 window is several s.e. wide — loose
+//! enough never to fail on Monte-Carlo noise, tight enough to reject a systematic
+//! SE bias of half a nominal-level point (too-low coverage => SE underestimates,
+//! e.g. ignores smoothing-penalty variance; too-high => SE overestimates).
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
@@ -139,7 +143,7 @@ fn pointwise_se(design: ArrayView2<'_, f64>, cov: &Array2<f64>) -> Vec<f64> {
 }
 
 #[test]
-fn ci_coverage_matches_mgcv_on_gaussian_truth_90pct() {
+fn ci_coverage_near_nominal_on_gaussian_truth_90pct() {
     init_parallelism();
 
     // ---- fixed design + 100 replicate responses (seed 42) -----------------
@@ -267,36 +271,48 @@ fn ci_coverage_matches_mgcv_on_gaussian_truth_90pct() {
     );
     let mgcv_coverage = r.scalar("coverage");
 
+    // Calibration error = absolute distance of empirical coverage from nominal.
+    // This is the objective quality scalar for an uncertainty band: 0 is perfect.
+    const NOMINAL: f64 = 0.90;
+    let gam_calib_err = (gam_coverage_vp - NOMINAL).abs();
+    let mgcv_calib_err = (mgcv_coverage - NOMINAL).abs();
+
     eprintln!(
         "Gaussian CI coverage (90% nominal, {N_REPLICATES} reps x {N_EVAL} eval pts = {total_trials} trials):\n  \
-         gam Vp coverage = {gam_coverage_vp:.4}  (smoothing-corrected; mgcv-default analog)\n  \
+         gam Vp coverage = {gam_coverage_vp:.4}  (calib err |cov-0.90| = {gam_calib_err:.4}; smoothing-corrected)\n  \
          gam Vb coverage = {gam_coverage_vb:.4}  (conditional; diagnostic)\n  \
-         mgcv coverage   = {mgcv_coverage:.4}  (predict se.fit, default Vp)"
+         mgcv coverage   = {mgcv_coverage:.4}  (calib err |cov-0.90| = {mgcv_calib_err:.4}; baseline)"
     );
 
-    // mgcv is the calibration reference: on this well-specified problem its
-    // Bayesian intervals are known to be close to nominal. Sanity-check it lands
-    // near 0.90 so a comparator misconfiguration cannot masquerade as a gam pass.
-    assert!(
-        mgcv_coverage >= 0.80 && mgcv_coverage <= 0.99,
-        "mgcv reference coverage {mgcv_coverage:.4} is implausibly far from nominal 0.90; \
-         the comparator setup is suspect"
-    );
-
-    // The core assertion: gam's penalized-covariance interval must achieve close
-    // to the nominal 90% coverage of the true mean function. [0.85, 0.95] is the
-    // principled +/- 0.05 window around 0.90; it rejects a systematic SE bias of
-    // half a nominal point while tolerating the between-replicate Monte-Carlo
-    // noise (~0.005-0.01 s.e. over the 100 effectively-independent replicates).
+    // PRIMARY (absolute, self-contained) ASSERTION: gam's own 90% penalized-
+    // covariance band must achieve close to nominal coverage of the TRUE mean
+    // function. [0.85, 0.95] is the principled +/-0.05 window around 0.90; it
+    // rejects a systematic SE bias of half a nominal point while tolerating the
+    // between-replicate Monte-Carlo noise (~0.005-0.01 s.e. over the 100
+    // effectively-independent replicates). This claim does not reference mgcv.
     assert!(
         gam_coverage_vp >= 0.85 && gam_coverage_vp <= 0.95,
         "gam 90% CI empirical coverage {gam_coverage_vp:.4} is outside the nominal window \
-         [0.85, 0.95] (mgcv reference = {mgcv_coverage:.4}); gam's standard errors are \
-         {} the truth.",
+         [0.85, 0.95]; gam's standard errors are {} the truth.",
         if gam_coverage_vp < 0.85 {
             "under-covering (SE too small)"
         } else {
             "over-covering (SE too large)"
         }
+    );
+
+    // SECONDARY (match-or-beat baseline): gam's calibration error must be no
+    // worse than the mature field-standard interval's by more than a small
+    // Monte-Carlo margin. mgcv is the floor on quality, not a "gam == mgcv"
+    // target — gam is allowed to be *better* calibrated, only not meaningfully
+    // worse. The 0.03 margin (~3-6 between-replicate s.e.) absorbs the noise in
+    // both engines' coverage estimates without licensing a real calibration gap.
+    const MATCH_OR_BEAT_MARGIN: f64 = 0.03;
+    assert!(
+        gam_calib_err <= mgcv_calib_err + MATCH_OR_BEAT_MARGIN,
+        "gam CI calibration error {gam_calib_err:.4} (coverage {gam_coverage_vp:.4}) is worse \
+         than the mgcv baseline {mgcv_calib_err:.4} (coverage {mgcv_coverage:.4}) by more than \
+         the {MATCH_OR_BEAT_MARGIN:.2} margin; gam's intervals are less honest than the \
+         field-standard reference on identical data."
     );
 }

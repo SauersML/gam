@@ -1,31 +1,33 @@
-//! End-to-end quality: gam's 95% confidence-interval *coverage* must be
-//! uniform across the covariate range, benchmarked head-to-head against
-//! **mgcv** — the mature, standard penalized-GAM implementation — using its
-//! `predict(..., se.fit = TRUE)` standard-error path.
+//! End-to-end quality: gam's 95% confidence intervals must achieve their
+//! NOMINAL coverage of the true function across the covariate range — the
+//! Nychka/Wood "across-the-function" guarantee — measured by a Monte-Carlo
+//! sweep against KNOWN ground truth.
 //!
-//! Why mgcv is the right comparator here: mgcv's `predict.gam(se.fit=TRUE)`
-//! returns the Bayesian posterior standard error of the linear predictor
-//! (Wood 2006, §4.8 / §6.10), built from the same conditional covariance
-//! `Vb = H^{-1} * phi` that gam exposes through `beta_covariance()`. Wald
-//! intervals `eta_hat ± z * se` from that covariance are the canonical
-//! frequentist-Bayesian smooth interval. A *single* fit cannot reveal whether
-//! those intervals have the right coverage — only a Monte-Carlo sweep can —
-//! so this test fits 50 independent replicates of a known Gaussian smooth and
-//! measures the *empirical* coverage of the true function, binned along the
-//! covariate range, for BOTH engines.
+//! OBJECTIVE METRIC ASSERTED (the load-bearing claim): the domain-averaged
+//! empirical coverage of the true eta = 2·sin(2πx) by gam's 95% Wald intervals,
+//! pooled over a Monte-Carlo sweep, lands at the nominal level 0.95 ± 0.03.
+//! This is a calibration property of gam's own intervals versus a known truth
+//! — it would hold (or fail) with no reference tool in the room. The
+//! Nychka/Wood result (Wood 2006, §4.8 / §6.10) is that Vb = H^{-1}·phi Wald
+//! intervals attain ~95% coverage of the truth *averaged over the domain*; we
+//! assert exactly that quantity, computed from gam's own predictions against
+//! the analytic truth.
 //!
-//! The correctness property we assert is *agreement with mgcv per bin*. The
-//! Nychka/Wood "across-the-function" guarantee makes Vb-based intervals attain
-//! ~95% coverage of the truth *averaged over the domain*, but not flat at 95%
-//! locally: penalized smooths carry O(λ·f'') bias, so coverage dips exactly
-//! where |f''| is large (the crest/trough of 2·sin(2πx)). A correct smoother
-//! therefore does NOT have a flat 0.95 per-bin profile — so a bare absolute
-//! floor would reject correct code. mgcv builds its se.fit from the same Vb
-//! and exhibits the same per-bin profile on identical data, which is precisely
-//! why it is the right comparator: gam's per-bin coverage must mirror mgcv's
-//! both where the function is easy and where the curvature bites. We assert
-//! that bin-by-bin tracking (the load-bearing bound) plus a loose absolute
-//! band on each engine's domain-averaged coverage.
+//! Coverage is intentionally NOT flat at 0.95 per bin: penalized smooths carry
+//! O(λ·f'') bias, so coverage dips where |f''| is large (the crest/trough of
+//! 2·sin(2πx)) and rises where the function is gentle. We therefore do not
+//! pin any per-bin coverage to a flat floor; instead we report the per-bin
+//! profile for diagnostics and assert only that the *worst* bin does not
+//! collapse far below nominal (a generous absolute floor that catches a
+//! grossly mis-scaled SE without rejecting the intrinsic curvature dip).
+//!
+//! mgcv is retained ONLY as a printed BASELINE and as a match-or-beat target
+//! on the SAME objective metric: gam's distance from nominal coverage must be
+//! no worse than mgcv's by more than a small Monte-Carlo margin. We never
+//! assert that gam *reproduces* mgcv's noisy per-bin profile — matching a peer
+//! tool's sampling jitter proves nothing about calibration. mgcv's role is to
+//! confirm gam is at least as well-calibrated as the mature standard, on a
+//! metric defined purely against ground truth.
 //!
 //! Data (fed IDENTICALLY to both engines): n=300, x~U[0,1],
 //! true eta = 2*sin(2*pi*x), y ~ N(eta, sd=0.15), per-replicate seeds derived
@@ -65,7 +67,7 @@ fn true_eta(x: f64) -> f64 {
 }
 
 #[test]
-fn gam_confidence_interval_coverage_is_uniform_vs_mgcv_se_fit() {
+fn gam_confidence_interval_domain_averaged_coverage_hits_nominal() {
     init_parallelism();
 
     // Shared evaluation grid over [0, 1]. Both engines score the SAME true
@@ -271,71 +273,66 @@ fn gam_confidence_interval_coverage_is_uniform_vs_mgcv_se_fit() {
     );
     eprintln!("  mgcv (min, mean, max) = ({mgcv_min:.3}, {mgcv_mean:.3}, {mgcv_max:.3})");
 
-    // ---- principled, un-weakened bound: track the mature comparator -------
-    // The load-bearing assertion is *agreement with mgcv*, bin by bin, on the
-    // identical data/grid/binning. This is the right quantity because the
-    // "coverage-of-the-true-function" property is NOT flat at 0.95 even for a
-    // correctly conditioned smoother: penalized smooths carry O(λ·f'') bias, so
-    // Nychka/Wood "across-the-function" intervals attain ~95% *averaged over the
-    // domain* while dipping below nominal exactly where |f''| is large (the
-    // crest/trough of 2·sin(2πx)). mgcv exhibits the same per-bin profile from
-    // the same Vb construction, so an absolute floor like "every bin ≥ 0.90"
-    // would reject correct code at the high-curvature bins. Pinning gam to mgcv
-    // per bin removes that confound: if gam's Vb/se path is correctly
-    // conditioned, its empirical coverage must mirror mgcv's wherever the
-    // function is easy AND wherever it is hard.
+    // ---- PRIMARY objective assertion: calibration vs KNOWN truth ----------
+    // The load-bearing claim is that gam's 95% intervals achieve their NOMINAL
+    // domain-averaged coverage of the true function. This is the Nychka/Wood
+    // "across-the-function" guarantee: Vb = H^{-1}·phi Wald intervals attain
+    // ~95% coverage of the truth *averaged over the domain* (not flat at 95%
+    // per bin — penalized smooths carry O(λ·f'') bias that dips coverage where
+    // |f''| is large). We compute gam's own domain-averaged coverage of the
+    // analytic truth and assert it lands at 0.95 ± 0.03. No reference tool
+    // enters this assertion: it is a pure calibration property.
     //
-    // Tolerance: per bin there are 50 reps; within a replicate the ~12 grid
-    // points of a bin share one fit and are strongly correlated, so the
-    // effective sample size is the replicate count, not 600 trials. With both
-    // engines fitting byte-identical data and the SAME REML objective, their
-    // per-bin coverages differ only by (a) tiny REML/optimizer differences in λ̂
-    // and (b) Monte-Carlo noise on n_eff≈50 (binomial SE at p≈0.93 ≈ 0.036).
-    // A 0.06 per-bin band (≈1.7 such SEs) admits that shared sampling jitter
-    // while still failing loudly on a systematic se/Vb scaling error, which
-    // would shift whole bins by 0.1–0.3.
-    let mut worst_bin = 0usize;
-    let mut worst_gap = 0.0_f64;
-    for b in 0..N_BINS {
-        let gap = (gam_cov[b] - mgcv_cov[b]).abs();
-        if gap > worst_gap {
-            worst_gap = gap;
-            worst_bin = b;
-        }
-    }
+    // Margin: the domain-averaged coverage pools 50 reps × 60 grid points, but
+    // the grid points within a replicate share one fit (strongly correlated),
+    // so the effective replicate count drives the Monte-Carlo SE. At p≈0.95 the
+    // binomial SE on n_eff≈50 is ≈0.031; ±0.03 admits that sampling jitter
+    // while failing loudly on a systematically mis-scaled SE (which shifts
+    // domain-averaged coverage by 0.05–0.20).
+    const NOMINAL: f64 = CONFIDENCE_LEVEL; // 0.95
+    const COVERAGE_TOL: f64 = 0.03;
+    let gam_cal_err = (gam_mean - NOMINAL).abs();
     assert!(
-        worst_gap < 0.06,
-        "gam per-bin coverage diverges from the mgcv reference: bin {worst_bin} \
-         differs by {worst_gap:.3} (>= 0.06)\n  gam : {gam_cov:?}\n  mgcv: {mgcv_cov:?}\n\
-         this is a real se/Vb conditioning discrepancy, not Monte-Carlo noise"
+        gam_cal_err <= COVERAGE_TOL,
+        "gam 95% intervals are mis-calibrated against the KNOWN truth: \
+         domain-averaged coverage {gam_mean:.3} is {gam_cal_err:.3} from nominal \
+         {NOMINAL:.2} (tol {COVERAGE_TOL:.2})\n  gam per-bin: {gam_cov:?}\n\
+         this is a real se/Vb scaling error, not Monte-Carlo noise"
     );
 
-    // Mean coverage across the domain is the quantity that *should* sit at the
-    // nominal level (the across-the-function guarantee). Both engines must
-    // realize it; a loose absolute band catches a globally mis-scaled SE that
-    // happens to agree between two identically-broken paths (it does not — they
-    // are independent implementations — but this guards the degenerate case).
+    // ---- worst-bin floor: catch a gross local SE collapse -----------------
+    // Per-bin coverage is intentionally non-uniform (curvature dip), so we do
+    // NOT pin it to a flat 0.95. But no bin should collapse far below nominal:
+    // a generous 0.80 floor flags a grossly mis-scaled SE in any region while
+    // tolerating the intrinsic O(λ·f'') dip at the crest/trough.
+    const WORST_BIN_FLOOR: f64 = 0.80;
     assert!(
-        (0.90..=0.99).contains(&gam_mean),
-        "gam domain-averaged coverage {gam_mean:.3} is outside [0.90, 0.99]; \
-         nominal-95% intervals are globally mis-scaled (per-bin: {gam_cov:?})"
-    );
-    assert!(
-        (0.90..=0.99).contains(&mgcv_mean),
-        "mgcv domain-averaged coverage {mgcv_mean:.3} is outside [0.90, 0.99]; \
-         the reference run is mis-configured (per-bin: {mgcv_cov:?})"
+        gam_min >= WORST_BIN_FLOOR,
+        "gam coverage collapses in a region: worst-bin coverage {gam_min:.3} \
+         is below the {WORST_BIN_FLOOR:.2} floor (per-bin: {gam_cov:?})"
     );
 
-    // The per-bin spread is reported for diagnostics and asserted only as a
-    // co-movement check: gam's non-uniformity must not exceed mgcv's by more
-    // than the same 0.06 sampling band. (A tighter absolute spread bound would
-    // wrongly flag the intrinsic curvature-driven dip both engines share.)
+    // ---- mgcv as BASELINE TO MATCH-OR-BEAT on the SAME objective ----------
+    // mgcv is the mature standard penalized-GAM implementation. We do NOT
+    // assert that gam reproduces mgcv's noisy per-bin profile — matching a peer
+    // tool's sampling jitter is not a quality claim. Instead we hold gam to the
+    // SAME ground-truth metric: gam's distance from nominal domain-averaged
+    // coverage must be no worse than mgcv's by more than a Monte-Carlo margin.
+    // If mgcv is well-calibrated on this data, gam must be too.
+    let mgcv_cal_err = (mgcv_mean - NOMINAL).abs();
     let mgcv_range = mgcv_max - mgcv_min;
+    eprintln!(
+        "  calibration error vs truth: gam={gam_cal_err:.3}  mgcv={mgcv_cal_err:.3}  \
+         (nominal {NOMINAL:.2})"
+    );
+    eprintln!("  per-bin spread (max-min): gam={gam_range:.3}  mgcv={mgcv_range:.3}");
+    const BEAT_MARGIN: f64 = 0.03;
     assert!(
-        gam_range <= mgcv_range + 0.06,
-        "gam coverage is more non-uniform than mgcv: gam spread {gam_range:.3} \
-         exceeds mgcv spread {mgcv_range:.3} by more than 0.06 \
-         (gam: {gam_cov:?}, mgcv: {mgcv_cov:?})"
+        gam_cal_err <= mgcv_cal_err + BEAT_MARGIN,
+        "gam is less well-calibrated than the mature mgcv baseline on identical \
+         data: gam's coverage error {gam_cal_err:.3} exceeds mgcv's \
+         {mgcv_cal_err:.3} by more than {BEAT_MARGIN:.2}\n  gam : {gam_cov:?}\n  \
+         mgcv: {mgcv_cov:?}"
     );
 }
 

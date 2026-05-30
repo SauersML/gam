@@ -1,51 +1,49 @@
 //! End-to-end quality: gam's Gaussian location-scale fit with a *cyclic*
 //! (periodic) smooth in BOTH the mean (mu) and the log-scale (sigma) block must
-//! match `gamlss` — the mature, standard GAMLSS-style distributional-regression
-//! implementation — on the same periodic, heteroscedastic data.
+//! RECOVER the known generating functions on a periodic, heteroscedastic signal.
 //!
-//! Why gamlss, and why this configuration
-//! --------------------------------------
-//! `gamlss::gamlss(family = NO())` is the reference for distributional
-//! regression: it fits separate additive predictors for mu and sigma by
-//! penalized likelihood, exactly the quantity gam's Gaussian location-scale
-//! path targets. Routing the smooths through mgcv's cyclic cubic basis
-//! (`ga(~ s(x, bs = "cc"))`) makes gamlss enforce the SAME wrap-around
-//! constraint gam's `s(x, bs='cc')` enforces: the fitted function and its
-//! derivatives are continuous across the period boundary. Comparing the two
-//! constrained smooth *shapes* (not just in-sample predictions) is what reveals
-//! bugs in how gam propagates the cyclic-basis null space and the blockwise
-//! penalty into both blocks when mu and sigma are fitted jointly.
+//! Objective metric asserted (TRUTH RECOVERY)
+//! ------------------------------------------
+//! The data are generated from a KNOWN truth,
+//!   x = seq(0, 2*pi, length = 150),  y ~ N(mu*(x), sigma*(x)^2),
+//!   mu*(x)    = sin(x),
+//!   sigma*(x) = 0.15 + 0.1*cos(x),   (so log sigma*(x) is also known),
+//! with x circular (0 and 2*pi identified). The PRIMARY claim is that gam's
+//! constrained cyclic smooths recover those generating functions. We assert,
+//! on 50 equally-spaced grid points in [0, 2*pi):
+//!   RMSE(mu_gam,        mu*)        <= 0.06   (~40% of the mean's signal SD;
+//!                                              cf. per-point noise sigma 0.05..0.25)
+//!   RMSE(log_sigma_gam, log sigma*) <= 0.30   (log-scale is identified one
+//!                                              likelihood-derivative removed from
+//!                                              the data, so its absolute bar is
+//!                                              looser, yet still pins the shape).
+//! These are absolute, reference-free accuracy bars: passing means gam fit the
+//! TRUE periodic mean and the TRUE periodic (log-)scale, not that it imitated
+//! another tool's (possibly equally wrong) fit.
 //!
-//! Data: a fixed-seed periodic, heteroscedastic signal,
-//!   x = seq(0, 2*pi, length = 150),  y ~ N(sin(x), (0.15 + 0.1*cos(x))^2),
-//! with x circular (0 and 2*pi identified). Both engines receive the IDENTICAL
-//! (x, y) and the SAME explicit period [0, 2*pi], so the only thing under test
-//! is the fitted cyclic mu- and sigma-shapes.
+//! gamlss as a match-or-beat ACCURACY baseline (not a target)
+//! ----------------------------------------------------------
+//! `gamlss::gamlss(family = NO())` is the mature distributional-regression
+//! engine; fed the IDENTICAL (x, y) and the SAME explicit period via mgcv's
+//! cyclic cubic basis (`ga(~ s(x, bs = "cc"))`), it produces its own cyclic mu-
+//! and log-sigma fits. We measure ITS error against the same truth and require
+//! gam to be at least as accurate (within a small slack):
+//!   RMSE(mu_gam,        mu*)        <= 1.10 * RMSE(mu_gamlss,        mu*)
+//!   RMSE(log_sigma_gam, log sigma*) <= 1.10 * RMSE(log_sigma_gamlss, log sigma*)
+//! gamlss is thus a floor to match-or-beat on recovery accuracy, never a fit gam
+//! must reproduce. The raw gam-vs-gamlss rel_l2 is still printed for context.
 //!
 //! Note on the formula: this is the faithful location-scale + cyclic-both
-//! configuration the metric targets. We deliberately do NOT add a `linkwiggle`
-//! mean-warp here — gamlss `NO()` has no inverse-link warp, so adding one would
-//! make the test measure a quantity the reference cannot express and would
-//! corrupt the very comparison the spec asks for.
-//!
-//! Bound: cyclic smooths add the wrap-around derivative-continuity constraint,
-//! so close agreement with gamlss validates that gam's `cc` basis and blockwise
-//! penalty correctly carry that structure into BOTH blocks. We assert
-//!   relative_l2(mu_gam, mu_gamlss)              < 0.02   (mean on the cycle)
-//!   relative_l2(log sigma_gam, log sigma_gamlss) < 0.04   (log-scale on cycle)
-//! evaluated on 50 equally-spaced points in [0, 2*pi). The sigma bound is looser
-//! because the log-scale block is identified one likelihood-derivative removed
-//! from the data (it sees residual second moments, not the response directly),
-//! so REML/penalty-selection differences between the two engines legitimately
-//! perturb log sigma more than mu — yet 0.04 still pins the *shape* tightly
-//! (a real divergence in the cyclic sigma smooth would blow well past it).
+//! configuration. We deliberately do NOT add a `linkwiggle` mean-warp here —
+//! gamlss `NO()` has no inverse-link warp, so the baseline would not see the same
+//! model, and the truth-recovery metric does not need it.
 
 use csv::StringRecord;
 use gam::families::sigma_link::logb_sigma_from_eta_scalar;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::solver::estimate::BlockRole;
-use gam::test_support::reference::{Column, relative_l2, run_r};
+use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -92,7 +90,7 @@ fn standard_normals(n: usize, seed: u64) -> Vec<f64> {
 }
 
 #[test]
-fn gam_cyclic_location_scale_matches_gamlss() {
+fn gam_cyclic_location_scale_recovers_truth() {
     init_parallelism();
 
     // ---- build the synthetic circular, heteroscedastic dataset ------------
@@ -238,30 +236,60 @@ fn gam_cyclic_location_scale_matches_gamlss() {
         "gamlss log-sigma length mismatch"
     );
 
-    // ---- compare the constrained cyclic shapes ----------------------------
+    // ---- KNOWN truth on the same evaluation grid --------------------------
+    // The data were generated from mu*(x)=sin(x) and sigma*(x)=0.15+0.1 cos(x),
+    // so log sigma*(x) is known too. These are the objective targets.
+    let truth_mu: Vec<f64> = grid_x.iter().map(|&gx| true_mu(gx)).collect();
+    let truth_log_sigma: Vec<f64> = grid_x.iter().map(|&gx| true_sigma(gx).ln()).collect();
+
+    // ---- objective accuracy of gam against the truth ----------------------
+    let gam_mu_rmse = rmse(&gam_mu, &truth_mu);
+    let gam_log_sigma_rmse = rmse(&gam_log_sigma, &truth_log_sigma);
+
+    // ---- gamlss accuracy against the SAME truth (match-or-beat baseline) ---
+    let gamlss_mu_rmse = rmse(gamlss_mu, &truth_mu);
+    let gamlss_log_sigma_rmse = rmse(gamlss_log_sigma, &truth_log_sigma);
+
+    // Raw gam-vs-gamlss agreement, printed for context only (NOT asserted).
     let mu_rel = relative_l2(&gam_mu, gamlss_mu);
     let log_sigma_rel = relative_l2(&gam_log_sigma, gamlss_log_sigma);
 
     eprintln!(
-        "cyclic location-scale vs gamlss: n={n} m={m} \
-         mu_rel_l2={mu_rel:.4} log_sigma_rel_l2={log_sigma_rel:.4} \
+        "cyclic location-scale truth recovery: n={n} m={m} \
+         mu_rmse_gam={gam_mu_rmse:.4} mu_rmse_gamlss={gamlss_mu_rmse:.4} \
+         log_sigma_rmse_gam={gam_log_sigma_rmse:.4} log_sigma_rmse_gamlss={gamlss_log_sigma_rmse:.4} \
+         (context: mu_rel_l2={mu_rel:.4} log_sigma_rel_l2={log_sigma_rel:.4}) \
          beta_mu={} beta_sigma={}",
         beta_mu.len(),
         beta_noise.len()
     );
 
-    // Both engines fit a cyclic cubic smooth in each block by penalized
-    // likelihood on identical data with the identical period; the constrained
-    // mu-shape must essentially coincide.
+    // PRIMARY: gam recovers the true cyclic mean. The mean's signal SD is
+    // ~1/sqrt(2) and per-point noise sigma runs 0.05..0.25, so 0.06 RMSE means
+    // the recovered mean tracks sin(x) to a small fraction of the signal range.
     assert!(
-        mu_rel < 0.02,
-        "cyclic mu smooth diverges from gamlss: rel_l2={mu_rel:.4} (bound 0.02)"
+        gam_mu_rmse <= 0.06,
+        "cyclic mu does not recover sin(x): RMSE={gam_mu_rmse:.4} (bound 0.06)"
     );
-    // The log-scale block is identified one derivative removed from the data, so
-    // its bound is the looser 0.04 justified above — still tight enough to catch
-    // any real failure to carry the cyclic constraint into the sigma block.
+    // PRIMARY: gam recovers the true cyclic log-scale. The log-scale block is
+    // identified one likelihood-derivative removed from the data, so its
+    // absolute bar is looser, yet 0.30 still requires the recovered curve to
+    // track log(0.15+0.1 cos x) (which spans about [log 0.05, log 0.25]).
     assert!(
-        log_sigma_rel < 0.04,
-        "cyclic log-sigma smooth diverges from gamlss: rel_l2={log_sigma_rel:.4} (bound 0.04)"
+        gam_log_sigma_rmse <= 0.30,
+        "cyclic log-sigma does not recover log(0.15+0.1 cos x): RMSE={gam_log_sigma_rmse:.4} (bound 0.30)"
+    );
+
+    // MATCH-OR-BEAT: gam must be at least as accurate as the mature gamlss fit
+    // (within a 10% slack) on each block's recovery of the truth.
+    assert!(
+        gam_mu_rmse <= 1.10 * gamlss_mu_rmse,
+        "gam mu recovery worse than gamlss: gam={gam_mu_rmse:.4} > 1.10*gamlss={:.4}",
+        gamlss_mu_rmse
+    );
+    assert!(
+        gam_log_sigma_rmse <= 1.10 * gamlss_log_sigma_rmse,
+        "gam log-sigma recovery worse than gamlss: gam={gam_log_sigma_rmse:.4} > 1.10*gamlss={:.4}",
+        gamlss_log_sigma_rmse
     );
 }

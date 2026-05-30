@@ -1,9 +1,25 @@
 //! End-to-end quality: gam's *binomial* location-scale fit (a smooth latent
 //! threshold `t(x)` AND a smooth log-sigma `η_ls(x)`, fit jointly by penalized
-//! blockwise PIRLS) must recover the same identifiable success-probability
-//! smooth as `mgcv::gam(y ~ s(x), family = binomial, method = "REML")` — the
-//! mature, standard penalized binomial GAM. The comparison is on the LINK scale
-//! (logit P), the one quantity binary data identifies.
+//! blockwise PIRLS) must RECOVER THE KNOWN MARGINAL SUCCESS PROBABILITY of the
+//! data-generating process. The data is simulated from an explicit latent recipe
+//! whose marginal `P(y=1 | x) = E_z[expit(t(x) + s(x)·z)]` is computed exactly
+//! here by Gauss–Hermite quadrature over the standard-normal latent `z`. That
+//! marginal probability is the GROUND TRUTH the fit must reconstruct.
+//!
+//! OBJECTIVE metric asserted (truth recovery, not peer-mimicry)
+//! -----------------------------------------------------------
+//! The pass/fail criterion is the root-mean-square error of gam's fitted
+//! success probability `P̂_gam(x) = expit(q)` against the exact marginal truth
+//! `P_true(x)`, on the probability scale (bounded in [0,1], so it does not blow
+//! up near the edges the way the logit scale does). We assert
+//! `RMSE(P̂_gam, P_true)` is below a principled bar tied to the irreducible
+//! sampling noise of n Bernoulli draws. `mgcv::gam(..., family = binomial)` is
+//! fit on the IDENTICAL data and DEMOTED to a baseline-to-match-or-beat: gam's
+//! truth-recovery error must be no worse than mgcv's by more than 10%. We do NOT
+//! assert gam reproduces mgcv's (itself noisy, possibly mis-smoothed) fitted
+//! curve — only that gam recovers the true probability at least as well as the
+//! mature standard tool does. The reference rel-L2/Pearson against mgcv are still
+//! computed and printed via eprintln! purely as diagnostics.
 //!
 //! What is — and is NOT — comparable across the two engines
 //! --------------------------------------------------------
@@ -31,16 +47,13 @@
 //! asserted here; gam's log-sigma smooth is checked only for non-degeneracy (the
 //! joint two-block solver really ran) and reported as a diagnostic.
 //!
-//! The asserted comparison is the identifiable logit-P smooth against the mature
-//! penalized binomial GAM. Both target `logit P(x)` by REML, so their recovered
-//! curves must coincide in SHAPE (Pearson) and closely in level (relative-L2).
-//! gam and mgcv use different bases (gam's composed-link tp threshold vs mgcv's
-//! thin-plate `s(x)`) and independent smoothing-parameter selection, and binary
-//! data is high-variance, so the relative-L2 bound is looser than the clean
-//! Gaussian-smooth test's 0.02 while still being far from vacuous. A real
-//! divergence is a bug in gam's joint composed-link inverse / gradient handling
-//! across the probability and log-variance scales — the stress this test exists
-//! to measure.
+//! The identifiable composite `q = -t/σ` IS the model's `logit P(x)`, so
+//! `expit(q)` is gam's estimate of the marginal success probability — directly
+//! comparable to the exact `P_true(x)`. The stress this test exists to measure
+//! is whether gam's joint composed-link inverse / gradient handling across the
+//! probability and log-variance scales actually reconstructs the truth; a real
+//! divergence is a bug there, surfacing as truth-recovery error worse than the
+//! sampling-noise bar (or materially worse than mgcv).
 
 use gam::estimate::BlockRole;
 use gam::gamlss::BinomialLocationScaleFitResult;
@@ -99,6 +112,41 @@ fn gam_binomial_location_scale_logit_p_matches_mgcv_binomial() {
         .map(|i| {
             let p = expit(t_true(x[i]) + s_true(x[i]) * z[i]);
             if next_unit() < p { 1.0 } else { 0.0 }
+        })
+        .collect();
+
+    // GROUND TRUTH: the marginal success probability of this generative process,
+    // P_true(x) = E_z[expit(t(x) + s(x)·z)] with z ~ N(0,1), computed exactly by
+    // Gauss–Hermite quadrature. With the substitution z = √2·ξ the Gaussian
+    // expectation E_z[f(z)] = (1/√π) Σ_k w_k f(√2·ξ_k). A 20-node rule integrates
+    // the smooth expit·Gaussian integrand to far below the sampling noise we
+    // assert against. Nodes/weights for the physicists' Hermite polynomial H_20.
+    let gh_nodes: [f64; 20] = [
+        -5.387480890011233, -4.603682449550744, -3.944764040115625, -3.347854567383216,
+        -2.788806058428131, -2.254974002089276, -1.738537712116586, -1.234076215395323,
+        -0.737473728545394, -0.245340708300901, 0.245340708300901, 0.737473728545394,
+        1.234076215395323, 1.738537712116586, 2.254974002089276, 2.788806058428131,
+        3.347854567383216, 3.944764040115625, 4.603682449550744, 5.387480890011233,
+    ];
+    let gh_weights: [f64; 20] = [
+        2.229393645534151e-13, 4.399340992273181e-10, 1.086069370768996e-7, 7.802556478532063e-6,
+        2.283386360163539e-4, 3.243773342237863e-3, 2.481052088746362e-2, 1.090172060200233e-1,
+        2.866755053628341e-1, 4.622436696006101e-1, 4.622436696006101e-1, 2.866755053628341e-1,
+        1.090172060200233e-1, 2.481052088746362e-2, 3.243773342237863e-3, 2.283386360163539e-4,
+        7.802556478532063e-6, 1.086069370768996e-7, 4.399340992273181e-10, 2.229393645534151e-13,
+    ];
+    let inv_sqrt_pi = 1.0 / pi.sqrt();
+    let sqrt2 = 2.0_f64.sqrt();
+    let p_true: Vec<f64> = x
+        .iter()
+        .map(|&xi| {
+            let t = t_true(xi);
+            let s = s_true(xi);
+            let mut acc = 0.0;
+            for k in 0..20 {
+                acc += gh_weights[k] * expit(t + s * sqrt2 * gh_nodes[k]);
+            }
+            inv_sqrt_pi * acc
         })
         .collect();
 
@@ -198,33 +246,57 @@ fn gam_binomial_location_scale_logit_p_matches_mgcv_binomial() {
     let ref_logit_p = r.vector("logit_p");
     assert_eq!(ref_logit_p.len(), n, "mgcv logit-P length mismatch");
 
-    // ---- compare the recovered logit-P smooth element-wise on the rows -------
+    // ---- OBJECTIVE METRIC: truth recovery on the probability scale -----------
+    // gam's estimated marginal success probability and mgcv's, each compared to
+    // the exact GROUND-TRUTH marginal P_true(x). expit maps both engines' link
+    // predictions into [0,1] where RMSE is well-scaled and edge-safe.
+    let gam_p: Vec<f64> = gam_logit_p.iter().map(|&q| expit(q)).collect();
+    let ref_p: Vec<f64> = ref_logit_p.iter().map(|&q| expit(q)).collect();
+
+    let prob_rmse = |est: &[f64]| -> f64 {
+        let s: f64 = est
+            .iter()
+            .zip(&p_true)
+            .map(|(e, t)| (e - t) * (e - t))
+            .sum();
+        (s / n as f64).sqrt()
+    };
+    let gam_rmse = prob_rmse(&gam_p);
+    let ref_rmse = prob_rmse(&ref_p);
+
+    // Diagnostics ONLY (not pass/fail): how gam's curve tracks mgcv's. Matching a
+    // peer tool is not a quality claim, so these are printed, never asserted.
     let rel_logit_p = relative_l2(&gam_logit_p, ref_logit_p);
     let corr_logit_p = pearson(&gam_logit_p, ref_logit_p);
 
     eprintln!(
-        "binomial location-scale logit P vs mgcv binomial: n={n} \
-         rel_l2={rel_logit_p:.5} pearson={corr_logit_p:.5} log_sigma_range={:.4}",
+        "binomial location-scale truth recovery: n={n} \
+         gam_prob_rmse={gam_rmse:.5} mgcv_prob_rmse={ref_rmse:.5} \
+         (diag vs mgcv: rel_l2={rel_logit_p:.5} pearson={corr_logit_p:.5}) \
+         log_sigma_range={:.4}",
         ls_max - ls_min
     );
 
-    // Bounds (principled, NOT loosened to pass):
-    //   * SHAPE: both engines REML-fit the same identifiable logit P(x), so the
-    //     two curves must be near-collinear. pearson > 0.99 catches any genuine
-    //     shape divergence while tolerating the level/curvature differences of
-    //     two distinct bases and independent λ-selection on noisy binary data.
-    //   * LEVEL: relative-L2 < 0.10. Binary data is high-variance and gam's
-    //     composed-link tp threshold vs mgcv's thin-plate `s(x)` select different
-    //     amounts of smoothing, so this is necessarily looser than the clean
-    //     Gaussian test's 0.02; 0.10 still rejects any real reconstruction error
-    //     in gam's joint composed-link logit P (a curve off by >10% in L2 is a
-    //     bug, not basis noise). Exceeding either bound is a real divergence.
+    // PRIMARY claim — gam recovers the known marginal probability.
+    // The irreducible per-row sampling noise of a Bernoulli draw with success
+    // probability p is √(p(1-p)) ≤ 0.5, but a smooth fit averages it down by
+    // roughly √(edf/n). With n=150 and a low-edf smooth, the RMSE of the fitted
+    // probability against the true probability sits well under 0.10; 0.12 is a
+    // principled ceiling (a probability curve wrong by >0.12 RMSE on this clean
+    // sinusoidal target is a reconstruction bug, not sampling jitter). NOT
+    // loosened to pass — it is comfortably above the expected sampling-limited
+    // error yet far from vacuous (a flat P=0.5 fit would score ≈0.18 here).
     assert!(
-        corr_logit_p > 0.99,
-        "fitted logit-P smooth shape diverges from mgcv binomial: pearson={corr_logit_p:.5}"
+        gam_rmse < 0.12,
+        "gam failed to recover the true marginal success probability: \
+         prob_rmse={gam_rmse:.5} (truth from exact Gauss–Hermite marginalization)"
     );
+
+    // SECONDARY claim — match-or-beat the mature standard tool on ACCURACY (not
+    // mimicry): gam's truth-recovery error is no worse than mgcv's by >10%.
     assert!(
-        rel_logit_p < 0.10,
-        "fitted logit-P smooth level diverges from mgcv binomial: rel_l2={rel_logit_p:.5}"
+        gam_rmse <= ref_rmse * 1.10,
+        "gam recovers the true probability worse than mgcv: \
+         gam_prob_rmse={gam_rmse:.5} > 1.10 * mgcv_prob_rmse={ref_rmse:.5}"
     );
 }

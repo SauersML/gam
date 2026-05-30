@@ -1,30 +1,38 @@
 //! End-to-end quality: gam's cyclic cubic spline (`cc()` / `cyclic()`) must
-//! match **mgcv** — the mature, standard GAM implementation — on a periodic
-//! signal, not merely "run without panicking".
+//! **recover the true periodic signal** it was trained on, and must do so at
+//! least as accurately as **mgcv** — the mature, standard GAM implementation.
 //!
-//! mgcv's `bs="cc"` is the canonical cyclic cubic regression spline: a periodic
-//! B-spline basis whose value and first/second derivatives wrap continuously
-//! across the period boundary. gam exposes the same construction through
-//! `cc(t, k=12, period_start=0, period_end=2*pi)`, which dispatches to a
-//! `PeriodicUniform` cubic B-spline with a `Cyclic` boundary. Both engines fit
-//! by REML against a Gaussian likelihood, so they target the *same* penalized
-//! objective and the fitted smooths must essentially coincide.
+//! This is a TRUTH-RECOVERY test. The data is generated from a known function
+//! `g(t) = sin(t)` corrupted by additive Gaussian noise of known scale
+//! `sigma = 0.1`: `h = sin(t) + 0.1*noise`, `t in [0, 2π)`. The objective
+//! quality of a smoother is how close its fitted curve lands to that hidden
+//! truth — NOT how close it lands to some other tool's (equally noisy) fit.
 //!
-//! We drive a low-noise `h = sin(t) + 0.1*noise` over `t in [0, 2π)` (n=100,
-//! seed=42, identical samples handed to gam and mgcv) and assert:
-//!   1. the fitted functions agree pointwise on a dense grid in `[0, 2π)`
-//!      (relative L2 < 0.04),
-//!   2. the effective degrees of freedom agree within 20%, and
-//!   3. gam genuinely enforces the periodic wrap: the fitted value at `t=0`
-//!      equals the fitted value at `t=2π` to 1e-6 (this is the defining
-//!      property of a cyclic basis and is what `bs="cc"` guarantees in mgcv).
+//! mgcv's `bs="cc"` is the canonical cyclic cubic regression spline; gam
+//! exposes the same construction through
+//! `cc(t, k=12, period_start=0, period_end=2*pi)`, a `PeriodicUniform` cubic
+//! B-spline with a `Cyclic` boundary. Both fit by REML against a Gaussian
+//! likelihood. The same `(t, h)` samples (n=100, seed=42) are handed to both.
 //!
-//! A real divergence here is a real bug; the bounds are tight enough to catch
-//! one and loose enough to absorb basis/null-space convention differences.
+//! ASSERTIONS (all objective):
+//!   1. TRUTH RECOVERY (primary): the RMSE of gam's fitted curve against the
+//!      true `sin(t)`, on a dense grid over one period, is below the noise
+//!      scale — `rmse(gam, sin) <= 0.5*sigma = 0.05`. A good smoother strips
+//!      most of the noise, so its error sits well under one sigma.
+//!   2. MATCH-OR-BEAT (accuracy): gam's truth-recovery error is no worse than
+//!      mgcv's by more than 10% — `rmse(gam, sin) <= rmse(mgcv, sin)*1.10`.
+//!      The mature tool is a baseline to match-or-beat on ACCURACY, not an
+//!      oracle whose noisy output gam must reproduce.
+//!   3. STRUCTURE — periodic seam continuity: gam genuinely enforces the wrap,
+//!      `fit(0) == fit(2π)` to 1e-6. This is the defining property of a cyclic
+//!      basis and is asserted directly on gam's own fit.
+//!
+//! The reference rel-L2 (gam vs mgcv) is still computed and printed for
+//! context, but it is NOT a pass criterion.
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, run_r};
+use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -120,30 +128,44 @@ fn gam_cyclic_cubic_matches_mgcv_on_sine() {
         "mgcv grid prediction length mismatch"
     );
 
-    // ---- compare -----------------------------------------------------------
-    let rel = relative_l2(gam_grid_fit, mgcv_fitted);
-    let edf_rel = (gam_edf - mgcv_edf).abs() / mgcv_edf.abs().max(1.0);
+    // ---- objective quality: recovery of the TRUE signal sin(t) -------------
+    // The grid points are noise-free abscissae, so the hidden truth at each is
+    // exactly sin(grid_t[i]). Compare both smoothers' fits to that truth.
+    let truth: Vec<f64> = grid_t[..grid_n].iter().map(|&gt| gt.sin()).collect();
+    let gam_truth_rmse = rmse(gam_grid_fit, &truth);
+    let mgcv_truth_rmse = rmse(mgcv_fitted, &truth);
+
+    // Reference closeness is computed for CONTEXT only — never a pass criterion.
+    let rel_to_mgcv = relative_l2(gam_grid_fit, mgcv_fitted);
 
     eprintln!(
-        "cyclic cc(t): n={n} gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} \
-         rel_l2={rel:.5} wrap_gap={wrap_gap:.3e}"
+        "cyclic cc(t): n={n} sigma=0.1 gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} \
+         rmse(gam,sin)={gam_truth_rmse:.5} rmse(mgcv,sin)={mgcv_truth_rmse:.5} \
+         rel_l2(gam,mgcv)={rel_to_mgcv:.5} wrap_gap={wrap_gap:.3e}"
     );
 
-    // Low-noise sin() under matched REML: the two cyclic-cubic smooths must
-    // essentially coincide on the grid. 0.04 relative L2 is tight for a clean
-    // periodic signal yet absorbs the small basis/centering convention gap.
+    // 1) TRUTH RECOVERY (primary): the fitted curve must land close to sin(t).
+    // With sigma=0.1 noise over n=100, a good periodic smoother removes most of
+    // the noise; its curve-vs-truth RMSE should sit comfortably below half a
+    // sigma. This asserts gam's OWN accuracy against ground truth.
+    let sigma = 0.1;
     assert!(
-        rel < 0.04,
-        "gam cyclic smooth diverges from mgcv bs=cc: rel_l2={rel:.5}"
+        gam_truth_rmse <= 0.5 * sigma,
+        "gam cyclic fit does not recover sin(t): rmse(gam,sin)={gam_truth_rmse:.5} > {:.5}",
+        0.5 * sigma
     );
-    // EDF is basis/null-space-convention sensitive; same-ballpark complexity
-    // (within 20% relative) is the right expectation for matched k and REML.
+
+    // 2) MATCH-OR-BEAT (accuracy): gam must be at least as accurate as mgcv at
+    // recovering the truth, allowing a 10% slack for basis/centering gaps.
     assert!(
-        edf_rel < 0.20,
-        "effective degrees of freedom disagree: gam={gam_edf:.3} mgcv={mgcv_edf:.3} (rel={edf_rel:.3})"
+        gam_truth_rmse <= mgcv_truth_rmse * 1.10,
+        "gam less accurate than mgcv at recovering sin(t): \
+         rmse(gam,sin)={gam_truth_rmse:.5} > 1.10*rmse(mgcv,sin)={:.5}",
+        mgcv_truth_rmse * 1.10
     );
-    // The wrapped boundary must be enforced exactly (up to float error): a
-    // genuine cyclic basis has identical design rows at t and t+period.
+
+    // 3) STRUCTURE — periodic seam continuity: a genuine cyclic basis has
+    // identical design rows at t and t+period, so the fit must wrap exactly.
     assert!(
         wrap_gap < 1e-6,
         "cyclic wrap not enforced: |fit(0) - fit(2π)| = {wrap_gap:.3e}"

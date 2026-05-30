@@ -1,32 +1,40 @@
-//! End-to-end quality: a *user-defined* Beta(α, β) regression family — with
-//! softplus-linked shape parameters α = softplus(η₁), β = softplus(η₂) — fitted
-//! through gam's generic `fit_custom_family` engine, with its row-wise
-//! negative-log-likelihood and forward-mode derivatives checked against two
-//! independent oracles.
+//! End-to-end OBJECTIVE quality: a *user-defined* Beta(α, β) regression family —
+//! with softplus-linked shape parameters α = softplus(η₁), β = softplus(η₂) —
+//! fitted through gam's generic `fit_custom_family` engine, judged by whether it
+//! RECOVERS THE DATA-GENERATING TRUTH and GENERALISES, not by whether it
+//! reproduces any peer tool's fitted numbers.
 //!
 //! Why this matters. gam exposes Gaussian, Poisson, Binomial, location-scale,
 //! survival, etc. through the formula DSL, but the **Beta** distribution is
 //! deliberately *not* a built-in family. A practitioner who needs it must
 //! implement the `CustomFamily` contract — supplying the per-block log-density
-//! gradient ∇_β log L and observed information −∇²_β log L by hand. This test
-//! is the honest verification that the custom-family path lets a user do that
-//! *correctly*: the arithmetic that gam's engine consumes (the row density and
-//! its derivatives) must match a mature reference and the calculus must be
-//! self-consistent.
+//! gradient ∇_β log L and observed information −∇²_β log L by hand. The honest
+//! question is not "does gam's arithmetic equal R's `lbeta`" (it must — that is
+//! the *same closed form*, so matching it proves nothing about fit quality), but
+//! "does the custom-family fit land on the truth and predict unseen data well".
 //!
-//! Two oracles, identical data:
-//!   1. **Hand-coded base-R** (`lbeta`) computes the row-wise NLL from the
-//!      *same* fitted linear predictors gam used. Base R's `lbeta` is the
-//!      mature reference for the Beta normalizing constant log B(α,β). They
-//!      must agree to 1e-10 (the same closed form, only float arithmetic
-//!      differs).
-//!   2. **Central finite differences** of the row NLL w.r.t. (η₁, η₂) are an
-//!      intrinsic ground truth for the analytic Jacobian gam's `evaluate`
-//!      produces — there is no external tool for "the derivative gam's family
-//!      handed the optimizer", so we differentiate the family's own NLL.
+//! OBJECTIVE METRICS ASSERTED (all on gam's OWN fit, identical data to baseline):
 //!
-//! A divergence in either is a real bug: (1) catches a wrong density/normalizer,
-//! (2) catches a wrong gradient (the quantity the inner Newton solve trusts).
+//!   1. TRUTH RECOVERY (primary). The response is simulated from a *known*
+//!      mean surface μ_i = α_i/(α_i+β_i) with α_i = softplus(0.2+0.4·x1_i),
+//!      β_i = softplus(0.3+0.5·x2_i). We assert gam's fitted Beta mean μ̂_i
+//!      tracks that ground-truth mean with RMSE ≤ a small fraction of the
+//!      response's own spread (much tighter than the irreducible Beta sampling
+//!      noise). This is recovery of the true function, not agreement with a tool.
+//!
+//!   2. HELD-OUT PREDICTIVE NLL, match-or-beat (secondary). A fixed train/test
+//!      split: gam is fit on the train rows only, then scored by mean Beta
+//!      negative-log-likelihood on the *unseen* test rows. We assert an absolute
+//!      held-out bar AND gam ≤ 1.05× the held-out NLL of an independent maximum-
+//!      likelihood fit of the *identical* model (R `optim`). The reference is a
+//!      BASELINE TO MATCH-OR-BEAT on generalisation, never a target to copy.
+//!
+//!   3. FAMILY-ARITHMETIC SELF-CONSISTENCY (intrinsic ground truth). Central
+//!      finite differences of the row NLL are the ground truth for the analytic
+//!      Jacobian gam's `evaluate` hands the inner Newton solve; a wrong
+//!      digamma/softplus chain term is an O(1) error. This is correctness vs an
+//!      exact mathematical quantity (the derivative of the family's own NLL), not
+//!      "same as a peer tool", so it is kept as an assertion.
 
 use gam::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, FamilyEvaluation, ParameterBlockSpec,
@@ -78,12 +86,19 @@ fn trigamma(mut x: f64) -> f64 {
 
 /// Row negative log-likelihood of Beta(α, β) at observation y, with
 /// α = softplus(η₁), β = softplus(η₂). This is the *exact* arithmetic the
-/// family below sums into its log-likelihood; the oracle and the FD harness
-/// differentiate / re-derive this same closed form.
+/// family below sums into its log-likelihood; the FD harness differentiates
+/// this same closed form, and the held-out scoring re-uses it.
 fn beta_row_nll(eta1: f64, eta2: f64, y: f64) -> f64 {
     let a = softplus(eta1);
     let b = softplus(eta2);
     -((a - 1.0) * y.ln() + (b - 1.0) * (1.0 - y).ln() - ln_beta(a, b))
+}
+
+/// Beta mean μ = α / (α + β) at linear predictors (η₁, η₂).
+fn beta_mean(eta1: f64, eta2: f64) -> f64 {
+    let a = softplus(eta1);
+    let b = softplus(eta2);
+    a / (a + b)
 }
 
 /// Analytic forward-mode Jacobian of the row NLL: [∂NLL/∂η₁, ∂NLL/∂η₂].
@@ -262,21 +277,17 @@ fn design_from_covariate(covariate: &[f64]) -> Array2<f64> {
     d
 }
 
-fn build_design0() -> Array2<f64> {
-    let (x1, x2) = synthetic_covariates();
-    assert_eq!(x1.len(), x2.len());
-    design_from_covariate(&x1)
-}
-
-fn build_design1() -> Array2<f64> {
-    let (x1, x2) = synthetic_covariates();
-    assert_eq!(x1.len(), x2.len());
-    design_from_covariate(&x2)
-}
-
 // ── deterministic synthetic data: n=140, X1,X2~N(0,1), Y~Beta(α,β) ───────────
 
 const N: usize = 140;
+
+/// Data-generating coefficients (ground truth). α = softplus(A0 + A1·x1),
+/// β = softplus(B0 + B1·x2); the mean surface μ = α/(α+β) is what gam must
+/// recover and predict.
+const TRUE_A0: f64 = 0.2;
+const TRUE_A1: f64 = 0.4;
+const TRUE_B0: f64 = 0.3;
+const TRUE_B1: f64 = 0.5;
 
 /// Tiny deterministic LCG → U(0,1); Box–Muller for normals; inverse-CDF-free
 /// Beta sampling via two Gamma(shape,1) draws (Marsaglia–Tsang). Fully
@@ -341,14 +352,24 @@ fn synthetic_covariates() -> (Vec<f64>, Vec<f64>) {
     (x1, x2)
 }
 
-fn synthetic_response() -> Vec<f64> {
-    let (x1, x2) = synthetic_covariates();
+/// True per-row Beta mean μ_i from the data-generating coefficients.
+fn true_means(x1: &[f64], x2: &[f64]) -> Vec<f64> {
+    (0..N)
+        .map(|i| {
+            let h1 = TRUE_A0 + TRUE_A1 * x1[i];
+            let h2 = TRUE_B0 + TRUE_B1 * x2[i];
+            beta_mean(h1, h2)
+        })
+        .collect()
+}
+
+fn synthetic_response(x1: &[f64], x2: &[f64]) -> Vec<f64> {
     // Re-seed independently so response draws don't reuse the covariate stream.
     let mut rng = Lcg::new(0xabcd_0009_5eed_4321);
     let mut y = Vec::with_capacity(N);
     for i in 0..N {
-        let a = softplus(0.2 + 0.4 * x1[i]);
-        let b = softplus(0.3 + 0.5 * x2[i]);
+        let a = softplus(TRUE_A0 + TRUE_A1 * x1[i]);
+        let b = softplus(TRUE_B0 + TRUE_B1 * x2[i]);
         let mut draw = rng.next_beta(a, b);
         // Beta support is the open (0,1); clamp away from the log-singularities.
         draw = draw.clamp(1e-9, 1.0 - 1e-9);
@@ -357,32 +378,60 @@ fn synthetic_response() -> Vec<f64> {
     y
 }
 
-#[test]
-fn beta_logit_custom_family_nll_and_jacobian_match_r_and_finite_differences() {
-    init_parallelism();
-    let y = synthetic_response();
-    assert_eq!(y.len(), N);
+/// Deterministic train/test split: every 4th row (indices 0,4,8,…) is held out
+/// for the predictive assertion; the rest train. Fixed by construction, so gam
+/// and the R baseline score the identical unseen rows.
+fn is_test_row(i: usize) -> bool {
+    i % 4 == 0
+}
 
-    // ── build the two parameter blocks: design = [1, covariate], no offset ──
-    let design0 = build_design0();
-    let design1 = build_design1();
+#[test]
+fn beta_logit_custom_family_recovers_truth_and_generalises() {
+    init_parallelism();
+    let (x1, x2) = synthetic_covariates();
+    assert_eq!(x1.len(), N);
+    assert_eq!(x2.len(), N);
+    let y = synthetic_response(&x1, &x2);
+    assert_eq!(y.len(), N);
+    let mu_truth = true_means(&x1, &x2);
+
+    // ── deterministic train/test partition (identical for gam and R) ────────
+    let train_idx: Vec<usize> = (0..N).filter(|&i| !is_test_row(i)).collect();
+    let test_idx: Vec<usize> = (0..N).filter(|&i| is_test_row(i)).collect();
+    assert!(test_idx.len() >= 20, "need a non-trivial held-out set");
+    assert!(train_idx.len() + test_idx.len() == N);
+
+    let take = |src: &[f64], idx: &[usize]| -> Vec<f64> { idx.iter().map(|&i| src[i]).collect() };
+    let (x1_tr, x2_tr, y_tr) = (
+        take(&x1, &train_idx),
+        take(&x2, &train_idx),
+        take(&y, &train_idx),
+    );
+    let (x1_te, x2_te, y_te) = (
+        take(&x1, &test_idx),
+        take(&x2, &test_idx),
+        take(&y, &test_idx),
+    );
+    let n_tr = train_idx.len();
+
+    // ── fit gam on the TRAIN rows only, through the custom-family engine ────
+    let design0_tr = design_from_covariate(&x1_tr);
+    let design1_tr = design_from_covariate(&x2_tr);
 
     let family = BetaLogitCustomFamily {
-        response: Array1::from(y.clone()),
-        alpha_offset: Array1::<f64>::zeros(N),
-        beta_offset: Array1::<f64>::zeros(N),
-        design0: design0.clone(),
-        design1: design1.clone(),
+        response: Array1::from(y_tr.clone()),
+        alpha_offset: Array1::<f64>::zeros(n_tr),
+        beta_offset: Array1::<f64>::zeros(n_tr),
+        design0: design0_tr.clone(),
+        design1: design1_tr.clone(),
     };
 
     // A tiny ridge keeps the inner Newton geometry well-conditioned without
-    // materially shrinking the 2-coefficient blocks; the assertions below hold
-    // at whatever β̂ the fit returns (they verify the family's arithmetic, not
-    // recovery of the data-generating truth).
+    // materially shrinking the 2-coefficient blocks.
     let make_spec = |name: &str, design: Array2<f64>| ParameterBlockSpec {
         name: name.to_string(),
         design: DesignMatrix::Dense(DenseDesignMatrix::from(design)),
-        offset: Array1::<f64>::zeros(N),
+        offset: Array1::<f64>::zeros(n_tr),
         penalties: vec![PenaltyMatrix::Dense(Array2::eye(2))],
         nullspace_dims: vec![0],
         initial_log_lambdas: Array1::from(vec![-4.0]),
@@ -390,8 +439,8 @@ fn beta_logit_custom_family_nll_and_jacobian_match_r_and_finite_differences() {
         ..ParameterBlockSpec::defaults()
     };
     let specs = vec![
-        make_spec("alpha", design0.clone()),
-        make_spec("beta", design1.clone()),
+        make_spec("alpha", design0_tr.clone()),
+        make_spec("beta", design1_tr.clone()),
     ];
 
     let options = BlockwiseFitOptions {
@@ -407,60 +456,88 @@ fn beta_logit_custom_family_nll_and_jacobian_match_r_and_finite_differences() {
     assert_eq!(b_alpha.len(), 2);
     assert_eq!(b_beta.len(), 2);
 
-    // ── fitted linear predictors (identical inputs handed to every oracle) ──
-    let eta1: Vec<f64> = design0.dot(&b_alpha).iter().copied().collect();
-    let eta2: Vec<f64> = design1.dot(&b_beta).iter().copied().collect();
+    // gam's fitted mean surface evaluated on ALL rows (train ∪ test), using the
+    // coefficients it learned from the train rows only.
+    let gam_eta1 = |i: usize| b_alpha[0] + b_alpha[1] * x1[i];
+    let gam_eta2 = |i: usize| b_beta[0] + b_beta[1] * x2[i];
+    let mu_hat: Vec<f64> = (0..N).map(|i| beta_mean(gam_eta1(i), gam_eta2(i))).collect();
 
-    // gam-side row NLL + analytic Jacobian using the family's own arithmetic.
-    let gam_nll: Vec<f64> = (0..N)
-        .map(|i| beta_row_nll(eta1[i], eta2[i], y[i]))
+    // ── METRIC 1 (PRIMARY): TRUTH RECOVERY of the mean surface ──────────────
+    // RMSE between gam's fitted mean and the ground-truth generating mean.
+    let truth_rmse = {
+        let s: f64 = (0..N).map(|i| (mu_hat[i] - mu_truth[i]).powi(2)).sum();
+        (s / N as f64).sqrt()
+    };
+    // Spread of the response itself (irreducible Beta sampling scatter); the
+    // recovered mean must be MUCH tighter to the truth than the data are.
+    let y_sd = {
+        let m = y.iter().sum::<f64>() / N as f64;
+        (y.iter().map(|v| (v - m).powi(2)).sum::<f64>() / N as f64).sqrt()
+    };
+
+    // ── METRIC 2 (SECONDARY): held-out predictive NLL, match-or-beat R MLE ──
+    let gam_test_nll: Vec<f64> = test_idx
+        .iter()
+        .enumerate()
+        .map(|(k, &i)| beta_row_nll(gam_eta1(i), gam_eta2(i), y_te[k]))
         .collect();
+    let gam_heldout_nll = gam_test_nll.iter().sum::<f64>() / gam_test_nll.len() as f64;
 
-    // ── oracle 1: hand-coded base R (lbeta, digamma) on the SAME η ──────────
-    let r = run_r(
+    // Baseline-to-match-or-beat: an INDEPENDENT maximum-likelihood fit of the
+    // *identical* Beta(softplus,softplus) model on the SAME train rows (R
+    // `optim`), scored on the SAME held-out rows. R fits and predicts; gam must
+    // generalise at least as well — we do not assert gam reproduces R's βs.
+    let r_train = run_r(
         &[
-            Column::new("y", &y),
-            Column::new("eta1", &eta1),
-            Column::new("eta2", &eta2),
+            Column::new("y", &y_tr),
+            Column::new("x1", &x1_tr),
+            Column::new("x2", &x2_tr),
         ],
         r#"
         softplus <- function(e) ifelse(e > 0, e + log1p(exp(-e)), log1p(exp(e)))
-        a <- softplus(df$eta1)
-        b <- softplus(df$eta2)
-        # Beta NLL with the normalizer from base R's lbeta = log(beta(a,b)).
-        nll <- -((a - 1) * log(df$y) + (b - 1) * log(1 - df$y) - lbeta(a, b))
-        emit("nll", nll)
+        negll <- function(p) {
+          a <- softplus(p[1] + p[2] * df$x1)
+          b <- softplus(p[3] + p[4] * df$x2)
+          -sum((a - 1) * log(df$y) + (b - 1) * log(1 - df$y) - lbeta(a, b))
+        }
+        opt <- optim(c(0, 0, 0, 0), negll, method = "BFGS",
+                     control = list(maxit = 500, reltol = 1e-12))
+        emit("coef", opt$par)
         "#,
     );
-    let r_nll = r.vector("nll");
-    assert_eq!(
-        r_nll.len(),
-        N,
-        "R returned {} NLLs, expected {N}",
-        r_nll.len()
-    );
-
-    let nll_max_abs = gam_nll
+    let r_coef = r_train.vector("coef");
+    assert_eq!(r_coef.len(), 4, "R MLE returned {} coefs", r_coef.len());
+    let r_eta1 = |i: usize| r_coef[0] + r_coef[1] * x1[i];
+    let r_eta2 = |i: usize| r_coef[2] + r_coef[3] * x2[i];
+    let r_heldout_nll = test_idx
         .iter()
-        .zip(r_nll)
-        .map(|(g, rr)| (g - rr).abs())
-        .fold(0.0_f64, f64::max);
+        .enumerate()
+        .map(|(k, &i)| beta_row_nll(r_eta1(i), r_eta2(i), y_te[k]))
+        .sum::<f64>()
+        / test_idx.len() as f64;
+    // gam's own recovery of the truth on the SAME held-out rows, for context.
+    let r_truth_rmse = {
+        let s: f64 = (0..N)
+            .map(|i| (beta_mean(r_eta1(i), r_eta2(i)) - mu_truth[i]).powi(2))
+            .sum();
+        (s / N as f64).sqrt()
+    };
 
-    // ── oracle 2: central finite differences of the row NLL vs analytic J ───
-    // Sample 10 rows deterministically and stack both partials (20 values).
-    let h = 1e-6;
+    // ── METRIC 3: family-arithmetic self-consistency (analytic J vs central FD)
+    // Sample 10 train rows deterministically and stack both partials (20 values).
     let mut idx_rng = Lcg::new(0x0f1e_2d3c_4b5a_6987);
     let mut sampled = Vec::<usize>::new();
     while sampled.len() < 10 {
-        let j = (idx_rng.next_u01() * N as f64) as usize % N;
+        let j = (idx_rng.next_u01() * n_tr as f64) as usize % n_tr;
         if !sampled.contains(&j) {
             sampled.push(j);
         }
     }
+    let h = 1e-6;
     let mut analytic = Vec::<f64>::with_capacity(20);
     let mut fdiff = Vec::<f64>::with_capacity(20);
-    for &i in &sampled {
-        let (h1, h2, yy) = (eta1[i], eta2[i], y[i]);
+    for &k in &sampled {
+        let (h1, h2, yy) = (gam_eta1(train_idx[k]), gam_eta2(train_idx[k]), y_tr[k]);
         let j = beta_row_nll_jacobian(h1, h2, yy);
         let fd1 = (beta_row_nll(h1 + h, h2, yy) - beta_row_nll(h1 - h, h2, yy)) / (2.0 * h);
         let fd2 = (beta_row_nll(h1, h2 + h, yy) - beta_row_nll(h1, h2 - h, yy)) / (2.0 * h);
@@ -472,23 +549,55 @@ fn beta_logit_custom_family_nll_and_jacobian_match_r_and_finite_differences() {
     let jac_rel = relative_l2(&analytic, &fdiff);
 
     eprintln!(
-        "beta-logit custom family: n={N} \
-         b_alpha=[{:.4},{:.4}] b_beta=[{:.4},{:.4}] \
-         nll_max_abs(R)={nll_max_abs:.3e} jac_rel_l2(FD)={jac_rel:.3e}",
-        b_alpha[0], b_alpha[1], b_beta[0], b_beta[1]
+        "beta-logit custom family: n_train={n_tr} n_test={} \
+         b_alpha=[{:.4},{:.4}] (truth [{TRUE_A0},{TRUE_A1}]) \
+         b_beta=[{:.4},{:.4}] (truth [{TRUE_B0},{TRUE_B1}]) | \
+         truth_rmse(mean)={truth_rmse:.4} y_sd={y_sd:.4} | \
+         heldout_nll: gam={gam_heldout_nll:.4} R={r_heldout_nll:.4} | \
+         r_truth_rmse={r_truth_rmse:.4} jac_rel_l2(FD)={jac_rel:.3e}",
+        test_idx.len(),
+        b_alpha[0],
+        b_alpha[1],
+        b_beta[0],
+        b_beta[1],
     );
 
-    // The row NLL is the *same closed form* in gam (Rust statrs::ln_beta) and in
-    // R (lbeta): only floating-point arithmetic differs, so 1e-10 is the honest
-    // bound for "same density, same normalizer".
+    // ── ASSERTION 1 (PRIMARY): gam recovers the true mean surface ───────────
+    // With n=140 Beta draws the mean μ∈(0,1) is recoverable to well under a
+    // quarter of the response's own spread; this is an absolute truth-recovery
+    // bar (not agreement with any tool). A wrong link / chain term blows it up.
     assert!(
-        nll_max_abs < 1e-10,
-        "gam vs hand-coded R row NLL disagree: max_abs={nll_max_abs:.3e}"
+        truth_rmse < 0.25 * y_sd,
+        "gam did not recover the true Beta mean surface: \
+         RMSE(mu_hat, mu_truth)={truth_rmse:.4} vs 0.25*y_sd={:.4}",
+        0.25 * y_sd
     );
+    assert!(
+        truth_rmse < 0.06,
+        "gam mean-surface recovery error too large: truth_rmse={truth_rmse:.4}"
+    );
+
+    // ── ASSERTION 2 (SECONDARY): generalises, match-or-beat the MLE baseline ─
+    // Absolute held-out bar: mean Beta NLL on unseen rows is finite & sane for
+    // this signal (the data-generating dispersion sits near here).
+    assert!(
+        gam_heldout_nll.is_finite() && gam_heldout_nll < 0.5,
+        "gam held-out NLL implausible: {gam_heldout_nll:.4}"
+    );
+    // Match-or-beat: gam's out-of-sample NLL is within 5% of the independent
+    // maximum-likelihood fit of the same model. The R MLE is a baseline to
+    // match-or-beat on GENERALISATION, never a fit gam must reproduce.
+    assert!(
+        gam_heldout_nll <= r_heldout_nll + 0.05 * r_heldout_nll.abs() + 1e-9,
+        "gam generalises worse than the same-model MLE baseline: \
+         gam_heldout_nll={gam_heldout_nll:.4} > 1.05*R_heldout_nll={:.4}",
+        r_heldout_nll * 1.05
+    );
+
+    // ── ASSERTION 3: family arithmetic is self-consistent vs ground-truth FD ─
     // Central differences with h=1e-6 on this smooth NLL carry O(h²)≈1e-12
-    // truncation plus ~ε/h≈1e-10 cancellation error; relative L2 stays well
-    // below 2e-4, which still flags any genuine bug in the analytic Jacobian
-    // (a wrong digamma/softplus chain term shifts it by O(1)).
+    // truncation plus ~ε/h≈1e-10 cancellation; relative L2 stays well below
+    // 2e-4. A wrong digamma/softplus chain term shifts it by O(1).
     assert!(
         jac_rel < 0.0002,
         "analytic Jacobian disagrees with finite differences: rel_l2={jac_rel:.3e}"

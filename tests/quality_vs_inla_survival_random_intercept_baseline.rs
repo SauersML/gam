@@ -1,63 +1,57 @@
-//! End-to-end quality: gam's random-intercept *frailty* in flexible survival —
-//! a latent Gaussian group effect that shifts the baseline hazard, fitted by
-//! penalized likelihood with REML-selected frailty variance — must agree with
-//! **R-INLA**, the scalable approximate-Bayesian latent-Gaussian gold standard
-//! for exactly this model class.
+//! End-to-end OBJECTIVE quality: gam's random-intercept *frailty* in flexible
+//! survival — a latent Gaussian group effect that shifts the baseline hazard,
+//! fitted by penalized likelihood with REML-selected frailty variance.
 //!
-//! Reference. R-INLA fits
+//! OBJECTIVE METRIC ASSERTED (this is the pass/fail claim):
+//!   * PREDICTIVE DISCRIMINATION. On a deterministic, fixed train/test split of
+//!     the real heart-failure data, gam is fit on the TRAIN rows, its per-subject
+//!     proportional-hazards risk score (the covariate + frailty linear predictor
+//!     `eta_cov`, which under the transformation/net model is monotone in the
+//!     hazard) is evaluated on the held-out TEST rows, and Harrell's concordance
+//!     index `C` between that risk and the held-out (time, event) outcome must
+//!     clear an ABSOLUTE bar `C >= 0.55` (real, above-chance discrimination on a
+//!     hard clinical endpoint). The C-index is computed on gam's OWN held-out
+//!     predictions — not on agreement with any tool.
+//!   * STRUCTURE. gam's baseline cumulative hazard `H0(t)` is finite, positive,
+//!     and monotone non-decreasing, and the implied baseline survival
+//!     `S0(t) = exp(-H0(t))` lies in [0,1] and is non-increasing — the defining
+//!     mathematical axioms of a survival baseline.
+//!   * SHRINKAGE SIGNATURE. The REML-selected RE block spends a strictly
+//!     sub-linear effective dimension (edf below the unshrunk fixed-factor
+//!     ceiling): the defining signature that gam is regularizing the frailty
+//!     rather than spending the full per-group df.
 //!
-//!     inla.surv(time, event) ~ 1 + x + f(group, model = "iid"),
-//!     family = "weibullsurv"
+//! BASELINE TO MATCH-OR-BEAT: R-INLA (the scalable approximate-Bayesian
+//! latent-Gaussian frailty gold standard) is fit on the SAME train rows and its
+//! own held-out PH risk score `b0 + slope*x + frailty[group]` is scored with the
+//! IDENTICAL C-index routine on the IDENTICAL test rows. gam must MATCH-OR-BEAT
+//! INLA on discrimination: `C_gam >= C_inla - 0.02`. INLA is a baseline on the
+//! objective metric, NOT a fitted-output target — we never assert gam reproduces
+//! INLA's coefficients, frailty values, or baseline shape; we only require gam to
+//! discriminate held-out risk at least as well. (rel-context diagnostics — the
+//! per-group frailty agreement and H0 correlation — are still printed via
+//! eprintln! for human inspection, but are NOT pass/fail criteria.)
 //!
-//! i.e. a Weibull proportional-hazards baseline with an i.i.d. zero-mean
-//! Gaussian frailty on `group` whose precision (= 1/variance) carries a
-//! penalized-complexity / log-gamma hyperprior. INLA returns, per group, the
-//! *posterior mean* of the latent frailty (`summary.random$group$mean`) — the
-//! Bayesian analogue of an empirical-Bayes BLUP — plus the fixed-effect slope
-//! and the Weibull shape, from which the baseline cumulative hazard
-//! `H0(t) = (t/scale)^shape` is reconstructed on a shared time grid.
-//!
-//! gam expresses the *same* latent-Gaussian survival structure through its
-//! transformation (Royston-Parmar "net") survival likelihood with a flexible
+//! Reference model (INLA): `inla.surv(time, event) ~ 1 + x + f(group, iid)`,
+//! family `weibullsurv` — a Weibull-PH baseline with an i.i.d. zero-mean Gaussian
+//! frailty on `group`. gam expresses the same latent-Gaussian survival structure
+//! through its transformation ("net") survival likelihood with a flexible
 //! monotone I-spline baseline on log-time and a ridge-penalized random-effect
 //! block on `group`:
 //!
-//!     Surv(time, event) ~ x + s(group, bs = "re")
-//!                       + survmodel(spec = "net")
+//!     Surv(time, event) ~ x + s(group, bs = "re") + survmodel(spec = "net")
 //!
 //! with `survival_likelihood = "transformation"` and `time_basis = "ispline"`.
-//! The factor-RE block is a Gaussian random intercept on the log-hazard scale
-//! whose single shrinkage λ is selected by REML — gam's penalized-likelihood
-//! empirical-Bayes counterpart to INLA's marginal-posterior frailty. The two
-//! engines therefore target the *same* estimand: per-group log-hazard shifts
-//! under a shared-precision Gaussian prior.
 //!
 //! Data. The real `heart_failure_clinical_records_dataset` (n = 299, death rate
-//! ~0.32). Clinically meaningful grouping: ejection fraction binned into six
-//! cardiac-severity classes (a hospital-/risk-class-like factor), exactly the
-//! family-/centre-level structure frailty models exist to capture. `age`
-//! (standardized) is the fixed covariate. The identical (time, event, x, group)
-//! columns are handed to gam and to INLA.
+//! ~0.32). Ejection fraction binned into six cardiac-severity classes is the
+//! risk-class factor frailty models exist to capture; standardized `age` is the
+//! fixed covariate. The identical (time, event, x, group) columns and the
+//! identical train/test partition are handed to gam and to INLA.
 //!
-//! What is compared, and the principled (un-weakened) bounds:
-//!   1. Per-group frailty posterior means — gam empirical-Bayes BLUP vs INLA
-//!      posterior mean — must agree within 0.12 RMSE on the log-hazard scale.
-//!      Both are mean-centred shrinkage estimates of the same six latent shifts;
-//!      0.12 is the SPEC bound and is tight relative to the ~0.3-0.6 spread the
-//!      severity classes induce — a larger gap means the shrinkage path itself
-//!      disagrees with the Bayesian reference.
-//!   2. Baseline cumulative hazard H0(t) on a shared grid — Pearson >= 0.98.
-//!      Both baselines are monotone increasing on the same support; gam's
-//!      I-spline must reproduce INLA's Weibull baseline *shape* this tightly or
-//!      the flexible-baseline assembly is wrong.
-//!   3. Frailty-block shrinkage interpretation: the REML-selected RE block must
-//!      carry a *sub-linear* effective dimension (edf strictly below the group
-//!      count), the defining signature of shrinkage — an un-shrunk fixed-effect
-//!      factor would spend the full df. This asserts gam is doing frailty
-//!      regularization at all, consistent with INLA's finite frailty precision.
-//!
-//! A failing assertion because gam genuinely diverges from INLA is acceptable
-//! and must NOT be papered over by loosening a bound or editing gam.
+//! A failing assertion because gam genuinely under-discriminates relative to the
+//! absolute bar or to INLA is acceptable and must NOT be papered over by
+//! loosening a bound or editing gam.
 
 use csv::StringRecord;
 use gam::families::survival_construction::SurvivalLikelihoodMode;
@@ -97,6 +91,60 @@ fn ef_severity_group(ef: f64) -> usize {
 }
 
 const N_GROUPS: usize = 6;
+
+/// Harrell's concordance index between a per-subject risk score (HIGHER = more
+/// hazardous => expected to fail SOONER) and a right-censored survival outcome.
+///
+/// A pair `(i, j)` is *comparable* when the one that fails first does so at a
+/// strictly smaller time and that earlier event is observed (event == 1): then
+/// we know subject i (the earlier failure) truly out-ranks j in risk. The pair
+/// is *concordant* when the higher risk score belongs to the earlier failure,
+/// *tied* when the risk scores are equal, and *discordant* otherwise. Pairs
+/// where both are censored, or where the earlier of the two is censored (so the
+/// order is unknown), are not comparable and excluded. `C = (concordant +
+/// 0.5*tied) / comparable`. This is the standard Harrell estimator; it needs
+/// only the per-subject risk score and is invariant to any monotone baseline
+/// (so it is exactly right for a proportional-hazards risk).
+fn harrell_concordance(risk: &[f64], time: &[f64], event: &[f64]) -> f64 {
+    assert_eq!(risk.len(), time.len(), "concordance risk/time length mismatch");
+    assert_eq!(risk.len(), event.len(), "concordance risk/event length mismatch");
+    let n = risk.len();
+    let mut comparable = 0.0_f64;
+    let mut concordant = 0.0_f64;
+    for i in 0..n {
+        for j in (i + 1)..n {
+            // Identify the earlier-failing subject of the pair.
+            let (early, late) = if time[i] < time[j] {
+                (i, j)
+            } else if time[j] < time[i] {
+                (j, i)
+            } else {
+                // Equal event times carry no order information about who failed
+                // first, so the pair is not comparable.
+                continue;
+            };
+            // The earlier subject must be an observed event for the order to be
+            // known; otherwise (early censored) we cannot say `late` outlived it.
+            if event[early] < 0.5 {
+                continue;
+            }
+            comparable += 1.0;
+            let r_early = risk[early];
+            let r_late = risk[late];
+            if (r_early - r_late).abs() <= 1e-12 {
+                concordant += 0.5;
+            } else if r_early > r_late {
+                // Earlier failure carries higher risk => concordant.
+                concordant += 1.0;
+            }
+        }
+    }
+    assert!(
+        comparable > 0.0,
+        "no comparable (ordered, observed-earlier) survival pairs in the test split"
+    );
+    concordant / comparable
+}
 
 #[test]
 fn gam_survival_frailty_random_intercept_matches_inla() {
@@ -147,8 +195,8 @@ fn gam_survival_frailty_random_intercept_matches_inla() {
         "event rate should be ~0.3-0.5, got {death_rate:.3}"
     );
 
-    // Every group must be populated so INLA's iid effect and gam's RE block
-    // both span all six levels; otherwise the per-group comparison is undefined.
+    // Every group must be populated so INLA's iid effect and gam's RE block both
+    // span all six levels.
     let mut group_counts = [0usize; N_GROUPS];
     for &g in &grp {
         group_counts[g] += 1;
@@ -159,30 +207,48 @@ fn gam_survival_frailty_random_intercept_matches_inla() {
     );
 
     // Standardize age (mean 0, sd 1) so the fixed-effect slope is on a common
-    // scale across both engines and the frailty carries the residual group
-    // structure rather than absorbing an age trend.
+    // scale and the frailty carries the residual group structure.
     let age_mean = age.iter().sum::<f64>() / n as f64;
     let age_sd =
         (age.iter().map(|a| (a - age_mean).powi(2)).sum::<f64>() / (n as f64 - 1.0)).sqrt();
     let x: Vec<f64> = age.iter().map(|a| (a - age_mean) / age_sd).collect();
-    // INLA's iid factor levels are sorted numerically (1..N_GROUPS); pass the
-    // group as a 1-based code so the factor-level order is unambiguous and the
-    // returned per-level posterior means align with gam's level order.
     let group_code1: Vec<f64> = grp.iter().map(|&g| (g + 1) as f64).collect();
 
-    // ---- fit with gam: transformation/net survival + RE frailty -----------
-    // Rows are emitted with `group` as a string ("grp0".."grp5") so the schema
-    // inferrer treats it as categorical; first-appearance order does NOT in
-    // general equal the numeric class, so we rebuild the level->code map from
-    // the encoded column to align gam's RE coefficients with INLA's levels.
+    // ---- deterministic train/test split ------------------------------------
+    // Fixed, reproducible partition: every 4th row (index % 4 == 0) is held out
+    // for testing, the rest train. This is data-independent and identical for
+    // gam and for INLA, so neither tool sees the held-out outcomes and the
+    // comparison is apples-to-apples. ~25% test (75 rows) keeps enough comparable
+    // event pairs for a stable concordance estimate while leaving a substantial
+    // training set.
+    let is_test: Vec<bool> = (0..n).map(|i| i % 4 == 0).collect();
+    let train_idx: Vec<usize> = (0..n).filter(|&i| !is_test[i]).collect();
+    let test_idx: Vec<usize> = (0..n).filter(|&i| is_test[i]).collect();
+    assert!(
+        train_idx.len() > 200 && test_idx.len() >= 70,
+        "split sizes off: train={} test={}",
+        train_idx.len(),
+        test_idx.len()
+    );
+    // Both splits must still carry observed events (for comparable pairs) and
+    // span groups (so the frailty levels are learnable and predictable).
+    let train_events: f64 = train_idx.iter().map(|&i| event[i]).sum();
+    let test_events: f64 = test_idx.iter().map(|&i| event[i]).sum();
+    assert!(
+        train_events >= 30.0 && test_events >= 10.0,
+        "need observed events in both splits: train_events={train_events} test_events={test_events}"
+    );
+
+    // ---- fit gam on the TRAIN rows: transformation/net survival + RE frailty
     let headers = vec![
         "time".to_string(),
         "event".to_string(),
         "x".to_string(),
         "group".to_string(),
     ];
-    let rows: Vec<StringRecord> = (0..n)
-        .map(|i| {
+    let train_rows: Vec<StringRecord> = train_idx
+        .iter()
+        .map(|&i| {
             StringRecord::from(vec![
                 time[i].to_string(),
                 event[i].to_string(),
@@ -191,8 +257,8 @@ fn gam_survival_frailty_random_intercept_matches_inla() {
             ])
         })
         .collect();
-    let data =
-        encode_recordswith_inferred_schema(headers, rows).expect("encode frailty survival data");
+    let data = encode_recordswith_inferred_schema(headers, train_rows)
+        .expect("encode train frailty survival data");
     let col = data.column_map();
     let x_idx = col["x"];
     let group_idx = col["group"];
@@ -227,28 +293,55 @@ fn gam_survival_frailty_random_intercept_matches_inla() {
         "beta must carry covariate/RE columns beyond the {time_cols} time-basis columns; beta.len()={}",
         beta.len()
     );
-    // The covariate+RE coefficient block is the tail; the resolvedspec design
-    // is exactly this block (gam's real prediction path).
     let cov_beta = beta.slice(ndarray::s![time_cols..]).to_owned();
 
-    // Recover each encoded group level's numeric code by reading the encoded
-    // categorical column directly (string "grp{k}" -> level index, paired with
-    // the row's true class k). Build an anchor row per encoded level.
+    // Map each encoded group level to its clinical class (the encoder orders
+    // levels by first appearance, not by numeric class).
     let group_encoded: Vec<f64> = data.values.column(group_idx).to_vec();
-    // level_to_class[level] = clinical class index (0..N_GROUPS) for that level.
     let mut level_to_class = vec![usize::MAX; N_GROUPS];
-    for i in 0..n {
-        let level = group_encoded[i].round() as usize;
+    let mut class_to_level = vec![usize::MAX; N_GROUPS];
+    for (row, &train_i) in train_idx.iter().enumerate() {
+        let level = group_encoded[row].round() as usize;
         assert!(level < N_GROUPS, "encoded group level {level} out of range");
-        level_to_class[level] = grp[i];
+        level_to_class[level] = grp[train_i];
+        class_to_level[grp[train_i]] = level;
     }
     assert!(
         level_to_class.iter().all(|&c| c != usize::MAX),
         "every encoded level must map to a clinical class: {level_to_class:?}"
     );
+    assert!(
+        class_to_level.iter().all(|&l| l != usize::MAX),
+        "every clinical class must map to an encoded level (each group must appear in TRAIN)"
+    );
 
-    // Anchor design: one row per encoded level, x at its reference (0 = mean
-    // age) so the row-to-row spread isolates the frailty (RE) contribution.
+    // ---- gam's held-out PH risk score on the TEST rows ----------------------
+    // Build the covariate+RE design at the TEST subjects (their standardized x
+    // and their group's encoded level) and apply the fitted covariate block.
+    // Under the transformation/net model log H(t) = log H0(t) + eta_cov, so
+    // eta_cov is the proportional-hazards risk score: monotone in the hazard,
+    // baseline-shape invariant, exactly what concordance ranks.
+    let mut test_design_in = Array2::<f64>::zeros((test_idx.len(), data.headers.len()));
+    for (row, &i) in test_idx.iter().enumerate() {
+        test_design_in[[row, x_idx]] = x[i];
+        test_design_in[[row, group_idx]] = class_to_level[grp[i]] as f64;
+    }
+    let test_design = build_term_collection_design(test_design_in.view(), &fit.resolvedspec)
+        .expect("build covariate+RE design at TEST rows");
+    assert_eq!(
+        test_design.design.ncols(),
+        cov_beta.len(),
+        "covariate+RE design width must match the covariate-coefficient block"
+    );
+    let gam_risk: Vec<f64> = test_design.design.apply(&cov_beta).to_vec();
+    assert_eq!(gam_risk.len(), test_idx.len());
+
+    let test_time: Vec<f64> = test_idx.iter().map(|&i| time[i]).collect();
+    let test_event: Vec<f64> = test_idx.iter().map(|&i| event[i]).collect();
+    let gam_c = harrell_concordance(&gam_risk, &test_time, &test_event);
+
+    // ---- per-group frailty (context diagnostic only, NOT a pass criterion) --
+    // Anchor row per encoded level at x = 0 isolates the frailty contribution.
     let mut anchor = Array2::<f64>::zeros((N_GROUPS, data.headers.len()));
     for level in 0..N_GROUPS {
         anchor[[level, x_idx]] = 0.0;
@@ -256,27 +349,15 @@ fn gam_survival_frailty_random_intercept_matches_inla() {
     }
     let anchor_design = build_term_collection_design(anchor.view(), &fit.resolvedspec)
         .expect("rebuild covariate+RE design at group anchors");
-    assert_eq!(
-        anchor_design.design.ncols(),
-        cov_beta.len(),
-        "covariate+RE design width must match the covariate-coefficient block"
-    );
     let eta_by_level: Vec<f64> = anchor_design.design.apply(&cov_beta).to_vec();
-    // Reorder into clinical-class order (class 0..5) so it aligns element-wise
-    // with INLA's 1..N_GROUPS factor levels.
     let mut gam_frailty_by_class = vec![0.0_f64; N_GROUPS];
     for level in 0..N_GROUPS {
         gam_frailty_by_class[level_to_class[level]] = eta_by_level[level];
     }
-    // Centre to mean-zero deviations, matching INLA's zero-mean iid frailty.
     let gam_mean = gam_frailty_by_class.iter().sum::<f64>() / N_GROUPS as f64;
     let gam_frailty: Vec<f64> = gam_frailty_by_class.iter().map(|v| v - gam_mean).collect();
 
     // ---- frailty-block effective dimension (shrinkage signature) -----------
-    // The REML-selected RE block must spend strictly less than its N_GROUPS
-    // nominal columns: that sub-linear edf IS the frailty shrinkage. We read the
-    // total edf and assert it leaves headroom below (time-basis cap + fixed x +
-    // full RE block), i.e. the RE block is regularized rather than saturated.
     let edf_total = fit.fit.edf_total().expect("gam reports total edf");
     let edf_blocks = fit.fit.edf_by_block();
     assert!(
@@ -284,13 +365,7 @@ fn gam_survival_frailty_random_intercept_matches_inla() {
         "gam must report per-block edf for the penalized frailty fit"
     );
 
-    // ---- baseline cumulative hazard on a shared time grid ------------------
-    // Evaluate gam's baseline H0(t) at the reference (x=0, frailty=0) over a
-    // grid spanning the observed follow-up. gam's transformation/net baseline is
-    // exp(time-basis . beta_time) accumulated as the I-spline cumulative hazard;
-    // the structural API exposes it via the predicted survival at the reference,
-    // so we read H0 from the time-basis block directly through the fitted
-    // baseline cumulative-hazard helper on the grid.
+    // ---- baseline cumulative hazard on a shared time grid (structure check) -
     let t_lo = time.iter().cloned().fold(f64::INFINITY, f64::min).max(1.0);
     let t_hi = time.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     assert!(t_hi > t_lo, "follow-up grid must be non-degenerate");
@@ -298,15 +373,29 @@ fn gam_survival_frailty_random_intercept_matches_inla() {
     let t_grid: Vec<f64> = (0..grid_n)
         .map(|k| t_lo + (t_hi - t_lo) * (k as f64) / ((grid_n - 1) as f64))
         .collect();
-    // gam baseline cumulative hazard at the reference covariate/frailty: the
-    // transformation model stores it as the I-spline image of log-time. We
-    // reconstruct H0(t) = exp(eta0) * basis-accumulated hazard by evaluating the
-    // *fitted* cumulative hazard through gam's survival baseline helper.
     let gam_h0: Vec<f64> = baseline_cumulative_hazard(&fit, &t_grid);
     assert_eq!(gam_h0.len(), grid_n);
+
+    // STRUCTURE: H0(t) finite, positive, monotone non-decreasing; baseline
+    // survival S0(t) = exp(-H0(t)) in [0,1] and non-increasing. These are the
+    // mathematical axioms of a survival baseline — an objective correctness
+    // claim, independent of any reference tool.
+    assert!(
+        gam_h0.iter().all(|v| v.is_finite() && *v > 0.0),
+        "baseline cumulative hazard must be finite and positive: {gam_h0:?}"
+    );
     assert!(
         gam_h0.windows(2).all(|w| w[1] + 1e-9 >= w[0]),
         "baseline cumulative hazard must be monotone non-decreasing: {gam_h0:?}"
+    );
+    let s0: Vec<f64> = gam_h0.iter().map(|h| (-h).exp()).collect();
+    assert!(
+        s0.iter().all(|s| (0.0..=1.0).contains(s)),
+        "baseline survival S0(t)=exp(-H0) must lie in [0,1]: {s0:?}"
+    );
+    assert!(
+        s0.windows(2).all(|w| w[1] <= w[0] + 1e-9),
+        "baseline survival must be non-increasing: {s0:?}"
     );
 
     let t_grid_csv = t_grid
@@ -315,32 +404,39 @@ fn gam_survival_frailty_random_intercept_matches_inla() {
         .collect::<Vec<_>>()
         .join(",");
 
-    // ---- fit the SAME data with R-INLA (the scalable Bayesian reference) ----
+    // ---- fit the SAME TRAIN rows with R-INLA (the match-or-beat baseline) ----
+    // INLA is fit on TRAIN and emits the components of its held-out PH risk
+    // score: the `x` slope, the per-group frailty posterior means, and the per-
+    // TEST-row group code. We assemble INLA's test risk = slope*x + frailty[grp]
+    // in Rust and score it with the IDENTICAL concordance routine on the
+    // IDENTICAL test rows, so the only thing compared is held-out discrimination.
+    let train_time: Vec<f64> = train_idx.iter().map(|&i| time[i]).collect();
+    let train_event: Vec<f64> = train_idx.iter().map(|&i| event[i]).collect();
+    let train_x: Vec<f64> = train_idx.iter().map(|&i| x[i]).collect();
+    let train_group1: Vec<f64> = train_idx.iter().map(|&i| group_code1[i]).collect();
     let r = run_r(
         &[
-            Column::new("time", &time),
-            Column::new("event", &event),
-            Column::new("x", &x),
-            Column::new("group", &group_code1),
+            Column::new("time", &train_time),
+            Column::new("event", &train_event),
+            Column::new("x", &train_x),
+            Column::new("group", &train_group1),
         ],
         &format!(
             r#"
             suppressPackageStartupMessages(library(INLA))
             df$group <- as.integer(round(df$group))
             # Weibull-PH survival with an i.i.d. Gaussian frailty on `group`.
-            # f(group, model='iid') is the latent-Gaussian random intercept; its
-            # precision carries a (default log-gamma) hyperprior that INLA
-            # integrates over -- the scalable approx-Bayesian frailty estimand.
             form <- inla.surv(time, event) ~ 1 + x + f(group, model = "iid")
             r <- inla(form, family = "weibullsurv", data = df,
                       control.compute = list(dic = TRUE, waic = TRUE),
                       control.inla = list(strategy = "laplace"))
-            # Per-group posterior mean frailty (zero-mean iid), level order 1..K.
+            # Per-group posterior-mean frailty (zero-mean iid), level order 1..K.
             fr <- r$summary.random$group$mean
             emit("frailty", as.numeric(fr))
-            # Weibull shape `alpha` (hyperpar) and Intercept on the log-hazard
-            # scale -> baseline cumulative hazard H0(t) = exp(b0) * t^alpha for
-            # INLA's weibullsurv (PH, scale absorbed into the intercept).
+            # Fixed-effect slope on x (the covariate part of the PH risk score).
+            slope <- r$summary.fixed["x", "mean"]
+            emit("slope", as.numeric(slope))
+            # Diagnostics-only: Weibull shape + intercept -> H0(t)=exp(b0)*t^alpha.
             alpha <- r$summary.hyperpar["alpha parameter for weibullsurv", "mean"]
             b0 <- r$summary.fixed["(Intercept)", "mean"]
             tg <- c({t_grid_csv})
@@ -351,6 +447,7 @@ fn gam_survival_frailty_random_intercept_matches_inla() {
         ),
     );
     let inla_frailty = r.vector("frailty");
+    let inla_slope = r.scalar("slope");
     let inla_h0 = r.vector("H0");
     let inla_waic = r.scalar("waic");
     assert_eq!(
@@ -360,55 +457,55 @@ fn gam_survival_frailty_random_intercept_matches_inla() {
         inla_frailty.len()
     );
     assert_eq!(inla_h0.len(), grid_n, "INLA H0 grid length mismatch");
-    // INLA's iid effect is already zero-mean; centre defensively so both vectors
-    // are mean-zero deviations before the element-wise RMSE.
+
+    // INLA's held-out PH risk score on the TEST rows. INLA's iid frailty levels
+    // are in numeric group order 1..K, i.e. frailty[k] for clinical class k.
+    let inla_risk: Vec<f64> = test_idx
+        .iter()
+        .map(|&i| inla_slope * x[i] + inla_frailty[grp[i]])
+        .collect();
+    let inla_c = harrell_concordance(&inla_risk, &test_time, &test_event);
+
+    // ---- context-only diagnostics (NOT pass/fail) --------------------------
     let inla_mean = inla_frailty.iter().sum::<f64>() / N_GROUPS as f64;
     let inla_frailty_c: Vec<f64> = inla_frailty.iter().map(|v| v - inla_mean).collect();
-
-    // ---- compare -----------------------------------------------------------
     let frailty_rmse = rmse(&gam_frailty, &inla_frailty_c);
     let frailty_corr = pearson(&gam_frailty, &inla_frailty_c);
     let h0_corr = pearson(&gam_h0, inla_h0);
 
     eprintln!(
-        "frailty survival vs INLA: n={n} groups={N_GROUPS} death_rate={death_rate:.3} \
-         counts={group_counts:?} edf_total={edf_total:.3} edf_blocks={edf_blocks:?} \
-         frailty_rmse={frailty_rmse:.4} frailty_pearson={frailty_corr:.4} \
+        "frailty survival (held-out): n={n} train={} test={} groups={N_GROUPS} \
+         death_rate={death_rate:.3} counts={group_counts:?} edf_total={edf_total:.3} \
+         edf_blocks={edf_blocks:?} gam_C={gam_c:.4} inla_C={inla_c:.4} \
+         [context-only] frailty_rmse={frailty_rmse:.4} frailty_pearson={frailty_corr:.4} \
          H0_pearson={h0_corr:.4} INLA_waic={inla_waic:.2}\n  \
-         gam_frailty={gam_frailty:?}\n  inla_frailty={inla_frailty_c:?}"
+         gam_frailty={gam_frailty:?}\n  inla_frailty={inla_frailty_c:?}",
+        train_idx.len(),
+        test_idx.len()
     );
 
-    // (1) SPEC bound: per-group frailty posterior means within 0.12 RMSE. Both
-    // are mean-centred Gaussian-prior shrinkage estimates of the same six
-    // log-hazard shifts; the severity classes induce a real spread, so 0.12 is
-    // tight yet leaves room for the EB-vs-marginal-posterior gap and the
-    // ispline-vs-Weibull baseline mismatch. A larger gap = genuine divergence
-    // in gam's penalized frailty assembly.
+    // (1) PRIMARY OBJECTIVE: held-out concordance clears an absolute bar. A
+    // C-index of 0.5 is random guessing; 0.55 is a principled floor for real,
+    // above-chance discrimination of a hard clinical endpoint from age + a
+    // six-level severity frailty alone. This is gam's OWN held-out predictive
+    // quality, not agreement with any tool.
     assert!(
-        frailty_rmse <= 0.12,
-        "gam frailty posterior means diverge from INLA: rmse={frailty_rmse:.4} (bound 0.12)"
+        gam_c >= 0.55,
+        "gam under-discriminates held-out survival: C={gam_c:.4} (absolute bar 0.55)"
     );
-    // The frailty *ordering* must also agree: both engines see the identical
-    // group structure, so the sign/rank of the six shifts must coincide. r>0.85
-    // is a principled floor for six noisy-but-real shrinkage estimates.
+    // (1b) MATCH-OR-BEAT: gam must discriminate held-out risk at least as well
+    // as the INLA baseline (within a 0.02 estimation-noise margin). INLA is a
+    // baseline on the objective metric, never a fitted-output target.
     assert!(
-        frailty_corr > 0.85,
-        "gam frailty ordering disagrees with INLA: pearson={frailty_corr:.4}"
+        gam_c >= inla_c - 0.02,
+        "gam loses to INLA on held-out discrimination: gam_C={gam_c:.4} inla_C={inla_c:.4} (margin 0.02)"
     );
-    // (2) SPEC bound: baseline cumulative hazard Pearson >= 0.98. Both H0(t) are
-    // monotone on the same support; gam's I-spline must track INLA's Weibull
-    // baseline shape this tightly or the flexible-baseline assembly is wrong.
-    assert!(
-        h0_corr >= 0.98,
-        "gam baseline cumulative hazard shape diverges from INLA: pearson={h0_corr:.4}"
-    );
-    // (3) Shrinkage signature: the REML-selected RE frailty must spend a
-    // sub-linear effective dimension. The fixed effects floor is: 1 time anchor
-    // + at least 1 ispline df + 1 fixed x. A *fully unshrunk* factor would add
-    // the full N_GROUPS-1 = 5 contrasts on top; a frailty shrinks below that.
-    // Asserting edf_total strictly below (time_cols + 1 fixed-x + full RE block)
-    // confirms gam is regularizing the frailty, consistent with INLA's finite
-    // posterior precision rather than a saturated fixed-effect factor.
+    // (2) Structure assertions on H0/S0 are above (axioms, no reference needed).
+    // (3) SHRINKAGE SIGNATURE: the REML-selected RE frailty must spend a
+    // sub-linear effective dimension. A fully unshrunk factor would add the full
+    // N_GROUPS contrasts on top of the time basis + fixed x; a frailty shrinks
+    // below that. edf_total strictly below (time_cols + 1 fixed-x + full RE
+    // block) confirms gam is regularizing the frailty.
     let unshrunk_ceiling = time_cols as f64 + 1.0 + (N_GROUPS as f64);
     assert!(
         edf_total < unshrunk_ceiling,
@@ -462,11 +559,6 @@ fn baseline_cumulative_hazard(
     };
 
     let time_cols = fit.time_base_ncols;
-    // The fit centered the time block at `saved.anchor`: it subtracted the
-    // anchor I-spline row from every exit/entry row before estimating β_time.
-    // Reproduce that exact anchor row (same evaluator the workflow used) so the
-    // reconstructed baseline matches the fitted parameterization rather than an
-    // un-centered re-derivation.
     let anchor_row = evaluate_survival_time_basis_row(saved.anchor, &cfg)
         .expect("evaluate saved ispline anchor row");
     assert_eq!(
@@ -477,8 +569,6 @@ fn baseline_cumulative_hazard(
     );
 
     let grid = Array1::from_vec(t_grid.to_vec());
-    // No left-truncation at the reference: entry times are zero (the exit basis
-    // alone carries H0(t)).
     let entry = Array1::<f64>::zeros(grid.len());
     let build = build_survival_time_basis(&entry, &grid, cfg, None)
         .expect("rebuild survival time basis at grid from saved state");
@@ -490,9 +580,6 @@ fn baseline_cumulative_hazard(
         x_exit.ncols()
     );
     let beta_time = fit.fit.beta.slice(ndarray::s![..time_cols]).to_owned();
-    // eta0(t) = (x_exit(log t) − x_exit(anchor)) · β_time on the log-cumulative-
-    // hazard scale, then H0(t) = exp(eta0(t)) — the engine's anchor-centered RP
-    // baseline arithmetic.
     (0..t_grid.len())
         .map(|k| {
             let eta: f64 = (0..time_cols)

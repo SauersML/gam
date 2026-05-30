@@ -1,21 +1,42 @@
-//! Ground-truth quality: gam's ALO (approximate leave-one-out) corrected linear
-//! predictor `eta_tilde` must match the *exact* leave-one-out predictor obtained
-//! by brute-force refitting — the canonical oracle for any ALO method.
+//! OBJECTIVE quality of gam's ALO (approximate leave-one-out) corrected linear
+//! predictor on real binomial/logit data.
 //!
-//! Mature comparator: **gam itself, run as exact LOO**. ALO is, by definition, a
-//! closed-form approximation to leave-one-out cross-validation. The unimpeachable
-//! reference is therefore exact LOO: refit the GAM `n` times, each time holding
-//! out observation `i`, and read off the held-out linear predictor
-//! `eta_hat^{(-i)}(x_i)`. There is no external tool that does penalized-GAM exact
-//! LOO for us, and approximating ALO against anything *other* than exact LOO would
-//! be circular — so the honest comparator is gam's own refit. (mgcv/pygam expose
-//! GCV/UBRE shortcut scores, not the per-observation exact-LOO linear predictor
-//! this test validates, so they are not the right oracle here.)
+//! The point of any LOO method is *honest out-of-sample prediction*: the
+//! corrected predictor `eta_tilde_i` is what the model would have predicted for
+//! observation `i` had it never seen `i`. The objective metric this test asserts
+//! is therefore the **mean held-out binomial deviance (log-loss)** of the
+//! corrected linear predictor against the real `DEATH_EVENT` responses:
+//!
+//!     loss(eta) = mean_i [ -2 * ( y_i*log p_i + (1-y_i)*log(1-p_i) ) ],
+//!     p_i = logistic(eta_i).
+//!
+//! PRIMARY OBJECTIVE CLAIM (truth recovery / predictive accuracy):
+//!   * ALO's held-out log-loss must be *strictly larger* than the model's own
+//!     in-sample log-loss — an LOO predictor that does not pay an honest
+//!     out-of-sample penalty is not doing leave-one-out at all (it is just the
+//!     in-sample fit relabelled). This is a property of LOO that holds for any
+//!     correct implementation regardless of any reference tool.
+//!   * ALO's held-out log-loss must beat the trivial intercept-only baseline
+//!     (predict the marginal event rate for everyone): the smooth carries real,
+//!     out-of-sample-honest predictive signal.
+//!
+//! BASELINE TO MATCH-OR-BEAT (objective accuracy, not "same fit"):
+//!   * exact brute-force LOO — refit the GAM `n` times, dropping observation `i`,
+//!     and read off `eta_hat^{(-i)}(x_i)`. This is the unimpeachable mathematical
+//!     oracle for *any* ALO method (the EXACT quantity ALO approximates), so it is
+//!     ground truth, not a peer tool. We assert gam's ALO predicts at least as
+//!     accurately out of sample as the exact oracle: ALO log-loss <= exact-LOO
+//!     log-loss * 1.02.
+//!
+//! GROUND-TRUTH CORRECTNESS (kept — exact LOO is the analytic quantity ALO
+//! approximates, not a noisy peer-tool fit): the corrected predictors must agree
+//! element-wise with exact LOO. A genuine error in the ALO algebra would both
+//! blow up this agreement and degrade the predictive metric above; keeping it
+//! pins down *where* a regression came from.
 //!
 //! We use Binomial/logit — the canonical GLM case. The logit link is canonical,
 //! so the IRLS working weights equal the Fisher information and ALO's one-step
-//! Newton correction is at its most accurate; this is precisely where ALO must be
-//! trusted essentially to machine-relevant precision against the exact oracle.
+//! Newton correction is at its most accurate.
 //!
 //! Data: `heart_failure_clinical_records_dataset.csv` (299 real patients),
 //! `DEATH_EVENT ~ s(ejection_fraction)`. Identical encoded data feeds the full
@@ -97,6 +118,22 @@ fn dataset_without_row(ds: &EncodedDataset, drop: usize) -> EncodedDataset {
     }
 }
 
+/// Mean held-out binomial deviance (log-loss) of a linear predictor `eta`
+/// against binary responses `y`: `mean_i -2*(y log p + (1-y) log(1-p))`,
+/// `p = logistic(eta)`. Lower is a more accurate probabilistic prediction.
+/// Probabilities are clamped away from {0,1} so a single confident miss cannot
+/// produce a non-finite loss.
+fn mean_binomial_log_loss(eta: &[f64], y: &[f64]) -> f64 {
+    assert_eq!(eta.len(), y.len(), "log-loss length mismatch");
+    const EPS: f64 = 1e-12;
+    let mut acc = 0.0;
+    for (&e, &yi) in eta.iter().zip(y.iter()) {
+        let p = (1.0 / (1.0 + (-e).exp())).clamp(EPS, 1.0 - EPS);
+        acc += -2.0 * (yi * p.ln() + (1.0 - yi) * (1.0 - p).ln());
+    }
+    acc / eta.len() as f64
+}
+
 #[test]
 fn alo_eta_tilde_matches_exact_loo_binomial_logit() {
     init_parallelism();
@@ -116,8 +153,9 @@ fn alo_eta_tilde_matches_exact_loo_binomial_logit() {
 
     // ---- full fit + ALO ----------------------------------------------------
     // The full-fit ALO reads everything it needs from `full_fit`; the resolved
-    // spec is only needed for the per-row refits below (which return their own).
-    let (full_fit, _) = fit_binomial_logit(&ds);
+    // spec is reused to evaluate the IN-SAMPLE linear predictor eta_hat(x_i),
+    // which is the predictive-honesty baseline the corrected predictor must beat.
+    let (full_fit, full_spec) = fit_binomial_logit(&ds);
     let y: Vec<f64> = ds.values.column(col["DEATH_EVENT"]).to_vec();
     let alo = compute_alo_diagnostics_from_fit(
         &full_fit,
@@ -137,23 +175,70 @@ fn alo_eta_tilde_matches_exact_loo_binomial_logit() {
         exact_loo.push(eta_i);
     }
 
-    // ---- compare element-wise on the logit scale --------------------------
+    // ---- in-sample predictor eta_hat(x_i) (predictive-honesty baseline) ----
+    // The naive in-sample fit has seen every observation, so its log-loss is an
+    // optimistic floor. A correct LOO predictor must score WORSE than this.
+    let in_sample: Vec<f64> = (0..n)
+        .map(|i| eta_at_point(&full_fit.beta, &full_spec, n_headers, pred_idx, x[i]))
+        .collect();
+
+    // ---- trivial intercept-only baseline: predict the marginal event rate ----
+    // logit(mean(y)) for everyone. Any model with real signal must beat this.
+    let p_bar = y.iter().sum::<f64>() / n as f64;
+    let eta_bar = (p_bar / (1.0 - p_bar)).ln();
+    let intercept_only = vec![eta_bar; n];
+
+    // ---- OBJECTIVE METRIC: mean held-out binomial deviance (log-loss) ------
+    let loss_alo = mean_binomial_log_loss(&alo_eta_tilde, &y);
+    let loss_exact = mean_binomial_log_loss(&exact_loo, &y);
+    let loss_in_sample = mean_binomial_log_loss(&in_sample, &y);
+    let loss_intercept = mean_binomial_log_loss(&intercept_only, &y);
+
+    // ---- element-wise agreement vs the exact-LOO oracle (ground truth) -----
     let rel = relative_l2(&alo_eta_tilde, &exact_loo);
     let max_abs = max_abs_diff(&alo_eta_tilde, &exact_loo);
     let corr = pearson(&alo_eta_tilde, &exact_loo);
 
     eprintln!(
-        "ALO vs exact-LOO (binomial/logit, n={n}): rel_l2={rel:.5} \
-         max_abs={max_abs:.5} pearson={corr:.6}"
+        "binomial/logit n={n}: log-loss alo={loss_alo:.5} exact-LOO={loss_exact:.5} \
+         in-sample={loss_in_sample:.5} intercept-only={loss_intercept:.5} | \
+         ALO vs exact-LOO rel_l2={rel:.5} max_abs={max_abs:.5} pearson={corr:.6}"
     );
 
-    // Principled bound: ALO is a first-order (one Newton step) approximation to
-    // exact LOO. For a canonical link (logit) with a stable penalized fit the
-    // residual approximation error is second-order in the per-observation
-    // leverage and is empirically tiny here. The spec bounds — rel_l2 < 0.01,
-    // max_abs < 0.05 logits, pearson > 0.9999 — assert genuine element-wise
-    // agreement with the oracle (not mere correlation) while leaving no room for
-    // a real divergence in the ALO algebra to slip through. They are NOT loosened.
+    // === PRIMARY OBJECTIVE: out-of-sample predictive honesty + signal =======
+    // (1) The corrected predictor must pay an honest out-of-sample penalty:
+    //     held-out log-loss strictly exceeds the optimistic in-sample log-loss.
+    //     If ALO's loss were <= in-sample, the "correction" would be removing no
+    //     information about the held-out point — a broken LOO.
+    assert!(
+        loss_alo > loss_in_sample,
+        "ALO held-out log-loss ({loss_alo:.5}) must exceed the in-sample floor \
+         ({loss_in_sample:.5}); an LOO predictor that is no worse than in-sample \
+         is not leaving anything out"
+    );
+    // (2) The smooth must carry real out-of-sample signal: it must beat the
+    //     intercept-only marginal-rate predictor on the SAME held-out metric.
+    assert!(
+        loss_alo < loss_intercept,
+        "ALO held-out log-loss ({loss_alo:.5}) must beat the intercept-only \
+         baseline ({loss_intercept:.5}): the smooth carries no out-of-sample signal"
+    );
+
+    // === BASELINE TO MATCH-OR-BEAT: exact-LOO oracle predictive accuracy =====
+    // gam's fast ALO must be at least as predictive out of sample as the exact
+    // brute-force oracle it approximates (2% slack for the first-order residual).
+    assert!(
+        loss_alo <= loss_exact * 1.02,
+        "ALO held-out log-loss ({loss_alo:.5}) must match or beat exact-LOO \
+         ({loss_exact:.5}) to within 2%: the approximation is losing accuracy"
+    );
+
+    // === GROUND-TRUTH CORRECTNESS: agreement with the exact-LOO quantity =====
+    // Exact LOO is the analytic quantity ALO approximates (not a peer tool), so
+    // element-wise agreement is a correctness claim. ALO is a one-Newton-step
+    // approximation; on a canonical link with a stable penalized fit the residual
+    // is second-order in per-observation leverage and empirically tiny. These
+    // bounds pin down a divergence in the ALO algebra; they are NOT loosened.
     assert!(
         corr > 0.9999,
         "ALO eta_tilde must track exact LOO almost perfectly: pearson={corr:.6}"

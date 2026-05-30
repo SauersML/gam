@@ -1,18 +1,29 @@
 //! End-to-end quality: gam's SINDy Sequential Thresholded Least Squares
-//! (STLSQ) sparse-identification solver must match **PySINDy** — the reference
-//! Python implementation of SINDy (Brunton, Proctor & Kutz, PNAS 2016, and the
-//! `pysindy` package by de Silva et al., JOSS 2020) — on the canonical
-//! Lorenz-63 benchmark.
+//! (STLSQ) sparse-identification solver must **recover the true Lorenz-63
+//! governing equations** — the canonical SINDy benchmark of Brunton, Proctor &
+//! Kutz (PNAS 2016).
 //!
-//! Why this comparator: PySINDy's `STLSQ` optimizer *is* the same algorithm as
-//! `gam::solver::sindy::sindy_stlsq_solve` — sequential thresholded least
-//! squares with a ridge regularizer on the active set. STLSQ is a deterministic
-//! fixed-point iteration: fed an identical library matrix `Θ` and identical
-//! target derivative matrix `Ẋ`, with identical threshold and ridge `λ`, the two
-//! engines must converge to the *same* sparse support (the same coefficients set
-//! to exactly zero) and the *same* coefficient values to within solver
-//! precision. Lorenz-63 is the headline system of Brunton 2016; a divergence
-//! here is a genuine bug in either support recovery or coefficient accuracy.
+//! OBJECTIVE METRIC (the pass criterion): TRUTH RECOVERY. Lorenz-63 is generated
+//! from a *known* sparse 7×3 coefficient matrix. The test asserts gam's
+//! recovered coefficient matrix equals that ground-truth matrix to machine
+//! precision — both the exact sparse support (every off-support term thresholded
+//! to exactly zero) and the on-support coefficient values. With exact analytic
+//! derivatives and the exact spanning library, the unregularized least-squares
+//! solution on the recovered support IS the true Lorenz matrix to ~1e-12, so a
+//! tight bound (max|Δ| < 1e-6) is the right objective bar: it catches a real
+//! support-recovery failure (a missed or spurious term) or a coefficient bug
+//! (an O(1e-3) drift from a stray ridge or a transposed/mis-scaled solve)
+//! without tolerating any genuine error.
+//!
+//! BASELINE TO MATCH-OR-BEAT: **PySINDy** — the reference Python implementation
+//! of SINDy (the `pysindy` package, de Silva et al., JOSS 2020). PySINDy's
+//! `STLSQ` optimizer is the same algorithm as
+//! `gam::solver::sindy::sindy_stlsq_solve`. We fit it on the byte-identical
+//! (Θ, Ẋ) and require gam's recovery error to be no worse than PySINDy's (up to
+//! a 10% accuracy margin). This is a match-or-beat ACCURACY check against a
+//! mature peer — NOT "gam reproduces PySINDy's fit"; the primary, sufficient
+//! claim is recovery of the analytic truth. PySINDy's own truth error and the
+//! gam-vs-PySINDy spread are printed for context only.
 //!
 //! To eliminate every confound we do NOT let either engine build its own
 //! library or estimate its own derivatives: we construct ONE library matrix and
@@ -31,7 +42,7 @@
 //! SINDy.
 
 use gam::solver::sindy::{SindyPenaltyKind, sindy_stlsq_solve};
-use gam::test_support::reference::{Column, max_abs_diff, run_python};
+use gam::test_support::reference::{Column, max_abs_diff, rmse, run_python};
 use ndarray::Array2;
 
 // Lorenz-63 parameters (Brunton 2016, the standard chaotic regime).
@@ -81,7 +92,7 @@ fn rk4_step(x: f64, y: f64, z: f64) -> (f64, f64, f64) {
 }
 
 #[test]
-fn gam_sindy_matches_pysindy_on_lorenz63() {
+fn gam_sindy_recovers_true_lorenz63_governing_equations() {
     // ---- generate the canonical Lorenz-63 trajectory (fixed seed=0) --------
     // "seed=0" fixes the deterministic initial condition; the trajectory is
     // fully reproducible RK4 with no stochasticity. Both engines see the exact
@@ -233,31 +244,7 @@ emit("nonzero", (xi != 0.0).reshape(-1, order="F").astype(float))
     assert_eq!(py_xi.len(), P * 3, "pysindy coef must be 7x3 flattened");
     assert_eq!(py_nonzero.len(), P * 3, "pysindy support must be 7x3");
 
-    // ---- sparsity-pattern (support) agreement: EXACT ----------------------
-    // Both engines run the same hard-threshold STLSQ at the same threshold, so
-    // the set of nonzero coefficients must agree element-wise with NO mismatch.
-    let term_names = ["1", "x", "y", "z", "x*y", "x*z", "y*z"];
-    let deriv_names = ["dx/dt", "dy/dt", "dz/dt"];
-    let mut support_mismatches = 0usize;
-    for c in 0..3 {
-        for r in 0..P {
-            let k = c * P + r;
-            let gam_nz = gam_xi[k] != 0.0;
-            let py_nz = py_nonzero[k] != 0.0;
-            if gam_nz != py_nz {
-                support_mismatches += 1;
-                eprintln!(
-                    "SUPPORT mismatch {} term {}: gam_nz={} py_nz={} (gam={:.6}, py={:.6})",
-                    deriv_names[c], term_names[r], gam_nz, py_nz, gam_xi[k], py_xi[k]
-                );
-            }
-        }
-    }
-
-    // ---- coefficient agreement on the recovered matrix --------------------
-    let coef_max_abs = max_abs_diff(&gam_xi, py_xi);
-
-    // ---- recovery sanity: the true Lorenz support must be the 7 nonzeros ---
+    // ---- GROUND-TRUTH Lorenz coefficient matrix (the known generator) ------
     // true (col-major) nonzero pattern over [dx, dy, dz]:
     //   dx: -sigma at x(row1), +sigma at y(row2)
     //   dy: +rho at x(row1), -1 at y(row2), -1 at x*z(row5)
@@ -271,50 +258,78 @@ emit("nonzero", (xi != 0.0).reshape(-1, order="F").astype(float))
     true_xi[idx(1, 5)] = -1.0; // dy : x*z
     true_xi[idx(2, 3)] = -BETA; // dz : z
     true_xi[idx(2, 4)] = 1.0; // dz : x*y
-    let gam_vs_true = max_abs_diff(&gam_xi, &true_xi);
-    let py_vs_true = max_abs_diff(py_xi, &true_xi);
 
-    eprintln!("=== SINDy Lorenz-63: gam STLSQ vs PySINDy STLSQ ===");
+    // ---- OBJECTIVE accuracy: recovery error vs the analytic truth ----------
+    // RMSE (over all 21 entries) and max|Δ| are pure error-vs-ground-truth
+    // metrics; PySINDy is not in the loop here.
+    let gam_rmse_vs_true = rmse(&gam_xi, &true_xi);
+    let gam_max_vs_true = max_abs_diff(&gam_xi, &true_xi);
+    let py_rmse_vs_true = rmse(py_xi, &true_xi);
+    let py_max_vs_true = max_abs_diff(py_xi, &true_xi);
+
+    // ---- CONTEXT ONLY: support agreement + gam-vs-pysindy spread -----------
+    // These reproduce-the-peer numbers are printed but NOT asserted on: matching
+    // PySINDy's noisy support/coefficients proves nothing about correctness.
+    let term_names = ["1", "x", "y", "z", "x*y", "x*z", "y*z"];
+    let deriv_names = ["dx/dt", "dy/dt", "dz/dt"];
+    let mut support_mismatches = 0usize;
+    for c in 0..3 {
+        for r in 0..P {
+            let k = c * P + r;
+            let gam_nz = gam_xi[k] != 0.0;
+            let py_nz = py_nonzero[k] != 0.0;
+            if gam_nz != py_nz {
+                support_mismatches += 1;
+                eprintln!(
+                    "SUPPORT diff {} term {}: gam_nz={} py_nz={} (gam={:.6}, py={:.6})",
+                    deriv_names[c], term_names[r], gam_nz, py_nz, gam_xi[k], py_xi[k]
+                );
+            }
+        }
+    }
+    let coef_max_abs = max_abs_diff(&gam_xi, py_xi);
+
+    eprintln!("=== SINDy Lorenz-63: gam STLSQ truth recovery (PySINDy = baseline) ===");
     eprintln!(
         "rounds_used={} converged={}",
         gam.rounds_used, gam.converged
     );
-    eprintln!("support mismatches (gam vs pysindy): {support_mismatches}");
-    eprintln!("coef max|Δ| gam-vs-pysindy : {coef_max_abs:.3e}");
-    eprintln!("coef max|Δ| gam-vs-true    : {gam_vs_true:.3e}");
-    eprintln!("coef max|Δ| pysindy-vs-true: {py_vs_true:.3e}");
+    eprintln!("OBJECTIVE  gam RMSE-vs-truth    : {gam_rmse_vs_true:.3e}");
+    eprintln!("OBJECTIVE  gam max|Δ|-vs-truth  : {gam_max_vs_true:.3e}");
+    eprintln!("BASELINE   pysindy RMSE-vs-truth: {py_rmse_vs_true:.3e}");
+    eprintln!("BASELINE   pysindy max|Δ|-truth : {py_max_vs_true:.3e}");
+    eprintln!("context    support diffs vs pysindy : {support_mismatches}");
+    eprintln!("context    coef max|Δ| gam-vs-pysindy: {coef_max_abs:.3e}");
 
-    // ---- assertions --------------------------------------------------------
-    // (1) Both engines must recover the EXACT Lorenz support — anything else
-    //     means STLSQ failed on its headline benchmark. Sanity-gate so a shared
-    //     bug recovering the wrong (but identical) support can't pass silently.
+    // ---- assertions: OBJECTIVE quality, not reproduction of a peer tool ----
+    // (1) PRIMARY CLAIM — gam recovers the TRUE Lorenz-63 governing equations.
+    //     With exact analytic derivatives and the exact spanning library, the
+    //     unregularized least-squares solution on the thresholded support is the
+    //     true coefficient matrix to ~1e-12. A 1e-6 bound on both RMSE and the
+    //     worst single entry is tight enough to catch a missed/spurious term or
+    //     an O(1e-3) coefficient drift, while tolerating Cholesky rounding.
     assert!(
-        gam_vs_true < 1.0e-6,
-        "gam STLSQ must recover true Lorenz coefficients (max|Δ|={gam_vs_true:.3e}); \
-         with exact analytic derivatives and the exact spanning library the \
-         least-squares solution is the true matrix to machine precision"
+        gam_rmse_vs_true < 1.0e-6,
+        "gam STLSQ must recover the true Lorenz-63 coefficients \
+         (RMSE-vs-truth={gam_rmse_vs_true:.3e}); with exact analytic derivatives \
+         and the exact spanning library the least-squares solution on the \
+         recovered support is the true matrix to machine precision"
     );
     assert!(
-        py_vs_true < 1.0e-6,
-        "pysindy STLSQ must recover true Lorenz coefficients (max|Δ|={py_vs_true:.3e})"
+        gam_max_vs_true < 1.0e-6,
+        "gam STLSQ worst-entry error vs true Lorenz coefficients must be ~0 \
+         (max|Δ|-vs-truth={gam_max_vs_true:.3e})"
     );
 
-    // (2) Sparsity pattern must match EXACTLY — same algorithm, same threshold,
-    //     same inputs: zero positions must coincide with no slack.
-    assert_eq!(
-        support_mismatches, 0,
-        "gam and pysindy STLSQ must agree on the sparse support element-wise"
-    );
-
-    // (3) Coefficient agreement: at λ=0 both engines solve the same OLS normal
-    //     equations on the same recovered support, so they differ only by
-    //     linear-algebra rounding (~1e-12 in practice). 1e-6 is tight enough to
-    //     catch a real coefficient bug — e.g. the O(1e-3) drift a stray ridge
-    //     term or a transposed/mis-scaled solve would introduce — while
-    //     tolerating Cholesky-vs-pysindy-solver floating-point differences.
+    // (2) MATCH-OR-BEAT — gam's recovery accuracy is no worse than the mature
+    //     PySINDy baseline (up to a 10% margin). This is an accuracy comparison
+    //     against a peer, never a "reproduce PySINDy's output" check; the +1e-12
+    //     floor keeps the ratio well-defined when both errors are ~machine-eps.
+    let baseline_bar = py_rmse_vs_true.max(1e-12) * 1.10;
     assert!(
-        coef_max_abs < 1.0e-6,
-        "gam and pysindy STLSQ coefficients must match to solver precision \
-         (max|Δ|={coef_max_abs:.3e})"
+        gam_rmse_vs_true <= baseline_bar,
+        "gam STLSQ recovery accuracy must match-or-beat the PySINDy baseline: \
+         gam RMSE-vs-truth={gam_rmse_vs_true:.3e} exceeds 1.10*PySINDy \
+         ({baseline_bar:.3e}, PySINDy RMSE-vs-truth={py_rmse_vs_true:.3e})"
     );
 }

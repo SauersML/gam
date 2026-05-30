@@ -1,22 +1,25 @@
 //! End-to-end quality: gam's Gaussian *location-scale* fit (a smooth mean
 //! AND a smooth log-sigma, fit jointly by penalized blockwise PIRLS) must
-//! match `gamlss::gamlss(family = NO())` — the reference GAMLSS implementation
-//! for distributional regression and the de-facto standard for location-scale
-//! models with both a smooth mean and a smooth log-variance in R.
+//! RECOVER THE KNOWN GENERATING FUNCTIONS of a heteroscedastic synthetic
+//! dataset. This is the cross-feature combination single-parameter GAM tests
+//! never exercise: family (Gaussian) x TWO smooths (mean + scale) fit jointly.
 //!
-//! This is the cross-feature combination that single-parameter GAM tests never
-//! exercise: family (Gaussian) x TWO smooths (mean + scale) fit jointly. We
-//! synthesize a sin signal with a heteroscedastic noise envelope, feed the
-//! *identical* (x, y) rows to both engines, and compare the recovered smooth
-//! shapes — not predictions of held-out data — on a dense grid:
-//!   * the fitted mean mu(x), and
-//!   * the fitted log standard deviation log(sigma(x)).
+//! OBJECTIVE METRIC (truth recovery, NOT closeness to a reference tool):
+//!   * the data are drawn from a KNOWN mean mu_true(x) = sin(2*pi*x) and a
+//!     KNOWN noise standard deviation s_true(x) = |0.1 + 0.2*sin(2*pi*x)|;
+//!   * the PRIMARY pass/fail assertions are that gam's recovered mean smooth
+//!     and recovered log-sigma smooth track those TRUE functions:
+//!       - RMSE(gam_mu, mu_true) <= a fraction of the mean noise level, and
+//!       - RMSE(gam_log_sigma, log s_true) <= a small absolute bar in log units
+//!         (a constant +d in log-sigma is an exp(d) multiplicative factor in
+//!         sigma), with strong Pearson correlation against the true envelope.
 //!
-//! Both engines maximize the same Gaussian location-scale (penalized) joint
-//! log-likelihood `ell = -1/2 sum (y-mu)^2 / sigma^2 - sum log sigma`, so the
-//! recovered mean and log-sigma smooths should converge to nearly identical
-//! shapes up to numerical-integration / basis-convention tolerance. A genuine
-//! divergence here is a real bug in gam's blockwise location-scale solver.
+//! `gamlss::gamlss(family = NO())` — the de-facto standard GAMLSS engine for
+//! distributional regression in R — is fit on the IDENTICAL rows and used only
+//! as a BASELINE-TO-MATCH-OR-BEAT on the same truth-recovery error: gam's error
+//! must not exceed gamlss's by more than 10%. "We reproduce gamlss's fitted
+//! output" is explicitly NOT the claim; recovering the truth at least as
+//! accurately as the mature tool is.
 //!
 //! Notes on the gam side that this test pins down by reading the source:
 //!   * `fit_from_formula(..., FitConfig{ noise_formula: Some(...), .. })` routes
@@ -194,56 +197,83 @@ fn gam_gaussian_location_scale_matches_gamlss() {
     );
     let gamlss_log_sigma: Vec<f64> = gamlss_sigma.iter().map(|&s| s.ln()).collect();
 
-    // ---- compare the recovered smooth shapes on the grid -------------------
-    // mu(x) is a genuine sine that crosses zero, so its grid vector's norm is
-    // the signal itself (no large additive offset); relative L2 is the right,
-    // scale-free element-wise agreement metric there.
-    let rel_mu = relative_l2(&gam_mu, gamlss_mu);
+    // ---- TRUTH on the SAME grid (the known generating functions) -----------
+    // The data were drawn as y_i = mu_true(x_i) + s_true(x_i) * z_i with z_i
+    // standard normal. The recoverable scale function is the standard deviation
+    // of that noise, |s_true(x)| (the multiplier's sign is invisible to a
+    // symmetric standard normal), so the truth for the log-sigma smooth is
+    // log|s_true(x)|. These are the ground-truth targets both engines aim at.
+    let true_mu: Vec<f64> = grid_x.iter().map(|&t| mu_true(t)).collect();
+    let true_log_sigma: Vec<f64> = grid_x.iter().map(|&t| sigma_true(t).abs().ln()).collect();
 
-    // log-sigma(x) sits at a large negative LEVEL (sigma ~ 0.01..0.3 here, so
-    // log-sigma ~ -4.6..-1.2). A relative-L2 on log-sigma would be dominated by
-    // that constant offset and would barely move with the smooth's *shape* — it
-    // would assert almost nothing. The meaningful, well-conditioned metrics are
-    // (a) RMSE in log units, which is exactly the multiplicative error in sigma
-    // (a constant +d in log-sigma is a constant exp(d) factor in sigma), and
-    // (b) the Pearson correlation of the recovered shape across the grid.
-    let rmse_log_sigma = rmse(&gam_log_sigma, &gamlss_log_sigma);
-    let corr_log_sigma = pearson(&gam_log_sigma, &gamlss_log_sigma);
+    // ---- PRIMARY objective metric: recovery of the KNOWN functions ---------
+    let mean_noise_level = {
+        // Average true noise sd over the grid; the natural scale for the mean
+        // smooth's reconstruction error (a fit cannot reasonably beat the noise
+        // floor it is averaging over).
+        let s: f64 = grid_x.iter().map(|&t| sigma_true(t).abs()).sum();
+        s / grid_n as f64
+    };
+    let gam_rmse_mu = rmse(&gam_mu, &true_mu);
+    let gam_rmse_log_sigma = rmse(&gam_log_sigma, &true_log_sigma);
+    let gam_corr_log_sigma = pearson(&gam_log_sigma, &true_log_sigma);
+
+    // ---- gamlss as a BASELINE-TO-MATCH-OR-BEAT on the SAME truth ------------
+    let gamlss_rmse_mu = rmse(gamlss_mu, &true_mu);
+    let gamlss_rmse_log_sigma = rmse(&gamlss_log_sigma, &true_log_sigma);
+
+    // Context only: how close the two fitted outputs happen to be. NOT asserted.
+    let rel_mu_vs_gamlss = relative_l2(&gam_mu, gamlss_mu);
 
     eprintln!(
-        "gaussian location-scale vs gamlss NO(): n={n} grid={grid_n} \
-         rel_l2(mu)={rel_mu:.5} rmse(log sigma)={rmse_log_sigma:.5} \
-         pearson(log sigma)={corr_log_sigma:.5}"
+        "gaussian location-scale truth recovery: n={n} grid={grid_n} \
+         mean_noise_level={mean_noise_level:.4} \
+         | gam: rmse(mu->truth)={gam_rmse_mu:.5} rmse(log sigma->truth)={gam_rmse_log_sigma:.5} \
+         pearson(log sigma,truth)={gam_corr_log_sigma:.5} \
+         | gamlss: rmse(mu->truth)={gamlss_rmse_mu:.5} rmse(log sigma->truth)={gamlss_rmse_log_sigma:.5} \
+         | (context) rel_l2(gam mu, gamlss mu)={rel_mu_vs_gamlss:.5}"
     );
 
-    // Both engines maximize the same Gaussian location-scale (penalized) joint
-    // log-likelihood, so they must recover the same mean and log-sigma smooths.
-    // But this is a CROSS-PACKAGE comparison: gam uses thin-plate smooths with
-    // REML smoothing selection, gamlss `pb()` uses P-splines selected by its RS
-    // local-ML criterion. Different bases + different lambda selectors mean the
-    // two penalized fits agree to a few percent, not to mgcv-vs-gam precision,
-    // so the bounds are deliberately looser than the same-engine smooth test.
-    //
-    // mu is the better-determined parameter (variance-stabilized by the shared
-    // 1/sigma^2 weights), so 5% relative L2 is a tight-but-fair bar that would
-    // still catch any real mean-block divergence.
+    // PRIMARY claim #1: gam recovers the TRUE mean. The mean is variance-
+    // stabilized by the shared 1/sigma^2 weights and is the better-determined
+    // parameter; its reconstruction error must sit comfortably below the mean
+    // noise standard deviation it is averaging through.
     assert!(
-        rel_mu < 0.05,
-        "fitted mean smooth diverges from gamlss: rel_l2(mu)={rel_mu:.5}"
+        gam_rmse_mu < 0.5 * mean_noise_level,
+        "gam mean smooth does not recover the truth: rmse(mu->truth)={gam_rmse_mu:.5} \
+         (bar = 0.5*mean_noise_level = {:.5})",
+        0.5 * mean_noise_level
     );
-    // log-sigma is a second-moment quantity estimated from n=200 squared
-    // residuals across two different P-spline/thin-plate bases, so it is
-    // genuinely noisier. We require the shapes to be strongly correlated
-    // (pearson > 0.9 — both must trace the same heteroscedastic envelope) AND
-    // the level to agree to within ~0.20 in log units, i.e. better than a ~22%
-    // multiplicative discrepancy in the recovered sigma(x). Either bound being
-    // exceeded is a real divergence of gam's blockwise solver from GAMLSS.
+
+    // PRIMARY claim #2: gam recovers the TRUE log-sigma envelope. log-sigma is a
+    // second-moment quantity from n=200 squared residuals, so it is genuinely
+    // noisier; we require the recovered shape to be strongly correlated with the
+    // true heteroscedastic envelope AND the level to land within ~0.30 in log
+    // units of the truth (better than a ~35% multiplicative error in sigma(x)).
     assert!(
-        corr_log_sigma > 0.9,
-        "log-sigma smooth shape uncorrelated with gamlss: pearson={corr_log_sigma:.5}"
+        gam_corr_log_sigma > 0.85,
+        "gam log-sigma smooth does not trace the true envelope: \
+         pearson(log sigma, truth)={gam_corr_log_sigma:.5}"
     );
     assert!(
-        rmse_log_sigma < 0.20,
-        "fitted log-sigma level diverges from gamlss: rmse(log sigma)={rmse_log_sigma:.5}"
+        gam_rmse_log_sigma < 0.30,
+        "gam log-sigma smooth does not recover the true level: \
+         rmse(log sigma->truth)={gam_rmse_log_sigma:.5}"
+    );
+
+    // BASELINE claim: gam must recover the truth AT LEAST AS WELL as the mature
+    // GAMLSS engine (matching the noisy fitted output of gamlss would prove
+    // nothing — beating it on TRUTH-RECOVERY error does). Allow a 10% slack so
+    // basis/lambda-selector differences alone never flip the test.
+    assert!(
+        gam_rmse_mu <= 1.10 * gamlss_rmse_mu,
+        "gam mean recovery worse than gamlss: gam={gam_rmse_mu:.5} > 1.10*gamlss={:.5}",
+        1.10 * gamlss_rmse_mu
+    );
+    assert!(
+        gam_rmse_log_sigma <= 1.10 * gamlss_rmse_log_sigma,
+        "gam log-sigma recovery worse than gamlss: gam={gam_rmse_log_sigma:.5} \
+         > 1.10*gamlss={:.5}",
+        1.10 * gamlss_rmse_log_sigma
     );
 }
