@@ -32629,6 +32629,141 @@ mod tests {
         );
     }
 
+    /// Independent reference for the order-`m` B-spline derivative coefficient
+    /// vector, coded separately from the production recurrence engine.
+    ///
+    /// Bottoms out at the plain (order-0) basis via the test-module
+    /// [`evaluate_bspline`] helper, then applies the single de-Boor derivative
+    /// step `B^{(r)}_{i,d} = d·(B^{(r-1)}_{i,d-1}/Δ_left − B^{(r-1)}_{i+1,d-1}/Δ_right)`
+    /// `m` times, peeling one order and one degree per step. Distinct code from
+    /// `evaluate_bspline_derivative_recurrence_into`, so equality is a real
+    /// cross-check rather than a tautology.
+    fn reference_bspline_derivative(
+        m: usize,
+        x: f64,
+        knots: &Array1<f64>,
+        degree: usize,
+    ) -> Vec<f64> {
+        // Support guard matches the engine: derivatives are zero outside the
+        // closed support [t_degree, t_{num_basis}].
+        let num_basis_top = knots.len() - degree - 1;
+        if num_basis_top > 0 {
+            let left = knots[degree];
+            let right = knots[num_basis_top];
+            if x < left || x > right {
+                return vec![0.0; num_basis_top];
+            }
+        }
+
+        // Order-0 (plain) basis at the base degree `degree - m`.
+        let base_degree = degree - m;
+
+        // The engine's base case is the order-1 derivative on degree
+        // `base_degree + 1`, which evaluates the plain `base_degree` basis at
+        // `one_sided_derivative_eval_point(x, knots, base_degree + 1)`. Mirror
+        // that exactly so endpoint evaluation agrees bit-for-bit.
+        let x_base = one_sided_derivative_eval_point(x, knots.view(), base_degree + 1);
+        let base_count = knots.len() - base_degree - 1;
+        let mut current: Vec<f64> = (0..base_count)
+            .map(|i| evaluate_bspline(x_base, knots, i, base_degree))
+            .collect();
+
+        // Apply `m` derivative steps, raising the degree by one each time.
+        for step in 1..=m {
+            let d = base_degree + step;
+            let count = knots.len() - d - 1;
+            let mut next = vec![0.0; count];
+            let kf = d as f64;
+            for i in 0..count {
+                let denom_left = knots[i + d] - knots[i];
+                let denom_right = knots[i + d + 1] - knots[i + 1];
+                let left = if denom_left.abs() > 1e-12 {
+                    kf * current[i] / denom_left
+                } else {
+                    0.0
+                };
+                let right = if denom_right.abs() > 1e-12 {
+                    kf * current[i + 1] / denom_right
+                } else {
+                    0.0
+                };
+                next[i] = left - right;
+            }
+            current = next;
+        }
+
+        current
+    }
+
+    /// Parity test for the unified higher-derivative engine: the public
+    /// 2nd/3rd/4th-derivative adapters must match an independently coded
+    /// reference recurrence across derivative orders, polynomial degrees, and
+    /// at the support edges (interior, both endpoints, and just outside).
+    #[test]
+    fn test_higher_derivative_engine_matches_reference() {
+        // (knots, degree) pairs spanning several degrees and knot multiplicities.
+        let cases: Vec<(Array1<f64>, usize)> = vec![
+            (array![0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0], 3),
+            (
+                array![0.0, 0.0, 0.0, 0.0, 0.25, 0.5, 0.75, 1.0, 1.0, 1.0, 1.0],
+                3,
+            ),
+            (
+                array![0.0, 0.0, 0.0, 0.0, 0.0, 0.3, 0.6, 1.0, 1.0, 1.0, 1.0, 1.0],
+                4,
+            ),
+            (
+                array![
+                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.4, 0.7, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0
+                ],
+                5,
+            ),
+        ];
+
+        for (knots, degree) in &cases {
+            let degree = *degree;
+            let num_basis = knots.len() - degree - 1;
+            let left = knots[degree];
+            let right = knots[num_basis];
+            // Interior points plus exact endpoints and just-outside-support points.
+            let xs = [
+                left - 1e-3,
+                left,
+                left + 1e-6,
+                0.5 * (left + right),
+                0.13 * left + 0.87 * right,
+                right - 1e-6,
+                right,
+                right + 1e-3,
+            ];
+
+            for m in 2..=degree.min(4) {
+                let dispatch = |x: f64, out: &mut [f64]| match m {
+                    2 => evaluate_bsplinesecond_derivative_scalar(x, knots.view(), degree, out),
+                    3 => evaluate_bsplinethird_derivative_scalar(x, knots.view(), degree, out),
+                    4 => evaluate_bspline_fourth_derivative_scalar(x, knots.view(), degree, out),
+                    _ => unreachable!("only orders 2..=4 are dispatched"),
+                };
+
+                for &x in &xs {
+                    let mut got = vec![0.0; num_basis];
+                    dispatch(x, &mut got).expect("engine derivative should succeed");
+                    let want = reference_bspline_derivative(m, x, knots, degree);
+                    assert_eq!(want.len(), got.len());
+                    for j in 0..num_basis {
+                        assert!(
+                            (got[j] - want[j]).abs() <= 1e-9,
+                            "order-{m} derivative mismatch at x={x}, degree={degree}, basis {j}: \
+                             engine={}, reference={}",
+                            got[j],
+                            want[j]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_sparsesecond_derivative_matches_scalar() {
         let knots = array![0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0];

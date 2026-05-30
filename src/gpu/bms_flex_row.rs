@@ -3814,6 +3814,174 @@ mod tests {
         }
     }
 
+    /// Parity for the third launch mode — device-output HVP
+    /// ([`launch_bms_flex_row_hvp_into_device`]) — which the
+    /// `run_bms_flex_row_partial_reduce` unification routes through the same
+    /// partial+reduce engine as the host-returning `_hvp` / `_diagonal`
+    /// adapters. Confirms that keeping the result on-stream (no internal sync /
+    /// DtoH) reaches bit-identical output to both the CPU oracle and the
+    /// host-out adapter, so the engine's mode/output split is faithful.
+    ///
+    /// Skips cleanly on non-Linux / no-CUDA hosts using the convention shared
+    /// with the sibling parity tests.
+    #[test]
+    fn bms_flex_row_hvp_into_device_matches_cpu_oracle_and_host_out() {
+        #[cfg(not(target_os = "linux"))]
+        {
+            eprintln!(
+                "[bms_flex_row hvp_into_device parity] non-Linux host — skipping \
+                 CUDA parity (CPU oracle exercised by sibling tests)"
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+                eprintln!(
+                    "[bms_flex_row hvp_into_device parity] no CUDA runtime — \
+                     skipping device parity"
+                );
+                return;
+            };
+            let n = 4_usize;
+            let r = 4_usize;
+            let p_m = 2_usize;
+            let p_g = 2_usize;
+            let p_h_dim = 1_usize;
+            let p_w_dim = 1_usize;
+            let p_total = p_m + p_g + p_h_dim + p_w_dim;
+            let block = BmsFlexBlockLayout {
+                p_m,
+                p_g,
+                h: Some(p_m + p_g..p_m + p_g + p_h_dim),
+                w: Some(p_m + p_g + p_h_dim..p_m + p_g + p_h_dim + p_w_dim),
+                p_total,
+            };
+            let primary = BmsFlexPrimaryLayout {
+                h: Some(2..3),
+                w: Some(3..4),
+                r,
+            };
+            let mut row_hessians = vec![0.0_f64; n * r * r];
+            for row in 0..n {
+                for u in 0..r {
+                    for v in u..r {
+                        let val = ((row + 1) as f64) * (1.0 + (u as f64) + 2.0 * (v as f64));
+                        row_hessians[row * r * r + u * r + v] = val;
+                        row_hessians[row * r * r + v * r + u] = val;
+                    }
+                }
+            }
+            let mut marginal = vec![0.0_f64; n * p_m];
+            for row in 0..n {
+                for j in 0..p_m {
+                    marginal[row * p_m + j] = 0.5 + (row as f64) * 0.1 - (j as f64) * 0.2;
+                }
+            }
+            let mut logslope = vec![0.0_f64; n * p_g];
+            for row in 0..n {
+                for j in 0..p_g {
+                    logslope[row * p_g + j] = -0.3 + (row as f64) * 0.05 + (j as f64) * 0.15;
+                }
+            }
+            let v: Vec<f64> = (0..p_total).map(|i| 0.1 + (i as f64) * 0.25).collect();
+            let cpu_hvp = cpu_oracle_bms_flex_row_hvp(
+                &row_hessians,
+                &marginal,
+                &logslope,
+                &block,
+                &primary,
+                n,
+                &v,
+            );
+
+            let backend = match HvpKernelBackend::probe() {
+                Ok(b) => b,
+                Err(err) => {
+                    eprintln!(
+                        "[bms_flex_row hvp_into_device parity] backend probe \
+                         failed: {err}"
+                    );
+                    return;
+                }
+            };
+            let stream = backend.stream.clone();
+            let d_h = match stream.clone_htod(&row_hessians) {
+                Ok(s) => s,
+                Err(err) => {
+                    eprintln!("[bms_flex_row hvp_into_device parity] upload h failed: {err}");
+                    return;
+                }
+            };
+            let d_m = match stream.clone_htod(&marginal) {
+                Ok(s) => s,
+                Err(err) => {
+                    eprintln!("[bms_flex_row hvp_into_device parity] upload marg failed: {err}");
+                    return;
+                }
+            };
+            let d_g = match stream.clone_htod(&logslope) {
+                Ok(s) => s,
+                Err(err) => {
+                    eprintln!("[bms_flex_row hvp_into_device parity] upload logslope failed: {err}");
+                    return;
+                }
+            };
+            let storage = DeviceResidentRowHess {
+                hess: d_h,
+                marginal_design: d_m,
+                logslope_design: d_g,
+                n,
+                r,
+                block: block.clone(),
+                primary: primary.clone(),
+
+                bytes: ((n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>()) as u64,
+            };
+
+            // Host-out adapter (allocates its own d_out, syncs + downloads).
+            let host_out_hvp = launch_bms_flex_row_hvp(&storage, &v)
+                .expect("host-out HVP kernel must launch on CUDA host");
+
+            // Device-out adapter: caller owns d_v + d_out; the engine performs
+            // no sync / DtoH, so we synchronize + download here.
+            let d_v = stream
+                .clone_htod(&v)
+                .expect("upload direction for device-out HVP");
+            let mut d_out = stream
+                .alloc_zeros::<f64>(p_total)
+                .expect("alloc device-out HVP output");
+            launch_bms_flex_row_hvp_into_device(&storage, &d_v, &mut d_out)
+                .expect("device-out HVP kernel must launch on CUDA host");
+            stream
+                .synchronize()
+                .expect("synchronize after device-out HVP");
+            let device_out_hvp = stream
+                .clone_dtoh(&d_out)
+                .expect("download device-out HVP output");
+
+            assert_eq!(device_out_hvp.len(), cpu_hvp.len());
+            assert_eq!(device_out_hvp.len(), host_out_hvp.len());
+            for i in 0..p_total {
+                let diff = (cpu_hvp[i] - device_out_hvp[i]).abs();
+                assert!(
+                    diff <= 1e-10,
+                    "device-out HVP[{i}] vs CPU: cpu={} gpu={} |Δ|={diff:.3e}",
+                    cpu_hvp[i],
+                    device_out_hvp[i]
+                );
+                // Both adapters share the engine; the only difference is the
+                // copy-back path, so they must be bit-identical.
+                let host_diff = (host_out_hvp[i] - device_out_hvp[i]).abs();
+                assert!(
+                    host_diff == 0.0,
+                    "device-out vs host-out HVP[{i}]: host={} device={} |Δ|={host_diff:.3e}",
+                    host_out_hvp[i],
+                    device_out_hvp[i]
+                );
+            }
+        }
+    }
+
     /// Block 9 Phase 2 parity gate at the shape specified by the
     /// charter task: `n = 64`, `r = 20`, `p_total = 44`. Splits
     /// `p_total` as `p_m = 14`, `p_g = 12`, `p_h = 10`, `p_w = 8` so

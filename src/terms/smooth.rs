@@ -11045,137 +11045,17 @@ impl SpatialAdaptiveExactFamily {
         hyper: SpatialAdaptiveHyperSpec,
     ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
         match hyper.kind {
-            SpatialAdaptiveHyperKind::LogLambdaMagnitude => {
-                let (mut beta_mixed, mut betahessian) = self.zero_hyper_parts();
-                let cache = self.runtime_caches.get(hyper.cache_index).ok_or_else(|| {
-                    format!("adaptive cache index {} out of bounds", hyper.cache_index)
-                })?;
-                let params = self.adaptive_params.get(hyper.cache_index).ok_or_else(|| {
-                    format!(
-                        "adaptive hyperparameter block {} out of bounds",
-                        hyper.cache_index
-                    )
-                })?;
-                let state = eval.adaptive_states.get(hyper.cache_index).ok_or_else(|| {
-                    format!(
-                        "adaptive exact state index {} out of bounds",
-                        hyper.cache_index
-                    )
-                })?;
-                let lambda = params.lambda[0];
-                let beta_mixed_local = lambda
-                    * scalar_operatorgradient(&cache.d0, &state.magnitude.betagradient_coeff());
-                let betahessian_local =
-                    lambda * scalar_operatorhessian(&cache.d0, &state.magnitude.betahessian_diag());
-                beta_mixed
-                    .slice_mut(s![cache.coeff_global_range.clone()])
-                    .assign(&beta_mixed_local);
-                betahessian
-                    .slice_mut(s![
-                        cache.coeff_global_range.clone(),
-                        cache.coeff_global_range.clone()
-                    ])
-                    .assign(&betahessian_local);
-                Ok((
-                    lambda * state.magnitude.penalty_value(),
-                    beta_mixed,
-                    betahessian,
-                ))
-            }
-            SpatialAdaptiveHyperKind::LogLambdaGradient => {
-                let (mut beta_mixed, mut betahessian) = self.zero_hyper_parts();
-                let cache = self.runtime_caches.get(hyper.cache_index).ok_or_else(|| {
-                    format!("adaptive cache index {} out of bounds", hyper.cache_index)
-                })?;
-                let params = self.adaptive_params.get(hyper.cache_index).ok_or_else(|| {
-                    format!(
-                        "adaptive hyperparameter block {} out of bounds",
-                        hyper.cache_index
-                    )
-                })?;
-                let state = eval.adaptive_states.get(hyper.cache_index).ok_or_else(|| {
-                    format!(
-                        "adaptive exact state index {} out of bounds",
-                        hyper.cache_index
-                    )
-                })?;
-                let lambda = params.lambda[1];
-                let beta_mixed_local = lambda
-                    * grouped_operatorgradient(
-                        &cache.d1,
-                        cache.dimension,
-                        &state.gradient.betagradient_blocks(),
-                    )
-                    .map_err(|e| e.to_string())?;
-                let betahessian_local = lambda
-                    * grouped_operatorhessian(
-                        &cache.d1,
-                        cache.dimension,
-                        &state.gradient.betahessian_blocks(),
-                    )
-                    .map_err(|e| e.to_string())?;
-                beta_mixed
-                    .slice_mut(s![cache.coeff_global_range.clone()])
-                    .assign(&beta_mixed_local);
-                betahessian
-                    .slice_mut(s![
-                        cache.coeff_global_range.clone(),
-                        cache.coeff_global_range.clone()
-                    ])
-                    .assign(&betahessian_local);
-                Ok((
-                    lambda * state.gradient.penalty_value(),
-                    beta_mixed,
-                    betahessian,
-                ))
-            }
-            SpatialAdaptiveHyperKind::LogLambdaCurvature => {
-                let (mut beta_mixed, mut betahessian) = self.zero_hyper_parts();
-                let cache = self.runtime_caches.get(hyper.cache_index).ok_or_else(|| {
-                    format!("adaptive cache index {} out of bounds", hyper.cache_index)
-                })?;
-                let params = self.adaptive_params.get(hyper.cache_index).ok_or_else(|| {
-                    format!(
-                        "adaptive hyperparameter block {} out of bounds",
-                        hyper.cache_index
-                    )
-                })?;
-                let state = eval.adaptive_states.get(hyper.cache_index).ok_or_else(|| {
-                    format!(
-                        "adaptive exact state index {} out of bounds",
-                        hyper.cache_index
-                    )
-                })?;
-                let lambda = params.lambda[2];
-                let beta_mixed_local = lambda
-                    * grouped_operatorgradient(
-                        &cache.d2,
-                        cache.dimension * cache.dimension,
-                        &state.curvature.betagradient_blocks(),
-                    )
-                    .map_err(|e| e.to_string())?;
-                let betahessian_local = lambda
-                    * grouped_operatorhessian(
-                        &cache.d2,
-                        cache.dimension * cache.dimension,
-                        &state.curvature.betahessian_blocks(),
-                    )
-                    .map_err(|e| e.to_string())?;
-                beta_mixed
-                    .slice_mut(s![cache.coeff_global_range.clone()])
-                    .assign(&beta_mixed_local);
-                betahessian
-                    .slice_mut(s![
-                        cache.coeff_global_range.clone(),
-                        cache.coeff_global_range.clone()
-                    ])
-                    .assign(&betahessian_local);
-                Ok((
-                    lambda * state.curvature.penalty_value(),
-                    beta_mixed,
-                    betahessian,
-                ))
-            }
+            // Per-term `log lambda` (rho) hyper-derivative: the bare penalty
+            // pieces for this cache's selected component.
+            SpatialAdaptiveHyperKind::LogLambdaMagnitude
+            | SpatialAdaptiveHyperKind::LogLambdaGradient
+            | SpatialAdaptiveHyperKind::LogLambdaCurvature => self.adaptive_block_eval(
+                eval,
+                hyper.cache_index,
+                AdaptiveComponent::from_index(hyper.component_index())?,
+                HyperDerivativeKind::Rho,
+            ),
+            // Shared `log epsilon` hyper-derivative: summed across all terms.
             SpatialAdaptiveHyperKind::LogEpsilonMagnitude
             | SpatialAdaptiveHyperKind::LogEpsilonGradient
             | SpatialAdaptiveHyperKind::LogEpsilonCurvature => {
@@ -11615,10 +11495,11 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
         let drift = match hyper.kind {
             SpatialAdaptiveHyperKind::LogLambdaMagnitude
             | SpatialAdaptiveHyperKind::LogLambdaGradient
-            | SpatialAdaptiveHyperKind::LogLambdaCurvature => self.adaptive_block_drift(
+            | SpatialAdaptiveHyperKind::LogLambdaCurvature => self.adaptive_block_drift_eval(
                 &eval,
                 hyper.cache_index,
-                hyper.kind.component_index(),
+                AdaptiveComponent::from_index(hyper.kind.component_index())?,
+                HyperDriftKind::Rho,
                 direction,
             )?,
             SpatialAdaptiveHyperKind::LogEpsilonMagnitude
@@ -27249,6 +27130,346 @@ mod tests {
             eta_mass.explicit_second_order_kind(eta_grad),
             SpatialAdaptiveExplicitSecondOrderKind::StructuralZero
         );
+    }
+
+    /// Parity test for the unified adaptive hyper-derivative dispatch (issue
+    /// #426). The unified `adaptive_block_eval` / `adaptive_block_drift_eval`
+    /// engines must reproduce, bit-for-bit, the per-(component, derivative-kind)
+    /// pieces that the previous hand-rolled `adaptive_block_*` /
+    /// `adaptive_block_*_drift` functions assembled. The right-hand reference
+    /// below is the same closed-form composition those duplicated functions
+    /// performed: pick the matching state accessor, run it through the matching
+    /// scalar / grouped operator with the component weight, and embed into the
+    /// global coordinate range. Equality is exact (both sides call the identical
+    /// accessors and operators), so the bound is a true `==`.
+    #[test]
+    fn adaptive_hyper_derivative_dispatch_matches_reference() {
+        let n = 40usize;
+        let mut data = Array2::<f64>::zeros((n, 1));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let x = i as f64 / (n as f64 - 1.0);
+            data[[i, 0]] = x;
+            y[i] = 0.3 * (2.0 * std::f64::consts::PI * x).sin()
+                + 1.1 / (1.0 + (-(x - 0.5) / 0.02).exp());
+        }
+
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "duchon".to_string(),
+                basis: SmoothBasisSpec::Duchon {
+                    feature_cols: vec![0],
+                    spec: DuchonBasisSpec {
+                        periodic: None,
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 15 },
+                        length_scale: Some(0.9),
+                        power: 2.0,
+                        nullspace_order: DuchonNullspaceOrder::Linear,
+                        identifiability: SpatialIdentifiability::default(),
+                        aniso_log_scales: None,
+                        operator_penalties: DuchonOperatorPenaltySpec::default(),
+                        boundary: OneDimensionalBoundary::Open,
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+                joint_null_rotation: None,
+            }],
+        };
+        let baseline = fit_term_collection_forspec(
+            data.view(),
+            y.view(),
+            Array1::ones(n).view(),
+            Array1::zeros(n).view(),
+            &spec,
+            LikelihoodSpec::gaussian_identity(),
+            &FitOptions {
+                max_iter: 20,
+                penalty_shrinkage_floor: None,
+                ..FitOptions::default()
+            },
+        )
+        .expect("baseline fit");
+        let runtime_caches = extract_spatial_operator_runtime_caches(&spec, &baseline.design)
+            .expect("runtime caches");
+        assert_eq!(runtime_caches.len(), 1);
+        let (eps_0, eps_g, eps_c) =
+            compute_initial_epsilons(&baseline.fit.beta, &runtime_caches, 1e-8)
+                .expect("initial epsilons");
+        let hyperspecs = build_spatial_adaptive_hyperspecs(runtime_caches.len());
+        let p = baseline.design.design.ncols();
+
+        let family = SpatialAdaptiveExactFamily {
+            family: LikelihoodSpec::gaussian_identity(),
+            latent_cloglog_state: None,
+            mixture_link_state: None,
+            sas_link_state: None,
+            y: Arc::new(y.clone()),
+            weights: Arc::new(Array1::ones(n)),
+            design: baseline.design.design.to_dense_arc(),
+            offset: Arc::new(Array1::zeros(n)),
+            linear_constraints: baseline.design.linear_constraints.clone(),
+            runtime_caches: Arc::new(runtime_caches.clone()),
+            adaptive_params: vec![SpatialAdaptiveTermHyperParams {
+                lambda: [0.7, 1.3, 0.4],
+                epsilon: [eps_0, eps_g, eps_c],
+            }],
+            fixed_quadratichessian: Arc::new(Array2::<f64>::zeros((p, p))),
+            hyperspecs: Arc::new(hyperspecs),
+            exact_eval_cache: Arc::new(Mutex::new(None)),
+        };
+
+        let beta = baseline.fit.beta.clone();
+        let eval = family.exact_evaluation(&beta).expect("exact evaluation");
+        let cache = &family.runtime_caches[0];
+        let params = &family.adaptive_params[0];
+        let state = &eval.adaptive_states[0];
+        let range = cache.coeff_global_range.clone();
+
+        // Independent reference assembly for one (component, kind) parts triple.
+        let reference_parts =
+            |component: AdaptiveComponent,
+             kind: HyperDerivativeKind|
+             -> (f64, Array1<f64>, Array2<f64>) {
+                let (objective, grad_local, hess_local) = match component {
+                    AdaptiveComponent::Magnitude => {
+                        let lambda = params.lambda[0];
+                        let mag = &state.magnitude;
+                        let (obj, gc, hd) = match kind {
+                            HyperDerivativeKind::Rho => (
+                                mag.penalty_value(),
+                                mag.betagradient_coeff(),
+                                mag.betahessian_diag(),
+                            ),
+                            HyperDerivativeKind::LogEpsilonFirst => (
+                                mag.log_epsilon_gradient_terms().sum(),
+                                mag.log_epsilon_betagradient_coeff(),
+                                mag.log_epsilon_betahessian_diag(),
+                            ),
+                            HyperDerivativeKind::LogEpsilonSecond => (
+                                mag.log_epsilon_hessian_terms().sum(),
+                                mag.log_epsilon_beta_mixed_second_coeff(),
+                                mag.log_epsilon_betahessian_second_diag(),
+                            ),
+                        };
+                        (
+                            lambda * obj,
+                            lambda * scalar_operatorgradient(&cache.d0, &gc),
+                            lambda * scalar_operatorhessian(&cache.d0, &hd),
+                        )
+                    }
+                    AdaptiveComponent::Gradient => {
+                        let lambda = params.lambda[1];
+                        let grad = &state.gradient;
+                        let (obj, gb, hb) = match kind {
+                            HyperDerivativeKind::Rho => (
+                                grad.penalty_value(),
+                                grad.betagradient_blocks(),
+                                grad.betahessian_blocks(),
+                            ),
+                            HyperDerivativeKind::LogEpsilonFirst => (
+                                grad.log_epsilon_gradient_terms().sum(),
+                                grad.log_epsilon_betagradient_blocks(),
+                                grad.log_epsilon_betahessian_blocks(),
+                            ),
+                            HyperDerivativeKind::LogEpsilonSecond => (
+                                grad.log_epsilon_hessian_terms().sum(),
+                                grad.log_epsilon_beta_mixed_second_blocks(),
+                                grad.log_epsilon_betahessian_second_blocks(),
+                            ),
+                        };
+                        (
+                            lambda * obj,
+                            lambda
+                                * grouped_operatorgradient(&cache.d1, cache.dimension, &gb)
+                                    .expect("grouped gradient"),
+                            lambda
+                                * grouped_operatorhessian(&cache.d1, cache.dimension, &hb)
+                                    .expect("grouped hessian"),
+                        )
+                    }
+                    AdaptiveComponent::Curvature => {
+                        let lambda = params.lambda[2];
+                        let group = cache.dimension * cache.dimension;
+                        let curv = &state.curvature;
+                        let (obj, gb, hb) = match kind {
+                            HyperDerivativeKind::Rho => (
+                                curv.penalty_value(),
+                                curv.betagradient_blocks(),
+                                curv.betahessian_blocks(),
+                            ),
+                            HyperDerivativeKind::LogEpsilonFirst => (
+                                curv.log_epsilon_gradient_terms().sum(),
+                                curv.log_epsilon_betagradient_blocks(),
+                                curv.log_epsilon_betahessian_blocks(),
+                            ),
+                            HyperDerivativeKind::LogEpsilonSecond => (
+                                curv.log_epsilon_hessian_terms().sum(),
+                                curv.log_epsilon_beta_mixed_second_blocks(),
+                                curv.log_epsilon_betahessian_second_blocks(),
+                            ),
+                        };
+                        (
+                            lambda * obj,
+                            lambda
+                                * grouped_operatorgradient(&cache.d2, group, &gb)
+                                    .expect("grouped gradient"),
+                            lambda
+                                * grouped_operatorhessian(&cache.d2, group, &hb)
+                                    .expect("grouped hessian"),
+                        )
+                    }
+                };
+                let mut grad = Array1::<f64>::zeros(p);
+                grad.slice_mut(s![range.clone()]).assign(&grad_local);
+                let mut hess = Array2::<f64>::zeros((p, p));
+                hess.slice_mut(s![range.clone(), range.clone()])
+                    .assign(&hess_local);
+                (objective, grad, hess)
+            };
+
+        let components = [
+            AdaptiveComponent::Magnitude,
+            AdaptiveComponent::Gradient,
+            AdaptiveComponent::Curvature,
+        ];
+        let kinds = [
+            HyperDerivativeKind::Rho,
+            HyperDerivativeKind::LogEpsilonFirst,
+            HyperDerivativeKind::LogEpsilonSecond,
+        ];
+
+        for &component in &components {
+            for &kind in &kinds {
+                let (obj_new, grad_new, hess_new) = family
+                    .adaptive_block_eval(&eval, 0, component, kind)
+                    .expect("unified block eval");
+                let (obj_ref, grad_ref, hess_ref) = reference_parts(component, kind);
+                assert_eq!(
+                    obj_new, obj_ref,
+                    "objective mismatch for {component:?}/{kind:?}"
+                );
+                assert_eq!(grad_new, grad_ref, "gradient mismatch for {component:?}/{kind:?}");
+                assert_eq!(hess_new, hess_ref, "hessian mismatch for {component:?}/{kind:?}");
+            }
+        }
+
+        // Directional-drift parity: independent reference per (component, drift).
+        let direction = {
+            let mut d = Array1::<f64>::zeros(p);
+            for (i, v) in d.iter_mut().enumerate() {
+                *v = 0.05 + 0.01 * (i as f64);
+            }
+            d
+        };
+        let reference_drift = |component: AdaptiveComponent, drift: HyperDriftKind| -> Array2<f64> {
+            let direction_local = direction.slice(s![range.clone()]);
+            let local = match component {
+                AdaptiveComponent::Magnitude => {
+                    let d0_u = cache.d0.dot(&direction_local);
+                    let mag = &state.magnitude;
+                    let diag = match drift {
+                        HyperDriftKind::Rho => mag.directionalhessian_diag(&d0_u),
+                        HyperDriftKind::LogEpsilon => {
+                            mag.log_epsilon_betahessian_directional_diag(&d0_u)
+                        }
+                    };
+                    params.lambda[0] * scalar_operatorhessian(&cache.d0, &diag)
+                }
+                AdaptiveComponent::Gradient => {
+                    let d1_u = cache.d1.dot(&direction_local);
+                    let blocks_in = collocationgradient_blocks(&d1_u, cache.dimension)
+                        .expect("collocation gradient blocks");
+                    let grad = &state.gradient;
+                    let blocks = match drift {
+                        HyperDriftKind::Rho => grad.directionalhessian_blocks(&blocks_in),
+                        HyperDriftKind::LogEpsilon => {
+                            grad.log_epsilon_betahessian_directional_blocks(&blocks_in)
+                        }
+                    };
+                    params.lambda[1]
+                        * grouped_operatorhessian(&cache.d1, cache.dimension, &blocks)
+                            .expect("grouped hessian")
+                }
+                AdaptiveComponent::Curvature => {
+                    let group = cache.dimension * cache.dimension;
+                    let d2_u = cache.d2.dot(&direction_local);
+                    let blocks_in = collocationhessian_blocks(&d2_u, cache.dimension)
+                        .expect("collocation hessian blocks");
+                    let curv = &state.curvature;
+                    let blocks = match drift {
+                        HyperDriftKind::Rho => curv.directionalhessian_blocks(&blocks_in),
+                        HyperDriftKind::LogEpsilon => {
+                            curv.log_epsilon_betahessian_directional_blocks(&blocks_in)
+                        }
+                    };
+                    params.lambda[2]
+                        * grouped_operatorhessian(&cache.d2, group, &blocks)
+                            .expect("grouped hessian")
+                }
+            };
+            let mut out = Array2::<f64>::zeros((p, p));
+            out.slice_mut(s![range.clone(), range.clone()]).assign(&local);
+            out
+        };
+
+        for &component in &components {
+            for &drift in &[HyperDriftKind::Rho, HyperDriftKind::LogEpsilon] {
+                let drift_new = family
+                    .adaptive_block_drift_eval(&eval, 0, component, drift, &direction)
+                    .expect("unified block drift eval");
+                let drift_ref = reference_drift(component, drift);
+                assert_eq!(
+                    drift_new, drift_ref,
+                    "drift mismatch for {component:?}/{drift:?}"
+                );
+            }
+        }
+
+        // Dispatch-surface parity: the public entry points must route to the
+        // same engine output. `adaptive_hyper_parts` on a per-term `log lambda`
+        // spec equals the `Rho` block eval; on a shared `log epsilon` spec it
+        // equals the summed `LogEpsilonFirst` blocks.
+        for (kind, component) in [
+            (SpatialAdaptiveHyperKind::LogLambdaMagnitude, AdaptiveComponent::Magnitude),
+            (SpatialAdaptiveHyperKind::LogLambdaGradient, AdaptiveComponent::Gradient),
+            (SpatialAdaptiveHyperKind::LogLambdaCurvature, AdaptiveComponent::Curvature),
+        ] {
+            let hyper = SpatialAdaptiveHyperSpec {
+                cache_index: 0,
+                kind,
+            };
+            let (obj_disp, grad_disp, hess_disp) = family
+                .adaptive_hyper_parts(&eval, hyper)
+                .expect("hyper parts");
+            let (obj_ref, grad_ref, hess_ref) = reference_parts(component, HyperDerivativeKind::Rho);
+            assert_eq!(obj_disp, obj_ref);
+            assert_eq!(grad_disp, grad_ref);
+            assert_eq!(hess_disp, hess_ref);
+        }
+
+        for (kind, component) in [
+            (SpatialAdaptiveHyperKind::LogEpsilonMagnitude, AdaptiveComponent::Magnitude),
+            (SpatialAdaptiveHyperKind::LogEpsilonGradient, AdaptiveComponent::Gradient),
+            (SpatialAdaptiveHyperKind::LogEpsilonCurvature, AdaptiveComponent::Curvature),
+        ] {
+            let hyper = SpatialAdaptiveHyperSpec {
+                cache_index: 0,
+                kind,
+            };
+            // Single cache, so the shared sum equals the single block's
+            // first-order `log epsilon` eval.
+            let (obj_disp, grad_disp, hess_disp) = family
+                .adaptive_hyper_parts(&eval, hyper)
+                .expect("hyper parts");
+            let (obj_ref, grad_ref, hess_ref) =
+                reference_parts(component, HyperDerivativeKind::LogEpsilonFirst);
+            assert_eq!(obj_disp, obj_ref);
+            assert_eq!(grad_disp, grad_ref);
+            assert_eq!(hess_disp, hess_ref);
+        }
     }
 
     #[test]
