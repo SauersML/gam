@@ -21,9 +21,11 @@
 //!   2. fitted means are near-identical (Pearson ≥ 0.9999), and
 //!   3. the Poisson deviance agrees within 2%.
 //!
-//! The deviance is recomputed from the fitted means via the standard GLM
-//! formula `D = 2·Σ[y·log(y/μ) − (y−μ)]` on both sides, so the comparison is
-//! independent of gam's internal `-2ℓ` bookkeeping convention.
+//! The gam-side deviance is recomputed from the fitted means via the standard
+//! GLM formula `D = 2·Σ[y·log(y/μ) − (y−μ)]`, and statsmodels reports its own
+//! `res.deviance`, which uses that identical Poisson deviance definition. The
+//! comparison is therefore independent of gam's internal `-2ℓ` bookkeeping
+//! convention.
 
 use gam::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, FamilyEvaluation, ParameterBlockSpec,
