@@ -101,7 +101,7 @@ fn empirical_coverage(lo: &[f64], hi: &[f64], truth: &[f64]) -> f64 {
         .iter()
         .zip(hi.iter())
         .zip(truth.iter())
-        .filter(|((&l, &h), &t)| t >= l && t <= h)
+        .filter(|((l, h), t)| t >= l && t <= h)
         .count();
     hits as f64 / lo.len().max(1) as f64
 }

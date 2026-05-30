@@ -177,8 +177,10 @@ fn gam_sleepstudy_random_slope_forecasts_held_out_days_vs_lme4() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("Reaction ~ fs(Days, Subject)", &ds, &cfg)
-        .expect("gam factor-smooth fit on sleepstudy");
+    // Use the explicit `s(.., bs="fs")` factor-smooth form proven by the
+    // synthetic factor-smooth test (the `fs(..)` shorthand was not accepted here).
+    let result = fit_from_formula("Reaction ~ s(Days, Subject, bs=\"fs\")", &ds, &cfg)
+        .unwrap_or_else(|e| panic!("gam factor-smooth fit on sleepstudy: {e:?}"));
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for a gaussian factor-smooth");
     };
