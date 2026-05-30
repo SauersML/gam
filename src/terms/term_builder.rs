@@ -2503,7 +2503,10 @@ pub fn parse_duchon_order(
     options: &BTreeMap<String, String>,
 ) -> Result<DuchonNullspaceOrder, String> {
     match options.get("order") {
-        None => Ok(DuchonNullspaceOrder::Zero),
+        // Structural cubic Duchon is affine-by-default: an unspecified order is
+        // the `Linear` (constant + linear) null space, matching the magic
+        // default. An explicit `order=0` still selects the constant-only space.
+        None => Ok(DuchonNullspaceOrder::Linear),
         Some(raw) => match raw.parse::<usize>() {
             Ok(0) => Ok(DuchonNullspaceOrder::Zero),
             Ok(1) => Ok(DuchonNullspaceOrder::Linear),

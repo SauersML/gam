@@ -13054,7 +13054,7 @@ mod tests {
         let options = BTreeMap::new();
         assert_eq!(
             parse_duchon_order(&options).expect("default Duchon order"),
-            DuchonNullspaceOrder::Zero
+            DuchonNullspaceOrder::Linear
         );
 
         let mut linear = BTreeMap::new();
