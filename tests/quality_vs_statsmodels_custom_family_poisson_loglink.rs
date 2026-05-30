@@ -283,7 +283,6 @@ fn custom_poisson_identity_link_recovers_truth_and_predicts() {
     // gam predictions: identity link ⇒ μ̂ = X·β.
     let mu_gam_full: Vec<f64> = xmat_full.dot(&beta_gam_arr).to_vec();
     let mu_gam_test: Vec<f64> = xmat_test.dot(&beta_gam_arr).to_vec();
-    let mu_true_test: Vec<f64> = test_idx.iter().map(|&i| mu_true[i]).collect();
 
     // OBJECTIVE metric 1: held-out mean Poisson deviance on gam's own preds.
     let dev_gam_test = mean_poisson_deviance(&y_test, &mu_gam_test);
