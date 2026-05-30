@@ -204,7 +204,7 @@ fn gam_solar_zenith_cylinder_predicts_heldout_and_closes_seam() {
             pts[[r, time_idx]] = times[r];
         }
         let d = build_term_collection_design(pts.view(), &fit.resolvedspec)
-            .expect("rebuild solar-zenith cylinder design");
+            .unwrap_or_else(|e| panic!("rebuild solar-zenith cylinder design: {e:?}"));
         d.design.apply(&fit.fit.beta).to_vec()
     };
 
