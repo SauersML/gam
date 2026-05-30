@@ -13,8 +13,10 @@ fn bug_term_builder_duchon_defaults_and_rejection() {
     let empty = BTreeMap::<String, String>::new();
     assert_eq!(
         parse_duchon_power(&empty).expect("default duchon power should parse"),
-        2,
-        "Duchon power with no explicit option should default to 2."
+        1.5,
+        "Duchon power with no explicit option should default to the cubic-rule \
+         spectral placeholder 1.5 (the f64 parser-level default; the dimension-aware \
+         (d-1)/2 resolution happens later in build_smooth_basis)."
     );
     assert_eq!(
         parse_duchon_order(&empty).expect("default duchon order should parse"),
