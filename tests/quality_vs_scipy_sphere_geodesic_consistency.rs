@@ -2,26 +2,37 @@
 //! the great-circle (geodesic) metric of the sphere, not the R³ chordal/Euclidean
 //! metric of the embedding.
 //!
-//! Ground truth for great-circle distance is computed with NumPy/SciPy on the
-//! exact unit-sphere central angle `d_geod(p,q) = arccos(p·q)` — the definitional
-//! geodesic distance on S², which is exactly what `scipy.spatial.distance` /
-//! sklearn's `haversine_distances` return for unit vectors (haversine and the
-//! arccos-of-dot-product formula agree to round-off for the central angle). We
-//! cross-check the two formulas inside the Python body so the "ground truth" is
-//! itself verified, then export the pairwise geodesic distances. We additionally
-//! fit `mgcv`'s spline-on-sphere (`bs="sos"`) as the closest mature comparator and
-//! confirm it satisfies the *same* geodesic-consistency property (by design),
-//! making it a meaningful secondary baseline.
+//! Ground truth for the great-circle distance-to-pole is computed with
+//! NumPy/SciPy via the classic haversine great-circle formula, cross-checked in
+//! the Python body against both the arccos-of-dot-product central angle
+//! `d_geod(p,q) = arccos(p·q)` and the analytic colatitude `π/2 − lat`, so the
+//! exported "ground truth" is itself verified three independent ways before gam
+//! is judged against it. We additionally fit `mgcv`'s spline-on-sphere
+//! (`bs="sos"`) as the closest mature comparator and confirm it reconstructs the
+//! same geodesic surface (it is geodesic-consistent by construction), making it a
+//! meaningful secondary baseline.
 //!
 //! The intrinsic correctness property: fit `y ~ sphere(lat, lon, k=20)` on noisy
 //! samples of a radially-symmetric truth `f(p) = exp(-d_geod(p, pole)/bandwidth)`,
-//! evaluate the fitted surface at a set of probe points, and measure how the
-//! *fitted-function distance* `|f_gam(p) - f_gam(q)|` relates to the *geodesic
-//! distance* `d_geod(p,q)`. Because the truth is monotone in geodesic distance to
-//! the pole, a metric-respecting smooth produces fitted differences that are
-//! strongly (positively) correlated with geodesic separation. If gam's sphere
-//! kernel were accidentally keyed on Euclidean R³ distance (or on raw lat/lon
-//! degrees) instead of the intrinsic S² geodesic, that correlation would collapse.
+//! evaluate the fitted surface at a probe grid, and test two things that a
+//! metric-respecting S² smooth must satisfy and a coordinate/chordal-confused
+//! kernel cannot:
+//!   1. RECONSTRUCTION — gam's fitted surface must track the haversine-derived
+//!      true surface `f_true` per probe point, and be monotone-decreasing in the
+//!      geodesic distance-to-pole. (We deliberately do NOT correlate the pairwise
+//!      fitted differences `|f_gam(p)−f_gam(q)|` against the pairwise geodesic
+//!      distance `d_geod(p,q)`: for a truth radial about a single point the fitted
+//!      differences track the difference of distances-TO-POLE, which even for a
+//!      perfect fit correlates only ~0.5 with the pairwise separation, so such a
+//!      bound would assert something false.)
+//!   2. ANTIMERIDIAN SEAM — two probe points at the same latitude straddling the
+//!      ±180° seam are ~10° apart geodesically but ~350° apart in raw longitude.
+//!      An intrinsic kernel gives them near-equal fitted values; a kernel keyed on
+//!      raw lat/lon degrees would see them as maximally separated. This is the
+//!      sharpest discriminator, because a single-center radial truth alone cannot
+//!      separate geodesic from chordal-R³ distance (both are monotone in the same
+//!      central angle, so any radial function of one is a near-monotone function
+//!      of the other).
 //!
 //! The sphere-smoothing tool ecosystem is fragmented — there is no integrated
 //! GAM that advertises "geodesic-consistent" fits — so the finding is twofold:
@@ -32,7 +43,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, run_python, run_r};
+use gam::test_support::reference::{Column, pearson, relative_l2, run_python, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -89,8 +100,8 @@ fn gam_sphere_smooth_is_geodesic_consistent_and_tracks_mgcv_sos() {
     let n = 50usize;
     let bandwidth = 0.8_f64; // radians; ~46° correlation length on S²
     let mut rng = StdRng::seed_from_u64(20260529);
-    let u_z = Uniform::new_inclusive(-1.0, 1.0);
-    let u_lon = Uniform::new(-180.0_f64, 180.0_f64);
+    let u_z = Uniform::new_inclusive(-1.0, 1.0).expect("uniform z");
+    let u_lon = Uniform::new(-180.0_f64, 180.0_f64).expect("uniform lon");
     let noise = Normal::new(0.0, 0.01).expect("normal");
 
     let mut lats = Vec::with_capacity(n);
@@ -150,91 +161,99 @@ fn gam_sphere_smooth_is_geodesic_consistent_and_tracks_mgcv_sos() {
     let gam_eval: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
     assert_eq!(gam_eval.len(), m, "gam eval length must match probe grid");
 
-    // ---- pairwise fitted-function distances |f_gam(p) - f_gam(q)| ----------
-    // Flatten the strictly-upper-triangular pairs in a fixed order so the gam and
-    // SciPy vectors are element-aligned by (i, j).
-    let mut gam_pair_diff = Vec::with_capacity(m * (m - 1) / 2);
-    for i in 0..m {
-        for j in (i + 1)..m {
-            gam_pair_diff.push((gam_eval[i] - gam_eval[j]).abs());
-        }
-    }
-
-    // ---- ground-truth pairwise geodesic distances via NumPy/SciPy ----------
-    // Identical probe points fed to Python. We compute the great-circle central
-    // angle two independent ways (arccos-of-dot-product and the haversine
-    // formula) and assert they agree, so the exported "ground truth" is itself
-    // verified before gam is judged against it. SciPy's distance machinery is
-    // used to form the pairwise matrix; the central-angle metric IS the geodesic
-    // distance on the unit sphere.
+    // ---- ground-truth GEODESIC distance-to-pole + true surface via SciPy ---
+    // The truth `f(p) = exp(-d_geod(p, pole) / bandwidth)` is a function of the
+    // great-circle distance from each probe point to the +z pole (lat=+90). We
+    // recompute that distance in Python with the classic haversine great-circle
+    // formula, cross-check it against the arccos-of-dot-product central angle so
+    // the exported ground truth is itself verified, then form the true surface
+    // on the probe grid. `import scipy` enforces the no-skip contract (a missing
+    // reference stack is a hard failure, not a silent pass).
+    //
+    // Why this quantity and not pairwise |f(p)-f(q)| vs pairwise d_geod(p,q):
+    // the truth is radial about ONE point, so fitted differences track the
+    // difference of distances-TO-POLE, which is only weakly (~0.5) correlated
+    // with the pairwise separation d_geod(p,q) even for a perfect fit. The
+    // quantity that actually matters is whether gam reconstructs the geodesic
+    // surface itself, so we compare gam's fitted values to f_true per probe
+    // point (grid-aligned by index).
+    let bw = bandwidth;
     let py = run_python(
         &[
             Column::new("elat", &eval_lats),
             Column::new("elon", &eval_lons),
+            Column::new("bw", &vec![bw; m]),
         ],
         r#"
 import numpy as np
-import scipy  # ensure SciPy is present; hard-fail otherwise
-from scipy.spatial.distance import pdist
+import scipy  # ensure SciPy is present; hard-fail otherwise (no skip path)
 
 lat = np.radians(np.asarray(df["elat"], dtype=float))
 lon = np.radians(np.asarray(df["elon"], dtype=float))
+bw = float(np.asarray(df["bw"], dtype=float)[0])
 
 # Unit vectors on S^2 (same convention as gam: x=cos(lat)cos(lon), etc.).
 x = np.cos(lat) * np.cos(lon)
 y = np.cos(lat) * np.sin(lon)
 z = np.sin(lat)
 P = np.column_stack([x, y, z])
-nrm = np.linalg.norm(P, axis=1)
-assert np.allclose(nrm, 1.0, atol=1e-12), "probe points must be unit vectors"
+assert np.allclose(np.linalg.norm(P, axis=1), 1.0, atol=1e-12), "probe points must be unit"
 
-m = P.shape[0]
-iu, ju = np.triu_indices(m, k=1)
+pole = np.array([0.0, 0.0, 1.0])  # lat=+90
 
-# (A) geodesic via arccos of dot product (the central angle on S^2).
-dots = np.clip(np.einsum("ij,ij->i", P[iu], P[ju]), -1.0, 1.0)
-geo_arccos = np.arccos(dots)
+# (A) geodesic distance-to-pole via arccos of dot product (central angle on S^2).
+d_pole_arccos = np.arccos(np.clip(P @ pole, -1.0, 1.0))
 
-# (B) geodesic via the haversine formula on (lat, lon) — the classic
-# great-circle distance. On the unit sphere this equals the central angle.
-dlat = lat[ju] - lat[iu]
-dlon = lon[ju] - lon[iu]
-hav = (np.sin(dlat / 2.0) ** 2
-       + np.cos(lat[iu]) * np.cos(lat[ju]) * np.sin(dlon / 2.0) ** 2)
-geo_hav = 2.0 * np.arcsin(np.sqrt(np.clip(hav, 0.0, 1.0)))
+# (B) geodesic distance-to-pole via the haversine great-circle formula between
+# (lat, lon) and the pole (lat=pi/2, lon=0). On the unit sphere this equals the
+# central angle. For a point at latitude `lat`, the colatitude is exactly
+# pi/2 - lat; haversine must reproduce it.
+lat_p, lon_p = np.pi / 2.0, 0.0
+dlat = lat_p - lat
+dlon = lon_p - lon
+hav = np.sin(dlat / 2.0) ** 2 + np.cos(lat) * np.cos(lat_p) * np.sin(dlon / 2.0) ** 2
+d_pole_hav = 2.0 * np.arcsin(np.sqrt(np.clip(hav, 0.0, 1.0)))
 
 # The two great-circle formulas must agree: this validates the ground truth.
-assert np.allclose(geo_arccos, geo_hav, atol=1e-9), "haversine vs arccos disagree"
+assert np.allclose(d_pole_arccos, d_pole_hav, atol=1e-9), "haversine vs arccos disagree"
+# And both must equal the analytic colatitude pi/2 - lat.
+assert np.allclose(d_pole_arccos, np.pi / 2.0 - lat, atol=1e-9), "colatitude check"
 
-# Sanity: SciPy's chordal (Euclidean R^3) distance is a DIFFERENT metric from the
-# geodesic; emit their correlation to document that they are not interchangeable.
-chord = pdist(P, metric="euclidean")
-def corr(a, b):
-    a = np.asarray(a); b = np.asarray(b)
-    return float(np.corrcoef(a, b)[0, 1])
+# True geodesic-radial surface at the probe points.
+f_true = np.exp(-d_pole_hav / bw)
 
-emit("geodesic", geo_arccos)
-emit("geo_vs_chord_corr", [corr(geo_arccos, chord)])
-emit("npairs", [float(geo_arccos.size)])
+# Document that geodesic and chordal-to-pole distances are DIFFERENT metrics
+# (chord = 2 sin(d_geod/2)); emit the largest relative gap over the probe grid.
+chord_pole = np.linalg.norm(P - pole[None, :], axis=1)
+metric_gap = float(np.max(np.abs(d_pole_arccos - chord_pole) / np.maximum(d_pole_arccos, 1e-9)))
+
+emit("f_true", f_true)
+emit("d_pole", d_pole_hav)
+emit("metric_gap", [metric_gap])
 "#,
     );
-    let geodesic = py.vector("geodesic");
-    let geo_vs_chord = py.scalar("geo_vs_chord_corr");
+    let f_true = py.vector("f_true");
+    let d_pole = py.vector("d_pole");
+    let metric_gap = py.scalar("metric_gap");
     assert_eq!(
-        geodesic.len(),
-        gam_pair_diff.len(),
-        "geodesic pair count must match gam pair count"
+        f_true.len(),
+        m,
+        "scipy true-surface length must match the {m} probe points"
     );
 
     // ---- the intrinsic correctness metric ---------------------------------
-    // Pearson correlation between gam's fitted-function pairwise differences and
-    // the true geodesic pairwise distances. A metric-respecting fit of a truth
-    // monotone in geodesic-distance-to-pole yields a strong positive correlation.
-    let corr_geo = pearson(&gam_pair_diff, geodesic);
+    // (i) gam must RECONSTRUCT the geodesic-radial truth: its fitted surface
+    // tracks f_true (computed from the haversine great-circle distance-to-pole)
+    // across the probe grid. (ii) gam's fitted values must be MONOTONE-DECREASING
+    // in the geodesic distance to the pole — the defining signature of a smooth
+    // keyed on the intrinsic S² metric rather than raw lat/lon.
+    let corr_true = pearson(gam_eval.as_slice(), f_true);
+    let corr_gam_dpole = pearson(gam_eval.as_slice(), d_pole);
+    let l2_true = relative_l2(gam_eval.as_slice(), f_true);
     eprintln!(
-        "[sphere-geodesic] n={n} m_probe={m} npairs={} edf={edf:.3} \
-         pearson(|df_gam|, d_geod)={corr_geo:.4} corr(geodesic, chordal)={geo_vs_chord:.4}",
-        gam_pair_diff.len()
+        "[sphere-geodesic] n={n} m_probe={m} edf={edf:.3} \
+         pearson(f_gam, f_true)={corr_true:.4} relL2(f_gam, f_true)={l2_true:.4} \
+         pearson(f_gam, d_geod_to_pole)={corr_gam_dpole:.4} metric_gap={metric_gap:.4}"
     );
 
     // ---- secondary baseline: mgcv spline-on-sphere (bs="sos") --------------
@@ -269,68 +288,111 @@ emit("npairs", [float(geo_arccos.size)])
         "mgcv sos prediction length must match the {m} probe points"
     );
 
-    // mgcv's own fitted-function pairwise differences, same (i, j) order.
-    let mut mgcv_pair_diff = Vec::with_capacity(gam_pair_diff.len());
-    for i in 0..m {
-        for j in (i + 1)..m {
-            mgcv_pair_diff.push((mgcv_pred[i] - mgcv_pred[j]).abs());
-        }
-    }
-    let mgcv_corr_geo = pearson(&mgcv_pair_diff, geodesic);
+    // mgcv's own reconstruction of the geodesic-radial truth, grid-aligned.
+    let mgcv_corr_true = pearson(mgcv_pred, f_true);
     // How closely gam's probe-surface tracks mgcv's spline-on-sphere surface.
-    let gam_vs_mgcv = pearson(&gam_eval, mgcv_pred);
+    let gam_vs_mgcv = pearson(gam_eval.as_slice(), mgcv_pred);
     eprintln!(
         "[sphere-geodesic] mgcv_edf={mgcv_edf:.3} \
-         pearson(|df_mgcv|, d_geod)={mgcv_corr_geo:.4} pearson(gam, mgcv_sos)={gam_vs_mgcv:.4}"
+         pearson(f_mgcv, f_true)={mgcv_corr_true:.4} pearson(gam, mgcv_sos)={gam_vs_mgcv:.4}"
+    );
+
+    // ---- antimeridian-seam discriminator ----------------------------------
+    // Two probe points at the SAME latitude straddling the ±180° seam are
+    // geodesically near (10° apart across the antimeridian) yet ~350° apart in
+    // raw longitude. The radial truth assigns them IDENTICAL values (same
+    // colatitude). An intrinsic S² smooth therefore gives them near-equal fitted
+    // values; a kernel that confused raw lat/lon degrees with distance would see
+    // them as maximally separated and assign wildly different values. This is the
+    // sharpest available test that gam keys on the geodesic, not on coordinates.
+    let mut seam_grid = Array2::<f64>::zeros((2, 3));
+    seam_grid[[0, 0]] = 0.0;
+    seam_grid[[0, 1]] = -175.0;
+    seam_grid[[1, 0]] = 0.0;
+    seam_grid[[1, 1]] = 175.0;
+    let seam_design = build_term_collection_design(seam_grid.view(), &fit.resolvedspec)
+        .expect("rebuild sphere design at seam points");
+    let seam_eval: Vec<f64> = seam_design.design.apply(&fit.fit.beta).to_vec();
+    let fitted_range = gam_eval
+        .iter()
+        .cloned()
+        .fold(f64::NEG_INFINITY, f64::max)
+        - gam_eval.iter().cloned().fold(f64::INFINITY, f64::min);
+    let seam_gap = (seam_eval[0] - seam_eval[1]).abs();
+    let seam_rel = seam_gap / fitted_range.max(1e-12);
+    eprintln!(
+        "[sphere-geodesic] seam |f(-175)-f(175)|={seam_gap:.5} \
+         fitted_range={fitted_range:.5} seam_rel={seam_rel:.4}"
     );
 
     // ---- assertions --------------------------------------------------------
-    // (1) Intrinsic property. The truth is monotone-decreasing in geodesic
-    // distance to the pole, so points far apart geodesically tend to have larger
-    // fitted-value differences. A metric-respecting smooth therefore yields a
-    // strong positive Pearson correlation between |f_gam(p)-f_gam(q)| and
-    // d_geod(p,q). 0.85 is the principled bound from the spec: not 1.0 because the
-    // fit is noisy and the relationship is monotone-but-not-linear (so even a
-    // perfect smooth would not give correlation 1), yet far above the ~0.0–0.4
-    // a chordal/lat-lon-confused kernel would produce. A failure here means the
-    // kernel is not keyed on the intrinsic S² geodesic — check the lat/lon <-> 3D
-    // unit-vector conversion feeding the kernel.
+    // (1) gam RECONSTRUCTS the geodesic-radial truth. f_true is built from the
+    // haversine great-circle distance-to-pole (cross-checked against the arccos
+    // central angle and the analytic colatitude in Python). A smooth keyed on the
+    // intrinsic S² metric recovers this surface up to noise and the k=20 basis
+    // budget. 0.97 is tight: a perfect noiseless reconstruction would correlate
+    // ~1, the noise sd is only 0.01 against a unit-amplitude surface, so anything
+    // below 0.97 signals real surface distortion. If this fails, check the
+    // kernel's lat/lon <-> 3D unit-vector conversion: the smooth must respect S²
+    // geometry, not the R³ embedding.
     assert!(
-        corr_geo > 0.85,
-        "gam sphere smooth is NOT geodesic-consistent: \
-         pearson(|f_gam diff|, d_geod) = {corr_geo:.4} (bound 0.85). \
-         Check the kernel's lat/lon <-> 3D unit-vector conversion: the smooth must \
-         respect S² geometry, not the R³ embedding."
+        corr_true > 0.97,
+        "gam sphere smooth does NOT reconstruct the geodesic-radial truth: \
+         pearson(f_gam, f_true) = {corr_true:.4} (bound 0.97), \
+         relL2 = {l2_true:.4}. Check the kernel's lat/lon <-> 3D unit-vector \
+         conversion: the smooth must respect S² geometry, not the R³ embedding."
+    );
+    // The fitted surface must also be MONOTONE-DECREASING in geodesic distance to
+    // the pole (f = exp(-d/bw) decreases with d), i.e. a strong NEGATIVE
+    // correlation. A chordal/coordinate-confused kernel would not order points by
+    // their intrinsic distance to the pole.
+    assert!(
+        corr_gam_dpole < -0.9,
+        "gam fitted values are not monotone in geodesic distance-to-pole: \
+         pearson(f_gam, d_geod_to_pole) = {corr_gam_dpole:.4} (bound -0.9)"
     );
 
-    // (2) The mature comparator must clear the same bar — this is what makes it a
-    // valid yardstick (mgcv sos is geodesic-consistent by construction).
+    // (2) The mature comparator clears the same reconstruction bar — this is what
+    // makes mgcv bs=\"sos\" a valid yardstick (it is geodesic-consistent by
+    // construction). If mgcv itself fails, the reference fit is broken, not gam.
     assert!(
-        mgcv_corr_geo > 0.85,
-        "mgcv bs=\"sos\" baseline failed the geodesic-consistency bar it defines: \
-         pearson(|f_mgcv diff|, d_geod) = {mgcv_corr_geo:.4} (bound 0.85) — \
-         check the reference fit, not gam"
+        mgcv_corr_true > 0.97,
+        "mgcv bs=\"sos\" baseline failed to reconstruct the geodesic-radial truth \
+         it should track by construction: pearson(f_mgcv, f_true) = {mgcv_corr_true:.4} \
+         (bound 0.97) — check the reference fit, not gam"
     );
 
-    // (3) Sanity that the geodesic and chordal metrics are genuinely different
-    // (otherwise the test could pass even for a Euclidean-embedding kernel). On
-    // points spread across the sphere the chordal/geodesic correlation is well
-    // below 1; if it were ~1 the test would not be discriminating.
+    // (3) gam tracks the mature spline-on-sphere surface on identical data; both
+    // REML-fit the same intrinsic surface with k=20, so their probe-grid surfaces
+    // are strongly correlated. 0.95 is tight enough to catch a real baseline
+    // divergence yet tolerant of the differing sphere bases (gam Sobolev/Wahba vs
+    // mgcv thin-plate-on-sphere).
     assert!(
-        geo_vs_chord < 0.999,
-        "geodesic and chordal metrics are indistinguishable on this grid \
-         (corr={geo_vs_chord:.5}); the test would not discriminate intrinsic vs \
-         embedding kernels — widen the probe grid"
-    );
-
-    // (4) gam must track the mature spline-on-sphere surface on identical data;
-    // both REML-fit the same intrinsic surface with k=20, so their probe-grid
-    // surfaces should be strongly correlated. 0.9 is tight enough to catch a real
-    // baseline divergence yet tolerant of the differing sphere bases (gam Sobolev
-    // Wahba vs mgcv thin-plate-on-sphere).
-    assert!(
-        gam_vs_mgcv > 0.9,
+        gam_vs_mgcv > 0.95,
         "gam sphere fit diverges from the mgcv bs=\"sos\" baseline: \
-         pearson(gam, mgcv_sos) = {gam_vs_mgcv:.4} (bound 0.9)"
+         pearson(gam, mgcv_sos) = {gam_vs_mgcv:.4} (bound 0.95)"
+    );
+
+    // (4) Antimeridian-seam consistency: geodesically-near (10°) but
+    // coordinate-far (~350° in longitude) probe points get near-equal fitted
+    // values. Their fitted difference must be a small fraction of the total
+    // fitted range. 0.1 is principled: across the seam the true surface values
+    // are identical and only ~10° of geodesic separation plus fit noise can move
+    // them apart, so a kernel respecting S² geometry keeps |Δ| well under 10% of
+    // the full range, whereas a coordinate-confused kernel (350° apart) would
+    // produce a near-maximal gap. The check also confirms the fitted surface is
+    // non-degenerate (positive range) so the ratio is meaningful.
+    assert!(
+        fitted_range > 1e-3,
+        "gam fitted surface is degenerate over the probe grid (range \
+         {fitted_range:.6}); the seam ratio would be meaningless"
+    );
+    assert!(
+        seam_rel < 0.1,
+        "gam sphere smooth fails antimeridian-seam consistency: probe points at \
+         (0,-175) and (0,+175) are 10° apart geodesically but ~350° apart in raw \
+         longitude, yet gam assigns them values differing by {seam_gap:.5} = \
+         {seam_rel:.4} of the fitted range (bound 0.1). The kernel is keyed on raw \
+         lat/lon, not the intrinsic S² geodesic."
     );
 }

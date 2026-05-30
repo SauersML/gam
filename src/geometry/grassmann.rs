@@ -13,8 +13,20 @@ pub struct GrassmannManifold {
 }
 
 impl GrassmannManifold {
-    pub const fn new(k: usize, n: usize) -> Self {
-        Self { k, n }
+    /// Construct the Grassmannian `Gr(k, n)`, the set of `k`-dimensional
+    /// subspaces of `ℝⁿ`. This object exists only for `1 ≤ k ≤ n`: with
+    /// `k > n` there is no `k`-dimensional subspace of `ℝⁿ`, the dimension
+    /// `k(n − k)` would be negative (and `n − k` underflows in `usize`), and
+    /// the QR orthonormalization cannot produce a rank-`k` basis. The domain is
+    /// rejected here, before any dimension, projection, exponential, or
+    /// curvature computation can run on a nonexistent manifold.
+    pub fn new(k: usize, n: usize) -> GeometryResult<Self> {
+        if k == 0 || n == 0 || k > n {
+            return Err(GeometryError::InvalidPoint(
+                "Grassmann Gr(k, n) requires 1 <= k <= n",
+            ));
+        }
+        Ok(Self { k, n })
     }
 
     fn orthonormalize(&self, y: &Array2<f64>) -> Array2<f64> {

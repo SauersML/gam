@@ -143,7 +143,6 @@ k = gp.kernel_
 # WhiteKernel term, the signal kernel is everything else.
 white = k.k2
 signal = k.k1
-ys = y - y.mean()
 Ksig = signal(x)
 sigma2 = white.noise_level
 n = x.shape[0]

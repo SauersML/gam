@@ -220,19 +220,22 @@ emit("crps", np.asarray(crps, dtype=float))
 
     // Both sides evaluate the identical closed-form Gaussian CRPS at the identical
     // (y, mu, sigma); the only freedom is the floating-point erf/erfc backend
-    // (gam: statrs::erfc; properscoring: scipy/numpy). Element-wise agreement to
-    // < 0.02 relative is far looser than that ~1e-12 numerical gap and exists only
-    // to flag a real transcription/linking error in gam's predictive (mu, sigma).
+    // (gam: statrs::erfc; properscoring: scipy/numpy), each near machine epsilon.
+    // The per-observation relative gap is therefore ~1e-12 in practice, so a 1e-9
+    // relative bound is principled — tight enough that ANY transcription/linking
+    // error in gam's predictive (mu, sigma) blows past it, yet a few hundred ulps
+    // of headroom over the genuine cross-backend erf disagreement.
     assert!(
-        max_rel < 0.02,
+        max_rel < 1e-9,
         "per-observation Gaussian CRPS diverges from properscoring: max_rel={max_rel:.3e}"
     );
     // The aggregate (mean) CRPS is the headline calibration number; with identical
-    // inputs and formula it must match to within 1e-6. A larger gap is not a
+    // inputs and formula the per-element abs diffs are ~1e-13, so the mean diff is
+    // ~1e-13 and must match to within 1e-9 absolute. A larger gap is not a
     // statistical disagreement but a sign that gam mis-wired mu/sigma into the
     // predictive distribution (wrong link, wrong block, wrong floor).
     assert!(
-        mean_diff < 1e-6,
+        mean_diff < 1e-9,
         "mean hold-out CRPS disagrees with properscoring: gam={mean_gam:.8} ps={mean_ps:.8} diff={mean_diff:.3e}"
     );
 }

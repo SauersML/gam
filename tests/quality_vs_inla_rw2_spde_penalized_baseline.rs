@@ -41,12 +41,18 @@
 //!      different estimator — 8% is tight enough that a real structural
 //!      divergence fails, loose enough to admit the two priors' legitimate gap.
 //!   2. **Penalty (hyperparameter) equivalence**: after the σ² gauge that maps
-//!      INLA's precision `tau` to gam's penalty weight `lambda` (`lambda ≈
-//!      tau * σ²` for the identity-Gaussian model — both standardize the
-//!      structure matrix, gam via REML scale, INLA via `scale.model=TRUE`),
-//!      `|log lambda_gam − log lambda_inla| / |log lambda_gam| < 0.3`. This is
-//!      the heart of the test: do the two evidence calculations select the same
-//!      smoothing level on the log scale.
+//!      INLA's precision `tau` to gam's penalty weight `lambda` (`lambda =
+//!      tau * σ²` for the identity-Gaussian model — gam's MAP system adds the
+//!      penalty `S(λ)` to the *unscaled* Gram `XᵀX` and then scales the inverse
+//!      by `σ²`, while INLA carries the likelihood precision `1/σ²` separately,
+//!      so equating the two MAP normal equations gives `λ = τ σ²`; both
+//!      standardize the structure matrix, gam via REML scale, INLA via
+//!      `scale.model=TRUE`), `|log lambda_gam − log lambda_inla| < 1.0` nat.
+//!      This is the heart of the test: do the two evidence calculations select
+//!      the same smoothing level? The bound is on the *absolute* log gap (one
+//!      e-fold in `lambda`), the only scale-free distance for a quantity that is
+//!      already a log; a relative bound on `log lambda` itself would be vacuous
+//!      where `log lambda` is large and unsatisfiable where it is near zero.
 //!   3. **Posterior SD**: `rmse(gam_sd, inla_sd) < 0.1 * mean(inla_sd)` at the
 //!      training points, where gam's SD is `sqrt(diag(X Vb Xᵀ))` from the
 //!      Bayesian covariance and INLA's is the fitted-value marginal SD.
@@ -155,22 +161,24 @@ fn gam_rw2_pspline_matches_inla_latent_gaussian() {
         ],
         r#"
         suppressPackageStartupMessages(library(INLA))
-        # Order rows by the covariate so rw2's ordered-lattice assumption holds,
-        # then bin onto the rw2 location index. Restore original order at the end.
-        df$.row <- seq_len(nrow(df))
+        # Bin `range` onto the ordered rw2 location lattice with inla.group.
+        # f(xg, model="rw2") internally orders the latent field by the VALUES of
+        # xg, so no row reordering of `df` is needed: summary.fitted.values is
+        # returned in the input-row order and therefore aligns element-wise with
+        # gam's gam_fitted / gam_sd, which are in the same input-row order.
         df$xg <- inla.group(df$range, n = 50, method = "quantile")
+        df$intercept <- 1
         form <- logratio ~ -1 + intercept + f(xg, model = "rw2",
                                                scale.model = TRUE,
                                                constr = TRUE)
-        df$intercept <- 1
         m <- inla(form, data = df, family = "gaussian",
                   control.predictor = list(compute = TRUE),
                   control.compute = list(config = TRUE),
                   control.inla = list(int.strategy = "grid"))
         # Posterior-mean fitted values + marginal SD at each training row, in the
-        # ORIGINAL row order.
-        fit_mean <- m$summary.fitted.values$mean[df$.row]
-        fit_sd   <- m$summary.fitted.values$sd[df$.row]
+        # input row order (one fitted row per observation).
+        fit_mean <- m$summary.fitted.values$mean[seq_len(nrow(df))]
+        fit_sd   <- m$summary.fitted.values$sd[seq_len(nrow(df))]
         emit("fitted", as.numeric(fit_mean))
         emit("sd", as.numeric(fit_sd))
         # Posterior mode of the latent field's log-precision (log tau for rw2).
@@ -208,14 +216,19 @@ fn gam_rw2_pspline_matches_inla_latent_gaussian() {
     let sd_rmse = rmse(&gam_sd, inla_sd);
     let inla_sd_mean = inla_sd.iter().sum::<f64>() / inla_sd.len() as f64;
     let sd_tol = 0.1 * inla_sd_mean;
-    let lambda_rel = (gam_log_lambda - inla_log_lambda).abs() / gam_log_lambda.abs().max(1e-12);
+    // log_lambda is already a log-scale quantity, so the natural scale-free
+    // distance between the two selected smoothing levels is the ABSOLUTE
+    // difference of the logs (= |log(lambda_gam / lambda_inla)|), not a relative
+    // tolerance on the log itself (which would be meaningless: it tightens or
+    // loosens depending on where lambda happens to land on the log axis).
+    let log_lambda_gap = (gam_log_lambda - inla_log_lambda).abs();
 
     eprintln!(
         "lidar RW2 gam vs INLA: n={n} \
          rel_l2(fitted)={rel_fit:.4} \
          gam_log_lambda={gam_log_lambda:.4} inla_log_tau={inla_log_tau:.4} \
          inla_sigma2={inla_sigma2:.4} gam_sigma2={gam_sigma2:.4} \
-         inla_log_lambda={inla_log_lambda:.4} lambda_rel={lambda_rel:.4} \
+         inla_log_lambda={inla_log_lambda:.4} log_lambda_gap={log_lambda_gap:.4} \
          sd_rmse={sd_rmse:.5} inla_sd_mean={inla_sd_mean:.5} sd_tol={sd_tol:.5}"
     );
 
@@ -229,15 +242,20 @@ fn gam_rw2_pspline_matches_inla_latent_gaussian() {
     );
 
     // Metric 2: both engines' evidence calculations select the same smoothing
-    // level on the log scale (after the sigma^2 gauge). 30% relative on the log
-    // penalty weight is principled: log lambda is the quantity both engines
-    // optimize, and a 30% gap on the log scale would already flag a real
-    // disagreement in the marginal-likelihood / evidence machinery.
+    // level (after the sigma^2 gauge log lambda = log tau + log sigma^2). The
+    // bound is on the ABSOLUTE log gap: 1.0 nat == a factor of e in lambda. That
+    // is the honest tolerance for "the same smoothing level" given that the two
+    // engines optimize genuinely different structure matrices (gam: a 2nd-order
+    // difference penalty on B-spline coefficients selected by REML; INLA: an RW2
+    // precision on grouped lattice nodes selected by the marginal posterior of
+    // log tau). A gap below one e-fold means the two evidence machineries land on
+    // the same effective amount of smoothing; a multi-fold gap (>= e) would flag
+    // a real disagreement and is not admitted.
     assert!(
-        lambda_rel < 0.3,
+        log_lambda_gap < 1.0,
         "gam and INLA disagree on the selected smoothing level: \
          log_lambda_gam={gam_log_lambda:.4} log_lambda_inla={inla_log_lambda:.4} \
-         (rel={lambda_rel:.4})"
+         (|gap|={log_lambda_gap:.4} nats, bound 1.0)"
     );
 
     // Metric 3: posterior uncertainty agrees. RMSE of the fitted-value SDs must

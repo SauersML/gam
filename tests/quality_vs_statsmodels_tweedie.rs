@@ -14,10 +14,12 @@
 //! `y ~ s(x1, k=4) + s(x2, k=4) + linear(offset)`, and we ship that dense
 //! design matrix straight into a plain statsmodels Tweedie GLM. Both engines
 //! then maximize the identical Tweedie (`p = 1.5`, log-link) likelihood over
-//! the identical column space; gam additionally applies a *mild* wiggliness
-//! penalty (the smooths are low-rank, k = 4, so they are nearly saturated and
-//! the penalty barely bites). The two fitted linear predictors `η = Xβ` must
-//! therefore essentially coincide.
+//! the identical column space; gam additionally applies a REML-selected
+//! wiggliness penalty. With k = 4 each smooth has only a *two-dimensional*
+//! penalized wiggle subspace on top of its unpenalized {const, linear} null
+//! space, so the penalty can perturb `η = Xβ` only within that small subspace.
+//! The two fitted linear predictors must therefore essentially coincide, with
+//! a discrepancy bounded by how far REML shrinks those few wiggle dimensions.
 //!
 //! We assert:
 //!   1. relative-L2 of the fitted log-scale linear predictor `η` < 0.10
@@ -221,8 +223,9 @@ emit("eta", np.asarray(eta, dtype=float))
     eprintln!("[tweedie offset] pearson(eta_with - eta_without, offset) = {off_align:.4}");
 
     // (1) Same Tweedie likelihood + same basis: η must essentially coincide.
-    // The only wedge is gam's light k=4 wiggliness penalty, worth a few percent
-    // on η; 0.10 is a principled bound that still catches a wrong power/link.
+    // The only wedge is REML shrinkage on the 2-dim penalized wiggle subspace
+    // per k=4 smooth; 0.10 relative-L2 on η bounds that shrinkage while still
+    // catching a wrong variance power, wrong link, or broken working-response.
     assert!(
         corr > 0.99,
         "fitted Tweedie η should track statsmodels closely: pearson={corr:.5}"

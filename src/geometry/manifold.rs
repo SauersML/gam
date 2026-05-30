@@ -146,20 +146,35 @@ pub enum ManifoldSpec {
 }
 
 impl ManifoldSpec {
-    pub fn build(&self) -> Box<dyn RiemannianManifold> {
+    /// Instantiate the concrete [`RiemannianManifold`] for this descriptor.
+    ///
+    /// Fallible because the constrained-frame families have nonempty domains:
+    /// `Gr(k, n)` and `St(n, k)` exist only for `1 ≤ k ≤ n`. An out-of-domain
+    /// descriptor is rejected here (and recursively for [`Product`] parts)
+    /// before any dimension, projection, exponential, or curvature computation
+    /// can run on a nonexistent manifold.
+    ///
+    /// [`Product`]: Self::Product
+    pub fn build(&self) -> GeometryResult<Box<dyn RiemannianManifold>> {
         match self {
-            Self::Euclidean(dim) => Box::new(crate::geometry::EuclideanManifold::new(*dim)),
-            Self::Circle => Box::new(crate::geometry::CircleManifold::new()),
+            Self::Euclidean(dim) => Ok(Box::new(crate::geometry::EuclideanManifold::new(*dim))),
+            Self::Circle => Ok(Box::new(crate::geometry::CircleManifold::new())),
             Self::Sphere { intrinsic_dim } => {
-                Box::new(crate::geometry::SphereManifold::new(*intrinsic_dim))
+                Ok(Box::new(crate::geometry::SphereManifold::new(*intrinsic_dim)))
             }
-            Self::Torus { dim } => Box::new(crate::geometry::TorusManifold::new(*dim)),
-            Self::Grassmann { k, n } => Box::new(crate::geometry::GrassmannManifold::new(*k, *n)),
-            Self::Stiefel { k, n } => Box::new(crate::geometry::StiefelManifold::new(*k, *n)),
-            Self::Spd { n } => Box::new(crate::geometry::SpdManifold::new(*n)),
-            Self::Product(parts) => Box::new(crate::geometry::ProductManifold::new(
-                parts.iter().map(Self::build).collect(),
-            )),
+            Self::Torus { dim } => Ok(Box::new(crate::geometry::TorusManifold::new(*dim))),
+            Self::Grassmann { k, n } => {
+                Ok(Box::new(crate::geometry::GrassmannManifold::new(*k, *n)?))
+            }
+            Self::Stiefel { k, n } => Ok(Box::new(crate::geometry::StiefelManifold::new(*k, *n)?)),
+            Self::Spd { n } => Ok(Box::new(crate::geometry::SpdManifold::new(*n))),
+            Self::Product(parts) => {
+                let mut built = Vec::with_capacity(parts.len());
+                for part in parts {
+                    built.push(part.build()?);
+                }
+                Ok(Box::new(crate::geometry::ProductManifold::new(built)))
+            }
         }
     }
 }
