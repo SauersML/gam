@@ -11870,7 +11870,6 @@ fn sae_manifold_predict_oos<'py>(
         assignment_kind,
         sparsity_strength,
         smoothness,
-        None,
         max_iter,
         learning_rate,
         ridge_ext_coord,
@@ -29462,7 +29461,6 @@ fn build_survival_marginal_slope_ffi_payload(
     use gam::families::survival_construction::{
         build_survival_time_basis, parse_survival_baseline_config, parse_survival_likelihood_mode,
         parse_survival_time_basis_config, resolve_survival_time_anchor_value,
-        survival_baseline_targetname,
     };
 
     let frozen_marginal = freeze_term_collection_from_design(
@@ -29853,7 +29851,6 @@ fn build_survival_location_scale_ffi_payload(
     use gam::families::survival_construction::{
         build_survival_time_basis, parse_survival_baseline_config, parse_survival_likelihood_mode,
         parse_survival_time_basis_config, resolve_survival_time_anchor_value,
-        survival_baseline_targetname,
     };
     use ndarray::{Array2, s};
 
