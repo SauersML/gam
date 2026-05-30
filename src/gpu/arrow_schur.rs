@@ -18,8 +18,9 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use ndarray::{Array1, Array2, ArrayView2};
 
+use crate::linalg::triangular::cholesky_solve_vector;
 use crate::solver::arrow_schur::ArrowSchurSystem;
 
 /// Outcome of a single Arrow-Schur Newton solve.
@@ -385,7 +386,7 @@ fn build_row_procedural_matvec(
                 let mut v_i = Array1::<f64>::zeros(di);
                 forward(i, x.view(), &mut v_i);
                 // w_i = (H_tt^(i) + ρ_t·I)^{-1} v_i via L_i L_iᵀ.
-                let w_i = solve_cholesky_lower_host(factors[i].view(), v_i.view());
+                let w_i = cholesky_solve_vector(factors[i].view(), v_i.view());
                 // neg += H_βt^(i)·w_i (sparse scatter); subtract once at the end.
                 transpose(i, w_i.view(), &mut neg);
             }
@@ -501,7 +502,7 @@ pub fn solve_arrow_newton_step_dense_reference(
         log_det += factor[[i, i]].ln();
     }
     log_det *= 2.0;
-    let solved = solve_cholesky_lower_host(factor.view(), rhs.view());
+    let solved = cholesky_solve_vector(factor.view(), rhs.view());
     let delta_t = solved.slice(ndarray::s![..n * d]).to_owned();
     let delta_beta = solved.slice(ndarray::s![n * d..]).to_owned();
     Ok(ArrowSchurGpuSolution {
@@ -535,28 +536,6 @@ fn cholesky_lower_host(a: ArrayView2<'_, f64>) -> Option<Array2<f64>> {
         }
     }
     Some(l)
-}
-
-#[inline]
-fn solve_cholesky_lower_host(l: ArrayView2<'_, f64>, rhs: ArrayView1<'_, f64>) -> Array1<f64> {
-    let n = l.nrows();
-    let mut y = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let mut sum = rhs[i];
-        for j in 0..i {
-            sum -= l[[i, j]] * y[j];
-        }
-        y[i] = sum / l[[i, i]];
-    }
-    let mut x = Array1::<f64>::zeros(n);
-    for i in (0..n).rev() {
-        let mut sum = y[i];
-        for j in (i + 1)..n {
-            sum -= l[[j, i]] * x[j];
-        }
-        x[i] = sum / l[[i, i]];
-    }
-    x
 }
 
 #[cfg(target_os = "linux")]
@@ -1821,7 +1800,7 @@ mod tests {
         }
         let l = cholesky_lower_host(h.view()).unwrap();
         let rhs = g.mapv(|v| -v);
-        let expected = solve_cholesky_lower_host(l.view(), rhs.view());
+        let expected = cholesky_solve_vector(l.view(), rhs.view());
         for i in 0..n * d {
             assert!(
                 (solution.delta_t[i] - expected[i]).abs() < 1e-10 * (1.0 + expected[i].abs()),
