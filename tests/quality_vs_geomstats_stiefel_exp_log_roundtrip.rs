@@ -16,11 +16,11 @@
 //! elementary inverse exists; `src/geometry/stiefel.rs` returns
 //! `GeometryError::Unsupported` rather than a wrong projected difference), so the
 //! round-trip cannot be closed *inside* gam. We therefore close it through the
-//! mature comparator: `||geomstats.log(gam.exp(Y, v)) − v||_F` must vanish,
-//! which confirms gam's exponential is the true geometric inverse of geomstats'
-//! logarithm. We also assert head-to-head that gam's exp output matches
-//! geomstats' exp output elementwise. Identical fixed-seed data is fed to both
-//! engines.
+//! mature comparator: `||geomstats.log(gam.exp(Y, v)) − v||_F` must collapse to
+//! geomstats' own iterative-log convergence floor, which confirms gam's
+//! exponential is the true geometric inverse of geomstats' logarithm. We also
+//! assert head-to-head that gam's exp output matches geomstats' exp output
+//! elementwise. Identical fixed-seed data is fed to both engines.
 
 use gam::geometry::{RiemannianManifold, StiefelManifold};
 use gam::test_support::reference::{Column, max_abs_diff, run_python};
@@ -213,16 +213,30 @@ emit("geo_log_of_gam", geo_log_of_gam.reshape(-1))
          roundtrip_max_abs={log_max_abs:.3e}"
     );
 
-    // Both implement the identical closed-form canonical-metric geodesic, so the
-    // only difference is floating-point round-off in the 2k×2k matrix
-    // exponential and QR; agreement to ~1e-10 / ~1e-9 is the correct bar and a
-    // wider divergence signals a genuine block-assembly / exp / QR bug.
+    // Both engines implement the identical closed-form canonical-metric geodesic
+    // (the 2k×2k block exponential `[[A,−Rᵀ],[R,0]]` then a QR projection — see
+    // `_StiefelLogSolver`/`StiefelCanonicalMetric.exp` in geomstats and
+    // `src/geometry/stiefel.rs`), so the only difference between the two exp
+    // outputs is floating-point round-off in `expm` and `qr`. Agreement to
+    // ~1e-10 is the correct head-to-head bar; a wider divergence signals a
+    // genuine block-assembly / exp / QR bug.
     assert!(
         exp_max_abs < 1e-10,
         "gam Stiefel exp diverges from geomstats: max_abs_diff={exp_max_abs:.3e}"
     );
+
+    // The round-trip is closed through geomstats' *iterative* Stiefel logarithm
+    // (`_StiefelLogSolver`), which terminates as soon as its internal residual
+    // norm falls below its convergence tolerance `tol = 1e-8` (with
+    // `imag_tol = 1e-6`, `max_iter = 500`). The recovered tangent therefore
+    // carries the solver's own ~1e-8 convergence floor, accumulated in
+    // quadrature across the `n_samples` frames. Asserting tighter than that
+    // floor would test geomstats' iteration count, not gam: the principled bar
+    // is one comfortably above the comparator's documented `tol` yet far below
+    // the O(1e-1)+ residual a real exp/QR/block-assembly bug would produce, so
+    // it still catches any genuine inverse-relation failure in gam's exp.
     assert!(
-        roundtrip_frob < 1e-9,
+        roundtrip_frob < 1e-6,
         "gam exp is not the inverse of geomstats log: ||log(exp(v)) - v||_F={roundtrip_frob:.3e}"
     );
 }
