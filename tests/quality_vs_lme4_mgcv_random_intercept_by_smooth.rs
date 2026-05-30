@@ -137,11 +137,14 @@ fn gam_random_intercept_by_smooth_matches_lme4_and_mgcv() {
     assert_eq!(gam_fitted.len(), n, "gam fitted length mismatch");
 
     // Per-group predicted intercept: evaluate at a single common x reference for
-    // every group. The s(x) + s(x,by=g) curvature differs by group, so to isolate
-    // the *vertical* random-intercept offset we read the model at the data-mean x
-    // and then center; the residual spread is gam's BLUP-equivalent group effect.
-    // (We compare its SHAPE to lme4's conditional modes, so the common smooth +
-    // global-intercept contribution cancels under centering.)
+    // every group, then center across groups. Reading every group at the SAME x
+    // makes the shared s(x) + global-intercept contribution a per-group CONSTANT,
+    // which the across-group centering removes exactly. What survives is
+    // group(g)'s BLUP-equivalent offset plus the by-smooth's value at x_ref,
+    // s(x,by=g)(x_ref); the latter is the small linear deviation 0.15*slope_g*x_ref
+    // (|x_ref|≈0.5, slope_g~N(0,0.5) ⇒ SD≈0.04 vs the intercept SD 0.4, i.e. ~10%
+    // contamination), so the centered vector is dominated by — and tracks the SHAPE
+    // of — the random intercept that we compare to lme4's conditional modes.
     let x_ref = x.iter().sum::<f64>() / n as f64;
     let mut anchor = Array2::<f64>::zeros((N_GROUPS, ds.headers.len()));
     for grp in 0..N_GROUPS {
@@ -213,9 +216,10 @@ fn gam_random_intercept_by_smooth_matches_lme4_and_mgcv() {
     // subtracts the per-group mean, killing the vertical offset (gam's random
     // intercept; mgcv's group-level constant absorbed into the smooth), so what
     // remains is the smooth shape s(x)+s(x,by=g) is responsible for. We correlate
-    // the two centered curves per group (rows are x-sorted within group? no — we
-    // compare element-wise on the SAME rows, which are grid-aligned by construction
-    // because both engines saw identical row order).
+    // the two centered curves per group element-wise on the SAME rows: both engines
+    // were handed the identical row order, and within a group we collect rows by the
+    // shared grp_of_row index in that order, so gam_c[k] and mgcv_c[k] are the same
+    // observation (same x) on both sides — no sorting or re-gridding is needed.
     let mut corr_per_group = Vec::<f64>::with_capacity(N_GROUPS);
     for grp in 0..N_GROUPS {
         let mut gam_c = Vec::<f64>::new();
@@ -266,8 +270,12 @@ fn gam_random_intercept_by_smooth_matches_lme4_and_mgcv() {
     // (2) gam's group(g) random intercept must match lme4's conditional modes.
     // The 5 group offsets (intercept_g ~ N(0,0.4)) are well separated relative to
     // the per-group noise floor (σ_ε²/60 ≈ 7e-4), so both REML engines recover the
-    // same BLUP ordering and magnitudes. pearson > 0.96 is the spec bound; a lower
-    // value means gam soaked the offset into the smooth instead of group(g).
+    // same BLUP ordering and magnitudes. pearson (not a tighter element-wise bound)
+    // is the right metric here because gam's anchor vector carries the ~10% by-smooth
+    // contamination quantified above plus a basis-dependent BLUP shrinkage scale that
+    // need not equal lme4's, so we test agreement of the per-group ORDERING/SHAPE.
+    // pearson > 0.96 is the spec bound; a lower value means gam soaked the offset
+    // into the smooth instead of group(g).
     assert!(
         intercept_corr > 0.96,
         "gam per-group intercepts disagree with lme4 conditional modes: pearson={intercept_corr:.5}"

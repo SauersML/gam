@@ -163,9 +163,11 @@ fn gam_tensor_te_2d_binomial_logit_matches_mgcv() {
 
     // Both engines REML-fit the same penalized binomial deviance on identical
     // integer counts, so their logit-scale linear predictors must essentially
-    // coincide. The bound is tighter than the Gaussian-lidar smooth (rel<0.02)
-    // is loose because the binomial link inversion + mu(1-mu) working weight add
-    // genuine numerical sensitivity at extreme eta; rel_l2 < 0.035 and
+    // coincide. The bound is slightly looser than the Gaussian-lidar smooth
+    // (rel<0.02): the binomial link inversion + mu*(1-mu) working weight add
+    // genuine numerical sensitivity at extreme eta, where p saturates toward 0/1
+    // and the working weight collapses, so per-row eta estimates can wander a
+    // little more than in the identity-link Gaussian case. rel_l2 < 0.035 and
     // pearson > 0.985 still demand near-coincident surfaces and would catch any
     // real binomial-PIRLS divergence (wrong working weight, mis-signed link
     // gradient, or a botched logit inversion all blow these up well past it).

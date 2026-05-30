@@ -17,7 +17,9 @@
 //!      deviations is ~0 at every x (the defining property of `sz`), measured
 //!      after removing the shared intercept; and
 //!   2. AGREEMENT: gam's fitted values at the training points track mgcv's
-//!      `fitted()` in relative L2.
+//!      `fitted()` in relative L2; and
+//!   3. COMPLEXITY: gam's total effective degrees of freedom agree with mgcv's
+//!      in ballpark (EDF is convention-sensitive, so a relative tolerance).
 //!
 //! Both engines REML-fit the same penalized objective, so close agreement is
 //! the correct expectation and a genuine divergence is a real bug.
@@ -109,6 +111,7 @@ fn gam_factor_smooth_sz_matches_mgcv() {
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for the sz factor smooth");
     };
+    let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
     let n_cols = ds.headers.len();
 
     // gam fitted values at the training rows (identity link => design*beta).
@@ -183,14 +186,17 @@ fn gam_factor_smooth_sz_matches_mgcv() {
     );
     let mgcv_fitted = r.vector("fitted");
     let mgcv_constraint_max = r.scalar("constraint_max");
+    let mgcv_edf = r.scalar("edf");
     assert_eq!(mgcv_fitted.len(), n, "mgcv fitted length mismatch");
 
     let rel = relative_l2(&gam_fitted, mgcv_fitted);
+    let edf_rel = (gam_edf - mgcv_edf).abs() / mgcv_edf.abs().max(1.0);
 
     eprintln!(
         "sz factor smooth: n={n} groups={N_GROUPS} signal_sd={signal_sd:.4} \
          gam_constraint_max={constraint_max:.5} gam_constraint_rms={constraint_rms:.5} \
-         mgcv_constraint_max={mgcv_constraint_max:.5} rel_l2={rel:.4}"
+         mgcv_constraint_max={mgcv_constraint_max:.5} rel_l2={rel:.4} \
+         gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3}"
     );
 
     // (1) CONSTRAINT. The sz basis is *defined* by sum_g deviation_g(x) = 0; gam
@@ -218,5 +224,17 @@ fn gam_factor_smooth_sz_matches_mgcv() {
     assert!(
         rel < 0.04,
         "gam sz fit diverges from mgcv: rel_l2={rel:.4} (bound 0.04)"
+    );
+
+    // (3) COMPLEXITY. Total effective degrees of freedom must agree in
+    // ballpark. EDF is basis/null-space-convention sensitive (gam's default
+    // inner basis vs mgcv's k=10 thin-plate per level), so we assert a 30%
+    // relative tolerance — tight enough to catch a smoother that wildly
+    // over/under-fits the per-level deviations, loose enough to absorb the
+    // legitimate convention difference between the two thin-plate smoothers.
+    assert!(
+        edf_rel < 0.30,
+        "sz effective degrees of freedom disagree: gam={gam_edf:.3} mgcv={mgcv_edf:.3} \
+         (rel={edf_rel:.3}, bound 0.30)"
     );
 }

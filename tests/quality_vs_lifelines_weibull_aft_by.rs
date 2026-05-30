@@ -21,7 +21,15 @@
 //! (shape), baseline `lambda_` (scale at the covariate reference), and the
 //! per-stratum predicted survival surface. Comparing gam's single by-factored
 //! fit against the two independent lifelines stratum fits is the canonical way
-//! to check that gam's by-factor factorization is correct.
+//! to check that gam's by-factor factorization is correct. For the single
+//! shared baseline *shape* (which is not a per-stratum quantity) the matched
+//! reference is instead a POOLED `WeibullAFTFitter` (x + group on all rows),
+//! which estimates one `rho_` under the same shared-shape assumption gam makes.
+//!
+//! `group` is fed to gam as a categorical label ("A"/"B"): a numeric "0"/"1"
+//! column infers as Binary and turns `s(x, by=group)` into a single continuous
+//! varying-coefficient smooth (basis × value, which zeroes group A at value 0),
+//! NOT the per-level by-FACTOR expansion this test is meant to validate.
 //!
 //! ## Data (fixed seed, n=200, 100 per group)
 //!
@@ -37,8 +45,9 @@
 //!   * Per-stratum *scale* within 0.10 absolute: the effective Weibull scale at
 //!     each group's covariate reference is set by the shared baseline shifted by
 //!     that group's AFT term, which the by-factor smooth fits per stratum.
-//!   * Shared *shape* within 0.10 of lifelines' across-stratum mean shape: gam
-//!     shares one baseline shape, so the honest target is the pooled shape.
+//!   * Shared *shape* within 0.08 of lifelines' POOLED shape: gam shares one
+//!     baseline shape, so the honest matched target is the single pooled-fit
+//!     `rho_`, and 0.08 is on the order of the shape MLE's asymptotic SE at n=200.
 //!   * `relative_l2` on `S(t | x, g)` over a (group × x × t) grid ≤ 0.025 — the
 //!     load-bearing quantity; slightly looser than the single-smooth case
 //!     because the by-factor block carries an extra identifiability null space.
@@ -130,13 +139,23 @@ fn gam_weibull_aft_by_factor_matches_lifelines_per_stratum() {
         "x".to_string(),
         "group".to_string(),
     ];
+    // `group` MUST be fed to gam as a categorical label ("A"/"B"), not the
+    // numeric code: schema inference treats "0"/"1" as a Binary numeric column,
+    // which makes `s(x, by=group)` a single continuous varying-coefficient
+    // smooth (basis * value, zeroing out group A at value 0). Only a Categorical
+    // by-variable triggers the per-level by-FACTOR expansion gam advertises here
+    // (one smooth per level + an unpenalized treatment-coded factor main effect).
+    // Group A rows come first, so first-appearance level order gives A->0, B->1,
+    // matching the numeric `g_code` used by the prediction grid and the Python
+    // comparator (which filters on the numeric `group` column it receives).
+    let group_label = |group_a: bool| if group_a { "A" } else { "B" };
     let rows: Vec<StringRecord> = (0..n)
         .map(|i| {
             StringRecord::from(vec![
                 time[i].to_string(),
                 event[i].to_string(),
                 x[i].to_string(),
-                g_code[i].to_string(),
+                group_label(is_a[i]).to_string(),
             ])
         })
         .collect();
@@ -286,12 +305,21 @@ for gc in (0.0, 1.0):
         col = sf.iloc[:, j].to_numpy()
         surv_rows.extend(float(v) for v in col)
 
+# Pooled WeibullAFT on ALL rows with x + group covariates. This shares ONE
+# Weibull shape (rho_) across strata under the same shared-shape assumption gam
+# makes, so its rho_ is the honest matched target for gam's single baseline
+# shape (the arithmetic mean of two independent stratum shapes is only a proxy).
+pooled = WeibullAFTFitter()
+pooled.fit(frame, duration_col="time", event_col="event")
+emit("shape_pooled", [float(np.exp(pooled.params_.loc[("rho_", "Intercept")]))])
+
 emit("surv", surv_rows)
 "#,
     );
 
     let life_shape_a = py.scalar("shape_a");
     let life_shape_b = py.scalar("shape_b");
+    let life_shape_pooled = py.scalar("shape_pooled");
     let life_scale_a = py.scalar("scale_a");
     let life_scale_b = py.scalar("scale_b");
     let life_surv = py.vector("surv");
@@ -309,13 +337,12 @@ emit("surv", surv_rows)
         1.0 - is_a.iter().zip(&event).filter(|(a, _)| !**a).map(|(_, e)| *e).sum::<f64>() / N_PER_GROUP as f64;
 
     let rel_surv = relative_l2(&gam_surv, life_surv);
-    let life_shape_mean = 0.5 * (life_shape_a + life_shape_b);
 
     eprintln!(
         "weibull-AFT by-factor: n={n} censoring A={cens_a_frac:.2} B={cens_b_frac:.2}\n  \
          gam baseline: scale={gam_scale:.4} shape={gam_shape:.4}\n  \
          gam eff scale A={gam_scale_eff_a:.4} B={gam_scale_eff_b:.4}\n  \
-         lifelines shape A={life_shape_a:.4} B={life_shape_b:.4} (mean={life_shape_mean:.4})\n  \
+         lifelines shape A={life_shape_a:.4} B={life_shape_b:.4} pooled={life_shape_pooled:.4}\n  \
          lifelines scale A={life_scale_a:.4} B={life_scale_b:.4}\n  \
          S(t|x,g) rel_l2={rel_surv:.4}"
     );
@@ -336,13 +363,18 @@ emit("surv", surv_rows)
         "group B effective scale diverges from lifelines: gam={gam_scale_eff_b:.4} lifelines={life_scale_b:.4} (|Δ|={scale_err_b:.4})"
     );
 
-    // (2) Shared shape. gam uses ONE Weibull baseline shape across strata, so
-    // the principled target is the across-stratum mean of the two independent
-    // lifelines shapes. 0.10 absolute is the spec bound.
-    let shape_err = (gam_shape - life_shape_mean).abs();
+    // (2) Shared shape. gam uses ONE Weibull baseline shape across strata. The
+    // honest matched target is lifelines' POOLED WeibullAFT fit (x + group on all
+    // rows), which estimates a single rho_ under the same shared-shape assumption
+    // — not the arithmetic mean of two independent stratum shapes, which is only a
+    // proxy and need not equal the likelihood-pooled MLE. 0.08 absolute: with
+    // n=200 the Weibull shape MLE has an asymptotic SE on the order of
+    // shape/sqrt(events) ~ 1.0/sqrt(~150) ~ 0.08, so two correctly-specified
+    // pooled fits should agree to well within one such SE.
+    let shape_err = (gam_shape - life_shape_pooled).abs();
     assert!(
-        shape_err < 0.10,
-        "gam shared shape diverges from lifelines mean stratum shape: gam={gam_shape:.4} lifelines_mean={life_shape_mean:.4} (|Δ|={shape_err:.4})"
+        shape_err < 0.08,
+        "gam shared shape diverges from lifelines pooled shape: gam={gam_shape:.4} lifelines_pooled={life_shape_pooled:.4} (|Δ|={shape_err:.4})"
     );
 
     // (3) Survival surface — the load-bearing quantity. Both engines target the

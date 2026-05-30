@@ -141,6 +141,22 @@ fn gam_beta_logit_matches_betareg() {
     assert_eq!(betareg_mu.len(), N, "betareg fitted length mismatch");
     let betareg_eta: Vec<f64> = betareg_mu.iter().map(|&m| logit(m)).collect();
 
+    // betareg's `precision` coefficient is phi on the natural scale (constant
+    // precision => identity phi-link by default), i.e. the SAME mean/precision
+    // parameterisation used to draw the data: Var = mu(1-mu)/(1+phi). Confirm it
+    // recovers the true PHI within a wide band — this guards against a precision-
+    // vs-dispersion mismatch in the comparator (a dispersion 1/phi ~= 0.05 or a
+    // variance-style sigma would fall far outside [10, 40]). The band is loose
+    // because phi is only weakly identified from n=150 boundary-crowded draws
+    // (its sampling CV is O(sqrt(2/n)) ~ 12%, plus a downward bias from the basis
+    // misfit of the full-period x2 cosine under df=2), but it is a real check that
+    // both engines share the mean/precision parameterisation of the data.
+    assert!(
+        betareg_phi.is_finite() && betareg_phi > 0.5 * PHI && betareg_phi < 2.0 * PHI,
+        "betareg precision phi={betareg_phi:.3} is implausible for true phi={PHI} \
+         (wrong precision parameterisation?)"
+    );
+
     // ---- compare on the proportions and the logit-scale predictions -------
     let corr_mu = pearson(&gam_mu, betareg_mu);
     let rmse_eta = rmse(&gam_eta, &betareg_eta);
@@ -165,6 +181,14 @@ fn gam_beta_logit_matches_betareg() {
     // convention (gam's penalised range space vs betareg's natural-spline df)
     // and gam's REML smoothing penalty (mild shrinkage that betareg lacks);
     // these are small relative to the signal here.
+    //
+    // pearson(mu) is the scale/level-free shape match: >0.99 means the two fitted
+    // proportion curves trace the same shape, robust to the constant offset that
+    // penalised vs unpenalised fits can introduce. rmse(eta) is on the logit
+    // scale where the truth spans eta in [0.5 - 0.5, 0.5 + 0.5] = [0, 1] (a unit
+    // range); 0.08 RMSE is <8% of that span — loose enough to absorb the basis-
+    // convention and REML-shrinkage differences, tight enough that any genuine
+    // smoother divergence (which would be O(0.2+) at the data extremes) fails.
     assert!(
         corr_mu > 0.99,
         "fitted proportions diverge from betareg: pearson(mu)={corr_mu:.5}"

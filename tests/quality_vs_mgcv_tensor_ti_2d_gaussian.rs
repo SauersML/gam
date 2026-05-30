@@ -1,7 +1,8 @@
 //! End-to-end quality: gam's tensor *interaction* smooth `ti(x, z, k=6)` must
 //! match mgcv — the mature, standard GAM implementation — on identical data.
 //!
-//! Reference: `mgcv::gam(y ~ ti(x, z, k=6), method="REML")`.
+//! Reference: `mgcv::gam(y ~ ti(x, z, bs="ps", m=list(c(2,2),c(2,2)), k=6),
+//! method="REML")`.
 //!
 //! `ti()` is mgcv's mechanism for an interaction-ONLY tensor smooth: each
 //! marginal B-spline basis is sum-to-zero centered *before* the tensor product
@@ -12,6 +13,17 @@
 //! coefficients (one global sum-to-zero drop), whereas `ti(x,z,k=6)` carries
 //! exactly `(k-1)^2 = 25` — the Kronecker product `Z₀ ⊗ Z₁` of the two
 //! per-margin null-space bases, each margin contributing `(k-1)=5` dimensions.
+//!
+//! The marginal basis MUST be matched to gam's tensor margin to make the
+//! fitted-surface comparison an apples-to-apples test of the SAME penalized
+//! objective. gam's `ti(x,z,k=6)` margins are cubic B-splines (`degree=3`) with
+//! a second-order DIFFERENCE penalty (`penalty_order=2`) and 6 basis columns
+//! per margin (`num_internal_knots = k-(degree+1) = 2`). That is precisely
+//! mgcv's P-spline `bs="ps"` with `m=c(2,2)` (cubic B-spline + 2nd-order
+//! difference penalty), so the R reference uses `bs="ps", m=list(c(2,2),c(2,2))`
+//! rather than the mgcv `ti` default `bs="cr"` (cubic regression spline with a
+//! curvature/derivative penalty), which would be a genuinely different smoother
+//! and would not justify a tight pointwise bound.
 //!
 //! This test benchmarks two things gam must replicate exactly:
 //!   1. The fitted interaction surface, pointwise on the training grid, must
@@ -114,7 +126,11 @@ fn gam_ti_2d_interaction_matches_mgcv() {
         ],
         r#"
         suppressPackageStartupMessages(library(mgcv))
-        m <- gam(y ~ ti(x, z, k = 6), data = df, method = "REML")
+        # bs="ps", m=c(2,2) per margin == gam's tensor margin: cubic B-spline +
+        # 2nd-order difference penalty, 6 columns/margin for k=6. This matches
+        # gam's penalized objective so the fitted surfaces are comparable.
+        m <- gam(y ~ ti(x, z, bs = "ps", m = list(c(2, 2), c(2, 2)), k = 6),
+                 data = df, method = "REML")
         emit("fitted", as.numeric(fitted(m)))
         # number of coefficients in the ti smooth block (excludes intercept):
         # mgcv stores per-smooth coefficient ranges in m$smooth[[1]]$first.para..last.para
@@ -153,12 +169,13 @@ fn gam_ti_2d_interaction_matches_mgcv() {
         "mgcv ti coefficient count {mgcv_ti_ncoef} != (k-1)^2 = {expected_count}"
     );
 
-    // (2) Both engines REML-fit the same interaction-only objective on identical
-    //     data, so their fitted surfaces must essentially coincide. 0.025 is a
-    //     tight relative-L2 bound that still leaves margin for basis-knot and
-    //     null-space-convention differences between gam's and mgcv's tensor
-    //     B-spline constructions, yet would catch any real divergence in the
-    //     interaction smoother.
+    // (2) Both engines REML-fit the SAME interaction-only objective on identical
+    //     data with a matched marginal basis (cubic P-spline + 2nd-order
+    //     difference penalty, 6 cols/margin), so their fitted surfaces must
+    //     essentially coincide. 0.025 is a tight relative-L2 bound: the only
+    //     residual difference is internal-knot placement (gam vs mgcv quantile
+    //     vs even spacing), which on this uniform grid is negligible, yet the
+    //     bound still catches any real divergence in the interaction smoother.
     assert!(
         corr > 0.999,
         "ti fitted surfaces should be near-identical: pearson={corr:.5}"

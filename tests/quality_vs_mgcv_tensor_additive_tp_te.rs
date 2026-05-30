@@ -186,4 +186,17 @@ fn gam_additive_tp_plus_te_matches_mgcv() {
         rel < 0.025,
         "additive tp+te total fit diverges from mgcv: rel_l2={rel:.5}"
     );
+    // Total EDF (summed over BOTH penalty blocks + intercept) is the most direct
+    // observable of correct cross-block aggregation: a lambda-selection coupling
+    // bug can leave the noise-free fitted surface near-identical while
+    // mis-attributing complexity between blocks, which shows up in the *sum*.
+    // Each block carries the same basis/null-space-convention slack vs mgcv that
+    // its sibling test allows (tp ~15%), so on the additive total — where the
+    // two engines also differ in thin-plate truncation vs k=6 tensor centering —
+    // a 20% relative bound tracks the selected complexity without being trivial.
+    assert!(
+        edf_rel < 0.20,
+        "additive tp+te effective degrees of freedom disagree: \
+         gam={gam_edf:.3} mgcv={mgcv_edf:.3} (rel={edf_rel:.4})"
+    );
 }

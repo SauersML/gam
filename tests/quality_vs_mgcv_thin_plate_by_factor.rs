@@ -3,11 +3,15 @@
 //! smooth is fit per factor level.
 //!
 //! This benchmarks gam's `s(x, by=g, bs='tp')` against
-//! `mgcv::gam(y ~ s(x, by=g, bs='tp', k=15), method="REML")` with `g` a factor.
-//! mgcv's `by=<factor>` mechanism creates an independent thin-plate basis block
-//! per level, so each level gets its OWN smooth function — the canonical way to
-//! fit treatment-specific / group-specific curves in GAM practice. We give the
-//! two engines byte-identical data (same x, same A/B labels, same y) and assert:
+//! `mgcv::gam(y ~ g + s(x, by=g, bs='tp', k=15), method="REML")` with `g` a
+//! factor. mgcv's `by=<factor>` mechanism creates an independent thin-plate
+//! basis block per level, so each level gets its OWN smooth function — the
+//! canonical way to fit treatment-specific / group-specific curves in GAM
+//! practice. The parametric `+ g` carries the per-level intercept (each
+//! by-level smooth is sum-to-zero centered in both engines), matching the
+//! unpenalized treatment-coded factor main effect gam adds automatically for a
+//! categorical `by=`. We give the two engines byte-identical data (same x, same
+//! A/B labels, same y) and assert:
 //!   1. per-LEVEL fitted values agree pointwise (relative L2 over each group),
 //!   2. total effective degrees of freedom agree (same overall complexity), and
 //!   3. the two recovered group curves are genuinely DISTINCT — the by-factor
@@ -117,9 +121,42 @@ fn gam_thin_plate_by_factor_matches_mgcv() {
     let gam_fitted: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
     assert_eq!(gam_fitted.len(), n, "gam fitted length mismatch");
 
+    // Distinctness on a TRUE shared grid: evaluate the level-A and level-B
+    // smooths at the SAME x points (g held at A=0, then at B=1) by rebuilding
+    // the design twice on one common linspace. Because both predictions share
+    // the grid, a collapse to a single shared smooth would force these two
+    // curves to coincide; their disagreement is unambiguous proof of distinct
+    // by-factor blocks (no reliance on the two groups' x draws lining up).
+    const N_GRID: usize = 120;
+    let mut grid_a = Array2::<f64>::zeros((N_GRID, ds.headers.len()));
+    let mut grid_b = Array2::<f64>::zeros((N_GRID, ds.headers.len()));
+    for j in 0..N_GRID {
+        let xj = j as f64 / (N_GRID as f64 - 1.0);
+        grid_a[[j, x_idx]] = xj;
+        grid_a[[j, g_idx]] = 0.0; // level A
+        grid_b[[j, x_idx]] = xj;
+        grid_b[[j, g_idx]] = 1.0; // level B
+    }
+    let curve_a: Vec<f64> = build_term_collection_design(grid_a.view(), &fit.resolvedspec)
+        .expect("rebuild design on grid (level A)")
+        .design
+        .apply(&fit.fit.beta)
+        .to_vec();
+    let curve_b: Vec<f64> = build_term_collection_design(grid_b.view(), &fit.resolvedspec)
+        .expect("rebuild design on grid (level B)")
+        .design
+        .apply(&fit.fit.beta)
+        .to_vec();
+
     // ---- fit the SAME model with mgcv (the mature reference) --------------
     // g arrives as a numeric 0/1 column; rebuild it as the matching factor so
-    // mgcv's by=<factor> creates a separate tp basis per level.
+    // mgcv's by=<factor> creates a separate tp basis per level. The factor main
+    // effect `+ g` is REQUIRED to match gam's model: with an unordered `by=`
+    // factor mgcv centers each level smooth (sum-to-zero), so the per-level
+    // intercept difference lives ONLY in the parametric `g` term — exactly the
+    // unpenalized treatment-coded main effect gam adds automatically for a
+    // categorical `by=`. Omitting `+ g` would leave mgcv structurally unable to
+    // represent that level offset, making the comparison apples-to-oranges.
     let r = run_r(
         &[
             Column::new("x", &x),
@@ -129,7 +166,7 @@ fn gam_thin_plate_by_factor_matches_mgcv() {
         r#"
         suppressPackageStartupMessages(library(mgcv))
         df$g <- factor(ifelse(df$g < 0.5, "A", "B"), levels = c("A", "B"))
-        m <- gam(y ~ s(x, by = g, bs = "tp", k = 15), data = df, method = "REML")
+        m <- gam(y ~ g + s(x, by = g, bs = "tp", k = 15), data = df, method = "REML")
         emit("fitted", as.numeric(fitted(m)))
         emit("edf", sum(m$edf))
         "#,
@@ -158,16 +195,17 @@ fn gam_thin_plate_by_factor_matches_mgcv() {
     let corr_a = pearson(&gam_a, &mgcv_a);
     let corr_b = pearson(&gam_b, &mgcv_b);
 
-    // Distinctness: the two recovered group curves must differ. We compare the
-    // gam-fitted A vs B curves on a shared rank grid (sorted within each group)
-    // — sin(6πx) and cos(4πx) are nearly uncorrelated, so a low cross-group
-    // correlation proves the by-factor blocks did NOT collapse to one smooth.
-    let mut a_sorted = gam_a.clone();
-    let mut b_sorted = gam_b.clone();
-    a_sorted.sort_by(|p, q| p.partial_cmp(q).unwrap());
-    b_sorted.sort_by(|p, q| p.partial_cmp(q).unwrap());
-    // Order-preserving (by x, since each group block is already x-sorted) curves.
-    let cross_corr = pearson(&gam_a, &gam_b);
+    // Distinctness on the shared grid (curve_a, curve_b evaluated at identical
+    // x): sin(6πx) and cos(4πx) over [0,1] are nearly uncorrelated, so a low
+    // cross-group correlation proves the by-factor blocks did NOT collapse onto
+    // one shared smooth. Both curves live on the same x, so a collapse would
+    // force corr -> 1.
+    let cross_corr = pearson(&curve_a, &curve_b);
+    // Per-level fitted ranges over the shared grid, for the diagnostic line.
+    let a_min = curve_a.iter().cloned().fold(f64::INFINITY, f64::min);
+    let a_max = curve_a.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let b_min = curve_b.iter().cloned().fold(f64::INFINITY, f64::min);
+    let b_max = curve_b.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
 
     let edf_rel = (gam_edf - mgcv_edf).abs() / mgcv_edf.abs().max(1.0);
 
@@ -176,11 +214,7 @@ fn gam_thin_plate_by_factor_matches_mgcv() {
          A: rel_l2={rel_a:.4} pearson={corr_a:.5}\n  \
          B: rel_l2={rel_b:.4} pearson={corr_b:.5}\n  \
          cross-group pearson(A,B)={cross_corr:.4} \
-         (A range [{:.3},{:.3}] B range [{:.3},{:.3}])",
-        a_sorted[0],
-        a_sorted[a_sorted.len() - 1],
-        b_sorted[0],
-        b_sorted[b_sorted.len() - 1],
+         (A range [{a_min:.3},{a_max:.3}] B range [{b_min:.3},{b_max:.3}])",
     );
 
     // (1) Per-level agreement. Both engines REML-fit the same per-level tp
@@ -207,8 +241,10 @@ fn gam_thin_plate_by_factor_matches_mgcv() {
 
     // (2) Same overall complexity. Per-group EDF attribution is basis/null-space
     // convention sensitive; the robust, convention-stable quantity is the TOTAL
-    // EDF summed over both level blocks, which both engines report. 20% relative
-    // is the spec's complexity tolerance applied to the model total.
+    // EDF summed over both level blocks (plus the shared g main effect), which
+    // both engines report via sum(m$edf). With matched k=15 and REML the totals
+    // should agree closely; 20% relative tolerates tp null-space convention
+    // differences while still rejecting a wrong penalty structure.
     assert!(
         edf_rel < 0.20,
         "total effective degrees of freedom disagree: gam={gam_edf:.3} mgcv={mgcv_edf:.3} (rel={edf_rel:.3})"
@@ -216,8 +252,8 @@ fn gam_thin_plate_by_factor_matches_mgcv() {
 
     // (3) Distinctness — the by-factor mechanism must keep the levels separate.
     // sin(6πx) vs cos(4πx) on [0,1] are nearly orthogonal; the two recovered
-    // gam curves (sampled at their own x, both x-sorted) must have |corr| well
-    // below 1. A collapse-to-shared-smooth bug would force corr -> 1.
+    // gam curves, evaluated on the SAME x grid, must have |corr| well below 1.
+    // A collapse-to-shared-smooth bug would force corr -> 1.
     assert!(
         cross_corr.abs() < 0.7,
         "by-factor smooths collapsed toward a single shared curve: cross-group pearson={cross_corr:.4}"

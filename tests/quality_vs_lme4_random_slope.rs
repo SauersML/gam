@@ -93,8 +93,13 @@ fn gam_factor_smooth_random_slope_matches_lme4() {
         .map(|i| {
             StringRecord::from(vec![
                 x[i].to_string(),
-                // emit g as an integer-valued string so it infers as categorical
-                (g_code[i] as i64).to_string(),
+                // Emit g as a NON-numeric label ("g0".."g5"). gam's schema
+                // inference classifies any column whose every value parses as
+                // f64 as Continuous — an integer-valued string like "3" would
+                // infer numeric and `fs(x, g)` would reject it ("requires one
+                // categorical factor variable"). A "g" prefix forces the
+                // Categorical kind the factor-smooth needs.
+                format!("g{}", g_code[i] as i64),
                 y[i].to_string(),
             ])
         })
@@ -134,8 +139,10 @@ fn gam_factor_smooth_random_slope_matches_lme4() {
 
     // gam per-group slope: the X_EVAL block for group gi is contiguous; fit the
     // straight line through its 4 predicted points by least squares (slope =
-    // cov(x, yhat) / var(x)). With 4 evenly-spaced points this is exact for the
-    // near-linear factor-smooth recovered here.
+    // cov(x, yhat) / var(x)). The fs() marginal is a penalized cubic B-spline,
+    // but the wiggliness penalty shrinks each group's curve toward its linear
+    // null space (the true DGP is linear), so the LS slope through 4 evenly
+    // spaced points is a faithful summary of the recovered per-group trend.
     let gam_slope = group_slopes(&gam_pred);
 
     // ---- fit the SAME model with lme4 (the mature reference) -------------

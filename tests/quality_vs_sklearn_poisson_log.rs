@@ -13,7 +13,10 @@
 //! additive Poisson regression. statsmodels exposes both the additive smooth
 //! structure and the canonical log link, so it is a far better reference than a
 //! plain linear `PoissonRegressor` (which cannot represent the sinusoidal
-//! covariate effects at all).
+//! covariate effects at all). Crucially we let statsmodels pick its per-smoother
+//! penalty by GCV via `select_penweight()` and refit at the optimum — a bare
+//! `GLMGam(...).fit()` uses the default `alpha=0` (unpenalized, overfitting) and
+//! would NOT target a comparable smoothing objective to gam's REML.
 //!
 //! Both engines fit the same penalized Poisson log-likelihood, so they must
 //! recover essentially the same fitted function. We assert:
@@ -107,8 +110,11 @@ fn gam_poisson_log_matches_statsmodels_glm() {
 
     // ---- fit the SAME model with statsmodels (the mature reference) --------
     // GLMGam with two penalized cubic B-spline smooths (df=5 each, matching
-    // k=5) under Poisson(Log). statsmodels selects the smoothing penalty via its
-    // own criterion; both engines target the same penalized Poisson likelihood.
+    // k=5) under Poisson(Log). select_penweight() picks the per-smoother penalty
+    // by GCV, then we refit at that optimum, so statsmodels actually performs
+    // smoothing-parameter selection (comparable to gam's REML) rather than
+    // fitting unpenalized at the alpha=0 default — both engines then target the
+    // same penalized Poisson(log) likelihood.
     let r = run_python(
         &[
             Column::new("x1", &x1),
@@ -127,8 +133,14 @@ y  = np.asarray(df["y"],  dtype=float)
 X = np.column_stack([x1, x2])
 # Cubic B-spline smooth basis, 5 basis functions per covariate (matches k=5).
 bs = BSplines(X, df=[5, 5], degree=[3, 3])
-model = GLMGam(y, smoother=bs, family=sm.families.Poisson(link=sm.families.links.Log()))
-res = model.fit()
+fam = sm.families.Poisson(link=sm.families.links.Log())
+
+alpha0 = [1.0, 1.0]
+gam = GLMGam(y, smoother=bs, alpha=alpha0, family=fam)
+# GCV search over the per-smoother penalty weights, then refit at the optimum.
+alpha_opt, _ = gam.select_penweight()
+gam = GLMGam(y, smoother=bs, alpha=alpha_opt, family=fam)
+res = gam.fit()
 
 eta_hat = np.asarray(res.predict(which="linear"), dtype=float)
 mu_hat  = np.asarray(res.predict(), dtype=float)
@@ -142,31 +154,50 @@ emit("mu", mu_hat)
     assert_eq!(sm_mu.len(), N, "statsmodels mu length mismatch");
 
     // ---- compare -----------------------------------------------------------
-    // (a) gam's eta_hat vs the known truth: both engines recover the smooth
-    //     linear predictor, so gam should track eta_truth tightly.
-    let rel_truth = relative_l2(&gam_eta, &eta_truth);
+    // (a) gam's eta_hat vs the known truth, as SHAPE recovery. The truth lives
+    //     on a +0.5 pedestal with only ±0.3/±0.2 sinusoidal variation, so a
+    //     relative-L2 against eta_truth would be dominated by the intercept and
+    //     would assert almost nothing about the smooth signal. Pearson is
+    //     offset/scale-invariant and directly measures whether gam recovered the
+    //     sinusoidal structure under Poisson noise.
+    let corr_truth = pearson(&gam_eta, &eta_truth);
     // (b) cross-engine fitted-mean agreement on the exp scale: the inverse link
     //     and PIRLS must produce the same fitted means as statsmodels.
     let corr_mean = pearson(&gam_mean, sm_mu);
-    // Supplementary: cross-engine eta agreement.
+    // (c) cross-engine eta agreement. Both engines see the SAME Poisson draws,
+    //     so sampling noise is shared and cancels — their fitted linear
+    //     predictors should nearly coincide. This is the tight apples-to-apples
+    //     check (relative_l2 here is NOT pedestal-dominated because the engines
+    //     share the +0.5 offset, so the residual is pure cross-engine drift).
     let rel_eta_cross = relative_l2(&gam_eta, sm_eta);
 
     eprintln!(
         "poisson s(x1)+s(x2): n={N} gam_edf={gam_edf:.3} \
-         rel_l2(eta,truth)={rel_truth:.4} pearson(mean)={corr_mean:.5} \
+         pearson(eta,truth)={corr_truth:.5} pearson(mean)={corr_mean:.5} \
          rel_l2(eta,statsmodels)={rel_eta_cross:.4}"
     );
 
-    // Both gam and statsmodels fit the same penalized Poisson(log) additive
-    // model, and the truth is a smooth low-frequency signal these k=5 bases
-    // resolve exactly, so eta_hat must track eta_truth to within 5% relative L2
-    // and the two engines' fitted means must be >0.99 Pearson-correlated.
+    // (a) gam must recover the smooth low-frequency truth that a k=5 cubic basis
+    //     resolves exactly; >0.9 Pearson on eta vs the noise-free truth is the
+    //     floor a correct Poisson(log) PIRLS clears at n=200 (Poisson noise on a
+    //     small-amplitude signal caps perfect recovery, but a broken inverse
+    //     link or design would collapse this well below 0.9).
     assert!(
-        rel_truth < 0.05,
-        "gam linear predictor diverges from the truth: rel_l2={rel_truth:.4}"
+        corr_truth > 0.9,
+        "gam linear predictor fails to recover the smooth truth: pearson={corr_truth:.5}"
     );
+    // (b) Both engines fit the same penalized Poisson(log) model, so their fitted
+    //     means must be >0.99 Pearson-correlated.
     assert!(
         corr_mean > 0.99,
         "gam vs statsmodels fitted means disagree on the exp scale: pearson={corr_mean:.5}"
+    );
+    // (c) Sharing the data, the two engines' linear predictors should agree to
+    //     within ~10% relative L2 (GCV vs REML penalty selection on the same
+    //     k=5 bases differs only in smoothing weight, not in resolvable
+    //     structure). A real inverse-link/PIRLS/design bug in gam blows past this.
+    assert!(
+        rel_eta_cross < 0.10,
+        "gam vs statsmodels linear predictors diverge: rel_l2={rel_eta_cross:.4}"
     );
 }

@@ -17,10 +17,12 @@
 //!   2. the effective degrees of freedom agree (same complexity).
 //!
 //! Because both engines use the *identical* basis (cubic B-spline, k=15) and
-//! penalty (2nd-difference) and both select λ by REML, the fitted functions
-//! should coincide far more tightly than the generic thin-plate comparison; a
-//! real divergence is a real bug in gam's p-spline construction or its REML
-//! smoothing-parameter selection.
+//! penalty (2nd-order difference) and both select λ by REML, the fitted
+//! functions should coincide to within the small gap left by the two REML
+//! optimizers landing on slightly different λ — comparably tight to the
+//! thin-plate REML comparison and far tighter than the independent
+//! pyGAM/GCV cross-check. A real divergence is a real bug in gam's p-spline
+//! construction or its REML smoothing-parameter selection.
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
@@ -70,7 +72,10 @@ fn gam_pspline_matches_mgcv_on_lidar() {
     let gam_fitted: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
 
     // ---- fit the SAME model with mgcv (the mature reference) --------------
-    // Identical basis (bs='ps', k=15) and identical REML objective.
+    // Identical basis (bs='ps', k=15) and identical REML objective. m=c(2,2)
+    // pins mgcv to a cubic B-spline (degree 3) with a 2nd-order difference
+    // penalty — gam's `bs='ps'` defaults (degree=3, penalty_order=2) — so the
+    // comparison cannot silently drift if mgcv's defaults ever change.
     let r = run_r(
         &[
             Column::new("range", &range),
@@ -78,7 +83,7 @@ fn gam_pspline_matches_mgcv_on_lidar() {
         ],
         r#"
         suppressPackageStartupMessages(library(mgcv))
-        m <- gam(logratio ~ s(range, bs = "ps", k = 15), data = df, method = "REML")
+        m <- gam(logratio ~ s(range, bs = "ps", k = 15, m = c(2, 2)), data = df, method = "REML")
         emit("fitted", as.numeric(fitted(m)))
         emit("edf", sum(m$edf))
         "#,

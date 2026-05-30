@@ -8,13 +8,19 @@
 //! the marginal centering / identifiability transform) that a 2-D smooth can
 //! skip. With `k=5` per margin a `te()` carries 5^3 = 125 basis functions
 //! before centering; a wrong Kronecker order, a dropped margin, or centering on
-//! the wrong axis would all leave the additive truth recoverable in 2-D but
-//! corrupt the 3-D fit.
+//! the wrong axis would all corrupt the 3-D fit while a lower-dimensional smooth
+//! could still limp along.
 //!
 //! We fit a deterministic 8x8x6 grid over [0,1]^3 whose mean surface is the
-//! additive function f(x1,x2,x3) = 0.5*sin(2*pi*x1) + 0.3*cos(2*pi*x2) +
-//! 0.2*x3 with both gam and `mgcv::gam(y ~ te(x1,x2,x3,k=5), method="REML")`
-//! and assert the two fitted surfaces agree pointwise on the training grid.
+//! genuinely non-additive function
+//!   f(x1,x2,x3) = 0.5*sin(2*pi*x1) + 0.3*cos(2*pi*x2) + 0.2*x3
+//!               + 0.4*sin(2*pi*x1)*x2*x3
+//! with both gam and `mgcv::gam(y ~ te(x1,x2,x3,k=5), method="REML")` and assert
+//! the two fitted surfaces agree pointwise on the training grid. The
+//! `sin(2*pi*x1)*x2*x3` cross term lives in the pure tensor-interaction space
+//! that an additive model cannot represent, so recovering it actually exercises
+//! the Kronecker-product interaction blocks — the part of the 3-D construction a
+//! purely additive truth would leave untested.
 //!
 //! Both engines REML-fit the same penalized tensor-product objective on the
 //! same data, so their fitted surfaces must essentially coincide. The bound
@@ -37,7 +43,7 @@ use ndarray::Array2;
 fn gam_te_3d_matches_mgcv_gaussian() {
     init_parallelism();
 
-    // ---- deterministic 8x8x6 grid over [0,1]^3, additive mean surface ------
+    // ---- deterministic 8x8x6 grid over [0,1]^3, non-additive mean surface --
     // No random noise: the comparison is between the two REML-penalized fits of
     // an identical, fully reproducible design, so any divergence is attributable
     // to the smoother itself, not to sampling variation.
@@ -56,7 +62,10 @@ fn gam_te_3d_matches_mgcv_gaussian() {
             let v2 = j as f64 / (nx2 as f64 - 1.0);
             for k in 0..nx3 {
                 let v3 = k as f64 / (nx3 as f64 - 1.0);
-                let f = 0.5 * (two_pi * v1).sin() + 0.3 * (two_pi * v2).cos() + 0.2 * v3;
+                let f = 0.5 * (two_pi * v1).sin()
+                    + 0.3 * (two_pi * v2).cos()
+                    + 0.2 * v3
+                    + 0.4 * (two_pi * v1).sin() * v2 * v3;
                 x1.push(v1);
                 x2.push(v2);
                 x3.push(v3);
@@ -139,11 +148,15 @@ fn gam_te_3d_matches_mgcv_gaussian() {
     );
 
     // A real 3-D tensor must track mgcv's fitted surface almost exactly: the
-    // two engines minimize the same REML objective on identical data. Pearson
-    // near 1 confirms the recovered surface shape; rel_l2 < 0.03 confirms the
-    // amplitude/centering. Any dropped margin or wrong Kronecker order would
-    // blow rel_l2 far past 0.1, so this bound asserts something real while
-    // tolerating only convention-level basis differences.
+    // two engines minimize the same REML objective on identical data, and the
+    // smooth non-additive truth is comfortably representable by k=5 cubic
+    // margins so both interpolate it rather than fighting noise. Pearson near 1
+    // confirms the recovered surface shape (including the x1:x2:x3 interaction);
+    // rel_l2 < 0.03 confirms the amplitude/centering. A dropped margin, wrong
+    // Kronecker order, or an interaction block centered on the wrong axis would
+    // fail to recover the cross term and blow rel_l2 far past 0.1, so this bound
+    // asserts something real while tolerating only convention-level basis
+    // differences (cf. the ~0.005 a 1-D smooth achieves vs mgcv).
     assert!(
         corr > 0.999,
         "3-D tensor surfaces should be near-identical to mgcv: pearson={corr:.5}"

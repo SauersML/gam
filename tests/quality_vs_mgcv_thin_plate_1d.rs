@@ -4,13 +4,15 @@
 //!
 //! Reference tool: `mgcv::gam(..., method="REML")` with `s(range, bs="tp", k=20)`.
 //! mgcv's thin-plate regression spline is its default smooth and the canonical
-//! implementation of Wood's (2003) low-rank thin-plate basis. gam implements the
-//! same radial thin-plate kernel construction; in 1-D it reduces to a
-//! spline-like smoother while preserving the radial-basis-kernel structure
-//! (centers + radial penalty + linear nullspace). Both engines select the
-//! smoothing parameter by REML against the *same* penalized objective and the
-//! *same* basis dimension (`k=20`), so the fitted functions should be nearly
-//! identical and a real divergence is a real bug in the smoother.
+//! implementation of Wood's (2003) low-rank thin-plate basis. Both engines
+//! penalize the same thin-plate (curvature) energy and select the smoothing
+//! parameter by REML against the same penalized least-squares objective at the
+//! same basis dimension (`k=20`). They reach that low-rank space differently —
+//! mgcv truncates the thin-plate eigenbasis, gam uses an explicit radial-kernel
+//! basis at 20 centers plus the linear nullspace — so the *fitted function*
+//! should track tightly while the per-coefficient EDF, which depends on the
+//! low-rank convention, may differ modestly. A large divergence in the fitted
+//! smooth is a real bug in the smoother.
 //!
 //! We assert on the quantity that matters — the fitted function on the training
 //! grid — plus the effective degrees of freedom (model complexity).

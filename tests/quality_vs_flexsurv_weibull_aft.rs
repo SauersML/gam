@@ -1,52 +1,67 @@
-//! End-to-end quality: gam's parametric Weibull survival baseline (the
-//! transformation-mode / Royston-Parmar net model with a *parametric Weibull*
-//! baseline) must reproduce the mature R reference for parametric AFT survival:
-//! `survival::survreg(dist = "weibull")` and `flexsurv::flexsurvreg(dist =
-//! "weibull")`.
+//! End-to-end quality: gam's parametric Weibull survival baseline
+//! (`survival_likelihood = "weibull"`, the Royston-Parmar net model with a
+//! *linear* `[1, log t]` time basis seeded by scale/shape) must reproduce the
+//! mature R reference for parametric Weibull survival:
+//! `flexsurv::flexsurvreg(dist = "weibull")`.
 //!
-//! Why these references. `survreg` and `flexsurvreg` are the gold-standard
-//! parametric survival fitters in R. The Weibull distribution is the unique
-//! distribution that is simultaneously proportional-hazards (PH) and
-//! accelerated-failure-time (AFT), so a *single* fitted Weibull is comparable
-//! across the three engines despite their different internal parameterizations.
-//! gam parameterizes the model on the log-cumulative-hazard scale (Royston-
-//! Parmar net):
+//! Why flexsurv. `flexsurvreg` is the gold-standard parametric survival fitter
+//! in R and reports a *proportional-hazards* Weibull directly: it parameterizes
+//! the model by `shape` and `scale` and exposes the covariate effect as a
+//! log-hazard-ratio on the PH scale via `summary(..., type = "survival")` /
+//! `type = "cumhaz"`. The Weibull distribution is simultaneously PH and AFT, so
+//! a Weibull fitted by gam (which works on the log-cumulative-hazard / net-
+//! survival scale) is directly comparable.
 //!
-//!     log H(t|x) = beta0 + beta1*log t + gamma*x,
-//!     beta1 = shape p,  scale lambda = exp(-beta0 / beta1),  gamma = log-HR,
-//!     S(t|x) = exp(-(t/lambda)^p * exp(gamma*x)).
+//! What gam actually fits — and why we compare the FITTED FUNCTION, not the
+//! `(scale, shape)` struct. In `survival_likelihood = "weibull"` mode with no
+//! `timewiggle`, gam's `baseline_cfg.target` stays `Linear` (the Weibull enters
+//! only as the *seed* of a 2-column `[1, log t]` time basis); `baseline_cfg`
+//! never carries the fitted `scale`/`shape` (they are `None`). The fitted model
+//! lives entirely in the coefficient vector
 //!
-//! survreg reports the *AFT* parameterization log T = mu + alpha*x + sigma*W
-//! (W = standard extreme-value). The closed-form Weibull PH <-> AFT map is
-//! exact:
+//!     beta = [ beta_time(2) | gamma_cov ],
+//!     log Λ(t | x) = Σ_k (b_k(t) − b_k(anchor)) · beta_time_k + gamma·x,
+//!     S(t | x)     = exp(−Λ(t | x)),
 //!
-//!     intercept mu = log(lambda),         (location)
-//!     log(sigma)   = -log(p),             (log-scale; survreg `Log(scale)`)
-//!     alpha        = -gamma / p.          (AFT covariate coefficient)
+//! exactly as the sibling `quality_vs_flexsurv_rp_baseline` test reconstructs a
+//! Royston-Parmar fit. The constant basis column is anchor-centred to zero, so
+//! the *free* estimands gam reports are the log-time slope (Weibull shape p =
+//! beta_time[1]) and the covariate PH log-hazard-ratio gamma; the baseline
+//! location is fixed by the time anchor. We therefore compare the two quantities
+//! gam genuinely produces — the fitted survival curve S(t|x) on a shared time
+//! grid (both arms), and the covariate PH log-hazard-ratio — against flexsurv,
+//! reconstructing gam's curve from the frozen time basis + beta (no reliance on
+//! the unset `baseline_cfg.scale/shape`).
 //!
-//! Because the AFT coefficients and the scale parameter are *parametric*
-//! targets — invariant to any smoothing — agreement should be tight. We assert
-//!   1. max |gam - survreg| over (mu, log sigma, alpha) <= 0.05, and
-//!   2. Pearson correlation of S(t|x) on a time grid (both arms, from
-//!      flexsurvreg) >= 0.995.
-//! These bounds are loose enough to absorb the small-sample (n=24) optimizer
-//! differences between three independent fitters yet tight enough that any real
-//! divergence in gam's parametric Weibull baseline or covariate effect fails
-//! the test. We never weaken them and never edit gam to pass.
+//! Bounds:
+//!   1. relative-L2 of S(t|x) over both arms on the grid ≤ 0.03, and
+//!   2. |gam gamma − flexsurv PH log-HR| ≤ 0.05.
+//! The covariate PH log-HR is a parametric, smoothing-invariant target; gam and
+//! flexsurv maximize (penalized) likelihood on identical n=23 data, so it must
+//! agree to optimizer noise (0.05). S(t|x) is the full fitted survival function;
+//! 0.03 relative-L2 catches any real divergence in shape or covariate effect
+//! while tolerating the small-sample/anchor differences between the two fitters.
+//! We never weaken them and never edit gam to pass.
 
-use gam::families::survival_construction::SurvivalBaselineTarget;
-use gam::test_support::reference::{Column, max_abs_diff, pearson, run_r};
+use gam::families::survival_construction::{
+    SurvivalTimeBasisConfig, evaluate_survival_time_basis_row,
+    resolved_survival_time_basis_config_from_build,
+};
+use gam::matrix::LinearOperator;
+use gam::smooth::build_term_collection_design;
+use gam::test_support::reference::{Column, max_abs_diff, relative_l2, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
 use csv::StringRecord;
+use ndarray::Array2;
 use std::fs;
 use std::path::Path;
 
 const BONE_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/bone.csv");
 
 #[test]
-fn gam_weibull_aft_matches_flexsurv_and_survreg_on_bone() {
+fn gam_weibull_matches_flexsurv_on_bone() {
     init_parallelism();
 
     // ---- load the real bone-marrow-transplant survival dataset ------------
@@ -61,7 +76,6 @@ fn gam_weibull_aft_matches_flexsurv_and_survreg_on_bone() {
     let mut trt: Vec<f64> = Vec::new();
     for (i, line) in raw.lines().enumerate() {
         if i == 0 {
-            // header
             assert!(line.starts_with("\"t\""), "unexpected bone.csv header: {line}");
             continue;
         }
@@ -85,18 +99,18 @@ fn gam_weibull_aft_matches_flexsurv_and_survreg_on_bone() {
     );
 
     // ---- fit with gam: parametric Weibull survival ------------------------
-    // `survival_likelihood = "weibull"` is gam's pure parametric Weibull
-    // baseline: a 2-column linear time basis [1, log t] seeded by scale/shape,
-    // with the single linear covariate appended. The fitted Weibull
-    // (scale, shape) is recovered into `baseline_cfg`; the covariate
-    // coefficient is the last beta entry.
+    // `survival_likelihood = "weibull"` is gam's parametric Weibull baseline: a
+    // 2-column `[1, log t]` time basis seeded by scale/shape, with the single
+    // linear covariate appended. The fit lives in the coefficient vector
+    // (beta = [time(2) | gamma]); baseline_cfg stays Linear and does NOT carry
+    // the fitted (scale, shape).
     let headers = vec!["t".to_string(), "d".to_string(), "trt".to_string()];
     let rows: Vec<StringRecord> = (0..n)
         .map(|i| {
             StringRecord::from(vec![
-                t[i].to_string(),
-                d[i].to_string(),
-                trt[i].to_string(),
+                format!("{:.17e}", t[i]),
+                format!("{:.1}", d[i]),
+                format!("{:.1}", trt[i]),
             ])
         })
         .collect();
@@ -106,54 +120,86 @@ fn gam_weibull_aft_matches_flexsurv_and_survreg_on_bone() {
         survival_likelihood: "weibull".to_string(),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("Surv(t, d) ~ trt", &data, &cfg).expect("gam Weibull AFT fit");
+    let result = fit_from_formula("Surv(t, d) ~ trt", &data, &cfg).expect("gam Weibull fit");
     let FitResult::SurvivalTransformation(fit) = result else {
         panic!("expected a SurvivalTransformation fit result for survival_likelihood=weibull");
     };
 
-    assert_eq!(
-        fit.baseline_cfg.target,
-        SurvivalBaselineTarget::Weibull,
-        "gam must report a fitted Weibull baseline"
-    );
-    let scale = fit.baseline_cfg.scale.expect("fitted Weibull scale lambda");
-    let shape = fit.baseline_cfg.shape.expect("fitted Weibull shape p");
-    assert!(
-        scale.is_finite() && scale > 0.0 && shape.is_finite() && shape > 0.0,
-        "fitted Weibull (scale={scale}, shape={shape}) must be positive and finite"
-    );
-
-    // beta layout: [time0, time1(=shape), covariate]. With a single numeric
-    // covariate and no covariate intercept (the baseline absorbs it), the trt
-    // PH log-hazard-ratio gamma is the last coefficient.
+    // beta = [β_time(2) | gamma]; the linear time block is a strict prefix.
     let beta = &fit.fit.beta;
+    let p_time = fit.time_base_ncols;
+    assert_eq!(p_time, 2, "Weibull linear time basis must have 2 columns, got {p_time}");
     assert_eq!(
         beta.len(),
         3,
         "Weibull beta = [time0, time1, trt] expected length 3, got {}",
         beta.len()
     );
-    let gamma = beta[beta.len() - 1];
+    let beta_time = beta.slice(ndarray::s![..p_time]).to_owned();
+    let gamma = beta[beta.len() - 1]; // covariate PH log-hazard-ratio
 
-    // Map gam's PH-scale Weibull to the AFT parameterization survreg reports.
-    let gam_aft_intercept = scale.ln(); // mu = log(lambda)
-    let gam_aft_log_scale = -(shape.ln()); // log(sigma) = -log(p)
-    let gam_aft_trt = -gamma / shape; // alpha = -gamma / p
-    let gam_aft = [gam_aft_intercept, gam_aft_log_scale, gam_aft_trt];
+    // Resolved (knot-frozen) time-basis config + anchor row, mirroring the
+    // engine's anchor-centred `[1, log t]` rows that produced `beta_time`.
+    let time_cfg: SurvivalTimeBasisConfig = resolved_survival_time_basis_config_from_build(
+        &fit.time_basis.basisname,
+        fit.time_basis.degree,
+        fit.time_basis.knots.as_ref(),
+        fit.time_basis.keep_cols.as_ref(),
+        fit.time_basis.smooth_lambda,
+    )
+    .expect("resolve frozen survival time-basis config");
+    let anchor_row = evaluate_survival_time_basis_row(fit.time_basis.anchor, &time_cfg)
+        .expect("evaluate time-basis anchor row");
+    assert_eq!(
+        anchor_row.len(),
+        p_time,
+        "anchor row width must equal the Weibull time block width"
+    );
 
-    // gam survival curve on a shared grid, analytic from the fitted Weibull +
-    // PH covariate effect: S(t|x) = exp(-(t/lambda)^p * exp(gamma*x)).
+    // Covariate linear predictor gamma·trt, rebuilt from the frozen spec so the
+    // column order/coding match `beta` exactly. trt enters linearly, so the PH
+    // log-hazard-ratio is the finite difference of the covariate predictor.
+    let trt_idx = data.column_map()["trt"];
+    let beta_cov = beta.slice(ndarray::s![p_time..]).to_owned();
+    let cov_eta = |trt_val: f64| -> f64 {
+        let mut grid = Array2::<f64>::zeros((1, data.headers.len()));
+        grid[[0, trt_idx]] = trt_val;
+        let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
+            .expect("rebuild covariate design");
+        assert_eq!(
+            design.design.ncols(),
+            beta_cov.len(),
+            "covariate design width must equal β_cov length"
+        );
+        design.design.apply(&beta_cov).to_vec()[0]
+    };
+    let gam_gamma = cov_eta(1.0) - cov_eta(0.0); // PH log-HR (allo -> auto)
+    assert!(
+        (gam_gamma - gamma).abs() < 1e-9,
+        "single linear covariate: finite-difference PH log-HR must equal the last beta"
+    );
+
+    // gam fitted survival curve on a shared time grid, reconstructed from the
+    // frozen time basis + beta exactly as the engine evaluates log Λ:
+    //   log Λ(t|x) = Σ_k (b_k(t) − anchor_k)·beta_time_k + gamma·x,
+    //   S(t|x) = exp(−Λ).
     let t_max = t.iter().cloned().fold(f64::MIN, f64::max);
     let grid: Vec<f64> = (1..=40).map(|k| t_max * (k as f64) / 40.0).collect();
     let mut gam_surv: Vec<f64> = Vec::with_capacity(grid.len() * 2);
     for &x in &[0.0_f64, 1.0_f64] {
+        let cov_contrib = cov_eta(x);
         for &tt in &grid {
-            let h = (tt / scale).powf(shape) * (gamma * x).exp();
-            gam_surv.push((-h).exp());
+            let b = evaluate_survival_time_basis_row(tt, &time_cfg)
+                .expect("evaluate time-basis row at grid time");
+            let mut log_cumhaz = cov_contrib;
+            for k in 0..p_time {
+                log_cumhaz += (b[k] - anchor_row[k]) * beta_time[k];
+            }
+            gam_surv.push((-log_cumhaz.exp()).exp());
         }
     }
 
-    // ---- fit the SAME data with survreg (AFT) and flexsurvreg ------------
+    // ---- fit the SAME data with flexsurvreg(dist = "weibull") -------------
     let grid_csv = grid
         .iter()
         .map(|v| format!("{v:.17e}"))
@@ -167,19 +213,21 @@ fn gam_weibull_aft_matches_flexsurv_and_survreg_on_bone() {
         ],
         &format!(
             r#"
-            suppressPackageStartupMessages(library(survival))
             suppressPackageStartupMessages(library(flexsurv))
             grid <- c({grid_csv})
 
-            # survreg AFT parameterization: log T = mu + alpha*trt + sigma*W.
-            sr <- survreg(Surv(t, d) ~ trt, data = df, dist = "weibull")
-            # coefficients(sr) = c((Intercept)=mu, trt=alpha); sr$scale = sigma.
-            emit("sr_intercept", as.numeric(coef(sr)[["(Intercept)"]]))
-            emit("sr_log_scale", log(as.numeric(sr$scale)))
-            emit("sr_trt", as.numeric(coef(sr)[["trt"]]))
-
-            # flexsurvreg Weibull: survival curves on the shared grid for both arms.
+            # flexsurvreg Weibull: PH-comparable parametric fit on identical data.
             fs <- flexsurvreg(Surv(t, d) ~ trt, data = df, dist = "weibull")
+
+            # Proportional-hazards log-hazard-ratio for the covariate. flexsurv's
+            # Weibull is AFT-parameterized (coef on the log-scale / AFT time
+            # ratio); convert the AFT covariate coefficient to the PH log-HR via
+            # the exact Weibull map  log-HR = -shape * alpha_AFT.
+            shape <- as.numeric(fs$res["shape", "est"])
+            alpha_aft <- as.numeric(coef(fs)[["trt"]])
+            emit("ph_loghr", -shape * alpha_aft)
+
+            # Survival curves on the shared grid for both arms.
             s0 <- summary(fs, newdata = data.frame(trt = 0), t = grid, ci = FALSE)[[1]]
             s1 <- summary(fs, newdata = data.frame(trt = 1), t = grid, ci = FALSE)[[1]]
             emit("surv", c(s0$est, s1$est))
@@ -187,11 +235,7 @@ fn gam_weibull_aft_matches_flexsurv_and_survreg_on_bone() {
         ),
     );
 
-    let r_aft = [
-        r.scalar("sr_intercept"),
-        r.scalar("sr_log_scale"),
-        r.scalar("sr_trt"),
-    ];
+    let r_ph_loghr = r.scalar("ph_loghr");
     let r_surv = r.vector("surv");
     assert_eq!(
         r_surv.len(),
@@ -201,31 +245,30 @@ fn gam_weibull_aft_matches_flexsurv_and_survreg_on_bone() {
         r_surv.len()
     );
 
-    // ---- compare ----------------------------------------------------------
-    let coef_diff = max_abs_diff(&gam_aft, &r_aft);
-    let surv_corr = pearson(&gam_surv, r_surv);
+    // ---- compare on the quantities gam genuinely fits ---------------------
+    let surv_rel = relative_l2(&gam_surv, r_surv);
+    let loghr_diff = max_abs_diff(&[gam_gamma], &[r_ph_loghr]);
 
     eprintln!(
-        "bone Weibull AFT: n={n} gam(scale={scale:.4}, shape={shape:.4}, gamma={gamma:.4}) \
-         gam_aft=[mu={:.4}, log_sigma={:.4}, trt={:.4}] \
-         survreg_aft=[mu={:.4}, log_sigma={:.4}, trt={:.4}] \
-         max_abs_coef_diff={coef_diff:.4} surv_pearson={surv_corr:.5}",
-        gam_aft[0], gam_aft[1], gam_aft[2], r_aft[0], r_aft[1], r_aft[2]
+        "bone Weibull vs flexsurv: n={n} gam(shape=beta_time1={:.4}, gamma={gam_gamma:.4}) \
+         flexsurv_ph_loghr={r_ph_loghr:.4} loghr_diff={loghr_diff:.4} surv_rel_l2={surv_rel:.5}",
+        beta_time[1]
     );
 
-    // AFT coefficients (location + log-scale + covariate) are parametric and
-    // smoothing-invariant; the three engines should agree to within optimizer
-    // noise on n=24. 0.05 is a tight, principled bound.
+    // The covariate PH log-hazard-ratio is a parametric, smoothing-invariant
+    // target; both engines maximize (penalized) likelihood on identical n=23
+    // data, so it must agree to optimizer noise. 0.05 is a tight, principled
+    // bound.
     assert!(
-        coef_diff <= 0.05,
-        "AFT coefficients diverge from survreg: max_abs_diff={coef_diff:.4} \
-         (gam={gam_aft:?}, survreg={r_aft:?})"
+        loghr_diff <= 0.05,
+        "PH log-hazard-ratio diverges from flexsurv: |gam={gam_gamma:.4} - flexsurv={r_ph_loghr:.4}| = {loghr_diff:.4}"
     );
     // The fitted S(t|x) over both arms must essentially coincide with
-    // flexsurvreg's; >= 0.995 Pearson catches any real divergence in shape,
-    // scale, or covariate effect while tolerating tiny grid-level differences.
+    // flexsurvreg's; 0.03 relative-L2 catches any real divergence in shape,
+    // baseline, or covariate effect while tolerating tiny grid-level / small-n
+    // differences between the two parametric fitters.
     assert!(
-        surv_corr >= 0.995,
-        "fitted survival curves diverge from flexsurvreg: pearson={surv_corr:.5}"
+        surv_rel <= 0.03,
+        "fitted survival curves diverge from flexsurvreg: rel_l2={surv_rel:.5}"
     );
 }

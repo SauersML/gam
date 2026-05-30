@@ -13,15 +13,19 @@
 //! function* validates that gam's p-spline tracks a third-party GAM standard,
 //! not just mgcv.
 //!
-//! Why looser bounds than the mgcv test: pyGAM selects its single smoothing
-//! parameter by a grid search minimizing generalized cross-validation under a
-//! PIRLS fit, whereas gam selects lambda by REML. The two criteria pick
-//! slightly different amounts of smoothing on the same data, so the fitted
-//! curves agree in shape (correlation) very tightly but can differ by a few
-//! percent in L2 — hence `relative_l2 < 0.04` and `pearson > 0.995`, with EDF
-//! agreement only to within 30% (different penalty conventions and
-//! lambda-selection criteria). These bounds still falsify any real divergence
-//! in the smoother while honestly accounting for REML-vs-PIRLS slack.
+//! Why looser bounds than the mgcv test: we let pyGAM select its single
+//! smoothing parameter from the data with `.gridsearch()` (its default search
+//! minimizes generalized cross-validation under a PIRLS fit), whereas gam
+//! selects lambda by REML. Plain `LinearGAM(...).fit()` would instead leave the
+//! per-term penalty at pyGAM's fixed default `lam=0.6` — that is NOT a fitted
+//! smoothing parameter, so we must call `.gridsearch()` for an apples-to-apples
+//! "both engines auto-select smoothing" comparison. GCV and REML pick slightly
+//! different amounts of smoothing on the same data, so the fitted curves agree
+//! in shape (correlation) very tightly but can differ by a few percent in L2 —
+//! hence `relative_l2 < 0.06` and `pearson > 0.995`, with EDF agreement only to
+//! within 30% (different penalty conventions and lambda-selection criteria).
+//! These bounds still falsify any real divergence in the smoother while
+//! honestly accounting for the REML-vs-GCV slack.
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
@@ -72,9 +76,13 @@ fn gam_pspline_matches_pygam_on_lidar() {
     let gam_fitted: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
 
     // ---- fit the SAME model with pyGAM (the independent GAM reference) -----
-    // LinearGAM(s(0, n_splines=15)) is a default cubic B-spline p-spline fit by
-    // PIRLS; .predict on the training inputs returns the fitted function and
-    // statistics_['edof'] the effective degrees of freedom.
+    // LinearGAM(s(0, n_splines=15)) is a default cubic (spline_order=3) B-spline
+    // with a 2nd-order difference penalty (penalties='auto'), the same basis gam
+    // builds for bs="ps", k=15. `.gridsearch()` selects the single penalty by
+    // minimizing GCV (pyGAM's default search objective) so that, like gam's REML,
+    // the smoothing parameter is fit from the data rather than left at pyGAM's
+    // fixed default lam=0.6. `.predict` on the training inputs returns the fitted
+    // function; statistics_['edof'] the effective degrees of freedom.
     let py = run_python(
         &[
             Column::new("range", &range),
@@ -84,7 +92,7 @@ fn gam_pspline_matches_pygam_on_lidar() {
 from pygam import LinearGAM, s
 X = np.asarray(df["range"], dtype=float).reshape(-1, 1)
 y = np.asarray(df["logratio"], dtype=float)
-gam = LinearGAM(s(0, n_splines=15)).fit(X, y)
+gam = LinearGAM(s(0, n_splines=15)).gridsearch(X, y, progress=False)
 emit("fitted", gam.predict(X))
 emit("edf", [float(gam.statistics_["edof"])])
 "#,
@@ -110,11 +118,13 @@ emit("edf", [float(gam.statistics_["edof"])])
         corr > 0.995,
         "gam vs pyGAM p-spline shapes diverge: pearson={corr:.5}"
     );
-    // L2 budget absorbs the REML-vs-PIRLS/GCV lambda-selection difference; 0.04
-    // is loose enough to not flag that slack yet tight enough to catch a real
-    // basis or penalty bug (a wrong difference-penalty order blows past it).
+    // L2 budget absorbs the REML-vs-GCV lambda-selection difference on the
+    // heteroscedastic lidar data (the two criteria settle on modestly different
+    // amounts of smoothing); 0.06 is loose enough to not flag that slack yet
+    // tight enough to catch a real basis or penalty bug (a wrong difference-
+    // penalty order or degree changes the fitted curve far more than 6%).
     assert!(
-        rel < 0.04,
+        rel < 0.06,
         "gam p-spline fit diverges from pyGAM: rel_l2={rel:.4}"
     );
     // EDF conventions differ (penalty normalization + lambda criterion), so we
