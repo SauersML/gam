@@ -38,11 +38,14 @@
 //! 0.05). Too low => SE underestimates (e.g. ignores smoothing-penalty variance);
 //! too high => SE overestimates. The window is tight enough that a systematic SE
 //! bias of more than ~half a nominal-level point is rejected, yet wide enough to
-//! absorb Monte-Carlo error from 100 x 50 = 5000 coverage trials
-//! (binomial s.e. of a 0.90 rate over 5000 draws ~= 0.004, so the +/-0.05 window
-//! is ~12 sigma — it asserts a real coverage property, not noise). mgcv's own
-//! coverage on the identical data is reported alongside as the calibration
-//! reference.
+//! absorb Monte-Carlo error. The 50 eval points within one replicate share the
+//! same fitted curve and the same noise draw, so they are strongly correlated;
+//! the effective sample size for the coverage rate is therefore on the order of
+//! the 100 replicates, not the 5000 (replicate, point) pairs. The between-
+//! replicate s.e. of the coverage estimate is ~0.005-0.01, so the +/-0.05 window
+//! is several s.e. wide — loose enough to never fail on noise, tight enough that
+//! a systematic SE bias of half a nominal point is rejected. mgcv's own coverage
+//! on the identical data is reported alongside as the calibration reference.
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
@@ -282,8 +285,9 @@ fn ci_coverage_matches_mgcv_on_gaussian_truth_90pct() {
 
     // The core assertion: gam's penalized-covariance interval must achieve close
     // to the nominal 90% coverage of the true mean function. [0.85, 0.95] is the
-    // principled +/- 0.05 window around 0.90; with ~5000 trials it rejects any
-    // systematic SE bias while tolerating Monte-Carlo noise.
+    // principled +/- 0.05 window around 0.90; it rejects a systematic SE bias of
+    // half a nominal point while tolerating the between-replicate Monte-Carlo
+    // noise (~0.005-0.01 s.e. over the 100 effectively-independent replicates).
     assert!(
         gam_coverage_vp >= 0.85 && gam_coverage_vp <= 0.95,
         "gam 90% CI empirical coverage {gam_coverage_vp:.4} is outside the nominal window \
