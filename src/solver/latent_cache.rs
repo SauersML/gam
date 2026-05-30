@@ -139,7 +139,7 @@ pub(crate) enum LatentBasisKind {
     Duchon {
         centers: Array2<f64>,
         length_scale: Option<f64>,
-        power: usize,
+        power: f64,
         nullspace_order: DuchonNullspaceOrder,
         aniso_log_scales: Vec<f64>,
     },
@@ -224,7 +224,7 @@ impl LatentBasisKind {
                 hasher.write_usize(centers.nrows());
                 hasher.write_usize(centers.ncols());
                 hash_optional_f64(*length_scale, &mut hasher);
-                hasher.write_usize(*power);
+                hasher.write_u64(power.to_bits());
                 hash_duchon_nullspace_order(*nullspace_order, &mut hasher);
                 hash_f64_slice(aniso_log_scales, &mut hasher);
                 hash_matrix(centers, &mut hasher);
