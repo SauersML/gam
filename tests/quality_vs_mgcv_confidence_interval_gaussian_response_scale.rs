@@ -9,13 +9,17 @@
 //! What this pins down. For a Gaussian model with the identity link the inverse
 //! link is g⁻¹(η) = η, so its Jacobian dμ/dη ≡ 1 and the response-scale SE is
 //! algebraically *identical* to the η-scale SE — no transformation happens. gam
-//! constructs response-scale SEs via the delta method
-//! (`MeanIntervalMethod::Delta`, `mean_standard_error` of
-//! `PredictUncertaintyResult`), multiplying the η-scale SE by the inverse-link
-//! Jacobian. Under identity that multiplier must collapse to exactly 1, so gam's
-//! `mean_standard_error` must reproduce mgcv's `type="response"` `se.fit`. A
-//! mismatch would expose an algebra error in gam's delta-method SE path (e.g. a
-//! wrong Jacobian, a dropped scale factor, or a covariance-mode mismatch).
+//! reports the response-scale SE in `PredictUncertaintyResult::mean_standard_error`
+//! as the standard deviation of μ̂ = g⁻¹(η̂) under the posterior uncertainty in
+//! η̂ (`strategy.posterior_meanvariance`); to first order this is the delta-method
+//! Var(μ̂) = (dμ/dη)² · Var(η̂). Under the identity link dμ/dη ≡ 1 so that
+//! variance collapses to exactly Var(η̂), and `mean_standard_error` must equal
+//! `eta_standard_error` element-wise and reproduce mgcv's `type="response"`
+//! `se.fit`. A mismatch would expose an algebra error in gam's response-scale SE
+//! path (e.g. a wrong Jacobian, a dropped scale factor, or a covariance-mode
+//! mismatch). `MeanIntervalMethod::Delta` additionally fixes how the response
+//! *interval* (not the SE) is formed — μ̂ ± z · se — keeping it on the same
+//! delta-method footing rather than transforming the η interval endpoints.
 //!
 //! Matching conventions. mgcv's default `predict.gam` SEs use the posterior
 //! covariance `Vp` *conditional on the estimated smoothing parameters*
