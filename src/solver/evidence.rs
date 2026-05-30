@@ -47,6 +47,7 @@ use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::linalg::faer_ndarray::FaerEigh;
+use crate::linalg::triangular::cholesky_solve_vector;
 use crate::solver::arrow_schur::{ArrowFactorCache, ArrowSchurSystem};
 
 pub const ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD: usize = 1024;
@@ -614,7 +615,7 @@ pub fn ift_du_dbeta(cache: &ArrowFactorCache) -> Array2<f64> {
                 // available but failed to populate it — contract violation.
                 return Array2::<f64>::from_elem((total_len, k), f64::NAN);
             }
-            let y = chol_lower_solve_vector(factor, &rhs_i);
+            let y = cholesky_solve_vector(factor, &rhs_i);
             for c in 0..di {
                 out[[row_base + c, col]] = -y[c];
             }
@@ -651,7 +652,7 @@ pub fn ift_dbeta_drho(
         for row in 0..k {
             rhs[row] = dg_red_drho[[row, a]];
         }
-        let x = chol_lower_solve_vector(schur, &rhs);
+        let x = cholesky_solve_vector(schur, &rhs);
         for row in 0..k {
             out[[row, a]] = -x[row];
         }
@@ -710,7 +711,7 @@ pub fn ift_du_drho(
             }
             let rhs_slice = rhs.slice(ndarray::s![..di]).to_owned();
             // u_ρ_i = -H_uu_i⁻¹ rhs_i, undamped factor.
-            let v = chol_lower_solve_vector(cache.undamped_factor(i), &rhs_slice);
+            let v = cholesky_solve_vector(cache.undamped_factor(i), &rhs_slice);
             for c in 0..di {
                 out[[row_base + c, a]] = -v[c];
             }
@@ -878,7 +879,7 @@ pub fn evidence_grad_rho(
                 out.fill(f64::NAN);
                 return out;
             }
-            let v = chol_lower_solve_vector(factor, &rhs_i);
+            let v = cholesky_solve_vector(factor, &rhs_i);
             for c in 0..di {
                 yi[[c, col]] = v[c];
             }
@@ -911,7 +912,7 @@ pub fn evidence_grad_rho(
                 for r0 in 0..di {
                     tr_rhs_i[r0] = m_i[[r0, col]];
                 }
-                let v = chol_lower_solve_vector(cache.undamped_factor(i), &tr_rhs_i);
+                let v = cholesky_solve_vector(cache.undamped_factor(i), &tr_rhs_i);
                 row_trace_acc += v[col];
             }
         }
@@ -981,7 +982,7 @@ pub fn evidence_grad_rho(
             for r0 in 0..k {
                 col_scratch[r0] = da[[r0, j]];
             }
-            let v = chol_lower_solve_vector(schur, &col_scratch);
+            let v = cholesky_solve_vector(schur, &col_scratch);
             schur_trace_acc += v[j];
         }
 
@@ -1136,36 +1137,6 @@ pub fn cache_matches_system(cache: &ArrowFactorCache, sys: &ArrowSchurSystem) ->
         && cache.undamped_factor_count() == sys.rows.len()
         && cache.manifold_mode_fingerprint == sys.manifold_mode_fingerprint
         && cache.row_hessian_fingerprint == sys.current_row_hessian_fingerprint()
-}
-
-// ---------------------------------------------------------------------------
-// Local linear-algebra utilities (copy of arrow_schur's private helpers).
-//
-// arrow_schur.rs keeps `cholesky_lower` / `chol_solve_vector` private to
-// its module. We re-implement the solve here so this module does not
-// modify arrow_schur.rs's public surface. The Cholesky decomposition
-// itself is owned by the cache producer; we only need the solve.
-// ---------------------------------------------------------------------------
-
-fn chol_lower_solve_vector(l: &Array2<f64>, b: &Array1<f64>) -> Array1<f64> {
-    let n = l.nrows();
-    let mut y = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let mut sum = b[i];
-        for kk in 0..i {
-            sum -= l[[i, kk]] * y[kk];
-        }
-        y[i] = sum / l[[i, i]];
-    }
-    let mut x = Array1::<f64>::zeros(n);
-    for i in (0..n).rev() {
-        let mut sum = y[i];
-        for kk in (i + 1)..n {
-            sum -= l[[kk, i]] * x[kk];
-        }
-        x[i] = sum / l[[i, i]];
-    }
-    x
 }
 
 // ---------------------------------------------------------------------------

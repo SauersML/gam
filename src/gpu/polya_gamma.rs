@@ -53,6 +53,8 @@
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
+use crate::linalg::triangular::{back_substitution_lower_transpose, cholesky_solve_vector};
+
 #[cfg(target_os = "linux")]
 use super::error::GpuError;
 
@@ -670,7 +672,7 @@ pub fn logistic_gibbs_step(
     let l = cholesky_lower_inplace(q.clone())
         .map_err(|e| format!("logistic_gibbs_step Cholesky: {e}"))?;
     // μ = (Q_ω)⁻¹ m via L y = m, Lᵀ μ = y.
-    let mean = solve_lower_then_upper(&l, &m);
+    let mean = cholesky_solve_vector(&l, &m);
 
     // Step 6: β ← μ + L⁻ᵀ η.
     let mut norm_state = XorwowState::new(norm_seed, 0);
@@ -678,7 +680,7 @@ pub fn logistic_gibbs_step(
     for j in 0..p {
         eta[j] = norm_state.next_norm();
     }
-    let perturb = solve_upper_transpose(&l, &eta);
+    let perturb = back_substitution_lower_transpose(&l, &eta);
     let mut beta_new = Array1::<f64>::zeros(p);
     for j in 0..p {
         beta_new[j] = mean[j] + perturb[j];
@@ -708,41 +710,6 @@ fn cholesky_lower_inplace(mut a: Array2<f64>) -> Result<Array2<f64>, String> {
         }
     }
     Ok(a)
-}
-
-fn solve_lower_then_upper(l: &Array2<f64>, rhs: &Array1<f64>) -> Array1<f64> {
-    let n = l.nrows();
-    let mut y = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let mut s = rhs[i];
-        for k in 0..i {
-            s -= l[[i, k]] * y[k];
-        }
-        y[i] = s / l[[i, i]];
-    }
-    let mut x = Array1::<f64>::zeros(n);
-    for i in (0..n).rev() {
-        let mut s = y[i];
-        for k in (i + 1)..n {
-            s -= l[[k, i]] * x[k];
-        }
-        x[i] = s / l[[i, i]];
-    }
-    x
-}
-
-fn solve_upper_transpose(l: &Array2<f64>, rhs: &Array1<f64>) -> Array1<f64> {
-    // Solves Lᵀ x = rhs for x.
-    let n = l.nrows();
-    let mut x = Array1::<f64>::zeros(n);
-    for i in (0..n).rev() {
-        let mut s = rhs[i];
-        for k in (i + 1)..n {
-            s -= l[[k, i]] * x[k];
-        }
-        x[i] = s / l[[i, i]];
-    }
-    x
 }
 
 // ────────────────────────────────────────────────────────────────────────

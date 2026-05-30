@@ -99,6 +99,9 @@ use std::sync::Arc;
 
 use crate::cache::Fingerprinter;
 use crate::linalg::faer_ndarray::{FaerArrayView, FaerLlt};
+use crate::linalg::triangular::{
+    cholesky_solve_matrix, cholesky_solve_vector, forward_substitution_lower_matrix,
+};
 use crate::solver::arrow_schur_beta_graph::BetaCouplingGraph;
 use crate::terms::analytic_penalties::{AnalyticPenaltyKind, AnalyticPenaltyRegistry, PenaltyTier};
 use crate::terms::latent_coord::{LatentCoordValues, LatentManifold};
@@ -1200,15 +1203,15 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
     }
 
     fn solve_block_vector(&self, factor: &Array2<f64>, rhs: &Array1<f64>) -> Array1<f64> {
-        chol_solve_vector(factor, rhs)
+        cholesky_solve_vector(factor, rhs)
     }
 
     fn solve_block_matrix(&self, factor: &Array2<f64>, rhs: &Array2<f64>) -> Array2<f64> {
-        chol_solve_matrix(factor, rhs)
+        cholesky_solve_matrix(factor, rhs)
     }
 
     fn sqrt_solve_block_matrix(&self, factor: &Array2<f64>, rhs: &Array2<f64>) -> Array2<f64> {
-        lower_triangular_solve_matrix(factor, rhs)
+        forward_substitution_lower_matrix(factor, rhs)
     }
 
     fn block_gemm_subtract(
@@ -3253,7 +3256,7 @@ impl ArrowFactorCache {
             if !self.apply_htbeta_row(i, delta_beta.view(), &mut rhs_slice) {
                 return Array1::<f64>::zeros(total_len);
             }
-            let v = chol_solve_vector(self.undamped_factor(i), &rhs_slice);
+            let v = cholesky_solve_vector(self.undamped_factor(i), &rhs_slice);
             let row_base = self.row_offsets[i];
             for c in 0..di {
                 out[row_base + c] = -v[c];
@@ -3312,7 +3315,7 @@ impl ArrowFactorCache {
                 }
             }
             let rhs_slice = rhs.slice(ndarray::s![..di]).to_owned();
-            let v = chol_solve_vector(self.undamped_factor(i), &rhs_slice);
+            let v = cholesky_solve_vector(self.undamped_factor(i), &rhs_slice);
             for c in 0..di {
                 out[row_base + c] = -v[c];
             }
@@ -3372,7 +3375,7 @@ impl ArrowFactorCache {
             let rhs = delta_gt
                 .slice(ndarray::s![row_base..row_base + di])
                 .to_owned();
-            let v = chol_solve_vector(self.undamped_factor(i), &rhs);
+            let v = cholesky_solve_vector(self.undamped_factor(i), &rhs);
             for c in 0..di {
                 out[row_base + c] = -v[c];
             }
@@ -3453,7 +3456,7 @@ impl ArrowFactorCache {
                 }
                 e_j[j] = 1.0;
                 let e_j_slice = e_j.slice(ndarray::s![..di]).to_owned();
-                let a = chol_solve_vector(factor, &e_j_slice);
+                let a = cholesky_solve_vector(factor, &e_j_slice);
                 // w = H_βt^(i) a (a K-vector); accumulator must start zeroed.
                 w.fill(0.0);
                 if !self.apply_htbeta_row_transpose(i, a.view(), &mut w, None) {
@@ -3465,7 +3468,7 @@ impl ArrowFactorCache {
                     });
                 }
                 // z = S⁻¹ w; correction = w · z.
-                let z = chol_solve_vector(schur_factor, &w);
+                let z = cholesky_solve_vector(schur_factor, &w);
                 let mut corr = 0.0_f64;
                 for c in 0..self.k {
                     corr += w[c] * z[c];
@@ -3522,7 +3525,7 @@ impl ArrowFactorCache {
             });
         }
         let rhs_owned = rhs.to_owned();
-        Ok(chol_solve_vector(schur_factor, &rhs_owned))
+        Ok(cholesky_solve_vector(schur_factor, &rhs_owned))
     }
 
     /// Diagonal of the β-block of the full inverse, `diag((H⁻¹)_ββ) = diag(S_β⁻¹)`,
@@ -3547,7 +3550,7 @@ impl ArrowFactorCache {
                 e_j[c] = 0.0;
             }
             e_j[j] = 1.0;
-            let col = chol_solve_vector(schur_factor, &e_j);
+            let col = cholesky_solve_vector(schur_factor, &e_j);
             out[j] = col[j];
         }
         Ok(out)
@@ -4189,7 +4192,7 @@ fn solve_dense_reduced_system(
     // accumulates the (H_tt^(i))⁻¹ contributions of every row in finite
     // precision. With many weak-but-admissible rows those terms can sum to a
     // Schur matrix whose Cholesky succeeds yet whose condition number is far
-    // past the safe inversion regime, so `chol_solve_vector` yields an
+    // past the safe inversion regime, so `cholesky_solve_vector` yields an
     // inaccurate Δβ that is silently propagated to the Newton step. Apply the
     // same diagonal-ratio κ proxy used per-row to the reduced factor and treat
     // an over-threshold estimate as a Schur-stability failure: `SchurFactorFailed`
@@ -4213,7 +4216,7 @@ fn solve_dense_reduced_system(
             });
         }
     }
-    let direct = chol_solve_vector(&factor, rhs_beta);
+    let direct = cholesky_solve_vector(&factor, rhs_beta);
     if step_inside_trust_region(direct.view(), options.trust_region.radius, metric_weights) {
         return Ok((direct, Some(factor), PcgDiagnostics::default()));
     }
@@ -5492,60 +5495,6 @@ fn cholesky_lower(a: &Array2<f64>) -> Result<Array2<f64>, String> {
     Ok(l)
 }
 
-fn chol_solve_vector(l: &Array2<f64>, b: &Array1<f64>) -> Array1<f64> {
-    let n = l.nrows();
-    let mut y = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let mut sum = b[i];
-        for kk in 0..i {
-            sum -= l[[i, kk]] * y[kk];
-        }
-        y[i] = sum / l[[i, i]];
-    }
-    let mut x = Array1::<f64>::zeros(n);
-    for i in (0..n).rev() {
-        let mut sum = y[i];
-        for kk in (i + 1)..n {
-            sum -= l[[kk, i]] * x[kk];
-        }
-        x[i] = sum / l[[i, i]];
-    }
-    x
-}
-
-fn chol_solve_matrix(l: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
-    let n = l.nrows();
-    let m = b.ncols();
-    let mut out = Array2::<f64>::zeros((n, m));
-    let mut col = Array1::<f64>::zeros(n);
-    for cidx in 0..m {
-        for r in 0..n {
-            col[r] = b[[r, cidx]];
-        }
-        let x = chol_solve_vector(l, &col);
-        for r in 0..n {
-            out[[r, cidx]] = x[r];
-        }
-    }
-    out
-}
-
-fn lower_triangular_solve_matrix(l: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
-    let n = l.nrows();
-    let m = b.ncols();
-    let mut out = Array2::<f64>::zeros((n, m));
-    for cidx in 0..m {
-        for i in 0..n {
-            let mut sum = b[[i, cidx]];
-            for kk in 0..i {
-                sum -= l[[i, kk]] * out[[kk, cidx]];
-            }
-            out[[i, cidx]] = sum / l[[i, i]];
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5736,7 +5685,7 @@ mod tests {
         // Solve hjoint · x = -gjoint via cholesky.
         let lj = cholesky_lower(&hjoint).expect("dense ref PD");
         let neg_g = gjoint.mapv(|v| -v);
-        let xref = chol_solve_vector(&lj, &neg_g);
+        let xref = cholesky_solve_vector(&lj, &neg_g);
         // Compare β.
         for a in 0..k {
             assert!(
@@ -5979,7 +5928,7 @@ mod tests {
 
         // Dense inverse via Cholesky against the identity.
         let l = cholesky_lower(&h).expect("assembled bordered H must be SPD");
-        let h_inv = chol_solve_matrix(&l, &Array2::<f64>::eye(dim));
+        let h_inv = cholesky_solve_matrix(&l, &Array2::<f64>::eye(dim));
 
         let diag = cache
             .latent_block_inverse_diagonal()
@@ -6057,7 +6006,7 @@ mod tests {
             }
         }
         let l = cholesky_lower(&h).expect("assembled bordered H must be SPD");
-        let h_inv = chol_solve_matrix(&l, &Array2::<f64>::eye(dim));
+        let h_inv = cholesky_solve_matrix(&l, &Array2::<f64>::eye(dim));
 
         // The β-block of H⁻¹ is the bottom-right K×K corner.
         let beta_off = n * d;
