@@ -1,6 +1,6 @@
 use crate::faer_ndarray::{
-    FaerArrayView, array2_to_matmut, fast_ab, fast_atb, fast_atv, fast_atv_into, fast_av,
-    fast_av_into, fast_xt_diag_x,
+    CrossprodAccum, CrossprodStructure, FaerArrayView, array2_to_matmut, fast_ab, fast_atb,
+    fast_atv, fast_atv_into, fast_av, fast_av_into, fast_xt_diag_x, stream_weighted_crossprod_into,
 };
 use crate::resource::{
     MaterializationPolicy, MatrixMaterializationError, ResourcePolicy, rows_for_target_bytes,
@@ -6524,90 +6524,22 @@ impl EmbeddedColumnBlock<'_> {
     }
 }
 
-/// Streaming chunked BLAS computation of X^T * diag(W) * X.
+/// Streaming chunked computation of X^T * diag(W) * X into a `p × p` output.
 ///
-/// Processes rows in cache-friendly chunks, scaling each row of X by w
-/// and accumulating Xᵀ·(W·X) via BLAS matmul. Peak intermediate allocation
-/// is chunk_size × p × 8 bytes (~8 MB) instead of n × p × 8 bytes.
-///
-/// Uses signed weights directly; the prior sqrt(max(0, w))-then-Gram form
-/// clipped negative weights to zero and corrupted observed-Hessian assembly
-/// whenever the diagonal block had any negative entries.
+/// Thin adapter over the shared dense weighted-Gram kernel
+/// [`stream_weighted_crossprod_into`]: it requests a full output and replaces
+/// `out` with `Xᵀ·diag(W)·X`. All callers here pass a freshly-zeroed buffer
+/// and want the complete (non-triangular) Gram, so the chunk sizing, signed
+/// negative-weight handling, and layout tuning all live in the one kernel.
 fn streaming_blas_xt_diag_x(x: &Array2<f64>, weights: &Array1<f64>, out: &mut Array2<f64>) {
-    let n = x.nrows();
-    let p = x.ncols();
-    if n == 0 || p == 0 {
-        return;
-    }
-
-    // Target ~8MB working set per chunk (matches faer_ndarray streaming path).
-    const TARGET_BYTES: usize = 8 * 1024 * 1024;
-    const MIN_ROWS: usize = 512;
-    const MAX_ROWS: usize = 131_072;
-    let chunk_rows = (TARGET_BYTES / (p * 8)).max(MIN_ROWS).min(MAX_ROWS).min(n);
-
-    let par = faer::get_global_parallelism();
-    // Row-major (C-order) so per-row writes are stride-1 alongside the
-    // stride-1 reads from a row-major X. The previous F-order layout
-    // forced the inner write loop to skip by `chunk_rows` between
-    // columns, defeating cache + vectorization.
-    let mut wx_chunk = Array2::<f64>::zeros((chunk_rows, p));
-
-    let x_is_row_major = x.is_standard_layout();
-    let weights_slice_opt = weights.as_slice();
-
-    {
-        let mut out_view = array2_to_matmut(out);
-
-        for start in (0..n).step_by(chunk_rows) {
-            let rows = (n - start).min(chunk_rows);
-            {
-                let chunk_slice = wx_chunk
-                    .as_slice_mut()
-                    .expect("row-major chunk is contiguous");
-                if x_is_row_major
-                    && let Some(x_slice_all) = x.as_slice()
-                    && let Some(w_slice) = weights_slice_opt
-                {
-                    // Fast path: scale row-major X directly via raw slices.
-                    for local in 0..rows {
-                        let src = start + local;
-                        let wi = w_slice[src];
-                        let src_off = src * p;
-                        let dst_off = local * p;
-                        let src_row = &x_slice_all[src_off..src_off + p];
-                        let dst_row = &mut chunk_slice[dst_off..dst_off + p];
-                        for col in 0..p {
-                            dst_row[col] = src_row[col] * wi;
-                        }
-                    }
-                } else {
-                    for local in 0..rows {
-                        let src = start + local;
-                        let wi = weights[src];
-                        let xrow = x.row(src);
-                        let dst_off = local * p;
-                        let dst_row = &mut chunk_slice[dst_off..dst_off + p];
-                        for (col, xij) in xrow.iter().enumerate() {
-                            dst_row[col] = xij * wi;
-                        }
-                    }
-                }
-            }
-            let x_slice = x.slice(s![start..start + rows, ..]);
-            let wx_slice = wx_chunk.slice(s![0..rows, ..]);
-            let x_view = FaerArrayView::new(&x_slice);
-            let wx_view = FaerArrayView::new(&wx_slice);
-            matmul(
-                out_view.as_mut(),
-                Accum::Add,
-                x_view.as_ref().transpose(),
-                wx_view.as_ref(),
-                1.0,
-                par,
-            );
-        }
-    }
+    stream_weighted_crossprod_into(
+        x,
+        weights,
+        out,
+        CrossprodStructure::Full,
+        CrossprodAccum::Replace,
+        faer::get_global_parallelism(),
+    );
 }
 
 impl DesignMatrix {

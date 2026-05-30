@@ -222,59 +222,45 @@ impl XorwowState {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-// CPU host reference — Devroye PG(1, c) using the XORWOW state above
+// CPU host reference — Devroye PG(1, c) via the shared sampler core
 // ────────────────────────────────────────────────────────────────────────
 //
-// We replicate the algorithm from `src/inference/polya_gamma.rs` here
-// because the CPU oracle for parity tests has to *use the same RNG bytes
-// as the device kernel*. That module’s sampler takes any `rand::Rng`,
-// which is the right abstraction for production code but the wrong one
-// for a bit-for-bit GPU oracle. The math (Devroye 1986; PSW 2013) is
-// identical down to the alternating-series tail.
+// The CPU oracle for parity tests has to *use the same RNG bytes as the
+// device kernel*, so it drives the shared Devroye core
+// (`crate::inference::polya_gamma_core`) through the bit-exact `XorwowState`
+// rather than through the production `rand::Rng` adapter. The math (Devroye
+// 1986; PSW 2013) is the single shared implementation — there is no second
+// copy of the tail mass / series / inverse-Gaussian helpers to drift.
 
-use std::f64::consts::{FRAC_2_PI, FRAC_PI_2, PI};
+use crate::inference::polya_gamma_core::{PgRng, draw_pg1};
+use std::f64::consts::{FRAC_PI_2, PI};
 
-const PI_SQ: f64 = PI * PI;
-const SQRT_2_OVER_SQRT_PI: f64 = 0.797_884_560_802_865_4;
-const SQRT_PI_OVER_2: f64 = 1.253_314_137_315_500_1;
+/// `XorwowState` is the randomness source for the bit-exact GPU oracle. Wiring
+/// it through [`PgRng`] lets the shared Devroye core run against the same RNG
+/// byte stream the device kernel consumes.
+impl PgRng for XorwowState {
+    #[inline]
+    fn next_unit(&mut self) -> f64 {
+        XorwowState::next_unit(self)
+    }
+
+    #[inline]
+    fn next_exp(&mut self) -> f64 {
+        XorwowState::next_exp(self)
+    }
+
+    #[inline]
+    fn next_norm(&mut self) -> f64 {
+        XorwowState::next_norm(self)
+    }
+}
 
 /// CPU oracle for one PG(1, c) draw using a `XorwowState` directly. The
 /// device kernel performs the same arithmetic byte-for-byte (modulo IEEE
 /// rounding of transcendentals, which agree to <1 ULP for the inputs we
 /// touch).
 pub fn pg1_draw_cpu_oracle(state: &mut XorwowState, tilt: f64) -> f64 {
-    let half_tilt = tilt.abs() * 0.5;
-    let half_tilt_sq = half_tilt * half_tilt;
-    let scale = 0.125 * PI_SQ + 0.5 * half_tilt_sq;
-    let exp_mass = exponential_tail_mass(half_tilt);
-
-    loop {
-        let u = state.next_unit();
-        let proposal = if u < exp_mass {
-            FRAC_2_PI + state.next_exp() / scale
-        } else {
-            sample_trunc_inv_gauss(state, half_tilt, FRAC_2_PI)
-        };
-
-        let mut sum = series_coefficient(0, proposal);
-        let threshold = state.next_unit() * sum;
-        let mut idx = 0usize;
-        loop {
-            idx += 1;
-            let term = series_coefficient(idx, proposal);
-            if idx % 2 == 1 {
-                sum -= term;
-                if threshold <= sum {
-                    return 0.25 * proposal;
-                }
-            } else {
-                sum += term;
-                if threshold >= sum {
-                    break;
-                }
-            }
-        }
-    }
+    draw_pg1(state, tilt)
 }
 
 /// Higher-shape draw on host via convolution: PG(b, c) =_d Σ_{j=1..b} PG(1, c).
@@ -282,84 +268,6 @@ pub fn pg1_draw_cpu_oracle(state: &mut XorwowState, tilt: f64) -> f64 {
 /// saddlepoint kernel at modest `b`.
 pub fn pg_convolution_cpu_oracle(state: &mut XorwowState, b: u32, tilt: f64) -> f64 {
     (0..b).map(|_| pg1_draw_cpu_oracle(state, tilt)).sum()
-}
-
-fn exponential_tail_mass(tilt: f64) -> f64 {
-    let base = 0.125 * PI_SQ + 0.5 * tilt * tilt;
-    let upper = SQRT_PI_OVER_2 * (FRAC_2_PI * tilt - 1.0);
-    let lower = -(SQRT_PI_OVER_2 * (FRAC_2_PI * tilt + 1.0));
-    let base_factor = base * (base * FRAC_2_PI).exp();
-    let p_upper = base_factor * (-tilt).exp() * std_normal_cdf(upper);
-    let p_lower = base_factor * tilt.exp() * std_normal_cdf(lower);
-    let exp_terms = (4.0 / PI) * (p_upper + p_lower);
-    1.0 / (1.0 + exp_terms)
-}
-
-#[inline]
-fn std_normal_cdf(x: f64) -> f64 {
-    use statrs::distribution::{ContinuousCDF, Normal};
-    Normal::standard().cdf(x)
-}
-
-#[inline]
-fn series_coefficient(n: usize, x: f64) -> f64 {
-    if x <= 0.0 {
-        return 0.0;
-    }
-    let k = n as f64 + 0.5;
-    let k_sq = k * k;
-    if x <= FRAC_2_PI {
-        // Left branch: a_n(x) = 2k · sqrt(2/π) · x^{-3/2} · exp(-2k²/x).
-        let coeff = 2.0 * k * SQRT_2_OVER_SQRT_PI;
-        let inv_x = 1.0 / x;
-        coeff * inv_x * inv_x.sqrt() * (-2.0 * k_sq * inv_x).exp()
-    } else {
-        // Right branch — math team’s Phase 1 fix: π · k · exp(...).
-        PI * k * (-0.5 * k_sq * PI_SQ * x).exp()
-    }
-}
-
-fn sample_trunc_inv_gauss(state: &mut XorwowState, z: f64, trunc: f64) -> f64 {
-    let z = z.abs();
-    if FRAC_2_PI > z {
-        sample_small_z(state, z, trunc)
-    } else {
-        sample_large_z(state, 1.0 / z, trunc)
-    }
-}
-
-fn sample_small_z(state: &mut XorwowState, z: f64, trunc: f64) -> f64 {
-    let mut accept = 0.0;
-    let mut sample = 0.0;
-    while accept < state.next_unit() {
-        let exp_sample = loop {
-            let e1 = state.next_exp();
-            let e2 = state.next_exp();
-            if e1 * e1 <= 2.0 * e2 / trunc {
-                break e1;
-            }
-        };
-        sample = 1.0 + exp_sample * trunc;
-        sample = trunc / (sample * sample);
-        accept = (-0.5 * z * z * sample).exp();
-    }
-    sample
-}
-
-fn sample_large_z(state: &mut XorwowState, mean: f64, trunc: f64) -> f64 {
-    let mut sample = f64::INFINITY;
-    while sample > trunc {
-        let n = state.next_norm();
-        let n_sq = n * n;
-        let half_mean = 0.5 * mean;
-        let mn_sq = mean * n_sq;
-        let disc = (4.0 * mn_sq + mn_sq * mn_sq).sqrt();
-        sample = mean + half_mean * mn_sq - half_mean * disc;
-        if state.next_unit() > mean / (mean + sample) {
-            sample = mean * mean / sample;
-        }
-    }
-    sample
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -853,12 +761,17 @@ mod linux_cuda {
     use ndarray::Array1;
     use std::sync::Arc;
 
-    /// NVRTC source for the three regime kernels plus shared device-side
-    /// XORWOW state advance, SplitMix64 seeding, and the Devroye and
-    /// saddlepoint helpers. All arithmetic is in `double`; the device
-    /// transcendentals (`exp`, `log`, `tanh`, `tan`, `sqrt`, `erfc`) are
-    /// the high-accuracy intrinsics — we do NOT use `__expf` / `__tanhf`,
-    /// which would diverge from the CPU oracle past a few ULPs.
+    /// NVRTC source prelude: SplitMix64 seeding, the per-row XORWOW state
+    /// advance, and the unit/exp/normal draw helpers. The Devroye constants
+    /// and the sampler body that follow are appended at compile time by
+    /// [`ptx_source`], with the numeric constants rendered from the shared
+    /// Rust [`crate::inference::polya_gamma_core::constants`] so no device
+    /// literal is hand-typed.
+    ///
+    /// All arithmetic is in `double`; the device transcendentals (`exp`,
+    /// `log`, `tanh`, `tan`, `sqrt`, `erfc`) are the high-accuracy intrinsics
+    /// — we do NOT use `__expf` / `__tanhf`, which would diverge from the CPU
+    /// oracle past a few ULPs.
     ///
     /// Layout of inputs/outputs:
     ///
@@ -869,7 +782,7 @@ mod linux_cuda {
     ///   state from `(seed, i)` via SplitMix64, draws once, and writes
     ///   `out[i]`. No shared state → no warp divergence beyond what the
     ///   algorithm itself dictates.
-    pub(super) const PTX_SOURCE: &str = r#"
+    const PTX_SOURCE_PRELUDE: &str = r#"
 extern "C" __device__ unsigned long long splitmix64_mix(unsigned long long z) {
     z += 0x9E3779B97F4A7C15ULL;
     unsigned long long x = z;
@@ -939,15 +852,14 @@ extern "C" __device__ double xorwow_norm(struct XorwowState* st) {
         }
     }
 }
+"#;
 
-// ── Devroye PG(1, c) helpers ─────────────────────────────────────────────
-
-#define PG_FRAC_2_PI       (0.63661977236758134307553505349006)
-#define PG_PI              (3.14159265358979323846)
-#define PG_PI_SQ           (9.86960440108935861883)
-#define PG_SQRT_2_OVER_PI  (0.79788456080286535588)
-#define PG_SQRT_PI_OVER_2  (1.25331413731550025121)
-
+    /// NVRTC source body: the Devroye / saddlepoint device helpers and the
+    /// three regime kernels. Appended by [`ptx_source`] after the prelude and
+    /// the rendered `#define` constants. The `// ── Devroye PG(1, c)` helpers
+    /// here consume `PG_FRAC_2_PI`, `PG_PI`, `PG_PI_SQ`, `PG_SQRT_2_OVER_PI`,
+    /// and `PG_SQRT_PI_OVER_2`, all defined by the rendered constant block.
+    const PTX_SOURCE_BODY: &str = r#"
 extern "C" __device__ double std_normal_cdf(double x) {
     // 0.5 · erfc(-x / sqrt(2)).
     return 0.5 * erfc(-x * 0.7071067811865475);
@@ -1172,10 +1084,28 @@ extern "C" __global__ void normal_kernel(
 
     const THREADS_PER_BLOCK: u32 = 128;
 
+    /// Assemble the full NVRTC source: the prelude, then the Devroye `#define`
+    /// constants rendered from the shared Rust core, then the sampler body and
+    /// kernels. Rendering the `#define` block from
+    /// [`crate::inference::polya_gamma_core::render_cuda_constants`] is what
+    /// parity-locks every device constant to its host value (issue #414) — the
+    /// kernel and the CPU oracle cannot disagree on a numeric literal because
+    /// there is exactly one source for those literals.
+    fn ptx_source() -> String {
+        let mut src = String::with_capacity(
+            PTX_SOURCE_PRELUDE.len() + PTX_SOURCE_BODY.len() + 256,
+        );
+        src.push_str(PTX_SOURCE_PRELUDE);
+        src.push_str("\n// ── Devroye PG(1, c) constants (rendered from Rust core) ──────────────\n");
+        src.push_str(&crate::inference::polya_gamma_core::render_cuda_constants());
+        src.push_str(PTX_SOURCE_BODY);
+        src
+    }
+
     fn module(ctx: &Arc<CudaContext>) -> Result<&'static Arc<CudaModule>, GpuError> {
         static CACHE: crate::gpu::common::PtxModuleCache =
             crate::gpu::common::PtxModuleCache::new();
-        CACHE.get_or_compile(ctx, "polya_gamma", PTX_SOURCE)
+        CACHE.get_or_compile(ctx, "polya_gamma", &ptx_source())
     }
 
     pub(super) fn draw_batch_gpu(
@@ -2032,5 +1962,88 @@ mod tests {
                 tilts[i]
             );
         }
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Issue #414 unification parity gates
+    // ────────────────────────────────────────────────────────────────────
+
+    /// The GPU host oracle must be a *thin adapter* over the shared Devroye
+    /// core: feeding the same `XorwowState` byte stream through
+    /// `pg1_draw_cpu_oracle` and directly through the shared
+    /// `polya_gamma_core::draw_pg1` must produce bit-identical draws. Any
+    /// remaining private copy of the sampler math (which #414 removed) would
+    /// surface here as a non-equal draw, even at a single bit.
+    #[test]
+    fn gpu_oracle_is_bit_identical_to_shared_core() {
+        use crate::inference::polya_gamma_core::draw_pg1;
+        for &c in &[0.0_f64, 0.3, 1.5, 4.0, 12.0] {
+            for row in 0..256u64 {
+                let mut via_oracle = XorwowState::new(0x0414_u64 ^ c.to_bits(), row);
+                let mut via_core = XorwowState::new(0x0414_u64 ^ c.to_bits(), row);
+                let a = pg1_draw_cpu_oracle(&mut via_oracle, c);
+                let b = draw_pg1(&mut via_core, c);
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "GPU oracle diverged from shared core at c={c}, row={row}: {a} vs {b}"
+                );
+            }
+        }
+    }
+
+    /// The inference-module production sampler and the GPU host oracle now both
+    /// route through the single `polya_gamma_core::draw_pg1`. With identical
+    /// driver semantics they must agree in distribution. This KS gate locks the
+    /// CPU posterior path and the GPU oracle to the same sampler math.
+    #[test]
+    fn inference_sampler_and_gpu_oracle_share_distribution() {
+        use crate::inference::polya_gamma::PolyaGamma;
+        use rand::{SeedableRng, rngs::StdRng};
+        let pg = PolyaGamma::new();
+        for &c in &[0.0_f64, 1.0, 3.0, 8.0] {
+            let n = 8_000usize;
+            let mut from_oracle: Vec<f64> = (0..n)
+                .map(|i| {
+                    let mut st = XorwowState::new(0xBEEF_0414_u64 ^ c.to_bits(), i as u64);
+                    pg1_draw_cpu_oracle(&mut st, c)
+                })
+                .collect();
+            let mut from_inference: Vec<f64> = {
+                let mut rng = StdRng::seed_from_u64(0xFACE_0414_u64 ^ c.to_bits());
+                (0..n).map(|_| pg.draw(&mut rng, c)).collect()
+            };
+            let d = ks_two_sample(&mut from_oracle, &mut from_inference);
+            let crit = ks_critical_001(n, n);
+            assert!(
+                d <= crit,
+                "PG(1, c={c}) inference vs GPU-oracle KS d={d} > crit={crit}: shared core drifted"
+            );
+        }
+    }
+
+    /// Device-source parity lock: the embedded CUDA source must consume the
+    /// Devroye constants *rendered from the Rust core*, with no second
+    /// hand-typed copy of those literals. We assert the assembled NVRTC source
+    /// embeds the rendered `#define` block verbatim and that the prelude/body
+    /// templates carry no stray `#define PG_…` of their own (which would be a
+    /// drift hazard). Linux-only because `ptx_source` lives in the CUDA module.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cuda_source_uses_rendered_constants_only() {
+        let rendered = crate::inference::polya_gamma_core::render_cuda_constants();
+        let assembled = linux_cuda::ptx_source();
+        assert!(
+            assembled.contains(rendered.trim_end()),
+            "assembled CUDA source does not embed the rendered constant block"
+        );
+        // No constant literal may be hand-typed in the templates; the only
+        // `#define PG_` lines must come from the rendered block.
+        let define_count = assembled.matches("#define PG_").count();
+        let rendered_count = rendered.matches("#define PG_").count();
+        assert_eq!(
+            define_count, rendered_count,
+            "CUDA source has {define_count} `#define PG_` lines but the rendered block has {rendered_count}; a stale hand-typed constant is present"
+        );
     }
 }

@@ -20,6 +20,10 @@ use crate::families::custom_family::{
     PenaltyMatrix, fit_custom_family,
 };
 use crate::families::gamlss::{FamilyMetadata, ParameterLink};
+use crate::families::latent_interval::{
+    LatentFrailtyResolution, LatentIntervalModel, LatentIntervalRowView,
+    validate_latent_interval_inputs,
+};
 use crate::families::lognormal_kernel::{
     FrailtySpec, HazardLoading, LatentSurvivalEventType, LatentSurvivalRow, LatentSurvivalRowJet,
     log_kernel_bundle,
@@ -470,195 +474,74 @@ pub fn fit_latent_binary_terms(
     })
 }
 
+/// Latent-survival adapter for the shared [`LatentIntervalModel`] driver.
+///
+/// Survival permits a learnable sigma (`sigma_fixed == None`) and carries the
+/// per-row unloaded baseline hazard at exit (which feeds the exact-event
+/// loaded/unloaded split); everything else is validated by the shared engine.
+struct LatentSurvivalModel;
+
+impl LatentIntervalModel for LatentSurvivalModel {
+    fn context() -> &'static str {
+        "latent-survival"
+    }
+
+    fn frailty_policy(
+        frailty: &FrailtySpec,
+    ) -> Result<LatentFrailtyResolution, LatentSurvivalError> {
+        match frailty {
+            FrailtySpec::HazardMultiplier {
+                sigma_fixed,
+                loading,
+            } => {
+                if let Some(sigma) = sigma_fixed
+                    && (!sigma.is_finite() || *sigma < 0.0)
+                {
+                    return Err(LatentSurvivalError::InvalidFrailty {
+                        reason: format!(
+                            "latent-survival requires a finite hazard-multiplier sigma >= 0, got {sigma}"
+                        ),
+                    });
+                }
+                Ok(LatentFrailtyResolution {
+                    sigma: *sigma_fixed,
+                    loading: *loading,
+                })
+            }
+            FrailtySpec::GaussianShift { .. } => Err(LatentSurvivalError::InvalidFrailty {
+                reason: "latent-survival requires HazardMultiplier frailty, not GaussianShift"
+                    .to_string(),
+            }),
+            FrailtySpec::None => Err(LatentSurvivalError::InvalidFrailty {
+                reason: "latent-survival requires a HazardMultiplier frailty specification"
+                    .to_string(),
+            }),
+        }
+    }
+}
+
 fn validate_latent_survival_inputs(
     data: ArrayView2<'_, f64>,
     spec: &LatentSurvivalTermSpec,
     frailty: &FrailtySpec,
 ) -> Result<Option<f64>, LatentSurvivalError> {
-    let (sigma, hazard_loading) = match frailty {
-        FrailtySpec::HazardMultiplier {
-            sigma_fixed,
-            loading,
-        } => {
-            if let Some(sigma) = sigma_fixed
-                && (!sigma.is_finite() || *sigma < 0.0)
-            {
-                return Err(LatentSurvivalError::InvalidFrailty {
-                    reason: format!(
-                        "latent-survival requires a finite hazard-multiplier sigma >= 0, got {sigma}"
-                    ),
-                });
-            }
-            (*sigma_fixed, *loading)
-        }
-        FrailtySpec::GaussianShift { .. } => {
-            return Err(LatentSurvivalError::InvalidFrailty {
-                reason: "latent-survival requires HazardMultiplier frailty, not GaussianShift"
-                    .to_string(),
-            });
-        }
-        FrailtySpec::None => {
-            return Err(LatentSurvivalError::InvalidFrailty {
-                reason: "latent-survival requires a HazardMultiplier frailty specification"
-                    .to_string(),
-            });
-        }
+    let row = LatentIntervalRowView {
+        frailty,
+        age_entry: &spec.age_entry,
+        age_exit: &spec.age_exit,
+        event_target: &spec.event_target,
+        weights: &spec.weights,
+        unloaded_mass_entry: &spec.unloaded_mass_entry,
+        unloaded_mass_exit: &spec.unloaded_mass_exit,
+        unloaded_hazard_exit: Some(&spec.unloaded_hazard_exit),
+        mean_offset: &spec.mean_offset,
+        derivative_guard: spec.derivative_guard,
+        time_block: &spec.time_block,
     };
-    let n = data.nrows();
-    if n == 0 {
-        return Err(LatentSurvivalError::InvalidDataset {
-            reason: "latent-survival requires a non-empty dataset".to_string(),
-        });
-    }
-    if spec.age_entry.len() != n
-        || spec.age_exit.len() != n
-        || spec.event_target.len() != n
-        || spec.weights.len() != n
-        || spec.unloaded_mass_entry.len() != n
-        || spec.unloaded_mass_exit.len() != n
-        || spec.unloaded_hazard_exit.len() != n
-        || spec.mean_offset.len() != n
-    {
-        return Err(LatentSurvivalError::InvalidDataset {
-            reason: format!(
-                "latent-survival size mismatch: data has {n} rows, entry={}, exit={}, event={}, weights={}, unloaded_entry={}, unloaded_exit={}, unloaded_hazard={}, offset={}",
-                spec.age_entry.len(),
-                spec.age_exit.len(),
-                spec.event_target.len(),
-                spec.weights.len(),
-                spec.unloaded_mass_entry.len(),
-                spec.unloaded_mass_exit.len(),
-                spec.unloaded_hazard_exit.len(),
-                spec.mean_offset.len()
-            ),
-        });
-    }
-    if !spec.derivative_guard.is_finite() || spec.derivative_guard < 0.0 {
-        return Err(LatentSurvivalError::InvalidDataset {
-            reason: format!(
-                "latent-survival derivative_guard must be finite and >= 0, got {}",
-                spec.derivative_guard
-            ),
-        });
-    }
-    for i in 0..n {
-        let entry = spec.age_entry[i];
-        let exit = spec.age_exit[i];
-        let event = spec.event_target[i];
-        let weight = spec.weights[i];
-        let unloaded_entry = spec.unloaded_mass_entry[i];
-        let unloaded_exit = spec.unloaded_mass_exit[i];
-        let unloaded_hazard = spec.unloaded_hazard_exit[i];
-        if !entry.is_finite() || !exit.is_finite() {
-            return Err(LatentSurvivalError::InvalidDataset {
-                reason: format!(
-                    "latent-survival row {} has non-finite entry/exit ages: entry={}, exit={}",
-                    i + 1,
-                    entry,
-                    exit
-                ),
-            });
-        }
-        if entry < 0.0 || exit < entry {
-            return Err(LatentSurvivalError::InvalidDataset {
-                reason: format!(
-                    "latent-survival row {} has invalid delayed-entry bounds: entry={}, exit={}",
-                    i + 1,
-                    entry,
-                    exit
-                ),
-            });
-        }
-        if event > 1 {
-            return Err(LatentSurvivalError::InvalidDataset {
-                reason: format!(
-                    "latent-survival row {} has invalid event target {}; expected 0 or 1",
-                    i + 1,
-                    event
-                ),
-            });
-        }
-        if !weight.is_finite() || weight < 0.0 {
-            return Err(LatentSurvivalError::InvalidDataset {
-                reason: format!(
-                    "latent-survival row {} has invalid weight {}; expected a finite non-negative weight",
-                    i + 1,
-                    weight
-                ),
-            });
-        }
-        if !unloaded_entry.is_finite()
-            || !unloaded_exit.is_finite()
-            || !unloaded_hazard.is_finite()
-            || unloaded_entry < 0.0
-            || unloaded_exit < unloaded_entry
-            || unloaded_hazard < 0.0
-        {
-            return Err(LatentSurvivalError::InvalidDataset {
-                reason: format!(
-                    "latent-survival row {} has invalid unloaded hazard decomposition: entry_mass={}, exit_mass={}, exit_hazard={}",
-                    i + 1,
-                    unloaded_entry,
-                    unloaded_exit,
-                    unloaded_hazard
-                ),
-            });
-        }
-        validate_unloaded_components_for_loading(
-            "latent-survival",
-            i,
-            hazard_loading,
-            unloaded_entry,
-            unloaded_exit,
-            Some(unloaded_hazard),
-        )?;
-    }
-    let time_block = &spec.time_block;
-    let p_time = time_block.design_exit.ncols();
-    if time_block.design_entry.nrows() != n
-        || time_block.design_exit.nrows() != n
-        || time_block.design_derivative_exit.nrows() != n
-    {
-        return Err(LatentSurvivalError::InvalidDataset {
-            reason: format!(
-                "latent-survival time block row mismatch: n={}, entry_rows={}, exit_rows={}, derivative_rows={}",
-                n,
-                time_block.design_entry.nrows(),
-                time_block.design_exit.nrows(),
-                time_block.design_derivative_exit.nrows()
-            ),
-        });
-    }
-    if time_block.design_entry.ncols() != p_time
-        || time_block.design_derivative_exit.ncols() != p_time
-    {
-        return Err(LatentSurvivalError::InvalidDataset {
-            reason: format!(
-                "latent-survival time block column mismatch: entry_cols={}, exit_cols={}, derivative_cols={}",
-                time_block.design_entry.ncols(),
-                time_block.design_exit.ncols(),
-                time_block.design_derivative_exit.ncols()
-            ),
-        });
-    }
-    if time_block.offset_entry.len() != n
-        || time_block.offset_exit.len() != n
-        || time_block.derivative_offset_exit.len() != n
-    {
-        return Err(LatentSurvivalError::InvalidDataset {
-            reason: format!(
-                "latent-survival time block offset mismatch: n={}, entry_offset={}, exit_offset={}, derivative_offset={}",
-                n,
-                time_block.offset_entry.len(),
-                time_block.offset_exit.len(),
-                time_block.derivative_offset_exit.len()
-            ),
-        });
-    }
-    Ok(sigma)
+    validate_latent_interval_inputs::<LatentSurvivalModel>(data, &row)
 }
 
-fn validate_unloaded_components_for_loading(
+pub(crate) fn validate_unloaded_components_for_loading(
     context: &str,
     row_index: usize,
     loading: HazardLoading,
@@ -688,158 +571,57 @@ fn validate_unloaded_components_for_loading(
     Ok(())
 }
 
+/// Latent-binary adapter for the shared [`LatentIntervalModel`] driver.
+///
+/// Binary never evaluates an exact event, so it requires a finite *fixed*
+/// latent sigma (via [`fixed_latent_hazard_frailty_typed`]) and carries no
+/// per-row unloaded hazard; every other invariant is validated by the shared
+/// engine.
+struct LatentBinaryModel;
+
+impl LatentIntervalModel for LatentBinaryModel {
+    fn context() -> &'static str {
+        "latent-binary"
+    }
+
+    fn frailty_policy(
+        frailty: &FrailtySpec,
+    ) -> Result<LatentFrailtyResolution, LatentSurvivalError> {
+        let (sigma, loading) = fixed_latent_hazard_frailty_typed(frailty, "latent-binary")?;
+        Ok(LatentFrailtyResolution {
+            sigma: Some(sigma),
+            loading,
+        })
+    }
+}
+
 fn validate_latent_binary_inputs(
     data: ArrayView2<'_, f64>,
     spec: &LatentBinaryTermSpec,
     frailty: &FrailtySpec,
 ) -> Result<f64, LatentSurvivalError> {
-    let (sigma, hazard_loading) = fixed_latent_hazard_frailty_typed(frailty, "latent-binary")?;
-    let n = data.nrows();
-    if n == 0 {
-        return Err(LatentSurvivalError::InvalidDataset {
-            reason: "latent-binary requires a non-empty dataset".to_string(),
-        });
-    }
-    if spec.age_entry.len() != n
-        || spec.age_exit.len() != n
-        || spec.event_target.len() != n
-        || spec.weights.len() != n
-        || spec.unloaded_mass_entry.len() != n
-        || spec.unloaded_mass_exit.len() != n
-        || spec.mean_offset.len() != n
-    {
-        return Err(LatentSurvivalError::InvalidDataset {
-            reason: format!(
-                "latent-binary size mismatch: data has {n} rows, entry={}, exit={}, event={}, weights={}, unloaded_entry={}, unloaded_exit={}, offset={}",
-                spec.age_entry.len(),
-                spec.age_exit.len(),
-                spec.event_target.len(),
-                spec.weights.len(),
-                spec.unloaded_mass_entry.len(),
-                spec.unloaded_mass_exit.len(),
-                spec.mean_offset.len()
-            ),
-        });
-    }
-    if !spec.derivative_guard.is_finite() || spec.derivative_guard < 0.0 {
-        return Err(LatentSurvivalError::InvalidDataset {
-            reason: format!(
-                "latent-binary derivative_guard must be finite and >= 0, got {}",
-                spec.derivative_guard
-            ),
-        });
-    }
-    for i in 0..n {
-        let entry = spec.age_entry[i];
-        let exit = spec.age_exit[i];
-        let weight = spec.weights[i];
-        let unloaded_entry = spec.unloaded_mass_entry[i];
-        let unloaded_exit = spec.unloaded_mass_exit[i];
-        let event = spec.event_target[i];
-        if !entry.is_finite() || !exit.is_finite() {
-            return Err(LatentSurvivalError::InvalidDataset {
-                reason: format!(
-                    "latent-binary row {} has non-finite entry/exit ages: entry={}, exit={}",
-                    i + 1,
-                    entry,
-                    exit
-                ),
-            });
+    let row = LatentIntervalRowView {
+        frailty,
+        age_entry: &spec.age_entry,
+        age_exit: &spec.age_exit,
+        event_target: &spec.event_target,
+        weights: &spec.weights,
+        unloaded_mass_entry: &spec.unloaded_mass_entry,
+        unloaded_mass_exit: &spec.unloaded_mass_exit,
+        unloaded_hazard_exit: None,
+        mean_offset: &spec.mean_offset,
+        derivative_guard: spec.derivative_guard,
+        time_block: &spec.time_block,
+    };
+    // The binary `frailty_policy` always yields `Some(sigma)` (it rejects the
+    // learnable-scale case), so the shared driver's `Option<f64>` is `Some`
+    // here; surface a structured error rather than unwrapping if that ever
+    // changes.
+    validate_latent_interval_inputs::<LatentBinaryModel>(data, &row)?.ok_or_else(|| {
+        LatentSurvivalError::InvalidFrailty {
+            reason: "latent-binary requires a fixed latent sigma".to_string(),
         }
-        if entry < 0.0 || exit < entry {
-            return Err(LatentSurvivalError::InvalidDataset {
-                reason: format!(
-                    "latent-binary row {} has invalid delayed-entry bounds: entry={}, exit={}",
-                    i + 1,
-                    entry,
-                    exit
-                ),
-            });
-        }
-        if event > 1 {
-            return Err(LatentSurvivalError::InvalidDataset {
-                reason: format!(
-                    "latent-binary row {} has invalid event target {}; expected 0 or 1",
-                    i + 1,
-                    event
-                ),
-            });
-        }
-        if !weight.is_finite() || weight < 0.0 {
-            return Err(LatentSurvivalError::InvalidDataset {
-                reason: format!(
-                    "latent-binary row {} has invalid weight {}; expected a finite non-negative weight",
-                    i + 1,
-                    weight
-                ),
-            });
-        }
-        if !unloaded_entry.is_finite()
-            || !unloaded_exit.is_finite()
-            || unloaded_entry < 0.0
-            || unloaded_exit < unloaded_entry
-        {
-            return Err(LatentSurvivalError::InvalidDataset {
-                reason: format!(
-                    "latent-binary row {} has invalid unloaded mass decomposition: entry_mass={}, exit_mass={}",
-                    i + 1,
-                    unloaded_entry,
-                    unloaded_exit,
-                ),
-            });
-        }
-        validate_unloaded_components_for_loading(
-            "latent-binary",
-            i,
-            hazard_loading,
-            unloaded_entry,
-            unloaded_exit,
-            None,
-        )?;
-    }
-    let time_block = &spec.time_block;
-    let p_time = time_block.design_exit.ncols();
-    if time_block.design_entry.nrows() != n
-        || time_block.design_exit.nrows() != n
-        || time_block.design_derivative_exit.nrows() != n
-    {
-        return Err(LatentSurvivalError::InvalidDataset {
-            reason: format!(
-                "latent-binary time block row mismatch: n={}, entry_rows={}, exit_rows={}, derivative_rows={}",
-                n,
-                time_block.design_entry.nrows(),
-                time_block.design_exit.nrows(),
-                time_block.design_derivative_exit.nrows()
-            ),
-        });
-    }
-    if time_block.design_entry.ncols() != p_time
-        || time_block.design_derivative_exit.ncols() != p_time
-    {
-        return Err(LatentSurvivalError::InvalidDataset {
-            reason: format!(
-                "latent-binary time block column mismatch: entry_cols={}, exit_cols={}, derivative_cols={}",
-                time_block.design_entry.ncols(),
-                time_block.design_exit.ncols(),
-                time_block.design_derivative_exit.ncols()
-            ),
-        });
-    }
-    if time_block.offset_entry.len() != n
-        || time_block.offset_exit.len() != n
-        || time_block.derivative_offset_exit.len() != n
-    {
-        return Err(LatentSurvivalError::InvalidDataset {
-            reason: format!(
-                "latent-binary time block offset mismatch: n={}, entry_offset={}, exit_offset={}, derivative_offset={}",
-                n,
-                time_block.offset_entry.len(),
-                time_block.offset_exit.len(),
-                time_block.derivative_offset_exit.len()
-            ),
-        });
-    }
-    Ok(sigma)
+    })
 }
 
 fn prepare_latent_time_block(

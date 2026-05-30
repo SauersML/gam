@@ -88,6 +88,101 @@ pub(crate) fn probit_frailty_scale_multi_dir_jet(
     Ok(MultiDirJet::with_coeffs(n_dirs, &coeffs))
 }
 
+/// Per-sweep scale jets for the shared directional obj/grad/hess kernel.
+///
+/// Every marginal-slope family forms its exact-Newton primary terms by
+/// differentiating the same row negative-log directional jet
+/// (`row_neglog_directional_with_scale_jet`) along unit primary directions.
+/// The sweep appends one unit direction for the gradient pass and two for the
+/// Hessian pass on top of a fixed *leading* prefix of directions, scaling the
+/// frailty kernel with an order-matched [`MultiDirJet`] each time. The `obj`
+/// slot is `Some` only when the caller also wants the zeroth-order objective
+/// (the prefix-only evaluation); psi-Hessian directional sweeps leave it `None`.
+#[derive(Clone)]
+pub(crate) struct DirectionalScaleJets {
+    pub(crate) obj: Option<MultiDirJet>,
+    pub(crate) grad: MultiDirJet,
+    pub(crate) hess: MultiDirJet,
+}
+
+/// Output of [`directional_obj_grad_hess`]: the (optional) zeroth-order
+/// objective, the full primary gradient, and the symmetric primary Hessian.
+pub(crate) struct DirectionalPrimaryTerms {
+    pub(crate) objective: f64,
+    pub(crate) grad: Array1<f64>,
+    pub(crate) hess: Array2<f64>,
+}
+
+/// Shared exact-Newton primary directional sweep for the marginal-slope
+/// families (Bernoulli, survival, latent survival).
+///
+/// Given a fixed `leading` prefix of directions and a family-specific row jet
+/// evaluator `eval`, this builds the objective (when requested), the gradient
+/// `g_a = D[leading, e_a] φ`, and the symmetric Hessian
+/// `H_ab = D[leading, e_a, e_b] φ`, where `e_a` is the `a`-th unit primary
+/// direction (length `primary_dim`) and `D[..]` is the mixed directional
+/// derivative the row jet returns. `eval(dirs, scale)` must return the highest
+/// mixed-partial coefficient of the row negative-log jet for the supplied
+/// directions and scale jet — exactly what each family's
+/// `row_neglog_directional_with_scale_jet` produces.
+///
+/// Centralizing the sweep removes the per-family duplication of the
+/// obj/grad/hess loop nest, which is the single most drift-prone piece of the
+/// exact-Newton stack: a stray index or a missing symmetric assignment in one
+/// copy silently destabilizes only that family's optimizer.
+pub(crate) fn directional_obj_grad_hess<Eval>(
+    primary_dim: usize,
+    leading: &[&Array1<f64>],
+    scales: &DirectionalScaleJets,
+    eval: Eval,
+) -> Result<DirectionalPrimaryTerms, String>
+where
+    Eval: Fn(&[&Array1<f64>], &MultiDirJet) -> Result<f64, String>,
+{
+    let objective = if let Some(scale_obj) = scales.obj.as_ref() {
+        eval(leading, scale_obj)?
+    } else {
+        0.0
+    };
+
+    let unit = |a: usize| -> Array1<f64> {
+        let mut da = Array1::<f64>::zeros(primary_dim);
+        da[a] = 1.0;
+        da
+    };
+
+    let mut grad = Array1::<f64>::zeros(primary_dim);
+    let mut dirs: Vec<&Array1<f64>> = Vec::with_capacity(leading.len() + 2);
+    for a in 0..primary_dim {
+        let da = unit(a);
+        dirs.clear();
+        dirs.extend_from_slice(leading);
+        dirs.push(&da);
+        grad[a] = eval(&dirs, &scales.grad)?;
+    }
+
+    let mut hess = Array2::<f64>::zeros((primary_dim, primary_dim));
+    for a in 0..primary_dim {
+        let da = unit(a);
+        for b in a..primary_dim {
+            let db = unit(b);
+            dirs.clear();
+            dirs.extend_from_slice(leading);
+            dirs.push(&da);
+            dirs.push(&db);
+            let value = eval(&dirs, &scales.hess)?;
+            hess[[a, b]] = value;
+            hess[[b, a]] = value;
+        }
+    }
+
+    Ok(DirectionalPrimaryTerms {
+        objective,
+        grad,
+        hess,
+    })
+}
+
 fn zero_local_span_cubic() -> LocalSpanCubic {
     LocalSpanCubic {
         left: 0.0,

@@ -47,24 +47,31 @@
 //!
 //! # Convergence
 //!
-//! Damped Newton with backtracking on the penalized negative log-likelihood:
-//! at each iteration the assembled penalized Hessian `H + I_{K-1} ⊗ (λ_a S)`
-//! is factored via faer's symmetric-PD-with-fallback path, the full Newton
-//! step `δ = −H^{-1} ∇F` is computed, and accepted with step halving if the
-//! objective fails to decrease (up to a small backtracking budget). The
-//! convergence test is the relative coefficient step norm
-//! `‖δ‖ / (1 + ‖β‖) ≤ tol`, matching the existing pyffi reference path.
+//! The damped-Newton-with-backtracking scaffold lives once in the shared
+//! [`crate::families::penalized_vector_glm`] engine: at each iteration the
+//! assembled penalized Hessian `H + I_{K-1} ⊗ (λ_a S)` is factored via faer's
+//! symmetric-PD-with-fallback path, the full Newton step `δ = −H^{-1} ∇F` is
+//! computed, and accepted with step halving if the objective fails to decrease
+//! (up to a small backtracking budget). The convergence test is the relative
+//! coefficient step norm `‖δ‖ / (1 + ‖β‖) ≤ tol`, matching the existing pyffi
+//! reference path. This module is the softmax adapter over that engine: it
+//! supplies the dense `(K-1)×(K-1)` Fisher block, the residual, and the
+//! log-likelihood through [`MultinomialLogitLikelihood`], and owns the
+//! class-count / simplex preconditions. The independent-binomial sibling
+//! [`crate::families::binomial_multi`] is the same engine with a row-diagonal
+//! Fisher block instead.
 
-use crate::faer_ndarray::{FaerArrayView, array2_to_matmut, factorize_symmetricwith_fallback};
 use crate::families::custom_family::{BlockwiseFitOptions, fit_custom_family_with_rho_prior};
 use crate::families::multinomial_reml::MultinomialFamily;
+use crate::families::penalized_vector_glm::{
+    PenalizedVectorGlmInputs, fit_penalized_vector_glm,
+};
 use crate::families::vector_response::{
-    MultinomialLogitLikelihood, VectorLikelihood, validate_multinomial_simplex,
+    MultinomialLogitLikelihood, validate_multinomial_simplex,
 };
 use crate::inference::data::EncodedDataset;
 use crate::inference::formula_dsl::parse_formula;
 use crate::inference::model::ColumnKindTag;
-use crate::pirls::dense_block_xtwx;
 use crate::resource::ProblemHints;
 use crate::solver::estimate::EstimationError;
 use crate::solver::workflow::{
@@ -76,7 +83,6 @@ use crate::terms::smooth::{
 };
 use crate::terms::term_builder::resolve_role_col;
 use crate::types::ResponseColumnKind;
-use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -163,14 +169,15 @@ pub fn fit_penalized_multinomial(
         tol,
     } = inputs;
 
-    // ────────────────────────────── shape checks ──────────────────────────
+    // ──────────────────────── family-specific validation ───────────────────
+    // The shared engine re-validates the geometry common to every vector-GLM
+    // (nonempty design, penalty shape, λ finiteness/non-negativity, override
+    // `(N, M, M)` shape, finite design). The multinomial family owns the
+    // class-count contract (`K ≥ 2`, λ length `K − 1`), the per-row simplex
+    // precondition under which the softmax residual/Fisher are the exact
+    // derivatives of `Σ_c y_c log p_c`, and the row-weight check the likelihood
+    // adapter consumes.
     let n_obs = design.nrows();
-    let p = design.ncols();
-    if n_obs == 0 || p == 0 {
-        crate::bail_invalid_estim!(
-            "fit_penalized_multinomial: design must be nonempty (got {n_obs}x{p})"
-        );
-    }
     let (y_rows, k) = y_one_hot.dim();
     if y_rows != n_obs {
         crate::bail_invalid_estim!(
@@ -188,19 +195,6 @@ pub fn fit_penalized_multinomial(
             "fit_penalized_multinomial: lambdas length {} ≠ K-1 = {m}",
             lambdas.len()
         );
-    }
-    if penalty.dim() != (p, p) {
-        crate::bail_invalid_estim!(
-            "fit_penalized_multinomial: penalty shape {:?} ≠ (P, P) = ({p}, {p})",
-            penalty.dim()
-        );
-    }
-    for (i, &v) in lambdas.iter().enumerate() {
-        if !(v.is_finite() && v >= 0.0) {
-            crate::bail_invalid_estim!(
-                "fit_penalized_multinomial: lambdas[{i}] must be finite and ≥ 0 (got {v})"
-            );
-        }
     }
     if let Some(fw) = fisher_w_override.as_ref() {
         if fw.dim() != (n_obs, m, m) {
@@ -226,13 +220,6 @@ pub fn fit_penalized_multinomial(
         }
     }
     validate_multinomial_simplex(y_one_hot, "fit_penalized_multinomial")?;
-    for ((i, j), &v) in design.indexed_iter() {
-        if !v.is_finite() {
-            crate::bail_invalid_estim!(
-                "fit_penalized_multinomial: design[{i},{j}] must be finite (got {v})"
-            );
-        }
-    }
 
     // ────────────────────────── likelihood construction ───────────────────
     let mut likelihood = MultinomialLogitLikelihood::with_classes(k)?;
@@ -240,276 +227,33 @@ pub fn fit_penalized_multinomial(
         likelihood = likelihood.with_row_weights(w.to_owned())?;
     }
 
-    // ────────────────────────── Newton iteration ──────────────────────────
-    // β stored as (P, M) column-major-per-class; flat index uses output-major
-    // ordering `flat[a · P + i] = β[i, a]` to align with `dense_block_xtwx`.
-    let mut beta = Array2::<f64>::zeros((p, m));
-    let mut eta = Array2::<f64>::zeros((n_obs, m));
-    // Working response z = η − W^{−1} (∇_η · −1) in the diagonal IRLS form;
-    // for the dense per-row Fisher block the canonical update solves
-    //     (X^T W X + Sλ) β_new = X^T W z,   with z = η + W^{-1} (y − p)
-    // but the dense-block form factors more cleanly through the Newton
-    // residual directly:
-    //     δ = − (X^T W X + Sλ)^{-1} · (X^T (p − y) + Sλ · β)
-    // which is what we compute below. Both forms produce the identical β_new.
+    // ─────────────────── shared penalized vector-GLM solve ─────────────────
+    // The softmax Fisher block is dense across the `M = K − 1` active classes;
+    // the engine assembles the coupled `(P·M)×(P·M)` penalized Hessian, runs
+    // the damped Newton loop, and returns the converged `β̂` and `η = X β̂`.
+    let fit = fit_penalized_vector_glm(
+        PenalizedVectorGlmInputs {
+            design,
+            y: y_one_hot,
+            penalty,
+            lambdas,
+            fisher_w_override,
+            max_iter,
+            tol,
+        },
+        &likelihood,
+        "fit_penalized_multinomial",
+    )?;
 
-    let mut iterations = 0usize;
-    let mut converged = false;
-    let mut last_objective = f64::INFINITY;
-
-    let beta_flat_dim = p * m;
-
-    for iter in 0..max_iter {
-        iterations = iter + 1;
-
-        // η = X · β (per class).
-        for a in 0..m {
-            let beta_col = beta.column(a);
-            for row in 0..n_obs {
-                let mut eta_val = 0.0_f64;
-                for i in 0..p {
-                    eta_val += design[[row, i]] * beta_col[i];
-                }
-                eta[[row, a]] = eta_val;
-            }
-        }
-
-        // Assemble per-row dense Fisher block H_{n,a,b} = w_n p_a (δ_ab − p_b)
-        // and gradient residual r_{n,a} = w_n (p_a − y_a) (= −∂ log L / ∂η_a).
-        // The Hessian block is multiplied by w_n already (the likelihood
-        // factors row weights into `hess_block`), so we pass `None` for the
-        // row_weights argument of `dense_block_xtwx` to avoid double-counting.
-        // Curvature: either the caller-supplied per-row Fisher-block override
-        // (issue #349 research escape-hatch — curvature only) or the analytic
-        // softmax Fisher block. The gradient/residual path below stays
-        // analytic in both cases, matching the old override-replaces-Fisher
-        // semantics.
-        let analytic_fisher = fisher_w_override.as_ref().map_or_else(
-            || Some(likelihood.hess_block(eta.view(), y_one_hot)),
-            |_| None,
-        );
-        let fisher_blocks = match fisher_w_override.as_ref() {
-            Some(fw) => *fw,
-            None => analytic_fisher
-                .as_ref()
-                .expect("analytic Fisher computed when no override")
-                .view(),
-        };
-        let grad_eta_logl = likelihood.grad_eta(eta.view(), y_one_hot);
-        // residual = p − y = −(y − p) = −grad_eta(log L). The pyffi reference
-        // and the dense_block_xtwy contract both want the multinomial
-        // *residual* in (N, M) form, scaled by row weights — `grad_eta`
-        // already returns `w_n (y − p)`, so the residual is `−grad_eta`.
-        let residual_active = grad_eta_logl.mapv(|v| -v);
-
-        let mut hessian = dense_block_xtwx(design, fisher_blocks, None)?;
-        if hessian.nrows() != beta_flat_dim || hessian.ncols() != beta_flat_dim {
-            crate::bail_invalid_estim!(
-                "fit_penalized_multinomial: assembled Hessian shape {:?} ≠ ({beta_flat_dim}, {beta_flat_dim})",
-                hessian.dim()
-            );
-        }
-
-        // Add block-replicated penalty: H[a·P:(a+1)·P, a·P:(a+1)·P] += λ_a · S
-        for a in 0..m {
-            let la = lambdas[a];
-            if la == 0.0 {
-                continue;
-            }
-            let base = a * p;
-            for i in 0..p {
-                for j in 0..p {
-                    hessian[[base + i, base + j]] += la * penalty[[i, j]];
-                }
-            }
-        }
-
-        // Gradient of penalized negative log L: ∇F_a = X^T r_{·,a} + λ_a · S β_a
-        // dense_block_xtwy(design, fisher_blocks, residual_active, None) would
-        // produce X^T W (residual / W) — but residual_active is *already*
-        // weighted by w_n through grad_eta. The cleanest assembly is the
-        // direct path: X^T residual_active + Sλ β, no W involvement.
-        let mut grad_flat = Array1::<f64>::zeros(beta_flat_dim);
-        for a in 0..m {
-            for i in 0..p {
-                let mut acc = 0.0_f64;
-                for row in 0..n_obs {
-                    acc += design[[row, i]] * residual_active[[row, a]];
-                }
-                grad_flat[a * p + i] = acc;
-            }
-        }
-        for a in 0..m {
-            let la = lambdas[a];
-            if la == 0.0 {
-                continue;
-            }
-            let beta_col = beta.column(a);
-            for i in 0..p {
-                let mut s_beta_i = 0.0_f64;
-                for j in 0..p {
-                    s_beta_i += penalty[[i, j]] * beta_col[j];
-                }
-                grad_flat[a * p + i] += la * s_beta_i;
-            }
-        }
-
-        // δ = − H^{-1} · grad
-        let factor = factorize_symmetricwith_fallback(
-            FaerArrayView::new(&hessian).as_ref(),
-            Side::Lower,
-        )
-        .map_err(|err| {
-            EstimationError::InvalidInput(format!(
-                "fit_penalized_multinomial: Hessian factorization failed at iter {iter}: {err}"
-            ))
-        })?;
-        let mut rhs = Array2::<f64>::zeros((beta_flat_dim, 1));
-        for i in 0..beta_flat_dim {
-            rhs[[i, 0]] = -grad_flat[i];
-        }
-        {
-            let rhs_view = array2_to_matmut(&mut rhs);
-            factor.solve_in_place(rhs_view);
-        }
-        let mut delta = Array1::<f64>::zeros(beta_flat_dim);
-        for i in 0..beta_flat_dim {
-            delta[i] = rhs[[i, 0]];
-        }
-        if delta.iter().any(|v| !v.is_finite()) {
-            crate::bail_invalid_estim!(
-                "fit_penalized_multinomial: Newton step is non-finite at iter {iter}"
-            );
-        }
-
-        // Damped acceptance: try the full step first, halve up to 8 times if
-        // the penalized negative log-likelihood fails to decrease. The first
-        // iteration always accepts (the initial β = 0 gives the trivial
-        // uniform-class predictor and we want to start moving).
-        let proposed_beta = |alpha: f64| -> Array2<f64> {
-            let mut out = beta.clone();
-            for a in 0..m {
-                for i in 0..p {
-                    out[[i, a]] += alpha * delta[a * p + i];
-                }
-            }
-            out
-        };
-        let evaluate_objective = |beta_trial: &Array2<f64>| -> f64 {
-            // η_trial = X · β_trial
-            let mut eta_trial = Array2::<f64>::zeros((n_obs, m));
-            for a in 0..m {
-                let beta_col = beta_trial.column(a);
-                for row in 0..n_obs {
-                    let mut v = 0.0_f64;
-                    for i in 0..p {
-                        v += design[[row, i]] * beta_col[i];
-                    }
-                    eta_trial[[row, a]] = v;
-                }
-            }
-            let ll = likelihood.log_lik(eta_trial.view(), y_one_hot);
-            let mut pen = 0.0_f64;
-            for a in 0..m {
-                let la = lambdas[a];
-                if la == 0.0 {
-                    continue;
-                }
-                let beta_col = beta_trial.column(a);
-                let mut quad = 0.0_f64;
-                for i in 0..p {
-                    let mut s_beta_i = 0.0_f64;
-                    for j in 0..p {
-                        s_beta_i += penalty[[i, j]] * beta_col[j];
-                    }
-                    quad += beta_col[i] * s_beta_i;
-                }
-                pen += 0.5 * la * quad;
-            }
-            -ll + pen
-        };
-        if iter == 0 {
-            last_objective = evaluate_objective(&beta);
-            if !last_objective.is_finite() {
-                crate::bail_invalid_estim!(
-                    "fit_penalized_multinomial: non-finite objective at β = 0"
-                );
-            }
-        }
-        let mut alpha = 1.0_f64;
-        let mut accepted_beta = proposed_beta(alpha);
-        let mut new_objective = evaluate_objective(&accepted_beta);
-        let mut backtrack = 0usize;
-        while (!new_objective.is_finite() || new_objective > last_objective + 1.0e-12)
-            && backtrack < 8
-        {
-            alpha *= 0.5;
-            accepted_beta = proposed_beta(alpha);
-            new_objective = evaluate_objective(&accepted_beta);
-            backtrack += 1;
-        }
-
-        let mut step_norm_sq = 0.0_f64;
-        let mut beta_norm_sq = 0.0_f64;
-        for a in 0..m {
-            for i in 0..p {
-                let d = accepted_beta[[i, a]] - beta[[i, a]];
-                step_norm_sq += d * d;
-                let v = accepted_beta[[i, a]];
-                beta_norm_sq += v * v;
-            }
-        }
-
-        beta = accepted_beta;
-        last_objective = new_objective;
-
-        let step_norm = step_norm_sq.sqrt();
-        let beta_norm = beta_norm_sq.sqrt();
-        if step_norm <= tol * (1.0 + beta_norm) {
-            converged = true;
-            break;
-        }
-    }
-
-    // ──────────────────────────── post-process ────────────────────────────
-    // η = X · β̂ (final).
-    for a in 0..m {
-        let beta_col = beta.column(a);
-        for row in 0..n_obs {
-            let mut v = 0.0_f64;
-            for i in 0..p {
-                v += design[[row, i]] * beta_col[i];
-            }
-            eta[[row, a]] = v;
-        }
-    }
-    let fitted_probabilities = likelihood.probabilities(eta.view());
-    let log_lik = likelihood.log_lik(eta.view(), y_one_hot);
-    let mut pen = 0.0_f64;
-    for a in 0..m {
-        let la = lambdas[a];
-        if la == 0.0 {
-            continue;
-        }
-        let beta_col = beta.column(a);
-        let mut quad = 0.0_f64;
-        for i in 0..p {
-            let mut s_beta_i = 0.0_f64;
-            for j in 0..p {
-                s_beta_i += penalty[[i, j]] * beta_col[j];
-            }
-            quad += beta_col[i] * s_beta_i;
-        }
-        pen += 0.5 * la * quad;
-    }
+    let fitted_probabilities = likelihood.probabilities(fit.eta.view());
 
     Ok(MultinomialFitOutputs {
-        coefficients_active: beta,
+        coefficients_active: fit.coefficients,
         fitted_probabilities,
-        iterations,
-        converged,
-        penalized_neg_log_likelihood: -log_lik + pen,
-        deviance: -2.0 * log_lik,
+        iterations: fit.iterations,
+        converged: fit.converged,
+        penalized_neg_log_likelihood: -fit.log_likelihood + fit.penalty_term,
+        deviance: -2.0 * fit.log_likelihood,
     })
 }
 

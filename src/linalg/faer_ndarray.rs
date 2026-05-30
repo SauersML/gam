@@ -650,25 +650,101 @@ fn fast_xt_diag_x_with_parallelism_impl<S1: Data<Elem = f64>, S2: Data<Elem = f6
     w: &ArrayBase<S2, Ix1>,
     par: Par,
 ) -> Array2<f64> {
+    use ndarray::ShapeBuilder;
+
+    let p = x.ncols();
+    // F-order result so the symmetric lower-triangle accumulation writes
+    // column-contiguously; the kernel mirrors to a full symmetric matrix.
+    let mut result = Array2::<f64>::zeros((p, p).f());
+    stream_weighted_crossprod_into(
+        x,
+        w,
+        &mut result,
+        CrossprodStructure::SymmetricLower,
+        CrossprodAccum::Replace,
+        par,
+    );
+    result
+}
+
+/// Output packaging for [`stream_weighted_crossprod_into`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CrossprodStructure {
+    /// Compute every entry of the (symmetric) Gram via full GEMM.
+    Full,
+    /// Accumulate only the lower triangle via triangular matmul (~50% fewer
+    /// FLOPs), then mirror once into the upper triangle for a full symmetric
+    /// result. Mathematically identical output to [`Full`](Self::Full).
+    SymmetricLower,
+}
+
+/// Accumulation policy for [`stream_weighted_crossprod_into`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CrossprodAccum {
+    /// Overwrite `out` with `Xᵀ·diag(W)·X`, ignoring prior contents.
+    Replace,
+    /// Add `Xᵀ·diag(W)·X` into the existing contents of `out`.
+    Add,
+}
+
+/// Shared dense weighted-Gram kernel: accumulate `Xᵀ·diag(W)·X` into `out`.
+///
+/// This is the single tuned implementation of the chunked row-scaling +
+/// matmul strategy; the matrix-returning (`fast_xt_diag_x*`) and
+/// stream-into (`streaming_blas_xt_diag_x`) entry points are thin adapters
+/// over it so that performance tuning, negative-weight handling, chunk
+/// sizing, and layout fixes land in exactly one place.
+///
+/// Computes the product as `Xᵀ·(W·X)` to preserve the sign of `W`: the prior
+/// `sqrt(max(0, w))`-then-Gram form clipped negative weights to zero, which
+/// corrupted observed-Hessian assembly when any block carried heavy residuals
+/// (e.g. under the logb σ link).
+///
+/// Peak working-set allocation is `chunk_rows × p × 8` bytes (~8 MB) rather
+/// than `n × p × 8` bytes for a materialized `W·X`.
+///
+/// `out` must be `p × p`. With [`CrossprodStructure::SymmetricLower`] the
+/// lower triangle is accumulated and then mirrored, so on return `out` holds
+/// the full symmetric matrix regardless of `structure`.
+pub fn stream_weighted_crossprod_into<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
+    x: &ArrayBase<S1, Ix2>,
+    w: &ArrayBase<S2, Ix1>,
+    out: &mut Array2<f64>,
+    structure: CrossprodStructure,
+    accum: CrossprodAccum,
+    par: Par,
+) {
     use faer::Accum;
+    use faer::linalg::matmul::matmul;
     use faer::linalg::matmul::triangular::{BlockStructure, matmul as tri_matmul};
-    use ndarray::{ShapeBuilder, s};
+    use ndarray::s;
 
     let (n, p) = x.dim();
     assert_eq!(n, w.len(), "X rows must match W length");
-    if n == 0 || p == 0 {
-        return Array2::<f64>::zeros((p, p));
+    assert_eq!(out.nrows(), p, "output rows must match X cols");
+    assert_eq!(out.ncols(), p, "output cols must match X cols");
+    if p == 0 {
+        return;
     }
+    if n == 0 {
+        if accum == CrossprodAccum::Replace {
+            out.fill(0.0);
+        }
+        return;
+    }
+
     if !should_use_faer_matmul(p, p, n) {
+        // Tiny products: ndarray's own GEMM avoids faer setup overhead.
         let w_x = Array2::from_shape_fn((n, p), |(i, j)| w[i] * x[[i, j]]);
-        return x.t().dot(&w_x);
+        let gram = x.t().dot(&w_x);
+        match accum {
+            CrossprodAccum::Replace => out.assign(&gram),
+            CrossprodAccum::Add => *out += &gram,
+        }
+        return;
     }
 
     // Streaming chunked: peak allocation is chunk_rows × p instead of n × p.
-    // Compute Xᵀ·diag(W)·X as Xᵀ·(W·X) to preserve sign on W; the prior
-    // sqrt(max(0, w))-then-Gram form clipped negative weights to zero, which
-    // corrupted observed-Hessian assembly when any block had n > a (e.g. heavy
-    // residuals under the logb σ link).
     const TARGET_BYTES: usize = 8 * 1024 * 1024;
     const MIN_ROWS: usize = 512;
     const MAX_ROWS: usize = 131_072;
@@ -676,24 +752,28 @@ fn fast_xt_diag_x_with_parallelism_impl<S1: Data<Elem = f64>, S2: Data<Elem = f6
         .clamp(MIN_ROWS, MAX_ROWS)
         .min(n);
 
-    let mut result = Array2::<f64>::zeros((p, p).f());
+    // Triangular accumulation requires a zero baseline in the lower triangle
+    // because each chunk's `Accum::Add` lands there; for a Replace request we
+    // zero up front and add every chunk, for an Add request the caller's
+    // contents are preserved and every chunk adds on top.
+    if accum == CrossprodAccum::Replace {
+        out.fill(0.0);
+    }
+
     // Row-major wx_chunk so the per-row scaling loop has stride-1 writes
-    // alongside stride-1 reads from a row-major X. The previous F-order
-    // wx_chunk forced strided writes by `chunk_rows`, breaking
-    // vectorization and cache locality on the per-PIRLS-iter Hessian
-    // assembly. faer's matmul handles either layout via FaerArrayView.
+    // alongside stride-1 reads from a row-major X. An F-order wx_chunk would
+    // force strided writes by `chunk_rows`, breaking vectorization and cache
+    // locality on the per-PIRLS-iter Hessian assembly. faer's matmul handles
+    // either layout via FaerArrayView.
     let mut wx_chunk = Array2::<f64>::zeros((chunk_rows, p));
 
     let x_is_row_major = x.is_standard_layout();
     let w_slice_opt = w.as_slice();
 
-    // Scope the faer mutable view so its borrow on `result` ends before the
-    // symmetric mirror step. A previous `drop(out_view)` tried to terminate
-    // the borrow explicitly, but `Mat<Mut<'_, f64>>` does not implement
-    // `Drop` (clippy::drop_non_drop, denied as suspicious) — the call did
-    // nothing the borrow checker wasn't already doing under NLL.
+    // Scope the faer mutable view so its borrow on `out` ends before the
+    // symmetric mirror step.
     {
-        let mut out_view = array2_to_matmut(&mut result);
+        let mut out_view = array2_to_matmut(out);
         for start in (0..n).step_by(chunk_rows) {
             let rows = (n - start).min(chunk_rows);
             {
@@ -729,29 +809,45 @@ fn fast_xt_diag_x_with_parallelism_impl<S1: Data<Elem = f64>, S2: Data<Elem = f6
             let wx_slice = wx_chunk.slice(s![0..rows, ..]);
             let x_view = FaerArrayView::new(&x_slice);
             let wx_view = FaerArrayView::new(&wx_slice);
-            // X^T diag(W) X is symmetric; accumulate the lower triangle only, then
-            // mirror once after the chunk loop. ~50% fewer FLOPs vs. full GEMM.
-            tri_matmul(
-                out_view.as_mut(),
-                BlockStructure::TriangularLower,
-                Accum::Add,
-                x_view.as_ref().transpose(),
-                BlockStructure::Rectangular,
-                wx_view.as_ref(),
-                BlockStructure::Rectangular,
-                1.0,
-                par,
-            );
+            match structure {
+                CrossprodStructure::SymmetricLower => {
+                    // X^T diag(W) X is symmetric; accumulate the lower triangle
+                    // only, then mirror once after the chunk loop. ~50% fewer
+                    // FLOPs vs. full GEMM.
+                    tri_matmul(
+                        out_view.as_mut(),
+                        BlockStructure::TriangularLower,
+                        Accum::Add,
+                        x_view.as_ref().transpose(),
+                        BlockStructure::Rectangular,
+                        wx_view.as_ref(),
+                        BlockStructure::Rectangular,
+                        1.0,
+                        par,
+                    );
+                }
+                CrossprodStructure::Full => {
+                    matmul(
+                        out_view.as_mut(),
+                        Accum::Add,
+                        x_view.as_ref().transpose(),
+                        wx_view.as_ref(),
+                        1.0,
+                        par,
+                    );
+                }
+            }
         }
     }
 
-    // Mirror lower triangle to upper for a full symmetric output.
-    for i in 0..p {
-        for j in (i + 1)..p {
-            result[[i, j]] = result[[j, i]];
+    if structure == CrossprodStructure::SymmetricLower {
+        // Mirror lower triangle to upper for a full symmetric output.
+        for i in 0..p {
+            for j in (i + 1)..p {
+                out[[i, j]] = out[[j, i]];
+            }
         }
     }
-    result
 }
 
 /// Compute A^T * diag(W) * B using streaming chunks.
@@ -1814,6 +1910,137 @@ mod tests {
             for j in 0..p {
                 assert!((got[[i, j]] - got[[j, i]]).abs() < 1e-12);
             }
+        }
+    }
+
+    #[test]
+    fn stream_weighted_crossprod_full_and_triangular_parity_with_negative_weights() {
+        // The two historical kernels (matrix.rs `streaming_blas_xt_diag_x`,
+        // full GEMM, stream-into; and faer_ndarray `fast_xt_diag_x*`,
+        // triangular + mirror, return) are now adapters over the one shared
+        // kernel. Both packaging modes — and both accumulation modes — must
+        // reproduce the naive `Xᵀ·diag(w)·X` reference, including signed
+        // (negative) weights, which the pre-unification sqrt-clip form
+        // silently corrupted.
+        //
+        // Exercise both the streaming faer path (n large enough to clear
+        // `should_use_faer_matmul`) and the tiny ndarray fallback (small n,p).
+        for &(n, p) in &[(900usize, 40usize), (8usize, 3usize)] {
+            let x: Array2<f64> =
+                Array2::from_shape_fn((n, p), |(i, j)| (i as f64 * 0.07).cos() + j as f64 * 0.013);
+            // Weights span both signs and zero so negative-weight handling and
+            // sign preservation are genuinely tested.
+            let w: Array1<f64> =
+                Array1::from_shape_fn(n, |i| (i as f64 * 0.11).sin() - 0.25 * (i % 3) as f64);
+            assert!(
+                w.iter().any(|&v| v < 0.0),
+                "weight vector must contain negatives to test sign preservation"
+            );
+
+            // Naive reference: Xᵀ diag(w) X with signed weights.
+            let wx = Array2::from_shape_fn((n, p), |(i, j)| w[i] * x[[i, j]]);
+            let expected = x.t().dot(&wx);
+
+            let par = matmul_parallelism(p, p, n);
+
+            // Full output, Replace.
+            let mut full = Array2::<f64>::ones((p, p));
+            stream_weighted_crossprod_into(
+                &x,
+                &w,
+                &mut full,
+                CrossprodStructure::Full,
+                CrossprodAccum::Replace,
+                par,
+            );
+
+            // Triangular+mirror output, Replace. Seed with garbage to prove
+            // Replace clears prior contents (incl. the upper triangle, which
+            // the triangular path only reaches via the mirror).
+            let mut tri = Array2::<f64>::from_elem((p, p), -7.0);
+            stream_weighted_crossprod_into(
+                &x,
+                &w,
+                &mut tri,
+                CrossprodStructure::SymmetricLower,
+                CrossprodAccum::Replace,
+                par,
+            );
+
+            let full_err = (&full - &expected)
+                .iter()
+                .fold(0.0_f64, |a, &v| a.max(v.abs()));
+            let tri_err = (&tri - &expected)
+                .iter()
+                .fold(0.0_f64, |a, &v| a.max(v.abs()));
+            assert!(full_err < 1e-9, "full kernel mismatch (n={n}, p={p}): {full_err:e}");
+            assert!(
+                tri_err < 1e-9,
+                "triangular kernel mismatch (n={n}, p={p}): {tri_err:e}"
+            );
+
+            // Full and triangular packaging must agree elementwise, and both
+            // must be exactly symmetric.
+            for i in 0..p {
+                for j in 0..p {
+                    assert!(
+                        (full[[i, j]] - tri[[i, j]]).abs() < 1e-12,
+                        "full vs triangular disagree at ({i},{j})"
+                    );
+                    assert!(
+                        (tri[[i, j]] - tri[[j, i]]).abs() < 1e-12,
+                        "triangular output not symmetric at ({i},{j})"
+                    );
+                }
+            }
+
+            // Accumulation parity: Add into a pre-filled buffer must equal the
+            // prior contents plus the Gram, for both structures.
+            let base = Array2::<f64>::from_elem((p, p), 1.5);
+            let mut add_full = base.clone();
+            stream_weighted_crossprod_into(
+                &x,
+                &w,
+                &mut add_full,
+                CrossprodStructure::Full,
+                CrossprodAccum::Add,
+                par,
+            );
+            let mut add_tri = base.clone();
+            stream_weighted_crossprod_into(
+                &x,
+                &w,
+                &mut add_tri,
+                CrossprodStructure::SymmetricLower,
+                CrossprodAccum::Add,
+                par,
+            );
+            let expected_add = &base + &expected;
+            let add_full_err = (&add_full - &expected_add)
+                .iter()
+                .fold(0.0_f64, |a, &v| a.max(v.abs()));
+            let add_tri_err = (&add_tri - &expected_add)
+                .iter()
+                .fold(0.0_f64, |a, &v| a.max(v.abs()));
+            assert!(
+                add_full_err < 1e-9,
+                "full Add mismatch (n={n}, p={p}): {add_full_err:e}"
+            );
+            assert!(
+                add_tri_err < 1e-9,
+                "triangular Add mismatch (n={n}, p={p}): {add_tri_err:e}"
+            );
+
+            // The matrix.rs adapter (Full + Replace into a zeroed buffer) must
+            // match the faer_ndarray return-style adapter bit-for-functionally.
+            let returned = fast_xt_diag_x(&x, &w);
+            let returned_err = (&returned - &full)
+                .iter()
+                .fold(0.0_f64, |a, &v| a.max(v.abs()));
+            assert!(
+                returned_err < 1e-12,
+                "return adapter vs stream-into adapter disagree (n={n}, p={p}): {returned_err:e}"
+            );
         }
     }
 

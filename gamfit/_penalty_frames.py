@@ -79,51 +79,20 @@ def torch_penalty_hvp(wrapper: Any, t: Any, v: Any) -> Any:
 def jax_penalty_value_grad(wrapper: Any, t: Any) -> tuple[Any, Any]:
     """JAX-frame ``(value, grad)`` differentiable via ``jax.grad``.
 
-    The forward runs the Rust kernel through :func:`jax.pure_callback`,
-    making the call safe under ``jit`` and ``vmap``. A
-    :class:`jax.custom_vjp` wires the backward pass to the Rust
-    gradient, so ``jax.grad(lambda x: value_grad(x)[0])`` recovers
-    ``grad`` to within float64 round-trip noise.
+    Thin adapter over :func:`jax_value_grad_from_rust`: the only
+    wrapper-specific piece is the host callback that runs the Rust
+    ``analytic_penalty_value_grad`` kernel for this dataclass wrapper.
     """
-    from ._frame import import_jax
-    from ._frame_jax import from_numpy_like, to_numpy_f64
+    from ._penalty_jax_vjp import jax_value_grad_from_rust
 
-    jax, jnp = import_jax()
-    t_np = to_numpy_f64(t)
-    value_np, grad_np = _penalty_value_grad_via_rust(wrapper, t_np)
+    shape = tuple(int(s) for s in t.shape)
 
-    out_dtype = jnp.float64
-    value_spec = jax.ShapeDtypeStruct((), out_dtype)
-    grad_spec = jax.ShapeDtypeStruct(t.shape, out_dtype)
+    def _callback(x_np: np.ndarray) -> tuple[float, np.ndarray]:
+        return _penalty_value_grad_via_rust(wrapper, x_np)
 
-    @jax.custom_vjp
-    def _val(x: Any) -> Any:
-        def _host(z: Any) -> np.ndarray:
-            z_np = np.asarray(z, dtype=np.float64)
-            v, _g = _penalty_value_grad_via_rust(wrapper, z_np)
-            return np.asarray(v, dtype=np.float64)
-
-        return jax.pure_callback(_host, value_spec, x)
-
-    def _val_fwd(x: Any) -> tuple[Any, Any]:
-        return _val(x), x
-
-    def _val_bwd(res: Any, g: Any) -> tuple[Any]:
-        x = res
-
-        def _host_g(args: Any) -> np.ndarray:
-            z, gout = args
-            z_np = np.asarray(z, dtype=np.float64)
-            _v, gr = _penalty_value_grad_via_rust(wrapper, z_np)
-            return np.asarray(gr, dtype=np.float64) * float(np.asarray(gout))
-
-        return (jax.pure_callback(_host_g, grad_spec, (x, g)),)
-
-    _val.defvjp(_val_fwd, _val_bwd)
-
-    value_j = _val(t)
-    grad_j = from_numpy_like(np.asarray(grad_np, dtype=np.float64), t)
-    return value_j, grad_j
+    return jax_value_grad_from_rust(
+        type(wrapper).__name__, shape, _callback, ref=t
+    )
 
 
 def jax_penalty_hvp(wrapper: Any, t: Any, v: Any) -> Any:

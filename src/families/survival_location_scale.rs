@@ -24,6 +24,7 @@ use crate::families::gamlss::{
     monotone_wiggle_nonnegative_constraints, select_wiggle_basis_from_seed,
     validate_monotone_wiggle_beta_nonnegative,
 };
+use crate::families::location_scale_engine::build_location_scale_exact_joint_setup;
 use crate::families::scale_design::{
     build_scale_deviation_operator, build_scale_deviation_transform_design,
     infer_non_intercept_start_design,
@@ -3985,77 +3986,15 @@ fn build_survival_two_block_exact_joint_setup(
     rho0: Array1<f64>,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> ExactJointHyperSetup {
-    let threshold_terms = spatial_length_scale_term_indices(thresholdspec);
-    let log_sigma_terms = spatial_length_scale_term_indices(log_sigmaspec);
-    let rho_lower = Array1::<f64>::from_elem(rho0.len(), -12.0);
-    let rho_upper = Array1::<f64>::from_elem(rho0.len(), 12.0);
-
-    let threshold_kappa = SpatialLogKappaCoords::from_length_scales_aniso(
-        thresholdspec,
-        &threshold_terms,
-        kappa_options,
-    )
-    .reseed_from_data(data, thresholdspec, &threshold_terms, kappa_options);
-    let log_sigma_kappa = SpatialLogKappaCoords::from_length_scales_aniso(
-        log_sigmaspec,
-        &log_sigma_terms,
-        kappa_options,
-    )
-    .reseed_from_data(data, log_sigmaspec, &log_sigma_terms, kappa_options);
-    let mut all_values = threshold_kappa.as_array().to_vec();
-    all_values.extend(log_sigma_kappa.as_array().iter());
-    let threshold_dims = threshold_kappa.dims_per_term().to_vec();
-    let log_sigma_dims = log_sigma_kappa.dims_per_term().to_vec();
-    let mut all_dims = threshold_dims.clone();
-    all_dims.extend(log_sigma_dims.iter().copied());
-    let log_kappa0 =
-        SpatialLogKappaCoords::new_with_dims(Array1::from_vec(all_values), all_dims.clone());
-    let threshold_lower = SpatialLogKappaCoords::lower_bounds_aniso_from_data(
+    // Survival location-scale uses the shared engine directly: the rho seed is
+    // already assembled by the caller (penalty + link-wiggle layout), and the
+    // two linear predictors (threshold, log sigma) supply the per-block
+    // log(kappa) geometry in theta order.
+    build_location_scale_exact_joint_setup(
         data,
-        thresholdspec,
-        &threshold_terms,
-        &threshold_dims,
-        kappa_options,
-    );
-    let log_sigma_lower = SpatialLogKappaCoords::lower_bounds_aniso_from_data(
-        data,
-        log_sigmaspec,
-        &log_sigma_terms,
-        &log_sigma_dims,
-        kappa_options,
-    );
-    let mut lower_vals = threshold_lower.as_array().to_vec();
-    lower_vals.extend(log_sigma_lower.as_array().iter());
-    let log_kappa_lower =
-        SpatialLogKappaCoords::new_with_dims(Array1::from_vec(lower_vals), all_dims.clone());
-    let threshold_upper = SpatialLogKappaCoords::upper_bounds_aniso_from_data(
-        data,
-        thresholdspec,
-        &threshold_terms,
-        &threshold_dims,
-        kappa_options,
-    );
-    let log_sigma_upper = SpatialLogKappaCoords::upper_bounds_aniso_from_data(
-        data,
-        log_sigmaspec,
-        &log_sigma_terms,
-        &log_sigma_dims,
-        kappa_options,
-    );
-    let mut upper_vals = threshold_upper.as_array().to_vec();
-    upper_vals.extend(log_sigma_upper.as_array().iter());
-    let log_kappa_upper =
-        SpatialLogKappaCoords::new_with_dims(Array1::from_vec(upper_vals), all_dims);
-    // Project seed onto bounds; spec.length_scale is a hint, not a constraint.
-    let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
-
-    ExactJointHyperSetup::new(
+        &[thresholdspec, log_sigmaspec],
         rho0,
-        rho_lower,
-        rho_upper,
-        log_kappa0,
-        log_kappa_lower,
-        log_kappa_upper,
+        kappa_options,
     )
 }
 

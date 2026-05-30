@@ -1432,7 +1432,7 @@ fn fit_cause_specific_survival_transformation_custom(
     spec: &SurvivalTransformationTermSpec,
     resolvedspec: TermCollectionSpec,
     baseline_cfg: crate::families::survival_construction::SurvivalBaselineConfig,
-    prepared: PreparedWorkflowSurvivalTimeStack,
+    prepared: PreparedSurvivalTimeStack,
     dense_cov_design: &Array2<f64>,
     penalty_blocks: Vec<PenaltyBlock>,
     beta0_flat: Array1<f64>,
@@ -1464,7 +1464,7 @@ fn fit_cause_specific_survival_transformation_custom(
 
     let dense_time_entry = prepared.time_design_entry.to_dense();
     let dense_time_exit = prepared.time_design_exit.to_dense();
-    let dense_time_derivative = prepared.time_design_derivative.to_dense();
+    let dense_time_derivative = prepared.time_design_derivative_exit.to_dense();
     let mut x_entry = Array2::<f64>::zeros((n, p));
     let mut x_exit = Array2::<f64>::zeros((n, p));
     let mut x_derivative = Array2::<f64>::zeros((n, p));
@@ -1700,7 +1700,7 @@ fn persistent_survival_transformation_key(
     spec: &SurvivalTransformationTermSpec,
     baseline_cfg: &crate::families::survival_construction::SurvivalBaselineConfig,
     dense_cov_design: ArrayView2<'_, f64>,
-    prepared: &PreparedWorkflowSurvivalTimeStack,
+    prepared: &PreparedSurvivalTimeStack,
     penalty_blocks: &[crate::survival::PenaltyBlock],
     opts: &crate::pirls::WorkingModelPirlsOptions,
     n_cols: usize,
@@ -1773,7 +1773,7 @@ fn persistent_survival_transformation_key(
     hash_workflow_array_view(&mut hasher, prepared.derivative_offset_exit.view());
     hash_workflow_design_matrix(&mut hasher, &prepared.time_design_entry);
     hash_workflow_design_matrix(&mut hasher, &prepared.time_design_exit);
-    hash_workflow_design_matrix(&mut hasher, &prepared.time_design_derivative);
+    hash_workflow_design_matrix(&mut hasher, &prepared.time_design_derivative_exit);
     hasher.write_usize(penalty_blocks.len());
     for block in penalty_blocks {
         hasher.write_f64(block.lambda);
@@ -1882,7 +1882,7 @@ fn fit_survival_transformation_model(
 
     let build_working_model =
         |candidate: &crate::families::survival_construction::SurvivalBaselineConfig| {
-            let prepared = prepare_workflow_survival_time_stack(
+            let prepared = prepare_survival_time_stack(
                 &spec.age_entry,
                 &spec.age_exit,
                 candidate,
@@ -1934,7 +1934,7 @@ fn fit_survival_transformation_model(
             }
             let dense_time_entry = prepared.time_design_entry.to_dense();
             let dense_time_exit = prepared.time_design_exit.to_dense();
-            let dense_time_derivative = prepared.time_design_derivative.to_dense();
+            let dense_time_derivative = prepared.time_design_derivative_exit.to_dense();
             let event_competing = Array1::<u8>::zeros(spec.event_target.len());
             // `spec.event_target` carries *cause labels* (0 = censored, k = cause k).
             // The shared baseline working model is a single-hazard Royston-Parmar
@@ -3085,6 +3085,7 @@ pub fn resolve_family(
     family: Option<&str>,
     negative_binomial_theta: Option<f64>,
     link_choice: Option<&LinkChoice>,
+    sas_linkspec: Option<&SasLinkSpec>,
     y: ArrayView1<'_, f64>,
     y_kind: ResponseColumnKind,
     response_name: &str,
@@ -3191,6 +3192,24 @@ pub fn resolve_family(
                         InverseLink::Standard(StandardLink::Log),
                     ),
                     false,
+                ),
+                // Royston-Parmar flexible-parametric survival and the
+                // transformation-normal response model are CLI/formula families
+                // whose materialization is dispatched before the scalar GLM
+                // family resolver runs (survival via `Surv(...)`, transformation
+                // via the dedicated transformation-normal path). They are listed
+                // here so this resolver is the single total source of truth for
+                // every family name the surface accepts: `royston-parmar` maps to
+                // the canonical flexible-parametric likelihood, and
+                // `transformation-normal` shares Gaussian-identity scalar
+                // semantics (the transformation is learned outside this spec).
+                "royston-parmar" => (LikelihoodSpec::royston_parmar(), true),
+                "transformation-normal" => (
+                    LikelihoodSpec::new(
+                        ResponseFamily::Gaussian,
+                        InverseLink::Standard(StandardLink::Identity),
+                    ),
+                    true,
                 ),
                 // Tweedie compound-Poisson-Gamma family. The variance power
                 // p must lie strictly in (1, 2); we default to mgcv's
@@ -3307,19 +3326,26 @@ pub fn resolve_family(
                     InverseLink::Standard(StandardLink::CLogLog),
                 ),
                 LinkFunction::Sas => {
-                    let state = state_from_sasspec(SasLinkSpec {
+                    // Carry the caller-supplied SAS initial state (epsilon,
+                    // log_delta) when present so the CLI path embeds the user's
+                    // `link(sas_init=...)` exactly; absent an override the
+                    // canonical zero seed is used (the value the link-parameter
+                    // optimizer would start from anyway).
+                    let init = sas_linkspec.copied().unwrap_or(SasLinkSpec {
                         initial_epsilon: 0.0,
                         initial_log_delta: 0.0,
-                    })
-                    .map_err(|err| format!("SAS link initial state: {err}"))?;
+                    });
+                    let state = state_from_sasspec(init)
+                        .map_err(|err| format!("SAS link initial state: {err}"))?;
                     LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Sas(state))
                 }
                 LinkFunction::BetaLogistic => {
-                    let state = state_from_beta_logisticspec(SasLinkSpec {
+                    let init = sas_linkspec.copied().unwrap_or(SasLinkSpec {
                         initial_epsilon: 0.0,
                         initial_log_delta: 0.0,
-                    })
-                    .map_err(|err| format!("Beta-Logistic link initial state: {err}"))?;
+                    });
+                    let state = state_from_beta_logisticspec(init)
+                        .map_err(|err| format!("Beta-Logistic link initial state: {err}"))?;
                     LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::BetaLogistic(state))
                 }
             }
@@ -3458,22 +3484,30 @@ fn resolve_survival_marginal_slope_base_link(
     }
 }
 
-struct PreparedWorkflowSurvivalTimeStack {
-    eta_offset_entry: Array1<f64>,
-    eta_offset_exit: Array1<f64>,
-    derivative_offset_exit: Array1<f64>,
-    unloaded_mass_entry: Array1<f64>,
-    unloaded_mass_exit: Array1<f64>,
-    unloaded_hazard_exit: Array1<f64>,
-    time_design_entry: crate::matrix::DesignMatrix,
-    time_design_exit: crate::matrix::DesignMatrix,
-    time_design_derivative: crate::matrix::DesignMatrix,
-    time_penalties: Vec<Array2<f64>>,
-    time_nullspace_dims: Vec<usize>,
-    timewiggle_block: Option<TimeWiggleBlockInput>,
+/// Canonical baseline-time stack shared by the workflow materializer and the
+/// CLI survival path (`crate::bin::main`-side `run_survival`). Both entry points
+/// build the survival time block identically — baseline offsets, derivative
+/// guard, optional baseline time-wiggle augmentation — so the assembly lives
+/// here once and the CLI consumes it through a thin re-export rather than
+/// reconstructing the same decision tree.
+pub(crate) struct PreparedSurvivalTimeStack {
+    pub(crate) eta_offset_entry: Array1<f64>,
+    pub(crate) eta_offset_exit: Array1<f64>,
+    pub(crate) derivative_offset_exit: Array1<f64>,
+    pub(crate) unloaded_mass_entry: Array1<f64>,
+    pub(crate) unloaded_mass_exit: Array1<f64>,
+    pub(crate) unloaded_hazard_exit: Array1<f64>,
+    pub(crate) time_design_entry: crate::matrix::DesignMatrix,
+    pub(crate) time_design_exit: crate::matrix::DesignMatrix,
+    pub(crate) time_design_derivative_exit: crate::matrix::DesignMatrix,
+    pub(crate) time_penalties: Vec<Array2<f64>>,
+    pub(crate) time_nullspace_dims: Vec<usize>,
+    pub(crate) timewiggle_build:
+        Option<crate::families::survival_construction::SurvivalTimeWiggleBuild>,
+    pub(crate) timewiggle_block: Option<TimeWiggleBlockInput>,
 }
 
-fn prepare_workflow_survival_time_stack(
+pub(crate) fn prepare_survival_time_stack(
     age_entry: &Array1<f64>,
     age_exit: &Array1<f64>,
     baseline_cfg: &crate::families::survival_construction::SurvivalBaselineConfig,
@@ -3484,7 +3518,7 @@ fn prepare_workflow_survival_time_stack(
     time_build: &crate::families::survival_construction::SurvivalTimeBuildOutput,
     effective_timewiggle: Option<&LinkWiggleFormulaSpec>,
     latent_loading: Option<crate::families::lognormal_kernel::HazardLoading>,
-) -> Result<PreparedWorkflowSurvivalTimeStack, String> {
+) -> Result<PreparedSurvivalTimeStack, String> {
     let (
         mut eta_offset_entry,
         mut eta_offset_exit,
@@ -3543,7 +3577,7 @@ fn prepare_workflow_survival_time_stack(
     };
     let mut time_design_entry = time_build.x_entry_time.clone();
     let mut time_design_exit = time_build.x_exit_time.clone();
-    let mut time_design_derivative = time_build.x_derivative_time.clone();
+    let mut time_design_derivative_exit = time_build.x_derivative_time.clone();
     let mut time_penalties = time_build.penalties.clone();
     let mut time_nullspace_dims = time_build.nullspace_dims.clone();
     let mut timewiggle_block = None;
@@ -3552,7 +3586,7 @@ fn prepare_workflow_survival_time_stack(
         append_zero_tail_columns(
             &mut time_design_entry,
             &mut time_design_exit,
-            &mut time_design_derivative,
+            &mut time_design_derivative_exit,
             wiggle.ncols,
         );
         for (idx, penalty) in wiggle.penalties.iter().enumerate() {
@@ -3572,7 +3606,7 @@ fn prepare_workflow_survival_time_stack(
             ncols: wiggle.ncols,
         });
     }
-    Ok(PreparedWorkflowSurvivalTimeStack {
+    Ok(PreparedSurvivalTimeStack {
         eta_offset_entry,
         eta_offset_exit,
         derivative_offset_exit,
@@ -3581,9 +3615,10 @@ fn prepare_workflow_survival_time_stack(
         unloaded_hazard_exit,
         time_design_entry,
         time_design_exit,
-        time_design_derivative,
+        time_design_derivative_exit,
         time_penalties,
         time_nullspace_dims,
+        timewiggle_build,
         timewiggle_block,
     })
 }
@@ -5360,6 +5395,7 @@ fn materialize_standard<'a>(
         config.family.as_deref(),
         config.negative_binomial_theta,
         link_choice.as_ref(),
+        None,
         y.view(),
         y_kind,
         &parsed.response,
@@ -6138,7 +6174,7 @@ fn materialize_survival<'a>(
 
     let build_time_block =
         |candidate: &crate::families::survival_construction::SurvivalBaselineConfig| {
-            let prepared = prepare_workflow_survival_time_stack(
+            let prepared = prepare_survival_time_stack(
                 &age_entry,
                 &age_exit,
                 candidate,
@@ -6168,7 +6204,7 @@ fn materialize_survival<'a>(
             let time_block = TimeBlockInput {
                 design_entry: prepared.time_design_entry.clone(),
                 design_exit: prepared.time_design_exit.clone(),
-                design_derivative_exit: prepared.time_design_derivative.clone(),
+                design_derivative_exit: prepared.time_design_derivative_exit.clone(),
                 offset_entry: prepared.eta_offset_entry.clone(),
                 offset_exit: prepared.eta_offset_exit.clone(),
                 derivative_offset_exit: prepared.derivative_offset_exit.clone(),
@@ -6288,7 +6324,7 @@ fn materialize_survival<'a>(
                 "internal error: latent survival loading missing after frailty validation"
                     .to_string()
             })?;
-            let prepared = prepare_workflow_survival_time_stack(
+            let prepared = prepare_survival_time_stack(
                 &age_entry,
                 &age_exit,
                 candidate,
@@ -6312,7 +6348,7 @@ fn materialize_survival<'a>(
             let time_block = TimeBlockInput {
                 design_entry: prepared.time_design_entry.clone(),
                 design_exit: prepared.time_design_exit.clone(),
-                design_derivative_exit: prepared.time_design_derivative.clone(),
+                design_derivative_exit: prepared.time_design_derivative_exit.clone(),
                 offset_entry: prepared.eta_offset_entry.clone(),
                 offset_exit: prepared.eta_offset_exit.clone(),
                 derivative_offset_exit: prepared.derivative_offset_exit.clone(),
@@ -6347,7 +6383,7 @@ fn materialize_survival<'a>(
             let loading = latent_loading.ok_or_else(|| {
                 "internal error: latent binary loading missing after frailty validation".to_string()
             })?;
-            let prepared = prepare_workflow_survival_time_stack(
+            let prepared = prepare_survival_time_stack(
                 &age_entry,
                 &age_exit,
                 candidate,
@@ -6371,7 +6407,7 @@ fn materialize_survival<'a>(
             let time_block = TimeBlockInput {
                 design_entry: prepared.time_design_entry.clone(),
                 design_exit: prepared.time_design_exit.clone(),
-                design_derivative_exit: prepared.time_design_derivative.clone(),
+                design_derivative_exit: prepared.time_design_derivative_exit.clone(),
                 offset_entry: prepared.eta_offset_entry.clone(),
                 offset_exit: prepared.eta_offset_exit.clone(),
                 derivative_offset_exit: prepared.derivative_offset_exit.clone(),
@@ -6749,6 +6785,7 @@ fn materialize_location_scale<'a>(
         config.family.as_deref(),
         config.negative_binomial_theta,
         link_choice.as_ref(),
+        None,
         y.view(),
         y_kind,
         &parsed.response,

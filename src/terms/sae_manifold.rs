@@ -438,6 +438,88 @@ impl SaeBasisEvaluator for RawPeriodicCircleEvaluator {
     }
 }
 
+/// Diagonal of the chart-local seven-column sphere basis penalty.
+///
+/// The columns are `[1, x, y, z, xy, yz, xz]`; the constant column carries a
+/// numerically-negligible ridge (`1e-8`) so the penalty stays positive
+/// definite, the three linear columns are penalized at unit weight, and the
+/// three bilinear columns at weight `4` (their second-order angular content).
+/// This is the single source of truth for the chart penalty shared between the
+/// core SAE path and the PyFFI `sphere_chart_basis_with_jet` helper.
+pub const SPHERE_CHART_PENALTY_DIAGONAL: [f64; 7] = [1e-8, 1.0, 1.0, 1.0, 4.0, 4.0, 4.0];
+
+/// Shared single source of truth for the chart-local sphere basis and its
+/// analytic first-derivative (lat/lon) jet.
+///
+/// `coords` is an `(N, 2)` array of latitude/longitude pairs in radians. The
+/// returned `phi` has shape `(N, 7)` with columns `[1, x, y, z, xy, yz, xz]`
+/// for the unit-sphere embedding `x = cos(lat)cos(lon)`, `y = cos(lat)sin(lon)`,
+/// `z = sin(lat)`; the returned `jet` has shape `(N, 7, 2)` with the last axis
+/// indexing `[∂/∂lat, ∂/∂lon]`.
+///
+/// Latitude is clamped to `[-π/2, π/2]`. The clamp truncates derivatives w.r.t.
+/// the raw input coordinate outside the interior `(-π/2, π/2)`: in the
+/// saturated region the `phi` entries are constant in `coords[[row, 0]]`, so the
+/// chain rule contributes a zero factor on the `∂/∂lat` axis. Failing to apply
+/// this `chain_lat` gating leaks a non-zero analytic gradient where finite
+/// differences correctly report zero, sending Newton steps in lat in a
+/// direction the loss does not actually decrease along. Both the core path
+/// ([`SphereChartEvaluator`]) and the PyFFI helper route through this function,
+/// so the saturated-latitude gating is identical everywhere.
+pub fn sphere_chart_basis_jet(
+    coords: ArrayView2<'_, f64>,
+) -> Result<(Array2<f64>, Array3<f64>), String> {
+    if coords.ncols() != 2 {
+        return Err(format!(
+            "sphere_chart_basis_jet expects latent_dim == 2, got {}",
+            coords.ncols()
+        ));
+    }
+    let n = coords.nrows();
+    let mut phi = Array2::<f64>::zeros((n, 7));
+    let mut jet = Array3::<f64>::zeros((n, 7, 2));
+    for row in 0..n {
+        let raw_lat = coords[[row, 0]];
+        let lat = raw_lat.clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
+        let lat_active =
+            raw_lat > -std::f64::consts::FRAC_PI_2 && raw_lat < std::f64::consts::FRAC_PI_2;
+        let chain_lat = if lat_active { 1.0 } else { 0.0 };
+        let lon = coords[[row, 1]];
+        let clat = lat.cos();
+        let slat = lat.sin();
+        let clon = lon.cos();
+        let slon = lon.sin();
+        let x = clat * clon;
+        let y = clat * slon;
+        let z = slat;
+        phi[[row, 0]] = 1.0;
+        phi[[row, 1]] = x;
+        phi[[row, 2]] = y;
+        phi[[row, 3]] = z;
+        phi[[row, 4]] = x * y;
+        phi[[row, 5]] = y * z;
+        phi[[row, 6]] = x * z;
+
+        let dx_dlat = -slat * clon * chain_lat;
+        let dx_dlon = -clat * slon;
+        let dy_dlat = -slat * slon * chain_lat;
+        let dy_dlon = clat * clon;
+        let dz_dlat = clat * chain_lat;
+        jet[[row, 1, 0]] = dx_dlat;
+        jet[[row, 1, 1]] = dx_dlon;
+        jet[[row, 2, 0]] = dy_dlat;
+        jet[[row, 2, 1]] = dy_dlon;
+        jet[[row, 3, 0]] = dz_dlat;
+        jet[[row, 4, 0]] = dx_dlat * y + x * dy_dlat;
+        jet[[row, 4, 1]] = dx_dlon * y + x * dy_dlon;
+        jet[[row, 5, 0]] = dy_dlat * z + y * dz_dlat;
+        jet[[row, 5, 1]] = dy_dlon * z;
+        jet[[row, 6, 0]] = dx_dlat * z + x * dz_dlat;
+        jet[[row, 6, 1]] = dx_dlon * z;
+    }
+    Ok((phi, jet))
+}
+
 /// Lat/lon sphere chart evaluator used by the Rust-owned minimal SAE path.
 #[derive(Debug, Clone)]
 pub struct SphereChartEvaluator;
@@ -448,62 +530,7 @@ impl SaeBasisEvaluator for SphereChartEvaluator {
     }
 
     fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
-        if coords.ncols() != 2 {
-            return Err(format!(
-                "SphereChartEvaluator expects latent_dim == 2, got {}",
-                coords.ncols()
-            ));
-        }
-        let n = coords.nrows();
-        let mut phi = Array2::<f64>::zeros((n, 7));
-        let mut jet = Array3::<f64>::zeros((n, 7, 2));
-        for row in 0..n {
-            let raw_lat = coords[[row, 0]];
-            let lat = raw_lat.clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
-            // The clamp truncates derivatives w.r.t. the raw input coordinate
-            // outside the interior `(-π/2, π/2)`: in the saturated region the
-            // phi entries are constant in `coords[[row, 0]]`, so the chain rule
-            // contributes a zero factor on the `∂/∂coords[row,0]` axis. Failing
-            // to apply this leaks a non-zero analytic gradient where finite
-            // differences correctly report zero, sending Newton steps in lat
-            // in a direction the loss does not actually decrease along.
-            let lat_active =
-                raw_lat > -std::f64::consts::FRAC_PI_2 && raw_lat < std::f64::consts::FRAC_PI_2;
-            let chain_lat = if lat_active { 1.0 } else { 0.0 };
-            let lon = coords[[row, 1]];
-            let clat = lat.cos();
-            let slat = lat.sin();
-            let clon = lon.cos();
-            let slon = lon.sin();
-            let x = clat * clon;
-            let y = clat * slon;
-            let z = slat;
-            phi[[row, 0]] = 1.0;
-            phi[[row, 1]] = x;
-            phi[[row, 2]] = y;
-            phi[[row, 3]] = z;
-            phi[[row, 4]] = x * y;
-            phi[[row, 5]] = y * z;
-            phi[[row, 6]] = x * z;
-
-            let dx_dlat = -slat * clon * chain_lat;
-            let dx_dlon = -clat * slon;
-            let dy_dlat = -slat * slon * chain_lat;
-            let dy_dlon = clat * clon;
-            let dz_dlat = clat * chain_lat;
-            jet[[row, 1, 0]] = dx_dlat;
-            jet[[row, 1, 1]] = dx_dlon;
-            jet[[row, 2, 0]] = dy_dlat;
-            jet[[row, 2, 1]] = dy_dlon;
-            jet[[row, 3, 0]] = dz_dlat;
-            jet[[row, 4, 0]] = dx_dlat * y + x * dy_dlat;
-            jet[[row, 4, 1]] = dx_dlon * y + x * dy_dlon;
-            jet[[row, 5, 0]] = dy_dlat * z + y * dz_dlat;
-            jet[[row, 5, 1]] = dy_dlon * z;
-            jet[[row, 6, 0]] = dx_dlat * z + x * dz_dlat;
-            jet[[row, 6, 1]] = dx_dlon * z;
-        }
-        Ok((phi, jet))
+        sphere_chart_basis_jet(coords)
     }
 }
 
@@ -6288,6 +6315,98 @@ mod tests {
             assert!(torus_jet[[row, 0, 0]].abs() <= 1.0e-12);
             assert!(torus_jet[[row, 0, 1]].abs() <= 1.0e-12);
         }
+    }
+
+    /// Parity guard for the sphere chart: the shared engine
+    /// [`sphere_chart_basis_jet`] is the single source of derivative truth used
+    /// by both the core SAE path ([`SphereChartEvaluator::evaluate`]) and the
+    /// PyFFI `sphere_chart_basis_with_jet` helper, which now routes through the
+    /// exact same function. This pins the behavior that previously drifted —
+    /// the saturated-latitude `chain_lat` gating — at both saturated and
+    /// non-saturated latitudes, so a future divergence would fail here.
+    #[test]
+    fn sphere_chart_basis_jet_is_single_source_of_truth() {
+        // A mix of interior and clamp-saturated (|lat| >= π/2) latitudes,
+        // including the exact boundary, which the gate treats as saturated.
+        let coords = array![
+            [-1.2, -2.4],         // interior
+            [0.35, 0.9],          // interior
+            [std::f64::consts::FRAC_PI_2, 0.4],   // upper boundary (saturated)
+            [-std::f64::consts::FRAC_PI_2, -1.1], // lower boundary (saturated)
+            [2.3, 0.7],           // beyond upper clamp (saturated)
+            [-3.0, 1.9],          // beyond lower clamp (saturated)
+        ];
+
+        // The core evaluator adapter must be bit-identical to the shared engine
+        // — they are the same code path, so any difference is a regression in
+        // the thin adapter rather than a tolerance question.
+        let (engine_phi, engine_jet) = sphere_chart_basis_jet(coords.view()).unwrap();
+        let (adapter_phi, adapter_jet) = SphereChartEvaluator.evaluate(coords.view()).unwrap();
+        assert_eq!(engine_phi, adapter_phi);
+        assert_eq!(engine_jet, adapter_jet);
+
+        for row in 0..coords.nrows() {
+            let raw_lat = coords[[row, 0]];
+            let lon = coords[[row, 1]];
+            let saturated = !(raw_lat > -std::f64::consts::FRAC_PI_2
+                && raw_lat < std::f64::consts::FRAC_PI_2);
+
+            let lat = raw_lat.clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
+            let clat = lat.cos();
+            let slat = lat.sin();
+            let clon = lon.cos();
+            let slon = lon.sin();
+            let x = clat * clon;
+            let y = clat * slon;
+            let z = slat;
+
+            // Basis is always the clamped embedding, gating or not.
+            assert!((engine_phi[[row, 0]] - 1.0).abs() <= 1.0e-12);
+            assert!((engine_phi[[row, 1]] - x).abs() <= 1.0e-12);
+            assert!((engine_phi[[row, 2]] - y).abs() <= 1.0e-12);
+            assert!((engine_phi[[row, 3]] - z).abs() <= 1.0e-12);
+            assert!((engine_phi[[row, 4]] - x * y).abs() <= 1.0e-12);
+            assert!((engine_phi[[row, 5]] - y * z).abs() <= 1.0e-12);
+            assert!((engine_phi[[row, 6]] - x * z).abs() <= 1.0e-12);
+
+            // Longitude derivatives never depend on the latitude clamp.
+            let dx_dlon = -clat * slon;
+            let dy_dlon = clat * clon;
+            assert!((engine_jet[[row, 1, 1]] - dx_dlon).abs() <= 1.0e-12);
+            assert!((engine_jet[[row, 2, 1]] - dy_dlon).abs() <= 1.0e-12);
+            assert_eq!(engine_jet[[row, 3, 1]], 0.0);
+            assert!((engine_jet[[row, 4, 1]] - (dx_dlon * y + x * dy_dlon)).abs() <= 1.0e-12);
+            assert!((engine_jet[[row, 5, 1]] - dy_dlon * z).abs() <= 1.0e-12);
+            assert!((engine_jet[[row, 6, 1]] - dx_dlon * z).abs() <= 1.0e-12);
+
+            // Latitude derivatives are gated to exactly zero in the saturated
+            // region (where finite differences also report zero) and equal the
+            // ungated analytic values in the interior.
+            let chain_lat = if saturated { 0.0 } else { 1.0 };
+            let dx_dlat = -slat * clon * chain_lat;
+            let dy_dlat = -slat * slon * chain_lat;
+            let dz_dlat = clat * chain_lat;
+            if saturated {
+                assert_eq!(engine_jet[[row, 1, 0]], 0.0);
+                assert_eq!(engine_jet[[row, 2, 0]], 0.0);
+                assert_eq!(engine_jet[[row, 3, 0]], 0.0);
+                assert_eq!(engine_jet[[row, 4, 0]], 0.0);
+                assert_eq!(engine_jet[[row, 5, 0]], 0.0);
+                assert_eq!(engine_jet[[row, 6, 0]], 0.0);
+            }
+            assert!((engine_jet[[row, 1, 0]] - dx_dlat).abs() <= 1.0e-12);
+            assert!((engine_jet[[row, 2, 0]] - dy_dlat).abs() <= 1.0e-12);
+            assert!((engine_jet[[row, 3, 0]] - dz_dlat).abs() <= 1.0e-12);
+            assert!((engine_jet[[row, 4, 0]] - (dx_dlat * y + x * dy_dlat)).abs() <= 1.0e-12);
+            assert!((engine_jet[[row, 5, 0]] - (dy_dlat * z + y * dz_dlat)).abs() <= 1.0e-12);
+            assert!((engine_jet[[row, 6, 0]] - (dx_dlat * z + x * dz_dlat)).abs() <= 1.0e-12);
+        }
+
+        // The chart penalty diagonal is also shared with the PyFFI helper.
+        assert_eq!(
+            SPHERE_CHART_PENALTY_DIAGONAL,
+            [1e-8, 1.0, 1.0, 1.0, 4.0, 4.0, 4.0]
+        );
     }
 
     /// Central-difference oracle for `second_jet`: differentiate the analytic

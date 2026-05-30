@@ -190,9 +190,6 @@ class _RustPenaltyDescriptor(PenaltyDescriptor):
             )
             return float(value), grad.reshape(t_np.shape)
         if frame is Frame.JAX:
-            from ._penalty_frames import jax_penalty_value_grad
-
-            # Reuse the wrapper helper by adapting the rust call signature.
             return _jax_value_grad_via_rust(self, t)
         torch = _require_torch()
         if not isinstance(t, torch.Tensor):
@@ -272,54 +269,26 @@ class _RustPenaltyDescriptor(PenaltyDescriptor):
 def _jax_value_grad_via_rust(descriptor_obj: Any, t: Any) -> tuple[Any, Any]:
     """JAX-frame ``(value, grad)`` for a :class:`_RustPenaltyDescriptor`.
 
-    The forward call dispatches through :func:`jax.pure_callback` so the
-    same Rust kernel runs unchanged; the backward route is a
-    :class:`jax.custom_vjp` consulting the kernel's analytic gradient.
+    Thin adapter over :func:`jax_value_grad_from_rust`: the only
+    descriptor-specific piece is the host callback that runs
+    ``analytic_penalty_value_grad`` for this descriptor's JSON.
     """
-    from ._frame import import_jax
-    from ._frame_jax import from_numpy_like, to_numpy_f64
+    from ._penalty_jax_vjp import jax_value_grad_from_rust
 
-    jax, jnp = import_jax()
-
-    t_np = to_numpy_f64(t)
     shape = tuple(int(s) for s in t.shape)
-    n, d = _infer_shape(t_np)
+    n, d = _infer_shape(np.asarray(t, dtype=np.float64))
     descriptor = descriptor_obj._descriptor(n, d)
     target_name = descriptor_obj.target_name
 
-    value_spec = jax.ShapeDtypeStruct((), jnp.float64)
-    grad_spec = jax.ShapeDtypeStruct(shape, jnp.float64)
-
-    def _host_val(x: Any) -> np.ndarray:
-        x_np = np.asarray(x, dtype=np.float64).reshape(-1)
-        v, _g, _ = _call_value_grad(x_np, n, d, target_name, descriptor)
-        return np.asarray(v, dtype=np.float64)
-
-    def _host_grad(args: Any) -> np.ndarray:
-        x, gout = args
-        x_np = np.asarray(x, dtype=np.float64).reshape(-1)
-        _v, g, _ = _call_value_grad(x_np, n, d, target_name, descriptor)
-        return np.ascontiguousarray(
-            (np.asarray(g, dtype=np.float64) * float(np.asarray(gout))).reshape(shape)
+    def _callback(x_np: np.ndarray) -> tuple[float, np.ndarray]:
+        value, grad, _grad_rho = _call_value_grad(
+            x_np.reshape(-1), n, d, target_name, descriptor
         )
+        return value, grad.reshape(shape)
 
-    @jax.custom_vjp
-    def _val(x: Any) -> Any:
-        return jax.pure_callback(_host_val, value_spec, x)
-
-    def _val_fwd(x: Any) -> tuple[Any, Any]:
-        return _val(x), x
-
-    def _val_bwd(res: Any, g: Any) -> tuple[Any]:
-        return (jax.pure_callback(_host_grad, grad_spec, (res, g)),)
-
-    _val.defvjp(_val_fwd, _val_bwd)
-
-    value_j = _val(t)
-    # Analytic gradient (no autograd needed) for the second return slot.
-    _v0, g0, _ = _call_value_grad(t_np.reshape(-1), n, d, target_name, descriptor)
-    grad_j = from_numpy_like(np.asarray(g0, dtype=np.float64).reshape(shape), t)
-    return value_j, grad_j
+    return jax_value_grad_from_rust(
+        descriptor.get("kind", "penalty"), shape, _callback, ref=t
+    )
 
 
 class ARDPenalty(_RustPenaltyDescriptor):

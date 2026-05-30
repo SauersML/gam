@@ -82,9 +82,10 @@ use gam::terms::basis::{
     build_spherical_spline_basis, build_thin_plate_penalty_matrix, create_basis,
     create_cyclic_difference_penalty_matrix, create_difference_penalty_matrix,
     duchon_nullspace_dimension, duchon_polynomial_first_derivative_nd,
-    duchon_radial_first_derivative_nd, evaluate_bspline_basis_scalar,
-    matern_radial_first_derivative_nd,
-    matern_radial_second_derivative_nd, monomial_exponents, periodic_bspline_first_derivative_nd,
+    duchon_pure_kernel_amplification, duchon_radial_first_derivative_nd,
+    evaluate_bspline_basis_scalar,
+    matern_input_location_hessian_nd, matern_input_location_jet_nd,
+    matern_radial_first_derivative_nd, monomial_exponents, periodic_bspline_first_derivative_nd,
     resolve_duchon_orders, select_spherical_farthest_point_centers, sphere_first_derivative_nd,
 };
 use gam::terms::input_loc_derivatives::contract_input_loc_gradient;
@@ -3277,6 +3278,14 @@ fn duchon_basis_with_jet<'py>(
         radial_input_location_jet(pts, ctrs, radial_first.view()).map_err(py_value_error)?;
     let poly_jet = duchon_polynomial_first_derivative_nd(pts, effective_nullspace);
 
+    // Scalar kernel amplification `α` — identical to the value the forward
+    // `build_duchon_basis` design applies to the pure polyharmonic kernel
+    // block above (`power = 0`, `length_scale = None`). The forward block is
+    // `α·K(t,C)·Z`, so its input-location derivative is `α·K'(t,C)·Z`; the raw
+    // radial jet must be scaled by the same `α`. The appended polynomial
+    // columns carry no amplification, matching the forward.
+    let kernel_amp = duchon_pure_kernel_amplification(ctrs, requested_nullspace);
+
     let n_rows = pts.nrows();
     let dim = pts.ncols();
     let n_kernel = radial_transform.ncols();
@@ -3284,7 +3293,9 @@ fn duchon_basis_with_jet<'py>(
     let mut jet = Array3::<f64>::zeros((n_rows, n_kernel + n_poly, dim));
     for axis in 0..dim {
         let projected = radial_jet.index_axis(Axis(2), axis).dot(&radial_transform);
-        jet.slice_mut(s![.., ..n_kernel, axis]).assign(&projected);
+        let mut block = jet.slice_mut(s![.., ..n_kernel, axis]);
+        block.assign(&projected);
+        block *= kernel_amp;
     }
     jet.slice_mut(s![.., n_kernel.., ..]).assign(&poly_jet);
 
@@ -7882,10 +7893,19 @@ fn latent_input_location_jet(
                     poly_jet.shape()[2],
                 ));
             }
+            // Scalar kernel amplification `α` the forward
+            // `build_latent_duchon_design` (→ `build_duchon_basis` with
+            // `power = 0`, `length_scale = None`) applies to the kernel block
+            // `α·K(t,C)·Z`. The input-location derivative is `α·K'(t,C)·Z`, so
+            // the raw radial jet must carry the same `α`; the appended
+            // polynomial columns are un-amplified, matching the forward.
+            let kernel_amp = duchon_pure_kernel_amplification(centers, requested_nullspace);
             let mut jet = Array3::<f64>::zeros((n_rows, n_kernel + n_poly, dim));
             for axis in 0..dim {
                 let projected = radial_jet.index_axis(Axis(2), axis).dot(&radial_transform);
-                jet.slice_mut(s![.., ..n_kernel, axis]).assign(&projected);
+                let mut block = jet.slice_mut(s![.., ..n_kernel, axis]);
+                block.assign(&projected);
+                block *= kernel_amp;
             }
             jet.slice_mut(s![.., n_kernel.., ..]).assign(&poly_jet);
             Ok(jet)
@@ -17364,43 +17384,68 @@ fn parse_matern_nu_py(context: &str, nu: &str) -> PyResult<MaternNu> {
     }
 }
 
-#[pyfunction(signature = (t, centers, length_scale, nu = "3/2"))]
-fn matern_input_location_first_derivative<'py>(
+/// Full input-location first jet `∂Φ/∂t` of the Matérn kernel under the
+/// anisotropic metric `r_A = √(Σ_a w_a (t_a − c_a)²)`.
+///
+/// Returns a `(n_rows, n_centers, dim)` tensor. `aniso_log_scales` is threaded
+/// through the *same* centred-contrast transform the forward `matern_basis`
+/// applies, so this jet exactly differentiates the forward design value even
+/// when anisotropy is active (issue #437). With `aniso_log_scales = None` the
+/// metric is isotropic.
+#[pyfunction(signature = (t, centers, length_scale, nu = "3/2", aniso_log_scales = None))]
+fn matern_input_location_first_jet<'py>(
     py: Python<'py>,
     t: PyReadonlyArray2<'py, f64>,
     centers: PyReadonlyArray2<'py, f64>,
     length_scale: f64,
     nu: &str,
-) -> PyResult<Py<PyArray2<f64>>> {
-    let nu_parsed = parse_matern_nu_py("matern_input_location_first_derivative", nu)?;
-    let out = matern_radial_first_derivative_nd(
+    aniso_log_scales: Option<PyReadonlyArray1<'py, f64>>,
+) -> PyResult<Py<PyArray3<f64>>> {
+    let nu_parsed = parse_matern_nu_py("matern_input_location_first_jet", nu)?;
+    let aniso_vec = aniso_log_scales
+        .as_ref()
+        .map(|values| values.as_slice())
+        .transpose()
+        .map_err(|err| py_value_error(format!("aniso_log_scales must be contiguous: {err}")))?
+        .map(|slice| slice.to_vec());
+    let out = matern_input_location_jet_nd(
         t.as_array(),
         centers.as_array(),
         length_scale,
         nu_parsed,
+        aniso_vec.as_deref(),
     )
     .map_err(|err| py_value_error(err.to_string()))?;
     Ok(out.into_pyarray(py).unbind())
 }
 
-/// `φ''(r_{n,k})` for the Matérn kernel at every `(row, center)` pair.
-/// Companion to `matern_input_location_first_derivative`; combine with
-/// `φ'(r)` and the axis ratios `u = (t − c)/r` at the call site to assemble
-/// the input-location Hessian.
-#[pyfunction(signature = (t, centers, length_scale, nu = "3/2"))]
-fn matern_input_location_second_derivative<'py>(
+/// Full input-location Hessian `∂²Φ/∂t∂tᵀ` of the Matérn kernel under the
+/// anisotropic metric. Companion to `matern_input_location_first_jet`;
+/// returns a `(n_rows, n_centers, dim, dim)` tensor exactly matching the
+/// second derivative of the forward kernel value. `aniso_log_scales` follows
+/// the same forward centred-contrast transform.
+#[pyfunction(signature = (t, centers, length_scale, nu = "3/2", aniso_log_scales = None))]
+fn matern_input_location_hessian<'py>(
     py: Python<'py>,
     t: PyReadonlyArray2<'py, f64>,
     centers: PyReadonlyArray2<'py, f64>,
     length_scale: f64,
     nu: &str,
-) -> PyResult<Py<PyArray2<f64>>> {
-    let nu_parsed = parse_matern_nu_py("matern_input_location_second_derivative", nu)?;
-    let out = matern_radial_second_derivative_nd(
+    aniso_log_scales: Option<PyReadonlyArray1<'py, f64>>,
+) -> PyResult<Py<PyArray4<f64>>> {
+    let nu_parsed = parse_matern_nu_py("matern_input_location_hessian", nu)?;
+    let aniso_vec = aniso_log_scales
+        .as_ref()
+        .map(|values| values.as_slice())
+        .transpose()
+        .map_err(|err| py_value_error(format!("aniso_log_scales must be contiguous: {err}")))?
+        .map(|slice| slice.to_vec());
+    let out = matern_input_location_hessian_nd(
         t.as_array(),
         centers.as_array(),
         length_scale,
         nu_parsed,
+        aniso_vec.as_deref(),
     )
     .map_err(|err| py_value_error(err.to_string()))?;
     Ok(out.into_pyarray(py).unbind())
@@ -22741,17 +22786,13 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     // The Duchon descriptor differentiates the *built* design (kernel-nullspace
     // projection + polynomial columns + amplification) via `duchon_basis_with_jets`,
     // not the raw centerwise radial kernel, so no Duchon raw-radial FFI is
-    // registered here. The Matérn descriptor pairs the raw radial scalars with
-    // the closed-form axis ratio in Python (no nullspace projection / polynomial
-    // tail for that basis), so it keeps its raw-radial helpers.
-    module.add_function(wrap_pyfunction!(
-        matern_input_location_first_derivative,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        matern_input_location_second_derivative,
-        module
-    )?)?;
+    // registered here. The Matérn descriptor has no nullspace projection /
+    // polynomial tail, so its input-location jet and Hessian are the full
+    // metric-aware kernel derivatives (anisotropy threaded through, matching the
+    // forward design exactly — issue #437); the assembly lives in Rust, Python
+    // only contracts the returned tensors with upstream gradients.
+    module.add_function(wrap_pyfunction!(matern_input_location_first_jet, module)?)?;
+    module.add_function(wrap_pyfunction!(matern_input_location_hessian, module)?)?;
     module.add_function(wrap_pyfunction!(matern_basis_gradient_streaming, module)?)?;
     module.add_function(wrap_pyfunction!(
         sphere_input_location_first_derivative,

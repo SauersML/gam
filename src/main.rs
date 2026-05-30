@@ -8639,6 +8639,40 @@ fn sample_std(v: ArrayView1<'_, f64>) -> f64 {
     var.max(0.0).sqrt()
 }
 
+/// Canonical family name for a CLI `--family` selection.
+///
+/// This is the one place that maps the closed `FamilyArg` enum onto the
+/// string vocabulary understood by the canonical resolver
+/// (`gam::resolve_family` in `src/solver/workflow.rs`). `Auto` returns `None`
+/// so the resolver runs response inference; every concrete variant returns the
+/// exact name the resolver matches, preserving its pinned/unpinned link
+/// semantics (e.g. `binomial-logit` pins the link, `gaussian`/`poisson`/`gamma`
+/// leave it open to refinement by a `link(...)` choice).
+fn family_arg_canonical_name(arg: FamilyArg) -> Option<&'static str> {
+    match arg {
+        FamilyArg::Auto => None,
+        FamilyArg::Gaussian => Some("gaussian"),
+        FamilyArg::BinomialLogit => Some("binomial-logit"),
+        FamilyArg::BinomialProbit => Some("binomial-probit"),
+        FamilyArg::BinomialCloglog => Some("binomial-cloglog"),
+        FamilyArg::LatentCloglogBinomial => Some("latent-cloglog-binomial"),
+        FamilyArg::PoissonLog => Some("poisson"),
+        FamilyArg::NegativeBinomial => Some("negative-binomial"),
+        FamilyArg::GammaLog => Some("gamma"),
+        FamilyArg::RoystonParmar => Some("royston-parmar"),
+        FamilyArg::TransformationNormal => Some("transformation-normal"),
+    }
+}
+
+/// CLI adapter over the canonical family resolver.
+///
+/// The fit-routing contract — explicit family vs link-implied family, the
+/// SAS/Beta-Logistic state-bearing links, negative-binomial `theta`, and
+/// response auto-inference — lives once in `gam::resolve_family`. The CLI keeps
+/// only the surface-specific concerns: translating the typed `FamilyArg` into
+/// the canonical name and enforcing the CLI flag rule that
+/// `--negative-binomial-theta` is meaningful exclusively with
+/// `--family negative-binomial`.
 fn resolve_family(
     arg: FamilyArg,
     negative_binomial_theta: Option<f64>,
@@ -8648,128 +8682,18 @@ fn resolve_family(
     y_kind: ResponseColumnKind,
     response_name: &str,
 ) -> Result<LikelihoodSpec, String> {
-    let nb_theta = negative_binomial_theta.unwrap_or(1.0);
-    if !nb_theta.is_finite() || nb_theta <= 0.0 {
-        return Err(format!(
-            "negative-binomial theta must be finite and > 0; got {nb_theta}"
-        ));
-    }
     if negative_binomial_theta.is_some() && !matches!(arg, FamilyArg::NegativeBinomial) {
         return Err("--negative-binomial-theta requires --family negative-binomial".to_string());
     }
-    let explicit_family = family_from_arg(arg, nb_theta);
-    if let Some(choice) = link_choice.as_ref() {
-        let from_link = if choice.mixture_components.is_some() {
-            LikelihoodSpec::binomial_logit()
-        } else {
-            match choice.link {
-                LinkFunction::Identity => LikelihoodSpec::gaussian_identity(),
-                LinkFunction::Log => {
-                    if y.iter()
-                        .all(|&yi| yi.is_finite() && yi >= 0.0 && (yi - yi.round()).abs() <= 1e-9)
-                    {
-                        LikelihoodSpec::poisson_log()
-                    } else {
-                        LikelihoodSpec::gamma_log()
-                    }
-                }
-                LinkFunction::Logit => LikelihoodSpec::binomial_logit(),
-                LinkFunction::Probit => LikelihoodSpec::binomial_probit(),
-                LinkFunction::CLogLog => LikelihoodSpec::binomial_cloglog(),
-                // Sas / BetaLogistic resolve to their state-bearing `InverseLink`
-                // variants directly: the `sas_linkspec` parsed above carries the
-                // initial state, so there is no need for the historical
-                // "state-less `Standard(Sas)` placeholder" pattern (the type
-                // system no longer permits it).
-                LinkFunction::Sas => {
-                    let spec = *sas_linkspec.ok_or_else(|| {
-                        "--link sas requires link(type=sas, sas_init=...) so the SAS state is available at family resolution".to_string()
-                    })?;
-                    let state = state_from_sasspec(spec)
-                        .map_err(|e| format!("invalid SAS link configuration: {e}"))?;
-                    LikelihoodSpec::binomial_sas(state)
-                }
-                LinkFunction::BetaLogistic => {
-                    let spec = *sas_linkspec.ok_or_else(|| {
-                        "--link beta-logistic requires link(type=beta-logistic, beta_logistic_init=...) so the link state is available at family resolution".to_string()
-                    })?;
-                    let state = state_from_beta_logisticspec(spec)
-                        .map_err(|e| format!("invalid Beta-Logistic link configuration: {e}"))?;
-                    LikelihoodSpec::binomial_beta_logistic(state)
-                }
-            }
-        };
-        if let Some(explicit) = explicit_family.as_ref() {
-            let compatible_log_nb = matches!(
-                (
-                    &explicit.response,
-                    choice.link,
-                    choice.mixture_components.as_ref(),
-                ),
-                (
-                    ResponseFamily::NegativeBinomial { .. },
-                    LinkFunction::Log,
-                    None,
-                )
-            );
-            if *explicit != from_link && !compatible_log_nb {
-                return Err(format!(
-                    "--family '{}' conflicts with --link '{}'",
-                    explicit.name(),
-                    link_choice_to_string(choice)
-                ));
-            }
-        }
-        return Ok(explicit_family.unwrap_or(from_link));
-    }
-
-    Ok(match arg {
-        FamilyArg::Gaussian => LikelihoodSpec::gaussian_identity(),
-        FamilyArg::BinomialLogit => LikelihoodSpec::binomial_logit(),
-        FamilyArg::BinomialProbit => LikelihoodSpec::binomial_probit(),
-        FamilyArg::BinomialCloglog => LikelihoodSpec::binomial_cloglog(),
-        FamilyArg::LatentCloglogBinomial => LikelihoodSpec::binomial_cloglog(),
-        FamilyArg::PoissonLog => LikelihoodSpec::poisson_log(),
-        FamilyArg::NegativeBinomial => LikelihoodSpec::negative_binomial_log(nb_theta),
-        FamilyArg::GammaLog => LikelihoodSpec::gamma_log(),
-        FamilyArg::RoystonParmar => LikelihoodSpec::royston_parmar(),
-        FamilyArg::TransformationNormal => LikelihoodSpec::gaussian_identity(),
-        FamilyArg::Auto => {
-            // Delegate to `ResponseFamily::infer_from_response` so the
-            // refusal policy for non-numeric response columns matches the
-            // formula API exactly.
-            let response = ResponseFamily::infer_from_response(y, y_kind)
-                .map_err(|refusal| refusal.message_for(response_name))?;
-            match response {
-                ResponseFamily::Binomial => LikelihoodSpec::binomial_logit(),
-                ResponseFamily::Gaussian => LikelihoodSpec::gaussian_identity(),
-                // `infer_from_response` only ever returns Binomial or
-                // Gaussian today; treat any future addition conservatively
-                // by routing through gaussian_identity rather than panicking,
-                // which preserves the CLI's user-facing behaviour while the
-                // formula API picks up the richer inference.
-                _ => LikelihoodSpec::gaussian_identity(),
-            }
-        }
-    })
-}
-
-fn family_from_arg(arg: FamilyArg, negative_binomial_theta: f64) -> Option<LikelihoodSpec> {
-    match arg {
-        FamilyArg::Auto => None,
-        FamilyArg::Gaussian => Some(LikelihoodSpec::gaussian_identity()),
-        FamilyArg::BinomialLogit => Some(LikelihoodSpec::binomial_logit()),
-        FamilyArg::BinomialProbit => Some(LikelihoodSpec::binomial_probit()),
-        FamilyArg::BinomialCloglog => Some(LikelihoodSpec::binomial_cloglog()),
-        FamilyArg::LatentCloglogBinomial => Some(LikelihoodSpec::binomial_cloglog()),
-        FamilyArg::PoissonLog => Some(LikelihoodSpec::poisson_log()),
-        FamilyArg::NegativeBinomial => Some(LikelihoodSpec::negative_binomial_log(
-            negative_binomial_theta,
-        )),
-        FamilyArg::GammaLog => Some(LikelihoodSpec::gamma_log()),
-        FamilyArg::RoystonParmar => Some(LikelihoodSpec::royston_parmar()),
-        FamilyArg::TransformationNormal => Some(LikelihoodSpec::gaussian_identity()),
-    }
+    gam::resolve_family(
+        family_arg_canonical_name(arg),
+        negative_binomial_theta,
+        link_choice.as_ref(),
+        sas_linkspec,
+        y,
+        y_kind,
+        response_name,
+    )
 }
 
 fn parse_comma_f64(v: &str, label: &str) -> Result<Vec<f64>, String> {
@@ -8798,21 +8722,6 @@ fn inverse_link_from_fitted_link_state(state: &FittedLinkState) -> Option<Invers
         FittedLinkState::Sas { state, .. } => Some(InverseLink::Sas(*state)),
         FittedLinkState::BetaLogistic { state, .. } => Some(InverseLink::BetaLogistic(*state)),
         FittedLinkState::Mixture { state, .. } => Some(InverseLink::Mixture(state.clone())),
-    }
-}
-
-fn link_choice_to_string(choice: &LinkChoice) -> String {
-    if let Some(components) = choice.mixture_components.as_ref() {
-        let names = components
-            .iter()
-            .map(|component| component.name())
-            .collect::<Vec<_>>()
-            .join(",");
-        return format!("blended({names})");
-    }
-    match choice.mode {
-        LinkMode::Strict => choice.link.name().to_string(),
-        LinkMode::Flexible => format!("flexible({})", choice.link.name()),
     }
 }
 
@@ -10017,8 +9926,9 @@ mod tests {
         collect_linear_smooth_overlapwarnings, collect_spatial_smooth_usagewarnings,
         compact_fit_result_for_batch, compact_saved_multiblock_fit_result,
         compute_probit_q0_from_eta, core_saved_fit_result, covariance_from_model,
-        effectivelinkwiggle_formulaspec, exact_kernel, fit_result_from_external,
-        load_dataset_projected, parse_formula, parse_link_choice, parse_matching_auxiliary_formula,
+        effectivelinkwiggle_formulaspec, exact_kernel, family_arg_canonical_name,
+        fit_result_from_external, load_dataset_projected, parse_formula, parse_link_choice,
+        parse_matching_auxiliary_formula,
         parse_surv_response, parse_survival_inverse_link, parse_survival_time_basis_config,
         predict_gam, prepend_id_column_to_prediction_csv, required_columns_for_fit, resolve_family,
         summarizewiggle_domain, validate_cli_firth_configuration,
@@ -10698,6 +10608,235 @@ mod tests {
         .expect("resolve family");
 
         assert_eq!(family, LikelihoodSpec::binomial_logit());
+    }
+
+    /// Parity guard for issue #401: the CLI must not reconstruct its own
+    /// fit-routing decision tree. Across a representative matrix of
+    /// `(FamilyArg, link_choice, sas_init)` inputs — including auto-inference,
+    /// explicit families, link-implied families, the log-link Poisson/Gamma
+    /// branch that depends on the response, and the state-bearing SAS link —
+    /// the CLI adapter `resolve_family` must return exactly what the canonical
+    /// resolver `gam::resolve_family` produces for the same canonical family
+    /// name. If the two ever diverge (validation, family routing, link
+    /// defaults, SAS state) this test fails, which is the whole point: there is
+    /// one fit-routing contract, and the CLI is a thin adapter over it.
+    #[test]
+    fn cli_resolve_family_matches_canonical_workflow_resolver() {
+        assert!(file!().ends_with(".rs"));
+        let y_binary = array![0.0, 1.0, 1.0, 0.0];
+        let y_count = array![0.0, 1.0, 2.0, 3.0, 4.0];
+        let y_positive = array![0.5, 1.5, 2.5, 3.5];
+
+        let logit = LinkChoice {
+            mode: LinkMode::Strict,
+            link: LinkFunction::Logit,
+            mixture_components: None,
+        };
+        let log = LinkChoice {
+            mode: LinkMode::Strict,
+            link: LinkFunction::Log,
+            mixture_components: None,
+        };
+        let sas = LinkChoice {
+            mode: LinkMode::Strict,
+            link: LinkFunction::Sas,
+            mixture_components: None,
+        };
+        let sas_init = gam::types::SasLinkSpec {
+            initial_epsilon: 0.3,
+            initial_log_delta: -0.2,
+        };
+
+        // (FamilyArg, nb_theta, link_choice, sas_linkspec, y, y_kind)
+        let cases: Vec<(
+            FamilyArg,
+            Option<f64>,
+            Option<LinkChoice>,
+            Option<&gam::types::SasLinkSpec>,
+            &ndarray::Array1<f64>,
+            ResponseColumnKind,
+        )> = vec![
+            // Auto inference: binary → logit, continuous → identity.
+            (
+                FamilyArg::Auto,
+                None,
+                None,
+                None,
+                &y_binary,
+                ResponseColumnKind::Numeric,
+            ),
+            (
+                FamilyArg::Auto,
+                None,
+                None,
+                None,
+                &y_positive,
+                ResponseColumnKind::Numeric,
+            ),
+            // Explicit families with no link choice.
+            (
+                FamilyArg::Gaussian,
+                None,
+                None,
+                None,
+                &y_positive,
+                ResponseColumnKind::Numeric,
+            ),
+            (
+                FamilyArg::BinomialProbit,
+                None,
+                None,
+                None,
+                &y_binary,
+                ResponseColumnKind::Numeric,
+            ),
+            (
+                FamilyArg::NegativeBinomial,
+                Some(2.5),
+                None,
+                None,
+                &y_count,
+                ResponseColumnKind::Numeric,
+            ),
+            (
+                FamilyArg::GammaLog,
+                None,
+                None,
+                None,
+                &y_positive,
+                ResponseColumnKind::Numeric,
+            ),
+            // Link-implied families. Log link on integer-valued y → Poisson;
+            // on non-integer y → Gamma.
+            (
+                FamilyArg::Auto,
+                None,
+                Some(log.clone()),
+                None,
+                &y_count,
+                ResponseColumnKind::Numeric,
+            ),
+            (
+                FamilyArg::Auto,
+                None,
+                Some(log.clone()),
+                None,
+                &y_positive,
+                ResponseColumnKind::Numeric,
+            ),
+            (
+                FamilyArg::Auto,
+                None,
+                Some(logit.clone()),
+                None,
+                &y_binary,
+                ResponseColumnKind::Numeric,
+            ),
+            // State-bearing SAS link with an explicit, non-default init: the
+            // canonical resolver must embed the exact same state.
+            (
+                FamilyArg::Auto,
+                None,
+                Some(sas.clone()),
+                Some(&sas_init),
+                &y_binary,
+                ResponseColumnKind::Numeric,
+            ),
+        ];
+
+        for (arg, nb_theta, link_choice, sas_spec, y, y_kind) in cases {
+            let cli = resolve_family(
+                arg,
+                nb_theta,
+                link_choice.clone(),
+                sas_spec,
+                y.view(),
+                y_kind,
+                "y",
+            );
+            let canonical = gam::resolve_family(
+                family_arg_canonical_name(arg),
+                nb_theta,
+                link_choice.as_ref(),
+                sas_spec,
+                y.view(),
+                y_kind,
+                "y",
+            );
+            assert_eq!(
+                cli, canonical,
+                "CLI resolve_family diverged from canonical resolver for {arg:?}"
+            );
+        }
+
+        // Pin the concrete contract for the load-bearing cases so a future
+        // refactor cannot make both paths agree on a *wrong* answer.
+        assert_eq!(
+            resolve_family(
+                FamilyArg::Auto,
+                None,
+                None,
+                None,
+                y_binary.view(),
+                ResponseColumnKind::Numeric,
+                "y",
+            )
+            .expect("auto binary"),
+            LikelihoodSpec::binomial_logit()
+        );
+        assert_eq!(
+            resolve_family(
+                FamilyArg::Auto,
+                None,
+                Some(log.clone()),
+                None,
+                y_count.view(),
+                ResponseColumnKind::Numeric,
+                "y",
+            )
+            .expect("log link on counts"),
+            LikelihoodSpec::poisson_log()
+        );
+        let sas_family = resolve_family(
+            FamilyArg::Auto,
+            None,
+            Some(sas),
+            Some(&sas_init),
+            y_binary.view(),
+            ResponseColumnKind::Numeric,
+            "y",
+        )
+        .expect("sas link");
+        match &sas_family.link {
+            InverseLink::Sas(state) => {
+                assert_eq!(state.epsilon, sas_init.initial_epsilon);
+                assert_eq!(state.log_delta, sas_init.initial_log_delta);
+            }
+            other => panic!("expected SAS inverse link, got {other:?}"),
+        }
+    }
+
+    /// The CLI flag rule `--negative-binomial-theta` requires
+    /// `--family negative-binomial` is a surface concern owned by the CLI
+    /// adapter (the canonical resolver only rejects a theta with no family at
+    /// all). Guard it explicitly so the adapter keeps enforcing it.
+    #[test]
+    fn cli_resolve_family_rejects_theta_without_negative_binomial() {
+        let y = array![0.0, 1.0, 2.0, 3.0];
+        let err = resolve_family(
+            FamilyArg::PoissonLog,
+            Some(2.0),
+            None,
+            None,
+            y.view(),
+            ResponseColumnKind::Numeric,
+            "y",
+        )
+        .expect_err("theta without negative-binomial family must be rejected");
+        assert_eq!(
+            err,
+            "--negative-binomial-theta requires --family negative-binomial"
+        );
     }
 
     #[test]

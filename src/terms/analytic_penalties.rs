@@ -350,6 +350,45 @@ pub trait AnalyticPenalty: Send + Sync {
         out
     }
 
+    /// Diagonal of a **PSD majorizer** of the Hessian — the positive
+    /// re-weighted-ℓ₂ / MM surrogate `diag(B(target; ρ))` with
+    /// `B ⪰ ∂²P/∂target²` everywhere and `B ⪰ 0`. This is a *different*
+    /// operator from [`Self::hessian_diag`]: for nonconvex penalties (log
+    /// sparsity, JumpReLU) the exact Hessian is indefinite, but the inner
+    /// Newton / PIRLS solve and the log-det / preconditioner pipeline require
+    /// a PSD curvature block. For convex penalties the majorizer coincides
+    /// with the exact Hessian, so the default simply delegates to
+    /// [`Self::hessian_diag`]; nonconvex penalties override.
+    fn psd_majorizer_diag(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Option<Array1<f64>> {
+        self.hessian_diag(target, rho)
+    }
+
+    /// Matrix-vector product against the **PSD majorizer** `B(target; ρ) v`
+    /// (see [`Self::psd_majorizer_diag`]). For convex penalties this is the
+    /// exact Hessian-vector product, so the default delegates to
+    /// [`Self::hvp`]; nonconvex penalties override to return their PSD
+    /// surrogate instead of the indefinite true Hessian.
+    fn psd_majorizer_hvp(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+        v: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        if let Some(diag) = self.psd_majorizer_diag(target, rho) {
+            assert_eq!(diag.len(), v.len(), "psd_majorizer_hvp dimension mismatch");
+            let mut out = Array1::<f64>::zeros(v.len());
+            for i in 0..v.len() {
+                out[i] = diag[i] * v[i];
+            }
+            return out;
+        }
+        self.hvp(target, rho, v)
+    }
+
     /// Gradient of the penalty value w.r.t. each owned ρ-axis. Length equals
     /// [`Self::rho_count`].
     fn grad_rho(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64>;
@@ -2212,21 +2251,18 @@ impl AnalyticPenalty for SparsityPenalty {
             }
             SparsityKind::Log { .. } => {
                 let mut d = Array1::<f64>::zeros(target.len());
-                // The TRUE second derivative of λ log(1 + x²/δ²) is
-                //   2λ(δ² − x²)/(δ² + x²)²
-                // which is NEGATIVE for |x| > δ — i.e. Log is nonconvex.
-                // We therefore expose the IRLS (MM) MAJORIZER
-                //   2λ / (δ² + x²)
-                // through `hessian_diag`. This is always strictly positive,
-                // matches the true Hessian at |x| = 0, and is the standard
-                // re-weighted ℓ₂ surrogate used by IRLS-based log-sparsity
-                // solvers. PSD consumers (preconditioner, `log_det_plus_λI`,
-                // FrozenAnalyticPenaltyOp routing) thus see a PSD operator
-                // even though `value` and `grad_target` use the exact log.
+                // The EXACT second derivative of λ log(1 + x²/δ²):
+                //   d/dx [ 2λx/(δ²+x²) ] = 2λ(δ² − x²)/(δ² + x²)²,
+                // which is NEGATIVE for |x| > δ — Log is nonconvex. This is
+                // the genuine Hessian diagonal and exactly differentiates
+                // `grad_target`. PSD consumers (Newton block, preconditioner,
+                // `log_det_plus_λI`, FrozenAnalyticPenaltyOp) must instead
+                // route through `psd_majorizer_diag`/`psd_majorizer_hvp`,
+                // which expose the IRLS/MM surrogate `2λ/(δ²+x²)`.
                 let d2 = smooth * smooth;
                 for (i, &x) in target.iter().enumerate() {
                     let denom = d2 + x * x;
-                    d[i] = lam * 2.0 / denom;
+                    d[i] = lam * 2.0 * (d2 - x * x) / (denom * denom);
                 }
                 Some(d)
             }
@@ -2265,19 +2301,16 @@ impl AnalyticPenalty for SparsityPenalty {
                 out
             }
             SparsityKind::Log { .. } => {
-                // PSD IRLS majorizer 2λ/(δ²+x²) — matches `hessian_diag`.
-                // The true second derivative 2λ(δ²−x²)/(δ²+x²)² is not used
-                // here because it is indefinite (negative for |x|>δ) and
-                // would break the PSD contract `FrozenAnalyticPenaltyOp`
-                // exposes through `matvec` to the canonical PIRLS / log-det
-                // pipeline. IRLS / MM theory: the surrogate is a global
-                // upper bound on the log-sparsity penalty and agrees with
-                // the exact Hessian at x = 0.
+                // EXACT Hessian-vector product: the Log Hessian is diagonal
+                // with entries 2λ(δ²−x²)/(δ²+x²)², so (Hv)_i = h_i v_i. This
+                // is the genuine second derivative (indefinite for |x|>δ).
+                // PSD consumers use `psd_majorizer_hvp` for the IRLS/MM
+                // surrogate 2λ/(δ²+x²) instead.
                 let mut out = Array1::<f64>::zeros(n_target);
                 let d2 = smooth * smooth;
                 for (i, &x) in target.iter().enumerate() {
                     let denom = d2 + x * x;
-                    out[i] = lam * 2.0 / denom * v[i];
+                    out[i] = lam * 2.0 * (d2 - x * x) / (denom * denom) * v[i];
                 }
                 out
             }
@@ -2329,6 +2362,32 @@ impl AnalyticPenalty for SparsityPenalty {
                 }
                 out
             }
+        }
+    }
+
+    fn psd_majorizer_diag(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Option<Array1<f64>> {
+        let (lam, smooth) = self.resolved(rho);
+        match self.kind {
+            // SmoothedL1 is convex: the majorizer equals the exact Hessian.
+            SparsityKind::SmoothedL1 { .. } => self.hessian_diag(target, rho),
+            // Log is nonconvex; expose the IRLS/MM re-weighted-ℓ₂ surrogate
+            //   2λ/(δ²+x²) ⪰ 2λ(δ²−x²)/(δ²+x²)²,
+            // strictly positive, agreeing with the exact Hessian at x = 0.
+            SparsityKind::Log { .. } => {
+                let mut d = Array1::<f64>::zeros(target.len());
+                let d2 = smooth * smooth;
+                for (i, &x) in target.iter().enumerate() {
+                    d[i] = lam * 2.0 / (d2 + x * x);
+                }
+                Some(d)
+            }
+            // Hoyer's Hessian is dense; no diagonal majorizer. Callers fall
+            // back to the exact dense `hvp` through `psd_majorizer_hvp`.
+            SparsityKind::Hoyer => None,
         }
     }
 
@@ -2878,7 +2937,7 @@ impl AnalyticPenalty for JumpReLUPenalty {
             for axis in 0..d {
                 let tau = self.threshold(axis, rho);
                 let gate = self.sigmoid_gate((target[base + axis] - tau) / self.smoothing_eps);
-                diag[base + axis] = self.psd_hessian_diag_entry(tau, gate);
+                diag[base + axis] = self.true_hessian_diag_entry(tau, gate);
             }
         }
         Some(diag)
@@ -2903,6 +2962,30 @@ impl AnalyticPenalty for JumpReLUPenalty {
             }
         }
         out
+    }
+
+    fn psd_majorizer_diag(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Option<Array1<f64>> {
+        // The smoothed JumpReLU surrogate's exact diagonal Hessian
+        //   λτ·g(1−g)(1−2g)/ε²
+        // is indefinite (negative once the gate passes the inflection
+        // g = ½). The Newton / PIRLS pipeline needs a PSD curvature block, so
+        // expose the re-weighted majorizer  λτ·[g(1−g)]²/ε² ⪰ 0.
+        let d = self.latent_dim;
+        let n_obs = target.len() / d;
+        let mut diag = Array1::<f64>::zeros(target.len());
+        for row in 0..n_obs {
+            let base = row * d;
+            for axis in 0..d {
+                let tau = self.threshold(axis, rho);
+                let gate = self.sigmoid_gate((target[base + axis] - tau) / self.smoothing_eps);
+                diag[base + axis] = self.psd_hessian_diag_entry(tau, gate);
+            }
+        }
+        Some(diag)
     }
 
     fn grad_rho(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
@@ -7023,6 +7106,27 @@ macro_rules! define_analytic_penalty_kind {
                     $(AnalyticPenaltyKind::$variant(p) => <$ty as AnalyticPenalty>::hvp(p, target, rho, v),)*
                 }
             }
+
+            pub fn psd_majorizer_diag(
+                &self,
+                target: ArrayView1<'_, f64>,
+                rho: ArrayView1<'_, f64>,
+            ) -> Option<Array1<f64>> {
+                match self {
+                    $(AnalyticPenaltyKind::$variant(p) => <$ty as AnalyticPenalty>::psd_majorizer_diag(p, target, rho),)*
+                }
+            }
+
+            pub fn psd_majorizer_hvp(
+                &self,
+                target: ArrayView1<'_, f64>,
+                rho: ArrayView1<'_, f64>,
+                v: ArrayView1<'_, f64>,
+            ) -> Array1<f64> {
+                match self {
+                    $(AnalyticPenaltyKind::$variant(p) => <$ty as AnalyticPenalty>::psd_majorizer_hvp(p, target, rho, v),)*
+                }
+            }
         }
     };
 }
@@ -7125,7 +7229,13 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
     }
 
     fn matvec(&self, w: ArrayView1<'_, f64>, mut out: ArrayViewMut1<'_, f64>) {
-        let h = self.penalty.hvp(self.target.view(), self.rho.view(), w);
+        // `FrozenAnalyticPenaltyOp` is the PSD curvature operator routed into
+        // the canonical PIRLS / preconditioner / log-det pipeline, so it must
+        // expose the PSD majorizer, not the (possibly indefinite) exact
+        // Hessian. For convex penalties the majorizer is the exact HVP.
+        let h = self
+            .penalty
+            .psd_majorizer_hvp(self.target.view(), self.rho.view(), w);
         for i in 0..h.len() {
             out[i] = h[i];
         }
@@ -7138,14 +7248,14 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
         // required use the analytic path even when the dense Hessian is large.
         match &self.penalty {
             AnalyticPenaltyKind::Ard(p) => p
-                .hessian_diag(self.target.view(), self.rho.view())
+                .psd_majorizer_diag(self.target.view(), self.rho.view())
                 .expect("ARD diag"),
             AnalyticPenaltyKind::TopKActivation(p) => p
-                .hessian_diag(self.target.view(), self.rho.view())
+                .psd_majorizer_diag(self.target.view(), self.rho.view())
                 .expect("TopK activation diag"),
             AnalyticPenaltyKind::JumpReLU(p) => p
-                .hessian_diag(self.target.view(), self.rho.view())
-                .expect("JumpReLU diag"),
+                .psd_majorizer_diag(self.target.view(), self.rho.view())
+                .expect("JumpReLU majorizer diag"),
             AnalyticPenaltyKind::TotalVariation(p) => {
                 p.diag_target(self.target.view(), self.rho.view())
             }
@@ -7184,11 +7294,11 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             }
             AnalyticPenaltyKind::ScadMcp(p) => p.diag_target(self.target.view(), self.rho.view()),
             AnalyticPenaltyKind::IBPAssignment(p) => p
-                .hessian_diag(self.target.view(), self.rho.view())
+                .psd_majorizer_diag(self.target.view(), self.rho.view())
                 .expect("IBP assignment diag"),
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_) => self.diag_via_matvec(),
             AnalyticPenaltyKind::Sparsity(p) => {
-                if let Some(d) = p.hessian_diag(self.target.view(), self.rho.view()) {
+                if let Some(d) = p.psd_majorizer_diag(self.target.view(), self.rho.view()) {
                     d
                 } else {
                     self.diag_via_matvec()
@@ -7201,7 +7311,7 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             }
             AnalyticPenaltyKind::Isometry(_) => self.diag_via_matvec(),
             AnalyticPenaltyKind::NestedPrefix(p) => p
-                .hessian_diag(self.target.view(), self.rho.view())
+                .psd_majorizer_diag(self.target.view(), self.rho.view())
                 .expect("NestedPrefix diag"),
             AnalyticPenaltyKind::SheafConsistency(_)
                 if self.dim() > ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD =>
@@ -8169,8 +8279,11 @@ mod tests {
         assert!((h[3] - 3.0).abs() < 1e-12);
     }
 
-    #[test]
-    fn jumprelu_hessian_diag_majorizer_is_psd_over_logit_sweep() {
+    /// Build the canonical JumpReLU sweep fixture: a logit grid that straddles
+    /// each per-axis scaled threshold so the gate `g = σ((z − τ)/ε)` sweeps both
+    /// sides of its inflection `g = ½`, where the true Hessian
+    /// `wτ·g(1−g)(1−2g)/ε²` changes sign.
+    fn jumprelu_sweep_fixture() -> (JumpReLUPenalty, Array1<f64>, Array1<f64>, [f64; 2], f64, f64) {
         let thresholds = array![0.25_f64, 0.8];
         let rho = array![0.0_f64, 1.5_f64.ln()];
         let eps = 0.04_f64;
@@ -8187,8 +8300,72 @@ mod tests {
         let slice = PsiSlice::full(target_values.len(), Some(latent_dim));
         let pen =
             JumpReLUPenalty::new(slice, thresholds, weight, eps).expect("valid JumpReLU penalty");
+        (pen, target_values, rho, scaled_thresholds, eps, weight)
+    }
+
+    #[test]
+    fn jumprelu_hessian_diag_is_exact_true_second_derivative() {
+        let (pen, target_values, rho, scaled_thresholds, eps, weight) = jumprelu_sweep_fixture();
+        let latent_dim = scaled_thresholds.len();
+        // `hessian_diag` must be the EXACT diagonal second derivative of the
+        // smoothed jump penalty `P(z) = wτ·σ((z − τ)/ε)`:
+        //   P''(z) = wτ·g(1 − g)(1 − 2g)/ε²,   g = σ((z − τ)/ε).
+        // This is the true (indefinite) Hessian, not the PSD majorizer.
         let diag = pen
             .hessian_diag(target_values.view(), rho.view())
+            .expect("JumpReLU exposes an analytic diagonal Hessian");
+
+        let mut saw_negative = false;
+        for (idx, &entry) in diag.iter().enumerate() {
+            let axis = idx % latent_dim;
+            let gate = pen.sigmoid_gate((target_values[idx] - scaled_thresholds[axis]) / eps);
+            let expected =
+                weight * scaled_thresholds[axis] * gate * (1.0 - gate) * (1.0 - 2.0 * gate)
+                    / (eps * eps);
+            assert!(
+                entry.is_finite(),
+                "JumpReLU hessian_diag must be finite at index {idx}; entry={entry}"
+            );
+            assert_abs_diff_eq!(entry, expected, epsilon = 1e-12);
+            if entry < 0.0 {
+                saw_negative = true;
+            }
+        }
+        // The true Hessian is genuinely indefinite past the gate inflection
+        // (g > ½); the sweep must exercise that sign change so this test would
+        // catch any regression back to the always-nonnegative PSD surrogate.
+        assert!(
+            saw_negative,
+            "true JumpReLU hessian_diag must go negative once the gate passes g = ½"
+        );
+    }
+
+    #[test]
+    fn jumprelu_hvp_diagonal_matches_hessian_diag() {
+        let (pen, target_values, rho, _scaled_thresholds, _eps, _weight) =
+            jumprelu_sweep_fixture();
+        // `hvp` and `hessian_diag` are the SAME true operator; probing `hvp`
+        // with unit vectors must reproduce `hessian_diag` exactly.
+        let diag = pen
+            .hessian_diag(target_values.view(), rho.view())
+            .expect("JumpReLU exposes an analytic diagonal Hessian");
+        for i in 0..target_values.len() {
+            let mut e_i = Array1::<f64>::zeros(target_values.len());
+            e_i[i] = 1.0;
+            let hv_i = pen.hvp(target_values.view(), rho.view(), e_i.view());
+            assert_abs_diff_eq!(diag[i], hv_i[i], epsilon = 1e-12);
+        }
+    }
+
+    #[test]
+    fn jumprelu_psd_majorizer_diag_is_psd_over_logit_sweep() {
+        let (pen, target_values, rho, scaled_thresholds, eps, weight) = jumprelu_sweep_fixture();
+        let latent_dim = scaled_thresholds.len();
+        // The PSD majorizer is a DISTINCT operator from the true Hessian:
+        //   B(z) = wτ·[g(1 − g)]²/ε² ⪰ 0.
+        // The Newton / PIRLS curvature block consumes this, not `hessian_diag`.
+        let diag = pen
+            .psd_majorizer_diag(target_values.view(), rho.view())
             .expect("JumpReLU exposes a PSD diagonal majorizer");
 
         for (idx, &entry) in diag.iter().enumerate() {
@@ -8198,7 +8375,7 @@ mod tests {
             let expected = weight * scaled_thresholds[axis] * slope * slope / (eps * eps);
             assert!(
                 entry.is_finite() && entry >= 0.0,
-                "JumpReLU hessian_diag majorizer must be finite and PSD at index {idx}; entry={entry}"
+                "JumpReLU psd_majorizer_diag must be finite and PSD at index {idx}; entry={entry}"
             );
             assert_abs_diff_eq!(entry, expected, epsilon = 1e-12);
         }
