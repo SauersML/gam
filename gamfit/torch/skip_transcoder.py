@@ -160,13 +160,26 @@ class SkipAffineSmooth(nn.Module):
         """Sparse code after JumpReLU gating."""
         return self.jumprelu.gate(self.encode(x_in))
 
+    def skip_projection(self, x_in: torch.Tensor) -> torch.Tensor | None:
+        """Skip input projection ``XV = x_in @ skip_V``, shape ``(B, rank)``.
+
+        This is the skip bypass's data-dependent activation: together with the
+        output loading ``skip_U`` it is the *only* way the rank-``r`` map
+        ``A = U V^T`` enters the prediction (``skip(x) = (x V) U^T``). Returns
+        ``None`` when the skip is disabled (``rank_skip = 0``).
+        """
+        if self.skip_V is None:
+            return None
+        return x_in @ self.skip_V
+
     def skip_term(self, x_in: torch.Tensor) -> torch.Tensor:
         """Low-rank affine bypass A * x_in.  Returns 0 when rank_skip=0."""
-        if self.skip_U is None:
+        proj = self.skip_projection(x_in)
+        if proj is None:
             return torch.zeros(
                 x_in.shape[0], self.out_dim, device=x_in.device, dtype=x_in.dtype
             )
-        return (x_in @ self.skip_V) @ self.skip_U.t()
+        return proj @ self.skip_U.t()
 
     def forward(
         self, x_in: torch.Tensor
@@ -339,15 +352,19 @@ def reml_score_skip_transcoder(
     """Closed-form Gaussian REML score for one trained skip-transcoder.
 
     Thin marshaling over the Rust ``skip_transcoder_reml_metrics`` driver:
-    the Rust core assembles the effective design (active-atom decoder rows
-    plus skip bypass), Cholesky-factors ``M Mᵀ + lambda_sparse * I``, and
-    returns ``0.5 * (n * log sigma2 + logdet)`` — the Laplace marginal
+    the Rust core assembles the effective design — every feature column is the
+    flattened outer product of a per-observation activation with an
+    output-space loading: ``(z[:, a], W_dec[a, :])`` for sparse atoms and
+    ``(XV[:, r], U[:, r])`` for the skip bypass, with ``XV = x_in @ skip_V``.
+    It Cholesky-factors ``DᵀD + lambda_sparse * I`` and returns
+    ``0.5 * (n * log sigma2 + logdet)`` — the gauge-invariant Laplace marginal
     likelihood used by gam's outer loop.
     """
     with torch.no_grad():
         y_hat, z = smooth(x_in)
+        skip_proj = smooth.skip_projection(x_in)
         skip_u = None if smooth.skip_U is None else _as_2d_f64_numpy(smooth.skip_U)
-        skip_v = None if smooth.skip_V is None else _as_2d_f64_numpy(smooth.skip_V)
+        skip_proj = None if skip_proj is None else _as_2d_f64_numpy(skip_proj)
         metrics = rust_module().skip_transcoder_reml_metrics(
             _as_2d_f64_numpy(y_out),
             _as_2d_f64_numpy(y_hat),
@@ -355,7 +372,7 @@ def reml_score_skip_transcoder(
             _as_2d_f64_numpy(smooth.W_dec),
             float(lambda_sparse),
             skip_u,
-            skip_v,
+            skip_proj,
         )
         return float(metrics["reml_score"])
 
@@ -387,8 +404,9 @@ def score_and_select(
     with torch.no_grad():
         for r in results:
             y_hat, z = r.smooth(x_in)
+            skip_proj = r.smooth.skip_projection(x_in)
             skip_u = None if r.smooth.skip_U is None else _as_2d_f64_numpy(r.smooth.skip_U)
-            skip_v = None if r.smooth.skip_V is None else _as_2d_f64_numpy(r.smooth.skip_V)
+            skip_proj = None if skip_proj is None else _as_2d_f64_numpy(skip_proj)
             m = rm.skip_transcoder_reml_metrics(
                 _as_2d_f64_numpy(y_out),
                 _as_2d_f64_numpy(y_hat),
@@ -396,7 +414,7 @@ def score_and_select(
                 _as_2d_f64_numpy(r.smooth.W_dec),
                 float(r.lambda_sparse),
                 skip_u,
-                skip_v,
+                skip_proj,
             )
             r.reml_score = float(m["reml_score"])
             r.mse = float(m["mse"])

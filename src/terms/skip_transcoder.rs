@@ -2,12 +2,32 @@ use crate::faer_ndarray::FaerCholesky;
 use faer::Side;
 use ndarray::{Array2, ArrayView2};
 
+/// Inputs to the closed-form Gaussian REML/Laplace score of a trained
+/// skip-transcoder.
+///
+/// Every feature of the effective design is a rank-1 outer product of a
+/// per-observation activation column with an output-space loading vector,
+/// flattened over the `(observation, output)` pair:
+///
+/// * sparse atom `a`: `D_a = vec(z[:, a] · W_dec[a, :]^T)`,
+/// * skip component `r`: `D_r = vec((XV)[:, r] · U[:, r]^T)`,
+///
+/// where `XV = x_in · skip_V` is the skip's data-dependent projection onto its
+/// `rank_skip`-dimensional input subspace and `U = skip_U` is its output
+/// loading. Because the skip map enters the prediction only through the
+/// products `XV` and `U` (the prediction is `(x_in · V) · U^T`), passing those
+/// two products — rather than `V` and `U` separately — makes the score
+/// invariant to the unidentifiable balancing gauge `U -> cU, V -> V/c`, which
+/// leaves the represented function unchanged.
 pub struct SkipTranscoderRemlInputs<'a> {
     pub y_out: ArrayView2<'a, f64>,
     pub y_hat: ArrayView2<'a, f64>,
     pub z: ArrayView2<'a, f64>,
     pub w_dec: ArrayView2<'a, f64>,
     pub lambda_sparse: f64,
+    /// Skip input projection `XV = x_in · skip_V`, shape `(n_obs, rank_skip)`.
+    pub skip_proj: Option<ArrayView2<'a, f64>>,
+    /// Skip output loading `U = skip_U`, shape `(out_dim, rank_skip)`.
     pub skip_u: Option<ArrayView2<'a, f64>>,
 }
 
@@ -28,6 +48,7 @@ pub fn skip_transcoder_reml_metrics(
     let z = inputs.z;
     let w_dec = inputs.w_dec;
     let lambda_sparse = inputs.lambda_sparse;
+    let skip_proj = inputs.skip_proj;
     let skip_u = inputs.skip_u;
 
     let mut active_atoms = Vec::new();
@@ -47,33 +68,53 @@ pub fn skip_transcoder_reml_metrics(
 
     let skip_rank = skip_u.as_ref().map_or(0, |value| value.ncols());
     let feature_count = active_atoms.len() + skip_rank;
-    let mut gram = Array2::<f64>::zeros((feature_count, feature_count));
 
-    for (i, &atom_i) in active_atoms.iter().enumerate() {
-        let row_i = w_dec.row(atom_i);
-        for (j, &atom_j) in active_atoms.iter().enumerate().take(i + 1) {
-            let value = row_i.dot(&w_dec.row(atom_j));
+    // The effective design column of every feature is the flattened outer
+    // product of a per-observation activation column with an output-space
+    // loading vector. Hence the Gram entry between two features is the
+    // elementwise (Hadamard) product of their activation inner product and
+    // their loading inner product:
+    //
+    //     G_{pq} = (act_p^T act_q) · (load_p^T load_q).
+    //
+    // For atoms the activation is z[:, a] and the loading is W_dec[a, :]; for
+    // skip components the activation is (XV)[:, r] and the loading is U[:, r].
+    // The features are stacked in the ordering [active atoms .. | skip ranks ..]
+    // so the sparse circuit and the bypass are scored on equal footing.
+    let mut gram = Array2::<f64>::zeros((feature_count, feature_count));
+    let n_active = active_atoms.len();
+    let activation_inner = |feature: usize, other: usize| -> f64 {
+        let act_col = |idx: usize| {
+            if idx < n_active {
+                z.column(active_atoms[idx])
+            } else {
+                skip_proj
+                    .as_ref()
+                    .expect("skip_proj present whenever skip ranks exist")
+                    .column(idx - n_active)
+            }
+        };
+        act_col(feature).dot(&act_col(other))
+    };
+    let loading_inner = |feature: usize, other: usize| -> f64 {
+        let load_vec = |idx: usize| {
+            if idx < n_active {
+                w_dec.row(active_atoms[idx])
+            } else {
+                skip_u
+                    .as_ref()
+                    .expect("skip_u present whenever skip ranks exist")
+                    .column(idx - n_active)
+            }
+        };
+        load_vec(feature).dot(&load_vec(other))
+    };
+
+    for i in 0..feature_count {
+        for j in 0..=i {
+            let value = activation_inner(i, j) * loading_inner(i, j);
             gram[[i, j]] = value;
             gram[[j, i]] = value;
-        }
-    }
-    if let Some(skip_u) = skip_u.as_ref() {
-        let offset = active_atoms.len();
-        for (i, &atom_i) in active_atoms.iter().enumerate() {
-            let row_i = w_dec.row(atom_i);
-            for rank in 0..skip_rank {
-                let value = row_i.dot(&skip_u.column(rank));
-                gram[[i, offset + rank]] = value;
-                gram[[offset + rank, i]] = value;
-            }
-        }
-        for rank_i in 0..skip_rank {
-            let col_i = skip_u.column(rank_i);
-            for rank_j in 0..=rank_i {
-                let value = col_i.dot(&skip_u.column(rank_j));
-                gram[[offset + rank_i, offset + rank_j]] = value;
-                gram[[offset + rank_j, offset + rank_i]] = value;
-            }
         }
     }
     for diag in 0..feature_count {
