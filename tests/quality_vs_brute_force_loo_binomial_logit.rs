@@ -112,7 +112,9 @@ fn alo_eta_tilde_matches_exact_loo_binomial_logit() {
     assert_eq!(n, 299, "heart failure dataset should have 299 rows, got {n}");
 
     // ---- full fit + ALO ----------------------------------------------------
-    let (full_fit, full_spec) = fit_binomial_logit(&ds);
+    // The full-fit ALO reads everything it needs from `full_fit`; the resolved
+    // spec is only needed for the per-row refits below (which return their own).
+    let (full_fit, _) = fit_binomial_logit(&ds);
     let y: Vec<f64> = ds.values.column(col["DEATH_EVENT"]).to_vec();
     let alo = compute_alo_diagnostics_from_fit(
         &full_fit,
