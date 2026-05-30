@@ -188,31 +188,36 @@ def _as_torch_tensor(x: Any, *, name: str) -> "torch.Tensor":
 
 @dataclass(slots=True)
 class Duchon(Smooth):
-    """Duchon m-spline. Isotropic radial kernel. Works at any d ≥ 1.
+    """Structural amplitude/slope/curvature smoother on a cubic (r³)
+    polyharmonic radial basis. Works at any d ≥ 1.
 
-    Special cases:
+    This is **not** the classical Duchon native seminorm. The design is the
+    cubic (r³) polyharmonic radial basis on the supplied centers, and the
+    penalty is *structural*: three separately REML-tuned penalties act on the
+    fitted function — its amplitude (deviation from the mean), its slope, and
+    its curvature — each with its own smoothing parameter ``λ``. Only the
+    **global mean** is left free (unpenalized); the polynomial nullspace order
+    selected by ``m`` (below) is what stays exempt from the slope/curvature
+    operators. Penalizing amplitude, slope, and curvature independently lets
+    REML decide, from the data, how much of each structure to keep, rather
+    than collapsing them into a single native-seminorm ``λ``.
 
-    * m=2, d=1 — natural cubic smoothing spline.
-    * m=2, d=2 — thin-plate spline (the TPS *is* the d=2 special case of
-      Duchon m=2 with the function-norm penalty).
-    * m=2, d ≥ 3 — Duchon's generalized thin-plate spline.
+    Special cases (intuition only — the penalty here is structural, not the
+    native seminorm):
 
-    For a Duchon radial basis with kernel ϕ and centers c_1, ..., c_K, the
-    (K × K) Gram matrix P with P_{ij} = ϕ(‖c_i − c_j‖) IS exactly the
-    function-norm penalty matrix. That is, P = R^T R is the Cholesky factor
-    of the smoothness penalty matrix used internally; users who manually
-    build a radial-basis design X with rows X_{n,k} = ϕ(‖x_n − c_k‖) and
-    want the corresponding REML-compatible penalty should pass P directly.
-    The same identity holds for Matérn (M = K K^T where K is the covariance)
-    — this is why kernel ridge regression and penalized smoothing are the
-    same problem.
+    * m=2, d=1 — behaves like a natural cubic smoothing spline.
+    * m=2, d=2 — thin-plate-like cubic surface.
+    * m=2, d ≥ 3 — generalized thin-plate-like cubic smoother.
 
     Parameters
     ----------
     centers : array-like of shape ``(K, d)`` — control points in ℝ^d.
         ``d`` is inferred from ``centers.shape[1]``. For 1D smooths,
         a shape ``(K,)`` 1D array is auto-promoted to ``(K, 1)``.
-    m : int, default 2. Spline order.
+    m : int, default 2. Spline ORDER — selects the polynomial nullspace the
+        slope/curvature operators leave unpenalized (1 → mean only, 2 → mean +
+        linear, k → degree k-1). It is the nullspace order, **not** the spectral
+        power ``s``.
     length_scale : optional positive float. ``None`` selects the
         scale-free pure Duchon spectrum ``‖w‖^(2(p+s))``. A positive
         value enables the hybrid spectrum
