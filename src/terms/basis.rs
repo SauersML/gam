@@ -18499,8 +18499,10 @@ fn build_matern_aniso_primary_raw_derivative_matrices(
         .into_par_iter()
         .map(|i| {
             let ci: Vec<f64> = (0..dim).map(|a| centers[[i, a]]).collect();
-            let mut first_by_axis = vec![Vec::with_capacity(k - i); dim];
-            let mut second_diag_by_axis = vec![Vec::with_capacity(k - i); dim];
+            let mut first_by_axis: Vec<Vec<f64>> =
+                (0..dim).map(|_| Vec::with_capacity(k - i)).collect();
+            let mut second_diag_by_axis: Vec<Vec<f64>> =
+                (0..dim).map(|_| Vec::with_capacity(k - i)).collect();
             for j in i..k {
                 let cj: Vec<f64> = (0..dim).map(|a| centers[[j, a]]).collect();
                 let (r, s_vec) = aniso_distance_and_components(&ci, &cj, eta);
