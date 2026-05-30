@@ -7,9 +7,12 @@
 //! Fisher working weight and in the second/third curvature buffers `c`/`d`.
 //!
 //! [`write_log_link_working_state`] is the single row engine; each family
-//! supplies a [`LogLinkWorkingKernel`] that contributes the weight rule, the
-//! curvature terms, and two numerical policies (whether the weight is floored at
-//! `MIN_WEIGHT`, and whether the `mu`-jet is zeroed when `eta` is clamped).
+//! supplies a [`LogLinkRule`] that describes — as data — the weight rule, the
+//! curvature rule, and two numerical policies (whether the weight is floored at
+//! `MIN_WEIGHT`, and whether the `mu`-jet is zeroed when `eta` is clamped). The
+//! rule is matched per row, so each family's formula consumes exactly the inputs
+//! it depends on (the Gamma weight ignores `mu`, the Poisson curvature ignores
+//! it) without any family being forced to accept an argument it never reads.
 
 use super::{WorkingDerivativeBuffersMut, standard_inverse_link_jet};
 use crate::estimate::EstimationError;
@@ -28,43 +31,84 @@ pub(super) const MIN_WEIGHT: f64 = 1e-12;
 /// Clamp bound on `eta` so `exp(eta)` cannot overflow.
 const ETA_CLAMP: f64 = 700.0;
 
-/// Family-specific contributions to the shared log-link row engine.
-///
-/// The engine owns the outer loop, the `eta` clamp, the `mu` floor, the working
-/// response, the `dmu/deta` jet, and the buffer plumbing; the kernel supplies
-/// only the pieces that genuinely vary between families.
-pub(super) trait LogLinkWorkingKernel: Sync {
-    /// Validate `y`/`priorweights` once before the row loop (integer counts,
-    /// non-negative responses, parameter ranges, ...). Defaults to no-op.
-    fn validate(
-        &self,
-        _y: ArrayView1<f64>,
-        _priorweights: ArrayView1<f64>,
-    ) -> Result<(), EstimationError> {
-        Ok(())
+/// Family-specific raw (un-floored) Fisher working-weight rule, already scaled
+/// by the row's prior weight. The Fisher weight never depends on the response
+/// `y` (that is what distinguishes Fisher scoring from observed-information
+/// Newton), so the response is not part of any rule.
+pub(super) enum WorkingWeight {
+    /// Poisson: `prior * mu` (`V(mu) = mu`).
+    PoissonIdentity,
+    /// Gamma(shape): `prior * shape`, independent of `eta`/`mu` (`V(mu) = mu^2`).
+    Constant { factor: f64 },
+    /// Tweedie(p, phi): `prior * floor(mu)^(2 - p) / phi`.
+    TweediePower { p: f64, phi: f64 },
+    /// Negative-binomial(theta): `prior * mu * theta / (theta + mu)`, written in
+    /// the cancellation-stable branch form.
+    NegativeBinomial { theta: f64 },
+}
+
+/// Family-specific second/third curvature-buffer rule `(c, d)`, evaluated from
+/// the row's floored working weight (and, for negative-binomial, `mu`).
+pub(super) enum WorkingCurvature {
+    /// `(c_ratio * weight, d_ratio * weight)`. Covers the canonical/quasi
+    /// families whose curvature is a fixed multiple of the weight: Poisson
+    /// `(1, 1)`, Gamma `(0, 0)`, Tweedie `(2 - p, (2 - p)^2)`.
+    Proportional { c_ratio: f64, d_ratio: f64 },
+    /// Negative-binomial(theta): `mu`-dependent curvature.
+    NegativeBinomial { theta: f64 },
+}
+
+/// Full description of a log-link family's contribution to the shared row
+/// engine: the weight rule, the curvature rule, and the two numerical policies
+/// (whether positive weights are floored at [`MIN_WEIGHT`], and whether the
+/// `dmu/deta` jet is zeroed when `eta` is clamped).
+pub(super) struct LogLinkRule {
+    pub weight: WorkingWeight,
+    pub curvature: WorkingCurvature,
+    /// Families with a `mu`-dependent weight floor (Poisson/Tweedie/NegBin) set
+    /// this; the Gamma weight is `eta`-independent and is written unfloored.
+    pub floor_weight: bool,
+    /// Only Tweedie (fractional `mu` power) needs the jet zeroed on clamp; the
+    /// others keep the `mu`-valued jet regardless of clamping.
+    pub zero_mu_jet_on_clamp: bool,
+}
+
+/// Raw (un-floored) Fisher working weight for one row. Each match arm reads only
+/// the inputs its family depends on; `mu` is consumed by the identity, power,
+/// and negative-binomial arms.
+#[inline]
+fn raw_weight(weight: &WorkingWeight, mu: f64, prior_weight: f64) -> f64 {
+    match *weight {
+        WorkingWeight::PoissonIdentity => prior_weight * mu,
+        WorkingWeight::Constant { factor } => prior_weight * factor,
+        WorkingWeight::TweediePower { p, phi } => {
+            prior_weight * super::tweedie_log_weight_mu_power(mu, p) / phi
+        }
+        WorkingWeight::NegativeBinomial { theta } => {
+            let negbin_weight = if theta > mu {
+                mu / (1.0 + mu / theta)
+            } else {
+                theta / (1.0 + theta / mu)
+            };
+            prior_weight * negbin_weight
+        }
     }
+}
 
-    /// Raw (un-floored) Fisher working weight for one row, already including the
-    /// prior weight: `prior_weight * V_Fisher(mu)`-style contribution.
-    fn raw_weight(&self, y: f64, mu: f64, prior_weight: f64) -> f64;
-
-    /// Second/third curvature buffers `(c, d)` for one row, given the row's
-    /// floored `raw_weight`. Returned only when the row keeps curvature; the
-    /// engine zeros them when a floor/clamp invalidates the local jet.
-    fn curvature_terms(&self, y: f64, mu: f64, raw_weight: f64) -> (f64, f64);
-
-    /// Whether positive weights are floored at [`MIN_WEIGHT`]. Families with a
-    /// `mu`-dependent weight floor (Poisson/Tweedie/NegBin) return `true`; the
-    /// Gamma weight is independent of `eta` and is written unfloored.
-    fn floor_weight(&self) -> bool {
-        true
-    }
-
-    /// Whether the `dmu/deta` jet buffers are zeroed when `eta` is clamped. Only
-    /// Tweedie (with its fractional `mu` power) needs this; the others keep the
-    /// `mu`-valued jet regardless of clamping.
-    fn zero_mu_jet_on_clamp(&self) -> bool {
-        false
+/// Second/third curvature buffers `(c, d)` for one row, from the row's floored
+/// `weight`. The proportional arm ignores `mu`; the negative-binomial arm reads
+/// it.
+#[inline]
+fn curvature_terms(curvature: &WorkingCurvature, mu: f64, weight: f64) -> (f64, f64) {
+    match *curvature {
+        WorkingCurvature::Proportional { c_ratio, d_ratio } => (c_ratio * weight, d_ratio * weight),
+        WorkingCurvature::NegativeBinomial { theta } => {
+            let denom = theta + mu;
+            (
+                weight * theta / denom,
+                weight * theta * (theta - mu) / (denom * denom),
+            )
+        }
     }
 }
 
@@ -73,8 +117,8 @@ pub(super) trait LogLinkWorkingKernel: Sync {
 /// Computes `mu`, `weights`, and `z` for every row, and (when `derivatives` is
 /// present) the `dmu/deta` jet plus the curvature buffers `c`/`d`, delegating
 /// the weight rule, curvature, and numerical policies to `kernel`.
-pub(super) fn write_log_link_working_state<K: LogLinkWorkingKernel>(
-    kernel: &K,
+pub(super) fn write_log_link_working_state(
+    rule: &LogLinkRule,
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
     priorweights: ArrayView1<f64>,
@@ -82,10 +126,9 @@ pub(super) fn write_log_link_working_state<K: LogLinkWorkingKernel>(
     weights: &mut Array1<f64>,
     z: &mut Array1<f64>,
     derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
-) -> Result<(), EstimationError> {
-    kernel.validate(y, priorweights)?;
-    let floor_weight = kernel.floor_weight();
-    let zero_mu_jet_on_clamp = kernel.zero_mu_jet_on_clamp();
+) {
+    let floor_weight = rule.floor_weight;
+    let zero_mu_jet_on_clamp = rule.zero_mu_jet_on_clamp;
     if let Some(derivs) = derivatives {
         let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
         let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
@@ -120,7 +163,7 @@ pub(super) fn write_log_link_working_state<K: LogLinkWorkingKernel>(
                     let clamp_active = eta_raw != eta_i;
                     let mu_i = eta_i.exp().max(MIN_MU);
                     *mu_o = mu_i;
-                    let raw_weight = kernel.raw_weight(y[i], mu_i, priorweights[i].max(0.0));
+                    let raw_weight = raw_weight(&rule.weight, mu_i, priorweights[i].max(0.0));
                     let floor_active = floor_weight && raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
                     *w_o = if raw_weight > 0.0 {
                         if floor_weight {
@@ -145,7 +188,7 @@ pub(super) fn write_log_link_working_state<K: LogLinkWorkingKernel>(
                         *c_o = 0.0;
                         *d_o = 0.0;
                     } else {
-                        let (c_i, d_i) = kernel.curvature_terms(y[i], mu_i, *w_o);
+                        let (c_i, d_i) = curvature_terms(&rule.curvature, mu_i, *w_o);
                         *c_o = c_i;
                         *d_o = d_i;
                     }
@@ -163,7 +206,7 @@ pub(super) fn write_log_link_working_state<K: LogLinkWorkingKernel>(
                 let eta_i = eta[i].clamp(-ETA_CLAMP, ETA_CLAMP);
                 let mu_i = eta_i.exp().max(MIN_MU);
                 *mu_o = mu_i;
-                let raw_weight = kernel.raw_weight(y[i], mu_i, priorweights[i].max(0.0));
+                let raw_weight = raw_weight(&rule.weight, mu_i, priorweights[i].max(0.0));
                 *w_o = if raw_weight > 0.0 {
                     if floor_weight {
                         raw_weight.max(MIN_WEIGHT)
@@ -176,7 +219,6 @@ pub(super) fn write_log_link_working_state<K: LogLinkWorkingKernel>(
                 *z_o = eta_i + (y[i] - mu_i) / mu_i;
             });
     }
-    Ok(())
 }
 
 /// Shared log-link outer-derivative writer for the η-curvature carriers.
@@ -184,27 +226,23 @@ pub(super) fn write_log_link_working_state<K: LogLinkWorkingKernel>(
 /// The exact-outer-derivative path needs, per row, the working-curvature
 /// carriers `c = dW/dη`, `d = d²W/dη²` and the inverse-link jet
 /// (`dmu/deta`, `d²mu/deta²`, `d³mu/deta³`) — but no `mu`/`weights`/`z`. The
-/// weight rule and the `(c, d)` curvature are exactly the same per-family
-/// functions the working-state engine uses, so this routes them through the
-/// identical [`LogLinkWorkingKernel`] instead of re-deriving them inline.
+/// weight rule and the `(c, d)` curvature are exactly the same data-driven
+/// [`LogLinkRule`] the working-state engine uses, so this routes them through
+/// the identical [`raw_weight`]/[`curvature_terms`] functions instead of
+/// re-deriving them inline.
 ///
-/// `kernel.validate` is invoked with empty views so its parameter-range checks
-/// (Tweedie power/phi, negative-binomial theta) still fire while the response
-/// validation — which has no `y` to inspect on this path — is skipped.
-pub(super) fn write_log_link_eta_curvature<K: LogLinkWorkingKernel>(
-    kernel: &K,
+/// Parameter-range validation (Tweedie power/phi, negative-binomial theta)
+/// belongs to the caller that owns the raw parameters; this path has no `y`,
+/// so the response validation the working-state builders perform is skipped.
+pub(super) fn write_log_link_eta_curvature(
+    rule: &LogLinkRule,
     inverse_link: &InverseLink,
     eta: &Array1<f64>,
     priorweights: ArrayView1<f64>,
     buffers: WorkingDerivativeBuffersMut<'_>,
 ) -> Result<(), EstimationError> {
-    // Run the kernel's parameter-range validation only; the response loop in
-    // `validate` is a no-op over these empty views, which is correct here since
-    // the outer-derivative path has no `y` to inspect.
-    const EMPTY: &[f64] = &[];
-    kernel.validate(ArrayView1::from(EMPTY), ArrayView1::from(EMPTY))?;
-    let floor_weight = kernel.floor_weight();
-    let zero_mu_jet_on_clamp = kernel.zero_mu_jet_on_clamp();
+    let floor_weight = rule.floor_weight;
+    let zero_mu_jet_on_clamp = rule.zero_mu_jet_on_clamp;
     let c_s = buffers.c.as_slice_mut().expect("c must be contiguous");
     let d_s = buffers.d.as_slice_mut().expect("d must be contiguous");
     let dmu_s = buffers
@@ -231,13 +269,13 @@ pub(super) fn write_log_link_eta_curvature<K: LogLinkWorkingKernel>(
                 let eta_used = eta_raw.clamp(-ETA_CLAMP, ETA_CLAMP);
                 let clamp_active = eta_raw != eta_used;
                 let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
-                let raw_weight = kernel.raw_weight(0.0, jet.mu, priorweights[i].max(0.0));
-                let floor_active = floor_weight && raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
+                let raw_w = raw_weight(&rule.weight, jet.mu, priorweights[i].max(0.0));
+                let floor_active = floor_weight && raw_w > 0.0 && raw_w <= MIN_WEIGHT;
                 if clamp_active || floor_active {
                     *c_o = 0.0;
                     *d_o = 0.0;
                 } else {
-                    let (c_i, d_i) = kernel.curvature_terms(0.0, jet.mu, raw_weight);
+                    let (c_i, d_i) = curvature_terms(&rule.curvature, jet.mu, raw_w);
                     *c_o = c_i;
                     *d_o = d_i;
                 }

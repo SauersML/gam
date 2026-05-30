@@ -3688,23 +3688,10 @@ fn write_identityworking_state(
     }
 }
 
-/// Poisson log-link kernel: `V(mu) = mu`, so the Fisher weight is `prior * mu`
-/// and the canonical-link curvature buffers both equal the working weight.
-struct PoissonLogKernel;
-
-impl log_link_working_state::LogLinkWorkingKernel for PoissonLogKernel {
-    #[inline]
-    fn raw_weight(&self, _y: f64, mu: f64, prior_weight: f64) -> f64 {
-        prior_weight * mu
-    }
-
-    #[inline]
-    fn curvature_terms(&self, _y: f64, _mu: f64, raw_weight: f64) -> (f64, f64) {
-        (raw_weight, raw_weight)
-    }
-}
-
 /// Working state for Poisson with a log link.
+///
+/// `V(mu) = mu`, so the Fisher weight is `prior * mu` and the canonical-link
+/// curvature buffers both equal the working weight.
 #[inline]
 fn write_poisson_log_working_state(
     y: ArrayView1<f64>,
@@ -3716,7 +3703,15 @@ fn write_poisson_log_working_state(
     derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
 ) {
     log_link_working_state::write_log_link_working_state(
-        &PoissonLogKernel,
+        &log_link_working_state::LogLinkRule {
+            weight: log_link_working_state::WorkingWeight::PoissonIdentity,
+            curvature: log_link_working_state::WorkingCurvature::Proportional {
+                c_ratio: 1.0,
+                d_ratio: 1.0,
+            },
+            floor_weight: true,
+            zero_mu_jet_on_clamp: false,
+        },
         y,
         eta,
         priorweights,
@@ -3724,37 +3719,14 @@ fn write_poisson_log_working_state(
         weights,
         z,
         derivatives,
-    )
-    .expect("Poisson log-link kernel has no validation that can fail");
+    );
 }
 
-/// Gamma(shape = k) log-link kernel.
+/// Working state for Gamma(shape = k) with a log link.
 ///
 /// With `mu = exp(eta)` and `V(mu) = mu^2`, the Fisher weight is the
 /// prior/sample weight scaled by the fixed Gamma shape, independent of `eta`;
 /// the weight is therefore written unfloored and the curvature buffers vanish.
-struct GammaLogKernel {
-    shape: f64,
-}
-
-impl log_link_working_state::LogLinkWorkingKernel for GammaLogKernel {
-    #[inline]
-    fn raw_weight(&self, _y: f64, _mu: f64, prior_weight: f64) -> f64 {
-        prior_weight * self.shape
-    }
-
-    #[inline]
-    fn curvature_terms(&self, _y: f64, _mu: f64, _raw_weight: f64) -> (f64, f64) {
-        (0.0, 0.0)
-    }
-
-    #[inline]
-    fn floor_weight(&self) -> bool {
-        false
-    }
-}
-
-/// Working state for Gamma(shape = k) with a log link.
 #[inline]
 fn write_gamma_log_working_state(
     y: ArrayView1<f64>,
@@ -3767,7 +3739,15 @@ fn write_gamma_log_working_state(
     derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
 ) {
     log_link_working_state::write_log_link_working_state(
-        &GammaLogKernel { shape },
+        &log_link_working_state::LogLinkRule {
+            weight: log_link_working_state::WorkingWeight::Constant { factor: shape },
+            curvature: log_link_working_state::WorkingCurvature::Proportional {
+                c_ratio: 0.0,
+                d_ratio: 0.0,
+            },
+            floor_weight: false,
+            zero_mu_jet_on_clamp: false,
+        },
         y,
         eta,
         priorweights,
@@ -3775,8 +3755,7 @@ fn write_gamma_log_working_state(
         weights,
         z,
         derivatives,
-    )
-    .expect("Gamma log-link kernel has no validation that can fail");
+    );
 }
 
 pub const BETA_MU_EPS: f64 = 1.0e-12;
@@ -3941,63 +3920,12 @@ fn beta_logit_working_curvature_eta_derivatives(
     (c, d)
 }
 
-/// Tweedie log-link kernel.
+/// Working state for Tweedie with a log link.
 ///
 /// With `mu = exp(eta)`, `V(mu) = phi * mu^p`, and `g'(mu) = 1 / mu`, the Fisher
 /// working weight is `mu^(2-p) / phi`, scaled by prior weight. The `mu`-jet must
 /// be zeroed when `eta` is clamped because the fractional power makes the local
 /// jet unreliable there. Parameter ranges and responses are validated up front.
-struct TweedieLogKernel {
-    p: f64,
-    phi: f64,
-    exponent: f64,
-}
-
-impl log_link_working_state::LogLinkWorkingKernel for TweedieLogKernel {
-    #[inline]
-    fn validate(
-        &self,
-        y: ArrayView1<f64>,
-        priorweights: ArrayView1<f64>,
-    ) -> Result<(), EstimationError> {
-        if !is_valid_tweedie_power(self.p) {
-            crate::bail_invalid_estim!(
-                "Tweedie variance power must be finite and strictly between 1 and 2; got {p}",
-                p = self.p
-            );
-        }
-        if !(self.phi.is_finite() && self.phi > 0.0) {
-            crate::bail_invalid_estim!(
-                "Tweedie dispersion phi must be finite and > 0; got {phi}",
-                phi = self.phi
-            );
-        }
-        validate_tweedie_responses(&y, &priorweights)
-    }
-
-    #[inline]
-    fn raw_weight(&self, _y: f64, mu: f64, prior_weight: f64) -> f64 {
-        // `mu` is already floored like Poisson/Gamma for the log-link working
-        // response; the helper adds the deeper deviance-scale floor needed
-        // specifically by the Tweedie fractional power.
-        prior_weight * tweedie_log_weight_mu_power(mu, self.p) / self.phi
-    }
-
-    #[inline]
-    fn curvature_terms(&self, _y: f64, _mu: f64, raw_weight: f64) -> (f64, f64) {
-        (
-            self.exponent * raw_weight,
-            self.exponent * self.exponent * raw_weight,
-        )
-    }
-
-    #[inline]
-    fn zero_mu_jet_on_clamp(&self) -> bool {
-        true
-    }
-}
-
-/// Working state for Tweedie with a log link.
 #[inline]
 fn write_tweedie_log_working_state(
     y: ArrayView1<f64>,
@@ -4010,11 +3938,29 @@ fn write_tweedie_log_working_state(
     z: &mut Array1<f64>,
     derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
 ) -> Result<(), EstimationError> {
+    if !is_valid_tweedie_power(p) {
+        crate::bail_invalid_estim!(
+            "Tweedie variance power must be finite and strictly between 1 and 2; got {p}",
+            p = p
+        );
+    }
+    if !(phi.is_finite() && phi > 0.0) {
+        crate::bail_invalid_estim!(
+            "Tweedie dispersion phi must be finite and > 0; got {phi}",
+            phi = phi
+        );
+    }
+    validate_tweedie_responses(&y, &priorweights)?;
+    let exponent = 2.0 - p;
     log_link_working_state::write_log_link_working_state(
-        &TweedieLogKernel {
-            p,
-            phi,
-            exponent: 2.0 - p,
+        &log_link_working_state::LogLinkRule {
+            weight: log_link_working_state::WorkingWeight::TweediePower { p, phi },
+            curvature: log_link_working_state::WorkingCurvature::Proportional {
+                c_ratio: exponent,
+                d_ratio: exponent * exponent,
+            },
+            floor_weight: true,
+            zero_mu_jet_on_clamp: true,
         },
         y,
         eta,
@@ -4023,58 +3969,16 @@ fn write_tweedie_log_working_state(
         weights,
         z,
         derivatives,
-    )
+    );
+    Ok(())
 }
 
-/// Negative-binomial log-link kernel with fixed `theta`.
+/// Working state for NB(mu, theta) with a log link and fixed theta.
 ///
 /// The size parameter is treated as a fixed hyperparameter for this GLM stack;
 /// no theta profiling or REML update is performed here. The Fisher weight is
 /// `mu * theta / (theta + mu)`, written in the numerically-stable branch form
 /// that avoids cancellation for very small or very large `mu / theta`.
-struct NegativeBinomialLogKernel {
-    theta: f64,
-}
-
-impl log_link_working_state::LogLinkWorkingKernel for NegativeBinomialLogKernel {
-    #[inline]
-    fn validate(
-        &self,
-        y: ArrayView1<f64>,
-        priorweights: ArrayView1<f64>,
-    ) -> Result<(), EstimationError> {
-        if !valid_negbin_theta(self.theta) {
-            crate::bail_invalid_estim!(
-                "negative-binomial theta must be finite and > 0; got {theta}",
-                theta = self.theta
-            );
-        }
-        validate_count_responses(&y, &priorweights, "negative-binomial")
-    }
-
-    #[inline]
-    fn raw_weight(&self, _y: f64, mu: f64, prior_weight: f64) -> f64 {
-        let theta = self.theta;
-        let negbin_weight = if theta > mu {
-            mu / (1.0 + mu / theta)
-        } else {
-            theta / (1.0 + theta / mu)
-        };
-        prior_weight * negbin_weight
-    }
-
-    #[inline]
-    fn curvature_terms(&self, _y: f64, mu: f64, raw_weight: f64) -> (f64, f64) {
-        let theta = self.theta;
-        let denom = theta + mu;
-        (
-            raw_weight * theta / denom,
-            raw_weight * theta * (theta - mu) / (denom * denom),
-        )
-    }
-}
-
-/// Working state for NB(mu, theta) with a log link and fixed theta.
 #[inline]
 fn write_negative_binomial_log_working_state(
     y: ArrayView1<f64>,
@@ -4086,8 +3990,20 @@ fn write_negative_binomial_log_working_state(
     z: &mut Array1<f64>,
     derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
 ) -> Result<(), EstimationError> {
+    if !valid_negbin_theta(theta) {
+        crate::bail_invalid_estim!(
+            "negative-binomial theta must be finite and > 0; got {theta}",
+            theta = theta
+        );
+    }
+    validate_count_responses(&y, &priorweights, "negative-binomial")?;
     log_link_working_state::write_log_link_working_state(
-        &NegativeBinomialLogKernel { theta },
+        &log_link_working_state::LogLinkRule {
+            weight: log_link_working_state::WorkingWeight::NegativeBinomial { theta },
+            curvature: log_link_working_state::WorkingCurvature::NegativeBinomial { theta },
+            floor_weight: true,
+            zero_mu_jet_on_clamp: false,
+        },
         y,
         eta,
         priorweights,
@@ -4095,7 +4011,8 @@ fn write_negative_binomial_log_working_state(
         weights,
         z,
         derivatives,
-    )
+    );
+    Ok(())
 }
 
 /// Working state for Beta(mu * phi, (1 - mu) * phi) with a logit link.
@@ -4813,7 +4730,15 @@ pub(crate) fn computeworkingweight_derivatives_from_eta(
         }
         ResponseFamily::Poisson => {
             log_link_working_state::write_log_link_eta_curvature(
-                &PoissonLogKernel,
+                &log_link_working_state::LogLinkRule {
+                    weight: log_link_working_state::WorkingWeight::PoissonIdentity,
+                    curvature: log_link_working_state::WorkingCurvature::Proportional {
+                        c_ratio: 1.0,
+                        d_ratio: 1.0,
+                    },
+                    floor_weight: true,
+                    zero_mu_jet_on_clamp: false,
+                },
                 inverse_link,
                 eta,
                 priorweights,
@@ -4829,11 +4754,28 @@ pub(crate) fn computeworkingweight_derivatives_from_eta(
         ResponseFamily::Tweedie { p } => {
             let p = *p;
             let phi = fixed_glm_dispersion(likelihood);
+            if !is_valid_tweedie_power(p) {
+                crate::bail_invalid_estim!(
+                    "Tweedie variance power must be finite and strictly between 1 and 2; got {p}",
+                    p = p
+                );
+            }
+            if !(phi.is_finite() && phi > 0.0) {
+                crate::bail_invalid_estim!(
+                    "Tweedie dispersion phi must be finite and > 0; got {phi}",
+                    phi = phi
+                );
+            }
+            let exponent = 2.0 - p;
             log_link_working_state::write_log_link_eta_curvature(
-                &TweedieLogKernel {
-                    p,
-                    phi,
-                    exponent: 2.0 - p,
+                &log_link_working_state::LogLinkRule {
+                    weight: log_link_working_state::WorkingWeight::TweediePower { p, phi },
+                    curvature: log_link_working_state::WorkingCurvature::Proportional {
+                        c_ratio: exponent,
+                        d_ratio: exponent * exponent,
+                    },
+                    floor_weight: true,
+                    zero_mu_jet_on_clamp: true,
                 },
                 inverse_link,
                 eta,
@@ -4848,8 +4790,20 @@ pub(crate) fn computeworkingweight_derivatives_from_eta(
             )?;
         }
         ResponseFamily::NegativeBinomial { theta } => {
+            let theta = *theta;
+            if !valid_negbin_theta(theta) {
+                crate::bail_invalid_estim!(
+                    "negative-binomial theta must be finite and > 0; got {theta}",
+                    theta = theta
+                );
+            }
             log_link_working_state::write_log_link_eta_curvature(
-                &NegativeBinomialLogKernel { theta: *theta },
+                &log_link_working_state::LogLinkRule {
+                    weight: log_link_working_state::WorkingWeight::NegativeBinomial { theta },
+                    curvature: log_link_working_state::WorkingCurvature::NegativeBinomial { theta },
+                    floor_weight: true,
+                    zero_mu_jet_on_clamp: false,
+                },
                 inverse_link,
                 eta,
                 priorweights,
@@ -4923,7 +4877,15 @@ pub(crate) fn computeworkingweight_derivatives_from_eta(
             // working-curvature carriers `c`/`d` vanish identically (the kernel
             // returns `(0, 0)`); only the link jet is written here.
             log_link_working_state::write_log_link_eta_curvature(
-                &GammaLogKernel { shape: 1.0 },
+                &log_link_working_state::LogLinkRule {
+                    weight: log_link_working_state::WorkingWeight::Constant { factor: 1.0 },
+                    curvature: log_link_working_state::WorkingCurvature::Proportional {
+                        c_ratio: 0.0,
+                        d_ratio: 0.0,
+                    },
+                    floor_weight: false,
+                    zero_mu_jet_on_clamp: false,
+                },
                 inverse_link,
                 eta,
                 priorweights,
