@@ -9354,8 +9354,8 @@ const SAE_DEFAULT_TORUS_HARMONICS: usize = 3;
 /// Sphere chart basis size (lat/lon ⇒ `[1, x, y, z, xy, yz, xz]`).
 const SAE_SPHERE_BASIS_SIZE: usize = 7;
 /// Duchon nullspace knob `m` for a SAE-manifold atom of latent dimension
-/// `dim`, derived so the scale-free (`power = 0`) curvature seminorm
-/// (`OperatorStiffness`) is always well-posed.
+/// `dim`, derived so the curvature (data-jet) penalty block
+/// (`OperatorStiffness`) on the structural cubic basis is always well-posed.
 ///
 /// `m` maps to the polynomial-nullspace order via [`duchon_nullspace_from_m`]
 /// (`m = 1 → Zero/p=1`, `m = 2 → Linear/p=2`, `m = k+1 → Degree(k)/p=k+1`), so
@@ -10807,7 +10807,7 @@ fn sae_build_duchon_atom(
     // amplification-consistent core entry point so the seed atom matches the
     // `DuchonCoordinateEvaluator` refresh bit-for-bit (issue #247).
     let built = build_duchon_basis(centers, &spec).map_err(|err| err.to_string())?;
-    // The scale-free curvature seminorm is the `OperatorStiffness` block. With
+    // The curvature (data-jet) penalty is the `OperatorStiffness` block. With
     // `m = sae_duchon_atom_m(dim)` the D2 collocation inequality holds, so this
     // block is always built and active — assert it as a structural invariant
     // rather than silently returning `None`.
