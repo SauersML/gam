@@ -99,9 +99,9 @@ use gam::terms::interchange_decoder::{
 use gam::terms::latent_coord::{AuxPriorFamily, aux_prior_targets};
 use gam::terms::sae_manifold::{
     AssignmentMode, DuchonCoordinateEvaluator, EuclideanPatchEvaluator, GumbelTemperatureSchedule,
-    PeriodicHarmonicEvaluator, SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldRho, ScheduleKind,
-    SphereChartEvaluator, TorusHarmonicEvaluator, sphere_chart_basis_jet,
-    term_from_padded_blocks_with_mode, SPHERE_CHART_PENALTY_DIAGONAL,
+    PeriodicHarmonicEvaluator, SPHERE_CHART_PENALTY_DIAGONAL, SaeAtomBasisKind, SaeBasisEvaluator,
+    SaeManifoldRho, ScheduleKind, SphereChartEvaluator, TorusHarmonicEvaluator,
+    sphere_chart_basis_jet, term_from_padded_blocks_with_mode,
 };
 use gam::terms::skip_transcoder::{
     SkipTranscoderRemlInputs, skip_transcoder_reml_metrics as skip_transcoder_reml_metrics_core,
