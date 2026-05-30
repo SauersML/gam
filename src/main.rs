@@ -77,8 +77,8 @@ use gam::survival::{
 use gam::survival_construction::{
     SavedSurvivalTimeBasis, SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
     SurvivalTimeBasisConfig, SurvivalTimeBuildOutput, add_survival_time_derivative_guard_offset,
-    append_zero_tail_columns, baseline_chain_rule_gradient, build_latent_survival_baseline_offsets,
-    build_survival_time_basis, build_survival_time_offsets_for_likelihood,
+    baseline_chain_rule_gradient, build_survival_time_basis,
+    build_survival_time_offsets_for_likelihood,
     build_survival_timewiggle_from_baseline, build_time_varying_survival_covariate_template,
     center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
     initial_survival_baseline_config_for_fit, location_scale_uses_probit_survival_baseline,
@@ -93,8 +93,8 @@ use gam::survival_construction::{
 };
 use gam::survival_location_scale::{
     ResidualDistribution, SurvivalCovariateTermBlockTemplate, SurvivalLocationScalePredictInput,
-    SurvivalLocationScaleTermSpec, TimeBlockInput, TimeWiggleBlockInput,
-    predict_survival_location_scale, project_onto_linear_constraints,
+    SurvivalLocationScaleTermSpec, TimeBlockInput, predict_survival_location_scale,
+    project_onto_linear_constraints,
     residual_distribution_inverse_link,
 };
 use gam::survival_marginal_slope::SurvivalMarginalSlopeTermSpec;
@@ -117,10 +117,10 @@ use gam::types::{
 use gam::{
     BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, FitRequest, FitResult,
     GaussianLocationScaleFitRequest, LatentBinaryFitRequest, LatentSurvivalFitRequest,
-    LinkWiggleConfig, StandardBinomialWiggleConfig, StandardFitRequest,
+    LinkWiggleConfig, PreparedSurvivalTimeStack, StandardBinomialWiggleConfig, StandardFitRequest,
     SurvivalLocationScaleFitRequest, SurvivalMarginalSlopeFitRequest,
     SurvivalTransformationFitRequest, TransformationNormalFitRequest, fit_model,
-    resolve_offset_column, resolve_weight_column,
+    prepare_survival_time_stack, resolve_offset_column, resolve_weight_column,
 };
 use ndarray::{Array1, Array2, ArrayView1, Axis, array, s};
 use rand::{SeedableRng, rngs::StdRng};
@@ -4026,22 +4026,6 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     Ok(())
 }
 
-struct PreparedSurvivalTimeStack {
-    eta_offset_entry: Array1<f64>,
-    eta_offset_exit: Array1<f64>,
-    derivative_offset_exit: Array1<f64>,
-    unloaded_mass_entry: Array1<f64>,
-    unloaded_mass_exit: Array1<f64>,
-    unloaded_hazard_exit: Array1<f64>,
-    time_design_entry: DesignMatrix,
-    time_design_exit: DesignMatrix,
-    time_design_derivative_exit: DesignMatrix,
-    time_penalties: Vec<Array2<f64>>,
-    time_nullspace_dims: Vec<usize>,
-    timewiggle_build: Option<gam::survival_construction::SurvivalTimeWiggleBuild>,
-    timewiggle_block: Option<TimeWiggleBlockInput>,
-}
-
 fn survival_working_reml_score(state: &gam::pirls::WorkingState) -> f64 {
     0.5 * (state.deviance + state.penalty_term)
 }
@@ -4114,119 +4098,6 @@ fn fitted_weibull_baseline_from_linear_time_beta(beta: &Array1<f64>) -> Option<(
         return None;
     }
     Some((scale, shape))
-}
-
-fn prepare_survival_time_stack(
-    age_entry: &Array1<f64>,
-    age_exit: &Array1<f64>,
-    baseline_cfg: &SurvivalBaselineConfig,
-    likelihood_mode: SurvivalLikelihoodMode,
-    inverse_link: Option<&InverseLink>,
-    time_anchor: f64,
-    exact_derivative_guard: f64,
-    time_build: &SurvivalTimeBuildOutput,
-    effective_timewiggle: Option<&LinkWiggleFormulaSpec>,
-    latent_loading: Option<gam::families::lognormal_kernel::HazardLoading>,
-) -> Result<PreparedSurvivalTimeStack, String> {
-    let (
-        mut eta_offset_entry,
-        mut eta_offset_exit,
-        mut derivative_offset_exit,
-        unloaded_mass_entry,
-        unloaded_mass_exit,
-        unloaded_hazard_exit,
-    ) = if let Some(loading) = latent_loading {
-        let offsets =
-            build_latent_survival_baseline_offsets(age_entry, age_exit, baseline_cfg, loading)?;
-        (
-            offsets.loaded_eta_entry,
-            offsets.loaded_eta_exit,
-            offsets.loaded_derivative_exit,
-            offsets.unloaded_mass_entry,
-            offsets.unloaded_mass_exit,
-            offsets.unloaded_hazard_exit,
-        )
-    } else {
-        let (eta_offset_entry, eta_offset_exit, derivative_offset_exit) =
-            build_survival_time_offsets_for_likelihood(
-                age_entry,
-                age_exit,
-                baseline_cfg,
-                likelihood_mode,
-                inverse_link,
-            )?;
-        let n = age_entry.len();
-        (
-            eta_offset_entry,
-            eta_offset_exit,
-            derivative_offset_exit,
-            Array1::zeros(n),
-            Array1::zeros(n),
-            Array1::zeros(n),
-        )
-    };
-    add_survival_time_derivative_guard_offset(
-        age_entry,
-        age_exit,
-        time_anchor,
-        exact_derivative_guard,
-        &mut eta_offset_entry,
-        &mut eta_offset_exit,
-        &mut derivative_offset_exit,
-    )?;
-    let timewiggle_build = if let Some(cfg) = effective_timewiggle {
-        Some(build_survival_timewiggle_from_baseline(
-            &eta_offset_entry,
-            &eta_offset_exit,
-            &derivative_offset_exit,
-            cfg,
-        )?)
-    } else {
-        None
-    };
-    let mut time_design_entry = time_build.x_entry_time.clone();
-    let mut time_design_exit = time_build.x_exit_time.clone();
-    let mut time_design_derivative_exit = time_build.x_derivative_time.clone();
-    let mut time_penalties = time_build.penalties.clone();
-    let mut time_nullspace_dims = time_build.nullspace_dims.clone();
-    let mut timewiggle_block = None;
-    if let Some(tw) = timewiggle_build.as_ref() {
-        let p_base = time_design_exit.ncols();
-        append_zero_tail_columns(
-            &mut time_design_entry,
-            &mut time_design_exit,
-            &mut time_design_derivative_exit,
-            tw.ncols,
-        );
-        for (idx, p) in tw.penalties.iter().enumerate() {
-            let mut embedded = Array2::<f64>::zeros((p_base + tw.ncols, p_base + tw.ncols));
-            embedded
-                .slice_mut(s![p_base..p_base + tw.ncols, p_base..p_base + tw.ncols])
-                .assign(p);
-            time_penalties.push(embedded);
-            time_nullspace_dims.push(tw.nullspace_dims.get(idx).copied().unwrap_or(0));
-        }
-        timewiggle_block = Some(TimeWiggleBlockInput {
-            knots: tw.knots.clone(),
-            degree: tw.degree,
-            ncols: tw.ncols,
-        });
-    }
-    Ok(PreparedSurvivalTimeStack {
-        eta_offset_entry,
-        eta_offset_exit,
-        derivative_offset_exit,
-        unloaded_mass_entry,
-        unloaded_mass_exit,
-        unloaded_hazard_exit,
-        time_design_entry,
-        time_design_exit,
-        time_design_derivative_exit,
-        time_penalties,
-        time_nullspace_dims,
-        timewiggle_build,
-        timewiggle_block,
-    })
 }
 
 fn baseline_timewiggle_is_present(model: &SavedModel) -> bool {
