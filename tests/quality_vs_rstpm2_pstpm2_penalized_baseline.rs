@@ -351,6 +351,26 @@ fn gam_penalized_baseline_matches_rstpm2_pstpm2_on_cirrhosis() {
         gam_survival.len(),
         "rstpm2 survival grid length mismatch"
     );
+    // The reference vectors must be clean before they enter the metrics: a
+    // non-finite log Λ (e.g. log of a non-positive cumhaz at a grid edge) would
+    // make `relative_l2`/`pearson` return NaN, and `NaN <= bound` is false, so
+    // the assertions below would still fire — but with a misleading message that
+    // blames divergence rather than a degenerate reference prediction. Catch it
+    // here with an attributable failure (same rigor as the monotone sibling test).
+    assert!(
+        rstpm2_logcum.iter().all(|v| v.is_finite()),
+        "rstpm2 emitted a non-finite log cumulative hazard on the grid: {rstpm2_logcum:?}"
+    );
+    assert!(
+        rstpm2_surv
+            .iter()
+            .all(|v| v.is_finite() && (0.0..=1.0).contains(v)),
+        "rstpm2 emitted a non-finite or out-of-range survival probability: {rstpm2_surv:?}"
+    );
+    assert!(
+        rstpm2_edf.is_finite() && rstpm2_edf > 0.0,
+        "rstpm2 must report a finite positive total edf, got {rstpm2_edf}"
+    );
 
     // ---- compare on the grid that matters ---------------------------------
     let rel_logcum = relative_l2(&gam_log_cumhaz, rstpm2_logcum);
