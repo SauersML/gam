@@ -11,8 +11,8 @@ use crate::families::bernoulli_marginal_slope::{
 };
 use crate::families::gamlss::{
     BinomialLocationScaleFitResult, BinomialLocationScaleTermSpec, BlockwiseTermFitResult,
-    BlockwiseTermFitResultParts, GaussianLocationScaleFitResult, GaussianLocationScaleTermSpec,
-    WiggleBlockConfig, fit_binomial_location_scale_terms,
+    BlockwiseTermFitResultParts, BlockwiseTermWiggleFitResult, GaussianLocationScaleFitResult,
+    GaussianLocationScaleTermSpec, WiggleBlockConfig, fit_binomial_location_scale_terms,
     fit_binomial_location_scale_terms_with_selected_wiggle,
     fit_binomial_mean_wiggle_terms_with_selected_basis, fit_gaussian_location_scale_terms,
     fit_gaussian_location_scale_terms_with_selected_wiggle,
@@ -1181,25 +1181,188 @@ fn fit_standard_model(request: StandardFitRequest<'_>) -> Result<StandardFitResu
     })
 }
 
-fn fit_gaussian_location_scale_model(
-    request: GaussianLocationScaleFitRequest<'_>,
-) -> Result<GaussianLocationScaleFitResult, String> {
-    if let Some(wiggle_cfg) = request.wiggle {
-        let pilot = fit_gaussian_location_scale_terms(
-            request.data,
+/// Broken-out pieces of a location-scale fit request, family-agnostic.
+///
+/// Both the Gaussian and binomial location-scale requests are structurally the
+/// same — a borrowed data matrix, a family-specific term spec, an optional link
+/// wiggle config, and the two option bundles. The shared wiggle-pilot engine
+/// ([`fit_location_scale_with_optional_wiggle`]) consumes these parts; each
+/// family's request type lowers itself into them via
+/// [`LocationScaleWorkflowAdapter::into_parts`].
+struct LocationScaleWorkflowParts<'a, S> {
+    data: ArrayView2<'a, f64>,
+    spec: S,
+    wiggle: Option<LinkWiggleConfig>,
+    options: BlockwiseFitOptions,
+    kappa_options: SpatialLengthScaleOptimizationOptions,
+}
+
+/// Family-specific glue for the shared location-scale wiggle-pilot workflow.
+///
+/// The workflow policy (pilot fit — which also enforces any family wiggle
+/// compatibility guard — → select link wiggle basis from the pilot → refit with
+/// the selected wiggle → extract `beta_link_wiggle` and assemble; otherwise the
+/// plain non-wiggle fit) is identical across Gaussian and binomial
+/// location-scale models — only the family fit/select/refit functions and result
+/// type differ (#430). An adapter supplies exactly those family-specific
+/// operations; the engine owns the policy.
+trait LocationScaleWorkflowAdapter {
+    /// The owned term spec for this family (`GaussianLocationScaleTermSpec` /
+    /// `BinomialLocationScaleTermSpec`).
+    type Spec;
+    /// The borrowed request type the public model entry point receives.
+    type Request<'a>;
+    /// The family-specific fit result the engine assembles.
+    type Result;
+
+    /// Lower the borrowed request into the family-agnostic workflow parts.
+    fn into_parts<'a>(
+        request: Self::Request<'a>,
+    ) -> LocationScaleWorkflowParts<'a, Self::Spec>;
+
+    /// Pilot fit on the bare (non-wiggle) spec, used to seed the wiggle-basis
+    /// selector. This is the first work the wiggle path performs, so any
+    /// family-specific wiggle compatibility guard (e.g. the binomial inverse
+    /// link must support a joint wiggle refit) is enforced here before fitting.
+    /// The adapter clones whatever spec fields the pilot consumes so the caller
+    /// retains ownership of `spec` for the subsequent refit.
+    fn fit_pilot(
+        data: ArrayView2<'_, f64>,
+        spec: &Self::Spec,
+        options: &BlockwiseFitOptions,
+        kappa_options: &SpatialLengthScaleOptimizationOptions,
+    ) -> Result<BlockwiseTermFitResult, String>;
+
+    /// Select the link-wiggle basis from the pilot, then refit the full model
+    /// with that selected wiggle block. Consumes `spec`.
+    fn refit_with_selected_wiggle(
+        data: ArrayView2<'_, f64>,
+        spec: Self::Spec,
+        pilot: &BlockwiseTermFitResult,
+        wiggle_cfg: &LinkWiggleConfig,
+        options: &BlockwiseFitOptions,
+        kappa_options: &SpatialLengthScaleOptimizationOptions,
+    ) -> Result<BlockwiseTermWiggleFitResult, String>;
+
+    /// Plain non-wiggle fit, used when no wiggle config is present. Consumes
+    /// `spec`.
+    fn fit_plain(
+        data: ArrayView2<'_, f64>,
+        spec: Self::Spec,
+        options: &BlockwiseFitOptions,
+        kappa_options: &SpatialLengthScaleOptimizationOptions,
+    ) -> Result<BlockwiseTermFitResult, String>;
+
+    /// Assemble the family result from a non-wiggle fit (knots/degree/wiggle
+    /// coefficients all absent).
+    fn assemble_plain(fit: BlockwiseTermFitResult) -> Self::Result;
+
+    /// Assemble the family result from a wiggle refit, carrying the selected
+    /// knots/degree and the extracted `beta_link_wiggle` block.
+    fn assemble_with_wiggle(
+        fit: BlockwiseTermFitResult,
+        wiggle_knots: Array1<f64>,
+        wiggle_degree: usize,
+        beta_link_wiggle: Option<Vec<f64>>,
+    ) -> Self::Result;
+}
+
+/// Shared wiggle-pilot workflow for Gaussian and binomial location-scale models
+/// (#430). The single source of truth for the policy; families differ only via
+/// their [`LocationScaleWorkflowAdapter`].
+fn fit_location_scale_with_optional_wiggle<A: LocationScaleWorkflowAdapter>(
+    request: A::Request<'_>,
+) -> Result<A::Result, String> {
+    let LocationScaleWorkflowParts {
+        data,
+        spec,
+        wiggle,
+        options,
+        kappa_options,
+    } = A::into_parts(request);
+
+    let Some(wiggle_cfg) = wiggle else {
+        let fit = A::fit_plain(data, spec, &options, &kappa_options)?;
+        return Ok(A::assemble_plain(fit));
+    };
+
+    let pilot = A::fit_pilot(data, &spec, &options, &kappa_options)?;
+    let solved =
+        A::refit_with_selected_wiggle(data, spec, &pilot, &wiggle_cfg, &options, &kappa_options)?;
+
+    // The selected link-wiggle basis is appended as the third blockwise term
+    // (after the mean/threshold and log-σ blocks), so its coefficients live in
+    // block 2 of the refit.
+    let fit = solved.fit.fit;
+    let beta_link_wiggle = fit.block_states.get(2).map(|b| b.beta.to_vec());
+    let assembled_fit = BlockwiseTermFitResult::try_from_parts(BlockwiseTermFitResultParts {
+        fit,
+        meanspec_resolved: solved.fit.meanspec_resolved,
+        noisespec_resolved: solved.fit.noisespec_resolved,
+        mean_design: solved.fit.mean_design,
+        noise_design: solved.fit.noise_design,
+    })?;
+    Ok(A::assemble_with_wiggle(
+        assembled_fit,
+        solved.wiggle_knots,
+        solved.wiggle_degree,
+        beta_link_wiggle,
+    ))
+}
+
+/// Gaussian location-scale adapter for the shared wiggle-pilot workflow.
+struct GaussianLocationScaleWorkflow;
+
+impl LocationScaleWorkflowAdapter for GaussianLocationScaleWorkflow {
+    type Spec = GaussianLocationScaleTermSpec;
+    type Request<'a> = GaussianLocationScaleFitRequest<'a>;
+    type Result = GaussianLocationScaleFitResult;
+
+    fn into_parts<'a>(
+        request: Self::Request<'a>,
+    ) -> LocationScaleWorkflowParts<'a, Self::Spec> {
+        LocationScaleWorkflowParts {
+            data: request.data,
+            spec: request.spec,
+            wiggle: request.wiggle,
+            options: request.options,
+            kappa_options: request.kappa_options,
+        }
+    }
+
+    fn fit_pilot(
+        data: ArrayView2<'_, f64>,
+        spec: &Self::Spec,
+        options: &BlockwiseFitOptions,
+        kappa_options: &SpatialLengthScaleOptimizationOptions,
+    ) -> Result<BlockwiseTermFitResult, String> {
+        // Gaussian location-scale uses an identity mean link; the joint wiggle
+        // refit is always admissible, so the pilot fits with no extra guard.
+        fit_gaussian_location_scale_terms(
+            data,
             GaussianLocationScaleTermSpec {
-                y: request.spec.y.clone(),
-                weights: request.spec.weights.clone(),
-                meanspec: request.spec.meanspec.clone(),
-                log_sigmaspec: request.spec.log_sigmaspec.clone(),
-                mean_offset: request.spec.mean_offset.clone(),
-                log_sigma_offset: request.spec.log_sigma_offset.clone(),
+                y: spec.y.clone(),
+                weights: spec.weights.clone(),
+                meanspec: spec.meanspec.clone(),
+                log_sigmaspec: spec.log_sigmaspec.clone(),
+                mean_offset: spec.mean_offset.clone(),
+                log_sigma_offset: spec.log_sigma_offset.clone(),
             },
-            &request.options,
-            &request.kappa_options,
-        )?;
+            options,
+            kappa_options,
+        )
+    }
+
+    fn refit_with_selected_wiggle(
+        data: ArrayView2<'_, f64>,
+        spec: Self::Spec,
+        pilot: &BlockwiseTermFitResult,
+        wiggle_cfg: &LinkWiggleConfig,
+        options: &BlockwiseFitOptions,
+        kappa_options: &SpatialLengthScaleOptimizationOptions,
+    ) -> Result<BlockwiseTermWiggleFitResult, String> {
         let selected_wiggle_basis = select_gaussian_location_scale_link_wiggle_basis_from_pilot(
-            &pilot,
+            pilot,
             &WiggleBlockConfig {
                 degree: wiggle_cfg.degree,
                 num_internal_knots: wiggle_cfg.num_internal_knots,
@@ -1208,110 +1371,167 @@ fn fit_gaussian_location_scale_model(
             },
             &wiggle_cfg.penalty_orders,
         )?;
-        let solved = fit_gaussian_location_scale_terms_with_selected_wiggle(
-            request.data,
-            request.spec,
+        fit_gaussian_location_scale_terms_with_selected_wiggle(
+            data,
+            spec,
             selected_wiggle_basis,
-            &request.options,
-            &request.kappa_options,
-        )?;
-        let fit = solved.fit.fit;
-        let beta_link_wiggle = fit.block_states.get(2).map(|b| b.beta.to_vec());
-        Ok(GaussianLocationScaleFitResult {
-            fit: BlockwiseTermFitResult::try_from_parts(BlockwiseTermFitResultParts {
-                fit,
-                meanspec_resolved: solved.fit.meanspec_resolved,
-                noisespec_resolved: solved.fit.noisespec_resolved,
-                mean_design: solved.fit.mean_design,
-                noise_design: solved.fit.noise_design,
-            })?,
-            wiggle_knots: Some(solved.wiggle_knots),
-            wiggle_degree: Some(solved.wiggle_degree),
-            beta_link_wiggle,
-        })
-    } else {
-        let fit = fit_gaussian_location_scale_terms(
-            request.data,
-            request.spec,
-            &request.options,
-            &request.kappa_options,
-        )?;
-        Ok(GaussianLocationScaleFitResult {
+            options,
+            kappa_options,
+        )
+    }
+
+    fn fit_plain(
+        data: ArrayView2<'_, f64>,
+        spec: Self::Spec,
+        options: &BlockwiseFitOptions,
+        kappa_options: &SpatialLengthScaleOptimizationOptions,
+    ) -> Result<BlockwiseTermFitResult, String> {
+        fit_gaussian_location_scale_terms(data, spec, options, kappa_options)
+    }
+
+    fn assemble_plain(fit: BlockwiseTermFitResult) -> Self::Result {
+        GaussianLocationScaleFitResult {
             fit,
             wiggle_knots: None,
             wiggle_degree: None,
             beta_link_wiggle: None,
-        })
+        }
     }
+
+    fn assemble_with_wiggle(
+        fit: BlockwiseTermFitResult,
+        wiggle_knots: Array1<f64>,
+        wiggle_degree: usize,
+        beta_link_wiggle: Option<Vec<f64>>,
+    ) -> Self::Result {
+        GaussianLocationScaleFitResult {
+            fit,
+            wiggle_knots: Some(wiggle_knots),
+            wiggle_degree: Some(wiggle_degree),
+            beta_link_wiggle,
+        }
+    }
+}
+
+/// Binomial location-scale adapter for the shared wiggle-pilot workflow.
+struct BinomialLocationScaleWorkflow;
+
+impl LocationScaleWorkflowAdapter for BinomialLocationScaleWorkflow {
+    type Spec = BinomialLocationScaleTermSpec;
+    type Request<'a> = BinomialLocationScaleFitRequest<'a>;
+    type Result = BinomialLocationScaleFitResult;
+
+    fn into_parts<'a>(
+        request: Self::Request<'a>,
+    ) -> LocationScaleWorkflowParts<'a, Self::Spec> {
+        LocationScaleWorkflowParts {
+            data: request.data,
+            spec: request.spec,
+            wiggle: request.wiggle,
+            options: request.options,
+            kappa_options: request.kappa_options,
+        }
+    }
+
+    fn fit_pilot(
+        data: ArrayView2<'_, f64>,
+        spec: &Self::Spec,
+        options: &BlockwiseFitOptions,
+        kappa_options: &SpatialLengthScaleOptimizationOptions,
+    ) -> Result<BlockwiseTermFitResult, String> {
+        // Binomial location-scale requires an inverse link that supports the
+        // joint link-wiggle refit; gate it before any fitting work (the pilot
+        // runs only on the wiggle path).
+        require_inverse_link_supports_joint_wiggle(
+            &spec.link_kind,
+            "binomial location-scale link wiggle",
+        )?;
+        fit_binomial_location_scale_terms(
+            data,
+            BinomialLocationScaleTermSpec {
+                y: spec.y.clone(),
+                weights: spec.weights.clone(),
+                link_kind: spec.link_kind.clone(),
+                thresholdspec: spec.thresholdspec.clone(),
+                log_sigmaspec: spec.log_sigmaspec.clone(),
+                threshold_offset: spec.threshold_offset.clone(),
+                log_sigma_offset: spec.log_sigma_offset.clone(),
+            },
+            options,
+            kappa_options,
+        )
+    }
+
+    fn refit_with_selected_wiggle(
+        data: ArrayView2<'_, f64>,
+        spec: Self::Spec,
+        pilot: &BlockwiseTermFitResult,
+        wiggle_cfg: &LinkWiggleConfig,
+        options: &BlockwiseFitOptions,
+        kappa_options: &SpatialLengthScaleOptimizationOptions,
+    ) -> Result<BlockwiseTermWiggleFitResult, String> {
+        let selected_wiggle_basis = select_binomial_location_scale_link_wiggle_basis_from_pilot(
+            pilot,
+            &WiggleBlockConfig {
+                degree: wiggle_cfg.degree,
+                num_internal_knots: wiggle_cfg.num_internal_knots,
+                penalty_order: 2,
+                double_penalty: wiggle_cfg.double_penalty,
+            },
+            &wiggle_cfg.penalty_orders,
+        )?;
+        fit_binomial_location_scale_terms_with_selected_wiggle(
+            data,
+            spec,
+            selected_wiggle_basis,
+            options,
+            kappa_options,
+        )
+    }
+
+    fn fit_plain(
+        data: ArrayView2<'_, f64>,
+        spec: Self::Spec,
+        options: &BlockwiseFitOptions,
+        kappa_options: &SpatialLengthScaleOptimizationOptions,
+    ) -> Result<BlockwiseTermFitResult, String> {
+        fit_binomial_location_scale_terms(data, spec, options, kappa_options)
+    }
+
+    fn assemble_plain(fit: BlockwiseTermFitResult) -> Self::Result {
+        BinomialLocationScaleFitResult {
+            fit,
+            wiggle_knots: None,
+            wiggle_degree: None,
+            beta_link_wiggle: None,
+        }
+    }
+
+    fn assemble_with_wiggle(
+        fit: BlockwiseTermFitResult,
+        wiggle_knots: Array1<f64>,
+        wiggle_degree: usize,
+        beta_link_wiggle: Option<Vec<f64>>,
+    ) -> Self::Result {
+        BinomialLocationScaleFitResult {
+            fit,
+            wiggle_knots: Some(wiggle_knots),
+            wiggle_degree: Some(wiggle_degree),
+            beta_link_wiggle,
+        }
+    }
+}
+
+fn fit_gaussian_location_scale_model(
+    request: GaussianLocationScaleFitRequest<'_>,
+) -> Result<GaussianLocationScaleFitResult, String> {
+    fit_location_scale_with_optional_wiggle::<GaussianLocationScaleWorkflow>(request)
 }
 
 fn fit_binomial_location_scale_model(
     request: BinomialLocationScaleFitRequest<'_>,
 ) -> Result<BinomialLocationScaleFitResult, String> {
-    if let Some(wiggle_cfg) = request.wiggle {
-        require_inverse_link_supports_joint_wiggle(
-            &request.spec.link_kind,
-            "binomial location-scale link wiggle",
-        )?;
-        let pilot = fit_binomial_location_scale_terms(
-            request.data,
-            BinomialLocationScaleTermSpec {
-                y: request.spec.y.clone(),
-                weights: request.spec.weights.clone(),
-                link_kind: request.spec.link_kind.clone(),
-                thresholdspec: request.spec.thresholdspec.clone(),
-                log_sigmaspec: request.spec.log_sigmaspec.clone(),
-                threshold_offset: request.spec.threshold_offset.clone(),
-                log_sigma_offset: request.spec.log_sigma_offset.clone(),
-            },
-            &request.options,
-            &request.kappa_options,
-        )?;
-        let selected_wiggle_basis = select_binomial_location_scale_link_wiggle_basis_from_pilot(
-            &pilot,
-            &WiggleBlockConfig {
-                degree: wiggle_cfg.degree,
-                num_internal_knots: wiggle_cfg.num_internal_knots,
-                penalty_order: 2,
-                double_penalty: wiggle_cfg.double_penalty,
-            },
-            &wiggle_cfg.penalty_orders,
-        )?;
-        let solved = fit_binomial_location_scale_terms_with_selected_wiggle(
-            request.data,
-            request.spec,
-            selected_wiggle_basis,
-            &request.options,
-            &request.kappa_options,
-        )?;
-        let fit = solved.fit.fit;
-        let beta_link_wiggle = fit.block_states.get(2).map(|b| b.beta.to_vec());
-        Ok(BinomialLocationScaleFitResult {
-            fit: BlockwiseTermFitResult::try_from_parts(BlockwiseTermFitResultParts {
-                fit,
-                meanspec_resolved: solved.fit.meanspec_resolved,
-                noisespec_resolved: solved.fit.noisespec_resolved,
-                mean_design: solved.fit.mean_design,
-                noise_design: solved.fit.noise_design,
-            })?,
-            wiggle_knots: Some(solved.wiggle_knots),
-            wiggle_degree: Some(solved.wiggle_degree),
-            beta_link_wiggle,
-        })
-    } else {
-        let solved = fit_binomial_location_scale_terms(
-            request.data,
-            request.spec,
-            &request.options,
-            &request.kappa_options,
-        )?;
-        Ok(BinomialLocationScaleFitResult {
-            fit: solved,
-            wiggle_knots: None,
-            wiggle_degree: None,
-            beta_link_wiggle: None,
-        })
-    }
+    fit_location_scale_with_optional_wiggle::<BinomialLocationScaleWorkflow>(request)
 }
 
 fn survival_working_reml_score(state: &crate::pirls::WorkingState) -> f64 {
@@ -7508,5 +7728,377 @@ mod tests {
                 "survival timewiggle wrongly rejected by the non-survival guard: {msg}"
             );
         }
+    }
+
+    // ---- #430 location-scale wiggle-pilot unification: parity tests ---------
+    //
+    // The Gaussian and binomial location-scale model entry points are now thin
+    // adapters over the single `fit_location_scale_with_optional_wiggle` engine.
+    // The tests below pin that the unified engine reproduces, coefficient for
+    // coefficient, the exact per-family reference sequence it replaced — both
+    // with and without a wiggle config — so the deslop cannot silently change
+    // any fitted result. The reference replays the *old* hand-rolled flow
+    // (pilot fit → select link-wiggle basis from the pilot → refit with that
+    // basis → extract `beta_link_wiggle` from block 2) directly against the
+    // family functions, with no shared code path with the engine other than
+    // those leaf family functions.
+
+    fn gaussian_location_scale_dataset() -> Dataset {
+        // A mildly heteroscedastic, monotone-in-x signal with enough rows for a
+        // stable mean+scale fit and a small wiggle basis.
+        let n = 48usize;
+        let mut records: Vec<csv::StringRecord> = Vec::with_capacity(n);
+        for i in 0..n {
+            let x = -2.0 + 4.0 * (i as f64) / ((n - 1) as f64);
+            // Deterministic, smooth response; the σ-model is intercept-only so
+            // the test stays small while still exercising both blocks.
+            let y = 0.7 * x + 0.3 * (1.3 * x).sin();
+            records.push(csv::StringRecord::from(vec![
+                format!("{y:.17e}"),
+                format!("{x:.17e}"),
+            ]));
+        }
+        crate::inference::data::encode_recordswith_inferred_schema(
+            vec!["y".to_string(), "x".to_string()],
+            records,
+        )
+        .expect("encode gaussian location-scale dataset")
+    }
+
+    fn binomial_location_scale_dataset() -> Dataset {
+        // Balanced 0/1 response with a clear monotone gradient in x so the
+        // threshold/log-σ blocks are well posed.
+        let n = 60usize;
+        let mut records: Vec<csv::StringRecord> = Vec::with_capacity(n);
+        for i in 0..n {
+            let x = -2.0 + 4.0 * (i as f64) / ((n - 1) as f64);
+            let y = if i % 2 == 0 { 1.0 } else { 0.0 };
+            records.push(csv::StringRecord::from(vec![
+                format!("{y:.17e}"),
+                format!("{x:.17e}"),
+            ]));
+        }
+        crate::inference::data::encode_recordswith_inferred_schema(
+            vec!["y".to_string(), "x".to_string()],
+            records,
+        )
+        .expect("encode binomial location-scale dataset")
+    }
+
+    fn small_wiggle_cfg() -> LinkWiggleConfig {
+        LinkWiggleConfig {
+            degree: 3,
+            num_internal_knots: 3,
+            penalty_orders: vec![2],
+            double_penalty: false,
+        }
+    }
+
+    fn assert_block_states_match(
+        label: &str,
+        lhs: &UnifiedFitResult,
+        rhs: &UnifiedFitResult,
+    ) {
+        assert_eq!(
+            lhs.block_states.len(),
+            rhs.block_states.len(),
+            "{label}: block count mismatch (engine {} vs reference {})",
+            lhs.block_states.len(),
+            rhs.block_states.len()
+        );
+        for (i, (a, b)) in lhs
+            .block_states
+            .iter()
+            .zip(rhs.block_states.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                a.beta.len(),
+                b.beta.len(),
+                "{label}: block {i} coefficient length mismatch"
+            );
+            for (j, (&av, &bv)) in a.beta.iter().zip(b.beta.iter()).enumerate() {
+                // The engine and reference share the same leaf family functions
+                // and feed them identical inputs, so the fitted coefficients
+                // must agree to full numerical precision — this is a refactor,
+                // not an approximation. A loose tolerance here would let a real
+                // orchestration bug slip through, so the bound stays at the
+                // bit-noise floor of an exact replay.
+                assert!(
+                    (av - bv).abs() <= 1e-12 * (1.0 + bv.abs()),
+                    "{label}: block {i} coef {j} diverged: engine {av:.17e} vs reference {bv:.17e}"
+                );
+            }
+        }
+    }
+
+    fn assert_beta_link_wiggle_match(
+        label: &str,
+        engine: &Option<Vec<f64>>,
+        reference: &Option<Vec<f64>>,
+    ) {
+        match (engine, reference) {
+            (Some(e), Some(r)) => {
+                assert_eq!(
+                    e.len(),
+                    r.len(),
+                    "{label}: beta_link_wiggle length mismatch (engine {} vs reference {})",
+                    e.len(),
+                    r.len()
+                );
+                for (j, (&ev, &rv)) in e.iter().zip(r.iter()).enumerate() {
+                    // Same exact-replay floor as the block-state comparison: the
+                    // engine reads block 2 off the very fit the reference refit
+                    // produced, so any divergence beyond bit noise is a bug.
+                    assert!(
+                        (ev - rv).abs() <= 1e-12 * (1.0 + rv.abs()),
+                        "{label}: beta_link_wiggle coef {j} diverged: \
+                         engine {ev:.17e} vs reference {rv:.17e}"
+                    );
+                }
+            }
+            (None, None) => {}
+            (e, r) => panic!(
+                "{label}: beta_link_wiggle presence mismatch (engine is_some={}, reference is_some={})",
+                e.is_some(),
+                r.is_some()
+            ),
+        }
+    }
+
+    #[test]
+    fn gaussian_location_scale_engine_matches_reference_flow() {
+        let data = gaussian_location_scale_dataset();
+        let config = FitConfig {
+            family: Some("gaussian".to_string()),
+            noise_formula: Some("1".to_string()),
+            ..FitConfig::default()
+        };
+        let materialized =
+            materialize("y ~ x", &data, &config).expect("gaussian location-scale materialization");
+        let FitRequest::GaussianLocationScale(request) = materialized.request else {
+            panic!("expected a Gaussian location-scale request");
+        };
+        let GaussianLocationScaleFitRequest {
+            data: req_data,
+            spec,
+            options,
+            kappa_options,
+            ..
+        } = request;
+
+        // --- no-wiggle parity ------------------------------------------------
+        let engine_plain = fit_gaussian_location_scale_model(GaussianLocationScaleFitRequest {
+            data: req_data,
+            spec: spec.clone(),
+            wiggle: None,
+            options: options.clone(),
+            kappa_options: kappa_options.clone(),
+        })
+        .expect("engine gaussian no-wiggle fit");
+        let reference_plain =
+            fit_gaussian_location_scale_terms(req_data, spec.clone(), &options, &kappa_options)
+                .expect("reference gaussian no-wiggle fit");
+        assert_block_states_match(
+            "gaussian/no-wiggle",
+            &engine_plain.fit.fit,
+            &reference_plain.fit,
+        );
+        assert!(engine_plain.wiggle_knots.is_none());
+        assert!(engine_plain.wiggle_degree.is_none());
+        assert!(engine_plain.beta_link_wiggle.is_none());
+
+        // --- wiggle parity ---------------------------------------------------
+        let wiggle_cfg = small_wiggle_cfg();
+        let engine_wiggle = fit_gaussian_location_scale_model(GaussianLocationScaleFitRequest {
+            data: req_data,
+            spec: spec.clone(),
+            wiggle: Some(wiggle_cfg.clone()),
+            options: options.clone(),
+            kappa_options: kappa_options.clone(),
+        })
+        .expect("engine gaussian wiggle fit");
+
+        // Reference: the exact pre-unification hand-rolled sequence.
+        let ref_pilot =
+            fit_gaussian_location_scale_terms(req_data, spec.clone(), &options, &kappa_options)
+                .expect("reference gaussian pilot");
+        let ref_basis = select_gaussian_location_scale_link_wiggle_basis_from_pilot(
+            &ref_pilot,
+            &WiggleBlockConfig {
+                degree: wiggle_cfg.degree,
+                num_internal_knots: wiggle_cfg.num_internal_knots,
+                penalty_order: 2,
+                double_penalty: wiggle_cfg.double_penalty,
+            },
+            &wiggle_cfg.penalty_orders,
+        )
+        .expect("reference gaussian wiggle basis selection");
+        let ref_solved = fit_gaussian_location_scale_terms_with_selected_wiggle(
+            req_data,
+            spec.clone(),
+            ref_basis,
+            &options,
+            &kappa_options,
+        )
+        .expect("reference gaussian wiggle refit");
+
+        assert_block_states_match(
+            "gaussian/wiggle",
+            &engine_wiggle.fit.fit,
+            &ref_solved.fit.fit,
+        );
+        assert_eq!(
+            engine_wiggle.wiggle_degree,
+            Some(ref_solved.wiggle_degree),
+            "gaussian wiggle degree must match the reference refit"
+        );
+        let engine_knots = engine_wiggle
+            .wiggle_knots
+            .as_ref()
+            .expect("engine gaussian wiggle knots present");
+        assert_eq!(
+            engine_knots.len(),
+            ref_solved.wiggle_knots.len(),
+            "gaussian wiggle knot count must match the reference refit"
+        );
+        for (k, (&ek, &rk)) in engine_knots.iter().zip(ref_solved.wiggle_knots.iter()).enumerate() {
+            assert!(
+                (ek - rk).abs() <= 1e-12 * (1.0 + rk.abs()),
+                "gaussian wiggle knot {k} diverged: engine {ek:.17e} vs reference {rk:.17e}"
+            );
+        }
+        // `beta_link_wiggle` is block 2 of the refit; the engine must extract it
+        // exactly as the reference would read it off the same fit.
+        let ref_beta_link_wiggle = ref_solved.fit.fit.block_states.get(2).map(|b| b.beta.to_vec());
+        assert_beta_link_wiggle_match(
+            "gaussian",
+            &engine_wiggle.beta_link_wiggle,
+            &ref_beta_link_wiggle,
+        );
+        assert!(
+            engine_wiggle.beta_link_wiggle.is_some(),
+            "a wiggle refit must populate beta_link_wiggle (block 2 present)"
+        );
+    }
+
+    #[test]
+    fn binomial_location_scale_engine_matches_reference_flow() {
+        let data = binomial_location_scale_dataset();
+        let config = FitConfig {
+            family: Some("binomial".to_string()),
+            noise_formula: Some("1".to_string()),
+            ..FitConfig::default()
+        };
+        let materialized =
+            materialize("y ~ x", &data, &config).expect("binomial location-scale materialization");
+        let FitRequest::BinomialLocationScale(request) = materialized.request else {
+            panic!("expected a binomial location-scale request");
+        };
+        let BinomialLocationScaleFitRequest {
+            data: req_data,
+            spec,
+            options,
+            kappa_options,
+            ..
+        } = request;
+
+        // --- no-wiggle parity ------------------------------------------------
+        let engine_plain = fit_binomial_location_scale_model(BinomialLocationScaleFitRequest {
+            data: req_data,
+            spec: spec.clone(),
+            wiggle: None,
+            options: options.clone(),
+            kappa_options: kappa_options.clone(),
+        })
+        .expect("engine binomial no-wiggle fit");
+        let reference_plain =
+            fit_binomial_location_scale_terms(req_data, spec.clone(), &options, &kappa_options)
+                .expect("reference binomial no-wiggle fit");
+        assert_block_states_match(
+            "binomial/no-wiggle",
+            &engine_plain.fit.fit,
+            &reference_plain.fit,
+        );
+        assert!(engine_plain.wiggle_knots.is_none());
+        assert!(engine_plain.wiggle_degree.is_none());
+        assert!(engine_plain.beta_link_wiggle.is_none());
+
+        // --- wiggle parity ---------------------------------------------------
+        let wiggle_cfg = small_wiggle_cfg();
+        let engine_wiggle = fit_binomial_location_scale_model(BinomialLocationScaleFitRequest {
+            data: req_data,
+            spec: spec.clone(),
+            wiggle: Some(wiggle_cfg.clone()),
+            options: options.clone(),
+            kappa_options: kappa_options.clone(),
+        })
+        .expect("engine binomial wiggle fit");
+
+        // Reference: the exact pre-unification hand-rolled sequence, including
+        // the binomial-only link compatibility guard.
+        require_inverse_link_supports_joint_wiggle(
+            &spec.link_kind,
+            "binomial location-scale link wiggle",
+        )
+        .expect("logit link supports joint wiggle");
+        let ref_pilot =
+            fit_binomial_location_scale_terms(req_data, spec.clone(), &options, &kappa_options)
+                .expect("reference binomial pilot");
+        let ref_basis = select_binomial_location_scale_link_wiggle_basis_from_pilot(
+            &ref_pilot,
+            &WiggleBlockConfig {
+                degree: wiggle_cfg.degree,
+                num_internal_knots: wiggle_cfg.num_internal_knots,
+                penalty_order: 2,
+                double_penalty: wiggle_cfg.double_penalty,
+            },
+            &wiggle_cfg.penalty_orders,
+        )
+        .expect("reference binomial wiggle basis selection");
+        let ref_solved = fit_binomial_location_scale_terms_with_selected_wiggle(
+            req_data,
+            spec.clone(),
+            ref_basis,
+            &options,
+            &kappa_options,
+        )
+        .expect("reference binomial wiggle refit");
+
+        assert_block_states_match(
+            "binomial/wiggle",
+            &engine_wiggle.fit.fit,
+            &ref_solved.fit.fit,
+        );
+        assert_eq!(
+            engine_wiggle.wiggle_degree,
+            Some(ref_solved.wiggle_degree),
+            "binomial wiggle degree must match the reference refit"
+        );
+        let engine_knots = engine_wiggle
+            .wiggle_knots
+            .as_ref()
+            .expect("engine binomial wiggle knots present");
+        assert_eq!(
+            engine_knots.len(),
+            ref_solved.wiggle_knots.len(),
+            "binomial wiggle knot count must match the reference refit"
+        );
+        for (k, (&ek, &rk)) in engine_knots.iter().zip(ref_solved.wiggle_knots.iter()).enumerate() {
+            assert!(
+                (ek - rk).abs() <= 1e-12 * (1.0 + rk.abs()),
+                "binomial wiggle knot {k} diverged: engine {ek:.17e} vs reference {rk:.17e}"
+            );
+        }
+        let ref_beta_link_wiggle = ref_solved.fit.fit.block_states.get(2).map(|b| b.beta.to_vec());
+        assert_beta_link_wiggle_match(
+            "binomial",
+            &engine_wiggle.beta_link_wiggle,
+            &ref_beta_link_wiggle,
+        );
+        assert!(
+            engine_wiggle.beta_link_wiggle.is_some(),
+            "a wiggle refit must populate beta_link_wiggle (block 2 present)"
+        );
     }
 }

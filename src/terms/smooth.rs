@@ -1885,44 +1885,20 @@ fn resolve_group_columns(
     Ok(cols)
 }
 
-fn coefficient_group_concatenated_column_components(
-    name: &str,
-    children_by_parent: &BTreeMap<String, Vec<String>>,
-    resolved: &BTreeMap<String, BTreeSet<usize>>,
-) -> Vec<BTreeSet<usize>> {
-    let Some(children) = children_by_parent.get(name) else {
-        return vec![
-            resolved
-                .get(name)
-                .expect("coefficient group columns should exist")
-                .clone(),
-        ];
-    };
-    let mut components = Vec::new();
-    for child in children {
-        components.extend(coefficient_group_concatenated_column_components(
-            child,
-            children_by_parent,
-            resolved,
-        ));
-    }
-    components
-}
-
 fn realize_coefficient_groups(
     design: &TermCollectionDesign,
     groups: &[CoefficientGroupSpec],
     base_prior: &crate::types::RhoPrior,
 ) -> Result<RealizedCoefficientGroups, BasisError> {
+    use crate::terms::coefficient_group_resolver::{ResolvedGroup, ResolvedGroupHierarchy};
+
     let p = design.design.ncols();
-    let mut names = BTreeSet::<String>::new();
+    // Carrier-specific validation and selector resolution. The standard-term
+    // carrier is columns of the realized design matrix; `resolve_group_columns`
+    // turns each declared selector into a `BTreeSet<usize>` and rejects empty
+    // selector lists. The prior is validated here because its diagnostic
+    // context uses the standard-term label.
     for group in groups {
-        if group.name.trim().is_empty() {
-            crate::bail_invalid_basis!("coefficient group name must not be empty");
-        }
-        if !names.insert(group.name.clone()) {
-            crate::bail_invalid_basis!("duplicate coefficient group '{}'", group.name);
-        }
         if group.selectors.is_empty() {
             crate::bail_invalid_basis!("coefficient group '{}' contains no selectors", group.name);
         }
@@ -1931,75 +1907,20 @@ fn realize_coefficient_groups(
         }
     }
 
-    let mut resolved = BTreeMap::<String, BTreeSet<usize>>::new();
-    for group in groups {
-        resolved.insert(group.name.clone(), resolve_group_columns(design, group)?);
-    }
-    let parent_by_name: BTreeMap<String, Option<String>> = groups
+    let resolved_groups = groups
         .iter()
-        .map(|group| (group.name.clone(), group.parent.clone()))
-        .collect();
-    let mut children_by_parent = BTreeMap::<String, Vec<String>>::new();
-    for group in groups {
-        if let Some(parent) = group.parent.as_ref() {
-            children_by_parent
-                .entry(parent.clone())
-                .or_default()
-                .push(group.name.clone());
-        }
-    }
-    for group in groups {
-        let mut path = BTreeSet::<String>::new();
-        let mut cursor = Some(group.name.as_str());
-        while let Some(name) = cursor {
-            if !path.insert(name.to_string()) {
-                crate::bail_invalid_basis!(
-                    "coefficient group hierarchy contains a cycle involving '{name}'"
-                );
-            }
-            cursor = parent_by_name
-                .get(name)
-                .ok_or_else(|| {
-                    BasisError::InvalidInput(format!(
-                        "coefficient group hierarchy references unknown group '{name}'"
-                    ))
-                })?
-                .as_deref();
-        }
-        if let Some(parent) = group.parent.as_ref() {
-            let parent_cols = resolved.get(parent).ok_or_else(|| {
-                BasisError::InvalidInput(format!(
-                    "coefficient group '{}' references unknown parent group '{parent}'",
-                    group.name
-                ))
-            })?;
-            let child_cols = resolved.get(&group.name).expect("group was resolved above");
-            if !child_cols.is_subset(parent_cols) {
-                crate::bail_invalid_basis!(
-                    "coefficient group '{}' is not a subset of parent group '{parent}'",
-                    group.name
-                );
-            }
-        }
-        if let Some(children) = children_by_parent.get(&group.name) {
-            let mut child_union = BTreeSet::<usize>::new();
-            for child in children {
-                let child_cols = resolved
-                    .get(child)
-                    .expect("child group columns should exist after resolution");
-                child_union.extend(child_cols.iter().copied());
-            }
-            let parent_cols = resolved
-                .get(&group.name)
-                .expect("parent group columns should exist after resolution");
-            if &child_union != parent_cols {
-                crate::bail_invalid_basis!(
-                    "coefficient group '{}' has children but its coefficients are not exactly the union of its child groups; nested supergroups concatenate child coefficients",
-                    group.name
-                );
-            }
-        }
-    }
+        .map(|group| {
+            Ok(ResolvedGroup {
+                label: group.name.clone(),
+                parent: group.parent.clone(),
+                coordinates: resolve_group_columns(design, group)?,
+            })
+        })
+        .collect::<Result<Vec<_>, BasisError>>()?;
+    // Carrier-agnostic policy: unique non-empty labels, acyclic hierarchy,
+    // child ⊆ parent, interior == union of children.
+    let hierarchy = ResolvedGroupHierarchy::build(resolved_groups)
+        .map_err(BasisError::InvalidInput)?;
 
     let mut penalty_specs: Vec<PenaltySpec> = design
         .penalties
@@ -2008,14 +1929,10 @@ fn realize_coefficient_groups(
         .collect();
     let mut nullspace_dims = design.nullspace_dims.clone();
     let mut group_column_indices = Vec::<(String, Vec<usize>)>::with_capacity(groups.len());
-    for group in groups {
-        let cols = resolved.get(&group.name).expect("group was resolved above");
+    for (group, resolved) in groups.iter().zip(hierarchy.groups()) {
+        let cols = &resolved.coordinates;
         let mut penalty = Array2::<f64>::zeros((p, p));
-        let penalty_components = coefficient_group_concatenated_column_components(
-            &group.name,
-            &children_by_parent,
-            &resolved,
-        );
+        let penalty_components = hierarchy.concatenated_penalty_components(&group.name);
         let active_cols = penalty_components
             .iter()
             .flat_map(|component| component.iter().copied())

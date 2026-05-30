@@ -1022,56 +1022,19 @@ fn expand_custom_group_base_prior(
     }
 }
 
-fn coefficient_group_concatenated_penalty_components(
-    label: &str,
-    children_by_parent: &BTreeMap<String, Vec<String>>,
-    group_sets: &BTreeMap<String, BTreeSet<(usize, usize)>>,
-) -> Vec<BTreeSet<(usize, usize)>> {
-    let Some(children) = children_by_parent.get(label) else {
-        return vec![
-            group_sets
-                .get(label)
-                .expect("coefficient group set should exist")
-                .clone(),
-        ];
-    };
-    let mut components = Vec::new();
-    for child in children {
-        components.extend(coefficient_group_concatenated_penalty_components(
-            child,
-            children_by_parent,
-            group_sets,
-        ));
-    }
-    components
-}
-
 pub fn realize_coefficient_groups_for_custom_family(
     specs: &[ParameterBlockSpec],
     groups: &[CoefficientGroupSpec],
     base_prior: crate::types::RhoPrior,
 ) -> Result<RealizedCoefficientGroupSpecs, String> {
+    use crate::terms::coefficient_group_resolver::{ResolvedGroup, ResolvedGroupHierarchy};
+
     validate_blockspecs(specs)?;
-    let mut seen = BTreeSet::<String>::new();
+    // Carrier-specific validation. The prior and the custom-only
+    // `initial_log_precision` field are validated here because they have no
+    // analogue on the standard-term carrier; label, duplicate, empty-set, and
+    // hierarchy checks are delegated to the shared resolver below.
     for group in groups {
-        if group.label.trim().is_empty() {
-            return Err(CustomFamilyError::ConstraintViolation {
-                reason: "coefficient group label must not be empty".to_string(),
-            }
-            .into());
-        }
-        if !seen.insert(group.label.clone()) {
-            return Err(CustomFamilyError::ConstraintViolation {
-                reason: format!("duplicate coefficient group label '{}'", group.label),
-            }
-            .into());
-        }
-        if group.coefficients.is_empty() {
-            return Err(format!(
-                "coefficient group '{}' contains no coefficients",
-                group.label
-            ));
-        }
         if let Some(prior) = group.prior.as_ref() {
             prior.validate(&format!("coefficient group '{}'", group.label))?;
         }
@@ -1088,102 +1051,45 @@ pub fn realize_coefficient_groups_for_custom_family(
         }
     }
 
-    let mut realized_groups = Vec::<RealizedCoefficientGroup>::with_capacity(groups.len());
-    let mut group_sets = BTreeMap::<String, BTreeSet<(usize, usize)>>::new();
-    for group in groups {
-        let mut coeffs = BTreeSet::<(usize, usize)>::new();
-        for label in &group.coefficients {
-            let block_idx = coefficient_group_block_index(specs, &label.block)?;
-            let p = specs[block_idx].design.ncols();
-            if label.column >= p {
-                return Err(format!(
-                    "coefficient group '{}' references column {} in block '{}' (index {block_idx}), but the block has {p} columns",
-                    group.label, label.column, specs[block_idx].name
-                ));
+    // Carrier = `(block_idx, column)` coordinates of the parameter blocks.
+    // Resolve every declared label into its coordinate set, then hand the
+    // carrier-agnostic policy (labels, hierarchy, subsets, child unions) to the
+    // shared resolver.
+    let resolved_groups = groups
+        .iter()
+        .map(|group| {
+            let mut coordinates = BTreeSet::<(usize, usize)>::new();
+            for label in &group.coefficients {
+                let block_idx = coefficient_group_block_index(specs, &label.block)?;
+                let p = specs[block_idx].design.ncols();
+                if label.column >= p {
+                    return Err(format!(
+                        "coefficient group '{}' references column {} in block '{}' (index {block_idx}), but the block has {p} columns",
+                        group.label, label.column, specs[block_idx].name
+                    ));
+                }
+                coordinates.insert((block_idx, label.column));
             }
-            coeffs.insert((block_idx, label.column));
-        }
-        group_sets.insert(group.label.clone(), coeffs.clone());
-        realized_groups.push(RealizedCoefficientGroup {
+            Ok(ResolvedGroup {
+                label: group.label.clone(),
+                parent: group.parent.clone(),
+                coordinates,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let hierarchy = ResolvedGroupHierarchy::build(resolved_groups)?;
+
+    let realized_groups = groups
+        .iter()
+        .zip(hierarchy.groups())
+        .map(|(group, resolved)| RealizedCoefficientGroup {
             label: group.label.clone(),
             parent: group.parent.clone(),
-            coefficients: coeffs.iter().copied().collect(),
+            coefficients: resolved.coordinates.iter().copied().collect(),
             prior: group.prior.clone(),
             initial_log_precision: group.initial_log_precision.unwrap_or(0.0),
-        });
-    }
-
-    let parent_by_label: BTreeMap<String, Option<String>> = groups
-        .iter()
-        .map(|group| (group.label.clone(), group.parent.clone()))
-        .collect();
-    let mut children_by_parent = BTreeMap::<String, Vec<String>>::new();
-    for group in groups {
-        if let Some(parent) = group.parent.as_ref() {
-            children_by_parent
-                .entry(parent.clone())
-                .or_default()
-                .push(group.label.clone());
-        }
-    }
-    for group in &realized_groups {
-        let mut path = BTreeSet::<String>::new();
-        let mut cursor = Some(group.label.as_str());
-        while let Some(label) = cursor {
-            if !path.insert(label.to_string()) {
-                return Err(CustomFamilyError::ConstraintViolation {
-                    reason: format!(
-                        "coefficient group hierarchy contains a cycle involving '{label}'"
-                    ),
-                }
-                .into());
-            }
-            cursor = parent_by_label
-                .get(label)
-                .ok_or_else(|| {
-                    format!("coefficient group hierarchy references unknown group '{label}'")
-                })?
-                .as_deref();
-        }
-        if let Some(parent) = group.parent.as_ref() {
-            let parent_set = group_sets.get(parent).ok_or_else(|| {
-                format!(
-                    "coefficient group '{}' references unknown parent group '{parent}'",
-                    group.label
-                )
-            })?;
-            let child_set = group_sets
-                .get(&group.label)
-                .expect("realized group set should exist");
-            if !child_set.is_subset(parent_set) {
-                return Err(CustomFamilyError::ConstraintViolation {
-                    reason: format!(
-                        "coefficient group '{}' is not a subset of parent group '{parent}'",
-                        group.label
-                    ),
-                }
-                .into());
-            }
-        }
-        if let Some(children) = children_by_parent.get(&group.label) {
-            let mut child_union = BTreeSet::<(usize, usize)>::new();
-            for child in children {
-                let child_set = group_sets
-                    .get(child)
-                    .expect("child group set should exist after resolution");
-                child_union.extend(child_set.iter().copied());
-            }
-            let parent_set = group_sets
-                .get(&group.label)
-                .expect("parent group set should exist after resolution");
-            if &child_union != parent_set {
-                return Err(CustomFamilyError::ConstraintViolation { reason: format!(
-                    "coefficient group '{}' has children but its coefficients are not exactly the union of its child groups; nested supergroups concatenate child coefficients",
-                    group.label
-                ) }.into());
-            }
-        }
-    }
+        })
+        .collect::<Vec<_>>();
 
     let mut realized_specs = specs.to_vec();
     let mut penalty_labels = Vec::<String>::new();
@@ -1242,11 +1148,7 @@ pub fn realize_coefficient_groups_for_custom_family(
         // not a block-sum shortcut: overlapping children remain separate
         // factors, so their log normalizers and quadratic contributions both
         // add.
-        let penalty_components = coefficient_group_concatenated_penalty_components(
-            &group.label,
-            &children_by_parent,
-            &group_sets,
-        );
+        let penalty_components = hierarchy.concatenated_penalty_components(&group.label);
         for component in penalty_components {
             let mut by_block = BTreeMap::<usize, Vec<usize>>::new();
             for &(block_idx, column) in &component {

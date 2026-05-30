@@ -13,7 +13,7 @@
 //! the two engines rather than a tuning disagreement.
 //!
 //! We fix curvature `c = -1` (`k = 1`, ball radius `1/√k = 1`) — the default
-//! `geomstats.geometry.hyperbolic.Hyperbolic` / `PoincareBall` metric — feed
+//! `geomstats.geometry.poincare_ball.PoincareBall(dim).metric` — feed
 //! BOTH engines the *same* fixed-seed random tangent vectors `v` whose norms
 //! span `[1e-8, 0.95]` (strictly below the saturation radius) across
 //! dimensions `d ∈ {2, 4, 8}`, and assert:
@@ -99,7 +99,8 @@ fn gam_poincare_exp_log_roundtrip_matches_geomstats() {
     let mut rng = Lcg::new(0x5EED_C0FF_EE15_600D);
     // Flatten every vector into a single padded matrix so it can ride the CSV
     // wire to Python: row = one tangent vector, columns c0..c7 (zeros beyond
-    // the row's own dimension), plus the row's true dimension and norm.
+    // the row's own dimension), plus the row's true dimension `dim` so Python
+    // reads only the first `dim` entries of each padded row.
     let max_d = *dims.iter().max().expect("dims non-empty");
     let mut vectors: Vec<Vec<f64>> = Vec::new();
     let mut row_dim: Vec<f64> = Vec::new();
@@ -152,8 +153,7 @@ fn gam_poincare_exp_log_roundtrip_matches_geomstats() {
         &columns,
         r#"
 import numpy as np
-import geomstats.backend as gs
-from geomstats.geometry.hyperbolic import Hyperbolic
+from geomstats.geometry.poincare_ball import PoincareBall
 
 # Column-major rebuild of every tangent vector (rows shorter than max_d are
 # zero-padded; only the first `dim` entries are physically meaningful).
@@ -170,24 +170,23 @@ self_l2 = []
 self_maxabs = []
 
 # Group rows by dimension so we hand each PoincareBall metric vectors of its
-# own intrinsic dimension. c = -1 is the geomstats default scale (k = 1).
+# own intrinsic dimension. The default-scale PoincareBall is the curvature
+# c = -1 (k = 1) unit ball — the same metric gam evaluates. `PoincareBall`
+# attaches its PoincareBallMetric in __init__; .metric.exp / .metric.log are
+# the closed-form tanh / artanh tangent maps.
 for d in sorted(set(int(x) for x in dim_arr)):
     idx = np.where(dim_arr == d)[0]
-    ball = Hyperbolic(dim=d, default_coords_type="ball")
-    metric = ball.metric
-    origin = gs.zeros(d)
-    V = mat[idx, :d]                      # tangent vectors at the origin
+    metric = PoincareBall(d).metric
+    V = mat[idx, :d]                              # tangent vectors at the origin
     # exp_0(v) and log_0(exp_0(v)); base_point is the origin for every row.
-    base = gs.array(np.tile(origin, (len(idx), 1)))
-    Vg = gs.array(V)
-    Y = metric.exp(Vg, base)             # points on the ball
-    B = metric.log(Y, base)              # back to the tangent space
-    Y = np.asarray(Y, dtype=float)
-    B = np.asarray(B, dtype=float)
+    # geomstats signature: exp(tangent_vec, base_point), log(point, base_point).
+    origin = np.zeros((len(idx), d), dtype=float)
+    Y = np.asarray(metric.exp(V, origin), dtype=float)   # points on the ball
+    B = np.asarray(metric.log(Y, origin), dtype=float)   # back to tangent space
     exp_flat[np.ix_(idx, range(d))] = Y
     round_flat[np.ix_(idx, range(d))] = B
     # geomstats' OWN round-trip error per row.
-    for r, gi in enumerate(idx):
+    for r in range(len(idx)):
         v = V[r]
         b = B[r]
         denom = np.sqrt(np.sum(v * v))

@@ -871,29 +871,15 @@ impl CubicMomentBackend {
 
     #[cfg(target_os = "linux")]
     fn probe_linux() -> Result<Self, GpuError> {
-        let runtime = super::runtime::GpuRuntime::global().ok_or_else(|| {
-            GpuError::DriverLibraryUnavailable {
-                reason: "cubic_bspline_moments backend: no CUDA runtime available".to_string(),
-            }
-        })?;
-        let ordinal = runtime.selected_device().ordinal;
-        let ctx = super::runtime::cuda_context_for(ordinal).ok_or_else(|| {
-            gpu_err!(
-                "cubic_bspline_moments backend: failed to create CUDA context for device {ordinal}"
-            )
-        })?;
-        let stream = ctx.default_stream();
-        let cap = &runtime.selected_device().capability;
-        let cc_major = cap.compute_major;
-        let cc_minor = cap.compute_minor;
+        let parts = super::backend_probe::probe_cuda_backend("cubic_bspline_moments")?;
         Ok(CubicMomentBackend {
             inner: CubicMomentBackendInner {
-                ctx,
-                stream,
+                ctx: parts.ctx,
+                stream: parts.stream,
                 modules: Mutex::new(HashMap::new()),
                 tet_modules: Mutex::new(HashMap::new()),
-                cc_major,
-                cc_minor,
+                cc_major: parts.capability.compute_major,
+                cc_minor: parts.capability.compute_minor,
             },
         })
     }

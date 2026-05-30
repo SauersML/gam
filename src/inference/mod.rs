@@ -7,6 +7,7 @@ pub mod generative;
 pub mod hmc;
 pub mod identifiability;
 pub mod model;
+pub mod model_payload_builders;
 pub mod polya_gamma;
 pub mod polya_gamma_core;
 pub mod posterior;

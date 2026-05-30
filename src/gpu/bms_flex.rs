@@ -354,24 +354,11 @@ impl BmsFlexGpuBackend {
 
     #[cfg(target_os = "linux")]
     fn probe_linux() -> Result<Self, GpuError> {
-        let runtime = super::runtime::GpuRuntime::global().ok_or_else(|| {
-            GpuError::DriverLibraryUnavailable {
-                reason: "bms_flex backend: no CUDA runtime available".to_string(),
-            }
-        })?;
-        let ctx = super::runtime::cuda_context_for(runtime.selected_device().ordinal).ok_or_else(
-            || {
-                gpu_err!(
-                    "bms_flex backend: failed to create CUDA context for device {}",
-                    runtime.selected_device().ordinal
-                )
-            },
-        )?;
-        let stream = ctx.default_stream();
+        let parts = super::backend_probe::probe_cuda_backend("bms_flex")?;
         let backend = BmsFlexGpuBackend {
             inner: BmsFlexGpuContextLinux {
-                ctx,
-                stream,
+                ctx: parts.ctx,
+                stream: parts.stream,
                 module: PtxModuleCache::new(),
                 arena: Mutex::new(DeviceArena::default()),
             },

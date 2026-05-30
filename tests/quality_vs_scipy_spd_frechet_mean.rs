@@ -36,7 +36,9 @@ const ITERS: usize = 100; // fixed-point iterations (matches the reference)
 /// symmetric; we symmetrize defensively to kill round-off asymmetry before
 /// handing the flat buffer to gam.
 fn symmetrize(a: &Array2<f64>) -> Array2<f64> {
-    0.5 * (&a.view() + &a.t())
+    let mut s = a + &a.t();
+    s *= 0.5;
+    s
 }
 
 /// Row-major flatten of an `N×N` matrix into the `N*N` ambient vector that
@@ -127,7 +129,7 @@ def sym_eig_map(P, f):
     return (V * f(w)) @ V.T
 
 def spd_log(P, Q):
-    # Affine-invariant log_P(Q) = P^{1/2} log(P^{-1/2} Q P^{-1/2}) P^{1/2}.
+    # Affine-invariant log_P(Q) = sqrt(P) . log( isqrt(P) Q isqrt(P) ) . sqrt(P).
     sp = sym_eig_map(P, np.sqrt)
     isp = sym_eig_map(P, lambda x: 1.0 / np.sqrt(x))
     mid = isp @ Q @ isp
@@ -135,7 +137,7 @@ def spd_log(P, Q):
     return sp @ lm @ sp
 
 def spd_exp(P, U):
-    # Affine-invariant exp_P(U) = P^{1/2} expm(P^{-1/2} U P^{-1/2}) P^{1/2}.
+    # Affine-invariant exp_P(U) = sqrt(P) . expm( isqrt(P) U isqrt(P) ) . sqrt(P).
     sp = sym_eig_map(P, np.sqrt)
     isp = sym_eig_map(P, lambda x: 1.0 / np.sqrt(x))
     mid = 0.5 * (isp @ U @ isp + (isp @ U @ isp).T)  # exp of a symmetric mat

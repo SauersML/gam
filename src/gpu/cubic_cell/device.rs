@@ -111,23 +111,11 @@ impl CubicCellGpuBackend {
 
     #[cfg(target_os = "linux")]
     fn probe_linux() -> Result<Self, GpuError> {
-        let runtime = crate::gpu::runtime::GpuRuntime::global().ok_or_else(|| {
-            GpuError::DriverLibraryUnavailable {
-                reason: "cubic_cell backend: no CUDA runtime available".to_string(),
-            }
-        })?;
-        let ctx = crate::gpu::runtime::cuda_context_for(runtime.selected_device().ordinal)
-            .ok_or_else(|| {
-                gpu_err!(
-                    "cubic_cell backend: failed to create CUDA context for device {}",
-                    runtime.selected_device().ordinal
-                )
-            })?;
-        let stream = ctx.default_stream();
+        let parts = crate::gpu::backend_probe::probe_cuda_backend("cubic_cell")?;
         Ok(CubicCellGpuBackend {
             inner: CubicCellGpuContextLinux {
-                ctx,
-                stream,
+                ctx: parts.ctx,
+                stream: parts.stream,
                 modules: Mutex::new(std::collections::HashMap::new()),
             },
         })

@@ -484,24 +484,11 @@ impl SurvivalFlexGpuBackend {
 
     #[cfg(target_os = "linux")]
     fn probe_linux() -> Result<Self, GpuError> {
-        let runtime = super::runtime::GpuRuntime::global().ok_or_else(|| {
-            GpuError::DriverLibraryUnavailable {
-                reason: "survival_flex backend: no CUDA runtime available".to_string(),
-            }
-        })?;
-        let ctx = super::runtime::cuda_context_for(runtime.selected_device().ordinal).ok_or_else(
-            || GpuError::DriverCallFailed {
-                reason: format!(
-                    "survival_flex backend: failed to create CUDA context for device {}",
-                    runtime.selected_device().ordinal
-                ),
-            },
-        )?;
-        let stream = ctx.default_stream();
+        let parts = super::backend_probe::probe_cuda_backend("survival_flex")?;
         let backend = SurvivalFlexGpuBackend {
             inner: SurvivalFlexGpuContextLinux {
-                ctx,
-                stream,
+                ctx: parts.ctx,
+                stream: parts.stream,
                 module: PtxModuleCache::new(),
                 arena: Mutex::new(DeviceArena::default()),
             },

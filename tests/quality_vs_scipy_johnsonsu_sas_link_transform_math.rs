@@ -135,11 +135,18 @@ def delta_of(ld):
 
 def cdf(e, ep, ld):
     # exact gam transform: mu = Phi(sinh(B*tanh((delta*asinh(eta)-eps)/B)))
+    # gam takes a probit shortcut (latent z == eta) whenever eps==0 and
+    # delta==1; the FD reference MUST evaluate the identical function gam does,
+    # so replicate that shortcut elementwise — otherwise the full chain's
+    # ~O((asinh(eta)/B)^2) deviation from the identity at those points would
+    # make the FD compare gam's pdf against the derivative of a *different*
+    # function and the cross-check would fail for a bogus reason.
     d = delta_of(ld)
     a = np.arcsinh(e)
     ur = d * a - ep
     z = np.sinh(B * np.tanh(ur / B))
-    return Phi(z)
+    shortcut = (np.abs(ep) < 1e-12) & (np.abs(d - 1.0) < 1e-12)
+    return Phi(np.where(shortcut, e, z))
 
 mu = np.empty_like(eta)
 d1 = np.empty_like(eta)

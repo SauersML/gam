@@ -17,8 +17,14 @@
 //! reference that forms the identical weighted sum of `plogis`, `pnorm`, and the
 //! cloglog inverse `1 - exp(-exp(η))`. Because this is pure link arithmetic with
 //! no fitting uncertainty on either side, the two must agree to ~machine
-//! precision: rel_l2 < 1e-3 and pearson > 0.99999 are deliberately conservative
-//! (gam achieves ~1e-15 here) yet still flag any real divergence in the blend.
+//! precision. gam's probit uses the exact special function Φ(x)=½erfc(−x/√2)
+//! (same form R's `pnorm` evaluates), while logit/cloglog are elementary; the
+//! only divergence is cross-library round-off in the special functions and the
+//! 17-significant-digit CSV round-trip, so the achievable agreement is ~1e-13.
+//! We therefore assert the *tight* bounds rel_l2 < 1e-11 and pearson > 1 − 1e-13:
+//! still a hair above f64 round-off, but six-plus orders tighter than a token
+//! 1e-3, so a misweighted component, a value/derivative mixup, or a swapped link
+//! cannot hide behind a high correlation.
 //!
 //! We additionally assert the simplex contract gam's softmax must satisfy
 //! (π_j ≥ 0, Σπ_j = 1 to machine precision) and the identifiability convention
@@ -173,14 +179,16 @@ fn mixture_link_blend_matches_handcoded_reference() {
     );
 
     // Pure link arithmetic on both sides => agreement is limited only by f64
-    // round-off (gam computes ~1e-15 here). 1e-3 / 0.99999 are far looser than
-    // the achievable precision yet would catch any real blend/weight/link bug.
+    // round-off: identical η, identical weights, and identical inverse-link
+    // closed forms (gam's Φ is the same ½erfc(−x/√2) that R's pnorm computes).
+    // The bounds sit just above that round-off floor so any real blend/weight/
+    // link defect is caught rather than masked by a loose tolerance.
     assert!(
-        rel < 1e-3,
+        rel < 1e-11,
         "mixture μ̂ diverges from hand-coded blend: rel_l2={rel:.3e}"
     );
     assert!(
-        corr > 0.99999,
-        "mixture μ̂ shape disagrees with hand-coded blend: pearson={corr:.12}"
+        corr > 1.0 - 1e-13,
+        "mixture μ̂ shape disagrees with hand-coded blend: pearson={corr:.15}"
     );
 }

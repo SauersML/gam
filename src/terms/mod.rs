@@ -3,6 +3,7 @@ pub mod atom_codes;
 pub mod atom_selection;
 pub mod basis;
 pub mod closed_form_operator;
+pub mod coefficient_group_resolver;
 pub mod construction;
 pub mod equivariant_penalty;
 pub mod gated_decoder;
