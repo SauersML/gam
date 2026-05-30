@@ -25121,7 +25121,7 @@ pub(crate) mod internal {
 
     /// Thread-local scratch buffers for spline evaluation. These are reused across
     /// points to reduce allocation and improve cache locality.
-    #[derive(Clone, Debug)]
+    #[derive(Clone, Debug, Default)]
     pub struct BsplineScratch {
         left: Vec<f64>,
         right: Vec<f64>,

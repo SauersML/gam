@@ -47,8 +47,8 @@ use crate::pirls::LinearInequalityConstraints;
 use crate::probability::erfcx_nonnegative;
 use crate::probability::{normal_cdf, normal_pdf};
 use crate::smooth::{
-    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
-    TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
+    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, TermCollectionDesign,
+    TermCollectionSpec, build_term_collection_design,
     freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices,
 };
@@ -3693,10 +3693,12 @@ impl crate::custom_family::SpatialPsiBlockTransform for SurvivalTimeVaryingPsiTr
 
     fn transform_design(&self, base: Array2<f64>) -> Array2<f64> {
         let base_dm = DesignMatrix::Dense(DenseDesignMatrix::from(base));
-        let exit_cow = rowwise_kronecker(&base_dm, &self.time_basis_exit).to_dense_cow();
-        let entry_cow = rowwise_kronecker(&base_dm, &self.time_basis_entry).to_dense_cow();
-        let deriv_cow =
-            rowwise_kronecker(&base_dm, &self.time_basis_derivative_exit).to_dense_cow();
+        let exit_design = rowwise_kronecker(&base_dm, &self.time_basis_exit);
+        let entry_design = rowwise_kronecker(&base_dm, &self.time_basis_entry);
+        let deriv_design = rowwise_kronecker(&base_dm, &self.time_basis_derivative_exit);
+        let exit_cow = exit_design.to_dense_cow();
+        let entry_cow = entry_design.to_dense_cow();
+        let deriv_cow = deriv_design.to_dense_cow();
         let n = exit_cow.nrows();
         let p = exit_cow.ncols();
         let mut stacked = Array2::<f64>::zeros((3 * n, p));
