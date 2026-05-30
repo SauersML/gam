@@ -22597,12 +22597,11 @@ mod tests {
         if let Some(w) = &sl.link_dev {
             out.slice_mut(s![w.clone(), w.clone()]).assign(&acc.h_ww);
         }
-        let mut place = |r: std::ops::Range<usize>,
-                         c: std::ops::Range<usize>,
-                         m: ArrayView2<'_, f64>| {
-            out.slice_mut(s![r.clone(), c.clone()]).assign(&m);
-            out.slice_mut(s![c, r]).assign(&m.t());
-        };
+        let mut place =
+            |r: std::ops::Range<usize>, c: std::ops::Range<usize>, m: ArrayView2<'_, f64>| {
+                out.slice_mut(s![r.clone(), c.clone()]).assign(&m);
+                out.slice_mut(s![c, r]).assign(&m.t());
+            };
         place(sl.time.clone(), sl.marginal.clone(), acc.h_tm.view());
         place(sl.time.clone(), sl.logslope.clone(), acc.h_tg.view());
         place(sl.marginal.clone(), sl.logslope.clone(), acc.h_mg.view());
@@ -22637,7 +22636,8 @@ mod tests {
             let got = acc.to_dense(&sl);
             let want = parity_reference_dense(&acc, &sl);
             assert_eq!(
-                got, want,
+                got,
+                want,
                 "to_dense diverged from hand scatter for layout {:?}",
                 (pt, pm, pg, ph, pw)
             );
@@ -22652,7 +22652,8 @@ mod tests {
             let got = acc.diagonal(&sl);
             let want = parity_reference_dense(&acc, &sl).diag().to_owned();
             assert_eq!(
-                got, want,
+                got,
+                want,
                 "diagonal diverged from dense diagonal for layout {:?}",
                 (pt, pm, pg, ph, pw)
             );
@@ -22702,7 +22703,8 @@ mod tests {
             let op = acc.into_operator(sl.clone());
             let via_op = op.to_dense();
             assert_eq!(
-                direct, via_op,
+                direct,
+                via_op,
                 "operator to_dense diverged from accumulator to_dense for layout {:?}",
                 (pt, pm, pg, ph, pw)
             );
