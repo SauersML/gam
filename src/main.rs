@@ -77,8 +77,7 @@ use gam::survival_construction::{
     SavedSurvivalTimeBasis, SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
     SurvivalTimeBasisConfig, SurvivalTimeBuildOutput, add_survival_time_derivative_guard_offset,
     baseline_chain_rule_gradient, build_survival_time_basis,
-    build_survival_time_offsets_for_likelihood,
-    build_survival_timewiggle_from_baseline, build_time_varying_survival_covariate_template,
+    build_survival_time_offsets_for_likelihood, build_time_varying_survival_covariate_template,
     center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
     initial_survival_baseline_config_for_fit, location_scale_uses_probit_survival_baseline,
     marginal_slope_baseline_chain_rule_gradient, marginal_slope_baseline_chain_rule_hessian,
@@ -93,8 +92,7 @@ use gam::survival_construction::{
 use gam::survival_location_scale::{
     SurvivalCovariateTermBlockTemplate, SurvivalLocationScalePredictInput,
     SurvivalLocationScaleTermSpec, TimeBlockInput, predict_survival_location_scale,
-    project_onto_linear_constraints,
-    residual_distribution_inverse_link,
+    project_onto_linear_constraints, residual_distribution_inverse_link,
 };
 use gam::survival_marginal_slope::SurvivalMarginalSlopeTermSpec;
 use gam::survival_predict::{
@@ -9598,6 +9596,7 @@ mod tests {
         TermCollectionSpec,
     };
     use gam::survival_construction::build_survival_baseline_offsets;
+    use gam::survival_construction::build_survival_timewiggle_from_baseline;
     use gam::survival_construction::parse_survival_baseline_config;
     use gam::survival_construction::{SurvivalBaselineConfig, evaluate_survival_baseline};
     use gam::survival_location_scale::{ResidualDistribution, project_onto_linear_constraints};
@@ -14349,7 +14348,7 @@ mod tests {
             "timewiggle(degree=3, internal_knots=4)",
         )
         .expect("baseline-timewiggle cfg");
-        let built = super::build_survival_timewiggle_from_baseline(
+        let built = build_survival_timewiggle_from_baseline(
             &eta_entry,
             &eta_exit,
             &derivative_exit,
@@ -14667,7 +14666,7 @@ mod tests {
             "timewiggle(degree=3, internal_knots=4)",
         )
         .expect("baseline-timewiggle cfg");
-        let built = super::build_survival_timewiggle_from_baseline(
+        let built = build_survival_timewiggle_from_baseline(
             &eta_entry,
             &eta_exit,
             &derivative_exit,
