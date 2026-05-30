@@ -481,7 +481,7 @@ emit("cif_tx", cif_on_grid(2))
     // useful CIF must beat this comfortably; it anchors the absolute bar.
     let zero_pred = |cause_idx: usize, j: usize| -> Vec<f64> {
         // covariate-free, horizon-free null: predict 0 for everyone.
-        debug_assert!(cause_idx < 2 && j < grid.len());
+        assert!(cause_idx < 2 && j < grid.len());
         vec![0.0; n]
     };
     let null_brier_death = brier_over_grid(1.0, 0, &zero_pred);
