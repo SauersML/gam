@@ -3,17 +3,25 @@
 //! `scipy.stats.multivariate_normal` samples *exactly*.
 //!
 //! Comparator: **scipy.stats** (exact ground truth). For a Gaussian likelihood
-//! with identity link and a Gaussian (improper-on-the-nullspace) prior
-//! `β ~ N(0, (λP)^-)`, the posterior over coefficients is available in closed
-//! form — this is the textbook conjugate Bayesian linear model:
+//! with identity link and the GAM smoothing penalty `S_λ = λP` entering on the
+//! φ=1 scale, gam's NUTS targets the log-posterior
 //!
-//!     Σ_post = (Xᵀ X / σ² + λP)⁻¹ ,   μ_post = Σ_post · (Xᵀ y / σ²) .
+//!     log p(β) ∝ −(1/2φ)·[ (y − Xβ)ᵀ(y − Xβ) + βᵀ S_λ β ] ,
+//!
+//! whose normal form is the standard mgcv Bayesian posterior `N(μ_post, Vb)`:
+//!
+//!     H = XᵀX + S_λ ,   Vb = Σ_post = φ·H⁻¹ ,   μ_post = H⁻¹·(Xᵀ y) .
+//!
+//! Both the likelihood AND the penalty are φ-scaled (this is the `Vb = φ·H⁻¹`
+//! module invariant in `inference::dispersion_cov`, NOT the classical
+//! conjugate-regression prior precision `S` that is φ-independent). This normal
+//! posterior is available in closed form, so `scipy.stats.multivariate_normal`
+//! samples it exactly.
 //!
 //! gam's NUTS path whitens the coefficient space with the *fitted penalized
-//! Hessian* `H = XᵀX/φ + S_λ` as the mass matrix and draws with the φ-scaled
-//! covariance `φ·H⁻¹`. For Gaussian identity with σ² = φ that is precisely
-//! `Σ_post` above, so gam's draws must reproduce scipy's exact posterior. This
-//! is the cleanest possible check of gam's whitening + Cholesky-inversion
+//! Hessian* (the φ-scaled `(1/φ)·H`) as the mass matrix and draws the φ-scaled
+//! covariance `φ·H⁻¹`, so gam's draws must reproduce scipy's exact posterior.
+//! This is the cleanest possible check of gam's whitening + Cholesky-inversion
 //! machinery (`explicit_fit_hessian_for_whitening` →
 //! `run_nuts_sampling_flattened_family`): a real divergence is a real bug in
 //! the sampler's mass matrix or the triangular solve.
@@ -92,8 +100,9 @@ fn gam_nuts_posterior_matches_scipy_exact_conjugate_gaussian() {
     assert!(phi.is_finite() && phi > 0.0, "fitted dispersion must be positive, got {phi}");
 
     // ---- run gam's NUTS over the coefficient vector -----------------------
-    // We whiten with the SAVED penalized Hessian H = XᵀX/φ + S_λ (the exact
-    // function the CLI `sample` path uses) and draw the φ-scaled posterior.
+    // We whiten with the SAVED penalized Hessian H = XᵀX + S_λ (the exact
+    // function the CLI `sample` path uses; the sampler scales the Cholesky by
+    // √φ so the drawn covariance is the φ-scaled posterior φ·H⁻¹).
     // One chain, 10k post-warmup draws: this convex Gaussian target mixes
     // immediately, so the Monte-Carlo error on each coordinate mean is
     // ~ sd/sqrt(10000) ≈ sd/100.
@@ -158,11 +167,18 @@ sigma2 = float(df["dims"].to_numpy()[2])
 X = df["x_flat"].to_numpy()[: n * p].reshape(n, p)
 S = df["s_flat"].to_numpy()[: p * p].reshape(p, p)
 y = df["y"].to_numpy()[:n]
-# Conjugate Gaussian posterior with prior precision S = lambda*P:
-#   Sigma_post = (X'X/sigma2 + S)^-1 ,  mu_post = Sigma_post @ (X'y / sigma2).
-prec = X.T @ X / sigma2 + S
-cov = np.linalg.inv(prec)
-mu = cov @ (X.T @ y / sigma2)
+# Penalized-Gaussian (mgcv "Vb") posterior. gam's NUTS targets
+#   log p(beta) ∝ -1/(2*sigma2) * [ (y - X beta)'(y - X beta) + beta' S beta ],
+# i.e. BOTH the likelihood and the penalty S_lambda live on the sigma2=phi
+# scale, giving the standard GAM Bayesian covariance Vb = sigma2 * H^-1 with
+# the *unscaled* penalized Hessian H = X'X + S. (This is the mgcv convention:
+# S_lambda is defined at phi=1 and the whole posterior is phi-scaled, NOT the
+# classical conjugate-regression prior precision S that is independent of phi.)
+#   H = X'X + S ,  Sigma_post = sigma2 * H^-1 ,  mu_post = H^-1 @ (X'y).
+H = X.T @ X + S
+H_inv = np.linalg.inv(H)
+cov = sigma2 * H_inv
+mu = H_inv @ (X.T @ y)
 # Exact analytic posterior sd of each coefficient (sqrt of diagonal).
 sd_exact = np.sqrt(np.clip(np.diag(cov), 0.0, None))
 # Draw 10k i.i.d. samples from the exact posterior to mirror gam's NUTS run.
