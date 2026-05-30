@@ -357,7 +357,7 @@ fn gam_smooth_covariate_matches_rstpm2_pstpm2_on_bone() {
 
     // ---- fit the SAME model with rstpm2::pstpm2 ---------------------------
     // pstpm2 fits a PENALIZED generalized survival model on the log-cumulative-
-    // hazard scale (link="PH" => log Λ): s(log t) baseline + s(Age) + s(x) smooth
+    // hazard scale (link.type="PH" => log Λ): s(log t) baseline + s(Age) + s(x) smooth
     // covariates, smoothing parameters by REML (criterion="REML"). We read back:
     //   * total edf (sum of per-term edf),
     //   * the ∂ log Λ / ∂x slope surface via central FD of predict(type="link")
@@ -391,13 +391,24 @@ fn gam_smooth_covariate_matches_rstpm2_pstpm2_on_bone() {
 
             # Penalized generalized survival model: penalized cubic splines s(.)
             # on the covariates plus a penalized log-time baseline, REML smoothing.
+            # `link.type = "PH"` (rstpm2's argument is link.type, not link) gives
+            # g(S) = log(-log S) = log Λ, the transformation estimand. The baseline
+            # is an explicit penalized spline of log(t) to mirror gam's penalized
+            # I-spline log-time baseline rather than relying on the package default.
             m <- pstpm2(Surv(t, event) ~ s(Age) + s(x_continuous), data = df,
-                        link = "PH", criterion = "REML")
+                        smooth.formula = ~ s(log(t)),
+                        link.type = "PH", criterion = "REML")
 
-            # Total effective degrees of freedom (sum over penalized blocks).
-            ed <- tryCatch(sum(m@edf), error = function(e) NA_real_)
-            if (!is.finite(ed)) {{
-              ed <- tryCatch(sum(extractAIC(m)[1]), error = function(e) NA_real_)
+            # Total effective degrees of freedom of the penalized fit (baseline
+            # spline + both covariate splines + parametric terms), the REML-selected
+            # complexity comparable to gam's edf_total. pstpm2 stores the penalized
+            # working fit's effective df as the trace of the smoother/hat operator
+            # in edf_var; sum it. Fall back to the coefficient count only if the
+            # slot is unavailable (guards version drift, never silently a scalar).
+            ed <- tryCatch(sum(as.numeric(m@args$edf_var)),
+                           error = function(e) NA_real_)
+            if (!is.finite(ed) || ed <= 0) {{
+              ed <- tryCatch(length(coef(m)), error = function(e) NA_real_)
             }}
             emit("edf", ed)
 
