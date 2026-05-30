@@ -14477,10 +14477,7 @@ impl SurvivalMarginalSlopeFamily {
     ) -> Result<Array2<f64>, String> {
         let slices = block_slices(self, block_states);
         let p_total = slices.total;
-        let p_time = slices.time.len();
-        let p_marginal = slices.marginal.len();
         let time_tail = self.time_wiggle_range();
-        let p_base = time_tail.start;
         let d_time = d_beta_flat.slice(s![slices.time.clone()]);
         let d_marginal = d_beta_flat.slice(s![slices.marginal.clone()]);
         let beta_time = &block_states[0].beta;
@@ -14567,10 +14564,7 @@ impl SurvivalMarginalSlopeFamily {
         let primary = flex_primary_slices(self);
         let identity_blocks = flex_identity_block_pairs(&primary, &slices);
         let p_total = slices.total;
-        let p_time = slices.time.len();
-        let p_marginal = slices.marginal.len();
         let time_tail = self.time_wiggle_range();
-        let p_base = time_tail.start;
         let d_time = d_beta_flat.slice(s![slices.time.clone()]);
         let d_marginal = d_beta_flat.slice(s![slices.marginal.clone()]);
         let beta_time = &block_states[0].beta;
