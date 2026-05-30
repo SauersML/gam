@@ -391,7 +391,7 @@ fn alo_loo_recovers_truth_and_matches_exact_brute_force_poisson_log() {
     let se_max_diff = max_abs_diff(alo_se, &brute_se_bayes);
 
     eprintln!(
-        "ALO Poisson/log te(x1,x2): n={n} p={p} signal_range={signal_range:.3f}\n  \
+        "ALO Poisson/log te(x1,x2): n={n} p={p} signal_range={signal_range:.3}\n  \
          OBJECTIVE  truth-recovery RMSE(eta_tilde,eta_true)={loo_truth_rmse:.4} \
          (={:.2}% of range; exact-brute RMSE={brute_truth_rmse:.4})  \
          deviance in-sample={dev_in_sample:.4} LOO={dev_loo:.4}\n  \

@@ -407,11 +407,7 @@ fn beta_logit_custom_family_recovers_truth_and_generalises() {
         take(&x2, &train_idx),
         take(&y, &train_idx),
     );
-    let (x1_te, x2_te, y_te) = (
-        take(&x1, &test_idx),
-        take(&x2, &test_idx),
-        take(&y, &test_idx),
-    );
+    let y_te = take(&y, &test_idx);
     let n_tr = train_idx.len();
 
     // ── fit gam on the TRAIN rows only, through the custom-family engine ────
