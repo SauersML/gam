@@ -136,10 +136,13 @@ fn gam_pointwise_eta_se_matches_mgcv_on_lidar() {
     // fitted linear predictor as sqrt(diag(X Vb Xᵀ)). The SE is basis-invariant,
     // so the only sources of disagreement are (a) a genuinely different smoothing
     // parameter / scale estimate or (b) a bug in gam's covariance or design path.
-    // mgcv's lidar SE ranges roughly 0.01–0.04; the bounds below are tight enough
-    // that any real divergence in the covariance computation trips them while
-    // still allowing for the small basis/null-space-convention differences
-    // between gam's default thin-plate construction and mgcv's k=10 default.
+    // mgcv's lidar SE ranges ~0.0143–0.0290 (mean ~0.0154) for this REML fit; the
+    // bounds below are tight enough that any real divergence in the covariance
+    // computation trips them (a 5% relative-L2 break is ~0.0008 on this scale, and
+    // the max-abs bound of 0.003 is ~20% of the typical SE — a gross covariance or
+    // design bug distorts the SE far beyond that), while still allowing for the
+    // small basis/null-space-convention differences between gam's default
+    // thin-plate construction and mgcv's k=10 default.
     assert!(
         corr > 0.9999,
         "pointwise eta SE shape must track mgcv near-exactly: pearson={corr:.6}"
