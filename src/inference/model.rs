@@ -2010,6 +2010,14 @@ impl FittedModel {
         // the cyclic invariant f(x₀) = f(x₀ + period) at predict time and
         // shows up as a visible seam in surface plots.
         let periodic_axes = self.training_periodic_axes(training_headers);
+        // Parametric/linear-term axes must never be clipped either: a linear
+        // term's contract is η = β0 + β1·x, i.e. genuine linear extrapolation.
+        // Clamping its input to the training extreme turns predict into a
+        // piecewise-constant plateau outside the training hull and freezes the
+        // prediction SE at the boundary (the clamped x feeds xᵀ Var(β) x), so
+        // credible intervals stop widening with distance from the data. This
+        // mirrors how periodic axes are exempted just above.
+        let linear_axes = self.training_linear_axes(training_headers.len());
         let mut clipped = data.to_owned();
         let mut any_clipped = false;
         for (col_in_training, (header, &(lo, hi))) in
@@ -2025,6 +2033,9 @@ impl FittedModel {
                 continue;
             }
             if periodic_axes.contains(&col_in_training) {
+                continue;
+            }
+            if linear_axes.contains(&col_in_training) {
                 continue;
             }
             let Some(&col_idx) = col_map.get(header) else {
@@ -2097,6 +2108,41 @@ impl FittedModel {
                     }
                 }
                 _ => {}
+            }
+        }
+        out
+    }
+
+    /// Collect the set of training-column indices that feed a parametric/linear
+    /// term — on *any* modelled surface (mean, noise/scale, log-slope). A
+    /// linear term realises the design column `∏ feature_cols` and contributes
+    /// `β·(that product)` to the linear predictor, so its inputs must be allowed
+    /// to take any real value at predict time: clamping them to the training
+    /// range would replace genuine linear extrapolation with a boundary plateau
+    /// (and freeze the prediction SE at the hull edge). Returned indices
+    /// reference `self.training_headers` (training-time layout), matching the
+    /// iteration in `axis_clip_to_training_ranges`. Wilkinson-Rogers `:`
+    /// interactions contribute every column in their `feature_cols` product.
+    fn training_linear_axes(&self, n_training_headers: usize) -> std::collections::HashSet<usize> {
+        let mut out: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut single_specs: Vec<&TermCollectionSpec> = [
+            self.resolved_termspec.as_ref(),
+            self.resolved_termspec_noise.as_ref(),
+            self.resolved_termspec_logslope.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if let Some(specs) = self.resolved_termspec_logslopes.as_ref() {
+            single_specs.extend(specs.iter());
+        }
+        for spec in single_specs {
+            for term in &spec.linear_terms {
+                for col in term.effective_feature_cols() {
+                    if col < n_training_headers {
+                        out.insert(col);
+                    }
+                }
             }
         }
         out
