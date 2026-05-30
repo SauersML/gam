@@ -68,10 +68,10 @@ fn multinomial_logit_matches_statsmodels_mnlogit() {
     }
 
     // True coefficients (intercept + slopes on x1..x4) for the three active
-    // classes, with class 3 as the reference (η_3 ≡ 0). The slope pattern
-    // [+0.5, -0.3, +0.8, 0] from the spec is the per-covariate signature;
-    // distinct per-class intercepts/scaling keep the four classes
-    // well-separated so the fit is well-conditioned.
+    // classes, with class 3 as the reference (η_3 ≡ 0). The moderate
+    // magnitudes (|β| ≤ 0.9) keep per-row class probabilities well spread out
+    // (no row near a 0/1 degenerate), so the sampled labels overlap across
+    // classes and the unpenalized MLE stays finite and well-conditioned.
     let true_beta: [[f64; P]; K - 1] = [
         // class 0: intercept,  x1,   x2,   x3,   x4
         [0.4, 0.5, -0.3, 0.8, 0.0],
@@ -81,9 +81,16 @@ fn multinomial_logit_matches_statsmodels_mnlogit() {
         [0.2, 0.9, 0.1, -0.7, -0.4],
     ];
 
-    // Hard labels via argmax of the *true* softmax probabilities (η_3 ≡ 0).
-    // Deterministic given the deterministic covariates, so both engines fit
-    // exactly the same response — no sampling noise to disagree about.
+    // Labels SAMPLED from the true softmax categorical (η_3 ≡ 0), not argmax.
+    // This is the critical design choice: argmax labels are perfectly linearly
+    // separable, under which the *unpenalized* multinomial MLE is not finite
+    // (coefficients diverge to ±∞ along the separating direction) and neither
+    // gam nor statsmodels would converge to a comparable β. Drawing each label
+    // from its row's categorical distribution produces overlapping classes, so
+    // the unpenalized log-likelihood is strictly concave with a finite, unique
+    // maximizer — the well-posed common target both engines must reach. The
+    // draw uses the same deterministic LCG stream, so the labels (and thus the
+    // data fed to both engines) are byte-identical run to run.
     let mut labels = vec![0usize; N];
     for i in 0..N {
         let xrow = [1.0, x1[i], x2[i], x3[i], x4[i]];
@@ -95,15 +102,27 @@ fn multinomial_logit_matches_statsmodels_mnlogit() {
             }
             eta[a] = e;
         }
-        let mut best = 0usize;
-        let mut best_eta = eta[0];
-        for c in 1..K {
-            if eta[c] > best_eta {
-                best_eta = eta[c];
-                best = c;
+        // Stable softmax over the K linear predictors (eta[K-1] = 0 reference).
+        let max_eta = eta.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let mut probs = [0.0_f64; K];
+        let mut denom = 0.0_f64;
+        for c in 0..K {
+            probs[c] = (eta[c] - max_eta).exp();
+            denom += probs[c];
+        }
+        // next_unif() returns U[-2,2]; rescale that same draw to U[0,1) for the
+        // inverse-CDF categorical sample (no new RNG, keeps the stream aligned).
+        let u01 = (next_unif() + 2.0) / 4.0;
+        let mut cum = 0.0_f64;
+        let mut drawn = K - 1; // fallback to last class on float round-off
+        for c in 0..K {
+            cum += probs[c] / denom;
+            if u01 < cum {
+                drawn = c;
+                break;
             }
         }
-        labels[i] = best;
+        labels[i] = drawn;
     }
 
     // ---- gam: build the linear design X = [1, x1, x2, x3, x4] -------------

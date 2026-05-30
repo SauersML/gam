@@ -162,7 +162,6 @@ x1 = np.asarray(df["x1"], dtype=float)
 x2 = np.asarray(df["x2"], dtype=float)
 x3 = np.asarray(df["x3"], dtype=float)
 y  = np.asarray(df["y"],  dtype=float)
-n = y.shape[0]
 
 # Individual smoothers, each on its own covariate.
 bs1 = BSplines(x1.reshape(-1, 1), df=[10], degree=[3])
@@ -174,28 +173,46 @@ alpha0 = [1.0, 1.0, 1.0]
 gam = GLMGam(y, smoother=smoothers, alpha=alpha0,
              family=sm.families.Gaussian(sm.families.links.Identity()))
 # GCV search over the per-smoother penalty weights, then refit at the optimum.
-alpha_opt, _ = gam.select_penweight()
-gam = GLMGam(y, smoother=smoothers, alpha=alpha_opt,
+# select_penweight()'s return shape has varied across statsmodels versions
+# (bare alpha array vs (alpha, ...) tuple); normalize to the alpha vector so a
+# version change cannot silently mis-bind the optimum.
+sel = gam.select_penweight()
+alpha_opt = sel[0] if isinstance(sel, tuple) else sel
+alpha_opt = np.asarray(alpha_opt, dtype=float).reshape(-1)
+assert alpha_opt.shape[0] == 3, f"expected 3 penalty weights, got {alpha_opt.shape}"
+gam = GLMGam(y, smoother=smoothers, alpha=list(alpha_opt),
              family=sm.families.Gaussian(sm.families.links.Identity()))
 res = gam.fit()
 
 emit("fitted", np.asarray(res.fittedvalues, dtype=float))
-# Total effective degrees of freedom: intercept + sum of per-smoother edf.
-# statsmodels reports model df via res.df_model (excludes intercept), so the
-# total model complexity is df_model + 1.
-emit("edf_total", [float(res.df_model) + 1.0])
+# Penalized effective degrees of freedom = trace of the penalized hat
+# (smoother) matrix, res.hat_matrix_trace (== sum(res.edf), the per-column edf).
+# THIS is the quantity comparable to gam's penalized edf_total. (res.df_model is
+# the unpenalized parametric rank = total basis-column count, which would
+# spuriously disagree with a penalized fit and must NOT be used.) The trace
+# already counts the intercept column.
+emit("edf_total", [float(res.hat_matrix_trace)])
 
 # Per-term partial predictions: evaluate each smoother's basis at the data
 # with that smoother's own coefficients (offset-free term contribution).
 params = np.asarray(res.params, dtype=float)
-# Layout: [intercept, bs1(10), cc2(8), bs3(12)].
+# Recover each smoother's own basis at the data; its column count IS the per-
+# term coefficient width. Slice res.params by those widths instead of hard-
+# coding df, and assert the layout [intercept | x1 | x2 | x3] adds up, so a
+# basis-dimension mismatch fails loudly rather than producing garbage partials.
+Bx1 = np.asarray(bs1.transform(x1.reshape(-1, 1)), dtype=float)
+Bx2 = np.asarray(cc2.transform(x2.reshape(-1, 1)), dtype=float)
+Bx3 = np.asarray(bs3.transform(x3.reshape(-1, 1)), dtype=float)
+k1, k2, k3 = Bx1.shape[1], Bx2.shape[1], Bx3.shape[1]
+assert params.shape[0] == 1 + k1 + k2 + k3, \
+    f"unexpected GLMGam param layout: {params.shape[0]} != 1+{k1}+{k2}+{k3}"
 o = 1
-b1 = params[o:o+10]; o += 10
-b2 = params[o:o+8];  o += 8
-b3 = params[o:o+12]; o += 12
-emit("part_x1", bs1.transform(x1.reshape(-1, 1)) @ b1)
-emit("part_x2", cc2.transform(x2.reshape(-1, 1)) @ b2)
-emit("part_x3", bs3.transform(x3.reshape(-1, 1)) @ b3)
+b1 = params[o:o+k1]; o += k1
+b2 = params[o:o+k2]; o += k2
+b3 = params[o:o+k3]; o += k3
+emit("part_x1", Bx1 @ b1)
+emit("part_x2", Bx2 @ b2)
+emit("part_x3", Bx3 @ b3)
 "#,
     );
     let sm_fitted = r.vector("fitted");
@@ -261,12 +278,13 @@ emit("part_x3", bs3.transform(x3.reshape(-1, 1)) @ b3)
     assert!(p2 > 0.95, "cyclic term cc(x2) disagrees with statsmodels: pearson={p2:.4}");
     assert!(p3 > 0.95, "matern term matern(x3) disagrees with statsmodels: pearson={p3:.4}");
 
-    // (4) Total effective degrees of freedom (additive total = intercept +
-    // Σ per-term edf). Basis/null-space conventions differ between the engines,
-    // so we assert same-ballpark total complexity rather than bit-identical:
-    // within 25%, mirroring the spec's term-wise-EDF tolerance at the aggregate
-    // (the robust cross-engine EDF quantity — a broken term inflates/collapses
-    // the total and is caught here).
+    // (4) Total PENALIZED effective degrees of freedom: gam's edf_total vs the
+    // trace of statsmodels' penalized smoother hat matrix (res.edf). Both are
+    // the true effective complexity of the *fitted* (penalized) model, so they
+    // are the right cross-engine quantity to compare. Basis/null-space and
+    // penalty-selection conventions (gam REML vs statsmodels GCV) still differ,
+    // so we assert same-ballpark complexity, within 25% — a broken term that
+    // inflates or collapses the total blows past this.
     assert!(
         edf_rel < 0.25,
         "total effective degrees of freedom disagree: gam={gam_edf:.3} sm={sm_edf:.3} (rel={edf_rel:.3})"

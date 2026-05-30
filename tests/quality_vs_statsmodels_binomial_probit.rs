@@ -1,30 +1,43 @@
 //! End-to-end quality: gam's Binomial(probit) GLM must match statsmodels —
-//! the standard reference GLM implementation — on the linear predictor.
+//! the standard reference GLM implementation — on the fitted probability curve.
 //!
-//! This is a *cross-family* check: the logit link is gam's default binomial
-//! link, so a separate probit test verifies that gam's link-family dispatch
+//! This is a *cross-link* check. The logit link is gam's default binomial link,
+//! so a separate probit test verifies that gam's link-family dispatch
 //! (`family="binomial-probit"` -> `InverseLink::Standard(StandardLink::Probit)`)
 //! is wired correctly for a non-logit binomial. Probit is the second-most
-//! common binomial link (the Gaussian-CDF inverse, heavier-tailed than logit),
-//! and statsmodels `GLM(family=Binomial(link=Probit()))` is the canonical
-//! reference.
+//! common binomial link (the standard-normal-CDF inverse, lighter-tailed than
+//! logit), and statsmodels `GLM(family=Binomial(link=Probit()))` is the
+//! canonical reference implementation.
 //!
 //! We fit the *same* synthetic data with gam (`y ~ s(x1, k=4)`, probit) and
-//! statsmodels (a probit GLM with a matched cubic-spline basis on x1), then
-//! compare the fitted linear predictor eta = design*beta on a held-out
-//! evaluation grid. Because both engines fit the same profile-likelihood model
-//! (penalized IRLS / PIRLS for gam, IRLS for statsmodels on a comparable
-//! spline basis), their linear predictors must coincide up to small
-//! penalty/basis differences.
+//! statsmodels (a probit GLM on a cubic regression spline `cr(x1, df=4)` of x1)
+//! and compare the fitted **mean** mu = Phi(eta) on a held-out evaluation grid.
+//! The comparison is deliberately on the probability scale rather than on eta:
+//!   * gam REML-*penalizes* its smooth toward a lower-rank fit, while patsy's
+//!     `cr` basis enters statsmodels *unpenalized*, and the two cubic bases use
+//!     different knot/centering conventions. So eta need not coincide
+//!     coefficient-for-coefficient even though both encode the same probit
+//!     model — but the fitted probability curve they imply (the only
+//!     link-identified, basis-invariant quantity) must.
 //!
-//! Bound: max_abs_diff on eta, divided by the spread of eta (max-min), must be
-//! below 0.03 — both engines target the same probit profile likelihood, so the
-//! only legitimate gap is the modest smoothing/basis-convention difference, and
-//! a larger gap signals a real link-dispatch bug.
+//! To make this a genuine *link-dispatch* test and not merely "two cubic fits
+//! look similar", we additionally fit the identical data under a Binomial
+//! *logit* link in statsmodels and assert that gam's probit mean is strictly
+//! closer to the statsmodels probit mean than to the statsmodels logit mean.
+//! If gam's "probit" dispatch were silently running logit, that ordering would
+//! invert — so this comparison fails loudly on a real link-wiring bug.
+//!
+//! Bounds (both justified by the small k=4 basis on n=250 binary observations):
+//!   * Pearson correlation of gam-probit mu vs statsmodels-probit mu > 0.99 and
+//!     relative-L2 of the mean curve < 0.05 — the penalty/basis gap on a 3-df
+//!     smooth moves probabilities by at most a few percent of their spread.
+//!   * gam-vs-(statsmodels probit) relative-L2 must be < 0.5x gam-vs-(logit),
+//!     a strict separation that only holds if gam genuinely used the probit
+//!     inverse link.
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, max_abs_diff, run_python};
+use gam::test_support::reference::{Column, pearson, relative_l2, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -97,13 +110,16 @@ fn gam_binomial_probit_matches_statsmodels() {
         .expect("rebuild design at evaluation grid");
     let gam_eta: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
 
-    // ---- fit the SAME model with statsmodels (the mature reference) -------
-    // statsmodels GLM with a Binomial(probit) family on a natural-cubic-spline
-    // basis of x1 (df=4 columns, matching gam's k=4 cubic smooth), then predict
-    // the linear predictor at the evaluation grid. patsy's `cr(x1, df=4)`
-    // builds a centered cubic regression spline, the closest statsmodels-side
-    // analogue of gam's penalized cubic s(x1, k=4); both engines land on the
-    // same probit profile likelihood.
+    // gam fitted mean on the grid: mu = Phi(eta) (probit inverse link).
+    let gam_mu: Vec<f64> = gam_eta.iter().map(|&e| std_normal.cdf(e)).collect();
+
+    // ---- fit the SAME data with statsmodels (the mature reference) --------
+    // statsmodels GLM with a cubic regression spline of x1 (`cr(x1, df=4)`,
+    // df=4 columns, matching gam's k=4 cubic smooth), under TWO binomial links:
+    // probit (the model gam claims to fit) and logit (the discriminator). We
+    // return the fitted MEAN curve mu at the evaluation grid for each link —
+    // the mean is the link-identified, basis-invariant quantity to compare,
+    // whereas eta would depend on each engine's (different) spline basis.
     let grid_literal = xgrid
         .iter()
         .map(|v| format!("{v:.17e}"))
@@ -112,54 +128,62 @@ fn gam_binomial_probit_matches_statsmodels() {
     let body = format!(
         r#"
 import numpy as np
-import statsmodels.api as sm
-import statsmodels.formula.api as smf
-
-xgrid = np.array([{grid_literal}], dtype=float)
-
-# Probit GLM with a cubic regression spline on x1 (df=4, matching s(x1, k=4)).
-model = smf.glm(
-    "y ~ cr(x1, df=4)",
-    data=df,
-    family=sm.families.Binomial(link=sm.families.links.Probit()),
-)
-res = model.fit()
-
-# Linear predictor (eta) at the evaluation grid. `linear=True` returns the
-# untransformed predictor (design*beta) rather than the probit mean Phi(eta).
 import pandas as pd
-eta = res.predict(pd.DataFrame({"x1": xgrid}), linear=True)
-emit("eta", np.asarray(eta, dtype=float))
-emit("df_model", [float(res.df_model)])
+import statsmodels.formula.api as smf
+import statsmodels.api as sm
+
+xgrid = pd.DataFrame({{"x1": np.array([{grid_literal}], dtype=float)}})
+
+def fit_mean(link):
+    model = smf.glm(
+        "y ~ cr(x1, df=4)",
+        data=df,
+        family=sm.families.Binomial(link=link),
+    )
+    res = model.fit()
+    # default predict() returns the mean mu = g^{{-1}}(eta) on the grid.
+    return np.asarray(res.predict(xgrid), dtype=float)
+
+emit("mu_probit", fit_mean(sm.families.links.Probit()))
+emit("mu_logit", fit_mean(sm.families.links.Logit()))
 "#
     );
 
-    let r = run_python(
-        &[Column::new("x1", &x1), Column::new("y", &y)],
-        &body,
-    );
-    let sm_eta = r.vector("eta");
-    assert_eq!(sm_eta.len(), NGRID, "statsmodels eta length mismatch");
+    let r = run_python(&[Column::new("x1", &x1), Column::new("y", &y)], &body);
+    let sm_mu_probit = r.vector("mu_probit");
+    let sm_mu_logit = r.vector("mu_logit");
+    assert_eq!(sm_mu_probit.len(), NGRID, "statsmodels probit mean length mismatch");
+    assert_eq!(sm_mu_logit.len(), NGRID, "statsmodels logit mean length mismatch");
 
-    // ---- compare on the linear predictor ----------------------------------
-    let mad = max_abs_diff(&gam_eta, sm_eta);
-    let eta_min = sm_eta.iter().cloned().fold(f64::INFINITY, f64::min);
-    let eta_max = sm_eta.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let eta_scale = (eta_max - eta_min).abs().max(1e-6);
-    let rel_mad = mad / eta_scale;
+    // ---- compare on the fitted probability curve --------------------------
+    let corr = pearson(&gam_mu, sm_mu_probit);
+    let rel_probit = relative_l2(&gam_mu, sm_mu_probit);
+    let rel_logit = relative_l2(&gam_mu, sm_mu_logit);
 
     eprintln!(
         "binomial-probit s(x1,k=4): n={N} ngrid={NGRID} gam_edf={gam_edf:.3} \
-         eta_scale={eta_scale:.4} max_abs_diff={mad:.5} rel_mad={rel_mad:.5}"
+         pearson={corr:.5} rel_l2(probit)={rel_probit:.4} rel_l2(logit)={rel_logit:.4}"
     );
 
-    // Both PIRLS (gam) and statsmodels IRLS fit the same probit profile
-    // likelihood on a comparable df=4 cubic basis, so the linear predictors
-    // must agree to well within 3% of eta's range; a larger gap means gam's
-    // probit link dispatch diverges from the standard GLM.
+    // gam (penalized PIRLS, probit) and statsmodels (unpenalized IRLS, probit
+    // on a cr df=4 basis) encode the same probit model; the only legitimate gap
+    // is the REML penalty + differing cubic-basis convention on a 3-df smooth,
+    // which moves the fitted probabilities by at most a few percent of their
+    // spread. So the curves must be near-collinear and L2-close.
+    assert!(corr > 0.99, "gam probit mean not collinear with statsmodels: pearson={corr:.5}");
     assert!(
-        rel_mad < 0.03,
-        "gam probit linear predictor diverges from statsmodels: \
-         max_abs_diff={mad:.5}, eta_scale={eta_scale:.4}, rel_mad={rel_mad:.5}"
+        rel_probit < 0.05,
+        "gam probit mean curve diverges from statsmodels probit: rel_l2={rel_probit:.4}"
+    );
+
+    // Link-dispatch discriminator: if gam genuinely uses the probit inverse
+    // link, its mean must sit strictly closer to the statsmodels *probit* mean
+    // than to the statsmodels *logit* mean fit to identical data. A 0.5x margin
+    // is comfortably satisfied when the right link is used and is violated only
+    // if "binomial-probit" silently dispatches to logit (or any wrong link).
+    assert!(
+        rel_probit < 0.5 * rel_logit,
+        "gam 'probit' fit is not closer to statsmodels probit than to logit \
+         (rel_l2 probit={rel_probit:.4} vs logit={rel_logit:.4}) — link dispatch is suspect"
     );
 }

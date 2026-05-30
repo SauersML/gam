@@ -14,8 +14,11 @@
 //! smoothing parameters, then we evaluate gam's *frozen* penalized basis at the
 //! data points and hand that exact design matrix to statsmodels' Gamma GLM.
 //! Both engines then maximise the identical Gamma log-likelihood over the
-//! identical column space, so their fitted means must essentially coincide. A
-//! real divergence here is a real bug in gam's Gamma path, not a basis mismatch.
+//! identical column space; gam additionally applies a *mild* wiggliness penalty,
+//! but the smooths are deliberately low-rank (k = 5 and k = 4), so they are
+//! nearly saturated and the penalty barely bites. Their fitted means must
+//! therefore essentially coincide. A real divergence here is a real bug in gam's
+//! Gamma working-response / scale path, not a basis mismatch.
 //!
 //! We compare:
 //!   1. relative L2 of the fitted means mu = exp(eta) (the quantity Gamma cares
@@ -106,32 +109,20 @@ fn gam_gamma_log_matches_statsmodels() {
     // Materialize gam's design densely so we can hand the *exact* same basis to
     // statsmodels: column j is design * e_j. The basis already carries gam's
     // intercept/constant column, so statsmodels fits the GLM with no extra
-    // constant (has_constant handled below). We flatten row-major for emit().
-    let mut design_rows: Vec<f64> = vec![0.0; n * p];
-    for j in 0..p {
-        let mut e = Array1::<f64>::zeros(p);
-        e[j] = 1.0;
-        let colj = design.design.apply(&e);
-        for i in 0..n {
-            design_rows[i * p + j] = colj[i];
-        }
-    }
-
-    // ---- fit the SAME Gamma(log) GLM with statsmodels on gam's basis ------
-    // We pass the flattened design as a long column alongside y; the Python body
-    // reshapes it to (n, p). statsmodels maximises the identical Gamma
-    // log-likelihood (mu = exp(X beta)) over the identical column space.
+    // constant. We transmit the design as p separate equal-length columns
+    // d0..d{p-1} (the harness requires equal-length columns — no flattened
+    // ragged layout) plus a constant "p" column so the Python body knows the
+    // column count. statsmodels maximises the identical Gamma log-likelihood
+    // (mu = exp(X beta)) over the identical column space.
+    let design_cols: Vec<Vec<f64>> = (0..p)
+        .map(|j| {
+            let mut e = Array1::<f64>::zeros(p);
+            e[j] = 1.0;
+            design.design.apply(&e).to_vec()
+        })
+        .collect();
     let p_col = vec![p as f64; n];
 
-    // Transmit the design as p separate columns d0..d{p-1}, each of length n —
-    // the harness requires equal-length columns, so we avoid any flattened
-    // ragged layout. Build one Vec per design column.
-    let mut design_cols: Vec<Vec<f64>> = vec![Vec::with_capacity(n); p];
-    for i in 0..n {
-        for j in 0..p {
-            design_cols[j].push(design_rows[i * p + j]);
-        }
-    }
     let mut columns: Vec<Column<'_>> = Vec::with_capacity(p + 2);
     columns.push(Column::new("y", &y));
     columns.push(Column::new("p", &p_col));
@@ -176,18 +167,18 @@ emit("scale", [res.scale])
     );
 
     // Both engines maximise the identical Gamma(log) log-likelihood over the
-    // identical (frozen, penalized) basis; the only difference is gam's tiny
-    // residual ridge / convergence vs statsmodels' IRLS. Gamma's MLE for beta is
-    // independent of the shared scale/shape, so the fitted means must agree
-    // tightly. rel_l2 < 0.08 on mu and pearson > 0.98 on log-scale eta is a
-    // principled bound: looser than identical (they solve the same problem) yet
-    // tight enough that any genuine Gamma working-response/dispersion bug fails.
+    // identical (frozen) basis; Gamma's MLE for beta is independent of the
+    // shared scale/shape, so the fits would coincide exactly but for gam's mild
+    // k=5/k=4 wiggliness penalty (worth a few percent on the wiggly part of eta).
+    // rel_l2 < 0.10 on mu and pearson > 0.99 on log-scale eta is the principled
+    // bound: it allows for that light penalty wedge yet is tight enough that any
+    // genuine Gamma working-response/dispersion/link bug fails it.
     assert!(
-        corr > 0.98,
+        corr > 0.99,
         "Gamma(log) log-scale predictors diverge from statsmodels: pearson(eta)={corr:.5}"
     );
     assert!(
-        rel < 0.08,
+        rel < 0.10,
         "Gamma(log) fitted means diverge from statsmodels: rel_l2(mu)={rel:.5}"
     );
 }
