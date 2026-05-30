@@ -31,13 +31,20 @@ def _resolve_centers_tensor(t: torch.Tensor, centers: Any) -> torch.Tensor:
 
 def _resolve_knots_tensor(
     t: torch.Tensor, knots: Any, *, degree: int
-) -> torch.Tensor:
-    """Accept None / int / Tensor for B-spline knots; auto-derive when needed."""
+) -> tuple[torch.Tensor, int]:
+    """Accept None / int / Tensor for B-spline knots; auto-derive when needed.
+
+    Returns ``(knots_tensor, effective_degree)``. Auto-knot derivation can
+    downgrade the degree for small ``n`` (#340); the clamped knot vector is
+    then built for ``effective_degree`` and must be evaluated at that degree,
+    so callers must use the returned degree rather than the requested one. An
+    explicit knot tensor passes the requested degree straight through.
+    """
     if isinstance(knots, torch.Tensor):
-        return knots
+        return knots, degree
     # Auto quantile knot placement delegates to Rust core, do not reimplement.
     resolved = _api._resolve_knots(knots, to_numpy_f64(t), label="knots", degree=degree)
-    return from_numpy_like(resolved, t)
+    return from_numpy_like(resolved.locations, t), int(resolved.order)
 
 
 class _BsplineBasisFn(torch.autograd.Function):
@@ -309,9 +316,9 @@ def bspline_basis(
     torch.Tensor
         Basis matrix of shape ``(n_t, n_basis)``.
     """
-    knots_t = _resolve_knots_tensor(t, knots, degree=int(degree))
+    knots_t, eff_degree = _resolve_knots_tensor(t, knots, degree=int(degree))
     apply = cast(Callable[..., torch.Tensor], _BsplineBasisFn.apply)
-    return apply(t, knots_t, int(degree), bool(periodic))
+    return apply(t, knots_t, eff_degree, bool(periodic))
 
 
 def bspline_basis_derivative(
@@ -347,11 +354,11 @@ def bspline_basis_derivative(
     torch.Tensor
         Derivative basis matrix of shape ``(n_t, n_basis)``.
     """
-    knots_t = _resolve_knots_tensor(t, knots, degree=int(degree))
+    knots_t, eff_degree = _resolve_knots_tensor(t, knots, degree=int(degree))
     deriv = _api.bspline_basis_derivative(
         to_numpy_f64(t),
         to_numpy_f64(knots_t),
-        degree=int(degree),
+        degree=eff_degree,
         order=int(order),
         periodic=bool(periodic),
     )
