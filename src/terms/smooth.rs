@@ -10855,16 +10855,7 @@ impl SpatialAdaptiveExactFamily {
         //   J_{eta_p}         = sum_m lambda_{m,p} U_{m,p,eta},
         //   J_{beta,eta_p}    = sum_m lambda_{m,p} U_{m,p,beta eta},
         //   J_{beta,beta,eta} = sum_m lambda_{m,p} U_{m,p,beta beta eta}.
-        let (mut score, mut hessian) = self.zero_hyper_parts();
-        let mut objective = 0.0;
-        for cache_idx in 0..self.runtime_caches.len() {
-            let (local_objective, local_score, local_hessian) =
-                self.adaptive_block_log_epsilon_parts(eval, cache_idx, component)?;
-            objective += local_objective;
-            score += &local_score;
-            hessian += &local_hessian;
-        }
-        Ok((objective, score, hessian))
+        self.adaptive_shared_block_eval(eval, component, HyperDerivativeKind::LogEpsilonFirst)
     }
 
     fn adaptive_shared_log_epsilon_second_parts(
@@ -10877,11 +10868,25 @@ impl SpatialAdaptiveExactFamily {
         //   J_{eta_p,eta_p}            = sum_m lambda_{m,p} U_{m,p,eta eta},
         //   J_{beta,eta_p,eta_p}       = sum_m lambda_{m,p} U_{m,p,beta eta eta},
         //   J_{beta,beta,eta_p,eta_p}  = sum_m lambda_{m,p} U_{m,p,beta beta eta eta}.
+        self.adaptive_shared_block_eval(eval, component, HyperDerivativeKind::LogEpsilonSecond)
+    }
+
+    /// Sum a per-block hyper-derivative across every adaptive term for one shared
+    /// `log epsilon` coordinate (selected by `component`). The three log-epsilon
+    /// coordinates are shared globally by penalty type, so each contributes the
+    /// matching component's block from every cache.
+    fn adaptive_shared_block_eval(
+        &self,
+        eval: &SpatialAdaptiveExactEvaluation,
+        component: usize,
+        derivative: HyperDerivativeKind,
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+        let component = AdaptiveComponent::from_index(component)?;
         let (mut score, mut hessian) = self.zero_hyper_parts();
         let mut objective = 0.0;
         for cache_idx in 0..self.runtime_caches.len() {
             let (local_objective, local_score, local_hessian) =
-                self.adaptive_block_log_epsilon_second_parts(eval, cache_idx, component)?;
+                self.adaptive_block_eval(eval, cache_idx, component, derivative)?;
             objective += local_objective;
             score += &local_score;
             hessian += &local_hessian;
@@ -10898,11 +10903,17 @@ impl SpatialAdaptiveExactFamily {
         // Exact shared-log-epsilon Hessian drift:
         //
         //   T_{eta_p}[u] = sum_m lambda_{m,p} D_beta(U_{m,p,beta beta eta})[u].
+        let component = AdaptiveComponent::from_index(component)?;
         let total_dim = self.design.ncols();
         let mut total = Array2::<f64>::zeros((total_dim, total_dim));
         for cache_idx in 0..self.runtime_caches.len() {
-            total +=
-                &self.adaptive_block_log_epsilon_drift(eval, cache_idx, component, direction)?;
+            total += &self.adaptive_block_drift_eval(
+                eval,
+                cache_idx,
+                component,
+                HyperDriftKind::LogEpsilon,
+                direction,
+            )?;
         }
         Ok(total)
     }
@@ -10926,19 +10937,23 @@ impl SpatialAdaptiveExactFamily {
                 let (score, hessian) = self.zero_hyper_parts();
                 Ok((0.0, score, hessian))
             }
-            SpatialAdaptiveExplicitSecondOrderKind::LocalAlphaAlpha => {
-                self.adaptive_block_parts(eval, left.cache_index, left.component_index())
-            }
+            SpatialAdaptiveExplicitSecondOrderKind::LocalAlphaAlpha => self.adaptive_block_eval(
+                eval,
+                left.cache_index,
+                AdaptiveComponent::from_index(left.component_index())?,
+                HyperDerivativeKind::Rho,
+            ),
             SpatialAdaptiveExplicitSecondOrderKind::LocalAlphaEta => {
                 let local_alpha = if left.kind.is_log_lambda() {
                     left
                 } else {
                     right
                 };
-                self.adaptive_block_log_epsilon_parts(
+                self.adaptive_block_eval(
                     eval,
                     local_alpha.cache_index,
-                    local_alpha.component_index(),
+                    AdaptiveComponent::from_index(local_alpha.component_index())?,
+                    HyperDerivativeKind::LogEpsilonFirst,
                 )
             }
             SpatialAdaptiveExplicitSecondOrderKind::SharedEtaEta => {
@@ -10947,11 +10962,19 @@ impl SpatialAdaptiveExactFamily {
         }
     }
 
-    fn adaptive_block_drift(
+    /// Unified per-block directional-drift assembly. Owns the shared cache /
+    /// hyperparameter / exact-state lookup, the per-component direction
+    /// projection through the collocation operators, the operator embedding, and
+    /// the global embedding via [`Self::embed_local_hyper_hessian`]. The only
+    /// piece that varies with `drift` is the directional state accessor:
+    /// [`HyperDriftKind::Rho`] takes the bare directional Hessian drift, while
+    /// [`HyperDriftKind::LogEpsilon`] takes its `log epsilon` derivative.
+    fn adaptive_block_drift_eval(
         &self,
         eval: &SpatialAdaptiveExactEvaluation,
         cache_idx: usize,
-        component: usize,
+        component: AdaptiveComponent,
+        drift: HyperDriftKind,
         direction: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
         let cache = self
@@ -10969,116 +10992,47 @@ impl SpatialAdaptiveExactFamily {
         let direction_local = direction.slice(s![cache.coeff_global_range.clone()]);
 
         let local_hessian = match component {
-            0 => {
+            AdaptiveComponent::Magnitude => {
                 let d0_u = cache.d0.dot(&direction_local);
-                params.lambda[0]
-                    * scalar_operatorhessian(
-                        &cache.d0,
-                        &state.magnitude.directionalhessian_diag(&d0_u),
-                    )
+                let mag = &state.magnitude;
+                let diag = match drift {
+                    HyperDriftKind::Rho => mag.directionalhessian_diag(&d0_u),
+                    HyperDriftKind::LogEpsilon => {
+                        mag.log_epsilon_betahessian_directional_diag(&d0_u)
+                    }
+                };
+                params.lambda[0] * scalar_operatorhessian(&cache.d0, &diag)
             }
-            1 => {
+            AdaptiveComponent::Gradient => {
                 let d1_u = cache.d1.dot(&direction_local);
+                let direction_blocks = collocationgradient_blocks(&d1_u, cache.dimension)
+                    .map_err(|e| e.to_string())?;
+                let grad = &state.gradient;
+                let blocks = match drift {
+                    HyperDriftKind::Rho => grad.directionalhessian_blocks(&direction_blocks),
+                    HyperDriftKind::LogEpsilon => {
+                        grad.log_epsilon_betahessian_directional_blocks(&direction_blocks)
+                    }
+                };
                 params.lambda[1]
-                    * grouped_operatorhessian(
-                        &cache.d1,
-                        cache.dimension,
-                        &state.gradient.directionalhessian_blocks(
-                            &collocationgradient_blocks(&d1_u, cache.dimension)
-                                .map_err(|e| e.to_string())?,
-                        ),
-                    )
-                    .map_err(|e| e.to_string())?
+                    * grouped_operatorhessian(&cache.d1, cache.dimension, &blocks)
+                        .map_err(|e| e.to_string())?
             }
-            2 => {
+            AdaptiveComponent::Curvature => {
+                let group = cache.dimension * cache.dimension;
                 let d2_u = cache.d2.dot(&direction_local);
+                let direction_blocks = collocationhessian_blocks(&d2_u, cache.dimension)
+                    .map_err(|e| e.to_string())?;
+                let curv = &state.curvature;
+                let blocks = match drift {
+                    HyperDriftKind::Rho => curv.directionalhessian_blocks(&direction_blocks),
+                    HyperDriftKind::LogEpsilon => {
+                        curv.log_epsilon_betahessian_directional_blocks(&direction_blocks)
+                    }
+                };
                 params.lambda[2]
-                    * grouped_operatorhessian(
-                        &cache.d2,
-                        cache.dimension * cache.dimension,
-                        &state.curvature.directionalhessian_blocks(
-                            &collocationhessian_blocks(&d2_u, cache.dimension)
-                                .map_err(|e| e.to_string())?,
-                        ),
-                    )
-                    .map_err(|e| e.to_string())?
-            }
-            _ => {
-                return Err(SmoothError::invalid_index(format!(
-                    "invalid adaptive component index {}",
-                    component
-                ))
-                .into());
-            }
-        };
-
-        Ok(self.embed_local_hyper_hessian(&cache.coeff_global_range, &local_hessian))
-    }
-
-    fn adaptive_block_log_epsilon_drift(
-        &self,
-        eval: &SpatialAdaptiveExactEvaluation,
-        cache_idx: usize,
-        component: usize,
-        direction: &Array1<f64>,
-    ) -> Result<Array2<f64>, String> {
-        let cache = self
-            .runtime_caches
-            .get(cache_idx)
-            .ok_or_else(|| format!("adaptive cache index {} out of bounds", cache_idx))?;
-        let params = self
-            .adaptive_params
-            .get(cache_idx)
-            .ok_or_else(|| format!("adaptive hyperparameter block {} out of bounds", cache_idx))?;
-        let state = eval
-            .adaptive_states
-            .get(cache_idx)
-            .ok_or_else(|| format!("adaptive exact state index {} out of bounds", cache_idx))?;
-        let direction_local = direction.slice(s![cache.coeff_global_range.clone()]);
-
-        let local_hessian = match component {
-            0 => {
-                let d0_u = cache.d0.dot(&direction_local);
-                params.lambda[0]
-                    * scalar_operatorhessian(
-                        &cache.d0,
-                        &state
-                            .magnitude
-                            .log_epsilon_betahessian_directional_diag(&d0_u),
-                    )
-            }
-            1 => {
-                let d1_u = cache.d1.dot(&direction_local);
-                params.lambda[1]
-                    * grouped_operatorhessian(
-                        &cache.d1,
-                        cache.dimension,
-                        &state.gradient.log_epsilon_betahessian_directional_blocks(
-                            &collocationgradient_blocks(&d1_u, cache.dimension)
-                                .map_err(|e| e.to_string())?,
-                        ),
-                    )
-                    .map_err(|e| e.to_string())?
-            }
-            2 => {
-                let d2_u = cache.d2.dot(&direction_local);
-                params.lambda[2]
-                    * grouped_operatorhessian(
-                        &cache.d2,
-                        cache.dimension * cache.dimension,
-                        &state.curvature.log_epsilon_betahessian_directional_blocks(
-                            &collocationhessian_blocks(&d2_u, cache.dimension)
-                                .map_err(|e| e.to_string())?,
-                        ),
-                    )
-                    .map_err(|e| e.to_string())?
-            }
-            _ => {
-                return Err(SmoothError::invalid_index(format!(
-                    "invalid adaptive component index {}",
-                    component
-                ))
-                .into());
+                    * grouped_operatorhessian(&cache.d2, group, &blocks)
+                        .map_err(|e| e.to_string())?
             }
         };
 

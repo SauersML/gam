@@ -2305,20 +2305,12 @@ pub(crate) fn launch_bms_flex_row_hvp(
     }
     let backend = HvpKernelBackend::probe()?;
     let stream = backend.stream.clone();
-    let n = storage.n;
     let p_total = storage.block.p_total;
-    let r = storage.r;
-    let num_chunks = num_hvp_chunks(n);
 
     let d_v = stream
         .clone_htod(v)
         .map_err(|err| GpuError::DriverCallFailed {
             reason: format!("bms_flex_row hvp upload v: {err}"),
-        })?;
-    let mut d_partial = stream
-        .alloc_zeros::<f64>(num_chunks * p_total)
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("bms_flex_row hvp alloc partial: {err}"),
         })?;
     let mut d_out =
         stream
@@ -2327,115 +2319,14 @@ pub(crate) fn launch_bms_flex_row_hvp(
                 reason: format!("bms_flex_row hvp alloc out: {err}"),
             })?;
 
-    let partial_kernel_name = "bms_flex_row_hvp_partial";
-    let part_func = backend
-        .module
-        .load_function(partial_kernel_name)
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("bms_flex_row hvp load {partial_kernel_name}: {err}"),
-        })?;
-    let red_func = backend
-        .module
-        .load_function("bms_flex_row_hvp_reduce")
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("bms_flex_row hvp load reduce: {err}"),
-        })?;
+    run_bms_flex_row_partial_reduce(
+        storage,
+        BmsFlexRowLaunchMode::Hvp,
+        Some(&d_v),
+        &mut d_out,
+        "hvp",
+    )?;
 
-    let n_i32 = n as i32;
-    let r_i32 = r as i32;
-    let p_m_i32 = storage.block.p_m as i32;
-    let p_g_i32 = storage.block.p_g as i32;
-    let p_total_i32 = p_total as i32;
-    let h_block_start = storage
-        .block
-        .h
-        .as_ref()
-        .map(|r| r.start as i32)
-        .unwrap_or(0);
-    let h_block_len = storage
-        .block
-        .h
-        .as_ref()
-        .map(|r| r.len() as i32)
-        .unwrap_or(0);
-    let w_block_start = storage
-        .block
-        .w
-        .as_ref()
-        .map(|r| r.start as i32)
-        .unwrap_or(0);
-    let w_block_len = storage
-        .block
-        .w
-        .as_ref()
-        .map(|r| r.len() as i32)
-        .unwrap_or(0);
-    let h_primary_start = storage
-        .primary
-        .h
-        .as_ref()
-        .map(|r| r.start as i32)
-        .unwrap_or(0);
-    let w_primary_start = storage
-        .primary
-        .w
-        .as_ref()
-        .map(|r| r.start as i32)
-        .unwrap_or(0);
-    let rows_per_cta = HVP_ROWS_PER_CTA as i32;
-    let num_chunks_u32 = num_chunks as u32;
-
-    let cfg_part = LaunchConfig {
-        grid_dim: (num_chunks_u32, 1, 1),
-        block_dim: (HVP_THREADS, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    let mut builder = stream.launch_builder(&part_func);
-    builder
-        .arg(&n_i32)
-        .arg(&r_i32)
-        .arg(&p_m_i32)
-        .arg(&p_g_i32)
-        .arg(&p_total_i32)
-        .arg(&h_block_start)
-        .arg(&h_block_len)
-        .arg(&w_block_start)
-        .arg(&w_block_len)
-        .arg(&h_primary_start)
-        .arg(&w_primary_start)
-        .arg(&rows_per_cta)
-        .arg(&storage.hess)
-        .arg(&storage.marginal_design)
-        .arg(&storage.logslope_design)
-        .arg(&d_v)
-        .arg(&mut d_partial);
-    // SAFETY: every device pointer above either comes from `storage` (whose
-    // capacities were established by `launch_bms_flex_row_kernel_device_resident`)
-    // or was just allocated here (`d_v` length-checked, `d_partial` =
-    // num_chunks * p_total). Scalar args are i32 / u32 by-value.
-    unsafe { builder.launch(cfg_part) }.map_err(|err| GpuError::DriverCallFailed {
-        reason: format!("bms_flex_row hvp partial launch: {err}"),
-    })?;
-
-    let red_threads: u32 = 256;
-    let red_blocks: u32 = ((p_total as u32) + red_threads - 1) / red_threads;
-    let cfg_red = LaunchConfig {
-        grid_dim: (red_blocks, 1, 1),
-        block_dim: (red_threads, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    let num_chunks_i32 = num_chunks as i32;
-    let mut builder = stream.launch_builder(&red_func);
-    builder
-        .arg(&num_chunks_i32)
-        .arg(&p_total_i32)
-        .arg(&d_partial)
-        .arg(&mut d_out);
-    // SAFETY: `d_partial` was just populated by the partial kernel above;
-    // `d_out` is `p_total` doubles; both scalar args fit i32.
-    unsafe { builder.launch(cfg_red) }.map_err(|err| GpuError::DriverCallFailed {
-        reason: format!("bms_flex_row hvp reduce launch: {err}"),
-    })?;
     stream
         .synchronize()
         .map_err(|err| GpuError::DriverCallFailed {
@@ -2456,134 +2347,28 @@ pub(crate) fn launch_bms_flex_row_diagonal(
 ) -> Result<Vec<f64>, GpuError> {
     let backend = HvpKernelBackend::probe()?;
     let stream = backend.stream.clone();
-    let n = storage.n;
     let p_total = storage.block.p_total;
-    let r = storage.r;
-    let num_chunks = num_hvp_chunks(n);
 
-    let mut d_partial = stream
-        .alloc_zeros::<f64>(num_chunks * p_total)
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("bms_flex_row diag alloc partial: {err}"),
-        })?;
     let mut d_out =
         stream
             .alloc_zeros::<f64>(p_total)
             .map_err(|err| GpuError::DriverCallFailed {
                 reason: format!("bms_flex_row diag alloc out: {err}"),
             })?;
-    let diag_kernel_name = "bms_flex_row_diag_partial";
-    let part_func = backend
-        .module
-        .load_function(diag_kernel_name)
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("bms_flex_row diag load {diag_kernel_name}: {err}"),
-        })?;
-    let red_func = backend
-        .module
-        .load_function("bms_flex_row_hvp_reduce")
-        .map_err(|err| GpuError::DriverCallFailed {
-            reason: format!("bms_flex_row diag load reduce: {err}"),
-        })?;
 
-    let n_i32 = n as i32;
-    let r_i32 = r as i32;
-    let p_m_i32 = storage.block.p_m as i32;
-    let p_g_i32 = storage.block.p_g as i32;
-    let p_total_i32 = p_total as i32;
-    let h_block_start = storage
-        .block
-        .h
-        .as_ref()
-        .map(|r| r.start as i32)
-        .unwrap_or(0);
-    let h_block_len = storage
-        .block
-        .h
-        .as_ref()
-        .map(|r| r.len() as i32)
-        .unwrap_or(0);
-    let w_block_start = storage
-        .block
-        .w
-        .as_ref()
-        .map(|r| r.start as i32)
-        .unwrap_or(0);
-    let w_block_len = storage
-        .block
-        .w
-        .as_ref()
-        .map(|r| r.len() as i32)
-        .unwrap_or(0);
-    let h_primary_start = storage
-        .primary
-        .h
-        .as_ref()
-        .map(|r| r.start as i32)
-        .unwrap_or(0);
-    let w_primary_start = storage
-        .primary
-        .w
-        .as_ref()
-        .map(|r| r.start as i32)
-        .unwrap_or(0);
-    let rows_per_cta = HVP_ROWS_PER_CTA as i32;
-    let num_chunks_u32 = num_chunks as u32;
+    run_bms_flex_row_partial_reduce(
+        storage,
+        BmsFlexRowLaunchMode::Diagonal,
+        None,
+        &mut d_out,
+        "diag",
+    )?;
 
-    let cfg_part = LaunchConfig {
-        grid_dim: (num_chunks_u32, 1, 1),
-        block_dim: (HVP_THREADS, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    let mut builder = stream.launch_builder(&part_func);
-    builder
-        .arg(&n_i32)
-        .arg(&r_i32)
-        .arg(&p_m_i32)
-        .arg(&p_g_i32)
-        .arg(&p_total_i32)
-        .arg(&h_block_start)
-        .arg(&h_block_len)
-        .arg(&w_block_start)
-        .arg(&w_block_len)
-        .arg(&h_primary_start)
-        .arg(&w_primary_start)
-        .arg(&rows_per_cta)
-        .arg(&storage.hess)
-        .arg(&storage.marginal_design)
-        .arg(&storage.logslope_design)
-        .arg(&mut d_partial);
-    // SAFETY: same contract as the HVP partial kernel above — pointers come
-    // from `storage` (capacities established at construction time) and
-    // freshly allocated buffers sized to `num_chunks * p_total`.
-    unsafe { builder.launch(cfg_part) }.map_err(|err| GpuError::DriverCallFailed {
-        reason: format!("bms_flex_row diag partial launch: {err}"),
-    })?;
-
-    let red_threads: u32 = 256;
-    let red_blocks: u32 = ((p_total as u32) + red_threads - 1) / red_threads;
-    let cfg_red = LaunchConfig {
-        grid_dim: (red_blocks, 1, 1),
-        block_dim: (red_threads, 1, 1),
-        shared_mem_bytes: 0,
-    };
-    let num_chunks_i32 = num_chunks as i32;
-    let mut builder = stream.launch_builder(&red_func);
-    builder
-        .arg(&num_chunks_i32)
-        .arg(&p_total_i32)
-        .arg(&d_partial)
-        .arg(&mut d_out);
-    // SAFETY: `d_partial` populated above, `d_out` sized to `p_total`.
-    unsafe { builder.launch(cfg_red) }.map_err(|err| GpuError::DriverCallFailed {
-        reason: format!("bms_flex_row diag reduce launch: {err}"),
-    })?;
     stream
         .synchronize()
         .map_err(|err| GpuError::DriverCallFailed {
             reason: format!("bms_flex_row diag synchronize: {err}"),
         })?;
-    assert!(num_chunks_u32 as usize == num_chunks);
     stream
         .clone_dtoh(&d_out)
         .map_err(|err| GpuError::DriverCallFailed {
