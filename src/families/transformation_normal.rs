@@ -761,185 +761,6 @@ fn scop_psi_marginal(
     (h_psi, hp_psi, endpoint_psi)
 }
 
-/// Computes the per-covariate fourth-order chain term `hv` for the SCOP
-/// psi-psi directional/batched/bilinear accumulators. The body is identical
-/// across all three accumulation modes; only the accumulation target (which
-/// indexes the loop variable `cidx`) differs, so the caller keeps the final
-/// `+= wi * hv` write and this macro yields `hv`.
-///
-/// Free identifiers (`cov_row`, `cov_i_row`, `cov_j_row`, `cov_ij_row`, `k`,
-/// `rvk`, `rdk`, `g`/`gi`/`gj`/`gij`, `u`/`ui`/`uj`/`uij`, `endpoint_basis`,
-/// `h*`/`hp*`/`dh`, `inv_hp*`, `q`, and `endpoint_*`) resolve to the call-site
-/// row/column scope; `$cidx` selects the covariate column.
-macro_rules! scop_psi_pair_hv {
-    ($cidx:expr) => {{
-        let cidx = $cidx;
-        let c = cov_row[cidx];
-        let ci = cov_i_row[cidx];
-        let cj = cov_j_row[cidx];
-        let cij = cov_ij_row[cidx];
-        let (
-            dh,
-            dhp,
-            dh_i,
-            dh_j,
-            dh_ij,
-            dhp_i,
-            dhp_j,
-            dhp_ij,
-            ddh,
-            ddhp,
-            ddh_i,
-            ddh_j,
-            ddh_ij,
-            ddhp_i,
-            ddhp_j,
-            ddhp_ij,
-        ) = if k == 0 {
-            (
-                rvk * c,
-                rdk * c,
-                rvk * ci,
-                rvk * cj,
-                rvk * cij,
-                rdk * ci,
-                rdk * cj,
-                rdk * cij,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-            )
-        } else {
-            (
-                2.0 * rvk * g * c,
-                2.0 * rdk * g * c,
-                2.0 * rvk * (gi * c + g * ci),
-                2.0 * rvk * (gj * c + g * cj),
-                2.0 * rvk * (gj * ci + gi * cj + gij * c + g * cij),
-                2.0 * rdk * (gi * c + g * ci),
-                2.0 * rdk * (gj * c + g * cj),
-                2.0 * rdk * (gj * ci + gi * cj + gij * c + g * cij),
-                2.0 * rvk * u * c,
-                2.0 * rdk * u * c,
-                2.0 * rvk * (ui * c + u * ci),
-                2.0 * rvk * (uj * c + u * cj),
-                2.0 * rvk * (uj * ci + ui * cj + uij * c + u * cij),
-                2.0 * rdk * (ui * c + u * ci),
-                2.0 * rdk * (uj * c + u * cj),
-                2.0 * rdk * (uj * ci + ui * cj + uij * c + u * cij),
-            )
-        };
-
-        let endpoint_a = if k == 0 {
-            [endpoint_basis[0][k] * c, endpoint_basis[1][k] * c]
-        } else {
-            [
-                2.0 * endpoint_basis[0][k] * g * c,
-                2.0 * endpoint_basis[1][k] * g * c,
-            ]
-        };
-        let endpoint_i_a = if k == 0 {
-            [endpoint_basis[0][k] * ci, endpoint_basis[1][k] * ci]
-        } else {
-            [
-                2.0 * endpoint_basis[0][k] * (gi * c + g * ci),
-                2.0 * endpoint_basis[1][k] * (gi * c + g * ci),
-            ]
-        };
-        let endpoint_j_a = if k == 0 {
-            [endpoint_basis[0][k] * cj, endpoint_basis[1][k] * cj]
-        } else {
-            [
-                2.0 * endpoint_basis[0][k] * (gj * c + g * cj),
-                2.0 * endpoint_basis[1][k] * (gj * c + g * cj),
-            ]
-        };
-        let endpoint_ij_a = if k == 0 {
-            [endpoint_basis[0][k] * cij, endpoint_basis[1][k] * cij]
-        } else {
-            [
-                2.0 * endpoint_basis[0][k] * (gj * ci + gi * cj + gij * c + g * cij),
-                2.0 * endpoint_basis[1][k] * (gj * ci + gi * cj + gij * c + g * cij),
-            ]
-        };
-        let endpoint_a_d = if k == 0 {
-            [0.0; 2]
-        } else {
-            [
-                2.0 * endpoint_basis[0][k] * u * c,
-                2.0 * endpoint_basis[1][k] * u * c,
-            ]
-        };
-        let endpoint_i_a_d = if k == 0 {
-            [0.0; 2]
-        } else {
-            [
-                2.0 * endpoint_basis[0][k] * (ui * c + u * ci),
-                2.0 * endpoint_basis[1][k] * (ui * c + u * ci),
-            ]
-        };
-        let endpoint_j_a_d = if k == 0 {
-            [0.0; 2]
-        } else {
-            [
-                2.0 * endpoint_basis[0][k] * (uj * c + u * cj),
-                2.0 * endpoint_basis[1][k] * (uj * c + u * cj),
-            ]
-        };
-        let endpoint_ij_a_d = if k == 0 {
-            [0.0; 2]
-        } else {
-            [
-                2.0 * endpoint_basis[0][k] * (uj * ci + ui * cj + uij * c + u * cij),
-                2.0 * endpoint_basis[1][k] * (uj * ci + ui * cj + uij * c + u * cij),
-            ]
-        };
-        let n1 = dhp_i * hp_j + hp_i * dhp_j;
-        let n1_dot = ddhp_i * hp_j + dhp_i * hp_j_dot + hp_i_dot * dhp_j + hp_i * ddhp_j;
-        let n2_dot = hp_i_dot * hp_j * dhp + hp_i * hp_j_dot * dhp + hp_i * hp_j * ddhp;
-        ddh_i * h_j
-            + dh_i * h_j_dot
-            + h_i_dot * dh_j
-            + h_i * ddh_j
-            + ddh * h_ij
-            + dh * h_ij_dot
-            + h_dot * dh_ij
-            + h * ddh_ij
-            - ddhp_ij * inv_hp
-            + dhp_ij * hp_dot * inv_hp_sq
-            + hp_ij_dot * dhp * inv_hp_sq
-            + hp_ij * ddhp * inv_hp_sq
-            - 2.0 * hp_ij * dhp * hp_dot * inv_hp_cu
-            + n1_dot * inv_hp_sq
-            - 2.0 * n1 * hp_dot * inv_hp_cu
-            - 2.0 * n2_dot * inv_hp_cu
-            + 6.0 * hp_i * hp_j * dhp * hp_dot * inv_hp_qu
-            + endpoint_chain_fourth(
-                &q,
-                endpoint_i,
-                endpoint_j,
-                endpoint_a,
-                endpoint_d,
-                endpoint_ij,
-                endpoint_i_a,
-                endpoint_i_d,
-                endpoint_j_a,
-                endpoint_j_d,
-                endpoint_a_d,
-                endpoint_ij_a,
-                endpoint_ij_d,
-                endpoint_i_a_d,
-                endpoint_j_a_d,
-                endpoint_ij_a_d,
-            )
-    }};
-}
-
 fn factorial(n: usize) -> f64 {
     match n {
         0 | 1 => 1.0,
@@ -5421,7 +5242,171 @@ impl TransformationNormalFamily {
                             acc.gamma_ij_dot[k],
                         );
                         for cidx in 0..p_cov {
-                            let hv = scop_psi_pair_hv!(cidx);
+                            let c = cov_row[cidx];
+                            let ci = cov_i_row[cidx];
+                            let cj = cov_j_row[cidx];
+                            let cij = cov_ij_row[cidx];
+                            let (
+                                dh,
+                                dhp,
+                                dh_i,
+                                dh_j,
+                                dh_ij,
+                                dhp_i,
+                                dhp_j,
+                                dhp_ij,
+                                ddh,
+                                ddhp,
+                                ddh_i,
+                                ddh_j,
+                                ddh_ij,
+                                ddhp_i,
+                                ddhp_j,
+                                ddhp_ij,
+                            ) = if k == 0 {
+                                (
+                                    rvk * c,
+                                    rdk * c,
+                                    rvk * ci,
+                                    rvk * cj,
+                                    rvk * cij,
+                                    rdk * ci,
+                                    rdk * cj,
+                                    rdk * cij,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                )
+                            } else {
+                                (
+                                    2.0 * rvk * g * c,
+                                    2.0 * rdk * g * c,
+                                    2.0 * rvk * (gi * c + g * ci),
+                                    2.0 * rvk * (gj * c + g * cj),
+                                    2.0 * rvk * (gj * ci + gi * cj + gij * c + g * cij),
+                                    2.0 * rdk * (gi * c + g * ci),
+                                    2.0 * rdk * (gj * c + g * cj),
+                                    2.0 * rdk * (gj * ci + gi * cj + gij * c + g * cij),
+                                    2.0 * rvk * u * c,
+                                    2.0 * rdk * u * c,
+                                    2.0 * rvk * (ui * c + u * ci),
+                                    2.0 * rvk * (uj * c + u * cj),
+                                    2.0 * rvk * (uj * ci + ui * cj + uij * c + u * cij),
+                                    2.0 * rdk * (ui * c + u * ci),
+                                    2.0 * rdk * (uj * c + u * cj),
+                                    2.0 * rdk * (uj * ci + ui * cj + uij * c + u * cij),
+                                )
+                            };
+
+                            let endpoint_a = if k == 0 {
+                                [endpoint_basis[0][k] * c, endpoint_basis[1][k] * c]
+                            } else {
+                                [
+                                    2.0 * endpoint_basis[0][k] * g * c,
+                                    2.0 * endpoint_basis[1][k] * g * c,
+                                ]
+                            };
+                            let endpoint_i_a = if k == 0 {
+                                [endpoint_basis[0][k] * ci, endpoint_basis[1][k] * ci]
+                            } else {
+                                [
+                                    2.0 * endpoint_basis[0][k] * (gi * c + g * ci),
+                                    2.0 * endpoint_basis[1][k] * (gi * c + g * ci),
+                                ]
+                            };
+                            let endpoint_j_a = if k == 0 {
+                                [endpoint_basis[0][k] * cj, endpoint_basis[1][k] * cj]
+                            } else {
+                                [
+                                    2.0 * endpoint_basis[0][k] * (gj * c + g * cj),
+                                    2.0 * endpoint_basis[1][k] * (gj * c + g * cj),
+                                ]
+                            };
+                            let endpoint_ij_a = if k == 0 {
+                                [endpoint_basis[0][k] * cij, endpoint_basis[1][k] * cij]
+                            } else {
+                                [
+                                    2.0 * endpoint_basis[0][k] * (gj * ci + gi * cj + gij * c + g * cij),
+                                    2.0 * endpoint_basis[1][k] * (gj * ci + gi * cj + gij * c + g * cij),
+                                ]
+                            };
+                            let endpoint_a_d = if k == 0 {
+                                [0.0; 2]
+                            } else {
+                                [
+                                    2.0 * endpoint_basis[0][k] * u * c,
+                                    2.0 * endpoint_basis[1][k] * u * c,
+                                ]
+                            };
+                            let endpoint_i_a_d = if k == 0 {
+                                [0.0; 2]
+                            } else {
+                                [
+                                    2.0 * endpoint_basis[0][k] * (ui * c + u * ci),
+                                    2.0 * endpoint_basis[1][k] * (ui * c + u * ci),
+                                ]
+                            };
+                            let endpoint_j_a_d = if k == 0 {
+                                [0.0; 2]
+                            } else {
+                                [
+                                    2.0 * endpoint_basis[0][k] * (uj * c + u * cj),
+                                    2.0 * endpoint_basis[1][k] * (uj * c + u * cj),
+                                ]
+                            };
+                            let endpoint_ij_a_d = if k == 0 {
+                                [0.0; 2]
+                            } else {
+                                [
+                                    2.0 * endpoint_basis[0][k] * (uj * ci + ui * cj + uij * c + u * cij),
+                                    2.0 * endpoint_basis[1][k] * (uj * ci + ui * cj + uij * c + u * cij),
+                                ]
+                            };
+                            let n1 = dhp_i * hp_j + hp_i * dhp_j;
+                            let n1_dot =
+                                ddhp_i * hp_j + dhp_i * hp_j_dot + hp_i_dot * dhp_j + hp_i * ddhp_j;
+                            let n2_dot =
+                                hp_i_dot * hp_j * dhp + hp_i * hp_j_dot * dhp + hp_i * hp_j * ddhp;
+                            let hv = ddh_i * h_j
+                                + dh_i * h_j_dot
+                                + h_i_dot * dh_j
+                                + h_i * ddh_j
+                                + ddh * h_ij
+                                + dh * h_ij_dot
+                                + h_dot * dh_ij
+                                + h * ddh_ij
+                                - ddhp_ij * inv_hp
+                                + dhp_ij * hp_dot * inv_hp_sq
+                                + hp_ij_dot * dhp * inv_hp_sq
+                                + hp_ij * ddhp * inv_hp_sq
+                                - 2.0 * hp_ij * dhp * hp_dot * inv_hp_cu
+                                + n1_dot * inv_hp_sq
+                                - 2.0 * n1 * hp_dot * inv_hp_cu
+                                - 2.0 * n2_dot * inv_hp_cu
+                                + 6.0 * hp_i * hp_j * dhp * hp_dot * inv_hp_qu
+                                + endpoint_chain_fourth(
+                                    &q,
+                                    endpoint_i,
+                                    endpoint_j,
+                                    endpoint_a,
+                                    endpoint_d,
+                                    endpoint_ij,
+                                    endpoint_i_a,
+                                    endpoint_i_d,
+                                    endpoint_j_a,
+                                    endpoint_j_d,
+                                    endpoint_a_d,
+                                    endpoint_ij_a,
+                                    endpoint_ij_d,
+                                    endpoint_i_a_d,
+                                    endpoint_j_a_d,
+                                    endpoint_ij_a_d,
+                                );
                             acc.hvp[offset + cidx] += wi * hv;
                         }
                     }
@@ -5717,7 +5702,174 @@ impl TransformationNormalFamily {
                                 acc.gamma_ij_dot[k * rank + col],
                             );
                             for cidx in 0..p_cov {
-                                let hv = scop_psi_pair_hv!(cidx);
+                                let c = cov_row[cidx];
+                                let ci = cov_i_row[cidx];
+                                let cj = cov_j_row[cidx];
+                                let cij = cov_ij_row[cidx];
+                                let (
+                                    dh,
+                                    dhp,
+                                    dh_i,
+                                    dh_j,
+                                    dh_ij,
+                                    dhp_i,
+                                    dhp_j,
+                                    dhp_ij,
+                                    ddh,
+                                    ddhp,
+                                    ddh_i,
+                                    ddh_j,
+                                    ddh_ij,
+                                    ddhp_i,
+                                    ddhp_j,
+                                    ddhp_ij,
+                                ) = if k == 0 {
+                                    (
+                                        rvk * c,
+                                        rdk * c,
+                                        rvk * ci,
+                                        rvk * cj,
+                                        rvk * cij,
+                                        rdk * ci,
+                                        rdk * cj,
+                                        rdk * cij,
+                                        0.0,
+                                        0.0,
+                                        0.0,
+                                        0.0,
+                                        0.0,
+                                        0.0,
+                                        0.0,
+                                        0.0,
+                                    )
+                                } else {
+                                    (
+                                        2.0 * rvk * g * c,
+                                        2.0 * rdk * g * c,
+                                        2.0 * rvk * (gi * c + g * ci),
+                                        2.0 * rvk * (gj * c + g * cj),
+                                        2.0 * rvk * (gj * ci + gi * cj + gij * c + g * cij),
+                                        2.0 * rdk * (gi * c + g * ci),
+                                        2.0 * rdk * (gj * c + g * cj),
+                                        2.0 * rdk * (gj * ci + gi * cj + gij * c + g * cij),
+                                        2.0 * rvk * u * c,
+                                        2.0 * rdk * u * c,
+                                        2.0 * rvk * (ui * c + u * ci),
+                                        2.0 * rvk * (uj * c + u * cj),
+                                        2.0 * rvk * (uj * ci + ui * cj + uij * c + u * cij),
+                                        2.0 * rdk * (ui * c + u * ci),
+                                        2.0 * rdk * (uj * c + u * cj),
+                                        2.0 * rdk * (uj * ci + ui * cj + uij * c + u * cij),
+                                    )
+                                };
+
+                                let endpoint_a = if k == 0 {
+                                    [endpoint_basis[0][k] * c, endpoint_basis[1][k] * c]
+                                } else {
+                                    [
+                                        2.0 * endpoint_basis[0][k] * g * c,
+                                        2.0 * endpoint_basis[1][k] * g * c,
+                                    ]
+                                };
+                                let endpoint_i_a = if k == 0 {
+                                    [endpoint_basis[0][k] * ci, endpoint_basis[1][k] * ci]
+                                } else {
+                                    [
+                                        2.0 * endpoint_basis[0][k] * (gi * c + g * ci),
+                                        2.0 * endpoint_basis[1][k] * (gi * c + g * ci),
+                                    ]
+                                };
+                                let endpoint_j_a = if k == 0 {
+                                    [endpoint_basis[0][k] * cj, endpoint_basis[1][k] * cj]
+                                } else {
+                                    [
+                                        2.0 * endpoint_basis[0][k] * (gj * c + g * cj),
+                                        2.0 * endpoint_basis[1][k] * (gj * c + g * cj),
+                                    ]
+                                };
+                                let endpoint_ij_a = if k == 0 {
+                                    [endpoint_basis[0][k] * cij, endpoint_basis[1][k] * cij]
+                                } else {
+                                    [
+                                        2.0 * endpoint_basis[0][k] * (gj * ci + gi * cj + gij * c + g * cij),
+                                        2.0 * endpoint_basis[1][k] * (gj * ci + gi * cj + gij * c + g * cij),
+                                    ]
+                                };
+                                let endpoint_a_d = if k == 0 {
+                                    [0.0; 2]
+                                } else {
+                                    [
+                                        2.0 * endpoint_basis[0][k] * u * c,
+                                        2.0 * endpoint_basis[1][k] * u * c,
+                                    ]
+                                };
+                                let endpoint_i_a_d = if k == 0 {
+                                    [0.0; 2]
+                                } else {
+                                    [
+                                        2.0 * endpoint_basis[0][k] * (ui * c + u * ci),
+                                        2.0 * endpoint_basis[1][k] * (ui * c + u * ci),
+                                    ]
+                                };
+                                let endpoint_j_a_d = if k == 0 {
+                                    [0.0; 2]
+                                } else {
+                                    [
+                                        2.0 * endpoint_basis[0][k] * (uj * c + u * cj),
+                                        2.0 * endpoint_basis[1][k] * (uj * c + u * cj),
+                                    ]
+                                };
+                                let endpoint_ij_a_d = if k == 0 {
+                                    [0.0; 2]
+                                } else {
+                                    [
+                                        2.0 * endpoint_basis[0][k] * (uj * ci + ui * cj + uij * c + u * cij),
+                                        2.0 * endpoint_basis[1][k] * (uj * ci + ui * cj + uij * c + u * cij),
+                                    ]
+                                };
+                                let n1 = dhp_i * hp_j + hp_i * dhp_j;
+                                let n1_dot = ddhp_i * hp_j
+                                    + dhp_i * hp_j_dot
+                                    + hp_i_dot * dhp_j
+                                    + hp_i * ddhp_j;
+                                let n2_dot = hp_i_dot * hp_j * dhp
+                                    + hp_i * hp_j_dot * dhp
+                                    + hp_i * hp_j * ddhp;
+                                let hv = ddh_i * h_j
+                                    + dh_i * h_j_dot
+                                    + h_i_dot * dh_j
+                                    + h_i * ddh_j
+                                    + ddh * h_ij
+                                    + dh * h_ij_dot
+                                    + h_dot * dh_ij
+                                    + h * ddh_ij
+                                    - ddhp_ij * inv_hp
+                                    + dhp_ij * hp_dot * inv_hp_sq
+                                    + hp_ij_dot * dhp * inv_hp_sq
+                                    + hp_ij * ddhp * inv_hp_sq
+                                    - 2.0 * hp_ij * dhp * hp_dot * inv_hp_cu
+                                    + n1_dot * inv_hp_sq
+                                    - 2.0 * n1 * hp_dot * inv_hp_cu
+                                    - 2.0 * n2_dot * inv_hp_cu
+                                    + 6.0 * hp_i * hp_j * dhp * hp_dot * inv_hp_qu
+                                    + endpoint_chain_fourth(
+                                        &q,
+                                        endpoint_i,
+                                        endpoint_j,
+                                        endpoint_a,
+                                        endpoint_d,
+                                        endpoint_ij,
+                                        endpoint_i_a,
+                                        endpoint_i_d,
+                                        endpoint_j_a,
+                                        endpoint_j_d,
+                                        endpoint_a_d,
+                                        endpoint_ij_a,
+                                        endpoint_ij_d,
+                                        endpoint_i_a_d,
+                                        endpoint_j_a_d,
+                                        endpoint_ij_a_d,
+                                    );
                                 acc.hvp[[offset + cidx, col]] += wi * hv;
                             }
                         }

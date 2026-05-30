@@ -4871,8 +4871,8 @@ impl BernoulliMarginalSlopeFamily {
                         basis_span,
                         b,
                         scale,
-                        &mut g_u_fixed,
-                        &mut g_bu_fixed,
+                        &mut *g_u_fixed,
+                        &mut *g_bu_fixed,
                     );
                     Ok(())
                 },
@@ -4891,9 +4891,9 @@ impl BernoulliMarginalSlopeFamily {
                         a,
                         b,
                         scale,
-                        &mut g_u_fixed,
-                        &mut g_au_fixed,
-                        &mut g_bu_fixed,
+                        &mut *g_u_fixed,
+                        &mut *g_au_fixed,
+                        &mut *g_bu_fixed,
                     );
                     Ok(())
                 },

@@ -9908,8 +9908,6 @@ struct GlsWiggleSecondDirCoeffs {
 /// second directional derivative: `xi`/`zeta` are the X_mu/X_ls contractions,
 /// and `q`/`s1`/`g2` are the mixed first/second-derivative wiggle pieces.
 struct GlsWiggleDirPieces<'a> {
-    xi_u: &'a Array1<f64>,
-    xi_v: &'a Array1<f64>,
     zeta_u: &'a Array1<f64>,
     zeta_v: &'a Array1<f64>,
     q_u: &'a Array1<f64>,
@@ -9931,8 +9929,6 @@ fn gls_wiggle_second_directional_coeffs(
     dir: &GlsWiggleDirPieces<'_>,
 ) -> GlsWiggleSecondDirCoeffs {
     let GlsWiggleDirPieces {
-        xi_u,
-        xi_v,
         zeta_u,
         zeta_v,
         q_u,
@@ -10605,8 +10601,6 @@ impl GaussianLocationScaleWiggleFamily {
             &rows,
             &geom,
             &GlsWiggleDirPieces {
-                xi_u: &xi_u,
-                xi_v: &xi_v,
                 zeta_u: &zeta_u,
                 zeta_v: &zeta_v,
                 q_u: &q_u,
@@ -10799,8 +10793,6 @@ impl GaussianLocationScaleWiggleFamily {
             &rows,
             &geom,
             &GlsWiggleDirPieces {
-                xi_u: &xi_u,
-                xi_v: &xi_v,
                 zeta_u: &zeta_u,
                 zeta_v: &zeta_v,
                 q_u: &q_u,
