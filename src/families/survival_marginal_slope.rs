@@ -14222,6 +14222,249 @@ impl SurvivalMarginalSlopeFamily {
             })
     }
 
+    /// Shared per-row pullback of the timewiggle q-map Jacobian/curvature
+    /// derivatives into the joint Hessian accumulator.  Used by both the
+    /// cached `_inner` path (with an empty `identity_blocks`) and the flex
+    /// path (with non-empty `identity_blocks`); the only behavioural
+    /// difference between those callers is whether the identity-block cross
+    /// terms are added, which is driven entirely by `identity_blocks`.
+    #[allow(clippy::too_many_arguments)]
+    fn accumulate_timewiggle_directional_row(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        slices: &BlockSlices,
+        q_geom: &SurvivalMarginalSlopeDynamicRow,
+        f_pi: &Array1<f64>,
+        h_pi: ArrayView2<'_, f64>,
+        d_time: ndarray::ArrayView1<'_, f64>,
+        d_marginal: ndarray::ArrayView1<'_, f64>,
+        beta_time: &Array1<f64>,
+        beta_time_w: ndarray::ArrayView1<'_, f64>,
+        identity_blocks: &[(std::ops::Range<usize>, std::ops::Range<usize>)],
+        acc: &mut Array2<f64>,
+    ) -> Result<(), String> {
+        let time_tail = self.time_wiggle_range();
+        let p_base = time_tail.start;
+        let p_time = slices.time.len();
+        let p_marginal = slices.marginal.len();
+
+        // ── Timewiggle Jacobian derivatives ────────────────
+        let ec = self
+            .design_entry
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| format!("design_entry try_row_chunk: {e}"))?;
+        let xc = self
+            .design_exit
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| format!("design_exit try_row_chunk: {e}"))?;
+        let dc = self
+            .design_derivative_exit
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| format!("design_derivative_exit try_row_chunk: {e}"))?;
+        let xe = ec.row(0).slice(s![..p_base]).to_owned();
+        let xx = xc.row(0).slice(s![..p_base]).to_owned();
+        let xd = dc.row(0).slice(s![..p_base]).to_owned();
+        let mc = self
+            .marginal_design
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| format!("marginal_design try_row_chunk: {e}"))?;
+        let mr = mc.row(0).to_owned();
+        let dh0 = xe.dot(&d_time.slice(s![..p_base])) + mr.dot(&d_marginal);
+        let dh1 = xx.dot(&d_time.slice(s![..p_base])) + mr.dot(&d_marginal);
+        let ddr = xd.dot(&d_time.slice(s![..p_base]));
+        let bm = block_states[1].eta[row];
+        let h0 = xe.dot(&beta_time.slice(s![..p_base])) + self.offset_entry[row] + bm;
+        let h1 = xx.dot(&beta_time.slice(s![..p_base])) + self.offset_exit[row] + bm;
+        let dr = xd.dot(&beta_time.slice(s![..p_base])) + self.derivative_offset_exit[row];
+        let eg = self
+            .time_wiggle_geometry(Array1::from_vec(vec![h0]).view(), beta_time_w)?
+            .ok_or_else(|| "timewiggle geometry missing at entry".to_string())?;
+        let xg = self
+            .time_wiggle_geometry(Array1::from_vec(vec![h1]).view(), beta_time_w)?
+            .ok_or_else(|| "timewiggle geometry missing at exit".to_string())?;
+        let (m2e, m3e) = (eg.d2q_dq02[0], eg.d3q_dq03[0]);
+        let (m2x, m3x, m4x) = (xg.d2q_dq02[0], xg.d3q_dq03[0], xg.d4q_dq04[0]);
+
+        // dJ_{q,time}[a] / dβ[d]
+        let mut dj0t = vec![0.0f64; p_time];
+        let mut dj1t = vec![0.0f64; p_time];
+        let mut djdt = vec![0.0f64; p_time];
+        for a in 0..p_base {
+            dj0t[a] = m2e * dh0 * xe[a];
+            dj1t[a] = m2x * dh1 * xx[a];
+            djdt[a] = m3x * dh1 * dr * xx[a] + m2x * ddr * xx[a] + m2x * dh1 * xd[a];
+        }
+        for li in 0..time_tail.len() {
+            let ci = time_tail.start + li;
+            dj0t[ci] = eg.basis_d1[[0, li]] * dh0;
+            dj1t[ci] = xg.basis_d1[[0, li]] * dh1;
+            djdt[ci] = xg.basis_d2[[0, li]] * dh1 * dr + xg.basis_d1[[0, li]] * ddr;
+        }
+        let djt = [&dj0t[..], &dj1t[..], &djdt[..]];
+        let mut dj0m = vec![0.0f64; p_marginal];
+        let mut dj1m = vec![0.0f64; p_marginal];
+        let mut djdm = vec![0.0f64; p_marginal];
+        for a in 0..p_marginal {
+            dj0m[a] = m2e * dh0 * mr[a];
+            dj1m[a] = m2x * dh1 * mr[a];
+            djdm[a] = m3x * dh1 * dr * mr[a] + m2x * ddr * mr[a];
+        }
+        let djm = [&dj0m[..], &dj1m[..], &djdm[..]];
+        let jt: [&Array1<f64>; 3] = [&q_geom.dq0_time, &q_geom.dq1_time, &q_geom.dqd1_time];
+        let jm: [&Array1<f64>; 3] = [
+            &q_geom.dq0_marginal,
+            &q_geom.dq1_marginal,
+            &q_geom.dqd1_marginal,
+        ];
+
+        // Term 2: (dJ/d)^T H J + J^T H (dJ/d)
+        for a in 0..p_time {
+            for b in 0..p_time {
+                let mut v = 0.0;
+                for qu in 0..3 {
+                    for qv in 0..3 {
+                        v += h_pi[[qu, qv]] * (djt[qu][a] * jt[qv][b] + jt[qu][a] * djt[qv][b]);
+                    }
+                }
+                acc[[slices.time.start + a, slices.time.start + b]] += v;
+            }
+        }
+        for a in 0..p_marginal {
+            for b in 0..p_marginal {
+                let mut v = 0.0;
+                for qu in 0..3 {
+                    for qv in 0..3 {
+                        v += h_pi[[qu, qv]] * (djm[qu][a] * jm[qv][b] + jm[qu][a] * djm[qv][b]);
+                    }
+                }
+                acc[[slices.marginal.start + a, slices.marginal.start + b]] += v;
+            }
+        }
+        for a in 0..p_time {
+            for b in 0..p_marginal {
+                let mut v = 0.0;
+                for qu in 0..3 {
+                    for qv in 0..3 {
+                        v += h_pi[[qu, qv]] * (djt[qu][a] * jm[qv][b] + jt[qu][a] * djm[qv][b]);
+                    }
+                }
+                acc[[slices.time.start + a, slices.marginal.start + b]] += v;
+                acc[[slices.marginal.start + b, slices.time.start + a]] += v;
+            }
+        }
+        let gc = self
+            .logslope_design
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| format!("logslope_design try_row_chunk: {e}"))?;
+        let gr = gc.row(0);
+        for a in 0..p_time {
+            let mut w = 0.0;
+            for qu in 0..3 {
+                w += h_pi[[qu, 3]] * djt[qu][a];
+            }
+            for b in 0..slices.logslope.len() {
+                let v = w * gr[b];
+                acc[[slices.time.start + a, slices.logslope.start + b]] += v;
+                acc[[slices.logslope.start + b, slices.time.start + a]] += v;
+            }
+        }
+        for a in 0..p_marginal {
+            let mut w = 0.0;
+            for qu in 0..3 {
+                w += h_pi[[qu, 3]] * djm[qu][a];
+            }
+            for b in 0..slices.logslope.len() {
+                let v = w * gr[b];
+                acc[[slices.marginal.start + a, slices.logslope.start + b]] += v;
+                acc[[slices.logslope.start + b, slices.marginal.start + a]] += v;
+            }
+        }
+
+        for (primary_range, joint_range) in identity_blocks {
+            for local in 0..primary_range.len() {
+                let primary_idx = primary_range.start + local;
+                let joint_idx = joint_range.start + local;
+                for a in 0..p_time {
+                    let mut value = 0.0;
+                    for qu in 0..3 {
+                        value += h_pi[[qu, primary_idx]] * djt[qu][a];
+                    }
+                    acc[[slices.time.start + a, joint_idx]] += value;
+                    acc[[joint_idx, slices.time.start + a]] += value;
+                }
+                for a in 0..p_marginal {
+                    let mut value = 0.0;
+                    for qu in 0..3 {
+                        value += h_pi[[qu, primary_idx]] * djm[qu][a];
+                    }
+                    acc[[slices.marginal.start + a, joint_idx]] += value;
+                    acc[[joint_idx, slices.marginal.start + a]] += value;
+                }
+            }
+        }
+
+        // Term 4: Σ_r f_r dK_r/d
+        for a in 0..p_base {
+            for b in 0..p_base {
+                let dk0 = m3e * dh0 * xe[a] * xe[b];
+                let dk1 = m3x * dh1 * xx[a] * xx[b];
+                let dkd = m4x * dh1 * dr * xx[a] * xx[b]
+                    + m3x * ddr * xx[a] * xx[b]
+                    + m3x * dh1 * (xx[a] * xd[b] + xd[a] * xx[b]);
+                acc[[slices.time.start + a, slices.time.start + b]] +=
+                    f_pi[0] * dk0 + f_pi[1] * dk1 + f_pi[2] * dkd;
+            }
+        }
+        for li in 0..time_tail.len() {
+            let ci = time_tail.start + li;
+            for a in 0..p_base {
+                let dk0 = eg.basis_d2[[0, li]] * dh0 * xe[a];
+                let dk1 = xg.basis_d2[[0, li]] * dh1 * xx[a];
+                let dkd = xg.basis_d3[[0, li]] * dh1 * dr * xx[a]
+                    + xg.basis_d2[[0, li]] * ddr * xx[a]
+                    + xg.basis_d2[[0, li]] * dh1 * xd[a];
+                let v = f_pi[0] * dk0 + f_pi[1] * dk1 + f_pi[2] * dkd;
+                acc[[slices.time.start + a, slices.time.start + ci]] += v;
+                acc[[slices.time.start + ci, slices.time.start + a]] += v;
+            }
+        }
+        for a in 0..p_base {
+            for b in 0..p_marginal {
+                let dk0 = m3e * dh0 * xe[a] * mr[b];
+                let dk1 = m3x * dh1 * xx[a] * mr[b];
+                let dkd = m4x * dh1 * dr * xx[a] * mr[b]
+                    + m3x * ddr * xx[a] * mr[b]
+                    + m3x * dh1 * xd[a] * mr[b];
+                let v = f_pi[0] * dk0 + f_pi[1] * dk1 + f_pi[2] * dkd;
+                acc[[slices.time.start + a, slices.marginal.start + b]] += v;
+                acc[[slices.marginal.start + b, slices.time.start + a]] += v;
+            }
+        }
+        for li in 0..time_tail.len() {
+            let ci = time_tail.start + li;
+            for b in 0..p_marginal {
+                let dk0 = eg.basis_d2[[0, li]] * dh0 * mr[b];
+                let dk1 = xg.basis_d2[[0, li]] * dh1 * mr[b];
+                let dkd = xg.basis_d3[[0, li]] * dh1 * dr * mr[b]
+                    + xg.basis_d2[[0, li]] * ddr * mr[b];
+                let v = f_pi[0] * dk0 + f_pi[1] * dk1 + f_pi[2] * dkd;
+                acc[[slices.time.start + ci, slices.marginal.start + b]] += v;
+                acc[[slices.marginal.start + b, slices.time.start + ci]] += v;
+            }
+        }
+        for a in 0..p_marginal {
+            for b in 0..p_marginal {
+                let dk0 = m3e * dh0 * mr[a] * mr[b];
+                let dk1 = m3x * dh1 * mr[a] * mr[b];
+                let dkd = m4x * dh1 * dr * mr[a] * mr[b] + m3x * ddr * mr[a] * mr[b];
+                acc[[slices.marginal.start + a, slices.marginal.start + b]] +=
+                    f_pi[0] * dk0 + f_pi[1] * dk1 + f_pi[2] * dkd;
+            }
+        }
+        Ok(())
+    }
+
     /// Exact directional derivative of the joint Hessian for timewiggle-only
     /// models (no score-warp / link-deviation).  Computes the derivative by
     /// differentiating the J^T H J + f·K pullback through the timewiggle
@@ -14279,201 +14522,20 @@ impl SurvivalMarginalSlopeFamily {
                         &mut acc,
                     )?;
 
-                    // ── Timewiggle Jacobian derivatives ────────────────
-                    let ec = self
-                        .design_entry
-                        .try_row_chunk(row..row + 1)
-                        .map_err(|e| format!("design_entry try_row_chunk: {e}"))?;
-                    let xc = self
-                        .design_exit
-                        .try_row_chunk(row..row + 1)
-                        .map_err(|e| format!("design_exit try_row_chunk: {e}"))?;
-                    let dc = self
-                        .design_derivative_exit
-                        .try_row_chunk(row..row + 1)
-                        .map_err(|e| format!("design_derivative_exit try_row_chunk: {e}"))?;
-                    let xe = ec.row(0).slice(s![..p_base]).to_owned();
-                    let xx = xc.row(0).slice(s![..p_base]).to_owned();
-                    let xd = dc.row(0).slice(s![..p_base]).to_owned();
-                    let mc = self
-                        .marginal_design
-                        .try_row_chunk(row..row + 1)
-                        .map_err(|e| format!("marginal_design try_row_chunk: {e}"))?;
-                    let mr = mc.row(0).to_owned();
-                    let dh0 = xe.dot(&d_time.slice(s![..p_base])) + mr.dot(&d_marginal);
-                    let dh1 = xx.dot(&d_time.slice(s![..p_base])) + mr.dot(&d_marginal);
-                    let ddr = xd.dot(&d_time.slice(s![..p_base]));
-                    let bm = block_states[1].eta[row];
-                    let h0 = xe.dot(&beta_time.slice(s![..p_base])) + self.offset_entry[row] + bm;
-                    let h1 = xx.dot(&beta_time.slice(s![..p_base])) + self.offset_exit[row] + bm;
-                    let dr =
-                        xd.dot(&beta_time.slice(s![..p_base])) + self.derivative_offset_exit[row];
-                    let eg = self
-                        .time_wiggle_geometry(Array1::from_vec(vec![h0]).view(), beta_time_w)?
-                        .ok_or_else(|| "timewiggle geometry missing at entry".to_string())?;
-                    let xg = self
-                        .time_wiggle_geometry(Array1::from_vec(vec![h1]).view(), beta_time_w)?
-                        .ok_or_else(|| "timewiggle geometry missing at exit".to_string())?;
-                    let (m2e, m3e) = (eg.d2q_dq02[0], eg.d3q_dq03[0]);
-                    let (m2x, m3x, m4x) = (xg.d2q_dq02[0], xg.d3q_dq03[0], xg.d4q_dq04[0]);
-
-                    // dJ_{q,time}[a] / dβ[d]
-                    let mut dj0t = vec![0.0f64; p_time];
-                    let mut dj1t = vec![0.0f64; p_time];
-                    let mut djdt = vec![0.0f64; p_time];
-                    for a in 0..p_base {
-                        dj0t[a] = m2e * dh0 * xe[a];
-                        dj1t[a] = m2x * dh1 * xx[a];
-                        djdt[a] = m3x * dh1 * dr * xx[a] + m2x * ddr * xx[a] + m2x * dh1 * xd[a];
-                    }
-                    for li in 0..time_tail.len() {
-                        let ci = time_tail.start + li;
-                        dj0t[ci] = eg.basis_d1[[0, li]] * dh0;
-                        dj1t[ci] = xg.basis_d1[[0, li]] * dh1;
-                        djdt[ci] = xg.basis_d2[[0, li]] * dh1 * dr + xg.basis_d1[[0, li]] * ddr;
-                    }
-                    let djt = [&dj0t[..], &dj1t[..], &djdt[..]];
-                    let mut dj0m = vec![0.0f64; p_marginal];
-                    let mut dj1m = vec![0.0f64; p_marginal];
-                    let mut djdm = vec![0.0f64; p_marginal];
-                    for a in 0..p_marginal {
-                        dj0m[a] = m2e * dh0 * mr[a];
-                        dj1m[a] = m2x * dh1 * mr[a];
-                        djdm[a] = m3x * dh1 * dr * mr[a] + m2x * ddr * mr[a];
-                    }
-                    let djm = [&dj0m[..], &dj1m[..], &djdm[..]];
-                    let jt: [&Array1<f64>; 3] =
-                        [&q_geom.dq0_time, &q_geom.dq1_time, &q_geom.dqd1_time];
-                    let jm: [&Array1<f64>; 3] = [
-                        &q_geom.dq0_marginal,
-                        &q_geom.dq1_marginal,
-                        &q_geom.dqd1_marginal,
-                    ];
-
-                    // Term 2: (dJ/d)^T H J + J^T H (dJ/d)
-                    for a in 0..p_time {
-                        for b in 0..p_time {
-                            let mut v = 0.0;
-                            for qu in 0..3 {
-                                for qv in 0..3 {
-                                    v += h_pi[[qu, qv]]
-                                        * (djt[qu][a] * jt[qv][b] + jt[qu][a] * djt[qv][b]);
-                                }
-                            }
-                            acc[[slices.time.start + a, slices.time.start + b]] += v;
-                        }
-                    }
-                    for a in 0..p_marginal {
-                        for b in 0..p_marginal {
-                            let mut v = 0.0;
-                            for qu in 0..3 {
-                                for qv in 0..3 {
-                                    v += h_pi[[qu, qv]]
-                                        * (djm[qu][a] * jm[qv][b] + jm[qu][a] * djm[qv][b]);
-                                }
-                            }
-                            acc[[slices.marginal.start + a, slices.marginal.start + b]] += v;
-                        }
-                    }
-                    for a in 0..p_time {
-                        for b in 0..p_marginal {
-                            let mut v = 0.0;
-                            for qu in 0..3 {
-                                for qv in 0..3 {
-                                    v += h_pi[[qu, qv]]
-                                        * (djt[qu][a] * jm[qv][b] + jt[qu][a] * djm[qv][b]);
-                                }
-                            }
-                            acc[[slices.time.start + a, slices.marginal.start + b]] += v;
-                            acc[[slices.marginal.start + b, slices.time.start + a]] += v;
-                        }
-                    }
-                    let gc = self
-                        .logslope_design
-                        .try_row_chunk(row..row + 1)
-                        .map_err(|e| format!("logslope_design try_row_chunk: {e}"))?;
-                    let gr = gc.row(0);
-                    for a in 0..p_time {
-                        let mut w = 0.0;
-                        for qu in 0..3 {
-                            w += h_pi[[qu, 3]] * djt[qu][a];
-                        }
-                        for b in 0..slices.logslope.len() {
-                            let v = w * gr[b];
-                            acc[[slices.time.start + a, slices.logslope.start + b]] += v;
-                            acc[[slices.logslope.start + b, slices.time.start + a]] += v;
-                        }
-                    }
-                    for a in 0..p_marginal {
-                        let mut w = 0.0;
-                        for qu in 0..3 {
-                            w += h_pi[[qu, 3]] * djm[qu][a];
-                        }
-                        for b in 0..slices.logslope.len() {
-                            let v = w * gr[b];
-                            acc[[slices.marginal.start + a, slices.logslope.start + b]] += v;
-                            acc[[slices.logslope.start + b, slices.marginal.start + a]] += v;
-                        }
-                    }
-
-                    // Term 4: Σ_r f_r dK_r/d
-                    for a in 0..p_base {
-                        for b in 0..p_base {
-                            let dk0 = m3e * dh0 * xe[a] * xe[b];
-                            let dk1 = m3x * dh1 * xx[a] * xx[b];
-                            let dkd = m4x * dh1 * dr * xx[a] * xx[b]
-                                + m3x * ddr * xx[a] * xx[b]
-                                + m3x * dh1 * (xx[a] * xd[b] + xd[a] * xx[b]);
-                            acc[[slices.time.start + a, slices.time.start + b]] +=
-                                f_pi[0] * dk0 + f_pi[1] * dk1 + f_pi[2] * dkd;
-                        }
-                    }
-                    for li in 0..time_tail.len() {
-                        let ci = time_tail.start + li;
-                        for a in 0..p_base {
-                            let dk0 = eg.basis_d2[[0, li]] * dh0 * xe[a];
-                            let dk1 = xg.basis_d2[[0, li]] * dh1 * xx[a];
-                            let dkd = xg.basis_d3[[0, li]] * dh1 * dr * xx[a]
-                                + xg.basis_d2[[0, li]] * ddr * xx[a]
-                                + xg.basis_d2[[0, li]] * dh1 * xd[a];
-                            let v = f_pi[0] * dk0 + f_pi[1] * dk1 + f_pi[2] * dkd;
-                            acc[[slices.time.start + a, slices.time.start + ci]] += v;
-                            acc[[slices.time.start + ci, slices.time.start + a]] += v;
-                        }
-                    }
-                    for a in 0..p_base {
-                        for b in 0..p_marginal {
-                            let dk0 = m3e * dh0 * xe[a] * mr[b];
-                            let dk1 = m3x * dh1 * xx[a] * mr[b];
-                            let dkd = m4x * dh1 * dr * xx[a] * mr[b]
-                                + m3x * ddr * xx[a] * mr[b]
-                                + m3x * dh1 * xd[a] * mr[b];
-                            let v = f_pi[0] * dk0 + f_pi[1] * dk1 + f_pi[2] * dkd;
-                            acc[[slices.time.start + a, slices.marginal.start + b]] += v;
-                            acc[[slices.marginal.start + b, slices.time.start + a]] += v;
-                        }
-                    }
-                    for li in 0..time_tail.len() {
-                        let ci = time_tail.start + li;
-                        for b in 0..p_marginal {
-                            let dk0 = eg.basis_d2[[0, li]] * dh0 * mr[b];
-                            let dk1 = xg.basis_d2[[0, li]] * dh1 * mr[b];
-                            let dkd = xg.basis_d3[[0, li]] * dh1 * dr * mr[b]
-                                + xg.basis_d2[[0, li]] * ddr * mr[b];
-                            let v = f_pi[0] * dk0 + f_pi[1] * dk1 + f_pi[2] * dkd;
-                            acc[[slices.time.start + ci, slices.marginal.start + b]] += v;
-                            acc[[slices.marginal.start + b, slices.time.start + ci]] += v;
-                        }
-                    }
-                    for a in 0..p_marginal {
-                        for b in 0..p_marginal {
-                            let dk0 = m3e * dh0 * mr[a] * mr[b];
-                            let dk1 = m3x * dh1 * mr[a] * mr[b];
-                            let dkd = m4x * dh1 * dr * mr[a] * mr[b] + m3x * ddr * mr[a] * mr[b];
-                            acc[[slices.marginal.start + a, slices.marginal.start + b]] +=
-                                f_pi[0] * dk0 + f_pi[1] * dk1 + f_pi[2] * dkd;
-                        }
-                    }
+                    self.accumulate_timewiggle_directional_row(
+                        row,
+                        block_states,
+                        &slices,
+                        &q_geom,
+                        f_pi,
+                        h_pi.view(),
+                        d_time,
+                        d_marginal,
+                        beta_time,
+                        beta_time_w,
+                        &[],
+                        &mut acc,
+                    )?;
                     Ok(acc)
                 },
             )
@@ -14547,220 +14609,20 @@ impl SurvivalMarginalSlopeFamily {
                         &mut acc,
                     )?;
 
-                    let ec = self
-                        .design_entry
-                        .try_row_chunk(row..row + 1)
-                        .map_err(|e| format!("design_entry try_row_chunk: {e}"))?;
-                    let xc = self
-                        .design_exit
-                        .try_row_chunk(row..row + 1)
-                        .map_err(|e| format!("design_exit try_row_chunk: {e}"))?;
-                    let dc = self
-                        .design_derivative_exit
-                        .try_row_chunk(row..row + 1)
-                        .map_err(|e| format!("design_derivative_exit try_row_chunk: {e}"))?;
-                    let xe = ec.row(0).slice(s![..p_base]).to_owned();
-                    let xx = xc.row(0).slice(s![..p_base]).to_owned();
-                    let xd = dc.row(0).slice(s![..p_base]).to_owned();
-                    let mc = self
-                        .marginal_design
-                        .try_row_chunk(row..row + 1)
-                        .map_err(|e| format!("marginal_design try_row_chunk: {e}"))?;
-                    let mr = mc.row(0).to_owned();
-                    let dh0 = xe.dot(&d_time.slice(s![..p_base])) + mr.dot(&d_marginal);
-                    let dh1 = xx.dot(&d_time.slice(s![..p_base])) + mr.dot(&d_marginal);
-                    let ddr = xd.dot(&d_time.slice(s![..p_base]));
-                    let bm = block_states[1].eta[row];
-                    let h0 = xe.dot(&beta_time.slice(s![..p_base])) + self.offset_entry[row] + bm;
-                    let h1 = xx.dot(&beta_time.slice(s![..p_base])) + self.offset_exit[row] + bm;
-                    let dr =
-                        xd.dot(&beta_time.slice(s![..p_base])) + self.derivative_offset_exit[row];
-                    let eg = self
-                        .time_wiggle_geometry(Array1::from_vec(vec![h0]).view(), beta_time_w)?
-                        .ok_or_else(|| "timewiggle geometry missing at entry".to_string())?;
-                    let xg = self
-                        .time_wiggle_geometry(Array1::from_vec(vec![h1]).view(), beta_time_w)?
-                        .ok_or_else(|| "timewiggle geometry missing at exit".to_string())?;
-                    let (m2e, m3e) = (eg.d2q_dq02[0], eg.d3q_dq03[0]);
-                    let (m2x, m3x, m4x) = (xg.d2q_dq02[0], xg.d3q_dq03[0], xg.d4q_dq04[0]);
-
-                    let mut dj0t = vec![0.0f64; p_time];
-                    let mut dj1t = vec![0.0f64; p_time];
-                    let mut djdt = vec![0.0f64; p_time];
-                    for a in 0..p_base {
-                        dj0t[a] = m2e * dh0 * xe[a];
-                        dj1t[a] = m2x * dh1 * xx[a];
-                        djdt[a] = m3x * dh1 * dr * xx[a] + m2x * ddr * xx[a] + m2x * dh1 * xd[a];
-                    }
-                    for li in 0..time_tail.len() {
-                        let ci = time_tail.start + li;
-                        dj0t[ci] = eg.basis_d1[[0, li]] * dh0;
-                        dj1t[ci] = xg.basis_d1[[0, li]] * dh1;
-                        djdt[ci] = xg.basis_d2[[0, li]] * dh1 * dr + xg.basis_d1[[0, li]] * ddr;
-                    }
-                    let djt = [&dj0t[..], &dj1t[..], &djdt[..]];
-                    let mut dj0m = vec![0.0f64; p_marginal];
-                    let mut dj1m = vec![0.0f64; p_marginal];
-                    let mut djdm = vec![0.0f64; p_marginal];
-                    for a in 0..p_marginal {
-                        dj0m[a] = m2e * dh0 * mr[a];
-                        dj1m[a] = m2x * dh1 * mr[a];
-                        djdm[a] = m3x * dh1 * dr * mr[a] + m2x * ddr * mr[a];
-                    }
-                    let djm = [&dj0m[..], &dj1m[..], &djdm[..]];
-                    let jt: [&Array1<f64>; 3] =
-                        [&q_geom.dq0_time, &q_geom.dq1_time, &q_geom.dqd1_time];
-                    let jm: [&Array1<f64>; 3] = [
-                        &q_geom.dq0_marginal,
-                        &q_geom.dq1_marginal,
-                        &q_geom.dqd1_marginal,
-                    ];
-
-                    for a in 0..p_time {
-                        for b in 0..p_time {
-                            let mut v = 0.0;
-                            for qu in 0..3 {
-                                for qv in 0..3 {
-                                    v += h_pi[[qu, qv]]
-                                        * (djt[qu][a] * jt[qv][b] + jt[qu][a] * djt[qv][b]);
-                                }
-                            }
-                            acc[[slices.time.start + a, slices.time.start + b]] += v;
-                        }
-                    }
-                    for a in 0..p_marginal {
-                        for b in 0..p_marginal {
-                            let mut v = 0.0;
-                            for qu in 0..3 {
-                                for qv in 0..3 {
-                                    v += h_pi[[qu, qv]]
-                                        * (djm[qu][a] * jm[qv][b] + jm[qu][a] * djm[qv][b]);
-                                }
-                            }
-                            acc[[slices.marginal.start + a, slices.marginal.start + b]] += v;
-                        }
-                    }
-                    for a in 0..p_time {
-                        for b in 0..p_marginal {
-                            let mut v = 0.0;
-                            for qu in 0..3 {
-                                for qv in 0..3 {
-                                    v += h_pi[[qu, qv]]
-                                        * (djt[qu][a] * jm[qv][b] + jt[qu][a] * djm[qv][b]);
-                                }
-                            }
-                            acc[[slices.time.start + a, slices.marginal.start + b]] += v;
-                            acc[[slices.marginal.start + b, slices.time.start + a]] += v;
-                        }
-                    }
-                    let gc = self
-                        .logslope_design
-                        .try_row_chunk(row..row + 1)
-                        .map_err(|e| format!("logslope_design try_row_chunk: {e}"))?;
-                    let gr = gc.row(0);
-                    for a in 0..p_time {
-                        let mut w = 0.0;
-                        for qu in 0..3 {
-                            w += h_pi[[qu, 3]] * djt[qu][a];
-                        }
-                        for b in 0..slices.logslope.len() {
-                            let v = w * gr[b];
-                            acc[[slices.time.start + a, slices.logslope.start + b]] += v;
-                            acc[[slices.logslope.start + b, slices.time.start + a]] += v;
-                        }
-                    }
-                    for a in 0..p_marginal {
-                        let mut w = 0.0;
-                        for qu in 0..3 {
-                            w += h_pi[[qu, 3]] * djm[qu][a];
-                        }
-                        for b in 0..slices.logslope.len() {
-                            let v = w * gr[b];
-                            acc[[slices.marginal.start + a, slices.logslope.start + b]] += v;
-                            acc[[slices.logslope.start + b, slices.marginal.start + a]] += v;
-                        }
-                    }
-
-                    for (primary_range, joint_range) in &identity_blocks {
-                        for local in 0..primary_range.len() {
-                            let primary_idx = primary_range.start + local;
-                            let joint_idx = joint_range.start + local;
-                            for a in 0..p_time {
-                                let mut value = 0.0;
-                                for qu in 0..3 {
-                                    value += h_pi[[qu, primary_idx]] * djt[qu][a];
-                                }
-                                acc[[slices.time.start + a, joint_idx]] += value;
-                                acc[[joint_idx, slices.time.start + a]] += value;
-                            }
-                            for a in 0..p_marginal {
-                                let mut value = 0.0;
-                                for qu in 0..3 {
-                                    value += h_pi[[qu, primary_idx]] * djm[qu][a];
-                                }
-                                acc[[slices.marginal.start + a, joint_idx]] += value;
-                                acc[[joint_idx, slices.marginal.start + a]] += value;
-                            }
-                        }
-                    }
-
-                    for a in 0..p_base {
-                        for b in 0..p_base {
-                            let dk0 = m3e * dh0 * xe[a] * xe[b];
-                            let dk1 = m3x * dh1 * xx[a] * xx[b];
-                            let dkd = m4x * dh1 * dr * xx[a] * xx[b]
-                                + m3x * ddr * xx[a] * xx[b]
-                                + m3x * dh1 * (xx[a] * xd[b] + xd[a] * xx[b]);
-                            acc[[slices.time.start + a, slices.time.start + b]] +=
-                                f_pi[0] * dk0 + f_pi[1] * dk1 + f_pi[2] * dkd;
-                        }
-                    }
-                    for li in 0..time_tail.len() {
-                        let ci = time_tail.start + li;
-                        for a in 0..p_base {
-                            let dk0 = eg.basis_d2[[0, li]] * dh0 * xe[a];
-                            let dk1 = xg.basis_d2[[0, li]] * dh1 * xx[a];
-                            let dkd = xg.basis_d3[[0, li]] * dh1 * dr * xx[a]
-                                + xg.basis_d2[[0, li]] * ddr * xx[a]
-                                + xg.basis_d2[[0, li]] * dh1 * xd[a];
-                            let v = f_pi[0] * dk0 + f_pi[1] * dk1 + f_pi[2] * dkd;
-                            acc[[slices.time.start + a, slices.time.start + ci]] += v;
-                            acc[[slices.time.start + ci, slices.time.start + a]] += v;
-                        }
-                    }
-                    for a in 0..p_base {
-                        for b in 0..p_marginal {
-                            let dk0 = m3e * dh0 * xe[a] * mr[b];
-                            let dk1 = m3x * dh1 * xx[a] * mr[b];
-                            let dkd = m4x * dh1 * dr * xx[a] * mr[b]
-                                + m3x * ddr * xx[a] * mr[b]
-                                + m3x * dh1 * xd[a] * mr[b];
-                            let v = f_pi[0] * dk0 + f_pi[1] * dk1 + f_pi[2] * dkd;
-                            acc[[slices.time.start + a, slices.marginal.start + b]] += v;
-                            acc[[slices.marginal.start + b, slices.time.start + a]] += v;
-                        }
-                    }
-                    for li in 0..time_tail.len() {
-                        let ci = time_tail.start + li;
-                        for b in 0..p_marginal {
-                            let dk0 = eg.basis_d2[[0, li]] * dh0 * mr[b];
-                            let dk1 = xg.basis_d2[[0, li]] * dh1 * mr[b];
-                            let dkd = xg.basis_d3[[0, li]] * dh1 * dr * mr[b]
-                                + xg.basis_d2[[0, li]] * ddr * mr[b];
-                            let v = f_pi[0] * dk0 + f_pi[1] * dk1 + f_pi[2] * dkd;
-                            acc[[slices.time.start + ci, slices.marginal.start + b]] += v;
-                            acc[[slices.marginal.start + b, slices.time.start + ci]] += v;
-                        }
-                    }
-                    for a in 0..p_marginal {
-                        for b in 0..p_marginal {
-                            let dk0 = m3e * dh0 * mr[a] * mr[b];
-                            let dk1 = m3x * dh1 * mr[a] * mr[b];
-                            let dkd = m4x * dh1 * dr * mr[a] * mr[b] + m3x * ddr * mr[a] * mr[b];
-                            acc[[slices.marginal.start + a, slices.marginal.start + b]] +=
-                                f_pi[0] * dk0 + f_pi[1] * dk1 + f_pi[2] * dkd;
-                        }
-                    }
+                    self.accumulate_timewiggle_directional_row(
+                        row,
+                        block_states,
+                        &slices,
+                        &q_geom,
+                        &f_pi,
+                        h_pi.view(),
+                        d_time,
+                        d_marginal,
+                        beta_time,
+                        beta_time_w,
+                        &identity_blocks,
+                        &mut acc,
+                    )?;
 
                     Ok(acc)
                 },

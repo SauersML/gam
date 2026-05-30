@@ -172,6 +172,158 @@ mod tests {
         Ok((family, states, cache, direction))
     }
 
+    /// Shared fixture for the dual-flex (score-warp + link-deviation) exact
+    /// higher-order tests. Returns the family plus its four-block parameter
+    /// state. Every dual-flex test site builds the identical `z`/`y`/`weights`
+    /// data, the same score-warp and link-deviation blocks, and the same
+    /// `block_states`; this collapses that ~57-line preamble into one call.
+    fn dual_flex_exact_fixture() -> (BernoulliMarginalSlopeFamily, Vec<ParameterBlockState>) {
+        let z = array![-0.8, 0.2, 1.1];
+        let y = array![0.0, 1.0, 1.0];
+        let weights = array![1.0, 0.7, 1.3];
+        let score_prepared = build_score_warp_deviation_block_from_seed(
+            &z,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("score warp block");
+        let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
+        let link_prepared = build_test_link_deviation_block_from_seed(
+            &link_seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("link block");
+        let family =
+            BernoulliMarginalSlopeFamily {
+                y: Arc::new(y.clone()),
+                weights: Arc::new(weights.clone()),
+                z: Arc::new(z.clone()),
+                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    array![[1.0], [1.0], [1.0]],
+                )),
+                score_warp: Some(score_prepared.runtime.clone()),
+                link_dev: Some(link_prepared.runtime.clone()),
+                ..default_test_family()
+            };
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.25],
+                eta: Array1::from_elem(z.len(), 0.25),
+            },
+            ParameterBlockState {
+                beta: array![0.6],
+                eta: Array1::from_elem(z.len(), 0.6),
+            },
+            ParameterBlockState {
+                beta: Array1::from_iter(
+                    (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
+                ),
+                eta: Array1::zeros(z.len()),
+            },
+            ParameterBlockState {
+                beta: Array1::from_iter(
+                    (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
+                ),
+                eta: Array1::zeros(z.len()),
+            },
+        ];
+        (family, block_states)
+    }
+
+    /// Shared fixture for the h-only (score-warp deviation) exact higher-order
+    /// tests. Identical `seed`, single deviation block, and `block_states`
+    /// across every h-only site.
+    fn h_only_exact_fixture() -> (BernoulliMarginalSlopeFamily, Vec<ParameterBlockState>) {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_score_warp_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build score-warp block");
+        let score_dim = prepared
+            .block
+            .initial_beta
+            .as_ref()
+            .expect("score-warp initial beta")
+            .len();
+        let block_states = vec![
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(
+                Array1::from_iter((0..score_dim).map(|idx| 0.04 * (idx as f64 + 1.0))),
+                seed.len(),
+            ),
+        ];
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
+            weights: Arc::new(Array1::ones(seed.len())),
+            z: Arc::new(seed.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            score_warp: Some(prepared.runtime.clone()),
+            ..default_test_family()
+        };
+        (family, block_states)
+    }
+
+    /// Shared fixture for the w-only (link-deviation) exact higher-order tests.
+    /// Identical `seed`, single deviation block, and `block_states` across every
+    /// w-only site.
+    fn w_only_exact_fixture() -> (BernoulliMarginalSlopeFamily, Vec<ParameterBlockState>) {
+        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
+        let prepared = build_test_link_deviation_block_from_seed(
+            &seed,
+            &DeviationBlockConfig {
+                num_internal_knots: 4,
+                ..DeviationBlockConfig::default()
+            },
+        )
+        .expect("build link deviation block");
+        let link_dim = prepared
+            .block
+            .initial_beta
+            .as_ref()
+            .expect("link initial beta")
+            .len();
+        let block_states = vec![
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(array![0.0], seed.len()),
+            dummy_block_state(
+                Array1::from_iter((0..link_dim).map(|idx| 0.05 * (idx as f64 + 1.0))),
+                seed.len(),
+            ),
+        ];
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
+            weights: Arc::new(Array1::ones(seed.len())),
+            z: Arc::new(seed.clone()),
+            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::zeros((seed.len(), 0)),
+            )),
+            link_dev: Some(prepared.runtime.clone()),
+            ..default_test_family()
+        };
+        (family, block_states)
+    }
+
     fn assert_allclose_relative(actual: &Array1<f64>, expected: &Array1<f64>, tol: f64) {
         assert_eq!(actual.len(), expected.len());
         for (idx, (&a, &e)) in actual.iter().zip(expected.iter()).enumerate() {
@@ -3972,63 +4124,7 @@ mod tests {
 
     #[test]
     fn dual_flex_row_primary_higher_order_contractions_are_finite_and_symmetric() {
-        let z = array![-0.8, 0.2, 1.1];
-        let y = array![0.0, 1.0, 1.0];
-        let weights = array![1.0, 0.7, 1.3];
-        let score_prepared = build_score_warp_deviation_block_from_seed(
-            &z,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("score warp block");
-        let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_test_link_deviation_block_from_seed(
-            &link_seed,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("link block");
-        let family =
-            BernoulliMarginalSlopeFamily {
-                y: Arc::new(y.clone()),
-                weights: Arc::new(weights.clone()),
-                z: Arc::new(z.clone()),
-                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                    array![[1.0], [1.0], [1.0]],
-                )),
-                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                    array![[1.0], [1.0], [1.0]],
-                )),
-                score_warp: Some(score_prepared.runtime.clone()),
-                link_dev: Some(link_prepared.runtime.clone()),
-                ..default_test_family()
-            };
-        let block_states = vec![
-            ParameterBlockState {
-                beta: array![0.25],
-                eta: Array1::from_elem(z.len(), 0.25),
-            },
-            ParameterBlockState {
-                beta: array![0.6],
-                eta: Array1::from_elem(z.len(), 0.6),
-            },
-            ParameterBlockState {
-                beta: Array1::from_iter(
-                    (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
-                ),
-                eta: Array1::zeros(z.len()),
-            },
-            ParameterBlockState {
-                beta: Array1::from_iter(
-                    (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
-                ),
-                eta: Array1::zeros(z.len()),
-            },
-        ];
+        let (family, block_states) = dual_flex_exact_fixture();
 
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -4056,7 +4152,7 @@ mod tests {
 
         let mut max_abs_third = 0.0_f64;
         let mut max_abs_fourth = 0.0_f64;
-        for row in 0..z.len() {
+        for row in 0..family.z.len() {
             let row_ctx = family
                 .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
@@ -4118,69 +4214,13 @@ mod tests {
 
     #[test]
     fn dual_flex_row_primary_higher_order_zero_direction_returns_zero() {
-        let z = array![-0.8, 0.2, 1.1];
-        let y = array![0.0, 1.0, 1.0];
-        let weights = array![1.0, 0.7, 1.3];
-        let score_prepared = build_score_warp_deviation_block_from_seed(
-            &z,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("score warp block");
-        let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_test_link_deviation_block_from_seed(
-            &link_seed,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("link block");
-        let family =
-            BernoulliMarginalSlopeFamily {
-                y: Arc::new(y.clone()),
-                weights: Arc::new(weights.clone()),
-                z: Arc::new(z.clone()),
-                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                    array![[1.0], [1.0], [1.0]],
-                )),
-                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                    array![[1.0], [1.0], [1.0]],
-                )),
-                score_warp: Some(score_prepared.runtime.clone()),
-                link_dev: Some(link_prepared.runtime.clone()),
-                ..default_test_family()
-            };
-        let block_states = vec![
-            ParameterBlockState {
-                beta: array![0.25],
-                eta: Array1::from_elem(z.len(), 0.25),
-            },
-            ParameterBlockState {
-                beta: array![0.6],
-                eta: Array1::from_elem(z.len(), 0.6),
-            },
-            ParameterBlockState {
-                beta: Array1::from_iter(
-                    (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
-                ),
-                eta: Array1::zeros(z.len()),
-            },
-            ParameterBlockState {
-                beta: Array1::from_iter(
-                    (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
-                ),
-                eta: Array1::zeros(z.len()),
-            },
-        ];
+        let (family, block_states) = dual_flex_exact_fixture();
 
         let cache = family
             .build_exact_eval_cache(&block_states)
             .expect("exact eval cache");
         let zero = Array1::<f64>::zeros(cache.primary.total);
-        for row in 0..z.len() {
+        for row in 0..family.z.len() {
             let row_ctx = family
                 .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
@@ -4215,47 +4255,12 @@ mod tests {
 
     #[test]
     fn h_only_row_primary_higher_order_zero_direction_returns_zero() {
-        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_score_warp_deviation_block_from_seed(
-            &seed,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("build score-warp block");
-        let score_dim = prepared
-            .block
-            .initial_beta
-            .as_ref()
-            .expect("score-warp initial beta")
-            .len();
-        let block_states = vec![
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(
-                Array1::from_iter((0..score_dim).map(|idx| 0.04 * (idx as f64 + 1.0))),
-                seed.len(),
-            ),
-        ];
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
-            weights: Arc::new(Array1::ones(seed.len())),
-            z: Arc::new(seed.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            score_warp: Some(prepared.runtime.clone()),
-            ..default_test_family()
-        };
+        let (family, block_states) = h_only_exact_fixture();
         let cache = family
             .build_exact_eval_cache(&block_states)
             .expect("exact eval cache");
         let zero = Array1::<f64>::zeros(cache.primary.total);
-        for row in 0..seed.len() {
+        for row in 0..family.z.len() {
             let row_ctx = family
                 .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
@@ -4290,47 +4295,12 @@ mod tests {
 
     #[test]
     fn w_only_row_primary_higher_order_zero_direction_returns_zero() {
-        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_test_link_deviation_block_from_seed(
-            &seed,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("build link deviation block");
-        let link_dim = prepared
-            .block
-            .initial_beta
-            .as_ref()
-            .expect("link initial beta")
-            .len();
-        let block_states = vec![
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(
-                Array1::from_iter((0..link_dim).map(|idx| 0.05 * (idx as f64 + 1.0))),
-                seed.len(),
-            ),
-        ];
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
-            weights: Arc::new(Array1::ones(seed.len())),
-            z: Arc::new(seed.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            link_dev: Some(prepared.runtime.clone()),
-            ..default_test_family()
-        };
+        let (family, block_states) = w_only_exact_fixture();
         let cache = family
             .build_exact_eval_cache(&block_states)
             .expect("exact eval cache");
         let zero = Array1::<f64>::zeros(cache.primary.total);
-        for row in 0..seed.len() {
+        for row in 0..family.z.len() {
             let row_ctx = family
                 .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
@@ -4365,63 +4335,7 @@ mod tests {
 
     #[test]
     fn dual_flex_exact_outer_zero_direction_returns_zero() {
-        let z = array![-0.8, 0.2, 1.1];
-        let y = array![0.0, 1.0, 1.0];
-        let weights = array![1.0, 0.7, 1.3];
-        let score_prepared = build_score_warp_deviation_block_from_seed(
-            &z,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("score warp block");
-        let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_test_link_deviation_block_from_seed(
-            &link_seed,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("link block");
-        let family =
-            BernoulliMarginalSlopeFamily {
-                y: Arc::new(y.clone()),
-                weights: Arc::new(weights.clone()),
-                z: Arc::new(z.clone()),
-                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                    array![[1.0], [1.0], [1.0]],
-                )),
-                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                    array![[1.0], [1.0], [1.0]],
-                )),
-                score_warp: Some(score_prepared.runtime.clone()),
-                link_dev: Some(link_prepared.runtime.clone()),
-                ..default_test_family()
-            };
-        let block_states = vec![
-            ParameterBlockState {
-                beta: array![0.25],
-                eta: Array1::from_elem(z.len(), 0.25),
-            },
-            ParameterBlockState {
-                beta: array![0.6],
-                eta: Array1::from_elem(z.len(), 0.6),
-            },
-            ParameterBlockState {
-                beta: Array1::from_iter(
-                    (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
-                ),
-                eta: Array1::zeros(z.len()),
-            },
-            ParameterBlockState {
-                beta: Array1::from_iter(
-                    (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
-                ),
-                eta: Array1::zeros(z.len()),
-            },
-        ];
+        let (family, block_states) = dual_flex_exact_fixture();
 
         let slices = block_slices(&family);
         let zero = Array1::<f64>::zeros(slices.total);
@@ -4446,63 +4360,7 @@ mod tests {
 
     #[test]
     fn dual_flex_exact_outer_fourth_direction_swap_is_symmetric() {
-        let z = array![-0.8, 0.2, 1.1];
-        let y = array![0.0, 1.0, 1.0];
-        let weights = array![1.0, 0.7, 1.3];
-        let score_prepared = build_score_warp_deviation_block_from_seed(
-            &z,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("score warp block");
-        let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_test_link_deviation_block_from_seed(
-            &link_seed,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("link block");
-        let family =
-            BernoulliMarginalSlopeFamily {
-                y: Arc::new(y.clone()),
-                weights: Arc::new(weights.clone()),
-                z: Arc::new(z.clone()),
-                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                    array![[1.0], [1.0], [1.0]],
-                )),
-                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                    array![[1.0], [1.0], [1.0]],
-                )),
-                score_warp: Some(score_prepared.runtime.clone()),
-                link_dev: Some(link_prepared.runtime.clone()),
-                ..default_test_family()
-            };
-        let block_states = vec![
-            ParameterBlockState {
-                beta: array![0.25],
-                eta: Array1::from_elem(z.len(), 0.25),
-            },
-            ParameterBlockState {
-                beta: array![0.6],
-                eta: Array1::from_elem(z.len(), 0.6),
-            },
-            ParameterBlockState {
-                beta: Array1::from_iter(
-                    (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
-                ),
-                eta: Array1::zeros(z.len()),
-            },
-            ParameterBlockState {
-                beta: Array1::from_iter(
-                    (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
-                ),
-                eta: Array1::zeros(z.len()),
-            },
-        ];
+        let (family, block_states) = dual_flex_exact_fixture();
 
         let slices = block_slices(&family);
         let total = slices.total;
@@ -4549,63 +4407,7 @@ mod tests {
 
     #[test]
     fn dual_flex_row_primary_fourth_direction_swap_is_symmetric() {
-        let z = array![-0.8, 0.2, 1.1];
-        let y = array![0.0, 1.0, 1.0];
-        let weights = array![1.0, 0.7, 1.3];
-        let score_prepared = build_score_warp_deviation_block_from_seed(
-            &z,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("score warp block");
-        let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_test_link_deviation_block_from_seed(
-            &link_seed,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("link block");
-        let family =
-            BernoulliMarginalSlopeFamily {
-                y: Arc::new(y.clone()),
-                weights: Arc::new(weights.clone()),
-                z: Arc::new(z.clone()),
-                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                    array![[1.0], [1.0], [1.0]],
-                )),
-                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                    array![[1.0], [1.0], [1.0]],
-                )),
-                score_warp: Some(score_prepared.runtime.clone()),
-                link_dev: Some(link_prepared.runtime.clone()),
-                ..default_test_family()
-            };
-        let block_states = vec![
-            ParameterBlockState {
-                beta: array![0.25],
-                eta: Array1::from_elem(z.len(), 0.25),
-            },
-            ParameterBlockState {
-                beta: array![0.6],
-                eta: Array1::from_elem(z.len(), 0.6),
-            },
-            ParameterBlockState {
-                beta: Array1::from_iter(
-                    (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
-                ),
-                eta: Array1::zeros(z.len()),
-            },
-            ParameterBlockState {
-                beta: Array1::from_iter(
-                    (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
-                ),
-                eta: Array1::zeros(z.len()),
-            },
-        ];
+        let (family, block_states) = dual_flex_exact_fixture();
 
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -4631,7 +4433,7 @@ mod tests {
             dir_v[w_range.start + 1] = -0.02;
         }
 
-        for row in 0..z.len() {
+        for row in 0..family.z.len() {
             let row_ctx = family
                 .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
@@ -4671,63 +4473,7 @@ mod tests {
 
     #[test]
     fn dual_flex_row_primary_higher_order_direction_sign_rules_hold() {
-        let z = array![-0.8, 0.2, 1.1];
-        let y = array![0.0, 1.0, 1.0];
-        let weights = array![1.0, 0.7, 1.3];
-        let score_prepared = build_score_warp_deviation_block_from_seed(
-            &z,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("score warp block");
-        let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_test_link_deviation_block_from_seed(
-            &link_seed,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("link block");
-        let family =
-            BernoulliMarginalSlopeFamily {
-                y: Arc::new(y.clone()),
-                weights: Arc::new(weights.clone()),
-                z: Arc::new(z.clone()),
-                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                    array![[1.0], [1.0], [1.0]],
-                )),
-                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                    array![[1.0], [1.0], [1.0]],
-                )),
-                score_warp: Some(score_prepared.runtime.clone()),
-                link_dev: Some(link_prepared.runtime.clone()),
-                ..default_test_family()
-            };
-        let block_states = vec![
-            ParameterBlockState {
-                beta: array![0.25],
-                eta: Array1::from_elem(z.len(), 0.25),
-            },
-            ParameterBlockState {
-                beta: array![0.6],
-                eta: Array1::from_elem(z.len(), 0.6),
-            },
-            ParameterBlockState {
-                beta: Array1::from_iter(
-                    (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
-                ),
-                eta: Array1::zeros(z.len()),
-            },
-            ParameterBlockState {
-                beta: Array1::from_iter(
-                    (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
-                ),
-                eta: Array1::zeros(z.len()),
-            },
-        ];
+        let (family, block_states) = dual_flex_exact_fixture();
 
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -4754,7 +4500,7 @@ mod tests {
         }
 
         let neg_dir_u = dir_u.mapv(|value| -value);
-        for row in 0..z.len() {
+        for row in 0..family.z.len() {
             let row_ctx = family
                 .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
@@ -4814,42 +4560,7 @@ mod tests {
 
     #[test]
     fn h_only_row_primary_fourth_direction_swap_is_symmetric() {
-        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_score_warp_deviation_block_from_seed(
-            &seed,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("build score-warp block");
-        let score_dim = prepared
-            .block
-            .initial_beta
-            .as_ref()
-            .expect("score-warp initial beta")
-            .len();
-        let block_states = vec![
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(
-                Array1::from_iter((0..score_dim).map(|idx| 0.04 * (idx as f64 + 1.0))),
-                seed.len(),
-            ),
-        ];
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
-            weights: Arc::new(Array1::ones(seed.len())),
-            z: Arc::new(seed.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            score_warp: Some(prepared.runtime.clone()),
-            ..default_test_family()
-        };
+        let (family, block_states) = h_only_exact_fixture();
         let cache = family
             .build_exact_eval_cache(&block_states)
             .expect("exact eval cache");
@@ -4871,7 +4582,7 @@ mod tests {
             dir_v[h_range.start + 1] = 0.05;
         }
 
-        for row in 0..seed.len() {
+        for row in 0..family.z.len() {
             let row_ctx = family
                 .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
@@ -4909,42 +4620,7 @@ mod tests {
 
     #[test]
     fn w_only_row_primary_fourth_direction_swap_is_symmetric() {
-        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_test_link_deviation_block_from_seed(
-            &seed,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("build link deviation block");
-        let link_dim = prepared
-            .block
-            .initial_beta
-            .as_ref()
-            .expect("link initial beta")
-            .len();
-        let block_states = vec![
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(
-                Array1::from_iter((0..link_dim).map(|idx| 0.05 * (idx as f64 + 1.0))),
-                seed.len(),
-            ),
-        ];
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
-            weights: Arc::new(Array1::ones(seed.len())),
-            z: Arc::new(seed.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            link_dev: Some(prepared.runtime.clone()),
-            ..default_test_family()
-        };
+        let (family, block_states) = w_only_exact_fixture();
         let cache = family
             .build_exact_eval_cache(&block_states)
             .expect("exact eval cache");
@@ -4966,7 +4642,7 @@ mod tests {
             dir_v[w_range.start + 1] = 0.03;
         }
 
-        for row in 0..seed.len() {
+        for row in 0..family.z.len() {
             let row_ctx = family
                 .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
@@ -5004,42 +4680,7 @@ mod tests {
 
     #[test]
     fn h_only_row_primary_higher_order_direction_sign_rules_hold() {
-        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_score_warp_deviation_block_from_seed(
-            &seed,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("build score-warp block");
-        let score_dim = prepared
-            .block
-            .initial_beta
-            .as_ref()
-            .expect("score-warp initial beta")
-            .len();
-        let block_states = vec![
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(
-                Array1::from_iter((0..score_dim).map(|idx| 0.04 * (idx as f64 + 1.0))),
-                seed.len(),
-            ),
-        ];
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
-            weights: Arc::new(Array1::ones(seed.len())),
-            z: Arc::new(seed.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            score_warp: Some(prepared.runtime.clone()),
-            ..default_test_family()
-        };
+        let (family, block_states) = h_only_exact_fixture();
         let cache = family
             .build_exact_eval_cache(&block_states)
             .expect("exact eval cache");
@@ -5054,7 +4695,7 @@ mod tests {
         }
         let neg_dir = dir.mapv(|value| -value);
 
-        for row in 0..seed.len() {
+        for row in 0..family.z.len() {
             let row_ctx = family
                 .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
@@ -5110,42 +4751,7 @@ mod tests {
 
     #[test]
     fn w_only_row_primary_higher_order_direction_sign_rules_hold() {
-        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_test_link_deviation_block_from_seed(
-            &seed,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("build link deviation block");
-        let link_dim = prepared
-            .block
-            .initial_beta
-            .as_ref()
-            .expect("link initial beta")
-            .len();
-        let block_states = vec![
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(
-                Array1::from_iter((0..link_dim).map(|idx| 0.05 * (idx as f64 + 1.0))),
-                seed.len(),
-            ),
-        ];
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
-            weights: Arc::new(Array1::ones(seed.len())),
-            z: Arc::new(seed.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            link_dev: Some(prepared.runtime.clone()),
-            ..default_test_family()
-        };
+        let (family, block_states) = w_only_exact_fixture();
         let cache = family
             .build_exact_eval_cache(&block_states)
             .expect("exact eval cache");
@@ -5160,7 +4766,7 @@ mod tests {
         }
         let neg_dir = dir.mapv(|value| -value);
 
-        for row in 0..seed.len() {
+        for row in 0..family.z.len() {
             let row_ctx = family
                 .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
@@ -5216,63 +4822,7 @@ mod tests {
 
     #[test]
     fn dual_flex_exact_outer_direction_sign_rules_hold() {
-        let z = array![-0.8, 0.2, 1.1];
-        let y = array![0.0, 1.0, 1.0];
-        let weights = array![1.0, 0.7, 1.3];
-        let score_prepared = build_score_warp_deviation_block_from_seed(
-            &z,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("score warp block");
-        let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_test_link_deviation_block_from_seed(
-            &link_seed,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("link block");
-        let family =
-            BernoulliMarginalSlopeFamily {
-                y: Arc::new(y.clone()),
-                weights: Arc::new(weights.clone()),
-                z: Arc::new(z.clone()),
-                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                    array![[1.0], [1.0], [1.0]],
-                )),
-                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                    array![[1.0], [1.0], [1.0]],
-                )),
-                score_warp: Some(score_prepared.runtime.clone()),
-                link_dev: Some(link_prepared.runtime.clone()),
-                ..default_test_family()
-            };
-        let block_states = vec![
-            ParameterBlockState {
-                beta: array![0.25],
-                eta: Array1::from_elem(z.len(), 0.25),
-            },
-            ParameterBlockState {
-                beta: array![0.6],
-                eta: Array1::from_elem(z.len(), 0.6),
-            },
-            ParameterBlockState {
-                beta: Array1::from_iter(
-                    (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
-                ),
-                eta: Array1::zeros(z.len()),
-            },
-            ParameterBlockState {
-                beta: Array1::from_iter(
-                    (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
-                ),
-                eta: Array1::zeros(z.len()),
-            },
-        ];
+        let (family, block_states) = dual_flex_exact_fixture();
 
         let slices = block_slices(&family);
         let total = slices.total;
@@ -5338,63 +4888,7 @@ mod tests {
 
     #[test]
     fn dual_flex_exact_outer_fourth_double_sign_flip_is_invariant() {
-        let z = array![-0.8, 0.2, 1.1];
-        let y = array![0.0, 1.0, 1.0];
-        let weights = array![1.0, 0.7, 1.3];
-        let score_prepared = build_score_warp_deviation_block_from_seed(
-            &z,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("score warp block");
-        let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_test_link_deviation_block_from_seed(
-            &link_seed,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("link block");
-        let family =
-            BernoulliMarginalSlopeFamily {
-                y: Arc::new(y.clone()),
-                weights: Arc::new(weights.clone()),
-                z: Arc::new(z.clone()),
-                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                    array![[1.0], [1.0], [1.0]],
-                )),
-                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                    array![[1.0], [1.0], [1.0]],
-                )),
-                score_warp: Some(score_prepared.runtime.clone()),
-                link_dev: Some(link_prepared.runtime.clone()),
-                ..default_test_family()
-            };
-        let block_states = vec![
-            ParameterBlockState {
-                beta: array![0.25],
-                eta: Array1::from_elem(z.len(), 0.25),
-            },
-            ParameterBlockState {
-                beta: array![0.6],
-                eta: Array1::from_elem(z.len(), 0.6),
-            },
-            ParameterBlockState {
-                beta: Array1::from_iter(
-                    (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
-                ),
-                eta: Array1::zeros(z.len()),
-            },
-            ParameterBlockState {
-                beta: Array1::from_iter(
-                    (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
-                ),
-                eta: Array1::zeros(z.len()),
-            },
-        ];
+        let (family, block_states) = dual_flex_exact_fixture();
 
         let slices = block_slices(&family);
         let total = slices.total;
@@ -5447,63 +4941,7 @@ mod tests {
 
     #[test]
     fn dual_flex_exact_outer_third_direction_is_linear() {
-        let z = array![-0.8, 0.2, 1.1];
-        let y = array![0.0, 1.0, 1.0];
-        let weights = array![1.0, 0.7, 1.3];
-        let score_prepared = build_score_warp_deviation_block_from_seed(
-            &z,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("score warp block");
-        let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_test_link_deviation_block_from_seed(
-            &link_seed,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("link block");
-        let family =
-            BernoulliMarginalSlopeFamily {
-                y: Arc::new(y.clone()),
-                weights: Arc::new(weights.clone()),
-                z: Arc::new(z.clone()),
-                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                    array![[1.0], [1.0], [1.0]],
-                )),
-                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                    array![[1.0], [1.0], [1.0]],
-                )),
-                score_warp: Some(score_prepared.runtime.clone()),
-                link_dev: Some(link_prepared.runtime.clone()),
-                ..default_test_family()
-            };
-        let block_states = vec![
-            ParameterBlockState {
-                beta: array![0.25],
-                eta: Array1::from_elem(z.len(), 0.25),
-            },
-            ParameterBlockState {
-                beta: array![0.6],
-                eta: Array1::from_elem(z.len(), 0.6),
-            },
-            ParameterBlockState {
-                beta: Array1::from_iter(
-                    (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
-                ),
-                eta: Array1::zeros(z.len()),
-            },
-            ParameterBlockState {
-                beta: Array1::from_iter(
-                    (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
-                ),
-                eta: Array1::zeros(z.len()),
-            },
-        ];
+        let (family, block_states) = dual_flex_exact_fixture();
 
         let slices = block_slices(&family);
         let total = slices.total;
@@ -5554,63 +4992,7 @@ mod tests {
 
     #[test]
     fn dual_flex_row_primary_third_direction_is_linear() {
-        let z = array![-0.8, 0.2, 1.1];
-        let y = array![0.0, 1.0, 1.0];
-        let weights = array![1.0, 0.7, 1.3];
-        let score_prepared = build_score_warp_deviation_block_from_seed(
-            &z,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("score warp block");
-        let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_test_link_deviation_block_from_seed(
-            &link_seed,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("link block");
-        let family =
-            BernoulliMarginalSlopeFamily {
-                y: Arc::new(y.clone()),
-                weights: Arc::new(weights.clone()),
-                z: Arc::new(z.clone()),
-                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                    array![[1.0], [1.0], [1.0]],
-                )),
-                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                    array![[1.0], [1.0], [1.0]],
-                )),
-                score_warp: Some(score_prepared.runtime.clone()),
-                link_dev: Some(link_prepared.runtime.clone()),
-                ..default_test_family()
-            };
-        let block_states = vec![
-            ParameterBlockState {
-                beta: array![0.25],
-                eta: Array1::from_elem(z.len(), 0.25),
-            },
-            ParameterBlockState {
-                beta: array![0.6],
-                eta: Array1::from_elem(z.len(), 0.6),
-            },
-            ParameterBlockState {
-                beta: Array1::from_iter(
-                    (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
-                ),
-                eta: Array1::zeros(z.len()),
-            },
-            ParameterBlockState {
-                beta: Array1::from_iter(
-                    (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
-                ),
-                eta: Array1::zeros(z.len()),
-            },
-        ];
+        let (family, block_states) = dual_flex_exact_fixture();
 
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -5637,7 +5019,7 @@ mod tests {
         }
 
         let dir_sum = &dir_u + &dir_v;
-        for row in 0..z.len() {
+        for row in 0..family.z.len() {
             let row_ctx = family
                 .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
@@ -5683,42 +5065,7 @@ mod tests {
 
     #[test]
     fn h_only_row_primary_third_direction_is_linear() {
-        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_score_warp_deviation_block_from_seed(
-            &seed,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("build score-warp block");
-        let score_dim = prepared
-            .block
-            .initial_beta
-            .as_ref()
-            .expect("score-warp initial beta")
-            .len();
-        let block_states = vec![
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(
-                Array1::from_iter((0..score_dim).map(|idx| 0.04 * (idx as f64 + 1.0))),
-                seed.len(),
-            ),
-        ];
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
-            weights: Arc::new(Array1::ones(seed.len())),
-            z: Arc::new(seed.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            score_warp: Some(prepared.runtime.clone()),
-            ..default_test_family()
-        };
+        let (family, block_states) = h_only_exact_fixture();
         let cache = family
             .build_exact_eval_cache(&block_states)
             .expect("exact eval cache");
@@ -5741,7 +5088,7 @@ mod tests {
         }
 
         let dir_sum = &dir_u + &dir_v;
-        for row in 0..seed.len() {
+        for row in 0..family.z.len() {
             let row_ctx = family
                 .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
@@ -5787,42 +5134,7 @@ mod tests {
 
     #[test]
     fn w_only_row_primary_third_direction_is_linear() {
-        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_test_link_deviation_block_from_seed(
-            &seed,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("build link deviation block");
-        let link_dim = prepared
-            .block
-            .initial_beta
-            .as_ref()
-            .expect("link initial beta")
-            .len();
-        let block_states = vec![
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(
-                Array1::from_iter((0..link_dim).map(|idx| 0.05 * (idx as f64 + 1.0))),
-                seed.len(),
-            ),
-        ];
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
-            weights: Arc::new(Array1::ones(seed.len())),
-            z: Arc::new(seed.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            link_dev: Some(prepared.runtime.clone()),
-            ..default_test_family()
-        };
+        let (family, block_states) = w_only_exact_fixture();
         let cache = family
             .build_exact_eval_cache(&block_states)
             .expect("exact eval cache");
@@ -5845,7 +5157,7 @@ mod tests {
         }
 
         let dir_sum = &dir_u + &dir_v;
-        for row in 0..seed.len() {
+        for row in 0..family.z.len() {
             let row_ctx = family
                 .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
@@ -5891,63 +5203,7 @@ mod tests {
 
     #[test]
     fn dual_flex_exact_outer_fourth_first_direction_is_linear() {
-        let z = array![-0.8, 0.2, 1.1];
-        let y = array![0.0, 1.0, 1.0];
-        let weights = array![1.0, 0.7, 1.3];
-        let score_prepared = build_score_warp_deviation_block_from_seed(
-            &z,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("score warp block");
-        let link_seed = array![-2.0, -0.5, 0.0, 0.5, 2.0];
-        let link_prepared = build_test_link_deviation_block_from_seed(
-            &link_seed,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("link block");
-        let family =
-            BernoulliMarginalSlopeFamily {
-                y: Arc::new(y.clone()),
-                weights: Arc::new(weights.clone()),
-                z: Arc::new(z.clone()),
-                marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                    array![[1.0], [1.0], [1.0]],
-                )),
-                logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                    array![[1.0], [1.0], [1.0]],
-                )),
-                score_warp: Some(score_prepared.runtime.clone()),
-                link_dev: Some(link_prepared.runtime.clone()),
-                ..default_test_family()
-            };
-        let block_states = vec![
-            ParameterBlockState {
-                beta: array![0.25],
-                eta: Array1::from_elem(z.len(), 0.25),
-            },
-            ParameterBlockState {
-                beta: array![0.6],
-                eta: Array1::from_elem(z.len(), 0.6),
-            },
-            ParameterBlockState {
-                beta: Array1::from_iter(
-                    (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
-                ),
-                eta: Array1::zeros(z.len()),
-            },
-            ParameterBlockState {
-                beta: Array1::from_iter(
-                    (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
-                ),
-                eta: Array1::zeros(z.len()),
-            },
-        ];
+        let (family, block_states) = dual_flex_exact_fixture();
 
         let slices = block_slices(&family);
         let total = slices.total;
@@ -6008,42 +5264,7 @@ mod tests {
 
     #[test]
     fn h_only_exact_outer_third_direction_is_linear() {
-        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_score_warp_deviation_block_from_seed(
-            &seed,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("build score-warp block");
-        let score_dim = prepared
-            .block
-            .initial_beta
-            .as_ref()
-            .expect("score-warp initial beta")
-            .len();
-        let block_states = vec![
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(
-                Array1::from_iter((0..score_dim).map(|idx| 0.04 * (idx as f64 + 1.0))),
-                seed.len(),
-            ),
-        ];
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
-            weights: Arc::new(Array1::ones(seed.len())),
-            z: Arc::new(seed.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            score_warp: Some(prepared.runtime.clone()),
-            ..default_test_family()
-        };
+        let (family, block_states) = h_only_exact_fixture();
         let slices = block_slices(&family);
         let total = slices.total;
         let mut dir_u = Array1::<f64>::zeros(total);
@@ -6086,42 +5307,7 @@ mod tests {
 
     #[test]
     fn w_only_exact_outer_third_direction_is_linear() {
-        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_test_link_deviation_block_from_seed(
-            &seed,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("build link deviation block");
-        let link_dim = prepared
-            .block
-            .initial_beta
-            .as_ref()
-            .expect("link initial beta")
-            .len();
-        let block_states = vec![
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(
-                Array1::from_iter((0..link_dim).map(|idx| 0.05 * (idx as f64 + 1.0))),
-                seed.len(),
-            ),
-        ];
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
-            weights: Arc::new(Array1::ones(seed.len())),
-            z: Arc::new(seed.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            link_dev: Some(prepared.runtime.clone()),
-            ..default_test_family()
-        };
+        let (family, block_states) = w_only_exact_fixture();
         let slices = block_slices(&family);
         let total = slices.total;
         let mut dir_u = Array1::<f64>::zeros(total);
@@ -6164,42 +5350,7 @@ mod tests {
 
     #[test]
     fn h_only_exact_outer_direction_sign_rules_hold() {
-        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_score_warp_deviation_block_from_seed(
-            &seed,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("build score-warp block");
-        let score_dim = prepared
-            .block
-            .initial_beta
-            .as_ref()
-            .expect("score-warp initial beta")
-            .len();
-        let block_states = vec![
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(
-                Array1::from_iter((0..score_dim).map(|idx| 0.04 * (idx as f64 + 1.0))),
-                seed.len(),
-            ),
-        ];
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
-            weights: Arc::new(Array1::ones(seed.len())),
-            z: Arc::new(seed.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            score_warp: Some(prepared.runtime.clone()),
-            ..default_test_family()
-        };
+        let (family, block_states) = h_only_exact_fixture();
         let slices = block_slices(&family);
         let total = slices.total;
         let mut dir = Array1::<f64>::zeros(total);
@@ -6247,42 +5398,7 @@ mod tests {
 
     #[test]
     fn w_only_exact_outer_direction_sign_rules_hold() {
-        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_test_link_deviation_block_from_seed(
-            &seed,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("build link deviation block");
-        let link_dim = prepared
-            .block
-            .initial_beta
-            .as_ref()
-            .expect("link initial beta")
-            .len();
-        let block_states = vec![
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(
-                Array1::from_iter((0..link_dim).map(|idx| 0.05 * (idx as f64 + 1.0))),
-                seed.len(),
-            ),
-        ];
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
-            weights: Arc::new(Array1::ones(seed.len())),
-            z: Arc::new(seed.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            link_dev: Some(prepared.runtime.clone()),
-            ..default_test_family()
-        };
+        let (family, block_states) = w_only_exact_fixture();
         let slices = block_slices(&family);
         let total = slices.total;
         let mut dir = Array1::<f64>::zeros(total);
@@ -6330,42 +5446,7 @@ mod tests {
 
     #[test]
     fn h_only_exact_outer_fourth_direction_swap_is_symmetric() {
-        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_score_warp_deviation_block_from_seed(
-            &seed,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("build score-warp block");
-        let score_dim = prepared
-            .block
-            .initial_beta
-            .as_ref()
-            .expect("score-warp initial beta")
-            .len();
-        let block_states = vec![
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(
-                Array1::from_iter((0..score_dim).map(|idx| 0.04 * (idx as f64 + 1.0))),
-                seed.len(),
-            ),
-        ];
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
-            weights: Arc::new(Array1::ones(seed.len())),
-            z: Arc::new(seed.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            score_warp: Some(prepared.runtime.clone()),
-            ..default_test_family()
-        };
+        let (family, block_states) = h_only_exact_fixture();
         let slices = block_slices(&family);
         let total = slices.total;
         let mut dir_u = Array1::<f64>::zeros(total);
@@ -6402,42 +5483,7 @@ mod tests {
 
     #[test]
     fn w_only_exact_outer_fourth_direction_swap_is_symmetric() {
-        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_test_link_deviation_block_from_seed(
-            &seed,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("build link deviation block");
-        let link_dim = prepared
-            .block
-            .initial_beta
-            .as_ref()
-            .expect("link initial beta")
-            .len();
-        let block_states = vec![
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(
-                Array1::from_iter((0..link_dim).map(|idx| 0.05 * (idx as f64 + 1.0))),
-                seed.len(),
-            ),
-        ];
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
-            weights: Arc::new(Array1::ones(seed.len())),
-            z: Arc::new(seed.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            link_dev: Some(prepared.runtime.clone()),
-            ..default_test_family()
-        };
+        let (family, block_states) = w_only_exact_fixture();
         let slices = block_slices(&family);
         let total = slices.total;
         let mut dir_u = Array1::<f64>::zeros(total);
@@ -6474,42 +5520,7 @@ mod tests {
 
     #[test]
     fn h_only_exact_outer_zero_direction_returns_zero() {
-        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_score_warp_deviation_block_from_seed(
-            &seed,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("build score-warp block");
-        let score_dim = prepared
-            .block
-            .initial_beta
-            .as_ref()
-            .expect("score-warp initial beta")
-            .len();
-        let block_states = vec![
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(
-                Array1::from_iter((0..score_dim).map(|idx| 0.04 * (idx as f64 + 1.0))),
-                seed.len(),
-            ),
-        ];
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
-            weights: Arc::new(Array1::ones(seed.len())),
-            z: Arc::new(seed.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            score_warp: Some(prepared.runtime.clone()),
-            ..default_test_family()
-        };
+        let (family, block_states) = h_only_exact_fixture();
         let slices = block_slices(&family);
         let zero = Array1::<f64>::zeros(slices.total);
         let third = family
@@ -6533,42 +5544,7 @@ mod tests {
 
     #[test]
     fn w_only_exact_outer_zero_direction_returns_zero() {
-        let seed = array![-1.5, -0.5, 0.0, 0.5, 1.5];
-        let prepared = build_test_link_deviation_block_from_seed(
-            &seed,
-            &DeviationBlockConfig {
-                num_internal_knots: 4,
-                ..DeviationBlockConfig::default()
-            },
-        )
-        .expect("build link deviation block");
-        let link_dim = prepared
-            .block
-            .initial_beta
-            .as_ref()
-            .expect("link initial beta")
-            .len();
-        let block_states = vec![
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(array![0.0], seed.len()),
-            dummy_block_state(
-                Array1::from_iter((0..link_dim).map(|idx| 0.05 * (idx as f64 + 1.0))),
-                seed.len(),
-            ),
-        ];
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
-            weights: Arc::new(Array1::ones(seed.len())),
-            z: Arc::new(seed.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-                Array2::zeros((seed.len(), 0)),
-            )),
-            link_dev: Some(prepared.runtime.clone()),
-            ..default_test_family()
-        };
+        let (family, block_states) = w_only_exact_fixture();
         let slices = block_slices(&family);
         let zero = Array1::<f64>::zeros(slices.total);
         let third = family

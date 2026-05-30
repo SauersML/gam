@@ -10989,6 +10989,71 @@ impl UnifiedOuterHessianOperator {
             Ok(self.hop.trace_logdet_operator(&combined))
         }
     }
+
+    /// Per-coordinate outer-Hessian-row × `alpha` contraction shared by the
+    /// `matvec` and zero-alloc `apply_into` paths. `a_alpha`,
+    /// `correction_m_alpha`, and `callback_neg_m_alpha` are the
+    /// alpha-dependent quantities precomputed once per call by the caller.
+    fn outer_hessian_index_entry(
+        &self,
+        idx: usize,
+        alpha: &Array1<f64>,
+        a_alpha: f64,
+        correction_m_alpha: &Array1<f64>,
+        callback_neg_m_alpha: Option<&Array1<f64>>,
+    ) -> Result<f64, String> {
+        let coord = &self.coords[idx];
+        let pair_a = self.pair_a.row(idx).dot(alpha);
+        let pair_ld_s = self.pair_ld_s.row(idx).dot(alpha);
+        let g_dot_v_alpha = self.g_dot_v.row(idx).dot(alpha);
+        let base_h2 = self.base_h2.row(idx).dot(alpha);
+        let m_terms = self.m_pair_trace.row(idx).dot(alpha);
+
+        let cross_trace = match self.cross_trace.as_ref() {
+            Some(ct) => ct.row(idx).dot(alpha),
+            None => 0.0,
+        };
+
+        let correction = if self.incl_logdet_h {
+            match &self.kernel {
+                OuterHessianDerivativeKernel::Gaussian => 0.0,
+                OuterHessianDerivativeKernel::ScalarGlm { .. } => {
+                    self.scalar_correction_trace(idx, alpha, &coord.v, correction_m_alpha)?
+                }
+                OuterHessianDerivativeKernel::Callback { .. } => {
+                    let second_v = &self
+                        .callback_second_modes
+                        .as_ref()
+                        .expect("callback second modes")[idx];
+                    let rhs = self.pair_rhs_combo(idx, alpha);
+                    self.callback_correction_trace(
+                        &rhs,
+                        second_v,
+                        callback_neg_m_alpha.expect("callback negated mode"),
+                    )?
+                }
+            }
+        } else {
+            0.0
+        };
+
+        Ok(outer_hessian_entry(
+            coord.a,
+            a_alpha,
+            g_dot_v_alpha,
+            pair_a,
+            cross_trace,
+            base_h2 + m_terms + correction,
+            pair_ld_s,
+            self.profiled_phi,
+            self.profiled_nu,
+            self.profiled_dp_cgrad,
+            self.profiled_dp_cgrad2,
+            self.is_profiled,
+            self.incl_logdet_h,
+            self.incl_logdet_s,
+        ))
+    }
 }
 
 impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessianOperator {
@@ -11022,59 +11087,13 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
         let values: Result<Vec<f64>, String> = (0..self.coords.len())
             .into_par_iter()
             .map(|idx| {
-                let coord = &self.coords[idx];
-                let pair_a = self.pair_a.row(idx).dot(alpha);
-                let pair_ld_s = self.pair_ld_s.row(idx).dot(alpha);
-                let g_dot_v_alpha = self.g_dot_v.row(idx).dot(alpha);
-                let base_h2 = self.base_h2.row(idx).dot(alpha);
-                let m_terms = self.m_pair_trace.row(idx).dot(alpha);
-
-                let cross_trace = match self.cross_trace.as_ref() {
-                    Some(ct) => ct.row(idx).dot(alpha),
-                    None => 0.0,
-                };
-
-                let correction = if self.incl_logdet_h {
-                    match &self.kernel {
-                        OuterHessianDerivativeKernel::Gaussian => 0.0,
-                        OuterHessianDerivativeKernel::ScalarGlm { .. } => {
-                            self.scalar_correction_trace(idx, alpha, &coord.v, &correction_m_alpha)?
-                        }
-                        OuterHessianDerivativeKernel::Callback { .. } => {
-                            let second_v = &self
-                                .callback_second_modes
-                                .as_ref()
-                                .expect("callback second modes")[idx];
-                            let rhs = self.pair_rhs_combo(idx, alpha);
-                            self.callback_correction_trace(
-                                &rhs,
-                                second_v,
-                                callback_neg_m_alpha
-                                    .as_ref()
-                                    .expect("callback negated mode"),
-                            )?
-                        }
-                    }
-                } else {
-                    0.0
-                };
-
-                Ok(outer_hessian_entry(
-                    coord.a,
+                self.outer_hessian_index_entry(
+                    idx,
+                    alpha,
                     a_alpha,
-                    g_dot_v_alpha,
-                    pair_a,
-                    cross_trace,
-                    base_h2 + m_terms + correction,
-                    pair_ld_s,
-                    self.profiled_phi,
-                    self.profiled_nu,
-                    self.profiled_dp_cgrad,
-                    self.profiled_dp_cgrad2,
-                    self.is_profiled,
-                    self.incl_logdet_h,
-                    self.incl_logdet_s,
-                ))
+                    &correction_m_alpha,
+                    callback_neg_m_alpha.as_ref(),
+                )
             })
             .collect();
 
@@ -11129,59 +11148,13 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
             .par_iter_mut()
             .enumerate()
             .try_for_each(|(idx, cell)| {
-                let coord = &self.coords[idx];
-                let pair_a = self.pair_a.row(idx).dot(alpha);
-                let pair_ld_s = self.pair_ld_s.row(idx).dot(alpha);
-                let g_dot_v_alpha = self.g_dot_v.row(idx).dot(alpha);
-                let base_h2 = self.base_h2.row(idx).dot(alpha);
-                let m_terms = self.m_pair_trace.row(idx).dot(alpha);
-
-                let cross_trace = match self.cross_trace.as_ref() {
-                    Some(ct) => ct.row(idx).dot(alpha),
-                    None => 0.0,
-                };
-
-                let correction = if self.incl_logdet_h {
-                    match &self.kernel {
-                        OuterHessianDerivativeKernel::Gaussian => 0.0,
-                        OuterHessianDerivativeKernel::ScalarGlm { .. } => {
-                            self.scalar_correction_trace(idx, alpha, &coord.v, &correction_m_alpha)?
-                        }
-                        OuterHessianDerivativeKernel::Callback { .. } => {
-                            let second_v = &self
-                                .callback_second_modes
-                                .as_ref()
-                                .expect("callback second modes")[idx];
-                            let rhs = self.pair_rhs_combo(idx, alpha);
-                            self.callback_correction_trace(
-                                &rhs,
-                                second_v,
-                                callback_neg_m_alpha
-                                    .as_ref()
-                                    .expect("callback negated mode"),
-                            )?
-                        }
-                    }
-                } else {
-                    0.0
-                };
-
-                *cell = outer_hessian_entry(
-                    coord.a,
+                *cell = self.outer_hessian_index_entry(
+                    idx,
+                    alpha,
                     a_alpha,
-                    g_dot_v_alpha,
-                    pair_a,
-                    cross_trace,
-                    base_h2 + m_terms + correction,
-                    pair_ld_s,
-                    self.profiled_phi,
-                    self.profiled_nu,
-                    self.profiled_dp_cgrad,
-                    self.profiled_dp_cgrad2,
-                    self.is_profiled,
-                    self.incl_logdet_h,
-                    self.incl_logdet_s,
-                );
+                    &correction_m_alpha,
+                    callback_neg_m_alpha.as_ref(),
+                )?;
                 Ok(())
             })
     }
@@ -18296,6 +18269,92 @@ mod tests {
         }
     }
 
+    /// Helper: the inflated-`penalty_logdet` sentinel `InnerSolution` shared by
+    /// the envelope-tripwire regression tests. They differ only in the
+    /// dispersion handling and whether a projected KKT residual is attached.
+    fn build_sentinel_tripwire_solution(
+        dispersion: DispersionHandling,
+        kkt_residual: Option<ProjectedKktResidual>,
+    ) -> InnerSolution<'static> {
+        let hop = Arc::new(DenseSpectralOperator::from_symmetric(&Array2::eye(2)).unwrap());
+        let family_operator = Arc::new(SentinelOuterHessianOperator {
+            matrix: array![[42.0]],
+        });
+        let deriv_provider = FamilyOperatorOnlyDerivatives {
+            op: family_operator,
+        };
+
+        InnerSolution {
+            log_likelihood: -1.25,
+            penalty_quadratic: 0.4,
+            hessian_op: hop,
+            beta: array![0.5, -0.25],
+            penalty_coords: vec![PenaltyCoordinate::from_dense_root(Array2::eye(2))],
+            penalty_logdet: PenaltyLogdetDerivs {
+                value: 0.0,
+                first: array![1.0e20],
+                second: Some(array![[0.0]]),
+            },
+            deriv_provider: Box::new(deriv_provider),
+            tk_correction: 0.0,
+            tk_gradient: None,
+            firth: None,
+            hessian_logdet_correction: 0.0,
+            penalty_subspace_trace: None,
+            rho_curvature_scale: 1.0,
+            rho_prior: crate::types::RhoPrior::Flat,
+            n_observations: 2,
+            nullspace_dim: 0.0,
+            dispersion,
+            ext_coords: Vec::new(),
+            ext_coord_pair_fn: None,
+            rho_ext_pair_fn: None,
+            fixed_drift_deriv: None,
+            barrier_config: None,
+            kkt_residual,
+            active_constraints: None,
+            stochastic_trace_state: Arc::new(Mutex::new(StochasticTraceState::default())),
+        }
+    }
+
+    /// Helper: assemble the analytic dense outer Hessian, the matrix-free
+    /// operator, and the materialised dense form of that operator for
+    /// `solution`. The operator-vs-dense equivalence tests all build this
+    /// identical `(dense, operator, materialized)` triple before comparing
+    /// entries and matvecs.
+    fn dense_and_materialized_outer_hessian(
+        solution: &InnerSolution<'_>,
+        rho: &[f64],
+        lambdas: &[f64],
+    ) -> (Array2<f64>, UnifiedOuterHessianOperator, Array2<f64>) {
+        let dense = compute_outer_hessian(
+            solution,
+            rho,
+            lambdas,
+            solution.hessian_op.as_ref(),
+            solution.deriv_provider.as_ref(),
+            None,
+        )
+        .unwrap();
+        let kernel = solution
+            .deriv_provider
+            .outer_hessian_derivative_kernel()
+            .unwrap();
+        let operator = build_outer_hessian_operator(
+            solution,
+            lambdas,
+            solution.deriv_provider.as_ref(),
+            kernel,
+            None,
+            None,
+        )
+        .unwrap();
+        let materialized =
+            crate::solver::outer_strategy::OuterHessianOperator::materialize_dense(&operator)
+                .unwrap();
+        (dense, operator, materialized)
+    }
+
     #[test]
     fn value_gradient_hessian_prefers_family_supplied_outer_operator() {
         let hop = Arc::new(DenseSpectralOperator::from_symmetric(&Array2::eye(2)).unwrap());
@@ -18475,52 +18534,16 @@ mod tests {
     /// gradient (|g|∞·√ε ≤ 4·|cost|).
     #[test]
     fn cert_zero_residual_must_not_emit_unbounded_gradient_through_gate() {
-        let hop = Arc::new(DenseSpectralOperator::from_symmetric(&Array2::eye(2)).unwrap());
-        let family_operator = Arc::new(SentinelOuterHessianOperator {
-            matrix: array![[42.0]],
-        });
-        let deriv_provider = FamilyOperatorOnlyDerivatives {
-            op: family_operator,
-        };
-
-        let solution = InnerSolution {
-            log_likelihood: -1.25,
-            penalty_quadratic: 0.4,
-            hessian_op: hop,
-            beta: array![0.5, -0.25],
-            penalty_coords: vec![PenaltyCoordinate::from_dense_root(Array2::eye(2))],
-            penalty_logdet: PenaltyLogdetDerivs {
-                value: 0.0,
-                first: array![1.0e20],
-                second: Some(array![[0.0]]),
-            },
-            deriv_provider: Box::new(deriv_provider),
-            tk_correction: 0.0,
-            tk_gradient: None,
-            firth: None,
-            hessian_logdet_correction: 0.0,
-            penalty_subspace_trace: None,
-            rho_curvature_scale: 1.0,
-            rho_prior: crate::types::RhoPrior::Flat,
-            n_observations: 2,
-            nullspace_dim: 0.0,
-            // Profiled Gaussian does not satisfy the fixed-dispersion IFT
-            // identity used by the projected KKT residual correction, so an
-            // inconsistent envelope gradient remains a soft "unavailable
-            // derivative" result rather than a missing-residual contract
-            // violation.
-            dispersion: DispersionHandling::ProfiledGaussian,
-            ext_coords: Vec::new(),
-            ext_coord_pair_fn: None,
-            rho_ext_pair_fn: None,
-            fixed_drift_deriv: None,
-            barrier_config: None,
-            kkt_residual: Some(ProjectedKktResidual::from_active_projected(array![
+        // Profiled Gaussian does not satisfy the fixed-dispersion IFT identity
+        // used by the projected KKT residual correction, so an inconsistent
+        // envelope gradient remains a soft "unavailable derivative" result
+        // rather than a missing-residual contract violation.
+        let solution = build_sentinel_tripwire_solution(
+            DispersionHandling::ProfiledGaussian,
+            Some(ProjectedKktResidual::from_active_projected(array![
                 0.0, 0.0
             ])),
-            active_constraints: None,
-            stochastic_trace_state: Arc::new(Mutex::new(StochasticTraceState::default())),
-        };
+        );
 
         let result = reml_laml_evaluate(&solution, &[0.0], EvalMode::ValueGradientHessian, None)
             .expect("constrained-stationary cert evaluation");
@@ -18639,49 +18662,14 @@ mod tests {
     /// non-finite derivatives.
     #[test]
     fn aou_missing_projected_kkt_residual_is_contract_error() {
-        let hop = Arc::new(DenseSpectralOperator::from_symmetric(&Array2::eye(2)).unwrap());
-        let family_operator = Arc::new(SentinelOuterHessianOperator {
-            matrix: array![[42.0]],
-        });
-        let deriv_provider = FamilyOperatorOnlyDerivatives {
-            op: family_operator,
-        };
-
-        let solution = InnerSolution {
-            log_likelihood: -1.25,
-            penalty_quadratic: 0.4,
-            hessian_op: hop,
-            beta: array![0.5, -0.25],
-            penalty_coords: vec![PenaltyCoordinate::from_dense_root(Array2::eye(2))],
-            penalty_logdet: PenaltyLogdetDerivs {
-                value: 0.0,
-                first: array![1.0e20],
-                second: Some(array![[0.0]]),
-            },
-            deriv_provider: Box::new(deriv_provider),
-            tk_correction: 0.0,
-            tk_gradient: None,
-            firth: None,
-            hessian_logdet_correction: 0.0,
-            penalty_subspace_trace: None,
-            rho_curvature_scale: 1.0,
-            rho_prior: crate::types::RhoPrior::Flat,
-            n_observations: 2,
-            nullspace_dim: 0.0,
-            dispersion: DispersionHandling::Fixed {
+        let solution = build_sentinel_tripwire_solution(
+            DispersionHandling::Fixed {
                 phi: 1.0,
                 include_logdet_h: true,
                 include_logdet_s: true,
             },
-            ext_coords: Vec::new(),
-            ext_coord_pair_fn: None,
-            rho_ext_pair_fn: None,
-            fixed_drift_deriv: None,
-            barrier_config: None,
-            kkt_residual: None,
-            active_constraints: None,
-            stochastic_trace_state: Arc::new(Mutex::new(StochasticTraceState::default())),
-        };
+            None,
+        );
 
         let err = match reml_laml_evaluate(&solution, &[0.0], EvalMode::ValueGradientHessian, None)
         {
@@ -18697,50 +18685,12 @@ mod tests {
 
     #[test]
     fn envelope_inconsistent_gradient_skips_outer_hessian_assembly() {
-        let hop = Arc::new(DenseSpectralOperator::from_symmetric(&Array2::eye(2)).unwrap());
-        let family_operator = Arc::new(SentinelOuterHessianOperator {
-            matrix: array![[42.0]],
-        });
-        let deriv_provider = FamilyOperatorOnlyDerivatives {
-            op: family_operator,
-        };
-
-        let solution = InnerSolution {
-            log_likelihood: -1.25,
-            penalty_quadratic: 0.4,
-            hessian_op: hop,
-            beta: array![0.5, -0.25],
-            penalty_coords: vec![PenaltyCoordinate::from_dense_root(Array2::eye(2))],
-            penalty_logdet: PenaltyLogdetDerivs {
-                value: 0.0,
-                first: array![1.0e20],
-                second: Some(array![[0.0]]),
-            },
-            deriv_provider: Box::new(deriv_provider),
-            tk_correction: 0.0,
-            tk_gradient: None,
-            firth: None,
-            hessian_logdet_correction: 0.0,
-            penalty_subspace_trace: None,
-            rho_curvature_scale: 1.0,
-            rho_prior: crate::types::RhoPrior::Flat,
-            n_observations: 2,
-            nullspace_dim: 0.0,
-            // Profiled Gaussian does not satisfy the fixed-dispersion IFT
-            // identity used by the projected KKT residual correction, so an
-            // inconsistent envelope gradient remains a soft "unavailable
-            // derivative" result rather than a missing-residual contract
-            // violation.
-            dispersion: DispersionHandling::ProfiledGaussian,
-            ext_coords: Vec::new(),
-            ext_coord_pair_fn: None,
-            rho_ext_pair_fn: None,
-            fixed_drift_deriv: None,
-            barrier_config: None,
-            kkt_residual: None,
-            active_constraints: None,
-            stochastic_trace_state: Arc::new(Mutex::new(StochasticTraceState::default())),
-        };
+        // Profiled Gaussian does not satisfy the fixed-dispersion IFT identity
+        // used by the projected KKT residual correction, so an inconsistent
+        // envelope gradient remains a soft "unavailable derivative" result
+        // rather than a missing-residual contract violation.
+        let solution =
+            build_sentinel_tripwire_solution(DispersionHandling::ProfiledGaussian, None);
 
         let result = reml_laml_evaluate(&solution, &[0.0], EvalMode::ValueGradientHessian, None)
             .expect("envelope tripwire evaluation");
@@ -19087,31 +19037,8 @@ mod tests {
         let rho: Vec<f64> = vec![0.2_f64];
         let lambdas: Vec<f64> = rho.iter().map(|value| value.exp()).collect();
 
-        let dense = compute_outer_hessian(
-            &solution,
-            &rho,
-            &lambdas,
-            solution.hessian_op.as_ref(),
-            solution.deriv_provider.as_ref(),
-            None,
-        )
-        .unwrap();
-        let kernel = solution
-            .deriv_provider
-            .outer_hessian_derivative_kernel()
-            .unwrap();
-        let operator = build_outer_hessian_operator(
-            &solution,
-            &lambdas,
-            solution.deriv_provider.as_ref(),
-            kernel,
-            None,
-            None,
-        )
-        .unwrap();
-        let materialized =
-            crate::solver::outer_strategy::OuterHessianOperator::materialize_dense(&operator)
-                .unwrap();
+        let (dense, operator, materialized) =
+            dense_and_materialized_outer_hessian(&solution, &rho, &lambdas);
 
         for row in 0..dense.nrows() {
             for col in 0..dense.ncols() {
@@ -19381,33 +19308,9 @@ mod tests {
         let rho: Vec<f64> = vec![0.2_f64, -0.1];
         let lambdas: Vec<f64> = rho.iter().map(|value| value.exp()).collect();
 
-        let dense = compute_outer_hessian(
-            &solution,
-            &rho,
-            &lambdas,
-            solution.hessian_op.as_ref(),
-            solution.deriv_provider.as_ref(),
-            None,
-        )
-        .unwrap();
-        let kernel = solution
-            .deriv_provider
-            .outer_hessian_derivative_kernel()
-            .unwrap();
-        let operator = build_outer_hessian_operator(
-            &solution,
-            &lambdas,
-            solution.deriv_provider.as_ref(),
-            kernel,
-            None,
-            None,
-        )
-        .unwrap();
-
         // (6) Materialised dense extension to r=2: every entry must match.
-        let materialized =
-            crate::solver::outer_strategy::OuterHessianOperator::materialize_dense(&operator)
-                .unwrap();
+        let (dense, operator, materialized) =
+            dense_and_materialized_outer_hessian(&solution, &rho, &lambdas);
         for row in 0..dense.nrows() {
             for col in 0..dense.ncols() {
                 assert_relative_eq!(
@@ -19524,31 +19427,8 @@ mod tests {
         let rho: Vec<f64> = vec![0.2_f64];
         let lambdas: Vec<f64> = rho.iter().map(|value| value.exp()).collect();
 
-        let dense = compute_outer_hessian(
-            &solution,
-            &rho,
-            &lambdas,
-            solution.hessian_op.as_ref(),
-            solution.deriv_provider.as_ref(),
-            None,
-        )
-        .unwrap();
-        let kernel = solution
-            .deriv_provider
-            .outer_hessian_derivative_kernel()
-            .unwrap();
-        let operator = build_outer_hessian_operator(
-            &solution,
-            &lambdas,
-            solution.deriv_provider.as_ref(),
-            kernel,
-            None,
-            None,
-        )
-        .unwrap();
-        let materialized =
-            crate::solver::outer_strategy::OuterHessianOperator::materialize_dense(&operator)
-                .unwrap();
+        let (dense, _, materialized) =
+            dense_and_materialized_outer_hessian(&solution, &rho, &lambdas);
 
         for row in 0..dense.nrows() {
             for col in 0..dense.ncols() {
@@ -19844,31 +19724,8 @@ mod tests {
         let rho: Vec<f64> = vec![0.2_f64, -0.4_f64];
         let lambdas: Vec<f64> = rho.iter().map(|value| value.exp()).collect();
 
-        let dense = compute_outer_hessian(
-            &solution,
-            &rho,
-            &lambdas,
-            solution.hessian_op.as_ref(),
-            solution.deriv_provider.as_ref(),
-            None,
-        )
-        .unwrap();
-        let kernel = solution
-            .deriv_provider
-            .outer_hessian_derivative_kernel()
-            .unwrap();
-        let operator = build_outer_hessian_operator(
-            &solution,
-            &lambdas,
-            solution.deriv_provider.as_ref(),
-            kernel,
-            None,
-            None,
-        )
-        .unwrap();
-        let materialized =
-            crate::solver::outer_strategy::OuterHessianOperator::materialize_dense(&operator)
-                .unwrap();
+        let (dense, _, materialized) =
+            dense_and_materialized_outer_hessian(&solution, &rho, &lambdas);
 
         for row in 0..dense.nrows() {
             for col in 0..dense.ncols() {
@@ -20418,64 +20275,28 @@ mod tests {
         assert!(gradient[0].is_finite());
     }
 
-    /// Helper: build an InnerSolution for a Gaussian model at a given rho.
-    /// The Hessian H = X'X + Σ λₖ Sₖ depends on rho through the penalty,
-    /// so we must rebuild InnerSolution for each rho evaluation.
-    fn build_gaussian_test_solution(rho: &[f64]) -> InnerSolution<'_> {
-        let p = 3; // 3 coefficients
-        let n = 50; // 50 observations
-
-        // Fixed X'X (data-dependent, rho-independent)
-        let xtx = array![[10.0, 2.0, 1.0], [2.0, 8.0, 0.5], [1.0, 0.5, 6.0],];
-
-        // Two penalty matrices (one per smoothing parameter)
-        let s1 = array![[1.0, 0.2, 0.0], [0.2, 1.0, 0.0], [0.0, 0.0, 0.0],];
-        let s2 = array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0],];
-
-        let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
-
-        // Build H = X'X + λ₁S₁ + λ₂S₂
-        let mut h = xtx.clone();
-        h.scaled_add(lambdas[0], &s1);
-        h.scaled_add(lambdas[1], &s2);
-
-        let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
-
-        // Solve for β̂ = H⁻¹ X'y (simulate with a fixed X'y)
-        let xty = array![5.0, 3.0, 2.0];
-        let beta = op.solve(&xty);
-
-        // Penalty roots via eigendecomposition: Sₖ = Rₖᵀ Rₖ (exact).
-        let r1 = penalty_matrix_root(&s1).unwrap();
-        let r2 = penalty_matrix_root(&s2).unwrap();
-
-        // Penalty quadratic: Σ λₖ β'Sₖβ
-        let penalty_quad =
-            lambdas[0] * beta.dot(&s1.dot(&beta)) + lambdas[1] * beta.dot(&s2.dot(&beta));
-
-        // Deviance at β̂: ||y − Xβ̂||² = y'y − 2β̂'X'y + β̂'X'Xβ̂.
-        // y'y is a ρ-independent constant (the actual value doesn't matter).
-        // Computing deviance at the mode is essential: the analytic gradient
-        // relies on the envelope theorem (∂D_p/∂β = 0 at the mode), which
-        // is violated if deviance is held constant as β̂ varies with ρ.
-        let yty = 20.0;
-        let deviance = yty - 2.0 * beta.dot(&xty) + beta.dot(&xtx.dot(&beta));
-        let log_likelihood = -0.5 * deviance;
-
-        // Penalty logdet: exact pseudo-logdet on positive eigenspace.
+    /// Helper: exact pseudo-logdet of S(λ) = Σ λₖ Sₖ together with its first
+    /// and second ρ-derivatives via central finite differences. Shared by the
+    /// Gaussian `InnerSolution` builders, which all carry the same two penalty
+    /// matrices `s1`, `s2` and dimension `p`.
+    fn gaussian_penalty_logdet_fd(
+        p: usize,
+        s1: &Array2<f64>,
+        s2: &Array2<f64>,
+        rho: &[f64],
+    ) -> PenaltyLogdetDerivs {
         let mut s_total = Array2::zeros((p, p));
-        s_total.scaled_add(lambdas[0], &s1);
-        s_total.scaled_add(lambdas[1], &s2);
+        s_total.scaled_add(rho[0].exp(), s1);
+        s_total.scaled_add(rho[1].exp(), s2);
         let (s_eigs, _) = s_total.eigh(faer::Side::Lower).unwrap();
         let threshold = positive_eigenvalue_threshold(s_eigs.as_slice().unwrap());
         let log_det_s = exact_pseudo_logdet(s_eigs.as_slice().unwrap(), threshold);
 
-        // Penalty logdet first derivatives (numerical FD).
         let log_det_s_at = |rho_eval: &[f64]| -> f64 {
             let lambdas_eval: Vec<f64> = rho_eval.iter().map(|&r| r.exp()).collect();
             let mut s_eval = Array2::zeros((p, p));
-            s_eval.scaled_add(lambdas_eval[0], &s1);
-            s_eval.scaled_add(lambdas_eval[1], &s2);
+            s_eval.scaled_add(lambdas_eval[0], s1);
+            s_eval.scaled_add(lambdas_eval[1], s2);
             let (s_eigs_eval, _) = s_eval.eigh(faer::Side::Lower).unwrap();
             let threshold_eval = positive_eigenvalue_threshold(s_eigs_eval.as_slice().unwrap());
             exact_pseudo_logdet(s_eigs_eval.as_slice().unwrap(), threshold_eval)
@@ -20528,6 +20349,60 @@ mod tests {
             }
         }
 
+        PenaltyLogdetDerivs {
+            value: log_det_s,
+            first: det1,
+            second: Some(det2),
+        }
+    }
+
+    /// Helper: build an InnerSolution for a Gaussian model at a given rho.
+    /// The Hessian H = X'X + Σ λₖ Sₖ depends on rho through the penalty,
+    /// so we must rebuild InnerSolution for each rho evaluation.
+    fn build_gaussian_test_solution(rho: &[f64]) -> InnerSolution<'_> {
+        let p = 3; // 3 coefficients
+        let n = 50; // 50 observations
+
+        // Fixed X'X (data-dependent, rho-independent)
+        let xtx = array![[10.0, 2.0, 1.0], [2.0, 8.0, 0.5], [1.0, 0.5, 6.0],];
+
+        // Two penalty matrices (one per smoothing parameter)
+        let s1 = array![[1.0, 0.2, 0.0], [0.2, 1.0, 0.0], [0.0, 0.0, 0.0],];
+        let s2 = array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0],];
+
+        let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
+
+        // Build H = X'X + λ₁S₁ + λ₂S₂
+        let mut h = xtx.clone();
+        h.scaled_add(lambdas[0], &s1);
+        h.scaled_add(lambdas[1], &s2);
+
+        let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
+
+        // Solve for β̂ = H⁻¹ X'y (simulate with a fixed X'y)
+        let xty = array![5.0, 3.0, 2.0];
+        let beta = op.solve(&xty);
+
+        // Penalty roots via eigendecomposition: Sₖ = Rₖᵀ Rₖ (exact).
+        let r1 = penalty_matrix_root(&s1).unwrap();
+        let r2 = penalty_matrix_root(&s2).unwrap();
+
+        // Penalty quadratic: Σ λₖ β'Sₖβ
+        let penalty_quad =
+            lambdas[0] * beta.dot(&s1.dot(&beta)) + lambdas[1] * beta.dot(&s2.dot(&beta));
+
+        // Deviance at β̂: ||y − Xβ̂||² = y'y − 2β̂'X'y + β̂'X'Xβ̂.
+        // y'y is a ρ-independent constant (the actual value doesn't matter).
+        // Computing deviance at the mode is essential: the analytic gradient
+        // relies on the envelope theorem (∂D_p/∂β = 0 at the mode), which
+        // is violated if deviance is held constant as β̂ varies with ρ.
+        let yty = 20.0;
+        let deviance = yty - 2.0 * beta.dot(&xty) + beta.dot(&xtx.dot(&beta));
+        let log_likelihood = -0.5 * deviance;
+
+        // Penalty logdet (value + FD ρ-derivatives) on positive eigenspace.
+        let penalty_logdet = gaussian_penalty_logdet_fd(p, &s1, &s2, rho);
+
         InnerSolution {
             log_likelihood,
             penalty_quadratic: penalty_quad,
@@ -20537,11 +20412,7 @@ mod tests {
                 PenaltyCoordinate::from_dense_root(r1),
                 PenaltyCoordinate::from_dense_root(r2),
             ],
-            penalty_logdet: PenaltyLogdetDerivs {
-                value: log_det_s,
-                first: det1,
-                second: Some(det2),
-            },
+            penalty_logdet,
             deriv_provider: Box::new(GaussianDerivatives),
             tk_correction: 0.0,
             tk_gradient: None,
@@ -22645,69 +22516,7 @@ mod tests {
         let r1 = penalty_matrix_root(&s1).unwrap();
         let r2 = penalty_matrix_root(&s2).unwrap();
 
-        let mut s_total = Array2::zeros((p, p));
-        s_total.scaled_add(lambdas[0], &s1);
-        s_total.scaled_add(lambdas[1], &s2);
-        let (s_eigs, _) = s_total.eigh(faer::Side::Lower).unwrap();
-        let threshold = positive_eigenvalue_threshold(s_eigs.as_slice().unwrap());
-        let log_det_s = exact_pseudo_logdet(s_eigs.as_slice().unwrap(), threshold);
-
-        let log_det_s_at = |rho_eval: &[f64]| -> f64 {
-            let lambdas_eval: Vec<f64> = rho_eval.iter().map(|&r| r.exp()).collect();
-            let mut s_eval = Array2::zeros((p, p));
-            s_eval.scaled_add(lambdas_eval[0], &s1);
-            s_eval.scaled_add(lambdas_eval[1], &s2);
-            let (s_eigs_eval, _) = s_eval.eigh(faer::Side::Lower).unwrap();
-            let threshold_eval = positive_eigenvalue_threshold(s_eigs_eval.as_slice().unwrap());
-            exact_pseudo_logdet(s_eigs_eval.as_slice().unwrap(), threshold_eval)
-        };
-
-        let mut det1 = Array1::zeros(rho.len());
-        let eps = 1e-7;
-        for k in 0..rho.len() {
-            let mut rho_plus = rho.to_vec();
-            rho_plus[k] += eps;
-            let log_det_s_plus = log_det_s_at(&rho_plus);
-
-            let mut rho_minus = rho.to_vec();
-            rho_minus[k] -= eps;
-            let log_det_s_minus = log_det_s_at(&rho_minus);
-
-            det1[k] = (log_det_s_plus - log_det_s_minus) / (2.0 * eps);
-        }
-        let mut det2 = Array2::zeros((rho.len(), rho.len()));
-        let eps2 = 1e-5;
-        for i in 0..rho.len() {
-            for j in i..rho.len() {
-                let value = if i == j {
-                    let mut rho_plus = rho.to_vec();
-                    rho_plus[i] += eps2;
-                    let mut rho_minus = rho.to_vec();
-                    rho_minus[i] -= eps2;
-                    (log_det_s_at(&rho_plus) - 2.0 * log_det_s + log_det_s_at(&rho_minus))
-                        / (eps2 * eps2)
-                } else {
-                    let mut pp = rho.to_vec();
-                    pp[i] += eps2;
-                    pp[j] += eps2;
-                    let mut pm = rho.to_vec();
-                    pm[i] += eps2;
-                    pm[j] -= eps2;
-                    let mut mp = rho.to_vec();
-                    mp[i] -= eps2;
-                    mp[j] += eps2;
-                    let mut mm = rho.to_vec();
-                    mm[i] -= eps2;
-                    mm[j] -= eps2;
-                    (log_det_s_at(&pp) - log_det_s_at(&pm) - log_det_s_at(&mp) + log_det_s_at(&mm))
-                        / (4.0 * eps2 * eps2)
-                };
-                det2[[i, j]] = value;
-                if i != j {
-                    det2[[j, i]] = value;
-                }
-            }
-        }
+        let penalty_logdet = gaussian_penalty_logdet_fd(p, &s1, &s2, rho);
 
         InnerSolution {
             log_likelihood,
@@ -22718,11 +22527,7 @@ mod tests {
                 PenaltyCoordinate::from_dense_root(r1),
                 PenaltyCoordinate::from_dense_root(r2),
             ],
-            penalty_logdet: PenaltyLogdetDerivs {
-                value: log_det_s,
-                first: det1,
-                second: Some(det2),
-            },
+            penalty_logdet,
             deriv_provider: Box::new(GaussianDerivatives),
             tk_correction: 0.0,
             tk_gradient: None,

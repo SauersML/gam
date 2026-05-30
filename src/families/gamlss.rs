@@ -9882,6 +9882,151 @@ impl GaussianLocationScaleWiggleFamily {
     }
 }
 
+/// Row-coefficient bundle for the GLS Wiggle joint second directional
+/// derivative, shared by the matrix-free operator and the dense
+/// `_from_designs` assemblies. Holds exactly the quantities both consumers
+/// read downstream of the (identical) coefficient computation.
+struct GlsWiggleSecondDirCoeffs {
+    coeff_mm_uv: Array1<f64>,
+    coeff_ml_uv: Array1<f64>,
+    coeff_ll_uv: Array1<f64>,
+    a_u: Array1<f64>,
+    a_v: Array1<f64>,
+    a_uv: Array1<f64>,
+    c_u: Array1<f64>,
+    c_v: Array1<f64>,
+    c_uv: Array1<f64>,
+    l_u: Array1<f64>,
+    l_v: Array1<f64>,
+    l_uv: Array1<f64>,
+    dw_u: Array1<f64>,
+    dw_v: Array1<f64>,
+    dw_uv: Array1<f64>,
+}
+
+/// The two probe directions resolved to row space for the GLS Wiggle joint
+/// second directional derivative: `xi`/`zeta` are the X_mu/X_ls contractions,
+/// and `q`/`s1`/`g2` are the mixed first/second-derivative wiggle pieces.
+struct GlsWiggleDirPieces<'a> {
+    xi_u: &'a Array1<f64>,
+    xi_v: &'a Array1<f64>,
+    zeta_u: &'a Array1<f64>,
+    zeta_v: &'a Array1<f64>,
+    q_u: &'a Array1<f64>,
+    q_v: &'a Array1<f64>,
+    q_uv: &'a Array1<f64>,
+    s1_u: &'a Array1<f64>,
+    s1_v: &'a Array1<f64>,
+    s1_uv: &'a Array1<f64>,
+    g2_u: &'a Array1<f64>,
+    g2_v: &'a Array1<f64>,
+    g2_uv: &'a Array1<f64>,
+}
+
+/// Compute the shared GLS Wiggle second-directional row coefficients from the
+/// per-row scalars, wiggle geometry, and the resolved probe directions.
+fn gls_wiggle_second_directional_coeffs(
+    rows: &GaussianJointRowScalars,
+    geom: &GaussianLocationScaleWiggleGeometry,
+    dir: &GlsWiggleDirPieces<'_>,
+) -> GlsWiggleSecondDirCoeffs {
+    let GlsWiggleDirPieces {
+        xi_u,
+        xi_v,
+        zeta_u,
+        zeta_v,
+        q_u,
+        q_v,
+        q_uv,
+        s1_u,
+        s1_v,
+        s1_uv,
+        g2_u,
+        g2_v,
+        g2_uv,
+    } = *dir;
+    let szeta_u = &rows.kappa * zeta_u;
+    let szeta_v = &rows.kappa * zeta_v;
+    let zeta_u_zeta_v = zeta_u * zeta_v;
+    let dw_u = -2.0 * &rows.w * &szeta_u;
+    let dw_v = -2.0 * &rows.w * &szeta_v;
+    let dw_uv = 4.0 * &rows.w * &(&szeta_u * &szeta_v)
+        - 2.0 * &rows.w * &rows.kappa_prime * &zeta_u_zeta_v;
+    let dm_u = -(&rows.w * q_u) - &(2.0 * &rows.m * &szeta_u);
+    let dm_v = -(&rows.w * q_v) - &(2.0 * &rows.m * &szeta_v);
+    let dm_uv = &(2.0 * &rows.w * &(q_u * &szeta_v + q_v * &szeta_u)) - &(&rows.w * q_uv)
+        + &(4.0 * &rows.m * &(&szeta_u * &szeta_v))
+        - 2.0 * &rows.m * &rows.kappa_prime * &zeta_u_zeta_v;
+    let dn_uv = &(2.0 * &rows.w * &(q_u * q_v))
+        + &(4.0 * &rows.m * &(q_u * &szeta_v + q_v * &szeta_u))
+        - &(2.0 * &rows.m * q_uv)
+        + &(4.0 * &rows.n * &(&szeta_u * &szeta_v))
+        - 2.0 * &rows.n * &rows.kappa_prime * &zeta_u_zeta_v;
+    let dn_u = -(2.0 * &rows.m * q_u) - &(2.0 * &rows.n * &szeta_u);
+    let dn_v = -(2.0 * &rows.m * q_v) - &(2.0 * &rows.n * &szeta_v);
+    let one_minus_2kappa = rows.kappa.mapv(|k| 1.0 - 2.0 * k);
+    let kappa_tprime =
+        &rows.kappa_dprime * &one_minus_2kappa - 2.0 * &(&rows.kappa_prime * &rows.kappa_prime);
+    let amn = &rows.obs_weight - &rows.n;
+
+    let coeff_mm_uv = &(&dw_uv * &geom.dq_dq0.mapv(|v| v * v))
+        + &(2.0 * &dw_u * &geom.dq_dq0 * s1_v)
+        + &(2.0 * &dw_v * &geom.dq_dq0 * s1_u)
+        + &(2.0 * &rows.w * s1_u * s1_v)
+        + &(2.0 * &rows.w * &geom.dq_dq0 * s1_uv)
+        - &(&dm_uv * &geom.d2q_dq02)
+        - &(&dm_u * g2_v)
+        - &(&dm_v * g2_u)
+        - &(&rows.m * g2_uv);
+    let a_md_v = &dm_v * &geom.dq_dq0 + &rows.m * s1_v;
+    let a_md_u = &dm_u * &geom.dq_dq0 + &rows.m * s1_u;
+    let coeff_ml_uv = 2.0
+        * &rows.kappa
+        * &(&dm_uv * &geom.dq_dq0 + &dm_u * s1_v + &dm_v * s1_u + &rows.m * s1_uv)
+        + 2.0 * &rows.kappa_prime * &(zeta_u * &a_md_v + zeta_v * &a_md_u)
+        + 2.0 * &rows.kappa_dprime * &zeta_u_zeta_v * &rows.m * &geom.dq_dq0;
+    let two_ki2_minus_kpi = 2.0 * &rows.kappa * &rows.kappa - &rows.kappa_prime;
+    let four_kkpi_minus_kdpi = 4.0 * &(&rows.kappa * &rows.kappa_prime) - &rows.kappa_dprime;
+    let zeta_n_sym = zeta_u * &dn_v + zeta_v * &dn_u;
+    let bracketed_eta_eta = 4.0
+        * &rows.n
+        * &(&rows.kappa_prime * &rows.kappa_prime + &rows.kappa * &rows.kappa_dprime)
+        + &kappa_tprime * &amn;
+    let coeff_ll_uv = &two_ki2_minus_kpi * &dn_uv
+        + &four_kkpi_minus_kdpi * &zeta_n_sym
+        + &bracketed_eta_eta * &zeta_u_zeta_v;
+
+    let a_u = &dw_u * &geom.dq_dq0 + &rows.w * s1_u;
+    let a_v = &dw_v * &geom.dq_dq0 + &rows.w * s1_v;
+    let a_uv = &dw_uv * &geom.dq_dq0 + &dw_u * s1_v + &dw_v * s1_u + &rows.w * s1_uv;
+    let c_u = -&dm_u;
+    let c_v = -&dm_v;
+    let c_uv = -&dm_uv;
+    let l_u = 2.0 * &rows.kappa * &dm_u + 2.0 * &rows.kappa_prime * &(zeta_u * &rows.m);
+    let l_v = 2.0 * &rows.kappa * &dm_v + 2.0 * &rows.kappa_prime * &(zeta_v * &rows.m);
+    let l_uv = 2.0 * &rows.kappa * &dm_uv
+        + 2.0 * &rows.kappa_prime * &(zeta_u * &dm_v + zeta_v * &dm_u)
+        + 2.0 * &rows.kappa_dprime * &(&zeta_u_zeta_v * &rows.m);
+
+    GlsWiggleSecondDirCoeffs {
+        coeff_mm_uv,
+        coeff_ml_uv,
+        coeff_ll_uv,
+        a_u,
+        a_v,
+        a_uv,
+        c_u,
+        c_v,
+        c_uv,
+        l_u,
+        l_v,
+        l_uv,
+        dw_u,
+        dw_v,
+        dw_uv,
+    }
+}
+
 impl GaussianLocationScaleWiggleFamily {
     fn exact_newton_joint_hessian_for_specs(
         &self,
@@ -10440,68 +10585,41 @@ impl GaussianLocationScaleWiggleFamily {
         let s1_uv = &(&geom.d3q_dq03 * &(&xi_u * &xi_v)) + &(&b2u * &xi_v) + &(&b2v * &xi_u);
         let g2_uv = &(&geom.d4q_dq04 * &(&xi_u * &xi_v)) + &(&b3u * &xi_v) + &(&b3v * &xi_u);
 
-        let szeta_u = &rows.kappa * &zeta_u;
-        let szeta_v = &rows.kappa * &zeta_v;
-        let zeta_u_zeta_v = &zeta_u * &zeta_v;
-        let dw_u = -2.0 * &rows.w * &szeta_u;
-        let dw_v = -2.0 * &rows.w * &szeta_v;
-        let dw_uv = 4.0 * &rows.w * &(&szeta_u * &szeta_v)
-            - 2.0 * &rows.w * &rows.kappa_prime * &zeta_u_zeta_v;
-        let dm_u = -(&rows.w * &q_u) - &(2.0 * &rows.m * &szeta_u);
-        let dm_v = -(&rows.w * &q_v) - &(2.0 * &rows.m * &szeta_v);
-        let dm_uv = &(2.0 * &rows.w * &(&q_u * &szeta_v + &q_v * &szeta_u)) - &(&rows.w * &q_uv)
-            + &(4.0 * &rows.m * &(&szeta_u * &szeta_v))
-            - 2.0 * &rows.m * &rows.kappa_prime * &zeta_u_zeta_v;
-        let dn_uv = &(2.0 * &rows.w * &(&q_u * &q_v))
-            + &(4.0 * &rows.m * &(&q_u * &szeta_v + &q_v * &szeta_u))
-            - &(2.0 * &rows.m * &q_uv)
-            + &(4.0 * &rows.n * &(&szeta_u * &szeta_v))
-            - 2.0 * &rows.n * &rows.kappa_prime * &zeta_u_zeta_v;
-        let dn_u = -(2.0 * &rows.m * &q_u) - &(2.0 * &rows.n * &szeta_u);
-        let dn_v = -(2.0 * &rows.m * &q_v) - &(2.0 * &rows.n * &szeta_v);
-        let one_minus_2kappa = rows.kappa.mapv(|k| 1.0 - 2.0 * k);
-        let kappa_tprime =
-            &rows.kappa_dprime * &one_minus_2kappa - 2.0 * &(&rows.kappa_prime * &rows.kappa_prime);
-        let amn = &rows.obs_weight - &rows.n;
-
-        let coeff_mm_uv = &(&dw_uv * &geom.dq_dq0.mapv(|v| v * v))
-            + &(2.0 * &dw_u * &geom.dq_dq0 * &s1_v)
-            + &(2.0 * &dw_v * &geom.dq_dq0 * &s1_u)
-            + &(2.0 * &rows.w * &s1_u * &s1_v)
-            + &(2.0 * &rows.w * &geom.dq_dq0 * &s1_uv)
-            - &(&dm_uv * &geom.d2q_dq02)
-            - &(&dm_u * &g2_v)
-            - &(&dm_v * &g2_u)
-            - &(&rows.m * &g2_uv);
-        let a_md_v = &dm_v * &geom.dq_dq0 + &rows.m * &s1_v;
-        let a_md_u = &dm_u * &geom.dq_dq0 + &rows.m * &s1_u;
-        let coeff_ml_uv = 2.0
-            * &rows.kappa
-            * &(&dm_uv * &geom.dq_dq0 + &dm_u * &s1_v + &dm_v * &s1_u + &rows.m * &s1_uv)
-            + 2.0 * &rows.kappa_prime * &(&zeta_u * &a_md_v + &zeta_v * &a_md_u)
-            + 2.0 * &rows.kappa_dprime * &zeta_u_zeta_v * &rows.m * &geom.dq_dq0;
-        let two_ki2_minus_kpi = 2.0 * &rows.kappa * &rows.kappa - &rows.kappa_prime;
-        let four_kkpi_minus_kdpi = 4.0 * &(&rows.kappa * &rows.kappa_prime) - &rows.kappa_dprime;
-        let zeta_n_sym = &zeta_u * &dn_v + &zeta_v * &dn_u;
-        let bracketed_eta_eta = 4.0
-            * &rows.n
-            * &(&rows.kappa_prime * &rows.kappa_prime + &rows.kappa * &rows.kappa_dprime)
-            + &kappa_tprime * &amn;
-        let coeff_ll_uv = &two_ki2_minus_kpi * &dn_uv
-            + &four_kkpi_minus_kdpi * &zeta_n_sym
-            + &bracketed_eta_eta * &zeta_u_zeta_v;
-
-        let a_u = &dw_u * &geom.dq_dq0 + &rows.w * &s1_u;
-        let a_v = &dw_v * &geom.dq_dq0 + &rows.w * &s1_v;
-        let a_uv = &dw_uv * &geom.dq_dq0 + &dw_u * &s1_v + &dw_v * &s1_u + &rows.w * &s1_uv;
-        let c_u = -&dm_u;
-        let c_v = -&dm_v;
-        let c_uv = -&dm_uv;
-        let l_u = 2.0 * &rows.kappa * &dm_u + 2.0 * &rows.kappa_prime * &(&zeta_u * &rows.m);
-        let l_v = 2.0 * &rows.kappa * &dm_v + 2.0 * &rows.kappa_prime * &(&zeta_v * &rows.m);
-        let l_uv = 2.0 * &rows.kappa * &dm_uv
-            + 2.0 * &rows.kappa_prime * &(&zeta_u * &dm_v + &zeta_v * &dm_u)
-            + 2.0 * &rows.kappa_dprime * &(&zeta_u_zeta_v * &rows.m);
+        let GlsWiggleSecondDirCoeffs {
+            coeff_mm_uv,
+            coeff_ml_uv,
+            coeff_ll_uv,
+            a_u,
+            a_v,
+            a_uv,
+            c_u,
+            c_v,
+            c_uv,
+            l_u,
+            l_v,
+            l_uv,
+            dw_u,
+            dw_v,
+            dw_uv,
+        } = gls_wiggle_second_directional_coeffs(
+            &rows,
+            &geom,
+            &GlsWiggleDirPieces {
+                xi_u: &xi_u,
+                xi_v: &xi_v,
+                zeta_u: &zeta_u,
+                zeta_v: &zeta_v,
+                q_u: &q_u,
+                q_v: &q_v,
+                q_uv: &q_uv,
+                s1_u: &s1_u,
+                s1_v: &s1_v,
+                s1_uv: &s1_uv,
+                g2_u: &g2_u,
+                g2_v: &g2_v,
+                g2_uv: &g2_uv,
+            },
+        );
 
         // Pair-coefficient bundles. Cross-block (mu, B'/B'') absorb basis_u/v/uv row scaling.
         let xi_u_xi_v = &xi_u * &xi_v;
@@ -10658,82 +10776,44 @@ impl GaussianLocationScaleWiggleFamily {
         let basis1_v = scale_matrix_rows(&geom.basis_d2, &xi_v)?;
         let basis1_uv = scale_matrix_rows(&geom.basis_d3, &(&xi_u * &xi_v))?;
 
-        // logb κ-scaled η_ls directions; κ' = κ(1−κ), κ'' = κ(1−κ)(1−2κ).
-        let szeta_u = &rows.kappa * &zeta_u;
-        let szeta_v = &rows.kappa * &zeta_v;
-        let zeta_u_zeta_v = &zeta_u * &zeta_v;
-        let dw_u = -2.0 * &rows.w * &szeta_u;
-        let dw_v = -2.0 * &rows.w * &szeta_v;
-        // ∂²w/∂u∂v: differentiating −2wκζ_u along v gains a −2w·κ'·ζ_v·ζ_u
-        // term that the κ-as-constant code dropped.
-        let dw_uv = 4.0 * &rows.w * &(&szeta_u * &szeta_v)
-            - 2.0 * &rows.w * &rows.kappa_prime * &zeta_u_zeta_v;
-        let dm_u = -(&rows.w * &q_u) - &(2.0 * &rows.m * &szeta_u);
-        let dm_v = -(&rows.w * &q_v) - &(2.0 * &rows.m * &szeta_v);
-        // ∂²m/∂u∂v: same structural κ' correction as dw_uv (the −2mκζ_u term
-        // gains −2m·κ'·ζ_v·ζ_u when differentiated along η_ls).
-        let dm_uv = &(2.0 * &rows.w * &(&q_u * &szeta_v + &q_v * &szeta_u)) - &(&rows.w * &q_uv)
-            + &(4.0 * &rows.m * &(&szeta_u * &szeta_v))
-            - 2.0 * &rows.m * &rows.kappa_prime * &zeta_u_zeta_v;
-        let dn_uv = &(2.0 * &rows.w * &(&q_u * &q_v))
-            + &(4.0 * &rows.m * &(&q_u * &szeta_v + &q_v * &szeta_u))
-            - &(2.0 * &rows.m * &q_uv)
-            + &(4.0 * &rows.n * &(&szeta_u * &szeta_v))
-            - 2.0 * &rows.n * &rows.kappa_prime * &zeta_u_zeta_v;
-        // First-directional drifts of n (used by coeff_ll_uv cross terms).
-        let dn_u = -(2.0 * &rows.m * &q_u) - &(2.0 * &rows.n * &szeta_u);
-        let dn_v = -(2.0 * &rows.m * &q_v) - &(2.0 * &rows.n * &szeta_v);
-        // κ''' = ∂κ''/∂η_ls = κ''(1−2κ) − 2(κ')². Inline since this is the
-        // only site that needs the third η-derivative of κ.
-        let one_minus_2kappa = rows.kappa.mapv(|k| 1.0 - 2.0 * k);
-        let kappa_tprime =
-            &rows.kappa_dprime * &one_minus_2kappa - 2.0 * &(&rows.kappa_prime * &rows.kappa_prime);
-        let amn = &rows.obs_weight - &rows.n;
-
-        let coeff_mm_uv = &(&dw_uv * &geom.dq_dq0.mapv(|v| v * v))
-            + &(2.0 * &dw_u * &geom.dq_dq0 * &s1_v)
-            + &(2.0 * &dw_v * &geom.dq_dq0 * &s1_u)
-            + &(2.0 * &rows.w * &s1_u * &s1_v)
-            + &(2.0 * &rows.w * &geom.dq_dq0 * &s1_uv)
-            - &(&dm_uv * &geom.d2q_dq02)
-            - &(&dm_u * &g2_v)
-            - &(&dm_v * &g2_u)
-            - &(&rows.m * &g2_uv);
-        // ∂²(2κmD)/∂u∂v = 2κ·A_uv + 2κ'·ζ_u·A_v + 2κ'·ζ_v·A_u + 2κ''·ζ_uζ_v·A,
-        // with A = mD; the κ-as-constant code dropped the κ' and κ'' terms.
-        let a_md_v = &dm_v * &geom.dq_dq0 + &rows.m * &s1_v;
-        let a_md_u = &dm_u * &geom.dq_dq0 + &rows.m * &s1_u;
-        let coeff_ml_uv = 2.0
-            * &rows.kappa
-            * &(&dm_uv * &geom.dq_dq0 + &dm_u * &s1_v + &dm_v * &s1_u + &rows.m * &s1_uv)
-            + 2.0 * &rows.kappa_prime * &(&zeta_u * &a_md_v + &zeta_v * &a_md_u)
-            + 2.0 * &rows.kappa_dprime * &zeta_u_zeta_v * &rows.m * &geom.dq_dq0;
-        // ∂²(2κ²n + κ'(a−n))/∂u∂v factored as
-        //   (2κ² − κ')·n_uv + (4κκ' − κ'')·(ζ_u n_v + ζ_v n_u)
-        //   + [4n((κ')² + κκ'') + κ'''(a−n)]·ζ_u ζ_v.
-        let two_ki2_minus_kpi = 2.0 * &rows.kappa * &rows.kappa - &rows.kappa_prime;
-        let four_kkpi_minus_kdpi = 4.0 * &(&rows.kappa * &rows.kappa_prime) - &rows.kappa_dprime;
-        let zeta_n_sym = &zeta_u * &dn_v + &zeta_v * &dn_u;
-        let bracketed_eta_eta = 4.0
-            * &rows.n
-            * &(&rows.kappa_prime * &rows.kappa_prime + &rows.kappa * &rows.kappa_dprime)
-            + &kappa_tprime * &amn;
-        let coeff_ll_uv = &two_ki2_minus_kpi * &dn_uv
-            + &four_kkpi_minus_kdpi * &zeta_n_sym
-            + &bracketed_eta_eta * &zeta_u_zeta_v;
-
-        let a_u = &dw_u * &geom.dq_dq0 + &rows.w * &s1_u;
-        let a_v = &dw_v * &geom.dq_dq0 + &rows.w * &s1_v;
-        let a_uv = &dw_uv * &geom.dq_dq0 + &dw_u * &s1_v + &dw_v * &s1_u + &rows.w * &s1_uv;
-        let c_u = -&dm_u;
-        let c_v = -&dm_v;
-        let c_uv = -&dm_uv;
-        // ls-wiggle cross block: l = 2κm; pick up κ', κ'' on each direction.
-        let l_u = 2.0 * &rows.kappa * &dm_u + 2.0 * &rows.kappa_prime * &(&zeta_u * &rows.m);
-        let l_v = 2.0 * &rows.kappa * &dm_v + 2.0 * &rows.kappa_prime * &(&zeta_v * &rows.m);
-        let l_uv = 2.0 * &rows.kappa * &dm_uv
-            + 2.0 * &rows.kappa_prime * &(&zeta_u * &dm_v + &zeta_v * &dm_u)
-            + 2.0 * &rows.kappa_dprime * &(&zeta_u_zeta_v * &rows.m);
+        // Shared κ-aware second-directional row coefficients (κ' = κ(1−κ),
+        // κ'' = κ(1−κ)(1−2κ), κ''' = κ''(1−2κ) − 2(κ')²): identical to the
+        // matrix-free operator path, factored into one helper.
+        let GlsWiggleSecondDirCoeffs {
+            coeff_mm_uv,
+            coeff_ml_uv,
+            coeff_ll_uv,
+            a_u,
+            a_v,
+            a_uv,
+            c_u,
+            c_v,
+            c_uv,
+            l_u,
+            l_v,
+            l_uv,
+            dw_u,
+            dw_v,
+            dw_uv,
+        } = gls_wiggle_second_directional_coeffs(
+            &rows,
+            &geom,
+            &GlsWiggleDirPieces {
+                xi_u: &xi_u,
+                xi_v: &xi_v,
+                zeta_u: &zeta_u,
+                zeta_v: &zeta_v,
+                q_u: &q_u,
+                q_v: &q_v,
+                q_uv: &q_uv,
+                s1_u: &s1_u,
+                s1_v: &s1_v,
+                s1_uv: &s1_uv,
+                g2_u: &g2_u,
+                g2_v: &g2_v,
+                g2_uv: &g2_uv,
+            },
+        );
 
         let h_mm = xt_diag_x_dense(xmu, &coeff_mm_uv)?;
         let h_ml = xt_diag_y_dense(xmu, &coeff_ml_uv, x_ls)?;
@@ -14643,145 +14723,91 @@ trait BinomialLocationScaleJointPsiFamily: Clone + Send + Sync + 'static {
     ) -> Result<Array2<f64>, String>;
 }
 
-impl BinomialLocationScaleJointPsiFamily for BinomialLocationScaleFamily {
-    const LABEL: &'static str = "BinomialLocationScaleFamily";
+/// Both `BinomialLocationScaleJointPsiFamily` impls are byte-identical thin
+/// delegations to inherent methods, differing only in the implementing type
+/// and its `LABEL` fragment; generate them from one template.
+macro_rules! impl_binomial_location_scale_joint_psi_family {
+    ($family:ty, $label:literal) => {
+        impl BinomialLocationScaleJointPsiFamily for $family {
+            const LABEL: &'static str = $label;
 
-    fn ws_policy(&self) -> &crate::resource::ResourcePolicy {
-        &self.policy
-    }
+            fn ws_policy(&self) -> &crate::resource::ResourcePolicy {
+                &self.policy
+            }
 
-    fn ws_exact_joint_dense_block_designs<'a>(
-        &'a self,
-        specs: Option<&'a [ParameterBlockSpec]>,
-    ) -> Result<Option<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>)>, String> {
-        self.exact_joint_dense_block_designs(specs)
-    }
+            fn ws_exact_joint_dense_block_designs<'a>(
+                &'a self,
+                specs: Option<&'a [ParameterBlockSpec]>,
+            ) -> Result<Option<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>)>, String> {
+                self.exact_joint_dense_block_designs(specs)
+            }
 
-    fn ws_psi_direction(
-        &self,
-        block_states: &[ParameterBlockState],
-        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
-        psi_index: usize,
-        x_t: &Array2<f64>,
-        x_ls: &Array2<f64>,
-        policy: &crate::resource::ResourcePolicy,
-    ) -> Result<Option<BinomialLocationScaleJointPsiDirection>, String> {
-        self.exact_newton_joint_psi_direction(
-            block_states,
-            derivative_blocks,
-            psi_index,
-            x_t,
-            x_ls,
-            policy,
-        )
-    }
+            fn ws_psi_direction(
+                &self,
+                block_states: &[ParameterBlockState],
+                derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+                psi_index: usize,
+                x_t: &Array2<f64>,
+                x_ls: &Array2<f64>,
+                policy: &crate::resource::ResourcePolicy,
+            ) -> Result<Option<BinomialLocationScaleJointPsiDirection>, String> {
+                self.exact_newton_joint_psi_direction(
+                    block_states,
+                    derivative_blocks,
+                    psi_index,
+                    x_t,
+                    x_ls,
+                    policy,
+                )
+            }
 
-    fn ws_psi_second_order_terms_from_parts(
-        &self,
-        block_states: &[ParameterBlockState],
-        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
-        psi_a: &BinomialLocationScaleJointPsiDirection,
-        psi_b: &BinomialLocationScaleJointPsiDirection,
-        x_t: &Array2<f64>,
-        x_ls: &Array2<f64>,
-    ) -> Result<ExactNewtonJointPsiSecondOrderTerms, String> {
-        self.exact_newton_joint_psisecond_order_terms_from_parts(
-            block_states,
-            derivative_blocks,
-            psi_a,
-            psi_b,
-            x_t,
-            x_ls,
-        )
-    }
+            fn ws_psi_second_order_terms_from_parts(
+                &self,
+                block_states: &[ParameterBlockState],
+                derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+                psi_a: &BinomialLocationScaleJointPsiDirection,
+                psi_b: &BinomialLocationScaleJointPsiDirection,
+                x_t: &Array2<f64>,
+                x_ls: &Array2<f64>,
+            ) -> Result<ExactNewtonJointPsiSecondOrderTerms, String> {
+                self.exact_newton_joint_psisecond_order_terms_from_parts(
+                    block_states,
+                    derivative_blocks,
+                    psi_a,
+                    psi_b,
+                    x_t,
+                    x_ls,
+                )
+            }
 
-    fn ws_psi_hessian_directional_from_parts(
-        &self,
-        block_states: &[ParameterBlockState],
-        psi_dir: &BinomialLocationScaleJointPsiDirection,
-        d_beta_flat: &Array1<f64>,
-        x_t: &Array2<f64>,
-        x_ls: &Array2<f64>,
-    ) -> Result<Array2<f64>, String> {
-        self.exact_newton_joint_psihessian_directional_derivative_from_parts(
-            block_states,
-            psi_dir,
-            d_beta_flat,
-            x_t,
-            x_ls,
-        )
-    }
+            fn ws_psi_hessian_directional_from_parts(
+                &self,
+                block_states: &[ParameterBlockState],
+                psi_dir: &BinomialLocationScaleJointPsiDirection,
+                d_beta_flat: &Array1<f64>,
+                x_t: &Array2<f64>,
+                x_ls: &Array2<f64>,
+            ) -> Result<Array2<f64>, String> {
+                self.exact_newton_joint_psihessian_directional_derivative_from_parts(
+                    block_states,
+                    psi_dir,
+                    d_beta_flat,
+                    x_t,
+                    x_ls,
+                )
+            }
+        }
+    };
 }
 
-impl BinomialLocationScaleJointPsiFamily for BinomialLocationScaleWiggleFamily {
-    const LABEL: &'static str = "BinomialLocationScaleWiggleFamily";
-
-    fn ws_policy(&self) -> &crate::resource::ResourcePolicy {
-        &self.policy
-    }
-
-    fn ws_exact_joint_dense_block_designs<'a>(
-        &'a self,
-        specs: Option<&'a [ParameterBlockSpec]>,
-    ) -> Result<Option<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>)>, String> {
-        self.exact_joint_dense_block_designs(specs)
-    }
-
-    fn ws_psi_direction(
-        &self,
-        block_states: &[ParameterBlockState],
-        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
-        psi_index: usize,
-        x_t: &Array2<f64>,
-        x_ls: &Array2<f64>,
-        policy: &crate::resource::ResourcePolicy,
-    ) -> Result<Option<BinomialLocationScaleJointPsiDirection>, String> {
-        self.exact_newton_joint_psi_direction(
-            block_states,
-            derivative_blocks,
-            psi_index,
-            x_t,
-            x_ls,
-            policy,
-        )
-    }
-
-    fn ws_psi_second_order_terms_from_parts(
-        &self,
-        block_states: &[ParameterBlockState],
-        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
-        psi_a: &BinomialLocationScaleJointPsiDirection,
-        psi_b: &BinomialLocationScaleJointPsiDirection,
-        x_t: &Array2<f64>,
-        x_ls: &Array2<f64>,
-    ) -> Result<ExactNewtonJointPsiSecondOrderTerms, String> {
-        self.exact_newton_joint_psisecond_order_terms_from_parts(
-            block_states,
-            derivative_blocks,
-            psi_a,
-            psi_b,
-            x_t,
-            x_ls,
-        )
-    }
-
-    fn ws_psi_hessian_directional_from_parts(
-        &self,
-        block_states: &[ParameterBlockState],
-        psi_dir: &BinomialLocationScaleJointPsiDirection,
-        d_beta_flat: &Array1<f64>,
-        x_t: &Array2<f64>,
-        x_ls: &Array2<f64>,
-    ) -> Result<Array2<f64>, String> {
-        self.exact_newton_joint_psihessian_directional_derivative_from_parts(
-            block_states,
-            psi_dir,
-            d_beta_flat,
-            x_t,
-            x_ls,
-        )
-    }
-}
+impl_binomial_location_scale_joint_psi_family!(
+    BinomialLocationScaleFamily,
+    "BinomialLocationScaleFamily"
+);
+impl_binomial_location_scale_joint_psi_family!(
+    BinomialLocationScaleWiggleFamily,
+    "BinomialLocationScaleWiggleFamily"
+);
 
 /// Joint exact-Newton ψ workspace shared by `BinomialLocationScaleFamily` and
 /// `BinomialLocationScaleWiggleFamily`. The two families plug in via
@@ -20779,7 +20805,154 @@ impl BinomialLocationScaleWiggleHessianRowPieces {
     }
 }
 
+/// Per-row coefficient arrays for the BLS Wiggle joint first-directional
+/// Hessian derivative `D_β H_L[u]`, shared by the dense `_directional_derivative`
+/// assembly and the matrix-free `bls_wiggle_directional_operator`.
+struct BinomialWiggleDhRowCoeffs {
+    coeff_tt: Array1<f64>,
+    coeff_tl: Array1<f64>,
+    coeff_ll: Array1<f64>,
+    coeff_tw_b: Array1<f64>,
+    coeff_tw_d: Array1<f64>,
+    coeff_tw_dd: Array1<f64>,
+    coeff_lw_b: Array1<f64>,
+    coeff_lw_d: Array1<f64>,
+    coeff_lw_dd: Array1<f64>,
+    coeffww_bb: Array1<f64>,
+    coeffww_db: Array1<f64>,
+}
+
+/// All references needed to evaluate [`BinomialWiggleDhRowCoeffs`].
+struct BinomialWiggleDhRowInputs<'a> {
+    core0: &'a BinomialLocationScaleCore,
+    eta_t: &'a Array1<f64>,
+    etaw: &'a Array1<f64>,
+    sigma: &'a Array1<f64>,
+    m: &'a Array1<f64>,
+    g2: &'a Array1<f64>,
+    g3: &'a Array1<f64>,
+    b0: &'a Array2<f64>,
+    d0: &'a Array2<f64>,
+    dd0: &'a Array2<f64>,
+    uw: &'a Array1<f64>,
+    d_eta_t: &'a Array1<f64>,
+    d_eta_ls: &'a Array1<f64>,
+}
+
 impl BinomialLocationScaleWiggleFamily {
+    /// Per-row coefficient loop for the joint first-directional Hessian
+    /// derivative. The dense and operator paths build the identical 11
+    /// coefficient arrays from the same canonical directional-q formulas.
+    fn binomial_wiggle_dh_row_coeffs(
+        &self,
+        n: usize,
+        inputs: &BinomialWiggleDhRowInputs<'_>,
+    ) -> BinomialWiggleDhRowCoeffs {
+        let BinomialWiggleDhRowInputs {
+            core0,
+            eta_t,
+            etaw,
+            sigma,
+            m,
+            g2,
+            g3,
+            b0,
+            d0,
+            dd0,
+            uw,
+            d_eta_t,
+            d_eta_ls,
+        } = *inputs;
+
+        let mut coeff_tt = Array1::<f64>::zeros(n);
+        let mut coeff_tl = Array1::<f64>::zeros(n);
+        let mut coeff_ll = Array1::<f64>::zeros(n);
+        let mut coeff_tw_b = Array1::<f64>::zeros(n);
+        let mut coeff_tw_d = Array1::<f64>::zeros(n);
+        let mut coeff_tw_dd = Array1::<f64>::zeros(n);
+        let mut coeff_lw_b = Array1::<f64>::zeros(n);
+        let mut coeff_lw_d = Array1::<f64>::zeros(n);
+        let mut coeff_lw_dd = Array1::<f64>::zeros(n);
+        let mut coeffww_bb = Array1::<f64>::zeros(n);
+        let mut coeffww_db = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let q_i = core0.q0[i] + etaw[i];
+            let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
+                self.y[i],
+                self.weights[i],
+                q_i,
+                core0.mu[i],
+                core0.dmu_dq[i],
+                core0.d2mu_dq2[i],
+                core0.d3mu_dq3[i],
+                &self.link_kind,
+            );
+            let q0 = nonwiggle_q_derivs(eta_t[i], sigma[i]);
+            let dq0 = nonwiggle_q_directional(q0, d_eta_t[i], d_eta_ls[i]);
+
+            let br = b0.row(i);
+            let dr = d0.row(i);
+            let ddr = dd0.row(i);
+            let duw_i = dr.dot(uw);
+            let dduw_i = ddr.dot(uw);
+
+            let delta_m = g2[i] * dq0.delta_q + duw_i;
+            let delta_g2 = g3[i] * dq0.delta_q + dduw_i;
+
+            let q_t = m[i] * q0.q_t;
+            let q_ls = m[i] * q0.q_ls;
+            let q_tt = g2[i] * q0.q_t * q0.q_t;
+            let q_tl = g2[i] * q0.q_t * q0.q_ls + m[i] * q0.q_tl;
+            let q_ll = g2[i] * q0.q_ls * q0.q_ls + m[i] * q0.q_ll;
+
+            let delta_q_t = delta_m * q0.q_t + m[i] * dq0.delta_q_t;
+            let delta_q_ls = delta_m * q0.q_ls + m[i] * dq0.delta_q_ls;
+            let delta_q_tt = delta_g2 * q0.q_t * q0.q_t + g2[i] * 2.0 * q0.q_t * dq0.delta_q_t;
+            let delta_q_tl = delta_g2 * q0.q_t * q0.q_ls
+                + g2[i] * (dq0.delta_q_t * q0.q_ls + q0.q_t * dq0.delta_q_ls)
+                + delta_m * q0.q_tl
+                + m[i] * dq0.delta_q_tl;
+            let delta_q_ll = delta_g2 * q0.q_ls * q0.q_ls
+                + g2[i] * 2.0 * q0.q_ls * dq0.delta_q_ls
+                + delta_m * q0.q_ll
+                + m[i] * dq0.delta_q_ll;
+
+            let delta_q = m[i] * dq0.delta_q + br.dot(uw);
+
+            coeff_tt[i] = directionalhessian_coeff_fromobjective_q_terms(
+                m1, m2, m3, delta_q, q_t, q_t, q_tt, delta_q_t, delta_q_t, delta_q_tt,
+            );
+            coeff_tl[i] = directionalhessian_coeff_fromobjective_q_terms(
+                m1, m2, m3, delta_q, q_t, q_ls, q_tl, delta_q_t, delta_q_ls, delta_q_tl,
+            );
+            coeff_ll[i] = directionalhessian_coeff_fromobjective_q_terms(
+                m1, m2, m3, delta_q, q_ls, q_ls, q_ll, delta_q_ls, delta_q_ls, delta_q_ll,
+            );
+            coeff_tw_b[i] = m3 * delta_q * q_t + m2 * delta_q_t;
+            coeff_tw_d[i] = m2 * (q_t * dq0.delta_q + delta_q * q0.q_t) + m1 * dq0.delta_q_t;
+            coeff_tw_dd[i] = m1 * dq0.delta_q * q0.q_t;
+            coeff_lw_b[i] = m3 * delta_q * q_ls + m2 * delta_q_ls;
+            coeff_lw_d[i] = m2 * (q_ls * dq0.delta_q + delta_q * q0.q_ls) + m1 * dq0.delta_q_ls;
+            coeff_lw_dd[i] = m1 * dq0.delta_q * q0.q_ls;
+            coeffww_bb[i] = m3 * delta_q;
+            coeffww_db[i] = m2 * dq0.delta_q;
+        }
+
+        BinomialWiggleDhRowCoeffs {
+            coeff_tt,
+            coeff_tl,
+            coeff_ll,
+            coeff_tw_b,
+            coeff_tw_d,
+            coeff_tw_dd,
+            coeff_lw_b,
+            coeff_lw_d,
+            coeff_lw_dd,
+            coeffww_bb,
+            coeffww_db,
+        }
+    }
+
     /// Build the [`BlockEffectiveJacobian`] for block `block_idx`.
     ///
     /// The two-output map is (η_threshold, η_log_sigma).
@@ -21340,97 +21513,36 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         let g3 = d3q;
         let (sigma, ..) = exp_sigma_derivs_up_to_third(eta_ls.view());
 
-        let mut coeff_tt = Array1::<f64>::zeros(n);
-        let mut coeff_tl = Array1::<f64>::zeros(n);
-        let mut coeff_ll = Array1::<f64>::zeros(n);
-        let mut coeff_tw_b = Array1::<f64>::zeros(n);
-        let mut coeff_tw_d = Array1::<f64>::zeros(n);
-        let mut coeff_tw_dd = Array1::<f64>::zeros(n);
-        let mut coeff_lw_b = Array1::<f64>::zeros(n);
-        let mut coeff_lw_d = Array1::<f64>::zeros(n);
-        let mut coeff_lw_dd = Array1::<f64>::zeros(n);
-        let mut coeffww_bb = Array1::<f64>::zeros(n);
-        let mut coeffww_db = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let q_i = core0.q0[i] + etaw[i];
-            let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
-                self.y[i],
-                self.weights[i],
-                q_i,
-                core0.mu[i],
-                core0.dmu_dq[i],
-                core0.d2mu_dq2[i],
-                core0.d3mu_dq3[i],
-                &self.link_kind,
-            );
-            let q0 = nonwiggle_q_derivs(eta_t[i], sigma[i]);
-            let dq0 = nonwiggle_q_directional(q0, d_eta_t[i], d_eta_ls[i]);
-
-            let br = b0.row(i);
-            let dr = d0.row(i);
-            let ddr = dd0.row(i);
-            let duw_i = dr.dot(&uw);
-            let dduw_i = ddr.dot(&uw);
-
-            // Canonical directional wiggle scalars:
-            //   dm  = B'(q0)·uw + g2*dq0
-            //   dg2 = B''(q0)·uw + g3*dq0
-            let delta_m = g2[i] * dq0.delta_q + duw_i;
-            let delta_g2 = g3[i] * dq0.delta_q + dduw_i;
-
-            let q_t = m[i] * q0.q_t;
-            let q_ls = m[i] * q0.q_ls;
-            let q_tt = g2[i] * q0.q_t * q0.q_t;
-            let q_tl = g2[i] * q0.q_t * q0.q_ls + m[i] * q0.q_tl;
-            let q_ll = g2[i] * q0.q_ls * q0.q_ls + m[i] * q0.q_ll;
-
-            let delta_q_t = delta_m * q0.q_t + m[i] * dq0.delta_q_t;
-            let delta_q_ls = delta_m * q0.q_ls + m[i] * dq0.delta_q_ls;
-            let delta_q_tt = delta_g2 * q0.q_t * q0.q_t + g2[i] * 2.0 * q0.q_t * dq0.delta_q_t;
-            let delta_q_tl = delta_g2 * q0.q_t * q0.q_ls
-                + g2[i] * (dq0.delta_q_t * q0.q_ls + q0.q_t * dq0.delta_q_ls)
-                + delta_m * q0.q_tl
-                + m[i] * dq0.delta_q_tl;
-            let delta_q_ll = delta_g2 * q0.q_ls * q0.q_ls
-                + g2[i] * 2.0 * q0.q_ls * dq0.delta_q_ls
-                + delta_m * q0.q_ll
-                + m[i] * dq0.delta_q_ll;
-
-            let delta_q = m[i] * dq0.delta_q + br.dot(&uw);
-
-            // Closed forms by block from:
-            // dH_ab = m3*dq*q_a*q_b + m2*(dq_a*q_b + q_a*dq_b + dq*q_ab) + m1*dq_ab.
-            //
-            // (tt):
-            //   dH_tt = m3*dq*q_t^2 + m2*(2*dq_t*q_t + dq*q_tt) + m1*dq_tt.
-            let coeff_tt_i = directionalhessian_coeff_fromobjective_q_terms(
-                m1, m2, m3, delta_q, q_t, q_t, q_tt, delta_q_t, delta_q_t, delta_q_tt,
-            );
-            // (tl):
-            //   dH_tl = m3*dq*q_t*q_l
-            //        + m2*(dq_t*q_l + q_t*dq_l + dq*q_tl)
-            //        + m1*dq_tl.
-            let coeff_tl_i = directionalhessian_coeff_fromobjective_q_terms(
-                m1, m2, m3, delta_q, q_t, q_ls, q_tl, delta_q_t, delta_q_ls, delta_q_tl,
-            );
-            // (ll):
-            //   dH_ll = m3*dq*q_l^2 + m2*(2*dq_l*q_l + dq*q_ll) + m1*dq_ll.
-            let coeff_ll_i = directionalhessian_coeff_fromobjective_q_terms(
-                m1, m2, m3, delta_q, q_ls, q_ls, q_ll, delta_q_ls, delta_q_ls, delta_q_ll,
-            );
-
-            coeff_tt[i] = coeff_tt_i;
-            coeff_tl[i] = coeff_tl_i;
-            coeff_ll[i] = coeff_ll_i;
-            coeff_tw_b[i] = m3 * delta_q * q_t + m2 * delta_q_t;
-            coeff_tw_d[i] = m2 * (q_t * dq0.delta_q + delta_q * q0.q_t) + m1 * dq0.delta_q_t;
-            coeff_tw_dd[i] = m1 * dq0.delta_q * q0.q_t;
-            coeff_lw_b[i] = m3 * delta_q * q_ls + m2 * delta_q_ls;
-            coeff_lw_d[i] = m2 * (q_ls * dq0.delta_q + delta_q * q0.q_ls) + m1 * dq0.delta_q_ls;
-            coeff_lw_dd[i] = m1 * dq0.delta_q * q0.q_ls;
-            coeffww_bb[i] = m3 * delta_q;
-            coeffww_db[i] = m2 * dq0.delta_q;
-        }
+        let BinomialWiggleDhRowCoeffs {
+            coeff_tt,
+            coeff_tl,
+            coeff_ll,
+            coeff_tw_b,
+            coeff_tw_d,
+            coeff_tw_dd,
+            coeff_lw_b,
+            coeff_lw_d,
+            coeff_lw_dd,
+            coeffww_bb,
+            coeffww_db,
+        } = self.binomial_wiggle_dh_row_coeffs(
+            n,
+            &BinomialWiggleDhRowInputs {
+                core0: &core0,
+                eta_t,
+                etaw,
+                sigma: &sigma,
+                m: &m,
+                g2: &g2,
+                g3: &g3,
+                b0: &b0,
+                d0: &d0,
+                dd0: &dd0,
+                uw: &uw,
+                d_eta_t: &d_eta_t,
+                d_eta_ls: &d_eta_ls,
+            },
+        );
         let d_h_tt = xt_diag_x_dense(&x_t, &coeff_tt)?;
         let d_h_tl = xt_diag_y_dense(&x_t, &coeff_tl, &x_ls)?;
         let d_h_ll = xt_diag_x_dense(&x_ls, &coeff_ll)?;
@@ -22155,79 +22267,36 @@ impl BinomialLocationScaleWiggleFamily {
         let g3 = d3q;
         let (sigma, ..) = exp_sigma_derivs_up_to_third(eta_ls.view());
 
-        let mut coeff_tt = Array1::<f64>::zeros(n);
-        let mut coeff_tl = Array1::<f64>::zeros(n);
-        let mut coeff_ll = Array1::<f64>::zeros(n);
-        let mut coeff_tw_b = Array1::<f64>::zeros(n);
-        let mut coeff_tw_d = Array1::<f64>::zeros(n);
-        let mut coeff_tw_dd = Array1::<f64>::zeros(n);
-        let mut coeff_lw_b = Array1::<f64>::zeros(n);
-        let mut coeff_lw_d = Array1::<f64>::zeros(n);
-        let mut coeff_lw_dd = Array1::<f64>::zeros(n);
-        let mut coeffww_bb = Array1::<f64>::zeros(n);
-        let mut coeffww_db = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let q_i = core0.q0[i] + etaw[i];
-            let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
-                self.y[i],
-                self.weights[i],
-                q_i,
-                core0.mu[i],
-                core0.dmu_dq[i],
-                core0.d2mu_dq2[i],
-                core0.d3mu_dq3[i],
-                &self.link_kind,
-            );
-            let q0 = nonwiggle_q_derivs(eta_t[i], sigma[i]);
-            let dq0 = nonwiggle_q_directional(q0, d_eta_t[i], d_eta_ls[i]);
-
-            let br = b0.row(i);
-            let dr = d0.row(i);
-            let ddr = dd0.row(i);
-            let duw_i = dr.dot(&uw);
-            let dduw_i = ddr.dot(&uw);
-
-            let delta_m = g2[i] * dq0.delta_q + duw_i;
-            let delta_g2 = g3[i] * dq0.delta_q + dduw_i;
-
-            let q_t = m[i] * q0.q_t;
-            let q_ls = m[i] * q0.q_ls;
-            let q_tt = g2[i] * q0.q_t * q0.q_t;
-            let q_tl = g2[i] * q0.q_t * q0.q_ls + m[i] * q0.q_tl;
-            let q_ll = g2[i] * q0.q_ls * q0.q_ls + m[i] * q0.q_ll;
-
-            let delta_q_t = delta_m * q0.q_t + m[i] * dq0.delta_q_t;
-            let delta_q_ls = delta_m * q0.q_ls + m[i] * dq0.delta_q_ls;
-            let delta_q_tt = delta_g2 * q0.q_t * q0.q_t + g2[i] * 2.0 * q0.q_t * dq0.delta_q_t;
-            let delta_q_tl = delta_g2 * q0.q_t * q0.q_ls
-                + g2[i] * (dq0.delta_q_t * q0.q_ls + q0.q_t * dq0.delta_q_ls)
-                + delta_m * q0.q_tl
-                + m[i] * dq0.delta_q_tl;
-            let delta_q_ll = delta_g2 * q0.q_ls * q0.q_ls
-                + g2[i] * 2.0 * q0.q_ls * dq0.delta_q_ls
-                + delta_m * q0.q_ll
-                + m[i] * dq0.delta_q_ll;
-
-            let delta_q = m[i] * dq0.delta_q + br.dot(&uw);
-
-            coeff_tt[i] = directionalhessian_coeff_fromobjective_q_terms(
-                m1, m2, m3, delta_q, q_t, q_t, q_tt, delta_q_t, delta_q_t, delta_q_tt,
-            );
-            coeff_tl[i] = directionalhessian_coeff_fromobjective_q_terms(
-                m1, m2, m3, delta_q, q_t, q_ls, q_tl, delta_q_t, delta_q_ls, delta_q_tl,
-            );
-            coeff_ll[i] = directionalhessian_coeff_fromobjective_q_terms(
-                m1, m2, m3, delta_q, q_ls, q_ls, q_ll, delta_q_ls, delta_q_ls, delta_q_ll,
-            );
-            coeff_tw_b[i] = m3 * delta_q * q_t + m2 * delta_q_t;
-            coeff_tw_d[i] = m2 * (q_t * dq0.delta_q + delta_q * q0.q_t) + m1 * dq0.delta_q_t;
-            coeff_tw_dd[i] = m1 * dq0.delta_q * q0.q_t;
-            coeff_lw_b[i] = m3 * delta_q * q_ls + m2 * delta_q_ls;
-            coeff_lw_d[i] = m2 * (q_ls * dq0.delta_q + delta_q * q0.q_ls) + m1 * dq0.delta_q_ls;
-            coeff_lw_dd[i] = m1 * dq0.delta_q * q0.q_ls;
-            coeffww_bb[i] = m3 * delta_q;
-            coeffww_db[i] = m2 * dq0.delta_q;
-        }
+        let BinomialWiggleDhRowCoeffs {
+            coeff_tt,
+            coeff_tl,
+            coeff_ll,
+            coeff_tw_b,
+            coeff_tw_d,
+            coeff_tw_dd,
+            coeff_lw_b,
+            coeff_lw_d,
+            coeff_lw_dd,
+            coeffww_bb,
+            coeffww_db,
+        } = self.binomial_wiggle_dh_row_coeffs(
+            n,
+            &BinomialWiggleDhRowInputs {
+                core0: &core0,
+                eta_t,
+                etaw,
+                sigma: &sigma,
+                m: &m,
+                g2: &g2,
+                g3: &g3,
+                b0: &b0,
+                d0: &d0,
+                dd0: &dd0,
+                uw: &uw,
+                d_eta_t: &d_eta_t,
+                d_eta_ls: &d_eta_ls,
+            },
+        );
 
         let basis: Arc<Array2<f64>> = Arc::new(b0);
         let basis_d1: Arc<Array2<f64>> = Arc::new(d0);
@@ -24584,115 +24653,11 @@ mod tests {
         // coefficients (`coeff_tw_b/d`, `coeff_lw_b/d`, `coeffww`) and the
         // t↔ℓ block against the dense assembly used by
         // `exact_newton_joint_hessian` for the wiggle variant.
-        let n = 10usize;
+        let (family, states, specs, _xt, _xls, wiggle_design_current) =
+            bls_wiggle_workspace_fixture();
         let pt = 3usize;
         let pls = 2usize;
-        let xt = Array2::from_shape_fn((n, pt), |(i, j)| {
-            ((i as f64) * 0.17 + (j as f64) * 0.29).sin() * 0.4
-        });
-        let xls = Array2::from_shape_fn((n, pls), |(i, j)| {
-            ((i as f64) * 0.23 + (j as f64) * 0.41).cos() * 0.3
-        });
-        let beta_t = array![0.20, -0.10, 0.05];
-        let beta_ls = array![0.30, -0.15];
-        let eta_t = xt.dot(&beta_t);
-        let eta_ls = xls.dot(&beta_ls);
-
-        // Build a tiny wiggle basis through the existing seed helper.
-        let q_seed = Array1::linspace(-1.0, 1.0, n);
-        let (wiggle_block, knots) = BinomialLocationScaleWiggleFamily::buildwiggle_block_input(
-            q_seed.view(),
-            2,
-            3,
-            2,
-            false,
-        )
-        .expect("wiggle block");
-        let y = Array1::from_iter((0..n).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 }));
-        let weights = Array1::from_elem(n, 1.0);
-        let threshold_design =
-            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(xt.clone()));
-        let log_sigma_design =
-            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(xls.clone()));
-        let family = BinomialLocationScaleWiggleFamily {
-            y,
-            weights,
-            link_kind: InverseLink::Standard(StandardLink::Probit),
-            threshold_design: Some(threshold_design.clone()),
-            log_sigma_design: Some(log_sigma_design.clone()),
-            wiggle_knots: knots,
-            wiggle_degree: 2,
-            policy: crate::resource::ResourcePolicy::default_library(),
-        };
-        let q0 = Array1::from_iter(
-            eta_t
-                .iter()
-                .zip(eta_ls.iter())
-                .map(|(&eta_t_i, &eta_ls_i)| {
-                    binomial_location_scale_q0(eta_t_i, exp_sigma_from_eta_scalar(eta_ls_i))
-                }),
-        );
-        let wiggle_design_current = family
-            .wiggle_design(q0.view())
-            .expect("current wiggle basis");
         let pw = wiggle_design_current.ncols();
-        let beta_w = Array1::from_shape_fn(pw, |j| 0.05 * ((j + 1) as f64).cos());
-        let eta_w = wiggle_design_current.dot(&beta_w);
-        let states = vec![
-            ParameterBlockState {
-                beta: beta_t,
-                eta: eta_t,
-            },
-            ParameterBlockState {
-                beta: beta_ls,
-                eta: eta_ls,
-            },
-            ParameterBlockState {
-                beta: beta_w,
-                eta: eta_w,
-            },
-        ];
-        let specs = vec![
-            ParameterBlockSpec {
-                name: "threshold".to_string(),
-                design: threshold_design,
-                offset: Array1::zeros(n),
-                penalties: Vec::new(),
-                nullspace_dims: Vec::new(),
-                initial_log_lambdas: Array1::zeros(0),
-                initial_beta: None,
-                gauge_priority: 100,
-                jacobian_callback: None,
-                stacked_design: None,
-                stacked_offset: None,
-            },
-            ParameterBlockSpec {
-                name: "log_sigma".to_string(),
-                design: log_sigma_design,
-                offset: Array1::zeros(n),
-                penalties: Vec::new(),
-                nullspace_dims: Vec::new(),
-                initial_log_lambdas: Array1::zeros(0),
-                initial_beta: None,
-                gauge_priority: 100,
-                jacobian_callback: None,
-                stacked_design: None,
-                stacked_offset: None,
-            },
-            ParameterBlockSpec {
-                name: "wiggle".to_string(),
-                design: wiggle_block.design,
-                offset: Array1::zeros(n),
-                penalties: Vec::new(),
-                nullspace_dims: Vec::new(),
-                initial_log_lambdas: Array1::zeros(0),
-                initial_beta: None,
-                gauge_priority: 100,
-                jacobian_callback: None,
-                stacked_design: None,
-                stacked_offset: None,
-            },
-        ];
 
         let p = pt + pls + pw;
         let dense = family
@@ -26737,6 +26702,68 @@ mod tests {
         assert!(hess.iter().all(|v| v.is_finite()));
     }
 
+    /// Shared assertion body for the `*_exposes_joint_psi_hook_surface` tests:
+    /// pulls the joint ψ terms / second-order terms / mixed directional drift
+    /// off `family` and checks their shapes. `label` names the family in the
+    /// panic messages; `slope`/`intercept` parameterize the `d_beta` probe.
+    fn assert_joint_psi_hook_surface<F: CustomFamily>(
+        family: &F,
+        block_states: &[ParameterBlockState],
+        blocks: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        slope: f64,
+        intercept: f64,
+        label: &str,
+    ) {
+        let psi_terms = family
+            .exact_newton_joint_psi_terms(block_states, blocks, derivative_blocks, 0)
+            .expect("joint psi terms call")
+            .unwrap_or_else(|| panic!("{label} family should return joint psi terms"));
+        let psi2_terms = family
+            .exact_newton_joint_psisecond_order_terms(block_states, blocks, derivative_blocks, 0, 0)
+            .expect("joint psi second-order call")
+            .unwrap_or_else(|| {
+                panic!("{label} family should return joint psi second-order terms")
+            });
+        let total = block_states
+            .iter()
+            .map(|state| state.beta.len())
+            .sum::<usize>();
+        assert_eq!(psi_terms.score_psi.len(), total);
+        if psi_terms.hessian_psi_operator.is_some() {
+            assert_eq!(psi_terms.hessian_psi.dim(), (0, 0));
+        } else {
+            assert_eq!(psi_terms.hessian_psi.dim(), (total, total));
+        }
+        assert_eq!(psi2_terms.score_psi_psi.len(), total);
+        if psi2_terms.hessian_psi_psi_operator.is_some() {
+            assert_eq!(psi2_terms.hessian_psi_psi.dim(), (0, 0));
+        } else {
+            assert_eq!(psi2_terms.hessian_psi_psi.dim(), (total, total));
+        }
+
+        let mut d_beta_flat = Array1::<f64>::zeros(total);
+        let mut at = 0usize;
+        for state in block_states {
+            let end = at + state.beta.len();
+            d_beta_flat
+                .slice_mut(s![at..end])
+                .assign(&state.beta.mapv(|v| slope * v + intercept));
+            at = end;
+        }
+        let mixed = family
+            .exact_newton_joint_psihessian_directional_derivative(
+                block_states,
+                blocks,
+                derivative_blocks,
+                0,
+                &d_beta_flat,
+            )
+            .expect("joint psi mixed drift call")
+            .unwrap_or_else(|| panic!("{label} family should return joint psi mixed drift"));
+        assert_eq!(mixed.dim(), (total, total));
+    }
+
     #[test]
     fn binomial_location_scalewiggle_family_exposes_joint_psi_hook_surface() {
         let n = 12usize;
@@ -26817,57 +26844,15 @@ mod tests {
                 &noise_design,
             )
             .expect("psi derivative blocks");
-        let psi_terms = family
-            .exact_newton_joint_psi_terms(&block_states, &blocks, &derivative_blocks, 0)
-            .expect("joint psi terms call")
-            .expect("wiggle family should return joint psi terms");
-        let psi2_terms = family
-            .exact_newton_joint_psisecond_order_terms(
-                &block_states,
-                &blocks,
-                &derivative_blocks,
-                0,
-                0,
-            )
-            .expect("joint psi second-order call")
-            .expect("wiggle family should return joint psi second-order terms");
-        let total = block_states
-            .iter()
-            .map(|state| state.beta.len())
-            .sum::<usize>();
-        assert_eq!(psi_terms.score_psi.len(), total);
-        if psi_terms.hessian_psi_operator.is_some() {
-            assert_eq!(psi_terms.hessian_psi.dim(), (0, 0));
-        } else {
-            assert_eq!(psi_terms.hessian_psi.dim(), (total, total));
-        }
-        assert_eq!(psi2_terms.score_psi_psi.len(), total);
-        if psi2_terms.hessian_psi_psi_operator.is_some() {
-            assert_eq!(psi2_terms.hessian_psi_psi.dim(), (0, 0));
-        } else {
-            assert_eq!(psi2_terms.hessian_psi_psi.dim(), (total, total));
-        }
-
-        let mut d_beta_flat = Array1::<f64>::zeros(total);
-        let mut at = 0usize;
-        for state in &block_states {
-            let end = at + state.beta.len();
-            d_beta_flat
-                .slice_mut(s![at..end])
-                .assign(&state.beta.mapv(|v| 0.25 * v + 0.1));
-            at = end;
-        }
-        let mixed = family
-            .exact_newton_joint_psihessian_directional_derivative(
-                &block_states,
-                &blocks,
-                &derivative_blocks,
-                0,
-                &d_beta_flat,
-            )
-            .expect("joint psi mixed drift call")
-            .expect("wiggle family should return joint psi mixed drift");
-        assert_eq!(mixed.dim(), (total, total));
+        assert_joint_psi_hook_surface(
+            &family,
+            &block_states,
+            &blocks,
+            &derivative_blocks,
+            0.25,
+            0.1,
+            "wiggle",
+        );
     }
 
     #[test]
@@ -26933,58 +26918,15 @@ mod tests {
                 &noise_design,
             )
             .expect("psi derivative blocks");
-        let psi_terms = family
-            .exact_newton_joint_psi_terms(&fit.block_states, &blocks, &derivative_blocks, 0)
-            .expect("joint psi terms call")
-            .expect("gaussian family should return joint psi terms");
-        let psi2_terms = family
-            .exact_newton_joint_psisecond_order_terms(
-                &fit.block_states,
-                &blocks,
-                &derivative_blocks,
-                0,
-                0,
-            )
-            .expect("joint psi second-order call")
-            .expect("gaussian family should return joint psi second-order terms");
-        let total = fit
-            .block_states
-            .iter()
-            .map(|state| state.beta.len())
-            .sum::<usize>();
-        assert_eq!(psi_terms.score_psi.len(), total);
-        if psi_terms.hessian_psi_operator.is_some() {
-            assert_eq!(psi_terms.hessian_psi.dim(), (0, 0));
-        } else {
-            assert_eq!(psi_terms.hessian_psi.dim(), (total, total));
-        }
-        assert_eq!(psi2_terms.score_psi_psi.len(), total);
-        if psi2_terms.hessian_psi_psi_operator.is_some() {
-            assert_eq!(psi2_terms.hessian_psi_psi.dim(), (0, 0));
-        } else {
-            assert_eq!(psi2_terms.hessian_psi_psi.dim(), (total, total));
-        }
-
-        let mut d_beta_flat = Array1::<f64>::zeros(total);
-        let mut at = 0usize;
-        for state in &fit.block_states {
-            let end = at + state.beta.len();
-            d_beta_flat
-                .slice_mut(s![at..end])
-                .assign(&state.beta.mapv(|v| 0.2 * v + 0.15));
-            at = end;
-        }
-        let mixed = family
-            .exact_newton_joint_psihessian_directional_derivative(
-                &fit.block_states,
-                &blocks,
-                &derivative_blocks,
-                0,
-                &d_beta_flat,
-            )
-            .expect("joint psi mixed drift call")
-            .expect("gaussian family should return joint psi mixed drift");
-        assert_eq!(mixed.dim(), (total, total));
+        assert_joint_psi_hook_surface(
+            &family,
+            &fit.block_states,
+            &blocks,
+            &derivative_blocks,
+            0.2,
+            0.15,
+            "gaussian",
+        );
     }
 
     #[test]
@@ -28439,8 +28381,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn wiggle_familygradients_match_finite_differencewith_nontrivial_designs() {
+    /// Build the nontrivial-design BLS Wiggle family + designs + wiggle block
+    /// shared by the FD-gradient and FD-joint-Hessian tests below.
+    fn wiggle_nontrivial_fixture() -> (
+        BinomialLocationScaleWiggleFamily,
+        DesignMatrix,
+        DesignMatrix,
+        ParameterBlockInput,
+        Array1<f64>,
+        Array1<f64>,
+    ) {
         let n = 9usize;
         let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
         let weights = Array1::from_vec(vec![1.0; n]);
@@ -28479,40 +28429,82 @@ mod tests {
             wiggle_degree: 3,
             policy: crate::resource::ResourcePolicy::default_library(),
         };
+        (
+            family,
+            threshold_design,
+            log_sigma_design,
+            wiggle_block,
+            y,
+            weights,
+        )
+    }
+
+    /// Rebuild the three-block state for the nontrivial-design wiggle fixture.
+    fn rebuild_wiggle_nontrivial_states(
+        family: &BinomialLocationScaleWiggleFamily,
+        threshold_design: &DesignMatrix,
+        log_sigma_design: &DesignMatrix,
+        y: &Array1<f64>,
+        weights: &Array1<f64>,
+        beta_t: &Array1<f64>,
+        beta_ls: &Array1<f64>,
+        betaw: &Array1<f64>,
+    ) -> Vec<ParameterBlockState> {
+        let eta_t = threshold_design.matrixvectormultiply(beta_t);
+        let eta_ls = log_sigma_design.matrixvectormultiply(beta_ls);
+        let core_q0 =
+            binomial_location_scale_core(y, weights, &eta_t, &eta_ls, None, &family.link_kind)
+                .expect("core q0");
+        let etaw = family
+            .wiggle_design(core_q0.q0.view())
+            .expect("wiggle design")
+            .dot(betaw);
+        vec![
+            ParameterBlockState {
+                beta: beta_t.clone(),
+                eta: eta_t,
+            },
+            ParameterBlockState {
+                beta: beta_ls.clone(),
+                eta: eta_ls,
+            },
+            ParameterBlockState {
+                beta: betaw.clone(),
+                eta: etaw,
+            },
+        ]
+    }
+
+    /// Extract the exact-Newton gradient for one block of a wiggle evaluation.
+    fn extract_wiggle_gradient(eval: &FamilyEvaluation, block_idx: usize) -> Array1<f64> {
+        match &eval.blockworking_sets[block_idx] {
+            BlockWorkingSet::ExactNewton {
+                gradient,
+                hessian: _,
+            } => gradient.clone(),
+            BlockWorkingSet::Diagonal { .. } => panic!("expected exact newton"),
+        }
+    }
+
+    #[test]
+    fn wiggle_familygradients_match_finite_differencewith_nontrivial_designs() {
+        let (family, threshold_design, log_sigma_design, wiggle_block, y, weights) =
+            wiggle_nontrivial_fixture();
 
         let rebuild_states = |beta_t: &Array1<f64>,
                               beta_ls: &Array1<f64>,
                               betaw: &Array1<f64>|
          -> Vec<ParameterBlockState> {
-            let eta_t = threshold_design.matrixvectormultiply(beta_t);
-            let eta_ls = log_sigma_design.matrixvectormultiply(beta_ls);
-            let core_q0 = binomial_location_scale_core(
+            rebuild_wiggle_nontrivial_states(
+                &family,
+                &threshold_design,
+                &log_sigma_design,
                 &y,
                 &weights,
-                &eta_t,
-                &eta_ls,
-                None,
-                &family.link_kind,
+                beta_t,
+                beta_ls,
+                betaw,
             )
-            .expect("core q0");
-            let etaw = family
-                .wiggle_design(core_q0.q0.view())
-                .expect("wiggle design")
-                .dot(betaw);
-            vec![
-                ParameterBlockState {
-                    beta: beta_t.clone(),
-                    eta: eta_t,
-                },
-                ParameterBlockState {
-                    beta: beta_ls.clone(),
-                    eta: eta_ls,
-                },
-                ParameterBlockState {
-                    beta: betaw.clone(),
-                    eta: etaw,
-                },
-            ]
         };
 
         let objective = |beta_t: &Array1<f64>, beta_ls: &Array1<f64>, betaw: &Array1<f64>| {
@@ -28520,15 +28512,7 @@ mod tests {
             -family.evaluate(&states).expect("evaluate").log_likelihood
         };
 
-        let extractgradient = |eval: &FamilyEvaluation, block_idx: usize| -> Array1<f64> {
-            match &eval.blockworking_sets[block_idx] {
-                BlockWorkingSet::ExactNewton {
-                    gradient,
-                    hessian: _,
-                } => gradient.clone(),
-                BlockWorkingSet::Diagonal { .. } => panic!("expected exact newton"),
-            }
-        };
+        let extractgradient = extract_wiggle_gradient;
 
         let beta_t = Array1::from_vec(vec![0.15, -0.3, 0.2]);
         let beta_ls = Array1::from_vec(vec![-0.2, 0.1]);
@@ -28577,89 +28561,26 @@ mod tests {
 
     #[test]
     fn wiggle_family_joint_hessian_matches_fd_gradients_with_nontrivial_designs() {
-        let n = 9usize;
-        let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
-        let weights = Array1::from_vec(vec![1.0; n]);
-        let t_grid = Array1::linspace(0.0, 1.0, n);
-        let threshold_x = Array2::from_shape_fn((n, 3), |(i, j)| match j {
-            0 => 1.0,
-            1 => t_grid[i] - 0.5,
-            2 => (2.0 * std::f64::consts::PI * t_grid[i]).sin(),
-            _ => unreachable!(),
-        });
-        let log_sigma_x = Array2::from_shape_fn((n, 2), |(i, j)| match j {
-            0 => 1.0,
-            1 => (3.0 * std::f64::consts::PI * t_grid[i]).cos(),
-            _ => unreachable!(),
-        });
-        let threshold_design =
-            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(threshold_x.clone()));
-        let log_sigma_design =
-            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(log_sigma_x.clone()));
-        let q_seed = Array1::linspace(-1.3, 1.1, n);
-        let (wiggle_block, knots) = BinomialLocationScaleWiggleFamily::buildwiggle_block_input(
-            q_seed.view(),
-            3,
-            4,
-            2,
-            false,
-        )
-        .expect("wiggle block");
-        let family = BinomialLocationScaleWiggleFamily {
-            y: y.clone(),
-            weights: weights.clone(),
-            link_kind: InverseLink::Standard(StandardLink::Probit),
-            threshold_design: Some(threshold_design.clone()),
-            log_sigma_design: Some(log_sigma_design.clone()),
-            wiggle_knots: knots,
-            wiggle_degree: 3,
-            policy: crate::resource::ResourcePolicy::default_library(),
-        };
+        let (family, threshold_design, log_sigma_design, wiggle_block, y, weights) =
+            wiggle_nontrivial_fixture();
 
         let rebuild_states = |beta_t: &Array1<f64>,
                               beta_ls: &Array1<f64>,
                               betaw: &Array1<f64>|
          -> Vec<ParameterBlockState> {
-            let eta_t = threshold_design.matrixvectormultiply(beta_t);
-            let eta_ls = log_sigma_design.matrixvectormultiply(beta_ls);
-            let core_q0 = binomial_location_scale_core(
+            rebuild_wiggle_nontrivial_states(
+                &family,
+                &threshold_design,
+                &log_sigma_design,
                 &y,
                 &weights,
-                &eta_t,
-                &eta_ls,
-                None,
-                &family.link_kind,
+                beta_t,
+                beta_ls,
+                betaw,
             )
-            .expect("core q0");
-            let etaw = family
-                .wiggle_design(core_q0.q0.view())
-                .expect("wiggle design")
-                .dot(betaw);
-            vec![
-                ParameterBlockState {
-                    beta: beta_t.clone(),
-                    eta: eta_t,
-                },
-                ParameterBlockState {
-                    beta: beta_ls.clone(),
-                    eta: eta_ls,
-                },
-                ParameterBlockState {
-                    beta: betaw.clone(),
-                    eta: etaw,
-                },
-            ]
         };
 
-        let extractgradient = |eval: &FamilyEvaluation, block_idx: usize| -> Array1<f64> {
-            match &eval.blockworking_sets[block_idx] {
-                BlockWorkingSet::ExactNewton {
-                    gradient,
-                    hessian: _,
-                } => gradient.clone(),
-                BlockWorkingSet::Diagonal { .. } => panic!("expected exact newton"),
-            }
-        };
+        let extractgradient = extract_wiggle_gradient;
 
         let beta_t = Array1::from_vec(vec![0.15, -0.3, 0.2]);
         let beta_ls = Array1::from_vec(vec![-0.2, 0.1]);
