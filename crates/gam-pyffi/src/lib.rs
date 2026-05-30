@@ -3435,8 +3435,9 @@ fn duchon_basis_with_jets<'py>(
 /// `points` is `(N, d)`, `centers` is `(K, d)`. `nu` accepted as `"1/2"`,
 /// `"3/2"`, `"5/2"`, `"7/2"`, or `"9/2"` (also accepts `"0.5"`/etc). Forward
 /// only; gradients with respect to `points` are exposed via
-/// `matern_input_location_first_derivative` (returns `φ'(r)`, to be paired
-/// with `(t − c) / r` per axis at the call site).
+/// `matern_input_location_first_jet` (the full `∂Φ/∂t` tensor under the same
+/// anisotropic metric) and `matern_input_location_hessian` (the matching
+/// second derivative).
 #[pyfunction(signature = (points, centers, length_scale = 1.0, nu = "3/2", aniso_log_scales = None))]
 fn matern_basis<'py>(
     py: Python<'py>,

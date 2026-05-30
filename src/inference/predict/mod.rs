@@ -4639,41 +4639,24 @@ pub fn enrich_posterior_mean_bounds(
     family: crate::types::LikelihoodSpec,
     link_kind: Option<&InverseLink>,
 ) -> Result<(), EstimationError> {
-    if !(confidence_level.is_finite() && confidence_level > 0.0 && confidence_level < 1.0) {
-        return Err(EstimationError::InvalidInput(format!(
-            "confidence_level must be in (0,1), got {confidence_level}"
-        )));
-    }
-    let z = crate::probability::standard_normal_quantile(0.5 + 0.5 * confidence_level)
-        .map_err(EstimationError::InvalidInput)?;
-
-    let z_se = result.eta_standard_error.mapv(|s| z * s);
-    let eta_lower = &result.eta - &z_se;
-    let eta_upper = &result.eta + &z_se;
+    let z = validated_central_z(confidence_level)?;
+    let (eta_lower, eta_upper) = symmetric_interval(&result.eta, &result.eta_standard_error, z);
 
     let spec = spec_from_family_link(family, link_kind);
-    let transformed_lower = apply_family_inverse_link(&eta_lower, &spec)?;
-    let transformed_upper = apply_family_inverse_link(&eta_upper, &spec)?;
-
-    // Handle potentially non-monotone transforms (e.g. survival).
-    let mut mean_lower = Array1::from_iter(
-        transformed_lower
-            .iter()
-            .zip(transformed_upper.iter())
-            .map(|(&lo, &hi)| lo.min(hi)),
-    );
-    let mut mean_upper = Array1::from_iter(
-        transformed_lower
-            .iter()
-            .zip(transformed_upper.iter())
-            .map(|(&lo, &hi)| lo.max(hi)),
-    );
-
-    // Clamp bounded-response families to their support.
-    if let Some((lo, hi)) = spec.response.mean_clamp_bounds() {
-        mean_lower.mapv_inplace(|v| v.clamp(lo, hi));
-        mean_upper.mapv_inplace(|v| v.clamp(lo, hi));
-    }
+    // TransformEta bounds: transform the η endpoints through the inverse link,
+    // handle non-monotone transforms, and clamp to the family support. The
+    // shared policy engine owns this construction so it cannot drift from the
+    // per-predictor interval paths.
+    let (mean_lower, mean_upper) = mean_bounds(
+        &eta_lower,
+        &eta_upper,
+        &result.mean,
+        z,
+        MeanBoundMethod::TransformEta {
+            bounds: ResponseBounds::for_family(&spec.response),
+            response_map: &|eta: &Array1<f64>| apply_family_inverse_link(eta, &spec),
+        },
+    )?;
 
     result.mean_lower = Some(mean_lower);
     result.mean_upper = Some(mean_upper);
