@@ -973,7 +973,7 @@ fn hash_analytic_penalty_kind(
                 }
                 None => hasher.write_bool(false),
             }
-            match p.cache_third_decoder_derivative.as_ref() {
+            match p.third_decoder_derivative() {
                 Some(values) => {
                     hasher.write_bool(true);
                     hash_array3(hasher, values.as_ref());

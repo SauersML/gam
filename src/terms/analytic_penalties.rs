@@ -635,8 +635,11 @@ pub struct IsometryPenalty {
     ///   B_{ab,cd} = K_{a,cd}^T W J_b + H_{a,c}^T W H_{b,d}
     ///             + H_{a,d}^T W H_{b,c} + J_a^T W K_{b,cd}.
     /// Either this cache or `duchon_radial_source` must be present for
-    /// analytic `hvp` calls.
-    pub cache_third_decoder_derivative: Option<Arc<ndarray::Array3<f64>>>,
+    /// analytic `hvp` calls. Interior-mutable (mirrors
+    /// `jacobian_second_cache_slot`) so the SAE outer loop can refresh `K` in
+    /// place each step. Access through [`Self::third_decoder_derivative`] /
+    /// [`Self::set_third_decoder_derivative`].
+    pub third_decoder_derivative_slot: RwLock<Option<Arc<ndarray::Array3<f64>>>>,
     /// Output dimensionality `p` (column count of each per-row Jacobian).
     pub p_out: usize,
     /// Per-row behavioral metric in low-rank factored form. Defaults to
@@ -672,7 +675,7 @@ impl IsometryPenalty {
             jacobian_cache_slot: RwLock::new(None),
             jacobian_second_cache_slot: RwLock::new(None),
             duchon_radial_source: None,
-            cache_third_decoder_derivative: None,
+            third_decoder_derivative_slot: RwLock::new(None),
             p_out,
             weight: WeightField::Identity,
             scalar_weight: 1.0,
@@ -736,6 +739,24 @@ impl IsometryPenalty {
             .write()
             .expect("IsometryPenalty::jacobian_second_cache_slot poisoned") = jac2;
     }
+
+    /// Read-side accessor for the per-row Jacobian third derivative `K`.
+    /// Mirrors [`Self::jacobian_second_cache`].
+    #[must_use]
+    pub fn third_decoder_derivative(&self) -> Option<Arc<ndarray::Array3<f64>>> {
+        self.third_decoder_derivative_slot
+            .read()
+            .expect("IsometryPenalty::third_decoder_derivative_slot poisoned")
+            .clone()
+    }
+
+    /// In-place writer for just the Jacobian third-derivative cache `K`.
+    pub fn set_third_decoder_derivative(&self, jac3: Option<Arc<ndarray::Array3<f64>>>) {
+        *self
+            .third_decoder_derivative_slot
+            .write()
+            .expect("IsometryPenalty::third_decoder_derivative_slot poisoned") = jac3;
+    }
 }
 
 impl Clone for IsometryPenalty {
@@ -747,7 +768,7 @@ impl Clone for IsometryPenalty {
             jacobian_cache_slot: RwLock::new(self.jacobian_cache()),
             jacobian_second_cache_slot: RwLock::new(self.jacobian_second_cache()),
             duchon_radial_source: self.duchon_radial_source.clone(),
-            cache_third_decoder_derivative: self.cache_third_decoder_derivative.clone(),
+            third_decoder_derivative_slot: RwLock::new(self.third_decoder_derivative()),
             p_out: self.p_out,
             weight: self.weight.clone(),
             scalar_weight: self.scalar_weight,
@@ -763,8 +784,8 @@ impl IsometryPenalty {
     /// uses the full residual-curvature term in addition to the metric
     /// Gauss-Newton piece.
     #[must_use]
-    pub fn with_third_decoder_derivative(mut self, k: Arc<ndarray::Array3<f64>>) -> Self {
-        self.cache_third_decoder_derivative = Some(k);
+    pub fn with_third_decoder_derivative(self, k: Arc<ndarray::Array3<f64>>) -> Self {
+        self.set_third_decoder_derivative(Some(k));
         self
     }
 
@@ -843,12 +864,12 @@ impl IsometryPenalty {
     }
 
     fn has_jacobian_third_source(&self, method: &str) -> bool {
-        if self.cache_third_decoder_derivative.is_some() || self.duchon_radial_source.is_some() {
+        if self.third_decoder_derivative().is_some() || self.duchon_radial_source.is_some() {
             true
         } else {
             self.missing_cache_default(
                 method,
-                "both cache_third_decoder_derivative and duchon_radial_source are None",
+                "both third_decoder_derivative cache and duchon_radial_source are None",
             );
             false
         }
@@ -1065,8 +1086,8 @@ impl IsometryPenalty {
         n_obs: usize,
         d: usize,
     ) -> Option<CowArray<'a, f64, Ix3>> {
-        if let Some(jac3) = self.cache_third_decoder_derivative.as_ref() {
-            return Some(CowArray::from(jac3.view()));
+        if let Some(jac3) = self.third_decoder_derivative() {
+            return Some(CowArray::from(jac3.as_ref().clone()));
         }
         let source = self.duchon_radial_source.as_ref()?;
         match self.duchon_radial_jacobian_third(target, n_obs, d, source) {
