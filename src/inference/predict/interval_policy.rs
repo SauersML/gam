@@ -21,6 +21,9 @@
 //! behaviour cannot drift between families.
 
 use crate::estimate::EstimationError;
+use crate::inference::predict::{
+    InferenceCovarianceMode, PredictPosteriorMeanResult, PredictUncertaintyResult,
+};
 use crate::types::ResponseFamily;
 use ndarray::Array1;
 
@@ -193,4 +196,121 @@ pub fn mean_bounds(
         }
         MeanBoundMethod::IdentityEta => Ok((eta_lower.clone(), eta_upper.clone())),
     }
+}
+
+/// How the η-scale confidence interval is produced for a predictor.
+///
+/// Most families form the central interval `η ± z·SE(η)`. Threshold-scale
+/// families (binomial location-scale) have an η predictor whose interval is not
+/// directly meaningful on the response scale, so they collapse the η interval
+/// onto the point predictor and carry all uncertainty through the delta-method
+/// response interval instead.
+pub enum EtaInterval {
+    /// Central interval `η ± z·SE(η)`.
+    Symmetric,
+    /// η interval collapsed to the point predictor (`η_lower = η_upper = η`);
+    /// response uncertainty is carried entirely by the mean-bound method.
+    Collapsed,
+}
+
+impl EtaInterval {
+    fn endpoints(&self, eta: &Array1<f64>, eta_se: &Array1<f64>, z: f64) -> (Array1<f64>, Array1<f64>) {
+        match self {
+            EtaInterval::Symmetric => symmetric_interval(eta, eta_se, z),
+            EtaInterval::Collapsed => (eta.clone(), eta.clone()),
+        }
+    }
+}
+
+/// Optional observation (prediction) interval half-width `z·σ` on the response
+/// scale, added to / subtracted from the point prediction. `None` for families
+/// that do not expose an observation-scale noise term.
+pub struct ObservationInterval<'a> {
+    /// Per-row response-scale noise standard deviation.
+    pub noise_sd: &'a Array1<f64>,
+}
+
+/// Static metadata threaded into every [`PredictUncertaintyResult`].
+///
+/// These fields are pure provenance — the requested covariance mode and whether
+/// a smoothing-corrected covariance was actually used — and are copied verbatim
+/// into the result so the engine, not each predictor, owns the struct shape.
+pub struct UncertaintyProvenance {
+    pub covariance_mode_requested: InferenceCovarianceMode,
+    pub covariance_corrected_used: bool,
+}
+
+/// Assemble a [`PredictUncertaintyResult`] from a predictor's already-computed
+/// linear-predictor / response state.
+///
+/// This is the shared tail every `predict_full_uncertainty` impl used to inline:
+/// validate the confidence level, form the η interval, map it onto the response
+/// scale via `method`, optionally attach an observation interval, and populate
+/// the result struct. Predictors supply only the family-specific quantities
+/// (`eta`, `mean`, the two standard errors) plus the policy choices
+/// (`eta_interval`, `method`); the engine owns everything else so interval
+/// construction cannot drift between families.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_uncertainty_result(
+    confidence_level: f64,
+    eta: Array1<f64>,
+    mean: Array1<f64>,
+    eta_standard_error: Array1<f64>,
+    mean_standard_error: Array1<f64>,
+    eta_interval: EtaInterval,
+    method: MeanBoundMethod<'_>,
+    observation: Option<ObservationInterval<'_>>,
+    provenance: UncertaintyProvenance,
+) -> Result<PredictUncertaintyResult, EstimationError> {
+    let z = validated_central_z(confidence_level)?;
+    let (eta_lower, eta_upper) = eta_interval.endpoints(&eta, &eta_standard_error, z);
+    let (mean_lower, mean_upper) = mean_bounds(&eta_lower, &eta_upper, &mean, z, method)?;
+    let (observation_lower, observation_upper) = match observation {
+        Some(obs) => {
+            let half = obs.noise_sd.mapv(|s| z * s);
+            (Some(&mean - &half), Some(&mean + &half))
+        }
+        None => (None, None),
+    };
+    Ok(PredictUncertaintyResult {
+        eta,
+        mean,
+        eta_standard_error,
+        mean_standard_error,
+        eta_lower,
+        eta_upper,
+        mean_lower,
+        mean_upper,
+        observation_lower,
+        observation_upper,
+        covariance_mode_requested: provenance.covariance_mode_requested,
+        covariance_corrected_used: provenance.covariance_corrected_used,
+    })
+}
+
+/// Attach response-scale confidence bounds to a [`PredictPosteriorMeanResult`].
+///
+/// When a confidence level is supplied, this is the shared tail every
+/// `predict_posterior_mean` impl used to inline: validate the level, form the η
+/// interval, map it onto the response scale via `method`, and set
+/// `mean_lower` / `mean_upper`. When no level is supplied the bounds are left
+/// `None`. `eta` / `eta_se` are taken from `result`, so a predictor whose η
+/// interval is not meaningful supplies `EtaInterval::Collapsed`.
+pub fn assemble_posterior_mean_bounds(
+    result: &mut PredictPosteriorMeanResult,
+    confidence_level: Option<f64>,
+    eta_interval: EtaInterval,
+    method: MeanBoundMethod<'_>,
+) -> Result<(), EstimationError> {
+    let Some(level) = confidence_level else {
+        return Ok(());
+    };
+    let z = validated_central_z(level)?;
+    let (eta_lower, eta_upper) =
+        eta_interval.endpoints(&result.eta, &result.eta_standard_error, z);
+    let (mean_lower, mean_upper) =
+        mean_bounds(&eta_lower, &eta_upper, &result.mean, z, method)?;
+    result.mean_lower = Some(mean_lower);
+    result.mean_upper = Some(mean_upper);
+    Ok(())
 }

@@ -1347,43 +1347,41 @@ impl BernoulliMarginalSlopeFamily {
         let row_iter = outer_row_indices(options, n).to_vec();
         let row_weights =
             crate::families::marginal_slope_shared::outer_row_weights_by_index(options, n);
+        // Sigma scale jets and the zero primary direction are constant across
+        // rows; resolve once outside the fold. The shared
+        // `directional_obj_grad_hess` sweep differentiates *through* the fixed
+        // leading prefix `[zero, row_dir]` (one zero log-sigma slot, the
+        // perturbation direction) and appends the grad/hess unit directions;
+        // `obj: None` suppresses the zeroth-order pass.
+        let scale_grad = self.sigma_scale_jet(3, &[1], &[])?;
+        let scale_hess = self.sigma_scale_jet(4, &[1], &[])?;
+        let zero = Array1::<f64>::zeros(primary.total);
         let acc = chunked_row_reduction(
             row_iter.as_slice(),
             || BernoulliBlockHessianAccumulator::new(&slices),
             |row, acc| -> Result<(), String> {
                 let row_dir =
                     self.row_primary_direction_from_flat(row, &slices, &primary, d_beta_flat)?;
-                let zero = Array1::<f64>::zeros(primary.total);
-                let mut grad = Array1::<f64>::zeros(primary.total);
-                for a in 0..primary.total {
-                    let mut da = Array1::<f64>::zeros(primary.total);
-                    da[a] = 1.0;
-                    let scale = self.sigma_scale_jet(3, &[1], &[])?;
-                    grad[a] = self.row_neglog_directional_with_scale_jet(
-                        row,
-                        block_states,
-                        &[zero.clone(), row_dir.clone(), da],
-                        &scale,
-                    )?;
-                }
-                let mut hess = Array2::<f64>::zeros((primary.total, primary.total));
-                for a in 0..primary.total {
-                    let mut da = Array1::<f64>::zeros(primary.total);
-                    da[a] = 1.0;
-                    for b in a..primary.total {
-                        let mut db = Array1::<f64>::zeros(primary.total);
-                        db[b] = 1.0;
-                        let scale = self.sigma_scale_jet(4, &[1], &[])?;
-                        let value = self.row_neglog_directional_with_scale_jet(
+                let scales = DirectionalScaleJets {
+                    obj: None,
+                    grad: scale_grad.clone(),
+                    hess: scale_hess.clone(),
+                };
+                let terms = directional_obj_grad_hess(
+                    primary.total,
+                    &[&zero, &row_dir],
+                    &scales,
+                    |dirs, scale| {
+                        let owned: Vec<Array1<f64>> = dirs.iter().map(|d| (*d).clone()).collect();
+                        self.row_neglog_directional_with_scale_jet(
                             row,
                             block_states,
-                            &[zero.clone(), row_dir.clone(), da.clone(), db],
-                            &scale,
-                        )?;
-                        hess[[a, b]] = value;
-                        hess[[b, a]] = value;
-                    }
-                }
+                            &owned,
+                            scale,
+                        )
+                    },
+                )?;
+                let mut hess = terms.hess;
                 let w = row_weights[row];
                 if w != 1.0 {
                     hess.mapv_inplace(|v| v * w);
