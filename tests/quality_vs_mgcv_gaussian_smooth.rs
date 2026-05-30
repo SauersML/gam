@@ -67,7 +67,6 @@ fn gam_smooth_matches_mgcv_on_lidar() {
         m <- gam(logratio ~ s(range), data = df, method = "REML")
         emit("fitted", as.numeric(fitted(m)))
         emit("edf", sum(m$edf))
-        emit("scale", m$scale)
         "#,
     );
     let mgcv_fitted = r.vector("fitted");

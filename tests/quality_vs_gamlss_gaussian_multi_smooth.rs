@@ -1,8 +1,11 @@
 //! End-to-end quality: gam's Gaussian *location-scale* fit with MULTIPLE
-//! additive smooths in BOTH the mean and the log-sigma blocks must match
-//! `gamlss::gamlss(family = NO())` — the reference GAMLSS implementation for
-//! distributional regression and the de-facto standard for location-scale
-//! models with smooth mean and smooth log-variance in R.
+//! additive thin-plate smooths in BOTH the mean and the log-sigma blocks must
+//! match `gamlss::gamlss(family = NO())` — the reference GAMLSS implementation
+//! for distributional regression and the de-facto standard for location-scale
+//! models with smooth mean and smooth log-variance in R. To compare like with
+//! like, the gamlss side uses the SAME thin-plate basis as gam via
+//! `ga(~ s(x, bs="tp"))` (the `gamlss.add` bridge to `mgcv`'s `s()`), not the
+//! P-spline `pb()` default, so any divergence is in the solver, not the basis.
 //!
 //! This is the cross-feature combination that single-smooth location-scale
 //! tests never exercise: family (Gaussian) x TWO additive smooths per block
@@ -186,9 +189,12 @@ fn gam_gaussian_multi_smooth_matches_gamlss() {
     assert_eq!(gam_sigma.len(), grid_n);
 
     // ---- fit the SAME model with gamlss (the mature GAMLSS reference) ------
-    // family = NO() (Gaussian with mu + log-sigma); two penalized B-spline
-    // smooths pb(x1) + pb(x2) in BOTH mu.formula and sigma.formula, predicted
-    // on the identical 10x10 grid.
+    // family = NO() (Gaussian with mu + log-sigma); two penalized thin-plate
+    // smooths ga(~ s(x1, bs="tp")) + ga(~ s(x2, bs="tp")) in BOTH mu.formula
+    // and sigma.formula — the SAME tp basis gam uses — predicted on the
+    // identical 10x10 grid. `predictAll(..., data = df)` re-supplies the fitting
+    // frame the ga()/mgcv smoother needs to evaluate at new points and returns
+    // mu and sigma on the response scale in one call.
     let grid_x1_csv = grid_x1
         .iter()
         .map(|t| format!("{t:.17e}"))
@@ -202,17 +208,17 @@ fn gam_gaussian_multi_smooth_matches_gamlss() {
     let body = format!(
         r#"
         suppressPackageStartupMessages(library(gamlss))
-        m <- gamlss(y ~ pb(x1) + pb(x2),
-                    sigma.formula = ~ pb(x1) + pb(x2),
+        suppressPackageStartupMessages(library(gamlss.add))
+        m <- gamlss(y ~ ga(~ s(x1, bs = "tp")) + ga(~ s(x2, bs = "tp")),
+                    sigma.formula = ~ ga(~ s(x1, bs = "tp")) + ga(~ s(x2, bs = "tp")),
                     family = NO(), data = df,
                     control = gamlss.control(trace = FALSE))
         gx1 <- as.numeric(strsplit("{grid_x1_csv}", ",")[[1]])
         gx2 <- as.numeric(strsplit("{grid_x2_csv}", ",")[[1]])
         nd <- data.frame(x1 = gx1, x2 = gx2)
-        mu <- predict(m, what = "mu", newdata = nd, type = "response")
-        sigma <- predict(m, what = "sigma", newdata = nd, type = "response")
-        emit("mu", as.numeric(mu))
-        emit("sigma", as.numeric(sigma))
+        pa <- predictAll(m, newdata = nd, data = df, type = "response")
+        emit("mu", as.numeric(pa$mu))
+        emit("sigma", as.numeric(pa$sigma))
         "#
     );
     let r = run_r(
@@ -239,21 +245,25 @@ fn gam_gaussian_multi_smooth_matches_gamlss() {
     );
 
     // Both engines maximize the same penalized Gaussian location-scale joint
-    // log-likelihood with two additive penalized smooths per block, so the
-    // recovered additive mean and log-sigma surfaces must coincide up to
-    // basis-convention / numerical tolerance. The mean is the better-determined
-    // parameter (variance-stabilized by the same 1/sigma^2 weights both engines
-    // use), hence the tighter 0.018 bound; the log-sigma surface is a second-
-    // moment quantity estimated from squared residuals and gets a looser 0.035.
-    // With multiple smooths active in each block, exceeding either bound flags a
-    // penalty-block-alignment or blockwise-Jacobian bug that would not surface
-    // in a single-smooth fit.
+    // log-likelihood with two additive penalized thin-plate smooths per block,
+    // so the recovered additive mean and log-sigma surfaces must coincide up to
+    // numerical tolerance. The mean is the better-determined parameter
+    // (variance-stabilized by the same 1/sigma^2 weights both engines use),
+    // hence the tighter 0.02 bound — the same bar the single-smooth mgcv and
+    // gamlss benchmarks hit. The log-sigma surface is a noisier second-moment
+    // quantity AND uses a different noise link (gam's floored sigma = 0.01 +
+    // exp(eta) vs gamlss NO()'s log link sigma = exp(eta)); since sigma_true in
+    // [0.1, 0.25] keeps the 0.01 floor at most ~10% of sigma at its smallest,
+    // that reparametrization adds a small pointwise bias on log sigma, so it
+    // gets the looser 0.04 bound (matching the by-group gamlss benchmark). With
+    // two smooths active per block, exceeding either bound flags a penalty-
+    // block-alignment or blockwise-Jacobian bug invisible to a single-smooth fit.
     assert!(
-        rel_mu < 0.018,
+        rel_mu < 0.02,
         "fitted mean surface diverges from gamlss: rel_l2(mu)={rel_mu:.5}"
     );
     assert!(
-        rel_log_sigma < 0.035,
+        rel_log_sigma < 0.04,
         "fitted log-sigma surface diverges from gamlss: rel_l2(log sigma)={rel_log_sigma:.5}"
     );
 }

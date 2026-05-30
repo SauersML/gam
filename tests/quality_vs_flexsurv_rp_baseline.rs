@@ -19,11 +19,13 @@
 //! (`SurvivalSpec::Net`) — the proportional-hazards-on-log-Λ structure flexsurv
 //! fits — so the comparison is like-for-like.
 //!
-//! df = 3 cubic RP baseline: flexsurv's default cubic spline parameterizes the
-//! baseline with boundary knots plus interior knots; `df = 3` corresponds to a
-//! single interior knot (`k = 1`: two boundary + one interior). We give gam a
-//! cubic (degree-3) time basis with one interior knot so the two baselines have
-//! matched wiggliness. They are NOT bit-identical: flexsurv anchors knots on the
+//! Matched wiggliness via one interior knot (`k = 1`): flexsurv parameterizes the
+//! baseline with two boundary knots plus `k` interior knots, and in its own
+//! notation `df = k + 1` (so `k = 1` is flexsurv's `df = 2`, a cubic spline with a
+//! single interior knot). We match the engines on the quantity that actually sets
+//! the baseline flexibility — the interior-knot count — by giving gam a cubic
+//! (degree-3) time basis with one interior knot and passing `k = 1` to flexsurv.
+//! They are NOT bit-identical: flexsurv anchors knots on the
 //! quantiles of the uncensored log event times and uses a *natural* cubic spline;
 //! gam uses a monotone I-spline on log t anchored on its own log-time knots. The
 //! spec therefore allows ±5% on the covariate coefficient and an 0.08 RMSE on the
@@ -73,9 +75,9 @@ use std::path::Path;
 
 const BONE_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/bone.csv");
 
-// df = 3 cubic RP baseline: one interior knot (k = 1) plus the two boundary
-// knots flexsurv always places. gam's cubic (degree-3) I-spline gets the same
-// single interior knot so the baselines have matched flexibility.
+// One interior knot (k = 1) plus the two boundary knots flexsurv always places
+// (flexsurv's own `df = k + 1`, i.e. df = 2). gam's cubic (degree-3) I-spline
+// gets the same single interior knot so the baselines have matched flexibility.
 const N_INTERNAL_KNOTS: usize = 1;
 const TIME_DEGREE: usize = 3;
 
@@ -195,7 +197,7 @@ fn gam_rp_baseline_coefficients_match_flexsurvspline_on_bone() {
     // `survival_likelihood="transformation"` is gam's Royston-Parmar family: it
     // models log Λ(t|covariates) directly. `survmodel(spec=net)` selects the
     // net-survival working model (SurvivalSpec::Net). The cubic I-spline time
-    // basis with one interior knot is the df=3 flexible-parametric baseline;
+    // basis with one interior knot is the k=1 flexible-parametric baseline;
     // `trt` and `x` enter as proportional linear covariates on the
     // log-cumulative-hazard scale — exactly flexsurvspline(scale="hazard").
     let cfg = FitConfig {
@@ -281,7 +283,7 @@ fn gam_rp_baseline_coefficients_match_flexsurvspline_on_bone() {
 
     // ---- fit the SAME model with flexsurv::flexsurvspline -------------------
     // scale="hazard" => Royston-Parmar log-cumulative-hazard spline; k = 1
-    // interior knot reproduces the df=3 cubic baseline. summary(type="cumhaz")
+    // interior knot matches gam's single-interior-knot baseline. summary(type="cumhaz")
     // returns Λ(t | newdata) on the requested day grid per (trt, x) row.
     let r = run_r(
         &[
@@ -336,12 +338,26 @@ fn gam_rp_baseline_coefficients_match_flexsurvspline_on_bone() {
         grid_times.len()
     );
 
+    // Precondition for a *relative* coefficient bound: the reference β_x must be
+    // meaningfully non-zero, otherwise |Δ|/|ref| is a ratio of two near-zero
+    // numbers and asserts nothing. The fixed-seed confounder is not orthogonal to
+    // the 14 events, so flexsurv's unpenalized MLE β_x is a finite, non-trivial
+    // slope; this floor enforces that precondition and turns the degenerate
+    // near-zero case into a loud failure instead of a chance pass.
+    assert!(
+        flex_beta_x.abs() > 0.05,
+        "reference β_x={flex_beta_x:.4} is too close to zero for a relative bound \
+         to be meaningful; the comparison would assert nothing"
+    );
+
     // The continuous covariate coefficient is the core estimand: a proportional
     // shift of log Λ that both engines fit by maximum (penalized) likelihood on
     // identical data. flexsurv is unpenalized MLE; gam's transformation family
-    // applies a light smoothing penalty only to the *time* spline, leaving the
-    // linear covariate effectively unpenalized, so β_x must agree to within the
-    // basis/knot difference. The spec's principled bound: ±5% relative.
+    // applies only a 1e-6 stabilizing ridge to the linear covariate block
+    // (negligible against the O(1) Fisher information from 14 events) and a
+    // smoothing penalty to the *time* spline alone, so the covariate is
+    // effectively unpenalized in both engines and β_x must agree to within the
+    // basis/knot difference. Principled bound: ±5% relative.
     assert!(
         rel_beta_x <= 0.05,
         "gam's RP covariate coefficient diverges from flexsurvspline: \

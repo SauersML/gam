@@ -7,13 +7,25 @@
 //! with the canonical log link) layered on top of a multi-dimensional
 //! tensor-product `te()` smooth. A 1-D Gaussian smooth can pass while the
 //! tensor + IRLS-row interaction is subtly broken, so we test them together:
-//!   * gam fits `y ~ te(x, z, k=[4,3])`, family = poisson, REML.
-//!   * mgcv fits `gam(y ~ te(x, z, k = c(4, 3)), family = poisson(link="log"),
-//!     method = "REML")` — its tensor-product machinery is the field reference.
-//! Both engines target the *same* penalized REML objective on the *same* data,
-//! so their fitted Poisson means (on the response scale, exp(eta)) must track
-//! pointwise across the entire 15×20 surface. We assert relative L2 on those
-//! fitted means. A genuine divergence here is a real bug in gam's PIRLS-row /
+//!   * gam fits `y ~ te(x, z, k=[6,6])`, family = poisson, REML.
+//!   * mgcv fits `gam(y ~ te(x, z, bs="ps", k=c(6,6)), family=poisson(link=
+//!     "log"), method="REML")` — its tensor-product machinery is the field
+//!     reference.
+//!
+//! Basis alignment matters for a *tight* comparison: gam's `te()` uses cubic
+//! (degree-3) B-spline margins with a 2nd-order difference penalty per margin
+//! (term_builder: `degree=3`, `penalty_order=2`, single per-margin penalty).
+//! mgcv's default `te()` margin is thin-plate (`bs="tp"`), which would inject a
+//! pure basis-convention gap. We therefore pin mgcv to `bs="ps"` (P-splines):
+//! its default `m=c(2,2)` gives exactly a cubic B-spline basis with a 2nd-order
+//! penalty, the *same* marginal construction as gam. With `k=6` per margin both
+//! engines build 6 basis functions per axis (gam: internal_knots =
+//! max(6-(3+1),1) = 2, total = 2+3+1 = 6), so the marginal bases coincide.
+//!
+//! Both engines then target the *same* penalized REML objective on the *same*
+//! data, so their fitted Poisson means (response scale, exp(eta)) must track
+//! pointwise across the whole surface. We assert relative L2 on the fitted
+//! means. A genuine divergence here is a real bug in gam's PIRLS-row /
 //! tensor-design integration, not a reason to loosen the bound.
 
 use gam::matrix::LinearOperator;
@@ -25,24 +37,26 @@ use gam::{
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand_distr::{Distribution, Poisson, Uniform};
+use rand_distr::{Distribution, Poisson};
 
-/// Synthetic Poisson surface on a 15×20 grid (n=300): x~U(0,2π), z~U(-1,1),
-/// log-mean eta = 0.8 + 0.3*sin(x) + 0.2*z^2, y ~ Poisson(exp(eta)). Seed=345,
-/// fed *identically* to gam and mgcv via the shared CSV the harness writes.
+/// Deterministic 15×20 Poisson surface (n=300): x on an even grid over [0,2π],
+/// z on an even grid over [-1,1], log-mean eta = 0.8 + 0.3*sin(x) + 0.2*z^2,
+/// y ~ Poisson(exp(eta)) with the Poisson draws seeded (seed=345). The grid is
+/// fully deterministic and only the response carries noise, so the identical
+/// (x, z, y) triples reach both gam and mgcv via the shared CSV the harness
+/// writes — there is no sampling difference between the two engines.
 fn make_poisson_tensor_data(seed: u64) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     let mut rng = StdRng::seed_from_u64(seed);
-    let ux = Uniform::new(0.0, 2.0 * std::f64::consts::PI).expect("uniform x");
-    let uz = Uniform::new(-1.0, 1.0).expect("uniform z");
     let nx = 15usize;
     let nz = 20usize;
     let mut x = Vec::with_capacity(nx * nz);
     let mut z = Vec::with_capacity(nx * nz);
     let mut y = Vec::with_capacity(nx * nz);
-    for _ in 0..nx {
-        for _ in 0..nz {
-            let xi = ux.sample(&mut rng);
-            let zi = uz.sample(&mut rng);
+    for ix in 0..nx {
+        // even grid endpoints included: x in [0, 2π], z in [-1, 1].
+        let xi = (ix as f64) / ((nx - 1) as f64) * (2.0 * std::f64::consts::PI);
+        for iz in 0..nz {
+            let zi = -1.0 + 2.0 * (iz as f64) / ((nz - 1) as f64);
             let eta = 0.8 + 0.3 * xi.sin() + 0.2 * zi * zi;
             let lambda = eta.exp();
             let pois = Poisson::new(lambda).expect("poisson lambda > 0");
@@ -80,12 +94,14 @@ fn gam_poisson_tensor_matches_mgcv() {
     let x_idx = col["x"];
     let z_idx = col["z"];
 
-    // ---- fit with gam: y ~ te(x, z, k=[4,3]), poisson(log), REML ----------
+    // ---- fit with gam: y ~ te(x, z, k=[6,6]), poisson(log), REML ----------
+    // k=6 per margin: cubic B-spline (degree 3) requires k >= 4; 6 leaves room
+    // to express the sin(x) / z^2 structure and matches the mgcv ps margins.
     let cfg = FitConfig {
         family: Some("poisson".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ te(x, z, k=[4,3])", &ds, &cfg).expect("gam poisson te fit");
+    let result = fit_from_formula("y ~ te(x, z, k=[6,6])", &ds, &cfg).expect("gam poisson te fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for poisson(log) + te()");
     };
@@ -104,6 +120,8 @@ fn gam_poisson_tensor_matches_mgcv() {
     let gam_mean: Vec<f64> = gam_eta.iter().map(|e| e.exp()).collect();
 
     // ---- fit the SAME model with mgcv (the mature tensor reference) -------
+    // bs="ps" with default m=c(2,2) => cubic B-spline margins + 2nd-order
+    // penalty, matching gam's te() margin construction (see module doc).
     let r = run_r(
         &[
             Column::new("x", &x),
@@ -112,7 +130,7 @@ fn gam_poisson_tensor_matches_mgcv() {
         ],
         r#"
         suppressPackageStartupMessages(library(mgcv))
-        m <- gam(y ~ te(x, z, k = c(4, 3)), data = df,
+        m <- gam(y ~ te(x, z, bs = "ps", k = c(6, 6)), data = df,
                  family = poisson(link = "log"), method = "REML")
         emit("fitted", as.numeric(fitted(m)))
         emit("edf", sum(m$edf))
@@ -126,19 +144,32 @@ fn gam_poisson_tensor_matches_mgcv() {
     let rel = relative_l2(&gam_mean, mgcv_mean);
     let corr = pearson(&gam_mean, mgcv_mean);
     eprintln!(
-        "poisson te(x,z,k=c(4,3)): n={n} gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} \
+        "poisson te(x,z,bs=ps,k=c(6,6)): n={n} gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} \
          rel_l2={rel:.4} pearson={corr:.5}"
     );
 
-    // Both engines REML-fit the identical Poisson surface with a 4×3 tensor
-    // basis, so the fitted means must coincide closely. The residual gap is the
-    // B-spline (gam margins) vs thin-plate (mgcv te default) marginal-basis
-    // convention plus REML lambda-selection differences on a single noisy draw;
-    // rel_l2 < 0.12 is tight enough that any real break in the PIRLS-row /
-    // tensor-design integration (the thing this combination exercises) fails it,
-    // while not penalizing the legitimate basis-convention difference.
+    // Both engines REML-fit the identical Poisson surface with *matched* cubic
+    // B-spline (P-spline) 6×6 tensor margins and a 2nd-order marginal penalty,
+    // so the only remaining gap is each engine's independent REML lambda search
+    // and tensor reparameterization on one noisy Poisson draw. That keeps the
+    // fitted means very close: rel_l2 < 0.06 is tight enough to catch any real
+    // break in the PIRLS-row / tensor-design integration this combination
+    // exercises, while leaving headroom for the legitimate lambda-search
+    // difference. pearson > 0.99 guards the surface shape independently.
     assert!(
-        rel < 0.12,
+        corr > 0.99,
+        "Poisson+te() fitted means decorrelate from mgcv: pearson={corr:.5} (rel_l2={rel:.4})"
+    );
+    assert!(
+        rel < 0.06,
         "Poisson+te() fitted means diverge from mgcv: rel_l2={rel:.4} (pearson={corr:.5})"
+    );
+    // EDF is reparameterization/null-space-convention sensitive across the two
+    // tensor implementations, so assert same-ballpark complexity rather than
+    // bit-identical: within 35% relative.
+    let edf_rel = (gam_edf - mgcv_edf).abs() / mgcv_edf.abs().max(1.0);
+    assert!(
+        edf_rel < 0.35,
+        "tensor effective degrees of freedom disagree: gam={gam_edf:.3} mgcv={mgcv_edf:.3} (rel={edf_rel:.3})"
     );
 }

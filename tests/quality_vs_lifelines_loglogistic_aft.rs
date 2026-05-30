@@ -43,8 +43,8 @@
 use gam::families::survival_construction::{
     SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeBasisConfig,
     add_survival_time_derivative_guard_offset, build_survival_time_basis,
-    build_survival_time_offsets_for_likelihood, center_survival_time_designs_at_anchor,
-    evaluate_survival_time_basis_row, resolve_survival_time_anchor_value,
+    build_survival_time_offsets_for_likelihood, evaluate_survival_time_basis_row,
+    resolve_survival_time_anchor_value,
     resolved_survival_time_basis_config_from_build, survival_derivative_guard_for_likelihood,
 };
 use gam::families::survival_location_scale::{
@@ -222,50 +222,43 @@ fn gam_loglogistic_aft_matches_lifelines_on_haberman_ages() {
     let gam_surv = gam_grid_survival(&fit, &time_ctx, &grid_age, &grid_time);
 
     // ---- fit the SAME data with lifelines.LogLogisticAFT (the reference) -----
-    let mut grid_age_flat = Vec::with_capacity(grid_n);
-    let mut grid_time_flat = Vec::with_capacity(grid_n);
-    for i in 0..grid_n {
-        grid_age_flat.push(grid_age[i]);
-        grid_time_flat.push(grid_time[i]);
-    }
-    let r = run_python(
-        &[
-            Column::new("time", &time),
-            Column::new("event", &event),
-            Column::new("age", &age_col),
-            Column::new("grid_age", &grid_age_flat),
-            Column::new("grid_time", &grid_time_flat),
-        ],
+    // The harness CSV requires every column to have the SAME length (it asserts
+    // equal `data.len()` and does NOT pad), so only the n-row training columns
+    // (time/event/age) travel through `df`. The grid_n-row evaluation grid is
+    // rendered into the Python source as literal lists built from the very same
+    // Rust `grid_age`/`grid_time` vectors gam evaluates, so both engines score
+    // the identical (age, time) pairs in the identical order.
+    let py_list = |v: &Array1<f64>| -> String {
+        let items: Vec<String> = (0..v.len()).map(|i| format!("{:.17e}", v[i])).collect();
+        format!("[{}]", items.join(", "))
+    };
+    let grid_age_py = py_list(&grid_age);
+    let grid_time_py = py_list(&grid_time);
+    let body = format!(
         r#"
 import pandas as pd
 from lifelines import LogLogisticAFTFitter
 
-# The data CSV is padded to the grid length by the harness (longest column
-# wins, shorter columns are NaN-filled). Reconstruct the clean training frame
-# and the evaluation grid from their own non-NaN spans.
-fit_df = pd.DataFrame({
+fit_df = pd.DataFrame({{
     "time": df["time"],
     "event": df["event"],
     "age": df["age"],
-}).dropna()
+}})
 fit_df = fit_df[fit_df["time"] > 0]
 
 aft = LogLogisticAFTFitter()
 aft.fit(fit_df, duration_col="time", event_col="event", ancillary=False)
 
-grid = pd.DataFrame({
-    "grid_age": df["grid_age"],
-    "grid_time": df["grid_time"],
-}).dropna()
-gx = pd.DataFrame({"age": grid["grid_age"].to_numpy()})
-gt = grid["grid_time"].to_numpy()
+grid_age = np.asarray({grid_age_py}, dtype=float)
+grid_time = np.asarray({grid_time_py}, dtype=float)
 
 # Per-row survivor probability S(t_i | age_i): evaluate each subject's curve at
 # its own grid time. predict_survival_function returns a (times x rows) frame;
-# pull the row-specific time via reindex+interpolate to land exactly on gt[i].
+# request exactly the row's time so the single returned cell is S(t_i | age_i).
 surv = []
-for i in range(len(gt)):
-    sf = aft.predict_survival_function(gx.iloc[[i]], times=[float(gt[i])])
+for i in range(len(grid_time)):
+    gx = pd.DataFrame({{"age": [float(grid_age[i])]}})
+    sf = aft.predict_survival_function(gx, times=[float(grid_time[i])])
     surv.append(float(sf.to_numpy()[0, 0]))
 emit("surv", surv)
 
@@ -274,7 +267,15 @@ emit("surv", surv)
 params = aft.params_
 a_age = float(params.loc[("alpha_", "age")])
 emit("a_age", a_age)
-"#,
+"#
+    );
+    let r = run_python(
+        &[
+            Column::new("time", &time),
+            Column::new("event", &event),
+            Column::new("age", &age_col),
+        ],
+        &body,
     );
     let ref_surv = r.vector("surv");
     let ref_a_age = r.scalar("a_age");

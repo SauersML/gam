@@ -30,9 +30,10 @@
 //! Marginal comparison. AalenJohansen estimates the *marginal* (population)
 //! CIF. The comparable gam quantity is the g-formula / direct-standardization
 //! marginal CIF: the per-subject CIF averaged over the empirical Age
-//! distribution of the cohort, F_k(t) = (1/n) sum_i F_k(t | x_i). Because the
-//! thin-plate smooth is centered, this average integrates the covariate effect
-//! out exactly the way AalenJohansen does empirically.
+//! distribution of the cohort, F_k(t) = (1/n) sum_i F_k(t | x_i). Averaging the
+//! per-subject CIFs (not exp(eta) before integrating — that would be Jensen-
+//! biased) is the correct standardized estimand and converges to the same
+//! population CIF that AalenJohansen estimates non-parametrically.
 //!
 //! Data: the real PBC `cirrhosis.csv` (418 subjects). Status D = death,
 //! CL = liver transplant — the two competing *events*; Status C = censored
@@ -40,13 +41,18 @@
 //! years). CIF is evaluated on the grid [0, 1000, 2000, 3000, 4000] days.
 //!
 //! Bound. lifelines uses a product-limit / Aalen-Johansen scheme; gam uses a
-//! Weibull spline baseline with crude-risk quadrature. These are genuinely
-//! different numerical schemes on the same data, so a 1-2% absolute CIF
-//! difference is the expected order. We assert max |gam - AJ| <= 0.015 per
-//! cause across the grid. That is tight enough to catch any real divergence in
-//! gam's baseline, covariate effect, or CIF integral, while honestly absorbing
-//! the parametric-vs-nonparametric and quadrature differences. We never weaken
-//! it and never edit gam to pass — a genuine divergence failing here is useful.
+//! parametric two-parameter Weibull PH baseline (no time spline in pure Weibull
+//! mode — the linear log-time basis *is* the Weibull, so scale/shape are read
+//! straight from baseline_cfg) marginalized via crude-risk quadrature. These
+//! are genuinely different schemes on the same data. The death CIF reaches
+//! ~0.4 by 4000 days; a well-specified Weibull tracks the Aalen-Johansen step
+//! curve to a few percent of that level, so a ~1-2% absolute CIF difference is
+//! the expected order. We assert max |gam - AJ| <= 0.015 per cause across the
+//! grid: tight enough that a real divergence in gam's baseline, covariate
+//! effect, or CIF integral fails the test, yet loose enough to absorb the
+//! parametric-vs-nonparametric and quadrature difference. We never weaken it
+//! and never edit gam to pass — a genuine divergence failing here is useful and
+//! would point at a real bug rather than the (bounded) scheme mismatch.
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
@@ -265,7 +271,10 @@ T = np.asarray(df["N_Days"], dtype=float)
 E = np.asarray(df["event"], dtype=float).astype(int)
 
 def cif_on_grid(cause):
-    ajf = AalenJohansenFitter(calculate_variance=False)
+    # PBC event times are integer days with many ties; AalenJohansenFitter
+    # breaks ties by jittering. Fix `seed` so the jitter (and thus the CIF) is
+    # reproducible across runs — otherwise the comparison would be flaky.
+    ajf = AalenJohansenFitter(calculate_variance=False, seed=0)
     ajf.fit(T, E, event_of_interest=cause)
     cif = ajf.cumulative_density_
     # cif index = event times; column 0 = CIF estimate. Step function: value at

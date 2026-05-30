@@ -13,17 +13,24 @@
 //!
 //! We use a *separable* truth f(x,z) = sin(3πx)·cos(3πz) on a deterministic
 //! 20×20 grid over [0,1]² (n=400, noiseless, fixed by construction). A separable
-//! function is *exactly* representable in a tensor-product space when the
-//! marginal bases are rich enough, so with k=8 per margin (an 8×8 = 64-function
-//! tensor basis before centering) both engines should recover it nearly
-//! perfectly. We fit `y ~ te(x, z, k=8)` with gam (REML) and the identical model
+//! function is the ideal probe for the Kronecker contract: its rank-1 structure
+//! is captured by a single outer product of marginal coefficients, so any error
+//! in how the marginal bases are tensored or centered shows up directly in the
+//! surface. With k=8 per margin (an 8×8 = 64-function tensor basis before
+//! centering) both engines have ample resolution to track these sinusoids very
+//! closely. We fit `y ~ te(x, z, k=8)` with gam (REML) and the identical model
 //! `mgcv::gam(y ~ te(x, z, k=8), method="REML")`, then compare the two fitted
 //! surfaces pointwise on the training grid.
 //!
-//! Both engines REML-fit the same separable data in tensor-product spaces with
-//! identical per-margin basis counts, so the fitted surfaces must essentially
-//! coincide. A real divergence here is a real bug in gam's tensor-product
-//! construction, not a tolerance artifact.
+//! Both engines REML-fit the same separable data with the same per-margin basis
+//! count, so the fitted surfaces must essentially coincide — up to the mild
+//! difference in marginal-basis convention (gam tensors B-spline margins; mgcv's
+//! default `te` margins are `bs="cr"`), which both span the same smooth space.
+//! That basis difference is why we compare surfaces (not EDF, which is
+//! convention-sensitive and kept diagnostic-only) with a tolerance that absorbs
+//! it yet still catches a real Kronecker/centering bug. A divergence past the
+//! bounds below is a real bug in gam's tensor-product construction, not a
+//! tolerance artifact.
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
@@ -122,11 +129,12 @@ fn gam_te_2d_smooth_matches_mgcv_on_separable_grid() {
          rel_l2={rel:.5} pearson={corr:.6}"
     );
 
-    // A separable truth lies exactly in the tensor-product span when both
-    // engines use k=8 per margin (8x8 = 64 basis functions before centering),
-    // so the REML fits must coincide up to the (tiny) penalty shrinkage both
-    // apply identically. 0.02 / 0.995 are tight bounds that still leave a sane
-    // margin yet would catch any real bug in gam's Kronecker/centering logic.
+    // A separable truth is closely resolved by both k=8-per-margin tensor fits
+    // (8x8 = 64 basis functions before centering), so the two REML surfaces must
+    // nearly coincide, differing only by the marginal-basis convention (gam
+    // B-spline vs mgcv cr) plus the tiny penalty shrinkage both apply. 0.02 /
+    // 0.995 are tight enough to catch any real Kronecker/centering bug yet leave
+    // a sane margin for that benign basis difference.
     assert!(
         corr > 0.995,
         "te(x,z) fitted surfaces should be near-identical to mgcv: pearson={corr:.6}"

@@ -19,7 +19,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, run_python, run_r};
+use gam::test_support::reference::{Column, pearson, relative_l2, run_python, run_r};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::path::Path;
@@ -178,6 +178,11 @@ emit("coef1", [float(clf1.coef_[0, 0]), float(clf1.intercept_[0])])
 
     // ---- compare ----------------------------------------------------------
     let corr_mgcv = pearson(&gam_prob, mgcv_prob);
+    // Pointwise (not merely correlated) probability agreement: pearson is
+    // affine-invariant and would pass even if gam's probabilities were a
+    // scaled/shifted copy of mgcv's, so we also require small relative-L2 on
+    // the [0,1] probability scale where both engines emit the same quantity.
+    let rel_mgcv = relative_l2(&gam_prob, mgcv_prob);
     let gam_auc = auc(&gam_prob, &y);
     let mgcv_auc = auc(mgcv_prob, &y);
     let sk_auc = auc(sk_prob, &y);
@@ -187,7 +192,7 @@ emit("coef1", [float(clf1.coef_[0, 0]), float(clf1.intercept_[0])])
 
     eprintln!(
         "prostate binomial(logit): n={n} gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} \
-         (edf_rel={edf_rel:.3}) prob_pearson(gam,mgcv)={corr_mgcv:.5} \
+         (edf_rel={edf_rel:.3}) prob_pearson(gam,mgcv)={corr_mgcv:.5} prob_rel_l2={rel_mgcv:.4} \
          AUC gam={gam_auc:.4} mgcv={mgcv_auc:.4} sklearn={sk_auc:.4} | \
          1D slope gam={gam_slope:.4} sklearn={sk_slope:.4} (rel={slope_rel:.3}) \
          intercept gam={gam_intercept:.4} sklearn={sk_intercept:.4}"
@@ -201,6 +206,17 @@ emit("coef1", [float(clf1.coef_[0, 0]), float(clf1.intercept_[0])])
     assert!(
         corr_mgcv > 0.99,
         "gam vs mgcv fitted probabilities diverge: pearson={corr_mgcv:.5}"
+    );
+    // Same penalized binomial smooth fit by both engines: post-logit fitted
+    // probabilities must coincide pointwise, not just correlate. The bound is
+    // looser than the gaussian-smooth test's 0.02 because the two engines
+    // differ in basis (gam default vs mgcv k=5 thin-plate) and in smoothing-
+    // parameter selection, which shifts the wiggly tails on the probability
+    // scale; 0.10 still rules out a mis-inverted link (which would blow rel_l2
+    // to O(1)) or a probabilities-clamped-at-0.5 bug.
+    assert!(
+        rel_mgcv < 0.10,
+        "gam vs mgcv fitted probabilities diverge pointwise: rel_l2={rel_mgcv:.4}"
     );
 
     // (2) AUC (rank) agreement: a correct classifier must order cases like the
