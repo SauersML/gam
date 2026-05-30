@@ -42,6 +42,7 @@ mod linux {
     /// stream, and the device's compute capability. Module-specific
     /// backends layer their own caches and optional eager compilation on
     /// top of these.
+    #[derive(Debug)]
     pub(crate) struct CudaBackendParts {
         pub(crate) ctx: Arc<CudaContext>,
         pub(crate) stream: Arc<CudaStream>,

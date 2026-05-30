@@ -43,6 +43,15 @@ pub struct ResolvedGroupHierarchy<C: Ord + Clone> {
     children_by_parent: BTreeMap<String, Vec<String>>,
 }
 
+impl<C: Ord + Clone> std::fmt::Debug for ResolvedGroupHierarchy<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedGroupHierarchy")
+            .field("group_count", &self.groups.len())
+            .field("labels", &self.coordinates_by_label.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
 impl<C: Ord + Clone> ResolvedGroupHierarchy<C> {
     /// Validate the carrier-resolved groups and build the hierarchy.
     ///
