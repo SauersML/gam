@@ -199,26 +199,31 @@ def _build_design_penalty(
         bspline_degree = smooth.degree
         bspline_periodic = smooth.periodic
         bspline_penalty_order = smooth.penalty_order
-        knots = (
-            _to_tensor(bspline_knots, points).reshape(-1)
-            if bspline_knots is not None
-            else None
-        )
-        design = bspline_basis(
-            points.squeeze(1), knots, degree=bspline_degree, periodic=bspline_periodic,
-        )
         from .._api import smoothness_penalty as _smoothness_penalty
-        if knots is not None:
-            knots_np = knots.detach().cpu().to(torch.float64).numpy()
-        else:
+        if bspline_knots is None or isinstance(bspline_knots, int):
+            # Resolve auto-knots once (the `None` default and the integer
+            # interior-knot-count form both auto-derive) so the design and the
+            # penalty share the same knot vector AND effective degree. Auto-knot
+            # derivation may downgrade the degree for small n (#340); the design
+            # must not be built at one degree and the penalty at another.
             from .._api import _resolve_knots
-            knots_np = _resolve_knots(
-                None,
+            resolved = _resolve_knots(
+                bspline_knots,
                 points.squeeze(1).detach().cpu().to(torch.float64).numpy(),
                 label="knots", degree=bspline_degree,
             )
+            knots_np = resolved.locations
+            eff_degree = int(resolved.order)
+            knots = torch.as_tensor(knots_np, dtype=torch.float64, device=points.device)
+        else:
+            knots = _to_tensor(bspline_knots, points).reshape(-1)
+            knots_np = knots.detach().cpu().to(torch.float64).numpy()
+            eff_degree = bspline_degree
+        design = bspline_basis(
+            points.squeeze(1), knots, degree=eff_degree, periodic=bspline_periodic,
+        )
         penalty_np, _null_basis = _smoothness_penalty(
-            knots_np, degree=bspline_degree, order=bspline_penalty_order,
+            knots_np, degree=eff_degree, order=bspline_penalty_order,
         )
         penalty = torch.as_tensor(penalty_np, dtype=torch.float64, device=points.device)
         return design.to(torch.float64), penalty

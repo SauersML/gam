@@ -45,7 +45,13 @@ def _ensure_bspline_knots(spec: Any, t_np: Any) -> Any:
     knots = spec.knots
     if knots is None or isinstance(knots, int):
         resolved = _api._resolve_knots(knots, t_np, label="knots", degree=int(spec.degree))
-        spec.knots = np.asarray(resolved, dtype=np.float64)
+        # Cache the resolved knot vector AND the effective degree: auto-knot
+        # derivation may downgrade the degree for small n (#340), and the
+        # clamped vector's boundary multiplicity is `order + 1`, so the cached
+        # spec must carry the matching degree for every later evaluate()/
+        # basis_size call to stay consistent with the knots.
+        spec.knots = np.asarray(resolved.locations, dtype=np.float64)
+        spec.degree = int(resolved.order)
     return spec.knots
 
 
