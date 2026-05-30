@@ -126,21 +126,35 @@ fn build_collapse_probe_term(coords: Array2<f64>) -> SaeManifoldTerm {
     let d = coords.ncols();
     let assignment = SaeAssignment::from_blocks_with_mode(
         Array2::<f64>::zeros((n, 1)),
-        vec![coords],
+        vec![coords.clone()],
         AssignmentMode::softmax(1.0),
     )
     .expect("assignment should build");
-    // m = 1 basis column, p = 1 output channel: the decoder block is 1x1 and
-    // full-rank for any non-zero assignment weight, so the inner Newton solve
-    // is well posed and the criterion's ½log|H| isolates the ARD α curvature.
+    // Identity basis φ(t) = t: m = d basis columns, basis_values = the coords,
+    // Jacobian = per-row I_d. This makes the decoded output genuinely depend on
+    // the latent coords, so each axis is IDENTIFIED by data and carries real
+    // per-axis data curvature in the inner Hessian. Decoder B = I_d routes axis
+    // j to output channel j (p = d). With real curvature, the ARD α on a
+    // small-but-nonzero-spread axis has a genuine FINITE interior REML optimum
+    // (≈ √(n·c / ‖t‖²)) — far below the deleted α = n/‖t‖² rule's explosion
+    // past the log-α clamp. A *zero*-Jacobian basis would leave the coords
+    // unidentified (the criterion would be flat in α), which is why this probe
+    // supplies real first-jet curvature.
+    let basis_values = coords.clone();
+    let mut basis_jacobian = Array3::<f64>::zeros((n, d, d));
+    for i in 0..n {
+        for j in 0..d {
+            basis_jacobian[[i, j, j]] = 1.0;
+        }
+    }
     let atom = SaeManifoldAtom::new(
         "a",
         gam::terms::sae_manifold::SaeAtomBasisKind::Precomputed("dict".into()),
         d,
-        Array2::<f64>::ones((n, 1)),
-        Array3::zeros((n, 1, d)),
-        array![[1.0]],
-        array![[1.0]],
+        basis_values,
+        basis_jacobian,
+        Array2::<f64>::eye(d),
+        Array2::<f64>::zeros((d, d)),
     )
     .expect("atom should build");
     SaeManifoldTerm::new(vec![atom], assignment).expect("term should build")
@@ -155,12 +169,21 @@ fn reml_criterion_keeps_alpha_finite_on_collapsing_axis() {
     // (falling in α). Sweep log α on the collapsing axis and assert the argmin
     // is finite and interior — no clamp needed.
     let coords = array![
-        [1.0, 1.0e-6],
-        [3.0, -1.0e-6],
-        [-2.0, 1.0e-6],
-        [0.5, -1.0e-6]
+        [1.0, 0.01],
+        [3.0, -0.01],
+        [-2.0, 0.01],
+        [0.5, -0.01]
     ];
-    let target = array![[0.4], [1.1], [-0.7], [0.2]];
+    // p = d = 2 (identity basis routes axis j → output channel j). target ≈ the
+    // coords so the decoder fits β ≈ I with small residual; the ARD α on the
+    // small-spread axis 1 is then set by the curvature/‖t‖² balance and has a
+    // finite interior optimum ≈ √(n·c/‖t‖²) well inside the swept grid.
+    let target = array![
+        [1.0, 0.01],
+        [3.0, -0.01],
+        [-2.0, 0.01],
+        [0.5, -0.01]
+    ];
     let base_term = build_collapse_probe_term(coords);
 
     let log_alpha_grid = [-6.0_f64, -2.0, 0.0, 2.0, 6.0, 10.0, 16.0];
@@ -230,7 +253,15 @@ fn reml_criterion_has_interior_minimum_in_log_lambda_smooth() {
     )
     .expect("atom should build");
     let base_term = SaeManifoldTerm::new(vec![atom], assignment).expect("term should build");
-    let target = array![[0.4], [1.1], [-0.7], [0.9], [-1.0], [0.3]];
+    // Signal target = 10·(1 − coord) (β0=+10, β1=−10). The rank-1 penalty
+    // S=[[1,-1],[-1,1]] penalises (β0−β1)², so over-smoothing (large λ → β0≈β1)
+    // collapses the fit onto span(1+coord) — orthogonal to this 10·(1−coord)
+    // signal — so the data-fit cost of over-smoothing is LARGE (residual grows
+    // to O(10²) per row), dominating the O(logλ) logdet/Occam scale. That steep
+    // bias/variance cost is what turns the criterion back up at large λ, giving
+    // the −½·rank·logλ Occam balance a genuine finite INTERIOR argmin (a target
+    // near the penalty null space would leave it monotone/endpoint-pinned).
+    let target = array![[8.0], [2.0], [15.0], [-3.0], [21.0], [6.0]];
 
     let log_lambda_grid = [-8.0_f64, -4.0, -1.0, 1.0, 4.0, 8.0, 12.0];
     let mut best = (f64::INFINITY, f64::NAN);
