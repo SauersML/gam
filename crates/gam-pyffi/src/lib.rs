@@ -8458,6 +8458,29 @@ fn latent_multi_output_fit_to_pydict<'py>(
             "multinomial-logit requires at least two response columns".to_string(),
         ));
     }
+    if multinomial {
+        // The softmax cross-entropy −Σ_c y_c log p_c has residual gradient
+        // y_a − p_a and Fisher block p_a δ_ab − p_a p_b only when each row is a
+        // point on the probability simplex (Σ_c y_c = 1; nonnegativity is
+        // already enforced by the per-entry [0,1] loop above). A row with mass
+        // s ≠ 1 has true gradient y_a − s p_a, so accepting it would fit with a
+        // curvature that disagrees with the objective. Reject before solving.
+        // (Binomial-multi treats the K columns as independent Bernoulli draws,
+        // for which the per-entry [0,1] constraint alone is correct.)
+        for n in 0..n_obs {
+            let mut row_sum = 0.0_f64;
+            for a in 0..n_outputs {
+                row_sum += y[[n, a]];
+            }
+            if (row_sum - 1.0).abs() > 1.0e-9 {
+                return Err(py_value_error(format!(
+                    "multinomial-logit response rows must sum to 1 (one-hot for hard \
+                     labels, or a label-smoothed probability vector); row {n} sums to \
+                     {row_sum}"
+                )));
+            }
+        }
+    }
     if !(multinomial || binomial_multi) {
         return Err(py_value_error(format!(
             "multi-output GLM latent supports binomial-logit and multinomial-logit; got {family_name:?}"

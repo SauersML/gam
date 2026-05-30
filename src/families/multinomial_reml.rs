@@ -58,7 +58,9 @@ use crate::families::custom_family::{
     PenaltyMatrix,
 };
 use crate::families::gamlss::{FamilyMetadata, ParameterLink};
-use crate::families::vector_response::{MultinomialLogitLikelihood, VectorLikelihood};
+use crate::families::vector_response::{
+    MultinomialLogitLikelihood, VectorLikelihood, validate_multinomial_simplex,
+};
 use crate::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
 use crate::pirls::dense_block_xtwx;
 use ndarray::{Array1, Array2, Array3, ArrayView2};
@@ -83,8 +85,12 @@ use std::sync::Arc;
 /// All four are validated by [`MultinomialFamily::new`].
 #[derive(Clone, Debug)]
 pub struct MultinomialFamily {
-    /// One-hot response matrix `Y ∈ ℝ^{N × K}` (label-smoothed rows accepted;
-    /// row sums need only be finite). Column `K − 1` is the reference class.
+    /// Categorical response matrix `Y ∈ ℝ^{N × K}`. Each row must be a point on
+    /// the probability simplex (`y_c ≥ 0`, `Σ_c y_c = 1`): a one-hot indicator
+    /// or a label-smoothed probability vector. Rows whose mass departs from 1
+    /// are rejected by [`MultinomialFamily::new`] — the softmax residual and
+    /// Fisher block are the derivatives of `Σ_c y_c log p_c` only under the
+    /// simplex constraint. Column `K − 1` is the reference class.
     pub y_one_hot: Array2<f64>,
     /// Per-row weights `w ∈ ℝ^N`, finite and non-negative.
     pub weights: Array1<f64>,
@@ -189,13 +195,8 @@ impl MultinomialFamily {
                 penalty.dim()
             ));
         }
-        for ((i, j), &v) in y_one_hot.indexed_iter() {
-            if !v.is_finite() {
-                return Err(format!(
-                    "MultinomialFamily: y_one_hot[{i},{j}] must be finite (got {v})"
-                ));
-            }
-        }
+        validate_multinomial_simplex(y_one_hot.view(), "MultinomialFamily")
+            .map_err(|e| e.to_string())?;
         for ((i, j), &v) in design.indexed_iter() {
             if !v.is_finite() {
                 return Err(format!(
