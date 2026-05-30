@@ -10490,6 +10490,56 @@ enum SpatialAdaptiveExplicitSecondOrderKind {
     SharedEtaEta,
 }
 
+/// Penalty family selected within one adaptive smooth cache. The component index
+/// (0/1/2) used throughout the runtime caches maps onto these three operators:
+/// the scalar magnitude operator `d0`, the grouped gradient operator `d1`, and
+/// the grouped curvature operator `d2`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdaptiveComponent {
+    Magnitude,
+    Gradient,
+    Curvature,
+}
+
+impl AdaptiveComponent {
+    fn from_index(index: usize) -> Result<Self, String> {
+        match index {
+            0 => Ok(AdaptiveComponent::Magnitude),
+            1 => Ok(AdaptiveComponent::Gradient),
+            2 => Ok(AdaptiveComponent::Curvature),
+            other => Err(SmoothError::invalid_index(format!(
+                "invalid adaptive component index {}",
+                other
+            ))
+            .into()),
+        }
+    }
+}
+
+/// Which hyper-derivative of the adaptive penalty's local pieces to assemble.
+/// Each variant selects one accessor triple (objective scalar, beta-mixed
+/// gradient, beta hessian) on the per-component exact state; the operator
+/// embedding around those accessors is identical across variants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HyperDerivativeKind {
+    /// First derivative in `log lambda` (rho): the bare penalty pieces.
+    Rho,
+    /// First derivative in `log epsilon`.
+    LogEpsilonFirst,
+    /// Second derivative in `log epsilon`.
+    LogEpsilonSecond,
+}
+
+/// Which directional-drift hyper-derivative of the adaptive penalty Hessian to
+/// assemble: the bare rho drift, or the shared-`log epsilon` drift. Both share
+/// the per-component direction projection, operator embedding, and global
+/// embedding; only the directional state accessor differs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HyperDriftKind {
+    Rho,
+    LogEpsilon,
+}
+
 impl SpatialAdaptiveHyperSpec {
     fn component_index(self) -> usize {
         self.kind.component_index()
@@ -10669,11 +10719,20 @@ impl SpatialAdaptiveExactFamily {
         out
     }
 
-    fn adaptive_block_parts(
+    /// Unified per-block hyper-derivative assembly. Owns the shared cache /
+    /// hyperparameter / exact-state lookup, the component -> operator selection
+    /// (scalar magnitude `d0`, grouped gradient `d1`, grouped curvature `d2`),
+    /// and the global embedding via [`Self::embed_local_hyper_parts`]. The only
+    /// piece that varies with `derivative` is the per-component accessor triple
+    /// (objective scalar, beta-mixed gradient, beta hessian) read off the exact
+    /// state. Returns `(objective, beta_mixed, betahessian)`, each already
+    /// scaled by the component's penalty weight `lambda`.
+    fn adaptive_block_eval(
         &self,
         eval: &SpatialAdaptiveExactEvaluation,
         cache_idx: usize,
-        component: usize,
+        component: AdaptiveComponent,
+        derivative: HyperDerivativeKind,
     ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
         let cache = self
             .runtime_caches
@@ -10688,294 +10747,102 @@ impl SpatialAdaptiveExactFamily {
             .get(cache_idx)
             .ok_or_else(|| format!("adaptive exact state index {} out of bounds", cache_idx))?;
 
-        match component {
-            0 => {
+        let (objective_local, beta_mixed_local, betahessian_local) = match component {
+            AdaptiveComponent::Magnitude => {
                 let lambda = params.lambda[0];
-                let beta_mixed_local = lambda
-                    * scalar_operatorgradient(&cache.d0, &state.magnitude.betagradient_coeff());
-                let betahessian_local =
-                    lambda * scalar_operatorhessian(&cache.d0, &state.magnitude.betahessian_diag());
-                let (beta_mixed, betahessian) = self.embed_local_hyper_parts(
-                    &cache.coeff_global_range,
-                    &beta_mixed_local,
-                    &betahessian_local,
-                );
-                Ok((
-                    lambda * state.magnitude.penalty_value(),
-                    beta_mixed,
-                    betahessian,
-                ))
+                let mag = &state.magnitude;
+                let (objective, gradient_coeff, hessian_diag) = match derivative {
+                    HyperDerivativeKind::Rho => (
+                        mag.penalty_value(),
+                        mag.betagradient_coeff(),
+                        mag.betahessian_diag(),
+                    ),
+                    HyperDerivativeKind::LogEpsilonFirst => (
+                        mag.log_epsilon_gradient_terms().sum(),
+                        mag.log_epsilon_betagradient_coeff(),
+                        mag.log_epsilon_betahessian_diag(),
+                    ),
+                    HyperDerivativeKind::LogEpsilonSecond => (
+                        mag.log_epsilon_hessian_terms().sum(),
+                        mag.log_epsilon_beta_mixed_second_coeff(),
+                        mag.log_epsilon_betahessian_second_diag(),
+                    ),
+                };
+                (
+                    lambda * objective,
+                    lambda * scalar_operatorgradient(&cache.d0, &gradient_coeff),
+                    lambda * scalar_operatorhessian(&cache.d0, &hessian_diag),
+                )
             }
-            1 => {
+            AdaptiveComponent::Gradient => {
                 let lambda = params.lambda[1];
-                let beta_mixed_local = lambda
-                    * grouped_operatorgradient(
-                        &cache.d1,
-                        cache.dimension,
-                        &state.gradient.betagradient_blocks(),
-                    )
-                    .map_err(|e| e.to_string())?;
-                let betahessian_local = lambda
-                    * grouped_operatorhessian(
-                        &cache.d1,
-                        cache.dimension,
-                        &state.gradient.betahessian_blocks(),
-                    )
-                    .map_err(|e| e.to_string())?;
-                let (beta_mixed, betahessian) = self.embed_local_hyper_parts(
-                    &cache.coeff_global_range,
-                    &beta_mixed_local,
-                    &betahessian_local,
-                );
-                Ok((
-                    lambda * state.gradient.penalty_value(),
-                    beta_mixed,
-                    betahessian,
-                ))
+                let grad = &state.gradient;
+                let (objective, gradient_blocks, hessian_blocks) = match derivative {
+                    HyperDerivativeKind::Rho => (
+                        grad.penalty_value(),
+                        grad.betagradient_blocks(),
+                        grad.betahessian_blocks(),
+                    ),
+                    HyperDerivativeKind::LogEpsilonFirst => (
+                        grad.log_epsilon_gradient_terms().sum(),
+                        grad.log_epsilon_betagradient_blocks(),
+                        grad.log_epsilon_betahessian_blocks(),
+                    ),
+                    HyperDerivativeKind::LogEpsilonSecond => (
+                        grad.log_epsilon_hessian_terms().sum(),
+                        grad.log_epsilon_beta_mixed_second_blocks(),
+                        grad.log_epsilon_betahessian_second_blocks(),
+                    ),
+                };
+                (
+                    lambda * objective,
+                    lambda
+                        * grouped_operatorgradient(&cache.d1, cache.dimension, &gradient_blocks)
+                            .map_err(|e| e.to_string())?,
+                    lambda
+                        * grouped_operatorhessian(&cache.d1, cache.dimension, &hessian_blocks)
+                            .map_err(|e| e.to_string())?,
+                )
             }
-            2 => {
+            AdaptiveComponent::Curvature => {
                 let lambda = params.lambda[2];
-                let beta_mixed_local = lambda
-                    * grouped_operatorgradient(
-                        &cache.d2,
-                        cache.dimension * cache.dimension,
-                        &state.curvature.betagradient_blocks(),
-                    )
-                    .map_err(|e| e.to_string())?;
-                let betahessian_local = lambda
-                    * grouped_operatorhessian(
-                        &cache.d2,
-                        cache.dimension * cache.dimension,
-                        &state.curvature.betahessian_blocks(),
-                    )
-                    .map_err(|e| e.to_string())?;
-                let (beta_mixed, betahessian) = self.embed_local_hyper_parts(
-                    &cache.coeff_global_range,
-                    &beta_mixed_local,
-                    &betahessian_local,
-                );
-                Ok((
-                    lambda * state.curvature.penalty_value(),
-                    beta_mixed,
-                    betahessian,
-                ))
+                let group = cache.dimension * cache.dimension;
+                let curv = &state.curvature;
+                let (objective, gradient_blocks, hessian_blocks) = match derivative {
+                    HyperDerivativeKind::Rho => (
+                        curv.penalty_value(),
+                        curv.betagradient_blocks(),
+                        curv.betahessian_blocks(),
+                    ),
+                    HyperDerivativeKind::LogEpsilonFirst => (
+                        curv.log_epsilon_gradient_terms().sum(),
+                        curv.log_epsilon_betagradient_blocks(),
+                        curv.log_epsilon_betahessian_blocks(),
+                    ),
+                    HyperDerivativeKind::LogEpsilonSecond => (
+                        curv.log_epsilon_hessian_terms().sum(),
+                        curv.log_epsilon_beta_mixed_second_blocks(),
+                        curv.log_epsilon_betahessian_second_blocks(),
+                    ),
+                };
+                (
+                    lambda * objective,
+                    lambda
+                        * grouped_operatorgradient(&cache.d2, group, &gradient_blocks)
+                            .map_err(|e| e.to_string())?,
+                    lambda
+                        * grouped_operatorhessian(&cache.d2, group, &hessian_blocks)
+                            .map_err(|e| e.to_string())?,
+                )
             }
-            _ => Err(SmoothError::invalid_index(format!(
-                "invalid adaptive component index {}",
-                component
-            ))
-            .into()),
-        }
-    }
+        };
 
-    fn adaptive_block_log_epsilon_parts(
-        &self,
-        eval: &SpatialAdaptiveExactEvaluation,
-        cache_idx: usize,
-        component: usize,
-    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
-        let cache = self
-            .runtime_caches
-            .get(cache_idx)
-            .ok_or_else(|| format!("adaptive cache index {} out of bounds", cache_idx))?;
-        let params = self
-            .adaptive_params
-            .get(cache_idx)
-            .ok_or_else(|| format!("adaptive hyperparameter block {} out of bounds", cache_idx))?;
-        let state = eval
-            .adaptive_states
-            .get(cache_idx)
-            .ok_or_else(|| format!("adaptive exact state index {} out of bounds", cache_idx))?;
-
-        match component {
-            0 => {
-                let lambda = params.lambda[0];
-                let beta_mixed_local = lambda
-                    * scalar_operatorgradient(
-                        &cache.d0,
-                        &state.magnitude.log_epsilon_betagradient_coeff(),
-                    );
-                let betahessian_local = lambda
-                    * scalar_operatorhessian(
-                        &cache.d0,
-                        &state.magnitude.log_epsilon_betahessian_diag(),
-                    );
-                let (beta_mixed, betahessian) = self.embed_local_hyper_parts(
-                    &cache.coeff_global_range,
-                    &beta_mixed_local,
-                    &betahessian_local,
-                );
-                Ok((
-                    lambda * state.magnitude.log_epsilon_gradient_terms().sum(),
-                    beta_mixed,
-                    betahessian,
-                ))
-            }
-            1 => {
-                let lambda = params.lambda[1];
-                let beta_mixed_local = lambda
-                    * grouped_operatorgradient(
-                        &cache.d1,
-                        cache.dimension,
-                        &state.gradient.log_epsilon_betagradient_blocks(),
-                    )
-                    .map_err(|e| e.to_string())?;
-                let betahessian_local = lambda
-                    * grouped_operatorhessian(
-                        &cache.d1,
-                        cache.dimension,
-                        &state.gradient.log_epsilon_betahessian_blocks(),
-                    )
-                    .map_err(|e| e.to_string())?;
-                let (beta_mixed, betahessian) = self.embed_local_hyper_parts(
-                    &cache.coeff_global_range,
-                    &beta_mixed_local,
-                    &betahessian_local,
-                );
-                Ok((
-                    lambda * state.gradient.log_epsilon_gradient_terms().sum(),
-                    beta_mixed,
-                    betahessian,
-                ))
-            }
-            2 => {
-                let lambda = params.lambda[2];
-                let beta_mixed_local = lambda
-                    * grouped_operatorgradient(
-                        &cache.d2,
-                        cache.dimension * cache.dimension,
-                        &state.curvature.log_epsilon_betagradient_blocks(),
-                    )
-                    .map_err(|e| e.to_string())?;
-                let betahessian_local = lambda
-                    * grouped_operatorhessian(
-                        &cache.d2,
-                        cache.dimension * cache.dimension,
-                        &state.curvature.log_epsilon_betahessian_blocks(),
-                    )
-                    .map_err(|e| e.to_string())?;
-                let (beta_mixed, betahessian) = self.embed_local_hyper_parts(
-                    &cache.coeff_global_range,
-                    &beta_mixed_local,
-                    &betahessian_local,
-                );
-                Ok((
-                    lambda * state.curvature.log_epsilon_gradient_terms().sum(),
-                    beta_mixed,
-                    betahessian,
-                ))
-            }
-            _ => Err(SmoothError::invalid_index(format!(
-                "invalid adaptive component index {}",
-                component
-            ))
-            .into()),
-        }
-    }
-
-    fn adaptive_block_log_epsilon_second_parts(
-        &self,
-        eval: &SpatialAdaptiveExactEvaluation,
-        cache_idx: usize,
-        component: usize,
-    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
-        let cache = self
-            .runtime_caches
-            .get(cache_idx)
-            .ok_or_else(|| format!("adaptive cache index {} out of bounds", cache_idx))?;
-        let params = self
-            .adaptive_params
-            .get(cache_idx)
-            .ok_or_else(|| format!("adaptive hyperparameter block {} out of bounds", cache_idx))?;
-        let state = eval
-            .adaptive_states
-            .get(cache_idx)
-            .ok_or_else(|| format!("adaptive exact state index {} out of bounds", cache_idx))?;
-
-        match component {
-            0 => {
-                let lambda = params.lambda[0];
-                let beta_mixed_local = lambda
-                    * scalar_operatorgradient(
-                        &cache.d0,
-                        &state.magnitude.log_epsilon_beta_mixed_second_coeff(),
-                    );
-                let betahessian_local = lambda
-                    * scalar_operatorhessian(
-                        &cache.d0,
-                        &state.magnitude.log_epsilon_betahessian_second_diag(),
-                    );
-                let (beta_mixed, betahessian) = self.embed_local_hyper_parts(
-                    &cache.coeff_global_range,
-                    &beta_mixed_local,
-                    &betahessian_local,
-                );
-                Ok((
-                    lambda * state.magnitude.log_epsilon_hessian_terms().sum(),
-                    beta_mixed,
-                    betahessian,
-                ))
-            }
-            1 => {
-                let lambda = params.lambda[1];
-                let beta_mixed_local = lambda
-                    * grouped_operatorgradient(
-                        &cache.d1,
-                        cache.dimension,
-                        &state.gradient.log_epsilon_beta_mixed_second_blocks(),
-                    )
-                    .map_err(|e| e.to_string())?;
-                let betahessian_local = lambda
-                    * grouped_operatorhessian(
-                        &cache.d1,
-                        cache.dimension,
-                        &state.gradient.log_epsilon_betahessian_second_blocks(),
-                    )
-                    .map_err(|e| e.to_string())?;
-                let (beta_mixed, betahessian) = self.embed_local_hyper_parts(
-                    &cache.coeff_global_range,
-                    &beta_mixed_local,
-                    &betahessian_local,
-                );
-                Ok((
-                    lambda * state.gradient.log_epsilon_hessian_terms().sum(),
-                    beta_mixed,
-                    betahessian,
-                ))
-            }
-            2 => {
-                let lambda = params.lambda[2];
-                let beta_mixed_local = lambda
-                    * grouped_operatorgradient(
-                        &cache.d2,
-                        cache.dimension * cache.dimension,
-                        &state.curvature.log_epsilon_beta_mixed_second_blocks(),
-                    )
-                    .map_err(|e| e.to_string())?;
-                let betahessian_local = lambda
-                    * grouped_operatorhessian(
-                        &cache.d2,
-                        cache.dimension * cache.dimension,
-                        &state.curvature.log_epsilon_betahessian_second_blocks(),
-                    )
-                    .map_err(|e| e.to_string())?;
-                let (beta_mixed, betahessian) = self.embed_local_hyper_parts(
-                    &cache.coeff_global_range,
-                    &beta_mixed_local,
-                    &betahessian_local,
-                );
-                Ok((
-                    lambda * state.curvature.log_epsilon_hessian_terms().sum(),
-                    beta_mixed,
-                    betahessian,
-                ))
-            }
-            _ => Err(SmoothError::invalid_index(format!(
-                "invalid adaptive component index {}",
-                component
-            ))
-            .into()),
-        }
+        let (beta_mixed, betahessian) = self.embed_local_hyper_parts(
+            &cache.coeff_global_range,
+            &beta_mixed_local,
+            &betahessian_local,
+        );
+        Ok((objective_local, beta_mixed, betahessian))
     }
 
     fn adaptive_shared_log_epsilon_parts(

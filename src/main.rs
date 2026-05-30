@@ -10605,7 +10605,6 @@ mod tests {
             FamilyArg::Auto,
             None,
             None,
-            None,
             y.view(),
             ResponseColumnKind::Numeric,
             "y",
@@ -10647,17 +10646,12 @@ mod tests {
             link: LinkFunction::Sas,
             mixture_components: None,
         };
-        let sas_init = gam::types::SasLinkSpec {
-            initial_epsilon: 0.3,
-            initial_log_delta: -0.2,
-        };
 
-        // (FamilyArg, nb_theta, link_choice, sas_linkspec, y, y_kind)
+        // (FamilyArg, nb_theta, link_choice, y, y_kind)
         let cases: Vec<(
             FamilyArg,
             Option<f64>,
             Option<LinkChoice>,
-            Option<&gam::types::SasLinkSpec>,
             &ndarray::Array1<f64>,
             ResponseColumnKind,
         )> = vec![
@@ -10666,13 +10660,11 @@ mod tests {
                 FamilyArg::Auto,
                 None,
                 None,
-                None,
                 &y_binary,
                 ResponseColumnKind::Numeric,
             ),
             (
                 FamilyArg::Auto,
-                None,
                 None,
                 None,
                 &y_positive,
@@ -10683,13 +10675,11 @@ mod tests {
                 FamilyArg::Gaussian,
                 None,
                 None,
-                None,
                 &y_positive,
                 ResponseColumnKind::Numeric,
             ),
             (
                 FamilyArg::BinomialProbit,
-                None,
                 None,
                 None,
                 &y_binary,
@@ -10699,13 +10689,11 @@ mod tests {
                 FamilyArg::NegativeBinomial,
                 Some(2.5),
                 None,
-                None,
                 &y_count,
                 ResponseColumnKind::Numeric,
             ),
             (
                 FamilyArg::GammaLog,
-                None,
                 None,
                 None,
                 &y_positive,
@@ -10717,7 +10705,6 @@ mod tests {
                 FamilyArg::Auto,
                 None,
                 Some(log.clone()),
-                None,
                 &y_count,
                 ResponseColumnKind::Numeric,
             ),
@@ -10725,7 +10712,6 @@ mod tests {
                 FamilyArg::Auto,
                 None,
                 Some(log.clone()),
-                None,
                 &y_positive,
                 ResponseColumnKind::Numeric,
             ),
@@ -10733,28 +10719,27 @@ mod tests {
                 FamilyArg::Auto,
                 None,
                 Some(logit.clone()),
-                None,
                 &y_binary,
                 ResponseColumnKind::Numeric,
             ),
-            // State-bearing SAS link with an explicit, non-default init: the
-            // canonical resolver must embed the exact same state.
+            // State-bearing SAS link: family resolution returns the canonical
+            // zero-seed placeholder identically on both paths. The user's
+            // `sas_init` is threaded separately through `FitOptions.sas_link`
+            // and is intentionally NOT part of this contract.
             (
                 FamilyArg::Auto,
                 None,
                 Some(sas.clone()),
-                Some(&sas_init),
                 &y_binary,
                 ResponseColumnKind::Numeric,
             ),
         ];
 
-        for (arg, nb_theta, link_choice, sas_spec, y, y_kind) in cases {
+        for (arg, nb_theta, link_choice, y, y_kind) in cases {
             let cli = resolve_family(
                 arg,
                 nb_theta,
                 link_choice.clone(),
-                sas_spec,
                 y.view(),
                 y_kind,
                 "y",
@@ -10763,7 +10748,6 @@ mod tests {
                 family_arg_canonical_name(arg),
                 nb_theta,
                 link_choice.as_ref(),
-                sas_spec,
                 y.view(),
                 y_kind,
                 "y",
@@ -10781,7 +10765,6 @@ mod tests {
                 FamilyArg::Auto,
                 None,
                 None,
-                None,
                 y_binary.view(),
                 ResponseColumnKind::Numeric,
                 "y",
@@ -10794,7 +10777,6 @@ mod tests {
                 FamilyArg::Auto,
                 None,
                 Some(log.clone()),
-                None,
                 y_count.view(),
                 ResponseColumnKind::Numeric,
                 "y",
@@ -10802,11 +10784,15 @@ mod tests {
             .expect("log link on counts"),
             LikelihoodSpec::poisson_log()
         );
+        // The SAS link is state-bearing, but family resolution embeds only the
+        // canonical zero seed (epsilon = 0, log_delta = 0). The actual initial
+        // state is supplied at fit time via `FitOptions.sas_link` and overrides
+        // this placeholder in `effective_sas_link_for_family`. Pinning the seed
+        // here guards the single resolver contract shared with the workflow.
         let sas_family = resolve_family(
             FamilyArg::Auto,
             None,
             Some(sas),
-            Some(&sas_init),
             y_binary.view(),
             ResponseColumnKind::Numeric,
             "y",
@@ -10814,8 +10800,8 @@ mod tests {
         .expect("sas link");
         match &sas_family.link {
             InverseLink::Sas(state) => {
-                assert_eq!(state.epsilon, sas_init.initial_epsilon);
-                assert_eq!(state.log_delta, sas_init.initial_log_delta);
+                assert_eq!(state.epsilon, 0.0);
+                assert_eq!(state.log_delta, 0.0);
             }
             other => panic!("expected SAS inverse link, got {other:?}"),
         }
@@ -10831,7 +10817,6 @@ mod tests {
         let err = resolve_family(
             FamilyArg::PoissonLog,
             Some(2.0),
-            None,
             None,
             y.view(),
             ResponseColumnKind::Numeric,

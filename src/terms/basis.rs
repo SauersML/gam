@@ -26549,10 +26549,10 @@ fn evaluate_bspline_derivative_recurrence_into(
     Ok(())
 }
 
-/// Evaluates B-spline second derivatives at a single scalar point `x` into a provided buffer.
+/// Evaluates B-spline second derivatives at a single scalar point `x` into `out`.
 ///
-/// Uses the derivative recursion:
-/// B''_{i,k}(x) = k * (B'_{i,k-1}(x)/(t_{i+k}-t_i) - B'_{i+1,k-1}(x)/(t_{i+k+1}-t_{i+1}))
+/// Thin adapter over [`evaluate_bspline_derivative_recurrence_into`] with
+/// `derivative_order = 2`; the de-Boor recurrence body lives there exactly once.
 ///
 /// This returns derivatives in the raw spline basis. If a model uses an
 /// identifiability/constrained basis `BZ`, the caller must apply that same
@@ -26563,123 +26563,14 @@ pub fn evaluate_bsplinesecond_derivative_scalar(
     degree: usize,
     out: &mut [f64],
 ) -> Result<(), BasisError> {
-    if degree < 2 {
-        return Err(BasisError::InsufficientDegreeForDerivative {
-            degree,
-            derivative_order: 2,
-            minimum_degree: 2,
-        });
-    }
-    let num_basis_lower = knot_vector
-        .len()
-        .saturating_sub(degree - 1)
-        .saturating_sub(1);
-    let mut deriv_lower = vec![0.0; num_basis_lower];
-    let mut lower_basis = vec![0.0; knot_vector.len().saturating_sub(degree - 1)];
-    let mut lower_scratch = internal::BsplineScratch::new(degree.saturating_sub(2));
-    evaluate_bsplinesecond_derivative_scalar_into(
-        x,
-        knot_vector,
-        degree,
-        out,
-        &mut deriv_lower,
-        &mut lower_basis,
-        &mut lower_scratch,
-    )
+    let mut workspace = BsplineDerivativeWorkspace::new();
+    evaluate_bspline_derivative_recurrence_into(2, x, knot_vector, degree, out, &mut workspace, 0)
 }
 
-/// Zero-allocation version for second derivatives: pass pre-allocated buffers.
-/// - `deriv_lower`: length = knot_vector.len() - (degree - 1) - 1
-/// - `lower_basis`: length = knot_vector.len() - (degree - 1)
-/// - `lower_scratch`: BsplineScratch for degree-2
-pub fn evaluate_bsplinesecond_derivative_scalar_into(
-    x: f64,
-    knot_vector: ArrayView1<f64>,
-    degree: usize,
-    out: &mut [f64],
-    deriv_lower: &mut [f64],
-    lower_basis: &mut [f64],
-    lower_scratch: &mut internal::BsplineScratch,
-) -> Result<(), BasisError> {
-    if degree < 2 {
-        return Err(BasisError::InsufficientDegreeForDerivative {
-            degree,
-            derivative_order: 2,
-            minimum_degree: 2,
-        });
-    }
-    validate_knots_for_degree(knot_vector, degree)?;
-
-    let num_basis = knot_vector.len() - degree - 1;
-    if out.len() != num_basis {
-        return Err(BasisError::InvalidKnotVector(format!(
-            "Output buffer length {} does not match number of basis functions {}",
-            out.len(),
-            num_basis
-        )));
-    }
-    if num_basis > 0 {
-        let left = knot_vector[degree];
-        let right = knot_vector[num_basis];
-        if x < left || x > right {
-            out.fill(0.0);
-            return Ok(());
-        }
-    }
-
-    let num_basis_lower = knot_vector
-        .len()
-        .saturating_sub(degree - 1)
-        .saturating_sub(1);
-    if deriv_lower.len() != num_basis_lower {
-        return Err(BasisError::InvalidKnotVector(format!(
-            "Lower-derivative buffer length {} does not match expected length {}",
-            deriv_lower.len(),
-            num_basis_lower
-        )));
-    }
-    let expected_lower_basis = knot_vector.len().saturating_sub(degree - 1);
-    if lower_basis.len() != expected_lower_basis {
-        return Err(BasisError::InvalidKnotVector(format!(
-            "Lower-basis buffer length {} does not match expected length {}",
-            lower_basis.len(),
-            expected_lower_basis
-        )));
-    }
-
-    evaluate_bspline_derivative_scalar_into(
-        x,
-        knot_vector,
-        degree - 1,
-        deriv_lower,
-        lower_basis,
-        lower_scratch,
-    )?;
-
-    let k = degree as f64;
-    for i in 0..num_basis {
-        let denom1 = knot_vector[i + degree] - knot_vector[i];
-        let denom2 = knot_vector[i + degree + 1] - knot_vector[i + 1];
-        let term1 = if denom1.abs() > 1e-12 {
-            k * deriv_lower[i] / denom1
-        } else {
-            0.0
-        };
-        let term2 = if denom2.abs() > 1e-12 {
-            k * deriv_lower[i + 1] / denom2
-        } else {
-            0.0
-        };
-        out[i] = term1 - term2;
-    }
-
-    Ok(())
-}
-
-/// Evaluates B-spline third derivatives at a single scalar point `x` into a provided buffer.
+/// Evaluates B-spline third derivatives at a single scalar point `x` into `out`.
 ///
-/// Uses the derivative recursion:
-/// B'''_{i,k}(x) = k * (B''_{i,k-1}(x)/(t_{i+k}-t_i) - B''_{i+1,k-1}(x)/(t_{i+k+1}-t_{i+1}))
+/// Thin adapter over [`evaluate_bspline_derivative_recurrence_into`] with
+/// `derivative_order = 3`; the de-Boor recurrence body lives there exactly once.
 ///
 /// This returns derivatives in the raw spline basis. If a model uses an
 /// identifiability/constrained basis `BZ`, the caller must apply that same
@@ -26690,130 +26581,14 @@ pub fn evaluate_bsplinethird_derivative_scalar(
     degree: usize,
     out: &mut [f64],
 ) -> Result<(), BasisError> {
-    if degree < 3 {
-        return Err(BasisError::InsufficientDegreeForDerivative {
-            degree,
-            derivative_order: 3,
-            minimum_degree: 3,
-        });
-    }
-    let numsecond_lower = knot_vector.len().saturating_sub(degree);
-    let mut second_lower = vec![0.0; numsecond_lower];
-    let mut deriv_lower = vec![0.0; knot_vector.len().saturating_sub(degree - 1)];
-    let mut lower_basis = vec![0.0; knot_vector.len().saturating_sub(degree - 2)];
-    let mut lower_scratch = internal::BsplineScratch::new(degree.saturating_sub(3));
-    evaluate_bsplinethird_derivative_scalar_into(
-        x,
-        knot_vector,
-        degree,
-        out,
-        &mut second_lower,
-        &mut deriv_lower,
-        &mut lower_basis,
-        &mut lower_scratch,
-    )
+    let mut workspace = BsplineDerivativeWorkspace::new();
+    evaluate_bspline_derivative_recurrence_into(3, x, knot_vector, degree, out, &mut workspace, 0)
 }
 
-/// Zero-allocation version for third derivatives: pass pre-allocated buffers.
-/// - `second_lower`: length = knot_vector.len() - degree
-/// - `deriv_lower`: length = knot_vector.len() - (degree - 1)
-/// - `lower_basis`: length = knot_vector.len() - (degree - 2)
-/// - `lower_scratch`: BsplineScratch for degree-3
-pub fn evaluate_bsplinethird_derivative_scalar_into(
-    x: f64,
-    knot_vector: ArrayView1<f64>,
-    degree: usize,
-    out: &mut [f64],
-    second_lower: &mut [f64],
-    deriv_lower: &mut [f64],
-    lower_basis: &mut [f64],
-    lower_scratch: &mut internal::BsplineScratch,
-) -> Result<(), BasisError> {
-    if degree < 3 {
-        return Err(BasisError::InsufficientDegreeForDerivative {
-            degree,
-            derivative_order: 3,
-            minimum_degree: 3,
-        });
-    }
-    validate_knots_for_degree(knot_vector, degree)?;
-
-    let num_basis = knot_vector.len() - degree - 1;
-    if out.len() != num_basis {
-        return Err(BasisError::InvalidKnotVector(format!(
-            "Output buffer length {} does not match number of basis functions {}",
-            out.len(),
-            num_basis
-        )));
-    }
-    if num_basis > 0 {
-        let left = knot_vector[degree];
-        let right = knot_vector[num_basis];
-        if x < left || x > right {
-            out.fill(0.0);
-            return Ok(());
-        }
-    }
-
-    let expectedsecond_lower = knot_vector.len().saturating_sub(degree);
-    if second_lower.len() != expectedsecond_lower {
-        return Err(BasisError::InvalidKnotVector(format!(
-            "Lower-second-derivative buffer length {} does not match expected length {}",
-            second_lower.len(),
-            expectedsecond_lower
-        )));
-    }
-    let expected_deriv_lower = knot_vector.len().saturating_sub(degree - 1);
-    if deriv_lower.len() != expected_deriv_lower {
-        return Err(BasisError::InvalidKnotVector(format!(
-            "Lower-derivative buffer length {} does not match expected length {}",
-            deriv_lower.len(),
-            expected_deriv_lower
-        )));
-    }
-    let expected_lower_basis = knot_vector.len().saturating_sub(degree - 2);
-    if lower_basis.len() != expected_lower_basis {
-        return Err(BasisError::InvalidKnotVector(format!(
-            "Lower-basis buffer length {} does not match expected length {}",
-            lower_basis.len(),
-            expected_lower_basis
-        )));
-    }
-
-    evaluate_bsplinesecond_derivative_scalar_into(
-        x,
-        knot_vector,
-        degree - 1,
-        second_lower,
-        deriv_lower,
-        lower_basis,
-        lower_scratch,
-    )?;
-
-    let k = degree as f64;
-    for i in 0..num_basis {
-        let denom1 = knot_vector[i + degree] - knot_vector[i];
-        let denom2 = knot_vector[i + degree + 1] - knot_vector[i + 1];
-        let term1 = if denom1.abs() > 1e-12 {
-            k * second_lower[i] / denom1
-        } else {
-            0.0
-        };
-        let term2 = if denom2.abs() > 1e-12 {
-            k * second_lower[i + 1] / denom2
-        } else {
-            0.0
-        };
-        out[i] = term1 - term2;
-    }
-
-    Ok(())
-}
-
-/// Evaluates B-spline fourth derivatives at a single scalar point `x` into a provided buffer.
+/// Evaluates B-spline fourth derivatives at a single scalar point `x` into `out`.
 ///
-/// Uses the derivative recursion:
-/// B''''_{i,k}(x) = k * (B'''_{i,k-1}(x)/(t_{i+k}-t_i) - B'''_{i+1,k-1}(x)/(t_{i+k+1}-t_{i+1}))
+/// Thin adapter over [`evaluate_bspline_derivative_recurrence_into`] with
+/// `derivative_order = 4`; the de-Boor recurrence body lives there exactly once.
 ///
 /// This returns derivatives in the raw spline basis. If a model uses an
 /// identifiability/constrained basis `BZ`, the caller must apply that same
@@ -26824,137 +26599,8 @@ pub fn evaluate_bspline_fourth_derivative_scalar(
     degree: usize,
     out: &mut [f64],
 ) -> Result<(), BasisError> {
-    if degree < 4 {
-        return Err(BasisError::InsufficientDegreeForDerivative {
-            degree,
-            derivative_order: 4,
-            minimum_degree: 4,
-        });
-    }
-    let numthird_lower = knot_vector.len().saturating_sub(degree);
-    let mut third_lower = vec![0.0; numthird_lower];
-    let mut second_lower = vec![0.0; knot_vector.len().saturating_sub(degree - 1)];
-    let mut deriv_lower = vec![0.0; knot_vector.len().saturating_sub(degree - 2)];
-    let mut lower_basis = vec![0.0; knot_vector.len().saturating_sub(degree - 3)];
-    let mut lower_scratch = internal::BsplineScratch::new(degree.saturating_sub(4));
-    evaluate_bspline_fourth_derivative_scalar_into(
-        x,
-        knot_vector,
-        degree,
-        out,
-        &mut third_lower,
-        &mut second_lower,
-        &mut deriv_lower,
-        &mut lower_basis,
-        &mut lower_scratch,
-    )
-}
-
-/// Zero-allocation version for fourth derivatives: pass pre-allocated buffers.
-/// - `third_lower`: length = knot_vector.len() - degree
-/// - `second_lower`: length = knot_vector.len() - (degree - 1)
-/// - `deriv_lower`: length = knot_vector.len() - (degree - 2)
-/// - `lower_basis`: length = knot_vector.len() - (degree - 3)
-/// - `lower_scratch`: BsplineScratch for degree-4
-pub fn evaluate_bspline_fourth_derivative_scalar_into(
-    x: f64,
-    knot_vector: ArrayView1<f64>,
-    degree: usize,
-    out: &mut [f64],
-    third_lower: &mut [f64],
-    second_lower: &mut [f64],
-    deriv_lower: &mut [f64],
-    lower_basis: &mut [f64],
-    lower_scratch: &mut internal::BsplineScratch,
-) -> Result<(), BasisError> {
-    if degree < 4 {
-        return Err(BasisError::InsufficientDegreeForDerivative {
-            degree,
-            derivative_order: 4,
-            minimum_degree: 4,
-        });
-    }
-    validate_knots_for_degree(knot_vector, degree)?;
-
-    let num_basis = knot_vector.len() - degree - 1;
-    if out.len() != num_basis {
-        return Err(BasisError::InvalidKnotVector(format!(
-            "Output buffer length {} does not match number of basis functions {}",
-            out.len(),
-            num_basis
-        )));
-    }
-    if num_basis > 0 {
-        let left = knot_vector[degree];
-        let right = knot_vector[num_basis];
-        if x < left || x > right {
-            out.fill(0.0);
-            return Ok(());
-        }
-    }
-
-    let expectedthird_lower = knot_vector.len().saturating_sub(degree);
-    if third_lower.len() != expectedthird_lower {
-        return Err(BasisError::InvalidKnotVector(format!(
-            "Lower-third-derivative buffer length {} does not match expected length {}",
-            third_lower.len(),
-            expectedthird_lower
-        )));
-    }
-    let expectedsecond_lower = knot_vector.len().saturating_sub(degree - 1);
-    if second_lower.len() != expectedsecond_lower {
-        return Err(BasisError::InvalidKnotVector(format!(
-            "Lower-second-derivative buffer length {} does not match expected length {}",
-            second_lower.len(),
-            expectedsecond_lower
-        )));
-    }
-    let expected_deriv_lower = knot_vector.len().saturating_sub(degree - 2);
-    if deriv_lower.len() != expected_deriv_lower {
-        return Err(BasisError::InvalidKnotVector(format!(
-            "Lower-derivative buffer length {} does not match expected length {}",
-            deriv_lower.len(),
-            expected_deriv_lower
-        )));
-    }
-    let expected_lower_basis = knot_vector.len().saturating_sub(degree - 3);
-    if lower_basis.len() != expected_lower_basis {
-        return Err(BasisError::InvalidKnotVector(format!(
-            "Lower-basis buffer length {} does not match expected length {}",
-            lower_basis.len(),
-            expected_lower_basis
-        )));
-    }
-
-    evaluate_bsplinethird_derivative_scalar_into(
-        x,
-        knot_vector,
-        degree - 1,
-        third_lower,
-        second_lower,
-        deriv_lower,
-        lower_basis,
-        lower_scratch,
-    )?;
-
-    let k = degree as f64;
-    for i in 0..num_basis {
-        let denom1 = knot_vector[i + degree] - knot_vector[i];
-        let denom2 = knot_vector[i + degree + 1] - knot_vector[i + 1];
-        let term1 = if denom1.abs() > 1e-12 {
-            k * third_lower[i] / denom1
-        } else {
-            0.0
-        };
-        let term2 = if denom2.abs() > 1e-12 {
-            k * third_lower[i + 1] / denom2
-        } else {
-            0.0
-        };
-        out[i] = term1 - term2;
-    }
-
-    Ok(())
+    let mut workspace = BsplineDerivativeWorkspace::new();
+    evaluate_bspline_derivative_recurrence_into(4, x, knot_vector, degree, out, &mut workspace, 0)
 }
 
 /// Closed-form scalar building blocks for Riesz, Matérn, and isotropic

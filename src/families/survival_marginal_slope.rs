@@ -28,10 +28,10 @@ use crate::families::cubic_cell_kernel as exact_kernel;
 use crate::families::gamlss::{ParameterBlockInput, monotone_wiggle_basis_with_derivative_order};
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::marginal_slope_shared::{
-    CoeffSupport, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView, add_optional_matrix,
-    add_optional_vector, add_scaled_coeff4, add_two_surface_psi_outer,
+    CoeffSupport, DirectionalScaleJets, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView,
+    add_optional_matrix, add_optional_vector, add_scaled_coeff4, add_two_surface_psi_outer,
     build_denested_partition_cells as shared_denested_partition_cells, chunked_row_reduction,
-    eval_coeff4_at, is_sigma_aux_index as shared_is_sigma_aux_index,
+    directional_obj_grad_hess, eval_coeff4_at, is_sigma_aux_index as shared_is_sigma_aux_index,
     observed_denested_cell_partials as shared_observed_denested_cell_partials, outer_row_indices,
     outer_row_weights_by_index, outer_weighted_rows, parameter_block_specs_match_rows,
     probit_frailty_scale, probit_frailty_scale_multi_dir_jet, psi_derivative_location,
@@ -4844,82 +4844,36 @@ impl SurvivalMarginalSlopeFamily {
     ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
         let primary_dim = N_PRIMARY;
         let zero = zero_primary_direction_ref();
-        // sigma_scale_jet only depends on the multi-dir spec, not on the
-        // row — so resolve each variant once and reuse across the
-        // objective + grad + hess sweeps for this row. Previously this
-        // was rebuilt 1 + N_PRIMARY + N_PRIMARY*(N_PRIMARY+1)/2 = 15
-        // times per row.
-        let (scale_obj, scale_grad, scale_hess) = if second_sigma {
+        // The leading prefix is the fixed number of zero primary directions the
+        // log-sigma hyperderivative differentiates *through*: one for the first
+        // log-sigma derivative, two for the second. The shared
+        // `directional_obj_grad_hess` sweep appends the unit primary directions
+        // for grad/hess on top of this prefix. `sigma_scale_jet` only depends on
+        // the multi-dir spec, not on the row, so each variant is resolved once
+        // here and reused across the objective + grad + hess passes.
+        let (leading, scales): (Vec<&Array1<f64>>, DirectionalScaleJets) = if second_sigma {
             (
-                self.sigma_scale_jet(2, &[1, 2], &[3])?,
-                self.sigma_scale_jet(3, &[1, 2], &[3])?,
-                self.sigma_scale_jet(4, &[1, 2], &[3])?,
+                vec![zero, zero],
+                DirectionalScaleJets {
+                    obj: Some(self.sigma_scale_jet(2, &[1, 2], &[3])?),
+                    grad: self.sigma_scale_jet(3, &[1, 2], &[3])?,
+                    hess: self.sigma_scale_jet(4, &[1, 2], &[3])?,
+                },
             )
         } else {
             (
-                self.sigma_scale_jet(1, &[1], &[])?,
-                self.sigma_scale_jet(2, &[1], &[])?,
-                self.sigma_scale_jet(3, &[1], &[])?,
+                vec![zero],
+                DirectionalScaleJets {
+                    obj: Some(self.sigma_scale_jet(1, &[1], &[])?),
+                    grad: self.sigma_scale_jet(2, &[1], &[])?,
+                    hess: self.sigma_scale_jet(3, &[1], &[])?,
+                },
             )
         };
-        let objective = if second_sigma {
-            self.row_neglog_directional_with_scale_jet(
-                row,
-                block_states,
-                &[zero, zero],
-                &scale_obj,
-            )?
-        } else {
-            self.row_neglog_directional_with_scale_jet(row, block_states, &[zero], &scale_obj)?
-        };
-
-        let mut grad = Array1::<f64>::zeros(primary_dim);
-        for a in 0..primary_dim {
-            let da = unit_primary_direction_ref(a);
-            let value = if second_sigma {
-                self.row_neglog_directional_with_scale_jet(
-                    row,
-                    block_states,
-                    &[zero, zero, da],
-                    &scale_grad,
-                )?
-            } else {
-                self.row_neglog_directional_with_scale_jet(
-                    row,
-                    block_states,
-                    &[zero, da],
-                    &scale_grad,
-                )?
-            };
-            grad[a] = value;
-        }
-
-        let mut hess = Array2::<f64>::zeros((primary_dim, primary_dim));
-        for a in 0..primary_dim {
-            let da = unit_primary_direction_ref(a);
-            for b in a..primary_dim {
-                let db = unit_primary_direction_ref(b);
-                let value = if second_sigma {
-                    self.row_neglog_directional_with_scale_jet(
-                        row,
-                        block_states,
-                        &[zero, zero, da, db],
-                        &scale_hess,
-                    )?
-                } else {
-                    self.row_neglog_directional_with_scale_jet(
-                        row,
-                        block_states,
-                        &[zero, da, db],
-                        &scale_hess,
-                    )?
-                };
-                hess[[a, b]] = value;
-                hess[[b, a]] = value;
-            }
-        }
-
-        Ok((objective, grad, hess))
+        let terms = directional_obj_grad_hess(primary_dim, &leading, &scales, |dirs, scale| {
+            self.row_neglog_directional_with_scale_jet(row, block_states, dirs, scale)
+        })?;
+        Ok((terms.objective, terms.grad, terms.hess))
     }
 
     fn sigma_exact_joint_psi_terms(
@@ -5168,7 +5122,11 @@ impl SurvivalMarginalSlopeFamily {
         let row_weights = outer_row_weights_by_index(options, self.n);
         // Sigma scale jets and the zero primary direction are constant
         // across rows; resolve once outside the fold instead of rebuilding
-        // per-row (and per (a,b) pair) inside it.
+        // per-row (and per (a,b) pair) inside it. The shared
+        // `directional_obj_grad_hess` sweep differentiates *through* the
+        // fixed leading prefix `[zero, row_dir]` (one zero log-sigma slot,
+        // the perturbation direction) and appends the grad/hess unit
+        // directions; `obj: None` suppresses the zeroth-order pass.
         let scale_grad = self.sigma_scale_jet(3, &[1], &[])?;
         let scale_hess = self.sigma_scale_jet(4, &[1], &[])?;
         let zero = zero_primary_direction_ref();
@@ -5183,31 +5141,26 @@ impl SurvivalMarginalSlopeFamily {
                     &slices,
                     d_beta_flat,
                 )?;
-                let mut grad = Array1::<f64>::zeros(primary_dim);
-                for a in 0..primary_dim {
-                    let da = unit_primary_direction_ref(a);
-                    grad[a] = self.row_neglog_directional_with_scale_jet(
-                        row,
-                        block_states,
-                        &[zero, &row_dir, da],
-                        &scale_grad,
-                    )?;
-                }
-                let mut hess = Array2::<f64>::zeros((primary_dim, primary_dim));
-                for a in 0..primary_dim {
-                    let da = unit_primary_direction_ref(a);
-                    for b in a..primary_dim {
-                        let db = unit_primary_direction_ref(b);
-                        let value = self.row_neglog_directional_with_scale_jet(
+                let scales = DirectionalScaleJets {
+                    obj: None,
+                    grad: scale_grad.clone(),
+                    hess: scale_hess.clone(),
+                };
+                let terms = directional_obj_grad_hess(
+                    primary_dim,
+                    &[zero, &row_dir],
+                    &scales,
+                    |dirs, scale| {
+                        self.row_neglog_directional_with_scale_jet(
                             row,
                             block_states,
-                            &[zero, &row_dir, da, db],
-                            &scale_hess,
-                        )?;
-                        hess[[a, b]] = value;
-                        hess[[b, a]] = value;
-                    }
-                }
+                            dirs,
+                            scale,
+                        )
+                    },
+                )?;
+                let mut grad = terms.grad;
+                let mut hess = terms.hess;
                 let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
                 let w = row_weights[row];
                 if w != 1.0 {

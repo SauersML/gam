@@ -17,7 +17,9 @@ use crate::inference::model::{
     SavedCompiledFlexBlock, SavedLatentZNormalization, SavedLinkWiggleRuntime,
 };
 use crate::inference::predict::interval_policy::{
-    MeanBoundMethod, ResponseBounds, mean_bounds, symmetric_interval, validated_central_z,
+    EtaInterval, MeanBoundMethod, ObservationInterval, ResponseBounds, UncertaintyProvenance,
+    assemble_posterior_mean_bounds, assemble_uncertainty_result, mean_bounds, symmetric_interval,
+    validated_central_z,
 };
 use crate::inference::predict::linalg::{
     PredictionCovarianceBackend, design_row_chunk, prediction_chunk_rows,
@@ -917,33 +919,24 @@ impl PredictableModel for StandardPredictor {
                 "standard link-wiggle uncertainty requires covariance".to_string(),
             )
         })?;
-        let z = validated_central_z(options.confidence_level)?;
-        let (eta_lower, eta_upper) = symmetric_interval(&pred.eta, &eta_se, z);
         let spec = spec_from_family_link(self.family.clone(), self.link_kind.as_ref());
-        let (mean_lower, mean_upper) = mean_bounds(
-            &eta_lower,
-            &eta_upper,
-            &pred.mean,
-            z,
+        assemble_uncertainty_result(
+            options.confidence_level,
+            pred.eta,
+            pred.mean,
+            eta_se,
+            mean_se.clone(),
+            EtaInterval::Symmetric,
             MeanBoundMethod::Delta {
                 mean_se: &mean_se,
                 bounds: ResponseBounds::for_family(&spec.response),
             },
-        )?;
-        Ok(PredictUncertaintyResult {
-            eta: pred.eta,
-            mean: pred.mean,
-            eta_standard_error: eta_se,
-            mean_standard_error: mean_se,
-            eta_lower,
-            eta_upper,
-            mean_lower,
-            mean_upper,
-            observation_lower: None,
-            observation_upper: None,
-            covariance_mode_requested: options.covariance_mode,
-            covariance_corrected_used: false,
-        })
+            None,
+            UncertaintyProvenance {
+                covariance_mode_requested: options.covariance_mode,
+                covariance_corrected_used: false,
+            },
+        )
     }
 
     fn predict_posterior_mean(

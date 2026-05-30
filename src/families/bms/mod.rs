@@ -14,10 +14,10 @@ use crate::families::gamlss::{ParameterBlockInput, initialize_monotone_wiggle_kn
 use crate::families::jet_partitions::MultiDirJet;
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::marginal_slope_shared::{
-    CoeffSupport, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView, WeightedOuterRow,
-    add_optional_matrix, add_optional_vector, add_two_surface_psi_outer,
+    CoeffSupport, DirectionalScaleJets, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView,
+    WeightedOuterRow, add_optional_matrix, add_optional_vector, add_two_surface_psi_outer,
     build_denested_partition_cells as shared_denested_partition_cells, chunked_row_reduction,
-    eval_coeff4_at, is_sigma_aux_index as shared_is_sigma_aux_index,
+    directional_obj_grad_hess, eval_coeff4_at, is_sigma_aux_index as shared_is_sigma_aux_index,
     observed_denested_cell_partials as shared_observed_denested_cell_partials, outer_row_indices,
     outer_weighted_rows, parameter_block_specs_match_rows, probit_frailty_scale,
     probit_frailty_scale_multi_dir_jet, psi_derivative_location, scale_coeff4,

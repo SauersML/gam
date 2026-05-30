@@ -7822,91 +7822,27 @@ fn aggregate_labeled_hessian(
     Ok(out)
 }
 
+/// Adapter over the shared [`rho_prior_eval`](crate::solver::estimate::reml::rho_prior_eval)
+/// engine using the custom-family invalid-prior policy
+/// (`HardError`): the prior math is shared with the REML/LAML runtime, and a
+/// malformed prior surfaces as a structured [`CustomFamilyError`] rather than
+/// being folded into the objective.
 fn rho_prior_cost_gradient_hessian(
     prior: &crate::types::RhoPrior,
     rho: &Array1<f64>,
 ) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), String> {
-    fn scalar_terms(
-        prior: &crate::types::RhoPrior,
-        r: f64,
-        context: &str,
-    ) -> Result<(f64, f64, f64), String> {
-        match prior {
-            crate::types::RhoPrior::Flat => Ok((0.0, 0.0, 0.0)),
-            crate::types::RhoPrior::Normal { mean, sd } => {
-                if !mean.is_finite() || !sd.is_finite() || *sd <= 0.0 {
-                    return Err(format!(
-                        "{context} Normal log-precision prior requires finite mean and sd > 0"
-                    ));
-                }
-                let inv_var = 1.0 / (*sd * *sd);
-                let delta = r - *mean;
-                Ok((0.5 * delta * delta * inv_var, delta * inv_var, inv_var))
-            }
-            crate::types::RhoPrior::GammaPrecision { shape, rate } => {
-                if !shape.is_finite() || *shape <= 0.0 || !rate.is_finite() || *rate < 0.0 {
-                    return Err(CustomFamilyError::DimensionMismatch {
-                        reason: format!(
-                            "{context} Gamma precision prior requires shape > 0 and rate >= 0"
-                        ),
-                    }
-                    .into());
-                }
-                let lambda = r.exp();
-                Ok((
-                    *rate * lambda - (*shape - 1.0) * r,
-                    *rate * lambda - (*shape - 1.0),
-                    *rate * lambda,
-                ))
-            }
-            crate::types::RhoPrior::Independent(_) => Err(CustomFamilyError::ConstraintViolation {
-                reason: format!(
-                    "{context} must be a scalar rho prior, not a nested Independent prior"
-                ),
-            }
-            .into()),
+    use crate::solver::estimate::reml::rho_prior_eval::{InvalidPriorPolicy, RhoPriorError};
+    match crate::solver::estimate::reml::rho_prior_eval::evaluate(
+        prior,
+        rho,
+        InvalidPriorPolicy::HardError,
+    ) {
+        Ok(eval) => Ok((eval.cost, eval.gradient, eval.hessian)),
+        Err(RhoPriorError::DimensionMismatch { reason }) => {
+            Err(CustomFamilyError::DimensionMismatch { reason }.into())
         }
-    }
-
-    match prior {
-        crate::types::RhoPrior::Flat => Ok((0.0, Array1::zeros(rho.len()), None)),
-        crate::types::RhoPrior::Normal { .. } | crate::types::RhoPrior::GammaPrecision { .. } => {
-            let mut cost = 0.0;
-            let mut gradient = Array1::<f64>::zeros(rho.len());
-            let mut hessian = Array2::<f64>::zeros((rho.len(), rho.len()));
-            let mut any_hessian = false;
-            for (idx, &r) in rho.iter().enumerate() {
-                let (c, g, h) = scalar_terms(prior, r, "rho prior")?;
-                cost += c;
-                gradient[idx] = g;
-                hessian[[idx, idx]] = h;
-                any_hessian |= h != 0.0;
-            }
-            Ok((cost, gradient, any_hessian.then_some(hessian)))
-        }
-        crate::types::RhoPrior::Independent(priors) => {
-            if priors.len() != rho.len() {
-                return Err(CustomFamilyError::DimensionMismatch {
-                    reason: format!(
-                        "Independent rho prior length mismatch: got {}, expected {}",
-                        priors.len(),
-                        rho.len()
-                    ),
-                }
-                .into());
-            }
-            let mut cost = 0.0;
-            let mut gradient = Array1::<f64>::zeros(rho.len());
-            let mut hessian = Array2::<f64>::zeros((rho.len(), rho.len()));
-            let mut any_hessian = false;
-            for (idx, (prior, &r)) in priors.iter().zip(rho.iter()).enumerate() {
-                let (c, g, h) = scalar_terms(prior, r, &format!("rho prior coordinate {idx}"))?;
-                cost += c;
-                gradient[idx] = g;
-                hessian[[idx, idx]] = h;
-                any_hessian |= h != 0.0;
-            }
-            Ok((cost, gradient, any_hessian.then_some(hessian)))
+        Err(RhoPriorError::ConstraintViolation { reason }) => {
+            Err(CustomFamilyError::ConstraintViolation { reason }.into())
         }
     }
 }

@@ -268,6 +268,34 @@ class SurvivalPrediction:
         result = rust_module().survival_ffi_surface(self.times, surface)
         return (None, None) if result is None else result
 
+    def _surface_chunks(
+        self,
+        *,
+        n_rows: int,
+        times_arr: Any,
+        people_chunk: int,
+        time_grid_chunk: int,
+        block_fn: Any,
+    ) -> Any:
+        """Drive the shared row/time-grid chunking for every surface kind.
+
+        This is the one place that validates the chunk sizes and walks the
+        nested ``(row_slice, time_slice)`` lattice. Each surface path supplies
+        a ``block_fn(row_slice, time_slice)`` that produces the values for a
+        single tile -- whether by interpolating a precomputed FFI surface,
+        evaluating the per-row survival block, or transforming an upstream
+        chunk -- so the chunking control flow is never duplicated.
+        """
+        people_chunk = _validate_survival_chunk_size(people_chunk, "people_chunk")
+        time_grid_chunk = _validate_survival_chunk_size(time_grid_chunk, "time_grid_chunk")
+        for row_start in range(0, n_rows, people_chunk):
+            row_stop = min(row_start + people_chunk, n_rows)
+            row_slice = slice(row_start, row_stop)
+            for time_start in range(0, times_arr.size, time_grid_chunk):
+                time_stop = min(time_start + time_grid_chunk, times_arr.size)
+                time_slice = slice(time_start, time_stop)
+                yield (row_slice, time_slice, block_fn(row_slice, time_slice))
+
     def _ffi_surface_at_chunks(
         self,
         kind: str,
@@ -280,31 +308,25 @@ class SurvivalPrediction:
         grid, surface = self._ffi_surface(kind)
         if grid is None or surface is None:
             return None
-        people_chunk = _validate_survival_chunk_size(people_chunk, "people_chunk")
-        time_grid_chunk = _validate_survival_chunk_size(time_grid_chunk, "time_grid_chunk")
         left_value, right_value = _extrapolation_for(kind)
 
-        def chunks() -> Any:
-            for row_start in range(0, surface.shape[0], people_chunk):
-                row_stop = min(row_start + people_chunk, surface.shape[0])
-                row_surface = surface[row_start:row_stop, :]
-                for time_start in range(0, times_arr.size, time_grid_chunk):
-                    time_stop = min(time_start + time_grid_chunk, times_arr.size)
-                    time_block = times_arr[time_start:time_stop]
-                    yield (
-                        slice(row_start, row_stop),
-                        slice(time_start, time_stop),
-                        _interpolate_rows(
-                            grid,
-                            row_surface,
-                            time_block,
-                            clip=clip,
-                            left_value=left_value,
-                            right_value=right_value,
-                        ),
-                    )
+        def block_fn(row_slice: slice, time_slice: slice) -> Any:
+            return _interpolate_rows(
+                grid,
+                surface[row_slice, :],
+                times_arr[time_slice],
+                clip=clip,
+                left_value=left_value,
+                right_value=right_value,
+            )
 
-        return chunks()
+        return self._surface_chunks(
+            n_rows=surface.shape[0],
+            times_arr=times_arr,
+            people_chunk=people_chunk,
+            time_grid_chunk=time_grid_chunk,
+            block_fn=block_fn,
+        )
 
     def survival_at_chunks(
         self,
@@ -325,18 +347,17 @@ class SurvivalPrediction:
             yield from ffi_chunks
             return
         params = self._parameters_array()
-        people_chunk = _validate_survival_chunk_size(people_chunk, "people_chunk")
-        time_grid_chunk = _validate_survival_chunk_size(time_grid_chunk, "time_grid_chunk")
-        for row_start in range(0, params.shape[0], people_chunk):
-            row_stop = min(row_start + people_chunk, params.shape[0])
-            row_params = params[row_start:row_stop, :]
-            for time_start in range(0, times_arr.size, time_grid_chunk):
-                time_stop = min(time_start + time_grid_chunk, times_arr.size)
-                yield (
-                    slice(row_start, row_stop),
-                    slice(time_start, time_stop),
-                    self._survival_block(row_params, times_arr[time_start:time_stop]),
-                )
+
+        def block_fn(row_slice: slice, time_slice: slice) -> Any:
+            return self._survival_block(params[row_slice, :], times_arr[time_slice])
+
+        yield from self._surface_chunks(
+            n_rows=params.shape[0],
+            times_arr=times_arr,
+            people_chunk=people_chunk,
+            time_grid_chunk=time_grid_chunk,
+            block_fn=block_fn,
+        )
 
     def cumulative_hazard_at_chunks(
         self,
