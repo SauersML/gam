@@ -1570,13 +1570,6 @@ pub struct MaternSplineBasis {
 #[derive(Debug, Clone)]
 struct DuchonBasisDesign {
     basis: Array2<f64>,
-    num_kernel_basis: usize,
-    num_polynomial_basis: usize,
-    dimension: usize,
-    /// Effective null-space order actually used to build the basis. May
-    /// differ from the requested order when auto-degraded to `Zero` because
-    /// the center count could not span the requested polynomial block.
-    nullspace_order: DuchonNullspaceOrder,
 }
 
 /// Boundary-condition policy for one-dimensional smooth bases.
@@ -20536,13 +20529,7 @@ fn build_duchon_basis_designwithworkspace(
         basis.slice_mut(s![.., kernel_cols..]).assign(&poly_block);
     }
 
-    Ok(DuchonBasisDesign {
-        basis,
-        num_kernel_basis: kernel_cols,
-        num_polynomial_basis: poly_cols,
-        dimension: d,
-        nullspace_order,
-    })
+    Ok(DuchonBasisDesign { basis })
 }
 
 fn build_cyclic_duchon_basis_1dwithworkspace(
