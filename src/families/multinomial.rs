@@ -58,7 +58,9 @@
 use crate::faer_ndarray::{FaerArrayView, array2_to_matmut, factorize_symmetricwith_fallback};
 use crate::families::custom_family::{BlockwiseFitOptions, fit_custom_family_with_rho_prior};
 use crate::families::multinomial_reml::MultinomialFamily;
-use crate::families::vector_response::{MultinomialLogitLikelihood, VectorLikelihood};
+use crate::families::vector_response::{
+    MultinomialLogitLikelihood, VectorLikelihood, validate_multinomial_simplex,
+};
 use crate::inference::data::EncodedDataset;
 use crate::inference::formula_dsl::parse_formula;
 use crate::inference::model::ColumnKindTag;
@@ -91,8 +93,12 @@ use std::sync::Arc;
 pub struct MultinomialFitInputs<'a> {
     /// Design matrix `X ∈ ℝ^{N×P}` (one row per observation).
     pub design: ArrayView2<'a, f64>,
-    /// One-hot response `Y ∈ ℝ^{N×K}` (row sums ≈ 1 for hard classification;
-    /// non-integer rows are permitted for label-smoothed targets).
+    /// Categorical response `Y ∈ ℝ^{N×K}`. Each row must be a point on the
+    /// probability simplex (`y_c ≥ 0`, `Σ_c y_c = 1`): a one-hot indicator for
+    /// hard classification, or a label-smoothed probability vector. Rows whose
+    /// mass departs from 1 are rejected — the softmax residual gradient and
+    /// Fisher block are the derivatives of `Σ_c y_c log p_c` only under the
+    /// simplex constraint (see `validate_multinomial_simplex`).
     pub y_one_hot: ArrayView2<'a, f64>,
     /// Shared smoothing penalty `S ∈ ℝ^{P×P}` (symmetric, PSD).
     pub penalty: ArrayView2<'a, f64>,
@@ -219,13 +225,7 @@ pub fn fit_penalized_multinomial(
             }
         }
     }
-    for ((i, j), &v) in y_one_hot.indexed_iter() {
-        if !v.is_finite() {
-            crate::bail_invalid_estim!(
-                "fit_penalized_multinomial: y[{i},{j}] must be finite (got {v})"
-            );
-        }
-    }
+    validate_multinomial_simplex(y_one_hot, "fit_penalized_multinomial")?;
     for ((i, j), &v) in design.indexed_iter() {
         if !v.is_finite() {
             crate::bail_invalid_estim!(

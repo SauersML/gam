@@ -137,6 +137,63 @@ impl VectorResponseTarget {
     }
 }
 
+/// Relative tolerance on the per-row simplex constraint `Σ_c y_{n,c} = 1`.
+///
+/// The multinomial-logit log-likelihood `ℓ = Σ_c y_c log p_c` has the
+/// canonical residual gradient `y_a − p_a` and Fisher block
+/// `p_a δ_{ab} − p_a p_b` **only** when each target row is a probability
+/// vector (`y_c ≥ 0`, `Σ_c y_c = 1`). For a general row mass `s = Σ_c y_c`
+/// the true derivatives are `y_a − s p_a` and `s (p_a δ_{ab} − p_a p_b)`, so
+/// any row whose mass deviates from 1 makes the implemented gradient/Hessian
+/// disagree with the implemented objective. We therefore require simplex rows
+/// at every construction boundary and reject anything else, rather than
+/// silently fitting with inconsistent curvature. The tolerance absorbs only
+/// floating-point round-off in an otherwise-exact one-hot / label-smoothed
+/// row (e.g. a sum of `K` rationals), not genuine count or proportional data.
+pub(crate) const MULTINOMIAL_SIMPLEX_TOL: f64 = 1.0e-9;
+
+/// Validate that every row of a multinomial target `y ∈ ℝ^{N×K}` is a point on
+/// the probability simplex: `y_{n,c} ≥ 0` for all entries and
+/// `Σ_c y_{n,c} = 1` for every row (up to [`MULTINOMIAL_SIMPLEX_TOL`]). This
+/// is the precondition under which [`MultinomialLogitLikelihood`]'s residual
+/// gradient and Fisher block are the exact derivatives of its log-likelihood;
+/// see the constant's docs. Finiteness is checked first so the message points
+/// at the offending entry rather than at a NaN-poisoned row sum.
+pub(crate) fn validate_multinomial_simplex(
+    y: ArrayView2<f64>,
+    context: &str,
+) -> Result<(), EstimationError> {
+    let (n, k) = y.dim();
+    for row in 0..n {
+        let mut row_sum = 0.0_f64;
+        for c in 0..k {
+            let v = y[[row, c]];
+            if !v.is_finite() {
+                crate::bail_invalid_estim!(
+                    "{context}: y[{row},{c}] must be finite (got {v})"
+                );
+            }
+            if v < 0.0 {
+                crate::bail_invalid_estim!(
+                    "{context}: multinomial target must be a probability vector \
+                     (y_c ≥ 0); got y[{row},{c}] = {v}"
+                );
+            }
+            row_sum += v;
+        }
+        if (row_sum - 1.0).abs() > MULTINOMIAL_SIMPLEX_TOL {
+            crate::bail_invalid_estim!(
+                "{context}: multinomial target rows must sum to 1 (one-hot for \
+                 hard labels, or a label-smoothed probability vector); row {row} \
+                 sums to {row_sum}. The softmax residual gradient y_a − p_a and \
+                 Fisher block p_a δ_ab − p_a p_b are the derivatives of \
+                 Σ_c y_c log p_c only when the row mass is 1."
+            );
+        }
+    }
+    Ok(())
+}
+
 fn validate_row_weights(weights: &Array1<f64>, n: usize) -> Result<(), EstimationError> {
     if weights.len() != n {
         crate::bail_invalid_estim!("row_weights length {} ≠ N={n}", weights.len());
@@ -171,11 +228,12 @@ pub trait VectorLikelihood {
     /// Per-row dense Hessian block −∂² log p / ∂η_a ∂η_b, shape (N, M, M).
     ///
     /// Default implementation lifts [`Self::hess_diag`] onto the per-row
-    /// diagonal so existing diagonal-likelihood implementors (e.g.
-    /// [`GaussianVectorLikelihood`]) require no override. Likelihoods whose
-    /// per-row Hessian is genuinely non-diagonal across outputs — most
-    /// importantly multinomial-logit, where the per-row Fisher block is
-    /// `p_a (δ_ab − p_b)` — must override this method.
+    /// diagonal, valid only when the per-row Hessian is genuinely diagonal
+    /// across outputs (e.g. Gaussian with Isotropic/Diagonal noise).
+    /// Likelihoods with off-diagonal output coupling must override this:
+    /// [`GaussianVectorLikelihood`] with a low-rank precision factor `F`
+    /// (block `w·(diag(precision) + F·Fᵀ)`, off-diagonals `w·Σ_k F[a,k]·F[b,k]`)
+    /// and multinomial-logit (per-row Fisher block `p_a (δ_ab − p_b)`).
     ///
     /// The returned array is consumed by
     /// [`crate::solver::pirls::dense_block_xtwx`] /
@@ -331,11 +389,12 @@ impl VectorLikelihood for GaussianVectorLikelihood {
 
     fn hess_diag(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> Array2<f64> {
         assert_eq!(eta.dim(), y.dim());
-        // −∂² log p / ∂η² = w · (diag(d) + F·Fᵀ); the diagonal of (F·Fᵀ)
-        // at output m is Σ_k F[m, k]². Cross terms F[m, k]·F[m', k] live in
-        // the dense rank-r correction returned by `hess_full` (only exposed
-        // via the `GaussianVectorLikelihood` API; the `VectorLikelihood`
-        // trait sees the diagonal preconditioner).
+        // Diagonal of −∂² log p / ∂η² = w · diag(diag(d) + F·Fᵀ); the diagonal
+        // of (F·Fᵀ) at output m is Σ_k F[m, k]². This is the diagonal
+        // *preconditioner* only — the off-diagonal cross terms F[a, k]·F[b, k]
+        // are carried by the full per-row block in [`Self::hess_block`] (which
+        // this type overrides whenever `factor` is present). Callers that need
+        // the true Hessian must use `hess_block`, not this diagonal.
         let (n_rows, n_cols) = eta.dim();
         let mut out = Array2::<f64>::zeros((n_rows, n_cols));
         // Pre-compute Σ_k F[m, k]² per output m (independent of n).
@@ -365,6 +424,53 @@ impl VectorLikelihood for GaussianVectorLikelihood {
         }
         out
     }
+
+    fn hess_block(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> Array3<f64> {
+        // Per-row dense block −∂² log p / ∂η_a ∂η_b. With log-likelihood
+        //     ℓ = −½ Σ_n w_n · rₙᵀ W rₙ,   r = y − η,   W = diag(precision) + F·Fᵀ,
+        // the gradient is wₙ · W rₙ and the negative Hessian block is exactly
+        //     H_{n,a,b} = w_n · ( precision_a · δ_ab + Σ_k F[a,k] · F[b,k] ).
+        // This is the true second derivative of `log_lik` (it differentiates
+        // `grad_eta` exactly); the diagonal-only trait default would drop the
+        // F·Fᵀ cross terms F[a,k]·F[b,k] for a ≠ b, so it must be overridden
+        // whenever a low-rank factor is present.
+        assert_eq!(eta.dim(), y.dim());
+        assert_eq!(eta.ncols(), self.precision.len());
+        let (n_rows, m) = eta.dim();
+        let rank = self.factor.as_ref().map_or(0, |f| f.ncols());
+
+        // Per-output Gram of the low-rank factor, G_{a,b} = Σ_k F[a,k]·F[b,k].
+        // Independent of the row n, so assemble once and scale by w_n.
+        let gram: Option<Array2<f64>> = self.factor.as_ref().map(|f| {
+            let mut g = Array2::<f64>::zeros((m, m));
+            for a in 0..m {
+                for b in a..m {
+                    let mut acc = 0.0;
+                    for k in 0..rank {
+                        acc += f[[a, k]] * f[[b, k]];
+                    }
+                    g[[a, b]] = acc;
+                    g[[b, a]] = acc;
+                }
+            }
+            g
+        });
+
+        let mut out = Array3::<f64>::zeros((n_rows, m, m));
+        for n in 0..n_rows {
+            let w = self.row_weight(n);
+            for a in 0..m {
+                for b in 0..m {
+                    let mut val = if a == b { self.precision[a] } else { 0.0 };
+                    if let Some(g) = gram.as_ref() {
+                        val += g[[a, b]];
+                    }
+                    out[[n, a, b]] = w * val;
+                }
+            }
+        }
+        out
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -378,9 +484,15 @@ impl VectorLikelihood for GaussianVectorLikelihood {
 ///   columns corresponding to the *active* classes. Class `K - 1` is the
 ///   reference class with η_{K-1} ≡ 0 (so the gauge is fixed by construction
 ///   and no additional sum-to-zero projection is required at the η level).
-/// - `y` is the one-hot encoded response with shape `(N, K)`. Rows must sum to
-///   row weights (typically 1.0); each row puts mass on exactly one class for
-///   hard-label classification.
+/// - `y` is the categorical response with shape `(N, K)`. Each row must be a
+///   point on the probability simplex (`y_c ≥ 0`, `Σ_c y_c = 1`): a one-hot
+///   indicator for hard-label classification, or a label-smoothed probability
+///   vector. The row *weight* `w_n` scales the whole row's likelihood
+///   contribution and is independent of the row mass — it is **not** the row
+///   sum. Callers enforce the simplex precondition via
+///   [`validate_multinomial_simplex`] at every construction boundary; under it
+///   the residual gradient `y_a − p_a` and Fisher block `p_a δ_ab − p_a p_b`
+///   below are the exact derivatives of the log-likelihood `Σ_c y_c log p_c`.
 /// - `eta` is the active linear predictor with shape `(N, M = K - 1)`.
 ///
 /// Softmax with baseline:
