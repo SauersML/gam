@@ -93,8 +93,6 @@ fn gam_smooth_predicts_heldout_lidar_at_least_as_well_as_inla() {
 
     let test_range: Vec<f64> = test_rows.iter().map(|&i| ds.values[[i, range_idx]]).collect();
     let test_y: Vec<f64> = test_rows.iter().map(|&i| ds.values[[i, logratio_idx]]).collect();
-    let train_range: Vec<f64> =
-        train_rows.iter().map(|&i| ds.values[[i, range_idx]]).collect();
     let train_y: Vec<f64> =
         train_rows.iter().map(|&i| ds.values[[i, logratio_idx]]).collect();
 
