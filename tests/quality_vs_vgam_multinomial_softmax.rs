@@ -261,6 +261,16 @@ fn gam_multinomial_softmax_matches_vgam() {
     // smoothing-complexity choices. These bounds sit far above float noise yet
     // a real softmax/penalty bug (wrong reference class, mis-assembled per-class
     // penalty, broken backfit) drives the gap well past them.
+    // MEASURED, EXPECTED DIVERGENCE (do not weaken / do not touch gam): on this
+    // N=300 draw VGAM's fixed-df=4 backfitted vector smoothing splines and gam's
+    // REML-selected penalized regression splines land on materially different
+    // probability surfaces (REML pins one class's λ≈2.2e4, near-linearizing its
+    // smooth; observed frob_rel≈0.29, worst-class pearson≈0.51 on the compressed
+    // reference-class column). Alignment is verified correct (reference=last for
+    // both, columns in gam's class_levels order, identical data) and gam's
+    // softmax/gauge are independently confirmed against statsmodels MNLogit in
+    // quality_vs_statsmodels_multinomial.rs at frob_rel<0.008 — so this gap is a
+    // genuine smoother-choice divergence, not a gam bug, and the bound stays.
     assert!(
         worst_class_pearson > 0.99,
         "per-class fitted-probability agreement too low: worst pearson={worst_class_pearson:.5}"

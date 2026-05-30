@@ -19,9 +19,15 @@
 //! never carries the fitted `scale`/`shape` (they are `None`). The fitted model
 //! lives entirely in the coefficient vector
 //!
-//!     beta = [ beta_time(2) | gamma_cov ],
+//!     beta = [ beta_time(2) | beta_cov ],
 //!     log Λ(t | x) = Σ_k (b_k(t) − b_k(anchor)) · beta_time_k + gamma·x,
 //!     S(t | x)     = exp(−Λ(t | x)),
+//!
+//! where `beta_cov` is gam's covariate design block (the auto-added intercept
+//! plus the linear `trt` column), so `beta` has length p_time + p_cov (here 4),
+//! not 3. We never index `trt` positionally: its PH log-hazard-ratio `gamma` is
+//! recovered as a finite difference over the rebuilt covariate design at
+//! trt = 1 vs trt = 0, in which the intercept and any column ordering cancel.
 //!
 //! exactly as the sibling `quality_vs_flexsurv_rp_baseline` test reconstructs a
 //! Royston-Parmar fit. The constant basis column is anchor-centred to zero, so
@@ -109,8 +115,8 @@ fn gam_weibull_matches_flexsurv_on_bone() {
     // `survival_likelihood = "weibull"` is gam's parametric Weibull baseline: a
     // 2-column `[1, log t]` time basis seeded by scale/shape, with the single
     // linear covariate appended. The fit lives in the coefficient vector
-    // (beta = [time(2) | gamma]); baseline_cfg stays Linear and does NOT carry
-    // the fitted (scale, shape).
+    // (beta = [time(2) | beta_cov]); baseline_cfg stays Linear and does NOT
+    // carry the fitted (scale, shape).
     let headers = vec!["t".to_string(), "d".to_string(), "trt".to_string()];
     let rows: Vec<StringRecord> = (0..n)
         .map(|i| {
@@ -132,21 +138,24 @@ fn gam_weibull_matches_flexsurv_on_bone() {
         panic!("expected a SurvivalTransformation fit result for survival_likelihood=weibull");
     };
 
-    // beta = [β_time(2) | gamma]; the linear time block is a strict prefix.
+    // beta = [β_time(2) | β_cov]; the linear time block is a strict prefix and
+    // the covariate block carries the (gam-built) intercept + linear `trt`
+    // columns. We never assume the covariate block is a single column or that
+    // `trt` is the last coefficient — its effect is recovered below as a
+    // finite difference over the rebuilt covariate design (the intercept and
+    // any column ordering cancel), exactly as the sibling RP-baseline test.
     let beta = &fit.fit.beta;
     let p_time = fit.time_base_ncols;
     assert_eq!(
         p_time, 2,
         "Weibull linear time basis must have 2 columns, got {p_time}"
     );
-    assert_eq!(
-        beta.len(),
-        3,
-        "Weibull beta = [time0, time1, trt] expected length 3, got {}",
+    assert!(
+        p_time < beta.len(),
+        "Weibull time block must be a strict prefix of beta: p_time={p_time}, p={}",
         beta.len()
     );
     let beta_time = beta.slice(ndarray::s![..p_time]).to_owned();
-    let gamma = beta[beta.len() - 1]; // covariate PH log-hazard-ratio
 
     // Resolved (knot-frozen) time-basis config + anchor row, mirroring the
     // engine's anchor-centred `[1, log t]` rows that produced `beta_time`.
@@ -184,10 +193,6 @@ fn gam_weibull_matches_flexsurv_on_bone() {
         design.design.apply(&beta_cov).to_vec()[0]
     };
     let gam_gamma = cov_eta(1.0) - cov_eta(0.0); // PH log-HR (allo -> auto)
-    assert!(
-        (gam_gamma - gamma).abs() < 1e-9,
-        "single linear covariate: finite-difference PH log-HR must equal the last beta"
-    );
 
     // gam fitted survival curve on a shared time grid, reconstructed from the
     // frozen time basis + beta exactly as the engine evaluates log Λ:

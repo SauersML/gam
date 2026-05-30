@@ -127,19 +127,18 @@ fn gam_gaussian_location_scale_matches_gamlss() {
         .beta
         .clone();
 
-    // ---- evaluate gam's smooths on a dense grid at 100 points --------------
-    // Span the EMPIRICAL data range [min(x), max(x)] rather than [0,1]: the
-    // training x are Uniform(0,1) and never reach the open boundaries, so a
-    // [0,1] grid would force both smoothers to *extrapolate* at the ends, where
-    // thin-plate (gam) and P-spline (gamlss) bases disagree for reasons that
-    // have nothing to do with gam's solver. Restricting to the interpolation
-    // region makes the comparison test the fitted smooth, not boundary policy.
-    let x_lo = x.first().copied().expect("x is non-empty");
-    let x_hi = x.last().copied().expect("x is non-empty");
-    let grid_n = 100usize;
-    let grid_x: Vec<f64> = (0..grid_n)
-        .map(|i| x_lo + (x_hi - x_lo) * (i as f64) / (grid_n as f64 - 1.0))
-        .collect();
+    // ---- evaluate gam's smooths at the TRAINING x (the n fitted points) ----
+    // We compare the two engines at the exact training abscissae rather than a
+    // synthetic dense grid. This (a) keeps the comparison strictly inside the
+    // interpolation region (the training x are Uniform(0,1) and never reach the
+    // open boundaries, so neither thin-plate nor P-spline basis extrapolates),
+    // and (b) lets us read gamlss's recovered smooths off `fitted(m, "mu")` /
+    // `fitted(m, "sigma")` — its fitted values ON the training data — instead of
+    // `predict(newdata=)`, whose smoother-refit path in `predict.gamlss` is
+    // fragile and was erroring here. Both engines are thus scored on the same
+    // x, with each engine's own native evaluation of its fitted smooth.
+    let grid_n = n;
+    let grid_x: Vec<f64> = x.clone();
     let mut grid = Array2::<f64>::zeros((grid_n, ncols));
     for (i, &t) in grid_x.iter().enumerate() {
         grid[[i, x_idx]] = t;
@@ -166,25 +165,24 @@ fn gam_gaussian_location_scale_matches_gamlss() {
 
     // ---- fit the SAME model with gamlss (the mature GAMLSS reference) ------
     // family = NO() (Gaussian with mu + log-sigma), smooth mean and smooth
-    // log-sigma via pb() penalized B-splines, predicted on the identical grid.
-    let grid_csv = grid_x
-        .iter()
-        .map(|t| format!("{t:.17e}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let body = format!(
-        r#"
+    // log-sigma via pb() penalized B-splines. We read the recovered smooths off
+    // the FITTED VALUES on the training data — `fitted(m, "mu")` returns mu(x_i)
+    // on the response scale and `fitted(m, "sigma")` returns sigma(x_i) directly
+    // (the identity-then-log link inside NO() is undone for us) — instead of
+    // `predict(m, newdata=)`, whose smoother-refit machinery in `predict.gamlss`
+    // is fragile (it dereferences the model's `data` slot by name and errored
+    // with "object of type 'closure' is not subsettable" here). The rows of df
+    // are in the SAME order gam sees them, so fitted[i] aligns with x[i].
+    let body = r#"
         suppressPackageStartupMessages(library(gamlss))
         m <- gamlss(y ~ pb(x), sigma.formula = ~ pb(x), family = NO(),
                     data = df, control = gamlss.control(trace = FALSE))
-        gx <- as.numeric(strsplit("{grid_csv}", ",")[[1]])
-        nd <- data.frame(x = gx)
-        mu <- predict(m, what = "mu", newdata = nd, type = "response")
-        sigma <- predict(m, what = "sigma", newdata = nd, type = "response")
+        mu <- fitted(m, "mu")
+        sigma <- fitted(m, "sigma")
         emit("mu", as.numeric(mu))
         emit("sigma", as.numeric(sigma))
         "#
-    );
+    .to_string();
     let r = run_r(&[Column::new("x", &x), Column::new("y", &y)], &body);
     let gamlss_mu = r.vector("mu");
     let gamlss_sigma = r.vector("sigma");
