@@ -364,8 +364,15 @@ impl ResponseFamily {
     /// Per-family textual description of the response-support requirement.
     /// `None` means the family is supported on the entire real line at the
     /// validation layer (Gaussian) or has its support enforced by a downstream
-    /// pathway (Binomial via `is_binary_response` and the PIRLS row kernel;
-    /// RoystonParmar via the survival pipeline).
+    /// pathway (RoystonParmar via the survival pipeline).
+    ///
+    /// `Binomial` is the scalar Bernoulli-logit family: with no per-row trial
+    /// count `mᵢ`, the log-likelihood is `ℓ(η) = y·η − log(1 + eη)`, which is
+    /// unbounded above for `y ∉ {0, 1}` (as `η → ∞`, `ℓ ~ (y − 1)·η`), and the
+    /// binomial deviance term `(1 − y)·log((1 − y)/(1 − μ))` leaves its domain
+    /// for `y > 1`. The family is therefore only well-posed for `y ∈ {0, 1}`,
+    /// which the support check enforces up front rather than deferring to the
+    /// downstream binarity heuristic.
     #[inline]
     pub fn response_support_requirement(&self) -> Option<&'static str> {
         match self {
@@ -374,7 +381,8 @@ impl ResponseFamily {
                 Some("non-negative response values (y ≥ 0)")
             }
             Self::Beta { .. } => Some("response values strictly in the open interval (0, 1)"),
-            Self::Gaussian | Self::Binomial | Self::RoystonParmar => None,
+            Self::Binomial => Some("binary response values (y ∈ {0, 1})"),
+            Self::Gaussian | Self::RoystonParmar => None,
         }
     }
 
@@ -382,8 +390,14 @@ impl ResponseFamily {
     /// support. Only meaningful for families with a non-trivial domain
     /// constraint at the validation layer; `validate_response_support` calls
     /// this only after `response_support_requirement` returns `Some`, so the
-    /// "unconstrained" families (Gaussian / Binomial / RoystonParmar) never
-    /// hit this code path.
+    /// "unconstrained" families (Gaussian / RoystonParmar) never hit this code
+    /// path.
+    ///
+    /// `Binomial` accepts only an (exactly) binary value: `y` must equal `0` or
+    /// `1` to within `BINOMIAL_BINARY_TOL` — the same `{0, 1}` test used by the
+    /// auto-inference and degeneracy paths — because the scalar Bernoulli-logit
+    /// likelihood is unbounded for any other value (see
+    /// `response_support_requirement`).
     #[inline]
     fn response_support_contains(&self, yi: f64) -> bool {
         match self {
@@ -392,7 +406,12 @@ impl ResponseFamily {
                 yi.is_finite() && yi >= 0.0
             }
             Self::Beta { .. } => yi.is_finite() && yi > 0.0 && yi < 1.0,
-            Self::Gaussian | Self::Binomial | Self::RoystonParmar => true,
+            Self::Binomial => {
+                yi.is_finite()
+                    && ((yi - 0.0).abs() < BINOMIAL_BINARY_TOL
+                        || (yi - 1.0).abs() < BINOMIAL_BINARY_TOL)
+            }
+            Self::Gaussian | Self::RoystonParmar => true,
         }
     }
 
@@ -421,8 +440,9 @@ impl ResponseFamily {
     ///
     /// Returns `Ok(())` for families whose support is the entire real line at
     /// this layer (Gaussian) or whose support is enforced by a downstream
-    /// pathway (Binomial via `is_binary_response` + PIRLS, RoystonParmar via
-    /// the survival pipeline).
+    /// pathway (RoystonParmar via the survival pipeline). `Binomial` is
+    /// enforced here: only `y ∈ {0, 1}` keeps the scalar Bernoulli-logit
+    /// likelihood bounded.
     ///
     /// Up to `ResponseSupportViolation::MAX_REPORTED` offending row indices
     /// are returned in the violation so the message stays bounded on large
@@ -485,9 +505,9 @@ impl ResponseFamily {
                 let mut saw_zero = false;
                 let mut saw_one = false;
                 for &yi in y.iter() {
-                    if (yi - 0.0).abs() < 1e-12 {
+                    if (yi - 0.0).abs() < BINOMIAL_BINARY_TOL {
                         saw_zero = true;
-                    } else if (yi - 1.0).abs() < 1e-12 {
+                    } else if (yi - 1.0).abs() < BINOMIAL_BINARY_TOL {
                         saw_one = true;
                     }
                     if saw_zero && saw_one {
@@ -499,9 +519,12 @@ impl ResponseFamily {
                 } else if saw_zero {
                     ResponseDegeneracyKind::BinomialAllZeros
                 } else {
-                    // y is empty or contains no exact 0/1 — defer to the
-                    // existing binarity check downstream rather than claiming
-                    // degeneracy of the saturated-boundary flavour here.
+                    // Reachable only for an empty response: the support check
+                    // (`validate_response_support`) has already rejected any
+                    // non-binary value, so every present `yᵢ` is exactly 0 or 1
+                    // and at least one of `saw_zero`/`saw_one` is set whenever
+                    // `y` is non-empty. An empty response carries no
+                    // saturated-boundary degeneracy, so accept it here.
                     return Ok(());
                 };
                 Err(ResponseDegeneracy {
@@ -567,7 +590,9 @@ impl ResponseFamily {
             ResponseColumnKind::Numeric => {
                 let binary = !y.is_empty()
                     && y.iter().all(|v| {
-                        v.is_finite() && ((*v - 0.0).abs() < 1e-12 || (*v - 1.0).abs() < 1e-12)
+                        v.is_finite()
+                            && ((*v - 0.0).abs() < BINOMIAL_BINARY_TOL
+                                || (*v - 1.0).abs() < BINOMIAL_BINARY_TOL)
                     });
                 if binary {
                     Ok(Self::Binomial)
@@ -631,6 +656,18 @@ impl std::fmt::Display for ResponseSupportViolation {
 }
 
 impl std::error::Error for ResponseSupportViolation {}
+
+/// Absolute tolerance for the exact-`{0, 1}` test that defines the scalar
+/// Bernoulli (`Binomial`) response support.
+///
+/// The scalar `Binomial` family carries no per-row trial count, so its
+/// log-likelihood is the Bernoulli/soft-label cross-entropy
+/// `ℓ(η) = y·η − log(1 + eη)`, which is unbounded above for `y ∉ {0, 1}`.
+/// Both the auto-inference (`infer_from_response`) and degeneracy
+/// (`validate_response_degeneracy`) paths classify a value as binary by the
+/// same `1e-12` window; the support check shares this single threshold so the
+/// three layers agree on exactly which responses are admissible.
+pub const BINOMIAL_BINARY_TOL: f64 = 1.0e-12;
 
 /// Floor on the sample standard deviation of a Gaussian response.
 ///

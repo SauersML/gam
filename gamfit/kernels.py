@@ -81,7 +81,13 @@ def euclidean_cost(points: np.ndarray) -> np.ndarray:
 
 def geodesic_sphere_cost(directions: np.ndarray) -> np.ndarray:
     """Squared great-circle cost on the 2-sphere from ``(M, 3)`` unit
-    vectors. Rows must be unit-norm to within ``1e-6``.
+    vectors.
+
+    Each row must lie within ``1e-6`` of the unit sphere; accepted rows
+    are renormalized to exact unit length before any cosine is formed,
+    so the result is the true squared great-circle distance
+    ``arccos(<x_i/|x_i|, x_j/|x_j|>) ** 2`` with a symmetric, exactly
+    zero diagonal.
     """
     arr = _as_f64_2d("directions", directions)
     if arr.shape[1] != 3:

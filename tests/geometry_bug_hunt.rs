@@ -309,9 +309,17 @@ fn closed_form_less_manifolds_refuse_exp_map_vjp() {
         "Grassmann exp_map_vjp must refuse instead of returning identity grads"
     );
 
-    let st = StiefelManifold::new(1, 3);
+    // St(2, 4) is a genuinely curved Stiefel manifold with no closed-form
+    // geodesic backward (St(n, 1) = S^{n-1} now correctly delegates to the
+    // sphere, which *does* have an analytic VJP, so it is no longer the
+    // closed-form-less case to test here).
+    let st = StiefelManifold::new(2, 4);
+    let p_st = array![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+    let v_st = array![0.0, 0.1, 0.2, 0.3, 0.0, 0.0, 0.4, 0.5];
+    let g_st = array![0.3, -0.4, 0.5, 0.1, -0.2, 0.6, 0.7, -0.8];
     assert!(
-        st.exp_map_vjp(p.view(), v.view(), g.view()).is_err(),
+        st.exp_map_vjp(p_st.view(), v_st.view(), g_st.view())
+            .is_err(),
         "Stiefel exp_map_vjp must refuse instead of returning identity grads"
     );
 

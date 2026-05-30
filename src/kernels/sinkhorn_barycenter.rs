@@ -739,8 +739,18 @@ pub fn euclidean_cost(points: ArrayView2<'_, f64>) -> Result<Array2<f64>, String
 }
 
 /// Squared great-circle (geodesic) distance on the unit 2-sphere from
-/// `(M, 3)` unit direction vectors. Validates approximate unit-norm
-/// to within `1e-6`.
+/// `(M, 3)` direction vectors.
+///
+/// Each row must lie within `1e-6` of the unit sphere; rows that pass
+/// this check are renormalized to exact unit length before any cosine
+/// is formed, so the cost is the true squared great-circle distance
+///
+/// `C_ij = arccos( <x_i/|x_i|, x_j/|x_j|> )^2`
+///
+/// of the projected directions. This guarantees a symmetric matrix
+/// with an exactly-zero diagonal: without renormalization an accepted
+/// row with `|x|^2 = 1 - O(1e-6)` would yield `arccos(<x,x>)^2 > 0` on
+/// the diagonal, contradicting `d(x, x) = 0`.
 pub fn geodesic_sphere_cost(directions: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
     let (m, d) = directions.dim();
     if d != 3 {
@@ -748,8 +758,9 @@ pub fn geodesic_sphere_cost(directions: ArrayView2<'_, f64>) -> Result<Array2<f6
             "geodesic_sphere_cost requires direction vectors of dimension 3, got {d}"
         ));
     }
+    let mut unit = Array2::<f64>::zeros((m, 3));
     for i in 0..m {
-        let mut norm = 0.0_f64;
+        let mut norm_sq = 0.0_f64;
         for k in 0..3 {
             let v = directions[[i, k]];
             if !v.is_finite() {
@@ -757,13 +768,16 @@ pub fn geodesic_sphere_cost(directions: ArrayView2<'_, f64>) -> Result<Array2<f6
                     "geodesic_sphere_cost directions must be finite; got {v} at ({i}, {k})"
                 ));
             }
-            norm += v * v;
+            norm_sq += v * v;
         }
-        if (norm.sqrt() - 1.0).abs() > 1.0e-6 {
+        let norm = norm_sq.sqrt();
+        if (norm - 1.0).abs() > 1.0e-6 {
             return Err(format!(
-                "geodesic_sphere_cost row {i} must be unit-norm; got |x| = {}",
-                norm.sqrt()
+                "geodesic_sphere_cost row {i} must be unit-norm; got |x| = {norm}"
             ));
+        }
+        for k in 0..3 {
+            unit[[i, k]] = directions[[i, k]] / norm;
         }
     }
     let mut out = Array2::<f64>::zeros((m, m));
@@ -771,12 +785,13 @@ pub fn geodesic_sphere_cost(directions: ArrayView2<'_, f64>) -> Result<Array2<f6
         for j in 0..m {
             let mut dot = 0.0_f64;
             for k in 0..3 {
-                dot += directions[[i, k]] * directions[[j, k]];
+                dot += unit[[i, k]] * unit[[j, k]];
             }
             let dot_clamped = dot.clamp(-1.0, 1.0);
             let theta = dot_clamped.acos();
             out[[i, j]] = theta * theta;
         }
+        out[[i, i]] = 0.0;
     }
     Ok(out)
 }
