@@ -98,7 +98,7 @@ mod tests {
     // penalty S = diag(s)). Then H⁻¹ and β are closed-form, so we can check the
     // analytic ∂β/∂ρ against a central finite difference with no linear-algebra
     // dependency.
-    fn diag_setup(lambda: f64) -> (Array2<f64>, Array2<f64>, Array1<f64>, Array1<f64>) {
+    fn diag_setup(lambda: f64) -> (Array2<f64>, Array2<f64>, Array1<f64>) {
         let s = [0.5_f64, 2.0, 0.0, 4.0];
         let b = [1.3_f64, -0.7, 2.1, 0.4]; // XᵀWy
         let p = s.len();
@@ -112,7 +112,7 @@ mod tests {
             h_inv[[i, i]] = 1.0 / h_ii;
             beta[i] = b_arr[i] / h_ii;
         }
-        (penalty, h_inv, beta, b_arr)
+        (penalty, h_inv, beta)
     }
 
     fn beta_at_rho(rho: f64, s: &[f64], b: &[f64]) -> Array1<f64> {
@@ -128,7 +128,7 @@ mod tests {
     fn dbeta_drho_matches_central_finite_difference() {
         let rho = 0.37_f64;
         let lambda = rho.exp();
-        let (penalty, h_inv, beta, _b) = diag_setup(lambda);
+        let (penalty, h_inv, beta) = diag_setup(lambda);
         let analytic = dbeta_drho(h_inv.view(), penalty.view(), beta.view(), lambda);
 
         let s = [0.5_f64, 2.0, 0.0, 4.0];
