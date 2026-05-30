@@ -333,7 +333,6 @@ for lam in lams:
             run.scad_support.len(),
             run.ridge_support.len()
         );
-
     }
 
     // ---- global sparsity-induction check ----------------------------------
