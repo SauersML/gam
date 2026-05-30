@@ -22,11 +22,17 @@
 //!     Λ(t | x) = 0.08 · t · exp(0.4 · x),   so   log Λ(t | x=0) = log(0.08) + log t,
 //!
 //! a strictly increasing function of `log t`. gam recovers `log Λ(t | x=0)`
-//! from its I-spline baseline (covariate held at the mean, x=0). scam fits the
-//! same monotone-increasing curve directly: we form the Nelson–Aalen estimate of
-//! the marginal cumulative hazard `Λ̂(tⱼ)` at the event times, take `log Λ̂`, and
-//! regress it on `log t` with `bs = "mpi"`. Both produce a monotone log-Λ curve;
-//! we compare them pointwise on a common `log t` grid.
+//! from its I-spline baseline (covariate held at x=0). scam fits the *marginal*
+//! curve: we form the Nelson–Aalen estimate of the marginal cumulative hazard
+//! `Λ̂(tⱼ)` (averaged over the empirical `x` distribution) at the event times,
+//! take `log Λ̂`, and regress it on `log t` with `bs = "mpi"`. The two are NOT
+//! the same function — marginalizing `exp(0.4·x)` over `x ~ N(0,1)` shifts the
+//! level and mildly bends the marginal hazard relative to the conditional-at-x=0
+//! baseline — but both are *monotone-increasing in `log t`* with the same
+//! dominant log-linear shape, so they are near-collinear on a `log t` grid.
+//! We therefore compare them with the affine-invariant Pearson correlation
+//! (which absorbs the marginal-vs-baseline level/scale offset and isolates the
+//! shared monotone shape), pointwise on a common `log t` grid.
 //!
 //! What we assert, on the quantities that matter:
 //!   1. gam's fitted baseline is genuinely monotone: the finite-difference
@@ -39,11 +45,14 @@
 //!      non-monotone sampling wiggle in `Λ̂`).
 //!   3. gam's monotone baseline tracks scam's monotone `mpi` smooth: Pearson
 //!      correlation of the two `log Λ` curves on the common `log t` grid ≥ 0.97.
-//!      Both are monotone fits of the same increasing signal, so they must be
-//!      near-collinear; 0.97 is tight enough to catch a real divergence in gam's
-//!      I-spline assembly / inequality solve, yet leaves room for the genuine
-//!      basis difference (gam's I-spline on `log t` knots vs scam's SCOP-spline,
-//!      and gam's likelihood fit vs scam's Gaussian regression on `log Λ̂`).
+//!      Both are monotone fits whose shape is dominated by the same log-linear
+//!      `log t` trend, so they must be near-collinear up to the affine
+//!      marginal-vs-baseline offset that Pearson discards; 0.97 is tight enough
+//!      to catch a real divergence in gam's I-spline assembly / inequality solve
+//!      (a flat, non-monotone, or wrongly-curved baseline drops correlation well
+//!      below it), yet leaves room for the genuine basis/estimand difference
+//!      (gam's I-spline likelihood fit of `log Λ(t|x=0)` vs scam's Gaussian
+//!      SCOP-spline regression of the marginal `log Λ̂`).
 //!
 //! Data: n = 400 synthetic subjects, fixed seed 3141. `x ~ N(0,1)` (deterministic
 //! Box–Muller on a fixed LCG), event time `T ~ Exp(rate = 0.08·exp(0.4·x))`,
@@ -315,10 +324,12 @@ fn gam_monotone_baseline_matches_scam_mpi() {
         rmse_constraint >= 0.05,
         "monotonicity constraint should visibly change the fit: rmse(mpi,ps)={rmse_constraint:.4} < 0.05"
     );
-    // Both gam (I-spline likelihood fit) and scam (mpi regression on log Λ̂)
-    // estimate the same monotone-increasing log Λ curve, so they must be
-    // near-collinear on the grid. 0.97 catches a real divergence in gam's
-    // I-spline/inequality solve while tolerating the basis/fit difference.
+    // gam (I-spline likelihood fit of log Λ(t|x=0)) and scam (mpi regression on
+    // the marginal log Λ̂) fit related but distinct monotone curves whose shape
+    // is dominated by the same log-linear log-t trend; Pearson discards the
+    // affine marginal-vs-baseline offset and isolates that shared shape, so the
+    // two must be near-collinear on the grid. 0.97 catches a real divergence in
+    // gam's I-spline/inequality solve while tolerating the basis/estimand gap.
     assert!(
         corr >= 0.97,
         "gam monotone baseline diverges from scam mpi smooth: pearson={corr:.5} < 0.97"

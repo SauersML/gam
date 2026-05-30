@@ -61,7 +61,8 @@ fn sample_negbin(mu: f64, theta: f64, rng: &mut StdRng) -> f64 {
     let gamma = Gamma::new(theta, mu / theta).expect("gamma params valid");
     let lambda = gamma.sample(rng);
     let pois = Poisson::new(lambda.max(1e-12)).expect("poisson rate valid");
-    pois.sample(rng) as f64
+    // rand_distr 0.6 `Poisson<f64>::sample` already returns the count as f64.
+    pois.sample(rng)
 }
 
 #[test]
