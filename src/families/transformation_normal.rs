@@ -7960,7 +7960,19 @@ impl CustomFamily for TransformationNormalFamily {
         let p_resp = self.response_val_basis.ncols() as u64;
         let p_cov = self.covariate_design.ncols() as u64;
         let expected_p_total = p_resp.saturating_mul(p_cov);
+        // Block-spec preview is optional. Callers without an assembled
+        // ParameterBlockSpec — cost estimators, planners, the
+        // BlockwiseFitOptions screen, every code path that asks "how
+        // expensive would the Hessian be on *this* family?" — pass `&[]`.
+        // The Khatri–Rao layout is fully determined by `p_resp · p_cov`
+        // from the family state, so fall back to `expected_p_total` for
+        // the empty-specs preview rather than returning the `u64::MAX`
+        // unreachable sentinel that would dominate every cost comparison.
+        // When specs IS supplied we still enforce the structural
+        // expectation `spec.design.ncols() == p_resp · p_cov`; a mismatch
+        // is the only condition that legitimately surfaces the sentinel.
         let p_total = match specs {
+            [] => expected_p_total,
             [spec] if spec.design.ncols() as u64 == expected_p_total => spec.design.ncols() as u64,
             _ => return u64::MAX,
         };
