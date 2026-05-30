@@ -1,9 +1,7 @@
 use csv::StringRecord;
 use faer::Side;
 use gam::basis::create_duchon_basis_1d_derivative_dense;
-use gam::bernoulli_marginal_slope::{
-    BernoulliMarginalSlopeFitResult, DeviationRuntime, LatentMeasureKind,
-};
+use gam::bernoulli_marginal_slope::{BernoulliMarginalSlopeFitResult, LatentMeasureKind};
 use gam::estimate::{
     BlockRole, EstimationError, ExternalOptimOptions,
     optimize_external_designwith_heuristic_lambdas, saved_latent_cloglog_state_from_fit,
@@ -52,9 +50,13 @@ use gam::inference::data::{
 use gam::inference::formula_dsl::{ParsedTerm, parse_formula, parse_surv_response};
 use gam::inference::model::{
     ColumnKindTag, DataSchema, FittedFamily, FittedModel, FittedModelPayload, GroupMetadata,
-    MODEL_PAYLOAD_VERSION, ModelKind, PredictModelClass, SavedAnchorComponent, SavedAnchorKind,
-    SavedCompiledFlexBlock, SavedDeploymentExtension, SavedLatentZNormalization, SchemaColumn,
-    append_deployment_extension_columns,
+    MODEL_PAYLOAD_VERSION, ModelKind, PredictModelClass, SavedDeploymentExtension,
+    SavedLatentZNormalization, SchemaColumn, append_deployment_extension_columns,
+};
+use gam::inference::model_payload_builders::{
+    BernoulliMarginalSlopeInputs, SavedModelSourceMetadata, TransformationNormalInputs,
+    assemble_bernoulli_marginal_slope_payload, assemble_transformation_normal_payload,
+    serialize_anchored_deviation_runtime,
 };
 use gam::inference::posterior_bands::{self, PosteriorPredictBandsPayload};
 use gam::inference::predict::input::build_predict_input_for_model;
@@ -7901,8 +7903,13 @@ fn latent_input_location_jet(
                 pyffi_duchon_effective_nullspace_order(centers, requested_nullspace);
             let radial_transform =
                 pyffi_duchon_kernel_constraint_nullspace(centers, effective_nullspace)?;
+            // `build_latent_duchon_design` builds the forward with
+            // `power = 0` and `length_scale = None` (pure scale-free Duchon),
+            // so the radial derivative resolves the same `s = 0` spectrum
+            // (issue #440): the derivative differentiates the exact forward
+            // Green's function rather than a hard-coded surrogate.
             let phi_r =
-                duchon_radial_first_derivative_nd(t_mat, centers, None, effective_nullspace)
+                duchon_radial_first_derivative_nd(t_mat, centers, None, effective_nullspace, 0)
                     .map_err(|err| err.to_string())?;
             let radial_jet = radial_input_location_jet(t_mat, centers, phi_r.view())?;
             let poly_jet = duchon_polynomial_first_derivative_nd(t_mat, effective_nullspace);
@@ -30617,38 +30624,25 @@ fn build_transformation_normal_ffi_payload(
     )
     .map_err(|err| format!("failed to freeze transformation-normal covariate spec: {err}"))?;
 
-    let family = &tn_result.family;
-    let response_transform_rows: Vec<Vec<f64>> = family
-        .response_transform()
-        .rows()
-        .into_iter()
-        .map(|row| row.to_vec())
-        .collect();
-
-    let mut payload = FittedModelPayload::new(
-        MODEL_VERSION,
-        formula,
-        ModelKind::TransformationNormal,
-        FittedFamily::TransformationNormal {
-            likelihood: LikelihoodSpec::new(
-                ResponseFamily::Gaussian,
-                InverseLink::Standard(StandardLink::Identity),
-            ),
+    // Thin adapter over the shared core assembler; the FFI freezes the
+    // covariate spec from its design and reads the offset column from the
+    // FitConfig. See `assemble_transformation_normal_payload`.
+    Ok(assemble_transformation_normal_payload(
+        TransformationNormalInputs {
+            formula,
+            data_schema: dataset.schema.clone(),
+            resolved_covariate_spec: frozen_covariate,
+            fit_result: tn_result.fit.clone(),
+            family: &tn_result.family,
+            score_calibration: tn_result.score_calibration.clone(),
         },
-        "transformation-normal".to_string(),
-    );
-    payload.unified = Some(tn_result.fit.clone());
-    payload.fit_result = Some(tn_result.fit);
-    payload.data_schema = Some(dataset.schema.clone());
-    payload.set_training_feature_metadata(dataset.headers.clone(), dataset.feature_ranges());
-    payload.resolved_termspec = Some(frozen_covariate);
-    payload.transformation_response_knots = Some(family.response_knots().to_vec());
-    payload.transformation_response_transform = Some(response_transform_rows);
-    payload.transformation_response_degree = Some(family.response_degree());
-    payload.transformation_response_median = Some(family.response_median());
-    payload.transformation_score_calibration = Some(tn_result.score_calibration);
-    payload.offset_column = fit_config.offset_column.clone();
-    Ok(payload)
+        SavedModelSourceMetadata {
+            training_headers: dataset.headers.clone(),
+            training_feature_ranges: Some(dataset.feature_ranges()),
+            offset_column: fit_config.offset_column.clone(),
+            noise_offset_column: None,
+        },
+    ))
 }
 
 fn build_bernoulli_marginal_slope_ffi_payload(
@@ -30679,52 +30673,41 @@ fn build_bernoulli_marginal_slope_ffi_payload(
         .clone()
         .ok_or_else(|| "bernoulli marginal-slope requires z_column".to_string())?;
 
-    let likelihood = inverse_link_to_binomial_spec(&base_link).map_err(|e| {
-        format!(
-            "failed to resolve LikelihoodSpec for bernoulli marginal-slope base link {:?}: {e}",
-            base_link
-        )
-    })?;
-
-    let mut payload = FittedModelPayload::new(
-        MODEL_VERSION,
-        formula,
-        ModelKind::MarginalSlope,
-        FittedFamily::MarginalSlope {
-            likelihood,
-            base_link: Some(base_link.clone()),
+    // Thin adapter over the shared core assembler. The FFI's source-specific
+    // work is freezing term collections from their designs, reading the
+    // logslope formula / z column / offset columns from the FitConfig, and
+    // persisting headers without per-feature ranges; the semantic payload is
+    // assembled by the same core path the CLI uses, so the two save routes
+    // produce identical contracts.
+    assemble_bernoulli_marginal_slope_payload(
+        BernoulliMarginalSlopeInputs {
+            formula,
+            data_schema: dataset.schema.clone(),
+            logslope_formula,
+            z_column,
+            resolved_marginalspec: frozen_marginal,
+            resolved_logslopespec: frozen_logslope,
+            fit_result: ms_result.fit.clone(),
+            baseline_marginal: ms_result.baseline_marginal,
+            baseline_logslope: ms_result.baseline_logslope,
+            latent_z_normalization: SavedLatentZNormalization {
+                mean: ms_result.z_normalization.mean,
+                sd: ms_result.z_normalization.sd,
+            },
+            latent_measure: ms_result.latent_measure.clone(),
+            latent_z_rank_int_calibration: ms_result.latent_z_rank_int_calibration.clone(),
+            score_warp_runtime: ms_result.score_warp_runtime.as_ref(),
+            link_dev_runtime: ms_result.link_dev_runtime.as_ref(),
+            base_link,
             frailty,
         },
-        "bernoulli-marginal-slope".to_string(),
-    );
-    payload.unified = Some(ms_result.fit.clone());
-    payload.fit_result = Some(ms_result.fit);
-    payload.data_schema = Some(dataset.schema.clone());
-    payload.formula_logslope = Some(logslope_formula);
-    payload.z_column = Some(z_column);
-    payload.latent_z_normalization = Some(SavedLatentZNormalization {
-        mean: ms_result.z_normalization.mean,
-        sd: ms_result.z_normalization.sd,
-    });
-    payload.latent_measure = Some(ms_result.latent_measure.clone());
-    payload.latent_z_rank_int_calibration = ms_result.latent_z_rank_int_calibration.clone();
-    payload.marginal_baseline = Some(ms_result.baseline_marginal);
-    payload.logslope_baseline = Some(ms_result.baseline_logslope);
-    payload.link = Some(base_link.clone());
-    payload.training_headers = Some(dataset.headers.clone());
-    payload.resolved_termspec = Some(frozen_marginal);
-    payload.resolved_termspec_logslope = Some(frozen_logslope);
-    payload.score_warp_runtime = ms_result
-        .score_warp_runtime
-        .as_ref()
-        .map(saved_anchored_deviation_runtime);
-    payload.link_deviation_runtime = ms_result
-        .link_dev_runtime
-        .as_ref()
-        .map(saved_anchored_deviation_runtime);
-    payload.offset_column = fit_config.offset_column.clone();
-    payload.noise_offset_column = fit_config.noise_offset_column.clone();
-    Ok(payload)
+        SavedModelSourceMetadata {
+            training_headers: dataset.headers.clone(),
+            training_feature_ranges: None,
+            offset_column: fit_config.offset_column.clone(),
+            noise_offset_column: fit_config.noise_offset_column.clone(),
+        },
+    )
 }
 
 fn build_survival_marginal_slope_ffi_payload(
@@ -30875,11 +30858,11 @@ fn build_survival_marginal_slope_ffi_payload(
     payload.score_warp_runtime = ms_result
         .score_warp_runtime
         .as_ref()
-        .map(saved_anchored_deviation_runtime);
+        .map(serialize_anchored_deviation_runtime);
     payload.link_deviation_runtime = ms_result
         .link_dev_runtime
         .as_ref()
-        .map(saved_anchored_deviation_runtime);
+        .map(serialize_anchored_deviation_runtime);
     payload.offset_column = fit_config.offset_column.clone();
     payload.noise_offset_column = fit_config.noise_offset_column.clone();
     Ok(payload)
@@ -31563,69 +31546,6 @@ fn build_latent_window_ffi_payload(
     payload.offset_column = fit_config.offset_column.clone();
     payload.noise_offset_column = fit_config.noise_offset_column.clone();
     Ok(payload)
-}
-
-fn saved_anchored_deviation_runtime(runtime: &DeviationRuntime) -> SavedCompiledFlexBlock {
-    use gam::families::bernoulli_marginal_slope::deviation_runtime::AnchorComponentTag;
-
-    let mut anchor_correction: Option<Vec<Vec<f64>>> = None;
-    let mut anchor_components: Vec<SavedAnchorComponent> = Vec::new();
-    if let Some(installed) = runtime.installed_flex_block() {
-        anchor_correction = Some(
-            installed
-                .anchor_correction
-                .rows()
-                .into_iter()
-                .map(|row| row.to_vec())
-                .collect::<Vec<Vec<f64>>>(),
-        );
-        for component in &installed.anchor_components {
-            anchor_components.push(SavedAnchorComponent {
-                kind: match component {
-                    AnchorComponentTag::Parametric { block, ncols } => {
-                        SavedAnchorKind::Parametric {
-                            block: *block,
-                            ncols: *ncols,
-                        }
-                    }
-                    AnchorComponentTag::FlexEvaluation { ncols } => {
-                        SavedAnchorKind::FlexEvaluation { ncols: *ncols }
-                    }
-                },
-            });
-        }
-    }
-    SavedCompiledFlexBlock {
-        kernel: gam::families::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL.to_string(),
-        breakpoints: runtime.breakpoints().to_vec(),
-        basis_dim: runtime.basis_dim(),
-        span_c0: runtime
-            .span_c0()
-            .rows()
-            .into_iter()
-            .map(|row| row.to_vec())
-            .collect(),
-        span_c1: runtime
-            .span_c1()
-            .rows()
-            .into_iter()
-            .map(|row| row.to_vec())
-            .collect(),
-        span_c2: runtime
-            .span_c2()
-            .rows()
-            .into_iter()
-            .map(|row| row.to_vec())
-            .collect(),
-        span_c3: runtime
-            .span_c3()
-            .rows()
-            .into_iter()
-            .map(|row| row.to_vec())
-            .collect(),
-        anchor_correction,
-        anchor_components,
-    }
 }
 
 fn predict_table_survival(

@@ -756,22 +756,10 @@ impl PirlsRowBackend {
 
     #[cfg(target_os = "linux")]
     fn probe_linux() -> Result<Self, GpuError> {
-        let runtime = super::runtime::GpuRuntime::global().ok_or_else(|| {
-            GpuError::DriverLibraryUnavailable {
-                reason: "pirls_row backend: no CUDA runtime available".to_string(),
-            }
-        })?;
-        let ctx = super::runtime::cuda_context_for(runtime.selected_device().ordinal).ok_or_else(
-            || {
-                gpu_err!(
-                    "pirls_row backend: failed to create CUDA context for device {}",
-                    runtime.selected_device().ordinal
-                )
-            },
-        )?;
+        let parts = super::backend_probe::probe_cuda_backend("pirls_row")?;
         Ok(Self {
             inner: PirlsRowBackendLinux {
-                ctx,
+                ctx: parts.ctx,
                 modules: Mutex::new(std::collections::HashMap::new()),
                 jit_modules: Mutex::new(std::collections::HashMap::new()),
             },

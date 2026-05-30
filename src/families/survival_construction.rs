@@ -1922,6 +1922,110 @@ pub fn baseline_offset_theta_partials(
     }
 }
 
+/// Shared chain-rule θ-gradient contraction for baseline offsets.
+///
+/// Both [`baseline_chain_rule_gradient`] (RP eta offsets) and
+/// [`marginal_slope_baseline_chain_rule_gradient`] (probit q-offsets) reduce to
+/// the same contraction of [`OffsetChannelResiduals`] against per-age baseline
+/// θ-partials; only the `partials` provider differs. This engine owns the length
+/// checks, the θ-dim probe, the parallel per-row reduction, the entry gating, and
+/// the error handling. Each provider returns, per age, a length-`theta_dim` vector
+/// of `(∂eta/∂θ_k, ∂(d eta/dt)/∂θ_k)` pairs (or `(∂q/∂θ_k, ∂(dq/dt)/∂θ_k)` for the
+/// probit channel), and `None` when `cfg` has no θ-parameters (`Linear` target).
+///
+/// Contract (envelope theorem at converged β; the penalty has no θ dependence):
+///
+///   d[0.5·deviance + 0.5·βᵀS_λβ] / dθ_k
+///     = Σᵢ r_X[i]·(∂o_X_i/∂θ_k) + r_D[i]·(∂o_D_i/∂θ_k) + r_E[i]·(∂o_E_i/∂θ_k)
+///
+/// where `r_X = residuals.exit`, `r_D = residuals.derivative`, `r_E =
+/// residuals.entry` (all sampleweight-scaled already). Exit and derivative
+/// partials both come from the `age_exit[i]` evaluation; the entry partial from
+/// `age_entry[i]`. Origin-entry rows have `r_E[i] == 0` exactly, so the entry
+/// partial is skipped for those rows (avoiding the `age > 0` precondition failure
+/// when `age_entry` is 0).
+///
+/// Returns `Ok(None)` when the provider reports no θ-parameters.
+fn baseline_chain_rule_gradient_with_partials<F>(
+    label: &'static str,
+    age_entry: ndarray::ArrayView1<'_, f64>,
+    age_exit: ndarray::ArrayView1<'_, f64>,
+    cfg: &SurvivalBaselineConfig,
+    residuals: &crate::families::survival::OffsetChannelResiduals,
+    partials: F,
+) -> Result<Option<Array1<f64>>, String>
+where
+    F: Fn(f64, &SurvivalBaselineConfig) -> Result<Option<Vec<(f64, f64)>>, String> + Sync,
+{
+    let n = age_exit.len();
+    if age_entry.len() != n
+        || residuals.exit.len() != n
+        || residuals.entry.len() != n
+        || residuals.derivative.len() != n
+    {
+        return Err(format!(
+            "{label}: length mismatch (age_entry={}, age_exit={}, r_exit={}, r_entry={}, r_deriv={})",
+            age_entry.len(),
+            n,
+            residuals.exit.len(),
+            residuals.entry.len(),
+            residuals.derivative.len(),
+        ));
+    }
+    // Probe θ-dim via any valid positive age. If the provider returns None the
+    // config carries no θ-parameters (Linear target) and there is no θ-gradient.
+    let probe_age = age_exit.iter().copied().find(|v| v.is_finite() && *v > 0.0);
+    let theta_dim = match probe_age {
+        Some(t) => match partials(t, cfg)? {
+            None => return Ok(None),
+            Some(v) => v.len(),
+        },
+        None => {
+            return Err(format!("{label}: no valid positive age for dim probe"));
+        }
+    };
+    // Per-row partial contractions are independent. Each iteration produces a
+    // length-`theta_dim` increment vector; rayon's try_fold/try_reduce sums them
+    // and short-circuits on the first Err. Identity = zeros(theta_dim).
+    let grad = (0..n)
+        .into_par_iter()
+        .try_fold(
+            || Array1::<f64>::zeros(theta_dim),
+            |mut acc, i| -> Result<Array1<f64>, String> {
+                // Exit + derivative partials both come from the age_exit evaluation.
+                let partials_exit = partials(age_exit[i], cfg)?
+                    .ok_or_else(|| format!("{label}: unexpected None from partials at exit"))?;
+                if partials_exit.len() != theta_dim {
+                    return Err(format!(
+                        "{label}: theta_dim drifted ({} != {})",
+                        partials_exit.len(),
+                        theta_dim
+                    ));
+                }
+                let r_x = residuals.exit[i];
+                let r_d = residuals.derivative[i];
+                for k in 0..theta_dim {
+                    let (d_eta_dk, d_od_dk) = partials_exit[k];
+                    acc[k] += r_x * d_eta_dk + r_d * d_od_dk;
+                }
+                // Entry channel is nonzero only for rows with a positive entry
+                // interval; for origin-entry rows age_entry may be 0 and calling
+                // the provider would error. Gate on residual==0.
+                let r_e = residuals.entry[i];
+                if r_e != 0.0 {
+                    let partials_entry = partials(age_entry[i], cfg)?
+                        .ok_or_else(|| format!("{label}: unexpected None from partials at entry"))?;
+                    for k in 0..theta_dim {
+                        acc[k] += r_e * partials_entry[k].0;
+                    }
+                }
+                Ok(acc)
+            },
+        )
+        .try_reduce(|| Array1::<f64>::zeros(theta_dim), |a, b| Ok(a + b))?;
+    Ok(Some(grad))
+}
+
 /// Contract `OffsetChannelResiduals` against `baseline_offset_theta_partials`
 /// to produce the closed-form θ-gradient of the unpenalized NLL at converged β.
 ///
@@ -1957,79 +2061,14 @@ pub fn baseline_chain_rule_gradient(
     cfg: &SurvivalBaselineConfig,
     residuals: &crate::families::survival::OffsetChannelResiduals,
 ) -> Result<Option<Array1<f64>>, String> {
-    let n = age_exit.len();
-    if age_entry.len() != n
-        || residuals.exit.len() != n
-        || residuals.entry.len() != n
-        || residuals.derivative.len() != n
-    {
-        return Err(format!(
-            "baseline_chain_rule_gradient: length mismatch (age_entry={}, age_exit={}, r_exit={}, r_entry={}, r_deriv={})",
-            age_entry.len(),
-            n,
-            residuals.exit.len(),
-            residuals.entry.len(),
-            residuals.derivative.len(),
-        ));
-    }
-    // Probe θ-dim via any valid age. If cfg is Linear the probe returns None
-    // and we short-circuit with no θ-gradient.
-    let probe_age = age_exit.iter().copied().find(|v| v.is_finite() && *v > 0.0);
-    let theta_dim = match probe_age {
-        Some(t) => match baseline_offset_theta_partials(t, cfg)? {
-            None => return Ok(None),
-            Some(v) => v.len(),
-        },
-        None => {
-            return Err(
-                "baseline_chain_rule_gradient: no valid positive age for dim probe".to_string(),
-            );
-        }
-    };
-    // Per-row partial contractions are independent. Each iteration produces a
-    // length-`theta_dim` increment vector; rayon's try_fold/try_reduce sums them
-    // and short-circuits on the first Err. Identity = zeros(theta_dim).
-    let grad = (0..n)
-        .into_par_iter()
-        .try_fold(
-            || Array1::<f64>::zeros(theta_dim),
-            |mut acc, i| -> Result<Array1<f64>, String> {
-                let t_exit = age_exit[i];
-                // Exit + derivative partials both come from the age_exit evaluation.
-                let partials_exit = baseline_offset_theta_partials(t_exit, cfg)?
-                    .ok_or_else(|| "unexpected None from baseline partials at exit".to_string())?;
-                if partials_exit.len() != theta_dim {
-                    return Err(format!(
-                        "baseline_chain_rule_gradient: theta_dim drifted ({} != {})",
-                        partials_exit.len(),
-                        theta_dim
-                    ));
-                }
-                let r_x = residuals.exit[i];
-                let r_d = residuals.derivative[i];
-                for k in 0..theta_dim {
-                    let (d_eta_dk, d_od_dk) = partials_exit[k];
-                    acc[k] += r_x * d_eta_dk + r_d * d_od_dk;
-                }
-                // Entry channel is nonzero only for rows with a positive entry
-                // interval; for origin-entry rows age_entry may be 0 and calling
-                // baseline_offset_theta_partials would error. Gate on residual==0.
-                let r_e = residuals.entry[i];
-                if r_e != 0.0 {
-                    let t_entry = age_entry[i];
-                    let partials_entry =
-                        baseline_offset_theta_partials(t_entry, cfg)?.ok_or_else(|| {
-                            "unexpected None from baseline partials at entry".to_string()
-                        })?;
-                    for k in 0..theta_dim {
-                        acc[k] += r_e * partials_entry[k].0;
-                    }
-                }
-                Ok(acc)
-            },
-        )
-        .try_reduce(|| Array1::<f64>::zeros(theta_dim), |a, b| Ok(a + b))?;
-    Ok(Some(grad))
+    baseline_chain_rule_gradient_with_partials(
+        "baseline_chain_rule_gradient",
+        age_entry,
+        age_exit,
+        cfg,
+        residuals,
+        baseline_offset_theta_partials,
+    )
 }
 
 /// Chain-rule θ-gradient for marginal-slope probit baseline offsets.
@@ -2044,82 +2083,14 @@ pub fn marginal_slope_baseline_chain_rule_gradient(
     cfg: &SurvivalBaselineConfig,
     residuals: &crate::families::survival::OffsetChannelResiduals,
 ) -> Result<Option<Array1<f64>>, String> {
-    let n = age_exit.len();
-    if age_entry.len() != n
-        || residuals.exit.len() != n
-        || residuals.entry.len() != n
-        || residuals.derivative.len() != n
-    {
-        return Err(format!(
-            "marginal_slope_baseline_chain_rule_gradient: length mismatch (age_entry={}, age_exit={}, r_exit={}, r_entry={}, r_deriv={})",
-            age_entry.len(),
-            n,
-            residuals.exit.len(),
-            residuals.entry.len(),
-            residuals.derivative.len(),
-        ));
-    }
-
-    let probe_age = age_exit.iter().copied().find(|v| v.is_finite() && *v > 0.0);
-    let theta_dim = match probe_age {
-        Some(t) => match marginal_slope_baseline_offset_theta_partials(t, cfg)? {
-            None => return Ok(None),
-            Some(v) => v.len(),
-        },
-        None => {
-            return Err(
-                "marginal_slope_baseline_chain_rule_gradient: no valid positive age for dim probe"
-                    .to_string(),
-            );
-        }
-    };
-
-    // Per-row residual·partial contraction; rows are independent. Parallel
-    // try_fold/try_reduce sums the per-row Array1 increments and short-circuits
-    // on the first Err propagated by the partials helpers.
-    let grad = (0..n)
-        .into_par_iter()
-        .try_fold(
-            || Array1::<f64>::zeros(theta_dim),
-            |mut acc, i| -> Result<Array1<f64>, String> {
-                let partials_exit = marginal_slope_baseline_offset_theta_partials(
-                    age_exit[i],
-                    cfg,
-                )?
-                .ok_or_else(|| {
-                    "unexpected None from marginal-slope baseline partials at exit".to_string()
-                })?;
-                if partials_exit.len() != theta_dim {
-                    return Err(format!(
-                        "marginal_slope_baseline_chain_rule_gradient: theta_dim drifted ({} != {})",
-                        partials_exit.len(),
-                        theta_dim
-                    ));
-                }
-                let r_x = residuals.exit[i];
-                let r_d = residuals.derivative[i];
-                for k in 0..theta_dim {
-                    let (d_q_dk, d_qt_dk) = partials_exit[k];
-                    acc[k] += r_x * d_q_dk + r_d * d_qt_dk;
-                }
-
-                let r_e = residuals.entry[i];
-                if r_e != 0.0 {
-                    let partials_entry =
-                        marginal_slope_baseline_offset_theta_partials(age_entry[i], cfg)?
-                            .ok_or_else(|| {
-                                "unexpected None from marginal-slope baseline partials at entry"
-                                    .to_string()
-                            })?;
-                    for k in 0..theta_dim {
-                        acc[k] += r_e * partials_entry[k].0;
-                    }
-                }
-                Ok(acc)
-            },
-        )
-        .try_reduce(|| Array1::<f64>::zeros(theta_dim), |a, b| Ok(a + b))?;
-    Ok(Some(grad))
+    baseline_chain_rule_gradient_with_partials(
+        "marginal_slope_baseline_chain_rule_gradient",
+        age_entry,
+        age_exit,
+        cfg,
+        residuals,
+        marginal_slope_baseline_offset_theta_partials,
+    )
 }
 
 /// Shared Gompertz hazard components `(H_G(t), h_G(t))`.
@@ -3839,6 +3810,108 @@ mod tests {
                 expected[k],
                 1e-12,
                 &format!("gm-probit chain gradient theta[{k}]"),
+            );
+        }
+    }
+
+    /// Parity guard for the shared `baseline_chain_rule_gradient_with_partials`
+    /// engine (issue #429): both public gradient functions delegate to it with a
+    /// different partials provider. This test reimplements the pre-unification
+    /// inline contraction (the serial reference) and asserts bit-for-bit equality
+    /// against the unified engine's output for BOTH providers on the same data —
+    /// the RP-eta provider (`baseline_offset_theta_partials`) and the probit-q
+    /// provider (`marginal_slope_baseline_offset_theta_partials`). Any drift in
+    /// the extracted contraction (length checks, theta-dim probe, exit/derivative
+    /// combination, or entry gating) breaks this with an exact (0.0) tolerance.
+    #[test]
+    fn baseline_chain_rule_gradient_engine_matches_inline_reference() {
+        assert!(file!().ends_with(".rs"));
+        let cfg = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::GompertzMakeham,
+            scale: None,
+            shape: Some(0.028),
+            rate: Some(0.011),
+            makeham: Some(0.0025),
+        };
+        // Mixed entry interval: row 1 is origin-entry (age_entry==0, r_entry==0)
+        // to exercise the entry-gating branch in the shared engine.
+        let age_entry = array![3.0, 0.0, 5.5];
+        let age_exit = array![8.0, 12.0, 16.0];
+        let residuals = OffsetChannelResiduals {
+            exit: array![0.7, -0.2, 0.45],
+            entry: array![0.1, 0.0, -0.3],
+            derivative: array![1.3, -0.6, 0.2],
+        };
+
+        // Serial reference contraction matching the original inline body. Mirrors
+        // the engine's exit+derivative/entry split and origin-entry gating.
+        let reference_gradient = |partials: &dyn Fn(
+            f64,
+            &SurvivalBaselineConfig,
+        )
+            -> Result<Option<Vec<(f64, f64)>>, String>|
+         -> Array1<f64> {
+            let theta_dim = partials(age_exit[0], &cfg)
+                .expect("probe partials")
+                .expect("nonlinear")
+                .len();
+            let mut acc = Array1::<f64>::zeros(theta_dim);
+            for i in 0..age_exit.len() {
+                let p_exit = partials(age_exit[i], &cfg)
+                    .expect("exit partials")
+                    .expect("nonlinear");
+                let r_x = residuals.exit[i];
+                let r_d = residuals.derivative[i];
+                for k in 0..theta_dim {
+                    acc[k] += r_x * p_exit[k].0 + r_d * p_exit[k].1;
+                }
+                let r_e = residuals.entry[i];
+                if r_e != 0.0 {
+                    let p_entry = partials(age_entry[i], &cfg)
+                        .expect("entry partials")
+                        .expect("nonlinear");
+                    for k in 0..theta_dim {
+                        acc[k] += r_e * p_entry[k].0;
+                    }
+                }
+            }
+            acc
+        };
+
+        // RP-eta provider parity.
+        let rp_engine =
+            baseline_chain_rule_gradient(age_entry.view(), age_exit.view(), &cfg, &residuals)
+                .expect("rp gradient")
+                .expect("rp nonlinear");
+        let rp_reference = reference_gradient(&baseline_offset_theta_partials);
+        assert_eq!(rp_engine.len(), rp_reference.len());
+        for k in 0..rp_engine.len() {
+            assert_close(
+                rp_engine[k],
+                rp_reference[k],
+                0.0,
+                &format!("rp engine vs inline reference theta[{k}]"),
+            );
+        }
+
+        // Probit-q provider parity.
+        let probit_engine = marginal_slope_baseline_chain_rule_gradient(
+            age_entry.view(),
+            age_exit.view(),
+            &cfg,
+            &residuals,
+        )
+        .expect("probit gradient")
+        .expect("probit nonlinear");
+        let probit_reference =
+            reference_gradient(&marginal_slope_baseline_offset_theta_partials);
+        assert_eq!(probit_engine.len(), probit_reference.len());
+        for k in 0..probit_engine.len() {
+            assert_close(
+                probit_engine[k],
+                probit_reference[k],
+                0.0,
+                &format!("probit engine vs inline reference theta[{k}]"),
             );
         }
     }

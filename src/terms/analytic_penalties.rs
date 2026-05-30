@@ -106,10 +106,7 @@ use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayViewMut1, Cow
 use std::sync::{Arc, RwLock};
 
 use crate::linalg::faer_ndarray::{FaerEigh, FaerSvd};
-use crate::terms::basis::{
-    BasisError, DuchonNullspaceOrder, duchon_radial_first_derivative_nd,
-    duchon_radial_second_derivative_nd, duchon_radial_third_derivative_nd,
-};
+use crate::terms::basis::{BasisError, DuchonNullspaceOrder, radial_basis_cartesian_derivative};
 use crate::terms::penalties::PenaltyManifest;
 use crate::terms::penalty_op::PenaltyOp;
 use crate::terms::sae_manifold::{GumbelTemperatureSchedule, ScheduleKind};
@@ -498,6 +495,12 @@ pub struct IsometryDuchonRadialSource {
     pub radial_coefficients: Arc<Array2<f64>>,
     pub length_scale: Option<f64>,
     pub nullspace_order: DuchonNullspaceOrder,
+    /// Forward hybrid spectral order `s = spec.power`. The Cartesian
+    /// derivative engine must resolve the same `(p, s, κ)` the forward
+    /// `build_duchon_basis` used, so it differentiates the exact resolved
+    /// hybrid Green's function `φ_{p,s,κ}` rather than a hard-coded `s = 0`
+    /// surrogate (issue #440).
+    pub power: usize,
 }
 
 impl std::fmt::Debug for WeightField {
@@ -584,8 +587,8 @@ impl WeightField {
 ///
 /// The per-row Jacobian `J_n` is exactly the radial-derivative jet
 /// `design_gradient_wrt_t` already computes for `LatentCoordValues`; the
-/// second derivative `∂J/∂t` is rebuilt from
-/// [`crate::terms::basis::duchon_radial_second_derivative_nd`] using the
+/// second derivative `∂J/∂t` is built by the shared
+/// [`crate::terms::basis::radial_basis_cartesian_derivative`] engine from the
 /// radial Hessian identity. A finite-difference oracle for the docstring is
 /// to central-difference `value(t ± h e_j)` against `grad_target(t)[j]`;
 /// the analytic value follows the oracle until finite-difference
@@ -967,6 +970,13 @@ impl IsometryPenalty {
         out
     }
 
+    /// Second-order input-location derivative tensor of the Duchon decoder,
+    /// flattened to `(n_obs, p_out · d²)` with column layout
+    /// `i·d² + (a·d + c)`.
+    ///
+    /// Thin adapter over the shared [`radial_basis_cartesian_derivative`]
+    /// engine: it owns the radial-jet evaluation and the radial→Cartesian map;
+    /// here we only forward the source geometry.
     fn duchon_radial_jacobian_second(
         &self,
         target: ArrayView1<'_, f64>,
@@ -974,59 +984,28 @@ impl IsometryPenalty {
         d: usize,
         source: &IsometryDuchonRadialSource,
     ) -> Result<Array2<f64>, BasisError> {
-        let t = Self::target_matrix(target, n_obs, d);
-        let phi_r = duchon_radial_first_derivative_nd(
-            t.view(),
-            source.centers.view(),
-            source.length_scale,
-            source.nullspace_order,
-        )?;
-        let phi_rr = duchon_radial_second_derivative_nd(
-            t.view(),
-            source.centers.view(),
-            source.length_scale,
-            source.nullspace_order,
-        )?;
-        let n_centers = source.centers.nrows();
         assert_eq!(source.centers.ncols(), d);
-        assert_eq!(source.radial_coefficients.nrows(), n_centers);
+        assert_eq!(source.radial_coefficients.nrows(), source.centers.nrows());
         assert_eq!(source.radial_coefficients.ncols(), self.p_out);
-
-        let mut out = Array2::<f64>::zeros((n_obs, self.p_out * d * d));
-        for n in 0..n_obs {
-            for k in 0..n_centers {
-                let mut r2 = 0.0_f64;
-                for a in 0..d {
-                    let delta = t[[n, a]] - source.centers[[k, a]];
-                    r2 += delta * delta;
-                }
-                let r = r2.sqrt();
-                for a in 0..d {
-                    for c in 0..d {
-                        let basis_hess = if r == 0.0 {
-                            if a == c { phi_rr[[n, k]] } else { 0.0 }
-                        } else {
-                            let inv_r = 1.0 / r;
-                            let u_a = (t[[n, a]] - source.centers[[k, a]]) * inv_r;
-                            let u_c = (t[[n, c]] - source.centers[[k, c]]) * inv_r;
-                            let q = phi_r[[n, k]] * inv_r;
-                            let eye = if a == c { 1.0 } else { 0.0 };
-                            q * eye + (phi_rr[[n, k]] - q) * u_a * u_c
-                        };
-                        if basis_hess == 0.0 {
-                            continue;
-                        }
-                        for i in 0..self.p_out {
-                            out[[n, (i * d + a) * d + c]] +=
-                                source.radial_coefficients[[k, i]] * basis_hess;
-                        }
-                    }
-                }
-            }
-        }
-        Ok(out)
+        let t = Self::target_matrix(target, n_obs, d);
+        radial_basis_cartesian_derivative(
+            2,
+            t.view(),
+            source.centers.view(),
+            source.radial_coefficients.view(),
+            source.length_scale,
+            source.nullspace_order,
+            source.power,
+        )
     }
 
+    /// Third-order input-location derivative tensor of the Duchon decoder,
+    /// shaped `(n_obs, p_out, d³)` with last-axis layout `(a·d + c)·d + e`.
+    ///
+    /// Thin adapter over the shared [`radial_basis_cartesian_derivative`]
+    /// engine; the flat `(n_obs, p_out · d³)` result is reshaped to the
+    /// `Array3` consumed by the HVP path (row-major flatten of `(p_out, d³)`
+    /// is exactly `i·d³ + idx`).
     fn duchon_radial_jacobian_third(
         &self,
         target: ArrayView1<'_, f64>,
@@ -1034,71 +1013,22 @@ impl IsometryPenalty {
         d: usize,
         source: &IsometryDuchonRadialSource,
     ) -> Result<ndarray::Array3<f64>, BasisError> {
-        let t = Self::target_matrix(target, n_obs, d);
-        let phi_r = duchon_radial_first_derivative_nd(
-            t.view(),
-            source.centers.view(),
-            source.length_scale,
-            source.nullspace_order,
-        )?;
-        let phi_rr = duchon_radial_second_derivative_nd(
-            t.view(),
-            source.centers.view(),
-            source.length_scale,
-            source.nullspace_order,
-        )?;
-        let phi_rrr = duchon_radial_third_derivative_nd(
-            t.view(),
-            source.centers.view(),
-            source.length_scale,
-            source.nullspace_order,
-        )?;
-        let n_centers = source.centers.nrows();
         assert_eq!(source.centers.ncols(), d);
-        assert_eq!(source.radial_coefficients.nrows(), n_centers);
+        assert_eq!(source.radial_coefficients.nrows(), source.centers.nrows());
         assert_eq!(source.radial_coefficients.ncols(), self.p_out);
-
-        let mut out = ndarray::Array3::<f64>::zeros((n_obs, self.p_out, d * d * d));
-        for n in 0..n_obs {
-            for k in 0..n_centers {
-                let mut r2 = 0.0_f64;
-                for a in 0..d {
-                    let delta = t[[n, a]] - source.centers[[k, a]];
-                    r2 += delta * delta;
-                }
-                let r = r2.sqrt();
-                if r == 0.0 {
-                    continue;
-                }
-                let inv_r = 1.0 / r;
-                let q = phi_r[[n, k]] * inv_r;
-                let b_coef = (phi_rr[[n, k]] - q) * inv_r;
-                let a_coef = phi_rrr[[n, k]] - 3.0 * b_coef;
-                for a in 0..d {
-                    let u_a = (t[[n, a]] - source.centers[[k, a]]) * inv_r;
-                    for c in 0..d {
-                        let u_c = (t[[n, c]] - source.centers[[k, c]]) * inv_r;
-                        for dd in 0..d {
-                            let u_d = (t[[n, dd]] - source.centers[[k, dd]]) * inv_r;
-                            let eye_ac = if a == c { 1.0 } else { 0.0 };
-                            let eye_ad = if a == dd { 1.0 } else { 0.0 };
-                            let eye_cd = if c == dd { 1.0 } else { 0.0 };
-                            let basis_third = a_coef * u_a * u_c * u_d
-                                + b_coef * (eye_ac * u_d + eye_ad * u_c + eye_cd * u_a);
-                            if basis_third == 0.0 {
-                                continue;
-                            }
-                            let idx = ((a * d) + c) * d + dd;
-                            for i in 0..self.p_out {
-                                out[[n, i, idx]] +=
-                                    source.radial_coefficients[[k, i]] * basis_third;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(out)
+        let t = Self::target_matrix(target, n_obs, d);
+        let flat = radial_basis_cartesian_derivative(
+            3,
+            t.view(),
+            source.centers.view(),
+            source.radial_coefficients.view(),
+            source.length_scale,
+            source.nullspace_order,
+            source.power,
+        )?;
+        Ok(flat
+            .into_shape_with_order((n_obs, self.p_out, d * d * d))
+            .expect("radial_basis_cartesian_derivative order-3 output reshapes to (n_obs, p, d³)"))
     }
 
     fn jacobian_second<'a>(
@@ -1479,16 +1409,16 @@ impl AnalyticPenalty for IsometryPenalty {
         grad
     }
 
-    /// Fully analytic - wired through `duchon_radial_third_derivative_nd`.
+    /// Fully analytic - wired through `radial_basis_cartesian_derivative`.
     fn hvp(
         &self,
         target: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        // Fully analytic isometry Hessian-vector product wired through
-        // duchon_radial_third_derivative_nd when no third-derivative cache is
-        // supplied.
+        // Fully analytic isometry Hessian-vector product wired through the
+        // shared `radial_basis_cartesian_derivative` engine when no
+        // third-derivative cache is supplied.
         //
         // The full Hessian of P_iso = (μ/2) Σ_n ||J^T W J - G_ref||²_F
         // (per proposal §4(b)) is

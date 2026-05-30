@@ -8,6 +8,7 @@
 
 pub mod arrow_schur;
 pub mod arrow_schur_nvrtc;
+pub mod backend_probe;
 pub mod blas;
 pub mod bms_flex;
 pub mod bms_flex_row;

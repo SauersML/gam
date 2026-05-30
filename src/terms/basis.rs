@@ -20980,6 +20980,7 @@ fn duchon_radial_jets_nd(
     centers: ArrayView2<'_, f64>,
     length_scale: Option<f64>,
     nullspace_order: DuchonNullspaceOrder,
+    power: usize,
     caller: &str,
 ) -> Result<DuchonRadialJetsNd, BasisError> {
     let n_rows = t.nrows();
@@ -20997,15 +20998,25 @@ fn duchon_radial_jets_nd(
     );
     let effective_order = duchon_effective_nullspace_order(centers, nullspace_order);
     let p_order = duchon_p_from_nullspace_order(effective_order);
-    // Hybrid Matérn-tail order. The latent-coord / isometry helpers
-    // conservatively use s_order = 0 (pure polyharmonic), matching the 1-D
-    // `position_basis_*` entry points and the configuration the LatentCoord
-    // prototype targets.
-    let s_order: usize = 0;
-    // Partial-fraction coefficients; for `s_order = 0` this is the trivial
-    // `a_p = 1` case.
+    // Resolve the same hybrid `(p, s, κ)` triple the forward `build_duchon_basis`
+    // uses, so the radial jets differentiate the *exact* forward Green's
+    // function `φ_{p,s,κ}` rather than a hard-coded `s = 0` surrogate
+    // (issue #440). `power` is the forward spectral order `s = spec.power`.
+    //
+    //   * Hybrid (`length_scale = Some`): spectrum `‖w‖^{2p}(κ²+‖w‖²)^s`, built
+    //     from the integer partial-fraction blocks at the real κ = 1/length_scale.
+    //   * Pure scale-free (`length_scale = None`): the forward kernel collapses
+    //     to the polyharmonic of total order `p + s` (`pure_duchon_block_order`,
+    //     `duchon_matern_kernel_general_from_distance`'s `None` branch). Folding
+    //     `s` into the polyharmonic order (`s_jets = 0`, `a_{p+s} = 1`) makes the
+    //     operator core κ-independent and reproduces that exact kernel and all
+    //     of its radial derivatives.
+    let (jet_p_order, s_order) = match length_scale {
+        Some(_) => (p_order, power),
+        None => (p_order + power, 0usize),
+    };
     let kappa = length_scale.map(|l| 1.0 / l.max(1e-300)).unwrap_or(0.0);
-    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
+    let coeffs = duchon_partial_fraction_coeffs(jet_p_order, s_order, kappa);
     let effective_length_scale = duchon_effective_length_scale(length_scale, centers);
 
     let mut phi_r = Array2::<f64>::zeros((n_rows, n_centers));
@@ -21027,8 +21038,14 @@ fn duchon_radial_jets_nd(
                 r2 += dv * dv;
             }
             let r = r2.sqrt();
-            let jets =
-                duchon_radial_jets(r, effective_length_scale, p_order, s_order, dim, &coeffs)?;
+            let jets = duchon_radial_jets(
+                r,
+                effective_length_scale,
+                jet_p_order,
+                s_order,
+                dim,
+                &coeffs,
+            )?;
             phi_r[[n, k]] = jets.phi_r;
             if max_order >= 2 {
                 phi_rr[[n, k]] = jets.phi_rr;
@@ -21073,6 +21090,7 @@ pub(crate) fn radial_basis_cartesian_derivative(
     coeffs: ArrayView2<'_, f64>,
     length_scale: Option<f64>,
     nullspace_order: DuchonNullspaceOrder,
+    power: usize,
 ) -> Result<Array2<f64>, BasisError> {
     assert!(
         order == 2 || order == 3,
@@ -21094,6 +21112,7 @@ pub(crate) fn radial_basis_cartesian_derivative(
         centers,
         length_scale,
         nullspace_order,
+        power,
         "radial_basis_cartesian_derivative",
     )?;
     let d_pow = d.pow(order as u32);
@@ -21188,6 +21207,7 @@ pub fn duchon_radial_first_derivative_nd(
     centers: ArrayView2<'_, f64>,
     length_scale: Option<f64>,
     nullspace_order: DuchonNullspaceOrder,
+    power: usize,
 ) -> Result<Array2<f64>, BasisError> {
     Ok(duchon_radial_jets_nd(
         1,
@@ -21195,6 +21215,7 @@ pub fn duchon_radial_first_derivative_nd(
         centers,
         length_scale,
         nullspace_order,
+        power,
         "duchon_radial_first_derivative_nd",
     )?
     .phi_r)
@@ -21226,6 +21247,7 @@ pub fn duchon_radial_second_derivative_nd(
     centers: ArrayView2<'_, f64>,
     length_scale: Option<f64>,
     nullspace_order: DuchonNullspaceOrder,
+    power: usize,
 ) -> Result<Array2<f64>, BasisError> {
     Ok(duchon_radial_jets_nd(
         2,
@@ -21233,6 +21255,7 @@ pub fn duchon_radial_second_derivative_nd(
         centers,
         length_scale,
         nullspace_order,
+        power,
         "duchon_radial_second_derivative_nd",
     )?
     .phi_rr)
@@ -21251,6 +21274,7 @@ pub fn duchon_radial_third_derivative_nd(
     centers: ArrayView2<'_, f64>,
     length_scale: Option<f64>,
     nullspace_order: DuchonNullspaceOrder,
+    power: usize,
 ) -> Result<Array2<f64>, BasisError> {
     Ok(duchon_radial_jets_nd(
         3,
@@ -21258,6 +21282,7 @@ pub fn duchon_radial_third_derivative_nd(
         centers,
         length_scale,
         nullspace_order,
+        power,
         "duchon_radial_third_derivative_nd",
     )?
     .phi_rrr)
@@ -21485,7 +21510,7 @@ pub fn duchon_sae_atom_basis_with_jet(
     }
 
     // Input-location first jet, scaled by the *same* `α` on the kernel block.
-    let radial_first = duchon_radial_first_derivative_nd(t, centers, None, effective_order)?;
+    let radial_first = duchon_radial_first_derivative_nd(t, centers, None, effective_order, 0)?;
     let radial_jet = radial_input_location_jet_nd(t, centers, radial_first.view())?;
     let poly_jet = duchon_polynomial_first_derivative_nd(t, effective_order);
     if poly_jet.shape()[1] != n_poly {
@@ -21558,8 +21583,8 @@ pub fn duchon_sae_atom_second_jet(
 
     let n_rows = t.nrows();
     let n_centers = centers.nrows();
-    let radial_first = duchon_radial_first_derivative_nd(t, centers, None, effective_order)?;
-    let radial_second = duchon_radial_second_derivative_nd(t, centers, None, effective_order)?;
+    let radial_first = duchon_radial_first_derivative_nd(t, centers, None, effective_order, 0)?;
+    let radial_second = duchon_radial_second_derivative_nd(t, centers, None, effective_order, 0)?;
 
     let poly_block_t_cols = polynomial_block_from_order(t, effective_order).ncols();
 
@@ -35883,6 +35908,11 @@ mod tests {
         ];
         let length_scale = Some(0.8_f64);
         let nullspace_order = DuchonNullspaceOrder::Linear;
+        // Hybrid spectral order s = power: with p = 1 (Linear) and d = 3 the
+        // hybrid kernel `‖w‖^{2p}(κ²+‖w‖²)^s` needs `2(p+s) > d`, i.e. s ≥ 1.
+        // Both the direct radial adapters and the Cartesian engine must resolve
+        // the *same* `(p, s, κ)` (issue #440), so they share `power` here.
+        let power = 1usize;
 
         // Independent radial derivative matrices via the public adapters.
         let phi_r = duchon_radial_first_derivative_nd(
@@ -35890,6 +35920,7 @@ mod tests {
             centers.view(),
             length_scale,
             nullspace_order,
+            power,
         )
         .expect("phi_r");
         let phi_rr = duchon_radial_second_derivative_nd(
@@ -35897,6 +35928,7 @@ mod tests {
             centers.view(),
             length_scale,
             nullspace_order,
+            power,
         )
         .expect("phi_rr");
         let phi_rrr = duchon_radial_third_derivative_nd(
@@ -35904,6 +35936,7 @@ mod tests {
             centers.view(),
             length_scale,
             nullspace_order,
+            power,
         )
         .expect("phi_rrr");
 
@@ -35946,6 +35979,7 @@ mod tests {
             coeffs.view(),
             length_scale,
             nullspace_order,
+            power,
         )
         .expect("shared order-2");
         assert_eq!(shared2.dim(), legacy2.dim());
@@ -36005,6 +36039,7 @@ mod tests {
             coeffs.view(),
             length_scale,
             nullspace_order,
+            power,
         )
         .expect("shared order-3");
         let shared3 = shared3_flat

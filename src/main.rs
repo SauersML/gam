@@ -46,6 +46,11 @@ use gam::inference::model::{
     MODEL_PAYLOAD_VERSION, ModelKind, PredictModelClass, SavedCompiledFlexBlock,
     SavedLatentZNormalization, load_survival_time_basis_config_from_model,
 };
+use gam::inference::model_payload_builders::{
+    BernoulliMarginalSlopeInputs, SavedModelSourceMetadata, TransformationNormalInputs,
+    assemble_bernoulli_marginal_slope_payload, assemble_transformation_normal_payload,
+    serialize_anchored_deviation_runtime,
+};
 use gam::inference::predict::input::build_predict_input_for_model;
 use gam::inference::predict::linalg::{PredictionCovarianceBackend, rowwise_local_covariances};
 use gam::inference::smooth_test::{SmoothTestInput, wood_smooth_test};
@@ -5320,9 +5325,11 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             payload.score_warp_runtime = fit
                 .score_warp_runtime
                 .as_ref()
-                .map(saved_compiled_flex_block);
-            payload.link_deviation_runtime =
-                fit.link_dev_runtime.as_ref().map(saved_compiled_flex_block);
+                .map(serialize_anchored_deviation_runtime);
+            payload.link_deviation_runtime = fit
+                .link_dev_runtime
+                .as_ref()
+                .map(serialize_anchored_deviation_runtime);
             write_payload_json(&out, payload)?;
             progress.advance_workflow(survival_total_steps);
         }
@@ -7352,70 +7359,6 @@ fn build_location_scale_saved_model(
     SavedModel::from_payload(payload)
 }
 
-fn saved_compiled_flex_block(runtime: &DeviationRuntime) -> SavedCompiledFlexBlock {
-    use gam::families::bernoulli_marginal_slope::deviation_runtime::AnchorComponentTag;
-    use gam::inference::model::{SavedAnchorComponent, SavedAnchorKind};
-
-    let mut anchor_correction: Option<Vec<Vec<f64>>> = None;
-    let mut anchor_components: Vec<SavedAnchorComponent> = Vec::new();
-    if let Some(installed) = runtime.installed_flex_block() {
-        anchor_correction = Some(
-            installed
-                .anchor_correction
-                .rows()
-                .into_iter()
-                .map(|row| row.to_vec())
-                .collect::<Vec<Vec<f64>>>(),
-        );
-        for component in &installed.anchor_components {
-            anchor_components.push(SavedAnchorComponent {
-                kind: match component {
-                    AnchorComponentTag::Parametric { block, ncols } => {
-                        SavedAnchorKind::Parametric {
-                            block: *block,
-                            ncols: *ncols,
-                        }
-                    }
-                    AnchorComponentTag::FlexEvaluation { ncols } => {
-                        SavedAnchorKind::FlexEvaluation { ncols: *ncols }
-                    }
-                },
-            });
-        }
-    }
-    SavedCompiledFlexBlock {
-        kernel: exact_kernel::ANCHORED_DEVIATION_KERNEL.to_string(),
-        breakpoints: runtime.breakpoints().to_vec(),
-        basis_dim: runtime.basis_dim(),
-        span_c0: runtime
-            .span_c0()
-            .rows()
-            .into_iter()
-            .map(|row| row.to_vec())
-            .collect(),
-        span_c1: runtime
-            .span_c1()
-            .rows()
-            .into_iter()
-            .map(|row| row.to_vec())
-            .collect(),
-        span_c2: runtime
-            .span_c2()
-            .rows()
-            .into_iter()
-            .map(|row| row.to_vec())
-            .collect(),
-        span_c3: runtime
-            .span_c3()
-            .rows()
-            .into_iter()
-            .map(|row| row.to_vec())
-            .collect(),
-        anchor_correction,
-        anchor_components,
-    }
-}
-
 fn deviation_block_config_from_formula_linkwiggle(
     wiggle: &LinkWiggleFormulaSpec,
 ) -> Result<DeviationBlockConfig, String> {
@@ -7663,54 +7606,40 @@ fn build_bernoulli_marginal_slope_saved_model(
     base_link: InverseLink,
     frailty: gam::families::lognormal_kernel::FrailtySpec,
 ) -> Result<SavedModel, String> {
-    let marginal_likelihood_spec =
-        inverse_link_to_binomial_spec(&base_link).map_err(|e| e.to_string())?;
-    let mut payload = FittedModelPayload::new(
-        MODEL_VERSION,
-        formula,
-        ModelKind::MarginalSlope,
-        FittedFamily::MarginalSlope {
-            likelihood: marginal_likelihood_spec,
-            base_link: Some(base_link.clone()),
+    // Thin adapter over the shared core assembler. Everything semantic — the
+    // singular/vector mirror fields, the flex-runtime serialization, the
+    // likelihood resolution — lives in
+    // `gam::inference::model_payload_builders` so the CLI- and Python-created
+    // payloads are identical by construction. The CLI's only source-specific
+    // contribution here is per-feature training ranges (the FFI path persists
+    // headers without them); the caller applies offset columns to the returned
+    // model.
+    let payload = assemble_bernoulli_marginal_slope_payload(
+        BernoulliMarginalSlopeInputs {
+            formula,
+            data_schema,
+            logslope_formula,
+            z_column,
+            resolved_marginalspec,
+            resolved_logslopespec,
+            fit_result,
+            baseline_marginal,
+            baseline_logslope,
+            latent_z_normalization,
+            latent_measure,
+            latent_z_rank_int_calibration,
+            score_warp_runtime,
+            link_dev_runtime,
+            base_link,
             frailty,
         },
-        FAMILY_BERNOULLI_MARGINAL_SLOPE.to_string(),
-    );
-    payload.unified = Some(fit_result.clone());
-    payload.fit_result = Some(fit_result);
-    payload.data_schema = Some(data_schema);
-    payload.formula_logslope = Some(logslope_formula);
-    payload.z_column = Some(z_column);
-    payload.formula_logslopes = Some(vec![
-        payload
-            .formula_logslope
-            .as_ref()
-            .expect("formula_logslope just set")
-            .clone(),
-    ]);
-    payload.z_columns = Some(vec![
-        payload
-            .z_column
-            .as_ref()
-            .expect("z_column just set")
-            .clone(),
-    ]);
-    payload.latent_z_normalization = Some(latent_z_normalization);
-    payload.latent_measure = Some(latent_measure);
-    payload.latent_z_rank_int_calibration = latent_z_rank_int_calibration;
-    payload.marginal_baseline = Some(baseline_marginal);
-    payload.logslope_baseline = Some(baseline_logslope);
-    payload.logslope_baselines = Some(vec![baseline_logslope]);
-    payload.link = Some(base_link.clone());
-    payload.set_training_feature_metadata(training_headers, training_feature_ranges);
-    payload.resolved_termspec = Some(resolved_marginalspec);
-    payload.resolved_termspec_logslope = Some(resolved_logslopespec);
-    payload.resolved_termspec_logslopes = payload
-        .resolved_termspec_logslope
-        .as_ref()
-        .map(|spec| vec![spec.clone()]);
-    payload.score_warp_runtime = score_warp_runtime.map(saved_compiled_flex_block);
-    payload.link_deviation_runtime = link_dev_runtime.map(saved_compiled_flex_block);
+        SavedModelSourceMetadata {
+            training_headers,
+            training_feature_ranges: Some(training_feature_ranges),
+            offset_column: None,
+            noise_offset_column: None,
+        },
+    )?;
     Ok(SavedModel::from_payload(payload))
 }
 
@@ -7760,35 +7689,25 @@ fn build_transformation_normal_saved_model(
     family: &gam::families::transformation_normal::TransformationNormalFamily,
     score_calibration: gam::inference::model::TransformationScoreCalibration,
 ) -> SavedModel {
-    let mut payload = FittedModelPayload::new(
-        MODEL_VERSION,
-        formula,
-        ModelKind::TransformationNormal,
-        FittedFamily::TransformationNormal {
-            likelihood: LikelihoodSpec::new(
-                ResponseFamily::Gaussian,
-                InverseLink::Standard(StandardLink::Identity),
-            ),
+    // Thin adapter over the shared core assembler; the CLI supplies per-feature
+    // training ranges and no offset columns. See
+    // `assemble_transformation_normal_payload`.
+    let payload = assemble_transformation_normal_payload(
+        TransformationNormalInputs {
+            formula,
+            data_schema,
+            resolved_covariate_spec,
+            fit_result,
+            family,
+            score_calibration,
         },
-        FAMILY_TRANSFORMATION_NORMAL.to_string(),
+        SavedModelSourceMetadata {
+            training_headers,
+            training_feature_ranges: Some(training_feature_ranges),
+            offset_column: None,
+            noise_offset_column: None,
+        },
     );
-    payload.unified = Some(fit_result.clone());
-    payload.fit_result = Some(fit_result);
-    payload.data_schema = Some(data_schema);
-    payload.set_training_feature_metadata(training_headers, training_feature_ranges);
-    payload.resolved_termspec = Some(resolved_covariate_spec);
-    payload.transformation_response_knots = Some(family.response_knots().to_vec());
-    payload.transformation_response_transform = Some(
-        family
-            .response_transform()
-            .rows()
-            .into_iter()
-            .map(|r| r.to_vec())
-            .collect(),
-    );
-    payload.transformation_response_degree = Some(family.response_degree());
-    payload.transformation_response_median = Some(family.response_median());
-    payload.transformation_score_calibration = Some(score_calibration);
     SavedModel::from_payload(payload)
 }
 
@@ -9967,6 +9886,10 @@ mod tests {
     use gam::inference::model::{
         ColumnKindTag, FittedModelPayload, SavedCompiledFlexBlock, SavedLatentZNormalization,
         SchemaColumn,
+    };
+    use gam::inference::model_payload_builders::{
+        BernoulliMarginalSlopeInputs, SavedModelSourceMetadata,
+        assemble_bernoulli_marginal_slope_payload,
     };
     use gam::matrix::{DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator};
     use gam::predict::PredictableModel;
@@ -13025,6 +12948,130 @@ mod tests {
                 .resolved_inverse_link()
                 .expect("resolved inverse link"),
             Some(InverseLink::Standard(StandardLink::Probit))
+        );
+    }
+
+    /// Snapshot parity: the CLI and PyFFI save paths feed identical *semantic*
+    /// inputs into the same shared core assembler
+    /// (`assemble_bernoulli_marginal_slope_payload`), differing only in
+    /// source-specific metadata — the CLI supplies per-feature training ranges,
+    /// the FFI supplies offset columns. This test drives the assembler with both
+    /// source-metadata shapes and asserts the serialized payloads are
+    /// byte-identical once the legitimately source-specific fields are
+    /// normalized away. Any drift in the semantic contract between the two save
+    /// routes (the exact failure mode #402 closes) would break this assertion.
+    #[test]
+    fn cli_and_ffi_bernoulli_marginal_slope_payloads_have_one_contract() {
+        let schema = DataSchema {
+            columns: vec![SchemaColumn {
+                name: "z".to_string(),
+                kind: ColumnKindTag::Continuous,
+                levels: vec![],
+            }],
+        };
+        // Build the resolved semantic inputs once; clone into the two source
+        // shapes so the *only* differences are the source-specific fields.
+        let make_inputs = || BernoulliMarginalSlopeInputs {
+            formula: "y ~ 1".to_string(),
+            data_schema: schema.clone(),
+            logslope_formula: "y ~ z".to_string(),
+            z_column: "z".to_string(),
+            resolved_marginalspec: empty_termspec(),
+            resolved_logslopespec: empty_termspec(),
+            fit_result: core_saved_fit_result(
+                array![0.3],
+                Array1::zeros(0),
+                1.0,
+                None,
+                None,
+                saved_fit_summary_fixture(),
+            ),
+            baseline_marginal: -0.2,
+            baseline_logslope: 0.7,
+            latent_z_normalization: SavedLatentZNormalization { mean: 1.1, sd: 2.2 },
+            latent_measure: LatentMeasureKind::StandardNormal,
+            latent_z_rank_int_calibration: None,
+            score_warp_runtime: None,
+            link_dev_runtime: None,
+            base_link: InverseLink::Standard(StandardLink::Probit),
+            frailty: gam::families::lognormal_kernel::FrailtySpec::None,
+        };
+
+        // CLI source metadata: headers + per-feature ranges, no offset columns.
+        let cli_payload = assemble_bernoulli_marginal_slope_payload(
+            make_inputs(),
+            SavedModelSourceMetadata {
+                training_headers: vec!["z".to_string()],
+                training_feature_ranges: Some(vec![(0.0, 4.0)]),
+                offset_column: None,
+                noise_offset_column: None,
+            },
+        )
+        .expect("CLI-shaped payload");
+
+        // FFI source metadata: headers only (no ranges), offset columns present.
+        let ffi_payload = assemble_bernoulli_marginal_slope_payload(
+            make_inputs(),
+            SavedModelSourceMetadata {
+                training_headers: vec!["z".to_string()],
+                training_feature_ranges: None,
+                offset_column: Some("off".to_string()),
+                noise_offset_column: Some("noff".to_string()),
+            },
+        )
+        .expect("FFI-shaped payload");
+
+        // The semantic mirror fields the marginal-slope contract depends on must
+        // match exactly between the two routes — this is what used to drift.
+        assert_eq!(cli_payload.formula_logslope, ffi_payload.formula_logslope);
+        assert_eq!(cli_payload.formula_logslopes, ffi_payload.formula_logslopes);
+        assert_eq!(cli_payload.z_column, ffi_payload.z_column);
+        assert_eq!(cli_payload.z_columns, ffi_payload.z_columns);
+        assert_eq!(cli_payload.logslope_baseline, ffi_payload.logslope_baseline);
+        assert_eq!(
+            cli_payload.logslope_baselines,
+            ffi_payload.logslope_baselines
+        );
+        assert_eq!(cli_payload.marginal_baseline, ffi_payload.marginal_baseline);
+        // `TermCollectionSpec` is not `PartialEq`; the resolved-termspec
+        // singular/vector mirrors are covered by the full serialized snapshot
+        // equality at the end of this test.
+        assert_eq!(
+            cli_payload.latent_z_normalization,
+            ffi_payload.latent_z_normalization
+        );
+        assert_eq!(cli_payload.latent_measure, ffi_payload.latent_measure);
+
+        // The vector mirror fields must be the singletons of their scalar peers
+        // — the core assembler is the single place that guarantees this.
+        assert_eq!(
+            cli_payload.formula_logslopes.as_deref(),
+            Some([cli_payload.formula_logslope.clone().unwrap()].as_slice())
+        );
+        assert_eq!(
+            cli_payload.z_columns.as_deref(),
+            Some([cli_payload.z_column.clone().unwrap()].as_slice())
+        );
+        assert_eq!(
+            cli_payload.logslope_baselines.as_deref(),
+            Some([cli_payload.logslope_baseline.unwrap()].as_slice())
+        );
+
+        // Full snapshot parity: serialize both, normalize away the
+        // deliberately source-specific fields, and require byte equality.
+        let mut cli_json = serde_json::to_value(&cli_payload).expect("serialize CLI payload");
+        let mut ffi_json = serde_json::to_value(&ffi_payload).expect("serialize FFI payload");
+        for json in [&mut cli_json, &mut ffi_json] {
+            // Field names are kebab-case under the payload's
+            // `#[serde(rename_all = "kebab-case")]`.
+            let obj = json.as_object_mut().expect("payload serializes to an object");
+            obj.remove("training-feature-ranges");
+            obj.remove("offset-column");
+            obj.remove("noise-offset-column");
+        }
+        assert_eq!(
+            cli_json, ffi_json,
+            "CLI- and FFI-shaped marginal-slope payloads diverged in their semantic contract"
         );
     }
 

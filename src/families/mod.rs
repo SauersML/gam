@@ -40,6 +40,7 @@ pub mod survival_location_scale;
 pub mod survival_marginal_slope;
 pub mod survival_marginal_slope_identifiability;
 pub mod survival_predict;
+pub mod survival_time_constraints;
 pub mod transformation_normal;
 pub mod vector_response;
 
