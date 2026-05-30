@@ -33,8 +33,9 @@ use std::path::PathBuf;
 
 use crate::inference::data::EncodedDataset as Dataset;
 use crate::terms::basis::{
-    BSplineBasisSpec, BSplineKnotSpec, CenterStrategy, DuchonBasisSpec, MaternBasisSpec, MaternNu,
-    OneDimensionalBoundary, SphereMethod, SphericalSplineBasisSpec, ThinPlateBasisSpec,
+    BSplineBasisSpec, BSplineKnotSpec, CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder,
+    MaternBasisSpec, MaternNu, OneDimensionalBoundary, SphereMethod, SphericalSplineBasisSpec,
+    ThinPlateBasisSpec,
 };
 use crate::terms::smooth::{
     SmoothBasisSpec, SmoothTermSpec, TensorBSplineSpec, TermCollectionSpec, parse_shape_constraint,
@@ -282,8 +283,30 @@ fn apply_duchon(
     symbol: &str,
 ) -> Result<(), String> {
     apply_center_strategy(&mut spec.center_strategy, descriptor, symbol)?;
-    if let Some(power) = descriptor.get("m").and_then(JsonValue::as_f64) {
-        spec.power = power;
+    // `m` is the spline ORDER: it selects the polynomial nullspace the smoother
+    // leaves unpenalized (1 -> mean only, 2 -> mean + linear, k -> degree k-1),
+    // mirroring `duchon_nullspace_from_m` in gam-pyffi. It is NOT the spectral
+    // power. The Riesz spectral power `s` is a separate descriptor key.
+    if let Some(m_val) = descriptor.get("m") {
+        let m = m_val.as_u64().filter(|m| *m >= 1).ok_or_else(|| {
+            format!("smooths[{symbol:?}].m must be a positive integer (spline order)")
+        })?;
+        spec.nullspace_order = match m {
+            1 => DuchonNullspaceOrder::Zero,
+            2 => DuchonNullspaceOrder::Linear,
+            other => DuchonNullspaceOrder::Degree((other - 1) as usize),
+        };
+    }
+    if let Some(s_val) = descriptor.get("s").or_else(|| descriptor.get("power")) {
+        let s = s_val.as_f64().ok_or_else(|| {
+            format!("smooths[{symbol:?}].s (spectral power) must be a number")
+        })?;
+        if !s.is_finite() || s < 0.0 {
+            return Err(format!(
+                "smooths[{symbol:?}].s (spectral power) must be a non-negative finite value, got {s}"
+            ));
+        }
+        spec.power = s;
     }
     if let Some(ls) = descriptor.get("length_scale") {
         if ls.is_null() {

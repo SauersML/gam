@@ -4024,9 +4024,10 @@ fn duchon_function_norm_penalty<'py>(
     };
     let built = build_duchon_basis(center_matrix.view(), &spec)
         .map_err(|err| py_value_error(err.to_string()))?;
-    // The scale-free pure-Duchon path emits the operator triplet (mass,
-    // tension, stiffness); the function-norm seminorm is the curvature
-    // (stiffness) block — `∫|∇^(p+s) f|²`-flavoured.
+    // The non-periodic Euclidean path emits the three data-jet candidates
+    // (mass, tension, stiffness) on the cubic (r^3) basis; the structural
+    // smoother penalty is the curvature (data-jet) block — the stiffness
+    // candidate, which penalizes second-derivative (curvature) energy.
     let stiffness_idx = built
         .penaltyinfo
         .iter()
