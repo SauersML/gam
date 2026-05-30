@@ -9,7 +9,7 @@
 //! 2010) is the reference implementation in R; statsmodels has no beta family,
 //! so `betareg` is the best-in-class choice here.
 //!
-//! We fit the additive logit-link beta model `y ~ s(x1, k=4) + s(x2, k=3)` with
+//! We fit the additive logit-link beta model `y ~ s(x1, k=4) + s(x2, k=4)` with
 //! gam, and the *same* additive structure with `betareg` using natural-spline
 //! bases (`splines::ns`, df = k-1 to match the rank of each penalised smooth's
 //! range space) and a logit link. Both maximise the *same* beta log-likelihood
@@ -79,7 +79,7 @@ fn gam_beta_logit_matches_betareg() {
         y.push(yi);
     }
 
-    // ---- fit with gam: y ~ s(x1,k=4) + s(x2,k=3), family = beta (logit) ----
+    // ---- fit with gam: y ~ s(x1,k=4) + s(x2,k=4), family = beta (logit) ----
     let headers = vec!["y".to_string(), "x1".to_string(), "x2".to_string()];
     let rows: Vec<csv::StringRecord> = (0..N)
         .map(|i| {
@@ -95,7 +95,7 @@ fn gam_beta_logit_matches_betareg() {
         family: Some("beta".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ s(x1, k=4) + s(x2, k=3)", &ds, &cfg).expect("gam beta fit");
+    let result = fit_from_formula("y ~ s(x1, k=4) + s(x2, k=4)", &ds, &cfg).expect("gam beta fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for the beta family");
     };
@@ -114,7 +114,7 @@ fn gam_beta_logit_matches_betareg() {
 
     // ---- fit the SAME additive model with betareg (the mature reference) ---
     // Natural-spline bases match the rank of each penalised smooth's range
-    // space (df = k - 1: s(x1,k=4)->df 3, s(x2,k=3)->df 2). Logit link, shared
+    // space (df = k - 1: s(x1,k=4)->df 3, s(x2,k=4)->df 3). Logit link, shared
     // precision phi. emit the fitted means; we reconstruct eta = logit(mu).
     let r = run_r(
         &[
@@ -125,7 +125,7 @@ fn gam_beta_logit_matches_betareg() {
         r#"
         suppressPackageStartupMessages(library(betareg))
         suppressPackageStartupMessages(library(splines))
-        m <- betareg(y ~ ns(x1, df = 3) + ns(x2, df = 2), data = df, link = "logit")
+        m <- betareg(y ~ ns(x1, df = 3) + ns(x2, df = 3), data = df, link = "logit")
         mu <- as.numeric(predict(m, type = "response"))
         emit("mu", mu)
         emit("phi", as.numeric(m$coefficients$precision))
@@ -143,8 +143,8 @@ fn gam_beta_logit_matches_betareg() {
     // vs-dispersion mismatch in the comparator (a dispersion 1/phi ~= 0.05 or a
     // variance-style sigma would fall far outside [10, 40]). The band is loose
     // because phi is only weakly identified from n=150 boundary-crowded draws
-    // (its sampling CV is O(sqrt(2/n)) ~ 12%, plus a downward bias from the basis
-    // misfit of the full-period x2 cosine under df=2), but it is a real check that
+    // (its sampling CV is O(sqrt(2/n)) ~ 12%, plus a mild downward bias from the
+    // residual basis misfit of the smooth truth), but it is a real check that
     // both engines share the mean/precision parameterisation of the data.
     assert!(
         betareg_phi.is_finite() && betareg_phi > 0.5 * PHI && betareg_phi < 2.0 * PHI,

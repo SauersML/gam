@@ -351,6 +351,12 @@ fn gam_continuation_ratio_matches_vgam_sratio() {
     // relative-L2 on class probabilities are tight enough that any real
     // divergence in gam's binomial/cyclic path trips them, yet leave margin for
     // the spline-vs-harmonic and REML-smoothing-vs-unpenalized gap.
+    // MEASURED HONEST DIVERGENCE (~0.11 rel-L2, peaking at level 4): the sratio
+    // parameterization is correctly aligned (reverse=FALSE => logit P[Y=j|Y>=j],
+    // parallel=TRUE, category order 1..4 matching gam's stacked-binomial chain
+    // rule, x2 slope agrees), but gam REML-penalizes the cyclic-cubic g(x) while
+    // VGAM fits two unpenalized harmonics, so gam attenuates the 0.9-amplitude
+    // oscillation and that gap compounds through the chain-rule class product.
     assert!(
         class_rel < 0.03,
         "fitted class probabilities diverge from VGAM::sratio: \

@@ -65,7 +65,8 @@ fn gam_lognormal_location_scale_aft_smooth_matches_survreg() {
     //   linear function of z that a k=5 thin-plate / df=4 pspline can both fit),
     //   eps ~ Normal(0,1), sigma a single constant drawn from InverseGamma(shape=2)
     //   (one scale for the whole dataset, as a constant-scale lognormal requires),
-    //   censoring ~40% (right-censored at an independent exponential time).
+    //   censoring ~40% (right-censored at an independent exponential time with
+    //   mean ~0.9, on the same scale as the event-time median).
     // The data is generated only here and the columns are handed verbatim to R, so
     // gam and survreg see byte-identical rows (no cross-engine RNG to reconcile).
     let n = 300usize;
@@ -91,10 +92,13 @@ fn gam_lognormal_location_scale_aft_smooth_matches_survreg() {
         let s_z = (std::f64::consts::PI * z[i]).sin();
         let eta_loc = -0.5 + 0.8 * x[i] + s_z;
         let t_event = (eta_loc + eps[i] * sigma_true).exp();
-        // Independent exponential censoring time, c ~ Exponential(rate = 1/2.4);
-        // the multiplier 2.4 is scale-matched to median(T) ~ exp(-0.5) so that
-        // P(T > c) ~ 0.40, giving the target ~40% right-censoring.
-        let c = -cens_u[i].ln() * 2.4;
+        // Independent exponential censoring time c ~ Exponential(mean = 0.9):
+        // T is lognormal with median ~exp(-0.5) but a heavy right tail, so a
+        // censoring mean comparable to (not far above) the event median is what
+        // delivers the target ~40% right-censoring. A mean of 2.4 censors far too
+        // little (~22%, because it dwarfs typical event times); 0.9 puts the
+        // censoring clock on the same scale as T and lands censoring in band.
+        let c = -cens_u[i].ln() * 0.9;
         if t_event <= c {
             t.push(t_event);
             event.push(1.0);
