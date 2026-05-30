@@ -32,17 +32,18 @@
 //! depends on.
 //!
 //! Asserted, with one-line justifications at each site:
-//!   * leverage a_ii: max |ALO − brute| < 1e-8 and pearson > 0.9999 — leverage
+//!   * leverage a_ii: max |ALO − brute| < 1e-8 and pearson > 0.999999 — leverage
 //!     is a deterministic property of the *full-data* hat matrix, so ALO's
 //!     chunked solve and the dense reference solve must agree to solver
 //!     round-off; a loose bound here would hide an influence-matrix bug.
-//!   * η̃ (ALO LOO predictor): relative L2 < 0.015 vs the exact reduced-system
-//!     refit — the rank-1 update is exact for the linearised model up to the
-//!     curvature change between β̂ and β₋ᵢ, so a few-permille agreement is the
-//!     correct expectation.
-//!   * Bayesian SE √(φ x_iᵀ H⁻¹ x_i): pearson > 0.99 vs the reference x_iᵀH⁻¹x_i,
-//!     confirming ALO's uncertainty quantification tracks the true conditional
-//!     variance diagonal.
+//!   * η̃ (ALO LOO predictor): relative L2 < 1e-6 vs the exact reduced-system
+//!     refit. For the canonical Poisson/log link W_h == W_s, so the ALO rank-1
+//!     formula is the *exact* Sherman–Morrison solution of the same downdated
+//!     system the brute force factorises — they agree to solver round-off, and
+//!     a permille-scale bound would assert essentially nothing for an identity.
+//!   * Bayesian SE √(φ x_iᵀ H⁻¹ x_i): pearson > 0.999999 AND max|Δ| < 1e-8 vs
+//!     the reference √(φ x_iᵀH⁻¹x_i) — the same exact diagonal, so correlation
+//!     alone (scale/offset blind) is backed by an absolute round-off bound.
 
 use gam::inference::alo::compute_alo_diagnostics_from_fit;
 use gam::matrix::LinearOperator;
@@ -222,7 +223,20 @@ fn alo_matches_brute_force_loo_on_poisson_log_tensor() {
     assert_eq!(x.nrows(), n, "transformed design row count mismatch");
     assert_eq!(h.nrows(), p, "Hessian must be p x p");
 
+    // ALO forms leverage and the rank-1 downdate with the Hessian-side weights
+    // (H = XᵀW_h X + S) and the score/RHS with the score-side Fisher weights.
+    // For the canonical Poisson/log link Fisher == observed information, so
+    // W_h == W_s == μ; we assert that here and then carry a single `w`, which
+    // is exactly what makes the ALO closed form an EXACT Sherman–Morrison
+    // solution of the brute-force downdated system rather than an approximation.
+    let w_hess: Vec<f64> = pirls.final_weights_signed().view().to_vec();
     let w: Vec<f64> = pirls.solve_weights_psd().view().to_vec(); // score-side Fisher weights
+    let wh_ws_max_diff = max_abs_diff(&w_hess, &w);
+    assert!(
+        wh_ws_max_diff < 1e-12,
+        "canonical Poisson/log must have Hessian weights == score weights \
+         (Fisher == observed information): max|W_h − W_s|={wh_ws_max_diff:.3e}"
+    );
     let z = &pirls.solveworking_response; // working response
     let eta_hat = &pirls.final_eta;
     let offset = &pirls.final_offset;
@@ -315,12 +329,13 @@ fn alo_matches_brute_force_loo_on_poisson_log_tensor() {
     let eta_rel = relative_l2(alo_eta, &brute_eta_tilde);
     let eta_corr = pearson(alo_eta, &brute_eta_tilde);
     let se_corr = pearson(alo_se, &brute_se_bayes);
+    let se_max_diff = max_abs_diff(alo_se, &brute_se_bayes);
 
     eprintln!(
         "ALO vs brute-force LOO (Poisson/log te(x1,x2)): n={n} p={p} \
          leverage max|Δ|={lev_max_diff:.3e} pearson={lev_corr:.6} \
-         eta_tilde rel_l2={eta_rel:.5} pearson={eta_corr:.6} \
-         se_bayes pearson={se_corr:.5}"
+         eta_tilde rel_l2={eta_rel:.3e} pearson={eta_corr:.6} \
+         se_bayes max|Δ|={se_max_diff:.3e} pearson={se_corr:.5}"
     );
 
     // Leverage a_ii = w_i x_iᵀ H⁻¹ x_i is a deterministic function of the
@@ -334,30 +349,44 @@ fn alo_matches_brute_force_loo_on_poisson_log_tensor() {
         "ALO leverage must match exact w_i x_iᵀH⁻¹x_i to round-off: max|Δ|={lev_max_diff:.3e}"
     );
     assert!(
-        lev_corr > 0.9999,
+        lev_corr > 0.999999,
         "ALO leverage must be near-perfectly correlated with exact leverage: pearson={lev_corr:.6}"
     );
 
-    // η̃: the rank-1 ALO update is exact for the linearised working model up to
-    // the curvature difference between β̂ and the hold-out β₋ᵢ. A few-permille
-    // agreement is the correct expectation; rel_l2 < 0.015 still flags any real
-    // error in the leave-one-out score/denominator algebra (a botched 1−a_ii or
-    // a wrong score weight would move η̃ far beyond 1.5%).
+    // η̃: for the canonical Poisson/log link the Hessian-side weights equal the
+    // score-side Fisher weights (w_h == w_s == μ ≥ 0), so the ALO closed form
+    //   η̃_i = o_i + (η̂_i−o_i) + (x_iᵀH⁻¹x_i)·w_i(η̂_i−z_i) / (1 − w_i x_iᵀH⁻¹x_i)
+    // is the EXACT Sherman–Morrison solution of the same rank-1 downdated
+    // system the brute force factorises directly. The two therefore agree to
+    // solver round-off, not to a "few permille": the only slack is the
+    // difference between one factor of H reused via Sherman–Morrison and a
+    // fresh Cholesky of H − w_i x_i x_iᵀ per fold, both well-conditioned here
+    // (small leverages, 1−a_ii ≈ 1). 1e-6 stays comfortably above that
+    // round-off while a botched 1−a_ii, a wrong score weight, or an offset
+    // sign error would blow rel_l2 far past it; the previous 1.5% bound was so
+    // loose it asserted essentially nothing for an exact identity.
     assert!(
-        eta_rel < 0.015,
-        "ALO eta_tilde must track exact leave-one-out predictor: rel_l2={eta_rel:.5}"
+        eta_rel < 1e-6,
+        "ALO eta_tilde must match the exact Sherman–Morrison leave-one-out predictor to round-off: rel_l2={eta_rel:.3e}"
     );
     assert!(
-        eta_corr > 0.999,
+        eta_corr > 0.999999,
         "ALO eta_tilde must be near-perfectly correlated with exact LOO: pearson={eta_corr:.6}"
     );
 
-    // Bayesian SE √(φ x_iᵀ H⁻¹ x_i) is monotone in the conditional variance
-    // diagonal the reference forms exactly; near-perfect correlation confirms
-    // ALO's uncertainty quantification is correct. pearson > 0.99 is the spec
-    // bound and leaves only room for benign solve round-off.
+    // Bayesian SE √(φ x_iᵀ H⁻¹ x_i): ALO and the reference form the IDENTICAL
+    // quantity from the same H and the same x_i (φ = 1 for Poisson), so this is
+    // another exact identity up to solver round-off — not merely "monotone".
+    // Pearson alone is a weak guard here (it is invariant to a wrong constant
+    // scale on φ or a uniform variance offset), so we additionally pin the
+    // absolute agreement: max|Δ| < 1e-8 catches any scale/offset defect in
+    // ALO's uncertainty quantification that a bare correlation would miss.
     assert!(
-        se_corr > 0.99,
-        "ALO Bayesian SE must track exact conditional variance diagonal: pearson={se_corr:.5}"
+        se_corr > 0.999999,
+        "ALO Bayesian SE must track exact conditional variance diagonal: pearson={se_corr:.6}"
+    );
+    assert!(
+        se_max_diff < 1e-8,
+        "ALO Bayesian SE √(φ x_iᵀH⁻¹x_i) must equal the exact diagonal to round-off: max|Δ|={se_max_diff:.3e}"
     );
 }
