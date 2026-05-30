@@ -30615,7 +30615,7 @@ mod tests {
                     ResponseFamily::Gaussian,
                     InverseLink::Standard(StandardLink::Identity),
                 ),
-                link: Some(LinkFunction::Identity),
+                link: Some(StandardLink::Identity),
                 latent_cloglog_state: None,
                 mixture_state: None,
                 sas_state: None,
