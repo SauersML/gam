@@ -113,6 +113,23 @@ def check_forward_state(state: Any, *, name: str) -> None:
             )
 
 
+def coerce_grad_payload(payload: Any, *, design_grad_key: str = "grad_x") -> dict[str, Any]:
+    """Coerce a Gaussian-REML backward payload's gradient entries to f64 arrays.
+
+    Every NumPy backward face in :mod:`gamfit._api` coerced the same gradient
+    keys with the same per-key loop; this is that loop in one place.
+    ``design_grad_key`` selects ``grad_x`` (array designs) vs ``grad_t``
+    (position bases); a missing ``grad_by`` is simply skipped.
+    """
+    import numpy as np
+
+    result = dict(payload)
+    for key in (design_grad_key, "grad_y", "grad_penalty", "grad_weights", "grad_by"):
+        if result.get(key) is not None:
+            result[key] = np.asarray(result[key], dtype=float)
+    return result
+
+
 def validate_forward_state(state: dict[str, Any], *, name: str) -> dict[str, Any]:
     """Validate and defensively copy a converged forward-state payload.
 
