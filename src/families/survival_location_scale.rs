@@ -48,9 +48,8 @@ use crate::probability::erfcx_nonnegative;
 use crate::probability::{normal_cdf, normal_pdf};
 use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, TermCollectionDesign,
-    TermCollectionSpec, build_term_collection_design,
-    freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint,
-    spatial_length_scale_term_indices,
+    TermCollectionSpec, build_term_collection_design, freeze_term_collection_from_design,
+    optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
 };
 use crate::solver::estimate::UnifiedFitResult;
 use crate::solver::estimate::{

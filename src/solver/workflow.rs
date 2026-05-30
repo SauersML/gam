@@ -52,7 +52,6 @@ use crate::smooth::{
 use crate::solver::latent_cache::LatentRetractionRegistry;
 use crate::solver::riemannian_retraction::{ProductRetraction, RetractionKind};
 use crate::survival::PenaltyBlock;
-use crate::terms::AnalyticPenaltyRegistry;
 use crate::terms::latent_coord::{
     AuxPriorFamily, AuxPriorStrength, LatentCoordValues, LatentIdMode, LatentManifold,
 };

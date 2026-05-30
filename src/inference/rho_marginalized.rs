@@ -30,7 +30,7 @@
 //! them (closed-form Gaussian REML, PIRLS+LAML, survival, …) and are exercised
 //! directly by unit tests.
 
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use ndarray::{Array1, ArrayView1, ArrayView2};
 
 /// `∂β/∂ρ_k = −λ_k H_ββ⁻¹ S_k β` — the sensitivity of the penalized
 /// coefficients to the log smoothing parameter of one penalty block.
