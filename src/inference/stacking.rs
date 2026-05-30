@@ -121,9 +121,8 @@ pub fn stacking_weights(
 
 #[cfg(test)]
 mod tests {
-    use ndarray::{Array1, Array2};
-
     use super::*;
+    use ndarray::Array2;
 
     #[test]
     fn concentrates_on_a_dominant_candidate() {
