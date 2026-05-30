@@ -849,7 +849,7 @@ mod tests {
         let m = 3;
         let factor = Array2::from_shape_vec((m, 2), vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6]).unwrap();
         let target = VectorResponseTarget::new(
-            array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            Array2::<f64>::zeros((n, m)),
             VectorNoise::LowRank {
                 diag: Array1::from(vec![1.0; m]),
                 factor: factor.clone(),
@@ -862,7 +862,14 @@ mod tests {
         for ((i, j), v) in stored.indexed_iter() {
             assert_eq!(*v, factor[[i, j]]);
         }
-        assert_eq!(n, lik.precision.len().max(n));
+        // `GaussianVectorLikelihood::precision` is the per-output diagonal
+        // of length `M`, populated from `target.noise.diag_precision(M)`
+        // — not a per-row precision of length `N`. The historical
+        // `assert_eq!(n, lik.precision.len().max(n))` reduces to
+        // `precision.len() ≤ n`, which is the opposite of the contract
+        // (and false for any `M > N`, the typical multivariate-response
+        // shape).
+        assert_eq!(m, lik.precision.len());
     }
 
     #[test]
