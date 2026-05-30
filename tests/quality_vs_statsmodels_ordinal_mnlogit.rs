@@ -582,17 +582,22 @@ fn gam_multinomial_recovers_true_class_simplex_on_real_data() {
         out.resize(n_train, fill);
         out
     };
+    let padded_t_h_temp = pad(&test_h_temp);
+    let padded_t_s_temp = pad(&test_s_temp);
+    let padded_t_w_rain = pad(&test_w_rain);
+    let padded_t_h_rain = pad(&test_h_rain);
+    let test_n_col = vec![n_test as f64; n_train];
     let cols: Vec<Column<'_>> = vec![
         Column::new("y", &train_y),
         Column::new("h_temp", &train_h_temp),
         Column::new("s_temp", &train_s_temp),
         Column::new("w_rain", &train_w_rain),
         Column::new("h_rain", &train_h_rain),
-        Column::new("t_h_temp", &pad(&test_h_temp)),
-        Column::new("t_s_temp", &pad(&test_s_temp)),
-        Column::new("t_w_rain", &pad(&test_w_rain)),
-        Column::new("t_h_rain", &pad(&test_h_rain)),
-        Column::new("test_n", &vec![n_test as f64; n_train]),
+        Column::new("t_h_temp", &padded_t_h_temp),
+        Column::new("t_s_temp", &padded_t_s_temp),
+        Column::new("t_w_rain", &padded_t_w_rain),
+        Column::new("t_h_rain", &padded_t_h_rain),
+        Column::new("test_n", &test_n_col),
     ];
     let py_body = r#"
 import numpy as np
