@@ -359,6 +359,32 @@ for lam in lams:
         scad_min <= ridge_min,
         "SCAD's sparsest solution ({scad_min}) is not at least as sparse as ridge's ({ridge_min})"
     );
+
+    // ---- (4) near-oracle recovery: distance to the TRUE ξ* -----------------
+    // The principled Fan-Li 2001 property is near-unbiasedness: among the swept
+    // λ, SCAD's best coefficient estimate is at least as close to the true
+    // ξ* = [0, -1, 0.1] as ridge's best, because ridge biases every surviving
+    // coefficient uniformly toward zero while SCAD leaves the large signal
+    // terms essentially un-shrunk. We assert both the head-to-head (SCAD's best
+    // distance ≤ ridge's best) AND a tight absolute bound (SCAD's best is
+    // essentially exact, < 1e-6) so this is not a vacuous one-sided inequality.
+    // The true coefficients are an external oracle (the analytic ODE), so this
+    // needs no Python reference and cannot be gamed by the solver.
+    let scad_best_err = runs.iter().map(|r| r.scad_err).fold(f64::INFINITY, f64::min);
+    let ridge_best_err = runs.iter().map(|r| r.ridge_err).fold(f64::INFINITY, f64::min);
+    eprintln!("best ||·-xi*|| over sweep: scad={scad_best_err:.3e} ridge={ridge_best_err:.3e}");
+    assert!(
+        scad_best_err <= ridge_best_err + 1e-12,
+        "SCAD's best recovery (||ξ-ξ*||={scad_best_err:.3e}) is not at least as \
+         close to the true ξ* as ridge's best (={ridge_best_err:.3e}) — concave \
+         near-unbiasedness should make SCAD's best estimate no worse than ridge's"
+    );
+    assert!(
+        scad_best_err < 1e-6,
+        "SCAD's best recovery over the λ sweep (||ξ-ξ*||={scad_best_err:.3e}) is not \
+         essentially exact (< 1e-6); SCAD should achieve near-oracle recovery of \
+         the true cubic dynamics"
+    );
 }
 
 /// Render a λ value the way Python's `"%g"` formats it, so the emitted-key

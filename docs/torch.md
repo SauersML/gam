@@ -40,8 +40,9 @@ The same pattern applies to `gaussian_reml_fit_batched`,
 `gaussian_reml_fit_additive`, and `gaussian_reml_fit_blocks`. The additive
 and block variants return `AdditiveRemlOutput` (`coefficients`, `fitted`,
 `lambdas`, `log_lambdas`, `reml_score`, `edf`); single-response additive
-fits use per-smooth lambdas, while multi-output additive fits use the
-single-lambda block-diagonal path. Saved tensors are version-checked;
+fits use exact dense multi-block REML, while multi-output additive fits use
+the shared-scale block-orthogonal estimator with per-smooth lambdas. Saved
+tensors are version-checked;
 in-place mutation between forward and backward raises `RuntimeError`.
 
 ## Embedding a fitted model

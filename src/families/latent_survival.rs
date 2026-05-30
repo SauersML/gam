@@ -3906,7 +3906,7 @@ mod tests {
 
     // --- shared latent-interval validation engine: parity / contract tests ---
 
-    use crate::families::survival_location_scale::TimeBlockMonotonicity;
+    use crate::families::survival_location_scale::{TimeBlockInput, TimeBlockMonotonicity};
 
     /// Minimal, structurally valid `TimeBlockInput` for `n` rows and `p_time`
     /// columns, used to exercise the shared validation driver without standing
