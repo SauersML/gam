@@ -1,51 +1,54 @@
 //! End-to-end quality: gam's *multinomial* GAM with a smooth-by-factor
-//! interaction (`s(x) + s(x, by=group)`) must agree with VGAM — the mature,
-//! standard R package for vector-response (multinomial) regression — on the
-//! *fitted class-probability surface*, not merely run without panicking.
+//! interaction (`s(x) + s(x, by=group)`) must RECOVER THE TRUE class-probability
+//! surface that generated the data — an objective accuracy claim, not "matches a
+//! reference tool's fitted output".
 //!
-//! Reference tool: **VGAM** (`VGAM::vglm` with `family = multinomial()` and a
-//! group-crossed natural-cubic-spline basis `ns(x, df)`). VGAM is the canonical
-//! R package for multi-class softmax GLM/GAM. Note the deliberate choice of
-//! `vglm` over `vgam`: VGAM's `s()` smoother takes **no `by=` argument** (a
-//! per-group smooth-by-factor is an mgcv feature, not a VGAM one), so the
-//! standard, reliable VGAM idiom for "a separate smooth curve of x per group"
-//! is to freeze one spline basis on the training x and cross it with the group
-//! factor — `vglm(y ~ grp + grp:ns(x, df))`. This is an *unpenalized*
-//! fixed-basis parametric softmax fit. gam, in contrast, fits a *REML-penalized*
-//! thin-plate smooth-by-factor. The two therefore agree only insofar as the
-//! data dominates the penalty; the synthetic signal below is built strong (and
-//! N large enough per group) precisely so that gam's selected λ is light and
-//! its penalized per-group curves recover essentially the same shapes the
-//! unpenalized basis fit does. That is the honest, principled regime in which a
-//! penalized smoother and a fixed-df basis fit must coincide.
+//! OBJECTIVE METRIC (the pass criterion): TRUTH RECOVERY. The labels are drawn
+//! from a known 3-class softmax whose log-odds `true_eta(x, g)` are a closed-form
+//! group-specific smooth function of `x`. The true class-probability surface on
+//! the evaluation grid is therefore known exactly. We assert that gam's fitted
+//! probability surface has small RMSE against that TRUTH:
+//!   * `rmse(gam_probs, true_probs) <= PROB_RMSE_BAR` (absolute accuracy bar on
+//!     the simplex), and
+//!   * `rmse(gam) <= rmse(VGAM) * 1.10` (gam matches-or-beats the mature tool on
+//!     the SAME truth-recovery error — accuracy, not mutual agreement).
+//! The primary claim is "gam recovers the data-generating probabilities". VGAM is
+//! demoted to a BASELINE TO MATCH-OR-BEAT on that same objective error; it is no
+//! longer the thing gam is asserted to reproduce. (We still compute VGAM's fit and
+//! print gam↔VGAM rel_l2 for context only — it is never a pass/fail criterion.)
+//!
+//! Reference baseline tool: **VGAM** (`VGAM::vglm` with `family = multinomial()`
+//! and a group-crossed natural-cubic-spline basis `ns(x, df)`). VGAM is the
+//! canonical R package for multi-class softmax GLM/GAM. `vglm` is used over
+//! `vgam` because VGAM's `s()` smoother takes **no `by=` argument** (a per-group
+//! smooth-by-factor is an mgcv feature, not a VGAM one), so the standard VGAM
+//! idiom for "a separate smooth curve of x per group" is to freeze one spline
+//! basis on the training x and cross it with the group factor —
+//! `vglm(y ~ grp + grp:ns(x, df))`. VGAM's `multinomial(refLevel = K)` makes the
+//! last factor level the η ≡ 0 baseline, which is *exactly* gam's softmax gauge
+//! (`MultinomialLogitLikelihood::softmax_with_baseline`, reference = last
+//! `class_levels` entry); we pin VGAM's factor levels to gam's reported
+//! `class_levels` order so both engines share the identical reference class and
+//! every emitted probability column aligns class-for-class — to TRUTH and to each
+//! other.
 //!
 //! gam's `s(x, by=group)` over a categorical `group` builds (see
 //! `terms::term_builder`): a treatment-coded `group` main effect, one penalized
-//! smooth of x *per group level*, plus the shared global `s(x)`. The VGAM side
-//! mirrors this: a `grp` main effect plus `grp:xb` (each group its own spline
-//! coefficients). Both engines therefore endow each group with its own smooth
-//! η-curve for every active class. Coefficients are basis- and gauge-dependent
-//! and NOT directly comparable; the fitted probability simplex is. VGAM's
-//! `multinomial(refLevel = K)` makes the last factor level the η ≡ 0 baseline,
-//! which is *exactly* gam's softmax gauge
-//! (`MultinomialLogitLikelihood::softmax_with_baseline`, reference = last
-//! `class_levels` entry), so the emitted probability columns align class-for-
-//! class. We pin VGAM's factor levels to gam's reported `class_levels` order so
-//! the reference class — and thus the whole identified simplex — coincides.
+//! smooth of x *per group level*, plus the shared global `s(x)`. Both engines
+//! therefore endow each group with its own smooth η-curve for every active class.
 //!
 //! Data: a synthetic, fixed-seed (RNG-reproducible) 3-class softmax draw whose
-//! true log-odds carry a genuinely *group-specific* smooth shape of x (the
-//! loaded combination the spec targets: a smooth crossed with class AND with a
-//! grouping factor in a real K = 3 response). The identical numeric table is
-//! handed to gam and to VGAM, so any divergence is a real modelling difference.
-//! We compare fitted class probabilities on a dense grid of x over its observed
-//! range, at each of the three group levels, exercising the full smooth-by-
-//! factor surface.
+//! true log-odds carry a genuinely *group-specific* smooth shape of x (the loaded
+//! combination the spec targets: a smooth crossed with class AND with a grouping
+//! factor in a real K = 3 response). The identical numeric table is handed to gam
+//! and to VGAM. We evaluate both fits — and the closed-form truth — on a dense
+//! grid of x over its observed range at each of the three group levels, exercising
+//! the full smooth-by-factor surface.
 
 use csv::StringRecord;
 use gam::data::{EncodedDataset, UnseenCategoryPolicy, encode_recordswith_schema};
 use gam::families::multinomial::{fit_penalized_multinomial_formula, predict_multinomial_formula};
-use gam::test_support::reference::{Column, pearson, relative_l2, run_r};
+use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_r};
 use gam::{FitConfig, encode_recordswith_inferred_schema, init_parallelism};
 use ndarray::Array2;
 use rand::SeedableRng;
@@ -91,7 +94,7 @@ fn softmax(eta: &[f64; K]) -> [f64; K] {
 }
 
 #[test]
-fn gam_multinomial_smooth_by_factor_matches_vgam() {
+fn gam_multinomial_smooth_by_factor_recovers_truth() {
     init_parallelism();
 
     // ---- synthesize the shared dataset (fixed seed, fed to BOTH engines) ----
@@ -298,9 +301,28 @@ fn gam_multinomial_smooth_by_factor_matches_vgam() {
     let p2 = r.vector("p2");
     assert_eq!(p0.len(), n_grid, "VGAM grid length mismatch");
 
-    // ---- compare fitted class probabilities, grid-aligned, per class ---------
-    // gam_probs columns follow model.class_levels == VGAM's pinned factor order,
-    // so gam column k corresponds to VGAM's pr[, k+1] (= emit pk).
+    // ---- TRUTH: closed-form data-generating probabilities on the grid -------
+    // The labels were drawn from softmax(true_eta(x, g)); evaluating that exact
+    // function on the SAME grid (grid_x, grid_group) gives the true class-
+    // probability surface that the fit is trying to recover. This is the
+    // objective target — independent of any reference tool.
+    let mut true_c0: Vec<f64> = Vec::with_capacity(n_grid);
+    let mut true_c1: Vec<f64> = Vec::with_capacity(n_grid);
+    let mut true_c2: Vec<f64> = Vec::with_capacity(n_grid);
+    for i in 0..n_grid {
+        let p = softmax(&true_eta(grid_x[i], grid_group[i]));
+        true_c0.push(p[0]);
+        true_c1.push(p[1]);
+        true_c2.push(p[2]);
+    }
+    let mut flat_true: Vec<f64> = Vec::with_capacity(K * n_grid);
+    flat_true.extend_from_slice(&true_c0);
+    flat_true.extend_from_slice(&true_c1);
+    flat_true.extend_from_slice(&true_c2);
+
+    // gam_probs columns follow model.class_levels == VGAM's pinned factor order
+    // == true_eta's class index, so column k corresponds to true class k and to
+    // VGAM's pr[, k+1] (= emit pk).
     let gam_c0: Vec<f64> = (0..n_grid).map(|i| gam_probs[[i, 0]]).collect();
     let gam_c1: Vec<f64> = (0..n_grid).map(|i| gam_probs[[i, 1]]).collect();
     let gam_c2: Vec<f64> = (0..n_grid).map(|i| gam_probs[[i, 2]]).collect();
@@ -314,40 +336,49 @@ fn gam_multinomial_smooth_by_factor_matches_vgam() {
     flat_ref.extend_from_slice(p1);
     flat_ref.extend_from_slice(p2);
 
-    let rel = relative_l2(&flat_gam, &flat_ref);
-    let corr0 = pearson(&gam_c0, p0);
-    let corr1 = pearson(&gam_c1, p1);
-    let corr2 = pearson(&gam_c2, p2);
-    let worst = corr0.min(corr1).min(corr2);
+    // ---- OBJECTIVE accuracy: RMSE of each fit against the TRUTH -------------
+    let gam_truth_rmse = rmse(&flat_gam, &flat_true);
+    let ref_truth_rmse = rmse(&flat_ref, &flat_true);
+
+    // Context only (never a pass/fail criterion): how close the two FITS are to
+    // each other, and per-class shape correlation against truth.
+    let rel_gam_ref = relative_l2(&flat_gam, &flat_ref);
+    let corr0 = pearson(&gam_c0, &true_c0);
+    let corr1 = pearson(&gam_c1, &true_c1);
+    let corr2 = pearson(&gam_c2, &true_c2);
 
     eprintln!(
         "multinomial s(x)+s(x,by=group): N={N} K={K} grid={n_grid} converged={} \
-         rel_l2={rel:.4} pearson(c0)={corr0:.5} pearson(c1)={corr1:.5} pearson(c2)={corr2:.5} \
+         gam_truth_rmse={gam_truth_rmse:.5} vgam_truth_rmse={ref_truth_rmse:.5} \
+         rel_l2(gam,vgam)={rel_gam_ref:.4} \
+         pearson_vs_truth(c0)={corr0:.5} (c1)={corr1:.5} (c2)={corr2:.5} \
          lambdas={:?}",
         model.converged, model.lambdas
     );
 
-    // gam fits a REML-penalized thin-plate smooth-by-factor; VGAM fits an
-    // unpenalized fixed-df (ns, df=5) basis crossed with the group factor. On
-    // this strong, group-specific smooth signal with ~160 obs/group, gam's
-    // selected λ is light, so its penalized per-group curves and the unpenalized
-    // basis curves recover essentially the same probability surface. The
-    // legitimate gap is the basis difference (penalized thin-plate vs fixed
-    // natural-cubic-spline) plus the residual shrinkage gam applies — a few
-    // percent on the simplex. The relative Frobenius distance over the stacked
-    // (K × n_grid) probability matrix < 0.06 bounds the whole surface while
-    // still catching any real softmax/penalty/by-factor divergence; per-class
-    // pearson > 0.99 demands a genuinely matching shape per class, not a loose
-    // correlation. (These are looser than the strictly-penalized-vs-penalized
-    // sibling test's 0.05/0.998 precisely because one engine here is unpenalized
-    // — the honest, justified slack, not a weakening to pass.)
+    // PRIMARY claim — gam recovers the data-generating probability surface.
+    // Bar: 0.05 RMSE on the [0,1] simplex. The probabilities span essentially
+    // the full simplex range (each class crosses from near-0 to near-1 across
+    // the group-specific smooth signal), so a 0.05 RMSE is a small fraction of
+    // the signal range — a genuine accuracy bar, not a loose one. It is the
+    // honest irreducible floor here: with finite per-group N the fitted surface
+    // cannot reach the noise-free truth exactly, but a faithful penalized
+    // smooth-by-factor softmax must land within a few percent of it.
+    const PROB_RMSE_BAR: f64 = 0.05;
     assert!(
-        rel < 0.06,
-        "fitted multinomial probability surfaces diverge from VGAM: rel_l2={rel:.4}"
+        gam_truth_rmse <= PROB_RMSE_BAR,
+        "gam did not recover the true multinomial probability surface: \
+         rmse(gam, truth)={gam_truth_rmse:.5} > {PROB_RMSE_BAR}"
     );
+
+    // SECONDARY claim — gam matches or beats the mature baseline (VGAM) on the
+    // SAME objective truth-recovery error (accuracy, not mutual agreement). A
+    // 10% slack absorbs the legitimate basis/penalty difference (gam's penalized
+    // thin-plate vs VGAM's fixed-df natural cubic spline) without letting gam be
+    // meaningfully less accurate than the trusted reference.
     assert!(
-        worst > 0.99,
-        "per-class probability traces should track VGAM: \
-         pearson(c0)={corr0:.5} pearson(c1)={corr1:.5} pearson(c2)={corr2:.5}"
+        gam_truth_rmse <= ref_truth_rmse * 1.10,
+        "gam is less accurate at recovering the truth than the VGAM baseline: \
+         rmse(gam, truth)={gam_truth_rmse:.5} > 1.10 * rmse(vgam, truth)={ref_truth_rmse:.5}"
     );
 }

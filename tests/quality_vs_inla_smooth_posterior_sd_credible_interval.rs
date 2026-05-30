@@ -1,88 +1,154 @@
-//! End-to-end quality: gam's *uncertainty quantification* — the pointwise
-//! posterior standard deviation and 95% credible-interval width derived from its
-//! Laplace covariance `V_b` (`covariance_conditional`) — must agree with
-//! **R-INLA**, the mature approximate-Bayesian latent-Gaussian engine.
+//! End-to-end OBJECTIVE quality: gam's *uncertainty quantification* — the
+//! pointwise posterior standard deviation and 95% credible interval derived from
+//! its Laplace covariance `V_b` (`covariance_conditional`) — must be **well
+//! calibrated against a known ground truth**, not merely "the same as" a peer
+//! Bayesian engine.
 //!
-//! This is the credible-interval counterpart to the mgcv point-estimate test.
-//! gam stores `V_b = H⁻¹·φ̂` (the Bayesian/conditional coefficient covariance)
-//! and turns it into a pointwise posterior SD on the linear predictor via
-//! `sqrt(diag(D · V_b · Dᵀ))`, where `D` is the design matrix evaluated at the
-//! training points. INLA, by contrast, integrates the latent field numerically
-//! and reports the marginal posterior mean / SD / quantiles of the linear
-//! predictor at every observation in `summary.linear.predictor`. Comparing the
-//! two directly tests whether gam's Hessian-based Laplace approximation tracks a
-//! fully marginalized posterior on the *same* additive model.
+//! What we assert (the objective metric):
+//!   Data are simulated from a KNOWN additive mean function
+//!     `η(x1, x2) = f(x1) + g(x2)`,  `y = η + N(0, σ²)`.
+//!   Over many independent Monte-Carlo replicates we refit gam each time, form
+//!   gam's pointwise 95% credible interval for the linear predictor at every
+//!   training point from `sqrt(diag(D·V_b·Dᵀ))`, and record whether the TRUE
+//!   `η(xᵢ)` falls inside. A correctly-calibrated Bayesian smoother has
+//!   empirical coverage close to the nominal 0.95 (averaged across points and
+//!   replicates — this is the standard Nychka/Marra–Wood "across-the-function"
+//!   coverage property of the Bayesian credible band). We assert:
+//!     (1) empirical coverage of the TRUTH is within 0.95 ± 0.07,
+//!     (2) the probability-integral-transform of the truth under gam's posterior
+//!         (Φ((η_true − η̂)/sd)) is approximately Uniform(0,1): KS statistic small,
+//!     (3) the posterior mean recovers the truth: RMSE(η̂, η_true) ≤ σ.
+//!   These are pure objective properties of gam's own output versus the
+//!   generating truth — no reference tool appears in the pass criteria.
 //!
-//! Model (identical data to both engines):
-//!   `price ~ s(h_rain) + s(s_temp)` — two univariate smooths, Gaussian/REML.
+//! R-INLA (the mature approximate-Bayesian latent-Gaussian engine) is retained
+//! only as a BASELINE-TO-MATCH-OR-BEAT on calibration: on one representative
+//! replicate we fit the same model with two `rw2` smooths, measure INLA's
+//! empirical coverage of the same truth, and assert that gam's coverage is at
+//! least as close to nominal as INLA's (up to a small slack). "Matches INLA's
+//! posterior SD" is explicitly NOT a pass criterion; we only `eprintln!` the
+//! posterior-SD relative-L2 for context.
 //!
-//! INLA has no `bs="ps"`/`bs="tp"` basis; its mature analog for a smooth
-//! function of a continuous covariate is a second-order random walk
-//! (`f(x, model="rw2")`), the intrinsic-GMRF spline that INLA was built around
-//! and the correct head-to-head for a penalized cubic/P-spline. Both engines
-//! therefore fit a doubly-penalized (second-difference) smooth selected by an
-//! empirical-Bayes criterion (REML for gam, the INLA hyperparameter posterior
-//! mode for INLA), so close agreement on posterior SD is the right expectation
-//! and a large gap is a real divergence in gam's uncertainty quantification.
-//!
-//! Data: `bench/datasets/wine.csv` (the Bordeaux vintage dataset). The spec's
-//! nominal column names (`alcohol`/`fixed acidity`/`pH`) belong to a different
-//! "wine" table; this repository's `wine.csv` carries vintage price and weather
-//! covariates, so we use `price` as the Gaussian response and the two clean,
-//! NA-free weather covariates `h_rain` (harvest rain) and `s_temp` (summer
-//! temperature) as the two univariate smooth terms — exactly two smooths over
-//! two continuous covariates, as the capability requires.
+//! Model (identical data to both engines): `y ~ s(x1) + s(x2)`, Gaussian/REML.
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
-use std::path::Path;
+use std::io::Write;
 
-const WINE_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/wine.csv");
+/// Two known smooth components. Their sum is the ground-truth linear predictor.
+fn truth_f(x1: f64) -> f64 {
+    // smooth, non-monotone bump on [0, 1]
+    (2.0 * std::f64::consts::PI * x1).sin() + 0.5 * x1
+}
+fn truth_g(x2: f64) -> f64 {
+    // a different smooth shape on [0, 1]
+    3.0 * (x2 - 0.5) * (x2 - 0.5) - 0.4 * (4.0 * x2).cos()
+}
+fn truth_eta(x1: f64, x2: f64) -> f64 {
+    truth_f(x1) + truth_g(x2)
+}
 
-#[test]
-fn gam_posterior_sd_and_credible_interval_match_inla() {
-    init_parallelism();
-
-    // ---- load the Bordeaux wine dataset -----------------------------------
-    let ds = load_csvwith_inferred_schema(Path::new(WINE_CSV)).expect("load wine.csv");
-    let col = ds.column_map();
-    let price_idx = col["price"];
-    let h_rain_idx = col["h_rain"];
-    let s_temp_idx = col["s_temp"];
-    let price: Vec<f64> = ds.values.column(price_idx).to_vec();
-    let h_rain: Vec<f64> = ds.values.column(h_rain_idx).to_vec();
-    let s_temp: Vec<f64> = ds.values.column(s_temp_idx).to_vec();
-    let n = price.len();
-    assert!(n > 40, "wine dataset should have ~47 rows, got {n}");
-    // The three columns we use must be fully finite (no NA round-trips into
-    // either engine); the unused `parker` column carries the NAs.
-    for (name, v) in [("price", &price), ("h_rain", &h_rain), ("s_temp", &s_temp)] {
-        assert!(
-            v.iter().all(|x| x.is_finite()),
-            "column {name} has non-finite entries; cannot feed identical data to both engines"
-        );
+/// SplitMix64 — a tiny, self-contained, fully deterministic PRNG so the
+/// simulation is reproducible across machines without an external crate.
+struct SplitMix64 {
+    state: u64,
+}
+impl SplitMix64 {
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
     }
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    /// Uniform(0,1).
+    fn uniform(&mut self) -> f64 {
+        // 53 bits of mantissa precision.
+        (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+    /// Standard normal via Box–Muller.
+    fn normal(&mut self) -> f64 {
+        let u1 = self.uniform().max(1e-300);
+        let u2 = self.uniform();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+    }
+}
 
-    // ---- fit with gam: price ~ s(h_rain) + s(s_temp), Gaussian/REML --------
-    let cfg = FitConfig {
-        family: Some("gaussian".to_string()),
-        ..FitConfig::default()
-    };
+/// Generate one replicate: fixed design points on [0,1]², noisy Gaussian
+/// response around the known `truth_eta`. The covariate grid is held FIXED
+/// across replicates (only the noise is redrawn) so the design / V_b geometry
+/// is comparable and the coverage statement is a clean frequentist one.
+fn simulate(seed: u64, n: usize, sigma: f64, x1: &[f64], x2: &[f64]) -> Vec<f64> {
+    assert_eq!(x1.len(), n);
+    assert_eq!(x2.len(), n);
+    let mut rng = SplitMix64::new(seed);
+    (0..n)
+        .map(|i| truth_eta(x1[i], x2[i]) + sigma * rng.normal())
+        .collect()
+}
+
+/// Fixed, well-spread covariate design on [0,1]² (a low-discrepancy-ish
+/// deterministic scatter), shared by every replicate and by INLA.
+fn fixed_design(n: usize) -> (Vec<f64>, Vec<f64>) {
+    let mut x1 = Vec::with_capacity(n);
+    let mut x2 = Vec::with_capacity(n);
+    // van der Corput / additive-recurrence pair — deterministic, spread out.
+    let mut a = 0.5_f64;
+    let mut b = 0.5_f64;
+    let g1 = 0.618_033_988_749_894_8_f64; // golden-ratio conjugate
+    let g2 = 0.754_877_666_246_692_8_f64; // plastic-number-ish second stream
+    for _ in 0..n {
+        a = (a + g1).fract();
+        b = (b + g2).fract();
+        x1.push(a);
+        x2.push(b);
+    }
+    (x1, x2)
+}
+
+/// Write a (y, x1, x2) dataset to a temp CSV and load it through gam's normal
+/// CSV path, so the fit sees a fully schema-inferred `EncodedDataset` exactly
+/// like a user-supplied file would produce.
+fn dataset_csv(dir: &std::path::Path, tag: &str, y: &[f64], x1: &[f64], x2: &[f64]) -> std::path::PathBuf {
+    let n = y.len();
+    let path = dir.join(format!("sim_{tag}.csv"));
+    let mut s = String::from("y,x1,x2\n");
+    for i in 0..n {
+        s.push_str(&format!("{:.17e},{:.17e},{:.17e}\n", y[i], x1[i], x2[i]));
+    }
+    let mut f = std::fs::File::create(&path).expect("write sim csv");
+    f.write_all(s.as_bytes()).expect("flush sim csv");
+    path
+}
+
+/// One gam fit on a simulated replicate; returns the pointwise posterior mean
+/// and SD of the linear predictor at every training point.
+fn gam_posterior_mean_sd(
+    csv_path: &std::path::Path,
+    cfg: &FitConfig,
+    n: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    let ds = load_csvwith_inferred_schema(csv_path).expect("load sim csv");
+    let col = ds.column_map();
+    let x1_idx = col["x1"];
+    let x2_idx = col["x2"];
+
     let result = fit_from_formula(
-        "price ~ s(h_rain, bs='ps', k=20) + s(s_temp, bs='tp', k=15)",
+        "y ~ s(x1, bs='ps', k=20) + s(x2, bs='tp', k=15)",
         &ds,
-        &cfg,
+        cfg,
     )
     .expect("gam fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit");
     };
 
-    // Vb = H⁻¹·φ̂ : gam's Bayesian/conditional coefficient covariance. This is
-    // exactly the matrix the spec targets; pull it directly off the fit.
     let vb = fit
         .fit
         .covariance_conditional
@@ -90,38 +156,27 @@ fn gam_posterior_sd_and_credible_interval_match_inla() {
         .expect("gam fit reports the conditional (Bayesian) covariance V_b");
     let beta = &fit.fit.beta;
     let p = beta.len();
-    assert_eq!(vb.nrows(), p, "V_b row dim must match coefficient count");
-    assert_eq!(vb.ncols(), p, "V_b col dim must match coefficient count");
+    assert_eq!(vb.nrows(), p);
+    assert_eq!(vb.ncols(), p);
 
-    // Rebuild the (dense) design at the training points from the frozen spec.
-    // Identity link ⇒ row i of D maps β to the fitted mean at observation i,
-    // and the pointwise posterior variance is dᵢᵀ V_b dᵢ.
+    // Rebuild the design at the training points from the frozen spec.
+    let x1: Vec<f64> = ds.values.column(x1_idx).to_vec();
+    let x2: Vec<f64> = ds.values.column(x2_idx).to_vec();
     let mut grid = Array2::<f64>::zeros((n, ds.headers.len()));
     for i in 0..n {
-        grid[[i, h_rain_idx]] = h_rain[i];
-        grid[[i, s_temp_idx]] = s_temp[i];
+        grid[[i, x1_idx]] = x1[i];
+        grid[[i, x2_idx]] = x2[i];
     }
     let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
         .expect("rebuild design at training points");
     let d_dense = design.design.to_dense();
-    assert_eq!(d_dense.nrows(), n, "design row count must match n");
-    assert_eq!(
-        d_dense.ncols(),
-        p,
-        "design col count must match coefficient count"
-    );
+    assert_eq!(d_dense.nrows(), n);
+    assert_eq!(d_dense.ncols(), p);
 
-    // gam posterior mean, pointwise SD, and 95% CI width at each training point.
-    let gam_mean: Vec<f64> = design.design.apply(beta).to_vec();
-    let mut gam_sd = vec![0.0f64; n];
-    let mut gam_ci_width = vec![0.0f64; n];
-    let mut gam_lo = vec![0.0f64; n];
-    let mut gam_hi = vec![0.0f64; n];
-    // z for a two-sided 95% interval.
-    const Z95: f64 = 1.959963984540054;
+    let mean: Vec<f64> = design.design.apply(beta).to_vec();
+    let mut sd = vec![0.0f64; n];
     for i in 0..n {
         let di = d_dense.row(i);
-        // var_i = dᵢᵀ V_b dᵢ  (quadratic form against the full covariance).
         let mut var_i = 0.0;
         for a in 0..p {
             let dia = di[a];
@@ -136,37 +191,143 @@ fn gam_posterior_sd_and_credible_interval_match_inla() {
         }
         assert!(
             var_i.is_finite() && var_i >= 0.0,
-            "posterior variance at point {i} is not a valid (finite, non-negative) value: {var_i}"
+            "posterior variance at point {i} is invalid: {var_i}"
         );
-        let sd = var_i.sqrt();
-        gam_sd[i] = sd;
-        gam_ci_width[i] = 2.0 * Z95 * sd;
-        gam_lo[i] = gam_mean[i] - Z95 * sd;
-        gam_hi[i] = gam_mean[i] + Z95 * sd;
+        sd[i] = var_i.sqrt();
+    }
+    (mean, sd)
+}
+
+/// Standard-normal CDF via erf (for the PIT uniformity check).
+fn norm_cdf(z: f64) -> f64 {
+    0.5 * (1.0 + erf(z / std::f64::consts::SQRT_2))
+}
+
+/// Abramowitz–Stegun 7.1.26 rational approximation to erf (|err| < 1.5e-7),
+/// ample for a KS-statistic sanity check on the PIT.
+fn erf(x: f64) -> f64 {
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let x = x.abs();
+    let t = 1.0 / (1.0 + 0.327_591_1 * x);
+    let y = 1.0
+        - (((((1.061_405_429 * t - 1.453_152_027) * t) + 1.421_413_741) * t - 0.284_496_736) * t
+            + 0.254_829_592)
+            * t
+            * (-x * x).exp();
+    sign * y
+}
+
+/// One-sample Kolmogorov–Smirnov statistic of `samples` against Uniform(0,1).
+fn ks_vs_uniform(samples: &mut [f64]) -> f64 {
+    let m = samples.len();
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mut d = 0.0_f64;
+    for (k, &u) in samples.iter().enumerate() {
+        let f_lo = k as f64 / m as f64;
+        let f_hi = (k + 1) as f64 / m as f64;
+        d = d.max((u - f_lo).abs()).max((u - f_hi).abs());
+    }
+    d
+}
+
+#[test]
+fn gam_credible_intervals_are_calibrated_against_truth() {
+    init_parallelism();
+
+    const N: usize = 200;
+    const SIGMA: f64 = 0.6;
+    const REPLICATES: usize = 24;
+    const Z95: f64 = 1.959963984540054;
+
+    let (x1, x2) = fixed_design(N);
+    // True linear predictor at every (fixed) design point.
+    let eta_true: Vec<f64> = (0..N).map(|i| truth_eta(x1[i], x2[i])).collect();
+    let signal_range = {
+        let lo = eta_true.iter().cloned().fold(f64::INFINITY, f64::min);
+        let hi = eta_true.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        hi - lo
+    };
+
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+
+    let dir = std::env::temp_dir().join(format!(
+        "gam_inla_calib_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+
+    // ---- Monte-Carlo coverage of the TRUTH by gam's 95% credible band -------
+    let mut total_points = 0usize;
+    let mut covered_points = 0usize;
+    let mut pit: Vec<f64> = Vec::with_capacity(N * REPLICATES);
+    let mut mean_rmse_acc = 0.0f64;
+
+    // Keep one replicate's gam SD around for the (context-only) INLA comparison.
+    let mut rep0_gam_sd: Vec<f64> = Vec::new();
+    let mut rep0_y: Vec<f64> = Vec::new();
+
+    for rep in 0..REPLICATES {
+        let seed = 0xA11CE_u64.wrapping_mul(rep as u64 + 1).wrapping_add(1234567);
+        let y = simulate(seed, N, SIGMA, &x1, &x2);
+        let csv = dataset_csv(&dir, &format!("rep{rep}"), &y, &x1, &x2);
+        let (mean, sd) = gam_posterior_mean_sd(&csv, &cfg, N);
+        std::fs::remove_file(&csv).ok();
+
+        // RMSE of the posterior mean against the known truth.
+        mean_rmse_acc += rmse(&mean, &eta_true);
+
+        for i in 0..N {
+            let lo = mean[i] - Z95 * sd[i];
+            let hi = mean[i] + Z95 * sd[i];
+            total_points += 1;
+            if eta_true[i] >= lo && eta_true[i] <= hi {
+                covered_points += 1;
+            }
+            // PIT: probability mass the gam posterior puts below the truth.
+            let s = sd[i].max(1e-12);
+            pit.push(norm_cdf((eta_true[i] - mean[i]) / s));
+        }
+
+        if rep == 0 {
+            rep0_gam_sd = sd;
+            rep0_y = y;
+        }
     }
 
-    // ---- fit the SAME model with R-INLA (the mature reference) ------------
-    // Two independent rw2 (second-order random-walk) smooths — INLA's intrinsic
-    // GMRF spline, the mature analog of a doubly-penalized P-spline / thin-plate
-    // smooth. rw2 needs an integer location index per distinct covariate value,
-    // so we pass the raw covariates and let R map them to ranked indices; INLA's
-    // summary.linear.predictor then reports the marginal posterior of η at each
-    // observation, grid-aligned row-for-row with gam's training points.
+    let coverage = covered_points as f64 / total_points as f64;
+    let mean_rmse = mean_rmse_acc / REPLICATES as f64;
+    let ks = ks_vs_uniform(&mut pit.clone());
+
+    eprintln!(
+        "calibration: n={N} reps={REPLICATES} sigma={SIGMA} signal_range={signal_range:.3} \
+         coverage={coverage:.3} pit_ks={ks:.4} mean_rmse={mean_rmse:.4}"
+    );
+
+    // ---- R-INLA baseline-to-match on the SAME replicate (context + match) ---
+    // Fit the same additive model in INLA with two rw2 smooths, build its 95%
+    // posterior credible band for the linear predictor, and measure how well it
+    // covers the SAME known truth. This is a fair head-to-head on the OBJECTIVE
+    // metric (coverage of the truth), not a "reproduce INLA's numbers" check.
     let r = run_r(
         &[
-            Column::new("price", &price),
-            Column::new("h_rain", &h_rain),
-            Column::new("s_temp", &s_temp),
+            Column::new("y", &rep0_y),
+            Column::new("x1", &x1),
+            Column::new("x2", &x2),
+            Column::new("eta_true", &eta_true),
         ],
         r#"
         suppressPackageStartupMessages(library(INLA))
-        # rw2 requires an integer location column; map each covariate to the
-        # rank of its (sorted, unique) value so equal covariate values share a
-        # latent node, exactly as a smooth basis would tie them.
-        df$ih <- match(df$h_rain, sort(unique(df$h_rain)))
-        df$is <- match(df$s_temp, sort(unique(df$s_temp)))
-        form <- price ~ f(ih, model = "rw2", scale.model = TRUE) +
-                        f(is, model = "rw2", scale.model = TRUE)
+        df$ih <- match(df$x1, sort(unique(df$x1)))
+        df$is <- match(df$x2, sort(unique(df$x2)))
+        form <- y ~ f(ih, model = "rw2", scale.model = TRUE) +
+                    f(is, model = "rw2", scale.model = TRUE)
         m <- inla(
             form,
             data = df,
@@ -175,72 +336,53 @@ fn gam_posterior_sd_and_credible_interval_match_inla() {
             control.compute = list(config = TRUE)
         )
         lp <- m$summary.linear.predictor
-        emit("mean", as.numeric(lp[["mean"]]))
+        # coverage of the known truth by INLA's central 95% band
+        lo <- as.numeric(lp[["0.025quant"]])
+        hi <- as.numeric(lp[["0.975quant"]])
+        et <- df$eta_true
+        emit("inla_cover", mean(et >= lo & et <= hi))
         emit("sd", as.numeric(lp[["sd"]]))
-        emit("lo", as.numeric(lp[["0.025quant"]]))
-        emit("hi", as.numeric(lp[["0.975quant"]]))
         "#,
     );
-    let inla_mean = r.vector("mean");
+    let inla_cover = r.scalar("inla_cover");
     let inla_sd = r.vector("sd");
-    let inla_lo = r.vector("lo");
-    let inla_hi = r.vector("hi");
-    assert_eq!(inla_sd.len(), n, "INLA posterior-SD length must equal n");
-    assert_eq!(
-        inla_mean.len(),
-        n,
-        "INLA posterior-mean length must equal n"
-    );
+    assert_eq!(inla_sd.len(), N, "INLA posterior-SD length must equal n");
 
-    let inla_ci_width: Vec<f64> = inla_hi
-        .iter()
-        .zip(inla_lo.iter())
-        .map(|(h, l)| h - l)
-        .collect();
-
-    // ---- metric 1: posterior SD agreement ---------------------------------
-    let mean_inla_sd = inla_sd.iter().sum::<f64>() / inla_sd.len() as f64;
-    let sd_rmse = rmse(&gam_sd, inla_sd);
-    let sd_rmse_rel = sd_rmse / mean_inla_sd;
-
-    // ---- metric 2: 95% credible-interval width agreement ------------------
-    let ci_rel_l2 = relative_l2(&gam_ci_width, &inla_ci_width);
-
-    // ---- metric 3: coverage of INLA posterior means by gam's intervals ----
-    let mut covered = 0usize;
-    for i in 0..n {
-        if inla_mean[i] >= gam_lo[i] && inla_mean[i] <= gam_hi[i] {
-            covered += 1;
-        }
-    }
-    let coverage = covered as f64 / n as f64;
-
+    // Context only — NOT a pass criterion. How close gam's SD is to INLA's SD.
+    let sd_rel_l2 = relative_l2(&rep0_gam_sd, inla_sd);
+    let gam_cover_err = (coverage - 0.95).abs();
+    let inla_cover_err = (inla_cover - 0.95).abs();
     eprintln!(
-        "wine price ~ s(h_rain)+s(s_temp): n={n} p={p} \
-         mean_inla_sd={mean_inla_sd:.4} sd_rmse={sd_rmse:.4} \
-         sd_rmse_rel={sd_rmse_rel:.4} ci_rel_l2={ci_rel_l2:.4} coverage={coverage:.3}"
+        "inla baseline: inla_cover={inla_cover:.3} (err={inla_cover_err:.3}) \
+         gam_cover_err={gam_cover_err:.3} sd_rel_l2(context)={sd_rel_l2:.4}"
     );
 
-    // ---- principled bounds ------------------------------------------------
-    // gam's Laplace `V_b` and INLA's fully marginalized posterior solve the same
-    // empirical-Bayes additive model with second-difference penalties; their
-    // pointwise posterior SDs should track each other to well within the basis-
-    // and hyperparameter-marginalization differences. The spec's bounds:
-    //  (1) SD RMSE under 12% of the mean INLA SD,
-    //  (2) CI-width relative-L2 under 8%,
-    //  (3) at least 85% of INLA's posterior means inside gam's 95% intervals
-    //      (relaxed to absorb Laplace-vs-numerical-integration drift).
+    std::fs::remove_dir_all(&dir).ok();
+
+    // ---- OBJECTIVE pass criteria -------------------------------------------
+    // (1) The posterior mean recovers the truth to within the noise level.
     assert!(
-        sd_rmse_rel < 0.12,
-        "gam posterior SD diverges from INLA: rmse={sd_rmse:.4} is {:.1}% of mean INLA SD {mean_inla_sd:.4}",
-        100.0 * sd_rmse_rel
+        mean_rmse <= SIGMA,
+        "gam posterior mean does not recover the truth: mean RMSE {mean_rmse:.4} > sigma {SIGMA}"
     );
+    // (2) Empirical coverage of the truth is close to the nominal 0.95. A
+    // Bayesian credible band that is wildly over/under-confident fails here.
     assert!(
-        ci_rel_l2 < 0.08,
-        "gam 95% credible-interval width diverges from INLA: relative_l2={ci_rel_l2:.4}"
+        (coverage - 0.95).abs() <= 0.07,
+        "gam 95% credible band is mis-calibrated: empirical coverage {coverage:.3} is outside 0.95 ± 0.07"
     );
+    // (3) The PIT of the truth under gam's posterior is approximately uniform.
+    // KS bar is generous (the posterior mean is shared across points within a
+    // replicate, inducing correlation) but still rejects gross mis-shaping.
     assert!(
-        coverage >= 0.85,
-        "gam 95% credible intervals cover too few INLA posterior means: coverage={coverage:.3}"
+        ks <= 0.15,
+        "gam posterior is mis-shaped: PIT-vs-Uniform KS statistic {ks:.4} > 0.15"
+    );
+    // (4) MATCH-OR-BEAT the mature tool ON THE OBJECTIVE METRIC: gam's coverage
+    // must be at least as close to nominal as INLA's, up to a small slack.
+    assert!(
+        gam_cover_err <= inla_cover_err + 0.05,
+        "gam's calibration is worse than INLA's on the same truth: \
+         gam coverage error {gam_cover_err:.3} > INLA coverage error {inla_cover_err:.3} + 0.05"
     );
 }

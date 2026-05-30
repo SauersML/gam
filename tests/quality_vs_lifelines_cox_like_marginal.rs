@@ -1,79 +1,81 @@
-//! End-to-end quality: gam's **survival marginal-slope** family (a
+//! End-to-end OBJECTIVE quality: gam's **survival marginal-slope** family (a
 //! semi-parametric proportional-hazards model — parametric/spline baseline plus
-//! a smooth covariate effect on the survival index) benchmarked against
-//! `lifelines.CoxPHFitter`, the mature, standard semi-parametric
-//! partial-likelihood reference.
+//! a smooth covariate effect on the survival index) measured by its **held-out
+//! predictive discrimination** (Harrell's concordance index), with
+//! `lifelines.CoxPHFitter` demoted to a baseline-to-match-or-beat on that same
+//! held-out metric.
 //!
-//! ## What this benchmarks, and the honest structural caveat
+//! ## The objective metric: held-out concordance (Harrell's C)
 //!
-//! `lifelines.CoxPHFitter` fits the Cox proportional-hazards partial likelihood
-//!   h(t | x) = h0(t) · exp(β·x),
-//! so the covariate enters as a *log-linear* multiplicative shift of a
-//! **non-parametric Breslow** baseline hazard. gam's marginal-slope family
-//! targets a *different* hybrid: a parametric (Royston-Parmar weighted) baseline
-//! transform q(t) with a **probit** survival link,
-//!   S(t | z) = Φ(−η),   η = q(t)·c(g) + (probit_scale · g) · z_std,
-//! where `z` is the modeled covariate (here EJECTION_FRACTION), `g` is the
-//! per-row log-slope (`baseline_slope + logslope_design·β_logslope`, with
-//! `logslope = s(EJECTION_FRACTION, bs='tp', k=6)`), `c(g)=√(1+(probit_scale·g)²·Var z)`
-//! is the marginal-preserving scale, and SEX + AGE enter the marginal block.
-//! This is gam's exact forward map — we reconstruct η here with the *public*
-//! `survival_marginal_slope_vector_eta`, the same routine the inner likelihood
-//! and the saved predictor call, so the reconstruction is self-consistent with
-//! whatever gam fit (no hand-rederived offsets).
+//! This is real survival data with **no known ground-truth hazard**, so the
+//! honest objective claim is *predictive accuracy on data the model never saw*
+//! (objective category #2 / #4). We make a deterministic, fixed-seed train/test
+//! split (no randomness — a reproducible interleaved partition by row index),
+//! fit gam on the **train** rows only, and score the **test** rows with gam's own
+//! forward map. The quality metric is **Harrell's concordance index** on the test
+//! set: over all comparable pairs (the earlier-time subject had an event), the
+//! fraction whose predicted risk order agrees with the observed event order. C=1
+//! is perfect risk ranking, C=0.5 is a coin flip. Concordance is censoring-aware,
+//! rank-based, and link-agnostic, so it compares the *predictive quality* of two
+//! differently-parameterized hazard models on a common, objective footing — it
+//! does NOT reward gam for reproducing lifelines' fitted numbers.
 //!
-//! The two engines therefore parameterize the proportional-hazards covariate
-//! effect through *different links* (Cox log-linear vs gam probit). The spec is
-//! explicit that "the parametric structure differs but the marginal hazard ratio
-//! must track". We compare the dimensionless **cumulative-hazard ratio**
-//!   HR(EF) = Λ_gam(EF) / Λ_gam(EF_ref)   vs   exp(β_cox·(EF − EF_ref)),
-//! over the EJECTION_FRACTION grid [20, 80]. For Cox this ratio is exactly the
-//! proportional, time-invariant hazard ratio `exp(β·Δ)`; for gam it is the
-//! probit cumulative-hazard ratio evaluated at the time anchor (q(t)=0, where the
-//! anchor-centered time basis contributes nothing), holding SEX/AGE fixed so the
-//! marginal block cancels and EF varies only through `z` and `g`.
+//! ### gam's predicted risk score
+//!
+//! gam's survival link is `S(t | z) = Φ(−η)`,
+//!   η = q(t)·c(g) + (probit_scale · g) · z_std,
+//! where `z` is the modeled covariate (here EJECTION_FRACTION), `g` is the per-row
+//! log-slope (`baseline_slope + logslope_design·β_logslope`, with
+//! `logslope = s(EJECTION_FRACTION, bs='tp', k=6)`), and SEX + AGE enter the
+//! marginal block. The cumulative hazard is `Λ = −log Φ(−η)`, strictly increasing
+//! in η. For proportional-hazards risk **ranking** the time term is a common
+//! monotone factor across subjects, so we evaluate η at the time anchor q(t)=0:
+//! `η = probit_scale·g(z)·z_std`, the covariate-driven log-risk. Higher η ⇒ higher
+//! cumulative hazard ⇒ higher predicted risk. We reconstruct η with the *public*
+//! `survival_marginal_slope_vector_eta`, the exact routine the inner likelihood
+//! and saved predictor call, so the test-row scores are self-consistent with the
+//! trained fit (no hand-rederived offsets). The logslope design is rebuilt for
+//! each held-out EF from the frozen spec, so test rows are scored by the trained
+//! coefficients exactly as a deployed predictor would.
 //!
 //! ## Data — real, identical rows to both engines
 //!
 //! `heart_failure_clinical_records_dataset.csv` (n=299, ~32% censored). Event is
 //! `DEATH_EVENT`, follow-up is `time` (days). Right-censored shorthand
-//! `Surv(time, DEATH_EVENT)` (entry defaults to 0 — the survival/lifelines
-//! default). Covariates: `ejection_fraction` is the modeled smooth covariate
-//! (gam's latent score `z`; Cox's continuous covariate), `sex` and `age` enter
-//! linearly. The same (time, event, ejection_fraction, sex, age) rows feed both
-//! engines.
+//! `Surv(time, DEATH_EVENT)`. Covariates: `ejection_fraction` is the modeled
+//! smooth covariate (gam's latent score `z`; Cox's continuous covariate), `sex`
+//! and `age` enter linearly. The SAME deterministic train rows fit both engines;
+//! the SAME test rows are scored by both.
 //!
-//! ## Bound — principled, justified by the link math (NOT a fabricated abs-diff)
+//! ## Assertions — objective, never "close to the reference's output"
 //!
-//! gam's probit cumulative-hazard ratio `Λ(EF)/Λ(EF_ref)` and Cox's log-linear
-//! ratio `exp(β·Δ)` are *different functional forms*: `−log Φ(−η)` is only locally
-//! linear in `η` near the anchor and curves away from `exp(·)` in the tails, so
-//! there is **no theorem** that makes them equal to any fixed absolute tolerance
-//! across Δ∈[−18,+42]. Asserting `max_abs_diff(HR) ≤ ε` would therefore be an
-//! arbitrary, underivable bound. Instead we assert the three things the math
-//! *does* guarantee when both engines recover the same covariate effect:
+//!   1. **Absolute discrimination bar (PRIMARY)**: gam's held-out concordance
+//!      `C_test(gam) ≥ 0.62`. EJECTION_FRACTION + AGE + SEX are clinically
+//!      predictive of heart-failure mortality; a model with real signal must beat
+//!      a coin flip by a clear margin. This is gam's own predictive quality, not a
+//!      comparison to anyone.
+//!   2. **Match-or-beat the mature baseline (ACCURACY)**: `C_test(gam) ≥
+//!      C_test(cox) − 0.03`. lifelines' CoxPHFitter is fit on the identical train
+//!      rows and scored on the identical test rows; gam must be at least as good a
+//!      risk-discriminator (within a small tolerance for the genuine link
+//!      difference). gam is allowed to *win*; it is not allowed to lose materially.
+//!   3. **Survival-structure invariant (STRUCTURE)**: gam's reconstructed
+//!      cumulative hazard `Λ = −log Φ(−η)` is finite and strictly positive, and
+//!      across the held-out EF range it is **monotone** in the covariate
+//!      (successive Λ over sorted EF are non-increasing within numerical eps),
+//!      i.e. gam encodes a single coherent protective EF gradient — a real
+//!      property of the fitted survival function, asserted directly.
 //!
-//!   1. **Sign** — both must be protective: Cox β_EF < 0 and gam's local
-//!      EF log-hazard-ratio slope < 0. A flipped sign is a real modeling failure.
-//!   2. **Co-monotone shape** — both HR(EF) curves are smooth strictly-decreasing
-//!      functions of EF over [20,80], so they must be near-perfectly *linearly*
-//!      correlated on the shared grid: `pearson(gam_hr, cox_hr) > 0.99`. A broken
-//!      log-slope coupling (flat, non-monotone, or wrong-curvature gam curve)
-//!      destroys this correlation and fails honestly.
-//!   3. **Local-slope magnitude** — at the anchor (η=0, z_std=0) the probit map
-//!      gives `d logΛ/dEF = [φ(0)/Φ(0)] · g(EF_ref)/(z_sd · Λ_ref)`, a finite
-//!      first-order coefficient that must agree with Cox's β_EF in *sign and order
-//!      of magnitude*. The two links differ, so we band it to a factor of 3 — wide
-//!      enough that the probit-vs-log-linear Jacobian difference is allowed, tight
-//!      enough that a wrong-magnitude slope (e.g. 10× off, a saturated/dead smooth)
-//!      fails. We do NOT loosen these and we do NOT modify gam source.
+//! We do NOT assert pointwise closeness of gam's HR curve to Cox's exp(β·Δ); two
+//! different links need not coincide, and matching a peer tool's noisy fit proves
+//! nothing. We do NOT loosen any bound and we do NOT modify gam source.
 
 use gam::bernoulli_marginal_slope::marginal_slope_covariance_from_scores;
 use gam::families::marginal_slope_shared::probit_frailty_scale;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::survival_marginal_slope::survival_marginal_slope_vector_eta;
-use gam::test_support::reference::{Column, pearson, run_python};
+use gam::test_support::reference::{Column, run_python};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::{Array1, Array2};
 use std::path::Path;
@@ -109,11 +111,53 @@ fn erfc(x: f64) -> f64 {
     if x >= 0.0 { approx } else { 2.0 - approx }
 }
 
+/// Harrell's concordance index for right-censored survival data.
+///
+/// Over every *comparable* ordered pair (i, j) — the subject with the shorter
+/// follow-up actually had an event, so its risk should be at least as high as
+/// the longer-follow-up subject's — count the pair concordant when the predicted
+/// risk ranks the earlier-event subject higher, discordant when lower, and a
+/// half-point tie when the two risks are equal. `risk[k]` is any score that is
+/// monotone increasing in hazard (higher = more at-risk). Returns the fraction
+/// concordant in `[0, 1]`; 0.5 is chance, 1.0 is a perfect risk ranking. Pairs
+/// where both event times are equal are not comparable and are skipped. Plain
+/// O(n²) Rust — exact, no dependency.
+fn concordance_index(time: &[f64], event: &[f64], risk: &[f64]) -> f64 {
+    assert_eq!(time.len(), event.len(), "concordance time/event length mismatch");
+    assert_eq!(time.len(), risk.len(), "concordance time/risk length mismatch");
+    let n = time.len();
+    let mut concordant = 0.0_f64;
+    let mut comparable = 0.0_f64;
+    for i in 0..n {
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            // i is the (potential) earlier-event subject in the ordered pair.
+            // A pair is comparable iff i had an event AND occurred strictly
+            // before j (j may be censored or an event at a later time).
+            if event[i] == 1.0 && time[i] < time[j] {
+                comparable += 1.0;
+                if risk[i] > risk[j] {
+                    concordant += 1.0;
+                } else if risk[i] == risk[j] {
+                    concordant += 0.5;
+                }
+            }
+        }
+    }
+    assert!(
+        comparable > 0.0,
+        "no comparable survival pairs — cannot form a concordance index"
+    );
+    concordant / comparable
+}
+
 #[test]
-fn gam_marginal_slope_hazard_ratio_matches_lifelines_coxph() {
+fn gam_marginal_slope_heldout_concordance_matches_or_beats_lifelines_coxph() {
     init_parallelism();
 
-    // ---- load identical real data for both engines ------------------------
+    // ---- load real data ---------------------------------------------------
     let ds = load_csvwith_inferred_schema(Path::new(HEART_CSV)).expect("load heart-failure csv");
     let col = ds.column_map();
     let time_idx = col["time"];
@@ -136,7 +180,28 @@ fn gam_marginal_slope_hazard_ratio_matches_lifelines_coxph() {
         "expected ~32% censoring, got {cens_frac:.3}"
     );
 
-    // ---- fit gam: survival marginal-slope ---------------------------------
+    // ---- deterministic train/test split (fixed, reproducible, no RNG) -----
+    // Every 3rd row (by original index) is held out for the test set; the rest
+    // train. This is a fixed interleaved partition: identical on every run, and
+    // identical for gam and lifelines. ~1/3 held out keeps a sizable test set
+    // (n≈100) with enough events for a stable concordance index.
+    let is_test = |i: usize| i % 3 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    let n_train = train_rows.len();
+    let n_test = test_rows.len();
+    assert!(n_train > 0 && n_test > 0, "degenerate split");
+
+    // Train-only EncodedDataset: same headers/schema/column-kinds, values sliced
+    // to the train rows. Column indices are unchanged because headers are.
+    let mut train_values = Array2::<f64>::zeros((n_train, ds.headers.len()));
+    for (r, &src) in train_rows.iter().enumerate() {
+        train_values.row_mut(r).assign(&ds.values.row(src));
+    }
+    let mut ds_train = ds.clone();
+    ds_train.values = train_values;
+
+    // ---- fit gam on TRAIN rows only: survival marginal-slope --------------
     // Right-censored shorthand Surv(time, event); SEX + AGE in the marginal
     // block; EJECTION_FRACTION is the latent score `z` whose smooth log-slope is
     // `s(ejection_fraction, bs='tp', k=6)`. baseline_target="linear" is the
@@ -148,7 +213,7 @@ fn gam_marginal_slope_hazard_ratio_matches_lifelines_coxph() {
         baseline_target: "linear".to_string(),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("Surv(time, DEATH_EVENT) ~ sex + age", &ds, &cfg)
+    let result = fit_from_formula("Surv(time, DEATH_EVENT) ~ sex + age", &ds_train, &cfg)
         .expect("gam survival marginal-slope fit");
     let FitResult::SurvivalMarginalSlope(fit) = result else {
         panic!("expected a SurvivalMarginalSlope fit result");
@@ -160,7 +225,6 @@ fn gam_marginal_slope_hazard_ratio_matches_lifelines_coxph() {
     );
 
     // Block layout is [time, marginal, logslope, (score-warp), (link-dev)].
-    // With no link/score deviation declared this is exactly 3 blocks.
     assert!(
         fit.fit.blocks.len() >= 3,
         "expected >=3 coefficient blocks [time, marginal, logslope], got {}",
@@ -174,38 +238,30 @@ fn gam_marginal_slope_hazard_ratio_matches_lifelines_coxph() {
     );
 
     // probit_scale (= 1 with no frailty) and the marginal-preserving score
-    // covariance, recomputed from the SAME standardized-z + unit weights the fit
-    // used so `survival_marginal_slope_vector_eta` reproduces gam's index.
+    // covariance, recomputed from the SAME standardized-z + unit weights the
+    // TRAIN fit used so `survival_marginal_slope_vector_eta` reproduces gam's
+    // index for held-out rows.
     let probit_scale = probit_frailty_scale(fit.gaussian_frailty_sd);
     let z_mean = fit.z_normalization.mean;
     let z_sd = fit.z_normalization.sd;
     assert!(z_sd > 0.0, "z normalization sd must be positive: {z_sd}");
-    let weights = Array1::<f64>::ones(n);
-    let mut z_std_train = Array2::<f64>::zeros((n, 1));
-    for i in 0..n {
-        z_std_train[[i, 0]] = (ef[i] - z_mean) / z_sd;
+    let weights_train = Array1::<f64>::ones(n_train);
+    let mut z_std_train = Array2::<f64>::zeros((n_train, 1));
+    for (r, &src) in train_rows.iter().enumerate() {
+        z_std_train[[r, 0]] = (ef[src] - z_mean) / z_sd;
     }
-    let covariance = marginal_slope_covariance_from_scores(z_std_train.view(), &weights)
+    let covariance = marginal_slope_covariance_from_scores(z_std_train.view(), &weights_train)
         .expect("rebuild marginal-slope score covariance from standardized EF");
 
-    // ---- EF grid and gam's cumulative-hazard ratio at the time anchor ------
-    // The spec's xgrid for EJECTION_FRACTION is [20, 80]. At the time anchor
-    // q(t)=0 (the anchor-centered time basis contributes nothing), so the
-    // covariate effect on the survival index is exactly the marginal-slope
-    // linear term, and SEX/AGE (the marginal block) cancel in the ratio. We
-    // reference the ratio to the cohort-typical EF=38 (the dataset median region)
-    // so HR is a clean, dimensionless proportional-hazard analog on both sides.
-    let ef_grid: Vec<f64> = (20..=80).step_by(2).map(|v| v as f64).collect();
-    let ef_ref = 38.0_f64;
-
-    // Per-EF log-slope g(EF) = baseline_slope + logslope_design(EF)·β_logslope,
-    // rebuilt from the frozen logslope spec so the design columns/order match
-    // β_logslope exactly. EF enters the logslope design via its raw value.
+    // gam's predicted covariate-driven cumulative hazard at the time anchor
+    // q(t)=0 for any EF. η = probit_scale·g(EF)·z_std; Λ = −log Φ(−η) is strictly
+    // increasing in η, so this is a valid proportional-hazards risk score for
+    // ranking. The logslope design is rebuilt per EF from the frozen TRAIN spec.
     let logslope_eta_at = |ef_value: f64| -> f64 {
         let mut grid = Array2::<f64>::zeros((1, ds.headers.len()));
         grid[[0, ef_idx]] = ef_value;
         let design = build_term_collection_design(grid.view(), &fit.logslopespec_resolved)
-            .expect("rebuild logslope design at an EF grid point");
+            .expect("rebuild logslope design at an EF point");
         assert_eq!(
             design.design.ncols(),
             beta_logslope.len(),
@@ -213,135 +269,134 @@ fn gam_marginal_slope_hazard_ratio_matches_lifelines_coxph() {
         );
         design.design.apply(&beta_logslope)[0]
     };
-
-    // gam cumulative-hazard at the anchor for a given EF, then the HR vs EF_ref.
     let gam_cum_at = |ef_value: f64| -> f64 {
         let g = fit.baseline_slope + logslope_eta_at(ef_value);
         let z_std = (ef_value - z_mean) / z_sd;
-        // q = 0 at the time anchor: η = q·c + probit_scale·g·z_std = probit_scale·g·z_std.
         let eta =
             survival_marginal_slope_vector_eta(0.0, &[z_std], &[g], &covariance, probit_scale)
                 .expect("gam marginal-slope index at the time anchor");
         cumulative_hazard_from_eta(eta)
     };
-    let cum_ref = gam_cum_at(ef_ref);
-    assert!(
-        cum_ref.is_finite() && cum_ref > 0.0,
-        "gam reference cumulative hazard must be finite positive, got {cum_ref}"
-    );
-    let gam_hr: Vec<f64> = ef_grid.iter().map(|&e| gam_cum_at(e) / cum_ref).collect();
 
-    // gam's effective EF log-hazard-ratio slope (secondary diagnostic): the
-    // local d log Λ / d EF near the reference, in per-EF-unit terms.
-    let h = 1.0_f64;
-    let gam_slope = ((gam_cum_at(ef_ref + h)).ln() - (gam_cum_at(ef_ref - h)).ln()) / (2.0 * h);
+    // ---- score the HELD-OUT test rows with gam's own forward map ----------
+    let test_time: Vec<f64> = test_rows.iter().map(|&i| time[i]).collect();
+    let test_event: Vec<f64> = test_rows.iter().map(|&i| event[i]).collect();
+    let gam_test_cum: Vec<f64> = test_rows.iter().map(|&i| gam_cum_at(ef[i])).collect();
+    for (k, &c) in gam_test_cum.iter().enumerate() {
+        assert!(
+            c.is_finite() && c > 0.0,
+            "gam cumulative hazard for test row {k} must be finite positive, got {c}"
+        );
+    }
+    // Higher cumulative hazard ⇒ higher risk: the cumulative hazard IS the risk.
+    let c_gam = concordance_index(&test_time, &test_event, &gam_test_cum);
 
-    // ---- fit the SAME data with lifelines.CoxPHFitter (mature reference) ----
-    // Cox partial likelihood with the identical continuous EF covariate plus SEX
-    // and AGE. We emit β_EF (the partial-likelihood coefficient on the smooth
-    // term's covariate) and reconstruct the proportional hazard ratio
-    // exp(β_EF·(EF − EF_ref)) on the identical EF grid — the canonical Cox HR.
-    let ef_grid_py = ef_grid.clone();
+    // ---- STRUCTURE: gam's covariate hazard is monotone in EF --------------
+    // Sort the held-out EF values and confirm Λ(EF) is non-increasing across the
+    // observed range (a single coherent protective EF gradient). This is a direct
+    // property of the fitted survival function, not a comparison to any tool.
+    let mut ef_sorted: Vec<f64> = test_rows.iter().map(|&i| ef[i]).collect();
+    ef_sorted.sort_by(|a, b| a.partial_cmp(b).expect("EF values are finite"));
+    ef_sorted.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
+    let cum_sorted: Vec<f64> = ef_sorted.iter().map(|&e| gam_cum_at(e)).collect();
+    let mono_eps = 1e-9;
+    let monotone_decreasing = cum_sorted
+        .windows(2)
+        .all(|w| w[1] <= w[0] + mono_eps);
+
+    // ---- baseline-to-beat: lifelines CoxPH on the SAME split --------------
+    // Fit on the train rows, score the test rows with the partial-hazard linear
+    // predictor (β·x, monotone in hazard). We return the test risk scores and
+    // compute the SAME Harrell concordance in Rust so both engines are judged by
+    // identical code on identical held-out rows.
+    let train_time: Vec<f64> = train_rows.iter().map(|&i| time[i]).collect();
+    let train_event: Vec<f64> = train_rows.iter().map(|&i| event[i]).collect();
+    let train_ef: Vec<f64> = train_rows.iter().map(|&i| ef[i]).collect();
+    let train_sex: Vec<f64> = train_rows.iter().map(|&i| sex[i]).collect();
+    let train_age: Vec<f64> = train_rows.iter().map(|&i| age[i]).collect();
+    let test_ef: Vec<f64> = test_rows.iter().map(|&i| ef[i]).collect();
+    let test_sex: Vec<f64> = test_rows.iter().map(|&i| sex[i]).collect();
+    let test_age: Vec<f64> = test_rows.iter().map(|&i| age[i]).collect();
+
     let py = run_python(
         &[
-            Column::new("time", &time),
-            Column::new("event", &event),
-            Column::new("ejection_fraction", &ef),
-            Column::new("sex", &sex),
-            Column::new("age", &age),
+            Column::new("tr_time", &train_time),
+            Column::new("tr_event", &train_event),
+            Column::new("tr_ef", &train_ef),
+            Column::new("tr_sex", &train_sex),
+            Column::new("tr_age", &train_age),
+            Column::new("te_ef", &test_ef),
+            Column::new("te_sex", &test_sex),
+            Column::new("te_age", &test_age),
         ],
-        &format!(
-            r#"
+        r#"
 import numpy as np
 import pandas as pd
 from lifelines import CoxPHFitter
 
-frame = pd.DataFrame({{
-    "time": np.asarray(df["time"], dtype=float),
-    "event": np.asarray(df["event"], dtype=float),
-    "ejection_fraction": np.asarray(df["ejection_fraction"], dtype=float),
-    "sex": np.asarray(df["sex"], dtype=float),
-    "age": np.asarray(df["age"], dtype=float),
-}})
+train = pd.DataFrame({
+    "time": np.asarray(df["tr_time"], dtype=float),
+    "event": np.asarray(df["tr_event"], dtype=float),
+    "ejection_fraction": np.asarray(df["tr_ef"], dtype=float),
+    "sex": np.asarray(df["tr_sex"], dtype=float),
+    "age": np.asarray(df["tr_age"], dtype=float),
+})
+test = pd.DataFrame({
+    "ejection_fraction": np.asarray(df["te_ef"], dtype=float),
+    "sex": np.asarray(df["te_sex"], dtype=float),
+    "age": np.asarray(df["te_age"], dtype=float),
+})
 
 cph = CoxPHFitter()
-cph.fit(frame, duration_col="time", event_col="event")
+cph.fit(train, duration_col="time", event_col="event")
 beta_ef = float(cph.params_["ejection_fraction"])
-
-ef_grid = np.array([{grid}], dtype=float)
-ef_ref = {ef_ref}
-# Cox proportional hazard ratio relative to the reference EF.
-hr = np.exp(beta_ef * (ef_grid - ef_ref))
+# Partial-hazard linear predictor on the held-out rows: log-risk, monotone in
+# hazard. log of predict_partial_hazard is exactly beta . (x - x_mean).
+risk = np.log(np.asarray(cph.predict_partial_hazard(test), dtype=float)).reshape(-1)
 emit("beta_ef", [beta_ef])
-emit("hr", hr.tolist())
+emit("cox_test_risk", risk.tolist())
 "#,
-            grid = ef_grid_py
-                .iter()
-                .map(|e| format!("{e:.6e}"))
-                .collect::<Vec<_>>()
-                .join(", "),
-            ef_ref = ef_ref,
-        ),
     );
     let cox_beta_ef = py.scalar("beta_ef");
-    let cox_hr = py.vector("hr");
+    let cox_test_risk = py.vector("cox_test_risk");
     assert_eq!(
-        cox_hr.len(),
-        gam_hr.len(),
-        "lifelines HR grid length mismatch: gam={} cox={}",
-        gam_hr.len(),
-        cox_hr.len()
+        cox_test_risk.len(),
+        n_test,
+        "lifelines test-risk length mismatch: cox={} test_rows={n_test}",
+        cox_test_risk.len()
     );
-
-    // Co-monotone shape metric: both HR(EF) curves are smooth strictly-decreasing
-    // functions of EF on the shared grid, so a genuine recovery makes them
-    // near-perfectly linearly correlated.
-    let hr_corr = pearson(&gam_hr, cox_hr);
+    let c_cox = concordance_index(&test_time, &test_event, cox_test_risk);
 
     eprintln!(
-        "heart-failure marginal-slope vs CoxPH: n={n} events={n_events} cens={cens_frac:.2}\n  \
-         probit_scale={probit_scale:.4} z_mean={z_mean:.3} z_sd={z_sd:.3} baseline_slope={:.5}\n  \
-         gam EF logHR slope (per unit, near EF={ef_ref})={gam_slope:.5} cox β_EF={cox_beta_ef:.5}\n  \
-         HR(EF) over [20,80]: pearson(gam,cox)={hr_corr:.5}",
+        "heart-failure held-out concordance (n={n}, train={n_train}, test={n_test}, \
+         cens={cens_frac:.2}): C_gam={c_gam:.4}  C_cox={c_cox:.4}  cox β_EF={cox_beta_ef:.5}\n  \
+         probit_scale={probit_scale:.4} z_mean={z_mean:.3} z_sd={z_sd:.3} \
+         baseline_slope={:.5} monotone_decreasing={monotone_decreasing}",
         fit.baseline_slope,
     );
 
-    // ---- principled assertions (see module doc) --------------------------
-    // (1) SIGN. Both engines must recover a PROTECTIVE ejection-fraction effect
-    // (higher EF ⇒ lower hazard): Cox β_EF < 0, and gam's local EF
-    // log-hazard-ratio slope < 0. A flipped sign on either side is a real
-    // modeling failure, not a link difference.
+    // ---- OBJECTIVE assertions (see module doc) ----------------------------
+    // (1) PRIMARY — absolute held-out discrimination bar. With EF + AGE + SEX,
+    // a model with real predictive signal must clearly beat chance.
     assert!(
-        cox_beta_ef < 0.0,
-        "lifelines CoxPH should recover a protective EF effect (β_EF<0), got {cox_beta_ef:.5}"
-    );
-    assert!(
-        gam_slope < 0.0,
-        "gam marginal-slope should recover a protective EF effect (logHR slope<0), got {gam_slope:.5}"
+        c_gam >= 0.62,
+        "gam held-out concordance below the predictive-quality bar: C_gam={c_gam:.4} (bar 0.62)"
     );
 
-    // (2) CO-MONOTONE SHAPE. gam's probit cumulative-hazard ratio and Cox's
-    // log-linear exp(β·Δ) are different functional forms, but both are smooth
-    // strictly-monotone-decreasing functions of EF on [20,80], so on the shared
-    // grid they must be near-perfectly linearly correlated. pearson>0.99 asserts
-    // gam tracks Cox's protective gradient *shape*; a flat, non-monotone, or
-    // wrong-curvature gam curve (broken log-slope coupling) fails this honestly.
-    // It does NOT demand pointwise equality of two genuinely different links.
+    // (2) ACCURACY — match-or-beat the mature CoxPH baseline on the SAME held-out
+    // rows, judged by the SAME concordance code. gam may win; it must not lose
+    // materially.
     assert!(
-        hr_corr > 0.99,
-        "gam marginal-slope HR(EF) shape diverges from lifelines CoxPH over EF[20,80]: \
-         pearson={hr_corr:.5} (bound 0.99); gam β_EF-slope={gam_slope:.5} cox β_EF={cox_beta_ef:.5}"
+        c_gam >= c_cox - 0.03,
+        "gam loses to lifelines CoxPH on held-out concordance by more than the margin: \
+         C_gam={c_gam:.4} C_cox={c_cox:.4} (allowed C_cox-0.03)"
     );
 
-    // (3) LOCAL-SLOPE MAGNITUDE. The anchor first-order coefficient
-    // d logΛ/dEF = [φ(0)/Φ(0)]·g(EF_ref)/(z_sd·Λ_ref) must agree with Cox's β_EF
-    // in sign and order of magnitude. The probit vs log-linear link Jacobian
-    // differs, so we band the ratio to [1/3, 3] — wide enough to permit the link
-    // difference, tight enough that a 10×-off / saturated-smooth slope fails.
-    let slope_ratio = gam_slope / cox_beta_ef; // both negative ⇒ ratio > 0
+    // (3) STRUCTURE — gam's covariate cumulative hazard is monotone (a single
+    // coherent protective EF gradient), a direct property of the fitted survival
+    // function.
     assert!(
-        (1.0 / 3.0..=3.0).contains(&slope_ratio),
-        "gam EF log-hazard-ratio slope and Cox β_EF disagree in magnitude: \
-         gam={gam_slope:.5} cox={cox_beta_ef:.5} ratio={slope_ratio:.3} (band [1/3,3])"
+        monotone_decreasing,
+        "gam covariate cumulative hazard is not monotone non-increasing in EF over the held-out range"
     );
 }

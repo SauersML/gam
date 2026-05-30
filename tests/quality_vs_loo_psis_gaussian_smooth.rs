@@ -1,36 +1,36 @@
-//! End-to-end quality: gam's ALO (Approximate Leave-One-Out) leave-one-out
-//! linear predictor `eta_tilde` must agree with the mature external LOO
-//! diagnostic stack on a real Gaussian smooth.
+//! End-to-end OBJECTIVE quality: gam's ALO (Approximate Leave-One-Out) must be
+//! a faithful, honest estimate of genuine out-of-sample predictive error on a
+//! real Gaussian smooth.
 //!
-//! Mature comparator: **R `loo` (PSIS-LOO/WAIC)** — the standard Bayesian
-//! leave-one-out package (Vehtari/Gelman/Gabry) — combined with `mgcv`'s
-//! posterior. There is no closer head-to-head than this: `loo::loo()` is the
-//! reference implementation of Pareto-smoothed importance-sampling LOO, and it
-//! consumes a pointwise log-likelihood matrix. We fit the canonical `lidar`
-//! benchmark (`logratio ~ s(range)`, Gaussian) with both engines and ask:
+//! OBJECTIVE METRIC ASSERTED (no "matches a peer tool" claim):
 //!
-//!   1. Does gam's ALO `eta_tilde` reproduce the *exact* leave-one-out linear
-//!      predictor? The ground truth is mgcv refit n times, each time leaving
-//!      one observation out (brute-force LOO). For Gaussian-identity the
-//!      pointwise LOO log-likelihood is computable in closed form from
-//!      `eta_tilde_i` and `y_i`, so we compare the pointwise loglik vectors via
-//!      Pearson correlation. ALO is a one-fit analytic approximation to this
-//!      n-fit brute-force quantity; tight correlation is the whole claim.
+//!   A. GROUND-TRUTH FIDELITY of the leave-one-out predictor. The exact
+//!      leave-one-out linear predictor is *defined* by refitting the model n
+//!      times, each time deleting one observation and predicting the deleted
+//!      point. That n-refit quantity is not a peer tool's opinion — it is the
+//!      mathematical object ALO approximates in a single fit. We compute it by
+//!      brute force (mgcv refit n times) and assert ALO's `eta_tilde` recovers
+//!      it: per-point RMSE small relative to the spread of the LOO predictor.
+//!      This is the EXCEPTION case (exact brute-force LOO refits are ground
+//!      truth), so a tight match here IS an objective accuracy claim.
 //!
-//!   2. Does ALO agree with `loo`'s PSIS-LOO *pointwise predictive density*? We
-//!      build mgcv's Gaussian posterior over the smooth (coefficients ~ N(beta,
-//!      Vp)), form the S x n pointwise loglik matrix, and let `loo::loo()`
-//!      compute the Pareto-smoothed per-point LOO log predictive density
-//!      `elpd_loo_i`. That `elpd_loo_i` is exactly the same quantity ALO's
-//!      `alo_loglik_i` estimates — the leave-one-out pointwise log-likelihood —
-//!      so we compare the two vectors DIRECTLY (no lossy softmax/simplex
-//!      re-standardization that would collapse the additive log-density scale).
-//!      PSIS adds a small posterior-predictive-variance term that ALO's
-//!      conditional closed form omits, so we test (a) shape via Pearson and (b)
-//!      level via RMSE with a bound that admits only that O(v_i) gap.
+//!   B. HONEST GENERALIZATION ERROR. The reason anyone computes LOO is to get an
+//!      unbiased estimate of out-of-sample error. We assert that property
+//!      directly on gam alone: ALO's held-out RMSE against the observed `y`
+//!      (i) is finite and on the scale of the noise, (ii) is LARGER than the
+//!      in-sample (training-residual) RMSE — i.e. ALO actually pays the
+//!      out-of-sample penalty instead of reporting optimistic in-sample error —
+//!      and (iii) equals the brute-force exact-LOO held-out RMSE to tight
+//!      tolerance (match-or-beat the gold-standard CV estimate of generalization
+//!      error). gam's own predictions are scored throughout.
 //!
-//! A real divergence here is a real bug in ALO; the bounds are not weakened to
-//! make gam pass.
+//! The R `loo` PSIS-LOO `elpd_loo` vector is still COMPUTED and printed for
+//! context, but matching `loo`'s noisy importance-sampling estimate is NOT a
+//! pass criterion: agreeing with a peer Monte-Carlo diagnostic proves nothing
+//! about correctness. The pass/fail criteria are the objective metrics above.
+//!
+//! Bounds are not weakened to force a pass; a genuine ALO shortfall failing is
+//! the intended behavior.
 
 use gam::inference::alo::compute_alo_diagnostics_from_fit;
 use gam::test_support::reference::{Column, pearson, rmse, run_r};
@@ -41,7 +41,7 @@ use std::path::Path;
 const LIDAR_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/lidar.csv");
 
 #[test]
-fn gam_alo_eta_tilde_matches_loo_psis_on_lidar() {
+fn gam_alo_is_honest_loo_predictive_error_on_lidar() {
     init_parallelism();
 
     // ---- load the canonical lidar dataset (range -> logratio) -------------
@@ -75,40 +75,35 @@ fn gam_alo_eta_tilde_matches_loo_psis_on_lidar() {
     let eta_tilde: Vec<f64> = alo.eta_tilde.to_vec();
     assert_eq!(eta_tilde.len(), n, "ALO eta_tilde length mismatch");
 
-    // gam's residual-variance (scale) estimate: the same dispersion ALO used
-    // internally for Gaussian (RSS / (n - edf)). Recompute here from the fitted
-    // mean so the pointwise Gaussian loglik below uses a single, gam-consistent
-    // phi for BOTH the ALO loglik and the brute-force comparison.
-    let edf = fit.fit.edf_total().expect("gam reports total edf");
+    // In-sample fitted mean (the full-data fit, no point held out).
     let mu_hat: Vec<f64> = alo.pred_identity.to_vec();
-    let rss: f64 = logratio
+    assert_eq!(mu_hat.len(), n, "fitted-mean length mismatch");
+
+    // gam's residual-variance (scale) estimate, used only to put RMSE bounds on
+    // the noise scale and for the contextual loo() comparison below.
+    let edf = fit.fit.edf_total().expect("gam reports total edf");
+    let rss_in: f64 = logratio
         .iter()
         .zip(&mu_hat)
         .map(|(y, m)| (y - m) * (y - m))
         .sum();
-    let phi = rss / ((n as f64) - edf).max(1.0);
+    let phi = rss_in / ((n as f64) - edf).max(1.0);
     assert!(
         phi.is_finite() && phi > 0.0,
         "gam scale must be positive finite"
     );
+    let sigma = phi.sqrt();
 
-    // Pointwise Gaussian LOO log-likelihood implied by ALO's eta_tilde:
-    //   L_i = -0.5*ln(2*pi*phi) - 0.5*(y_i - eta_tilde_i)^2 / phi.
-    let half_ln_2pi_phi = 0.5 * (2.0 * std::f64::consts::PI * phi).ln();
-    let alo_loglik: Vec<f64> = logratio
-        .iter()
-        .zip(&eta_tilde)
-        .map(|(y, et)| {
-            let r = y - et;
-            -half_ln_2pi_phi - 0.5 * r * r / phi
-        })
-        .collect();
+    // gam's OWN out-of-sample (held-out) RMSE from ALO: how far each held-out
+    // prediction is from the observation it was not allowed to see.
+    let alo_holdout_rmse = rmse(&eta_tilde, &logratio);
+    // gam's in-sample (training) RMSE: optimistic, uses each point in its own fit.
+    let insample_rmse = rmse(&mu_hat, &logratio);
 
-    // ---- mature reference: exact brute-force LOO (mgcv) + loo::loo PSIS ----
-    // We hand R the SAME data and the SAME phi gam used, so the Gaussian
-    // pointwise loglik formula is identical on both sides and the only thing
-    // being tested is how well ALO's eta_tilde tracks (a) the exact n-refit LOO
-    // predictor and (b) the loo package's PSIS importance weights.
+    // ---- reference: exact brute-force LOO (ground truth) + loo (context) ---
+    // mgcv refit n times leaving one point out gives the EXACT leave-one-out
+    // predictor eta_loo[i] that ALO approximates. The loo::loo PSIS block is
+    // computed only to print elpd context; it is not asserted against.
     let phi_col = vec![phi; n];
     let r = run_r(
         &[
@@ -122,24 +117,22 @@ fn gam_alo_eta_tilde_matches_loo_psis_on_lidar() {
         phi <- df$phi[1]
         n <- nrow(df)
 
-        # (1) EXACT brute-force LOO: refit s(range) leaving each point out and
-        #     predict the held-out mean. This is the ground-truth eta_tilde that
-        #     ALO approximates analytically from a single fit.
+        # (1) GROUND TRUTH: exact brute-force LOO predictor. Refit s(range)
+        #     leaving each point out and predict the held-out mean. This is the
+        #     definition of the leave-one-out linear predictor ALO approximates.
         eta_loo <- numeric(n)
         for (i in seq_len(n)) {
           mi <- gam(logratio ~ s(range), data = df[-i, , drop = FALSE], method = "REML")
           eta_loo[i] <- as.numeric(predict(mi, newdata = df[i, , drop = FALSE]))
         }
-        # Exact-LOO pointwise Gaussian loglik with the SAME phi gam used.
-        c0 <- -0.5 * log(2 * pi * phi)
-        loglik_loo_exact <- c0 - 0.5 * (df$logratio - eta_loo)^2 / phi
-        emit("loglik_loo_exact", loglik_loo_exact)
+        emit("eta_loo", eta_loo)
+        # Exact-LOO held-out RMSE: the gold-standard estimate of out-of-sample
+        # error gam's ALO held-out RMSE must match.
+        emit("loo_holdout_rmse", sqrt(mean((df$logratio - eta_loo)^2)))
 
-        # (2) PSIS-LOO via the loo package on mgcv's Gaussian posterior.
-        #     Sample coefficients ~ N(beta, Vp), form the S x n pointwise loglik
-        #     matrix, and let loo::loo() compute Pareto-smoothed LOO. loo gives
-        #     pointwise elpd_loo (the PSIS-LOO log predictive density per point);
-        #     standardize to relative weights below for the MAE comparison.
+        # (2) CONTEXT ONLY (not asserted): loo::loo PSIS-LOO elpd_loo on mgcv's
+        #     Gaussian posterior. Printed for diagnostics; agreeing with this
+        #     peer Monte-Carlo estimate is not a quality criterion.
         m <- gam(logratio ~ s(range), data = df, method = "REML")
         set.seed(20240529)
         S <- 2000
@@ -148,91 +141,116 @@ fn gam_alo_eta_tilde_matches_loo_psis_on_lidar() {
         L <- t(chol(Vp))
         draws <- matrix(rnorm(S * length(beta)), nrow = S) %*% t(L)
         draws <- sweep(draws, 2, beta, "+")
-        Xp <- predict(m, type = "lpmatrix")   # n x p design at the data
-        mu_draws <- draws %*% t(Xp)            # S x n posterior means
-        # S x n pointwise loglik with the shared phi.
+        Xp <- predict(m, type = "lpmatrix")
+        mu_draws <- draws %*% t(Xp)
+        c0 <- -0.5 * log(2 * pi * phi)
         ll <- matrix(0.0, nrow = S, ncol = n)
         for (s in seq_len(S)) {
           ll[s, ] <- c0 - 0.5 * (df$logratio - mu_draws[s, ])^2 / phi
         }
         lo <- suppressWarnings(loo(ll, r_eff = rep(1.0, n)))
-        # Per-point PSIS-LOO log predictive density.
-        elpd_i <- lo$pointwise[, "elpd_loo"]
-        emit("elpd_loo", as.numeric(elpd_i))
+        emit("elpd_loo", as.numeric(lo$pointwise[, "elpd_loo"]))
         "#,
     );
 
-    let loglik_loo_exact = r.vector("loglik_loo_exact");
+    let eta_loo = r.vector("eta_loo");
+    let loo_holdout_rmse = r.scalar("loo_holdout_rmse");
     let elpd_loo = r.vector("elpd_loo");
-    assert_eq!(
-        loglik_loo_exact.len(),
-        n,
-        "exact-LOO loglik length mismatch"
-    );
+    assert_eq!(eta_loo.len(), n, "exact-LOO predictor length mismatch");
     assert_eq!(elpd_loo.len(), n, "PSIS elpd length mismatch");
 
-    // ---- metric 1: Pearson of pointwise LOO log-likelihood ----------------
-    // ALO's analytic loglik vs the exact n-refit LOO loglik. Same phi, same
-    // closed form on both sides, so this isolates eta_tilde fidelity.
-    let corr = pearson(&alo_loglik, loglik_loo_exact);
-
-    // ---- metric 2: ALO loglik vs loo's PSIS-LOO pointwise log-density ------
-    // `loo`'s `elpd_loo_i` and ALO's `alo_loglik_i` are the SAME object — the
-    // per-point leave-one-out log predictive density — so we compare them
-    // directly. Two scale-aware metrics: Pearson isolates shape (immune to the
-    // constant `-0.5*ln(2*pi*phi)` offset both share), and RMSE bounds the
-    // level gap. PSIS marginalizes the posterior, so each elpd_loo_i carries an
-    // extra `-0.5*v_i/phi`-style posterior-predictive-variance term (v_i =
-    // x_i Vp x_i^T) that ALO's conditional closed form omits; that term is the
-    // only admissible discrepancy, and it is small relative to the loglik
-    // spread driven by the residuals.
-    let elpd_pearson = pearson(&alo_loglik, elpd_loo);
-    let elpd_rmse = rmse(&alo_loglik, elpd_loo);
-    // Spread of the loglik vector itself, so the RMSE bound is judged against
-    // the scale of the quantity being compared rather than an absolute guess.
-    let loglik_spread = {
-        let mn = alo_loglik.iter().copied().fold(f64::INFINITY, f64::min);
-        let mx = alo_loglik.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    // ---- objective quantities ---------------------------------------------
+    // (A) Ground-truth fidelity: ALO eta_tilde vs the exact n-refit LOO
+    // predictor, measured in the predictor's own units and normalised by its
+    // spread so the bound is judged at the scale of the quantity compared.
+    let eta_tilde_vs_exact_rmse = rmse(&eta_tilde, eta_loo);
+    let loo_spread = {
+        let mn = eta_loo.iter().copied().fold(f64::INFINITY, f64::min);
+        let mx = eta_loo.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         mx - mn
     };
 
+    // Contextual-only peer comparison: ALO's Gaussian LOO loglik vs loo's
+    // elpd_loo. Printed, never asserted.
+    let half_ln_2pi_phi = 0.5 * (2.0 * std::f64::consts::PI * phi).ln();
+    let alo_loglik: Vec<f64> = logratio
+        .iter()
+        .zip(&eta_tilde)
+        .map(|(y, et)| {
+            let resid = y - et;
+            -half_ln_2pi_phi - 0.5 * resid * resid / phi
+        })
+        .collect();
+    let elpd_pearson_context = pearson(&alo_loglik, elpd_loo);
+
     eprintln!(
-        "lidar ALO vs loo/PSIS: n={n} edf={edf:.3} phi={phi:.5} \
-         loglik_pearson={corr:.5} elpd_pearson={elpd_pearson:.5} \
-         elpd_rmse={elpd_rmse:.5} loglik_spread={loglik_spread:.5}"
+        "lidar ALO honest-LOO: n={n} edf={edf:.3} sigma={sigma:.5} \
+         alo_holdout_rmse={alo_holdout_rmse:.5} insample_rmse={insample_rmse:.5} \
+         loo_holdout_rmse={loo_holdout_rmse:.5} \
+         eta_tilde_vs_exact_rmse={eta_tilde_vs_exact_rmse:.5} loo_spread={loo_spread:.5} \
+         (context: elpd_pearson_vs_loo={elpd_pearson_context:.5})"
     );
 
-    // ALO is a single-fit analytic approximation to the n-refit exact LOO
-    // predictor; on this smooth Gaussian benchmark its pointwise LOO loglik
-    // tracks the brute-force LOO loglik essentially exactly. Pearson > 0.995 is
-    // a tight, principled bound: it admits only the small analytic-vs-exact gap
-    // and would fire on any real divergence in the LOO predictor. (A trivial
-    // constant-shift correlation cannot pass; the bound asserts shape fidelity.)
+    // ====================================================================
+    // (A) GROUND-TRUTH FIDELITY of the leave-one-out predictor.
+    // ====================================================================
+    // The exact LOO predictor varies over a range `loo_spread`. ALO is a
+    // single-fit analytic approximation to that n-refit object; on a smooth
+    // Gaussian benchmark it must reproduce it to a small fraction of its spread.
     assert!(
-        corr > 0.995,
-        "ALO pointwise LOO loglik must track exact brute-force LOO: pearson={corr:.5}"
-    );
-    // Shape: ALO's pointwise LOO loglik and loo's PSIS elpd_loo are the same
-    // per-point predictive density; once the shared constant offset is removed
-    // they must track essentially perfectly. The residual-driven term dominates
-    // both, so a real eta_tilde error would decorrelate them.
-    assert!(
-        elpd_pearson > 0.99,
-        "ALO loglik must track loo PSIS-LOO elpd_loo in shape: pearson={elpd_pearson:.5}"
-    );
-    // Level: the only admissible gap is PSIS's posterior-predictive-variance
-    // term, which is small versus the loglik spread. Require the per-point RMSE
-    // to be well under a tenth of that spread — loose enough to admit the
-    // genuine O(v_i/phi) PSIS-vs-conditional difference, tight enough that a
-    // real divergence in eta_tilde (which moves the residual term, the dominant
-    // contribution) blows straight through it.
-    assert!(
-        loglik_spread > 1.0,
-        "loglik spread should be O(1+): {loglik_spread:.5}"
+        loo_spread > 1.0,
+        "exact-LOO predictor should span O(1+): spread={loo_spread:.5}"
     );
     assert!(
-        elpd_rmse < 0.1 * loglik_spread,
-        "ALO loglik vs loo PSIS-LOO elpd_loo diverge in level: \
-         rmse={elpd_rmse:.5} spread={loglik_spread:.5}"
+        eta_tilde_vs_exact_rmse < 0.02 * loo_spread,
+        "ALO eta_tilde must recover the EXACT brute-force LOO predictor: \
+         rmse={eta_tilde_vs_exact_rmse:.5} spread={loo_spread:.5}"
+    );
+
+    // ====================================================================
+    // (B) HONEST GENERALIZATION ERROR (gam scored on its own predictions).
+    // ====================================================================
+    // (i) Held-out error is finite and on the scale of the noise — not blown up,
+    // not collapsed. A smooth fit of lidar leaves residual sd ~= sigma; the
+    // held-out RMSE must sit in a sane band around it.
+    assert!(
+        alo_holdout_rmse.is_finite() && alo_holdout_rmse > 0.0,
+        "ALO held-out RMSE must be positive finite: {alo_holdout_rmse:.5}"
+    );
+    assert!(
+        alo_holdout_rmse < 2.0 * sigma,
+        "ALO held-out RMSE must stay on the noise scale (not diverge): \
+         holdout={alo_holdout_rmse:.5} sigma={sigma:.5}"
+    );
+
+    // (ii) ALO reports an HONEST out-of-sample error: leaving each point out
+    // costs accuracy, so the held-out RMSE must EXCEED the optimistic in-sample
+    // RMSE. If ALO merely echoed the training fit (holdout <= in-sample) it
+    // would be useless as a generalization estimate; this asserts the LOO
+    // property directly.
+    assert!(
+        insample_rmse > 0.0 && insample_rmse.is_finite(),
+        "in-sample RMSE must be positive finite: {insample_rmse:.5}"
+    );
+    assert!(
+        alo_holdout_rmse > insample_rmse,
+        "ALO must pay the out-of-sample penalty (held-out > in-sample): \
+         holdout={alo_holdout_rmse:.5} insample={insample_rmse:.5}"
+    );
+
+    // (iii) Match-or-beat the gold-standard CV estimate of generalization error.
+    // The brute-force exact-LOO held-out RMSE is the trusted estimate of
+    // out-of-sample error; ALO's held-out RMSE must agree with it tightly. This
+    // is the strongest objective statement: gam's cheap diagnostic delivers the
+    // same honest generalization number as n full refits.
+    assert!(
+        loo_holdout_rmse.is_finite() && loo_holdout_rmse > 0.0,
+        "exact-LOO held-out RMSE must be positive finite: {loo_holdout_rmse:.5}"
+    );
+    let rel_holdout_gap = (alo_holdout_rmse - loo_holdout_rmse).abs() / loo_holdout_rmse;
+    assert!(
+        rel_holdout_gap < 0.05,
+        "ALO held-out RMSE must match the exact brute-force LOO held-out RMSE: \
+         alo={alo_holdout_rmse:.5} exact={loo_holdout_rmse:.5} rel_gap={rel_holdout_gap:.5}"
     );
 }

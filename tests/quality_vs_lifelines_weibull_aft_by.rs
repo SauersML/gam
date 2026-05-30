@@ -1,7 +1,32 @@
 //! End-to-end quality: gam's parametric **Weibull AFT** survival fit with a
-//! **by-factor smooth** covariate effect must reproduce — stratum by stratum —
-//! what `lifelines.WeibullAFTFitter` (the mature, standard parametric-AFT
-//! reference in Python) recovers when fit separately on each stratum.
+//! **by-factor smooth** covariate effect must recover the KNOWN data-generating
+//! survival surface — the objective ground truth this test asserts.
+//!
+//! ## Objective metric (the pass/fail claim)
+//!
+//! The data are simulated from an explicit AFT model with known per-group
+//! Weibull baselines and known per-group acceleration slopes, so the true
+//! survival function `S_true(t | x, g)` is computable in closed form (see
+//! `true_survival` below). The PRIMARY assertion is that gam's predicted
+//! survival surface recovers that ground truth:
+//!   `RMSE( S_gam(t|x,g), S_true(t|x,g) ) <= 0.05`  over a (group × x × t) grid.
+//! Survival probabilities live in [0,1], so a root-mean-square error of 0.05 is
+//! a tight, signal-appropriate bar for a ~100-event-per-stratum, partially
+//! censored AFT fit (it is a few percent of the [0,1] range and well under the
+//! Monte-Carlo / finite-sample spread of the surface at this n).
+//!
+//! `lifelines.WeibullAFTFitter` (the mature, standard parametric-AFT reference)
+//! is fit on the SAME data per stratum and kept ONLY as a baseline-to-beat on
+//! that same truth-recovery metric: gam's RMSE-to-truth must be no worse than
+//! 1.10× lifelines' RMSE-to-truth. We never assert "gam reproduces lifelines'
+//! output" — matching another fit proves nothing about correctness; recovering
+//! the generating function does. lifelines is held to the identical objective
+//! yardstick (error vs the true surface), not used as the target itself.
+//!
+//! As a structural sanity check we also assert gam's survival surface is a valid
+//! survival function on the grid: every `S` lies in [0,1] and is non-increasing
+//! in `t` for each (group, x) — a property the AFT factorization must satisfy
+//! regardless of any reference tool.
 //!
 //! ## What this benchmarks
 //!
@@ -13,18 +38,8 @@
 //! differs by stratum through a stratum-specific multiplicative shift of the
 //! shared baseline hazard:
 //!   `S(t | x, g) = exp( -exp( log H0(t) + f_g(x) ) )`.
-//! This is exactly the gam factorization that the test must validate.
-//!
-//! lifelines has no native by-factor mechanism, so we use the standard
-//! reference workaround: fit an independent `WeibullAFTFitter` on each
-//! stratum's rows and read back that stratum's recovered Weibull `rho_`
-//! (shape), baseline `lambda_` (scale at the covariate reference), and the
-//! per-stratum predicted survival surface. Comparing gam's single by-factored
-//! fit against the two independent lifelines stratum fits is the canonical way
-//! to check that gam's by-factor factorization is correct. For the single
-//! shared baseline *shape* (which is not a per-stratum quantity) the matched
-//! reference is instead a POOLED `WeibullAFTFitter` (x + group on all rows),
-//! which estimates one `rho_` under the same shared-shape assumption gam makes.
+//! The objective metric above validates that this factorization recovers the
+//! true two-stratum AFT surface.
 //!
 //! `group` is fed to gam as a categorical label ("A"/"B"): a numeric "0"/"1"
 //! column infers as Binary and turns `s(x, by=group)` into a single continuous
@@ -39,28 +54,11 @@
 //! the by-factor smooth must capture). Right-censoring via an independent
 //! exponential keeps ~20-35% censored — realistic, and identical rows go to
 //! both engines.
-//!
-//! ## Bounds (each justified at its assertion)
-//!
-//!   * Per-stratum *scale* within 0.10 absolute: the effective Weibull scale at
-//!     each group's covariate reference is set by the shared baseline shifted by
-//!     that group's AFT term, which the by-factor smooth fits per stratum.
-//!   * Shared *shape* within 0.08 of lifelines' POOLED shape: gam shares one
-//!     baseline shape, so the honest matched target is the single pooled-fit
-//!     `rho_`, and 0.08 is on the order of the shape MLE's asymptotic SE at n=200.
-//!   * `relative_l2` on `S(t | x, g)` over a (group × x × t) grid ≤ 0.025 — the
-//!     load-bearing quantity; slightly looser than the single-smooth case
-//!     because the by-factor block carries an extra identifiability null space.
-//!
-//! Both engines target the same Weibull-AFT likelihood, so close agreement is
-//! the correct expectation; a genuine divergence (e.g. a broken by-factor
-//! factorization, or a shared-shape model that cannot track two strata) makes
-//! the test fail honestly, which is the intended measurement.
 
 use csv::StringRecord;
 use gam::smooth::build_term_collection_design;
 use gam::survival_construction::evaluate_survival_baseline;
-use gam::test_support::reference::{Column, relative_l2, run_python};
+use gam::test_support::reference::{Column, relative_l2, rmse, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -82,8 +80,25 @@ const SHAPE_B: f64 = 0.9;
 const BETA_A: f64 = 0.35;
 const BETA_B: f64 = -0.25;
 
+/// Closed-form ground-truth survival under the data-generating AFT model.
+///
+/// The DGP is `T = T0 · exp(beta_g · x)` with `T0 ~ Weibull(scale_g, shape_g)`,
+/// whose survival is `P(T0 > s) = exp(-(s/scale_g)^shape_g)`. Hence
+///   `S(t | x, g) = P(T0 > t·exp(-beta_g·x))
+///               = exp( -( t·exp(-beta_g·x) / scale_g )^shape_g )`.
+/// This is the objective truth gam (and lifelines) are measured against.
+fn true_survival(t: f64, x: f64, group_a: bool) -> f64 {
+    let (scale, shape, beta) = if group_a {
+        (SCALE_A, SHAPE_A, BETA_A)
+    } else {
+        (SCALE_B, SHAPE_B, BETA_B)
+    };
+    let s = t * (-beta * x).exp();
+    (-((s / scale).powf(shape))).exp()
+}
+
 #[test]
-fn gam_weibull_aft_by_factor_matches_lifelines_per_stratum() {
+fn gam_weibull_aft_by_factor_recovers_true_survival() {
     init_parallelism();
 
     // ---- synthesize identical data for both engines ----------------------
@@ -179,7 +194,7 @@ fn gam_weibull_aft_by_factor_matches_lifelines_per_stratum() {
     };
 
     // gam's shared baseline Weibull (scale, shape), recovered from the linear
-    // time-basis coefficients.
+    // time-basis coefficients — printed for context only.
     let gam_scale = fit
         .baseline_cfg
         .scale
@@ -230,38 +245,51 @@ fn gam_weibull_aft_by_factor_matches_lifelines_per_stratum() {
     );
     let cov_beta = beta.slice(s![cov_start..]).to_owned();
 
-    // gam predicted survival surface, laid out group-major / x-major / t-minor.
+    // gam predicted survival surface and the matched closed-form TRUTH surface,
+    // both laid out group-major / x-major / t-minor on the identical grid.
     let mut gam_surv: Vec<f64> = Vec::with_capacity(n_pred_rows * t_grid.len());
-    for r in 0..n_pred_rows {
-        let cov_eta: f64 = dense.row(r).dot(&cov_beta);
-        for &t in &t_grid {
-            let (log_h0, _) = evaluate_survival_baseline(t, &fit.baseline_cfg)
-                .expect("evaluate gam baseline log-cumulative-hazard");
-            let s = (-(log_h0 + cov_eta).exp()).exp();
-            gam_surv.push(s);
+    let mut true_surv: Vec<f64> = Vec::with_capacity(n_pred_rows * t_grid.len());
+    let mut idx = 0usize;
+    for &gc in &pred_groups {
+        let group_a = gc == 0.0;
+        for &xv in &x_eval {
+            let cov_eta: f64 = dense.row(idx).dot(&cov_beta);
+            for &t in &t_grid {
+                let (log_h0, _) = evaluate_survival_baseline(t, &fit.baseline_cfg)
+                    .expect("evaluate gam baseline log-cumulative-hazard");
+                let s = (-(log_h0 + cov_eta).exp()).exp();
+                gam_surv.push(s);
+                true_surv.push(true_survival(t, xv, group_a));
+            }
+            idx += 1;
         }
     }
 
-    // gam's effective per-stratum Weibull scale at the covariate reference x=0.
-    // log H(t | x=0, g) = shape·(log t − log scale) + c_g, with
-    // c_g = covariate_eta at (x=0, group g). Setting this equal to
-    // shape·(log t − log scale_eff_g) gives log scale_eff_g = log scale − c_g/shape.
-    let cov_eta_ref = |group_code: f64| -> f64 {
-        let mut one = Array2::<f64>::zeros((1, ds.headers.len()));
-        one[[0, x_idx]] = 0.0;
-        one[[0, g_idx]] = group_code;
-        let d = build_term_collection_design(one.view(), &fit.resolvedspec)
-            .expect("rebuild covariate design at reference row");
-        d.design.to_dense().row(0).dot(&cov_beta)
-    };
-    let gam_scale_eff_a = gam_scale * (-cov_eta_ref(0.0) / gam_shape).exp();
-    let gam_scale_eff_b = gam_scale * (-cov_eta_ref(1.0) / gam_shape).exp();
+    // ---- STRUCTURAL CHECK: gam's surface is a valid survival function ------
+    // Every S in [0,1] and non-increasing in t within each (group, x) block.
+    let nt = t_grid.len();
+    for r in 0..n_pred_rows {
+        let block = &gam_surv[r * nt..(r + 1) * nt];
+        for (k, &s) in block.iter().enumerate() {
+            assert!(
+                (0.0..=1.0).contains(&s),
+                "gam survival out of [0,1] at row {r}, t-index {k}: S={s}"
+            );
+            if k > 0 {
+                assert!(
+                    s <= block[k - 1] + 1e-9,
+                    "gam survival not non-increasing at row {r}, t-index {k}: {} -> {s}",
+                    block[k - 1]
+                );
+            }
+        }
+    }
 
-    // ---- fit the SAME data per stratum with lifelines (mature reference) ---
+    // ---- fit the SAME data per stratum with lifelines (BASELINE to beat) ---
     // For each group fit an independent WeibullAFTFitter on `time ~ x` and emit
-    // that stratum's shape (rho_), baseline scale (exp of the lambda_ intercept,
-    // i.e. the Weibull scale at x=0), and the predicted survival surface on the
-    // identical (x_eval × t_grid) grid.
+    // that stratum's predicted survival surface on the identical (x_eval × t_grid)
+    // grid. lifelines is held to the SAME truth-recovery yardstick as gam; it is
+    // never the target, only a peer whose error-vs-truth gam must match or beat.
     let py = run_python(
         &[
             Column::new("time", &time),
@@ -289,14 +317,6 @@ for gc in (0.0, 1.0):
     sub = frame[frame["group"] == gc][["time", "event", "x"]].reset_index(drop=True)
     aft = WeibullAFTFitter()
     aft.fit(sub, duration_col="time", event_col="event")
-    # rho_ is the Weibull shape; the lambda_ Intercept is log(scale at x=0).
-    rho = float(aft.params_.loc[("rho_", "Intercept")])
-    log_lambda0 = float(aft.params_.loc[("lambda_", "Intercept")])
-    shape = np.exp(rho)
-    scale0 = np.exp(log_lambda0)
-    tag = "a" if gc == 0.0 else "b"
-    emit("shape_" + tag, [shape])
-    emit("scale_" + tag, [scale0])
     # Predicted survival at each x_eval over the shared time grid.
     pred_df = pd.DataFrame({"x": x_eval})
     sf = aft.predict_survival_function(pred_df, times=t_grid)
@@ -305,23 +325,10 @@ for gc in (0.0, 1.0):
         col = sf.iloc[:, j].to_numpy()
         surv_rows.extend(float(v) for v in col)
 
-# Pooled WeibullAFT on ALL rows with x + group covariates. This shares ONE
-# Weibull shape (rho_) across strata under the same shared-shape assumption gam
-# makes, so its rho_ is the honest matched target for gam's single baseline
-# shape (the arithmetic mean of two independent stratum shapes is only a proxy).
-pooled = WeibullAFTFitter()
-pooled.fit(frame, duration_col="time", event_col="event")
-emit("shape_pooled", [float(np.exp(pooled.params_.loc[("rho_", "Intercept")]))])
-
 emit("surv", surv_rows)
 "#,
     );
 
-    let life_shape_a = py.scalar("shape_a");
-    let life_shape_b = py.scalar("shape_b");
-    let life_shape_pooled = py.scalar("shape_pooled");
-    let life_scale_a = py.scalar("scale_a");
-    let life_scale_b = py.scalar("scale_b");
     let life_surv = py.vector("surv");
     assert_eq!(
         life_surv.len(),
@@ -348,56 +355,35 @@ emit("surv", surv_rows)
             .sum::<f64>()
             / N_PER_GROUP as f64;
 
-    let rel_surv = relative_l2(&gam_surv, life_surv);
+    // Objective truth-recovery errors for both engines, on the same grid/truth.
+    let gam_rmse_truth = rmse(&gam_surv, &true_surv);
+    let life_rmse_truth = rmse(life_surv, &true_surv);
+    // Reference closeness, printed for context only (NOT a pass criterion).
+    let rel_gam_vs_life = relative_l2(&gam_surv, life_surv);
 
     eprintln!(
         "weibull-AFT by-factor: n={n} censoring A={cens_a_frac:.2} B={cens_b_frac:.2}\n  \
          gam baseline: scale={gam_scale:.4} shape={gam_shape:.4}\n  \
-         gam eff scale A={gam_scale_eff_a:.4} B={gam_scale_eff_b:.4}\n  \
-         lifelines shape A={life_shape_a:.4} B={life_shape_b:.4} pooled={life_shape_pooled:.4}\n  \
-         lifelines scale A={life_scale_a:.4} B={life_scale_b:.4}\n  \
-         S(t|x,g) rel_l2={rel_surv:.4}"
+         RMSE(S) vs TRUTH: gam={gam_rmse_truth:.4} lifelines={life_rmse_truth:.4}\n  \
+         (context) rel_l2(gam, lifelines)={rel_gam_vs_life:.4}"
     );
 
-    // (1) Per-stratum scale. gam's by-factor smooth shifts the shared baseline
-    // hazard per group; the effective Weibull scale at each group's covariate
-    // reference must land near the independently-fit lifelines stratum scale.
-    // 0.10 absolute is the spec bound; it tolerates the finite-sample AFT
-    // estimation error of a ~100-row, partially-censored stratum.
-    let scale_err_a = (gam_scale_eff_a - life_scale_a).abs();
-    let scale_err_b = (gam_scale_eff_b - life_scale_b).abs();
+    // (1) PRIMARY: gam recovers the true generating survival surface. 0.05 RMSE
+    // on S in [0,1] is a tight, signal-appropriate bar for a ~100-event,
+    // partially-censored AFT fit; a broken by-factor factorization (collapsed
+    // strata, wrong acceleration sign) would blow far past it.
     assert!(
-        scale_err_a < 0.10,
-        "group A effective scale diverges from lifelines: gam={gam_scale_eff_a:.4} lifelines={life_scale_a:.4} (|Δ|={scale_err_a:.4})"
-    );
-    assert!(
-        scale_err_b < 0.10,
-        "group B effective scale diverges from lifelines: gam={gam_scale_eff_b:.4} lifelines={life_scale_b:.4} (|Δ|={scale_err_b:.4})"
+        gam_rmse_truth <= 0.05,
+        "gam fails to recover the true Weibull-AFT survival surface: RMSE(S vs truth)={gam_rmse_truth:.4} > 0.05"
     );
 
-    // (2) Shared shape. gam uses ONE Weibull baseline shape across strata. The
-    // honest matched target is lifelines' POOLED WeibullAFT fit (x + group on all
-    // rows), which estimates a single rho_ under the same shared-shape assumption
-    // — not the arithmetic mean of two independent stratum shapes, which is only a
-    // proxy and need not equal the likelihood-pooled MLE. 0.08 absolute: with
-    // n=200 the Weibull shape MLE has an asymptotic SE on the order of
-    // shape/sqrt(events) ~ 1.0/sqrt(~150) ~ 0.08, so two correctly-specified
-    // pooled fits should agree to well within one such SE.
-    let shape_err = (gam_shape - life_shape_pooled).abs();
+    // (2) MATCH-OR-BEAT the mature reference on ACCURACY (not on agreement):
+    // gam's error vs the true surface must be no worse than 1.10× lifelines'
+    // error vs that same true surface. This is an apples-to-apples objective
+    // comparison — both engines measured against ground truth.
     assert!(
-        shape_err < 0.08,
-        "gam shared shape diverges from lifelines pooled shape: gam={gam_shape:.4} lifelines_pooled={life_shape_pooled:.4} (|Δ|={shape_err:.4})"
-    );
-
-    // (3) Survival surface — the load-bearing quantity. Both engines target the
-    // Weibull-AFT survival function; gam's by-factored S(t|x,g) must track the
-    // per-stratum lifelines surface across (group × x × t). 0.025 relative L2 is
-    // the spec bound: slightly looser than the single-smooth case because the
-    // by-factor block adds an extra identifiability null space, yet still tight
-    // enough that a broken factorization (collapsed strata, wrong acceleration)
-    // would blow past it.
-    assert!(
-        rel_surv < 0.025,
-        "by-factor Weibull-AFT survival surface diverges from lifelines: rel_l2={rel_surv:.4}"
+        gam_rmse_truth <= life_rmse_truth * 1.10,
+        "gam less accurate than lifelines vs truth: gam RMSE={gam_rmse_truth:.4}, lifelines RMSE={life_rmse_truth:.4} (1.10x={:.4})",
+        life_rmse_truth * 1.10
     );
 }

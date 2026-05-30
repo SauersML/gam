@@ -1,33 +1,40 @@
-//! End-to-end quality: gam's factor-smooth random-slope structure must match
-//! `lme4::lmer` — the mature, standard mixed-model implementation — at recovering
-//! per-group linear trends when the slope varies by group.
+//! End-to-end quality: gam's factor-smooth random-slope structure must RECOVER
+//! the known per-group linear trends of a synthetic random-slope DGP, and do so
+//! at least as accurately as `lme4::lmer` (the mature mixed-model reference,
+//! demoted here to a baseline-to-match-or-beat).
 //!
-//! This benchmarks gam's `fs(x, g)` (mgcv factor-smooth "fs": one smooth per
-//! group sharing a SINGLE marginal smoothing parameter, i.e. the smooths are
-//! treated as a random effect with a common variance component) against
-//! `lme4::lmer(y ~ 1 + x + (x | g))` (a correlated random intercept + random
-//! slope per group). Both are the GAM/mixed-model analogue of the SAME
-//! statistical object: slope heterogeneity across groups estimated under a
-//! shared variance component, with partial pooling shrinking each group's
-//! curve toward the population trend. We give the two engines byte-identical
-//! data and assert:
-//!   1. the per-(group, x) predicted means agree across a 6-group × 4-point
-//!      grid (gam fitted values vs lmer conditional expectations E[y | g, x]),
-//!   2. the recovered per-group SLOPES β̂_g agree (the random-slope quantity
-//!      that is the whole point of the structure).
+//! OBJECTIVE METRIC (the pass criterion): TRUTH RECOVERY. The data is generated
+//! from a known function y = 2 + (3 + β_g)·x + ε with known per-group slopes
+//! 3 + β_g and known conditional means E[y | g, x] = 2 + (3 + β_g)·x. We fit
+//! gam's `fs(x, g)` and assert, against that GROUND TRUTH:
+//!   1. RMSE of gam's per-(group, x) predicted means vs the true conditional
+//!      means is below a noise-scaled bar (well under the residual σ = 0.3),
+//!   2. RMSE of gam's recovered per-group SLOPES vs the true slopes is a small
+//!      fraction of the between-group slope spread (SD = 1.5).
+//! Both bars are absolute statements about how well gam recovers the signal —
+//! they make no reference to lme4's output.
+//!
+//! lme4 REMAINS, as a BASELINE TO MATCH-OR-BEAT on those same truth-referenced
+//! errors: we additionally require gam's prediction RMSE-to-truth and slope
+//! RMSE-to-truth to be no worse than 1.10× lme4's. (We still COMPUTE and print
+//! the gam-vs-lmer agreement for context, but it is NOT a pass criterion —
+//! tracking a peer tool's noisy fit would prove nothing on its own.)
+//!
+//! `fs(x, g)` is mgcv's factor-smooth: one smooth of x per level of g, all
+//! sharing a single smoothing parameter (a random-effect variance over the
+//! per-group curves) — the GAM analogue of lmer's correlated random intercept +
+//! slope `(x | g)`, with the shared penalty doing the partial pooling.
 //!
 //! Truth: y = 2 + 3·x + β_g·x + ε, β_g ~ N(0, 1.5²) (so the per-group slope is
 //! 3 + β_g), ε ~ N(0, 0.3), n = 240 over 6 groups of 40. With n_per_group = 40
-//! the slope is well-identified per group and both engines should recover the
-//! same partially-pooled trends. A genuine divergence (e.g. gam over-shrinking
-//! the slope variance, or collapsing the groups) is a real bug, not a tolerance
-//! issue, so the bounds are tight and grounded in the math: r > 0.98 on the
-//! group×point prediction grid and r > 0.95 on the per-group slopes.
+//! the slope is well-identified per group, so a genuine recovery failure (gam
+//! over-shrinking the slope variance, or collapsing the groups) drives these
+//! RMSEs up and fails the test — a real bug, not a tolerance issue.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, run_r};
+use gam::test_support::reference::{Column, pearson, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -188,58 +195,74 @@ fn gam_factor_smooth_random_slope_matches_lme4() {
     );
     assert_eq!(lmer_slope.len(), N_GROUPS, "lmer slope count mismatch");
 
-    // ---- compare ----------------------------------------------------------
+    // ---- GROUND TRUTH at the same grid / slopes --------------------------
+    // The DGP is exactly linear in x per group, so the true conditional mean at
+    // (group gi, x) is FIXED_INTERCEPT + true_slope[gi]·x, and the true slope of
+    // group gi is true_slope[gi]. These are the quantities the test asserts
+    // recovery of — no reference tool involved.
+    let mut truth_pred = Vec::<f64>::with_capacity(grid_len);
+    for gi in 0..N_GROUPS {
+        for &xe in X_EVAL.iter() {
+            truth_pred.push(FIXED_INTERCEPT + true_slope[gi] * xe);
+        }
+    }
+
+    // ---- truth-referenced errors: gam (primary) and lmer (baseline) ------
+    let gam_pred_rmse = rmse(&gam_pred, &truth_pred);
+    let gam_slope_rmse = rmse(&gam_slope, &true_slope);
+    let lmer_pred_rmse = rmse(lmer_pred, &truth_pred);
+    let lmer_slope_rmse = rmse(lmer_slope, &true_slope);
+
+    // ---- gam-vs-lmer AGREEMENT: printed for context only, NOT asserted ---
     let pred_corr = pearson(&gam_pred, lmer_pred);
     let slope_corr = pearson(&gam_slope, lmer_slope);
 
-    // Also correlate each engine's recovered slopes against the TRUE per-group
-    // slopes — a sanity check that both engines actually recovered the signal,
-    // not merely that they agree with each other.
-    let gam_truth_corr = pearson(&gam_slope, &true_slope);
-    let lmer_truth_corr = pearson(lmer_slope, &true_slope);
-
     eprintln!(
-        "fs(x,g) vs lmer(x|g): n={n} groups={N_GROUPS} per_group={N_PER_GROUP} gam_edf={gam_edf:.3}\n  \
-         pred grid pearson={pred_corr:.5} (over {grid_len} group×x points)\n  \
-         slope pearson(gam,lmer)={slope_corr:.5}\n  \
-         slope-vs-truth: gam={gam_truth_corr:.4} lmer={lmer_truth_corr:.4}\n  \
+        "fs(x,g) random-slope recovery: n={n} groups={N_GROUPS} per_group={N_PER_GROUP} gam_edf={gam_edf:.3}\n  \
+         RMSE-to-truth  pred:  gam={gam_pred_rmse:.5} lmer={lmer_pred_rmse:.5} (over {grid_len} group×x points, noise σ={NOISE_SD})\n  \
+         RMSE-to-truth  slope: gam={gam_slope_rmse:.5} lmer={lmer_slope_rmse:.5} (slope spread SD={SLOPE_SD})\n  \
+         [context only] gam-vs-lmer pearson: pred={pred_corr:.5} slope={slope_corr:.5}\n  \
          true_slopes={true_slope:?}\n  \
          gam_slopes={gam_slope:?}\n  \
          lmer_slopes={lmer_slope:?}"
     );
 
-    // (1) Prediction-grid agreement. Both engines fit a correlated random
-    // intercept+slope per group under a shared variance component, so their
-    // partially-pooled conditional means E[y | g, x] must track closely across
-    // the full 6×4 grid. r > 0.98 is tight given the wide between-group slope
-    // spread (SD = 1.5 → predictions at x=0.8 differ by ~several units across
-    // groups), yet leaves margin for the basis/parameterization differences
-    // between a penalized factor-smooth and an explicit Gaussian random effect.
+    // (1) PRIMARY — gam recovers the true conditional means. The data carries
+    // residual noise σ = 0.3; with 40 points/group the partially-pooled mean
+    // curve is estimated far better than a single observation, so the average
+    // error of the fitted means at the evaluation grid must sit well below σ.
+    // The bar 0.5·σ = 0.15 is an absolute accuracy statement (it never mentions
+    // lme4); breaching it means gam mis-estimated the per-group trends.
+    let pred_bar = 0.5 * NOISE_SD;
     assert!(
-        pred_corr > 0.98,
-        "group×x predicted means diverge from lme4: pearson={pred_corr:.5}"
+        gam_pred_rmse <= pred_bar,
+        "gam predicted means missed the truth: RMSE-to-truth={gam_pred_rmse:.5} > bar {pred_bar:.5}"
     );
 
-    // (2) Per-group slope agreement — the random-slope quantity itself. Both
-    // engines shrink the per-group slopes toward the population slope by the
-    // same partial-pooling logic, so the recovered β̂_g must line up. r > 0.95
-    // tolerates differing shrinkage factors while catching a real failure to
-    // recover slope heterogeneity (which would push this toward 0).
+    // (2) PRIMARY — gam recovers the per-group SLOPES, the random-slope quantity
+    // itself. The between-group slope spread is SD = 1.5; recovering the slopes
+    // to within RMSE 0.30 (one fifth of that spread) means the slope
+    // heterogeneity is genuinely captured, not shrunk to the population mean.
+    // Absolute bar, independent of any reference tool.
+    let slope_bar = 0.2 * SLOPE_SD;
     assert!(
-        slope_corr > 0.95,
-        "per-group slope estimates diverge from lme4: pearson={slope_corr:.5}"
+        gam_slope_rmse <= slope_bar,
+        "gam slopes missed the truth: RMSE-to-truth={gam_slope_rmse:.5} > bar {slope_bar:.5}"
     );
 
-    // (3) Signal sanity — neither engine may have merely agreed on noise. With
-    // SD = 1.5 slope spread vs σ = 0.3 residual over 40 pts/group the slopes are
-    // strongly identified, so both must correlate highly with the truth.
+    // (3) MATCH-OR-BEAT — on the SAME truth-referenced error, gam must be no
+    // worse than 1.10× the mature mixed-model reference. lme4 is the accuracy
+    // baseline here, never the target: we beat-or-match its recovery error, we
+    // do not reproduce its fit.
     assert!(
-        gam_truth_corr > 0.95,
-        "gam failed to recover the true per-group slopes: pearson={gam_truth_corr:.4}"
+        gam_pred_rmse <= lmer_pred_rmse * 1.10,
+        "gam predicted-mean recovery worse than lme4: gam={gam_pred_rmse:.5} > 1.10·lmer={:.5}",
+        lmer_pred_rmse * 1.10
     );
     assert!(
-        lmer_truth_corr > 0.95,
-        "lme4 failed to recover the true per-group slopes: pearson={lmer_truth_corr:.4}"
+        gam_slope_rmse <= lmer_slope_rmse * 1.10,
+        "gam slope recovery worse than lme4: gam={gam_slope_rmse:.5} > 1.10·lmer={:.5}",
+        lmer_slope_rmse * 1.10
     );
 }
 

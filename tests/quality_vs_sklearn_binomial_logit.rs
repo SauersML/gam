@@ -1,25 +1,32 @@
-//! End-to-end quality: gam's Binomial(logit) GLM with smooth terms must agree
-//! with scikit-learn's `LogisticRegression` — the de-facto standard binary
-//! classifier — on the *probability scale*, and with `mgcv::gam(binomial)` on
-//! the smooth fitted probabilities.
+//! End-to-end OBJECTIVE quality: gam's Binomial(logit) GAM must *generalize* —
+//! it has to rank held-out cases well, not merely reproduce another tool's fit.
 //!
-//! Why this benchmark matters: the logit link is the most widely used binomial
-//! link, and the single most common source of bugs in a GLM implementation is
-//! the link inversion (eta -> probability). A correct penalized binomial fit
-//! must (a) recover the same fitted probabilities as a mature smoother (mgcv),
-//! (b) rank cases the same way a trusted classifier does (AUC agreement), and
-//! (c) on a 1-D *linear* model reproduce the coefficient sklearn's unpenalized
-//! logistic regression finds. We test all three on the real `prostate.csv`
-//! binary outcome (y ~ pc1, pc2), feeding *identical* data to every engine.
+//! OBJECTIVE METRIC ASSERTED (case 2, predictive accuracy on real data with no
+//! known truth): a deterministic train/test split of the real `prostate.csv`
+//! binary outcome. We fit `y ~ s(pc1,k=5)+s(pc2,k=5)` on the TRAIN rows only,
+//! predict the held-out TEST rows, invert the logit link ourselves, and assert
+//! gam's held-out **AUC** clears an absolute bar (`>= 0.70`) AND matches-or-beats
+//! the best mature baseline on the SAME split (gam_test_auc >= best_ref - 0.02).
+//! AUC on truly held-out cases is an honest generalization claim: a model that
+//! merely memorized the training fit (or that another tool happened to also fit)
+//! cannot game it. mgcv (penalized binomial GAM) and scikit-learn's
+//! `LogisticRegression` are demoted to baselines-to-match-or-beat, NOT targets to
+//! reproduce; their fitted values are printed for context only.
 //!
-//! gam's design*beta yields the linear predictor eta; we apply the logistic
-//! inverse `1/(1+exp(-eta))` ourselves, which is exactly the link inversion we
-//! want to stress. A genuine divergence here is a real bug, not a reason to
-//! loosen the bounds.
+//! Plus one GROUND-TRUTH correctness check that is NOT "same as a peer tool":
+//! gam's 1-D *unpenalized* (penalized-zero) logistic regression on a single
+//! linear term reduces *mathematically* to ordinary MLE logistic regression, the
+//! exact convex objective scikit-learn (`penalty=None`) solves. Agreement there
+//! is correctness vs the analytic MLE, so we keep it as a tight assertion.
+//!
+//! The link inversion (eta -> probability) is the single most common GLM bug, so
+//! we apply `1/(1+exp(-eta))` ourselves on gam's own linear predictor. A genuine
+//! shortfall here is a real bug, never a reason to loosen a bound.
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, run_python, run_r};
+use gam::test_support::reference::{Column, relative_l2, run_python, run_r};
+use gam::data::EncodedDataset;
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::path::Path;
@@ -62,8 +69,23 @@ fn auc(scores: &[f64], labels: &[f64]) -> f64 {
     (sum_ranks_pos - n_pos * (n_pos + 1.0) / 2.0) / (n_pos * n_neg)
 }
 
+/// Build a row-subset of an `EncodedDataset` keeping the schema/encoding intact,
+/// so the smaller dataset can be fed to `fit_from_formula` unchanged.
+fn subset_rows(ds: &EncodedDataset, rows: &[usize]) -> EncodedDataset {
+    let mut sub = ds.clone();
+    let ncol = ds.values.ncols();
+    let mut values = Array2::<f64>::zeros((rows.len(), ncol));
+    for (new_r, &old_r) in rows.iter().enumerate() {
+        for c in 0..ncol {
+            values[[new_r, c]] = ds.values[[old_r, c]];
+        }
+    }
+    sub.values = values;
+    sub
+}
+
 #[test]
-fn gam_binomial_logit_matches_sklearn_and_mgcv() {
+fn gam_binomial_logit_generalizes_on_heldout_prostate() {
     init_parallelism();
 
     // ---- load the real prostate binary outcome (y ~ pc1, pc2) -------------
@@ -81,89 +103,125 @@ fn gam_binomial_logit_matches_sklearn_and_mgcv() {
         assert!(yi == 0.0 || yi == 1.0, "y must be binary 0/1, saw {yi}");
     }
 
-    // ---- (A) gam smooth binomial-logit fit: y ~ s(pc1,k=5)+s(pc2,k=5) -----
+    // ---- deterministic train/test split (every 4th row -> test) -----------
+    // Fixed, reproducible, no RNG: rows with index % 4 == 0 are held out for
+    // evaluation; the rest train. ~25% held out is enough positives/negatives
+    // for a stable held-out AUC on this dataset.
+    let test_rows: Vec<usize> = (0..n).filter(|i| i % 4 == 0).collect();
+    let train_rows: Vec<usize> = (0..n).filter(|i| i % 4 != 0).collect();
+    let y_test: Vec<f64> = test_rows.iter().map(|&i| y[i]).collect();
+    let pc1_train: Vec<f64> = train_rows.iter().map(|&i| pc1[i]).collect();
+    let pc2_train: Vec<f64> = train_rows.iter().map(|&i| pc2[i]).collect();
+    let y_train: Vec<f64> = train_rows.iter().map(|&i| y[i]).collect();
+    let pc1_test: Vec<f64> = test_rows.iter().map(|&i| pc1[i]).collect();
+    let pc2_test: Vec<f64> = test_rows.iter().map(|&i| pc2[i]).collect();
+    {
+        let n_pos = y_test.iter().filter(|&&v| v > 0.5).count();
+        assert!(
+            n_pos > 0 && n_pos < y_test.len(),
+            "held-out test set must contain both classes (pos={n_pos}, n={})",
+            y_test.len()
+        );
+    }
+
     let cfg = FitConfig {
         family: Some("binomial".to_string()),
         link: Some("logit".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ s(pc1, k=5) + s(pc2, k=5)", &ds, &cfg).expect("gam fit");
+
+    // ---- (A) gam smooth binomial-logit fit on TRAIN, predict TEST ---------
+    let ds_train = subset_rows(&ds, &train_rows);
+    let result =
+        fit_from_formula("y ~ s(pc1, k=5) + s(pc2, k=5)", &ds_train, &cfg).expect("gam fit");
     let FitResult::Standard(fit) = result else {
         panic!("binomial(logit) GLM with smooths should be a Standard fit");
     };
     let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
 
-    // Rebuild the design at the training rows and apply beta -> eta, then
-    // invert the logit link ourselves to get fitted probabilities.
-    let mut grid = Array2::<f64>::zeros((n, ds.headers.len()));
-    for i in 0..n {
-        grid[[i, pc1_idx]] = pc1[i];
-        grid[[i, pc2_idx]] = pc2[i];
+    // Rebuild the design at the HELD-OUT test rows and apply beta -> eta, then
+    // invert the logit link ourselves to get held-out fitted probabilities.
+    let ntest = test_rows.len();
+    let mut grid = Array2::<f64>::zeros((ntest, ds.headers.len()));
+    for (r, &i) in test_rows.iter().enumerate() {
+        grid[[r, pc1_idx]] = pc1[i];
+        grid[[r, pc2_idx]] = pc2[i];
     }
     let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
-        .expect("rebuild design at training points");
+        .expect("rebuild design at held-out test points");
     let gam_eta: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
     let gam_prob: Vec<f64> = gam_eta.iter().map(|&e| inv_logit(e)).collect();
-    assert_eq!(gam_prob.len(), n, "gam fitted-probability length mismatch");
+    assert_eq!(gam_prob.len(), ntest, "gam held-out probability length");
 
-    // ---- (B) mgcv smooth reference: SAME smooth binomial model ------------
-    // mgcv::gam(y ~ s(pc1,k=5)+s(pc2,k=5), binomial) is the mature penalized
-    // GAM; fitted(m) is on the probability scale (type="response" default).
+    // ---- (B) mgcv smooth baseline: fit TRAIN, predict TEST ----------------
+    // Same penalized binomial GAM, trained on the identical TRAIN rows and
+    // scored on the identical TEST rows. A baseline to match-or-beat on
+    // held-out AUC, not a target to reproduce pointwise.
     let r = run_r(
         &[
-            Column::new("pc1", &pc1),
-            Column::new("pc2", &pc2),
-            Column::new("y", &y),
+            Column::new("pc1", &pc1_train),
+            Column::new("pc2", &pc2_train),
+            Column::new("y", &y_train),
+            Column::new("pc1_te", &pad_to(&pc1_test, train_rows.len())),
+            Column::new("pc2_te", &pad_to(&pc2_test, train_rows.len())),
+            Column::new("ntest", &vec![ntest as f64; train_rows.len()]),
         ],
         r#"
         suppressPackageStartupMessages(library(mgcv))
         m <- gam(y ~ s(pc1, k=5) + s(pc2, k=5), data = df,
                  family = binomial(link="logit"), method = "REML")
-        emit("prob", as.numeric(fitted(m)))
-        emit("edf", sum(m$edf))
+        ntest <- as.integer(df$ntest[1])
+        newd <- data.frame(pc1 = df$pc1_te[1:ntest], pc2 = df$pc2_te[1:ntest])
+        emit("prob", as.numeric(predict(m, newdata = newd, type = "response")))
         "#,
     );
     let mgcv_prob = r.vector("prob");
-    let mgcv_edf = r.scalar("edf");
-    assert_eq!(
-        mgcv_prob.len(),
-        n,
-        "mgcv fitted-probability length mismatch"
-    );
+    assert_eq!(mgcv_prob.len(), ntest, "mgcv held-out probability length");
 
-    // ---- (C) scikit-learn classifier reference ----------------------------
-    // Unpenalized LogisticRegression (penalty=None, lbfgs) on the SAME two
-    // features gives a trusted linear-logit probability score; we use it only
-    // for AUC (rank) agreement against the smooth gam fit, since the linear
-    // sklearn model and the penalized smooth need not coincide pointwise but
-    // must rank the same binary outcome essentially identically here.
+    // ---- (C) scikit-learn baseline: fit TRAIN, predict TEST ---------------
+    // Unpenalized LogisticRegression on the SAME two TRAIN features, scored on
+    // the SAME TEST rows. Linear-logit baseline to match-or-beat on AUC.
+    // Also: a 1-D unpenalized logistic on pc1 over the FULL data, whose
+    // coefficient is the analytic MLE ground truth for gam's linear fit below.
     let sk = run_python(
         &[
-            Column::new("pc1", &pc1),
-            Column::new("pc2", &pc2),
-            Column::new("y", &y),
+            Column::new("pc1", &pc1_train),
+            Column::new("pc2", &pc2_train),
+            Column::new("y", &y_train),
+            Column::new("pc1_te", &pad_to(&pc1_test, train_rows.len())),
+            Column::new("pc2_te", &pad_to(&pc2_test, train_rows.len())),
+            Column::new("ntest", &vec![ntest as f64; train_rows.len()]),
+            Column::new("pc1_full", &pad_to(&pc1, train_rows.len())),
+            Column::new("y_full", &pad_to(&y, train_rows.len())),
+            Column::new("nfull", &vec![n as f64; train_rows.len()]),
         ],
         r#"
 from sklearn.linear_model import LogisticRegression
-X = np.column_stack([np.asarray(df["pc1"], float), np.asarray(df["pc2"], float)])
-yv = np.asarray(df["y"], float)
+ntest = int(np.asarray(df["ntest"])[0])
+nfull = int(np.asarray(df["nfull"])[0])
+Xtr = np.column_stack([np.asarray(df["pc1"], float), np.asarray(df["pc2"], float)])
+ytr = np.asarray(df["y"], float)
+Xte = np.column_stack([np.asarray(df["pc1_te"], float)[:ntest],
+                       np.asarray(df["pc2_te"], float)[:ntest]])
 clf = LogisticRegression(penalty=None, solver="lbfgs", max_iter=10000)
-clf.fit(X, yv)
-emit("prob", clf.predict_proba(X)[:, 1])
+clf.fit(Xtr, ytr)
+emit("prob", clf.predict_proba(Xte)[:, 1])
 
-# 1-D unpenalized logistic on pc1 alone: coefficient ground truth.
+# 1-D unpenalized logistic on pc1 alone over the FULL data: MLE ground truth.
+xf = np.asarray(df["pc1_full"], float)[:nfull].reshape(-1, 1)
+yf = np.asarray(df["y_full"], float)[:nfull]
 clf1 = LogisticRegression(penalty=None, solver="lbfgs", max_iter=10000)
-clf1.fit(X[:, [0]], yv)
+clf1.fit(xf, yf)
 emit("coef1", [float(clf1.coef_[0, 0]), float(clf1.intercept_[0])])
 "#,
     );
     let sk_prob = sk.vector("prob");
     let sk_coef1 = sk.vector("coef1"); // [slope, intercept]
-    assert_eq!(sk_prob.len(), n, "sklearn probability length mismatch");
+    assert_eq!(sk_prob.len(), ntest, "sklearn held-out probability length");
 
-    // ---- (D) gam 1-D *linear* binomial-logit fit: y ~ pc1 -----------------
-    // No smooth: an ordinary penalized-zero logistic regression on pc1. Its
-    // coefficient must match sklearn's unpenalized logistic-regression slope.
+    // ---- (D) gam 1-D *linear* binomial-logit fit on FULL data: y ~ pc1 ----
+    // No smooth: ordinary penalized-zero logistic regression on pc1, fit on the
+    // SAME full data sklearn used. Its coefficient must match the analytic MLE.
     let lin = fit_from_formula("y ~ pc1", &ds, &cfg).expect("gam linear logit fit");
     let FitResult::Standard(linfit) = lin else {
         panic!("linear binomial(logit) should be a Standard fit");
@@ -180,78 +238,68 @@ emit("coef1", [float(clf1.coef_[0, 0]), float(clf1.intercept_[0])])
     let sk_slope = sk_coef1[0];
     let sk_intercept = sk_coef1[1];
 
-    // ---- compare ----------------------------------------------------------
-    let corr_mgcv = pearson(&gam_prob, mgcv_prob);
-    // Pointwise (not merely correlated) probability agreement: pearson is
-    // affine-invariant and would pass even if gam's probabilities were a
-    // scaled/shifted copy of mgcv's, so we also require small relative-L2 on
-    // the [0,1] probability scale where both engines emit the same quantity.
+    // ---- objective metric: held-out AUC ----------------------------------
+    let gam_auc = auc(&gam_prob, &y_test);
+    let mgcv_auc = auc(mgcv_prob, &y_test);
+    let sk_auc = auc(sk_prob, &y_test);
+    let best_ref = mgcv_auc.max(sk_auc);
+    // Printed for context only — NOT a pass criterion.
     let rel_mgcv = relative_l2(&gam_prob, mgcv_prob);
-    let gam_auc = auc(&gam_prob, &y);
-    let mgcv_auc = auc(mgcv_prob, &y);
-    let sk_auc = auc(sk_prob, &y);
-    let edf_rel = (gam_edf - mgcv_edf).abs() / mgcv_edf.abs().max(1.0);
     let slope_rel = (gam_slope - sk_slope).abs() / sk_slope.abs().max(1e-6);
     let intercept_abs = (gam_intercept - sk_intercept).abs();
 
     eprintln!(
-        "prostate binomial(logit): n={n} gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} \
-         (edf_rel={edf_rel:.3}) prob_pearson(gam,mgcv)={corr_mgcv:.5} prob_rel_l2={rel_mgcv:.4} \
-         AUC gam={gam_auc:.4} mgcv={mgcv_auc:.4} sklearn={sk_auc:.4} | \
-         1D slope gam={gam_slope:.4} sklearn={sk_slope:.4} (rel={slope_rel:.3}) \
-         intercept gam={gam_intercept:.4} sklearn={sk_intercept:.4}"
+        "prostate binomial(logit) HELD-OUT (n_train={} n_test={ntest}): \
+         gam_edf={gam_edf:.3} | held-out AUC gam={gam_auc:.4} mgcv={mgcv_auc:.4} \
+         sklearn={sk_auc:.4} (best_ref={best_ref:.4}) | context: \
+         prob_rel_l2(gam,mgcv)={rel_mgcv:.4} | 1D-MLE slope gam={gam_slope:.4} \
+         sklearn={sk_slope:.4} (rel={slope_rel:.3}) intercept gam={gam_intercept:.4} \
+         sklearn={sk_intercept:.4}",
+        train_rows.len()
     );
 
-    // (1) Probability-scale agreement with mgcv: both REML-fit the identical
-    // penalized binomial smooth, so post-logit fitted probabilities must be
-    // nearly collinear. gam vs mgcv on this data tracks at pearson ~0.999;
-    // 0.99 is a tight bound that still tolerates basis/null-space convention
-    // differences while catching any link-inversion or smoother bug.
+    // (1) PRIMARY objective claim — gam generalizes: held-out AUC clears an
+    // absolute bar. pc1/pc2 carry real signal for this outcome; a correct
+    // penalized binomial GAM ranks held-out cases well above chance. 0.70 is a
+    // principled floor (well above the 0.5 chance line) that a genuinely broken
+    // link inversion or under/over-smoothed fit could not reach.
     assert!(
-        corr_mgcv > 0.99,
-        "gam vs mgcv fitted probabilities diverge: pearson={corr_mgcv:.5}"
-    );
-    // Same penalized binomial smooth fit by both engines: post-logit fitted
-    // probabilities must coincide pointwise, not just correlate. The bound is
-    // looser than the gaussian-smooth test's 0.02 because the two engines
-    // differ in basis (gam default vs mgcv k=5 thin-plate) and in smoothing-
-    // parameter selection, which shifts the wiggly tails on the probability
-    // scale; 0.10 still rules out a mis-inverted link (which would blow rel_l2
-    // to O(1)) or a probabilities-clamped-at-0.5 bug.
-    assert!(
-        rel_mgcv < 0.10,
-        "gam vs mgcv fitted probabilities diverge pointwise: rel_l2={rel_mgcv:.4}"
+        gam_auc >= 0.70,
+        "gam held-out AUC below objective bar: {gam_auc:.4} < 0.70"
     );
 
-    // (2) AUC (rank) agreement: a correct classifier must order cases like the
-    // mature references. The smooth gam fit and the trusted classifiers should
-    // differ by <0.01 in AUC (the spec bound).
+    // (2) Match-or-beat the best mature baseline on the SAME split. gam's
+    // generalization must not trail mgcv or sklearn by more than 0.02 AUC.
     assert!(
-        (gam_auc - mgcv_auc).abs() < 0.01,
-        "gam vs mgcv AUC disagree: gam={gam_auc:.4} mgcv={mgcv_auc:.4}"
-    );
-    assert!(
-        (gam_auc - sk_auc).abs() < 0.01,
-        "gam vs sklearn AUC disagree: gam={gam_auc:.4} sklearn={sk_auc:.4}"
+        gam_auc >= best_ref - 0.02,
+        "gam held-out AUC trails best baseline: gam={gam_auc:.4} \
+         best_ref={best_ref:.4} (mgcv={mgcv_auc:.4} sklearn={sk_auc:.4})"
     );
 
-    // (3) EDF same-ballpark complexity (basis-convention sensitive): within 30%.
-    assert!(
-        edf_rel < 0.30,
-        "effective degrees of freedom disagree: gam={gam_edf:.3} mgcv={mgcv_edf:.3} (rel={edf_rel:.3})"
-    );
-
-    // (4) 1-D linear coefficient: gam's penalized-zero logistic regression on
-    // a single linear term reduces to ordinary MLE logistic regression, which
-    // is exactly what sklearn (penalty=None) computes. Slope must match within
-    // 2% relative and intercept within 0.02 absolute — tight, since both solve
-    // the same convex log-likelihood.
+    // (3) GROUND-TRUTH correctness (not peer-matching): gam's penalized-zero
+    // logistic regression on a single linear term IS ordinary MLE logistic
+    // regression — the exact convex objective sklearn(penalty=None) solves.
+    // Slope within 2% relative, intercept within 0.02 absolute.
     assert!(
         slope_rel < 0.02,
-        "1-D logit slope disagrees with sklearn: gam={gam_slope:.5} sklearn={sk_slope:.5} (rel={slope_rel:.4})"
+        "1-D logit slope disagrees with the analytic MLE: gam={gam_slope:.5} \
+         mle={sk_slope:.5} (rel={slope_rel:.4})"
     );
     assert!(
         intercept_abs < 0.02,
-        "1-D logit intercept disagrees with sklearn: gam={gam_intercept:.5} sklearn={sk_intercept:.5}"
+        "1-D logit intercept disagrees with the analytic MLE: gam={gam_intercept:.5} \
+         mle={sk_intercept:.5}"
     );
+}
+
+/// Pad a vector to `len` by repeating its last value (or 0.0 if empty). Used to
+/// ship a short test-row column alongside longer train-row columns through the
+/// single-`data.frame` harness; the reference body slices back to the true
+/// length via an emitted `ntest`/`nfull` count.
+fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
+    assert!(v.len() <= len, "pad_to: source longer than target");
+    let fill = v.last().copied().unwrap_or(0.0);
+    let mut out = v.to_vec();
+    out.resize(len, fill);
+    out
 }

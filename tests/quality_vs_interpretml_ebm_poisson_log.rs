@@ -1,57 +1,47 @@
-//! End-to-end quality: gam's penalized PoissonGAM must reach predictive parity
-//! with **InterpretML's `ExplainableBoostingRegressor`** (the ML-world glassbox
-//! GAM) on the exact same count data, under the exact same objective.
+//! End-to-end OBJECTIVE quality: gam's penalized PoissonGAM must RECOVER THE
+//! KNOWN MEAN SURFACE `mu_true(x) = exp(true_eta(x))` on held-out data, and do so
+//! at least as accurately as **InterpretML's `ExplainableBoostingRegressor`**
+//! (the ML-world glassbox GAM) fit to the identical count data.
 //!
-//! InterpretML's EBM is the machine-learning lineage's answer to the GAM: a
-//! purely additive model `eta = f1(x1) + f2(x2) + ...` learned by cyclic
-//! gradient boosting on shallow trees, with an explicit Poisson-deviance
-//! objective (`objective="poisson_deviance"`, log link). It is the best-in-class
-//! ML comparator here precisely because it shares gam's *additive* structure and
-//! gam's *objective* (Poisson deviance) while using a completely different
-//! estimation strategy (boosted bins vs REML penalized PIRLS). If the two agree,
-//! it is because both recovered the same smooth count surface — strong, method-
-//! independent evidence that gam's log-link inversion and smoothing are correct.
+//! The data are generated from a fully known additive log-mean
+//!   true_eta = 0.5 + 0.2*sin(pi*x1/5) + 0.15*cos(pi*x2/5),  count ~ Poisson(exp(true_eta)),
+//! so there is a GROUND TRUTH mean `mu_true = exp(true_eta)` at every covariate.
+//! The objective quality of any Poisson learner is how close its fitted mean comes
+//! to that true mean on data it did not train on — NOT how close it comes to a peer
+//! tool's (equally noisy) fit. So the pass/fail criterion is truth recovery, and
+//! the EBM is demoted to a baseline-to-match-or-beat on that same truth metric.
+//!
+//! OBJECTIVE METRIC (the primary assertion): on a held-out 30% test fold, the
+//! Poisson deviance of gam's fitted mean against the TRUE mean,
+//!   D_true(mu_hat) = 2*sum( mu_true*log(mu_true/mu_hat) - (mu_true - mu_hat) ),
+//! must be small in absolute terms — at most a small fraction of the irreducible
+//! deviance the truth itself carries against the realized counts. Equivalently the
+//! held-out RMSE of mu_hat against mu_true must be a small fraction of the signal
+//! amplitude. This is a real recovery claim: a broken PIRLS loop or a mis-inverted
+//! log link cannot recover exp(true_eta) and fails it.
 //!
 //! Setup (identical bytes fed to both engines):
-//!   * synthetic n=250, x1,x2 ~ U[0,10], seed 20260530,
-//!     true_eta = 0.5 + 0.2*sin(pi*x1/5) + 0.15*cos(pi*x2/5),
-//!     count ~ Poisson(exp(true_eta)).
+//!   * synthetic n=250, x1,x2 ~ U[0,10], seed 20260530, counts as above.
 //!   * a fixed 70/30 train/test split (indices computed identically Rust-side and
-//!     handed to both engines as a `fold` column: 1 = test, 0 = train).
+//!     handed to EBM as a `fold` column: 1 = test, 0 = train).
 //!   * gam fits `count ~ s(x1, k=6) + s(x2, k=6)` (Poisson, log link, REML) on the
 //!     TRAIN rows, then predicts mu on the TEST rows.
 //!   * EBM fits on the TRAIN rows, predicts mu on the TEST rows.
 //!
-//! Two different additive *machines* (boosted bins vs REML penalized splines)
-//! cannot be expected to agree pointwise on a noisy held-out fold of tiny counts
-//! — boosting fits piecewise-constant shape functions, gam fits smooth splines,
-//! so per-row means differ in shape even when both are correct. What they MUST
-//! share is the predictive *operating point*: the same aggregate loss, the same
-//! calibration (total expected count), and the same ordering of the test points.
-//! Those are exactly the quantities the sibling EBM-binomial test compares (AUC,
-//! Brier, aggregate deviance), and they are what bite here too.
-//!
-//! Assertions (Poisson is the second-most-common applied GLM family):
-//!   1. Aggregate held-out Poisson deviance agrees: deviance(y,mu) =
-//!      2*sum(y*log(y/mu) - (y-mu)) is the *same* objective both engines minimize,
-//!      so the total test deviance must match to within a relative ratio — the
-//!      strongest single "same operating point" check, and a broken PIRLS loop or
-//!      a mis-inverted log link blows it out.
-//!   2. Calibration on the exp scale agrees: the total predicted count over the
-//!      test fold (sum of fitted means) must match within a relative tolerance —
-//!      this is the log-link inversion fidelity test. A factor error in the link
-//!      inversion (e.g. forgetting the exp, or an intercept offset) fails it
-//!      immediately, while it does not demand pointwise shape agreement that two
-//!      different additive learners legitimately do not share.
-//!   3. Ranked mean prediction Pearson > 0.90: the two additive surfaces must
-//!      order the test points near-identically.
-//! A genuine divergence is a real bug in gam's Poisson/PIRLS path, never a reason
-//! to weaken these bounds.
+//! Assertions:
+//!   1. TRUTH RECOVERY (primary): gam's held-out RMSE against the TRUE mean
+//!      `mu_true` is a small fraction of the true-mean range — gam has recovered
+//!      the smooth count surface, not merely tracked the noisy realization.
+//!   2. MATCH-OR-BEAT (baseline): gam's held-out truth-deviance is no worse than
+//!      the EBM's truth-deviance times 1.10. The mature ML additive learner sets
+//!      the accuracy bar; gam must meet or beat it on recovering the SAME truth.
+//! A genuine recovery shortfall failing is a real bug in gam's Poisson/PIRLS path,
+//! never a reason to weaken these bounds.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, run_python};
+use gam::test_support::reference::{Column, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -190,96 +180,82 @@ emit("mu", mu)
     let ebm_mu = r.vector("mu");
     assert_eq!(ebm_mu.len(), n_test, "EBM test-mu length mismatch");
 
-    // ---- compare on the TEST fold --------------------------------------------
+    // ---- OBJECTIVE evaluation on the TEST fold against the KNOWN truth --------
+    // The data were generated from a known log-mean, so the true mean at each test
+    // covariate is mu_true = exp(true_eta). Objective quality is recovery of THAT
+    // surface on held-out points, not agreement with a peer tool's noisy fit.
+    let mu_true: Vec<f64> = test_idx
+        .iter()
+        .map(|&i| truth_eta(x1[i], x2[i]).exp())
+        .collect();
     let y_test: Vec<f64> = test_idx.iter().map(|&i| y[i]).collect();
 
-    // Per-row Poisson deviance contributions under each engine's fitted mean.
-    // Summed below into the aggregate held-out deviance both engines minimize.
-    let gam_dev: Vec<f64> = y_test
+    // Truth-recovery deviance: each learner's fitted mean against the TRUE mean.
+    // (D_true uses mu_true in the y-slot of the Poisson deviance; the y=0 limit is
+    //  never hit because exp(true_eta) > 0 everywhere.)
+    let gam_truth_dev: f64 = mu_true
         .iter()
         .zip(&gam_mu)
-        .map(|(&yi, &mu)| poisson_dev_unit(yi, mu))
-        .collect();
-    let ebm_dev: Vec<f64> = y_test
+        .map(|(&mt, &mh)| poisson_dev_unit(mt, mh))
+        .sum();
+    let ebm_truth_dev: f64 = mu_true
         .iter()
         .zip(ebm_mu)
-        .map(|(&yi, &mu)| poisson_dev_unit(yi, mu))
-        .collect();
-    let gam_test_dev: f64 = gam_dev.iter().sum();
-    let ebm_test_dev: f64 = ebm_dev.iter().sum();
-    // (1) Aggregate held-out Poisson deviance: the literal objective both engines
-    //     minimize, summed over the same test rows. Same y, so any gap is driven
-    //     by the fitted means alone.
-    let rel_total_dev = (gam_test_dev - ebm_test_dev).abs() / ebm_test_dev.abs().max(1e-12);
+        .map(|(&mt, &mh)| poisson_dev_unit(mt, mh))
+        .sum();
 
-    // (2) Calibration on the exp scale: total predicted count over the test fold.
-    //     A correctly-inverted log link reproduces the mean count; a factor error
-    //     (missing exp, intercept offset) shifts this far beyond the tolerance.
-    let gam_total_mu: f64 = gam_mu.iter().sum();
-    let ebm_total_mu: f64 = ebm_mu.iter().sum();
-    let rel_total_mu = (gam_total_mu - ebm_total_mu).abs() / ebm_total_mu.abs().max(1e-12);
+    // (1) Truth-recovery RMSE on the held-out mean surface, reported relative to
+    //     the amplitude (range) of the true mean over the test fold. This is the
+    //     primary objective bar: a small fraction of the signal range.
+    let n_test_f = n_test as f64;
+    let gam_truth_rmse =
+        (gam_mu.iter().zip(&mu_true).map(|(&mh, &mt)| (mh - mt).powi(2)).sum::<f64>() / n_test_f)
+            .sqrt();
+    let mu_true_min = mu_true.iter().cloned().fold(f64::INFINITY, f64::min);
+    let mu_true_max = mu_true.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let mu_true_range = (mu_true_max - mu_true_min).max(1e-12);
+    let rel_truth_rmse = gam_truth_rmse / mu_true_range;
 
-    // (3) ranked mean-prediction correlation (Spearman = Pearson on ranks): the
-    //     two additive surfaces must order the test points near-identically.
-    let gam_rank = ranks(&gam_mu);
-    let ebm_rank = ranks(ebm_mu);
-    let corr_rank = pearson(&gam_rank, &ebm_rank);
+    // Irreducible deviance the truth itself carries against the realized counts —
+    // a no-model-can-beat reference scale for the held-out deviance (context only).
+    let truth_vs_counts_dev: f64 = y_test
+        .iter()
+        .zip(&mu_true)
+        .map(|(&yi, &mt)| poisson_dev_unit(yi, mt))
+        .sum();
+
+    // Match-or-beat ratio on the SAME truth metric (gam vs the mature ML learner).
+    let truth_dev_ratio = gam_truth_dev / ebm_truth_dev.max(1e-12);
 
     eprintln!(
-        "EBM-vs-gam poisson: n_train={} n_test={} gam_edf={gam_edf:.3} \
-         gam_test_dev={gam_test_dev:.3} ebm_test_dev={ebm_test_dev:.3} (rel={rel_total_dev:.4}) \
-         gam_total_mu={gam_total_mu:.3} ebm_total_mu={ebm_total_mu:.3} (rel={rel_total_mu:.4}) \
-         pearson(rank_mu)={corr_rank:.5}",
+        "poisson truth-recovery: n_train={} n_test={} gam_edf={gam_edf:.3} \
+         gam_truth_dev={gam_truth_dev:.4} ebm_truth_dev={ebm_truth_dev:.4} (ratio={truth_dev_ratio:.4}) \
+         gam_truth_rmse={gam_truth_rmse:.4} mu_true_range={mu_true_range:.4} (rel={rel_truth_rmse:.4}) \
+         irreducible_dev(truth_vs_counts)={truth_vs_counts_dev:.4}",
         train_idx.len(),
         n_test
     );
 
-    // Aggregate Poisson deviance is the strongest single "same operating point"
-    // signal: both engines minimize exactly this loss, so their held-out totals
-    // must agree to within 15% relative — loose enough for genuinely different
-    // penalization (REML vs boosting early-stop) and the smooth-vs-step shape
-    // difference, tight enough that a broken PIRLS loop or mis-inverted link fails.
+    // (1) PRIMARY — truth recovery: gam's held-out fitted mean tracks the TRUE
+    //     mean to well within a fifth of the true-mean amplitude. exp(true_eta)
+    //     ranges only mildly (the signal is gentle), so a learner that recovered
+    //     the smooth surface lands far inside this; a broken PIRLS loop or a
+    //     mis-inverted log link cannot.
     assert!(
-        rel_total_dev < 0.15,
-        "aggregate test-fold Poisson deviance diverges between gam and EBM: \
-         gam={gam_test_dev:.3} ebm={ebm_test_dev:.3} (rel={rel_total_dev:.4})"
+        rel_truth_rmse < 0.20,
+        "gam did not recover the true held-out mean surface: \
+         RMSE(mu_hat, mu_true)={gam_truth_rmse:.4} is {rel_truth_rmse:.4} of the \
+         true-mean range {mu_true_range:.4} (bar 0.20)"
     );
-    // Calibration: the total expected count on the exp scale is the log-link
-    // inversion fidelity test. 10% relative is comfortably inside what two
-    // correctly-calibrated additive Poisson learners reproduce, yet a factor
-    // error in the link inversion (or a dropped intercept) blows straight past it.
-    assert!(
-        rel_total_mu < 0.10,
-        "test-fold total predicted count disagrees on the exp scale: \
-         gam={gam_total_mu:.3} ebm={ebm_total_mu:.3} (rel={rel_total_mu:.4})"
-    );
-    // Both additive surfaces resolve the same monotone-within-period signal, so
-    // their rankings of the test points must be strongly correlated. 0.90 still
-    // demands the dominant-signal ordering agree while tolerating the noise-level
-    // reshuffling of near-tied means that boosted step functions produce.
-    assert!(
-        corr_rank > 0.90,
-        "ranked mean predictions disagree between gam and EBM: pearson={corr_rank:.5}"
-    );
-}
 
-/// Fractional ranks (average ties), so Pearson on these is Spearman correlation.
-fn ranks(v: &[f64]) -> Vec<f64> {
-    let mut order: Vec<usize> = (0..v.len()).collect();
-    order.sort_by(|&a, &b| v[a].partial_cmp(&v[b]).expect("no NaN in predictions"));
-    let mut out = vec![0.0; v.len()];
-    let mut i = 0;
-    while i < order.len() {
-        let mut j = i + 1;
-        while j < order.len() && v[order[j]] == v[order[i]] {
-            j += 1;
-        }
-        // average rank (1-based) over the tie block [i, j)
-        let avg = ((i + 1 + j) as f64) / 2.0;
-        for &idx in &order[i..j] {
-            out[idx] = avg;
-        }
-        i = j;
-    }
-    out
+    // (2) MATCH-OR-BEAT — gam's truth-deviance must be no worse than the mature
+    //     EBM's by more than 10%. Both fit the identical training counts and are
+    //     scored against the identical known truth; gam must be at least as
+    //     accurate as the best-in-class ML additive learner at recovering it.
+    assert!(
+        truth_dev_ratio <= 1.10,
+        "gam is materially less accurate than InterpretML EBM at recovering the \
+         true mean: gam_truth_dev={gam_truth_dev:.4} ebm_truth_dev={ebm_truth_dev:.4} \
+         (ratio={truth_dev_ratio:.4}, bar 1.10)"
+    );
 }

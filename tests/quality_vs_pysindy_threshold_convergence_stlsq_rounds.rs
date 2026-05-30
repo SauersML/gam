@@ -1,39 +1,56 @@
-//! End-to-end quality: gam's STLSQ loop must match **pysindy** — the reference
-//! implementation of Sparse Identification of Nonlinear Dynamics (Brunton,
-//! Proctor & Kutz, PNAS 2016) — on the *core* behaviour that defines the
-//! algorithm: how the active support evolves round by round, and how many
-//! rounds the sequential-thresholded-least-squares loop takes to converge.
+//! End-to-end OBJECTIVE quality: gam's STLSQ loop must **recover the true
+//! governing equations** of a known dynamical system from data — correct sparse
+//! support and accurate coefficients — not merely reproduce pysindy's fitted
+//! output.
 //!
-//! pysindy's `STLSQ` optimizer is the canonical, widely-used implementation of
-//! Algorithm 1 (ridge-regress on the active set → hard-threshold entries below
-//! `tol` → repeat until the support stabilises). We feed *identical* data to
-//! both engines:
-//!   * the library `Θ = [const, x, y, z]` evaluated on a 1200-row RK4-integrated
-//!     trajectory of a deliberately multi-scale linear system
-//!         dx/dt = -10 x + 0.1 y
-//!         dy/dt =  100 z
-//!         dz/dt =  0.01 x
-//!     (coefficients span four decades, which is exactly what stresses a hard
-//!     threshold: which terms survive depends sharply on `tol`), and
-//!   * the same derivative targets `Ẋ = [dx/dt, dy/dt, dz/dt]`.
+//! Sparse Identification of Nonlinear Dynamics (Brunton, Proctor & Kutz, PNAS
+//! 2016) exists to answer one question objectively: *given trajectory data, do
+//! we recover the equations that actually generated it?* We therefore generate
+//! data from a system whose coefficients are KNOWN exactly, and assert gam
+//! recovers that ground truth. The reference (pysindy's canonical `STLSQ`) is
+//! kept only as a **match-or-beat baseline on coefficient accuracy** — gam's
+//! error to the true coefficients must be no worse than pysindy's times 1.10.
+//! Matching pysindy's noisy mask is explicitly NOT a pass criterion.
 //!
-//! The STLSQ recursion is deterministic given `(Θ, Ẋ, tol)`. For each
-//! `tol ∈ {0.001, 0.01, 0.05, 0.1}` we assert:
-//!   1. gam's final sparsity pattern is **at least as sparse** as pysindy's
-//!      (same kept terms, or a strict subset) — the support that survives a
-//!      hard threshold is a property of the algorithm, not the implementation;
-//!   2. the per-tol support *cardinality* matches pysindy's converged active
-//!      set count exactly (the multi-scale design makes the expected count a
-//!      sharp function of `tol`); and
-//!   3. tightening the threshold never *reduces* the round count and never
-//!      *increases* the surviving support cardinality (monotone structure that
-//!      both engines must obey).
+//! The known multi-scale linear system (state = [x, y, z]):
+//!     dx/dt = -10 x + 0.1 y
+//!     dy/dt =  100 z
+//!     dz/dt =  0.01 x
+//! Its true coefficient matrix Ξ ∈ ℝ^{p×d} over the library Θ = [const, x, y, z]
+//! (p = 4 features, d = 3 outputs) has exactly four nonzero entries:
+//!     Ξ[1,0] = -10   (x → dx)      Ξ[2,0] = 0.1  (y → dx)
+//!     Ξ[3,1] = 100   (z → dy)      Ξ[1,2] = 0.01 (x → dz)
+//! and zero everywhere else. The coefficients span four decades, which is what
+//! stresses a hard threshold: which terms should survive at a given `tol` is a
+//! sharp, *knowable* function of the truth.
 //!
-//! A weak ridge (`lam = 1e-4`) is used in gam to stress the thresholding rather
-//! than the shrinkage; pysindy is given the matching `alpha = 1e-4`.
+//! We feed identical data (the 1200-row RK4-integrated trajectory and its
+//! analytic derivatives Ẋ) to both engines and assert, against GROUND TRUTH:
+//!
+//!   1. NO FALSE POSITIVES (structure). At every `tol`, every coefficient gam
+//!      keeps is one of the four true governing terms. A surviving term that is
+//!      truly zero is spurious identification — overfitting the algorithm must
+//!      not do.
+//!
+//!   2. EXACT TRUTH RECOVERY at the finest threshold. With `tol = 0.001` (below
+//!      every true magnitude, including the 0.01 term), gam's surviving support
+//!      must be *exactly* the four-term true active set — no term dropped, none
+//!      added.
+//!
+//!   3. COEFFICIENT ACCURACY vs truth (truth recovery + match-or-beat). At the
+//!      finest threshold gam's recovered coefficients must track the true Ξ:
+//!      relative-L2 error over all p·d entries is small in absolute terms, AND
+//!      no worse than pysindy's error to the same truth times 1.10.
+//!
+//!   4. CONVERGENCE. The system is exactly representable in the library, so
+//!      STLSQ must reach a stable support strictly inside the iteration cap at
+//!      every tol; a cap-pinned or non-converged run signals a broken loop.
+//!
+//! A weak ridge (`lam = 1e-4`) keeps the hard threshold — not the L2 shrinkage —
+//! in control of which terms survive; pysindy gets the matching `alpha = 1e-4`.
 
 use gam::solver::sindy::{SindyPenaltyKind, sindy_stlsq_solve};
-use gam::test_support::reference::{Column, run_python};
+use gam::test_support::reference::{Column, relative_l2, run_python};
 use ndarray::Array2;
 
 /// Number of trajectory rows.
@@ -47,6 +64,10 @@ const LAM: f64 = 1.0e-4;
 const MAX_ROUNDS: usize = 30;
 /// Thresholds swept, tight → loose.
 const TOLS: [f64; 4] = [0.001, 0.01, 0.05, 0.1];
+/// Library width (p = number of features) and output count (d = number of
+/// state-derivative columns).
+const P: usize = 4;
+const DD: usize = 3;
 
 /// One RK4 step of the multi-scale linear system. State = [x, y, z].
 fn rhs(s: [f64; 3]) -> [f64; 3] {
@@ -81,8 +102,23 @@ fn rk4_step(s: [f64; 3], dt: f64) -> [f64; 3] {
     ]
 }
 
+/// True coefficient matrix Ξ flattened in gam's layout (column-major over
+/// outputs: index = c * P + j for output c, feature j). Four nonzero entries.
+fn true_coeffs_flat() -> Vec<f64> {
+    let mut t = vec![0.0f64; P * DD];
+    let slot = |c: usize, j: usize| c * P + j;
+    // output c=0 (dx): -10 x + 0.1 y
+    t[slot(0, 1)] = -10.0; // x
+    t[slot(0, 2)] = 0.1; // y
+    // output c=1 (dy): 100 z
+    t[slot(1, 3)] = 100.0; // z
+    // output c=2 (dz): 0.01 x
+    t[slot(2, 1)] = 0.01; // x
+    t
+}
+
 #[test]
-fn stlsq_threshold_convergence_matches_pysindy() {
+fn stlsq_recovers_true_governing_equations() {
     // ---- build the identical trajectory both engines will see -------------
     // Fixed deterministic seed=42 LCG perturbs only the *initial* condition so
     // the trajectory excites all three states; the dynamics themselves are the
@@ -115,10 +151,8 @@ fn stlsq_threshold_convergence_matches_pysindy() {
     }
 
     // Library Θ = [const, x, y, z]  (p = 4). Targets Ẋ = [dx, dy, dz] (d = 3).
-    let p = 4usize;
-    let dd = 3usize;
-    let mut theta = Array2::<f64>::zeros((N, p));
-    let mut dzdt = Array2::<f64>::zeros((N, dd));
+    let mut theta = Array2::<f64>::zeros((N, P));
+    let mut dzdt = Array2::<f64>::zeros((N, DD));
     for i in 0..N {
         theta[(i, 0)] = 1.0;
         theta[(i, 1)] = x[i];
@@ -129,15 +163,16 @@ fn stlsq_threshold_convergence_matches_pysindy() {
         dzdt[(i, 2)] = dz[i];
     }
 
-    // ---- gam: run STLSQ at each tol; record rounds + support pattern ------
-    // Support pattern: a length-(p*d) 0/1 mask of nonzero coefficients, plus
-    // total cardinality. Per-round cardinality is observable indirectly, but
-    // the round count + final pattern are the load-bearing quantities pysindy
-    // also exposes, so those drive the assertions.
-    let mut gam_rounds = [0usize; TOLS.len()];
+    let truth = true_coeffs_flat();
+    // The four true governing slots (flattened c*P + j) — used to detect any
+    // false-positive (spurious) term gam might keep.
+    let true_support: Vec<usize> = (0..P * DD).filter(|&k| truth[k] != 0.0).collect();
+    assert_eq!(true_support.len(), 4, "true system has exactly four terms");
+
+    // ---- gam: run STLSQ at each tol; record coefficients, support, loop ----
     let mut gam_converged = [false; TOLS.len()];
-    let mut gam_card = [0usize; TOLS.len()];
-    let mut gam_mask: Vec<Vec<u8>> = Vec::with_capacity(TOLS.len());
+    let mut gam_rounds = [0usize; TOLS.len()];
+    let mut gam_flat: Vec<Vec<f64>> = Vec::with_capacity(TOLS.len());
 
     for (ti, &tol) in TOLS.iter().enumerate() {
         let res = sindy_stlsq_solve(
@@ -151,20 +186,17 @@ fn stlsq_threshold_convergence_matches_pysindy() {
         )
         .expect("gam STLSQ must succeed");
 
-        let mut mask = vec![0u8; p * dd];
-        let mut card = 0usize;
-        for c in 0..dd {
-            for j in 0..p {
-                if res.coefficients[(j, c)] != 0.0 {
-                    mask[c * p + j] = 1;
-                    card += 1;
-                }
+        // Flatten Ξ in gam's layout (column-major over outputs): index = c*P + j.
+        let mut flat = vec![0.0f64; P * DD];
+        for c in 0..DD {
+            for j in 0..P {
+                flat[c * P + j] = res.coefficients[(j, c)];
             }
         }
-        gam_rounds[ti] = res.rounds_used;
+        let card = flat.iter().filter(|&&v| v != 0.0).count();
         gam_converged[ti] = res.converged;
-        gam_card[ti] = card;
-        gam_mask.push(mask);
+        gam_rounds[ti] = res.rounds_used;
+        gam_flat.push(flat);
 
         eprintln!(
             "gam tol={tol:>6}: rounds={} converged={} support_card={}",
@@ -172,13 +204,12 @@ fn stlsq_threshold_convergence_matches_pysindy() {
         );
     }
 
-    // ---- pysindy: identical data, identical thresholds --------------------
-    // We drive pysindy's STLSQ optimizer directly with the same Θ and Ẋ via the
-    // SINDy `optimizer` on a precomputed library (IdentityLibrary on the columns
-    // we provide), so the algorithm — not pysindy's feature generation — is what
-    // is compared. For each tol we emit the converged support cardinality per
-    // output and the flattened 0/1 mask, in the SAME (column-major over outputs)
-    // layout gam uses above.
+    // ---- pysindy: identical data, identical thresholds (baseline) ---------
+    // We drive pysindy's STLSQ optimizer directly with the same Θ and Ẋ so the
+    // algorithm — not pysindy's feature generation — is what is compared. For
+    // each tol we emit the fitted coefficient matrix flattened in gam's layout
+    // (column-major over outputs => for c in 0..d, for j in 0..p). pysindy is a
+    // BASELINE on accuracy-to-truth only; we never assert gam matches its mask.
     let tol_list: Vec<f64> = TOLS.to_vec();
     let ref_res = run_python(
         &[
@@ -206,26 +237,16 @@ tols = {tols:?}
 lam = {lam}
 max_rounds = {max_rounds}
 
-card_all = []
-mask_all = []
-rounds_all = []
+coef_all = []
 for tol in tols:
     opt = STLSQ(threshold=tol, alpha=lam, max_iter=max_rounds)
     # pysindy fits coef_ of shape (n_targets, n_features) = (d, p).
     opt.fit(Theta, Xdot)
     coef = np.asarray(opt.coef_)          # (d, p)
-    # Flatten in gam's layout: column-major over outputs => for c in 0..d, for j in 0..p.
-    mask = (coef != 0.0).astype(float)    # (d, p)
-    flat = mask.reshape(d * p)            # row c (output c) then p features -> c*p + j
-    card_all.append(float(mask.sum()))
-    mask_all.extend(flat.tolist())
-    # Number of STLSQ rounds pysindy actually executed (length of its history).
-    hist = getattr(opt, "history_", None)
-    rounds_all.append(float(len(hist)) if hist is not None else float("nan"))
+    # Flatten in gam's layout: for c in 0..d, for j in 0..p -> c*p + j.
+    coef_all.extend(coef.reshape(d * p).tolist())
 
-emit("card", card_all)
-emit("rounds", rounds_all)
-emit("mask", mask_all)
+emit("coef", coef_all)
 "#,
             tols = tol_list,
             lam = LAM,
@@ -233,81 +254,73 @@ emit("mask", mask_all)
         ),
     );
 
-    let py_card = ref_res.vector("card");
-    let py_mask = ref_res.vector("mask");
-    let py_rounds = ref_res.vector("rounds");
+    let py_coef = ref_res.vector("coef");
     assert_eq!(
-        py_card.len(),
-        TOLS.len(),
-        "pysindy must report one cardinality per tol"
-    );
-    assert_eq!(
-        py_mask.len(),
-        TOLS.len() * p * dd,
-        "pysindy mask layout mismatch"
+        py_coef.len(),
+        TOLS.len() * P * DD,
+        "pysindy coefficient layout mismatch"
     );
 
+    // ---- assertion 1: NO FALSE POSITIVES at any tol (structure) -----------
+    // Every coefficient gam keeps must be one of the four true governing terms.
+    // A surviving slot that is truly zero is spurious identification.
     for (ti, &tol) in TOLS.iter().enumerate() {
-        eprintln!(
-            "pysindy tol={tol:>6}: rounds={} support_card={}",
-            py_rounds[ti], py_card[ti] as usize
-        );
-    }
-
-    // ---- assertion 1: cardinality matches pysindy exactly at every tol ----
-    // The surviving active-set size after a deterministic hard threshold is an
-    // algorithmic invariant; with a multi-scale system the expected count is a
-    // sharp function of tol, so an exact match is the principled bound (not a
-    // tolerance). gam may legitimately be *sparser* if it drops a borderline
-    // term pysindy keeps, but never denser — see assertion 2.
-    for (ti, &tol) in TOLS.iter().enumerate() {
-        let pyc = py_card[ti] as usize;
-        assert!(
-            gam_card[ti] <= pyc,
-            "tol={tol}: gam support ({}) must be no denser than pysindy ({})",
-            gam_card[ti],
-            pyc
-        );
-    }
-
-    // ---- assertion 2: gam's kept terms are a subset of pysindy's ----------
-    // Every coefficient gam keeps, pysindy must also keep (same sparsity
-    // pattern, or strictly sparser). A term gam keeps that pysindy zeroed would
-    // be a genuine divergence in the threshold logic.
-    for (ti, &tol) in TOLS.iter().enumerate() {
-        for k in 0..(p * dd) {
-            let gam_on = gam_mask[ti][k] == 1;
-            let py_on = py_mask[ti * p * dd + k] != 0.0;
-            assert!(
-                !gam_on || py_on,
-                "tol={tol}: gam kept coefficient slot {k} that pysindy thresholded out",
-            );
+        for k in 0..(P * DD) {
+            if gam_flat[ti][k] != 0.0 {
+                assert!(
+                    truth[k] != 0.0,
+                    "tol={tol}: gam kept spurious term at slot {k} (true coefficient is zero)"
+                );
+            }
         }
     }
 
-    // ---- assertion 3: monotone structure across the tol sweep -------------
-    // Tightening the threshold (smaller tol) keeps at least as many terms and
-    // needs at least as many rounds — true for any correct STLSQ. TOLS is
-    // ordered tight → loose, so cardinality is non-increasing and round count
-    // is non-increasing as we walk the array. Both engines must obey this.
-    for ti in 1..TOLS.len() {
+    // ---- assertion 2: EXACT TRUTH RECOVERY at the finest threshold --------
+    // tol=0.001 sits below every true magnitude (smallest is 0.01), so the
+    // surviving support must be EXACTLY the four-term true active set.
+    let fine = 0; // TOLS[0] = 0.001
+    for &k in &true_support {
         assert!(
-            gam_card[ti] <= gam_card[ti - 1],
-            "gam support cardinality must not grow as tol loosens: tol {} -> {} gave {} -> {}",
-            TOLS[ti - 1],
-            TOLS[ti],
-            gam_card[ti - 1],
-            gam_card[ti]
-        );
-        assert!(
-            gam_rounds[ti] <= gam_rounds[ti - 1] + 1,
-            "gam rounds should not increase as tol loosens: tol {} -> {} gave {} -> {}",
-            TOLS[ti - 1],
-            TOLS[ti],
-            gam_rounds[ti - 1],
-            gam_rounds[ti]
+            gam_flat[fine][k] != 0.0,
+            "tol={}: gam failed to recover true term at slot {k}",
+            TOLS[fine]
         );
     }
+    let fine_card = gam_flat[fine].iter().filter(|&&v| v != 0.0).count();
+    assert_eq!(
+        fine_card,
+        true_support.len(),
+        "tol={}: gam support cardinality {fine_card} != true {} (exact recovery required)",
+        TOLS[fine],
+        true_support.len()
+    );
+
+    // ---- assertion 3: COEFFICIENT ACCURACY vs truth (+ match-or-beat) -----
+    // At the finest threshold gam's recovered coefficients must track the true
+    // Ξ closely (relative-L2 over all p*d entries), and no worse than pysindy's
+    // error to the same truth times 1.10. The PRIMARY claim is truth recovery;
+    // pysindy is only a same-or-better baseline.
+    let gam_rel_truth = relative_l2(&gam_flat[fine], &truth);
+    let py_fine: Vec<f64> = py_coef[fine * P * DD..(fine + 1) * P * DD].to_vec();
+    let py_rel_truth = relative_l2(&py_fine, &truth);
+    eprintln!(
+        "tol={}: rel_l2(gam, truth)={gam_rel_truth:.3e}  rel_l2(pysindy, truth)={py_rel_truth:.3e}",
+        TOLS[fine]
+    );
+    // Absolute objective bar: the system is exactly linear-in-library and
+    // analytically differentiated, so the recovered coefficients must be within
+    // 1% (relative L2) of truth.
+    assert!(
+        gam_rel_truth <= 1.0e-2,
+        "tol={}: gam relative-L2 error to true coefficients {gam_rel_truth:.3e} exceeds 1e-2",
+        TOLS[fine]
+    );
+    // Match-or-beat pysindy on accuracy-to-truth.
+    assert!(
+        gam_rel_truth <= py_rel_truth * 1.10 + 1.0e-12,
+        "tol={}: gam error-to-truth {gam_rel_truth:.3e} worse than pysindy {py_rel_truth:.3e} * 1.10",
+        TOLS[fine]
+    );
 
     // ---- assertion 4: gam reports a converged, bounded loop everywhere ----
     // The system is exactly representable in the library, so STLSQ must reach a
@@ -322,22 +335,6 @@ emit("mask", mask_all)
             gam_rounds[ti] >= 1 && gam_rounds[ti] < MAX_ROUNDS,
             "tol={tol}: gam rounds_used={} out of expected (1, {MAX_ROUNDS}) range",
             gam_rounds[ti]
-        );
-    }
-
-    // ---- assertion 5: the loose threshold recovers the dominant term ------
-    // dy/dt = 100 z is the largest-magnitude relation; at every tol the z->dy
-    // coefficient (output c=1, feature j=3) must survive in BOTH engines. This
-    // pins the comparison to a known-true recovery, not just structural parity.
-    let slot = p + 3; // c=1 (dy), j=3 (z): flattened index c*p + j
-    for (ti, &tol) in TOLS.iter().enumerate() {
-        assert!(
-            gam_mask[ti][slot] == 1,
-            "tol={tol}: gam dropped the dominant z->dy term"
-        );
-        assert!(
-            py_mask[ti * p * dd + slot] != 0.0,
-            "tol={tol}: pysindy dropped the dominant z->dy term (data/library mismatch?)"
         );
     }
 }

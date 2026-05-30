@@ -1,34 +1,40 @@
-//! End-to-end quality: gam's Grassmann exponential/logarithm maps must agree
-//! with `geomstats` — the mature differential-geometry reference — on the
-//! canonical principal-angle invariants of `Gr(3, 10)`, and must round-trip to
-//! transcendental precision.
+//! End-to-end quality: gam's Grassmann exponential/logarithm maps must satisfy
+//! the exact Riemannian-geodesic axioms of `Gr(3, 10)` against ANALYTIC ground
+//! truth — not merely reproduce a peer library's output.
 //!
 //! The Grassmannian `Gr(k, n)` is a quotient manifold: a point is a
 //! `k`-dimensional subspace of `ℝⁿ` (equivalently an orthonormal `n×k` frame,
 //! modulo `O(k)`). Its Riemannian exponential and logarithm have a closed form
 //! built from the *compact SVD* of the tangent matrix and `cos`/`sin` of the
-//! singular values (= principal angles); there is no optimization, so any
-//! disagreement is a linear-algebra or transcendental-function error, not a
-//! convergence artifact.
+//! singular values (= principal angles); there is no optimization, so the maps
+//! are EXACT mathematical objects whose properties are derivable a priori.
 //!
-//! Two facts are asserted on identical, fixed-seed data:
-//!   1. **Intrinsic round-trip (gam alone).** For a base frame `P` and a
-//!      horizontal tangent `v`, `log_map(P, exp_map(P, v)) == v` to
-//!      `max_abs_diff < 1e-10` and Frobenius `< 1e-9`. This is the cleanest
-//!      probe of the SVD → sin/cos → atan composition: exp pushes the angles
-//!      through `cos`/`sin`, log pulls them back through `atan`, and the
-//!      residual is pure floating-point rounding.
-//!   2. **Head-to-head with geomstats.** gam and geomstats are handed the SAME
-//!      base subspace and the SAME tangent direction (gam in the `n×k`-frame
-//!      representation it uses internally; geomstats in the `n×n`-projector
-//!      representation it uses internally — `P₀ = YYᵀ`, tangent
-//!      `W = HYᵀ + YHᵀ`). We then compare the *principal angles* between the
-//!      base subspace and the geodesic endpoint, and the principal angles
-//!      recovered by each library's `log`. Principal angles are the canonical,
-//!      `O(k)`-invariant, frame-vs-projector-metric-invariant description of a
-//!      pair of subspaces, so they are the correct quantity to compare across
-//!      two libraries with different internal representations. Both must equal
-//!      the input singular spectrum `σ`.
+//! OBJECTIVE METRIC (the pass criterion): for a base frame `P` and a horizontal
+//! tangent `v` with compact-SVD spectrum `σ` (constructed by the test, hence
+//! known in closed form), the geodesic `t ↦ exp_P(t v)` obeys three analytic
+//! axioms that gam must reproduce to linear-algebra precision, WITHOUT reference
+//! to any external tool:
+//!   (a) **Round-trip / involution.** `log_P(exp_P(v)) == v` to
+//!       `max_abs_diff < 1e-10`, Frobenius `< 1e-9`. exp pushes the angles
+//!       through `cos`/`sin`; log pulls them back through `atan`; the residual is
+//!       pure f64 rounding.
+//!   (b) **Principal-angle law θ = σ.** The principal angles between `P` and the
+//!       geodesic endpoint `exp_P(v)` equal the input singular spectrum `σ`
+//!       exactly; likewise the singular spectrum of the recovered `log` equals
+//!       `σ`. `σ` is computed directly from `v` by this test (analytic truth),
+//!       so this is an absolute-accuracy claim, not a cross-tool agreement.
+//!   (c) **Isometry of the metric.** The geodesic distance
+//!       `dist(P, exp_P(v)) = ‖log_P(exp_P(v))‖_F = ‖v‖_F = ‖σ‖₂`. gam's exp/log
+//!       must preserve the canonical Frobenius length to `< 1e-9`.
+//! All three are asserted against quantities the test derives itself; the worst
+//! deviation across all `N_CASES` must clear the bar.
+//!
+//! geomstats is retained ONLY as an independent GROUND-TRUTH cross-check (the
+//! Grassmann geodesic is an exact closed form, so geomstats is mathematical
+//! truth, not a noisy peer fit — the EXCEPTION case): we hand it the identical
+//! base/tangent and additionally require gam to match its exact endpoint and
+//! log invariants. But the primary, sufficient pass criterion is gam-vs-analytic
+//! axioms above; geomstats only sharpens it.
 //!
 //! There is no skip path: if `python3` or `geomstats` is missing the reference
 //! body fails loudly and so does this test.
@@ -153,8 +159,16 @@ fn grassmann_exp_log_roundtrip_matches_geomstats() {
 
     let mut max_roundtrip_abs = 0.0_f64;
     let mut max_roundtrip_frob = 0.0_f64;
+    // Worst deviation of gam's geodesic invariants from ANALYTIC ground truth
+    // (the input spectrum σ that the test itself constructs): endpoint principal
+    // angles vs σ, log-recovered singular values vs σ, and geodesic distance
+    // dist(P, exp_P v) = ‖v‖_F vs ‖σ‖₂. These are the primary pass criteria.
+    let mut max_exp_angle_truth_err = 0.0_f64;
+    let mut max_log_sigma_truth_err = 0.0_f64;
+    let mut max_isometry_err = 0.0_f64;
     // gam's principal angles of the geodesic endpoint and of its recovered log,
-    // per case (flattened K-vectors), to compare against geomstats.
+    // per case (flattened K-vectors), retained for the geomstats ground-truth
+    // cross-check only.
     let mut gam_exp_angles: Vec<f64> = Vec::with_capacity(N_CASES * K);
     let mut gam_log_angles: Vec<f64> = Vec::with_capacity(N_CASES * K);
 
@@ -222,6 +236,26 @@ fn grassmann_exp_log_roundtrip_matches_geomstats() {
         max_roundtrip_abs = max_roundtrip_abs.max(abs);
         max_roundtrip_frob = max_roundtrip_frob.max(frob);
 
+        // --- ANALYTIC ground truth for this case --------------------------
+        // The principal angles of exp_P(v) equal the singular values σ of the
+        // tangent matrix v (the θ = σ law); the geodesic distance is ‖v‖_F.
+        // Both are read off v directly, independent of any library.
+        let v_in_mat = {
+            let mut m = Array2::<f64>::zeros((N, K));
+            for r in 0..N {
+                for c in 0..K {
+                    m[[r, c]] = v_flat[r * K + c];
+                }
+            }
+            m
+        };
+        let mut truth_sigma: Vec<f64> = sym_eigvals(&v_in_mat.t().dot(&v_in_mat))
+            .into_iter()
+            .map(|e| e.max(0.0).sqrt())
+            .collect();
+        truth_sigma.sort_by(|a, b| a.partial_cmp(b).unwrap()); // ascending
+        let truth_dist: f64 = truth_sigma.iter().map(|s| s * s).sum::<f64>().sqrt();
+
         // gam's principal angles at the endpoint and from the recovered log.
         let z = {
             let mut m = Array2::<f64>::zeros((N, K));
@@ -232,9 +266,12 @@ fn grassmann_exp_log_roundtrip_matches_geomstats() {
             }
             m
         };
-        for ang in principal_angles(&y, &z) {
-            gam_exp_angles.push(ang);
-        }
+        let exp_angles = principal_angles(&y, &z); // ascending
+        // (b) endpoint principal angles must equal the analytic spectrum σ.
+        max_exp_angle_truth_err =
+            max_exp_angle_truth_err.max(max_abs_diff(&exp_angles, &truth_sigma));
+        gam_exp_angles.extend(exp_angles.iter().copied());
+
         // Recovered-log principal angles = singular values of the recovered
         // tangent matrix = sqrt of eigenvalues of (V_recᵀ V_rec).
         let v_rec_mat = {
@@ -251,6 +288,12 @@ fn grassmann_exp_log_roundtrip_matches_geomstats() {
             .map(|e| e.max(0.0).sqrt())
             .collect();
         log_sigma.sort_by(|a, b| a.partial_cmp(b).unwrap()); // ascending
+        // (b) log-recovered singular spectrum must equal the analytic spectrum.
+        max_log_sigma_truth_err =
+            max_log_sigma_truth_err.max(max_abs_diff(&log_sigma, &truth_sigma));
+        // (c) isometry: geodesic distance ‖log_P(exp_P v)‖_F must equal ‖v‖_F.
+        let gam_dist: f64 = v_rec.iter().map(|x| x * x).sum::<f64>().sqrt();
+        max_isometry_err = max_isometry_err.max((gam_dist - truth_dist).abs());
         gam_log_angles.extend(log_sigma);
 
         base_flat.extend(y_flat.iter().copied());
@@ -327,15 +370,21 @@ emit("log_angles", log_angles)
     let log_angle_diff = max_abs_diff(&gam_log_angles, gs_log);
 
     eprintln!(
-        "Gr({K},{N}) n_cases={N_CASES} | gam round-trip: max_abs={max_roundtrip_abs:.3e} \
-         frob={max_roundtrip_frob:.3e} | vs geomstats principal angles: \
-         exp_endpoint_max_diff={exp_angle_diff:.3e} log_recovered_max_diff={log_angle_diff:.3e}"
+        "Gr({K},{N}) n_cases={N_CASES} | gam vs ANALYTIC truth: roundtrip_abs={max_roundtrip_abs:.3e} \
+         roundtrip_frob={max_roundtrip_frob:.3e} exp_angle_vs_σ={max_exp_angle_truth_err:.3e} \
+         log_σ_vs_σ={max_log_sigma_truth_err:.3e} isometry_dist_err={max_isometry_err:.3e} | \
+         geomstats ground-truth cross-check: exp_endpoint_diff={exp_angle_diff:.3e} \
+         log_recovered_diff={log_angle_diff:.3e}"
     );
 
-    // (1) Intrinsic round-trip is pure SVD + cos/sin/atan rounding. The maps
-    // are exact closed forms within the injectivity radius, so the only error
-    // is f64 transcendental/linear-algebra rounding; 1e-10 / 1e-9 leave a sane
-    // margin above machine epsilon while still catching any real defect.
+    // ===================== PRIMARY: gam vs ANALYTIC geodesic axioms =========
+    // The Grassmann exp/log are exact closed forms; their defining properties
+    // are derivable a priori from the input spectrum σ that this test builds.
+    // gam must satisfy them to f64 linear-algebra precision with NO reference
+    // to any external tool. 1e-10 / 1e-9 leave a sane margin above machine
+    // epsilon while still catching any real SVD/trig/inverse defect.
+
+    // (a) Involution: log_P(exp_P(v)) == v.
     assert!(
         max_roundtrip_abs < 1e-10,
         "gam Grassmann exp/log round-trip component error too large: {max_roundtrip_abs:.3e}"
@@ -345,17 +394,36 @@ emit("log_angles", log_angles)
         "gam Grassmann exp/log round-trip Frobenius error too large: {max_roundtrip_frob:.3e}"
     );
 
-    // (2) Principal angles are the canonical subspace invariants computed by
-    // both libraries' SVD/trig composition; gam and geomstats walk the same
-    // geodesic, so their endpoint angles and their log-recovered angles must
-    // coincide to linear-algebra precision. 1e-9 is geomstats' own LAPACK-SVD
-    // noise floor — tight, and not weakened for either engine.
+    // (b) Principal-angle law θ = σ: the angles between P and exp_P(v), and the
+    // singular spectrum recovered by log, both equal the analytic input σ.
+    assert!(
+        max_exp_angle_truth_err < 1e-9,
+        "gam exp-endpoint principal angles deviate from analytic spectrum σ: {max_exp_angle_truth_err:.3e}"
+    );
+    assert!(
+        max_log_sigma_truth_err < 1e-9,
+        "gam log-recovered singular spectrum deviates from analytic σ: {max_log_sigma_truth_err:.3e}"
+    );
+
+    // (c) Isometry: geodesic distance dist(P, exp_P(v)) = ‖v‖_F = ‖σ‖₂.
+    assert!(
+        max_isometry_err < 1e-9,
+        "gam Grassmann geodesic violates the metric isometry ‖log(exp(v))‖ = ‖v‖: {max_isometry_err:.3e}"
+    );
+
+    // ===================== GROUND-TRUTH CROSS-CHECK vs geomstats ============
+    // The Grassmann geodesic is an exact closed form (no fit, no noise), so
+    // geomstats is an independent computation of the SAME mathematical truth,
+    // not a peer tool whose noisy fit we chase. We require gam to additionally
+    // match geomstats' exact endpoint and log invariants to its LAPACK-SVD
+    // noise floor (1e-9) — a sharper, redundant confirmation of the axioms
+    // above, not the primary claim.
     assert!(
         exp_angle_diff < 1e-9,
-        "exp-endpoint principal angles disagree with geomstats: {exp_angle_diff:.3e}"
+        "gam exp-endpoint principal angles disagree with geomstats ground truth: {exp_angle_diff:.3e}"
     );
     assert!(
         log_angle_diff < 1e-9,
-        "log-recovered principal angles disagree with geomstats: {log_angle_diff:.3e}"
+        "gam log-recovered principal angles disagree with geomstats ground truth: {log_angle_diff:.3e}"
     );
 }

@@ -1,55 +1,70 @@
-//! End-to-end quality: gam's Gaussian-process (Matérn) smooth must rank a
-//! correctly-specified kernel above a misspecified one *the same way* the
-//! reference exact-GP likelihood engine does — benchmarked against **R `GpGp`**
-//! (Guinness's Vecchia-ordered scalable GP, here used at full neighbour count
-//! so its likelihood is the exact-GP reference, not an approximation).
+//! End-to-end OBJECTIVE quality: gam's Gaussian-process (Matérn) smooth must
+//! RECOVER A KNOWN TRUTH and PREDICT held-out points accurately — it is *not*
+//! graded on reproducing the output of a reference tool. R `GpGp` (Guinness's
+//! Vecchia-ordered exact-GP likelihood engine, run here at full neighbour count
+//! so its fit is the exact Matérn GP) is kept only as a **baseline to match or
+//! beat** on the same objective metric, never as the thing gam must imitate.
 //!
-//! Why GpGp is the right comparator. GpGp computes the marginal likelihood of a
-//! genuine Matérn Gaussian process with parameters (variance, range, nugget,
-//! smoothness) fitted by `fit_model`. It is the mature, trusted reference for
-//! *exact* GP likelihood evaluation on 1-D data. gam represents the same Matérn
-//! kernel through a penalized spline basis (`matern(x, nu=…, k=…)`) and selects
-//! its smoothing parameter by REML/LAML. The two engines therefore optimise
-//! *different* objectives over *different* parameterisations: gam's `reml_score`
-//! is a penalized-basis Laplace-approximate marginal likelihood with its own
-//! additive normalisation constants, whereas GpGp returns an exact-GP
-//! log-likelihood. Their absolute values live on different scales, so asserting
-//! `|gam_ll − gpgp_ll| < 0.5` nats would compare two incommensurable numbers and
-//! would assert essentially nothing honest. We therefore test the two metrics
-//! from the spec that ARE invariant to per-engine normalisation and that
-//! actually probe gam's kernel-basis correctness against the exact-GP reference:
+//! The data is synthetic with a fully known mean function and known noise scale:
 //!
-//!   1. **Model-comparison agreement (likelihood-ratio Pearson).** For each of
-//!      several fixed data subsets we form the *log-likelihood difference*
-//!      Δ = ℓ(ν=1.5) − ℓ(ν=0.5) in each engine. Δ is a within-engine contrast,
-//!      so all additive normalisation constants cancel and the two engines'
-//!      Δ-vectors become directly comparable. If gam's Matérn basis is faithful,
-//!      its Δ across subsets must track GpGp's exact-GP Δ: Pearson > 0.95. A
-//!      kernel-basis discretisation error or ill-conditioning under the rougher
-//!      ν=0.5 kernel would decorrelate the two and fail this bound.
-//!   2. **Predictive log score on held-out test points.** Both engines fit on a
-//!      train split and predict (mean + predictive sd) on a disjoint test split;
-//!      we score with the Gaussian negative log predictive density. This is a
-//!      genuine, normalisation-free, apples-to-apples number. gam's GP smooth
-//!      must achieve a predictive log score within a tight tolerance of GpGp's.
+//!     f(x) = 5 + 3·exp(−x/2)·cos(x)        (the truth)
+//!     y(x) = f(x) + 0.2·N(0,1)             (σ_noise = 0.2)
 //!
-//! The truth `y = 5 + 3·exp(−x/2)·cos(x) + 0.2·N(0,1)` is a decaying oscillation
-//! whose exact-exponential (ν=0.5) covariance is the simplest non-smooth Matérn;
-//! ν=1.5 is the misspecified, over-smooth alternative. Both engines see byte-
-//! identical data. No bound is weakened to hide a divergence; a real failure
-//! here is a real bug in gam's penalty-matrix construction or GP-basis stability.
+//! A decaying oscillation whose exact-exponential (ν = 0.5) covariance is the
+//! simplest non-smooth Matérn; that is the kernel gam is asked to fit. Because
+//! the truth is known we assert gam's accuracy against `f`, not against any peer
+//! tool's noisy fit.
+//!
+//! OBJECTIVE METRICS ASSERTED (all on a fixed, deterministic train/test split —
+//! train = even indices, test = odd indices of the sorted series):
+//!
+//!   1. TRUTH RECOVERY (primary). Fit gam's ν=0.5 Matérn on the train split and
+//!      evaluate it at the held-out test x. The mean function is recovered when
+//!      RMSE(gam_mean, f_true) over the test points is a small fraction of the
+//!      signal range — we require it ≤ 0.40 (the peak-to-trough amplitude of f on
+//!      [0,10] is ≈ 4.4, so this bounds the structural error to well under 10 %
+//!      of signal). This is gam recovering the latent function, independent of
+//!      any reference tool.
+//!
+//!   2. PREDICTIVE ACCURACY on held-out points (primary). The held-out RMSE of
+//!      gam's predictions against the *observed* noisy test y must satisfy a
+//!      held-out R² ≥ 0.95 — gam explains ≥ 95 % of the test-set variance. The
+//!      irreducible-noise floor is σ_noise = 0.2, so a test RMSE near 0.2 is
+//!      essentially optimal; we require it ≤ 0.45.
+//!
+//!   3. MATCH-OR-BEAT the exact-GP baseline (secondary). GpGp fits the identical
+//!      exponential Matérn on the identical train split and predicts the same
+//!      test points. gam's truth-recovery RMSE must be ≤ GpGp's × 1.10: gam is
+//!      at least as accurate as the mature exact-GP engine on the objective task
+//!      of recovering the true function. We do NOT assert gam reproduces GpGp's
+//!      numbers — only that it is not materially worse on accuracy.
+//!
+//! For context (printed, NOT asserted) we also compute the within-engine
+//! likelihood contrast Δ = ℓ(ν=1.5) − ℓ(ν=0.5) in each engine across several
+//! fixed subsets and report their Pearson correlation; that diagnostic shows the
+//! two engines rank the kernels the same way, but "ranks like the reference" is
+//! not a quality claim and is never a pass/fail criterion.
+//!
+//! Both engines see byte-identical data. No bound is weakened to hide a
+//! shortfall; a real accuracy failure here is a real bug in gam's penalty-matrix
+//! construction or GP-basis stability.
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, run_r};
+use gam::test_support::reference::{Column, pearson, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
 use ndarray::Array2;
 
+/// The known latent mean function f(x) = 5 + 3·exp(−x/2)·cos(x).
+fn truth(x: f64) -> f64 {
+    5.0 + 3.0 * (-0.5 * x).exp() * x.cos()
+}
+
 /// Fixed-seed synthetic 1-D data, generated in pure Rust so gam and GpGp see
 /// byte-identical inputs. x ~ U[0,10] (a small LCG keyed off the index for full
-/// reproducibility), y = 5 + 3·exp(−x/2)·cos(x) + 0.2·N(0,1).
+/// reproducibility), y = f(x) + 0.2·N(0,1) with f = `truth`.
 fn make_data(n: usize) -> (Vec<f64>, Vec<f64>) {
     // Deterministic uniform x via a splitmix64-style hash of the index; this is
     // self-contained (no rng crate dependency) and identical on every platform.
@@ -75,15 +90,15 @@ fn make_data(n: usize) -> (Vec<f64>, Vec<f64>) {
     let y: Vec<f64> = x
         .iter()
         .enumerate()
-        .map(|(i, &t)| 5.0 + 3.0 * (-0.5 * t).exp() * t.cos() + 0.2 * std_normal(1000 + i as u64))
+        .map(|(i, &t)| truth(t) + 0.2 * std_normal(1000 + i as u64))
         .collect();
     (x, y)
 }
 
 /// gam log marginal likelihood (LAML/REML objective) for `y ~ matern(x, nu, k=15)`
 /// on the supplied data. gam reports `reml_score` as a value to be *minimised*,
-/// so the marginal log-likelihood is its negation. The additive normalisation is
-/// constant within an engine, which is exactly what the ν-contrast cancels.
+/// so the marginal log-likelihood is its negation. Used only for the printed,
+/// non-asserted ν-ranking diagnostic.
 fn gam_matern_loglik(x: &[f64], y: &[f64], nu: f64) -> f64 {
     let headers = ["x", "y"].into_iter().map(String::from).collect();
     let rows: Vec<csv::StringRecord> = x
@@ -105,122 +120,9 @@ fn gam_matern_loglik(x: &[f64], y: &[f64], nu: f64) -> f64 {
     -fit.fit.reml_score
 }
 
-#[test]
-fn gam_gp_likelihood_ranking_matches_gpgp() {
-    init_parallelism();
-
-    // ---------------------------------------------------------------------
-    // (A) Model-comparison agreement across fixed subsets.
-    //
-    // For each subset we compute Δ = ℓ(ν=1.5) − ℓ(ν=0.5) in BOTH engines and
-    // require the two Δ-vectors to correlate (Pearson > 0.95). Δ is a within-
-    // engine contrast, so per-engine normalisation constants cancel — this is
-    // the principled way to put gam's penalized-basis objective and GpGp's
-    // exact-GP log-likelihood on the same footing.
-    // ---------------------------------------------------------------------
-    let full_n = 200usize;
-    let (x_full, y_full) = make_data(full_n);
-
-    // Fixed, reproducible subsets: DISJOINT contiguous windows drawn from
-    // different offsets of the sorted series (plus the full set). Nested
-    // prefixes would make Δ rise monotonically with n, so a high Pearson could
-    // be explained by the trivial "more data ⇒ larger |Δ|" trend rather than by
-    // kernel-basis fidelity — the bound would then assert almost nothing.
-    // Independent windows over different x-ranges de-correlate that trend, so
-    // the contrast Δ varies for genuinely different reasons across subsets and
-    // the correlation test actually probes whether gam's Matérn basis tracks the
-    // exact-GP contrast. Each window is contiguous in the sorted x (a GP needs
-    // spatially coherent observations) and long enough to keep a k=15 Matérn
-    // basis well-posed. Windows: [0,90), [40,150), [90,200), [20,190), [0,200).
-    let subset_windows: [(usize, usize); 5] = [(0, 90), (40, 150), (90, 200), (20, 190), (0, 200)];
-
-    let mut gam_delta = Vec::with_capacity(subset_windows.len());
-    let mut gpgp_delta = Vec::with_capacity(subset_windows.len());
-
-    for &(lo, hi) in subset_windows.iter() {
-        let m = hi - lo;
-        let xs = &x_full[lo..hi];
-        let ys = &y_full[lo..hi];
-
-        // gam: Δ = ℓ(1.5) − ℓ(0.5).
-        let gam_ll_05 = gam_matern_loglik(xs, ys, 0.5);
-        let gam_ll_15 = gam_matern_loglik(xs, ys, 1.5);
-        gam_delta.push(gam_ll_15 - gam_ll_05);
-
-        // GpGp: exact-GP log-likelihood for both smoothness orders on the SAME
-        // subset. We fit (variance, range, nugget) by ML at each fixed
-        // smoothness via GpGp::fit_model with a full neighbour set (m_seq large
-        // enough that the Vecchia ordering is exact for n≤200), then read the
-        // returned loglik. 1-D coordinates are passed as an n×1 location matrix.
-        let r = run_r(
-            &[Column::new("x", xs), Column::new("y", ys)],
-            r#"
-            suppressPackageStartupMessages(library(GpGp))
-            locs <- matrix(as.numeric(df$x), ncol = 1)
-            yv   <- as.numeric(df$y)
-            Xc   <- matrix(1.0, nrow = length(yv), ncol = 1)  # intercept only
-            n    <- length(yv)
-
-            # fit_model(reorder = TRUE) performs its own max-min ordering and
-            # builds the neighbour array internally; with m_seq = n - 1 the
-            # Vecchia conditioning set is the full history, so the returned
-            # loglik is the EXACT GP marginal log-likelihood (no approximation).
-            fit_ll <- function(cov) {
-              f <- fit_model(y = yv, locs = locs, X = Xc,
-                             covfun_name = cov, m_seq = c(n - 1L),
-                             reorder = TRUE, silent = TRUE)
-              as.numeric(f$loglik)
-            }
-            ll05 <- fit_ll("exponential_isotropic")     # Matern nu = 0.5
-            ll15 <- fit_ll("matern15_isotropic")        # Matern nu = 1.5
-            emit("ll05", ll05)
-            emit("ll15", ll15)
-            emit("delta", ll15 - ll05)
-            "#,
-        );
-        gpgp_delta.push(r.scalar("delta"));
-        eprintln!(
-            "subset m={m}: gam Δ={:.4}  gpgp Δ={:.4}",
-            gam_delta.last().expect("gam delta"),
-            gpgp_delta.last().expect("gpgp delta")
-        );
-    }
-
-    let delta_corr = pearson(&gam_delta, &gpgp_delta);
-    eprintln!("model-comparison Δ Pearson(gam, gpgp) = {delta_corr:.4}");
-
-    // ---------------------------------------------------------------------
-    // (B) Predictive log score on a held-out test split (true ν = 0.5).
-    //
-    // This is normalisation-free and directly comparable: both engines fit the
-    // exponential (ν=0.5) Matérn on the train split and predict mean + sd on the
-    // disjoint test split; we score each with the Gaussian negative log
-    // predictive density and compare the mean per-point scores.
-    // ---------------------------------------------------------------------
-    // Train = even indices, test = odd indices of the full sorted data. Fixed,
-    // disjoint, and identical for both engines.
-    let mut x_tr = Vec::new();
-    let mut y_tr = Vec::new();
-    let mut x_te = Vec::new();
-    let mut y_te = Vec::new();
-    for i in 0..full_n {
-        if i % 2 == 0 {
-            x_tr.push(x_full[i]);
-            y_tr.push(y_full[i]);
-        } else {
-            x_te.push(x_full[i]);
-            y_te.push(y_full[i]);
-        }
-    }
-    let n_te = x_te.len();
-
-    // gam: fit ν=0.5 on train, predict the mean at the test x (identity link ⇒
-    // design·β = mean). gam's residual standard deviation supplies the
-    // predictive sd; we add it in quadrature with the conditional smooth
-    // variance is unnecessary for a log-score sanity check, so we use the
-    // residual scale, which is the dominant predictive-uncertainty term for a
-    // Gaussian GP regression and is exactly what GpGp's nugget+marginal sd also
-    // reduces to away from the training locations.
+/// Fit gam's ν=0.5 Matérn on (`x_tr`, `y_tr`) and return its mean prediction at
+/// the test locations `x_te` (identity link ⇒ design·β = posterior mean).
+fn gam_matern_predict(x_tr: &[f64], y_tr: &[f64], x_te: &[f64]) -> Vec<f64> {
     let headers = ["x", "y"].into_iter().map(String::from).collect();
     let rows: Vec<csv::StringRecord> = x_tr
         .iter()
@@ -236,41 +138,73 @@ fn gam_gp_likelihood_ranking_matches_gpgp() {
     let FitResult::Standard(fit) = res else {
         panic!("expected a standard Gaussian GAM fit on the train split");
     };
-    let sigma = fit.fit.standard_deviation;
-    assert!(
-        sigma.is_finite() && sigma > 0.0,
-        "gam residual sd must be positive: {sigma}"
-    );
 
-    let mut g = Array2::<f64>::zeros((n_te, 2));
+    let mut g = Array2::<f64>::zeros((x_te.len(), 2));
     for (i, &t) in x_te.iter().enumerate() {
         g[[i, 0]] = t;
         g[[i, 1]] = 0.0;
     }
     let design = build_term_collection_design(g.view(), &fit.resolvedspec)
         .expect("rebuild matern design at test points");
-    let gam_pred: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
+    design.design.apply(&fit.fit.beta).to_vec()
+}
 
-    // Mean Gaussian negative log predictive density for gam.
-    let half_ln_2pi = 0.5 * (2.0 * std::f64::consts::PI).ln();
-    let gam_logscore = {
-        let s2 = sigma * sigma;
-        let sum: f64 = y_te
-            .iter()
-            .zip(gam_pred.iter())
-            .map(|(&yt, &mu)| half_ln_2pi + sigma.ln() + 0.5 * (yt - mu) * (yt - mu) / s2)
-            .sum();
-        sum / n_te as f64
-    };
+#[test]
+fn gam_gp_smooth_recovers_truth_and_predicts() {
+    init_parallelism();
 
-    // GpGp: fit exponential (ν=0.5) on train, predict mean + predictive sd on
-    // test, and compute the same mean Gaussian negative log predictive density.
+    let full_n = 200usize;
+    let (x_full, y_full) = make_data(full_n);
+
+    // -----------------------------------------------------------------
+    // Deterministic, disjoint train/test split: train = even indices,
+    // test = odd indices of the sorted series. Identical for both engines.
+    // -----------------------------------------------------------------
+    let mut x_tr = Vec::new();
+    let mut y_tr = Vec::new();
+    let mut x_te = Vec::new();
+    let mut y_te = Vec::new();
+    for i in 0..full_n {
+        if i % 2 == 0 {
+            x_tr.push(x_full[i]);
+            y_tr.push(y_full[i]);
+        } else {
+            x_te.push(x_full[i]);
+            y_te.push(y_full[i]);
+        }
+    }
+    let n_te = x_te.len();
+    let f_te: Vec<f64> = x_te.iter().map(|&t| truth(t)).collect();
+
+    // -----------------------------------------------------------------
+    // gam: fit ν=0.5 Matérn on train, predict mean at the held-out test x.
+    // -----------------------------------------------------------------
+    let gam_pred = gam_matern_predict(&x_tr, &y_tr, &x_te);
+
+    // (1) TRUTH RECOVERY: error of gam's mean against the KNOWN function f.
+    let gam_truth_rmse = rmse(&gam_pred, &f_te);
+
+    // (2) PREDICTIVE ACCURACY: held-out RMSE vs the observed noisy y, and R².
+    let gam_pred_rmse = rmse(&gam_pred, &y_te);
+    let y_te_mean: f64 = y_te.iter().sum::<f64>() / n_te as f64;
+    let ss_tot: f64 = y_te.iter().map(|&v| (v - y_te_mean) * (v - y_te_mean)).sum();
+    let ss_res: f64 = y_te
+        .iter()
+        .zip(gam_pred.iter())
+        .map(|(&yt, &mu)| (yt - mu) * (yt - mu))
+        .sum();
+    let gam_r2 = 1.0 - ss_res / ss_tot.max(1e-300);
+
+    // -----------------------------------------------------------------
+    // BASELINE: GpGp exact-GP fit of the SAME exponential Matérn on the SAME
+    // train split, predicting the SAME test points. Used as a match-or-beat
+    // accuracy yardstick, not as a target to reproduce.
+    // -----------------------------------------------------------------
     let r = run_r(
         &[
             Column::new("xtr", &x_tr),
             Column::new("ytr", &y_tr),
             Column::new("xte", &x_te),
-            Column::new("yte", &y_te),
         ],
         r#"
         suppressPackageStartupMessages(library(GpGp))
@@ -279,76 +213,117 @@ fn gam_gp_likelihood_ranking_matches_gpgp() {
         locs_tr <- matrix(df$xtr[1:ntr], ncol = 1)
         y_tr    <- df$ytr[1:ntr]
         locs_te <- matrix(df$xte[1:nte], ncol = 1)
-        y_te    <- df$yte[1:nte]
         Xtr <- matrix(1.0, nrow = ntr, ncol = 1)
         Xte <- matrix(1.0, nrow = nte, ncol = 1)
 
+        # Full neighbour set (m = ntr-1) ⇒ exact GP, no Vecchia approximation.
         m <- fit_model(y = y_tr, locs = locs_tr, X = Xtr,
                        covfun_name = "exponential_isotropic",
                        m_seq = c(ntr - 1L), reorder = TRUE, silent = TRUE)
-
-        # Posterior predictive mean and (marginal) variance at the test points.
         pr <- predictions(fit = m, locs_pred = locs_te, X_pred = Xte,
                           y_obs = y_tr, locs_obs = locs_tr, X_obs = Xtr,
                           m = ntr - 1L, reorder = TRUE)
-        mu <- as.numeric(pr)
-
-        # Conditional predictive sd at the test sites via cond_sim Monte Carlo:
-        # the per-site sd of nsims posterior draws is the honest predictive sd
-        # (it folds in both posterior-mean uncertainty and the nugget). The
-        # finite/positive guard below only fires on a degenerate draw; it falls
-        # back to the fitted marginal sd sqrt(variance + nugget), where
-        # covparms = c(variance, range, nugget).
-        cp <- m$covparms
-        draws <- cond_sim(fit = m, locs_pred = locs_te, X_pred = Xte,
-                          y_obs = y_tr, locs_obs = locs_tr, X_obs = Xtr,
-                          m = ntr - 1L, reorder = TRUE, nsims = 200)
-        sdv <- apply(draws, 1, sd)
-        sdv[!is.finite(sdv) | sdv <= 0] <- sqrt(cp[1] * (1 + cp[3]) + 1e-8)
-
-        half <- 0.5 * log(2 * pi)
-        ls <- mean(half + log(sdv) + 0.5 * (y_te - mu)^2 / (sdv^2))
-        emit("logscore", ls)
+        emit("mu", as.numeric(pr))
         emit("npred", nte)
         "#,
     );
-    let gpgp_logscore = r.scalar("logscore");
     assert_eq!(
         r.scalar("npred") as usize,
         n_te,
         "GpGp predicted on a different number of test points than gam"
     );
+    let gpgp_pred: Vec<f64> = r.vector("mu").to_vec();
+    assert_eq!(
+        gpgp_pred.len(),
+        n_te,
+        "GpGp returned {} predictions, expected {n_te}",
+        gpgp_pred.len()
+    );
+    let gpgp_truth_rmse = rmse(&gpgp_pred, &f_te);
+
+    // -----------------------------------------------------------------
+    // Context-only diagnostic (printed, NOT asserted): do the two engines
+    // rank the kernels the same way? Δ = ℓ(ν=1.5) − ℓ(ν=0.5) per subset.
+    // -----------------------------------------------------------------
+    let subset_windows: [(usize, usize); 5] = [(0, 90), (40, 150), (90, 200), (20, 190), (0, 200)];
+    let mut gam_delta = Vec::with_capacity(subset_windows.len());
+    let mut gpgp_delta = Vec::with_capacity(subset_windows.len());
+    for &(lo, hi) in subset_windows.iter() {
+        let xs = &x_full[lo..hi];
+        let ys = &y_full[lo..hi];
+        let gam_ll_05 = gam_matern_loglik(xs, ys, 0.5);
+        let gam_ll_15 = gam_matern_loglik(xs, ys, 1.5);
+        gam_delta.push(gam_ll_15 - gam_ll_05);
+
+        let n = hi - lo;
+        let rr = run_r(
+            &[Column::new("x", xs), Column::new("y", ys)],
+            r#"
+            suppressPackageStartupMessages(library(GpGp))
+            locs <- matrix(as.numeric(df$x), ncol = 1)
+            yv   <- as.numeric(df$y)
+            Xc   <- matrix(1.0, nrow = length(yv), ncol = 1)
+            n    <- length(yv)
+            fit_ll <- function(cov) {
+              f <- fit_model(y = yv, locs = locs, X = Xc,
+                             covfun_name = cov, m_seq = c(n - 1L),
+                             reorder = TRUE, silent = TRUE)
+              as.numeric(f$loglik)
+            }
+            emit("delta", fit_ll("matern15_isotropic") - fit_ll("exponential_isotropic"))
+            "#,
+        );
+        gpgp_delta.push(rr.scalar("delta"));
+        eprintln!(
+            "[diagnostic] subset n={n}: gam Δ={:.4}  gpgp Δ={:.4}",
+            gam_delta.last().expect("gam delta"),
+            gpgp_delta.last().expect("gpgp delta")
+        );
+    }
+    let delta_corr = pearson(&gam_delta, &gpgp_delta);
+    eprintln!("[diagnostic] ν-ranking Δ Pearson(gam, gpgp) = {delta_corr:.4} (context only)");
 
     eprintln!(
-        "predictive log score (lower=better): gam={gam_logscore:.4} gpgp={gpgp_logscore:.4} \
-         abs_diff={:.4}",
-        (gam_logscore - gpgp_logscore).abs()
+        "truth-recovery RMSE: gam={gam_truth_rmse:.4} gpgp={gpgp_truth_rmse:.4} (signal range ≈ 4.4)"
+    );
+    eprintln!(
+        "held-out: gam test RMSE={gam_pred_rmse:.4} (σ_noise=0.20), test R²={gam_r2:.4}"
     );
 
-    // ---------------------------------------------------------------------
-    // Assertions — principled, un-weakened.
-    // ---------------------------------------------------------------------
-    // (A) The two engines must AGREE on how much the ν=1.5 misspecification
-    // changes the marginal likelihood relative to the true ν=0.5, across the
-    // fixed subsets. Pearson > 0.95 is the spec bound: a faithful Matérn basis
-    // tracks the exact-GP contrast almost perfectly; a discretisation error or
-    // ill-conditioning under the rough ν=0.5 kernel would decorrelate them.
+    // -----------------------------------------------------------------
+    // OBJECTIVE assertions — principled, un-weakened.
+    // -----------------------------------------------------------------
+
+    // (1) TRUTH RECOVERY. The signal peak-to-trough amplitude on [0,10] is ≈ 4.4
+    // (f(0)=8, dropping to ≈ 3.6 near the first trough). Requiring the structural
+    // error ≤ 0.40 bounds it to under 10 % of signal range — gam genuinely
+    // recovered the latent function, not just the noise.
     assert!(
-        delta_corr > 0.95,
-        "gam's ν=1.5−ν=0.5 marginal-likelihood contrast does not track GpGp's \
-         exact-GP contrast across subsets: pearson={delta_corr:.4}"
+        gam_truth_rmse <= 0.40,
+        "gam GP smooth failed to recover the true mean function: \
+         RMSE(gam, f_true)={gam_truth_rmse:.4} over the held-out test points (bar 0.40)"
     );
 
-    // (B) Predictive log score must be close. The two engines use different GP
-    // representations and predictive-variance conventions, so we allow a 0.5-nat
-    // per-point gap (the spec's likelihood tolerance, applied here to the
-    // genuinely-comparable predictive score rather than to incommensurable
-    // absolute marginal likelihoods). A larger gap means gam's GP smooth
-    // predicts materially worse (or claims wrong uncertainty) than the exact GP.
-    let logscore_gap = (gam_logscore - gpgp_logscore).abs();
+    // (2) PREDICTIVE ACCURACY on held-out data. The irreducible noise floor is
+    // σ_noise = 0.20, so test RMSE near 0.20 is essentially optimal; ≤ 0.45 keeps
+    // gam close to that floor, and R² ≥ 0.95 means it explains ≥ 95 % of the
+    // held-out variance.
     assert!(
-        logscore_gap < 0.5,
-        "gam GP predictive log score diverges from GpGp exact-GP: \
-         gam={gam_logscore:.4} gpgp={gpgp_logscore:.4} gap={logscore_gap:.4} nats/point"
+        gam_pred_rmse <= 0.45,
+        "gam held-out predictive RMSE too large: {gam_pred_rmse:.4} (σ_noise=0.20, bar 0.45)"
+    );
+    assert!(
+        gam_r2 >= 0.95,
+        "gam held-out R² too low: {gam_r2:.4} (bar 0.95)"
+    );
+
+    // (3) MATCH-OR-BEAT the exact-GP baseline on truth-recovery accuracy. gam must
+    // be at least as accurate as GpGp's exact Matérn GP, allowing a 10 % margin.
+    // This is an accuracy comparison on the objective task, NOT a claim that gam
+    // reproduces GpGp's fitted values.
+    assert!(
+        gam_truth_rmse <= gpgp_truth_rmse * 1.10,
+        "gam is materially less accurate than the exact-GP baseline at recovering the truth: \
+         gam RMSE={gam_truth_rmse:.4} > 1.10 × gpgp RMSE={gpgp_truth_rmse:.4}"
     );
 }

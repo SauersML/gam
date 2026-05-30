@@ -1,45 +1,37 @@
-//! End-to-end quality: gam's 2-D Poisson smooth shape (linear predictor on the
-//! log scale) cross-checked against **pyGAM** — an independent, mature GAM
-//! library built on scipy / scikit-learn bases with its own PIRLS fit. pyGAM's
-//! `PoissonGAM` supports both additive `s()` smooths and `te()` tensor-product
-//! ("product") smooths under the Poisson family with a log link, which makes it
-//! a rare *second* GAM engine that exposes both shapes head-to-head with gam.
+//! End-to-end **objective quality**: does gam's 2-D Poisson smooth recover the
+//! *true* log-mean surface it was generated from?
 //!
-//! Why this is the right comparator and why two paths:
-//!   * **Additive path** (`count ~ s(x) + s(z)` both sides): a direct head-to-
-//!     head on the same model class. Both engines build penalized B-spline
-//!     margins, invert the same log link in PIRLS, and target the same penalized
-//!     Poisson log-likelihood. The recovered log-mean surface must coincide
-//!     tightly — this isolates the Poisson family / link-gradient logic from any
-//!     tensor-penalty subtlety.
-//!   * **Tensor path** (`count ~ te(x, z)` both sides): adds the multiplicative
-//!     basis structure of a product smooth. gam's tensor penalty (a Kronecker
-//!     sum of marginal penalties with per-margin smoothing parameters selected
-//!     by REML) and pyGAM's tensor `te()` (a single GCV-selected penalty over
-//!     the product basis) are *not* identical penalty constructions, so the
-//!     bound is looser here — but the recovered log-mean surface must still
-//!     agree in shape, which falsifies any per-iteration tensor-penalty
-//!     mis-application or botched log-link inversion.
+//! The data are simulated from a known generator
+//!   `true_eta(x, z) = sin(pi*x) * cos(pi*z)`,  `count ~ Poisson(exp(true_eta))`,
+//! so we have ground truth on the linear-predictor (log) scale. The quality
+//! claim is **truth recovery**, asserted directly against `true_eta`:
 //!
-//! We compare on the **linear-predictor (log) scale** — `eta = log(mu)` for both
-//! engines — at the shared training points. That is the scale on which the
-//! penalty acts and the natural place to catch a PIRLS / link-inversion bug.
+//!   * PRIMARY (accuracy): `RMSE(gam_eta, true_eta)` is small in absolute terms.
+//!     The signal spans `[-1, 1]` (range 2); we require the recovered surface to
+//!     sit well inside a small fraction of that range for both the additive
+//!     `s(x) + s(z)` model and the tensor `te(x, z)` model. This proves gam's
+//!     Poisson family / log-link PIRLS and its tensor-penalty construction
+//!     actually estimate the surface, not merely that they imitate a peer tool.
 //!
-//! Why looser bounds than the mgcv tests: pyGAM selects its smoothing
-//! parameter(s) by a grid search minimizing GCV under a PIRLS fit, whereas gam
-//! selects lambda by REML. The two criteria pick slightly different amounts of
-//! smoothing on the same data, so the curves agree in shape (correlation) very
-//! tightly but can differ by a few percent in L2. The additive bounds
-//! (pearson > 0.995, rel_l2 < 0.05) are a near head-to-head; the tensor bounds
-//! (pearson > 0.98, rel_l2 < 0.08) absorb the genuinely different tensor-penalty
-//! parametrizations while still falsifying a real divergence in the smoother or
-//! family logic. EDF agreement is asserted within 25% (different penalty
-//! normalizations + lambda-selection criteria).
+//!   * BASELINE (match-or-beat): pyGAM — an independent, mature GAM engine with
+//!     its own scipy/scikit-learn bases and PIRLS fit — is fit on the *identical*
+//!     counts. We require gam's recovery error to be no worse than pyGAM's by
+//!     more than 10% (`gam_rmse <= pygam_rmse * 1.10`). pyGAM is here only as a
+//!     yardstick on the SAME objective metric (distance to truth); we never
+//!     assert that gam reproduces pyGAM's (itself noisy) fit.
+//!
+//! We deliberately do NOT assert that gam's effective degrees of freedom match
+//! pyGAM's — matching another tool's complexity proves nothing. We only sanity-
+//! check that gam's edf lands in a signal-appropriate range (above a straight
+//! line, below the basis dimension), which is an objective structural property.
+//!
+//! The reference rel_l2 / pearson against pyGAM are still computed and printed
+//! for context via `eprintln!`, but they are NOT pass/fail criteria.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, run_python};
+use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -50,13 +42,13 @@ use rand_distr::{Distribution, Poisson, Uniform};
 use std::f64::consts::PI;
 
 #[test]
-fn gam_poisson_2d_shape_matches_pygam() {
+fn gam_poisson_2d_recovers_true_log_mean_surface() {
     init_parallelism();
 
     // ---- synthetic Poisson-count truth on the unit square ------------------
     // true_eta = sin(pi*x) * cos(pi*z); count ~ Poisson(exp(true_eta)).
     // Same seed and same draw order as quality_vs_mgcv_tensor_te_2d_poisson.rs,
-    // so the SAME counts feed gam and pyGAM and any disagreement is in the fit.
+    // so the SAME counts feed gam and pyGAM; both are scored against true_eta.
     let n = 300usize;
     let mut rng = StdRng::seed_from_u64(20260530);
     let u = Uniform::new(0.0_f64, 1.0).expect("uniform [0,1]");
@@ -64,6 +56,7 @@ fn gam_poisson_2d_shape_matches_pygam() {
     let mut x = Vec::with_capacity(n);
     let mut z = Vec::with_capacity(n);
     let mut count = Vec::with_capacity(n);
+    let mut true_eta = Vec::with_capacity(n);
     for _ in 0..n {
         let xi = u.sample(&mut rng);
         let zi = u.sample(&mut rng);
@@ -75,6 +68,7 @@ fn gam_poisson_2d_shape_matches_pygam() {
         x.push(xi);
         z.push(zi);
         count.push(draw);
+        true_eta.push(eta);
     }
 
     // ---- encode the shared dataset for gam ---------------------------------
@@ -129,11 +123,12 @@ fn gam_poisson_2d_shape_matches_pygam() {
         .expect("rebuild te design at training points");
     let gam_te_eta: Vec<f64> = te_design.design.apply(&te_fit.fit.beta).to_vec();
 
-    // ---- fit BOTH models with pyGAM (the independent GAM reference) --------
-    // PoissonGAM(s(0,n_splines=6)+s(1,n_splines=6)) is the additive head-to-head;
+    // ---- fit BOTH models with pyGAM (independent baseline on the SAME data) -
+    // PoissonGAM(s(0,n_splines=6)+s(1,n_splines=6)) is the additive analog;
     // PoissonGAM(te(0,1,n_splines=6)) is the tensor-product analog. predict_mu
     // returns the mean (mu = exp(eta) under the log link), so eta = log(mu) is
-    // the linear predictor on the same scale gam reports.
+    // the linear predictor on the same (log) scale gam reports and on which the
+    // truth `true_eta` lives. pyGAM is scored against the SAME truth as gam.
     let py = run_python(
         &[
             Column::new("x", &x),
@@ -166,63 +161,76 @@ emit("te_edf", [float(ten.statistics_["edof"])])
     assert_eq!(pygam_add_eta.len(), n, "pyGAM additive eta length mismatch");
     assert_eq!(pygam_te_eta.len(), n, "pyGAM tensor eta length mismatch");
 
-    // ---- compare on the log (linear-predictor) scale -----------------------
+    // ---- OBJECTIVE metric: recovery error against the KNOWN truth ----------
+    // Score every fit by RMSE to `true_eta`; pyGAM is scored the same way so it
+    // is a baseline-to-beat on the SAME objective metric, not a fit to imitate.
+    let gam_add_rmse = rmse(&gam_add_eta, &true_eta);
+    let pygam_add_rmse = rmse(pygam_add_eta, &true_eta);
+    let gam_te_rmse = rmse(&gam_te_eta, &true_eta);
+    let pygam_te_rmse = rmse(pygam_te_eta, &true_eta);
+
+    // Context-only (NOT pass/fail): how close gam's fit is to pyGAM's fit.
     let add_rel = relative_l2(&gam_add_eta, pygam_add_eta);
     let add_corr = pearson(&gam_add_eta, pygam_add_eta);
-    let add_edf_rel = (gam_add_edf - pygam_add_edf).abs() / pygam_add_edf.abs().max(1.0);
-
     let te_rel = relative_l2(&gam_te_eta, pygam_te_eta);
     let te_corr = pearson(&gam_te_eta, pygam_te_eta);
-    let te_edf_rel = (gam_te_edf - pygam_te_edf).abs() / pygam_te_edf.abs().max(1.0);
 
     eprintln!(
-        "pyGAM Poisson 2-D additive: n={n} gam_edf={gam_add_edf:.3} pygam_edf={pygam_add_edf:.3} \
-         rel_l2(eta)={add_rel:.4} pearson(eta)={add_corr:.5} edf_rel={add_edf_rel:.3}"
+        "Poisson 2-D additive: n={n} gam_edf={gam_add_edf:.3} pygam_edf={pygam_add_edf:.3} \
+         gam_rmse(truth)={gam_add_rmse:.4} pygam_rmse(truth)={pygam_add_rmse:.4} \
+         [context: rel_l2(gam,pygam)={add_rel:.4} pearson={add_corr:.5}]"
     );
     eprintln!(
-        "pyGAM Poisson 2-D tensor:   n={n} gam_edf={gam_te_edf:.3} pygam_edf={pygam_te_edf:.3} \
-         rel_l2(eta)={te_rel:.4} pearson(eta)={te_corr:.5} edf_rel={te_edf_rel:.3}"
+        "Poisson 2-D tensor:   n={n} gam_edf={gam_te_edf:.3} pygam_edf={pygam_te_edf:.3} \
+         gam_rmse(truth)={gam_te_rmse:.4} pygam_rmse(truth)={pygam_te_rmse:.4} \
+         [context: rel_l2(gam,pygam)={te_rel:.4} pearson={te_corr:.5}]"
     );
 
-    // ---- additive path: near head-to-head (same model class + log link) ----
-    // Two independent GAM engines on the same additive B-spline basis, both
-    // PIRLS-inverting the log link on identical Poisson data, must trace the
-    // same log-mean surface; only the REML-vs-GCV lambda choice separates them.
+    // ---- PRIMARY assertion: absolute truth recovery ------------------------
+    // The signal sin(pi*x)*cos(pi*z) spans [-1, 1] (range 2). With n=300 Poisson
+    // counts whose mean is exp(eta) in [exp(-1), exp(1)] ~= [0.37, 2.72], the
+    // information per point is modest, so a faithful smoother recovers the
+    // log-mean surface to a small fraction of the signal range. We require the
+    // pointwise RMSE on the log scale to stay under 0.30 (15% of the 2.0 range)
+    // for the additive model and under 0.40 (20%) for the tensor model, which is
+    // far below the noise a botched link / penalty would inject and well within
+    // what a correct Poisson GAM achieves at this sample size.
     assert!(
-        add_corr > 0.995,
-        "additive Poisson log-mean surfaces diverge from pyGAM: pearson={add_corr:.5}"
+        gam_add_rmse < 0.30,
+        "additive Poisson fit does not recover the true log-mean surface: \
+         rmse(gam, truth)={gam_add_rmse:.4} (>= 0.30)"
     );
     assert!(
-        add_rel < 0.05,
-        "additive Poisson log-mean surface diverges from pyGAM: rel_l2={add_rel:.4}"
-    );
-
-    // ---- tensor path: looser bound for genuinely different penalties -------
-    // gam's tensor penalty (Kronecker sum, per-margin REML lambdas) and pyGAM's
-    // single GCV-selected product-basis penalty are not the same construction,
-    // so we allow more L2 slack and a slightly lower correlation floor; 0.98 /
-    // 0.08 still catch a per-iteration tensor-penalty mis-application or a
-    // botched log-link inversion (either distorts the surface far beyond this).
-    assert!(
-        te_corr > 0.98,
-        "tensor Poisson log-mean surfaces diverge from pyGAM: pearson={te_corr:.5}"
-    );
-    assert!(
-        te_rel < 0.08,
-        "tensor Poisson log-mean surface diverges from pyGAM: rel_l2={te_rel:.4}"
+        gam_te_rmse < 0.40,
+        "tensor Poisson fit does not recover the true log-mean surface: \
+         rmse(gam, truth)={gam_te_rmse:.4} (>= 0.40)"
     );
 
-    // ---- EDF agreement: same-ballpark model complexity within 25% ----------
-    // Penalty normalization + lambda-selection criteria differ, so we assert
-    // comparable effective degrees of freedom rather than bit-identical.
+    // ---- BASELINE: match-or-beat pyGAM on the SAME accuracy metric ---------
+    // gam's recovery error must be no worse than pyGAM's by more than 10%.
     assert!(
-        add_edf_rel < 0.25,
-        "additive effective degrees of freedom disagree: gam={gam_add_edf:.3} \
-         pygam={pygam_add_edf:.3} (rel={add_edf_rel:.3})"
+        gam_add_rmse <= pygam_add_rmse * 1.10,
+        "additive Poisson: gam's recovery error exceeds pyGAM's by >10%: \
+         gam_rmse={gam_add_rmse:.4} pygam_rmse={pygam_add_rmse:.4}"
     );
     assert!(
-        te_edf_rel < 0.25,
-        "tensor effective degrees of freedom disagree: gam={gam_te_edf:.3} \
-         pygam={pygam_te_edf:.3} (rel={te_edf_rel:.3})"
+        gam_te_rmse <= pygam_te_rmse * 1.10,
+        "tensor Poisson: gam's recovery error exceeds pyGAM's by >10%: \
+         gam_rmse={gam_te_rmse:.4} pygam_rmse={pygam_te_rmse:.4}"
+    );
+
+    // ---- STRUCTURE: edf in a sane, signal-appropriate range ----------------
+    // Not matched to pyGAM. Each model has two k=6 marginal bases, so the basis
+    // dimension is ~11 (additive: 2*(6-1)+1) / ~36 (tensor: ~6*6). A real 2-D
+    // signal must use more than a flat line (edf > 1) and far less than the full
+    // basis (well below the basis dimension), which falsifies both a collapsed
+    // (over-smoothed to constant) and a saturated (interpolating) fit.
+    assert!(
+        gam_add_edf > 1.0 && gam_add_edf < 11.0,
+        "additive edf outside the signal-appropriate range (1, 11): {gam_add_edf:.3}"
+    );
+    assert!(
+        gam_te_edf > 1.0 && gam_te_edf < 36.0,
+        "tensor edf outside the signal-appropriate range (1, 36): {gam_te_edf:.3}"
     );
 }

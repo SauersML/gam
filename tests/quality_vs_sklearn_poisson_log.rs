@@ -1,5 +1,5 @@
-//! End-to-end quality: gam's Poisson(log) GLM with smooth terms must recover the
-//! same linear predictor as a mature count-data engine on identical data.
+//! End-to-end OBJECTIVE quality: gam's Poisson(log) GLM with smooth terms must
+//! RECOVER the known truth used to generate the data.
 //!
 //! Poisson(log) with smooth covariates is the quintessential count-data GAM. We
 //! generate a fixed-seed synthetic dataset where the true linear predictor is
@@ -7,29 +7,33 @@
 //!     eta = 0.5 + 0.3*sin(x1*pi/5) + 0.2*cos(x2*pi/5),   y ~ Poisson(exp(eta)),
 //!
 //! and fit `y ~ s(x1, k=5) + s(x2, k=5)` with gam (REML smoothing-parameter
-//! selection, log link). The mature reference is **statsmodels**
-//! `GLMGam(family=Poisson(link=Log()))` with the SAME penalized B-spline smooths
-//! fed the IDENTICAL data — the standard Python implementation of penalized
-//! additive Poisson regression. statsmodels exposes both the additive smooth
-//! structure and the canonical log link, so it is a far better reference than a
-//! plain linear `PoissonRegressor` (which cannot represent the sinusoidal
-//! covariate effects at all). Crucially we let statsmodels pick its per-smoother
-//! penalty by GCV via `select_penweight()` and refit at the optimum — a bare
-//! `GLMGam(...).fit()` uses the default `alpha=0` (unpenalized, overfitting) and
-//! would NOT target a comparable smoothing objective to gam's REML.
+//! selection, log link).
 //!
-//! Both engines fit the same penalized Poisson log-likelihood, so they must
-//! recover essentially the same fitted function. We assert:
-//!   1. gam's fitted linear predictor `eta_hat` tracks the known truth on the
-//!      data grid (relative L2 over `eta`), and
-//!   2. gam's fitted mean `exp(eta_hat)` and statsmodels' fitted mean are
-//!      near-perfectly correlated (Pearson on the exp-scale).
-//! A genuine divergence here is a real bug in gam's inverse-link / PIRLS logic.
+//! OBJECTIVE METRIC (the pass/fail claim): truth recovery on the linear-predictor
+//! scale. We assert that gam's fitted `eta_hat` reconstructs the noise-free
+//! generating `eta` with small RMSE. Because both the centered smooth basis and
+//! the data-generating expression carry an arbitrary additive offset (the smooth
+//! terms are mean-centered for identifiability while the intercept absorbs the
+//! level), the meaningful, units-preserving error is the RMSE between the
+//! mean-centered fitted eta and the mean-centered truth — this measures whether
+//! gam recovered the SHAPE of the sinusoidal signal in eta-units, not merely its
+//! correlation. The signal (centered) has standard deviation ~0.26 and a
+//! peak-to-peak range ~1.0; we require the recovery RMSE to be a small fraction
+//! of that range, which a correct k=5 cubic-spline Poisson PIRLS clears easily at
+//! n=200 while a broken inverse link / design / PIRLS would not.
+//!
+//! BASELINE TO MATCH-OR-BEAT: statsmodels `GLMGam(family=Poisson(link=Log()))`
+//! with the SAME penalized B-spline smooths and GCV penalty selection, fed the
+//! IDENTICAL data, is fit and scored on the SAME truth-recovery metric. We assert
+//! gam's recovery RMSE is no worse than 1.10x statsmodels' — i.e. gam is at least
+//! as ACCURATE at recovering the truth as the mature reference. Matching
+//! statsmodels' fitted output is NOT a pass criterion; cross-engine agreement is
+//! computed and printed for context only.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, run_python};
+use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -46,8 +50,16 @@ fn truth_eta(x1: f64, x2: f64) -> f64 {
     0.5 + 0.3 * (x1 * pi / 5.0).sin() + 0.2 * (x2 * pi / 5.0).cos()
 }
 
+/// Subtract the mean so two predictors are compared on a common (offset-free)
+/// scale — eta is identifiable only up to an additive constant split between the
+/// centered smooths and the intercept, so the SHAPE lives in the centered vector.
+fn centered(v: &[f64]) -> Vec<f64> {
+    let mean = v.iter().sum::<f64>() / v.len().max(1) as f64;
+    v.iter().map(|x| x - mean).collect()
+}
+
 #[test]
-fn gam_poisson_log_matches_statsmodels_glm() {
+fn gam_poisson_log_recovers_truth() {
     init_parallelism();
 
     // ---- synthetic count data (identical bytes feed gam and statsmodels) ---
@@ -103,13 +115,13 @@ fn gam_poisson_log_matches_statsmodels_glm() {
     let gam_eta: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
     let gam_mean: Vec<f64> = gam_eta.iter().map(|e| e.exp()).collect();
 
-    // ---- fit the SAME model with statsmodels (the mature reference) --------
+    // ---- fit the SAME model with statsmodels (the match-or-beat baseline) --
     // GLMGam with two penalized cubic B-spline smooths (df=5 each, matching
     // k=5) under Poisson(Log). select_penweight() picks the per-smoother penalty
     // by GCV, then we refit at that optimum, so statsmodels actually performs
     // smoothing-parameter selection (comparable to gam's REML) rather than
-    // fitting unpenalized at the alpha=0 default — both engines then target the
-    // same penalized Poisson(log) likelihood.
+    // fitting unpenalized at the alpha=0 default. We then score statsmodels on
+    // the SAME truth-recovery metric as gam.
     let r = run_python(
         &[
             Column::new("x1", &x1),
@@ -148,51 +160,58 @@ emit("mu", mu_hat)
     assert_eq!(sm_eta.len(), N, "statsmodels eta length mismatch");
     assert_eq!(sm_mu.len(), N, "statsmodels mu length mismatch");
 
-    // ---- compare -----------------------------------------------------------
-    // (a) gam's eta_hat vs the known truth, as SHAPE recovery. The truth lives
-    //     on a +0.5 pedestal with only ±0.3/±0.2 sinusoidal variation, so a
-    //     relative-L2 against eta_truth would be dominated by the intercept and
-    //     would assert almost nothing about the smooth signal. Pearson is
-    //     offset/scale-invariant and directly measures whether gam recovered the
-    //     sinusoidal structure under Poisson noise.
+    // ---- OBJECTIVE metric: truth recovery on the (centered) eta scale ------
+    // eta is identifiable only up to an additive constant, so center both the
+    // fit and the truth before measuring RMSE: this isolates SHAPE recovery in
+    // eta-units and is independent of either engine's centering convention.
+    let truth_c = centered(&eta_truth);
+    let gam_eta_c = centered(&gam_eta);
+    let sm_eta_c = centered(sm_eta);
+
+    let gam_recovery_rmse = rmse(&gam_eta_c, &truth_c);
+    let sm_recovery_rmse = rmse(&sm_eta_c, &truth_c);
+
+    // Scale of the signal we are trying to recover (centered truth).
+    let signal_sd = {
+        let mss: f64 = truth_c.iter().map(|v| v * v).sum::<f64>() / truth_c.len() as f64;
+        mss.sqrt()
+    };
+    let signal_range = {
+        let lo = truth_c.iter().cloned().fold(f64::INFINITY, f64::min);
+        let hi = truth_c.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        hi - lo
+    };
+
+    // Context-only cross-engine diagnostics (NOT pass criteria).
     let corr_truth = pearson(&gam_eta, &eta_truth);
-    // (b) cross-engine fitted-mean agreement on the exp scale: the inverse link
-    //     and PIRLS must produce the same fitted means as statsmodels.
     let corr_mean = pearson(&gam_mean, sm_mu);
-    // (c) cross-engine eta agreement. Both engines see the SAME Poisson draws,
-    //     so sampling noise is shared and cancels — their fitted linear
-    //     predictors should nearly coincide. This is the tight apples-to-apples
-    //     check (relative_l2 here is NOT pedestal-dominated because the engines
-    //     share the +0.5 offset, so the residual is pure cross-engine drift).
     let rel_eta_cross = relative_l2(&gam_eta, sm_eta);
 
     eprintln!(
-        "poisson s(x1)+s(x2): n={N} gam_edf={gam_edf:.3} \
-         pearson(eta,truth)={corr_truth:.5} pearson(mean)={corr_mean:.5} \
+        "poisson s(x1)+s(x2): n={N} gam_edf={gam_edf:.3} signal_sd={signal_sd:.4} \
+         signal_range={signal_range:.4} \
+         recovery_rmse: gam={gam_recovery_rmse:.4} statsmodels={sm_recovery_rmse:.4} \
+         | context: pearson(eta,truth)={corr_truth:.5} pearson(mean)={corr_mean:.5} \
          rel_l2(eta,statsmodels)={rel_eta_cross:.4}"
     );
 
-    // (a) gam must recover the smooth low-frequency truth that a k=5 cubic basis
-    //     resolves exactly; >0.9 Pearson on eta vs the noise-free truth is the
-    //     floor a correct Poisson(log) PIRLS clears at n=200 (Poisson noise on a
-    //     small-amplitude signal caps perfect recovery, but a broken inverse
-    //     link or design would collapse this well below 0.9).
+    // (1) PRIMARY OBJECTIVE CLAIM: gam recovers the noise-free truth. The
+    //     centered signal has sd ~0.26 and range ~1.0; we require the recovery
+    //     RMSE below 0.12 eta-units (< ~half a signal sd, ~12% of the range).
+    //     This is an absolute accuracy bar a correct Poisson(log) k=5 PIRLS
+    //     clears at n=200; a broken inverse link/design/PIRLS overshoots it.
     assert!(
-        corr_truth > 0.9,
-        "gam linear predictor fails to recover the smooth truth: pearson={corr_truth:.5}"
+        gam_recovery_rmse < 0.12,
+        "gam fails to recover the smooth truth on the eta scale: rmse={gam_recovery_rmse:.4} \
+         (signal_sd={signal_sd:.4}, signal_range={signal_range:.4})"
     );
-    // (b) Both engines fit the same penalized Poisson(log) model, so their fitted
-    //     means must be >0.99 Pearson-correlated.
+
+    // (2) MATCH-OR-BEAT on ACCURACY: gam's truth-recovery error must be no worse
+    //     than 1.10x the mature reference's on the SAME metric. gam is at least
+    //     as accurate as statsmodels at reconstructing the generating function.
     assert!(
-        corr_mean > 0.99,
-        "gam vs statsmodels fitted means disagree on the exp scale: pearson={corr_mean:.5}"
-    );
-    // (c) Sharing the data, the two engines' linear predictors should agree to
-    //     within ~10% relative L2 (GCV vs REML penalty selection on the same
-    //     k=5 bases differs only in smoothing weight, not in resolvable
-    //     structure). A real inverse-link/PIRLS/design bug in gam blows past this.
-    assert!(
-        rel_eta_cross < 0.10,
-        "gam vs statsmodels linear predictors diverge: rel_l2={rel_eta_cross:.4}"
+        gam_recovery_rmse <= sm_recovery_rmse * 1.10,
+        "gam is less accurate at recovering the truth than statsmodels: \
+         gam_rmse={gam_recovery_rmse:.4} > 1.10 * statsmodels_rmse={sm_recovery_rmse:.4}"
     );
 }

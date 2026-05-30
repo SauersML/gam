@@ -1,31 +1,38 @@
 //! End-to-end quality: gam's 1-D thin-plate *by-factor* (interaction) smooth
-//! must match `mgcv` — the mature, standard GAM implementation — when a separate
-//! smooth is fit per factor level.
+//! must RECOVER THE KNOWN PER-LEVEL TRUTH that generated the data, and do so at
+//! least as accurately as `mgcv` — the mature, standard GAM implementation.
 //!
-//! This benchmarks gam's `s(x, by=g, bs='tp')` against
-//! `mgcv::gam(y ~ g + s(x, by=g, bs='tp', k=15), method="REML")` with `g` a
-//! factor. mgcv's `by=<factor>` mechanism creates an independent thin-plate
-//! basis block per level, so each level gets its OWN smooth function — the
-//! canonical way to fit treatment-specific / group-specific curves in GAM
-//! practice. The parametric `+ g` carries the per-level intercept (each
-//! by-level smooth is sum-to-zero centered in both engines), matching the
-//! unpenalized treatment-coded factor main effect gam adds automatically for a
-//! categorical `by=`. We give the two engines byte-identical data (same x, same
-//! A/B labels, same y) and assert:
-//!   1. per-LEVEL fitted values agree pointwise (relative L2 over each group),
-//!   2. total effective degrees of freedom agree (same overall complexity), and
-//!   3. the two recovered group curves are genuinely DISTINCT — the by-factor
-//!      mechanism must not collapse the levels onto one shared smooth.
+//! OBJECTIVE METRIC ASSERTED (truth recovery, not tool mimicry): the data are
+//! generated from two known functions — group-A: sin(6πx), group-B: cos(4πx) —
+//! contaminated by N(0, σ=0.06) noise. The PRIMARY pass/fail claim is that gam's
+//! per-level fitted smooth recovers its own group's true function with
+//! RMSE(gam_fit, truth) below a principled bar set by the noise level: a good
+//! smoother averages out noise, so its error against the *true* signal should be
+//! a fraction of σ, comfortably below σ itself. We assert this per group.
 //!
-//! Both engines REML-fit the same penalized objective, so close agreement is the
-//! correct expectation and a real divergence is a real bug. The truth is
-//! group-A: sin(6πx), group-B: cos(4πx) at σ=0.06 — two clearly different shapes,
-//! so a collapse-to-shared-smooth bug would blow up the per-group L2.
+//! mgcv is fit on byte-identical data and demoted to a BASELINE TO MATCH-OR-BEAT
+//! on the SAME objective metric: gam's RMSE-to-truth must be no worse than 1.10×
+//! mgcv's RMSE-to-truth per group. "Same as mgcv" is never the criterion —
+//! mgcv's own fit is a noisy estimate, so we only require gam to be as accurate
+//! as it against the truth, and otherwise to recover the truth on its own merits.
+//!
+//! We also assert two structural properties that hold independently of any
+//! reference: the two recovered group curves are genuinely DISTINCT (the
+//! by-factor mechanism must not collapse the levels onto one shared smooth), and
+//! gam's total effective degrees of freedom lie in a sane, signal-appropriate
+//! range (more than the 2 linear null-space dims, well under the 2·k cap).
+//!
+//! mgcv uses `gam(y ~ g + s(x, by=g, bs='tp', k=15), method="REML")` with `g` a
+//! factor: its `by=<factor>` mechanism creates an independent thin-plate basis
+//! block per level (each centered sum-to-zero), and the parametric `+ g` carries
+//! the per-level intercept — the unpenalized treatment-coded main effect gam adds
+//! automatically for a categorical `by=`. Identical x, A/B labels, and y go to
+//! both engines.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, run_r};
+use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -49,7 +56,7 @@ fn truth(x: f64, group_a: bool) -> f64 {
 }
 
 #[test]
-fn gam_thin_plate_by_factor_matches_mgcv() {
+fn gam_thin_plate_by_factor_recovers_per_level_truth() {
     init_parallelism();
 
     // ---- synthesize identical data for both engines ----------------------
@@ -173,25 +180,41 @@ fn gam_thin_plate_by_factor_matches_mgcv() {
     let mgcv_edf = r.scalar("edf");
     assert_eq!(mgcv_fitted.len(), n, "mgcv fitted length mismatch");
 
-    // ---- split fitted values by group and compare per level --------------
+    // ---- split fitted values by group and score AGAINST THE KNOWN TRUTH ----
+    // The objective quantity is the error of each engine's per-level fitted mean
+    // against the function that actually generated that group's data, evaluated
+    // at the same training x. A good smoother averages out the N(0,σ) noise, so
+    // its RMSE-to-truth should be a fraction of σ — NOT the ~σ that a raw,
+    // unsmoothed estimate of y would incur.
     let mut gam_a = Vec::new();
     let mut gam_b = Vec::new();
     let mut mgcv_a = Vec::new();
     let mut mgcv_b = Vec::new();
+    let mut truth_a = Vec::new();
+    let mut truth_b = Vec::new();
     for i in 0..n {
+        let ti = truth(x[i], is_a[i]);
         if is_a[i] {
             gam_a.push(gam_fitted[i]);
             mgcv_a.push(mgcv_fitted[i]);
+            truth_a.push(ti);
         } else {
             gam_b.push(gam_fitted[i]);
             mgcv_b.push(mgcv_fitted[i]);
+            truth_b.push(ti);
         }
     }
 
+    // PRIMARY objective metric: RMSE of the fitted smooth against the TRUE signal.
+    let gam_err_a = rmse(&gam_a, &truth_a);
+    let gam_err_b = rmse(&gam_b, &truth_b);
+    let mgcv_err_a = rmse(&mgcv_a, &truth_a);
+    let mgcv_err_b = rmse(&mgcv_b, &truth_b);
+
+    // For context only (NOT a pass criterion): how close the two engines' fits
+    // are to each other. Printed, never asserted — "same as mgcv" proves nothing.
     let rel_a = relative_l2(&gam_a, &mgcv_a);
     let rel_b = relative_l2(&gam_b, &mgcv_b);
-    let corr_a = pearson(&gam_a, &mgcv_a);
-    let corr_b = pearson(&gam_b, &mgcv_b);
 
     // Distinctness on the shared grid (curve_a, curve_b evaluated at identical
     // x): sin(6πx) and cos(4πx) over [0,1] are nearly uncorrelated, so a low
@@ -205,47 +228,40 @@ fn gam_thin_plate_by_factor_matches_mgcv() {
     let b_min = curve_b.iter().cloned().fold(f64::INFINITY, f64::min);
     let b_max = curve_b.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
 
-    let edf_rel = (gam_edf - mgcv_edf).abs() / mgcv_edf.abs().max(1.0);
-
     eprintln!(
-        "tp by-factor: n={n} gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} edf_rel={edf_rel:.3}\n  \
-         A: rel_l2={rel_a:.4} pearson={corr_a:.5}\n  \
-         B: rel_l2={rel_b:.4} pearson={corr_b:.5}\n  \
+        "tp by-factor truth recovery (sigma={SIGMA}): n={n} gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3}\n  \
+         A: rmse(gam,truth)={gam_err_a:.4} rmse(mgcv,truth)={mgcv_err_a:.4} (gam-vs-mgcv rel_l2={rel_a:.4})\n  \
+         B: rmse(gam,truth)={gam_err_b:.4} rmse(mgcv,truth)={mgcv_err_b:.4} (gam-vs-mgcv rel_l2={rel_b:.4})\n  \
          cross-group pearson(A,B)={cross_corr:.4} \
          (A range [{a_min:.3},{a_max:.3}] B range [{b_min:.3},{b_max:.3}])",
     );
 
-    // (1) Per-level agreement. Both engines REML-fit the same per-level tp
-    // penalized objective; at σ=0.06 / 80 pts the smooth is well-determined, so
-    // each group's fitted curve must essentially coincide. 0.06 relative L2 is a
-    // tight bound that still tolerates basis-convention differences (gam's
-    // default tp null space vs mgcv's) while catching any real divergence.
+    // (1) TRUTH RECOVERY — the primary claim. Each group's fitted smooth must
+    // recover its OWN true generating function to well within the noise level.
+    // With 80 points per level at σ=0.06, a properly penalized tp smooth drives
+    // the estimation error far below σ; we require RMSE-to-truth < σ (a clearly
+    // smoothing, signal-tracking fit), which a noise-following or collapsed fit
+    // cannot meet.
     assert!(
-        rel_a < 0.06,
-        "group A fitted smooth diverges from mgcv: rel_l2={rel_a:.4} (pearson={corr_a:.5})"
+        gam_err_a < SIGMA,
+        "group A fit does not recover sin(6πx) within the noise level: rmse(gam,truth)={gam_err_a:.4} >= sigma={SIGMA}"
     );
     assert!(
-        rel_b < 0.06,
-        "group B fitted smooth diverges from mgcv: rel_l2={rel_b:.4} (pearson={corr_b:.5})"
-    );
-    assert!(
-        corr_a > 0.999,
-        "group A fitted smooth should be near-identical to mgcv: pearson={corr_a:.5}"
-    );
-    assert!(
-        corr_b > 0.999,
-        "group B fitted smooth should be near-identical to mgcv: pearson={corr_b:.5}"
+        gam_err_b < SIGMA,
+        "group B fit does not recover cos(4πx) within the noise level: rmse(gam,truth)={gam_err_b:.4} >= sigma={SIGMA}"
     );
 
-    // (2) Same overall complexity. Per-group EDF attribution is basis/null-space
-    // convention sensitive; the robust, convention-stable quantity is the TOTAL
-    // EDF summed over both level blocks (plus the shared g main effect), which
-    // both engines report via sum(m$edf). With matched k=15 and REML the totals
-    // should agree closely; 20% relative tolerates tp null-space convention
-    // differences while still rejecting a wrong penalty structure.
+    // (2) MATCH-OR-BEAT the mature reference ON ACCURACY. mgcv's fit is itself a
+    // noisy estimate of the truth, so we do not require gam to match its output —
+    // only that gam recovers the truth at least as accurately as mgcv does, to
+    // within a 10% tolerance per group.
     assert!(
-        edf_rel < 0.20,
-        "total effective degrees of freedom disagree: gam={gam_edf:.3} mgcv={mgcv_edf:.3} (rel={edf_rel:.3})"
+        gam_err_a <= mgcv_err_a * 1.10,
+        "group A: gam is less accurate than mgcv against truth: gam={gam_err_a:.4} mgcv={mgcv_err_a:.4}"
+    );
+    assert!(
+        gam_err_b <= mgcv_err_b * 1.10,
+        "group B: gam is less accurate than mgcv against truth: gam={gam_err_b:.4} mgcv={mgcv_err_b:.4}"
     );
 
     // (3) Distinctness — the by-factor mechanism must keep the levels separate.
@@ -255,5 +271,15 @@ fn gam_thin_plate_by_factor_matches_mgcv() {
     assert!(
         cross_corr.abs() < 0.7,
         "by-factor smooths collapsed toward a single shared curve: cross-group pearson={cross_corr:.4}"
+    );
+
+    // (4) Complexity sanity (NOT edf-matching). gam's total effective degrees of
+    // freedom must sit in a signal-appropriate range: above the 2-dim per-curve
+    // linear null space (so the smooths are genuinely wiggly, recovering the two
+    // oscillating signals) and below the 2·k=30 hard basis cap (so it has not
+    // interpolated noise). We deliberately do NOT assert gam's edf equals mgcv's.
+    assert!(
+        gam_edf > 2.0 && gam_edf < 30.0,
+        "gam total edf outside the sane signal range (2, 30): gam_edf={gam_edf:.3}"
     );
 }

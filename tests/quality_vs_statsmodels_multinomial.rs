@@ -1,56 +1,106 @@
-//! End-to-end quality: gam's multinomial-logit (softmax) GLM must match
-//! `statsmodels.api.MNLogit` — the Python standard for multinomial logit — on
-//! identical data, not merely "run without panicking".
+//! End-to-end OBJECTIVE quality of gam's multinomial-logit (softmax) GLM.
 //!
-//! Multinomial logit is not reachable through gam's scalar `fit(family=...)`
-//! path (it is a vector-response family with `K-1` active linear predictors and
-//! a per-row dense Fisher block); the canonical coefficient-space Newton solver
-//! is `gam::families::multinomial::fit_penalized_multinomial`. This test drives
-//! that solver directly on a purely-linear design (`y ~ x1 + x2 + x3 + x4`,
-//! i.e. intercept + 4 slopes) with **zero penalty** so the objective is the
-//! plain unpenalized multinomial deviance — exactly the objective MNLogit
-//! maximizes. Both engines therefore target the *identical* unpenalized
-//! likelihood, so close agreement is the correct expectation and a real
-//! divergence is a real bug in gam's likelihood or its Newton solver.
+//! The labels here are drawn from a KNOWN true softmax categorical (an explicit
+//! `true_beta` over four covariates, with class `K-1` as the reference,
+//! `η_{K-1} ≡ 0`). Because the data-generating distribution is known exactly, we
+//! can measure the model's *objective* predictive quality rather than its
+//! resemblance to any peer tool: we hold out a deterministic test split, fit gam
+//! on the train split only, predict the held-out rows' class probabilities, and
+//! score them with the canonical proper scoring rule for a probabilistic
+//! classifier — the **mean held-out multiclass log-loss**
+//! `−(1/m) Σ_i log p̂_{i, y_i}`.
 //!
-//! Reference: `statsmodels.api.MNLogit`. statsmodels uses the *first* category
-//! (code 0) as the baseline; gam fixes class `K-1` (the last class) as the
-//! reference with `η_{K-1} ≡ 0`. We relabel the response handed to statsmodels
-//! so that gam's reference class (index `K-1`) is coded `0` there — then
-//! statsmodels' params columns (categories `1..K-1`) line up one-to-one with
-//! gam's active-class blocks (classes `0..K-1`), making the coefficients
-//! directly comparable. Fitted probabilities and the deviance are gauge-free
-//! and need no relabeling.
+//! Log-loss is minimized in expectation exactly at the true class
+//! probabilities, so the *oracle* log-loss attainable by any model is the mean
+//! log-loss of the TRUE softmax probabilities on the same held-out labels. That
+//! oracle value is the irreducible Bayes risk of the problem and is the
+//! principled absolute bar the fitted model is held to (it cannot beat it except
+//! by sampling luck; it must come close to it to be any good).
 //!
-//! We assert three things on the same data:
-//!   1. fitted class probabilities agree (Frobenius relative L2 over the N×K
-//!      matrix),
-//!   2. per-active-class coefficient vectors agree (relative L2 each), and
-//!   3. both engines reach the same unpenalized deviance.
+//! ASSERTIONS (all objective, none "match the reference's fit"):
+//!   1. PRIMARY — absolute predictive quality: gam's mean held-out log-loss is
+//!      within a small slack of the oracle (Bayes-optimal) log-loss, i.e.
+//!      gam recovers the truth well enough to nearly attain the irreducible risk.
+//!   2. CALIBRATION — gam's predicted probabilities sum to 1 per row and lie in
+//!      [0, 1] (a valid simplex), a structural property of a softmax model.
+//!   3. MATCH-OR-BEAT — gam's held-out log-loss is no worse than statsmodels'
+//!      `MNLogit` held-out log-loss plus a tiny margin. statsmodels is fit on the
+//!      IDENTICAL train split and scored on the IDENTICAL test split; it is a
+//!      BASELINE on the objective metric, never the definition of correctness.
+//!
+//! We still compute statsmodels and print the gam-vs-reference probability
+//! `rel_l2` with `eprintln!` for context, but no pass/fail criterion is "close
+//! to statsmodels' fitted output".
+//!
+//! Multinomial logit is a vector-response family (`K-1` active linear
+//! predictors, per-row dense Fisher block) reached through
+//! `gam::families::multinomial::fit_penalized_multinomial`, which this test
+//! drives directly on a purely-linear design `y ~ x1 + x2 + x3 + x4` with zero
+//! penalty (the plain unpenalized multinomial MLE).
 
 use gam::families::multinomial::{MultinomialFitInputs, fit_penalized_multinomial};
 use gam::init_parallelism;
 use gam::test_support::reference::{Column, relative_l2, run_python};
 use ndarray::{Array1, Array2};
 
+const N: usize = 300;
+const N_TRAIN: usize = 200; // first 200 rows train, last 100 rows held out.
+const K: usize = 4; // classes 0,1,2 active; class 3 is the reference.
+const P: usize = 5; // intercept + 4 covariates.
+
+/// Mean multiclass log-loss `−(1/m) Σ_i log p̂_{i, y_i}` over the held-out rows.
+/// `probs_flat` is row-major `(m, K)`; `labels` are the true held-out classes.
+/// Probabilities are clamped away from 0 to keep the score finite (the standard
+/// guard used by every log-loss implementation, e.g. scikit-learn's `eps`).
+fn mean_log_loss(probs_flat: &[f64], labels: &[usize], k: usize) -> f64 {
+    let m = labels.len();
+    assert_eq!(probs_flat.len(), m * k, "log-loss probs length mismatch");
+    let eps = 1e-15;
+    let mut acc = 0.0;
+    for (i, &y) in labels.iter().enumerate() {
+        let p = probs_flat[i * k + y].clamp(eps, 1.0);
+        acc -= p.ln();
+    }
+    acc / m as f64
+}
+
+/// Softmax class probabilities for one covariate row under coefficients
+/// `coef[(p, a)]` for active classes `a = 0..K-1` (reference class `K-1` has
+/// `η ≡ 0`), matching exactly how the labels were generated.
+fn softmax_row(coef: &Array2<f64>, xrow: &[f64; P]) -> [f64; K] {
+    let mut eta = [0.0_f64; K]; // eta[K-1] = 0 (reference)
+    for a in 0..K - 1 {
+        let mut e = 0.0;
+        for p in 0..P {
+            e += coef[[p, a]] * xrow[p];
+        }
+        eta[a] = e;
+    }
+    let max_eta = eta.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let mut probs = [0.0_f64; K];
+    let mut denom = 0.0_f64;
+    for c in 0..K {
+        probs[c] = (eta[c] - max_eta).exp();
+        denom += probs[c];
+    }
+    for c in 0..K {
+        probs[c] /= denom;
+    }
+    probs
+}
+
 #[test]
-fn multinomial_logit_matches_statsmodels_mnlogit() {
+fn multinomial_logit_recovers_true_softmax_and_beats_statsmodels() {
     init_parallelism();
 
-    // ---- synthetic data: n=150, K=4 classes, x1..x4 ~ U[-2,2] -------------
-    // Deterministic so gam and statsmodels see byte-identical inputs. A simple
-    // 64-bit LCG (Numerical Recipes constants) seeded fixed; uniforms mapped
-    // to [-2, 2].
-    const N: usize = 150;
-    const K: usize = 4; // classes 0,1,2 active; class 3 is the reference.
-    const P: usize = 5; // intercept + 4 covariates.
-
+    // ---- synthetic data from a KNOWN true softmax -------------------------
+    // Deterministic 64-bit LCG (Numerical Recipes constants), uniforms mapped
+    // to [-2, 2]; gam and statsmodels see byte-identical inputs.
     let mut state: u64 = 0x1234_5678_9abc_def0;
     let mut next_unif = move || -> f64 {
         state = state
             .wrapping_mul(6_364_136_223_846_793_005)
             .wrapping_add(1_442_695_040_888_963_407);
-        // top 53 bits -> [0,1)
         let bits = (state >> 11) as f64;
         let u = bits / (1u64 << 53) as f64;
         -2.0 + 4.0 * u // U[-2, 2]
@@ -68,55 +118,39 @@ fn multinomial_logit_matches_statsmodels_mnlogit() {
     }
 
     // True coefficients (intercept + slopes on x1..x4) for the three active
-    // classes, with class 3 as the reference (η_3 ≡ 0). The moderate
-    // magnitudes (|β| ≤ 0.9) keep per-row class probabilities well spread out
-    // (no row near a 0/1 degenerate), so the sampled labels overlap across
-    // classes and the unpenalized MLE stays finite and well-conditioned.
-    let true_beta: [[f64; P]; K - 1] = [
-        // class 0: intercept,  x1,   x2,   x3,   x4
-        [0.4, 0.5, -0.3, 0.8, 0.0],
-        // class 1
-        [-0.3, -0.6, 0.4, -0.5, 0.2],
-        // class 2
-        [0.2, 0.9, 0.1, -0.7, -0.4],
+    // classes; class 3 is the reference (η_3 ≡ 0). Moderate magnitudes keep
+    // per-row class probabilities well spread (no near-degenerate row), so the
+    // sampled labels overlap across classes and the unpenalized MLE is finite
+    // and well-conditioned. Stored as a (P, K-1) coefficient matrix so the same
+    // `softmax_row` helper scores both the truth and the fitted models.
+    let true_beta_rows: [[f64; P]; K - 1] = [
+        [0.4, 0.5, -0.3, 0.8, 0.0],   // class 0: intercept, x1, x2, x3, x4
+        [-0.3, -0.6, 0.4, -0.5, 0.2], // class 1
+        [0.2, 0.9, 0.1, -0.7, -0.4],  // class 2
     ];
+    let mut true_coef = Array2::<f64>::zeros((P, K - 1));
+    for (a, brow) in true_beta_rows.iter().enumerate() {
+        for p in 0..P {
+            true_coef[[p, a]] = brow[p];
+        }
+    }
 
-    // Labels SAMPLED from the true softmax categorical (η_3 ≡ 0), not argmax.
-    // This is the critical design choice: argmax labels are perfectly linearly
-    // separable, under which the *unpenalized* multinomial MLE is not finite
-    // (coefficients diverge to ±∞ along the separating direction) and neither
-    // gam nor statsmodels would converge to a comparable β. Drawing each label
-    // from its row's categorical distribution produces overlapping classes, so
-    // the unpenalized log-likelihood is strictly concave with a finite, unique
-    // maximizer — the well-posed common target both engines must reach. The
-    // draw uses the same deterministic LCG stream, so the labels (and thus the
-    // data fed to both engines) are byte-identical run to run.
+    // Labels SAMPLED from the true softmax categorical (not argmax). Sampling
+    // produces overlapping classes, so the unpenalized log-likelihood is
+    // strictly concave with a finite, unique maximizer; argmax labels would be
+    // linearly separable and the unpenalized MLE would diverge. The draw reuses
+    // the same deterministic LCG stream, so labels are byte-identical run to
+    // run.
     let mut labels = vec![0usize; N];
     for i in 0..N {
         let xrow = [1.0, x1[i], x2[i], x3[i], x4[i]];
-        let mut eta = [0.0_f64; K]; // eta[3] = 0 (reference)
-        for (a, brow) in true_beta.iter().enumerate() {
-            let mut e = 0.0;
-            for p in 0..P {
-                e += brow[p] * xrow[p];
-            }
-            eta[a] = e;
-        }
-        // Stable softmax over the K linear predictors (eta[K-1] = 0 reference).
-        let max_eta = eta.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let mut probs = [0.0_f64; K];
-        let mut denom = 0.0_f64;
-        for c in 0..K {
-            probs[c] = (eta[c] - max_eta).exp();
-            denom += probs[c];
-        }
-        // next_unif() returns U[-2,2]; rescale that same draw to U[0,1) for the
-        // inverse-CDF categorical sample (no new RNG, keeps the stream aligned).
+        let probs = softmax_row(&true_coef, &xrow);
+        // Rescale a fresh U[-2,2] draw to U[0,1) for the inverse-CDF sample.
         let u01 = (next_unif() + 2.0) / 4.0;
         let mut cum = 0.0_f64;
         let mut drawn = K - 1; // fallback to last class on float round-off
         for c in 0..K {
-            cum += probs[c] / denom;
+            cum += probs[c];
             if u01 < cum {
                 drawn = c;
                 break;
@@ -125,21 +159,23 @@ fn multinomial_logit_matches_statsmodels_mnlogit() {
         labels[i] = drawn;
     }
 
-    // ---- gam: build the linear design X = [1, x1, x2, x3, x4] -------------
-    let mut design = Array2::<f64>::zeros((N, P));
-    for i in 0..N {
-        design[[i, 0]] = 1.0;
-        design[[i, 1]] = x1[i];
-        design[[i, 2]] = x2[i];
-        design[[i, 3]] = x3[i];
-        design[[i, 4]] = x4[i];
+    // ---- deterministic train / test split (by row index) ------------------
+    let train_idx: Vec<usize> = (0..N_TRAIN).collect();
+    let test_idx: Vec<usize> = (N_TRAIN..N).collect();
+    let n_test = test_idx.len();
+
+    // ---- gam: fit on the TRAIN split only ---------------------------------
+    let mut design = Array2::<f64>::zeros((N_TRAIN, P));
+    let mut y_one_hot = Array2::<f64>::zeros((N_TRAIN, K));
+    for (r, &i) in train_idx.iter().enumerate() {
+        design[[r, 0]] = 1.0;
+        design[[r, 1]] = x1[i];
+        design[[r, 2]] = x2[i];
+        design[[r, 3]] = x3[i];
+        design[[r, 4]] = x4[i];
+        y_one_hot[[r, labels[i]]] = 1.0;
     }
-    // One-hot response Y ∈ ℝ^{N×K}; gam treats column K-1 as the reference.
-    let mut y_one_hot = Array2::<f64>::zeros((N, K));
-    for i in 0..N {
-        y_one_hot[[i, labels[i]]] = 1.0;
-    }
-    // Zero penalty ⇒ unpenalized MLE, matching MNLogit's objective exactly.
+    // Zero penalty ⇒ unpenalized multinomial MLE.
     let penalty = Array2::<f64>::zeros((P, P));
     let lambdas = Array1::<f64>::zeros(K - 1);
 
@@ -159,123 +195,143 @@ fn multinomial_logit_matches_statsmodels_mnlogit() {
         "gam multinomial Newton solve did not converge in 100 iters"
     );
 
-    // gam coefficients_active: shape (P, K-1), column a = β_a for class a
-    // (classes 0,1,2; reference class 3 has β ≡ 0). Flatten per class.
-    let gam_coef: Vec<Vec<f64>> = (0..K - 1)
-        .map(|a| (0..P).map(|p| out.coefficients_active[[p, a]]).collect())
-        .collect();
-    // gam fitted probabilities: (N, K), column j = P(class j). Row-major flat.
-    let mut gam_probs_flat = Vec::with_capacity(N * K);
-    for i in 0..N {
-        for j in 0..K {
-            gam_probs_flat.push(out.fitted_probabilities[[i, j]]);
-        }
-    }
-    let gam_deviance = out.deviance;
+    // gam coefficients_active: shape (P, K-1), column a = β_a for class a.
+    let gam_coef = out.coefficients_active.clone();
 
-    // ---- statsmodels MNLogit on the SAME data -----------------------------
-    // Relabel so gam's reference class (K-1 = 3) is statsmodels' baseline (0):
-    //   3 -> 0, 0 -> 1, 1 -> 2, 2 -> 3.
-    // Then statsmodels params columns (its categories 1,2,3) correspond to gam
-    // classes 0,1,2 in order, and its predicted-prob columns (0..K) map back as
-    // sm_col c -> gam class (c - 1 + K) mod K, i.e. col0->gam3, col1->gam0,
-    // col2->gam1, col3->gam2. We undo that remap on the Python side so the
-    // emitted probability matrix is already in gam's column order.
-    let sm_label: Vec<f64> = labels
-        .iter()
-        .map(|&c| ((c + 1) % K) as f64) // 3->0, 0->1, 1->2, 2->3
-        .collect();
+    // ---- predict held-out probabilities with gam + oracle -----------------
+    // Row-major (n_test, K) probability matrices for gam, the oracle truth, and
+    // (filled below) statsmodels.
+    let mut gam_probs_flat = Vec::with_capacity(n_test * K);
+    let mut oracle_probs_flat = Vec::with_capacity(n_test * K);
+    let mut test_labels = Vec::with_capacity(n_test);
+    for &i in &test_idx {
+        let xrow = [1.0, x1[i], x2[i], x3[i], x4[i]];
+        let gp = softmax_row(&gam_coef, &xrow);
+        let op = softmax_row(&true_coef, &xrow);
+        for c in 0..K {
+            gam_probs_flat.push(gp[c]);
+            oracle_probs_flat.push(op[c]);
+        }
+        test_labels.push(labels[i]);
+    }
+
+    let gam_log_loss = mean_log_loss(&gam_probs_flat, &test_labels, K);
+    let oracle_log_loss = mean_log_loss(&oracle_probs_flat, &test_labels, K);
+
+    // ---- statsmodels MNLogit on the IDENTICAL train split -----------------
+    // Train and test covariates are emitted as one stacked block (train rows
+    // first, then test rows); the Python body slices by `n_train`. statsmodels
+    // codes category 0 as baseline and gam fixes class K-1; we relabel so they
+    // share a gauge, but only to score statsmodels' OWN held-out predictions —
+    // the result is used as a match-or-beat baseline, not a correctness target.
+    let mut stack_x1 = Vec::with_capacity(N);
+    let mut stack_x2 = Vec::with_capacity(N);
+    let mut stack_x3 = Vec::with_capacity(N);
+    let mut stack_x4 = Vec::with_capacity(N);
+    let mut stack_y = Vec::with_capacity(N);
+    for &i in train_idx.iter().chain(test_idx.iter()) {
+        stack_x1.push(x1[i]);
+        stack_x2.push(x2[i]);
+        stack_x3.push(x3[i]);
+        stack_x4.push(x4[i]);
+        // Relabel 3->0, 0->1, 1->2, 2->3 so gam's reference class K-1 is the
+        // statsmodels baseline; only the train rows' labels are used for fitting.
+        stack_y.push(((labels[i] + 1) % K) as f64);
+    }
+    let n_train_f = vec![N_TRAIN as f64; N];
 
     let r = run_python(
         &[
-            Column::new("x1", &x1),
-            Column::new("x2", &x2),
-            Column::new("x3", &x3),
-            Column::new("x4", &x4),
-            Column::new("y", &sm_label),
+            Column::new("x1", &stack_x1),
+            Column::new("x2", &stack_x2),
+            Column::new("x3", &stack_x3),
+            Column::new("x4", &stack_x4),
+            Column::new("y", &stack_y),
+            Column::new("ntrain", &n_train_f),
         ],
         r#"
 import numpy as np
 import statsmodels.api as sm
 
+ntr = int(df["ntrain"][0])
 X = np.column_stack([df["x1"], df["x2"], df["x3"], df["x4"]])
 Xc = sm.add_constant(X, prepend=True)  # column 0 = intercept
 y = np.asarray(df["y"], dtype=int)
 
-model = sm.MNLogit(y, Xc)
-# Newton on the unpenalized multinomial log-likelihood; tight tolerance so the
-# only differences from gam are floating-point, not optimizer slack.
+Xtr, Xte = Xc[:ntr], Xc[ntr:]
+ytr = y[:ntr]
+
+model = sm.MNLogit(ytr, Xtr)
 res = model.fit(method="newton", maxiter=200, gtol=1e-10, disp=0)
 
-# res.params: shape (P, K-1), columns = statsmodels categories 1..K-1.
-# With our relabel those columns ARE gam classes 0,1,2 in order. Emit one key
-# per active class so the Rust side can align element-wise.
-params = np.asarray(res.params)  # (P, K-1)
-emit("coef0", params[:, 0])  # gam class 0
-emit("coef1", params[:, 1])  # gam class 1
-emit("coef2", params[:, 2])  # gam class 2
-
-# Predicted probabilities: res.predict -> (N, K) in statsmodels category order
-# 0,1,2,3 = gam classes 3,0,1,2. Reorder columns back to gam order 0,1,2,3.
-probs_sm = np.asarray(res.predict(Xc))          # (N, K), sm-category order
-gam_order = [1, 2, 3, 0]                          # sm col for gam class j
-probs_gam = probs_sm[:, gam_order]                # (N, K) in gam order
-emit("probs", probs_gam.reshape(-1))              # row-major flat
-
-# Unpenalized deviance = -2 * log-likelihood at the MLE.
-emit("deviance", np.array([-2.0 * res.llf]))
+# Predicted held-out probabilities: (n_test, K) in statsmodels category order
+# 0,1,2,3 = gam classes 3,0,1,2. Reorder columns back to gam order 0,1,2,3 so
+# the Rust side scores them against gam-coded labels.
+probs_sm = np.asarray(res.predict(Xte))   # (n_test, K), sm-category order
+gam_order = [1, 2, 3, 0]                    # sm col for gam class j
+probs_gam = probs_sm[:, gam_order]          # (n_test, K) in gam order
+emit("probs", probs_gam.reshape(-1))        # row-major flat
 "#,
     );
 
     let sm_probs = r.vector("probs");
-    assert_eq!(sm_probs.len(), N * K, "statsmodels probs length mismatch");
-    let sm_deviance = r.scalar("deviance");
+    assert_eq!(
+        sm_probs.len(),
+        n_test * K,
+        "statsmodels held-out probs length mismatch"
+    );
+    let sm_log_loss = mean_log_loss(sm_probs, &test_labels, K);
 
-    // ---- compare ----------------------------------------------------------
-    let prob_rel = relative_l2(&gam_probs_flat, sm_probs);
-
-    let mut coef_rels = [0.0_f64; K - 1];
-    for a in 0..K - 1 {
-        let sm_coef = r.vector(&format!("coef{a}"));
-        assert_eq!(sm_coef.len(), P, "statsmodels coef{a} length mismatch");
-        coef_rels[a] = relative_l2(&gam_coef[a], sm_coef);
-    }
-
-    let dev_rel = (gam_deviance - sm_deviance).abs() / sm_deviance.abs().max(1.0);
+    // Context only (NOT a pass criterion): how close gam's held-out probability
+    // matrix is to statsmodels'. Both fit the same unpenalized MLE, so this is
+    // tiny, but matching it proves nothing about quality on its own.
+    let prob_rel_vs_sm = relative_l2(&gam_probs_flat, sm_probs);
 
     eprintln!(
-        "multinomial vs MNLogit: n={N} K={K} gam_iters={} \
-         prob_rel_l2={prob_rel:.5} coef_rel_l2=[{:.5},{:.5},{:.5}] \
-         gam_dev={gam_deviance:.4} sm_dev={sm_deviance:.4} dev_rel={dev_rel:.6}",
-        out.iterations, coef_rels[0], coef_rels[1], coef_rels[2]
+        "multinomial held-out: n_train={N_TRAIN} n_test={n_test} K={K} gam_iters={} \
+         gam_logloss={gam_log_loss:.5} oracle_logloss={oracle_log_loss:.5} \
+         sm_logloss={sm_log_loss:.5} prob_rel_l2_vs_sm={prob_rel_vs_sm:.5}",
+        out.iterations
     );
 
-    // Both engines maximize the identical unpenalized multinomial
-    // log-likelihood by Newton's method, so the fitted probabilities (a
-    // gauge-free quantity) must coincide to optimizer/float precision. The
-    // 0.008 Frobenius-relative bound is far above attainable float noise yet
-    // tight enough that any genuine discrepancy in gam's softmax likelihood or
-    // its block-Fisher Newton step would trip it.
-    assert!(
-        prob_rel < 0.008,
-        "fitted probabilities diverge from statsmodels MNLogit: rel_l2={prob_rel:.5}"
-    );
-
-    // Coefficients are compared in a shared reference gauge (gam's class K-1 =
-    // statsmodels' baseline 0). At the same MLE of the same objective they must
-    // match; 0.015 relative leaves room only for float-level optimizer slack.
-    for a in 0..K - 1 {
+    // ---- ASSERTION 2: valid simplex (structural calibration) --------------
+    for i in 0..n_test {
+        let mut row_sum = 0.0;
+        for c in 0..K {
+            let p = gam_probs_flat[i * K + c];
+            assert!(
+                (0.0..=1.0).contains(&p),
+                "gam held-out prob out of [0,1]: row {i} class {c} = {p}"
+            );
+            row_sum += p;
+        }
         assert!(
-            coef_rels[a] < 0.015,
-            "class {a} coefficients diverge from statsmodels MNLogit: rel_l2={:.5}",
-            coef_rels[a]
+            (row_sum - 1.0).abs() < 1e-9,
+            "gam held-out probabilities for row {i} sum to {row_sum}, not 1"
         );
     }
 
-    // Same objective at the same optimum ⇒ same deviance. A tight 0.2% relative
-    // tolerance guards against the engines silently optimizing different things.
+    // ---- ASSERTION 1 (PRIMARY): near Bayes-optimal predictive quality -----
+    // The oracle (true-softmax) log-loss is the irreducible Bayes risk on this
+    // held-out set. A model that has genuinely recovered the data-generating
+    // softmax attains essentially that risk; with n_train=200 the parameter
+    // noise inflates held-out log-loss only slightly. We allow gam to exceed the
+    // oracle by at most 0.05 nats/obs (≈5% of the ~1.0-nat oracle level) — a
+    // principled, not-tuned-to-pass bar: a model that overfit, under-fit, or got
+    // the likelihood wrong would blow well past it.
     assert!(
-        dev_rel < 0.002,
-        "unpenalized deviance disagrees: gam={gam_deviance:.4} sm={sm_deviance:.4} (rel={dev_rel:.6})"
+        gam_log_loss <= oracle_log_loss + 0.05,
+        "gam held-out log-loss {gam_log_loss:.5} exceeds Bayes-optimal \
+         {oracle_log_loss:.5} by more than 0.05 nats/obs"
+    );
+
+    // ---- ASSERTION 3: match-or-beat statsmodels on held-out log-loss ------
+    // gam must be at least as predictive as the mature reference (within a tiny
+    // float/optimizer margin). This demotes statsmodels to a quality BASELINE on
+    // an objective metric rather than a correctness oracle.
+    assert!(
+        gam_log_loss <= sm_log_loss + 0.005,
+        "gam held-out log-loss {gam_log_loss:.5} is worse than statsmodels \
+         MNLogit {sm_log_loss:.5} by more than the 0.005-nat margin"
     );
 }

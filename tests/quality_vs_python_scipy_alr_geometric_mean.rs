@@ -1,34 +1,43 @@
-//! Compositional (Aitchison-geometry) primitive benchmark: gam's closed
-//! geometric / Fréchet mean on the simplex vs. SciPy's exact reference.
+//! Compositional (Aitchison-geometry) primitive quality test: gam's closed
+//! geometric / Fréchet mean on the simplex.
 //!
-//! BENCHMARKS AGAINST: `scipy.stats.gmean` (the column-wise geometric mean —
-//! SciPy's exact, well-tested compositional reference) together with the
-//! standard simplex `closure` operator. The closed geometric mean is the
-//! Aitchison/Fréchet centre of mass of a sample of compositions: the point
-//! that minimises the sum of squared Aitchison distances, equivalently the
-//! inverse-CLR of the per-part arithmetic mean of the centred-log-ratio (CLR)
-//! coordinates. gam exposes exactly this primitive as
-//! `gam::geometry::simplex::simplex_frechet_mean`.
+//! OBJECTIVE METRIC ASSERTED (primary): the Fréchet *variational optimality* of
+//! gam's centroid. The compositional geometric mean is, by definition, the
+//! minimiser of the Aitchison-Fréchet functional
 //!
-//! DISTINCTIVE-AXIS / FRAGMENTATION FINDING (documented per the suite rules):
-//! the spec asked for an *isometric log-ratio (ILR) transform* and a check that
-//! ILR preserves the Aitchison metric isometrically into Euclidean space. gam
-//! has **no ILR transform** — there is no orthonormal-basis log-ratio map, the
-//! `closure` operator is private, and the only public compositional primitive
-//! is the Fréchet/geometric mean. That absence is itself the honest finding:
-//! compositional Riemannian tooling is fragmented and single-purpose (SciPy has
-//! `gmean` but no ILR; `geomstats`/R `compositions` carry the ILR basis), and
-//! gam currently implements the *centroid*, not the *coordinate transform*.
-//! This test therefore benchmarks the primitive gam actually has, to
-//! machine precision, AND asserts two intrinsic correctness properties any
-//! correct compositional geometric mean must satisfy:
-//!   (a) closure validity — the result is a valid composition (parts strictly
-//!       positive, summing to one);
-//!   (b) Aitchison perturbation-equivariance — perturbing every observation by
-//!       a fixed composition `q` (the simplex group operation) shifts the
-//!       geometric mean by exactly the same perturbation, the defining
-//!       invariance of the Fréchet centre under the Aitchison group.
-//! Both engines are fed byte-identical data; SciPy is the exact ground truth.
+//!     F(m) = (1/n) Σ_i d_A(m, x_i)^2 ,
+//!
+//! where `d_A` is the Aitchison distance (Euclidean distance between
+//! centred-log-ratio coordinates). "Quality" here is therefore not "looks like
+//! some tool's output" — it is *does gam's point actually minimise the defining
+//! objective*. We assert this two ways, both computed on gam's own returned
+//! point against the identical sample:
+//!   (P1) STATIONARITY / GLOBAL MINIMALITY: F(gam_mean) is a true minimum. The
+//!        Fréchet functional on the simplex is strictly convex in clr space, so
+//!        the minimiser is unique and any displacement must raise F. We assert
+//!        F(gam_mean) <= F(candidate) for a battery of perturbed candidates
+//!        (each observation, the arithmetic centroid, random simplex points),
+//!        and that the analytic Fréchet gradient at gam_mean is ~0.
+//!   (P2) MATCH-OR-BEAT THE REFERENCE ON THE OBJECTIVE: SciPy's closed-form
+//!        `closure(gmean(X))` is fed the byte-identical sample; we assert
+//!        F(gam_mean) <= F(scipy_mean) * (1 + tiny). gam's centroid is at least
+//!        as good a minimiser of the true objective as the mature tool's — an
+//!        accuracy claim about the objective, never "the coordinates match".
+//!
+//! Because the Aitchison-Fréchet minimiser admits the exact closed form
+//! `closure(exp(mean_j log x))`, SciPy's `gmean` is *exact mathematical ground
+//! truth* for the location of that minimiser. We additionally report (eprintln,
+//! NOT asserted as the pass criterion) the coordinate deviation vs SciPy for
+//! context, but the gate is the objective F, not coordinate closeness.
+//!
+//! INTRINSIC STRUCTURE also asserted (any correct compositional centroid must
+//! satisfy these regardless of the optimiser used):
+//!   (S1) closure validity — strictly positive parts summing to one;
+//!   (S2) Aitchison perturbation-equivariance — perturbing every observation by
+//!        a fixed composition `q` shifts the centroid by exactly `q`, the
+//!        defining group-invariance of the Fréchet centre.
+//!
+//! Both engines are fed byte-identical data.
 
 use gam::geometry::simplex::simplex_frechet_mean;
 use gam::test_support::reference::{Column, max_abs_diff, run_python};
@@ -47,8 +56,33 @@ fn perturb(x: &[f64], q: &[f64]) -> Vec<f64> {
     close_row(&prod)
 }
 
+/// Centred-log-ratio coordinates of a composition: `clr(x)_j = ln x_j - mean_k ln x_k`.
+/// This is the isometry that maps Aitchison geometry into ordinary Euclidean
+/// space, so squared Aitchison distance is just squared Euclidean distance here.
+fn clr(x: &[f64]) -> Vec<f64> {
+    let logs: Vec<f64> = x.iter().map(|v| v.ln()).collect();
+    let mean = logs.iter().sum::<f64>() / logs.len() as f64;
+    logs.iter().map(|l| l - mean).collect()
+}
+
+/// Squared Aitchison distance between two compositions = ||clr(a) - clr(b)||^2.
+fn aitchison_sq(a: &[f64], b: &[f64]) -> f64 {
+    let ca = clr(a);
+    let cb = clr(b);
+    ca.iter()
+        .zip(&cb)
+        .map(|(x, y)| (x - y) * (x - y))
+        .sum()
+}
+
+/// Aitchison-Fréchet functional F(m) = mean_i d_A(m, x_i)^2 for candidate `m`.
+fn frechet_objective(m: &[f64], rows: &[[f64; 4]]) -> f64 {
+    let s: f64 = rows.iter().map(|r| aitchison_sq(m, r)).sum();
+    s / rows.len() as f64
+}
+
 #[test]
-fn simplex_geometric_mean_matches_scipy_gmean() {
+fn simplex_geometric_mean_minimizes_aitchison_frechet_objective() {
     // ---- synthetic 4-part compositions, identical to both engines ---------
     // Rows are random [a, b, c, 1-a-b-c] with a,b,c ~ U(0.01, 0.98) drawn from
     // a fixed-seed deterministic generator, rejecting rows whose 4th part is
@@ -108,11 +142,10 @@ fn simplex_geometric_mean_matches_scipy_gmean() {
         "Fréchet mean must have one part per column"
     );
 
-    // ---- SciPy exact reference: closure(gmean(X, axis=0)) -----------------
+    // ---- SciPy closed-form reference: closure(gmean(X, axis=0)) -----------
     // scipy.stats.gmean is the column-wise geometric mean; closing it yields the
-    // compositional geometric mean. (Closure of the inputs would only add a
-    // common per-part constant that cancels in the closed result, so raw X is
-    // fed and closed once at the end — exactly gam's definition.)
+    // compositional geometric mean — the exact closed form of the
+    // Aitchison-Fréchet minimiser. Used here as a BASELINE on the objective F.
     let r = run_python(
         &[
             Column::new("p0", &p0),
@@ -126,29 +159,117 @@ X = np.column_stack([df["p0"], df["p1"], df["p2"], df["p3"]])
 g = gmean(X, axis=0)          # exact column-wise geometric mean
 g = g / g.sum()               # closure -> valid composition (sums to 1)
 emit("mean", g)
-emit("sum", [float(g.sum())])
 "#,
     );
     let scipy_mean = r.vector("mean");
-    let scipy_sum = r.scalar("sum");
     assert_eq!(scipy_mean.len(), nparts, "scipy mean length mismatch");
 
-    // ---- (1) machine-precision agreement vs SciPy ground truth ------------
-    let dev = max_abs_diff(&gam_mean, scipy_mean);
-    eprintln!(
-        "simplex gmean: n={n} parts={nparts} gam={gam_mean:?} scipy={scipy_mean:?} \
-         max_abs_dev={dev:.3e} scipy_sum={scipy_sum:.6}"
-    );
-    // Both compute closure(exp(mean_j log x)) over the identical sample; only
-    // floating-point summation order differs, so they must agree to a few ulps
-    // scaled by the part magnitudes. 1e-12 is far tighter than any modelling
-    // tolerance yet leaves headroom for cross-language summation reordering.
+    // ---- (P1) the centroid is the MINIMISER of the Fréchet objective ------
+    // The defining quality of a Fréchet/geometric mean: it minimises the mean
+    // squared Aitchison distance to the sample. We assert gam's point is at
+    // least as good as a battery of competing candidates, and that no nearby
+    // displacement lowers the objective (global minimality of a strictly
+    // convex problem). This asserts gam's OBJECTIVE quality, not its likeness
+    // to any tool.
+    let f_gam = frechet_objective(&gam_mean, &rows);
     assert!(
-        dev < 1e-12,
-        "gam Fréchet mean disagrees with scipy gmean: max_abs_dev={dev:.3e}"
+        f_gam.is_finite() && f_gam >= 0.0,
+        "Fréchet objective at gam mean is not a valid value: {f_gam}"
     );
 
-    // ---- (2) intrinsic property: closure validity -------------------------
+    // Candidate set: every observation (the centroid must beat any single
+    // member), the arithmetic centroid (closed mean of raw parts — a natural
+    // but WRONG centre for Aitchison geometry), and a spread of random simplex
+    // points. None may achieve a lower objective than gam's centroid.
+    let mut arith = vec![0.0_f64; nparts];
+    for r in &rows {
+        for j in 0..nparts {
+            arith[j] += r[j];
+        }
+    }
+    let arith = close_row(&arith);
+
+    let mut candidates: Vec<Vec<f64>> = Vec::new();
+    for r in &rows {
+        candidates.push(r.to_vec());
+    }
+    candidates.push(arith.clone());
+    for _ in 0..64 {
+        let raw = [
+            lo + (hi - lo) * next_u01(),
+            lo + (hi - lo) * next_u01(),
+            lo + (hi - lo) * next_u01(),
+            lo + (hi - lo) * next_u01(),
+        ];
+        candidates.push(close_row(&raw));
+    }
+
+    let mut worst_competitor = f64::INFINITY;
+    for cand in &candidates {
+        let f = frechet_objective(cand, &rows);
+        if f < worst_competitor {
+            worst_competitor = f;
+        }
+        // gam's centroid must not be beaten by any candidate (allow a tiny
+        // floating-point slack only).
+        assert!(
+            f_gam <= f + 1e-12,
+            "gam Fréchet mean is NOT the minimiser: F(gam)={f_gam:.12e} > F(candidate)={f:.12e}"
+        );
+    }
+    // The arithmetic centroid is the wrong centre for Aitchison geometry; it
+    // must score strictly worse, confirming the test discriminates the correct
+    // optimum from a plausible-but-wrong one.
+    let f_arith = frechet_objective(&arith, &rows);
+    assert!(
+        f_arith > f_gam + 1e-9,
+        "arithmetic centroid did not score worse than the Aitchison centroid \
+         (test cannot discriminate the correct optimum): F(arith)={f_arith:.12e} F(gam)={f_gam:.12e}"
+    );
+
+    // First-order stationarity: the gradient of F in clr coordinates at the
+    // minimiser is 2*(clr(m) - mean_i clr(x_i)). gam's point must annihilate it.
+    let clr_gam = clr(&gam_mean);
+    let mut clr_bar = vec![0.0_f64; nparts];
+    for r in &rows {
+        let c = clr(r);
+        for j in 0..nparts {
+            clr_bar[j] += c[j];
+        }
+    }
+    for v in clr_bar.iter_mut() {
+        *v /= n as f64;
+    }
+    let grad_norm = clr_gam
+        .iter()
+        .zip(&clr_bar)
+        .map(|(g, b)| (2.0 * (g - b)).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    assert!(
+        grad_norm < 1e-10,
+        "Fréchet gradient at gam mean is non-zero (not a stationary point): |grad|={grad_norm:.3e}"
+    );
+
+    // ---- (P2) MATCH-OR-BEAT the reference on the objective ----------------
+    let f_scipy = frechet_objective(scipy_mean, &rows);
+    let coord_dev = max_abs_diff(&gam_mean, scipy_mean);
+    eprintln!(
+        "simplex Fréchet: n={n} parts={nparts} F(gam)={f_gam:.12e} F(scipy)={f_scipy:.12e} \
+         F(arith)={f_arith:.12e} best_competitor={worst_competitor:.12e} \
+         |grad|={grad_norm:.3e} coord_dev_vs_scipy={coord_dev:.3e}"
+    );
+    // gam must be at least as good a minimiser of the TRUE objective as SciPy's
+    // mature closed form. (Both sit at the analytic optimum, so the two F values
+    // coincide to floating point; the 1e-9 relative slack guards rounding only
+    // and would catch any genuine optimisation shortfall in gam.)
+    assert!(
+        f_gam <= f_scipy * (1.0 + 1e-9) + 1e-15,
+        "gam Fréchet objective is worse than the SciPy baseline: \
+         F(gam)={f_gam:.12e} > F(scipy)={f_scipy:.12e}"
+    );
+
+    // ---- (S1) intrinsic property: closure validity ------------------------
     let gam_sum: f64 = gam_mean.iter().sum();
     assert!(
         (gam_sum - 1.0).abs() < 1e-13,
@@ -161,7 +282,7 @@ emit("sum", [float(g.sum())])
         );
     }
 
-    // ---- (3) intrinsic property: Aitchison perturbation-equivariance ------
+    // ---- (S2) intrinsic property: Aitchison perturbation-equivariance -----
     // The Fréchet centre is equivariant under the simplex group operation:
     //   mean(x_i ⊕ q) = mean(x_i) ⊕ q   for any composition q.
     // This is the defining invariance of the geometric mean as the Aitchison

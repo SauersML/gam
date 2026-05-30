@@ -1,49 +1,121 @@
-//! End-to-end quality: gam's Fréchet (center-of-mass) mean on the simplex must
-//! match the Aitchison-geometry weighted centroid that the mature R
-//! `compositions` / `robCompositions` packages implement, and the
-//! `scipy.stats.gmean` geometric mean for the unweighted case.
+//! End-to-end quality: gam's Fréchet (center-of-mass) mean on the simplex is
+//! asserted to be the TRUE Aitchison-geometry barycenter — i.e. the *minimizer*
+//! of the weighted sum of squared Aitchison distances — not merely "close to
+//! what a reference package prints".
 //!
-//! ## What is benchmarked
-//! `gam::geometry::simplex::simplex_frechet_mean` computes the barycenter of a
-//! set of compositional points under the Aitchison metric. By construction the
-//! Aitchison Fréchet mean is the *weighted arithmetic mean in log space,
-//! exponentiated and closed to the simplex* — equivalently the (weighted)
-//! geometric mean followed by closure. This is the foundational primitive for
-//! any fitted response distribution on the simplex, so it must be correct to
-//! floating-point precision, not merely "in the ballpark".
+//! ## Objective metric asserted (not "matches a peer tool")
+//! The Aitchison Fréchet mean of points `x_1..x_n` with weights `w_i` is, by
+//! definition, the unique minimizer over the open simplex of
 //!
-//! ## Comparators (best-in-class, fragmented field — see DISTINCTIVE-AXIS note)
-//!   * **R `compositions::acomp()` + `mean()`** — the standard Aitchison-geometry
-//!     toolkit. `mean(acomp(X))` *is* the unweighted Aitchison center, and the
-//!     weighted center is the closed log-space weighted mean (we compute that
-//!     directly from the documented definition so the weighting is unambiguous).
-//!   * **Python `scipy.stats.gmean`** — independent ground truth for the
-//!     unweighted geometric mean; closing it gives the Aitchison center.
+//!     F(mu) = sum_i w_i * d_A(x_i, mu)^2,
 //!
-//! There is *no* integrated compositional-GAM engine to assert gam's fitted
-//! predictive mean against end-to-end; the compositional-data ecosystem is a
-//! fragment of single-purpose tools. That fragmentation is itself the finding.
-//! We therefore (a) compare against the closest mature tools for the core
-//! primitive and (b) assert the INTRINSIC correctness properties the operation
-//! must satisfy: simplex closure (output sums to 1, strictly positive) and the
-//! defining identity that the unweighted mean equals the uniform-weighted mean.
+//! where `d_A` is the Aitchison distance (Euclidean distance between centered
+//! log-ratio / clr coordinates). We assert gam's output is that minimizer via
+//! three OBJECTIVE quality criteria, computed on gam's OWN output:
+//!
+//!   1. **First-order optimality (stationarity).** In clr coordinates the
+//!      gradient of `F` is `2 * sum_i w_i (clr(mu) - clr(x_i))`. At the true
+//!      barycenter this is exactly zero. We assert `||grad F(clr(gam_mean))||`
+//!      is at round-off (<= 1e-10). This is the defining axiom of a Fréchet mean
+//!      and is a pure intrinsic property of gam's result.
+//!   2. **Global optimality vs. mature baselines (match-or-beat).** We also fit
+//!      the barycenter with R `compositions::mean(acomp())` and Python
+//!      `scipy.stats.gmean`, evaluate the SAME objective `F` at each, and assert
+//!      `F(gam) <= F(reference) + tol`. gam must do as-well-or-better at the
+//!      objective it claims to optimize; the mature tools are demoted to
+//!      baselines-to-match-or-beat on that objective, never the pass criterion.
+//!   3. **Ground-truth recovery (EXCEPTION: exact closed form).** The Aitchison
+//!      barycenter has a known closed form — the closed weighted geometric mean.
+//!      We compute it directly in-test (exact ground truth) and assert gam
+//!      recovers it to floating-point precision. scipy.stats.gmean is an
+//!      independent ground-truth confirmation for the unweighted case.
+//!
+//! Plus the intrinsic simplex constraints (closure: rows sum to 1, strictly
+//! positive) and the uniform-weight invariance of the weighted barycenter.
+//!
+//! The reference tools therefore remain — but only as (a) baselines we must
+//! match-or-beat on the objective `F`, and (b) an independent recomputation of
+//! the exact closed form. The pass/fail criterion is gam's own optimality, not
+//! agreement with a peer fit.
 //!
 //! ## Data
-//! Identical data is fed to all three engines. We generate, with a fixed seed,
-//! 100 Dirichlet(alpha = [1,1,1,1]) draws over 4 components (Dirichlet =
+//! Identical data is fed to gam and the baselines. We generate, with a fixed
+//! seed, 100 Dirichlet(alpha = [1,1,1,1]) draws over 4 components (Dirichlet =
 //! normalized independent Gamma(1,1) variates) and a fixed Exp(1) weight vector.
-//! The exact composition columns and weights are handed verbatim to gam, R, and
-//! Python.
 
 use gam::geometry::simplex::simplex_frechet_mean;
-use gam::test_support::reference::{Column, max_abs_diff, relative_l2, run_python, run_r};
+use gam::test_support::reference::{Column, relative_l2, run_python, run_r};
 use ndarray::{Array2, ArrayView1};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Exp, Gamma};
 
+/// Centered-log-ratio coordinates of a strictly-positive composition row.
+/// `clr(p)_k = ln p_k - mean_j ln p_j`. Aitchison distance is the Euclidean
+/// distance between clr coordinates, so the barycenter objective is a plain
+/// least-squares problem in clr space.
+fn clr(p: &[f64]) -> Vec<f64> {
+    let d = p.len();
+    let log: Vec<f64> = p.iter().map(|v| v.ln()).collect();
+    let mean = log.iter().sum::<f64>() / d as f64;
+    log.iter().map(|l| l - mean).collect()
+}
+
+/// Weighted Fréchet objective `F(mu) = sum_i w_i * ||clr(x_i) - clr(mu)||^2`
+/// evaluated on already-closed rows `points` (N x D) with normalized weights.
+fn frechet_objective(points: &Array2<f64>, weights: &[f64], mu: &[f64]) -> f64 {
+    let (n, d) = points.dim();
+    let clr_mu = clr(mu);
+    let mut f = 0.0_f64;
+    for i in 0..n {
+        let row: Vec<f64> = (0..d).map(|c| points[[i, c]]).collect();
+        let clr_x = clr(&row);
+        let sq: f64 = (0..d).map(|k| (clr_x[k] - clr_mu[k]).powi(2)).sum();
+        f += weights[i] * sq;
+    }
+    f
+}
+
+/// Gradient L2-norm of `F` w.r.t. clr(mu): `grad = 2 * sum_i w_i (clr(mu) -
+/// clr(x_i))`. Zero exactly at the barycenter (clr(mu) = weighted mean of the
+/// clr(x_i)). Returns `||grad||_2`.
+fn frechet_gradient_norm(points: &Array2<f64>, weights: &[f64], mu: &[f64]) -> f64 {
+    let (n, d) = points.dim();
+    let clr_mu = clr(mu);
+    let mut grad = vec![0.0_f64; d];
+    for i in 0..n {
+        let row: Vec<f64> = (0..d).map(|c| points[[i, c]]).collect();
+        let clr_x = clr(&row);
+        for k in 0..d {
+            grad[k] += weights[i] * (clr_mu[k] - clr_x[k]);
+        }
+    }
+    let g2: f64 = grad.iter().map(|g| (2.0 * g).powi(2)).sum();
+    g2.sqrt()
+}
+
+/// Exact closed-form Aitchison barycenter: closed weighted geometric mean.
+/// `mu_k proportional to exp(sum_i w_i ln x_ik)`, closed to the simplex. This is
+/// the analytic ground truth for the minimizer of `F`.
+fn closed_weighted_geometric_mean(points: &Array2<f64>, weights: &[f64]) -> Vec<f64> {
+    let (n, d) = points.dim();
+    let mut log_mean = vec![0.0_f64; d];
+    for i in 0..n {
+        for k in 0..d {
+            log_mean[k] += weights[i] * points[[i, k]].ln();
+        }
+    }
+    let mx = log_mean.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let mut out: Vec<f64> = log_mean.iter().map(|l| (l - mx).exp()).collect();
+    let s: f64 = out.iter().sum();
+    for v in out.iter_mut() {
+        *v /= s;
+    }
+    out
+}
+
 #[test]
-fn frechet_mean_matches_compositions_and_scipy() {
+fn frechet_mean_is_the_aitchison_barycenter() {
     // ---- generate identical compositional data (seeded, reproducible) -------
     const N: usize = 100;
     const D: usize = 4;
@@ -68,6 +140,9 @@ fn frechet_mean_matches_compositions_and_scipy() {
 
     // A single fixed non-uniform weight vector drawn from Exp(1).
     let weights: Vec<f64> = (0..N).map(|_| exp.sample(&mut rng)).collect();
+    let wsum: f64 = weights.iter().sum();
+    let weights_norm: Vec<f64> = weights.iter().map(|w| w / wsum).collect();
+    let uniform_norm = vec![1.0_f64 / N as f64; N];
 
     // Column-major flattening for the reference engines (one column per part).
     let part_cols: Vec<Vec<f64>> = (0..D)
@@ -83,7 +158,7 @@ fn frechet_mean_matches_compositions_and_scipy() {
     assert_eq!(gam_unweighted.len(), D);
     assert_eq!(gam_weighted.len(), D);
 
-    // ---- INTRINSIC property 1: simplex closure (sum = 1, strictly > 0) ------
+    // ---- INTRINSIC property: simplex closure (sum = 1, strictly > 0) --------
     for (label, m) in [("unweighted", &gam_unweighted), ("weighted", &gam_weighted)] {
         let s: f64 = m.iter().sum();
         assert!(
@@ -98,12 +173,41 @@ fn frechet_mean_matches_compositions_and_scipy() {
         }
     }
 
-    // ---- INTRINSIC property 2: unweighted == uniform-weighted (1e-10) -------
-    // The Fréchet mean with all weights equal must coincide with the no-weights
-    // path; this is the defining invariance of the weighted barycenter.
-    let uniform = vec![1.0_f64 / N as f64; N];
+    // ---- OBJECTIVE 1: first-order optimality of gam's own output -----------
+    // grad F at the barycenter is exactly zero; we assert it is at round-off.
+    let grad_unw = frechet_gradient_norm(&points, &uniform_norm, &gam_unweighted);
+    let grad_w = frechet_gradient_norm(&points, &weights_norm, &gam_weighted);
+    eprintln!("simplex Fréchet stationarity: ||grad F||(unweighted)={grad_unw:.3e} (weighted)={grad_w:.3e}");
+    assert!(
+        grad_unw < 1e-10,
+        "gam unweighted mean is not a stationary point of the Aitchison Fréchet objective: ||grad F||={grad_unw:.3e}"
+    );
+    assert!(
+        grad_w < 1e-10,
+        "gam weighted mean is not a stationary point of the Aitchison Fréchet objective: ||grad F||={grad_w:.3e}"
+    );
+
+    // ---- OBJECTIVE 3 (ground truth, exact closed form): truth recovery ------
+    // The barycenter equals the closed weighted geometric mean exactly.
+    let truth_unweighted = closed_weighted_geometric_mean(&points, &uniform_norm);
+    let truth_weighted = closed_weighted_geometric_mean(&points, &weights_norm);
+    let truth_unw_rel = relative_l2(&gam_unweighted, &truth_unweighted);
+    let truth_w_rel = relative_l2(&gam_weighted, &truth_weighted);
+    eprintln!(
+        "simplex Fréchet truth-recovery rel_l2: unweighted={truth_unw_rel:.3e} weighted={truth_w_rel:.3e}"
+    );
+    assert!(
+        truth_unw_rel < 1e-12,
+        "gam unweighted mean must equal the exact closed weighted geometric mean (ground truth): rel_l2={truth_unw_rel:.3e}"
+    );
+    assert!(
+        truth_w_rel < 1e-12,
+        "gam weighted mean must equal the exact closed weighted geometric mean (ground truth): rel_l2={truth_w_rel:.3e}"
+    );
+
+    // ---- INTRINSIC: unweighted == uniform-weighted (defining invariance) ----
     let gam_uniform =
-        simplex_frechet_mean(points.view(), Some(ArrayView1::from(uniform.as_slice())))
+        simplex_frechet_mean(points.view(), Some(ArrayView1::from(uniform_norm.as_slice())))
             .expect("uniform");
     let uniform_rel = relative_l2(&gam_uniform, &gam_unweighted);
     eprintln!("simplex Fréchet: unweighted-vs-uniform rel_l2={uniform_rel:.3e}");
@@ -112,7 +216,7 @@ fn frechet_mean_matches_compositions_and_scipy() {
         "unweighted mean must equal uniform-weighted mean: rel_l2={uniform_rel:.3e}"
     );
 
-    // ---- reference: R compositions::acomp() + log-space weighted mean -------
+    // ---- baselines: R compositions::acomp() + log-space weighted mean -------
     let mut r_columns: Vec<Column<'_>> = (0..D)
         .map(|c| Column::new(part_name(c), &part_cols[c]))
         .collect();
@@ -123,15 +227,11 @@ fn frechet_mean_matches_compositions_and_scipy() {
         suppressPackageStartupMessages(library(compositions))
         X <- as.matrix(df[, c("p0","p1","p2","p3")])
         ac <- acomp(X)
-        # Unweighted Aitchison centre: mean.acomp == closed geometric mean.
         mu <- as.numeric(mean(ac))
         emit("r_unweighted", mu)
-        # Weighted Aitchison centre, by definition: closed exp of the weighted
-        # mean of the log-composition. acomp already closes rows; logs of the
-        # closed parts give the clr-up-to-constant coordinates.
         w <- df$w / sum(df$w)
-        L <- log(as.matrix(ac))                       # n x D, row-closed parts
-        ml <- as.numeric(colSums(L * w))              # weighted mean in log space
+        L <- log(as.matrix(ac))
+        ml <- as.numeric(colSums(L * w))
         wmu <- exp(ml - max(ml)); wmu <- wmu / sum(wmu)
         emit("r_weighted", wmu)
         "#,
@@ -141,7 +241,7 @@ fn frechet_mean_matches_compositions_and_scipy() {
     assert_eq!(r_unweighted.len(), D, "R unweighted mean length");
     assert_eq!(r_weighted.len(), D, "R weighted mean length");
 
-    // ---- reference: scipy.stats.gmean (unweighted ground truth) -------------
+    // ---- baseline: scipy.stats.gmean (unweighted) ---------------------------
     let py_columns: Vec<Column<'_>> = (0..D)
         .map(|c| Column::new(part_name(c), &part_cols[c]))
         .collect();
@@ -150,48 +250,53 @@ fn frechet_mean_matches_compositions_and_scipy() {
         r#"
 from scipy.stats import gmean
 X = np.column_stack([df["p0"], df["p1"], df["p2"], df["p3"]])
-g = gmean(X, axis=0)          # per-component geometric mean
-g = g / g.sum()               # closure to the simplex
+g = gmean(X, axis=0)
+g = g / g.sum()
 emit("py_unweighted", g)
         "#,
     );
     let py_unweighted = py.vector("py_unweighted");
     assert_eq!(py_unweighted.len(), D, "scipy unweighted mean length");
 
-    // ---- compare ------------------------------------------------------------
+    // ---- OBJECTIVE 2: match-or-beat the baselines on the objective F --------
+    // Evaluate the SAME Fréchet objective at gam's and each baseline's output;
+    // gam must achieve a value no larger (modulo round-off). This is the true
+    // "as-good-or-better" quality claim, not agreement-with-a-peer.
+    let f_gam_unw = frechet_objective(&points, &uniform_norm, &gam_unweighted);
+    let f_gam_w = frechet_objective(&points, &weights_norm, &gam_weighted);
+    let f_r_unw = frechet_objective(&points, &uniform_norm, r_unweighted);
+    let f_r_w = frechet_objective(&points, &weights_norm, r_weighted);
+    let f_py_unw = frechet_objective(&points, &uniform_norm, py_unweighted);
+
+    // Context only: how closely the baselines reproduce gam's barycenter.
     let rel_unw_r = relative_l2(&gam_unweighted, r_unweighted);
     let rel_unw_py = relative_l2(&gam_unweighted, py_unweighted);
     let rel_w_r = relative_l2(&gam_weighted, r_weighted);
-    let max_unw_r = max_abs_diff(&gam_unweighted, r_unweighted);
-    let max_unw_py = max_abs_diff(&gam_unweighted, py_unweighted);
-    let max_w_r = max_abs_diff(&gam_weighted, r_weighted);
-
     eprintln!(
-        "simplex Fréchet (n={N}, d={D}): \
-         unweighted rel_l2 vs compositions={rel_unw_r:.3e} vs scipy={rel_unw_py:.3e}; \
-         weighted rel_l2 vs compositions={rel_w_r:.3e}; \
-         max_abs unweighted(R)={max_unw_r:.3e} unweighted(scipy)={max_unw_py:.3e} \
-         weighted(R)={max_w_r:.3e}"
+        "simplex Fréchet objective F (lower=better): \
+         gam_unw={f_gam_unw:.6e} R_unw={f_r_unw:.6e} scipy_unw={f_py_unw:.6e}; \
+         gam_w={f_gam_w:.6e} R_w={f_r_w:.6e}"
     );
-    eprintln!("gam unweighted = {gam_unweighted:?}");
-    eprintln!("gam weighted   = {gam_weighted:?}");
+    eprintln!(
+        "simplex Fréchet baseline rel_l2 (context only): \
+         unweighted vs R={rel_unw_r:.3e} vs scipy={rel_unw_py:.3e}; weighted vs R={rel_w_r:.3e}"
+    );
 
-    // The three implementations evaluate the *same closed-form* expression
-    // (closed weighted/uniform geometric mean) on byte-identical data, so they
-    // must agree to floating-point round-off. 1e-10 leaves headroom for the
-    // log/exp summation order differing across BLAS/R/numpy yet would catch any
-    // genuine formula or weighting error.
+    // tol absorbs summation-order round-off in F across BLAS/R/numpy while still
+    // catching any genuine sub-optimality of gam relative to the baselines.
+    let tol = 1e-9 * f_gam_unw.max(1.0);
     assert!(
-        rel_unw_r < 1e-10,
-        "gam unweighted Fréchet mean diverges from compositions::mean(acomp): rel_l2={rel_unw_r:.3e}"
+        f_gam_unw <= f_r_unw + tol,
+        "gam unweighted mean must be at-least-as-good as compositions on the Aitchison objective: F(gam)={f_gam_unw:.6e} > F(R)={f_r_unw:.6e}"
     );
     assert!(
-        rel_unw_py < 1e-10,
-        "gam unweighted Fréchet mean diverges from scipy.stats.gmean: rel_l2={rel_unw_py:.3e}"
+        f_gam_unw <= f_py_unw + tol,
+        "gam unweighted mean must be at-least-as-good as scipy.stats.gmean on the Aitchison objective: F(gam)={f_gam_unw:.6e} > F(scipy)={f_py_unw:.6e}"
     );
+    let tol_w = 1e-9 * f_gam_w.max(1.0);
     assert!(
-        rel_w_r < 1e-10,
-        "gam weighted Fréchet mean diverges from Aitchison log-space weighted mean: rel_l2={rel_w_r:.3e}"
+        f_gam_w <= f_r_w + tol_w,
+        "gam weighted mean must be at-least-as-good as the Aitchison log-space weighted mean baseline: F(gam)={f_gam_w:.6e} > F(R)={f_r_w:.6e}"
     );
 }
 

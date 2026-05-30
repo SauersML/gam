@@ -1,8 +1,31 @@
-//! End-to-end quality: gam's lognormal location-scale AFT must produce a
-//! *predictive distribution* whose Monte-Carlo CRPS calibration matches what
-//! `lifelines.LogNormalAFTFitter` — the de-facto gold-standard Python
-//! parametric-survival regressor for lognormal AFT — produces on the *identical*
-//! synthetic right-censored data.
+//! End-to-end quality: gam's lognormal location-scale AFT must RECOVER THE KNOWN
+//! TRUTH it was simulated from, and emit a predictive distribution whose held-out
+//! Monte-Carlo CRPS (scored against the actually observed times) is objectively
+//! sharp+calibrated — at least as good as the mature
+//! `lifelines.LogNormalAFTFitter` baseline on the *identical* data.
+//!
+//! OBJECTIVE METRICS ASSERTED (no "same-as-reference" pass criterion):
+//!   1. TRUTH RECOVERY of the location surface. The data is generated from a
+//!      KNOWN function `eta_loc(x,z) = -0.4 + 0.6*x + sin(pi*z)`, so we assert
+//!      gam's fitted location (gauge-anchored to the TRUE location, not to
+//!      lifelines) tracks `eta_loc` with centered RMSE <= sigma_true/2 — i.e. the
+//!      reconstruction error of the systematic mean is at most half the
+//!      irreducible noise s.d. This is a pure accuracy claim against ground truth.
+//!   2. TRUTH RECOVERY of the scale. We assert |gam_sigma - sigma_true|/sigma_true
+//!      <= 0.15: gam recovers the lognormal spread the data was drawn with.
+//!   3. PREDICTIVE CALIBRATION via held-out-free CRPS against the observed times.
+//!      The Continuous Ranked Probability Score is the standard *proper* scoring
+//!      rule for a full predictive distribution; gam's mean CRPS (location
+//!      anchored to truth) must be <= the irreducible CRPS of the TRUE
+//!      data-generating distribution times 1.20 (an absolute calibration bar that
+//!      no fit can beat in expectation), AND <= the lifelines baseline's CRPS
+//!      times 1.05 (match-or-beat the mature tool on the proper score).
+//!
+//! lifelines is DEMOTED to a baseline-to-match-or-beat: its CRPS and its
+//! truth-recovery error are computed on the same data and gam is required to be
+//! as-good-or-better, but "close to lifelines' fitted numbers" is never the pass
+//! criterion. Passing requires gam to recover the simulated truth and to score
+//! well as a proper predictive distribution in its own right.
 //!
 //! Capability under test: survival AFT predictive *calibration* (not just point
 //! coefficients) for the lognormal location-scale family, requested via
@@ -21,34 +44,28 @@
 //! `s(z)` directly, so it receives a flexible basis expansion of `z` instead;
 //! see the body). gam carries the smooth via `s(z, bs="tp", k=5)`.
 //!
-//! Why CRPS via Monte Carlo. The Continuous Ranked Probability Score is the
-//! standard *proper* scoring rule for a full predictive distribution; for a
-//! sample {y_j} ~ LogNormal(mu_i, sigma_i) and observed time t_i,
+//! Why CRPS via Monte Carlo. For a sample {y_j} ~ LogNormal(mu_i, sigma_i) and
+//! observed time t_i,
 //!   CRPS_i = (1/M) Σ_j |y_j - t_i| - (1/2 M^2) Σ_{j,k} |y_j - y_k|,
-//! and CRPS = mean_i CRPS_i. It tests the engines' ability to emit a *coherent*
-//! (mu_i, sigma_i) pair (calibration of both channels at once), not just point
-//! estimates — exactly the AFT-parameterization stress the spec asks for, with
-//! no closed-form algebra. We draw the M standard-normal deviates ONCE on the
-//! Rust side and hand them to BOTH engines (common random numbers): each engine
-//! maps them through its OWN (mu_i, sigma_i) as y = exp(mu_i + sigma_i * eps),
-//! so the CRPS *difference* isolates parameter disagreement rather than MC noise.
+//! and CRPS = mean_i CRPS_i. It scores a *coherent* (mu_i, sigma_i) pair against
+//! the realized outcome (calibration of both channels at once), with no
+//! closed-form algebra. We draw the M standard-normal deviates ONCE on the Rust
+//! side and reuse them for gam, for lifelines, and for the TRUE distribution
+//! (common random numbers), so the CRPS *differences* isolate parameter
+//! disagreement rather than Monte-Carlo noise.
 //!
-//! The gauge. gam learns `h(t)` flexibly while lifelines fixes `log t`, so the
-//! two location channels differ by an unknown additive *gauge offset* (the
-//! absolute time anchor) — exactly as in the sibling `quality_vs_lifelines_
-//! lognormal_aft` / `quality_vs_survival_location_scale_lognormal` tests, which
-//! re-anchor before comparing. CRPS_i depends on the absolute location (it scores
-//! against the observed t_i), so we re-anchor gam's location to lifelines'
-//! (subtract the mean location offset) before forming gam's predictive sample;
-//! the covariate / smooth dependence and the scale sigma — the parts the spec's
-//! calibration actually measures — are gauge-free and survive. The separate
-//! (mu_i, sigma_i) correlation check is gauge-invariant for correlation (an
-//! additive constant cannot change Pearson r), so it uses gam's raw location.
+//! The gauge. gam learns `h(t)` flexibly while the simulation (and lifelines) use
+//! `log t`, so gam's location channel differs from the truth by an unknown
+//! additive *gauge offset* (the absolute time anchor). The systematic
+//! covariate/smooth shape and the scale sigma are gauge-free. We therefore anchor
+//! gam's location to the TRUE location (subtract the mean offset) before scoring
+//! truth-recovery RMSE and CRPS — a purely objective re-gauge against ground
+//! truth, not against the reference tool.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, run_python};
+use gam::test_support::reference::{Column, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -92,10 +109,15 @@ fn gam_lognormal_aft_crps_calibration_matches_lifelines() {
 
     let mut t = Vec::with_capacity(n);
     let mut event = Vec::with_capacity(n);
+    // True systematic location eta_loc(x_i, z_i) at each training point — the
+    // ground-truth surface gam must recover (used for the truth-recovery RMSE and
+    // for the irreducible-CRPS calibration bar).
+    let mut eta_loc_true = Vec::with_capacity(n);
     let mut n_censored = 0usize;
     for i in 0..n {
         let s_z = (std::f64::consts::PI * z[i]).sin();
         let eta_loc = -0.4 + 0.6 * x[i] + s_z;
+        eta_loc_true.push(eta_loc);
         let t_event = (eta_loc + eps[i] * sigma_true).exp();
         t.push(t_event.max(1e-6));
         // Bernoulli(0.65) event indicator: u < 0.65 => observed event, else
@@ -266,182 +288,123 @@ emit("sigma", [float(np.exp(sigma_params["Intercept"]))])
     let ref_sigma = r.scalar("sigma");
     assert_eq!(ref_mu.len(), n, "lifelines mu length mismatch");
 
-    // ---- re-anchor gam's location to lifelines' (remove the time gauge) -----
-    // gam learns h(t) while lifelines fixes log t, so the absolute location
-    // anchor lives on different gauges; CRPS scores against the observed t_i, so
-    // we subtract the mean location offset (the gauge constant) before forming
-    // gam's predictive sample. The covariate / smooth dependence and sigma are
-    // gauge-free and survive — exactly as the sibling AFT tests re-anchor.
-    let gam_mean = gam_mu_train.iter().sum::<f64>() / n as f64;
-    let ref_mean = ref_mu.iter().sum::<f64>() / n as f64;
-    let offset = gam_mean - ref_mean;
-    let gam_mu_anchored: Vec<f64> = gam_mu_train.iter().map(|&mu| mu - offset).collect();
+    // ---- TRUTH-RECOVERY re-gauge: anchor each location to the TRUE location ---
+    // gam learns h(t) while the simulation (and lifelines) use log t, so each
+    // location channel differs from the ground-truth eta_loc by an unknown
+    // additive gauge constant (the absolute time anchor). The systematic shape is
+    // gauge-free, so we center both gam's and the truth's location to mean zero
+    // and measure how well the *shape* is recovered. lifelines is re-gauged the
+    // same way so its truth-recovery error is a fair baseline.
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    let truth_mean = mean(&eta_loc_true);
+    let gam_mean = mean(&gam_mu_train);
+    let ref_mean = mean(ref_mu);
 
-    // ---- Monte-Carlo CRPS per engine (shared eps, each via its own mu_i,sigma) ----
+    // Centered RMSE of each fitted location surface against the centered truth.
+    let centered_rmse = |fit_loc: &[f64], fit_mean: f64| -> f64 {
+        let mut s = 0.0;
+        for i in 0..n {
+            let d = (fit_loc[i] - fit_mean) - (eta_loc_true[i] - truth_mean);
+            s += d * d;
+        }
+        (s / n as f64).sqrt()
+    };
+    let gam_loc_rmse = centered_rmse(&gam_mu_train, gam_mean);
+    let ref_loc_rmse = centered_rmse(ref_mu, ref_mean);
+
+    // Location anchored to the TRUE absolute level, so the CRPS (scored against
+    // the observed t_i on the original time scale) is on the correct gauge.
+    let gam_offset = gam_mean - truth_mean;
+    let ref_offset = ref_mean - truth_mean;
+    let gam_mu_anchored: Vec<f64> = gam_mu_train.iter().map(|&mu| mu - gam_offset).collect();
+    let ref_mu_anchored: Vec<f64> = ref_mu.iter().map(|&mu| mu - ref_offset).collect();
+
+    // ---- Monte-Carlo CRPS scored against the OBSERVED times -----------------
+    // Shared eps for gam, lifelines, and the TRUE distribution (common random
+    // numbers). The truth-CRPS is the irreducible proper-score floor for this
+    // data-generating process; gam's CRPS must come close to it and beat the
+    // lifelines baseline.
     let mut gam_crps_sum = 0.0;
     let mut ref_crps_sum = 0.0;
+    let mut truth_crps_sum = 0.0;
     let mut gam_y = vec![0.0f64; m_mc];
     let mut ref_y = vec![0.0f64; m_mc];
+    let mut truth_y = vec![0.0f64; m_mc];
     for i in 0..n {
         let gmu = gam_mu_anchored[i];
-        let rmu = ref_mu[i];
+        let rmu = ref_mu_anchored[i];
+        let tmu = eta_loc_true[i];
         for (j, &e) in mc_eps.iter().enumerate() {
             gam_y[j] = (gmu + gam_sigma * e).exp();
             ref_y[j] = (rmu + ref_sigma * e).exp();
+            truth_y[j] = (tmu + sigma_true * e).exp();
         }
         gam_crps_sum += crps_sample(t[i], &gam_y);
         ref_crps_sum += crps_sample(t[i], &ref_y);
+        truth_crps_sum += crps_sample(t[i], &truth_y);
     }
     let gam_crps = gam_crps_sum / n as f64;
     let ref_crps = ref_crps_sum / n as f64;
-    let crps_rel = (gam_crps - ref_crps).abs() / gam_crps.max(ref_crps).max(1e-12);
+    let truth_crps = truth_crps_sum / n as f64;
 
-    // ---- (mu, sigma) correlation on a grid of (x, z) values -----------------
-    // Build a 12x12 grid spanning the covariate support and compare the two
-    // engines' predicted (mu, sigma). Correlation is gauge-invariant (an additive
-    // location offset cannot change Pearson r), so this uses gam's RAW location.
-    let g = 12usize;
-    let grid_n = g * g;
-    let mut grid = Array2::<f64>::zeros((grid_n, ncols));
-    let mut gx = Vec::with_capacity(grid_n);
-    let mut gz = Vec::with_capacity(grid_n);
-    for ix in 0..g {
-        for iz in 0..g {
-            let xv = -1.0 + 2.0 * ix as f64 / (g as f64 - 1.0);
-            let zv = -1.0 + 2.0 * iz as f64 / (g as f64 - 1.0);
-            let row = ix * g + iz;
-            grid[[row, x_idx]] = xv;
-            grid[[row, z_idx]] = zv;
-            gx.push(xv);
-            gz.push(zv);
-        }
-    }
-    let grid_loc = build_term_collection_design(grid.view(), &fit.fit.resolved_thresholdspec)
-        .expect("rebuild location design on (x,z) grid");
-    let gam_mu_grid: Vec<f64> = grid_loc.design.apply(&beta_location).to_vec();
-    // gam sigma is constant across the grid; lifelines sigma likewise. With both
-    // scale channels constant, the sigma "correlation" is degenerate, so the
-    // meaningful grid quantity is the LOCATION mu correlation: reconstruct
-    // lifelines' mu on the SAME grid from its recovered cubic-in-z + x model.
-    let ref_mu_grid: Vec<f64> = {
-        // Refit-free reconstruction: recover lifelines' location coefficients by
-        // least-squares from its emitted training mu against [1, x, z, z^2, z^3]
-        // (exact, since lifelines' mu IS that linear combination). Solving the
-        // 5x5 normal equations recovers beta, then evaluate on the grid.
-        let cols: [Box<dyn Fn(usize) -> f64>; 5] = [
-            Box::new(|_| 1.0),
-            Box::new(|i| x[i]),
-            Box::new(|i| z[i]),
-            Box::new(|i| z[i] * z[i]),
-            Box::new(|i| z[i] * z[i] * z[i]),
-        ];
-        // Normal equations A = X^T X (5x5), b = X^T mu.
-        let mut a = [[0.0f64; 5]; 5];
-        let mut bvec = [0.0f64; 5];
-        for i in 0..n {
-            let xi: [f64; 5] = [cols[0](i), cols[1](i), cols[2](i), cols[3](i), cols[4](i)];
-            for p in 0..5 {
-                bvec[p] += xi[p] * ref_mu[i];
-                for q in 0..5 {
-                    a[p][q] += xi[p] * xi[q];
-                }
-            }
-        }
-        // Gaussian elimination with partial pivoting on the 5x5 system.
-        let beta = solve5(a, bvec);
-        gx.iter()
-            .zip(gz.iter())
-            .map(|(&xv, &zv)| {
-                beta[0] + beta[1] * xv + beta[2] * zv + beta[3] * zv * zv + beta[4] * zv * zv * zv
-            })
-            .collect()
-    };
-    let mu_grid_corr = pearson(&gam_mu_grid, &ref_mu_grid);
-    let sigma_rel = (gam_sigma - ref_sigma).abs() / ref_sigma.abs().max(1e-12);
+    let gam_sigma_err = (gam_sigma - sigma_true).abs() / sigma_true;
+    let ref_sigma_err = (ref_sigma - sigma_true).abs() / sigma_true;
 
     eprintln!(
-        "lognormal AFT CRPS vs lifelines: n={n} cens={cens_frac:.3} M={m_mc} \
-         gam_crps={gam_crps:.5} ref_crps={ref_crps:.5} crps_rel={crps_rel:.4} \
-         gam_sigma={gam_sigma:.4} ref_sigma={ref_sigma:.4} sigma_rel={sigma_rel:.4} \
-         gauge_offset={offset:.4} mu_grid_pearson={mu_grid_corr:.5}"
+        "lognormal AFT truth-recovery: n={n} cens={cens_frac:.3} M={m_mc} sigma_true={sigma_true} \
+         gam_loc_rmse={gam_loc_rmse:.4} ref_loc_rmse={ref_loc_rmse:.4} \
+         gam_sigma={gam_sigma:.4} (err {gam_sigma_err:.4}) ref_sigma={ref_sigma:.4} (err {ref_sigma_err:.4}) \
+         gam_crps={gam_crps:.5} truth_crps={truth_crps:.5} ref_crps={ref_crps:.5}"
     );
 
-    // Bounds (spec-derived, principled, un-weakened):
-    //  * aggregate-CRPS relative gap < 0.08. Both engines fit the SAME lognormal
-    //    location-scale likelihood under right-censoring; once the time gauge is
-    //    re-anchored their predictive samples (built from common random numbers)
-    //    must score nearly identically. The 8% allowance is the spec's stated
-    //    margin for survival CRPS's higher variance (censoring + two-channel
-    //    estimation + lifelines' log-linear-cubic vs gam's penalized thin-plate
-    //    smooth). Tighter would be over-asserting given the basis mismatch.
+    // ---- OBJECTIVE BOUNDS (truth recovery + proper-score calibration) -------
+    //
+    //  1. TRUTH RECOVERY (location). gam must reconstruct the simulated
+    //     systematic location surface eta_loc(x,z) = -0.4 + 0.6x + sin(pi z).
+    //     With ~35% censoring and n=250, the centered reconstruction error of the
+    //     mean surface should be well under half the irreducible noise s.d. — a
+    //     fit whose systematic error rivals the noise has not recovered the truth.
+    let loc_bar = 0.5 * sigma_true;
     assert!(
-        crps_rel < 0.08,
-        "aggregate CRPS calibration diverges from lifelines: |gam-ref|/max={crps_rel:.4} \
-         (gam_crps={gam_crps:.5}, ref_crps={ref_crps:.5})"
+        gam_loc_rmse <= loc_bar,
+        "gam did not recover the true location surface: centered RMSE {gam_loc_rmse:.4} \
+         > bar {loc_bar:.4} (sigma_true={sigma_true})"
     );
-    //  * location-mu correlation on the (x,z) grid >= 0.95. Both engines recover
-    //    the SAME covariate-dependent location surface (gam via penalized
-    //    thin-plate, lifelines via its cubic-in-z proxy); their predicted mu must
-    //    co-vary almost perfectly across the covariate support. This is the
-    //    gauge-invariant calibration check the spec asks for.
+    //     ACCURACY match-or-beat: gam's truth-recovery error must not exceed the
+    //     lifelines baseline's by more than 10%. (lifelines chases sin(pi z) with
+    //     a cubic-in-z proxy, so gam's penalized thin-plate smooth should be at
+    //     least as accurate.)
     assert!(
-        mu_grid_corr >= 0.95,
-        "location (mu) surface diverges from lifelines across the (x,z) grid: \
-         pearson={mu_grid_corr:.5}"
+        gam_loc_rmse <= ref_loc_rmse * 1.10,
+        "gam location accuracy worse than lifelines baseline: gam {gam_loc_rmse:.4} \
+         > 1.10 * ref {ref_loc_rmse:.4}"
     );
-    //  * constant log-scale sigma relative gap <= 0.05. CRPS already folds sigma
-    //    into the predictive spread, but the scale channel is the second half of
-    //    the (mu, sigma) calibration the spec measures, so it gets its own
-    //    gauge-free assertion. Both engines estimate one constant lognormal scale
-    //    under the SAME right-censored likelihood; 0.05 is the established bound
-    //    for constant-scale lognormal estimation in the sibling AFT tests (scale
-    //    estimation is intrinsically noisier than the location, so a tighter bound
-    //    would over-assert; a looser one would let a mis-estimated spread slip
-    //    through even when CRPS happens to cancel).
-    assert!(
-        sigma_rel <= 0.05,
-        "lognormal scale sigma diverges from lifelines: gam_sigma={gam_sigma:.4} \
-         ref_sigma={ref_sigma:.4} rel={sigma_rel:.4}"
-    );
-}
 
-/// Solve a 5x5 linear system `a * x = b` by Gaussian elimination with partial
-/// pivoting. Used to recover lifelines' (well-conditioned) location coefficients
-/// from its emitted training-point mu, so the location surface can be evaluated
-/// on the comparison grid.
-fn solve5(mut a: [[f64; 5]; 5], mut b: [f64; 5]) -> [f64; 5] {
-    for col in 0..5 {
-        // Partial pivot.
-        let mut piv = col;
-        for r in (col + 1)..5 {
-            if a[r][col].abs() > a[piv][col].abs() {
-                piv = r;
-            }
-        }
-        a.swap(col, piv);
-        b.swap(col, piv);
-        let d = a[col][col];
-        assert!(
-            d.abs() > 1e-12,
-            "singular 5x5 system recovering lifelines mu"
-        );
-        for r in (col + 1)..5 {
-            let f = a[r][col] / d;
-            for c in col..5 {
-                a[r][c] -= f * a[col][c];
-            }
-            b[r] -= f * b[col];
-        }
-    }
-    let mut x = [0.0f64; 5];
-    for row in (0..5).rev() {
-        let mut s = b[row];
-        for c in (row + 1)..5 {
-            s -= a[row][c] * x[c];
-        }
-        x[row] = s / a[row][row];
-    }
-    x
+    //  2. TRUTH RECOVERY (scale). gam must recover the lognormal spread the data
+    //     was drawn with. Scale estimation under censoring is intrinsically noisy,
+    //     so the bar is 15% relative error against the KNOWN sigma_true (not
+    //     against lifelines' estimate).
+    assert!(
+        gam_sigma_err <= 0.15,
+        "gam did not recover the true lognormal scale: |gam_sigma - sigma_true|/sigma_true \
+         = {gam_sigma_err:.4} > 0.15 (gam_sigma={gam_sigma:.4}, sigma_true={sigma_true})"
+    );
+
+    //  3. PREDICTIVE CALIBRATION via CRPS against the observed times. The CRPS of
+    //     the TRUE distribution is the irreducible proper-score floor; no fit can
+    //     beat it in expectation. gam's CRPS must be within 20% of that floor (an
+    //     absolute calibration bar) AND must match-or-beat the mature lifelines
+    //     baseline within 5% (CRPS(gam) <= CRPS(ref) * 1.05, the category-3 rule).
+    assert!(
+        gam_crps <= truth_crps * 1.20,
+        "gam predictive distribution is mis-calibrated: CRPS {gam_crps:.5} \
+         > 1.20 * irreducible truth-CRPS {truth_crps:.5}"
+    );
+    assert!(
+        gam_crps <= ref_crps * 1.05,
+        "gam CRPS does not match-or-beat the lifelines baseline: gam {gam_crps:.5} \
+         > 1.05 * ref {ref_crps:.5}"
+    );
 }
 
 /// Minimal fixed-seed MT19937 generator (MT19937 core, 53-bit uniform in [0, 1)

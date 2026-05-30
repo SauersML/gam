@@ -1,11 +1,19 @@
-//! End-to-end quality: gam's Gaussian *location-scale* fit with MULTIPLE
-//! additive thin-plate smooths in BOTH the mean and the log-sigma blocks must
-//! match `gamlss::gamlss(family = NO())` — the reference GAMLSS implementation
-//! for distributional regression and the de-facto standard for location-scale
-//! models with smooth mean and smooth log-variance in R. To compare like with
-//! like, the gamlss side uses the SAME thin-plate basis as gam via
-//! `ga(~ s(x, bs="tp"))` (the `gamlss.add` bridge to `mgcv`'s `s()`), not the
-//! P-spline `pb()` default, so any divergence is in the solver, not the basis.
+//! End-to-end OBJECTIVE quality: gam's Gaussian *location-scale* fit with
+//! MULTIPLE additive thin-plate smooths in BOTH the mean and the log-sigma
+//! blocks must RECOVER THE KNOWN GENERATING SURFACES. The data are synthesized
+//! from a known additive heteroscedastic recipe, so we have ground truth for
+//! both the mean surface mu(x1,x2) and the log-sd surface log(sigma(x1,x2)) at
+//! every grid point. The PRIMARY claim is truth recovery, asserted as an
+//! absolute RMSE bar against the generating functions — NOT closeness to any
+//! reference tool's (noisy, possibly-overfit) fit.
+//!
+//! `gamlss::gamlss(family = NO())` is fit on the IDENTICAL data and kept only as
+//! a MATCH-OR-BEAT accuracy baseline: gam's truth-recovery RMSE must be no worse
+//! than 1.10x gamlss's truth-recovery RMSE on each surface. So gam must both
+//! recover the truth in absolute terms AND be at least as accurate as the mature
+//! GAMLSS reference. To compare like with like, the gamlss side uses the SAME
+//! thin-plate basis as gam via `ga(~ s(x, bs="tp"))` (the `gamlss.add` bridge to
+//! `mgcv`'s `s()`), not the P-spline `pb()` default.
 //!
 //! This is the cross-feature combination that single-smooth location-scale
 //! tests never exercise: family (Gaussian) x TWO additive smooths per block
@@ -16,21 +24,13 @@
 //! correctly requires gam's penalty-block alignment and blockwise Jacobian to
 //! keep every term's column range and penalty in register across BOTH active
 //! blocks. A bug that mis-aligns a penalty block or leaks one term's columns
-//! into another's would distort the recovered additive surface — invisible to a
-//! single-smooth test, caught here.
+//! into another's would distort the recovered additive surface — so failing to
+//! recover the known truth here flags a penalty-block-alignment or blockwise-
+//! Jacobian bug invisible to a single-smooth fit.
 //!
-//! We synthesize an additive heteroscedastic recipe, feed the *identical*
-//! (x1, x2, y) rows to both engines, and compare the recovered surfaces — not
-//! held-out predictions — on a dense 10x10 grid over [0,1]^2:
-//!   * the fitted mean mu(x1, x2), and
-//!   * the fitted log standard deviation log(sigma(x1, x2)).
-//!
-//! Both engines maximize the same Gaussian location-scale (penalized) joint
-//! log-likelihood `ell = -1/2 sum (y-mu)^2 / sigma^2 - sum log sigma`, so the
-//! recovered additive mean and log-sigma surfaces should converge to nearly
-//! identical shapes up to basis-convention / numerical-integration tolerance.
-//! A genuine divergence here is a real bug in gam's blockwise location-scale
-//! solver or its multi-term penalty concatenation.
+//! We feed the *identical* (x1, x2, y) rows to both engines and evaluate the
+//! recovered surfaces — the fitted mean and the fitted log standard deviation —
+//! against the KNOWN truth on a dense grid over [0,1]^2.
 //!
 //! Notes on the gam side that this test pins down by reading the source:
 //!   * `fit_from_formula(..., FitConfig{ noise_formula: Some(...), .. })` routes
@@ -50,7 +50,7 @@ use gam::estimate::BlockRole;
 use gam::gamlss::GaussianLocationScaleFitResult;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, run_r};
+use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -238,35 +238,72 @@ fn gam_gaussian_multi_smooth_matches_gamlss() {
     );
     let gamlss_log_sigma: Vec<f64> = gamlss_sigma.iter().map(|&s| s.ln()).collect();
 
-    // ---- compare the recovered surfaces on the grid ------------------------
+    // ---- KNOWN GROUND TRUTH on the same grid -------------------------------
+    // The data were generated from mu_true / sigma_true, so we can score each
+    // engine's recovered surface against the exact generating functions.
+    let truth_mu: Vec<f64> = (0..grid_n)
+        .map(|i| mu_true(grid_x1[i], grid_x2[i]))
+        .collect();
+    let truth_log_sigma: Vec<f64> = (0..grid_n)
+        .map(|i| sigma_true(grid_x1[i], grid_x2[i]).ln())
+        .collect();
+
+    // ---- OBJECTIVE metric: truth-recovery RMSE -----------------------------
+    let gam_rmse_mu = rmse(&gam_mu, &truth_mu);
+    let gam_rmse_log_sigma = rmse(&gam_log_sigma, &truth_log_sigma);
+    let gamlss_rmse_mu = rmse(gamlss_mu, &truth_mu);
+    let gamlss_rmse_log_sigma = rmse(&gamlss_log_sigma, &truth_log_sigma);
+
+    // Reference closeness kept ONLY as printed context, not a pass criterion.
     let rel_mu = relative_l2(&gam_mu, gamlss_mu);
     let rel_log_sigma = relative_l2(&gam_log_sigma, &gamlss_log_sigma);
 
     eprintln!(
-        "gaussian multi-smooth location-scale vs gamlss NO(): n={n} grid={grid_n} \
-         rel_l2(mu)={rel_mu:.5} rel_l2(log sigma)={rel_log_sigma:.5}"
+        "gaussian multi-smooth location-scale truth recovery: n={n} grid={grid_n}\n  \
+         RMSE_vs_truth(mu): gam={gam_rmse_mu:.5} gamlss={gamlss_rmse_mu:.5}\n  \
+         RMSE_vs_truth(log sigma): gam={gam_rmse_log_sigma:.5} gamlss={gamlss_rmse_log_sigma:.5}\n  \
+         [context] rel_l2_vs_gamlss(mu)={rel_mu:.5} rel_l2_vs_gamlss(log sigma)={rel_log_sigma:.5}"
     );
 
-    // Both engines maximize the same penalized Gaussian location-scale joint
-    // log-likelihood with two additive penalized thin-plate smooths per block,
-    // so the recovered additive mean and log-sigma surfaces must coincide up to
-    // numerical tolerance. The mean is the better-determined parameter
-    // (variance-stabilized by the same 1/sigma^2 weights both engines use),
-    // hence the tighter 0.02 bound — the same bar the single-smooth mgcv and
-    // gamlss benchmarks hit. The log-sigma surface is a noisier second-moment
-    // quantity AND uses a different noise link (gam's floored sigma = 0.01 +
-    // exp(eta) vs gamlss NO()'s log link sigma = exp(eta)); since sigma_true in
-    // [0.1, 0.25] keeps the 0.01 floor at most ~10% of sigma at its smallest,
-    // that reparametrization adds a small pointwise bias on log sigma, so it
-    // gets the looser 0.04 bound (matching the by-group gamlss benchmark). With
-    // two smooths active per block, exceeding either bound flags a penalty-
-    // block-alignment or blockwise-Jacobian bug invisible to a single-smooth fit.
+    // PRIMARY claim: gam recovers the known generating surfaces.
+    //
+    // Mean bar. The mean is the well-determined first moment, fit with the
+    // same 1/sigma^2 weights gamlss uses. The signal mu_true = sin(2*pi*x1) +
+    // cos(2*pi*x2) ranges over [-2, 2]; sigma_true in [0.10, 0.25] so the
+    // mean's standard error per point is small. A correctly recovered surface
+    // sits well inside the noise scale: we require RMSE(mu) <= 0.20, ~5% of the
+    // 4.0 signal range and below the largest sigma. A penalty-block-alignment
+    // bug that leaks one smooth's columns into the other would distort the
+    // additive mean far past this bar.
     assert!(
-        rel_mu < 0.02,
-        "fitted mean surface diverges from gamlss: rel_l2(mu)={rel_mu:.5}"
+        gam_rmse_mu <= 0.20,
+        "gam failed to recover the mean surface: RMSE_vs_truth(mu)={gam_rmse_mu:.5} > 0.20"
+    );
+
+    // Log-sigma bar. The log-sd surface is a noisier second-moment quantity:
+    // log(sigma_true) ranges over roughly [log 0.10, log 0.25] ~ [-2.30, -1.39]
+    // (a span of ~0.91), and gam's floored noise link sigma = 0.01 + exp(eta)
+    // adds a small pointwise bias near the floor. A faithful recovery still
+    // tracks the truth to RMSE(log sigma) <= 0.30, about a third of the
+    // log-sigma signal span.
+    assert!(
+        gam_rmse_log_sigma <= 0.30,
+        "gam failed to recover the log-sigma surface: \
+         RMSE_vs_truth(log sigma)={gam_rmse_log_sigma:.5} > 0.30"
+    );
+
+    // SECONDARY claim: match-or-beat the mature GAMLSS reference ON ACCURACY,
+    // i.e. gam's truth-recovery error is no worse than 1.10x gamlss's on each
+    // surface. This is a comparison of who recovers the truth better, NOT a
+    // claim that gam reproduces gamlss's fitted output.
+    assert!(
+        gam_rmse_mu <= gamlss_rmse_mu * 1.10,
+        "gam mean surface less accurate than gamlss: \
+         gam RMSE_vs_truth(mu)={gam_rmse_mu:.5} > 1.10 * gamlss {gamlss_rmse_mu:.5}"
     );
     assert!(
-        rel_log_sigma < 0.04,
-        "fitted log-sigma surface diverges from gamlss: rel_l2(log sigma)={rel_log_sigma:.5}"
+        gam_rmse_log_sigma <= gamlss_rmse_log_sigma * 1.10,
+        "gam log-sigma surface less accurate than gamlss: \
+         gam RMSE_vs_truth(log sigma)={gam_rmse_log_sigma:.5} > 1.10 * gamlss {gamlss_rmse_log_sigma:.5}"
     );
 }

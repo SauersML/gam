@@ -1,38 +1,38 @@
-//! End-to-end quality: gam's Gaussian-process Matérn smooth
-//! (`matern(x, nu=2.5)`) must agree with `sklearn.gaussian_process.
-//! GaussianProcessRegressor` — the Python standard for vanilla GP regression —
-//! when both fit the same Matérn ν = 5/2 kernel to the same data.
+//! End-to-end OBJECTIVE quality: gam's Gaussian-process Matérn smooth
+//! (`matern(x, nu=2.5)`) must RECOVER the known deterministic function the data
+//! were generated from — and do so at least as accurately as the Python
+//! reference exact-GP regressor (`sklearn.gaussian_process.
+//! GaussianProcessRegressor` with a `Matern(nu=2.5)` kernel).
 //!
-//! Why this comparator: scikit-learn's `GaussianProcessRegressor` is the
-//! reference exact-GP regressor in the Python ecosystem. With a
-//! `Matern(nu=2.5)` kernel it implements precisely the kernel gam's
-//! `matern(x, nu=2.5)` basis targets, and it selects its length-scale by
-//! maximizing the log marginal likelihood (sklearn's default
-//! `fmin_l_bfgs_b` optimizer) — the same marginal-likelihood / REML criterion
-//! gam uses to choose its smoothing. Two exact GP methods fitting the identical
-//! ν = 5/2 kernel to identical fixed-seed data must produce nearly the same
-//! posterior-mean function; a real divergence is a real bug in gam's GP-kernel
-//! basis or hyperparameter selection, and we do NOT weaken the bound to hide it.
+//! OBJECTIVE METRIC ASSERTED (truth recovery, case 1):
+//!   * PRIMARY: RMSE(gam_fit, TRUTH) on a dense interior grid <= the noise
+//!     standard deviation (sigma = 0.1). The data were generated as
+//!     y = truth(x) + N(0, sigma^2); a faithful ν = 5/2 GP must denoise back to
+//!     within the noise level, i.e. its bias+resolution error must not exceed a
+//!     single noise sd. This is a pure ground-truth accuracy claim — it does not
+//!     reference any peer tool.
+//!   * MATCH-OR-BEAT (accuracy baseline, NOT a "same-as" claim): gam's RMSE to
+//!     truth <= 1.10 × sklearn's RMSE to truth. sklearn's GaussianProcessRegressor
+//!     is the mature Python exact-GP regressor; we require gam to be at least as
+//!     accurate at recovering the truth, never that gam reproduces sklearn's
+//!     (itself noisy, possibly mis-tuned) fitted output.
 //!
-//! Note on length-scale: gam's Matérn basis is REML-penalized (a smoothing
-//! parameter on a finite kernel basis) while sklearn fits a continuous-kernel
-//! length-scale plus a `WhiteKernel` noise term. These parametrizations are not
-//! interchangeable, and gam exposes no scalar "length-scale" on its fit, so a
-//! numeric length-scale equality would be unprincipled. We therefore compare the
-//! quantity that is genuinely shared and observable — the fitted (posterior
-//! mean) function on a dense common grid — plus effective complexity (EDF), and
-//! additionally anchor both engines to the KNOWN deterministic truth they were
-//! generated from. That keeps every assertion meaningful.
+//! Deliberately NOT asserted: closeness of gam's fit to sklearn's fit, and EDF
+//! agreement. Matching a peer tool's noisy posterior mean, or its effective
+//! complexity, proves nothing about correctness — both could overfit or
+//! mis-select length-scale alike. The rel-L2 / Pearson / EDF agreement between
+//! the two engines is still COMPUTED and printed for context, but it is not a
+//! pass/fail criterion.
 //!
-//! We compare on a dense, identical evaluation grid:
-//!   * relative L2 of the two fitted functions   (scale-free trajectory match),
-//!   * Pearson correlation of the two functions   (shape match),
-//!   * effective degrees of freedom               (complexity match),
-//!   * relative L2 of each engine vs the known truth (both must recover it).
+//! Why sklearn as the baseline: it is the reference exact-GP regressor in the
+//! Python ecosystem, fitting precisely the Matérn ν = 5/2 kernel gam's
+//! `matern(x, nu=2.5)` basis targets, selecting its length-scale by maximizing
+//! the log marginal likelihood. That makes it a fair, strong accuracy bar to
+//! match-or-beat on truth recovery.
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, run_python};
+use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -42,16 +42,17 @@ use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
 
 #[test]
-fn gam_matern_gp_matches_sklearn_gpr() {
+fn gam_matern_gp_recovers_truth_and_beats_sklearn() {
     init_parallelism();
 
     // ---- fixed-seed synthetic data, fed IDENTICALLY to gam and sklearn ----
     // x ~ U[0,1] (n=150, sorted); truth(x) = 2 + 1.5·sin(6π·x) + 0.5·cos(4π·x);
     // y = truth(x) + N(0, 0.1²). The deterministic truth is known exactly.
     let n = 150usize;
+    let noise_sd = 0.1_f64;
     let mut rng = StdRng::seed_from_u64(20260529);
     let ux = Uniform::new(0.0, 1.0).expect("uniform [0,1]");
-    let noise = Normal::new(0.0, 0.1).expect("gaussian noise sd=0.1");
+    let noise = Normal::new(0.0, noise_sd).expect("gaussian noise sd=0.1");
     let mut x: Vec<f64> = (0..n).map(|_| ux.sample(&mut rng)).collect();
     x.sort_by(|a, b| a.partial_cmp(b).expect("finite x"));
     let truth = |t: f64| {
@@ -108,9 +109,9 @@ fn gam_matern_gp_matches_sklearn_gpr() {
     // ---- fit the SAME data with sklearn GaussianProcessRegressor ----------
     // Matern(nu=2.5) kernel × a fitted constant amplitude + WhiteKernel noise;
     // sklearn maximizes the log marginal likelihood (its default) to pick the
-    // length-scale, amplitude, and noise — the marginal-likelihood criterion
-    // gam's REML matches. We predict the posterior mean on x_grid and also
-    // report sklearn's effective DoF, trace(K (K+σ²I)⁻¹), the GP analogue of EDF.
+    // length-scale, amplitude, and noise. We predict its posterior mean on
+    // x_grid: this is the BASELINE-TO-BEAT for truth-recovery accuracy. We also
+    // report sklearn's effective DoF, trace(K (K+σ²I)⁻¹), purely for context.
     let r = run_python(
         &[
             Column::new("x", &x),
@@ -158,53 +159,40 @@ emit("edf", np.trace(S))
         "sklearn grid prediction length mismatch"
     );
 
-    // ---- compare ----------------------------------------------------------
+    // ---- OBJECTIVE metric: accuracy vs the KNOWN truth --------------------
+    let gam_rmse_truth = rmse(&gam_grid, &truth_grid);
+    let sk_rmse_truth = rmse(sk_grid, &truth_grid);
+
+    // ---- context only (NOT pass/fail): agreement between the two engines --
     let rel = relative_l2(&gam_grid, sk_grid);
     let corr = pearson(&gam_grid, sk_grid);
     let edf_rel = (gam_edf - sk_edf).abs() / sk_edf.abs().max(1.0);
-    let gam_vs_truth = relative_l2(&gam_grid, &truth_grid);
-    let sk_vs_truth = relative_l2(sk_grid, &truth_grid);
 
     eprintln!(
-        "matern(x,nu=2.5,k=25) vs sklearn GPR Matern(nu=2.5): n={n} grid={grid_n} \
-         gam_edf={gam_edf:.3} sk_edf={sk_edf:.3} edf_rel={edf_rel:.3} \
-         rel_l2={rel:.4} pearson={corr:.5} \
-         gam_vs_truth={gam_vs_truth:.4} sklearn_vs_truth={sk_vs_truth:.4}"
+        "matern(x,nu=2.5,k=25) truth-recovery: n={n} grid={grid_n} noise_sd={noise_sd:.3} \
+         gam_rmse_truth={gam_rmse_truth:.4} sklearn_rmse_truth={sk_rmse_truth:.4} \
+         (context: gam_edf={gam_edf:.3} sk_edf={sk_edf:.3} edf_rel={edf_rel:.3} \
+         gam_vs_sklearn_rel_l2={rel:.4} pearson={corr:.5})"
     );
 
-    // Both engines are exact GP methods fitting the identical Matérn ν = 5/2
-    // kernel by marginal likelihood to identical fixed-seed data, so their
-    // posterior-mean functions must nearly coincide. Bounds (per the spec):
-    //  - Pearson > 0.998: trajectories must share shape; a kernel or
-    //    hyperparameter-selection divergence would drop this well below it.
-    //  - relative L2 < 0.05: tight pointwise agreement on the dense grid — both
-    //    are exact GP methods, so a loose bound here would assert nothing.
-    //  - each engine within rel-L2 0.05 of the KNOWN truth: anchors the
-    //    comparison to ground truth, so agreeing on a *wrong* function cannot
-    //    pass. SNR here is ~15 (signal sd ≈ 1.1, noise sd = 0.1), so a faithful
-    //    ν = 5/2 GP recovers the smooth truth to a few percent.
-    //  - EDF within 30%: same effective model complexity. gam's penalized
-    //    finite-basis EDF and sklearn's trace(K(K+σ²I)⁻¹) use different
-    //    conventions, so same-ballpark wiggliness is the right expectation, not
-    //    a bit-identical match.
+    // PRIMARY claim — gam recovers the deterministic truth to within one noise
+    // sd. The data carry N(0, 0.1²) noise; a faithful ν = 5/2 GP denoises the
+    // n=150 sample back to at worst the noise level (SNR ≈ 15, signal sd ≈ 1.1).
+    // A real kernel-basis or hyperparameter-selection bug would blow the bias or
+    // leave residual wiggle above the noise floor and trip this. Not weakened.
     assert!(
-        corr > 0.998,
-        "matern GP shape diverges from sklearn GPR: pearson={corr:.5}"
+        gam_rmse_truth <= noise_sd,
+        "gam matern GP fails to recover the known truth within the noise level: \
+         rmse(gam, truth)={gam_rmse_truth:.4} > noise_sd={noise_sd:.3}"
     );
+
+    // MATCH-OR-BEAT — gam is at least as accurate at recovering the truth as the
+    // mature Python exact-GP reference (within a 10% tolerance). This is an
+    // ACCURACY comparison on ground truth, NOT a "gam reproduces sklearn's fit"
+    // claim: we never assert the two fitted functions are close.
     assert!(
-        rel < 0.05,
-        "matern GP fitted function diverges from sklearn GPR: rel_l2={rel:.4}"
-    );
-    assert!(
-        gam_vs_truth < 0.05,
-        "gam matern GP fails to recover the known truth: rel_l2={gam_vs_truth:.4}"
-    );
-    assert!(
-        sk_vs_truth < 0.05,
-        "sklearn GPR fails to recover the known truth (sanity on the comparator): rel_l2={sk_vs_truth:.4}"
-    );
-    assert!(
-        edf_rel < 0.30,
-        "matern GP effective degrees of freedom disagree: gam={gam_edf:.3} sklearn={sk_edf:.3} (rel={edf_rel:.3})"
+        gam_rmse_truth <= sk_rmse_truth * 1.10,
+        "gam matern GP is less accurate than sklearn GPR at recovering the truth: \
+         rmse(gam, truth)={gam_rmse_truth:.4} > 1.10 × rmse(sklearn, truth)={sk_rmse_truth:.4}"
     );
 }

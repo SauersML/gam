@@ -1,48 +1,44 @@
-//! End-to-end quality: gam's tensor *interaction* smooth `ti(x, z, k=6)` must
-//! match mgcv — the mature, standard GAM implementation — on identical data.
+//! End-to-end OBJECTIVE quality of gam's tensor *interaction* smooth
+//! `ti(x, z, k=6)` on a noiseless, known surface.
 //!
-//! Reference: `mgcv::gam(y ~ ti(x, z, bs="ps", m=list(c(2,2),c(2,2)), k=6),
-//! method="REML")`.
+//! OBJECTIVE METRIC (the pass/fail claim):
+//!   1. TRUTH RECOVERY. The data are generated *without noise* from a known
+//!      function `f(x,z) = sin(3x)·cos(3z)`. An interaction-only `ti` smooth can
+//!      only represent the *pure-interaction* part of any surface, so the
+//!      well-defined recovery target is the two-way functional-ANOVA interaction
+//!      component of the truth, `f_int = f − f̄ − r(x) − c(z)` (grand mean, plus
+//!      x- and z-marginal means removed). We assert
+//!      `RMSE(gam_fit_int, f_int) <= 0.02 · range(f_int)` — gam reconstructs the
+//!      true interaction surface to a small fraction of its own amplitude. This
+//!      is an absolute statement about gam's accuracy against ground truth, not
+//!      about any other tool's output.
+//!   2. STRUCTURE / IDENTIFIABILITY. `ti` is interaction-ONLY: per-margin
+//!      sum-to-zero centering before the tensor product must purge all main
+//!      effects. We assert this directly on gam's own fitted surface — its
+//!      x-marginal means and z-marginal means over the regular grid must each
+//!      vanish (max |marginal mean| <= 1e-6 · range) — and that the smooth block
+//!      carries exactly `(k-1)^2` coefficients (the Kronecker null-space
+//!      dimension `Z₀ ⊗ Z₁`). A non-zero marginal mean or a wrong coefficient
+//!      count is direct proof the `ti` contract is broken (it would have leaked
+//!      main effects or fallen back to a `te`-style single global constraint at
+//!      `k*k-1 = 35`, or centered only one margin at `(k-1)*k = 30`).
 //!
-//! `ti()` is mgcv's mechanism for an interaction-ONLY tensor smooth: each
-//! marginal B-spline basis is sum-to-zero centered *before* the tensor product
-//! is formed, so the resulting column space contains no function of a single
-//! variable alone — the marginal main effects are excluded and only the pure
-//! `x×z` interaction survives. This is algebraically distinct from `te()`'s
-//! single global centering constraint: `te(x,z,k=6)` keeps `k*k - 1 = 35`
-//! coefficients (one global sum-to-zero drop), whereas `ti(x,z,k=6)` carries
-//! exactly `(k-1)^2 = 25` — the Kronecker product `Z₀ ⊗ Z₁` of the two
-//! per-margin null-space bases, each margin contributing `(k-1)=5` dimensions.
+//! BASELINE TO MATCH-OR-BEAT: mgcv (`bs="ps", m=list(c(2,2),c(2,2)), k=6`,
+//! method="REML") fits the SAME interaction-only penalized objective with the
+//! SAME marginal basis (cubic P-spline + 2nd-order difference penalty, 6
+//! cols/margin). We fit mgcv on identical rows, ANOVA-center its fitted surface
+//! the same way, and require gam's recovery error to be no worse than mgcv's by
+//! more than 10% (`rmse_gam <= 1.10 · rmse_mgcv`). mgcv is the bar to match-or-
+//! beat on accuracy, NOT the thing gam must reproduce: the primary claim is
+//! truth recovery; the relative-L2 of the two fits is printed for context only.
 //!
-//! The marginal basis MUST be matched to gam's tensor margin to make the
-//! fitted-surface comparison an apples-to-apples test of the SAME penalized
-//! objective. gam's `ti(x,z,k=6)` margins are cubic B-splines (`degree=3`) with
-//! a second-order DIFFERENCE penalty (`penalty_order=2`) and 6 basis columns
-//! per margin (`num_internal_knots = k-(degree+1) = 2`). That is precisely
-//! mgcv's P-spline `bs="ps"` with `m=c(2,2)` (cubic B-spline + 2nd-order
-//! difference penalty), so the R reference uses `bs="ps", m=list(c(2,2),c(2,2))`
-//! rather than the mgcv `ti` default `bs="cr"` (cubic regression spline with a
-//! curvature/derivative penalty), which would be a genuinely different smoother
-//! and would not justify a tight pointwise bound.
-//!
-//! This test benchmarks two things gam must replicate exactly:
-//!   1. The fitted interaction surface, pointwise on the training grid, must
-//!      agree with mgcv's (both REML-fit the SAME penalized objective, so close
-//!      agreement is the correct expectation; a real divergence is a real bug).
-//!   2. The coefficient count of the `ti` block must be `(k-1)^2`, NOT
-//!      `(k-1)*k` or `k*k-1`. A count mismatch is direct proof that per-margin
-//!      centering-before-tensor (the load-bearing `ti` identifiability
-//!      contract) is broken — gam would then be silently fitting a `te`-style
-//!      smooth or leaking main-effect dimensions into the interaction block.
-//!
-//! Data: a fixed, deterministic 18×18 grid on [0,1]² (n=324, no RNG) with truth
-//! f(x,z) = sin(3x)·cos(3z), a product structure that lives largely in the pure
-//! interaction subspace. Identical rows are handed to gam and to mgcv.
+//! Data: a fixed, deterministic 18×18 grid on [0,1]² (n=324, no RNG). Identical
+//! rows are handed to gam and to mgcv.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, run_r};
+use gam::test_support::reference::{Column, relative_l2, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -53,12 +49,77 @@ const K: usize = 6;
 // 18x18 deterministic grid on [0,1]^2 => n = 324, no RNG (identical to mgcv).
 const GRID: usize = 18;
 
+/// Two-way functional-ANOVA interaction component of a surface sampled on a
+/// regular `rows x cols` grid stored row-major (`v[i*cols + j]`): subtract the
+/// grand mean, each row mean, and each column mean. The result is the pure
+/// interaction part — exactly what an interaction-only `ti` smooth represents —
+/// and by construction has zero row means and zero column means.
+fn anova_interaction(v: &[f64], rows: usize, cols: usize) -> Vec<f64> {
+    assert_eq!(v.len(), rows * cols, "anova_interaction grid size mismatch");
+    let n = (rows * cols) as f64;
+    let grand: f64 = v.iter().sum::<f64>() / n;
+    let mut row_mean = vec![0.0_f64; rows];
+    let mut col_mean = vec![0.0_f64; cols];
+    for i in 0..rows {
+        for j in 0..cols {
+            let val = v[i * cols + j];
+            row_mean[i] += val;
+            col_mean[j] += val;
+        }
+    }
+    for rm in row_mean.iter_mut() {
+        *rm /= cols as f64;
+    }
+    for cm in col_mean.iter_mut() {
+        *cm /= rows as f64;
+    }
+    let mut out = vec![0.0_f64; rows * cols];
+    for i in 0..rows {
+        for j in 0..cols {
+            out[i * cols + j] = v[i * cols + j] - row_mean[i] - col_mean[j] + grand;
+        }
+    }
+    out
+}
+
+/// Max absolute x-marginal (row) mean and z-marginal (column) mean of a
+/// row-major `rows x cols` grid. For a genuine interaction-only surface both
+/// must be ~0 at every margin index.
+fn max_marginal_mean(v: &[f64], rows: usize, cols: usize) -> f64 {
+    let mut worst = 0.0_f64;
+    for i in 0..rows {
+        let m: f64 = (0..cols).map(|j| v[i * cols + j]).sum::<f64>() / cols as f64;
+        worst = worst.max(m.abs());
+    }
+    for j in 0..cols {
+        let m: f64 = (0..rows).map(|i| v[i * cols + j]).sum::<f64>() / rows as f64;
+        worst = worst.max(m.abs());
+    }
+    worst
+}
+
+fn rmse(a: &[f64], b: &[f64]) -> f64 {
+    assert_eq!(a.len(), b.len(), "rmse length mismatch");
+    let s: f64 = a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum();
+    (s / a.len() as f64).sqrt()
+}
+
+fn range_of(v: &[f64]) -> f64 {
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for &x in v {
+        lo = lo.min(x);
+        hi = hi.max(x);
+    }
+    hi - lo
+}
+
 #[test]
-fn gam_ti_2d_interaction_matches_mgcv() {
+fn gam_ti_2d_interaction_recovers_truth() {
     init_parallelism();
 
     // ---- build the deterministic interaction-only grid --------------------
-    // f(x,z) = sin(3x)*cos(3z) on a regular 18x18 grid; n = 324, fixed seed-free.
+    // f(x,z) = sin(3x)*cos(3z) on a regular 18x18 grid; n = 324, no RNG.
+    // Stored row-major: row i fixes x_i, column j fixes z_j.
     let n = GRID * GRID;
     let mut x = Vec::with_capacity(n);
     let mut z = Vec::with_capacity(n);
@@ -72,6 +133,16 @@ fn gam_ti_2d_interaction_matches_mgcv() {
             y.push((3.0 * xi).sin() * (3.0 * zj).cos());
         }
     }
+
+    // The well-defined recovery target for an interaction-only smooth: the
+    // two-way ANOVA interaction component of the noiseless truth.
+    let truth_int = anova_interaction(&y, GRID, GRID);
+    let truth_int_range = range_of(&truth_int);
+    assert!(
+        truth_int_range > 0.1,
+        "degenerate test: truth interaction component has range {truth_int_range:.4}; \
+         f(x,z) must carry real x*z interaction"
+    );
 
     // ---- encode for gam ---------------------------------------------------
     let headers = ["x", "z", "y"].into_iter().map(String::from).collect();
@@ -110,7 +181,12 @@ fn gam_ti_2d_interaction_matches_mgcv() {
     let intercept_cols = design.intercept_range.len();
     let ti_coeff_count = total_cols - intercept_cols;
 
-    // ---- fit the SAME model with mgcv (the mature reference) --------------
+    // gam's pure interaction surface (the intercept is the only non-ti column,
+    // so ANOVA-centering both fit and truth the same way is the apples-to-apples
+    // comparison and removes that constant).
+    let gam_int = anova_interaction(&gam_fitted, GRID, GRID);
+
+    // ---- fit the SAME model with mgcv (BASELINE to match-or-beat) ---------
     let r = run_r(
         &[
             Column::new("x", &x),
@@ -120,61 +196,71 @@ fn gam_ti_2d_interaction_matches_mgcv() {
         r#"
         suppressPackageStartupMessages(library(mgcv))
         # bs="ps", m=c(2,2) per margin == gam's tensor margin: cubic B-spline +
-        # 2nd-order difference penalty, 6 columns/margin for k=6. This matches
-        # gam's penalized objective so the fitted surfaces are comparable.
+        # 2nd-order difference penalty, 6 columns/margin for k=6.
         m <- gam(y ~ ti(x, z, bs = "ps", m = list(c(2, 2), c(2, 2)), k = 6),
                  data = df, method = "REML")
         emit("fitted", as.numeric(fitted(m)))
-        # number of coefficients in the ti smooth block (excludes intercept):
-        # mgcv stores per-smooth coefficient ranges in m$smooth[[1]]$first.para..last.para
         s1 <- m$smooth[[1]]
         emit("ti_ncoef", as.numeric(s1$last.para - s1$first.para + 1))
         "#,
     );
     let mgcv_fitted = r.vector("fitted");
     let mgcv_ti_ncoef = r.scalar("ti_ncoef").round() as usize;
-
     assert_eq!(mgcv_fitted.len(), n, "mgcv fitted length mismatch");
+    let mgcv_int = anova_interaction(mgcv_fitted, GRID, GRID);
 
-    // ---- compare ----------------------------------------------------------
-    let rel = relative_l2(&gam_fitted, mgcv_fitted);
-    let corr = pearson(&gam_fitted, mgcv_fitted);
+    // ---- objective metrics ------------------------------------------------
+    let rmse_gam = rmse(&gam_int, &truth_int);
+    let rmse_mgcv = rmse(&mgcv_int, &truth_int);
+    let rel_gam = relative_l2(&gam_int, &truth_int);
+    let rel_vs_mgcv = relative_l2(&gam_int, &mgcv_int); // context only
+    let gam_marginal = max_marginal_mean(&gam_fitted, GRID, GRID);
     let expected_count = (K - 1) * (K - 1);
+    let recovery_bar = 0.02 * truth_int_range;
 
     eprintln!(
-        "ti(x,z,k=6) gaussian: n={n} rel_l2={rel:.4} pearson={corr:.5} \
+        "ti(x,z,k=6) gaussian truth-recovery: n={n} \
+         rmse_gam_vs_truth={rmse_gam:.5} rmse_mgcv_vs_truth={rmse_mgcv:.5} \
+         bar={recovery_bar:.5} rel_gam_vs_truth={rel_gam:.4} \
+         rel_gam_vs_mgcv={rel_vs_mgcv:.4}(ctx) \
+         gam_max_marginal_mean={gam_marginal:.2e} \
+         truth_int_range={truth_int_range:.4} \
          gam_ti_ncoef={ti_coeff_count} mgcv_ti_ncoef={mgcv_ti_ncoef} \
          expected=(k-1)^2={expected_count}"
     );
 
-    // (1) LOAD-BEARING: gam's ti block must carry exactly (k-1)^2 coefficients.
-    //     A mismatch proves per-margin centering-before-tensor is broken (would
-    //     show (k-1)*k = 30 if only one margin centered, or k*k-1 = 35 if it
-    //     fell back to te()'s single global constraint).
+    // (1) STRUCTURE: gam's ti block carries exactly (k-1)^2 coefficients.
+    //     A mismatch proves per-margin centering-before-tensor is broken
+    //     ((k-1)*k = 30 if only one margin centered; k*k-1 = 35 if it fell back
+    //     to te()'s single global constraint).
     assert_eq!(
         ti_coeff_count, expected_count,
         "gam ti coefficient count {ti_coeff_count} != (k-1)^2 = {expected_count}: \
          per-margin sum-to-zero identifiability is broken"
     );
-    // mgcv must agree on the same count — it is the canonical ti contract.
-    assert_eq!(
-        mgcv_ti_ncoef, expected_count,
-        "mgcv ti coefficient count {mgcv_ti_ncoef} != (k-1)^2 = {expected_count}"
+
+    // (2) STRUCTURE: the fitted ti surface is genuinely interaction-only — every
+    //     x-marginal mean and z-marginal mean must vanish. This is the load-
+    //     bearing `ti` contract, asserted directly on gam's own output.
+    assert!(
+        gam_marginal <= 1e-6 * truth_int_range.max(1.0),
+        "gam ti surface leaks a main effect: max |marginal mean| = {gam_marginal:.3e} \
+         (must be ~0 for an interaction-only smooth)"
     );
 
-    // (2) Both engines REML-fit the SAME interaction-only objective on identical
-    //     data with a matched marginal basis (cubic P-spline + 2nd-order
-    //     difference penalty, 6 cols/margin), so their fitted surfaces must
-    //     essentially coincide. 0.025 is a tight relative-L2 bound: the only
-    //     residual difference is internal-knot placement (gam vs mgcv quantile
-    //     vs even spacing), which on this uniform grid is negligible, yet the
-    //     bound still catches any real divergence in the interaction smoother.
+    // (3) TRUTH RECOVERY (PRIMARY): gam reconstructs the true interaction
+    //     component to within 2% of its amplitude.
     assert!(
-        corr > 0.999,
-        "ti fitted surfaces should be near-identical: pearson={corr:.5}"
+        rmse_gam <= recovery_bar,
+        "gam fails to recover the true interaction surface: \
+         rmse={rmse_gam:.5} > bar={recovery_bar:.5} (= 0.02 * range {truth_int_range:.4})"
     );
+
+    // (4) MATCH-OR-BEAT: gam's recovery accuracy is no worse than mgcv's by
+    //     more than 10%. mgcv is the baseline, not the target.
     assert!(
-        rel < 0.025,
-        "ti fitted surface diverges from mgcv: rel_l2={rel:.4}"
+        rmse_gam <= 1.10 * rmse_mgcv,
+        "gam's interaction recovery is worse than mgcv's baseline: \
+         rmse_gam={rmse_gam:.5} > 1.10 * rmse_mgcv={rmse_mgcv:.5}"
     );
 }

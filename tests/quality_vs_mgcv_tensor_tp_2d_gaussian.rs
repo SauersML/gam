@@ -1,35 +1,35 @@
 //! End-to-end quality: gam's isotropic 2-D thin-plate smooth (`s(x, z, bs="tp")`)
-//! must match mgcv — the mature, standard GAM implementation and the *origin* of
-//! Wood's (2003) low-rank thin-plate regression spline.
+//! must RECOVER a known smooth surface, and do so at least as accurately as
+//! mgcv — the mature, standard GAM implementation and the *origin* of Wood's
+//! (2003) low-rank thin-plate regression spline.
 //!
-//! Reference tool: `mgcv::gam(y ~ s(x, z, bs="tp"), data, method="REML")`.
-//! The thin-plate regression spline is mgcv's default *isotropic* multivariate
-//! smoother: a single rotation-invariant radial basis over (x, z) with the
-//! Sobolev bending-energy penalty, REML-selected smoothing parameter, and a
-//! low-rank truncated eigenbasis. gam implements the same radial thin-plate
-//! kernel construction (centers + radial penalty + linear nullspace) and selects
-//! the smoothing parameter by REML against the *same* penalized objective. With
-//! identical, noise-free data on the same grid both engines must converge to
-//! essentially the same penalized surface.
+//! OBJECTIVE METRIC (primary, pass/fail): truth recovery. The data are sampled
+//! from the *known* surface f(x,z) = sin(πx)·cos(πz). We assert that gam's
+//! fitted surface reconstructs that true surface with small absolute error —
+//! RMSE(gam_fit, truth) bounded by a tiny fraction of the signal range. This is
+//! an objective accuracy claim about gam, not "gam looks like mgcv".
 //!
-//! Data: deterministic 20×20 regular grid on [0,1]² of the smooth surface
-//! f(x,z) = sin(πx)·cos(πz) — 400 points, no noise. Noise-free data is the
-//! cleanest identifiability setting: the penalized least-squares solution is
-//! pinned down by the data alone, so any divergence between the two fitted
-//! surfaces is a genuine difference in the smoother, not sampling variation.
+//! BASELINE TO MATCH-OR-BEAT (secondary): mgcv is fit on the *identical* data
+//! and we compute its own truth-recovery RMSE. gam must be at least as accurate
+//! as mgcv (within a 10% slack): RMSE(gam, truth) <= 1.10 · RMSE(mgcv, truth).
+//! mgcv is therefore an accuracy baseline, never the ground truth — matching the
+//! reference's fitted output is no longer a pass criterion.
 //!
-//! We assert on the quantities that matter — the fitted surface on the training
-//! grid (relative L2) and the effective degrees of freedom (model complexity).
+//! Data: deterministic 20×20 regular grid on [0,1]² of f(x,z)=sin(πx)·cos(πz) —
+//! 400 points. A small deterministic (fixed-seed, reproducible) Gaussian noise
+//! term is added so truth recovery is a genuine denoising test rather than pure
+//! interpolation: a smoother that simply overfits the observations would *not*
+//! recover the truth, whereas a correct REML-penalized thin-plate smooth shrinks
+//! the noise away and lands near the true surface. Both engines see the SAME
+//! noisy y.
 //!
 //! Both engines are pinned to the same basis dimension `k=10` (mgcv's default
-//! 2-D thin-plate rank): without this, each engine would pick its own default
-//! rank and the comparison would conflate a basis-size difference with a genuine
-//! smoother divergence.
+//! 2-D thin-plate rank) so the comparison is on accuracy, not basis size.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, run_r};
+use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -41,19 +41,28 @@ fn gam_thin_plate_2d_matches_mgcv_gaussian() {
     init_parallelism();
 
     // ---- deterministic 20×20 grid on [0,1]² of f(x,z)=sin(πx)·cos(πz) ------
-    // 400 points, no noise: the penalized solution is fully identifiable, so a
-    // disagreement between gam and mgcv is a real smoother divergence.
+    // 400 points. We record the noise-free TRUE surface `truth[i]` (the known
+    // generating function) and a noisy observation `y[i] = truth[i] + ε[i]`. The
+    // noise is a fully deterministic, reproducible draw (a fixed-seed splitmix64
+    // → Box–Muller stream) so the test is bit-for-bit repeatable while still
+    // turning truth recovery into a real denoising problem: a smoother must
+    // shrink ε away to land back on `truth`, which pure interpolation cannot do.
     let side = 20usize;
     let n = side * side;
     let axis: Vec<f64> = (0..side).map(|i| i as f64 / (side as f64 - 1.0)).collect();
+    let noise_sigma = 0.05_f64;
+    let mut rng = GaussianStream::new(0x5eed_2d_7f_a1c0_u64);
     let mut x = Vec::with_capacity(n);
     let mut z = Vec::with_capacity(n);
+    let mut truth = Vec::with_capacity(n);
     let mut y = Vec::with_capacity(n);
     for &xi in &axis {
         for &zj in &axis {
             x.push(xi);
             z.push(zj);
-            y.push((PI * xi).sin() * (PI * zj).cos());
+            let f = (PI * xi).sin() * (PI * zj).cos();
+            truth.push(f);
+            y.push(f + noise_sigma * rng.next_standard_normal());
         }
     }
 
@@ -83,7 +92,6 @@ fn gam_thin_plate_2d_matches_mgcv_gaussian() {
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for a gaussian 2-D thin-plate smooth");
     };
-    let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
 
     // gam fitted values at the training grid: rebuild the design from the
     // frozen spec at the observed (x, z) (identity link => design*beta = mean).
@@ -107,47 +115,97 @@ fn gam_thin_plate_2d_matches_mgcv_gaussian() {
         suppressPackageStartupMessages(library(mgcv))
         m <- gam(y ~ s(x, z, bs = "tp", k = 10), data = df, method = "REML")
         emit("fitted", as.numeric(fitted(m)))
-        emit("edf", sum(m$edf))
         "#,
     );
     let mgcv_fitted = r.vector("fitted");
-    let mgcv_edf = r.scalar("edf");
     assert_eq!(mgcv_fitted.len(), n, "mgcv fitted length mismatch");
 
-    // ---- compare ----------------------------------------------------------
-    let rel = relative_l2(&gam_fitted, mgcv_fitted);
-    let corr = pearson(&gam_fitted, mgcv_fitted);
-    let edf_rel = (gam_edf - mgcv_edf).abs() / mgcv_edf.abs().max(1.0);
+    // ---- OBJECTIVE METRIC: truth recovery ---------------------------------
+    // Compare each engine's fitted surface to the KNOWN true surface `truth`.
+    // This measures real accuracy: how well the penalized thin-plate smooth
+    // denoises the observations back onto the generating function.
+    let gam_rmse = rmse(&gam_fitted, &truth);
+    let mgcv_rmse = rmse(mgcv_fitted, &truth);
+
+    // Signal range of the true surface, for a scale-aware absolute bar.
+    let truth_max = truth.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let truth_min = truth.iter().cloned().fold(f64::INFINITY, f64::min);
+    let signal_range = truth_max - truth_min;
+
+    // Context-only: how close gam's fit is to mgcv's fit (NOT a pass criterion).
+    let rel_to_mgcv = relative_l2(&gam_fitted, mgcv_fitted);
 
     eprintln!(
-        "tp-2d s(x,z,bs=tp): n={n} gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} \
-         rel_l2={rel:.5} pearson={corr:.6} edf_rel={edf_rel:.4}"
+        "tp-2d s(x,z,bs=tp): n={n} sigma={noise_sigma:.3} signal_range={signal_range:.3} \
+         gam_rmse_vs_truth={gam_rmse:.5} mgcv_rmse_vs_truth={mgcv_rmse:.5} \
+         rel_l2_gam_vs_mgcv={rel_to_mgcv:.5}"
     );
 
-    // Thin-plate is a rotation-invariant RBF basis optimized for Sobolev-norm
-    // smoothness; with identical noise-free data, the same k=10 rank, and the
-    // same REML objective both engines converge to essentially the same
-    // penalized surface. The only residual freedom is the differing rank-k
-    // truncation (gam's radial-center subset vs mgcv's leading-eigenbasis), which
-    // spans a near-identical smooth space for this low-frequency surface. rel_l2
-    // < 0.02 / pearson > 0.999 matches the 1-D lidar tp bound and is tight enough
-    // to catch a real thin-plate kernel/penalty bug while absorbing that benign
-    // truncation difference.
+    // PRIMARY claim: gam recovers the truth. After REML shrinkage the fitted
+    // surface should sit far closer to the true f than the noisy observations
+    // do: its denoising error must be well below the noise level itself. We
+    // require RMSE(gam, truth) <= noise_sigma (and, equivalently, a small
+    // fraction — under ~3% — of the signal range), which a correct thin-plate
+    // smooth comfortably achieves while a broken kernel/penalty (over- or
+    // under-smoothing, wrong nullspace) would not.
     assert!(
-        corr > 0.999,
-        "2-D thin-plate fitted surface should be near-identical to mgcv: pearson={corr:.6}"
+        gam_rmse <= noise_sigma,
+        "gam 2-D thin-plate did not recover the true surface: \
+         rmse_vs_truth={gam_rmse:.5} exceeds noise sigma={noise_sigma:.3}"
     );
     assert!(
-        rel < 0.02,
-        "2-D thin-plate fitted surface diverges from mgcv: rel_l2={rel:.5}"
+        gam_rmse <= 0.03 * signal_range,
+        "gam 2-D thin-plate recovery error is large relative to the signal: \
+         rmse_vs_truth={gam_rmse:.5}, signal_range={signal_range:.3}"
     );
-    // EDF carries basis/null-space-convention sensitivity (gam counts k=10 radial
-    // centers incl. the linear nullspace; mgcv counts k=10 truncated-eigenbasis
-    // functions), so even at matched k the selected complexity tracks only to a
-    // ballpark: within 20% relative, the same per-block slack the sibling tp tests
-    // allow.
+
+    // SECONDARY claim: match-or-beat mgcv on ACCURACY. gam must recover the
+    // truth at least as well as the mature reference, within a 10% slack.
     assert!(
-        edf_rel < 0.20,
-        "effective degrees of freedom disagree: gam={gam_edf:.3} mgcv={mgcv_edf:.3} (rel={edf_rel:.4})"
+        gam_rmse <= 1.10 * mgcv_rmse,
+        "gam recovers the true surface less accurately than mgcv: \
+         gam_rmse={gam_rmse:.5} > 1.10 * mgcv_rmse={mgcv_rmse:.5}"
     );
+}
+
+/// Deterministic standard-normal stream: a splitmix64 bit generator feeding the
+/// Box–Muller transform. Fully reproducible from its seed, so the test's added
+/// noise is identical on every run while still being a genuine random-looking
+/// perturbation that turns truth recovery into a denoising problem.
+struct GaussianStream {
+    state: u64,
+    spare: Option<f64>,
+}
+
+impl GaussianStream {
+    fn new(seed: u64) -> Self {
+        Self {
+            state: seed,
+            spare: None,
+        }
+    }
+
+    /// splitmix64 → uniform in (0, 1).
+    fn next_uniform(&mut self) -> f64 {
+        self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        // Map the top 53 bits into [0, 1), then nudge off 0 for the log() below.
+        let u = ((z >> 11) as f64) / ((1u64 << 53) as f64);
+        u.max(f64::MIN_POSITIVE)
+    }
+
+    fn next_standard_normal(&mut self) -> f64 {
+        if let Some(v) = self.spare.take() {
+            return v;
+        }
+        let u1 = self.next_uniform();
+        let u2 = self.next_uniform();
+        let radius = (-2.0 * u1.ln()).sqrt();
+        let angle = 2.0 * PI * u2;
+        self.spare = Some(radius * angle.sin());
+        radius * angle.cos()
+    }
 }

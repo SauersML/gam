@@ -1,39 +1,46 @@
-//! Intrinsic S² rotation equivariance — gam's spherical smooth vs `mgcv`'s
-//! spline-on-sphere (`bs="sos"`) as the closest mature comparator.
+//! Intrinsic S² spherical smooth — OBJECTIVE quality on two axes:
+//!   (1) STRUCTURE/AXIOM: rotation equivariance under SO(3) (max |g(p) − g_R(Rp)|).
+//!   (2) TRUTH RECOVERY: RMSE of the fitted surface against the KNOWN generating
+//!       function on a dense evaluation grid, with gam additionally required to
+//!       match-or-beat mgcv `bs="sos"` on that same truth-recovery accuracy.
 //!
-//! Sphere smooths are intrinsically defined on S² via Riemannian geometry. A
-//! spherical-harmonic basis spans a function space that is *exactly* invariant
-//! under the rotation group SO(3): if you rotate every data point by a fixed 3D
-//! rotation R, refit, and then evaluate the refit at the rotated locations, you
-//! recover the original fitted surface, because the harmonic subspace is mapped
-//! to itself by R, the Laplace-Beltrami penalty is rotation-invariant, and so
-//! the penalized REML problem is the *same* problem expressed in a rotated
-//! coordinate frame. The two fits are NOT bit-identical: the rotated design
-//! matrix carries different floating-point harmonic values, and the rotated
-//! REML optimization is an independent run that certifies its smoothing
-//! parameter against the same convergence tolerance (default 1e-6) rather than
-//! reproducing the original ρ̂ exactly. The residual gap is therefore set by
+//! Neither assertion is "gam reproduces a reference tool's fitted output". The
+//! data are generated from a known closed-form surface, so accuracy is measured
+//! against ground truth; mgcv is demoted to a baseline-to-beat ON ACCURACY, not
+//! a target to match.
+//!
+//! AXIOM (1). Sphere smooths are intrinsically defined on S² via Riemannian
+//! geometry. A spherical-harmonic basis spans a function space that is *exactly*
+//! invariant under the rotation group SO(3): if you rotate every data point by a
+//! fixed 3D rotation R, refit, and then evaluate the refit at the rotated
+//! locations, you recover the original fitted surface, because the harmonic
+//! subspace is mapped to itself by R, the Laplace-Beltrami penalty is
+//! rotation-invariant, and so the penalized REML problem is the *same* problem
+//! expressed in a rotated coordinate frame. The two fits are NOT bit-identical:
+//! the rotated design matrix carries different floating-point harmonic values,
+//! and the rotated REML optimization is an independent run that certifies its
+//! smoothing parameter against the same convergence tolerance (default 1e-6)
+//! rather than reproducing the original ρ̂ exactly. The residual gap is set by
 //! REML convergence and basis-construction round-off, not by f64 round-off
 //! alone — but it stays far below the O(1) surface scale a genuinely
 //! frame-dependent basis would produce. This is an *intrinsic correctness
 //! property* gam must satisfy independent of any comparator.
 //!
-//! mgcv `bs="sos"` uses a fixed (lat, lon) parameterization and is **not**
-//! designed to handle rotated coordinate frames: rotating the data in 3D and
-//! re-expressing it as (lat', lon') silently moves data across the lat/lon
-//! singularities (poles, ±180° seam), so mgcv's surface is not expected to be
-//! rotation-equivariant the way an intrinsic harmonic basis is. We therefore
-//! (a) assert the intrinsic equivariance property on gam directly with a tight
-//! absolute bound, and (b) use mgcv's `sos` fit only as a relative baseline to
-//! confirm gam's *unrotated* surface tracks the mature spline-on-sphere on the
-//! same data — divergence in either is a real finding. The fragmentation of the
-//! sphere-smoothing tool ecosystem (no integrated rotation-equivariant GAM
-//! reference exists) is itself part of the finding documented here.
+//! TRUTH RECOVERY (2). The responses are y = sin(lat)·cos(2·lon) + N(0, σ²),
+//! σ = 0.01, a degree-2 spherical surface that lives exactly in the harmonic
+//! function space (max_degree=4 ⊇ degree 2). With σ this small, a faithful
+//! smoother must reconstruct the surface to well within the signal range
+//! [−1, 1]; we assert RMSE(gam, truth) below an absolute bar tied to σ and the
+//! signal scale. mgcv `bs="sos"` is fit on the IDENTICAL data and evaluated on
+//! the IDENTICAL grid as a mature accuracy baseline: gam must recover the truth
+//! at least as well as mgcv (gam_rmse ≤ mgcv_rmse · 1.10). We print rel_l2 and
+//! Pearson vs mgcv for context only — they are no longer pass/fail criteria,
+//! because matching mgcv's (also noisy) fit proves nothing about correctness.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, run_r};
+use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -121,7 +128,7 @@ fn fit_and_eval(
 }
 
 #[test]
-fn gam_sphere_smooth_is_rotation_equivariant_and_tracks_mgcv_sos() {
+fn gam_sphere_smooth_is_rotation_equivariant_and_recovers_truth() {
     init_parallelism();
 
     // ---- synthetic data: n=100 uniform points on S² -----------------------
@@ -225,12 +232,24 @@ fn gam_sphere_smooth_is_rotation_equivariant_and_tracks_mgcv_sos() {
          max|g(p) - g_R(Rp)| = {max_abs:.3e} (bound 5e-3)"
     );
 
-    // ---- relative baseline vs mgcv bs="sos" on the UNROTATED data ----------
-    // mgcv's spline-on-sphere is the closest mature comparator. On the original
-    // (un-rotated) frame both engines smooth the same intrinsic surface, so
-    // gam's fit should track mgcv's. (We do NOT ask mgcv to be rotation
-    // equivariant — its fixed (lat,lon) parameterization is not designed for
-    // rotated frames; that gap is the documented finding.)
+    // ---- TRUTH RECOVERY: ground-truth surface on the eval grid -------------
+    // The data were generated from the closed-form surface
+    // f(lat,lon) = sin(lat)·cos(2·lon) (radians). It is a degree-2 spherical
+    // function and therefore lies exactly inside the degree-4 harmonic space we
+    // fit, so a correct smoother must reconstruct it; the only obstruction is
+    // the σ=0.01 observation noise and the 100-point sampling density. We
+    // evaluate the truth on the SAME 12×12 grid both engines predict on.
+    let truth: Vec<f64> = eval_lats
+        .iter()
+        .zip(&eval_lons)
+        .map(|(lat, lon)| lat.to_radians().sin() * (2.0 * lon.to_radians()).cos())
+        .collect();
+
+    // ---- mgcv bs="sos" as a TRUTH-RECOVERY accuracy baseline ---------------
+    // mgcv's spline-on-sphere is the closest mature comparator. We fit it on the
+    // IDENTICAL unrotated data and predict on the IDENTICAL grid, then compare
+    // how well EACH engine recovers the known truth. mgcv is a baseline to
+    // match-or-beat on accuracy, NOT a target to reproduce.
     // The reference harness requires every column to share one length, so the
     // 144-point eval grid cannot ride along as extra columns next to the
     // 100-row fit data. Instead we hand mgcv only the fit data and have R
@@ -266,30 +285,40 @@ fn gam_sphere_smooth_is_rotation_equivariant_and_tracks_mgcv_sos() {
         fit_orig_at_p.len()
     );
 
+    // ---- OBJECTIVE accuracy vs ground truth --------------------------------
+    let gam_truth_rmse = rmse(&fit_orig_at_p, &truth);
+    let mgcv_truth_rmse = rmse(mgcv_pred, &truth);
+
+    // Context only (NOT pass/fail): how closely the two fits track each other.
+    // Matching a peer tool's noisy fit is not a quality claim, so these are
+    // printed for diagnostics rather than asserted.
     let rel = relative_l2(&fit_orig_at_p, mgcv_pred);
     let corr = pearson(&fit_orig_at_p, mgcv_pred);
     eprintln!(
-        "[s2-equivariance] mgcv_edf={mgcv_edf:.3} rel_l2(gam, mgcv_sos)={rel:.4} \
-         pearson={corr:.5}"
+        "[s2-truth] gam_truth_rmse={gam_truth_rmse:.4} mgcv_truth_rmse={mgcv_truth_rmse:.4} \
+         mgcv_edf={mgcv_edf:.3} | context: rel_l2(gam,mgcv)={rel:.4} pearson={corr:.5}"
     );
 
-    // Both engines fit the same smooth surface on the same data via REML, but
-    // through genuinely different sphere bases (gam harmonic L=4, dim 24 vs
-    // mgcv sos k=25 thin-plate-on-sphere) on a degree-2 longitude truth. They
-    // must agree on the *shape* tightly and on *magnitude* to within the
-    // basis-mismatch margin: pearson > 0.95 catches any structural divergence,
-    // and rel_l2 < 0.20 catches a magnitude break while tolerating the
-    // basis-and-penalty difference. These mirror the established gam-vs-sos
-    // baseline in tests/quality_vs_mgcv_sphere_s2_wahba_vs_sos.rs (rel<0.20,
-    // pearson>0.95); a tighter bound would falsely flag the legitimate
-    // basis mismatch rather than a real regression.
+    // PRIMARY CLAIM: gam recovers the known surface. The truth has range [−1, 1]
+    // (peak-to-peak 2) and the observation noise is σ=0.01. A faithful penalized
+    // smoother reconstructs a degree-2 surface that lives inside its degree-4
+    // harmonic space from 100 points to far better than the signal scale; we
+    // require RMSE ≤ 0.10, i.e. ≤ 5% of the signal range and ~10× the noise σ,
+    // which leaves headroom for the finite-sample smoothing bias while still
+    // failing hard on any genuine reconstruction defect.
     assert!(
-        corr > 0.95,
-        "gam sphere surface shape diverges from mgcv bs=\"sos\" baseline: \
-         pearson={corr:.5} (bound 0.95)"
+        gam_truth_rmse <= 0.10,
+        "gam does not recover the known S² surface: RMSE(gam, truth)={gam_truth_rmse:.4} \
+         (bound 0.10, signal range 2, noise σ=0.01)"
     );
+
+    // MATCH-OR-BEAT (accuracy, not reproduction): gam must recover the truth at
+    // least as well as the mature spline-on-sphere, within a 10% margin for the
+    // legitimate basis/penalty difference (gam harmonic L=4 dim 24 vs mgcv sos
+    // k=25 thin-plate-on-sphere).
     assert!(
-        rel < 0.20,
-        "gam sphere fit diverges from mgcv bs=\"sos\" baseline: rel_l2={rel:.4} (bound 0.20)"
+        gam_truth_rmse <= mgcv_truth_rmse * 1.10,
+        "gam recovers the S² truth worse than the mgcv bs=\"sos\" baseline: \
+         gam_rmse={gam_truth_rmse:.4} > 1.10 · mgcv_rmse={mgcv_truth_rmse:.4}"
     );
 }

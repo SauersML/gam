@@ -1,6 +1,6 @@
-//! End-to-end quality: gam's 2-D tensor-product smooth `te(x, z)` must match
-//! `mgcv` — the mature, de-facto standard implementation of tensor-product GAM
-//! smooths — on the *same* data, not merely "run without panicking".
+//! End-to-end quality: gam's 2-D tensor-product smooth `te(x, z)` must RECOVER a
+//! known separable surface, and do so at least as accurately as `mgcv` — the
+//! mature, de-facto standard implementation of tensor-product GAM smooths.
 //!
 //! Tensor products are mgcv's workhorse for moderate-dimensional smoothing: for
 //! d >= 2 with many observations, `te()` is the canonical choice because it
@@ -8,34 +8,33 @@
 //! marginal bases, with a separate penalty per margin. That Kronecker structure
 //! is a load-bearing algebraic contract: if gam's tensor construction (marginal
 //! bases, the Kronecker logic, or the per-margin centering) has a bug, the
-//! fitted surface will diverge from mgcv even on data the model can represent
-//! exactly.
+//! fitted surface cannot reproduce a surface the basis can represent exactly,
+//! and gam's recovery error against the GROUND-TRUTH function blows up.
 //!
-//! We use a *separable* truth f(x,z) = sin(3πx)·cos(3πz) on a deterministic
-//! 20×20 grid over [0,1]² (n=400, noiseless, fixed by construction). A separable
-//! function is the ideal probe for the Kronecker contract: its rank-1 structure
-//! is captured by a single outer product of marginal coefficients, so any error
-//! in how the marginal bases are tensored or centered shows up directly in the
-//! surface. With k=8 per margin (an 8×8 = 64-function tensor basis before
-//! centering) both engines have ample resolution to track these sinusoids very
-//! closely. We fit `y ~ te(x, z, k=8)` with gam (REML) and the identical model
-//! `mgcv::gam(y ~ te(x, z, k=8), method="REML")`, then compare the two fitted
-//! surfaces pointwise on the training grid.
+//! Truth: f(x,z) = sin(3πx)·cos(3πz) on a deterministic 20×20 grid over [0,1]²
+//! (n=400, noiseless, fixed by construction). Because the data are generated
+//! from this known function with zero noise, the function values ARE the ground
+//! truth — there is no estimation target to argue about. A separable truth is
+//! the ideal probe for the Kronecker contract: its rank-1 structure is captured
+//! by a single outer product of marginal coefficients, so any error in how the
+//! marginal bases are tensored or centered shows up directly as recovery error.
+//! With k=8 per margin (an 8×8 = 64-function tensor basis before centering) the
+//! smooth space has ample resolution to track these sinusoids very closely.
 //!
-//! Both engines REML-fit the same separable data with the same per-margin basis
-//! count, so the fitted surfaces must essentially coincide — up to the mild
-//! difference in marginal-basis convention (gam tensors B-spline margins; mgcv's
-//! default `te` margins are `bs="cr"`), which both span the same smooth space.
-//! That basis difference is why we compare surfaces (not EDF, which is
-//! convention-sensitive and kept diagnostic-only) with a tolerance that absorbs
-//! it yet still catches a real Kronecker/centering bug. A divergence past the
-//! bounds below is a real bug in gam's tensor-product construction, not a
-//! tolerance artifact.
+//! OBJECTIVE METRIC (truth recovery): we assert RMSE(gam_fitted, truth) is a
+//! small fraction of the signal's amplitude (truth ranges over [-1, 1], so the
+//! peak-to-peak signal range is 2.0). The primary claim is that gam recovers the
+//! generating function. We additionally fit the identical model with
+//! `mgcv::gam(y ~ te(x, z, k=8), method="REML")` and require gam's recovery
+//! error to be no worse than mgcv's by more than 10% — mgcv is demoted from
+//! "thing to reproduce" to a BASELINE TO MATCH-OR-BEAT on accuracy against the
+//! truth. We never assert closeness of the two fitted surfaces to each other,
+//! and EDF is kept diagnostic-only (convention-sensitive, not a quality claim).
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, run_r};
+use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -114,27 +113,43 @@ fn gam_te_2d_smooth_matches_mgcv_on_separable_grid() {
     let mgcv_edf = r.scalar("edf");
     assert_eq!(mgcv_fitted.len(), n, "mgcv fitted length mismatch");
 
-    // ---- compare the fitted surfaces pointwise on the training grid -------
-    let rel = relative_l2(&gam_fitted, mgcv_fitted);
-    let corr = pearson(&gam_fitted, mgcv_fitted);
+    // ---- OBJECTIVE METRIC: recovery error against the GROUND-TRUTH ---------
+    // The data are noiseless: `y` IS the value of the known generating function
+    // f(x,z) at each grid point, so it is the ground truth. Quality = how well
+    // each engine's fitted surface reproduces that function, not how well the
+    // two engines reproduce each other.
+    let truth = y.as_slice();
+    let gam_err = rmse(&gam_fitted, truth);
+    let mgcv_err = rmse(mgcv_fitted, truth);
+
+    // Context only (NOT a pass criterion): how close the two fits are to each
+    // other, printed for diagnosis of basis-convention differences.
+    let rel_gam_vs_mgcv = relative_l2(&gam_fitted, mgcv_fitted);
 
     eprintln!(
-        "te(x,z) 2D separable: n={n} gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} \
-         rel_l2={rel:.5} pearson={corr:.6}"
+        "te(x,z) 2D separable truth recovery: n={n} \
+         gam_rmse_vs_truth={gam_err:.6} mgcv_rmse_vs_truth={mgcv_err:.6} \
+         gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} \
+         rel_l2(gam,mgcv)={rel_gam_vs_mgcv:.5}"
     );
 
-    // A separable truth is closely resolved by both k=8-per-margin tensor fits
-    // (8x8 = 64 basis functions before centering), so the two REML surfaces must
-    // nearly coincide, differing only by the marginal-basis convention (gam
-    // B-spline vs mgcv cr) plus the tiny penalty shrinkage both apply. 0.02 /
-    // 0.995 are tight enough to catch any real Kronecker/centering bug yet leave
-    // a sane margin for that benign basis difference.
+    // PRIMARY: gam recovers the generating function. The truth spans [-1, 1]
+    // (peak-to-peak range 2.0); a k=8-per-margin tensor basis resolves these
+    // sinusoids tightly. We require the recovery RMSE to be under 1% of the
+    // signal range (0.02), which a correct Kronecker/centering construction
+    // clears with room to spare and a real construction bug cannot.
     assert!(
-        corr > 0.995,
-        "te(x,z) fitted surfaces should be near-identical to mgcv: pearson={corr:.6}"
+        gam_err < 0.02,
+        "te(x,z) failed to recover the separable truth: rmse_vs_truth={gam_err:.6} \
+         (signal range 2.0); a Kronecker/centering bug, not a tolerance artifact"
     );
+
+    // BASELINE TO MATCH-OR-BEAT: gam's recovery error must be no worse than
+    // mgcv's by more than 10%. mgcv is the accuracy yardstick on the truth, not
+    // a target to reproduce.
     assert!(
-        rel < 0.02,
-        "te(x,z) fitted surface diverges from mgcv: rel_l2={rel:.5}"
+        gam_err <= mgcv_err * 1.10,
+        "te(x,z): gam is less accurate than mgcv at recovering the truth: \
+         gam_rmse={gam_err:.6} > 1.10 * mgcv_rmse={mgcv_err:.6}"
     );
 }

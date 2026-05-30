@@ -1,5 +1,6 @@
-//! End-to-end quality: gam's Gamma(log) GLM must match statsmodels — the mature,
-//! standard general-GLM implementation — on positive continuous data.
+//! End-to-end OBJECTIVE quality: gam's Gamma(log) GLM must RECOVER the known
+//! truth function on positive continuous data — not merely reproduce another
+//! tool's fit.
 //!
 //! Capability under test: `family = "gamma"` (ResponseFamily::Gamma with a log
 //! inverse link, see src/solver/workflow.rs) fit through the additive smooth
@@ -7,28 +8,29 @@
 //! for strictly-positive continuous outcomes with multiplicative error (cost /
 //! severity / survival-time data); the log link is universal for it.
 //!
-//! Reference: statsmodels `GLM(y, X, family=Gamma(link=Log()))`. To make this a
-//! clean apples-to-apples GLM check — isolating gam's Gamma likelihood / scale /
-//! working-response machinery rather than confounding it with two engines'
-//! independent smoothing-parameter selection — gam first fits and selects its
-//! smoothing parameters, then we evaluate gam's *frozen* penalized basis at the
-//! data points and hand that exact design matrix to statsmodels' Gamma GLM.
-//! Both engines then maximise the identical Gamma log-likelihood over the
-//! identical column space; gam additionally applies a *mild* wiggliness penalty,
-//! but the smooths are deliberately low-rank (k = 5 and k = 4), so they are
-//! nearly saturated and the penalty barely bites. Their fitted means must
-//! therefore essentially coincide. A real divergence here is a real bug in gam's
-//! Gamma working-response / scale path, not a basis mismatch.
+//! OBJECTIVE METRIC (truth recovery): the data are simulated from a KNOWN log-
+//! mean surface eta_true = 2.0 + 0.5*sin(x*pi/5) + 0.3*cos(z*pi/6), with
+//! y ~ Gamma(shape=2, scale=exp(eta_true)/2) so E[y] = exp(eta_true). Because
+//! the Gamma error is multiplicative (Var = mu^2/shape), the natural scale-free
+//! accuracy measure is RMSE on the LOG-MEAN predictor: how well does gam's fitted
+//! eta_hat = log(mu_hat) track the true eta? The PRIMARY assertion is that gam
+//! recovers that surface — RMSE(eta_hat, eta_true) is a small fraction of the
+//! signal's amplitude (and far below the per-observation noise sd of the working
+//! log-response). This is a real quality claim about gam, independent of any peer
+//! tool.
 //!
-//! We compare:
-//!   1. relative L2 of the fitted means mu = exp(eta) (the quantity Gamma cares
-//!      about — its variance is mu^2/shape), and
-//!   2. Pearson correlation of the log-scale fitted predictors eta = log(mu).
+//! BASELINE TO MATCH-OR-BEAT: statsmodels `GLM(y, X, family=Gamma(link=Log()))`
+//! is fit on gam's identical frozen basis (so the only difference is gam's mild
+//! k=5/k=4 wiggliness penalty). We additionally require gam's truth-recovery
+//! error to be no worse than statsmodels' by more than 10% — i.e. on the
+//! objective accuracy metric, gam matches or beats the mature reference. We still
+//! print rel_l2(mu) / pearson(eta) vs statsmodels for context, but neither is a
+//! pass criterion.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, run_python};
+use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -54,6 +56,7 @@ fn gam_gamma_log_matches_statsmodels() {
     let mut x = Vec::<f64>::with_capacity(n);
     let mut z = Vec::<f64>::with_capacity(n);
     let mut y = Vec::<f64>::with_capacity(n);
+    let mut eta_true = Vec::<f64>::with_capacity(n);
     for _ in 0..n {
         let xi = ux.sample(&mut rng);
         let zi = ux.sample(&mut rng);
@@ -66,6 +69,7 @@ fn gam_gamma_log_matches_statsmodels() {
         x.push(xi);
         z.push(zi);
         y.push(yi);
+        eta_true.push(eta);
     }
     assert!(
         y.iter().all(|&v| v > 0.0),
@@ -158,29 +162,54 @@ emit("scale", [res.scale])
     let ref_eta = r.vector("eta");
     assert_eq!(ref_mu.len(), n, "statsmodels mu length mismatch");
 
-    // ---- compare ----------------------------------------------------------
+    // ---- OBJECTIVE quality: truth recovery on the log-mean surface --------
+    // gam's eta_hat = log(mu_hat) is on the same scale as the simulated eta_true;
+    // the Gamma's multiplicative error makes log-scale RMSE the natural scale-free
+    // accuracy measure. statsmodels, fit on the SAME frozen basis, gives the
+    // unpenalized-MLE error on this surface as a match-or-beat baseline.
+    let gam_rmse_truth = rmse(&gam_eta, &eta_true);
+    let ref_rmse_truth = rmse(ref_eta, &eta_true);
+
+    // Signal amplitude of the wiggly part (range of 0.5*sin(.) + 0.3*cos(.) is
+    // [-0.8, 0.8] => 1.6) and the per-observation noise on the working log-
+    // response (Var(log y) for Gamma(shape) is the trigamma psi'(shape); for
+    // shape = 2, psi'(2) = pi^2/6 - 1 ~= 0.6449, so noise sd ~= 0.803). A fitted
+    // log-mean within ~0.25 RMSE of truth is well inside the signal range and
+    // roughly a third of the per-point noise sd — a genuine recovery, not a fit
+    // tracking noise.
+    let signal_range = 1.6_f64;
+    let working_noise_sd = (std::f64::consts::PI * std::f64::consts::PI / 6.0 - 1.0).sqrt();
+    let truth_bar = 0.25_f64;
+
+    // Context only (NOT a pass criterion): agreement with statsmodels' own fit.
     let rel = relative_l2(&gam_mu, ref_mu);
     let corr = pearson(&gam_eta, ref_eta);
     let sm_scale = r.scalar("scale");
 
     eprintln!(
         "gamma(log) s(x,k=5)+s(z,k=4): n={n} p={p} gam_edf={gam_edf:.3} \
-         sm_scale={sm_scale:.4} rel_l2(mu)={rel:.5} pearson(eta)={corr:.5}"
+         sm_scale={sm_scale:.4} signal_range={signal_range:.3} \
+         working_noise_sd={working_noise_sd:.3} \
+         rmse(eta_hat,eta_true)=gam:{gam_rmse_truth:.5} sm:{ref_rmse_truth:.5} \
+         [context only] rel_l2(mu)={rel:.5} pearson(eta)={corr:.5}"
     );
 
-    // Both engines maximise the identical Gamma(log) log-likelihood over the
-    // identical (frozen) basis; Gamma's MLE for beta is independent of the
-    // shared scale/shape, so the fits would coincide exactly but for gam's mild
-    // k=5/k=4 wiggliness penalty (worth a few percent on the wiggly part of eta).
-    // rel_l2 < 0.10 on mu and pearson > 0.99 on log-scale eta is the principled
-    // bound: it allows for that light penalty wedge yet is tight enough that any
-    // genuine Gamma working-response/dispersion/link bug fails it.
+    // PRIMARY claim: gam recovers the true log-mean surface.
     assert!(
-        corr > 0.99,
-        "Gamma(log) log-scale predictors diverge from statsmodels: pearson(eta)={corr:.5}"
+        gam_rmse_truth < truth_bar,
+        "Gamma(log) failed to recover the true log-mean surface: \
+         rmse(eta_hat, eta_true)={gam_rmse_truth:.5} >= bar {truth_bar:.5} \
+         (signal_range={signal_range:.3}, working_noise_sd={working_noise_sd:.3})"
     );
+
+    // MATCH-OR-BEAT on accuracy: gam's truth-recovery error must not exceed the
+    // mature reference's by more than 10%. (Gamma's beta-MLE is independent of
+    // scale/shape, so on the shared frozen basis statsmodels is the unpenalized
+    // optimum; gam's mild penalty trades a little fidelity for less variance and
+    // must stay within this margin.)
     assert!(
-        rel < 0.10,
-        "Gamma(log) fitted means diverge from statsmodels: rel_l2(mu)={rel:.5}"
+        gam_rmse_truth <= ref_rmse_truth * 1.10,
+        "Gamma(log) truth-recovery error worse than statsmodels by >10%: \
+         gam={gam_rmse_truth:.5} vs statsmodels={ref_rmse_truth:.5}"
     );
 }

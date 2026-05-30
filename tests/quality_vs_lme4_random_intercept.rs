@@ -1,33 +1,41 @@
-//! End-to-end quality: gam's random-intercept term must match `lme4::lmer` —
-//! the de-facto standard for mixed-effects variance-component estimation in R —
-//! on a synthetic random-intercept design.
+//! End-to-end quality: gam's random-intercept term must RECOVER THE TRUTH on a
+//! synthetic random-intercept design — not merely reproduce another tool's fit.
 //!
-//! `lme4::lmer(y ~ 1 + (1|g))` fits a Gaussian linear mixed model by REML and
-//! reports (a) the random-intercept variance σ_g² and residual variance σ_ε²
-//! (`VarCorr`/`sigma`) and (b) the per-group conditional modes (BLUPs,
-//! `ranef`). gam expresses the same structure via `group(g)` / `s(g, bs="re")`:
+//! The data is generated from a KNOWN structure:
+//!
+//!     y = 2π·sin(x) + μ_g + ε,   ε ~ N(0, σ_ε²=0.25),   μ_g = MU_G[g]
+//!
+//! so the ground-truth random-intercept deviations (the centred `MU_G`), the
+//! true random-intercept variance σ_g² (the population sample-variance of the
+//! centred `MU_G`), and the true residual variance σ_ε² = 0.25 are all known in
+//! closed form. gam expresses the structure via `group(g)` / `s(g, bs="re")`:
 //! the random intercept is a ridge-penalized factor block whose penalty is
-//! selected by REML, exactly the criterion lme4 optimizes. With a smooth main
-//! effect added, the gam model fit here is
+//! selected by REML. The fitted gam model is
 //!
 //!     y ~ s(x) + group(g)
 //!
-//! which exercises the cross-feature combination that matters: a penalized
-//! smooth additive with a random intercept (a by/RE-x-smooth interaction of
-//! penalized blocks). Both engines target the same REML objective, so they must
-//! agree on:
-//!   1. the per-group predicted intercepts (Pearson r vs lme4 conditional
-//!      modes — the *shape* of the group effects), and
-//!   2. the estimated variance components σ_g² and σ_ε².
+//! exercising the cross-feature combination that matters: a penalized smooth
+//! additive with a random intercept (penalized blocks side by side).
 //!
-//! The data is generated once and handed *identically* to gam and to lme4. A
-//! genuine divergence here is a real bug in gam's random-effect machinery, not
-//! something to paper over by loosening the bound.
+//! OBJECTIVE METRIC ASSERTED (truth recovery, never "matches lme4"):
+//!   1. ACCURACY of the per-group effects: RMSE(gam group deviations, centred
+//!      true μ_g) is a small fraction of the group-effect signal range, AND
+//!      gam's RMSE ≤ lme4's RMSE × 1.10 (match-or-beat lme4 on accuracy).
+//!   2. RESIDUAL VARIANCE recovery: |σ̂_ε² − 0.25| small, AND gam at least as
+//!      accurate as lme4 (its |error| ≤ lme4's |error| × 1.10).
+//!   3. RANDOM-INTERCEPT VARIANCE recovery: σ̂_g² recovers the true population
+//!      sample variance of the centred μ_g, AND gam ≤ lme4 error × 1.10.
+//!
+//! lme4 is fit on the IDENTICAL data and retained only as a BASELINE TO
+//! MATCH-OR-BEAT on each accuracy metric — never as the pass criterion. The
+//! primary claim is that gam recovers the data-generating truth. A genuine
+//! shortfall here is a real bug in gam's random-effect machinery, not something
+//! to paper over by loosening the bound.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, run_r};
+use gam::test_support::reference::{Column, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -161,41 +169,82 @@ fn gam_random_intercept_matches_lme4() {
         lme4_ranef.len()
     );
 
-    // ---- compare ----------------------------------------------------------
-    let corr = pearson(&gam_dev, lme4_ranef);
-    let var_g_rel = (gam_sigma_g2 - lme4_sigma_g2).abs() / lme4_sigma_g2.abs().max(1e-12);
-    let var_e_rel = (gam_resid_var - lme4_sigma_e2).abs() / lme4_sigma_e2.abs().max(1e-12);
+    // ---- ground truth (closed form from the data-generating process) ------
+    // True per-group deviations: the population intercepts MU_G centred to
+    // mean-zero, matching the conditional-mode convention used for gam_dev and
+    // lme4's ranef.
+    let true_mu_mean = MU_G.iter().sum::<f64>() / N_GROUPS as f64;
+    let true_dev: Vec<f64> = MU_G.iter().map(|m| m - true_mu_mean).collect();
+    // True random-intercept variance in the same (n-1) sample-variance
+    // convention used to compute gam_sigma_g2 from the predicted deviations.
+    let true_sigma_g2 = true_dev.iter().map(|d| d * d).sum::<f64>() / (N_GROUPS as f64 - 1.0);
+    // Signal range of the group effects, used as the scale for the accuracy bar.
+    let dev_range = true_dev.iter().cloned().fold(f64::MIN, f64::max)
+        - true_dev.iter().cloned().fold(f64::MAX, f64::min);
+
+    // ---- accuracy vs truth (the OBJECTIVE metric) -------------------------
+    // (1) Per-group effect accuracy: RMSE of the predicted group deviations
+    // against the true centred μ_g. lme4's conditional modes are also scored
+    // against the same truth, purely as a baseline to match-or-beat.
+    let gam_dev_rmse = rmse(&gam_dev, &true_dev);
+    let lme4_dev_rmse = rmse(lme4_ranef, &true_dev);
+
+    // (2) Residual-variance accuracy: absolute error against the true σ_ε²=0.25.
+    let gam_e_err = (gam_resid_var - RESID_VAR).abs();
+    let lme4_e_err = (lme4_sigma_e2 - RESID_VAR).abs();
+
+    // (3) Random-intercept-variance accuracy: absolute error against the true
+    // population sample variance of the centred μ_g.
+    let gam_g_err = (gam_sigma_g2 - true_sigma_g2).abs();
+    let lme4_g_err = (lme4_sigma_g2 - true_sigma_g2).abs();
 
     eprintln!(
-        "random-intercept vs lme4: n={n} groups={N_GROUPS} \
-         pearson(group effects)={corr:.5} \
-         sigma_g2 gam={gam_sigma_g2:.4} lme4={lme4_sigma_g2:.4} rel={var_g_rel:.4} \
-         sigma_e2 gam={gam_resid_var:.4} lme4={lme4_sigma_e2:.4} (truth {RESID_VAR:.4}) rel={var_e_rel:.4}"
+        "random-intercept truth recovery: n={n} groups={N_GROUPS} \
+         dev_rmse gam={gam_dev_rmse:.4} lme4={lme4_dev_rmse:.4} (range {dev_range:.3}) | \
+         sigma_e2 gam={gam_resid_var:.4} lme4={lme4_sigma_e2:.4} truth={RESID_VAR:.4} \
+         (err gam={gam_e_err:.4} lme4={lme4_e_err:.4}) | \
+         sigma_g2 gam={gam_sigma_g2:.4} lme4={lme4_sigma_g2:.4} truth={true_sigma_g2:.4} \
+         (err gam={gam_g_err:.4} lme4={lme4_g_err:.4})"
     );
 
-    // (1) The per-group effects are well separated (8 distinct μ_g spanning
-    // [-1.5, 1.5]) and far above the per-group noise floor (σ_ε²/60 ≈ 0.004), so
-    // both REML engines recover essentially the same BLUP ordering and
-    // magnitudes. Pearson r > 0.99 is the principled bound: anything lower means
-    // gam's random-intercept shrinkage/estimation genuinely disagrees with the
-    // mixed-model standard.
+    // (1) The 8 group effects span [-1.5, 1.5] (range ≈ 3.0) and sit far above
+    // the per-group noise floor (σ_ε²/60 ≈ 0.004), so a faithful random-intercept
+    // estimator pins them tightly. RMSE ≤ 10% of the signal range is the
+    // principled accuracy bar; gam must additionally do no worse than lme4 ×1.10.
     assert!(
-        corr > 0.99,
-        "gam per-group intercepts disagree with lme4 conditional modes: pearson={corr:.5}"
+        gam_dev_rmse <= 0.10 * dev_range,
+        "gam group effects miss the truth: rmse={gam_dev_rmse:.4} > {:.4} (10% of range {dev_range:.3})",
+        0.10 * dev_range
     );
-    // (2) Both fit residual variance by REML on the same data; σ_ε² is the
-    // best-determined component (n=480 residual d.f.), so it must match tightly.
     assert!(
-        var_e_rel < 0.10,
-        "residual variance disagrees with lme4: gam={gam_resid_var:.4} lme4={lme4_sigma_e2:.4} (rel={var_e_rel:.4})"
+        gam_dev_rmse <= lme4_dev_rmse * 1.10,
+        "gam group-effect accuracy worse than lme4 baseline: gam_rmse={gam_dev_rmse:.4} vs lme4_rmse={lme4_dev_rmse:.4}"
     );
-    // (3) The random-intercept variance is estimated from only 8 groups, so it
-    // is the noisiest component for *both* engines; they nonetheless target the
-    // same REML estimand. 0.10 relative is the principled bound — both engines
-    // see the identical 8 group means, and shrinkage is ~1% at 60 obs/group, so
-    // a larger gap signals a real divergence in the variance-component machinery.
+
+    // (2) Residual variance is the best-determined component (≈480 residual
+    // d.f.); a faithful REML fit nails σ_ε²=0.25 to within 10% absolute-relative
+    // of the truth. gam must also match-or-beat lme4's accuracy.
     assert!(
-        var_g_rel < 0.10,
-        "random-intercept variance disagrees with lme4: gam={gam_sigma_g2:.4} lme4={lme4_sigma_g2:.4} (rel={var_g_rel:.4})"
+        gam_e_err <= 0.10 * RESID_VAR,
+        "gam residual variance misses truth 0.25: sigma_e2={gam_resid_var:.4} (err={gam_e_err:.4} > {:.4})",
+        0.10 * RESID_VAR
+    );
+    assert!(
+        gam_e_err <= lme4_e_err * 1.10 + 1e-6,
+        "gam residual-variance accuracy worse than lme4 baseline: gam_err={gam_e_err:.4} vs lme4_err={lme4_e_err:.4}"
+    );
+
+    // (3) The random-intercept variance is estimated from only 8 groups and so
+    // is the noisiest component, but with shrinkage ≈1% at 60 obs/group the
+    // BLUP-derived estimate should recover the true population variance within
+    // 25% of its value. gam must also do no worse than lme4 ×1.10.
+    assert!(
+        gam_g_err <= 0.25 * true_sigma_g2,
+        "gam random-intercept variance misses truth: sigma_g2={gam_sigma_g2:.4} truth={true_sigma_g2:.4} (err={gam_g_err:.4} > {:.4})",
+        0.25 * true_sigma_g2
+    );
+    assert!(
+        gam_g_err <= lme4_g_err * 1.10 + 1e-6,
+        "gam random-intercept-variance accuracy worse than lme4 baseline: gam_err={gam_g_err:.4} vs lme4_err={lme4_g_err:.4}"
     );
 }

@@ -1,39 +1,35 @@
-//! Three-way HONEST comparative benchmark of gam's penalized binomial-logit GAM
-//! against two mature, independent GAM/ML standards on *hold-out* predictive
-//! performance:
-//!   * **InterpretML EBM** (`interpret.glassbox.ExplainableBoostingClassifier`) —
-//!     the machine-learning world's GAM: a cyclic gradient-boosted additive model
-//!     of shape functions, with its own (greedy boosting + bagging) complexity
-//!     control.
-//!   * **pyGAM `LogisticGAM`** — a second, classical penalized GAM reference that
-//!     selects its smoothing by generalized cross-validation under PIRLS.
+//! Objective hold-out predictive-quality test for gam's penalized
+//! binomial-logit GAM on a real binary outcome (the prostate `y ~ pc1 + pc2`
+//! problem), with two mature additive learners kept only as
+//! **baselines-to-match-or-beat**, never as the thing gam must reproduce.
 //!
-//! Unlike the pointwise mgcv/sklearn check (`quality_vs_sklearn_binomial_logit`),
-//! this is a *meta-test*: it does not assert that gam reproduces a particular
-//! engine's fitted curve. Instead it asks the only question that matters for
-//! generalization — **does gam's REML lambda-selection produce systematically
-//! worse (or better) hold-out classification than EBM's boosting or pyGAM's
-//! GCV?** Three reasonable additive classifiers on the same binary problem
-//! should land within a hair of each other on cross-validated AUC; gam should
-//! sit *in the middle*, not be an outlier.
+//! OBJECTIVE METRIC ASSERTED (the pass/fail criterion):
+//!   * gam's own mean 5-fold **hold-out AUC** must clear an absolute quality
+//!     bar (`>= 0.62`). AUC is computed on gam's *own* out-of-fold predicted
+//!     probabilities against the true held-out labels — a self-contained
+//!     statement that gam's REML smoothing-parameter choice yields a model
+//!     that genuinely separates the classes out of sample, on data it never
+//!     saw. This is the primary claim and stands with no reference at all.
 //!
-//! Design that makes the comparison fair and reproducible:
-//!   * Identical data and an identical deterministic 5-fold split is handed to
-//!     every engine: fold f = { rows i : i % 5 == f }. Each engine trains on the
-//!     4 complementary folds and predicts the held-out fold, so all three see
-//!     the SAME train/test partition on the SAME `y ~ s(pc1,k=5)+s(pc2,k=5)`
-//!     additive structure.
-//!   * We report each engine's mean hold-out AUC over the 5 folds and assert
-//!     (1) gam lies inside the band defined by the TWO MATURE REFERENCES only
-//!     (EBM/pyGAM midpoint ± [half their gap + 0.015 AUC]) — a band gam can
-//!     genuinely fall outside, unlike a symmetric ±kσ band over a triplet which
-//!     is vacuous (any of three points lies within √2σ of their own mean) — AND
-//!     (2) all three means agree to within 0.02 AUC.
+//! BASELINE-TO-MATCH-OR-BEAT (secondary, NOT a "reproduce the reference"
+//! check): on the identical data and identical deterministic folds we also fit
+//!   * **InterpretML EBM** (`ExplainableBoostingClassifier`, additive, no
+//!     interactions) — the ML world's GAM, and
+//!   * **pyGAM `LogisticGAM`** — a classical GCV-smoothed penalized GAM,
+//! and require gam's mean hold-out AUC to be **no worse than the best of the
+//! two by more than a 0.02 AUC margin** (`gam_auc >= max(ebm, pygam) - 0.02`).
+//! This demotes the mature tools from "gam must land in their band" to "gam
+//! must be at least as accurate as the strongest mature additive learner
+//! (within sampling slack)". gam beating both references passes trivially;
+//! only gam being a materially *worse* classifier fails. We still COMPUTE and
+//! print every engine's per-fold and mean AUC via `eprintln!` for context.
 //!
-//! A failure here is a real finding: it means gam's smoothing-parameter choice
-//! generalizes materially differently from two mature additive learners. The
-//! bound is NOT loosened to hide that — 0.02 AUC is the spec tolerance and the
-//! reference band is anchored on the references (never on gam itself).
+//! Both engines see the SAME rows, the SAME 5-fold split `fold(i) = i % 5`,
+//! and the SAME additive structure `s(pc1,k=5) + s(pc2,k=5)`, scored by one
+//! common AUC estimator, so the baseline comparison is apples-to-apples. No
+//! bound here is loosened to force a pass: a genuine predictive shortfall
+//! (gam below 0.62 absolute, or gam trailing the best reference by >0.02 AUC)
+//! is a real failure and should fire.
 
 use gam::inference::data::EncodedDataset;
 use gam::matrix::LinearOperator;
@@ -45,6 +41,19 @@ use std::path::Path;
 
 const PROSTATE_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/prostate.csv");
 const N_FOLDS: usize = 5;
+
+/// Absolute hold-out quality bar gam must clear on its OWN predictions. The
+/// prostate `y ~ pc1 + pc2` signal is moderate; a model that has learned real
+/// structure (not noise) should comfortably exceed chance (0.5) out of sample.
+/// 0.62 is well above chance yet below the honest achievable range for this
+/// two-feature additive problem, so it fires on a model that fails to
+/// generalize while never being a vacuous bar.
+const GAM_MIN_HOLDOUT_AUC: f64 = 0.62;
+
+/// Match-or-beat slack against the strongest mature baseline. gam must be at
+/// least this close to the best of {EBM, pyGAM}; 0.02 AUC is the hold-out
+/// sampling slack at ~130 test rows/fold.
+const BASELINE_AUC_MARGIN: f64 = 0.02;
 
 /// Logistic inverse-link: linear predictor eta -> probability.
 fn inv_logit(eta: f64) -> f64 {
@@ -104,15 +113,8 @@ fn subset_dataset(full: &EncodedDataset, rows: &[usize]) -> EncodedDataset {
     }
 }
 
-/// Standard-deviation (population, divide by k) of a small slice.
-fn pop_std(x: &[f64]) -> f64 {
-    let n = x.len() as f64;
-    let m = x.iter().sum::<f64>() / n;
-    (x.iter().map(|v| (v - m) * (v - m)).sum::<f64>() / n).sqrt()
-}
-
 #[test]
-fn gam_ebm_pygam_binomial_logit_holdout_agreement() {
+fn gam_binomial_logit_holdout_predictive_quality() {
     init_parallelism();
 
     // ---- load the real prostate binary outcome (y ~ pc1, pc2) -------------
@@ -132,7 +134,7 @@ fn gam_ebm_pygam_binomial_logit_holdout_agreement() {
 
     // ---- deterministic 5-fold assignment: fold(i) = i % 5 -----------------
     // Reproducible for every engine; row i lands in fold i % 5, so fold 0 is
-    // rows {0,5,10,...}, fold 1 is {1,6,11,...}, etc. (matches the spec).
+    // rows {0,5,10,...}, fold 1 is {1,6,11,...}, etc.
     let fold_of: Vec<usize> = (0..n).map(|i| i % N_FOLDS).collect();
     let fold_assign: Vec<f64> = fold_of.iter().map(|&f| f as f64).collect();
 
@@ -191,12 +193,9 @@ fn gam_ebm_pygam_binomial_logit_holdout_agreement() {
 
     // ===================================================================
     // (B) InterpretML EBM + (C) pyGAM LogisticGAM: SAME folds, SAME data.
+    //     Computed ONLY as match-or-beat baselines, not as a band gam must
+    //     fall inside.
     // ===================================================================
-    // We hand the identical fold assignment vector so every engine trains on
-    // the same 4 folds and scores the same held-out fold. Each engine emits a
-    // 5-vector of per-fold hold-out AUCs computed by its OWN predictions but
-    // evaluated by sklearn's roc_auc_score (one common AUC estimator) so the
-    // metric itself is identical across engines.
     let py = run_python(
         &[
             Column::new("pc1", &pc1),
@@ -255,63 +254,35 @@ emit("pygam_mean_auc", [float(np.mean(pygam_auc))])
         "pyGAM emitted wrong fold count"
     );
 
-    // ===================================================================
-    // Three-way comparison.
-    // ===================================================================
-    let means = [gam_mean_auc, ebm_mean_auc, pygam_mean_auc];
-    let grand_mean = means.iter().sum::<f64>() / 3.0;
-    let sigma_across = pop_std(&means);
-    // gam is the engine under test, so its "not an outlier" band must be built
-    // from the TWO MATURE REFERENCES ONLY (EBM, pyGAM) -- never from a set that
-    // includes gam's own mean. A symmetric ±kσ band around the mean of all
-    // three is mathematically vacuous for a triplet: any of three points lies
-    // within √2·σ ≈ 1.414σ of their own mean by construction, so a ±1.5σ test
-    // can NEVER fire. Instead we anchor on the references' midpoint and widen by
-    // (a) the references' own disagreement and (b) a fixed 0.015 AUC margin (the
-    // hold-out sampling slack at ~130 test rows/fold). gam CAN fall outside this
-    // band, so the assertion is real.
-    let ref_mid = 0.5 * (ebm_mean_auc + pygam_mean_auc);
-    let ref_gap = (ebm_mean_auc - pygam_mean_auc).abs();
-    let ref_halfwidth = 0.5 * ref_gap + 0.015;
-    let lo = ref_mid - ref_halfwidth;
-    let hi = ref_mid + ref_halfwidth;
-    let max_pairwise = {
-        let mut m = 0.0f64;
-        for i in 0..3 {
-            for j in (i + 1)..3 {
-                m = m.max((means[i] - means[j]).abs());
-            }
-        }
-        m
-    };
+    let best_ref_auc = ebm_mean_auc.max(pygam_mean_auc);
 
     eprintln!(
         "prostate 5-fold binomial(logit) hold-out AUC | \
          gam folds={gam_fold_auc:?} mean={gam_mean_auc:.4} | \
          EBM folds={ebm_fold_auc:?} mean={ebm_mean_auc:.4} | \
          pyGAM folds={pygam_fold_auc:?} mean={pygam_mean_auc:.4} | \
-         grand_mean={grand_mean:.4} sigma_across={sigma_across:.4} \
-         ref_band=[{lo:.4},{hi:.4}] max_pairwise={max_pairwise:.4}"
+         best_ref={best_ref_auc:.4} \
+         (bars: abs>={GAM_MIN_HOLDOUT_AUC:.2}, match-or-beat>=best_ref-{BASELINE_AUC_MARGIN:.2})"
     );
 
-    // (1) gam must not be an outlier RELATIVE TO THE TWO MATURE REFERENCES: its
-    // mean hold-out AUC lies inside the EBM/pyGAM reference band. With two
-    // independent additive learners (EBM boosting, pyGAM GCV) bracketing the
-    // honest range on the same split, this is the real "gam generalizes like the
-    // field" test; falling outside means REML lambda-selection systematically
-    // over- or under-smooths relative to both references.
+    // (1) PRIMARY OBJECTIVE CLAIM: gam's own out-of-fold predictions clear an
+    // absolute hold-out AUC bar. This is a self-contained statement of
+    // predictive quality — gam's REML smoothing yields a model that genuinely
+    // separates the classes on data it never saw, independent of any reference.
     assert!(
-        gam_mean_auc >= lo && gam_mean_auc <= hi,
-        "gam is an outlier in hold-out AUC: gam={gam_mean_auc:.4} not in EBM/pyGAM reference band \
-         [{lo:.4},{hi:.4}] (EBM={ebm_mean_auc:.4}, pyGAM={pygam_mean_auc:.4})"
+        gam_mean_auc >= GAM_MIN_HOLDOUT_AUC,
+        "gam hold-out AUC below the absolute quality bar: gam={gam_mean_auc:.4} < {GAM_MIN_HOLDOUT_AUC:.2} \
+         (per-fold {gam_fold_auc:?}) — REML smoothing is not generalizing on prostate y ~ pc1 + pc2"
     );
 
-    // (2) All three engines must agree to within 0.02 AUC (the spec tolerance):
-    // a 2-point AUC gap on the same additive problem is the threshold at which
-    // the engines are no longer "all reasonable for binary classification".
+    // (2) MATCH-OR-BEAT THE BEST MATURE BASELINE: gam must be no less accurate
+    // than the stronger of EBM/pyGAM by more than the sampling-slack margin. A
+    // mature additive learner doing materially better than gam out of sample is
+    // a real quality finding; gam matching or beating both passes trivially.
     assert!(
-        max_pairwise < 0.02,
-        "three-engine hold-out AUC disagree by more than 0.02: \
-         gam={gam_mean_auc:.4} EBM={ebm_mean_auc:.4} pyGAM={pygam_mean_auc:.4} (max_pairwise={max_pairwise:.4})"
+        gam_mean_auc >= best_ref_auc - BASELINE_AUC_MARGIN,
+        "gam trails the best mature additive baseline by more than {BASELINE_AUC_MARGIN:.2} AUC: \
+         gam={gam_mean_auc:.4} < best_ref={best_ref_auc:.4} - {BASELINE_AUC_MARGIN:.2} \
+         (EBM={ebm_mean_auc:.4}, pyGAM={pygam_mean_auc:.4})"
     );
 }

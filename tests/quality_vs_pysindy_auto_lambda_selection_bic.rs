@@ -1,35 +1,38 @@
-//! End-to-end quality: gam's automatic SINDy `λ` selection via BIC must match
-//! **pysindy** — the reference implementation of Sparse Identification of
-//! Nonlinear Dynamics (Brunton, Proctor & Kutz, PNAS 2016) — when both run the
-//! identical sequentially-thresholded least-squares (STLSQ) sweep over the same
-//! geometric `λ` grid and pick the minimum-BIC model on the same library and
-//! derivatives.
-//!
-//! Why pysindy is the right comparator: `sindy_stlsq_auto_lam` reimplements the
-//! literature-standard SINDy auto-`λ` recipe (STLSQ per grid point, Schwarz-BIC
-//! complexity rule). pysindy ships the canonical `STLSQ` optimizer; running it
-//! on the *same* `Θ`/`Ẋ` and scoring with the *same* Gaussian profile-likelihood
-//! BIC `n·log(RSS/n) + k·log(n)` is a head-to-head check that gam's grid
-//! generation, thresholding, and BIC formula reproduce the reference choice.
+//! End-to-end quality: gam's automatic SINDy `λ` selection via BIC must RECOVER
+//! THE TRUE SPARSE DYNAMICS of a system whose governing equations we know
+//! exactly. This is a truth-recovery test, not a "reproduce pysindy" test:
+//! matching another tool's fitted coefficients proves nothing about correctness,
+//! so the pass/fail criterion is gam's distance to the *analytic ground-truth
+//! coefficient matrix*, with **pysindy** (Brunton, Proctor & Kutz, PNAS 2016 —
+//! the canonical SINDy implementation) demoted to a match-or-beat ACCURACY
+//! baseline on that same truth metric.
 //!
 //! Data: an 800-row trajectory of the planar system
 //!     dx/dt = 2x − y + 0.5·x²y,   dy/dt = −y + 0.1·x·y
 //! integrated with fixed-step RK4 from a fixed seed; near-exact analytic
 //! derivatives (noise std 1e-8). The library is the polynomial set
 //! [1, x, y, x², xy, y², x²y, xy²] — a superset of the true terms so STLSQ has
-//! genuine work to do pruning spurious columns. The SAME `Θ` and `Ẋ` matrices
-//! are handed to both engines (gam reads them as ndarrays; pysindy gets them
-//! flattened over the wire), so any disagreement is a real divergence in the
-//! selection logic, not a data or library mismatch.
+//! genuine work to do pruning spurious columns. In the `(p, d)` coefficient
+//! layout (one column per state derivative) the ground-truth matrix is therefore
+//!     Ξ*[x, 0]=2, Ξ*[y, 0]=−1, Ξ*[x²y, 0]=0.5  (dx/dt column),
+//!     Ξ*[y, 1]=−1, Ξ*[xy, 1]=0.1               (dy/dt column),
+//! all other entries exactly zero. The SAME `Θ` and `Ẋ` matrices are handed to
+//! both engines (gam reads them as ndarrays; pysindy gets them flattened over the
+//! wire), so the baseline comparison is fair.
 //!
-//! Asserted (un-weakened) bounds:
-//!   1. selected `λ` agrees within a factor of 2 (the spec's grid-step tolerance);
-//!   2. coefficient matrices agree in relative L2 (both must recover the true
-//!      sparse dynamics, so they coincide to STLSQ tolerance);
-//!   3. the active support has identical cardinality.
+//! Objective metric asserted (un-weakened):
+//!   1. EXACT SUPPORT RECOVERY — gam's nonzero entries are precisely the five
+//!      true-term locations and nothing else (no spurious columns survive, no
+//!      true column is dropped).
+//!   2. COEFFICIENT ACCURACY VS TRUTH — max-abs error of gam's nonzero
+//!      coefficients against the analytic values is below a principled bar
+//!      (the derivatives carry only ~1e-8 noise, so the true terms must be
+//!      recovered to well under 1% of the smallest true coefficient, 0.1).
+//!   3. MATCH-OR-BEAT — gam's relative-L2 error to truth is no worse than
+//!      1.10× pysindy's relative-L2 error to the same truth.
 
 use gam::solver::sindy::{SindyPenaltyKind, sindy_stlsq_auto_lam};
-use gam::test_support::reference::{Column, relative_l2, run_python};
+use gam::test_support::reference::{Column, max_abs_diff, relative_l2, run_python};
 use ndarray::Array2;
 
 /// Polynomial library width: [1, x, y, x², xy, y², x²y, xy²].
@@ -46,6 +49,21 @@ fn library_row(x: f64, y: f64) -> [f64; P] {
     [1.0, x, y, x * x, x * y, y * y, x * x * y, x * y * y]
 }
 
+/// Analytic ground-truth coefficient matrix `Ξ* ∈ ℝ^{P × D}` for the planar
+/// system, in the same row-major `(library_term, derivative)` layout gam emits.
+/// Library order is [1, x, y, x², xy, y², x²y, xy²].
+///   dx/dt = 2x − y + 0.5·x²y → col 0: index 1→2.0, 2→−1.0, 6→0.5
+///   dy/dt = −y + 0.1·x·y     → col 1: index 2→−1.0, 4→0.1
+fn truth_coefficients() -> Array2<f64> {
+    let mut xi = Array2::<f64>::zeros((P, D));
+    xi[(1, 0)] = 2.0; // x      in dx/dt
+    xi[(2, 0)] = -1.0; // y      in dx/dt
+    xi[(6, 0)] = 0.5; // x²y    in dx/dt
+    xi[(2, 1)] = -1.0; // y      in dy/dt
+    xi[(4, 1)] = 0.1; // xy     in dy/dt
+    xi
+}
+
 /// Analytic vector field f(x, y) = (dx/dt, dy/dt).
 fn vector_field(x: f64, y: f64) -> (f64, f64) {
     let dx = 2.0 * x - y + 0.5 * x * x * y;
@@ -54,7 +72,7 @@ fn vector_field(x: f64, y: f64) -> (f64, f64) {
 }
 
 #[test]
-fn gam_sindy_auto_lambda_matches_pysindy_bic() {
+fn gam_sindy_auto_lambda_recovers_true_dynamics() {
     // ---- deterministic RK4 trajectory + library/derivative matrices --------
     let n = 800usize;
     let dt = 1.0e-3;
@@ -105,12 +123,14 @@ fn gam_sindy_auto_lambda_matches_pysindy_bic() {
     )
     .expect("gam sindy_stlsq_auto_lam");
     let gam_coef = &gam_res.coefficients;
-    let gam_support = gam_coef.iter().filter(|&&v| v != 0.0).count();
+    let truth = truth_coefficients();
+    let truth_flat: Vec<f64> = truth.iter().copied().collect();
 
-    // ---- pysindy: identical STLSQ sweep + identical BIC, same Θ/Ẋ ----------
+    // ---- pysindy baseline: its own STLSQ+BIC sweep on the same Θ/Ẋ ---------
     // Flatten Θ (row-major, n×P) and Ẋ (n×D) into wire columns; Python rebuilds
-    // both matrices and runs pysindy.STLSQ at each grid point, scoring with the
-    // same Gaussian profile-likelihood BIC gam uses.
+    // both matrices and runs pysindy.STLSQ at each grid point, picking its own
+    // minimum-BIC model. This is the reference fit we judge AGAINST THE SAME
+    // ground truth (it is not the pass criterion).
     let theta_flat_raw: Vec<f64> = theta.iter().copied().collect();
     let dz_flat_raw: Vec<f64> = dz.iter().copied().collect();
     let shape: Vec<f64> = vec![n as f64, P as f64, D as f64, TOL, MAX_ROUNDS as f64];
@@ -178,76 +198,73 @@ for lam in grid:
         best_xi = Xi
 
 emit("lam", [best_lam])
-emit("bic", [best_bic])
-emit("support", [int(np.count_nonzero(best_xi))])
 emit("coef", best_xi.reshape(-1))  # row-major (p, d), matches gam ndarray order
 "#,
     );
 
     let py_lam = r.scalar("lam");
-    let py_bic = r.scalar("bic");
-    let py_support = r.scalar("support") as usize;
     let py_coef = r.vector("coef");
 
-    // gam's own BIC at the selected model, computed identically, for reporting.
-    let gam_bic = gaussian_profile_bic(&theta, &dz, gam_coef);
     let gam_coef_flat: Vec<f64> = gam_coef.iter().copied().collect();
-    assert_eq!(py_coef.len(), gam_coef_flat.len(), "coef length mismatch");
-    let coef_rel = relative_l2(&gam_coef_flat, py_coef);
+    assert_eq!(
+        py_coef.len(),
+        gam_coef_flat.len(),
+        "pysindy coef length mismatch"
+    );
+    assert_eq!(
+        gam_coef_flat.len(),
+        truth_flat.len(),
+        "gam coef length mismatch with truth"
+    );
+
+    // PRIMARY objective metric: distance of each engine's recovered coefficients
+    // to the ANALYTIC ground truth (not to each other).
+    let gam_err_vs_truth = relative_l2(&gam_coef_flat, &truth_flat);
+    let py_err_vs_truth = relative_l2(py_coef, &truth_flat);
+    let gam_max_abs_err = max_abs_diff(&gam_coef_flat, &truth_flat);
+
+    // The five true-term locations, in the (j outer, c inner) order the scan
+    // below produces them: (1,0)=x→dx, (2,0)=y→dx, (2,1)=y→dy, (4,1)=xy→dy,
+    // (6,0)=x²y→dx.
+    let true_support: Vec<(usize, usize)> = vec![(1, 0), (2, 0), (2, 1), (4, 1), (6, 0)];
+    let gam_recovered_support: Vec<(usize, usize)> = (0..P)
+        .flat_map(|j| (0..D).map(move |c| (j, c)))
+        .filter(|&(j, c)| gam_coef[(j, c)] != 0.0)
+        .collect();
 
     eprintln!(
-        "sindy auto-λ BIC: n={n} P={P} D={D} | gam_lam={gam_lam:.3e} py_lam={py_lam:.3e} \
-         | gam_bic={gam_bic:.3} py_bic={py_bic:.3} | gam_support={gam_support} \
-         py_support={py_support} | coef_rel_l2={coef_rel:.4e}"
+        "sindy truth recovery: n={n} P={P} D={D} | gam_lam={gam_lam:.3e} py_lam={py_lam:.3e} \
+         | gam_rel_l2_vs_truth={gam_err_vs_truth:.4e} py_rel_l2_vs_truth={py_err_vs_truth:.4e} \
+         | gam_max_abs_err={gam_max_abs_err:.4e} | gam_support={gam_recovered_support:?}"
     );
 
-    // (1) Selected λ within a factor of 2 (one grid step in a decade-spaced
-    // grid is 10×, so factor-2 is well inside a single step): the two engines
-    // must land on the same grid point.
-    let lam_ratio = (gam_lam / py_lam).max(py_lam / gam_lam);
-    assert!(
-        lam_ratio <= 2.0,
-        "selected λ disagree beyond factor 2: gam={gam_lam:.3e} py={py_lam:.3e} (ratio={lam_ratio:.3})"
-    );
-
-    // (2) Identical support cardinality: both must recover the same sparse
-    // structure of the true dynamics.
+    // (1) EXACT SUPPORT RECOVERY: gam's nonzero entries are precisely the five
+    // true-term locations — no spurious columns survive, no true column drops.
     assert_eq!(
-        gam_support, py_support,
-        "active-support cardinality differs: gam={gam_support} py={py_support}"
+        gam_recovered_support, true_support,
+        "gam did not recover the exact true support: got {gam_recovered_support:?}, \
+         expected {true_support:?}"
     );
 
-    // (3) Coefficient matrices coincide. With near-exact derivatives both engines
-    // recover the same support and refit ridge-regularized LS on it, so the
-    // fitted coefficients agree to well under 1% relative L2; 2e-2 leaves margin
-    // for the differing ridge solvers (faer Cholesky vs sklearn) while still
-    // catching any structural disagreement.
+    // (2) COEFFICIENT ACCURACY VS TRUTH: with ~1e-8 derivative noise the true
+    // coefficients must be recovered to far below 1% of the smallest true
+    // coefficient (0.1), i.e. max-abs error well under 1e-3.
     assert!(
-        coef_rel < 2.0e-2,
-        "selected coefficient matrices diverge from pysindy: rel_l2={coef_rel:.4e}"
+        gam_max_abs_err < 1.0e-3,
+        "gam coefficients diverge from analytic truth: max_abs_err={gam_max_abs_err:.4e} \
+         (true coefficients [2, -1, 0.5, -1, 0.1])"
     );
-}
 
-/// Gaussian profile-likelihood BIC `Σ_c [ n·log(RSS_c/n) + k_c·log(n) ]` —
-/// the same formula gam's `sindy_stlsq_auto_lam` minimizes, recomputed here on
-/// the selected model for head-to-head reporting against pysindy's score.
-fn gaussian_profile_bic(theta: &Array2<f64>, dz: &Array2<f64>, xi: &Array2<f64>) -> f64 {
-    let n = theta.nrows();
-    let d = dz.ncols();
-    let resid = &theta.dot(xi) - dz;
-    let n_f = n as f64;
-    let mut bic = 0.0;
-    for c in 0..d {
-        let rss: f64 = resid
-            .column(c)
-            .iter()
-            .map(|&v| v * v)
-            .sum::<f64>()
-            .max(1.0e-300);
-        let k = xi.column(c).iter().filter(|&&v| v != 0.0).count() as f64;
-        bic += n_f * (rss / n_f).ln() + k * n_f.ln();
-    }
-    bic
+    // (3) MATCH-OR-BEAT pysindy on accuracy-to-truth: gam's relative-L2 error to
+    // the ground truth is no worse than 1.10× the reference's error to the same
+    // truth. This keeps pysindy as a baseline without making "same as pysindy"
+    // the pass criterion — both are judged against the known answer.
+    assert!(
+        gam_err_vs_truth <= py_err_vs_truth * 1.10,
+        "gam less accurate to truth than pysindy: gam_rel_l2={gam_err_vs_truth:.4e} \
+         py_rel_l2={py_err_vs_truth:.4e} (allowed {:.4e})",
+        py_err_vs_truth * 1.10
+    );
 }
 
 /// Right-pad `v` with NaN up to `len` so every wire column shares one row count.

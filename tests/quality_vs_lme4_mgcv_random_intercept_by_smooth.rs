@@ -1,37 +1,49 @@
 //! End-to-end quality: gam's COMBINATION of a shared smooth, a by-factor smooth,
-//! and a random intercept — `y ~ s(x) + s(x, by=g) + group(g)` — benchmarked
-//! against the two mature standards for the two estimands it must partition.
+//! and a random intercept — `y ~ s(x) + s(x, by=g) + group(g)`. The data is
+//! synthesized from a KNOWN generative law, so the test asserts OBJECTIVE TRUTH
+//! RECOVERY, not agreement with any reference tool.
 //!
-//!   * `mgcv::gam(y ~ s(x) + s(x, by = as.factor(g)))` — the de-facto GAM
-//!     reference — for the *group-specific smooth shape*. mgcv's `s(x)` is a
-//!     shared main-effect curve and each `s(x, by=level)` adds a level-specific
-//!     deviation, so the per-group fitted smooth is `s(x) + s(x, by=g)`. This is
-//!     exactly the fixed-smooth structure gam expresses with `s(x) + s(x,by=g)`.
-//!   * `lme4::lmer(y ~ ns(x) + (1 | g))` — the de-facto mixed-model reference —
-//!     for the *random-intercept variance component* and the per-group conditional
-//!     modes (BLUPs). gam's `group(g)` is a REML-penalized random intercept, the
-//!     same estimand lme4 optimizes.
+//! Generative truth (per row i in group g):
+//!   μ_i  = base_smooth(x_i) + 0.15·slope_g·x_i + intercept_g      (the true mean)
+//!   y_i  = μ_i + ε_i,   ε_i ~ N(0, σ_ε²),  σ_ε² = RESID_VAR
+//! with one slope_g and one intercept_g drawn per group. The model must PARTITION
+//! this without double-counting: the per-group vertical offset belongs to
+//! `group(g)`, the per-group curvature/tilt to `s(x,by=g)`, the shared shape to
+//! `s(x)`, and the leftover scatter to σ_ε². A double-penalization or
+//! mis-attribution bug corrupts the recovered mean, the recovered intercepts, or
+//! the recovered noise scale — all three are measured against the TRUE values.
 //!
-//! The point of the combination is that gam must correctly PARTITION variance
-//! between the fixed by-smooth and the random intercept without double-counting:
-//! the per-group vertical offset must land in `group(g)` (matching lme4's BLUP),
-//! while the per-group *curvature* must land in `s(x,by=g)` (matching mgcv's
-//! smooth). A double-penalization or mis-attribution bug shows up as either the
-//! group curves disagreeing with mgcv or the intercepts disagreeing with lme4.
+//! OBJECTIVE assertions (truth recovery; bars are principled, not tool-matched):
+//!   1. MEAN RECOVERY: RMSE(gam_fitted, true μ) over all n rows must sit below the
+//!      irreducible noise floor — RMSE ≤ 0.5·σ_ε. A fit cannot do better than the
+//!      noise it cannot see; landing well under σ_ε proves the structured signal
+//!      (shared smooth + per-group tilt + per-group offset) was recovered, not the
+//!      noise overfit.
+//!   2. INTERCEPT RECOVERY: the per-group offsets gam attributes to `group(g)`
+//!      (read at a common x and centered across groups) must track the TRUE
+//!      centered intercepts intercept_g with small absolute RMSE
+//!      (≤ 0.10, i.e. ≤ 25% of the intercept SD 0.4). Misattributing the offset to
+//!      the smooth's null space inflates this error.
+//!   3. NOISE RECOVERY: gam's estimated residual variance σ̂_ε² must be within 20%
+//!      of the TRUE σ_ε² = RESID_VAR. Double-penalization inflates it; overfitting
+//!      deflates it.
 //!
-//! Identical data is handed to all three engines. We assert:
-//!   1. Pearson r on each group's fitted smooth curve (gam vs mgcv `s(x)+s(x,by=g)`,
-//!      with the random intercept removed by within-group centering on both sides).
-//!   2. Pearson r on the per-group intercepts (gam `group(g)` effect vs lme4 BLUP).
-//!   3. Relative RMSE on the residual variance σ_ε² (gam vs lme4).
-//! Bounds (pearson > 0.97 curves, > 0.96 intercepts, rel-RMSE < 0.12 on σ_ε²) are
-//! the spec's principled tolerances; a genuine divergence failing them is a real
-//! bug in gam's RE×by-smooth partitioning, not something to loosen.
+//! BASELINE-TO-MATCH-OR-BEAT (mature tools fit on the IDENTICAL data, then held to
+//! the same objective metrics — gam must be at least as accurate, never merely
+//! "close to" them):
+//!   * `mgcv::gam(y ~ s(x) + s(x, by=g))` — its fitted mean error vs true μ is the
+//!     accuracy bar for (1): gam's mean RMSE ≤ 1.10·mgcv's mean RMSE.
+//!   * `lme4::lmer(y ~ ns(x) + (1|g))` — its σ̂_ε² error vs true σ_ε² is the bar
+//!     for (3): gam's |σ̂² − σ²| ≤ 1.10·lme4's |σ̂² − σ²|.
+//! The reference rel-L2 / curve correlations are still COMPUTED and printed for
+//! context, but no pass/fail criterion is "gam reproduces the reference output".
+//! A genuine recovery shortfall failing these bars is a real bug, not something to
+//! loosen.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, run_r};
+use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -54,7 +66,7 @@ fn base_smooth(x: f64) -> f64 {
 }
 
 #[test]
-fn gam_random_intercept_by_smooth_matches_lme4_and_mgcv() {
+fn gam_random_intercept_by_smooth_recovers_truth() {
     init_parallelism();
 
     // ---- synthesize identical data for all engines -----------------------
@@ -80,20 +92,18 @@ fn gam_random_intercept_by_smooth_matches_lme4_and_mgcv() {
 
     let mut x = Vec::<f64>::with_capacity(n);
     let mut y = Vec::<f64>::with_capacity(n);
+    let mut true_mean = Vec::<f64>::with_capacity(n); // noise-free generative μ per row
     let mut g_code = Vec::<f64>::with_capacity(n); // numeric group index for R
-    let mut grp_of_row = Vec::<usize>::with_capacity(n);
     let mut rows = Vec::<StringRecord>::with_capacity(n);
     for grp in 0..N_GROUPS {
         for _ in 0..PER_GROUP {
             let xi = ux.sample(&mut rng);
-            let yi = base_smooth(xi)
-                + 0.15 * slope_g[grp] * xi
-                + intercept_g[grp]
-                + noise.sample(&mut rng);
+            let mui = base_smooth(xi) + 0.15 * slope_g[grp] * xi + intercept_g[grp];
+            let yi = mui + noise.sample(&mut rng);
             x.push(xi);
             y.push(yi);
+            true_mean.push(mui);
             g_code.push(grp as f64);
-            grp_of_row.push(grp);
             rows.push(StringRecord::from(vec![
                 format!("{xi}"),
                 format!("g{grp}"),
@@ -101,6 +111,13 @@ fn gam_random_intercept_by_smooth_matches_lme4_and_mgcv() {
             ]));
         }
     }
+
+    // True per-group intercepts, centered across groups (the offset estimand). The
+    // shared s(x) + global intercept is a per-group constant only when read at a
+    // common x, so centering the TRUE intercept_g the same way gam's anchor is
+    // centered makes the two directly comparable.
+    let true_intercept_mean = intercept_g.iter().sum::<f64>() / N_GROUPS as f64;
+    let true_intercept_dev: Vec<f64> = intercept_g.iter().map(|v| v - true_intercept_mean).collect();
 
     let headers = vec!["x".to_string(), "g".to_string(), "y".to_string()];
     let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode combined dataset");
@@ -211,79 +228,76 @@ fn gam_random_intercept_by_smooth_matches_lme4_and_mgcv() {
         lme4_ranef.len()
     );
 
-    // ---- (1) per-group smooth SHAPE: gam vs mgcv, intercept removed --------
-    // Split fitted values by group and within-group center both engines. Centering
-    // subtracts the per-group mean, killing the vertical offset (gam's random
-    // intercept; mgcv's group-level constant absorbed into the smooth), so what
-    // remains is the smooth shape s(x)+s(x,by=g) is responsible for. We correlate
-    // the two centered curves per group element-wise on the SAME rows: both engines
-    // were handed the identical row order, and within a group we collect rows by the
-    // shared grp_of_row index in that order, so gam_c[k] and mgcv_c[k] are the same
-    // observation (same x) on both sides — no sorting or re-gridding is needed.
-    let mut corr_per_group = Vec::<f64>::with_capacity(N_GROUPS);
-    for grp in 0..N_GROUPS {
-        let mut gam_c = Vec::<f64>::new();
-        let mut mgcv_c = Vec::<f64>::new();
-        for i in 0..n {
-            if grp_of_row[i] == grp {
-                gam_c.push(gam_fitted[i]);
-                mgcv_c.push(mgcv_fitted[i]);
-            }
-        }
-        let gam_m = gam_c.iter().sum::<f64>() / gam_c.len() as f64;
-        let mgcv_m = mgcv_c.iter().sum::<f64>() / mgcv_c.len() as f64;
-        let gam_cc: Vec<f64> = gam_c.iter().map(|v| v - gam_m).collect();
-        let mgcv_cc: Vec<f64> = mgcv_c.iter().map(|v| v - mgcv_m).collect();
-        corr_per_group.push(pearson(&gam_cc, &mgcv_cc));
-    }
-    let min_curve_corr = corr_per_group.iter().copied().fold(f64::INFINITY, f64::min);
+    // ---- OBJECTIVE METRIC (1): mean recovery vs TRUE μ ---------------------
+    // RMSE of each engine's fitted mean against the noise-free generative μ. This
+    // is the direct accuracy quantity: how close the recovered structured signal
+    // (shared smooth + per-group tilt + per-group offset) is to the truth. mgcv's
+    // fitted mean is its s(x)+s(x,by=g) prediction on the same rows — its error vs
+    // the SAME true μ is the match-or-beat accuracy bar.
+    let gam_mean_rmse = rmse(&gam_fitted, &true_mean);
+    let mgcv_mean_rmse = rmse(mgcv_fitted, &true_mean);
 
-    // ---- (2) per-group intercepts: gam group effect vs lme4 BLUP -----------
-    let intercept_corr = pearson(&gam_intercept_dev, lme4_ranef);
+    // ---- OBJECTIVE METRIC (2): intercept recovery vs TRUE offsets ---------
+    // gam's per-group offset (anchor read at common x, centered across groups)
+    // against the TRUE centered intercept_g. Absolute RMSE in the units of the
+    // intercept (SD 0.4); the small by-smooth-at-x_ref contamination (~10%) lives
+    // inside gam's value, so a 0.10 bar (25% of the intercept SD) is principled.
+    let intercept_rmse = rmse(&gam_intercept_dev, &true_intercept_dev);
 
-    // ---- (3) residual variance: relative RMSE (single component) -----------
-    // With one scalar per engine, the relative RMSE collapses to the relative
-    // absolute difference |σ²_gam − σ²_lme4| / σ²_lme4.
-    let resid_rel_rmse = (gam_resid_var - lme4_sigma_e2).abs() / lme4_sigma_e2.abs().max(1e-12);
+    // ---- OBJECTIVE METRIC (3): noise-scale recovery vs TRUE σ_ε² ----------
+    // gam's estimated residual variance vs the TRUE σ_ε² = RESID_VAR. lme4's
+    // estimate vs the same truth is the match-or-beat bar.
+    let gam_var_err = (gam_resid_var - RESID_VAR).abs();
+    let lme4_var_err = (lme4_sigma_e2 - RESID_VAR).abs();
+
+    // Context-only reference closeness (printed, never asserted as pass/fail): how
+    // near gam's fitted mean is to mgcv's, and gam's group offsets to lme4's BLUPs.
+    let gam_vs_mgcv_rel_l2 = relative_l2(&gam_fitted, mgcv_fitted);
+    let gam_vs_lme4_blup_rel_l2 = relative_l2(&gam_intercept_dev, lme4_ranef);
 
     eprintln!(
-        "RE + by-smooth combo: n={n} groups={N_GROUPS} gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3}\n  \
-         per-group smooth pearson (gam vs mgcv, centered): {corr_per_group:?} min={min_curve_corr:.5}\n  \
-         intercept pearson (gam group(g) vs lme4 BLUP): {intercept_corr:.5}\n  \
-         residual var gam={gam_resid_var:.5} lme4={lme4_sigma_e2:.5} (truth {RESID_VAR:.5}) rel-RMSE={resid_rel_rmse:.4}"
+        "RE + by-smooth TRUTH RECOVERY: n={n} groups={N_GROUPS} σ_ε={RESID_SD:.3} (σ_ε²={RESID_VAR:.5})\n  \
+         gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3}\n  \
+         mean RMSE vs truth: gam={gam_mean_rmse:.5} mgcv={mgcv_mean_rmse:.5} (bar ≤ {:.5}; gam ≤ 1.10·mgcv?)\n  \
+         intercept RMSE vs true offsets: gam={intercept_rmse:.5} (bar ≤ 0.10)\n  \
+         resid-var err vs truth: gam={gam_var_err:.5} (σ̂²={gam_resid_var:.5}) lme4={lme4_var_err:.5} (σ̂²={lme4_sigma_e2:.5})\n  \
+         [context only] gam-vs-mgcv mean rel-L2={gam_vs_mgcv_rel_l2:.4}  gam-vs-lme4-BLUP rel-L2={gam_vs_lme4_blup_rel_l2:.4}",
+        0.5 * RESID_SD
     );
 
-    // (1) Both engines REML-fit the same shared+by-factor smooth structure; with
-    // the vertical offset removed, each group's smooth shape must coincide. The
-    // by-smooth deviation here is mild (0.15*slope_g*x), so the curves are
-    // dominated by the shared sin(3πx) plus a small per-group tilt — pearson > 0.97
-    // on every group is the spec bound and catches any mis-attribution that would
-    // distort the recovered shape.
+    // (1) MEAN RECOVERY. A fit cannot beat the noise it cannot observe; landing
+    // well under σ_ε proves the structured signal was recovered rather than the
+    // noise overfit. Bar: RMSE ≤ 0.5·σ_ε.
     assert!(
-        min_curve_corr > 0.97,
-        "a group smooth shape diverges from mgcv: per-group pearson={corr_per_group:?}"
+        gam_mean_rmse <= 0.5 * RESID_SD,
+        "gam mean fit does not recover the true μ: RMSE={gam_mean_rmse:.5} > {:.5} (0.5·σ_ε)",
+        0.5 * RESID_SD
+    );
+    // ... and gam must be at least as accurate as mgcv on the same truth.
+    assert!(
+        gam_mean_rmse <= 1.10 * mgcv_mean_rmse,
+        "gam mean fit is less accurate than the mgcv baseline vs truth: gam={gam_mean_rmse:.5} > 1.10·{mgcv_mean_rmse:.5}"
     );
 
-    // (2) gam's group(g) random intercept must match lme4's conditional modes.
-    // The 5 group offsets (intercept_g ~ N(0,0.4)) are well separated relative to
-    // the per-group noise floor (σ_ε²/60 ≈ 7e-4), so both REML engines recover the
-    // same BLUP ordering and magnitudes. pearson (not a tighter element-wise bound)
-    // is the right metric here because gam's anchor vector carries the ~10% by-smooth
-    // contamination quantified above plus a basis-dependent BLUP shrinkage scale that
-    // need not equal lme4's, so we test agreement of the per-group ORDERING/SHAPE.
-    // pearson > 0.96 is the spec bound; a lower value means gam soaked the offset
-    // into the smooth instead of group(g).
+    // (2) INTERCEPT RECOVERY. The per-group offset gam attributes to group(g) must
+    // track the TRUE intercept_g. Misattributing the offset to the smooth's null
+    // space inflates this error. Bar: RMSE ≤ 0.10 (≤ 25% of the intercept SD 0.4).
     assert!(
-        intercept_corr > 0.96,
-        "gam per-group intercepts disagree with lme4 conditional modes: pearson={intercept_corr:.5}"
+        intercept_rmse <= 0.10,
+        "gam per-group intercepts do not recover the true offsets: RMSE={intercept_rmse:.5} > 0.10"
     );
 
-    // (3) Residual variance is the best-determined component (≈295 residual d.f.).
-    // Both engines fit it by REML on identical data, so it must match tightly; a
-    // double-penalization bug (smooth + RE both soaking signal) would inflate gam's
-    // σ_ε². rel-RMSE < 0.12 is the spec bound.
+    // (3) NOISE-SCALE RECOVERY. The residual variance is the best-determined
+    // component (≈295 residual d.f.); a double-penalization bug (smooth + RE both
+    // soaking signal) inflates it, overfitting deflates it. Bar: within 20% of the
+    // TRUE σ_ε², and at least as accurate as lme4 on the same truth.
     assert!(
-        resid_rel_rmse < 0.12,
-        "residual variance disagrees with lme4: gam={gam_resid_var:.5} lme4={lme4_sigma_e2:.5} (rel-RMSE={resid_rel_rmse:.4})"
+        gam_var_err <= 0.20 * RESID_VAR,
+        "gam residual variance does not recover true σ_ε²: |{gam_resid_var:.5} − {RESID_VAR:.5}|={gam_var_err:.5} > {:.5} (20%)",
+        0.20 * RESID_VAR
+    );
+    assert!(
+        gam_var_err <= 1.10 * lme4_var_err.max(1e-6),
+        "gam residual variance is less accurate than the lme4 baseline vs truth: gam_err={gam_var_err:.5} > 1.10·{lme4_var_err:.5}"
     );
 }

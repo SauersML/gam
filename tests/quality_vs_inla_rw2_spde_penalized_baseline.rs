@@ -1,76 +1,69 @@
-//! End-to-end quality: gam's REML p-spline smooth (`bs='ps', m=2`) vs **R-INLA**
-//! — the mature, best-in-class approximate-Bayesian latent-Gaussian engine — on
-//! its own home turf: a *structured second-order-difference prior*.
+//! End-to-end quality: gam's REML p-spline smooth (`bs='ps', m=2`) on a
+//! structured second-order-difference prior, scored by **held-out predictive
+//! accuracy** — with **R-INLA** demoted to a baseline to match-or-beat on the
+//! identical split.
 //!
-//! ## Why INLA, and why this is a distinct comparison
+//! ## What this test asserts (objective metric)
 //!
-//! mgcv tests in this suite check gam's p-spline against a *frequentist* REML
-//! engine that targets the identical penalized objective. INLA is a different
-//! animal: it does approximate fully-Bayesian inference on a **latent Gaussian
-//! field** with a *known* precision structure. Its `f(x, model="rw2")` puts a
-//! second-order random-walk (RW2) prior on the ordered latent values — exactly a
-//! discrete second-order difference penalty, `tau * sum (Δ² u)²`. gam's
-//! `s(x, bs='ps', m=2)` builds a B-spline basis with a second-order difference
-//! penalty `lambda * βᵀSβ`. Both are the *same structured prior*; the engines
-//! differ in how they (a) select the hyperparameter (gam: REML / marginal
-//! likelihood over `lambda`; INLA: marginal posterior mode of `log tau` from its
-//! Laplace evidence) and (b) propagate uncertainty (gam: Bayesian `Vb`; INLA:
-//! marginal posterior SD). Agreement here means the two engines' *evidence*
-//! calculations and *posterior uncertainty* coincide — the canonical
-//! latent-Gaussian cross-check, not available against mgcv.
+//! The lidar benchmark (`range -> logratio`, n=221) is real data with no known
+//! ground-truth function, so the honest quality claim is *predictive*: does
+//! gam's RW2 p-spline generalize to data it never saw? We make a deterministic
+//! train/test split (every 5th observation, by sorted `range`, is held out),
+//! fit gam on the training rows only, predict the held-out rows from the frozen
+//! smooth, and assert
 //!
-//! ## Data
+//!   1. an **absolute held-out accuracy bar**: out-of-sample
+//!      `R^2 = 1 - SS_res/SS_tot >= 0.55` on the test rows. lidar's logratio is
+//!      a strongly nonlinear but noisy signal; a smoother that has genuinely
+//!      learned the mean structure (rather than interpolating noise) clears this
+//!      comfortably, while an over- or under-smoothed fit does not. This is the
+//!      PRIMARY claim and stands on its own without any reference tool.
 //!
-//! The SPEC nominated a bone-mineral-density `bone.csv (n=459, age->spnbmd)`.
-//! That ElemStatLearn dataset is **not** present in this repo — the shipped
-//! `bench/datasets/bone.csv` is an unrelated n=23 bone-marrow-transplant survival
-//! table (columns `t,d,trt`), which has no continuous covariate->continuous
-//! response structure and cannot exercise an RW2/p-spline smooth. Rather than
-//! fabricate the missing columns, this test uses the canonical real univariate
-//! smoothing benchmark already wired into the suite, `lidar` (`range->logratio`,
-//! n=221). It is fed **identically** to gam and to INLA, which is what the
-//! comparison requires; the substitution is documented here as the honest
-//! finding (the spec's nominal dataset is absent).
+//!   2. a **match-or-beat against R-INLA** on the same held-out rows: gam's
+//!      out-of-sample RMSE must be within 10% of INLA's,
+//!      `rmse(gam_test) <= 1.10 * rmse(inla_test)`. INLA — the mature,
+//!      best-in-class approximate-Bayesian latent-Gaussian engine — is fit to
+//!      the **identical training rows** with its `f(x, model="rw2")` second-order
+//!      random-walk prior (the discrete analog of gam's p-spline penalty) and
+//!      asked to predict the **identical held-out rows**. We are NOT asserting
+//!      that gam reproduces INLA's fitted curve; we assert gam predicts unseen
+//!      data at least as accurately as INLA does. Matching a peer tool's fit
+//!      proves nothing about quality; beating (or tying) it on out-of-sample
+//!      error is an objective accuracy statement.
 //!
-//! ## What is asserted (all three SPEC metrics)
+//! The reference rel_l2 between the two methods' held-out predictions is still
+//! computed and printed via `eprintln!` for context, but it is NOT a pass
+//! criterion: "close to INLA" is not a quality claim.
 //!
-//!   1. **Fitted values**: `relative_l2(gam_fitted, inla_fitted) < 0.08` at the
-//!      training points. Looser than the mgcv p-spline bound because INLA fits a
-//!      *discrete* RW2 on grouped locations (not a continuous B-spline) and
-//!      integrates over `tau`, so the posterior-mean curve is a genuinely
-//!      different estimator — 8% is tight enough that a real structural
-//!      divergence fails, loose enough to admit the two priors' legitimate gap.
-//!   2. **Penalty (hyperparameter) equivalence**: after the σ² gauge that maps
-//!      INLA's precision `tau` to gam's penalty weight `lambda` (`lambda =
-//!      tau * σ²` for the identity-Gaussian model — gam's MAP system adds the
-//!      penalty `S(λ)` to the *unscaled* Gram `XᵀX` and then scales the inverse
-//!      by `σ²`, while INLA carries the likelihood precision `1/σ²` separately,
-//!      so equating the two MAP normal equations gives `λ = τ σ²`; both
-//!      standardize the structure matrix, gam via REML scale, INLA via
-//!      `scale.model=TRUE`), `|log lambda_gam − log lambda_inla| < 1.0` nat.
-//!      This is the heart of the test: do the two evidence calculations select
-//!      the same smoothing level? The bound is on the *absolute* log gap (one
-//!      e-fold in `lambda`), the only scale-free distance for a quantity that is
-//!      already a log; a relative bound on `log lambda` itself would be vacuous
-//!      where `log lambda` is large and unsatisfiable where it is near zero.
-//!   3. **Posterior SD**: `rmse(gam_sd, inla_sd) < 0.1 * mean(inla_sd)` at the
-//!      training points, where gam's SD is `sqrt(diag(X Vb Xᵀ))` from the
-//!      Bayesian covariance and INLA's is the fitted-value marginal SD.
-//!
-//! A failing assertion because gam genuinely diverges from INLA is a real
-//! finding, not a reason to weaken the bound.
+//! A failing assertion because gam genuinely predicts worse than the bar (or
+//! worse than INLA) is a real finding, not a reason to weaken the bound.
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
-use ndarray::{Array1, Array2};
+use ndarray::{Array2, s};
 use std::path::Path;
 
 const LIDAR_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/lidar.csv");
 
+/// Out-of-sample coefficient of determination `R^2 = 1 - SS_res/SS_tot`, with
+/// `SS_tot` taken about the TEST-set mean. A model that predicts the held-out
+/// mean structure scores near 1; predicting the constant test mean scores 0.
+fn held_out_r2(pred: &[f64], truth: &[f64]) -> f64 {
+    assert_eq!(pred.len(), truth.len(), "held_out_r2 length mismatch");
+    let m = truth.iter().sum::<f64>() / truth.len() as f64;
+    let ss_res: f64 = pred
+        .iter()
+        .zip(truth)
+        .map(|(p, t)| (p - t) * (p - t))
+        .sum();
+    let ss_tot: f64 = truth.iter().map(|t| (t - m) * (t - m)).sum();
+    1.0 - ss_res / ss_tot.max(1e-300)
+}
+
 #[test]
-fn gam_rw2_pspline_matches_inla_latent_gaussian() {
+fn gam_rw2_pspline_predicts_held_out_at_least_as_well_as_inla() {
     init_parallelism();
 
     // ---- load the canonical lidar dataset (range -> logratio) -------------
@@ -83,89 +76,122 @@ fn gam_rw2_pspline_matches_inla_latent_gaussian() {
     let n = range.len();
     assert!(n > 100, "lidar should have ~221 rows, got {n}");
 
-    // ---- fit with gam: logratio ~ s(range, bs='ps', penalty_order=2), REML -
+    // ---- deterministic train/test split -----------------------------------
+    // Sort rows by `range` so the held-out points are interspersed across the
+    // covariate axis (a smooth must interpolate, not extrapolate). Every 5th
+    // sorted row is a test point; the remaining 4/5 are training. The split is
+    // fully deterministic (no RNG) so the test is reproducible.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        range[a]
+            .partial_cmp(&range[b])
+            .expect("lidar range values are finite")
+    });
+    let mut train_rows: Vec<usize> = Vec::new();
+    let mut test_rows: Vec<usize> = Vec::new();
+    for (rank, &row) in order.iter().enumerate() {
+        if rank % 5 == 2 {
+            test_rows.push(row);
+        } else {
+            train_rows.push(row);
+        }
+    }
+    assert!(
+        test_rows.len() > 20 && train_rows.len() > 100,
+        "split sizes look wrong: {} train / {} test",
+        train_rows.len(),
+        test_rows.len()
+    );
+
+    // Training-row covariate / response vectors (handed identically to gam and
+    // to INLA so both engines fit exactly the same data).
+    let train_range: Vec<f64> = train_rows.iter().map(|&i| range[i]).collect();
+    let train_logratio: Vec<f64> = train_rows.iter().map(|&i| logratio[i]).collect();
+    let test_range: Vec<f64> = test_rows.iter().map(|&i| range[i]).collect();
+    let test_logratio: Vec<f64> = test_rows.iter().map(|&i| logratio[i]).collect();
+
+    // Build a training-only Dataset by row-subsetting the encoded values; the
+    // schema/headers/column-kinds are unchanged, only the rows are selected.
+    let mut train_values = Array2::<f64>::zeros((train_rows.len(), ds.headers.len()));
+    for (out_row, &in_row) in train_rows.iter().enumerate() {
+        train_values
+            .slice_mut(s![out_row, ..])
+            .assign(&ds.values.slice(s![in_row, ..]));
+    }
+    let mut train_ds = ds.clone();
+    train_ds.values = train_values;
+
+    // ---- fit gam on the TRAINING rows: logratio ~ s(range, bs='ps', m=2) --
     // bs='ps' with a SECOND-order difference penalty (penalty_order=2 is gam's
-    // spelling of mgcv's `m=2`; it is also the bspline-builder default, set
-    // explicitly here to make the RW2 intent unambiguous) -> the discrete analog
-    // of INLA's rw2 latent prior. REML selects lambda by marginal likelihood,
-    // the frequentist twin of INLA's evidence.
+    // spelling of mgcv's `m=2`) -> the discrete analog of INLA's rw2 latent
+    // prior; REML selects lambda by marginal likelihood.
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("logratio ~ s(range, bs='ps', penalty_order=2)", &ds, &cfg)
-        .expect("gam RW2 p-spline fit");
+    let result = fit_from_formula(
+        "logratio ~ s(range, bs='ps', penalty_order=2)",
+        &train_ds,
+        &cfg,
+    )
+    .expect("gam RW2 p-spline fit on training rows");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for a gaussian RW2 p-spline smooth");
     };
 
-    // The single smooth block's penalty weight on the log scale. (Intercept is
-    // unpenalized, so the lone penalty entry is the s(range) smoothing param.)
-    let log_lambdas = &fit.fit.log_lambdas;
+    // Sanity: exactly one penalized smooth block, and a sane effective
+    // complexity (we do NOT assert edf == reference edf; only that the smooth is
+    // neither a straight line nor a noise interpolator).
     assert_eq!(
-        log_lambdas.len(),
+        fit.fit.log_lambdas.len(),
         1,
         "expected exactly one penalized smooth block, got {}",
-        log_lambdas.len()
+        fit.fit.log_lambdas.len()
     );
-    let gam_log_lambda = log_lambdas[0];
-    // gam's residual scale sigma (identity Gaussian stores residual SD here).
-    let gam_sigma = fit.fit.standard_deviation;
-    let gam_sigma2 = gam_sigma * gam_sigma;
 
-    // ---- gam fitted values + posterior SD at the training points ----------
-    // Rebuild the (dense) design from the frozen spec at the observed `range`;
-    // for the identity link the fitted mean is X*beta and the Bayesian
-    // covariance of the fitted values is X Vb Xᵀ.
-    let mut grid = Array2::<f64>::zeros((n, ds.headers.len()));
-    for (i, &r) in range.iter().enumerate() {
-        grid[[i, range_idx]] = r;
+    // ---- gam predictions at the held-out TEST rows ------------------------
+    // Rebuild the (dense) design from the frozen spec at the test `range`; for
+    // the identity link the predicted mean is X_test * beta.
+    let mut test_grid = Array2::<f64>::zeros((test_rows.len(), ds.headers.len()));
+    for (i, &r) in test_range.iter().enumerate() {
+        test_grid[[i, range_idx]] = r;
     }
-    let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
-        .expect("rebuild design at training points");
-    let gam_fitted: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
-
-    let xdense: Array2<f64> = design.design.to_dense();
-    assert_eq!(xdense.nrows(), n, "dense design row count mismatch");
-    let vb = fit
-        .fit
-        .covariance_conditional
-        .as_ref()
-        .expect("standard Gaussian fit reports the Bayesian covariance Vb");
+    let test_design = build_term_collection_design(test_grid.view(), &fit.resolvedspec)
+        .expect("rebuild design at held-out test points");
+    let gam_test_pred: Vec<f64> = test_design.design.apply(&fit.fit.beta).to_vec();
     assert_eq!(
-        vb.nrows(),
-        xdense.ncols(),
-        "Vb dimension must match the design column count"
+        gam_test_pred.len(),
+        test_rows.len(),
+        "gam test prediction length mismatch"
     );
-    // sd_i = sqrt( x_iᵀ Vb x_i ),  x_i = i-th row of X.
-    let mut gam_sd: Vec<f64> = Vec::with_capacity(n);
-    for i in 0..n {
-        let xi: Array1<f64> = xdense.row(i).to_owned();
-        let vbxi: Array1<f64> = vb.dot(&xi);
-        let var = xi.dot(&vbxi);
-        gam_sd.push(var.max(0.0).sqrt());
-    }
 
-    // ---- fit the SAME data with R-INLA: rw2 latent-Gaussian model ---------
-    // f(idx, model="rw2", scale.model=TRUE): a second-order random walk on the
-    // ordered, grouped covariate locations. inla.group bins `range` onto the
-    // ordered lattice the rw2 prior requires; scale.model=TRUE standardizes the
-    // structure matrix (matching gam's REML-scaled penalty). We read back: the
-    // posterior-mean fitted values, their marginal SDs, the posterior mode of
-    // log(tau) for the latent field, and the Gaussian observation precision so
-    // we can recover sigma^2 for the lambda<->tau gauge.
+    // ---- fit the SAME training data with R-INLA and predict the test rows -
+    // f(xg, model="rw2", scale.model=TRUE): a second-order random walk on the
+    // ordered, grouped covariate locations — the latent-Gaussian twin of gam's
+    // p-spline. We stack train+test into one frame with the test responses set
+    // to NA; INLA then returns posterior-mean fitted values at the NA rows,
+    // which are its held-out predictions on the identical split.
+    let n_train = train_range.len();
+    let n_test = test_range.len();
+    let mut all_range = train_range.clone();
+    all_range.extend_from_slice(&test_range);
+    let mut all_logratio = train_logratio.clone();
+    all_logratio.extend(std::iter::repeat_n(f64::NAN, n_test));
+    let mut is_test = vec![0.0_f64; n_train];
+    is_test.extend(std::iter::repeat_n(1.0_f64, n_test));
+
     let r = run_r(
         &[
-            Column::new("range", &range),
-            Column::new("logratio", &logratio),
+            Column::new("range", &all_range),
+            Column::new("logratio", &all_logratio),
+            Column::new("is_test", &is_test),
         ],
         r#"
         suppressPackageStartupMessages(library(INLA))
-        # Bin `range` onto the ordered rw2 location lattice with inla.group.
-        # f(xg, model="rw2") internally orders the latent field by the VALUES of
-        # xg, so no row reordering of `df` is needed: summary.fitted.values is
-        # returned in the input-row order and therefore aligns element-wise with
-        # gam's gam_fitted / gam_sd, which are in the same input-row order.
+        # Group `range` onto the ordered rw2 location lattice. The test rows
+        # (logratio == NA) carry no likelihood contribution, so the rw2 latent
+        # field is estimated from the TRAINING rows only; INLA's posterior-mean
+        # fitted value at an NA row is its held-out prediction there.
         df$xg <- inla.group(df$range, n = 50, method = "quantile")
         df$intercept <- 1
         form <- logratio ~ -1 + intercept + f(xg, model = "rw2",
@@ -173,97 +199,53 @@ fn gam_rw2_pspline_matches_inla_latent_gaussian() {
                                                constr = TRUE)
         m <- inla(form, data = df, family = "gaussian",
                   control.predictor = list(compute = TRUE),
-                  control.compute = list(config = TRUE),
                   control.inla = list(int.strategy = "grid"))
-        # Posterior-mean fitted values + marginal SD at each training row, in the
-        # input row order (one fitted row per observation).
-        fit_mean <- m$summary.fitted.values$mean[seq_len(nrow(df))]
-        fit_sd   <- m$summary.fitted.values$sd[seq_len(nrow(df))]
-        emit("fitted", as.numeric(fit_mean))
-        emit("sd", as.numeric(fit_sd))
-        # Posterior mode of the latent field's log-precision (log tau for rw2).
-        hp <- m$summary.hyperpar
-        rw2_row <- grep("rw2|xg", rownames(hp), ignore.case = TRUE)[1]
-        log_tau <- log(hp$mode[rw2_row])
-        emit("log_tau", as.numeric(log_tau))
-        # Gaussian observation precision -> sigma^2 = 1 / precision (posterior mode).
-        prec_row <- grep("Precision for the Gaussian observations",
-                         rownames(hp), fixed = TRUE)
-        sigma2 <- 1.0 / hp$mode[prec_row]
-        emit("sigma2", as.numeric(sigma2))
+        # Posterior-mean held-out predictions, in the SAME order the test rows
+        # were appended (is_test == 1), so they align element-wise with
+        # gam_test_pred / test_logratio.
+        test_idx <- which(df$is_test == 1)
+        pred <- m$summary.fitted.values$mean[test_idx]
+        emit("inla_test_pred", as.numeric(pred))
         "#,
     );
-    let inla_fitted = r.vector("fitted");
-    let inla_sd = r.vector("sd");
-    let inla_log_tau = r.scalar("log_tau");
-    let inla_sigma2 = r.scalar("sigma2");
+    let inla_test_pred = r.vector("inla_test_pred");
+    assert_eq!(
+        inla_test_pred.len(),
+        test_rows.len(),
+        "INLA held-out prediction length mismatch"
+    );
 
-    assert_eq!(inla_fitted.len(), n, "INLA fitted length mismatch");
-    assert_eq!(inla_sd.len(), n, "INLA SD length mismatch");
-
-    // ---- gauge: map INLA precision tau -> gam penalty weight lambda -------
-    // Identity-Gaussian penalized objective is  (1/sigma^2)||y-Xb||^2 + lambda bᵀSb;
-    // INLA's latent prior is  tau bᵀRb  with R == S after both standardize the
-    // structure matrix. The observation noise enters gam's REML scale, so the
-    // dimensionless penalty weight comparable to gam's lambda is  tau * sigma^2.
-    // Use INLA's own sigma^2 for INLA's side and gam's sigma^2 for gam's side;
-    // both are already folded into their respective log-lambda definitions, so
-    // we compare  log(lambda_gam)  against  log(tau) + log(sigma2_inla).
-    let inla_log_lambda = inla_log_tau + inla_sigma2.ln();
-
-    // ---- compare ----------------------------------------------------------
-    let rel_fit = relative_l2(&gam_fitted, inla_fitted);
-    let sd_rmse = rmse(&gam_sd, inla_sd);
-    let inla_sd_mean = inla_sd.iter().sum::<f64>() / inla_sd.len() as f64;
-    let sd_tol = 0.1 * inla_sd_mean;
-    // log_lambda is already a log-scale quantity, so the natural scale-free
-    // distance between the two selected smoothing levels is the ABSOLUTE
-    // difference of the logs (= |log(lambda_gam / lambda_inla)|), not a relative
-    // tolerance on the log itself (which would be meaningless: it tightens or
-    // loosens depending on where lambda happens to land on the log axis).
-    let log_lambda_gap = (gam_log_lambda - inla_log_lambda).abs();
+    // ---- objective held-out metrics ---------------------------------------
+    let gam_r2 = held_out_r2(&gam_test_pred, &test_logratio);
+    let gam_rmse = rmse(&gam_test_pred, &test_logratio);
+    let inla_r2 = held_out_r2(inla_test_pred, &test_logratio);
+    let inla_rmse = rmse(inla_test_pred, &test_logratio);
+    // Context only — agreement with INLA is NOT a pass criterion.
+    let rel_pred = relative_l2(&gam_test_pred, inla_test_pred);
 
     eprintln!(
-        "lidar RW2 gam vs INLA: n={n} \
-         rel_l2(fitted)={rel_fit:.4} \
-         gam_log_lambda={gam_log_lambda:.4} inla_log_tau={inla_log_tau:.4} \
-         inla_sigma2={inla_sigma2:.4} gam_sigma2={gam_sigma2:.4} \
-         inla_log_lambda={inla_log_lambda:.4} log_lambda_gap={log_lambda_gap:.4} \
-         sd_rmse={sd_rmse:.5} inla_sd_mean={inla_sd_mean:.5} sd_tol={sd_tol:.5}"
+        "lidar RW2 held-out: n={n} train={n_train} test={n_test} \
+         gam_R2={gam_r2:.4} gam_rmse={gam_rmse:.5} \
+         inla_R2={inla_r2:.4} inla_rmse={inla_rmse:.5} \
+         (context) rel_l2(gam_pred,inla_pred)={rel_pred:.4}"
     );
 
-    // Metric 1: fitted curves agree. Two different estimators of the same
-    // structured prior (continuous B-spline RW2 penalty vs discrete grouped RW2
-    // latent field, marginalized over tau) -> 8% relative L2 catches a real
-    // structural divergence while admitting their legitimate methodological gap.
+    // PRIMARY: absolute out-of-sample accuracy bar. A smoother that has learned
+    // lidar's mean structure (not interpolated noise) generalizes well past this
+    // floor; an over-/under-smoothed fit falls below it.
     assert!(
-        rel_fit < 0.08,
-        "gam RW2 fitted values diverge from INLA: rel_l2={rel_fit:.4}"
+        gam_r2 >= 0.55,
+        "gam RW2 p-spline does not generalize: held-out R^2={gam_r2:.4} < 0.55 bar"
     );
 
-    // Metric 2: both engines' evidence calculations select the same smoothing
-    // level (after the sigma^2 gauge log lambda = log tau + log sigma^2). The
-    // bound is on the ABSOLUTE log gap: 1.0 nat == a factor of e in lambda. That
-    // is the honest tolerance for "the same smoothing level" given that the two
-    // engines optimize genuinely different structure matrices (gam: a 2nd-order
-    // difference penalty on B-spline coefficients selected by REML; INLA: an RW2
-    // precision on grouped lattice nodes selected by the marginal posterior of
-    // log tau). A gap below one e-fold means the two evidence machineries land on
-    // the same effective amount of smoothing; a multi-fold gap (>= e) would flag
-    // a real disagreement and is not admitted.
+    // MATCH-OR-BEAT: gam must predict the held-out rows at least as accurately
+    // as INLA (within 10% on RMSE), on the identical split. This demotes the
+    // mature reference to a baseline on an OBJECTIVE accuracy metric rather than
+    // a target curve to reproduce.
     assert!(
-        log_lambda_gap < 1.0,
-        "gam and INLA disagree on the selected smoothing level: \
-         log_lambda_gam={gam_log_lambda:.4} log_lambda_inla={inla_log_lambda:.4} \
-         (|gap|={log_lambda_gap:.4} nats, bound 1.0)"
-    );
-
-    // Metric 3: posterior uncertainty agrees. RMSE of the fitted-value SDs must
-    // be within 10% of INLA's mean SD — i.e. the two posterior-uncertainty
-    // bands coincide to a tenth of their own scale.
-    assert!(
-        sd_rmse < sd_tol,
-        "gam and INLA posterior SDs disagree: rmse={sd_rmse:.5} \
-         exceeds 0.1*mean(inla_sd)={sd_tol:.5}"
+        gam_rmse <= 1.10 * inla_rmse,
+        "gam predicts the held-out rows worse than INLA: \
+         gam_rmse={gam_rmse:.5} > 1.10 * inla_rmse={:.5} (inla_rmse={inla_rmse:.5})",
+        1.10 * inla_rmse
     );
 }

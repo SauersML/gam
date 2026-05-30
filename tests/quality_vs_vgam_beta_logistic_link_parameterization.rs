@@ -1,43 +1,46 @@
-//! End-to-end quality: gam's *beta-logistic* inverse link — the exotic,
+//! End-to-end OBJECTIVE quality: gam's *beta-logistic* inverse link — the exotic,
 //! state-bearing variant of the sinh-arcsinh (SAS) link family that reuses the
 //! same `SasLinkState` machine but parameterizes the mean through a regularized
-//! incomplete-beta map instead of `asinh`/`tanh` — must agree with the
-//! beta-distribution mathematics that R's **VGAM** beta-binomial family is built
-//! on. VGAM (Yee, *Vector Generalized Linear and Additive Models*) is the mature
-//! reference for this family: its `betabinomial`/`betabinomial2` likelihoods are
-//! a Beta(`a`,`b`) mixture of binomials, whose mixing kernel is exactly the
-//! continuous Beta CDF/PDF this link evaluates.
+//! incomplete-beta map instead of `asinh`/`tanh`.
 //!
-//! What the beta-logistic link computes (verified against
-//! `src/solver/mixture_link.rs::beta_logistic_inverse_link_jet`):
-//!   * `u   = logistic(eta)`,
-//!   * `a   = exp(log_delta - epsilon)`, `b = exp(log_delta + epsilon)`,
-//!   * `mu(eta)  = I_u(a, b)`               (regularized incomplete beta = `pbeta(u,a,b)`),
-//!   * `mu'(eta) = u^a (1-u)^b / B(a,b)`    (`= dbeta(u,a,b) * u(1-u)`, the link-scale density).
-//! The shapes are exactly VGAM's beta-binomial `shape1`/`shape2`. With the
-//! mean/dispersion reparameterization VGAM uses, `delta = exp(log_delta)`
-//! controls overall concentration and `epsilon` the asymmetry; here the spec's
-//! true `delta = 1.2`, `epsilon = 0.15` give `a = 1.2*exp(-0.15)`,
+//! OBJECTIVE METRICS THIS TEST ASSERTS (none is "gam reproduces a peer tool's
+//! fitted output"):
+//!
+//!   (A) TRUTH RECOVERY — primary quality claim. The binomial response is drawn
+//!       from a *known* smooth probability surface `p_true(x1,x2) =
+//!       I_{logistic(eta_true)}(a,b)`. gam fits `y ~ s(x_1d) + s(x_2d)` through the
+//!       beta-logistic link and we assert the fitted success-probability surface
+//!       recovers the truth: `RMSE(p_hat, p_true)` is below a principled bar set by
+//!       the binomial sampling floor (the irreducible per-point noise SD of a
+//!       single Bernoulli draw, averaged over the surface), not by any reference
+//!       fit. The fit must also explain the data better than the constant model:
+//!       its mean negative log-likelihood beats the intercept-only baseline.
+//!
+//!   (B) LINK-MATH CORRECTNESS vs MATHEMATICAL GROUND TRUTH — the beta-logistic
+//!       inverse link is, by definition, the regularized incomplete beta function
+//!       `mu(eta) = I_{logistic(eta)}(a,b)` with derivative `mu'(eta) =
+//!       dbeta(u,a,b)*u(1-u)`. Base-R `pbeta`/`dbeta` are the *exact analytic
+//!       definition* of those special functions (TOMS-708), so asserting gam's
+//!       link code reproduces them is a correctness-vs-ground-truth claim, NOT a
+//!       "same as a peer tool" claim. We KEEP this: gam's `mu` must equal `pbeta`,
+//!       gam's analytic `d1` must equal the link-scale density `dbeta*u(1-u)` AND
+//!       the finite difference of the CDF (catching a wrong-derivative link bug).
+//!
+//! VGAM's role: DEMOTED to a parameterization cross-check only. We confirm VGAM's
+//! `betabinomial(size=1)` success mass equals the Beta mean `a/(a+b)` so the shape
+//! map `a=exp(log_delta-eps)`, `b=exp(log_delta+eps)` is the one VGAM's family
+//! uses — but gam's pass/fail never depends on matching a VGAM *fit*. The exact
+//! beta special functions are base-R's; VGAM is not the source of truth here.
+//! Here the spec's true `delta = 1.2`, `epsilon = 0.15` give `a = 1.2*exp(-0.15)`,
 //! `b = 1.2*exp(+0.15)`.
 //!
-//! Why this isolates the LINK (not the smoother): gam's public formula fit only
-//! pins the *standard* link state machine to its seed, so the fitted-mean head-
-//! to-head would degenerate to a logit comparison. The honest, capability-true
-//! measurement of the beta-logistic link is therefore its mean curve `mu(eta)`
-//! and its first eta-derivative `mu'(eta)` — gam's actual link code — evaluated
-//! over an `eta` grid produced by a genuine `s(x_1d) + s(x_2d)` binomial fit, and
-//! compared to base-R `pbeta`/`dbeta` (the exact kernel VGAM mixes over) at the
-//! identical shapes. We additionally assert gam's analytic `d1` matches the link
-//! CDF's finite difference — the same `mu'(eta) = d/deta pbeta(u,a,b)` identity
-//! VGAM relies on — which directly catches a wrong-derivative link bug.
-//!
-//! Requires R + VGAM; a missing interpreter or package is a hard test failure,
-//! never a silent skip (see `src/test_support/reference.rs`).
+//! Requires R; a missing interpreter or package is a hard test failure, never a
+//! silent skip (see `src/test_support/reference.rs`).
 
 use gam::matrix::LinearOperator;
 use gam::mixture_link::{inverse_link_jet_for_family, state_from_beta_logisticspec};
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, max_abs_diff, pearson, relative_l2, run_r};
+use gam::test_support::reference::{Column, max_abs_diff, pearson, relative_l2, rmse, run_r};
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, SasLinkSpec};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
@@ -93,6 +96,9 @@ fn gam_beta_logistic_link_matches_vgam_beta_parameterization() {
     let mut x1 = Vec::<f64>::with_capacity(N);
     let mut x2 = Vec::<f64>::with_capacity(N);
     let mut y = Vec::<f64>::with_capacity(N);
+    // The KNOWN generating probability surface, retained for the truth-recovery
+    // assertion: p_true[i] = I_{logistic(eta_true(x1,x2))}(a,b).
+    let mut p_true = Vec::<f64>::with_capacity(N);
     for _ in 0..N {
         let a = 10.0 * next_unit();
         let b = 10.0 * next_unit();
@@ -105,6 +111,7 @@ fn gam_beta_logistic_link_matches_vgam_beta_parameterization() {
         x1.push(a);
         x2.push(b);
         y.push(yi);
+        p_true.push(p);
     }
     let ones: f64 = y.iter().sum();
     assert!(
@@ -179,11 +186,55 @@ fn gam_beta_logistic_link_matches_vgam_beta_parameterization() {
         })
         .collect();
 
-    // ---- R/VGAM reference: the beta CDF/PDF the betabinomial family mixes ----
-    // VGAM is loaded (hard requirement); the continuous Beta(a,b) CDF/PDF that
-    // its betabinomial/betabinomial2 likelihoods integrate over IS base-R
-    // pbeta/dbeta at shape1=a, shape2=b. We pass the identical eta grid and
-    // shapes and emit:
+    // gam's fitted success-probability surface at the training rows IS
+    // mu(eta_grid): the beta-logistic link applied to gam's converged additive
+    // predictor. This is what we hold against the KNOWN truth p_true below.
+    let p_hat: Vec<f64> = gam_mu.clone();
+
+    // ======================= OBJECTIVE METRIC (A): TRUTH RECOVERY =============
+    // The response was drawn from the known surface p_true; assert gam recovers it.
+    // The principled bar is the binomial sampling floor: a single Bernoulli draw
+    // at probability p has SD sqrt(p(1-p)), so the smallest RMSE any estimator
+    // could plausibly reach on this design (with n=400 spread over a 2-D smooth)
+    // is a fraction of the mean draw SD. We require gam's probability RMSE to be
+    // well under that mean per-point Bernoulli SD — i.e. gam extracts most of the
+    // recoverable signal rather than tracking the noisy 0/1 labels.
+    let mean_bernoulli_sd: f64 =
+        (p_true.iter().map(|&p| p * (1.0 - p)).sum::<f64>() / N as f64).sqrt();
+    let rmse_truth = rmse(&p_hat, &p_true);
+    // Constant (intercept-only) baseline probability: the response mean. A fit
+    // that recovered nothing would do no better than this on truth recovery.
+    let p_bar = ones / N as f64;
+    let p_const = vec![p_bar; N];
+    let rmse_const = rmse(&p_const, &p_true);
+
+    // Mean Bernoulli negative log-likelihood: gam's fitted probabilities must
+    // explain the observed labels strictly better than the constant model. This
+    // is gam's OWN held-against-data fit quality (lower = better), computed only
+    // from gam's predictions and the data — no reference involved.
+    let nll = |probs: &[f64]| -> f64 {
+        let eps = 1e-12;
+        probs
+            .iter()
+            .zip(&y)
+            .map(|(&p, &yi)| {
+                let pc = p.clamp(eps, 1.0 - eps);
+                -(yi * pc.ln() + (1.0 - yi) * (1.0 - pc).ln())
+            })
+            .sum::<f64>()
+            / N as f64
+    };
+    let nll_gam = nll(&p_hat);
+    let nll_const = nll(&p_const);
+
+    // ---- base-R beta special functions (MATHEMATICAL GROUND TRUTH) ----------
+    // The beta-logistic inverse link IS, by definition, the regularized incomplete
+    // beta function pbeta(u,a,b); its derivative is the link-scale density
+    // dbeta(u,a,b)*u(1-u). Base-R's pbeta/dbeta are the exact analytic special
+    // functions (TOMS-708), so matching them is correctness vs ground truth, not
+    // "same as a peer fit". We additionally cross-check that VGAM's betabinomial
+    // shape parameterization is the one gam uses, but no pass/fail depends on a
+    // VGAM *fit*. We pass the identical eta grid and shapes and emit:
     //   mu_ref  = pbeta(logistic(eta), a, b)             (link CDF)
     //   d1_ref  = dbeta(u, a, b) * u*(1-u)               (link-scale density)
     //   d1_fd   = central finite difference of pbeta     (VGAM's PDF = d/deta CDF)
@@ -223,68 +274,111 @@ fn gam_beta_logistic_link_matches_vgam_beta_parameterization() {
         emit("beta_mean", a / (a + b))
         "#,
     );
-    let vgam_mu = r.vector("mu_ref");
-    let vgam_d1 = r.vector("d1_ref");
-    let vgam_d1_fd = r.vector("d1_fd");
+    let exact_mu = r.vector("mu_ref");
+    let exact_d1 = r.vector("d1_ref");
+    let exact_d1_fd = r.vector("d1_fd");
     let bb_mean = r.scalar("bb_mean");
     let beta_mean = r.scalar("beta_mean");
-    assert_eq!(vgam_mu.len(), N, "VGAM mu_ref length mismatch");
-    assert_eq!(vgam_d1.len(), N, "VGAM d1_ref length mismatch");
-    assert_eq!(vgam_d1_fd.len(), N, "VGAM d1_fd length mismatch");
+    assert_eq!(exact_mu.len(), N, "pbeta mu_ref length mismatch");
+    assert_eq!(exact_d1.len(), N, "dbeta d1_ref length mismatch");
+    assert_eq!(exact_d1_fd.len(), N, "pbeta d1_fd length mismatch");
 
-    // VGAM's beta-binomial(size=1) success mass must equal the Beta mean a/(a+b):
-    // confirms the comparator's shape parameterization is the one gam uses (a
-    // dispersion-vs-precision mismatch would break this identity, ~6% apart here).
-    assert!(
-        (bb_mean - beta_mean).abs() < 1e-9,
-        "VGAM betabinomial(size=1) mass {bb_mean:.9} != Beta mean {beta_mean:.9}: \
-         comparator shape parameterization mismatch"
-    );
-
-    // ---- compare on the link CDF, its derivative, and the FD identity -------
-    let rel_l2_mu = relative_l2(&gam_mu, vgam_mu);
-    let corr_mu = pearson(&gam_mu, vgam_mu);
-    let max_diff_mu = max_abs_diff(&gam_mu, vgam_mu);
-    let rel_l2_d1 = relative_l2(&gam_d1, vgam_d1);
-    // gam's analytic d1 vs the finite difference of the reference CDF (VGAM's PDF).
-    let max_diff_d1_fd = max_abs_diff(&gam_d1, vgam_d1_fd);
+    // Link-math correctness vs ground truth: gam's analytic CDF/derivative on the
+    // eta grid against the exact base-R special functions.
+    let rel_l2_mu = relative_l2(&gam_mu, exact_mu);
+    let corr_mu = pearson(&gam_mu, exact_mu);
+    let max_diff_mu = max_abs_diff(&gam_mu, exact_mu);
+    let rel_l2_d1 = relative_l2(&gam_d1, exact_d1);
+    // gam's analytic d1 vs the finite difference of the exact CDF (the link PDF).
+    let max_diff_d1_fd = max_abs_diff(&gam_d1, exact_d1_fd);
 
     eprintln!(
-        "beta-logistic link (delta={TRUE_DELTA} eps={TRUE_EPSILON}): n={N} edf={edf:.3} \
-         rel_l2(mu)={rel_l2_mu:.6} pearson(mu)={corr_mu:.7} max_diff(mu)={max_diff_mu:.6} \
+        "beta-logistic (delta={TRUE_DELTA} eps={TRUE_EPSILON}): n={N} edf={edf:.3}\n  \
+         [TRUTH] rmse(p_hat,p_true)={rmse_truth:.6} bernoulli_sd={mean_bernoulli_sd:.6} \
+         rmse_const={rmse_const:.6} | nll_gam={nll_gam:.6} nll_const={nll_const:.6}\n  \
+         [LINK ] rel_l2(mu)={rel_l2_mu:.6} pearson(mu)={corr_mu:.7} max_diff(mu)={max_diff_mu:.6} \
          rel_l2(d1)={rel_l2_d1:.6} max_diff(d1_vs_pdf_fd)={max_diff_d1_fd:.6}"
     );
 
+    // ===================== ASSERTION (A): TRUTH RECOVERY (PRIMARY) ============
+    // gam recovers the known generating probability surface. The irreducible
+    // single-Bernoulli noise SD averages to ~0.45 on this design; a fit that
+    // recovers the smooth signal sits FAR below that floor (it does not chase the
+    // 0/1 labels). 0.5 * mean_bernoulli_sd (~0.22) is a generous, never-weakened
+    // bar that a genuine recovery clears with room while a degenerate / wrong-link
+    // fit (which collapses toward the constant) cannot.
+    assert!(
+        rmse_truth <= 0.5 * mean_bernoulli_sd,
+        "beta-logistic fit fails to recover the true probability surface: \
+         rmse(p_hat,p_true)={rmse_truth:.6} > 0.5*bernoulli_sd={:.6}",
+        0.5 * mean_bernoulli_sd
+    );
+    // Match-or-beat the trivial baseline ON ACCURACY: the structured fit must be
+    // strictly closer to truth than the intercept-only model (with margin), i.e.
+    // the smooths add real, correctly-shaped signal rather than noise.
+    assert!(
+        rmse_truth <= 0.85 * rmse_const,
+        "beta-logistic fit no better than the constant model on truth recovery: \
+         rmse(p_hat,p_true)={rmse_truth:.6} vs 0.85*rmse_const={:.6}",
+        0.85 * rmse_const
+    );
+    // gam's fitted probabilities explain the observed labels better than the
+    // constant model (lower mean Bernoulli NLL) — gam's own held-against-data fit
+    // quality, with no reference in the criterion.
+    assert!(
+        nll_gam < nll_const,
+        "beta-logistic fit does not beat the intercept-only model in log-likelihood: \
+         nll_gam={nll_gam:.6} >= nll_const={nll_const:.6}"
+    );
+    // edf sanity: a 2-D smooth additive fit through k=6 bases per term must use
+    // more than a single (constant) df yet stay well within the basis budget.
+    assert!(
+        (1.5..12.0).contains(&edf),
+        "beta-logistic edf out of a sensible signal-appropriate range: edf={edf:.3}"
+    );
+
+    // ============ ASSERTION (B): LINK MATH vs MATHEMATICAL GROUND TRUTH =======
     // gam's beta-logistic inverse-link CDF mu(eta) = I_{logistic(eta)}(a,b) is, up
     // to a continued-fraction implementation of the regularized incomplete beta,
-    // bit-for-bit the same function as R's pbeta(logistic(eta), a, b). The only
-    // residual is the difference between two independent incomplete-beta
-    // evaluations (gam's statrs-style CF vs R's TOMS-708), which is ~1e-12; the
-    // bounds below are orders of magnitude above that floor and exist to catch a
-    // wrong shape map (a<->b swap, missing log_delta, epsilon sign) or a wrong
-    // logistic argument, all of which would move mu by O(0.1+).
+    // bit-for-bit the EXACT function R's pbeta(logistic(eta), a, b) computes (the
+    // analytic special-function definition — TOMS-708). The only residual is the
+    // difference between two independent incomplete-beta evaluations (gam's
+    // statrs-style CF vs R's TOMS-708), ~1e-12; the bounds below are orders of
+    // magnitude above that floor and exist to catch a wrong shape map (a<->b swap,
+    // missing log_delta, epsilon sign) or a wrong logistic argument, all of which
+    // would move mu by O(0.1+). This is correctness vs ground truth, not parity
+    // with a peer fit.
     assert!(
         corr_mu > 0.999,
-        "beta-logistic mu diverges from VGAM/pbeta in shape: pearson={corr_mu:.7}"
+        "beta-logistic mu diverges from exact pbeta in shape: pearson={corr_mu:.7}"
     );
     assert!(
         rel_l2_mu < 0.020,
-        "beta-logistic mu diverges from VGAM/pbeta: rel_l2={rel_l2_mu:.6}"
+        "beta-logistic mu diverges from exact pbeta: rel_l2={rel_l2_mu:.6}"
     );
     assert!(
         max_diff_mu < 0.03,
-        "beta-logistic mu has a pointwise gap vs VGAM/pbeta: max_diff={max_diff_mu:.6}"
+        "beta-logistic mu has a pointwise gap vs exact pbeta: max_diff={max_diff_mu:.6}"
     );
     // The analytic link derivative must match the *numerical* derivative of the
-    // reference CDF (the spec's d1-vs-VGAM-PDF finite-difference check): a wrong
-    // d1 (e.g. dbeta without the u(1-u) chain factor, or wrong shapes) is the most
-    // common link-derivative bug and would blow this far past 0.03. The 0.03
-    // budget absorbs only the O(h^2)+roundoff FD error of the central difference
-    // at h=1e-6 (~1e-6 here), so it is loose for FD noise yet strict for any real
-    // derivative error.
+    // exact CDF (d1-vs-PDF finite-difference check): a wrong d1 (e.g. dbeta without
+    // the u(1-u) chain factor, or wrong shapes) is the most common link-derivative
+    // bug and would blow this far past 0.03. The 0.03 budget absorbs only the
+    // O(h^2)+roundoff FD error of the central difference at h=1e-6 (~1e-6 here), so
+    // it is loose for FD noise yet strict for any real derivative error.
     assert!(
         max_diff_d1_fd < 0.03,
-        "beta-logistic analytic d1 != finite-difference of VGAM/pbeta CDF (PDF): \
+        "beta-logistic analytic d1 != finite-difference of exact pbeta CDF (PDF): \
          max_diff={max_diff_d1_fd:.6}"
+    );
+
+    // VGAM cross-check (NOT a pass criterion on a VGAM fit): confirm VGAM's
+    // betabinomial(size=1) success mass equals the Beta mean a/(a+b), so the shape
+    // parameterization gam uses is the one VGAM's family is built on. A
+    // dispersion-vs-precision mismatch would break this identity (~6% apart).
+    assert!(
+        (bb_mean - beta_mean).abs() < 1e-9,
+        "VGAM betabinomial(size=1) mass {bb_mean:.9} != Beta mean {beta_mean:.9}: \
+         shape parameterization mismatch"
     );
 }

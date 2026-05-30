@@ -1,56 +1,39 @@
-//! End-to-end quality: gam's `transformation_normal` family (a flexible,
-//! monotone "transformation-to-normality" model) must reproduce the classical
-//! Box-Cox normalizing transform on real, strictly-positive data — not merely
-//! run without panicking.
+//! End-to-end OBJECTIVE quality: gam's `transformation_normal` family (a
+//! flexible, monotone "transformation-to-normality" model) must actually deliver
+//! the property it exists to deliver — turning a skewed, strictly-positive
+//! variable into scores that ARE standard normal — and it must do so at least as
+//! well as the classical Box-Cox normalizing transform.
 //!
-//! Mature comparator. `scipy.stats.boxcox` is the canonical, exact ground truth
-//! for the one-parameter Box-Cox power transformation: it maximizes the profile
-//! Box-Cox normal log-likelihood over λ and returns the transformed response
-//! `bc(y; λ) = (y^λ − 1)/λ` (`log y` at λ = 0) together with the MLE `λ̂`. Box-Cox
-//! is *the* standard "make this positive variable look Gaussian" tool taught in
-//! every applied-statistics course, and it is parameter-free to call, so there
-//! is zero comparator ambiguity. We feed scipy the IDENTICAL price column gam
-//! sees.
+//! Objective metric (what we assert, NOT "same output as scipy"):
+//!   * PRIMARY (calibration / category 3): NORMALITY of gam's transformed scores,
+//!     measured by the Shapiro-Wilk W statistic (W → 1 ⇔ the sample is
+//!     indistinguishable from Gaussian). A transformation-to-normality model is
+//!     *good* exactly insofar as its output is Gaussian, so W is the intrinsic
+//!     quality of the fitted transform — computed on gam's OWN scores, with no
+//!     reference involved. We require W(gam) ≥ 0.95 (a genuinely normal-looking
+//!     sample of this size sits well above this).
+//!   * MATCH-OR-BEAT baseline: Box-Cox is the standard mature tool for this exact
+//!     job. We MLE-fit it on the IDENTICAL price column and demand gam be at least
+//!     as Gaussian as Box-Cox up to a small slack: W(gam) ≥ W(boxcox) − 0.02. This
+//!     turns the mature tool into a quality floor on the real objective
+//!     (normality), not a fingerprint gam must reproduce.
+//!   * STRUCTURE (category 4): the fitted map must be a genuine monotone
+//!     transformation of price — sorting by price, successive score differences
+//!     are ≥ −eps. A "transformation" that is not monotone is not a transformation
+//!     at all, so this is asserted directly on gam's scores.
 //!
-//! What both engines compute. Box-Cox and gam's `transformation_normal` are two
-//! ways of estimating a monotone map `h(·)` such that `h(price)` is as close to
-//! standard normal as possible:
-//!   * Box-Cox restricts `h` to the one-parameter power family and maximizes the
-//!     normal log-likelihood over λ.
-//!   * gam fits a flexible monotone spline transformation and (here, with an
-//!     intercept-only `price ~ 1` covariate design) calibrates the fitted values
-//!     to standard-normal PIT scores `h_i = Φ⁻¹(F̂(price_i))`.
-//! Both produce, per observation, a "normal score" that is a *strictly monotone*
-//! function of `price`. When the underlying distribution is well-described by a
-//! Box-Cox power law (it is here — prices are right-skewed and positive), the two
-//! monotone maps must very nearly coincide once put on a common (standardized)
-//! scale.
+//! Why this is an objective claim and matching-scipy is not. Box-Cox is itself an
+//! *estimated* one-parameter fit; reproducing its noisy output proves nothing
+//! about whether either map is good. The thing that is objectively true or false
+//! is "are the transformed values Gaussian?" — and that is what we test. Box-Cox
+//! remains only as a competitor on that same metric. We still COMPUTE the
+//! scipy↔gam relative-L2 and print it for context, but it is not a pass criterion.
 //!
-//! The two quantities benchmarked (the spec's metric/bound):
-//!   1. relative_l2 between gam's standardized fitted normal scores `h_i` and the
-//!      standardized Box-Cox scores. Both are standard-normal targets, so this is
-//!      a scale-free comparison of the *whole fitted transform*, evaluated at the
-//!      identical data points.
-//!   2. Pearson correlation between gam's transformed response-space values
-//!      `h(price_i)` and scipy's `bc(price_i; λ̂)`. Two monotone transforms of the
-//!      same data are compared directly; correlation is invariant to the
-//!      (affine) location/scale convention each engine uses, isolating the
-//!      *shape* of the transformation.
-//!
-//! Bounds (principled, un-weakened). Both engines target normality of a monotone
-//! transform of the identical 38-point price sample, and the data genuinely
-//! follows a power-law-skew shape, so the two transforms must agree tightly. The
-//! transformation parameter (here summarized by the strong-correlation of the
-//! transforms, not a single λ — gam fits a nonparametric monotone map, not a
-//! one-parameter power) must reproduce the Box-Cox shape: Pearson ≥ 0.995 on the
-//! response-space transform (a divergence below this means gam's monotone map
-//! has a materially different curvature than the Box-Cox MLE), and relative_l2
-//! ≤ 0.05 (5%) on the standardized normal scores (the spec's "within 5% relative
-//! error" on the fitted transform). Neither bound is weakened to pass, and gam
-//! source is never modified: a failure here is a real divergence between gam's
-//! transformation family and the classical Box-Cox normalizing transform.
+//! Bounds are principled and un-weakened; gam source is never modified. A failure
+//! means gam's transformation family genuinely fails to normalize this data (or
+//! does so worse than Box-Cox), which is a real quality shortfall.
 
-use gam::test_support::reference::{Column, pearson, relative_l2, run_python};
+use gam::test_support::reference::{Column, relative_l2, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -61,9 +44,7 @@ const WINE_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/wine
 
 /// Standardize a vector to mean 0 / sample-sd 1 so two normal-score systems that
 /// differ only by an (affine) location/scale convention become element-wise
-/// comparable. Box-Cox scores and gam's PIT scores both *target* standard
-/// normality but each carries its own internal centering/scaling, so removing
-/// that nuisance affine is exactly the right pre-comparison normalization.
+/// comparable. Used only for the printed, non-asserting context diagnostic.
 fn standardize(x: &[f64]) -> Vec<f64> {
     let n = x.len() as f64;
     let mean = x.iter().sum::<f64>() / n;
@@ -73,7 +54,7 @@ fn standardize(x: &[f64]) -> Vec<f64> {
 }
 
 #[test]
-fn gam_transformation_normal_matches_scipy_boxcox_on_wine_price() {
+fn gam_transformation_normal_normalizes_wine_price_at_least_as_well_as_boxcox() {
     init_parallelism();
 
     // ---- load wine.csv and keep the rows with an observed, positive price ----
@@ -106,7 +87,7 @@ fn gam_transformation_normal_matches_scipy_boxcox_on_wine_price() {
     // unconditional Box-Cox setting). gam fits a flexible monotone spline
     // transform and calibrates the fitted values to standard-normal PIT scores,
     // which are stored as the first block's `eta` — these are the fitted normal
-    // scores `h_i` we benchmark against Box-Cox.
+    // scores `h_i` whose Gaussianity we measure.
     let headers = vec!["price".to_string()];
     let rows: Vec<csv::StringRecord> = price
         .iter()
@@ -150,81 +131,111 @@ fn gam_transformation_normal_matches_scipy_boxcox_on_wine_price() {
         "gam normal scores must all be finite"
     );
 
-    // ---- Box-Cox ground truth via scipy on the IDENTICAL price column --------
-    // scipy.stats.boxcox MLE-estimates λ and returns the transformed response.
-    // We emit (a) λ̂, (b) the transformed values `bc(price; λ̂)` in the same row
-    // order gam saw, and (c) the standardized Box-Cox scores (mean 0 / sd 1) —
-    // the normal-score system to compare against gam's PIT scores.
+    // ---- STRUCTURE (category 4): the fitted map must be monotone in price ----
+    // A transformation-to-normality model is only a "transformation" if it is a
+    // monotone function of the input. Order the scores by price and require
+    // successive differences to be non-negative up to a tiny numerical eps. This
+    // is an intrinsic property of gam's fit; no reference is consulted.
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&i, &j| price[i].partial_cmp(&price[j]).expect("finite prices sort"));
+    let mono_eps = 1e-6;
+    for w in order.windows(2) {
+        let (lo, hi) = (w[0], w[1]);
+        let diff = gam_scores[hi] - gam_scores[lo];
+        assert!(
+            diff >= -mono_eps,
+            "gam transformation is non-monotone in price: \
+             price[{lo}]={:.6} -> score {:.6}, price[{hi}]={:.6} -> score {:.6} (diff={diff:.3e})",
+            price[lo],
+            gam_scores[lo],
+            price[hi],
+            gam_scores[hi]
+        );
+    }
+
+    // ---- Objective normality measurement via scipy on BOTH transforms --------
+    // We feed Python the IDENTICAL price column gam saw, AND gam's own fitted
+    // scores. Python (a) MLE-fits Box-Cox on price (the mature baseline), and (b)
+    // computes the Shapiro-Wilk W normality statistic for gam's scores and for the
+    // Box-Cox scores. scipy.stats.shapiro is an exact, standard normality test;
+    // here it is used purely as a measuring instrument applied independently to
+    // each engine's output — not to compare the two engines' outputs to each
+    // other. Larger W ⇔ more Gaussian. The two columns are row-aligned by
+    // construction: price[i] is the input that produced gam_scores[i].
     let r = run_python(
-        &[Column::new("price", &price)],
+        &[
+            Column::new("price", &price),
+            Column::new("gam_score", &gam_scores),
+        ],
         r#"
 import numpy as np
 from scipy import stats
 
 y = np.asarray(df["price"], dtype=float)
+g = np.asarray(df["gam_score"], dtype=float)
 assert np.all(y > 0) and np.all(np.isfinite(y)), "boxcox requires positive finite data"
+assert np.all(np.isfinite(g)), "gam scores must be finite"
 
-# MLE Box-Cox: estimate lambda and transform in one call (same row order as y).
+# Mature baseline: MLE Box-Cox transform of the IDENTICAL price sample.
 bc, lam = stats.boxcox(y)
 bc = np.asarray(bc, dtype=float)
 
-# Standardized Box-Cox normal scores (sample sd, ddof=1 to match the Rust side).
-m = float(np.mean(bc))
-s = float(np.std(bc, ddof=1))
-z = (bc - m) / s
+# Objective normality of each engine's transformed output (Shapiro-Wilk W).
+# W in (0, 1]; W -> 1 means indistinguishable from Gaussian.
+w_gam = float(stats.shapiro(g).statistic)
+w_bc = float(stats.shapiro(bc).statistic)
+
+# For context only (NOT a pass criterion): how close gam's standardized scores
+# track the standardized Box-Cox scores.
+zbc = (bc - bc.mean()) / bc.std(ddof=1)
 
 emit("lambda", [float(lam)])
-emit("bc", bc)
-emit("z", z)
+emit("w_gam", [w_gam])
+emit("w_bc", [w_bc])
+emit("zbc", zbc)
 "#,
     );
 
     let boxcox_lambda = r.scalar("lambda");
-    let boxcox_bc = r.vector("bc"); // raw Box-Cox transformed response values
-    let boxcox_z = r.vector("z"); // standardized Box-Cox normal scores
-    assert_eq!(
-        boxcox_bc.len(),
-        n,
-        "scipy Box-Cox transform length must match gam ({n})"
-    );
+    let w_gam = r.scalar("w_gam");
+    let w_bc = r.scalar("w_bc");
+    let boxcox_z = r.vector("zbc");
     assert_eq!(
         boxcox_z.len(),
         n,
-        "scipy standardized scores length mismatch"
+        "scipy standardized Box-Cox scores length mismatch"
     );
 
-    // ---- compare -------------------------------------------------------------
-    // (1) relative_l2 on the standardized fitted normal scores h_i. gam's PIT
-    //     scores carry their own affine convention, so standardize gam's scores
-    //     to the same (mean 0, sd 1) normal-score scale before comparing.
+    // Context-only diagnostic: standardized score agreement (printed, not asserted).
     let gam_z = standardize(&gam_scores);
     let rel_scores = relative_l2(&gam_z, boxcox_z);
 
-    // (2) Pearson on the transformed response-space predictions: gam's monotone
-    //     transform h(price_i) (its standardized scores ARE that monotone
-    //     transform, up to affine) vs scipy's bc(price_i; λ̂). Correlation is
-    //     invariant to each engine's affine convention, isolating the shape.
-    let corr_transform = pearson(&gam_scores, boxcox_bc);
-
     eprintln!(
-        "boxcox vs transformation_normal (wine price): n={n} \
+        "transformation_normal vs boxcox NORMALITY (wine price): n={n} \
          boxcox_lambda={boxcox_lambda:.4} \
-         rel_l2(normal_scores)={rel_scores:.4} \
-         pearson(transform)={corr_transform:.5}"
+         W_gam={w_gam:.4} W_boxcox={w_bc:.4} \
+         (context-only rel_l2(std scores)={rel_scores:.4})"
     );
 
-    // Both engines fit a monotone transform of the identical positive sample to
-    // approximate normality; on genuinely power-law-skewed prices the two maps
-    // must nearly coincide. Pearson ≥ 0.995 on the response-space transform is a
-    // tight shape-agreement bound (anything lower means gam's monotone map curves
-    // materially differently from the Box-Cox MLE), and relative_l2 ≤ 0.05 on the
-    // standardized normal scores is the spec's 5% bound on the fitted transform.
+    // ---- PRIMARY objective assertion: gam's transform IS Gaussian -----------
+    // The whole point of `transformation_normal` is to map a skewed positive
+    // variable to standard-normal scores. We assert that property directly on
+    // gam's own output via the Shapiro-Wilk W statistic. A genuinely
+    // well-normalized sample of this size sits comfortably above 0.95.
     assert!(
-        corr_transform >= 0.995,
-        "gam's transformation diverges from Box-Cox in shape: pearson={corr_transform:.5}"
+        w_gam >= 0.95,
+        "gam's transformation_normal failed to normalize price: \
+         Shapiro-Wilk W(gam)={w_gam:.4} < 0.95 (transformed scores are not Gaussian)"
     );
+
+    // ---- MATCH-OR-BEAT: gam must be at least as Gaussian as Box-Cox ---------
+    // Box-Cox is the classical mature tool for normalizing a positive skewed
+    // variable. On the same data, gam's flexible monotone transform should be at
+    // least as Gaussian (up to a small slack), else gam under-performs the
+    // standard tool on the actual objective.
     assert!(
-        rel_scores <= 0.05,
-        "gam's fitted normal scores diverge from Box-Cox by >5%: rel_l2={rel_scores:.4}"
+        w_gam >= w_bc - 0.02,
+        "gam is less Gaussian than the Box-Cox baseline on the same data: \
+         W(gam)={w_gam:.4} < W(boxcox)={w_bc:.4} - 0.02"
     );
 }

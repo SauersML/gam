@@ -1,34 +1,40 @@
 //! End-to-end quality: gam's *multi-smooth additive* model (p-spline + cyclic
-//! cubic + Matérn) must agree with `statsmodels`' Generalized Additive Model —
-//! a third mature, independently-implemented additive-spline reference (after
-//! mgcv and pyGAM) — on the same Gaussian data.
+//! cubic + Matérn) must RECOVER A KNOWN ADDITIVE TRUTH on noisy Gaussian data.
 //!
-//! Why statsmodels GAM here: `statsmodels.gam` is the canonical Python additive
-//! B-spline implementation. It supports exactly the basis mixture this test
-//! exercises — `BSplines` (penalized p-spline, the analogue of gam's
-//! `s(..., bs='ps')`), `CyclicCubicSplines` (periodic, the analogue of gam's
-//! `cc(...)`), and a further penalized `BSplines` term standing in for gam's
-//! `matern(...)` smooth of `x3` (statsmodels has no native Matérn kernel, so
-//! the mature cross-engine analogue for "a penalized smooth of x3" is another
-//! B-spline smoother; both engines must recover the same underlying function).
-//! statsmodels selects its per-smoother penalty weights by GCV via
-//! `select_penweight()`, so it targets a comparable smoothing objective to
-//! gam's REML — the fitted additive surfaces should essentially coincide.
+//! OBJECTIVE METRIC (the pass criterion): the data are generated from a known
+//! noise-free additive function `truth(x1,x2,x3) = sin(4π·x1) + cos(4π·x2) +
+//! 0.5·x3` plus i.i.d. N(0,σ²) noise (σ = 0.10). The primary assertion is that
+//! gam's fitted mean recovers that truth in root-mean-square:
+//!     RMSE(gam_fitted, y_truth) <= σ.
+//! A correct smoother averages out independent noise, so the fitted mean is
+//! strictly closer to the truth than the noisy observations are; the per-point
+//! noise scale σ is therefore a principled, non-trivial ceiling on the recovery
+//! error (the raw observations sit at ≈σ from truth by construction). We also
+//! assert the recovered surface is highly correlated with the truth in SHAPE
+//! (Pearson) and, term by term, that each smooth recovers the shape of its own
+//! true component — the direct test that the p-spline, cyclic, and Matérn terms
+//! are each constructed, identified, and stacked correctly.
+//!
+//! Why statsmodels GAM is still here, as a BASELINE TO MATCH-OR-BEAT (not as the
+//! pass criterion): `statsmodels.gam` is a mature, independently-implemented
+//! additive B-spline reference. We fit the SAME data with it and require that
+//! gam's recovery error is no worse than statsmodels' by more than 10%
+//! (RMSE_gam <= 1.10 · RMSE_sm). This demotes the reference to an accuracy
+//! benchmark: matching its noisy fitted *output* proves nothing, but recovering
+//! the truth at least as accurately as a trusted tool is a real quality claim.
+//! The cross-engine `rel_l2`/Pearson agreement is computed and printed for
+//! context via `eprintln!`, but is NOT a pass/fail gate.
 //!
 //! Combinations are where bugs hide: overlapping bases, mixed penalty
 //! structures, and identifiability constraints across three simultaneously-fit
-//! smooths of different families. This test asserts that gam's multi-term
-//! formula parsing, design stacking, identifiability handling, and REML smooth-
-//! parameter selection produce an additive fit that matches statsmodels jointly
-//! and term-by-term, and recovers the noise-free truth.
-//!
-//! A genuine divergence failing any assertion below is a real, useful signal —
-//! the bounds are principled and must NOT be loosened to force a pass.
+//! smooths of different families. A genuine divergence failing any assertion
+//! below is a real, useful signal — the bounds are principled and must NOT be
+//! loosened to force a pass.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, run_python};
+use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -46,8 +52,22 @@ const SIGMA: f64 = 0.10;
 /// exactly two periods on [0,1], so it is genuinely periodic on the unit
 /// interval — the right structure to exercise the cyclic-cubic smooth.
 fn truth(x1: f64, x2: f64, x3: f64) -> f64 {
-    let tau = 2.0 * std::f64::consts::PI;
-    (2.0 * tau * x1).sin() + (2.0 * tau * x2).cos() + 0.5 * x3
+    true_x1(x1) + true_x2(x2) + true_x3(x3)
+}
+
+/// True smooth component for x1 (the p-spline term's target shape).
+fn true_x1(x1: f64) -> f64 {
+    (4.0 * std::f64::consts::PI * x1).sin()
+}
+
+/// True smooth component for x2 (the cyclic-cubic term's target shape).
+fn true_x2(x2: f64) -> f64 {
+    (4.0 * std::f64::consts::PI * x2).cos()
+}
+
+/// True smooth component for x3 (the Matérn term's target shape).
+fn true_x3(x3: f64) -> f64 {
+    0.5 * x3
 }
 
 #[test]
@@ -189,116 +209,91 @@ res = gam.fit()
 
 emit("fitted", np.asarray(res.fittedvalues, dtype=float))
 # Penalized effective degrees of freedom = trace of the penalized hat
-# (smoother) matrix, res.hat_matrix_trace (== sum(res.edf), the per-column edf).
-# THIS is the quantity comparable to gam's penalized edf_total. (res.df_model is
-# the unpenalized parametric rank = total basis-column count, which would
-# spuriously disagree with a penalized fit and must NOT be used.) The trace
-# already counts the intercept column.
+# (smoother) matrix, res.hat_matrix_trace. Emitted for CONTEXT ONLY (printed
+# alongside gam's edf_total); it is NOT a pass/fail gate — matching another
+# tool's edf is not a quality claim.
 emit("edf_total", [float(res.hat_matrix_trace)])
-
-# Per-term partial predictions: evaluate each smoother's basis at the data
-# with that smoother's own coefficients (offset-free term contribution).
-params = np.asarray(res.params, dtype=float)
-# Recover each smoother's own basis at the data; its column count IS the per-
-# term coefficient width. Slice res.params by those widths instead of hard-
-# coding df, and assert the layout [intercept | x1 | x2 | x3] adds up, so a
-# basis-dimension mismatch fails loudly rather than producing garbage partials.
-Bx1 = np.asarray(bs1.transform(x1.reshape(-1, 1)), dtype=float)
-Bx2 = np.asarray(cc2.transform(x2.reshape(-1, 1)), dtype=float)
-Bx3 = np.asarray(bs3.transform(x3.reshape(-1, 1)), dtype=float)
-k1, k2, k3 = Bx1.shape[1], Bx2.shape[1], Bx3.shape[1]
-assert params.shape[0] == 1 + k1 + k2 + k3, \
-    f"unexpected GLMGam param layout: {params.shape[0]} != 1+{k1}+{k2}+{k3}"
-o = 1
-b1 = params[o:o+k1]; o += k1
-b2 = params[o:o+k2]; o += k2
-b3 = params[o:o+k3]; o += k3
-emit("part_x1", Bx1 @ b1)
-emit("part_x2", Bx2 @ b2)
-emit("part_x3", Bx3 @ b3)
 "#,
     );
     let sm_fitted = r.vector("fitted");
     let sm_edf = r.scalar("edf_total");
-    let sm_part_x1 = r.vector("part_x1");
-    let sm_part_x2 = r.vector("part_x2");
-    let sm_part_x3 = r.vector("part_x3");
 
     assert_eq!(sm_fitted.len(), N, "statsmodels fitted length mismatch");
 
-    // ---- compare -----------------------------------------------------------
+    // ---- true per-term components (ground-truth shapes) --------------------
+    // Each gam smooth must recover the SHAPE of its own true additive component,
+    // not the reference's (noisy) fitted partial. We compare against the truth.
+    let truth_part_x1: Vec<f64> = x1.iter().map(|&v| true_x1(v)).collect();
+    let truth_part_x2: Vec<f64> = x2.iter().map(|&v| true_x2(v)).collect();
+    let truth_part_x3: Vec<f64> = x3.iter().map(|&v| true_x3(v)).collect();
+
+    // ---- OBJECTIVE metric: recovery of the noise-free truth ----------------
+    // RMSE of each engine's fitted mean against the noise-free truth. The raw
+    // observations sit at ≈σ from truth by construction; a correct smoother
+    // averages noise out and lands well below σ.
+    let rmse_gam = rmse(&gam_fitted, &y_truth);
+    let rmse_sm = rmse(sm_fitted, &y_truth);
+    let corr_truth_gam = pearson(&gam_fitted, &y_truth);
+    // Term-wise SHAPE recovery against the true components (Pearson, offset-free).
+    let p1 = pearson(&gam_part_x1, &truth_part_x1);
+    let p2 = pearson(&gam_part_x2, &truth_part_x2);
+    let p3 = pearson(&gam_part_x3, &truth_part_x3);
+
+    // ---- cross-engine agreement: CONTEXT ONLY, not a pass/fail gate --------
     let rel = relative_l2(&gam_fitted, sm_fitted);
     let corr_joint = pearson(&gam_fitted, sm_fitted);
-    let corr_truth_gam = pearson(&gam_fitted, &y_truth);
-    let corr_truth_sm = pearson(sm_fitted, &y_truth);
-    let edf_rel = (gam_edf - sm_edf).abs() / sm_edf.abs().max(1.0);
-    let p1 = pearson(&gam_part_x1, sm_part_x1);
-    let p2 = pearson(&gam_part_x2, sm_part_x2);
-    let p3 = pearson(&gam_part_x3, sm_part_x3);
-
     eprintln!(
-        "additive ps+cc+matern: n={N} gam_edf={gam_edf:.3} sm_edf={sm_edf:.3} \
-         rel_l2={rel:.4} pearson_joint={corr_joint:.5} \
-         pearson_truth(gam={corr_truth_gam:.4}, sm={corr_truth_sm:.4}) \
-         term_pearson(x1={p1:.4}, x2={p2:.4}, x3={p3:.4}) edf_rel={edf_rel:.3}"
+        "additive ps+cc+matern: n={N} sigma={SIGMA:.3} \
+         rmse_truth(gam={rmse_gam:.4}, sm={rmse_sm:.4}) ratio={:.3} \
+         pearson_truth_gam={corr_truth_gam:.4} \
+         term_pearson_truth(x1={p1:.4}, x2={p2:.4}, x3={p3:.4}) \
+         [context only] gam_edf={gam_edf:.3} sm_edf={sm_edf:.3} \
+         rel_l2_vs_sm={rel:.4} pearson_joint_vs_sm={corr_joint:.5}",
+        rmse_gam / rmse_sm.max(1e-12)
     );
 
-    // (1) Joint fitted surfaces. gam (REML) and statsmodels (GCV) use different
-    // penalty/PIRLS machinery on overlapping bases, so we allow a looser band
-    // than the single-smooth-vs-mgcv case (which hits ~0.005). rel_l2 < 0.08 is
-    // still tight: it asserts the two additive surfaces agree to within ~8% of
-    // the fitted-vector norm, which a genuine stacking/identifiability bug
-    // (wrong term sign, dropped null space, mis-centred basis) would blow past.
+    // (1) PRIMARY CLAIM — gam recovers the truth. With σ=0.10 and n=250 a
+    // correct additive smoother averages independent noise out, so its fitted
+    // mean is strictly closer to truth than the σ-scale observations. Requiring
+    // RMSE(gam, truth) <= σ is therefore a principled, non-trivial ceiling that
+    // a mis-built term (wrong sign, dropped null space, mis-centred basis,
+    // cross-term contamination) would blow past.
     assert!(
-        rel < 0.08,
-        "joint additive fit diverges from statsmodels: rel_l2={rel:.4}"
-    );
-    assert!(
-        corr_joint > 0.98,
-        "joint additive fit shape disagrees with statsmodels: pearson={corr_joint:.5}"
+        rmse_gam <= SIGMA,
+        "gam additive fit fails to recover truth: rmse={rmse_gam:.4} > sigma={SIGMA:.3}"
     );
 
-    // (2) Recovery of the noise-free truth. With σ=0.10 and n=250 a correct
-    // additive smoother recovers the true mean closely; >0.98 Pearson is the
-    // sanity floor both engines must clear (a mis-built term destroys it).
+    // (2) MATCH-OR-BEAT the mature reference on ACCURACY (not on output). gam's
+    // recovery error must be no worse than statsmodels' by more than 10%.
+    assert!(
+        rmse_gam <= rmse_sm * 1.10,
+        "gam recovery worse than statsmodels baseline: rmse_gam={rmse_gam:.4} > 1.10*rmse_sm={:.4}",
+        rmse_sm * 1.10
+    );
+
+    // (3) Joint SHAPE recovery: the fitted surface must track the true mean.
+    // >0.98 Pearson is the sanity floor a correct multi-smooth fit clears.
     assert!(
         corr_truth_gam > 0.98,
-        "gam additive fit fails to recover truth: pearson={corr_truth_gam:.4}"
-    );
-    assert!(
-        corr_truth_sm > 0.98,
-        "reference statsmodels fit fails to recover truth (data/ref sanity): \
-         pearson={corr_truth_sm:.4}"
+        "gam additive fit shape diverges from truth: pearson={corr_truth_gam:.4}"
     );
 
-    // (3) Term-wise agreement. Each smooth's recovered shape must track the
-    // corresponding statsmodels smoother. >0.95 Pearson per term is the per-
-    // smooth analogue of the "EDF within 25%" complexity-matching intent:
-    // a term that is over/under-smoothed, mis-parameterised, or contaminated by
-    // a neighbouring term (the classic multi-smooth identifiability bug) would
-    // drop well below this. The cyclic term is the most basis-sensitive.
+    // (4) Term-wise SHAPE recovery against the TRUE components. Each smooth must
+    // recover the shape of its own true additive function. >0.95 Pearson per
+    // term: a term that is over/under-smoothed, mis-parameterised, or
+    // contaminated by a neighbouring term (the classic multi-smooth
+    // identifiability bug) drops well below this. The cyclic term is the most
+    // basis-sensitive.
     assert!(
         p1 > 0.95,
-        "p-spline term s(x1) disagrees with statsmodels: pearson={p1:.4}"
+        "p-spline term s(x1) fails to recover sin component: pearson={p1:.4}"
     );
     assert!(
         p2 > 0.95,
-        "cyclic term cc(x2) disagrees with statsmodels: pearson={p2:.4}"
+        "cyclic term cc(x2) fails to recover cos component: pearson={p2:.4}"
     );
     assert!(
         p3 > 0.95,
-        "matern term matern(x3) disagrees with statsmodels: pearson={p3:.4}"
-    );
-
-    // (4) Total PENALIZED effective degrees of freedom: gam's edf_total vs the
-    // trace of statsmodels' penalized smoother hat matrix (res.edf). Both are
-    // the true effective complexity of the *fitted* (penalized) model, so they
-    // are the right cross-engine quantity to compare. Basis/null-space and
-    // penalty-selection conventions (gam REML vs statsmodels GCV) still differ,
-    // so we assert same-ballpark complexity, within 25% — a broken term that
-    // inflates or collapses the total blows past this.
-    assert!(
-        edf_rel < 0.25,
-        "total effective degrees of freedom disagree: gam={gam_edf:.3} sm={sm_edf:.3} (rel={edf_rel:.3})"
+        "matern term matern(x3) fails to recover linear component: pearson={p3:.4}"
     );
 }

@@ -1,38 +1,34 @@
-//! End-to-end quality: gam's factor-smooth term `s(x, group, bs="fs")` must
-//! match `mgcv` — the mature, standard GAM implementation and the canonical
-//! reference for the `fs` ("factor smooth") penalty structure — on identical
-//! data.
+//! End-to-end OBJECTIVE quality: gam's factor-smooth term `s(x, group, bs="fs")`
+//! must RECOVER THE KNOWN GENERATING FUNCTION, not merely echo mgcv's fit.
 //!
-//! mgcv's `bs="fs"` builds, for every level of a factor `group`, the *same*
-//! marginal smooth basis in `x` with its own coefficients, penalized by a
-//! *shared* smoothing parameter through a marginal second-derivative (wiggliness)
-//! penalty AND a penalty on the marginal null space (so the per-level
-//! intercept/linear trend are themselves shrunk — the random-effect flavour of a
-//! smooth). It is the de-facto reference for "one smooth shape per group that
-//! borrows strength across groups". gam implements this as
-//! `FactorSmoothFlavour::Fs` (a B-spline marginal with `double_penalty=true`
-//! plus a null-space penalty of order `m=2`), routed from the formula
-//! `s(x, group, bs="fs")`.
+//! The data are simulated from a known per-group truth
+//!     y = μ_g + A·sin(4πx) + N(0, σ²),
+//! i.e. one common sinusoidal shape shared across groups plus a distinct
+//! per-group mean offset μ_g. The `fs` ("factor smooth") penalty is exactly the
+//! right structure for this: a single shared marginal smooth in `x` replicated
+//! per factor level, with a shared smoothing parameter and a null-space penalty
+//! that shrinks the per-level offsets (the random-effect flavour of a smooth).
 //!
-//! Both engines fit by REML, so they target the same penalized log-likelihood
-//! and the per-group fitted curves should essentially coincide. We:
-//!   1. fit `y ~ s(x, group, bs="fs")` with gam (REML, gaussian), and the SAME
-//!      model with `mgcv::gam(..., method="REML")`;
-//!   2. rebuild gam's design on a shared (x-grid x group) lattice and apply
-//!      `beta` to get gam's fitted per-group curves; obtain mgcv's fitted curves
-//!      at the IDENTICAL lattice via `predict`;
-//!   3. assert the per-group fitted curves agree (relative L2 over the full
-//!      lattice), that the curve SHAPE correlates (Pearson over the lattice), and
-//!      that the single shared smooth EDF agrees in magnitude.
+//! OBJECTIVE METRIC (the pass/fail claim): on a dense (x-grid × group) lattice we
+//! evaluate gam's fitted per-group curves and compare them to the NOISELESS truth
+//! `μ_g + A·sin(4πx)`. We assert
+//!   * RMSE(gam_fit, truth) <= 0.5·σ — recovering the mean function to well below
+//!     the per-observation noise level is the defining property of a correct
+//!     smoother (≈400 points / 4 groups give it ample data to average out σ);
+//!   * each per-group fit is genuinely wiggly (its sample std over the x-grid is a
+//!     sizeable fraction of the true amplitude A), so a degenerate flat/collapsed
+//!     fit cannot pass.
 //!
-//! A genuine divergence here is a real bug in gam's factor-smooth penalty (e.g.
-//! a missing null-space penalty or a per-level rather than shared smoothing
-//! parameter), and this test is meant to catch exactly that.
+//! mgcv (`gam(..., bs="fs", method="REML")`) is fit on the IDENTICAL data and
+//! kept ONLY as a match-or-beat ACCURACY BASELINE: gam's truth-recovery RMSE must
+//! be no worse than 1.10× mgcv's truth-recovery RMSE. We are not asserting gam
+//! reproduces mgcv's (itself noisy) fitted output — both are scored against the
+//! same ground-truth function, and gam must recover it at least as well.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, run_r};
+use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -51,11 +47,15 @@ const AMP: f64 = 1.0;
 /// that the fs penalty shrinks, so they exercise the null-space penalty path.
 const MU: [f64; N_GROUPS] = [-0.8, -0.2, 0.4, 1.0];
 
+/// Noiseless per-group truth `μ_g + A·sin(4πx)` — the function gam must recover.
+fn truth(x: f64, g: usize) -> f64 {
+    MU[g] + AMP * (4.0 * std::f64::consts::PI * x).sin()
+}
+
 fn build_data() -> (gam::data::EncodedDataset, Vec<f64>, Vec<String>) {
     let mut rng = StdRng::seed_from_u64(SEED);
     let ux = Uniform::new(0.0, 1.0).expect("uniform");
     let noise = Normal::new(0.0, SIGMA).expect("normal");
-    let four_pi = 4.0 * std::f64::consts::PI;
 
     let mut x = Vec::with_capacity(N);
     let mut grp = Vec::with_capacity(N);
@@ -63,7 +63,7 @@ fn build_data() -> (gam::data::EncodedDataset, Vec<f64>, Vec<String>) {
     for i in 0..N {
         let xi = ux.sample(&mut rng);
         let g = i % N_GROUPS; // round-robin keeps all groups well-populated
-        let yi = MU[g] + AMP * (four_pi * xi).sin() + noise.sample(&mut rng);
+        let yi = truth(xi, g) + noise.sample(&mut rng);
         x.push(xi);
         grp.push(g);
         y.push(yi);
@@ -90,7 +90,7 @@ fn build_data() -> (gam::data::EncodedDataset, Vec<f64>, Vec<String>) {
 }
 
 #[test]
-fn gam_factor_smooth_fs_matches_mgcv() {
+fn gam_factor_smooth_fs_recovers_truth() {
     init_parallelism();
 
     let (ds, y, group_labels) = build_data();
@@ -111,8 +111,9 @@ fn gam_factor_smooth_fs_matches_mgcv() {
     };
     let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
 
-    // ---- shared evaluation lattice: x in {0,0.1,...,1.0} x each group ------
-    let x_grid: Vec<f64> = (0..=10).map(|k| k as f64 / 10.0).collect();
+    // ---- shared evaluation lattice: dense x in [0,1] × each group ---------
+    let n_x = 41usize;
+    let x_grid: Vec<f64> = (0..n_x).map(|k| k as f64 / (n_x as f64 - 1.0)).collect();
     let n_eval = x_grid.len() * N_GROUPS;
     // gam side: build a design at the lattice. The group column carries the
     // categorical level CODE (0.0..3.0 as f64), matching the encoder above.
@@ -120,6 +121,8 @@ fn gam_factor_smooth_fs_matches_mgcv() {
     // R side: feed mgcv the IDENTICAL lattice as (x, group-label) pairs.
     let mut grid_x = Vec::with_capacity(n_eval);
     let mut grid_group = Vec::with_capacity(n_eval);
+    // Noiseless truth at every lattice node — the objective target.
+    let mut truth_curve = Vec::with_capacity(n_eval);
     let mut row = 0;
     for g in 0..N_GROUPS {
         for &xv in &x_grid {
@@ -127,6 +130,7 @@ fn gam_factor_smooth_fs_matches_mgcv() {
             grid[[row, group_idx]] = g as f64;
             grid_x.push(xv);
             grid_group.push(format!("g{g}"));
+            truth_curve.push(truth(xv, g));
             row += 1;
         }
     }
@@ -137,11 +141,12 @@ fn gam_factor_smooth_fs_matches_mgcv() {
     let gam_curves: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
     assert_eq!(gam_curves.len(), n_eval, "gam lattice prediction length");
 
-    // ---- fit the SAME model with mgcv (the mature fs reference) -----------
+    // ---- fit the SAME model with mgcv (match-or-beat accuracy baseline) ---
     // `group` must be a factor; bs="fs" with method="REML" reproduces the shared
     // smoothing parameter + null-space penalty. We predict the smooth on the
-    // identical lattice. mgcv emits the lattice columns row-major in the order
-    // we send them, so the returned `fitted` aligns elementwise with gam_curves.
+    // identical lattice; mgcv emits the lattice columns row-major in the order we
+    // send them, so the returned `fitted` aligns elementwise with gam_curves and
+    // with truth_curve. mgcv is scored against the SAME ground truth as gam.
     let r = run_r(
         &[
             Column::new("x", &x_vals),
@@ -190,46 +195,63 @@ fn gam_factor_smooth_fs_matches_mgcv() {
         "mgcv lattice prediction length mismatch"
     );
 
-    // ---- compare ----------------------------------------------------------
-    let rel = relative_l2(&gam_curves, mgcv_curves);
-    let corr = pearson(&gam_curves, mgcv_curves);
-    let edf_rel = (gam_edf - mgcv_edf).abs() / mgcv_edf.abs().max(1.0);
+    // ---- OBJECTIVE truth-recovery scoring ---------------------------------
+    let gam_truth_rmse = rmse(&gam_curves, &truth_curve);
+    let mgcv_truth_rmse = rmse(mgcv_curves, &truth_curve);
+    // Context only: how close the two fits happen to be (NOT a pass criterion).
+    let rel_to_mgcv = relative_l2(&gam_curves, mgcv_curves);
 
-    // Per-group diagnostics so a divergence localizes to a level.
+    // Per-group diagnostics + a wiggliness guard: each fit must reproduce a real
+    // sinusoid, not collapse to a flat line. The true per-group curve has sample
+    // std AMP/√2 ≈ 0.707 over a uniform x-grid spanning two full periods.
+    let mut min_group_std = f64::INFINITY;
     for g in 0..N_GROUPS {
         let lo = g * x_grid.len();
         let hi = lo + x_grid.len();
-        let rg = relative_l2(&gam_curves[lo..hi], &mgcv_curves[lo..hi]);
-        eprintln!("[fs] group g{g}: rel_l2={rg:.4}");
+        let seg = &gam_curves[lo..hi];
+        let mean = seg.iter().sum::<f64>() / seg.len() as f64;
+        let var = seg.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / seg.len() as f64;
+        let std = var.sqrt();
+        min_group_std = min_group_std.min(std);
+        let rg = rmse(seg, &truth_curve[lo..hi]);
+        eprintln!("[fs] group g{g}: truth_rmse={rg:.4} fit_std={std:.4}");
     }
+
     eprintln!(
-        "[fs] s(x,group,bs=fs): n={N} groups={N_GROUPS} gam_edf={gam_edf:.3} \
-         mgcv_edf={mgcv_edf:.3} (rel={edf_rel:.3}) lattice_rel_l2={rel:.4} pearson={corr:.5}"
+        "[fs] s(x,group,bs=fs): n={N} groups={N_GROUPS} \
+         gam_truth_rmse={gam_truth_rmse:.4} mgcv_truth_rmse={mgcv_truth_rmse:.4} \
+         (gam/mgcv={:.3}) min_group_std={min_group_std:.4} \
+         gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} rel_l2_to_mgcv={rel_to_mgcv:.4} (context only)",
+        gam_truth_rmse / mgcv_truth_rmse.max(1e-12)
     );
 
-    // Both engines REML-fit the identical fs penalty, so the per-group fitted
-    // curves must nearly coincide. rel_l2 < 0.05 is the principled bound from the
-    // spec: it is far tighter than any basis/parameterization quirk could excuse
-    // (curves span ~[-1.8, 2.0]) yet leaves margin for REML λ-selection differing
-    // in the last few significant digits.
+    // PRIMARY CLAIM: gam recovers the noiseless generating function. Averaging
+    // ~100 observations per group beats down σ; recovering the mean to half the
+    // per-observation noise is the correct-smoother bar (a fit that merely
+    // interpolated the noise would sit near σ, and an oversmoothed/flat fit would
+    // miss the sinusoid by ~AMP/√2 ≫ σ).
     assert!(
-        rel < 0.05,
-        "factor-smooth fitted curves diverge from mgcv: rel_l2={rel:.4}"
+        gam_truth_rmse <= 0.5 * SIGMA,
+        "factor-smooth fit fails to recover the truth: rmse={gam_truth_rmse:.4} > {:.4}",
+        0.5 * SIGMA
     );
-    // Shape correlation across the whole lattice: the fs penalty's defining
-    // property is one COMMON shape per group, so the concatenated curves must be
-    // essentially collinear with mgcv's.
+
+    // STRUCTURE GUARD: every per-group fit must be genuinely wiggly — at least
+    // half the true sinusoid's std (AMP/√2). Rejects a degenerate flat/collapsed
+    // solution that could otherwise sneak under an RMSE bar via low variance.
+    let min_required_std = 0.5 * AMP / std::f64::consts::SQRT_2;
     assert!(
-        corr > 0.95,
-        "factor-smooth curve shapes uncorrelated with mgcv: pearson={corr:.5}"
+        min_group_std >= min_required_std,
+        "a factor-smooth group fit collapsed (too flat): min_group_std={min_group_std:.4} < {min_required_std:.4}"
     );
-    // Total smooth complexity (shared EDF across the fs block) is basis- and
-    // null-space-convention sensitive (gam's B-spline marginal vs mgcv's default
-    // tp marginal), so we assert same-ballpark complexity rather than equality:
-    // within 30% relative, which still rejects a wrong penalty structure that
-    // would mis-count degrees of freedom by 2x or collapse to a single curve.
+
+    // MATCH-OR-BEAT BASELINE: gam's truth-recovery accuracy must be no worse than
+    // mgcv's by more than 10%. mgcv is the mature fs reference; scored on the same
+    // ground truth, gam must be at least as accurate (within margin) — NOT merely
+    // "close to mgcv's output".
     assert!(
-        edf_rel < 0.30,
-        "factor-smooth EDF disagrees with mgcv: gam={gam_edf:.3} mgcv={mgcv_edf:.3} (rel={edf_rel:.3})"
+        gam_truth_rmse <= mgcv_truth_rmse * 1.10,
+        "gam less accurate than mgcv at recovering truth: gam_rmse={gam_truth_rmse:.4} > 1.10*mgcv_rmse={:.4}",
+        mgcv_truth_rmse * 1.10
     );
 }

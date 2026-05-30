@@ -1,33 +1,33 @@
-//! End-to-end quality: gam's sum-to-zero factor smooth `s(group, x, bs="sz")`
-//! must match mgcv — the mature, standard GAM implementation — both in the
-//! identifiability constraint it enforces and in the function it fits.
+//! End-to-end quality: gam's sum-to-zero factor smooth `s(group, x, bs="sz")`.
 //!
-//! mgcv's `bs="sz"` basis builds a factor-by-smooth interaction subject to a
-//! sum-to-zero constraint *across the factor levels*: at every covariate value
-//! the per-level smooth deviations sum to zero, so the levels describe
-//! departures from a common (intercept-absorbed) mean curve and the model is
-//! identifiable. gam routes the same formula to its `FactorSumToZero` basis,
-//! which estimates L-1 deviation blocks and sets the last level to the negative
-//! sum of the others — algebraically the identical constraint.
+//! OBJECTIVE METRIC ASSERTED: this test generates data from a KNOWN truth —
+//! per-group curves f_g(x) = sin(2*pi*x) * z_g with the amplitudes z_g centered
+//! so sum_g z_g = 0 (hence sum_g f_g(x) = 0 pointwise) — and asserts that gam
+//! RECOVERS that truth and ENFORCES the defining structural constraint:
 //!
-//! This test fits the SAME synthetic data (6 groups, per-group amplitude
-//! z_g centered so the truth itself sums to zero pointwise) with both engines
-//! under REML and asserts:
-//!   1. CONSTRAINT: the across-group sum of the fitted per-level smooth
-//!      deviations is ~0 at every x (the defining property of `sz`), measured
-//!      after removing the shared intercept; and
-//!   2. AGREEMENT: gam's fitted values at the training points track mgcv's
-//!      `fitted()` in relative L2; and
-//!   3. COMPLEXITY: gam's total effective degrees of freedom agree with mgcv's
-//!      in ballpark (EDF is convention-sensitive, so a relative tolerance).
+//!   1. TRUTH RECOVERY (primary, category 1): the RMSE of gam's estimated
+//!      per-group deviation curves against the true f_g(x), evaluated at every
+//!      training row, is no larger than the observation noise sigma. Because the
+//!      truth is mean-zero (no intercept), gam's deviation = fitted - intercept
+//!      is compared directly to f_g(x_i). A smoother that recovered noise rather
+//!      than the signal would blow past this bar.
+//!   2. MATCH-OR-BEAT ACCURACY (category 1 addendum): mgcv — the mature, standard
+//!      GAM implementation — is fit on the IDENTICAL data and its own per-row
+//!      smooth-term estimate is scored against the SAME truth. gam's truth-
+//!      recovery RMSE must be no worse than mgcv's by more than 10%. mgcv is a
+//!      BASELINE TO MATCH-OR-BEAT on accuracy, not an output to reproduce.
+//!   3. STRUCTURE / CONSTRAINT (category 4): the across-group sum of gam's fitted
+//!      per-level smooth deviations is ~0 at every x — the defining identifiability
+//!      property of the `sz` basis — measured after removing the shared intercept.
 //!
-//! Both engines REML-fit the same penalized objective, so close agreement is
-//! the correct expectation and a genuine divergence is a real bug.
+//! The primary claim is that gam recovers the generating function; matching mgcv
+//! is only a secondary accuracy guardrail. We still compute and print gam-vs-mgcv
+//! relative L2 for context, but it is NOT a pass/fail criterion.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, run_r};
+use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -66,6 +66,7 @@ fn gam_factor_smooth_sz_matches_mgcv() {
     let mut group_str: Vec<String> = Vec::with_capacity(n); // "g0".."g5" for gam categorical
     let mut x: Vec<f64> = Vec::with_capacity(n);
     let mut y: Vec<f64> = Vec::with_capacity(n);
+    let mut truth: Vec<f64> = Vec::with_capacity(n); // f_g(x_i), the mean-zero signal
     // Row order encounters group 0 first, then 1, ... so gam's level codes
     // (assigned in encounter order) coincide with mgcv's numeric labels 0..5.
     for g in 0..N_GROUPS {
@@ -77,8 +78,11 @@ fn gam_factor_smooth_sz_matches_mgcv() {
             group_str.push(format!("g{g}"));
             x.push(xi);
             y.push(yi);
+            truth.push(fi);
         }
     }
+    // Observation noise standard deviation that generated y from the truth.
+    const NOISE_SD: f64 = 0.2;
     let signal_sd = {
         let m = y.iter().sum::<f64>() / n as f64;
         (y.iter().map(|v| (v - m) * (v - m)).sum::<f64>() / (n as f64 - 1.0)).sqrt()
@@ -167,7 +171,10 @@ fn gam_factor_smooth_sz_matches_mgcv() {
         df$gf <- factor(df$g)
         m <- gam(y ~ s(gf, x, bs = "sz"), data = df, method = "REML")
         emit("fitted", as.numeric(fitted(m)))
-        emit("edf", sum(m$edf))
+        # Per-row smooth-term estimate (intercept excluded): mgcv's estimate of
+        # the mean-zero per-group deviation, directly comparable to the truth.
+        tt_train <- predict(m, type = "terms")
+        emit("term", as.numeric(rowSums(as.matrix(tt_train))))
         # Constraint on a shared x-grid: sum the per-level smooth deviations
         # across groups at each grid point; sz forces this to ~0.
         levs <- levels(df$gf)
@@ -183,56 +190,61 @@ fn gam_factor_smooth_sz_matches_mgcv() {
         "#,
     );
     let mgcv_fitted = r.vector("fitted");
+    let mgcv_term = r.vector("term");
     let mgcv_constraint_max = r.scalar("constraint_max");
-    let mgcv_edf = r.scalar("edf");
     assert_eq!(mgcv_fitted.len(), n, "mgcv fitted length mismatch");
+    assert_eq!(mgcv_term.len(), n, "mgcv term length mismatch");
 
+    // ---- truth-recovery RMSE (the objective metric) ------------------------
+    // gam's estimate of the mean-zero per-group deviation at each training row
+    // is fitted - intercept; compare directly to the generating signal f_g(x_i).
+    let gam_term: Vec<f64> = gam_fitted.iter().map(|v| v - intercept).collect();
+    let gam_rmse = rmse(&gam_term, &truth);
+    // mgcv's intercept-excluded smooth term scored against the SAME truth.
+    let mgcv_rmse = rmse(mgcv_term, &truth);
+
+    // Context only (NOT a pass/fail criterion): how closely the two engines'
+    // fitted values track each other.
     let rel = relative_l2(&gam_fitted, mgcv_fitted);
-    let edf_rel = (gam_edf - mgcv_edf).abs() / mgcv_edf.abs().max(1.0);
 
     eprintln!(
-        "sz factor smooth: n={n} groups={N_GROUPS} signal_sd={signal_sd:.4} \
+        "sz factor smooth: n={n} groups={N_GROUPS} signal_sd={signal_sd:.4} noise_sd={NOISE_SD:.4} \
+         gam_rmse_vs_truth={gam_rmse:.5} mgcv_rmse_vs_truth={mgcv_rmse:.5} \
          gam_constraint_max={constraint_max:.5} gam_constraint_rms={constraint_rms:.5} \
-         mgcv_constraint_max={mgcv_constraint_max:.5} rel_l2={rel:.4} \
-         gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3}"
+         mgcv_constraint_max={mgcv_constraint_max:.5} rel_l2={rel:.4} gam_edf={gam_edf:.3}"
     );
 
-    // (1) CONSTRAINT. The sz basis is *defined* by sum_g deviation_g(x) = 0; gam
-    // builds the last level as the exact negative sum of the rest, so the
-    // residual is pure floating-point / design-rebuild noise. A bound of
-    // 0.01 * signal_sd is far above round-off yet small enough that a basis that
-    // failed to enforce the constraint (deviations the size of the signal) would
-    // trip it immediately. mgcv must satisfy the same property.
+    // (1) TRUTH RECOVERY (PRIMARY). gam must recover the generating per-group
+    // curves to within the observation noise: the row-wise RMSE of the estimated
+    // deviation against the true f_g(x) is no larger than the noise sd that
+    // corrupted y. A smoother that fit the noise instead of the signal — or that
+    // failed to separate the per-group amplitudes — would exceed this bar.
+    assert!(
+        gam_rmse <= NOISE_SD,
+        "gam sz does not recover the truth: rmse_vs_truth={gam_rmse:.5} > noise_sd={NOISE_SD:.4}"
+    );
+
+    // (2) MATCH-OR-BEAT mgcv ON ACCURACY. gam's truth-recovery error must be no
+    // worse than the mature reference's by more than 10%. mgcv is a baseline to
+    // match-or-beat on accuracy, not an output to reproduce.
+    assert!(
+        gam_rmse <= mgcv_rmse * 1.10,
+        "gam sz less accurate than mgcv on truth recovery: gam_rmse={gam_rmse:.5} \
+         > 1.10 * mgcv_rmse={:.5}",
+        mgcv_rmse * 1.10
+    );
+
+    // (3) STRUCTURE / CONSTRAINT. The sz basis is *defined* by
+    // sum_g deviation_g(x) = 0; gam builds the last level as the exact negative
+    // sum of the rest, so the residual is pure floating-point / design-rebuild
+    // noise. A bound of 0.01 * signal_sd is far above round-off yet small enough
+    // that a basis that failed to enforce the constraint (deviations the size of
+    // the signal) would trip it immediately. This is an objective property of
+    // gam's own fit, asserted directly.
     let constraint_bound = 0.01 * signal_sd;
     assert!(
         constraint_max < constraint_bound,
         "gam sz violates sum-to-zero across groups: max|sum_g dev|={constraint_max:.5} \
          >= {constraint_bound:.5} (=0.01*signal_sd)"
-    );
-    assert!(
-        mgcv_constraint_max < constraint_bound,
-        "mgcv sz violates sum-to-zero across groups: max={mgcv_constraint_max:.5}"
-    );
-
-    // (2) AGREEMENT. Both engines REML-fit the identical data under the same
-    // sz penalized objective, so their fitted values must essentially coincide.
-    // 0.04 relative L2 is tight enough to catch a real divergence in the
-    // factor-smooth fit while leaving margin for basis/null-space convention
-    // differences between the two thin-plate-style smoothers.
-    assert!(
-        rel < 0.04,
-        "gam sz fit diverges from mgcv: rel_l2={rel:.4} (bound 0.04)"
-    );
-
-    // (3) COMPLEXITY. Total effective degrees of freedom must agree in
-    // ballpark. EDF is basis/null-space-convention sensitive (gam's default
-    // inner basis vs mgcv's k=10 thin-plate per level), so we assert a 30%
-    // relative tolerance — tight enough to catch a smoother that wildly
-    // over/under-fits the per-level deviations, loose enough to absorb the
-    // legitimate convention difference between the two thin-plate smoothers.
-    assert!(
-        edf_rel < 0.30,
-        "sz effective degrees of freedom disagree: gam={gam_edf:.3} mgcv={mgcv_edf:.3} \
-         (rel={edf_rel:.3}, bound 0.30)"
     );
 }

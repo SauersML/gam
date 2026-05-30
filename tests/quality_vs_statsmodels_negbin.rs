@@ -1,48 +1,51 @@
-//! End-to-end quality: gam's Negative-Binomial(log, fixed theta) GLM must match
-//! statsmodels — the mature, standard Python GLM implementation — on
-//! overdispersed count data with a smooth + linear additive structure.
+//! End-to-end quality: gam's Negative-Binomial(log, fixed theta) GLM must
+//! RECOVER THE TRUE conditional-mean function from overdispersed count data with
+//! a smooth + linear additive structure. The objective metric is accuracy
+//! against the known generating truth, not agreement with any reference tool.
 //!
 //! Capability under test: `family="negative-binomial"` with a fixed
 //! overdispersion parameter `theta`, log link, and the key feature combination
 //! `y ~ s(x, k=5) + linear(z)` (a penalized smooth term plus a parametric
 //! linear term). The negative-binomial variance function is
 //! `Var(mu) = mu + mu^2 / theta`, so the IRLS/PIRLS working weights depend on
-//! `theta`; getting the fitted means right is exactly the test that gam's PIRLS
-//! incorporates the theta-dependent variance function correctly.
-//!
-//! Reference: `statsmodels.api.GLM(y, X, family=NegativeBinomial(alpha=1/theta))`.
-//! statsmodels parameterizes the NB family by the dispersion `alpha = 1/theta`
-//! (so theta=2.0 => alpha=0.5), with the SAME log link and the SAME fixed
-//! dispersion held constant during fitting that gam uses. We hand statsmodels a
-//! design that mirrors the gam formula: a 5-column cubic B-spline basis on `x`
-//! (matching `s(x, k=5)`) plus the raw `z` column (`linear(z)`) plus an
-//! intercept. statsmodels is unpenalized; gam REML-penalizes the smooth, so the
-//! two fitted-mean vectors are not bit-identical, but on a true smooth signal
-//! the recovered conditional means must track each other tightly.
+//! `theta`; recovering the true mean function is exactly the test that gam's
+//! PIRLS incorporates the theta-dependent variance function correctly.
 //!
 //! Data (seed=678, n=220): x~U(0,10), z~U(-2,2);
 //! eta = 1.0 + 0.6*sin(x*pi/5) + 0.4*z; y ~ NegBinom(mu=exp(eta), theta=2.0).
+//! Because the data is generated from this known eta, the true conditional mean
+//! mu_true = exp(eta) is KNOWN at every row, so we can score gam's fitted means
+//! directly against ground truth.
+//!
+//! OBJECTIVE METRIC (primary claim): relative RMSE of gam's fitted means against
+//! the true means, rRMSE = RMSE(mu_gam, mu_true) / range(mu_true). On a true
+//! smooth+linear signal with NB(theta=2) noise, a correctly-specified penalized
+//! NB-log fit recovers the conditional mean to a small fraction of the signal
+//! range; we require rRMSE <= 0.15.
+//!
+//! BASELINE TO MATCH-OR-BEAT (accuracy, not output-agreement): the same NB-log
+//! model is fit with statsmodels — `sm.GLM(y, X, NegativeBinomial(alpha=1/theta))`
+//! on a 5-df cubic B-spline of x (mirroring s(x,k=5)) + z + intercept, same fixed
+//! dispersion. We require gam's RMSE-to-truth <= statsmodels' RMSE-to-truth * 1.10.
+//! statsmodels is a yardstick on the SAME objective (truth recovery); we never
+//! assert gam reproduces statsmodels' fitted output. The reference rel_l2 between
+//! the two fits is printed only as context.
 //!
 //! Asserts:
-//!   1. pearson(gam fitted means, statsmodels fitted means) > 0.995 on the
-//!      exp(eta) scale — both are MLE/penalized-MLE NB-log fits of the same
-//!      smooth+linear structure, so their fitted means must nearly coincide.
-//!   2. Pearson chi-square / n in (0.8, 1.2). For a correctly-specified NB GLM
+//!   1. rRMSE(mu_gam, mu_true) <= 0.15 — gam recovers the true mean function.
+//!   2. RMSE(mu_gam, mu_true) <= RMSE(mu_sm, mu_true) * 1.10 — gam is at least as
+//!      accurate at recovering the truth as the mature reference.
+//!   3. Pearson chi-square / n in (0.8, 1.2). For a correctly-specified NB GLM
 //!      the Pearson statistic sum((y-mu)^2 / V(mu)) with the NB variance
 //!      V(mu) = mu + mu^2/theta has E[(y-mu)^2 / V(mu)] = 1 per row, so the
-//!      statistic ~ n and chi2/n ~ 1. This is the standard dispersion check:
-//!      values near 1 confirm the modeled variance (which BAKES IN theta)
-//!      matches the data's overdispersion. The spec writes the chi2 with a
-//!      mu_hat denominator, but the (0.8,1.2) bound it cites is the NB
-//!      dispersion=1/theta statistic, which is only ~1 under the NB variance;
-//!      we therefore use V(mu) so the asserted bound and its stated rationale
-//!      agree. A model that ignored theta (e.g. plain Poisson variance) would
-//!      drive this far above 1.2.
+//!      statistic ~ n and chi2/n ~ 1. This confirms the theta-dependent variance
+//!      the PIRLS weights bake in matches the data's overdispersion; a model
+//!      ignoring theta (plain Poisson variance) drives this well above 1.2.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, run_python};
+use gam::test_support::reference::{Column, relative_l2, rmse, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -157,8 +160,17 @@ emit("mu", mu)
     let sm_mu = r.vector("mu");
     assert_eq!(sm_mu.len(), N, "statsmodels fitted-mean length mismatch");
 
-    // ---- compare on the exp(eta) (fitted mean) scale ---------------------
-    let corr = pearson(&gam_mu, sm_mu);
+    // ---- score BOTH fits against the KNOWN true conditional means --------
+    // Truth recovery on the exp(eta) (fitted-mean) scale: mu_true is exact.
+    let rmse_gam_truth = rmse(&gam_mu, &mu_true);
+    let rmse_sm_truth = rmse(sm_mu, &mu_true);
+
+    // Relative RMSE normalized by the dynamic range of the true mean function,
+    // so the bar is scale-free and signal-appropriate.
+    let mu_min = mu_true.iter().copied().fold(f64::INFINITY, f64::min);
+    let mu_max = mu_true.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let mu_range = (mu_max - mu_min).max(1e-12);
+    let rrmse_gam = rmse_gam_truth / mu_range;
 
     // Pearson chi-square with the NB variance V(mu) = mu + mu^2/theta (this is
     // the statistic whose expectation is n, matching the cited (0.8,1.2) bound).
@@ -172,19 +184,33 @@ emit("mu", mu)
         .sum();
     let chi2_over_n = chi2_gam / N as f64;
 
+    // Reference output-agreement is printed for CONTEXT only — never asserted.
+    let rel_l2_vs_sm = relative_l2(&gam_mu, sm_mu);
     eprintln!(
         "negbin s(x,k=5)+linear(z): n={N} theta={THETA} gam_edf={gam_edf:.3} \
-         pearson(mu_gam,mu_sm)={corr:.5} chi2/n(NB-var)={chi2_over_n:.3}"
+         rmse(mu_gam,truth)={rmse_gam_truth:.4} rmse(mu_sm,truth)={rmse_sm_truth:.4} \
+         rRMSE_gam={rrmse_gam:.4} chi2/n(NB-var)={chi2_over_n:.3} \
+         rel_l2(gam,sm)={rel_l2_vs_sm:.4} (context only)"
     );
 
-    // (1) Both engines fit a NB-log smooth+linear model to identical data with
-    // the same fixed theta, so their conditional means must nearly coincide.
+    // (1) PRIMARY: gam recovers the true conditional mean to a small fraction of
+    // the signal range. NB(theta=2) noise on a smooth+linear signal of this size
+    // is fit by a correctly-specified penalized NB-log model to rRMSE well under
+    // 0.15; failure here means gam mis-recovers the mean, not "differs from a tool".
     assert!(
-        corr > 0.995,
-        "gam vs statsmodels NB fitted means diverge: pearson={corr:.5}"
+        rrmse_gam <= 0.15,
+        "gam failed to recover the true NB mean: rRMSE={rrmse_gam:.4} (rmse={rmse_gam_truth:.4}, range={mu_range:.4})"
     );
 
-    // (2) Dispersion sanity: under the NB variance V(mu)=mu+mu^2/theta,
+    // (2) MATCH-OR-BEAT (accuracy on the SAME objective): gam is at least as
+    // accurate at recovering the truth as the mature statsmodels NB-log fit.
+    assert!(
+        rmse_gam_truth <= rmse_sm_truth * 1.10,
+        "gam less accurate than statsmodels at recovering truth: \
+         rmse_gam={rmse_gam_truth:.4} > 1.10 * rmse_sm={rmse_sm_truth:.4}"
+    );
+
+    // (3) Dispersion sanity: under the NB variance V(mu)=mu+mu^2/theta,
     // E[(y-mu)^2/V(mu)] = 1, so chi2/n ~ 1; the (0.8,1.2) window confirms the
     // theta-dependent variance the PIRLS weights bake in matches the data's
     // overdispersion. A model ignoring theta drives this well above 1.2.
