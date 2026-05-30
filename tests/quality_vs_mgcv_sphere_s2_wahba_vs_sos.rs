@@ -28,7 +28,7 @@
 //! controlled SNR. The identical (lat, lon, y) triples are handed to both engines.
 
 use gam::matrix::LinearOperator;
-use gam::smooth::build_term_collection_design;
+use gam::smooth::{build_term_collection_design, freeze_term_collection_from_design};
 use gam::test_support::reference::{Column, pearson, relative_l2, run_r};
 use gam::{
     FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema,
@@ -188,15 +188,26 @@ fn gam_sphere_matches_mgcv_sos_on_geographic_surface() {
     }
     let ng = grid_lat.len();
 
-    // gam fitted surface at the grid: rebuild the frozen design at grid points
+    // gam fitted surface at the grid: rebuild the FROZEN design at grid points
     // (identity link => design·beta = fitted mean).
+    //
+    // CRITICAL: the sphere basis places its kernel centers from the *fit* data
+    // (data-dependent CenterStrategy). `fit.resolvedspec` is only the resolved
+    // (planned) spec; rebuilding a design straight from it on the grid would
+    // re-plan the sphere centers at the grid points, yielding a basis that the
+    // fitted `beta` was never estimated against — `design·beta` would be
+    // meaningless. We must first freeze the spec against the fit-time design
+    // (pinning centers to UserProvided), then evaluate that frozen basis at the
+    // grid. This is exactly what gam's own predict path does in main.rs.
+    let frozenspec = freeze_term_collection_from_design(&fit.resolvedspec, &fit.design)
+        .expect("freeze sphere term collection against fit-time design");
     let mut grid = Array2::<f64>::zeros((ng, ds.headers.len()));
     for k in 0..ng {
         grid[[k, lat_idx]] = grid_lat[k];
         grid[[k, lon_idx]] = grid_lon[k];
     }
-    let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
-        .expect("rebuild sphere design at grid points");
+    let design = build_term_collection_design(grid.view(), &frozenspec)
+        .expect("rebuild frozen sphere design at grid points");
     let gam_surface: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
     std::fs::remove_dir_all(&dir).ok();
 
