@@ -199,11 +199,17 @@ fn gam_tensor_product_matches_inla_spde_on_hgdp_pc1() {
         spde <- inla.spde2.matern(mesh = mesh, alpha = 2)
         s.index <- inla.spde.make.index(name = "spatial", n.spde = spde$n.spde)
         A <- inla.spde.make.A(mesh = mesh, loc = loc)
+        # Two effect blocks paired one-to-one with the A list: the spatial SPDE
+        # index is projected through the sparse mesh matrix A, while the
+        # intercept is a per-observation fixed effect projected through the
+        # identity (A = 1). Pairing the A=1 block with a populated effect list
+        # (a length-n intercept column) is the canonical, well-formed stack;
+        # an empty second effect list would be a malformed stack.
         stk <- inla.stack(
           data    = list(y = df$pc1),
           A       = list(A, 1),
-          effects = list(c(s.index, list(Intercept = 1)),
-                         list()),
+          effects = list(spatial   = s.index,
+                         data.frame(Intercept = rep(1, n))),
           tag     = "est")
         form <- y ~ -1 + Intercept + f(spatial, model = spde)
         m <- inla(form,
