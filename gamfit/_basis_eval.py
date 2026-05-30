@@ -163,13 +163,23 @@ def _DuchonRustFn_apply(
 ) -> Any:
     """Autograd boundary for Duchon.
 
-    Forward calls the Rust ``duchon_basis`` PyFFI. Backward composes the
-    Rust radial first derivative ``φ'(r)`` with the closed-form axis
-    ratio ``(t − c)/r`` to produce the per-row jet ``(B, K, d)``. The
-    jet is itself routed through :func:`_RadialJetFn_apply` so that
-    ``torch.autograd.grad`` of the jacobian — i.e. the input-location
-    Hessian — is well-defined: that Function's own backward uses the
-    Rust ``φ''(r)`` to assemble the analytic Hessian.
+    The Rust Duchon *forward* design is **not** the raw centerwise radial
+    kernel ``K(x, C)``; it is the built design
+
+    ``X(x) = [ α · K(x, C) · Z ,  P(x) ]``,
+
+    where ``Z = null(P(C)ᵀ)`` is the polynomial-constraint null space,
+    ``P(x)`` the appended monomial nullspace columns, and ``α`` the kernel
+    amplification factor. Backward must therefore differentiate **that**
+    matrix, column-for-column — not ``K(x, C)``.
+
+    Both the forward design and its analytic input-location first/second
+    jets come from a single Rust call, :func:`duchon_basis_with_jets`, which
+    resolves the spec (nullspace order, power, length-scale, periodic chord
+    embedding, amplification) identically to the ``duchon_basis`` forward.
+    The first jet is routed through a nested :class:`torch.autograd.Function`
+    so that ``torch.autograd.grad`` of the Jacobian — i.e. the input-location
+    Hessian — is well-defined via the Rust second jet.
     """
     torch = _torch()
     from . import _api
@@ -197,21 +207,50 @@ def _DuchonRustFn_apply(
             ctrs_np = ctrs_np.reshape(-1, 1)
         return ctrs_np
 
-    def _radial_first(pts_np: Any, ctrs_np: Any) -> Any:
+    def _design_jets(pts_np: Any) -> tuple[Any, Any, Any]:
+        """Forward design, first jet ``(B, M, d)``, second jet ``(B, M, d, d)``.
+
+        Single Rust call so all three are built from the *same* resolved
+        spec — the jets are the exact derivatives of the returned design.
+        """
         import numpy as np
 
-        out = _api.rust_module().duchon_input_location_first_derivative(
-            pts_np, ctrs_np, length_scale, int(m),
+        ctrs_np = _resolve_centers_np(pts_np)
+        phi_np, jet_np, hess_np = _api.rust_module().duchon_basis_with_jets(
+            pts_np, ctrs_np, **kwargs
         )
-        return np.asarray(out, dtype=float)
-
-    def _radial_second(pts_np: Any, ctrs_np: Any) -> Any:
-        import numpy as np
-
-        out = _api.rust_module().duchon_input_location_second_derivative(
-            pts_np, ctrs_np, length_scale, int(m),
+        return (
+            np.asarray(phi_np, dtype=float),
+            np.asarray(jet_np, dtype=float),
+            np.asarray(hess_np, dtype=float),
         )
-        return np.asarray(out, dtype=float)
+
+    class _JetFn(torch.autograd.Function):
+        """Input-location first jet ``∂X/∂x`` of the built Duchon design.
+
+        Forward returns ``(B, M, d)``. Backward contracts the upstream
+        cotangent with the Rust second jet (Hessian) ``∂²X/∂x∂xᵀ`` so the
+        descriptor's ``hessian`` (autograd of ``jacobian``) is exact.
+        """
+
+        @staticmethod
+        def forward(ctx: Any, pts: Any) -> Any:
+            pts_np = pts.detach().cpu().to(dtype=torch.float64).numpy()
+            _phi, jet_np, _hess = _design_jets(pts_np)
+            ctx.save_for_backward(pts)
+            return torch.as_tensor(jet_np, dtype=pts.dtype, device=pts.device)
+
+        @staticmethod
+        def backward(ctx: Any, *grads: Any) -> Any:
+            (grad_jet,) = grads  # (B, M, d)
+            (pts,) = ctx.saved_tensors
+            pts_np = pts.detach().cpu().to(dtype=torch.float64).numpy()
+            _phi, _jet, hess_np = _design_jets(pts_np)
+            hess = torch.as_tensor(hess_np, dtype=pts.dtype, device=pts.device)
+            grad_pts = torch.einsum(
+                "bmj,bmij->bi", grad_jet.to(dtype=hess.dtype), hess
+            )
+            return grad_pts
 
     class _Fn(torch.autograd.Function):
         @staticmethod
@@ -226,10 +265,8 @@ def _DuchonRustFn_apply(
         def backward(ctx: Any, *grads: Any) -> Any:
             (g,) = grads
             (pts,) = ctx.saved_tensors
-            jet = _RadialJetFn_apply(
-                pts, _resolve_centers_np, _radial_first, _radial_second
-            )  # (B, K, d), autograd-tracked through pts
-            grad_pts = torch.einsum("bk,bkj->bj", g.to(dtype=jet.dtype), jet)
+            jet = _JetFn.apply(pts)  # (B, M, d), autograd-tracked through pts
+            grad_pts = torch.einsum("bm,bmj->bj", g.to(dtype=jet.dtype), jet)
             return grad_pts
 
     return _Fn.apply(points)

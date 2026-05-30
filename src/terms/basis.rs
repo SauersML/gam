@@ -21520,6 +21520,391 @@ pub fn duchon_sae_atom_second_jet(
     Ok(out)
 }
 
+/// Forward design, input-location first jet, and input-location second jet
+/// (Hessian) of the **general** Duchon basis — the same matrix
+/// [`build_duchon_basis`] / [`build_duchon_basis_mixed_periodicity_auto`]
+/// produce for the resolved spec, differentiated **exactly**.
+///
+/// This is the analytic-derivative companion to the basis-only Python FFI
+/// `duchon_basis`. The forward Duchon design is **not** the raw centerwise
+/// radial kernel `K(x, C)`; it is
+///
+/// ```text
+/// X(x) = [ α · K(x, C) · Z ,  P(x) ],
+/// ```
+///
+/// where `Z = null(P(C)ᵀ)` is the polynomial-constraint null space, `P(x)`
+/// is the monomial nullspace block, and `α` is the kernel amplification the
+/// design path applies. The jets returned here are the exact `x`-derivatives
+/// of that built matrix, column-for-column:
+///
+/// ```text
+/// J(x)   = [ α · ∂ₓK(x,C) · Z ,  ∂ₓP(x) ],
+/// H(x)   = [ α · ∂²ₓK(x,C) · Z , ∂²ₓP(x) ].
+/// ```
+///
+/// Both the non-periodic radial path (pure polyharmonic and hybrid Matérn
+/// length-scale, `s_order = power`) and the mixed-periodicity chord-embedding
+/// path are handled, matching whichever forward builder the spec selects.
+///
+/// `t` is `(n_rows, dim)`, `centers` is `(n_centers, dim)`. The returned
+/// triple is `(Φ, J, H)` with `Φ` shape `(n_rows, n_kernel + n_poly)`,
+/// `J` shape `(n_rows, n_kernel + n_poly, dim)`, `H` shape
+/// `(n_rows, n_kernel + n_poly, dim, dim)`.
+pub fn build_duchon_basis_design_and_jets(
+    t: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    length_scale: Option<f64>,
+    power: f64,
+    nullspace_order: DuchonNullspaceOrder,
+    periodic_per_axis: &[bool],
+    periods: &[f64],
+) -> Result<(Array2<f64>, Array3<f64>, Array4<f64>), BasisError> {
+    let dim = centers.ncols();
+    if dim == 0 {
+        crate::bail_invalid_basis!(
+            "build_duchon_basis_design_and_jets: centers must have at least one column"
+        );
+    }
+    if t.ncols() != dim {
+        crate::bail_dim_basis!(
+            "build_duchon_basis_design_and_jets: t has {} cols but centers have {dim}",
+            t.ncols()
+        );
+    }
+    if periodic_per_axis.len() != dim {
+        crate::bail_invalid_basis!(
+            "build_duchon_basis_design_and_jets: periodic_per_axis must have length {dim}, got {}",
+            periodic_per_axis.len()
+        );
+    }
+    if periods.len() != dim {
+        crate::bail_invalid_basis!(
+            "build_duchon_basis_design_and_jets: periods must have length {dim}, got {}",
+            periods.len()
+        );
+    }
+    let any_periodic = periodic_per_axis.iter().any(|&p| p);
+
+    let n_rows = t.nrows();
+    let n_centers = centers.nrows();
+
+    // ----------------------------------------------------------------- spec
+    // The mixed-periodicity forward forces the constraint nullspace to
+    // {constants} (the only polynomial periodic on every periodic axis),
+    // gates the spectrum to the pure polyharmonic case (length_scale = None,
+    // power = 0), and applies NO kernel amplification. The non-periodic
+    // forward keeps the (auto-degraded) requested nullspace, the hybrid
+    // length-scale / power, and the amplification α. Mirror both exactly.
+    if any_periodic {
+        if length_scale.is_some() {
+            crate::bail_invalid_basis!(
+                "mixed-periodicity Duchon basis currently only supports the pure polyharmonic spectrum (length_scale=None)"
+            );
+        }
+        if power != 0.0 {
+            crate::bail_invalid_basis!(
+                "mixed-periodicity Duchon basis currently requires power = 0 (pure polyharmonic); got power={power}"
+            );
+        }
+        for (j, (&per, &period)) in periodic_per_axis.iter().zip(periods.iter()).enumerate() {
+            if per && !(period.is_finite() && period > 0.0) {
+                crate::bail_invalid_basis!(
+                    "axis {j} is periodic but period={period} is not finite & positive"
+                );
+            }
+        }
+    }
+
+    let effective_order = duchon_effective_nullspace_order(centers, nullspace_order);
+    let kernel_nullspace_order = if any_periodic {
+        DuchonNullspaceOrder::Zero
+    } else {
+        effective_order
+    };
+    let p_order = duchon_p_from_nullspace_order(kernel_nullspace_order);
+    // For the periodic chord path the kernel smoothness order tracks the
+    // user's requested m (carried in `nullspace_order`, not the forced-to-
+    // constant kernel-nullspace order), matching the mixed-periodicity forward.
+    let kernel_m = if any_periodic {
+        duchon_p_from_nullspace_order(nullspace_order)
+    } else {
+        p_order
+    };
+    let s_order_int = duchon_power_to_usize(power);
+    let s_order_f = power;
+
+    // Polynomial-constraint null space `Z` (same construction as every design
+    // path: null of the polynomial side-condition block at the centers).
+    let poly_block_centers = polynomial_block_from_order(centers, kernel_nullspace_order);
+    let z = kernel_constraint_nullspace_from_matrix(poly_block_centers.view())?;
+    let n_kernel = z.ncols();
+
+    // Hybrid partial-fraction coefficients (None ⇒ pure polyharmonic).
+    let coeffs = length_scale
+        .map(|ls| duchon_partial_fraction_coeffs(p_order, s_order_int, 1.0 / ls.max(1e-300)));
+    let pure_poly_coeff = if length_scale.is_none() {
+        Some(PolyharmonicBlockCoeff::new(
+            pure_duchon_block_order(kernel_m, s_order_f),
+            dim,
+        ))
+    } else {
+        None
+    };
+
+    // Kernel amplification α — identical to the value the design path applies.
+    // The mixed-periodicity forward applies no amplification (α = 1).
+    let kernel_amp = if any_periodic {
+        1.0
+    } else {
+        duchon_kernel_amplification(
+            centers,
+            length_scale,
+            p_order,
+            s_order_int,
+            dim,
+            None,
+            coeffs.as_ref(),
+            pure_poly_coeff.as_ref(),
+        )
+    };
+
+    // --------------------------------------------------- radial value block
+    // Per (row, center) metric distance `r` plus the scalar radial value
+    // φ(r), first derivative φ'(r), and second derivative φ''(r) of the SAME
+    // kernel the forward design evaluates. `metric_axis[(n,k,a)]` is the
+    // per-axis chord-embedding partial dδ_a/dx_a and `metric_axis2` its second
+    // derivative (zero on linear / non-periodic axes); the displacement
+    // `delta_a = δ_a(x_a − c_a)` is the chord (or plain difference) used to
+    // contract the radial scalars into the input-location jet.
+    let mut radial_value = Array2::<f64>::zeros((n_rows, n_centers));
+    let mut radial_first = Array2::<f64>::zeros((n_rows, n_centers));
+    let mut radial_second = Array2::<f64>::zeros((n_rows, n_centers));
+    // delta[(n,k,a)] = embedded displacement along axis a (chord or plain).
+    let mut delta = Array3::<f64>::zeros((n_rows, n_centers, dim));
+    // d1[(n,k,a)] = ∂δ_a/∂x_a, d2 = ∂²δ_a/∂x_a²  (chord-embedding metric jets).
+    let mut metric_d1 = Array3::<f64>::zeros((n_rows, n_centers, dim));
+    let mut metric_d2 = Array3::<f64>::zeros((n_rows, n_centers, dim));
+
+    // Pure-polyharmonic radial scalars φ',φ'' come from the FD-verified
+    // `duchon_radial_*_derivative_nd` (which use the same `duchon_radial_jets`
+    // machinery the hybrid path uses); the forward value uses `ppc.eval`
+    // verbatim. Hybrid scalars come straight from `duchon_radial_jets` so φ, φ',
+    // φ'' are mutually consistent at the resolved `s_order`.
+    let effective_length_scale_hint = length_scale.unwrap_or_else(|| {
+        let mut acc = 0.0_f64;
+        let mut cnt = 0usize;
+        for i in 0..n_centers.min(8) {
+            for j in (i + 1)..n_centers.min(8) {
+                let mut r2 = 0.0_f64;
+                for a in 0..dim {
+                    let dv = centers[[i, a]] - centers[[j, a]];
+                    r2 += dv * dv;
+                }
+                acc += r2.sqrt();
+                cnt += 1;
+            }
+        }
+        if cnt == 0 || acc <= 0.0 { 1.0 } else { acc / cnt as f64 }
+    });
+    let pure_coeffs = duchon_partial_fraction_coeffs(kernel_m, 0, 1.0 / effective_length_scale_hint.max(1e-300));
+
+    let pi = std::f64::consts::PI;
+    for n in 0..n_rows {
+        for k in 0..n_centers {
+            let mut r2 = 0.0_f64;
+            for a in 0..dim {
+                let raw = t[[n, a]] - centers[[k, a]];
+                let (d_a, d1_a, d2_a) = if periodic_per_axis[a] {
+                    // Chord embedding on the circle of circumference P_a:
+                    //   δ_a   = (P/π) sin(π·raw/P)
+                    //   δ_a'  = cos(π·raw/P)
+                    //   δ_a'' = −(π/P) sin(π·raw/P)
+                    let p = periods[a];
+                    let theta = pi * raw / p;
+                    (
+                        (p / pi) * theta.sin(),
+                        theta.cos(),
+                        -(pi / p) * theta.sin(),
+                    )
+                } else {
+                    (raw, 1.0, 0.0)
+                };
+                delta[[n, k, a]] = d_a;
+                metric_d1[[n, k, a]] = d1_a;
+                metric_d2[[n, k, a]] = d2_a;
+                r2 += d_a * d_a;
+            }
+            let r = r2.sqrt();
+            let (phi, phi_r, phi_rr) = if let Some(ref ppc) = pure_poly_coeff {
+                let jets = duchon_radial_jets(r, effective_length_scale_hint, kernel_m, 0, dim, &pure_coeffs)?;
+                (ppc.eval(r), jets.phi_r, jets.phi_rr)
+            } else {
+                let jets = duchon_radial_jets(
+                    r,
+                    length_scale.expect("hybrid Duchon requires length_scale"),
+                    p_order,
+                    s_order_int,
+                    dim,
+                    coeffs.as_ref().expect("hybrid Duchon requires coeffs"),
+                )?;
+                (jets.phi, jets.phi_r, jets.phi_rr)
+            };
+            radial_value[[n, k]] = phi * kernel_amp;
+            radial_first[[n, k]] = phi_r;
+            radial_second[[n, k]] = phi_rr;
+        }
+    }
+
+    // ---------------------------------------------------- forward kernel block
+    let kernel_design = fast_ab(&radial_value, &z);
+
+    // Polynomial forward block P(x).  Periodic ⇒ constant-only column.
+    let poly_design = polynomial_block_from_order(t, kernel_nullspace_order);
+    let n_poly = poly_design.ncols();
+
+    let mut phi_design = Array2::<f64>::zeros((n_rows, n_kernel + n_poly));
+    phi_design.slice_mut(s![.., ..n_kernel]).assign(&kernel_design);
+    if n_poly > 0 {
+        phi_design.slice_mut(s![.., n_kernel..]).assign(&poly_design);
+    }
+
+    // -------------------------------------------------- radial input-location
+    // jets, contracted through the chord-embedding metric.  For each (n, k):
+    //   ∂φ/∂x_a   = φ'(r) · (δ_a · δ_a') / r
+    //   ∂²φ/∂x_a∂x_c = (φ''(r) − φ'(r)/r)/r² · (δ_a δ_a')(δ_c δ_c')
+    //                + [a == c] · (φ'(r)/r) · ( (δ_a')² + δ_a · δ_a'' )
+    // The first form collapses to the standard radial jet when every axis is
+    // non-periodic (δ_a = x_a − c_a, δ_a' = 1, δ_a'' = 0).
+    let mut radial_jet = Array3::<f64>::zeros((n_rows, n_centers, dim));
+    let mut radial_hess = Array4::<f64>::zeros((n_rows, n_centers, dim, dim));
+    for n in 0..n_rows {
+        for k in 0..n_centers {
+            let mut r2 = 0.0_f64;
+            for a in 0..dim {
+                let da = delta[[n, k, a]];
+                r2 += da * da;
+            }
+            let r = r2.sqrt();
+            let phi_r = radial_first[[n, k]];
+            let phi_rr = radial_second[[n, k]];
+            if r <= 1.0e-12 {
+                // Collision limit: the radial gradient vanishes and the Hessian
+                // is the isotropic φ''(0) δ_ac scaled by (δ_a')² (= 1 at the
+                // center for both linear and chord embeddings).
+                for a in 0..dim {
+                    let d1a = metric_d1[[n, k, a]];
+                    radial_hess[[n, k, a, a]] = phi_rr * kernel_amp * d1a * d1a;
+                }
+                continue;
+            }
+            let q = phi_r / r;
+            let s_scalar = (phi_rr - q) / r2;
+            // g_a = δ_a · δ_a' is ∂r/∂x_a · r (the metric-contracted gradient
+            // of ½r²).
+            for a in 0..dim {
+                let ga = delta[[n, k, a]] * metric_d1[[n, k, a]];
+                radial_jet[[n, k, a]] = q * ga * kernel_amp;
+            }
+            for a in 0..dim {
+                let ga = delta[[n, k, a]] * metric_d1[[n, k, a]];
+                for c in 0..dim {
+                    let gc = delta[[n, k, c]] * metric_d1[[n, k, c]];
+                    let mut value = s_scalar * ga * gc;
+                    if a == c {
+                        let d1a = metric_d1[[n, k, a]];
+                        let curvature = d1a * d1a + delta[[n, k, a]] * metric_d2[[n, k, a]];
+                        value += q * curvature;
+                    }
+                    radial_hess[[n, k, a, c]] = value * kernel_amp;
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------- assemble jet (J)
+    let poly_jet = duchon_polynomial_first_derivative_nd(t, kernel_nullspace_order);
+    if poly_jet.shape()[1] != n_poly {
+        crate::bail_dim_basis!(
+            "build_duchon_basis_design_and_jets: polynomial jet has {} columns but design has {n_poly}",
+            poly_jet.shape()[1]
+        );
+    }
+    let mut jet = Array3::<f64>::zeros((n_rows, n_kernel + n_poly, dim));
+    for axis in 0..dim {
+        let projected = radial_jet.index_axis(Axis(2), axis).dot(&z);
+        jet.slice_mut(s![.., ..n_kernel, axis]).assign(&projected);
+    }
+    if n_poly > 0 {
+        jet.slice_mut(s![.., n_kernel.., ..]).assign(&poly_jet);
+    }
+
+    // ---------------------------------------------------- assemble Hessian (H)
+    let mut hess = Array4::<f64>::zeros((n_rows, n_kernel + n_poly, dim, dim));
+    for a in 0..dim {
+        for c in 0..dim {
+            let slab = radial_hess.slice(s![.., .., a, c]);
+            let projected = slab.dot(&z);
+            hess.slice_mut(s![.., ..n_kernel, a, c]).assign(&projected);
+        }
+    }
+    if n_poly > 0 {
+        // Polynomial Hessian block: ∂²(Π t_i^{α_i}) / ∂t_a ∂t_c.
+        let max_degree = match kernel_nullspace_order {
+            DuchonNullspaceOrder::Zero => 0,
+            DuchonNullspaceOrder::Linear => 1,
+            DuchonNullspaceOrder::Degree(deg) => deg,
+        };
+        let exponents = monomial_exponents(dim, max_degree);
+        if exponents.len() != n_poly {
+            crate::bail_dim_basis!(
+                "build_duchon_basis_design_and_jets: monomial count {} != polynomial block columns {n_poly}",
+                exponents.len()
+            );
+        }
+        for (col, alpha) in exponents.iter().enumerate() {
+            for a in 0..dim {
+                let coeff_a = alpha[a];
+                if coeff_a == 0 {
+                    continue;
+                }
+                for c in 0..dim {
+                    let coeff_c = if a == c {
+                        alpha[c].saturating_sub(1)
+                    } else {
+                        alpha[c]
+                    };
+                    if a != c && coeff_c == 0 {
+                        continue;
+                    }
+                    let lead = (coeff_a as f64) * (coeff_c as f64);
+                    if lead == 0.0 {
+                        continue;
+                    }
+                    for row in 0..n_rows {
+                        let mut value = lead;
+                        for axis in 0..dim {
+                            let mut exp = alpha[axis];
+                            if axis == a {
+                                exp = exp.saturating_sub(1);
+                            }
+                            if axis == c {
+                                exp = exp.saturating_sub(1);
+                            }
+                            if exp != 0 {
+                                value *= t[[row, axis]].powi(exp as i32);
+                            }
+                        }
+                        hess[[row, n_kernel + col, a, c]] = value;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((phi_design, jet, hess))
+}
+
 /// N-D Matérn radial first-derivative `φ'(r)` evaluated for every
 /// `(row, center)` pair.
 ///
