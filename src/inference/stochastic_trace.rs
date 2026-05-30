@@ -79,9 +79,8 @@ pub fn controlled_trace(
 
 #[cfg(test)]
 mod tests {
-    use ndarray::{Array2, ArrayView2};
-
     use super::*;
+    use ndarray::Array2;
 
     // Order-4 Hadamard matrix; columns are orthogonal with norm 2 and
     // (1/4) H Hᵀ = I, so a full Hadamard probe set makes Hutchinson exact.
