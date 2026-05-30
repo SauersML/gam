@@ -7072,6 +7072,14 @@ pub struct AnalyticPenaltyRegistry {
     pub penalties: Vec<AnalyticPenaltyKind>,
 }
 
+impl std::fmt::Debug for AnalyticPenaltyRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnalyticPenaltyRegistry")
+            .field("penalty_count", &self.penalties.len())
+            .finish()
+    }
+}
+
 impl AnalyticPenaltyRegistry {
     #[must_use]
     pub fn new() -> Self {
