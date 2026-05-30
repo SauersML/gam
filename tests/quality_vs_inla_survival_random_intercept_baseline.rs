@@ -413,22 +413,26 @@ fn gam_survival_frailty_random_intercept_matches_inla() {
 /// and time-block coefficients — gam's structural transformation/net baseline.
 ///
 /// For the transformation ("net") likelihood with a Linear baseline target the
-/// parametric offset is zero, so the linear predictor on the log-cumulative-
-/// hazard scale at the reference is exactly the I-spline image of `log t`
-/// against the fitted time-block β; the baseline cumulative hazard is its
-/// exponential, `H0(t) = exp(x_exit(log t) · β_time)`.
+/// parametric offset is zero and the transformation derivative guard is zero,
+/// so the only thing carried in the time channel is the I-spline image of
+/// `log t`. The engine fits the time block against **anchor-centered** columns
+/// `x_exit(log t) − x_exit(anchor)` (see `center_survival_time_designs_at_anchor`
+/// in the workflow fit path), so the fitted β_time multiplies the centered
+/// basis. The baseline cumulative hazard is therefore
+/// `H0(t) = exp( (x_exit(log t) − x_exit(anchor)) · β_time )`.
 ///
 /// We rebuild the I-spline basis from the *saved* basis state — its inferred
 /// knots, degree, kept identifiable columns, and smoothing λ — so the rebuilt
 /// columns are bit-for-bit the ones the fit used (I-splines are deterministic
-/// given their knots), then apply the fitted time-block β. This is gam's real
+/// given their knots), evaluate the same anchor row the fit subtracted, then
+/// apply the fitted time-block β to the centered rows. This is gam's real
 /// baseline-prediction arithmetic, not a re-derivation.
 fn baseline_cumulative_hazard(
     fit: &gam::SurvivalTransformationFitResult,
     t_grid: &[f64],
 ) -> Vec<f64> {
     use gam::families::survival_construction::{
-        SurvivalTimeBasisConfig, build_survival_time_basis,
+        SurvivalTimeBasisConfig, build_survival_time_basis, evaluate_survival_time_basis_row,
     };
     use ndarray::Array1;
 
@@ -449,6 +453,21 @@ fn baseline_cumulative_hazard(
         smooth_lambda,
     };
 
+    let time_cols = fit.time_base_ncols;
+    // The fit centered the time block at `saved.anchor`: it subtracted the
+    // anchor I-spline row from every exit/entry row before estimating β_time.
+    // Reproduce that exact anchor row (same evaluator the workflow used) so the
+    // reconstructed baseline matches the fitted parameterization rather than an
+    // un-centered re-derivation.
+    let anchor_row = evaluate_survival_time_basis_row(saved.anchor, &cfg)
+        .expect("evaluate saved ispline anchor row");
+    assert_eq!(
+        anchor_row.len(),
+        time_cols,
+        "anchor row width {} must match fitted time-block width {time_cols}",
+        anchor_row.len()
+    );
+
     let grid = Array1::from_vec(t_grid.to_vec());
     // No left-truncation at the reference: entry times are zero (the exit basis
     // alone carries H0(t)).
@@ -456,7 +475,6 @@ fn baseline_cumulative_hazard(
     let build = build_survival_time_basis(&entry, &grid, cfg, None)
         .expect("rebuild survival time basis at grid from saved state");
     let x_exit = build.x_exit_time.to_dense();
-    let time_cols = fit.time_base_ncols;
     assert_eq!(
         x_exit.ncols(),
         time_cols,
@@ -464,6 +482,15 @@ fn baseline_cumulative_hazard(
         x_exit.ncols()
     );
     let beta_time = fit.fit.beta.slice(ndarray::s![..time_cols]).to_owned();
-    // eta0(t) on the log-cumulative-hazard scale, then H0 = exp(eta0).
-    x_exit.dot(&beta_time).iter().map(|e| e.exp()).collect()
+    // eta0(t) = (x_exit(log t) − x_exit(anchor)) · β_time on the log-cumulative-
+    // hazard scale, then H0(t) = exp(eta0(t)) — the engine's anchor-centered RP
+    // baseline arithmetic.
+    (0..t_grid.len())
+        .map(|k| {
+            let eta: f64 = (0..time_cols)
+                .map(|j| (x_exit[[k, j]] - anchor_row[j]) * beta_time[j])
+                .sum();
+            eta.exp()
+        })
+        .collect()
 }
