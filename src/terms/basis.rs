@@ -20919,58 +20919,37 @@ pub fn create_duchon_basis_1d_derivative_dense(
     Ok(basis)
 }
 
-/// N-D Duchon radial first-derivative `φ'(r)` evaluated for every
-/// `(row, center)` pair.
+/// Shared N-D Duchon radial-jet matrices: the per-`(row, center)` scalar
+/// radial derivatives `φ'(r)`, `φ''(r)`, `φ'''(r)` of the Duchon kernel.
 ///
-/// Returns an `(n_rows, n_centers)` matrix whose `(n, k)` entry is the
-/// scalar radial derivative `φ'(r_{nk})` of the Duchon kernel,
-/// where `r_{nk} = ‖t_n − c_k‖_2`.
+/// This is the single place that performs the expensive, error-prone work
+/// behind every N-D Duchon derivative consumer: distance evaluation, the
+/// effective-scale default, partial-fraction-coefficient derivation, and the
+/// per-pair [`duchon_radial_jets`] call. The first/second/third radial
+/// derivative helpers, and the analytic-penalty Cartesian-derivative tensors,
+/// are all thin adapters over the matrices produced here.
 ///
-/// This is the load-bearing primitive for differentiating a Duchon design
-/// against its *first* kernel argument (i.e. per-row latent coordinates
-/// `t_n`); the full per-row gradient is reconstructed at the call site as
-/// `∂Φ_{n,k}/∂t_n = φ'(r_{n,k}) · (t_n − c_k) / r_{n,k}` (see
-/// [`crate::terms::latent_coord::LatentCoordValues::design_gradient_wrt_t`]).
-///
-/// `length_scale = None` selects the scale-free pure-Duchon spectrum
-/// (matches `gam_pyffi::position_basis_derivative` for the 1-D case).
-pub fn duchon_radial_first_derivative_nd(
-    t: ArrayView2<'_, f64>,
-    centers: ArrayView2<'_, f64>,
-    length_scale: Option<f64>,
-    nullspace_order: DuchonNullspaceOrder,
-) -> Result<Array2<f64>, BasisError> {
-    let n_rows = t.nrows();
-    let n_centers = centers.nrows();
-    let dim = centers.ncols();
-    if dim == 0 {
-        crate::bail_invalid_basis!(
-            "duchon_radial_first_derivative_nd: centers must have at least one column".into(),
-        );
-    }
-    if t.ncols() != dim {
-        crate::bail_invalid_basis!(
-            "duchon_radial_first_derivative_nd: t has {} cols but centers have {}",
-            t.ncols(),
-            dim
-        );
-    }
-    let effective_order = duchon_effective_nullspace_order(centers, nullspace_order);
-    let p_order = duchon_p_from_nullspace_order(effective_order);
-    // Hybrid Matérn-tail order. The latent-coord helper conservatively uses
-    // s_order = 0 (pure polyharmonic), matching the 1-D `position_basis_*`
-    // entry points and the configuration the LatentCoord prototype targets.
-    let s_order: usize = 0;
-    // Pre-compute partial-fraction coefficients when in hybrid mode. For
-    // `s_order = 0` this is the trivial `a_p = 1` case.
-    let kappa = length_scale.map(|l| 1.0 / l.max(1e-300)).unwrap_or(0.0);
-    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
-    // `duchon_radial_jets` requires a positive length_scale for its r_floor
-    // and collision-Taylor radii. Use the data diameter (or 1.0 fallback) as
-    // the effective scale when the caller passed `None` — this only sets the
-    // numerical guards near r = 0 and does not change the analytic kernel.
-    let effective_length_scale = length_scale.unwrap_or_else(|| {
-        // pick a safe default: the typical inter-center distance.
+/// Only the radial orders `1..=max_order` are materialized; higher matrices
+/// are left empty. `max_order` must be in `1..=3` for the supported latent /
+/// isometry paths.
+struct DuchonRadialJetsNd {
+    /// `(n_rows, n_centers)` matrix of `φ'(r_{nk})`; always populated.
+    phi_r: Array2<f64>,
+    /// `(n_rows, n_centers)` matrix of `φ''(r_{nk})`; populated iff `max_order ≥ 2`.
+    phi_rr: Array2<f64>,
+    /// `(n_rows, n_centers)` matrix of `φ'''(r_{nk})`; populated iff `max_order ≥ 3`.
+    phi_rrr: Array2<f64>,
+}
+
+/// Effective length scale used by [`duchon_radial_jets`]'s near-origin guards
+/// (`r_floor`, collision-Taylor radius) when the caller selects the scale-free
+/// pure-Duchon spectrum via `length_scale = None`. This only sets the
+/// numerical guards near `r = 0` and does not change the analytic kernel; we
+/// pick the typical inter-center distance (or `1.0` as a last resort).
+fn duchon_effective_length_scale(length_scale: Option<f64>, centers: ArrayView2<'_, f64>) -> f64 {
+    length_scale.unwrap_or_else(|| {
+        let n_centers = centers.nrows();
+        let dim = centers.ncols();
         let mut acc = 0.0_f64;
         let mut cnt = 0usize;
         for i in 0..n_centers.min(8) {
@@ -20989,8 +20968,57 @@ pub fn duchon_radial_first_derivative_nd(
         } else {
             acc / cnt as f64
         }
-    });
-    let mut out = Array2::<f64>::zeros((n_rows, n_centers));
+    })
+}
+
+/// Evaluate the shared N-D Duchon radial jets up to `max_order` (`1..=3`).
+///
+/// `caller` is used only to give callers a precise validation message.
+fn duchon_radial_jets_nd(
+    max_order: usize,
+    t: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    length_scale: Option<f64>,
+    nullspace_order: DuchonNullspaceOrder,
+    caller: &str,
+) -> Result<DuchonRadialJetsNd, BasisError> {
+    let n_rows = t.nrows();
+    let n_centers = centers.nrows();
+    let dim = centers.ncols();
+    if dim == 0 {
+        crate::bail_invalid_basis!("{caller}: centers must have at least one column");
+    }
+    if t.ncols() != dim {
+        crate::bail_invalid_basis!("{caller}: t has {} cols but centers have {}", t.ncols(), dim);
+    }
+    assert!(
+        (1..=3).contains(&max_order),
+        "duchon_radial_jets_nd supports radial orders 1..=3; got {max_order}"
+    );
+    let effective_order = duchon_effective_nullspace_order(centers, nullspace_order);
+    let p_order = duchon_p_from_nullspace_order(effective_order);
+    // Hybrid Matérn-tail order. The latent-coord / isometry helpers
+    // conservatively use s_order = 0 (pure polyharmonic), matching the 1-D
+    // `position_basis_*` entry points and the configuration the LatentCoord
+    // prototype targets.
+    let s_order: usize = 0;
+    // Partial-fraction coefficients; for `s_order = 0` this is the trivial
+    // `a_p = 1` case.
+    let kappa = length_scale.map(|l| 1.0 / l.max(1e-300)).unwrap_or(0.0);
+    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
+    let effective_length_scale = duchon_effective_length_scale(length_scale, centers);
+
+    let mut phi_r = Array2::<f64>::zeros((n_rows, n_centers));
+    let mut phi_rr = if max_order >= 2 {
+        Array2::<f64>::zeros((n_rows, n_centers))
+    } else {
+        Array2::<f64>::zeros((0, 0))
+    };
+    let mut phi_rrr = if max_order >= 3 {
+        Array2::<f64>::zeros((n_rows, n_centers))
+    } else {
+        Array2::<f64>::zeros((0, 0))
+    };
     for n in 0..n_rows {
         for k in 0..n_centers {
             let mut r2 = 0.0_f64;
@@ -21001,10 +21029,175 @@ pub fn duchon_radial_first_derivative_nd(
             let r = r2.sqrt();
             let jets =
                 duchon_radial_jets(r, effective_length_scale, p_order, s_order, dim, &coeffs)?;
-            out[[n, k]] = jets.phi_r;
+            phi_r[[n, k]] = jets.phi_r;
+            if max_order >= 2 {
+                phi_rr[[n, k]] = jets.phi_rr;
+            }
+            if max_order >= 3 {
+                phi_rrr[[n, k]] = jets.phi_rrr;
+            }
+        }
+    }
+    Ok(DuchonRadialJetsNd {
+        phi_r,
+        phi_rr,
+        phi_rrr,
+    })
+}
+
+/// Map shared N-D Duchon radial jets into the Cartesian input-location
+/// derivative tensor of `order` (2 or 3), contracted against per-center
+/// decoder coefficients.
+///
+/// `coeffs` is the `(n_centers, p_out)` matrix of radial-basis coefficients
+/// `c_{k,i}`. The result is a flat `(n_rows, p_out · dⁿ)` matrix whose entry
+/// for row `n`, output `i`, and Cartesian multi-index `m` lives at column
+/// `i · dⁿ + m`, where `m` enumerates the axes in row-major order
+/// (`(a·d + c)` for `order = 2`, `((a·d + c)·d + e)` for `order = 3`).
+///
+/// The radial→Cartesian maps are:
+///
+/// ```text
+/// order 2: ∂²Φ/∂t_a∂t_c = q δ_ac + (φ'' − q) u_a u_c,   q = φ'/r
+/// order 3: ∂³Φ/∂t_a∂t_c∂t_e = a u_a u_c u_e
+///                            + b (δ_ac u_e + δ_ae u_c + δ_ce u_a)
+///          b = (φ'' − q)/r,   a = φ''' − 3b
+/// ```
+///
+/// with `u = (t_n − c_k)/r`. At `r = 0` the order-2 collision limit is the
+/// isotropic `φ''(0) δ_ac`; the order-3 tensor vanishes there.
+pub(crate) fn radial_basis_cartesian_derivative(
+    order: usize,
+    t: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    coeffs: ArrayView2<'_, f64>,
+    length_scale: Option<f64>,
+    nullspace_order: DuchonNullspaceOrder,
+) -> Result<Array2<f64>, BasisError> {
+    assert!(
+        order == 2 || order == 3,
+        "radial_basis_cartesian_derivative supports Cartesian orders 2 and 3; got {order}"
+    );
+    let n_rows = t.nrows();
+    let n_centers = centers.nrows();
+    let d = centers.ncols();
+    let p_out = coeffs.ncols();
+    assert_eq!(
+        coeffs.nrows(),
+        n_centers,
+        "radial_basis_cartesian_derivative: coeffs has {} rows but centers have {n_centers}",
+        coeffs.nrows()
+    );
+    let jets = duchon_radial_jets_nd(
+        order,
+        t,
+        centers,
+        length_scale,
+        nullspace_order,
+        "radial_basis_cartesian_derivative",
+    )?;
+    let d_pow = d.pow(order as u32);
+    let mut out = Array2::<f64>::zeros((n_rows, p_out * d_pow));
+    for n in 0..n_rows {
+        for k in 0..n_centers {
+            let mut r2 = 0.0_f64;
+            for a in 0..d {
+                let delta = t[[n, a]] - centers[[k, a]];
+                r2 += delta * delta;
+            }
+            let r = r2.sqrt();
+            match order {
+                2 => {
+                    for a in 0..d {
+                        for c in 0..d {
+                            let basis_hess = if r == 0.0 {
+                                if a == c { jets.phi_rr[[n, k]] } else { 0.0 }
+                            } else {
+                                let inv_r = 1.0 / r;
+                                let u_a = (t[[n, a]] - centers[[k, a]]) * inv_r;
+                                let u_c = (t[[n, c]] - centers[[k, c]]) * inv_r;
+                                let q = jets.phi_r[[n, k]] * inv_r;
+                                let eye = if a == c { 1.0 } else { 0.0 };
+                                q * eye + (jets.phi_rr[[n, k]] - q) * u_a * u_c
+                            };
+                            if basis_hess == 0.0 {
+                                continue;
+                            }
+                            let m = a * d + c;
+                            for i in 0..p_out {
+                                out[[n, i * d_pow + m]] += coeffs[[k, i]] * basis_hess;
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    if r == 0.0 {
+                        continue;
+                    }
+                    let inv_r = 1.0 / r;
+                    let q = jets.phi_r[[n, k]] * inv_r;
+                    let b_coef = (jets.phi_rr[[n, k]] - q) * inv_r;
+                    let a_coef = jets.phi_rrr[[n, k]] - 3.0 * b_coef;
+                    for a in 0..d {
+                        let u_a = (t[[n, a]] - centers[[k, a]]) * inv_r;
+                        for c in 0..d {
+                            let u_c = (t[[n, c]] - centers[[k, c]]) * inv_r;
+                            for e in 0..d {
+                                let u_e = (t[[n, e]] - centers[[k, e]]) * inv_r;
+                                let eye_ac = if a == c { 1.0 } else { 0.0 };
+                                let eye_ae = if a == e { 1.0 } else { 0.0 };
+                                let eye_ce = if c == e { 1.0 } else { 0.0 };
+                                let basis_third = a_coef * u_a * u_c * u_e
+                                    + b_coef * (eye_ac * u_e + eye_ae * u_c + eye_ce * u_a);
+                                if basis_third == 0.0 {
+                                    continue;
+                                }
+                                let m = (a * d + c) * d + e;
+                                for i in 0..p_out {
+                                    out[[n, i * d_pow + m]] += coeffs[[k, i]] * basis_third;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     Ok(out)
+}
+
+/// N-D Duchon radial first-derivative `φ'(r)` evaluated for every
+/// `(row, center)` pair.
+///
+/// Returns an `(n_rows, n_centers)` matrix whose `(n, k)` entry is the
+/// scalar radial derivative `φ'(r_{nk})` of the Duchon kernel,
+/// where `r_{nk} = ‖t_n − c_k‖_2`.
+///
+/// This is the load-bearing primitive for differentiating a Duchon design
+/// against its *first* kernel argument (i.e. per-row latent coordinates
+/// `t_n`); the full per-row gradient is reconstructed at the call site as
+/// `∂Φ_{n,k}/∂t_n = φ'(r_{n,k}) · (t_n − c_k) / r_{n,k}` (see
+/// [`crate::terms::latent_coord::LatentCoordValues::design_gradient_wrt_t`]).
+///
+/// `length_scale = None` selects the scale-free pure-Duchon spectrum
+/// (matches `gam_pyffi::position_basis_derivative` for the 1-D case).
+///
+/// Thin adapter over [`duchon_radial_jets_nd`].
+pub fn duchon_radial_first_derivative_nd(
+    t: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    length_scale: Option<f64>,
+    nullspace_order: DuchonNullspaceOrder,
+) -> Result<Array2<f64>, BasisError> {
+    Ok(duchon_radial_jets_nd(
+        1,
+        t,
+        centers,
+        length_scale,
+        nullspace_order,
+        "duchon_radial_first_derivative_nd",
+    )?
+    .phi_r)
 }
 
 /// N-D Duchon radial second derivative `φ''(r)` evaluated for every
@@ -21026,67 +21219,23 @@ pub fn duchon_radial_first_derivative_nd(
 /// At `r = 0`, consumers should use the isotropic collision limit
 /// `φ''(0) δ_ab`; `duchon_radial_jets` supplies that finite scalar whenever
 /// the selected Duchon order is smooth enough for the supported latent path.
+///
+/// Thin adapter over [`duchon_radial_jets_nd`].
 pub fn duchon_radial_second_derivative_nd(
     t: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
     length_scale: Option<f64>,
     nullspace_order: DuchonNullspaceOrder,
 ) -> Result<Array2<f64>, BasisError> {
-    let n_rows = t.nrows();
-    let n_centers = centers.nrows();
-    let dim = centers.ncols();
-    if dim == 0 {
-        crate::bail_invalid_basis!(
-            "duchon_radial_second_derivative_nd: centers must have at least one column".into(),
-        );
-    }
-    if t.ncols() != dim {
-        crate::bail_invalid_basis!(
-            "duchon_radial_second_derivative_nd: t has {} cols but centers have {}",
-            t.ncols(),
-            dim
-        );
-    }
-    let effective_order = duchon_effective_nullspace_order(centers, nullspace_order);
-    let p_order = duchon_p_from_nullspace_order(effective_order);
-    let s_order: usize = 0;
-    let kappa = length_scale.map(|l| 1.0 / l.max(1e-300)).unwrap_or(0.0);
-    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
-    let effective_length_scale = length_scale.unwrap_or_else(|| {
-        let mut acc = 0.0_f64;
-        let mut cnt = 0usize;
-        for i in 0..n_centers.min(8) {
-            for j in (i + 1)..n_centers.min(8) {
-                let mut r2 = 0.0_f64;
-                for a in 0..dim {
-                    let dv = centers[[i, a]] - centers[[j, a]];
-                    r2 += dv * dv;
-                }
-                acc += r2.sqrt();
-                cnt += 1;
-            }
-        }
-        if cnt == 0 || acc <= 0.0 {
-            1.0
-        } else {
-            acc / cnt as f64
-        }
-    });
-    let mut out = Array2::<f64>::zeros((n_rows, n_centers));
-    for n in 0..n_rows {
-        for k in 0..n_centers {
-            let mut r2 = 0.0_f64;
-            for a in 0..dim {
-                let dv = t[[n, a]] - centers[[k, a]];
-                r2 += dv * dv;
-            }
-            let r = r2.sqrt();
-            let jets =
-                duchon_radial_jets(r, effective_length_scale, p_order, s_order, dim, &coeffs)?;
-            out[[n, k]] = jets.phi_rr;
-        }
-    }
-    Ok(out)
+    Ok(duchon_radial_jets_nd(
+        2,
+        t,
+        centers,
+        length_scale,
+        nullspace_order,
+        "duchon_radial_second_derivative_nd",
+    )?
+    .phi_rr)
 }
 
 /// N-D Duchon radial third derivative `φ'''(r)` evaluated for every
@@ -21095,67 +21244,23 @@ pub fn duchon_radial_second_derivative_nd(
 /// Returns an `(n_rows, n_centers)` matrix whose `(n, k)` entry is the scalar
 /// third radial derivative `φ'''(r_{nk})` from the same
 /// [`duchon_radial_jets`] path used by the first/second derivative helpers.
+///
+/// Thin adapter over [`duchon_radial_jets_nd`].
 pub fn duchon_radial_third_derivative_nd(
     t: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
     length_scale: Option<f64>,
     nullspace_order: DuchonNullspaceOrder,
 ) -> Result<Array2<f64>, BasisError> {
-    let n_rows = t.nrows();
-    let n_centers = centers.nrows();
-    let dim = centers.ncols();
-    if dim == 0 {
-        crate::bail_invalid_basis!(
-            "duchon_radial_third_derivative_nd: centers must have at least one column".into(),
-        );
-    }
-    if t.ncols() != dim {
-        crate::bail_invalid_basis!(
-            "duchon_radial_third_derivative_nd: t has {} cols but centers have {}",
-            t.ncols(),
-            dim
-        );
-    }
-    let effective_order = duchon_effective_nullspace_order(centers, nullspace_order);
-    let p_order = duchon_p_from_nullspace_order(effective_order);
-    let s_order: usize = 0;
-    let kappa = length_scale.map(|l| 1.0 / l.max(1e-300)).unwrap_or(0.0);
-    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
-    let effective_length_scale = length_scale.unwrap_or_else(|| {
-        let mut acc = 0.0_f64;
-        let mut cnt = 0usize;
-        for i in 0..n_centers.min(8) {
-            for j in (i + 1)..n_centers.min(8) {
-                let mut r2 = 0.0_f64;
-                for a in 0..dim {
-                    let dv = centers[[i, a]] - centers[[j, a]];
-                    r2 += dv * dv;
-                }
-                acc += r2.sqrt();
-                cnt += 1;
-            }
-        }
-        if cnt == 0 || acc <= 0.0 {
-            1.0
-        } else {
-            acc / cnt as f64
-        }
-    });
-    let mut out = Array2::<f64>::zeros((n_rows, n_centers));
-    for n in 0..n_rows {
-        for k in 0..n_centers {
-            let mut r2 = 0.0_f64;
-            for a in 0..dim {
-                let dv = t[[n, a]] - centers[[k, a]];
-                r2 += dv * dv;
-            }
-            let r = r2.sqrt();
-            let jets =
-                duchon_radial_jets(r, effective_length_scale, p_order, s_order, dim, &coeffs)?;
-            out[[n, k]] = jets.phi_rrr;
-        }
-    }
-    Ok(out)
+    Ok(duchon_radial_jets_nd(
+        3,
+        t,
+        centers,
+        length_scale,
+        nullspace_order,
+        "duchon_radial_third_derivative_nd",
+    )?
+    .phi_rrr)
 }
 
 fn fill_duchon_1d_polynomial_derivative(
@@ -21727,28 +21832,18 @@ pub fn build_duchon_basis_design_and_jets(
     let mut metric_d1 = Array3::<f64>::zeros((n_rows, n_centers, dim));
     let mut metric_d2 = Array3::<f64>::zeros((n_rows, n_centers, dim));
 
-    // Pure-polyharmonic radial scalars φ',φ'' come from the FD-verified
-    // `duchon_radial_*_derivative_nd` (which use the same `duchon_radial_jets`
-    // machinery the hybrid path uses); the forward value uses `ppc.eval`
-    // verbatim. Hybrid scalars come straight from `duchon_radial_jets` so φ, φ',
-    // φ'' are mutually consistent at the resolved `s_order`.
-    let effective_length_scale_hint = length_scale.unwrap_or_else(|| {
-        let mut acc = 0.0_f64;
-        let mut cnt = 0usize;
-        for i in 0..n_centers.min(8) {
-            for j in (i + 1)..n_centers.min(8) {
-                let mut r2 = 0.0_f64;
-                for a in 0..dim {
-                    let dv = centers[[i, a]] - centers[[j, a]];
-                    r2 += dv * dv;
-                }
-                acc += r2.sqrt();
-                cnt += 1;
-            }
-        }
-        if cnt == 0 || acc <= 0.0 { 1.0 } else { acc / cnt as f64 }
-    });
-    let pure_coeffs = duchon_partial_fraction_coeffs(kernel_m, 0, 1.0 / effective_length_scale_hint.max(1e-300));
+    // Pure-polyharmonic radial scalars φ, φ', φ'' all come from the SAME
+    // analytic jet of the polyharmonic block `c · r^(2m_pure − d)` (or its log
+    // variant) that defines the forward value, via `polyharmonic_block_jet4`.
+    // This is the *exact* derivative of `ppc.eval(r)` — `polyharmonic_block_jet4`
+    // and `PolyharmonicBlockCoeff::new` share the identical coefficient `c`,
+    // power, and log-case branch — so the returned φ' and φ'' differentiate the
+    // forward kernel value column-for-column with no Matérn-regularized
+    // surrogate. (The earlier `duchon_radial_jets` path injected a fabricated
+    // length scale + partial-fraction coeffs, producing φ', φ'' of a *hybrid*
+    // kernel that is NOT the derivative of the pure polyharmonic `ppc.eval`.)
+    // The kernel smoothness order `m_pure` is the one that built `pure_poly_coeff`.
+    let m_pure = pure_duchon_block_order(kernel_m, s_order_f);
 
     let pi = std::f64::consts::PI;
     for n in 0..n_rows {
@@ -21777,9 +21872,10 @@ pub fn build_duchon_basis_design_and_jets(
                 r2 += d_a * d_a;
             }
             let r = r2.sqrt();
-            let (phi, phi_r, phi_rr) = if let Some(ref ppc) = pure_poly_coeff {
-                let jets = duchon_radial_jets(r, effective_length_scale_hint, kernel_m, 0, dim, &pure_coeffs)?;
-                (ppc.eval(r), jets.phi_r, jets.phi_rr)
+            let (phi, phi_r, phi_rr) = if pure_poly_coeff.is_some() {
+                // Exact analytic (value, φ', φ'') of the pure polyharmonic block,
+                // i.e. the true derivatives of the forward `ppc.eval(r)`.
+                polyharmonic_kernel_triplet(r, m_pure, dim)?
             } else {
                 let jets = duchon_radial_jets(
                     r,
@@ -35751,6 +35847,192 @@ mod tests {
         assert!(core.phi.value.is_finite());
         assert!(core.phi.psi.is_finite());
         assert!(core.phi.psi_psi.is_finite());
+    }
+
+    #[test]
+    fn test_radial_basis_cartesian_derivative_matches_legacy_loops() {
+        // Parity test for the shared Duchon radial-jet / Cartesian-derivative
+        // engine (issue #425). The shared `radial_basis_cartesian_derivative`
+        // must reproduce, bit-for-bit-up-to-rounding, the radial→Cartesian
+        // tensors that the analytic-penalty path used to build with its own
+        // inline loops. We rebuild those *legacy* loops here verbatim from the
+        // independently-evaluated radial derivative matrices and require an
+        // exact match.
+        let centers = array![
+            [0.10, -0.30, 0.20],
+            [-0.40, 0.15, 0.05],
+            [0.25, 0.35, -0.10],
+            [-0.05, -0.20, 0.45],
+        ];
+        // Eval points: one off-origin generic row plus one that lands exactly
+        // on a center (collision r = 0) to exercise both branches.
+        let t = array![
+            [0.05, 0.10, -0.15],
+            [-0.40, 0.15, 0.05], // == centers row 1 → r = 0 at k = 1
+            [0.30, -0.25, 0.40],
+        ];
+        let d = centers.ncols();
+        let n_centers = centers.nrows();
+        let n_rows = t.nrows();
+        let p_out = 2usize;
+        let coeffs = array![
+            [1.10, -0.40],
+            [-0.25, 0.70],
+            [0.60, 0.15],
+            [0.05, -0.90],
+        ];
+        let length_scale = Some(0.8_f64);
+        let nullspace_order = DuchonNullspaceOrder::Linear;
+
+        // Independent radial derivative matrices via the public adapters.
+        let phi_r = duchon_radial_first_derivative_nd(
+            t.view(),
+            centers.view(),
+            length_scale,
+            nullspace_order,
+        )
+        .expect("phi_r");
+        let phi_rr = duchon_radial_second_derivative_nd(
+            t.view(),
+            centers.view(),
+            length_scale,
+            nullspace_order,
+        )
+        .expect("phi_rr");
+        let phi_rrr = duchon_radial_third_derivative_nd(
+            t.view(),
+            centers.view(),
+            length_scale,
+            nullspace_order,
+        )
+        .expect("phi_rrr");
+
+        // --- order 2: legacy Hessian loop -----------------------------------
+        let mut legacy2 = Array2::<f64>::zeros((n_rows, p_out * d * d));
+        for n in 0..n_rows {
+            for k in 0..n_centers {
+                let mut r2 = 0.0_f64;
+                for a in 0..d {
+                    let delta = t[[n, a]] - centers[[k, a]];
+                    r2 += delta * delta;
+                }
+                let r = r2.sqrt();
+                for a in 0..d {
+                    for c in 0..d {
+                        let basis_hess = if r == 0.0 {
+                            if a == c { phi_rr[[n, k]] } else { 0.0 }
+                        } else {
+                            let inv_r = 1.0 / r;
+                            let u_a = (t[[n, a]] - centers[[k, a]]) * inv_r;
+                            let u_c = (t[[n, c]] - centers[[k, c]]) * inv_r;
+                            let q = phi_r[[n, k]] * inv_r;
+                            let eye = if a == c { 1.0 } else { 0.0 };
+                            q * eye + (phi_rr[[n, k]] - q) * u_a * u_c
+                        };
+                        if basis_hess == 0.0 {
+                            continue;
+                        }
+                        for i in 0..p_out {
+                            legacy2[[n, (i * d + a) * d + c]] += coeffs[[k, i]] * basis_hess;
+                        }
+                    }
+                }
+            }
+        }
+        let shared2 = radial_basis_cartesian_derivative(
+            2,
+            t.view(),
+            centers.view(),
+            coeffs.view(),
+            length_scale,
+            nullspace_order,
+        )
+        .expect("shared order-2");
+        assert_eq!(shared2.dim(), legacy2.dim());
+        let err2 = (&shared2 - &legacy2)
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            err2 < 1e-14,
+            "order-2 Cartesian derivative parity mismatch: max abs err {err2}"
+        );
+
+        // --- order 3: legacy third-derivative loop --------------------------
+        let mut legacy3 = ndarray::Array3::<f64>::zeros((n_rows, p_out, d * d * d));
+        for n in 0..n_rows {
+            for k in 0..n_centers {
+                let mut r2 = 0.0_f64;
+                for a in 0..d {
+                    let delta = t[[n, a]] - centers[[k, a]];
+                    r2 += delta * delta;
+                }
+                let r = r2.sqrt();
+                if r == 0.0 {
+                    continue;
+                }
+                let inv_r = 1.0 / r;
+                let q = phi_r[[n, k]] * inv_r;
+                let b_coef = (phi_rr[[n, k]] - q) * inv_r;
+                let a_coef = phi_rrr[[n, k]] - 3.0 * b_coef;
+                for a in 0..d {
+                    let u_a = (t[[n, a]] - centers[[k, a]]) * inv_r;
+                    for c in 0..d {
+                        let u_c = (t[[n, c]] - centers[[k, c]]) * inv_r;
+                        for e in 0..d {
+                            let u_e = (t[[n, e]] - centers[[k, e]]) * inv_r;
+                            let eye_ac = if a == c { 1.0 } else { 0.0 };
+                            let eye_ae = if a == e { 1.0 } else { 0.0 };
+                            let eye_ce = if c == e { 1.0 } else { 0.0 };
+                            let basis_third = a_coef * u_a * u_c * u_e
+                                + b_coef * (eye_ac * u_e + eye_ae * u_c + eye_ce * u_a);
+                            if basis_third == 0.0 {
+                                continue;
+                            }
+                            let idx = ((a * d) + c) * d + e;
+                            for i in 0..p_out {
+                                legacy3[[n, i, idx]] += coeffs[[k, i]] * basis_third;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let shared3_flat = radial_basis_cartesian_derivative(
+            3,
+            t.view(),
+            centers.view(),
+            coeffs.view(),
+            length_scale,
+            nullspace_order,
+        )
+        .expect("shared order-3");
+        let shared3 = shared3_flat
+            .into_shape_with_order((n_rows, p_out, d * d * d))
+            .expect("reshape order-3");
+        assert_eq!(shared3.dim(), legacy3.dim());
+        let err3 = (&shared3 - &legacy3)
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            err3 < 1e-14,
+            "order-3 Cartesian derivative parity mismatch: max abs err {err3}"
+        );
+
+        // The radial-jet matrices themselves must be non-trivial, so the
+        // parity assertions above are exercising real values rather than an
+        // all-zero coincidence.
+        assert!(
+            phi_r.iter().any(|v| v.abs() > 1e-9)
+                && phi_rr.iter().any(|v| v.abs() > 1e-9)
+                && phi_rrr.iter().any(|v| v.abs() > 1e-9),
+            "radial-jet matrices unexpectedly trivial"
+        );
+        assert!(
+            shared2.iter().any(|v| v.abs() > 1e-9) && shared3.iter().any(|v| v.abs() > 1e-9),
+            "Cartesian derivative tensors unexpectedly trivial"
+        );
     }
 
     #[test]
