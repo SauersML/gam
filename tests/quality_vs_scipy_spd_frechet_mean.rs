@@ -96,7 +96,7 @@ fn spd_frechet_mean_matches_handcoded_riemannian_descent() {
     // ---- reference: the identical recursion, hand-coded in NumPy ----------
     // Pass the EXACT same matrices as flat columns (one column per (row,col)
     // entry, M rows) so the reference consumes bit-identical input.
-    let mut columns: Vec<Vec<f64>> = vec![Vec::with_capacity(M); N * N];
+    let mut columns: Vec<Vec<f64>> = (0..N * N).map(|_| Vec::with_capacity(M)).collect();
     for x in &samples {
         for (k, val) in x.iter().enumerate() {
             columns[k].push(*val);

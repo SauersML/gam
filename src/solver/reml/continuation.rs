@@ -686,7 +686,13 @@ mod tests {
             &mut self,
             beta: &Array1<f64>,
         ) -> Result<crate::solver::outer_strategy::SeedOutcome, EstimationError> {
-            assert_eq!(beta.len(), self.n_params);
+            // Contract (see `prime_outer_seed` / `eval_step` docstrings):
+            // an empty-β seed means "no warm-start available, use your
+            // own cold default" and must be accepted as a no-op. Only
+            // a populated β is required to match `n_params`.
+            if !beta.is_empty() {
+                assert_eq!(beta.len(), self.n_params);
+            }
             self.seed_calls += 1;
             self.last_seeded_beta_len = Some(beta.len());
             Ok(crate::solver::outer_strategy::SeedOutcome::Installed)
