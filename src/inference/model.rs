@@ -3111,6 +3111,23 @@ impl FittedModel {
                             .to_string(),
                 });
             }
+            // Non-latent survival predict reconstructs the baseline-time
+            // basis via `load_survival_time_basis_config_from_model` and
+            // anchors that basis at `survival_time_anchor`; both are
+            // required for the saved model to be loadable. The CLI's
+            // marginal-slope+time-wiggle save path previously dropped one or
+            // the other on partial-write, producing models that loaded but
+            // would panic at the first predict. Enforce both before persisting.
+            if self.survival_time_basis.is_none() {
+                return Err(FittedModelError::MissingField {
+                    reason: "survival model is missing survival_time_basis; refit to persist the baseline-time basis configuration".to_string(),
+                });
+            }
+            if self.survival_time_anchor.is_none() {
+                return Err(FittedModelError::MissingField {
+                    reason: "survival model is missing survival_time_anchor; refit to persist the baseline-time anchor".to_string(),
+                });
+            }
         }
         if let FittedFamily::LatentSurvival { frailty } = &self.family_state {
             match frailty {
