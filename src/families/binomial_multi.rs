@@ -51,9 +51,7 @@
 //! the two are interchangeable at the FFI layer: same input arity, same
 //! convergence semantics, same `(N, K)` fitted-probability output.
 
-use crate::families::penalized_vector_glm::{
-    PenalizedVectorGlmInputs, fit_penalized_vector_glm,
-};
+use crate::families::penalized_vector_glm::{PenalizedVectorGlmInputs, fit_penalized_vector_glm};
 use crate::families::vector_response::VectorLikelihood;
 use crate::solver::estimate::EstimationError;
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3};

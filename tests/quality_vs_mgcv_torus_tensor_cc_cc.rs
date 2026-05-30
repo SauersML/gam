@@ -26,13 +26,13 @@
 //! f(θ,φ)=sin(2θ)·cos(3φ)+sin(θ+φ), Gaussian noise σ=0.05 from a fixed seed.
 //! The identical (θ,φ,y) rows are handed to both gam and mgcv.
 
+use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, relative_l2, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -72,7 +72,10 @@ fn gam_torus_tensor_cc_cc_matches_mgcv_and_wraps_at_both_seams() {
     // `boundary=['periodic','periodic']` + `period=[2*pi, 2*pi]` is gam's exact
     // analog of mgcv's te(bs=c('cc','cc')): two cyclic B-spline marginals tensor
     // -producted on the torus.
-    let headers = ["theta", "phi", "y"].into_iter().map(String::from).collect();
+    let headers = ["theta", "phi", "y"]
+        .into_iter()
+        .map(String::from)
+        .collect();
     let rows: Vec<StringRecord> = (0..n)
         .map(|r| {
             StringRecord::from(vec![
@@ -91,8 +94,7 @@ fn gam_torus_tensor_cc_cc_matches_mgcv_and_wraps_at_both_seams() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let formula =
-        "y ~ te(theta, phi, boundary=['periodic','periodic'], period=[2*pi, 2*pi], k=8)";
+    let formula = "y ~ te(theta, phi, boundary=['periodic','periodic'], period=[2*pi, 2*pi], k=8)";
     let result = fit_from_formula(formula, &ds, &cfg).expect("gam torus tensor fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for the torus tensor smooth");

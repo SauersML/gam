@@ -58,6 +58,7 @@
 //!      stand-in for the log-log-plot visual check, catching a monotonicity-induced
 //!      shape bias even where the L2 magnitude stays small.
 
+use csv::StringRecord;
 use gam::families::survival_construction::{
     SurvivalTimeBasisConfig, evaluate_survival_time_basis_row,
     resolved_survival_time_basis_config_from_build,
@@ -68,7 +69,6 @@ use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array2;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -180,12 +180,8 @@ fn gam_smooth_ispline_baseline_matches_flexsurvspline_on_icu() {
         time_num_internal_knots: N_INTERNAL_KNOTS,
         ..FitConfig::default()
     };
-    let result = fit_from_formula(
-        "Surv(time, event) ~ age + survmodel(spec=net)",
-        &ds,
-        &cfg,
-    )
-    .expect("gam smooth I-spline RP net-survival fit");
+    let result = fit_from_formula("Surv(time, event) ~ age + survmodel(spec=net)", &ds, &cfg)
+        .expect("gam smooth I-spline RP net-survival fit");
     let FitResult::SurvivalTransformation(fit) = result else {
         panic!("expected a survival-transformation (Royston-Parmar) fit result");
     };
@@ -228,7 +224,10 @@ fn gam_smooth_ispline_baseline_matches_flexsurvspline_on_icu() {
     sorted_t.sort_by(f64::total_cmp);
     let t_lo = sorted_t[((0.05 * n as f64) as usize).min(n - 1)];
     let t_hi = sorted_t[((0.95 * n as f64) as usize).min(n - 1)];
-    assert!(t_lo > 0.0 && t_hi > t_lo, "log-time grid needs 0 < t_lo < t_hi");
+    assert!(
+        t_lo > 0.0 && t_hi > t_lo,
+        "log-time grid needs 0 < t_lo < t_hi"
+    );
     let n_t = 15usize;
     let times: Vec<f64> = (0..n_t)
         .map(|j| {

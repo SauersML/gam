@@ -168,22 +168,12 @@ fn reml_criterion_keeps_alpha_finite_on_collapsing_axis() {
     // ½log|H| Laplace term (rising in α) balances the −½n·logα data/prior term
     // (falling in α). Sweep log α on the collapsing axis and assert the argmin
     // is finite and interior — no clamp needed.
-    let coords = array![
-        [1.0, 0.01],
-        [3.0, -0.01],
-        [-2.0, 0.01],
-        [0.5, -0.01]
-    ];
+    let coords = array![[1.0, 0.01], [3.0, -0.01], [-2.0, 0.01], [0.5, -0.01]];
     // p = d = 2 (identity basis routes axis j → output channel j). target ≈ the
     // coords so the decoder fits β ≈ I with small residual; the ARD α on the
     // small-spread axis 1 is then set by the curvature/‖t‖² balance and has a
     // finite interior optimum ≈ √(n·c/‖t‖²) well inside the swept grid.
-    let target = array![
-        [1.0, 0.01],
-        [3.0, -0.01],
-        [-2.0, 0.01],
-        [0.5, -0.01]
-    ];
+    let target = array![[1.0, 0.01], [3.0, -0.01], [-2.0, 0.01], [0.5, -0.01]];
     let base_term = build_collapse_probe_term(coords);
 
     let log_alpha_grid = [-6.0_f64, -2.0, 0.0, 2.0, 6.0, 10.0, 16.0];

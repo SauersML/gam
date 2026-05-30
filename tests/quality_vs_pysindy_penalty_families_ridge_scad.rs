@@ -340,14 +340,14 @@ for lam in lams:
     // be eliminated by both families, and SCAD must have recovered the true
     // two-term support {x, x^3} = {1, 2} at least at one swept λ — the
     // recovery the whole method exists to deliver.
-    let scad_recovered_truth = runs
-        .iter()
-        .any(|r| r.scad_support == vec![1usize, 2usize]);
+    let scad_recovered_truth = runs.iter().any(|r| r.scad_support == vec![1usize, 2usize]);
     assert!(
         scad_recovered_truth,
         "SCAD never recovered the true active support {{x, x^3}} across the λ sweep; \
          supports were {:?}",
-        runs.iter().map(|r| r.scad_support.clone()).collect::<Vec<_>>()
+        runs.iter()
+            .map(|r| r.scad_support.clone())
+            .collect::<Vec<_>>()
     );
 
     // SCAD's tightest support over the sweep must be no larger than ridge's
@@ -370,8 +370,14 @@ for lam in lams:
     // essentially exact, < 1e-6) so this is not a vacuous one-sided inequality.
     // The true coefficients are an external oracle (the analytic ODE), so this
     // needs no Python reference and cannot be gamed by the solver.
-    let scad_best_err = runs.iter().map(|r| r.scad_err).fold(f64::INFINITY, f64::min);
-    let ridge_best_err = runs.iter().map(|r| r.ridge_err).fold(f64::INFINITY, f64::min);
+    let scad_best_err = runs
+        .iter()
+        .map(|r| r.scad_err)
+        .fold(f64::INFINITY, f64::min);
+    let ridge_best_err = runs
+        .iter()
+        .map(|r| r.ridge_err)
+        .fold(f64::INFINITY, f64::min);
     eprintln!("best ||·-xi*|| over sweep: scad={scad_best_err:.3e} ridge={ridge_best_err:.3e}");
     assert!(
         scad_best_err <= ridge_best_err + 1e-12,

@@ -131,7 +131,11 @@ fn gam_crude_cif_matches_aalen_johansen_and_closed_form() {
     let n_times = fine_times.len();
     let cumulative = Array3::from_shape_fn((2, N, n_times), |(endpoint, row, t_idx)| {
         let x = xs[row];
-        let rate = if endpoint == 0 { lambda_d(x) } else { lambda_m(x) };
+        let rate = if endpoint == 0 {
+            lambda_d(x)
+        } else {
+            lambda_m(x)
+        };
         rate * fine_times[t_idx]
     });
     let cif = assemble_competing_risks_cif(ndarray::aview1(&fine_times), cumulative.view())

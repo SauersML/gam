@@ -54,7 +54,9 @@ fn make_data(n: usize) -> (Vec<f64>, Vec<f64>) {
     // Deterministic uniform x via a splitmix64-style hash of the index; this is
     // self-contained (no rng crate dependency) and identical on every platform.
     let hash01 = |i: u64| -> f64 {
-        let mut z = i.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(0x1234_5678_9ABC_DEF0);
+        let mut z = i
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(0x1234_5678_9ABC_DEF0);
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^= z >> 31;
@@ -130,8 +132,7 @@ fn gam_gp_likelihood_ranking_matches_gpgp() {
     // exact-GP contrast. Each window is contiguous in the sorted x (a GP needs
     // spatially coherent observations) and long enough to keep a k=15 Matérn
     // basis well-posed. Windows: [0,90), [40,150), [90,200), [20,190), [0,200).
-    let subset_windows: [(usize, usize); 5] =
-        [(0, 90), (40, 150), (90, 200), (20, 190), (0, 200)];
+    let subset_windows: [(usize, usize); 5] = [(0, 90), (40, 150), (90, 200), (20, 190), (0, 200)];
 
     let mut gam_delta = Vec::with_capacity(subset_windows.len());
     let mut gpgp_delta = Vec::with_capacity(subset_windows.len());
@@ -236,7 +237,10 @@ fn gam_gp_likelihood_ranking_matches_gpgp() {
         panic!("expected a standard Gaussian GAM fit on the train split");
     };
     let sigma = fit.fit.standard_deviation;
-    assert!(sigma.is_finite() && sigma > 0.0, "gam residual sd must be positive: {sigma}");
+    assert!(
+        sigma.is_finite() && sigma > 0.0,
+        "gam residual sd must be positive: {sigma}"
+    );
 
     let mut g = Array2::<f64>::zeros((n_te, 2));
     for (i, &t) in x_te.iter().enumerate() {

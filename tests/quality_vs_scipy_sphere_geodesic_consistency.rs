@@ -41,13 +41,13 @@
 //! fails, check the kernel evaluation for the lat/lon <-> 3D unit-vector
 //! conversion (the embedding must feed an intrinsic, not chordal, distance).
 
+use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, relative_l2, run_python, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -313,10 +313,7 @@ emit("metric_gap", [metric_gap])
     let seam_design = build_term_collection_design(seam_grid.view(), &fit.resolvedspec)
         .expect("rebuild sphere design at seam points");
     let seam_eval: Vec<f64> = seam_design.design.apply(&fit.fit.beta).to_vec();
-    let fitted_range = gam_eval
-        .iter()
-        .cloned()
-        .fold(f64::NEG_INFINITY, f64::max)
+    let fitted_range = gam_eval.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
         - gam_eval.iter().cloned().fold(f64::INFINITY, f64::min);
     let seam_gap = (seam_eval[0] - seam_eval[1]).abs();
     let seam_rel = seam_gap / fitted_range.max(1e-12);

@@ -121,8 +121,7 @@ fn gam_gaulss_tensor_product_matches_mgcv() {
             ])
         })
         .collect();
-    let ds =
-        encode_recordswith_inferred_schema(headers, rows).expect("encode gaulss-tensor data");
+    let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode gaulss-tensor data");
     let col = ds.column_map();
     let x1_idx = col["x1"];
     let x2_idx = col["x2"];

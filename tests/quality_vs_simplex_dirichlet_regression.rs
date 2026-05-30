@@ -51,7 +51,9 @@
 //!     engines, per ALR axis (the Aitchison-coordinate agreement).
 //!   * **Relative L2** of the fitted log-concentration `log φ(x) = log Σ_k α_k`.
 
-use gam::basis::{BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, build_bspline_basis_1d};
+use gam::basis::{
+    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, build_bspline_basis_1d,
+};
 use gam::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, FamilyEvaluation, ParameterBlockSpec,
     ParameterBlockState, PenaltyMatrix, fit_custom_family,
@@ -83,10 +85,13 @@ fn trigamma(mut x: f64) -> f64 {
     let inv2 = inv * inv;
     // 1/x + 1/(2x²) + 1/(6x³) − 1/(30x⁵) + 1/(42x⁷) − 1/(30x⁹)
     value
-        + inv * (1.0
-            + inv * (0.5
-                + inv * (1.0 / 6.0
-                    + inv2 * (-1.0 / 30.0 + inv2 * (1.0 / 42.0 - inv2 / 30.0)))))
+        + inv
+            * (1.0
+                + inv
+                    * (0.5
+                        + inv
+                            * (1.0 / 6.0
+                                + inv2 * (-1.0 / 30.0 + inv2 * (1.0 / 42.0 - inv2 / 30.0)))))
 }
 
 /// True smooth log-α surfaces η_k(x), k = 0..K-1, in the Dirichlet common
@@ -94,9 +99,9 @@ fn trigamma(mut x: f64) -> f64 {
 /// (Σα) both genuinely vary with x.
 fn true_eta(x: f64) -> [f64; K] {
     [
-        0.6 + 0.9 * x.sin(),                      // part 1
-        0.2 - 0.5 * x + 0.4 * (1.3 * x).cos(),    // part 2
-        -0.3 + 0.7 * (0.8 * x).sin() + 0.15 * x,  // part 3
+        0.6 + 0.9 * x.sin(),                     // part 1
+        0.2 - 0.5 * x + 0.4 * (1.3 * x).cos(),   // part 2
+        -0.3 + 0.7 * (0.8 * x).sin() + 0.15 * x, // part 3
     ]
 }
 
@@ -107,9 +112,7 @@ fn true_eta(x: f64) -> [f64; K] {
 /// identical for fitting and prediction; rows are then split. Returns the
 /// `(train_design, penalties, nullspace_dims, grid_design)` parts shared by
 /// every Dirichlet block.
-fn pspline_parts(
-    x_all: &[f64],
-) -> (Array2<f64>, Vec<PenaltyMatrix>, Vec<usize>, Array2<f64>) {
+fn pspline_parts(x_all: &[f64]) -> (Array2<f64>, Vec<PenaltyMatrix>, Vec<usize>, Array2<f64>) {
     let x_arr = Array1::from_vec(x_all.to_vec());
     let lo = x_all.iter().cloned().fold(f64::INFINITY, f64::min);
     let hi = x_all.iter().cloned().fold(f64::NEG_INFINITY, f64::max);

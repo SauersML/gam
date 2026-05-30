@@ -43,7 +43,9 @@
 //! diverges from the mature reference; we never weaken the bound or edit gam.
 
 use gam::smooth::TermCollectionDesign;
-use gam::terms::basis::{BasisOptions, Dense, KnotSource, create_basis, create_ispline_derivative_dense};
+use gam::terms::basis::{
+    BasisOptions, Dense, KnotSource, create_basis, create_ispline_derivative_dense,
+};
 use gam::test_support::reference::{Column, pearson, relative_l2, run_r};
 use gam::transformation_normal::{TRANSFORMATION_MONOTONICITY_EPS, TransformationNormalFitResult};
 use gam::{
@@ -53,8 +55,10 @@ use gam::{
 use ndarray::{Array1, Array2};
 use std::path::Path;
 
-const HF_CSV: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/heart_failure_clinical_records_dataset.csv");
+const HF_CSV: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/bench/datasets/heart_failure_clinical_records_dataset.csv"
+);
 
 /// Deterministic SplitMix64 so the synthetic response is reproducible bit-for-bit
 /// and fed IDENTICALLY to gam and to R.
@@ -138,8 +142,8 @@ fn reconstruct_transform(
     .expect("I-spline value basis at response points");
     let shape_val = raw_val_arc.as_ref().dot(resp_transform);
 
-    let raw_deriv =
-        create_ispline_derivative_dense(y_arr.view(), &resp_knots, degree, 1).expect("M-spline basis");
+    let raw_deriv = create_ispline_derivative_dense(y_arr.view(), &resp_knots, degree, 1)
+        .expect("M-spline basis");
     let shape_deriv = raw_deriv.dot(resp_transform);
 
     let mut upper_shape = vec![0.0; p_shape];
@@ -190,7 +194,11 @@ fn norm_cdf(x: f64) -> f64 {
             + 0.254_829_592)
             * t
             * (-(x * x) / 2.0).exp();
-    if x >= 0.0 { 0.5 * (1.0 + y) } else { 0.5 * (1.0 - y) }
+    if x >= 0.0 {
+        0.5 * (1.0 + y)
+    } else {
+        0.5 * (1.0 - y)
+    }
 }
 
 #[test]

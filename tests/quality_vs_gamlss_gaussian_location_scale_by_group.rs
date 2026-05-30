@@ -41,13 +41,13 @@
 //! bounds are NOT loosened to whitelist a divergence; a genuine gap is a real
 //! finding.
 
+use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, relative_l2, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -191,8 +191,9 @@ fn gam_location_scale_by_group_matches_gamlss() {
             design_pts[[i, x_idx]] = xv;
             design_pts[[i, group_idx]] = code;
         }
-        let mean_design = build_term_collection_design(design_pts.view(), &fit.fit.meanspec_resolved)
-            .expect("rebuild mean design at grid");
+        let mean_design =
+            build_term_collection_design(design_pts.view(), &fit.fit.meanspec_resolved)
+                .expect("rebuild mean design at grid");
         let noise_design =
             build_term_collection_design(design_pts.view(), &fit.fit.noisespec_resolved)
                 .expect("rebuild noise design at grid");

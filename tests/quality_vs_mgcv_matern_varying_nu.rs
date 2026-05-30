@@ -46,9 +46,7 @@ fn gam_matern_family_matches_mgcv_gp_across_nu() {
     let noise = Normal::new(0.0, 0.08).expect("gaussian noise");
     let mut x: Vec<f64> = (0..n).map(|_| ux.sample(&mut rng)).collect();
     x.sort_by(|a, b| a.partial_cmp(b).expect("finite x"));
-    let truth = |t: f64| {
-        0.5 + (3.0 * std::f64::consts::PI * t).sin() * (-t * t / 2.0).exp()
-    };
+    let truth = |t: f64| 0.5 + (3.0 * std::f64::consts::PI * t).sin() * (-t * t / 2.0).exp();
     let y: Vec<f64> = x
         .iter()
         .map(|&t| truth(t) + noise.sample(&mut rng))
@@ -180,9 +178,7 @@ fn gam_matern_family_matches_mgcv_gp_across_nu() {
     let (nu_lo, grid_lo) = &gam_grids_by_nu[0]; // ν = 3/2 (roughest)
     let (nu_hi, grid_hi) = &gam_grids_by_nu[gam_grids_by_nu.len() - 1]; // ν = 7/2 (smoothest)
     let cross_order_rel = relative_l2(grid_lo, grid_hi);
-    eprintln!(
-        "kernel-distinctness: rel_l2(nu={nu_lo}, nu={nu_hi}) = {cross_order_rel:.4}"
-    );
+    eprintln!("kernel-distinctness: rel_l2(nu={nu_lo}, nu={nu_hi}) = {cross_order_rel:.4}");
     assert!(
         cross_order_rel > 0.01,
         "gam Matérn fits for nu={nu_lo} and nu={nu_hi} are indistinguishable \

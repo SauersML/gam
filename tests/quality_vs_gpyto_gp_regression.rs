@@ -97,7 +97,10 @@ fn gam_gp_regression_matches_gpytorch() {
     let mut x: Vec<f64> = (0..n).map(|_| ux.sample(&mut rng)).collect();
     x.sort_by(|a, b| a.partial_cmp(b).expect("finite x"));
     let truth = |t: f64| t * t.sin() + t / 5.0;
-    let y: Vec<f64> = x.iter().map(|&t| truth(t) + noise.sample(&mut rng)).collect();
+    let y: Vec<f64> = x
+        .iter()
+        .map(|&t| truth(t) + noise.sample(&mut rng))
+        .collect();
 
     // ---- fit with gam: y ~ matern(x, nu=2.5, k=30), REML ---------------------
     let headers = ["x", "y"].into_iter().map(String::from).collect();

@@ -70,8 +70,7 @@ fn gam_matern_gp_matches_sklearn_gpr() {
         .zip(y.iter())
         .map(|(a, b)| csv::StringRecord::from(vec![a.to_string(), b.to_string()]))
         .collect();
-    let ds =
-        encode_recordswith_inferred_schema(headers, rows).expect("encode matern GP dataset");
+    let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode matern GP dataset");
 
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),

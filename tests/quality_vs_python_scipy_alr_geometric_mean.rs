@@ -102,7 +102,11 @@ fn simplex_geometric_mean_matches_scipy_gmean() {
 
     // ---- gam: closed geometric (Fréchet) mean on the simplex --------------
     let gam_mean = simplex_frechet_mean(mat.view(), None).expect("gam simplex Fréchet mean");
-    assert_eq!(gam_mean.len(), nparts, "Fréchet mean must have one part per column");
+    assert_eq!(
+        gam_mean.len(),
+        nparts,
+        "Fréchet mean must have one part per column"
+    );
 
     // ---- SciPy exact reference: closure(gmean(X, axis=0)) -----------------
     // scipy.stats.gmean is the column-wise geometric mean; closing it yields the

@@ -45,6 +45,7 @@
 //! `β = [β_time | β_cov]` is the joint coefficient vector, and the Linear
 //! baseline target contributes a zero eta-offset for the transformation mode.
 
+use csv::StringRecord;
 use gam::families::survival_construction::{
     SurvivalTimeBasisConfig, evaluate_survival_time_basis_row,
     resolved_survival_time_basis_config_from_build,
@@ -55,7 +56,6 @@ use gam::test_support::reference::{Column, pearson, relative_l2, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array2;
 use std::fs::File;
 use std::io::{BufRead, BufReader};

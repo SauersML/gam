@@ -139,13 +139,22 @@ fn gam_poincare_exp_log_roundtrip_matches_geomstats() {
     let mut col_storage: Vec<Vec<f64>> = Vec::with_capacity(max_d);
     for j in 0..max_d {
         let col: Vec<f64> = (0..n)
-            .map(|i| if j < vectors[i].len() { vectors[i][j] } else { 0.0 })
+            .map(|i| {
+                if j < vectors[i].len() {
+                    vectors[i][j]
+                } else {
+                    0.0
+                }
+            })
             .collect();
         col_storage.push(col);
     }
     let col_names: Vec<String> = (0..max_d).map(|j| format!("c{j}")).collect();
     for j in 0..max_d {
-        columns.push(Column::new(col_names[j].as_str(), col_storage[j].as_slice()));
+        columns.push(Column::new(
+            col_names[j].as_str(),
+            col_storage[j].as_slice(),
+        ));
     }
     columns.push(Column::new("dim", &row_dim));
 
@@ -206,8 +215,16 @@ emit("self_maxabs_max", [float(np.max(self_maxabs))])
     let geo_self_l2_max = py.scalar("self_l2_max");
     let geo_self_maxabs_max = py.scalar("self_maxabs_max");
 
-    assert_eq!(geo_exp_flat.len(), n * max_d, "geomstats exp length mismatch");
-    assert_eq!(geo_round_flat.len(), n * max_d, "geomstats round length mismatch");
+    assert_eq!(
+        geo_exp_flat.len(),
+        n * max_d,
+        "geomstats exp length mismatch"
+    );
+    assert_eq!(
+        geo_round_flat.len(),
+        n * max_d,
+        "geomstats round length mismatch"
+    );
 
     // ---- cross-engine agreement on the exp map and the round-trip ---------
     let exp_maxabs = max_abs_diff(&gam_exp_flat, geo_exp_flat);

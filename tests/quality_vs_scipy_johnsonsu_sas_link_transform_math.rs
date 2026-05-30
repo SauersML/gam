@@ -47,9 +47,7 @@ use gam::test_support::reference::{Column, max_abs_diff, relative_l2, run_python
 #[test]
 fn gam_sas_link_transform_matches_scipy_sinh_arcsinh_cdf() {
     // ---- shared grid: eta in [-3, 3] x 100, (epsilon, log_delta) x 9 --------
-    let eta_grid: Vec<f64> = (0..100)
-        .map(|i| -3.0 + 6.0 * (i as f64) / 99.0)
-        .collect();
+    let eta_grid: Vec<f64> = (0..100).map(|i| -3.0 + 6.0 * (i as f64) / 99.0).collect();
     let epsilons = [-0.5_f64, 0.0, 0.5];
     let log_deltas = [-1.0_f64, 0.0, 1.0];
 
@@ -235,8 +233,14 @@ emit("fd1", fd1)
     // implementations of the identical elementary ops, so a few ULP (~1e-14
     // absolute on mu in [0,1], a handful of ULP relative on the derivatives) is
     // the principled, non-weakened bound.
-    assert!(mu_max < 2e-14, "SAS mu disagrees with scipy CDF: max_abs={mu_max:.3e}");
-    assert!(d1_max < 2e-14, "SAS d1 disagrees with scipy pdf: max_abs={d1_max:.3e}");
+    assert!(
+        mu_max < 2e-14,
+        "SAS mu disagrees with scipy CDF: max_abs={mu_max:.3e}"
+    );
+    assert!(
+        d1_max < 2e-14,
+        "SAS d1 disagrees with scipy pdf: max_abs={d1_max:.3e}"
+    );
     assert!(d1_rel < 1e-12, "SAS d1 relative_l2 too large: {d1_rel:.3e}");
     assert!(d2_rel < 1e-12, "SAS d2 relative_l2 too large: {d2_rel:.3e}");
     assert!(d3_rel < 1e-12, "SAS d3 relative_l2 too large: {d3_rel:.3e}");

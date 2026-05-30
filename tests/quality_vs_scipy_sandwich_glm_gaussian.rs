@@ -31,7 +31,9 @@ use csv::StringRecord;
 use gam::inference::alo::compute_alo_diagnostics_from_fit;
 use gam::test_support::reference::{Column, max_abs_diff, pearson, run_python};
 use gam::types::LinkFunction;
-use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism};
+use gam::{
+    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal};

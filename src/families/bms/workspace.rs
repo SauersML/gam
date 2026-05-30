@@ -1116,15 +1116,10 @@ impl BernoulliMarginalSlopeFamily {
                 },
             )
         };
-        let terms = directional_obj_grad_hess(
-            primary_dim,
-            &leading,
-            &scales,
-            |dirs, scale| {
-                let owned: Vec<Array1<f64>> = dirs.iter().map(|d| (*d).clone()).collect();
-                self.row_neglog_directional_with_scale_jet(row, block_states, &owned, scale)
-            },
-        )?;
+        let terms = directional_obj_grad_hess(primary_dim, &leading, &scales, |dirs, scale| {
+            let owned: Vec<Array1<f64>> = dirs.iter().map(|d| (*d).clone()).collect();
+            self.row_neglog_directional_with_scale_jet(row, block_states, &owned, scale)
+        })?;
         Ok((terms.objective, terms.grad, terms.hess))
     }
 
@@ -1373,12 +1368,7 @@ impl BernoulliMarginalSlopeFamily {
                     &scales,
                     |dirs, scale| {
                         let owned: Vec<Array1<f64>> = dirs.iter().map(|d| (*d).clone()).collect();
-                        self.row_neglog_directional_with_scale_jet(
-                            row,
-                            block_states,
-                            &owned,
-                            scale,
-                        )
+                        self.row_neglog_directional_with_scale_jet(row, block_states, &owned, scale)
                     },
                 )?;
                 let mut hess = terms.hess;

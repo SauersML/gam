@@ -127,7 +127,11 @@ mod tests {
         let probes = hadamard4();
         let a_probes = a.dot(&probes);
         let est = hutchinson_trace(probes.view(), a_probes.view());
-        assert!((est - trace(a.view())).abs() < 1e-10, "{est} vs {}", trace(a.view()));
+        assert!(
+            (est - trace(a.view())).abs() < 1e-10,
+            "{est} vs {}",
+            trace(a.view())
+        );
     }
 
     #[test]
@@ -144,7 +148,11 @@ mod tests {
         let probes = hadamard4();
         let a_probes = a.dot(&probes);
         let est = controlled_trace(q.view(), a_q.view(), probes.view(), a_probes.view());
-        assert!((est - trace(a.view())).abs() < 1e-10, "{est} vs {}", trace(a.view()));
+        assert!(
+            (est - trace(a.view())).abs() < 1e-10,
+            "{est} vs {}",
+            trace(a.view())
+        );
     }
 
     #[test]

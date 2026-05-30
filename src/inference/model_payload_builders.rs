@@ -219,10 +219,8 @@ pub fn assemble_bernoulli_marginal_slope_payload(
     payload.resolved_termspec = Some(resolved_marginalspec);
     payload.resolved_termspec_logslopes = Some(vec![resolved_logslopespec.clone()]);
     payload.resolved_termspec_logslope = Some(resolved_logslopespec);
-    payload.score_warp_runtime =
-        score_warp_runtime.map(serialize_anchored_deviation_runtime);
-    payload.link_deviation_runtime =
-        link_dev_runtime.map(serialize_anchored_deviation_runtime);
+    payload.score_warp_runtime = score_warp_runtime.map(serialize_anchored_deviation_runtime);
+    payload.link_deviation_runtime = link_dev_runtime.map(serialize_anchored_deviation_runtime);
     source.apply_to(&mut payload);
     Ok(payload)
 }
@@ -342,7 +340,8 @@ pub fn assemble_location_scale_payload(
     response: LocationScaleResponse<'_>,
     source: SavedModelSourceMetadata,
 ) -> Result<FittedModelPayload, String> {
-    let (family_tag, likelihood, base_link, link, response_scale, noise_transform) = match response {
+    let (family_tag, likelihood, base_link, link, response_scale, noise_transform) = match response
+    {
         LocationScaleResponse::Gaussian {
             response_scale,
             base_link,
@@ -573,8 +572,11 @@ pub fn assemble_survival_transformation_payload(
     payload.survivalspec = Some(inputs.survivalspec);
     if let Some(cause_count) = inputs.cause_count {
         payload.survival_cause_count = Some(cause_count);
-        payload.survival_endpoint_names =
-            Some((1..=cause_count).map(|idx| format!("cause_{idx}")).collect());
+        payload.survival_endpoint_names = Some(
+            (1..=cause_count)
+                .map(|idx| format!("cause_{idx}"))
+                .collect(),
+        );
     }
     payload.survival_baseline_target =
         Some(survival_baseline_targetname(inputs.baseline_cfg.target).to_string());

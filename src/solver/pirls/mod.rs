@@ -7002,12 +7002,7 @@ mod tests {
             with.d3mu_deta3 = d3;
         }
         let mut without = LogLinkWorkingOutputs::zeros(n);
-        write(
-            &mut without.mu,
-            &mut without.weights,
-            &mut without.z,
-            None,
-        );
+        write(&mut without.mu, &mut without.weights, &mut without.z, None);
         (with, without)
     }
 
@@ -7027,15 +7022,7 @@ mod tests {
         // Poisson.
         let reference = reference_poisson(&eta, &y, &prior);
         let (with, without) = run_unified(n, |mu, w, z, derivs| {
-            write_poisson_log_working_state(
-                y.view(),
-                &eta,
-                prior.view(),
-                mu,
-                w,
-                z,
-                derivs,
-            );
+            write_poisson_log_working_state(y.view(), &eta, prior.view(), mu, w, z, derivs);
         });
         with.assert_matches(&reference, "Poisson (derivatives)");
         assert_eq!(with.mu.to_vec(), without.mu.to_vec(), "Poisson mu branch");
@@ -7050,16 +7037,7 @@ mod tests {
         let shape = 2.5;
         let reference = reference_gamma(&eta, &y, &prior, shape);
         let (with, without) = run_unified(n, |mu, w, z, derivs| {
-            write_gamma_log_working_state(
-                y.view(),
-                &eta,
-                prior.view(),
-                shape,
-                mu,
-                w,
-                z,
-                derivs,
-            );
+            write_gamma_log_working_state(y.view(), &eta, prior.view(), shape, mu, w, z, derivs);
         });
         with.assert_matches(&reference, "Gamma (derivatives)");
         assert_eq!(with.mu.to_vec(), without.mu.to_vec(), "Gamma mu branch");
@@ -7075,18 +7053,8 @@ mod tests {
         let phi = 0.7;
         let reference = reference_tweedie(&eta, &y, &prior, p, phi);
         let (with, without) = run_unified(n, |mu, w, z, derivs| {
-            write_tweedie_log_working_state(
-                y.view(),
-                &eta,
-                prior.view(),
-                p,
-                phi,
-                mu,
-                w,
-                z,
-                derivs,
-            )
-            .expect("valid Tweedie parameters");
+            write_tweedie_log_working_state(y.view(), &eta, prior.view(), p, phi, mu, w, z, derivs)
+                .expect("valid Tweedie parameters");
         });
         with.assert_matches(&reference, "Tweedie (derivatives)");
         assert_eq!(with.mu.to_vec(), without.mu.to_vec(), "Tweedie mu branch");

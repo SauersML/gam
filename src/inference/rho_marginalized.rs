@@ -180,12 +180,10 @@ mod tests {
     fn batched_matches_scalar_per_row() {
         let rho_cov = Array2::from_shape_vec((2, 2), vec![1.0, 0.2, 0.2, 0.7]).unwrap();
         let conditional = Array1::from(vec![0.1_f64, 0.3, 0.05]);
-        let rows =
-            Array2::from_shape_vec((3, 2), vec![1.0, 0.0, 0.5, -0.5, -1.0, 2.0]).unwrap();
+        let rows = Array2::from_shape_vec((3, 2), vec![1.0, 0.0, 0.5, -0.5, -1.0, 2.0]).unwrap();
         let batched = rho_marginalized_variances(conditional.view(), rows.view(), rho_cov.view());
         for i in 0..3 {
-            let scalar =
-                rho_marginalized_variance(conditional[i], rows.row(i), rho_cov.view());
+            let scalar = rho_marginalized_variance(conditional[i], rows.row(i), rho_cov.view());
             assert!((batched[i] - scalar).abs() < 1e-12);
         }
     }

@@ -67,12 +67,12 @@
 //! track each other monotonically across the whole grid. We never weaken them and
 //! never edit gam to pass.
 
+use csv::StringRecord;
 use gam::inference::probability::normal_cdf;
 use gam::test_support::reference::{Column, max_abs_diff, pearson, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 
 #[test]
 fn gam_conditional_transformation_matches_r_mlt_on_bone() {
@@ -85,7 +85,8 @@ fn gam_conditional_transformation_matches_r_mlt_on_bone() {
     // not the response a transformation model acts on — see the module doc.)
     let t: Vec<f64> = vec![
         28.0, 32.0, 49.0, 84.0, 357.0, 933.0, 1078.0, 1183.0, 1560.0, 2114.0, 2144.0, // allo
-        42.0, 53.0, 57.0, 63.0, 81.0, 140.0, 176.0, 210.0, 252.0, 476.0, 524.0, 1037.0, // auto
+        42.0, 53.0, 57.0, 63.0, 81.0, 140.0, 176.0, 210.0, 252.0, 476.0, 524.0,
+        1037.0, // auto
     ];
     let trt: Vec<f64> = vec![
         0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, // allo
@@ -109,8 +110,7 @@ fn gam_conditional_transformation_matches_r_mlt_on_bone() {
     let rows: Vec<StringRecord> = (0..n)
         .map(|i| StringRecord::from(vec![t[i].to_string(), trt[i].to_string()]))
         .collect();
-    let data =
-        encode_recordswith_inferred_schema(headers, rows).expect("encode bone CTM data");
+    let data = encode_recordswith_inferred_schema(headers, rows).expect("encode bone CTM data");
 
     let cfg = FitConfig {
         transformation_normal: true,

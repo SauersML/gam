@@ -24,7 +24,8 @@ use crate::terms::{
     MonotonicityPenalty, NestedPrefixPenalty, NuclearNormPenalty, OrthogonalityPenalty,
     ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
     RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule, ScheduleKind,
-    SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TopKActivationPenalty, TotalVariationPenalty,
+    SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TopKActivationPenalty,
+    TotalVariationPenalty,
 };
 
 /// A latent block a penalty descriptor can target, identified either by name or
@@ -662,7 +663,9 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                     .to_ascii_lowercase()
                     .replace('-', "_");
                 let mut penalty = match sparsity_kind.as_str() {
-                    "smooth_l1" | "smoothed_l1" => SparsityPenalty::smoothed_l1(PenaltyTier::Psi, eps),
+                    "smooth_l1" | "smoothed_l1" => {
+                        SparsityPenalty::smoothed_l1(PenaltyTier::Psi, eps)
+                    }
                     "log" => SparsityPenalty::log(PenaltyTier::Psi, eps),
                     "hoyer" => Ok(SparsityPenalty::hoyer(PenaltyTier::Psi)),
                     other => Err(format!(
@@ -786,8 +789,7 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                 let k_max = descriptor_usize(descriptor, "k_max", target.d)?;
                 let alpha = descriptor_f64(descriptor, "alpha", 1.0)?;
                 let tau = descriptor_f64(descriptor, "tau", 1.0)?;
-                let temperature_schedule =
-                    descriptor_temperature_schedule(descriptor, &context)?;
+                let temperature_schedule = descriptor_temperature_schedule(descriptor, &context)?;
                 let learnable = descriptor
                     .get("learnable")
                     .or_else(|| descriptor.get("learnable_alpha"))
@@ -1262,9 +1264,9 @@ fn descriptor_axis_groups(
         .ok_or_else(|| format!("{context}.{key} is required"))?;
     let mut groups = Vec::with_capacity(raw_groups.len());
     for (group_idx, raw_group) in raw_groups.iter().enumerate() {
-        let raw_axes = raw_group.as_array().ok_or_else(|| {
-            format!("{context}.{key}[{group_idx}] must be a list of latent axes")
-        })?;
+        let raw_axes = raw_group
+            .as_array()
+            .ok_or_else(|| format!("{context}.{key}[{group_idx}] must be a list of latent axes"))?;
         let mut group = Vec::with_capacity(raw_axes.len());
         for (axis_idx, raw_axis) in raw_axes.iter().enumerate() {
             let raw_axis = raw_axis.as_u64().ok_or_else(|| {

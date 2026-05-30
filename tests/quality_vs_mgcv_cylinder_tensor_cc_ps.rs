@@ -101,8 +101,7 @@ fn gam_cylinder_tensor_cc_ps_matches_mgcv_and_mixes_boundaries() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let formula =
-        "y ~ te(theta, z, boundary=['periodic','clamped'], period=[2*pi, None], k=8)";
+    let formula = "y ~ te(theta, z, boundary=['periodic','clamped'], period=[2*pi, None], k=8)";
     let result = fit_from_formula(formula, &ds, &cfg).expect("gam cylinder tensor fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for the cylinder tensor smooth");
@@ -191,7 +190,8 @@ fn gam_cylinder_tensor_cc_ps_matches_mgcv_and_mixes_boundaries() {
     // ≈ 1.0: the surface MUST be free to differ across the z ends. If gam wrongly
     // wrapped z, this gap would collapse toward 0. We require the gap to be a
     // sizeable fraction of the truth's span and to match mgcv's "ps" margin.
-    let theta_quarter: Vec<f64> = std::iter::repeat_n(std::f64::consts::FRAC_PI_4, z_grid.len()).collect();
+    let theta_quarter: Vec<f64> =
+        std::iter::repeat_n(std::f64::consts::FRAC_PI_4, z_grid.len()).collect();
     let gam_zprobe = gam_predict(&theta_quarter, &z_grid);
     let gam_z0 = gam_zprobe[0];
     let gam_z1 = gam_zprobe[gam_zprobe.len() - 1];

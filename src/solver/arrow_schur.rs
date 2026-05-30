@@ -2621,7 +2621,8 @@ impl StreamingArrowSchur {
             let di = row.htt.nrows();
             self.validate_row(row_idx, &row)?;
             let htbeta = self.row_htbeta(row_idx, &row, di);
-            let factor = factor_one_row(&row, ridge_t, di, row_idx, self.tolerate_ill_conditioning)?;
+            let factor =
+                factor_one_row(&row, ridge_t, di, row_idx, self.tolerate_ill_conditioning)?;
             let v = backend.solve_block_vector(&factor, &row.gt);
             for c in 0..di {
                 let vc = v[c];
@@ -6141,12 +6142,8 @@ mod tests {
         sys.gb = array![0.0_f64, 0.0];
 
         // Default guard rejects the ill-conditioned per-row block.
-        let strict = solve_arrow_newton_step_with_options(
-            &sys,
-            0.0,
-            0.0,
-            &ArrowSolveOptions::direct(),
-        );
+        let strict =
+            solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &ArrowSolveOptions::direct());
         assert!(
             matches!(
                 strict,

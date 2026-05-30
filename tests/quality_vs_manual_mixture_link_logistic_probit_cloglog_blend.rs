@@ -63,7 +63,10 @@ fn mixture_link_blend_matches_handcoded_reference() {
     assert_eq!(pi.len(), 3, "three-component blend");
     let pi_sum: f64 = pi.iter().sum();
     for (j, &p) in pi.iter().enumerate() {
-        assert!(p >= 0.0, "softmax weight π_{j} must be nonnegative, got {p}");
+        assert!(
+            p >= 0.0,
+            "softmax weight π_{j} must be nonnegative, got {p}"
+        );
     }
     assert!(
         (pi_sum - 1.0).abs() < 1e-15,
@@ -94,7 +97,9 @@ fn mixture_link_blend_matches_handcoded_reference() {
     // engines: we emit η itself to R, so there is zero basis-convention drift —
     // the comparison is strictly about the link blend, not the basis.
     let n = 600usize;
-    let x: Vec<f64> = (0..n).map(|i| 10.0 * (i as f64) / (n as f64 - 1.0)).collect();
+    let x: Vec<f64> = (0..n)
+        .map(|i| 10.0 * (i as f64) / (n as f64 - 1.0))
+        .collect();
 
     // Cubic (degree-3) B-spline-like basis with 5 columns over [0,10] using a
     // simple cardinal cubic on 5 equally spaced centers; this is only a vehicle

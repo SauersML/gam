@@ -3913,7 +3913,10 @@ mod tests {
     /// up a full term-collection design.
     fn validation_time_block(n: usize, p_time: usize) -> TimeBlockInput {
         let design = |fill: f64| {
-            DesignMatrix::Dense(DenseDesignMatrix::from(Array2::from_elem((n, p_time), fill)))
+            DesignMatrix::Dense(DenseDesignMatrix::from(Array2::from_elem(
+                (n, p_time),
+                fill,
+            )))
         };
         TimeBlockInput {
             design_entry: design(0.1),
@@ -4002,9 +4005,12 @@ mod tests {
         )
         .expect("valid survival spec must validate");
         assert_eq!(surv_sigma, Some(0.3));
-        let bin_sigma =
-            validate_latent_binary_inputs(data.view(), &valid_binary_spec(n, p_time), &loaded_frailty())
-                .expect("valid binary spec must validate");
+        let bin_sigma = validate_latent_binary_inputs(
+            data.view(),
+            &valid_binary_spec(n, p_time),
+            &loaded_frailty(),
+        )
+        .expect("valid binary spec must validate");
         assert_eq!(bin_sigma, 0.3);
 
         // 2. Empty data: shared driver, per-model context prefix.
@@ -4019,9 +4025,12 @@ mod tests {
             surv_empty.to_string(),
             "latent-survival requires a non-empty dataset"
         );
-        let bin_empty =
-            validate_latent_binary_inputs(empty.view(), &valid_binary_spec(n, p_time), &loaded_frailty())
-                .expect_err("empty data must be rejected");
+        let bin_empty = validate_latent_binary_inputs(
+            empty.view(),
+            &valid_binary_spec(n, p_time),
+            &loaded_frailty(),
+        )
+        .expect_err("empty data must be rejected");
         assert_eq!(
             bin_empty.to_string(),
             "latent-binary requires a non-empty dataset"
@@ -4046,7 +4055,8 @@ mod tests {
             .expect_err("size mismatch must be rejected");
         let bin_msg = bin_size.to_string();
         assert!(
-            bin_msg.starts_with("latent-binary size mismatch") && !bin_msg.contains("unloaded_hazard"),
+            bin_msg.starts_with("latent-binary size mismatch")
+                && !bin_msg.contains("unloaded_hazard"),
             "binary size-mismatch message must omit unloaded_hazard: {bin_msg}"
         );
 
@@ -4098,9 +4108,12 @@ mod tests {
             sigma_fixed: None,
             loading: HazardLoading::LoadedVsUnloaded,
         };
-        let surv_learnable =
-            validate_latent_survival_inputs(data.view(), &valid_survival_spec(n, p_time), &learnable)
-                .expect("survival accepts a learnable latent scale");
+        let surv_learnable = validate_latent_survival_inputs(
+            data.view(),
+            &valid_survival_spec(n, p_time),
+            &learnable,
+        )
+        .expect("survival accepts a learnable latent scale");
         assert_eq!(surv_learnable, None);
         let bin_learnable =
             validate_latent_binary_inputs(data.view(), &valid_binary_spec(n, p_time), &learnable)

@@ -2114,12 +2114,42 @@ impl PreparedBmsFlexRowLaunchArgs {
             p_m_i32: storage.block.p_m as i32,
             p_g_i32: storage.block.p_g as i32,
             p_total_i32: p_total as i32,
-            h_block_start: storage.block.h.as_ref().map(|r| r.start as i32).unwrap_or(0),
-            h_block_len: storage.block.h.as_ref().map(|r| r.len() as i32).unwrap_or(0),
-            w_block_start: storage.block.w.as_ref().map(|r| r.start as i32).unwrap_or(0),
-            w_block_len: storage.block.w.as_ref().map(|r| r.len() as i32).unwrap_or(0),
-            h_primary_start: storage.primary.h.as_ref().map(|r| r.start as i32).unwrap_or(0),
-            w_primary_start: storage.primary.w.as_ref().map(|r| r.start as i32).unwrap_or(0),
+            h_block_start: storage
+                .block
+                .h
+                .as_ref()
+                .map(|r| r.start as i32)
+                .unwrap_or(0),
+            h_block_len: storage
+                .block
+                .h
+                .as_ref()
+                .map(|r| r.len() as i32)
+                .unwrap_or(0),
+            w_block_start: storage
+                .block
+                .w
+                .as_ref()
+                .map(|r| r.start as i32)
+                .unwrap_or(0),
+            w_block_len: storage
+                .block
+                .w
+                .as_ref()
+                .map(|r| r.len() as i32)
+                .unwrap_or(0),
+            h_primary_start: storage
+                .primary
+                .h
+                .as_ref()
+                .map(|r| r.start as i32)
+                .unwrap_or(0),
+            w_primary_start: storage
+                .primary
+                .w
+                .as_ref()
+                .map(|r| r.start as i32)
+                .unwrap_or(0),
             rows_per_cta: HVP_ROWS_PER_CTA as i32,
             num_chunks,
         }
@@ -2255,7 +2285,10 @@ fn launch_bms_flex_row_host(
     if let Some(v) = v {
         if v.len() != p_total {
             return Err(GpuError::DriverCallFailed {
-                reason: format!("bms_flex_row {ctx}: v.len()={} != p_total={p_total}", v.len()),
+                reason: format!(
+                    "bms_flex_row {ctx}: v.len()={} != p_total={p_total}",
+                    v.len()
+                ),
             });
         }
     }
@@ -2264,11 +2297,13 @@ fn launch_bms_flex_row_host(
     let stream = backend.stream.clone();
 
     let d_v = match v {
-        Some(v) => Some(stream.clone_htod(v).map_err(|err| {
-            GpuError::DriverCallFailed {
-                reason: format!("bms_flex_row {ctx} upload v: {err}"),
-            }
-        })?),
+        Some(v) => Some(
+            stream
+                .clone_htod(v)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("bms_flex_row {ctx} upload v: {err}"),
+                })?,
+        ),
         None => None,
     };
     let mut d_out =
@@ -4005,7 +4040,9 @@ mod tests {
             let d_g = match stream.clone_htod(&logslope) {
                 Ok(s) => s,
                 Err(err) => {
-                    eprintln!("[bms_flex_row hvp_into_device parity] upload logslope failed: {err}");
+                    eprintln!(
+                        "[bms_flex_row hvp_into_device parity] upload logslope failed: {err}"
+                    );
                     return;
                 }
             };

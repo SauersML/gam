@@ -1973,7 +1973,10 @@ mod tests {
             let tri_err = (&tri - &expected)
                 .iter()
                 .fold(0.0_f64, |a, &v| a.max(v.abs()));
-            assert!(full_err < 1e-9, "full kernel mismatch (n={n}, p={p}): {full_err:e}");
+            assert!(
+                full_err < 1e-9,
+                "full kernel mismatch (n={n}, p={p}): {full_err:e}"
+            );
             assert!(
                 tri_err < 1e-9,
                 "triangular kernel mismatch (n={n}, p={p}): {tri_err:e}"

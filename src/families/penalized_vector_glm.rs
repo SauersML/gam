@@ -186,9 +186,7 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
     }
     for (i, &v) in lambdas.iter().enumerate() {
         if !(v.is_finite() && v >= 0.0) {
-            crate::bail_invalid_estim!(
-                "{context}: lambdas[{i}] must be finite and ≥ 0 (got {v})"
-            );
+            crate::bail_invalid_estim!("{context}: lambdas[{i}] must be finite and ≥ 0 (got {v})");
         }
     }
     if let Some(fw) = fisher_w_override.as_ref() {
@@ -427,9 +425,7 @@ mod parity_tests {
     //!      from-scratch single-column penalized logistic Newton solve column
     //!      for column (the row-diagonal block must decouple exactly).
 
-    use crate::families::binomial_multi::{
-        BinomialMultiFitInputs, fit_penalized_binomial_multi,
-    };
+    use crate::families::binomial_multi::{BinomialMultiFitInputs, fit_penalized_binomial_multi};
     use crate::families::multinomial::{MultinomialFitInputs, fit_penalized_multinomial};
     use ndarray::{Array1, Array2};
 
@@ -579,7 +575,11 @@ mod parity_tests {
         });
         let y = Array2::<f64>::from_shape_fn((n, k), |(i, a)| {
             // Deterministic but non-degenerate {0,1} labels per column.
-            if ((i * 7 + a * 13 + 3) % 5) < 3 { 1.0 } else { 0.0 }
+            if ((i * 7 + a * 13 + 3) % 5) < 3 {
+                1.0
+            } else {
+                0.0
+            }
         });
         let penalty = Array2::<f64>::eye(p);
         let lambdas = Array1::from(vec![0.3_f64, 1.2, 2.5]);

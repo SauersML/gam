@@ -50,6 +50,7 @@
 //! divergence in the design / baseline / covariate-effect pathway. We never
 //! weaken them and never edit gam to pass.
 
+use csv::StringRecord;
 use gam::families::survival_construction::{
     SurvivalBaselineTarget, SurvivalTimeBasisConfig, evaluate_survival_time_basis_row,
     resolved_survival_time_basis_config_from_build,
@@ -60,7 +61,6 @@ use gam::test_support::reference::{Column, pearson, relative_l2, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::{Array1, Array2};
 
 /// Deterministic, dependency-free PRNG (SplitMix64) so the synthetic data is
@@ -200,7 +200,8 @@ fn gam_transformation_survival_prediction_grid_matches_scipy() {
     let gamma: Array1<f64> = beta.slice(ndarray::s![p_time..]).to_owned();
     let n_cov = gamma.len();
     assert_eq!(
-        n_cov, 2,
+        n_cov,
+        2,
         "expected 2 covariate coefficients (x1, x2) after the 2-col Weibull time basis; beta.len()={}",
         beta.len()
     );

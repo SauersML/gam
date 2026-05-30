@@ -331,10 +331,22 @@ emit("surv", surv_rows)
         life_surv.len()
     );
 
-    let cens_a_frac =
-        1.0 - is_a.iter().zip(&event).filter(|(a, _)| **a).map(|(_, e)| *e).sum::<f64>() / N_PER_GROUP as f64;
-    let cens_b_frac =
-        1.0 - is_a.iter().zip(&event).filter(|(a, _)| !**a).map(|(_, e)| *e).sum::<f64>() / N_PER_GROUP as f64;
+    let cens_a_frac = 1.0
+        - is_a
+            .iter()
+            .zip(&event)
+            .filter(|(a, _)| **a)
+            .map(|(_, e)| *e)
+            .sum::<f64>()
+            / N_PER_GROUP as f64;
+    let cens_b_frac = 1.0
+        - is_a
+            .iter()
+            .zip(&event)
+            .filter(|(a, _)| !**a)
+            .map(|(_, e)| *e)
+            .sum::<f64>()
+            / N_PER_GROUP as f64;
 
     let rel_surv = relative_l2(&gam_surv, life_surv);
 

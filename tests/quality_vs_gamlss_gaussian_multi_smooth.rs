@@ -116,8 +116,7 @@ fn gam_gaussian_multi_smooth_matches_gamlss() {
             ])
         })
         .collect();
-    let ds =
-        encode_recordswith_inferred_schema(headers, rows).expect("encode multi-smooth data");
+    let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode multi-smooth data");
     let col = ds.column_map();
     let x1_idx = col["x1"];
     let x2_idx = col["x2"];
@@ -232,7 +231,11 @@ fn gam_gaussian_multi_smooth_matches_gamlss() {
     let gamlss_mu = r.vector("mu");
     let gamlss_sigma = r.vector("sigma");
     assert_eq!(gamlss_mu.len(), grid_n, "gamlss mu grid length mismatch");
-    assert_eq!(gamlss_sigma.len(), grid_n, "gamlss sigma grid length mismatch");
+    assert_eq!(
+        gamlss_sigma.len(),
+        grid_n,
+        "gamlss sigma grid length mismatch"
+    );
     let gamlss_log_sigma: Vec<f64> = gamlss_sigma.iter().map(|&s| s.ln()).collect();
 
     // ---- compare the recovered surfaces on the grid ------------------------

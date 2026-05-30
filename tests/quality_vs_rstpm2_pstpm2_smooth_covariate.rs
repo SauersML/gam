@@ -187,7 +187,10 @@ fn gam_smooth_covariate_matches_rstpm2_pstpm2_on_bone() {
     let n = time.len();
     assert!(n >= 20, "bone should have ~23 rows, got {n}");
     let n_events: usize = event.iter().filter(|&&e| e == 1.0).count();
-    assert!(n_events >= 8, "expected the bone relapse events, got {n_events}");
+    assert!(
+        n_events >= 8,
+        "expected the bone relapse events, got {n_events}"
+    );
 
     // Two fixed-seed continuous confounders, shared byte-for-byte. `Age` rescaled
     // to a realistic transplant-age range (mean ~38, sd ~10); `x_continuous`
@@ -296,7 +299,10 @@ fn gam_smooth_covariate_matches_rstpm2_pstpm2_on_bone() {
     // surface replicates across time — which is exactly the structural property
     // both engines must reproduce. Age is held at its mean (slope of f_x alone).
     let x_lo = x_continuous.iter().cloned().fold(f64::INFINITY, f64::min);
-    let x_hi = x_continuous.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let x_hi = x_continuous
+        .iter()
+        .cloned()
+        .fold(f64::NEG_INFINITY, f64::max);
     // Stay inside the observed support (10% inset) so neither engine extrapolates.
     let x_lo_in = x_lo + 0.1 * (x_hi - x_lo);
     let x_hi_in = x_hi - 0.1 * (x_hi - x_lo);

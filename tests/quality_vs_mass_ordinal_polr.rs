@@ -47,10 +47,10 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
+use gam::test_support::reference::{Column, max_abs_diff, relative_l2, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use gam::test_support::reference::{Column, max_abs_diff, relative_l2, run_r};
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -244,8 +244,18 @@ fn gam_continuation_ratio_matches_vgam_sratio() {
     // gam shared x2 slope on the conditional-logit scale: finite difference of
     // eta wrt x2 across the grid (parallel/shared slope => x-independent;
     // average for a stable read). Robust to coefficient ordering.
-    let eta_lo = gam_eta(&grid_x, &vec![0.0; n_grid], &vec![0.0; n_grid], &vec![0.0; n_grid]);
-    let eta_hi = gam_eta(&grid_x, &vec![1.0; n_grid], &vec![0.0; n_grid], &vec![0.0; n_grid]);
+    let eta_lo = gam_eta(
+        &grid_x,
+        &vec![0.0; n_grid],
+        &vec![0.0; n_grid],
+        &vec![0.0; n_grid],
+    );
+    let eta_hi = gam_eta(
+        &grid_x,
+        &vec![1.0; n_grid],
+        &vec![0.0; n_grid],
+        &vec![0.0; n_grid],
+    );
     let gam_x2_slope: f64 =
         eta_hi.iter().zip(&eta_lo).map(|(h, l)| h - l).sum::<f64>() / (n_grid as f64);
 

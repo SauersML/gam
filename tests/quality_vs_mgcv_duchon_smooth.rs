@@ -74,7 +74,8 @@ fn gam_duchon_1d_matches_mgcv_ds() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ duchon(x, k=20, order=1)", &ds, &cfg).expect("gam duchon fit");
+    let result =
+        fit_from_formula("y ~ duchon(x, k=20, order=1)", &ds, &cfg).expect("gam duchon fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for a gaussian Duchon smooth");
     };
@@ -82,7 +83,9 @@ fn gam_duchon_1d_matches_mgcv_ds() {
 
     // ---- dense test grid interior to [0,1] (avoid extrapolation edges) -----
     let m = 201usize;
-    let x_test: Vec<f64> = (0..m).map(|i| 0.005 + 0.99 * i as f64 / (m as f64 - 1.0)).collect();
+    let x_test: Vec<f64> = (0..m)
+        .map(|i| 0.005 + 0.99 * i as f64 / (m as f64 - 1.0))
+        .collect();
     let y_truth: Vec<f64> = x_test.iter().map(|&t| (two_pi_f * t).sin()).collect();
 
     // gam fitted values at the test grid: rebuild the design from the frozen

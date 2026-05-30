@@ -210,7 +210,12 @@ mod tests {
         let (eta_mean, eta_lower, eta_upper, mean, mean_lower, mean_upper) =
             eta_bands_from_matrix(eta.view(), "identity", 0.95).expect("bands");
         for v in [
-            &eta_mean, &eta_lower, &eta_upper, &mean, &mean_lower, &mean_upper,
+            &eta_mean,
+            &eta_lower,
+            &eta_upper,
+            &mean,
+            &mean_lower,
+            &mean_upper,
         ] {
             assert_eq!(v.len(), 3);
             assert!(v.iter().all(|x| *x == 0.0));

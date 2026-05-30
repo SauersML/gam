@@ -38,18 +38,20 @@
 //! both a Matérn field and a tensor-product spline should comfortably capture it
 //! and their fitted surfaces should track closely.
 
+use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::{Array1, Array2};
 use std::path::Path;
 
-const HGDP_TSV: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/hgdp_1kg_pc_data.tsv");
+const HGDP_TSV: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/bench/datasets/hgdp_1kg_pc_data.tsv"
+);
 
 /// Number of samples handed identically to gam and INLA.
 const N: usize = 500;

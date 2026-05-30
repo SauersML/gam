@@ -47,7 +47,9 @@ use gam::inference::probability::{normal_cdf, normal_pdf};
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, max_abs_diff, run_python};
-use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism};
+use gam::{
+    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+};
 use ndarray::Array2;
 
 /// gam's location-scale noise link floor: sigma = 0.01 + exp(eta_scale).
@@ -102,7 +104,9 @@ fn gam_gaussian_location_scale_crps_matches_properscoring() {
 
     let mu_true = |t: f64| (two_pi * t).sin();
     let sigma_true = |t: f64| 0.1 + 0.2 * (two_pi * t).sin();
-    let y: Vec<f64> = (0..n).map(|i| mu_true(x[i]) + sigma_true(x[i]) * z[i]).collect();
+    let y: Vec<f64> = (0..n)
+        .map(|i| mu_true(x[i]) + sigma_true(x[i]) * z[i])
+        .collect();
 
     // ---- split: first 100 train, last 50 hold-out test --------------------
     // x is sorted, so taking a contiguous tail as the test set probes
@@ -136,9 +140,9 @@ fn gam_gaussian_location_scale_crps_matches_properscoring() {
         noise_formula: Some("1 + s(x, k=8)".to_string()),
         ..FitConfig::default()
     };
-    let result =
-        fit_from_formula("y ~ s(x, k=8)", &ds, &cfg).expect("gam location-scale fit");
-    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult { fit, .. }) = result else {
+    let result = fit_from_formula("y ~ s(x, k=8)", &ds, &cfg).expect("gam location-scale fit");
+    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult { fit, .. }) = result
+    else {
         panic!("expected a Gaussian location-scale fit");
     };
 
@@ -177,7 +181,10 @@ fn gam_gaussian_location_scale_crps_matches_properscoring() {
     assert_eq!(mu_test.len(), n_test);
     assert_eq!(sigma_test.len(), n_test);
     for &s in &sigma_test {
-        assert!(s > 0.0 && s.is_finite(), "predicted sigma must be positive/finite: {s}");
+        assert!(
+            s > 0.0 && s.is_finite(),
+            "predicted sigma must be positive/finite: {s}"
+        );
     }
 
     // ---- gam-side CRPS via gam's own normal_cdf / normal_pdf ---------------

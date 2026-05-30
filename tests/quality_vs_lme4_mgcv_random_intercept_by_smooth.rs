@@ -28,13 +28,13 @@
 //! the spec's principled tolerances; a genuine divergence failing them is a real
 //! bug in gam's RE×by-smooth partitioning, not something to loosen.
 
+use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -236,10 +236,7 @@ fn gam_random_intercept_by_smooth_matches_lme4_and_mgcv() {
         let mgcv_cc: Vec<f64> = mgcv_c.iter().map(|v| v - mgcv_m).collect();
         corr_per_group.push(pearson(&gam_cc, &mgcv_cc));
     }
-    let min_curve_corr = corr_per_group
-        .iter()
-        .copied()
-        .fold(f64::INFINITY, f64::min);
+    let min_curve_corr = corr_per_group.iter().copied().fold(f64::INFINITY, f64::min);
 
     // ---- (2) per-group intercepts: gam group effect vs lme4 BLUP -----------
     let intercept_corr = pearson(&gam_intercept_dev, lme4_ranef);

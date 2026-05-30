@@ -59,6 +59,7 @@
 //! A failing assertion because gam genuinely diverges from INLA is acceptable
 //! and must NOT be papered over by loosening a bound or editing gam.
 
+use csv::StringRecord;
 use gam::families::survival_construction::SurvivalLikelihoodMode;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
@@ -66,7 +67,6 @@ use gam::test_support::reference::{Column, pearson, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array2;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -110,7 +110,11 @@ fn gam_survival_frailty_random_intercept_matches_inla() {
     let mut lines = BufReader::new(file).lines();
     let header = lines.next().expect("header line").expect("read header");
     let cols: Vec<&str> = header.split(',').collect();
-    let idx = |name: &str| cols.iter().position(|c| *c == name).unwrap_or_else(|| panic!("column {name} not found"));
+    let idx = |name: &str| {
+        cols.iter()
+            .position(|c| *c == name)
+            .unwrap_or_else(|| panic!("column {name} not found"))
+    };
     let age_c = idx("age");
     let ef_c = idx("ejection_fraction");
     let time_c = idx("time");
@@ -158,7 +162,8 @@ fn gam_survival_frailty_random_intercept_matches_inla() {
     // scale across both engines and the frailty carries the residual group
     // structure rather than absorbing an age trend.
     let age_mean = age.iter().sum::<f64>() / n as f64;
-    let age_sd = (age.iter().map(|a| (a - age_mean).powi(2)).sum::<f64>() / (n as f64 - 1.0)).sqrt();
+    let age_sd =
+        (age.iter().map(|a| (a - age_mean).powi(2)).sum::<f64>() / (n as f64 - 1.0)).sqrt();
     let x: Vec<f64> = age.iter().map(|a| (a - age_mean) / age_sd).collect();
     // INLA's iid factor levels are sorted numerically (1..N_GROUPS); pass the
     // group as a 1-based code so the factor-level order is unambiguous and the
@@ -186,7 +191,8 @@ fn gam_survival_frailty_random_intercept_matches_inla() {
             ])
         })
         .collect();
-    let data = encode_recordswith_inferred_schema(headers, rows).expect("encode frailty survival data");
+    let data =
+        encode_recordswith_inferred_schema(headers, rows).expect("encode frailty survival data");
     let col = data.column_map();
     let x_idx = col["x"];
     let group_idx = col["group"];
@@ -203,7 +209,9 @@ fn gam_survival_frailty_random_intercept_matches_inla() {
     )
     .expect("gam transformation frailty fit");
     let FitResult::SurvivalTransformation(fit) = result else {
-        panic!("expected a SurvivalTransformation fit result for survival_likelihood=transformation");
+        panic!(
+            "expected a SurvivalTransformation fit result for survival_likelihood=transformation"
+        );
     };
     assert_eq!(
         fit.likelihood_mode,

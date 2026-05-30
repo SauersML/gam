@@ -39,13 +39,13 @@
 //! f(x,z) = sin(3x)·cos(3z), a product structure that lives largely in the pure
 //! interaction subspace. Identical rows are handed to gam and to mgcv.
 
+use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, relative_l2, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array2;
 
 // k as passed to ti(...); per-margin centering => (k-1)^2 interaction coefs.
@@ -76,13 +76,7 @@ fn gam_ti_2d_interaction_matches_mgcv() {
     // ---- encode for gam ---------------------------------------------------
     let headers = ["x", "z", "y"].into_iter().map(String::from).collect();
     let rows: Vec<StringRecord> = (0..n)
-        .map(|r| {
-            StringRecord::from(vec![
-                x[r].to_string(),
-                z[r].to_string(),
-                y[r].to_string(),
-            ])
-        })
+        .map(|r| StringRecord::from(vec![x[r].to_string(), z[r].to_string(), y[r].to_string()]))
         .collect();
     let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode ti grid");
     let col = ds.column_map();
@@ -94,8 +88,7 @@ fn gam_ti_2d_interaction_matches_mgcv() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result =
-        fit_from_formula("y ~ ti(x, z, k=6)", &ds, &cfg).expect("gam ti fit succeeded");
+    let result = fit_from_formula("y ~ ti(x, z, k=6)", &ds, &cfg).expect("gam ti fit succeeded");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for y ~ ti(x, z, k=6)");
     };

@@ -125,7 +125,11 @@ fn gam_binomial_logit_matches_sklearn_and_mgcv() {
     );
     let mgcv_prob = r.vector("prob");
     let mgcv_edf = r.scalar("edf");
-    assert_eq!(mgcv_prob.len(), n, "mgcv fitted-probability length mismatch");
+    assert_eq!(
+        mgcv_prob.len(),
+        n,
+        "mgcv fitted-probability length mismatch"
+    );
 
     // ---- (C) scikit-learn classifier reference ----------------------------
     // Unpenalized LogisticRegression (penalty=None, lbfgs) on the SAME two

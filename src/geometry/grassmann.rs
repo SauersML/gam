@@ -180,7 +180,11 @@ impl RiemannianManifold for GrassmannManifold {
         if let Some(sphere) = self.as_sphere() {
             return sphere.parallel_transport(point_along, vec);
         }
-        check_len("Grassmann path width", point_along.ncols(), self.ambient_dim())?;
+        check_len(
+            "Grassmann path width",
+            point_along.ncols(),
+            self.ambient_dim(),
+        )?;
         check_len(
             "Grassmann transported vector",
             vec.len(),
@@ -282,8 +286,16 @@ impl RiemannianManifold for GrassmannManifold {
         // The previous constant 0.0 is only correct for a flat manifold, which
         // Grassmannians are not. The k = 1 case (Gr(1,n) = ℝP^{n-1}, constant
         // sectional curvature +1) is delegated to `as_sphere` above.
-        let x = from_flat(self.project_tangent(point, tangent_pair.0)?.view(), self.n, self.k)?;
-        let y = from_flat(self.project_tangent(point, tangent_pair.1)?.view(), self.n, self.k)?;
+        let x = from_flat(
+            self.project_tangent(point, tangent_pair.0)?.view(),
+            self.n,
+            self.k,
+        )?;
+        let y = from_flat(
+            self.project_tangent(point, tangent_pair.1)?.view(),
+            self.n,
+            self.k,
+        )?;
         let gxx = x.t().dot(&x);
         let gyy = y.t().dot(&y);
         let gxy = x.t().dot(&y);

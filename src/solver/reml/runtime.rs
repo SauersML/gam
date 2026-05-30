@@ -3998,7 +3998,10 @@ impl<'a> RemlState<'a> {
     /// malformed prior folds into the objective as `+inf` cost (and `NaN`
     /// gradient/Hessian) so the outer optimizer steps away from it. The math
     /// itself is shared with custom-family handling.
-    fn evaluate_configured_rho_prior(&self, rho: &Array1<f64>) -> super::rho_prior_eval::RhoPriorEval {
+    fn evaluate_configured_rho_prior(
+        &self,
+        rho: &Array1<f64>,
+    ) -> super::rho_prior_eval::RhoPriorEval {
         super::rho_prior_eval::evaluate(
             &self.rho_prior,
             rho,

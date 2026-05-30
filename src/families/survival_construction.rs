@@ -816,21 +816,21 @@ fn run_baseline_theta_optimizer_with_eval<F>(
     objective: F,
 ) -> Result<SurvivalBaselineConfig, String>
 where
-    F: FnMut(
-        &SurvivalBaselineConfig,
-    ) -> Result<crate::solver::outer_strategy::OuterEval, String>,
+    F: FnMut(&SurvivalBaselineConfig) -> Result<crate::solver::outer_strategy::OuterEval, String>,
 {
     let target = initial.target;
     let engine_context = context.to_string();
     let objective = std::rc::Rc::new(std::cell::RefCell::new(objective));
-    let eval_at = move |obj: &std::rc::Rc<
-        std::cell::RefCell<F>,
-    >,
+    let eval_at = move |obj: &std::rc::Rc<std::cell::RefCell<F>>,
                         theta: &Array1<f64>|
-          -> Result<crate::solver::outer_strategy::OuterEval, crate::estimate::EstimationError> {
+          -> Result<
+        crate::solver::outer_strategy::OuterEval,
+        crate::estimate::EstimationError,
+    > {
         let cfg = survival_baseline_config_from_theta(target, theta)
             .map_err(crate::estimate::EstimationError::InvalidInput)?;
-        let eval = obj.borrow_mut()(&cfg).map_err(crate::estimate::EstimationError::InvalidInput)?;
+        let eval =
+            obj.borrow_mut()(&cfg).map_err(crate::estimate::EstimationError::InvalidInput)?;
         if eval.gradient.len() != theta.len() {
             return Err(crate::estimate::EstimationError::InvalidInput(format!(
                 "{engine_context}: baseline gradient dimension mismatch: got {}, expected {}",
@@ -1992,8 +1992,9 @@ where
                 // the provider would error. Gate on residual==0.
                 let r_e = residuals.entry[i];
                 if r_e != 0.0 {
-                    let partials_entry = partials(age_entry[i], cfg)?
-                        .ok_or_else(|| format!("{label}: unexpected None from partials at entry"))?;
+                    let partials_entry = partials(age_entry[i], cfg)?.ok_or_else(|| {
+                        format!("{label}: unexpected None from partials at entry")
+                    })?;
                     for k in 0..theta_dim {
                         acc[k] += r_e * partials_entry[k].0;
                     }
@@ -3362,11 +3363,12 @@ mod tests {
         };
 
         let cost_only = cost_at.clone();
-        let result_cost_only =
-            optimize_survival_baseline_config(&initial, "baseline parity (cost-only)", move |cfg| {
-                cost_only(cfg)
-            })
-            .expect("cost-only baseline optimization converges");
+        let result_cost_only = optimize_survival_baseline_config(
+            &initial,
+            "baseline parity (cost-only)",
+            move |cfg| cost_only(cfg),
+        )
+        .expect("cost-only baseline optimization converges");
 
         let curvature_grad = curvature.clone();
         let star_grad = theta_star.clone();
@@ -3412,7 +3414,9 @@ mod tests {
             ("gradient-only", &theta_grad_only),
             ("gradient+Hessian", &theta_grad_hess),
         ] {
-            let err = (theta - &theta_star).mapv(f64::abs).fold(0.0_f64, |a, &v| a.max(v));
+            let err = (theta - &theta_star)
+                .mapv(f64::abs)
+                .fold(0.0_f64, |a, &v| a.max(v));
             assert!(
                 err <= 2e-3,
                 "{label} contract recovered θ {theta:?} off true minimizer {theta_star:?} by {err:e}"
@@ -3882,8 +3886,7 @@ mod tests {
         )
         .expect("probit gradient")
         .expect("probit nonlinear");
-        let probit_reference =
-            reference_gradient(&marginal_slope_baseline_offset_theta_partials);
+        let probit_reference = reference_gradient(&marginal_slope_baseline_offset_theta_partials);
         assert_eq!(probit_engine.len(), probit_reference.len());
         for k in 0..probit_engine.len() {
             assert_close(

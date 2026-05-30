@@ -24,13 +24,13 @@
 //! genuine divergence here is a real bug in gam's random-effect machinery, not
 //! something to paper over by loosening the bound.
 
+use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -124,8 +124,7 @@ fn gam_random_intercept_matches_lme4() {
     // σ_g². With 60 observations/group and σ_ε²=0.25 the BLUP shrinkage factor
     // σ_g²/(σ_g²+σ_ε²/60) ≈ 0.99, so this is an essentially unbiased read of the
     // variance component and the apples-to-apples match for lme4's VarCorr.
-    let gam_sigma_g2 =
-        gam_dev.iter().map(|v| v * v).sum::<f64>() / (N_GROUPS as f64 - 1.0);
+    let gam_sigma_g2 = gam_dev.iter().map(|v| v * v).sum::<f64>() / (N_GROUPS as f64 - 1.0);
 
     // ---- fit the SAME model with lme4 (the mature reference) ---------------
     // lme4 separates fixed and random parts: the smooth main effect of x is a

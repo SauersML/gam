@@ -97,7 +97,10 @@ fn gam_nuts_posterior_matches_scipy_exact_conjugate_gaussian() {
     let phi = match dispersion {
         Dispersion::Estimated(v) | Dispersion::Known(v) => v,
     };
-    assert!(phi.is_finite() && phi > 0.0, "fitted dispersion must be positive, got {phi}");
+    assert!(
+        phi.is_finite() && phi > 0.0,
+        "fitted dispersion must be positive, got {phi}"
+    );
 
     // ---- run gam's NUTS over the coefficient vector -----------------------
     // We whiten with the SAVED penalized Hessian H = XᵀX + S_λ (the exact
@@ -246,7 +249,11 @@ emit("sd_draws", draws.std(axis=0, ddof=1))
 /// can ride in a single rectangular CSV handed to the reference body, which
 /// slices each back to its true length. Length must not exceed `len`.
 fn pad(v: &[f64], len: usize) -> Vec<f64> {
-    assert!(v.len() <= len, "pad target {len} shorter than source {}", v.len());
+    assert!(
+        v.len() <= len,
+        "pad target {len} shorter than source {}",
+        v.len()
+    );
     let mut out = v.to_vec();
     out.resize(len, 0.0);
     out

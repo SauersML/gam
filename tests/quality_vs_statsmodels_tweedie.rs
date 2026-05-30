@@ -100,7 +100,10 @@ fn gam_tweedie_matches_statsmodels_power_variance() {
     );
 
     // ---- fit gam: y ~ s(x1, k=4) + s(x2, k=4) + linear(offset), Tweedie ----
-    let headers: Vec<String> = ["y", "x1", "x2", "offset"].into_iter().map(String::from).collect();
+    let headers: Vec<String> = ["y", "x1", "x2", "offset"]
+        .into_iter()
+        .map(String::from)
+        .collect();
     let rows: Vec<csv::StringRecord> = (0..n)
         .map(|i| {
             csv::StringRecord::from(vec![
@@ -120,12 +123,8 @@ fn gam_tweedie_matches_statsmodels_power_variance() {
         family: Some("tweedie".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula(
-        "y ~ s(x1, k=4) + s(x2, k=4) + linear(offset)",
-        &ds,
-        &cfg,
-    )
-    .expect("gam tweedie fit");
+    let result = fit_from_formula("y ~ s(x1, k=4) + s(x2, k=4) + linear(offset)", &ds, &cfg)
+        .expect("gam tweedie fit");
     let FitResult::Standard(fit) = result else {
         panic!("Tweedie(log) is a scalar GLM family => expected FitResult::Standard");
     };

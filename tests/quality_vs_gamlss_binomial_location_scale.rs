@@ -113,12 +113,10 @@ fn gam_binomial_location_scale_logit_p_matches_mgcv_binomial() {
     // ---- build the dataset (column 0 = x, column 1 = y) --------------------
     let headers: Vec<String> = vec!["x".to_string(), "y".to_string()];
     let rows: Vec<csv::StringRecord> = (0..n)
-        .map(|i| {
-            csv::StringRecord::from(vec![format!("{:.17e}", x[i]), format!("{:.17e}", y[i])])
-        })
+        .map(|i| csv::StringRecord::from(vec![format!("{:.17e}", x[i]), format!("{:.17e}", y[i])]))
         .collect();
-    let ds =
-        encode_recordswith_inferred_schema(headers, rows).expect("encode binomial location-scale data");
+    let ds = encode_recordswith_inferred_schema(headers, rows)
+        .expect("encode binomial location-scale data");
 
     // ---- fit with gam: threshold ~ s(x, bs='tp'), log-sigma ~ 1 + s(x, bs='tp')
     let cfg = FitConfig {
@@ -128,7 +126,8 @@ fn gam_binomial_location_scale_logit_p_matches_mgcv_binomial() {
     };
     let result =
         fit_from_formula("y ~ s(x, bs='tp')", &ds, &cfg).expect("gam binomial location-scale fit");
-    let FitResult::BinomialLocationScale(BinomialLocationScaleFitResult { fit, .. }) = result else {
+    let FitResult::BinomialLocationScale(BinomialLocationScaleFitResult { fit, .. }) = result
+    else {
         panic!("expected a binomial location-scale fit");
     };
 
@@ -175,7 +174,10 @@ fn gam_binomial_location_scale_logit_p_matches_mgcv_binomial() {
     // not a collapsed constant. This confirms the SCALE axis was actually fit,
     // without asserting an unjustified element-wise match to a different σ.
     let ls_min = gam_log_sigma.iter().cloned().fold(f64::INFINITY, f64::min);
-    let ls_max = gam_log_sigma.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let ls_max = gam_log_sigma
+        .iter()
+        .cloned()
+        .fold(f64::NEG_INFINITY, f64::max);
     assert!(
         (ls_max - ls_min) > 1e-3,
         "log-sigma smooth collapsed to a constant (range {:.3e}); the joint scale axis did not fit",

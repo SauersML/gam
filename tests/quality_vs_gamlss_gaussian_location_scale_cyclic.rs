@@ -40,6 +40,7 @@
 //! perturb log sigma more than mu — yet 0.04 still pins the *shape* tightly
 //! (a real divergence in the cyclic sigma smooth would blow well past it).
 
+use csv::StringRecord;
 use gam::families::sigma_link::logb_sigma_from_eta_scalar;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
@@ -48,7 +49,6 @@ use gam::test_support::reference::{Column, relative_l2, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::{Array1, Array2};
 use std::f64::consts::PI;
 
@@ -125,7 +125,9 @@ fn gam_cyclic_location_scale_matches_gamlss() {
     // the `knots = list(x = c(0, 2*pi))` we hand mgcv inside gamlss below.
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
-        noise_formula: Some("1 + s(x, bs='cc', period_start=0, period_end=6.283185307179586)".to_string()),
+        noise_formula: Some(
+            "1 + s(x, bs='cc', period_start=0, period_end=6.283185307179586)".to_string(),
+        ),
         ..FitConfig::default()
     };
     let result = fit_from_formula(
@@ -230,7 +232,11 @@ fn gam_cyclic_location_scale_matches_gamlss() {
     // is exactly log(sigma): directly comparable to gam's log-sigma curve.
     let gamlss_log_sigma = r.vector("log_sigma");
     assert_eq!(gamlss_mu.len(), m, "gamlss mu length mismatch");
-    assert_eq!(gamlss_log_sigma.len(), m, "gamlss log-sigma length mismatch");
+    assert_eq!(
+        gamlss_log_sigma.len(),
+        m,
+        "gamlss log-sigma length mismatch"
+    );
 
     // ---- compare the constrained cyclic shapes ----------------------------
     let mu_rel = relative_l2(&gam_mu, gamlss_mu);

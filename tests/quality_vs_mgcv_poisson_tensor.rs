@@ -82,11 +82,7 @@ fn gam_poisson_tensor_matches_mgcv() {
     let headers = vec!["x".to_string(), "z".to_string(), "y".to_string()];
     let rows: Vec<csv::StringRecord> = (0..n)
         .map(|i| {
-            csv::StringRecord::from(vec![
-                x[i].to_string(),
-                z[i].to_string(),
-                y[i].to_string(),
-            ])
+            csv::StringRecord::from(vec![x[i].to_string(), z[i].to_string(), y[i].to_string()])
         })
         .collect();
     let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode poisson dataset");

@@ -63,12 +63,8 @@
 
 use crate::families::custom_family::{BlockwiseFitOptions, fit_custom_family_with_rho_prior};
 use crate::families::multinomial_reml::MultinomialFamily;
-use crate::families::penalized_vector_glm::{
-    PenalizedVectorGlmInputs, fit_penalized_vector_glm,
-};
-use crate::families::vector_response::{
-    MultinomialLogitLikelihood, validate_multinomial_simplex,
-};
+use crate::families::penalized_vector_glm::{PenalizedVectorGlmInputs, fit_penalized_vector_glm};
+use crate::families::vector_response::{MultinomialLogitLikelihood, validate_multinomial_simplex};
 use crate::inference::data::EncodedDataset;
 use crate::inference::formula_dsl::parse_formula;
 use crate::inference::model::ColumnKindTag;

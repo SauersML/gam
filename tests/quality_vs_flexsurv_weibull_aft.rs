@@ -43,6 +43,7 @@
 //! while tolerating the small-sample/anchor differences between the two fitters.
 //! We never weaken them and never edit gam to pass.
 
+use csv::StringRecord;
 use gam::families::survival_construction::{
     SurvivalTimeBasisConfig, evaluate_survival_time_basis_row,
     resolved_survival_time_basis_config_from_build,
@@ -53,7 +54,6 @@ use gam::test_support::reference::{Column, max_abs_diff, relative_l2, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array2;
 use std::fs;
 use std::path::Path;
@@ -76,11 +76,18 @@ fn gam_weibull_matches_flexsurv_on_bone() {
     let mut trt: Vec<f64> = Vec::new();
     for (i, line) in raw.lines().enumerate() {
         if i == 0 {
-            assert!(line.starts_with("\"t\""), "unexpected bone.csv header: {line}");
+            assert!(
+                line.starts_with("\"t\""),
+                "unexpected bone.csv header: {line}"
+            );
             continue;
         }
         let fields: Vec<&str> = line.split(',').collect();
-        assert_eq!(fields.len(), 3, "bone.csv row {i} should have 3 fields: {line}");
+        assert_eq!(
+            fields.len(),
+            3,
+            "bone.csv row {i} should have 3 fields: {line}"
+        );
         t.push(fields[0].trim().parse::<f64>().expect("parse t"));
         d.push(fields[1].trim().parse::<f64>().expect("parse d"));
         let arm = fields[2].trim().trim_matches('"');
@@ -128,7 +135,10 @@ fn gam_weibull_matches_flexsurv_on_bone() {
     // beta = [β_time(2) | gamma]; the linear time block is a strict prefix.
     let beta = &fit.fit.beta;
     let p_time = fit.time_base_ncols;
-    assert_eq!(p_time, 2, "Weibull linear time basis must have 2 columns, got {p_time}");
+    assert_eq!(
+        p_time, 2,
+        "Weibull linear time basis must have 2 columns, got {p_time}"
+    );
     assert_eq!(
         beta.len(),
         3,

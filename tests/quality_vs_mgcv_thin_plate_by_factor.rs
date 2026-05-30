@@ -22,13 +22,13 @@
 //! group-A: sin(6πx), group-B: cos(4πx) at σ=0.06 — two clearly different shapes,
 //! so a collapse-to-shared-smooth bug would blow up the per-group L2.
 
+use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, relative_l2, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -75,7 +75,11 @@ fn gam_thin_plate_by_factor_matches_mgcv() {
             let yi = truth(xi, group_a) + noise.sample(&mut rng);
             x.push(xi);
             y.push(yi);
-            g.push(if group_a { "A".to_string() } else { "B".to_string() });
+            g.push(if group_a {
+                "A".to_string()
+            } else {
+                "B".to_string()
+            });
             g_code.push(if group_a { 0.0 } else { 1.0 });
             is_a.push(group_a);
         }
@@ -84,13 +88,7 @@ fn gam_thin_plate_by_factor_matches_mgcv() {
     // ---- fit with gam: y ~ s(x, by=g, bs='tp', k=15), REML ----------------
     let headers = vec!["x".to_string(), "g".to_string(), "y".to_string()];
     let rows: Vec<StringRecord> = (0..n)
-        .map(|i| {
-            StringRecord::from(vec![
-                x[i].to_string(),
-                g[i].clone(),
-                y[i].to_string(),
-            ])
-        })
+        .map(|i| StringRecord::from(vec![x[i].to_string(), g[i].clone(), y[i].to_string()]))
         .collect();
     let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode by-factor dataset");
     let col = ds.column_map();

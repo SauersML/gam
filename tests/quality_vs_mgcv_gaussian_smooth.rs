@@ -15,10 +15,10 @@
 //! Both fit by REML, so they target the same penalized objective; close
 //! agreement is the correct expectation and a real divergence is a real bug.
 
-use gam::test_support::reference::{Column, pearson, relative_l2, run_r};
-use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
+use gam::test_support::reference::{Column, pearson, relative_l2, run_r};
+use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::path::Path;
 
@@ -61,7 +61,10 @@ fn gam_smooth_matches_mgcv_on_lidar() {
 
     // ---- fit the SAME model with mgcv (the mature reference) --------------
     let r = run_r(
-        &[Column::new("range", &range), Column::new("logratio", &logratio)],
+        &[
+            Column::new("range", &range),
+            Column::new("logratio", &logratio),
+        ],
         r#"
         suppressPackageStartupMessages(library(mgcv))
         m <- gam(logratio ~ s(range), data = df, method = "REML")
@@ -88,8 +91,14 @@ fn gam_smooth_matches_mgcv_on_lidar() {
     // essentially coincide. gam achieves rel_l2 ~= 0.005 and pearson ~= 0.99997
     // here; 0.02 / 0.999 are tight bounds that still leave a sane margin and
     // would catch any real divergence in the smoother.
-    assert!(corr > 0.999, "fitted smooths should be near-identical: pearson={corr:.5}");
-    assert!(rel < 0.02, "fitted smooths diverge from mgcv: rel_l2={rel:.4}");
+    assert!(
+        corr > 0.999,
+        "fitted smooths should be near-identical: pearson={corr:.5}"
+    );
+    assert!(
+        rel < 0.02,
+        "fitted smooths diverge from mgcv: rel_l2={rel:.4}"
+    );
     // EDF is basis/null-space-convention sensitive (gam's default basis vs
     // mgcv's k=10 thin-plate), so we assert same-ballpark complexity rather
     // than bit-identical: within 30% relative (gam is ~18% here).

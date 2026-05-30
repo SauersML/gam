@@ -209,9 +209,13 @@ fn gam_multinomial_smooth_by_factor_matches_vgam() {
             ])
         })
         .collect();
-    let grid_ds =
-        encode_recordswith_schema(grid_headers, grid_rows, &ds.schema, UnseenCategoryPolicy::Error)
-            .expect("encode grid dataset under training schema");
+    let grid_ds = encode_recordswith_schema(
+        grid_headers,
+        grid_rows,
+        &ds.schema,
+        UnseenCategoryPolicy::Error,
+    )
+    .expect("encode grid dataset under training schema");
     let gam_probs: Array2<f64> =
         predict_multinomial_formula(&model, &grid_ds).expect("gam grid prediction");
     assert_eq!(gam_probs.dim(), (n_grid, K));
@@ -284,7 +288,11 @@ fn gam_multinomial_smooth_by_factor_matches_vgam() {
                 .join(","),
         ),
     );
-    assert_eq!(r.scalar("ncol") as usize, K, "VGAM returned K probability columns");
+    assert_eq!(
+        r.scalar("ncol") as usize,
+        K,
+        "VGAM returned K probability columns"
+    );
     let p0 = r.vector("p0");
     let p1 = r.vector("p1");
     let p2 = r.vector("p2");

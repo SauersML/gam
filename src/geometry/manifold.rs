@@ -159,9 +159,9 @@ impl ManifoldSpec {
         match self {
             Self::Euclidean(dim) => Ok(Box::new(crate::geometry::EuclideanManifold::new(*dim))),
             Self::Circle => Ok(Box::new(crate::geometry::CircleManifold::new())),
-            Self::Sphere { intrinsic_dim } => {
-                Ok(Box::new(crate::geometry::SphereManifold::new(*intrinsic_dim)))
-            }
+            Self::Sphere { intrinsic_dim } => Ok(Box::new(crate::geometry::SphereManifold::new(
+                *intrinsic_dim,
+            ))),
             Self::Torus { dim } => Ok(Box::new(crate::geometry::TorusManifold::new(*dim))),
             Self::Grassmann { k, n } => {
                 Ok(Box::new(crate::geometry::GrassmannManifold::new(*k, *n)?))

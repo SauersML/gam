@@ -569,7 +569,9 @@ fn trace_product_dense(left: ArrayView2<'_, f64>, right: ArrayView2<'_, f64>) ->
     value
 }
 
-fn block_penalty_rank_logdet(penalty: ArrayView2<'_, f64>) -> Result<(usize, f64), EstimationError> {
+fn block_penalty_rank_logdet(
+    penalty: ArrayView2<'_, f64>,
+) -> Result<(usize, f64), EstimationError> {
     let eigs = penalty
         .to_owned()
         .eigh(Side::Lower)
@@ -664,7 +666,12 @@ fn solve_block_orthogonal_rho(
             + 0.5
                 * scale_precision
                     .iter()
-                    .zip(current.penalty_energy.iter().zip(current.curvature_energy.iter()))
+                    .zip(
+                        current
+                            .penalty_energy
+                            .iter()
+                            .zip(current.curvature_energy.iter()),
+                    )
                     .map(|(scale, (energy, curvature))| scale * (energy - 2.0 * curvature))
                     .sum::<f64>();
         if !(grad.is_finite() && hess.is_finite()) {

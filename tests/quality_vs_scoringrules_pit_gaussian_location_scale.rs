@@ -130,8 +130,8 @@ fn gam_location_scale_pit_is_calibrated_on_holdout() {
             train_rows.push(StringRecord::from(vec![x[i].to_string(), y[i].to_string()]));
         }
     }
-    let train_ds = encode_recordswith_inferred_schema(headers, train_rows)
-        .expect("encode training dataset");
+    let train_ds =
+        encode_recordswith_inferred_schema(headers, train_rows).expect("encode training dataset");
     let col = train_ds.column_map();
     let x_idx = col["x"];
 
@@ -140,7 +140,8 @@ fn gam_location_scale_pit_is_calibrated_on_holdout() {
         noise_formula: Some("1 + s(x, k=8)".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ s(x, k=8)", &train_ds, &cfg).expect("gam location-scale fit");
+    let result =
+        fit_from_formula("y ~ s(x, k=8)", &train_ds, &cfg).expect("gam location-scale fit");
     let FitResult::GaussianLocationScale(fit) = result else {
         panic!("expected a GaussianLocationScale fit for a Gaussian noise_formula model");
     };
@@ -244,7 +245,11 @@ emit("bin_counts", counts.astype(float))
     let ks_pvalue = py.scalar("ks_pvalue");
     let bin_counts = py.vector("bin_counts");
     assert_eq!(ref_pit.len(), grid_n, "reference PIT length mismatch");
-    assert_eq!(bin_counts.len(), 10, "expected 10 equiprobable histogram bins");
+    assert_eq!(
+        bin_counts.len(),
+        10,
+        "expected 10 equiprobable histogram bins"
+    );
 
     // gam's PIT must match the analytic reference PIT element-wise (only the
     // A&S erf approximation error, ~1.5e-7, should separate them).

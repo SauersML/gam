@@ -40,12 +40,13 @@
 //!     acceleration factor, i.e. the "location" parameter both engines report)
 //!     within 3% relative.
 
+use csv::StringRecord;
 use gam::families::survival_construction::{
-    SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeBasisConfig,
-    add_survival_time_derivative_guard_offset, build_survival_time_basis,
+    SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
+    SurvivalTimeBasisConfig, add_survival_time_derivative_guard_offset, build_survival_time_basis,
     build_survival_time_offsets_for_likelihood, evaluate_survival_time_basis_row,
-    resolve_survival_time_anchor_value,
-    resolved_survival_time_basis_config_from_build, survival_derivative_guard_for_likelihood,
+    resolve_survival_time_anchor_value, resolved_survival_time_basis_config_from_build,
+    survival_derivative_guard_for_likelihood,
 };
 use gam::families::survival_location_scale::{
     SurvivalLocationScalePredictInput, predict_survival_location_scale,
@@ -55,7 +56,6 @@ use gam::types::InverseLink;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::{Array1, Array2};
 use std::path::Path;
 
@@ -206,8 +206,7 @@ fn gam_loglogistic_aft_matches_lifelines_on_haberman_ages() {
     // anchor the fit used so every grid evaluation reuses the same basis.
     let train_entry = Array1::<f64>::zeros(n);
     let train_exit = Array1::<f64>::from_vec(time.clone());
-    let (resolved_cfg, anchor, anchor_row) =
-        resolve_training_time_basis(&train_entry, &train_exit);
+    let (resolved_cfg, anchor, anchor_row) = resolve_training_time_basis(&train_entry, &train_exit);
     let time_ctx = TimeBasisCtx {
         resolved_cfg,
         anchor,
@@ -279,7 +278,11 @@ emit("a_age", a_age)
     );
     let ref_surv = r.vector("surv");
     let ref_a_age = r.scalar("a_age");
-    assert_eq!(ref_surv.len(), grid_n, "lifelines surv grid length mismatch");
+    assert_eq!(
+        ref_surv.len(),
+        grid_n,
+        "lifelines surv grid length mismatch"
+    );
 
     // ---- compare S(t|age) on the grid ---------------------------------------
     let gam_surv_vec: Vec<f64> = gam_surv.to_vec();

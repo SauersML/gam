@@ -70,16 +70,8 @@ fn lorenz_rhs(x: f64, y: f64, z: f64) -> (f64, f64, f64) {
 /// One classical RK4 step of size `DT`.
 fn rk4_step(x: f64, y: f64, z: f64) -> (f64, f64, f64) {
     let (k1x, k1y, k1z) = lorenz_rhs(x, y, z);
-    let (k2x, k2y, k2z) = lorenz_rhs(
-        x + 0.5 * DT * k1x,
-        y + 0.5 * DT * k1y,
-        z + 0.5 * DT * k1z,
-    );
-    let (k3x, k3y, k3z) = lorenz_rhs(
-        x + 0.5 * DT * k2x,
-        y + 0.5 * DT * k2y,
-        z + 0.5 * DT * k2z,
-    );
+    let (k2x, k2y, k2z) = lorenz_rhs(x + 0.5 * DT * k1x, y + 0.5 * DT * k1y, z + 0.5 * DT * k1z);
+    let (k3x, k3y, k3z) = lorenz_rhs(x + 0.5 * DT * k2x, y + 0.5 * DT * k2y, z + 0.5 * DT * k2z);
     let (k4x, k4y, k4z) = lorenz_rhs(x + DT * k3x, y + DT * k3y, z + DT * k3z);
     (
         x + DT / 6.0 * (k1x + 2.0 * k2x + 2.0 * k3x + k4x),
@@ -282,7 +274,10 @@ emit("nonzero", (xi != 0.0).reshape(-1, order="F").astype(float))
     let py_vs_true = max_abs_diff(py_xi, &true_xi);
 
     eprintln!("=== SINDy Lorenz-63: gam STLSQ vs PySINDy STLSQ ===");
-    eprintln!("rounds_used={} converged={}", gam.rounds_used, gam.converged);
+    eprintln!(
+        "rounds_used={} converged={}",
+        gam.rounds_used, gam.converged
+    );
     eprintln!("support mismatches (gam vs pysindy): {support_mismatches}");
     eprintln!("coef max|Δ| gam-vs-pysindy : {coef_max_abs:.3e}");
     eprintln!("coef max|Δ| gam-vs-true    : {gam_vs_true:.3e}");

@@ -168,8 +168,8 @@ pub fn validate_latent_interval_inputs<M: LatentIntervalModel>(
             || !unloaded_exit.is_finite()
             || unloaded_entry < 0.0
             || unloaded_exit < unloaded_entry;
-        let hazard_invalid = unloaded_hazard
-            .is_some_and(|hazard| !hazard.is_finite() || hazard < 0.0);
+        let hazard_invalid =
+            unloaded_hazard.is_some_and(|hazard| !hazard.is_finite() || hazard < 0.0);
         if masses_invalid || hazard_invalid {
             return Err(LatentSurvivalError::InvalidDataset {
                 reason: unloaded_decomposition_reason(

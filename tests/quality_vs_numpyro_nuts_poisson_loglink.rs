@@ -36,9 +36,7 @@ use gam::inference::model::{
 use gam::smooth::{freeze_term_collection_from_design, weighted_blockwise_penalty_sum};
 use gam::test_support::reference::{Column, max_abs_diff, pearson, run_python};
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
-use gam::{
-    FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema,
-};
+use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use std::io::Write;
 use std::path::Path;
 
@@ -146,7 +144,8 @@ fn gam_nuts_poisson_loglink_matches_numpyro() {
         family: Some("poisson".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("count ~ s(age) + s(los)", &agg_ds, &cfg).expect("gam poisson fit");
+    let result =
+        fit_from_formula("count ~ s(age) + s(los)", &agg_ds, &cfg).expect("gam poisson fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for Poisson count regression");
     };
@@ -190,10 +189,7 @@ fn gam_nuts_poisson_loglink_matches_numpyro() {
         "poisson".to_string(),
     );
     payload.resolved_termspec = Some(frozen);
-    payload.set_training_feature_metadata(
-        agg_ds.headers.clone(),
-        agg_ds.feature_ranges(),
-    );
+    payload.set_training_feature_metadata(agg_ds.headers.clone(), agg_ds.feature_ranges());
     let model = FittedModel::from_payload(payload);
 
     let nuts_cfg = gam::hmc::NutsConfig {

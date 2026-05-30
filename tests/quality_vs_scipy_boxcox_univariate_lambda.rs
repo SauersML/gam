@@ -187,7 +187,11 @@ emit("z", z)
         n,
         "scipy Box-Cox transform length must match gam ({n})"
     );
-    assert_eq!(boxcox_z.len(), n, "scipy standardized scores length mismatch");
+    assert_eq!(
+        boxcox_z.len(),
+        n,
+        "scipy standardized scores length mismatch"
+    );
 
     // ---- compare -------------------------------------------------------------
     // (1) relative_l2 on the standardized fitted normal scores h_i. gam's PIT

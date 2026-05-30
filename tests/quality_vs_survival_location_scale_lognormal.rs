@@ -46,13 +46,13 @@
 //! both of which enter `mu` additively and survive mean-centering. Separately we
 //! compare the constant log-scale parameter `log(sigma)`.
 
+use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, relative_l2, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array2;
 
 #[test]
@@ -140,12 +140,8 @@ fn gam_lognormal_location_scale_aft_smooth_matches_survreg() {
         survival_distribution: "gaussian".to_string(),
         ..FitConfig::default()
     };
-    let result = fit_from_formula(
-        r#"Surv(t, event) ~ x + s(z, bs="tp", k=5)"#,
-        &ds,
-        &cfg,
-    )
-    .expect("gam lognormal location-scale AFT fit");
+    let result = fit_from_formula(r#"Surv(t, event) ~ x + s(z, bs="tp", k=5)"#, &ds, &cfg)
+        .expect("gam lognormal location-scale AFT fit");
     let FitResult::SurvivalLocationScale(fit) = result else {
         panic!("expected a survival location-scale fit result");
     };
@@ -176,14 +172,16 @@ fn gam_lognormal_location_scale_aft_smooth_matches_survreg() {
         train_grid[[i, x_idx]] = x[i];
         train_grid[[i, z_idx]] = z[i];
     }
-    let loc_design = build_term_collection_design(train_grid.view(), &fit.fit.resolved_thresholdspec)
-        .expect("rebuild location (threshold) design at training points");
+    let loc_design =
+        build_term_collection_design(train_grid.view(), &fit.fit.resolved_thresholdspec)
+            .expect("rebuild location (threshold) design at training points");
     let gam_mu_train: Vec<f64> = loc_design.design.apply(&beta_location).to_vec();
     assert_eq!(gam_mu_train.len(), n);
 
     // Constant log-scale channel: sigma = exp(eta_ls) at any (x, z) (intercept-only).
-    let ls_design = build_term_collection_design(train_grid.view(), &fit.fit.resolved_log_sigmaspec)
-        .expect("rebuild log-sigma design at training points");
+    let ls_design =
+        build_term_collection_design(train_grid.view(), &fit.fit.resolved_log_sigmaspec)
+            .expect("rebuild log-sigma design at training points");
     let gam_eta_ls: Vec<f64> = ls_design.design.apply(&beta_log_sigma).to_vec();
     assert!(
         gam_eta_ls.iter().all(|&v| (v - gam_eta_ls[0]).abs() < 1e-9),

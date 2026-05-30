@@ -114,10 +114,7 @@ pub enum GuardConstraintFailure {
     /// `design.nrows() != offsets.len()`.
     RowOffsetMismatch { rows: usize, offsets: usize },
     /// The guard value is outside the family's admissible range.
-    GuardOutOfRange {
-        guard: f64,
-        range: &'static str,
-    },
+    GuardOutOfRange { guard: f64, range: &'static str },
     /// A derivative offset is non-finite at the given row.
     NonFiniteOffset { row: usize, offset: f64 },
     /// A derivative design entry is non-finite at the given cell.
@@ -273,10 +270,16 @@ mod tests {
         assert_eq!(ls.a.shape(), ms.a.shape());
         assert_eq!(ls.b.len(), ms.b.len());
         for (x, y) in ls.a.iter().zip(ms.a.iter()) {
-            assert_eq!(x, y, "constraint A entries must match exactly across policies");
+            assert_eq!(
+                x, y,
+                "constraint A entries must match exactly across policies"
+            );
         }
         for (x, y) in ls.b.iter().zip(ms.b.iter()) {
-            assert_eq!(x, y, "constraint b entries must match exactly across policies");
+            assert_eq!(
+                x, y,
+                "constraint b entries must match exactly across policies"
+            );
         }
 
         // Row normalization invariant: A β ≥ b with each row scaled by
@@ -325,9 +328,13 @@ mod tests {
         let design = dense(2, 0, &[]);
 
         // Offsets comfortably above the guard: feasible, no constraints.
-        let ok = build_time_derivative_guard_constraints(&design, &array![1.0, 2.0], 0.5, MS_POLICY)
-            .expect("feasible offsets must not error");
-        assert!(ok.is_none(), "coefficient-free feasible block emits no rows");
+        let ok =
+            build_time_derivative_guard_constraints(&design, &array![1.0, 2.0], 0.5, MS_POLICY)
+                .expect("feasible offsets must not error");
+        assert!(
+            ok.is_none(),
+            "coefficient-free feasible block emits no rows"
+        );
 
         // An offset below the guard by more than the slack: infeasible.
         match build_time_derivative_guard_constraints(&design, &array![1.0, 0.1], 0.5, MS_POLICY) {

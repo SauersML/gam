@@ -1092,11 +1092,11 @@ extern "C" __global__ void normal_kernel(
     /// kernel and the CPU oracle cannot disagree on a numeric literal because
     /// there is exactly one source for those literals.
     pub(super) fn ptx_source() -> String {
-        let mut src = String::with_capacity(
-            PTX_SOURCE_PRELUDE.len() + PTX_SOURCE_BODY.len() + 256,
-        );
+        let mut src = String::with_capacity(PTX_SOURCE_PRELUDE.len() + PTX_SOURCE_BODY.len() + 256);
         src.push_str(PTX_SOURCE_PRELUDE);
-        src.push_str("\n// ── Devroye PG(1, c) constants (rendered from Rust core) ──────────────\n");
+        src.push_str(
+            "\n// ── Devroye PG(1, c) constants (rendered from Rust core) ──────────────\n",
+        );
         src.push_str(&crate::inference::polya_gamma_core::render_cuda_constants());
         src.push_str(PTX_SOURCE_BODY);
         src

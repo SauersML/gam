@@ -69,8 +69,8 @@ fn eta_at_point(
 ) -> f64 {
     let mut grid = Array2::<f64>::zeros((1, n_headers));
     grid[[0, pred_idx]] = x;
-    let design = build_term_collection_design(grid.view(), spec)
-        .expect("rebuild design at held-out point");
+    let design =
+        build_term_collection_design(grid.view(), spec).expect("rebuild design at held-out point");
     design.design.apply(beta)[0]
 }
 
@@ -109,7 +109,10 @@ fn alo_eta_tilde_matches_exact_loo_binomial_logit() {
     let n_headers = ds.headers.len();
     let x: Vec<f64> = ds.values.column(pred_idx).to_vec();
     let n = x.len();
-    assert_eq!(n, 299, "heart failure dataset should have 299 rows, got {n}");
+    assert_eq!(
+        n, 299,
+        "heart failure dataset should have 299 rows, got {n}"
+    );
 
     // ---- full fit + ALO ----------------------------------------------------
     // The full-fit ALO reads everything it needs from `full_fit`; the resolved

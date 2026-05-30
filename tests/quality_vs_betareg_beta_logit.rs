@@ -83,11 +83,7 @@ fn gam_beta_logit_matches_betareg() {
     let headers = vec!["y".to_string(), "x1".to_string(), "x2".to_string()];
     let rows: Vec<csv::StringRecord> = (0..N)
         .map(|i| {
-            csv::StringRecord::from(vec![
-                y[i].to_string(),
-                x1[i].to_string(),
-                x2[i].to_string(),
-            ])
+            csv::StringRecord::from(vec![y[i].to_string(), x1[i].to_string(), x2[i].to_string()])
         })
         .collect();
     let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode beta dataset");
@@ -99,8 +95,7 @@ fn gam_beta_logit_matches_betareg() {
         family: Some("beta".to_string()),
         ..FitConfig::default()
     };
-    let result =
-        fit_from_formula("y ~ s(x1, k=4) + s(x2, k=3)", &ds, &cfg).expect("gam beta fit");
+    let result = fit_from_formula("y ~ s(x1, k=4) + s(x2, k=3)", &ds, &cfg).expect("gam beta fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for the beta family");
     };

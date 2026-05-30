@@ -169,9 +169,7 @@ pub(crate) fn validate_multinomial_simplex(
         for c in 0..k {
             let v = y[[row, c]];
             if !v.is_finite() {
-                crate::bail_invalid_estim!(
-                    "{context}: y[{row},{c}] must be finite (got {v})"
-                );
+                crate::bail_invalid_estim!("{context}: y[{row},{c}] must be finite (got {v})");
             }
             if v < 0.0 {
                 crate::bail_invalid_estim!(

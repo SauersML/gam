@@ -95,8 +95,8 @@ fn confidence_intervals_match_mgcv_under_logistic_link() {
     let records: Vec<csv::StringRecord> = (0..n)
         .map(|i| csv::StringRecord::from(vec![format!("{:.17e}", x[i]), format!("{:.17e}", y[i])]))
         .collect();
-    let ds = encode_recordswith_inferred_schema(headers, records)
-        .expect("encode synthetic dataset");
+    let ds =
+        encode_recordswith_inferred_schema(headers, records).expect("encode synthetic dataset");
     let col = ds.column_map();
     let x_idx = col["x"];
 
