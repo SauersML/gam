@@ -16,6 +16,11 @@ import numpy as np
 import torch
 
 from gamfit import _api as _np_api
+from gamfit._reml_common import (
+    RemlCallSpec,
+    run_point_design_backward,
+    run_point_design_forward,
+)
 
 from ._coerce import from_numpy_like, to_numpy_f64, to_numpy_uintp
 
@@ -125,8 +130,53 @@ def _wrap_optional(arr: Any, ref: torch.Tensor) -> torch.Tensor | None:
     return from_numpy_like(np.asarray(arr, dtype=np.float64), ref)
 
 
-def _copy_forward_state(out: dict[str, Any]) -> dict[str, Any]:
-    return {k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in out.items()}
+class _TorchRemlOps:
+    """PyTorch binding of the framework-agnostic REML bridge contract.
+
+    Implements :class:`gamfit._reml_common.RemlBridgeOps` so the shared
+    point-design forward/backward marshalling can move torch tensors through
+    the Rust engine without the bridge ever importing torch.
+    """
+
+    @staticmethod
+    def to_numpy_f64(value: Any) -> Any:
+        return to_numpy_f64(value)
+
+    @staticmethod
+    def to_numpy_uintp(value: Any) -> Any:
+        return to_numpy_uintp(value)
+
+    @staticmethod
+    def from_numpy_like(array: Any, ref: Any) -> Any:
+        return from_numpy_like(array, ref)
+
+    @staticmethod
+    def scalar_grad(grad: Any | None) -> float:
+        return _scalar_grad(grad)
+
+    @staticmethod
+    def vector_grad(grad: Any | None) -> Any | None:
+        return _batch_grad(grad)
+
+
+_TORCH_REML_OPS = _TorchRemlOps()
+
+# The single and ragged-batched point-design fits share a byte-for-byte
+# identical marshalling contract; only the ``row_offsets`` positional arg and
+# the scalar-vs-vector cotangent reduction differ. Both are expressed as
+# :class:`RemlCallSpec`s and driven through one shared engine.
+_SINGLE_SPEC = RemlCallSpec(
+    name="gaussian_reml_fit",
+    forward=_np_api.gaussian_reml_fit,
+    backward=_np_api.gaussian_reml_fit_backward,
+    batched=False,
+)
+_BATCHED_SPEC = RemlCallSpec(
+    name="gaussian_reml_fit_batched",
+    forward=_np_api.gaussian_reml_fit_batched,
+    backward=_np_api.gaussian_reml_fit_batched_backward,
+    batched=True,
+)
 
 
 def _save_diff_tensors(ctx: Any, *tensors: Any) -> None:
@@ -139,193 +189,99 @@ def _save_diff_tensors(ctx: Any, *tensors: Any) -> None:
 def _check_saved_versions(ctx: Any) -> None:
     """Touch ``ctx.saved_tensors`` so PyTorch raises if any saved input was
     modified in-place between forward and backward."""
-    _ = ctx.saved_tensors
+    ctx.saved_tensors  # noqa: B018 — version-check side effect, value discarded
 
 
-class _GaussianRemlFitFn(torch.autograd.Function):
-    """Autograd Function for the non-batched closed-form Gaussian REML fit."""
+class _PointDesignRemlFn(torch.autograd.Function):
+    """Autograd Function for a point-design closed-form Gaussian REML fit.
+
+    A single class drives both the non-batched and ragged-batched variants.
+    The variant is carried as the leading non-differentiable ``spec``
+    argument, so the forward and backward marshalling — coercion, forward-state
+    persistence, cotangent reduction, gradient routing — lives once in
+    :mod:`gamfit._reml_common`. ``row_offsets`` is ``None`` for the single
+    fit and the packed boundary vector for the batched fit; the positional
+    layout is shared so both variants route through one Function.
+    """
 
     @staticmethod
     def forward(
         ctx: Any,
+        spec: RemlCallSpec,
         x: torch.Tensor,
         y: torch.Tensor,
+        row_offsets: torch.Tensor | None,
         penalty: torch.Tensor,
         weights: torch.Tensor | None,
         by: torch.Tensor | None,
         init_lambda: float | None,
         by_start_col: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        x_np = to_numpy_f64(x)
-        y_np = to_numpy_f64(y)
-        penalty_np = to_numpy_f64(penalty)
-        weights_np = None if weights is None else to_numpy_f64(weights)
-        by_np = None if by is None else to_numpy_f64(by)
-
-        out = _np_api.gaussian_reml_fit(
-            x_np,
-            y_np,
-            penalty_np,
-            weights=weights_np,
+        run = run_point_design_forward(
+            spec,
+            _TORCH_REML_OPS,
+            x=x,
+            y=y,
+            penalty=penalty,
+            row_offsets=row_offsets,
+            weights=weights,
+            by=by,
             init_lambda=init_lambda,
-            by=by_np,
             by_start_col=by_start_col,
+            ref=x,
         )
 
         # Save the differentiable input tensors so PyTorch can version-check
         # them and raise on any in-place mutation between forward and backward.
-        # Keep the numpy aliases on ctx for performance — they are only read in
-        # backward, which is gated by the version check.
+        # Keep the numpy aliases (in ``run.arrays``) on ctx for performance —
+        # they are only read in backward, which is gated by the version check.
         _save_diff_tensors(ctx, x, y, penalty, weights, by)
-        ctx.x_np = x_np
-        ctx.y_np = y_np
-        ctx.penalty_np = penalty_np
-        ctx.weights_np = weights_np
-        ctx.by_np = by_np
+        ctx.spec = spec
+        ctx.arrays = run.arrays
+        ctx.forward_state = run.forward_state
         ctx.init_lambda = init_lambda
         ctx.by_start_col = by_start_col
-        ctx.forward_state = _copy_forward_state(out)
         ctx.has_weights = weights is not None
         ctx.has_by = by is not None
         ctx.ref = x
         ctx.penalty_ref = penalty
 
-        coefficients = from_numpy_like(out["coefficients"], x)
-        fitted = from_numpy_like(out["fitted"], x)
-        lam = from_numpy_like(out["lambda"], x)
-        reml_score = from_numpy_like(out["reml_score"], x)
-        edf = from_numpy_like(out["edf"], x)
+        coefficients, fitted, lam, reml_score, edf = run.outputs
         return coefficients, fitted, lam, reml_score, edf
 
     @staticmethod
     def backward(ctx: Any, *grad_outputs: Any) -> tuple[Any, ...]:
-        grad_coefficients, grad_fitted, grad_lam, grad_reml_score, grad_edf = grad_outputs
         _check_saved_versions(ctx)
-        grad_coef_np = None if grad_coefficients is None else to_numpy_f64(grad_coefficients)
-        grad_fitted_np = None if grad_fitted is None else to_numpy_f64(grad_fitted)
-        grad_lambda_scalar = _scalar_grad(grad_lam)
-        grad_reml_scalar = _scalar_grad(grad_reml_score)
-        grad_edf_scalar = _scalar_grad(grad_edf)
-
-        result = _np_api.gaussian_reml_fit_backward(
-            ctx.x_np,
-            ctx.y_np,
-            ctx.penalty_np,
-            grad_lambda=grad_lambda_scalar,
-            grad_coefficients=grad_coef_np,
-            grad_fitted=grad_fitted_np,
-            grad_reml_score=grad_reml_scalar,
-            grad_edf=grad_edf_scalar,
+        grads = run_point_design_backward(
+            ctx.spec,
+            _TORCH_REML_OPS,
+            arrays=ctx.arrays,
             forward_state=ctx.forward_state,
-            weights=ctx.weights_np,
+            grad_outputs=cast(
+                tuple[Any, Any, Any, Any, Any], grad_outputs
+            ),
             init_lambda=ctx.init_lambda,
-            by=ctx.by_np,
             by_start_col=ctx.by_start_col,
+            has_weights=ctx.has_weights,
+            has_by=ctx.has_by,
+            ref=ctx.ref,
+            penalty_ref=ctx.penalty_ref,
         )
-
-        ref = ctx.ref
-        grad_x = _wrap_optional(result.get("grad_x"), ref)
-        grad_y = _wrap_optional(result.get("grad_y"), ref)
-        grad_penalty = _wrap_optional(result.get("grad_penalty"), ctx.penalty_ref)
-        grad_weights = _wrap_optional(result.get("grad_weights"), ref) if ctx.has_weights else None
-        grad_by = _wrap_optional(result.get("grad_by"), ref) if ctx.has_by else None
-        # Order matches forward(...) positional args: x, y, penalty, weights, by,
-        # init_lambda, by_start_col.
-        return grad_x, grad_y, grad_penalty, grad_weights, grad_by, None, None
-
-
-class _GaussianRemlFitBatchedFn(torch.autograd.Function):
-    """Autograd Function for the ragged batched closed-form Gaussian REML fit."""
-
-    @staticmethod
-    def forward(
-        ctx: Any,
-        x: torch.Tensor,
-        y: torch.Tensor,
-        row_offsets: torch.Tensor,
-        penalty: torch.Tensor,
-        weights: torch.Tensor | None,
-        by: torch.Tensor | None,
-        init_lambda: float | None,
-        by_start_col: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        x_np = to_numpy_f64(x)
-        y_np = to_numpy_f64(y)
-        offsets_np = to_numpy_uintp(row_offsets)
-        penalty_np = to_numpy_f64(penalty)
-        weights_np = None if weights is None else to_numpy_f64(weights)
-        by_np = None if by is None else to_numpy_f64(by)
-
-        out = _np_api.gaussian_reml_fit_batched(
-            x_np,
-            y_np,
-            offsets_np,
-            penalty_np,
-            weights=weights_np,
-            init_lambda=init_lambda,
-            by=by_np,
-            by_start_col=by_start_col,
+        # Order matches forward(...) positional args:
+        #   spec, x, y, row_offsets, penalty, weights, by, init_lambda,
+        #   by_start_col. ``spec``, ``row_offsets``, ``init_lambda`` and
+        #   ``by_start_col`` are non-differentiable.
+        return (
+            None,
+            grads["grad_x"],
+            grads["grad_y"],
+            None,
+            grads["grad_penalty"],
+            grads["grad_weights"],
+            grads["grad_by"],
+            None,
+            None,
         )
-
-        _save_diff_tensors(ctx, x, y, penalty, weights, by)
-        ctx.x_np = x_np
-        ctx.y_np = y_np
-        ctx.offsets_np = offsets_np
-        ctx.penalty_np = penalty_np
-        ctx.weights_np = weights_np
-        ctx.by_np = by_np
-        ctx.init_lambda = init_lambda
-        ctx.by_start_col = by_start_col
-        ctx.forward_state = _copy_forward_state(out)
-        ctx.has_weights = weights is not None
-        ctx.has_by = by is not None
-        ctx.ref = x
-        ctx.penalty_ref = penalty
-
-        coefficients = from_numpy_like(out["coefficients"], x)
-        fitted = from_numpy_like(out["fitted"], x)
-        lam = from_numpy_like(out["lambda"], x)
-        reml_score = from_numpy_like(out["reml_score"], x)
-        edf = from_numpy_like(out["edf"], x)
-        return coefficients, fitted, lam, reml_score, edf
-
-    @staticmethod
-    def backward(ctx: Any, *grad_outputs: Any) -> tuple[Any, ...]:
-        grad_coefficients, grad_fitted, grad_lam, grad_reml_score, grad_edf = grad_outputs
-        _check_saved_versions(ctx)
-        grad_coef_np = None if grad_coefficients is None else to_numpy_f64(grad_coefficients)
-        grad_fitted_np = None if grad_fitted is None else to_numpy_f64(grad_fitted)
-        grad_lambda_vec = _batch_grad(grad_lam)
-        grad_reml_vec = _batch_grad(grad_reml_score)
-        grad_edf_vec = _batch_grad(grad_edf)
-
-        result = _np_api.gaussian_reml_fit_batched_backward(
-            ctx.x_np,
-            ctx.y_np,
-            ctx.offsets_np,
-            ctx.penalty_np,
-            grad_lambda=grad_lambda_vec,
-            grad_coefficients=grad_coef_np,
-            grad_fitted=grad_fitted_np,
-            grad_reml_score=grad_reml_vec,
-            grad_edf=grad_edf_vec,
-            forward_state=ctx.forward_state,
-            weights=ctx.weights_np,
-            init_lambda=ctx.init_lambda,
-            by=ctx.by_np,
-            by_start_col=ctx.by_start_col,
-        )
-
-        ref = ctx.ref
-        grad_x = _wrap_optional(result.get("grad_x"), ref)
-        grad_y = _wrap_optional(result.get("grad_y"), ref)
-        grad_penalty = _wrap_optional(result.get("grad_penalty"), ctx.penalty_ref)
-        grad_weights = _wrap_optional(result.get("grad_weights"), ref) if ctx.has_weights else None
-        grad_by = _wrap_optional(result.get("grad_by"), ref) if ctx.has_by else None
-        # Order matches forward(...) positional args: x, y, row_offsets, penalty,
-        # weights, by, init_lambda, by_start_col.
-        return grad_x, grad_y, None, grad_penalty, grad_weights, grad_by, None, None
-
 
 
 def gaussian_reml_fit(
@@ -376,9 +332,9 @@ def gaussian_reml_fit(
         Tuple of ``(coefficients, fitted, lam, reml_score, edf)`` as torch
         tensors sharing ``x``'s device and dtype.
     """
-    apply = cast(Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]], _GaussianRemlFitFn.apply)
+    apply = cast(Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]], _PointDesignRemlFn.apply)
     coefficients, fitted, lam, reml_score, edf = apply(
-        x, y, penalty, weights, by, init_lambda, by_start_col
+        _SINGLE_SPEC, x, y, None, penalty, weights, by, init_lambda, by_start_col
     )
     return GaussianRemlOutput(coefficients, fitted, lam, reml_score, edf)
 
@@ -419,9 +375,9 @@ def gaussian_reml_fit_batched(
         ``lam`` and ``reml_score`` are length-``K`` tensors; ``coefficients``
         and ``fitted`` follow the engine's packed layout.
     """
-    apply = cast(Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]], _GaussianRemlFitBatchedFn.apply)
+    apply = cast(Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]], _PointDesignRemlFn.apply)
     coefficients, fitted, lam, reml_score, edf = apply(
-        x, y, row_offsets, penalty, weights, by, init_lambda, by_start_col
+        _BATCHED_SPEC, x, y, row_offsets, penalty, weights, by, init_lambda, by_start_col
     )
     return GaussianRemlOutput(coefficients, fitted, lam, reml_score, edf)
 

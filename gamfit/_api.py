@@ -18,6 +18,7 @@ from ._cuda import cuda_subprocess_library_dirs as _cuda_subprocess_library_dirs
 from ._cuda import format_cuda_diagnostics as _format_cuda_diagnostics
 from ._exceptions import map_exception
 from ._model import Model
+from ._reml_common import check_forward_state
 from ._response_geometry import ResponseGeometryModel, fit_response_geometry
 from ._tables import normalize_table
 from ._validation import FormulaValidation
@@ -2166,6 +2167,8 @@ def gaussian_reml_fit_backward(
     """Run the analytic VJP for ``gaussian_reml_fit`` outputs."""
     import numpy as np
 
+    if forward_state is not None:
+        check_forward_state(forward_state, name="gaussian_reml_fit_backward")
     try:
         out = rust_module().gaussian_reml_fit_backward(
             _numeric_matrix(x, "x"),
@@ -2243,6 +2246,8 @@ def gaussian_reml_fit_batched_backward(
     """Run packed ragged analytic VJPs for ``gaussian_reml_fit_batched``."""
     import numpy as np
 
+    if forward_state is not None:
+        check_forward_state(forward_state, name="gaussian_reml_fit_batched_backward")
     offsets = _index_vector(row_offsets, "row_offsets")
     batch = int(offsets.size - 1)
     try:

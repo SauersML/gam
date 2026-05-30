@@ -3283,6 +3283,107 @@ mod tests {
         }
     }
 
+    /// Independent finite-difference correctness lock on the oracle's probit
+    /// Mills layer — the most optimizer-sensitive, drift-prone term in the
+    /// whole row kernel (issue #415: "third/fourth-order derivative
+    /// contractions drift silently … formulas are complex and
+    /// optimizer-sensitive"). The device kernel's `bms_flex_row_kernel` and
+    /// the host oracle's `cpu_oracle_outputs` both close out with the same
+    /// Mills algebra:
+    ///
+    /// ```text
+    ///     m       = s · e_obs ;  s = 2y − 1
+    ///     A       = −w · s · λ(m)
+    ///     B       =  w · λ(m) · (m + λ(m))
+    ///     neglog  = −w · log Φ(s · e_obs)
+    ///     g_u     = A · bar_e_u
+    ///     H_uv    = B · bar_e_u · bar_e_v + A · bar_e_uv
+    /// ```
+    ///
+    /// Holding the observed jets `bar_e` fixed, the row neglog is a function
+    /// of the single scalar `e := bar_e_u[0] = e_obs`, and by the assembled
+    /// formula `∂neglog/∂e = A` and `∂²neglog/∂e² = B`. This test reconstructs
+    /// `A`, `B`, and `neglog` exactly as the oracle does (same
+    /// `oracle_log_ndtr_and_mills`, same sign convention), then verifies the
+    /// analytic `A`/`B` against high-order central differences of
+    /// `e ↦ −w · log Φ(s·e)`. A drift in the kernel's Mills derivatives —
+    /// which the device-parity test cannot catch because it checks the kernel
+    /// *against the same (possibly-wrong) oracle* — fails here on every host,
+    /// CUDA or not. Bounds are the genuine fifth-order central-difference
+    /// truncation floor; they are not weakened to pass.
+    #[test]
+    fn cpu_oracle_mills_layer_matches_finite_differences() {
+        // Probit neglog as the oracle assembles it, as a function of the
+        // observed scalar predictor `e` with weight `w` and label `y`.
+        let neglog_of = |e: f64, y: f64, w: f64| -> f64 {
+            let s = 2.0 * y - 1.0;
+            let (log_cdf, _) = oracle_log_ndtr_and_mills(s * e);
+            -w * log_cdf
+        };
+        // Analytic first/second derivatives wrt `e` — the exact `A`/`B` the
+        // kernel writes into `grad`/`hess`.
+        let ab_of = |e: f64, y: f64, w: f64| -> (f64, f64) {
+            let s = 2.0 * y - 1.0;
+            let m_arg = s * e;
+            let (_, lambda) = oracle_log_ndtr_and_mills(m_arg);
+            let a_i = -w * s * lambda;
+            let b_i = w * lambda * (m_arg + lambda);
+            (a_i, b_i)
+        };
+
+        // Sweep both labels (s = ±1), both tails of the predictor, and a
+        // non-unit weight so every sign/scale path of the Mills algebra is
+        // exercised. Points stay clear of the deep-tail asymptote where a
+        // central-difference reference loses its own accuracy.
+        let cases: [(f64, f64, f64); 12] = [
+            (-1.6, 1.0, 1.0),
+            (-0.7, 1.0, 1.0),
+            (0.0, 1.0, 1.0),
+            (0.9, 1.0, 1.0),
+            (1.8, 1.0, 1.0),
+            (-1.4, 0.0, 1.0),
+            (-0.3, 0.0, 1.0),
+            (0.0, 0.0, 1.0),
+            (0.6, 0.0, 1.0),
+            (1.5, 0.0, 1.0),
+            (0.4, 1.0, 0.75),
+            (-0.8, 0.0, 1.3),
+        ];
+        // Fifth-order central stencils; `h` chosen near the f64 sweet spot for
+        // first/second derivatives of a smooth O(1) function.
+        let h = 1e-3_f64;
+        for (e, y, w) in cases {
+            let (a_ana, b_ana) = ab_of(e, y, w);
+
+            let fp2 = neglog_of(e + 2.0 * h, y, w);
+            let fp1 = neglog_of(e + h, y, w);
+            let f0 = neglog_of(e, y, w);
+            let fm1 = neglog_of(e - h, y, w);
+            let fm2 = neglog_of(e - 2.0 * h, y, w);
+
+            // 5-point central first derivative: O(h⁴).
+            let d1_fd = (-fp2 + 8.0 * fp1 - 8.0 * fm1 + fm2) / (12.0 * h);
+            // 5-point central second derivative: O(h⁴).
+            let d2_fd = (-fp2 + 16.0 * fp1 - 30.0 * f0 + 16.0 * fm1 - fm2) / (12.0 * h * h);
+
+            let a_abs = (a_ana - d1_fd).abs();
+            let a_rel = a_abs / a_ana.abs().max(1.0);
+            assert!(
+                a_abs <= 5e-8 || a_rel <= 5e-8,
+                "Mills A (∂neglog/∂e) drift at e={e} y={y} w={w}: \
+                 analytic={a_ana:.17e} fd={d1_fd:.17e} abs={a_abs:.3e} rel={a_rel:.3e}"
+            );
+
+            let b_abs = (b_ana - d2_fd).abs();
+            let b_rel = b_abs / b_ana.abs().max(1.0);
+            assert!(
+                b_abs <= 5e-6 || b_rel <= 5e-6,
+                "Mills B (∂²neglog/∂e²) drift at e={e} y={y} w={w}: \
+                 analytic={b_ana:.17e} fd={d2_fd:.17e} abs={b_abs:.3e} rel={b_rel:.3e}"
+            );
+        }
+    }
+
     /// CPU↔GPU parity. Only runs end-to-end on a Linux host with a CUDA
     /// runtime; skips with a clear `eprintln!` on every other host so the
     /// always-on test suite stays green on the macOS dev box and CPU CI.

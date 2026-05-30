@@ -4314,14 +4314,13 @@ fn gaussian_reml_score<'py>(
     // input-validation errors are wrapped into `EstimationError::InvalidInput`
     // so the closure's error type stays uniform.
     let score = detach_estimation_result(py, "gaussian_reml_score", move || {
-        let gated_x;
-        let fit_x = if let Some(by_arr) = by_values.as_ref() {
-            gated_x = apply_by_gate(x_values.view(), by_arr.view(), by_start_col)
-                .map_err(EstimationError::InvalidInput)?;
-            gated_x.view()
-        } else {
-            x_values.view()
-        };
+        let gated_x = gate_design_for_forward(
+            x_values.view(),
+            by_values.as_ref().map(|b| b.view()),
+            by_start_col,
+        )
+        .map_err(EstimationError::InvalidInput)?;
+        let fit_x = gated_x.as_ref().map_or(x_values.view(), |g| g.view());
         gaussian_reml_free_b_score(
             fit_x,
             y_values.view(),
@@ -5185,13 +5184,9 @@ fn gaussian_reml_fit<'py>(
     let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
     let by_values = by.as_ref().map(|b| b.as_array().to_owned());
     let result = detach_py_result(py, "gaussian_reml_fit", move || {
-        let gated_x;
-        let fit_x = if let Some(by_arr) = by_values.as_ref() {
-            gated_x = apply_by_gate(x_values.view(), by_arr.view(), by_start_col)?;
-            gated_x.view()
-        } else {
-            x_values.view()
-        };
+        let gated_x =
+            gate_design_for_forward(x_values.view(), by_values.as_ref().map(|b| b.view()), by_start_col)?;
+        let fit_x = gated_x.as_ref().map_or(x_values.view(), |g| g.view());
         match gaussian_reml_multi_closed_form_with_cache(
             fit_x,
             y_values.view(),
@@ -5261,14 +5256,13 @@ fn gaussian_reml_fit_backward<'py>(
         .map_err(py_value_error)?;
     let (grad_x, grad_by, grad_y, grad_penalty, grad_weights) =
         detach_estimation_result(py, "gaussian_reml_fit_backward", move || {
-            let gated_x;
-            let fit_x = if let Some(by_arr) = by_values.as_ref() {
-                gated_x = apply_by_gate(x_values.view(), by_arr.view(), by_start_col)
-                    .map_err(EstimationError::InvalidInput)?;
-                gated_x.view()
-            } else {
-                x_values.view()
-            };
+            let gated_x = gate_design_for_forward(
+                x_values.view(),
+                by_values.as_ref().map(|b| b.view()),
+                by_start_col,
+            )
+            .map_err(EstimationError::InvalidInput)?;
+            let fit_x = gated_x.as_ref().map_or(x_values.view(), |g| g.view());
             let backward = if let Some(fit) = forward_fit.as_ref() {
                 gaussian_reml_multi_closed_form_backward_from_fit(
                     fit_x,
@@ -5296,19 +5290,13 @@ fn gaussian_reml_fit_backward<'py>(
                     grad_edf,
                 )
             }?;
-            let grad_x_raw = backward.grad_x;
-            let (grad_x, grad_by) = if let Some(by_arr) = by_values.as_ref() {
-                let (grad_x, grad_by) = apply_by_gate_backward(
-                    x_values.view(),
-                    by_arr.view(),
-                    by_start_col,
-                    grad_x_raw.view(),
-                )
-                .map_err(EstimationError::InvalidInput)?;
-                (grad_x, Some(grad_by))
-            } else {
-                (grad_x_raw, None)
-            };
+            let (grad_x, grad_by) = ungate_design_gradient(
+                x_values.view(),
+                by_values.as_ref().map(|b| b.view()),
+                by_start_col,
+                backward.grad_x,
+            )
+            .map_err(EstimationError::InvalidInput)?;
             Ok((
                 grad_x,
                 grad_by,
@@ -6921,13 +6909,9 @@ fn gaussian_reml_fit_batched<'py>(
     let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
     let by_values = by.as_ref().map(|b| b.as_array().to_owned());
     let result = detach_py_result(py, "gaussian_reml_fit_batched", move || {
-        let gated_x;
-        let fit_x = if let Some(by_arr) = by_values.as_ref() {
-            gated_x = apply_by_gate(x_values.view(), by_arr.view(), by_start_col)?;
-            gated_x.view()
-        } else {
-            x_values.view()
-        };
+        let gated_x =
+            gate_design_for_forward(x_values.view(), by_values.as_ref().map(|b| b.view()), by_start_col)?;
+        let fit_x = gated_x.as_ref().map_or(x_values.view(), |g| g.view());
         gaussian_reml_fit_batched_impl(
             fit_x,
             y_values.view(),
@@ -7051,13 +7035,12 @@ fn gaussian_reml_fit_batched_backward<'py>(
     let by_values = by.as_ref().map(|b| b.as_array().to_owned());
     let (statuses, grad_x, grad_by, grad_y, grad_penalty, grad_weights) =
         detach_py_result(py, "gaussian_reml_fit_batched_backward", move || {
-            let gated_x;
-            let fit_x = if let Some(by_arr) = by_values.as_ref() {
-                gated_x = apply_by_gate(x_values.view(), by_arr.view(), by_start_col)?;
-                gated_x.view()
-            } else {
-                x_values.view()
-            };
+            let gated_x = gate_design_for_forward(
+                x_values.view(),
+                by_values.as_ref().map(|b| b.view()),
+                by_start_col,
+            )?;
+            let fit_x = gated_x.as_ref().map_or(x_values.view(), |g| g.view());
             let backward = gaussian_reml_fit_batched_backward_impl(
                 fit_x,
                 y_values.view(),
@@ -7072,18 +7055,12 @@ fn gaussian_reml_fit_batched_backward<'py>(
                 grad_edf_values.as_ref().map(|g| g.view()),
                 forward_fits.as_deref(),
             )?;
-            let grad_x_raw = backward.grad_x;
-            let (grad_x, grad_by) = if let Some(by_arr) = by_values.as_ref() {
-                let (grad_x, grad_by) = apply_by_gate_backward(
-                    x_values.view(),
-                    by_arr.view(),
-                    by_start_col,
-                    grad_x_raw.view(),
-                )?;
-                (grad_x, Some(grad_by))
-            } else {
-                (grad_x_raw, None)
-            };
+            let (grad_x, grad_by) = ungate_design_gradient(
+                x_values.view(),
+                by_values.as_ref().map(|b| b.view()),
+                by_start_col,
+                backward.grad_x,
+            )?;
             Ok((
                 backward.statuses,
                 grad_x,
@@ -7155,13 +7132,9 @@ fn gaussian_reml_fit_positions<'py>(
             periodic,
             period,
         )?;
-        let gated_x;
-        let fit_x = if let Some(by_arr) = by_values.as_ref() {
-            gated_x = apply_by_gate(x.view(), by_arr.view(), by_start_col)?;
-            gated_x.view()
-        } else {
-            x.view()
-        };
+        let gated_x =
+            gate_design_for_forward(x.view(), by_values.as_ref().map(|b| b.view()), by_start_col)?;
+        let fit_x = gated_x.as_ref().map_or(x.view(), |g| g.view());
         match gaussian_reml_multi_closed_form_with_cache(
             fit_x,
             y_values.view(),
@@ -14347,13 +14320,8 @@ fn gaussian_reml_fit_positions_backward_impl(
         periodic,
         period,
     )?;
-    let gated_x;
-    let fit_x = if let Some(by_values) = by {
-        gated_x = apply_by_gate(x.view(), by_values, by_start_col)?;
-        gated_x.view()
-    } else {
-        x.view()
-    };
+    let gated_x = gate_design_for_forward(x.view(), by, by_start_col)?;
+    let fit_x = gated_x.as_ref().map_or(x.view(), |g| g.view());
     let backward = if let Some(fit) = forward_fit {
         gaussian_reml_multi_closed_form_backward_from_fit(
             fit_x,
@@ -14382,13 +14350,7 @@ fn gaussian_reml_fit_positions_backward_impl(
         )
     }
     .map_err(|err| err.to_string())?;
-    let (grad_x, grad_by) = if let Some(by_values) = by {
-        let (grad_x, grad_by) =
-            apply_by_gate_backward(x.view(), by_values, by_start_col, backward.grad_x.view())?;
-        (grad_x, Some(grad_by))
-    } else {
-        (backward.grad_x, None)
-    };
+    let (grad_x, grad_by) = ungate_design_gradient(x.view(), by, by_start_col, backward.grad_x)?;
     let grad_t = contract_position_gradient(grad_x.view(), basis_derivative.view())?;
     Ok(PositionGaussianRemlBackwardResult {
         grad_t,
@@ -14878,13 +14840,8 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
                 ));
             }
             let by_slice = by.as_ref().map(|values| values.slice(s![start..end]));
-            let gated_x;
-            let x_slice = if let Some(by_values) = by_slice {
-                gated_x = apply_by_gate(x_base.view(), by_values, by_start_col)?;
-                gated_x.view()
-            } else {
-                x_base.view()
-            };
+            let gated_x = gate_design_for_forward(x_base.view(), by_slice, by_start_col)?;
+            let x_slice = gated_x.as_ref().map_or(x_base.view(), |g| g.view());
             let y_slice = y.slice(s![start..end, ..]);
             let backward_result = if let Some(fits) = forward_fits {
                 match fits[b].as_ref() {
@@ -14918,17 +14875,8 @@ fn gaussian_reml_fit_positions_batched_backward_impl(
             };
             match backward_result {
                 Ok(backward) => {
-                    let (grad_x, grad_by) = if let Some(by_values) = by_slice {
-                        let (grad_x, grad_by) = apply_by_gate_backward(
-                            x_base.view(),
-                            by_values,
-                            by_start_col,
-                            backward.grad_x.view(),
-                        )?;
-                        (grad_x, Some(grad_by))
-                    } else {
-                        (backward.grad_x, None)
-                    };
+                    let (grad_x, grad_by) =
+                        ungate_design_gradient(x_base.view(), by_slice, by_start_col, backward.grad_x)?;
                     let grad_t = contract_position_gradient(grad_x.view(), basis_derivative.view())?;
                     Ok((
                         b,
@@ -15243,6 +15191,51 @@ fn apply_by_gate_backward(
         }
     }
     Ok((grad_x, grad_by))
+}
+
+/// Materialize the `by`-gated design for a forward solve, if a gate is present.
+///
+/// Returns `None` when there is no gate so the caller fits against the raw
+/// `x` view directly; returns `Some(gated)` otherwise. Centralizing this here
+/// keeps every Gaussian REML forward `#[pyfunction]` from re-implementing the
+/// `let gated; let fit_x = if let Some(by) = ... else x.view()` lifetime
+/// dance. The owned array is held by the caller so the fit view borrows from
+/// a binding that outlives the solve. The error type is `String`; the typed
+/// (`EstimationError`) call sites wrap it with `EstimationError::InvalidInput`.
+fn gate_design_for_forward(
+    x: ArrayView2<'_, f64>,
+    by: Option<ArrayView1<'_, f64>>,
+    by_start_col: usize,
+) -> Result<Option<Array2<f64>>, String> {
+    match by {
+        Some(by_arr) => Ok(Some(apply_by_gate(x, by_arr, by_start_col)?)),
+        None => Ok(None),
+    }
+}
+
+/// Route a raw design-gradient back through the `by` gate, if one was applied.
+///
+/// `grad_x_raw` is the gradient w.r.t. the (possibly gated) design that went
+/// into the solver. With no gate this is already the gradient w.r.t. the raw
+/// design and `grad_by` is absent; with a gate this splits the cotangent into
+/// `(grad_x, grad_by)` via the gate's analytic backward. Collapses the
+/// repeated `(grad_x, grad_by)` reconstruction across every Gaussian REML
+/// backward `#[pyfunction]`. The error type is `String`; typed call sites
+/// wrap it with `EstimationError::InvalidInput`.
+fn ungate_design_gradient(
+    x: ArrayView2<'_, f64>,
+    by: Option<ArrayView1<'_, f64>>,
+    by_start_col: usize,
+    grad_x_raw: Array2<f64>,
+) -> Result<(Array2<f64>, Option<Array1<f64>>), String> {
+    match by {
+        Some(by_arr) => {
+            let (grad_x, grad_by) =
+                apply_by_gate_backward(x, by_arr, by_start_col, grad_x_raw.view())?;
+            Ok((grad_x, Some(grad_by)))
+        }
+        None => Ok((grad_x_raw, None)),
+    }
 }
 
 #[pyfunction]
