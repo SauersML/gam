@@ -76,7 +76,7 @@ fn frechet_mean_matches_compositions_and_scipy() {
 
     // ---- gam: unweighted and weighted Fréchet means ------------------------
     let gam_unweighted = simplex_frechet_mean(points.view(), None).expect("gam unweighted mean");
-    let w_view = ArrayView1::from(&weights);
+    let w_view = ArrayView1::from(weights.as_slice());
     let gam_weighted =
         simplex_frechet_mean(points.view(), Some(w_view)).expect("gam weighted mean");
 
@@ -103,7 +103,8 @@ fn frechet_mean_matches_compositions_and_scipy() {
     // path; this is the defining invariance of the weighted barycenter.
     let uniform = vec![1.0_f64 / N as f64; N];
     let gam_uniform =
-        simplex_frechet_mean(points.view(), Some(ArrayView1::from(&uniform))).expect("uniform");
+        simplex_frechet_mean(points.view(), Some(ArrayView1::from(uniform.as_slice())))
+            .expect("uniform");
     let uniform_rel = relative_l2(&gam_uniform, &gam_unweighted);
     eprintln!("simplex Fréchet: unweighted-vs-uniform rel_l2={uniform_rel:.3e}");
     assert!(

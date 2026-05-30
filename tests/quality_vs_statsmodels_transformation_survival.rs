@@ -19,16 +19,27 @@
 //! survival CDF), so it is the right quantity to benchmark.
 //!
 //! gam parameterizes the same model on the log-cumulative-hazard / Royston-
-//! Parmar net scale with a parametric Weibull baseline:
+//! Parmar net scale. For `survival_likelihood="weibull"` the time axis is a
+//! *linear* basis on `log t` (columns `[1, log t]`, anchor-centered at the
+//! engine's time anchor), so the fitted log-cumulative-hazard is
 //!
-//!     S(t|x) = exp( -(t/lambda)^p * exp(gamma . x) ),
+//!     log Λ(t|x) = β_cov · c(x)  +  Σ_k (b_k(t) − b_k(anchor)) · β_time_k,
+//!     S(t|x)     = exp( −exp( log Λ(t|x) ) ),
 //!
-//! where `lambda` (scale) and `p` (shape) are recovered into `baseline_cfg` and
-//! `gamma` is the covariate-block log-hazard-ratio vector (the tail of `beta`).
-//! The Weibull is simultaneously PH and AFT, so the two parameterizations
-//! describe the *same* `S(t|x)` surface: `mu = log lambda`, `b_j = -gamma_j/p`.
-//! We compare the survival surfaces directly, so the parameterization map
-//! cancels and any real divergence in gam's prediction pathway is exposed.
+//! where `β = [β_time (2 cols) | β_cov]`, `b(t) = [1, log t]`, and `c(x)` is the
+//! frozen covariate design (no covariate intercept — the baseline level lives in
+//! the time block). We reconstruct `S(t|x)` from the *actual fitted `β`* exactly
+//! as `survival_predict` assembles the exit predictor (`x_exit · β + offset`,
+//! offset = 0 for the Weibull-linear path: the derivative guard is 0 and the
+//! parametric target is folded into the linear time block), NOT from a
+//! `(t/scale)^shape` parametric shortcut. The Weibull baseline is linear in
+//! `log t`, so this is the same `S(t|x)` surface scipy's AFT describes: the
+//! AFT↔PH map `p = 1/sigma`, `β_time slope = p`, `intercept ↔ −p·mu` cancels in
+//! the surface, and any real divergence in gam's β → design → survival pathway
+//! is exposed. We do NOT lean on `baseline_cfg.scale`: with the anchor-centered
+//! linear basis the level-column is identically zero, so the recovered `scale`
+//! is a seed artifact — only the surface (and the shape slope `β_time[1]`) is a
+//! faithful witness of the fitted model.
 //!
 //! Bound. Both engines fit the same parametric likelihood on the same data, so
 //! the predicted `S(t|x)` surface is *deterministic* up to optimizer tolerance;
@@ -39,7 +50,10 @@
 //! divergence in the design / baseline / covariate-effect pathway. We never
 //! weaken them and never edit gam to pass.
 
-use gam::families::survival_construction::SurvivalBaselineTarget;
+use gam::families::survival_construction::{
+    SurvivalBaselineTarget, SurvivalTimeBasisConfig, evaluate_survival_time_basis_row,
+    resolved_survival_time_basis_config_from_build,
+};
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, relative_l2, run_python};
@@ -168,24 +182,56 @@ fn gam_transformation_survival_prediction_grid_matches_scipy() {
         SurvivalBaselineTarget::Weibull,
         "gam must report a fitted Weibull baseline"
     );
-    let lambda = fit.baseline_cfg.scale.expect("fitted Weibull scale lambda");
-    let p = fit.baseline_cfg.shape.expect("fitted Weibull shape p");
-    assert!(
-        lambda.is_finite() && lambda > 0.0 && p.is_finite() && p > 0.0,
-        "fitted Weibull (scale={lambda}, shape={p}) must be positive and finite"
-    );
 
+    // beta = [β_time | β_cov]; the linear Weibull time block is a strict prefix
+    // of length `time_base_ncols` (2 columns: [1, log t]).
     let beta = &fit.fit.beta;
-    // beta = [time-basis cols (2 for the linear Weibull basis), covariate cols].
-    // The covariate block is the tail; build the covariate design at the grid
-    // to extract gamma . x robustly (no assumption about x1/x2 column order).
-    let n_cov = beta.len() - 2;
+    let p_time = fit.time_base_ncols;
+    assert_eq!(
+        p_time, 2,
+        "the linear Weibull time basis must be 2 columns [1, log t]; got {p_time}"
+    );
+    assert!(
+        p_time < beta.len(),
+        "RP time block should be a strict prefix of beta: p_time={p_time}, p={}",
+        beta.len()
+    );
+    let beta_time: Array1<f64> = beta.slice(ndarray::s![..p_time]).to_owned();
+    let gamma: Array1<f64> = beta.slice(ndarray::s![p_time..]).to_owned();
+    let n_cov = gamma.len();
     assert_eq!(
         n_cov, 2,
         "expected 2 covariate coefficients (x1, x2) after the 2-col Weibull time basis; beta.len()={}",
         beta.len()
     );
-    let gamma: Array1<f64> = beta.slice(ndarray::s![2..]).to_owned();
+    // The shape `p` of a Weibull RP baseline is the slope of log Λ_0 in log t,
+    // i.e. β_time[1] (the coefficient on the `log t` column). It must be a
+    // positive, finite Weibull exponent. We do NOT use `baseline_cfg.scale`:
+    // the anchor-centered linear basis zeros the level column, so the recovered
+    // scale is a seed artifact, not a witness of the fit.
+    let p = beta_time[1];
+    assert!(
+        p.is_finite() && p > 0.0,
+        "fitted Weibull shape (β_time[1]={p}) must be a positive, finite exponent"
+    );
+
+    // Resolved (frozen) time-basis config + anchor row, mirroring the engine's
+    // anchor-centered linear rows on log(t).
+    let time_cfg: SurvivalTimeBasisConfig = resolved_survival_time_basis_config_from_build(
+        &fit.time_basis.basisname,
+        fit.time_basis.degree,
+        fit.time_basis.knots.as_ref(),
+        fit.time_basis.keep_cols.as_ref(),
+        fit.time_basis.smooth_lambda,
+    )
+    .expect("resolve frozen survival time-basis config");
+    let anchor_row = evaluate_survival_time_basis_row(fit.time_basis.anchor, &time_cfg)
+        .expect("evaluate time-basis anchor row");
+    assert_eq!(
+        anchor_row.len(),
+        p_time,
+        "anchor row width must equal the time block width"
+    );
 
     // ---- shared prediction grid: (x1, x2) in [-2, 2]^2 (10x10), t in [0.5, 20] (10) ----
     let grid_n = 10usize;
@@ -224,18 +270,27 @@ fn gam_transformation_survival_prediction_grid_matches_scipy() {
         gamma.len(),
         "covariate design width must match the covariate-coefficient block"
     );
-    // eta_x = gamma . x for each covariate grid point.
+    // Covariate contribution β_cov · c(x) per covariate grid point.
     let eta_x: Vec<f64> = cov_design.design.apply(&gamma).to_vec();
     assert_eq!(eta_x.len(), cov_pairs.len());
 
-    // gam predicted survival surface, row-major over (cov pair, time):
-    // S(t|x) = exp( -(t/lambda)^p * exp(gamma . x) ).
+    // gam predicted survival surface, row-major over (cov pair, time), assembled
+    // exactly as `survival_predict` builds the exit predictor:
+    //   log Λ(t|x) = β_cov·c(x) + Σ_k (b_k(t) − b_k(anchor))·β_time_k,
+    //   S(t|x)     = exp( −exp(log Λ(t|x)) ).
+    // The Weibull-linear offset is identically zero (derivative guard = 0, the
+    // parametric target is folded into the linear time block), so the centered
+    // time block plus the covariate block is the whole linear predictor.
     let mut gam_surv: Vec<f64> = Vec::with_capacity(cov_pairs.len() * t_pts.len());
-    for &e in &eta_x {
-        let cov_mult = e.exp();
+    for &cov_eta in &eta_x {
         for &tt in &t_pts {
-            let cum_haz = (tt / lambda).powf(p) * cov_mult;
-            gam_surv.push((-cum_haz).exp());
+            let b = evaluate_survival_time_basis_row(tt, &time_cfg)
+                .expect("evaluate time-basis row at grid time");
+            let mut log_cum_haz = cov_eta;
+            for k in 0..p_time {
+                log_cum_haz += (b[k] - anchor_row[k]) * beta_time[k];
+            }
+            gam_surv.push((-log_cum_haz.exp()).exp());
         }
     }
 
@@ -321,6 +376,11 @@ emit("converged", [1.0 if res.success else 0.0])
 
     let scipy_surv = r.vector("surv");
     let scipy_shape = r.scalar("shape");
+    let scipy_converged = r.scalar("converged");
+    assert_eq!(
+        scipy_converged, 1.0,
+        "scipy Weibull-AFT optimizer must converge for the reference to be valid"
+    );
     assert_eq!(
         scipy_surv.len(),
         gam_surv.len(),
@@ -335,11 +395,21 @@ emit("converged", [1.0 if res.success else 0.0])
 
     eprintln!(
         "transformation Weibull S(t|x) grid: n={n} events={n_events} \
-         gam(lambda={lambda:.4}, shape_p={p:.4}, gamma={:?}) scipy_shape={scipy_shape:.4} \
+         gam(shape_p={p:.4}, gamma={:?}) scipy_shape={scipy_shape:.4} \
          grid={}x{} (cov 10x10, t 10) rel_l2={rel:.5} pearson={corr:.6}",
         gamma.to_vec(),
         cov_pairs.len(),
         t_pts.len()
+    );
+
+    // Same Weibull likelihood, same data => the shape exponent must agree. gam's
+    // shape is β_time[1] (slope of log Λ_0 in log t); scipy's is 1/sigma. A 5%
+    // tolerance absorbs two independent optimizers' small-sample noise while
+    // catching a genuinely wrong time-axis slope.
+    let shape_rel = (p - scipy_shape).abs() / scipy_shape.abs().max(1e-12);
+    assert!(
+        shape_rel <= 0.05,
+        "fitted Weibull shape disagrees: gam={p:.5} scipy={scipy_shape:.5} (rel={shape_rel:.4})"
     );
 
     // Same likelihood, same data => the predicted S(t|x) surface is

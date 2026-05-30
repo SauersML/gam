@@ -13,8 +13,20 @@ pub struct StiefelManifold {
 }
 
 impl StiefelManifold {
-    pub const fn new(k: usize, n: usize) -> Self {
-        Self { k, n }
+    /// Construct the Stiefel manifold `St(n, k) = {Y ∈ ℝ^{n×k} : YᵀY = I_k}`
+    /// of `k`-frames in `ℝⁿ`. This object exists only for `1 ≤ k ≤ n`: with
+    /// `k > n` there cannot be `k` orthonormal columns in `ℝⁿ`, the dimension
+    /// `nk − k(k+1)/2` ceases to describe a frame manifold, and the QR
+    /// retraction cannot produce `k` orthonormal columns. The domain is
+    /// rejected here, before any dimension, projection, exponential, or
+    /// curvature computation can run on a nonexistent manifold.
+    pub fn new(k: usize, n: usize) -> GeometryResult<Self> {
+        if k == 0 || n == 0 || k > n {
+            return Err(GeometryError::InvalidPoint(
+                "Stiefel St(n, k) requires 1 <= k <= n",
+            ));
+        }
+        Ok(Self { k, n })
     }
 
     /// QR-based *retraction* `R_Y(Δ) = qf(Y + Δ)` with the sign convention that

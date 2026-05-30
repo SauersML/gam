@@ -154,7 +154,7 @@ fn multinomial_stored_deviance_matches_independent_softmax_recompute() {
     // deviance = -2 · Σ_i log p̂(y_i | x_i), summed exactly the way the
     // definition prescribes. Rows must each have a finite, strictly-positive
     // realized-class probability or the recompute is undefined.
-    let mut neg2_loglik = 0.0_f64;
+    let mut loglik = 0.0_f64;
     for (i, label) in labels.iter().enumerate() {
         let c = class_index(label);
         let p = probs[[i, c]];
@@ -162,9 +162,9 @@ fn multinomial_stored_deviance_matches_independent_softmax_recompute() {
             p.is_finite() && p > 0.0,
             "row {i}: realized-class probability {p} is non-positive/non-finite"
         );
-        neg2_loglik += p.ln();
+        loglik += p.ln();
     }
-    let deviance_recompute = -2.0 * neg2_loglik;
+    let deviance_recompute = -2.0 * loglik;
 
     let deviance_stored = model.deviance;
     let abs_diff = (deviance_stored - deviance_recompute).abs();

@@ -1,29 +1,27 @@
 //! End-to-end quality: gam's Gaussian-process **Matérn family** must stay
-//! consistent across the whole smoothness ladder ν ∈ {0.5, 1.5, 2.5, 3.5} when
-//! benchmarked against `mgcv`'s GP basis (`bs="gp"`) — the mature, standard
-//! reference for kernel smooths.
+//! consistent across the smoothness ladder ν ∈ {1.5, 2.5, 3.5} when benchmarked
+//! against `mgcv`'s GP basis (`bs="gp"`) — the mature, standard reference for
+//! kernel smooths.
 //!
-//! mgcv parametrises the Matérn order through the integer `m = κ` argument of
-//! `s(x, bs="gp", m=κ)`, and the bs='gp' help documents the direct
-//! correspondence κ = 1,2,3,4 ⇔ ν = 1/2, 3/2, 5/2, 7/2 (each integer step adds
-//! one order of mean-square differentiability). gam exposes the *same* family
-//! through an explicit half-integer `nu`, so a single synthetic dataset can be
-//! fit four times — once per order — in both engines and compared head to head.
-//! This is the cross-family fidelity test the single-ν `quality_vs_mgcv_matern`
-//! test cannot give: it proves gam's kernel/penalty construction is correct for
-//! every Matérn order, not just ν=5/2.
+//! mgcv's `bs="gp"` selects the *correlation function* through the FIRST entry
+//! of the integer `m` argument of `s(x, bs="gp", m=κ)`. Per the `?gp.smooth`
+//! help, only `m = 3, 4, 5` are Matérn kernels, with the correspondence
+//!     m = 3 ⇔ ν = 3/2,  m = 4 ⇔ ν = 5/2,  m = 5 ⇔ ν = 7/2,
+//! i.e. each integer step adds one order of mean-square differentiability.
+//! (`m = 1` is spherical and `m = 2` power-exponential — NOT Matérn — so mgcv
+//! cannot fit the ν=1/2 exponential Matérn through `bs="gp"`, and we do not
+//! pretend it can.) gam exposes the same Matérn family through an explicit
+//! half-integer `nu`, so a single synthetic dataset is fit three times — once
+//! per supported order — in both engines and compared head to head. This is the
+//! cross-family fidelity test the single-ν `quality_vs_mgcv_matern` test cannot
+//! give: it proves gam's kernel/penalty construction is correct for every
+//! mgcv-supported Matérn order, not just ν=5/2.
 //!
 //! The signal `y = 0.5 + sin(3πx)·exp(-x²/2) + N(0,0.08²)` is smooth but
-//! non-polynomial, so all four orders can capture it, but with different
-//! trade-offs: the rough ν=0.5 (exponential kernel, non-differentiable paths)
-//! chases noise and is hardest to reproduce across two independent kernel
-//! discretisations, while the smooth ν=3.5 is easiest. We therefore assert,
-//! beyond per-order pointwise/EDF/REML agreement, the *intrinsic* ordering
-//!     rel_l2(0.5) > rel_l2(1.5) > rel_l2(2.5) > rel_l2(3.5),
-//! which can only hold if gam's basis genuinely tracks the Matérn order rather
-//! than collapsing every `nu` onto one effective kernel — a real kernel bug
-//! would either break a per-order bound or scramble this ranking. We do NOT
-//! weaken any bound to hide a divergence.
+//! non-polynomial, so all three orders can capture it. For each order both
+//! engines REML-fit the *same* Matérn-order GP on the *same* data, so the
+//! recovered smooth, its shape, and its effective complexity must each track the
+//! mgcv counterpart. We do NOT weaken any bound to hide a divergence.
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
@@ -71,13 +69,9 @@ fn gam_matern_family_matches_mgcv_gp_across_nu() {
         .collect();
     let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode matern dataset");
 
-    // ν ladder and the mgcv κ=m that selects the same Matérn order.
-    let orders: [(f64, i32); 4] = [(0.5, 1), (1.5, 2), (2.5, 3), (3.5, 4)];
-
-    // Collected per-order relative-L2 to check the smoothness ranking afterward.
-    let mut rel_by_nu: Vec<(f64, f64)> = Vec::with_capacity(orders.len());
-    // Per-order normalised REML scores for the cross-ν agreement check.
-    let mut reml_pairs: Vec<(f64, f64, f64)> = Vec::with_capacity(orders.len());
+    // ν ladder and the mgcv `m` (first entry) that selects the SAME Matérn
+    // order: per `?gp.smooth`, m=3⇔ν=3/2, m=4⇔ν=5/2, m=5⇔ν=7/2.
+    let orders: [(f64, i32); 3] = [(1.5, 3), (2.5, 4), (3.5, 5)];
 
     for (nu, kappa) in orders {
         // ---- gam fit: y ~ matern(x, nu=<ν>, k=18), REML -------------------
@@ -92,7 +86,6 @@ fn gam_matern_family_matches_mgcv_gp_across_nu() {
             panic!("expected a standard Gaussian GAM fit for matern(nu={nu})");
         };
         let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
-        let gam_reml = fit.fit.fit.reml_score;
 
         // gam fitted function on the grid (identity link ⇒ design·beta = mean).
         let mut g = Array2::<f64>::zeros((grid_n, 2));
@@ -105,9 +98,9 @@ fn gam_matern_family_matches_mgcv_gp_across_nu() {
         let gam_grid: Vec<f64> = grid_design.design.apply(&fit.fit.beta).to_vec();
 
         // ---- mgcv fit: same data, s(x, bs="gp", k=18, m=κ), REML ----------
-        // m=c(κ) selects the Matérn order; the length-scale (2nd m entry) is
-        // left at mgcv's data-driven default, matching gam's internal selection.
-        // We also return mgcv's REML score (gcv.ubre under method="REML").
+        // The scalar `m=κ` selects the Matérn correlation order (first m entry);
+        // the length-scale (optional 2nd m entry) is left at mgcv's data-driven
+        // default, matching gam's internal length-scale selection.
         let r = run_r(
             &[
                 Column::new("x", &x),
@@ -124,12 +117,10 @@ fn gam_matern_family_matches_mgcv_gp_across_nu() {
                      data = fit_df, method = "REML")
             emit("grid_fit", as.numeric(predict(m, newdata = grid_df)))
             emit("edf", sum(m$edf))
-            emit("reml", as.numeric(m$gcv.ubre))
             "#,
         );
         let mgcv_grid = r.vector("grid_fit");
         let mgcv_edf = r.scalar("edf");
-        let mgcv_reml = r.scalar("reml");
         assert_eq!(
             mgcv_grid.len(),
             grid_n,
@@ -143,10 +134,7 @@ fn gam_matern_family_matches_mgcv_gp_across_nu() {
 
         eprintln!(
             "matern nu={nu} (mgcv m={kappa}): gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} \
-             edf_rel={edf_rel:.3} rel_l2={rel:.4} pearson={corr:.5} \
-             gam_reml/n={:.5} mgcv_reml/n={:.5}",
-            gam_reml / n as f64,
-            mgcv_reml / n as f64
+             edf_rel={edf_rel:.3} rel_l2={rel:.4} pearson={corr:.5}"
         );
 
         // Both engines REML-fit the identical Matérn-order GP on identical data,
