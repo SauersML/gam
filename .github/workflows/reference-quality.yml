@@ -135,7 +135,11 @@ jobs:
       - name: Run quality suite (resilient + streaming; failures tolerated)
         shell: bash
         run: |
-          set -uo pipefail
+          # GitHub's `shell: bash` runs with `-e`, which would abort this step at
+          # the FIRST diverging/failing test (cargo test returns nonzero) before
+          # the streaming loop and exit 0. Turn `-e` OFF: per-test failures are
+          # the expected, tolerated outcome here; we classify and stream them.
+          set +e -u -o pipefail
           mapfile -t files < <(ls tests/quality_vs_*.rs 2>/dev/null | xargs -n1 basename | sed 's/\.rs$//')
           N=${#files[@]}; i=0; pass=0; fail=0; cerr=0; tmo=0
           RES=/tmp/quality_results.tsv; : > "$RES"
