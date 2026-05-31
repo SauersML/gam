@@ -1716,7 +1716,7 @@ pub fn build_smooth_basis(
             )?;
             if options.contains_key("double_penalty") {
                 return Err(TermBuilderError::incompatible_config(format!(
-                    "Duchon smooth '{}' does not support double_penalty; Duchon uses mass, tension, and stiffness operator penalties.",
+                    "Duchon smooth '{}' does not support double_penalty; the Duchon smoother already ships its native reproducing-norm penalty plus a null-space shrinkage ridge.",
                     vars.join(", ")
                 ))
                 .to_string());
@@ -1748,7 +1748,7 @@ pub fn build_smooth_basis(
                     }
                     (requested_nullspace_order, req_power)
                 }
-                DuchonPowerPolicy::MinimumAdmissibleForTripleOperator => {
+                DuchonPowerPolicy::CubicStructuralDefault => {
                     // Magic cubic rule: affine nullspace, spectral power s = (d-1)/2.
                     (DuchonNullspaceOrder::Linear, (cols.len() as f64 - 1.0) / 2.0)
                 }
@@ -2457,7 +2457,10 @@ fn unsupported_matern_nu_message(raw: &str) -> String {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum DuchonPowerPolicy {
     Explicit(f64),
-    MinimumAdmissibleForTripleOperator,
+    /// No explicit `power=` given: defer to the cubic structural default, which
+    /// the builder resolves dimension-aware as `s = (d − 1)/2` (so `φ(r) = r³`
+    /// in every dimension). There is no triple-operator minimum any more.
+    CubicStructuralDefault,
 }
 
 pub fn parse_duchon_power_policy(
@@ -2488,14 +2491,19 @@ pub fn parse_duchon_power_policy(
             }
             Ok(DuchonPowerPolicy::Explicit(value))
         }
-        None => Ok(DuchonPowerPolicy::MinimumAdmissibleForTripleOperator),
+        None => Ok(DuchonPowerPolicy::CubicStructuralDefault),
     }
 }
 
 pub fn parse_duchon_power(options: &BTreeMap<String, String>) -> Result<f64, String> {
     match parse_duchon_power_policy(options)? {
         DuchonPowerPolicy::Explicit(power) => Ok(power),
-        DuchonPowerPolicy::MinimumAdmissibleForTripleOperator => Ok(1.5),
+        // Context-free placeholder: the bare option parser has no column count,
+        // so it cannot compute the dimension-aware cubic power `s = (d − 1)/2`.
+        // The dimension-aware resolution happens later in `build_smooth_basis`;
+        // this 1.5 is only a stand-in for callers that need a concrete number
+        // without data context (e.g. round-trip parser tests).
+        DuchonPowerPolicy::CubicStructuralDefault => Ok(1.5),
     }
 }
 
