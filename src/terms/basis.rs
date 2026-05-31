@@ -23354,15 +23354,15 @@ pub fn build_duchon_basiswithworkspace(
     // Initialize anisotropy contrasts from knot cloud geometry when the caller
     // enabled scale-dimensions but left η at the zero default.
     let aniso = maybe_initialize_aniso_contrasts(centers.view(), spec.aniso_log_scales.as_deref());
-    let max_active_operator_order =
-        duchon_max_active_operator_derivative_order(&spec.operator_penalties);
-    validate_duchon_collocation_orders(
-        spec.length_scale,
-        p_order,
-        spec.power,
-        data.ncols(),
-        max_active_operator_order,
-    )?;
+    // The native reproducing-norm Gram penalty (`Primary`) is assembled from
+    // kernel VALUES at the center pairs (K_CC), not from collocated D1/D2
+    // derivative operators, so the build only requires the pointwise kernel to
+    // EXIST (`2(p+s) > d`). The stricter operator-collocation orders
+    // (`2(p+s) > d+1` / `> d+2`) are a property of the old triple-operator
+    // penalties that this path no longer builds; enforcing them here would
+    // spuriously reject valid kernels — e.g. the `s=0` thin-plate `r²·log r`
+    // (`2(p+s)=d+2` in 2D), which the native Gram handles fine.
+    validate_duchon_kernel_orders(spec.length_scale, p_order, spec.power, data.ncols())?;
     let kernel_transform = kernel_constraint_nullspace(
         centers.view(),
         effective_nullspace_order,
