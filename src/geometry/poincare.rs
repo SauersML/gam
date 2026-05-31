@@ -191,12 +191,20 @@ pub fn poincare_distance(
     }
     let denom_a = (1.0 + curvature * a_sq).max(ORIGIN_EPS);
     let denom_b = (1.0 + curvature * b_sq).max(ORIGIN_EPS);
-    let arg = 1.0 + 2.0 * (-curvature) * diff_sq / (denom_a * denom_b);
-    // Clamp at exactly 1.0 — `acosh(1.0) == 0.0` in IEEE 754, so identical
-    // points yield exact-zero distance. A `1.0 + ε` clamp would inject
-    // `acosh(1+ε) ≈ √(2ε)` of noise (~4.5e-8 for ε=1e-15).
-    let arg = arg.max(1.0);
-    Ok(arg.acosh() / sqrt_negc)
+    // Geodesic distance via the cosh half-angle identity
+    //   arccosh(1 + 2δ) = 2·arcsinh(√δ),
+    //   δ = (-c)|a-b|² / ((1 + c|a|²)(1 + c|b|²)).
+    // The textbook `arccosh(1 + 2δ)` form cancels catastrophically for nearby
+    // points: `1 + 2δ` rounds away everything in δ below ~1e-16 relative to 1,
+    // and since arccosh(1+2δ) ≈ 2√δ at the branch point, a relative argument
+    // perturbation ~eps/(2δ) becomes a ~eps/δ ~ eps/sep² error in the distance
+    // (≈4% at sep=1e-8). Forming √δ straight from |a-b|² and applying arcsinh
+    // (which does not cancel for small argument) keeps full relative accuracy.
+    // δ ≥ 0 always (−c>0, |a-b|²≥0, denoms>0); arcsinh(0)=0 still gives exact
+    // zero for identical points, so the self-distance contract is preserved
+    // without any near-1 clamp.
+    let delta = (-curvature) * diff_sq / (denom_a * denom_b);
+    Ok(2.0 * delta.max(0.0).sqrt().asinh() / sqrt_negc)
 }
 
 /// Poincaré logarithm at the origin: `log_0(y) = artanh(sqrt(k)|y|) / (sqrt(k)|y|) * y`.
