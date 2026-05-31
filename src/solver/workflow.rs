@@ -2851,7 +2851,9 @@ use crate::inference::formula_dsl::{
     require_inverse_link_supports_joint_wiggle, validate_marginal_slope_z_column_exclusion,
 };
 use crate::term_builder::{
-    build_termspec, column_map_with_alias, enable_scale_dimensions, resolve_role_col,
+    build_termspec, column_map_with_alias, enable_scale_dimensions,
+    has_explicit_countwith_basis_alias, resolve_role_col, resolve_smooth_type_name,
+    smooth_type_uses_spatial_center_heuristic,
 };
 
 /// Non-formula configuration for model fitting. All fields have sensible defaults.
@@ -5267,7 +5269,8 @@ fn materialize_survival<'a>(
         SurvivalCovariateTermBlockTemplate::Static
     };
     let log_sigmaspec = if let Some(noise) = config.noise_formula.as_deref() {
-        let noise_parsed = parse_formula(&format!("{} ~ {noise}", parsed.response))?;
+        let mut noise_parsed = parse_formula(&format!("{} ~ {noise}", parsed.response))?;
+        apply_secondary_predictor_basis_parsimony(&mut noise_parsed.terms, data.values.nrows());
         // Use the same aliased col_map as the main termspec — survival
         // marginal-slope reserves `z` as a placeholder for `--z-column`,
         // and the logslope/noise formula may reference it too.
@@ -6059,6 +6062,39 @@ fn materialize_transformation_normal<'a>(
     })
 }
 
+/// Apply basis parsimony to a *secondary* (distributional) predictor's smooths.
+///
+/// In a location-scale / GAMLSS fit the mean is identified directly by the
+/// response and warrants the generous default basis, but the scale (log-σ) and
+/// other distributional predictors are identified only through (noisy) squared
+/// residuals. Handing their radial spatial smooths a basis sized for the mean
+/// lets REML over-fit them (#501). For each spatial smooth (thin-plate /
+/// Matérn / Duchon) the user did not size explicitly, inject a conservative
+/// `centers` count so the existing explicit-count path sizes the basis
+/// parsimoniously. Smooths the user sized explicitly, and the non-radial bases
+/// (B-spline, cyclic, tensor) which already default modestly via knot counts,
+/// are deliberately left untouched.
+fn apply_secondary_predictor_basis_parsimony(terms: &mut [ParsedTerm], n_rows: usize) {
+    for term in terms.iter_mut() {
+        if let ParsedTerm::Smooth {
+            vars,
+            kind,
+            options,
+            ..
+        } = term
+        {
+            let canonical = resolve_smooth_type_name(*kind, vars.len(), options);
+            if !smooth_type_uses_spatial_center_heuristic(&canonical)
+                || has_explicit_countwith_basis_alias(options, "centers")
+            {
+                continue;
+            }
+            let centers = crate::terms::basis::conservative_secondary_centers(n_rows, vars.len());
+            options.insert("centers".to_string(), centers.to_string());
+        }
+    }
+}
+
 fn materialize_location_scale<'a>(
     parsed: &ParsedFormula,
     data: &'a Dataset,
@@ -6074,7 +6110,8 @@ fn materialize_location_scale<'a>(
         .noise_formula
         .as_deref()
         .ok_or_else(|| "noise_formula is required for location-scale models".to_string())?;
-    let noise_parsed = parse_formula(&format!("{} ~ {noise_formula}", parsed.response))?;
+    let mut noise_parsed = parse_formula(&format!("{} ~ {noise_formula}", parsed.response))?;
+    apply_secondary_predictor_basis_parsimony(&mut noise_parsed.terms, data.values.nrows());
 
     let link_choice = parse_link_choice(config.link.as_deref(), config.flexible_link)?;
     let family = resolve_family(
