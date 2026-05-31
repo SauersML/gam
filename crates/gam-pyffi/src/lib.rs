@@ -9337,21 +9337,20 @@ const SAE_DEFAULT_TORUS_HARMONICS: usize = 3;
 /// Sphere chart basis size (lat/lon ⇒ `[1, x, y, z, xy, yz, xz]`).
 const SAE_SPHERE_BASIS_SIZE: usize = 7;
 /// Duchon nullspace knob `m` for a SAE-manifold atom of latent dimension
-/// `dim`, derived so the curvature (data-jet) penalty block
-/// (`OperatorStiffness`) on the structural cubic basis is always well-posed.
+/// `dim`, sized so the native reproducing-norm Gram (`PenaltySource::Primary`)
+/// on the scale-free polyharmonic basis is well-posed in every dimension.
 ///
 /// `m` maps to the polynomial-nullspace order via [`duchon_nullspace_from_m`]
 /// (`m = 1 → Zero/p=1`, `m = 2 → Linear/p=2`, `m = k+1 → Degree(k)/p=k+1`), so
-/// `p_order == m`. The scale-free curvature (D²) penalty requires D2
-/// collocation `2(p + s) > dim + 2`; with `s = 0` (the pure-polyharmonic basis
-/// the `DuchonCoordinateEvaluator` evaluates) this is `2·m > dim + 2`, whose
-/// smallest integer solution is `m = ⌊dim / 2⌋ + 2`.
+/// `p_order == m`. The pure-polyharmonic basis the `DuchonCoordinateEvaluator`
+/// evaluates uses `s = 0`; sizing the null space by `2·m > dim + 2` keeps the
+/// kernel CPD/null-space adequacy comfortable across dimensions, whose smallest
+/// integer solution is `m = ⌊dim / 2⌋ + 2`.
 ///
 /// For `dim == 1` this reproduces the historical `m = 2` (constant + linear
-/// null space). For `dim ≥ 2` it grows the null space just enough to admit the
-/// curvature penalty — the previous hard-coded `m = 2` left the resolved
-/// power/order inconsistent with the power-0 evaluator and emitted no usable
-/// smoothness penalty. The seed build and every
+/// null space). For `dim ≥ 2` it grows the null space with the latent
+/// dimension — the previous hard-coded `m = 2` left the resolved power/order
+/// inconsistent with the power-0 evaluator. The seed build and every
 /// [`DuchonCoordinateEvaluator`] refresh read this same derived `m`, so the
 /// design `Φ`, its jet, and the penalty stay column-consistent (the issue-247
 /// invariant).
@@ -9486,7 +9485,7 @@ fn build_sae_basis_evaluators(
                 // Same dimension-aware `m` the seed build
                 // (`sae_build_duchon_atom`) used: both read `centers.ncols()`,
                 // so the refreshed `Φ`/jet stays column-consistent with the
-                // seed design and its curvature penalty (issue-247 invariant).
+                // seed design and its native (Primary) penalty (issue-247 invariant).
                 Arc::new(DuchonCoordinateEvaluator::new(
                     centers.clone(),
                     sae_duchon_atom_m(centers.ncols()),
@@ -10750,21 +10749,19 @@ fn sae_build_duchon_atom(
     pts: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
 ) -> Result<(Array2<f64>, Array3<f64>, Array2<f64>), String> {
-    // The `DuchonCoordinateEvaluator` evaluates the structural cubic (r^3)
-    // basis (`length_scale = None`, `power = 0`) at the resolved nullspace
-    // order, so the matching smoothness penalty is the curvature (data-jet)
-    // block, which `build_duchon_basis` emits as
-    // `PenaltySource::OperatorStiffness` — the same block
-    // `duchon_function_norm_penalty` selects. The mass and tension data-jet
-    // candidates penalize amplitude / slope energy and reintroduce a finite
-    // reversion length, exactly the Type-A behaviour the structural smoother
-    // is chosen to avoid, so only the top-order curvature term is requested
-    // here.
+    // The `DuchonCoordinateEvaluator` evaluates the pure polyharmonic basis
+    // (`length_scale = None`, `power = 0`, scale-free) at the resolved nullspace
+    // order, so the matching smoothness penalty is the native reproducing-norm
+    // Gram `ω = α²·Zᵀ K_CC Z`, which the redesigned `build_duchon_basis` emits
+    // as `PenaltySource::Primary` (the structural roughness energy on the same
+    // `[K(·,C)·Z | P]` columns the evaluator produces). The redesign no longer
+    // ships the old mass/tension/stiffness operator triplet for the Euclidean
+    // path, so `operator_penalties` is fully disabled here — the native penalty
+    // path ignores it, and leaving a stale `Active` stiffness would only mislead.
     //
     // The nullspace order and power MUST match the evaluator (`power = 0`,
-    // order = `duchon_nullspace_from_m(m)`); the D2 collocation inequality
-    // `2(p + s) > d + 2` is satisfied by construction because
-    // `m = sae_duchon_atom_m(d)` is the smallest `m` with `2·m > d + 2`.
+    // order = `duchon_nullspace_from_m(m)`); with `m = sae_duchon_atom_m(d)` the
+    // polynomial nullspace is large enough that the native Gram is well-posed.
     let dim = centers.ncols();
     let m: usize = sae_duchon_atom_m(dim);
     let spec = DuchonBasisSpec {
@@ -10777,10 +10774,7 @@ fn sae_build_duchon_atom(
         operator_penalties: DuchonOperatorPenaltySpec {
             mass: OperatorPenaltySpec::Disabled,
             tension: OperatorPenaltySpec::Disabled,
-            stiffness: OperatorPenaltySpec::Active {
-                initial_log_lambda: 0.0,
-                prior: None,
-            },
+            stiffness: OperatorPenaltySpec::Disabled,
         },
         periodic: None,
         boundary: OneDimensionalBoundary::Open,
@@ -10790,28 +10784,28 @@ fn sae_build_duchon_atom(
     // amplification-consistent core entry point so the seed atom matches the
     // `DuchonCoordinateEvaluator` refresh bit-for-bit (issue #247).
     let built = build_duchon_basis(centers, &spec).map_err(|err| err.to_string())?;
-    // The curvature (data-jet) penalty is the `OperatorStiffness` block. With
-    // `m = sae_duchon_atom_m(dim)` the D2 collocation inequality holds, so this
-    // block is always built and active — assert it as a structural invariant
-    // rather than silently returning `None`.
-    let stiffness_idx = built
+    // The structural roughness penalty is the native reproducing-norm Gram,
+    // emitted as the `PenaltySource::Primary` block. The redesigned Euclidean
+    // Duchon basis always emits exactly one `Primary` candidate, so assert it as
+    // a structural invariant rather than silently returning `None`.
+    let primary_idx = built
         .penaltyinfo
         .iter()
-        .position(|info| matches!(info.source, gam::basis::PenaltySource::OperatorStiffness))
+        .position(|info| matches!(info.source, gam::basis::PenaltySource::Primary))
         .ok_or_else(|| {
             format!(
-                "sae_build_duchon_atom: curvature (OperatorStiffness) penalty was not built for \
-                 dim={dim}, m={m}, nullspace_order={:?}; the D2 collocation invariant \
-                 2*m > dim+2 should guarantee it",
+                "sae_build_duchon_atom: native (Primary) smoothness penalty was not built for \
+                 dim={dim}, m={m}, nullspace_order={:?}; the Euclidean Duchon basis must always \
+                 emit a Primary native-norm Gram",
                 duchon_nullspace_from_m(m),
             )
         })?;
     let penalty = built
         .penalties
-        .get(stiffness_idx)
+        .get(primary_idx)
         .ok_or_else(|| {
             format!(
-                "sae_build_duchon_atom: curvature penalty index {stiffness_idx} exceeds {} penalty matrices",
+                "sae_build_duchon_atom: native penalty index {primary_idx} exceeds {} penalty matrices",
                 built.penalties.len()
             )
         })?
@@ -29025,10 +29019,15 @@ struct DuchonHybridConfig {
 ///   penalties (e.g. the Python ``duchon_basis`` PyFFI returns only the
 ///   design matrix). Only kernel-existence and the pure-Duchon CPD guard
 ///   apply; D1 / D2 collocation is not required.
-/// * ``max_op = 2`` — full operator-penalty triplet (mass + tension +
-///   stiffness). Used by the formula path and by
-///   ``duchon_function_norm_penalty``, whose returned penalty IS the
-///   stiffness block in the non-periodic pure-Duchon path.
+/// * ``max_op = 2`` — collocation up to the curvature operator (mass +
+///   tension + stiffness). Used only by the low-level reference primitive
+///   ``duchon_function_norm_penalty``, which exposes the closed-form
+///   collocation operator Grams for the reference-quality suite. The formula
+///   path does NOT route through this resolver: the non-periodic Euclidean
+///   smooth term resolves ``(nullspace_order, power)`` via the cubic
+///   structural rule (``Linear`` null space, spectral power ``s = (d−1)/2``)
+///   and ships the native reproducing-norm Gram plus a null-space shrinkage
+///   ridge, not the operator triplet.
 fn resolve_duchon_hybrid_config(
     dim: usize,
     m: usize,
