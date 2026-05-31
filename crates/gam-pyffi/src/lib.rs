@@ -22249,6 +22249,85 @@ fn sindy_stlsq_solve_array<'py>(
     ))
 }
 
+/// SINDy candidate-library `Θ` builder FFI bridge. Marshals the trajectory and
+/// an ordered library specification into [`gam::solver::sindy::sindy_library`]
+/// and returns the `(n, p)` design matrix plus one display name per column.
+///
+/// `spec` is an ordered list, one element per user library entry, each a tuple
+/// `(token, custom_column, custom_name)`:
+/// * built-in families pass `token ∈ {"const","id","square","cube","product",
+///   "sin","cos"}` with `custom_column = None` and `custom_name = None`;
+/// * Python callable terms (which cannot run in Rust) pass `token = "custom"`
+///   with their already-evaluated `(n,)` `custom_column` and a `custom_name`.
+///
+/// The ordering and per-family column expansion are owned by Rust, so the
+/// returned name list matches the coefficient-matrix column order exactly.
+#[pyfunction]
+fn sindy_library_array<'py>(
+    py: Python<'py>,
+    z: PyReadonlyArray2<'py, f64>,
+    state_names: Vec<String>,
+    spec: &Bound<'py, PyList>,
+) -> PyResult<(Py<PyArray2<f64>>, Vec<String>)> {
+    use gam::solver::sindy::{SindyLibraryTerm, sindy_library};
+    let mut terms: Vec<SindyLibraryTerm> = Vec::with_capacity(spec.len());
+    for entry in spec.iter() {
+        let tuple = entry.downcast::<PyTuple>().map_err(|_| {
+            py_value_error(
+                "sindy_library_array: each spec entry must be a (token, column, name) tuple"
+                    .to_string(),
+            )
+        })?;
+        let token: String = tuple.get_item(0)?.extract()?;
+        let term = match token.as_str() {
+            "const" => SindyLibraryTerm::Const,
+            "id" | "linear" => SindyLibraryTerm::Identity,
+            "square" => SindyLibraryTerm::Square,
+            "cube" => SindyLibraryTerm::Cube,
+            "product" => SindyLibraryTerm::Product,
+            "sin" => SindyLibraryTerm::Sin,
+            "cos" => SindyLibraryTerm::Cos,
+            "custom" => {
+                let col_obj = tuple.get_item(1)?;
+                let column: PyReadonlyArray1<'py, f64> = col_obj.extract().map_err(|_| {
+                    py_value_error(
+                        "sindy_library_array: custom term column must be a 1-D float64 array"
+                            .to_string(),
+                    )
+                })?;
+                let name: String = tuple.get_item(2)?.extract()?;
+                SindyLibraryTerm::Custom {
+                    name,
+                    column: column.as_array().to_owned(),
+                }
+            }
+            other => {
+                return Err(py_value_error(format!(
+                    "sindy_library_array: unknown library token {other:?}"
+                )));
+            }
+        };
+        terms.push(term);
+    }
+    let (theta, names) =
+        sindy_library(z.as_array(), &state_names, &terms).map_err(py_value_error)?;
+    Ok((theta.into_pyarray(py).unbind(), names))
+}
+
+/// SINDy finite-difference derivative FFI bridge. Estimates `dz/dt` from the
+/// trajectory `z` with spacing `dt` (centered interior, one-sided endpoints) via
+/// [`gam::solver::sindy::sindy_finite_difference`].
+#[pyfunction]
+fn sindy_finite_difference_array<'py>(
+    py: Python<'py>,
+    z: PyReadonlyArray2<'py, f64>,
+    dt: f64,
+) -> PyResult<Py<PyArray2<f64>>> {
+    use gam::solver::sindy::sindy_finite_difference;
+    let dz = sindy_finite_difference(z.as_array(), dt).map_err(py_value_error)?;
+    Ok(dz.into_pyarray(py).unbind())
+}
+
 /// Identifiability theorem precondition checks (Principle (f)).
 ///
 /// Caller serialises a `gam::inference::identifiability::FitSummary` as
@@ -22830,6 +22909,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NuclearNormPenalty>()?;
     module.add_class::<MechanismSparsityPenalty>()?;
     module.add_function(wrap_pyfunction!(sindy_stlsq_solve_array, module)?)?;
+    module.add_function(wrap_pyfunction!(sindy_library_array, module)?)?;
+    module.add_function(wrap_pyfunction!(sindy_finite_difference_array, module)?)?;
     Ok(())
 }
 
