@@ -1260,6 +1260,7 @@ mod tests {
         project_stationarity_residual_on_constraint_cone,
         rank_reduce_rows_pivoted_qr_with_dependence,
         solve_newton_direction_with_linear_constraints_impl,
+        solve_quadratic_with_linear_constraints,
     };
     use approx::assert_relative_eq;
     use ndarray::{Array1, array};
@@ -1388,6 +1389,182 @@ mod tests {
             "scaled primal {:.3e} should pass a 1e-7 gate; raw slack would be {:.3e}",
             diag_big.primal_feasibility,
             1000.0 * geometric_violation
+        );
+    }
+
+    // A B-spline `bc=clamped`/`bc=anchored` constraint is an EQUALITY
+    // `a·β = b` encoded as two opposing inequalities `a·β ≥ b` and
+    // `−a·β ≥ −b`. The active-set solver must drive the unconstrained
+    // optimum back onto the hyperplane `a·β = b`. This is the isolated
+    // analogue of the `bc=clamped` startup-validation abort: the exact
+    // validation solve left `a·β ≈ 7.76` instead of 0, so the KKT primal
+    // residual blew past tolerance and every seed was refused.
+    #[test]
+    fn opposing_inequality_pair_pins_equality_to_target() {
+        // Minimize ½‖β‖² − rhs·β  (H = I) ⇒ unconstrained optimum β* = rhs.
+        // rhs = [5,5,0,0] ⇒ a·β* = 10 with a = [1,1,0,0].
+        // The opposing pair must pull a·β back to the target 0.
+        let hessian = array![
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let rhs = array![5.0, 5.0, 0.0, 0.0];
+        let beta_start = Array1::<f64>::zeros(4);
+        let constraints = LinearInequalityConstraints {
+            a: array![[1.0, 1.0, 0.0, 0.0], [-1.0, -1.0, 0.0, 0.0]],
+            b: array![0.0, 0.0],
+        };
+
+        let (beta, _active) = solve_quadratic_with_linear_constraints(
+            &hessian,
+            &rhs,
+            &beta_start,
+            &constraints,
+            None,
+        )
+        .expect("opposing-inequality equality QP must solve");
+
+        let a_dot_beta = beta[0] + beta[1];
+        assert!(
+            a_dot_beta.abs() < 1e-8,
+            "opposing inequalities must pin a·β to 0, got {a_dot_beta:.6e} (β = {beta:?})"
+        );
+    }
+
+    // Same as above but with a non-zero target and a large row norm — the
+    // exact shape of a B-spline endpoint-derivative clamp, whose rows carry
+    // ‖a‖ ≫ 1. The equality must still be pinned in geometric coordinates.
+    #[test]
+    fn opposing_inequality_pair_pins_scaled_equality_to_nonzero_target() {
+        let hessian = array![
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let rhs = array![5.0, 5.0, 0.0, 0.0];
+        let beta_start = Array1::<f64>::zeros(4);
+        // Row scaled ×1000 (mimics a derivative-clamp row norm) with target 3000
+        // ⇒ geometric target a·β = 3.0 in unit coordinates.
+        let constraints = LinearInequalityConstraints {
+            a: array![[1000.0, 1000.0, 0.0, 0.0], [-1000.0, -1000.0, 0.0, 0.0]],
+            b: array![3000.0, -3000.0],
+        };
+
+        let (beta, _active) = solve_quadratic_with_linear_constraints(
+            &hessian,
+            &rhs,
+            &beta_start,
+            &constraints,
+            None,
+        )
+        .expect("scaled opposing-inequality equality QP must solve");
+
+        let a_dot_beta = 1000.0 * (beta[0] + beta[1]);
+        assert!(
+            (a_dot_beta - 3000.0).abs() < 1e-5,
+            "opposing inequalities must pin a·β to 3000, got {a_dot_beta:.6e} (β = {beta:?})"
+        );
+    }
+
+    // `bc=clamped` at BOTH ends produces TWO opposing-inequality equalities
+    // (4 rows total). The real abort reports `active=2/4` — only ONE of the
+    // two equalities is being pinned. Reproduce two independent equalities
+    // and require BOTH to be driven to their targets.
+    #[test]
+    fn two_opposing_inequality_equalities_both_pinned() {
+        let hessian = array![
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let rhs = array![5.0, 5.0, 5.0, 5.0];
+        let beta_start = Array1::<f64>::zeros(4);
+        // Equality A: β0 + β1 = 0 (rows 0,1). Equality B: β2 + β3 = 0 (rows 2,3).
+        let constraints = LinearInequalityConstraints {
+            a: array![
+                [1.0, 1.0, 0.0, 0.0],
+                [-1.0, -1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 1.0],
+                [0.0, 0.0, -1.0, -1.0],
+            ],
+            b: array![0.0, 0.0, 0.0, 0.0],
+        };
+
+        let (beta, _active) = solve_quadratic_with_linear_constraints(
+            &hessian,
+            &rhs,
+            &beta_start,
+            &constraints,
+            None,
+        )
+        .expect("two-equality QP must solve");
+
+        assert!(
+            (beta[0] + beta[1]).abs() < 1e-8,
+            "equality A not pinned: β0+β1 = {:.6e}",
+            beta[0] + beta[1]
+        );
+        assert!(
+            (beta[2] + beta[3]).abs() < 1e-8,
+            "equality B not pinned: β2+β3 = {:.6e}",
+            beta[2] + beta[3]
+        );
+    }
+
+    // Faithful to the failing fit: the penalized IRLS Hessian `X'WX + λS`
+    // with λ at the over-smoothing ceiling is severely ill-conditioned — the
+    // penalty `S` is rank-deficient (null space = the unpenalized polynomial
+    // part), so directions in null(S) are governed by a tiny `X'WX` block
+    // while penalized directions carry a huge λ. The opposing-inequality
+    // equalities must STILL be pinned under this conditioning.
+    #[test]
+    fn opposing_inequality_equalities_pinned_under_ill_conditioned_penalty() {
+        // H = diag(1, 1, λ, λ) with λ = 1e8 — penalized directions 2,3 are
+        // ~1e8 stiffer than the data directions 0,1.
+        let lam = 1.0e8_f64;
+        let hessian = array![
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, lam, 0.0],
+            [0.0, 0.0, 0.0, lam],
+        ];
+        let rhs = array![5.0, 5.0, 5.0, 5.0];
+        let beta_start = Array1::<f64>::zeros(4);
+        // Two equalities that COUPLE a stiff and a soft coordinate, like a
+        // B-spline derivative row spanning penalized and unpenalized parts:
+        // A: β0 + β2 = 0, B: β1 + β3 = 0.
+        let constraints = LinearInequalityConstraints {
+            a: array![
+                [1.0, 0.0, 1.0, 0.0],
+                [-1.0, 0.0, -1.0, 0.0],
+                [0.0, 1.0, 0.0, 1.0],
+                [0.0, -1.0, 0.0, -1.0],
+            ],
+            b: array![0.0, 0.0, 0.0, 0.0],
+        };
+
+        let (beta, _active) = solve_quadratic_with_linear_constraints(
+            &hessian,
+            &rhs,
+            &beta_start,
+            &constraints,
+            None,
+        )
+        .expect("ill-conditioned two-equality QP must solve");
+
+        assert!(
+            (beta[0] + beta[2]).abs() < 1e-6,
+            "equality A not pinned under ill-conditioning: β0+β2 = {:.6e}",
+            beta[0] + beta[2]
+        );
+        assert!(
+            (beta[1] + beta[3]).abs() < 1e-6,
+            "equality B not pinned under ill-conditioning: β1+β3 = {:.6e}",
+            beta[1] + beta[3]
         );
     }
 }
