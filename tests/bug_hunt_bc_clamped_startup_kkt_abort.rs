@@ -142,5 +142,7 @@ fn clamped_zero_offset_sine_does_not_abort_startup_validation() {
     // here would conflate two distinct bugs.
     let rmse_free = rmse(&fit_and_probe("y ~ s(x, k=12)", &data, &eval_xs), &eval_xs);
     let rmse_clamped = rmse(&pred_clamped, &eval_xs);
-    eprintln!("[bc-500] free={rmse_free:.4} clamped={rmse_clamped:.4} (clamped quality tracked separately)");
+    eprintln!(
+        "[bc-500] free={rmse_free:.4} clamped={rmse_clamped:.4} (clamped quality tracked separately)"
+    );
 }
