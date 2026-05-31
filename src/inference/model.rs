@@ -2018,11 +2018,20 @@ impl FittedModel {
         // credible intervals stop widening with distance from the data. This
         // mirrors how periodic axes are exempted just above.
         let linear_axes = self.training_linear_axes(training_headers.len());
+        // Sphere latitude is a closed-manifold coordinate: its clip bounds are
+        // the manifold's intrinsic domain ([-π/2, π/2] or [-90, 90]), not the
+        // sampled range, so a pole prediction reaches the true pole instead of
+        // being clamped to a near-pole latitude (see the method doc).
+        let sphere_lat_bounds = self.training_sphere_latitude_bounds(training_headers);
         let mut clipped = data.to_owned();
         let mut any_clipped = false;
         for (col_in_training, (header, &(lo, hi))) in
             training_headers.iter().zip(ranges.iter()).enumerate()
         {
+            let (lo, hi) = sphere_lat_bounds
+                .get(&col_in_training)
+                .copied()
+                .unwrap_or((lo, hi));
             if !(lo.is_finite() && hi.is_finite()) || hi <= lo {
                 continue;
             }
@@ -2079,7 +2088,10 @@ impl FittedModel {
         for term in &spec.smooth_terms {
             match &term.basis {
                 // Sphere terms: longitude (second feature col) is always
-                // periodic. Latitude is bounded and stays clamped.
+                // periodic and exempt from clipping. Latitude is not periodic
+                // but is a closed-manifold coordinate, so it is clipped to the
+                // manifold's intrinsic bounds rather than the sampled range —
+                // see `training_sphere_latitude_bounds`.
                 SmoothBasisSpec::Sphere { feature_cols, .. } => {
                     if let Some(&lon_col) = feature_cols.get(1)
                         && lon_col < training_headers.len()
@@ -2143,6 +2155,53 @@ impl FittedModel {
                         out.insert(col);
                     }
                 }
+            }
+        }
+        out
+    }
+
+    /// Manifold-intrinsic clip bounds for sphere *latitude* columns.
+    ///
+    /// A `sphere(lat, lon)` smooth charts the closed manifold S²: the poles
+    /// (lat = ±π/2, or ±90°) are interior limit points of that manifold, not
+    /// endpoints of an unbounded axis to extrapolate along. A finite training
+    /// sample never reaches the pole exactly, so clamping a pole prediction to
+    /// the *observed* latitude extreme lands at a near-pole latitude where the
+    /// Wahba SOS kernel's `cos(lat)·cos(lat_c)·cos(Δlon)` term has not yet
+    /// damped — and the predictor then sweeps a spurious `cos(lon)` profile at
+    /// what is physically a single point, reintroducing the pole artefact the
+    /// SOS basis exists to remove.
+    ///
+    /// The correct clip bound for this coordinate is therefore the manifold's
+    /// intrinsic domain — `[-π/2, π/2]` radians or `[-90, 90]` degrees — not
+    /// the sampled range. Clamping to those bounds keeps the pole reachable
+    /// (single-valued in longitude) while still mapping any out-of-domain
+    /// latitude onto the manifold boundary. Longitude needs no entry here: it
+    /// is periodic and already exempted from clipping entirely
+    /// (`training_periodic_axes`). Returned indices reference
+    /// `self.training_headers`, matching the iteration in
+    /// `axis_clip_to_training_ranges`.
+    fn training_sphere_latitude_bounds(
+        &self,
+        training_headers: &[String],
+    ) -> std::collections::HashMap<usize, (f64, f64)> {
+        use crate::smooth::SmoothBasisSpec;
+        let mut out: std::collections::HashMap<usize, (f64, f64)> =
+            std::collections::HashMap::new();
+        let Some(spec) = self.resolved_termspec.as_ref() else {
+            return out;
+        };
+        for term in &spec.smooth_terms {
+            if let SmoothBasisSpec::Sphere { feature_cols, spec } = &term.basis
+                && let Some(&lat_col) = feature_cols.first()
+                && lat_col < training_headers.len()
+            {
+                let bound = if spec.radians {
+                    std::f64::consts::FRAC_PI_2
+                } else {
+                    90.0
+                };
+                out.insert(lat_col, (-bound, bound));
             }
         }
         out
