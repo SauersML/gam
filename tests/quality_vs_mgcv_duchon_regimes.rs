@@ -48,7 +48,10 @@ fn assert_gaussian_regime(
     let mut rng = StdRng::seed_from_u64(seed);
     let noise = Normal::new(0.0, sigma).expect("normal");
     let x: Vec<f64> = (0..n).map(|i| i as f64 / (n as f64 - 1.0)).collect();
-    let y: Vec<f64> = x.iter().map(|&t| truth(t) + noise.sample(&mut rng)).collect();
+    let y: Vec<f64> = x
+        .iter()
+        .map(|&t| truth(t) + noise.sample(&mut rng))
+        .collect();
 
     let headers = ["x", "y"].into_iter().map(String::from).collect();
     let rows = x
@@ -192,7 +195,9 @@ fn gam_duchon_1d_poisson_log_mean_recovery_matches_mgcv() {
         .iter()
         .map(|&t| {
             let lambda = eta_true(t).exp().max(1e-12);
-            Poisson::new(lambda).expect("valid Poisson rate").sample(&mut rng)
+            Poisson::new(lambda)
+                .expect("valid Poisson rate")
+                .sample(&mut rng)
         })
         .collect();
 
