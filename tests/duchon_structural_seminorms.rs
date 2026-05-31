@@ -32,11 +32,11 @@
 //! spaces. We assert the structural pattern with absolute energy bounds tied to the
 //! penalty normalization, not to any reference tool.
 
+use faer::Side;
 use gam::basis::{
     CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
     OneDimensionalBoundary, PenaltySource, SpatialIdentifiability, build_duchon_basis,
 };
-use faer::Side;
 use gam::faer_ndarray::FaerCholesky;
 use ndarray::{Array1, Array2};
 use rand::SeedableRng;
@@ -244,10 +244,9 @@ fn null_space_ridge_penalizes_the_linear_trend() {
     let data = synthetic_data(200, 2, 21);
     let spec = duchon_spec(20, DuchonNullspaceOrder::Linear);
     let built = build(&data, &spec);
-    let ridge = built
-        .ridge
-        .as_ref()
-        .expect("null-space ridge (DoublePenaltyNullspace) must be present for an affine null space");
+    let ridge = built.ridge.as_ref().expect(
+        "null-space ridge (DoublePenaltyNullspace) must be present for an affine null space",
+    );
 
     let c_lin = coeff_for_target(&built.design, &linear_target(&data), "linear");
     let ridge_energy = quad(ridge, &c_lin);

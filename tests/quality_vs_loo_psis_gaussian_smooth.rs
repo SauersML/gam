@@ -416,13 +416,20 @@ fn gam_alo_is_honest_loo_predictive_error_on_lidar_on_real_data() {
 
     // Lower-triangular Cholesky L with L Lᵀ = cov (jitter for safety).
     let mut l = Array2::<f64>::zeros((pdim, pdim));
-    let jitter = 1e-10 * (0..pdim).map(|i| cov[[i, i]]).fold(0.0_f64, f64::max).max(1.0);
+    let jitter = 1e-10
+        * (0..pdim)
+            .map(|i| cov[[i, i]])
+            .fold(0.0_f64, f64::max)
+            .max(1.0);
     for j in 0..pdim {
         let mut d = cov[[j, j]] + jitter;
         for k in 0..j {
             d -= l[[j, k]] * l[[j, k]];
         }
-        assert!(d > 0.0, "posterior covariance not positive definite at {j}: {d}");
+        assert!(
+            d > 0.0,
+            "posterior covariance not positive definite at {j}: {d}"
+        );
         let ljj = d.sqrt();
         l[[j, j]] = ljj;
         for i in (j + 1)..pdim {

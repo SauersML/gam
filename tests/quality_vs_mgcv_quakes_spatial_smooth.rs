@@ -34,9 +34,7 @@
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, rmse, run_r};
-use gam::{
-    FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema,
-};
+use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::path::Path;
 
@@ -127,12 +125,8 @@ fn gam_spatial_smooth_predicts_quakes_better_than_baseline() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula(
-        "mag ~ s(long, lat, bs=\"tp\") + s(depth)",
-        &train_ds,
-        &cfg,
-    )
-    .expect("gam fit");
+    let result = fit_from_formula("mag ~ s(long, lat, bs=\"tp\") + s(depth)", &train_ds, &cfg)
+        .expect("gam fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for a gaussian spatial smooth");
     };
@@ -297,8 +291,8 @@ fn gam_spatial_smooth_predicts_quakes_better_than_baseline_on_real_data() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("mag ~ s(long, lat, bs=\"tp\")", &train_ds, &cfg)
-        .expect("gam fit");
+    let result =
+        fit_from_formula("mag ~ s(long, lat, bs=\"tp\")", &train_ds, &cfg).expect("gam fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for a gaussian spatial smooth");
     };

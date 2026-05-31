@@ -40,11 +40,7 @@ fn r_squared(pred: &[f64], truth: &[f64]) -> f64 {
     let n = truth.len() as f64;
     let mean = truth.iter().sum::<f64>() / n;
     let ss_tot: f64 = truth.iter().map(|y| (y - mean) * (y - mean)).sum();
-    let ss_res: f64 = pred
-        .iter()
-        .zip(truth)
-        .map(|(p, y)| (y - p) * (y - p))
-        .sum();
+    let ss_res: f64 = pred.iter().zip(truth).map(|(p, y)| (y - p) * (y - p)).sum();
     1.0 - ss_res / ss_tot.max(1e-300)
 }
 
@@ -97,12 +93,8 @@ fn gam_thin_plate_1d_predicts_heldout_lidar_at_least_as_well_as_mgcv() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula(
-        "logratio ~ s(range, bs=\"tp\", k=20)",
-        &train_ds,
-        &cfg,
-    )
-    .expect("gam fit on train");
+    let result = fit_from_formula("logratio ~ s(range, bs=\"tp\", k=20)", &train_ds, &cfg)
+        .expect("gam fit on train");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for a gaussian thin-plate smooth");
     };

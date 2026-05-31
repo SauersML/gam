@@ -15,7 +15,6 @@ use rand::{RngExt, SeedableRng};
 use crate::basis::create_difference_penalty_matrix;
 use crate::estimate::{BlockRole, FitOptions, UnifiedFitResult, fit_gam, validate_all_finite};
 use crate::faer_ndarray::FaerCholesky;
-use crate::linalg::triangular::back_substitution_lower_transpose_guarded_into;
 use crate::families::royston_parmar::{self, RoystonParmarInputs};
 use crate::families::survival_predict::{
     fit_result_from_saved_model_for_prediction, require_saved_survival_likelihood_mode,
@@ -35,6 +34,7 @@ use crate::inference::formula_dsl::{LinkWiggleFormulaSpec, parse_formula};
 use crate::inference::model::{
     FittedModel as SavedModel, PredictModelClass, load_survival_time_basis_config_from_model,
 };
+use crate::linalg::triangular::back_substitution_lower_transpose_guarded_into;
 use crate::smooth::{build_term_collection_design, weighted_blockwise_penalty_sum};
 use crate::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
 use crate::survival_construction::{

@@ -441,9 +441,10 @@ fn gam_gaussian_location_scale_crps_matches_gamlss_on_real_data() {
         noise_formula: Some("1 + s(Age)".to_string()),
         ..FitConfig::default()
     };
-    let result =
-        fit_from_formula("GAG ~ s(Age)", &train_ds, &cfg).expect("gam location-scale fit on gagurine");
-    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult { fit, .. }) = result else {
+    let result = fit_from_formula("GAG ~ s(Age)", &train_ds, &cfg)
+        .expect("gam location-scale fit on gagurine");
+    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult { fit, .. }) = result
+    else {
         panic!("expected a Gaussian location-scale fit");
     };
 
@@ -482,9 +483,7 @@ fn gam_gaussian_location_scale_crps_matches_gamlss_on_real_data() {
     // ---- fit gamlss on the SAME train rows, predict the SAME test rows ----
     // A per-row train flag is sent so gamlss subsets to exactly gam's train set;
     // EVERY column in this single call is full length n (no length mixing).
-    let train_flag: Vec<f64> = (0..n)
-        .map(|i| if is_test(i) { 0.0 } else { 1.0 })
-        .collect();
+    let train_flag: Vec<f64> = (0..n).map(|i| if is_test(i) { 0.0 } else { 1.0 }).collect();
 
     let r = run_r(
         &[

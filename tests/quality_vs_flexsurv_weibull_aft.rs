@@ -56,7 +56,10 @@ const BONE_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/bone
 // (survival days), status (1 = death, 0 = censored), karno (Karnofsky
 // performance score, the dataset's dominant continuous prognostic covariate),
 // age (years). n = 137.
-const VETERAN_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/veteran_lung.csv");
+const VETERAN_CSV: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/bench/datasets/veteran_lung.csv"
+);
 
 /// Harrell's concordance index for a risk score (higher score = higher risk =
 /// expected-earlier failure). Over all orderable pairs where the earlier event
@@ -222,8 +225,7 @@ fn gam_weibull_survival_objective_quality_on_bone() {
     // basis + beta exactly as the engine evaluates it:
     //   log Λ(t|x) = Σ_k (b_k(t) − anchor_k)·β_time_k + γ·x.
     let log_cumhaz = |tt: f64, x: f64| -> f64 {
-        let b = evaluate_survival_time_basis_row(tt, &time_cfg)
-            .expect("evaluate time-basis row");
+        let b = evaluate_survival_time_basis_row(tt, &time_cfg).expect("evaluate time-basis row");
         let mut lc = cov_eta(x);
         for k in 0..p_time {
             lc += (b[k] - anchor_row[k]) * beta_time[k];
@@ -375,7 +377,10 @@ fn gam_weibull_survival_objective_quality_on_bone_on_real_data() {
     let karno: Vec<f64> = ds.values.column(karno_idx).to_vec();
     let age: Vec<f64> = ds.values.column(age_idx).to_vec();
     let n = time.len();
-    assert_eq!(n, 137, "veteran_lung.csv should have 137 data rows, got {n}");
+    assert_eq!(
+        n, 137,
+        "veteran_lung.csv should have 137 data rows, got {n}"
+    );
     assert!(
         status.iter().all(|&s| s == 0.0 || s == 1.0),
         "veteran status must be 0/1"

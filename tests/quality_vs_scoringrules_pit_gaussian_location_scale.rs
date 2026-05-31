@@ -96,7 +96,10 @@ fn ks_distance_to_uniform(samples: &[f64]) -> f64 {
     let n = samples.len();
     assert!(n > 0, "KS distance needs at least one sample");
     let mut sorted: Vec<f64> = samples.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).expect("PIT values must be finite for KS sort"));
+    sorted.sort_by(|a, b| {
+        a.partial_cmp(b)
+            .expect("PIT values must be finite for KS sort")
+    });
     let nf = n as f64;
     let mut d = 0.0_f64;
     for (i, &u) in sorted.iter().enumerate() {

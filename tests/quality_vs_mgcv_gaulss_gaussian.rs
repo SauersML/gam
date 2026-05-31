@@ -205,7 +205,10 @@ fn gam_gaulss_linear_mean_smooth_sigma_predicts_lidar_at_least_as_well_as_mgcv()
     let gam_mu: Vec<f64> = mean_design.design.apply(&beta_mean).to_vec();
     // log-sigma link: sigma = LOGB_SIGMA_FLOOR + exp(eta_scale).
     let eta_scale = noise_design.design.apply(&beta_scale);
-    let gam_sigma: Vec<f64> = eta_scale.iter().map(|&e| LOGB_SIGMA_FLOOR + e.exp()).collect();
+    let gam_sigma: Vec<f64> = eta_scale
+        .iter()
+        .map(|&e| LOGB_SIGMA_FLOOR + e.exp())
+        .collect();
 
     // ---- gam held-out objective scores ------------------------------------
     let gam_nll = gaussian_nll(&logratio_test, &gam_mu, &gam_sigma);

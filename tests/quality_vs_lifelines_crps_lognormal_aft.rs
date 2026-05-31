@@ -551,8 +551,9 @@ fn gam_lognormal_aft_crps_calibration_matches_lifelines_on_real_data() {
         test_grid[[i, karno_idx]] = karno_all[row];
         test_grid[[i, age_idx]] = age_all[row];
     }
-    let loc_design = build_term_collection_design(test_grid.view(), &fit.fit.resolved_thresholdspec)
-        .expect("rebuild location (threshold) design at held-out points");
+    let loc_design =
+        build_term_collection_design(test_grid.view(), &fit.fit.resolved_thresholdspec)
+            .expect("rebuild location (threshold) design at held-out points");
     let gam_mu_test: Vec<f64> = loc_design.design.apply(&beta_location).to_vec();
     assert_eq!(gam_mu_test.len(), test_rows.len());
 
@@ -586,7 +587,8 @@ fn gam_lognormal_aft_crps_calibration_matches_lifelines_on_real_data() {
         .collect();
     let train_logt_mean =
         train_obs.iter().map(|&i| train_time[i].ln()).sum::<f64>() / train_obs.len() as f64;
-    let train_mu_mean = train_obs.iter().map(|&i| gam_mu_train[i]).sum::<f64>() / train_obs.len() as f64;
+    let train_mu_mean =
+        train_obs.iter().map(|&i| gam_mu_train[i]).sum::<f64>() / train_obs.len() as f64;
     let gam_offset = train_mu_mean - train_logt_mean;
     let gam_mu_test_anchored: Vec<f64> = gam_mu_test.iter().map(|&mu| mu - gam_offset).collect();
 

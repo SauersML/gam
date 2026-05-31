@@ -108,7 +108,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use crate::faer_ndarray::FaerEigh;
 use crate::linalg::matrix::{
-    upper_triangle_pair_from_index, DesignMatrix, LinearOperator, SignedWeightsView,
+    DesignMatrix, LinearOperator, SignedWeightsView, upper_triangle_pair_from_index,
 };
 
 fn reml_contract_panic(message: impl Into<String>) -> ! {
@@ -18545,8 +18545,7 @@ mod tests {
         // used by the projected KKT residual correction, so an inconsistent
         // envelope gradient remains a soft "unavailable derivative" result
         // rather than a missing-residual contract violation.
-        let solution =
-            build_sentinel_tripwire_solution(DispersionHandling::ProfiledGaussian, None);
+        let solution = build_sentinel_tripwire_solution(DispersionHandling::ProfiledGaussian, None);
 
         let result = reml_laml_evaluate(&solution, &[0.0], EvalMode::ValueGradientHessian, None)
             .expect("envelope tripwire evaluation");

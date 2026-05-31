@@ -55,9 +55,7 @@ use gam::gamlss::GaussianLocationScaleFitResult;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, run_r};
-use gam::{
-    FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema,
-};
+use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::path::Path;
 
@@ -174,8 +172,8 @@ fn gam_location_scale_predicts_gagurine_better_than_baseline() {
         noise_formula: Some("1 + s(Age, bs='tp')".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("GAG ~ s(Age, bs='tp')", &train_ds, &cfg)
-        .expect("gam location-scale fit");
+    let result =
+        fit_from_formula("GAG ~ s(Age, bs='tp')", &train_ds, &cfg).expect("gam location-scale fit");
     let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult { fit, .. }) = result
     else {
         panic!("expected a Gaussian location-scale fit");
@@ -251,7 +249,11 @@ fn gam_location_scale_predicts_gagurine_better_than_baseline() {
     // the raw GAG scale. All columns are the SAME length (train length); the test
     // Age is padded and only its first `test_n` entries are read.
     let pad_to = |v: &[f64], len: usize| -> Vec<f64> {
-        assert!(v.len() <= len, "pad target {len} shorter than source {}", v.len());
+        assert!(
+            v.len() <= len,
+            "pad target {len} shorter than source {}",
+            v.len()
+        );
         let fill = v.last().copied().unwrap_or(0.0);
         let mut out = v.to_vec();
         out.resize(len, fill);

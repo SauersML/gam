@@ -353,9 +353,7 @@ fn quadratic_form_from_jetmu(
     cov: &Array2<f64>,
     partials: &[InverseLinkJet],
 ) -> Result<f64, EstimationError> {
-    quadratic_form_indexed(cov, partials.len(), "mixture gradient", |i| {
-        partials[i].mu
-    })
+    quadratic_form_indexed(cov, partials.len(), "mixture gradient", |i| partials[i].mu)
 }
 
 /// Shared kernel for the symmetric quadratic form `g' · C · g` for an SPD

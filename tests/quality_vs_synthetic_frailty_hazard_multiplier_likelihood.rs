@@ -238,8 +238,13 @@ fn lognormal_hazard_multiplier_kernel_recovers_frailty_variance() {
     // Observed-information standard error of the frailty-scale MLE, from gam's own
     // Hessian at the optimum. Var(log sigma_hat) ~ 1 / I(log sigma); by the delta
     // method se(sigma_hat) = sigma_hat * se(log sigma_hat).
-    let (_, _, neg_hess_at_opt) =
-        gam_logsigma_jet(&quadctx, &cum_hazard, &events, BASELINE_SLOPE, sigma_hat_gam);
+    let (_, _, neg_hess_at_opt) = gam_logsigma_jet(
+        &quadctx,
+        &cum_hazard,
+        &events,
+        BASELINE_SLOPE,
+        sigma_hat_gam,
+    );
     assert!(
         neg_hess_at_opt > 0.0,
         "frailty-scale log-likelihood must be concave at the MLE (observed info \
@@ -293,8 +298,13 @@ fn lognormal_hazard_multiplier_kernel_recovers_frailty_variance() {
     let r_loglik = r.scalar("loglik");
 
     // gam's log-likelihood at its own optimum, for context.
-    let (gam_loglik_at_opt, _, _) =
-        gam_logsigma_jet(&quadctx, &cum_hazard, &events, BASELINE_SLOPE, sigma_hat_gam);
+    let (gam_loglik_at_opt, _, _) = gam_logsigma_jet(
+        &quadctx,
+        &cum_hazard,
+        &events,
+        BASELINE_SLOPE,
+        sigma_hat_gam,
+    );
 
     let err_gam = (sigma_hat_gam - SIGMA_TRUE).abs();
     let err_r = (sigma_hat_r - SIGMA_TRUE).abs();

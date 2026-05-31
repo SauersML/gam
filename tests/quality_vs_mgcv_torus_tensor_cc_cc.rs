@@ -59,8 +59,10 @@ use std::path::Path;
 /// log1p(mean hourly rental count) over the cell, `n_obs` = cell sample count.
 /// Both axes are intrinsically cyclic (day-of-year wraps at 365, hour-of-day
 /// wraps at 24), making this the real-data analog of the doubly-periodic torus.
-const BIKE_TORUS_CSV: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/bike_sharing_torus.csv");
+const BIKE_TORUS_CSV: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/bench/datasets/bike_sharing_torus.csv"
+);
 
 /// Coefficient of determination of `pred` vs observed `truth` relative to the
 /// constant-mean predictor: `1 - SS_res / SS_tot`. R2 = 1 perfect, 0 = mean,

@@ -31,7 +31,10 @@ struct Rng(u64);
 impl Rng {
     fn next_u(&mut self) -> f64 {
         // Numerical Recipes LCG; take the top 53 bits as a uniform in (0, 1).
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let bits = (self.0 >> 11) as f64;
         (bits + 0.5) / (1u64 << 53) as f64
     }
@@ -81,11 +84,7 @@ fn group_design(n_per: usize, p: usize) -> Array2<f64> {
     x
 }
 
-fn fit(
-    x: &Array2<f64>,
-    y: &Array1<f64>,
-    prior: RhoPrior,
-) -> (f64, Array1<f64>) {
+fn fit(x: &Array2<f64>, y: &Array1<f64>, prior: RhoPrior) -> (f64, Array1<f64>) {
     let p = x.ncols();
     let n = x.nrows();
     let weights = Array1::<f64>::ones(n);
@@ -131,12 +130,18 @@ fn tighter_pc_prior_selects_more_smoothing() {
     let (lam_tight, beta_tight) = fit(
         &x,
         &y,
-        RhoPrior::PenalizedComplexity { upper: 0.1, tail_prob: 0.05 },
+        RhoPrior::PenalizedComplexity {
+            upper: 0.1,
+            tail_prob: 0.05,
+        },
     );
     let (lam_loose, beta_loose) = fit(
         &x,
         &y,
-        RhoPrior::PenalizedComplexity { upper: 5.0, tail_prob: 0.05 },
+        RhoPrior::PenalizedComplexity {
+            upper: 5.0,
+            tail_prob: 0.05,
+        },
     );
 
     // More smoothing: larger selected precision λ.
@@ -186,7 +191,10 @@ fn pc_prior_recovers_real_signal() {
     let rmse_flat = rmse(&beta_flat);
     // PC recovers the genuine signal: small absolute error and no material
     // degradation versus the flat prior despite its shrinkage pull.
-    assert!(rmse_pc < 0.2, "PC must recover real signal: rmse_pc={rmse_pc}");
+    assert!(
+        rmse_pc < 0.2,
+        "PC must recover real signal: rmse_pc={rmse_pc}"
+    );
     assert!(
         rmse_pc < 1.5 * rmse_flat + 0.05,
         "PC must not over-shrink real signal: rmse_pc={rmse_pc} rmse_flat={rmse_flat}"

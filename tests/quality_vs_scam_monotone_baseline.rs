@@ -266,10 +266,7 @@ fn gam_monotone_baseline_recovers_log_cumhaz_truth() {
     // This is the closed-form conditional log-cumulative-hazard of the
     // data-generating exponential baseline at the reference subject x=0. It is
     // the function gam's I-spline baseline (and the reference) must recover.
-    let truth_log_cumhaz: Vec<f64> = grid_times
-        .iter()
-        .map(|&t| LAMBDA0.ln() + t.ln())
-        .collect();
+    let truth_log_cumhaz: Vec<f64> = grid_times.iter().map(|&t| LAMBDA0.ln() + t.ln()).collect();
 
     // ---- fit the SAME conditional-at-x=0 estimand with scam (baseline) ----
     // gam's baseline is the CONDITIONAL hazard at x=0, so the reference must

@@ -152,8 +152,12 @@ fn gam_poincare_exp_log_satisfies_manifold_axioms() {
         gam_roundtrip_maxabs = gam_roundtrip_maxabs.max(mab);
 
         // (2) radial geodesic isometry: d_c(0, exp_0(v)) == |v|.
-        let d_geo = poincare_distance(origin_max.slice(ndarray::s![0..v.len()]), y.view(), CURVATURE)
-            .expect("gam poincare_distance");
+        let d_geo = poincare_distance(
+            origin_max.slice(ndarray::s![0..v.len()]),
+            y.view(),
+            CURVATURE,
+        )
+        .expect("gam poincare_distance");
         gam_isometry_maxabs = gam_isometry_maxabs.max((d_geo - norm(v)).abs());
 
         // (3) closed-form ground truth: exp_0(v) == phi * v with the textbook

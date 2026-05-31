@@ -119,9 +119,7 @@ mod cuda {
     /// that pairing consistent — the device pointer passed in is typed `*mut
     /// Self` / `*const Self`, so a mismatched symbol would hand cuSOLVER a
     /// wrongly-typed buffer.
-    trait CholScalar:
-        cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Copy
-    {
+    trait CholScalar: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Copy {
         /// cuSOLVER `*potrf_bufferSize`: `(handle, uplo, n, A, lda, *lwork)`.
         ///
         /// `a` is a live `n*n` column-major device buffer of type `Self`,
@@ -288,7 +286,8 @@ mod cuda {
             let (ptr, _rec) = dummy.device_ptr_mut(stream);
             // dummy is a live p*p device buffer of type T, lwork is a host i32;
             // the unsafe cuSOLVER FFI is contained in T::potrf_buffer_size.
-            let status = T::potrf_buffer_size(solver.cu(), uplo, p_i, ptr as *mut T, p_i, &mut lwork);
+            let status =
+                T::potrf_buffer_size(solver.cu(), uplo, p_i, ptr as *mut T, p_i, &mut lwork);
             check_cusolver(status, "cusolverDn*potrf_bufferSize")?;
         }
         usize::try_from(lwork).map_err(|_| "negative potrf lwork".to_string())

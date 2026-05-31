@@ -434,8 +434,16 @@ emit("surv", surv_rows)
 /// risk. Risk ties on a comparable pair count as half-concordant. Returns the
 /// fraction of comparable pairs that are concordant (0.5 = random ordering).
 fn concordance_index(risk: &[f64], time: &[f64], event: &[f64]) -> f64 {
-    assert_eq!(risk.len(), time.len(), "concordance: risk/time length mismatch");
-    assert_eq!(time.len(), event.len(), "concordance: time/event length mismatch");
+    assert_eq!(
+        risk.len(),
+        time.len(),
+        "concordance: risk/time length mismatch"
+    );
+    assert_eq!(
+        time.len(),
+        event.len(),
+        "concordance: time/event length mismatch"
+    );
     let n = risk.len();
     let mut concordant = 0.0_f64;
     let mut comparable = 0.0_f64;
@@ -581,9 +589,7 @@ fn gam_weibull_aft_by_factor_recovers_true_survival_on_real_data() {
     // train rows and scores the held-out rows by predicted EXPECTED survival
     // time, then forms its own held-out C-index (lifelines orients C so that
     // higher predicted survival ⇒ lower risk). Held to the identical metric.
-    let is_train: Vec<f64> = (0..n)
-        .map(|i| if is_test(i) { 0.0 } else { 1.0 })
-        .collect();
+    let is_train: Vec<f64> = (0..n).map(|i| if is_test(i) { 0.0 } else { 1.0 }).collect();
     let py = run_python(
         &[
             Column::new("time", &time),

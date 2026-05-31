@@ -65,11 +65,7 @@ fn r_squared(pred: &[f64], truth: &[f64]) -> f64 {
     let n = truth.len() as f64;
     let mean = truth.iter().sum::<f64>() / n;
     let ss_tot: f64 = truth.iter().map(|y| (y - mean) * (y - mean)).sum();
-    let ss_res: f64 = pred
-        .iter()
-        .zip(truth)
-        .map(|(p, y)| (p - y) * (p - y))
-        .sum();
+    let ss_res: f64 = pred.iter().zip(truth).map(|(p, y)| (p - y) * (p - y)).sum();
     1.0 - ss_res / ss_tot.max(1e-300)
 }
 

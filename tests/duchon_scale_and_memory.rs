@@ -65,11 +65,7 @@ fn encode_xzy(x: &[f64], z: &[f64], y: &[f64]) -> gam::data::EncodedDataset {
     let headers = ["x", "z", "y"].into_iter().map(String::from).collect();
     let rows = (0..x.len())
         .map(|i| {
-            csv::StringRecord::from(vec![
-                x[i].to_string(),
-                z[i].to_string(),
-                y[i].to_string(),
-            ])
+            csv::StringRecord::from(vec![x[i].to_string(), z[i].to_string(), y[i].to_string()])
         })
         .collect();
     encode_recordswith_inferred_schema(headers, rows).expect("encode synthetic 2-D dataset")
@@ -288,7 +284,9 @@ fn duchon_lazy_chunked_path_is_exercised_and_recovers_truth() {
     // conservative lower bound (k itself) so the assertion can only UNDER-count,
     // never falsely claim the lazy path triggers.
     let policy = ResourcePolicy::for_problem(n, 0, ProblemHints::default());
-    let dense_bytes_lower_bound = n.saturating_mul(k).saturating_mul(std::mem::size_of::<f64>());
+    let dense_bytes_lower_bound = n
+        .saturating_mul(k)
+        .saturating_mul(std::mem::size_of::<f64>());
     assert!(
         dense_bytes_lower_bound > policy.max_single_materialization_bytes,
         "lazy-path test misconfigured: dense lower bound {dense_bytes_lower_bound} bytes does not \

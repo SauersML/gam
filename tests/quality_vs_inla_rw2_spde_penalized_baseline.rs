@@ -57,11 +57,7 @@ const QUAKES_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/qu
 fn held_out_r2(pred: &[f64], truth: &[f64]) -> f64 {
     assert_eq!(pred.len(), truth.len(), "held_out_r2 length mismatch");
     let m = truth.iter().sum::<f64>() / truth.len() as f64;
-    let ss_res: f64 = pred
-        .iter()
-        .zip(truth)
-        .map(|(p, t)| (p - t) * (p - t))
-        .sum();
+    let ss_res: f64 = pred.iter().zip(truth).map(|(p, t)| (p - t) * (p - t)).sum();
     let ss_tot: f64 = truth.iter().map(|t| (t - m) * (t - m)).sum();
     1.0 - ss_res / ss_tot.max(1e-300)
 }

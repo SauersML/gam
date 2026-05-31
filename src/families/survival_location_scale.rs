@@ -1,7 +1,7 @@
 use crate::basis::BasisOptions;
 use crate::custom_family::{
-    BlockEffectiveJacobian, BlockWorkingSet, BlockwiseFitOptions,
-    CustomFamily, CustomFamilyBlockPsiDerivative, CustomFamilyJointDesignChannel,
+    BlockEffectiveJacobian, BlockWorkingSet, BlockwiseFitOptions, CustomFamily,
+    CustomFamilyBlockPsiDerivative, CustomFamilyJointDesignChannel,
     CustomFamilyJointDesignPairContribution, CustomFamilyJointPsiOperator,
     CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef, CustomFamilyWarmStart,
     ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
@@ -8405,7 +8405,11 @@ impl SurvivalLocationScaleFamily {
         crate::util::block_jacobian::AdditiveWiggleBlockLayout {
             family: "SurvivalLocationScaleFamily",
             n_outputs: 3,
-            additive_blocks: &[Self::BLOCK_TIME, Self::BLOCK_THRESHOLD, Self::BLOCK_LOG_SIGMA],
+            additive_blocks: &[
+                Self::BLOCK_TIME,
+                Self::BLOCK_THRESHOLD,
+                Self::BLOCK_LOG_SIGMA,
+            ],
             wiggle_block: Some(Self::BLOCK_LINK_WIGGLE),
         }
         .block_effective_jacobian(specs, block_idx)

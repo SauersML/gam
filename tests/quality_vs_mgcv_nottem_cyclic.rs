@@ -44,8 +44,10 @@ use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith
 use ndarray::Array2;
 use std::path::Path;
 
-const NOTTEM_CSV: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/nottem_monthly_temp.csv");
+const NOTTEM_CSV: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/bench/datasets/nottem_monthly_temp.csv"
+);
 
 /// Month-of-year cyclic period: months 1..=12, with the seam (knots) at 1 and
 /// 13, so December (12) wraps continuously back to January (1). Both gam's
@@ -117,9 +119,8 @@ fn gam_cyclic_predicts_nottem_seasonal_cycle_vs_mgcv() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let formula = format!(
-        "temp ~ cc(month, k={K}, period_start={PERIOD_START}, period_end={PERIOD_END})"
-    );
+    let formula =
+        format!("temp ~ cc(month, k={K}, period_start={PERIOD_START}, period_end={PERIOD_END})");
     let result = fit_from_formula(&formula, &train_ds, &cfg).expect("gam cyclic fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for a gaussian cyclic smooth");
@@ -235,7 +236,11 @@ fn gam_cyclic_predicts_nottem_seasonal_cycle_vs_mgcv() {
 /// can ride along as a column of the reference data.frame. Only the first
 /// `v.len()` entries are read back inside the R body.
 fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
-    assert!(v.len() <= len, "pad target {len} shorter than source {}", v.len());
+    assert!(
+        v.len() <= len,
+        "pad target {len} shorter than source {}",
+        v.len()
+    );
     let fill = v.last().copied().unwrap_or(0.0);
     let mut out = v.to_vec();
     out.resize(len, fill);

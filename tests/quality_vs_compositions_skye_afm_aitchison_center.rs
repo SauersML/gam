@@ -202,7 +202,11 @@ fn gam_aitchison_center_of_skye_afm_lavas_is_optimal_and_clr_exact() {
 
     // ---- gam output: the Aitchison center of the lava suite -------------------
     let gam_mean = simplex_frechet_mean(raw.view(), None).expect("gam simplex_frechet_mean");
-    assert_eq!(gam_mean.len(), d, "gam center must have 3 components (A,F,M)");
+    assert_eq!(
+        gam_mean.len(),
+        d,
+        "gam center must have 3 components (A,F,M)"
+    );
 
     // ===================================================================== //
     // (A) GROUND-TRUTH RECOVERY: match the exact closed-form Aitchison center

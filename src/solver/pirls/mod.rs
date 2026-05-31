@@ -55,11 +55,6 @@ mod state;
 
 // Re-export public API that lived in the original flat file
 use convergence::effective_kkt_tolerance;
-use log_link_working_state::ETA_CLAMP;
-/// The canonical PIRLS numeric floors live in [`log_link_working_state`]; this
-/// re-export gives every family in the crate one shared `MIN_WEIGHT` so the
-/// weighted normal equations stay well posed with a single retunable value.
-pub(crate) use log_link_working_state::MIN_WEIGHT;
 use damping::{
     add_scaled_diagonal_to_upper_sparse, compute_lm_d2, update_scaled_diagonal_in_place,
 };
@@ -68,6 +63,11 @@ use edf::{
     calculate_edf_from_sparse_factor, calculate_edf_with_penalty,
     calculate_edfwithworkspace_from_factor, calculate_edfwithworkspace_with_penalty,
 };
+use log_link_working_state::ETA_CLAMP;
+/// The canonical PIRLS numeric floors live in [`log_link_working_state`]; this
+/// re-export gives every family in the crate one shared `MIN_WEIGHT` so the
+/// weighted normal equations stay well posed with a single retunable value.
+pub(crate) use log_link_working_state::MIN_WEIGHT;
 use penalty::{
     KroneckerQsTransform, PirlsPenalty, WorkingCoordinateDesign, WorkingReparamTransform,
     attach_penalty_shift,

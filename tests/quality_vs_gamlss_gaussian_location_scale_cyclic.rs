@@ -391,7 +391,8 @@ fn gam_cyclic_location_scale_recovers_truth_on_real_data() {
         env!("CARGO_MANIFEST_DIR"),
         "/bench/datasets/nottem_monthly_temp.csv"
     );
-    let ds = load_csvwith_inferred_schema(Path::new(NOTTEM_CSV)).expect("load nottem_monthly_temp.csv");
+    let ds =
+        load_csvwith_inferred_schema(Path::new(NOTTEM_CSV)).expect("load nottem_monthly_temp.csv");
     let col = ds.column_map();
     let month_idx = col["month"];
     let temp_idx = col["temp"];
@@ -543,8 +544,16 @@ fn gam_cyclic_location_scale_recovers_truth_on_real_data() {
     // NO() uses a log link on sigma, so the link-scale sigma predictor is exactly
     // log(sigma): exponentiate to get gamlss's held-out response-unit sigma.
     let gamlss_sigma: Vec<f64> = r.vector("log_sigma").iter().map(|&v| v.exp()).collect();
-    assert_eq!(gamlss_mean.len(), test_rows.len(), "gamlss mu length mismatch");
-    assert_eq!(gamlss_sigma.len(), test_rows.len(), "gamlss sigma length mismatch");
+    assert_eq!(
+        gamlss_mean.len(),
+        test_rows.len(),
+        "gamlss mu length mismatch"
+    );
+    assert_eq!(
+        gamlss_sigma.len(),
+        test_rows.len(),
+        "gamlss sigma length mismatch"
+    );
 
     // ---- objective held-out metrics ---------------------------------------
     let gam_nll = gaussian_nll(&gam_test_mean, &gam_test_sigma, &test_temp);

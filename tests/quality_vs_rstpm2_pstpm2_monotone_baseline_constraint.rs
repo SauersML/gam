@@ -140,8 +140,7 @@ fn gam_penalized_baseline_is_monotone_and_concordant_on_cirrhosis() {
 
     // Center age at the TRAIN mean (test rows use the same shift — no leakage of
     // the test distribution into the centering constant).
-    let age_train_mean =
-        train_idx.iter().map(|&i| age[i]).sum::<f64>() / train_idx.len() as f64;
+    let age_train_mean = train_idx.iter().map(|&i| age[i]).sum::<f64>() / train_idx.len() as f64;
     let age_c: Vec<f64> = age.iter().map(|a| a - age_train_mean).collect();
 
     // ---- encode the TRAIN survival frame for gam --------------------------
@@ -460,7 +459,11 @@ fn gam_covariate_risk_scores(
 /// metric. Identical estimator is applied to gam's and pstpm2's risk scores so
 /// the comparison is apples-to-apples.
 fn harrell_c_index(time: &[f64], event: &[f64], risk: &[f64]) -> f64 {
-    assert_eq!(time.len(), event.len(), "C-index: time/event length mismatch");
+    assert_eq!(
+        time.len(),
+        event.len(),
+        "C-index: time/event length mismatch"
+    );
     assert_eq!(time.len(), risk.len(), "C-index: time/risk length mismatch");
     let n = time.len();
     let mut concordant = 0.0_f64;

@@ -6833,7 +6833,13 @@ impl DesignMatrix {
             return Ok(());
         }
         // Per-element scaling: `alpha * v` (axpy) or `alpha * v^2` (squared).
-        let scale = |value: f64| if square { alpha * value * value } else { alpha * value };
+        let scale = |value: f64| {
+            if square {
+                alpha * value * value
+            } else {
+                alpha * value
+            }
+        };
         match self {
             Self::Dense(matrix) => {
                 if let Some(dense) = matrix.as_dense_ref() {

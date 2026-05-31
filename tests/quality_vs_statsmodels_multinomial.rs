@@ -473,10 +473,7 @@ fn multinomial_logit_recovers_true_softmax_and_beats_statsmodels_on_real_data() 
         label.push(species_label(f[i_species].trim()));
     }
     let n = label.len();
-    assert!(
-        n > 300,
-        "expected ~333 complete penguin rows, got {n}"
-    );
+    assert!(n > 300, "expected ~333 complete penguin rows, got {n}");
 
     // ---- standardize the covariates (zero mean, unit sd) ------------------
     // Standardizing keeps the multinomial Newton solve well-conditioned and

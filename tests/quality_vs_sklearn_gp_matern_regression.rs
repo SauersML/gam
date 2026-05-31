@@ -323,10 +323,7 @@ fn gam_matern_gp_recovers_truth_and_beats_sklearn_on_real_data() {
             Column::new("range", &train_range),
             Column::new("logratio", &train_logratio),
             Column::new("test_range", &pad_to(&test_range, train_range.len())),
-            Column::new(
-                "test_n",
-                &vec![test_range.len() as f64; train_range.len()],
-            ),
+            Column::new("test_n", &vec![test_range.len() as f64; train_range.len()]),
         ],
         r#"
 from sklearn.gaussian_process import GaussianProcessRegressor

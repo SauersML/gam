@@ -337,9 +337,8 @@ fn dense_locscale_block_designs_cached<'a>(
     primary_label: &str,
     material_policy: &crate::resource::MaterializationPolicy,
 ) -> Result<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>), String> {
-    let primary_design = primary_design.ok_or_else(|| {
-        format!("{family_name} exact path is missing {primary_label} design")
-    })?;
+    let primary_design = primary_design
+        .ok_or_else(|| format!("{family_name} exact path is missing {primary_label} design"))?;
     let log_sigma_design = log_sigma_design
         .ok_or_else(|| format!("{family_name} exact path is missing log-sigma design"))?;
     let primary = match primary_design.as_dense_ref() {
@@ -359,9 +358,7 @@ fn dense_locscale_block_designs_cached<'a>(
         None => Cow::Owned(
             log_sigma_design
                 .try_to_dense_with_policy(material_policy, "gamlss dense_locscale_block_designs")
-                .map_err(|e| {
-                    format!("{short_family_name} dense_block_designs log_sigma: {e}")
-                })?
+                .map_err(|e| format!("{short_family_name} dense_block_designs log_sigma: {e}"))?
                 .as_ref()
                 .clone(),
         ),
@@ -436,9 +433,9 @@ fn locscale_joint_psi_direction_parts(
                         &format!("{family_name} {primary_label}"),
                         policy,
                     )?;
-                    primary_z = primary_psi.forward_mul(beta_primary.view()).map_err(|e| {
-                        format!("{family_name} {primary_label} forward_mul: {e}")
-                    })?;
+                    primary_z = primary_psi
+                        .forward_mul(beta_primary.view())
+                        .map_err(|e| format!("{family_name} {primary_label} forward_mul: {e}"))?;
                     log_sigma_psi = PsiDesignMap::Zero {
                         nrows: n,
                         ncols: p_log_sigma,
@@ -453,10 +450,9 @@ fn locscale_joint_psi_direction_parts(
                         &format!("{family_name} log-sigma"),
                         policy,
                     )?;
-                    log_sigma_z =
-                        log_sigma_psi.forward_mul(beta_log_sigma.view()).map_err(|e| {
-                            format!("{family_name} log-sigma forward_mul: {e}")
-                        })?;
+                    log_sigma_z = log_sigma_psi
+                        .forward_mul(beta_log_sigma.view())
+                        .map_err(|e| format!("{family_name} log-sigma forward_mul: {e}"))?;
                     primary_psi = PsiDesignMap::Zero {
                         nrows: n,
                         ncols: p_primary,
@@ -9981,8 +9977,8 @@ fn gls_wiggle_second_directional_coeffs(
     let zeta_u_zeta_v = zeta_u * zeta_v;
     let dw_u = -2.0 * &rows.w * &szeta_u;
     let dw_v = -2.0 * &rows.w * &szeta_v;
-    let dw_uv = 4.0 * &rows.w * &(&szeta_u * &szeta_v)
-        - 2.0 * &rows.w * &rows.kappa_prime * &zeta_u_zeta_v;
+    let dw_uv =
+        4.0 * &rows.w * &(&szeta_u * &szeta_v) - 2.0 * &rows.w * &rows.kappa_prime * &zeta_u_zeta_v;
     let dm_u = -(&rows.w * q_u) - &(2.0 * &rows.m * &szeta_u);
     let dm_v = -(&rows.w * q_v) - &(2.0 * &rows.m * &szeta_v);
     let dm_uv = &(2.0 * &rows.w * &(q_u * &szeta_v + q_v * &szeta_u)) - &(&rows.w * q_uv)
@@ -10019,10 +10015,9 @@ fn gls_wiggle_second_directional_coeffs(
     let two_ki2_minus_kpi = 2.0 * &rows.kappa * &rows.kappa - &rows.kappa_prime;
     let four_kkpi_minus_kdpi = 4.0 * &(&rows.kappa * &rows.kappa_prime) - &rows.kappa_dprime;
     let zeta_n_sym = zeta_u * &dn_v + zeta_v * &dn_u;
-    let bracketed_eta_eta = 4.0
-        * &rows.n
-        * &(&rows.kappa_prime * &rows.kappa_prime + &rows.kappa * &rows.kappa_dprime)
-        + &kappa_tprime * &amn;
+    let bracketed_eta_eta =
+        4.0 * &rows.n * &(&rows.kappa_prime * &rows.kappa_prime + &rows.kappa * &rows.kappa_dprime)
+            + &kappa_tprime * &amn;
     let coeff_ll_uv = &two_ki2_minus_kpi * &dn_uv
         + &four_kkpi_minus_kdpi * &zeta_n_sym
         + &bracketed_eta_eta * &zeta_u_zeta_v;
@@ -26455,9 +26450,7 @@ mod tests {
         let psi2_terms = family
             .exact_newton_joint_psisecond_order_terms(block_states, blocks, derivative_blocks, 0, 0)
             .expect("joint psi second-order call")
-            .unwrap_or_else(|| {
-                panic!("{label} family should return joint psi second-order terms")
-            });
+            .unwrap_or_else(|| panic!("{label} family should return joint psi second-order terms"));
         let total = block_states
             .iter()
             .map(|state| state.beta.len())

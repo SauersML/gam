@@ -64,7 +64,10 @@ fn encoded_dataset(n: usize, d: usize, seed: u64) -> gam::inference::data::Encod
 
 /// Pull the (nullspace_order, power) of the first (and only) Duchon smooth term
 /// from a resolved formula, without fitting.
-fn resolved_duchon(formula: &str, ds: &gam::inference::data::EncodedDataset) -> (DuchonNullspaceOrder, f64) {
+fn resolved_duchon(
+    formula: &str,
+    ds: &gam::inference::data::EncodedDataset,
+) -> (DuchonNullspaceOrder, f64) {
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()

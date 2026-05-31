@@ -476,7 +476,10 @@ fn gam_multinomial_recovers_true_class_simplex_on_real_data() {
     let n_train = design.nrows();
     let p = design.ncols();
     assert_eq!(n_train, train_rows.len(), "train design row count");
-    assert!(p >= 4, "expect intercept + weather + spline columns, got P={p}");
+    assert!(
+        p >= 4,
+        "expect intercept + weather + spline columns, got P={p}"
+    );
 
     // Shared P x P smooth penalty (intercept + linear blocks unpenalized).
     let mut penalty = Array2::<f64>::zeros((p, p));
@@ -536,7 +539,11 @@ fn gam_multinomial_recovers_true_class_simplex_on_real_data() {
         .design
         .try_to_dense_by_chunks("multinomial test design")
         .expect("materialize gam test design");
-    assert_eq!(test_design.ncols(), p, "test design column count must match train");
+    assert_eq!(
+        test_design.ncols(),
+        p,
+        "test design column count must match train"
+    );
     let n_test = test_design.nrows();
     assert_eq!(n_test, test_rows.len(), "test design row count");
 
@@ -621,9 +628,16 @@ emit("nclass", [probs.shape[1]])
 "#;
     let r = run_python(&cols, py_body);
     let nclass = r.scalar("nclass") as usize;
-    assert_eq!(nclass, RJ, "statsmodels recovered {nclass} classes, expected {RJ}");
+    assert_eq!(
+        nclass, RJ,
+        "statsmodels recovered {nclass} classes, expected {RJ}"
+    );
     let ref_flat = r.vector("probs");
-    assert_eq!(ref_flat.len(), n_test * RJ, "reference test prob size mismatch");
+    assert_eq!(
+        ref_flat.len(),
+        n_test * RJ,
+        "reference test prob size mismatch"
+    );
     let ref_test_probs: Vec<Vec<f64>> = (0..n_test)
         .map(|k| (0..RJ).map(|j| ref_flat[k * RJ + j]).collect())
         .collect();
