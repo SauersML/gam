@@ -42,15 +42,17 @@ fn rms(v: &[f64]) -> f64 {
     (v.iter().map(|t| t * t).sum::<f64>() / v.len() as f64).sqrt()
 }
 
-/// Print one comparison row and assert both gam variants beat the trivial
-/// (zero/mean) predictor whose RMSE is `rms_truth`.
-fn report_and_check(
+/// Print one comparison row; returns whether BOTH gam variants genuinely beat
+/// the trivial (zero/mean) predictor, whose RMSE is `rms_truth`. A real
+/// reconstruction sits clearly below it; 70% of `rms_truth` is a generous
+/// "recovering, not blown up / collapsed" floor.
+fn report_recovers(
     label: &str,
     rmse_r3: f64,
     rmse_r2logr: f64,
     rmse_mgcv: f64,
     rms_truth: f64,
-) {
+) -> bool {
     let winner = if rmse_r3 <= rmse_r2logr && rmse_r3 <= rmse_mgcv {
         "gam r³"
     } else if rmse_r2logr <= rmse_r3 && rmse_r2logr <= rmse_mgcv {
@@ -62,18 +64,8 @@ fn report_and_check(
         "{label:28} | gam r³={rmse_r3:.4} | gam r²·logr={rmse_r2logr:.4} | mgcv={rmse_mgcv:.4} \
          | rms_truth={rms_truth:.4} | best: {winner}"
     );
-    // Non-degeneracy: a real reconstruction sits clearly below the trivial
-    // predictor (RMSE = rms_truth). 70% of that is a generous "genuinely
-    // recovering, not blown up / collapsed" floor.
     let floor = 0.70 * rms_truth;
-    assert!(
-        rmse_r3 < floor,
-        "{label}: gam r³ did not recover (rmse {rmse_r3:.4} ≥ {floor:.4})"
-    );
-    assert!(
-        rmse_r2logr < floor,
-        "{label}: gam r²·log r did not recover (rmse {rmse_r2logr:.4} ≥ {floor:.4})"
-    );
+    rmse_r3 < floor && rmse_r2logr < floor
 }
 
 #[test]
@@ -138,12 +130,15 @@ fn bench_duchon_kernel_accuracy_1d() {
         );
         let mgcv = r.vector("fitted");
 
-        report_and_check(
-            label,
-            rmse(&r3, &y_truth),
-            rmse(&r2logr, &y_truth),
-            rmse(mgcv, &y_truth),
-            rms(&y_truth),
+        assert!(
+            report_recovers(
+                label,
+                rmse(&r3, &y_truth),
+                rmse(&r2logr, &y_truth),
+                rmse(mgcv, &y_truth),
+                rms(&y_truth),
+            ),
+            "{label}: a gam Duchon variant failed to recover the signal (beat the trivial predictor)"
         );
     }
 }
@@ -234,12 +229,15 @@ fn bench_duchon_kernel_accuracy_2d() {
         );
         let mgcv = r.vector("fitted");
 
-        report_and_check(
-            label,
-            rmse(&r3, &y_truth),
-            rmse(&r2logr, &y_truth),
-            rmse(mgcv, &y_truth),
-            rms(&y_truth),
+        assert!(
+            report_recovers(
+                label,
+                rmse(&r3, &y_truth),
+                rmse(&r2logr, &y_truth),
+                rmse(mgcv, &y_truth),
+                rms(&y_truth),
+            ),
+            "{label}: a gam Duchon variant failed to recover the signal (beat the trivial predictor)"
         );
     }
 }
