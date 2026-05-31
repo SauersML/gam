@@ -1033,6 +1033,40 @@ fn solve_newton_direction_with_linear_constraints_impl(
         )?;
         let step_norm = d.iter().map(|v| v * v).sum::<f64>().sqrt();
         if step_norm <= tol_step {
+            // A "stationary" iterate is only a genuine KKT point if it is
+            // also primal-feasible on the FULL constraint set. The
+            // "blocking-add" loop further down only catches rows that
+            // become tight DURING a non-degenerate step, so a tiny step
+            // entered with a residual violation on an inactive row would
+            // otherwise leak an infeasible direction through this
+            // short-circuit unchecked. Grow the active set with the
+            // most-violated inactive row and re-solve; `residualw` for that
+            // row will be non-zero on the next KKT solve, so the resulting
+            // step is non-degenerate.
+            let (worst, worst_row) = max_linear_constraint_violation(&x, constraints);
+            if worst > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL && !is_active[worst_row] {
+                active.push(worst_row);
+                is_active[worst_row] = true;
+                log_active_set_transition(
+                    "stationary-infeasible-add",
+                    iteration,
+                    active.len(),
+                    Some(worst_row),
+                );
+                record_active_working_set(&mut visited_working_sets, &active, iteration)?;
+                continue;
+            }
+            if worst > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
+                // The worst-violating row is already in the active set —
+                // the KKT step failed to restore its feasibility, typically
+                // because a previous iteration's `alpha`-clip prevented the
+                // full residual closure. Fall through to the post-loop exit
+                // gate, which inspects the iterate's full KKT residuals and
+                // either tries the projected-gradient fallback or returns
+                // an explicit error. Both are correct outcomes; silently
+                // returning the infeasible direction is not.
+                break;
+            }
             if compressed_working.groups.is_empty() {
                 direction_out.assign(&d_total);
                 return Ok(());
