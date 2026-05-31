@@ -47,8 +47,8 @@ fn fit_and_predict_on_grid(formula: &str, x: &[f64], y: &[f64]) -> Vec<f64> {
     let x_idx = col["x"];
 
     let cfg = FitConfig::default(); // gaussian / identity / REML
-    let result =
-        fit_from_formula(formula, &ds, &cfg).unwrap_or_else(|e| panic!("fit '{formula}' failed: {e}"));
+    let result = fit_from_formula(formula, &ds, &cfg)
+        .unwrap_or_else(|e| panic!("fit '{formula}' failed: {e}"));
     let FitResult::Standard(fit) = result else {
         panic!("1-D gaussian smooth should be a Standard GAM fit");
     };
