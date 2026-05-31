@@ -300,7 +300,21 @@ pub fn standard_normal_quantile(p: f64) -> Result<f64, String> {
         if !(density.is_finite() && density > 0.0) {
             break;
         }
-        let correction = (normal_cdf(x) - p) / density;
+        // Residual F(x) − p, formed without catastrophic cancellation in
+        // either tail. For an upper-tail iterate `x > 0`, `normal_cdf(x)`
+        // saturates to ~1, so the direct `normal_cdf(x) − p` annihilates the
+        // tiny residual the polish must act on; instead use the upper-tail
+        // complement `F(x) − p = (1 − p) − 0.5·erfc(x/√2)`, where both terms
+        // are the small upper-tail quantities (`1 − p` is exact by Sterbenz
+        // for `p ∈ [½,1)`). For `x ≤ 0`, `normal_cdf(x) = 0.5·erfc(|x|/√2)` is
+        // itself the faithfully carried small lower-tail value, so the direct
+        // form is already cancellation-free.
+        let residual = if x > 0.0 {
+            (1.0 - p) - 0.5 * erfc(x / std::f64::consts::SQRT_2)
+        } else {
+            normal_cdf(x) - p
+        };
+        let correction = residual / density;
         let denominator = 1.0 + 0.5 * x * correction;
         if !(correction.is_finite() && denominator.is_finite() && denominator != 0.0) {
             break;
