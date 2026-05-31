@@ -38,7 +38,8 @@ use gam::geometry::poincare::{
     tangent_decode_forward as poincare_tangent_decode_forward_impl,
     to_lorentz as poincare_to_lorentz_impl,
 };
-use gam::geometry::simplex::simplex_frechet_mean;
+use gam::geometry::simplex::{closure as simplex_closure, simplex_frechet_mean};
+use gam::geometry::sphere::normalize_sphere_matrix;
 use gam::hmc::{NutsConfig, NutsResult};
 use gam::inference::data::{
     EncodedDataset, UnseenCategoryPolicy, encode_recordswith_inferred_schema,
@@ -17695,64 +17696,6 @@ fn equivariant_penalty_value<'py>(
 // that delegates to a pure-Rust impl on ndarray views.
 // ===========================================================================
 
-fn rg_vector_norm(v: ArrayView1<'_, f64>) -> f64 {
-    v.iter().map(|x| x * x).sum::<f64>().sqrt()
-}
-
-fn rg_validate_array(values: ArrayView2<'_, f64>, label: &str) -> Result<(), String> {
-    let (n, d) = values.dim();
-    if n == 0 || d < 2 {
-        return Err(format!(
-            "{label} must have at least one row and at least two columns"
-        ));
-    }
-    if let Some(((row, col), value)) = values.indexed_iter().find(|(_, v)| !v.is_finite()) {
-        return Err(format!(
-            "{label} must contain only finite values; got {value} at ({row}, {col})"
-        ));
-    }
-    Ok(())
-}
-
-fn rg_normalize_sphere_matrix(values: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
-    rg_validate_array(values, "spherical values")?;
-    let (n, d) = values.dim();
-    let mut out = Array2::<f64>::zeros((n, d));
-    for row in 0..n {
-        let norm = rg_vector_norm(values.row(row));
-        if norm <= 0.0 {
-            return Err("spherical rows must have non-zero norm".to_string());
-        }
-        for col in 0..d {
-            out[[row, col]] = values[[row, col]] / norm;
-        }
-    }
-    Ok(out)
-}
-
-fn rg_closure_impl(values: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
-    rg_validate_array(values, "simplex values")?;
-    let (n, d) = values.dim();
-    let mut out = Array2::<f64>::zeros((n, d));
-    for row in 0..n {
-        let mut total = 0.0_f64;
-        for col in 0..d {
-            let v = values[[row, col]];
-            if v < 0.0 {
-                return Err("simplex values must be non-negative".to_string());
-            }
-            total += v;
-        }
-        if total <= 0.0 {
-            return Err("simplex rows must have positive total mass".to_string());
-        }
-        for col in 0..d {
-            out[[row, col]] = values[[row, col]] / total;
-        }
-    }
-    Ok(out)
-}
-
 fn rg_require_positive(comp: ArrayView2<'_, f64>, label: &str) -> Result<(), String> {
     for value in comp.iter() {
         if *value <= 0.0 {
@@ -17763,7 +17706,7 @@ fn rg_require_positive(comp: ArrayView2<'_, f64>, label: &str) -> Result<(), Str
 }
 
 fn rg_clr_impl(values: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
-    let comp = rg_closure_impl(values)?;
+    let comp = simplex_closure(values)?;
     rg_require_positive(comp.view(), "CLR coordinates")?;
     let (n, d) = comp.dim();
     let mut out = Array2::<f64>::zeros((n, d));
@@ -17792,7 +17735,7 @@ fn rg_resolve_reference(reference: isize, d: usize) -> usize {
 }
 
 fn rg_alr_impl(values: ArrayView2<'_, f64>, reference: isize) -> Result<Array2<f64>, String> {
-    let comp = rg_closure_impl(values)?;
+    let comp = simplex_closure(values)?;
     rg_require_positive(comp.view(), "ALR coordinates")?;
     let (n, d) = comp.dim();
     let ref_idx = rg_resolve_reference(reference, d);
@@ -17873,9 +17816,9 @@ fn rg_simplex_log_map_impl(
     coord: RgSimplexCoord,
     reference: isize,
 ) -> Result<Array2<f64>, String> {
-    let comp = rg_closure_impl(values)?;
+    let comp = simplex_closure(values)?;
     let base2 = Array2::from_shape_fn((1, base.len()), |(_, j)| base[j]);
-    let base_comp = rg_closure_impl(base2.view())?;
+    let base_comp = simplex_closure(base2.view())?;
     if comp.ncols() != base_comp.ncols() {
         return Err("simplex values and base point have different dimensions".to_string());
     }
@@ -17916,7 +17859,7 @@ fn rg_simplex_exp_map_impl(
     reference: isize,
 ) -> Result<Array2<f64>, String> {
     let base2 = Array2::from_shape_fn((1, base.len()), |(_, j)| base[j]);
-    let base_comp = rg_closure_impl(base2.view())?;
+    let base_comp = simplex_closure(base2.view())?;
     let d = base_comp.ncols();
     match coord {
         RgSimplexCoord::Clr => {
@@ -17968,9 +17911,9 @@ fn rg_sphere_log_map_impl(
     values: ArrayView2<'_, f64>,
     base: ArrayView1<'_, f64>,
 ) -> Result<Array2<f64>, String> {
-    let y = rg_normalize_sphere_matrix(values)?;
+    let y = normalize_sphere_matrix(values)?;
     let base2 = Array2::from_shape_fn((1, base.len()), |(_, j)| base[j]);
-    let b_mat = rg_normalize_sphere_matrix(base2.view())?;
+    let b_mat = normalize_sphere_matrix(base2.view())?;
     let (n, d) = y.dim();
     if d != b_mat.ncols() {
         return Err("spherical values and base point have different dimensions".to_string());
@@ -18010,7 +17953,7 @@ fn rg_sphere_exp_map_impl(
     base: ArrayView1<'_, f64>,
 ) -> Result<Array2<f64>, String> {
     let base2 = Array2::from_shape_fn((1, base.len()), |(_, j)| base[j]);
-    let b_mat = rg_normalize_sphere_matrix(base2.view())?;
+    let b_mat = normalize_sphere_matrix(base2.view())?;
     let (n, d) = tangent.dim();
     if d != b_mat.ncols() {
         return Err("spherical tangent and base point have different dimensions".to_string());
@@ -18417,7 +18360,7 @@ fn response_geometry_closure<'py>(
 ) -> PyResult<Py<PyArray2<f64>>> {
     let arr = values.as_array().to_owned();
     let out = detach_py_result(py, "response_geometry_closure", move || {
-        rg_closure_impl(arr.view())
+        simplex_closure(arr.view())
     })?;
     Ok(out.into_pyarray(py).unbind())
 }

@@ -1,6 +1,6 @@
 use crate::basis::BasisOptions;
 use crate::custom_family::{
-    AdditiveBlockJacobian, BlockEffectiveJacobian, BlockWorkingSet, BlockwiseFitOptions,
+    BlockEffectiveJacobian, BlockWorkingSet, BlockwiseFitOptions,
     CustomFamily, CustomFamilyBlockPsiDerivative, CustomFamilyJointDesignChannel,
     CustomFamilyJointDesignPairContribution, CustomFamilyJointPsiOperator,
     CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef, CustomFamilyWarmStart,
@@ -8414,38 +8414,13 @@ impl SurvivalLocationScaleFamily {
         specs: &[ParameterBlockSpec],
         block_idx: usize,
     ) -> Result<Box<dyn BlockEffectiveJacobian>, String> {
-        const N_OUTPUTS: usize = 3;
-        if block_idx >= specs.len() {
-            return Err(format!(
-                "SurvivalLocationScaleFamily::block_effective_jacobian: block_idx {} out of range ({})",
-                block_idx,
-                specs.len()
-            ));
+        crate::util::block_jacobian::AdditiveWiggleBlockLayout {
+            family: "SurvivalLocationScaleFamily",
+            n_outputs: 3,
+            additive_blocks: &[Self::BLOCK_TIME, Self::BLOCK_THRESHOLD, Self::BLOCK_LOG_SIGMA],
+            wiggle_block: Some(Self::BLOCK_LINK_WIGGLE),
         }
-        match block_idx {
-            Self::BLOCK_TIME | Self::BLOCK_THRESHOLD | Self::BLOCK_LOG_SIGMA => {
-                let design = specs[block_idx]
-                    .effective_design("SurvivalLocationScaleFamily::block_effective_jacobian")?;
-                Ok(Box::new(AdditiveBlockJacobian {
-                    design,
-                    own_output: block_idx,
-                    n_family_outputs: N_OUTPUTS,
-                }))
-            }
-            Self::BLOCK_LINK_WIGGLE => {
-                let n = specs[Self::BLOCK_TIME].design.nrows();
-                let p = specs[block_idx].design.ncols();
-                Ok(Box::new(AdditiveBlockJacobian {
-                    design: ndarray::Array2::<f64>::zeros((n, p)),
-                    own_output: 0,
-                    n_family_outputs: N_OUTPUTS,
-                }))
-            }
-            other => Err(format!(
-                "SurvivalLocationScaleFamily::block_effective_jacobian: unknown block_idx {}",
-                other
-            )),
-        }
+        .block_effective_jacobian(specs, block_idx)
     }
 }
 

@@ -1,6 +1,6 @@
 use ndarray::{Array2, ArrayView1, ArrayView2};
 
-fn validate_simplex_array(points: ArrayView2<'_, f64>) -> Result<(), String> {
+pub fn validate_simplex_array(points: ArrayView2<'_, f64>) -> Result<(), String> {
     let (n, d) = points.dim();
     if n == 0 || d < 2 {
         return Err(
@@ -41,7 +41,7 @@ fn normalize_weights(n: usize, weights: Option<ArrayView1<'_, f64>>) -> Result<V
     }
 }
 
-fn closure(points: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+pub fn closure(points: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
     validate_simplex_array(points)?;
     let (n, d) = points.dim();
     let mut out = Array2::<f64>::zeros((n, d));

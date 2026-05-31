@@ -6772,49 +6772,7 @@ impl DesignMatrix {
         alpha: f64,
         out: &mut ArrayViewMut1<'_, f64>,
     ) -> Result<(), String> {
-        if out.len() != self.ncols() {
-            return Err(format!(
-                "DesignMatrix::axpy_row_into length mismatch: out={}, ncols={}",
-                out.len(),
-                self.ncols()
-            ));
-        }
-        if alpha == 0.0 {
-            return Ok(());
-        }
-        match self {
-            Self::Dense(matrix) => {
-                if let Some(dense) = matrix.as_dense_ref() {
-                    for (dst, &value) in out.iter_mut().zip(dense.row(row).iter()) {
-                        *dst += alpha * value;
-                    }
-                } else {
-                    let chunk = matrix
-                        .try_row_chunk(row..row + 1)
-                        .map_err(|e| format!("DesignMatrix::axpy_row_into: {e}"))?;
-                    for (dst, &value) in out.iter_mut().zip(chunk.row(0).iter()) {
-                        *dst += alpha * value;
-                    }
-                }
-            }
-            Self::Sparse(matrix) => {
-                // SAFETY: `to_csr_arc` returns `None` only if csc→csr conversion
-                // fails, which is infallible for the well-formed sparse matrices
-                // that `SparseDesignMatrix` is contractually allowed to hold.
-                // SAFETY: SparseDesignMatrix invariants guarantee csc→csr conversion succeeds.
-                let csr = matrix.to_csr_arc().ok_or_else(|| {
-                    "DesignMatrix::axpy_row_into: failed to obtain CSR view".to_string()
-                })?;
-                let sym = csr.symbolic();
-                let row_ptr = sym.row_ptr();
-                let col_idx = sym.col_idx();
-                let vals = csr.val();
-                for ptr in row_ptr[row]..row_ptr[row + 1] {
-                    out[col_idx[ptr]] += alpha * vals[ptr];
-                }
-            }
-        }
-        Ok(())
+        self.axpy_row_into_impl(row, alpha, out, false, "axpy_row_into")
     }
 
     /// Add `alpha * X[row, :]^2` elementwise into `out` without allocating a
@@ -6825,9 +6783,27 @@ impl DesignMatrix {
         alpha: f64,
         out: &mut ArrayViewMut1<'_, f64>,
     ) -> Result<(), String> {
+        self.axpy_row_into_impl(row, alpha, out, true, "squared_axpy_row_into")
+    }
+
+    /// Shared kernel for [`axpy_row_into`](Self::axpy_row_into) and
+    /// [`squared_axpy_row_into`](Self::squared_axpy_row_into): adds
+    /// `alpha * X[row, :]` (when `square` is `false`) or
+    /// `alpha * X[row, :]^2` elementwise (when `square` is `true`) into `out`
+    /// without allocating a row buffer. `method` names the public entry point
+    /// in error messages.
+    #[inline]
+    fn axpy_row_into_impl(
+        &self,
+        row: usize,
+        alpha: f64,
+        out: &mut ArrayViewMut1<'_, f64>,
+        square: bool,
+        method: &str,
+    ) -> Result<(), String> {
         if out.len() != self.ncols() {
             return Err(format!(
-                "DesignMatrix::squared_axpy_row_into length mismatch: out={}, ncols={}",
+                "DesignMatrix::{method} length mismatch: out={}, ncols={}",
                 out.len(),
                 self.ncols()
             ));
@@ -6835,18 +6811,20 @@ impl DesignMatrix {
         if alpha == 0.0 {
             return Ok(());
         }
+        // Per-element scaling: `alpha * v` (axpy) or `alpha * v^2` (squared).
+        let scale = |value: f64| if square { alpha * value * value } else { alpha * value };
         match self {
             Self::Dense(matrix) => {
                 if let Some(dense) = matrix.as_dense_ref() {
                     for (dst, &value) in out.iter_mut().zip(dense.row(row).iter()) {
-                        *dst += alpha * value * value;
+                        *dst += scale(value);
                     }
                 } else {
                     let chunk = matrix
                         .try_row_chunk(row..row + 1)
-                        .map_err(|e| format!("DesignMatrix::squared_axpy_row_into: {e}"))?;
+                        .map_err(|e| format!("DesignMatrix::{method}: {e}"))?;
                     for (dst, &value) in out.iter_mut().zip(chunk.row(0).iter()) {
-                        *dst += alpha * value * value;
+                        *dst += scale(value);
                     }
                 }
             }
@@ -6855,16 +6833,15 @@ impl DesignMatrix {
                 // fails, which is infallible for the well-formed sparse matrices
                 // that `SparseDesignMatrix` is contractually allowed to hold.
                 // SAFETY: SparseDesignMatrix invariants guarantee csc→csr conversion succeeds.
-                let csr = matrix.to_csr_arc().ok_or_else(|| {
-                    "DesignMatrix::squared_axpy_row_into: failed to obtain CSR view".to_string()
-                })?;
+                let csr = matrix
+                    .to_csr_arc()
+                    .ok_or_else(|| format!("DesignMatrix::{method}: failed to obtain CSR view"))?;
                 let sym = csr.symbolic();
                 let row_ptr = sym.row_ptr();
                 let col_idx = sym.col_idx();
                 let vals = csr.val();
                 for ptr in row_ptr[row]..row_ptr[row + 1] {
-                    let value = vals[ptr];
-                    out[col_idx[ptr]] += alpha * value * value;
+                    out[col_idx[ptr]] += scale(vals[ptr]);
                 }
             }
         }
