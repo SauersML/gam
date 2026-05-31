@@ -14,13 +14,17 @@ name: Reference Quality Suite
 # compile-error table, but does not gate the pipeline red on assertion failures.
 
 on:
+  # Periodic dashboard rather than per-commit: building+running 139 heavy
+  # integration binaries is too expensive to do on every quality-test push, and
+  # the concurrent src/ churn would otherwise re-trigger it constantly. The
+  # schedule gives a warm-cache run every few hours; dispatch is on-demand.
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch: {}
   push:
     branches: [main]
     paths:
-      - "tests/quality_vs_*.rs"
-      - "src/test_support/reference.rs"
       - ".github/workflows/reference-quality.yml"
-  workflow_dispatch: {}
 
 # Do NOT cancel an in-progress run when a new push lands: this job is a slow
 # (full R+Python stack install + ~130 test-binary builds) match-vs-diverge
@@ -60,6 +64,14 @@ jobs:
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          # Cache all dependency crates (not just direct deps) under a shared
+          # key so consecutive runs warm-restore the full dependency build (the
+          # multi-GB faer/burn/ndarray/arrow chunk). The gam lib + the per-test
+          # binaries still rebuild when src/ changes — that is inherent and not
+          # cacheable, which is why the trigger below is periodic, not per-commit.
+          cache-all-crates: true
+          shared-key: reference-quality
 
       - name: Set up R
         uses: ./.github/actions/setup-bench-r
