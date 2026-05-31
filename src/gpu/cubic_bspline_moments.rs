@@ -304,55 +304,13 @@ pub fn moment_1d_local(c: [f64; PROD_LEN], width: f64, nu: usize) -> f64 {
 // 20-point Gauss-Legendre reference (parity gate for the closed-form path)
 // ────────────────────────────────────────────────────────────────────────
 
-/// 20-point Gauss-Legendre nodes/weights on [-1, 1]. Tabulated to f64 precision
-/// from the standard reference (Abramowitz & Stegun 25.4). Sufficient to
-/// integrate any polynomial of degree ≤ 39 exactly in finite arithmetic, far
-/// more than our degree-≤ (6 + ν) integrand needs.
-const GL20_X: [f64; 20] = [
-    -0.993_128_599_185_094_9,
-    -0.963_971_927_277_913_8,
-    -0.912_234_428_251_325_9,
-    -0.839_116_971_822_218_8,
-    -0.746_331_906_460_150_8,
-    -0.636_053_680_726_515_0,
-    -0.510_867_001_950_827_1,
-    -0.373_706_088_715_419_6,
-    -0.227_785_851_141_645_1,
-    -0.076_526_521_133_497_3,
-    0.076_526_521_133_497_3,
-    0.227_785_851_141_645_1,
-    0.373_706_088_715_419_6,
-    0.510_867_001_950_827_1,
-    0.636_053_680_726_515_0,
-    0.746_331_906_460_150_8,
-    0.839_116_971_822_218_8,
-    0.912_234_428_251_325_9,
-    0.963_971_927_277_913_8,
-    0.993_128_599_185_094_9,
-];
-
-const GL20_W: [f64; 20] = [
-    0.017_614_007_139_152_1,
-    0.040_601_429_800_386_9,
-    0.062_672_048_334_109_1,
-    0.083_276_741_576_704_7,
-    0.101_930_119_817_240_5,
-    0.118_194_531_961_518_4,
-    0.131_688_638_449_176_6,
-    0.142_096_109_318_382_1,
-    0.149_172_986_472_603_7,
-    0.152_753_387_130_725_8,
-    0.152_753_387_130_725_8,
-    0.149_172_986_472_603_7,
-    0.142_096_109_318_382_1,
-    0.131_688_638_449_176_6,
-    0.118_194_531_961_518_4,
-    0.101_930_119_817_240_5,
-    0.083_276_741_576_704_7,
-    0.062_672_048_334_109_1,
-    0.040_601_429_800_386_9,
-    0.017_614_007_139_152_1,
-];
+// Canonical 20-point Gauss-Legendre nodes/weights on [-1, 1] (Abramowitz &
+// Stegun 25.4), shared with the bivariate-normal cell integrator. The single
+// source of truth lives in `crate::families::cubic_cell_kernel`; this parity
+// gate references it so the two cubic-cell consumers can never silently drift.
+// 20 points integrate any polynomial of degree ≤ 39 exactly in finite
+// arithmetic — far more than our degree-≤ (6 + ν) integrand needs.
+use crate::families::cubic_cell_kernel::{GL20_NODES, GL20_WEIGHTS};
 
 /// Gauss-Legendre reference: ∫_L^R (x − m)^ν · P(x − L) dx with P given by the
 /// product-polynomial coefficient vector. Used solely as a parity gate.
@@ -370,7 +328,7 @@ pub fn moment_1d_gauss_legendre(
     let center = left + half;
     let mut acc = 0.0;
     for k in 0..20 {
-        let x = center + half * GL20_X[k];
+        let x = center + half * GL20_NODES[k];
         let u = x - left;
         // Horner on c[0..=6]
         let mut p = c[PROD_LEN - 1];
@@ -378,7 +336,7 @@ pub fn moment_1d_gauss_legendre(
             p = p * u + c[q];
         }
         let mom = (x - m).powi(nu as i32);
-        acc += GL20_W[k] * mom * p;
+        acc += GL20_WEIGHTS[k] * mom * p;
     }
     acc * half
 }

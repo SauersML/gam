@@ -2160,14 +2160,35 @@ fn gompertz_shape_derivatives(age: f64, shape: f64) -> (f64, f64) {
     }
 }
 
-fn survival_hazard_theta_partials(
+/// Per-target baseline parameters after the shared age guard and the per-target
+/// required-field extraction + finiteness/positivity validation have passed.
+///
+/// This is the single source of truth for *which* config fields each baseline
+/// target requires and *what* domain each must satisfy. Both the hazard-value
+/// evaluator (`survival_cumulative_and_instant_hazard`) and the θ-partials
+/// evaluator (`survival_hazard_theta_partials`) consume it and only differ in how
+/// they assemble their (value vs derivative) outputs from these checked scalars.
+#[derive(Clone, Copy, Debug)]
+enum ValidatedBaselineTarget {
+    Weibull { scale: f64, shape: f64 },
+    Gompertz { rate: f64, shape: f64 },
+    GompertzMakeham { rate: f64, shape: f64, makeham: f64 },
+}
+
+/// Shared prologue for the survival baseline hazard evaluators: validate the age,
+/// then extract and domain-check the per-target parameters from `cfg`.
+///
+/// `Ok(None)` is the `Linear` target (no parametric baseline). `context` is woven
+/// into the age-guard error so each caller keeps its specific phrasing.
+fn validated_baseline_params(
     age: f64,
     cfg: &SurvivalBaselineConfig,
-) -> Result<Option<Vec<(f64, f64)>>, String> {
+    context: &str,
+) -> Result<Option<ValidatedBaselineTarget>, String> {
     if !age.is_finite() || age <= 0.0 {
-        return Err(
-            "survival ages must be finite and positive for baseline hazard partials".to_string(),
-        );
+        return Err(format!(
+            "survival ages must be finite and positive for {context}"
+        ));
     }
 
     match cfg.target {
@@ -2185,14 +2206,7 @@ fn survival_hazard_theta_partials(
                 }
                 .into());
             }
-            let log_time_ratio = age.ln() - scale.ln();
-            let cumulative_hazard = (age / scale).powf(shape);
-            let instant_hazard = shape * cumulative_hazard / age;
-            let eta = shape * log_time_ratio;
-            Ok(Some(vec![
-                (-shape * cumulative_hazard, -shape * instant_hazard),
-                (eta * cumulative_hazard, (1.0 + eta) * instant_hazard),
-            ]))
+            Ok(Some(ValidatedBaselineTarget::Weibull { scale, shape }))
         }
         SurvivalBaselineTarget::Gompertz => {
             let rate = cfg
@@ -2206,20 +2220,18 @@ fn survival_hazard_theta_partials(
                     "gompertz baseline requires finite positive rate and finite shape".to_string(),
                 );
             }
-            let (cumulative_hazard, instant_hazard) = gompertz_hazard_components(age, rate, shape);
-            let (d_cum_dshape, d_inst_dshape) =
-                gompertz_cumulative_shape_derivative(age, rate, shape);
-            Ok(Some(vec![
-                (cumulative_hazard, instant_hazard),
-                (d_cum_dshape, d_inst_dshape),
-            ]))
+            Ok(Some(ValidatedBaselineTarget::Gompertz { rate, shape }))
         }
         SurvivalBaselineTarget::GompertzMakeham => {
-            let rate = cfg.rate.ok_or_else(|| "gm missing rate".to_string())?;
-            let shape = cfg.shape.ok_or_else(|| "gm missing shape".to_string())?;
+            let rate = cfg
+                .rate
+                .ok_or_else(|| "gompertz-makeham missing rate".to_string())?;
+            let shape = cfg
+                .shape
+                .ok_or_else(|| "gompertz-makeham missing shape".to_string())?;
             let makeham = cfg
                 .makeham
-                .ok_or_else(|| "gm missing makeham".to_string())?;
+                .ok_or_else(|| "gompertz-makeham missing makeham".to_string())?;
             if !(rate.is_finite()
                 && shape.is_finite()
                 && makeham.is_finite()
@@ -2231,6 +2243,48 @@ fn survival_hazard_theta_partials(
                         .to_string(),
                 );
             }
+            Ok(Some(ValidatedBaselineTarget::GompertzMakeham {
+                rate,
+                shape,
+                makeham,
+            }))
+        }
+    }
+}
+
+fn survival_hazard_theta_partials(
+    age: f64,
+    cfg: &SurvivalBaselineConfig,
+) -> Result<Option<Vec<(f64, f64)>>, String> {
+    let Some(params) = validated_baseline_params(age, cfg, "baseline hazard partials")? else {
+        return Ok(None);
+    };
+
+    match params {
+        ValidatedBaselineTarget::Weibull { scale, shape } => {
+            let log_time_ratio = age.ln() - scale.ln();
+            let cumulative_hazard = (age / scale).powf(shape);
+            let instant_hazard = shape * cumulative_hazard / age;
+            let eta = shape * log_time_ratio;
+            Ok(Some(vec![
+                (-shape * cumulative_hazard, -shape * instant_hazard),
+                (eta * cumulative_hazard, (1.0 + eta) * instant_hazard),
+            ]))
+        }
+        ValidatedBaselineTarget::Gompertz { rate, shape } => {
+            let (cumulative_hazard, instant_hazard) = gompertz_hazard_components(age, rate, shape);
+            let (d_cum_dshape, d_inst_dshape) =
+                gompertz_cumulative_shape_derivative(age, rate, shape);
+            Ok(Some(vec![
+                (cumulative_hazard, instant_hazard),
+                (d_cum_dshape, d_inst_dshape),
+            ]))
+        }
+        ValidatedBaselineTarget::GompertzMakeham {
+            rate,
+            shape,
+            makeham,
+        } => {
             let (cum_gompertz, inst_gompertz) = gompertz_hazard_components(age, rate, shape);
             let (d_cum_dshape, d_inst_dshape) =
                 gompertz_cumulative_shape_derivative(age, rate, shape);
@@ -2247,67 +2301,25 @@ fn survival_cumulative_and_instant_hazard(
     age: f64,
     cfg: &SurvivalBaselineConfig,
 ) -> Result<Option<(f64, f64)>, String> {
-    if !age.is_finite() || age <= 0.0 {
-        return Err(
-            "survival ages must be finite and positive for baseline hazard evaluation".to_string(),
-        );
-    }
+    let Some(params) = validated_baseline_params(age, cfg, "baseline hazard evaluation")? else {
+        return Ok(None);
+    };
 
-    match cfg.target {
-        SurvivalBaselineTarget::Linear => Ok(None),
-        SurvivalBaselineTarget::Weibull => {
-            let scale = cfg
-                .scale
-                .ok_or_else(|| "weibull missing scale".to_string())?;
-            let shape = cfg
-                .shape
-                .ok_or_else(|| "weibull missing shape".to_string())?;
-            if !(scale.is_finite() && shape.is_finite() && scale > 0.0 && shape > 0.0) {
-                return Err(SurvivalConstructionError::InvalidConfig {
-                    reason: "weibull baseline requires finite positive scale and shape".to_string(),
-                }
-                .into());
-            }
+    match params {
+        ValidatedBaselineTarget::Weibull { scale, shape } => {
             let cumulative_hazard = (age / scale).powf(shape);
             let instant_hazard = shape * cumulative_hazard / age;
             Ok(Some((cumulative_hazard, instant_hazard)))
         }
-        SurvivalBaselineTarget::Gompertz => {
-            let rate = cfg
-                .rate
-                .ok_or_else(|| "gompertz missing rate".to_string())?;
-            let shape = cfg
-                .shape
-                .ok_or_else(|| "gompertz missing shape".to_string())?;
-            if !(rate.is_finite() && shape.is_finite() && rate > 0.0) {
-                return Err(
-                    "gompertz baseline requires finite positive rate and finite shape".to_string(),
-                );
-            }
+        ValidatedBaselineTarget::Gompertz { rate, shape } => {
             let (cumulative_hazard, instant_hazard) = gompertz_hazard_components(age, rate, shape);
             Ok(Some((cumulative_hazard, instant_hazard)))
         }
-        SurvivalBaselineTarget::GompertzMakeham => {
-            let makeham = cfg
-                .makeham
-                .ok_or_else(|| "gompertz-makeham missing makeham".to_string())?;
-            let rate = cfg
-                .rate
-                .ok_or_else(|| "gompertz-makeham missing rate".to_string())?;
-            let shape = cfg
-                .shape
-                .ok_or_else(|| "gompertz-makeham missing shape".to_string())?;
-            if !(rate.is_finite()
-                && shape.is_finite()
-                && makeham.is_finite()
-                && rate > 0.0
-                && makeham > 0.0)
-            {
-                return Err(
-                    "gompertz-makeham baseline requires finite positive rate, makeham, and finite shape"
-                        .to_string(),
-                );
-            }
+        ValidatedBaselineTarget::GompertzMakeham {
+            rate,
+            shape,
+            makeham,
+        } => {
             let (h_gompertz, inst_gompertz) = gompertz_hazard_components(age, rate, shape);
             Ok(Some((makeham * age + h_gompertz, makeham + inst_gompertz)))
         }

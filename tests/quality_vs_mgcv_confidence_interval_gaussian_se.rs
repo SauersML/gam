@@ -153,7 +153,7 @@ fn gam_pointwise_ci_covers_truth_and_matches_mgcv_on_gaussian_smooth() {
 
         let vb = fit
             .fit
-            .vb_covariance()
+            .beta_covariance()
             .expect("gam reports Bayesian coefficient covariance Vb")
             .clone();
         let beta = fit.fit.beta.clone();

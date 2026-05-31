@@ -5131,23 +5131,15 @@ impl UnifiedFitResult {
 impl UnifiedFitResult {
     /// Get the conditional Bayesian covariance matrix (`Vb`) if available.
     ///
-    /// Contract: `Vb = H^{-1} * phi`, scaled by the fitted dispersion. This
-    /// method is the backward-compatible name for [`Self::beta_covariance_vb`].
+    /// Contract: `Vb = H^{-1} * phi`, scaled by the fitted dispersion. This is
+    /// the Wood/mgcv `Vb` (Bayesian/conditional) covariance.
     pub fn beta_covariance(&self) -> Option<&Array2<f64>> {
         self.covariance_conditional.as_ref()
     }
 
-    /// Get the conditional Bayesian covariance matrix (`Vb`) if available.
-    pub fn beta_covariance_vb(&self) -> Option<&Array2<f64>> {
-        self.beta_covariance()
-    }
-
-    /// Get the smoothing-parameter-corrected Bayesian covariance (`Vp`) if available.
-    pub fn beta_covariance_vp(&self) -> Option<&Array2<f64>> {
-        self.beta_covariance_corrected()
-    }
-
     /// Get the frequentist sandwich covariance (`Ve`) if available.
+    ///
+    /// Wood/mgcv `Ve = H⁻¹ X'WX H⁻¹ * φ̂`.
     pub fn beta_covariance_ve(&self) -> Option<&Array2<f64>> {
         self.inference
             .as_ref()
@@ -5166,37 +5158,15 @@ impl UnifiedFitResult {
         self.inference.as_ref().map(|inf| inf.dispersion)
     }
 
-    /// Get the smoothing-parameter-corrected beta covariance if available.
+    /// Get the smoothing-parameter-corrected beta covariance (`Vp`) if available.
+    ///
+    /// Wood/mgcv name for the smoothing-parameter-corrected covariance `Vp`.
     pub fn beta_covariance_corrected(&self) -> Option<&Array2<f64>> {
         self.covariance_corrected.as_ref().or_else(|| {
             self.inference
                 .as_ref()
                 .and_then(|inf| inf.beta_covariance_corrected.as_ref())
         })
-    }
-
-    /// Wood/mgcv name for the Bayesian/conditional covariance Vb = H⁻¹ * φ̂.
-    pub fn vb_covariance(&self) -> Option<&Array2<f64>> {
-        self.beta_covariance()
-    }
-
-    /// Wood/mgcv name for the smoothing-parameter-corrected covariance Vp.
-    pub fn vp_covariance(&self) -> Option<&Array2<f64>> {
-        self.beta_covariance_corrected()
-    }
-
-    /// Frequentist covariance Ve = H⁻¹ X'WX H⁻¹ * φ̂.
-    pub fn ve_covariance(&self) -> Option<&Array2<f64>> {
-        self.inference
-            .as_ref()
-            .and_then(|inf| inf.beta_covariance_frequentist.as_ref())
-    }
-
-    /// Coefficient-space influence matrix F = H⁻¹ X'WX.
-    pub fn influence_matrix(&self) -> Option<&Array2<f64>> {
-        self.inference
-            .as_ref()
-            .and_then(|inf| inf.coefficient_influence.as_ref())
     }
 
     /// Get beta standard errors (conditional) if available.

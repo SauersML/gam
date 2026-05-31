@@ -660,6 +660,68 @@ pub struct WorkingDerivativeBuffersMut<'a> {
     d3mu_deta3: &'a mut Array1<f64>,
 }
 
+/// Contiguous mutable views of the three core working buffers (`mu`, `weights`,
+/// `z`) shared by every PIRLS working-state writer.
+pub(super) struct WorkingSlices<'a> {
+    pub mu: &'a mut [f64],
+    pub weights: &'a mut [f64],
+    pub z: &'a mut [f64],
+}
+
+/// Contiguous mutable views of the Newton derivative/curvature buffers
+/// (`c`, `d`, `dmu/deta` jet) shared by the full-derivative PIRLS writers.
+pub(super) struct WorkingDerivSlices<'a> {
+    pub c: &'a mut [f64],
+    pub d: &'a mut [f64],
+    pub dmu: &'a mut [f64],
+    pub d2: &'a mut [f64],
+    pub d3: &'a mut [f64],
+}
+
+/// Canonical "contiguous-or-panic" unpacking of the three core working buffers.
+///
+/// Single source of truth for the contiguity contract and panic messages that
+/// every working-state writer relies on; every writer routes through this.
+#[inline]
+pub(super) fn working_slices<'a>(
+    mu: &'a mut Array1<f64>,
+    weights: &'a mut Array1<f64>,
+    z: &'a mut Array1<f64>,
+) -> WorkingSlices<'a> {
+    WorkingSlices {
+        mu: mu.as_slice_mut().expect("mu must be contiguous"),
+        weights: weights.as_slice_mut().expect("weights must be contiguous"),
+        z: z.as_slice_mut().expect("z must be contiguous"),
+    }
+}
+
+/// Canonical "contiguous-or-panic" unpacking of the Newton derivative buffers.
+///
+/// Single source of truth for the contiguity contract and panic messages of the
+/// `c`/`d`/`dmu`/`d2`/`d3` curvature buffers; every full-derivative writer routes
+/// through this.
+#[inline]
+pub(super) fn working_deriv_slices<'a>(
+    derivs: &'a mut WorkingDerivativeBuffersMut<'_>,
+) -> WorkingDerivSlices<'a> {
+    WorkingDerivSlices {
+        c: derivs.c.as_slice_mut().expect("c must be contiguous"),
+        d: derivs.d.as_slice_mut().expect("d must be contiguous"),
+        dmu: derivs
+            .dmu_deta
+            .as_slice_mut()
+            .expect("dmu_deta must be contiguous"),
+        d2: derivs
+            .d2mu_deta2
+            .as_slice_mut()
+            .expect("d2mu_deta2 must be contiguous"),
+        d3: derivs
+            .d3mu_deta3
+            .as_slice_mut()
+            .expect("d3mu_deta3 must be contiguous"),
+    }
+}
+
 #[derive(Clone, Copy)]
 struct WorkingBernoulliGeometry {
     mu: f64,
@@ -4032,24 +4094,19 @@ fn write_beta_logit_working_state(
         crate::bail_invalid_estim!("beta-regression phi must be finite and > 0; got {phi}");
     }
     validate_beta_responses(&y, &priorweights)?;
-    if let Some(derivs) = derivatives {
-        let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
-        let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
-        let z_s = z.as_slice_mut().expect("z must be contiguous");
-        let dmu_s = derivs
-            .dmu_deta
-            .as_slice_mut()
-            .expect("dmu_deta must be contiguous");
-        let d2_s = derivs
-            .d2mu_deta2
-            .as_slice_mut()
-            .expect("d2mu_deta2 must be contiguous");
-        let d3_s = derivs
-            .d3mu_deta3
-            .as_slice_mut()
-            .expect("d3mu_deta3 must be contiguous");
-        let c_s = derivs.c.as_slice_mut().expect("c must be contiguous");
-        let d_s = derivs.d.as_slice_mut().expect("d must be contiguous");
+    if let Some(mut derivs) = derivatives {
+        let WorkingSlices {
+            mu: mu_s,
+            weights: weights_s,
+            z: z_s,
+        } = working_slices(mu, weights, z);
+        let WorkingDerivSlices {
+            c: c_s,
+            d: d_s,
+            dmu: dmu_s,
+            d2: d2_s,
+            d3: d3_s,
+        } = working_deriv_slices(&mut derivs);
         mu_s.par_iter_mut()
             .zip(weights_s.par_iter_mut())
             .zip(z_s.par_iter_mut())
@@ -4104,9 +4161,11 @@ fn write_beta_logit_working_state(
                 },
             );
     } else {
-        let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
-        let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
-        let z_s = z.as_slice_mut().expect("z must be contiguous");
+        let WorkingSlices {
+            mu: mu_s,
+            weights: weights_s,
+            z: z_s,
+        } = working_slices(mu, weights, z);
         mu_s.par_iter_mut()
             .zip(weights_s.par_iter_mut())
             .zip(z_s.par_iter_mut())
@@ -4154,24 +4213,19 @@ pub fn update_glmvectors(
         && inverse_link.mixture_state().is_none()
         && inverse_link.sas_state().is_none()
     {
-        if let Some(derivs) = derivatives {
-            let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
-            let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
-            let z_s = z.as_slice_mut().expect("z must be contiguous");
-            let c_s = derivs.c.as_slice_mut().expect("c must be contiguous");
-            let d_s = derivs.d.as_slice_mut().expect("d must be contiguous");
-            let dmu_s = derivs
-                .dmu_deta
-                .as_slice_mut()
-                .expect("dmu_deta must be contiguous");
-            let d2_s = derivs
-                .d2mu_deta2
-                .as_slice_mut()
-                .expect("d2mu_deta2 must be contiguous");
-            let d3_s = derivs
-                .d3mu_deta3
-                .as_slice_mut()
-                .expect("d3mu_deta3 must be contiguous");
+        if let Some(mut derivs) = derivatives {
+            let WorkingSlices {
+                mu: mu_s,
+                weights: weights_s,
+                z: z_s,
+            } = working_slices(mu, weights, z);
+            let WorkingDerivSlices {
+                c: c_s,
+                d: d_s,
+                dmu: dmu_s,
+                d2: d2_s,
+                d3: d3_s,
+            } = working_deriv_slices(&mut derivs);
             mu_s.par_iter_mut()
                 .zip(weights_s.par_iter_mut())
                 .zip(z_s.par_iter_mut())
@@ -4205,9 +4259,11 @@ pub fn update_glmvectors(
                     },
                 );
         } else {
-            let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
-            let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
-            let z_s = z.as_slice_mut().expect("z must be contiguous");
+            let WorkingSlices {
+                mu: mu_s,
+                weights: weights_s,
+                z: z_s,
+            } = working_slices(mu, weights, z);
             mu_s.par_iter_mut()
                 .zip(weights_s.par_iter_mut())
                 .zip(z_s.par_iter_mut())
@@ -4242,24 +4298,19 @@ pub fn update_glmvectors(
             // regions so PIRLS and outer derivative code differentiate the
             // same piecewise-smooth surface.
             let zero_on_nonsmooth = matches!(link, LinkFunction::Logit);
-            if let Some(derivs) = derivatives {
-                let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
-                let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
-                let z_s = z.as_slice_mut().expect("z must be contiguous");
-                let c_s = derivs.c.as_slice_mut().expect("c must be contiguous");
-                let d_s = derivs.d.as_slice_mut().expect("d must be contiguous");
-                let dmu_s = derivs
-                    .dmu_deta
-                    .as_slice_mut()
-                    .expect("dmu_deta must be contiguous");
-                let d2_s = derivs
-                    .d2mu_deta2
-                    .as_slice_mut()
-                    .expect("d2mu_deta2 must be contiguous");
-                let d3_s = derivs
-                    .d3mu_deta3
-                    .as_slice_mut()
-                    .expect("d3mu_deta3 must be contiguous");
+            if let Some(mut derivs) = derivatives {
+                let WorkingSlices {
+                    mu: mu_s,
+                    weights: weights_s,
+                    z: z_s,
+                } = working_slices(mu, weights, z);
+                let WorkingDerivSlices {
+                    c: c_s,
+                    d: d_s,
+                    dmu: dmu_s,
+                    d2: d2_s,
+                    d3: d3_s,
+                } = working_deriv_slices(&mut derivs);
                 mu_s.par_iter_mut()
                     .zip(weights_s.par_iter_mut())
                     .zip(z_s.par_iter_mut())
@@ -4316,9 +4367,11 @@ pub fn update_glmvectors(
                         },
                     )?;
             } else {
-                let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
-                let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
-                let z_s = z.as_slice_mut().expect("z must be contiguous");
+                let WorkingSlices {
+                    mu: mu_s,
+                    weights: weights_s,
+                    z: z_s,
+                } = working_slices(mu, weights, z);
                 mu_s.par_iter_mut()
                     .zip(weights_s.par_iter_mut())
                     .zip(z_s.par_iter_mut())
@@ -4509,24 +4562,19 @@ pub fn update_glmvectors_integrated_for_link(
             inverse_link
         );
     }
-    if let Some(derivs) = derivatives {
-        let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
-        let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
-        let z_s = z.as_slice_mut().expect("z must be contiguous");
-        let c_s = derivs.c.as_slice_mut().expect("c must be contiguous");
-        let d_s = derivs.d.as_slice_mut().expect("d must be contiguous");
-        let dmu_s = derivs
-            .dmu_deta
-            .as_slice_mut()
-            .expect("dmu_deta must be contiguous");
-        let d2_s = derivs
-            .d2mu_deta2
-            .as_slice_mut()
-            .expect("d2mu_deta2 must be contiguous");
-        let d3_s = derivs
-            .d3mu_deta3
-            .as_slice_mut()
-            .expect("d3mu_deta3 must be contiguous");
+    if let Some(mut derivs) = derivatives {
+        let WorkingSlices {
+            mu: mu_s,
+            weights: weights_s,
+            z: z_s,
+        } = working_slices(mu, weights, z);
+        let WorkingDerivSlices {
+            c: c_s,
+            d: d_s,
+            dmu: dmu_s,
+            d2: d2_s,
+            d3: d3_s,
+        } = working_deriv_slices(&mut derivs);
         mu_s.par_iter_mut()
             .zip(weights_s.par_iter_mut())
             .zip(z_s.par_iter_mut())
@@ -4585,9 +4633,11 @@ pub fn update_glmvectors_integrated_for_link(
                 },
             )?;
     } else {
-        let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
-        let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
-        let z_s = z.as_slice_mut().expect("z must be contiguous");
+        let WorkingSlices {
+            mu: mu_s,
+            weights: weights_s,
+            z: z_s,
+        } = working_slices(mu, weights, z);
         mu_s.par_iter_mut()
             .zip(weights_s.par_iter_mut())
             .zip(z_s.par_iter_mut())

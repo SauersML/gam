@@ -123,7 +123,7 @@ use gam::terms::{
 };
 use gam::transformation_normal::TransformationNormalFitResult;
 use gam::types::{
-    InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoPrior, StandardLink,
+    InverseLink, LikelihoodSpec, ResponseFamily, RhoPrior, StandardLink,
 };
 use gam::{
     FitConfig, FitRequest, FitResult, WorkflowError, fit_model, materialize, resolve_offset_column,
@@ -25270,15 +25270,7 @@ fn family_link_kind(family: &LikelihoodSpec) -> &'static str {
         (ResponseFamily::RoystonParmar, _) => "royston-parmar",
         (ResponseFamily::Binomial, InverseLink::Sas(_)) => "sas",
         (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => "beta-logistic",
-        _ => match family.link_function() {
-            LinkFunction::Identity => "identity",
-            LinkFunction::Logit => "logit",
-            LinkFunction::Probit => "probit",
-            LinkFunction::CLogLog => "cloglog",
-            LinkFunction::Log => "log",
-            LinkFunction::Sas => "sas",
-            LinkFunction::BetaLogistic => "beta-logistic",
-        },
+        _ => family.link_function().name(),
     }
 }
 

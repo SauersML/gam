@@ -284,6 +284,53 @@ pub(crate) fn flatten(a: &Array2<f64>) -> Array1<f64> {
     out
 }
 
+/// Build an orthonormal basis of the tangent space at `point` by modified
+/// Gram–Schmidt over the projected ambient standard basis.
+///
+/// This is the shared engine behind [`tangent_basis`](RiemannianManifold::tangent_basis)
+/// for the matrix manifolds whose tangent space has no closed-form basis (the
+/// Stiefel and Grassmann manifolds). It walks the `n × k` standard basis in
+/// column-major order (outer `col`, inner `row`), projects each `e_{row,col}`
+/// onto the tangent space via `m.project_tangent`, re-orthogonalizes against the
+/// columns accepted so far, and keeps it iff its residual norm exceeds the
+/// `1e-10` drop tolerance, stopping the moment `m.dim()` independent directions
+/// have been collected. Each caller keeps its own input validation and then
+/// delegates here, so the numerically delicate orthogonalization order, drop
+/// tolerance, and early-exit logic live in exactly one place.
+pub(crate) fn projected_standard_basis_tangent<M: RiemannianManifold + ?Sized>(
+    m: &M,
+    point: ArrayView1<'_, f64>,
+    n: usize,
+    k: usize,
+) -> GeometryResult<Array2<f64>> {
+    let mut columns: Vec<Array1<f64>> = Vec::with_capacity(m.dim());
+    for col in 0..k {
+        for row in 0..n {
+            let mut e = Array2::<f64>::zeros((n, k));
+            e[[row, col]] = 1.0;
+            let mut v = m.project_tangent(point, flatten(&e).view())?;
+            for q in &columns {
+                let proj = dot(q.view(), v.view());
+                v -= &(q * proj);
+            }
+            let nrm = dot(v.view(), v.view()).sqrt();
+            if nrm > 1.0e-10 {
+                columns.push(v / nrm);
+            }
+            if columns.len() == m.dim() {
+                let mut out = Array2::<f64>::zeros((m.ambient_dim(), m.dim()));
+                for j in 0..columns.len() {
+                    for i in 0..m.ambient_dim() {
+                        out[[i, j]] = columns[j][i];
+                    }
+                }
+                return Ok(out);
+            }
+        }
+    }
+    Ok(Array2::<f64>::zeros((m.ambient_dim(), columns.len())))
+}
+
 pub(crate) fn qr_thin(a: &Array2<f64>) -> (Array2<f64>, Array2<f64>) {
     let n = a.nrows();
     let k = a.ncols();

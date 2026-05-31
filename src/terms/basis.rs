@@ -9789,14 +9789,32 @@ pub fn build_thin_plate_basiswithworkspace(
     })
 }
 
+/// Canonical domain guard for Matérn kernel evaluations: distance `r` must be
+/// finite and non-negative, length scale must be finite and positive. Single
+/// source of truth for the `(r, length_scale)` validity check shared by every
+/// Matérn kernel/derivative function below.
 #[inline(always)]
-fn matern_kernel_from_distance(r: f64, length_scale: f64, nu: MaternNu) -> Result<f64, BasisError> {
+fn validate_matern_inputs(r: f64, length_scale: f64) -> Result<(), BasisError> {
     if !r.is_finite() || r < 0.0 {
         crate::bail_invalid_basis!("Matérn kernel distance must be finite and non-negative");
     }
+    validate_matern_length_scale(length_scale)
+}
+
+/// Canonical guard for the length-scale-only Matérn sites: length scale must be
+/// finite and positive. Shared by `validate_matern_inputs` and by callers that
+/// validate the distance separately (or have no distance argument).
+#[inline(always)]
+fn validate_matern_length_scale(length_scale: f64) -> Result<(), BasisError> {
     if !length_scale.is_finite() || length_scale <= 0.0 {
         crate::bail_invalid_basis!("Matérn length_scale must be finite and positive");
     }
+    Ok(())
+}
+
+#[inline(always)]
+fn matern_kernel_from_distance(r: f64, length_scale: f64, nu: MaternNu) -> Result<f64, BasisError> {
+    validate_matern_inputs(r, length_scale)?;
 
     // Parameterization used here:
     //   x = r / length_scale
@@ -9838,12 +9856,7 @@ fn matern_kernel_log_kappa_derivative_from_distance(
     length_scale: f64,
     nu: MaternNu,
 ) -> Result<f64, BasisError> {
-    if !r.is_finite() || r < 0.0 {
-        crate::bail_invalid_basis!("Matérn kernel distance must be finite and non-negative");
-    }
-    if !length_scale.is_finite() || length_scale <= 0.0 {
-        crate::bail_invalid_basis!("Matérn length_scale must be finite and positive");
-    }
+    validate_matern_inputs(r, length_scale)?;
 
     let x = r / length_scale;
     let deriv = match nu {
@@ -9880,12 +9893,7 @@ fn matern_kernel_log_kappasecond_derivative_from_distance(
     length_scale: f64,
     nu: MaternNu,
 ) -> Result<f64, BasisError> {
-    if !r.is_finite() || r < 0.0 {
-        crate::bail_invalid_basis!("Matérn kernel distance must be finite and non-negative");
-    }
-    if !length_scale.is_finite() || length_scale <= 0.0 {
-        crate::bail_invalid_basis!("Matérn length_scale must be finite and positive");
-    }
+    validate_matern_inputs(r, length_scale)?;
 
     let x = r / length_scale;
     let second = match nu {
@@ -9930,12 +9938,7 @@ fn matern_kernel_radial_tripletwith_safe_ratio(
     length_scale: f64,
     nu: MaternNu,
 ) -> Result<(f64, f64, f64, f64), BasisError> {
-    if !r.is_finite() || r < 0.0 {
-        crate::bail_invalid_basis!("Matérn kernel distance must be finite and non-negative");
-    }
-    if !length_scale.is_finite() || length_scale <= 0.0 {
-        crate::bail_invalid_basis!("Matérn length_scale must be finite and positive");
-    }
+    validate_matern_inputs(r, length_scale)?;
 
     // Full derivation used by collocation operators:
     //   phi(r) = P_nu(a) exp(-a), a=sr, s=sqrt(2nu)/length_scale.
@@ -10060,9 +10063,7 @@ fn matern_aniso_extended_radial_scalars(
             "Matérn extended radial scalar distance must be finite and non-negative"
         );
     }
-    if !length_scale.is_finite() || length_scale <= 0.0 {
-        crate::bail_invalid_basis!("Matérn length_scale must be finite and positive");
-    }
+    validate_matern_length_scale(length_scale)?;
 
     match nu {
         // ----------------------------------------------------------------
@@ -15619,9 +15620,7 @@ pub fn create_matern_spline_basiswithworkspace(
     if data.iter().any(|v| !v.is_finite()) || centers.iter().any(|v| !v.is_finite()) {
         crate::bail_invalid_basis!("Matérn basis requires finite data and center values");
     }
-    if !length_scale.is_finite() || length_scale <= 0.0 {
-        crate::bail_invalid_basis!("Matérn length_scale must be finite and positive");
-    }
+    validate_matern_length_scale(length_scale)?;
     if let Some(eta) = aniso_log_scales {
         if eta.len() != d {
             crate::bail_dim_basis!(
@@ -17040,12 +17039,7 @@ fn maternvalue_psi_triplet(
     //   phi_psi_psi  = a*(dphi/da) + a^2*(d^2phi/da^2).
     //
     // This path is fully analytic and avoids FD in the hyper-derivative chain.
-    if !r.is_finite() || r < 0.0 {
-        crate::bail_invalid_basis!("Matérn kernel distance must be finite and non-negative");
-    }
-    if !length_scale.is_finite() || length_scale <= 0.0 {
-        crate::bail_invalid_basis!("Matérn length_scale must be finite and positive");
-    }
+    validate_matern_inputs(r, length_scale)?;
 
     let kappa = 1.0 / length_scale;
     let (s, p): (f64, &[f64]) = match nu {
