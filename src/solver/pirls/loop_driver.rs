@@ -62,8 +62,8 @@ use crate::probability::standard_normal_quantile;
 use crate::solver::active_set;
 use crate::types::{
     Coefficients, GlmLikelihoodSpec, InverseLink, LinearPredictor, LinkFunction,
-    LogSmoothingParamsView, MixtureLinkState, RidgePassport, RidgePolicy, SasLinkState,
-    StandardLink,
+    LogSmoothingParamsView, MixtureLinkState, ResponseFamily, RidgePassport, RidgePolicy,
+    SasLinkState, StandardLink,
 };
 use faer::sparse::{SparseColMat, Triplet};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
@@ -350,6 +350,7 @@ pub(super) fn assemble_pirls_result(
 
 pub(super) fn detect_logit_instability(
     link: LinkFunction,
+    response: &ResponseFamily,
     has_penalty: bool,
     firth_active: bool,
     summary: &WorkingModelPirlsResult,
@@ -357,7 +358,22 @@ pub(super) fn detect_logit_instability(
     finalweights: &Array1<f64>,
     y: ArrayView1<'_, f64>,
 ) -> bool {
-    if link != LinkFunction::Logit || firth_active {
+    // Perfect / quasi-perfect separation is a *Bernoulli/Binomial* pathology.
+    // Every heuristic below is binary-response–specific: saturation toward
+    // μ ∈ {0, 1}, the `yᵢ > 0.5` order-separation split, and working-weight
+    // collapse only carry meaning when each `yᵢ` is a 0/1 outcome (or a
+    // proportion of Bernoulli trials). The Beta family also fits through the
+    // logit link, but its response is *continuous* on (0, 1): a perfectly
+    // healthy monotone mean (μ increasing in a covariate ⇒ rows with y > 0.5
+    // sit at higher η than rows with y ≤ 0.5) trivially satisfies the
+    // `order_separated` test, so gating this detector on the logit link alone
+    // misclassifies well-behaved Beta fits as separated and forces a spurious
+    // inner-solve retreat at every smoothing-parameter seed (issue #499).
+    // Gate strictly on the Binomial response so only binary GLMs are screened.
+    if !matches!(response, ResponseFamily::Binomial)
+        || link != LinkFunction::Logit
+        || firth_active
+    {
         return false;
     }
 
@@ -1346,6 +1362,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     let firth_active = options.firth_bias_reduction;
     if detect_logit_instability(
         link_function,
+        &final_likelihood.spec.response,
         has_penalty,
         firth_active,
         &working_summary,
