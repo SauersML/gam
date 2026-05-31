@@ -179,10 +179,36 @@ pub(crate) fn compute_constraint_kkt_diagnostics(
     let m = constraints.a.nrows();
     let active_tolerance = ACTIVE_SET_PRIMAL_FEASIBILITY_TOL;
 
+    // Measure feasibility in the *scaled* (geometric) coordinate system the
+    // solver's tolerance is expressed in: normalize each inequality
+    // `a_i·β ≥ b_i` by ‖a_i‖ so its slack becomes the signed Euclidean
+    // distance from β to the constraint hyperplane. Without this, a row with a
+    // large norm — e.g. a B-spline endpoint *derivative* clamp, whose rows
+    // carry ‖a_i‖ ≫ 1 — reports a raw slack inflated by ‖a_i‖, so an iterate
+    // that is feasible to the solver's scaled `ACTIVE_SET_PRIMAL_FEASIBILITY_TOL`
+    // guarantee can still exceed a raw primal gate downstream and be spuriously
+    // refused. Per-row normalization makes the diagnostic scale-invariant and
+    // consistent with that contract. Dual/complementarity/stationarity are
+    // invariant under this positive per-row rescaling (with λ̂_i = ‖a_i‖·λ_i:
+    // Âᵀλ̂ = Aᵀλ and λ̂_i·ŝ_i = λ_i·s_i), so only primal feasibility and the
+    // active-set threshold change meaning — both toward the geometric distance
+    // the tolerance is meant to bound.
+    let p = constraints.a.ncols();
+    let mut a_scaled = constraints.a.clone();
+    let mut b_scaled = constraints.b.clone();
+    for i in 0..m {
+        let n_i = constraints.a.row(i).dot(&constraints.a.row(i)).sqrt();
+        if n_i > 0.0 {
+            let inv = 1.0 / n_i;
+            a_scaled.row_mut(i).mapv_inplace(|v| v * inv);
+            b_scaled[i] *= inv;
+        }
+    }
+
     let mut slack = Array1::<f64>::zeros(m);
     let mut primal_feasibility: f64 = 0.0;
     for i in 0..m {
-        let s_i = constraints.a.row(i).dot(beta) - constraints.b[i];
+        let s_i = a_scaled.row(i).dot(beta) - b_scaled[i];
         slack[i] = s_i;
         primal_feasibility = primal_feasibility.max((-s_i).max(0.0));
     }
@@ -191,10 +217,9 @@ pub(crate) fn compute_constraint_kkt_diagnostics(
     let mut lambda = Array1::<f64>::zeros(m);
     if !active_idx.is_empty() {
         let n_active = active_idx.len();
-        let p = constraints.a.ncols();
         let mut a_active = Array2::<f64>::zeros((n_active, p));
         for (r, &idx) in active_idx.iter().enumerate() {
-            a_active.row_mut(r).assign(&constraints.a.row(idx));
+            a_active.row_mut(r).assign(&a_scaled.row(idx));
         }
         if let Some((_, lambda_active)) =
             project_stationarity_residual_on_constraint_cone(gradient, &a_active)
@@ -213,7 +238,7 @@ pub(crate) fn compute_constraint_kkt_diagnostics(
     }
     let stationarity = {
         let mut resid = gradient.to_owned();
-        resid -= &constraints.a.t().dot(&lambda);
+        resid -= &a_scaled.t().dot(&lambda);
         resid.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()))
     };
 
@@ -1174,7 +1199,8 @@ pub(crate) fn solve_quadratic_with_linear_constraints(
 #[cfg(test)]
 mod tests {
     use super::{
-        LinearInequalityConstraints, project_stationarity_residual_on_constraint_cone,
+        LinearInequalityConstraints, compute_constraint_kkt_diagnostics,
+        project_stationarity_residual_on_constraint_cone,
         rank_reduce_rows_pivoted_qr_with_dependence,
         solve_newton_direction_with_linear_constraints_impl,
     };
@@ -1257,5 +1283,54 @@ mod tests {
                 );
             }
         }
+    }
+
+    // #500: the KKT primal residual must be the *geometric* distance to the
+    // constraint hyperplane — invariant to how the constraint row is scaled.
+    // A B-spline endpoint-derivative clamp carries a large row norm, so the
+    // raw slack `a·β − b` of a near-feasible iterate is inflated by ‖a‖ and a
+    // downstream raw primal gate would spuriously refuse it. The same geometry
+    // expressed with a unit-norm row must yield the same primal.
+    #[test]
+    fn kkt_primal_is_per_row_scale_invariant() {
+        // β sits 2.071e-8 on the infeasible side of the hyperplane `row·β ≥ 0`
+        // (the exact geometric residual reported in #500's startup abort).
+        let geometric_violation = 2.071e-8_f64;
+        let gradient = Array1::<f64>::zeros(2);
+
+        // Unit-norm row: raw slack == geometric distance.
+        let beta_unit = array![-geometric_violation, 0.0];
+        let unit = LinearInequalityConstraints {
+            a: array![[1.0, 0.0]],
+            b: array![0.0],
+        };
+        let diag_unit = compute_constraint_kkt_diagnostics(&beta_unit, &gradient, &unit);
+
+        // Same hyperplane, row scaled ×1000: raw slack would be 2.071e-5, but
+        // the *scaled* primal must still equal the geometric distance.
+        let beta_big = array![-geometric_violation, 0.0];
+        let big = LinearInequalityConstraints {
+            a: array![[1000.0, 0.0]],
+            b: array![0.0],
+        };
+        let diag_big = compute_constraint_kkt_diagnostics(&beta_big, &gradient, &big);
+
+        assert_relative_eq!(
+            diag_unit.primal_feasibility,
+            geometric_violation,
+            epsilon = 1e-14
+        );
+        assert_relative_eq!(
+            diag_big.primal_feasibility,
+            geometric_violation,
+            epsilon = 1e-14
+        );
+        // The scaled diagnostic must NOT report the ‖a‖-inflated raw slack.
+        assert!(
+            diag_big.primal_feasibility < 1e-7,
+            "scaled primal {:.3e} should pass a 1e-7 gate; raw slack would be {:.3e}",
+            diag_big.primal_feasibility,
+            1000.0 * geometric_violation
+        );
     }
 }
