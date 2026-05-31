@@ -1192,6 +1192,36 @@ fn validate_term_offset(y_len: usize, offset: &Array1<f64>, label: &str) -> Resu
     Ok(())
 }
 
+/// Shared degree/knot-count guard for the location-scale *wiggle* term specs.
+///
+/// Both `validate_gaussian_location_scalewiggle_termspec` and
+/// `validate_binomial_location_scalewiggle_termspec` enforce the identical
+/// invariant — `wiggle_degree >= 2` and at least
+/// `minimum_monotone_wiggle_knot_count(degree)` knots — with byte-for-byte
+/// identical error strings. This is the single home for that check.
+fn validate_wiggle_degree_and_knots(
+    context: &str,
+    wiggle_degree: usize,
+    wiggle_knots_len: usize,
+) -> Result<(), String> {
+    if wiggle_degree < 2 {
+        return Err(GamlssError::ConstraintViolation {
+            reason: format!("{context}: wiggle_degree must be >= 2, got {wiggle_degree}"),
+        }
+        .into());
+    }
+    let minimum_knots = minimum_monotone_wiggle_knot_count(wiggle_degree)?;
+    if wiggle_knots_len < minimum_knots {
+        return Err(GamlssError::DimensionMismatch {
+            reason: format!(
+                "{context}: wiggle_knots must have at least {minimum_knots} entries for degree {wiggle_degree}, got {wiggle_knots_len}"
+            ),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 fn validate_gaussian_location_scale_termspec(
     data: ndarray::ArrayView2<'_, f64>,
     spec: &GaussianLocationScaleTermSpec,
@@ -1212,28 +1242,7 @@ fn validate_gaussian_location_scalewiggle_termspec(
     validate_term_offset(n, &spec.mean_offset, "mean_offset")?;
     validate_term_offset(n, &spec.log_sigma_offset, "log_sigma_offset")?;
     validate_blockrows("wiggle", n, &spec.wiggle_block)?;
-    if spec.wiggle_degree < 2 {
-        return Err(GamlssError::ConstraintViolation {
-            reason: format!(
-                "{context}: wiggle_degree must be >= 2, got {}",
-                spec.wiggle_degree
-            ),
-        }
-        .into());
-    }
-    let minimum_knots = minimum_monotone_wiggle_knot_count(spec.wiggle_degree)?;
-    if spec.wiggle_knots.len() < minimum_knots {
-        return Err(GamlssError::DimensionMismatch {
-            reason: format!(
-                "{context}: wiggle_knots must have at least {} entries for degree {}, got {}",
-                minimum_knots,
-                spec.wiggle_degree,
-                spec.wiggle_knots.len()
-            ),
-        }
-        .into());
-    }
-    Ok(())
+    validate_wiggle_degree_and_knots(context, spec.wiggle_degree, spec.wiggle_knots.len())
 }
 
 fn validate_binomial_location_scale_termspec(
@@ -1263,28 +1272,7 @@ fn validate_binomial_location_scalewiggle_termspec(
         &spec.link_kind,
         context,
     )?;
-    if spec.wiggle_degree < 2 {
-        return Err(GamlssError::ConstraintViolation {
-            reason: format!(
-                "{context}: wiggle_degree must be >= 2, got {}",
-                spec.wiggle_degree
-            ),
-        }
-        .into());
-    }
-    let minimum_knots = minimum_monotone_wiggle_knot_count(spec.wiggle_degree)?;
-    if spec.wiggle_knots.len() < minimum_knots {
-        return Err(GamlssError::DimensionMismatch {
-            reason: format!(
-                "{context}: wiggle_knots must have at least {} entries for degree {}, got {}",
-                minimum_knots,
-                spec.wiggle_degree,
-                spec.wiggle_knots.len()
-            ),
-        }
-        .into());
-    }
-    Ok(())
+    validate_wiggle_degree_and_knots(context, spec.wiggle_degree, spec.wiggle_knots.len())
 }
 
 fn initial_log_lambdas_orzeros(block: &ParameterBlockInput) -> Result<Array1<f64>, String> {

@@ -3562,6 +3562,159 @@ impl RadialScalarKind {
     }
 }
 
+/// Shared chunked-operator machinery for the streaming basis evaluators.
+///
+/// `StreamingMaternEvaluator`, `StreamingSphereEvaluator` and
+/// `StreamingBSplineEvaluator` differ only in how a single row chunk of the
+/// design is materialized (`for_row_chunk`) and the chunk size policy
+/// (`chunk_rows`); every other operator method — the chunked matvec,
+/// transpose-matvec, weighted Gram and dense materialization — is identical
+/// boilerplate over that one primitive. This trait carries those shared
+/// methods as defaults keyed on `for_row_chunk`, so each evaluator implements
+/// only the per-basis pieces. The `NAME` const bakes the struct name into the
+/// panic/error strings so diagnostics stay per-evaluator.
+trait ChunkedDesign {
+    /// Struct name used in assertion / error messages.
+    const NAME: &'static str;
+
+    /// Number of design rows (observations).
+    fn op_nrows(&self) -> usize;
+
+    /// Number of design columns (basis functions after any transform).
+    fn op_ncols(&self) -> usize;
+
+    /// Row-block size used to bound the per-chunk working set.
+    fn chunk_rows(&self) -> usize;
+
+    /// Materialize the dense design rows `[start, end)` — the only genuinely
+    /// per-evaluator computation.
+    fn for_row_chunk(&self, start: usize, end: usize) -> Array2<f64>;
+
+    /// Chunked matvec `output = X · theta`.
+    fn chunked_gradient_into(&self, theta: ArrayView1<'_, f64>, output: &mut Array1<f64>) {
+        assert_eq!(
+            theta.len(),
+            self.op_ncols(),
+            "{} theta width mismatch",
+            Self::NAME
+        );
+        assert_eq!(
+            output.len(),
+            self.op_nrows(),
+            "{} output length mismatch",
+            Self::NAME
+        );
+        output.fill(0.0);
+        let nrows = self.op_nrows();
+        for start in (0..nrows).step_by(self.chunk_rows()) {
+            let end = (start + self.chunk_rows()).min(nrows);
+            let chunk = self.for_row_chunk(start, end);
+            let values = chunk.dot(&theta);
+            output.slice_mut(s![start..end]).assign(&values);
+        }
+    }
+
+    /// Chunked matvec returning a fresh vector (`LinearOperator::apply`).
+    fn chunked_apply(&self, vector: &Array1<f64>) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(self.op_nrows());
+        self.chunked_gradient_into(vector.view(), &mut out);
+        out
+    }
+
+    /// Chunked transpose-matvec `out = Xᵀ · vector`
+    /// (`LinearOperator::apply_transpose`).
+    fn chunked_apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
+        assert_eq!(
+            vector.len(),
+            self.op_nrows(),
+            "{} transpose vector length mismatch",
+            Self::NAME
+        );
+        let nrows = self.op_nrows();
+        let mut out = Array1::<f64>::zeros(self.op_ncols());
+        for start in (0..nrows).step_by(self.chunk_rows()) {
+            let end = (start + self.chunk_rows()).min(nrows);
+            let chunk = self.for_row_chunk(start, end);
+            let partial = chunk.t().dot(&vector.slice(s![start..end]));
+            out += &partial;
+        }
+        out
+    }
+
+    /// Chunked weighted Gram `XᵀWX` (`LinearOperator::diag_xtw_x`).
+    fn chunked_diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String>
+    where
+        Self: Sync,
+    {
+        let nrows = self.op_nrows();
+        if weights.len() != nrows {
+            return Err(format!(
+                "{} diag_xtw_x weight length mismatch: weights={}, nrows={}",
+                Self::NAME,
+                weights.len(),
+                nrows
+            ));
+        }
+        let p = self.op_ncols();
+        let chunk_rows = self.chunk_rows();
+        let starts = (0..nrows).step_by(chunk_rows).collect::<Vec<_>>();
+        Ok(starts
+            .into_par_iter()
+            .fold(
+                || Array2::<f64>::zeros((p, p)),
+                |mut acc, start| {
+                    let end = (start + chunk_rows).min(nrows);
+                    let chunk = self.for_row_chunk(start, end);
+                    let mut weighted = chunk.clone();
+                    for local in 0..(end - start) {
+                        let w = weights[start + local];
+                        weighted.row_mut(local).mapv_inplace(|v| v * w);
+                    }
+                    acc += &chunk.t().dot(&weighted);
+                    acc
+                },
+            )
+            .reduce(
+                || Array2::<f64>::zeros((p, p)),
+                |mut a, b| {
+                    a += &b;
+                    a
+                },
+            ))
+    }
+
+    /// Chunked dense row fill (`DenseDesignOperator::row_chunk_into`).
+    fn chunked_row_chunk_into(
+        &self,
+        rows: Range<usize>,
+        mut out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError> {
+        if rows.end > self.op_nrows() || rows.start > rows.end {
+            return Err(MatrixMaterializationError::MissingRowChunk {
+                context: Self::ROW_RANGE_OOB,
+            });
+        }
+        if out.nrows() != rows.end - rows.start || out.ncols() != self.op_ncols() {
+            return Err(MatrixMaterializationError::MissingRowChunk {
+                context: Self::ROW_CHUNK_SHAPE_MISMATCH,
+            });
+        }
+        out.assign(&self.for_row_chunk(rows.start, rows.end));
+        Ok(())
+    }
+
+    /// Full dense materialization (`DenseDesignOperator::to_dense`).
+    fn chunked_to_dense(&self) -> Array2<f64> {
+        self.for_row_chunk(0, self.op_nrows())
+    }
+
+    /// Static `&str` context strings for the row-chunk errors — kept as
+    /// associated consts because `MatrixMaterializationError::MissingRowChunk`
+    /// stores `&'static str`, so a runtime-formatted name cannot be used.
+    const ROW_RANGE_OOB: &'static str;
+    const ROW_CHUNK_SHAPE_MISMATCH: &'static str;
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct StreamingMaternEvaluator {
     data: Arc<Array2<f64>>,
@@ -3631,10 +3784,6 @@ impl StreamingMaternEvaluator {
         })
     }
 
-    fn chunk_rows(&self) -> usize {
-        self.chunk_size.min(self.data.nrows().max(1))
-    }
-
     fn raw_kernel_chunk(&self, rows: Range<usize>) -> Array2<f64> {
         let chunk_n = rows.end - rows.start;
         let k_raw = self.centers.nrows();
@@ -3669,11 +3818,7 @@ impl StreamingMaternEvaluator {
             .expect("StreamingMaternEvaluator chunk shape should match generated values")
     }
 
-    pub(crate) fn for_row_chunk(&self, start: usize, end: usize) -> Array2<f64> {
-        assert!(
-            start <= end && end <= self.data.nrows(),
-            "StreamingMaternEvaluator row chunk out of bounds"
-        );
+    fn for_row_chunk_impl(&self, start: usize, end: usize) -> Array2<f64> {
         let raw = self.raw_kernel_chunk(start..end);
         let kernel = match self.ident_transform.as_ref() {
             Some(z) => fast_ab(&raw, z),
@@ -3686,93 +3831,54 @@ impl StreamingMaternEvaluator {
         out.slice_mut(s![.., ..kernel.ncols()]).assign(&kernel);
         out
     }
+}
 
-    pub(crate) fn gradient_into(&self, theta: ArrayView1<'_, f64>, output: &mut Array1<f64>) {
-        assert_eq!(
-            theta.len(),
-            self.total_cols,
-            "StreamingMaternEvaluator theta width mismatch"
+impl ChunkedDesign for StreamingMaternEvaluator {
+    const NAME: &'static str = "StreamingMaternEvaluator";
+    const ROW_RANGE_OOB: &'static str = "StreamingMaternEvaluator row range out of bounds";
+    const ROW_CHUNK_SHAPE_MISMATCH: &'static str =
+        "StreamingMaternEvaluator row_chunk_into shape mismatch";
+
+    fn op_nrows(&self) -> usize {
+        self.data.nrows()
+    }
+
+    fn op_ncols(&self) -> usize {
+        self.total_cols
+    }
+
+    fn chunk_rows(&self) -> usize {
+        self.chunk_size.min(self.data.nrows().max(1))
+    }
+
+    fn for_row_chunk(&self, start: usize, end: usize) -> Array2<f64> {
+        assert!(
+            start <= end && end <= self.data.nrows(),
+            "StreamingMaternEvaluator row chunk out of bounds"
         );
-        assert_eq!(
-            output.len(),
-            self.data.nrows(),
-            "StreamingMaternEvaluator output length mismatch"
-        );
-        output.fill(0.0);
-        for start in (0..self.data.nrows()).step_by(self.chunk_rows()) {
-            let end = (start + self.chunk_rows()).min(self.data.nrows());
-            let chunk = self.for_row_chunk(start, end);
-            let values = chunk.dot(&theta);
-            output.slice_mut(s![start..end]).assign(&values);
-        }
+        self.for_row_chunk_impl(start, end)
     }
 }
 
 impl LinearOperator for StreamingMaternEvaluator {
     fn nrows(&self) -> usize {
-        self.data.nrows()
+        self.op_nrows()
     }
 
     fn ncols(&self) -> usize {
-        self.total_cols
+        self.op_ncols()
     }
 
     fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
-        let mut out = Array1::<f64>::zeros(self.nrows());
-        self.gradient_into(vector.view(), &mut out);
-        out
+        self.chunked_apply(vector)
     }
 
     fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
-        assert_eq!(
-            vector.len(),
-            self.nrows(),
-            "StreamingMaternEvaluator transpose vector length mismatch"
-        );
-        let mut out = Array1::<f64>::zeros(self.ncols());
-        for start in (0..self.nrows()).step_by(self.chunk_rows()) {
-            let end = (start + self.chunk_rows()).min(self.nrows());
-            let chunk = self.for_row_chunk(start, end);
-            let partial = chunk.t().dot(&vector.slice(s![start..end]));
-            out += &partial;
-        }
-        out
+        self.chunked_apply_transpose(vector)
     }
 
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
-        if weights.len() != self.nrows() {
-            return Err(format!(
-                "StreamingMaternEvaluator diag_xtw_x weight length mismatch: weights={}, nrows={}",
-                weights.len(),
-                self.nrows()
-            ));
-        }
-        let p = self.ncols();
-        let chunk_rows = self.chunk_rows();
-        let starts = (0..self.nrows()).step_by(chunk_rows).collect::<Vec<_>>();
-        Ok(starts
-            .into_par_iter()
-            .fold(
-                || Array2::<f64>::zeros((p, p)),
-                |mut acc, start| {
-                    let end = (start + chunk_rows).min(self.nrows());
-                    let chunk = self.for_row_chunk(start, end);
-                    let mut weighted = chunk.clone();
-                    for local in 0..(end - start) {
-                        let w = weights[start + local];
-                        weighted.row_mut(local).mapv_inplace(|v| v * w);
-                    }
-                    acc += &chunk.t().dot(&weighted);
-                    acc
-                },
-            )
-            .reduce(
-                || Array2::<f64>::zeros((p, p)),
-                |mut a, b| {
-                    a += &b;
-                    a
-                },
-            ))
+        self.chunked_diag_xtw_x(weights)
     }
 }
 
@@ -3780,24 +3886,13 @@ impl DenseDesignOperator for StreamingMaternEvaluator {
     fn row_chunk_into(
         &self,
         rows: Range<usize>,
-        mut out: ArrayViewMut2<'_, f64>,
+        out: ArrayViewMut2<'_, f64>,
     ) -> Result<(), MatrixMaterializationError> {
-        if rows.end > self.nrows() || rows.start > rows.end {
-            return Err(MatrixMaterializationError::MissingRowChunk {
-                context: "StreamingMaternEvaluator row range out of bounds",
-            });
-        }
-        if out.nrows() != rows.end - rows.start || out.ncols() != self.ncols() {
-            return Err(MatrixMaterializationError::MissingRowChunk {
-                context: "StreamingMaternEvaluator row_chunk_into shape mismatch",
-            });
-        }
-        out.assign(&self.for_row_chunk(rows.start, rows.end));
-        Ok(())
+        self.chunked_row_chunk_into(rows, out)
     }
 
     fn to_dense(&self) -> Array2<f64> {
-        self.for_row_chunk(0, self.nrows())
+        self.chunked_to_dense()
     }
 }
 
@@ -3881,10 +3976,6 @@ impl StreamingSphereEvaluator {
         })
     }
 
-    fn chunk_rows(&self) -> usize {
-        self.chunk_size.min(self.data.nrows().max(1))
-    }
-
     fn raw_kernel_chunk(&self, rows: Range<usize>) -> Array2<f64> {
         let chunk_n = rows.end - rows.start;
         let k = self.centers.nrows();
@@ -3961,104 +4052,61 @@ impl StreamingSphereEvaluator {
             .expect("StreamingSphereEvaluator chunk shape should match generated values")
     }
 
-    pub(crate) fn for_row_chunk(&self, start: usize, end: usize) -> Array2<f64> {
-        assert!(
-            start <= end && end <= self.data.nrows(),
-            "StreamingSphereEvaluator row chunk out of bounds"
-        );
+    fn for_row_chunk_impl(&self, start: usize, end: usize) -> Array2<f64> {
         let raw = self.raw_kernel_chunk(start..end);
         match self.constraint_transform.as_ref() {
             Some(z) => fast_ab(&raw, z),
             None => raw,
         }
     }
+}
 
-    pub(crate) fn gradient_into(&self, theta: ArrayView1<'_, f64>, output: &mut Array1<f64>) {
-        assert_eq!(
-            theta.len(),
-            self.total_cols,
-            "StreamingSphereEvaluator theta width mismatch"
+impl ChunkedDesign for StreamingSphereEvaluator {
+    const NAME: &'static str = "StreamingSphereEvaluator";
+    const ROW_RANGE_OOB: &'static str = "StreamingSphereEvaluator row range out of bounds";
+    const ROW_CHUNK_SHAPE_MISMATCH: &'static str =
+        "StreamingSphereEvaluator row_chunk_into shape mismatch";
+
+    fn op_nrows(&self) -> usize {
+        self.data.nrows()
+    }
+
+    fn op_ncols(&self) -> usize {
+        self.total_cols
+    }
+
+    fn chunk_rows(&self) -> usize {
+        self.chunk_size.min(self.data.nrows().max(1))
+    }
+
+    fn for_row_chunk(&self, start: usize, end: usize) -> Array2<f64> {
+        assert!(
+            start <= end && end <= self.data.nrows(),
+            "StreamingSphereEvaluator row chunk out of bounds"
         );
-        assert_eq!(
-            output.len(),
-            self.data.nrows(),
-            "StreamingSphereEvaluator output length mismatch"
-        );
-        output.fill(0.0);
-        for start in (0..self.data.nrows()).step_by(self.chunk_rows()) {
-            let end = (start + self.chunk_rows()).min(self.data.nrows());
-            let chunk = self.for_row_chunk(start, end);
-            let values = chunk.dot(&theta);
-            output.slice_mut(s![start..end]).assign(&values);
-        }
+        self.for_row_chunk_impl(start, end)
     }
 }
 
 impl LinearOperator for StreamingSphereEvaluator {
     fn nrows(&self) -> usize {
-        self.data.nrows()
+        self.op_nrows()
     }
 
     fn ncols(&self) -> usize {
-        self.total_cols
+        self.op_ncols()
     }
 
     fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
-        let mut out = Array1::<f64>::zeros(self.nrows());
-        self.gradient_into(vector.view(), &mut out);
-        out
+        self.chunked_apply(vector)
     }
 
     fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
-        assert_eq!(
-            vector.len(),
-            self.nrows(),
-            "StreamingSphereEvaluator transpose vector length mismatch"
-        );
-        let mut out = Array1::<f64>::zeros(self.ncols());
-        for start in (0..self.nrows()).step_by(self.chunk_rows()) {
-            let end = (start + self.chunk_rows()).min(self.nrows());
-            let chunk = self.for_row_chunk(start, end);
-            let partial = chunk.t().dot(&vector.slice(s![start..end]));
-            out += &partial;
-        }
-        out
+        self.chunked_apply_transpose(vector)
     }
 
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
-        if weights.len() != self.nrows() {
-            return Err(format!(
-                "StreamingSphereEvaluator diag_xtw_x weight length mismatch: weights={}, nrows={}",
-                weights.len(),
-                self.nrows()
-            ));
-        }
-        let p = self.ncols();
-        let chunk_rows = self.chunk_rows();
-        let starts = (0..self.nrows()).step_by(chunk_rows).collect::<Vec<_>>();
-        Ok(starts
-            .into_par_iter()
-            .fold(
-                || Array2::<f64>::zeros((p, p)),
-                |mut acc, start| {
-                    let end = (start + chunk_rows).min(self.nrows());
-                    let chunk = self.for_row_chunk(start, end);
-                    let mut weighted = chunk.clone();
-                    for local in 0..(end - start) {
-                        let w = weights[start + local];
-                        weighted.row_mut(local).mapv_inplace(|v| v * w);
-                    }
-                    acc += &chunk.t().dot(&weighted);
-                    acc
-                },
-            )
-            .reduce(
-                || Array2::<f64>::zeros((p, p)),
-                |mut a, b| {
-                    a += &b;
-                    a
-                },
-            ))
+        self.chunked_diag_xtw_x(weights)
     }
 }
 
@@ -4066,24 +4114,13 @@ impl DenseDesignOperator for StreamingSphereEvaluator {
     fn row_chunk_into(
         &self,
         rows: Range<usize>,
-        mut out: ArrayViewMut2<'_, f64>,
+        out: ArrayViewMut2<'_, f64>,
     ) -> Result<(), MatrixMaterializationError> {
-        if rows.end > self.nrows() || rows.start > rows.end {
-            return Err(MatrixMaterializationError::MissingRowChunk {
-                context: "StreamingSphereEvaluator row range out of bounds",
-            });
-        }
-        if out.nrows() != rows.end - rows.start || out.ncols() != self.ncols() {
-            return Err(MatrixMaterializationError::MissingRowChunk {
-                context: "StreamingSphereEvaluator row_chunk_into shape mismatch",
-            });
-        }
-        out.assign(&self.for_row_chunk(rows.start, rows.end));
-        Ok(())
+        self.chunked_row_chunk_into(rows, out)
     }
 
     fn to_dense(&self) -> Array2<f64> {
-        self.for_row_chunk(0, self.nrows())
+        self.chunked_to_dense()
     }
 }
 
@@ -4128,10 +4165,6 @@ impl StreamingBSplineEvaluator {
         })
     }
 
-    fn chunk_rows(&self) -> usize {
-        self.chunk_size.min(self.data.len().max(1))
-    }
-
     fn raw_chunk(&self, start: usize, end: usize) -> Array2<f64> {
         bspline_raw_row_chunk(
             self.data.view(),
@@ -4144,104 +4177,61 @@ impl StreamingBSplineEvaluator {
         .expect("StreamingBSplineEvaluator validated inputs should build row chunks")
     }
 
-    pub(crate) fn for_row_chunk(&self, start: usize, end: usize) -> Array2<f64> {
-        assert!(
-            start <= end && end <= self.data.len(),
-            "StreamingBSplineEvaluator row chunk out of bounds"
-        );
+    fn for_row_chunk_impl(&self, start: usize, end: usize) -> Array2<f64> {
         let raw = self.raw_chunk(start, end);
         match self.transform.as_ref() {
             Some(z) => fast_ab(&raw, z),
             None => raw,
         }
     }
+}
 
-    pub(crate) fn gradient_into(&self, theta: ArrayView1<'_, f64>, output: &mut Array1<f64>) {
-        assert_eq!(
-            theta.len(),
-            self.total_cols,
-            "StreamingBSplineEvaluator theta width mismatch"
+impl ChunkedDesign for StreamingBSplineEvaluator {
+    const NAME: &'static str = "StreamingBSplineEvaluator";
+    const ROW_RANGE_OOB: &'static str = "StreamingBSplineEvaluator row range out of bounds";
+    const ROW_CHUNK_SHAPE_MISMATCH: &'static str =
+        "StreamingBSplineEvaluator row_chunk_into shape mismatch";
+
+    fn op_nrows(&self) -> usize {
+        self.data.len()
+    }
+
+    fn op_ncols(&self) -> usize {
+        self.total_cols
+    }
+
+    fn chunk_rows(&self) -> usize {
+        self.chunk_size.min(self.data.len().max(1))
+    }
+
+    fn for_row_chunk(&self, start: usize, end: usize) -> Array2<f64> {
+        assert!(
+            start <= end && end <= self.data.len(),
+            "StreamingBSplineEvaluator row chunk out of bounds"
         );
-        assert_eq!(
-            output.len(),
-            self.data.len(),
-            "StreamingBSplineEvaluator output length mismatch"
-        );
-        output.fill(0.0);
-        for start in (0..self.data.len()).step_by(self.chunk_rows()) {
-            let end = (start + self.chunk_rows()).min(self.data.len());
-            let chunk = self.for_row_chunk(start, end);
-            let values = chunk.dot(&theta);
-            output.slice_mut(s![start..end]).assign(&values);
-        }
+        self.for_row_chunk_impl(start, end)
     }
 }
 
 impl LinearOperator for StreamingBSplineEvaluator {
     fn nrows(&self) -> usize {
-        self.data.len()
+        self.op_nrows()
     }
 
     fn ncols(&self) -> usize {
-        self.total_cols
+        self.op_ncols()
     }
 
     fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
-        let mut out = Array1::<f64>::zeros(self.nrows());
-        self.gradient_into(vector.view(), &mut out);
-        out
+        self.chunked_apply(vector)
     }
 
     fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
-        assert_eq!(
-            vector.len(),
-            self.nrows(),
-            "StreamingBSplineEvaluator transpose vector length mismatch"
-        );
-        let mut out = Array1::<f64>::zeros(self.ncols());
-        for start in (0..self.nrows()).step_by(self.chunk_rows()) {
-            let end = (start + self.chunk_rows()).min(self.nrows());
-            let chunk = self.for_row_chunk(start, end);
-            let partial = chunk.t().dot(&vector.slice(s![start..end]));
-            out += &partial;
-        }
-        out
+        self.chunked_apply_transpose(vector)
     }
 
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
-        if weights.len() != self.nrows() {
-            return Err(format!(
-                "StreamingBSplineEvaluator diag_xtw_x weight length mismatch: weights={}, nrows={}",
-                weights.len(),
-                self.nrows()
-            ));
-        }
-        let p = self.ncols();
-        let chunk_rows = self.chunk_rows();
-        let starts = (0..self.nrows()).step_by(chunk_rows).collect::<Vec<_>>();
-        Ok(starts
-            .into_par_iter()
-            .fold(
-                || Array2::<f64>::zeros((p, p)),
-                |mut acc, start| {
-                    let end = (start + chunk_rows).min(self.nrows());
-                    let chunk = self.for_row_chunk(start, end);
-                    let mut weighted = chunk.clone();
-                    for local in 0..(end - start) {
-                        let w = weights[start + local];
-                        weighted.row_mut(local).mapv_inplace(|v| v * w);
-                    }
-                    acc += &chunk.t().dot(&weighted);
-                    acc
-                },
-            )
-            .reduce(
-                || Array2::<f64>::zeros((p, p)),
-                |mut a, b| {
-                    a += &b;
-                    a
-                },
-            ))
+        self.chunked_diag_xtw_x(weights)
     }
 }
 
@@ -4249,24 +4239,13 @@ impl DenseDesignOperator for StreamingBSplineEvaluator {
     fn row_chunk_into(
         &self,
         rows: Range<usize>,
-        mut out: ArrayViewMut2<'_, f64>,
+        out: ArrayViewMut2<'_, f64>,
     ) -> Result<(), MatrixMaterializationError> {
-        if rows.end > self.nrows() || rows.start > rows.end {
-            return Err(MatrixMaterializationError::MissingRowChunk {
-                context: "StreamingBSplineEvaluator row range out of bounds",
-            });
-        }
-        if out.nrows() != rows.end - rows.start || out.ncols() != self.ncols() {
-            return Err(MatrixMaterializationError::MissingRowChunk {
-                context: "StreamingBSplineEvaluator row_chunk_into shape mismatch",
-            });
-        }
-        out.assign(&self.for_row_chunk(rows.start, rows.end));
-        Ok(())
+        self.chunked_row_chunk_into(rows, out)
     }
 
     fn to_dense(&self) -> Array2<f64> {
-        self.for_row_chunk(0, self.nrows())
+        self.chunked_to_dense()
     }
 }
 
@@ -23366,7 +23345,11 @@ fn duchon_data_jet_penalty_candidates(
         coeffs.as_ref().map(|(c, _)| c),
         pure_poly_coeff.as_ref(),
     );
-    let metric_weights: Option<Vec<f64>> = aniso_log_scales.map(centered_aniso_metric_weights);
+    // Per-axis metric weights, materialized once (unit when isotropic) so the
+    // hot inner loops index a slice instead of re-evaluating an Option per call.
+    let w_eff: Vec<f64> = aniso_log_scales
+        .map(centered_aniso_metric_weights)
+        .unwrap_or_else(|| vec![1.0; dim]);
 
     // Persistent (p × p) Gram accumulators. Tension/stiffness sum
     // `Σ_i Jᵢᵀ Jᵢ` / `Σ_i Hᵢᵀ Hᵢ` over chunks; mass needs the centered design
@@ -23381,12 +23364,23 @@ fn duchon_data_jet_penalty_candidates(
     let mut design_colsum = Array1::<f64>::zeros(p_out);
 
     const R_EPS: f64 = 1.0e-12;
-    // Streaming row-block size keeps each chunk's transient jet tensor at
-    // `block × p × d²` rather than the full `n_eval × p × d²`.
+    // Streaming row-block size keeps each chunk's transient at O(block × n_eval).
+    // The jet/Hessian are NOT staged as dense `block × n_eval × dim[× dim]`
+    // tensors (that is the dim² OOM term at high d/K); each axis / (a,c) pair is
+    // built into a single reused `block × n_eval` slab, projected through Z, and
+    // discarded.
     const DUCHON_DATA_JET_ROW_BLOCK: usize = 256;
     let block = DUCHON_DATA_JET_ROW_BLOCK.min(n_eval.max(1));
 
-    // Scratch reused per chunk (sized at first chunk).
+    // Scratch reused across chunks (block-sized). `q = φ'/r` and
+    // `s = (φ'' − q)/r²` are cached so the jet/Hessian slabs rebuild per axis
+    // without re-evaluating the kernel; `slab` is the single reused staging
+    // buffer; `gram_scratch` receives each `fast_ata_into`.
+    let mut radial_value = Array2::<f64>::zeros((block, n_eval));
+    let mut q_cache = Array2::<f64>::zeros((block, n_eval));
+    let mut s_cache = Array2::<f64>::zeros((block, n_eval));
+    let mut slab = Array2::<f64>::zeros((block, n_eval));
+    let mut gram_scratch = Array2::<f64>::zeros((p_out, p_out));
     let mut chunk_design = Array2::<f64>::zeros((block, p_out));
     let mut chunk_jet = Array2::<f64>::zeros((block * dim, p_out));
     let mut chunk_hess = Array2::<f64>::zeros((block * dim * dim, p_out));
@@ -23394,21 +23388,14 @@ fn duchon_data_jet_penalty_candidates(
     let mut start = 0usize;
     while start < n_eval {
         let rows = block.min(n_eval - start);
-        // Per-chunk pre-transform value/jet/hess in kernel-center coordinates.
-        // `radial_value[(local, k)]`, `radial_jet[(local, k, a)]`,
-        // `radial_hess[(local, k, a, c)]` for kernel-center `k`.
-        let mut radial_value = Array2::<f64>::zeros((rows, n_eval));
-        let mut radial_jet = Array3::<f64>::zeros((rows, n_eval, dim));
-        let mut radial_hess = Array4::<f64>::zeros((rows, n_eval, dim, dim));
+        // Radial scalars φ, q=φ'/r, s=(φ''−q)/r² at every (eval row, center).
         for local in 0..rows {
             let i = start + local;
             for k in 0..n_eval {
-                // Anisotropic (or isotropic) distance and raw displacements.
                 let mut r2 = 0.0_f64;
                 for a in 0..dim {
                     let h_a = centers[[i, a]] - centers[[k, a]];
-                    let w_a = metric_weights.as_ref().map(|w| w[a]).unwrap_or(1.0);
-                    r2 += w_a * h_a * h_a;
+                    r2 += w_eff[a] * h_a * h_a;
                 }
                 let r = r2.sqrt();
                 let (phi, phi_r, phi_rr) = if pure {
@@ -23433,38 +23420,16 @@ fn duchon_data_jet_penalty_candidates(
                 radial_value[[local, k]] = phi * kernel_amp;
                 // q = φ'/r (finite limit φ''(0) at r→0), s = (φ'' − q)/r².
                 let q = if r > R_EPS { phi_r / r } else { phi_rr };
-                let s_scalar = if r > R_EPS { (phi_rr - q) / r2 } else { 0.0 };
-                if r > R_EPS {
-                    for a in 0..dim {
-                        let w_a = metric_weights.as_ref().map(|w| w[a]).unwrap_or(1.0);
-                        let h_a = centers[[i, a]] - centers[[k, a]];
-                        radial_jet[[local, k, a]] = q * w_a * h_a * kernel_amp;
-                    }
-                }
-                for a in 0..dim {
-                    let w_a = metric_weights.as_ref().map(|w| w[a]).unwrap_or(1.0);
-                    let h_a = centers[[i, a]] - centers[[k, a]];
-                    for c in 0..dim {
-                        let w_c = metric_weights.as_ref().map(|w| w[c]).unwrap_or(1.0);
-                        let h_c = centers[[i, c]] - centers[[k, c]];
-                        let diagonal = if a == c { q * w_a } else { 0.0 };
-                        let mixed = if r > R_EPS {
-                            s_scalar * w_a * h_a * w_c * h_c
-                        } else {
-                            0.0
-                        };
-                        radial_hess[[local, k, a, c]] = (diagonal + mixed) * kernel_amp;
-                    }
-                }
+                q_cache[[local, k]] = q;
+                s_cache[[local, k]] = if r > R_EPS { (phi_rr - q) / r2 } else { 0.0 };
             }
         }
 
         // Project radial blocks through the kernel null space `Z` and stitch on
-        // the polynomial forward block / jet / Hessian, mirroring
-        // `build_duchon_basis_design_and_jets`. The result lives in the
+        // the polynomial forward block / jet / Hessian. The result lives in the
         // pre-identifiability `n_pre`-column frame.
         let mut pre_design = Array2::<f64>::zeros((rows, n_pre));
-        let kernel_design = fast_ab(&radial_value, z);
+        let kernel_design = fast_ab(&radial_value.slice(s![..rows, ..]), z);
         pre_design.slice_mut(s![.., ..n_kernel]).assign(&kernel_design);
         if n_poly > 0 {
             pre_design
@@ -23473,11 +23438,20 @@ fn duchon_data_jet_penalty_candidates(
         }
 
         // Pre-transform jet: `(rows*dim) × n_pre`, axis-major row order
-        // `(local*dim + a)`.
+        // `(local*dim + a)`. Build one reused `rows × n_eval` slab per axis from
+        // the cached q; at r=0 the displacement h_a is exactly 0 so the slab is
+        // 0 there (matching the old r>R_EPS guard) with no branch.
         let mut pre_jet = Array2::<f64>::zeros((rows * dim, n_pre));
         for a in 0..dim {
-            let slab = radial_jet.index_axis(Axis(2), a); // rows × n_eval
-            let projected = slab.dot(z); // rows × n_kernel
+            let wa = w_eff[a];
+            for local in 0..rows {
+                let i = start + local;
+                for k in 0..n_eval {
+                    let h_a = centers[[i, a]] - centers[[k, a]];
+                    slab[[local, k]] = q_cache[[local, k]] * wa * h_a * kernel_amp;
+                }
+            }
+            let projected = slab.slice(s![..rows, ..]).dot(z); // rows × n_kernel
             for local in 0..rows {
                 let dst_row = local * dim + a;
                 for col in 0..n_kernel {
@@ -23498,12 +23472,26 @@ fn duchon_data_jet_penalty_candidates(
         }
 
         // Pre-transform Hessian: `(rows*dim*dim) × n_pre`, row order
-        // `(local*dim + a)*dim + c`.
+        // `(local*dim + a)*dim + c`. diagonal = q·w_a when a==c; mixed =
+        // s·w_a·h_a·w_c·h_c (0 at r=0 since both h and s vanish there). One
+        // reused `rows × n_eval` slab per (a,c) — no dim² tensor staged.
         let mut pre_hess = Array2::<f64>::zeros((rows * dim * dim, n_pre));
         for a in 0..dim {
+            let wa = w_eff[a];
             for c in 0..dim {
-                let slab = radial_hess.slice(s![.., .., a, c]); // rows × n_eval
-                let projected = slab.dot(z); // rows × n_kernel
+                let wc = w_eff[c];
+                let diag_on = a == c;
+                for local in 0..rows {
+                    let i = start + local;
+                    for k in 0..n_eval {
+                        let h_a = centers[[i, a]] - centers[[k, a]];
+                        let h_c = centers[[i, c]] - centers[[k, c]];
+                        let diagonal = if diag_on { q_cache[[local, k]] * wa } else { 0.0 };
+                        let mixed = s_cache[[local, k]] * wa * h_a * wc * h_c;
+                        slab[[local, k]] = (diagonal + mixed) * kernel_amp;
+                    }
+                }
+                let projected = slab.slice(s![..rows, ..]).dot(z); // rows × n_kernel
                 for local in 0..rows {
                     let dst_row = (local * dim + a) * dim + c;
                     for col in 0..n_kernel {
@@ -23532,17 +23520,16 @@ fn duchon_data_jet_penalty_candidates(
                         if lead == 0.0 {
                             continue;
                         }
+                        // Adjusted exponents are row-invariant — hoist out of the
+                        // row loop. For a==c this subtracts twice (∂²/∂x_a²).
+                        let mut adj_exp = alpha.clone();
+                        adj_exp[a] = adj_exp[a].saturating_sub(1);
+                        adj_exp[c] = adj_exp[c].saturating_sub(1);
                         for local in 0..rows {
                             let i = start + local;
                             let mut value = lead;
                             for axis in 0..dim {
-                                let mut exp = alpha[axis];
-                                if axis == a {
-                                    exp = exp.saturating_sub(1);
-                                }
-                                if axis == c {
-                                    exp = exp.saturating_sub(1);
-                                }
+                                let exp = adj_exp[axis];
                                 if exp != 0 {
                                     value *= centers[[i, axis]].powi(exp as i32);
                                 }
@@ -23577,26 +23564,24 @@ fn duchon_data_jet_penalty_candidates(
             chunk_hess_block.assign(&pre_hess);
         }
 
-        // Accumulate the three Grams from this chunk into the persistent
-        // buffers via `fast_ata_into` on scratch, then add in.
+        // Accumulate the three Grams from this chunk into the persistent buffers
+        // via `fast_ata_into` on the reused scratch (it writes Accum::Replace, so
+        // no zeroing is needed between chunks), then add in.
         if want_mass {
             let d_view = chunk_design.slice(s![..rows, ..]);
             design_colsum += &d_view.sum_axis(Axis(0));
-            let mut g = Array2::<f64>::zeros((p_out, p_out));
-            fast_ata_into(&d_view, &mut g);
-            design_gram += &g;
+            fast_ata_into(&d_view, &mut gram_scratch);
+            design_gram += &gram_scratch;
         }
         if want_tension {
             let j_view = chunk_jet.slice(s![..rows * dim, ..]);
-            let mut g = Array2::<f64>::zeros((p_out, p_out));
-            fast_ata_into(&j_view, &mut g);
-            tension_gram += &g;
+            fast_ata_into(&j_view, &mut gram_scratch);
+            tension_gram += &gram_scratch;
         }
         if want_stiffness {
             let h_view = chunk_hess.slice(s![..rows * dim * dim, ..]);
-            let mut g = Array2::<f64>::zeros((p_out, p_out));
-            fast_ata_into(&h_view, &mut g);
-            stiffness_gram += &g;
+            fast_ata_into(&h_view, &mut gram_scratch);
+            stiffness_gram += &gram_scratch;
         }
 
         start += rows;

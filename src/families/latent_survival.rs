@@ -93,6 +93,14 @@ impl From<LatentSurvivalError> for String {
     }
 }
 
+impl From<crate::util::block_count::BlockCountMismatch> for LatentSurvivalError {
+    fn from(err: crate::util::block_count::BlockCountMismatch) -> LatentSurvivalError {
+        LatentSurvivalError::BlockMismatch {
+            reason: err.message(),
+        }
+    }
+}
+
 impl From<String> for LatentSurvivalError {
     /// Inbound conversion for the many `Result<_, String>` helpers this
     /// module still calls into (term-collection design assembly, dense
@@ -222,14 +230,11 @@ impl LatentSurvivalFamily {
         LatentSurvivalError,
     > {
         let expected_blocks = if self.latent_sd_fixed.is_some() { 2 } else { 3 };
-        if block_states.len() != expected_blocks {
-            return Err(LatentSurvivalError::BlockMismatch {
-                reason: format!(
-                    "LatentSurvivalFamily expects {expected_blocks} blocks, got {}",
-                    block_states.len(),
-                ),
-            });
-        }
+        crate::util::block_count::validate_block_count::<LatentSurvivalError>(
+            "LatentSurvivalFamily",
+            expected_blocks,
+            block_states.len(),
+        )?;
         let n = self.event_target.len();
         let eta_time = &block_states[Self::BLOCK_TIME].eta;
         let eta_mean = &block_states[Self::BLOCK_MEAN].eta;
@@ -286,14 +291,11 @@ impl LatentBinaryFamily {
         block_states: &'a [ParameterBlockState],
     ) -> Result<(ArrayView1<'a, f64>, ArrayView1<'a, f64>, &'a Array1<f64>), LatentSurvivalError>
     {
-        if block_states.len() != 2 {
-            return Err(LatentSurvivalError::BlockMismatch {
-                reason: format!(
-                    "LatentBinaryFamily expects 2 blocks, got {}",
-                    block_states.len()
-                ),
-            });
-        }
+        crate::util::block_count::validate_block_count::<LatentSurvivalError>(
+            "LatentBinaryFamily",
+            2,
+            block_states.len(),
+        )?;
         let n = self.event_target.len();
         let eta_time = &block_states[Self::BLOCK_TIME].eta;
         let eta_mean = &block_states[Self::BLOCK_MEAN].eta;
