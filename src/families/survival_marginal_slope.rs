@@ -21705,6 +21705,34 @@ mod tests {
     use faer::sparse::{SparseColMat, Triplet};
     use ndarray::array;
 
+    /// `with_row_context` must splice `at row N` between the reason prefix and
+    /// the `:` details separator so a scalar-kernel error reshapes into the
+    /// canonical `<reason> at row N: <details>` that downstream consumers
+    /// pattern-match on — and must degrade gracefully (append, not corrupt)
+    /// when the error carries no `:` separator at all.
+    #[test]
+    fn with_row_context_matches_canonical_row_tag_shape() {
+        // Canonical reason:detail kernel error -> tag spliced before the colon.
+        assert_eq!(
+            with_row_context(
+                "survival marginal-slope monotonicity violated: qd1=-0.5".to_string(),
+                7,
+            ),
+            "survival marginal-slope monotonicity violated at row 7: qd1=-0.5",
+        );
+        // Only the FIRST colon is the reason/detail boundary; later colons in
+        // the details (e.g. a nested key:value) must be left untouched.
+        assert_eq!(
+            with_row_context("reason: a=1: b=2".to_string(), 3),
+            "reason at row 3: a=1: b=2",
+        );
+        // No colon -> append the tag rather than dropping or mangling it.
+        assert_eq!(
+            with_row_context("bare error with no separator".to_string(), 42),
+            "bare error with no separator at row 42",
+        );
+    }
+
     /// Pin the survival cross-block W metric to the survival row Hessian
     /// formula `u2_eta1 = (1-d)·w·k2(-η, w·(1-d)) + d·w` rather than the
     /// Bernoulli probit proxy `φ²/(Φ·(1-Φ))`. Three rows exercise the
