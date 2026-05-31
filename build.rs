@@ -3053,6 +3053,11 @@ fn scan_for_useless_tests(root: &Path, dir: &Path, offenders: &mut Vec<(PathBuf,
         let lines: Vec<&str> = content.lines().collect();
         let stripped_lines = strip_file_lines(content);
         let n = lines.len();
+        // Index every local `fn` so a `#[test]` that delegates its assertions
+        // to a helper can be resolved by following the call into the helper
+        // body (see `test_body_reaches_assertion`), instead of relying solely
+        // on the helper's *name* matching an `assert_*`/`expect_*`/… prefix.
+        let local_fns = index_local_fns(&lines, &stripped_lines);
         let mut i = 0usize;
         while i < n {
             let s = stripped_lines
@@ -3126,31 +3131,8 @@ fn scan_for_useless_tests(root: &Path, dir: &Path, offenders: &mut Vec<(PathBuf,
                 i = j + 1;
                 continue;
             };
-            let mut found = false;
-            for (offset, raw_line) in lines[open..=close].iter().enumerate() {
-                let k = open + offset;
-                let line_s = stripped_lines
-                    .get(k)
-                    .map(String::as_str)
-                    .unwrap_or(raw_line);
-                if line_s.contains("assert!(")
-                    || line_s.contains("assert_eq!(")
-                    || line_s.contains("assert_ne!(")
-                    || line_s.contains("debug_assert!(")
-                    || line_s.contains("debug_assert_eq!(")
-                    || line_s.contains("debug_assert_ne!(")
-                    || line_s.contains("panic!(")
-                    || line_s.contains("unreachable!(")
-                    || line_s.contains("unimplemented!(")
-                    || line_s.contains("todo!(")
-                    || line_contains_propagating_question(line_s)
-                    || line_contains_assertion_helper_macro(line_s)
-                    || line_contains_assertion_helper_call(line_s)
-                {
-                    found = true;
-                    break;
-                }
-            }
+            let found =
+                test_body_reaches_assertion(&lines, &stripped_lines, open, close, &local_fns);
             if !found {
                 let raw = lines.get(i).copied().unwrap_or("");
                 if rel
@@ -3669,6 +3651,192 @@ fn find_fn_body_at(lines: &[&str], fn_line: usize) -> Option<(String, (usize, us
         }
     }
     None
+}
+
+/// Maximum number of helper-delegation hops the useless-test gate will follow
+/// when resolving whether a `#[test]` reaches an assertion. A test that calls a
+/// helper that calls a helper that asserts is still a real test; beyond a few
+/// hops the indirection is its own problem and we stop (and flag) rather than
+/// chase arbitrarily deep call graphs at build time.
+const MAX_DELEGATION_DEPTH: usize = 4;
+
+/// True when a single stripped source line contains an assertion-shaped
+/// construct: an `assert`/`debug_assert`/panic-family macro, `?`-propagation,
+/// or an `assert_*`/`expect_*`/`require_*`/`ensure_*`-named helper macro or
+/// bare call. This is the per-line recognizer for the useless-test gate.
+fn line_is_assertion_shaped(line_s: &str) -> bool {
+    line_s.contains("assert!(")
+        || line_s.contains("assert_eq!(")
+        || line_s.contains("assert_ne!(")
+        || line_s.contains("debug_assert!(")
+        || line_s.contains("debug_assert_eq!(")
+        || line_s.contains("debug_assert_ne!(")
+        || line_s.contains("panic!(")
+        || line_s.contains("unreachable!(")
+        || line_s.contains("unimplemented!(")
+        || line_s.contains("todo!(")
+        || line_contains_propagating_question(line_s)
+        || line_contains_assertion_helper_macro(line_s)
+        || line_contains_assertion_helper_call(line_s)
+}
+
+/// Extract the function name from a normalized signature string produced by
+/// `find_fn_body_at` (whitespace-collapsed, body brace stripped), e.g.
+/// `"pub fn report_and_check ( ... ) -> bool"` → `Some("report_and_check")`.
+/// Returns `None` when the `fn` token is a function-pointer *type*
+/// (`fn(f64) -> f64`) with no following identifier.
+fn fn_name_from_sig(sig: &str) -> Option<String> {
+    let mut toks = sig.split_whitespace();
+    while let Some(t) = toks.next() {
+        if t == "fn" {
+            let next = toks.next()?;
+            let name: String = next
+                .chars()
+                .take_while(|c| *c == '_' || c.is_ascii_alphanumeric())
+                .collect();
+            return if name.is_empty() { None } else { Some(name) };
+        }
+    }
+    None
+}
+
+/// Index every `fn <name>(...) { ... }` defined in the file as
+/// `(name, body_open_line, body_close_line)`. Nested and duplicate-named
+/// definitions are all retained so any matching definition can satisfy a
+/// delegation lookup. Function-pointer *types* (no name) are skipped.
+fn index_local_fns(lines: &[&str], stripped_lines: &[String]) -> Vec<(String, usize, usize)> {
+    let mut out = Vec::new();
+    let n = lines.len();
+    let mut i = 0usize;
+    while i < n {
+        let s = stripped_lines
+            .get(i)
+            .map(String::as_str)
+            .unwrap_or(lines[i]);
+        if line_has_keyword(s, "fn")
+            && let Some((sig, (open, close))) = find_fn_body_at(lines, i)
+            && let Some(name) = fn_name_from_sig(&sig)
+        {
+            out.push((name, open, close));
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Collect identifiers appearing in bare-call position (`<ident>(`, not the
+/// macro shape `<ident>!(`) on a stripped source line, appending them to
+/// `out`. Used to resolve which local helper functions a test body delegates
+/// to.
+fn collect_called_idents(stripped: &str, out: &mut Vec<String>) {
+    let bytes = stripped.as_bytes();
+    let n = bytes.len();
+    let mut i = 0usize;
+    while i < n {
+        if bytes[i] != b'(' {
+            i += 1;
+            continue;
+        }
+        if i > 0 && bytes[i - 1] == b'!' {
+            i += 1;
+            continue;
+        }
+        let mut start = i;
+        while start > 0 {
+            let b = bytes[start - 1];
+            if b == b'_' || b.is_ascii_alphanumeric() {
+                start -= 1;
+            } else {
+                break;
+            }
+        }
+        if start < i {
+            out.push(stripped[start..i].to_string());
+        }
+        i += 1;
+    }
+}
+
+/// True when the function body spanning `open..=close` (brace lines) reaches an
+/// assertion-shaped construct, either directly or by delegating to a local
+/// helper function that itself reaches one. This is what lets a test delegate
+/// its checks to a helper with an ordinary name (`report_and_check`,
+/// `verify_recovers`, …) without the gate false-flagging it as assertion-less:
+/// the gate follows the call into the helper body and finds the real `assert!`,
+/// rather than trusting (or rejecting) the helper by its name prefix.
+fn test_body_reaches_assertion(
+    lines: &[&str],
+    stripped_lines: &[String],
+    open: usize,
+    close: usize,
+    local_fns: &[(String, usize, usize)],
+) -> bool {
+    let mut visited: Vec<usize> = vec![open];
+    body_reaches_assertion(
+        lines,
+        stripped_lines,
+        open,
+        close,
+        local_fns,
+        &mut visited,
+        MAX_DELEGATION_DEPTH,
+    )
+}
+
+/// Depth- and cycle-bounded recursion behind `test_body_reaches_assertion`.
+/// `visited` holds the body-open line of every function already on the stack so
+/// mutual recursion between helpers cannot loop. `depth` bounds how many
+/// delegation hops are followed.
+fn body_reaches_assertion(
+    lines: &[&str],
+    stripped_lines: &[String],
+    open: usize,
+    close: usize,
+    local_fns: &[(String, usize, usize)],
+    visited: &mut Vec<usize>,
+    depth: usize,
+) -> bool {
+    for k in open..=close {
+        let line_s = stripped_lines
+            .get(k)
+            .map(String::as_str)
+            .unwrap_or_else(|| lines.get(k).copied().unwrap_or(""));
+        if line_is_assertion_shaped(line_s) {
+            return true;
+        }
+    }
+    if depth == 0 {
+        return false;
+    }
+    let mut callees: Vec<String> = Vec::new();
+    for k in open..=close {
+        let line_s = stripped_lines
+            .get(k)
+            .map(String::as_str)
+            .unwrap_or_else(|| lines.get(k).copied().unwrap_or(""));
+        collect_called_idents(line_s, &mut callees);
+    }
+    for callee in &callees {
+        for (name, h_open, h_close) in local_fns {
+            if name != callee || visited.contains(h_open) {
+                continue;
+            }
+            visited.push(*h_open);
+            let reached = body_reaches_assertion(
+                lines,
+                stripped_lines,
+                *h_open,
+                *h_close,
+                local_fns,
+                visited,
+                depth - 1,
+            );
+            if reached {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Case-insensitive substring patterns that flag a function identifier as a
