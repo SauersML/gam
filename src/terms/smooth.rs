@@ -8990,40 +8990,13 @@ fn extract_spatial_operator_runtime_caches(
                         centers.ncols(),
                     )
                 }
-                (
-                    SmoothBasisSpec::Duchon { feature_cols, .. },
-                    BasisMetadata::Duchon {
-                        centers,
-                        length_scale,
-                        power,
-                        nullspace_order,
-                        identifiability_transform,
-                        aniso_log_scales,
-                        ..
-                    },
-                ) => {
-                    let mut ws = crate::basis::BasisWorkspace::default();
-                    let ops =
-                        crate::basis::build_duchon_collocation_operator_matriceswithworkspace(
-                            centers.view(),
-                            None,
-                            *length_scale,
-                            *power,
-                            *nullspace_order,
-                            aniso_log_scales.as_deref(),
-                            identifiability_transform.as_ref().map(|z| z.view()),
-                            2,
-                            &mut ws,
-                        )?;
-                    (
-                        feature_cols.clone(),
-                        ops.d0,
-                        ops.d1,
-                        ops.d2,
-                        ops.collocation_points,
-                        centers.ncols(),
-                    )
-                }
+                // The redesigned non-periodic/periodic/cyclic Duchon bases ship a
+                // single native reproducing-norm penalty (`Primary`) plus a
+                // null-space shrinkage ridge — never the mass/tension/stiffness
+                // operator triplet the Charbonnier spatial-adaptive overlay
+                // requires. A Duchon term therefore never reaches this match (the
+                // operator-penalty lookup above `continue`s for it), so there is
+                // no Duchon arm here; only Matérn carries the operator triplet.
                 _ => continue,
             };
 
