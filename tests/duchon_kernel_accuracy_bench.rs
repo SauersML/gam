@@ -85,7 +85,10 @@ fn bench_duchon_kernel_accuracy_1d() {
         let noise = Normal::new(0.0, sigma).expect("normal");
         let two_pi_f = 2.0 * std::f64::consts::PI * freq;
         let x: Vec<f64> = (0..n).map(|i| i as f64 / (n as f64 - 1.0)).collect();
-        let y: Vec<f64> = x.iter().map(|&t| (two_pi_f * t).sin() + noise.sample(&mut rng)).collect();
+        let y: Vec<f64> = x
+            .iter()
+            .map(|&t| (two_pi_f * t).sin() + noise.sample(&mut rng))
+            .collect();
 
         let headers = ["x", "y"].into_iter().map(String::from).collect();
         let rows = x
@@ -97,7 +100,9 @@ fn bench_duchon_kernel_accuracy_1d() {
         let x_idx = ds.column_map()["x"];
 
         let m = 201usize;
-        let x_test: Vec<f64> = (0..m).map(|i| 0.005 + 0.99 * i as f64 / (m as f64 - 1.0)).collect();
+        let x_test: Vec<f64> = (0..m)
+            .map(|i| 0.005 + 0.99 * i as f64 / (m as f64 - 1.0))
+            .collect();
         let y_truth: Vec<f64> = x_test.iter().map(|&t| (two_pi_f * t).sin()).collect();
         let mut grid = Array2::<f64>::zeros((m, ds.headers.len()));
         for (i, &t) in x_test.iter().enumerate() {

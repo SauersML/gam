@@ -87,14 +87,11 @@ fn gam_duchon_2d_surface_matches_mgcv_ds() {
     let headers = ["x", "z", "y"].into_iter().map(String::from).collect();
     let rows = (0..n)
         .map(|i| {
-            csv::StringRecord::from(vec![
-                x[i].to_string(),
-                z[i].to_string(),
-                y[i].to_string(),
-            ])
+            csv::StringRecord::from(vec![x[i].to_string(), z[i].to_string(), y[i].to_string()])
         })
         .collect();
-    let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode synthetic 2d dataset");
+    let ds =
+        encode_recordswith_inferred_schema(headers, rows).expect("encode synthetic 2d dataset");
     let col = ds.column_map();
     let x_idx = col["x"];
     let z_idx = col["z"];
@@ -108,8 +105,7 @@ fn gam_duchon_2d_surface_matches_mgcv_ds() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result =
-        fit_from_formula("y ~ duchon(x, z, k=49)", &ds, &cfg).expect("gam 2d duchon fit");
+    let result = fit_from_formula("y ~ duchon(x, z, k=49)", &ds, &cfg).expect("gam 2d duchon fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for a gaussian 2-D Duchon smooth");
     };
@@ -179,8 +175,7 @@ fn gam_duchon_2d_surface_matches_mgcv_ds() {
 
     // RMS of the truth: the error a constant (zero) predictor would incur, the
     // "do-nothing" baseline that the recovery must clearly beat.
-    let rms_truth =
-        (y_truth.iter().map(|t| t * t).sum::<f64>() / y_truth.len() as f64).sqrt();
+    let rms_truth = (y_truth.iter().map(|t| t * t).sum::<f64>() / y_truth.len() as f64).sqrt();
 
     eprintln!(
         "duchon-truth-recovery-2d: n={n} grid={m} sigma=0.10 \

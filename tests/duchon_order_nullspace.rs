@@ -39,11 +39,11 @@
 //!    is the scenario the channel-aware identifiability audit is designed to
 //!    handle correctly (shared basis ≠ unresolvable alias when channels differ).
 
+use faer::Side;
 use gam::basis::{
     CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
     OneDimensionalBoundary, SpatialIdentifiability, build_duchon_basis, duchon_nullspace_dimension,
 };
-use faer::Side;
 use gam::faer_ndarray::FaerCholesky;
 use ndarray::{Array2, s};
 use rand::SeedableRng;

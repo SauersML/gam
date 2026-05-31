@@ -32973,7 +32973,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn test_build_duchon_basisfreezes_default_spatial_identifiability() {
         let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]];
@@ -34161,7 +34160,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn test_duchon_polyharmonic_log_branch_sign_depends_on_dimension() {
         let r = 1.7;
@@ -34294,7 +34292,6 @@ mod tests {
         let expected = 1.0 / (4.0 * std::f64::consts::PI);
         assert_abs_diff_eq!(got, expected, epsilon = 1e-12);
     }
-
 
     #[test]
     fn test_duchon_matern_block_origin_includes_kappa_power() {
@@ -36744,7 +36741,6 @@ mod tests {
         assert_matrix_close(&contrast_cross, &expected_cross, 1e-12);
     }
 
-
     #[test]
     fn test_pure_duchon_default_tuple_rejects_insufficient_nullspace() {
         let data = array![[0.0, 0.1], [0.2, 0.0], [0.4, 0.2], [0.6, 0.4], [0.8, 0.5]];
@@ -36821,7 +36817,6 @@ mod tests {
             "unexpected d=10, a=2 near-origin value: got {near_zero}, expected {expected}"
         );
     }
-
 
     #[test]
     fn test_matern_radial_triplet_matches_finite_difference() {
