@@ -1,6 +1,6 @@
 use crate::faer_ndarray::{
-    FaerEigh, FaerLinalgError, default_rrqr_rank_alpha, fast_ab, fast_abt, fast_ata, fast_ata_into,
-    fast_atb, rrqr_nullspace_basis,
+    FaerEigh, FaerLinalgError, default_rrqr_rank_alpha, fast_ab, fast_abt, fast_ata, fast_atb,
+    rrqr_nullspace_basis,
 };
 use crate::linalg::utils::KahanSum;
 use crate::matrix::{
