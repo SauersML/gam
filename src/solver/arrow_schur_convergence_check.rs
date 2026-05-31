@@ -1,6 +1,6 @@
 use ndarray::{Array1, Array2, ArrayView1};
 
-use crate::linalg::triangular::cholesky_solve_matrix;
+use crate::linalg::triangular::{CholeskyGuard, cholesky_factor_in_place, cholesky_solve_matrix};
 use crate::solver::arrow_schur::{ArrowSchurError, ArrowSchurSystem};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -291,7 +291,7 @@ fn build_shifted_schur(sys: &ArrowSchurSystem, ridge: f64) -> Option<Array2<f64>
         for j in 0..di {
             htt[[j, j]] += ridge;
         }
-        let factor = cholesky_lower_local(&htt)?;
+        let factor = cholesky_factor_in_place(htt.view(), CholeskyGuard::FiniteStrict)?;
         let solved = cholesky_solve_matrix(&factor, &row.htbeta);
         for c in 0..di {
             for a in 0..sys.k {
@@ -308,32 +308,6 @@ fn build_shifted_schur(sys: &ArrowSchurSystem, ridge: f64) -> Option<Array2<f64>
     symmetrize(&mut schur);
     Some(schur)
 }
-
-fn cholesky_lower_local(a: &Array2<f64>) -> Option<Array2<f64>> {
-    let n = a.nrows();
-    if a.ncols() != n || a.iter().any(|v| !v.is_finite()) {
-        return None;
-    }
-    let mut l = Array2::<f64>::zeros((n, n));
-    for i in 0..n {
-        for j in 0..=i {
-            let mut sum = a[[i, j]];
-            for k in 0..j {
-                sum -= l[[i, k]] * l[[j, k]];
-            }
-            if i == j {
-                if !(sum.is_finite() && sum > 0.0) {
-                    return None;
-                }
-                l[[i, j]] = sum.sqrt();
-            } else {
-                l[[i, j]] = sum / l[[j, j]];
-            }
-        }
-    }
-    Some(l)
-}
-
 
 fn symmetric_eigenvalue_bounds(a: &Array2<f64>) -> (f64, f64) {
     let n = a.nrows();

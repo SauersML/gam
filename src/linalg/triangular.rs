@@ -19,6 +19,72 @@
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
+/// Validation strictness for [`cholesky_factor_in_place`].
+///
+/// The historical call sites differed in how aggressively they rejected
+/// pathological inputs; this enum names those two policies exactly so callers
+/// keep their original behavior while sharing one factorization kernel.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CholeskyGuard {
+    /// Read the matrix as-is: no up-front scan of the input entries, and a pivot
+    /// is rejected only when the accumulated diagonal value is `<= 0.0`. A
+    /// non-finite (`NaN`/`+inf`) diagonal accumulator is *not* rejected here
+    /// (`NaN <= 0.0` and `inf <= 0.0` are both `false`), matching the GPU host
+    /// reference path.
+    NonnegativePivot,
+    /// Reject any non-finite entry in the input up front, and reject a pivot
+    /// unless the accumulated diagonal value is finite and strictly positive.
+    /// Matches the Schur convergence-check path.
+    FiniteStrict,
+}
+
+/// In-place lower-triangular Cholesky factor `L` (so `A = L Lᵀ`) of a symmetric
+/// positive-definite matrix `a`, returning the dense lower factor or `None` when
+/// the factorization fails under the requested [`CholeskyGuard`].
+///
+/// Only the on-and-below-diagonal entries of `a` are read. Returns `None` when
+/// `a` is not square, when [`CholeskyGuard::FiniteStrict`] is requested and `a`
+/// contains a non-finite entry, or when a pivot is rejected by the guard.
+pub(crate) fn cholesky_factor_in_place(
+    a: ArrayView2<'_, f64>,
+    guard: CholeskyGuard,
+) -> Option<Array2<f64>> {
+    let n = a.nrows();
+    if a.ncols() != n {
+        return None;
+    }
+    if guard == CholeskyGuard::FiniteStrict && a.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let mut l = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        for j in 0..=i {
+            let mut sum = a[[i, j]];
+            for k in 0..j {
+                sum -= l[[i, k]] * l[[j, k]];
+            }
+            if i == j {
+                // Each arm mirrors the original rejection *expression* (not its
+                // negation) so the `NaN` diagonal case is preserved bit-for-bit:
+                // `NaN <= 0.0` is `false`, so the nonnegative-pivot path lets a
+                // `NaN` accumulator through to `sqrt` exactly as the GPU host
+                // reference did.
+                let pivot_rejected = match guard {
+                    CholeskyGuard::NonnegativePivot => sum <= 0.0,
+                    CholeskyGuard::FiniteStrict => !(sum.is_finite() && sum > 0.0),
+                };
+                if pivot_rejected {
+                    return None;
+                }
+                l[[i, j]] = sum.sqrt();
+            } else {
+                l[[i, j]] = sum / l[[j, j]];
+            }
+        }
+    }
+    Some(l)
+}
+
 /// Solve `L y = b` (lower-triangular) for `y`.
 fn forward_kernel(l: ArrayView2<'_, f64>, b: ArrayView1<'_, f64>) -> Array1<f64> {
     let n = l.nrows();
@@ -55,6 +121,42 @@ pub(crate) fn back_substitution_lower_transpose<'l, 'y>(
     y: impl Into<ArrayView1<'y, f64>>,
 ) -> Array1<f64> {
     back_kernel(l.into(), y.into())
+}
+
+/// Back-substitution against `Lᵀ x = rhs` into a caller-provided buffer, with a
+/// tiny-pivot floor: rows whose diagonal satisfies `|L[i,i]| <= 1e-14` set
+/// `x[i] = 0` rather than dividing.
+///
+/// This is the Gaussian-draw form used by the precision-matrix samplers. For
+/// `Q = L Lᵀ`, a draw `x ~ N(0, Q⁻¹)` is obtained from `z ~ N(0, I)` via
+/// `x = L^{-T} z`, i.e. solving `Lᵀ x = z` by back-substitution. Using a
+/// forward solve (`L x = z`) instead would produce `Var(x) = L⁻¹ L^{-T}`,
+/// which equals `Q⁻¹` only when `L` is symmetric — wrong in general.
+///
+/// Unlike [`back_substitution_lower_transpose`], the near-zero-diagonal guard is
+/// retained here because the sampler tolerates rank-deficient conditional
+/// precisions by zeroing the corresponding draw component instead of emitting a
+/// non-finite value.
+pub(crate) fn back_substitution_lower_transpose_guarded_into(
+    l: &Array2<f64>,
+    rhs: &Array1<f64>,
+    out: &mut Array1<f64>,
+) {
+    let p = rhs.len();
+    assert_eq!(l.nrows(), p);
+    assert_eq!(l.ncols(), p);
+    assert_eq!(out.len(), p);
+    // Solve Lᵀ x = rhs from the bottom row up. Row i of Lᵀ has nonzeros
+    // at columns j ≥ i (= column i of L at rows j ≥ i), so
+    //   rhs[i] = L[i,i] · x[i] + Σ_{j>i} L[j,i] · x[j].
+    for i in (0..p).rev() {
+        let mut v = rhs[i];
+        for j in (i + 1)..p {
+            v -= l[[j, i]] * out[j];
+        }
+        let d = l[[i, i]];
+        out[i] = if d.abs() > 1e-14 { v / d } else { 0.0 };
+    }
 }
 
 /// Solve `A x = b` where `A = L Lᵀ` and `L` is the lower Cholesky factor.

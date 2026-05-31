@@ -32,6 +32,7 @@ use crate::estimate::{
 };
 use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_ata_into, fast_atv, fast_av_into};
 use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
+use crate::linalg::triangular::back_substitution_lower_transpose_guarded_into;
 use crate::matrix::DesignMatrix;
 use crate::solver::mixture_link::{
     InverseLinkKernel, LinkParamPartials, inverse_link_jet_for_inverse_link, softmax_last_fixedzero,
@@ -3681,31 +3682,6 @@ fn sample_standard_normal<R: rand::Rng + ?Sized>(rng: &mut R) -> f64 {
     (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
 }
 
-/// Back-substitution against `L^T x = rhs`, with `L` a lower-triangular factor.
-///
-/// For `Q = L Lᵀ`, a draw `x ~ N(0, Q⁻¹)` is obtained from `z ~ N(0, I)` via
-/// `x = L^{-T} z`, i.e. solving `Lᵀ x = z` by back-substitution. Using the
-/// forward solve (`L x = z`) instead would produce `Var(x) = L⁻¹ L^{-T}`,
-/// which equals `Q⁻¹` only when `L` is symmetric — wrong in general.
-#[inline]
-fn back_solve_lower_transposed(l: &Array2<f64>, rhs: &Array1<f64>, out: &mut Array1<f64>) {
-    let p = rhs.len();
-    assert_eq!(l.nrows(), p);
-    assert_eq!(l.ncols(), p);
-    assert_eq!(out.len(), p);
-    // Solve Lᵀ x = rhs from the bottom row up. Row i of Lᵀ has nonzeros
-    // at columns j ≥ i (= column i of L at rows j ≥ i), so
-    //   rhs[i] = L[i,i] · x[i] + Σ_{j>i} L[j,i] · x[j].
-    for i in (0..p).rev() {
-        let mut v = rhs[i];
-        for j in (i + 1)..p {
-            v -= l[[j, i]] * out[j];
-        }
-        let d = l[[i, i]];
-        out[i] = if d.abs() > 1e-14 { v / d } else { 0.0 };
-    }
-}
-
 /// Runs a Pólya-Gamma Gibbs sampler for Bernoulli-logit models.
 ///
 /// This sampler is gradient-free: each iteration alternates
@@ -3822,7 +3798,7 @@ pub fn run_logit_polya_gamma_gibbs(
                 z[j] = sample_standard_normal(&mut draw_rng);
             }
             let l = factor.lower_triangular();
-            back_solve_lower_transposed(&l, &z, &mut noise);
+            back_substitution_lower_transpose_guarded_into(&l, &z, &mut noise);
             beta.assign(&(&mean + &noise));
 
             if iter < config.nwarmup {
@@ -3993,7 +3969,7 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
                 z[j] = sample_standard_normal(&mut draw_rng);
             }
             let l = factor.lower_triangular();
-            back_solve_lower_transposed(&l, &z, &mut noise);
+            back_substitution_lower_transpose_guarded_into(&l, &z, &mut noise);
             beta.assign(&(&mean + &noise));
 
             if iter < config.nwarmup {

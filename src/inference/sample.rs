@@ -15,6 +15,7 @@ use rand::{RngExt, SeedableRng};
 use crate::basis::create_difference_penalty_matrix;
 use crate::estimate::{BlockRole, FitOptions, UnifiedFitResult, fit_gam, validate_all_finite};
 use crate::faer_ndarray::FaerCholesky;
+use crate::linalg::triangular::back_substitution_lower_transpose_guarded_into;
 use crate::families::royston_parmar::{self, RoystonParmarInputs};
 use crate::families::survival_predict::{
     fit_result_from_saved_model_for_prediction, require_saved_survival_likelihood_mode,
@@ -325,7 +326,7 @@ pub fn laplace_gaussian_fallback(
             for i in 0..p {
                 eps[i] = sample_standard_normal(&mut rng);
             }
-            back_solve_lower_transpose(&l, &eps, &mut delta);
+            back_substitution_lower_transpose_guarded_into(&l, &eps, &mut delta);
             for i in 0..p {
                 // `delta` has covariance H⁻¹; multiplying by √φ produces a
                 // draw with covariance φ·H⁻¹, matching the φ-scaled
@@ -358,25 +359,6 @@ fn sample_standard_normal<R: rand::Rng + ?Sized>(rng: &mut R) -> f64 {
     let u1 = rng.random::<f64>().max(1e-16);
     let u2 = rng.random::<f64>();
     (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
-}
-
-#[inline]
-fn back_solve_lower_transpose(l: &Array2<f64>, rhs: &Array1<f64>, out: &mut Array1<f64>) {
-    // Solve L^T · out = rhs for `out`, where `L` is the lower-triangular
-    // Cholesky factor of the penalised Hessian. Walks bottom-up since
-    // L^T is upper triangular.
-    let p = rhs.len();
-    assert_eq!(l.nrows(), p);
-    assert_eq!(l.ncols(), p);
-    assert_eq!(out.len(), p);
-    for i in (0..p).rev() {
-        let mut v = rhs[i];
-        for j in (i + 1)..p {
-            v -= l[[j, i]] * out[j];
-        }
-        let d = l[[i, i]];
-        out[i] = if d.abs() > 1e-14 { v / d } else { 0.0 };
-    }
 }
 
 fn sample_standard(

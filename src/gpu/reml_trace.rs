@@ -221,14 +221,11 @@ pub fn should_use_gpu_hutchinson(
 // same `(seed, k, i)`).
 // ────────────────────────────────────────────────────────────────────────
 
-/// SplitMix64 finalizer (Sebastiano Vigna, 2015).
+/// SplitMix64 finalizer (Sebastiano Vigna, 2015). Thin wrapper over the
+/// canonical implementation in [`crate::linalg::utils::splitmix64_hash`].
 #[inline]
-pub fn splitmix64_mix(mut z: u64) -> u64 {
-    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut x = z;
-    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    x ^ (x >> 31)
+pub fn splitmix64_mix(z: u64) -> u64 {
+    crate::linalg::utils::splitmix64_hash(z)
 }
 
 /// Stateless Rademacher entry at probe index `k` (0-based), coordinate

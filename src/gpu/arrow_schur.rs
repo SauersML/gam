@@ -18,9 +18,9 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-use ndarray::{Array1, Array2, ArrayView2};
+use ndarray::{Array1, Array2};
 
-use crate::linalg::triangular::cholesky_solve_vector;
+use crate::linalg::triangular::{CholeskyGuard, cholesky_factor_in_place, cholesky_solve_vector};
 use crate::solver::arrow_schur::ArrowSchurSystem;
 
 /// Outcome of a single Arrow-Schur Newton solve.
@@ -337,19 +337,20 @@ fn build_row_procedural_matvec(
         for r in 0..di {
             block[[r, r]] += ridge_t;
         }
-        let factor = cholesky_lower_host(block.view()).ok_or_else(|| {
-            let scale = row
-                .htt
-                .diag()
-                .iter()
-                .map(|v| v.abs())
-                .fold(0.0_f64, f64::max)
-                .max(1.0);
-            ArrowSchurGpuFailure::RidgeBumpRequired {
-                row: i,
-                bump: scale * f64::EPSILON.sqrt() * 1024.0,
-            }
-        })?;
+        let factor = cholesky_factor_in_place(block.view(), CholeskyGuard::NonnegativePivot)
+            .ok_or_else(|| {
+                let scale = row
+                    .htt
+                    .diag()
+                    .iter()
+                    .map(|v| v.abs())
+                    .fold(0.0_f64, f64::max)
+                    .max(1.0);
+                ArrowSchurGpuFailure::RidgeBumpRequired {
+                    row: i,
+                    bump: scale * f64::EPSILON.sqrt() * 1024.0,
+                }
+            })?;
         factors.push(factor);
     }
 
@@ -495,7 +496,7 @@ pub fn solve_arrow_newton_step_dense_reference(
         h[[n * d + c, n * d + c]] += ridge_beta;
         rhs[n * d + c] = -sys.gb[c];
     }
-    let factor = cholesky_lower_host(h.view())
+    let factor = cholesky_factor_in_place(h.view(), CholeskyGuard::NonnegativePivot)
         .ok_or_else(|| "dense reference Cholesky failed".to_string())?;
     let mut log_det = 0.0_f64;
     for i in 0..total {
@@ -510,32 +511,6 @@ pub fn solve_arrow_newton_step_dense_reference(
         delta_beta,
         log_det_hessian: log_det,
     })
-}
-
-#[inline]
-fn cholesky_lower_host(a: ArrayView2<'_, f64>) -> Option<Array2<f64>> {
-    let n = a.nrows();
-    if n != a.ncols() {
-        return None;
-    }
-    let mut l = Array2::<f64>::zeros((n, n));
-    for i in 0..n {
-        for j in 0..=i {
-            let mut sum = a[[i, j]];
-            for kk in 0..j {
-                sum -= l[[i, kk]] * l[[j, kk]];
-            }
-            if i == j {
-                if sum <= 0.0 {
-                    return None;
-                }
-                l[[i, i]] = sum.sqrt();
-            } else {
-                l[[i, j]] = sum / l[[j, j]];
-            }
-        }
-    }
-    Some(l)
 }
 
 #[cfg(target_os = "linux")]
@@ -1798,7 +1773,7 @@ mod tests {
             }
             g[n * d + c] = sys.gb[c];
         }
-        let l = cholesky_lower_host(h.view()).unwrap();
+        let l = cholesky_factor_in_place(h.view(), CholeskyGuard::NonnegativePivot).unwrap();
         let rhs = g.mapv(|v| -v);
         let expected = cholesky_solve_vector(l.view(), rhs.view());
         for i in 0..n * d {

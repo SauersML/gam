@@ -28846,7 +28846,7 @@ fn pyffi_duchon_polynomial_block(
             poly
         }
         DuchonNullspaceOrder::Degree(degree) => {
-            let exponents = pyffi_duchon_monomial_exponents(dim, degree);
+            let exponents = monomial_exponents(dim, degree);
             let mut poly = Array2::<f64>::zeros((n_rows, exponents.len()));
             for (col, alpha) in exponents.iter().enumerate() {
                 for row in 0..n_rows {
@@ -28865,35 +28865,6 @@ fn pyffi_duchon_polynomial_block(
     }
 }
 
-fn pyffi_duchon_monomial_exponents(dimension: usize, max_total_degree: usize) -> Vec<Vec<usize>> {
-    fn recurse(
-        axis: usize,
-        remaining_degree: usize,
-        current: &mut [usize],
-        out: &mut Vec<Vec<usize>>,
-    ) {
-        if axis + 1 == current.len() {
-            current[axis] = remaining_degree;
-            out.push(current.to_vec());
-            return;
-        }
-        for exponent in (0..=remaining_degree).rev() {
-            current[axis] = exponent;
-            recurse(axis + 1, remaining_degree - exponent, current, out);
-        }
-    }
-
-    if dimension == 0 {
-        return vec![Vec::new()];
-    }
-
-    let mut out = Vec::new();
-    let mut current = vec![0usize; dimension];
-    for total_degree in 0..=max_total_degree {
-        recurse(0, total_degree, &mut current, &mut out);
-    }
-    out
-}
 
 fn pyffi_duchon_effective_nullspace_order(
     centers: ArrayView2<'_, f64>,
