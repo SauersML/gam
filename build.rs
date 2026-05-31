@@ -16,6 +16,23 @@ fn main() {
 
     let manifest_dir =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set"));
+
+    // Everything below — the Python penalty-manifest generation and the
+    // first-party hygiene scanners — is development/CI tooling that operates on
+    // the full source tree and writes generated artifacts back into it (the
+    // `gamfit/_penalties_manifest.py` manifest, the `ban_history.txt` ledger).
+    // None of it applies when `gam` is built as a published dependency: the
+    // `.crate` tarball ships only the Rust sources (the `include` list in
+    // Cargo.toml omits `tests/`, `gamfit/`, etc.), there is no first-party tree
+    // to lint, and writing into the source directory makes `cargo publish`'s
+    // verification build fail with "source directory was modified by build.rs".
+    // Detect the published/consumed context by the absence of the `tests/` tree
+    // (excluded from the package) and return early so downstream builds — and
+    // the publish verification itself — see a plain, side-effect-free build.
+    if !manifest_dir.join("tests").is_dir() {
+        return;
+    }
+
     emit_python_penalty_manifest(&manifest_dir)
         .expect("failed to emit Python analytic-penalty manifest");
 
