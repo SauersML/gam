@@ -346,10 +346,7 @@ fn auc(prob: &[f64], y: &[f64]) -> f64 {
         }
     }
     let n_neg = n as f64 - n_pos;
-    assert!(
-        n_pos > 0.0 && n_neg > 0.0,
-        "auc needs both classes present"
-    );
+    assert!(n_pos > 0.0 && n_neg > 0.0, "auc needs both classes present");
     (sum_rank_pos - n_pos * (n_pos + 1.0) / 2.0) / (n_pos * n_neg)
 }
 
@@ -455,8 +452,8 @@ fn gam_binomial_smooth_recovers_true_probability_on_real_data() {
         link: Some("logit".to_string()),
         ..FitConfig::default()
     };
-    let result =
-        fit_from_formula("y ~ s(pc1) + s(pc2)", &train_ds, &cfg).expect("gam binomial 2-smooth fit");
+    let result = fit_from_formula("y ~ s(pc1) + s(pc2)", &train_ds, &cfg)
+        .expect("gam binomial 2-smooth fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for binomial/logit s(pc1)+s(pc2)");
     };
@@ -472,7 +469,11 @@ fn gam_binomial_smooth_recovers_true_probability_on_real_data() {
     let test_design = build_term_collection_design(test_grid.view(), &fit.resolvedspec)
         .expect("rebuild s(pc1)+s(pc2) design at held-out points");
     let gam_test_eta = test_design.design.apply(&fit.fit.beta);
-    assert_eq!(gam_test_eta.len(), test_rows.len(), "gam eta length mismatch");
+    assert_eq!(
+        gam_test_eta.len(),
+        test_rows.len(),
+        "gam eta length mismatch"
+    );
     let gam_test_prob: Vec<f64> = gam_test_eta.iter().map(|&e| invlogit(e)).collect();
 
     // ---- fit the SAME train rows with R-INLA, predict the SAME test rows ---
@@ -505,7 +506,11 @@ fn gam_binomial_smooth_recovers_true_probability_on_real_data() {
         .chain(test_rows.iter().map(|_| 0.0))
         .collect();
     let m = pc1_all.len();
-    assert_eq!(m, train_rows.len() + test_rows.len(), "pooled length mismatch");
+    assert_eq!(
+        m,
+        train_rows.len() + test_rows.len(),
+        "pooled length mismatch"
+    );
 
     let r = run_r(
         &[

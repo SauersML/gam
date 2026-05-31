@@ -222,9 +222,8 @@ fn gam_cylinder_tensor_cc_ps_recovers_truth_and_mixes_boundaries() {
     let gam_z0 = gam_zprobe[0];
     let gam_z1 = gam_zprobe[gam_zprobe.len() - 1];
     let gam_z_endpoint_gap = (gam_z1 - gam_z0).abs();
-    let truth_z_span = (truth(std::f64::consts::FRAC_PI_4, 1.0)
-        - truth(std::f64::consts::FRAC_PI_4, 0.0))
-    .abs(); // = 1.0
+    let truth_z_span =
+        (truth(std::f64::consts::FRAC_PI_4, 1.0) - truth(std::f64::consts::FRAC_PI_4, 0.0)).abs(); // = 1.0
     let gam_z_span_err = (gam_z_endpoint_gap - truth_z_span).abs();
     let mgcv_z_endpoint_gap = (mgcv_zends[1] - mgcv_zends[0]).abs();
 
@@ -314,7 +313,10 @@ fn gam_cylinder_tensor_cc_ps_recovers_truth_and_mixes_boundaries() {
 //              × 1.10 on the SAME train/test rows — mgcv is the mature
 //              match-or-beat yardstick, never a fitted target to copy.
 
-const SZA_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/solar_zenith_angle.csv");
+const SZA_CSV: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/bench/datasets/solar_zenith_angle.csv"
+);
 
 /// Coefficient of determination of `pred` vs observed `truth` relative to the
 /// mean predictor: `1 - SS_res/SS_tot`. R2 = 1 perfect, 0 = constant-mean.
@@ -380,7 +382,12 @@ fn gam_cylinder_tensor_cc_ps_recovers_truth_and_mixes_boundaries_on_real_data() 
     for rec in rdr.records() {
         let rec = rec.expect("read sza row");
         // columns: rownames, latitude, month, tst, sza
-        let lat: f64 = rec.get(1).expect("latitude").trim().parse().expect("parse latitude");
+        let lat: f64 = rec
+            .get(1)
+            .expect("latitude")
+            .trim()
+            .parse()
+            .expect("parse latitude");
         if (lat - 20.0).abs() > 1e-9 {
             continue; // single latitude => one clean (doy, tst) surface
         }

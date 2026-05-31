@@ -171,7 +171,11 @@ fn accuracy(probs_flat: &[f64], labels: &[usize], k: usize) -> f64 {
 /// minority classes — this metric exposes exactly that failure mode.
 fn per_class_recall(probs_flat: &[f64], labels: &[usize], k: usize) -> Vec<f64> {
     let m = labels.len();
-    assert_eq!(probs_flat.len(), m * k, "per_class_recall probs length mismatch");
+    assert_eq!(
+        probs_flat.len(),
+        m * k,
+        "per_class_recall probs length mismatch"
+    );
     let mut total = vec![0usize; k];
     let mut hit = vec![0usize; k];
     for (i, &y) in labels.iter().enumerate() {

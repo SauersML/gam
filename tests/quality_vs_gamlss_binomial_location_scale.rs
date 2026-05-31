@@ -135,18 +135,48 @@ fn gam_binomial_location_scale_logit_p_matches_mgcv_binomial() {
     // the smooth expit·Gaussian integrand to far below the sampling noise we
     // assert against. Nodes/weights for the physicists' Hermite polynomial H_20.
     let gh_nodes: [f64; 20] = [
-        -5.387480890011233, -4.603682449550744, -3.944764040115625, -3.347854567383216,
-        -2.788806058428131, -2.254974002089276, -1.738537712116586, -1.234076215395323,
-        -0.737473728545394, -0.245340708300901, 0.245340708300901, 0.737473728545394,
-        1.234076215395323, 1.738537712116586, 2.254974002089276, 2.788806058428131,
-        3.347854567383216, 3.944764040115625, 4.603682449550744, 5.387480890011233,
+        -5.387480890011233,
+        -4.603682449550744,
+        -3.944764040115625,
+        -3.347854567383216,
+        -2.788806058428131,
+        -2.254974002089276,
+        -1.738537712116586,
+        -1.234076215395323,
+        -0.737473728545394,
+        -0.245340708300901,
+        0.245340708300901,
+        0.737473728545394,
+        1.234076215395323,
+        1.738537712116586,
+        2.254974002089276,
+        2.788806058428131,
+        3.347854567383216,
+        3.944764040115625,
+        4.603682449550744,
+        5.387480890011233,
     ];
     let gh_weights: [f64; 20] = [
-        2.229393645534151e-13, 4.399340992273181e-10, 1.086069370768996e-7, 7.802556478532063e-6,
-        2.283386360163539e-4, 3.243773342237863e-3, 2.481052088746362e-2, 1.090172060200233e-1,
-        2.866755053628341e-1, 4.622436696006101e-1, 4.622436696006101e-1, 2.866755053628341e-1,
-        1.090172060200233e-1, 2.481052088746362e-2, 3.243773342237863e-3, 2.283386360163539e-4,
-        7.802556478532063e-6, 1.086069370768996e-7, 4.399340992273181e-10, 2.229393645534151e-13,
+        2.229393645534151e-13,
+        4.399340992273181e-10,
+        1.086069370768996e-7,
+        7.802556478532063e-6,
+        2.283386360163539e-4,
+        3.243773342237863e-3,
+        2.481052088746362e-2,
+        1.090172060200233e-1,
+        2.866755053628341e-1,
+        4.622436696006101e-1,
+        4.622436696006101e-1,
+        2.866755053628341e-1,
+        1.090172060200233e-1,
+        2.481052088746362e-2,
+        3.243773342237863e-3,
+        2.283386360163539e-4,
+        7.802556478532063e-6,
+        1.086069370768996e-7,
+        4.399340992273181e-10,
+        2.229393645534151e-13,
     ];
     let inv_sqrt_pi = 1.0 / pi.sqrt();
     let sqrt2 = 2.0_f64.sqrt();
@@ -470,8 +500,16 @@ fn gam_binomial_location_scale_logit_p_matches_mgcv_binomial_on_real_data() {
         .design
         .apply(&fit.fit.block_states[1].beta)
         .to_vec();
-    assert_eq!(eta_t_test.len(), test_rows.len(), "threshold test eta length");
-    assert_eq!(eta_ls_test.len(), test_rows.len(), "log-sigma test eta length");
+    assert_eq!(
+        eta_t_test.len(),
+        test_rows.len(),
+        "threshold test eta length"
+    );
+    assert_eq!(
+        eta_ls_test.len(),
+        test_rows.len(),
+        "log-sigma test eta length"
+    );
 
     let gam_test_logit_p: Vec<f64> = (0..test_rows.len())
         .map(|i| -eta_t_test[i] * exp_sigma_inverse_from_eta_scalar(eta_ls_test[i]))
@@ -504,7 +542,11 @@ fn gam_binomial_location_scale_logit_p_matches_mgcv_binomial_on_real_data() {
     "#,
     );
     let ref_test_p = r.vector("test_p");
-    assert_eq!(ref_test_p.len(), k, "mgcv held-out prediction length mismatch");
+    assert_eq!(
+        ref_test_p.len(),
+        k,
+        "mgcv held-out prediction length mismatch"
+    );
 
     // ---- OBJECTIVE held-out metrics (computed in plain Rust) ---------------
     let gam_auc = auc(&gam_test_p, &test_y);
@@ -529,7 +571,9 @@ fn gam_binomial_location_scale_logit_p_matches_mgcv_binomial_on_real_data() {
     // of sample, far above the chance level of 0.5. Below that bar the composed
     // -link inverse / joint two-block solve is mis-reconstructing the probability.
     assert!(
-        gam_test_p.iter().all(|p| p.is_finite() && (0.0..=1.0).contains(p)),
+        gam_test_p
+            .iter()
+            .all(|p| p.is_finite() && (0.0..=1.0).contains(p)),
         "gam held-out probabilities must be valid in [0,1]"
     );
     assert!(

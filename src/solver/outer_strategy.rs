@@ -5497,7 +5497,13 @@ fn run_outer_with_plan(
                         );
                     }
                 }
-                Err(cf) => {
+                Err(cf) if cf.is_structural() => {
+                    // The pre-warm surfaced a structural defect of the seed's
+                    // joint design (rank/alias deficiency or a genuine
+                    // active-set KKT bug). A cold solve at the seed ρ* would
+                    // hit it identically, so disqualify the seed and route the
+                    // failure through the same structural accounting any other
+                    // pre-validation rejection takes.
                     let msg = format!(
                         "continuation pre-warm refused before seed eval: {}",
                         cf.message()
@@ -5507,6 +5513,25 @@ fn run_outer_with_plan(
                     );
                     rejection_reasons.push((seed_idx, "validation", msg));
                     continue 'seed_attempts;
+                }
+                Err(cf) => {
+                    // Non-structural pre-warm failure: the continuation walk
+                    // could not complete from the heavily-oversmoothed ρ₀
+                    // (e.g. an ill-conditioned constraint KKT residual at
+                    // λ₀ ≫ λ*, a likelihood domain miss at that start, or a
+                    // stuck/budget-exhausted path). That is a property of the
+                    // warm-start schedule, NOT of the seed ρ* itself — which
+                    // the cold seed eval below judges on its own merits. The
+                    // pre-warm is a warm-start optimization, never a
+                    // feasibility gate (cf. #236, #500): a refusal here must
+                    // not disqualify a seed that would solve cold. Reset to a
+                    // clean baseline and fall through to the cold seed eval.
+                    log::warn!(
+                        "[OUTER] {context}: continuation pre-warm for seed {seed_idx} did not \
+                         complete ({}); falling back to a cold seed eval",
+                        cf.message()
+                    );
+                    obj.reset();
                 }
             }
         }

@@ -489,8 +489,9 @@ fn gam_gaussian_survival_location_scale_matches_gamlss_on_real_data() {
             test_grid[[out_row, c]] = ds.values[[src_row, c]];
         }
     }
-    let loc_design = build_term_collection_design(test_grid.view(), &fit.fit.resolved_thresholdspec)
-        .expect("rebuild location (threshold) design at held-out rows");
+    let loc_design =
+        build_term_collection_design(test_grid.view(), &fit.fit.resolved_thresholdspec)
+            .expect("rebuild location (threshold) design at held-out rows");
     let gam_test_score: Vec<f64> = loc_design.design.apply(&beta_location).to_vec();
     assert_eq!(gam_test_score.len(), test_rows.len());
 

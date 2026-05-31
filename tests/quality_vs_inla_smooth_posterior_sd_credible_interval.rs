@@ -115,7 +115,13 @@ fn fixed_design(n: usize) -> (Vec<f64>, Vec<f64>) {
 /// Write a (y, x1, x2) dataset to a temp CSV and load it through gam's normal
 /// CSV path, so the fit sees a fully schema-inferred `EncodedDataset` exactly
 /// like a user-supplied file would produce.
-fn dataset_csv(dir: &std::path::Path, tag: &str, y: &[f64], x1: &[f64], x2: &[f64]) -> std::path::PathBuf {
+fn dataset_csv(
+    dir: &std::path::Path,
+    tag: &str,
+    y: &[f64],
+    x1: &[f64],
+    x2: &[f64],
+) -> std::path::PathBuf {
     let n = y.len();
     let path = dir.join(format!("sim_{tag}.csv"));
     let mut s = String::from("y,x1,x2\n");
@@ -139,12 +145,8 @@ fn gam_posterior_mean_sd(
     let x1_idx = col["x1"];
     let x2_idx = col["x2"];
 
-    let result = fit_from_formula(
-        "y ~ s(x1, bs='ps', k=20) + s(x2, bs='tp', k=15)",
-        &ds,
-        cfg,
-    )
-    .expect("gam fit");
+    let result = fit_from_formula("y ~ s(x1, bs='ps', k=20) + s(x2, bs='tp', k=15)", &ds, cfg)
+        .expect("gam fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit");
     };
@@ -274,7 +276,9 @@ fn gam_credible_intervals_are_calibrated_against_truth() {
     let mut rep0_y: Vec<f64> = Vec::new();
 
     for rep in 0..REPLICATES {
-        let seed = 0xA11CE_u64.wrapping_mul(rep as u64 + 1).wrapping_add(1234567);
+        let seed = 0xA11CE_u64
+            .wrapping_mul(rep as u64 + 1)
+            .wrapping_add(1234567);
         let y = simulate(seed, N, SIGMA, &x1, &x2);
         let csv = dataset_csv(&dir, &format!("rep{rep}"), &y, &x1, &x2);
         let (mean, sd) = gam_posterior_mean_sd(&csv, &cfg, N);

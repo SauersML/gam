@@ -27,13 +27,11 @@
 //! still compute mgcv's in-sample fit and print the train-grid rel_l2 for
 //! context via `eprintln!`, but that closeness is never a pass criterion.
 
+use gam::data::EncodedDataset;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, relative_l2, run_r};
-use gam::data::EncodedDataset;
-use gam::{
-    FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema,
-};
+use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::path::Path;
 
@@ -46,11 +44,7 @@ fn r2(pred: &[f64], truth: &[f64]) -> f64 {
     assert_eq!(pred.len(), truth.len(), "r2 length mismatch");
     let n = truth.len() as f64;
     let mean = truth.iter().sum::<f64>() / n;
-    let ss_res: f64 = pred
-        .iter()
-        .zip(truth)
-        .map(|(p, y)| (y - p) * (y - p))
-        .sum();
+    let ss_res: f64 = pred.iter().zip(truth).map(|(p, y)| (y - p) * (y - p)).sum();
     let ss_tot: f64 = truth.iter().map(|y| (y - mean) * (y - mean)).sum();
     1.0 - ss_res / ss_tot.max(1e-300)
 }
@@ -59,11 +53,7 @@ fn r2(pred: &[f64], truth: &[f64]) -> f64 {
 fn rmse_pair(pred: &[f64], truth: &[f64]) -> f64 {
     assert_eq!(pred.len(), truth.len(), "rmse length mismatch");
     let n = pred.len() as f64;
-    let s: f64 = pred
-        .iter()
-        .zip(truth)
-        .map(|(p, y)| (p - y) * (p - y))
-        .sum();
+    let s: f64 = pred.iter().zip(truth).map(|(p, y)| (p - y) * (p - y)).sum();
     (s / n.max(1.0)).sqrt()
 }
 

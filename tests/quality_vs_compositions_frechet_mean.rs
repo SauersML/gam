@@ -58,7 +58,10 @@ use std::path::Path;
 /// throughout the compositional-data literature. Local copy:
 /// `bench/datasets/skye_afm_lavas.csv` (columns `A`,`F`,`M`; integer parts that
 /// closure normalizes onto the 2-simplex).
-const SKYE_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/skye_afm_lavas.csv");
+const SKYE_CSV: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/bench/datasets/skye_afm_lavas.csv"
+);
 
 /// Mean squared Aitchison distance of held-out compositions `points` (N x D,
 /// already strictly positive) to a fixed center `mu`. This is the *held-out*
@@ -205,7 +208,9 @@ fn frechet_mean_is_the_aitchison_barycenter() {
     // grad F at the barycenter is exactly zero; we assert it is at round-off.
     let grad_unw = frechet_gradient_norm(&points, &uniform_norm, &gam_unweighted);
     let grad_w = frechet_gradient_norm(&points, &weights_norm, &gam_weighted);
-    eprintln!("simplex Fréchet stationarity: ||grad F||(unweighted)={grad_unw:.3e} (weighted)={grad_w:.3e}");
+    eprintln!(
+        "simplex Fréchet stationarity: ||grad F||(unweighted)={grad_unw:.3e} (weighted)={grad_w:.3e}"
+    );
     assert!(
         grad_unw < 1e-10,
         "gam unweighted mean is not a stationary point of the Aitchison Fréchet objective: ||grad F||={grad_unw:.3e}"
@@ -234,9 +239,11 @@ fn frechet_mean_is_the_aitchison_barycenter() {
     );
 
     // ---- INTRINSIC: unweighted == uniform-weighted (defining invariance) ----
-    let gam_uniform =
-        simplex_frechet_mean(points.view(), Some(ArrayView1::from(uniform_norm.as_slice())))
-            .expect("uniform");
+    let gam_uniform = simplex_frechet_mean(
+        points.view(),
+        Some(ArrayView1::from(uniform_norm.as_slice())),
+    )
+    .expect("uniform");
     let uniform_rel = relative_l2(&gam_uniform, &gam_unweighted);
     eprintln!("simplex Fréchet: unweighted-vs-uniform rel_l2={uniform_rel:.3e}");
     assert!(

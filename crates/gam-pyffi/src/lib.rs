@@ -123,9 +123,7 @@ use gam::terms::{
     SheafConsistencyPenalty as CoreSheafConsistencyPenalty, StreamingMaternBasisGradientEvaluator,
 };
 use gam::transformation_normal::TransformationNormalFitResult;
-use gam::types::{
-    InverseLink, LikelihoodSpec, ResponseFamily, RhoPrior, StandardLink,
-};
+use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, RhoPrior, StandardLink};
 use gam::{
     FitConfig, FitRequest, FitResult, WorkflowError, fit_model, materialize, resolve_offset_column,
 };
@@ -28938,7 +28936,6 @@ fn pyffi_duchon_polynomial_block(
         }
     }
 }
-
 
 fn pyffi_duchon_effective_nullspace_order(
     centers: ArrayView2<'_, f64>,

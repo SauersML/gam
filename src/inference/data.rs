@@ -598,7 +598,11 @@ fn infer_delimited_column(
         row: row_idx + 1,
         col,
         error: DataError::InvalidValue {
-            reason: format!("non-finite value at row {}, column '{}'", row_idx + 1, header),
+            reason: format!(
+                "non-finite value at row {}, column '{}'",
+                row_idx + 1,
+                header
+            ),
         },
     };
 

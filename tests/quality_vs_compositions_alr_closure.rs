@@ -348,7 +348,10 @@ fn mean_heldout_aitchison(raw_test: &Array2<f64>, center: &[f64]) -> f64 {
 ///     match-or-beat on the objective held-out metric, never an output to copy.
 #[test]
 fn simplex_frechet_mean_is_the_optimal_aitchison_center_on_real_data() {
-    let csv = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/skye_afm_lavas.csv");
+    let csv = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/bench/datasets/skye_afm_lavas.csv"
+    );
     let ds = load_csvwith_inferred_schema(Path::new(csv)).expect("load skye_afm_lavas.csv");
     let col = ds.column_map();
     let a: Vec<f64> = ds.values.column(col["A"]).to_vec();

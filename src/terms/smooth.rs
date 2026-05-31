@@ -1507,11 +1507,20 @@ pub enum CoefficientSelector {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CoefficientGroupPrior {
     Flat,
-    NormalLogPrecision { mean: f64, sd: f64 },
-    GammaPrecision { shape: f64, rate: f64 },
+    NormalLogPrecision {
+        mean: f64,
+        sd: f64,
+    },
+    GammaPrecision {
+        shape: f64,
+        rate: f64,
+    },
     /// Penalized-complexity prior calibrated by `P(exp(-ρ/2) > upper) =
     /// tail_prob`; see [`crate::types::RhoPrior::PenalizedComplexity`].
-    PenalizedComplexity { upper: f64, tail_prob: f64 },
+    PenalizedComplexity {
+        upper: f64,
+        tail_prob: f64,
+    },
 }
 
 impl CoefficientGroupPrior {
@@ -27088,22 +27097,23 @@ mod tests {
         // spec equals the `Rho` block eval; on a shared `log epsilon` spec it
         // equals the summed `LogEpsilonFirst` blocks (single cache ⇒ the shared
         // sum is the single block's first-order `log epsilon` eval).
-        let check_dispatch_parity = |specs: [(SpatialAdaptiveHyperKind, AdaptiveComponent); 3],
-                                     deriv_kind: HyperDerivativeKind| {
-            for (kind, component) in specs {
-                let hyper = SpatialAdaptiveHyperSpec {
-                    cache_index: 0,
-                    kind,
-                };
-                let (obj_disp, grad_disp, hess_disp) = family
-                    .adaptive_hyper_parts(&eval, hyper)
-                    .expect("hyper parts");
-                let (obj_ref, grad_ref, hess_ref) = reference_parts(component, deriv_kind);
-                assert_eq!(obj_disp, obj_ref);
-                assert_eq!(grad_disp, grad_ref);
-                assert_eq!(hess_disp, hess_ref);
-            }
-        };
+        let check_dispatch_parity =
+            |specs: [(SpatialAdaptiveHyperKind, AdaptiveComponent); 3],
+             deriv_kind: HyperDerivativeKind| {
+                for (kind, component) in specs {
+                    let hyper = SpatialAdaptiveHyperSpec {
+                        cache_index: 0,
+                        kind,
+                    };
+                    let (obj_disp, grad_disp, hess_disp) = family
+                        .adaptive_hyper_parts(&eval, hyper)
+                        .expect("hyper parts");
+                    let (obj_ref, grad_ref, hess_ref) = reference_parts(component, deriv_kind);
+                    assert_eq!(obj_disp, obj_ref);
+                    assert_eq!(grad_disp, grad_ref);
+                    assert_eq!(hess_disp, hess_ref);
+                }
+            };
 
         check_dispatch_parity(
             [

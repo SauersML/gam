@@ -31,13 +31,13 @@
 //! floor. We still print the per-engine coverage and the worst-case SE magnitude
 //! with `eprintln!` for context.
 
+use csv::StringRecord;
 use gam::inference::alo::compute_alo_diagnostics_from_fit;
 use gam::test_support::reference::{Column, run_python};
 use gam::types::LinkFunction;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal};
@@ -109,13 +109,12 @@ fn gam_alo_sandwich_ci_covers_true_linear_predictor_at_nominal_rate() {
         // ---- build gam dataset (identical numbers) -------------------------
         let mut records: Vec<StringRecord> = Vec::with_capacity(N);
         for i in 0..N {
-            let mut fields: Vec<String> =
-                (0..P).map(|j| format!("{:.17e}", xcols[j][i])).collect();
+            let mut fields: Vec<String> = (0..P).map(|j| format!("{:.17e}", xcols[j][i])).collect();
             fields.push(format!("{:.17e}", yvec[i]));
             records.push(StringRecord::from(fields));
         }
-        let data = encode_recordswith_inferred_schema(headers.clone(), records)
-            .expect("encode dataset");
+        let data =
+            encode_recordswith_inferred_schema(headers.clone(), records).expect("encode dataset");
 
         // ---- fit gam: y ~ x1 + ... + x5, Gaussian-identity, NO smooth ------
         let formula = "y ~ x1 + x2 + x3 + x4 + x5";

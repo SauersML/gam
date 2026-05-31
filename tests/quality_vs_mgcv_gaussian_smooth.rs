@@ -339,7 +339,11 @@ fn gam_smooth_predicts_lidar_better_than_baseline_on_real_data() {
 /// can ride along as a column of the reference data.frame. Only the first
 /// `v.len()` entries are read back inside the R body.
 fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
-    assert!(v.len() <= len, "pad target {len} shorter than source {}", v.len());
+    assert!(
+        v.len() <= len,
+        "pad target {len} shorter than source {}",
+        v.len()
+    );
     let fill = v.last().copied().unwrap_or(0.0);
     let mut out = v.to_vec();
     out.resize(len, fill);

@@ -49,7 +49,9 @@ use std::path::PathBuf;
 /// synthetic/ground-truth test above pins to geomstats; here it is the kernel of
 /// an objective held-out classifier.
 fn grassmann_dist(gr: &GrassmannManifold, p: &Array1<f64>, q: &Array1<f64>) -> f64 {
-    let log = gr.log_map(p.view(), q.view()).expect("gam Grassmann log_map");
+    let log = gr
+        .log_map(p.view(), q.view())
+        .expect("gam Grassmann log_map");
     log.iter().map(|x| x * x).sum::<f64>().sqrt()
 }
 
@@ -64,12 +66,16 @@ fn grassmann_frechet_mean(gr: &GrassmannManifold, frames: &[Array1<f64>]) -> Arr
     for _ in 0..200 {
         let mut tangent = Array1::<f64>::zeros(D * K);
         for f in frames {
-            let log = gr.log_map(mu.view(), f.view()).expect("gam log_map in Karcher mean");
+            let log = gr
+                .log_map(mu.view(), f.view())
+                .expect("gam log_map in Karcher mean");
             tangent += &log;
         }
         tangent /= frames.len() as f64;
         let step: f64 = tangent.iter().map(|x| x * x).sum::<f64>().sqrt();
-        mu = gr.exp_map(mu.view(), tangent.view()).expect("gam exp_map in Karcher mean");
+        mu = gr
+            .exp_map(mu.view(), tangent.view())
+            .expect("gam exp_map in Karcher mean");
         if step < 1e-12 {
             break;
         }
@@ -114,7 +120,11 @@ fn dataset_path() -> PathBuf {
 fn load_groups() -> BTreeMap<String, Vec<[f64; D]>> {
     let text = std::fs::read_to_string(dataset_path()).expect("read olive_oils.csv");
     let mut lines = text.lines();
-    let header: Vec<&str> = lines.next().expect("olive_oils.csv header").split(',').collect();
+    let header: Vec<&str> = lines
+        .next()
+        .expect("olive_oils.csv header")
+        .split(',')
+        .collect();
     let area_idx = header
         .iter()
         .position(|h| *h == "area")
@@ -367,8 +377,7 @@ fn olive_oils_grassmann_distance_matches_geomstats() {
             let log_mat = matrix_from_flat(log_ij.as_slice().unwrap());
             let log_sigma = singular_values(&log_mat);
             let angles = principal_angles(&frames[i], &frames[j]);
-            max_log_sigma_vs_angle =
-                max_log_sigma_vs_angle.max(max_abs_diff(&log_sigma, &angles));
+            max_log_sigma_vs_angle = max_log_sigma_vs_angle.max(max_abs_diff(&log_sigma, &angles));
 
             // (C) exp/log round-trip + isometry on a controlled tangent. Scale the
             // log toward area j down to a Frobenius norm safely inside the
@@ -381,8 +390,10 @@ fn olive_oils_grassmann_distance_matches_geomstats() {
             let v_rec = gr
                 .log_map(yi, endpoint.view())
                 .expect("gam Grassmann log_map of exp endpoint");
-            max_roundtrip_abs = max_roundtrip_abs
-                .max(max_abs_diff(v_rec.as_slice().unwrap(), v.as_slice().unwrap()));
+            max_roundtrip_abs = max_roundtrip_abs.max(max_abs_diff(
+                v_rec.as_slice().unwrap(),
+                v.as_slice().unwrap(),
+            ));
             let v_norm: f64 = v.iter().map(|x| x * x).sum::<f64>().sqrt();
             let rec_norm: f64 = v_rec.iter().map(|x| x * x).sum::<f64>().sqrt();
             max_isometry_err = max_isometry_err.max((rec_norm - v_norm).abs());
@@ -536,10 +547,18 @@ fn olive_oils_grassmann_distance_matches_geomstats_on_real_data() {
     let mut test_frames: Vec<Array1<f64>> = Vec::new();
 
     for (area, rows) in groups.iter() {
-        let train_rows: Vec<[f64; D]> =
-            rows.iter().enumerate().filter(|(i, _)| i % 2 == 0).map(|(_, r)| *r).collect();
-        let test_rows: Vec<[f64; D]> =
-            rows.iter().enumerate().filter(|(i, _)| i % 2 == 1).map(|(_, r)| *r).collect();
+        let train_rows: Vec<[f64; D]> = rows
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 0)
+            .map(|(_, r)| *r)
+            .collect();
+        let test_rows: Vec<[f64; D]> = rows
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 1)
+            .map(|(_, r)| *r)
+            .collect();
         // Only keep areas whose BOTH halves admit a well-defined rank-K subspace
         // (enough samples and a clean spectral gap). pca_subspace asserts both, so
         // gate on size here and let it assert the gap.
@@ -674,7 +693,11 @@ emit("gam_mean_variance_gs", [variance(P_gam_mean)])
     let gs_dist = py.vector("gs_dist");
     let gs_mean_variance = py.scalar("gs_mean_variance");
     let gam_mean_variance_gs = py.scalar("gam_mean_variance_gs");
-    assert_eq!(gs_dist.len(), n_areas * n_areas, "geomstats distance-matrix size");
+    assert_eq!(
+        gs_dist.len(),
+        n_areas * n_areas,
+        "geomstats distance-matrix size"
+    );
 
     // gam's distance matrix must agree with geomstats' to the SVD noise floor
     // (this is the same closed-form geodesic distance the ground-truth test pins),

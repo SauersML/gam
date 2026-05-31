@@ -43,9 +43,7 @@
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, pearson, rmse, run_r};
-use gam::{
-    FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema,
-};
+use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::path::Path;
 
@@ -150,8 +148,8 @@ fn gam_sphere_smooth_predicts_global_city_temp_better_than_mgcv_sos() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("temp ~ sphere(lat, lon, k=40)", &train_ds, &cfg)
-        .expect("gam sphere fit");
+    let result =
+        fit_from_formula("temp ~ sphere(lat, lon, k=40)", &train_ds, &cfg).expect("gam sphere fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for a Gaussian sphere smooth");
     };
@@ -325,8 +323,8 @@ fn gam_sphere_smooth_predicts_global_city_temp_better_than_mgcv_sos_on_real_data
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("temp ~ sphere(lat, lon, k=40)", &train_ds, &cfg)
-        .expect("gam sphere fit");
+    let result =
+        fit_from_formula("temp ~ sphere(lat, lon, k=40)", &train_ds, &cfg).expect("gam sphere fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for a Gaussian sphere smooth");
     };

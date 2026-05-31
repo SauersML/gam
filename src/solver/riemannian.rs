@@ -336,21 +336,30 @@ impl Manifold for Circle {
         assert!((v[0] * p[0] + v[1] * p[1]).abs() < 1.0e-9);
     }
     fn retract(&self, p: ArrayView1<f64>, xi: ArrayView1<f64>, mut out: ArrayViewMut1<f64>) {
-        // Closed-form projective retraction (proposal §4.2):
-        //   R_p(ξ) = (p + ξ)/||p + ξ||.
-        // First-order accurate, seam-free, no angle parameterization needed
-        // (so no 2π wrap to handle here — periodicity is automatic).
-        let x = p[0] + xi[0];
-        let y = p[1] + xi[1];
-        let s2 = x * x + y * y;
+        // Exact exponential map on S¹ — rotate p by the signed arc-length
+        // s = ⟨ξ, t⟩ where t = (-p[1], p[0]) is the unit CCW tangent at p.
+        // For S¹ ⊂ R² this geodesic IS available in closed form, so there
+        // is no reason to fall back to the generic first-order projective
+        // retraction R_p(ξ) = (p + ξ)/||p + ξ||: the projective form
+        // truncates exp(s) at first order and accumulates an O(n·step³)
+        // angular drift over n steps — at n=100 around a full 2π loop the
+        // drift is ~10⁻², blowing past any tolerance tighter than ~10⁻².
+        // The exp-map below has only machine-roundoff error and closes 2π
+        // loops to ~10⁻¹⁵, which is what the canonical retraction on the
+        // circle should deliver.
+        assert_eq!(p.len(), 2);
+        assert_eq!(xi.len(), 2);
+        let s = (-xi[0]) * p[1] + xi[1] * p[0];
+        let (sin_s, cos_s) = s.sin_cos();
+        let new_x = p[0] * cos_s - p[1] * sin_s;
+        let new_y = p[0] * sin_s + p[1] * cos_s;
         assert!(
-            s2.is_finite() && s2 > 0.0,
-            "Circle::retract degenerate ||p+ξ||"
+            new_x.is_finite() && new_y.is_finite(),
+            "Circle::retract non-finite exp-map output (s={s})"
         );
-        let norm = s2.sqrt().max(1.0e-300);
-        out[0] = x / norm;
-        out[1] = y / norm;
-        // Post-condition: retraction stays on S¹.
+        out[0] = new_x;
+        out[1] = new_y;
+        // Post-condition: retraction stays on S¹ (up to roundoff in p).
         assert!((out[0] * out[0] + out[1] * out[1] - 1.0).abs() < 1.0e-9);
     }
     fn vector_transport(&self, from: ArrayView1<f64>, to: ArrayView1<f64>, xi: ArrayViewMut1<f64>) {

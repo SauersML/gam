@@ -115,6 +115,45 @@ impl ContinuationFailure {
             }
         }
     }
+
+    /// Whether this pre-warm failure reflects a *structural* defect of the
+    /// seed's joint design — one a cold inner solve at the seed ρ* would
+    /// hit identically, so retrying cold is futile and the seed should be
+    /// disqualified.
+    ///
+    /// This is **not** decided by the `ContinuationFailure` variant: the
+    /// continuation scheduler routes a generic `InnerFailure::Other` to
+    /// `Propagate` (hence `StructuralPropagate`) purely as a conservative
+    /// "don't burn ρ-anneal budget" choice, not because the failure is
+    /// genuinely structural. We therefore inspect the *underlying*
+    /// `InnerFailure`: only a rank/alias defect of the joint design
+    /// (`IdentifiabilityFailure`, `AliasingDetectedAtFit`) or a genuine
+    /// active-set KKT bug (`ActiveSetIncomplete`) is structural.
+    ///
+    /// Everything else — an ill-conditioned constraint KKT residual at the
+    /// heavily-oversmoothed ρ₀ (λ₀ ≫ λ*), a likelihood domain miss at that
+    /// start, a stuck or budget-exhausted path — is a numerical property of
+    /// the *warm-start schedule*, not of the seed ρ* the caller is about to
+    /// evaluate. For those the caller should fall back to a cold seed eval
+    /// (the pre-warm is an optimization, never a feasibility gate; cf. #236
+    /// and #500) rather than disqualify the seed.
+    pub(crate) fn is_structural(&self) -> bool {
+        let inner = match self {
+            Self::StructuralPropagate(last)
+            | Self::DomainAtOversmoothedStart(last)
+            | Self::PathStuck { last, .. }
+            | Self::PathBudgetExhausted { last, .. } => last,
+        };
+        matches!(
+            inner,
+            InnerFailure::IdentifiabilityFailure { .. }
+                | InnerFailure::CertRefused {
+                    diagnosis: KktRefusalDiagnosis::ActiveSetIncomplete
+                        | KktRefusalDiagnosis::AliasingDetectedAtFit,
+                    ..
+                }
+        )
+    }
 }
 
 /// Accepted state carried across continuation steps. Stage 2 carries

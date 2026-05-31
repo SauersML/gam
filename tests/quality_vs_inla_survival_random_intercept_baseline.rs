@@ -67,7 +67,10 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-const VETERAN_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/veteran_lung.csv");
+const VETERAN_CSV: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/bench/datasets/veteran_lung.csv"
+);
 
 const HF_CSV: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -110,8 +113,16 @@ const N_GROUPS: usize = 6;
 /// only the per-subject risk score and is invariant to any monotone baseline
 /// (so it is exactly right for a proportional-hazards risk).
 fn harrell_concordance(risk: &[f64], time: &[f64], event: &[f64]) -> f64 {
-    assert_eq!(risk.len(), time.len(), "concordance risk/time length mismatch");
-    assert_eq!(risk.len(), event.len(), "concordance risk/event length mismatch");
+    assert_eq!(
+        risk.len(),
+        time.len(),
+        "concordance risk/time length mismatch"
+    );
+    assert_eq!(
+        risk.len(),
+        event.len(),
+        "concordance risk/event length mismatch"
+    );
     let n = risk.len();
     let mut comparable = 0.0_f64;
     let mut concordant = 0.0_f64;

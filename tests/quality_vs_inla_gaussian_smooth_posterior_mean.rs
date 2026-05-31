@@ -91,10 +91,18 @@ fn gam_smooth_predicts_heldout_lidar_at_least_as_well_as_inla() {
     let n_test = test_rows.len();
     assert!(n_test > 20, "need a meaningful held-out set, got {n_test}");
 
-    let test_range: Vec<f64> = test_rows.iter().map(|&i| ds.values[[i, range_idx]]).collect();
-    let test_y: Vec<f64> = test_rows.iter().map(|&i| ds.values[[i, logratio_idx]]).collect();
-    let train_y: Vec<f64> =
-        train_rows.iter().map(|&i| ds.values[[i, logratio_idx]]).collect();
+    let test_range: Vec<f64> = test_rows
+        .iter()
+        .map(|&i| ds.values[[i, range_idx]])
+        .collect();
+    let test_y: Vec<f64> = test_rows
+        .iter()
+        .map(|&i| ds.values[[i, logratio_idx]])
+        .collect();
+    let train_y: Vec<f64> = train_rows
+        .iter()
+        .map(|&i| ds.values[[i, logratio_idx]])
+        .collect();
 
     // ---- fit gam on the TRAINING rows only --------------------------------
     let mut train_ds = ds.clone();
@@ -270,8 +278,14 @@ fn gam_smooth_predicts_heldout_lidar_at_least_as_well_as_inla_on_real_data() {
         "split sizes: train={n_train} test={n_test}"
     );
 
-    let test_range: Vec<f64> = test_rows.iter().map(|&i| ds.values[[i, range_idx]]).collect();
-    let test_y: Vec<f64> = test_rows.iter().map(|&i| ds.values[[i, logratio_idx]]).collect();
+    let test_range: Vec<f64> = test_rows
+        .iter()
+        .map(|&i| ds.values[[i, range_idx]])
+        .collect();
+    let test_y: Vec<f64> = test_rows
+        .iter()
+        .map(|&i| ds.values[[i, logratio_idx]])
+        .collect();
 
     // ---- fit gam on the TRAINING rows only --------------------------------
     let mut train_ds = ds.clone();
@@ -322,7 +336,10 @@ fn gam_smooth_predicts_heldout_lidar_at_least_as_well_as_inla_on_real_data() {
         })
         .collect();
     let full_range: Vec<f64> = (0..n).map(|i| ds.values[[i, range_idx]]).collect();
-    let mut test_positions: Vec<f64> = (0..n).filter(|&i| is_test(i)).map(|i| (i + 1) as f64).collect();
+    let mut test_positions: Vec<f64> = (0..n)
+        .filter(|&i| is_test(i))
+        .map(|i| (i + 1) as f64)
+        .collect();
     assert_eq!(test_positions.len(), n_test, "INLA test-position count");
     // Pad testpos to length N so all columns in this run_r call are equal length.
     test_positions.resize(n, f64::NAN);

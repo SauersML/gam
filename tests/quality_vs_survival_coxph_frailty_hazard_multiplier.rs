@@ -83,7 +83,10 @@ use std::path::Path;
 /// Statistical Analysis of Failure Time Data* (1980); shipped as the `veteran`
 /// data frame in R's `survival` package and vendored here at
 /// `bench/datasets/veteran_lung.csv`.
-const VETERAN_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/veteran_lung.csv");
+const VETERAN_CSV: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/bench/datasets/veteran_lung.csv"
+);
 
 const N_GROUPS: usize = 12;
 const PER_GROUP: usize = 10;
@@ -544,9 +547,7 @@ fn gam_hazard_multiplier_frailty_matches_coxph_frailty_on_real_data() {
     let all_time: Vec<f64> = (0..n_all).map(|i| time[i]).collect();
     let all_status: Vec<f64> = (0..n_all).map(|i| status[i]).collect();
     let all_karno: Vec<f64> = (0..n_all).map(|i| karno[i]).collect();
-    let all_celltype: Vec<f64> = (0..n_all)
-        .map(|i| raw.values[[i, r_celltype]])
-        .collect();
+    let all_celltype: Vec<f64> = (0..n_all).map(|i| raw.values[[i, r_celltype]]).collect();
     let r = run_r(
         &[
             Column::new("time", &all_time),

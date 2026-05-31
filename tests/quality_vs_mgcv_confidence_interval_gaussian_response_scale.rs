@@ -35,6 +35,7 @@
 //! `InferenceCovarianceMode::Conditional` and every optional inflation disabled,
 //! so both engines form the same plug-in Bayesian interval on identical data.
 
+use csv::StringRecord;
 use gam::predict::{
     InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
     predict_gamwith_uncertainty,
@@ -45,7 +46,6 @@ use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array1;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -94,11 +94,7 @@ fn response_scale_ci_is_calibrated_and_matches_or_beats_mgcv() {
     init_parallelism();
 
     let (pc1, pc2) = design_points(20_260_530);
-    let truth: Vec<f64> = pc1
-        .iter()
-        .zip(&pc2)
-        .map(|(&a, &b)| mu_true(a, b))
-        .collect();
+    let truth: Vec<f64> = pc1.iter().zip(&pc2).map(|(&a, &b)| mu_true(a, b)).collect();
 
     let gaussian_identity = LikelihoodSpec::new(
         ResponseFamily::Gaussian,

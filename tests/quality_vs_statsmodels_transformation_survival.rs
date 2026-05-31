@@ -496,8 +496,16 @@ emit("converged", [1.0 if res.success else 0.0])
 /// risk. Risk ties on a comparable pair count as half-concordant. Returns the
 /// fraction of comparable pairs that are concordant (0.5 = random ordering).
 fn concordance_index(risk: &[f64], time: &[f64], event: &[f64]) -> f64 {
-    assert_eq!(risk.len(), time.len(), "concordance: risk/time length mismatch");
-    assert_eq!(time.len(), event.len(), "concordance: time/event length mismatch");
+    assert_eq!(
+        risk.len(),
+        time.len(),
+        "concordance: risk/time length mismatch"
+    );
+    assert_eq!(
+        time.len(),
+        event.len(),
+        "concordance: time/event length mismatch"
+    );
     let n = risk.len();
     let mut concordant = 0.0_f64;
     let mut comparable = 0.0_f64;
@@ -647,9 +655,7 @@ fn gam_transformation_survival_prediction_grid_matches_scipy_on_real_data() {
     // (monotone in hazard) on the held-out rows in the SAME order and turn it
     // into the IDENTICAL Rust concordance metric. The test rows ride back in a
     // padded `sm_risk` column whose first `n_test` entries are the real scores.
-    let is_train: Vec<f64> = (0..n)
-        .map(|i| if is_test(i) { 0.0 } else { 1.0 })
-        .collect();
+    let is_train: Vec<f64> = (0..n).map(|i| if is_test(i) { 0.0 } else { 1.0 }).collect();
     let py = run_python(
         &[
             Column::new("time", &time),

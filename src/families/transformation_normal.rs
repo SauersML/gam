@@ -5339,8 +5339,10 @@ impl TransformationNormalFamily {
                                 [endpoint_basis[0][k] * cij, endpoint_basis[1][k] * cij]
                             } else {
                                 [
-                                    2.0 * endpoint_basis[0][k] * (gj * ci + gi * cj + gij * c + g * cij),
-                                    2.0 * endpoint_basis[1][k] * (gj * ci + gi * cj + gij * c + g * cij),
+                                    2.0 * endpoint_basis[0][k]
+                                        * (gj * ci + gi * cj + gij * c + g * cij),
+                                    2.0 * endpoint_basis[1][k]
+                                        * (gj * ci + gi * cj + gij * c + g * cij),
                                 ]
                             };
                             let endpoint_a_d = if k == 0 {
@@ -5371,8 +5373,10 @@ impl TransformationNormalFamily {
                                 [0.0; 2]
                             } else {
                                 [
-                                    2.0 * endpoint_basis[0][k] * (uj * ci + ui * cj + uij * c + u * cij),
-                                    2.0 * endpoint_basis[1][k] * (uj * ci + ui * cj + uij * c + u * cij),
+                                    2.0 * endpoint_basis[0][k]
+                                        * (uj * ci + ui * cj + uij * c + u * cij),
+                                    2.0 * endpoint_basis[1][k]
+                                        * (uj * ci + ui * cj + uij * c + u * cij),
                                 ]
                             };
                             let n1 = dhp_i * hp_j + hp_i * dhp_j;
@@ -5799,8 +5803,10 @@ impl TransformationNormalFamily {
                                     [endpoint_basis[0][k] * cij, endpoint_basis[1][k] * cij]
                                 } else {
                                     [
-                                        2.0 * endpoint_basis[0][k] * (gj * ci + gi * cj + gij * c + g * cij),
-                                        2.0 * endpoint_basis[1][k] * (gj * ci + gi * cj + gij * c + g * cij),
+                                        2.0 * endpoint_basis[0][k]
+                                            * (gj * ci + gi * cj + gij * c + g * cij),
+                                        2.0 * endpoint_basis[1][k]
+                                            * (gj * ci + gi * cj + gij * c + g * cij),
                                     ]
                                 };
                                 let endpoint_a_d = if k == 0 {
@@ -5831,8 +5837,10 @@ impl TransformationNormalFamily {
                                     [0.0; 2]
                                 } else {
                                     [
-                                        2.0 * endpoint_basis[0][k] * (uj * ci + ui * cj + uij * c + u * cij),
-                                        2.0 * endpoint_basis[1][k] * (uj * ci + ui * cj + uij * c + u * cij),
+                                        2.0 * endpoint_basis[0][k]
+                                            * (uj * ci + ui * cj + uij * c + u * cij),
+                                        2.0 * endpoint_basis[1][k]
+                                            * (uj * ci + ui * cj + uij * c + u * cij),
                                     ]
                                 };
                                 let n1 = dhp_i * hp_j + hp_i * dhp_j;

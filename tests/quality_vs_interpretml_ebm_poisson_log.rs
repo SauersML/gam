@@ -216,9 +216,13 @@ emit("mu", mu)
     //     the amplitude (range) of the true mean over the test fold. This is the
     //     primary objective bar: a small fraction of the signal range.
     let n_test_f = n_test as f64;
-    let gam_truth_rmse =
-        (gam_mu.iter().zip(&mu_true).map(|(&mh, &mt)| (mh - mt).powi(2)).sum::<f64>() / n_test_f)
-            .sqrt();
+    let gam_truth_rmse = (gam_mu
+        .iter()
+        .zip(&mu_true)
+        .map(|(&mh, &mt)| (mh - mt).powi(2))
+        .sum::<f64>()
+        / n_test_f)
+        .sqrt();
     let mu_true_min = mu_true.iter().cloned().fold(f64::INFINITY, f64::min);
     let mu_true_max = mu_true.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let mu_true_range = (mu_true_max - mu_true_min).max(1e-12);

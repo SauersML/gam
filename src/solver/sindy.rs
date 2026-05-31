@@ -412,10 +412,7 @@ pub fn sindy_library(
 /// Centered second-order differences on the interior, one-sided first-order
 /// differences at the two endpoints — the standard SINDy differentiation step
 /// (PySINDy's `FiniteDifference`). All `n` rows are kept.
-pub fn sindy_finite_difference(
-    z: ArrayView2<'_, f64>,
-    dt: f64,
-) -> Result<Array2<f64>, String> {
+pub fn sindy_finite_difference(z: ArrayView2<'_, f64>, dt: f64) -> Result<Array2<f64>, String> {
     let (n, d) = z.dim();
     if n < 2 || d == 0 {
         return Err(format!(

@@ -214,7 +214,10 @@ fn gam_gaussian_location_scale_crps_matches_properscoring() {
     // floor; no estimator can beat it in expectation. This is the optimality
     // yardstick for gam's distributional fit.
     let mu_oracle: Vec<f64> = x_test.iter().map(|&t| mu_true(t)).collect();
-    let sigma_oracle: Vec<f64> = x_test.iter().map(|&t| sigma_true(t).max(LOGB_SIGMA_FLOOR)).collect();
+    let sigma_oracle: Vec<f64> = x_test
+        .iter()
+        .map(|&t| sigma_true(t).max(LOGB_SIGMA_FLOOR))
+        .collect();
 
     // ---- HOMOSCEDASTIC baseline: right mean, scale channel switched off -----
     // Same true mean, but a single constant sigma = RMS of the true sigmas (the
@@ -222,8 +225,7 @@ fn gam_gaussian_location_scale_crps_matches_properscoring() {
     // gam's location-scale machinery must out-score on held-out CRPS to justify
     // fitting the log-sigma smooth at all.
     let sigma_const = {
-        let ms: f64 =
-            x_test.iter().map(|&t| sigma_true(t).powi(2)).sum::<f64>() / n_test as f64;
+        let ms: f64 = x_test.iter().map(|&t| sigma_true(t).powi(2)).sum::<f64>() / n_test as f64;
         ms.sqrt()
     };
     let mu_base: Vec<f64> = mu_oracle.clone();
@@ -264,8 +266,16 @@ emit("crps_base", crps("mu_base", "sigma_base"))
     let ps_crps_oracle = ref_py.vector("crps_oracle");
     let ps_crps_base = ref_py.vector("crps_base");
     assert_eq!(ps_crps_gam.len(), n_test, "properscoring gam CRPS length");
-    assert_eq!(ps_crps_oracle.len(), n_test, "properscoring oracle CRPS length");
-    assert_eq!(ps_crps_base.len(), n_test, "properscoring baseline CRPS length");
+    assert_eq!(
+        ps_crps_oracle.len(),
+        n_test,
+        "properscoring oracle CRPS length"
+    );
+    assert_eq!(
+        ps_crps_base.len(),
+        n_test,
+        "properscoring baseline CRPS length"
+    );
 
     let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
     let mean_gam = mean(ps_crps_gam);
@@ -462,7 +472,11 @@ emit("crps_base", crps("mu_base", "sigma_base"))
     let ps_crps_gam = ref_py.vector("crps_gam");
     let ps_crps_base = ref_py.vector("crps_base");
     assert_eq!(ps_crps_gam.len(), n_test, "properscoring gam CRPS length");
-    assert_eq!(ps_crps_base.len(), n_test, "properscoring baseline CRPS length");
+    assert_eq!(
+        ps_crps_base.len(),
+        n_test,
+        "properscoring baseline CRPS length"
+    );
 
     let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
     let mean_gam = mean(ps_crps_gam);

@@ -456,7 +456,9 @@ fn beta_logit_custom_family_recovers_truth_and_generalises() {
     // coefficients it learned from the train rows only.
     let gam_eta1 = |i: usize| b_alpha[0] + b_alpha[1] * x1[i];
     let gam_eta2 = |i: usize| b_beta[0] + b_beta[1] * x2[i];
-    let mu_hat: Vec<f64> = (0..N).map(|i| beta_mean(gam_eta1(i), gam_eta2(i))).collect();
+    let mu_hat: Vec<f64> = (0..N)
+        .map(|i| beta_mean(gam_eta1(i), gam_eta2(i)))
+        .collect();
 
     // ── METRIC 1 (PRIMARY): TRUTH RECOVERY of the mean surface ──────────────
     // RMSE between gam's fitted mean and the ground-truth generating mean.

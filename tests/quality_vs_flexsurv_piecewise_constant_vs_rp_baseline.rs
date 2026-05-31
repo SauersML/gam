@@ -360,7 +360,10 @@ fn gam_smooth_ispline_baseline_predicts_icu_survival() {
     sorted_t.sort_by(f64::total_cmp);
     let t_lo = sorted_t[((0.05 * n as f64) as usize).min(n - 1)];
     let t_hi = sorted_t[((0.95 * n as f64) as usize).min(n - 1)];
-    assert!(t_lo > 0.0 && t_hi > t_lo, "scoring grid needs 0 < t_lo < t_hi");
+    assert!(
+        t_lo > 0.0 && t_hi > t_lo,
+        "scoring grid needs 0 < t_lo < t_hi"
+    );
     let n_t = 15usize;
     let grid: Vec<f64> = (0..n_t)
         .map(|j| {
@@ -648,8 +651,12 @@ fn gam_smooth_ispline_baseline_predicts_icu_survival_on_real_data() {
         time_num_internal_knots: N_INTERNAL_KNOTS,
         ..FitConfig::default()
     };
-    let result = fit_from_formula("Surv(time, status) ~ karno + survmodel(spec=net)", &train_ds, &cfg)
-        .expect("gam smooth I-spline RP net-survival fit on veteran train fold");
+    let result = fit_from_formula(
+        "Surv(time, status) ~ karno + survmodel(spec=net)",
+        &train_ds,
+        &cfg,
+    )
+    .expect("gam smooth I-spline RP net-survival fit on veteran train fold");
     let FitResult::SurvivalTransformation(fit) = result else {
         panic!("expected a survival-transformation (Royston-Parmar) fit result");
     };
@@ -731,9 +738,7 @@ fn gam_smooth_ispline_baseline_predicts_icu_survival_on_real_data() {
     // column is length n_all), fit on the training rows, then emit each held-out
     // subject's log Λ(ref | karno) as its PH relative-risk score, scored with the
     // identical Rust concordance on the identical (test_time, test_status).
-    let train_flag: Vec<f64> = (0..n)
-        .map(|i| if is_test(i) { 0.0 } else { 1.0 })
-        .collect();
+    let train_flag: Vec<f64> = (0..n).map(|i| if is_test(i) { 0.0 } else { 1.0 }).collect();
     let all_time: Vec<f64> = (0..n).map(|i| ds.values[[i, time_idx]]).collect();
     let all_status: Vec<f64> = (0..n).map(|i| ds.values[[i, status_idx]]).collect();
     let all_karno: Vec<f64> = (0..n).map(|i| ds.values[[i, karno_idx]]).collect();
