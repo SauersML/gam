@@ -40,10 +40,10 @@ use gam::{
     load_csvwith_inferred_schema,
 };
 use ndarray::Array2;
-use std::path::Path;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
+use std::path::Path;
 
 const N_GROUPS: usize = 6;
 const N_PER_GROUP: usize = 40;
@@ -336,7 +336,10 @@ fn gam_factor_smooth_random_slope_matches_lme4_on_real_data() {
     // non-numeric label ("s308"), exactly like the synthetic arm prefixes "g".
     let subject_raw: Vec<f64> = ds.values.column(subject_idx).to_vec();
     let n = days_all.len();
-    assert_eq!(n, 180, "sleepstudy should have 18 subjects x 10 days = 180 rows, got {n}");
+    assert_eq!(
+        n, 180,
+        "sleepstudy should have 18 subjects x 10 days = 180 rows, got {n}"
+    );
 
     // Sorted unique subject ids; the sorted position is the categorical level
     // index gam will assign, because we emit the training records subject-by-
@@ -346,7 +349,10 @@ fn gam_factor_smooth_random_slope_matches_lme4_on_real_data() {
     subjects.sort_unstable();
     subjects.dedup();
     let n_subjects = subjects.len();
-    assert_eq!(n_subjects, 18, "sleepstudy should have 18 subjects, got {n_subjects}");
+    assert_eq!(
+        n_subjects, 18,
+        "sleepstudy should have 18 subjects, got {n_subjects}"
+    );
 
     // ---- deterministic split: Days 0..6 TRAIN, Days 7,8,9 held-out TEST -----
     // Identical rows in identical order to gam and lme4 (we build the row lists
@@ -355,8 +361,16 @@ fn gam_factor_smooth_random_slope_matches_lme4_on_real_data() {
     let is_test_day = |d: f64| d.round() as i64 >= 7;
     let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test_day(days_all[i])).collect();
     let test_rows: Vec<usize> = (0..n).filter(|&i| is_test_day(days_all[i])).collect();
-    assert_eq!(train_rows.len(), 18 * 7, "train should be 18 subjects x 7 days");
-    assert_eq!(test_rows.len(), 18 * 3, "test should be 18 subjects x 3 days");
+    assert_eq!(
+        train_rows.len(),
+        18 * 7,
+        "train should be 18 subjects x 7 days"
+    );
+    assert_eq!(
+        test_rows.len(),
+        18 * 3,
+        "test should be 18 subjects x 3 days"
+    );
 
     // ---- build a CATEGORICAL-Subject training dataset for gam ---------------
     // Emit records grouped by sorted subject so subject `subjects[k]` is first
@@ -440,7 +454,11 @@ fn gam_factor_smooth_random_slope_matches_lme4_on_real_data() {
     let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
         .expect("rebuild design at held-out grid");
     let gam_test_pred: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
-    assert_eq!(gam_test_pred.len(), grid_len, "gam prediction length mismatch");
+    assert_eq!(
+        gam_test_pred.len(),
+        grid_len,
+        "gam prediction length mismatch"
+    );
 
     // ---- fit the SAME model on TRAIN with lme4, predict the SAME TEST -------
     // One run_r call, all columns equal length: we pass the TRAIN rows (Days,
@@ -448,8 +466,7 @@ fn gam_factor_smooth_random_slope_matches_lme4_on_real_data() {
     // right-padded to the train length, and a test_n count. lmer fits on the
     // train rows and predicts the first test_n entries of the padded grid.
     let train_days: Vec<f64> = train_rows.iter().map(|&i| days_all[i]).collect();
-    let train_subject: Vec<f64> =
-        train_rows.iter().map(|&i| subject_raw[i].round()).collect();
+    let train_subject: Vec<f64> = train_rows.iter().map(|&i| subject_raw[i].round()).collect();
     let train_reaction: Vec<f64> = train_rows.iter().map(|&i| reaction_all[i]).collect();
     let m_train = train_days.len();
     let test_days_padded = pad_to(&grid_days, m_train);

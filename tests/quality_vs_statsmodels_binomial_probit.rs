@@ -78,7 +78,10 @@ fn gam_binomial_probit_recovers_truth() {
 
     // Ground-truth mean curve at the evaluation grid: mu_true = Phi(eta_true).
     // This is the data-generating function and the objective target of the fit.
-    let mu_true: Vec<f64> = xgrid.iter().map(|&x| std_normal.cdf(truth_eta(x))).collect();
+    let mu_true: Vec<f64> = xgrid
+        .iter()
+        .map(|&x| std_normal.cdf(truth_eta(x)))
+        .collect();
 
     // ---- fit with gam: y ~ s(x1, k=4), Binomial(probit) -------------------
     let headers = ["x1", "y"].into_iter().map(String::from).collect();

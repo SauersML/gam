@@ -27,13 +27,13 @@
 //! gam and mgcv fit byte-identical responses; any coverage gap is a property of
 //! the covariance/SE computation, not of the data.
 
+use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, relative_l2, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::{Array1, Array2};
 
 /// Deterministic SplitMix64 -> standard-normal stream (Box–Muller). Keeps the
@@ -134,12 +134,7 @@ fn gam_pointwise_ci_covers_truth_and_matches_mgcv_on_gaussian_smooth() {
         // numerically to what R receives.
         let headers = vec!["x".to_string(), "y".to_string()];
         let records: Vec<StringRecord> = (0..n)
-            .map(|i| {
-                StringRecord::from(vec![
-                    format!("{:.17e}", x[i]),
-                    format!("{:.17e}", yk[i]),
-                ])
-            })
+            .map(|i| StringRecord::from(vec![format!("{:.17e}", x[i]), format!("{:.17e}", yk[i])]))
             .collect();
         let ds = encode_recordswith_inferred_schema(headers, records)
             .expect("encode simulated replicate");

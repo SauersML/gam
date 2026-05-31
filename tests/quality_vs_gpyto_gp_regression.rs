@@ -80,7 +80,11 @@ fn r2(pred: &[f64], truth: &[f64]) -> f64 {
 /// train-length reference data.frame. Only the first `v.len()` entries are read
 /// back inside the reference body.
 fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
-    assert!(v.len() <= len, "pad target {len} shorter than source {}", v.len());
+    assert!(
+        v.len() <= len,
+        "pad target {len} shorter than source {}",
+        v.len()
+    );
     let fill = v.last().copied().unwrap_or(0.0);
     let mut out = v.to_vec();
     out.resize(len, fill);
@@ -91,7 +95,11 @@ fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
 /// symmetric band `[mean(x) − half(x), mean(x) + half(x)]`. Objective empirical
 /// coverage of a 95% credible band against ground truth.
 fn empirical_coverage(mean: &[f64], half_width: &[f64], truth: &[f64]) -> f64 {
-    assert_eq!(mean.len(), half_width.len(), "mean/half-width length mismatch");
+    assert_eq!(
+        mean.len(),
+        half_width.len(),
+        "mean/half-width length mismatch"
+    );
     assert_eq!(mean.len(), truth.len(), "mean/truth length mismatch");
     let n = mean.len();
     assert!(n > 0, "need a non-empty grid for coverage");

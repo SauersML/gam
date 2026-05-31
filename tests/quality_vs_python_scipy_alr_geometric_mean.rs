@@ -48,7 +48,10 @@ use std::path::Path;
 /// AFM volcanic-rock compositions from the Isle of Skye (Aitchison 1986, the
 /// canonical reference dataset for the additive log-ratio; shipped as
 /// `skye_afm_lavas.csv`). Each row is an (A=alkali, F=FeO, M=MgO) composition.
-const SKYE_AFM_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/skye_afm_lavas.csv");
+const SKYE_AFM_CSV: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/bench/datasets/skye_afm_lavas.csv"
+);
 
 /// Additive log-ratio (ALR) coordinates of a composition with the LAST part as
 /// the common reference: `alr(x)_j = ln(x_j / x_D)` for `j = 0..D-1`. This is
@@ -97,10 +100,7 @@ fn clr(x: &[f64]) -> Vec<f64> {
 fn aitchison_sq(a: &[f64], b: &[f64]) -> f64 {
     let ca = clr(a);
     let cb = clr(b);
-    ca.iter()
-        .zip(&cb)
-        .map(|(x, y)| (x - y) * (x - y))
-        .sum()
+    ca.iter().zip(&cb).map(|(x, y)| (x - y) * (x - y)).sum()
 }
 
 /// Aitchison-Fréchet functional F(m) = mean_i d_A(m, x_i)^2 for candidate `m`.
@@ -363,7 +363,8 @@ emit("mean", g)
 #[test]
 fn simplex_geometric_mean_minimizes_aitchison_frechet_objective_on_real_data() {
     // ---- load the canonical Skye AFM lavas (A, F, M strictly positive) -----
-    let ds = load_csvwith_inferred_schema(Path::new(SKYE_AFM_CSV)).expect("load skye_afm_lavas.csv");
+    let ds =
+        load_csvwith_inferred_schema(Path::new(SKYE_AFM_CSV)).expect("load skye_afm_lavas.csv");
     let col = ds.column_map();
     let a_idx = col["A"];
     let f_idx = col["F"];
@@ -418,7 +419,11 @@ fn simplex_geometric_mean_minimizes_aitchison_frechet_objective_on_real_data() {
 
     // ---- gam: compositional geometric (Fréchet) mean on TRAIN -------------
     let gam_mean = simplex_frechet_mean(train_mat.view(), None).expect("gam simplex Fréchet mean");
-    assert_eq!(gam_mean.len(), nparts, "Fréchet mean must have one part per column");
+    assert_eq!(
+        gam_mean.len(),
+        nparts,
+        "Fréchet mean must have one part per column"
+    );
 
     // ---- (PRIMARY) ALR-transform correctness + geometric-mean identity -----
     // The compositional geometric mean's ALR coordinates equal the arithmetic

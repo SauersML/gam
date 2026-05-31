@@ -61,7 +61,10 @@ use ndarray::Array2;
 use std::fs;
 use std::path::Path;
 
-const VETERAN_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/veteran_lung.csv");
+const VETERAN_CSV: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/bench/datasets/veteran_lung.csv"
+);
 
 /// Harrell's concordance index for a risk score (higher score = higher risk =
 /// expected-earlier failure). Over all orderable pairs where the earlier event
@@ -90,7 +93,10 @@ fn concordance(time: &[f64], event: &[f64], risk: &[f64]) -> f64 {
             }
         }
     }
-    assert!(comparable > 0.0, "no comparable event pairs for concordance");
+    assert!(
+        comparable > 0.0,
+        "no comparable event pairs for concordance"
+    );
     concordant / comparable
 }
 
@@ -148,7 +154,10 @@ fn gam_weibull_survival_out_of_sample_quality_on_veteran_lung() {
         age.push(fields[7].trim().parse::<f64>().expect("parse age"));
     }
     let n = time.len();
-    assert_eq!(n, 137, "veteran_lung.csv should have 137 data rows, got {n}");
+    assert_eq!(
+        n, 137,
+        "veteran_lung.csv should have 137 data rows, got {n}"
+    );
     assert!(
         event.iter().any(|&v| v == 1.0) && event.iter().any(|&v| v == 0.0),
         "both events and censoring must be present"
@@ -211,7 +220,8 @@ fn gam_weibull_survival_out_of_sample_quality_on_veteran_lung() {
             ])
         })
         .collect();
-    let data = encode_recordswith_inferred_schema(headers, rows).expect("encode veteran train data");
+    let data =
+        encode_recordswith_inferred_schema(headers, rows).expect("encode veteran train data");
 
     let cfg = FitConfig {
         survival_likelihood: "weibull".to_string(),
@@ -476,7 +486,10 @@ fn gam_weibull_survival_out_of_sample_quality_on_veteran_lung_on_real_data() {
         age.push(fields[7].trim().parse::<f64>().expect("parse age"));
     }
     let n = time.len();
-    assert_eq!(n, 137, "veteran_lung.csv should have 137 data rows, got {n}");
+    assert_eq!(
+        n, 137,
+        "veteran_lung.csv should have 137 data rows, got {n}"
+    );
 
     // ---- deterministic train/test split: every 4th row (0-indexed) is TEST,
     // the rest TRAIN. Identical numeric rows in the same order go to both
@@ -656,7 +669,10 @@ fn gam_weibull_survival_out_of_sample_quality_on_veteran_lung_on_real_data() {
         .iter()
         .map(|&i| {
             let m = r_median[i];
-            assert!(m > 0.0 && m.is_finite(), "survreg median time non-positive: {m}");
+            assert!(
+                m > 0.0 && m.is_finite(),
+                "survreg median time non-positive: {m}"
+            );
             m.ln()
         })
         .collect();

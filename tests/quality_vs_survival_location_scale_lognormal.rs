@@ -323,7 +323,11 @@ fn gam_lognormal_location_scale_aft_smooth_matches_survreg() {
 /// test-length covariate can ride along as a column of the train-length
 /// reference data.frame. Only the first `v.len()` entries are read back in R.
 fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
-    assert!(v.len() <= len, "pad target {len} shorter than source {}", v.len());
+    assert!(
+        v.len() <= len,
+        "pad target {len} shorter than source {}",
+        v.len()
+    );
     let fill = v.last().copied().unwrap_or(0.0);
     let mut out = v.to_vec();
     out.resize(len, fill);
@@ -356,8 +360,7 @@ fn erfc(x: f64) -> f64 {
                         + t * (-0.18628806
                             + t * (0.27886807
                                 + t * (-1.13520398
-                                    + t * (1.48851587
-                                        + t * (-0.82215223 + t * 0.17087277)))))))))
+                                    + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))))
             .exp();
     if x >= 0.0 { tau } else { 2.0 - tau }
 }
@@ -423,8 +426,10 @@ fn gam_lognormal_location_scale_aft_smooth_matches_survreg_on_real_data() {
     init_parallelism();
 
     // ---- load the Veterans' lung-cancer dataset (time, status, karno, age) ---
-    const VETERAN_CSV: &str =
-        concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/veteran_lung.csv");
+    const VETERAN_CSV: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/bench/datasets/veteran_lung.csv"
+    );
     let ds = load_csvwith_inferred_schema(Path::new(VETERAN_CSV)).expect("load veteran_lung.csv");
     let col = ds.column_map();
     let time_idx = col["time"];
@@ -513,8 +518,9 @@ fn gam_lognormal_location_scale_aft_smooth_matches_survreg_on_real_data() {
             probe_grid[[i, c]] = ds.values[[src_row, c]];
         }
     }
-    let ls_design = build_term_collection_design(probe_grid.view(), &fit.fit.resolved_log_sigmaspec)
-        .expect("rebuild log-sigma design");
+    let ls_design =
+        build_term_collection_design(probe_grid.view(), &fit.fit.resolved_log_sigmaspec)
+            .expect("rebuild log-sigma design");
     let gam_eta_ls: Vec<f64> = ls_design.design.apply(&beta_log_sigma).to_vec();
     assert!(
         gam_eta_ls.iter().all(|&v| (v - gam_eta_ls[0]).abs() < 1e-9),
@@ -566,8 +572,15 @@ fn gam_lognormal_location_scale_aft_smooth_matches_survreg_on_real_data() {
     );
     let ref_mu_test = r.vector("test_mu");
     let ref_sigma = r.scalar("sigma");
-    assert_eq!(ref_mu_test.len(), test_rows.len(), "survreg lp length mismatch");
-    assert!(ref_sigma > 0.0, "survreg returned non-positive scale: {ref_sigma}");
+    assert_eq!(
+        ref_mu_test.len(),
+        test_rows.len(),
+        "survreg lp length mismatch"
+    );
+    assert!(
+        ref_sigma > 0.0,
+        "survreg returned non-positive scale: {ref_sigma}"
+    );
 
     // ---- intercept-only NULL model fit on TRAIN (no covariates) --------------
     // The objective floor: a lognormal with a constant location + scale, ignoring

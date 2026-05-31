@@ -331,8 +331,8 @@ fn gam_poisson_log_recovers_truth_on_real_data() {
         family: Some("poisson".to_string()),
         ..FitConfig::default()
     };
-    let result =
-        fit_from_formula("numvisit ~ s(age) + linear(badh)", &train_ds, &cfg).expect("gam poisson fit");
+    let result = fit_from_formula("numvisit ~ s(age) + linear(badh)", &train_ds, &cfg)
+        .expect("gam poisson fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for the Poisson(log) family");
     };

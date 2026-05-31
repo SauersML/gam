@@ -123,8 +123,16 @@ fn erfc(x: f64) -> f64 {
 /// where both event times are equal are not comparable and are skipped. Plain
 /// O(n²) Rust — exact, no dependency.
 fn concordance_index(time: &[f64], event: &[f64], risk: &[f64]) -> f64 {
-    assert_eq!(time.len(), event.len(), "concordance time/event length mismatch");
-    assert_eq!(time.len(), risk.len(), "concordance time/risk length mismatch");
+    assert_eq!(
+        time.len(),
+        event.len(),
+        "concordance time/event length mismatch"
+    );
+    assert_eq!(
+        time.len(),
+        risk.len(),
+        "concordance time/risk length mismatch"
+    );
     let n = time.len();
     let mut concordant = 0.0_f64;
     let mut comparable = 0.0_f64;
@@ -300,9 +308,7 @@ fn gam_marginal_slope_heldout_concordance_matches_or_beats_lifelines_coxph() {
     ef_sorted.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
     let cum_sorted: Vec<f64> = ef_sorted.iter().map(|&e| gam_cum_at(e)).collect();
     let mono_eps = 1e-9;
-    let monotone_decreasing = cum_sorted
-        .windows(2)
-        .all(|w| w[1] <= w[0] + mono_eps);
+    let monotone_decreasing = cum_sorted.windows(2).all(|w| w[1] <= w[0] + mono_eps);
 
     // ---- baseline-to-beat: lifelines CoxPH on the SAME split --------------
     // Fit on the train rows, score the test rows with the partial-hazard linear

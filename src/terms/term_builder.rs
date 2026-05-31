@@ -1044,7 +1044,7 @@ fn bspline_boundary_declares_periodic_axis(options: &BTreeMap<String, String>) -
 /// Unrecognised inputs pass through unchanged so the dispatch can produce its
 /// usual "unsupported smooth type" error, preserving the existing diagnostic
 /// surface for genuine typos.
-fn canonicalize_smooth_type(raw: &str) -> &str {
+pub(crate) fn canonicalize_smooth_type(raw: &str) -> &str {
     match raw {
         // Thin-plate spline. mgcv `bs="tp"` is the default thin-plate
         // regression spline — exact semantic equivalent of gamfit's `"tps"`.
@@ -1056,6 +1056,64 @@ fn canonicalize_smooth_type(raw: &str) -> &str {
         "gp" => "matern",
         other => other,
     }
+}
+
+/// Does the smooth request a periodic/cyclic axis via its options?
+///
+/// Mirrors the boundary-condition reading used by the periodic-aware dispatch
+/// branches. Factored out so the type resolver and `build_smooth_basis` agree
+/// on a single notion of "periodic requested".
+pub(crate) fn smooth_options_declare_periodic(options: &BTreeMap<String, String>) -> bool {
+    options.contains_key("periodic")
+        || options.contains_key("cyclic")
+        || options
+            .get("boundary")
+            .or_else(|| options.get("bc"))
+            .map(|boundary| {
+                boundary.to_ascii_lowercase().contains("periodic")
+                    || boundary.to_ascii_lowercase().contains("cyclic")
+            })
+            .unwrap_or(false)
+}
+
+/// Resolve the canonical engine-internal smooth-type name for a term.
+///
+/// Reads the user-facing `type=`/`bs=` selector and collapses mgcv-compatible
+/// aliases (`tp`→`tps`, `gp`→`matern`) via [`canonicalize_smooth_type`], or
+/// derives the default from the smooth kind/arity when no selector is given.
+/// This is the single source of truth for the dispatch in
+/// [`build_smooth_basis`]; other call sites (e.g. predictor-specific basis
+/// policy) use it so the classification never drifts from the dispatch.
+pub(crate) fn resolve_smooth_type_name(
+    kind: SmoothKind,
+    n_cols: usize,
+    options: &BTreeMap<String, String>,
+) -> String {
+    options
+        .get("type")
+        .or_else(|| options.get("bs"))
+        .map(|s| canonicalize_smooth_type(&s.to_ascii_lowercase()).to_string())
+        .unwrap_or_else(|| match kind {
+            SmoothKind::Te | SmoothKind::Ti => "tensor".to_string(),
+            SmoothKind::S if n_cols == 1 => "bspline".to_string(),
+            // Mixed periodic Euclidean radial kernels are not separable on the
+            // cylinder. Use a tensor product with a cyclic margin so s(theta,h)
+            // honors seam continuity while preserving the formula-level s(...).
+            SmoothKind::S if smooth_options_declare_periodic(options) => "tensor".to_string(),
+            SmoothKind::S => "tps".to_string(),
+        })
+}
+
+/// Does this canonical smooth type size its basis through the generous spatial
+/// center heuristic ([`crate::terms::basis::default_num_centers`])?
+///
+/// Only the radial spatial bases (thin-plate, Matérn/GP, Duchon) route their
+/// default basis dimension through `plan_spatial_basis(.., Default, ..)`. The
+/// B-spline, cyclic, tensor, and factor-smooth bases use their own modest
+/// knot-based defaults, so they are unaffected by — and must not be perturbed
+/// by — secondary-predictor basis-parsimony adjustments (#501).
+pub(crate) fn smooth_type_uses_spatial_center_heuristic(canonical_type: &str) -> bool {
+    matches!(canonical_type, "tps" | "matern" | "duchon")
 }
 
 pub fn build_smooth_basis(
@@ -1132,37 +1190,7 @@ pub fn build_smooth_basis(
     }
 
     let smooth_double_penalty = option_bool(options, "double_penalty").unwrap_or(true);
-    let has_periodic_option = options.contains_key("periodic")
-        || options.contains_key("cyclic")
-        || options
-            .get("boundary")
-            .or_else(|| options.get("bc"))
-            .map(|boundary| {
-                boundary.to_ascii_lowercase().contains("periodic")
-                    || boundary.to_ascii_lowercase().contains("cyclic")
-            })
-            .unwrap_or(false);
-    // Read the raw user-facing smooth selector (`type=`/`bs=`) and collapse
-    // the mgcv-compatible aliases that have an exact gamfit equivalent (`tp` →
-    // `tps`, `gp` → `matern`) to their canonical names via the single source
-    // of truth in `canonicalize_smooth_type`. Aliases without an exact
-    // semantic match (e.g. `cs`, `ad`) are intentionally left unmapped so they
-    // reach the unsupported-type diagnostic. The match arms below see only
-    // canonical names — adding the next alias never requires touching the
-    // dispatch.
-    let type_opt = options
-        .get("type")
-        .or_else(|| options.get("bs"))
-        .map(|s| canonicalize_smooth_type(&s.to_ascii_lowercase()).to_string())
-        .unwrap_or_else(|| match kind {
-            SmoothKind::Te | SmoothKind::Ti => "tensor".to_string(),
-            SmoothKind::S if cols.len() == 1 => "bspline".to_string(),
-            // Mixed periodic Euclidean radial kernels are not separable on the
-            // cylinder. Use a tensor product with a cyclic margin so s(theta,h)
-            // honors seam continuity while preserving the formula-level s(...).
-            SmoothKind::S if has_periodic_option => "tensor".to_string(),
-            SmoothKind::S => "tps".to_string(),
-        });
+    let type_opt = resolve_smooth_type_name(kind, cols.len(), options);
 
     if matches!(type_opt.as_str(), "fs" | "sz" | "re") {
         validate_known_options(
@@ -1443,6 +1471,7 @@ pub fn build_smooth_basis(
                 "thinplate",
                 options,
                 &[
+                    SECONDARY_CENTER_CAP_OPTION,
                     "type",
                     "bs",
                     "by",
@@ -1472,7 +1501,11 @@ pub fn build_smooth_basis(
                 policy,
             )
             .map_err(|e| e.to_string())?;
-            let centers = parse_countwith_basis_alias(options, "centers", plan.centers)?;
+            let centers = parse_countwith_basis_alias(
+                options,
+                "centers",
+                cap_default_spatial_centers(options, plan.centers),
+            )?;
             let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
                 spatial_center_strategy_for_dimension(centers, cols.len())
             } else {
@@ -1608,6 +1641,7 @@ pub fn build_smooth_basis(
                 "matern",
                 options,
                 &[
+                    SECONDARY_CENTER_CAP_OPTION,
                     "type",
                     "bs",
                     "by",
@@ -1638,7 +1672,11 @@ pub fn build_smooth_basis(
                 policy,
             )
             .map_err(|e| e.to_string())?;
-            let centers = parse_countwith_basis_alias(options, "centers", plan.centers)?;
+            let centers = parse_countwith_basis_alias(
+                options,
+                "centers",
+                cap_default_spatial_centers(options, plan.centers),
+            )?;
             let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
                 spatial_center_strategy_for_dimension(centers, cols.len())
             } else {
@@ -1686,6 +1724,7 @@ pub fn build_smooth_basis(
                 "duchon",
                 options,
                 &[
+                    SECONDARY_CENTER_CAP_OPTION,
                     "type",
                     "bs",
                     "by",
@@ -1768,7 +1807,11 @@ pub fn build_smooth_basis(
             )
             .map_err(|e| e.to_string())?;
             let centers_explicit = has_explicit_countwith_basis_alias(options, "centers");
-            let requested_centers = parse_countwith_basis_alias(options, "centers", plan.centers)?;
+            let requested_centers = parse_countwith_basis_alias(
+                options,
+                "centers",
+                cap_default_spatial_centers(options, plan.centers),
+            )?;
             let polynomial_cols = match nullspace_order {
                 DuchonNullspaceOrder::Zero => 1,
                 DuchonNullspaceOrder::Linear => cols.len() + 1,
@@ -2316,6 +2359,31 @@ pub fn validate_known_options(
     Ok(())
 }
 
+/// Private (engine-injected) option that caps the *default* spatial center
+/// count for a secondary (distributional) predictor's smooth — see
+/// `solver::workflow::apply_secondary_predictor_basis_parsimony` and #501.
+///
+/// It is deliberately NOT one of the user-facing count aliases recognised by
+/// [`has_explicit_countwith_basis_alias`], so it never flips the spatial basis
+/// onto the explicit (hard) center-placement strategy: the cap lowers the
+/// *default* count while the `Auto` strategy is retained, so the count is still
+/// softly reduced when the data can't support it.
+pub(crate) const SECONDARY_CENTER_CAP_OPTION: &str = "__secondary_center_cap";
+
+/// Apply the secondary-predictor center cap to a *default* spatial center
+/// count. A no-op when the cap option is absent (the common case) or when the
+/// user supplied an explicit count (then `default_count` is ignored downstream
+/// by [`parse_countwith_basis_alias`] anyway).
+pub(crate) fn cap_default_spatial_centers(
+    options: &BTreeMap<String, String>,
+    default_count: usize,
+) -> usize {
+    match option_usize(options, SECONDARY_CENTER_CAP_OPTION) {
+        Some(cap) => default_count.min(cap),
+        None => default_count,
+    }
+}
+
 pub fn parse_countwith_basis_alias(
     options: &BTreeMap<String, String>,
     primarykey: &str,
@@ -2340,7 +2408,7 @@ pub fn parse_countwith_basis_alias(
     Ok(primary.or(basis_dim).unwrap_or(default_count))
 }
 
-fn has_explicit_countwith_basis_alias(
+pub(crate) fn has_explicit_countwith_basis_alias(
     options: &BTreeMap<String, String>,
     primarykey: &str,
 ) -> bool {

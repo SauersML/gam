@@ -615,7 +615,11 @@ fn gam_nuts_binomial_logit_recovers_truth_and_is_calibrated_on_real_data() {
     )
     .expect("gam NUTS sampling");
     assert_eq!(nuts.samples.ncols(), p, "posterior coeff dim mismatch");
-    assert!(nuts.rhat < 1.1, "gam NUTS did not converge: rhat={:.4}", nuts.rhat);
+    assert!(
+        nuts.rhat < 1.1,
+        "gam NUTS did not converge: rhat={:.4}",
+        nuts.rhat
+    );
 
     // Posterior-mean predicted probability on the held-out rows: average the
     // inverse-logit of η = X_test β over all draws (posterior predictive mean of

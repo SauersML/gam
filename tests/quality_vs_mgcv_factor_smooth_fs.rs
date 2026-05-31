@@ -290,8 +290,7 @@ fn gam_factor_smooth_fs_recovers_truth() {
 //     mgcv_test_rmse * 1.10. mgcv is the mature baseline to match-or-beat, not
 //     an output to replicate.
 
-const SLEEPSTUDY_CSV: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/sleepstudy.csv");
+const SLEEPSTUDY_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/sleepstudy.csv");
 
 /// Coefficient of determination of `pred` vs observed `truth`, relative to the
 /// mean predictor: `1 - SS_res/SS_tot`. R^2 = 1 perfect, 0 = grand-mean, < 0

@@ -247,8 +247,8 @@ fn gam_tensor_baseline_stratified_heldout_concordance() {
             ])
         })
         .collect();
-    let ds =
-        encode_recordswith_inferred_schema(headers, train_rows).expect("encode heart_failure train frame");
+    let ds = encode_recordswith_inferred_schema(headers, train_rows)
+        .expect("encode heart_failure train frame");
     let col = ds.column_map();
     let age_idx = col["age"];
     let ef_idx = col["ejection_fraction"];

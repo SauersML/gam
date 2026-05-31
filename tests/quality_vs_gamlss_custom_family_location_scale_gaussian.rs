@@ -36,10 +36,10 @@ use gam::custom_family::{
     BlockwiseFitOptions, ParameterBlockSpec, PenaltyMatrix, fit_custom_family,
 };
 use gam::families::gamlss::GaussianLocationScaleFamily;
+use gam::load_csvwith_inferred_schema;
 use gam::matrix::DesignMatrix;
 use gam::resource::ResourcePolicy;
 use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
-use gam::load_csvwith_inferred_schema;
 use ndarray::{Array1, Array2};
 use std::path::Path;
 

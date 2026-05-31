@@ -3479,6 +3479,19 @@ pub fn survival_marginal_slope_vector_eta(
         .map_err(|err| format!("survival marginal-slope vector eta: {err}"))
 }
 
+/// Splice `at row {row}` between the reason prefix and the `:` details
+/// separator so that errors from the scalar `row_primary_closed_form*`
+/// kernels (which are intentionally row-agnostic) match the canonical
+/// `<reason> at row N: <details>` shape that downstream consumers match on.
+fn with_row_context(err: String, row: usize) -> String {
+    if let Some(colon) = err.find(':') {
+        let (head, tail) = err.split_at(colon);
+        format!("{head} at row {row}{tail}")
+    } else {
+        format!("{err} at row {row}")
+    }
+}
+
 pub fn survival_marginal_slope_vector_neglog(
     q0: f64,
     q1: f64,
@@ -4367,7 +4380,8 @@ impl SurvivalMarginalSlopeFamily {
                 self.event[row],
                 self.derivative_guard,
                 probit_scale,
-            );
+            )
+            .map_err(|err| with_row_context(err, row));
         }
         if logslope_eta.len() != self.n {
             return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
@@ -4394,6 +4408,7 @@ impl SurvivalMarginalSlopeFamily {
             self.derivative_guard,
             probit_scale,
         )
+        .map_err(|err| with_row_context(err, row))
     }
 
     fn ensure_scalar_flex_exact_score_geometry(&self, context: &str) -> Result<(), String> {
@@ -14421,8 +14436,8 @@ impl SurvivalMarginalSlopeFamily {
             for b in 0..p_marginal {
                 let dk0 = eg.basis_d2[[0, li]] * dh0 * mr[b];
                 let dk1 = xg.basis_d2[[0, li]] * dh1 * mr[b];
-                let dkd = xg.basis_d3[[0, li]] * dh1 * dr * mr[b]
-                    + xg.basis_d2[[0, li]] * ddr * mr[b];
+                let dkd =
+                    xg.basis_d3[[0, li]] * dh1 * dr * mr[b] + xg.basis_d2[[0, li]] * ddr * mr[b];
                 let v = f_pi[0] * dk0 + f_pi[1] * dk1 + f_pi[2] * dkd;
                 acc[[slices.time.start + ci, slices.marginal.start + b]] += v;
                 acc[[slices.marginal.start + b, slices.time.start + ci]] += v;
@@ -21689,6 +21704,34 @@ mod tests {
     use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};
     use ndarray::array;
+
+    /// `with_row_context` must splice `at row N` between the reason prefix and
+    /// the `:` details separator so a scalar-kernel error reshapes into the
+    /// canonical `<reason> at row N: <details>` that downstream consumers
+    /// pattern-match on — and must degrade gracefully (append, not corrupt)
+    /// when the error carries no `:` separator at all.
+    #[test]
+    fn with_row_context_matches_canonical_row_tag_shape() {
+        // Canonical reason:detail kernel error -> tag spliced before the colon.
+        assert_eq!(
+            with_row_context(
+                "survival marginal-slope monotonicity violated: qd1=-0.5".to_string(),
+                7,
+            ),
+            "survival marginal-slope monotonicity violated at row 7: qd1=-0.5",
+        );
+        // Only the FIRST colon is the reason/detail boundary; later colons in
+        // the details (e.g. a nested key:value) must be left untouched.
+        assert_eq!(
+            with_row_context("reason: a=1: b=2".to_string(), 3),
+            "reason at row 3: a=1: b=2",
+        );
+        // No colon -> append the tag rather than dropping or mangling it.
+        assert_eq!(
+            with_row_context("bare error with no separator".to_string(), 42),
+            "bare error with no separator at row 42",
+        );
+    }
 
     /// Pin the survival cross-block W metric to the survival row Hessian
     /// formula `u2_eta1 = (1-d)·w·k2(-η, w·(1-d)) + d·w` rather than the

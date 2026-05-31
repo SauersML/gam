@@ -31,7 +31,11 @@ impl BlockCountMismatch {
     /// `"FooFamily expects 2 blocks, got 1"` (plural) or
     /// `"BarFamily expects 1 block, got 0"` (singular when `expected == 1`).
     pub fn message(&self) -> String {
-        let unit = if self.expected == 1 { "block" } else { "blocks" };
+        let unit = if self.expected == 1 {
+            "block"
+        } else {
+            "blocks"
+        };
         format!(
             "{} expects {} {unit}, got {}",
             self.family, self.expected, self.got

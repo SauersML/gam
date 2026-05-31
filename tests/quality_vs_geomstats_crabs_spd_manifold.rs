@@ -96,7 +96,10 @@ fn unflat(v: &Array1<f64>) -> Array2<f64> {
 /// matrices.
 fn sample_covariance(rows: &[[f64; P]]) -> Array2<f64> {
     let n = rows.len();
-    assert!(n > P, "need n > p for a full-rank covariance (got n={n}, p={P})");
+    assert!(
+        n > P,
+        "need n > p for a full-rank covariance (got n={n}, p={P})"
+    );
     let mut mean = [0.0_f64; P];
     for r in rows {
         for k in 0..P {
@@ -217,7 +220,12 @@ fn crabs_group_covariances_match_geomstats_spd_geometry() {
         })
         .collect();
     for (g, rs) in groups.iter().enumerate() {
-        assert_eq!(rs.len(), 50, "group {g} should hold 50 crabs, has {}", rs.len());
+        assert_eq!(
+            rs.len(),
+            50,
+            "group {g} should hold 50 crabs, has {}",
+            rs.len()
+        );
     }
     let covs: Vec<Array2<f64>> = groups.iter().map(|rs| sample_covariance(rs)).collect();
     let flat_covs: Vec<Array1<f64>> = covs.iter().map(flat).collect();
@@ -272,7 +280,9 @@ fn crabs_group_covariances_match_geomstats_spd_geometry() {
         tangent_mean += &spd.log_map(p_mean.view(), x.view()).expect("gam log_map");
     }
     tangent_mean /= M as f64;
-    let g_at_mean = spd.metric_tensor(p_mean.view()).expect("gam metric_tensor at mean");
+    let g_at_mean = spd
+        .metric_tensor(p_mean.view())
+        .expect("gam metric_tensor at mean");
     let grad_sq = tangent_mean.dot(&g_at_mean.dot(&tangent_mean));
     let grad_norm = grad_sq.max(0.0).sqrt();
     assert!(
@@ -548,10 +558,8 @@ fn crabs_group_covariances_match_geomstats_spd_geometry_on_real_data() {
         }
     }
     let meas_names = ["FL", "RW", "CL", "CW", "BD"];
-    let mut cols: Vec<Column<'_>> = vec![
-        Column::new("gid", &gid),
-        Column::new("is_train", &is_train),
-    ];
+    let mut cols: Vec<Column<'_>> =
+        vec![Column::new("gid", &gid), Column::new("is_train", &is_train)];
     for (k, name) in meas_names.iter().enumerate() {
         cols.push(Column::new(name, &meas_cols[k]));
     }
@@ -594,7 +602,11 @@ emit("acc", [correct / M])
     let r = run_python(&cols, &body);
     let ref_dist = r.vector("dist");
     let gs_acc = r.scalar("acc");
-    assert_eq!(ref_dist.len(), M * M, "geomstats held-out distance matrix size");
+    assert_eq!(
+        ref_dist.len(),
+        M * M,
+        "geomstats held-out distance matrix size"
+    );
 
     let dist_err = max_abs_diff(&gam_dist, ref_dist);
 

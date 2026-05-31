@@ -73,10 +73,7 @@ use gam::{
 /// would make the comparison ill-defined, so we require the caller to pass
 /// probabilities.
 fn ks_distance_to_uniform(samples: &[f64]) -> f64 {
-    assert!(
-        !samples.is_empty(),
-        "KS distance needs a non-empty sample"
-    );
+    assert!(!samples.is_empty(), "KS distance needs a non-empty sample");
     assert!(
         samples.iter().all(|&u| (0.0..=1.0).contains(&u)),
         "KS-vs-uniform inputs must be probabilities in [0, 1]"

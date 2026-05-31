@@ -486,7 +486,9 @@ fn gam_continuation_ratio_matches_vgam_sratio_on_real_data() {
     // NA price and load as NaN); standardize the two weather covariates so the
     // shared linear slopes are on a comparable scale for both engines.
     let usable: Vec<usize> = (0..n_all)
-        .filter(|&i| price_all[i].is_finite() && s_temp_all[i].is_finite() && h_temp_all[i].is_finite())
+        .filter(|&i| {
+            price_all[i].is_finite() && s_temp_all[i].is_finite() && h_temp_all[i].is_finite()
+        })
         .collect();
     let n = usable.len();
     assert!(n > 30, "expected >30 priced vintages, got {n}");
@@ -733,8 +735,14 @@ fn gam_continuation_ratio_matches_vgam_sratio_on_real_data() {
 
     // Context only (NOT a pass criterion): closeness of gam's held-out class
     // probabilities to VGAM's.
-    let gam_flat: Vec<f64> = gam_test_probs.iter().flat_map(|p| p.iter().copied()).collect();
-    let ref_flat: Vec<f64> = ref_test_probs.iter().flat_map(|p| p.iter().copied()).collect();
+    let gam_flat: Vec<f64> = gam_test_probs
+        .iter()
+        .flat_map(|p| p.iter().copied())
+        .collect();
+    let ref_flat: Vec<f64> = ref_test_probs
+        .iter()
+        .flat_map(|p| p.iter().copied())
+        .collect();
     let probs_rel_vs_ref = relative_l2(&gam_flat, &ref_flat);
     let probs_rmse_vs_ref = rmse(&gam_flat, &ref_flat);
 

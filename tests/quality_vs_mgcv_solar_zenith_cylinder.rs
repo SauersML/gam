@@ -185,8 +185,7 @@ fn gam_solar_zenith_cylinder_predicts_heldout_and_closes_seam() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let formula =
-        "sza ~ te(month_angle, tst_hours, boundary=['periodic','clamped'], period=[2*pi, None], k=8)";
+    let formula = "sza ~ te(month_angle, tst_hours, boundary=['periodic','clamped'], period=[2*pi, None], k=8)";
     let result = fit_from_formula(formula, &ds, &cfg).expect("gam cylinder fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for the solar-zenith cylinder smooth");

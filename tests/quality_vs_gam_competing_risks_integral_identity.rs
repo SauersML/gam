@@ -318,7 +318,10 @@ emit("cif_d", out)
 // gam's `assemble_competing_risks_cif` supplies, so this targets the same code
 // path as the synthetic arm.
 
-const VETERAN_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/veteran_lung.csv");
+const VETERAN_CSV: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/bench/datasets/veteran_lung.csv"
+);
 
 // CIF horizons (days) inside the well-observed support: veteran event times run
 // 1..999 (median 73), with the at-risk set still substantial through ~1 year,
@@ -486,13 +489,21 @@ fn cause_cumulative_hazard_real(
     );
     let cov_beta = beta.slice(ndarray::s![fit.time_base_ncols..]).to_owned();
     let eta = design.design.apply(&cov_beta);
-    assert_eq!(eta.len(), n_eval, "covariate eta length mismatch ({cause_label})");
+    assert_eq!(
+        eta.len(),
+        n_eval,
+        "covariate eta length mismatch ({cause_label})"
+    );
 
     let mut h = Array2::<f64>::zeros((n_eval, grid.len()));
     for i in 0..n_eval {
         let mult = eta[i].exp();
         for (j, &t) in grid.iter().enumerate() {
-            let h0 = if t <= 0.0 { 0.0 } else { (t / scale).powf(shape) };
+            let h0 = if t <= 0.0 {
+                0.0
+            } else {
+                (t / scale).powf(shape)
+            };
             h[[i, j]] = h0 * mult;
         }
     }
@@ -710,14 +721,28 @@ emit("cif1", out)
     // gam: subject-specific CIF predictions.
     let gam_pred = |j: usize| gam_subject_cif(j);
     let gam_brier = brier_over_grid_real(
-        1.0, &grid, &scored, &test_times, &test_event, &g_at_grid, &g_at_event, &gam_pred,
+        1.0,
+        &grid,
+        &scored,
+        &test_times,
+        &test_event,
+        &g_at_grid,
+        &g_at_event,
+        &gam_pred,
     );
 
     // Aalen-Johansen baseline: marginal CIF broadcast to every test subject.
     let aj_grid = aj_cif1.to_vec();
     let aj_pred = |j: usize| -> Vec<f64> { vec![aj_grid[j]; n_test] };
     let aj_brier = brier_over_grid_real(
-        1.0, &grid, &scored, &test_times, &test_event, &g_at_grid, &g_at_event, &aj_pred,
+        1.0,
+        &grid,
+        &scored,
+        &test_times,
+        &test_event,
+        &g_at_grid,
+        &g_at_event,
+        &aj_pred,
     );
 
     // Trivial all-zero predictor: anchors the absolute bar.
@@ -726,7 +751,14 @@ emit("cif1", out)
         vec![0.0; n_test]
     };
     let null_brier = brier_over_grid_real(
-        1.0, &grid, &scored, &test_times, &test_event, &g_at_grid, &g_at_event, &zero_pred,
+        1.0,
+        &grid,
+        &scored,
+        &test_times,
+        &test_event,
+        &g_at_grid,
+        &g_at_event,
+        &zero_pred,
     );
 
     eprintln!(

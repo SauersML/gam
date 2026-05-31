@@ -298,9 +298,9 @@ fn apply_duchon(
         };
     }
     if let Some(s_val) = descriptor.get("s").or_else(|| descriptor.get("power")) {
-        let s = s_val.as_f64().ok_or_else(|| {
-            format!("smooths[{symbol:?}].s (spectral power) must be a number")
-        })?;
+        let s = s_val
+            .as_f64()
+            .ok_or_else(|| format!("smooths[{symbol:?}].s (spectral power) must be a number"))?;
         if !s.is_finite() || s < 0.0 {
             return Err(format!(
                 "smooths[{symbol:?}].s (spectral power) must be a non-negative finite value, got {s}"

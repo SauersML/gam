@@ -370,9 +370,7 @@ pub(super) fn detect_logit_instability(
     // misclassifies well-behaved Beta fits as separated and forces a spurious
     // inner-solve retreat at every smoothing-parameter seed (issue #499).
     // Gate strictly on the Binomial response so only binary GLMs are screened.
-    if !matches!(response, ResponseFamily::Binomial)
-        || link != LinkFunction::Logit
-        || firth_active
+    if !matches!(response, ResponseFamily::Binomial) || link != LinkFunction::Logit || firth_active
     {
         return false;
     }

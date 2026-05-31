@@ -125,9 +125,7 @@ fn poincare_geodesic_is_a_correct_metric() {
         clamp_into_ball(&mut b, dim);
 
         // ---- gam vs EXACT CLOSED-FORM TRUTH (primary accuracy claim) -------
-        let gam_d: Vec<f64> = (0..N_PAIRS)
-            .map(|p| gam_dist(&a, &b, dim, p, p))
-            .collect();
+        let gam_d: Vec<f64> = (0..N_PAIRS).map(|p| gam_dist(&a, &b, dim, p, p)).collect();
         let truth_d: Vec<f64> = (0..N_PAIRS)
             .map(|p| closed_form_distance(point(&a, dim, p), point(&b, dim, p), CURVATURE))
             .collect();

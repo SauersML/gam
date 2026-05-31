@@ -398,10 +398,7 @@ fn gam_logistic_1d_shape_matches_pygam_on_logit_scale_on_real_data() {
             Column::new("pc1", &train_pc1),
             Column::new("y", &train_y),
             Column::new("test_pc1", &pad_to(&test_pc1, train_pc1.len())),
-            Column::new(
-                "test_n",
-                &vec![test_pc1.len() as f64; train_pc1.len()],
-            ),
+            Column::new("test_n", &vec![test_pc1.len() as f64; train_pc1.len()]),
         ],
         r#"
 from pygam import LogisticGAM, s

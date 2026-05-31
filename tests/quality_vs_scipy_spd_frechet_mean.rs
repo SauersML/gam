@@ -329,7 +329,10 @@ const REAL_ITERS: usize = 200; // fixed-point iterations (gam and reference shar
 /// matrix safely SPD for both engines' Cholesky/eigendecompositions.
 fn group_covariance_flat(meas: &[Vec<f64>; SPD_DIM], rows: &[usize]) -> Array1<f64> {
     let m = rows.len() as f64;
-    assert!(m > SPD_DIM as f64, "need more rows than dims for an SPD covariance");
+    assert!(
+        m > SPD_DIM as f64,
+        "need more rows than dims for an SPD covariance"
+    );
     let mut mean = [0.0f64; SPD_DIM];
     for d in 0..SPD_DIM {
         let s: f64 = rows.iter().map(|&r| meas[d][r]).sum();
@@ -359,7 +362,11 @@ fn group_covariance_flat(meas: &[Vec<f64>; SPD_DIM], rows: &[usize]) -> Array1<f
 /// Karcher-mean fixed point of `samples` (flat `SPD_DIM*SPD_DIM` vectors) at base
 /// point `init`, using gam's `exp_map`/`log_map`. Dimension-parameterized twin
 /// of the synthetic `gam_frechet_mean` so the synthetic arm stays untouched.
-fn gam_frechet_mean_dim(spd: &SpdManifold, samples: &[Array1<f64>], init: &Array1<f64>) -> Array1<f64> {
+fn gam_frechet_mean_dim(
+    spd: &SpdManifold,
+    samples: &[Array1<f64>],
+    init: &Array1<f64>,
+) -> Array1<f64> {
     let dim2 = SPD_DIM * SPD_DIM;
     let mut p = init.clone();
     for _ in 0..REAL_ITERS {
@@ -369,7 +376,9 @@ fn gam_frechet_mean_dim(spd: &SpdManifold, samples: &[Array1<f64>], init: &Array
             acc += &lg;
         }
         acc /= samples.len() as f64;
-        p = spd.exp_map(p.view(), acc.view()).expect("gam exp_map (real)");
+        p = spd
+            .exp_map(p.view(), acc.view())
+            .expect("gam exp_map (real)");
     }
     p
 }
@@ -386,7 +395,10 @@ fn gam_sq_dist_any(spd: &SpdManifold, p: ArrayView1<f64>, x: ArrayView1<f64>) ->
 
 /// Held-out dispersion `V_test(P) = (1/G) Σ_g d²(P, C_test_g)` via gam.
 fn gam_dispersion_any(spd: &SpdManifold, p: ArrayView1<f64>, samples: &[Array1<f64>]) -> f64 {
-    let s: f64 = samples.iter().map(|x| gam_sq_dist_any(spd, p, x.view())).sum();
+    let s: f64 = samples
+        .iter()
+        .map(|x| gam_sq_dist_any(spd, p, x.view()))
+        .sum();
     s / samples.len() as f64
 }
 
@@ -415,9 +427,8 @@ fn spd_frechet_mean_is_the_riemannian_center_of_mass_on_real_data() {
     let sex_idx = col["sex"];
     let sp_code: Vec<f64> = ds.values.column(sp_idx).to_vec();
     let sex_code: Vec<f64> = ds.values.column(sex_idx).to_vec();
-    let group_of = |r: usize| -> usize {
-        (sp_code[r].round() as usize) * 2 + (sex_code[r].round() as usize)
-    };
+    let group_of =
+        |r: usize| -> usize { (sp_code[r].round() as usize) * 2 + (sex_code[r].round() as usize) };
 
     // ---- deterministic train/test split: even row-index in a group = train,
     // odd = test. Done per group so both halves of every group are populated.
@@ -462,12 +473,16 @@ fn spd_frechet_mean_is_the_riemannian_center_of_mass_on_real_data() {
     let dim2 = SPD_DIM * SPD_DIM;
     let mut tangent_mean = Array1::<f64>::zeros(dim2);
     for x in &train_cov {
-        tangent_mean += &spd.log_map(p.view(), x.view()).expect("gam log_map (real grad)");
+        tangent_mean += &spd
+            .log_map(p.view(), x.view())
+            .expect("gam log_map (real grad)");
     }
     tangent_mean /= N_GROUPS as f64;
     let grad_sq = gam_sq_dist_any(&spd, p.view(), p.view()); // 0 baseline; see below
     assert!(grad_sq.abs() < 1e-12, "self-distance must be zero");
-    let g_at_p = spd.metric_tensor(p.view()).expect("gam metric_tensor (real grad)");
+    let g_at_p = spd
+        .metric_tensor(p.view())
+        .expect("gam metric_tensor (real grad)");
     let grad_norm = tangent_mean.dot(&g_at_p.dot(&tangent_mean)).sqrt();
     assert!(
         grad_norm < 1e-6,
@@ -593,7 +608,11 @@ emit("v_test_ref", [v_test_ref])
 
     let r = run_python(&cols, &body);
     let scipy_mean = r.vector("mean");
-    assert_eq!(scipy_mean.len(), dim2, "reference real mean length mismatch");
+    assert_eq!(
+        scipy_mean.len(),
+        dim2,
+        "reference real mean length mismatch"
+    );
     let v_test_ref = r.scalar("v_test_ref");
 
     // Context-only: closeness of the two centers (never asserted).

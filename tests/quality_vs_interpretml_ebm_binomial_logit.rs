@@ -202,7 +202,11 @@ fn gam_binomial_logit_heldout_accuracy_beats_ebm() {
         .expect("rebuild design at held-out points");
     let gam_eta: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
     let gam_prob_te: Vec<f64> = gam_eta.iter().map(|&e| inv_logit(e)).collect();
-    assert_eq!(gam_prob_te.len(), nte, "gam test-probability length mismatch");
+    assert_eq!(
+        gam_prob_te.len(),
+        nte,
+        "gam test-probability length mismatch"
+    );
 
     // ---- InterpretML EBM baseline: SAME train, SAME test ------------------
     // ExplainableBoostingClassifier is the ML-world interpretable additive
@@ -236,7 +240,11 @@ emit("prob_tr", ebm.predict_proba(Xtr)[:, 1])
         ),
     );
     let ebm_prob_te = py.vector("prob_te");
-    assert_eq!(ebm_prob_te.len(), nte, "EBM test-probability length mismatch");
+    assert_eq!(
+        ebm_prob_te.len(),
+        nte,
+        "EBM test-probability length mismatch"
+    );
 
     // ---- OBJECTIVE held-out metrics ---------------------------------------
     let gam_auc = auc(&gam_prob_te, &y_te);

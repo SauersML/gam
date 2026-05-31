@@ -290,7 +290,12 @@ fn gam_multinomial_softmax_recovers_true_simplex() {
 
 /// Held-out multiclass accuracy: fraction of test rows whose argmax-probability
 /// class equals the true class code.
-fn multiclass_accuracy(probs_flat_colmajor: &[f64], n: usize, k: usize, truth_code: &[usize]) -> f64 {
+fn multiclass_accuracy(
+    probs_flat_colmajor: &[f64],
+    n: usize,
+    k: usize,
+    truth_code: &[usize],
+) -> f64 {
     assert_eq!(probs_flat_colmajor.len(), n * k, "accuracy: prob length");
     assert_eq!(truth_code.len(), n, "accuracy: truth length");
     let mut correct = 0usize;
@@ -313,7 +318,12 @@ fn multiclass_accuracy(probs_flat_colmajor: &[f64], n: usize, k: usize, truth_co
 
 /// Multiclass log-loss (mean negative log-likelihood of the true class), with a
 /// tiny clamp so a degenerate zero probability does not produce -inf.
-fn multiclass_logloss(probs_flat_colmajor: &[f64], n: usize, k: usize, truth_code: &[usize]) -> f64 {
+fn multiclass_logloss(
+    probs_flat_colmajor: &[f64],
+    n: usize,
+    k: usize,
+    truth_code: &[usize],
+) -> f64 {
     assert_eq!(probs_flat_colmajor.len(), n * k, "logloss: prob length");
     let mut s = 0.0;
     for i in 0..n {
@@ -371,7 +381,11 @@ fn gam_multinomial_softmax_recovers_true_simplex_on_real_data() {
             }
         };
         // Drop incomplete rows (penguins has a few NA morphometrics).
-        match (parse(rec.get(i_bill)), parse(rec.get(i_flip)), parse(rec.get(i_mass))) {
+        match (
+            parse(rec.get(i_bill)),
+            parse(rec.get(i_flip)),
+            parse(rec.get(i_mass)),
+        ) {
             (Some(b), Some(f), Some(m)) if !sp.is_empty() => {
                 species.push(sp);
                 bill.push(b);
@@ -430,7 +444,11 @@ fn gam_multinomial_softmax_recovers_true_simplex_on_real_data() {
         1e-8,
     )
     .expect("gam multinomial fit on penguins train");
-    assert_eq!(model.class_levels.len(), K, "gam should recover K=3 species");
+    assert_eq!(
+        model.class_levels.len(),
+        K,
+        "gam should recover K=3 species"
+    );
 
     let gam_test_probs =
         predict_multinomial_formula(&model, &test_ds).expect("gam predict penguins test");

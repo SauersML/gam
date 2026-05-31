@@ -142,10 +142,7 @@ fn gam_te_3d_recovers_nonadditive_surface() {
     // ---- OBJECTIVE METRIC: truth recovery ---------------------------------
     // `y` is the noise-free truth f(x1,x2,x3) itself, so RMSE(fit, y) is the
     // surface-reconstruction error of each engine.
-    let signal_range = y
-        .iter()
-        .copied()
-        .fold(f64::NEG_INFINITY, f64::max)
+    let signal_range = y.iter().copied().fold(f64::NEG_INFINITY, f64::max)
         - y.iter().copied().fold(f64::INFINITY, f64::min);
     let gam_rmse = rmse(&gam_fitted, &y);
     let mgcv_rmse = rmse(mgcv_fitted, &y);

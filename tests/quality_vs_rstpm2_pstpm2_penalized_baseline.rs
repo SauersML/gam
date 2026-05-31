@@ -69,8 +69,16 @@ use std::path::Path;
 /// comparable pairs are dropped (no observed ordering). Returns the fraction of
 /// comparable pairs that are concordant — 0.5 is random ordering, 1.0 perfect.
 fn harrell_c(time: &[f64], event: &[f64], risk: &[f64]) -> f64 {
-    assert_eq!(time.len(), event.len(), "harrell_c time/event length mismatch");
-    assert_eq!(time.len(), risk.len(), "harrell_c time/risk length mismatch");
+    assert_eq!(
+        time.len(),
+        event.len(),
+        "harrell_c time/event length mismatch"
+    );
+    assert_eq!(
+        time.len(),
+        risk.len(),
+        "harrell_c time/risk length mismatch"
+    );
     let n = time.len();
     let mut concordant = 0.0_f64;
     let mut comparable = 0.0_f64;

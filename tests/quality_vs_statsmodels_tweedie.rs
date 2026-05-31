@@ -46,10 +46,10 @@ use gam::{
     load_csvwith_inferred_schema,
 };
 use ndarray::{Array1, Array2};
-use std::path::Path;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Gamma, Poisson, Uniform};
+use std::path::Path;
 
 /// Draw one compound Poisson-Gamma (Tweedie) variate with mean `mu`, power
 /// `p ∈ (1,2)`, dispersion `phi`. This is the exact exponential-dispersion
@@ -380,7 +380,10 @@ fn gam_tweedie_matches_statsmodels_power_variance_on_real_data() {
     // The response must actually be the overdispersed zero-inflated count that
     // makes Tweedie the right family.
     let zeros = numvisit.iter().filter(|&&v| v == 0.0).count();
-    assert!(zeros > 200, "badhealth numvisit should be zero-inflated; got {zeros}");
+    assert!(
+        zeros > 200,
+        "badhealth numvisit should be zero-inflated; got {zeros}"
+    );
 
     // ---- deterministic train/test split: every 5th row held out -----------
     let is_test = |i: usize| i % 5 == 0;
@@ -511,7 +514,11 @@ emit("mu_test", np.asarray(mu_te, dtype=float))
     );
     let r = run_python(&cols, &body);
     let sm_test_mu = r.vector("mu_test");
-    assert_eq!(sm_test_mu.len(), n_te, "statsmodels held-out mu length mismatch");
+    assert_eq!(
+        sm_test_mu.len(),
+        n_te,
+        "statsmodels held-out mu length mismatch"
+    );
 
     // ---- objective metrics on the HELD-OUT rows ---------------------------
     let gam_dev = tweedie_mean_deviance(&gam_test_mu, &test_nv, p);
@@ -559,7 +566,11 @@ emit("mu_test", np.asarray(mu_te, dtype=float))
 /// test-length basis column can ride along inside a train-length reference
 /// data.frame. Only the first `v.len()` entries are read back inside Python.
 fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
-    assert!(v.len() <= len, "pad target {len} shorter than source {}", v.len());
+    assert!(
+        v.len() <= len,
+        "pad target {len} shorter than source {}",
+        v.len()
+    );
     let fill = v.last().copied().unwrap_or(0.0);
     let mut out = v.to_vec();
     out.resize(len, fill);

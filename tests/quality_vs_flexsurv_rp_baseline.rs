@@ -327,9 +327,7 @@ fn gam_rp_baseline_holdout_concordance_matches_or_beats_flexsurvspline_on_bone()
     // emit, for each held-out test subject, the log-cumulative-hazard at a fixed
     // reference time as its PH relative-risk score (under PH the ordering of log Λ
     // across subjects is the ordering of the linear predictor, at any fixed t).
-    let train_flag: Vec<f64> = (0..n)
-        .map(|i| if i % 2 == 0 { 1.0 } else { 0.0 })
-        .collect();
+    let train_flag: Vec<f64> = (0..n).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 }).collect();
     let ref_time = {
         // A reference time inside the observed range; the median observed time.
         let mut sorted = time.clone();
@@ -434,7 +432,10 @@ fn gam_rp_baseline_holdout_concordance_matches_or_beats_flexsurvspline_on_bone()
 // above. Split is fixed (even original-row index ⇒ train, odd ⇒ test) so gam
 // and flexsurv see byte-identical train and test subsets.
 
-const VETERAN_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/veteran_lung.csv");
+const VETERAN_CSV: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/bench/datasets/veteran_lung.csv"
+);
 
 #[test]
 fn gam_rp_baseline_holdout_concordance_matches_or_beats_flexsurvspline_on_bone_on_real_data() {
@@ -521,8 +522,7 @@ fn gam_rp_baseline_holdout_concordance_matches_or_beats_flexsurvspline_on_bone_o
             ])
         })
         .collect();
-    let ds =
-        encode_recordswith_inferred_schema(headers, rows).expect("encode veteran train frame");
+    let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode veteran train frame");
 
     // ---- fit gam on TRAIN: Royston-Parmar net-survival baseline + linear cov -
     let cfg = FitConfig {
@@ -578,9 +578,7 @@ fn gam_rp_baseline_holdout_concordance_matches_or_beats_flexsurvspline_on_bone_o
     let gam_beta_karno = cov_eta(1.0) - cov_eta(0.0);
 
     // ---- fit the SAME model with flexsurv on the SAME TRAIN rows, score TEST --
-    let train_flag: Vec<f64> = (0..n)
-        .map(|i| if i % 2 == 0 { 1.0 } else { 0.0 })
-        .collect();
+    let train_flag: Vec<f64> = (0..n).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 }).collect();
     let ref_time = {
         let mut sorted = time.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).expect("finite times"));

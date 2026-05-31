@@ -187,7 +187,10 @@ fn gam_gp_smooth_recovers_truth_and_predicts() {
     // (2) PREDICTIVE ACCURACY: held-out RMSE vs the observed noisy y, and R².
     let gam_pred_rmse = rmse(&gam_pred, &y_te);
     let y_te_mean: f64 = y_te.iter().sum::<f64>() / n_te as f64;
-    let ss_tot: f64 = y_te.iter().map(|&v| (v - y_te_mean) * (v - y_te_mean)).sum();
+    let ss_tot: f64 = y_te
+        .iter()
+        .map(|&v| (v - y_te_mean) * (v - y_te_mean))
+        .sum();
     let ss_res: f64 = y_te
         .iter()
         .zip(gam_pred.iter())
@@ -286,9 +289,7 @@ fn gam_gp_smooth_recovers_truth_and_predicts() {
     eprintln!(
         "truth-recovery RMSE: gam={gam_truth_rmse:.4} gpgp={gpgp_truth_rmse:.4} (signal range ≈ 4.4)"
     );
-    eprintln!(
-        "held-out: gam test RMSE={gam_pred_rmse:.4} (σ_noise=0.20), test R²={gam_r2:.4}"
-    );
+    eprintln!("held-out: gam test RMSE={gam_pred_rmse:.4} (σ_noise=0.20), test R²={gam_r2:.4}");
 
     // -----------------------------------------------------------------
     // OBJECTIVE assertions — principled, un-weakened.

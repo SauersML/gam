@@ -1782,6 +1782,25 @@ pub fn default_num_centers(n: usize, d: usize) -> usize {
     k.min(n).min(small_data_cap)
 }
 
+/// Conservative center count for a *secondary* (distributional) predictor's
+/// spatial smooth — e.g. the log-σ scale model in a Gaussian location-scale
+/// fit.
+///
+/// The mean is identified directly by the response, so it warrants the
+/// generous [`default_num_centers`] basis. A scale/shape predictor is
+/// identified only through (noisy) squared residuals: handing it a basis sized
+/// for the mean lets REML/LAML smoothing selection over-fit it, because where
+/// the fitted scale is driven small the *observed* information collapses and
+/// the determinant penalty stops holding the wiggle down (#501). This mirrors
+/// standard GAMLSS/mgcv practice of giving distribution parameters a modest
+/// default (mgcv's `k = 10` for a 1-D `s()`), grown gently with dimensionality
+/// and never exceeding the generous primary-predictor default.
+pub fn conservative_secondary_centers(n: usize, d: usize) -> usize {
+    const BASE_1D_CENTERS: usize = 10;
+    let modest = BASE_1D_CENTERS.saturating_mul(d.max(1));
+    default_num_centers(n, d).min(modest).max(1)
+}
+
 /// Resource-aware plan for a spatial smooth (Duchon / Matérn / TPS).
 ///
 /// Returned by [`plan_spatial_basis`]. Captures the resolved center count,
