@@ -5283,9 +5283,26 @@ fn materialize_survival<'a>(
             &policy,
             config.smooth_overrides.as_ref(),
         )?
-    } else if survival_mode == SurvivalLikelihoodMode::LocationScale {
-        termspec.clone()
     } else {
+        // No `noise_formula` ⇒ default to an empty log-σ spec for every
+        // survival likelihood (constant log-σ baseline owned by the family
+        // adapter). The previous `LocationScale`-only branch cloned the
+        // mean `termspec` here, which duplicated every threshold term onto
+        // the log-σ block. For a smooth `s(x)` on the mean that was
+        // structurally fatal: the canonical-gauge identifiability audit
+        // saw the log-σ block as exact-aliased to threshold and (per the
+        // descending priorities time=200 > threshold=150 > log_sigma=120,
+        // issue #366) attributed/dropped every log-σ column, leaving the
+        // solver's `ParameterBlockSpec` design at width 0 while the
+        // family kept the un-audited `x_log_sigma` at the smooth's width.
+        // `SurvivalLocationScaleFamily::exact_newton_joint_gradient_evaluation`
+        // then errored "joint gradient length mismatch for block 2: got
+        // <smooth width>, expected 0" on every REML startup seed (#512).
+        // The empty default routes through the same
+        // `infer_non_intercept_start_design`/`design_column_tail`
+        // contract every other mode uses (yielding a 0-column
+        // `x_log_sigma` that matches the spec), so the family and spec
+        // agree by construction.
         TermCollectionSpec {
             linear_terms: vec![],
             random_effect_terms: vec![],
