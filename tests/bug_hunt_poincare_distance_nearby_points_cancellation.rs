@@ -60,9 +60,9 @@ fn poincare_distance_accurate_for_nearby_points() {
 #[test]
 fn poincare_distance_exact_for_distant_and_high_curvature_pairs() {
     let cases = [
-        (0.1_f64, 0.8_f64, -1.0_f64),   // far apart, c = -1
-        (-0.6_f64, 0.7_f64, -1.0_f64),  // straddling the origin
-        (0.05_f64, 0.2_f64, -8.0_f64),  // high curvature, nearby
+        (0.1_f64, 0.8_f64, -1.0_f64),          // far apart, c = -1
+        (-0.6_f64, 0.7_f64, -1.0_f64),         // straddling the origin
+        (0.05_f64, 0.2_f64, -8.0_f64),         // high curvature, nearby
         (0.05_f64, 0.05_f64 + 1e-7, -8.0_f64), // high curvature, very nearby
     ];
     for (r1, r2, c) in cases {
