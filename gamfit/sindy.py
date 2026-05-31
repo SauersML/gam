@@ -4,12 +4,16 @@ Implements :class:`SINDyAtoms`, a thin Python orchestration layer over the
 Rust :func:`gamfit._rust.sindy_stlsq_solve_array` solver. The numerics
 (Sequential Thresholded Least Squares, SCAD / MCP local-quadratic
 re-weighting, BIC-based ``lam='auto'`` selection) live entirely in Rust per
-the project's no-math-in-Python rule. This module only:
+the project's no-math-in-Python rule. The candidate-library Θ builder
+(``gam::solver::sindy::sindy_library``) and the finite-difference derivative
+(``gam::solver::sindy::sindy_finite_difference``) also live in Rust. This
+module only:
 
-  * builds the library design matrix Θ from a trajectory and a list of
-    library term descriptors;
-  * computes ``dz/dt`` via centered finite differences when the user does
-    not supply derivatives;
+  * parses the user library spec and evaluates any **callable** custom terms
+    (genuinely Python-only glue), marshaling the ordered spec into Rust which
+    owns the built-in monomial/trig column math and naming;
+  * requests ``dz/dt`` via the Rust finite-difference kernel when the user
+    does not supply derivatives;
   * marshals (Θ, Ẋ) into Rust and unpacks the coefficient matrix;
   * pretty-prints the learned ODE system.
 
@@ -28,8 +32,7 @@ Example
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Callable, Iterable, Sequence
+from typing import Sequence
 
 import numpy as np
 
@@ -39,120 +42,59 @@ __all__ = ["SINDyAtoms"]
 
 
 # ---------------------------------------------------------------------------
-# Library-term descriptors
+# Library-term spec marshaling
 # ---------------------------------------------------------------------------
 
-@dataclass(frozen=True)
-class _LibraryTerm:
-    """One column of the library design matrix Θ."""
+# Built-in family tokens recognised by the Rust library builder
+# (`gam::solver::sindy::sindy_library`). Aliases collapse onto these.
+_BUILTIN_LIBRARY_TOKENS = {
+    "const": "const",
+    "id": "id",
+    "linear": "id",
+    "square": "square",
+    "cube": "cube",
+    "product": "product",
+    "sin": "sin",
+    "cos": "cos",
+}
 
-    name: str
-    fn: Callable[[np.ndarray], np.ndarray]
-    """``fn(z) -> (n,)`` where ``z`` has shape ``(n, state_dim)``."""
 
-
-def _expand_library(
+def _build_library_spec(
     library: Sequence,
-    state_dim: int,
-    state_names: Sequence[str],
-) -> list[_LibraryTerm]:
-    """Expand the user-supplied library spec into one term per output column.
+    z: np.ndarray,
+) -> list[tuple[str, np.ndarray | None, str | None]]:
+    """Marshal the user library spec into the ordered Rust-FFI spec list.
 
-    Strings select canonical SINDy library families; callables become a single
-    user-named column. The expansion is deterministic and matches the Brunton
-    2016 conventions:
-
-    * ``'const'``           → ``1``
-    * ``'id'`` / ``'linear'`` → ``z_i`` for each state dim ``i``
-    * ``'square'``          → ``z_i**2`` for each ``i``
-    * ``'cube'``            → ``z_i**3`` for each ``i``
-    * ``'product'``         → ``z_i z_j`` for all unique pairs ``i < j``
-    * ``'sin'``             → ``sin(z_i)`` for each ``i``
-    * ``'cos'``             → ``cos(z_i)`` for each ``i``
+    Returns one ``(token, custom_column, custom_name)`` tuple per library entry,
+    in spec order. Built-in string families (``'const'``, ``'id'``/``'linear'``,
+    ``'square'``, ``'cube'``, ``'product'``, ``'sin'``, ``'cos'``) carry just a
+    token; the actual column math (powers, pairwise products, trig) and column
+    naming live in Rust. **Callable** terms are genuinely Python-only glue: each
+    is evaluated here and its ``(n,)`` column passed through as a ``'custom'``
+    entry so Rust can splice it into Θ at the right position.
     """
-    terms: list[_LibraryTerm] = []
+    spec: list[tuple[str, np.ndarray | None, str | None]] = []
     for entry in library:
         if callable(entry):
             name = getattr(entry, "__name__", "user_term")
-            terms.append(
-                _LibraryTerm(
-                    name=name,
-                    fn=lambda z, f=entry: np.asarray(f(z), dtype=np.float64).reshape(-1),
-                )
-            )
+            column = np.asarray(entry(z), dtype=np.float64).reshape(-1)
+            spec.append(("custom", column, str(name)))
             continue
         if not isinstance(entry, str):
             raise TypeError(
                 f"SINDyAtoms: library entries must be strings or callables; got {type(entry).__name__}"
             )
-        key = entry.strip().lower()
-        if key == "const":
-            terms.append(
-                _LibraryTerm(name="1", fn=lambda z: np.ones(z.shape[0], dtype=np.float64))
-            )
-        elif key in ("id", "linear"):
-            for i in range(state_dim):
-                terms.append(
-                    _LibraryTerm(
-                        name=state_names[i],
-                        fn=lambda z, i=i: z[:, i].astype(np.float64, copy=False),
-                    )
-                )
-        elif key == "square":
-            for i in range(state_dim):
-                terms.append(
-                    _LibraryTerm(
-                        name=f"{state_names[i]}^2",
-                        fn=lambda z, i=i: (z[:, i] * z[:, i]).astype(np.float64, copy=False),
-                    )
-                )
-        elif key == "cube":
-            for i in range(state_dim):
-                terms.append(
-                    _LibraryTerm(
-                        name=f"{state_names[i]}^3",
-                        fn=lambda z, i=i: (z[:, i] ** 3).astype(np.float64, copy=False),
-                    )
-                )
-        elif key == "product":
-            for i in range(state_dim):
-                for j in range(i, state_dim):
-                    if i == j:
-                        continue  # squares belong to the 'square' family
-                    name_i, name_j = state_names[i], state_names[j]
-                    terms.append(
-                        _LibraryTerm(
-                            name=f"{name_i}{name_j}",
-                            fn=lambda z, i=i, j=j: (z[:, i] * z[:, j]).astype(
-                                np.float64, copy=False
-                            ),
-                        )
-                    )
-        elif key == "sin":
-            for i in range(state_dim):
-                terms.append(
-                    _LibraryTerm(
-                        name=f"sin({state_names[i]})",
-                        fn=lambda z, i=i: np.sin(z[:, i]).astype(np.float64, copy=False),
-                    )
-                )
-        elif key == "cos":
-            for i in range(state_dim):
-                terms.append(
-                    _LibraryTerm(
-                        name=f"cos({state_names[i]})",
-                        fn=lambda z, i=i: np.cos(z[:, i]).astype(np.float64, copy=False),
-                    )
-                )
-        else:
+        token = _BUILTIN_LIBRARY_TOKENS.get(entry.strip().lower())
+        if token is None:
             raise ValueError(
                 f"SINDyAtoms: unknown library term {entry!r}. Built-ins are "
                 "'const', 'id', 'square', 'cube', 'product', 'sin', 'cos'; "
                 "pass a callable for custom features."
             )
-    if not terms:
+        spec.append((token, None, None))
+    if not spec:
         raise ValueError("SINDyAtoms: library expanded to zero terms")
-    return terms
+    return spec
 
 
 def _format_three_sig_figs(value: float) -> str:
@@ -349,16 +291,17 @@ class SINDyAtoms:
                 f"SINDyAtoms.fit: need at least 4 trajectory rows, got {n}"
             )
 
+        rust = rust_module()
         if dz_dt is None:
             if not (np.isfinite(dt) and dt > 0):
                 raise ValueError(
                     f"SINDyAtoms.fit: dt must be a positive finite float when dz_dt is None, got {dt}"
                 )
-            # Centered differences, one-sided at endpoints. Keep all n rows.
-            dz = np.empty_like(z)
-            dz[1:-1, :] = (z[2:, :] - z[:-2, :]) / (2.0 * dt)
-            dz[0, :] = (z[1, :] - z[0, :]) / dt
-            dz[-1, :] = (z[-1, :] - z[-2, :]) / dt
+            # Centered differences, one-sided at endpoints (Rust core). Keep all
+            # n rows. The standard SINDy differentiation step.
+            dz = np.asarray(
+                rust.sindy_finite_difference_array(z, float(dt)), dtype=np.float64
+            )
         else:
             dz = np.asarray(dz_dt, dtype=np.float64)
             if dz.shape != z.shape:
@@ -367,10 +310,11 @@ class SINDyAtoms:
                 )
 
         names = self._resolve_state_names(state_names)
-        terms = _expand_library(self._library_spec, self._state_dim, names)
-        theta_design = np.column_stack([term.fn(z) for term in terms]).astype(
-            np.float64, copy=False
-        )
+        # Built-in monomial/trig library columns + naming are owned by Rust;
+        # only user callable terms are evaluated in Python and spliced in.
+        library_spec = _build_library_spec(self._library_spec, z)
+        theta_design, term_names = rust.sindy_library_array(z, list(names), library_spec)
+        theta_design = np.asarray(theta_design, dtype=np.float64)
         if theta_design.shape[0] != n:
             raise ValueError(
                 "SINDyAtoms.fit: library term produced wrong row count "
@@ -378,7 +322,6 @@ class SINDyAtoms:
             )
 
         tol = self._resolve_tol(dz)
-        rust = rust_module()
         coefs_kxp, rounds_used, converged, lam_used = rust.sindy_stlsq_solve_array(
             theta_design,
             dz,
@@ -393,7 +336,7 @@ class SINDyAtoms:
         # the rows and library terms on the columns, so transpose at the
         # marshaling boundary.
         self.theta = np.asarray(coefs_kxp, dtype=np.float64).T.copy()
-        self._term_names = [term.name for term in terms]
+        self._term_names = [str(name) for name in term_names]
         self._state_names = list(names)
         self._rounds_used = int(rounds_used)
         self._converged = bool(converged)

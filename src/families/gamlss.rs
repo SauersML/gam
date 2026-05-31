@@ -323,6 +323,163 @@ fn dense_locscale_block_designs_fromspecs<'a>(
     Ok((primary, log_sigma))
 }
 
+/// Materialize a single location-scale family's two cached block designs
+/// (`primary` = mu/threshold, plus `log_sigma`) into dense matrices, borrowing
+/// when the design is already dense and owning a policy-materialized copy
+/// otherwise. Every non-wiggle and wiggle location-scale family's
+/// `dense_block_designs` method is identical bar the accessed field and the
+/// diagnostic labels, so both bits are passed in.
+fn dense_locscale_block_designs_cached<'a>(
+    primary_design: Option<&'a DesignMatrix>,
+    log_sigma_design: Option<&'a DesignMatrix>,
+    family_name: &str,
+    short_family_name: &str,
+    primary_label: &str,
+    material_policy: &crate::resource::MaterializationPolicy,
+) -> Result<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>), String> {
+    let primary_design = primary_design.ok_or_else(|| {
+        format!("{family_name} exact path is missing {primary_label} design")
+    })?;
+    let log_sigma_design = log_sigma_design
+        .ok_or_else(|| format!("{family_name} exact path is missing log-sigma design"))?;
+    let primary = match primary_design.as_dense_ref() {
+        Some(d) => Cow::Borrowed(d),
+        None => Cow::Owned(
+            primary_design
+                .try_to_dense_with_policy(material_policy, "gamlss dense_locscale_block_designs")
+                .map_err(|e| {
+                    format!("{short_family_name} dense_block_designs {primary_label}: {e}")
+                })?
+                .as_ref()
+                .clone(),
+        ),
+    };
+    let log_sigma = match log_sigma_design.as_dense_ref() {
+        Some(d) => Cow::Borrowed(d),
+        None => Cow::Owned(
+            log_sigma_design
+                .try_to_dense_with_policy(material_policy, "gamlss dense_locscale_block_designs")
+                .map_err(|e| {
+                    format!("{short_family_name} dense_block_designs log_sigma: {e}")
+                })?
+                .as_ref()
+                .clone(),
+        ),
+    };
+    Ok((primary, log_sigma))
+}
+
+/// One resolved ψ-direction for a two-axis (primary + log-σ) location-scale
+/// family. Holds the neutral pieces shared by every such family's
+/// `exact_newton_joint_psi_direction`; each family wraps these into its own
+/// named struct (mu/threshold field renames only).
+struct LocScalePsiDirectionParts {
+    block_idx: usize,
+    local_idx: usize,
+    primary_psi: PsiDesignMap,
+    log_sigma_psi: PsiDesignMap,
+    primary_z: Array1<f64>,
+    log_sigma_z: Array1<f64>,
+}
+
+/// Shared body of every two-axis location-scale family's
+/// `exact_newton_joint_psi_direction`. Walks the flat ψ-derivative list,
+/// resolves the ψ-design map for the selected block (primary = block 0, log-σ
+/// = block 1; the off-axis map is the matching `Zero`), and applies each
+/// block's β via `forward_mul`. The wiggle block (and any other index) yields
+/// `None`, matching the per-family methods. The only per-family variation —
+/// the column counts, the two block betas, the block-list length (2 or 3) and
+/// the diagnostic label prefix — is passed in; the math is identical across
+/// Gaussian/Binomial × wiggle/non-wiggle.
+#[allow(clippy::too_many_arguments)]
+fn locscale_joint_psi_direction_parts(
+    block_states: &[ParameterBlockState],
+    derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+    psi_index: usize,
+    n: usize,
+    p_primary: usize,
+    p_log_sigma: usize,
+    primary_block_idx: usize,
+    log_sigma_block_idx: usize,
+    expected_blocks: usize,
+    family_name: &str,
+    primary_label: &str,
+    policy: &crate::resource::ResourcePolicy,
+) -> Result<Option<LocScalePsiDirectionParts>, String> {
+    if block_states.len() != expected_blocks || derivative_blocks.len() != expected_blocks {
+        return Err(GamlssError::DimensionMismatch {
+            reason: format!(
+                "{family_name} joint psi direction expects {expected_blocks} blocks and {expected_blocks} derivative block lists, got {} and {}",
+                block_states.len(),
+                derivative_blocks.len()
+            ),
+        }
+        .into());
+    }
+    let beta_primary = &block_states[primary_block_idx].beta;
+    let beta_log_sigma = &block_states[log_sigma_block_idx].beta;
+
+    let mut global = 0usize;
+    for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
+        for (local_idx, deriv) in block_derivs.iter().enumerate() {
+            if global == psi_index {
+                let primary_psi;
+                let log_sigma_psi;
+                let primary_z;
+                let log_sigma_z;
+                if block_idx == primary_block_idx {
+                    primary_psi = resolve_custom_family_x_psi_map(
+                        deriv,
+                        n,
+                        p_primary,
+                        0..n,
+                        &format!("{family_name} {primary_label}"),
+                        policy,
+                    )?;
+                    primary_z = primary_psi.forward_mul(beta_primary.view()).map_err(|e| {
+                        format!("{family_name} {primary_label} forward_mul: {e}")
+                    })?;
+                    log_sigma_psi = PsiDesignMap::Zero {
+                        nrows: n,
+                        ncols: p_log_sigma,
+                    };
+                    log_sigma_z = Array1::<f64>::zeros(n);
+                } else if block_idx == log_sigma_block_idx {
+                    log_sigma_psi = resolve_custom_family_x_psi_map(
+                        deriv,
+                        n,
+                        p_log_sigma,
+                        0..n,
+                        &format!("{family_name} log-sigma"),
+                        policy,
+                    )?;
+                    log_sigma_z =
+                        log_sigma_psi.forward_mul(beta_log_sigma.view()).map_err(|e| {
+                            format!("{family_name} log-sigma forward_mul: {e}")
+                        })?;
+                    primary_psi = PsiDesignMap::Zero {
+                        nrows: n,
+                        ncols: p_primary,
+                    };
+                    primary_z = Array1::<f64>::zeros(n);
+                } else {
+                    return Ok(None);
+                }
+                return Ok(Some(LocScalePsiDirectionParts {
+                    block_idx,
+                    local_idx,
+                    primary_psi,
+                    log_sigma_psi,
+                    primary_z,
+                    log_sigma_z,
+                }));
+            }
+            global += 1;
+        }
+    }
+    Ok(None)
+}
+
 /// Per-block dispatch for the second-derivative ψ design map used by every
 /// location-scale family's `exact_newton_joint_psisecond_design_drifts`
 /// method. The two large `match psi_a.block_idx` arms in those methods
@@ -7111,79 +7268,31 @@ impl GaussianLocationScaleFamily {
         x_ls: &Array2<f64>,
         policy: &crate::resource::ResourcePolicy,
     ) -> Result<Option<GaussianLocationScaleJointPsiDirection>, String> {
-        if block_states.len() != 2 || derivative_blocks.len() != 2 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "GaussianLocationScaleFamily joint psi direction expects 2 blocks and 2 derivative block lists, got {} and {}",
-                block_states.len(),
-                derivative_blocks.len()
-            ) }.into());
-        }
-        let n = self.y.len();
-        let pmu = xmu.ncols();
-        let p_ls = x_ls.ncols();
-        let betamu = &block_states[Self::BLOCK_MU].beta;
-        let beta_ls = &block_states[Self::BLOCK_LOG_SIGMA].beta;
-
-        let mut global = 0usize;
-        for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
-            for (local_idx, deriv) in block_derivs.iter().enumerate() {
-                if global == psi_index {
-                    let xmu_psi;
-                    let x_ls_psi;
-                    let zmu_psi;
-                    let z_ls_psi;
-                    match block_idx {
-                        Self::BLOCK_MU => {
-                            xmu_psi = resolve_custom_family_x_psi_map(
-                                deriv,
-                                n,
-                                pmu,
-                                0..n,
-                                "GaussianLocationScaleFamily mu",
-                                policy,
-                            )?;
-                            zmu_psi = xmu_psi.forward_mul(betamu.view()).map_err(|e| {
-                                format!("GaussianLocationScaleFamily mu forward_mul: {e}")
-                            })?;
-                            x_ls_psi = PsiDesignMap::Zero {
-                                nrows: n,
-                                ncols: p_ls,
-                            };
-                            z_ls_psi = Array1::<f64>::zeros(n);
-                        }
-                        Self::BLOCK_LOG_SIGMA => {
-                            x_ls_psi = resolve_custom_family_x_psi_map(
-                                deriv,
-                                n,
-                                p_ls,
-                                0..n,
-                                "GaussianLocationScaleFamily log-sigma",
-                                policy,
-                            )?;
-                            z_ls_psi = x_ls_psi.forward_mul(beta_ls.view()).map_err(|e| {
-                                format!("GaussianLocationScaleFamily log-sigma forward_mul: {e}")
-                            })?;
-                            xmu_psi = PsiDesignMap::Zero {
-                                nrows: n,
-                                ncols: pmu,
-                            };
-                            zmu_psi = Array1::<f64>::zeros(n);
-                        }
-                        _ => return Ok(None),
-                    }
-                    return Ok(Some(GaussianLocationScaleJointPsiDirection {
-                        block_idx,
-                        local_idx,
-                        zmu_psi,
-                        z_ls_psi,
-                        xmu_psi,
-                        x_ls_psi,
-                    }));
-                }
-                global += 1;
-            }
-        }
-        Ok(None)
+        let Some(parts) = locscale_joint_psi_direction_parts(
+            block_states,
+            derivative_blocks,
+            psi_index,
+            self.y.len(),
+            xmu.ncols(),
+            x_ls.ncols(),
+            Self::BLOCK_MU,
+            Self::BLOCK_LOG_SIGMA,
+            2,
+            "GaussianLocationScaleFamily",
+            "mu",
+            policy,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(GaussianLocationScaleJointPsiDirection {
+            block_idx: parts.block_idx,
+            local_idx: parts.local_idx,
+            zmu_psi: parts.primary_z,
+            z_ls_psi: parts.log_sigma_z,
+            xmu_psi: parts.primary_psi,
+            x_ls_psi: parts.log_sigma_psi,
+        }))
     }
 
     fn exact_newton_joint_psisecond_design_drifts(
@@ -9721,39 +9830,14 @@ impl GaussianLocationScaleWiggleFamily {
     }
 
     fn dense_block_designs(&self) -> Result<(Cow<'_, Array2<f64>>, Cow<'_, Array2<f64>>), String> {
-        let mu_design = self.mu_design.as_ref().ok_or_else(|| {
-            "GaussianLocationScaleWiggleFamily exact path is missing mu design".to_string()
-        })?;
-        let log_sigma_design = self.log_sigma_design.as_ref().ok_or_else(|| {
-            "GaussianLocationScaleWiggleFamily exact path is missing log-sigma design".to_string()
-        })?;
-        let xmu = match mu_design.as_dense_ref() {
-            Some(d) => Cow::Borrowed(d),
-            None => Cow::Owned(
-                mu_design
-                    .try_to_dense_with_policy(
-                        &self.policy.material_policy(),
-                        "GaussianLocationScaleWiggle dense_block_designs mu",
-                    )
-                    .map_err(|e| e.to_string())?
-                    .as_ref()
-                    .clone(),
-            ),
-        };
-        let x_ls = match log_sigma_design.as_dense_ref() {
-            Some(d) => Cow::Borrowed(d),
-            None => Cow::Owned(
-                log_sigma_design
-                    .try_to_dense_with_policy(
-                        &self.policy.material_policy(),
-                        "GaussianLocationScaleWiggle dense_block_designs log_sigma",
-                    )
-                    .map_err(|e| e.to_string())?
-                    .as_ref()
-                    .clone(),
-            ),
-        };
-        Ok((xmu, x_ls))
+        dense_locscale_block_designs_cached(
+            self.mu_design.as_ref(),
+            self.log_sigma_design.as_ref(),
+            "GaussianLocationScaleWiggleFamily",
+            "GaussianLocationScaleWiggle",
+            "mu",
+            &self.policy.material_policy(),
+        )
     }
     fn dense_block_designs_fromspecs<'a>(
         &self,
@@ -10031,82 +10115,31 @@ impl GaussianLocationScaleWiggleFamily {
         x_ls: &Array2<f64>,
         policy: &crate::resource::ResourcePolicy,
     ) -> Result<Option<GaussianLocationScaleJointPsiDirection>, String> {
-        if block_states.len() != 3 || derivative_blocks.len() != 3 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "GaussianLocationScaleWiggleFamily joint psi direction expects 3 blocks and 3 derivative block lists, got {} and {}",
-                block_states.len(),
-                derivative_blocks.len()
-            ) }.into());
-        }
-        let n = self.y.len();
-        let pmu = xmu.ncols();
-        let p_ls = x_ls.ncols();
-        let betamu = &block_states[Self::BLOCK_MU].beta;
-        let beta_ls = &block_states[Self::BLOCK_LOG_SIGMA].beta;
-
-        let mut global = 0usize;
-        for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
-            for (local_idx, deriv) in block_derivs.iter().enumerate() {
-                if global == psi_index {
-                    let xmu_psi;
-                    let x_ls_psi;
-                    let zmu_psi;
-                    let z_ls_psi;
-                    match block_idx {
-                        Self::BLOCK_MU => {
-                            xmu_psi = resolve_custom_family_x_psi_map(
-                                deriv,
-                                n,
-                                pmu,
-                                0..n,
-                                "GaussianLocationScaleWiggleFamily mu",
-                                policy,
-                            )?;
-                            zmu_psi = xmu_psi.forward_mul(betamu.view()).map_err(|e| {
-                                format!("GaussianLocationScaleWiggleFamily mu forward_mul: {e}")
-                            })?;
-                            x_ls_psi = PsiDesignMap::Zero {
-                                nrows: n,
-                                ncols: p_ls,
-                            };
-                            z_ls_psi = Array1::<f64>::zeros(n);
-                        }
-                        Self::BLOCK_LOG_SIGMA => {
-                            x_ls_psi = resolve_custom_family_x_psi_map(
-                                deriv,
-                                n,
-                                p_ls,
-                                0..n,
-                                "GaussianLocationScaleWiggleFamily log-sigma",
-                                policy,
-                            )?;
-                            z_ls_psi = x_ls_psi.forward_mul(beta_ls.view()).map_err(|e| {
-                                format!(
-                                    "GaussianLocationScaleWiggleFamily log-sigma forward_mul: {e}"
-                                )
-                            })?;
-                            xmu_psi = PsiDesignMap::Zero {
-                                nrows: n,
-                                ncols: pmu,
-                            };
-                            zmu_psi = Array1::<f64>::zeros(n);
-                        }
-                        Self::BLOCK_WIGGLE => return Ok(None),
-                        _ => return Ok(None),
-                    }
-                    return Ok(Some(GaussianLocationScaleJointPsiDirection {
-                        block_idx,
-                        local_idx,
-                        zmu_psi,
-                        z_ls_psi,
-                        xmu_psi,
-                        x_ls_psi,
-                    }));
-                }
-                global += 1;
-            }
-        }
-        Ok(None)
+        let Some(parts) = locscale_joint_psi_direction_parts(
+            block_states,
+            derivative_blocks,
+            psi_index,
+            self.y.len(),
+            xmu.ncols(),
+            x_ls.ncols(),
+            Self::BLOCK_MU,
+            Self::BLOCK_LOG_SIGMA,
+            3,
+            "GaussianLocationScaleWiggleFamily",
+            "mu",
+            policy,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(GaussianLocationScaleJointPsiDirection {
+            block_idx: parts.block_idx,
+            local_idx: parts.local_idx,
+            zmu_psi: parts.primary_z,
+            z_ls_psi: parts.log_sigma_z,
+            xmu_psi: parts.primary_psi,
+            x_ls_psi: parts.log_sigma_psi,
+        }))
     }
 
     fn exact_newton_joint_psisecond_design_drifts(
@@ -14866,39 +14899,14 @@ impl BinomialLocationScaleFamily {
     }
 
     fn dense_block_designs(&self) -> Result<(Cow<'_, Array2<f64>>, Cow<'_, Array2<f64>>), String> {
-        let threshold_design = self.threshold_design.as_ref().ok_or_else(|| {
-            "BinomialLocationScaleFamily exact path is missing threshold design".to_string()
-        })?;
-        let log_sigma_design = self.log_sigma_design.as_ref().ok_or_else(|| {
-            "BinomialLocationScaleFamily exact path is missing log-sigma design".to_string()
-        })?;
-        let xt = match threshold_design.as_dense_ref() {
-            Some(d) => Cow::Borrowed(d),
-            None => Cow::Owned(
-                threshold_design
-                    .try_to_dense_with_policy(
-                        &self.policy.material_policy(),
-                        "BinomialLocationScale dense_block_designs threshold",
-                    )
-                    .map_err(|e| e.to_string())?
-                    .as_ref()
-                    .clone(),
-            ),
-        };
-        let x_ls = match log_sigma_design.as_dense_ref() {
-            Some(d) => Cow::Borrowed(d),
-            None => Cow::Owned(
-                log_sigma_design
-                    .try_to_dense_with_policy(
-                        &self.policy.material_policy(),
-                        "BinomialLocationScale dense_block_designs log_sigma",
-                    )
-                    .map_err(|e| e.to_string())?
-                    .as_ref()
-                    .clone(),
-            ),
-        };
-        Ok((xt, x_ls))
+        dense_locscale_block_designs_cached(
+            self.threshold_design.as_ref(),
+            self.log_sigma_design.as_ref(),
+            "BinomialLocationScaleFamily",
+            "BinomialLocationScale",
+            "threshold",
+            &self.policy.material_policy(),
+        )
     }
 
     fn dense_block_designs_fromspecs<'a>(
@@ -15631,79 +15639,31 @@ impl BinomialLocationScaleFamily {
         x_ls: &Array2<f64>,
         policy: &crate::resource::ResourcePolicy,
     ) -> Result<Option<BinomialLocationScaleJointPsiDirection>, String> {
-        if block_states.len() != 2 || derivative_blocks.len() != 2 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialLocationScaleFamily joint psi direction expects 2 blocks and 2 derivative block lists, got {} and {}",
-                block_states.len(),
-                derivative_blocks.len()
-            ) }.into());
-        }
-        let n = self.y.len();
-        let pt = x_t.ncols();
-        let pls = x_ls.ncols();
-        let beta_t = &block_states[Self::BLOCK_T].beta;
-        let beta_ls = &block_states[Self::BLOCK_LOG_SIGMA].beta;
-
-        let mut global = 0usize;
-        for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
-            for (local_idx, deriv) in block_derivs.iter().enumerate() {
-                if global == psi_index {
-                    let x_t_psi;
-                    let x_ls_psi;
-                    let z_t_psi;
-                    let z_ls_psi;
-                    match block_idx {
-                        Self::BLOCK_T => {
-                            x_t_psi = resolve_custom_family_x_psi_map(
-                                deriv,
-                                n,
-                                pt,
-                                0..n,
-                                "BinomialLocationScaleFamily threshold",
-                                policy,
-                            )?;
-                            z_t_psi = x_t_psi.forward_mul(beta_t.view()).map_err(|e| {
-                                format!("BinomialLocationScaleFamily threshold forward_mul: {e}")
-                            })?;
-                            x_ls_psi = PsiDesignMap::Zero {
-                                nrows: n,
-                                ncols: pls,
-                            };
-                            z_ls_psi = Array1::<f64>::zeros(n);
-                        }
-                        Self::BLOCK_LOG_SIGMA => {
-                            x_ls_psi = resolve_custom_family_x_psi_map(
-                                deriv,
-                                n,
-                                pls,
-                                0..n,
-                                "BinomialLocationScaleFamily log-sigma",
-                                policy,
-                            )?;
-                            z_ls_psi = x_ls_psi.forward_mul(beta_ls.view()).map_err(|e| {
-                                format!("BinomialLocationScaleFamily log-sigma forward_mul: {e}")
-                            })?;
-                            x_t_psi = PsiDesignMap::Zero {
-                                nrows: n,
-                                ncols: pt,
-                            };
-                            z_t_psi = Array1::<f64>::zeros(n);
-                        }
-                        _ => return Ok(None),
-                    }
-                    return Ok(Some(BinomialLocationScaleJointPsiDirection {
-                        block_idx,
-                        local_idx,
-                        x_t_psi,
-                        x_ls_psi,
-                        z_t_psi,
-                        z_ls_psi,
-                    }));
-                }
-                global += 1;
-            }
-        }
-        Ok(None)
+        let Some(parts) = locscale_joint_psi_direction_parts(
+            block_states,
+            derivative_blocks,
+            psi_index,
+            self.y.len(),
+            x_t.ncols(),
+            x_ls.ncols(),
+            Self::BLOCK_T,
+            Self::BLOCK_LOG_SIGMA,
+            2,
+            "BinomialLocationScaleFamily",
+            "threshold",
+            policy,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(BinomialLocationScaleJointPsiDirection {
+            block_idx: parts.block_idx,
+            local_idx: parts.local_idx,
+            x_t_psi: parts.primary_psi,
+            x_ls_psi: parts.log_sigma_psi,
+            z_t_psi: parts.primary_z,
+            z_ls_psi: parts.log_sigma_z,
+        }))
     }
 
     fn exact_newton_joint_psisecond_design_drifts(
@@ -18405,37 +18365,14 @@ impl BinomialLocationScaleWiggleFamily {
     }
 
     fn dense_block_designs(&self) -> Result<(Cow<'_, Array2<f64>>, Cow<'_, Array2<f64>>), String> {
-        let td = self.threshold_design.as_ref().ok_or_else(|| {
-            "BinomialLocationScaleWiggleFamily exact path is missing threshold design".to_string()
-        })?;
-        let lsd = self.log_sigma_design.as_ref().ok_or_else(|| {
-            "BinomialLocationScaleWiggleFamily exact path is missing log-sigma design".to_string()
-        })?;
-        let xt = match td.as_dense_ref() {
-            Some(d) => Cow::Borrowed(d),
-            None => Cow::Owned(
-                td.try_to_dense_with_policy(
-                    &self.policy.material_policy(),
-                    "BinomialLocationScaleWiggle dense_block_designs threshold",
-                )
-                .map_err(|e| e.to_string())?
-                .as_ref()
-                .clone(),
-            ),
-        };
-        let xls = match lsd.as_dense_ref() {
-            Some(d) => Cow::Borrowed(d),
-            None => Cow::Owned(
-                lsd.try_to_dense_with_policy(
-                    &self.policy.material_policy(),
-                    "BinomialLocationScaleWiggle dense_block_designs log_sigma",
-                )
-                .map_err(|e| e.to_string())?
-                .as_ref()
-                .clone(),
-            ),
-        };
-        Ok((xt, xls))
+        dense_locscale_block_designs_cached(
+            self.threshold_design.as_ref(),
+            self.log_sigma_design.as_ref(),
+            "BinomialLocationScaleWiggleFamily",
+            "BinomialLocationScaleWiggle",
+            "threshold",
+            &self.policy.material_policy(),
+        )
     }
 
     fn dense_block_designs_fromspecs<'a>(
@@ -18560,83 +18497,31 @@ impl BinomialLocationScaleWiggleFamily {
         x_ls: &Array2<f64>,
         policy: &crate::resource::ResourcePolicy,
     ) -> Result<Option<BinomialLocationScaleJointPsiDirection>, String> {
-        if block_states.len() != 3 || derivative_blocks.len() != 3 {
-            return Err(GamlssError::DimensionMismatch { reason: format!(
-                "BinomialLocationScaleWiggleFamily joint psi direction expects 3 blocks and 3 derivative block lists, got {} and {}",
-                block_states.len(),
-                derivative_blocks.len()
-            ) }.into());
-        }
-        let n = self.y.len();
-        let pt = x_t.ncols();
-        let pls = x_ls.ncols();
-        let beta_t = &block_states[Self::BLOCK_T].beta;
-        let beta_ls = &block_states[Self::BLOCK_LOG_SIGMA].beta;
-        let mut global = 0usize;
-        for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
-            for (local_idx, deriv) in block_derivs.iter().enumerate() {
-                if global == psi_index {
-                    let x_t_psi;
-                    let x_ls_psi;
-                    let z_t_psi;
-                    let z_ls_psi;
-                    match block_idx {
-                        Self::BLOCK_T => {
-                            x_t_psi = resolve_custom_family_x_psi_map(
-                                deriv,
-                                n,
-                                pt,
-                                0..n,
-                                "BinomialLocationScaleWiggleFamily threshold",
-                                policy,
-                            )?;
-                            z_t_psi = x_t_psi.forward_mul(beta_t.view()).map_err(|e| {
-                                format!(
-                                    "BinomialLocationScaleWiggleFamily threshold forward_mul: {e}"
-                                )
-                            })?;
-                            x_ls_psi = PsiDesignMap::Zero {
-                                nrows: n,
-                                ncols: pls,
-                            };
-                            z_ls_psi = Array1::<f64>::zeros(n);
-                        }
-                        Self::BLOCK_LOG_SIGMA => {
-                            x_ls_psi = resolve_custom_family_x_psi_map(
-                                deriv,
-                                n,
-                                pls,
-                                0..n,
-                                "BinomialLocationScaleWiggleFamily log-sigma",
-                                policy,
-                            )?;
-                            z_ls_psi = x_ls_psi.forward_mul(beta_ls.view()).map_err(|e| {
-                                format!(
-                                    "BinomialLocationScaleWiggleFamily log-sigma forward_mul: {e}"
-                                )
-                            })?;
-                            x_t_psi = PsiDesignMap::Zero {
-                                nrows: n,
-                                ncols: pt,
-                            };
-                            z_t_psi = Array1::<f64>::zeros(n);
-                        }
-                        Self::BLOCK_WIGGLE => return Ok(None),
-                        _ => return Ok(None),
-                    }
-                    return Ok(Some(BinomialLocationScaleJointPsiDirection {
-                        block_idx,
-                        local_idx,
-                        z_t_psi,
-                        z_ls_psi,
-                        x_t_psi,
-                        x_ls_psi,
-                    }));
-                }
-                global += 1;
-            }
-        }
-        Ok(None)
+        let Some(parts) = locscale_joint_psi_direction_parts(
+            block_states,
+            derivative_blocks,
+            psi_index,
+            self.y.len(),
+            x_t.ncols(),
+            x_ls.ncols(),
+            Self::BLOCK_T,
+            Self::BLOCK_LOG_SIGMA,
+            3,
+            "BinomialLocationScaleWiggleFamily",
+            "threshold",
+            policy,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(BinomialLocationScaleJointPsiDirection {
+            block_idx: parts.block_idx,
+            local_idx: parts.local_idx,
+            z_t_psi: parts.primary_z,
+            z_ls_psi: parts.log_sigma_z,
+            x_t_psi: parts.primary_psi,
+            x_ls_psi: parts.log_sigma_psi,
+        }))
     }
 
     fn exact_newton_joint_psisecond_design_drifts(

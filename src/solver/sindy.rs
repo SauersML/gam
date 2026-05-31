@@ -268,6 +268,180 @@ fn ridge_diag_solve(
     Ok(sol)
 }
 
+/// One entry of an ordered SINDy library specification.
+///
+/// Built-in families expand to one or more columns evaluated entirely here in
+/// Rust (the Brunton 2016 monomial / trig basis). A [`SindyLibraryTerm::Custom`]
+/// carries a single pre-evaluated column supplied by the caller — this is the
+/// escape hatch for user Python callables, which cannot run in Rust. Column
+/// order in the assembled design matrix follows the order of this slice, with
+/// each built-in family expanding in its canonical per-state-dimension order.
+#[derive(Debug, Clone)]
+pub enum SindyLibraryTerm {
+    /// `1` — a single all-ones column.
+    Const,
+    /// `z_i` for each state dimension `i` (`'id'` / `'linear'`).
+    Identity,
+    /// `z_i²` for each state dimension `i`.
+    Square,
+    /// `z_i³` for each state dimension `i`.
+    Cube,
+    /// `z_i z_j` for every unique pair `i < j`.
+    Product,
+    /// `sin(z_i)` for each state dimension `i`.
+    Sin,
+    /// `cos(z_i)` for each state dimension `i`.
+    Cos,
+    /// A single caller-supplied column with its display name. Used for Python
+    /// callable library terms, which are evaluated on the Python side.
+    Custom { name: String, column: Array1<f64> },
+}
+
+/// Build the SINDy library design matrix `Θ` and its column names from a
+/// trajectory `z ∈ ℝ^{n × d}` and an ordered library specification.
+///
+/// This is the canonical implementation of the Brunton 2016 candidate-function
+/// library (monomials up to cubic, pairwise products, sine / cosine). It
+/// returns the design matrix together with one display name per column, in the
+/// exact order the columns appear — so downstream pretty-printing of the learned
+/// ODE system can label coefficients by reading the name list positionally.
+///
+/// * `z`: `(n, d)` trajectory, one row per sample, one column per state var.
+/// * `state_names`: `d` display names for the state variables (e.g. `["x","y"]`).
+/// * `terms`: ordered library spec; built-in families expand in canonical order
+///   and [`SindyLibraryTerm::Custom`] columns are spliced in at their position.
+pub fn sindy_library(
+    z: ArrayView2<'_, f64>,
+    state_names: &[String],
+    terms: &[SindyLibraryTerm],
+) -> Result<(Array2<f64>, Vec<String>), String> {
+    let (n, d) = z.dim();
+    if n == 0 || d == 0 {
+        return Err(format!(
+            "sindy_library requires a non-empty trajectory; got ({n}, {d})"
+        ));
+    }
+    if state_names.len() != d {
+        return Err(format!(
+            "sindy_library requires one state name per column; got {} names for {d} state dims",
+            state_names.len()
+        ));
+    }
+
+    // Each closure produces one (name, column) pair; collected in spec order so
+    // the assembled Θ column order matches the Python contract exactly.
+    let mut columns: Vec<Array1<f64>> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    let mut push = |name: String, col: Array1<f64>| {
+        names.push(name);
+        columns.push(col);
+    };
+
+    for term in terms {
+        match term {
+            SindyLibraryTerm::Const => {
+                push("1".to_string(), Array1::<f64>::ones(n));
+            }
+            SindyLibraryTerm::Identity => {
+                for i in 0..d {
+                    push(state_names[i].clone(), z.column(i).to_owned());
+                }
+            }
+            SindyLibraryTerm::Square => {
+                for i in 0..d {
+                    let zi = z.column(i);
+                    push(format!("{}^2", state_names[i]), &zi * &zi);
+                }
+            }
+            SindyLibraryTerm::Cube => {
+                for i in 0..d {
+                    let zi = z.column(i);
+                    push(format!("{}^3", state_names[i]), &(&zi * &zi) * &zi);
+                }
+            }
+            SindyLibraryTerm::Product => {
+                for i in 0..d {
+                    for j in (i + 1)..d {
+                        let col = &z.column(i) * &z.column(j);
+                        push(format!("{}{}", state_names[i], state_names[j]), col);
+                    }
+                }
+            }
+            SindyLibraryTerm::Sin => {
+                for i in 0..d {
+                    push(
+                        format!("sin({})", state_names[i]),
+                        z.column(i).mapv(f64::sin),
+                    );
+                }
+            }
+            SindyLibraryTerm::Cos => {
+                for i in 0..d {
+                    push(
+                        format!("cos({})", state_names[i]),
+                        z.column(i).mapv(f64::cos),
+                    );
+                }
+            }
+            SindyLibraryTerm::Custom { name, column } => {
+                if column.len() != n {
+                    return Err(format!(
+                        "sindy_library custom term {name:?} produced {} rows, expected {n}",
+                        column.len()
+                    ));
+                }
+                push(name.clone(), column.clone());
+            }
+        }
+    }
+
+    if columns.is_empty() {
+        return Err("sindy_library: spec expanded to zero terms".to_string());
+    }
+
+    let p = columns.len();
+    let mut theta = Array2::<f64>::zeros((n, p));
+    for (k, col) in columns.iter().enumerate() {
+        theta.column_mut(k).assign(col);
+    }
+    Ok((theta, names))
+}
+
+/// Estimate `dz/dt` from a trajectory by finite differences with spacing `dt`.
+///
+/// Centered second-order differences on the interior, one-sided first-order
+/// differences at the two endpoints — the standard SINDy differentiation step
+/// (PySINDy's `FiniteDifference`). All `n` rows are kept.
+pub fn sindy_finite_difference(
+    z: ArrayView2<'_, f64>,
+    dt: f64,
+) -> Result<Array2<f64>, String> {
+    let (n, d) = z.dim();
+    if n < 2 || d == 0 {
+        return Err(format!(
+            "sindy_finite_difference requires at least 2 rows and 1 column; got ({n}, {d})"
+        ));
+    }
+    if !(dt.is_finite() && dt > 0.0) {
+        return Err(format!(
+            "sindy_finite_difference requires a positive finite dt, got {dt}"
+        ));
+    }
+    let mut dz = Array2::<f64>::zeros((n, d));
+    let inv_2dt = 1.0 / (2.0 * dt);
+    let inv_dt = 1.0 / dt;
+    for c in 0..d {
+        // Centered interior.
+        for r in 1..(n - 1) {
+            dz[(r, c)] = (z[(r + 1, c)] - z[(r - 1, c)]) * inv_2dt;
+        }
+        // One-sided endpoints.
+        dz[(0, c)] = (z[(1, c)] - z[(0, c)]) * inv_dt;
+        dz[(n - 1, c)] = (z[(n - 1, c)] - z[(n - 2, c)]) * inv_dt;
+    }
+    Ok(dz)
+}
+
 /// Automatic `λ` selection over a logarithmic grid using BIC, with STLSQ
 /// applied at each grid point. Returns `(best_lam, best_result)`.
 ///
