@@ -21,11 +21,11 @@ use crate::construction::{
     kronecker_logdet_and_derivatives, kronecker_marginal_eigensystems, kronecker_product,
 };
 use crate::custom_family::{
-    BlockGeometryDirectionalDerivative, BlockWorkingSet, BlockwiseFitOptions, CustomFamily,
-    CustomFamilyBlockPsiDerivative, CustomFamilyWarmStart, ExactNewtonJointPsiTerms,
-    ExactNewtonOuterObjective, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
-    PenaltyMatrix, evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs,
-    fit_custom_family,
+    BlockEffectiveJacobian, BlockGeometryDirectionalDerivative, BlockWorkingSet,
+    BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative, CustomFamilyWarmStart,
+    ExactNewtonJointPsiTerms, ExactNewtonOuterObjective, FamilyEvaluation,
+    FamilyLinearizationState, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
+    evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs, fit_custom_family,
 };
 use crate::estimate::{
     EstimationError, ExternalOptimOptions, FitInference, FitOptions, FittedLinkState, PenaltySpec,
@@ -10170,6 +10170,69 @@ struct BoundedLinearTermMeta {
     prior: BoundedCoefficientPriorSpec,
 }
 
+/// β-dependent effective Jacobian for the bounded-linear fit block.
+///
+/// Each bounded coefficient enters the linear predictor non-linearly, as
+/// `β = min + width·σ(θ)`, and is supplied to the solver through the family
+/// adapter's offset rather than the linear design. To keep that contribution
+/// out of the *linear* design the fit places a deliberately **zeroed**
+/// placeholder column for every bounded term in the block design
+/// (see `fit_bounded_term_collection_with_design`). The pre-fit
+/// identifiability audit, however, assesses block rank by reading each block's
+/// effective Jacobian — and a zeroed column reads as a structural rank
+/// deficiency, so without this callback the audit refuses *every* bounded
+/// model before fitting begins.
+///
+/// This callback reports the model's true Jacobian column for each bounded
+/// term, `∂η_i/∂θ = (dβ/dθ)·x_i`, so the audit inspects the same geometry the
+/// solver actually fits. Because `dβ/dθ = width·σ(θ)(1−σ(θ))` is strictly
+/// positive for finite θ and `width > 0`, a bounded column is rank-deficient
+/// in the audit exactly when its underlying covariate is genuinely collinear
+/// with the rest of the design — never merely because the placeholder was
+/// zeroed. The callback is consumed only by the identifiability audit /
+/// canonicalisation; the inner PIRLS solve drives η through the
+/// [`BoundedLinearFamily`] adapter, so reporting the non-zeroed Jacobian here
+/// does not double-count the bounded contribution.
+struct BoundedEffectiveJacobian {
+    design: Array2<f64>,
+    bounded_terms: Vec<BoundedLinearTermMeta>,
+}
+
+impl BlockEffectiveJacobian for BoundedEffectiveJacobian {
+    fn effective_jacobian_at(
+        &self,
+        state: &FamilyLinearizationState<'_>,
+    ) -> Result<Array2<f64>, String> {
+        let p = self.design.ncols();
+        if !state.beta.is_empty() {
+            if state.beta.len() != p {
+                return Err(format!(
+                    "BoundedEffectiveJacobian::effective_jacobian_at: beta length {} != design \
+                     ncols {p}",
+                    state.beta.len(),
+                ));
+            }
+            if state.beta.iter().any(|v| v.is_nan()) {
+                return Err(
+                    "BoundedEffectiveJacobian::effective_jacobian_at: beta contains NaN"
+                        .to_string(),
+                );
+            }
+        }
+        let mut jac = self.design.clone();
+        for term in &self.bounded_terms {
+            let theta = if state.beta.is_empty() {
+                0.0
+            } else {
+                state.beta[term.col_idx]
+            };
+            let (_, _, db_dtheta, _, _) = bounded_latent_derivatives(theta, term.min, term.max);
+            jac.column_mut(term.col_idx).mapv_inplace(|v| v * db_dtheta);
+        }
+        Ok(jac)
+    }
+}
+
 #[derive(Clone)]
 struct BoundedLinearFamily {
     family: LikelihoodSpec,
@@ -12057,7 +12120,15 @@ fn fit_bounded_term_collection_with_design(
         initial_log_lambdas,
         initial_beta: Some(initial_beta),
         gauge_priority: 100,
-        jacobian_callback: None,
+        // Report the true β-dependent Jacobian (bounded columns scaled by
+        // dβ/dθ) to the identifiability audit so it does not mistake the
+        // deliberately-zeroed placeholder columns for a structural rank
+        // deficiency. The inner solve still drives η through the family
+        // adapter, so this does not affect the fit geometry.
+        jacobian_callback: Some(Arc::new(BoundedEffectiveJacobian {
+            design: fit_design.clone(),
+            bounded_terms: bounded_terms.clone(),
+        })),
         stacked_design: None,
         stacked_offset: None,
     };
@@ -25309,8 +25380,14 @@ mod tests {
         let mut data = Array2::<f64>::zeros((n, 2));
         let mut y = Array1::<f64>::zeros(n);
         for i in 0..n {
-            let x = -1.0 + 2.0 * (i as f64) / ((n - 1) as f64);
-            let z = (i as f64) / ((n - 1) as f64);
+            let t = (i as f64) / ((n - 1) as f64);
+            let x = -1.0 + 2.0 * t;
+            // z must be linearly independent of {1, x}: a ramp z = (x+1)/2
+            // is exactly collinear with the intercept and x, so the bounded
+            // column's true ∂η/∂θ Jacobian is genuinely rank-deficient and the
+            // identifiability audit (correctly) refuses the fit. A 2-cycle
+            // sinusoid is orthogonal to the constant and the linear ramp.
+            let z = (2.0 * std::f64::consts::PI * 2.0 * t).sin();
             data[[i, 0]] = x;
             data[[i, 1]] = z;
             y[i] = 0.25 + 0.8 * x + 0.05 * z;
