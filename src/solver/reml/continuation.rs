@@ -1115,4 +1115,114 @@ mod tests {
         let msg = err.message();
         assert!(msg.contains("active_set_incomplete"), "msg='{msg}'");
     }
+
+    // ─────────────────────────────────────────────────────────────────
+    //  is_structural(): the discriminator the outer loop uses to decide
+    //  whether a pre-warm refusal disqualifies the seed (structural) or
+    //  falls back to a cold seed eval (numerical). #500.
+    // ─────────────────────────────────────────────────────────────────
+
+    fn cert_refused(diagnosis: KktRefusalDiagnosis) -> InnerFailure {
+        InnerFailure::CertRefused {
+            diagnosis,
+            carrying_block: None,
+            message: String::new(),
+        }
+    }
+
+    #[test]
+    fn is_structural_true_only_for_genuine_joint_design_defects() {
+        // Identifiability / aliasing / active-set-incomplete: a cold solve
+        // at the seed ρ* hits these identically — retrying cold is futile,
+        // so the seed must be disqualified. The wrapping variant must NOT
+        // change the verdict (a structural inner failure stays structural
+        // however the scheduler routed it).
+        for inner in [
+            InnerFailure::IdentifiabilityFailure {
+                message: "identifiability audit failed".into(),
+            },
+            cert_refused(KktRefusalDiagnosis::ActiveSetIncomplete),
+            cert_refused(KktRefusalDiagnosis::AliasingDetectedAtFit),
+        ] {
+            assert!(
+                ContinuationFailure::StructuralPropagate(inner.clone()).is_structural(),
+                "expected structural for {inner:?} via StructuralPropagate"
+            );
+            assert!(
+                ContinuationFailure::PathStuck {
+                    last: inner.clone(),
+                    rho_zero_offset: 27.7,
+                    final_rho: rho(&[0.0]),
+                }
+                .is_structural(),
+                "expected structural for {inner:?} via PathStuck"
+            );
+        }
+    }
+
+    #[test]
+    fn is_structural_false_for_numerical_prewarm_failures() {
+        // The #500 case: an ill-conditioned constraint-KKT residual at the
+        // oversmoothed ρ₀ classifies as InnerFailure::Other. The scheduler
+        // routes the first-step variant to PathStuck and the mid-walk
+        // variant to StructuralPropagate (conservative Other→Propagate) —
+        // NEITHER is a genuine structural defect, so both must fall back to
+        // a cold seed eval.
+        let kkt_other = InnerFailure::Other(
+            "Parameter constraint violation: KKT residuals exceed tolerance: \
+             primal=1.188e-6, dual=0.000e0, comp=0.000e0, stat=2.962e-14"
+                .into(),
+        );
+        assert!(
+            !ContinuationFailure::PathStuck {
+                last: kkt_other.clone(),
+                rho_zero_offset: 27.72589,
+                final_rho: rho(&[0.0, 0.0]),
+            }
+            .is_structural(),
+            "PathStuck(Other KKT residual) must be non-structural (#500 seed 0)"
+        );
+        assert!(
+            !ContinuationFailure::StructuralPropagate(kkt_other).is_structural(),
+            "StructuralPropagate(Other KKT residual) must be non-structural (#500 seed 1)"
+        );
+        // A likelihood/domain miss at the oversmoothed start, a budget
+        // exhaustion, a phantom-multiplier cert refusal, and a trust-region
+        // floor are all numerical/path conditions, not design defects.
+        assert!(
+            !ContinuationFailure::DomainAtOversmoothedStart(InnerFailure::LikelihoodFailure(
+                "likelihood evaluation failed: NaN".into()
+            ))
+            .is_structural()
+        );
+        assert!(
+            !ContinuationFailure::PathBudgetExhausted {
+                last: InnerFailure::BudgetExhausted {
+                    message: "budget exhausted".into()
+                },
+                steps_taken: 64,
+                final_rho: rho(&[0.0]),
+            }
+            .is_structural()
+        );
+        assert!(
+            !ContinuationFailure::PathStuck {
+                last: cert_refused(KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH),
+                rho_zero_offset: 27.7,
+                final_rho: rho(&[0.0]),
+            }
+            .is_structural(),
+            "phantom-multiplier cert refusal is recoverable, not structural"
+        );
+        assert!(
+            !ContinuationFailure::PathStuck {
+                last: InnerFailure::TrustRegionFloor {
+                    message: "trust-region floor".into()
+                },
+                rho_zero_offset: 27.7,
+                final_rho: rho(&[0.0]),
+            }
+            .is_structural()
+        );
+    }
 }
