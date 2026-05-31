@@ -26,11 +26,13 @@
 //!    centering) yields a design with exactly `k` columns, confirming the
 //!    polynomial columns are absorbed, not appended extra.
 //!
-//! 3. **Polynomial null-space columns lie in the excluded subspace** — after
-//!    the kernel constraint the polynomial directions `[1, x1, x2, x3]` are
-//!    NOT representable by the remaining kernel columns (they were projected out).
-//!    Equivalently the post-constraint kernel block is orthogonal to the
-//!    polynomial block at the center set.
+//! 3. **Polynomial null-space columns are independent of the kernel block** —
+//!    the side condition `P(centers)ᵀ Z = 0` projects the polynomial directions
+//!    out of the kernel COEFFICIENTS, so the polynomial block `[1, x1, x2, x3]`
+//!    is not representable by the kernel columns: the joint design has full
+//!    column rank `k`. (This is NOT a data-row orthogonality of the design
+//!    columns — with reduced knots the kernel functions are not L2-orthogonal to
+//!    the trend, and need not be.)
 //!
 //! 4. **Same-basis cosine identity** — building the same Duchon term twice on
 //!    the same data yields raw design columns with pairwise cosine 1.0, which
@@ -41,7 +43,9 @@ use gam::basis::{
     CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
     OneDimensionalBoundary, SpatialIdentifiability, build_duchon_basis, duchon_nullspace_dimension,
 };
-use ndarray::{Array1, Array2, s};
+use faer::Side;
+use gam::faer_ndarray::FaerCholesky;
+use ndarray::{Array2, s};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Uniform};
@@ -235,21 +239,25 @@ fn duchon_order1_d3_with_orthogonal_identifiability_gives_k_minus_1() {
     );
 }
 
-// ── Group 3: polynomial null-space columns lie in the excluded subspace ────────
+// ── Group 3: polynomial null-space columns are independent of the kernel block ─
 
-/// After the kernel-constraint reparameterisation, the polynomial columns
-/// `[1, x₁, x₂, x₃]` evaluated at the data rows must be orthogonal to the
-/// kernel block `Φ Z` (under the standard inner product) up to floating-point
-/// tolerance.
+/// The kernel-constraint reparameterisation enforces the side condition
+/// `P(centers)ᵀ Z = 0` on the kernel COEFFICIENTS, projecting the polynomial
+/// directions out of the kernel part. The observable, guaranteed consequence is
+/// that the polynomial block `[1, x₁, x₂, x₃]` is NOT representable by the kernel
+/// columns — the joint design `[kernel | poly]` has full column rank `k`.
 ///
-/// This checks that `(ΦZ)^T P ≈ 0` where `P = [1 | data]` and `ΦZ` is the
-/// `(n, k−4)` kernel block extracted from the full `(n, k)` design.
+/// (This is deliberately NOT a data-row orthogonality `(ΦZ)ᵀP ≈ 0`: with reduced
+/// knots `k ≪ n` and data ≠ centers, the kernel functions evaluated at the data
+/// are not L2-orthogonal to the trend, so that quantity is not ≈ 0 and is not a
+/// property of the standard knot-based Duchon construction. The trend-vs-wiggle
+/// PENALTY separation is verified in `duchon_structural_seminorms`.)
 ///
 /// We build with `SpatialIdentifiability::None` so the polynomial columns are
 /// still present in the design as columns `[k−4 .. k)`.  The kernel block
 /// occupies columns `[0 .. k−4)`.
 #[test]
-fn duchon_order1_kernel_block_orthogonal_to_polynomial_null_space_at_data() {
+fn duchon_order1_polynomial_block_is_independent_of_the_kernel_block() {
     let n = 200usize;
     let d = 3usize;
     let k = 10usize;
@@ -265,7 +273,6 @@ fn duchon_order1_kernel_block_orthogonal_to_polynomial_null_space_at_data() {
     let result = build_duchon_basis(data.view(), &spec).expect("build_duchon_basis succeeded");
 
     // Materialize the full design matrix.
-    let ones = Array1::<f64>::ones(n);
     let full: Array2<f64> = result
         .design
         .try_to_dense_arc("test")
@@ -279,8 +286,6 @@ fn duchon_order1_kernel_block_orthogonal_to_polynomial_null_space_at_data() {
         "expected {k} total cols before identifiability"
     );
 
-    // Kernel block: first `kernel_cols` columns.
-    let kernel_block = full.slice(s![.., 0..kernel_cols]).to_owned();
     // Polynomial block: last `poly_dim` columns = [constant col | x1 | x2 | x3].
     let poly_block = full.slice(s![.., kernel_cols..]).to_owned();
 
@@ -310,31 +315,22 @@ fn duchon_order1_kernel_block_orthogonal_to_polynomial_null_space_at_data() {
         );
     }
 
-    // Key assertion: kernel^T @ polynomial ≈ 0.
-    // cross[j, c] = Σ_i kernel[i,j] * poly[i,c]
-    let cross = kernel_block.t().dot(&poly_block);
-    let max_cross = cross.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-    // Tolerance: n × machine_epsilon × typical_scale.  With n=200 and kernel
-    // values O(1), this should be well below 1e-8 for exact side-condition
-    // enforcement via RRQR null-space projection.
+    // Key assertion: the polynomial block is NOT representable by the kernel
+    // block — the joint design `[kernel | poly]` has full column rank `k`, so
+    // its Gram is positive definite. The side condition `P(centers)ᵀ Z = 0` is
+    // enforced on the kernel COEFFICIENTS at the centers; the consequence we can
+    // observe in the materialized design is precisely this independence (if the
+    // trend were absorbed into / aliased by the kernel block, the Gram would be
+    // singular). We do NOT test a data-row orthogonality `(ΦZ)ᵀP ≈ 0`: it is not
+    // a property of the reduced-knot construction (data ≠ centers) — see the
+    // doc comment above.
+    let gram = full.t().dot(&full);
     assert!(
-        max_cross < 1e-6,
-        "kernel block is NOT orthogonal to polynomial null space at data rows: \
-         max |cross| = {max_cross:e} (expected < 1e-6)"
-    );
-
-    // Also verify the intercept is in the excluded subspace: the constant
-    // direction should be spanned by the polynomial block, not the kernel block.
-    let ones_proj_via_kernel: f64 = kernel_block
-        .t()
-        .dot(&ones)
-        .iter()
-        .map(|v| v.abs())
-        .fold(0.0_f64, f64::max);
-    assert!(
-        ones_proj_via_kernel < 1e-6,
-        "constant direction should be excluded from kernel block; \
-         max |kernel^T ones| = {ones_proj_via_kernel:e}"
+        gram.cholesky(Side::Lower).is_ok(),
+        "Duchon design [kernel | poly] is rank-deficient: the polynomial null \
+         space ({poly_dim} cols) is absorbed into / aliased by the {kernel_cols}-column \
+         kernel block (Gram not positive definite), so the trend is not separately \
+         identifiable"
     );
 }
 
