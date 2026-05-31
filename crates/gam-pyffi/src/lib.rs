@@ -23440,157 +23440,38 @@ where
 // -------------------------------------------------------------------------
 // Engine error → typed `PyErr` adaptors (issue #343).
 //
-// One trivial converter per declared Python exception class. Each helper
-// preserves the typed-class identity at the engine→Python boundary so
-// `except gamfit.SurvivalError` (etc.) is actionable without the user
-// parsing the prose. Call sites that previously did
+// One trivial converter per typed engine→Python boundary actually used.
+// Each helper preserves the typed-class identity so `except gamfit.SurvivalError`
+// (etc.) is actionable without the user parsing the prose. A call site that does
 // `.map_err(|e| e.to_string())?` against a `Result<_, EngineError>` in a
-// `PyResult<_>` function should swap to
-// `.map_err(<engine>_error_to_pyerr)?` — the message text is identical,
-// only the Python class type widens from `ValueError` to the typed
-// subclass. The orphan rule prevents a blanket `impl From<E> for PyErr`,
-// so each enum exposes its converter explicitly.
+// `PyResult<_>` function should swap to `.map_err(<engine>_error_to_pyerr)?` —
+// the message text is identical, only the Python class type widens from
+// `ValueError` to the typed subclass. The orphan rule prevents a blanket
+// `impl From<E> for PyErr`, so each converter is emitted explicitly via the
+// `error_to_pyerr!` macro below.
 // -------------------------------------------------------------------------
 
-fn matrix_materialization_error_to_pyerr(err: gam::resource::MatrixMaterializationError) -> PyErr {
-    MatrixMaterializationError::new_err(err.to_string())
+// Declarative converter generator: one orphan-rule-safe line per typed
+// engine error → Python exception boundary actually needed at a call site.
+// The body is invariably `<Pyo3Exc>::new_err(err.to_string())`; only the fn
+// name, the source engine error type, and the PyO3 exception class vary. A
+// blanket `impl From<E> for PyErr` is blocked by the orphan rule, so this
+// macro is the canonical single source of truth for the trivial converters.
+// Add a new typed converter by adding one `error_to_pyerr!(...)` invocation
+// at the point a `.map_err(...)` site needs it.
+macro_rules! error_to_pyerr {
+    ($fn_name:ident, $src:ty, $exc:ident) => {
+        fn $fn_name(err: $src) -> PyErr {
+            $exc::new_err(err.to_string())
+        }
+    };
 }
 
-fn gpu_error_to_pyerr(err: gam::gpu::GpuError) -> PyErr {
-    GpuError::new_err(err.to_string())
-}
-
-fn linear_algebra_error_to_pyerr(err: gam::linalg::faer_ndarray::FaerLinalgError) -> PyErr {
-    LinearAlgebraError::new_err(err.to_string())
-}
-
-fn matrix_error_to_pyerr(err: gam::linalg::matrix::MatrixError) -> PyErr {
-    MatrixError::new_err(err.to_string())
-}
-
-fn cache_store_error_to_pyerr(err: gam::cache::store::StoreError) -> PyErr {
-    CacheStoreError::new_err(err.to_string())
-}
-
-fn smooth_error_to_pyerr(err: gam::terms::smooth::SmoothError) -> PyErr {
-    SmoothError::new_err(err.to_string())
-}
-
-fn arrow_schur_error_to_pyerr(err: gam::solver::arrow_schur::ArrowSchurError) -> PyErr {
-    ArrowSchurError::new_err(err.to_string())
-}
-
-fn outer_strategy_error_to_pyerr(err: gam::solver::outer_strategy::OuterStrategyError) -> PyErr {
-    OuterStrategyError::new_err(err.to_string())
-}
-
-fn term_builder_error_to_pyerr(err: gam::terms::term_builder::TermBuilderError) -> PyErr {
-    TermBuilderError::new_err(err.to_string())
-}
-
-fn corrected_covariance_error_to_pyerr(err: gam::solver::CorrectedCovarianceError) -> PyErr {
-    CorrectedCovarianceError::new_err(err.to_string())
-}
-
-fn predict_input_error_to_pyerr(err: gam::inference::predict::input::PredictInputError) -> PyErr {
-    PredictInputError::new_err(err.to_string())
-}
-
-fn hmc_error_to_pyerr(err: gam::inference::hmc::HmcError) -> PyErr {
-    HmcError::new_err(err.to_string())
-}
-
-fn alo_error_to_pyerr(err: gam::inference::alo::AloError) -> PyErr {
-    AloError::new_err(err.to_string())
-}
-
-fn survival_error_to_pyerr(err: gam::families::survival::SurvivalError) -> PyErr {
-    SurvivalError::new_err(err.to_string())
-}
-
-fn cubic_cell_kernel_error_to_pyerr(
-    err: gam::families::cubic_cell_kernel::CubicCellKernelError,
-) -> PyErr {
-    CubicCellKernelError::new_err(err.to_string())
-}
-
-fn survival_construction_error_to_pyerr(
-    err: gam::families::survival_construction::SurvivalConstructionError,
-) -> PyErr {
-    SurvivalConstructionError::new_err(err.to_string())
-}
-
-fn transformation_normal_error_to_pyerr(
-    err: gam::families::transformation_normal::TransformationNormalError,
-) -> PyErr {
-    TransformationNormalError::new_err(err.to_string())
-}
-
-fn custom_family_error_to_pyerr(err: gam::families::custom_family::CustomFamilyError) -> PyErr {
-    CustomFamilyError::new_err(err.to_string())
-}
-
-fn gamlss_error_to_pyerr(err: gam::families::gamlss::GamlssError) -> PyErr {
-    GamlssError::new_err(err.to_string())
-}
-
-fn survival_marginal_slope_error_to_pyerr(
-    err: gam::families::survival_marginal_slope::SurvivalMarginalSlopeError,
-) -> PyErr {
-    SurvivalMarginalSlopeError::new_err(err.to_string())
-}
-
-fn latent_survival_error_to_pyerr(
-    err: gam::families::latent_survival::LatentSurvivalError,
-) -> PyErr {
-    LatentSurvivalError::new_err(err.to_string())
-}
-
-fn survival_predict_error_to_pyerr(
-    err: gam::families::survival_predict::SurvivalPredictError,
-) -> PyErr {
-    SurvivalPredictError::new_err(err.to_string())
-}
-
-fn deviation_runtime_error_to_pyerr(
-    err: gam::families::bms::deviation_runtime::DeviationRuntimeError,
-) -> PyErr {
-    DeviationRuntimeError::new_err(err.to_string())
-}
-
-fn data_error_to_pyerr(err: gam::inference::data::DataError) -> PyErr {
-    DataError::new_err(err.to_string())
-}
-
-fn fitted_model_error_to_pyerr(err: gam::inference::model::FittedModelError) -> PyErr {
-    FittedModelError::new_err(err.to_string())
-}
-
-fn lognormal_kernel_error_to_pyerr(
-    err: gam::families::lognormal_kernel::LognormalKernelError,
-) -> PyErr {
-    LognormalKernelError::new_err(err.to_string())
-}
-
-fn scale_design_error_to_pyerr(err: gam::families::scale_design::ScaleDesignError) -> PyErr {
-    ScaleDesignError::new_err(err.to_string())
-}
-
-fn identifiability_compiler_error_to_pyerr(
-    err: gam::families::identifiability_compiler::CompilerError,
-) -> PyErr {
-    IdentifiabilityCompilerError::new_err(err.to_string())
-}
-
-fn joint_penalty_error_to_pyerr(err: gam::families::joint_penalty::JointPenaltyError) -> PyErr {
-    JointPenaltyError::new_err(err.to_string())
-}
-
-fn survival_location_scale_error_to_pyerr(
-    err: gam::families::survival_location_scale::SurvivalLocationScaleError,
-) -> PyErr {
-    SurvivalLocationScaleError::new_err(err.to_string())
-}
+error_to_pyerr!(
+    survival_error_to_pyerr,
+    gam::families::survival::SurvivalError,
+    SurvivalError
+);
 
 fn fit_table_impl(
     headers: Vec<String>,

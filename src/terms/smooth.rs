@@ -104,6 +104,12 @@ impl From<SmoothError> for String {
     }
 }
 
+impl From<crate::util::block_count::BlockCountMismatch> for SmoothError {
+    fn from(err: crate::util::block_count::BlockCountMismatch) -> SmoothError {
+        SmoothError::invalid_index(err.message())
+    }
+}
+
 impl SmoothError {
     #[inline]
     fn invalid_config(reason: impl Into<String>) -> Self {
@@ -11474,13 +11480,11 @@ fn expect_single_block_state<'a>(
     block_states: &'a [ParameterBlockState],
     family_name: &str,
 ) -> Result<&'a ParameterBlockState, String> {
-    if block_states.len() != 1 {
-        return Err(SmoothError::invalid_index(format!(
-            "{family_name} expects 1 block, got {}",
-            block_states.len()
-        ))
-        .into());
-    }
+    crate::util::block_count::validate_block_count::<SmoothError>(
+        family_name,
+        1,
+        block_states.len(),
+    )?;
     Ok(&block_states[0])
 }
 
