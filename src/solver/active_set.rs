@@ -408,6 +408,17 @@ pub(crate) fn feasible_point_for_linear_constraints(
     }
 }
 
+/// Worst primal-feasibility violation across all rows of `constraints`,
+/// measured in the per-row-scaled (geometric) coordinate system documented on
+/// [`ACTIVE_SET_PRIMAL_FEASIBILITY_TOL`]. A row's slack is divided by ‖a_i‖
+/// so the returned value is the signed Euclidean distance from `beta` to the
+/// constraint hyperplane, not the raw dot-product residual. This matches
+/// [`compute_constraint_kkt_diagnostics`] and keeps the in-solver acceptance
+/// gate, the downstream KKT report, and any post-fit feasibility check on a
+/// single scale-invariant metric. A row with ‖a_i‖ = 38 (a typical B-spline
+/// endpoint-derivative clamp at k = 12) has a 1e-6 raw violation that is only
+/// 2.6e-8 in geometric units — accepting on raw alone is anisotropic in
+/// input-space and breaks the published contract.
 fn max_linear_constraint_violation(
     beta: &Array1<f64>,
     constraints: &LinearInequalityConstraints,
@@ -415,7 +426,9 @@ fn max_linear_constraint_violation(
     let mut worst = 0.0_f64;
     let mut worst_row = 0usize;
     for i in 0..constraints.a.nrows() {
-        let slack = constraints.a.row(i).dot(beta) - constraints.b[i];
+        let norm = constraints.a.row(i).dot(&constraints.a.row(i)).sqrt();
+        let inv = if norm > 0.0 { 1.0 / norm } else { 0.0 };
+        let slack = (constraints.a.row(i).dot(beta) - constraints.b[i]) * inv;
         let viol = (-slack).max(0.0);
         if viol > worst {
             worst = viol;
@@ -423,6 +436,21 @@ fn max_linear_constraint_violation(
         }
     }
     (worst, worst_row)
+}
+
+/// Per-row signed scaled slack: `(a_i·beta - b_i) / ‖a_i‖`. Returns zero for
+/// degenerate rows with `‖a_i‖ = 0` (those rows carry no geometric content).
+/// Used wherever the active-set solver needs to compare per-row feasibility
+/// against a scale-invariant tolerance.
+#[inline]
+fn scaled_constraint_slack(
+    beta: &Array1<f64>,
+    constraints: &LinearInequalityConstraints,
+    i: usize,
+) -> f64 {
+    let norm = constraints.a.row(i).dot(&constraints.a.row(i)).sqrt();
+    let inv = if norm > 0.0 { 1.0 / norm } else { 0.0 };
+    (constraints.a.row(i).dot(beta) - constraints.b[i]) * inv
 }
 
 pub(crate) fn solve_kkt_direction(
@@ -747,11 +775,21 @@ pub(crate) fn working_set_kkt_diagnostics_from_multipliers(
             working_constraints.a.nrows()
         );
     }
+    // Primal feasibility and complementarity are measured in the per-row-scaled
+    // (geometric) coordinate system the public solver contract is expressed in
+    // (see [`ACTIVE_SET_PRIMAL_FEASIBILITY_TOL`] and
+    // [`compute_constraint_kkt_diagnostics`]). Without scaling, a row with
+    // ‖a_i‖ ≫ 1 — e.g. a B-spline endpoint-derivative clamp — reports a raw
+    // slack inflated by ‖a_i‖, and the in-solver acceptance gate
+    // (`worst <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL`) becomes anisotropic across
+    // rows. Complementarity is the SCALED product `λ̂_i · ŝ_i` with
+    // `λ̂_i = ‖a_i‖·λ_i`; that's invariant under the same per-row rescaling, so
+    // its semantics are unchanged while the units match the primal column.
     let m = working_constraints.a.nrows();
     let mut slack = Array1::<f64>::zeros(m);
     let mut primal_feasibility: f64 = 0.0;
     for i in 0..m {
-        let s_i = working_constraints.a.row(i).dot(x) - working_constraints.b[i];
+        let s_i = scaled_constraint_slack(x, working_constraints, i);
         slack[i] = s_i;
         primal_feasibility = primal_feasibility.max((-s_i).max(0.0));
     }
@@ -840,9 +878,13 @@ fn fallback_projected_gradient_direction(
 
     let mut alpha = 1.0_f64;
     for i in 0..constraints.a.nrows() {
-        let ai = constraints.a.row(i);
-        let slack = ai.dot(x) - constraints.b[i];
-        let ai_d = ai.dot(&tangent_direction);
+        // Scale the step-fraction test by 1/‖a_i‖ so it matches the geometric
+        // activation tolerance used elsewhere (see in-loop alpha computation in
+        // `solve_newton_direction_with_linear_constraints_impl`).
+        let norm = constraints.a.row(i).dot(&constraints.a.row(i)).sqrt();
+        let inv = if norm > 0.0 { 1.0 / norm } else { 0.0 };
+        let slack = (constraints.a.row(i).dot(x) - constraints.b[i]) * inv;
+        let ai_d = constraints.a.row(i).dot(&tangent_direction) * inv;
         if let Some(candidate) = boundary_hit_step_fraction(slack, ai_d, alpha) {
             alpha = candidate;
         }
@@ -853,12 +895,13 @@ fn fallback_projected_gradient_direction(
 
     let fallback_step = tangent_direction * alpha;
     let new_x = x + &fallback_step;
+    // Per-row-scaled feasibility, matching ACTIVE_SET_PRIMAL_FEASIBILITY_TOL.
     let (worst, _) = max_linear_constraint_violation(&new_x, constraints);
-    if worst > 1e-8 {
+    if worst > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
         return Ok(None);
     }
     let active = (0..constraints.a.nrows())
-        .filter(|&i| constraints.a.row(i).dot(&new_x) - constraints.b[i] <= 1e-10)
+        .filter(|&i| scaled_constraint_slack(&new_x, constraints, i) <= 1e-10)
         .collect::<Vec<_>>();
     let active = canonicalize_active_constraint_ids(&new_x, constraints, &active)?;
     Ok(Some((d_total + &fallback_step, active)))
@@ -935,8 +978,10 @@ fn solve_newton_direction_with_linear_constraints_impl(
         let candidate = beta + &*direction_out;
         let mut feasible = true;
         for i in 0..m {
-            let slack = constraints.a.row(i).dot(&candidate) - constraints.b[i];
-            if slack < -1e-10 {
+            // Scaled (geometric) slack — matches `tol_active`'s semantics and
+            // the public solver contract on `ACTIVE_SET_PRIMAL_FEASIBILITY_TOL`.
+            let slack = scaled_constraint_slack(&candidate, constraints, i);
+            if slack < -tol_active {
                 feasible = false;
                 break;
             }
@@ -958,7 +1003,12 @@ fn solve_newton_direction_with_linear_constraints_impl(
         }
     }
     for i in 0..m {
-        let slack = constraints.a.row(i).dot(&x) - constraints.b[i];
+        // Scaled (geometric) slack: a row with ‖a_i‖ ≫ 1 (e.g. a B-spline
+        // endpoint-derivative clamp at k = 12, ‖a_i‖ ≈ 38) would otherwise
+        // require a raw slack of `tol_active·‖a_i‖` ≈ 4e-9 to activate, which
+        // is below LBLT-solve precision on the KKT system and starves the
+        // active set of rows that genuinely belong on the boundary.
+        let slack = scaled_constraint_slack(&x, constraints, i);
         if slack <= tol_active && !is_active[i] {
             active.push(i);
             is_active[i] = true;
@@ -1022,9 +1072,16 @@ fn solve_newton_direction_with_linear_constraints_impl(
             if is_active[i] {
                 continue;
             }
-            let ai = constraints.a.row(i);
-            let slack = ai.dot(&x) - constraints.b[i];
-            let ai_d = ai.dot(&d);
+            // boundary_hit_step_fraction is scale-equivariant in `(slack, ai_d)`:
+            // scaling both by 1/‖a_i‖ leaves `step = slack / -ai_d` unchanged,
+            // and its directional-tol/finite checks operate on a max-magnitude
+            // scale of the same triple. Doing the geometric rescale here keeps
+            // the step-fraction's "moving toward the boundary" test in the same
+            // scaled coordinates the activation tests use.
+            let norm = constraints.a.row(i).dot(&constraints.a.row(i)).sqrt();
+            let inv = if norm > 0.0 { 1.0 / norm } else { 0.0 };
+            let slack = (constraints.a.row(i).dot(&x) - constraints.b[i]) * inv;
+            let ai_d = constraints.a.row(i).dot(&d) * inv;
             if let Some(cand) = boundary_hit_step_fraction(slack, ai_d, alpha) {
                 alpha = cand;
             }
@@ -1045,7 +1102,7 @@ fn solve_newton_direction_with_linear_constraints_impl(
             if is_active[i] {
                 continue;
             }
-            let slack = constraints.a.row(i).dot(&x) - constraints.b[i];
+            let slack = scaled_constraint_slack(&x, constraints, i);
             if slack <= tol_active {
                 active.push(i);
                 is_active[i] = true;

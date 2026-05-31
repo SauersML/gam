@@ -12306,6 +12306,16 @@ fn enforce_term_constraint_feasibility(
     design: &TermCollectionDesign,
     fit: &UnifiedFitResult,
 ) -> Result<(), EstimationError> {
+    // Geometric (per-row-scaled) tolerance, matching the public contract on
+    // `ACTIVE_SET_PRIMAL_FEASIBILITY_TOL` and the diagnostic that
+    // `compute_constraint_kkt_diagnostics` exposes via `fit.constraint_kkt`.
+    // Lower-bound rows are unit-norm (a_i = e_i) so the scale-invariant and
+    // raw checks coincide there. Linear-inequality rows generally are NOT
+    // unit-norm — e.g. a B-spline endpoint-derivative clamp at k = 12 carries
+    // ‖a_i‖ ≈ 38, so a 1e-6 raw residual is only 2.6e-8 in geometric units.
+    // Holding this gate to raw 1e-7 while the in-solver acceptance gate
+    // measures geometric 1e-8 is the inconsistency that made well-conditioned
+    // clamped fits get rejected after they completed cleanly.
     let tol = 1e-7;
     let smooth_start = design
         .design
@@ -12335,11 +12345,13 @@ fn enforce_term_constraint_feasibility(
             }
         }
         if let Some(lin) = term.linear_constraints_local.as_ref() {
-            let slack = lin.a.dot(&beta_local) - &lin.b;
             let mut worst = 0.0_f64;
             let mut worstrow = 0usize;
-            for (i, &v) in slack.iter().enumerate() {
-                let viol = (-v).max(0.0);
+            for i in 0..lin.a.nrows() {
+                let norm = lin.a.row(i).dot(&lin.a.row(i)).sqrt();
+                let inv = if norm > 0.0 { 1.0 / norm } else { 0.0 };
+                let s = (lin.a.row(i).dot(&beta_local) - lin.b[i]) * inv;
+                let viol = (-s).max(0.0);
                 if viol > worst {
                     worst = viol;
                     worstrow = i;
