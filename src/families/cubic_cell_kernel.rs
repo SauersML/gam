@@ -3395,20 +3395,76 @@ fn evaluate_non_affine_cell_derivative_state(
     branch: ExactCellBranch,
     max_degree: usize,
 ) -> Result<CellDerivativeMomentState, String> {
+    // Mirror evaluate_non_affine_cell_state byte-for-byte on the moments —
+    // same SIMD lane ordering, same Horner-with-FMA for η, same
+    // `0.5 * (z² + η²)` evaluation order, same `scaled_weight = weight*half_width`
+    // pre-fold, same per-lane `accumulate_moments_unrolled4`. Diverging from
+    // any of those produces 1-ULP drift between the value- and derivative-only
+    // paths, breaking the contract that derivative contractions must consume
+    // the same moments the value evaluator integrates against. Only the
+    // value-side work (second exp(-½z²) and Φ(η) CDF) is omitted.
     let mut moments: CellMomentVec = smallvec![0.0_f64; max_degree + 1];
     let center = 0.5 * (cell.left + cell.right);
     let half_width = 0.5 * (cell.right - cell.left);
-    for (&node, &weight) in GL_NODES.iter().zip(GL_WEIGHTS.iter()) {
-        let z = center + half_width * node;
-        let moment_weight = weight * (-cell.q(z)).exp();
-        let mut z_pow = 1.0_f64;
-        for moment in &mut moments {
-            *moment = moment_weight.mul_add(z_pow, *moment);
-            z_pow *= z;
+    let c0 = cell.c0;
+    let c1 = cell.c1;
+    let c2 = cell.c2;
+    let c3 = cell.c3;
+    let moments_slice: &mut [f64] = &mut moments;
+    assert_eq!(GL_NODES.len(), GL_WEIGHTS.len());
+    use wide::f64x4;
+    let center_v = f64x4::splat(center);
+    let half_width_v = f64x4::splat(half_width);
+    let c0_v = f64x4::splat(c0);
+    let c1_v = f64x4::splat(c1);
+    let c2_v = f64x4::splat(c2);
+    let c3_v = f64x4::splat(c3);
+    let neg_half_v = f64x4::splat(-0.5);
+    let n_total = GL_NODES.len();
+    let n_simd = n_total - (n_total % 4);
+    let mut i = 0;
+    while i < n_simd {
+        let node_v = f64x4::from([
+            GL_NODES[i],
+            GL_NODES[i + 1],
+            GL_NODES[i + 2],
+            GL_NODES[i + 3],
+        ]);
+        let weight_v = f64x4::from([
+            GL_WEIGHTS[i],
+            GL_WEIGHTS[i + 1],
+            GL_WEIGHTS[i + 2],
+            GL_WEIGHTS[i + 3],
+        ]);
+        let z_v = half_width_v.mul_add(node_v, center_v);
+        let eta_v = c3_v
+            .mul_add(z_v, c2_v)
+            .mul_add(z_v, c1_v)
+            .mul_add(z_v, c0_v);
+        let z2_v = z_v * z_v;
+        let neg_q_v = neg_half_v * (z2_v + eta_v * eta_v);
+        let scaled_weight_v = weight_v * half_width_v;
+        let exp_negq_v = neg_q_v.exp();
+        let moment_weight_v = scaled_weight_v * exp_negq_v;
+        let z_arr = z_v.to_array();
+        let mw_arr = moment_weight_v.to_array();
+        for lane in 0..4 {
+            let z = z_arr[lane];
+            let mw = mw_arr[lane];
+            accumulate_moments_unrolled4(moments_slice, mw, z);
         }
+        i += 4;
     }
-    for moment in &mut moments {
-        *moment *= half_width;
+    while i < n_total {
+        let node = GL_NODES[i];
+        let weight = GL_WEIGHTS[i];
+        let z = center + half_width * node;
+        let eta = c3.mul_add(z, c2).mul_add(z, c1).mul_add(z, c0);
+        let q = 0.5 * (z * z + eta * eta);
+        let scaled_weight = weight * half_width;
+        let moment_weight = scaled_weight * (-q).exp();
+        accumulate_moments_unrolled4(moments_slice, moment_weight, z);
+        i += 1;
     }
     Ok(CellDerivativeMomentState { branch, moments })
 }
