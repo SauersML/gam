@@ -15003,16 +15003,30 @@ where
     F: Fn(usize, usize) -> Result<f64, BasisError> + Sync,
 {
     assert_eq!(matrix.nrows(), matrix.ncols());
+    let k = matrix.nrows();
+    // The kernels passed here are pure functions of the (symmetric) pairwise
+    // center distance, so `kernel(i, j) == kernel(j, i)`. Evaluate only the
+    // upper triangle (including the diagonal) in parallel — each row task
+    // touches only its own `j >= i` cells, so the borrows stay disjoint — then
+    // mirror into the lower triangle. This halves the (sqrt + special-function)
+    // kernel evaluations relative to filling every cell independently, with no
+    // change to the resulting matrix (still exactly symmetric).
     matrix
         .axis_iter_mut(Axis(0))
         .into_par_iter()
         .enumerate()
         .try_for_each(|(i, mut row)| {
-            for j in 0..row.len() {
+            for j in i..k {
                 row[j] = kernel(i, j)?;
             }
             Ok(())
-        })
+        })?;
+    for i in 1..k {
+        for j in 0..i {
+            matrix[[i, j]] = matrix[[j, i]];
+        }
+    }
+    Ok(())
 }
 
 /// Return y-space points `y_{i,a} = exp(ψ_a) x_{i,a}` with
