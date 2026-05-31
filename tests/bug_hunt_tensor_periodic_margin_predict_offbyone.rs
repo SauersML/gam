@@ -43,9 +43,7 @@ fn encode_xyz(rows_xyz: &[(f64, f64, f64)]) -> gam::data::EncodedDataset {
     let headers = ["theta", "h", "y"].into_iter().map(String::from).collect();
     let rows: Vec<StringRecord> = rows_xyz
         .iter()
-        .map(|(a, b, y)| {
-            StringRecord::from(vec![a.to_string(), b.to_string(), y.to_string()])
-        })
+        .map(|(a, b, y)| StringRecord::from(vec![a.to_string(), b.to_string(), y.to_string()]))
         .collect();
     encode_recordswith_inferred_schema(headers, rows).expect("encode dataset")
 }
@@ -83,7 +81,16 @@ fn tensor_periodic_margin_predict_recovers_cylinder_surface() {
 
     // Predict at interior points (including theta values that exercise the
     // periodic wrap, e.g. near and across the 0/2pi seam).
-    let test_thetas = [0.0, 0.3, 1.1, 2.0, std::f64::consts::PI, 4.5, 6.0, TWO_PI - 1e-6];
+    let test_thetas = [
+        0.0,
+        0.3,
+        1.1,
+        2.0,
+        std::f64::consts::PI,
+        4.5,
+        6.0,
+        TWO_PI - 1e-6,
+    ];
     let test_hs = [0.1, 0.5, 0.9];
     let mut new_data = Array2::<f64>::zeros((test_thetas.len() * test_hs.len(), 2));
     let mut expected = Vec::with_capacity(new_data.nrows());

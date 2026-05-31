@@ -324,8 +324,11 @@ fn gam_negbin_matches_statsmodels_overdispersed_counts_on_real_data() {
     // and statsmodels so both share the same dispersion assumption.
     let n_tr = train_numvisit.len() as f64;
     let mu_tr = train_numvisit.iter().sum::<f64>() / n_tr;
-    let var_tr =
-        train_numvisit.iter().map(|&v| (v - mu_tr) * (v - mu_tr)).sum::<f64>() / (n_tr - 1.0);
+    let var_tr = train_numvisit
+        .iter()
+        .map(|&v| (v - mu_tr) * (v - mu_tr))
+        .sum::<f64>()
+        / (n_tr - 1.0);
     let theta = mu_tr * mu_tr / (var_tr - mu_tr);
     assert!(
         theta.is_finite() && theta > 0.0,
@@ -386,7 +389,11 @@ fn gam_negbin_matches_statsmodels_overdispersed_counts_on_real_data() {
     // Within ONE python call every column is train-length; the test rows ride
     // along right-padded and only the first `test_n` entries are read back.
     let pad_to = |v: &[f64], len: usize| -> Vec<f64> {
-        assert!(v.len() <= len, "pad target {len} shorter than source {}", v.len());
+        assert!(
+            v.len() <= len,
+            "pad target {len} shorter than source {}",
+            v.len()
+        );
         let fill = v.last().copied().unwrap_or(0.0);
         let mut out = v.to_vec();
         out.resize(len, fill);

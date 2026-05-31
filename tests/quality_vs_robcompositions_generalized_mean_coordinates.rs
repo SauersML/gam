@@ -42,7 +42,10 @@ use std::path::Path;
 /// real compositional dataset (Aitchison 1986, "The Statistical Analysis of
 /// Compositional Data"; distributed in R's `compositions`/`robCompositions`
 /// as `SkyeAFM` / `skyeLavas`). Vendored at bench/datasets/skye_afm_lavas.csv.
-const SKYE_AFM_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/skye_afm_lavas.csv");
+const SKYE_AFM_CSV: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/bench/datasets/skye_afm_lavas.csv"
+);
 
 /// Squared Aitchison distance between two closed 3-part compositions: the
 /// squared Euclidean distance between their CLR images. This is the loss the
@@ -164,7 +167,15 @@ fn gam_simplex_frechet_mean_recovers_known_aitchison_center() {
     let gam_recovery_rmse = rmse(&gam_clr, &mu_clr);
     eprintln!(
         "TRUTH RECOVERY: gam_clr=[{:.5},{:.5},{:.5}] true_clr=[{:.5},{:.5},{:.5}] rmse={:.3e} bound={:.3e} (se={:.3e})",
-        gam_clr[0], gam_clr[1], gam_clr[2], mu_clr[0], mu_clr[1], mu_clr[2], gam_recovery_rmse, recovery_bound, se
+        gam_clr[0],
+        gam_clr[1],
+        gam_clr[2],
+        mu_clr[0],
+        mu_clr[1],
+        mu_clr[2],
+        gam_recovery_rmse,
+        recovery_bound,
+        se
     );
     assert!(
         gam_recovery_rmse <= recovery_bound,
@@ -201,8 +212,16 @@ fn gam_simplex_frechet_mean_recovers_known_aitchison_center() {
     let ref_clr_comp = r.vector("clr_comp");
     let ref_clr_rob = r.vector("clr_rob");
     assert_eq!(ref_center.len(), 3, "reference center must be 3-component");
-    assert_eq!(ref_clr_comp.len(), 3, "reference clr_comp must be 3-component");
-    assert_eq!(ref_clr_rob.len(), 3, "reference clr_rob must be 3-component");
+    assert_eq!(
+        ref_clr_comp.len(),
+        3,
+        "reference clr_comp must be 3-component"
+    );
+    assert_eq!(
+        ref_clr_rob.len(),
+        3,
+        "reference clr_rob must be 3-component"
+    );
 
     // Ground-truth correctness: gam == exact analytic closed geometric mean.
     let center_err = max_abs_diff(&gam_mean, ref_center);
@@ -301,7 +320,8 @@ fn gam_simplex_frechet_mean_recovers_known_aitchison_center_on_real_data() {
     // distance — below the held-out total Aitchison dispersion (the no-centering
     // baseline) and no worse than robCompositions' acomp center fit on the SAME
     // train rows.
-    let ds = load_csvwith_inferred_schema(Path::new(SKYE_AFM_CSV)).expect("load skye_afm_lavas.csv");
+    let ds =
+        load_csvwith_inferred_schema(Path::new(SKYE_AFM_CSV)).expect("load skye_afm_lavas.csv");
     let col = ds.column_map();
     let a_idx = col["A"];
     let f_idx = col["F"];
@@ -316,7 +336,10 @@ fn gam_simplex_frechet_mean_recovers_known_aitchison_center_on_real_data() {
     let comps: Vec<[f64; 3]> = (0..n)
         .map(|i| {
             let s = a[i] + f[i] + m[i];
-            assert!(s > 0.0 && a[i] > 0.0 && f[i] > 0.0 && m[i] > 0.0, "row {i} not strictly positive");
+            assert!(
+                s > 0.0 && a[i] > 0.0 && f[i] > 0.0 && m[i] > 0.0,
+                "row {i} not strictly positive"
+            );
             [a[i] / s, f[i] / s, m[i] / s]
         })
         .collect();
@@ -346,9 +369,11 @@ fn gam_simplex_frechet_mean_recovers_known_aitchison_center_on_real_data() {
 
     // ---- held-out objective metric: mean squared Aitchison distance --------
     // (predicting every TEST composition by the TRAIN center).
-    let gam_holdout: f64 =
-        test_rows.iter().map(|&i| aitchison_sq(&gam_center, &comps[i])).sum::<f64>()
-            / test_rows.len() as f64;
+    let gam_holdout: f64 = test_rows
+        .iter()
+        .map(|&i| aitchison_sq(&gam_center, &comps[i]))
+        .sum::<f64>()
+        / test_rows.len() as f64;
 
     // No-centering baseline: held-out total Aitchison dispersion about the
     // TEST sample's own CLR centroid is the variance a center cannot reduce
@@ -356,9 +381,11 @@ fn gam_simplex_frechet_mean_recovers_known_aitchison_center_on_real_data() {
     // (1/3,1/3,1/3) as the trivial location-free predictor. A genuine center
     // must beat it by a wide margin.
     let uniform = [1.0_f64 / 3.0; 3];
-    let uniform_holdout: f64 =
-        test_rows.iter().map(|&i| aitchison_sq(&uniform, &comps[i])).sum::<f64>()
-            / test_rows.len() as f64;
+    let uniform_holdout: f64 = test_rows
+        .iter()
+        .map(|&i| aitchison_sq(&uniform, &comps[i]))
+        .sum::<f64>()
+        / test_rows.len() as f64;
 
     // ---- robCompositions / compositions BASELINE: acomp center on TRAIN ----
     // Pass an is_train mask so every emitted column is equal length (full n);
@@ -383,12 +410,18 @@ fn gam_simplex_frechet_mean_recovers_known_aitchison_center_on_real_data() {
         "#,
     );
     let ref_center_vec = r.vector("center");
-    assert_eq!(ref_center_vec.len(), 3, "reference center must be 3-component");
+    assert_eq!(
+        ref_center_vec.len(),
+        3,
+        "reference center must be 3-component"
+    );
     let ref_center = [ref_center_vec[0], ref_center_vec[1], ref_center_vec[2]];
 
-    let ref_holdout: f64 =
-        test_rows.iter().map(|&i| aitchison_sq(&ref_center, &comps[i])).sum::<f64>()
-            / test_rows.len() as f64;
+    let ref_holdout: f64 = test_rows
+        .iter()
+        .map(|&i| aitchison_sq(&ref_center, &comps[i]))
+        .sum::<f64>()
+        / test_rows.len() as f64;
 
     eprintln!(
         "SKYE AFM held-out (n_train={} n_test={}): gam_center=[{:.5},{:.5},{:.5}] \

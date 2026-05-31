@@ -324,7 +324,11 @@ fn r2(pred: &[f64], truth: &[f64]) -> f64 {
 /// reference data.frame as the training columns. Only the first `v.len()`
 /// entries are ever read back inside the Python body.
 fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
-    assert!(v.len() <= len, "pad target {len} shorter than source {}", v.len());
+    assert!(
+        v.len() <= len,
+        "pad target {len} shorter than source {}",
+        v.len()
+    );
     let fill = v.last().copied().unwrap_or(0.0);
     let mut out = v.to_vec();
     out.resize(len, fill);

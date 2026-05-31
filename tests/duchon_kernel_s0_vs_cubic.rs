@@ -53,7 +53,8 @@ fn gam_fit_on_grid(
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula(formula, ds, &cfg).unwrap_or_else(|e| panic!("gam fit '{formula}': {e}"));
+    let result =
+        fit_from_formula(formula, ds, &cfg).unwrap_or_else(|e| panic!("gam fit '{formula}': {e}"));
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for '{formula}'");
     };
@@ -88,7 +89,9 @@ fn duchon_s0_thinplate_and_cubic_are_both_reachable_and_recover() {
 
     let headers = ["x", "z", "y"].into_iter().map(String::from).collect();
     let rows = (0..n)
-        .map(|i| csv::StringRecord::from(vec![x[i].to_string(), z[i].to_string(), y[i].to_string()]))
+        .map(|i| {
+            csv::StringRecord::from(vec![x[i].to_string(), z[i].to_string(), y[i].to_string()])
+        })
         .collect();
     let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode 2d dataset");
     let col = ds.column_map();
@@ -112,8 +115,14 @@ fn duchon_s0_thinplate_and_cubic_are_both_reachable_and_recover() {
     // Default (no power) is the magic cubic s=(d-1)/2 → r³; explicit power=0 is
     // the integer-order Duchon kernel s=0 → r²·log r (the thin-plate kernel).
     let gam_cubic = gam_fit_on_grid("y ~ duchon(x, z, k=49)", &ds, x_idx, z_idx, &gx, &gz);
-    let gam_thinplate =
-        gam_fit_on_grid("y ~ duchon(x, z, k=49, power=0)", &ds, x_idx, z_idx, &gx, &gz);
+    let gam_thinplate = gam_fit_on_grid(
+        "y ~ duchon(x, z, k=49, power=0)",
+        &ds,
+        x_idx,
+        z_idx,
+        &gx,
+        &gz,
+    );
 
     // ---- mgcv Duchon bs="ds", m=c(2,0): the r²·log r reference -------------
     let mut x_all = x.clone();

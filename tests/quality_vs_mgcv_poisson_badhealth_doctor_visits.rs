@@ -43,8 +43,7 @@ use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith
 use ndarray::Array2;
 use std::path::Path;
 
-const BADHEALTH_CSV: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/badhealth.csv");
+const BADHEALTH_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/badhealth.csv");
 
 /// Mean Poisson deviance per observation between observed counts `y` and fitted
 /// means `mu`: `(1/n) * sum 2*( y*log(y/mu) - (y - mu) )`, with the convention
@@ -344,8 +343,7 @@ fn gam_poisson_predicts_badhealth_visits_better_than_baseline_on_real_data() {
         family: Some("poisson".to_string()),
         ..FitConfig::default()
     };
-    let result =
-        fit_from_formula("numvisit ~ te(age, badh)", &train_ds, &cfg).expect("gam fit");
+    let result = fit_from_formula("numvisit ~ te(age, badh)", &train_ds, &cfg).expect("gam fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for the Poisson(log) family");
     };

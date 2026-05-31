@@ -80,8 +80,11 @@ fn gam_beta_logit_recovers_smooth_truth() {
     // the design — the natural accuracy floor for recovering the mean.
     // Var(y_i) = mu_i (1 - mu_i) / (1 + phi); sd_bar = sqrt(mean Var).
     let noise_sd_bar = {
-        let mean_var: f64 =
-            mu_truth.iter().map(|&m| m * (1.0 - m) / (1.0 + PHI)).sum::<f64>() / N as f64;
+        let mean_var: f64 = mu_truth
+            .iter()
+            .map(|&m| m * (1.0 - m) / (1.0 + PHI))
+            .sum::<f64>()
+            / N as f64;
         mean_var.sqrt()
     };
 

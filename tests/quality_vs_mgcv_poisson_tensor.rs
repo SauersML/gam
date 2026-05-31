@@ -213,7 +213,11 @@ fn gam_poisson_tensor_recovers_true_mean_surface() {
 /// Lower is better; 0 is a perfect fit. We assert an ABSOLUTE bar on this and a
 /// match-or-beat margin against mgcv on the SAME held-out rows.
 fn poisson_deviance(pred_mean: &[f64], obs: &[f64]) -> f64 {
-    assert_eq!(pred_mean.len(), obs.len(), "poisson_deviance length mismatch");
+    assert_eq!(
+        pred_mean.len(),
+        obs.len(),
+        "poisson_deviance length mismatch"
+    );
     let n = obs.len() as f64;
     let mut s = 0.0;
     for (&mu, &y) in pred_mean.iter().zip(obs) {

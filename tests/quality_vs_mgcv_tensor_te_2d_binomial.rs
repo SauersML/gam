@@ -184,10 +184,7 @@ fn gam_tensor_te_2d_binomial_logit_matches_mgcv() {
     // generating surface has logit-scale range up to pi/2 ~= 1.57 each margin,
     // so the centered truth spans well over 1.5 in eta; an RMSE that is a small
     // fraction of that means the structure is genuinely recovered, not the noise.
-    let truth_range = truth_c
-        .iter()
-        .cloned()
-        .fold(f64::NEG_INFINITY, f64::max)
+    let truth_range = truth_c.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
         - truth_c.iter().cloned().fold(f64::INFINITY, f64::min);
 
     // For context only (NOT a pass criterion): how close gam lands to mgcv.

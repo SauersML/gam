@@ -46,10 +46,10 @@ use gam::{
     load_csvwith_inferred_schema,
 };
 use ndarray::Array2;
-use std::path::Path;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
+use std::path::Path;
 
 /// Geographic (lat, lon) in degrees → unit vector on S², pole on +z. Mirrors
 /// `gam::gpu::sphere::latlon_to_xyz_host`: x=cos(lat)cos(lon), y=cos(lat)sin(lon),
@@ -370,7 +370,8 @@ fn gam_sphere_smooth_is_rotation_equivariant_and_recovers_truth_on_real_data() {
         env!("CARGO_MANIFEST_DIR"),
         "/bench/datasets/global_major_city_temp.csv"
     );
-    let ds = load_csvwith_inferred_schema(Path::new(TEMP_CSV)).expect("load global_major_city_temp.csv");
+    let ds =
+        load_csvwith_inferred_schema(Path::new(TEMP_CSV)).expect("load global_major_city_temp.csv");
     let col = ds.column_map();
     let lat_idx = col["lat"];
     let lon_idx = col["lon"];
@@ -379,7 +380,10 @@ fn gam_sphere_smooth_is_rotation_equivariant_and_recovers_truth_on_real_data() {
     let lon: Vec<f64> = ds.values.column(lon_idx).to_vec();
     let temp: Vec<f64> = ds.values.column(temp_idx).to_vec();
     let n = lat.len();
-    assert!(n >= 90, "global_major_city_temp should have ~100 rows, got {n}");
+    assert!(
+        n >= 90,
+        "global_major_city_temp should have ~100 rows, got {n}"
+    );
 
     // ---- deterministic train/test split: every 4th row held out -----------
     let is_test = |i: usize| i % 4 == 0;
@@ -569,7 +573,11 @@ fn make_temp_dataset(lats: &[f64], lons: &[f64], temps: &[f64]) -> gam::data::En
 /// shorter held-out coordinates can ride along in the reference data.frame; only
 /// the first `v.len()` entries are read back inside the R body.
 fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
-    assert!(v.len() <= len, "pad target {len} shorter than source {}", v.len());
+    assert!(
+        v.len() <= len,
+        "pad target {len} shorter than source {}",
+        v.len()
+    );
     let fill = v.last().copied().unwrap_or(0.0);
     let mut out = v.to_vec();
     out.resize(len, fill);

@@ -427,9 +427,7 @@ fn gam_binomial_logit_holdout_predictive_quality_on_real_data() {
     //     One run_python call; every Column is full length (n rows) and the
     //     `is_train` mask selects identical train/test rows in identical order.
     // ===================================================================
-    let is_train_mask: Vec<f64> = (0..n)
-        .map(|i| if is_test(i) { 0.0 } else { 1.0 })
-        .collect();
+    let is_train_mask: Vec<f64> = (0..n).map(|i| if is_test(i) { 0.0 } else { 1.0 }).collect();
     let py = run_python(
         &[
             Column::new("pc1", &pc1),

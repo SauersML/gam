@@ -221,7 +221,8 @@ fn gam_smooth_transformation_matches_r_tram_on_heart_failure() {
     let age_max = age.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let age_span = age_max - age_min;
     // The exact systematic age effect (used both to build y and as the truth target).
-    let true_effect = |a: f64| SIGNAL_AMP * (std::f64::consts::TAU * (a - age_min) / age_span).sin();
+    let true_effect =
+        |a: f64| SIGNAL_AMP * (std::f64::consts::TAU * (a - age_min) / age_span).sin();
     let mut rng = SplitMix64::new(0x7A11_B0DE_2026_0529);
     let mut y = Vec::with_capacity(n);
     for i in 0..n {

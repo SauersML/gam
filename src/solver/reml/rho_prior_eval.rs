@@ -298,7 +298,9 @@ mod tests {
             let cost_at = |k: usize, delta: f64| -> f64 {
                 let mut r = rho.clone();
                 r[k] += delta;
-                evaluate(prior, &r, InvalidPriorPolicy::HardError).unwrap().cost
+                evaluate(prior, &r, InvalidPriorPolicy::HardError)
+                    .unwrap()
+                    .cost
             };
             let (h_grad, h_hess) = (1e-6, 1e-4);
             for k in 0..rho.len() {
@@ -308,8 +310,8 @@ mod tests {
                     "gradient mismatch at {k}: fd {fd_grad} vs {}",
                     base.gradient[k]
                 );
-                let fd_hess =
-                    (cost_at(k, h_hess) - 2.0 * base.cost + cost_at(k, -h_hess)) / (h_hess * h_hess);
+                let fd_hess = (cost_at(k, h_hess) - 2.0 * base.cost + cost_at(k, -h_hess))
+                    / (h_hess * h_hess);
                 let analytic_hess = base.hessian.as_ref().map_or(0.0, |h| h[[k, k]]);
                 assert!(
                     (fd_hess - analytic_hess).abs() <= 1e-4,
@@ -404,7 +406,10 @@ mod tests {
         tail *= h;
         assert!((total - 1.0).abs() < 1e-4, "∫ p(ρ) dρ = {total}");
         // P(d > U) recovered from the ρ-density must equal the calibration α.
-        assert!((tail - alpha).abs() < 1e-3, "P(d>U) = {tail} vs α = {alpha}");
+        assert!(
+            (tail - alpha).abs() < 1e-3,
+            "P(d>U) = {tail} vs α = {alpha}"
+        );
     }
 
     #[test]
@@ -421,16 +426,22 @@ mod tests {
             // cost + log p(ρ) is the ρ-independent constant ln(θ/2).
             approx(cost + pc_log_pdf(upper, alpha, r), (0.5 * theta).ln());
             // grad = −d/dρ log p  (FD on the log-density).
-            let dlp = (pc_log_pdf(upper, alpha, r + h1) - pc_log_pdf(upper, alpha, r - h1))
-                / (2.0 * h1);
+            let dlp =
+                (pc_log_pdf(upper, alpha, r + h1) - pc_log_pdf(upper, alpha, r - h1)) / (2.0 * h1);
             let neg_dlp = -dlp;
-            assert!((grad - neg_dlp).abs() < 1e-5, "grad {grad} vs {neg_dlp} at r={r}");
+            assert!(
+                (grad - neg_dlp).abs() < 1e-5,
+                "grad {grad} vs {neg_dlp} at r={r}"
+            );
             // hess = −d²/dρ² log p (FD), and is strictly positive (convex).
             let d2lp = (pc_log_pdf(upper, alpha, r + h2) - 2.0 * pc_log_pdf(upper, alpha, r)
                 + pc_log_pdf(upper, alpha, r - h2))
                 / (h2 * h2);
             let neg_d2lp = -d2lp;
-            assert!((hess - neg_d2lp).abs() < 1e-4, "hess {hess} vs {neg_d2lp} at r={r}");
+            assert!(
+                (hess - neg_d2lp).abs() < 1e-4,
+                "hess {hess} vs {neg_d2lp} at r={r}"
+            );
             assert!(hess > 0.0, "PC curvature must be positive, got {hess}");
         }
     }
@@ -447,9 +458,13 @@ mod tests {
             tail_prob: 0.05,
         };
         let cost = |r: f64| {
-            evaluate(&prior, &Array1::from_vec(vec![r]), InvalidPriorPolicy::HardError)
-                .unwrap()
-                .cost
+            evaluate(
+                &prior,
+                &Array1::from_vec(vec![r]),
+                InvalidPriorPolicy::HardError,
+            )
+            .unwrap()
+            .cost
         };
         // Wiggly (ρ = −4) is penalized far more than smooth (ρ = +4).
         assert!(
@@ -467,7 +482,10 @@ mod tests {
         )
         .unwrap()
         .gradient[0];
-        assert!((g_far - 0.5).abs() < 1e-3, "far over-smoothing slope {g_far}");
+        assert!(
+            (g_far - 0.5).abs() < 1e-3,
+            "far over-smoothing slope {g_far}"
+        );
     }
 
     #[test]

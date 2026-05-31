@@ -119,7 +119,10 @@ fn gam_random_intercept_by_smooth_recovers_truth() {
     // common x, so centering the TRUE intercept_g the same way gam's anchor is
     // centered makes the two directly comparable.
     let true_intercept_mean = intercept_g.iter().sum::<f64>() / N_GROUPS as f64;
-    let true_intercept_dev: Vec<f64> = intercept_g.iter().map(|v| v - true_intercept_mean).collect();
+    let true_intercept_dev: Vec<f64> = intercept_g
+        .iter()
+        .map(|v| v - true_intercept_mean)
+        .collect();
 
     let headers = vec!["x".to_string(), "g".to_string(), "y".to_string()];
     let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode combined dataset");
@@ -352,7 +355,8 @@ fn gam_random_intercept_by_smooth_recovers_truth_on_real_data() {
     init_parallelism();
 
     // ---- load the real sleepstudy data (Reaction, Days, Subject) ----------
-    let ds_raw = load_csvwith_inferred_schema(Path::new(SLEEPSTUDY_CSV)).expect("load sleepstudy.csv");
+    let ds_raw =
+        load_csvwith_inferred_schema(Path::new(SLEEPSTUDY_CSV)).expect("load sleepstudy.csv");
     let col = ds_raw.column_map();
     let reaction_idx = col["Reaction"];
     let days_idx = col["Days"];
@@ -386,7 +390,10 @@ fn gam_random_intercept_by_smooth_recovers_truth_on_real_data() {
     subjects_sorted.sort_unstable();
     subjects_sorted.dedup();
     let n_subjects = subjects_sorted.len();
-    assert_eq!(n_subjects, 18, "sleepstudy has 18 subjects, got {n_subjects}");
+    assert_eq!(
+        n_subjects, 18,
+        "sleepstudy has 18 subjects, got {n_subjects}"
+    );
     let subject_code = |sid: i64| -> usize {
         subjects_sorted
             .iter()

@@ -42,9 +42,7 @@ use gam::custom_family::{
 use gam::matrix::{DenseDesignMatrix, DesignMatrix, LinearOperator};
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, relative_l2, run_python};
-use gam::{
-    FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema,
-};
+use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::{Array1, Array2};
 use std::path::Path;
 
@@ -196,21 +194,16 @@ fn custom_poisson_identity_link_recovers_truth_and_predicts() {
     // to statsmodels (no spline reimplementation), guaranteeing identical-data,
     // identical-design comparison.
     let mean_x: f64 = train_idx.iter().map(|&i| x[i]).sum::<f64>() / n_train as f64;
-    let var_x: f64 =
-        train_idx.iter().map(|&i| (x[i] - mean_x).powi(2)).sum::<f64>() / n_train as f64;
+    let var_x: f64 = train_idx
+        .iter()
+        .map(|&i| (x[i] - mean_x).powi(2))
+        .sum::<f64>()
+        / n_train as f64;
     let sd_x = var_x.sqrt().max(1e-12);
     let z_of = |xi: f64| -> f64 { (xi - mean_x) / sd_x };
     // Centering offsets for the quadratic/cubic powers, computed on train rows.
-    let m2: f64 = train_idx
-        .iter()
-        .map(|&i| z_of(x[i]).powi(2))
-        .sum::<f64>()
-        / n_train as f64;
-    let m3: f64 = train_idx
-        .iter()
-        .map(|&i| z_of(x[i]).powi(3))
-        .sum::<f64>()
-        / n_train as f64;
+    let m2: f64 = train_idx.iter().map(|&i| z_of(x[i]).powi(2)).sum::<f64>() / n_train as f64;
+    let m3: f64 = train_idx.iter().map(|&i| z_of(x[i]).powi(3)).sum::<f64>() / n_train as f64;
 
     let p = 4usize; // [1, z, z2-centered, z3-centered]
     let row_of = |xi: f64| -> [f64; 4] {
@@ -293,9 +286,7 @@ fn custom_poisson_identity_link_recovers_truth_and_predicts() {
     // The CSV carries the FULL response, the FULL design columns, and a
     // train/test flag, so statsmodels fits on train and predicts on the same
     // held-out rows from byte-identical data.
-    let train_flag: Vec<f64> = (0..n)
-        .map(|i| if is_test(i) { 0.0 } else { 1.0 })
-        .collect();
+    let train_flag: Vec<f64> = (0..n).map(|i| if is_test(i) { 0.0 } else { 1.0 }).collect();
     let r = run_python(
         &[
             Column::new("y", &y),

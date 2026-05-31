@@ -37,15 +37,15 @@
 //! `Age` coefficient — each scored on the *same* held-out rows.
 
 use csv::StringRecord;
+use gam::families::survival_construction::{
+    SurvivalTimeBasisConfig, evaluate_survival_time_basis_row,
+    resolved_survival_time_basis_config_from_build,
+};
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, relative_l2, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
-};
-use gam::families::survival_construction::{
-    SurvivalTimeBasisConfig, evaluate_survival_time_basis_row,
-    resolved_survival_time_basis_config_from_build,
 };
 use ndarray::Array2;
 use std::fs::File;
@@ -62,8 +62,10 @@ const CIRRHOSIS_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets
 // the dominant prognostic covariate in this trial — under the same
 // Royston-Parmar flexible-parametric (smooth-baseline) proportional-hazards
 // structure as the cirrhosis arm above.
-const VETERAN_LUNG_CSV: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/veteran_lung.csv");
+const VETERAN_LUNG_CSV: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/bench/datasets/veteran_lung.csv"
+);
 
 // Royston-Parmar flexible-parametric spline flexibility. gam's transformation
 // time basis uses a monotone I-spline on log(t); flexsurv uses a natural cubic
@@ -121,7 +123,11 @@ fn load_cirrhosis() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
 /// tied when `risk[i] == risk[j]` (counted as a half). Pairs where the earlier
 /// time is a censoring are not comparable. Plain `O(n^2)` Rust over the test set.
 fn harrell_c_index(time: &[f64], event: &[f64], risk: &[f64]) -> f64 {
-    assert_eq!(time.len(), event.len(), "C-index time/event length mismatch");
+    assert_eq!(
+        time.len(),
+        event.len(),
+        "C-index time/event length mismatch"
+    );
     assert_eq!(time.len(), risk.len(), "C-index time/risk length mismatch");
     let n = time.len();
     let mut comparable = 0.0_f64;
@@ -165,22 +171,37 @@ fn gam_rp_spline_holdout_concordance_matches_or_beats_flexsurvspline_on_cirrhosi
 
     let test_mask: Vec<bool> = (0..n).map(|i| i % TEST_STRIDE == 0).collect();
     let train_days: Vec<f64> = (0..n).filter(|&i| !test_mask[i]).map(|i| days[i]).collect();
-    let train_event: Vec<f64> = (0..n).filter(|&i| !test_mask[i]).map(|i| event[i]).collect();
+    let train_event: Vec<f64> = (0..n)
+        .filter(|&i| !test_mask[i])
+        .map(|i| event[i])
+        .collect();
     let train_age: Vec<f64> = (0..n)
         .filter(|&i| !test_mask[i])
         .map(|i| age_years[i])
         .collect();
     let test_days: Vec<f64> = (0..n).filter(|&i| test_mask[i]).map(|i| days[i]).collect();
     let test_event: Vec<f64> = (0..n).filter(|&i| test_mask[i]).map(|i| event[i]).collect();
-    let test_age: Vec<f64> = (0..n).filter(|&i| test_mask[i]).map(|i| age_years[i]).collect();
+    let test_age: Vec<f64> = (0..n)
+        .filter(|&i| test_mask[i])
+        .map(|i| age_years[i])
+        .collect();
 
     let n_train = train_days.len();
     let n_test = test_days.len();
-    assert!(n_train > 200 && n_test > 50, "split sizes off: {n_train}/{n_test}");
+    assert!(
+        n_train > 200 && n_test > 50,
+        "split sizes off: {n_train}/{n_test}"
+    );
     let train_events: usize = train_event.iter().filter(|&&e| e == 1.0).count();
     let test_events: usize = test_event.iter().filter(|&&e| e == 1.0).count();
-    assert!(train_events > 80, "expected >80 train deaths, got {train_events}");
-    assert!(test_events > 20, "expected >20 test deaths, got {test_events}");
+    assert!(
+        train_events > 80,
+        "expected >80 train deaths, got {train_events}"
+    );
+    assert!(
+        test_events > 20,
+        "expected >20 test deaths, got {test_events}"
+    );
 
     // Encode the TRAIN survival frame for gam. Identical train rows feed flexsurv
     // below; the test rows are never shown to either fitter.
@@ -197,7 +218,8 @@ fn gam_rp_spline_holdout_concordance_matches_or_beats_flexsurvspline_on_cirrhosi
             ])
         })
         .collect();
-    let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode cirrhosis train frame");
+    let ds =
+        encode_recordswith_inferred_schema(headers, rows).expect("encode cirrhosis train frame");
 
     // ---- fit gam on TRAIN: Royston-Parmar flexible parametric baseline ----
     let cfg = FitConfig {
@@ -282,7 +304,10 @@ fn gam_rp_spline_holdout_concordance_matches_or_beats_flexsurvspline_on_cirrhosi
     let mut sorted_age = train_age.clone();
     sorted_age.sort_by(f64::total_cmp);
     let age_q = |q: f64| sorted_age[((q * n_train as f64) as usize).min(n_train - 1)];
-    let ctx_ages: Vec<f64> = [0.10, 0.30, 0.50, 0.70, 0.90].into_iter().map(age_q).collect();
+    let ctx_ages: Vec<f64> = [0.10, 0.30, 0.50, 0.70, 0.90]
+        .into_iter()
+        .map(age_q)
+        .collect();
 
     let mut gam_log_cumhaz = Vec::with_capacity(ctx_ages.len() * ctx_times.len());
     for &age in &ctx_ages {
@@ -437,10 +462,19 @@ fn gam_rp_spline_holdout_concordance_matches_or_beats_flexsurvspline_on_cirrhosi
     // file order) is the untouched held-out test set; the rest train. No RNG.
     let test_mask: Vec<bool> = (0..n).map(|i| i % TEST_STRIDE == 0).collect();
     let train_time: Vec<f64> = (0..n).filter(|&i| !test_mask[i]).map(|i| time[i]).collect();
-    let train_status: Vec<f64> = (0..n).filter(|&i| !test_mask[i]).map(|i| status[i]).collect();
-    let train_karno: Vec<f64> = (0..n).filter(|&i| !test_mask[i]).map(|i| karno[i]).collect();
+    let train_status: Vec<f64> = (0..n)
+        .filter(|&i| !test_mask[i])
+        .map(|i| status[i])
+        .collect();
+    let train_karno: Vec<f64> = (0..n)
+        .filter(|&i| !test_mask[i])
+        .map(|i| karno[i])
+        .collect();
     let test_time: Vec<f64> = (0..n).filter(|&i| test_mask[i]).map(|i| time[i]).collect();
-    let test_status: Vec<f64> = (0..n).filter(|&i| test_mask[i]).map(|i| status[i]).collect();
+    let test_status: Vec<f64> = (0..n)
+        .filter(|&i| test_mask[i])
+        .map(|i| status[i])
+        .collect();
     let test_karno: Vec<f64> = (0..n).filter(|&i| test_mask[i]).map(|i| karno[i]).collect();
 
     let n_train = train_time.len();
@@ -451,8 +485,14 @@ fn gam_rp_spline_holdout_concordance_matches_or_beats_flexsurvspline_on_cirrhosi
     );
     let train_events: usize = train_status.iter().filter(|&&e| e == 1.0).count();
     let test_events: usize = test_status.iter().filter(|&&e| e == 1.0).count();
-    assert!(train_events > 80, "expected >80 train deaths, got {train_events}");
-    assert!(test_events > 20, "expected >20 test deaths, got {test_events}");
+    assert!(
+        train_events > 80,
+        "expected >80 train deaths, got {train_events}"
+    );
+    assert!(
+        test_events > 20,
+        "expected >20 test deaths, got {test_events}"
+    );
 
     // Encode the TRAIN survival frame for gam. The same train rows in the same
     // order feed flexsurv below; test rows are never shown to either fitter.
@@ -469,8 +509,7 @@ fn gam_rp_spline_holdout_concordance_matches_or_beats_flexsurvspline_on_cirrhosi
             ])
         })
         .collect();
-    let ds =
-        encode_recordswith_inferred_schema(headers, rows).expect("encode veteran train frame");
+    let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode veteran train frame");
 
     // ---- fit gam on TRAIN: Royston-Parmar flexible-parametric baseline ----
     // Smooth (monotone I-spline) log-cumulative-hazard baseline shape on log(t)

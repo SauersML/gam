@@ -437,25 +437,23 @@ emit("cif_tx", cif_on_grid(2))
 
     // Mean IPCW Brier for cause `code` over the scored horizons, given a
     // per-(cause, horizon) predictor `pred(cause_idx, j) -> Vec<f64> of len n`.
-    let brier_over_grid = |code: f64,
-                           cause_idx: usize,
-                           pred: &dyn Fn(usize, usize) -> Vec<f64>|
-     -> f64 {
-        let mut s = 0.0;
-        for &j in &scored {
-            let p = pred(cause_idx, j);
-            s += ipcw_brier(
-                &p,
-                &days,
-                &event_code,
-                code,
-                grid[j],
-                g_at_grid[j],
-                &g_at_event,
-            );
-        }
-        s / scored.len() as f64
-    };
+    let brier_over_grid =
+        |code: f64, cause_idx: usize, pred: &dyn Fn(usize, usize) -> Vec<f64>| -> f64 {
+            let mut s = 0.0;
+            for &j in &scored {
+                let p = pred(cause_idx, j);
+                s += ipcw_brier(
+                    &p,
+                    &days,
+                    &event_code,
+                    code,
+                    grid[j],
+                    g_at_grid[j],
+                    &g_at_event,
+                );
+            }
+            s / scored.len() as f64
+        };
 
     // gam: subject-specific CIF predictions.
     let gam_pred = |cause_idx: usize, j: usize| gam_subject_cif(cause_idx, j);

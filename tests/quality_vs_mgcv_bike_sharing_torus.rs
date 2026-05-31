@@ -61,8 +61,10 @@ use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith
 use ndarray::Array2;
 use std::path::Path;
 
-const BIKE_TORUS_CSV: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/bike_sharing_torus.csv");
+const BIKE_TORUS_CSV: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/bench/datasets/bike_sharing_torus.csv"
+);
 
 /// Seasonal period: a full year mapped to a [0, 365) circle, Dec wrapping to Jan.
 const SEASON_PERIOD: f64 = 365.0;
@@ -101,7 +103,11 @@ fn gam_torus_predicts_bike_sharing_diurnal_seasonal_cycle_vs_mgcv() {
     let hour: Vec<f64> = ds.values.column(hour_idx).to_vec();
     let log_count: Vec<f64> = ds.values.column(log_idx).to_vec();
     let n = season.len();
-    assert_eq!(n, 73 * 24, "bike torus should be a full 73x24 grid, got {n}");
+    assert_eq!(
+        n,
+        73 * 24,
+        "bike torus should be a full 73x24 grid, got {n}"
+    );
 
     // ---- deterministic train/test split: every 5th cell is held out --------
     // Rows are season-major (then hour) in the CSV, so striding by 5 scatters the

@@ -828,11 +828,20 @@ pub fn coefficient_label(block: impl Into<String>, column: usize) -> Coefficient
 #[derive(Debug, Clone, PartialEq)]
 pub enum CoefficientGroupPrior {
     Flat,
-    NormalLogPrecision { mean: f64, sd: f64 },
-    GammaPrecision { shape: f64, rate: f64 },
+    NormalLogPrecision {
+        mean: f64,
+        sd: f64,
+    },
+    GammaPrecision {
+        shape: f64,
+        rate: f64,
+    },
     /// Penalized-complexity prior calibrated by `P(exp(-ρ/2) > upper) =
     /// tail_prob`; see [`crate::types::RhoPrior::PenalizedComplexity`].
-    PenalizedComplexity { upper: f64, tail_prob: f64 },
+    PenalizedComplexity {
+        upper: f64,
+        tail_prob: f64,
+    },
 }
 
 impl CoefficientGroupPrior {
@@ -5332,9 +5341,7 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
         axis: usize,
         v: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        self.lifted_transpose_mul_with_base(v, |weighted| {
-            self.base.transpose_mul(axis, weighted)
-        })
+        self.lifted_transpose_mul_with_base(v, |weighted| self.base.transpose_mul(axis, weighted))
     }
 
     fn forward_mul(
@@ -5362,7 +5369,8 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
         v: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
         self.lifted_transpose_mul_with_base(v, |weighted| {
-            self.base.transpose_mul_second_cross(axis_d, axis_e, weighted)
+            self.base
+                .transpose_mul_second_cross(axis_d, axis_e, weighted)
         })
     }
 
@@ -10669,13 +10677,12 @@ fn exact_newton_d2h_apply<F: CustomFamily + Sync>(
     v: &Array1<f64>,
 ) -> Result<Option<DriftDerivResult>, String> {
     if use_outer_curvature_derivatives {
-        return match family
-            .exact_newton_outer_curvature_second_directional_derivative_with_specs(
-                synced_states,
-                specs,
-                u,
-                v,
-            )? {
+        return match family.exact_newton_outer_curvature_second_directional_derivative_with_specs(
+            synced_states,
+            specs,
+            u,
+            v,
+        )? {
             Some(m) => {
                 let mut sym =
                     symmetrized_square_matrix(m, total, "joint exact-newton d2H shape mismatch")?;
@@ -16464,13 +16471,7 @@ impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
         v_l: &Array1<f64>,
         u_kl: &Array1<f64>,
     ) -> Result<Option<DriftDerivResult>, String> {
-        joint_second_derivative_correction_result(
-            self.compute_dh,
-            self.compute_d2h,
-            v_k,
-            v_l,
-            u_kl,
-        )
+        joint_second_derivative_correction_result(self.compute_dh, self.compute_d2h, v_k, v_l, u_kl)
     }
 
     fn hessian_second_derivative_corrections_result(

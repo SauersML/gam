@@ -23,10 +23,10 @@
 //! we apply `1/(1+exp(-eta))` ourselves on gam's own linear predictor. A genuine
 //! shortfall here is a real bug, never a reason to loosen a bound.
 
+use gam::data::EncodedDataset;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, relative_l2, run_python, run_r};
-use gam::data::EncodedDataset;
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::path::Path;

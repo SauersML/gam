@@ -14421,8 +14421,8 @@ impl SurvivalMarginalSlopeFamily {
             for b in 0..p_marginal {
                 let dk0 = eg.basis_d2[[0, li]] * dh0 * mr[b];
                 let dk1 = xg.basis_d2[[0, li]] * dh1 * mr[b];
-                let dkd = xg.basis_d3[[0, li]] * dh1 * dr * mr[b]
-                    + xg.basis_d2[[0, li]] * ddr * mr[b];
+                let dkd =
+                    xg.basis_d3[[0, li]] * dh1 * dr * mr[b] + xg.basis_d2[[0, li]] * ddr * mr[b];
                 let v = f_pi[0] * dk0 + f_pi[1] * dk1 + f_pi[2] * dkd;
                 acc[[slices.time.start + ci, slices.marginal.start + b]] += v;
                 acc[[slices.marginal.start + b, slices.time.start + ci]] += v;

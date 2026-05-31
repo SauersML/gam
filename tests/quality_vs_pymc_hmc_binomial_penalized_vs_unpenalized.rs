@@ -354,10 +354,7 @@ fn gam_penalized_binomial_posterior_matches_pymc_and_concentrates_with_lambda() 
     // the best fit on the grid is the fair accuracy statistic) and require it to
     // be a small fraction of the signal range. This is the objective accuracy
     // claim — gam recovers the truth — and does not reference any peer tool.
-    let gam_best_rmse = gam_eta_rmse
-        .iter()
-        .cloned()
-        .fold(f64::INFINITY, f64::min);
+    let gam_best_rmse = gam_eta_rmse.iter().cloned().fold(f64::INFINITY, f64::min);
     let truth_bar = 0.25 * signal_range;
     eprintln!(
         "gam best-of-grid eta truth-recovery RMSE = {gam_best_rmse:.5} \
@@ -458,8 +455,7 @@ for li, lam in enumerate(LAMBDAS):
         // PyMC's posterior-mean fit on the η scale, and its truth-recovery RMSE.
         let pm_mean_arr = Array1::from(pm_mean.to_vec());
         let pm_eta: Array1<f64> = x_dense.dot(&pm_mean_arr);
-        let pm_eta_rmse =
-            gam::test_support::reference::rmse(pm_eta.as_slice().unwrap(), &truth);
+        let pm_eta_rmse = gam::test_support::reference::rmse(pm_eta.as_slice().unwrap(), &truth);
         pymc_best_rmse = pymc_best_rmse.min(pm_eta_rmse);
 
         // Context-only diagnostics: cross-engine rel-L2 on the penalized block.
@@ -469,10 +465,8 @@ for li, lam in enumerate(LAMBDAS):
         let pm_mean_pen: Vec<f64> = penalized_cols.iter().map(|&j| pm_mean[j]).collect();
         let gam_std_pen: Vec<f64> = penalized_cols.iter().map(|&j| gs[j]).collect();
         let pm_std_pen: Vec<f64> = penalized_cols.iter().map(|&j| pm_std[j]).collect();
-        let mean_rel_l2 =
-            gam::test_support::reference::relative_l2(&gam_mean_pen, &pm_mean_pen);
-        let std_rel_l2 =
-            gam::test_support::reference::relative_l2(&gam_std_pen, &pm_std_pen);
+        let mean_rel_l2 = gam::test_support::reference::relative_l2(&gam_mean_pen, &pm_mean_pen);
+        let std_rel_l2 = gam::test_support::reference::relative_l2(&gam_std_pen, &pm_std_pen);
         eprintln!(
             "lambda={lam:>5}: PyMC R-hat={pm_rhat:.4} eta_rmse_vs_truth={pm_eta_rmse:.5} \
              | context-only gam-vs-PyMC penalized-block rel_l2(mean)={mean_rel_l2:.4} \
@@ -603,7 +597,11 @@ fn gam_penalized_binomial_posterior_matches_pymc_and_concentrates_with_lambda_on
     let x_train = design_at(&train_pc1, &train_pc2);
     let x_test = design_at(&test_pc1, &test_pc2);
     let p = x_train.ncols();
-    assert_eq!(x_test.ncols(), p, "train/test design must share basis width");
+    assert_eq!(
+        x_test.ncols(),
+        p,
+        "train/test design must share basis width"
+    );
 
     let logistic = |eta: f64| 1.0 / (1.0 + (-eta).exp());
 
@@ -652,8 +650,7 @@ fn gam_penalized_binomial_posterior_matches_pymc_and_concentrates_with_lambda_on
     let mut columns: Vec<gam::test_support::reference::Column<'_>> = Vec::new();
     // Owned storage for design columns (must outlive the run_python call).
     let train_col_storage: Vec<Vec<f64>> = (0..p).map(|j| x_train.column(j).to_vec()).collect();
-    let test_col_storage: Vec<Vec<f64>> =
-        (0..p).map(|j| pad(&x_test.column(j).to_vec())).collect();
+    let test_col_storage: Vec<Vec<f64>> = (0..p).map(|j| pad(&x_test.column(j).to_vec())).collect();
     let train_name_storage: Vec<String> = (0..p).map(|j| format!("xtr{j}")).collect();
     let test_name_storage: Vec<String> = (0..p).map(|j| format!("xte{j}")).collect();
     for j in 0..p {
@@ -668,7 +665,10 @@ fn gam_penalized_binomial_posterior_matches_pymc_and_concentrates_with_lambda_on
     }
     columns.push(gam::test_support::reference::Column::new("ytr", &train_y));
     let test_n_col = vec![test_rows.len() as f64; n_train];
-    columns.push(gam::test_support::reference::Column::new("test_n", &test_n_col));
+    columns.push(gam::test_support::reference::Column::new(
+        "test_n",
+        &test_n_col,
+    ));
 
     let pen_flat: Vec<String> = s_pen.iter().map(|v| format!("{v:.17e}")).collect();
     let pen_literal = format!("[{}]", pen_flat.join(", "));
