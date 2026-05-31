@@ -1471,6 +1471,7 @@ pub fn build_smooth_basis(
                 "thinplate",
                 options,
                 &[
+                    SECONDARY_CENTER_CAP_OPTION,
                     "type",
                     "bs",
                     "by",
@@ -1500,7 +1501,11 @@ pub fn build_smooth_basis(
                 policy,
             )
             .map_err(|e| e.to_string())?;
-            let centers = parse_countwith_basis_alias(options, "centers", plan.centers)?;
+            let centers = parse_countwith_basis_alias(
+                options,
+                "centers",
+                cap_default_spatial_centers(options, plan.centers),
+            )?;
             let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
                 spatial_center_strategy_for_dimension(centers, cols.len())
             } else {
@@ -1636,6 +1641,7 @@ pub fn build_smooth_basis(
                 "matern",
                 options,
                 &[
+                    SECONDARY_CENTER_CAP_OPTION,
                     "type",
                     "bs",
                     "by",
@@ -1666,7 +1672,11 @@ pub fn build_smooth_basis(
                 policy,
             )
             .map_err(|e| e.to_string())?;
-            let centers = parse_countwith_basis_alias(options, "centers", plan.centers)?;
+            let centers = parse_countwith_basis_alias(
+                options,
+                "centers",
+                cap_default_spatial_centers(options, plan.centers),
+            )?;
             let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
                 spatial_center_strategy_for_dimension(centers, cols.len())
             } else {
@@ -1714,6 +1724,7 @@ pub fn build_smooth_basis(
                 "duchon",
                 options,
                 &[
+                    SECONDARY_CENTER_CAP_OPTION,
                     "type",
                     "bs",
                     "by",
@@ -1796,7 +1807,11 @@ pub fn build_smooth_basis(
             )
             .map_err(|e| e.to_string())?;
             let centers_explicit = has_explicit_countwith_basis_alias(options, "centers");
-            let requested_centers = parse_countwith_basis_alias(options, "centers", plan.centers)?;
+            let requested_centers = parse_countwith_basis_alias(
+                options,
+                "centers",
+                cap_default_spatial_centers(options, plan.centers),
+            )?;
             let polynomial_cols = match nullspace_order {
                 DuchonNullspaceOrder::Zero => 1,
                 DuchonNullspaceOrder::Linear => cols.len() + 1,
@@ -2342,6 +2357,31 @@ pub fn validate_known_options(
         }
     }
     Ok(())
+}
+
+/// Private (engine-injected) option that caps the *default* spatial center
+/// count for a secondary (distributional) predictor's smooth — see
+/// `solver::workflow::apply_secondary_predictor_basis_parsimony` and #501.
+///
+/// It is deliberately NOT one of the user-facing count aliases recognised by
+/// [`has_explicit_countwith_basis_alias`], so it never flips the spatial basis
+/// onto the explicit (hard) center-placement strategy: the cap lowers the
+/// *default* count while the `Auto` strategy is retained, so the count is still
+/// softly reduced when the data can't support it.
+pub(crate) const SECONDARY_CENTER_CAP_OPTION: &str = "__secondary_center_cap";
+
+/// Apply the secondary-predictor center cap to a *default* spatial center
+/// count. A no-op when the cap option is absent (the common case) or when the
+/// user supplied an explicit count (then `default_count` is ignored downstream
+/// by [`parse_countwith_basis_alias`] anyway).
+pub(crate) fn cap_default_spatial_centers(
+    options: &BTreeMap<String, String>,
+    default_count: usize,
+) -> usize {
+    match option_usize(options, SECONDARY_CENTER_CAP_OPTION) {
+        Some(cap) => default_count.min(cap),
+        None => default_count,
+    }
 }
 
 pub fn parse_countwith_basis_alias(
