@@ -15016,7 +15016,7 @@ where
             for j in i..k {
                 row[j] = kernel(i, j)?;
             }
-            Ok(())
+            Ok::<(), BasisError>(())
         })?;
     for i in 1..k {
         for j in 0..i {
