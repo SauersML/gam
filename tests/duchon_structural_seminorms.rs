@@ -2,36 +2,35 @@
 //! smoother.
 //!
 //! CONTRACT (the object these tests pin down): a non-periodic Euclidean Duchon
-//! term is a *structural* amplitude / slope / curvature smoother built on the
-//! cubic (`r^3`) polyharmonic basis. Its penalty is the sum of three data-jet
-//! seminorms over the basis, each with its own smoothing parameter:
+//! term is a polyharmonic smoother built on the cubic (`r^3`) basis, penalized
+//! by its own native reproducing-kernel norm (the analytic, closed-form analogue
+//! of mgcv's `bs="ds"`). Its penalty has two analytic blocks:
 //!
-//!   * `S0` — MASS / amplitude (centered deviation): `Σ_i (f(x_i) − f̄)²`.
-//!            Null space = the constant functions (the global mean is free).
-//!   * `S1` — TENSION / slope: `Σ_i ‖∇f(x_i)‖²`.
-//!            Null space = the constant functions (gradient kills constants).
-//!   * `S2` — STIFFNESS / curvature: `Σ_i ‖H f(x_i)‖_F²`.
-//!            Null space = the AFFINE functions (Hessian kills affine maps).
+//!   * `Primary` — the native roughness Gram `α²·Zᵀ K_CC Z`, which IS the exact
+//!            `(m+s)`-order Duchon seminorm. Null space = the AFFINE functions
+//!            (constant + linear): a polynomial in the null space has zero
+//!            `(m+s)`-order roughness. It penalizes curvature / wiggle.
+//!   * `DoublePenaltyNullspace` — an analytic shrinkage ridge on the affine null
+//!            space (the Wood `select=TRUE` pattern). It penalizes the affine
+//!            TREND, so the linear part is not left unpenalized; the global mean
+//!            is freed only later, by the model's identifiability transform.
 //!
-//! Crucially, the affine polynomial columns are INCLUDED in the slope and
-//! curvature penalties. The headline correctness claim — and the regression
-//! these tests guard — is that a pure-linear function therefore receives a
-//! NONZERO tension (`S1`) penalty. Under the old zero-padded-polynomial-block
-//! construction the affine columns sat in an unpenalized side block, so a
-//! linear function got exactly zero tension; that is the behaviour these tests
-//! must reject.
+//! The headline correctness claim — and the regression these tests guard — is
+//! that the linear TREND is genuinely penalized (by the ridge) while its
+//! ROUGHNESS is correctly annihilated (by the native Gram). Under the old
+//! zero-padded-polynomial-block construction the affine columns sat in an
+//! unpenalized side block; that is the behaviour these tests must reject.
 //!
-//! METHODOLOGY. The penalty matrices `S_k` returned by `build_duchon_basis`
-//! act on the design's own coefficient space: for a coefficient vector `c`,
-//! the seminorm value is the quadratic form `cᵀ S_k c` and equals the data-jet
-//! energy of the function `f = X c`. We never need the internal coordinates:
-//! for a target function `g` sampled at the data rows we recover the
-//! representing coefficients `c = argmin ‖X c − g‖²` by solving the normal
-//! equations (the design carries the affine columns, so constant / linear / and
-//! — at order ≥ 2 — quadratic targets are represented exactly, residual ≈ 0),
-//! then read off `cᵀ S_k c`. This is a coordinate-free, principled probe of the
-//! seminorm null spaces. We assert the structural pattern with absolute energy
-//! bounds tied to the penalty normalization, not to any reference tool.
+//! METHODOLOGY. The penalty matrices returned by `build_duchon_basis` act on the
+//! design's own coefficient space: for a coefficient vector `c`, the penalty value
+//! is the quadratic form `cᵀ S c` and equals the energy of the function `f = X c`.
+//! We never need the internal coordinates: for a target function `g` sampled at the
+//! data rows we recover the representing coefficients `c = argmin ‖X c − g‖²` by
+//! solving the normal equations (the design carries the affine columns, so constant
+//! and linear targets are represented exactly, residual ≈ 0), then read off
+//! `cᵀ S c`. This is a coordinate-free, principled probe of the penalty null
+//! spaces. We assert the structural pattern with absolute energy bounds tied to the
+//! penalty normalization, not to any reference tool.
 
 use gam::basis::{
     CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
@@ -65,8 +64,9 @@ fn duchon_spec(k: usize, order: DuchonNullspaceOrder) -> DuchonBasisSpec {
         periodic: None,
         length_scale: None,
         // d=2 cubic default s=(d-1)/2=0.5: satisfies CPD (2s<d) and yields the
-        // r^3 kernel, whose Hessian is finite at the center self-pairs the
-        // data-jet penalty evaluates (r^2 log r at power=0 would diverge there).
+        // r^3 kernel, whose value is finite at the center self-pairs that the
+        // native Gram K_CC evaluates (the r^2 log r kernel at power=0 is the
+        // thin-plate case; r^3 keeps the analytic seminorm clean here).
         power: 0.5,
         nullspace_order: order,
         // No extra intercept centering: we want the affine columns present in
@@ -78,15 +78,19 @@ fn duchon_spec(k: usize, order: DuchonNullspaceOrder) -> DuchonBasisSpec {
     }
 }
 
-/// One built Duchon basis: dense design plus the three structural seminorm
-/// matrices keyed by source. Each `S_k` is `None` when the construction dropped
-/// that block (numerically rank-zero) — a dropped tension/curvature block is
-/// itself a contract violation the tests below surface explicitly.
+/// One built Duchon basis: dense design plus the two analytic penalty blocks
+/// keyed by source. Each is `None` when the construction did not emit that block
+/// — a missing roughness Gram or null-space ridge is itself a contract violation
+/// the tests below surface explicitly.
 struct BuiltDuchon {
     design: Array2<f64>,
-    mass: Option<Array2<f64>>,
-    tension: Option<Array2<f64>>,
-    stiffness: Option<Array2<f64>>,
+    /// Native reproducing-norm roughness Gram `α²·Zᵀ K_CC Z` — the exact
+    /// `(m+s)`-order Duchon seminorm. Annihilates the affine null space
+    /// (constant + linear); penalizes curvature / wiggle.
+    primary: Option<Array2<f64>>,
+    /// Analytic null-space shrinkage ridge. Penalizes the affine trend's slope
+    /// (mean-free — the constant direction sits in its null space).
+    ridge: Option<Array2<f64>>,
 }
 
 fn build(data: &Array2<f64>, spec: &DuchonBasisSpec) -> BuiltDuchon {
@@ -99,11 +103,10 @@ fn build(data: &Array2<f64>, spec: &DuchonBasisSpec) -> BuiltDuchon {
         .clone();
 
     // `penalties` holds only the ACTIVE blocks, parallel to the active subset of
-    // `penaltyinfo` (dropped blocks appear in `penaltyinfo` but not in
-    // `penalties`). Walk them together to key each matrix by its source.
-    let mut mass = None;
-    let mut tension = None;
-    let mut stiffness = None;
+    // `penaltyinfo`. The analytic Duchon penalty emits a Primary roughness Gram
+    // and (when the null space is non-trivial) a DoublePenaltyNullspace ridge.
+    let mut primary = None;
+    let mut ridge = None;
     let active_sources = result
         .penaltyinfo
         .iter()
@@ -111,18 +114,16 @@ fn build(data: &Array2<f64>, spec: &DuchonBasisSpec) -> BuiltDuchon {
         .map(|info| info.source.clone());
     for (matrix, source) in result.penalties.iter().zip(active_sources) {
         match source {
-            PenaltySource::OperatorMass => mass = Some(matrix.clone()),
-            PenaltySource::OperatorTension => tension = Some(matrix.clone()),
-            PenaltySource::OperatorStiffness => stiffness = Some(matrix.clone()),
+            PenaltySource::Primary => primary = Some(matrix.clone()),
+            PenaltySource::DoublePenaltyNullspace => ridge = Some(matrix.clone()),
             _ => {}
         }
     }
 
     BuiltDuchon {
         design,
-        mass,
-        tension,
-        stiffness,
+        primary,
+        ridge,
     }
 }
 
@@ -185,168 +186,91 @@ fn linear_target(data: &Array2<f64>) -> Array1<f64> {
     g
 }
 
-fn quadratic_target(data: &Array2<f64>) -> Array1<f64> {
-    // 0.3 + Σ_j x_j² — non-affine, so the Hessian (stiffness) is nonzero.
-    let n = data.nrows();
-    let d = data.ncols();
-    let mut g = Array1::from_elem(n, 0.3);
-    for i in 0..n {
-        for j in 0..d {
-            g[i] += data[[i, j]] * data[[i, j]];
-        }
-    }
-    g
-}
+// ── (a) native Gram null space = affine; the ridge penalizes the trend ──────
 
-// ── (a) null spaces: S0 = constants, S1 = constants, S2 = affine ────────────
-
-/// The MASS seminorm (centered deviation) annihilates constants: a constant
-/// function has zero centered amplitude.
+/// The native reproducing-norm Gram `α²·Zᵀ K_CC Z` is the exact `(m+s)`-order
+/// Duchon seminorm, so it annihilates the AFFINE null space (constants AND
+/// pure-linear maps) and penalizes curvature. With an affine (m=2) null space the
+/// linear trend has zero `(m+s)`-order roughness, while the kernel block carries
+/// real roughness energy (non-degenerate Gram).
 #[test]
-fn mass_seminorm_null_space_is_constants() {
+fn native_gram_roughness_null_space_is_affine() {
     let data = synthetic_data(180, 2, 11);
     let spec = duchon_spec(16, DuchonNullspaceOrder::Linear);
     let built = build(&data, &spec);
-    let mass = built
-        .mass
+    let primary = built
+        .primary
         .as_ref()
-        .expect("mass (S0) penalty must be present");
+        .expect("native Gram (Primary) penalty must be present");
 
-    let c_const = coeff_for_target(&built.design, &constant_target(&data), "constant");
-    let energy_const = quad(mass, &c_const);
-
-    // Reference scale: a non-constant linear function should carry real mass
-    // energy, so we compare the constant's mass against that to make the "≈ 0"
-    // bound meaningful rather than absolute.
-    let c_lin = coeff_for_target(&built.design, &linear_target(&data), "linear");
-    let energy_lin = quad(mass, &c_lin);
-    assert!(
-        energy_lin > 1e-6,
-        "a non-constant linear function must carry nonzero MASS energy; got {energy_lin:.3e}"
-    );
-    assert!(
-        energy_const <= 1e-8 * energy_lin.max(1.0),
-        "MASS (S0) must annihilate constants: constant energy {energy_const:.3e} \
-         is not negligible vs linear-mass {energy_lin:.3e}"
-    );
-}
-
-/// The TENSION seminorm (slope) annihilates constants: ∇(const) = 0.
-#[test]
-fn tension_seminorm_null_space_is_constants() {
-    let data = synthetic_data(180, 2, 12);
-    let spec = duchon_spec(16, DuchonNullspaceOrder::Linear);
-    let built = build(&data, &spec);
-    let tension = built
-        .tension
-        .as_ref()
-        .expect("tension (S1) penalty must be present and non-dropped");
-
-    let c_const = coeff_for_target(&built.design, &constant_target(&data), "constant");
-    let energy_const = quad(tension, &c_const);
-
-    let c_lin = coeff_for_target(&built.design, &linear_target(&data), "linear");
-    let energy_lin = quad(tension, &c_lin);
-    assert!(
-        energy_lin > 1e-6,
-        "a non-constant linear function must carry nonzero TENSION energy; got {energy_lin:.3e}"
-    );
-    assert!(
-        energy_const <= 1e-8 * energy_lin.max(1.0),
-        "TENSION (S1) must annihilate constants: constant energy {energy_const:.3e} \
-         is not negligible vs linear-slope {energy_lin:.3e}"
-    );
-}
-
-/// The STIFFNESS seminorm (curvature) annihilates AFFINE functions: both
-/// constants and pure-linear maps have zero Hessian.
-#[test]
-fn stiffness_seminorm_null_space_is_affine() {
-    let data = synthetic_data(220, 2, 13);
-    // order=2 → affine + quadratic representable; quadratic target then carries
-    // real stiffness while affine targets must not.
-    let spec = duchon_spec(24, DuchonNullspaceOrder::Degree(2));
-    let built = build(&data, &spec);
-    let stiffness = built
-        .stiffness
-        .as_ref()
-        .expect("stiffness (S2) penalty must be present");
-
+    // Affine targets are exactly representable by the design's affine columns,
+    // so their projected coefficients are exact.
     let c_const = coeff_for_target(&built.design, &constant_target(&data), "constant");
     let c_lin = coeff_for_target(&built.design, &linear_target(&data), "linear");
-    let c_quad = coeff_for_target(&built.design, &quadratic_target(&data), "quadratic");
+    let energy_const = quad(primary, &c_const);
+    let energy_lin = quad(primary, &c_lin);
 
-    let energy_const = quad(stiffness, &c_const);
-    let energy_lin = quad(stiffness, &c_lin);
-    let energy_quad = quad(stiffness, &c_quad);
-
+    // Non-degeneracy: the Gram penalizes curvature somewhere — its trace is the
+    // reference scale that makes the "≈ 0" affine bounds meaningful.
+    let trace: f64 = (0..primary.nrows()).map(|i| primary[[i, i]]).sum();
     assert!(
-        energy_quad > 1e-6,
-        "a quadratic function must carry nonzero STIFFNESS energy; got {energy_quad:.3e}"
+        trace > 1e-6,
+        "native Gram must be non-degenerate (penalize curvature); trace={trace:.3e}"
     );
-    let bound = 1e-8 * energy_quad.max(1.0);
+    let bound = 1e-8 * trace.max(1.0);
     assert!(
         energy_const <= bound,
-        "STIFFNESS (S2) must annihilate constants: {energy_const:.3e} vs quad {energy_quad:.3e}"
+        "native Gram must annihilate constants: {energy_const:.3e} vs trace {trace:.3e}"
     );
     assert!(
         energy_lin <= bound,
-        "STIFFNESS (S2) must annihilate AFFINE maps: linear-curvature {energy_lin:.3e} \
-         is not negligible vs quadratic-curvature {energy_quad:.3e}"
+        "native Gram must annihilate the AFFINE null space (a linear map has zero \
+         (m+s)-order roughness): linear {energy_lin:.3e} vs trace {trace:.3e}"
     );
 }
 
-// ── (b) HEADLINE: a linear column gets NONZERO tension ──────────────────────
+// ── (b) the null-space ridge penalizes the affine trend ─────────────────────
 
-/// The redesign's headline correctness property: with the affine columns folded
-/// INTO the slope penalty, a pure-linear function receives a strictly nonzero
-/// TENSION (S1) penalty — while still receiving zero STIFFNESS (S2), because a
-/// linear map is curvature-free. The old zero-padded path would fail the first
-/// assertion (linear lives in an unpenalized side block ⇒ zero tension).
+/// The analytic null-space ridge (`DoublePenaltyNullspace`) penalizes the affine
+/// trend's slope, so the linear trend is NOT left fully unpenalized: a
+/// non-constant linear function carries strictly positive ridge energy. (In a
+/// fitted model the sum-to-zero identifiability transform removes the constant so
+/// only the global mean stays free; here, with `identifiability = None`, we verify
+/// the trend itself is penalized — the native Gram annihilates it, the ridge does
+/// not.) This is the analytic counterpart of "the trend is not in an unpenalized
+/// side block."
 #[test]
-fn linear_function_receives_nonzero_tension_but_zero_stiffness() {
+fn null_space_ridge_penalizes_the_linear_trend() {
     let data = synthetic_data(200, 2, 21);
     let spec = duchon_spec(20, DuchonNullspaceOrder::Linear);
     let built = build(&data, &spec);
-
-    let tension = built
-        .tension
+    let ridge = built
+        .ridge
         .as_ref()
-        .expect("tension (S1) penalty must exist and not be dropped to a zero block");
+        .expect("null-space ridge (DoublePenaltyNullspace) must be present for an affine null space");
 
     let c_lin = coeff_for_target(&built.design, &linear_target(&data), "linear");
-    let tension_energy = quad(tension, &c_lin);
-
-    // A reference magnitude so "nonzero" is a real bound, not a float wobble:
-    // the linear function's own L2 energy at the data sites.
+    let ridge_energy = quad(ridge, &c_lin);
+    // Reference: the linear function's own L2 energy at the data sites, so
+    // "nonzero" is a real bound rather than float wobble.
     let g = linear_target(&data);
     let g_energy: f64 = g.iter().map(|v| v * v).sum();
-
     assert!(
-        tension_energy > 1e-6 * g_energy,
-        "HEADLINE FIX FAILED: a pure-linear function got ~zero TENSION energy \
-         ({tension_energy:.3e}; reference L2 {g_energy:.3e}). The affine columns \
-         must be INCLUDED in the slope (S1) penalty — not zero-padded into an \
-         unpenalized side block."
+        ridge_energy > 1e-6 * g_energy,
+        "the null-space ridge must penalize a linear trend's slope (the trend is \
+         not left unpenalized): ridge energy {ridge_energy:.3e}, reference L2 {g_energy:.3e}"
     );
 
-    // Curvature still ignores the linear part: a linear map is exactly flat,
-    // and the constrained kernel columns are orthogonal to the affine span, so
-    // c_lin carries essentially no kernel curvature. Reference scale is the
-    // stiffness operator's own magnitude (it is Frobenius-normalized), so no
-    // exactly-representable quadratic is needed for a pure-linear probe.
-    if let Some(stiffness) = built.stiffness.as_ref() {
-        let stiffness_energy = quad(stiffness, &c_lin);
-        let stiffness_scale = stiffness
-            .diag()
-            .iter()
-            .cloned()
-            .fold(0.0_f64, f64::max)
-            .max(1e-12);
+    // The native roughness Gram, by contrast, annihilates the linear trend (it is
+    // in the (m+s)-order seminorm's null space): trend control comes from the
+    // ridge, not from the roughness penalty.
+    if let Some(primary) = built.primary.as_ref() {
+        let primary_energy = quad(primary, &c_lin);
+        let trace: f64 = (0..primary.nrows()).map(|i| primary[[i, i]]).sum();
         assert!(
-            stiffness_energy <= 1e-6 * stiffness_scale,
-            "a linear function must have ~zero STIFFNESS: {stiffness_energy:.3e} \
-             vs stiffness operator scale {stiffness_scale:.3e}"
+            primary_energy <= 1e-6 * trace.max(1.0),
+            "the native Gram must leave the linear trend's roughness ≈ 0: \
+             {primary_energy:.3e} vs trace {trace:.3e}"
         );
     }
 }
