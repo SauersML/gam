@@ -2355,18 +2355,19 @@ pub struct DuchonBasisSpec {
     /// spectrum `||w||^(2p + 2s)`. `Some(length_scale)` enables the hybrid
     /// spectrum `||w||^(2p) * (kappa^2 + ||w||^2)^s`, `kappa = 1/length_scale`.
     pub length_scale: Option<f64>,
-    /// Spectral power `s`. Stored as `f64` so the API surface admits
-    /// fractional values; the existing integer-only downstream chain
-    /// (validators, closed-form convergence predicate, kernel-block
-    /// coefficient tables) reads the value via `spec.power_as_usize()`
-    /// and asserts whole-valuedness. Threading a fractional `s`
-    /// end-to-end (the natural fix for high-`d` configurations that
-    /// don't want to ratchet the polynomial null-space order to satisfy
-    /// `2(m + s) > d`) is Tier 1 #1 in the construction plan and
-    /// touches ~50 internal sites. Until that lands, fractional values
-    /// will panic at the integer-only call sites with a clear
-    /// "fractional power not yet supported" message rather than
-    /// silently truncating.
+    /// Literal Duchon spectral power `s` (`f64`, fractional values fully
+    /// threaded end-to-end). The pure-Duchon kernel exponent is `2(p + s) − d`,
+    /// so this is the knob that sets `φ(r)`: `s = 0` is the integer-order Duchon
+    /// kernel `r^{2p−d}` (its `r²·log r` log case in even `d`, ≡ the thin-plate
+    /// kernel); `s = (d − 1)/2` gives the cubic `r³` in every dimension.
+    ///
+    /// This field is taken LITERALLY by the basis builder — `power = 0` means
+    /// `s = 0`, NOT "use a default". The magic cubic default (applied when the
+    /// user gives no explicit power) is a request-layer choice resolved by the
+    /// formula / CLI / pyffi front-ends via [`duchon_cubic_default`]; by the time
+    /// a spec reaches the builder this value is the final intended `s`. The
+    /// hybrid Duchon–Matérn path (`length_scale = Some`) still requires an
+    /// integer `s` (read via `spec.power_as_usize()`).
     #[serde(alias = "power_int")]
     pub power: f64,
     pub nullspace_order: DuchonNullspaceOrder,
@@ -23190,47 +23191,24 @@ pub fn build_duchon_basis_mixed_periodicity_auto(
     )
 }
 
-/// Resolve the structural-smoother default `(nullspace_order, power)` for a
-/// non-periodic Euclidean Duchon basis of dimension `d`.
+/// The magic *request-layer* default `(nullspace_order, power)` for a
+/// non-periodic Euclidean Duchon basis of dimension `d`: the cubic polyharmonic
+/// kernel in every dimension.
 ///
-/// The magic default is the *cubic* polyharmonic kernel in every dimension:
-/// an affine (`Linear`, `d+1` polynomial columns) null space and spectral
-/// power `s = (d − 1)/2` as an `f64`. With `m = p + s = 2 + (d−1)/2` the pure
-/// kernel exponent `2m − d = 3`, i.e. `φ(r) = r³` for every `d`. This is NOT
-/// the classical Duchon native seminorm — there is no order escalation and no
-/// `resolve_duchon_orders(... max_op = 2 ...)`. The data-jet penalty triplet
-/// (amplitude / slope / curvature) supplies the smoothing structure; only the
-/// global mean is left free.
+/// Returns an affine (`Linear`, `d+1` polynomial columns) null space and the
+/// fractional spectral power `s = (d − 1)/2`. With `m = p + s = 2 + (d−1)/2` the
+/// pure kernel exponent `2m − d = 3`, i.e. `φ(r) = r³` for every `d` — no order
+/// escalation, no even/odd-`d` log special case. The smoothing structure is the
+/// analytic native reproducing-norm Gram (`PenaltySource::Primary`) plus a
+/// null-space ridge; only the global mean is left free.
 ///
-/// The cubic structural default `(nullspace_order, power)` for dimension `d`:
-/// `(Linear, (d − 1)/2)`. With `m = p + s = 2 + (d−1)/2` the pure kernel
-/// exponent `2m − d = 3`, i.e. `φ(r) = r³` for every `d`.
+/// This is applied by the FRONT-ENDS (formula / CLI / pyffi) when the user gives
+/// no explicit `power`. The basis builder itself treats `spec.power` literally,
+/// so an explicit `power = 0` is honored as `s = 0` — the integer-order Duchon
+/// kernel `r²·log r` (≡ the thin-plate kernel) in even `d` — rather than being
+/// upgraded to the cubic default.
 pub fn duchon_cubic_default(dim: usize) -> (DuchonNullspaceOrder, f64) {
     (DuchonNullspaceOrder::Linear, (dim as f64 - 1.0) / 2.0)
-}
-
-/// Resolve the effective `(nullspace_order, power)` for a non-periodic Euclidean
-/// Duchon basis of dimension `d`, applying the cubic structural default.
-///
-/// An explicit caller override is honored verbatim — there is no order
-/// escalation and no `resolve_duchon_orders(... max_op = 2 ...)`. A request is
-/// treated as "wants the magic default" only when it is the raw serde default
-/// (`nullspace_order = Linear`, `power = 0.0`); that single case is upgraded to
-/// the dimension-aware cubic pair `(Linear, (d − 1)/2)`. Any other request
-/// (including a `power` already equal to the cubic default) passes through
-/// unchanged, so the resolver is idempotent on already-resolved specs.
-pub fn resolve_duchon_cubic_default(
-    dim: usize,
-    requested_nullspace_order: DuchonNullspaceOrder,
-    requested_power: f64,
-) -> (DuchonNullspaceOrder, f64) {
-    let wants_default =
-        requested_nullspace_order == DuchonNullspaceOrder::Linear && requested_power == 0.0;
-    if wants_default {
-        duchon_cubic_default(dim)
-    } else {
-        (requested_nullspace_order, requested_power)
-    }
 }
 
 /// Build the **analytic** Duchon penalty for a non-periodic Euclidean Duchon
@@ -23354,20 +23332,17 @@ pub fn build_duchon_basiswithworkspace(
     if spec.periodic.is_some() {
         return build_periodic_duchon_basis_1d(data, spec, centers, workspace);
     }
-    // Apply the cubic structural default for the non-periodic Euclidean path:
-    // a bare serde-default request (`Linear`, `power = 0`) resolves to the
-    // dimension-aware cubic pair `(Linear, (d−1)/2)` → `φ(r) = r³`. Any explicit
-    // request passes through unchanged (no order escalation). Every downstream
-    // read below uses the resolved spec so the basis, penalties, and recorded
-    // metadata all share one `(nullspace_order, power)`.
-    let (resolved_nullspace_order, resolved_power) =
-        resolve_duchon_cubic_default(data.ncols(), spec.nullspace_order, spec.power);
-    let resolved_spec = DuchonBasisSpec {
-        nullspace_order: resolved_nullspace_order,
-        power: resolved_power,
-        ..spec.clone()
-    };
-    let spec = &resolved_spec;
+    // `spec.power` is the LITERAL Duchon spectral power `s` at the basis layer.
+    // The kernel exponent is `2(p+s) − d`, so `power = 0` means `s = 0` — the
+    // integer-order Duchon kernel `r^{2(p)−d}` (its `r²·log r` log case in even
+    // `d`, which equals the thin-plate kernel) — and is honored verbatim, NOT
+    // read as "apply a default". The magic cubic default (no explicit power ⇒
+    // `s = (d−1)/2`, `φ(r)=r³`) is a REQUEST-LAYER choice the formula/CLI/pyffi
+    // front-ends resolve via `duchon_cubic_default`; the builder uses whatever
+    // `(nullspace_order, power)` it is handed, so both Duchon spectral powers —
+    // `s = 0` (thin-plate kernel) and `s = (d−1)/2` (fractional cubic) — are
+    // reachable through this one construction.
+    //
     // Auto-degrade the requested null-space order to Zero when the selected
     // centers cannot span the requested polynomial block. Every downstream
     // consumer of `spec.nullspace_order` in this function MUST use the

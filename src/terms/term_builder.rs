@@ -1749,8 +1749,13 @@ pub fn build_smooth_basis(
                     (requested_nullspace_order, req_power)
                 }
                 DuchonPowerPolicy::CubicStructuralDefault => {
-                    // Magic cubic rule: affine nullspace, spectral power s = (d-1)/2.
-                    (DuchonNullspaceOrder::Linear, (cols.len() as f64 - 1.0) / 2.0)
+                    // Magic cubic rule (REQUEST-LAYER default): no explicit power ⇒
+                    // affine null space + fractional spectral power s = (d-1)/2, i.e.
+                    // the Duchon kernel φ(r)=r³ in every dimension. An EXPLICIT
+                    // `power=0` is handled above and is honored as the s=0 Duchon
+                    // kernel (r²·log r ≡ the thin-plate kernel in even d) — the magic
+                    // default lives here, not in the basis builder.
+                    crate::basis::duchon_cubic_default(cols.len())
                 }
             };
             let plan = plan_spatial_basis(
