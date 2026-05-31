@@ -3161,11 +3161,21 @@ fn wrap_dense_design_with_transform(
     }
 }
 
-fn design_constraint_cross(
+/// Single-pass `(Bᵀ(W·C), BᵀB)` accumulation over the streamed design.
+///
+/// Materialises each row chunk of the design **once** and reuses it for both
+/// the constraint cross `Bᵀ(W·C)` and the Gram `BᵀB`. On the lazy chunked
+/// spatial path each `try_row_chunk` re-evaluates all kernel columns for the
+/// chunk, so accumulating both products in a single sweep halves the per-build
+/// kernel re-evaluation work (the dominant cost at biobank scale) versus two
+/// independent streaming passes — without changing the result beyond
+/// floating-point reassociation. The cross is masked off (`q == 0`) by the
+/// caller, which never invokes this when there is no constraint block.
+fn design_cross_and_gram(
     design: &DesignMatrix,
     constraint_matrix: ArrayView2<'_, f64>,
     weights: Option<ArrayView1<'_, f64>>,
-) -> Result<Array2<f64>, BasisError> {
+) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
     let n = design.nrows();
     let k = design.ncols();
     if constraint_matrix.nrows() != n {
@@ -3184,6 +3194,7 @@ fn design_constraint_cross(
     }
     let q = constraint_matrix.ncols();
     let mut cross = Array2::<f64>::zeros((k, q));
+    let mut gram = Array2::<f64>::zeros((k, k));
     for start in (0..n).step_by(DESIGN_CROSS_CHUNK_SIZE) {
         let end = (start + DESIGN_CROSS_CHUNK_SIZE).min(n);
         let basis_chunk = design
@@ -3199,22 +3210,9 @@ fn design_constraint_cross(
             }
         }
         cross += &fast_atb(&basis_chunk, &constraint_chunk);
+        gram += &fast_atb(&basis_chunk, &basis_chunk);
     }
-    Ok(cross)
-}
-
-fn design_gram_matrix(design: &DesignMatrix) -> Result<Array2<f64>, BasisError> {
-    let n = design.nrows();
-    let p = design.ncols();
-    let mut gram = Array2::<f64>::zeros((p, p));
-    for start in (0..n).step_by(DESIGN_CROSS_CHUNK_SIZE) {
-        let end = (start + DESIGN_CROSS_CHUNK_SIZE).min(n);
-        let chunk = design
-            .try_row_chunk(start..end)
-            .map_err(|e| BasisError::InvalidInput(e.to_string()))?;
-        gram += &fast_atb(&chunk, &chunk);
-    }
-    Ok(gram)
+    Ok((cross, gram))
 }
 
 fn positive_spectral_whitener_from_gram(gram: &Array2<f64>) -> Result<Array2<f64>, BasisError> {
@@ -3331,8 +3329,7 @@ pub(crate) fn orthogonality_transform_for_design(
     if q == 0 {
         return Ok(Array2::eye(k));
     }
-    let constraint_cross = design_constraint_cross(design, constraint_matrix, weights)?;
-    let gram = design_gram_matrix(design)?;
+    let (constraint_cross, gram) = design_cross_and_gram(design, constraint_matrix, weights)?;
     orthogonality_transform_from_cross_and_gram(&constraint_cross, &gram)
 }
 
