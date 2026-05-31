@@ -40,11 +40,10 @@ use crate::smooth::{
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
     freeze_term_collection_from_design,
 };
+use crate::solver::pirls::MIN_WEIGHT;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-
-const MIN_WEIGHT: f64 = 1e-12;
 
 /// Typed error for the latent-survival / latent-binary family kernels and
 /// their fit-time and per-row validation helpers. Variants pick the semantic

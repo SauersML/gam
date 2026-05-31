@@ -2051,15 +2051,22 @@ pub trait CustomFamily {
             capability,
             predicted_gradient_work,
             predicted_hessian_work,
-            // Default `false`: the trait's default outer-only paths
-            // (`log_likelihood_only_with_options`,
-            // `exact_newton_joint_psi_workspace_with_options`, ...)
-            // forward to the no-options variants and ignore
-            // `outer_score_subsample`. Families that override those
-            // hooks to honour HT-weighted partial sums must override
-            // this method and set `subsample_capable = true`.
-            subsample_capable: false,
+            subsample_capable: self.outer_derivative_subsample_capable(),
         }
+    }
+
+    /// Whether this family's outer-only paths honour HT-weighted partial sums
+    /// over `options.outer_score_subsample`.
+    ///
+    /// Default `false`: the trait's default outer-only paths
+    /// (`log_likelihood_only_with_options`,
+    /// `exact_newton_joint_psi_workspace_with_options`, ...) forward to the
+    /// no-options variants and ignore `outer_score_subsample`. Families that
+    /// override those hooks to honour HT-weighted partial sums should override
+    /// this hook to return `true`; the default [`Self::outer_derivative_policy`]
+    /// then threads the flag into the emitted [`OuterDerivativePolicy`].
+    fn outer_derivative_subsample_capable(&self) -> bool {
+        false
     }
 
     /// Family-specific outer seeding policy.

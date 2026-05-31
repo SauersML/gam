@@ -55,6 +55,11 @@ mod state;
 
 // Re-export public API that lived in the original flat file
 use convergence::effective_kkt_tolerance;
+use log_link_working_state::ETA_CLAMP;
+/// The canonical PIRLS numeric floors live in [`log_link_working_state`]; this
+/// re-export gives every family in the crate one shared `MIN_WEIGHT` so the
+/// weighted normal equations stay well posed with a single retunable value.
+pub(crate) use log_link_working_state::MIN_WEIGHT;
 use damping::{
     add_scaled_diagonal_to_upper_sparse, compute_lm_d2, update_scaled_diagonal_in_place,
 };
@@ -109,7 +114,7 @@ fn estimate_gamma_shape_from_eta(
                 return (0.0_f64, 0.0_f64);
             }
             let yi = y[i].max(EPS);
-            let mui = eta[i].clamp(-700.0, 700.0).exp().max(EPS);
+            let mui = eta[i].clamp(-ETA_CLAMP, ETA_CLAMP).exp().max(EPS);
             let ratio = yi / mui;
             (wi * (ratio - ratio.ln() - 1.0), wi)
         })
@@ -4089,7 +4094,6 @@ fn write_beta_logit_working_state(
     z: &mut Array1<f64>,
     derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
 ) -> Result<(), EstimationError> {
-    const MIN_WEIGHT: f64 = 1e-12;
     if !valid_beta_phi(phi) {
         crate::bail_invalid_estim!("beta-regression phi must be finite and > 0; got {phi}");
     }
@@ -4119,7 +4123,7 @@ fn write_beta_logit_working_state(
             .for_each(
                 |(i, (((((((mu_o, w_o), z_o), dmu_o), d2_o), d3_o), c_o), d_o))| {
                     let eta_raw = eta[i];
-                    let eta_i = eta_raw.clamp(-700.0, 700.0);
+                    let eta_i = eta_raw.clamp(-ETA_CLAMP, ETA_CLAMP);
                     let jet = logit_inverse_link_jet5(eta_i);
                     let mu_i = safe_beta_mu(jet.mu);
                     let q = (mu_i * (1.0 - mu_i)).max(BETA_MU_EPS);
@@ -4171,7 +4175,7 @@ fn write_beta_logit_working_state(
             .zip(z_s.par_iter_mut())
             .enumerate()
             .for_each(|(i, ((mu_o, w_o), z_o))| {
-                let eta_i = eta[i].clamp(-700.0, 700.0);
+                let eta_i = eta[i].clamp(-ETA_CLAMP, ETA_CLAMP);
                 let jet = logit_inverse_link_jet5(eta_i);
                 let mu_i = safe_beta_mu(jet.mu);
                 let q = (mu_i * (1.0 - mu_i)).max(BETA_MU_EPS);
@@ -4238,7 +4242,7 @@ pub fn update_glmvectors(
                 .for_each(
                     |(i, (((((((mu_o, w_o), z_o), c_o), d_o), dmu_o), d2_o), d3_o))| {
                         let eta_raw = eta[i];
-                        let eta_c = eta_raw.clamp(-700.0, 700.0);
+                        let eta_c = eta_raw.clamp(-ETA_CLAMP, ETA_CLAMP);
                         let jet = logit_inverse_link_jet5(eta_c);
                         let geom = bernoulli_logit_geometry_from_jet(
                             eta_raw,
@@ -4270,7 +4274,7 @@ pub fn update_glmvectors(
                 .enumerate()
                 .for_each(|(i, ((mu_o, w_o), z_o))| {
                     let eta_raw = eta[i];
-                    let eta_c = eta_raw.clamp(-700.0, 700.0);
+                    let eta_c = eta_raw.clamp(-ETA_CLAMP, ETA_CLAMP);
                     let jet = logit_inverse_link_jet5(eta_c);
                     let geom = bernoulli_logit_geometry_from_jet(
                         eta_raw,
@@ -4613,7 +4617,7 @@ pub fn update_glmvectors_integrated_for_link(
                         d2: jet.d2,
                         d3: jet.d3,
                     };
-                    let e = eta[i].clamp(-700.0, 700.0);
+                    let e = eta[i].clamp(-ETA_CLAMP, ETA_CLAMP);
                     let geom = bernoulli_geometry_from_jet(
                         eta[i],
                         e,
@@ -4669,7 +4673,7 @@ pub fn update_glmvectors_integrated_for_link(
                     d2: jet.d2,
                     d3: jet.d3,
                 };
-                let e = eta[i].clamp(-700.0, 700.0);
+                let e = eta[i].clamp(-ETA_CLAMP, ETA_CLAMP);
                 let geom = bernoulli_geometry_from_jet(eta[i], e, y[i], priorweights[i], local_jet);
                 *mu_o = geom.mu;
                 *w_o = geom.weight;
@@ -4868,7 +4872,6 @@ pub(crate) fn computeworkingweight_derivatives_from_eta(
         }
         ResponseFamily::Beta { phi } => {
             let phi = *phi;
-            const MIN_WEIGHT: f64 = 1e-12;
             if !valid_beta_phi(phi) {
                 crate::bail_invalid_estim!("beta-regression phi must be finite and > 0; got {phi}");
             }
@@ -4891,7 +4894,7 @@ pub(crate) fn computeworkingweight_derivatives_from_eta(
                 .enumerate()
                 .for_each(|(i, ((((c_o, d_o), dmu_o), d2_o), d3_o))| {
                     let eta_raw = eta[i];
-                    let eta_i = eta_raw.clamp(-700.0, 700.0);
+                    let eta_i = eta_raw.clamp(-ETA_CLAMP, ETA_CLAMP);
                     let jet = logit_inverse_link_jet5(eta_i);
                     let mu_i = safe_beta_mu(jet.mu);
                     let q = (mu_i * (1.0 - mu_i)).max(BETA_MU_EPS);
@@ -4979,12 +4982,12 @@ pub(crate) fn computeworkingweight_derivatives_from_eta(
                 .try_for_each(
                     |(i, ((((c_o, d_o), dmu_o), d2_o), d3_o))| -> Result<(), EstimationError> {
                         let eta_used = match link {
-                            LinkFunction::Logit => eta[i].clamp(-700.0, 700.0),
+                            LinkFunction::Logit => eta[i].clamp(-ETA_CLAMP, ETA_CLAMP),
                             LinkFunction::Probit
                             | LinkFunction::CLogLog
                             | LinkFunction::Sas
                             | LinkFunction::BetaLogistic => eta[i].clamp(-30.0, 30.0),
-                            LinkFunction::Log => eta[i].clamp(-700.0, 700.0),
+                            LinkFunction::Log => eta[i].clamp(-ETA_CLAMP, ETA_CLAMP),
                             LinkFunction::Identity => eta[i],
                         };
                         if matches!(link, LinkFunction::Logit) {
@@ -5312,7 +5315,9 @@ fn supports_observed_hessian_curvature_for_likelihood(
 fn eta_for_observed_hessian_jet(inverse_link: &InverseLink, eta: f64) -> f64 {
     match inverse_link {
         // Why: canonical links keep V(mu) representable across the full f64 eta range; only guard against inf.
-        InverseLink::Standard(StandardLink::Logit | StandardLink::Log) => eta.clamp(-700.0, 700.0),
+        InverseLink::Standard(StandardLink::Logit | StandardLink::Log) => {
+            eta.clamp(-ETA_CLAMP, ETA_CLAMP)
+        }
         InverseLink::Standard(StandardLink::Identity) => eta,
         // Why: probit mu=Phi(eta) saturates to 1.0 in f64 by |eta|~8.3; +/-6 keeps V=mu(1-mu) ~ 1e-9 representable.
         InverseLink::Standard(StandardLink::Probit) => eta.clamp(-6.0, 6.0),
@@ -6605,6 +6610,7 @@ mod low_rank_weight_pirls_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::log_link_working_state::{ETA_CLAMP, MIN_MU, MIN_WEIGHT};
     use super::loop_driver::default_beta_guess_external;
     use super::reweight::madsen_lm_accept_factor;
     use super::{
@@ -6846,12 +6852,10 @@ mod tests {
         y: &Array1<f64>,
         prior: &Array1<f64>,
     ) -> LogLinkWorkingOutputs {
-        const MIN_MU: f64 = 1e-10;
-        const MIN_WEIGHT: f64 = 1e-12;
         let mut out = LogLinkWorkingOutputs::zeros(eta.len());
         for i in 0..eta.len() {
             let eta_raw = eta[i];
-            let eta_i = eta_raw.clamp(-700.0, 700.0);
+            let eta_i = eta_raw.clamp(-ETA_CLAMP, ETA_CLAMP);
             let mu_i = eta_i.exp().max(MIN_MU);
             out.mu[i] = mu_i;
             let raw_weight = prior[i].max(0.0) * mu_i;
@@ -6881,10 +6885,9 @@ mod tests {
         prior: &Array1<f64>,
         shape: f64,
     ) -> LogLinkWorkingOutputs {
-        const MIN_MU: f64 = 1e-10;
         let mut out = LogLinkWorkingOutputs::zeros(eta.len());
         for i in 0..eta.len() {
-            let eta_i = eta[i].clamp(-700.0, 700.0);
+            let eta_i = eta[i].clamp(-ETA_CLAMP, ETA_CLAMP);
             let mu_i = eta_i.exp().max(MIN_MU);
             out.mu[i] = mu_i;
             out.weights[i] = prior[i].max(0.0) * shape;
@@ -6905,13 +6908,11 @@ mod tests {
         p: f64,
         phi: f64,
     ) -> LogLinkWorkingOutputs {
-        const MIN_MU: f64 = 1e-10;
-        const MIN_WEIGHT: f64 = 1e-12;
         let exponent = 2.0 - p;
         let mut out = LogLinkWorkingOutputs::zeros(eta.len());
         for i in 0..eta.len() {
             let eta_raw = eta[i];
-            let eta_i = eta_raw.clamp(-700.0, 700.0);
+            let eta_i = eta_raw.clamp(-ETA_CLAMP, ETA_CLAMP);
             let clamp_active = eta_raw != eta_i;
             let mu_i = eta_i.exp().max(MIN_MU);
             out.mu[i] = mu_i;
@@ -6944,12 +6945,10 @@ mod tests {
         prior: &Array1<f64>,
         theta: f64,
     ) -> LogLinkWorkingOutputs {
-        const MIN_MU: f64 = 1e-10;
-        const MIN_WEIGHT: f64 = 1e-12;
         let mut out = LogLinkWorkingOutputs::zeros(eta.len());
         for i in 0..eta.len() {
             let eta_raw = eta[i];
-            let eta_i = eta_raw.clamp(-700.0, 700.0);
+            let eta_i = eta_raw.clamp(-ETA_CLAMP, ETA_CLAMP);
             let mu_i = eta_i.exp().max(MIN_MU);
             let denom = theta + mu_i;
             let negbin_weight = if theta > mu_i {
@@ -7587,13 +7586,13 @@ mod tests {
             let jet = crate::quadrature::integrated_inverse_link_jet(
                 &ctx,
                 LinkFunction::Logit,
-                fit.final_eta[i].clamp(-700.0, 700.0),
+                fit.final_eta[i].clamp(-ETA_CLAMP, ETA_CLAMP),
                 covariate_se[i],
             )
             .expect("logit integrated inverse-link jet should evaluate");
             let expected = bernoulli_geometry_from_jet(
                 fit.final_eta[i],
-                fit.final_eta[i].clamp(-700.0, 700.0),
+                fit.final_eta[i].clamp(-ETA_CLAMP, ETA_CLAMP),
                 y[i],
                 w[i],
                 MixtureInverseLinkJet {

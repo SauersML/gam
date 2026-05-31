@@ -7984,11 +7984,18 @@ impl CustomFamily for TransformationNormalFamily {
             _ => return u64::MAX,
         };
         let n = n_usize as u64;
-        if crate::custom_family::use_joint_matrix_free_path(p_total as usize, n_usize) {
-            n.saturating_mul(p_resp.saturating_add(p_cov))
-        } else {
-            n.saturating_mul(p_total.saturating_mul(p_total))
-        }
+        // Shared operator-aware gate (see `coefficient_cost`): matrix-free Hv
+        // streams the Khatri–Rao operands at `n · (p_resp + p_cov)`; the dense
+        // fallback is the `n · p_total²` Khatri–Rao gram build. The dense count
+        // is supplied inline rather than via `joint_coupled_coefficient_hessian_cost`
+        // because the empty-specs preview must still report `n · p_total²` from
+        // the family-derived `p_total`, not the `n · 0²` an empty `specs` sum yields.
+        crate::families::coefficient_cost::operator_aware_hessian_cost(
+            p_total,
+            n,
+            n.saturating_mul(p_resp.saturating_add(p_cov)),
+            n.saturating_mul(p_total.saturating_mul(p_total)),
+        )
     }
 
     fn coefficient_gradient_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {

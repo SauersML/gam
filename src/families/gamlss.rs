@@ -4738,19 +4738,11 @@ struct NonWiggleQDirectional {
 }
 
 #[derive(Clone, Copy)]
-struct InverseLinkRow {
-    mu: f64,
-    d1: f64,
-    d2: f64,
-    d3: f64,
-}
-
-#[derive(Clone, Copy)]
 struct BinomialLocationScaleRow {
     sigma: f64,
     dsigma_deta: f64,
     q0: f64,
-    inverse_link: InverseLinkRow,
+    inverse_link: crate::mixture_link::InverseLinkJet,
     ll: f64,
 }
 
@@ -4901,16 +4893,6 @@ fn nonwiggle_q_directional(
 }
 
 #[inline]
-fn inverse_linkrow(jet: crate::mixture_link::InverseLinkJet) -> InverseLinkRow {
-    InverseLinkRow {
-        mu: jet.mu,
-        d1: jet.d1,
-        d2: jet.d2,
-        d3: jet.d3,
-    }
-}
-
-#[inline]
 fn clamped_binomial_probability(mu: f64) -> (f64, bool) {
     if !mu.is_finite() {
         return (0.5, true);
@@ -5038,7 +5020,7 @@ fn binomial_location_scalerow(
     // silently misreporting separated/saturated fits as well-fit modes.
     let (mu_clamped, _clamp_active) = clamped_binomial_probability(jet.mu);
     jet.mu = mu_clamped;
-    let inverse_link = inverse_linkrow(jet);
+    let inverse_link = jet;
     let ll = binomial_location_scale_log_likelihood(y, weight, q, link_kind, raw_mu)?;
     Ok(BinomialLocationScaleRow {
         sigma,
@@ -7886,16 +7868,10 @@ impl CustomFamily for GaussianLocationScaleFamily {
         // matrix. Report the operator work model so diagnostics and
         // first-order-only policies reflect the representation that actually
         // runs.
-        let n = self.y.len() as u64;
-        let p_total: u64 = specs
-            .iter()
-            .map(|s| s.design.ncols() as u64)
-            .fold(0u64, |a, p| a.saturating_add(p));
-        if crate::custom_family::use_joint_matrix_free_path(p_total as usize, n as usize) {
-            n.saturating_mul(p_total)
-        } else {
-            crate::custom_family::joint_coupled_coefficient_hessian_cost(n, specs)
-        }
+        crate::families::coefficient_cost::joint_coupled_operator_aware_hessian_cost(
+            self.y.len() as u64,
+            specs,
+        )
     }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
@@ -8510,25 +8486,8 @@ impl CustomFamily for GaussianLocationScaleFamily {
     /// the total outer score is still unbiased. Inner-PIRLS and final-
     /// covariance paths never install the option, so they continue to
     /// consume the exact full-data quantities.
-    fn outer_derivative_policy(
-        &self,
-        specs: &[ParameterBlockSpec],
-        psi_dim: usize,
-        options: &BlockwiseFitOptions,
-    ) -> crate::families::custom_family::OuterDerivativePolicy {
-        let capability = self.exact_outer_derivative_order(specs, options);
-        let grad_cost = self.coefficient_gradient_cost(specs);
-        let hess_cost = self.coefficient_hessian_cost(specs);
-        let (predicted_gradient_work, predicted_hessian_work) =
-            crate::families::custom_family::default_outer_derivative_policy_costs(
-                specs, psi_dim, grad_cost, hess_cost,
-            );
-        crate::families::custom_family::OuterDerivativePolicy {
-            capability,
-            predicted_gradient_work,
-            predicted_hessian_work,
-            subsample_capable: true,
-        }
+    fn outer_derivative_subsample_capable(&self) -> bool {
+        true
     }
 }
 
@@ -11716,16 +11675,10 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         // `use_joint_matrix_free_path` selects the workspace operator, joint
         // Hv apply is O(n · (p_t + p_ℓ + p_w)) — the row-streaming RowCoeffOperator
         // never materializes the dense (p_t + p_ℓ + p_w)² matrix.
-        let n = self.y.len() as u64;
-        let p_total: u64 = specs
-            .iter()
-            .map(|s| s.design.ncols() as u64)
-            .fold(0u64, |a, p| a.saturating_add(p));
-        if crate::custom_family::use_joint_matrix_free_path(p_total as usize, n as usize) {
-            n.saturating_mul(p_total)
-        } else {
-            crate::custom_family::joint_coupled_coefficient_hessian_cost(n, specs)
-        }
+        crate::families::coefficient_cost::joint_coupled_operator_aware_hessian_cost(
+            self.y.len() as u64,
+            specs,
+        )
     }
 
     fn block_linear_constraints(
@@ -12308,25 +12261,8 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
     /// order and directional-derivative reductions. Inner-PIRLS and final-
     /// covariance paths never install the option, so they continue to
     /// consume the exact full-data quantities.
-    fn outer_derivative_policy(
-        &self,
-        specs: &[ParameterBlockSpec],
-        psi_dim: usize,
-        options: &BlockwiseFitOptions,
-    ) -> crate::families::custom_family::OuterDerivativePolicy {
-        let capability = self.exact_outer_derivative_order(specs, options);
-        let grad_cost = self.coefficient_gradient_cost(specs);
-        let hess_cost = self.coefficient_hessian_cost(specs);
-        let (predicted_gradient_work, predicted_hessian_work) =
-            crate::families::custom_family::default_outer_derivative_policy_costs(
-                specs, psi_dim, grad_cost, hess_cost,
-            );
-        crate::families::custom_family::OuterDerivativePolicy {
-            capability,
-            predicted_gradient_work,
-            predicted_hessian_work,
-            subsample_capable: true,
-        }
+    fn outer_derivative_subsample_capable(&self) -> bool {
+        true
     }
 
     fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
@@ -16922,16 +16858,10 @@ impl CustomFamily for BinomialLocationScaleFamily {
         // Operator-aware: matrix-free workspace applies joint Hv at
         // O(n · (p_t + p_ℓ)); only fall back to the dense build cost when
         // `use_joint_matrix_free_path` declines the operator path.
-        let n = self.y.len() as u64;
-        let p_total: u64 = specs
-            .iter()
-            .map(|s| s.design.ncols() as u64)
-            .fold(0u64, |a, p| a.saturating_add(p));
-        if crate::custom_family::use_joint_matrix_free_path(p_total as usize, n as usize) {
-            n.saturating_mul(p_total)
-        } else {
-            crate::custom_family::joint_coupled_coefficient_hessian_cost(n, specs)
-        }
+        crate::families::coefficient_cost::joint_coupled_operator_aware_hessian_cost(
+            self.y.len() as u64,
+            specs,
+        )
     }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
@@ -17442,25 +17372,8 @@ impl CustomFamily for BinomialLocationScaleFamily {
     /// the full-data outer score. Inner-PIRLS and final-covariance paths
     /// never install the option, so they continue to consume the exact
     /// full-data quantities.
-    fn outer_derivative_policy(
-        &self,
-        specs: &[ParameterBlockSpec],
-        psi_dim: usize,
-        options: &BlockwiseFitOptions,
-    ) -> crate::families::custom_family::OuterDerivativePolicy {
-        let capability = self.exact_outer_derivative_order(specs, options);
-        let grad_cost = self.coefficient_gradient_cost(specs);
-        let hess_cost = self.coefficient_hessian_cost(specs);
-        let (predicted_gradient_work, predicted_hessian_work) =
-            crate::families::custom_family::default_outer_derivative_policy_costs(
-                specs, psi_dim, grad_cost, hess_cost,
-            );
-        crate::families::custom_family::OuterDerivativePolicy {
-            capability,
-            predicted_gradient_work,
-            predicted_hessian_work,
-            subsample_capable: true,
-        }
+    fn outer_derivative_subsample_capable(&self) -> bool {
+        true
     }
 
     fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
@@ -20994,16 +20907,10 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         // Operator-aware: matrix-free workspace applies joint Hv at
         // O(n · (p_t + p_ℓ + p_w)); only fall back to the dense build cost when
         // `use_joint_matrix_free_path` declines the operator path.
-        let n = self.y.len() as u64;
-        let p_total: u64 = specs
-            .iter()
-            .map(|s| s.design.ncols() as u64)
-            .fold(0u64, |a, p| a.saturating_add(p));
-        if crate::custom_family::use_joint_matrix_free_path(p_total as usize, n as usize) {
-            n.saturating_mul(p_total)
-        } else {
-            crate::custom_family::joint_coupled_coefficient_hessian_cost(n, specs)
-        }
+        crate::families::coefficient_cost::joint_coupled_operator_aware_hessian_cost(
+            self.y.len() as u64,
+            specs,
+        )
     }
 
     /// The wiggle family carries a structural null-space direction: the
@@ -22129,25 +22036,8 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
     /// the full-data outer score. Inner-PIRLS and final-covariance paths
     /// never install the option, so they continue to consume the exact
     /// full-data quantities.
-    fn outer_derivative_policy(
-        &self,
-        specs: &[ParameterBlockSpec],
-        psi_dim: usize,
-        options: &BlockwiseFitOptions,
-    ) -> crate::families::custom_family::OuterDerivativePolicy {
-        let capability = self.exact_outer_derivative_order(specs, options);
-        let grad_cost = self.coefficient_gradient_cost(specs);
-        let hess_cost = self.coefficient_hessian_cost(specs);
-        let (predicted_gradient_work, predicted_hessian_work) =
-            crate::families::custom_family::default_outer_derivative_policy_costs(
-                specs, psi_dim, grad_cost, hess_cost,
-            );
-        crate::families::custom_family::OuterDerivativePolicy {
-            capability,
-            predicted_gradient_work,
-            predicted_hessian_work,
-            subsample_capable: true,
-        }
+    fn outer_derivative_subsample_capable(&self) -> bool {
+        true
     }
 
     fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {

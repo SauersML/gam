@@ -11543,16 +11543,10 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         // O(n · (p_marginal + p_logslope + p_flex)) per call. Only fall back
         // to the dense `n · (Σ p_b)²` build when `use_joint_matrix_free_path`
         // declines the operator path.
-        let n = self.y.len() as u64;
-        let p_total: u64 = specs
-            .iter()
-            .map(|s| s.design.ncols() as u64)
-            .fold(0u64, |a, p| a.saturating_add(p));
-        if crate::custom_family::use_joint_matrix_free_path(p_total as usize, n as usize) {
-            n.saturating_mul(p_total)
-        } else {
-            crate::custom_family::joint_coupled_coefficient_hessian_cost(n, specs)
-        }
+        crate::families::coefficient_cost::joint_coupled_operator_aware_hessian_cost(
+            self.y.len() as u64,
+            specs,
+        )
     }
 
     fn exact_outer_derivative_order(
