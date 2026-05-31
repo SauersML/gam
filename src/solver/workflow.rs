@@ -2851,7 +2851,7 @@ use crate::inference::formula_dsl::{
     require_inverse_link_supports_joint_wiggle, validate_marginal_slope_z_column_exclusion,
 };
 use crate::term_builder::{
-    build_termspec, column_map_with_alias, enable_scale_dimensions,
+    SECONDARY_CENTER_CAP_OPTION, build_termspec, column_map_with_alias, enable_scale_dimensions,
     has_explicit_countwith_basis_alias, resolve_role_col, resolve_smooth_type_name,
     smooth_type_uses_spatial_center_heuristic,
 };
@@ -6069,11 +6069,13 @@ fn materialize_transformation_normal<'a>(
 /// other distributional predictors are identified only through (noisy) squared
 /// residuals. Handing their radial spatial smooths a basis sized for the mean
 /// lets REML over-fit them (#501). For each spatial smooth (thin-plate /
-/// Matérn / Duchon) the user did not size explicitly, inject a conservative
-/// `centers` count so the existing explicit-count path sizes the basis
-/// parsimoniously. Smooths the user sized explicitly, and the non-radial bases
-/// (B-spline, cyclic, tensor) which already default modestly via knot counts,
-/// are deliberately left untouched.
+/// Matérn / Duchon) the user did not size explicitly, cap the *default* center
+/// count via the private [`SECONDARY_CENTER_CAP_OPTION`]. The cap lowers the
+/// default while preserving the `Auto` center strategy, so the basis is still
+/// softly reduced when the data can't support the count (rather than erroring
+/// like an explicit count would). Smooths the user sized explicitly, and the
+/// non-radial bases (B-spline, cyclic, tensor) which already default modestly
+/// via knot counts, are deliberately left untouched.
 fn apply_secondary_predictor_basis_parsimony(terms: &mut [ParsedTerm], n_rows: usize) {
     for term in terms.iter_mut() {
         if let ParsedTerm::Smooth {
@@ -6089,8 +6091,8 @@ fn apply_secondary_predictor_basis_parsimony(terms: &mut [ParsedTerm], n_rows: u
             {
                 continue;
             }
-            let centers = crate::terms::basis::conservative_secondary_centers(n_rows, vars.len());
-            options.insert("centers".to_string(), centers.to_string());
+            let cap = crate::terms::basis::conservative_secondary_centers(n_rows, vars.len());
+            options.insert(SECONDARY_CENTER_CAP_OPTION.to_string(), cap.to_string());
         }
     }
 }
