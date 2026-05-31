@@ -4845,7 +4845,7 @@ impl ClusterJacobiPreconditioner {
     fn apply(&self, r: &Array1<f64>) -> Array1<f64> {
         let mut out = Array1::<f64>::zeros(r.len());
         for cluster in &self.clusters {
-            apply_cluster_non_overlapping(cluster, r, &mut out);
+            apply_cluster(cluster, r, &mut out, &ClusterApplyMode::Overwrite);
         }
         out
     }
@@ -4931,51 +4931,53 @@ impl AdditiveSchwarzPreconditioner {
     fn apply(&self, r: &Array1<f64>) -> Array1<f64> {
         let mut out = Array1::<f64>::zeros(r.len());
         for cluster in &self.clusters {
-            apply_cluster_overlapping(cluster, r, &mut out, &self.weights);
+            apply_cluster(
+                cluster,
+                r,
+                &mut out,
+                &ClusterApplyMode::Accumulate {
+                    weights: &self.weights,
+                },
+            );
         }
         out
     }
 }
 
-/// Apply a cluster factor (overwrite) for non-overlapping clusters.
-fn apply_cluster_non_overlapping(cluster: &ClusterFactor, r: &Array1<f64>, out: &mut Array1<f64>) {
-    match cluster {
-        ClusterFactor::Scalar { cols, inv } => {
-            for (local, &gi) in cols.iter().enumerate() {
-                out[gi] = inv[local] * r[gi];
-            }
-        }
-        ClusterFactor::Chol { cols, factor } => {
-            let b = cols.len();
-            let mut rhs = Array1::<f64>::zeros(b);
-            for (local, &gi) in cols.iter().enumerate() {
-                rhs[local] = r[gi];
-            }
-            use faer::linalg::solvers::Solve;
-            let stride = rhs.strides()[0];
-            let len = rhs.len();
-            // SAFETY: rhs is uniquely-borrowed contiguous Array1 with positive stride.
-            let rhs_mat = unsafe { faer::MatRef::from_raw_parts(rhs.as_ptr(), len, 1, stride, 0) };
-            let solved = factor.solve(rhs_mat);
-            for (local, &gi) in cols.iter().enumerate() {
-                out[gi] = solved[(local, 0)];
-            }
+/// How a cluster factor's contribution is written into the output vector.
+///
+/// `Overwrite` assigns `out[gi] = value` (non-overlapping clusters, each global
+/// column touched by exactly one cluster). `Accumulate` adds the partition-of-unity
+/// weighted contribution `out[gi] += weights[gi] * value` (overlapping Schwarz
+/// clusters, where a column may belong to several clusters).
+enum ClusterApplyMode<'w> {
+    Overwrite,
+    Accumulate { weights: &'w [f64] },
+}
+
+impl ClusterApplyMode<'_> {
+    #[inline]
+    fn write(&self, out: &mut Array1<f64>, gi: usize, value: f64) {
+        match self {
+            ClusterApplyMode::Overwrite => out[gi] = value,
+            ClusterApplyMode::Accumulate { weights } => out[gi] += weights[gi] * value,
         }
     }
 }
 
-/// Apply a cluster factor (accumulate with partition-of-unity weights)
-/// for overlapping Schwarz clusters.
-fn apply_cluster_overlapping(
+/// Apply a single cluster factor to the residual `r`, writing into `out`
+/// according to `mode` (overwrite for non-overlapping clusters, weighted
+/// accumulate for overlapping Schwarz clusters).
+fn apply_cluster(
     cluster: &ClusterFactor,
     r: &Array1<f64>,
     out: &mut Array1<f64>,
-    weights: &[f64],
+    mode: &ClusterApplyMode<'_>,
 ) {
     match cluster {
         ClusterFactor::Scalar { cols, inv } => {
             for (local, &gi) in cols.iter().enumerate() {
-                out[gi] += weights[gi] * inv[local] * r[gi];
+                mode.write(out, gi, inv[local] * r[gi]);
             }
         }
         ClusterFactor::Chol { cols, factor } => {
@@ -4991,7 +4993,7 @@ fn apply_cluster_overlapping(
             let rhs_mat = unsafe { faer::MatRef::from_raw_parts(rhs.as_ptr(), len, 1, stride, 0) };
             let solved = factor.solve(rhs_mat);
             for (local, &gi) in cols.iter().enumerate() {
-                out[gi] += weights[gi] * solved[(local, 0)];
+                mode.write(out, gi, solved[(local, 0)]);
             }
         }
     }

@@ -5258,6 +5258,62 @@ impl RowwiseKroneckerPsiDerivativeOperator {
         }
         Ok(stack_dense_row_blocks(&blocks))
     }
+
+    /// Canonical transpose-direction lifted matvec: for each time column `t`,
+    /// weight `v` by the time basis column, delegate to the base operator via
+    /// `base_op`, and scatter the per-base accumulator into the lifted layout.
+    fn lifted_transpose_mul_with_base<F>(
+        &self,
+        v: &ArrayView1<'_, f64>,
+        mut base_op: F,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError>
+    where
+        F: FnMut(&ArrayView1<'_, f64>) -> Result<Array1<f64>, crate::terms::basis::BasisError>,
+    {
+        assert_eq!(v.len(), self.n_data());
+        let p_base = self.base.p_out();
+        let mut out = Array1::<f64>::zeros(self.p_out);
+        for t in 0..self.p_time {
+            let mut accum = Array1::<f64>::zeros(p_base);
+            for (block_idx, time_basis) in self.time_bases.iter().enumerate() {
+                let row_start = block_idx * self.n_per_block;
+                let row_end = row_start + self.n_per_block;
+                let weighted = &v.slice(ndarray::s![row_start..row_end]).to_owned()
+                    * &time_basis.column(t).to_owned();
+                accum += &base_op(&weighted.view())?;
+            }
+            for j in 0..p_base {
+                out[j * self.p_time + t] = accum[j];
+            }
+        }
+        Ok(out)
+    }
+
+    /// Canonical forward-direction lifted matvec: split `u` into per-time-column
+    /// coefficient vectors, delegate each to the base operator via `base_op`, and
+    /// accumulate the time-basis-weighted contributions into the block rows.
+    fn lifted_forward_mul_with_base<F>(
+        &self,
+        u: &ArrayView1<'_, f64>,
+        mut base_op: F,
+    ) -> Result<Array1<f64>, crate::terms::basis::BasisError>
+    where
+        F: FnMut(&ArrayView1<'_, f64>) -> Result<Array1<f64>, crate::terms::basis::BasisError>,
+    {
+        let time_cols = self.split_time_columns(u);
+        let mut out = Array1::<f64>::zeros(self.n_data());
+        for (t, coeffs) in time_cols.iter().enumerate() {
+            let base_eval = base_op(&coeffs.view())?;
+            for (block_idx, time_basis) in self.time_bases.iter().enumerate() {
+                let row_start = block_idx * self.n_per_block;
+                let row_end = row_start + self.n_per_block;
+                let contrib = &base_eval * &time_basis.column(t).to_owned();
+                let mut out_block = out.slice_mut(ndarray::s![row_start..row_end]);
+                out_block += &contrib;
+            }
+        }
+        Ok(out)
+    }
 }
 
 impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator {
@@ -5278,23 +5334,9 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
         axis: usize,
         v: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        assert_eq!(v.len(), self.n_data());
-        let p_base = self.base.p_out();
-        let mut out = Array1::<f64>::zeros(self.p_out);
-        for t in 0..self.p_time {
-            let mut accum = Array1::<f64>::zeros(p_base);
-            for (block_idx, time_basis) in self.time_bases.iter().enumerate() {
-                let row_start = block_idx * self.n_per_block;
-                let row_end = row_start + self.n_per_block;
-                let weighted = &v.slice(ndarray::s![row_start..row_end]).to_owned()
-                    * &time_basis.column(t).to_owned();
-                accum += &self.base.transpose_mul(axis, &weighted.view())?;
-            }
-            for j in 0..p_base {
-                out[j * self.p_time + t] = accum[j];
-            }
-        }
-        Ok(out)
+        self.lifted_transpose_mul_with_base(v, |weighted| {
+            self.base.transpose_mul(axis, weighted)
+        })
     }
 
     fn forward_mul(
@@ -5302,19 +5344,7 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
         axis: usize,
         u: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        let time_cols = self.split_time_columns(u);
-        let mut out = Array1::<f64>::zeros(self.n_data());
-        for (t, coeffs) in time_cols.iter().enumerate() {
-            let base_eval = self.base.forward_mul(axis, &coeffs.view())?;
-            for (block_idx, time_basis) in self.time_bases.iter().enumerate() {
-                let row_start = block_idx * self.n_per_block;
-                let row_end = row_start + self.n_per_block;
-                let contrib = &base_eval * &time_basis.column(t).to_owned();
-                let mut out_block = out.slice_mut(ndarray::s![row_start..row_end]);
-                out_block += &contrib;
-            }
-        }
-        Ok(out)
+        self.lifted_forward_mul_with_base(u, |coeffs| self.base.forward_mul(axis, coeffs))
     }
 
     fn transpose_mul_second_diag(
@@ -5322,25 +5352,9 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
         axis: usize,
         v: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        assert_eq!(v.len(), self.n_data());
-        let p_base = self.base.p_out();
-        let mut out = Array1::<f64>::zeros(self.p_out);
-        for t in 0..self.p_time {
-            let mut accum = Array1::<f64>::zeros(p_base);
-            for (block_idx, time_basis) in self.time_bases.iter().enumerate() {
-                let row_start = block_idx * self.n_per_block;
-                let row_end = row_start + self.n_per_block;
-                let weighted = &v.slice(ndarray::s![row_start..row_end]).to_owned()
-                    * &time_basis.column(t).to_owned();
-                accum += &self
-                    .base
-                    .transpose_mul_second_diag(axis, &weighted.view())?;
-            }
-            for j in 0..p_base {
-                out[j * self.p_time + t] = accum[j];
-            }
-        }
-        Ok(out)
+        self.lifted_transpose_mul_with_base(v, |weighted| {
+            self.base.transpose_mul_second_diag(axis, weighted)
+        })
     }
 
     fn transpose_mul_second_cross(
@@ -5349,25 +5363,9 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
         axis_e: usize,
         v: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        assert_eq!(v.len(), self.n_data());
-        let p_base = self.base.p_out();
-        let mut out = Array1::<f64>::zeros(self.p_out);
-        for t in 0..self.p_time {
-            let mut accum = Array1::<f64>::zeros(p_base);
-            for (block_idx, time_basis) in self.time_bases.iter().enumerate() {
-                let row_start = block_idx * self.n_per_block;
-                let row_end = row_start + self.n_per_block;
-                let weighted = &v.slice(ndarray::s![row_start..row_end]).to_owned()
-                    * &time_basis.column(t).to_owned();
-                accum += &self
-                    .base
-                    .transpose_mul_second_cross(axis_d, axis_e, &weighted.view())?;
-            }
-            for j in 0..p_base {
-                out[j * self.p_time + t] = accum[j];
-            }
-        }
-        Ok(out)
+        self.lifted_transpose_mul_with_base(v, |weighted| {
+            self.base.transpose_mul_second_cross(axis_d, axis_e, weighted)
+        })
     }
 
     fn forward_mul_second_diag(
@@ -5375,19 +5373,9 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
         axis: usize,
         u: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        let time_cols = self.split_time_columns(u);
-        let mut out = Array1::<f64>::zeros(self.n_data());
-        for (t, coeffs) in time_cols.iter().enumerate() {
-            let base_eval = self.base.forward_mul_second_diag(axis, &coeffs.view())?;
-            for (block_idx, time_basis) in self.time_bases.iter().enumerate() {
-                let row_start = block_idx * self.n_per_block;
-                let row_end = row_start + self.n_per_block;
-                let contrib = &base_eval * &time_basis.column(t).to_owned();
-                let mut out_block = out.slice_mut(ndarray::s![row_start..row_end]);
-                out_block += &contrib;
-            }
-        }
-        Ok(out)
+        self.lifted_forward_mul_with_base(u, |coeffs| {
+            self.base.forward_mul_second_diag(axis, coeffs)
+        })
     }
 
     fn forward_mul_second_cross(
@@ -5396,21 +5384,9 @@ impl CustomFamilyPsiDerivativeOperator for RowwiseKroneckerPsiDerivativeOperator
         axis_e: usize,
         u: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        let time_cols = self.split_time_columns(u);
-        let mut out = Array1::<f64>::zeros(self.n_data());
-        for (t, coeffs) in time_cols.iter().enumerate() {
-            let base_eval = self
-                .base
-                .forward_mul_second_cross(axis_d, axis_e, &coeffs.view())?;
-            for (block_idx, time_basis) in self.time_bases.iter().enumerate() {
-                let row_start = block_idx * self.n_per_block;
-                let row_end = row_start + self.n_per_block;
-                let contrib = &base_eval * &time_basis.column(t).to_owned();
-                let mut out_block = out.slice_mut(ndarray::s![row_start..row_end]);
-                out_block += &contrib;
-            }
-        }
-        Ok(out)
+        self.lifted_forward_mul_with_base(u, |coeffs| {
+            self.base.forward_mul_second_cross(axis_d, axis_e, coeffs)
+        })
     }
 
     fn row_chunk_first(

@@ -163,65 +163,52 @@ fn parse_emitted(text: &str) -> BTreeMap<String, Vec<f64>> {
     out
 }
 
-/// Run an R reference body. The columns are exposed as a `data.frame` named
-/// `df`; the body calls `emit("key", numeric_vector)` to return results. The
-/// harness prepends the `df`, output path, and `emit` helper. Fails the test
-/// with the captured stderr when R exits non-zero — a broken or unavailable
-/// reference run (missing `Rscript`, missing package, R error) is a hard test
-/// failure, never a silent skip.
-pub fn run_r(columns: &[Column<'_>], body: &str) -> ReferenceResult {
-    let dir = unique_scratch_dir("r");
-    let data_csv = dir.join("data.csv");
-    let out_txt = dir.join("out.txt");
-    let script_r = dir.join("script.R");
-    write_columns_csv(&data_csv, columns);
+/// Per-language specifics for a reference subprocess run: scratch-dir tag,
+/// script filename, the interpreter `Command` (with any fixed leading args
+/// already applied), the script preamble/epilogue wrapped around the test body,
+/// and the human-readable name used in failure messages.
+struct ReferenceKind {
+    /// Short tag for the scratch directory (`"r"`, `"py"`).
+    tag: &'static str,
+    /// Script filename written into the scratch directory.
+    script_name: &'static str,
+    /// Code prepended before the test body (exposes `df`, output path, `emit`).
+    preamble: &'static str,
+    /// Code appended after the test body (e.g. Python's flush-to-file step).
+    epilogue: &'static str,
+    /// `.expect` message text for the spawn failure.
+    spawn_expect: &'static str,
+    /// `.expect` message text for the script-write failure.
+    write_expect: &'static str,
+    /// Human-readable language name used in the non-zero-exit assertion.
+    display: &'static str,
+}
 
-    let preamble = "\
+impl ReferenceKind {
+    fn r() -> Self {
+        ReferenceKind {
+            tag: "r",
+            script_name: "script.R",
+            preamble: "\
 args <- commandArgs(trailingOnly = TRUE)\n\
 df <- read.csv(args[1])\n\
 .OUT <- args[2]\n\
 emit <- function(key, x) {\n\
   cat(sprintf('%s:%s\\n', key, paste(format(as.numeric(x), digits = 17, scientific = TRUE), collapse = ' ')),\n\
       file = .OUT, append = TRUE)\n\
-}\n";
-    let full = format!("{preamble}\n{body}\n");
-    std::fs::write(&script_r, full).expect("write reference R script");
+}\n",
+            epilogue: "",
+            spawn_expect: "spawn Rscript (install R to run reference-comparison tests)",
+            write_expect: "write reference R script",
+            display: "R",
+        }
+    }
 
-    let output = Command::new("Rscript")
-        .arg("--vanilla")
-        .arg(&script_r)
-        .arg(&data_csv)
-        .arg(&out_txt)
-        .output()
-        .expect("spawn Rscript (install R to run reference-comparison tests)");
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success(),
-        "reference R body failed (status {:?})\n--- stderr ---\n{stderr}\n--- stdout ---\n{stdout}",
-        output.status.code()
-    );
-
-    let emitted = std::fs::read_to_string(&out_txt).unwrap_or_default();
-    let parsed = parse_emitted(&emitted);
-    std::fs::remove_dir_all(&dir).ok();
-    ReferenceResult { values: parsed }
-}
-
-/// Run a Python reference body. The columns are exposed as a pandas `df` (or,
-/// when pandas is unavailable, a dict of NumPy arrays). The body calls
-/// `emit("key", iterable)` to return results. Fails the test with captured
-/// stderr when Python exits non-zero (missing `python3`, missing module, or a
-/// raised exception).
-pub fn run_python(columns: &[Column<'_>], body: &str) -> ReferenceResult {
-    let dir = unique_scratch_dir("py");
-    let data_csv = dir.join("data.csv");
-    let out_txt = dir.join("out.txt");
-    let script_py = dir.join("script.py");
-    write_columns_csv(&data_csv, columns);
-
-    let preamble = "\
+    fn python() -> Self {
+        ReferenceKind {
+            tag: "py",
+            script_name: "script.py",
+            preamble: "\
 import sys\n\
 import numpy as np\n\
 _data_csv, _out = sys.argv[1], sys.argv[2]\n\
@@ -240,23 +227,61 @@ except Exception:\n\
 _lines = []\n\
 def emit(key, x):\n\
     arr = np.asarray(x, dtype=float).reshape(-1)\n\
-    _lines.append(str(key) + ':' + ' '.join(repr(float(v)) for v in arr))\n";
-    let epilogue = "\nopen(_out, 'w').write('\\n'.join(_lines) + '\\n')\n";
-    let full = format!("{preamble}\n{body}\n{epilogue}");
-    std::fs::write(&script_py, full).expect("write reference python script");
+    _lines.append(str(key) + ':' + ' '.join(repr(float(v)) for v in arr))\n",
+            epilogue: "\nopen(_out, 'w').write('\\n'.join(_lines) + '\\n')\n",
+            spawn_expect: "spawn python3 (install python3 to run reference-comparison tests)",
+            write_expect: "write reference python script",
+            display: "Python",
+        }
+    }
 
-    let output = Command::new("python3")
-        .arg(&script_py)
+    /// Build the interpreter command with its fixed leading arguments (before
+    /// the script path / data CSV / output path are appended by the runner).
+    fn command(&self) -> Command {
+        match self.tag {
+            "r" => {
+                let mut cmd = Command::new("Rscript");
+                cmd.arg("--vanilla");
+                cmd
+            }
+            _ => Command::new("python3"),
+        }
+    }
+}
+
+/// Run a reference body in the interpreter described by `kind`. The columns are
+/// written to a CSV the script reads; the wrapped script exposes `df`, the
+/// output path, and `emit("key", values)`, runs `body`, and emits results back
+/// over the line protocol. Fails the test with captured stderr/stdout when the
+/// interpreter exits non-zero — a broken or unavailable reference run (missing
+/// interpreter, missing package, runtime error) is a hard failure, never a
+/// silent skip.
+fn run_subprocess(kind: &ReferenceKind, columns: &[Column<'_>], body: &str) -> ReferenceResult {
+    let dir = unique_scratch_dir(kind.tag);
+    let data_csv = dir.join("data.csv");
+    let out_txt = dir.join("out.txt");
+    let script = dir.join(kind.script_name);
+    write_columns_csv(&data_csv, columns);
+
+    let preamble = kind.preamble;
+    let epilogue = kind.epilogue;
+    let full = format!("{preamble}\n{body}\n{epilogue}");
+    std::fs::write(&script, full).expect(kind.write_expect);
+
+    let output = kind
+        .command()
+        .arg(&script)
         .arg(&data_csv)
         .arg(&out_txt)
         .output()
-        .expect("spawn python3 (install python3 to run reference-comparison tests)");
+        .expect(kind.spawn_expect);
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
-        "reference Python body failed (status {:?})\n--- stderr ---\n{stderr}\n--- stdout ---\n{stdout}",
+        "reference {} body failed (status {:?})\n--- stderr ---\n{stderr}\n--- stdout ---\n{stdout}",
+        kind.display,
         output.status.code()
     );
 
@@ -264,6 +289,25 @@ def emit(key, x):\n\
     let parsed = parse_emitted(&emitted);
     std::fs::remove_dir_all(&dir).ok();
     ReferenceResult { values: parsed }
+}
+
+/// Run an R reference body. The columns are exposed as a `data.frame` named
+/// `df`; the body calls `emit("key", numeric_vector)` to return results. The
+/// harness prepends the `df`, output path, and `emit` helper. Fails the test
+/// with the captured stderr when R exits non-zero — a broken or unavailable
+/// reference run (missing `Rscript`, missing package, R error) is a hard test
+/// failure, never a silent skip.
+pub fn run_r(columns: &[Column<'_>], body: &str) -> ReferenceResult {
+    run_subprocess(&ReferenceKind::r(), columns, body)
+}
+
+/// Run a Python reference body. The columns are exposed as a pandas `df` (or,
+/// when pandas is unavailable, a dict of NumPy arrays). The body calls
+/// `emit("key", iterable)` to return results. Fails the test with captured
+/// stderr when Python exits non-zero (missing `python3`, missing module, or a
+/// raised exception).
+pub fn run_python(columns: &[Column<'_>], body: &str) -> ReferenceResult {
+    run_subprocess(&ReferenceKind::python(), columns, body)
 }
 
 /// Relative L2 distance `||a - b|| / max(||b||, eps)` — the natural

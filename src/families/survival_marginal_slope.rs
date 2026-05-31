@@ -60,6 +60,7 @@ use crate::smooth::{
 };
 use crate::solver::estimate::reml::unified::HyperOperator;
 use crate::types::{InverseLink, StandardLink};
+use crate::util::fnv::Fnv1a;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, s};
 use rayon::prelude::*;
 use smallvec::{SmallVec, smallvec};
@@ -435,35 +436,10 @@ fn hash_intercept_warm_start_key(
     beta_h: Option<&Array1<f64>>,
     beta_w: Option<&Array1<f64>>,
 ) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x100000001b3;
-    let mut hash = FNV_OFFSET;
-    let mix = |hash: &mut u64, byte: u8| {
-        *hash ^= byte as u64;
-        *hash = hash.wrapping_mul(FNV_PRIME);
-    };
-    let feed = |hash: &mut u64, beta: Option<&Array1<f64>>, marker: u8| {
-        mix(hash, marker);
-        match beta {
-            None => mix(hash, 0xffu8),
-            Some(v) => {
-                let len = v.len() as u64;
-                for b in len.to_le_bytes() {
-                    mix(hash, b);
-                }
-                for x in v.iter() {
-                    // Canonicalize -0.0 to +0.0 so equal vectors hash equal.
-                    let bits = if *x == 0.0 { 0u64 } else { x.to_bits() };
-                    for b in bits.to_le_bytes() {
-                        mix(hash, b);
-                    }
-                }
-            }
-        }
-    };
-    feed(&mut hash, beta_h, 0xa1);
-    feed(&mut hash, beta_w, 0xa2);
-    if hash == 0 { 1 } else { hash }
+    let mut hash = Fnv1a::new();
+    hash.mix_opt_beta(0xa1, beta_h);
+    hash.mix_opt_beta(0xa2, beta_w);
+    hash.finish_nonzero()
 }
 
 #[derive(Clone, Default)]

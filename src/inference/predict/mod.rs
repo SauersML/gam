@@ -342,31 +342,7 @@ impl UncertaintyCovarianceSource for Array2<f64> {
 /// row-major) so the inner accumulator vectorizes.
 #[inline]
 fn quadratic_form(cov: &Array2<f64>, grad: &[f64]) -> Result<f64, EstimationError> {
-    let m = grad.len();
-    if cov.nrows() != m || cov.ncols() != m {
-        return Err(EstimationError::InvalidInput(format!(
-            "covariance/gradient dimension mismatch: covariance is {}x{}, gradient length is {}",
-            cov.nrows(),
-            cov.ncols(),
-            m
-        )));
-    }
-    let mut diag_acc = 0.0_f64;
-    let mut off_acc = 0.0_f64;
-    for i in 0..m {
-        let row = cov.row(i);
-        let row_slice = row.as_slice().expect("Array2 row is contiguous");
-        let gi = grad[i];
-        // Diagonal term g_i² C_ii.
-        diag_acc += gi * gi * row_slice[i];
-        // Strict upper triangle Σ_{j>i} g_i g_j C_ij; doubled below by symmetry.
-        let mut row_off = 0.0_f64;
-        for j in (i + 1)..m {
-            row_off += grad[j] * row_slice[j];
-        }
-        off_acc += gi * row_off;
-    }
-    Ok((diag_acc + 2.0 * off_acc).max(0.0))
+    quadratic_form_indexed(cov, grad.len(), "gradient", |i| grad[i])
 }
 
 /// Symmetric quadratic form for the mixture-link `∂μ/∂θ` row, exploiting the
@@ -377,10 +353,30 @@ fn quadratic_form_from_jetmu(
     cov: &Array2<f64>,
     partials: &[InverseLinkJet],
 ) -> Result<f64, EstimationError> {
-    let m = partials.len();
+    quadratic_form_indexed(cov, partials.len(), "mixture gradient", |i| {
+        partials[i].mu
+    })
+}
+
+/// Shared kernel for the symmetric quadratic form `g' · C · g` for an SPD
+/// covariance `C`, where the per-element gradient is read lazily via `g(i)`.
+///
+/// Exploits symmetry of `C`:
+///   `g' C g = Σ_i g_i² C_ii + 2 Σ_{i<j} g_i g_j C_ij`.
+/// This halves the multiplications and reads each off-diagonal entry only
+/// once, while pulling each row out as a contiguous slice (`Array2` is
+/// row-major) so the inner accumulator vectorizes. `label` names the gradient
+/// source in the dimension-mismatch error.
+#[inline]
+fn quadratic_form_indexed(
+    cov: &Array2<f64>,
+    m: usize,
+    label: &str,
+    g: impl Fn(usize) -> f64,
+) -> Result<f64, EstimationError> {
     if cov.nrows() != m || cov.ncols() != m {
         return Err(EstimationError::InvalidInput(format!(
-            "covariance/mixture-gradient dimension mismatch: covariance is {}x{}, mixture gradient length is {}",
+            "covariance/{label} dimension mismatch: covariance is {}x{}, {label} length is {}",
             cov.nrows(),
             cov.ncols(),
             m
@@ -391,11 +387,13 @@ fn quadratic_form_from_jetmu(
     for i in 0..m {
         let row = cov.row(i);
         let row_slice = row.as_slice().expect("Array2 row is contiguous");
-        let gi = partials[i].mu;
+        let gi = g(i);
+        // Diagonal term g_i² C_ii.
         diag_acc += gi * gi * row_slice[i];
+        // Strict upper triangle Σ_{j>i} g_i g_j C_ij; doubled below by symmetry.
         let mut row_off = 0.0_f64;
         for j in (i + 1)..m {
-            row_off += partials[j].mu * row_slice[j];
+            row_off += g(j) * row_slice[j];
         }
         off_acc += gi * row_off;
     }

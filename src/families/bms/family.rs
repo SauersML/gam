@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::util::fnv::Fnv1a;
+
 #[derive(Clone)]
 pub(super) struct BernoulliMarginalSlopeFamily {
     pub(super) y: Arc<Array1<f64>>,
@@ -235,22 +237,12 @@ pub(super) fn new_intercept_warm_start_cache(n: usize) -> Arc<BernoulliIntercept
 /// cache's "never written" sentinel cannot collide with a real key.
 #[inline]
 pub(super) fn hash_intercept_warm_start_key_rigid(marginal_q: f64, slope: f64) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x100000001b3;
-    let mut hash = FNV_OFFSET;
-    let mix = |hash: &mut u64, byte: u8| {
-        *hash ^= byte as u64;
-        *hash = hash.wrapping_mul(FNV_PRIME);
-    };
+    let mut hash = Fnv1a::new();
     // Domain separator for the rigid (empirical-grid) cache stream.
-    mix(&mut hash, 0xb1);
-    for x in [marginal_q, slope] {
-        let bits = if x == 0.0 { 0u64 } else { x.to_bits() };
-        for b in bits.to_le_bytes() {
-            mix(&mut hash, b);
-        }
-    }
-    if hash == 0 { 1 } else { hash }
+    hash.mix_byte(0xb1);
+    hash.mix_f64(marginal_q);
+    hash.mix_f64(slope);
+    hash.finish_nonzero()
 }
 
 /// FNV-1a 64-bit hash of per-row state determining the FLEX intercept root.
@@ -265,43 +257,15 @@ pub(super) fn hash_intercept_warm_start_key_flex(
     beta_h: Option<&Array1<f64>>,
     beta_w: Option<&Array1<f64>>,
 ) -> u64 {
-    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-    const FNV_PRIME: u64 = 0x100000001b3;
-    let mut hash = FNV_OFFSET;
-    let mix = |hash: &mut u64, byte: u8| {
-        *hash ^= byte as u64;
-        *hash = hash.wrapping_mul(FNV_PRIME);
-    };
+    let mut hash = Fnv1a::new();
     // Domain separator for the FLEX cache stream so it cannot collide with
     // a rigid-stream hash that happens to produce the same scalar bits.
-    mix(&mut hash, 0xb2);
-    for x in [marginal_eta, slope] {
-        let bits = if x == 0.0 { 0u64 } else { x.to_bits() };
-        for b in bits.to_le_bytes() {
-            mix(&mut hash, b);
-        }
-    }
-    let feed = |hash: &mut u64, beta: Option<&Array1<f64>>, marker: u8| {
-        mix(hash, marker);
-        match beta {
-            None => mix(hash, 0xffu8),
-            Some(v) => {
-                let len = v.len() as u64;
-                for b in len.to_le_bytes() {
-                    mix(hash, b);
-                }
-                for x in v.iter() {
-                    let bits = if *x == 0.0 { 0u64 } else { x.to_bits() };
-                    for b in bits.to_le_bytes() {
-                        mix(hash, b);
-                    }
-                }
-            }
-        }
-    };
-    feed(&mut hash, beta_h, 0xc1);
-    feed(&mut hash, beta_w, 0xc2);
-    if hash == 0 { 1 } else { hash }
+    hash.mix_byte(0xb2);
+    hash.mix_f64(marginal_eta);
+    hash.mix_f64(slope);
+    hash.mix_opt_beta(0xc1, beta_h);
+    hash.mix_opt_beta(0xc2, beta_w);
+    hash.finish_nonzero()
 }
 
 #[derive(Clone, Default)]
