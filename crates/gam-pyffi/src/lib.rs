@@ -4025,22 +4025,21 @@ fn duchon_function_norm_penalty<'py>(
     };
     let built = build_duchon_basis(center_matrix.view(), &spec)
         .map_err(|err| py_value_error(err.to_string()))?;
-    // The non-periodic Euclidean path emits the three data-jet candidates
-    // (mass, tension, stiffness) on the cubic (r^3) basis; the structural
-    // smoother penalty is the curvature (data-jet) block — the stiffness
-    // candidate, which penalizes second-derivative (curvature) energy.
-    let stiffness_idx = built
+    // The redesigned non-periodic Euclidean path emits a single native
+    // reproducing-norm Gram as the `Primary` candidate (the function-norm
+    // penalty on the scale-free polyharmonic basis) plus a null-space shrinkage
+    // ridge; it no longer ships the mass/tension/stiffness operator triplet.
+    // The function norm is the Primary block.
+    let primary_idx = built
         .penaltyinfo
         .iter()
-        .position(|info| matches!(info.source, gam::basis::PenaltySource::OperatorStiffness))
+        .position(|info| matches!(info.source, gam::basis::PenaltySource::Primary))
         .ok_or_else(|| {
             py_value_error(
-                "Duchon function-norm penalty (stiffness) was not built; \
-                 ensure spec.operator_penalties.stiffness is Active"
-                    .to_string(),
+                "Duchon function-norm penalty (Primary native-norm Gram) was not built".to_string(),
             )
         })?;
-    let penalty = built.penalties[stiffness_idx].clone();
+    let penalty = built.penalties[primary_idx].clone();
     Ok(penalty.into_pyarray(py).unbind())
 }
 
