@@ -9888,13 +9888,15 @@ fn sae_manifold_fit_inner<'py>(
     let init_rho = SaeManifoldRho::new(sparsity_strength.ln(), smoothness.ln(), log_ard);
     let init_rho_flat = init_rho.to_flat();
     let n_params = init_rho_flat.len();
-    // TODO(sae-streaming-objective): LLM-scale fits (hundreds of millions of
-    // rows) want a minibatch REML objective so the `(N × M_total)` basis /
+    // Default: route every problem size through the full-batch objective on the
+    // owned `target`. LLM-scale fits (hundreds of millions of rows) would
+    // benefit from a minibatch REML objective so the `(N × M_total)` basis /
     // `(N × M_total × d)` jacobian / `(N × K)` logit buffers never materialize
-    // in full. v1 routes every problem size through the full-batch objective on
-    // the owned `target`; a follow-up replaces `target` with a chunked
-    // accumulator inside `SaeManifoldOuterObjective`. `sae_streaming_plan`
-    // remains a standalone diagnostic pyfunction for that work.
+    // in full, but the chunked accumulator that lets `SaeManifoldOuterObjective`
+    // own its rows incrementally is not a drop-in for the full-batch path the
+    // inner Arrow-Schur fit expects. Until that accumulator exists,
+    // `sae_streaming_plan` stays as a standalone diagnostic pyfunction and the
+    // outer-cascade entry point owns the full target verbatim.
     let mut objective = gam::terms::sae_manifold::SaeManifoldOuterObjective::new(
         base_term,
         z_view.to_owned(),
