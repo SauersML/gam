@@ -95,7 +95,7 @@ fn fit_exposes_posterior_covariance_and_standard_errors() {
     assert!(phi.is_finite() && phi > 0.0);
 
     let fmat = fit
-        .influence_matrix()
+        .coefficient_influence()
         .expect("coefficient-space influence matrix should be stored");
     let trace_f: f64 = (0..fmat.nrows()).map(|i| fmat[[i, i]]).sum();
     assert!(
@@ -118,7 +118,7 @@ fn fit_exposes_posterior_covariance_and_standard_errors() {
     let mut ve_expected = h_inv.dot(&xtwx).dot(&h_inv);
     ve_expected.mapv_inplace(|v| v * phi);
     let ve = fit
-        .ve_covariance()
+        .beta_covariance_ve()
         .expect("frequentist covariance should be stored when full covariance is available");
     let max_ve_diff = ve
         .iter()

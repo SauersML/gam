@@ -34,6 +34,8 @@ from typing import Sequence
 
 import numpy as np
 
+from ._binding import rust_module
+
 
 def _parse_shared_encoder(spec: str) -> list[int]:
     """Parse a shared-encoder spec into a list of hidden widths.
@@ -284,11 +286,12 @@ class Crosscoder:
             for li, (tl, rl) in enumerate(zip(tensors, recons_full)):
                 tl_np = tl.detach().cpu().numpy().astype(np.float64)
                 rl_np = rl.detach().cpu().numpy().astype(np.float64)
-                centered = tl_np - tl_np.mean(axis=0, keepdims=True)
-                ss_tot = float(np.sum(centered * centered))
-                ss_res = float(np.sum((tl_np - rl_np) ** 2))
-                per_layer[li] = (
-                    1.0 - ss_res / ss_tot if ss_tot > 0.0 else float("nan")
+                # Reconstruction R^2 is a numeric kernel owned by the Rust core
+                # (column-mean-centered SST, residual SSR, 1 - SSR/SST, with the
+                # SST==0 -> NaN and non-finite guards). Route through the FFI
+                # rather than re-deriving the formula here.
+                per_layer[li] = float(
+                    rust_module().sae_manifold_reconstruction_r2(tl_np, rl_np)
                 )
 
         self._module = module

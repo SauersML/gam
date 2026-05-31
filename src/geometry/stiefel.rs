@@ -1,8 +1,8 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::geometry::manifold::{
-    GeometryError, GeometryResult, RiemannianManifold, check_len, dot, flatten, from_flat,
-    identity, matrix_exp, qr_thin, sym, zero_christoffel,
+    GeometryError, GeometryResult, RiemannianManifold, check_len, flatten, from_flat, identity,
+    matrix_exp, projected_standard_basis_tangent, qr_thin, sym, zero_christoffel,
 };
 use crate::geometry::sphere::SphereManifold;
 
@@ -67,32 +67,7 @@ impl RiemannianManifold for StiefelManifold {
 
     fn tangent_basis(&self, point: ArrayView1<'_, f64>) -> GeometryResult<Array2<f64>> {
         check_len("Stiefel point", point.len(), self.ambient_dim())?;
-        let mut columns: Vec<Array1<f64>> = Vec::with_capacity(self.dim());
-        for col in 0..self.k {
-            for row in 0..self.n {
-                let mut e = Array2::<f64>::zeros((self.n, self.k));
-                e[[row, col]] = 1.0;
-                let mut v = self.project_tangent(point, flatten(&e).view())?;
-                for q in &columns {
-                    let proj = dot(q.view(), v.view());
-                    v -= &(q * proj);
-                }
-                let nrm = dot(v.view(), v.view()).sqrt();
-                if nrm > 1.0e-10 {
-                    columns.push(v / nrm);
-                }
-                if columns.len() == self.dim() {
-                    let mut out = Array2::<f64>::zeros((self.ambient_dim(), self.dim()));
-                    for j in 0..columns.len() {
-                        for i in 0..self.ambient_dim() {
-                            out[[i, j]] = columns[j][i];
-                        }
-                    }
-                    return Ok(out);
-                }
-            }
-        }
-        Ok(Array2::<f64>::zeros((self.ambient_dim(), columns.len())))
+        projected_standard_basis_tangent(self, point, self.n, self.k)
     }
 
     /// Riemannian exponential under the **canonical metric**

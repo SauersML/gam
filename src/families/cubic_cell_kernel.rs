@@ -1517,11 +1517,13 @@ impl CellMomentScratch {
 pub(crate) static CELL_MOMENT_REALLOCS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// 20-point Gauss–Legendre nodes on [-1, 1] for the Drezner–Wesolowsky
-/// bivariate normal CDF representation.  20 points give >30-digit accuracy
-/// for the smooth arcsin-transformed integrand, ensuring the BVN value is
-/// exact to f64 precision for all (h, k, ρ).
-const BVN_GL_NODES_20: [f64; 20] = [
+/// Canonical 20-point Gauss–Legendre nodes on [-1, 1] (Abramowitz & Stegun
+/// 25.4), tabulated to f64 precision. Used here for the Drezner–Wesolowsky
+/// bivariate normal CDF representation — 20 points give >30-digit accuracy for
+/// the smooth arcsin-transformed integrand, ensuring the BVN value is exact to
+/// f64 precision for all (h, k, ρ) — and shared with the cubic-cell B-spline
+/// moment parity gate in [`crate::gpu::cubic_bspline_moments`].
+pub(crate) const GL20_NODES: [f64; 20] = [
     -0.993_128_599_185_094_9,
     -0.963_971_927_277_913_8,
     -0.912_234_428_251_326,
@@ -1544,7 +1546,8 @@ const BVN_GL_NODES_20: [f64; 20] = [
     0.993_128_599_185_094_9,
 ];
 
-const BVN_GL_WEIGHTS_20: [f64; 20] = [
+/// Companion weights to [`GL20_NODES`]. Symmetric, summing to 2.
+pub(crate) const GL20_WEIGHTS: [f64; 20] = [
     0.017_614_007_139_152_12,
     0.040_601_429_800_386_94,
     0.062_672_048_334_109_06,
@@ -2915,8 +2918,8 @@ fn bvn_gl_sum(h: f64, k: f64, rho_clamped: f64, asr: f64) -> f64 {
     let (sin_mid, cos_mid) = half_asr.sin_cos();
     let mut sum = 0.0;
     for i in 0..10 {
-        let node = BVN_GL_NODES_20[i].abs();
-        let weight = BVN_GL_WEIGHTS_20[i];
+        let node = GL20_NODES[i].abs();
+        let weight = GL20_WEIGHTS[i];
         let (sin_delta, cos_delta) = (half_asr * node).sin_cos();
 
         let sn_lo = sin_mid * cos_delta - cos_mid * sin_delta;
@@ -2975,8 +2978,8 @@ fn bvn_gl_sum_interval(h: f64, left: f64, right: f64, rho_clamped: f64, asr: f64
     let (sin_mid, cos_mid) = half_asr.sin_cos();
     let mut sum = 0.0;
     for i in 0..10 {
-        let node = BVN_GL_NODES_20[i].abs();
-        let weight = BVN_GL_WEIGHTS_20[i];
+        let node = GL20_NODES[i].abs();
+        let weight = GL20_WEIGHTS[i];
         let (sin_delta, cos_delta) = (half_asr * node).sin_cos();
 
         let sn_lo = sin_mid * cos_delta - cos_mid * sin_delta;
@@ -3857,7 +3860,7 @@ mod tests {
         let hs = 0.5 * (h * h + k * k);
         let asr = rho_clamped.asin();
         let mut sum = 0.0;
-        for (&node, &weight) in BVN_GL_NODES_20.iter().zip(BVN_GL_WEIGHTS_20.iter()) {
+        for (&node, &weight) in GL20_NODES.iter().zip(GL20_WEIGHTS.iter()) {
             let sn = (0.5 * asr * (node + 1.0)).sin();
             let one_minus = 1.0 - sn * sn;
             let expo = ((sn * h * k) - hs) / one_minus;

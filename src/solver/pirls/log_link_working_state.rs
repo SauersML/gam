@@ -14,7 +14,10 @@
 //! it depends on (the Gamma weight ignores `mu`, the Poisson curvature ignores
 //! it) without any family being forced to accept an argument it never reads.
 
-use super::{WorkingDerivativeBuffersMut, standard_inverse_link_jet};
+use super::{
+    WorkingDerivSlices, WorkingDerivativeBuffersMut, WorkingSlices, standard_inverse_link_jet,
+    working_deriv_slices, working_slices,
+};
 use crate::estimate::EstimationError;
 use crate::types::InverseLink;
 use ndarray::{Array1, ArrayView1};
@@ -129,24 +132,19 @@ pub(super) fn write_log_link_working_state(
 ) {
     let floor_weight = rule.floor_weight;
     let zero_mu_jet_on_clamp = rule.zero_mu_jet_on_clamp;
-    if let Some(derivs) = derivatives {
-        let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
-        let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
-        let z_s = z.as_slice_mut().expect("z must be contiguous");
-        let dmu_s = derivs
-            .dmu_deta
-            .as_slice_mut()
-            .expect("dmu_deta must be contiguous");
-        let d2_s = derivs
-            .d2mu_deta2
-            .as_slice_mut()
-            .expect("d2mu_deta2 must be contiguous");
-        let d3_s = derivs
-            .d3mu_deta3
-            .as_slice_mut()
-            .expect("d3mu_deta3 must be contiguous");
-        let c_s = derivs.c.as_slice_mut().expect("c must be contiguous");
-        let d_s = derivs.d.as_slice_mut().expect("d must be contiguous");
+    if let Some(mut derivs) = derivatives {
+        let WorkingSlices {
+            mu: mu_s,
+            weights: weights_s,
+            z: z_s,
+        } = working_slices(mu, weights, z);
+        let WorkingDerivSlices {
+            c: c_s,
+            d: d_s,
+            dmu: dmu_s,
+            d2: d2_s,
+            d3: d3_s,
+        } = working_deriv_slices(&mut derivs);
         mu_s.par_iter_mut()
             .zip(weights_s.par_iter_mut())
             .zip(z_s.par_iter_mut())
@@ -195,9 +193,11 @@ pub(super) fn write_log_link_working_state(
                 },
             );
     } else {
-        let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
-        let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
-        let z_s = z.as_slice_mut().expect("z must be contiguous");
+        let WorkingSlices {
+            mu: mu_s,
+            weights: weights_s,
+            z: z_s,
+        } = working_slices(mu, weights, z);
         mu_s.par_iter_mut()
             .zip(weights_s.par_iter_mut())
             .zip(z_s.par_iter_mut())
@@ -239,24 +239,17 @@ pub(super) fn write_log_link_eta_curvature(
     inverse_link: &InverseLink,
     eta: &Array1<f64>,
     priorweights: ArrayView1<f64>,
-    buffers: WorkingDerivativeBuffersMut<'_>,
+    mut buffers: WorkingDerivativeBuffersMut<'_>,
 ) -> Result<(), EstimationError> {
     let floor_weight = rule.floor_weight;
     let zero_mu_jet_on_clamp = rule.zero_mu_jet_on_clamp;
-    let c_s = buffers.c.as_slice_mut().expect("c must be contiguous");
-    let d_s = buffers.d.as_slice_mut().expect("d must be contiguous");
-    let dmu_s = buffers
-        .dmu_deta
-        .as_slice_mut()
-        .expect("dmu_deta must be contiguous");
-    let d2_s = buffers
-        .d2mu_deta2
-        .as_slice_mut()
-        .expect("d2mu_deta2 must be contiguous");
-    let d3_s = buffers
-        .d3mu_deta3
-        .as_slice_mut()
-        .expect("d3mu_deta3 must be contiguous");
+    let WorkingDerivSlices {
+        c: c_s,
+        d: d_s,
+        dmu: dmu_s,
+        d2: d2_s,
+        d3: d3_s,
+    } = working_deriv_slices(&mut buffers);
     c_s.par_iter_mut()
         .zip(d_s.par_iter_mut())
         .zip(dmu_s.par_iter_mut())

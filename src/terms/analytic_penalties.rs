@@ -421,6 +421,63 @@ fn advance_scalar_weight(
     }
 }
 
+/// Emit the standard scalar-weight-schedule builder for a penalty struct whose
+/// scalar weight lives in `$field` and whose schedule lives in
+/// `weight_schedule: Option<ScalarWeightSchedule>`. The builder seeds the
+/// current weight from the schedule and stores the schedule. Invoke inside the
+/// struct's inherent `impl … {}` block.
+macro_rules! impl_with_weight_schedule {
+    ($field:ident) => {
+        /// Attach a scalar weight schedule, seeding the current weight from
+        /// the schedule's stored iteration counter.
+        #[must_use]
+        pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
+            self.$field = schedule.current_weight(schedule.iter_count);
+            self.weight_schedule = Some(schedule);
+            self
+        }
+    };
+}
+
+/// Emit the standard [`AnalyticPenalty::apply_schedule`] override for a penalty
+/// whose scalar weight lives in `$field`. Invoke inside the `impl
+/// AnalyticPenalty for …` block.
+macro_rules! impl_scalar_apply_schedule {
+    ($field:ident) => {
+        fn apply_schedule(&mut self, iter: usize) {
+            advance_scalar_weight(&mut self.$field, &mut self.weight_schedule, iter);
+        }
+    };
+}
+
+/// Emit the standard learnable-scalar-weight [`AnalyticPenalty::grad_rho`] for a
+/// penalty whose single owned ρ-axis is the (optionally learnable) log-weight at
+/// `self.rho_index`, gated by `self.learnable_weight`. Invoke inside the `impl
+/// AnalyticPenalty for …` block.
+macro_rules! impl_learnable_weight_grad_rho {
+    () => {
+        fn grad_rho(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
+            if !self.learnable_weight {
+                return Array1::<f64>::zeros(0);
+            }
+            let mut out = Array1::<f64>::zeros(1);
+            out[self.rho_index] = self.value(target, rho);
+            out
+        }
+    };
+}
+
+/// Emit the standard learnable-scalar-weight [`AnalyticPenalty::rho_count`]:
+/// one ρ-axis when the weight is learnable, none otherwise. Invoke inside the
+/// `impl AnalyticPenalty for …` block.
+macro_rules! impl_learnable_weight_rho_count {
+    () => {
+        fn rho_count(&self) -> usize {
+            usize::from(self.learnable_weight)
+        }
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Isometry penalty
 // ---------------------------------------------------------------------------
@@ -828,12 +885,7 @@ impl IsometryPenalty {
         self
     }
 
-    #[must_use]
-    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
-        self.scalar_weight = schedule.current_weight(schedule.iter_count);
-        self.weight_schedule = Some(schedule);
-        self
-    }
+    impl_with_weight_schedule!(scalar_weight);
 
     fn missing_cache_default(&self, method: &str, detail: &str) {
         log::warn!(
@@ -1562,9 +1614,7 @@ impl AnalyticPenalty for IsometryPenalty {
         "isometry"
     }
 
-    fn apply_schedule(&mut self, iter: usize) {
-        advance_scalar_weight(&mut self.scalar_weight, &mut self.weight_schedule, iter);
-    }
+    impl_scalar_apply_schedule!(scalar_weight);
 }
 
 // ---------------------------------------------------------------------------
@@ -1651,12 +1701,7 @@ impl SoftmaxAssignmentSparsityPenalty {
         }
     }
 
-    #[must_use]
-    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
-        self.weight = schedule.current_weight(schedule.iter_count);
-        self.weight_schedule = Some(schedule);
-        self
-    }
+    impl_with_weight_schedule!(weight);
 
     fn softmax_row(&self, row: &[f64]) -> Vec<f64> {
         let inv_tau = 1.0 / self.temperature;
@@ -1837,9 +1882,7 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
         "softmax_assignment_sparsity"
     }
 
-    fn apply_schedule(&mut self, iter: usize) {
-        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
-    }
+    impl_scalar_apply_schedule!(weight);
 }
 
 /// IBP-MAP active-set prior over SAE-manifold assignment logits.
@@ -1896,12 +1939,7 @@ impl IBPAssignmentPenalty {
         self
     }
 
-    #[must_use]
-    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
-        self.weight = schedule.current_weight(schedule.iter_count);
-        self.weight_schedule = Some(schedule);
-        self
-    }
+    impl_with_weight_schedule!(weight);
 
     fn resolved_alpha(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_alpha {
@@ -2160,12 +2198,7 @@ impl SparsityPenalty {
         }
     }
 
-    #[must_use]
-    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
-        self.weight = schedule.current_weight(schedule.iter_count);
-        self.weight_schedule = Some(schedule);
-        self
-    }
+    impl_with_weight_schedule!(weight);
 
     #[must_use]
     pub fn with_eps_reml(mut self, eps_rho_index: usize) -> Self {
@@ -2473,9 +2506,7 @@ impl AnalyticPenalty for SparsityPenalty {
         "sparsity"
     }
 
-    fn apply_schedule(&mut self, iter: usize) {
-        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
-    }
+    impl_scalar_apply_schedule!(weight);
 }
 
 // ---------------------------------------------------------------------------
@@ -2542,12 +2573,7 @@ impl ARDPenalty {
         }
     }
 
-    #[must_use]
-    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
-        self.weight = schedule.current_weight(schedule.iter_count);
-        self.weight_schedule = Some(schedule);
-        self
-    }
+    impl_with_weight_schedule!(weight);
 
     /// Override the effective observation count used in the Occam log-det
     /// term (default: `target.len() / latent_dim`). Pass the number of
@@ -2657,9 +2683,7 @@ impl AnalyticPenalty for ARDPenalty {
         "ard"
     }
 
-    fn apply_schedule(&mut self, iter: usize) {
-        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
-    }
+    impl_scalar_apply_schedule!(weight);
 }
 
 // ---------------------------------------------------------------------------
@@ -2703,12 +2727,7 @@ impl TopKActivationPenalty {
         })
     }
 
-    #[must_use]
-    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
-        self.weight = schedule.current_weight(schedule.iter_count);
-        self.weight_schedule = Some(schedule);
-        self
-    }
+    impl_with_weight_schedule!(weight);
 
     fn topk_mask_row(&self, target: ArrayView1<'_, f64>, row: usize, mask: &mut [bool]) {
         mask.fill(false);
@@ -2809,9 +2828,7 @@ impl AnalyticPenalty for TopKActivationPenalty {
         "topk_activation"
     }
 
-    fn apply_schedule(&mut self, iter: usize) {
-        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
-    }
+    impl_scalar_apply_schedule!(weight);
 }
 
 // ---------------------------------------------------------------------------
@@ -2875,12 +2892,7 @@ impl JumpReLUPenalty {
         })
     }
 
-    #[must_use]
-    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
-        self.weight = schedule.current_weight(schedule.iter_count);
-        self.weight_schedule = Some(schedule);
-        self
-    }
+    impl_with_weight_schedule!(weight);
 
     fn threshold(&self, axis: usize, rho: ArrayView1<'_, f64>) -> f64 {
         self.thresholds[axis] * rho[axis].exp()
@@ -3054,9 +3066,7 @@ impl AnalyticPenalty for JumpReLUPenalty {
         "jumprelu"
     }
 
-    fn apply_schedule(&mut self, iter: usize) {
-        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
-    }
+    impl_scalar_apply_schedule!(weight);
 }
 
 // ---------------------------------------------------------------------------
@@ -3147,12 +3157,7 @@ impl TotalVariationPenalty {
         })
     }
 
-    #[must_use]
-    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
-        self.weight = schedule.current_weight(schedule.iter_count);
-        self.weight_schedule = Some(schedule);
-        self
-    }
+    impl_with_weight_schedule!(weight);
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
@@ -3471,26 +3476,15 @@ impl AnalyticPenalty for TotalVariationPenalty {
         out
     }
 
-    fn grad_rho(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
-        if !self.learnable_weight {
-            return Array1::<f64>::zeros(0);
-        }
-        let mut out = Array1::<f64>::zeros(1);
-        out[self.rho_index] = self.value(target, rho);
-        out
-    }
+    impl_learnable_weight_grad_rho!();
 
-    fn rho_count(&self) -> usize {
-        usize::from(self.learnable_weight)
-    }
+    impl_learnable_weight_rho_count!();
 
     fn name(&self) -> &str {
         "total_variation"
     }
 
-    fn apply_schedule(&mut self, iter: usize) {
-        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
-    }
+    impl_scalar_apply_schedule!(weight);
 }
 
 // ---------------------------------------------------------------------------
@@ -3564,12 +3558,7 @@ impl MonotonicityPenalty {
         })
     }
 
-    #[must_use]
-    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
-        self.weight = schedule.current_weight(schedule.iter_count);
-        self.weight_schedule = Some(schedule);
-        self
-    }
+    impl_with_weight_schedule!(weight);
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
@@ -3702,26 +3691,15 @@ impl AnalyticPenalty for MonotonicityPenalty {
         out
     }
 
-    fn grad_rho(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
-        if !self.learnable_weight {
-            return Array1::<f64>::zeros(0);
-        }
-        let mut out = Array1::<f64>::zeros(1);
-        out[self.rho_index] = self.value(target, rho);
-        out
-    }
+    impl_learnable_weight_grad_rho!();
 
-    fn rho_count(&self) -> usize {
-        usize::from(self.learnable_weight)
-    }
+    impl_learnable_weight_rho_count!();
 
     fn name(&self) -> &str {
         "monotonicity"
     }
 
-    fn apply_schedule(&mut self, iter: usize) {
-        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
-    }
+    impl_scalar_apply_schedule!(weight);
 }
 
 // ---------------------------------------------------------------------------
@@ -3818,12 +3796,7 @@ impl NuclearNormPenalty {
         })
     }
 
-    #[must_use]
-    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
-        self.weight = schedule.current_weight(schedule.iter_count);
-        self.weight_schedule = Some(schedule);
-        self
-    }
+    impl_with_weight_schedule!(weight);
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
@@ -4076,26 +4049,15 @@ impl AnalyticPenalty for NuclearNormPenalty {
         Self::flatten_matrix(&out)
     }
 
-    fn grad_rho(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
-        if !self.learnable_weight {
-            return Array1::<f64>::zeros(0);
-        }
-        let mut out = Array1::<f64>::zeros(1);
-        out[self.rho_index] = self.value(target, rho);
-        out
-    }
+    impl_learnable_weight_grad_rho!();
 
-    fn rho_count(&self) -> usize {
-        usize::from(self.learnable_weight)
-    }
+    impl_learnable_weight_rho_count!();
 
     fn name(&self) -> &str {
         "nuclear_norm"
     }
 
-    fn apply_schedule(&mut self, iter: usize) {
-        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
-    }
+    impl_scalar_apply_schedule!(weight);
 }
 
 // ---------------------------------------------------------------------------
@@ -4217,12 +4179,7 @@ impl BlockSparsityPenalty {
         })
     }
 
-    #[must_use]
-    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
-        self.weight = schedule.current_weight(schedule.iter_count);
-        self.weight_schedule = Some(schedule);
-        self
-    }
+    impl_with_weight_schedule!(weight);
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
@@ -4409,26 +4366,15 @@ impl AnalyticPenalty for BlockSparsityPenalty {
         Self::flatten_matrix(&out)
     }
 
-    fn grad_rho(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
-        if !self.learnable_weight {
-            return Array1::<f64>::zeros(0);
-        }
-        let mut out = Array1::<f64>::zeros(1);
-        out[self.rho_index] = self.value(target, rho);
-        out
-    }
+    impl_learnable_weight_grad_rho!();
 
-    fn rho_count(&self) -> usize {
-        usize::from(self.learnable_weight)
-    }
+    impl_learnable_weight_rho_count!();
 
     fn name(&self) -> &str {
         "block_sparsity"
     }
 
-    fn apply_schedule(&mut self, iter: usize) {
-        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
-    }
+    impl_scalar_apply_schedule!(weight);
 }
 
 // ---------------------------------------------------------------------------
@@ -4743,18 +4689,9 @@ impl AnalyticPenalty for MechanismSparsityPenalty {
         out
     }
 
-    fn grad_rho(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
-        if !self.learnable_weight {
-            return Array1::<f64>::zeros(0);
-        }
-        let mut out = Array1::<f64>::zeros(1);
-        out[self.rho_index] = self.value(target, rho);
-        out
-    }
+    impl_learnable_weight_grad_rho!();
 
-    fn rho_count(&self) -> usize {
-        usize::from(self.learnable_weight)
-    }
+    impl_learnable_weight_rho_count!();
 
     fn name(&self) -> &str {
         "mechanism_sparsity"
@@ -4887,12 +4824,7 @@ impl RowPrecisionPriorPenalty {
         })
     }
 
-    #[must_use]
-    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
-        self.weight = schedule.current_weight(schedule.iter_count);
-        self.weight_schedule = Some(schedule);
-        self
-    }
+    impl_with_weight_schedule!(weight);
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
@@ -5121,17 +5053,13 @@ impl AnalyticPenalty for RowPrecisionPriorPenalty {
         out
     }
 
-    fn rho_count(&self) -> usize {
-        usize::from(self.learnable_weight)
-    }
+    impl_learnable_weight_rho_count!();
 
     fn name(&self) -> &str {
         "row_precision_prior"
     }
 
-    fn apply_schedule(&mut self, iter: usize) {
-        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
-    }
+    impl_scalar_apply_schedule!(weight);
 }
 
 // ---------------------------------------------------------------------------
@@ -5252,12 +5180,7 @@ impl IvaeRidgeMeanGauge {
         })
     }
 
-    #[must_use]
-    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
-        self.weight = schedule.current_weight(schedule.iter_count);
-        self.weight_schedule = Some(schedule);
-        self
-    }
+    impl_with_weight_schedule!(weight);
 
     fn invert_spd_gram(gram: Array2<f64>) -> Result<Array2<f64>, String> {
         let q = gram.nrows();
@@ -5486,17 +5409,13 @@ impl AnalyticPenalty for IvaeRidgeMeanGauge {
         out
     }
 
-    fn rho_count(&self) -> usize {
-        usize::from(self.learnable_weight)
-    }
+    impl_learnable_weight_rho_count!();
 
     fn name(&self) -> &str {
         "ivae_ridge_mean_gauge"
     }
 
-    fn apply_schedule(&mut self, iter: usize) {
-        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
-    }
+    impl_scalar_apply_schedule!(weight);
 }
 
 // ---------------------------------------------------------------------------
@@ -5664,12 +5583,7 @@ impl ParametricRowPrecisionPriorPenalty {
         })
     }
 
-    #[must_use]
-    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
-        self.weight = schedule.current_weight(schedule.iter_count);
-        self.weight_schedule = Some(schedule);
-        self
-    }
+    impl_with_weight_schedule!(weight);
 
     fn latent_dim(&self, target_len: usize) -> Option<usize> {
         if self.n_eff == 0 || !target_len.is_multiple_of(self.n_eff) {
@@ -5924,9 +5838,7 @@ impl AnalyticPenalty for ParametricRowPrecisionPriorPenalty {
         "parametric_row_precision_prior"
     }
 
-    fn apply_schedule(&mut self, iter: usize) {
-        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
-    }
+    impl_scalar_apply_schedule!(weight);
 }
 
 // ---------------------------------------------------------------------------
@@ -6043,12 +5955,7 @@ impl ScadMcpPenalty {
         })
     }
 
-    #[must_use]
-    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
-        self.weight = schedule.current_weight(schedule.iter_count);
-        self.weight_schedule = Some(schedule);
-        self
-    }
+    impl_with_weight_schedule!(weight);
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
@@ -6262,17 +6169,13 @@ impl AnalyticPenalty for ScadMcpPenalty {
         out
     }
 
-    fn rho_count(&self) -> usize {
-        usize::from(self.learnable_weight)
-    }
+    impl_learnable_weight_rho_count!();
 
     fn name(&self) -> &str {
         "scad_mcp"
     }
 
-    fn apply_schedule(&mut self, iter: usize) {
-        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
-    }
+    impl_scalar_apply_schedule!(weight);
 }
 
 // ---------------------------------------------------------------------------
@@ -6393,12 +6296,7 @@ impl BlockOrthogonalityPenalty {
         })
     }
 
-    #[must_use]
-    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
-        self.weight = schedule.current_weight(schedule.iter_count);
-        self.weight_schedule = Some(schedule);
-        self
-    }
+    impl_with_weight_schedule!(weight);
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
@@ -6691,26 +6589,15 @@ impl AnalyticPenalty for BlockOrthogonalityPenalty {
         Some(out)
     }
 
-    fn grad_rho(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
-        if !self.learnable_weight {
-            return Array1::<f64>::zeros(0);
-        }
-        let mut out = Array1::<f64>::zeros(1);
-        out[self.rho_index] = self.value(target, rho);
-        out
-    }
+    impl_learnable_weight_grad_rho!();
 
-    fn rho_count(&self) -> usize {
-        usize::from(self.learnable_weight)
-    }
+    impl_learnable_weight_rho_count!();
 
     fn name(&self) -> &str {
         "block_orthogonality"
     }
 
-    fn apply_schedule(&mut self, iter: usize) {
-        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
-    }
+    impl_scalar_apply_schedule!(weight);
 }
 
 // ---------------------------------------------------------------------------
@@ -6788,12 +6675,7 @@ impl OrthogonalityPenalty {
         })
     }
 
-    #[must_use]
-    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
-        self.weight = schedule.current_weight(schedule.iter_count);
-        self.weight_schedule = Some(schedule);
-        self
-    }
+    impl_with_weight_schedule!(weight);
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
@@ -6994,26 +6876,15 @@ impl AnalyticPenalty for OrthogonalityPenalty {
         Self::flatten_matrix(&hv)
     }
 
-    fn grad_rho(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
-        if !self.learnable_weight {
-            return Array1::<f64>::zeros(0);
-        }
-        let mut out = Array1::<f64>::zeros(1);
-        out[self.rho_index] = self.value(target, rho);
-        out
-    }
+    impl_learnable_weight_grad_rho!();
 
-    fn rho_count(&self) -> usize {
-        usize::from(self.learnable_weight)
-    }
+    impl_learnable_weight_rho_count!();
 
     fn name(&self) -> &str {
         "orthogonality"
     }
 
-    fn apply_schedule(&mut self, iter: usize) {
-        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
-    }
+    impl_scalar_apply_schedule!(weight);
 }
 
 // ---------------------------------------------------------------------------

@@ -98,11 +98,148 @@ mod cuda {
     }
 
     // -----------------------------------------------------------------------
-    // fp32 helpers: Cholesky factorization and triangular solve in f32
+    // Precision-generic Cholesky scaffold
+    //
+    // POTRF / POTRS host scaffolds are identical across single and double
+    // precision apart from the cuSOLVER symbol called and the device pointer
+    // type. `CholScalar` selects those per-precision pieces so the host-side
+    // allocation / info-handling / error-formatting logic lives once. The
+    // `Dpotr*` (f64) and `Spotr*` (f32) entry points below are thin wrappers
+    // over the generic helpers, preserving their public signatures byte for
+    // byte.
     // -----------------------------------------------------------------------
 
-    /// Compute the cuSOLVER workspace size for a p×p fp32 Cholesky.
-    fn spotrf_lwork(
+    /// cuSOLVER scalar abstraction: selects the precision-specific POTRF/POTRS
+    /// symbols and the precision tag used in deferred-info error messages.
+    ///
+    /// # Safety
+    ///
+    /// Implementors must wire `BUFFER_SIZE`, `POTRF`, and `POTRS` to the
+    /// cuSOLVER entry points whose pointer arguments match `Self` (e.g.
+    /// `cusolverDnDpotrf` for `f64`). The generic scaffold casts device
+    /// pointers to `*mut Self` / `*const Self` before calling, so a mismatch
+    /// would hand cuSOLVER a wrongly-typed buffer.
+    unsafe trait CholScalar:
+        cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Copy
+    {
+        /// cuSOLVER `*potrf_bufferSize`: `(handle, uplo, n, A, lda, *lwork)`.
+        const BUFFER_SIZE: unsafe fn(
+            cusolver_sys::cusolverDnHandle_t,
+            cusolver_sys::cublasFillMode_t,
+            i32,
+            *mut Self,
+            i32,
+            *mut i32,
+        ) -> cusolver_sys::cusolverStatus_t;
+        /// cuSOLVER `*potrf`: `(handle, uplo, n, A, lda, work, lwork, info)`.
+        const POTRF: unsafe fn(
+            cusolver_sys::cusolverDnHandle_t,
+            cusolver_sys::cublasFillMode_t,
+            i32,
+            *mut Self,
+            i32,
+            *mut Self,
+            i32,
+            *mut i32,
+        ) -> cusolver_sys::cusolverStatus_t;
+        /// cuSOLVER `*potrs`: `(handle, uplo, n, nrhs, A, lda, B, ldb, info)`.
+        const POTRS: unsafe fn(
+            cusolver_sys::cusolverDnHandle_t,
+            cusolver_sys::cublasFillMode_t,
+            i32,
+            i32,
+            *const Self,
+            i32,
+            *mut Self,
+            i32,
+            *mut i32,
+        ) -> cusolver_sys::cusolverStatus_t;
+        /// Symbol name fragment for error messages (e.g. `"Dpotrf"`).
+        const POTRF_NAME: &'static str;
+        const POTRS_NAME: &'static str;
+        /// Trailing clause appended to a POTRF "not SPD" error (e.g.
+        /// `" (matrix not SPD at f32)"`); empty for f64.
+        const POTRF_FAIL_SUFFIX: &'static str;
+    }
+
+    // SAFETY: each constant points at the cuSOLVER symbol whose buffer
+    // arguments are typed for the matching precision.
+    unsafe impl CholScalar for f64 {
+        const BUFFER_SIZE: unsafe fn(
+            cusolver_sys::cusolverDnHandle_t,
+            cusolver_sys::cublasFillMode_t,
+            i32,
+            *mut f64,
+            i32,
+            *mut i32,
+        ) -> cusolver_sys::cusolverStatus_t = cusolver_sys::cusolverDnDpotrf_bufferSize;
+        const POTRF: unsafe fn(
+            cusolver_sys::cusolverDnHandle_t,
+            cusolver_sys::cublasFillMode_t,
+            i32,
+            *mut f64,
+            i32,
+            *mut f64,
+            i32,
+            *mut i32,
+        ) -> cusolver_sys::cusolverStatus_t = cusolver_sys::cusolverDnDpotrf;
+        const POTRS: unsafe fn(
+            cusolver_sys::cusolverDnHandle_t,
+            cusolver_sys::cublasFillMode_t,
+            i32,
+            i32,
+            *const f64,
+            i32,
+            *mut f64,
+            i32,
+            *mut i32,
+        ) -> cusolver_sys::cusolverStatus_t = cusolver_sys::cusolverDnDpotrs;
+        const POTRF_NAME: &'static str = "Dpotrf";
+        const POTRS_NAME: &'static str = "Dpotrs";
+        const POTRF_FAIL_SUFFIX: &'static str = "";
+    }
+
+    // SAFETY: each constant points at the cuSOLVER symbol whose buffer
+    // arguments are typed for the matching precision.
+    unsafe impl CholScalar for f32 {
+        const BUFFER_SIZE: unsafe fn(
+            cusolver_sys::cusolverDnHandle_t,
+            cusolver_sys::cublasFillMode_t,
+            i32,
+            *mut f32,
+            i32,
+            *mut i32,
+        ) -> cusolver_sys::cusolverStatus_t = cusolver_sys::cusolverDnSpotrf_bufferSize;
+        const POTRF: unsafe fn(
+            cusolver_sys::cusolverDnHandle_t,
+            cusolver_sys::cublasFillMode_t,
+            i32,
+            *mut f32,
+            i32,
+            *mut f32,
+            i32,
+            *mut i32,
+        ) -> cusolver_sys::cusolverStatus_t = cusolver_sys::cusolverDnSpotrf;
+        const POTRS: unsafe fn(
+            cusolver_sys::cusolverDnHandle_t,
+            cusolver_sys::cublasFillMode_t,
+            i32,
+            i32,
+            *const f32,
+            i32,
+            *mut f32,
+            i32,
+            *mut i32,
+        ) -> cusolver_sys::cusolverStatus_t = cusolver_sys::cusolverDnSpotrs;
+        const POTRF_NAME: &'static str = "Spotrf";
+        const POTRS_NAME: &'static str = "Spotrs";
+        const POTRF_FAIL_SUFFIX: &'static str = " (matrix not SPD at f32)";
+    }
+
+    /// Query the cuSOLVER POTRF workspace size (element count) for a p×p
+    /// matrix at precision `T`. Allocates a temporary p×p dummy buffer for the
+    /// query.
+    fn potrf_bufsize_generic<T: CholScalar>(
         solver: &DnHandle,
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
         p: usize,
@@ -111,25 +248,128 @@ mod cuda {
         let uplo = cusolver_sys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER;
         let mut lwork = 0_i32;
         let mut dummy = stream
-            .alloc_zeros::<f32>(p.checked_mul(p).ok_or("p² overflow")?)
-            .map_err(|e| format!("alloc f32 dummy: {e}"))?;
+            .alloc_zeros::<T>(p.checked_mul(p).ok_or("p² overflow in lwork query")?)
+            .map_err(|e| format!("cuda alloc dummy for lwork query: {e}"))?;
         {
             let (ptr, _rec) = dummy.device_ptr_mut(stream);
-            // SAFETY: buffer-size query; dummy is a live p*p f32 device buffer.
+            // SAFETY: buffer-size query; dummy is a live p*p device buffer of
+            // type T, lwork is a host i32, T::BUFFER_SIZE is the matching symbol.
+            let status = unsafe { T::BUFFER_SIZE(solver.cu(), uplo, p_i, ptr as *mut T, p_i, &mut lwork) };
+            check_cusolver(status, "cusolverDn*potrf_bufferSize")?;
+        }
+        usize::try_from(lwork).map_err(|_| "negative potrf lwork".to_string())
+    }
+
+    /// Factor a p×p SPD device buffer in-place (lower-triangular Cholesky) at
+    /// precision `T`, querying and allocating its own workspace. Returns `Err`
+    /// if the matrix is singular/indefinite at precision `T`.
+    fn potrf_in_place_generic<T: CholScalar>(
+        solver: &DnHandle,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        p: usize,
+        a: &mut CudaSlice<T>,
+    ) -> Result<(), String> {
+        let p_i = to_i32(p)?;
+        let lwork = potrf_bufsize_generic::<T>(solver, stream, p)?;
+        let lwork_i = i32::try_from(lwork).map_err(|_| "negative potrf workspace".to_string())?;
+        let mut workspace = stream
+            .alloc_zeros::<T>(lwork.max(1))
+            .map_err(|e| format!("cuda alloc potrf workspace: {e}"))?;
+        let mut info = stream
+            .alloc_zeros::<i32>(1)
+            .map_err(|e| format!("cuda alloc potrf info: {e}"))?;
+        let uplo = cusolver_sys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER;
+        {
+            let (a_ptr, _a_rec) = a.device_ptr_mut(stream);
+            let (work_ptr, _work_rec) = workspace.device_ptr_mut(stream);
+            let (info_ptr, _info_rec) = info.device_ptr_mut(stream);
+            // SAFETY: cuSOLVER potrf; a is p*p col-major T, workspace was sized
+            // by T::BUFFER_SIZE, info is a 1-element i32 device buffer.
             let status = unsafe {
-                cusolver_sys::cusolverDnSpotrf_bufferSize(
+                T::POTRF(
                     solver.cu(),
                     uplo,
                     p_i,
-                    ptr as *mut f32,
+                    a_ptr as *mut T,
                     p_i,
-                    &mut lwork,
+                    work_ptr as *mut T,
+                    lwork_i,
+                    info_ptr as *mut i32,
                 )
             };
-            check_cusolver(status, "cusolverDnSpotrf_bufferSize")?;
+            check_cusolver(status, "cusolverDn*potrf")?;
         }
-        usize::try_from(lwork).map_err(|_| "negative spotrf lwork".to_string())
+        let info_host = stream
+            .clone_dtoh(&info)
+            .map_err(|e| format!("download potrf info: {e}"))?;
+        if info_host[0] == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "cusolverDn{} returned info={}{}",
+                T::POTRF_NAME,
+                info_host[0],
+                T::POTRF_FAIL_SUFFIX
+            ))
+        }
     }
+
+    /// Triangular solve using a pre-factored Cholesky lower-triangle at
+    /// precision `T`. Solves `A · x = rhs` in-place into `rhs` (column-major,
+    /// p × nrhs), allocating and downloading its own info scalar.
+    fn potrs_in_place_generic<T: CholScalar>(
+        solver: &DnHandle,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        p: usize,
+        nrhs: usize,
+        factor: &CudaSlice<T>,
+        rhs: &mut CudaSlice<T>,
+    ) -> Result<(), String> {
+        let p_i = to_i32(p)?;
+        let nrhs_i = to_i32(nrhs)?;
+        let uplo = cusolver_sys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER;
+        let mut info = stream
+            .alloc_zeros::<i32>(1)
+            .map_err(|e| format!("cuda alloc potrs info: {e}"))?;
+        {
+            let (f_ptr, _f_rec) = factor.device_ptr(stream);
+            let (r_ptr, _r_rec) = rhs.device_ptr_mut(stream);
+            let (info_ptr, _info_rec) = info.device_ptr_mut(stream);
+            // SAFETY: cuSOLVER potrs; factor is a p*p lower-triangular T from
+            // potrf, rhs is p*nrhs col-major T, info is a 1-element i32 device
+            // buffer; leading dims match column-major p_i.
+            let status = unsafe {
+                T::POTRS(
+                    solver.cu(),
+                    uplo,
+                    p_i,
+                    nrhs_i,
+                    f_ptr as *const T,
+                    p_i,
+                    r_ptr as *mut T,
+                    p_i,
+                    info_ptr as *mut i32,
+                )
+            };
+            check_cusolver(status, "cusolverDn*potrs")?;
+        }
+        let info_host = stream
+            .clone_dtoh(&info)
+            .map_err(|e| format!("download potrs info: {e}"))?;
+        if info_host[0] == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "cusolverDn{} returned info={}",
+                T::POTRS_NAME,
+                info_host[0]
+            ))
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // fp32 entry points (thin wrappers over the precision-generic scaffold)
+    // -----------------------------------------------------------------------
 
     /// Factor a p×p symmetric positive-definite f32 device buffer in-place
     /// (lower-triangular Cholesky). Returns `Err` if the matrix is
@@ -140,46 +380,7 @@ mod cuda {
         p: usize,
         a: &mut CudaSlice<f32>,
     ) -> Result<(), String> {
-        let p_i = to_i32(p)?;
-        let lwork = spotrf_lwork(solver, stream, p)?;
-        let mut workspace = stream
-            .alloc_zeros::<f32>(lwork.max(1))
-            .map_err(|e| format!("alloc spotrf workspace: {e}"))?;
-        let mut info = stream
-            .alloc_zeros::<i32>(1)
-            .map_err(|e| format!("alloc spotrf info: {e}"))?;
-        let uplo = cusolver_sys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER;
-        {
-            let (a_ptr, _a_rec) = a.device_ptr_mut(stream);
-            let (work_ptr, _work_rec) = workspace.device_ptr_mut(stream);
-            let (info_ptr, _info_rec) = info.device_ptr_mut(stream);
-            // SAFETY: cuSOLVER Spotrf; a is p*p col-major f32, workspace was
-            // sized by Spotrf_bufferSize, info is a 1-element i32 device buffer.
-            let status = unsafe {
-                cusolver_sys::cusolverDnSpotrf(
-                    solver.cu(),
-                    uplo,
-                    p_i,
-                    a_ptr as *mut f32,
-                    p_i,
-                    work_ptr as *mut f32,
-                    i32::try_from(lwork.max(1)).map_err(|_| "lwork i32 overflow")?,
-                    info_ptr as *mut i32,
-                )
-            };
-            check_cusolver(status, "cusolverDnSpotrf")?;
-        }
-        let info_host = stream
-            .clone_dtoh(&info)
-            .map_err(|e| format!("download spotrf info: {e}"))?;
-        if info_host[0] == 0 {
-            Ok(())
-        } else {
-            Err(format!(
-                "cusolverDnSpotrf returned info={} (matrix not SPD at f32)",
-                info_host[0]
-            ))
-        }
+        potrf_in_place_generic::<f32>(solver, stream, p, a)
     }
 
     /// Triangular solve using a pre-factored fp32 Cholesky lower-triangle.
@@ -192,41 +393,7 @@ mod cuda {
         factor: &CudaSlice<f32>,
         rhs: &mut CudaSlice<f32>,
     ) -> Result<(), String> {
-        let p_i = to_i32(p)?;
-        let nrhs_i = to_i32(nrhs)?;
-        let uplo = cusolver_sys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER;
-        let mut info = stream
-            .alloc_zeros::<i32>(1)
-            .map_err(|e| format!("alloc spotrs info: {e}"))?;
-        {
-            let (f_ptr, _f_rec) = factor.device_ptr(stream);
-            let (r_ptr, _r_rec) = rhs.device_ptr_mut(stream);
-            let (info_ptr, _info_rec) = info.device_ptr_mut(stream);
-            // SAFETY: cuSOLVER Spotrs; factor is p*p lower-triangular f32 from
-            // Spotrf, rhs is p*nrhs col-major f32, info is 1-element i32 device.
-            let status = unsafe {
-                cusolver_sys::cusolverDnSpotrs(
-                    solver.cu(),
-                    uplo,
-                    p_i,
-                    nrhs_i,
-                    f_ptr as *const f32,
-                    p_i,
-                    r_ptr as *mut f32,
-                    p_i,
-                    info_ptr as *mut i32,
-                )
-            };
-            check_cusolver(status, "cusolverDnSpotrs")?;
-        }
-        let info_host = stream
-            .clone_dtoh(&info)
-            .map_err(|e| format!("download spotrs info: {e}"))?;
-        if info_host[0] == 0 {
-            Ok(())
-        } else {
-            Err(format!("cusolverDnSpotrs returned info={}", info_host[0]))
-        }
+        potrs_in_place_generic::<f32>(solver, stream, p, nrhs, factor, rhs)
     }
 
     // -----------------------------------------------------------------------
@@ -465,60 +632,7 @@ mod cuda {
         p: usize,
         h: &mut CudaSlice<f64>,
     ) -> Result<(), String> {
-        let p_i = to_i32(p)?;
-        let uplo = cusolver_sys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER;
-        let mut lwork = 0_i32;
-        {
-            let (h_ptr, _h_record) = h.device_ptr_mut(stream);
-            // SAFETY: cuSOLVER buffer-size query; h_ptr is a live p*p device buffer, lwork is a
-            // valid mutable host i32, solver handle is initialized.
-            let status = unsafe {
-                cusolver_sys::cusolverDnDpotrf_bufferSize(
-                    solver.cu(),
-                    uplo,
-                    p_i,
-                    h_ptr as *mut f64,
-                    p_i,
-                    &mut lwork,
-                )
-            };
-            check_cusolver(status, "cusolverDnDpotrf_bufferSize")?;
-        }
-        let mut workspace = stream
-            .alloc_zeros::<f64>(usize::try_from(lwork).map_err(|_| "negative potrf workspace")?)
-            .map_err(|e| format!("cuda alloc potrf workspace: {e}"))?;
-        let mut info = stream
-            .alloc_zeros::<i32>(1)
-            .map_err(|e| format!("cuda alloc potrf info: {e}"))?;
-        {
-            let (h_ptr, _h_record) = h.device_ptr_mut(stream);
-            let (work_ptr, _work_record) = workspace.device_ptr_mut(stream);
-            let (info_ptr, _info_record) = info.device_ptr_mut(stream);
-            // SAFETY: cuSOLVER potrf factorization; h is p*p, workspace was allocated with the
-            // lwork size reported by the buffer-size query above, info is a 1-element device i32
-            // buffer.
-            let status = unsafe {
-                cusolver_sys::cusolverDnDpotrf(
-                    solver.cu(),
-                    uplo,
-                    p_i,
-                    h_ptr as *mut f64,
-                    p_i,
-                    work_ptr as *mut f64,
-                    lwork,
-                    info_ptr as *mut i32,
-                )
-            };
-            check_cusolver(status, "cusolverDnDpotrf")?;
-        }
-        let info_host = stream
-            .clone_dtoh(&info)
-            .map_err(|e| format!("download potrf info: {e}"))?;
-        if info_host[0] == 0 {
-            Ok(())
-        } else {
-            Err(format!("cusolverDnDpotrf returned info={}", info_host[0]))
-        }
+        potrf_in_place_generic::<f64>(solver, stream, p, h)
     }
 
     pub(crate) fn potrs_in_place(
@@ -529,41 +643,7 @@ mod cuda {
         h: &CudaSlice<f64>,
         rhs: &mut CudaSlice<f64>,
     ) -> Result<(), String> {
-        let p_i = to_i32(p)?;
-        let nrhs_i = to_i32(nrhs)?;
-        let uplo = cusolver_sys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER;
-        let mut info = stream
-            .alloc_zeros::<i32>(1)
-            .map_err(|e| format!("cuda alloc potrs info: {e}"))?;
-        {
-            let (h_ptr, _h_record) = h.device_ptr(stream);
-            let (rhs_ptr, _rhs_record) = rhs.device_ptr_mut(stream);
-            let (info_ptr, _info_record) = info.device_ptr_mut(stream);
-            // SAFETY: cuSOLVER potrs solve; h is a p*p Cholesky factor from potrf above, rhs is
-            // p*nrhs, info is a 1-element device i32 buffer, leading dims match column-major p_i.
-            let status = unsafe {
-                cusolver_sys::cusolverDnDpotrs(
-                    solver.cu(),
-                    uplo,
-                    p_i,
-                    nrhs_i,
-                    h_ptr as *const f64,
-                    p_i,
-                    rhs_ptr as *mut f64,
-                    p_i,
-                    info_ptr as *mut i32,
-                )
-            };
-            check_cusolver(status, "cusolverDnDpotrs")?;
-        }
-        let info_host = stream
-            .clone_dtoh(&info)
-            .map_err(|e| format!("download potrs info: {e}"))?;
-        if info_host[0] == 0 {
-            Ok(())
-        } else {
-            Err(format!("cusolverDnDpotrs returned info={}", info_host[0]))
-        }
+        potrs_in_place_generic::<f64>(solver, stream, p, nrhs, h, rhs)
     }
 
     /// Query the cuSOLVER POTRF workspace size for a p×p matrix.
@@ -575,30 +655,7 @@ mod cuda {
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
         p: usize,
     ) -> Result<usize, String> {
-        let p_i = to_i32(p)?;
-        let uplo = cusolver_sys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER;
-        let mut lwork = 0_i32;
-        // We need a dummy p*p device buffer for the buffer-size query. Allocate
-        // a temporary one since we only call this once at construction time.
-        let mut dummy = stream
-            .alloc_zeros::<f64>(p.checked_mul(p).ok_or("p² overflow in lwork query")?)
-            .map_err(|e| format!("cuda alloc dummy for lwork query: {e}"))?;
-        {
-            let (h_ptr, _h_record) = dummy.device_ptr_mut(stream);
-            // SAFETY: buffer-size query with a valid p*p dummy buffer; lwork is a host i32.
-            let status = unsafe {
-                cusolver_sys::cusolverDnDpotrf_bufferSize(
-                    solver.cu(),
-                    uplo,
-                    p_i,
-                    h_ptr as *mut f64,
-                    p_i,
-                    &mut lwork,
-                )
-            };
-            check_cusolver(status, "cusolverDnDpotrf_bufferSize (lwork query)")?;
-        }
-        usize::try_from(lwork).map_err(|_| "negative potrf lwork".to_string())
+        potrf_bufsize_generic::<f64>(solver, stream, p)
     }
 
     /// POTRF factorization using pre-allocated workspace and info buffers.

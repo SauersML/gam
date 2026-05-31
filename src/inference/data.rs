@@ -591,6 +591,17 @@ fn infer_delimited_column(
     let mut level_index = HashMap::<String, usize>::new();
     let mut levels = Vec::<String>::new();
 
+    // Shared constructor for the "non-finite parsed value" rejection, which is
+    // raised identically from the sample-window, post-window, and final recode
+    // passes below. `col`/`header` are in scope for the whole function.
+    let non_finite_err = |row_idx: usize| DelimitedInferenceError {
+        row: row_idx + 1,
+        col,
+        error: DataError::InvalidValue {
+            reason: format!("non-finite value at row {}, column '{}'", row_idx + 1, header),
+        },
+    };
+
     for row_idx in 0..total_rows {
         let raw = raw_fields[row_idx * n_cols + col].as_str();
         if raw.is_empty() {
@@ -607,17 +618,7 @@ fn infer_delimited_column(
         if row_idx < sample_count {
             if let Ok(v) = raw.parse::<f64>() {
                 if !v.is_finite() {
-                    return Err(DelimitedInferenceError {
-                        row: row_idx + 1,
-                        col,
-                        error: DataError::InvalidValue {
-                            reason: format!(
-                                "non-finite value at row {}, column '{}'",
-                                row_idx + 1,
-                                header
-                            ),
-                        },
-                    });
+                    return Err(non_finite_err(row_idx));
                 }
                 if (v - 0.0).abs() >= 1e-12 && (v - 1.0).abs() >= 1e-12 {
                     all_binary = false;
@@ -641,17 +642,7 @@ fn infer_delimited_column(
             // correctness (a column that looks binary in the first 1024 rows
             // may contain 2.5 on row 1025).
             if !v.is_finite() {
-                return Err(DelimitedInferenceError {
-                    row: row_idx + 1,
-                    col,
-                    error: DataError::InvalidValue {
-                        reason: format!(
-                            "non-finite value at row {}, column '{}'",
-                            row_idx + 1,
-                            header
-                        ),
-                    },
-                });
+                return Err(non_finite_err(row_idx));
             }
             if (v - 0.0).abs() >= 1e-12 && (v - 1.0).abs() >= 1e-12 {
                 all_binary = false;
@@ -707,17 +698,7 @@ fn infer_delimited_column(
 
     for (row_idx, &v) in values.iter().enumerate() {
         if !v.is_finite() {
-            return Err(DelimitedInferenceError {
-                row: row_idx + 1,
-                col,
-                error: DataError::InvalidValue {
-                    reason: format!(
-                        "non-finite value at row {}, column '{}'",
-                        row_idx + 1,
-                        header
-                    ),
-                },
-            });
+            return Err(non_finite_err(row_idx));
         }
     }
 

@@ -1,8 +1,9 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::geometry::manifold::{
-    GEOMETRY_EPS, GeometryError, GeometryResult, RiemannianManifold, check_len, dot, flatten,
-    from_flat, identity, inverse, jacobi_symmetric, qr_thin, zero_christoffel,
+    GEOMETRY_EPS, GeometryError, GeometryResult, RiemannianManifold, check_len, flatten, from_flat,
+    identity, inverse, jacobi_symmetric, projected_standard_basis_tangent, qr_thin,
+    zero_christoffel,
 };
 use crate::geometry::sphere::SphereManifold;
 
@@ -83,33 +84,7 @@ impl RiemannianManifold for GrassmannManifold {
 
     fn tangent_basis(&self, point: ArrayView1<'_, f64>) -> GeometryResult<Array2<f64>> {
         from_flat(point, self.n, self.k).map(|_| ())?;
-        let mut columns: Vec<Array1<f64>> = Vec::with_capacity(self.dim());
-        for col in 0..self.k {
-            for row in 0..self.n {
-                let mut e = Array2::<f64>::zeros((self.n, self.k));
-                e[[row, col]] = 1.0;
-                let p = self.project_tangent(point, flatten(&e).view())?;
-                let mut v = p;
-                for q in &columns {
-                    let proj = dot(q.view(), v.view());
-                    v -= &(q * proj);
-                }
-                let nrm = dot(v.view(), v.view()).sqrt();
-                if nrm > 1.0e-10 {
-                    columns.push(v / nrm);
-                }
-                if columns.len() == self.dim() {
-                    let mut out = Array2::<f64>::zeros((self.ambient_dim(), self.dim()));
-                    for j in 0..columns.len() {
-                        for i in 0..self.ambient_dim() {
-                            out[[i, j]] = columns[j][i];
-                        }
-                    }
-                    return Ok(out);
-                }
-            }
-        }
-        Ok(Array2::<f64>::zeros((self.ambient_dim(), columns.len())))
+        projected_standard_basis_tangent(self, point, self.n, self.k)
     }
 
     fn exp_map(

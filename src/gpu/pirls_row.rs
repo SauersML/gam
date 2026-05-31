@@ -766,32 +766,41 @@ impl PirlsRowBackend {
         })
     }
 
-    /// Compile (or fetch from cache) the **final-row** kernel module for
-    /// `(family, curvature)`. Writes all 9 output fields.
+    /// Compile (or fetch from cache) the kernel module for `(family, curvature)`
+    /// in the given [`KernelMode`]. This is the single source of truth behind
+    /// [`module_for`], [`module_for_solve`], and [`module_for_ladder`]; the only
+    /// per-mode variation is which CUDA source generator is used (selected by
+    /// `mode`) and the error label `label` woven into compile/load diagnostics.
     #[cfg(target_os = "linux")]
-    pub fn module_for(
+    fn module_for_kind(
         &self,
         family: PirlsRowFamily,
         curvature: CurvatureMode,
+        mode: KernelMode,
+        label: &str,
     ) -> Result<Arc<CudaModule>, GpuError> {
         let key = ModuleKey {
             family,
             curvature,
-            mode: KernelMode::FinalRow,
+            mode,
         };
         if let Some(existing) = self
             .inner
             .modules
             .lock()
-            .gpu_ctx("pirls_row module cache mutex poisoned")?
+            .gpu_ctx_with(|err| format!("pirls_row {label}module cache mutex poisoned: {err}"))?
             .get(&key)
         {
             return Ok(existing.clone());
         }
-        let source = cuda_source_for(family, curvature);
+        let source = match mode {
+            KernelMode::FinalRow => cuda_source_for(family, curvature),
+            KernelMode::SolveRow => solve_row_source_for(family, curvature),
+            KernelMode::AlphaLadder => ladder_source_for(family, curvature),
+        };
         let ptx = cudarc::nvrtc::compile_ptx(source).gpu_ctx_with(|err| {
             format!(
-                "pirls_row NVRTC compile failed for {family}/{curv}: {err}",
+                "pirls_row {label}NVRTC compile failed for {family}/{curv}: {err}",
                 family = family.as_str(),
                 curv = curvature.as_str(),
             )
@@ -800,13 +809,24 @@ impl PirlsRowBackend {
             .inner
             .ctx
             .load_module(ptx)
-            .gpu_ctx("pirls_row module load failed")?;
+            .gpu_ctx_with(|err| format!("pirls_row {label}module load failed: {err}"))?;
         self.inner
             .modules
             .lock()
-            .gpu_ctx("pirls_row module cache mutex poisoned")?
+            .gpu_ctx_with(|err| format!("pirls_row {label}module cache mutex poisoned: {err}"))?
             .insert(key, module.clone());
         Ok(module)
+    }
+
+    /// Compile (or fetch from cache) the **final-row** kernel module for
+    /// `(family, curvature)`. Writes all 9 output fields.
+    #[cfg(target_os = "linux")]
+    pub fn module_for(
+        &self,
+        family: PirlsRowFamily,
+        curvature: CurvatureMode,
+    ) -> Result<Arc<CudaModule>, GpuError> {
+        self.module_for_kind(family, curvature, KernelMode::FinalRow, "")
     }
 
     /// Compile (or fetch from cache) the **solve-row** kernel module for
@@ -818,39 +838,7 @@ impl PirlsRowBackend {
         family: PirlsRowFamily,
         curvature: CurvatureMode,
     ) -> Result<Arc<CudaModule>, GpuError> {
-        let key = ModuleKey {
-            family,
-            curvature,
-            mode: KernelMode::SolveRow,
-        };
-        if let Some(existing) = self
-            .inner
-            .modules
-            .lock()
-            .gpu_ctx("pirls_row solve module cache mutex poisoned")?
-            .get(&key)
-        {
-            return Ok(existing.clone());
-        }
-        let source = solve_row_source_for(family, curvature);
-        let ptx = cudarc::nvrtc::compile_ptx(source).gpu_ctx_with(|err| {
-            format!(
-                "pirls_row solve NVRTC compile failed for {family}/{curv}: {err}",
-                family = family.as_str(),
-                curv = curvature.as_str(),
-            )
-        })?;
-        let module = self
-            .inner
-            .ctx
-            .load_module(ptx)
-            .gpu_ctx("pirls_row solve module load failed")?;
-        self.inner
-            .modules
-            .lock()
-            .gpu_ctx("pirls_row solve module cache mutex poisoned")?
-            .insert(key, module.clone());
-        Ok(module)
+        self.module_for_kind(family, curvature, KernelMode::SolveRow, "solve ")
     }
 
     /// Compile (or fetch from cache) the **alpha-ladder** kernel module for
@@ -862,39 +850,7 @@ impl PirlsRowBackend {
         family: PirlsRowFamily,
         curvature: CurvatureMode,
     ) -> Result<Arc<CudaModule>, GpuError> {
-        let key = ModuleKey {
-            family,
-            curvature,
-            mode: KernelMode::AlphaLadder,
-        };
-        if let Some(existing) = self
-            .inner
-            .modules
-            .lock()
-            .gpu_ctx("pirls_row ladder module cache mutex poisoned")?
-            .get(&key)
-        {
-            return Ok(existing.clone());
-        }
-        let source = ladder_source_for(family, curvature);
-        let ptx = cudarc::nvrtc::compile_ptx(source).gpu_ctx_with(|err| {
-            format!(
-                "pirls_row ladder NVRTC compile failed for {family}/{curv}: {err}",
-                family = family.as_str(),
-                curv = curvature.as_str(),
-            )
-        })?;
-        let module = self
-            .inner
-            .ctx
-            .load_module(ptx)
-            .gpu_ctx("pirls_row ladder module load failed")?;
-        self.inner
-            .modules
-            .lock()
-            .gpu_ctx("pirls_row ladder module cache mutex poisoned")?
-            .insert(key, module.clone());
-        Ok(module)
+        self.module_for_kind(family, curvature, KernelMode::AlphaLadder, "ladder ")
     }
 
     /// Stage 6: JIT-compile and cache a custom-family row module.

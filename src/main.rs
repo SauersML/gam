@@ -2748,10 +2748,15 @@ fn run_predict_model(
     run_predict_unified(progress, args, model, &pred_input, &*predictor)
 }
 
-fn run_predict(args: PredictArgs) -> Result<(), String> {
-    if !(0.0 < args.level && args.level < 1.0) {
-        return Err(format!("--level must be in (0,1), got {}", args.level));
+fn validate_level(level: f64) -> Result<(), String> {
+    if !(level.is_finite() && level > 0.0 && level < 1.0) {
+        return Err(format!("--level must be in (0,1), got {level}"));
     }
+    Ok(())
+}
+
+fn run_predict(args: PredictArgs) -> Result<(), String> {
+    validate_level(args.level)?;
     let mut progress = gam::visualizer::VisualizerSession::new(true);
     progress.start_workflow("Predict", 5);
     let phase_start = std::time::Instant::now();
@@ -3181,9 +3186,7 @@ fn run_predict_saved_latent_window_impl(
         }
         mean = posterior_mean;
         if args.uncertainty {
-            if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
-                return Err(format!("--level must be in (0,1), got {}", args.level));
-            }
+            validate_level(args.level)?;
             let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
             let (lo, hi) = response_interval_from_mean_sd(
                 mean.view(),
@@ -3199,9 +3202,7 @@ fn run_predict_saved_latent_window_impl(
             mean_hi = Some(hi);
         }
     } else if args.uncertainty {
-        if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
-            return Err(format!("--level must be in (0,1), got {}", args.level));
-        }
+        validate_level(args.level)?;
         let local_cov = local_covariances.as_ref().ok_or_else(|| {
             "internal error: latent window uncertainty requires local covariance".to_string()
         })?;
@@ -3572,9 +3573,7 @@ fn run_predict_survival(
             .as_ref()
             .map(|out| out.eta_standard_error.clone());
         if include_survival_location_scale_intervals {
-            if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
-                return Err(format!("--level must be in (0,1), got {}", args.level));
-            }
+            validate_level(args.level)?;
             let out = posterior_or_uncertainty.as_ref().ok_or_else(|| {
                 "internal error: survival location-scale uncertainty output missing".to_string()
             })?;
@@ -3680,9 +3679,7 @@ fn run_predict_survival(
                     .map(|(&mu, &se)| normal_cdf(-mu / (1.0 + se * se).sqrt())),
             );
             if args.uncertainty {
-                if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
-                    return Err(format!("--level must be in (0,1), got {}", args.level));
-                }
+                validate_level(args.level)?;
                 let z_alpha = standard_normal_quantile(0.5 + args.level * 0.5)?;
                 let eta_lo = &eta - &(eta_se.mapv(|value| z_alpha * value));
                 let eta_hi = &eta + &(eta_se.mapv(|value| z_alpha * value));
@@ -3693,9 +3690,7 @@ fn run_predict_survival(
                 (eta, mean, None, None, None)
             }
         } else if args.uncertainty {
-            if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
-                return Err(format!("--level must be in (0,1), got {}", args.level));
-            }
+            validate_level(args.level)?;
             let pred = predictor
                 .predict_full_uncertainty(
                     &pred_input,
@@ -3834,9 +3829,7 @@ fn run_predict_survival(
     let mut mean_lo = None;
     let mut mean_hi = None;
     if args.uncertainty {
-        if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
-            return Err(format!("--level must be in (0,1), got {}", args.level));
-        }
+        validate_level(args.level)?;
         let uncertainty = predict_gamwith_uncertainty(
             x_exit.view(),
             beta.view(),
@@ -8390,17 +8383,12 @@ fn resolve_binomial_inverse_link_for_fit(
 /// fallback runs; reaching it with one of those wide variants is a contract
 /// violation by the caller.
 fn effective_link_to_standard(link: LinkFunction, context: &str) -> Result<StandardLink, String> {
-    match link {
-        LinkFunction::Logit => Ok(StandardLink::Logit),
-        LinkFunction::Probit => Ok(StandardLink::Probit),
-        LinkFunction::CLogLog => Ok(StandardLink::CLogLog),
-        LinkFunction::Identity => Ok(StandardLink::Identity),
-        LinkFunction::Log => Ok(StandardLink::Log),
-        LinkFunction::Sas | LinkFunction::BetaLogistic => Err(format!(
+    StandardLink::try_from(link).map_err(|_| {
+        format!(
             "{context}: state-bearing link `{}` must be routed through `InverseLink::Sas` / `InverseLink::BetaLogistic`, not `Standard(_)`",
             link.name()
-        )),
-    }
+        )
+    })
 }
 
 fn binomial_mean_linkwiggle_supports_family(
@@ -8812,7 +8800,7 @@ fn build_model_summary(
                 wood_smooth_test(SmoothTestInput {
                     beta: fit.beta.view(),
                     covariance: cov,
-                    influence_matrix: fit.influence_matrix(),
+                    influence_matrix: fit.coefficient_influence(),
                     coeff_range: term.coeff_range.clone(),
                     edf,
                     nullspace_dim: term.nullspace_dims.iter().copied().sum::<usize>(),

@@ -5954,11 +5954,6 @@ pub trait LinearOperator {
             .solvevectorwithridge_retries(&system, rhs, baseridge)
             .ok_or_else(|| "solve_systemwith_policy failed after ridge retries".to_string())
     }
-
-    // Backward-compatible alias for `apply` (matvec is the canonical BLAS name).
-    fn matvec(&self, vector: &Array1<f64>) -> Array1<f64> {
-        self.apply(vector)
-    }
 }
 
 impl LinearOperator for DesignMatrix {

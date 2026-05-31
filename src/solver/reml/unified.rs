@@ -17036,6 +17036,116 @@ fn modified_gram_schmidt(y: &Array2<f64>, q: &mut Array2<f64>) -> usize {
     rank
 }
 
+/// Shared Hutch++ stochastic-trace scaffold (Meyer–Musco 2021, SOSA).
+///
+/// Estimates `tr(B)` for a linear map `B: x ↦ apply(hop, x, &mut tmp)`,
+/// where `apply` is the per-probe action of `B` on a vector (using `tmp`
+/// as scratch and returning a fresh `Array1<f64>`). The three public
+/// estimators below differ *only* in this closure:
+///
+/// * `tr(H⁻¹ M)`        — `apply` = `M`-apply then one solve;
+/// * `tr((H⁻¹ A)²)`     — `apply` = apply/solve/apply/solve;
+/// * `tr(H⁻¹ A_L H⁻¹ A_R)` — `apply` = `A_R`/solve/`A_L`/solve.
+///
+/// Everything else (sketch dim, RNG seeding, randomized range finder +
+/// modified Gram–Schmidt, exact low-rank trace `tr(Qᵀ B Q)`, residual
+/// Hutchinson on `(I - Q Qᵀ) B (I - Q Qᵀ)` with the Welford-style
+/// adaptive relative-error stop) is identical, so it lives here once.
+/// `B` need not be self-adjoint: on Rademacher probes `E[zᵀ B z] = tr(B)`
+/// regardless, and the projected `tr(Qᵀ B Q)` is exact on `range(Q)`.
+fn hutchpp_estimate_trace_with_apply<F>(p: usize, config: &StochasticTraceConfig, apply: F) -> f64
+where
+    F: Fn(ArrayView1<'_, f64>, &mut Array1<f64>) -> Array1<f64>,
+{
+    if p == 0 {
+        return 0.0;
+    }
+    let sketch_dim = config.hutchpp_sketch_dim.unwrap_or(0).min(p);
+    let mut rng_state = Xoshiro256SS::from_seed(config.seed);
+
+    // Phase 1: build orthonormal Q ∈ R^{p × sketch_dim} approximating
+    // range(B) via a randomized range finder.
+    let mut q = Array2::<f64>::zeros((p, sketch_dim));
+    let mut q_rank = 0usize;
+    if sketch_dim > 0 {
+        let mut y = Array2::<f64>::zeros((p, sketch_dim));
+        let mut z = Array1::<f64>::zeros(p);
+        let mut tmp = Array1::<f64>::zeros(p);
+        for j in 0..sketch_dim {
+            rademacher_probe_into(z.view_mut(), &mut rng_state);
+            let w = apply(z.view(), &mut tmp);
+            y.column_mut(j).assign(&w);
+        }
+        q_rank = modified_gram_schmidt(&y, &mut q);
+    }
+
+    // Phase 2: T_low = tr(Qᵀ B Q), exact on range(Q).
+    let mut t_low = 0.0;
+    if q_rank > 0 {
+        let mut tmp = Array1::<f64>::zeros(p);
+        for j in 0..q_rank {
+            let qcol = q.column(j).to_owned();
+            let w = apply(qcol.view(), &mut tmp);
+            t_low += qcol.dot(&w);
+        }
+    }
+
+    // Phase 3: residual Hutchinson on (I - Q Qᵀ) B (I - Q Qᵀ).
+    // Budget = remaining matvecs from n_probes_max minus the 2*q_rank
+    // we already spent (sketch + Q-trace), but never below n_probes_min.
+    let used = 2 * q_rank;
+    let residual_budget_max = config.n_probes_max.saturating_sub(used);
+    let residual_min = config.n_probes_min.min(residual_budget_max);
+    let residual_budget = residual_budget_max.max(residual_min);
+    if residual_budget == 0 {
+        return t_low;
+    }
+
+    let mut sum = 0.0;
+    let mut sum_sq = 0.0;
+    let mut count = 0usize;
+    let mut z = Array1::<f64>::zeros(p);
+    let mut z_tilde = Array1::<f64>::zeros(p);
+    let mut tmp = Array1::<f64>::zeros(p);
+    let check_interval = 4usize;
+    for _ in 0..residual_budget {
+        rademacher_probe_into(z.view_mut(), &mut rng_state);
+        // z_tilde = (I - Q Qᵀ) z = z - Q (Qᵀ z)
+        z_tilde.assign(&z);
+        if q_rank > 0 {
+            for j in 0..q_rank {
+                let qcol = q.column(j);
+                let proj = qcol.dot(&z);
+                if proj != 0.0 {
+                    z_tilde.scaled_add(-proj, &qcol);
+                }
+            }
+        }
+        let w = apply(z_tilde.view(), &mut tmp);
+        let q_val = z_tilde.dot(&w);
+        sum += q_val;
+        sum_sq += q_val * q_val;
+        count += 1;
+
+        // Adaptive stopping: same Welford-style relative-error check
+        // as `estimate_from_probe_batch`, applied to the residual mean.
+        if count >= residual_min && count.is_multiple_of(check_interval) && count >= 2 {
+            let n = count as f64;
+            let mean = sum / n;
+            let var = (sum_sq - n * mean * mean) / (n - 1.0).max(1.0);
+            if var.is_finite() && var >= 0.0 {
+                let stderr = (var / n).sqrt();
+                let denom = (mean.abs()).max(config.tau_rel);
+                if stderr / denom <= config.relative_tol {
+                    break;
+                }
+            }
+        }
+    }
+    let mean_residual = if count > 0 { sum / count as f64 } else { 0.0 };
+    t_low + mean_residual
+}
+
 /// Hutch++ estimate of `tr(H⁻¹ M)` where `M` is accessed through its
 /// matrix-vector product (operator-only, dim p).
 ///
@@ -17080,97 +17190,11 @@ where
 {
     let p = hop.dim();
     assert_eq!(op.dim(), p, "Hutch++: operator dim mismatch");
-    if p == 0 {
-        return 0.0;
-    }
-    let sketch_dim = config.hutchpp_sketch_dim.unwrap_or(0).min(p);
-    let mut rng_state = Xoshiro256SS::from_seed(config.seed);
-
-    // Phase 1: build orthonormal Q ∈ R^{p × sketch_dim} approximating
-    // range(H⁻¹ M) via a randomized range finder.
-    let mut q = Array2::<f64>::zeros((p, sketch_dim));
-    let mut q_rank = 0usize;
-    if sketch_dim > 0 {
-        let mut y = Array2::<f64>::zeros((p, sketch_dim));
-        let mut z = Array1::<f64>::zeros(p);
-        let mut mz = Array1::<f64>::zeros(p);
-        for j in 0..sketch_dim {
-            rademacher_probe_into(z.view_mut(), &mut rng_state);
-            op.mul_vec_into(z.view(), mz.view_mut());
-            let w = hop.stochastic_trace_solve(&mz, config.solve_rel_tol);
-            y.column_mut(j).assign(&w);
-        }
-        q_rank = modified_gram_schmidt(&y, &mut q);
-    }
-
-    // Phase 2: T_low = tr(Qᵀ H⁻¹ M Q). Apply H⁻¹ M to each retained
-    // column of Q and accumulate Q[:,j] · W[:,j].
-    let mut t_low = 0.0;
-    if q_rank > 0 {
-        let mut mq = Array1::<f64>::zeros(p);
-        for j in 0..q_rank {
-            let qcol = q.column(j).to_owned();
-            op.mul_vec_into(qcol.view(), mq.view_mut());
-            let w = hop.stochastic_trace_solve(&mq, config.solve_rel_tol);
-            t_low += qcol.dot(&w);
-        }
-    }
-
-    // Phase 3: residual Hutchinson on (I - Q Qᵀ) M (I - Q Qᵀ).
-    // Budget = remaining matvecs from n_probes_max minus the 2*q_rank
-    // we already spent (sketch + Q-trace), but never below n_probes_min.
-    let used = 2 * q_rank;
-    let residual_budget_max = config.n_probes_max.saturating_sub(used);
-    let residual_min = config.n_probes_min.min(residual_budget_max);
-    let residual_budget = residual_budget_max.max(residual_min);
-    if residual_budget == 0 {
-        return t_low;
-    }
-
-    let mut sum = 0.0;
-    let mut sum_sq = 0.0;
-    let mut count = 0usize;
-    let mut z = Array1::<f64>::zeros(p);
-    let mut z_tilde = Array1::<f64>::zeros(p);
-    let mut mz = Array1::<f64>::zeros(p);
-    let check_interval = 4usize;
-    for _ in 0..residual_budget {
-        rademacher_probe_into(z.view_mut(), &mut rng_state);
-        // z_tilde = (I - Q Qᵀ) z = z - Q (Qᵀ z)
-        z_tilde.assign(&z);
-        if q_rank > 0 {
-            for j in 0..q_rank {
-                let qcol = q.column(j);
-                let proj = qcol.dot(&z);
-                if proj != 0.0 {
-                    z_tilde.scaled_add(-proj, &qcol);
-                }
-            }
-        }
-        op.mul_vec_into(z_tilde.view(), mz.view_mut());
-        let w = hop.stochastic_trace_solve(&mz, config.solve_rel_tol);
-        let q_val = z_tilde.dot(&w);
-        sum += q_val;
-        sum_sq += q_val * q_val;
-        count += 1;
-
-        // Adaptive stopping: same Welford-style relative-error check
-        // as `estimate_from_probe_batch`, applied to the residual mean.
-        if count >= residual_min && count.is_multiple_of(check_interval) && count >= 2 {
-            let n = count as f64;
-            let mean = sum / n;
-            let var = (sum_sq - n * mean * mean) / (n - 1.0).max(1.0);
-            if var.is_finite() && var >= 0.0 {
-                let stderr = (var / n).sqrt();
-                let denom = (mean.abs()).max(config.tau_rel);
-                if stderr / denom <= config.relative_tol {
-                    break;
-                }
-            }
-        }
-    }
-    let mean_residual = if count > 0 { sum / count as f64 } else { 0.0 };
-    t_low + mean_residual
+    // B x = H⁻¹ M x: apply M then a single solve.
+    hutchpp_estimate_trace_with_apply(p, config, |x, tmp| {
+        op.mul_vec_into(x, tmp.view_mut());
+        hop.stochastic_trace_solve(tmp, config.solve_rel_tol)
+    })
 }
 
 /// Hutch++ estimate of `tr((H⁻¹ A)²) = tr(H⁻¹ A H⁻¹ A)` for a symmetric
@@ -17192,93 +17216,13 @@ where
 {
     let p = hop.dim();
     assert_eq!(op.dim(), p, "Hutch++ squared: operator dim mismatch");
-    if p == 0 {
-        return 0.0;
-    }
-    let sketch_dim = config.hutchpp_sketch_dim.unwrap_or(0).min(p);
-    let mut rng_state = Xoshiro256SS::from_seed(config.seed);
-
-    // Apply B² = H⁻¹ A H⁻¹ A in place via two solve+apply legs.
-    let apply_b_squared =
-        |hop: &H, input: ArrayView1<'_, f64>, tmp: &mut Array1<f64>| -> Array1<f64> {
-            op.mul_vec_into(input, tmp.view_mut());
-            let mid = hop.stochastic_trace_solve(tmp, config.solve_rel_tol);
-            op.mul_vec_into(mid.view(), tmp.view_mut());
-            hop.stochastic_trace_solve(tmp, config.solve_rel_tol)
-        };
-
-    let mut q = Array2::<f64>::zeros((p, sketch_dim));
-    let mut q_rank = 0usize;
-    if sketch_dim > 0 {
-        let mut y = Array2::<f64>::zeros((p, sketch_dim));
-        let mut z = Array1::<f64>::zeros(p);
-        let mut tmp = Array1::<f64>::zeros(p);
-        for j in 0..sketch_dim {
-            rademacher_probe_into(z.view_mut(), &mut rng_state);
-            let w = apply_b_squared(hop, z.view(), &mut tmp);
-            y.column_mut(j).assign(&w);
-        }
-        q_rank = modified_gram_schmidt(&y, &mut q);
-    }
-
-    let mut t_low = 0.0;
-    if q_rank > 0 {
-        let mut tmp = Array1::<f64>::zeros(p);
-        for j in 0..q_rank {
-            let qcol = q.column(j).to_owned();
-            let w = apply_b_squared(hop, qcol.view(), &mut tmp);
-            t_low += qcol.dot(&w);
-        }
-    }
-
-    let used = 2 * q_rank;
-    let residual_budget_max = config.n_probes_max.saturating_sub(used);
-    let residual_min = config.n_probes_min.min(residual_budget_max);
-    let residual_budget = residual_budget_max.max(residual_min);
-    if residual_budget == 0 {
-        return t_low;
-    }
-
-    let mut sum = 0.0;
-    let mut sum_sq = 0.0;
-    let mut count = 0usize;
-    let mut z = Array1::<f64>::zeros(p);
-    let mut z_tilde = Array1::<f64>::zeros(p);
-    let mut tmp = Array1::<f64>::zeros(p);
-    let check_interval = 4usize;
-    for _ in 0..residual_budget {
-        rademacher_probe_into(z.view_mut(), &mut rng_state);
-        z_tilde.assign(&z);
-        if q_rank > 0 {
-            for j in 0..q_rank {
-                let qcol = q.column(j);
-                let proj = qcol.dot(&z);
-                if proj != 0.0 {
-                    z_tilde.scaled_add(-proj, &qcol);
-                }
-            }
-        }
-        let w = apply_b_squared(hop, z_tilde.view(), &mut tmp);
-        let q_val = z_tilde.dot(&w);
-        sum += q_val;
-        sum_sq += q_val * q_val;
-        count += 1;
-
-        if count >= residual_min && count.is_multiple_of(check_interval) && count >= 2 {
-            let n = count as f64;
-            let mean = sum / n;
-            let var = (sum_sq - n * mean * mean) / (n - 1.0).max(1.0);
-            if var.is_finite() && var >= 0.0 {
-                let stderr = (var / n).sqrt();
-                let denom = (mean.abs()).max(config.tau_rel);
-                if stderr / denom <= config.relative_tol {
-                    break;
-                }
-            }
-        }
-    }
-    let mean_residual = if count > 0 { sum / count as f64 } else { 0.0 };
-    t_low + mean_residual
+    // B x = (H⁻¹ A)² x = H⁻¹ A H⁻¹ A x via two solve+apply legs.
+    hutchpp_estimate_trace_with_apply(p, config, |x, tmp| {
+        op.mul_vec_into(x, tmp.view_mut());
+        let mid = hop.stochastic_trace_solve(tmp, config.solve_rel_tol);
+        op.mul_vec_into(mid.view(), tmp.view_mut());
+        hop.stochastic_trace_solve(tmp, config.solve_rel_tol)
+    })
 }
 
 /// Hutch++-style estimate of `tr(H⁻¹ A_left H⁻¹ A_right)` for two
@@ -17307,95 +17251,13 @@ where
     let p = hop.dim();
     assert_eq!(left.dim(), p, "cross trace: left operator dim mismatch");
     assert_eq!(right.dim(), p, "cross trace: right operator dim mismatch");
-    if p == 0 {
-        return 0.0;
-    }
-    let sketch_dim = config.hutchpp_sketch_dim.unwrap_or(0).min(p);
-    let mut rng_state = Xoshiro256SS::from_seed(config.seed);
-
-    let apply_m = |hop: &H, x: ArrayView1<'_, f64>, tmp: &mut Array1<f64>| -> Array1<f64> {
-        // M x = H⁻¹ A_L H⁻¹ A_R x
+    // M x = H⁻¹ A_L H⁻¹ A_R x.
+    hutchpp_estimate_trace_with_apply(p, config, |x, tmp| {
         right.mul_vec_into(x, tmp.view_mut());
         let mid = hop.stochastic_trace_solve(tmp, config.solve_rel_tol);
         left.mul_vec_into(mid.view(), tmp.view_mut());
         hop.stochastic_trace_solve(tmp, config.solve_rel_tol)
-    };
-
-    let mut q = Array2::<f64>::zeros((p, sketch_dim));
-    let mut q_rank = 0usize;
-    if sketch_dim > 0 {
-        let mut y = Array2::<f64>::zeros((p, sketch_dim));
-        let mut z = Array1::<f64>::zeros(p);
-        let mut tmp = Array1::<f64>::zeros(p);
-        for j in 0..sketch_dim {
-            rademacher_probe_into(z.view_mut(), &mut rng_state);
-            let w = apply_m(hop, z.view(), &mut tmp);
-            y.column_mut(j).assign(&w);
-        }
-        q_rank = modified_gram_schmidt(&y, &mut q);
-    }
-
-    // T_low = tr(Qᵀ M Q): for non-symmetric M this is the projected
-    // trace of M restricted to range(Q), which is exact on that
-    // subspace.
-    let mut t_low = 0.0;
-    if q_rank > 0 {
-        let mut tmp = Array1::<f64>::zeros(p);
-        for j in 0..q_rank {
-            let qcol = q.column(j).to_owned();
-            let w = apply_m(hop, qcol.view(), &mut tmp);
-            t_low += qcol.dot(&w);
-        }
-    }
-
-    let used = 2 * q_rank;
-    let residual_budget_max = config.n_probes_max.saturating_sub(used);
-    let residual_min = config.n_probes_min.min(residual_budget_max);
-    let residual_budget = residual_budget_max.max(residual_min);
-    if residual_budget == 0 {
-        return t_low;
-    }
-
-    let mut sum = 0.0;
-    let mut sum_sq = 0.0;
-    let mut count = 0usize;
-    let mut z = Array1::<f64>::zeros(p);
-    let mut z_tilde = Array1::<f64>::zeros(p);
-    let mut tmp = Array1::<f64>::zeros(p);
-    let check_interval = 4usize;
-    for _ in 0..residual_budget {
-        rademacher_probe_into(z.view_mut(), &mut rng_state);
-        z_tilde.assign(&z);
-        if q_rank > 0 {
-            for j in 0..q_rank {
-                let qcol = q.column(j);
-                let proj = qcol.dot(&z);
-                if proj != 0.0 {
-                    z_tilde.scaled_add(-proj, &qcol);
-                }
-            }
-        }
-        let w = apply_m(hop, z_tilde.view(), &mut tmp);
-        let q_val = z_tilde.dot(&w);
-        sum += q_val;
-        sum_sq += q_val * q_val;
-        count += 1;
-
-        if count >= residual_min && count.is_multiple_of(check_interval) && count >= 2 {
-            let n = count as f64;
-            let mean = sum / n;
-            let var = (sum_sq - n * mean * mean) / (n - 1.0).max(1.0);
-            if var.is_finite() && var >= 0.0 {
-                let stderr = (var / n).sqrt();
-                let denom = (mean.abs()).max(config.tau_rel);
-                if stderr / denom <= config.relative_tol {
-                    break;
-                }
-            }
-        }
-    }
-    let mean_residual = if count > 0 { sum / count as f64 } else { 0.0 };
-    t_low + mean_residual
+    })
 }
 
 #[cfg(test)]
