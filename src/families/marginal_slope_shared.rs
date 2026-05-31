@@ -54,12 +54,27 @@ pub fn make_beta_seed_validator(
     pending: &std::cell::RefCell<Option<Array1<f64>>>,
 ) -> impl FnMut(&Array1<f64>) -> Result<(), crate::solver::estimate::EstimationError> + '_ {
     move |beta: &Array1<f64>| {
-        if beta.iter().any(|v| !v.is_finite()) {
-            crate::bail_invalid_estim!("cached inner beta contains non-finite entries");
-        }
+        bail_if_cached_beta_non_finite(beta)?;
         pending.replace(Some(beta.clone()));
         Ok(())
     }
+}
+
+/// Canonical non-finite guard on a cached inner `beta`.
+///
+/// Single source of truth for the `"cached inner beta contains non-finite
+/// entries"` check + error: the full seed closure
+/// ([`make_beta_seed_validator`]) and the bare warm-start length-then-finite
+/// guards in `custom_family` all route through this so the predicate and the
+/// error construction (`EstimationError::InvalidInput`) never drift apart.
+#[inline]
+pub fn bail_if_cached_beta_non_finite(
+    beta: &Array1<f64>,
+) -> Result<(), crate::solver::estimate::EstimationError> {
+    if beta.iter().any(|v| !v.is_finite()) {
+        crate::bail_invalid_estim!("cached inner beta contains non-finite entries");
+    }
+    Ok(())
 }
 
 #[inline]

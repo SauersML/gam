@@ -5314,6 +5314,27 @@ impl SymmetricMatrix {
 /// argument types: `xt_diag_x_signed` takes a `SignedWeightsView<'_>` (free
 /// construction), and `xt_diag_x_psd` takes a `PsdWeightsView<'_>` (one-time
 /// `try_new` scan at the call site).
+/// In-place symmetrization of a square dense matrix: replace each
+/// off-diagonal pair `(m[i,j], m[j,i])` with their average so the result is
+/// exactly symmetric (the diagonal is untouched).
+///
+/// Canonical single source of truth for the "average the transpose" cleanup
+/// that every Hessian/penalty assembly applies to kill the small asymmetry
+/// left by floating-point accumulation order. ndarray callers across the
+/// crate (custom-family Hessian/pinv assembly, the pyffi penalty intake)
+/// route here; the faer-typed equivalent lives next to the faer bridge in
+/// `terms::construction::symmetrize_faer_matrix_in_place`.
+pub fn symmetrize_in_place(matrix: &mut Array2<f64>) {
+    let p = matrix.nrows();
+    for i in 0..p {
+        for j in 0..i {
+            let v = 0.5 * (matrix[[i, j]] + matrix[[j, i]]);
+            matrix[[i, j]] = v;
+            matrix[[j, i]] = v;
+        }
+    }
+}
+
 pub fn xt_diag_x_signed(
     design: &DesignMatrix,
     diag: SignedWeightsView<'_>,

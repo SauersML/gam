@@ -5640,15 +5640,8 @@ fn identity_matrix(n: usize) -> Array2<f64> {
 }
 
 fn symmetrized_matrix(input: &Array2<f64>) -> Array2<f64> {
-    let n = input.nrows();
     let mut out = input.clone();
-    for i in 0..n {
-        for j in (i + 1)..n {
-            let avg = 0.5 * (out[[i, j]] + out[[j, i]]);
-            out[[i, j]] = avg;
-            out[[j, i]] = avg;
-        }
-    }
+    gam::matrix::symmetrize_in_place(&mut out);
     out
 }
 

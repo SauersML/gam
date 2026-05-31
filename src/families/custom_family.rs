@@ -3520,9 +3520,7 @@ fn constrained_warm_start_from_cached_beta(
             expected
         );
     }
-    if beta.iter().any(|value| !value.is_finite()) {
-        crate::bail_invalid_estim!("cached inner beta contains non-finite entries");
-    }
+    crate::families::marginal_slope_shared::bail_if_cached_beta_non_finite(beta)?;
 
     let mut offset = 0usize;
     let mut block_beta = Vec::with_capacity(specs.len());
@@ -7007,9 +7005,7 @@ impl CustomFamilyWarmStart {
                 expected
             );
         }
-        if beta.iter().any(|value| !value.is_finite()) {
-            crate::bail_invalid_estim!("cached inner beta contains non-finite entries");
-        }
+        crate::families::marginal_slope_shared::bail_if_cached_beta_non_finite(beta)?;
         let mut offset = 0usize;
         let mut block_beta = Vec::with_capacity(block_col_counts.len());
         for &width in block_col_counts {
@@ -9500,14 +9496,7 @@ fn inverse_spdwith_retry(
 }
 
 pub(crate) fn symmetrize_dense_in_place(matrix: &mut Array2<f64>) {
-    let p = matrix.nrows();
-    for i in 0..p {
-        for j in 0..i {
-            let v = 0.5 * (matrix[[i, j]] + matrix[[j, i]]);
-            matrix[[i, j]] = v;
-            matrix[[j, i]] = v;
-        }
-    }
+    crate::linalg::matrix::symmetrize_in_place(matrix);
 }
 
 fn validate_flat_direction_length(
@@ -10864,7 +10853,12 @@ const STRICT_SPD_LM_RIDGE_GROWTH: f64 = 10.0;
 /// Floor applied to IRLS working weights so downstream divisions cannot hit
 /// exact zero. Used as the default `minweight` in `CustomFamilyOptions` and
 /// mirrored in tests that override it.
-const CUSTOM_FAMILY_WEIGHT_FLOOR: f64 = 1e-12;
+///
+/// Sourced from the canonical PIRLS positive-weight floor
+/// ([`crate::solver::pirls::MIN_WEIGHT`] = `1e-12`) so every floored family
+/// shares one definition; this alias keeps the descriptive local name at the
+/// `minweight` defaults.
+const CUSTOM_FAMILY_WEIGHT_FLOOR: f64 = crate::solver::pirls::MIN_WEIGHT;
 
 /// Default initial ridge δ for the explicit-stabilization Cholesky escalation
 /// schedule. Enters the quadratic term, the Laplace Hessian, and the penalty

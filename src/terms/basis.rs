@@ -23222,6 +23222,114 @@ pub fn resolve_duchon_cubic_default(
     }
 }
 
+/// Build the **analytic** Duchon penalty for a non-periodic Euclidean Duchon
+/// basis: the native reproducing-norm Gram `ω = α²·Zᵀ K_CC Z` (the kernel
+/// evaluated at center pairs, projected through the polynomial-constraint null
+/// space `Z`) plus an analytic null-space shrinkage ridge. This is the exact
+/// `(m+s)`-order Duchon seminorm — pure closed form, no quadrature — the same
+/// object mgcv `bs="ds"` uses, mirroring the Matérn `double_penalty` path. The
+/// design scales its kernel columns by the underflow amplification `α`, so the
+/// coefficient-space penalty scales by `α²`. The null-space ridge penalizes the
+/// affine trend's slope (mean-free: the constant is absorbed by the model
+/// intercept) so the trend is not left fully unpenalized.
+fn duchon_native_penalty_candidates(
+    centers: ArrayView2<'_, f64>,
+    length_scale: Option<f64>,
+    power: f64,
+    nullspace_order: DuchonNullspaceOrder,
+    aniso_log_scales: Option<&[f64]>,
+    kernel_transform: &Array2<f64>,
+    outer_identifiability: Option<&Array2<f64>>,
+    poly_cols: usize,
+) -> Result<Vec<PenaltyCandidate>, BasisError> {
+    let dim = centers.ncols();
+    if dim == 0 {
+        crate::bail_invalid_basis!(
+            "duchon_native_penalty_candidates: centers must have at least one column"
+        );
+    }
+    let k = centers.nrows();
+    let z = kernel_transform;
+    let n_kernel = z.ncols();
+    let p_order = duchon_p_from_nullspace_order(nullspace_order);
+    let s_int = duchon_power_to_usize(power);
+    let pure = length_scale.is_none();
+    let pure_poly_coeff = if pure {
+        Some(PolyharmonicBlockCoeff::new(
+            pure_duchon_block_order(p_order, power),
+            dim,
+        ))
+    } else {
+        None
+    };
+    let coeffs =
+        length_scale.map(|ls| duchon_partial_fraction_coeffs(p_order, s_int, 1.0 / ls.max(1e-300)));
+    let kernel_amp = duchon_kernel_amplification(
+        centers,
+        length_scale,
+        p_order,
+        s_int,
+        dim,
+        aniso_log_scales,
+        coeffs.as_ref(),
+        pure_poly_coeff.as_ref(),
+    );
+    let axis_scales = aniso_log_scales.map(aniso_axis_scales);
+
+    // K_CC: kernel value at every center pair (anisotropic distance when set).
+    let mut center_kernel = Array2::<f64>::zeros((k, k));
+    fill_symmetric_from_row_kernel(&mut center_kernel, |i, j| {
+        let r = if let Some(scales) = axis_scales.as_deref() {
+            aniso_distance_rows_with_scales(centers, i, centers, j, scales)
+        } else {
+            euclidean_distance_rows(centers, i, centers, j)
+        };
+        if let Some(ppc) = pure_poly_coeff.as_ref() {
+            Ok(ppc.eval(r))
+        } else {
+            duchon_matern_kernel_general_from_distance(
+                r,
+                length_scale,
+                p_order,
+                s_int,
+                dim,
+                coeffs.as_ref(),
+            )
+        }
+    })?;
+
+    // ω = α² · Zᵀ K_CC Z, embedded in the kernel block of the
+    // (n_kernel + poly) pre-identifiability frame (polynomial columns carry no
+    // native roughness), then mapped through the outer identifiability `T`.
+    let amp2 = kernel_amp * kernel_amp;
+    let omega = {
+        let zt_k = fast_atb(z, &center_kernel);
+        fast_ab(&zt_k, z).mapv(|v| v * amp2)
+    };
+    let n_pre = n_kernel + poly_cols;
+    let mut primary_pre = Array2::<f64>::zeros((n_pre, n_pre));
+    primary_pre
+        .slice_mut(s![..n_kernel, ..n_kernel])
+        .assign(&omega);
+    let primary = symmetrize(&project_penalty_matrix(&primary_pre, outer_identifiability));
+
+    let mut out = Vec::new();
+    let shrink = build_nullspace_shrinkage_penalty(&primary)?;
+    out.push(normalize_penalty_candidate(
+        primary,
+        0,
+        PenaltySource::Primary,
+    ));
+    if let Some(shrink) = shrink {
+        out.push(normalize_penalty_candidate(
+            shrink.sym_penalty,
+            0,
+            PenaltySource::DoublePenaltyNullspace,
+        ));
+    }
+    Ok(out)
+}
+
 /// Build the structural data-jet penalty triplet for a non-periodic Euclidean
 /// Duchon basis on the full design `B = [K(·,C)·Z | P]` (kernel block + affine
 /// polynomial columns), evaluated at the centers as quadrature points.
@@ -23851,7 +23959,7 @@ pub fn build_duchon_basiswithworkspace(
     // column. This applies to BOTH the pure scale-free (`length_scale = None`,
     // structural cubic `r³`) and the hybrid Matérn-blended (`length_scale =
     // Some`) branches — the radial jet picks the matching kernel internally.
-    let candidates = duchon_data_jet_penalty_candidates(
+    let candidates = duchon_native_penalty_candidates(
         centers.view(),
         spec.length_scale,
         spec.power,
@@ -23859,7 +23967,7 @@ pub fn build_duchon_basiswithworkspace(
         aniso.as_deref(),
         &kernel_transform,
         identifiability_transform.as_ref(),
-        &spec.operator_penalties,
+        poly_cols,
     )?;
     let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
         filter_active_penalty_candidates_with_ops(candidates)?;
