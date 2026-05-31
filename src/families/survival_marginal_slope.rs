@@ -3479,6 +3479,19 @@ pub fn survival_marginal_slope_vector_eta(
         .map_err(|err| format!("survival marginal-slope vector eta: {err}"))
 }
 
+/// Splice `at row {row}` between the reason prefix and the `:` details
+/// separator so that errors from the scalar `row_primary_closed_form*`
+/// kernels (which are intentionally row-agnostic) match the canonical
+/// `<reason> at row N: <details>` shape that downstream consumers match on.
+fn with_row_context(err: String, row: usize) -> String {
+    if let Some(colon) = err.find(':') {
+        let (head, tail) = err.split_at(colon);
+        format!("{head} at row {row}{tail}")
+    } else {
+        format!("{err} at row {row}")
+    }
+}
+
 pub fn survival_marginal_slope_vector_neglog(
     q0: f64,
     q1: f64,
@@ -4367,7 +4380,8 @@ impl SurvivalMarginalSlopeFamily {
                 self.event[row],
                 self.derivative_guard,
                 probit_scale,
-            );
+            )
+            .map_err(|err| with_row_context(err, row));
         }
         if logslope_eta.len() != self.n {
             return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
@@ -4394,6 +4408,7 @@ impl SurvivalMarginalSlopeFamily {
             self.derivative_guard,
             probit_scale,
         )
+        .map_err(|err| with_row_context(err, row))
     }
 
     fn ensure_scalar_flex_exact_score_geometry(&self, context: &str) -> Result<(), String> {
