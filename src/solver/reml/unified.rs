@@ -107,7 +107,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::{Arc, Condvar, Mutex};
 
 use crate::faer_ndarray::FaerEigh;
-use crate::linalg::matrix::{DesignMatrix, LinearOperator, SignedWeightsView};
+use crate::linalg::matrix::{
+    upper_triangle_pair_from_index, DesignMatrix, LinearOperator, SignedWeightsView,
+};
 
 fn reml_contract_panic(message: impl Into<String>) -> ! {
     std::panic::panic_any(message.into())
@@ -8642,14 +8644,6 @@ pub(crate) const MATRIX_FREE_OUTER_HESSIAN_K_THRESHOLD: usize = 32;
 /// because the dominant work is not `p x p` algebra; it is repeated row-kernel
 /// contractions over the upper-triangular coordinate pairs.
 pub(crate) const CALLBACK_OUTER_HESSIAN_ROW_PAIR_WORK_THRESHOLD: usize = 25_000_000;
-
-fn upper_triangle_pair_from_index(pair_idx: usize, n: usize) -> (usize, usize) {
-    let span = 2 * n + 1;
-    let discriminant = span * span - 8 * pair_idx;
-    let row = ((span as f64 - (discriminant as f64).sqrt()) * 0.5) as usize;
-    let row_start = row * (2 * n - row + 1) / 2;
-    (row, row + pair_idx - row_start)
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct OuterHessianRoutePlan {

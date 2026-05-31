@@ -97,12 +97,10 @@ impl RowMeasure {
     }
 }
 
-fn splitmix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = x;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
+/// Thin wrapper over the canonical SplitMix64 hash in
+/// [`crate::linalg::utils::splitmix64_hash`].
+fn splitmix64(x: u64) -> u64 {
+    crate::linalg::utils::splitmix64_hash(x)
 }
 
 const FULL_DATA_ROW_MEASURE_SENTINEL: u64 = 0xA5A5_5A5A_DEAD_BEEF;

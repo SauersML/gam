@@ -4001,7 +4001,7 @@ fn prepare_survival_location_scale_model(
             ))),
         ])?,
     )));
-    let time_stacked_offset = stack_offsets(&[
+    let time_stacked_offset = crate::linalg::utils::stack_offsets(&[
         &spec.time_block.offset_entry,
         &spec.time_block.offset_exit,
         &spec.time_block.derivative_offset_exit,
@@ -4129,7 +4129,7 @@ fn prepare_survival_location_scale_model(
                         x_deriv.clone(),
                     ])?,
                 )))),
-                Some(stack_offsets(&[
+                Some(crate::linalg::utils::stack_offsets(&[
                     &threshold_prep.offset,
                     &threshold_prep.offset,
                     &Array1::zeros(n),
@@ -4246,7 +4246,7 @@ fn prepare_survival_location_scale_model(
                         ls_deriv.clone(),
                     ])?,
                 )))),
-                Some(stack_offsets(&[
+                Some(crate::linalg::utils::stack_offsets(&[
                     &log_sigma_prep.offset,
                     &log_sigma_prep.offset,
                     &Array1::zeros(n),
@@ -4631,18 +4631,6 @@ fn validate_time_block(
         }
     }
     Ok(())
-}
-
-fn stack_offsets(parts: &[&Array1<f64>]) -> Array1<f64> {
-    let total: usize = parts.iter().map(|part| part.len()).sum();
-    let mut out = Array1::<f64>::zeros(total);
-    let mut offset = 0usize;
-    for part in parts {
-        let next = offset + part.len();
-        out.slice_mut(s![offset..next]).assign(part);
-        offset = next;
-    }
-    out
 }
 
 #[derive(Clone, Debug)]

@@ -33,6 +33,26 @@ pub(crate) const fn splitmix64_hash(x: u64) -> u64 {
     splitmix64(&mut state)
 }
 
+/// Vertically concatenate 1D blocks into a single contiguous vector.
+///
+/// Blocks are copied in order into a freshly allocated `Array1` whose length
+/// is the sum of the block lengths. Canonical home for the implementation that
+/// previously lived as identical module-local copies in
+/// `families/latent_survival.rs` and `families/survival_location_scale.rs`,
+/// where it stacks per-segment offset vectors (entry / exit / derivative) into
+/// one design offset.
+pub(crate) fn stack_offsets(blocks: &[&Array1<f64>]) -> Array1<f64> {
+    let total: usize = blocks.iter().map(|block| block.len()).sum();
+    let mut out = Array1::<f64>::zeros(total);
+    let mut row = 0usize;
+    for block in blocks {
+        let end = row + block.len();
+        out.slice_mut(ndarray::s![row..end]).assign(block);
+        row = end;
+    }
+    out
+}
+
 /// Numerically stable softplus `log(1 + exp(x))`.
 ///
 /// Uses the identity `softplus(x) = max(x, 0) + log1p(exp(-|x|))`, which

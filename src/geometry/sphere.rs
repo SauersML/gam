@@ -4,6 +4,7 @@ use crate::geometry::manifold::{
     GEOMETRY_EPS, GeometryError, GeometryResult, RiemannianManifold, check_len, dot, identity,
     norm, zero_christoffel,
 };
+use crate::geometry::normalize_weights;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SphereManifold {
@@ -283,35 +284,6 @@ pub fn normalize_sphere_matrix(values: ArrayView2<'_, f64>) -> Result<Array2<f64
         }
     }
     Ok(out)
-}
-
-fn normalize_weights(
-    n: usize,
-    weights: Option<ArrayView1<'_, f64>>,
-) -> Result<Array1<f64>, String> {
-    match weights {
-        None => Ok(Array1::from_elem(n, 1.0 / n as f64)),
-        Some(w) => {
-            if w.len() != n {
-                return Err("weights length must match the number of rows".to_string());
-            }
-            let mut total = 0.0_f64;
-            for value in w.iter() {
-                if !value.is_finite() || *value < 0.0 {
-                    return Err(
-                        "weights must be finite, non-negative, and have positive total".to_string(),
-                    );
-                }
-                total += *value;
-            }
-            if total <= 0.0 {
-                return Err(
-                    "weights must be finite, non-negative, and have positive total".to_string(),
-                );
-            }
-            Ok(w.mapv(|v| v / total))
-        }
-    }
 }
 
 fn sphere_orthogonal_unit(vector: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {

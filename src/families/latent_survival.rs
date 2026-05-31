@@ -686,18 +686,6 @@ fn stack_rows(blocks: &[&Array2<f64>]) -> Array2<f64> {
     out
 }
 
-fn stack_offsets(blocks: &[&Array1<f64>]) -> Array1<f64> {
-    let n: usize = blocks.iter().map(|v| v.len()).sum();
-    let mut out = Array1::<f64>::zeros(n);
-    let mut row = 0usize;
-    for block in blocks {
-        let end = row + block.len();
-        out.slice_mut(s![row..end]).assign(block);
-        row = end;
-    }
-    out
-}
-
 fn build_time_blockspec(
     prepared: &PreparedLatentTimeBlock,
     input: &TimeBlockInput,
@@ -710,7 +698,7 @@ fn build_time_blockspec(
     ParameterBlockSpec {
         name: "time_transform".to_string(),
         design: DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(stacked_design))),
-        offset: stack_offsets(&[
+        offset: crate::linalg::utils::stack_offsets(&[
             &input.offset_entry,
             &input.offset_exit,
             &input.derivative_offset_exit,
