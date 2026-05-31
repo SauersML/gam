@@ -36,13 +36,10 @@ use super::bms_flex_row::{
 };
 
 #[cfg(target_os = "linux")]
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
-use cudarc::driver::{CudaContext, CudaModule, CudaStream};
-
-#[cfg(target_os = "linux")]
-use super::common::{DeviceArena, PtxModuleCache};
+use cudarc::driver::CudaModule;
 
 // ────────────────────────────────────────────────────────────────────────
 // Public policy entry points (preserved from the previous policy-only
@@ -300,22 +297,7 @@ extern "C" __global__ void bms_flex_probe() {
 #[must_use]
 pub struct BmsFlexGpuBackend {
     #[cfg(target_os = "linux")]
-    inner: BmsFlexGpuContextLinux,
-}
-
-#[cfg(target_os = "linux")]
-struct BmsFlexGpuContextLinux {
-    ctx: Arc<CudaContext>,
-    stream: Arc<CudaStream>,
-    /// NVRTC-compiled module containing the probe kernel. Lazy so the
-    /// compile happens exactly once per process and is shared by every
-    /// dispatching thread.
-    module: PtxModuleCache,
-    /// Reusable f64 device buffers keyed by power-of-two element-count
-    /// buckets. Held under a `Mutex` because biobank fits dispatch from
-    /// multiple rayon worker threads; the mutex is only held during
-    /// `alloc` / `release`, not across kernel launches.
-    arena: Mutex<DeviceArena>,
+    inner: super::backend_probe::CudaBackendContext,
 }
 
 impl BmsFlexGpuBackend {
@@ -354,12 +336,7 @@ impl BmsFlexGpuBackend {
     fn probe_linux() -> Result<Self, GpuError> {
         let parts = super::backend_probe::probe_cuda_backend("bms_flex")?;
         let backend = BmsFlexGpuBackend {
-            inner: BmsFlexGpuContextLinux {
-                ctx: parts.ctx,
-                stream: parts.stream,
-                module: PtxModuleCache::new(),
-                arena: Mutex::new(DeviceArena::default()),
-            },
+            inner: super::backend_probe::CudaBackendContext::from_parts(parts),
         };
         // Eagerly compile the probe kernel so any NVRTC failure surfaces
         // here, not at first dispatch.

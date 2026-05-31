@@ -26,16 +26,17 @@
 //! there is no transitional shim.
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::probe_cuda_backend;
+pub(crate) use linux::{CudaBackendContext, probe_cuda_backend};
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use crate::gpu::common::{DeviceArena, PtxModuleCache};
     use crate::gpu::device::GpuCapability;
     use crate::gpu::error::GpuError;
     use crate::gpu::runtime::{GpuRuntime, cuda_context_for};
     use crate::gpu_err;
     use cudarc::driver::{CudaContext, CudaStream};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     /// The handles every cudarc backend shares once the probe succeeds:
     /// a context on the runtime's selected device, that context's default
@@ -72,6 +73,39 @@ mod linux {
             stream,
             capability,
         })
+    }
+
+    /// The process-wide device handles every cudarc backend stores after a
+    /// successful probe: the [`CudaContext`], its default [`CudaStream`], the
+    /// lazily NVRTC-compiled [`PtxModuleCache`], and the bucketed
+    /// [`DeviceArena`] of reusable f64 device buffers (held under a `Mutex`
+    /// because biobank fits dispatch from multiple rayon worker threads; the
+    /// mutex is only held during `alloc` / `release`, not across kernel
+    /// launches). Module-specific backends (`bms_flex`, `survival_flex`, …)
+    /// wrap one of these as their `inner` context so the host-side
+    /// scaffolding (arena pooling, module cache, mutex around alloc) is
+    /// uniform instead of duplicated per backend.
+    pub(crate) struct CudaBackendContext {
+        pub(crate) ctx: Arc<CudaContext>,
+        pub(crate) stream: Arc<CudaStream>,
+        pub(crate) module: PtxModuleCache,
+        pub(crate) arena: Mutex<DeviceArena>,
+    }
+
+    impl CudaBackendContext {
+        /// Build the stored context from a fresh [`CudaBackendParts`] probe
+        /// result: adopt its context and stream, start an empty module cache
+        /// (the backend's eager-compile step fills it), and an empty device
+        /// arena. The probe's compute `capability` is consumed by the probe
+        /// path itself and is not retained here.
+        pub(crate) fn from_parts(parts: CudaBackendParts) -> Self {
+            CudaBackendContext {
+                ctx: parts.ctx,
+                stream: parts.stream,
+                module: PtxModuleCache::new(),
+                arena: Mutex::new(DeviceArena::default()),
+            }
+        }
     }
 }
 

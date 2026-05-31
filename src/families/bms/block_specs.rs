@@ -1149,13 +1149,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             }
             Ok(eval.efs_eval)
         },
-        |beta: &Array1<f64>| {
-            if beta.iter().any(|v| !v.is_finite()) {
-                crate::bail_invalid_estim!("cached inner beta contains non-finite entries");
-            }
-            pending_beta_seed.replace(Some(beta.clone()));
-            Ok(())
-        },
+        crate::families::marginal_slope_shared::make_beta_seed_validator(&pending_beta_seed),
     )?;
 
     let mut resolved_specs = solved.resolved_specs;

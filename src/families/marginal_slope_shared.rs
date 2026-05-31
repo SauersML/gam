@@ -36,6 +36,32 @@ use ndarray::{Array1, Array2, Axis};
 use std::ops::Range;
 use std::sync::Arc;
 
+/// Canonical inner-cache `beta_seed` validator passed to the generic
+/// outer-engine (`optimize_spatial_length_scale_exact_joint`).
+///
+/// The outer solver hands back the converged inner `beta` at each accepted
+/// ρ-step so the next inner solve can warm-start from it. This guards that
+/// cached vector for non-finite entries (which would poison the warm start)
+/// and, when clean, stashes it into the caller's `pending` cell.
+///
+/// This is the single source of truth for the seed callback: every family
+/// that wires up the exact-joint outer engine (survival location-scale,
+/// bernoulli marginal-slope, survival marginal-slope) routes through here
+/// instead of re-deriving the identical closure, which previously drifted in
+/// error construction (`EstimationError::InvalidInput(...)` vs
+/// `bail_invalid_estim!`).
+pub fn make_beta_seed_validator(
+    pending: &std::cell::RefCell<Option<Array1<f64>>>,
+) -> impl FnMut(&Array1<f64>) -> Result<(), crate::solver::estimate::EstimationError> + '_ {
+    move |beta: &Array1<f64>| {
+        if beta.iter().any(|v| !v.is_finite()) {
+            crate::bail_invalid_estim!("cached inner beta contains non-finite entries");
+        }
+        pending.replace(Some(beta.clone()));
+        Ok(())
+    }
+}
+
 #[inline]
 pub const fn eval_coeff4_at(coefficients: &[f64; 4], z: f64) -> f64 {
     ((coefficients[3] * z + coefficients[2]) * z + coefficients[1]) * z + coefficients[0]

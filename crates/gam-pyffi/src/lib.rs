@@ -5651,17 +5651,6 @@ fn symmetrized_matrix(input: &Array2<f64>) -> Array2<f64> {
     out
 }
 
-fn symmetrize_in_place(input: &mut Array2<f64>) {
-    let n = input.nrows();
-    for i in 0..n {
-        for j in (i + 1)..n {
-            let avg = 0.5 * (input[[i, j]] + input[[j, i]]);
-            input[[i, j]] = avg;
-            input[[j, i]] = avg;
-        }
-    }
-}
-
 fn block_penalty_rank_and_pinv(
     penalty: &Array2<f64>,
 ) -> Result<(usize, Array2<f64>), EstimationError> {
@@ -6186,7 +6175,7 @@ fn gaussian_reml_fit_blocks_backward_analytic(
         // `outer_h` is the Jacobian of the negative profiled REML estimating
         // equation. Preserve signed curvature directions while flooring
         // near-zero modes; flipping negative eigenvalues would change the VJP.
-        symmetrize_in_place(&mut outer_h);
+        gam::linalg::utils::enforce_symmetry(&mut outer_h);
         if let Some(((row, col), value)) =
             outer_h.indexed_iter().find(|(_, value)| !value.is_finite())
         {
@@ -6278,7 +6267,7 @@ fn gaussian_reml_fit_blocks_backward_analytic(
         }
         local += &j_blocks[block];
         local *= lambdas[block];
-        symmetrize_in_place(&mut local);
+        gam::linalg::utils::enforce_symmetry(&mut local);
         grad_penalties.push(local);
     }
 

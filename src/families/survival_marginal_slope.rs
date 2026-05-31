@@ -58,7 +58,6 @@ use crate::smooth::{
     build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices,
 };
-use crate::solver::estimate::EstimationError;
 use crate::solver::estimate::reml::unified::HyperOperator;
 use crate::types::{InverseLink, StandardLink};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis, s};
@@ -16500,16 +16499,10 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         // Hv at O(n · (p_time + p_marginal + p_logslope + p_flex)) per call.
         // Report the operator work model so diagnostics and first-order-only
         // policies reflect the representation that actually executes.
-        let n = self.n as u64;
-        let p_total: u64 = specs
-            .iter()
-            .map(|s| s.design.ncols() as u64)
-            .fold(0u64, |a, p| a.saturating_add(p));
-        if crate::custom_family::use_joint_matrix_free_path(p_total as usize, n as usize) {
-            n.saturating_mul(p_total)
-        } else {
-            crate::custom_family::joint_coupled_coefficient_hessian_cost(n, specs)
-        }
+        crate::families::coefficient_cost::joint_coupled_operator_aware_hessian_cost(
+            self.n as u64,
+            specs,
+        )
     }
 
     fn outer_derivative_policy(
@@ -21464,15 +21457,7 @@ pub fn fit_survival_marginal_slope_terms(
             );
             Ok(eval.efs_eval)
         },
-        |beta: &Array1<f64>| {
-            if beta.iter().any(|v| !v.is_finite()) {
-                return Err(EstimationError::InvalidInput(
-                    "cached inner beta contains non-finite entries".to_string(),
-                ));
-            }
-            pending_beta_seed.replace(Some(beta.clone()));
-            Ok(())
-        },
+        crate::families::marginal_slope_shared::make_beta_seed_validator(&pending_beta_seed),
     )?;
     log::info!(
         "[survival-marginal-slope/outer] solve end elapsed={:.3}s",

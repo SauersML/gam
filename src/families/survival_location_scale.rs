@@ -19,9 +19,9 @@ use crate::faer_ndarray::{
     fast_xt_diag_x_with_parallelism,
 };
 use crate::families::gamlss::{
-    SelectedWiggleBasis, WiggleBlockConfig, monotone_wiggle_basis_with_derivative_order,
-    monotone_wiggle_nonnegative_constraints, select_wiggle_basis_from_seed,
-    validate_monotone_wiggle_beta_nonnegative,
+    ParameterBlockInput, SelectedWiggleBasis, WiggleBlockConfig,
+    monotone_wiggle_basis_with_derivative_order, monotone_wiggle_nonnegative_constraints,
+    select_wiggle_basis_from_seed, validate_monotone_wiggle_beta_nonnegative,
 };
 use crate::families::location_scale_engine::build_location_scale_exact_joint_setup;
 use crate::families::scale_design::{
@@ -880,17 +880,6 @@ fn map_guard_constraint_failure(failure: GuardConstraintFailure) -> String {
     }
 }
 
-#[derive(Clone)]
-pub struct CovariateBlockInput {
-    pub design: DesignMatrix,
-    pub offset: Array1<f64>,
-    pub penalties: Vec<crate::solver::estimate::PenaltySpec>,
-    /// Structural nullspace dimension of each penalty matrix.
-    pub nullspace_dims: Vec<usize>,
-    pub initial_log_lambdas: Option<Array1<f64>>,
-    pub initial_beta: Option<Array1<f64>>,
-}
-
 /// A covariate block whose linear predictor depends on the survival time axis
 /// via a tensor product: covariate design (n x p_cov) ⊗ B-spline on log(time).
 ///
@@ -923,7 +912,7 @@ pub struct TimeDependentCovariateBlockInput {
 /// depends on the survival time axis via a tensor product.
 #[derive(Clone)]
 pub enum CovariateBlockKind {
-    Static(CovariateBlockInput),
+    Static(ParameterBlockInput),
     TimeVarying(TimeDependentCovariateBlockInput),
 }
 
@@ -3134,7 +3123,7 @@ pub(crate) fn q_chain_derivs_scalar(eta_t: f64, eta_ls: f64) -> (f64, f64, f64, 
 fn validate_cov_block(
     name: &str,
     n: usize,
-    b: &CovariateBlockInput,
+    b: &ParameterBlockInput,
 ) -> Result<(), SurvivalLocationScaleError> {
     if b.design.nrows() != n {
         crate::bail_dim_sls!(
@@ -3601,7 +3590,7 @@ fn build_survival_covariate_block_from_design(
 ) -> Result<CovariateBlockKind, String> {
     match template {
         SurvivalCovariateTermBlockTemplate::Static => {
-            Ok(CovariateBlockKind::Static(CovariateBlockInput {
+            Ok(CovariateBlockKind::Static(ParameterBlockInput {
                 design: cov_design.design.clone(),
                 offset: offset.clone(),
                 penalties: cov_design
@@ -9142,25 +9131,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         Ok(Some(Arc::new(workspace)))
     }
 
-    fn outer_derivative_policy(
-        &self,
-        specs: &[ParameterBlockSpec],
-        psi_dim: usize,
-        options: &BlockwiseFitOptions,
-    ) -> crate::families::custom_family::OuterDerivativePolicy {
-        let capability = self.exact_outer_derivative_order(specs, options);
-        let grad_cost = self.coefficient_gradient_cost(specs);
-        let hess_cost = self.coefficient_hessian_cost(specs);
-        let (predicted_gradient_work, predicted_hessian_work) =
-            crate::families::custom_family::default_outer_derivative_policy_costs(
-                specs, psi_dim, grad_cost, hess_cost,
-            );
-        crate::families::custom_family::OuterDerivativePolicy {
-            capability,
-            predicted_gradient_work,
-            predicted_hessian_work,
-            subsample_capable: true,
-        }
+    fn outer_derivative_subsample_capable(&self) -> bool {
+        true
     }
 
     // Inherent `exact_newton_joint_psi_terms_masked` is defined in the
@@ -10584,13 +10556,7 @@ pub(crate) fn fit_survival_location_scale_terms(
             }
             Ok(eval.efs_eval)
         },
-        |beta: &Array1<f64>| {
-            if beta.iter().any(|v| !v.is_finite()) {
-                crate::bail_invalid_estim!("cached inner beta contains non-finite entries");
-            }
-            pending_beta_seed.replace(Some(beta.clone()));
-            Ok(())
-        },
+        crate::families::marginal_slope_shared::make_beta_seed_validator(&pending_beta_seed),
     )?;
 
     let mut resolved_specs = solved.resolved_specs;
@@ -11993,7 +11959,7 @@ mod tests {
                 initial_log_lambdas: None,
                 initial_beta: None,
             },
-            threshold_block: CovariateBlockKind::Static(CovariateBlockInput {
+            threshold_block: CovariateBlockKind::Static(ParameterBlockInput {
                 design: DesignMatrix::from(Array2::ones((n, 1))),
                 offset: Array1::zeros(n),
                 penalties: Vec::new(),
@@ -12001,7 +11967,7 @@ mod tests {
                 initial_log_lambdas: None,
                 initial_beta: None,
             }),
-            log_sigma_block: CovariateBlockKind::Static(CovariateBlockInput {
+            log_sigma_block: CovariateBlockKind::Static(ParameterBlockInput {
                 design: DesignMatrix::from(Array2::ones((n, 1))),
                 offset: Array1::zeros(n),
                 penalties: Vec::new(),
@@ -12068,7 +12034,7 @@ mod tests {
                 initial_log_lambdas: None,
                 initial_beta: None,
             },
-            threshold_block: CovariateBlockKind::Static(CovariateBlockInput {
+            threshold_block: CovariateBlockKind::Static(ParameterBlockInput {
                 design: DesignMatrix::from(Array2::ones((n, 1))),
                 offset: Array1::zeros(n),
                 penalties: Vec::new(),
@@ -12076,7 +12042,7 @@ mod tests {
                 initial_log_lambdas: None,
                 initial_beta: None,
             }),
-            log_sigma_block: CovariateBlockKind::Static(CovariateBlockInput {
+            log_sigma_block: CovariateBlockKind::Static(ParameterBlockInput {
                 design: DesignMatrix::from(Array2::ones((n, 1))),
                 offset: Array1::zeros(n),
                 penalties: Vec::new(),
@@ -12140,7 +12106,7 @@ mod tests {
                 initial_log_lambdas: None,
                 initial_beta: None,
             },
-            threshold_block: CovariateBlockKind::Static(CovariateBlockInput {
+            threshold_block: CovariateBlockKind::Static(ParameterBlockInput {
                 design: DesignMatrix::from(Array2::ones((n, 1))),
                 offset: Array1::zeros(n),
                 penalties: Vec::new(),
@@ -12148,7 +12114,7 @@ mod tests {
                 initial_log_lambdas: None,
                 initial_beta: None,
             }),
-            log_sigma_block: CovariateBlockKind::Static(CovariateBlockInput {
+            log_sigma_block: CovariateBlockKind::Static(ParameterBlockInput {
                 design: DesignMatrix::from(Array2::ones((n, 1))),
                 offset: Array1::zeros(n),
                 penalties: Vec::new(),
@@ -14175,7 +14141,7 @@ mod tests {
                 initial_log_lambdas: Some(array![0.0]),
                 initial_beta: None,
             },
-            threshold_block: CovariateBlockKind::Static(CovariateBlockInput {
+            threshold_block: CovariateBlockKind::Static(ParameterBlockInput {
                 design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::ones(
                     (n, 1),
                 ))),
@@ -14185,7 +14151,7 @@ mod tests {
                 initial_log_lambdas: None,
                 initial_beta: None,
             }),
-            log_sigma_block: CovariateBlockKind::Static(CovariateBlockInput {
+            log_sigma_block: CovariateBlockKind::Static(ParameterBlockInput {
                 design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::ones(
                     (n, 1),
                 ))),

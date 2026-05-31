@@ -48,13 +48,10 @@ use super::error::GpuError;
 use super::{GpuDecision, GpuKernel, decide};
 
 #[cfg(target_os = "linux")]
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
-use cudarc::driver::{CudaContext, CudaModule, CudaStream};
-
-#[cfg(target_os = "linux")]
-use super::common::{DeviceArena, PtxModuleCache};
+use cudarc::driver::CudaModule;
 
 // ────────────────────────────────────────────────────────────────────────
 // Policy entry points (parallels `bms_flex::row_primary_hessian_decision`).
@@ -436,21 +433,7 @@ extern "C" __global__ void survival_flex_rigid_rows(
 #[must_use]
 pub struct SurvivalFlexGpuBackend {
     #[cfg(target_os = "linux")]
-    inner: SurvivalFlexGpuContextLinux,
-}
-
-#[cfg(target_os = "linux")]
-struct SurvivalFlexGpuContextLinux {
-    ctx: Arc<CudaContext>,
-    stream: Arc<CudaStream>,
-    /// NVRTC-compiled module holding `survival_flex_rigid_rows` (and, in
-    /// later steps, the flex kernels).  `OnceLock` so the compile runs
-    /// exactly once per process and is shared by every dispatching thread.
-    module: PtxModuleCache,
-    /// Reusable f64 device buffers keyed by power-of-two element-count
-    /// buckets — the same bucketed arena `bms_flex` uses, so a fit that
-    /// touches both backends does not double up on device memory.
-    arena: Mutex<DeviceArena>,
+    inner: super::backend_probe::CudaBackendContext,
 }
 
 impl SurvivalFlexGpuBackend {
@@ -486,12 +469,7 @@ impl SurvivalFlexGpuBackend {
     fn probe_linux() -> Result<Self, GpuError> {
         let parts = super::backend_probe::probe_cuda_backend("survival_flex")?;
         let backend = SurvivalFlexGpuBackend {
-            inner: SurvivalFlexGpuContextLinux {
-                ctx: parts.ctx,
-                stream: parts.stream,
-                module: PtxModuleCache::new(),
-                arena: Mutex::new(DeviceArena::default()),
-            },
+            inner: super::backend_probe::CudaBackendContext::from_parts(parts),
         };
         backend.compile_rigid_module()?;
         Ok(backend)

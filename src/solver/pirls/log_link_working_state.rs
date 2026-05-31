@@ -25,14 +25,15 @@ use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelI
 
 /// Lower floor on `mu = exp(eta)`, shared by every log-link family so the
 /// working response `(y - mu) / mu` and any fractional `mu` power stay finite.
-pub(super) const MIN_MU: f64 = 1e-10;
+pub(crate) const MIN_MU: f64 = 1e-10;
 
 /// Lower floor on positive working weights, used by the floored families so the
 /// weighted normal equations stay numerically well posed.
-pub(super) const MIN_WEIGHT: f64 = 1e-12;
+pub(crate) const MIN_WEIGHT: f64 = 1e-12;
 
-/// Clamp bound on `eta` so `exp(eta)` cannot overflow.
-const ETA_CLAMP: f64 = 700.0;
+/// Clamp bound on `eta` so `exp(eta)` cannot overflow (`exp` overflows near
+/// `709`). Shared by every PIRLS row that exponentiates a linear predictor.
+pub(crate) const ETA_CLAMP: f64 = 700.0;
 
 /// Family-specific raw (un-floored) Fisher working-weight rule, already scaled
 /// by the row's prior weight. The Fisher weight never depends on the response
