@@ -132,49 +132,50 @@ jobs:
           cargo test --no-run "${args[@]}" 2>&1 | tail -120 \
             || echo "build reported compile errors; the run step classifies per target"
 
-      - name: Run quality suite (assertion failures tolerated, reported)
+      - name: Run quality suite (resilient + streaming; failures tolerated)
         shell: bash
         run: |
           set -uo pipefail
           mapfile -t files < <(ls tests/quality_vs_*.rs 2>/dev/null | xargs -n1 basename | sed 's/\.rs$//')
-          pass=0; fail=0; cerr=0
-          fail_list=()
-          cerr_list=()
+          N=${#files[@]}; i=0; pass=0; fail=0; cerr=0; tmo=0
+          RES=/tmp/quality_results.tsv; : > "$RES"
+          # Stream the dashboard row-by-row into the step summary so partial
+          # results are visible LIVE and survive even if the job is killed by the
+          # job timeout (the summary file is rendered regardless).
+          {
+            echo "## Reference quality suite (streaming)"
+            echo ""
+            echo "| # | test | outcome | metric |"
+            echo "|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
           for t in "${files[@]}"; do
-            echo "::group::run $t"
-            # Binaries are already built above; this just executes (and rebuilds
-            # only if stale). Classify compile errors from the captured log.
-            if cargo test --test "$t" -- --nocapture > "/tmp/$t.log" 2>&1; then
-              pass=$((pass+1)); tail -20 "/tmp/$t.log"
-            elif grep -qE 'could not compile|^error\[|^error:' "/tmp/$t.log"; then
-              echo "COMPILE ERROR: $t"; cerr=$((cerr+1)); cerr_list+=("$t"); tail -20 "/tmp/$t.log"
-            else
-              fail=$((fail+1)); fail_list+=("$t"); tail -25 "/tmp/$t.log"
-            fi
+            i=$((i+1))
+            echo "::group::[$i/$N] $t"
+            # Per-test wall-clock cap: a hung fit / R / Python subprocess can no
+            # longer stall the whole job. 124 = timed out, 137 = SIGKILL after.
+            timeout --kill-after=30 360 cargo test --test "$t" -- --nocapture > "/tmp/$t.log" 2>&1
+            rc=$?
+            metric=$(grep -hoaE '(R2|rmse|rel_l2|auc|deviance|nll|crps|acc|logloss|concordance|seam|edf|pearson|coverage|frechet|distance)[^ ,]*[=: ]-?[0-9.eE+]+' "/tmp/$t.log" 2>/dev/null | tr '\n' ' ' | head -c 110)
+            if [ "$rc" -eq 0 ]; then outcome=PASS; pass=$((pass+1))
+            elif [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then outcome=TIMEOUT; tmo=$((tmo+1))
+            elif grep -qaE 'could not compile|^error\[|^error:' "/tmp/$t.log"; then outcome=CERR; cerr=$((cerr+1))
+            else outcome=DIVERGE; fail=$((fail+1)); fi
+            printf '%s\t%s\t%s\n' "$outcome" "$t" "$metric" >> "$RES"
+            printf '| %d | %s | %s | %s |\n' "$i" "$t" "$outcome" "$metric" >> "$GITHUB_STEP_SUMMARY"
+            echo "[$i/$N] $outcome  $t  $metric"
+            tail -20 "/tmp/$t.log"
             echo "::endgroup::"
           done
-          {
-            echo "## Reference quality suite"
-            echo ""
-            echo "| outcome | count |"
-            echo "|---|---|"
-            echo "| matched mature tool (pass) | $pass |"
-            echo "| diverged (assertion fail) | $fail |"
-            echo "| compile error | $cerr |"
-            echo ""
-            # Gate on the integer counters, not on ${#arr[@]}: GHA's default
-            # `bash -eo pipefail` plus this script's `set -u` makes accessing
-            # ${#empty_array[@]} fire "unbound variable", which `-e` then turns
-            # into an abort — the intended `exit 0` below never runs, the job
-            # goes red, and the compile-error section is silently dropped.
-            if [ "$fail" -gt 0 ]; then
-              echo "### Diverged from reference"; printf '%s\n' "${fail_list[@]/#/- }"; echo ""
-            fi
-            if [ "$cerr" -gt 0 ]; then
-              echo "### Compile errors (test breakage to fix)"; printf '%s\n' "${cerr_list[@]/#/- }"; echo ""
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "pass=$pass diverged=$fail compile_errors=$cerr"
-          # Informational job: assertion-level divergences are honest findings,
-          # not pipeline failures. (Compile errors are surfaced in the summary.)
+          { echo ""; echo "### Totals"; echo "pass=$pass diverged=$fail timeout=$tmo compile_error=$cerr (of $N)"; } >> "$GITHUB_STEP_SUMMARY"
+          echo "pass=$pass diverged=$fail timeout=$tmo compile_errors=$cerr"
+          # Informational dashboard: divergences/timeouts are honest findings, not
+          # pipeline failures.
           exit 0
+
+      - name: Upload streaming quality results (always — survives timeout/cancel)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-results
+          path: /tmp/quality_results.tsv
+          if-no-files-found: ignore
