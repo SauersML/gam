@@ -141,13 +141,13 @@ fn duchon_fit_term_collection_gaussian_simulated_10d_default_like_config_rejects
 #[test]
 fn duchon_fit_term_collection_gaussian_simulated_10d_p2_s1_rejects_infinite_diagonal() {
     assert!(file!().ends_with(".rs"));
-    // An EXPLICIT pure-Duchon request whose kernel does not exist in 10D must
-    // still be rejected. Use (power=1, Linear) → p=2, s=1: 2·(p+s)=6 ≤ d=10, so
-    // the radial kernel diverges at the origin ("pointwise kernel values").
-    // (We deliberately do NOT use power=0 here: the affine+power-0 pair is the
-    // serde-default sentinel that `resolve_duchon_cubic_default` upgrades to the
-    // valid dimension-aware cubic kernel — the magic default is valid in every
-    // dimension and is covered by `duchon_default_cubic_resolution`.)
+    // An EXPLICIT pure-Duchon request whose kernel does not exist in 10D must be
+    // rejected. The basis builder treats `power` LITERALLY (the magic cubic
+    // default lives only in the formula/CLI/pyffi front-ends, not here), so
+    // (power=1, Linear) → p=2, s=1 with 2·(p+s)=6 ≤ d=10 gives a radial kernel
+    // that diverges at the origin ("pointwise kernel values"). The magic cubic
+    // default (no explicit power) is valid in every dimension and is covered by
+    // `duchon_default_cubic_resolution`.
     assert_invalid_pure_duchon_simulated_10d(1, DuchonNullspaceOrder::Linear);
 }
 
