@@ -22836,13 +22836,23 @@ mod tests {
         ]);
         let l = penalty_matrix_root(&s)
             .expect("penalty matrix root should be computable for semidefinite inputs");
-        let recon = l.dot(&l.t());
+        // `penalty_matrix_root` returns the root `R` with shape `(rank, n)`
+        // satisfying the codebase-wide convention `S = Rᵀ R` — this is the
+        // identity that every downstream consumer relies on (e.g.
+        // `PenaltyCoordinate::from_block_root` asserts `root.ncols() == n`
+        // and `apply_root` computes `R β` to get the per-mode scores). The
+        // previous test computed `R Rᵀ` instead, which for a non-full-rank
+        // input is a `(rank × rank)` matrix that cannot even be subtracted
+        // from the `(n × n)` `s` — so the test was failing on the shape
+        // mismatch panic before it ever reached the assertion. Reconstruct
+        // through the actual contract.
+        let recon = l.t().dot(&l);
         let frob_s = s.iter().map(|x| x * x).sum::<f64>().sqrt();
         let frob_err = (&recon - &s).iter().map(|x| x * x).sum::<f64>().sqrt();
         let rel = frob_err / frob_s.max(1.0);
         assert!(
             rel < 1e-9,
-            "Penalty root must reconstruct S_lambda to numerical tolerance, but relative Frobenius error was {rel:.3e}.",
+            "Penalty root must reconstruct S_lambda (as RᵀR) to numerical tolerance, but relative Frobenius error was {rel:.3e}.",
         );
     }
 
