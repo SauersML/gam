@@ -1260,6 +1260,17 @@ pub(super) struct GamWorkingModel<'a> {
     /// Optional per-observation SE for integrated (GHQ) likelihood.
     /// When present, uses integrated family-dispatched working updates.
     covariate_se: Option<Array1<f64>>,
+    /// Whether the Gamma dispersion shape has been estimated and frozen for the
+    /// duration of this inner P-IRLS solve. The shape (= 1/φ) is a nuisance
+    /// scale that multiplies both the working weight (`w = shape·prior`) and the
+    /// reported deviance (`2·shape·Σ wᵢ dᵢ`). Re-estimating it per inner Newton/LM
+    /// iterate moves the product φ·λ that the penalized argmin β̂ depends on, so
+    /// the LM gain ratio compares two different objectives and the solve stalls.
+    /// The shape is therefore estimated once from the warm-start η on the first
+    /// curvature build and held fixed; it refreshes naturally across *outer*
+    /// iterations because a fresh `GamWorkingModel` is built per inner solve.
+    /// See issue #511 (regression of #359).
+    gamma_shape_locked: bool,
     quadctx: crate::quadrature::QuadratureContext,
 }
 
@@ -1347,6 +1358,7 @@ impl<'a> GamWorkingModel<'a> {
             last_penalty_term: 0.0,
             x_original_csr,
             covariate_se: None,
+            gamma_shape_locked: false,
             quadctx,
         }
     }
@@ -1663,12 +1675,20 @@ impl<'a> GamWorkingModel<'a> {
             .par_for_each(|eta, &base, &d| *eta = base + d);
         self.workspace.delta_eta = delta_eta;
 
-        if self.likelihood.scale.gamma_shape_is_estimated() {
-            let shape =
-                estimate_gamma_shape_from_eta(self.y, &self.workspace.eta_buf, self.priorweights);
-            self.likelihood = self.likelihood.clone().with_gamma_shape(shape);
-        }
-
+        // NB: the Gamma dispersion shape is deliberately NOT re-estimated here.
+        // This screen only evaluates a *trial* β to feed the LM gain-ratio
+        // accept/reject test, whose predicted reduction comes from the gradient
+        // and Hessian built (at the current shape) by the last accepted
+        // `update_with_curvature`. Re-estimating the shape per trial — and per
+        // halving attempt — silently changes the objective the screen reports
+        // (deviance = 2·shape·Σ wᵢ dᵢ) relative to that predicted reduction, so
+        // the gain ratio compares two different objectives, every step is
+        // rejected, λ_LM runs to its ceiling, and the inner solve stalls with a
+        // large residual gradient ("LM step search exhausted"). The shape is a
+        // nuisance scale that must stay fixed within an inner Newton/LM step; it
+        // is updated once per *accepted* iterate in `update_with_curvature`
+        // (block-coordinate β | shape), exactly as mgcv holds the scale fixed
+        // through the inner P-IRLS solve. See issue #511 (regression of #359).
         let integrated = self.covariate_se.as_ref().map(|se| IntegratedWorkingInput {
             quadctx: &self.quadctx,
             se: se.view(),
@@ -1761,10 +1781,17 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         self.workspace.eta_buf += &matvec_tmp;
         self.workspace.matvec_buf = matvec_tmp;
 
-        if self.likelihood.scale.gamma_shape_is_estimated() {
+        // Estimate the Gamma dispersion shape once from the warm-start η and
+        // freeze it for the remainder of this inner solve. Holding the shape
+        // fixed keeps the product φ·λ constant, so the penalized argmin β̂ is a
+        // stationary target and the LM gain ratio stays consistent across trial
+        // and accepted iterates. The shape refreshes across outer iterations
+        // because a fresh model is built per inner solve. See issue #511.
+        if self.likelihood.scale.gamma_shape_is_estimated() && !self.gamma_shape_locked {
             let shape =
                 estimate_gamma_shape_from_eta(self.y, &self.workspace.eta_buf, self.priorweights);
             self.likelihood = self.likelihood.clone().with_gamma_shape(shape);
+            self.gamma_shape_locked = true;
         }
 
         // Use integrated (GHQ) likelihood if per-observation SE is available.
