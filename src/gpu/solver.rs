@@ -112,47 +112,57 @@ mod cuda {
     /// cuSOLVER scalar abstraction: selects the precision-specific POTRF/POTRS
     /// symbols and the precision tag used in deferred-info error messages.
     ///
-    /// # Safety
-    ///
-    /// Implementors must wire `BUFFER_SIZE`, `POTRF`, and `POTRS` to the
-    /// cuSOLVER entry points whose pointer arguments match `Self` (e.g.
-    /// `cusolverDnDpotrf` for `f64`). The generic scaffold casts device
-    /// pointers to `*mut Self` / `*const Self` before calling, so a mismatch
-    /// would hand cuSOLVER a wrongly-typed buffer.
-    unsafe trait CholScalar:
+    /// The FFI into cuSOLVER lives inside the trait methods' bodies (in `unsafe`
+    /// blocks), so the trait and its methods are safe to call: each impl wires
+    /// its method bodies to the cuSOLVER entry points whose pointer arguments
+    /// match `Self` (e.g. `cusolverDnDpotrf` for `f64`). Implementors must keep
+    /// that pairing consistent — the device pointer passed in is typed `*mut
+    /// Self` / `*const Self`, so a mismatched symbol would hand cuSOLVER a
+    /// wrongly-typed buffer.
+    trait CholScalar:
         cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Copy
     {
         /// cuSOLVER `*potrf_bufferSize`: `(handle, uplo, n, A, lda, *lwork)`.
-        const BUFFER_SIZE: unsafe fn(
-            cusolver_sys::cusolverDnHandle_t,
-            cusolver_sys::cublasFillMode_t,
-            i32,
-            *mut Self,
-            i32,
-            *mut i32,
+        ///
+        /// `a` is a live `n*n` column-major device buffer of type `Self`,
+        /// `lwork` is a host out-param. The unsafe FFI call is contained in the
+        /// method body.
+        fn potrf_buffer_size(
+            handle: cusolver_sys::cusolverDnHandle_t,
+            uplo: cusolver_sys::cublasFillMode_t,
+            n: i32,
+            a: *mut Self,
+            lda: i32,
+            lwork: *mut i32,
         ) -> cusolver_sys::cusolverStatus_t;
         /// cuSOLVER `*potrf`: `(handle, uplo, n, A, lda, work, lwork, info)`.
-        const POTRF: unsafe fn(
-            cusolver_sys::cusolverDnHandle_t,
-            cusolver_sys::cublasFillMode_t,
-            i32,
-            *mut Self,
-            i32,
-            *mut Self,
-            i32,
-            *mut i32,
+        ///
+        /// Pointer args must reference live device buffers of the documented
+        /// shape; the unsafe FFI call is contained in the method body.
+        fn potrf(
+            handle: cusolver_sys::cusolverDnHandle_t,
+            uplo: cusolver_sys::cublasFillMode_t,
+            n: i32,
+            a: *mut Self,
+            lda: i32,
+            work: *mut Self,
+            lwork: i32,
+            info: *mut i32,
         ) -> cusolver_sys::cusolverStatus_t;
         /// cuSOLVER `*potrs`: `(handle, uplo, n, nrhs, A, lda, B, ldb, info)`.
-        const POTRS: unsafe fn(
-            cusolver_sys::cusolverDnHandle_t,
-            cusolver_sys::cublasFillMode_t,
-            i32,
-            i32,
-            *const Self,
-            i32,
-            *mut Self,
-            i32,
-            *mut i32,
+        ///
+        /// Pointer args must reference live device buffers of the documented
+        /// shape; the unsafe FFI call is contained in the method body.
+        fn potrs(
+            handle: cusolver_sys::cusolverDnHandle_t,
+            uplo: cusolver_sys::cublasFillMode_t,
+            n: i32,
+            nrhs: i32,
+            a: *const Self,
+            lda: i32,
+            b: *mut Self,
+            ldb: i32,
+            info: *mut i32,
         ) -> cusolver_sys::cusolverStatus_t;
         /// Symbol name fragment for error messages (e.g. `"Dpotrf"`).
         const POTRF_NAME: &'static str;
@@ -162,75 +172,99 @@ mod cuda {
         const POTRF_FAIL_SUFFIX: &'static str;
     }
 
-    // SAFETY: each constant points at the cuSOLVER symbol whose buffer
-    // arguments are typed for the matching precision.
-    unsafe impl CholScalar for f64 {
-        const BUFFER_SIZE: unsafe fn(
-            cusolver_sys::cusolverDnHandle_t,
-            cusolver_sys::cublasFillMode_t,
-            i32,
-            *mut f64,
-            i32,
-            *mut i32,
-        ) -> cusolver_sys::cusolverStatus_t = cusolver_sys::cusolverDnDpotrf_bufferSize;
-        const POTRF: unsafe fn(
-            cusolver_sys::cusolverDnHandle_t,
-            cusolver_sys::cublasFillMode_t,
-            i32,
-            *mut f64,
-            i32,
-            *mut f64,
-            i32,
-            *mut i32,
-        ) -> cusolver_sys::cusolverStatus_t = cusolver_sys::cusolverDnDpotrf;
-        const POTRS: unsafe fn(
-            cusolver_sys::cusolverDnHandle_t,
-            cusolver_sys::cublasFillMode_t,
-            i32,
-            i32,
-            *const f64,
-            i32,
-            *mut f64,
-            i32,
-            *mut i32,
-        ) -> cusolver_sys::cusolverStatus_t = cusolver_sys::cusolverDnDpotrs;
+    impl CholScalar for f64 {
+        fn potrf_buffer_size(
+            handle: cusolver_sys::cusolverDnHandle_t,
+            uplo: cusolver_sys::cublasFillMode_t,
+            n: i32,
+            a: *mut f64,
+            lda: i32,
+            lwork: *mut i32,
+        ) -> cusolver_sys::cusolverStatus_t {
+            // SAFETY: caller guarantees `a` is a live n*n column-major f64 device
+            // buffer and `lwork` is a valid host out-param; symbol matches f64.
+            unsafe { cusolver_sys::cusolverDnDpotrf_bufferSize(handle, uplo, n, a, lda, lwork) }
+        }
+        fn potrf(
+            handle: cusolver_sys::cusolverDnHandle_t,
+            uplo: cusolver_sys::cublasFillMode_t,
+            n: i32,
+            a: *mut f64,
+            lda: i32,
+            work: *mut f64,
+            lwork: i32,
+            info: *mut i32,
+        ) -> cusolver_sys::cusolverStatus_t {
+            // SAFETY: caller guarantees `a` is a live n*n column-major f64 buffer,
+            // `work` was sized by potrf_buffer_size, `info` is a 1-element i32
+            // device buffer; symbol matches f64.
+            unsafe { cusolver_sys::cusolverDnDpotrf(handle, uplo, n, a, lda, work, lwork, info) }
+        }
+        fn potrs(
+            handle: cusolver_sys::cusolverDnHandle_t,
+            uplo: cusolver_sys::cublasFillMode_t,
+            n: i32,
+            nrhs: i32,
+            a: *const f64,
+            lda: i32,
+            b: *mut f64,
+            ldb: i32,
+            info: *mut i32,
+        ) -> cusolver_sys::cusolverStatus_t {
+            // SAFETY: caller guarantees `a` is a live n*n f64 Cholesky factor,
+            // `b` is n*nrhs column-major f64, `info` is a 1-element i32 device
+            // buffer; symbol matches f64.
+            unsafe { cusolver_sys::cusolverDnDpotrs(handle, uplo, n, nrhs, a, lda, b, ldb, info) }
+        }
         const POTRF_NAME: &'static str = "Dpotrf";
         const POTRS_NAME: &'static str = "Dpotrs";
         const POTRF_FAIL_SUFFIX: &'static str = "";
     }
 
-    // SAFETY: each constant points at the cuSOLVER symbol whose buffer
-    // arguments are typed for the matching precision.
-    unsafe impl CholScalar for f32 {
-        const BUFFER_SIZE: unsafe fn(
-            cusolver_sys::cusolverDnHandle_t,
-            cusolver_sys::cublasFillMode_t,
-            i32,
-            *mut f32,
-            i32,
-            *mut i32,
-        ) -> cusolver_sys::cusolverStatus_t = cusolver_sys::cusolverDnSpotrf_bufferSize;
-        const POTRF: unsafe fn(
-            cusolver_sys::cusolverDnHandle_t,
-            cusolver_sys::cublasFillMode_t,
-            i32,
-            *mut f32,
-            i32,
-            *mut f32,
-            i32,
-            *mut i32,
-        ) -> cusolver_sys::cusolverStatus_t = cusolver_sys::cusolverDnSpotrf;
-        const POTRS: unsafe fn(
-            cusolver_sys::cusolverDnHandle_t,
-            cusolver_sys::cublasFillMode_t,
-            i32,
-            i32,
-            *const f32,
-            i32,
-            *mut f32,
-            i32,
-            *mut i32,
-        ) -> cusolver_sys::cusolverStatus_t = cusolver_sys::cusolverDnSpotrs;
+    impl CholScalar for f32 {
+        fn potrf_buffer_size(
+            handle: cusolver_sys::cusolverDnHandle_t,
+            uplo: cusolver_sys::cublasFillMode_t,
+            n: i32,
+            a: *mut f32,
+            lda: i32,
+            lwork: *mut i32,
+        ) -> cusolver_sys::cusolverStatus_t {
+            // SAFETY: caller guarantees `a` is a live n*n column-major f32 device
+            // buffer and `lwork` is a valid host out-param; symbol matches f32.
+            unsafe { cusolver_sys::cusolverDnSpotrf_bufferSize(handle, uplo, n, a, lda, lwork) }
+        }
+        fn potrf(
+            handle: cusolver_sys::cusolverDnHandle_t,
+            uplo: cusolver_sys::cublasFillMode_t,
+            n: i32,
+            a: *mut f32,
+            lda: i32,
+            work: *mut f32,
+            lwork: i32,
+            info: *mut i32,
+        ) -> cusolver_sys::cusolverStatus_t {
+            // SAFETY: caller guarantees `a` is a live n*n column-major f32 buffer,
+            // `work` was sized by potrf_buffer_size, `info` is a 1-element i32
+            // device buffer; symbol matches f32.
+            unsafe { cusolver_sys::cusolverDnSpotrf(handle, uplo, n, a, lda, work, lwork, info) }
+        }
+        fn potrs(
+            handle: cusolver_sys::cusolverDnHandle_t,
+            uplo: cusolver_sys::cublasFillMode_t,
+            n: i32,
+            nrhs: i32,
+            a: *const f32,
+            lda: i32,
+            b: *mut f32,
+            ldb: i32,
+            info: *mut i32,
+        ) -> cusolver_sys::cusolverStatus_t {
+            // SAFETY: caller guarantees `a` is a live n*n f32 Cholesky factor,
+            // `b` is n*nrhs column-major f32, `info` is a 1-element i32 device
+            // buffer; symbol matches f32.
+            unsafe { cusolver_sys::cusolverDnSpotrs(handle, uplo, n, nrhs, a, lda, b, ldb, info) }
+        }
         const POTRF_NAME: &'static str = "Spotrf";
         const POTRS_NAME: &'static str = "Spotrs";
         const POTRF_FAIL_SUFFIX: &'static str = " (matrix not SPD at f32)";
@@ -252,9 +286,9 @@ mod cuda {
             .map_err(|e| format!("cuda alloc dummy for lwork query: {e}"))?;
         {
             let (ptr, _rec) = dummy.device_ptr_mut(stream);
-            // SAFETY: buffer-size query; dummy is a live p*p device buffer of
-            // type T, lwork is a host i32, T::BUFFER_SIZE is the matching symbol.
-            let status = unsafe { T::BUFFER_SIZE(solver.cu(), uplo, p_i, ptr as *mut T, p_i, &mut lwork) };
+            // dummy is a live p*p device buffer of type T, lwork is a host i32;
+            // the unsafe cuSOLVER FFI is contained in T::potrf_buffer_size.
+            let status = T::potrf_buffer_size(solver.cu(), uplo, p_i, ptr as *mut T, p_i, &mut lwork);
             check_cusolver(status, "cusolverDn*potrf_bufferSize")?;
         }
         usize::try_from(lwork).map_err(|_| "negative potrf lwork".to_string())
@@ -283,20 +317,19 @@ mod cuda {
             let (a_ptr, _a_rec) = a.device_ptr_mut(stream);
             let (work_ptr, _work_rec) = workspace.device_ptr_mut(stream);
             let (info_ptr, _info_rec) = info.device_ptr_mut(stream);
-            // SAFETY: cuSOLVER potrf; a is p*p col-major T, workspace was sized
-            // by T::BUFFER_SIZE, info is a 1-element i32 device buffer.
-            let status = unsafe {
-                T::POTRF(
-                    solver.cu(),
-                    uplo,
-                    p_i,
-                    a_ptr as *mut T,
-                    p_i,
-                    work_ptr as *mut T,
-                    lwork_i,
-                    info_ptr as *mut i32,
-                )
-            };
+            // a is p*p col-major T, workspace was sized by T::potrf_buffer_size,
+            // info is a 1-element i32 device buffer; the unsafe cuSOLVER FFI is
+            // contained in T::potrf.
+            let status = T::potrf(
+                solver.cu(),
+                uplo,
+                p_i,
+                a_ptr as *mut T,
+                p_i,
+                work_ptr as *mut T,
+                lwork_i,
+                info_ptr as *mut i32,
+            );
             check_cusolver(status, "cusolverDn*potrf")?;
         }
         let info_host = stream
@@ -335,22 +368,21 @@ mod cuda {
             let (f_ptr, _f_rec) = factor.device_ptr(stream);
             let (r_ptr, _r_rec) = rhs.device_ptr_mut(stream);
             let (info_ptr, _info_rec) = info.device_ptr_mut(stream);
-            // SAFETY: cuSOLVER potrs; factor is a p*p lower-triangular T from
-            // potrf, rhs is p*nrhs col-major T, info is a 1-element i32 device
-            // buffer; leading dims match column-major p_i.
-            let status = unsafe {
-                T::POTRS(
-                    solver.cu(),
-                    uplo,
-                    p_i,
-                    nrhs_i,
-                    f_ptr as *const T,
-                    p_i,
-                    r_ptr as *mut T,
-                    p_i,
-                    info_ptr as *mut i32,
-                )
-            };
+            // factor is a p*p lower-triangular T from potrf, rhs is p*nrhs
+            // col-major T, info is a 1-element i32 device buffer; leading dims
+            // match column-major p_i. The unsafe cuSOLVER FFI is contained in
+            // T::potrs.
+            let status = T::potrs(
+                solver.cu(),
+                uplo,
+                p_i,
+                nrhs_i,
+                f_ptr as *const T,
+                p_i,
+                r_ptr as *mut T,
+                p_i,
+                info_ptr as *mut i32,
+            );
             check_cusolver(status, "cusolverDn*potrs")?;
         }
         let info_host = stream
