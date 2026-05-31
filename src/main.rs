@@ -4347,7 +4347,21 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         }
         spec
     } else {
-        termspec.clone()
+        // No `--predict-noise` ⇒ default to an empty log-σ spec (constant
+        // log-σ baseline owned by the family adapter). Cloning the mean
+        // `termspec` here duplicated every threshold term onto log-σ; for a
+        // smooth `s(x)` on the mean the canonical-gauge identifiability
+        // audit then dropped every aliased log-σ column (time > threshold >
+        // log_sigma priorities, #366) so the solver's per-block spec had
+        // width 0 while the family kept x_log_sigma at the smooth width.
+        // `SurvivalLocationScaleFamily::exact_newton_joint_gradient_evaluation`
+        // then failed "joint gradient length mismatch for block 2: got
+        // <smooth width>, expected 0" on every REML startup seed (#512).
+        TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![],
+        }
     };
     let cov_design = build_term_collection_design(ds.values.view(), &termspec)
         .map_err(|e| format!("failed to build survival term collection design: {e}"))?;
