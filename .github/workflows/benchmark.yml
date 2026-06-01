@@ -242,6 +242,15 @@ jobs:
           cargo build --release --bin gam
           cp target/release/gam bench/runtime/gam
           chmod +x bench/runtime/gam
+          # Build the gamfit._rust PyO3 extension that bench/run_suite.py
+          # loads via filesystem glob from `gamfit/_rust*.so`. Without this
+          # step every shard fails with "gamfit Rust extension is not built"
+          # the moment it asks for CV folds.
+          python3 -m pip install --upgrade 'maturin>=1.7,<2'
+          maturin develop --release
+          # Ship the freshly-built extension through the shared runtime
+          # artifact so each shard does not have to recompile it.
+          cp gamfit/_rust*.so bench/runtime/
 
       - name: Save shared runtime cache
         if: ${{ steps.runtime-cache.outputs.cache-hit != 'true' }}
@@ -336,6 +345,22 @@ jobs:
               zf.extractall(out_dir)
           zip_path.unlink()
           PY
+
+      - name: Install gamfit Rust extension into source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          installed=0
+          for so in bench/runtime/_rust*.so; do
+            cp "$so" "gamfit/$(basename "$so")"
+            installed=$((installed + 1))
+          done
+          if [ "${installed}" -eq 0 ]; then
+            echo "::error title=Missing gamfit extension::No _rust*.so in bench-runtime artifact (bootstrap-runtime did not build gamfit._rust)"
+            exit 1
+          fi
+          ls -l gamfit/_rust*.so
 
       - name: Run scenario shard
         shell: bash
@@ -501,6 +526,22 @@ jobs:
               zf.extractall(out_dir)
           zip_path.unlink()
           PY
+
+      - name: Install gamfit Rust extension into source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          installed=0
+          for so in bench/runtime/_rust*.so; do
+            cp "$so" "gamfit/$(basename "$so")"
+            installed=$((installed + 1))
+          done
+          if [ "${installed}" -eq 0 ]; then
+            echo "::error title=Missing gamfit extension::No _rust*.so in bench-runtime artifact (bootstrap-runtime did not build gamfit._rust)"
+            exit 1
+          fi
+          ls -l gamfit/_rust*.so
 
       - name: Run scenario shard
         shell: bash
