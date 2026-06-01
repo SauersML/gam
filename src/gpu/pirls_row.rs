@@ -632,54 +632,13 @@ fn bernoulli_z(eta_used: f64, y: f64, mu: f64, dmu_deta: f64) -> f64 {
 /// `erfc(-x/√2)/2 = Φ(x)` used by libstd. Keeps mass at the tails accurate.
 #[inline]
 fn standard_normal_cdf(x: f64) -> f64 {
-    0.5 * erfc(-x * std::f64::consts::FRAC_1_SQRT_2)
+    0.5 * super::numerics_host::erfc(-x * std::f64::consts::FRAC_1_SQRT_2)
 }
 
 #[inline]
 fn standard_normal_pdf(x: f64) -> f64 {
     const COEFF: f64 = 0.398_942_280_401_432_7; // 1 / sqrt(2π)
     COEFF * (-0.5 * x * x).exp()
-}
-
-/// Abramowitz & Stegun 7.1.26 erfc approximation; relative error ≤ 1.5e-7.
-/// Used both here and as the CUDA implementation when libdevice's `erfc` is
-/// unavailable for NVRTC (the generated kernel sources mirror this).
-fn erfc(x: f64) -> f64 {
-    // Use libstd erf when available — this is the host-side parity reference
-    // and so should be as accurate as possible. The GPU kernel sources use
-    // their own NVRTC-visible `erfc()` from CUDA's math API.
-    libm_erfc(x)
-}
-
-#[inline]
-fn libm_erfc(x: f64) -> f64 {
-    // Branchless erfc using Chebyshev rational approximation (Cody 1969).
-    // Matches f64 libm to within 1 ULP across the input range and is what the
-    // GPU kernels' analytic implementation derives from. Used here so the CPU
-    // reference does not depend on a feature-gated `libm` dependency.
-    if !x.is_finite() {
-        return if x.is_nan() {
-            f64::NAN
-        } else if x > 0.0 {
-            0.0
-        } else {
-            2.0
-        };
-    }
-    let ax = x.abs();
-    let t = 1.0 / (1.0 + 0.5 * ax);
-    let r = t
-        * (-ax * ax - 1.265_512_23
-            + t * (1.000_023_68
-                + t * (0.374_091_96
-                    + t * (0.096_784_18
-                        + t * (-0.186_288_06
-                            + t * (0.278_868_07
-                                + t * (-1.135_203_98
-                                    + t * (1.488_515_87
-                                        + t * (-0.822_152_23 + t * 0.170_872_77)))))))))
-            .exp();
-    if x >= 0.0 { r } else { 2.0 - r }
 }
 
 // ────────────────────────────────────────────────────────────────────────

@@ -639,58 +639,18 @@ mod cuda_backend {
         Some(())
     }
 
+    /// Single-matrix lower Cholesky POTRF. Thin `Result → Option` adapter over
+    /// the shared precision-generic core in `solver.rs`
+    /// ([`crate::gpu::solver::potrf_in_place_generic`]) so the cuSOLVER
+    /// bufferSize/POTRF/info scaffold lives in exactly one place. The batched
+    /// variant (`cusolverDnDpotrfBatched`) above is kept separate by design.
     fn potrf_lower_in_place(
         solver: &DnHandle,
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
         p: usize,
         a: &mut cudarc::driver::CudaSlice<f64>,
     ) -> Option<()> {
-        let p_i = to_i32(p)?;
-        let uplo = cusolver_sys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER;
-        let mut lwork = 0_i32;
-        {
-            let (a_ptr, _a_record) = a.device_ptr_mut(stream);
-            // SAFETY: `a_ptr` addresses a live p-by-p column-major device buffer,
-            // `lwork` is a valid host out-parameter, and `solver` is initialized
-            // on the stream that owns the allocation.
-            let status = unsafe {
-                cusolver_sys::cusolverDnDpotrf_bufferSize(
-                    solver.cu(),
-                    uplo,
-                    p_i,
-                    a_ptr as *mut f64,
-                    p_i,
-                    &mut lwork,
-                )
-            };
-            check_cusolver(status)?;
-        }
-        let lwork = usize::try_from(lwork).ok()?;
-        let mut workspace = stream.alloc_zeros::<f64>(lwork).ok()?;
-        let mut info = stream.alloc_zeros::<i32>(1).ok()?;
-        {
-            let (a_ptr, _a_record) = a.device_ptr_mut(stream);
-            let (work_ptr, _work_record) = workspace.device_ptr_mut(stream);
-            let (info_ptr, _info_record) = info.device_ptr_mut(stream);
-            // SAFETY: `a`, `workspace`, and `info` are live device allocations
-            // on this stream. Workspace length comes from the matching cuSOLVER
-            // buffer-size query above and leading dimensions are p.
-            let status = unsafe {
-                cusolver_sys::cusolverDnDpotrf(
-                    solver.cu(),
-                    uplo,
-                    p_i,
-                    a_ptr as *mut f64,
-                    p_i,
-                    work_ptr as *mut f64,
-                    i32::try_from(lwork).ok()?,
-                    info_ptr as *mut i32,
-                )
-            };
-            check_cusolver(status)?;
-        }
-        let info_host = stream.clone_dtoh(&info).ok()?;
-        if info_host[0] == 0 { Some(()) } else { None }
+        crate::gpu::solver::potrf_in_place_generic::<f64>(solver, stream, p, a).ok()
     }
 
     #[inline]
