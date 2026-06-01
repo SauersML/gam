@@ -2164,12 +2164,9 @@ impl BlockHessianAccumulator {
         // existing channels: time uses {q0,q1,qd1}, marginal {q0,q1}, logslope
         // {g}, score_warp/link_dev their own primary ranges.
         if let Some(infl_idx) = primary.infl {
-            let z_tilde = family
-                .influence_absorber
-                .as_ref()
-                .ok_or_else(|| {
-                    "add_pullback: influence primary index present but no Z̃ design".to_string()
-                })?;
+            let z_tilde = family.influence_absorber.as_ref().ok_or_else(|| {
+                "add_pullback: influence primary index present but no Z̃ design".to_string()
+            })?;
             let z_row = z_tilde.row(row);
             let p_i = z_row.len();
 
@@ -5958,8 +5955,7 @@ impl SurvivalMarginalSlopeFamily {
         if self.influence_absorber.is_none() {
             return Ok(None);
         }
-        let idx =
-            3 + usize::from(self.score_warp.is_some()) + usize::from(self.link_dev.is_some());
+        let idx = 3 + usize::from(self.score_warp.is_some()) + usize::from(self.link_dev.is_some());
         block_states
             .get(idx)
             .map(|state| Some(&state.beta))
@@ -5974,9 +5970,10 @@ impl SurvivalMarginalSlopeFamily {
         row: usize,
         block_states: &[ParameterBlockState],
     ) -> Result<f64, String> {
-        let (Some(z_tilde), Some(gamma)) =
-            (self.influence_absorber.as_ref(), self.flex_influence_beta(block_states)?)
-        else {
+        let (Some(z_tilde), Some(gamma)) = (
+            self.influence_absorber.as_ref(),
+            self.flex_influence_beta(block_states)?,
+        ) else {
             return Ok(0.0);
         };
         if gamma.len() != z_tilde.ncols() {
@@ -8908,10 +8905,9 @@ impl SurvivalMarginalSlopeFamily {
         // its gradient and all cross-Hessians (vs core time/marginal/logslope and
         // vs the identity flex blocks) and its own diagonal are the `o_infl`
         // primary entries weighted by `Z̃[row,·]`.
-        if let (Some(infl_primary), Some(infl_joint)) = (
-            flex_primary_slices(self).infl,
-            slices.influence.as_ref(),
-        ) {
+        if let (Some(infl_primary), Some(infl_joint)) =
+            (flex_primary_slices(self).infl, slices.influence.as_ref())
+        {
             let z_tilde = self.influence_absorber.as_ref().ok_or_else(|| {
                 "accumulate_dynamic_q_joint_row: influence primary index present but no Z̃ design"
                     .to_string()
@@ -13897,9 +13893,7 @@ impl crate::families::marginal_slope_shared::MarginalSlopePsiFamily
         )
     }
 
-    fn psi_first_order_terms_all(
-        &self,
-    ) -> Result<Option<Vec<ExactNewtonJointPsiTerms>>, String> {
+    fn psi_first_order_terms_all(&self) -> Result<Option<Vec<ExactNewtonJointPsiTerms>>, String> {
         let total: usize = self.derivative_blocks.iter().map(Vec::len).sum();
         if total == 0 {
             return Ok(Some(Vec::new()));
@@ -19392,6 +19386,29 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
         }
         .into());
     }
+    if let Some(jac) = spec.score_influence_jacobian.as_ref() {
+        // #461 absorbed influence Jacobian `J = ∂z/∂θ₁` (n × p₁): must align with
+        // the fit rows and be finite. A zero-column J carries no leakage
+        // directions; the build site treats it as no absorber, but a row
+        // mismatch or non-finite entry is a hard error (the residualization Gram
+        // and the per-row Z̃ projection both assume `n` aligned finite rows).
+        if jac.nrows() != n {
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "survival-marginal-slope score_influence_jacobian has {} rows, expected {n}",
+                    jac.nrows()
+                ),
+            }
+            .into());
+        }
+        if jac.iter().any(|&v| !v.is_finite()) {
+            return Err(SurvivalMarginalSlopeError::InvalidInput {
+                reason: "survival-marginal-slope score_influence_jacobian must be finite"
+                    .to_string(),
+            }
+            .into());
+        }
+    }
     if spec.z.iter().any(|&zi| !zi.is_finite()) {
         return Err(SurvivalMarginalSlopeError::InvalidInput {
             reason: "survival-marginal-slope requires finite z values".to_string(),
@@ -20372,58 +20389,63 @@ pub fn fit_survival_marginal_slope_terms(
     // index, because the survival marginal block feeds the time-quantile
     // location `q·c(g)` (scaled), not a flat additive index. `None` ⇒ raw `z`,
     // and the free `score_warp` spline below is the x-free-column fallback.
-    let influence_absorber_residualized: Option<Array2<f64>> =
-        if let Some(jac) = spec.score_influence_jacobian.as_ref() {
-            use crate::families::marginal_slope_orthogonal::{
-                influence_block_design, residualize_influence_columns, ScoreInfluenceJacobian,
-            };
-            let marginal_dense = marginal_design
-                .design
-                .try_to_dense_by_chunks("survival marginal-slope influence-absorber marginal span")?;
-            // Realized leakage directions `Z_infl = diag(s_f·β̂₀)·J` via the core
-            // builder; `β̂₀(x_i)` is the rigid-pilot logslope and `s_f =
-            // probit_scale`. `influence_block_design` reads only `columns`; the
-            // latent score `z_primary` is the genuine `z` on these rows.
-            let jacobian = ScoreInfluenceJacobian {
-                columns: jac.clone(),
-                z: z_primary.clone(),
-            };
-            let rigid_logslope_at_rows = &spec.logslope_offset + baseline_slope;
-            let z_infl =
-                influence_block_design(&jacobian, &rigid_logslope_at_rows, probit_scale);
-            // Marginal-Gram ridge scaled to the weighted Gram's own magnitude so
-            // the projection solve stays stable when the marginal design is
-            // rank-deficient at the pilot, without perturbing a well-conditioned
-            // projection. Identical scaling to the BMS absorber site (single
-            // source of truth for the residualization math is
-            // `residualize_influence_columns`; only this caller-side ridge scale
-            // is shared by value).
-            let gram_scale = (0..marginal_dense.ncols())
-                .map(|j| {
-                    (0..marginal_dense.nrows())
-                        .map(|i| {
-                            cross_block_pilot_w[i] * marginal_dense[[i, j]] * marginal_dense[[i, j]]
-                        })
-                        .sum::<f64>()
-                })
-                .fold(0.0_f64, f64::max);
-            let eps = (gram_scale * 1e-10).max(1e-12);
-            let residualized = residualize_influence_columns(
-                &z_infl,
-                marginal_dense.view(),
-                &cross_block_pilot_w,
-                eps,
-            );
-            if residualized.iter().any(|v| !v.is_finite()) {
-                return Err(SurvivalMarginalSlopeError::NumericalFailure {
-                    reason: "survival influence-absorber residualized columns contain non-finite entries".to_string(),
-                }
-                .into());
-            }
-            Some(residualized)
-        } else {
-            None
+    let influence_absorber_residualized: Option<Array2<f64>> = if let Some(jac) = spec
+        .score_influence_jacobian
+        .as_ref()
+        .filter(|jac| jac.ncols() > 0)
+    {
+        // A zero-column Jacobian carries no leakage directions ⇒ no absorber.
+        use crate::families::marginal_slope_orthogonal::{
+            ScoreInfluenceJacobian, influence_block_design, residualize_influence_columns,
         };
+        let marginal_dense = marginal_design
+            .design
+            .try_to_dense_by_chunks("survival marginal-slope influence-absorber marginal span")?;
+        // Realized leakage directions `Z_infl = diag(s_f·β̂₀)·J` via the core
+        // builder; `β̂₀(x_i)` is the rigid-pilot logslope and `s_f =
+        // probit_scale`. `influence_block_design` reads only `columns`; the
+        // latent score `z_primary` is the genuine `z` on these rows.
+        let jacobian = ScoreInfluenceJacobian {
+            columns: jac.clone(),
+            z: z_primary.clone(),
+        };
+        let rigid_logslope_at_rows = &spec.logslope_offset + baseline_slope;
+        let z_infl = influence_block_design(&jacobian, &rigid_logslope_at_rows, probit_scale);
+        // Marginal-Gram ridge scaled to the weighted Gram's own magnitude so
+        // the projection solve stays stable when the marginal design is
+        // rank-deficient at the pilot, without perturbing a well-conditioned
+        // projection. Identical scaling to the BMS absorber site (single
+        // source of truth for the residualization math is
+        // `residualize_influence_columns`; only this caller-side ridge scale
+        // is shared by value).
+        let gram_scale = (0..marginal_dense.ncols())
+            .map(|j| {
+                (0..marginal_dense.nrows())
+                    .map(|i| {
+                        cross_block_pilot_w[i] * marginal_dense[[i, j]] * marginal_dense[[i, j]]
+                    })
+                    .sum::<f64>()
+            })
+            .fold(0.0_f64, f64::max);
+        let eps = (gram_scale * 1e-10).max(1e-12);
+        let residualized = residualize_influence_columns(
+            &z_infl,
+            marginal_dense.view(),
+            &cross_block_pilot_w,
+            eps,
+        );
+        if residualized.iter().any(|v| !v.is_finite()) {
+            return Err(SurvivalMarginalSlopeError::NumericalFailure {
+                reason:
+                    "survival influence-absorber residualized columns contain non-finite entries"
+                        .to_string(),
+            }
+            .into());
+        }
+        Some(residualized)
+    } else {
+        None
+    };
     // `location_anchor_design` was built above (alongside the non-rigid
     // pilot η) and is reused here for the cross-block residualisation
     // calls. Keeping the construction at one site means the
@@ -20745,7 +20767,9 @@ pub fn fit_survival_marginal_slope_terms(
                 core_len + out.len(),
                 crate::families::marginal_slope_orthogonal::INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA,
             ));
-            out.push(crate::families::marginal_slope_orthogonal::INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA);
+            out.push(
+                crate::families::marginal_slope_orthogonal::INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA,
+            );
         }
         out
     };
