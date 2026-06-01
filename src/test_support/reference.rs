@@ -208,26 +208,34 @@ emit <- function(key, x) {\n\
         ReferenceKind {
             tag: "py",
             script_name: "script.py",
-            preamble: "\
-import sys\n\
-import numpy as np\n\
-_data_csv, _out = sys.argv[1], sys.argv[2]\n\
-try:\n\
-    import pandas as pd\n\
-    df = pd.read_csv(_data_csv)\n\
-except Exception:\n\
-    import csv as _csv\n\
-    with open(_data_csv) as _fh:\n\
-        _r = _csv.DictReader(_fh)\n\
-        _cols = {k: [] for k in _r.fieldnames}\n\
-        for _row in _r:\n\
-            for _k, _v in _row.items():\n\
-                _cols[_k].append(float(_v))\n\
-    df = {k: np.asarray(v, dtype=float) for k, v in _cols.items()}\n\
-_lines = []\n\
-def emit(key, x):\n\
-    arr = np.asarray(x, dtype=float).reshape(-1)\n\
-    _lines.append(str(key) + ':' + ' '.join(repr(float(v)) for v in arr))\n",
+            // NOTE: built with concat! of per-line literals, NOT the `"\<newline>`
+            // continuation idiom. Rust's `\<newline>` continuation strips the
+            // leading whitespace of the following source line, which silently
+            // destroys Python's significant indentation — an earlier version did
+            // exactly that and every Python reference died with
+            // `IndentationError: expected an indented block after 'try'`. Keeping
+            // the indentation INSIDE each literal makes it immune to that.
+            preamble: concat!(
+                "import sys\n",
+                "import numpy as np\n",
+                "_data_csv, _out = sys.argv[1], sys.argv[2]\n",
+                "try:\n",
+                "    import pandas as pd\n",
+                "    df = pd.read_csv(_data_csv)\n",
+                "except Exception:\n",
+                "    import csv as _csv\n",
+                "    with open(_data_csv) as _fh:\n",
+                "        _r = _csv.DictReader(_fh)\n",
+                "        _cols = {k: [] for k in _r.fieldnames}\n",
+                "        for _row in _r:\n",
+                "            for _k, _v in _row.items():\n",
+                "                _cols[_k].append(float(_v))\n",
+                "    df = {k: np.asarray(v, dtype=float) for k, v in _cols.items()}\n",
+                "_lines = []\n",
+                "def emit(key, x):\n",
+                "    arr = np.asarray(x, dtype=float).reshape(-1)\n",
+                "    _lines.append(str(key) + ':' + ' '.join(repr(float(v)) for v in arr))\n",
+            ),
             epilogue: "\nopen(_out, 'w').write('\\n'.join(_lines) + '\\n')\n",
             spawn_expect: "spawn python3 (install python3 to run reference-comparison tests)",
             write_expect: "write reference python script",
