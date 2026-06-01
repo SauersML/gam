@@ -29418,6 +29418,7 @@ fn build_bernoulli_marginal_slope_ffi_payload(
             resolved_marginalspec: frozen_marginal,
             resolved_logslopespec: frozen_logslope,
             fit_result: ms_result.fit.clone(),
+            p_marginal: ms_result.marginal_design.design.ncols(),
             baseline_marginal: ms_result.baseline_marginal,
             baseline_logslope: ms_result.baseline_logslope,
             latent_z_normalization: SavedLatentZNormalization {

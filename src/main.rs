@@ -1947,6 +1947,7 @@ fn run_fit_bernoulli_marginal_slope(
             frozen_marginal,
             frozen_logslope,
             solved.fit,
+            solved.marginal_design.design.ncols(),
             solved.baseline_marginal,
             solved.baseline_logslope,
             SavedLatentZNormalization {
@@ -7308,6 +7309,7 @@ fn build_bernoulli_marginal_slope_saved_model(
     resolved_marginalspec: TermCollectionSpec,
     resolved_logslopespec: TermCollectionSpec,
     fit_result: UnifiedFitResult,
+    p_marginal: usize,
     baseline_marginal: f64,
     baseline_logslope: f64,
     latent_z_normalization: SavedLatentZNormalization,
@@ -7337,6 +7339,7 @@ fn build_bernoulli_marginal_slope_saved_model(
             resolved_marginalspec,
             resolved_logslopespec,
             fit_result,
+            p_marginal,
             baseline_marginal,
             baseline_logslope,
             latent_z_normalization,
@@ -12591,6 +12594,9 @@ mod tests {
                 None,
                 saved_fit_summary_fixture(),
             ),
+            // Single marginal coefficient, no influence absorber ⇒ truncation
+            // is a no-op (p_marginal == block-0 width).
+            p_marginal: 1,
             baseline_marginal: -0.2,
             baseline_logslope: 0.7,
             latent_z_normalization: SavedLatentZNormalization { mean: 1.1, sd: 2.2 },
