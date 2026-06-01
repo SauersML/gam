@@ -522,6 +522,14 @@ fn audit_identifiability_impl(
         }
     }
 
+    // Structural (λ-invariant) penalty per block, used to make the rank
+    // verdicts penalty-aware: a penalized direction that is design-null is still
+    // identified (`JᵀWJ + S` non-singular there), so the audit must rank `[J; S]`
+    // rather than `J`. `None` for unpenalized blocks ⇒ the historical raw-design
+    // verdict is preserved exactly.
+    let block_penalties: Vec<Option<Array2<f64>>> =
+        specs.iter().map(block_structural_penalty_dense).collect();
+
     let mut blocks: Vec<BlockIdentity> = Vec::with_capacity(specs.len());
     let mut col_offsets: Vec<usize> = Vec::with_capacity(specs.len() + 1);
     col_offsets.push(0);
@@ -533,8 +541,13 @@ fn audit_identifiability_impl(
         // invariant could be checked against the audit-visible rows.
         let dense = &dense_blocks[idx];
         let p_block = dense.ncols();
-        let block_singular = block_pivoted_qr_diagonal(dense)?;
-        let block_rank = count_rank(&block_singular, n, p_block);
+        // Penalty-aware: rank of `[J; S]`, so penalty-covered (design-null but
+        // regularized) directions count as identified. `count_rank`'s `n`
+        // argument scales the tolerance; pass the augmented row count.
+        let aug_rows = n + block_penalties[idx].as_ref().map_or(0, |_| p_block);
+        let block_singular =
+            block_penalty_aware_qr_diagonal(dense, block_penalties[idx].as_ref())?;
+        let block_rank = count_rank(&block_singular, aug_rows, p_block);
         blocks.push(BlockIdentity {
             block_name: spec.name.clone(),
             original_dim: p_block,
@@ -624,6 +637,38 @@ fn audit_identifiability_impl(
             x_joint.slice_mut(ndarray::s![.., start..end]).assign(block);
         }
     }
+
+    // Penalty-augmented joint design for the RANK verdict only: stack the
+    // block-diagonal structural penalties beneath `x_joint`, so the joint rank
+    // is `rank([X_joint; S_blockdiag])` and the only fatal deficiencies are
+    // directions that are BOTH data-null AND penalty-null (`ker(J) ∩ ker(S)`).
+    // The pairwise overlap scan below keeps using the *unaugmented* `x_joint`
+    // (penalty rows would distort the data-correlation cosines it measures);
+    // only the RRQR rank/attribution consumes this augmented matrix. When no
+    // block carries a penalty the augmented section is empty and this is bit-
+    // identical to RRQR on `x_joint` — unpenalized families are unaffected.
+    let n_penalty_rows: usize = block_penalties
+        .iter()
+        .enumerate()
+        .map(|(idx, s)| s.as_ref().map_or(0, |_| col_offsets[idx + 1] - col_offsets[idx]))
+        .sum();
+    let x_joint_rank_input: Array2<f64> = if n_penalty_rows == 0 {
+        x_joint.clone()
+    } else {
+        let mut aug = Array2::<f64>::zeros((n + n_penalty_rows, p_total));
+        aug.slice_mut(ndarray::s![..n, ..]).assign(&x_joint);
+        let mut row = n;
+        for (idx, s_opt) in block_penalties.iter().enumerate() {
+            let start = col_offsets[idx];
+            let end = col_offsets[idx + 1];
+            if let Some(s) = s_opt {
+                let h = end - start;
+                aug.slice_mut(ndarray::s![row..row + h, start..end]).assign(s);
+                row += h;
+            }
+        }
+        aug
+    };
 
     // Per-joint-column gauge priority, inherited from the owning block.
     // RRQR uses greedy column pivoting: at each step it picks the
@@ -720,14 +765,21 @@ fn audit_identifiability_impl(
             block_priority_summary.join(", "),
         );
     }
+    // RRQR runs on the penalty-augmented joint (`x_joint_rank_input`): the rank
+    // and the demoted-column attribution then reflect `ker(J) ∩ ker(S)`, not
+    // raw `ker(J)`. Column count is `p_total` in both; only the row count grows
+    // by the appended structural-penalty rows.
     let rrqr = if priority_perm_is_identity {
-        rrqr_with_permutation(&x_joint, default_rrqr_rank_alpha()).map_err(|e| {
+        rrqr_with_permutation(&x_joint_rank_input, default_rrqr_rank_alpha()).map_err(|e| {
             EstimationError::LayoutError(format!("identifiability audit joint RRQR failed: {e:?}"))
         })?
     } else {
-        let mut x_priority = Array2::<f64>::zeros((n, p_total));
+        let m_rows = x_joint_rank_input.nrows();
+        let mut x_priority = Array2::<f64>::zeros((m_rows, p_total));
         for (new_j, &old_j) in priority_perm.iter().enumerate() {
-            x_priority.column_mut(new_j).assign(&x_joint.column(old_j));
+            x_priority
+                .column_mut(new_j)
+                .assign(&x_joint_rank_input.column(old_j));
         }
         rrqr_with_permutation(&x_priority, default_rrqr_rank_alpha()).map_err(|e| {
             EstimationError::LayoutError(format!(
@@ -1992,6 +2044,63 @@ fn locate_block_column(
          outside col_offsets range (max = {})",
         col_offsets.last().copied().unwrap_or(0),
     )))
+}
+
+/// Structural (λ-invariant) penalty for a block: the unit-weight sum of its
+/// penalty matrices, materialised dense (`p_block × p_block`), or `None` when
+/// the block carries no penalty.
+///
+/// Identifiability of a PENALIZED block is governed by `H + S`, not the raw
+/// design `H` alone: a direction killed by the data design but COVERED by the
+/// penalty is still fully estimated (the penalized normal equations `JᵀWJ + S`
+/// are non-singular there). The block is genuinely non-identifiable only along
+/// `ker(J) ∩ ker(S)`. We therefore audit the rank of the design AUGMENTED with
+/// the penalty's rows — `[J; S]`, whose null space is exactly `ker(J) ∩ ker(S)`
+/// (`[J; S] v = 0 ⟺ Jv = 0 ∧ Sv = 0`), so appending `S` itself is equivalent to
+/// appending any square-root `√S` for the rank/null verdict and avoids a matrix
+/// square root.
+///
+/// Using the unit-weight STRUCTURAL sum (not a fitted λ) keeps the gate
+/// ρ-invariant: only the penalties' shared null space `∩_m ker(S_m)` matters,
+/// which is independent of the smoothing-parameter values. A block with no
+/// penalty returns `None`, so its augmented design is just `J` — the gate then
+/// reduces EXACTLY to the historical raw-design rank check, leaving every
+/// unpenalized block/family's verdict unchanged.
+fn block_structural_penalty_dense(spec: &ParameterBlockSpec) -> Option<Array2<f64>> {
+    let p = spec.design.ncols();
+    if p == 0 || spec.penalties.is_empty() {
+        return None;
+    }
+    let mut s = Array2::<f64>::zeros((p, p));
+    let mut any = false;
+    for penalty in &spec.penalties {
+        let dense = penalty.to_dense();
+        if dense.nrows() == p && dense.ncols() == p {
+            s += &dense;
+            any = true;
+        }
+    }
+    any.then_some(s)
+}
+
+/// Penalty-aware rank-revealing pivots for a block: the QR-pivot diagonal of the
+/// design `J` AUGMENTED with the block's structural penalty rows `[J; S]`. When
+/// the block has no penalty this is exactly `block_pivoted_qr_diagonal(J)`.
+fn block_penalty_aware_qr_diagonal(
+    block: &Array2<f64>,
+    structural_penalty: Option<&Array2<f64>>,
+) -> Result<Vec<f64>, EstimationError> {
+    match structural_penalty {
+        None => block_pivoted_qr_diagonal(block),
+        Some(s) => {
+            let n = block.nrows();
+            let p = block.ncols();
+            let mut augmented = Array2::<f64>::zeros((n + p, p));
+            augmented.slice_mut(ndarray::s![..n, ..]).assign(block);
+            augmented.slice_mut(ndarray::s![n.., ..]).assign(s);
+            block_pivoted_qr_diagonal(&augmented)
+        }
+    }
 }
 
 pub(crate) fn block_pivoted_qr_diagonal(block: &Array2<f64>) -> Result<Vec<f64>, EstimationError> {
