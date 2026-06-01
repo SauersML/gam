@@ -13655,6 +13655,7 @@ pub fn build_duchon_collocation_operator_matrices(
     let mut workspace = BasisWorkspace::default();
     build_duchon_collocation_operator_matriceswithworkspace(
         centers,
+        centers,
         collocationweights,
         length_scale,
         power,
@@ -13709,6 +13710,7 @@ pub fn build_thin_plate_penalty_matrix(
 
 pub fn build_duchon_collocation_operator_matriceswithworkspace(
     centers: ArrayView2<'_, f64>,
+    collocation_points: ArrayView2<'_, f64>,
     collocationweights: Option<ArrayView1<'_, f64>>,
     length_scale: Option<f64>,
     power: f64,
@@ -13718,11 +13720,24 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
     max_operator_derivative_order: usize,
     workspace: &mut BasisWorkspace,
 ) -> Result<CollocationOperatorMatrices, BasisError> {
+    // The operator design rows are the COLLOCATION points (a density-blind,
+    // space-filling sample of the data support); the columns are the `k` basis
+    // CENTERS. Decoupling them is what makes the operator penalty a faithful
+    // quadrature of `∫‖Dᵠf‖²` (collocating at the `k` centers themselves — the
+    // old `collocation_points == centers` special case — under-samples a
+    // `k`-bump basis and is what made these penalties explode).
     let nullspace_order = duchon_effective_nullspace_order(centers, nullspace_order);
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
     let s_order: f64 = power;
-    let p_colloc = centers.nrows();
+    let p_colloc = collocation_points.nrows();
+    let n_basis = centers.nrows();
     let dim = centers.ncols();
+    if collocation_points.ncols() != dim {
+        crate::bail_dim_basis!(
+            "collocation points dim {} != centers dim {dim}",
+            collocation_points.ncols()
+        );
+    }
     validate_duchon_collocation_orders(
         length_scale,
         p_order,
@@ -13767,20 +13782,25 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
         vec![1.0; p_colloc]
     };
     let z = kernel_constraint_nullspace(centers, nullspace_order, &mut workspace.cache)?;
-    let mut d0_raw = Array2::<f64>::zeros((p_colloc, p_colloc));
-    let mut d1_raw = Array2::<f64>::zeros((p_colloc * dim, p_colloc));
-    let mut d2_raw = Array2::<f64>::zeros((p_colloc * dim * dim, p_colloc));
+    // D0/D1/D2 rows = collocation points (`p_colloc`), columns = basis centers
+    // (`n_basis`). Gradients/Hessians are taken w.r.t. the EVALUATION point
+    // (the collocation row), so `delta = collocation - center`. No symmetry: the
+    // two point sets differ in general.
+    let mut d0_raw = Array2::<f64>::zeros((p_colloc, n_basis));
+    let mut d1_raw = Array2::<f64>::zeros((p_colloc * dim, n_basis));
+    let mut d2_raw = Array2::<f64>::zeros((p_colloc * dim * dim, n_basis));
     const R_EPS: f64 = 1e-10;
-    for k in 0..p_colloc {
-        let scale_k = row_scales[k];
-        for j in k..p_colloc {
-            let scale_j = row_scales[j];
+    for i in 0..p_colloc {
+        let scale_i = row_scales[i];
+        for j in 0..n_basis {
             let r = if let Some(eta) = aniso_log_scales {
-                let row_k: Vec<f64> = (0..dim).map(|a| centers[[k, a]]).collect();
+                let row_i: Vec<f64> = (0..dim).map(|a| collocation_points[[i, a]]).collect();
                 let row_j: Vec<f64> = (0..dim).map(|a| centers[[j, a]]).collect();
-                aniso_distance(&row_k, &row_j, eta)
+                aniso_distance(&row_i, &row_j, eta)
             } else {
-                stable_euclidean_norm((0..dim).map(|axis| centers[[k, axis]] - centers[[j, axis]]))
+                stable_euclidean_norm(
+                    (0..dim).map(|axis| collocation_points[[i, axis]] - centers[[j, axis]]),
+                )
             };
             let (phi, q, t) = if let (Some(length_scale), Some(coeffs)) =
                 (length_scale, coeffs.as_ref())
@@ -13807,19 +13827,18 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
             };
             if !phi.is_finite() || !q.is_finite() || !t.is_finite() {
                 crate::bail_invalid_basis!(
-                    "non-finite Duchon collocation operator derivative at rows ({k}, {j}), r={r}"
+                    "non-finite Duchon collocation operator derivative at (colloc {i}, center {j}), r={r}"
                 );
             }
-            d0_raw[[k, j]] = scale_k * phi;
-            d0_raw[[j, k]] = scale_j * phi;
+            d0_raw[[i, j]] = scale_i * phi;
             for axis_a in 0..dim {
-                let h_a = centers[[k, axis_a]] - centers[[j, axis_a]];
+                let h_a = collocation_points[[i, axis_a]] - centers[[j, axis_a]];
                 let w_a = metric_weights
                     .as_ref()
                     .map(|weights| weights[axis_a])
                     .unwrap_or(1.0);
                 for axis_b in 0..dim {
-                    let h_b = centers[[k, axis_b]] - centers[[j, axis_b]];
+                    let h_b = collocation_points[[i, axis_b]] - centers[[j, axis_b]];
                     let w_b = metric_weights
                         .as_ref()
                         .map(|weights| weights[axis_b])
@@ -13831,21 +13850,18 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
                         0.0
                     };
                     let value = diagonal + mixed;
-                    let row_k = (k * dim + axis_a) * dim + axis_b;
-                    let row_j = (j * dim + axis_a) * dim + axis_b;
-                    d2_raw[[row_k, j]] = scale_k * value;
-                    d2_raw[[row_j, k]] = scale_j * value;
+                    let row_i = (i * dim + axis_a) * dim + axis_b;
+                    d2_raw[[row_i, j]] = scale_i * value;
                 }
             }
             if r > R_EPS {
                 for axis in 0..dim {
-                    let delta = centers[[k, axis]] - centers[[j, axis]];
+                    let delta = collocation_points[[i, axis]] - centers[[j, axis]];
                     let axis_scale = metric_weights
                         .as_ref()
                         .map(|weights| weights[axis])
                         .unwrap_or(1.0);
-                    d1_raw[[k * dim + axis, j]] = scale_k * q * axis_scale * delta;
-                    d1_raw[[j * dim + axis, k]] = -scale_j * q * axis_scale * delta;
+                    d1_raw[[i * dim + axis, j]] = scale_i * q * axis_scale * delta;
                 }
             }
         }
@@ -13877,7 +13893,7 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
         d0,
         d1,
         d2,
-        collocation_points: centers.to_owned(),
+        collocation_points: collocation_points.to_owned(),
         kernel_nullspace_transform: Some(z),
         polynomial_block_cols: poly_cols,
     })
