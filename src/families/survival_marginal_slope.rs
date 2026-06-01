@@ -1754,13 +1754,19 @@ struct BlockHessianAccumulator {
     h_gh: Array2<f64>,
     h_gw: Array2<f64>,
     h_hw: Array2<f64>,
+    h_ti: Array2<f64>,
+    h_mi: Array2<f64>,
+    h_gi: Array2<f64>,
+    h_hi: Array2<f64>,
+    h_wi: Array2<f64>,
+    h_ii: Array2<f64>,
 }
 
 const PULLBACK_PARALLEL_MIN_CELLS: usize = 16_384;
 const PULLBACK_PARALLEL_TARGET_CELLS: usize = 65_536;
 
 impl BlockHessianAccumulator {
-    fn new(p_t: usize, p_m: usize, p_g: usize, p_h: usize, p_w: usize) -> Self {
+    fn new(p_t: usize, p_m: usize, p_g: usize, p_h: usize, p_w: usize, p_i: usize) -> Self {
         Self {
             h_tt: Array2::zeros((p_t, p_t)),
             h_mm: Array2::zeros((p_m, p_m)),
@@ -1777,6 +1783,12 @@ impl BlockHessianAccumulator {
             h_gh: Array2::zeros((p_g, p_h)),
             h_gw: Array2::zeros((p_g, p_w)),
             h_hw: Array2::zeros((p_h, p_w)),
+            h_ti: Array2::zeros((p_t, p_i)),
+            h_mi: Array2::zeros((p_m, p_i)),
+            h_gi: Array2::zeros((p_g, p_i)),
+            h_hi: Array2::zeros((p_h, p_i)),
+            h_wi: Array2::zeros((p_w, p_i)),
+            h_ii: Array2::zeros((p_i, p_i)),
         }
     }
 
@@ -2091,6 +2103,88 @@ impl BlockHessianAccumulator {
             }
         }
 
+        if let Some(z_tilde) = family.influence_absorber.as_ref() {
+            let z_row = z_tilde.row(row);
+            let ti_weights = [
+                primary_hessian[[0, 0]] + primary_hessian[[0, 1]],
+                primary_hessian[[1, 0]] + primary_hessian[[1, 1]],
+                primary_hessian[[2, 0]] + primary_hessian[[2, 1]],
+            ];
+            for (des, alpha) in time_designs.iter().zip(ti_weights.iter()) {
+                if *alpha == 0.0 {
+                    continue;
+                }
+                let t_chunk = des.try_row_chunk(row..row + 1).map_err(|e| {
+                    format!("add_pullback influence time design try_row_chunk: {e}")
+                })?;
+                let t_row = t_chunk.row(0);
+                ndarray::linalg::general_mat_mul(
+                    *alpha,
+                    &t_row.view().insert_axis(Axis(1)),
+                    &z_row.view().insert_axis(Axis(0)),
+                    1.0,
+                    &mut self.h_ti,
+                );
+            }
+            if mm_weight != 0.0 {
+                let m_chunk = family
+                    .marginal_design
+                    .try_row_chunk(row..row + 1)
+                    .map_err(|e| {
+                        format!("add_pullback influence marginal_design try_row_chunk: {e}")
+                    })?;
+                let m_row = m_chunk.row(0);
+                ndarray::linalg::general_mat_mul(
+                    mm_weight,
+                    &m_row.view().insert_axis(Axis(1)),
+                    &z_row.view().insert_axis(Axis(0)),
+                    1.0,
+                    &mut self.h_mi,
+                );
+                ndarray::linalg::general_mat_mul(
+                    mm_weight,
+                    &z_row.view().insert_axis(Axis(1)),
+                    &z_row.view().insert_axis(Axis(0)),
+                    1.0,
+                    &mut self.h_ii,
+                );
+            }
+            let gi_weight = primary_hessian[[3, 0]] + primary_hessian[[3, 1]];
+            if gi_weight != 0.0 {
+                ndarray::linalg::general_mat_mul(
+                    gi_weight,
+                    &g_row.view().insert_axis(Axis(1)),
+                    &z_row.view().insert_axis(Axis(0)),
+                    1.0,
+                    &mut self.h_gi,
+                );
+            }
+            if let Some(h_range) = primary.h.as_ref() {
+                for local_idx in 0..h_range.len() {
+                    let alpha = primary_hessian[[h_range.start + local_idx, 0]]
+                        + primary_hessian[[h_range.start + local_idx, 1]];
+                    if alpha == 0.0 {
+                        continue;
+                    }
+                    for infl_idx in 0..z_row.len() {
+                        self.h_hi[[local_idx, infl_idx]] += alpha * z_row[infl_idx];
+                    }
+                }
+            }
+            if let Some(w_range) = primary.w.as_ref() {
+                for local_idx in 0..w_range.len() {
+                    let alpha = primary_hessian[[w_range.start + local_idx, 0]]
+                        + primary_hessian[[w_range.start + local_idx, 1]];
+                    if alpha == 0.0 {
+                        continue;
+                    }
+                    for infl_idx in 0..z_row.len() {
+                        self.h_wi[[local_idx, infl_idx]] += alpha * z_row[infl_idx];
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -2353,6 +2447,17 @@ impl BlockHessianAccumulator {
 
             (ScoreWarp, LinkDev) => self.h_hw.view(),
             (LinkDev, ScoreWarp) => self.h_hw.t(),
+            (Time, Influence) => self.h_ti.view(),
+            (Influence, Time) => self.h_ti.t(),
+            (Marginal, Influence) => self.h_mi.view(),
+            (Influence, Marginal) => self.h_mi.t(),
+            (Logslope, Influence) => self.h_gi.view(),
+            (Influence, Logslope) => self.h_gi.t(),
+            (ScoreWarp, Influence) => self.h_hi.view(),
+            (Influence, ScoreWarp) => self.h_hi.t(),
+            (LinkDev, Influence) => self.h_wi.view(),
+            (Influence, LinkDev) => self.h_wi.t(),
+            (Influence, Influence) => self.h_ii.view(),
         }
     }
 
@@ -2421,6 +2526,12 @@ impl BlockHessianAccumulator {
         self.h_gh += &other.h_gh;
         self.h_gw += &other.h_gw;
         self.h_hw += &other.h_hw;
+        self.h_ti += &other.h_ti;
+        self.h_mi += &other.h_mi;
+        self.h_gi += &other.h_gi;
+        self.h_hi += &other.h_hi;
+        self.h_wi += &other.h_wi;
+        self.h_ii += &other.h_ii;
     }
 
     fn diagonal(&self, slices: &BlockSlices) -> Array1<f64> {
@@ -4836,6 +4947,7 @@ impl SurvivalMarginalSlopeFamily {
         let p_g = slices.logslope.len();
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
+        let p_i = slices.influence.as_ref().map_or(0, |range| range.len());
         let row_iter = outer_row_indices(options, self.n).to_vec();
         let row_weights = outer_row_weights_by_index(options, self.n);
         // Bit-deterministic reduction: see `chunked_row_reduction`.
@@ -4850,7 +4962,7 @@ impl SurvivalMarginalSlopeFamily {
                         Array1::zeros(p_g),
                         Array1::zeros(p_h),
                         Array1::zeros(p_w),
-                        BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                        BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w, p_i),
                     )
                 },
                 |row, a| -> Result<(), String> {
@@ -4933,6 +5045,7 @@ impl SurvivalMarginalSlopeFamily {
         let p_g = slices.logslope.len();
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
+        let p_i = slices.influence.as_ref().map_or(0, |range| range.len());
         let row_iter = outer_row_indices(options, self.n).to_vec();
         let row_weights = outer_row_weights_by_index(options, self.n);
         // Bit-deterministic reduction: see `chunked_row_reduction`.
@@ -4947,7 +5060,7 @@ impl SurvivalMarginalSlopeFamily {
                         Array1::zeros(p_g),
                         Array1::zeros(p_h),
                         Array1::zeros(p_w),
-                        BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                        BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w, p_i),
                     )
                 },
                 |row, a| -> Result<(), String> {
@@ -5034,6 +5147,7 @@ impl SurvivalMarginalSlopeFamily {
         let p_g = slices.logslope.len();
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
+        let p_i = slices.influence.as_ref().map_or(0, |range| range.len());
         let primary_dim = N_PRIMARY;
         let row_iter = outer_row_indices(options, self.n).to_vec();
         let row_weights = outer_row_weights_by_index(options, self.n);
@@ -5050,7 +5164,7 @@ impl SurvivalMarginalSlopeFamily {
         // Bit-deterministic reduction: see `chunked_row_reduction`.
         let acc = chunked_row_reduction(
             row_iter.as_slice(),
-            || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+            || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w, p_i),
             |row, acc| -> Result<(), String> {
                 let row_dir = self.row_primary_direction_from_flat_dynamic(
                     row,
@@ -5752,8 +5866,7 @@ impl SurvivalMarginalSlopeFamily {
         if self.influence_absorber.is_none() {
             return Ok(None);
         }
-        let idx =
-            3 + usize::from(self.score_warp.is_some()) + usize::from(self.link_dev.is_some());
+        let idx = 3 + usize::from(self.score_warp.is_some()) + usize::from(self.link_dev.is_some());
         block_states
             .get(idx)
             .map(|state| Some(&state.beta))
@@ -5768,9 +5881,10 @@ impl SurvivalMarginalSlopeFamily {
         row: usize,
         block_states: &[ParameterBlockState],
     ) -> Result<f64, String> {
-        let (Some(z_tilde), Some(gamma)) =
-            (self.influence_absorber.as_ref(), self.flex_influence_beta(block_states)?)
-        else {
+        let (Some(z_tilde), Some(gamma)) = (
+            self.influence_absorber.as_ref(),
+            self.flex_influence_beta(block_states)?,
+        ) else {
             return Ok(0.0);
         };
         if gamma.len() != z_tilde.ncols() {
@@ -11794,6 +11908,7 @@ impl SurvivalMarginalSlopeFamily {
         let p_g = slices.logslope.len();
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
+        let p_i = slices.influence.as_ref().map_or(0, |range| range.len());
 
         // Build the psi design map once; rowwise loop does direct row_vector(row)
         // calls via the PsiDesignMap API.
@@ -11825,7 +11940,7 @@ impl SurvivalMarginalSlopeFamily {
                 Array1::zeros(p_g),
                 Array1::zeros(p_h),
                 Array1::zeros(p_w),
-                BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w, p_i),
             )
         };
 
@@ -12076,6 +12191,7 @@ impl SurvivalMarginalSlopeFamily {
         let p_g = slices.logslope.len();
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
+        let p_i = slices.influence.as_ref().map_or(0, |range| range.len());
 
         struct BatchedPsiAxisAcc {
             objective_psi: f64,
@@ -12095,7 +12211,7 @@ impl SurvivalMarginalSlopeFamily {
                     score_g: Array1::zeros(p_g),
                     score_h: Array1::zeros(p_h),
                     score_w: Array1::zeros(p_w),
-                    hessian: BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                    hessian: BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w, p_i),
                 })
                 .collect()
         };
@@ -12305,6 +12421,7 @@ impl SurvivalMarginalSlopeFamily {
         let p_g = slices.logslope.len();
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
+        let p_i = slices.influence.as_ref().map_or(0, |range| range.len());
         let same_block = block_idx_i == block_idx_j;
 
         // Build psi design maps once outside the row loop; rowwise calls use
@@ -12360,7 +12477,7 @@ impl SurvivalMarginalSlopeFamily {
                 score_g: Array1::zeros(p_g),
                 score_h: Array1::zeros(p_h),
                 score_w: Array1::zeros(p_w),
-                hessian: BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                hessian: BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w, p_i),
             }
         };
 
@@ -12790,6 +12907,7 @@ impl SurvivalMarginalSlopeFamily {
         let p_g = slices.logslope.len();
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
+        let p_i = slices.influence.as_ref().map_or(0, |range| range.len());
 
         // Build the psi design map once; rowwise calls use direct row_vector(row).
         let policy = crate::resource::ResourcePolicy::default_library();
@@ -12808,7 +12926,7 @@ impl SurvivalMarginalSlopeFamily {
         // accumulators in row-chunk order for deterministic timewiggle assembly.
         let acc = chunked_row_reduction(
             row_iter.as_slice(),
-            || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+            || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w, p_i),
             |row, acc| -> Result<(), String> {
                 let psi_row = psi_map
                     .row_vector(row)
@@ -13007,8 +13125,9 @@ impl SurvivalMarginalSlopeFamily {
         let p_g = slices.logslope.len();
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
+        let p_i = slices.influence.as_ref().map_or(0, |range| range.len());
         let p_total = slices.total;
-        let make_acc = || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w);
+        let make_acc = || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w, p_i);
 
         // Phase 2d: the same per-row work that yields the block-Hessian pullback
         // also yields the row negative-log-likelihood and the joint gradient.
@@ -13141,11 +13260,12 @@ impl SurvivalMarginalSlopeFamily {
         let p_g = slices.logslope.len();
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
+        let p_i = slices.influence.as_ref().map_or(0, |range| range.len());
         let row_iter = outer_row_indices(options, self.n).to_vec();
         let row_weights = outer_row_weights_by_index(options, self.n);
         let make_acc_ws = || {
             (
-                BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w, p_i),
                 SurvivalMarginalSlopeDynamicRow::empty_workspace(),
             )
         };
@@ -13207,11 +13327,12 @@ impl SurvivalMarginalSlopeFamily {
         let p_g = slices.logslope.len();
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
+        let p_i = slices.influence.as_ref().map_or(0, |range| range.len());
         let row_iter = outer_row_indices(options, self.n).to_vec();
         let row_weights = outer_row_weights_by_index(options, self.n);
         let make_acc_ws = || {
             (
-                BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w, p_i),
                 SurvivalMarginalSlopeDynamicRow::empty_workspace(),
             )
         };
@@ -13561,9 +13682,7 @@ impl crate::families::marginal_slope_shared::MarginalSlopePsiFamily
         )
     }
 
-    fn psi_first_order_terms_all(
-        &self,
-    ) -> Result<Option<Vec<ExactNewtonJointPsiTerms>>, String> {
+    fn psi_first_order_terms_all(&self) -> Result<Option<Vec<ExactNewtonJointPsiTerms>>, String> {
         let total: usize = self.derivative_blocks.iter().map(Vec::len).sum();
         if total == 0 {
             return Ok(Some(Vec::new()));
@@ -20015,11 +20134,11 @@ pub fn fit_survival_marginal_slope_terms(
     let influence_absorber_residualized: Option<Array2<f64>> =
         if let Some(jac) = spec.score_influence_jacobian.as_ref() {
             use crate::families::marginal_slope_orthogonal::{
-                influence_block_design, residualize_influence_columns, ScoreInfluenceJacobian,
+                ScoreInfluenceJacobian, influence_block_design, residualize_influence_columns,
             };
-            let marginal_dense = marginal_design
-                .design
-                .try_to_dense_by_chunks("survival marginal-slope influence-absorber marginal span")?;
+            let marginal_dense = marginal_design.design.try_to_dense_by_chunks(
+                "survival marginal-slope influence-absorber marginal span",
+            )?;
             // Realized leakage directions `Z_infl = diag(s_f·β̂₀)·J` via the core
             // builder; `β̂₀(x_i)` is the rigid-pilot logslope and `s_f =
             // probit_scale`. `influence_block_design` reads only `columns`; the
@@ -20029,8 +20148,7 @@ pub fn fit_survival_marginal_slope_terms(
                 z: z_primary.clone(),
             };
             let rigid_logslope_at_rows = &spec.logslope_offset + baseline_slope;
-            let z_infl =
-                influence_block_design(&jacobian, &rigid_logslope_at_rows, probit_scale);
+            let z_infl = influence_block_design(&jacobian, &rigid_logslope_at_rows, probit_scale);
             // Marginal-Gram ridge scaled to the weighted Gram's own magnitude so
             // the projection solve stays stable when the marginal design is
             // rank-deficient at the pilot, without perturbing a well-conditioned
@@ -20056,9 +20174,11 @@ pub fn fit_survival_marginal_slope_terms(
             );
             if residualized.iter().any(|v| !v.is_finite()) {
                 return Err(SurvivalMarginalSlopeError::NumericalFailure {
-                    reason: "survival influence-absorber residualized columns contain non-finite entries".to_string(),
-                }
-                .into());
+                reason:
+                    "survival influence-absorber residualized columns contain non-finite entries"
+                        .to_string(),
+            }
+            .into());
             }
             Some(residualized)
         } else {
@@ -27971,7 +28091,7 @@ mod tests {
         p_h: usize,
         p_w: usize,
     ) -> BlockHessianAccumulator {
-        let mut acc = BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w);
+        let mut acc = BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w, p_i);
         // Per-pair base offsets keep the diagonal blocks symmetric (required
         // for a valid Hessian) while making the off-diagonal blocks distinct
         // and asymmetric, so `to_dense` must place each transpose correctly.
