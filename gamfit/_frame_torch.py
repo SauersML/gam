@@ -15,6 +15,8 @@ from typing import Any, Callable
 
 import numpy as np
 
+from ._frame_shared import stack_coords_generic
+
 
 def _torch() -> Any:
     from ._frame import import_torch
@@ -67,28 +69,24 @@ def from_numpy_like(array: Any, ref: Any | None) -> Any:
 def stack_coords(coords: list[Any] | tuple[Any, ...]) -> Any:
     """Stack 1D torch coordinates into a (B, d) float64 tensor."""
     torch = _torch()
-    if len(coords) == 0:
-        raise ValueError("stack_coords requires at least one coordinate")
-    tensors: list[Any] = []
-    ref_len: int | None = None
-    for idx, c in enumerate(coords):
+
+    def _coerce(idx: int, c: Any, _ref_len: int | None) -> tuple[Any, int]:
         if not isinstance(c, torch.Tensor):
             c = torch.as_tensor(c, dtype=torch.float64)
         if c.dim() != 1:
             raise ValueError(
                 f"coord {idx}: expected 1D tensor, got shape {tuple(c.shape)}"
             )
-        if ref_len is None:
-            ref_len = int(c.numel())
-        elif int(c.numel()) != ref_len:
-            raise ValueError(
-                f"coord {idx}: length {c.numel()} does not match reference "
-                f"length {ref_len}"
-            )
+        length = int(c.numel())
         if not torch.is_floating_point(c):
             c = c.to(dtype=torch.float64)
-        tensors.append(c)
-    return torch.stack(tensors, dim=1)
+        return c, length
+
+    return stack_coords_generic(
+        coords,
+        coerce=_coerce,
+        stack=lambda tensors: torch.stack(tensors, dim=1),
+    )
 
 
 def wrap_value_grad(
