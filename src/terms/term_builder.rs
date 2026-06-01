@@ -1747,6 +1747,7 @@ pub fn build_smooth_basis(
                     "period_start",
                     "period_end",
                     "scale_dims",
+                    "magnitude",
                     "double_penalty",
                     "by",
                     "id",
