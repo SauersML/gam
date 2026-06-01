@@ -113,6 +113,19 @@ jobs:
           '
           # R-INLA is not on CRAN; it ships from its own repository. Best-effort
           # (large download); tests that need it fail loudly if it is unavailable.
+          # INLA's loader pulls in the Bioconductor packages `graph`/`Rgraphviz`
+          # (the run annotated "dependencies 'Rgraphviz','gsl','graph' are not
+          # available" + a dyn.load failure) and `fmesher`, so install those
+          # first (gsl/graphviz system libs come from the apt step above).
+          Rscript -e '
+            options(repos = c(getOption("repos"),
+                              CRAN = "https://packagemanager.posit.co/cran/__linux__/jammy/latest"))
+            if (!requireNamespace("BiocManager", quietly=TRUE)) try(install.packages("BiocManager"), silent=TRUE)
+            for (p in c("graph","Rgraphviz"))
+              if (!requireNamespace(p, quietly=TRUE)) try(BiocManager::install(p, update=FALSE, ask=FALSE), silent=TRUE)
+            for (p in c("fmesher","sp","foreach"))
+              if (!requireNamespace(p, quietly=TRUE)) try(install.packages(p), silent=TRUE)
+          '
           Rscript -e '
             options(repos = c(getOption("repos"),
                               INLA = "https://inla.r-inla-download.org/R/stable",
