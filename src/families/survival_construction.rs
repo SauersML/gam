@@ -1098,7 +1098,8 @@ pub fn build_survival_time_basis(
 
     fn infer_survival_time_knots(
         combined: &Array1<f64>,
-        degree: usize,
+        knot_degree: usize,
+        validation_degree: usize,
         num_internal_knots: usize,
         basis_options: BasisOptions,
     ) -> Result<Array1<f64>, String> {
@@ -1164,7 +1165,7 @@ pub fn build_survival_time_basis(
                 let built = build_bspline_basis_1d(
                     combined.view(),
                     &BSplineBasisSpec {
-                        degree,
+                        degree: knot_degree,
                         penalty_order: 2,
                         knotspec: BSplineKnotSpec::Automatic {
                             num_internal_knots: Some(num_internal_knots),
@@ -1186,10 +1187,18 @@ pub fn build_survival_time_basis(
                         );
                     }
                 };
+                // `knot_degree` is the clamped B-spline degree used to size
+                // the knot vector. `validation_degree` is the public basis
+                // degree passed to the final evaluator. They differ for
+                // I-splines because `create_basis(..., BasisOptions::i_spline())`
+                // internally raises the public degree by one to its working
+                // B-spline antiderivative degree. Validating with
+                // `knot_degree` here would raise a second time and reject the
+                // coherent knot vector we just inferred.
                 create_basis::<Dense>(
                     combined.view(),
                     KnotSource::Provided(knots.view()),
-                    degree,
+                    validation_degree,
                     basis_options,
                 )
                 .map_err(|e| e.to_string())?;
@@ -1252,6 +1261,7 @@ pub fn build_survival_time_basis(
                 let combined = survival_time_knot_input(&log_entry, &log_exit);
                 infer_survival_time_knots(
                     &combined,
+                    degree,
                     degree,
                     num_internal_knots,
                     BasisOptions::value(),
@@ -1354,6 +1364,7 @@ pub fn build_survival_time_basis(
                 infer_survival_time_knots(
                     &combined,
                     bspline_degree,
+                    degree,
                     num_internal_knots,
                     BasisOptions::i_spline(),
                 )?
@@ -3449,6 +3460,39 @@ mod tests {
             pairwise_max(&theta_grad_only, &theta_grad_hess) <= 2e-3,
             "gradient-only vs gradient+Hessian disagree: {theta_grad_only:?} vs {theta_grad_hess:?}"
         );
+    }
+
+    #[test]
+    fn automatic_ispline_time_knots_are_sized_for_antiderivative_degree() {
+        let age_entry = array![1.0_f64, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let age_exit = array![2.0_f64, 3.0, 5.0, 8.0, 13.0, 21.0];
+        let requested_degree = 3;
+        let num_internal_knots = 1;
+
+        let built = build_survival_time_basis(
+            &age_entry,
+            &age_exit,
+            SurvivalTimeBasisConfig::ISpline {
+                degree: requested_degree,
+                knots: Array1::zeros(0),
+                keep_cols: Vec::new(),
+                smooth_lambda: 1e-2,
+            },
+            Some((num_internal_knots, 1e-2)),
+        )
+        .expect("automatic cubic ispline with one interior knot builds");
+
+        let working_degree = requested_degree + 1;
+        let knots = built.knots.expect("resolved ispline knots");
+        assert_eq!(
+            knots.len(),
+            num_internal_knots + 2 * (working_degree + 1),
+            "I-spline automatic knots must be clamped for the working B-spline degree"
+        );
+        assert_eq!(built.degree, Some(requested_degree));
+        assert!(built.x_exit_time.ncols() > 0);
+        assert_eq!(built.x_entry_time.ncols(), built.x_exit_time.ncols());
+        assert_eq!(built.x_derivative_time.ncols(), built.x_exit_time.ncols());
     }
 
     #[test]
