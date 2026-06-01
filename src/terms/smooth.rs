@@ -7707,11 +7707,22 @@ fn spatial_identifiability_policy(termspec: &SmoothTermSpec) -> Option<&SpatialI
 /// at basis-build time (`apply_sum_to_zero_constraint`), so they already satisfy
 /// the invariant and must NOT be double-constrained — they return `false`.
 ///
-/// Sphere / PCA kernels share the invariant in principle, but their
-/// `BasisMetadata` arms in `with_identifiability_transform` cannot yet carry a
-/// composed centering transform through freeze → reload, so wiring them here
-/// would silently lose the constraint on a reloaded model. They are deliberately
-/// excluded until that plumbing exists.
+/// The remaining bases are excluded, each for a concrete reason:
+///   - **Sphere, Harmonic method**: the real-spherical-harmonic basis starts at
+///     degree `l = 1` (`build_spherical_harmonic_basis`), so it never spans the
+///     degree-0 constant — no centering is needed.
+///   - **Sphere, Wahba method**: shares the invariant (its
+///     `weighted_coefficient_sum_to_zero_transform` is a *center*-space
+///     constraint, so the realized design still spans the constant — same class
+///     as Matérn). It is excluded only because `SphericalSplineBasisSpec` has no
+///     frozen-transform field: `build_spherical_spline_basis` recomputes its
+///     transform from the centers on every rebuild, so a parametric transform
+///     composed in here would be silently dropped at predict time. Fixing it
+///     needs a frozen-transform field on the sphere spec (tracked separately).
+///   - **PCA**: its `with_identifiability_transform` arm rejects a post-hoc
+///     transform (the constraint lives inside the orthonormal loadings), and its
+///     constant content is governed by the `centered` flag, not a residualizable
+///     design.
 ///
 /// `FrozenTransform` bases are excluded: a transform frozen by *this* pipeline
 /// already has the parametric orthogonalization composed in (see
