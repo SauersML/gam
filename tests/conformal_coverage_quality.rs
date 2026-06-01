@@ -26,8 +26,8 @@ use gam::estimate::{FitOptions, fit_gam};
 use gam::inference::predict::interval_policy::ResponseBounds;
 use gam::matrix::DesignMatrix;
 use gam::predict::{
-    ConformalTrainingData, PredictInput, PredictUncertaintyOptions, PredictableModel,
-    StandardPredictor, predict_full_uncertainty_conformal,
+    ConformalTrainingData, PredictInput, PredictUncertaintyOptions, StandardPredictor,
+    predict_full_uncertainty_conformal,
 };
 use gam::smooth::BlockwisePenalty;
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
