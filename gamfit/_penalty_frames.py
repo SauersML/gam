@@ -83,7 +83,7 @@ def jax_penalty_value_grad(wrapper: Any, t: Any) -> tuple[Any, Any]:
     wrapper-specific piece is the host callback that runs the Rust
     ``analytic_penalty_value_grad`` kernel for this dataclass wrapper.
     """
-    from ._penalty_jax_vjp import jax_value_grad_from_rust
+    from ._penalty_bridge import jax_value_grad_from_rust
 
     shape = tuple(int(s) for s in t.shape)
 

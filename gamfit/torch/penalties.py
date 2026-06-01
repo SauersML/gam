@@ -13,6 +13,16 @@ from torch import nn
 from torch.optim import Optimizer
 
 from .._binding import rust_module
+from .._penalty_bridge import (
+    GumbelTemperatureSchedule,
+    ard_descriptor,
+    block_orthogonality_descriptor,
+    call_rust_value_grad as _call_rust_value_grad,
+    ibp_assignment_descriptor,
+    latent_json as _latent_json,
+    mechanism_sparsity_descriptor,
+    penalty_json as _penalty_json,
+)
 from .._select_topology import TopologyAutoSelector
 from ._coerce import from_numpy_like, to_numpy_f64
 
@@ -34,64 +44,12 @@ def _check_matrix(value: torch.Tensor, name: str) -> torch.Tensor:
     return value
 
 
-def _latent_json(n: int, d: int, *, name: str = "t") -> str:
-    return json.dumps({name: {"name": name, "n": int(n), "d": int(d)}})
-
-
-def _fixed_weight_schedule(weight: float) -> dict[str, Any] | None:
-    if float(weight) == 1.0:
-        return None
-    return {
-        "w_start": float(weight),
-        "w_end": float(weight),
-        "kind": "linear",
-        "steps": 1,
-        "iter_count": 1,
-    }
-
-
-def _penalty_json(descriptor: dict[str, Any]) -> str:
-    return json.dumps([descriptor])
-
-
 def _rho_tensor(rho: torch.Tensor | None, ref: torch.Tensor, count: int) -> torch.Tensor:
     if rho is None:
         return torch.zeros(count, dtype=ref.dtype, device=ref.device)
     if rho.numel() != count:
         raise ValueError(f"rho length {rho.numel()} does not match expected {count}")
     return rho.reshape(-1).to(device=ref.device, dtype=ref.dtype)
-
-
-def _as_flat_target(target: torch.Tensor) -> torch.Tensor:
-    return target.contiguous().reshape(-1)
-
-
-def _call_rust_value_grad(
-    target: torch.Tensor,
-    rho: torch.Tensor,
-    latents_json: str,
-    penalties_json: str,
-    *,
-    isometry_jacobian: torch.Tensor | None = None,
-    isometry_jacobian_second: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    kwargs = {}
-    if isometry_jacobian is not None:
-        kwargs["isometry_jacobian"] = to_numpy_f64(isometry_jacobian)
-    if isometry_jacobian_second is not None:
-        kwargs["isometry_jacobian_second"] = to_numpy_f64(isometry_jacobian_second)
-    value, grad, grad_rho, grad_jac = rust_module().analytic_penalty_value_grad(
-        latents_json,
-        penalties_json,
-        to_numpy_f64(_as_flat_target(target)),
-        to_numpy_f64(rho.reshape(-1)),
-        **kwargs,
-    )
-    value_t = torch.as_tensor(value, dtype=target.dtype, device=target.device)
-    grad_t = from_numpy_like(grad, target).reshape_as(target)
-    grad_rho_t = from_numpy_like(grad_rho, rho).reshape_as(rho)
-    grad_jac_t = None if grad_jac is None else from_numpy_like(grad_jac, target)
-    return value_t, grad_t, grad_rho_t, grad_jac_t
 
 
 class _RustPenaltyFn(torch.autograd.Function):
@@ -344,10 +302,7 @@ class ARDPenalty(_RustPenaltyModule):
     ) -> _PenaltyCall:
         del basis
         latent = _check_matrix(primary, "latent")
-        descriptor: dict[str, Any] = {"kind": "ard", "target": self.target}
-        schedule = _fixed_weight_schedule(self.weight)
-        if schedule is not None:
-            descriptor["weight_schedule"] = schedule
+        descriptor = ard_descriptor(self.target, self.weight)
         return _PenaltyCall(
             target=latent,
             rho=self._rho(latent),
@@ -374,14 +329,13 @@ class BlockOrthogonalityPenalty(_RustPenaltyModule):
     ) -> _PenaltyCall:
         del basis
         latent = _check_matrix(primary, "latent")
-        descriptor = {
-            "kind": "block_orthogonality",
-            "target": self.target,
-            "groups": self.groups,
-            "weight": self.weight,
-            "n_eff": int(self.n_eff or latent.shape[0]),
-            "learnable": self.learnable,
-        }
+        descriptor = block_orthogonality_descriptor(
+            self.target,
+            self.groups,
+            self.weight,
+            int(self.n_eff or latent.shape[0]),
+            learnable=self.learnable,
+        )
         rho = _rho_tensor(getattr(self, "log_weight", None), latent, 1 if self.learnable else 0)
         return _PenaltyCall(
             target=latent,
@@ -467,15 +421,14 @@ class MechanismSparsityPenalty(_RustPenaltyModule):
     ) -> _PenaltyCall:
         del basis
         weights = _check_matrix(primary, "weights")
-        descriptor = {
-            "kind": "mechanism_sparsity",
-            "target": self.target,
-            "feature_groups": self.feature_groups,
-            "weight": self.weight,
-            "smoothing_eps": self.smoothing_eps,
-            "n_eff": self.n_eff,
-            "learnable": self.learnable,
-        }
+        descriptor = mechanism_sparsity_descriptor(
+            self.target,
+            self.feature_groups,
+            self.weight,
+            self.smoothing_eps,
+            self.n_eff,
+            learnable=self.learnable,
+        )
         rho = _rho_tensor(getattr(self, "log_weight", None), weights, 1 if self.learnable else 0)
         return _PenaltyCall(
             target=weights,
@@ -507,14 +460,13 @@ class IBPAssignmentPenalty(_RustPenaltyModule):
         logits = _check_matrix(primary, "logits")
         if logits.shape[1] != self.k_max:
             raise ValueError("logits width must equal k_max")
-        descriptor = {
-            "kind": "ibp_assignment",
-            "target": self.target,
-            "k_max": self.k_max,
-            "alpha": self.alpha,
-            "tau": self.tau,
-            "learnable": self.learnable,
-        }
+        descriptor = ibp_assignment_descriptor(
+            self.target,
+            self.k_max,
+            self.alpha,
+            self.tau,
+            learnable=self.learnable,
+        )
         rho = _rho_tensor(getattr(self, "log_alpha", None), logits, 1 if self.learnable else 0)
         return _PenaltyCall(
             target=logits,
@@ -727,45 +679,6 @@ def ibp_map(logits: torch.Tensor, temperature: float, alpha: float) -> torch.Ten
         raise TypeError("ibp_map logits must be a torch.Tensor")
     apply = cast(Callable[..., torch.Tensor], _IBPMapFn.apply)
     return apply(logits, float(temperature), float(alpha))
-
-
-class GumbelTemperatureSchedule:
-    """Deterministic Gumbel temperature schedule descriptor."""
-
-    def __init__(self, tau_start: float, tau_min: float, decay: str = "geometric", *, rate: float = 0.95, steps: int = 100) -> None:
-        self.tau_start = float(tau_start)
-        self.tau_min = float(tau_min)
-        self.decay = str(decay)
-        self.rate = float(rate)
-        self.steps = int(steps)
-        self.iter_count = 0
-
-    def step(self) -> float:
-        self.iter_count += 1
-        return self.current_tau()
-
-    def current_tau(self) -> float:
-        """Temperature at the current iteration, evaluated by the Rust
-        :class:`gam.terms.sae_manifold.GumbelTemperatureSchedule` so the decay
-        arithmetic lives in exactly one place."""
-        return float(
-            rust_module().gumbel_schedule_tau(
-                self.to_rust_descriptor(), int(self.iter_count)
-            )
-        )
-
-    def to_rust_descriptor(self) -> dict[str, Any]:
-        payload = {
-            "tau_start": self.tau_start,
-            "tau_min": self.tau_min,
-            "decay": self.decay,
-            "iter_count": self.iter_count,
-        }
-        if self.decay in {"geometric", "exponential"}:
-            payload["rate"] = self.rate
-        if self.decay == "linear":
-            payload["steps"] = self.steps
-        return payload
 
 
 class RiemannianRetraction(Optimizer):

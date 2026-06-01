@@ -19,33 +19,19 @@ into a :class:`CompositePenalty`.
 from __future__ import annotations
 
 import json
-import math
 from typing import Any
 
 import numpy as np
 
-from ._binding import rust_module as _rust_module
+from ._penalty_bridge import (
+    ard_descriptor,
+    block_orthogonality_descriptor,
+    call_hvp as _call_hvp,
+    call_value_grad as _call_value_grad,
+    ibp_assignment_descriptor,
+    mechanism_sparsity_descriptor,
+)
 from ._protocol import PenaltyDescriptor, _require_torch
-
-
-def _latent_json(n: int, d: int, *, name: str = "t") -> str:
-    return json.dumps({name: {"name": name, "n": int(n), "d": int(d)}})
-
-
-def _fixed_weight_schedule(weight: float) -> dict[str, Any] | None:
-    if float(weight) == 1.0:
-        return None
-    return {
-        "w_start": float(weight),
-        "w_end": float(weight),
-        "kind": "linear",
-        "steps": 1,
-        "iter_count": 1,
-    }
-
-
-def _penalty_json(descriptor: dict[str, Any]) -> str:
-    return json.dumps([descriptor])
 
 
 def _to_numpy_f64(t: Any) -> np.ndarray:
@@ -54,30 +40,6 @@ def _to_numpy_f64(t: Any) -> np.ndarray:
         return t.detach().cpu().to(torch.float64).contiguous().numpy().reshape(-1).astype(np.float64, copy=False)
     arr = np.ascontiguousarray(np.asarray(t, dtype=np.float64))
     return arr.reshape(-1)
-
-
-def _call_value_grad(
-    t_flat: np.ndarray, n: int, d: int, target_name: str, descriptor: dict[str, Any]
-) -> tuple[float, np.ndarray, np.ndarray]:
-    # rho=None lets the FFI fill a default zero rho sized to the registry's
-    # total_rho_count. These wrappers never manage rho themselves.
-    latents_json = _latent_json(n, d, name=target_name)
-    penalties_json = _penalty_json(descriptor)
-    value, grad, grad_rho, _ = _rust_module().analytic_penalty_value_grad(
-        latents_json, penalties_json, t_flat, None,
-    )
-    return float(value), np.asarray(grad, dtype=np.float64), np.asarray(grad_rho, dtype=np.float64)
-
-
-def _call_hvp(
-    t_flat: np.ndarray, v_flat: np.ndarray, n: int, d: int, target_name: str, descriptor: dict[str, Any]
-) -> np.ndarray:
-    latents_json = _latent_json(n, d, name=target_name)
-    penalties_json = _penalty_json(descriptor)
-    out = _rust_module().analytic_penalty_hvp(
-        latents_json, penalties_json, t_flat, v_flat, None,
-    )
-    return np.asarray(out, dtype=np.float64)
 
 
 def _infer_shape(t: Any) -> tuple[int, int]:
@@ -273,7 +235,7 @@ def _jax_value_grad_via_rust(descriptor_obj: Any, t: Any) -> tuple[Any, Any]:
     descriptor-specific piece is the host callback that runs
     ``analytic_penalty_value_grad`` for this descriptor's JSON.
     """
-    from ._penalty_jax_vjp import jax_value_grad_from_rust
+    from ._penalty_bridge import jax_value_grad_from_rust
 
     shape = tuple(int(s) for s in t.shape)
     n, d = _infer_shape(np.asarray(t, dtype=np.float64))
@@ -307,11 +269,7 @@ class ARDPenalty(_RustPenaltyDescriptor):
         self.target_name = str(target)
 
     def _descriptor(self, n: int, d: int) -> dict[str, Any]:
-        desc: dict[str, Any] = {"kind": "ard", "target": self.target_name}
-        sched = _fixed_weight_schedule(self.weight)
-        if sched is not None:
-            desc["weight_schedule"] = sched
-        return desc
+        return ard_descriptor(self.target_name, self.weight)
 
     def __repr__(self) -> str:
         return f"ARDPenalty(weight={self.weight})"
@@ -332,14 +290,9 @@ class IBPPenalty(_RustPenaltyDescriptor):
 
     def _descriptor(self, n: int, d: int) -> dict[str, Any]:
         k_max = self.k_max if self.k_max is not None else d
-        return {
-            "kind": "ibp_assignment",
-            "target": self.target_name,
-            "k_max": int(k_max),
-            "alpha": self.alpha,
-            "tau": self.tau,
-            "learnable": False,
-        }
+        return ibp_assignment_descriptor(
+            self.target_name, int(k_max), self.alpha, self.tau
+        )
 
     def __repr__(self) -> str:
         return f"IBPPenalty(alpha={self.alpha}, tau={self.tau})"
@@ -364,14 +317,9 @@ class BlockOrthogonalityDescriptor(_RustPenaltyDescriptor):
         self.target_name = str(target)
 
     def _descriptor(self, n: int, d: int) -> dict[str, Any]:
-        return {
-            "kind": "block_orthogonality",
-            "target": self.target_name,
-            "groups": self.groups,
-            "weight": self.weight,
-            "n_eff": int(self.n_eff or n),
-            "learnable": False,
-        }
+        return block_orthogonality_descriptor(
+            self.target_name, self.groups, self.weight, int(self.n_eff or n)
+        )
 
 
 class MechanismSparsityDescriptor(_RustPenaltyDescriptor):
@@ -395,15 +343,13 @@ class MechanismSparsityDescriptor(_RustPenaltyDescriptor):
         self.target_name = str(target)
 
     def _descriptor(self, n: int, d: int) -> dict[str, Any]:
-        return {
-            "kind": "mechanism_sparsity",
-            "target": self.target_name,
-            "feature_groups": self.feature_groups,
-            "weight": self.weight,
-            "smoothing_eps": self.smoothing_eps,
-            "n_eff": float(self.n_eff if self.n_eff is not None else n),
-            "learnable": False,
-        }
+        return mechanism_sparsity_descriptor(
+            self.target_name,
+            self.feature_groups,
+            self.weight,
+            self.smoothing_eps,
+            float(self.n_eff if self.n_eff is not None else n),
+        )
 
 
 __all__ = [

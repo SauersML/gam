@@ -1535,6 +1535,205 @@ pub fn outer_row_weights_by_index(
     }
 }
 
+/// Shared monotonicity line-search safeguard for time-block linear inequality
+/// constraints `A·beta >= b`.
+///
+/// Both survival families (location-scale and marginal-slope) clamp a Newton
+/// step `beta + alpha·delta` to the largest feasible fraction `alpha ∈ [0, 1]`
+/// such that no constraint row is driven below its bound, then back off by the
+/// fixed `0.995` safeguard whenever the boundary is reached. The slack/drift
+/// arithmetic and the `0.995` factor live here once; each family supplies only
+/// its own error type by mapping the dimension-mismatch and constraint-violation
+/// conditions into `E` via the two closures (preserving family-specific message
+/// text and error variants).
+///
+/// `map_dim_err` is called with `(beta_len, delta_len, expected_ncols)` when the
+/// step dimensions disagree with the constraint matrix. `map_violation_err` is
+/// called with `(row, slack)` when the current `beta` already violates a
+/// constraint row (slack below `-1e-10`).
+pub fn feasible_step_fraction<E>(
+    constraints: &crate::solver::active_set::LinearInequalityConstraints,
+    beta: &Array1<f64>,
+    direction: &Array1<f64>,
+    map_dim_err: impl Fn(usize, usize, usize) -> E,
+    map_violation_err: impl Fn(usize, f64) -> E,
+) -> Result<f64, E> {
+    if beta.len() != constraints.a.ncols() || direction.len() != constraints.a.ncols() {
+        return Err(map_dim_err(
+            beta.len(),
+            direction.len(),
+            constraints.a.ncols(),
+        ));
+    }
+    let mut alpha = 1.0f64;
+    for row in 0..constraints.a.nrows() {
+        let a_row = constraints.a.row(row);
+        let slack = a_row.dot(beta) - constraints.b[row];
+        if slack < -1e-10 {
+            return Err(map_violation_err(row, slack));
+        }
+        let drift = a_row.dot(direction);
+        if drift < 0.0 {
+            alpha = alpha.min((slack / -drift).clamp(0.0, 1.0));
+        }
+    }
+    if alpha >= 1.0 {
+        Ok(1.0)
+    } else {
+        Ok((0.995 * alpha).clamp(0.0, 1.0))
+    }
+}
+
+/// Family-specific ψ-calculus hooks for the shared exact-Newton joint-ψ
+/// workspace.
+///
+/// The two marginal-slope families (Bernoulli marginal-slope and survival
+/// marginal-slope) build an [`ExactNewtonJointPsiWorkspace`] whose four methods
+/// share a single skeleton: a σ-auxiliary (log-σ frailty) dispatch branch on
+/// top of a family-specific non-σ row pass. The skeleton lives once in
+/// [`MarginalSlopeExactNewtonPsiWorkspace`]; each family supplies only the
+/// resolved per-call operations here, holding its own block states, specs,
+/// derivative blocks, cache and outer-subsample options internally.
+///
+/// Implementors own all workspace state, so every hook takes only the ψ index /
+/// pair / direction. The two genuine per-family policy differences in the
+/// second-order σ-aux branch are encoded as
+/// [`both_sigma_aux_second_order`](Self::both_sigma_aux_second_order) (which
+/// pure-σ pairs are admissible) and
+/// [`mixed_sigma_aux_second_order`](Self::mixed_sigma_aux_second_order) (how a
+/// mixed σ / non-σ pair is handled) rather than being harmonized away.
+pub trait MarginalSlopePsiFamily: Send + Sync {
+    /// True when ψ index `psi_index` addresses the log-σ frailty auxiliary
+    /// parameter rather than a spatial / spline derivative axis.
+    fn is_sigma_aux(&self, psi_index: usize) -> bool;
+
+    /// First-order joint-ψ terms for the σ-auxiliary parameter.
+    fn sigma_first_order_terms(
+        &self,
+    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String>;
+
+    /// First-order joint-ψ terms for a non-σ derivative axis `psi_index`.
+    fn psi_first_order_terms(
+        &self,
+        psi_index: usize,
+    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String>;
+
+    /// Batched first-order joint-ψ terms over all derivative axes (used by the
+    /// outer score sweep). Returns `Ok(None)` when the batched fast path is
+    /// unavailable for the current configuration so the caller falls back to
+    /// per-axis evaluation.
+    fn psi_first_order_terms_all(
+        &self,
+    ) -> Result<Option<Vec<crate::custom_family::ExactNewtonJointPsiTerms>>, String>;
+
+    /// Whether the σ-aux second-order branch should treat `(psi_i, psi_j)` as a
+    /// pure-σ pair (dispatching to [`sigma_second_order_terms`](Self::sigma_second_order_terms)).
+    /// Any σ-touching pair that is not pure-σ routes through
+    /// [`mixed_sigma_aux_second_order`](Self::mixed_sigma_aux_second_order).
+    fn both_sigma_aux_second_order(&self, psi_i: usize, psi_j: usize) -> bool;
+
+    /// Second-order joint-ψ terms for a pure σ / σ pair.
+    fn sigma_second_order_terms(
+        &self,
+    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String>;
+
+    /// Per-family policy for a mixed σ / non-σ second-order pair: one family
+    /// rejects it (no cross auxiliary terms available), the other returns
+    /// `Ok(None)`.
+    fn mixed_sigma_aux_second_order(
+        &self,
+    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String>;
+
+    /// Second-order joint-ψ terms for a non-σ derivative-axis pair.
+    fn psi_second_order_terms(
+        &self,
+        psi_i: usize,
+        psi_j: usize,
+    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String>;
+
+    /// Hessian directional derivative for the σ-auxiliary parameter, returned
+    /// as a dense matrix (the generic wraps it into
+    /// [`DriftDerivResult::Dense`](crate::solver::estimate::reml::unified::DriftDerivResult::Dense)).
+    fn sigma_hessian_directional_derivative(
+        &self,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String>;
+
+    /// Hessian directional derivative for a non-σ derivative axis, returned as
+    /// a hyper-operator (the generic wraps it into
+    /// [`DriftDerivResult::Operator`](crate::solver::estimate::reml::unified::DriftDerivResult::Operator)).
+    fn psi_hessian_directional_derivative(
+        &self,
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>;
+}
+
+/// Generic exact-Newton joint-ψ workspace shared by the marginal-slope
+/// families. Owns the σ-auxiliary dispatch skeleton and delegates every
+/// family-specific operation to its [`MarginalSlopePsiFamily`] impl.
+pub struct MarginalSlopeExactNewtonPsiWorkspace<F: MarginalSlopePsiFamily> {
+    family: F,
+}
+
+impl<F: MarginalSlopePsiFamily> MarginalSlopeExactNewtonPsiWorkspace<F> {
+    pub fn new(family: F) -> Self {
+        Self { family }
+    }
+}
+
+impl<F: MarginalSlopePsiFamily> crate::custom_family::ExactNewtonJointPsiWorkspace
+    for MarginalSlopeExactNewtonPsiWorkspace<F>
+{
+    fn first_order_terms(
+        &self,
+        psi_index: usize,
+    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiTerms>, String> {
+        if self.family.is_sigma_aux(psi_index) {
+            return self.family.sigma_first_order_terms();
+        }
+        self.family.psi_first_order_terms(psi_index)
+    }
+
+    fn first_order_terms_all(
+        &self,
+    ) -> Result<Option<Vec<crate::custom_family::ExactNewtonJointPsiTerms>>, String> {
+        self.family.psi_first_order_terms_all()
+    }
+
+    fn second_order_terms(
+        &self,
+        psi_i: usize,
+        psi_j: usize,
+    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String> {
+        if self.family.is_sigma_aux(psi_i) || self.family.is_sigma_aux(psi_j) {
+            if self.family.both_sigma_aux_second_order(psi_i, psi_j) {
+                return self.family.sigma_second_order_terms();
+            }
+            return self.family.mixed_sigma_aux_second_order();
+        }
+        self.family.psi_second_order_terms(psi_i, psi_j)
+    }
+
+    fn hessian_directional_derivative(
+        &self,
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<crate::solver::estimate::reml::unified::DriftDerivResult>, String> {
+        if self.family.is_sigma_aux(psi_index) {
+            return self
+                .family
+                .sigma_hessian_directional_derivative(d_beta_flat)
+                .map(|result| {
+                    result.map(crate::solver::estimate::reml::unified::DriftDerivResult::Dense)
+                });
+        }
+        self.family
+            .psi_hessian_directional_derivative(psi_index, d_beta_flat)
+            .map(|result| result.map(crate::solver::estimate::reml::unified::DriftDerivResult::Operator))
+    }
+}
+
 /// Deterministic-order parallel reduction over a row-index slice.
 ///
 /// Splits `rows` into a fixed number of contiguous chunks
