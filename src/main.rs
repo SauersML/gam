@@ -11600,6 +11600,25 @@ mod tests {
     }
 
     #[test]
+    fn classify_cli_errorspecializes_duchon_power_too_low() {
+        // A Duchon admissibility error mentions "dimension=N" literally; ensure
+        // it is NOT misclassified as a data-shape mismatch and that the advice
+        // points at raising the power.
+        let err = classify_cli_error(
+            "transformation-normal fit failed: Underlying basis function generation failed: \
+             Invalid input: Duchon collision derivative phi^(2) psi triplet requires \
+             2*(p+s) > dimension+2; got 2*(p+s)=18, dimension=16, p=1, s=8. \
+             The exact two-block / transformation-normal path needs analytic length-scale \
+             derivatives of the kernel, which are finite only for a smoother spline: \
+             raise power to >= 9 (or reduce the joint smooth's dimension)."
+                .to_string(),
+        );
+        let advice = err.advice().expect("duchon advice");
+        assert!(advice.contains("power"));
+        assert!(!advice.contains("Shape mismatch detected"));
+    }
+
+    #[test]
     fn classify_cli_errorspecializes_thin_plate_knot_error() {
         let err = classify_cli_error(
             "failed to build term collection design: Invalid input: thin-plate spline requires at least d+1 knots (13), got 12"
