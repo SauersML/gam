@@ -4083,6 +4083,11 @@ pub fn cloglog_ghq_derivatives(
     let inv_sqrt_pi = 1.0 / std::f64::consts::PI.sqrt();
 
     // When sigma is negligibly small, evaluate directly at mu.
+    //
+    // From ∂^a_μ ∂^b_σ L = E[Z^b] g^{(a+b)}(μ) at σ = 0, only the moments
+    // E[Z^0]=1, E[Z^2]=1, E[Z^4]=3 survive (all odd moments vanish). So even
+    // sigma-derivatives are NOT zero: L_σσ = g'', L_μσσ = g''', L_μμσσ = g'''',
+    // and L_σσσσ = 3 g''''.
     if sigma.abs() < 1e-14 {
         let (g, g1, g2, g3, g4) = cloglog_g_derivatives(mu);
         return CLogLogConvolutionDerivatives {
@@ -4091,16 +4096,16 @@ pub fn cloglog_ghq_derivatives(
             l_sigma: 0.0,
             l_mumu: g2,
             l_musigma: 0.0,
-            l_sigmasigma: 0.0,
+            l_sigmasigma: g2,
             l_mumumu: g3,
             l_mumusigma: 0.0,
-            l_musigmasigma: 0.0,
+            l_musigmasigma: g3,
             l_sigmasigmasigma: 0.0,
             l_mumumumu: g4,
             l_mumumusigma: 0.0,
-            l_mumusigmasigma: 0.0,
+            l_mumusigmasigma: g4,
             l_musigmasigmasigma: 0.0,
-            l_sigmasigmasigmasigma: 0.0,
+            l_sigmasigmasigmasigma: 3.0 * g4,
         };
     }
 
@@ -5454,12 +5459,24 @@ mod tests {
         let (g, g1, g2, g3, g4) = cloglog_g_derivatives(mu);
         assert_relative_eq!(d.l, g, epsilon = 1e-14);
         assert_relative_eq!(d.l_mu, g1, epsilon = 1e-14);
-        assert_eq!(d.l_sigma, 0.0);
         assert_relative_eq!(d.l_mumu, g2, epsilon = 1e-14);
-        assert_eq!(d.l_musigma, 0.0);
-        assert_eq!(d.l_sigmasigma, 0.0);
         assert_relative_eq!(d.l_mumumu, g3, epsilon = 1e-14);
         assert_relative_eq!(d.l_mumumumu, g4, epsilon = 1e-14);
+
+        // Odd sigma-derivatives vanish at sigma=0 (odd Gaussian moments are 0).
+        assert_eq!(d.l_sigma, 0.0);
+        assert_eq!(d.l_musigma, 0.0);
+        assert_eq!(d.l_mumusigma, 0.0);
+        assert_eq!(d.l_mumumusigma, 0.0);
+        assert_eq!(d.l_sigmasigmasigma, 0.0);
+        assert_eq!(d.l_musigmasigmasigma, 0.0);
+
+        // Even sigma-derivatives carry the surviving moments E[Z^2]=1, E[Z^4]=3:
+        //   L_σσ = g'', L_μσσ = g''', L_μμσσ = g'''', L_σσσσ = 3 g''''.
+        assert_relative_eq!(d.l_sigmasigma, g2, epsilon = 1e-14);
+        assert_relative_eq!(d.l_musigmasigma, g3, epsilon = 1e-14);
+        assert_relative_eq!(d.l_mumusigmasigma, g4, epsilon = 1e-14);
+        assert_relative_eq!(d.l_sigmasigmasigmasigma, 3.0 * g4, epsilon = 1e-14);
     }
 
     #[test]
