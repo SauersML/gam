@@ -227,7 +227,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           for t in "${files[@]}"; do
             i=$((i+1))
-            outcome=""; cause=""; reason=""; rc=0
+            outcome=""; cause=""; reason=""; rc=0; cap=360
             echo "::group::[$i/$N] $t"
             log="$OUT/logs/$t.log"
             # Newest executable binary for this test in target/debug/deps
@@ -242,7 +242,17 @@ jobs:
               # EXECUTE the pre-built binary directly — no cargo, no rebuild.
               # Per-test wall-clock cap bounds a hung fit/R/Python subprocess.
               # 124 = timed out, 137 = SIGKILL after.
-              timeout --kill-after=30 360 "$bin" --nocapture --test-threads=1 > "$log" 2>&1
+              # A few tests are bounded by a correct-but-heavy REFERENCE tool
+              # (INLA grid/SPDE-mesh integration; mgcv full-rank thin-plate
+              # eigendecomposition on ~800 points), not by gam — they get a
+              # larger budget so they finish and report real metrics instead of
+              # a spurious TIMEOUT. gam-side slowness is filed as a perf bug, not
+              # papered over with a bump.
+              cap=360
+              case "$t" in
+                quality_vs_inla_rw2_spde_penalized_baseline|quality_vs_mgcv_quakes_spatial_smooth) cap=900 ;;
+              esac
+              timeout --kill-after=30 "$cap" "$bin" --nocapture --test-threads=1 > "$log" 2>&1
               rc=$?
             fi
             dur=$((SECONDS-start))
@@ -266,7 +276,7 @@ jobs:
             elif [ "$rc" -eq 0 ]; then
               outcome=PASS; cause=ok; reason=""; pass=$((pass+1))
             elif [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
-              outcome=TIMEOUT; cause=timeout; reason="exceeded 360s wall-clock"; tmo=$((tmo+1))
+              outcome=TIMEOUT; cause=timeout; reason="exceeded ${cap}s wall-clock"; tmo=$((tmo+1))
             elif [ -n "$refmarker" ]; then
               outcome=REF_ERROR; cause=reference_tool; reason="$refmarker"; referr=$((referr+1))
             elif printf '%s' "$panicmsg" | grep -qaE 'src/test_support/reference\.rs|No such file or directory|rows, expected|reference column'; then
