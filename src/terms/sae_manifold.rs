@@ -10,7 +10,8 @@
 //!
 //! * beta: [`SaeManifoldAtom::decoder_coefficients`] (`B_k`, one block per atom).
 //! * ext-coords: [`SaeAssignment`] (`logits -> a_ik` and per-atom
-//!   `LatentCoordValues`). Per-row latent coordinates are written `t`; existing
+//!   `LatentCoordValues`). Softmax uses the identifiable reference-logit chart
+//!   with `K - 1` free assignment coordinates (`0` for `K = 1`). Per-row latent coordinates are written `t`; existing
 //!   kernel-shape state remains with carriers such as `SpatialLogKappaCoords`.
 //! * rho: [`SaeManifoldRho`] (`lambda_sparse`, `lambda_smooth`, `alpha_kj`) plus
 //!   the discrete `K` selected by the Python `compare_models` wrapper.
@@ -18,8 +19,8 @@
 //! The per-row local block is exactly the audit-revised shape:
 //!
 //! ```text
-//! ext_i = (logits_i[0..K], t_i0[0..d_0], ..., t_iK[0..d_K])
-//! dim(ext_i) = K + sum_k d_k
+//! ext_i = (assignment chart_i, t_i0[0..d_0], ..., t_iK[0..d_K])
+//! dim(ext_i) = assignment_dim + sum_k d_k
 //! ```
 //!
 //! [`SaeManifoldTerm::assemble_arrow_schur`] materializes the Gauss-Newton
@@ -56,28 +57,6 @@ use faer::Side;
 const SAE_MANIFOLD_ARMIJO_C1: f64 = 1.0e-4;
 const SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS: usize = 12;
 
-/// Fixed precision of the proper Gaussian identifiability prior on the
-/// assignment logits, `½·κ·‖logit_row‖²` per observation row.
-///
-/// The softmax assignment is shift-invariant per row (adding a constant to
-/// every logit leaves `a = softmax(logit)` unchanged), so the logit
-/// Gauss-Newton curvature along the all-ones direction is *exactly* zero for
-/// every `K`: with the JVP `∂a_k/∂l_j = a_k(δ_kj − a_j)/τ`, the shift
-/// direction gives `Σ_j ∂a_k/∂l_j = a_k(1 − Σ_j a_j)/τ = 0`. For the
-/// single-atom `K=1` case the whole logit block is structurally zero. The
-/// assignment-sparsity prior (`assignment_hdiag`) does not in general cover
-/// that null direction. Left unregularised, the per-row latent Hessian
-/// `H_tt` is rank-deficient, so the REML/Laplace evidence `½log|H|` and the
-/// undamped selected-inverse traces are ill-defined at `ridge_t = 0`.
-///
-/// This κ is a *proper* prior (it enters the loss, gradient, and Hessian
-/// diagonal consistently), not a solver jitter: it pins the otherwise-flat
-/// logit gauge to 0, exactly as `mgcv` ridges an unpenalised smooth null
-/// space. It is a fixed model constant — independent of ρ — so it shifts the
-/// evidence by a ρ-independent amount and does not bias ρ-optimisation, while
-/// making `H_tt` positive-definite by construction so the exact undamped
-/// `arrow_log_det_from_cache` evidence and the IFT/EFS traces are well-posed.
-const SAE_LOGIT_IDENTIFIABILITY_PRECISION: f64 = 1.0e-4;
 
 /// Decay law for deterministic Gumbel/concrete assignment temperature.
 #[derive(Debug, Clone)]
@@ -1767,9 +1746,13 @@ impl AssignmentMode {
 
 /// Per-row latent assignment state.
 ///
-/// The free assignment parameter is `logits`; non-negative assignments are
+/// The stored assignment parameter is `logits`; non-negative assignments are
 /// derived by row-wise softmax, independent IBP-MAP sigmoid active indicators,
-/// or JumpReLU gates. `coords[k]` holds `t_{.,k}` for atom `k`.
+/// or JumpReLU gates. Softmax logits are canonicalized to the reference chart
+/// `logits[K - 1] = 0`, so the row-local Newton coordinates contain only the
+/// first `K - 1` logits (`0` coordinates for `K = 1`). Gate-style modes keep
+/// all `K` logits as identifiable scalar parameters. `coords[k]` holds
+/// `t_{.,k}` for atom `k`.
 #[derive(Debug, Clone)]
 pub struct SaeAssignment {
     pub logits: Array2<f64>,
@@ -1789,7 +1772,7 @@ impl SaeAssignment {
 
     #[must_use = "build error must be handled"]
     pub fn with_mode(
-        logits: Array2<f64>,
+        mut logits: Array2<f64>,
         coords: Vec<LatentCoordValues>,
         mode: AssignmentMode,
     ) -> Result<Self, String> {
@@ -1810,6 +1793,12 @@ impl SaeAssignment {
                 ));
             }
         }
+        for row in 0..n {
+            validate_finite_logits(logits.row(row), row)?;
+        }
+        if matches!(mode, AssignmentMode::Softmax { .. }) {
+            canonicalize_softmax_logits(&mut logits);
+        }
         Ok(Self {
             logits,
             coords,
@@ -1829,13 +1818,20 @@ impl SaeAssignment {
         self.coords.iter().map(|c| c.latent_dim()).sum()
     }
 
+    pub fn assignment_coord_dim(&self) -> usize {
+        match self.mode {
+            AssignmentMode::Softmax { .. } => self.k_atoms().saturating_sub(1),
+            AssignmentMode::IBPMap { .. } | AssignmentMode::JumpReLU { .. } => self.k_atoms(),
+        }
+    }
+
     pub fn row_block_dim(&self) -> usize {
-        self.k_atoms() + self.total_coord_dim()
+        self.assignment_coord_dim() + self.total_coord_dim()
     }
 
     pub fn coord_offsets(&self) -> Vec<usize> {
         let mut out = Vec::with_capacity(self.k_atoms());
-        let mut cursor = self.k_atoms();
+        let mut cursor = self.assignment_coord_dim();
         for coord in &self.coords {
             out.push(cursor);
             cursor += coord.latent_dim();
@@ -1894,16 +1890,20 @@ impl SaeAssignment {
     }
 
     /// Flatten extension coordinates in row-major SAE layout:
-    /// `(logits_i[0..K], t_i0[0..d_0], ..., t_iK[0..d_K])` for every row.
+    /// `(assignment chart_i, t_i0[0..d_0], ..., t_iK[0..d_K])` for every row.
+    /// Softmax contributes the first `K - 1` reference logits and omits the
+    /// fixed reference logit; gate-style assignment modes contribute all `K`
+    /// logits.
     pub fn flatten_ext_coords(&self) -> Array1<f64> {
         let n = self.n_obs();
         let q = self.row_block_dim();
         let k = self.k_atoms();
+        let assignment_dim = self.assignment_coord_dim();
         let offsets = self.coord_offsets();
         let mut out = Array1::<f64>::zeros(n * q);
         for row in 0..n {
             let base = row * q;
-            for atom in 0..k {
+            for atom in 0..assignment_dim {
                 out[base + atom] = self.logits[[row, atom]];
             }
             for atom in 0..k {
@@ -2236,7 +2236,7 @@ impl SaeManifoldLoss {
 /// concentrates on a small support) — only a subset of `K` atoms are active
 /// per observation.  The Arrow-Schur row block for observation `i` has dim
 /// `q_active_i = |active_atoms_i| + Σ_{k ∈ active_i} d_k` rather than
-/// `q = K + Σ_k d_k`.  This struct records which atoms are active per row
+/// `q = assignment_dim + Σ_k d_k`.  This struct records which atoms are active per row
 /// and maps compressed block positions back to full-q positions so that
 /// `apply_newton_step` can unpack the compact `delta_t` from the solve.
 ///
@@ -2898,6 +2898,7 @@ impl SaeManifoldTerm {
         let n = self.n_obs();
         let p = self.output_dim();
         let k_atoms = self.k_atoms();
+        let assignment_dim = self.assignment.assignment_coord_dim();
         let q = self.assignment.row_block_dim();
         let beta_dim = self.beta_dim();
         let beta_offsets = self.beta_offsets();
@@ -2951,7 +2952,7 @@ impl SaeManifoldTerm {
         //   * JumpReLU — structural gate (`logit > threshold`); the compact
         //     solve is bit-identical to the dense one (gated atoms carry zero
         //     assignment mass).
-        //   * Softmax / IBP-MAP at large `K` — the dense `(m_total · p)²` data
+        //   * IBP-MAP at large `K` — the dense `(m_total · p)²` data
         //     Gram is infeasible, so each row is truncated to its
         //     top-`k_active` atoms above a relative magnitude cutoff
         //     ([`Self::sparse_active_plan`]). Small-`K` problems return `None`
@@ -2973,7 +2974,8 @@ impl SaeManifoldTerm {
                 coord_dims.clone(),
                 self.assignment.coord_offsets(),
             )),
-            AssignmentMode::Softmax { .. } | AssignmentMode::IBPMap { .. } => {
+            AssignmentMode::Softmax { .. } => None,
+            AssignmentMode::IBPMap { .. } => {
                 match self.sparse_active_plan() {
                     Some((k_active_cap, relative_cutoff)) => {
                         // Build per-row dense assignments once to derive the
@@ -3147,7 +3149,7 @@ impl SaeManifoldTerm {
             } else {
                 // Fresh per-row Jacobian, structurally identical to the
                 // JumpReLU branch: every (q × p) element is unconditionally
-                // overwritten below (logit JVP rows + coordinate rows), so the
+                // overwritten below (assignment-chart JVP rows + coordinate rows), so the
                 // `Array2::zeros` allocation needs no separate `fill(0.0)` and
                 // the populated buffer is returned by move without a clone.
                 let mut jac_row = Array2::<f64>::zeros((q, p));
@@ -3203,9 +3205,10 @@ impl SaeManifoldTerm {
                     block.htt[[j, j]] += assignment_hdiag[assignment_base + k];
                 }
             } else {
-                for atom_idx in 0..k_atoms {
-                    block.gt[atom_idx] += assignment_grad[assignment_base + atom_idx];
-                    block.htt[[atom_idx, atom_idx]] += assignment_hdiag[assignment_base + atom_idx];
+                for free_idx in 0..assignment_dim {
+                    block.gt[free_idx] += assignment_grad[assignment_base + free_idx];
+                    block.htt[[free_idx, free_idx]] +=
+                        assignment_hdiag[assignment_base + free_idx];
                 }
             }
 
@@ -3465,7 +3468,12 @@ impl SaeManifoldTerm {
             self.validate_analytic_penalty_registry(registry)
                 .map_err(|err| format!("SaeManifoldTerm::assemble_arrow_schur: {err}"))?;
             beta_penalty_written = self
-                .add_sae_analytic_penalty_contributions(&mut sys, registry, penalty_scale)
+                .add_sae_analytic_penalty_contributions(
+                    &mut sys,
+                    registry,
+                    penalty_scale,
+                    row_layout.as_ref(),
+                )
                 .map_err(|err| format!("SaeManifoldTerm::assemble_arrow_schur: {err}"))?;
         }
         // Wire per-atom β block ranges so the Jacobi preconditioner builds one
@@ -3534,7 +3542,7 @@ impl SaeManifoldTerm {
 
     fn ext_coord_manifold(&self) -> LatentManifold {
         let mut parts = Vec::with_capacity(self.assignment.row_block_dim());
-        for _ in 0..self.k_atoms() {
+        for _ in 0..self.assignment.assignment_coord_dim() {
             parts.push(LatentManifold::Euclidean);
         }
         let mut any_constrained = false;
@@ -3693,10 +3701,10 @@ impl SaeManifoldTerm {
         // Evidence-only factorization: the Newton step (Δt, Δβ) is discarded
         // and only the factor cache is consumed — the exact undamped log-det
         // and the selected-inverse traces. As ρ sweeps to extremes (e.g. a
-        // wide ARD-α sweep), H_tt is genuinely PD but can be ill-conditioned
-        // (κ large); the standard Direct guard rejects that to protect
-        // Newton-step accuracy, but the log-det is exact from diag(L)
-        // regardless of κ and the traces only need the (PD) factor. So
+        // wide ARD-α sweep), H_tt is genuinely PD but can be ill-conditioned;
+        // the standard Direct guard rejects that to protect Newton-step
+        // accuracy, but the log-det is exact from diag(L) regardless of the
+        // condition number and the traces only need the (PD) factor. So
         // tolerate the ill-conditioning rejection here (a genuine non-PD pivot
         // still errors). The cache stays undamped at ridge=0, so
         // `arrow_log_det_from_cache` remains exact.
@@ -3776,8 +3784,8 @@ impl SaeManifoldTerm {
     ///   active list gives its compact coord-block start `coord_starts[i][pos]`;
     ///   inactive atoms contribute 0 (the prior dominates there anyway).
     /// - `None`: dense full-support layout, uniform row dim
-    ///   `q = K + Σ d_k`; atom `k`'s coord block sits at the fixed full-row
-    ///   offset `coord_offsets[k]` after the `K` logit scalars.
+    ///   `q = assignment_dim + Σ d_k`; atom `k`'s coord block sits at the
+    ///   fixed full-row offset `coord_offsets[k]` after the assignment chart.
     ///
     /// This `tr_kj(H⁻¹)` is exactly the posterior-variance term the deleted
     /// `α = n/‖t‖²` rule dropped; the corrected Mackay/Fellner-Schall fixed
@@ -3900,6 +3908,7 @@ impl SaeManifoldTerm {
         sys: &mut ArrowSchurSystem,
         registry: &AnalyticPenaltyRegistry,
         penalty_scale: f64,
+        row_layout: Option<&SaeRowLayout>,
     ) -> Result<bool, ArrowSchurError> {
         let rho_global = Array1::<f64>::zeros(registry.total_rho_count());
         let layout = registry.rho_layout();
@@ -3915,7 +3924,13 @@ impl SaeManifoldTerm {
                         AnalyticPenaltyKind::IBPAssignment(_)
                             | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
                     ) {
-                        self.add_sae_logit_penalty(sys, penalty, logits_flat.view(), rho_local);
+                        self.add_sae_logit_penalty(
+                            sys,
+                            penalty,
+                            logits_flat.view(),
+                            rho_local,
+                            row_layout,
+                        );
                     } else {
                         // Every other Psi-tier penalty here is row-block
                         // supported with a coord-shape that matches each
@@ -4064,13 +4079,21 @@ impl SaeManifoldTerm {
         penalty: &AnalyticPenaltyKind,
         target: ArrayView1<'_, f64>,
         rho_local: ArrayView1<'_, f64>,
+        row_layout: Option<&SaeRowLayout>,
     ) {
         let n = self.n_obs();
         let k = self.k_atoms();
+        let assignment_dim = self.assignment.assignment_coord_dim();
         let grad = penalty.grad_target(target, rho_local);
         for row in 0..n {
-            for atom in 0..k {
-                sys.rows[row].gt[atom] += grad[row * k + atom];
+            if let Some(layout) = row_layout {
+                for (pos, &atom) in layout.active_atoms[row].iter().enumerate() {
+                    sys.rows[row].gt[pos] += grad[row * k + atom];
+                }
+            } else {
+                for free_idx in 0..assignment_dim {
+                    sys.rows[row].gt[free_idx] += grad[row * k + free_idx];
+                }
             }
         }
         // The ArrowSchur `htt` block is the Newton / PIRLS curvature operator and
@@ -4081,8 +4104,14 @@ impl SaeManifoldTerm {
         // Hessian, so this is exact for them.
         if let Some(diag) = penalty.psd_majorizer_diag(target, rho_local) {
             for row in 0..n {
-                for atom in 0..k {
-                    sys.rows[row].htt[[atom, atom]] += diag[row * k + atom];
+                if let Some(layout) = row_layout {
+                    for (pos, &atom) in layout.active_atoms[row].iter().enumerate() {
+                        sys.rows[row].htt[[pos, pos]] += diag[row * k + atom];
+                    }
+                } else {
+                    for free_idx in 0..assignment_dim {
+                        sys.rows[row].htt[[free_idx, free_idx]] += diag[row * k + free_idx];
+                    }
                 }
             }
         }
@@ -4330,6 +4359,7 @@ impl SaeManifoldTerm {
         let n = self.n_obs();
         let q = self.assignment.row_block_dim();
         let k_atoms = self.k_atoms();
+        let assignment_dim = self.assignment.assignment_coord_dim();
         if delta_beta.len() != self.beta_dim() {
             return Err(format!(
                 "SaeManifoldTerm::apply_newton_step: delta_beta length {} != expected {}",
@@ -4369,7 +4399,7 @@ impl SaeManifoldTerm {
             // Apply logits from expanded buffer.
             for row in 0..n {
                 let row_base = row * q;
-                for atom_idx in 0..k_atoms {
+                for atom_idx in 0..assignment_dim {
                     self.assignment.logits[[row, atom_idx]] +=
                         step_size * full_delta[row_base + atom_idx];
                 }
@@ -4403,7 +4433,7 @@ impl SaeManifoldTerm {
             let coord_offsets = self.assignment.coord_offsets();
             for row in 0..n {
                 let row_base = row * q;
-                for atom_idx in 0..k_atoms {
+                for atom_idx in 0..assignment_dim {
                     self.assignment.logits[[row, atom_idx]] +=
                         step_size * delta_ext_coord[row_base + atom_idx];
                 }
@@ -4423,6 +4453,9 @@ impl SaeManifoldTerm {
                     self.atoms[atom_idx].refresh_basis(coords.view())?;
                 }
             }
+        }
+        if matches!(self.assignment.mode, AssignmentMode::Softmax { .. }) {
+            canonicalize_softmax_logits(&mut self.assignment.logits);
         }
 
         let mut beta = self.flatten_beta();
@@ -5501,6 +5534,24 @@ fn validate_finite_logits(logits: ArrayView1<'_, f64>, row: usize) -> Result<(),
     Ok(())
 }
 
+fn canonicalize_softmax_logits(logits: &mut Array2<f64>) {
+    let k = logits.ncols();
+    if k == 0 {
+        return;
+    }
+    if k == 1 {
+        logits.fill(0.0);
+        return;
+    }
+    for row in 0..logits.nrows() {
+        let reference = logits[[row, k - 1]];
+        for col in 0..k - 1 {
+            logits[[row, col]] -= reference;
+        }
+        logits[[row, k - 1]] = 0.0;
+    }
+}
+
 /// Truncated-IBP stick-breaking prior weights `π_k = (α/(α+1))^k` for
 /// k = 0, .., K-1. Under a Beta(α, 1) stick-breaking construction these are
 /// the prior means of the active-set probabilities, so IBP-MAP assignment
@@ -5636,21 +5687,17 @@ fn fill_assignment_logit_jvp_rows(
     ibp_prior: Option<&[f64]>,
     local_jac: &mut Array2<f64>,
 ) {
-    if assignments.len() == 1 {
-        for logit_col in 0..assignments.len() {
-            for out_col in 0..fitted.len() {
-                local_jac[[logit_col, out_col]] = 0.0;
-            }
-        }
-        return;
-    }
-
     match mode {
         AssignmentMode::Softmax { temperature, .. } => {
+            if assignments.len() == 1 {
+                return;
+            }
             // da_k/dl_j = a_k (1[k=j] - a_j) / tau, contracted against
-            // the assignment-weighted fitted row.
+            // the assignment-weighted fitted row. The dense row layout uses
+            // the reference-logit chart, so only columns `0..K-1` are free;
+            // the final reference logit is fixed at zero and has no row.
             let inv_tau = 1.0 / temperature;
-            for logit_col in 0..assignments.len() {
+            for logit_col in 0..assignments.len() - 1 {
                 for out_col in 0..fitted.len() {
                     local_jac[[logit_col, out_col]] = assignments[logit_col]
                         * (decoded[[logit_col, out_col]] - fitted[out_col])
@@ -5713,17 +5760,10 @@ fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifoldRho) -> f
             .expect("assignment logits must be finite");
     }
     let target = flat_logits(assignment.logits.view());
-    // Proper Gaussian identifiability prior ½·κ·‖logit‖² over every logit,
-    // pinning the shift-invariant softmax gauge (and the wholly-flat K=1
-    // logit) so the assembled H_tt is PD. See
-    // `SAE_LOGIT_IDENTIFIABILITY_PRECISION`. Applied for all K and all modes;
-    // it is the only assignment-prior term when `k_atoms() == 1`.
-    let identifiability: f64 =
-        0.5 * SAE_LOGIT_IDENTIFIABILITY_PRECISION * target.iter().map(|&l| l * l).sum::<f64>();
-    if assignment.k_atoms() == 1 {
-        return identifiability;
+    if matches!(assignment.mode, AssignmentMode::Softmax { .. }) && assignment.k_atoms() == 1 {
+        return 0.0;
     }
-    let sparsity_value = match assignment.mode {
+    match assignment.mode {
         AssignmentMode::Softmax {
             temperature,
             sparsity,
@@ -5763,8 +5803,7 @@ fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifoldRho) -> f
             }
             sparsity_strength * acc
         }
-    };
-    sparsity_value + identifiability
+    }
 }
 
 fn assignment_prior_grad_hdiag(
@@ -5775,19 +5814,9 @@ fn assignment_prior_grad_hdiag(
         validate_finite_logits(assignment.logits.row(row), row)?;
     }
     let target = flat_logits(assignment.logits.view());
-    // Proper Gaussian identifiability prior ½·κ·‖logit‖²: gradient `κ·logit`,
-    // Hessian diagonal `κ` on every logit. This pins the shift-invariant
-    // softmax gauge (and the flat K=1 logit) so the per-row H_tt logit block
-    // is PD. See `SAE_LOGIT_IDENTIFIABILITY_PRECISION`. Computed for all K;
-    // the sparsity prior (absent at K=1) is added on top below.
-    let kappa = SAE_LOGIT_IDENTIFIABILITY_PRECISION;
     let mut grad = Array1::<f64>::zeros(target.len());
     let mut diag = Array1::<f64>::zeros(target.len());
-    for idx in 0..target.len() {
-        grad[idx] = kappa * target[idx];
-        diag[idx] = kappa;
-    }
-    if assignment.k_atoms() == 1 {
+    if matches!(assignment.mode, AssignmentMode::Softmax { .. }) && assignment.k_atoms() == 1 {
         return Ok((grad, diag));
     }
     let (sparsity_grad, sparsity_diag) = match assignment.mode {
@@ -7492,9 +7521,9 @@ mod tests {
         assert_eq!(diag.len(), n * k);
         for (idx, &entry) in diag.iter().enumerate() {
             let logit = logits[[idx / k, idx % k]];
-            // Expected = JumpReLU gated majorizer PLUS the fixed logit
-            // identifiability prior κ (added on every logit for all modes so
-            // the per-row H_tt logit block is PD).
+            // Expected = JumpReLU gated majorizer. Softmax identifiability is
+            // handled by its reference-logit chart, not by adding curvature to
+            // gate logits.
             let sparsity = if logit > threshold {
                 let activation = crate::linalg::utils::stable_logistic(logit * inv_tau);
                 let slope = activation * (1.0 - activation);
@@ -7502,11 +7531,11 @@ mod tests {
             } else {
                 0.0
             };
-            let expected = sparsity + SAE_LOGIT_IDENTIFIABILITY_PRECISION;
+            let expected = sparsity;
             assert!(
-                entry.is_finite() && entry >= SAE_LOGIT_IDENTIFIABILITY_PRECISION,
-                "JumpReLU gated hessian_diag majorizer + identifiability prior must be finite and \
-                 ≥ κ at index {idx}; entry={entry}"
+                entry.is_finite() && entry >= 0.0,
+                "JumpReLU gated hessian_diag majorizer must be finite and non-negative at index \
+                 {idx}; entry={entry}"
             );
             assert_abs_diff_eq!(entry, expected, epsilon = 1e-12);
         }

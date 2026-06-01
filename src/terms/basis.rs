@@ -12753,11 +12753,6 @@ pub fn operator_penalty_candidates_closed_form(
     polynomial_block_cols: usize,
     outer_identifiability: Option<&Array2<f64>>,
 ) -> Vec<PenaltyCandidate> {
-    // q=0 mass always uses collocation Gram for symmetry with the pure path
-    // (the closed-form Lebesgue kernel at q=0 is the kernel itself, which is
-    // not generally what the canonical mass penalty represents).
-    let s0_raw = symmetrize(&fast_ata(d0));
-    let (s0, c0) = normalize_penalty(&s0_raw);
     let kappa = 1.0 / length_scale.max(1e-300);
 
     // Per-q Duchon convergence regime: closed-form Lebesgue kernel matrix is
@@ -12777,39 +12772,6 @@ pub fn operator_penalty_candidates_closed_form(
     // rebuilding the dense Gram. Below threshold, dense-only is preserved
     // (Cholesky on the small materialized H is faster).
     let emit_operator = centers.nrows() > CLOSED_FORM_OPERATOR_THRESHOLD;
-
-    let s1_raw = if duchon_closed_form_operator_penalty_converges(1, p_order, s_order as f64, d) {
-        closed_form_operator_penalty_in_total_basis(
-            centers,
-            1,
-            p_order,
-            s_order,
-            kappa,
-            aniso_log_scales,
-            kernel_nullspace,
-            polynomial_block_cols,
-            outer_identifiability,
-        )
-    } else {
-        symmetrize(&fast_ata(d1))
-    };
-    let (s1, c1) = normalize_penalty(&s1_raw);
-    let s2_raw = if duchon_closed_form_operator_penalty_converges(2, p_order, s_order as f64, d) {
-        closed_form_operator_penalty_in_total_basis(
-            centers,
-            2,
-            p_order,
-            s_order,
-            kappa,
-            aniso_log_scales,
-            kernel_nullspace,
-            polynomial_block_cols,
-            outer_identifiability,
-        )
-    } else {
-        symmetrize(&fast_ata(d2))
-    };
-    let (s2, c2) = normalize_penalty(&s2_raw);
 
     let make_op = |q: usize,
                    c: f64|
@@ -12843,10 +12805,14 @@ pub fn operator_penalty_candidates_closed_form(
         Some(scaled)
     };
 
+    // Each order is materialized ONLY when its spec is active, so a disabled
+    // order never touches its `d_q` operand (lets the caller build `D_q` with
+    // `max_op = max active order` and skip the `O(d²)`-row Hessian — the
+    // `D2`-skip). Mass is the *centered* collocation Gram `Σ(f−f̄)²`, identical
+    // to the pure path, so the constant direction is genuinely unpenalized.
     let mut out = Vec::new();
     if matches!(spec.mass, OperatorPenaltySpec::Active { .. }) {
-        // Mass is the collocation Gram; no closed-form operator analog (the
-        // factory takes q∈{1,2} via the closed-form path; q=0 is collocation).
+        let (s0, c0) = normalize_penalty(&symmetrize(&centered_design_gram(d0)));
         out.push(PenaltyCandidate {
             matrix: s0,
             nullspace_dim_hint: 0,
@@ -12857,6 +12823,23 @@ pub fn operator_penalty_candidates_closed_form(
         });
     }
     if matches!(spec.tension, OperatorPenaltySpec::Active { .. }) {
+        let s1_raw = if duchon_closed_form_operator_penalty_converges(1, p_order, s_order as f64, d)
+        {
+            closed_form_operator_penalty_in_total_basis(
+                centers,
+                1,
+                p_order,
+                s_order,
+                kappa,
+                aniso_log_scales,
+                kernel_nullspace,
+                polynomial_block_cols,
+                outer_identifiability,
+            )
+        } else {
+            symmetrize(&fast_ata(d1))
+        };
+        let (s1, c1) = normalize_penalty(&s1_raw);
         let op = make_op(1, c1);
         out.push(PenaltyCandidate {
             matrix: s1,
@@ -12868,6 +12851,23 @@ pub fn operator_penalty_candidates_closed_form(
         });
     }
     if matches!(spec.stiffness, OperatorPenaltySpec::Active { .. }) {
+        let s2_raw = if duchon_closed_form_operator_penalty_converges(2, p_order, s_order as f64, d)
+        {
+            closed_form_operator_penalty_in_total_basis(
+                centers,
+                2,
+                p_order,
+                s_order,
+                kappa,
+                aniso_log_scales,
+                kernel_nullspace,
+                polynomial_block_cols,
+                outer_identifiability,
+            )
+        } else {
+            symmetrize(&fast_ata(d2))
+        };
+        let (s2, c2) = normalize_penalty(&s2_raw);
         let op = make_op(2, c2);
         out.push(PenaltyCandidate {
             matrix: s2,
@@ -12989,9 +12989,6 @@ pub fn operator_penalty_candidates_closed_form_pure(
     // expresses the "springs to a floating flat sheet" semantics — the level
     // is free and only deviations get the spring force — while staying inside
     // the standard quadratic-penalty machinery.
-    let s0_raw = symmetrize(&centered_design_gram(d0));
-    let (s0, c0) = normalize_penalty(&s0_raw);
-
     let d = centers.ncols();
     // Convergence predicate also requires `isotropic_duchon_penalty`'s
     // partial-fraction precondition `2m ≥ q + 1`; without it, closed-form
@@ -13008,39 +13005,17 @@ pub fn operator_penalty_candidates_closed_form_pure(
         duchon_closed_form_operator_penalty_converges(q, p_order, s_order, d)
             && duchon_pure_closed_form_pair_block_cpd_adequate(q, p_order, s_order, d)
     };
-    let s1_raw = if closed_form_ok(1) {
-        closed_form_operator_penalty_in_total_basis_pure(
-            centers,
-            1,
-            p_order,
-            s_order,
-            aniso_log_scales,
-            kernel_nullspace,
-            polynomial_block_cols,
-            outer_identifiability,
-        )
-    } else {
-        symmetrize(&fast_ata(d1))
-    };
-    let (s1, c1) = normalize_penalty(&s1_raw);
-
-    let s2_raw = if closed_form_ok(2) {
-        closed_form_operator_penalty_in_total_basis_pure(
-            centers,
-            2,
-            p_order,
-            s_order,
-            aniso_log_scales,
-            kernel_nullspace,
-            polynomial_block_cols,
-            outer_identifiability,
-        )
-    } else {
-        symmetrize(&fast_ata(d2))
-    };
-    let (s2, c2) = normalize_penalty(&s2_raw);
+    // Each order is materialized ONLY when its spec is active: a disabled order
+    // never touches its `d_q` operand, so the caller can build `D_q` with
+    // `max_op = max active order` and leave the higher-order designs empty (the
+    // `D2`-skip — decisive in high `d`, where the Hessian has `O(d²)` rows).
     let mut out = Vec::new();
     if matches!(spec.mass, OperatorPenaltySpec::Active { .. }) {
+        // q=0 mass is the *centered* collocation Gram — the data-density-weighted
+        // spring penalty on deviations from the function's mean over the
+        // collocation sites; centering puts the constant direction exactly into
+        // the penalty null space (intercept genuinely unpenalized).
+        let (s0, c0) = normalize_penalty(&symmetrize(&centered_design_gram(d0)));
         out.push(PenaltyCandidate {
             matrix: s0,
             nullspace_dim_hint: 0,
@@ -13051,6 +13026,21 @@ pub fn operator_penalty_candidates_closed_form_pure(
         });
     }
     if matches!(spec.tension, OperatorPenaltySpec::Active { .. }) {
+        let s1_raw = if closed_form_ok(1) {
+            closed_form_operator_penalty_in_total_basis_pure(
+                centers,
+                1,
+                p_order,
+                s_order,
+                aniso_log_scales,
+                kernel_nullspace,
+                polynomial_block_cols,
+                outer_identifiability,
+            )
+        } else {
+            symmetrize(&fast_ata(d1))
+        };
+        let (s1, c1) = normalize_penalty(&s1_raw);
         out.push(PenaltyCandidate {
             matrix: s1,
             nullspace_dim_hint: 0,
@@ -13061,6 +13051,21 @@ pub fn operator_penalty_candidates_closed_form_pure(
         });
     }
     if matches!(spec.stiffness, OperatorPenaltySpec::Active { .. }) {
+        let s2_raw = if closed_form_ok(2) {
+            closed_form_operator_penalty_in_total_basis_pure(
+                centers,
+                2,
+                p_order,
+                s_order,
+                aniso_log_scales,
+                kernel_nullspace,
+                polynomial_block_cols,
+                outer_identifiability,
+            )
+        } else {
+            symmetrize(&fast_ata(d2))
+        };
+        let (s2, c2) = normalize_penalty(&s2_raw);
         out.push(PenaltyCandidate {
             matrix: s2,
             nullspace_dim_hint: 0,
@@ -23574,27 +23579,46 @@ const DUCHON_COLLOCATION_OVERSAMPLE: usize = 3;
 /// sample size does not grow with the data). Each is a plain penalty (`op = None`)
 /// with its own REML λ; REML drives an unhelpful one to zero. Stiffness (`D2`) is
 /// absent on purpose — `Primary` is the exact, superior curvature.
-fn duchon_collocation_operator_candidates(
+/// Emit the lower-order Hilbert-scale penalties — mass `Σ(f−f̄)²` (q=0),
+/// tension `Σ‖∇f‖²` (q=1), stiffness `Σ‖∇²f‖²` (q=2) — for a Duchon smooth.
+///
+/// Each active order routes through the shared closed-form factory, which uses
+/// the EXACT continuous reproducing-norm Gram wherever the polyharmonic
+/// integral converges (UV/IR + CPD adequacy — `n`-free, the high-`d` accuracy
+/// and scale win) and falls back to the `D_qᵀ D_q` quadrature otherwise. That
+/// quadrature is collocated on a density-blind, space-filling `O(k)`
+/// farthest-point sample of the DATA SUPPORT (`select_thin_plate_knots(data,
+/// 3k)`) — never the `k` sparse centers (which under-resolve a `k`-bump basis
+/// and made these penalties explode), and never all `n` (which would scale with
+/// the data). The collocation `D_q` is built with `max_op = max active order`,
+/// so a disabled higher order never allocates its `O(d²)`-row Hessian.
+///
+/// The operators use the ISOTROPIC metric (`aniso = None`): the anisotropy
+/// lives entirely in the curvature (`Primary`) RKHS Gram, which carries its own
+/// exact `η`-derivative. Keeping these low-order stabilizers isotropic makes
+/// their `η`-gradient identically zero, so the REML anisotropy optimization
+/// stays consistent without per-axis operator derivatives.
+fn duchon_operator_penalty_candidates(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
     operator_penalties: &DuchonOperatorPenaltySpec,
     length_scale: Option<f64>,
     power: f64,
     nullspace_order: DuchonNullspaceOrder,
-    aniso_log_scales: Option<&[f64]>,
     identifiability_transform: Option<&Array2<f64>>,
     workspace: &mut BasisWorkspace,
 ) -> Result<Vec<PenaltyCandidate>, BasisError> {
     let want_mass = matches!(operator_penalties.mass, OperatorPenaltySpec::Active { .. });
     let want_tension = matches!(operator_penalties.tension, OperatorPenaltySpec::Active { .. });
-    if !want_mass && !want_tension {
+    let want_stiffness = matches!(operator_penalties.stiffness, OperatorPenaltySpec::Active { .. });
+    if !want_mass && !want_tension && !want_stiffness {
         return Ok(Vec::new());
     }
+    let max_op = duchon_max_active_operator_derivative_order(operator_penalties);
     let n_basis = centers.nrows();
     let n = data.nrows();
     let m = (DUCHON_COLLOCATION_OVERSAMPLE * n_basis).min(n);
     let sample = select_thin_plate_knots(data, m)?;
-    // `max_op = 1`: value (D0) + gradient (D1) only; curvature is `Primary`.
     let ops = build_duchon_collocation_operator_matriceswithworkspace(
         centers,
         sample.view(),
@@ -23602,27 +23626,52 @@ fn duchon_collocation_operator_candidates(
         length_scale,
         power,
         nullspace_order,
-        aniso_log_scales,
+        None,
         identifiability_transform.map(|t| t.view()),
-        1,
+        max_op,
         workspace,
     )?;
-    let mut out = Vec::new();
-    if want_mass {
-        out.push(normalize_penalty_candidate(
-            symmetrize(&centered_design_gram(&ops.d0)),
-            0,
-            PenaltySource::OperatorMass,
-        ));
-    }
-    if want_tension {
-        out.push(normalize_penalty_candidate(
-            symmetrize(&fast_ata(&ops.d1)),
-            0,
-            PenaltySource::OperatorTension,
-        ));
-    }
-    Ok(out)
+    let effective = duchon_effective_nullspace_order(centers, nullspace_order);
+    let p_order = duchon_p_from_nullspace_order(effective);
+    let kernel_nullspace = ops.kernel_nullspace_transform.as_ref();
+    let poly_cols = ops.polynomial_block_cols;
+    // The collocation `D_q` already carry the kernel CPD nullspace `Z`, the
+    // polynomial padding, and the identifiability transform (final β-basis), so
+    // the factory's quadrature fallback `fast_ata(d_q)` is β-basis. Its
+    // closed-form branch rebuilds the same β-basis from `centers` via the SAME
+    // `kernel_nullspace` + `poly_cols` + `outer_identifiability`, so both
+    // branches agree. q=0 mass is always the centered quadrature Gram.
+    let candidates = if let Some(length_scale) = length_scale {
+        operator_penalty_candidates_closed_form(
+            centers,
+            &ops.d0,
+            &ops.d1,
+            &ops.d2,
+            operator_penalties,
+            p_order,
+            duchon_power_to_usize(power),
+            length_scale,
+            None,
+            kernel_nullspace,
+            poly_cols,
+            identifiability_transform,
+        )
+    } else {
+        operator_penalty_candidates_closed_form_pure(
+            centers,
+            &ops.d0,
+            &ops.d1,
+            &ops.d2,
+            operator_penalties,
+            p_order,
+            power,
+            None,
+            kernel_nullspace,
+            poly_cols,
+            identifiability_transform,
+        )
+    };
+    Ok(candidates)
 }
 
 pub fn build_duchon_basiswithworkspace(
@@ -23839,14 +23888,13 @@ pub fn build_duchon_basiswithworkspace(
         identifiability_transform.as_ref(),
         poly_cols,
     )?;
-    candidates.extend(duchon_collocation_operator_candidates(
+    candidates.extend(duchon_operator_penalty_candidates(
         data,
         centers.view(),
         &spec.operator_penalties,
         spec.length_scale,
         spec.power,
         effective_nullspace_order,
-        aniso.as_deref(),
         identifiability_transform.as_ref(),
         workspace,
     )?);
