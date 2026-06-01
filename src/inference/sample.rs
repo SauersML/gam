@@ -4,7 +4,9 @@
 //! both call into [`sample_saved_model`], which dispatches on the saved
 //! model's class (standard GLM, standard with link-wiggle, or survival) and
 //! returns a fully-converged [`NutsResult`] over the original coefficient
-//! space.
+//! space. Gaussian identity standard models are sampled from the saved
+//! closed-form posterior, conditioning on the training fit rather than any
+//! prediction rows supplied by the caller.
 
 use std::collections::HashMap;
 
@@ -13,7 +15,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use rand::{RngExt, SeedableRng};
 
 use crate::basis::create_difference_penalty_matrix;
-use crate::estimate::{BlockRole, FitOptions, UnifiedFitResult, fit_gam, validate_all_finite};
+use crate::estimate::{BlockRole, UnifiedFitResult, validate_all_finite};
 use crate::faer_ndarray::FaerCholesky;
 use crate::families::royston_parmar::{self, RoystonParmarInputs};
 use crate::families::survival_predict::{
@@ -174,10 +176,13 @@ const fn chain_stream_seed(seed: u64, chain: usize, stream: u64) -> u64 {
 ///
 /// Dispatches on `model.predict_model_class()`:
 ///
-/// * `Standard`: refits the GAM in flat space, whitens with the saved
-///   Hessian, and runs NUTS over the coefficient vector. Link-wiggle models
-///   take a specialised joint-space path that preserves the basis chain
-///   rule.
+/// * `Standard`: Gaussian identity models use the exact saved
+///   `N(mode, φ·H⁻¹)` posterior, where `mode`, `φ`, and `H` all come from the
+///   training fit. Other standard GLMs run NUTS from the saved mode,
+///   smoothing parameters, dispersion, and whitening curvature rather than
+///   refitting/reselecting them on the caller-supplied rows. Link-wiggle
+///   models take a specialised joint-space path that preserves the basis
+///   chain rule.
 /// * `Survival`: rebuilds the survival design (Royston-Parmar baseline +
 ///   wiggle + covariate blocks) on the supplied data, evaluates the mode,
 ///   and runs the survival-flat NUTS path. Latent and location-scale modes
@@ -369,6 +374,9 @@ fn sample_standard(
     likelihood: LikelihoodSpec,
     cfg: &NutsConfig,
 ) -> Result<NutsResult, String> {
+    if likelihood.is_gaussian_identity() {
+        return laplace_gaussian_fallback(model, cfg, "standard gaussian posterior");
+    }
     if model.has_link_wiggle() {
         return sample_standard_link_wiggle(
             model,
@@ -391,44 +399,23 @@ fn sample_standard(
     let design = build_term_collection_design(data, &spec)
         .map_err(|e| format!("failed to build term collection design: {e}"))?;
     let weights = Array1::ones(data.nrows());
-    let offset = Array1::zeros(data.nrows());
     let dense_design_hmc = design.design.to_dense();
     let p = dense_design_hmc.ncols();
-    let fit = fit_gam(
-        dense_design_hmc.view(),
-        y.view(),
-        weights.view(),
-        offset.view(),
-        &design.penalties,
-        likelihood.clone(),
-        &FitOptions {
-            latent_cloglog: None,
-            mixture_link: None,
-            optimize_mixture: false,
-            sas_link: None,
-            optimize_sas: false,
-            // NUTS whitening (line below) calls
-            // `explicit_fit_hessian_for_whitening`, which reads
-            // `fit.penalized_hessian()` from the inference output. With
-            // `compute_inference: false` the refit returns no inference and
-            // sampling fails with "fit result is missing an explicit
-            // penalized Hessian for HMC/NUTS whitening". The fit IS the
-            // upstream whose curvature we then whiten by, so the inference
-            // path is non-optional here.
-            compute_inference: true,
-            max_iter: 80,
-            tol: 1e-6,
-            nullspace_dims: design.nullspace_dims.clone(),
-            linear_constraints: design.linear_constraints.clone(),
-            firth_bias_reduction: false,
-            adaptive_regularization: None,
-            penalty_shrinkage_floor: Some(1e-6),
-            rho_prior: Default::default(),
-            kronecker_penalty_system: None,
-            kronecker_factored: None,
-        },
-    )
-    .map_err(|e| format!("fit_gam failed during sample refit: {e}"))?;
+    let fit = fit_result_from_saved_model_for_prediction(model)?;
+    if fit.beta.len() != p {
+        return Err(format!(
+            "standard sample: saved model has {} coefficients but rebuilt design has {} columns",
+            fit.beta.len(),
+            p,
+        ));
+    }
+    if fit.lambdas.len() != design.penalties.len() {
+        return Err(format!(
+            "standard sample: saved model has {} lambdas but rebuilt design has {} penalties",
+            fit.lambdas.len(),
+            design.penalties.len(),
+        ));
+    }
     let penalty =
         weighted_blockwise_penalty_sum(&design.penalties, fit.lambdas.as_slice().unwrap(), p);
 
@@ -440,11 +427,11 @@ fn sample_standard(
             weights: weights.view(),
             penalty_matrix: penalty.view(),
             mode: fit.beta.view(),
-            hessian: explicit_fit_hessian_for_whitening(&fit, p, "sample refit")?.view(),
+            hessian: explicit_fit_hessian_for_whitening(&fit, p, "saved standard model")?.view(),
             gamma_shape: fit.likelihood_scale.gamma_shape(),
-            // Forward the fitted dispersion so the NUTS posterior whitens
-            // against `Vb = φ·H⁻¹` for Gaussian / Gamma and stays a
-            // no-op for fixed-scale families.
+            // Forward the saved training dispersion so NUTS whitening uses the
+            // posterior scale selected at fit time; fixed-scale families remain
+            // a no-op.
             dispersion: fit.dispersion().unwrap_or_default(),
             firth_bias_reduction: false,
         }),
