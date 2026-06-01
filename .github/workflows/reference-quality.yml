@@ -137,12 +137,28 @@ jobs:
           set -uo pipefail
           mapfile -t files < <(ls tests/quality_vs_*.rs 2>/dev/null | xargs -n1 basename | sed 's/\.rs$//')
           echo "building ${#files[@]} quality test target(s) in ONE invocation (parallel codegen)"
-          # A single multi---test invocation links all binaries in one cargo run
-          # with parallel codegen — vastly faster than linking each separately in
-          # a loop (which previously dominated wall-clock and risked the timeout).
+          # A single multi---test invocation links all binaries in one cargo run.
+          # CRITICAL: emit the test->binary map (message-format=json) so the run
+          # step can EXECUTE the built binaries DIRECTLY — invoking `cargo test`
+          # per target re-does freshness/link work 141× and blew the timeout.
           args=(); for t in "${files[@]}"; do args+=(--test "$t"); done
-          cargo test --no-run "${args[@]}" 2>&1 | tail -120 \
-            || echo "build reported compile errors; the run step classifies per target"
+          cargo test --no-run --message-format=json "${args[@]}" > /tmp/cargo_build.json 2>/tmp/cargo_build.err \
+            || echo "build reported errors; missing binaries are flagged BUILDFAIL in the run step"
+          tail -40 /tmp/cargo_build.err || true
+          python3 - <<'PY'
+import json
+m = {}
+for line in open("/tmp/cargo_build.json"):
+    try: o = json.loads(line)
+    except Exception: continue
+    if o.get("reason") == "compiler-artifact" and o.get("executable") \
+       and "test" in (o.get("target", {}).get("kind") or []):
+        m[o["target"]["name"]] = o["executable"]
+with open("/tmp/testbins.tsv", "w") as f:
+    for k, v in sorted(m.items()):
+        f.write(f"{k}\t{v}\n")
+print(f"mapped {len(m)} test binaries -> /tmp/testbins.tsv")
+PY
 
       - name: Run quality suite (resilient + streaming; failures tolerated)
         shell: bash
@@ -153,11 +169,13 @@ jobs:
           # the expected, tolerated outcome here; we classify and stream them.
           set +e -u -o pipefail
           mapfile -t files < <(ls tests/quality_vs_*.rs 2>/dev/null | xargs -n1 basename | sed 's/\.rs$//')
-          N=${#files[@]}; i=0; pass=0; fail=0; cerr=0; tmo=0
+          # Load the test->binary map from the build step.
+          declare -A BIN
+          if [ -f /tmp/testbins.tsv ]; then
+            while IFS=$'\t' read -r name path; do BIN["$name"]="$path"; done < /tmp/testbins.tsv
+          fi
+          N=${#files[@]}; i=0; pass=0; fail=0; bf=0; tmo=0
           RES=/tmp/quality_results.tsv; : > "$RES"
-          # Stream the dashboard row-by-row into the step summary so partial
-          # results are visible LIVE and survive even if the job is killed by the
-          # job timeout (the summary file is rendered regardless).
           {
             echo "## Reference quality suite (streaming)"
             echo ""
@@ -167,23 +185,29 @@ jobs:
           for t in "${files[@]}"; do
             i=$((i+1))
             echo "::group::[$i/$N] $t"
-            # Per-test wall-clock cap: a hung fit / R / Python subprocess can no
-            # longer stall the whole job. 124 = timed out, 137 = SIGKILL after.
-            timeout --kill-after=30 360 cargo test --test "$t" -- --nocapture > "/tmp/$t.log" 2>&1
-            rc=$?
-            metric=$(grep -hoaE '(R2|rmse|rel_l2|auc|deviance|nll|crps|acc|logloss|concordance|seam|edf|pearson|coverage|frechet|distance)[^ ,]*[=: ]-?[0-9.eE+]+' "/tmp/$t.log" 2>/dev/null | tr '\n' ' ' | head -c 110)
-            if [ "$rc" -eq 0 ]; then outcome=PASS; pass=$((pass+1))
-            elif [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then outcome=TIMEOUT; tmo=$((tmo+1))
-            elif grep -qaE 'could not compile|^error\[|^error:' "/tmp/$t.log"; then outcome=CERR; cerr=$((cerr+1))
-            else outcome=DIVERGE; fail=$((fail+1)); fi
+            bin="${BIN[$t]:-}"
+            if [ -z "$bin" ] || [ ! -x "$bin" ]; then
+              # No binary => the build step couldn't compile this test.
+              outcome=BUILDFAIL; bf=$((bf+1)); metric=""
+            else
+              # EXECUTE the pre-built binary directly — no cargo, no rebuild.
+              # Per-test wall-clock cap bounds a hung fit/R/Python subprocess.
+              # 124 = timed out, 137 = SIGKILL after.
+              timeout --kill-after=30 360 "$bin" --nocapture --test-threads=1 > "/tmp/$t.log" 2>&1
+              rc=$?
+              metric=$(grep -hoaE '(R2|rmse|rel_l2|auc|deviance|nll|crps|acc|logloss|concordance|seam|edf|pearson|coverage|frechet|distance)[^ ,]*[=: ]-?[0-9.eE+]+' "/tmp/$t.log" 2>/dev/null | tr '\n' ' ' | head -c 110)
+              if [ "$rc" -eq 0 ]; then outcome=PASS; pass=$((pass+1))
+              elif [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then outcome=TIMEOUT; tmo=$((tmo+1))
+              else outcome=DIVERGE; fail=$((fail+1)); fi
+            fi
             printf '%s\t%s\t%s\n' "$outcome" "$t" "$metric" >> "$RES"
             printf '| %d | %s | %s | %s |\n' "$i" "$t" "$outcome" "$metric" >> "$GITHUB_STEP_SUMMARY"
             echo "[$i/$N] $outcome  $t  $metric"
-            tail -20 "/tmp/$t.log"
+            [ -f "/tmp/$t.log" ] && tail -20 "/tmp/$t.log"
             echo "::endgroup::"
           done
-          { echo ""; echo "### Totals"; echo "pass=$pass diverged=$fail timeout=$tmo compile_error=$cerr (of $N)"; } >> "$GITHUB_STEP_SUMMARY"
-          echo "pass=$pass diverged=$fail timeout=$tmo compile_errors=$cerr"
+          { echo ""; echo "### Totals"; echo "pass=$pass diverged=$fail timeout=$tmo build_fail=$bf (of $N)"; } >> "$GITHUB_STEP_SUMMARY"
+          echo "pass=$pass diverged=$fail timeout=$tmo build_fail=$bf"
           # Informational dashboard: divergences/timeouts are honest findings, not
           # pipeline failures.
           exit 0
