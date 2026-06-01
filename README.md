@@ -118,15 +118,21 @@ gamfit.fit(df, "case ~ s(age) + link(type=flexible(probit))"
 Marginal-slope models for binary or survival outcomes with a calibrated
 risk score. The baseline and the score effect are fit in separate
 formulas; the score effect is a smooth function of covariate space.
+Supply a `transformation_normal_stage1=` recipe to condition the score on
+covariates and cross-fit it inside the one call (a Neyman-orthogonal chain
+whose slope surface is insensitive to Stage-1 calibration error); no
+`z_column` is materialised by hand.
 
 ```python
 gamfit.fit(
     df,
     "case ~ matern(pc1, pc2, pc3)",
     family="bernoulli-marginal-slope",
-    link="probit",
-    z_column="pgs_z",
     logslope_formula="matern(pc1, pc2, pc3)",
+    transformation_normal_stage1=gamfit.CtnStage1(
+        response="pgs",
+        covariates="matern(pc1, pc2, pc3)",
+    ),
 )
 ```
 

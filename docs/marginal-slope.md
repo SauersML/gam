@@ -14,16 +14,17 @@ the probit/slope scale and varies smoothly with covariates.
 Two families:
 
 - Bernoulli marginal-slope for binary outcomes. In Python, pass
-  `family="bernoulli-marginal-slope"` with `z_column=` and
-  `logslope_formula=`; in the CLI, `--z-column` and `--logslope-formula`
-  route to this fit.
+  `family="bernoulli-marginal-slope"` with `logslope_formula=`; in the
+  CLI, `--z-column` and `--logslope-formula` route to this fit.
 - Survival marginal-slope (`survival_likelihood="marginal-slope"`) for
   time-to-event outcomes.
 
 Both are identified around a latent `z` scale that should be approximately
-`N(0, 1)` conditional on the covariates. By default the fit uses warn-only
-diagnostics for deviations from that target; use the transformation-normal
-calibration step to put `z` on the intended scale.
+`N(0, 1)` conditional on the covariates. Pass
+`transformation_normal_stage1=gamfit.CtnStage1(...)` to condition the score
+on covariates inside the fit (the calibrated chain below), or a raw
+`z_column=` when the score is already conditionally `N(0, 1)` from outside
+this pipeline.
 
 ## When to use it
 
@@ -40,72 +41,59 @@ forces one slope on the score. Marginal-slope makes the slope itself a
 smooth function of covariates while leaving the baseline as a separate
 smooth.
 
-## Stage 1: transformation-normal calibration
+## Calibrated marginal slope (CTN-conditioned score)
 
-If the raw score is not already conditionally `N(0, 1)`, fit:
-
-```python
-calib = gamfit.fit(
-    df,
-    "raw_score ~ duchon(pc1, pc2, pc3, pc4, centers=20)",
-    transformation_normal=True,
-    scale_dimensions=True,
-)
-df["z"] = calib.predict(df)
-```
-
-`transformation_normal=True` fits `h(score | covariates) ~ N(0, 1)`. The
-`predict()` method of a transformation-normal model returns a 1-D numpy
-array of z-scores.
-
-## Stage 2a: Bernoulli marginal-slope
+When the score must be conditioned on covariates to reach the latent
+`N(0, 1)` scale, supply a Stage-1 transformation-normal recipe with
+`transformation_normal_stage1=`. This is the single calibrated
+marginal-slope entry: it fits the conditional transformation
+`h(score | covariates) ~ N(0, 1)`, cross-fits it out-of-fold, and absorbs
+the Stage-1 score-influence directions so the fitted slope surface
+`β(x)` is insensitive to Stage-1 calibration error (Neyman-orthogonal
+cross-fitting). You do not materialise or pass a `z_column` yourself — the
+conditioned score is produced and cross-fitted inside the one fit.
 
 ```python
 model = gamfit.fit(
     df,
     "case ~ s(age) + matern(pc1, pc2, pc3)",
     family="bernoulli-marginal-slope",
-    z_column="z",
     logslope_formula="matern(pc1, pc2, pc3)",
+    transformation_normal_stage1=gamfit.CtnStage1(
+        response="raw_score",
+        covariates="duchon(pc1, pc2, pc3, pc4, centers=20)",
+    ),
     scale_dimensions=True,
 )
 
 probs = model.predict(test_df, return_type="dict")["mean"]
 ```
 
-- `family="bernoulli-marginal-slope"` names the likelihood; `z_column=`
-  and `logslope_formula=` route the Python fit onto the marginal-slope
-  path.
-- The base link is fixed to probit. In the CLI, `link(type=probit)` is
-  optional and non-probit formula links are rejected. The Python `link=`
-  keyword is not needed for marginal-slope fits.
-- `z_column="z"`: name of the conditional z-score column in both the
-  training and prediction tables.
-- `logslope_formula="..."`: formula for the slope surface as a
-  function of covariates.
+- `family="bernoulli-marginal-slope"` names the likelihood;
+  `logslope_formula=` is the slope surface as a function of covariates.
+- `transformation_normal_stage1=gamfit.CtnStage1(response=..., covariates=...)`
+  is the Stage-1 recipe: `response` is the raw score column to condition,
+  `covariates` is the covariate-side formula right-hand side used to fit
+  `h(score | covariates) ~ N(0, 1)`. Supplying it *is* the request for the
+  orthogonalized chain — there is no separate boolean.
+- The base link is fixed to probit. The Python `link=` keyword is not
+  needed for marginal-slope fits.
 
 The main formula controls the baseline risk; `logslope_formula` controls
-the strength of the `z` effect at each point in covariate space.
+the strength of the score effect at each point in covariate space.
 
-CLI equivalent:
-
-```bash
-gam fit data.csv 'case ~ s(age) + matern(pc1, pc2, pc3)' \
-    --logslope-formula 'matern(pc1, pc2, pc3)' --z-column z \
-    --scale-dimensions --out model.gam
-```
-
-Bernoulli marginal-slope currently consumes a single `z_column`.
-
-## Stage 2b: Survival marginal-slope
+The same recipe drives the survival likelihood:
 
 ```python
 model = gamfit.fit(
     df,
     "Surv(entry, exit, event) ~ s(bmi) + s(hba1c)",
     survival_likelihood="marginal-slope",
-    z_column="z",
     logslope_formula="s(bmi) + s(hba1c)",
+    transformation_normal_stage1=gamfit.CtnStage1(
+        response="raw_score",
+        covariates="s(bmi) + s(hba1c)",
+    ),
 )
 
 pred = model.predict(test_df)
@@ -116,7 +104,40 @@ The main formula specifies the baseline survival surface; the score's
 slope on the marginal-calibrated probit survival scale is a smooth
 function of covariates given by `logslope_formula`. In the Python API,
 omitting `logslope_formula` reuses the main covariate formula for the
-slope surface; the CLI requires `--logslope-formula`.
+slope surface.
+
+## Externally calibrated score (raw `z_column`)
+
+If the score is already conditionally `N(0, 1)` — for example a
+standardised score produced outside this pipeline — pass it directly with
+`z_column=` and omit the Stage-1 recipe. This raw-`z` path uses the
+free-warp `score_warp` fallback (it can only defend the covariate-free
+component of any residual miscalibration); prefer the calibrated chain
+above when the score is conditioned on covariates here.
+
+```python
+model = gamfit.fit(
+    df,
+    "case ~ s(age) + matern(pc1, pc2, pc3)",
+    family="bernoulli-marginal-slope",
+    z_column="z",
+    logslope_formula="matern(pc1, pc2, pc3)",
+    scale_dimensions=True,
+)
+```
+
+- `z_column="z"`: name of the conditional z-score column in both the
+  training and prediction tables.
+
+CLI equivalent:
+
+```bash
+gam fit data.csv 'case ~ s(age) + matern(pc1, pc2, pc3)' \
+    --logslope-formula 'matern(pc1, pc2, pc3)' --z-column z \
+    --scale-dimensions --out model.gam
+```
+
+Bernoulli marginal-slope currently consumes a single `z_column`.
 
 ## Frailty in marginal-slope survival
 
@@ -129,8 +150,10 @@ at fit time.
 gamfit.fit(df,
     "Surv(entry, exit, event) ~ s(age)",
     survival_likelihood="marginal-slope",
-    z_column="z",
     logslope_formula="s(age)",
+    transformation_normal_stage1=gamfit.CtnStage1(
+        response="raw_score", covariates="s(age)",
+    ),
     frailty_kind="gaussian-shift",
     frailty_sd=0.3,
 )
@@ -148,8 +171,10 @@ model.model_class                  # full class string
 
 ## Notes
 
-- Run Stage 1 (transformation-normal) before Stage 2 so `z_column` is
-  close to conditionally `N(0, 1)`.
+- Supply `transformation_normal_stage1=` to condition the score on
+  covariates inside the fit (the calibrated chain). Use a raw `z_column=`
+  only for a score already conditionally `N(0, 1)` from outside this
+  pipeline.
 - Set `scale_dimensions=True` when calibrating on a handful of PCs so
   anisotropic length scales are learned per axis.
 - Posterior sampling: Bernoulli marginal-slope and transformation-normal
@@ -160,7 +185,7 @@ model.model_class                  # full class string
   array by default. Pass `id_column=` or `return_type="dict"` for a
   table. The same applies to transformation-normal models.
 
-## Two-stage pipeline
+## End-to-end example
 
 ```python
 import gamfit
@@ -177,20 +202,17 @@ df = pd.DataFrame({
 })
 df["disease"] = (rng.uniform(0, 1, n) < 0.25).astype(float)
 
-# Stage 1: condition the score on PCs
-calib = gamfit.fit(
-    df, "PGS ~ matern(pc1, pc2, pc3, centers=20)",
-    transformation_normal=True, scale_dimensions=True,
-)
-df["pgs_z"] = np.asarray(calib.predict(df), dtype=float)
-
-# Stage 2: Bernoulli marginal-slope
+# Condition the score on the PCs and fit the slope surface in one
+# cross-fitted, orthogonalized call.
 model = gamfit.fit(
     df,
     "disease ~ matern(pc1, pc2, pc3, centers=20)",
     family="bernoulli-marginal-slope",
-    z_column="pgs_z",
     logslope_formula="matern(pc1, pc2, pc3, centers=20)",
+    transformation_normal_stage1=gamfit.CtnStage1(
+        response="PGS",
+        covariates="matern(pc1, pc2, pc3, centers=20)",
+    ),
     scale_dimensions=True,
 )
 

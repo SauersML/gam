@@ -39,20 +39,12 @@ def synth(n: int, seed: int = 11) -> dict[str, list[float]]:
     }
 
 
-def stage1_calibrate(data: dict[str, list[float]], formula: str) -> dict[str, list[float]]:
-    log(f"[stage1] fitting {formula!r}")
-    calib = gamfit.fit(data, formula, transformation_normal=True, scale_dimensions=True)
-    z = np.asarray(calib.predict(data), dtype=float)
-    out = dict(data)
-    out["pgs_z"] = z.tolist()
-    return out
-
-
 def time_fit(
     label: str,
     data: dict[str, list[float]],
     formula: str,
     logslope_formula: str,
+    stage1: gamfit.CtnStage1,
     repeats: int,
 ) -> list[float]:
     log(f"[fit] {label}: starting {repeats} fit(s)")
@@ -63,9 +55,8 @@ def time_fit(
             data,
             formula,
             family="bernoulli-marginal-slope",
-            link="probit",
-            z_column="pgs_z",
             logslope_formula=logslope_formula,
+            transformation_normal_stage1=stage1,
             scale_dimensions=True,
         )
         dt = time.perf_counter() - t0
@@ -78,8 +69,13 @@ def main() -> None:
     n = 2000
     log(f"=== benchmark: n={n}, predictors=3 ===")
 
-    raw = synth(n)
-    data = stage1_calibrate(raw, "PGS ~ duchon(x1, x2, x3, centers=30)")
+    data = synth(n)
+    # The Stage-1 CTN that conditions PGS on the covariates is now part of the
+    # one calibrated marginal-slope fit, so each timing covers the full chain
+    # (cross-fitted CTN refits + Stage-2 solve), not just Stage 2.
+    stage1 = gamfit.CtnStage1(
+        response="PGS", covariates="duchon(x1, x2, x3, centers=30)"
+    )
 
     runs = 3
     results = {
@@ -88,6 +84,7 @@ def main() -> None:
             data,
             "case ~ s(x1) + s(x2) + s(x3)",
             "s(x1) + s(x2) + s(x3)",
+            stage1,
             repeats=runs,
         ),
         "joint_duchon": time_fit(
@@ -95,6 +92,7 @@ def main() -> None:
             data,
             "case ~ duchon(x1, x2, x3, centers=30)",
             "duchon(x1, x2, x3, centers=30)",
+            stage1,
             repeats=runs,
         ),
     }
