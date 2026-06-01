@@ -23,6 +23,7 @@ calibration error.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -139,7 +140,7 @@ def normalize_ctn_stage1(value: Any) -> CtnStage1 | None:
         return None
     if isinstance(value, CtnStage1):
         return value
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         # Build directly; CtnStage1.__post_init__ validates required keys.
         try:
             return CtnStage1(**value)
