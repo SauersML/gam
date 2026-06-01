@@ -257,6 +257,14 @@ jobs:
       - macos
       - windows
       - sdist
+    # Publish whenever the Linux + musllinux + sdist artifacts succeeded. Under
+    # `linux_only=true` the macos/windows jobs are SKIPPED — a default `needs`
+    # would skip this upload job too (a job whose needs are skipped is skipped),
+    # so the fast Linux-only path built wheels but never published. Gate on the
+    # actual results instead: require the Linux set to succeed, allow macos/
+    # windows to be skipped (just not failed). The gate's `should_run=false`
+    # path skips the wheel jobs, so their result is `skipped` and this stays off.
+    if: ${{ !cancelled() && needs.linux.result == 'success' && needs.musllinux.result == 'success' && needs.sdist.result == 'success' && needs.macos.result != 'failure' && needs.windows.result != 'failure' }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/setup-python@v5
