@@ -517,17 +517,34 @@ impl SurvivalFlexGpuBackend {
         Ok(backend)
     }
 
-    /// NVRTC-compile (or fetch from cache) the rigid-kernel module.
+    /// NVRTC-compile (or fetch from cache) the survival-flex device
+    /// module.  The single cached module carries BOTH `extern "C"`
+    /// symbols (`survival_flex_rigid_rows` and `survival_flex_primary_rows`)
+    /// compiled as one translation unit sharing the probit-numerics
+    /// prelude.  `PtxModuleCache` holds exactly one `Arc<CudaModule>` per
+    /// backend keyed on first-compile, so both kernels MUST come from the
+    /// same source concatenation — the rigid and primary launchers then
+    /// `load_function` their respective symbol out of this one module.
     #[cfg(target_os = "linux")]
     fn compile_rigid_module(&self) -> Result<&Arc<CudaModule>, GpuError> {
         let source = [
             super::numerics_device::PROBIT_NUMERICS_CU,
             SURVIVAL_FLEX_RIGID_BODY,
+            SURVIVAL_FLEX_PRIMARY_BODY,
         ]
         .concat();
         self.inner
             .module
             .get_or_compile(&self.inner.ctx, "survival_flex", &source)
+    }
+
+    /// Alias for [`Self::compile_rigid_module`] — the flex row-primary
+    /// kernel lives in the same combined module, so this just returns
+    /// the shared cached module.  Kept as a named seam so the primary
+    /// launcher reads symmetrically with the rigid one.
+    #[cfg(target_os = "linux")]
+    fn compile_primary_module(&self) -> Result<&Arc<CudaModule>, GpuError> {
+        self.compile_rigid_module()
     }
 
     /// Round-trip the arena.  Mirrors `bms_flex` so the V100 smoke test
@@ -770,6 +787,872 @@ impl SurvivalFlexGpuBackend {
             row_status,
         })
     }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Step 5 — FLEX row-primary gradient/Hessian kernel (NVRTC).
+//
+// Native-GPU landing of `try_device_step5_primary_assembly` (the
+// device-shaped CPU reference earlier in this file) and its parent
+// `compute_row_flex_primary_gradient_hessian_from_parts`
+// (`src/families/survival_marginal_slope.rs`).  One thread = one row.
+// Each row produces:
+//   * `out_nll[i]`              the per-row NLL contribution
+//   * `out_grad[i*r + u]`       the `r`-vector primary gradient
+//   * `out_hess[i*r*r + u*r+v]` the full symmetric `r×r` primary Hessian
+//
+// `r` is a runtime int bounded by `SURVIVAL_FLEX_MAX_R` (32): the
+// rigid kernel is the fixed `r==4` flex=false subset; this kernel
+// generalizes it to `r ≤ MAX_R` driven by the full per-row jet
+// (η_u/η_uv, χ/χ_u/χ_uv, d/d_u/d_uv) computed by Steps 2–4.  The jets
+// are laid out Struct-of-Arrays per row (entry first, exit second):
+//   eta_u  : r          per timepoint
+//   eta_uv : r*r        per timepoint (row-major, symmetric)
+//   chi_u  : r          per timepoint
+//   chi_uv : r*r        per timepoint
+//   d_u    : r          per timepoint
+//   d_uv   : r*r        per timepoint
+// plus the per-row scalar bundle (eta/chi/d at each timepoint, the
+// `(k1,k2)` neglog derivatives, `log_surv0/1`, `q1`, `qd1`, `wi`, `di`,
+// and the `q1_index`/`qd1_index` perturbation slots, `usize::MAX` →
+// `-1` to disable).
+//
+// Sign convention is identical to `try_device_step5_primary_assembly`
+// and to the inline CPU loop in
+// `compute_row_flex_primary_gradient_hessian_from_parts`: `nll`,
+// `grad`, `hess` are derivatives of the *negative* log-likelihood —
+// i.e. the observed-information curvature the host accumulator adds.
+//
+// SUPPORTED SHAPE (caller pre-filters, see `try_flex_primary_rows`):
+//   * `family == StandardNormal`, `score_dim == 1`
+//   * `r ≤ SURVIVAL_FLEX_MAX_R`
+//   * NO influence absorber active (`o_infl` absent) — per the #461
+//     caveat at the top of this file the flex jet does not yet carry
+//     the `infl` primary coord, so we stay `Ok(None)` when it is
+//     present rather than silently dropping it.
+// Everything else returns `Ok(None)` for a clean CPU fallback.
+//
+// Numerically delicate spots (FLAGGED for the V100 parity pass):
+//   * the `chi_uv/chi − (chi_u·chi_u)/chi²` and the analogous `d`
+//     ratio terms are catastrophic-cancellation-prone when the two
+//     summands nearly cancel (small-curvature rows); the CPU computes
+//     them in the same order, so GPU/CPU must agree to round-off but
+//     the *absolute* magnitude can be tiny relative to the inputs.
+//   * `chi.ln()` / `d.ln()` and the `1/chi`, `1/d`, `1/qd1`,
+//     `1/qd1²` reciprocals assume the host pre-validated `chi>0`,
+//     `d>0`, `qd1>0` (the launcher asserts the same as the CPU
+//     reference); a row that slips through gets `row_status[i] = 2`
+//     and zeroed outputs.
+// ────────────────────────────────────────────────────────────────────────
+
+/// Maximum primary local dimension `r` the flex row-primary kernel
+/// supports.  Beyond this the entry point returns `Ok(None)` so the
+/// host falls back to CPU.  Mirrors the roadmap "Step 5" `MAX_R`.
+pub const SURVIVAL_FLEX_MAX_R: usize = 32;
+
+#[cfg(target_os = "linux")]
+const SURVIVAL_FLEX_PRIMARY_BODY: &str = r#"
+// -------- kernel-specific defines ----------------------------------------
+#define LN_TAU       1.8378770664093453  // log(2π)
+#define MAX_R        32
+
+// -------- flex row-primary gradient/Hessian kernel -----------------------
+//
+// One thread processes one row `i`.  The per-row jet is supplied as
+// flat SoA device buffers (entry timepoint then exit timepoint).  The
+// math mirrors `try_device_step5_primary_assembly` term-for-term.
+//
+// Buffer strides (all in f64, indexed by row `i` and primary `u`/`v`):
+//   *_eta_u  [i*r + u]
+//   *_eta_uv [i*r*r + u*r + v]
+//   ... likewise chi_u/chi_uv/d_u/d_uv ...
+// Scalars are length-`n` arrays indexed by `i`.
+//
+// `q1_index`/`qd1_index` are int arrays; a value `< 0` disables the
+// corresponding perturbation bump (matches `usize::MAX` on the host).
+//
+extern "C" __global__ void survival_flex_primary_rows(
+    int                          n,
+    int                          r,
+    // entry-timepoint jet
+    const double * __restrict__  e_eta,      // [n]
+    const double * __restrict__  e_eta_u,    // [n*r]
+    const double * __restrict__  e_eta_uv,   // [n*r*r]
+    // exit-timepoint jet
+    const double * __restrict__  x_eta,      // [n]
+    const double * __restrict__  x_chi,      // [n]
+    const double * __restrict__  x_d,        // [n]
+    const double * __restrict__  x_eta_u,    // [n*r]
+    const double * __restrict__  x_eta_uv,   // [n*r*r]
+    const double * __restrict__  x_chi_u,    // [n*r]
+    const double * __restrict__  x_chi_uv,   // [n*r*r]
+    const double * __restrict__  x_d_u,      // [n*r]
+    const double * __restrict__  x_d_uv,     // [n*r*r]
+    // per-row scalars
+    const double * __restrict__  wi_arr,     // [n]
+    const double * __restrict__  di_arr,     // [n]
+    const double * __restrict__  q1_arr,     // [n]
+    const double * __restrict__  qd1_arr,    // [n]
+    const double * __restrict__  entry_k1_a, // [n]
+    const double * __restrict__  entry_k2_a, // [n]
+    const double * __restrict__  exit_k1_a,  // [n]
+    const double * __restrict__  exit_k2_a,  // [n]
+    const double * __restrict__  log_surv0_a,// [n]
+    const double * __restrict__  log_surv1_a,// [n]
+    const int    * __restrict__  q1_index_a, // [n]
+    const int    * __restrict__  qd1_index_a,// [n]
+    // outputs
+    double * __restrict__        out_nll,    // [n]
+    double * __restrict__        out_grad,   // [n*r]
+    double * __restrict__        out_hess,   // [n*r*r]
+    int    * __restrict__        row_status  // [n]
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    // Defensive: the host guarantees r ≤ MAX_R, but never index past it.
+    if (r <= 0 || r > MAX_R) {
+        row_status[i] = 2;
+        out_nll[i] = 0.0;
+        return;
+    }
+
+    double wi  = wi_arr[i];
+    double di  = di_arr[i];
+    double q1  = q1_arr[i];
+    double qd1 = qd1_arr[i];
+
+    double exit_chi = x_chi[i];
+    double exit_eta = x_eta[i];
+    double exit_d   = x_d[i];
+
+    // Match the CPU validation: chi/d must be positive finite (the host
+    // already rejected such rows; this is belt-and-suspenders so a slip
+    // becomes a clean reject rather than a NaN write).
+    bool bad = (!isfinite(exit_chi)) || (exit_chi <= 0.0)
+            || (!isfinite(exit_d))   || (exit_d   <= 0.0)
+            || (!isfinite(qd1))      || (qd1      <= 0.0);
+    if (bad) {
+        row_status[i] = 2;
+        out_nll[i] = 0.0;
+        for (int u = 0; u < r; ++u) out_grad[i * r + u] = 0.0;
+        for (int k = 0; k < r * r; ++k) out_hess[(long long)i * r * r + k] = 0.0;
+        return;
+    }
+
+    int q1_index  = q1_index_a[i];
+    int qd1_index = qd1_index_a[i];
+
+    double entry_k1 = entry_k1_a[i];
+    double entry_k2 = entry_k2_a[i];
+    double exit_k1  = exit_k1_a[i];
+    double exit_k2  = exit_k2_a[i];
+    double log_surv0 = log_surv0_a[i];
+    double log_surv1 = log_surv1_a[i];
+
+    // ── NLL ──────────────────────────────────────────────────────────────
+    double log_phi_eta1 = -0.5 * (exit_eta * exit_eta + LN_TAU);
+    double log_phi_q1   = -0.5 * (q1 * q1 + LN_TAU);
+    double row_nll = wi
+        * (log_surv0
+           - (1.0 - di) * log_surv1
+           - di * log_phi_eta1
+           - di * log(exit_chi)
+           - di * log_phi_q1
+           + di * log(exit_d)
+           - di * log(qd1));
+    out_nll[i] = row_nll;
+
+    double entry_u1     = -entry_k1;
+    double entry_u2     =  entry_k2;
+    double exit_surv_u1 = -exit_k1;
+    double exit_surv_u2 =  exit_k2;
+
+    // Base device-buffer offsets for this row.
+    long long base_u  = (long long)i * r;       // length-r vectors
+    long long base_uv = (long long)i * r * r;   // r×r matrices
+
+    // ── Gradient ─────────────────────────────────────────────────────────
+    for (int u = 0; u < r; ++u) {
+        double e_eu = e_eta_u[base_u + u];
+        double x_eu = x_eta_u[base_u + u];
+        double val = 0.0;
+        val += entry_u1     * e_eu;
+        val += exit_surv_u1 * x_eu;
+        val += wi * di * exit_eta * x_eu;
+        val -= wi * di * x_chi_u[base_u + u] / exit_chi;
+        if (u == q1_index) {
+            val += wi * di * q1;
+        }
+        val += wi * di * x_d_u[base_u + u] / exit_d;
+        if (u == qd1_index) {
+            val -= wi * di / qd1;
+        }
+        out_grad[base_u + u] = val;
+    }
+
+    // ── Hessian (full symmetric r×r) ─────────────────────────────────────
+    double chi_sq = exit_chi * exit_chi;
+    double d_sq   = exit_d   * exit_d;
+    for (int u = 0; u < r; ++u) {
+        double e_eu = e_eta_u[base_u + u];
+        double x_eu = x_eta_u[base_u + u];
+        double x_cu = x_chi_u[base_u + u];
+        double x_du = x_d_u[base_u + u];
+        for (int v = u; v < r; ++v) {
+            double e_ev = e_eta_u[base_u + v];
+            double x_ev = x_eta_u[base_u + v];
+            double x_cv = x_chi_u[base_u + v];
+            double x_dv = x_d_u[base_u + v];
+            long long off_uv = base_uv + (long long)u * r + v;
+
+            double val = 0.0;
+            // entry survival term: k2 outer product + k1 second jet.
+            val += entry_u2 * e_eu * e_ev + entry_u1 * e_eta_uv[off_uv];
+            // exit survival term.
+            val += exit_surv_u2 * x_eu * x_ev + exit_surv_u1 * x_eta_uv[off_uv];
+            // event log φ(η₁) curvature.
+            val += wi * di * (x_eu * x_ev + exit_eta * x_eta_uv[off_uv]);
+            // − d·log χ₁ : FLAGGED cancellation-prone ratio term.
+            val -= wi * di
+                 * (x_chi_uv[off_uv] / exit_chi - (x_cu * x_cv) / chi_sq);
+            if (u == q1_index && v == q1_index) {
+                val += wi * di;
+            }
+            // + d·log d : same cancellation-prone structure.
+            val += wi * di
+                 * (x_d_uv[off_uv] / exit_d - (x_du * x_dv) / d_sq);
+            if (u == qd1_index && v == qd1_index) {
+                val += wi * di / (qd1 * qd1);
+            }
+
+            out_hess[off_uv] = val;
+            if (v != u) {
+                out_hess[base_uv + (long long)v * r + u] = val;
+            }
+        }
+    }
+
+    row_status[i] = 0;
+}
+"#;
+
+// ────────────────────────────────────────────────────────────────────────
+// Step 5 — FLEX row-primary launcher + host-side SoA inputs.
+//
+// `survival_flex_primary_rows` (NVRTC source above) is the native-GPU
+// generalization of the rigid r==4 kernel to r ≤ SURVIVAL_FLEX_MAX_R.
+// The host packs the per-row jet as flat Struct-of-Arrays device buffers
+// (entry timepoint then exit timepoint) that mirror, byte-for-byte, the
+// scalar / vector algebra in `try_device_step5_primary_assembly` (the
+// device-shaped CPU reference earlier in this file) and its parent
+// `compute_row_flex_primary_gradient_hessian_from_parts` in
+// `src/families/survival_marginal_slope.rs`.
+//
+// Per-row index `usize::MAX` on the host (the "no perturbation" sentinel
+// of `SurvivalFlexStep5RowInputs::q1_index` / `qd1_index`) maps to the
+// device `< 0` disable convention via `index_to_i32` — exactly the
+// `if (u == q1_index)` / `if (u == qd1_index)` guards in the kernel never
+// fire for a disabled slot.
+//
+// SUPPORTED SHAPE (the entry point pre-filters): scalar score, every row
+// of the batch sharing one `r ≤ SURVIVAL_FLEX_MAX_R`, NO influence
+// absorber (per the #461 caveat at the top of this file the jet does not
+// yet carry the `infl` primary coord).  Everything else stays `Ok(None)`
+// so the host falls back to CPU.
+// ────────────────────────────────────────────────────────────────────────
+
+/// Convert a host primary-index slot (`usize::MAX` ≡ "no perturbation")
+/// into the device kernel's `< 0` disable convention.  Any in-range index
+/// must fit in `i32` because `r ≤ SURVIVAL_FLEX_MAX_R`.
+#[inline]
+fn primary_index_to_i32(idx: usize) -> i32 {
+    if idx == usize::MAX {
+        -1
+    } else {
+        // `r ≤ 32` so an enabled index is always well within i32.
+        i32::try_from(idx).unwrap_or(-1)
+    }
+}
+
+/// One row's jet for a single timepoint, laid out as the host owns it.
+/// Entry timepoint only needs `eta`/`eta_u`/`eta_uv` (the survival term
+/// of the NLL involves no `chi`/`d` at entry); the exit timepoint carries
+/// the full bundle.
+#[derive(Clone, Copy, Debug)]
+pub struct SurvivalFlexPrimaryTimepointRow<'a> {
+    pub eta: f64,
+    pub chi: f64,
+    pub d: f64,
+    /// Length `r`.
+    pub eta_u: &'a [f64],
+    /// Row-major `r × r`, symmetric.
+    pub eta_uv: &'a [f64],
+    /// Length `r`.
+    pub chi_u: &'a [f64],
+    /// Row-major `r × r`, symmetric.
+    pub chi_uv: &'a [f64],
+    /// Length `r`.
+    pub d_u: &'a [f64],
+    /// Row-major `r × r`, symmetric.
+    pub d_uv: &'a [f64],
+}
+
+/// Per-row inputs for the flex row-primary GPU launcher.  Identical math
+/// contract to [`SurvivalFlexStep5RowInputs`]; the launcher flattens a
+/// slice of these into the device SoA buffers the kernel reads.
+#[derive(Clone, Copy, Debug)]
+pub struct SurvivalFlexPrimaryRow<'a> {
+    pub entry: SurvivalFlexPrimaryTimepointRow<'a>,
+    pub exit: SurvivalFlexPrimaryTimepointRow<'a>,
+    pub wi: f64,
+    pub di: f64,
+    pub q1: f64,
+    pub qd1: f64,
+    /// `usize::MAX` disables the `+ wi·di·q1` / `+ wi·di` bumps.
+    pub q1_index: usize,
+    /// `usize::MAX` disables the `-wi·di/qd1` / `+wi·di/qd1²` bumps.
+    pub qd1_index: usize,
+    pub entry_k1: f64,
+    pub entry_k2: f64,
+    pub exit_k1: f64,
+    pub exit_k2: f64,
+    pub log_surv0: f64,
+    pub log_surv1: f64,
+}
+
+/// Per-row output bundle from the flex row-primary GPU kernel.  Same
+/// shape contract as [`SurvivalFlexStep5RowOutputs`] but flattened across
+/// the whole batch (one `r`, `r×r` slot per row).
+#[derive(Clone, Debug)]
+pub struct SurvivalFlexPrimaryRowOutputs {
+    /// Per-row NLL contribution, length `n`.
+    pub nll: Vec<f64>,
+    /// Per-row primary gradient, length `n*r` (row-major).
+    pub grad: Vec<f64>,
+    /// Per-row primary Hessian, length `n*r*r` (row-major r×r symmetric
+    /// per row).
+    pub hess: Vec<f64>,
+    /// Per-row status — `0` ok, `2` non-finite / non-positive chi/d/qd1.
+    pub row_status: Vec<i32>,
+}
+
+/// Flattened host-side SoA staging for one batch of flex primary rows.
+/// Built by [`flatten_primary_rows`] and consumed by the launcher; kept
+/// as a named struct so the CPU oracle and the launcher pack the buffers
+/// identically (one source of truth for the device layout).
+struct SurvivalFlexPrimaryRowBatchFlat {
+    n: usize,
+    r: usize,
+    e_eta: Vec<f64>,
+    e_eta_u: Vec<f64>,
+    e_eta_uv: Vec<f64>,
+    x_eta: Vec<f64>,
+    x_chi: Vec<f64>,
+    x_d: Vec<f64>,
+    x_eta_u: Vec<f64>,
+    x_eta_uv: Vec<f64>,
+    x_chi_u: Vec<f64>,
+    x_chi_uv: Vec<f64>,
+    x_d_u: Vec<f64>,
+    x_d_uv: Vec<f64>,
+    wi: Vec<f64>,
+    di: Vec<f64>,
+    q1: Vec<f64>,
+    qd1: Vec<f64>,
+    entry_k1: Vec<f64>,
+    entry_k2: Vec<f64>,
+    exit_k1: Vec<f64>,
+    exit_k2: Vec<f64>,
+    log_surv0: Vec<f64>,
+    log_surv1: Vec<f64>,
+    q1_index: Vec<i32>,
+    qd1_index: Vec<i32>,
+}
+
+/// Validate + flatten a slice of [`SurvivalFlexPrimaryRow`] into the
+/// device SoA layout.  Enforces a single shared `r` (the kernel takes one
+/// `r` for the whole launch) and that every per-row jet has the right
+/// `r` / `r×r` lengths.  Returns `Err` on a shape violation so the entry
+/// point surfaces a single error surface, matching the rigid launcher.
+fn flatten_primary_rows(
+    rows: &[SurvivalFlexPrimaryRow<'_>],
+) -> Result<SurvivalFlexPrimaryRowBatchFlat, GpuError> {
+    let n = rows.len();
+    let r = rows[0].exit.eta_u.len();
+    let rr = r * r;
+
+    let mut flat = SurvivalFlexPrimaryRowBatchFlat {
+        n,
+        r,
+        e_eta: Vec::with_capacity(n),
+        e_eta_u: Vec::with_capacity(n * r),
+        e_eta_uv: Vec::with_capacity(n * rr),
+        x_eta: Vec::with_capacity(n),
+        x_chi: Vec::with_capacity(n),
+        x_d: Vec::with_capacity(n),
+        x_eta_u: Vec::with_capacity(n * r),
+        x_eta_uv: Vec::with_capacity(n * rr),
+        x_chi_u: Vec::with_capacity(n * r),
+        x_chi_uv: Vec::with_capacity(n * rr),
+        x_d_u: Vec::with_capacity(n * r),
+        x_d_uv: Vec::with_capacity(n * rr),
+        wi: Vec::with_capacity(n),
+        di: Vec::with_capacity(n),
+        q1: Vec::with_capacity(n),
+        qd1: Vec::with_capacity(n),
+        entry_k1: Vec::with_capacity(n),
+        entry_k2: Vec::with_capacity(n),
+        exit_k1: Vec::with_capacity(n),
+        exit_k2: Vec::with_capacity(n),
+        log_surv0: Vec::with_capacity(n),
+        log_surv1: Vec::with_capacity(n),
+        q1_index: Vec::with_capacity(n),
+        qd1_index: Vec::with_capacity(n),
+    };
+
+    for (i, row) in rows.iter().enumerate() {
+        let check = |label: &str, len: usize, expected: usize| -> Result<(), GpuError> {
+            if len != expected {
+                return Err(GpuError::DriverCallFailed {
+                    reason: format!(
+                        "survival_flex primary row {i}: {label}.len()={len} expected {expected} \
+                         (batch r={r})"
+                    ),
+                });
+            }
+            Ok(())
+        };
+        check("entry.eta_u", row.entry.eta_u.len(), r)?;
+        check("entry.eta_uv", row.entry.eta_uv.len(), rr)?;
+        check("exit.eta_u", row.exit.eta_u.len(), r)?;
+        check("exit.eta_uv", row.exit.eta_uv.len(), rr)?;
+        check("exit.chi_u", row.exit.chi_u.len(), r)?;
+        check("exit.chi_uv", row.exit.chi_uv.len(), rr)?;
+        check("exit.d_u", row.exit.d_u.len(), r)?;
+        check("exit.d_uv", row.exit.d_uv.len(), rr)?;
+
+        flat.e_eta.push(row.entry.eta);
+        flat.e_eta_u.extend_from_slice(row.entry.eta_u);
+        flat.e_eta_uv.extend_from_slice(row.entry.eta_uv);
+
+        flat.x_eta.push(row.exit.eta);
+        flat.x_chi.push(row.exit.chi);
+        flat.x_d.push(row.exit.d);
+        flat.x_eta_u.extend_from_slice(row.exit.eta_u);
+        flat.x_eta_uv.extend_from_slice(row.exit.eta_uv);
+        flat.x_chi_u.extend_from_slice(row.exit.chi_u);
+        flat.x_chi_uv.extend_from_slice(row.exit.chi_uv);
+        flat.x_d_u.extend_from_slice(row.exit.d_u);
+        flat.x_d_uv.extend_from_slice(row.exit.d_uv);
+
+        flat.wi.push(row.wi);
+        flat.di.push(row.di);
+        flat.q1.push(row.q1);
+        flat.qd1.push(row.qd1);
+        flat.entry_k1.push(row.entry_k1);
+        flat.entry_k2.push(row.entry_k2);
+        flat.exit_k1.push(row.exit_k1);
+        flat.exit_k2.push(row.exit_k2);
+        flat.log_surv0.push(row.log_surv0);
+        flat.log_surv1.push(row.log_surv1);
+        flat.q1_index.push(primary_index_to_i32(row.q1_index));
+        flat.qd1_index.push(primary_index_to_i32(row.qd1_index));
+    }
+
+    Ok(flat)
+}
+
+/// Launch the flex row-primary gradient/Hessian kernel for a batch of
+/// rows that all share one `r ≤ SURVIVAL_FLEX_MAX_R`.  Returns `Ok(None)`
+/// if the backend is unsupported on this build (non-Linux / no CUDA
+/// runtime) or the shape is out of range, so the caller falls back to
+/// CPU cleanly; returns `Err` for genuine driver / shape failures.
+///
+/// The host MUST pre-filter to the SUPPORTED SHAPE documented above — in
+/// particular it must NOT call this with an influence absorber active
+/// (the jet does not yet carry the `infl` coord; see the #461 caveat).
+pub fn try_flex_primary_rows(
+    rows: &[SurvivalFlexPrimaryRow<'_>],
+) -> Result<Option<SurvivalFlexPrimaryRowOutputs>, GpuError> {
+    if rows.is_empty() {
+        return Ok(Some(SurvivalFlexPrimaryRowOutputs {
+            nll: Vec::new(),
+            grad: Vec::new(),
+            hess: Vec::new(),
+            row_status: Vec::new(),
+        }));
+    }
+    // The kernel launches with a single runtime `r`; a ragged batch is an
+    // unsupported shape (each fit's flex jet is one fixed `r`).
+    let r = rows[0].exit.eta_u.len();
+    if r == 0 || r > SURVIVAL_FLEX_MAX_R {
+        return Ok(None);
+    }
+    // Flatten + shape-validate up front so a ragged / mis-sized batch
+    // surfaces as `Err` on EVERY build, not just on the V100 host.  The
+    // flattened batch always carries `n` rows of width `r`; assert that
+    // invariant so the value is live on every cfg (no dead binding off
+    // Linux) and a future layout regression trips loudly.
+    let flat = flatten_primary_rows(rows)?;
+    if flat.n != rows.len() || flat.r != r {
+        return Err(GpuError::DriverCallFailed {
+            reason: format!(
+                "survival_flex primary flatten produced n={} r={} expected n={} r={r}",
+                flat.n,
+                flat.r,
+                rows.len()
+            ),
+        });
+    }
+    if !SurvivalFlexGpuBackend::compiled() {
+        return Ok(None);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let backend = match SurvivalFlexGpuBackend::probe() {
+            Ok(b) => b,
+            Err(GpuError::DriverLibraryUnavailable { .. }) => return Ok(None),
+            Err(other) => return Err(other),
+        };
+        Some(backend.launch_primary_rows_linux(&flat)).transpose()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(None)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl SurvivalFlexGpuBackend {
+    fn launch_primary_rows_linux(
+        &self,
+        flat: &SurvivalFlexPrimaryRowBatchFlat,
+    ) -> Result<SurvivalFlexPrimaryRowOutputs, GpuError> {
+        use cudarc::driver::{LaunchConfig, PushKernelArg};
+        // The flex primary kernel is compiled into the same combined
+        // module as the rigid kernel (`compile_primary_module` aliases
+        // `compile_rigid_module`); both `extern "C"` symbols come from the
+        // single cached `Arc<CudaModule>`.
+        let module = self.compile_primary_module()?;
+        let func = module
+            .load_function("survival_flex_primary_rows")
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("survival_flex primary load_function: {err}"),
+            })?;
+
+        let n = flat.n;
+        let r = flat.r;
+        let stream = &self.inner.stream;
+        let mk_htod_f64 = |slice: &[f64], name: &str| -> Result<_, GpuError> {
+            stream
+                .clone_htod(slice)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("survival_flex primary memcpy_stod {name}: {err}"),
+                })
+        };
+        let mk_htod_i32 = |slice: &[i32], name: &str| -> Result<_, GpuError> {
+            stream
+                .clone_htod(slice)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("survival_flex primary memcpy_stod {name}: {err}"),
+                })
+        };
+
+        let d_e_eta = mk_htod_f64(&flat.e_eta, "e_eta")?;
+        let d_e_eta_u = mk_htod_f64(&flat.e_eta_u, "e_eta_u")?;
+        let d_e_eta_uv = mk_htod_f64(&flat.e_eta_uv, "e_eta_uv")?;
+        let d_x_eta = mk_htod_f64(&flat.x_eta, "x_eta")?;
+        let d_x_chi = mk_htod_f64(&flat.x_chi, "x_chi")?;
+        let d_x_d = mk_htod_f64(&flat.x_d, "x_d")?;
+        let d_x_eta_u = mk_htod_f64(&flat.x_eta_u, "x_eta_u")?;
+        let d_x_eta_uv = mk_htod_f64(&flat.x_eta_uv, "x_eta_uv")?;
+        let d_x_chi_u = mk_htod_f64(&flat.x_chi_u, "x_chi_u")?;
+        let d_x_chi_uv = mk_htod_f64(&flat.x_chi_uv, "x_chi_uv")?;
+        let d_x_d_u = mk_htod_f64(&flat.x_d_u, "x_d_u")?;
+        let d_x_d_uv = mk_htod_f64(&flat.x_d_uv, "x_d_uv")?;
+        let d_wi = mk_htod_f64(&flat.wi, "wi")?;
+        let d_di = mk_htod_f64(&flat.di, "di")?;
+        let d_q1 = mk_htod_f64(&flat.q1, "q1")?;
+        let d_qd1 = mk_htod_f64(&flat.qd1, "qd1")?;
+        let d_entry_k1 = mk_htod_f64(&flat.entry_k1, "entry_k1")?;
+        let d_entry_k2 = mk_htod_f64(&flat.entry_k2, "entry_k2")?;
+        let d_exit_k1 = mk_htod_f64(&flat.exit_k1, "exit_k1")?;
+        let d_exit_k2 = mk_htod_f64(&flat.exit_k2, "exit_k2")?;
+        let d_log_surv0 = mk_htod_f64(&flat.log_surv0, "log_surv0")?;
+        let d_log_surv1 = mk_htod_f64(&flat.log_surv1, "log_surv1")?;
+        let d_q1_index = mk_htod_i32(&flat.q1_index, "q1_index")?;
+        let d_qd1_index = mk_htod_i32(&flat.qd1_index, "qd1_index")?;
+
+        let mut d_nll =
+            stream
+                .alloc_zeros::<f64>(n)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("survival_flex primary alloc_zeros nll: {err}"),
+                })?;
+        let mut d_grad =
+            stream
+                .alloc_zeros::<f64>(n * r)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("survival_flex primary alloc_zeros grad: {err}"),
+                })?;
+        let mut d_hess =
+            stream
+                .alloc_zeros::<f64>(n * r * r)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("survival_flex primary alloc_zeros hess: {err}"),
+                })?;
+        let mut d_status =
+            stream
+                .alloc_zeros::<i32>(n)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("survival_flex primary alloc_zeros status: {err}"),
+                })?;
+
+        let n_i32 = i32::try_from(n).map_err(|_| GpuError::DriverCallFailed {
+            reason: format!("survival_flex primary n={n} overflows i32"),
+        })?;
+        let r_i32 = i32::try_from(r).map_err(|_| GpuError::DriverCallFailed {
+            reason: format!("survival_flex primary r={r} overflows i32"),
+        })?;
+
+        let block: u32 = 256;
+        let grid: u32 = ((n as u32) + block - 1) / block;
+        let cfg = LaunchConfig {
+            grid_dim: (grid.max(1), 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = stream.launch_builder(&func);
+        // Argument order MUST match the kernel signature exactly:
+        // (n, r, e_eta, e_eta_u, e_eta_uv, x_eta, x_chi, x_d, x_eta_u,
+        //  x_eta_uv, x_chi_u, x_chi_uv, x_d_u, x_d_uv, wi, di, q1, qd1,
+        //  entry_k1, entry_k2, exit_k1, exit_k2, log_surv0, log_surv1,
+        //  q1_index, qd1_index, out_nll, out_grad, out_hess, row_status).
+        builder
+            .arg(&n_i32)
+            .arg(&r_i32)
+            .arg(&d_e_eta)
+            .arg(&d_e_eta_u)
+            .arg(&d_e_eta_uv)
+            .arg(&d_x_eta)
+            .arg(&d_x_chi)
+            .arg(&d_x_d)
+            .arg(&d_x_eta_u)
+            .arg(&d_x_eta_uv)
+            .arg(&d_x_chi_u)
+            .arg(&d_x_chi_uv)
+            .arg(&d_x_d_u)
+            .arg(&d_x_d_uv)
+            .arg(&d_wi)
+            .arg(&d_di)
+            .arg(&d_q1)
+            .arg(&d_qd1)
+            .arg(&d_entry_k1)
+            .arg(&d_entry_k2)
+            .arg(&d_exit_k1)
+            .arg(&d_exit_k2)
+            .arg(&d_log_surv0)
+            .arg(&d_log_surv1)
+            .arg(&d_q1_index)
+            .arg(&d_qd1_index)
+            .arg(&mut d_nll)
+            .arg(&mut d_grad)
+            .arg(&mut d_hess)
+            .arg(&mut d_status);
+        // SAFETY: every argument is a typed device pointer / scalar
+        // matching the `survival_flex_primary_rows` signature above, and
+        // grid/block cover exactly `n` rows.  Out-of-range threads
+        // early-return; the kernel re-checks `r ≤ MAX_R` per thread.
+        unsafe { builder.launch(cfg) }.map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("survival_flex primary launch: {err}"),
+        })?;
+
+        let nll = stream
+            .clone_dtoh(&d_nll)
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("survival_flex primary memcpy_dtoh nll: {err}"),
+            })?;
+        let grad = stream
+            .clone_dtoh(&d_grad)
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("survival_flex primary memcpy_dtoh grad: {err}"),
+            })?;
+        let hess = stream
+            .clone_dtoh(&d_hess)
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("survival_flex primary memcpy_dtoh hess: {err}"),
+            })?;
+        let row_status =
+            stream
+                .clone_dtoh(&d_status)
+                .map_err(|err| GpuError::DriverCallFailed {
+                    reason: format!("survival_flex primary memcpy_dtoh status: {err}"),
+                })?;
+        stream
+            .synchronize()
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("survival_flex primary synchronize: {err}"),
+            })?;
+
+        Ok(SurvivalFlexPrimaryRowOutputs {
+            nll,
+            grad,
+            hess,
+            row_status,
+        })
+    }
+}
+
+/// CPU oracle for the flex row-primary kernel — the parity reference the
+/// V100 verification pass lands against.  Computes the per-row NLL,
+/// gradient and Hessian with the EXACT same operator order as the device
+/// `survival_flex_primary_rows` kernel (and as
+/// `try_device_step5_primary_assembly` / the family helper
+/// `compute_row_flex_primary_gradient_hessian_from_parts`), producing the
+/// flat batch layout the launcher returns.
+///
+/// Rows whose `exit.chi` / `exit.d` / `qd1` are non-positive or non-finite
+/// get `row_status = 2` and zeroed outputs — exactly the kernel's
+/// belt-and-suspenders reject.  All other rows get `row_status = 0`.
+pub fn cpu_oracle_flex_primary_rows(
+    rows: &[SurvivalFlexPrimaryRow<'_>],
+) -> Result<SurvivalFlexPrimaryRowOutputs, GpuError> {
+    if rows.is_empty() {
+        return Ok(SurvivalFlexPrimaryRowOutputs {
+            nll: Vec::new(),
+            grad: Vec::new(),
+            hess: Vec::new(),
+            row_status: Vec::new(),
+        });
+    }
+    let n = rows.len();
+    let r = rows[0].exit.eta_u.len();
+    // Reuse the launcher's flatten/validate so the oracle enforces the
+    // identical shape contract (single shared `r`, correct jet lengths).
+    // We only need the validation side-effect here; assert the derived
+    // `r` round-trips so the bound value stays live on every build.
+    let flat = flatten_primary_rows(rows)?;
+    if flat.r != r {
+        return Err(GpuError::DriverCallFailed {
+            reason: format!(
+                "survival_flex primary oracle: flatten r={} != derived r={r}",
+                flat.r
+            ),
+        });
+    }
+
+    let mut nll = vec![0.0_f64; n];
+    let mut grad = vec![0.0_f64; n * r];
+    let mut hess = vec![0.0_f64; n * r * r];
+    let mut row_status = vec![0_i32; n];
+
+    let ln_tau = std::f64::consts::TAU.ln();
+
+    for (i, row) in rows.iter().enumerate() {
+        let exit_chi = row.exit.chi;
+        let exit_eta = row.exit.eta;
+        let exit_d = row.exit.d;
+        let qd1 = row.qd1;
+
+        let bad = !exit_chi.is_finite()
+            || exit_chi <= 0.0
+            || !exit_d.is_finite()
+            || exit_d <= 0.0
+            || !qd1.is_finite()
+            || qd1 <= 0.0;
+        if bad {
+            row_status[i] = 2;
+            continue;
+        }
+
+        let wi = row.wi;
+        let di = row.di;
+        let q1 = row.q1;
+        let q1_index = primary_index_to_i32(row.q1_index);
+        let qd1_index = primary_index_to_i32(row.qd1_index);
+
+        // ── NLL ──────────────────────────────────────────────────────────
+        let log_phi_eta1 = -0.5 * (exit_eta * exit_eta + ln_tau);
+        let log_phi_q1 = -0.5 * (q1 * q1 + ln_tau);
+        nll[i] = wi
+            * (row.log_surv0 - (1.0 - di) * row.log_surv1
+                - di * log_phi_eta1
+                - di * exit_chi.ln()
+                - di * log_phi_q1
+                + di * exit_d.ln()
+                - di * qd1.ln());
+
+        let entry_u1 = -row.entry_k1;
+        let entry_u2 = row.entry_k2;
+        let exit_surv_u1 = -row.exit_k1;
+        let exit_surv_u2 = row.exit_k2;
+
+        let base_u = i * r;
+        let base_uv = i * r * r;
+
+        // ── Gradient ───────────────────────────────────────────────────────
+        for u in 0..r {
+            let mut val = 0.0;
+            val += entry_u1 * row.entry.eta_u[u];
+            val += exit_surv_u1 * row.exit.eta_u[u];
+            val += wi * di * exit_eta * row.exit.eta_u[u];
+            val -= wi * di * row.exit.chi_u[u] / exit_chi;
+            if (u as i32) == q1_index {
+                val += wi * di * q1;
+            }
+            val += wi * di * row.exit.d_u[u] / exit_d;
+            if (u as i32) == qd1_index {
+                val -= wi * di / qd1;
+            }
+            grad[base_u + u] = val;
+        }
+
+        // ── Hessian (full symmetric r×r) ───────────────────────────────────
+        let chi_sq = exit_chi * exit_chi;
+        let d_sq = exit_d * exit_d;
+        for u in 0..r {
+            for v in u..r {
+                let off_uv = u * r + v;
+                let mut val = 0.0;
+                val += entry_u2 * row.entry.eta_u[u] * row.entry.eta_u[v]
+                    + entry_u1 * row.entry.eta_uv[off_uv];
+                val += exit_surv_u2 * row.exit.eta_u[u] * row.exit.eta_u[v]
+                    + exit_surv_u1 * row.exit.eta_uv[off_uv];
+                val += wi
+                    * di
+                    * (row.exit.eta_u[u] * row.exit.eta_u[v]
+                        + exit_eta * row.exit.eta_uv[off_uv]);
+                // − d·log χ₁ — FLAGGED catastrophic-cancellation ratio.
+                val -= wi
+                    * di
+                    * (row.exit.chi_uv[off_uv] / exit_chi
+                        - (row.exit.chi_u[u] * row.exit.chi_u[v]) / chi_sq);
+                if (u as i32) == q1_index && (v as i32) == q1_index {
+                    val += wi * di;
+                }
+                // + d·log d — same cancellation-prone structure.
+                val += wi
+                    * di
+                    * (row.exit.d_uv[off_uv] / exit_d
+                        - (row.exit.d_u[u] * row.exit.d_u[v]) / d_sq);
+                if (u as i32) == qd1_index && (v as i32) == qd1_index {
+                    val += wi * di / (qd1 * qd1);
+                }
+                hess[base_uv + off_uv] = val;
+                if v != u {
+                    hess[base_uv + v * r + u] = val;
+                }
+            }
+        }
+    }
+
+    Ok(SurvivalFlexPrimaryRowOutputs {
+        nll,
+        grad,
+        hess,
+        row_status,
+    })
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -3559,12 +4442,21 @@ pub fn try_device_step5_primary_assembly(
 
 // ────────────────────────────────────────────────────────────────────────
 // Three thin pullback entry points.  The bodies all currently return
-// `Ok(None)` (the unsupported sentinel) because Steps 2–5 still need to
-// land the flex / cubic-cell / intercept-solve infrastructure before
-// the rigid kernel can be plugged into the full coefficient-space
-// gradient / HVP / dense-H aggregator.  Keeping the shape stable here
-// (option-typed, single shared input struct) lets Step 6 wire the
-// dispatcher without re-touching the call sites.
+// `Ok(None)` (the unsupported sentinel) because the host-side flex jet
+// assembly (Steps 2–4: cubic-cell moments → intercept solve → η/χ/d
+// jets) and the FAMILY-OWNED joint-β pullback (per-block design rows in
+// `marginal_design` / `logslope_design` / `score_warp` / `link_dev`) are
+// not yet wired through these `SurvivalFlexGpuRowInputs`-shaped entry
+// points.  The native row-primary gradient/Hessian kernel they will call
+// IS now landed: `try_flex_primary_rows` (Step 5) takes the assembled
+// per-row jet and returns the per-row primary `(nll, grad[r], hess[r×r])`
+// on the GPU.  Once the host orchestration builds the jet and the family
+// supplies the design-row pullback, these three entry points fold
+// `try_flex_primary_rows` outputs into the coefficient-space
+// gradient/HVP/dense-H.  Until then they stay `Ok(None)` so the
+// dispatcher falls back to CPU.  Keeping the shape stable here
+// (option-typed, single shared input struct) lets that wiring land
+// without re-touching the call sites.
 // ────────────────────────────────────────────────────────────────────────
 
 /// Evaluate the survival-flex negative log-likelihood and joint-β
@@ -4589,6 +5481,364 @@ mod survival_flex_gpu_tests {
                 assert!(reason.contains("derivative_guard"), "got: {reason}");
             }
             other => panic!("expected DriverCallFailed for invalid guard, got {other:?}"),
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Step 5 — flex row-primary gradient/Hessian kernel parity.
+    //
+    // The CPU oracle `cpu_oracle_flex_primary_rows` is the parity target
+    // the V100 verification pass lands against; it mirrors the device
+    // `survival_flex_primary_rows` kernel term-for-term.  The synthetic
+    // jets below are NOT physically consistent survival jets — they are
+    // arbitrary-but-finite values that exercise EVERY arithmetic path in
+    // the kernel (entry/exit survival k1/k2 terms, the event log φ(η₁)
+    // curvature, the χ and d ratio terms, and the q1/qd1 perturbation
+    // bumps), which is exactly what a launcher↔oracle bit-parity check
+    // needs.  Physical-jet end-to-end quality is covered upstream by the
+    // family's own flex tests.
+    // ────────────────────────────────────────────────────────────────────
+
+    /// Build `n_rows` synthetic flex primary rows of local dimension `r`.
+    /// The per-row jet entries are deterministic functions of `(i, u, v)`
+    /// so the oracle and the device see identical inputs.  Returns the
+    /// owned backing storage plus the row views (the views borrow the
+    /// storage, so the storage must outlive the rows — callers keep both).
+    fn make_flex_primary_storage(n_rows: usize, r: usize) -> FlexPrimaryStorage {
+        let mut s = FlexPrimaryStorage::new(n_rows, r);
+        for i in 0..n_rows {
+            let fi = (i as f64) + 1.0;
+            // entry jet
+            s.e_eta.push(0.3 * fi - 0.4);
+            // exit jet scalars: chi/d strictly positive, qd1 positive.
+            s.x_eta.push(0.2 * fi - 0.1);
+            s.x_chi.push(0.7 + 0.15 * fi);
+            s.x_d.push(1.1 + 0.2 * fi);
+            for u in 0..r {
+                let fu = (u as f64) + 1.0;
+                s.e_eta_u.push(0.11 * fu - 0.05 * fi);
+                s.x_eta_u.push(0.07 * fu + 0.03 * fi);
+                s.x_chi_u.push(0.04 * fu - 0.02 * fi);
+                s.x_d_u.push(0.06 * fu + 0.01 * fi);
+            }
+            for u in 0..r {
+                for v in 0..r {
+                    // Symmetric r×r second jets.
+                    let fu = (u as f64) + 1.0;
+                    let fv = (v as f64) + 1.0;
+                    let sym = (fu * fv).sqrt();
+                    s.e_eta_uv.push(0.02 * sym - 0.01 * fi);
+                    s.x_eta_uv.push(0.015 * sym + 0.005 * fi);
+                    s.x_chi_uv.push(0.012 * sym - 0.004 * fi);
+                    s.x_d_uv.push(0.018 * sym + 0.002 * fi);
+                }
+            }
+            s.wi.push(0.8 + 0.1 * fi);
+            // Alternate censored / observed rows so both NLL branches run.
+            s.di.push(if i % 2 == 0 { 1.0 } else { 0.0 });
+            s.q1.push(0.25 * fi - 0.5);
+            s.qd1.push(0.9 + 0.05 * fi);
+            s.entry_k1.push(-0.3 * fi);
+            s.entry_k2.push(0.2 * fi);
+            s.exit_k1.push(-0.25 * fi);
+            s.exit_k2.push(0.15 * fi);
+            s.log_surv0.push(-0.1 * fi);
+            s.log_surv1.push(-0.2 * fi);
+            // Route the q1/qd1 perturbation bumps onto real primary slots
+            // (only meaningful when r ≥ 2) so the diagonal `if (u==index)`
+            // branches fire on at least one row.
+            s.q1_index.push(if r >= 1 { 0 } else { usize::MAX });
+            s.qd1_index.push(if r >= 2 { 1 } else { usize::MAX });
+        }
+        s
+    }
+
+    /// Owned backing storage for the synthetic flex primary batch, with a
+    /// `rows()` accessor that re-slices the flat buffers into the borrowed
+    /// `SurvivalFlexPrimaryRow` views the API consumes.
+    struct FlexPrimaryStorage {
+        n_rows: usize,
+        r: usize,
+        e_eta: Vec<f64>,
+        e_eta_u: Vec<f64>,
+        e_eta_uv: Vec<f64>,
+        x_eta: Vec<f64>,
+        x_chi: Vec<f64>,
+        x_d: Vec<f64>,
+        x_eta_u: Vec<f64>,
+        x_eta_uv: Vec<f64>,
+        x_chi_u: Vec<f64>,
+        x_chi_uv: Vec<f64>,
+        x_d_u: Vec<f64>,
+        x_d_uv: Vec<f64>,
+        wi: Vec<f64>,
+        di: Vec<f64>,
+        q1: Vec<f64>,
+        qd1: Vec<f64>,
+        entry_k1: Vec<f64>,
+        entry_k2: Vec<f64>,
+        exit_k1: Vec<f64>,
+        exit_k2: Vec<f64>,
+        log_surv0: Vec<f64>,
+        log_surv1: Vec<f64>,
+        q1_index: Vec<usize>,
+        qd1_index: Vec<usize>,
+    }
+
+    impl FlexPrimaryStorage {
+        fn new(n_rows: usize, r: usize) -> Self {
+            FlexPrimaryStorage {
+                n_rows,
+                r,
+                e_eta: Vec::new(),
+                e_eta_u: Vec::new(),
+                e_eta_uv: Vec::new(),
+                x_eta: Vec::new(),
+                x_chi: Vec::new(),
+                x_d: Vec::new(),
+                x_eta_u: Vec::new(),
+                x_eta_uv: Vec::new(),
+                x_chi_u: Vec::new(),
+                x_chi_uv: Vec::new(),
+                x_d_u: Vec::new(),
+                x_d_uv: Vec::new(),
+                wi: Vec::new(),
+                di: Vec::new(),
+                q1: Vec::new(),
+                qd1: Vec::new(),
+                entry_k1: Vec::new(),
+                entry_k2: Vec::new(),
+                exit_k1: Vec::new(),
+                exit_k2: Vec::new(),
+                log_surv0: Vec::new(),
+                log_surv1: Vec::new(),
+                q1_index: Vec::new(),
+                qd1_index: Vec::new(),
+            }
+        }
+
+        fn rows(&self) -> Vec<SurvivalFlexPrimaryRow<'_>> {
+            let r = self.r;
+            let rr = r * r;
+            (0..self.n_rows)
+                .map(|i| SurvivalFlexPrimaryRow {
+                    entry: SurvivalFlexPrimaryTimepointRow {
+                        eta: self.e_eta[i],
+                        chi: 0.0,
+                        d: 0.0,
+                        eta_u: &self.e_eta_u[i * r..(i + 1) * r],
+                        eta_uv: &self.e_eta_uv[i * rr..(i + 1) * rr],
+                        // Entry χ/d jets never read by the kernel; point
+                        // them at the entry η jets so the slice lengths
+                        // are well-formed without allocating.
+                        chi_u: &self.e_eta_u[i * r..(i + 1) * r],
+                        chi_uv: &self.e_eta_uv[i * rr..(i + 1) * rr],
+                        d_u: &self.e_eta_u[i * r..(i + 1) * r],
+                        d_uv: &self.e_eta_uv[i * rr..(i + 1) * rr],
+                    },
+                    exit: SurvivalFlexPrimaryTimepointRow {
+                        eta: self.x_eta[i],
+                        chi: self.x_chi[i],
+                        d: self.x_d[i],
+                        eta_u: &self.x_eta_u[i * r..(i + 1) * r],
+                        eta_uv: &self.x_eta_uv[i * rr..(i + 1) * rr],
+                        chi_u: &self.x_chi_u[i * r..(i + 1) * r],
+                        chi_uv: &self.x_chi_uv[i * rr..(i + 1) * rr],
+                        d_u: &self.x_d_u[i * r..(i + 1) * r],
+                        d_uv: &self.x_d_uv[i * rr..(i + 1) * rr],
+                    },
+                    wi: self.wi[i],
+                    di: self.di[i],
+                    q1: self.q1[i],
+                    qd1: self.qd1[i],
+                    q1_index: self.q1_index[i],
+                    qd1_index: self.qd1_index[i],
+                    entry_k1: self.entry_k1[i],
+                    entry_k2: self.entry_k2[i],
+                    exit_k1: self.exit_k1[i],
+                    exit_k2: self.exit_k2[i],
+                    log_surv0: self.log_surv0[i],
+                    log_surv1: self.log_surv1[i],
+                })
+                .collect()
+        }
+    }
+
+    #[test]
+    fn flex_primary_oracle_is_finite_and_symmetric() {
+        // The oracle is the V100 parity target — assert it produces
+        // finite, symmetric per-row Hessians and finite gradients/NLL
+        // across a small batch so the device pass has a known-good
+        // target.  Also confirms the entry point returns `Ok(None)` on a
+        // non-CUDA host (clean CPU fallback).
+        let r = 3;
+        let storage = make_flex_primary_storage(5, r);
+        let rows = storage.rows();
+        let oracle = cpu_oracle_flex_primary_rows(&rows).expect("oracle");
+        assert_eq!(oracle.nll.len(), rows.len());
+        assert_eq!(oracle.grad.len(), rows.len() * r);
+        assert_eq!(oracle.hess.len(), rows.len() * r * r);
+        for i in 0..rows.len() {
+            assert_eq!(oracle.row_status[i], 0, "row {i} unexpectedly rejected");
+            assert!(oracle.nll[i].is_finite(), "row {i} nll non-finite");
+            for u in 0..r {
+                assert!(
+                    oracle.grad[i * r + u].is_finite(),
+                    "row {i} grad[{u}] non-finite"
+                );
+                for v in 0..r {
+                    let h_uv = oracle.hess[i * r * r + u * r + v];
+                    let h_vu = oracle.hess[i * r * r + v * r + u];
+                    assert!(h_uv.is_finite(), "row {i} hess[{u}][{v}] non-finite");
+                    assert!(
+                        (h_uv - h_vu).abs() <= 1e-12 * (1.0 + h_uv.abs()),
+                        "row {i} hess asymmetry [{u}][{v}]={h_uv} vs [{v}][{u}]={h_vu}"
+                    );
+                }
+            }
+        }
+
+        // On a non-CUDA host the launcher entry point must fall back to
+        // `Ok(None)` (or `Ok(Some)` on V100 — covered by the ignored
+        // parity test); never `Err` for this supported shape.
+        if !SurvivalFlexGpuBackend::compiled() {
+            match try_flex_primary_rows(&rows) {
+                Ok(None) => {}
+                other => panic!("expected Ok(None) on non-Linux build, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn flex_primary_rejects_ragged_r() {
+        // Two rows with mismatched `r` is an unsupported shape: the
+        // flatten/validate must surface a `DriverCallFailed` (the kernel
+        // launches with one runtime `r`).  Build manually so row 1 has a
+        // shorter exit.eta_u than row 0.
+        let eu0 = [0.1, 0.2, 0.3];
+        let euv0 = [0.0_f64; 9];
+        let eu1 = [0.1, 0.2];
+        let euv1 = [0.0_f64; 4];
+        let mk = |eu: &[f64], euv: &[f64]| SurvivalFlexPrimaryTimepointRow {
+            eta: 0.0,
+            chi: 1.0,
+            d: 1.0,
+            eta_u: eu,
+            eta_uv: euv,
+            chi_u: eu,
+            chi_uv: euv,
+            d_u: eu,
+            d_uv: euv,
+        };
+        let row0 = SurvivalFlexPrimaryRow {
+            entry: mk(&eu0, &euv0),
+            exit: mk(&eu0, &euv0),
+            wi: 1.0,
+            di: 1.0,
+            q1: 0.0,
+            qd1: 1.0,
+            q1_index: usize::MAX,
+            qd1_index: usize::MAX,
+            entry_k1: 0.0,
+            entry_k2: 0.0,
+            exit_k1: 0.0,
+            exit_k2: 0.0,
+            log_surv0: 0.0,
+            log_surv1: 0.0,
+        };
+        let row1 = SurvivalFlexPrimaryRow {
+            entry: mk(&eu1, &euv1),
+            exit: mk(&eu1, &euv1),
+            ..row0
+        };
+        // `r` is taken from row 0 (=3); row 1's length-2 jets must fail.
+        match cpu_oracle_flex_primary_rows(&[row0, row1]) {
+            Err(GpuError::DriverCallFailed { reason }) => {
+                assert!(reason.contains("expected 3"), "reason was: {reason}");
+            }
+            other => panic!("expected DriverCallFailed for ragged r, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flex_primary_rejects_nonpositive_chi() {
+        // A non-positive exit.chi must produce `row_status == 2` and
+        // zeroed outputs — the kernel's belt-and-suspenders reject.
+        let r = 2;
+        let mut storage = make_flex_primary_storage(1, r);
+        storage.x_chi[0] = -1.0; // invalid
+        let rows = storage.rows();
+        let oracle = cpu_oracle_flex_primary_rows(&rows).expect("oracle");
+        assert_eq!(oracle.row_status[0], 2, "expected reject status");
+        assert_eq!(oracle.nll[0], 0.0);
+        assert!(oracle.grad[..r].iter().all(|&g| g == 0.0));
+        assert!(oracle.hess[..r * r].iter().all(|&h| h == 0.0));
+    }
+
+    /// V100 parity: the device `survival_flex_primary_rows` kernel must
+    /// match `cpu_oracle_flex_primary_rows` to round-off across a batch
+    /// that exercises every arithmetic path (both event branches, the
+    /// χ/d ratio terms, the q1/qd1 perturbation bumps).  `#[ignore]` +
+    /// Linux-gated: runs only on the CUDA host in the V100 verification
+    /// pass.
+    ///
+    /// FLAGGED for the V100 reviewer: the `χ_uv/χ − χ_u·χ_v/χ²` and
+    /// `d_uv/d − d_u·d_v/d²` Hessian ratio terms are
+    /// catastrophic-cancellation-prone; the device and CPU compute them
+    /// in the identical operator order so they must agree to round-off,
+    /// but a per-row tolerance scaled by `(1 + |cpu|)` is required because
+    /// the absolute magnitude can be tiny relative to the inputs.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires CUDA device (V100) — run in the GPU verification pass"]
+    fn flex_primary_gpu_matches_cpu_oracle_v100() {
+        // Cover r=1 (scalar bank), r=4 (rigid-equivalent width), and a
+        // wider r=7 so the r×r loop and the diagonal perturbation
+        // branches all run on the device.
+        for &r in &[1_usize, 4, 7] {
+            let storage = make_flex_primary_storage(6, r);
+            let rows = storage.rows();
+            let cpu = cpu_oracle_flex_primary_rows(&rows).expect("cpu oracle");
+
+            let gpu = match try_flex_primary_rows(&rows) {
+                Ok(Some(out)) => out,
+                Ok(None) => panic!("r={r}: GPU returned None on a CUDA host (supported shape)"),
+                Err(err) => panic!("r={r}: GPU launch failed: {err:?}"),
+            };
+
+            assert_eq!(gpu.nll.len(), cpu.nll.len());
+            for i in 0..rows.len() {
+                assert_eq!(
+                    gpu.row_status[i], cpu.row_status[i],
+                    "r={r} row {i}: status mismatch"
+                );
+                let nll_err = (gpu.nll[i] - cpu.nll[i]).abs();
+                assert!(
+                    nll_err <= 1e-10 * (1.0 + cpu.nll[i].abs()),
+                    "r={r} row {i}: nll parity gpu={} cpu={} err={nll_err}",
+                    gpu.nll[i],
+                    cpu.nll[i]
+                );
+                for u in 0..r {
+                    let g_err = (gpu.grad[i * r + u] - cpu.grad[i * r + u]).abs();
+                    assert!(
+                        g_err <= 1e-8 * (1.0 + cpu.grad[i * r + u].abs()),
+                        "r={r} row {i}: grad[{u}] parity gpu={} cpu={} err={g_err}",
+                        gpu.grad[i * r + u],
+                        cpu.grad[i * r + u]
+                    );
+                    for v in 0..r {
+                        let idx = i * r * r + u * r + v;
+                        let h_err = (gpu.hess[idx] - cpu.hess[idx]).abs();
+                        assert!(
+                            h_err <= 1e-8 * (1.0 + cpu.hess[idx].abs()),
+                            "r={r} row {i}: hess[{u}][{v}] parity gpu={} cpu={} err={h_err}",
+                            gpu.hess[idx],
+                            cpu.hess[idx]
+                        );
+                    }
+                }
+            }
         }
     }
 
