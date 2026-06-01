@@ -993,6 +993,11 @@ struct DynamicQBlockwiseAccumulator {
     hess_score_warp: Option<Array2<f64>>,
     grad_link_dev: Option<Array1<f64>>,
     hess_link_dev: Option<Array2<f64>>,
+    /// Absorbed Stage-1 influence block (#461): the trailing block-diagonal
+    /// grad/Hess over the `p₁` absorber coefficients `γ`, projected from the
+    /// single `o_infl` primary scalar through the `Z̃_infl` design row.
+    grad_influence: Option<Array1<f64>>,
+    hess_influence: Option<Array2<f64>>,
 }
 
 #[derive(Clone)]
@@ -1031,6 +1036,14 @@ impl DynamicQBlockwiseAccumulator {
                 .link_dev
                 .as_ref()
                 .map(|range| Array2::zeros((range.len(), range.len()))),
+            grad_influence: slices
+                .influence
+                .as_ref()
+                .map(|range| Array1::zeros(range.len())),
+            hess_influence: slices
+                .influence
+                .as_ref()
+                .map(|range| Array2::zeros((range.len(), range.len()))),
         }
     }
 
@@ -1044,8 +1057,10 @@ impl DynamicQBlockwiseAccumulator {
         self.hess_logslope += &other.hess_logslope;
         add_optional_vector(&mut self.grad_score_warp, &other.grad_score_warp);
         add_optional_vector(&mut self.grad_link_dev, &other.grad_link_dev);
+        add_optional_vector(&mut self.grad_influence, &other.grad_influence);
         add_optional_matrix(&mut self.hess_score_warp, &other.hess_score_warp);
         add_optional_matrix(&mut self.hess_link_dev, &other.hess_link_dev);
+        add_optional_matrix(&mut self.hess_influence, &other.hess_influence);
     }
 
     fn into_family_evaluation(self) -> FamilyEvaluation {
@@ -1070,6 +1085,12 @@ impl DynamicQBlockwiseAccumulator {
             });
         }
         if let (Some(gradient), Some(hessian)) = (self.grad_link_dev, self.hess_link_dev) {
+            blockworking_sets.push(BlockWorkingSet::ExactNewton {
+                gradient,
+                hessian: SymmetricMatrix::Dense(hessian),
+            });
+        }
+        if let (Some(gradient), Some(hessian)) = (self.grad_influence, self.hess_influence) {
             blockworking_sets.push(BlockWorkingSet::ExactNewton {
                 gradient,
                 hessian: SymmetricMatrix::Dense(hessian),
@@ -8677,6 +8698,34 @@ impl SurvivalMarginalSlopeFamily {
             *hessian += &primary_hessian
                 .slice(s![primary_range.clone(), primary_range.clone()])
                 .to_owned();
+        }
+        // Absorbed-influence diagonal block (#461). Unlike the identity flex
+        // blocks above (whose basis IS the primary coordinate, so the block grad
+        // is a slice copy), the absorber's `p₁` coefficients project from the
+        // single `o_infl` primary scalar through `Z̃_infl[row,:]`:
+        //   grad_i = -primary_gradient[infl] · Z̃[row,i]
+        //   hess_ij += primary_hessian[[infl,infl]] · Z̃[row,i] · Z̃[row,j]
+        if let (Some(infl_idx), Some(gradient), Some(hessian)) = (
+            primary.infl,
+            acc.grad_influence.as_mut(),
+            acc.hess_influence.as_mut(),
+        ) {
+            let z_tilde = self.influence_absorber.as_ref().ok_or_else(|| {
+                "accumulate_dynamic_q_blockwise_row: influence primary index present but no Z̃ design"
+                    .to_string()
+            })?;
+            let z_row = z_tilde.row(row);
+            let g_infl = primary_gradient[infl_idx];
+            let h_infl = primary_hessian[[infl_idx, infl_idx]];
+            for i in 0..z_row.len() {
+                gradient[i] -= g_infl * z_row[i];
+                if h_infl != 0.0 {
+                    let hz = h_infl * z_row[i];
+                    for j in 0..z_row.len() {
+                        hessian[[i, j]] += hz * z_row[j];
+                    }
+                }
+            }
         }
         Ok(())
     }
