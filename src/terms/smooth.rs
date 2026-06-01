@@ -2604,7 +2604,14 @@ fn is_pure_duchon_aniso_term(spec: &TermCollectionSpec, term_idx: usize) -> bool
 }
 
 fn spatial_term_supports_hyper_optimization(spec: &TermCollectionSpec, term_idx: usize) -> bool {
-    get_spatial_length_scale(spec, term_idx).is_some() || is_pure_duchon_aniso_term(spec, term_idx)
+    // Duchon anisotropy η is a FIXED, geometry-derived basis parameter, NOT a
+    // REML hyper axis: the metric is estimated once from the knot-cloud spread
+    // (`maybe_initialize_aniso_contrasts`, applied on every basis build) and the
+    // Hilbert-scale λ's carry all learned smoothness. So a pure Duchon (no κ)
+    // contributes no outer optimization axis even when `scale_dims` is on —
+    // "standardize the geometry, then learn the smoothness." Only an explicit
+    // kernel length scale κ (the Matérn / hybrid path) is optimized here.
+    get_spatial_length_scale(spec, term_idx).is_some()
 }
 
 /// Returns `true` when a spatial term has NO outer optimization axes — i.e.
@@ -7110,10 +7117,8 @@ pub struct SmoothStructureAnalysis {
 ///
 /// `smoothspecs` is the same slice that [`apply_global_smooth_identifiability`] receives.
 pub fn analyze_smooth_ownership(smoothspecs: &[SmoothTermSpec]) -> SmoothStructureAnalysis {
-    let term_feature_cols: Vec<Vec<usize>> = smoothspecs
-        .iter()
-        .map(smooth_term_feature_cols)
-        .collect();
+    let term_feature_cols: Vec<Vec<usize>> =
+        smoothspecs.iter().map(smooth_term_feature_cols).collect();
     let basis_family_ranks: Vec<u8> = smoothspecs.iter().map(smooth_basis_family_rank).collect();
 
     let mut ownership_order: Vec<usize> = (0..smoothspecs.len()).collect();
@@ -9239,10 +9244,11 @@ fn compute_spatial_adaptiveweights_for_beta(
                     Array1::<f64>::zeros(exact.curvature.norm.len()),
                 ),
             };
-            let (_, inv_0) =
-                exact
-                    .magnitude
-                    .surrogateweights_posterior_snr(&var_0, weight_floor, weight_ceiling);
+            let (_, inv_0) = exact.magnitude.surrogateweights_posterior_snr(
+                &var_0,
+                weight_floor,
+                weight_ceiling,
+            );
             let (_, inv_g) =
                 exact
                     .gradient
@@ -13192,9 +13198,19 @@ pub(crate) fn try_build_spatial_log_kappa_derivativeinfo_list(
     for &term_idx in spatial_terms {
         let aniso = get_spatial_aniso_log_scales(resolvedspec, term_idx);
         let dim = get_spatial_feature_dim(resolvedspec, term_idx);
+        // Duchon anisotropy η is a fixed, geometry-derived basis parameter, never
+        // a REML hyper axis (see `spatial_term_supports_hyper_optimization`). A
+        // hybrid Duchon (explicit κ) still optimizes its scalar length scale, but
+        // through the regular κ path with η held at its geometry init — so it is
+        // excluded from the per-axis aniso enrollment here.
+        let is_duchon = matches!(
+            resolvedspec.smooth_terms.get(term_idx).map(|t| &t.basis),
+            Some(SmoothBasisSpec::Duchon { .. })
+        );
         if let (Some(eta), Some(d)) = (&aniso, dim)
             && eta.len() == d
             && d > 1
+            && !is_duchon
         {
             if let Some(entries) = try_build_spatial_term_log_kappa_aniso_derivativeinfos(
                 data,
@@ -26229,10 +26245,7 @@ mod tests {
         let fit_snr = fit(&w_snr);
 
         let region_mse = |idx: &[usize], f: &Array1<f64>| -> f64 {
-            idx.iter()
-                .map(|&j| (f[j] - truth[j]).powi(2))
-                .sum::<f64>()
-                / idx.len() as f64
+            idx.iter().map(|&j| (f[j] - truth[j]).powi(2)).sum::<f64>() / idx.len() as f64
         };
 
         let mse_flat_mag = region_mse(&left_flat, &fit_mag);

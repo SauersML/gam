@@ -3974,7 +3974,10 @@ fn run_todo_marker_history_audit(
     let mut current_contents: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     visit_files(manifest_dir, manifest_dir, &mut |rel, content| {
-        current_contents.insert(rel.to_string_lossy().replace('\\', "/"), content.to_string());
+        current_contents.insert(
+            rel.to_string_lossy().replace('\\', "/"),
+            content.to_string(),
+        );
     });
 
     for (key, previous_site) in &previous {
@@ -4008,7 +4011,10 @@ fn collect_current_todo_history_sites(
     let mut out = std::collections::BTreeMap::new();
     visit_files(manifest_dir, manifest_dir, &mut |rel, content| {
         for site in collect_todo_history_sites_from_content(rel, content, needle).into_values() {
-            out.insert((site.file.clone(), site.anchor.clone(), site.site.clone()), site);
+            out.insert(
+                (site.file.clone(), site.anchor.clone(), site.site.clone()),
+                site,
+            );
         }
     });
     out
@@ -4185,7 +4191,10 @@ fn load_todo_history_ledger(
             site: parts[2].to_string(),
             line_no,
         };
-        out.insert((site.file.clone(), site.anchor.clone(), site.site.clone()), site);
+        out.insert(
+            (site.file.clone(), site.anchor.clone(), site.site.clone()),
+            site,
+        );
     }
     out
 }

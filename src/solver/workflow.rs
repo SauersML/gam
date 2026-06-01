@@ -2910,8 +2910,8 @@ fn crossfit_score_calibration(
     }
 
     // Stage-1 response / weights / offset, resolved against the full dataset.
-    let y_col =
-        resolve_role_col(col_map, &recipe.response_column, "response").map_err(|e| e.to_string())?;
+    let y_col = resolve_role_col(col_map, &recipe.response_column, "response")
+        .map_err(|e| e.to_string())?;
     let response_full = data.values.column(y_col).to_owned();
     let weights_full = resolve_weight_column(data, col_map, recipe.weight_column.as_deref())
         .map_err(|e| e.to_string())?;
@@ -5606,9 +5606,7 @@ fn materialize_survival<'a>(
     // z_column is supplied. With a CTN Stage-1 recipe there is no dose column
     // (z is produced out-of-fold by cross-fitting) and the marginal formula
     // references only the x covariates, so no alias is needed.
-    let marginal_slope_aliased_col_map = if survival_mode
-        == SurvivalLikelihoodMode::MarginalSlope
-    {
+    let marginal_slope_aliased_col_map = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
         match config.z_column.as_deref() {
             Some(z_column) => Some(column_map_with_alias(col_map, "z", z_column)),
             None if config.ctn_stage1.is_some() => None,
@@ -5806,8 +5804,7 @@ fn materialize_survival<'a>(
                 Some(base_link),
             )
         } else if let Some(ls_formula) = config.logslope_formula.as_deref() {
-            let default_z_column =
-                marginal_z_column_name.expect("z column present when no recipe");
+            let default_z_column = marginal_z_column_name.expect("z column present when no recipe");
             let (_, ls_parsed) =
                 parse_matching_auxiliary_formula(ls_formula, &parsed.response, "logslope_formula")?;
             if ls_parsed.linkspec.is_some() {
@@ -5866,8 +5863,7 @@ fn materialize_survival<'a>(
                 Some(base_link),
             )
         } else {
-            let default_z_column =
-                marginal_z_column_name.expect("z column present when no recipe");
+            let default_z_column = marginal_z_column_name.expect("z column present when no recipe");
             validate_marginal_slope_z_column_exclusion(
                 parsed,
                 parsed,

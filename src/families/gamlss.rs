@@ -5877,7 +5877,9 @@ impl<F: LocationScaleJointPsiFamily> LocationScaleJointPsiWorkspace<F> {
         })
     }
 
-    fn subsample_rows(&self) -> Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]> {
+    fn subsample_rows(
+        &self,
+    ) -> Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]> {
         self.outer_score_subsample
             .as_ref()
             .map(|s| s.rows.as_ref().as_slice())

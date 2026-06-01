@@ -33,7 +33,11 @@ fn fit_and_predict_on_grid(formula: &str, x: &[f64], y: &[f64]) -> Vec<f64> {
         csv.push_str(&format!("{:.17e},{:.17e}\n", x[i], y[i]));
     }
     let mut tmp = std::env::temp_dir();
-    tmp.push(format!("gam_monotone_binding_{}_{}.csv", std::process::id(), n));
+    tmp.push(format!(
+        "gam_monotone_binding_{}_{}.csv",
+        std::process::id(),
+        n
+    ));
     {
         let mut f = std::fs::File::create(&tmp).expect("create synthetic csv");
         f.write_all(csv.as_bytes()).expect("write synthetic csv");

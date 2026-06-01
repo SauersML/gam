@@ -183,15 +183,8 @@ fn predict_with_conformal(
         phi,
     };
 
-    predict_full_uncertainty_conformal(
-        &predictor,
-        &input,
-        fit,
-        &gaussian_spec(),
-        &options,
-        &train,
-    )
-    .expect("conformal full-uncertainty predict")
+    predict_full_uncertainty_conformal(&predictor, &input, fit, &gaussian_spec(), &options, &train)
+        .expect("conformal full-uncertainty predict")
 }
 
 /// Fraction of held-out responses inside `[lower, upper]`.
@@ -218,13 +211,7 @@ fn conformal_covers_under_heteroscedastic_misspecification_while_plain_undercove
     let test_design = poly_design(&x_test);
 
     // Conformal-calibrated interval.
-    let conf = predict_with_conformal(
-        &fit,
-        &train_design,
-        &y_train,
-        &test_design,
-        Some(nominal),
-    );
+    let conf = predict_with_conformal(&fit, &train_design, &y_train, &test_design, Some(nominal));
     let conformal_cov = coverage(&y_test, &conf.mean_lower, &conf.mean_upper);
 
     // Plain model-based interval (no conformal).
@@ -266,13 +253,7 @@ fn conformal_covers_in_well_specified_homoscedastic_case() {
     let (x_test, y_test) = draw(2000, 0.5, false, &mut rng);
     let test_design = poly_design(&x_test);
 
-    let conf = predict_with_conformal(
-        &fit,
-        &train_design,
-        &y_train,
-        &test_design,
-        Some(nominal),
-    );
+    let conf = predict_with_conformal(&fit, &train_design, &y_train, &test_design, Some(nominal));
     let conformal_cov = coverage(&y_test, &conf.mean_lower, &conf.mean_upper);
 
     assert!(
