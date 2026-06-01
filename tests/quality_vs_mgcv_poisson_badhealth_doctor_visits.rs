@@ -280,13 +280,16 @@ fn gam_poisson_predicts_badhealth_visits_better_than_baseline() {
 ///     correlation out of sample.
 ///
 ///   BASELINE (match-or-beat): mgcv fits the SAME training rows with
-///     `gam(numvisit ~ te(age, badh, k = c(10, 2)), family = poisson,
+///     `gam(numvisit ~ te(age, badh, k = c(5, 2)), family = poisson,
 ///     method = "REML")` and predicts the SAME held-out rows on the response
 ///     scale; gam's held-out deviance must be no worse than `mgcv_dev * 1.05`.
 ///     mgcv is a baseline to match-or-beat, NOT a fitted target to reproduce.
 ///
-/// `k = c(10, 2)` caps the badh margin at its two distinct values (0/1); gam's
-/// `te(age, badh)` auto-sizes the binary margin the same way.
+/// `k = c(5, 2)` caps the badh margin at its two distinct values (0/1) so its
+/// cubic-regression (`cr`) margin is constructible — mgcv's
+/// `smooth.construct.cr.smooth.spec` errors when a margin's `k` exceeds the
+/// number of distinct covariate values. gam's `te(age, badh)` auto-sizes the
+/// binary margin the same way.
 #[test]
 fn gam_poisson_predicts_badhealth_visits_better_than_baseline_on_real_data() {
     init_parallelism();
@@ -370,7 +373,11 @@ fn gam_poisson_predicts_badhealth_visits_better_than_baseline_on_real_data() {
         ],
         r#"
         suppressPackageStartupMessages(library(mgcv))
-        m <- gam(numvisit ~ te(age, badh, k = c(10, 2)), data = df,
+        # badh is binary {0,1}: its cubic-regression (cr) margin holds at most
+        # k=2 knots, so per-margin k=c(5,2) keeps both te margins constructible
+        # (a scalar k would force k>2 on badh and break cr.smooth.spec). age has
+        # 41 distinct values, so k=5 is well within range.
+        m <- gam(numvisit ~ te(age, badh, k = c(5, 2)), data = df,
                  family = poisson, method = "REML")
         emit("fitted", as.numeric(fitted(m)))
         emit("edf", sum(m$edf))
@@ -399,7 +406,7 @@ fn gam_poisson_predicts_badhealth_visits_better_than_baseline_on_real_data() {
         ],
         r#"
         suppressPackageStartupMessages(library(mgcv))
-        m <- gam(numvisit ~ te(age, badh, k = c(10, 2)), data = df,
+        m <- gam(numvisit ~ te(age, badh, k = c(5, 2)), data = df,
                  family = poisson, method = "REML")
         k <- df$test_n[1]
         newd <- data.frame(age = df$test_age[1:k], badh = df$test_badh[1:k])
