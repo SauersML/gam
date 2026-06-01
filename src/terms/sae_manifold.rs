@@ -6245,6 +6245,7 @@ pub fn refresh_isometry_caches_from_term(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terms::analytic_penalties::IsometryReference;
     use approx::assert_abs_diff_eq;
     use ndarray::array;
 
@@ -7110,6 +7111,27 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn isometry_affine_third_jet_is_trivial_zero() -> Result<(), String> {
+        let evaluator = AffineCoordinateEvaluator { latent_dim: 3 };
+        let coords = array![[0.2, -0.3, 0.7], [1.1, 0.0, -0.4]];
+        let third = evaluator.third_jet(coords.view())?;
+        assert_eq!(third.dim(), (coords.nrows(), 4, 3, 3, 3));
+        assert!(
+            third.iter().all(|x| *x == 0.0),
+            "affine third jet must vanish identically, got {third:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn isometry_euclidean_patch_third_jet_matches_fd() -> Result<(), String> {
+        let evaluator = EuclideanPatchEvaluator::new(2, 4)?;
+        let coords = array![[0.2, -0.3], [0.7, 0.4], [-0.5, 0.9]];
+        assert_third_jet_matches_central_difference(&evaluator, coords, 1.0e-6, 1.0e-5)?;
+        Ok(())
+    }
+
     /// Issue #247: the Duchon coordinate evaluator must return a forward design
     /// and a derivative jet with *matching column counts* — the original bug
     /// was a radial-only design paired with a radial+polynomial jet (or vice
@@ -7924,6 +7946,186 @@ mod tests {
         assert_isometry_wiring_matches_fd(
             Arc::new(TorusHarmonicEvaluator::new(2, 2).unwrap()),
             array![[0.13, 0.42], [0.66, 0.19], [0.88, 0.55]],
+        );
+    }
+
+    fn deterministic_decoder(n_basis: usize, p_out: usize, seed: f64) -> Array2<f64> {
+        Array2::<f64>::from_shape_fn((n_basis, p_out), |(i, j)| {
+            let x = seed + 0.371 * (i as f64) - 0.193 * (j as f64) + 0.047 * ((i * j + 1) as f64);
+            0.8 * x.sin() + 0.35 * (1.7 * x).cos()
+        })
+    }
+
+    fn build_isometry_atom_for_evaluator(
+        evaluator: Arc<dyn SaeBasisSecondJet>,
+        kind: SaeAtomBasisKind,
+        coords: &Array2<f64>,
+        p_out: usize,
+        seed: f64,
+    ) -> (SaeManifoldAtom, IsometryPenalty, Array1<f64>) {
+        let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+        let m = phi.ncols();
+        let decoder = deterministic_decoder(m, p_out, seed);
+        let atom = SaeManifoldAtom::new(
+            "exact_hvp_atom",
+            kind,
+            coords.ncols(),
+            phi,
+            jet,
+            decoder,
+            Array2::<f64>::eye(m),
+        )
+        .unwrap()
+        .with_basis_second_jet(evaluator);
+        let target_flat: Array1<f64> = coords.iter().copied().collect();
+        let penalty = IsometryPenalty::new_euclidean(
+            PsiSlice::full(target_flat.len(), Some(coords.ncols())),
+            p_out,
+        );
+        (atom, penalty, target_flat)
+    }
+
+    fn assert_exact_isometry_hvp_matches_grad_fd(
+        evaluator: Arc<dyn SaeBasisSecondJet>,
+        kind: SaeAtomBasisKind,
+        coords: Array2<f64>,
+        p_out: usize,
+        direction: Array2<f64>,
+    ) {
+        let (atom, penalty, target_flat) =
+            build_isometry_atom_for_evaluator(evaluator, kind, &coords, p_out, 0.91);
+        let rho = array![0.0_f64];
+        let installed = refresh_isometry_caches_from_atom(&penalty, &atom, coords.view()).unwrap();
+        assert!(
+            installed,
+            "second-jet cache must be installed for exact HVP test"
+        );
+        assert!(
+            penalty.third_decoder_derivative().is_some(),
+            "non-Duchon exact HVP requires a live refreshed third-decoder-jet cache"
+        );
+        let v: Array1<f64> = direction.iter().copied().collect();
+        let exact = penalty.hvp(target_flat.view(), rho.view(), v.view());
+        assert!(
+            exact.iter().any(|x| x.abs() > 1.0e-7),
+            "exact isometry HVP should be nonzero after K refresh; got {exact:?}"
+        );
+
+        let eps = 1.0e-6;
+        let coords_plus = &coords + &(direction.mapv(|x| eps * x));
+        let coords_minus = &coords - &(direction.mapv(|x| eps * x));
+        let target_plus: Array1<f64> = coords_plus.iter().copied().collect();
+        let target_minus: Array1<f64> = coords_minus.iter().copied().collect();
+
+        refresh_isometry_caches_from_atom(&penalty, &atom, coords_plus.view()).unwrap();
+        let grad_plus = penalty.grad_target(target_plus.view(), rho.view());
+        refresh_isometry_caches_from_atom(&penalty, &atom, coords_minus.view()).unwrap();
+        let grad_minus = penalty.grad_target(target_minus.view(), rho.view());
+        refresh_isometry_caches_from_atom(&penalty, &atom, coords.view()).unwrap();
+
+        let fd = (&grad_plus - &grad_minus).mapv(|x| x / (2.0 * eps));
+        for i in 0..exact.len() {
+            let err = (exact[i] - fd[i]).abs();
+            let tol = 2.0e-4 + 3.0e-5 * exact[i].abs().max(fd[i].abs());
+            assert!(
+                err <= tol,
+                "exact isometry HVP/grad-FD mismatch at flat index {i}: exact={:.12e}, fd={:.12e}, err={:.6e}, tol={:.6e}",
+                exact[i],
+                fd[i],
+                err,
+                tol
+            );
+        }
+    }
+
+    fn assert_exact_isometry_hvp_collapses_to_gn_at_zero_residual(
+        evaluator: Arc<dyn SaeBasisSecondJet>,
+        kind: SaeAtomBasisKind,
+        coords: Array2<f64>,
+        p_out: usize,
+        direction: Array2<f64>,
+    ) {
+        let (atom, scratch, target_flat) =
+            build_isometry_atom_for_evaluator(evaluator, kind, &coords, p_out, 1.37);
+        let rho = array![0.0_f64];
+        refresh_isometry_caches_from_atom(&scratch, &atom, coords.view()).unwrap();
+        let jac = scratch
+            .jacobian_cache()
+            .expect("scratch Jacobian cache is available after refresh");
+        let d = coords.ncols();
+        let n_obs = coords.nrows();
+        let mut g_ref = Array2::<f64>::zeros((n_obs, d * d));
+        for n in 0..n_obs {
+            for a in 0..d {
+                for b in 0..d {
+                    let mut acc = 0.0_f64;
+                    for out_col in 0..p_out {
+                        acc += jac[[n, out_col * d + a]] * jac[[n, out_col * d + b]];
+                    }
+                    g_ref[[n, a * d + b]] = acc;
+                }
+            }
+        }
+
+        let penalty = IsometryPenalty::new_euclidean(
+            PsiSlice::full(target_flat.len(), Some(coords.ncols())),
+            p_out,
+        )
+        .with_reference(IsometryReference::UserSupplied(Arc::new(g_ref)));
+        refresh_isometry_caches_from_atom(&penalty, &atom, coords.view()).unwrap();
+        assert!(
+            penalty.third_decoder_derivative().is_some(),
+            "zero-residual exact/GN test must still carry the real refreshed K cache"
+        );
+        let v: Array1<f64> = direction.iter().copied().collect();
+        let exact = penalty.hvp(target_flat.view(), rho.view(), v.view());
+        let gn = penalty.psd_majorizer_hvp(target_flat.view(), rho.view(), v.view());
+        assert!(
+            gn.iter().any(|x| x.abs() > 1.0e-8),
+            "GN block should be nonzero so exact/GN equality is not vacuous"
+        );
+        for i in 0..exact.len() {
+            assert_abs_diff_eq!(exact[i], gn[i], epsilon = 1.0e-10);
+        }
+    }
+
+    #[test]
+    fn isometry_exact_hvp_sphere_matches_grad_fd_and_uses_refreshed_k() {
+        assert_exact_isometry_hvp_matches_grad_fd(
+            Arc::new(SphereChartEvaluator),
+            SaeAtomBasisKind::Sphere,
+            array![[-0.61, 0.23], [-0.18, -1.07], [0.42, 0.81], [0.73, -0.39]],
+            4,
+            array![[0.31, -0.27], [-0.18, 0.22], [0.14, 0.19], [-0.25, -0.11]],
+        );
+    }
+
+    #[test]
+    fn isometry_exact_hvp_torus_matches_grad_fd_and_uses_refreshed_k() {
+        assert_exact_isometry_hvp_matches_grad_fd(
+            Arc::new(TorusHarmonicEvaluator::new(2, 2).unwrap()),
+            SaeAtomBasisKind::Torus,
+            array![[0.13, 0.42], [0.66, 0.19], [0.88, 0.55]],
+            3,
+            array![[0.21, -0.16], [-0.24, 0.18], [0.13, 0.27]],
+        );
+    }
+
+    #[test]
+    fn isometry_exact_hvp_sphere_and_torus_collapse_to_gn_at_zero_residual() {
+        assert_exact_isometry_hvp_collapses_to_gn_at_zero_residual(
+            Arc::new(SphereChartEvaluator),
+            SaeAtomBasisKind::Sphere,
+            array![[-0.52, 0.17], [-0.11, -0.93], [0.39, 0.74]],
+            4,
+            array![[0.17, -0.21], [-0.13, 0.08], [0.22, 0.19]],
+        );
+        assert_exact_isometry_hvp_collapses_to_gn_at_zero_residual(
+            Arc::new(TorusHarmonicEvaluator::new(2, 2).unwrap()),
+            SaeAtomBasisKind::Torus,
+            array![[0.19, 0.31], [0.57, 0.73], [0.84, 0.12]],
+            3,
+            array![[0.11, -0.14], [-0.20, 0.07], [0.16, 0.23]],
         );
     }
 
