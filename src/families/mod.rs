@@ -25,6 +25,7 @@ pub mod latent_interval;
 pub mod latent_survival;
 pub mod location_scale_engine;
 pub mod lognormal_kernel;
+pub mod marginal_slope_orthogonal;
 pub mod marginal_slope_shared;
 pub mod monotone_root;
 pub mod multinomial;
