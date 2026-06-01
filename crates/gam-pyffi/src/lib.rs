@@ -22327,7 +22327,7 @@ fn sindy_library_array<'py>(
     use gam::solver::sindy::{SindyLibraryTerm, sindy_library};
     let mut terms: Vec<SindyLibraryTerm> = Vec::with_capacity(spec.len());
     for entry in spec.iter() {
-        let tuple = entry.downcast::<PyTuple>().map_err(|_| {
+        let tuple = entry.cast::<PyTuple>().map_err(|_| {
             py_value_error(
                 "sindy_library_array: each spec entry must be a (token, column, name) tuple"
                     .to_string(),
