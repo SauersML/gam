@@ -53,7 +53,13 @@ fn gam_alo_sandwich_ci_covers_true_linear_predictor_at_nominal_rate() {
     // the 95% CI is estimated with a tight Monte-Carlo error.
     const N: usize = 80;
     const P: usize = 5;
-    const REPS: usize = 200;
+    // Wall-clock is dominated by REPS sequential gam fits (the statsmodels
+    // baseline is a single subprocess that loops the same replicates). 200 reps
+    // overran the 360 s reference-quality budget; 60 reps still pools 60×80 = 4800
+    // coverage indicators, whose Monte-Carlo SE on a coverage proportion is
+    // ≈ sqrt(0.95·0.05/4800) ≈ 0.0031 — comfortably inside the ±0.02 calibration
+    // band asserted below, so the coverage claim keeps its statistical power.
+    const REPS: usize = 60;
     const SIGMA: f64 = 0.7;
     let beta_true = [1.3_f64, -0.8, 0.5, 2.1, -1.4];
     let intercept_true = 0.4_f64;
@@ -208,8 +214,8 @@ emit("ref_coverage", [covered / total])
     );
 
     // PRIMARY claim: gam's 95% interval covers the TRUE linear predictor at the
-    // nominal rate. Monte-Carlo SE of the coverage estimate over ~16000
-    // replicate*row indicators is ~0.0017, so a +/-0.02 band is well outside the
+    // nominal rate. Monte-Carlo SE of the coverage estimate over 60*80 = 4800
+    // replicate*row indicators is ~0.0031, so a +/-0.02 band is well outside the
     // noise yet still a genuine calibration test.
     assert!(
         gam_dev <= 0.02,
