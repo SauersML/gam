@@ -396,3 +396,25 @@ pub(crate) fn residualize_influence_columns(
     let projection = fast_ab(&marginal_design, &coeffs);
     z_infl - &projection
 }
+
+/// The full §3 absorbed-block projection from the raw score-influence Jacobian:
+/// build the realized leakage directions `Z_infl = diag(s_f·β̂₀)·J` and
+/// residualize them against the marginal/primary span in the rigid-pilot
+/// `W`-metric — `Z̃ = residualize(diag(s_f·β̂₀)·J)`.
+///
+/// This composes [`influence_block_design`] and [`residualize_influence_columns`]
+/// so neither family inlines the two-step composition: BMS (widened marginal
+/// design) and survival (dedicated η₁ channel) both obtain their absorbed
+/// columns from this single entry point. Arguments are the union of the two
+/// steps; see those functions for the per-argument contract.
+pub(crate) fn residualized_influence_block(
+    jac: &ScoreInfluenceJacobian,
+    pilot_beta0: &Array1<f64>,
+    s_f: f64,
+    marginal_design: ArrayView2<f64>,
+    w_metric: &Array1<f64>,
+    eps: f64,
+) -> Array2<f64> {
+    let z_infl = influence_block_design(jac, pilot_beta0, s_f);
+    residualize_influence_columns(&z_infl, marginal_design, w_metric, eps)
+}
