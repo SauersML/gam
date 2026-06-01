@@ -263,9 +263,10 @@ fn build_residualized_influence_columns(
     probit_scale: f64,
 ) -> Result<Array2<f64>, String> {
     use crate::faer_ndarray::{
-        factorize_symmetricwith_fallback, fast_ab, fast_xt_diag_x, fast_xt_diag_y, FaerMatBridge,
+        factorize_symmetricwith_fallback, fast_ab, fast_xt_diag_x, fast_xt_diag_y, FaerArrayView,
     };
     use crate::matrix::FactorizedSystem;
+    use faer::Side;
 
     let n = marginal_dense.nrows();
     if score_influence_jacobian.nrows() != n {
@@ -309,11 +310,9 @@ fn build_residualized_influence_columns(
         gram[[i, i]] += ridge;
     }
     let cross = fast_xt_diag_y(marginal_dense, pilot_row_metric_w, &z_infl);
-    let factor = factorize_symmetricwith_fallback(
-        FaerMatBridge::new(&gram).as_ref(),
-        faer::Side::Lower,
-    )
-    .map_err(|e| format!("influence block: weighted marginal Gram factorisation failed: {e}"))?;
+    let gram_view = FaerArrayView::new(&gram);
+    let factor = factorize_symmetricwith_fallback(gram_view.as_ref(), Side::Lower)
+        .map_err(|e| format!("influence block: weighted marginal Gram factorisation failed: {e}"))?;
     // coeffs = (MᵀWM + εI)⁻¹ MᵀW Z_infl   (p_m × p₁)
     let coeffs = factor
         .solvemulti(&cross)

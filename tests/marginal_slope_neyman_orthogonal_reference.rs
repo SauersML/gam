@@ -355,17 +355,19 @@ fn xspline_spec(num_internal_knots: usize, data_range: (f64, f64)) -> TermCollec
     }
 }
 
-/// Fit Stage 2. When `influence` is `Some(J)`, the orthogonalized absorbed
-/// influence block is wired in via the spec's `score_influence_jacobian` field
-/// (design §3 / §6); when `None`, this is the naive arm. Both arms share the
-/// identical `z`, `x`, `y`, and term specs, so they differ ONLY by the
+/// Fit Stage 2. When `jacobian` is `Some(J)`, the out-of-fold Stage-1 score-
+/// influence Jacobian is wired into the spec's `score_influence_jacobian` field
+/// (the field takes the RAW `J`; the family forms the absorbed block
+/// `Z_infl = diag(s_f·β̂₀)·J` internally at its own rigid pilot, design §3) —
+/// the orthogonalized arm. When `None`, this is the naive arm. Both arms share
+/// the identical `z`, `x`, `y`, and term specs, so they differ ONLY by the
 /// projection — that isolation is the whole point of the control.
 fn fit_stage2(
     x: &[f64],
     z: &Array1<f64>,
     y: &[f64],
     x_range: (f64, f64),
-    influence: Option<Array2<f64>>,
+    jacobian: Option<Array2<f64>>,
 ) -> BernoulliMarginalSlopeFitResult {
     let n = x.len();
     let mut data = Array2::<f64>::zeros((n, 1));
