@@ -8316,63 +8316,6 @@ impl CharbonnierScalarBlockState {
             .mapv(|r| 2.0 * eps2 / r - eps4 / r.powi(3) - epsilon)
     }
 
-    fn surrogateweights(
-        &self,
-        weight_floor: f64,
-        weight_ceiling: f64,
-    ) -> (Array1<f64>, Array1<f64>) {
-        // Exact scalar Charbonnier / pseudo-Huber block and its MM majorizer.
-        //
-        // The exact scalar penalty used by the nonquadratic spatial regularizer is
-        //
-        //   psi(t; eps) = sqrt(t^2 + eps^2) - eps,
-        //
-        // where:
-        //   - t is the scalar operator response at one collocation point,
-        //   - eps > 0 is the Charbonnier transition scale.
-        //
-        // The key exact scalar derivatives are:
-        //
-        //   d/dt psi(t; eps)        = t / sqrt(t^2 + eps^2),
-        //   d^2/dt^2 psi(t; eps)    = eps^2 / (t^2 + eps^2)^(3/2),
-        //   d/deps psi(t; eps)      = eps / sqrt(t^2 + eps^2) - 1,
-        //   d^2/(dt deps) psi       = -eps * t / (t^2 + eps^2)^(3/2).
-        //
-        // The omitted leading eps factor is intentional. The old scaled form
-        // made eps an amplitude parameter; because eps is optimized jointly with
-        // lambda, eps -> 0 erased the adaptive regularizer.
-        //
-        // These exact formulas define the real adaptive model used by the
-        // pseudo-Laplace hyperobjective. We still keep the legacy MM majorizer
-        // weights here because they remain useful for diagnostics/tests and for
-        // comparing the old surrogate path against the exact Charbonnier model.
-        //
-        // For a reference point t0, the same tangent majorizer in t^2 gives
-        // tangent majorizer in the variable t^2:
-        //
-        //   psi(t; eps) <= 0.5 * w(t0) * t^2 + const(t0),
-        //   w(t0) = 1 / sqrt(t0^2 + eps^2).
-        //
-        // So the MM algorithm reuses only the scalar weight
-        //
-        //   w_k = 1 / sqrt(t_k^2 + eps^2),
-        //
-        // while the exact derivatives above remain the source of truth for the
-        // production direct inner optimizer and exact outer hypergradient.
-        //
-        // Keeping the surrogate weight generation immediately beside the exact
-        // scalar Charbonnier formulas is deliberate:
-        //   1. it avoids a second copy of the scalar algebra,
-        //   2. it makes the current approximation explicit rather than implicit,
-        //   3. it gives one audited location for the transition from the true
-        //      penalty to the MM surrogate.
-        let weight = self
-            .radius
-            .mapv(|r| (1.0 / r).clamp(weight_floor, weight_ceiling));
-        let invweight = weight.mapv(|u| 1.0 / u);
-        (weight, invweight)
-    }
-
     fn surrogateweights_posterior_snr(
         &self,
         variance: &Array1<f64>,
@@ -8583,52 +8526,6 @@ impl CharbonnierGroupedBlockState {
         let eps4 = eps2 * eps2;
         self.radius
             .mapv(|r| 2.0 * eps2 / r - eps4 / r.powi(3) - epsilon)
-    }
-
-    fn surrogateweights(
-        &self,
-        weight_floor: f64,
-        weight_ceiling: f64,
-    ) -> (Array1<f64>, Array1<f64>) {
-        // Grouped Charbonnier / pseudo-Huber MM weights for the slope block.
-        //
-        // For the grouped penalty, each collocation point contributes
-        //
-        //   psi(g_k; eps_g) = sqrt(g_k^2 + eps_g^2) - eps_g,
-        //   g_k = ||v_k||_2,
-        //   v_k = G_k beta.
-        //
-        // The exact block gradient is
-        //
-        //   d/d beta psi(g_k; eps_g)
-        //   = G_k^T (v_k / sqrt(||v_k||^2 + eps_g^2)),
-        //
-        // and the exact block Hessian is
-        //
-        //   G_k^T B_k G_k,
-        //
-        //   B_k
-        //   = (1 / r_k) I - (1 / r_k^3) v_k v_k^T,
-        //   r_k = sqrt(||v_k||^2 + eps_g^2).
-        //
-        // The legacy surrogate path uses the grouped MM majorizer
-        //
-        //   psi(g; eps_g) <= 0.5 * w(g0) * g^2 + const(g0),
-        //   w(g0) = 1 / sqrt(g0^2 + eps_g^2),
-        //
-        // which yields the quadratic surrogate
-        //
-        //   K_g = D1^T (diag(w_g) \kron I_d) D1.
-        //
-        // These weights are therefore the grouped analogue of the scalar MM
-        // majorizer above. The exact grouped Hessian and third-derivative maps
-        // live in the neighboring methods and drive the direct pseudo-Laplace
-        // solver.
-        let weight = self
-            .radius
-            .mapv(|r| (1.0 / r).clamp(weight_floor, weight_ceiling));
-        let invweight = weight.mapv(|u| 1.0 / u);
-        (weight, invweight)
     }
 
     fn surrogateweights_posterior_snr(
