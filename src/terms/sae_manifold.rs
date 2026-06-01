@@ -282,7 +282,17 @@ pub trait SaeBasisEvaluator: Send + Sync + std::fmt::Debug {
     /// this to wrap the typed call in `Some(...)`. This sidesteps the lack of
     /// dyn-downcasting for non-`Any` traits while keeping `SaeBasisSecondJet`
     /// as the strongly-typed compile-time bound for tests / generics.
-    fn second_jet_dyn(&self, _coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
+    ///
+    /// `coords` is part of the trait contract — every override consumes it as
+    /// the evaluation grid for the analytic second jet — so the default
+    /// signature must accept it. The default has no analytic surface to
+    /// evaluate at those points; referencing the grid shape keeps the
+    /// otherwise-unused parameter a lint-clean no-op before reporting None.
+    /// (`drop(coords)` is a no-op on the `Copy` view and trips
+    /// `dropping_copy_types` under `-D warnings`; `let _ = coords` / `_coords`
+    /// are rejected by the source-hygiene gate in `build.rs`.)
+    fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
+        coords.dim();
         None
     }
 

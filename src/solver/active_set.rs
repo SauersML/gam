@@ -179,10 +179,36 @@ pub(crate) fn compute_constraint_kkt_diagnostics(
     let m = constraints.a.nrows();
     let active_tolerance = ACTIVE_SET_PRIMAL_FEASIBILITY_TOL;
 
+    // Measure feasibility in the *scaled* (geometric) coordinate system the
+    // solver's tolerance is expressed in: normalize each inequality
+    // `a_i·β ≥ b_i` by ‖a_i‖ so its slack becomes the signed Euclidean
+    // distance from β to the constraint hyperplane. Without this, a row with a
+    // large norm — e.g. a B-spline endpoint *derivative* clamp, whose rows
+    // carry ‖a_i‖ ≫ 1 — reports a raw slack inflated by ‖a_i‖, so an iterate
+    // that is feasible to the solver's scaled `ACTIVE_SET_PRIMAL_FEASIBILITY_TOL`
+    // guarantee can still exceed a raw primal gate downstream and be spuriously
+    // refused. Per-row normalization makes the diagnostic scale-invariant and
+    // consistent with that contract. Dual/complementarity/stationarity are
+    // invariant under this positive per-row rescaling (with λ̂_i = ‖a_i‖·λ_i:
+    // Âᵀλ̂ = Aᵀλ and λ̂_i·ŝ_i = λ_i·s_i), so only primal feasibility and the
+    // active-set threshold change meaning — both toward the geometric distance
+    // the tolerance is meant to bound.
+    let p = constraints.a.ncols();
+    let mut a_scaled = constraints.a.clone();
+    let mut b_scaled = constraints.b.clone();
+    for i in 0..m {
+        let n_i = constraints.a.row(i).dot(&constraints.a.row(i)).sqrt();
+        if n_i > 0.0 {
+            let inv = 1.0 / n_i;
+            a_scaled.row_mut(i).mapv_inplace(|v| v * inv);
+            b_scaled[i] *= inv;
+        }
+    }
+
     let mut slack = Array1::<f64>::zeros(m);
     let mut primal_feasibility: f64 = 0.0;
     for i in 0..m {
-        let s_i = constraints.a.row(i).dot(beta) - constraints.b[i];
+        let s_i = a_scaled.row(i).dot(beta) - b_scaled[i];
         slack[i] = s_i;
         primal_feasibility = primal_feasibility.max((-s_i).max(0.0));
     }
@@ -191,10 +217,9 @@ pub(crate) fn compute_constraint_kkt_diagnostics(
     let mut lambda = Array1::<f64>::zeros(m);
     if !active_idx.is_empty() {
         let n_active = active_idx.len();
-        let p = constraints.a.ncols();
         let mut a_active = Array2::<f64>::zeros((n_active, p));
         for (r, &idx) in active_idx.iter().enumerate() {
-            a_active.row_mut(r).assign(&constraints.a.row(idx));
+            a_active.row_mut(r).assign(&a_scaled.row(idx));
         }
         if let Some((_, lambda_active)) =
             project_stationarity_residual_on_constraint_cone(gradient, &a_active)
@@ -213,7 +238,7 @@ pub(crate) fn compute_constraint_kkt_diagnostics(
     }
     let stationarity = {
         let mut resid = gradient.to_owned();
-        resid -= &constraints.a.t().dot(&lambda);
+        resid -= &a_scaled.t().dot(&lambda);
         resid.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()))
     };
 
@@ -383,6 +408,17 @@ pub(crate) fn feasible_point_for_linear_constraints(
     }
 }
 
+/// Worst primal-feasibility violation across all rows of `constraints`,
+/// measured in the per-row-scaled (geometric) coordinate system documented on
+/// [`ACTIVE_SET_PRIMAL_FEASIBILITY_TOL`]. A row's slack is divided by ‖a_i‖
+/// so the returned value is the signed Euclidean distance from `beta` to the
+/// constraint hyperplane, not the raw dot-product residual. This matches
+/// [`compute_constraint_kkt_diagnostics`] and keeps the in-solver acceptance
+/// gate, the downstream KKT report, and any post-fit feasibility check on a
+/// single scale-invariant metric. A row with ‖a_i‖ = 38 (a typical B-spline
+/// endpoint-derivative clamp at k = 12) has a 1e-6 raw violation that is only
+/// 2.6e-8 in geometric units — accepting on raw alone is anisotropic in
+/// input-space and breaks the published contract.
 fn max_linear_constraint_violation(
     beta: &Array1<f64>,
     constraints: &LinearInequalityConstraints,
@@ -390,7 +426,9 @@ fn max_linear_constraint_violation(
     let mut worst = 0.0_f64;
     let mut worst_row = 0usize;
     for i in 0..constraints.a.nrows() {
-        let slack = constraints.a.row(i).dot(beta) - constraints.b[i];
+        let norm = constraints.a.row(i).dot(&constraints.a.row(i)).sqrt();
+        let inv = if norm > 0.0 { 1.0 / norm } else { 0.0 };
+        let slack = (constraints.a.row(i).dot(beta) - constraints.b[i]) * inv;
         let viol = (-slack).max(0.0);
         if viol > worst {
             worst = viol;
@@ -398,6 +436,21 @@ fn max_linear_constraint_violation(
         }
     }
     (worst, worst_row)
+}
+
+/// Per-row signed scaled slack: `(a_i·beta - b_i) / ‖a_i‖`. Returns zero for
+/// degenerate rows with `‖a_i‖ = 0` (those rows carry no geometric content).
+/// Used wherever the active-set solver needs to compare per-row feasibility
+/// against a scale-invariant tolerance.
+#[inline]
+fn scaled_constraint_slack(
+    beta: &Array1<f64>,
+    constraints: &LinearInequalityConstraints,
+    i: usize,
+) -> f64 {
+    let norm = constraints.a.row(i).dot(&constraints.a.row(i)).sqrt();
+    let inv = if norm > 0.0 { 1.0 / norm } else { 0.0 };
+    (constraints.a.row(i).dot(beta) - constraints.b[i]) * inv
 }
 
 pub(crate) fn solve_kkt_direction(
@@ -722,11 +775,21 @@ pub(crate) fn working_set_kkt_diagnostics_from_multipliers(
             working_constraints.a.nrows()
         );
     }
+    // Primal feasibility and complementarity are measured in the per-row-scaled
+    // (geometric) coordinate system the public solver contract is expressed in
+    // (see [`ACTIVE_SET_PRIMAL_FEASIBILITY_TOL`] and
+    // [`compute_constraint_kkt_diagnostics`]). Without scaling, a row with
+    // ‖a_i‖ ≫ 1 — e.g. a B-spline endpoint-derivative clamp — reports a raw
+    // slack inflated by ‖a_i‖, and the in-solver acceptance gate
+    // (`worst <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL`) becomes anisotropic across
+    // rows. Complementarity is the SCALED product `λ̂_i · ŝ_i` with
+    // `λ̂_i = ‖a_i‖·λ_i`; that's invariant under the same per-row rescaling, so
+    // its semantics are unchanged while the units match the primal column.
     let m = working_constraints.a.nrows();
     let mut slack = Array1::<f64>::zeros(m);
     let mut primal_feasibility: f64 = 0.0;
     for i in 0..m {
-        let s_i = working_constraints.a.row(i).dot(x) - working_constraints.b[i];
+        let s_i = scaled_constraint_slack(x, working_constraints, i);
         slack[i] = s_i;
         primal_feasibility = primal_feasibility.max((-s_i).max(0.0));
     }
@@ -815,9 +878,13 @@ fn fallback_projected_gradient_direction(
 
     let mut alpha = 1.0_f64;
     for i in 0..constraints.a.nrows() {
-        let ai = constraints.a.row(i);
-        let slack = ai.dot(x) - constraints.b[i];
-        let ai_d = ai.dot(&tangent_direction);
+        // Scale the step-fraction test by 1/‖a_i‖ so it matches the geometric
+        // activation tolerance used elsewhere (see in-loop alpha computation in
+        // `solve_newton_direction_with_linear_constraints_impl`).
+        let norm = constraints.a.row(i).dot(&constraints.a.row(i)).sqrt();
+        let inv = if norm > 0.0 { 1.0 / norm } else { 0.0 };
+        let slack = (constraints.a.row(i).dot(x) - constraints.b[i]) * inv;
+        let ai_d = constraints.a.row(i).dot(&tangent_direction) * inv;
         if let Some(candidate) = boundary_hit_step_fraction(slack, ai_d, alpha) {
             alpha = candidate;
         }
@@ -828,12 +895,13 @@ fn fallback_projected_gradient_direction(
 
     let fallback_step = tangent_direction * alpha;
     let new_x = x + &fallback_step;
+    // Per-row-scaled feasibility, matching ACTIVE_SET_PRIMAL_FEASIBILITY_TOL.
     let (worst, _) = max_linear_constraint_violation(&new_x, constraints);
-    if worst > 1e-8 {
+    if worst > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
         return Ok(None);
     }
     let active = (0..constraints.a.nrows())
-        .filter(|&i| constraints.a.row(i).dot(&new_x) - constraints.b[i] <= 1e-10)
+        .filter(|&i| scaled_constraint_slack(&new_x, constraints, i) <= 1e-10)
         .collect::<Vec<_>>();
     let active = canonicalize_active_constraint_ids(&new_x, constraints, &active)?;
     Ok(Some((d_total + &fallback_step, active)))
@@ -910,8 +978,10 @@ fn solve_newton_direction_with_linear_constraints_impl(
         let candidate = beta + &*direction_out;
         let mut feasible = true;
         for i in 0..m {
-            let slack = constraints.a.row(i).dot(&candidate) - constraints.b[i];
-            if slack < -1e-10 {
+            // Scaled (geometric) slack — matches `tol_active`'s semantics and
+            // the public solver contract on `ACTIVE_SET_PRIMAL_FEASIBILITY_TOL`.
+            let slack = scaled_constraint_slack(&candidate, constraints, i);
+            if slack < -tol_active {
                 feasible = false;
                 break;
             }
@@ -933,7 +1003,12 @@ fn solve_newton_direction_with_linear_constraints_impl(
         }
     }
     for i in 0..m {
-        let slack = constraints.a.row(i).dot(&x) - constraints.b[i];
+        // Scaled (geometric) slack: a row with ‖a_i‖ ≫ 1 (e.g. a B-spline
+        // endpoint-derivative clamp at k = 12, ‖a_i‖ ≈ 38) would otherwise
+        // require a raw slack of `tol_active·‖a_i‖` ≈ 4e-9 to activate, which
+        // is below LBLT-solve precision on the KKT system and starves the
+        // active set of rows that genuinely belong on the boundary.
+        let slack = scaled_constraint_slack(&x, constraints, i);
         if slack <= tol_active && !is_active[i] {
             active.push(i);
             is_active[i] = true;
@@ -958,6 +1033,40 @@ fn solve_newton_direction_with_linear_constraints_impl(
         )?;
         let step_norm = d.iter().map(|v| v * v).sum::<f64>().sqrt();
         if step_norm <= tol_step {
+            // A "stationary" iterate is only a genuine KKT point if it is
+            // also primal-feasible on the FULL constraint set. The
+            // "blocking-add" loop further down only catches rows that
+            // become tight DURING a non-degenerate step, so a tiny step
+            // entered with a residual violation on an inactive row would
+            // otherwise leak an infeasible direction through this
+            // short-circuit unchecked. Grow the active set with the
+            // most-violated inactive row and re-solve; `residualw` for that
+            // row will be non-zero on the next KKT solve, so the resulting
+            // step is non-degenerate.
+            let (worst, worst_row) = max_linear_constraint_violation(&x, constraints);
+            if worst > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL && !is_active[worst_row] {
+                active.push(worst_row);
+                is_active[worst_row] = true;
+                log_active_set_transition(
+                    "stationary-infeasible-add",
+                    iteration,
+                    active.len(),
+                    Some(worst_row),
+                );
+                record_active_working_set(&mut visited_working_sets, &active, iteration)?;
+                continue;
+            }
+            if worst > ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
+                // The worst-violating row is already in the active set —
+                // the KKT step failed to restore its feasibility, typically
+                // because a previous iteration's `alpha`-clip prevented the
+                // full residual closure. Fall through to the post-loop exit
+                // gate, which inspects the iterate's full KKT residuals and
+                // either tries the projected-gradient fallback or returns
+                // an explicit error. Both are correct outcomes; silently
+                // returning the infeasible direction is not.
+                break;
+            }
             if compressed_working.groups.is_empty() {
                 direction_out.assign(&d_total);
                 return Ok(());
@@ -997,9 +1106,16 @@ fn solve_newton_direction_with_linear_constraints_impl(
             if is_active[i] {
                 continue;
             }
-            let ai = constraints.a.row(i);
-            let slack = ai.dot(&x) - constraints.b[i];
-            let ai_d = ai.dot(&d);
+            // boundary_hit_step_fraction is scale-equivariant in `(slack, ai_d)`:
+            // scaling both by 1/‖a_i‖ leaves `step = slack / -ai_d` unchanged,
+            // and its directional-tol/finite checks operate on a max-magnitude
+            // scale of the same triple. Doing the geometric rescale here keeps
+            // the step-fraction's "moving toward the boundary" test in the same
+            // scaled coordinates the activation tests use.
+            let norm = constraints.a.row(i).dot(&constraints.a.row(i)).sqrt();
+            let inv = if norm > 0.0 { 1.0 / norm } else { 0.0 };
+            let slack = (constraints.a.row(i).dot(&x) - constraints.b[i]) * inv;
+            let ai_d = constraints.a.row(i).dot(&d) * inv;
             if let Some(cand) = boundary_hit_step_fraction(slack, ai_d, alpha) {
                 alpha = cand;
             }
@@ -1020,7 +1136,7 @@ fn solve_newton_direction_with_linear_constraints_impl(
             if is_active[i] {
                 continue;
             }
-            let slack = constraints.a.row(i).dot(&x) - constraints.b[i];
+            let slack = scaled_constraint_slack(&x, constraints, i);
             if slack <= tol_active {
                 active.push(i);
                 is_active[i] = true;
@@ -1174,9 +1290,11 @@ pub(crate) fn solve_quadratic_with_linear_constraints(
 #[cfg(test)]
 mod tests {
     use super::{
-        LinearInequalityConstraints, project_stationarity_residual_on_constraint_cone,
+        LinearInequalityConstraints, compute_constraint_kkt_diagnostics,
+        project_stationarity_residual_on_constraint_cone,
         rank_reduce_rows_pivoted_qr_with_dependence,
         solve_newton_direction_with_linear_constraints_impl,
+        solve_quadratic_with_linear_constraints,
     };
     use approx::assert_relative_eq;
     use ndarray::{Array1, array};
@@ -1257,5 +1375,230 @@ mod tests {
                 );
             }
         }
+    }
+
+    // #500: the KKT primal residual must be the *geometric* distance to the
+    // constraint hyperplane — invariant to how the constraint row is scaled.
+    // A B-spline endpoint-derivative clamp carries a large row norm, so the
+    // raw slack `a·β − b` of a near-feasible iterate is inflated by ‖a‖ and a
+    // downstream raw primal gate would spuriously refuse it. The same geometry
+    // expressed with a unit-norm row must yield the same primal.
+    #[test]
+    fn kkt_primal_is_per_row_scale_invariant() {
+        // β sits 2.071e-8 on the infeasible side of the hyperplane `row·β ≥ 0`
+        // (the exact geometric residual reported in #500's startup abort).
+        let geometric_violation = 2.071e-8_f64;
+        let gradient = Array1::<f64>::zeros(2);
+
+        // Unit-norm row: raw slack == geometric distance.
+        let beta_unit = array![-geometric_violation, 0.0];
+        let unit = LinearInequalityConstraints {
+            a: array![[1.0, 0.0]],
+            b: array![0.0],
+        };
+        let diag_unit = compute_constraint_kkt_diagnostics(&beta_unit, &gradient, &unit);
+
+        // Same hyperplane, row scaled ×1000: raw slack would be 2.071e-5, but
+        // the *scaled* primal must still equal the geometric distance.
+        let beta_big = array![-geometric_violation, 0.0];
+        let big = LinearInequalityConstraints {
+            a: array![[1000.0, 0.0]],
+            b: array![0.0],
+        };
+        let diag_big = compute_constraint_kkt_diagnostics(&beta_big, &gradient, &big);
+
+        assert_relative_eq!(
+            diag_unit.primal_feasibility,
+            geometric_violation,
+            epsilon = 1e-14
+        );
+        assert_relative_eq!(
+            diag_big.primal_feasibility,
+            geometric_violation,
+            epsilon = 1e-14
+        );
+        // The scaled diagnostic must NOT report the ‖a‖-inflated raw slack.
+        assert!(
+            diag_big.primal_feasibility < 1e-7,
+            "scaled primal {:.3e} should pass a 1e-7 gate; raw slack would be {:.3e}",
+            diag_big.primal_feasibility,
+            1000.0 * geometric_violation
+        );
+    }
+
+    // A B-spline `bc=clamped`/`bc=anchored` constraint is an EQUALITY
+    // `a·β = b` encoded as two opposing inequalities `a·β ≥ b` and
+    // `−a·β ≥ −b`. The active-set solver must drive the unconstrained
+    // optimum back onto the hyperplane `a·β = b`. This is the isolated
+    // analogue of the `bc=clamped` startup-validation abort: the exact
+    // validation solve left `a·β ≈ 7.76` instead of 0, so the KKT primal
+    // residual blew past tolerance and every seed was refused.
+    #[test]
+    fn opposing_inequality_pair_pins_equality_to_target() {
+        // Minimize ½‖β‖² − rhs·β  (H = I) ⇒ unconstrained optimum β* = rhs.
+        // rhs = [5,5,0,0] ⇒ a·β* = 10 with a = [1,1,0,0].
+        // The opposing pair must pull a·β back to the target 0.
+        let hessian = array![
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let rhs = array![5.0, 5.0, 0.0, 0.0];
+        let beta_start = Array1::<f64>::zeros(4);
+        let constraints = LinearInequalityConstraints {
+            a: array![[1.0, 1.0, 0.0, 0.0], [-1.0, -1.0, 0.0, 0.0]],
+            b: array![0.0, 0.0],
+        };
+
+        let (beta, _active) = solve_quadratic_with_linear_constraints(
+            &hessian,
+            &rhs,
+            &beta_start,
+            &constraints,
+            None,
+        )
+        .expect("opposing-inequality equality QP must solve");
+
+        let a_dot_beta = beta[0] + beta[1];
+        assert!(
+            a_dot_beta.abs() < 1e-8,
+            "opposing inequalities must pin a·β to 0, got {a_dot_beta:.6e} (β = {beta:?})"
+        );
+    }
+
+    // Same as above but with a non-zero target and a large row norm — the
+    // exact shape of a B-spline endpoint-derivative clamp, whose rows carry
+    // ‖a‖ ≫ 1. The equality must still be pinned in geometric coordinates.
+    #[test]
+    fn opposing_inequality_pair_pins_scaled_equality_to_nonzero_target() {
+        let hessian = array![
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let rhs = array![5.0, 5.0, 0.0, 0.0];
+        let beta_start = Array1::<f64>::zeros(4);
+        // Row scaled ×1000 (mimics a derivative-clamp row norm) with target 3000
+        // ⇒ geometric target a·β = 3.0 in unit coordinates.
+        let constraints = LinearInequalityConstraints {
+            a: array![[1000.0, 1000.0, 0.0, 0.0], [-1000.0, -1000.0, 0.0, 0.0]],
+            b: array![3000.0, -3000.0],
+        };
+
+        let (beta, _active) = solve_quadratic_with_linear_constraints(
+            &hessian,
+            &rhs,
+            &beta_start,
+            &constraints,
+            None,
+        )
+        .expect("scaled opposing-inequality equality QP must solve");
+
+        let a_dot_beta = 1000.0 * (beta[0] + beta[1]);
+        assert!(
+            (a_dot_beta - 3000.0).abs() < 1e-5,
+            "opposing inequalities must pin a·β to 3000, got {a_dot_beta:.6e} (β = {beta:?})"
+        );
+    }
+
+    // `bc=clamped` at BOTH ends produces TWO opposing-inequality equalities
+    // (4 rows total). The real abort reports `active=2/4` — only ONE of the
+    // two equalities is being pinned. Reproduce two independent equalities
+    // and require BOTH to be driven to their targets.
+    #[test]
+    fn two_opposing_inequality_equalities_both_pinned() {
+        let hessian = array![
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let rhs = array![5.0, 5.0, 5.0, 5.0];
+        let beta_start = Array1::<f64>::zeros(4);
+        // Equality A: β0 + β1 = 0 (rows 0,1). Equality B: β2 + β3 = 0 (rows 2,3).
+        let constraints = LinearInequalityConstraints {
+            a: array![
+                [1.0, 1.0, 0.0, 0.0],
+                [-1.0, -1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 1.0],
+                [0.0, 0.0, -1.0, -1.0],
+            ],
+            b: array![0.0, 0.0, 0.0, 0.0],
+        };
+
+        let (beta, _active) = solve_quadratic_with_linear_constraints(
+            &hessian,
+            &rhs,
+            &beta_start,
+            &constraints,
+            None,
+        )
+        .expect("two-equality QP must solve");
+
+        assert!(
+            (beta[0] + beta[1]).abs() < 1e-8,
+            "equality A not pinned: β0+β1 = {:.6e}",
+            beta[0] + beta[1]
+        );
+        assert!(
+            (beta[2] + beta[3]).abs() < 1e-8,
+            "equality B not pinned: β2+β3 = {:.6e}",
+            beta[2] + beta[3]
+        );
+    }
+
+    // Faithful to the failing fit: the penalized IRLS Hessian `X'WX + λS`
+    // with λ at the over-smoothing ceiling is severely ill-conditioned — the
+    // penalty `S` is rank-deficient (null space = the unpenalized polynomial
+    // part), so directions in null(S) are governed by a tiny `X'WX` block
+    // while penalized directions carry a huge λ. The opposing-inequality
+    // equalities must STILL be pinned under this conditioning.
+    #[test]
+    fn opposing_inequality_equalities_pinned_under_ill_conditioned_penalty() {
+        // H = diag(1, 1, λ, λ) with λ = 1e8 — penalized directions 2,3 are
+        // ~1e8 stiffer than the data directions 0,1.
+        let lam = 1.0e8_f64;
+        let hessian = array![
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, lam, 0.0],
+            [0.0, 0.0, 0.0, lam],
+        ];
+        let rhs = array![5.0, 5.0, 5.0, 5.0];
+        let beta_start = Array1::<f64>::zeros(4);
+        // Two equalities that COUPLE a stiff and a soft coordinate, like a
+        // B-spline derivative row spanning penalized and unpenalized parts:
+        // A: β0 + β2 = 0, B: β1 + β3 = 0.
+        let constraints = LinearInequalityConstraints {
+            a: array![
+                [1.0, 0.0, 1.0, 0.0],
+                [-1.0, 0.0, -1.0, 0.0],
+                [0.0, 1.0, 0.0, 1.0],
+                [0.0, -1.0, 0.0, -1.0],
+            ],
+            b: array![0.0, 0.0, 0.0, 0.0],
+        };
+
+        let (beta, _active) = solve_quadratic_with_linear_constraints(
+            &hessian,
+            &rhs,
+            &beta_start,
+            &constraints,
+            None,
+        )
+        .expect("ill-conditioned two-equality QP must solve");
+
+        assert!(
+            (beta[0] + beta[2]).abs() < 1e-6,
+            "equality A not pinned under ill-conditioning: β0+β2 = {:.6e}",
+            beta[0] + beta[2]
+        );
+        assert!(
+            (beta[1] + beta[3]).abs() < 1e-6,
+            "equality B not pinned under ill-conditioning: β1+β3 = {:.6e}",
+            beta[1] + beta[3]
+        );
     }
 }
