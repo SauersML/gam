@@ -20,6 +20,22 @@ use ndarray::{Array1, ArrayView2};
 /// exact-joint theta vector. Shared by all location-scale families.
 pub(crate) const EXACT_JOINT_RHO_BOUND: f64 = 12.0;
 
+/// Shared operator-aware coefficient-Hessian cost for joint-coupled
+/// location-scale families.
+///
+/// Every Gaussian/Binomial location-scale variant exposes the same inner
+/// coefficient Hessian representation: the exact dense fallback is one
+/// row-coupled Hessian over all parameter blocks, while the matrix-free path
+/// applies the joint Hessian in `O(n · Σp_b)`. Keep that trait-method body in
+/// one place so each family implementation only supplies its observation
+/// count.
+pub(crate) fn location_scale_coefficient_hessian_cost(
+    n: u64,
+    specs: &[crate::families::custom_family::ParameterBlockSpec],
+) -> u64 {
+    crate::families::coefficient_cost::joint_coupled_operator_aware_hessian_cost(n, specs)
+}
+
 /// Assemble the exact-joint hyperparameter setup for a location-scale family
 /// whose linear predictors are described, in theta order, by `blocks`.
 ///
