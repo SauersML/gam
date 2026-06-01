@@ -251,8 +251,17 @@ TRANSFORMATION_RESPONSE_GRID_SUBDIVISIONS = 4
 # preflight uses a conservative cap so the modelled grid size does not
 # under-report. Bumping this up is safe (only loosens the preflight check).
 CTN_RESPONSE_INTERNAL_KNOTS_CAP = 32
+# Spectral power for the 16-PC joint Duchon smooth. With order=0 the polynomial
+# null-space order is p=1, so 2*(p+power) = 2*(1+power). The exact two-block
+# spatial / transformation-normal (CTN) paths these specs run differentiate the
+# radial kernel at the origin and need its 2nd derivative, which is finite only
+# when 2*(p+power) > dimension+2 = 18. power=8 gives exactly 18 (not strictly
+# greater) and fails; power=9 gives 20 > 18 and clears every path the benchmark
+# exercises. (Kernel existence and D1/D2 collocation are all satisfied at 9, and
+# length_scale=1 makes the hybrid kernel strictly PD so the pure-mode CPD bound
+# 2*power < d does not apply.)
 BIOBANK_DUCHON16D_ORDER = 0
-BIOBANK_DUCHON16D_POWER = 8
+BIOBANK_DUCHON16D_POWER = 9
 BIOBANK_DUCHON16D_LENGTH_SCALE = 1.0
 PGS_RAW_COLUMN = "pgs_raw"
 PGS_CTN_Z_COLUMN = "pgs_ctn_z"
