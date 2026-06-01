@@ -16755,10 +16755,16 @@ fn build_spherical_harmonic_basis(
             Ok(())
         })?;
     }
-    // Diagonal eigenvalue penalty [l(l+1)]^2 per (l, m). Build as a dense
-    // matrix because downstream consumers (`normalize_penalty`, REML kernel
-    // selection) currently expect dense storage; the diagonal pattern keeps
-    // the matvec cheap (p ≤ L(L+2) ≤ 32·34 = 1088 even at the L=32 cap).
+    // Diagonal Laplace-Beltrami eigenvalue penalty [l(l+1)]^m per (l, m).
+    //
+    // This is already in the natural coefficient coordinates for the real
+    // spherical harmonics: the basis is orthonormal on S², so X'X/n is O(1)
+    // under uniform sampling, while the diagonal entries are the physical
+    // roughness eigenvalues of the final function. Frobenius-normalizing this
+    // matrix would divide away that meaningful spectral scale (≈1261 for
+    // L=4, m=2), making REML optimize against an artificially tiny physical
+    // penalty. Keep the raw operator with normalization_scale=1 so optimizer
+    // lambdas are physical lambdas for this smooth.
     let mut penalty = Array2::<f64>::zeros((p, p));
     let mut col = 0usize;
     for l in 1..=l_max {
@@ -16768,12 +16774,11 @@ fn build_spherical_harmonic_basis(
             col += 1;
         }
     }
-    let (penalty_norm, c_primary) = normalize_penalty(&penalty);
     let mut candidates = vec![PenaltyCandidate {
-        matrix: penalty_norm,
+        matrix: penalty,
         nullspace_dim_hint: 0,
         source: PenaltySource::Primary,
-        normalization_scale: c_primary,
+        normalization_scale: 1.0,
         kronecker_factors: None,
         op: None,
     }];
@@ -29425,6 +29430,38 @@ mod tests {
     /// centers-extraction match arms.
     fn expected_duchon_metadata_for_centers() -> ! {
         panic!("expected Duchon metadata for centers extraction")
+    }
+
+    #[test]
+    fn spherical_harmonic_penalty_keeps_laplace_beltrami_scale() {
+        let data = array![[-30.0, -120.0], [0.0, 0.0], [35.0, 80.0], [70.0, 160.0]];
+        let spec = SphericalSplineBasisSpec {
+            method: SphereMethod::Harmonic,
+            max_degree: Some(4),
+            double_penalty: false,
+            ..SphericalSplineBasisSpec::default()
+        };
+
+        let built = build_spherical_harmonic_basis(data.view(), &spec)
+            .expect("build harmonic spherical basis");
+        assert_eq!(built.penalties.len(), 1);
+        assert_eq!(built.penaltyinfo.len(), 1);
+        assert_eq!(built.penaltyinfo[0].source, PenaltySource::Primary);
+        assert_eq!(built.penaltyinfo[0].normalization_scale, 1.0);
+
+        let penalty = &built.penalties[0];
+        assert_eq!(penalty.nrows(), 24);
+        assert_eq!(penalty.ncols(), 24);
+
+        let mut col = 0usize;
+        for l in 1..=4 {
+            let eig = (l as f64 * (l as f64 + 1.0)).powi(2);
+            for _ in 0..(2 * l + 1) {
+                assert_abs_diff_eq!(penalty[[col, col]], eig, epsilon = 1e-12);
+                col += 1;
+            }
+        }
+        assert_eq!(col, penalty.ncols());
     }
 
     /// Issue #247: the SAE Duchon atom's forward design and its derivative jet
