@@ -1036,6 +1036,7 @@ mod tests {
             score_warp: None,
             link_dev: None,
             latent_z_policy: LatentZPolicy::default(),
+            score_influence_jacobian: None,
         }
     }
 
@@ -1741,6 +1742,7 @@ mod tests {
             score_warp: None,
             link_dev: None,
             latent_z_policy: LatentZPolicy::default(),
+            score_influence_jacobian: None,
         };
         let err = validate_spec(design.to_dense().view(), &spec)
             .expect_err("non-probit marginal-slope link should be rejected");
