@@ -139,13 +139,19 @@ fn gam_rw2_pspline_predicts_held_out_at_least_as_well_as_inla() {
         panic!("expected a standard GAM fit for a gaussian RW2 p-spline smooth");
     };
 
-    // Sanity: exactly one penalized smooth block, and a sane effective
-    // complexity (we do NOT assert edf == reference edf; only that the smooth is
-    // neither a straight line nor a noise interpolator).
-    assert_eq!(
-        fit.fit.log_lambdas.len(),
-        1,
-        "expected exactly one penalized smooth block, got {}",
+    // Sanity: the single `s(range, bs='ps')` term is penalized, and a sane
+    // effective complexity (we do NOT assert edf == reference edf; only that the
+    // smooth is neither a straight line nor a noise interpolator). gam's default
+    // p-spline is *double-penalized* — one smoothing parameter on the range
+    // (second-difference) penalty plus one on the null-space shrinkage penalty
+    // (the `double_penalty=true` default in `term_builder.rs`) — so a healthy
+    // fit carries 1..=2 smoothing parameters, not exactly 1. We assert the term
+    // is penalized at all (no degenerate unpenalized fit) rather than pinning an
+    // implementation-specific block count.
+    assert!(
+        (1..=2).contains(&fit.fit.log_lambdas.len()),
+        "expected the single p-spline term to be penalized (1 range + optional \
+         null-space shrinkage block), got {} smoothing parameters",
         fit.fit.log_lambdas.len()
     );
 
