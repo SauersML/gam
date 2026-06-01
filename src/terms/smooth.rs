@@ -9303,14 +9303,16 @@ fn compute_spatial_adaptiveweights_for_beta(
     //
     // Posterior-SNR reweighting (magic by default): when the inner working-Laplace
     // conditional covariance `Sigma_beta = H^{-1}` is available we replace the
-    // squared point-estimate radius `t_k^2 + eps^2` by the posterior *second
-    // moment* `t_k^2 + Var((D beta)_k) + eps^2`, with `Var = (D Sigma_beta D^T)_kk`.
-    // This stops the weight from chasing derivatives that are large only because
-    // they are poorly determined. `Sigma_beta` here is the already-formed inner
-    // Hessian inverse from the final exact-family solve — no second factorization
-    // is built; we only reuse the materialized covariance. When the covariance is
-    // unavailable (`None`) the variance is zero and this degrades *exactly* to the
-    // old magnitude-only radius.
+    // squared point-estimate radius `t_k^2 + eps^2` by the credible (noise-floor-
+    // corrected) second moment `max(t_k^2 - Var((D beta)_k), 0) + eps^2`, with
+    // `Var = (D Sigma_beta D^T)_kk`. This stops the weight from leaving derivatives
+    // un-penalized just because they are large but poorly determined: such
+    // responses are shrunk toward zero (large weight, strong smoothing), while
+    // credibly large derivatives (real edges) keep their small weight. `Sigma_beta`
+    // here is the already-formed inner Hessian inverse from the final exact-family
+    // solve — no second factorization is built; we only reuse the materialized
+    // covariance. When the covariance is unavailable (`None`) the variance is zero
+    // and this degrades *exactly* to the old magnitude-only radius.
     caches
         .iter()
         .map(|cache| {
@@ -26146,6 +26148,223 @@ mod tests {
         assert!(small[0].inv_magweight[0] < large[0].inv_magweight[0]);
         assert!(small[0].invgradweight[0] < large[0].invgradweight[0]);
         assert!(small[0].inv_lapweight[0] < large[0].inv_lapweight[0]);
+    }
+
+    // ------------------------------------------------------------------
+    // Posterior-SNR adaptive weighting: end-to-end objective-quality test.
+    //
+    // Truth: a 1D function on a uniform grid with a genuine sharp edge in the
+    // middle (high curvature, *credibly* determined) and two flat regions. The
+    // LEFT flat region is a low-information region whose grid coefficients are
+    // poorly determined: its posterior covariance Sigma_beta = H^{-1} carries
+    // large variance there, and the noisy point-estimate beta_hat shows
+    // spurious curvature there. The RIGHT flat region is well determined.
+    //
+    // We drive the *real* adaptive-weight machinery
+    // (`compute_spatial_adaptiveweights_for_beta`) two ways:
+    //   * magnitude-only baseline  -> covariance `None`,
+    //   * posterior-SNR (default)  -> covariance `Some(Sigma_beta)`,
+    // then build the curvature surrogate penalty K = D2^T diag(w_c) D2 each
+    // weighting implies, solve the penalized least-squares fit
+    // beta = (X^T X + lambda K)^{-1} X^T y on the identity design (X = I, so
+    // the coefficients ARE the fitted function values), and compare MSE-to-truth
+    //
+    //   * in the noisy LEFT flat region  -> must be STRICTLY LOWER for SNR
+    //     (it does not chase noise), and
+    //   * at the EDGE                     -> must be NO WORSE for SNR
+    //     (the credible edge is preserved).
+    // ------------------------------------------------------------------
+    fn posterior_snr_finite_difference_d2(m: usize, h: f64) -> Array2<f64> {
+        // Second-difference operator on a uniform 1D grid of `m` points: one
+        // collocation row per interior point, row layout matching the grouped
+        // curvature operator (block_dim = dimension^2 = 1 here). Rows for the
+        // two endpoints are zero (no curvature defined there).
+        let mut d2 = Array2::<f64>::zeros((m, m));
+        for k in 1..m - 1 {
+            d2[[k, k - 1]] = 1.0 / (h * h);
+            d2[[k, k]] = -2.0 / (h * h);
+            d2[[k, k + 1]] = 1.0 / (h * h);
+        }
+        d2
+    }
+
+    #[test]
+    fn posterior_snr_weighting_suppresses_noise_and_preserves_edge() {
+        use crate::faer_ndarray::FaerCholesky;
+        use faer::Side;
+
+        let m = 41usize;
+        let h = 1.0 / (m as f64 - 1.0);
+        let xs: Vec<f64> = (0..m).map(|j| j as f64 * h).collect();
+
+        // True function: flat-low on the left, a sharp tanh edge centered at
+        // x = 0.5, flat-high on the right.
+        let edge_center = 0.5;
+        let edge_sharpness = 28.0;
+        let amplitude = 2.0;
+        let truth = Array1::from_iter(
+            xs.iter()
+                .map(|&x| 0.5 * amplitude * (1.0 + (edge_sharpness * (x - edge_center)).tanh())),
+        );
+
+        // Region indices.
+        let left_flat: Vec<usize> = (0..m).filter(|&j| xs[j] <= 0.30).collect();
+        let edge_band: Vec<usize> = (0..m)
+            .filter(|&j| (xs[j] - edge_center).abs() <= 0.07)
+            .collect();
+        assert!(!left_flat.is_empty() && !edge_band.is_empty());
+
+        // Deterministic, reproducible "noise" pattern. The LEFT flat region is
+        // a low-information region: large noise. Elsewhere noise is tiny.
+        let noise = |j: usize| -> f64 {
+            let s = ((j as f64) * 12.9898).sin() * 43758.5453;
+            let frac = s - s.floor(); // pseudo-uniform in [0,1)
+            2.0 * frac - 1.0 // in [-1,1)
+        };
+        let mut y = truth.clone();
+        let mut beta_hat = truth.clone();
+        for &j in &left_flat {
+            let nz = 0.85 * noise(j);
+            y[j] += nz;
+            beta_hat[j] += nz; // noisy point estimate drives the weights
+        }
+        for j in 0..m {
+            if !left_flat.contains(&j) {
+                let nz = 0.02 * noise(j + 7);
+                y[j] += nz;
+                beta_hat[j] += nz;
+            }
+        }
+
+        // Working-Laplace conditional covariance proxy Sigma_beta = H^{-1}.
+        // Diagonal posterior variances: large in the poorly-determined LEFT
+        // flat region, small elsewhere. (Diagonal is sufficient and is the
+        // honest leading-order structure of a per-coefficient variance.)
+        let mut sigma = Array2::<f64>::zeros((m, m));
+        for j in 0..m {
+            let var = if left_flat.contains(&j) { 0.55 } else { 1e-4 };
+            sigma[[j, j]] = var;
+        }
+
+        let d2 = posterior_snr_finite_difference_d2(m, h);
+        // Magnitude-only and SNR machinery share the identical cache, betas and
+        // epsilons; only the covariance argument differs.
+        let cache = SpatialOperatorRuntimeCache {
+            termname: "snr_1d".to_string(),
+            feature_cols: vec![0],
+            coeff_global_range: 0..m,
+            mass_penalty_global_idx: 0,
+            tension_penalty_global_idx: 1,
+            stiffness_penalty_global_idx: 2,
+            d0: Array2::<f64>::zeros((m, m)),
+            d1: Array2::<f64>::zeros((m, m)),
+            d2: d2.clone(),
+            collocation_points: {
+                let mut cp = Array2::<f64>::zeros((m, 1));
+                for j in 0..m {
+                    cp[[j, 0]] = xs[j];
+                }
+                cp
+            },
+            dimension: 1,
+        };
+
+        let eps = 0.05; // shared Charbonnier transition scale
+        let weight_floor = 1e-12;
+        let weight_ceiling = 1e12;
+
+        let mag = compute_spatial_adaptiveweights_for_beta(
+            &beta_hat,
+            std::slice::from_ref(&cache),
+            eps,
+            eps,
+            eps,
+            weight_floor,
+            weight_ceiling,
+            None,
+        )
+        .expect("magnitude-only weights");
+        let snr = compute_spatial_adaptiveweights_for_beta(
+            &beta_hat,
+            std::slice::from_ref(&cache),
+            eps,
+            eps,
+            eps,
+            weight_floor,
+            weight_ceiling,
+            Some(&sigma),
+        )
+        .expect("posterior-SNR weights");
+
+        // inv_lapweight = 1 / w_c; recover the curvature weights w_c.
+        let w_mag = mag[0].inv_lapweight.mapv(|iv| 1.0 / iv);
+        let w_snr = snr[0].inv_lapweight.mapv(|iv| 1.0 / iv);
+
+        // Sanity on the mechanism itself: in the noisy LEFT flat region the SNR
+        // curvature weight must be substantially LARGER (more smoothing) than
+        // the magnitude-only weight, because the spurious point-estimate
+        // curvature there is swamped by the posterior variance. (The real
+        // quality bar is the MSE assertions below; this only confirms the
+        // covariance path is genuinely engaged.)
+        let mean = |idx: &[usize], w: &Array1<f64>| -> f64 {
+            idx.iter().map(|&j| w[j]).sum::<f64>() / idx.len() as f64
+        };
+        assert!(
+            mean(&left_flat, &w_snr) > mean(&left_flat, &w_mag) * 1.5,
+            "SNR must penalize the noisy flat region more: w_snr={:.4e} vs w_mag={:.4e}",
+            mean(&left_flat, &w_snr),
+            mean(&left_flat, &w_mag),
+        );
+
+        // Penalized least-squares fit on the identity design X = I:
+        //   beta = (I + lambda * D2^T diag(w_c) D2)^{-1} y.
+        let lambda = 0.02;
+        let fit = |w: &Array1<f64>| -> Array1<f64> {
+            let k = scalar_operatorhessian(&d2, w); // D2^T diag(w) D2 (symmetric)
+            let mut a = Array2::<f64>::eye(m);
+            a.scaled_add(lambda, &k);
+            let factor = a
+                .cholesky(Side::Lower)
+                .expect("penalized normal matrix is SPD");
+            factor.solvevec(&y)
+        };
+        let fit_mag = fit(&w_mag);
+        let fit_snr = fit(&w_snr);
+
+        let region_mse = |idx: &[usize], f: &Array1<f64>| -> f64 {
+            idx.iter()
+                .map(|&j| (f[j] - truth[j]).powi(2))
+                .sum::<f64>()
+                / idx.len() as f64
+        };
+
+        let mse_flat_mag = region_mse(&left_flat, &fit_mag);
+        let mse_flat_snr = region_mse(&left_flat, &fit_snr);
+        let mse_edge_mag = region_mse(&edge_band, &fit_mag);
+        let mse_edge_snr = region_mse(&edge_band, &fit_snr);
+
+        // Objective quality assertions.
+        // 1. Noisy flat region: SNR fit is STRICTLY closer to truth (does not
+        //    chase noise). Require a clear margin, not a hairline win.
+        assert!(
+            mse_flat_snr < mse_flat_mag * 0.9,
+            "posterior-SNR should be strictly smoother in the noisy flat region: \
+             mse_flat_snr={mse_flat_snr:.6e} vs mse_flat_mag={mse_flat_mag:.6e}"
+        );
+        // 2. Edge region: SNR recovers the edge at least as sharply (MSE no
+        //    worse, with a small tolerance for numerical wiggle).
+        assert!(
+            mse_edge_snr <= mse_edge_mag * 1.05,
+            "posterior-SNR must recover the edge at least as sharply: \
+             mse_edge_snr={mse_edge_snr:.6e} vs mse_edge_mag={mse_edge_mag:.6e}"
+        );
+
+        // Guard against the degenerate pass where both fits are identical (the
+        // covariance path must actually change the weights).
+        assert!(
+            (mse_flat_mag - mse_flat_snr).abs() > 1e-9,
+            "the two weightings must produce materially different flat-region fits"
+        );
     }
 
     #[test]
