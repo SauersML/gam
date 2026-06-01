@@ -71,11 +71,11 @@
 //! coverage proof does not need.
 
 use crate::estimate::{EstimationError, UnifiedFitResult};
-use crate::families::strategy::strategy_for_spec;
 use crate::families::strategy::FamilyStrategy;
+use crate::families::strategy::strategy_for_spec;
 use crate::inference::alo::compute_alo_diagnostics_from_unified;
-use crate::inference::predict::interval_policy::ResponseBounds;
 use crate::inference::predict::PredictUncertaintyResult;
+use crate::inference::predict::interval_policy::ResponseBounds;
 use crate::types::{LikelihoodSpec, LinkFunction};
 use ndarray::{Array1, Array2, ArrayView1};
 
@@ -391,9 +391,12 @@ mod tests {
 
     #[test]
     fn calibrated_interval_is_symmetric_and_clamped() {
-        let calib =
-            ConformalCalibrator::from_residuals_and_scales(array![1.0].view(), array![1.0].view(), 0.5)
-                .expect("valid");
+        let calib = ConformalCalibrator::from_residuals_and_scales(
+            array![1.0].view(),
+            array![1.0].view(),
+            0.5,
+        )
+        .expect("valid");
         // n = 1, alpha = 0.5 → rank = ceil(2 * 0.5) = 1 → q̂ = score = 1.0.
         assert_eq!(calib.q_hat(), 1.0);
         let mean = array![0.5, 2.0];

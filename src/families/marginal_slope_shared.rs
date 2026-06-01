@@ -1730,7 +1730,9 @@ impl<F: MarginalSlopePsiFamily> crate::custom_family::ExactNewtonJointPsiWorkspa
         }
         self.family
             .psi_hessian_directional_derivative(psi_index, d_beta_flat)
-            .map(|result| result.map(crate::solver::estimate::reml::unified::DriftDerivResult::Operator))
+            .map(|result| {
+                result.map(crate::solver::estimate::reml::unified::DriftDerivResult::Operator)
+            })
     }
 }
 

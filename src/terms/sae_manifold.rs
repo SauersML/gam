@@ -57,7 +57,6 @@ use faer::Side;
 const SAE_MANIFOLD_ARMIJO_C1: f64 = 1.0e-4;
 const SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS: usize = 12;
 
-
 /// Decay law for deterministic Gumbel/concrete assignment temperature.
 #[derive(Debug, Clone)]
 pub enum ScheduleKind {
@@ -3109,7 +3108,7 @@ impl SaeManifoldTerm {
 
             // Determine whether this row uses the compact active-set layout.
             //   * JumpReLU: only gated atoms (logit > threshold) enter.
-            //   * Softmax / IBP-MAP at large K: only the top-`k_active` atoms.
+            //   * IBP-MAP at large K: only the top-`k_active` atoms.
             //   * Otherwise (small K): the dense uniform-q layout.
             let (q_row, local_jac_row) = if let Some(ref layout) = row_layout {
                 let active = &layout.active_atoms[row];
@@ -3207,8 +3206,7 @@ impl SaeManifoldTerm {
             } else {
                 for free_idx in 0..assignment_dim {
                     block.gt[free_idx] += assignment_grad[assignment_base + free_idx];
-                    block.htt[[free_idx, free_idx]] +=
-                        assignment_hdiag[assignment_base + free_idx];
+                    block.htt[[free_idx, free_idx]] += assignment_hdiag[assignment_base + free_idx];
                 }
             }
 
@@ -4368,8 +4366,8 @@ impl SaeManifoldTerm {
             ));
         }
 
-        // When last_row_layout is set (any compact active-set mode — JumpReLU
-        // gate or large-K softmax/IBP truncation), delta_ext_coord uses a
+        // When last_row_layout is set (compact active-set mode — JumpReLU
+        // gate or large-K IBP truncation), delta_ext_coord uses a
         // variable-stride layout where row i occupies
         // [compact_offset_i .. compact_offset_i + q_active_i].
         // We expand each row back to full-q before applying.

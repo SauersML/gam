@@ -23609,8 +23609,14 @@ fn duchon_operator_penalty_candidates(
     workspace: &mut BasisWorkspace,
 ) -> Result<Vec<PenaltyCandidate>, BasisError> {
     let want_mass = matches!(operator_penalties.mass, OperatorPenaltySpec::Active { .. });
-    let want_tension = matches!(operator_penalties.tension, OperatorPenaltySpec::Active { .. });
-    let want_stiffness = matches!(operator_penalties.stiffness, OperatorPenaltySpec::Active { .. });
+    let want_tension = matches!(
+        operator_penalties.tension,
+        OperatorPenaltySpec::Active { .. }
+    );
+    let want_stiffness = matches!(
+        operator_penalties.stiffness,
+        OperatorPenaltySpec::Active { .. }
+    );
     if !want_mass && !want_tension && !want_stiffness {
         return Ok(Vec::new());
     }

@@ -330,8 +330,8 @@ fn penalty_cost_is_n_independent() {
 
     for &n in &[2_000usize, 40_000usize] {
         let data = synthetic_data(n, 1, 0xDEAD ^ n as u64);
-        let built =
-            build_duchon_basis(data.view(), &default_duchon_spec(k, 1)).expect("build_duchon_basis");
+        let built = build_duchon_basis(data.view(), &default_duchon_spec(k, 1))
+            .expect("build_duchon_basis");
 
         assert!(
             !built.penalties.is_empty(),

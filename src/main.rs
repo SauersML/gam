@@ -65,10 +65,10 @@ use gam::predict::{
 use gam::probability::{normal_cdf, standard_normal_quantile};
 use gam::report;
 use gam::smooth::{
-    BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec,
-    SmoothBasisSpec, SmoothStructureAnalysis, SmoothTermSpec,
-    SpatialLengthScaleOptimizationOptions, TermCollectionSpec, analyze_smooth_ownership,
-    build_term_collection_design, freeze_term_collection_from_design, smooth_term_feature_cols,
+    BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, SmoothBasisSpec,
+    SmoothStructureAnalysis, SmoothTermSpec, SpatialLengthScaleOptimizationOptions,
+    TermCollectionSpec, analyze_smooth_ownership, build_term_collection_design,
+    freeze_term_collection_from_design, smooth_term_feature_cols,
 };
 use gam::smooth_test::SmoothTestScale;
 use gam::survival::{

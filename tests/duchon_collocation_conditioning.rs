@@ -35,11 +35,11 @@
 //! centers/weights). Probing the emitted block guards the end-to-end contract —
 //! that the sample chosen by the redesign resolves all basis directions.
 
+use faer::Side;
 use gam::basis::{
     CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
     OneDimensionalBoundary, PenaltySource, SpatialIdentifiability, build_duchon_basis,
 };
-use faer::Side;
 use gam::faer_ndarray::FaerCholesky;
 use ndarray::{Array1, Array2};
 use rand::SeedableRng;

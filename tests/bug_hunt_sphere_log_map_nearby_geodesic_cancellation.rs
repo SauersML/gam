@@ -67,8 +67,8 @@ fn sphere_log_map_exact_for_distant_and_general_pairs() {
     // (p, q) unit vectors; exact geodesic = angle = acos(p·q) computed here in
     // a regime where acos is well-conditioned (well away from p·q≈1).
     let cases = [
-        (array![1.0, 0.0, 0.0], array![0.0, 1.0, 0.0]),         // π/2
-        (array![1.0, 0.0, 0.0], array![-1.0, 0.0, 0.0_f64]),    // near antipodal
+        (array![1.0, 0.0, 0.0], array![0.0, 1.0, 0.0]), // π/2
+        (array![1.0, 0.0, 0.0], array![-1.0, 0.0, 0.0_f64]), // near antipodal
         (
             array![0.5_f64.sqrt(), 0.5_f64.sqrt(), 0.0],
             array![0.0, 0.5_f64.sqrt(), 0.5_f64.sqrt()],

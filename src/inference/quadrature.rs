@@ -2596,11 +2596,7 @@ fn sas_point_jet(x: f64, epsilon: f64, log_delta: f64) -> (f64, f64, f64, f64) {
 }
 
 #[inline]
-fn beta_logistic_point_jet(
-    x: f64,
-    log_shape_center: f64,
-    epsilon: f64,
-) -> (f64, f64, f64, f64) {
+fn beta_logistic_point_jet(x: f64, log_shape_center: f64, epsilon: f64) -> (f64, f64, f64, f64) {
     let jet = beta_logistic_inverse_link_jet(x, log_shape_center, epsilon);
     (jet.mu, jet.d1, jet.d2, jet.d3)
 }

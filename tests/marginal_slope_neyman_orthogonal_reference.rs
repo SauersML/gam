@@ -58,11 +58,11 @@
 use gam::families::bernoulli_marginal_slope::BernoulliMarginalSlopeFitResult;
 use gam::families::marginal_slope_orthogonal::{influence_block_design, score_influence_jacobian};
 use gam::terms::smooth::build_term_collection_design;
-use gam::test_support::reference::{dml_partial_linear_reference, rmse, Column};
+use gam::test_support::reference::{Column, dml_partial_linear_reference, rmse};
 use gam::transformation_normal::TransformationNormalConfig;
 use gam::{
-    encode_recordswith_inferred_schema, fit_from_formula, init_parallelism, materialize,
-    CtnStage1Recipe, FitConfig, FitRequest, FitResult,
+    CtnStage1Recipe, FitConfig, FitRequest, FitResult, encode_recordswith_inferred_schema,
+    fit_from_formula, init_parallelism, materialize,
 };
 use ndarray::{Array1, Array2};
 
@@ -120,7 +120,12 @@ fn normal_cdf(x: f64) -> f64 {
 /// arm needs `x`, `y`, `score` and must NOT carry a `z` column — the calibrated
 /// entry synthesizes its own reserved score column and refuses if a clashing
 /// one is present.
-fn build_dataset(x: &[f64], y: &[f64], score: &[f64], z: Option<&[f64]>) -> gam::data::EncodedDataset {
+fn build_dataset(
+    x: &[f64],
+    y: &[f64],
+    score: &[f64],
+    z: Option<&[f64]>,
+) -> gam::data::EncodedDataset {
     let n = x.len();
     assert_eq!(y.len(), n, "x/y length mismatch");
     assert_eq!(score.len(), n, "x/score length mismatch");
@@ -184,8 +189,8 @@ fn expect_bms(result: FitResult) -> BernoulliMarginalSlopeFitResult {
 fn fit_ortho(x: &[f64], y: &[f64], score: &[f64]) -> BernoulliMarginalSlopeFitResult {
     let data = build_dataset(x, y, score, None); // {x, y, score}, NO z dose column
     let recipe = CtnStage1Recipe::new(
-        "score",        // Stage-1 CTN response column
-        COVARIATE_RHS,  // Stage-1 covariate RHS (no ~, no response)
+        "score",       // Stage-1 CTN response column
+        COVARIATE_RHS, // Stage-1 covariate RHS (no ~, no response)
         stage1_config(),
         None, // Stage-1 weight column
         None, // Stage-1 offset column
@@ -221,10 +226,7 @@ fn full_data_ctn_z(x: &[f64], score: &[f64]) -> Array1<f64> {
     let headers = vec!["x".to_string(), "score".to_string()];
     let records: Vec<csv::StringRecord> = (0..n)
         .map(|i| {
-            csv::StringRecord::from(vec![
-                format!("{:.17e}", x[i]),
-                format!("{:.17e}", score[i]),
-            ])
+            csv::StringRecord::from(vec![format!("{:.17e}", x[i]), format!("{:.17e}", score[i])])
         })
         .collect();
     let ds = encode_recordswith_inferred_schema(headers, records).expect("encode CTN dataset");
@@ -240,8 +242,7 @@ fn full_data_ctn_z(x: &[f64], score: &[f64]) -> Array1<f64> {
     };
     req.config.response_degree = 3;
     req.config.response_num_internal_knots = 6;
-    let result =
-        gam::fit_model(materialized.request).expect("fit full-data CTN Stage-1");
+    let result = gam::fit_model(materialized.request).expect("fit full-data CTN Stage-1");
     let FitResult::TransformationNormal(tn) = result else {
         panic!("expected a TransformationNormal fit result");
     };
@@ -716,8 +717,16 @@ fn influence_block_design_is_diag_scaled_jacobian() {
     };
     let block = influence_block_design(&jac, &pilot_beta0, s_f);
 
-    assert_eq!(block.nrows(), n, "influence block must have one row per observation");
-    assert_eq!(block.ncols(), p1, "influence block must have one column per Stage-1 parameter");
+    assert_eq!(
+        block.nrows(),
+        n,
+        "influence block must have one row per observation"
+    );
+    assert_eq!(
+        block.ncols(),
+        p1,
+        "influence block must have one column per Stage-1 parameter"
+    );
     for i in 0..n {
         for k in 0..p1 {
             let expected = s_f * pilot_beta0[i] * jac_cols[[i, k]];

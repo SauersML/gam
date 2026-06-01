@@ -317,7 +317,9 @@ fn widen_marginal_beta_hint(
         } else {
             let mut widened = Array1::<f64>::zeros(p_marginal_widened);
             let copy = hint.len().min(p_marginal_widened);
-            widened.slice_mut(s![..copy]).assign(&hint.slice(s![..copy]));
+            widened
+                .slice_mut(s![..copy])
+                .assign(&hint.slice(s![..copy]));
             widened
         }
     })
@@ -341,7 +343,8 @@ fn build_marginal_blockspec_bms(
     let raw_marginal_dense = design
         .design
         .try_to_dense_arc("build_marginal_blockspec_bms::marginal")?;
-    let marginal_dense = widen_marginal_dense_with_influence(&raw_marginal_dense, influence_columns)?;
+    let marginal_dense =
+        widen_marginal_dense_with_influence(&raw_marginal_dense, influence_columns)?;
     let logslope_dense = logslope_design
         .design
         .try_to_dense_arc("build_marginal_blockspec_bms::logslope")?;
@@ -710,8 +713,10 @@ pub fn fit_bernoulli_marginal_slope_terms(
     // x-dependent realisation of `ψ − Π_η[ψ]`. `None` ⇒ raw z, and the free
     // score_warp spline below is the x-free-column fallback. β̂₀(x_i) is the
     // rigid-pilot logslope `baseline.1 + logslope_offset[i]`; s_f = probit_scale.
-    let influence_columns = if let Some(jac) =
-        spec.score_influence_jacobian.as_ref().filter(|j| j.ncols() > 0)
+    let influence_columns = if let Some(jac) = spec
+        .score_influence_jacobian
+        .as_ref()
+        .filter(|j| j.ncols() > 0)
     {
         let marginal_dense_for_proj = marginal_design
             .design
@@ -731,14 +736,15 @@ pub fn fit_bernoulli_marginal_slope_terms(
         // dedicated η₁ channel). β̂₀(x_i) = baseline.1 + logslope_offset[i];
         // s_f = probit_scale; W = the rigid-pilot PIRLS row metric.
         let rigid_logslope_at_rows = &spec.logslope_offset + baseline.1;
-        let residualized = crate::families::marginal_slope_orthogonal::residualized_influence_block(
-            jac,
-            z_train,
-            &rigid_logslope_at_rows,
-            probit_scale,
-            marginal_dense.view(),
-            &cross_block_pilot_w_score_warp,
-        )?;
+        let residualized =
+            crate::families::marginal_slope_orthogonal::residualized_influence_block(
+                jac,
+                z_train,
+                &rigid_logslope_at_rows,
+                probit_scale,
+                marginal_dense.view(),
+                &cross_block_pilot_w_score_warp,
+            )?;
         Some(residualized)
     } else {
         None

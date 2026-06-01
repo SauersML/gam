@@ -386,7 +386,10 @@ pub fn dml_partial_linear_reference(
     x: &[Column<'_>],
     n_folds: usize,
 ) -> DmlPartialLinearReference {
-    assert!(!x.is_empty(), "DML reference needs at least one confounder X");
+    assert!(
+        !x.is_empty(),
+        "DML reference needs at least one confounder X"
+    );
     assert_eq!(y.len(), d.len(), "DML reference y/d length mismatch");
     let x_names: Vec<String> = x.iter().map(|c| format!("{:?}", c.name)).collect();
     let x_list = x_names.join(", ");

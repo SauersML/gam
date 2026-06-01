@@ -824,11 +824,13 @@ impl RowKernelBackend {
                             reason: format!("bms_flex_row NVRTC compile failed: {err}"),
                         }
                     })?;
-                    let module = parts.ctx.load_module(ptx).map_err(|err| {
-                        GpuError::DriverCallFailed {
-                            reason: format!("bms_flex_row module load failed: {err}"),
-                        }
-                    })?;
+                    let module =
+                        parts
+                            .ctx
+                            .load_module(ptx)
+                            .map_err(|err| GpuError::DriverCallFailed {
+                                reason: format!("bms_flex_row module load failed: {err}"),
+                            })?;
                     Ok(RowKernelBackend {
                         stream: parts.stream.clone(),
                         module,
@@ -1755,11 +1757,13 @@ impl HvpKernelBackend {
                             reason: format!("bms_flex_row hvp NVRTC compile failed: {err}"),
                         }
                     })?;
-                    let module = parts.ctx.load_module(ptx).map_err(|err| {
-                        GpuError::DriverCallFailed {
-                            reason: format!("bms_flex_row hvp module load failed: {err}"),
-                        }
-                    })?;
+                    let module =
+                        parts
+                            .ctx
+                            .load_module(ptx)
+                            .map_err(|err| GpuError::DriverCallFailed {
+                                reason: format!("bms_flex_row hvp module load failed: {err}"),
+                            })?;
                     Ok(HvpKernelBackend {
                         stream: parts.stream.clone(),
                         module,
