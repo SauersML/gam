@@ -25,17 +25,16 @@
 //! these tests verify exactly what the CLI / gamfit run — not a parallel
 //! test-only path:
 //!
-//!   * **orthogonalized arm** — [`fit_marginal_slope_from_ctn`], the single
-//!     magic-by-default production entry. Given the Stage-1 CTN description
-//!     (response column, covariate-formula RHS, CTN config) it BUILDS the
-//!     `CtnStage1Recipe`, sets `FitConfig::ctn_stage1`, fits Stage-1 once,
-//!     synthesizes the in-sample `z` as a reserved column, then routes through
-//!     [`fit_from_formula`] keeping `ctn_stage1` set — so the materializer
-//!     auto-cross-fits, **overrides** `z` with the out-of-fold score, and
-//!     installs the A2 leakage-projection block (the marginal design is widened
-//!     to `[M | Z̃_infl]`). The test passes the Stage-1 params explicitly and
-//!     does NOT hand-assemble the recipe, so it exercises the exact call the
-//!     CLI / gamfit make (design §5).
+//!   * **orthogonalized arm** — THE shipped path: a [`CtnStage1Recipe`] built
+//!     from the Stage-1 CTN description (response column, covariate-formula RHS,
+//!     CTN config), set on `FitConfig::ctn_stage1`, then plain
+//!     [`fit_from_formula`]. There is no separate combined entry function:
+//!     supplying the recipe *is* the request for orthogonalization. The
+//!     materializer fits Stage-1 per fold from the recipe, **cross-fits to
+//!     produce the out-of-fold `z`** (so NO `z_column` and no dose column in the
+//!     data), and installs the A2 leakage-projection block (the marginal design
+//!     is widened to `[M | Z̃_infl]`). This is exactly the call the CLI / lib /
+//!     Python funnel through (design §5).
 //!   * **naive arm (control)** — [`fit_from_formula`] with `ctn_stage1: None`
 //!     on a **precomputed** `z` column (a single full-data CTN score). No
 //!     cross-fit, no influence block ⇒ today's leaky free-warp behavior. This
@@ -62,8 +61,8 @@ use gam::terms::smooth::build_term_collection_design;
 use gam::test_support::reference::{dml_partial_linear_reference, rmse, Column};
 use gam::transformation_normal::TransformationNormalConfig;
 use gam::{
-    encode_recordswith_inferred_schema, fit_from_formula, fit_marginal_slope_from_ctn,
-    init_parallelism, materialize, FitConfig, FitRequest, FitResult,
+    encode_recordswith_inferred_schema, fit_from_formula, init_parallelism, materialize,
+    CtnStage1Recipe, FitConfig, FitRequest, FitResult,
 };
 use ndarray::{Array1, Array2};
 
@@ -157,9 +156,9 @@ fn stage1_config() -> TransformationNormalConfig {
 }
 
 /// Stage-2 marginal-slope `FitConfig` (Bernoulli probit base; logslope surface
-/// `s(x)`). `ctn_stage1` is left `None`: the orthogonalized arm's production
-/// entry [`fit_marginal_slope_from_ctn`] builds and installs the recipe itself,
-/// and the naive arm sets `z_column` instead.
+/// `s(x)`). Both arms start from this base: the orthogonalized arm then sets
+/// `ctn_stage1 = Some(recipe)` (and NO `z_column`), the naive arm sets
+/// `z_column` and leaves `ctn_stage1` `None`.
 fn stage2_config() -> FitConfig {
     FitConfig {
         family: Some("bernoulli-marginal-slope".to_string()),
@@ -175,25 +174,27 @@ fn expect_bms(result: FitResult) -> BernoulliMarginalSlopeFitResult {
     }
 }
 
-/// ORTHOGONALIZED arm — the shipped magic-by-default production entry. It builds
-/// the Stage-1 CTN recipe from the explicit `(response, covariate RHS, config)`
-/// params, sets `ctn_stage1`, fits Stage-1, cross-fits, and installs the A2
-/// absorber — exactly the call the CLI / gamfit make. The test does NOT
-/// hand-assemble the recipe (that would verify a parallel path).
+/// ORTHOGONALIZED arm — THE shipped path: a `CtnStage1Recipe` set on
+/// `FitConfig::ctn_stage1`, then plain [`fit_from_formula`]. Supplying the
+/// recipe *is* the request for orthogonalization (no flag, no combined entry
+/// function): the materializer fits Stage-1 per fold from the recipe,
+/// cross-fits to produce the out-of-fold `z` (so NO `z_column` and no dose
+/// column in the data), and installs the A2 absorber. This is exactly the call
+/// the CLI / lib / Python funnel through.
 fn fit_ortho(x: &[f64], y: &[f64], score: &[f64]) -> BernoulliMarginalSlopeFitResult {
-    let data = build_dataset(x, y, score, None);
-    let config = stage2_config(); // ctn_stage1 = None; the entry builds the recipe
-    let result = fit_marginal_slope_from_ctn(
-        STAGE2_FORMULA,
-        &data,
-        &config,
+    let data = build_dataset(x, y, score, None); // {x, y, score}, NO z dose column
+    let recipe = CtnStage1Recipe::new(
         "score",        // Stage-1 CTN response column
         COVARIATE_RHS,  // Stage-1 covariate RHS (no ~, no response)
         stage1_config(),
         None, // Stage-1 weight column
         None, // Stage-1 offset column
     )
-    .expect("orthogonalized marginal-slope-from-CTN fit");
+    .expect("build Stage-1 CTN recipe");
+    let mut config = stage2_config();
+    config.ctn_stage1 = Some(recipe); // do NOT set z_column — z is cross-fit OOF
+    let result = fit_from_formula(STAGE2_FORMULA, &data, &config)
+        .expect("orthogonalized marginal-slope fit (ctn_stage1 recipe + fit_from_formula)");
     expect_bms(result)
 }
 
