@@ -14263,29 +14263,43 @@ impl SurvivalMarginalSlopeFamily {
         // must equal `p = slices.total` to satisfy the GPU descriptor's
         // shape contract; mismatches force CPU fallback.
         let mut beta = vec![0.0_f64; p];
-        let copy_block = |dst: &mut [f64], range: &std::ops::Range<usize>, src: &Array1<f64>| {
-            if src.len() != range.len() {
-                return;
-            }
-            if let Some(slice) = src.as_slice() {
-                dst[range.clone()].copy_from_slice(slice);
-            } else {
-                // Non-contiguous Array1 — copy element-wise so the GPU
-                // descriptor still sees the canonical joint-block β.
-                for (offset, value) in src.iter().enumerate() {
-                    dst[range.start + offset] = *value;
+        // Returns `false` when the block β width does not match its joint
+        // slice. That invariant (`block_states[i].beta.len() ==
+        // design_i.ncols() == slice.len()`) holds for every well-formed inner
+        // state; if it is ever violated the CPU per-row path hard-errors (e.g.
+        // the `beta.len() != design_derivative_exit.ncols()` check). Silently
+        // leaving the block as zeros would feed the GPU kernel a corrupted β
+        // with no error and no fallback, so a mismatch forces CPU instead.
+        let copy_block =
+            |dst: &mut [f64], range: &std::ops::Range<usize>, src: &Array1<f64>| -> bool {
+                if src.len() != range.len() {
+                    return false;
                 }
-            }
-        };
-        copy_block(&mut beta, &slices.time, &block_states[0].beta);
-        copy_block(&mut beta, &slices.marginal, &block_states[1].beta);
-        copy_block(&mut beta, &slices.logslope, &block_states[2].beta);
+                if let Some(slice) = src.as_slice() {
+                    dst[range.clone()].copy_from_slice(slice);
+                } else {
+                    // Non-contiguous Array1 — copy element-wise so the GPU
+                    // descriptor still sees the canonical joint-block β.
+                    for (offset, value) in src.iter().enumerate() {
+                        dst[range.start + offset] = *value;
+                    }
+                }
+                true
+            };
+        let mut block_widths_match = copy_block(&mut beta, &slices.time, &block_states[0].beta)
+            && copy_block(&mut beta, &slices.marginal, &block_states[1].beta)
+            && copy_block(&mut beta, &slices.logslope, &block_states[2].beta);
         if let Some(range) = slices.score_warp.as_ref() {
-            copy_block(&mut beta, range, &block_states[3].beta);
+            block_widths_match =
+                block_widths_match && copy_block(&mut beta, range, &block_states[3].beta);
         }
         if let Some(range) = slices.link_dev.as_ref() {
             let block_index = 3 + usize::from(self.score_warp.is_some());
-            copy_block(&mut beta, range, &block_states[block_index].beta);
+            block_widths_match =
+                block_widths_match && copy_block(&mut beta, range, &block_states[block_index].beta);
+        }
+        if !block_widths_match {
+            return Ok(None);
         }
         Ok(Some(SurvivalFlexGpuRowBatch {
             n,
