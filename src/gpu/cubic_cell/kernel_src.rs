@@ -61,8 +61,14 @@ const HEADER: &str = r#"// AUTO-GENERATED CUDA C++ source for the de-nested cubi
 // butterflies. For affine and affine-tail cells lane 0 runs the closed-form
 // q'-recurrence and broadcasts via __shfl_sync.
 
-#include <math_constants.h>
 #include <stdint.h>
+
+// CUDART_INF normally comes from the CUDA math-constants header, but that
+// header is not on NVRTC's default search path (NVRTC is invoked with no -I),
+// so pulling it in aborts the JIT compile with "could not open source file".
+// Define the one symbol we use inline instead, matching the CUDA header's own
+// value. __longlong_as_double is an always-available NVRTC builtin (no header).
+#define CUDART_INF (__longlong_as_double(0x7ff0000000000000ULL))
 
 #define STATUS_OK              0
 #define STATUS_INVALID         1
@@ -329,6 +335,14 @@ mod tests {
         assert!(src.contains("cubic_deriv_moments_d9("));
         assert!(src.contains("MAX_DEGREE 9"));
         assert!(src.contains("__shfl_xor_sync"));
+        // NVRTC is invoked with no `-I`, so the source must not pull in a CUDA
+        // header it cannot find; `CUDART_INF` is supplied inline instead.
+        assert!(
+            !src.contains("math_constants.h"),
+            "NVRTC cannot resolve <math_constants.h> without an include path"
+        );
+        assert!(src.contains("#define CUDART_INF"));
+        assert!(src.contains("CUDART_INF"));
     }
 
     #[test]
