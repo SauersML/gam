@@ -663,6 +663,21 @@ pub(super) fn validate_spec(
     if spec.logslope_offset.iter().any(|&value| !value.is_finite()) {
         return Err("bernoulli-marginal-slope requires finite logslope offsets".to_string());
     }
+    if let Some(jac) = spec.score_influence_jacobian.as_ref() {
+        // #461: the absorbed Stage-1 influence Jacobian J = ∂z/∂θ₁ must be an
+        // n×p₁ matrix of finite entries co-indexed with the training rows.
+        if jac.nrows() != n {
+            return Err(format!(
+                "bernoulli-marginal-slope score_influence_jacobian has {} rows, expected {n}",
+                jac.nrows()
+            ));
+        }
+        if jac.iter().any(|&value| !value.is_finite()) {
+            return Err(
+                "bernoulli-marginal-slope score_influence_jacobian must be finite".to_string(),
+            );
+        }
+    }
     require_probit_marginal_slope_link(&spec.base_link, "bernoulli-marginal-slope")?;
     spec.frailty.validate_for_marginal_slope()?;
     match &spec.frailty {

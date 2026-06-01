@@ -815,7 +815,9 @@ pub fn fit_bernoulli_marginal_slope_terms(
     // x-dependent realisation of `ψ − Π_η[ψ]`. `None` ⇒ raw z, and the free
     // score_warp spline below is the x-free-column fallback. β̂₀(x_i) is the
     // rigid-pilot logslope `baseline.1 + logslope_offset[i]`; s_f = probit_scale.
-    let influence_columns = if let Some(jac) = spec.score_influence_jacobian.as_ref() {
+    let influence_columns = if let Some(jac) =
+        spec.score_influence_jacobian.as_ref().filter(|j| j.ncols() > 0)
+    {
         let marginal_dense_for_proj = marginal_design
             .design
             .try_to_dense_arc("bernoulli marginal-slope influence-block marginal projection")?;
