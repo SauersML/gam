@@ -84,10 +84,21 @@ jobs:
           #   libGLU/mesa  -> rgl (loaded transitively by some geometry refs)
           #   gsl          -> INLA and gsl-based refs
           #   gdal/geos/proj -> sf spatial stack
+          # INLA additionally ships PRECOMPILED native binaries (the `inla` and
+          # `fmesher` programs that its R layer dyn.load()s). On a runner those
+          # programs fail to start — the "unable to load shared object"/dyn.load
+          # error in the issue — unless their full runtime link set is present:
+          #   libgfortran5 / libquadmath0 -> the Fortran-built numerics
+          #   libgomp1                    -> OpenMP runtime the binaries thread on
+          #   libmetis / libsuitesparse   -> the sparse-Cholesky path INLA calls
+          #   libjpeg / libpng / libtiff  -> imaging libs linked by the bundled bin
           sudo apt-get update -y || true
           sudo apt-get install -y --no-install-recommends \
             libudunits2-dev libglu1-mesa-dev libgsl-dev \
-            libgdal-dev libgeos-dev libproj-dev || true
+            libgdal-dev libgeos-dev libproj-dev \
+            libgfortran5 libquadmath0 libgomp1 \
+            libmetis5 libsuitesparse-dev \
+            libjpeg-turbo8 libpng16-16 libtiff6 || true
 
       - name: Set up R
         uses: ./.github/actions/setup-bench-r
@@ -108,6 +119,13 @@ jobs:
                       "gamlss.add")
             for (p in pkgs) if (!requireNamespace(p, quietly=TRUE))
               try(install.packages(p), silent=TRUE)
+            # `scoringrules` is a pure-R CRAN package that is absent from the Posit
+            # jammy BINARY snapshot (the "there is no package called scoringrules"
+            # REF_ERROR in the issue). Retry it from SOURCE off canonical CRAN,
+            # where it is always available, so its CRPS reference test can run.
+            if (!requireNamespace("scoringrules", quietly=TRUE))
+              try(install.packages("scoringrules", type = "source",
+                                   repos = "https://cloud.r-project.org"), silent=TRUE)
             cat("installed R packages:\n")
             for (p in pkgs) cat(sprintf("  %-14s %s\n", p, requireNamespace(p, quietly=TRUE)))
           '
@@ -132,6 +150,18 @@ jobs:
                               CRAN = "https://packagemanager.posit.co/cran/__linux__/jammy/latest"))
             if (!requireNamespace("INLA", quietly=TRUE))
               try(install.packages("INLA", dependencies=TRUE), silent=TRUE)
+            # The R package installs fine; the failure mode in the issue is that
+            # its BUNDLED native binaries (the `inla`/`fmesher` programs the R
+            # layer shells/dyn.loads) do not match this runner, so the namespace
+            # load aborts. INLA ships per-OS native builds; fetch the one matching
+            # this host non-interactively so the binary actually runs. Pin to the
+            # Ubuntu build that matches the jammy package snapshot we install from.
+            if (requireNamespace("INLA", quietly=TRUE)) {
+              try({
+                suppressMessages(library(INLA))
+                INLA::inla.binary.install(os = "Ubuntu-22.04")
+              }, silent = TRUE)
+            }
             cat(sprintf("  %-14s %s\n", "INLA", requireNamespace("INLA", quietly=TRUE)))
           '
 
@@ -160,6 +190,18 @@ jobs:
         run: |
           set -uo pipefail
           Rscript -e 'for (p in c("mgcv","gamlss","survival")) library(p, character.only=TRUE); cat("R core refs ok\n")'
+          # Surface the EXACT load error for the two tools this job provisions but
+          # cannot hard-require (large/native): INLA's bundled-binary dyn.load and
+          # the source-built scoringrules. Non-fatal — the quality suite classifies
+          # a still-missing tool as REF_ERROR — but the captured message tells us
+          # precisely which system lib / binary arch is still missing if it recurs.
+          Rscript -e '
+            for (p in c("INLA","scoringrules")) {
+              ok <- tryCatch({ suppressMessages(library(p, character.only=TRUE)); TRUE },
+                             error = function(e) { cat(sprintf("%s load error: %s\n", p, conditionMessage(e))); FALSE })
+              cat(sprintf("  %-12s loadable=%s\n", p, ok))
+            }
+          ' || true
 
       - name: Build quality tests
         shell: bash
