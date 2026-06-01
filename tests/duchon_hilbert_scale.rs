@@ -65,14 +65,14 @@ fn synthetic_data(n: usize, d: usize, seed: u64) -> Array2<f64> {
 /// fields here are exactly the defaults the formula path resolves to, so the
 /// `DuchonOperatorPenaltySpec::default()` carried in the spec is what selects
 /// the all-on behavior at build time.
-fn default_duchon_spec(k: usize) -> DuchonBasisSpec {
+fn default_duchon_spec(k: usize, d: usize) -> DuchonBasisSpec {
     DuchonBasisSpec {
         center_strategy: CenterStrategy::FarthestPoint { num_centers: k },
         periodic: None,
         length_scale: None,
-        // 1-D cubic default s=(d-1)/2=0 → r^3 kernel; in 2-D s=0.5. Use the
-        // dimension-appropriate default at each call site via `power`.
-        power: 0.5,
+        // Cubic default `s = (d−1)/2`: 0 in 1-D (→ r³), 0.5 in 2-D. (`power=0.5`
+        // in 1-D is invalid — CPD requires `2s < d`.)
+        power: (d as f64 - 1.0) / 2.0,
         nullspace_order: DuchonNullspaceOrder::Linear,
         identifiability: SpatialIdentifiability::None,
         aniso_log_scales: None,
@@ -106,7 +106,7 @@ fn has_source(sources: &[PenaltySource], target: &PenaltySource) -> bool {
 #[test]
 fn all_on_by_default() {
     let data = synthetic_data(220, 1, 7);
-    let sources = active_sources(&default_duchon_spec(20), &data);
+    let sources = active_sources(&default_duchon_spec(20, 1), &data);
 
     for required in [
         PenaltySource::Primary,
@@ -331,7 +331,7 @@ fn penalty_cost_is_n_independent() {
     for &n in &[2_000usize, 40_000usize] {
         let data = synthetic_data(n, 1, 0xDEAD ^ n as u64);
         let built =
-            build_duchon_basis(data.view(), &default_duchon_spec(k)).expect("build_duchon_basis");
+            build_duchon_basis(data.view(), &default_duchon_spec(k, 1)).expect("build_duchon_basis");
 
         assert!(
             !built.penalties.is_empty(),
