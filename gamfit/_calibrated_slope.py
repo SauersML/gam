@@ -48,15 +48,13 @@ class CtnStage1:
     Parameters
     ----------
     response:
-        Stage-1 response column name — the ``y`` the CTN transforms into the
-        latent score. This is the column you would have fitted a standalone
-        ``transformation_normal=True`` model on in the old two-call workflow.
+        Stage-1 response column name — the raw score column the CTN conditions
+        on the covariates and transforms into the latent score.
     covariates:
         Stage-1 covariate-side formula right-hand side (e.g.
-        ``"s(pc1) + s(pc2)"``). Built into the CTN covariate basis exactly as
-        the standalone CTN fit would, so each per-fold refit reproduces the
-        original Stage-1 covariate geometry. Pass the right-hand side only — no
-        ``~`` and no response symbol.
+        ``"s(pc1) + s(pc2)"``). Built into the CTN covariate basis so each
+        per-fold refit reproduces the same Stage-1 covariate geometry. Pass the
+        right-hand side only — no ``~`` and no response symbol.
     response_degree, response_num_internal_knots, response_penalty_order,
     response_extra_penalty_orders, double_penalty:
         Optional overrides for the CTN response-direction basis / penalty.

@@ -220,26 +220,23 @@ pred.write_survival_at_csv(
 )
 ```
 
-## Two-stage marginal-slope pipeline
+## Calibrated marginal-slope pipeline
+
+Condition the score on covariates and fit the slope surface in one
+cross-fitted, orthogonalized call by supplying a Stage-1 recipe with
+`transformation_normal_stage1=`. No `z_column` is materialised or passed
+by hand — the conditioned, cross-fitted score lives inside the fit.
 
 ```python
-# Stage 1: condition the score on PCs (transformation-normal).
-calib = gamfit.fit(
-    df,
-    "PGS ~ matern(pc1, pc2, pc3, pc4, centers=20)",
-    transformation_normal=True,
-    scale_dimensions=True,
-)
-df["pgs_z"] = calib.predict(df)
-
-# Stage 2: Bernoulli marginal-slope.
 model = gamfit.fit(
     df,
     "case ~ s(age) + matern(pc1, pc2, pc3, pc4, centers=20)",
     family="bernoulli-marginal-slope",
-    link="probit",
-    z_column="pgs_z",
     logslope_formula="matern(pc1, pc2, pc3, pc4, centers=20)",
+    transformation_normal_stage1=gamfit.CtnStage1(
+        response="PGS",
+        covariates="matern(pc1, pc2, pc3, pc4, centers=20)",
+    ),
     scale_dimensions=True,
 )
 probs = model.predict(test_df, return_type="dict")["mean"]
@@ -252,8 +249,11 @@ gamfit.fit(
     df,
     "Surv(entry, exit, event) ~ s(bmi) + s(hba1c)",
     survival_likelihood="marginal-slope",
-    z_column="pgs_z",
     logslope_formula="s(bmi) + s(hba1c)",
+    transformation_normal_stage1=gamfit.CtnStage1(
+        response="PGS",
+        covariates="s(bmi) + s(hba1c)",
+    ),
 )
 ```
 
