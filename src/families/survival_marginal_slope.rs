@@ -5886,7 +5886,11 @@ impl SurvivalMarginalSlopeFamily {
     }
 
     fn flex_active(&self) -> bool {
-        self.score_warp.is_some() || self.link_dev.is_some()
+        // The absorbed influence block (#461) rides the dynamic-Q primary-jet
+        // path (it adds the `o_infl` primary coordinate), so it counts as "flex"
+        // for dispatch purposes even when no score_warp / link_dev is present —
+        // the rigid closed-form row kernel has no `o_infl` channel.
+        self.score_warp.is_some() || self.link_dev.is_some() || self.influence_absorber.is_some()
     }
 
     fn effective_flex_active(&self, block_states: &[ParameterBlockState]) -> Result<bool, String> {
@@ -5899,6 +5903,12 @@ impl SurvivalMarginalSlopeFamily {
         if self.link_dev.is_some() && self.flex_link_beta(block_states)?.is_none() {
             return Err(SurvivalMarginalSlopeError::InvalidInput {
                 reason: "missing survival link-deviation block state".to_string(),
+            }
+            .into());
+        }
+        if self.influence_absorber.is_some() && self.flex_influence_beta(block_states)?.is_none() {
+            return Err(SurvivalMarginalSlopeError::InvalidInput {
+                reason: "missing survival influence-absorber block state".to_string(),
             }
             .into());
         }
