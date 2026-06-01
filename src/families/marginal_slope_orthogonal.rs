@@ -34,7 +34,7 @@
 
 use crate::faer_ndarray::fast_abt;
 use crate::families::transformation_normal::{
-    TRANSFORMATION_MONOTONICITY_EPS, TransformationNormalFitResult,
+    TRANSFORMATION_MONOTONICITY_EPS, TransformationNormalFitResult, transformation_normal_pit_score,
 };
 use crate::inference::model::TRANSFORMATION_SCORE_PIT_CLIP_EPS;
 use crate::probability::{normal_cdf, normal_pdf, standard_normal_quantile};
@@ -210,25 +210,31 @@ pub fn score_influence_jacobian(
             ));
         }
 
-        // PIT probability u_pit and z, clamped exactly as the fitted PIT score
-        // does, so the Jacobian is taken at the same (clipped) operating point.
+        // z is the finite-support PIT score, computed by the SAME canonical
+        // kernel the normal Stage-2 path consumes (`calibrate_transformation_scores`
+        // → `transformation_normal_pit_score`). That kernel forms the PIT ratio in
+        // LOG space (`normal_logcdf` + `log1mexp_positive`), which stays accurate
+        // when h/L/U all sit deep in a tail where the direct CDF subtraction
+        // `(Φ(h)−Φ(L))/(Φ(U)−Φ(L))` would cancel catastrophically. Reusing it makes
+        // z bit-identical to Stage-2's z — single source of truth.
+        let z = transformation_normal_pit_score(h, l, u, TRANSFORMATION_SCORE_PIT_CLIP_EPS)
+            .map_err(|e| format!("score_influence_jacobian: PIT score failed at row {i}: {e}"))?;
+        z_scores[i] = z;
+
+        // The ∂u/∂θ chain is evaluated at the SAME (clipped) operating point z
+        // represents: u_pit = Φ(z) exactly inverts z = Φ⁻¹(u_clamped), so the
+        // derivative coefficient and the reported score stay self-consistent
+        // without recomputing the (less stable) direct ratio. The endpoint
+        // φ/Φ values below are the analytic derivatives of that ratio.
         let phi_l = normal_cdf(l);
         let phi_u = normal_cdf(u);
-        let phi_h = normal_cdf(h.clamp(l, u));
         let denom_mass = phi_u - phi_l;
         if !(denom_mass.is_finite() && denom_mass > 0.0) {
             return Err(format!(
                 "score_influence_jacobian: endpoint mass not resolvable at row {i}: Φ(U)−Φ(L)={denom_mass:.6e}"
             ));
         }
-        let u_pit_raw = ((phi_h - phi_l) / denom_mass).clamp(0.0, 1.0);
-        let u_pit = u_pit_raw.clamp(
-            TRANSFORMATION_SCORE_PIT_CLIP_EPS,
-            1.0 - TRANSFORMATION_SCORE_PIT_CLIP_EPS,
-        );
-        let z = standard_normal_quantile(u_pit)
-            .map_err(|e| format!("score_influence_jacobian: quantile failed at row {i}: {e}"))?;
-        z_scores[i] = z;
+        let u_pit = normal_cdf(z);
 
         // φ at h/L/U and at z. The chain ∂u/∂θ uses φ at the *unclamped* h when
         // h is inside [L,U]; at the boundary (h clamped) φ(h)·∂h is the limiting
