@@ -31,10 +31,11 @@
 //! With `s_i ≡ 1` this is classic absolute-residual split conformal; with
 //! heteroscedastic `s_i` it is conformalized scale regression.
 //!
-//! CRITICAL: this uses the EXACT k-th order statistic (sort, take index
-//! `rank − 1`). It deliberately does NOT use the interpolating quantile in
-//! `crate::util::quantile` — linear interpolation between order statistics
-//! would void the finite-sample coverage proof.
+//! CRITICAL: this uses the EXACT k-th order statistic from
+//! [`crate::util::quantile::order_statistic`]. It deliberately does NOT use
+//! the interpolating [`crate::util::quantile::quantile_from_sorted`] — linear
+//! interpolation between order statistics would void the finite-sample coverage
+//! proof.
 //!
 //! # Where the calibration lives, and how it is wired
 //!
@@ -71,12 +72,13 @@
 //! coverage proof does not need.
 
 use crate::estimate::{EstimationError, UnifiedFitResult};
-use crate::families::strategy::strategy_for_spec;
 use crate::families::strategy::FamilyStrategy;
+use crate::families::strategy::strategy_for_spec;
 use crate::inference::alo::compute_alo_diagnostics_from_unified;
-use crate::inference::predict::interval_policy::ResponseBounds;
 use crate::inference::predict::PredictUncertaintyResult;
+use crate::inference::predict::interval_policy::ResponseBounds;
 use crate::types::{LikelihoodSpec, LinkFunction};
+use crate::util::quantile::order_statistic;
 use ndarray::{Array1, Array2, ArrayView1};
 
 /// The conformal nonconformity scores `e_i = |r_i| / s_i` for held-out
@@ -155,10 +157,8 @@ pub fn conformal_multiplier(
         // Too few calibration points to certify coverage at this level.
         return Ok(f64::INFINITY);
     }
-    let mut sorted: Vec<f64> = scores.iter().copied().collect();
-    sorted.sort_by(|a, b| a.partial_cmp(b).expect("scores are finite, checked above"));
-    // rank is 1-based; the k-th smallest is at index k − 1.
-    Ok(sorted[rank - 1])
+    let values: Vec<f64> = scores.iter().copied().collect();
+    Ok(order_statistic(&values, rank))
 }
 
 /// A fitted conformal calibrator: the single scalar `q̂` and the miscoverage
@@ -391,9 +391,12 @@ mod tests {
 
     #[test]
     fn calibrated_interval_is_symmetric_and_clamped() {
-        let calib =
-            ConformalCalibrator::from_residuals_and_scales(array![1.0].view(), array![1.0].view(), 0.5)
-                .expect("valid");
+        let calib = ConformalCalibrator::from_residuals_and_scales(
+            array![1.0].view(),
+            array![1.0].view(),
+            0.5,
+        )
+        .expect("valid");
         // n = 1, alpha = 0.5 → rank = ceil(2 * 0.5) = 1 → q̂ = score = 1.0.
         assert_eq!(calib.q_hat(), 1.0);
         let mean = array![0.5, 2.0];
