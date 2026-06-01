@@ -190,15 +190,24 @@ pub struct SasLinkSpec {
     pub initial_log_delta: f64,
 }
 
-/// Runtime SAS link state with cached positive tail parameter.
+/// Runtime state shared by the two-parameter `Sas` and `BetaLogistic` links:
+/// an `epsilon` skew/asymmetry term plus a raw log-scale parameter (`log_delta`)
+/// and its derived positive companion (`delta`). The `delta` field's meaning is
+/// link-specific — see its doc — so derivative kernels must consume `log_delta`,
+/// never `delta`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SasLinkState {
     pub epsilon: f64,
-    /// Raw optimization parameter.
+    /// Raw optimization parameter. For `Sas` this is the pre-bound log-tail; for
+    /// `BetaLogistic` it is the unconstrained log geometric-mean beta shape (the
+    /// `log_shape_center` the beta-logistic kernels expect).
     pub log_delta: f64,
-    /// Effective tail parameter delta used in evaluation.
-    /// With current bounded parameterization:
-    /// delta = exp(B * tanh(log_delta / B)), B = SAS_LOG_DELTA_BOUND.
+    /// Derived positive companion of `log_delta`. Its meaning depends on the link:
+    /// - `Sas`: effective tail parameter `delta = exp(B * tanh(log_delta / B))`,
+    ///   `B = SAS_LOG_DELTA_BOUND`.
+    /// - `BetaLogistic`: geometric-mean beta shape `exp(log_delta) = sqrt(a*b)`.
+    /// The beta-logistic derivative kernels take `log_delta` (the log center), so
+    /// passing this exponentiated `delta` to them would be off by an `exp`.
     pub delta: f64,
 }
 

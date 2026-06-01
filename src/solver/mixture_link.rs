@@ -439,11 +439,15 @@ pub fn state_from_beta_logisticspec(spec: SasLinkSpec) -> Result<SasLinkState, S
     if !spec.initial_epsilon.is_finite() || !spec.initial_log_delta.is_finite() {
         return Err("Beta-Logistic link parameters must be finite".to_string());
     }
-    let delta_raw = spec.initial_log_delta;
+    // For Beta-Logistic, `log_delta` is the unconstrained log geometric-mean beta
+    // shape (the kernels' `log_shape_center`); the derived `delta = exp(log_delta)`
+    // is the positive geometric-mean shape `sqrt(a*b)`. Evaluation consumes
+    // `log_delta`, never `delta`.
+    let log_shape_center = spec.initial_log_delta;
     Ok(SasLinkState {
         epsilon: spec.initial_epsilon,
-        log_delta: delta_raw,
-        delta: delta_raw.exp(),
+        log_delta: log_shape_center,
+        delta: log_shape_center.exp(),
     })
 }
 
@@ -799,7 +803,9 @@ impl InverseLinkKernel for SasLinkState {
 
 #[derive(Clone, Copy, Debug)]
 pub struct BetaLogisticKernel {
-    pub delta: f64,
+    /// Unconstrained log of the geometric-mean beta shape — the raw optimization
+    /// parameter `SasLinkState::log_delta`, NOT the derived `SasLinkState::delta`.
+    pub log_shape_center: f64,
     pub epsilon: f64,
 }
 
@@ -807,14 +813,18 @@ impl InverseLinkKernel for BetaLogisticKernel {
     fn jet(&self, eta: f64) -> Result<InverseLinkJet, EstimationError> {
         Ok(beta_logistic_inverse_link_jet(
             eta,
-            self.delta,
+            self.log_shape_center,
             self.epsilon,
         ))
     }
 
     fn param_partials(&self, eta: f64) -> Result<Option<LinkParamPartials>, EstimationError> {
         Ok(Some(LinkParamPartials::Sas(
-            beta_logistic_inverse_link_jetwith_param_partials(eta, self.delta, self.epsilon),
+            beta_logistic_inverse_link_jetwith_param_partials(
+                eta,
+                self.log_shape_center,
+                self.epsilon,
+            ),
         )))
     }
 }
@@ -838,7 +848,7 @@ impl InverseLinkKernel for InverseLink {
             InverseLink::LatentCLogLog(state) => latent_cloglog_point_jet(state, eta),
             InverseLink::Sas(state) => state.jet(eta),
             InverseLink::BetaLogistic(state) => BetaLogisticKernel {
-                delta: state.log_delta,
+                log_shape_center: state.log_delta,
                 epsilon: state.epsilon,
             }
             .jet(eta),
@@ -852,7 +862,7 @@ impl InverseLinkKernel for InverseLink {
             InverseLink::LatentCLogLog(_) => Ok(None),
             InverseLink::Sas(state) => state.param_partials(eta),
             InverseLink::BetaLogistic(state) => BetaLogisticKernel {
-                delta: state.log_delta,
+                log_shape_center: state.log_delta,
                 epsilon: state.epsilon,
             }
             .param_partials(eta),
@@ -1072,10 +1082,14 @@ impl PdfDerivativeOrder {
         }
     }
 
-    fn beta_logistic(self, eta: f64, delta: f64, epsilon: f64) -> f64 {
+    fn beta_logistic(self, eta: f64, log_shape_center: f64, epsilon: f64) -> f64 {
         match self {
-            Self::Third => beta_logistic_inverse_link_pdfthird_derivative(eta, delta, epsilon),
-            Self::Fourth => beta_logistic_inverse_link_pdffourth_derivative(eta, delta, epsilon),
+            Self::Third => {
+                beta_logistic_inverse_link_pdfthird_derivative(eta, log_shape_center, epsilon)
+            }
+            Self::Fourth => {
+                beta_logistic_inverse_link_pdffourth_derivative(eta, log_shape_center, epsilon)
+            }
         }
     }
 }
@@ -1155,7 +1169,7 @@ pub fn inverse_link_jet_for_link_function(
     if let Some(sas) = sas_link_state {
         return match link {
             LinkFunction::BetaLogistic => BetaLogisticKernel {
-                delta: sas.log_delta,
+                log_shape_center: sas.log_delta,
                 epsilon: sas.epsilon,
             }
             .jet(eta),
@@ -1512,12 +1526,21 @@ fn beta_reg_with_shape_partials(a0: f64, b0: f64, x0: f64) -> (f64, f64, f64) {
 
 /// Beta-Logistic inverse-link jet for:
 ///   u = logistic(eta)
-///   a = exp(delta - epsilon), b = exp(delta + epsilon)
+///   a = exp(log_shape_center - epsilon), b = exp(log_shape_center + epsilon)
 ///   mu = I_u(a, b)
-pub fn beta_logistic_inverse_link_jet(eta: f64, delta: f64, epsilon: f64) -> InverseLinkJet {
+///
+/// NOTE: `log_shape_center` is the *unconstrained* log of the geometric-mean
+/// beta shape (so a·b = exp(2·log_shape_center)). Callers must pass the raw
+/// optimization parameter `SasLinkState::log_delta`, NOT the derived positive
+/// `SasLinkState::delta = exp(log_shape_center)`.
+pub fn beta_logistic_inverse_link_jet(
+    eta: f64,
+    log_shape_center: f64,
+    epsilon: f64,
+) -> InverseLinkJet {
     let (u, du) = logistic_uwith_derivatives(eta);
-    let a = (delta - epsilon).exp();
-    let b = (delta + epsilon).exp();
+    let a = (log_shape_center - epsilon).exp();
+    let b = (log_shape_center + epsilon).exp();
     let mu = beta_reg(a, b, u);
     if du == 0.0 {
         return InverseLinkJet {
@@ -1535,7 +1558,11 @@ pub fn beta_logistic_inverse_link_jet(eta: f64, delta: f64, epsilon: f64) -> Inv
     InverseLinkJet { mu, d1, d2, d3 }
 }
 
-pub fn beta_logistic_inverse_link_pdfthird_derivative(eta: f64, delta: f64, epsilon: f64) -> f64 {
+pub fn beta_logistic_inverse_link_pdfthird_derivative(
+    eta: f64,
+    log_shape_center: f64,
+    epsilon: f64,
+) -> f64 {
     // Beta-logistic link:
     //
     //   u = logistic(eta),
@@ -1562,8 +1589,8 @@ pub fn beta_logistic_inverse_link_pdfthird_derivative(eta: f64, delta: f64, epsi
     if du == 0.0 {
         return 0.0;
     }
-    let a = (delta - epsilon).exp();
-    let b = (delta + epsilon).exp();
+    let a = (log_shape_center - epsilon).exp();
+    let b = (log_shape_center + epsilon).exp();
     let log_d1 = a * u.ln() + b * (1.0 - u).ln() - ln_beta(a, b);
     let d1 = log_d1.exp();
     let c = a + b;
@@ -1579,13 +1606,17 @@ pub fn beta_logistic_inverse_link_pdfthird_derivative(eta: f64, delta: f64, epsi
 ///   d5 = d1 * [t^4 - 6c*t^2*u' - 4c*t*u'' + 3c^2*u'^2 - c*u''']
 ///
 /// where u' = u(1-u), u'' = u'(1-2u), u''' = u''(1-2u) - 2*u'^2.
-pub fn beta_logistic_inverse_link_pdffourth_derivative(eta: f64, delta: f64, epsilon: f64) -> f64 {
+pub fn beta_logistic_inverse_link_pdffourth_derivative(
+    eta: f64,
+    log_shape_center: f64,
+    epsilon: f64,
+) -> f64 {
     let (u, du) = logistic_uwith_derivatives(eta);
     if du == 0.0 {
         return 0.0;
     }
-    let a = (delta - epsilon).exp();
-    let b = (delta + epsilon).exp();
+    let a = (log_shape_center - epsilon).exp();
+    let b = (log_shape_center + epsilon).exp();
     let log_d1 = a * u.ln() + b * (1.0 - u).ln() - ln_beta(a, b);
     let d1 = log_d1.exp();
     let c = a + b;
@@ -1598,14 +1629,14 @@ pub fn beta_logistic_inverse_link_pdffourth_derivative(eta: f64, delta: f64, eps
 
 pub fn beta_logistic_inverse_link_jetwith_param_partials(
     eta: f64,
-    delta: f64,
+    log_shape_center: f64,
     epsilon: f64,
 ) -> SasJetWithParamPartials {
     let (u, du) = logistic_uwith_derivatives(eta);
-    let a = (delta - epsilon).exp();
-    let b = (delta + epsilon).exp();
+    let a = (log_shape_center - epsilon).exp();
+    let b = (log_shape_center + epsilon).exp();
     let (mu, dmu_da, dmu_db) = beta_reg_with_shape_partials(a, b, u);
-    let dmu_ddelta = a * dmu_da + b * dmu_db;
+    let dmu_dlog_shape_center = a * dmu_da + b * dmu_db;
     let dmu_depsilon = -a * dmu_da + b * dmu_db;
     if du == 0.0 {
         let zero = InverseLinkJet {
@@ -1623,7 +1654,7 @@ pub fn beta_logistic_inverse_link_jetwith_param_partials(
                 d3: 0.0,
             },
             djet_dlog_delta: InverseLinkJet {
-                mu: dmu_ddelta,
+                mu: dmu_dlog_shape_center,
                 d1: 0.0,
                 d2: 0.0,
                 d3: 0.0,
@@ -1658,12 +1689,12 @@ pub fn beta_logistic_inverse_link_jetwith_param_partials(
             d3: d3_p,
         }
     };
-    let djet_ddelta = partials_for(a, b, dmu_ddelta);
+    let djet_dlog_shape_center = partials_for(a, b, dmu_dlog_shape_center);
     let djet_depsilon = partials_for(-a, b, dmu_depsilon);
     SasJetWithParamPartials {
         jet,
         djet_depsilon,
-        djet_dlog_delta: djet_ddelta,
+        djet_dlog_delta: djet_dlog_shape_center,
     }
 }
 
