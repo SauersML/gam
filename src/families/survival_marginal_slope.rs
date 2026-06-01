@@ -6570,8 +6570,12 @@ impl SurvivalMarginalSlopeFamily {
         let g = block_states[2].eta[row];
         let beta_h = self.flex_score_beta(block_states)?;
         let beta_w = self.flex_link_beta(block_states)?;
+        // Absorbed Stage-1 influence offset (#461): a per-row additive shift of
+        // the de-nested observed index η₁ (un-`c(g)`-scaled), `0.0` when no
+        // absorber is installed.
+        let o_infl = self.influence_index_offset(row, block_states)?;
         self.row_neglog_flex_value_from_parts(
-            row, q_geom.q0, q_geom.q1, q_geom.qd1, g, beta_h, beta_w,
+            row, q_geom.q0, q_geom.q1, q_geom.qd1, g, beta_h, beta_w, o_infl,
         )
     }
 
@@ -6584,6 +6588,7 @@ impl SurvivalMarginalSlopeFamily {
         g: f64,
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
+        o_infl: f64,
     ) -> Result<f64, String> {
         if survival_derivative_guard_violated(qd1, self.derivative_guard) {
             return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
@@ -6617,8 +6622,14 @@ impl SurvivalMarginalSlopeFamily {
             }
             .into());
         }
-        let (eta0, _) = self.observed_denested_eta_chi(row, a0, g, beta_h, beta_w)?;
-        let (eta1, chi1) = self.observed_denested_eta_chi(row, a1, g, beta_h, beta_w)?;
+        // The absorbed-influence offset shifts the observed index η₁ additively
+        // at both the entry (eta0) and exit (eta1) calibration roots — `o_infl`
+        // is independent of the calibration intercept `a`, so the de-nesting
+        // derivative `chi1 = ∂η₁/∂a` is unchanged.
+        let (eta0_raw, _) = self.observed_denested_eta_chi(row, a0, g, beta_h, beta_w)?;
+        let (eta1_raw, chi1) = self.observed_denested_eta_chi(row, a1, g, beta_h, beta_w)?;
+        let eta0 = eta0_raw + o_infl;
+        let eta1 = eta1_raw + o_infl;
         if !chi1.is_finite() || chi1 <= 0.0 {
             return Err(SurvivalMarginalSlopeError::NumericalFailure {
                 reason: format!(
@@ -22518,6 +22529,7 @@ mod tests {
             logslope,
             score_warp,
             link_dev,
+            influence: None,
             total,
         }
     }
@@ -27981,6 +27993,7 @@ mod tests {
             logslope,
             score_warp: Some(score_warp),
             link_dev: Some(link_dev),
+            influence: None,
             total,
         }
     }
