@@ -262,27 +262,10 @@ struct PyCtnStage1Config {
 }
 
 impl PyCtnStage1 {
-    /// Convert the wire form to the core `gam::CtnStage1Recipe`, validating the
-    /// required string fields and folding any config overrides onto the default.
+    /// Convert the wire form to the core `gam::CtnStage1Recipe` via its public
+    /// constructor (single source of truth for the non-empty / RHS-only
+    /// validation), folding any config overrides onto the CTN default.
     fn into_recipe(self) -> Result<gam::CtnStage1Recipe, String> {
-        let response_column = self.response_column.trim().to_string();
-        if response_column.is_empty() {
-            return Err("ctn_stage1.response_column must be a non-empty column name".to_string());
-        }
-        let covariate_formula_rhs = self.covariate_formula_rhs.trim().to_string();
-        if covariate_formula_rhs.is_empty() {
-            return Err(
-                "ctn_stage1.covariate_formula_rhs must be a non-empty covariate formula RHS"
-                    .to_string(),
-            );
-        }
-        if covariate_formula_rhs.contains('~') {
-            return Err(
-                "ctn_stage1.covariate_formula_rhs is a right-hand side only; pass 's(pc1) + s(pc2)', \
-                 not 'score ~ s(pc1) + s(pc2)'"
-                    .to_string(),
-            );
-        }
         let mut config = gam::transformation_normal::TransformationNormalConfig::default();
         if let Some(overrides) = self.config {
             if let Some(value) = overrides.response_degree {
@@ -301,13 +284,13 @@ impl PyCtnStage1 {
                 config.double_penalty = value;
             }
         }
-        Ok(gam::CtnStage1Recipe {
-            response_column,
-            covariate_formula_rhs,
+        gam::CtnStage1Recipe::new(
+            &self.response_column,
+            &self.covariate_formula_rhs,
             config,
-            weight_column: self.weight_column.filter(|s| !s.trim().is_empty()),
-            offset_column: self.offset_column.filter(|s| !s.trim().is_empty()),
-        })
+            self.weight_column.as_deref(),
+            self.offset_column.as_deref(),
+        )
     }
 }
 
