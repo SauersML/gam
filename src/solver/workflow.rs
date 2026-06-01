@@ -2751,8 +2751,8 @@ pub struct CtnStage1Recipe {
     ///
     /// The recipe carries the formula RHS (a primitive string) rather than a
     /// resolved [`TermCollectionSpec`] because this struct is populated both by
-    /// the in-process combined entry point ([`fit_calibrated_marginal_slope`])
-    /// and by the gamfit FFI marshaller (`gamfit/_calibrated_slope.py`), which
+    /// the in-process entry point ([`fit_marginal_slope_from_ctn`]) and by the
+    /// gamfit FFI marshaller (`gamfit/_calibrated_slope.py`), which
     /// can only serialize primitives over the JSON boundary — a `TermCollectionSpec`
     /// is not serializable. Freezing on the full Stage-2 data is equivalent to
     /// freezing on the Stage-1 data whenever the two stages share a frame (the
@@ -3001,61 +3001,43 @@ fn crossfit_score_calibration(
 /// Synthetic column name carrying the Stage-1 latent score into the Stage-2
 /// marginal-slope materializer for the calibrated chain. Reserved (the leading
 /// `__gam` prefix is not a valid user formula symbol), so it cannot collide with
-/// a real covariate; [`fit_calibrated_marginal_slope`] rejects the pathological
-/// case where it already exists in the data. Public so the FFI
+/// a real covariate; [`prepare_calibrated_marginal_slope_stage2`] rejects the
+/// pathological case where it already exists in the data. Public so the FFI
 /// (`gam-pyffi`) can reuse the exact reserved name (single source of truth) when
 /// it synthesizes a placeholder score column for structural formula validation.
 pub const CALIBRATED_SLOPE_Z_COLUMN: &str = "__gam_ctn_stage1_z";
 
-/// Fit the calibrated (Neyman-orthogonal, cross-fitted) marginal-slope chain in
-/// one in-process call — the magic-by-default production path for #461.
+/// The SINGLE production entry point for the calibrated (Neyman-orthogonal,
+/// cross-fitted) marginal-slope chain — the magic-by-default path that closes
+/// #461 end-to-end. There is no parallel "calibrated" entry: every orthogonalized
+/// marginal-slope fit (CLI, lib, gamfit) routes through this function or, at the
+/// FFI boundary, through the shared [`prepare_calibrated_marginal_slope_stage2`]
+/// it delegates to.
 ///
-/// `config.ctn_stage1` carries the Stage-1 CTN recipe (response column, covariate
-/// formula RHS, CTN config). This entry point:
+/// Given the Stage-1 CTN description (`stage1_response` column,
+/// `stage1_covariates` formula RHS, `stage1_config`) and the Stage-2
+/// marginal-slope `config` (family / `logslope_formula` / link / …), it:
 ///
-/// 1. fits the Stage-1 CTN once on the full data from that recipe and reads its
-///    in-sample latent score `z = Φ⁻¹(PIT)` (the calibrated `block_states[0].eta`);
-/// 2. appends `z` to the dataset as the reserved [`CALIBRATED_SLOPE_Z_COLUMN`]
-///    and points `z_column` at it, while keeping `ctn_stage1` set;
+/// 1. assembles a [`CtnStage1Recipe`] from the explicit Stage-1 parameters and
+///    installs it on a clone of `config`;
+/// 2. fits the Stage-1 CTN once on the full data, reads its in-sample latent
+///    score, appends it as the reserved [`CALIBRATED_SLOPE_Z_COLUMN`], and points
+///    `z_column` at it (via [`prepare_calibrated_marginal_slope_stage2`]);
 /// 3. runs the Stage-2 marginal-slope fit via [`fit_from_formula`].
 ///
 /// The Stage-2 materializer (Bernoulli or survival) then detects the populated
 /// `ctn_stage1`, CROSS-FITS the CTN (refitting per fold on the complement),
-/// OVERRIDES the in-sample `z` with the out-of-fold `z_oof`, and installs the
+/// OVERRIDES the in-sample score with the out-of-fold `z_oof`, and installs the
 /// realized leakage-projection block — so the fitted slope surface `β(x)` is
-/// insensitive to Stage-1 calibration error (design §4-§5). The in-sample `z`
-/// from step 1 is only the column the materializer reads before replacing it; the
-/// orthogonalization uses the cross-fitted score throughout.
+/// insensitive to Stage-1 calibration error (design §4-§5).
 ///
-/// There is no flag to "turn on" orthogonalization: supplying `ctn_stage1` *is*
-/// the request. With `ctn_stage1 = None` callers should use [`fit_from_formula`]
-/// directly with a raw `z_column` (the free-warp `score_warp` fallback).
-pub fn fit_calibrated_marginal_slope(
-    stage2_formula: &str,
-    data: &Dataset,
-    config: &FitConfig,
-) -> Result<FitResult, WorkflowError> {
-    let (augmented, stage2_config) = prepare_calibrated_marginal_slope_stage2(data, config)?;
-    fit_from_formula(stage2_formula, &augmented, &stage2_config)
-}
-
-/// Production entry point for the calibrated marginal-slope chain that BUILDS the
-/// Stage-1 recipe from the supplied parameters and sets it on the config — the
-/// caller does not pre-populate `config.ctn_stage1`.
-///
-/// This is the single magic-by-default call that closes #461 end-to-end: given
-/// the Stage-1 CTN description (`stage1_response` column, `stage1_covariates`
-/// formula RHS, `stage1_config`) and the Stage-2 marginal-slope `config`
-/// (family / `logslope_formula` / link / …), it assembles a [`CtnStage1Recipe`],
-/// installs it on a clone of `config`, and runs [`fit_calibrated_marginal_slope`].
-/// The Stage-2 materializer then cross-fits the CTN, replaces the in-sample score
-/// with the out-of-fold one, and installs the leakage-projection block (design
-/// §4-§5).
+/// There is no flag to "turn on" orthogonalization and no way to chain Stage-1
+/// without it: supplying the Stage-1 recipe *is* the request. For the naive /
+/// free-warp control, do NOT use this entry — call [`fit_from_formula`] with a
+/// raw `z_column` and no recipe (the primitive standalone marginal-slope family).
 ///
 /// `config.ctn_stage1` MUST be `None` on entry: the recipe is built here from the
-/// explicit parameters, so a pre-set field would be ambiguous. Use this entry for
-/// the orthogonalized path; for the naive / free-warp control, leave
-/// `ctn_stage1` unset and call [`fit_from_formula`] with a raw `z_column`.
+/// explicit parameters, so a pre-set field would be ambiguous.
 pub fn fit_marginal_slope_from_ctn(
     stage2_formula: &str,
     data: &Dataset,
@@ -3069,8 +3051,7 @@ pub fn fit_marginal_slope_from_ctn(
     if config.ctn_stage1.is_some() {
         return Err(WorkflowError::InvalidConfig {
             reason: "fit_marginal_slope_from_ctn builds the Stage-1 recipe from its explicit \
-                     parameters; config.ctn_stage1 must be None on entry (use \
-                     fit_calibrated_marginal_slope if you already hold a CtnStage1Recipe)"
+                     parameters; config.ctn_stage1 must be None on entry"
                 .to_string(),
         });
     }
@@ -3104,11 +3085,13 @@ pub fn fit_marginal_slope_from_ctn(
         weight_column: stage1_weight_column.map(str::to_string),
         offset_column: stage1_offset_column.map(str::to_string),
     });
-    fit_calibrated_marginal_slope(stage2_formula, data, &stage2_config)
+    let (augmented, stage2_config) =
+        prepare_calibrated_marginal_slope_stage2(data, &stage2_config)?;
+    fit_from_formula(stage2_formula, &augmented, &stage2_config)
 }
 
 /// Stage-1 preparation for the calibrated marginal-slope chain, shared by the
-/// in-process [`fit_calibrated_marginal_slope`] entry point and the FFI
+/// in-process [`fit_marginal_slope_from_ctn`] entry point and the FFI
 /// (`gam-pyffi::fit_dataset_impl`) so both produce an identical Stage-2 setup.
 ///
 /// Requires `config.ctn_stage1` to be set (the auto-enable signal). Fits the
