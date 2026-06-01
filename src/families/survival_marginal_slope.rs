@@ -217,7 +217,7 @@ pub struct SurvivalMarginalSlopeTermSpec {
     /// no Stage-1 model), the free-warp `score_warp` path is used unchanged.
     /// Populated out-of-fold by `crossfit_score_calibration` in
     /// `solver/workflow.rs`; mirrors the BMS spec field of the same name.
-    pub score_influence_jacobian: Option<ndarray::Array2<f64>>,
+    pub score_influence_jacobian: Option<Array2<f64>>,
     pub latent_z_policy: LatentZPolicy,
 }
 
