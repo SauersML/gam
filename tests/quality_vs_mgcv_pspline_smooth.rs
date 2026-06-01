@@ -143,16 +143,27 @@ fn gam_pspline_generalizes_on_lidar() {
     // mgcv is the BASELINE: fit on the identical training partition, predict
     // the identical held-out `range`. m=c(2,2) pins mgcv to a cubic B-spline
     // (degree 3) with a 2nd-order difference penalty so the basis cannot drift.
+    //
+    // The reference harness writes all columns into a single CSV (one row per
+    // index), so every column handed to `run_r` must have the SAME length. We
+    // therefore pass the FULL dataset (`range`, `logratio`) plus an `is_test`
+    // mask column (all length `n`) and let R reconstruct the IDENTICAL split
+    // internally: train where is_test==0, predict where is_test==1. This keeps
+    // the train/test partition bit-identical to gam's while satisfying the
+    // equal-length-columns contract.
+    let is_test: Vec<f64> = (0..n).map(|i| if test_mask[i] { 1.0 } else { 0.0 }).collect();
     let r = run_r(
         &[
-            Column::new("range_train", &range_train),
-            Column::new("logratio_train", &logratio_train),
-            Column::new("range_test", &range_test),
+            Column::new("range", &range),
+            Column::new("logratio", &logratio),
+            Column::new("is_test", &is_test),
         ],
         r#"
         suppressPackageStartupMessages(library(mgcv))
-        tr <- data.frame(range = range_train, logratio = logratio_train)
-        te <- data.frame(range = range_test)
+        train <- is_test == 0
+        test  <- is_test == 1
+        tr <- data.frame(range = range[train], logratio = logratio[train])
+        te <- data.frame(range = range[test])
         m <- gam(logratio ~ s(range, bs = "ps", k = 15, m = c(2, 2)), data = tr, method = "REML")
         emit("test_pred", as.numeric(predict(m, newdata = te)))
         emit("train_fit", as.numeric(fitted(m)))
@@ -312,16 +323,21 @@ fn gam_pspline_generalizes_on_lidar_on_real_data() {
     let gam_train_fit: Vec<f64> = train_design.design.apply(&fit.fit.beta).to_vec();
 
     // ---- fit the SAME model with mgcv on the SAME train rows --------------
+    // Equal-length-columns contract: pass the FULL dataset plus an `is_test`
+    // mask and reconstruct the identical split inside R (see the first arm).
+    let is_test: Vec<f64> = (0..n).map(|i| if test_mask[i] { 1.0 } else { 0.0 }).collect();
     let r = run_r(
         &[
-            Column::new("range_train", &range_train),
-            Column::new("logratio_train", &logratio_train),
-            Column::new("range_test", &range_test),
+            Column::new("range", &range),
+            Column::new("logratio", &logratio),
+            Column::new("is_test", &is_test),
         ],
         r#"
         suppressPackageStartupMessages(library(mgcv))
-        tr <- data.frame(range = range_train, logratio = logratio_train)
-        te <- data.frame(range = range_test)
+        train <- is_test == 0
+        test  <- is_test == 1
+        tr <- data.frame(range = range[train], logratio = logratio[train])
+        te <- data.frame(range = range[test])
         m <- gam(logratio ~ s(range, bs = "ps", k = 15, m = c(2, 2)), data = tr, method = "REML")
         emit("test_pred", as.numeric(predict(m, newdata = te)))
         emit("train_fit", as.numeric(fitted(m)))

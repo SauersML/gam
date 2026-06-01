@@ -117,17 +117,28 @@ fn gam_pspline_held_out_accuracy_beats_pygam_on_lidar() {
     // penalty from the TRAIN data by minimizing GCV. We then predict the SAME
     // held-out test rows. pyGAM's held-out RMSE is the generalization baseline
     // for gam to match-or-beat; it is not used to constrain gam's curve shape.
+    //
+    // The reference harness writes all columns into a single CSV (one row per
+    // index), so every column handed to `run_python` must have the SAME length.
+    // Pass the FULL dataset (`range`, `logratio`) plus an `is_test` mask (all
+    // length `n`) and reconstruct the IDENTICAL every-4th split inside Python:
+    // train where is_test==0, predict where is_test==1. This keeps the partition
+    // bit-identical to gam's while satisfying the equal-length-columns contract.
+    let is_test: Vec<f64> = (0..n).map(|i| if i % 4 == 0 { 1.0 } else { 0.0 }).collect();
     let py = run_python(
         &[
-            Column::new("tr_range", &tr_range),
-            Column::new("tr_logratio", &tr_logratio),
-            Column::new("te_range", &te_range),
+            Column::new("range", &range),
+            Column::new("logratio", &logratio),
+            Column::new("is_test", &is_test),
         ],
         r#"
 from pygam import LinearGAM, s
-Xtr = np.asarray(df["tr_range"], dtype=float).reshape(-1, 1)
-ytr = np.asarray(df["tr_logratio"], dtype=float)
-Xte = np.asarray(df["te_range"], dtype=float).reshape(-1, 1)
+mask = np.asarray(df["is_test"], dtype=float) == 1.0
+rng = np.asarray(df["range"], dtype=float)
+lr = np.asarray(df["logratio"], dtype=float)
+Xtr = rng[~mask].reshape(-1, 1)
+ytr = lr[~mask]
+Xte = rng[mask].reshape(-1, 1)
 gam = LinearGAM(s(0, n_splines=15)).gridsearch(Xtr, ytr, progress=False)
 emit("test_pred", gam.predict(Xte))
 "#,
@@ -274,17 +285,26 @@ fn gam_pspline_held_out_accuracy_beats_pygam_on_lidar_on_real_data() {
     let gam_test_pred: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
 
     // ---- pyGAM on the SAME train rows, predict the SAME interior gap ------
+    // Equal-length-columns contract: pass the FULL sorted dataset plus an
+    // `is_test` mask marking the contiguous interior block [lo, hi), and
+    // reconstruct the identical split inside Python (see the first arm). numpy
+    // boolean indexing preserves row order, so the predicted gap rows come back
+    // in the same ascending-`range` order as gam's `te_range`.
+    let is_test: Vec<f64> = (0..n).map(|i| if i >= lo && i < hi { 1.0 } else { 0.0 }).collect();
     let py = run_python(
         &[
-            Column::new("tr_range", &tr_range),
-            Column::new("tr_logratio", &tr_logratio),
-            Column::new("te_range", &te_range),
+            Column::new("range", &range),
+            Column::new("logratio", &logratio),
+            Column::new("is_test", &is_test),
         ],
         r#"
 from pygam import LinearGAM, s
-Xtr = np.asarray(df["tr_range"], dtype=float).reshape(-1, 1)
-ytr = np.asarray(df["tr_logratio"], dtype=float)
-Xte = np.asarray(df["te_range"], dtype=float).reshape(-1, 1)
+mask = np.asarray(df["is_test"], dtype=float) == 1.0
+rng = np.asarray(df["range"], dtype=float)
+lr = np.asarray(df["logratio"], dtype=float)
+Xtr = rng[~mask].reshape(-1, 1)
+ytr = lr[~mask]
+Xte = rng[mask].reshape(-1, 1)
 gam = LinearGAM(s(0, n_splines=15)).gridsearch(Xtr, ytr, progress=False)
 emit("test_pred", gam.predict(Xte))
 "#,
