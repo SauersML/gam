@@ -2737,7 +2737,7 @@ pub struct CrossFitScoreCalibration {
 /// Stage-1 fit; its presence is the sole auto-enable signal for cross-fitted
 /// orthogonalization (design §5). When absent, Stage-2 falls back to the free
 /// 1-D `score_warp` spline (which spans only the x-free leakage column).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CtnStage1Recipe {
     /// Stage-1 response column name (the `y` the CTN transforms).
     pub response_column: String,
@@ -2859,8 +2859,8 @@ fn crossfit_score_calibration(
     }
 
     // Stage-1 response / weights / offset, resolved against the full dataset.
-    let y_col =
-        resolve_role_col(col_map, &recipe.response_column, "response").map_err(|e| e.to_string())?;
+    let y_col = resolve_role_col(col_map, &recipe.response_column, "response")
+        .map_err(|e| e.to_string())?;
     let response_full = data.values.column(y_col).to_owned();
     let weights_full = resolve_weight_column(data, col_map, recipe.weight_column.as_deref())
         .map_err(|e| e.to_string())?;

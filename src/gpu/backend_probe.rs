@@ -26,9 +26,7 @@
 //! there is no transitional shim.
 
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{
-    CudaBackendContext, CudaBackendParts, probe_backend_with_compile, probe_cuda_backend,
-};
+pub(crate) use linux::{CudaBackendContext, probe_backend_with_compile, probe_cuda_backend};
 
 #[cfg(target_os = "linux")]
 mod linux {
