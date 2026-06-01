@@ -6972,7 +6972,7 @@ fn smooth_basis_feature_cols(basis: &SmoothBasisSpec) -> Vec<usize> {
     }
 }
 
-fn smooth_term_feature_cols(term: &SmoothTermSpec) -> Vec<usize> {
+pub fn smooth_term_feature_cols(term: &SmoothTermSpec) -> Vec<usize> {
     smooth_basis_feature_cols(&term.basis)
 }
 
@@ -7079,6 +7079,64 @@ fn smooth_is_owned_by_prior_term(owner: &SmoothTermSpec, target: &SmoothTermSpec
         .into_iter()
         .collect::<BTreeSet<_>>();
     owner_features.is_subset(&target_features)
+}
+
+/// Static (spec-only) description of the hierarchical smooth-ownership decomposition.
+///
+/// This is the single source of truth for the deterministic ownership policy that
+/// [`apply_global_smooth_identifiability`] uses during the fit: the processing order of
+/// smooth terms, the feature columns each term spans, the candidate lower-order owners of
+/// each term (nested/duplicate feature sets), and the basis-family rank used as a
+/// tie-breaker. The fit engine consumes this structure and additionally applies a numerical
+/// cross-residual overlap test on the realized design columns; the CLI structure-warning
+/// path consumes the same structure for diagnostic messages, so both paths agree on which
+/// smooths own which subspaces.
+pub struct SmoothStructureAnalysis {
+    /// Smooth-term indices sorted into ownership-processing order (lowest priority first):
+    /// lower-order / narrower smooths come first and own their subspaces.
+    pub ownership_order: Vec<usize>,
+    /// `term_feature_cols[idx]` are the sorted, deduplicated feature columns that smooth term
+    /// `idx` spans (indexed by the original smooth-term index, not by `ownership_order`).
+    pub term_feature_cols: Vec<Vec<usize>>,
+    /// `term_owners[idx]` are the indices of prior (in `ownership_order`) smooth terms whose
+    /// feature set is a subset of term `idx`'s feature set, i.e. candidate owners of `idx`.
+    /// The list is given in ownership-processing order.
+    pub term_owners: Vec<Vec<usize>>,
+    /// `basis_family_ranks[idx]` is the basis-family ordering rank of smooth term `idx`.
+    pub basis_family_ranks: Vec<u8>,
+}
+
+/// Compute the static hierarchical smooth-ownership decomposition from the smooth-term specs.
+///
+/// `smoothspecs` is the same slice that [`apply_global_smooth_identifiability`] receives.
+pub fn analyze_smooth_ownership(smoothspecs: &[SmoothTermSpec]) -> SmoothStructureAnalysis {
+    let term_feature_cols: Vec<Vec<usize>> = smoothspecs
+        .iter()
+        .map(smooth_term_feature_cols)
+        .collect();
+    let basis_family_ranks: Vec<u8> = smoothspecs.iter().map(smooth_basis_family_rank).collect();
+
+    let mut ownership_order: Vec<usize> = (0..smoothspecs.len()).collect();
+    ownership_order.sort_by(|&lhs, &rhs| {
+        compare_smooth_ownership_priority(lhs, &smoothspecs[lhs], rhs, &smoothspecs[rhs])
+    });
+
+    let mut term_owners = vec![Vec::<usize>::new(); smoothspecs.len()];
+    for (pos, &target_idx) in ownership_order.iter().enumerate() {
+        let target = &smoothspecs[target_idx];
+        term_owners[target_idx] = ownership_order[..pos]
+            .iter()
+            .copied()
+            .filter(|&owner_idx| smooth_is_owned_by_prior_term(&smoothspecs[owner_idx], target))
+            .collect();
+    }
+
+    SmoothStructureAnalysis {
+        ownership_order,
+        term_feature_cols,
+        term_owners,
+        basis_family_ranks,
+    }
 }
 
 fn build_constraint_block(
@@ -7220,12 +7278,11 @@ fn apply_global_smooth_identifiability(
     let mut local_dims = vec![0usize; smooth.terms.len()];
     let mut local_linear_constraints = vec![None; smooth.terms.len()];
 
-    let mut ownership_order: Vec<usize> = (0..smooth.terms.len()).collect();
-    ownership_order.sort_by(|&lhs, &rhs| {
-        compare_smooth_ownership_priority(lhs, &smoothspecs[lhs], rhs, &smoothspecs[rhs])
-    });
-
-    let mut processed_owner_indices = Vec::<usize>::with_capacity(smooth.terms.len());
+    let SmoothStructureAnalysis {
+        ownership_order,
+        term_owners,
+        ..
+    } = analyze_smooth_ownership(smoothspecs);
 
     use rayon::iter::{
         IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
@@ -7241,13 +7298,8 @@ fn apply_global_smooth_identifiability(
             Vec::new()
         } else {
             let overlap_tol = 1e-10;
-            let owner_cross_checks = processed_owner_indices
-                .iter()
-                .copied()
-                .filter(|&owner_idx| {
-                    smooth_is_owned_by_prior_term(&smoothspecs[owner_idx], termspec)
-                })
-                .collect::<Vec<_>>()
+            let owner_cross_checks = term_owners[idx]
+                .clone()
                 .into_par_iter()
                 .map(|owner_idx| {
                     let owner_design = local_designs[owner_idx]
@@ -7404,7 +7456,6 @@ fn apply_global_smooth_identifiability(
             &term.metadata,
             z_opt.as_ref(),
         )?);
-        processed_owner_indices.push(idx);
     }
 
     let total_p: usize = local_dims.iter().sum();
