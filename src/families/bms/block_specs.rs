@@ -228,83 +228,6 @@ impl BlockEffectiveJacobian for BmsLogslopeJacobian {
     }
 }
 
-/// Build the absorbed Stage-1 influence columns `Z̃_infl` for the additive
-/// marginal-index block (#461, design §3).
-///
-/// Starts from the raw realized leakage directions `Z_infl = diag(s_f·β̂₀)·J`
-/// (built by `marginal_slope_orthogonal::influence_block_design`) and
-/// residualises them against the **marginal** design span in the PIRLS row
-/// metric `W` evaluated at the rigid pilot:
-///
-///   Z̃_infl = Z_infl − M·(MᵀWM + ε_gram·I)⁻¹·MᵀW·Z_infl.
-///
-/// The residualisation is against marginal **only** — the logslope-aligned
-/// component is deliberately retained so the absorber soaks the leakage
-/// direction that would otherwise manufacture spurious β(x) heterogeneity. The
-/// `W` metric matches the joint Hessian's row inner product (`pilot_irls_
-/// hessian_row_metric_at_eta` at the rigid pilot), so the orthogonality
-/// `M̃ᵀW Z̃_infl ≈ 0` holds in the same metric the penalised solve sees rather
-/// than merely in the Euclidean sense.
-fn build_residualized_influence_columns(
-    score_influence_jacobian: &Array2<f64>,
-    oof_z: &Array1<f64>,
-    marginal_dense: &Array2<f64>,
-    rigid_logslope_at_rows: &Array1<f64>,
-    pilot_row_metric_w: &Array1<f64>,
-    probit_scale: f64,
-) -> Result<Array2<f64>, String> {
-    use crate::faer_ndarray::fast_xt_diag_x;
-    use crate::families::marginal_slope_orthogonal::{
-        influence_block_design, residualize_influence_columns, ScoreInfluenceJacobian,
-    };
-
-    let n = marginal_dense.nrows();
-    if score_influence_jacobian.nrows() != n {
-        return Err(format!(
-            "influence block: Jacobian has {} rows, marginal design has {n}",
-            score_influence_jacobian.nrows()
-        ));
-    }
-    if rigid_logslope_at_rows.len() != n || pilot_row_metric_w.len() != n || oof_z.len() != n {
-        return Err(format!(
-            "influence block: pilot logslope ({}) / row metric ({}) / oof z ({}) length != {n}",
-            rigid_logslope_at_rows.len(),
-            pilot_row_metric_w.len(),
-            oof_z.len()
-        ));
-    }
-    // Z_infl = diag(s_f·β̂₀)·J via the core builder (single source of truth).
-    // `influence_block_design` reads only `.columns`; the co-indexed OOF `z`
-    // completes the core struct contract (it pairs with these J rows).
-    let jac = ScoreInfluenceJacobian {
-        columns: score_influence_jacobian.clone(),
-        z: oof_z.clone(),
-    };
-    let z_infl = influence_block_design(&jac, rigid_logslope_at_rows, probit_scale);
-
-    let p_m = marginal_dense.ncols();
-    if p_m == 0 {
-        // No marginal span to residualise against; the raw directions are the
-        // absorbed columns.
-        return Ok(z_infl);
-    }
-    // Ridge for the weighted-Gram solve, scaled to the Gram's own magnitude so a
-    // rank-deficient marginal design at the pilot stays solvable without
-    // perturbing a well-conditioned projection. The §3 projection itself is the
-    // SHARED core helper (single source of truth across bms + survival).
-    let gram_diag = fast_xt_diag_x(marginal_dense, pilot_row_metric_w);
-    let gram_scale = (0..p_m).map(|i| gram_diag[[i, i]]).fold(0.0_f64, f64::max);
-    let eps = (gram_scale * 1e-10).max(1e-12);
-    let residualized =
-        residualize_influence_columns(&z_infl, marginal_dense.view(), pilot_row_metric_w, eps);
-    if residualized.iter().any(|v| !v.is_finite()) {
-        return Err(
-            "influence block: residualised influence columns contain non-finite entries".to_string(),
-        );
-    }
-    Ok(residualized)
-}
-
 /// Horizontally stack the absorbed influence columns `Z̃_infl` onto the raw
 /// marginal design `M`, yielding the widened additive marginal-index design
 /// `[M | Z̃_infl]` (#461). When `influence_columns` is `None` the original
@@ -790,18 +713,57 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let influence_columns = if let Some(jac) =
         spec.score_influence_jacobian.as_ref().filter(|j| j.ncols() > 0)
     {
+        use crate::faer_ndarray::fast_xt_diag_x;
+        use crate::families::marginal_slope_orthogonal::{
+            influence_block_design, residualize_influence_columns, ScoreInfluenceJacobian,
+        };
         let marginal_dense_for_proj = marginal_design
             .design
             .try_to_dense_arc("bernoulli marginal-slope influence-block marginal projection")?;
+        let marginal_dense = marginal_dense_for_proj.as_ref();
+        if jac.nrows() != marginal_dense.nrows() {
+            return Err(format!(
+                "influence block: Jacobian has {} rows, marginal design has {}",
+                jac.nrows(),
+                marginal_dense.nrows()
+            ));
+        }
+        // Z_infl = diag(s_f·β̂₀)·J at the rigid pilot (β̂₀ = baseline logslope at
+        // rows; s_f = probit_scale), then residualised against the marginal span
+        // in the rigid-pilot W-metric — both via the SHARED core helpers (single
+        // source of truth across bms + survival).
         let rigid_logslope_at_rows = &spec.logslope_offset + baseline.1;
-        let residualized = build_residualized_influence_columns(
-            jac,
-            z_train,
-            marginal_dense_for_proj.as_ref(),
-            &rigid_logslope_at_rows,
-            &cross_block_pilot_w_score_warp,
-            probit_scale,
-        )?;
+        let score_jac = ScoreInfluenceJacobian {
+            columns: (*jac).clone(),
+            z: z_train.clone(),
+        };
+        let z_infl = influence_block_design(&score_jac, &rigid_logslope_at_rows, probit_scale);
+        // Magnitude-scaled ridge for the weighted-Gram projection solve so a
+        // rank-deficient marginal design at the pilot stays solvable without
+        // perturbing a well-conditioned projection. Core's residualiser is
+        // infallible (the ridge guarantees invertibility); guard the final
+        // columns for finiteness here.
+        let p_m = marginal_dense.ncols();
+        let residualized = if p_m == 0 {
+            z_infl
+        } else {
+            let gram_diag = fast_xt_diag_x(marginal_dense, &cross_block_pilot_w_score_warp);
+            let gram_scale = (0..p_m).map(|i| gram_diag[[i, i]]).fold(0.0_f64, f64::max);
+            let eps = (gram_scale * 1e-10).max(1e-12);
+            let out = residualize_influence_columns(
+                &z_infl,
+                marginal_dense.view(),
+                &cross_block_pilot_w_score_warp,
+                eps,
+            );
+            if out.iter().any(|v| !v.is_finite()) {
+                return Err(
+                    "influence block: residualised influence columns contain non-finite entries"
+                        .to_string(),
+                );
+            }
+            out
+        };
         Some(residualized)
     } else {
         None
