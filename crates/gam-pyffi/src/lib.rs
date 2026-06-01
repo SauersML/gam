@@ -24327,7 +24327,11 @@ fn validate_formula_json_impl(
     if fit_config.ctn_stage1.is_some() {
         const VALIDATION_PLACEHOLDER_Z: &str = "__gam_validation_ctn_stage1_z";
         fit_config.ctn_stage1 = None;
-        if dataset.headers.iter().any(|name| name == VALIDATION_PLACEHOLDER_Z) {
+        if dataset
+            .headers
+            .iter()
+            .any(|name| name == VALIDATION_PLACEHOLDER_Z)
+        {
             return Err(format!(
                 "reserved validation column '{VALIDATION_PLACEHOLDER_Z}' already exists in the \
                  input data; rename it before validating the calibrated chain"
