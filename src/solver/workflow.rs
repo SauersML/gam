@@ -2737,7 +2737,7 @@ pub struct CrossFitScoreCalibration {
 /// Stage-1 fit; its presence is the sole auto-enable signal for cross-fitted
 /// orthogonalization (design §5). When absent, Stage-2 falls back to the free
 /// 1-D `score_warp` spline (which spans only the x-free leakage column).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CtnStage1Recipe {
     /// Stage-1 response column name (the `y` the CTN transforms).
     pub response_column: String,
@@ -2859,8 +2859,8 @@ fn crossfit_score_calibration(
     }
 
     // Stage-1 response / weights / offset, resolved against the full dataset.
-    let y_col =
-        resolve_role_col(col_map, &recipe.response_column, "response").map_err(|e| e.to_string())?;
+    let y_col = resolve_role_col(col_map, &recipe.response_column, "response")
+        .map_err(|e| e.to_string())?;
     let response_full = data.values.column(y_col).to_owned();
     let weights_full = resolve_weight_column(data, col_map, recipe.weight_column.as_deref())
         .map_err(|e| e.to_string())?;
@@ -3065,8 +3065,9 @@ pub fn fit_marginal_slope_from_ctn(
     let covariate_formula_rhs = stage1_covariates.trim().to_string();
     if covariate_formula_rhs.is_empty() {
         return Err(WorkflowError::InvalidConfig {
-            reason: "fit_marginal_slope_from_ctn requires a non-empty Stage-1 covariate formula RHS"
-                .to_string(),
+            reason:
+                "fit_marginal_slope_from_ctn requires a non-empty Stage-1 covariate formula RHS"
+                    .to_string(),
         });
     }
     if covariate_formula_rhs.contains('~') {
@@ -3227,7 +3228,11 @@ fn fit_ctn_stage1_in_sample_score(
 /// into the Stage-2 materializer without mutating the caller's dataset.
 fn append_continuous_column(data: &Dataset, name: &str, values: Array1<f64>) -> Dataset {
     let n = data.values.nrows();
-    debug_assert_eq!(values.len(), n, "appended column length must equal row count");
+    assert_eq!(
+        values.len(),
+        n,
+        "appended column length must equal row count"
+    );
     let p = data.values.ncols();
     let mut augmented_values = Array2::<f64>::zeros((n, p + 1));
     augmented_values.slice_mut(s![.., ..p]).assign(&data.values);

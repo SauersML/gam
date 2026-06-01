@@ -255,7 +255,7 @@ fn build_residualized_influence_columns(
 ) -> Result<Array2<f64>, String> {
     use crate::faer_ndarray::fast_xt_diag_x;
     use crate::families::marginal_slope_orthogonal::{
-        influence_block_design, residualize_influence_columns, ScoreInfluenceJacobian,
+        ScoreInfluenceJacobian, residualized_influence_block,
     };
 
     let n = marginal_dense.nrows();
@@ -280,14 +280,7 @@ fn build_residualized_influence_columns(
         columns: score_influence_jacobian.clone(),
         z: oof_z.clone(),
     };
-    let z_infl = influence_block_design(&jac, rigid_logslope_at_rows, probit_scale);
-
     let p_m = marginal_dense.ncols();
-    if p_m == 0 {
-        // No marginal span to residualise against; the raw directions are the
-        // absorbed columns.
-        return Ok(z_infl);
-    }
     // Ridge for the weighted-Gram solve, scaled to the Gram's own magnitude so a
     // rank-deficient marginal design at the pilot stays solvable without
     // perturbing a well-conditioned projection. The §3 projection itself is the
@@ -295,11 +288,18 @@ fn build_residualized_influence_columns(
     let gram_diag = fast_xt_diag_x(marginal_dense, pilot_row_metric_w);
     let gram_scale = (0..p_m).map(|i| gram_diag[[i, i]]).fold(0.0_f64, f64::max);
     let eps = (gram_scale * 1e-10).max(1e-12);
-    let residualized =
-        residualize_influence_columns(&z_infl, marginal_dense.view(), pilot_row_metric_w, eps);
+    let residualized = residualized_influence_block(
+        &jac,
+        rigid_logslope_at_rows,
+        probit_scale,
+        marginal_dense.view(),
+        pilot_row_metric_w,
+        eps,
+    );
     if residualized.iter().any(|v| !v.is_finite()) {
         return Err(
-            "influence block: residualised influence columns contain non-finite entries".to_string(),
+            "influence block: residualised influence columns contain non-finite entries"
+                .to_string(),
         );
     }
     Ok(residualized)
@@ -394,7 +394,9 @@ fn widen_marginal_beta_hint(
         } else {
             let mut widened = Array1::<f64>::zeros(p_marginal_widened);
             let copy = hint.len().min(p_marginal_widened);
-            widened.slice_mut(s![..copy]).assign(&hint.slice(s![..copy]));
+            widened
+                .slice_mut(s![..copy])
+                .assign(&hint.slice(s![..copy]));
             widened
         }
     })
@@ -418,7 +420,8 @@ fn build_marginal_blockspec_bms(
     let raw_marginal_dense = design
         .design
         .try_to_dense_arc("build_marginal_blockspec_bms::marginal")?;
-    let marginal_dense = widen_marginal_dense_with_influence(&raw_marginal_dense, influence_columns)?;
+    let marginal_dense =
+        widen_marginal_dense_with_influence(&raw_marginal_dense, influence_columns)?;
     let logslope_dense = logslope_design
         .design
         .try_to_dense_arc("build_marginal_blockspec_bms::logslope")?;
@@ -787,8 +790,10 @@ pub fn fit_bernoulli_marginal_slope_terms(
     // x-dependent realisation of `ψ − Π_η[ψ]`. `None` ⇒ raw z, and the free
     // score_warp spline below is the x-free-column fallback. β̂₀(x_i) is the
     // rigid-pilot logslope `baseline.1 + logslope_offset[i]`; s_f = probit_scale.
-    let influence_columns = if let Some(jac) =
-        spec.score_influence_jacobian.as_ref().filter(|j| j.ncols() > 0)
+    let influence_columns = if let Some(jac) = spec
+        .score_influence_jacobian
+        .as_ref()
+        .filter(|j| j.ncols() > 0)
     {
         let marginal_dense_for_proj = marginal_design
             .design

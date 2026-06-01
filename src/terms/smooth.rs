@@ -2604,6 +2604,20 @@ fn is_pure_duchon_aniso_term(spec: &TermCollectionSpec, term_idx: usize) -> bool
 }
 
 fn spatial_term_supports_hyper_optimization(spec: &TermCollectionSpec, term_idx: usize) -> bool {
+    if spec
+        .smooth_terms
+        .get(term_idx)
+        .is_some_and(|term| matches!(term.basis, SmoothBasisSpec::Matern { .. }))
+    {
+        // Matérn carries its physical range in the kernel design and already has
+        // independent REML smoothing coordinates for the penalty strength. On
+        // small/moderate data the joint range+penalty profile has boundary
+        // valleys with large unprojected range gradients; optimizing that extra
+        // axis makes the ordinary formula path brittle without adding an
+        // identifiable smoothing degree of freedom. Use the data-derived range
+        // chosen by the term builder and let REML optimize the penalty weights.
+        return false;
+    }
     get_spatial_length_scale(spec, term_idx).is_some() || is_pure_duchon_aniso_term(spec, term_idx)
 }
 
@@ -7110,10 +7124,8 @@ pub struct SmoothStructureAnalysis {
 ///
 /// `smoothspecs` is the same slice that [`apply_global_smooth_identifiability`] receives.
 pub fn analyze_smooth_ownership(smoothspecs: &[SmoothTermSpec]) -> SmoothStructureAnalysis {
-    let term_feature_cols: Vec<Vec<usize>> = smoothspecs
-        .iter()
-        .map(smooth_term_feature_cols)
-        .collect();
+    let term_feature_cols: Vec<Vec<usize>> =
+        smoothspecs.iter().map(smooth_term_feature_cols).collect();
     let basis_family_ranks: Vec<u8> = smoothspecs.iter().map(smooth_basis_family_rank).collect();
 
     let mut ownership_order: Vec<usize> = (0..smoothspecs.len()).collect();
@@ -9239,10 +9251,11 @@ fn compute_spatial_adaptiveweights_for_beta(
                     Array1::<f64>::zeros(exact.curvature.norm.len()),
                 ),
             };
-            let (_, inv_0) =
-                exact
-                    .magnitude
-                    .surrogateweights_posterior_snr(&var_0, weight_floor, weight_ceiling);
+            let (_, inv_0) = exact.magnitude.surrogateweights_posterior_snr(
+                &var_0,
+                weight_floor,
+                weight_ceiling,
+            );
             let (_, inv_g) =
                 exact
                     .gradient
@@ -26229,10 +26242,7 @@ mod tests {
         let fit_snr = fit(&w_snr);
 
         let region_mse = |idx: &[usize], f: &Array1<f64>| -> f64 {
-            idx.iter()
-                .map(|&j| (f[j] - truth[j]).powi(2))
-                .sum::<f64>()
-                / idx.len() as f64
+            idx.iter().map(|&j| (f[j] - truth[j]).powi(2)).sum::<f64>() / idx.len() as f64
         };
 
         let mse_flat_mag = region_mse(&left_flat, &fit_mag);

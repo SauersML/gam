@@ -33,6 +33,29 @@ use crate::smooth::{
 };
 use crate::types::ColIdx;
 
+fn default_matern_length_scale(data: &Dataset, cols: &[usize]) -> f64 {
+    let mut diameter2 = 0.0_f64;
+    for &col in cols {
+        let column = data.values.column(col);
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for &value in column.iter().filter(|v| v.is_finite()) {
+            lo = lo.min(value);
+            hi = hi.max(value);
+        }
+        if lo.is_finite() && hi.is_finite() && hi > lo {
+            let span = hi - lo;
+            diameter2 += span * span;
+        }
+    }
+    let diameter = diameter2.sqrt();
+    if diameter.is_finite() && diameter > 0.0 {
+        (0.15 * diameter).max(1e-6)
+    } else {
+        1.0
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Typed errors
 // ---------------------------------------------------------------------------
@@ -1708,7 +1731,8 @@ pub fn build_smooth_basis(
                 spec: MaternBasisSpec {
                     center_strategy,
                     periodic: parse_periodic_axes_option(options, cols.len())?,
-                    length_scale: option_f64(options, "length_scale").unwrap_or(1.0),
+                    length_scale: option_f64(options, "length_scale")
+                        .unwrap_or_else(|| default_matern_length_scale(ds, cols)),
                     nu,
                     include_intercept: option_bool(options, "include_intercept").unwrap_or(false),
                     double_penalty: smooth_double_penalty,
