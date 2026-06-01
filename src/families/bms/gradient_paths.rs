@@ -429,6 +429,7 @@ pub(super) fn joint_setup(
     logslope_penalties: usize,
     extra_rho0: &[f64],
     kappa_options: &SpatialLengthScaleOptimizationOptions,
+    pinned_rho_slots: &[(usize, f64)],
 ) -> ExactJointHyperSetup {
     let marginal_terms = spatial_length_scale_term_indices(marginalspec);
     let logslope_terms = spatial_length_scale_term_indices(logslopespec);
@@ -437,8 +438,16 @@ pub(super) fn joint_setup(
     for (idx, &value) in extra_rho0.iter().enumerate() {
         rho0vec[marginal_penalties + logslope_penalties + idx] = value;
     }
-    let rho_lower = Array1::<f64>::from_elem(rho_dim, -12.0);
-    let rho_upper = Array1::<f64>::from_elem(rho_dim, 12.0);
+    let mut rho_lower = Array1::<f64>::from_elem(rho_dim, -12.0);
+    let mut rho_upper = Array1::<f64>::from_elem(rho_dim, 12.0);
+    // Pin fixed (non-REML-learned) ρ slots — e.g. the #461 Stage-1 influence
+    // absorber ridge — to a degenerate box so the joint optimiser holds them
+    // at their fixed value while every smooth/spatial slot is free.
+    for &(slot, value) in pinned_rho_slots {
+        rho0vec[slot] = value;
+        rho_lower[slot] = value;
+        rho_upper[slot] = value;
+    }
     let marginal_kappa = SpatialLogKappaCoords::from_length_scales_aniso(
         marginalspec,
         &marginal_terms,
