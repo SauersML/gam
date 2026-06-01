@@ -13478,7 +13478,7 @@ fn gaussian_reml_fit_formula_table_impl(
     fisher_rao_w: Option<ArrayView3<'_, f64>>,
 ) -> Result<TangentRemlMultiResult, String> {
     let dataset = dataset_with_inferred_schema(headers, rows)?;
-    let mut fit_config = parse_fit_config(config_json)?;
+    let (mut fit_config, _training_table_kind) = parse_fit_config(config_json)?;
     fit_config.family = Some("gaussian".to_string());
     fit_config.link = Some("identity".to_string());
     let materialized = materialize(&formula, &dataset, &fit_config)?;
@@ -23641,8 +23641,7 @@ fn fit_dataset_impl(
     let mut progress = gam::visualizer::VisualizerSession::new(true);
     progress.set_stage("fit", "optimizing penalized likelihood");
     progress.start_workflow_open_ended("Fit");
-    let training_table_kind = fit_config_training_table_kind(config_json)?;
-    let mut fit_config = parse_fit_config(config_json)?;
+    let (mut fit_config, training_table_kind) = parse_fit_config(config_json)?;
     if let Some(w) = fisher_rao_w {
         inject_scalar_fisher_rao_weight(&mut dataset, &mut fit_config, w)?;
     }
@@ -24318,7 +24317,7 @@ fn validate_formula_json_impl(
     config_json: Option<&str>,
 ) -> Result<String, String> {
     let mut dataset = dataset_with_inferred_schema(headers, rows)?;
-    let mut fit_config = parse_fit_config(config_json)?;
+    let (mut fit_config, _training_table_kind) = parse_fit_config(config_json)?;
     // Calibrated marginal-slope chain (#461): validation is purely structural and
     // must stay cheap — it must NOT cross-fit Stage-1. When a CTN Stage-1 recipe
     // is present, strip it and stand in a zero-valued placeholder dose column so
@@ -27329,36 +27328,17 @@ fn periodic_harmonic_basis_derivative<'py>(
     Ok(out.into_pyarray(py).unbind())
 }
 
-/// Extract the Python-only `training_table_kind` provenance tag from the fit
-/// config JSON, if present. This is intentionally separate from
-/// [`parse_fit_config`]: the value never enters the core solver
-/// [`gam::FitConfig`] (which carries math/solver state only) — it is persisted
-/// straight onto [`FittedModelPayload::training_table_kind`] so the predict-time
-/// output-container fallback survives `save`/`load`. A blank or absent config,
-/// or a config that omits the key, yields `None`. The key, when present, must be
-/// a JSON string.
-fn fit_config_training_table_kind(config_json: Option<&str>) -> Result<Option<String>, String> {
-    let raw = match config_json {
-        Some(raw) if !raw.trim().is_empty() => raw,
-        _ => return Ok(None),
-    };
-    let value: serde_json::Value =
-        serde_json::from_str(raw).map_err(|err| format!("invalid fit config json: {err}"))?;
-    match value.get("training_table_kind") {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(serde_json::Value::String(kind)) => Ok(Some(kind.clone())),
-        Some(other) => Err(format!(
-            "training_table_kind must be a JSON string, got {other}"
-        )),
-    }
-}
-
-fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
+fn parse_fit_config(config_json: Option<&str>) -> Result<(FitConfig, Option<String>), String> {
     let py_config = match config_json {
         Some(raw) if !raw.trim().is_empty() => serde_json::from_str::<PyFitConfig>(raw)
             .map_err(|err| format!("invalid fit config json: {err}"))?,
         _ => PyFitConfig::default(),
     };
+    // Python-only presentation provenance: the value never enters the core solver
+    // `FitConfig` (which carries math/solver state only). It flows straight onto
+    // `FittedModelPayload::training_table_kind` so the predict-time output-container
+    // fallback survives `save`/`load`.
+    let training_table_kind = py_config.training_table_kind;
     let mut fit_config = FitConfig::default();
     fit_config.group_metadata = parse_group_metadata(py_config.group_metadata, py_config.groups)?;
     fit_config.penalty_block_gamma_priors = parse_precision_hyperpriors(
@@ -27528,7 +27508,7 @@ fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
             "frailty_kind is required when frailty_sd or hazard_loading is provided".to_string(),
         );
     }
-    Ok(fit_config)
+    Ok((fit_config, training_table_kind))
 }
 
 fn parse_group_metadata(

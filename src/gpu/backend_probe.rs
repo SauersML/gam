@@ -25,10 +25,13 @@
 //! The migration is atomic: no backend re-implements the prologue, and
 //! there is no transitional shim.
 
+// `CudaBackendParts` is intentionally NOT re-exported here: it is the internal
+// trio bundle that `probe_cuda_backend` returns and `CudaBackendContext::from_parts`
+// consumes. Callers move that value through without ever naming the type, so
+// hoisting the name into this scope is a dead re-export that `-D warnings` rejects.
+// It stays `pub(crate)` inside `linux` for the in-module producers/consumers.
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{
-    CudaBackendContext, CudaBackendParts, probe_backend_with_compile, probe_cuda_backend,
-};
+pub(crate) use linux::{CudaBackendContext, probe_backend_with_compile, probe_cuda_backend};
 
 #[cfg(target_os = "linux")]
 mod linux {
