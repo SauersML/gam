@@ -149,7 +149,7 @@ fn gam_cyclic_cubic_matches_mgcv_on_sine() {
         r#"
         suppressPackageStartupMessages(library(mgcv))
         m <- gam(h ~ s(t, bs = "cc", k = 12), data = df, method = "REML",
-                 knots = list(t = c(0, 2 * pi)))
+                 knots = list(t = seq(0, 2 * pi, length = 12)))
         gridn <- 200
         gt <- (2 * pi) * (0:(gridn - 1)) / gridn
         pr <- as.numeric(predict(m, newdata = data.frame(t = gt)))
@@ -319,7 +319,7 @@ fn gam_cyclic_cubic_matches_mgcv_on_sine_on_real_data() {
         r#"
         suppressPackageStartupMessages(library(mgcv))
         m <- gam(temp ~ s(month, bs = "cc", k = 12), data = df, method = "REML",
-                 knots = list(month = c(1, 13)))
+                 knots = list(month = seq(1, 13, length = 12)))
         emit("edf", sum(m$edf))
         k <- df$test_n[1]
         newd <- data.frame(month = df$test_month[1:k])
