@@ -20395,28 +20395,22 @@ pub fn fit_survival_marginal_slope_terms(
         .filter(|jac| jac.ncols() > 0)
     {
         // A zero-column Jacobian carries no leakage directions ⇒ no absorber.
-        use crate::families::marginal_slope_orthogonal::{
-            ScoreInfluenceJacobian, residualized_influence_block,
-        };
+        use crate::families::marginal_slope_orthogonal::residualized_influence_block;
         let marginal_dense = marginal_design
             .design
             .try_to_dense_by_chunks("survival marginal-slope influence-absorber marginal span")?;
-        // `β̂₀(x_i)` is the rigid-pilot logslope; `s_f = probit_scale`. The latent
-        // score `z_primary` is the genuine `z` on these rows (the combined core
-        // builder reads only `columns`, but `ScoreInfluenceJacobian` carries `z`).
-        let jacobian = ScoreInfluenceJacobian {
-            columns: jac.clone(),
-            z: z_primary.clone(),
-        };
+        // `β̂₀(x_i)` is the rigid-pilot logslope; `s_f = probit_scale`; `z_primary`
+        // is the OOF latent z on these rows.
         let rigid_logslope_at_rows = &spec.logslope_offset + baseline_slope;
         // Z̃_infl = residualize(diag(s_f·β̂₀)·J, marginal, W) — the combined core
         // builder (single source of truth shared with the BMS absorber site). It
-        // encapsulates the full §3 sequence: build Z_infl, derive the weighted
-        // marginal-Gram ridge internally (max diag·1e-10, floored 1e-12), residualize,
-        // and finite-check (Err on non-finite), so this caller passes no ε and
-        // propagates the error.
+        // takes the raw n×p₁ J + OOF z and encapsulates the full §3 sequence: build
+        // Z_infl, derive the weighted marginal-Gram ridge internally (max diag·1e-10,
+        // floored 1e-12), residualize, and finite-check (Err on non-finite), so this
+        // caller passes no ε and propagates the error.
         let residualized = residualized_influence_block(
-            &jacobian,
+            jac,
+            &z_primary,
             &rigid_logslope_at_rows,
             probit_scale,
             marginal_dense.view(),
