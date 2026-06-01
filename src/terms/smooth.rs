@@ -4598,35 +4598,54 @@ fn build_tensor_bspline_basis(
         marginal_penalties.len() + if spec.double_penalty { 1 } else { 0 },
     );
 
-    for dim in 0..marginal_penalties.len() {
+    // Tensor-product smoothing parameters are one-per-margin.  Therefore the
+    // physical penalty attached to a margin must be normalized in that margin's
+    // own working coordinates before it is embedded in the full tensor product.
+    // Normalizing only the already-Kroneckered matrix would fold arbitrary
+    // dimension-dependent identity factors into the margin's lambda and would
+    // make anisotropic REML/LAML smoothing depend on the other margins' basis
+    // sizes rather than on the marginal roughness operator itself.
+    let normalized_marginal_penalties: Vec<(Array2<f64>, f64)> = marginal_penalties
+        .iter()
+        .map(normalize_penalty_in_constrained_space)
+        .collect();
+    let mut kronecker_marginal_penalties =
+        Vec::<Array2<f64>>::with_capacity(normalized_marginal_penalties.len());
+
+    for dim in 0..normalized_marginal_penalties.len() {
         let mut s_dim = Array2::<f64>::eye(1);
         let mut factors = Vec::<Array2<f64>>::with_capacity(marginalnum_basis.len());
         for (j, &qj) in marginalnum_basis.iter().enumerate() {
             let factor = if j == dim {
-                marginal_penalties[j].clone()
+                normalized_marginal_penalties[j].0.clone()
             } else {
                 Array2::<f64>::eye(qj)
             };
             factors.push(factor.clone());
             s_dim = kronecker_product(&s_dim, &factor);
         }
+        if dim == kronecker_marginal_penalties.len() {
+            kronecker_marginal_penalties.push(normalized_marginal_penalties[dim].0.clone());
+        }
 
         candidates.push(PenaltyCandidate {
             matrix: s_dim,
             nullspace_dim_hint: 0,
             source: PenaltySource::TensorMarginal { dim },
-            normalization_scale: 1.0,
+            normalization_scale: normalized_marginal_penalties[dim].1,
             kronecker_factors: Some(factors),
             op: None,
         });
     }
 
     if spec.double_penalty {
+        let ridge = Array2::<f64>::eye(total_cols);
+        let (matrix, normalization_scale) = normalize_penalty_in_constrained_space(&ridge);
         candidates.push(PenaltyCandidate {
-            matrix: Array2::<f64>::eye(total_cols),
+            matrix,
             nullspace_dim_hint: 0,
             source: PenaltySource::TensorGlobalRidge,
-            normalization_scale: 1.0,
+            normalization_scale,
             kronecker_factors: None,
             op: None,
         });
@@ -4702,11 +4721,18 @@ fn build_tensor_bspline_basis(
                 let zt_s = fast_atb(z, &candidate.matrix);
                 let matrix = fast_ab(&zt_s, z);
                 let (matrix, c_new) = normalize_penalty_in_constrained_space(&matrix);
+                let preserve_margin_scale =
+                    matches!(&candidate.source, PenaltySource::TensorMarginal { .. });
+                let (matrix, normalization_scale) = if preserve_margin_scale {
+                    (matrix.mapv(|v| v * c_new), candidate.normalization_scale)
+                } else {
+                    (matrix, candidate.normalization_scale * c_new)
+                };
                 Ok(PenaltyCandidate {
                     nullspace_dim_hint: candidate.nullspace_dim_hint,
                     matrix,
                     source: candidate.source,
-                    normalization_scale: candidate.normalization_scale * c_new,
+                    normalization_scale,
                     kronecker_factors: candidate.kronecker_factors.clone(),
                     op: candidate.op.clone(),
                 })
@@ -4773,7 +4799,7 @@ fn build_tensor_bspline_basis(
         kronecker_factored: if matches!(spec.identifiability, TensorBSplineIdentifiability::None) {
             Some(KroneckerFactoredBasis {
                 marginal_designs,
-                marginal_penalties,
+                marginal_penalties: kronecker_marginal_penalties,
                 marginal_dims: marginalnum_basis.clone(),
                 has_double_penalty: spec.double_penalty,
             })
@@ -5745,15 +5771,33 @@ fn build_single_local_smooth_term(
                 }
             }
             let mut penalties = Vec::<Array2<f64>>::with_capacity(inner_built.penalties.len());
-            for s_inner in &inner_built.penalties {
+            let active_penalty_indices = inner_built
+                .penaltyinfo
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, info)| info.active.then_some(idx))
+                .collect::<Vec<_>>();
+            if active_penalty_indices.len() != inner_built.penalties.len() {
+                crate::bail_invalid_basis!(
+                    "internal sz penalty metadata mismatch: activeinfos={}, penalties={}",
+                    active_penalty_indices.len(),
+                    inner_built.penalties.len()
+                );
+            }
+            for (penalty_pos, s_inner) in inner_built.penalties.iter().enumerate() {
                 let mut s_big = Array2::<f64>::zeros((p * l_minus_one, p * l_minus_one));
                 for a in 0..l_minus_one {
                     for b in 0..l_minus_one {
                         let factor = if a == b { 2.0 } else { 1.0 };
-                        let mut block = s_big.slice_mut(s![a * p..(a + 1) * p, b * p..(b + 1) * p]);
+                        let mut block =
+                            s_big.slice_mut(s![a * p..(a + 1) * p, b * p..(b + 1) * p]);
                         block.assign(&s_inner.mapv(|v| v * factor));
                     }
                 }
+                let (s_big, factor_smooth_scale) =
+                    normalize_penalty_in_constrained_space(&s_big);
+                let info_idx = active_penalty_indices[penalty_pos];
+                inner_built.penaltyinfo[info_idx].normalization_scale *= factor_smooth_scale;
                 penalties.push(s_big);
             }
             inner_built.dim = p * l_minus_one;
@@ -6149,25 +6193,48 @@ fn build_single_local_smooth_term(
         .map(
             |((matrix, info), op_in)| -> Result<PenaltyCandidate, BasisError> {
                 let (matrix, c_new) = normalize_penalty_in_constrained_space(&matrix);
+                let preserve_margin_scale =
+                    matches!(&info.source, PenaltySource::TensorMarginal { .. });
+                let (matrix, normalization_scale, op_scale, kronecker_scale) =
+                    if preserve_margin_scale {
+                        (
+                            matrix.mapv(|v| v * c_new),
+                            info.normalization_scale,
+                            1.0,
+                            1.0,
+                        )
+                    } else {
+                        (
+                            matrix,
+                            info.normalization_scale * c_new,
+                            1.0 / c_new,
+                            1.0 / c_new,
+                        )
+                    };
                 // Frobenius rescale: wrap inner op in `ScaledPenaltyOp(1/c_new)`
                 // so `op.as_dense() == matrix` post-normalization.
-                let scaled_op = if c_new > 0.0 && c_new.is_finite() {
+                let scaled_op = if op_scale > 0.0 && op_scale.is_finite() {
                     op_in.map(|op| {
                         std::sync::Arc::new(crate::terms::penalty_op::ScaledPenaltyOp::new(
-                            op,
-                            1.0 / c_new,
+                            op, op_scale,
                         ))
                             as std::sync::Arc<dyn crate::terms::penalty_op::PenaltyOp>
                     })
                 } else {
                     None
                 };
+                let kronecker_factors = info.kronecker_factors.map(|mut factors| {
+                    if let Some(first) = factors.first_mut() {
+                        first.mapv_inplace(|v| v * kronecker_scale);
+                    }
+                    factors
+                });
                 Ok(PenaltyCandidate {
                     nullspace_dim_hint: info.nullspace_dim_hint,
                     matrix,
                     source: info.source,
-                    normalization_scale: info.normalization_scale * c_new,
-                    kronecker_factors: None,
+                    normalization_scale,
+                    kronecker_factors,
                     op: scaled_op,
                 })
             },
