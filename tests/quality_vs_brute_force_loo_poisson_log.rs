@@ -172,7 +172,7 @@ fn alo_loo_recovers_truth_and_matches_exact_brute_force_poisson_log() {
         eta_truth.push(eta);
     }
 
-    // ---- fit with gam: y ~ te(x1, x2), Poisson / log link ------------------
+    // ---- fit with gam: y ~ te(x1, x2, k=8), Poisson / log link -------------
     let headers = ["x1", "x2", "y"].into_iter().map(String::from).collect();
     let rows = (0..n)
         .map(|i| {
@@ -188,7 +188,14 @@ fn alo_loo_recovers_truth_and_matches_exact_brute_force_poisson_log() {
         family: Some("poisson".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ te(x1, x2)", &ds, &cfg).expect("gam poisson te fit");
+    // Per-margin k=8 => an 8x8 = 64-column tensor basis, comfortably below n=310
+    // (basis_dim + intercept + smoothing-parameter dof << n) so the penalized
+    // REML fit is well-posed, while still resolving the genuine 2-D interaction
+    // structure of eta_true. A larger default basis (20x20=400 cols) would exceed
+    // n and leave the fit under-determined; it would also make the O(n*p^2)
+    // brute-force LOO needlessly heavy.
+    let result =
+        fit_from_formula("y ~ te(x1, x2, k=8)", &ds, &cfg).expect("gam poisson te fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for Poisson te(x1, x2)");
     };
