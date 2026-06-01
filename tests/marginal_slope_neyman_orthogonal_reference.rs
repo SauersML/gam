@@ -58,7 +58,7 @@ use gam::families::bernoulli_marginal_slope::BernoulliMarginalSlopeFitResult;
 use gam::families::marginal_slope_orthogonal::{influence_block_design, score_influence_jacobian};
 use gam::terms::smooth::build_term_collection_design;
 use gam::test_support::reference::{dml_partial_linear_reference, rmse, Column};
-use gam::transformation_normal::{TransformationNormalConfig, TransformationNormalFitResult};
+use gam::transformation_normal::TransformationNormalConfig;
 use gam::{
     encode_recordswith_inferred_schema, fit_calibrated_marginal_slope, fit_from_formula,
     init_parallelism, materialize, CtnStage1Recipe, FitConfig, FitRequest, FitResult,
