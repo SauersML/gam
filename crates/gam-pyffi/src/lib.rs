@@ -23663,20 +23663,11 @@ fn fit_dataset_impl(
     if let Some(w) = fisher_rao_w {
         inject_scalar_fisher_rao_weight(&mut dataset, &mut fit_config, w)?;
     }
-    // Calibrated marginal-slope chain (#461): when a CTN Stage-1 recipe is
-    // present, fit Stage-1 once, synthesize the latent-score column, and point
-    // z_column at it before materializing. The ordinary marginal-slope
-    // materialize/fit path below then detects the populated `ctn_stage1`,
-    // cross-fits the CTN, overrides the in-sample score with the out-of-fold one,
-    // and installs the leakage-projection block — all in Rust core. The payload
-    // builders see the augmented dataset (with the synthetic score column) and a
-    // Stage-2 config whose `z_column` points at it.
-    if fit_config.ctn_stage1.is_some() {
-        let (augmented, stage2_config) =
-            gam::prepare_calibrated_marginal_slope_stage2(&dataset, &fit_config)?;
-        dataset = augmented;
-        fit_config = stage2_config;
-    }
+    // Calibrated marginal-slope chain (#461): when a CTN Stage-1 recipe is present
+    // (config.ctn_stage1), the marginal-slope materializer cross-fits the CTN and
+    // produces the calibrated `z` out-of-fold — no z_column is needed and no
+    // Stage-1 pre-fit / synthetic column round-trip is performed here. The recipe
+    // rides on fit_config straight into materialize.
     let materialized = materialize(&formula, &dataset, &fit_config)?;
     let request = materialized.request;
 
@@ -24345,19 +24336,17 @@ fn validate_formula_json_impl(
 ) -> Result<String, String> {
     let mut dataset = dataset_with_inferred_schema(headers, rows)?;
     let mut fit_config = parse_fit_config(config_json)?;
-    // Calibrated marginal-slope chain (#461): validation must NOT fit Stage-1
-    // (it is purely structural and should stay cheap). When a CTN Stage-1 recipe
-    // is present the real fit synthesizes the latent-score column; here we
-    // synthesize a PLACEHOLDER zero-valued score column under the same reserved
-    // name and point z_column at it, so the Stage-2 materializer validates the
-    // marginal-slope structure without a Stage-1 fit. Strip ctn_stage1 first so
-    // the structural materialize does not attempt cross-fitting.
+    // Calibrated marginal-slope chain (#461): validation is purely structural and
+    // must stay cheap — it must NOT cross-fit Stage-1. When a CTN Stage-1 recipe
+    // is present, strip it and stand in a zero-valued placeholder dose column so
+    // the Stage-2 marginal-slope structure validates without any Stage-1 fit or
+    // cross-fit. The real fit produces `z` out-of-fold and needs no such column.
     if fit_config.ctn_stage1.is_some() {
-        let reserved_z = gam::CALIBRATED_SLOPE_Z_COLUMN;
+        const VALIDATION_PLACEHOLDER_Z: &str = "__gam_validation_ctn_stage1_z";
         fit_config.ctn_stage1 = None;
-        if dataset.headers.iter().any(|name| name == reserved_z) {
+        if dataset.headers.iter().any(|name| name == VALIDATION_PLACEHOLDER_Z) {
             return Err(format!(
-                "reserved calibrated-slope score column '{reserved_z}' already exists in the \
+                "reserved validation column '{VALIDATION_PLACEHOLDER_Z}' already exists in the \
                  input data; rename it before validating the calibrated chain"
             ));
         }
@@ -24366,7 +24355,7 @@ fn validate_formula_json_impl(
         let mut values = Array2::<f64>::zeros((n, old_cols + 1));
         values.slice_mut(s![.., ..old_cols]).assign(&dataset.values);
         dataset.values = values;
-        dataset.headers.push(reserved_z.to_string());
+        dataset.headers.push(VALIDATION_PLACEHOLDER_Z.to_string());
         dataset
             .column_kinds
             .push(gam::inference::model::ColumnKindTag::Continuous);
@@ -24374,11 +24363,11 @@ fn validate_formula_json_impl(
             .schema
             .columns
             .push(gam::inference::model::SchemaColumn {
-                name: reserved_z.to_string(),
+                name: VALIDATION_PLACEHOLDER_Z.to_string(),
                 kind: gam::inference::model::ColumnKindTag::Continuous,
                 levels: Vec::new(),
             });
-        fit_config.z_column = Some(reserved_z.to_string());
+        fit_config.z_column = Some(VALIDATION_PLACEHOLDER_Z.to_string());
     }
     let materialized = materialize(&formula, &dataset, &fit_config)?;
     let (family_name, model_class, supported_by_python) = request_metadata(&materialized.request);
