@@ -36,6 +36,7 @@ use crate::smooth::TermCollectionSpec;
 use crate::types::{
     InverseLink, LikelihoodSpec, ResponseFamily, StandardLink, inverse_link_to_binomial_spec,
 };
+use ndarray::Array2;
 
 /// Family tag persisted for Bernoulli marginal-slope saved models.
 const FAMILY_BERNOULLI_MARGINAL_SLOPE: &str = "bernoulli-marginal-slope";
@@ -149,6 +150,19 @@ pub struct BernoulliMarginalSlopeInputs<'a> {
     pub resolved_marginalspec: TermCollectionSpec,
     pub resolved_logslopespec: TermCollectionSpec,
     pub fit_result: UnifiedFitResult,
+    /// Number of *raw* marginal design columns `p_m` (= the term-collection
+    /// marginal design's `ncols()` BEFORE any #461 influence-absorber widening).
+    ///
+    /// When the Stage-1 influence absorber is active (A2), the fitted marginal
+    /// block carries the widened coefficient `[β_m; γ]` (length `p_m + p₁`) and
+    /// the joint covariance is dimensioned over the widened block. The absorbed
+    /// influence columns `Z̃_infl` are a TRAINING-only leakage absorber that does
+    /// not exist at predict rows, so the persisted model must drop `γ` and the
+    /// marginalized-out covariance sub-block to stay self-consistent against the
+    /// raw `p_m` marginal design at predict. The assembler uses this to truncate
+    /// the fit result once (shared CLI + FFI). With no absorber it equals the
+    /// fitted block width and the truncation is a no-op.
+    pub p_marginal: usize,
     pub baseline_marginal: f64,
     pub baseline_logslope: f64,
     pub latent_z_normalization: SavedLatentZNormalization,
@@ -158,6 +172,143 @@ pub struct BernoulliMarginalSlopeInputs<'a> {
     pub link_dev_runtime: Option<&'a DeviationRuntime>,
     pub base_link: InverseLink,
     pub frailty: crate::families::lognormal_kernel::FrailtySpec,
+}
+
+/// Drop the #461 training-only influence-absorber coefficients `γ` from a fitted
+/// Bernoulli marginal-slope result so the persisted model is self-consistent
+/// against the raw `p_m`-column marginal design at predict.
+///
+/// When the A2 influence absorber is active the marginal block (block 0) is the
+/// widened `[β_m; γ]` (length `p_m + p₁`, with `γ` the contiguous trailing `p₁`
+/// columns — see bms `widen_marginal_dense_with_influence`) and the joint
+/// conditional covariance is dimensioned over the widened joint coefficient
+/// vector. The absorbed columns `Z̃_infl` exist only at training rows; predict
+/// reconstructs the marginal index from the raw `p_m` design and the
+/// orthogonalized `β̂_m` is a property of the training fit. So this:
+///
+///  * slices `blocks[0].beta` and `block_states[0].beta` to their first `p_m`
+///    entries (the flat `beta` is recomputed from the blocks by
+///    `try_from_parts`),
+///  * **marginalizes** `γ` out of the joint Gaussian by dropping the `γ`
+///    rows/cols from the conditional covariance — taking the corresponding
+///    SUB-BLOCK of `Σ` is the exact marginal of a joint Gaussian (no
+///    re-inversion), so the kept `[β_m | β_logslope | …]` covariance is the
+///    correct predictive uncertainty accounting for the fitted absorber,
+///  * drops the persisted joint penalized-Hessian geometry: it is a precision
+///    over the *widened* joint coefficient vector, so a sub-block would be the
+///    wrong marginalization, and the only predict path that consumes it is the
+///    covariance-fallback that re-inverts `H` — which post-truncation would have
+///    the wrong dimension anyway. With the dense (already-marginalized) `Σ`
+///    matching the predict dimension, that fallback is never taken, so dropping
+///    the geometry removes a stale, wrong-dimension path rather than a used one.
+///
+/// Block-level `edf` / `lambdas` are left untouched: they are fitted scalars
+/// that legitimately reflect the full model (the absorber consumed real dof at
+/// fit time) and are persisted as-is. With no absorber (`block0.len() == p_m`)
+/// this is a no-op clone.
+fn truncate_marginal_slope_influence_absorber(
+    fit_result: UnifiedFitResult,
+    p_marginal: usize,
+) -> Result<UnifiedFitResult, String> {
+    let Some(block0) = fit_result.blocks.first() else {
+        return Err("marginal-slope fit result has no coefficient blocks".to_string());
+    };
+    let widened_len = block0.beta.len();
+    if widened_len <= p_marginal {
+        // No influence absorber installed (or already raw width): nothing to drop.
+        return Ok(fit_result);
+    }
+    let p_influence = widened_len - p_marginal;
+
+    let UnifiedFitResult {
+        mut blocks,
+        log_lambdas,
+        lambdas,
+        likelihood_family,
+        likelihood_scale,
+        log_likelihood_normalization,
+        log_likelihood,
+        deviance,
+        reml_score,
+        stable_penalty_term,
+        penalized_objective,
+        outer_iterations,
+        outer_converged,
+        outer_gradient_norm,
+        standard_deviation,
+        covariance_conditional,
+        covariance_corrected,
+        inference,
+        fitted_link,
+        geometry: _,
+        mut block_states,
+        beta: _,
+        pirls_status,
+        max_abs_eta,
+        constraint_kkt,
+        artifacts,
+        inner_cycles,
+    } = fit_result;
+
+    // Slice block 0's coefficients (and matching block-state) to the raw p_m,
+    // dropping the trailing γ absorber columns.
+    blocks[0].beta = blocks[0].beta.slice(ndarray::s![..p_marginal]).to_owned();
+    if let Some(state0) = block_states.first_mut() {
+        state0.beta = state0.beta.slice(ndarray::s![..p_marginal]).to_owned();
+    }
+
+    // Marginalize γ out of the joint conditional covariance: keep every index
+    // except the contiguous γ block [p_marginal, p_marginal + p_influence).
+    let drop_gamma_block = |cov: Option<Array2<f64>>| -> Option<Array2<f64>> {
+        cov.map(|cov| {
+            let total = cov.nrows();
+            let kept: Vec<usize> = (0..p_marginal)
+                .chain((p_marginal + p_influence)..total)
+                .collect();
+            let mut out = Array2::<f64>::zeros((kept.len(), kept.len()));
+            for (ri, &r) in kept.iter().enumerate() {
+                for (ci, &c) in kept.iter().enumerate() {
+                    out[[ri, ci]] = cov[[r, c]];
+                }
+            }
+            out
+        })
+    };
+    let covariance_conditional = drop_gamma_block(covariance_conditional);
+    let covariance_corrected = drop_gamma_block(covariance_corrected);
+
+    UnifiedFitResult::try_from_parts(crate::estimate::UnifiedFitResultParts {
+        blocks,
+        log_lambdas,
+        lambdas,
+        likelihood_family,
+        likelihood_scale,
+        log_likelihood_normalization,
+        log_likelihood,
+        deviance,
+        reml_score,
+        stable_penalty_term,
+        penalized_objective,
+        outer_iterations,
+        outer_converged,
+        outer_gradient_norm,
+        standard_deviation,
+        covariance_conditional,
+        covariance_corrected,
+        inference,
+        fitted_link,
+        // Drop the widened-joint penalized Hessian: see the doc comment.
+        geometry: None,
+        block_states,
+        pirls_status,
+        max_abs_eta,
+        constraint_kkt,
+        artifacts,
+        inner_cycles,
+    })
+    .map_err(|e| {
+        format!("marginal-slope influence-absorber truncation produced an invalid fit result: {e}")
+    })
 }
 
 /// Assemble the canonical Bernoulli marginal-slope payload.
@@ -179,6 +330,7 @@ pub fn assemble_bernoulli_marginal_slope_payload(
         resolved_marginalspec,
         resolved_logslopespec,
         fit_result,
+        p_marginal,
         baseline_marginal,
         baseline_logslope,
         latent_z_normalization,
@@ -189,6 +341,11 @@ pub fn assemble_bernoulli_marginal_slope_payload(
         base_link,
         frailty,
     } = inputs;
+
+    // #461 predict seam: drop the training-only influence-absorber γ (and
+    // marginalize it out of the covariance) so the persisted model matches the
+    // raw p_m marginal design at predict. No-op when the absorber is inactive.
+    let fit_result = truncate_marginal_slope_influence_absorber(fit_result, p_marginal)?;
 
     let marginal_likelihood_spec =
         inverse_link_to_binomial_spec(&base_link).map_err(|e| e.to_string())?;
