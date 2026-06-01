@@ -2861,6 +2861,12 @@ pub enum PenaltySource {
     OperatorMass,
     OperatorTension,
     OperatorStiffness,
+    /// One per input axis `a` of a multivariate Duchon smooth: the gradient
+    /// energy along axis `a`, `Σ(∂f/∂x_a)²`, each with its own REML λ_a. REML
+    /// shrinks an axis's contribution toward flat only when it does not earn
+    /// its keep — penalty-based ARD / variable relevance, the replacement for
+    /// brittle kernel-η optimization. Emitted when `scale_dims` is on.
+    OperatorRelevance { axis: usize },
     TensorMarginal { dim: usize },
     TensorGlobalRidge,
     Other(String),
@@ -22732,6 +22738,7 @@ fn duchon_operator_penalty_candidates(
     length_scale: Option<f64>,
     power: f64,
     nullspace_order: DuchonNullspaceOrder,
+    per_axis_relevance: bool,
     identifiability_transform: Option<&Array2<f64>>,
     workspace: &mut BasisWorkspace,
 ) -> Result<Vec<PenaltyCandidate>, BasisError> {
@@ -22768,19 +22775,36 @@ fn duchon_operator_penalty_candidates(
     let p_order = duchon_p_from_nullspace_order(effective);
     let kernel_nullspace = ops.kernel_nullspace_transform.as_ref();
     let poly_cols = ops.polynomial_block_cols;
+    // When per-axis relevance is requested (`scale_dims`), the single isotropic
+    // gradient penalty `Σ‖∇f‖²` is REPLACED by `dim` per-axis penalties
+    // `Σ(∂f/∂x_a)²`, each its own REML λ_a (ARD: REML shrinks an axis's
+    // nonlinear contribution toward flat only when it does not earn its keep).
+    // The isotropic-order penalties (mass, stiffness) still route through the
+    // shared factory; tension is removed from its spec here and re-emitted
+    // per-axis below. The affine slopes stay in the global trend ridge, so a
+    // smooth, linearly-useful axis keeps its slope while its nonlinear λ_a may
+    // grow.
+    let split_tension = per_axis_relevance && want_tension;
+    let factory_spec = if split_tension {
+        let mut spec = operator_penalties.clone();
+        spec.tension = OperatorPenaltySpec::Disabled;
+        spec
+    } else {
+        operator_penalties.clone()
+    };
     // The collocation `D_q` already carry the kernel CPD nullspace `Z`, the
     // polynomial padding, and the identifiability transform (final β-basis), so
     // the factory's quadrature fallback `fast_ata(d_q)` is β-basis. Its
     // closed-form branch rebuilds the same β-basis from `centers` via the SAME
     // `kernel_nullspace` + `poly_cols` + `outer_identifiability`, so both
     // branches agree. q=0 mass is always the centered quadrature Gram.
-    let candidates = if let Some(length_scale) = length_scale {
+    let mut candidates = if let Some(length_scale) = length_scale {
         operator_penalty_candidates_closed_form(
             centers,
             &ops.d0,
             &ops.d1,
             &ops.d2,
-            operator_penalties,
+            &factory_spec,
             p_order,
             duchon_power_to_usize(power),
             length_scale,
@@ -22795,7 +22819,7 @@ fn duchon_operator_penalty_candidates(
             &ops.d0,
             &ops.d1,
             &ops.d2,
-            operator_penalties,
+            &factory_spec,
             p_order,
             power,
             None,
@@ -22804,6 +22828,22 @@ fn duchon_operator_penalty_candidates(
             identifiability_transform,
         )
     };
+    if split_tension {
+        // `D1` rows are indexed `collocation_i · dim + axis`, so axis `a` owns
+        // the strided row set `a, a+dim, a+2·dim, …`. `fast_ata` of that slice
+        // is the density-blind support quadrature of `∫(∂f/∂x_a)²` in the final
+        // β-basis (the poly null space is zeroed in `D1`, so this is the
+        // NONLINEAR gradient energy; the affine slope is the trend ridge's job).
+        let dim = centers.ncols();
+        for axis in 0..dim {
+            let d1_axis = ops.d1.slice(s![axis..; dim, ..]).to_owned();
+            candidates.push(normalize_penalty_candidate(
+                symmetrize(&fast_ata(&d1_axis)),
+                0,
+                PenaltySource::OperatorRelevance { axis },
+            ));
+        }
+    }
     Ok(candidates)
 }
 
@@ -23028,6 +23068,7 @@ pub fn build_duchon_basiswithworkspace(
         spec.length_scale,
         spec.power,
         effective_nullspace_order,
+        aniso.is_some(),
         identifiability_transform.as_ref(),
         workspace,
     )?);
