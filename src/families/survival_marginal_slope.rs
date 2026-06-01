@@ -27697,23 +27697,90 @@ mod tests {
     // to within 5e-8 absolute / 5e-7 relative.
     // ────────────────────────────────────────────────────────────────────
 
-    fn b10_flex_family_for_parity() -> (SurvivalMarginalSlopeFamily, Vec<ParameterBlockState>) {
+    #[derive(Clone, Copy)]
+    struct B10ParityFixture {
+        label: &'static str,
+        event: f64,
+        weight: f64,
+        z: f64,
+        q0: f64,
+        q1: f64,
+        qd1: f64,
+        score_eta: f64,
+        h_scale: f64,
+        w_scale: f64,
+    }
+
+    const B10_PARITY_FIXTURES: &[B10ParityFixture] = &[
+        B10ParityFixture {
+            label: "event_nonzero_warps",
+            event: 1.0,
+            weight: 0.75,
+            z: -0.2,
+            q0: -0.4,
+            q1: 0.6,
+            qd1: 0.85,
+            score_eta: 0.32,
+            h_scale: 0.05,
+            w_scale: 0.04,
+        },
+        B10ParityFixture {
+            label: "censored_left_tail",
+            event: 0.0,
+            weight: 1.35,
+            z: -1.15,
+            q0: -1.35,
+            q1: -0.9,
+            qd1: 0.42,
+            score_eta: -0.55,
+            h_scale: -0.035,
+            w_scale: 0.025,
+        },
+        B10ParityFixture {
+            label: "near_boundary_derivative",
+            event: 1.0,
+            weight: 0.2,
+            z: 0.95,
+            q0: 0.15,
+            q1: 1.05,
+            qd1: 0.08,
+            score_eta: 0.72,
+            h_scale: 0.015,
+            w_scale: -0.02,
+        },
+        B10ParityFixture {
+            label: "zero_warp_edge",
+            event: 0.0,
+            weight: 0.9,
+            z: 0.0,
+            q0: -0.05,
+            q1: 0.25,
+            qd1: 1.2,
+            score_eta: 0.0,
+            h_scale: 0.0,
+            w_scale: 0.0,
+        },
+    ];
+
+    fn b10_flex_family_for_parity(
+        fixture: B10ParityFixture,
+    ) -> (SurvivalMarginalSlopeFamily, Vec<ParameterBlockState>) {
         let score_runtime = test_deviation_runtime();
         let link_runtime = test_deviation_runtime();
         let family = SurvivalMarginalSlopeFamily {
             n: 1,
-            event: Arc::new(array![1.0]),
-            weights: Arc::new(array![0.75]),
-            z: Arc::new(array![-0.2].insert_axis(Axis(1))),
+            event: Arc::new(array![fixture.event]),
+            weights: Arc::new(array![fixture.weight]),
+            z: Arc::new(array![fixture.z].insert_axis(Axis(1))),
             score_covariance: unit_score_covariance(),
             gaussian_frailty_sd: None,
             derivative_guard: 1e-6,
             design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
             design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
             design_derivative_exit: DesignMatrix::from(Array2::zeros((1, 1))),
-            offset_entry: Arc::new(array![-0.4]),
-            offset_exit: Arc::new(array![0.6]),
-            derivative_offset_exit: Arc::new(array![0.85]),
+            offset_entry: Arc::new(array![fixture.q0]),
+            offset_exit: Arc::new(array![fixture.q1]),
+            derivative_offset_exit: Arc::new(array![fixture.qd1]),
             marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
             logslope_design: DesignMatrix::from(Array2::zeros((1, 0))),
             logslope_surface_ranges: empty_logslope_surface_ranges(),
@@ -27730,14 +27797,12 @@ mod tests {
         };
         let h_dim = score_runtime.basis_dim();
         let w_dim = link_runtime.basis_dim();
-        // Mild non-zero coefficients to drive the chi/D quotient terms
-        // away from the zero-warp / zero-deviation degenerate case.
         let h_beta: Array1<f64> = (0..h_dim)
-            .map(|k| 0.05 * ((k as f64 + 1.0).sin()))
+            .map(|k| fixture.h_scale * ((k as f64 + 1.0).sin()))
             .collect::<Vec<_>>()
             .into();
         let w_beta: Array1<f64> = (0..w_dim)
-            .map(|k| 0.04 * ((k as f64 + 1.0).cos()))
+            .map(|k| fixture.w_scale * ((k as f64 + 1.0).cos()))
             .collect::<Vec<_>>()
             .into();
         let block_states = vec![
@@ -27751,7 +27816,7 @@ mod tests {
             },
             ParameterBlockState {
                 beta: Array1::zeros(0),
-                eta: array![0.32],
+                eta: array![fixture.score_eta],
             },
             ParameterBlockState {
                 beta: h_beta,
@@ -27763,6 +27828,28 @@ mod tests {
             },
         ];
         (family, block_states)
+    }
+
+    fn b10_direction_set(p: usize) -> Vec<(&'static str, Array1<f64>)> {
+        let mixed: Array1<f64> = (0..p)
+            .map(|k| 0.1 + 0.07 * ((k as f64 + 1.7).sin()))
+            .collect::<Vec<_>>()
+            .into();
+        let alternating: Array1<f64> = (0..p)
+            .map(|k| if k % 2 == 0 { 0.16 } else { -0.11 })
+            .collect::<Vec<_>>()
+            .into();
+        let mut qd_axis = Array1::zeros(p);
+        if p > 2 {
+            qd_axis[2] = 1.0;
+        }
+        let zero = Array1::zeros(p);
+        vec![
+            ("mixed", mixed),
+            ("alternating", alternating),
+            ("qd_axis", qd_axis),
+            ("zero", zero),
+        ]
     }
 
     fn b10_pack_base(
@@ -27932,35 +28019,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn block10_cpu_oracle_third_contraction_matches_family() {
-        let (family, block_states) = b10_flex_family_for_parity();
-        let primary = flex_primary_slices(&family);
-        let p = primary.total;
-        // Deterministic non-axis-aligned direction.
-        let dir: Array1<f64> = (0..p)
-            .map(|k| 0.1 + 0.07 * ((k as f64 + 1.7).sin()))
-            .collect::<Vec<_>>()
-            .into();
-
-        let expected = family
-            .row_flex_primary_third_contracted_exact(0, &block_states, &dir)
-            .expect("cpu third contraction");
-
-        let (
-            entry_base,
-            exit_base,
-            entry_ext,
-            exit_ext,
-            _e2,
-            _x2,
-            _eb,
-            _xb,
-            _qd1,
-            qd1_idx,
-            p_total,
-        ) = flex_primary_timepoint_jets_for_test(&family, 0, &block_states, &dir, None)
-            .expect("jets");
+    fn b10_third_oracle_from_family(
+        family: &SurvivalMarginalSlopeFamily,
+        block_states: &[ParameterBlockState],
+        dir: &Array1<f64>,
+    ) -> Vec<f64> {
+        let (entry_base, exit_base, entry_ext, exit_ext, _e2, _x2, _eb, _xb, qd1, qd1_idx, p_total) =
+            flex_primary_timepoint_jets_for_test(family, 0, block_states, dir, None)
+                .expect("third-contraction jets");
 
         let entry_b = b10_pack_base(&entry_base);
         let exit_b = b10_pack_base(&exit_base);
@@ -27970,10 +28036,7 @@ mod tests {
         let inputs = crate::gpu::survival_flex::SurvivalFlexBlock10ThirdInputs {
             p: p_total,
             qd1_index: qd1_idx,
-            qd1: family
-                .row_dynamic_q_geometry(0, &block_states)
-                .expect("q geom")
-                .qd1,
+            qd1,
             w: family.weights[0],
             d: family.event[0],
             dir: &dir_vec,
@@ -27982,30 +28045,15 @@ mod tests {
             entry_ext: &entry_d,
             exit_ext: &exit_d,
         };
-        let actual =
-            crate::gpu::survival_flex::cpu_oracle_third_contraction(&inputs).expect("oracle third");
-        assert_eq!(actual.len(), expected.nrows() * expected.ncols());
-        b10_assert_parity(&actual, &expected, "block10_third");
+        crate::gpu::survival_flex::cpu_oracle_third_contraction(&inputs).expect("oracle third")
     }
 
-    #[test]
-    fn block10_cpu_oracle_fourth_contraction_matches_family() {
-        let (family, block_states) = b10_flex_family_for_parity();
-        let primary = flex_primary_slices(&family);
-        let p = primary.total;
-        let dir_u: Array1<f64> = (0..p)
-            .map(|k| 0.08 + 0.06 * ((k as f64 + 0.4).cos()))
-            .collect::<Vec<_>>()
-            .into();
-        let dir_v: Array1<f64> = (0..p)
-            .map(|k| -0.05 + 0.09 * ((k as f64 + 1.1).sin()))
-            .collect::<Vec<_>>()
-            .into();
-
-        let expected = family
-            .row_flex_primary_fourth_contracted_exact(0, &block_states, &dir_u, &dir_v)
-            .expect("cpu fourth contraction");
-
+    fn b10_fourth_oracle_from_family(
+        family: &SurvivalMarginalSlopeFamily,
+        block_states: &[ParameterBlockState],
+        dir_u: &Array1<f64>,
+        dir_v: &Array1<f64>,
+    ) -> Vec<f64> {
         let (
             entry_base,
             exit_base,
@@ -28015,11 +28063,11 @@ mod tests {
             exit_ext2,
             entry_bi,
             exit_bi,
-            _qd1,
+            qd1,
             qd1_idx,
             p_total,
-        ) = flex_primary_timepoint_jets_for_test(&family, 0, &block_states, &dir_u, Some(&dir_v))
-            .expect("bi-jets");
+        ) = flex_primary_timepoint_jets_for_test(family, 0, block_states, dir_u, Some(dir_v))
+            .expect("fourth-contraction bi-jets");
         let entry_ext2 = entry_ext2.expect("entry ext2");
         let exit_ext2 = exit_ext2.expect("exit ext2");
         let entry_bi = entry_bi.expect("entry bi");
@@ -28038,10 +28086,7 @@ mod tests {
         let inputs = crate::gpu::survival_flex::SurvivalFlexBlock10FourthInputs {
             p: p_total,
             qd1_index: qd1_idx,
-            qd1: family
-                .row_dynamic_q_geometry(0, &block_states)
-                .expect("q geom")
-                .qd1,
+            qd1,
             w: family.weights[0],
             d: family.event[0],
             dir_u: &dir_u_v,
@@ -28055,10 +28100,53 @@ mod tests {
             entry_bi: &entry_bi_p,
             exit_bi: &exit_bi_p,
         };
-        let actual = crate::gpu::survival_flex::cpu_oracle_fourth_contraction(&inputs)
-            .expect("oracle fourth");
-        assert_eq!(actual.len(), expected.nrows() * expected.ncols());
-        b10_assert_parity(&actual, &expected, "block10_fourth");
+        crate::gpu::survival_flex::cpu_oracle_fourth_contraction(&inputs).expect("oracle fourth")
+    }
+
+    #[test]
+    fn block10_cpu_oracle_third_contraction_matches_family_shared_fixtures() {
+        for &fixture in B10_PARITY_FIXTURES {
+            let (family, block_states) = b10_flex_family_for_parity(fixture);
+            let primary = flex_primary_slices(&family);
+            for (dir_label, dir) in b10_direction_set(primary.total) {
+                let expected = family
+                    .row_flex_primary_third_contracted_exact(0, &block_states, &dir)
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "{} / {dir_label}: cpu third contraction failed: {err}",
+                            fixture.label
+                        )
+                    });
+                let actual = b10_third_oracle_from_family(&family, &block_states, &dir);
+                assert_eq!(actual.len(), expected.nrows() * expected.ncols());
+                b10_assert_parity(&actual, &expected, fixture.label);
+            }
+        }
+    }
+
+    #[test]
+    fn block10_cpu_oracle_fourth_contraction_matches_family_shared_fixtures() {
+        for &fixture in B10_PARITY_FIXTURES {
+            let (family, block_states) = b10_flex_family_for_parity(fixture);
+            let primary = flex_primary_slices(&family);
+            let dirs = b10_direction_set(primary.total);
+            let pairs = [(0usize, 0usize), (0, 1), (1, 0), (1, 2), (2, 3), (3, 0)];
+            for &(u_idx, v_idx) in &pairs {
+                let (u_label, dir_u) = &dirs[u_idx];
+                let (v_label, dir_v) = &dirs[v_idx];
+                let expected = family
+                    .row_flex_primary_fourth_contracted_exact(0, &block_states, dir_u, dir_v)
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "{} / {u_label}->{v_label}: cpu fourth contraction failed: {err}",
+                            fixture.label
+                        )
+                    });
+                let actual = b10_fourth_oracle_from_family(&family, &block_states, dir_u, dir_v);
+                assert_eq!(actual.len(), expected.nrows() * expected.ncols());
+                b10_assert_parity(&actual, &expected, fixture.label);
+            }
+        }
     }
 
     // ── flex-chain Jacobian FD tests ─────────────────────────────────────────
