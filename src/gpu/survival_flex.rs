@@ -44,17 +44,30 @@
 //! from the BMS A2 (widened-marginal) realization. The survival linear
 //! predictor is `η₀ = q₀·c(g) + s_f·g·z`, `η₁ = q₁·c(g) + s_f·g·z`: the
 //! marginal/location index enters through the time-quantiles `q₀`/`q₁`, each
-//! **scaled by `c(g)`**. A plain-additive absorber `+Z̃_infl·γ` (chain factor
-//! `∂η/∂γ = 1`, NOT `×c`) therefore cannot be folded into `q₀`/`q₁`; survival
-//! realizes it as a **dedicated additive η channel** (sibling of the existing
-//! primaries), not a widened q-design. Because these kernels currently emit a
-//! fixed 4-primary `(q₀, q₁, q̇₁, g)` grad/Hessian and compute η on-device, the
-//! GPU mirror of that channel (a per-row channel input added to η, its grad
-//! slot, and its η-space Hessian cross terms) is **pending the survival CPU
-//! realization in `row_primary_closed_form`** — the GPU kernel mirrors that
-//! reference term-for-term, so it must not be implemented ahead of it. Until
-//! the channel lands here, absorber survival fits run on CPU. The block is
-//! dropped at predict (the absorber is training-only).
+//! **scaled by `c(g)`**. A plain-additive absorber (chain factor `∂η/∂γ = 1`,
+//! NOT `×c`) therefore cannot be folded into `q₀`/`q₁`; the CPU path
+//! (`survival_marginal_slope.rs`) realizes it as a **dedicated additive η
+//! channel** `o_infl` — a single trailing primary scalar appended to
+//! `FlexPrimarySlices` after the link-deviation `w` block, so the primary
+//! vector becomes `[q₀, q₁, q̇₁, g, h…, w…, o_infl]` and `r = primary.total`
+//! grows by 1 when the absorber is active. Per row `o_infl = Z̃_infl[row,:]·γ`
+//! (the `n×p₁` design `Z̃_infl` projects `p₁` coeffs → the scalar), and it is
+//! added to **both** `η₀` and `η₁` (`∂η₀/∂o_infl = ∂η₁/∂o_infl = 1`, zero
+//! higher self-derivs; `o_infl` is independent of the calibration intercept
+//! `a`, so `χ₁ = ∂η₁/∂a` is unchanged). The absorber is **flex-only** (active
+//! only under `FlexActivation::On`).
+//!
+//! When the flex GPU kernels land, they must carry this `o_infl` channel: a
+//! per-row `o_infl[i]` input, `eta0 += o_infl`, `eta1 += o_infl`, a grad slot
+//! `g_oinfl = u1_eta0 + u1_eta1`, and Hessian cross terms `H(o,o)=u2_eta0+
+//! u2_eta1`, `H(o,q₀)=u2_eta0·c`, `H(o,q₁)=u2_eta1·c`,
+//! `H(o,g)=u2_eta0·∂η₀/∂g + u2_eta1·∂η₁/∂g` (∂²η/∂o_infl² = 0). The RIGID GPU
+//! kernel below stays a fixed 4-primary `(q₀,q₁,q̇₁,g)` kernel — it is the
+//! `flex=false` path and never sees an absorber. Until the flex GPU kernels
+//! carry `o_infl`, the host `build_survival_flex_gpu_row_batch` must fall back
+//! to CPU (`Ok(None)`) whenever the absorber is active, so the 4-primary batch
+//! never silently drops `o_infl`. The block is dropped at predict (the
+//! absorber is training-only).
 
 use std::sync::OnceLock;
 
