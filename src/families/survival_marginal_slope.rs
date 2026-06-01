@@ -472,6 +472,7 @@ struct ThetaHints {
     logslope_beta: Option<Array1<f64>>,
     score_warp_beta: Option<Array1<f64>>,
     link_dev_beta: Option<Array1<f64>>,
+    influence_beta: Option<Array1<f64>>,
 }
 
 #[derive(Clone)]
@@ -19212,6 +19213,7 @@ fn joint_setup(
     logslope_penalties: usize,
     core_rho0_seed: &[f64],
     extra_rho0: &[f64],
+    pinned_rho_slots: &[(usize, f64)],
     initial_sigma: Option<f64>,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> ExactJointHyperSetup {
@@ -19234,8 +19236,22 @@ fn joint_setup(
             rho0vec[start + idx] = value;
         }
     }
-    let rho_lower = Array1::<f64>::from_elem(rho_dim, -12.0);
-    let rho_upper = Array1::<f64>::from_elem(rho_dim, 12.0);
+    let mut rho_lower = Array1::<f64>::from_elem(rho_dim, -12.0);
+    let mut rho_upper = Array1::<f64>::from_elem(rho_dim, 12.0);
+    // Pin fixed-ridge penalty slots (e.g. the #461 influence absorber) to a
+    // degenerate box so the outer REML optimizer can never move their log-λ:
+    // the absorber ridge is a fixed training-time leakage absorber, not a
+    // smooth/learned surface. Seed rho0 at the pinned value too so the start
+    // point is feasible.
+    for &(slot, value) in pinned_rho_slots {
+        assert!(
+            slot < rho_dim,
+            "pinned rho slot {slot} out of range (rho_dim={rho_dim})"
+        );
+        rho0vec[slot] = value;
+        rho_lower[slot] = value;
+        rho_upper[slot] = value;
+    }
     // Time block has no spatial length scales (pure B-spline on time)
     let empty_kappa = SpatialLogKappaCoords::new_with_dims(Array1::zeros(0), vec![]);
     let marginal_kappa = SpatialLogKappaCoords::from_length_scales_aniso(
@@ -20690,6 +20706,12 @@ pub fn fit_survival_marginal_slope_terms(
         }
         joint_training_design_preflight(&segments, &spec.weights)?;
     }
+    // Penalty seeds for the flex/aux blocks beyond the core (time/marginal/
+    // logslope). The absorbed influence block (#461) contributes ONE trailing
+    // fixed-ridge penalty whose log-λ is pinned (not REML-learned); its flat
+    // rho index is recorded in `pinned_rho_slots` so `joint_setup` clamps it to
+    // a degenerate box.
+    let mut pinned_rho_slots: Vec<(usize, f64)> = Vec::new();
     let extra_rho0 = {
         let mut out = Vec::new();
         if let Some(ref prepared) = score_warp_prepared {
@@ -20697,6 +20719,17 @@ pub fn fit_survival_marginal_slope_terms(
         }
         if let Some(ref prepared) = link_dev_prepared {
             out.extend(std::iter::repeat_n(0.0, prepared.block.penalties.len()));
+        }
+        if influence_absorber_residualized.is_some() {
+            let core_len = time_penalties_len
+                + marginal_design.penalties.len()
+                + logslope_design.penalties.len();
+            // The absorber's single fixed ridge sits at the trailing extra slot.
+            pinned_rho_slots.push((
+                core_len + out.len(),
+                crate::families::marginal_slope_orthogonal::INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA,
+            ));
+            out.push(crate::families::marginal_slope_orthogonal::INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA);
         }
         out
     };
@@ -20727,6 +20760,7 @@ pub fn fit_survival_marginal_slope_terms(
         logslope_design.penalties.len(),
         &core_rho0_seed,
         &extra_rho0,
+        &pinned_rho_slots,
         initial_sigma,
         kappa_options,
     );
@@ -21263,6 +21297,12 @@ pub fn fit_survival_marginal_slope_terms(
             FlexActivation::On => link_dev_prepared.as_ref(),
             FlexActivation::OffForRigidPilot => None,
         };
+        // The absorbed influence block (#461) is suppressed during the rigid
+        // pilot (its residualization derives FROM that pilot); active otherwise.
+        let influence_active = match flex {
+            FlexActivation::On => influence_absorber_residualized.as_ref(),
+            FlexActivation::OffForRigidPilot => None,
+        };
         // The warm-start hint `hints.time_beta` is seeded from the rigid
         // pilot's time block (line ~21559). After the pilot's identifiability
         // reduction the stored β can have a *lower* dimension than the raw
@@ -21357,6 +21397,40 @@ pub fn fit_survival_marginal_slope_terms(
             None,
             hints.link_dev_beta.clone(),
         )?;
+        // Absorbed Stage-1 influence block (#461): a trailing additive block whose
+        // design is the residualized leakage columns `Z̃_infl` and whose single
+        // fixed-ridge penalty `½·ρ·‖γ‖²` is pinned out of REML (the rho slot is
+        // clamped to `INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA` by `joint_setup`). Its
+        // gauge priority (130) sits strictly between marginal (150) and logslope
+        // (120): the residualization already removes the marginal-aligned
+        // component, and the 130 tier makes the canonical-gauge RRQR demote the
+        // *logslope* direction (not the absorber) on any shared leakage axis — the
+        // discrete realization of `ψ − Π_η[ψ]`. Dropped at predict.
+        if let Some(z_tilde) = influence_active {
+            let p_i = z_tilde.ncols();
+            let rho_i = rho.slice(s![cursor..cursor + 1]).to_owned();
+            cursor += 1;
+            let beta_i = hints
+                .influence_beta
+                .clone()
+                .filter(|beta| beta.len() == p_i)
+                .unwrap_or_else(|| Array1::<f64>::zeros(p_i));
+            blocks.push(ParameterBlockSpec {
+                name: "influence_absorber".to_string(),
+                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                    z_tilde.clone(),
+                )),
+                offset: Array1::zeros(z_tilde.nrows()),
+                penalties: vec![PenaltyMatrix::Dense(Array2::<f64>::eye(p_i))],
+                nullspace_dims: vec![0],
+                initial_log_lambdas: rho_i,
+                initial_beta: Some(beta_i),
+                gauge_priority: 130,
+                jacobian_callback: None,
+                stacked_design: None,
+                stacked_offset: None,
+            });
+        }
         // When timewiggle is active, replace the rigid time and marginal
         // Jacobians with the timewiggle-aware versions.  These compute
         // the full (∂q_r/∂β_t, ∂q_r/∂β_m) chain-rule corrections from
