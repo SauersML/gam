@@ -29524,6 +29524,7 @@ fn build_survival_marginal_slope_ffi_payload(
             baseline_logslope: ms_result.baseline_slope,
             score_warp_runtime: ms_result.score_warp_runtime.as_ref(),
             link_dev_runtime: ms_result.link_dev_runtime.as_ref(),
+            influence_absorber_width: ms_result.influence_absorber_width,
         },
         SavedModelSourceMetadata {
             training_headers: dataset.headers.clone(),
