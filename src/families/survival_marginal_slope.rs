@@ -8832,6 +8832,74 @@ impl SurvivalMarginalSlopeFamily {
             }
         }
 
+        // Absorbed Stage-1 influence block (#461). The absorber is a SINGLE
+        // primary scalar `o_infl` at index `primary.infl` whose `p₁` joint
+        // coefficients `γ` map to it through the residualized design row
+        // `Z̃_infl[row,:]` (NOT an identity block — unlike score_warp/link_dev
+        // whose bases are themselves primary coordinates). It therefore projects
+        // like a non-identity single-scalar channel: each γ-coefficient `i` acts
+        // as a copy of the `o_infl` primary direction scaled by `Z̃[row,i]`, so
+        // its gradient and all cross-Hessians (vs core time/marginal/logslope and
+        // vs the identity flex blocks) and its own diagonal are the `o_infl`
+        // primary entries weighted by `Z̃[row,·]`.
+        if let (Some(infl_primary), Some(infl_joint)) = (
+            flex_primary_slices(self).infl,
+            slices.influence.as_ref(),
+        ) {
+            let z_tilde = self.influence_absorber.as_ref().ok_or_else(|| {
+                "accumulate_dynamic_q_joint_row: influence primary index present but no Z̃ design"
+                    .to_string()
+            })?;
+            let z_row = z_tilde.row(row);
+            let core_col = primary_hessian.slice(s![0..N_PRIMARY, infl_primary]);
+            // Per-coefficient gradient + cross with core blocks (time/marginal/
+            // logslope), reusing the identity-channel core-cross helper with the
+            // `o_infl` core Hessian column scaled by `Z̃[row, i]`.
+            for i in 0..z_row.len() {
+                let z_i = z_row[i];
+                joint_gradient[infl_joint.start + i] -= primary_gradient[infl_primary] * z_i;
+                if z_i != 0.0 {
+                    let scaled_core_col = &core_col.to_owned() * z_i;
+                    self.accumulate_identity_primary_cross_hessian(
+                        row,
+                        slices,
+                        q_geom,
+                        scaled_core_col.view(),
+                        infl_joint,
+                        i,
+                        joint_hessian,
+                    )?;
+                }
+            }
+            // Influence × influence diagonal: primary_hessian[[infl,infl]]·Z̃Z̃ᵀ.
+            let ii_weight = primary_hessian[[infl_primary, infl_primary]];
+            if ii_weight != 0.0 {
+                for i in 0..z_row.len() {
+                    for j in 0..z_row.len() {
+                        joint_hessian[[infl_joint.start + i, infl_joint.start + j]] +=
+                            ii_weight * z_row[i] * z_row[j];
+                    }
+                }
+            }
+            // Influence × identity-flex (score_warp/link_dev) cross-blocks: each
+            // flex coefficient `f` (a primary coordinate) crossed with each
+            // absorber coefficient `i` is `primary_hessian[[flex, infl]]·Z̃[row,i]`.
+            for (flex_primary, flex_joint) in identity_blocks {
+                for f in 0..flex_primary.len() {
+                    let weight = primary_hessian[[flex_primary.start + f, infl_primary]];
+                    if weight == 0.0 {
+                        continue;
+                    }
+                    let fj = flex_joint.start + f;
+                    for i in 0..z_row.len() {
+                        let value = weight * z_row[i];
+                        joint_hessian[[fj, infl_joint.start + i]] += value;
+                        joint_hessian[[infl_joint.start + i, fj]] += value;
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
