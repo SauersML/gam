@@ -14,9 +14,7 @@
 //! Reference: dense composite-Simpson quadrature over +/-18 sigma, independently
 //! validated by finite-differencing the mean (matches to < 1e-6).
 
-use gam::inference::quadrature::{
-    integrated_inverse_link_mean_and_derivative, QuadratureContext,
-};
+use gam::inference::quadrature::{QuadratureContext, integrated_inverse_link_mean_and_derivative};
 use gam::types::LinkFunction;
 
 fn cloglog(x: f64) -> f64 {
@@ -55,13 +53,9 @@ fn cloglog_integrated_mean_and_derivative_are_accurate_at_large_sigma() {
     let mut worst_d = 0.0f64;
     let mut worst_d_at = (0.0, 0.0, 0.0, 0.0);
     for (mu, sigma) in cases {
-        let got = integrated_inverse_link_mean_and_derivative(
-            &ctx,
-            LinkFunction::CLogLog,
-            mu,
-            sigma,
-        )
-        .unwrap();
+        let got =
+            integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::CLogLog, mu, sigma)
+                .unwrap();
         let want_m = gaussian_expectation(cloglog, mu, sigma);
         let want_d = gaussian_expectation(cloglog_d1, mu, sigma);
         let em = (got.mean - want_m).abs();
@@ -79,12 +73,18 @@ fn cloglog_integrated_mean_and_derivative_are_accurate_at_large_sigma() {
         worst_m < tol,
         "CLogLog integrated mean off by {worst_m:.3e} (tol {tol:.0e}) at \
          (mu={}, sigma={}): got {}, want {}",
-        worst_m_at.0, worst_m_at.1, worst_m_at.2, worst_m_at.3
+        worst_m_at.0,
+        worst_m_at.1,
+        worst_m_at.2,
+        worst_m_at.3
     );
     assert!(
         worst_d < tol,
         "CLogLog integrated d/dmu off by {worst_d:.3e} (tol {tol:.0e}) at \
          (mu={}, sigma={}): got {}, want {}",
-        worst_d_at.0, worst_d_at.1, worst_d_at.2, worst_d_at.3
+        worst_d_at.0,
+        worst_d_at.1,
+        worst_d_at.2,
+        worst_d_at.3
     );
 }

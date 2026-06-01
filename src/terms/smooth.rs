@@ -5789,13 +5789,11 @@ fn build_single_local_smooth_term(
                 for a in 0..l_minus_one {
                     for b in 0..l_minus_one {
                         let factor = if a == b { 2.0 } else { 1.0 };
-                        let mut block =
-                            s_big.slice_mut(s![a * p..(a + 1) * p, b * p..(b + 1) * p]);
+                        let mut block = s_big.slice_mut(s![a * p..(a + 1) * p, b * p..(b + 1) * p]);
                         block.assign(&s_inner.mapv(|v| v * factor));
                     }
                 }
-                let (s_big, factor_smooth_scale) =
-                    normalize_penalty_in_constrained_space(&s_big);
+                let (s_big, factor_smooth_scale) = normalize_penalty_in_constrained_space(&s_big);
                 let info_idx = active_penalty_indices[penalty_pos];
                 inner_built.penaltyinfo[info_idx].normalization_scale *= factor_smooth_scale;
                 penalties.push(s_big);
