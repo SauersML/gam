@@ -263,11 +263,10 @@ fn build_residualized_influence_columns(
     pilot_row_metric_w: &Array1<f64>,
     probit_scale: f64,
 ) -> Result<Array2<f64>, String> {
-    use crate::faer_ndarray::{
-        factorize_symmetricwith_fallback, fast_ab, fast_xt_diag_x, fast_xt_diag_y, FaerArrayView,
+    use crate::faer_ndarray::fast_xt_diag_x;
+    use crate::families::marginal_slope_orthogonal::{
+        influence_block_design, residualize_influence_columns, ScoreInfluenceJacobian,
     };
-    use crate::matrix::FactorizedSystem;
-    use faer::Side;
 
     let n = marginal_dense.nrows();
     if score_influence_jacobian.nrows() != n {
@@ -287,15 +286,11 @@ fn build_residualized_influence_columns(
     // Z_infl = diag(s_f·β̂₀)·J via the core builder (single source of truth).
     // `influence_block_design` reads only `.columns`; the co-indexed OOF `z`
     // completes the core struct contract (it pairs with these J rows).
-    let jac = crate::families::marginal_slope_orthogonal::ScoreInfluenceJacobian {
+    let jac = ScoreInfluenceJacobian {
         columns: score_influence_jacobian.clone(),
         z: oof_z.clone(),
     };
-    let z_infl = crate::families::marginal_slope_orthogonal::influence_block_design(
-        &jac,
-        rigid_logslope_at_rows,
-        probit_scale,
-    );
+    let z_infl = influence_block_design(&jac, rigid_logslope_at_rows, probit_scale);
 
     let p_m = marginal_dense.ncols();
     if p_m == 0 {
@@ -303,28 +298,15 @@ fn build_residualized_influence_columns(
         // absorbed columns.
         return Ok(z_infl);
     }
-    // Weighted Gram MᵀWM and cross term MᵀW Z_infl in the pilot row metric.
-    let mut gram = fast_xt_diag_x(marginal_dense, pilot_row_metric_w);
-    // Symmetric ridge so the weighted Gram is invertible even when the marginal
-    // design is rank-deficient at the pilot (a dropped/aliased spatial column
-    // leaves a zero pivot); scaled to the Gram's own magnitude so it never
-    // perturbs a well-conditioned projection.
-    let gram_scale = (0..p_m).map(|i| gram[[i, i]]).fold(0.0_f64, f64::max);
-    let ridge = (gram_scale * 1e-10).max(1e-12);
-    for i in 0..p_m {
-        gram[[i, i]] += ridge;
-    }
-    let cross = fast_xt_diag_y(marginal_dense, pilot_row_metric_w, &z_infl);
-    let gram_view = FaerArrayView::new(&gram);
-    let factor = factorize_symmetricwith_fallback(gram_view.as_ref(), Side::Lower)
-        .map_err(|e| format!("influence block: weighted marginal Gram factorisation failed: {e}"))?;
-    // coeffs = (MᵀWM + εI)⁻¹ MᵀW Z_infl   (p_m × p₁)
-    let coeffs = factor
-        .solvemulti(&cross)
-        .map_err(|e| format!("influence block: marginal projection solve failed: {e}"))?;
-    // Z̃_infl = Z_infl − M·coeffs.
-    let projection = fast_ab(marginal_dense, &coeffs);
-    let residualized = &z_infl - &projection;
+    // Ridge for the weighted-Gram solve, scaled to the Gram's own magnitude so a
+    // rank-deficient marginal design at the pilot stays solvable without
+    // perturbing a well-conditioned projection. The §3 projection itself is the
+    // SHARED core helper (single source of truth across bms + survival).
+    let gram_diag = fast_xt_diag_x(marginal_dense, pilot_row_metric_w);
+    let gram_scale = (0..p_m).map(|i| gram_diag[[i, i]]).fold(0.0_f64, f64::max);
+    let eps = (gram_scale * 1e-10).max(1e-12);
+    let residualized =
+        residualize_influence_columns(&z_infl, marginal_dense.view(), pilot_row_metric_w, eps);
     if residualized.iter().any(|v| !v.is_finite()) {
         return Err(
             "influence block: residualised influence columns contain non-finite entries".to_string(),
