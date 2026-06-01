@@ -103,7 +103,20 @@ impl RiemannianManifold for SphereManifold {
         check_len("Sphere source", p_from.len(), m)?;
         check_len("Sphere target", p_to.len(), m)?;
         let c = dot(p_from, p_to).clamp(-1.0, 1.0);
-        let theta = c.acos();
+        // Geodesic length via the chord/haversine form theta = 2·arcsin(|p-q|/2)
+        // rather than acos(p·q). For nearby unit vectors p·q = 1 − |p-q|²/2
+        // saturates to ~1, so `1 − c` carries only ~eps/(theta²/2) relative
+        // accuracy and acos(1−x) ≈ √(2x) amplifies it to ~eps/theta² error in
+        // theta. The chord |p-q| is formed straight from the coordinates (no
+        // near-1 subtraction) and stays accurate to ~1e-12 across the range.
+        // Identical points give chord 0 → theta 0 (preserving the short-circuit
+        // below); the dot product c is still used for the tangent direction.
+        let mut chord_sq = 0.0_f64;
+        for i in 0..m {
+            let d = p_to[i] - p_from[i];
+            chord_sq += d * d;
+        }
+        let theta = 2.0 * (0.5 * chord_sq.sqrt()).min(1.0).asin();
         if theta < 1.0e-10 {
             return Ok(Array1::<f64>::zeros(m));
         }
@@ -367,14 +380,20 @@ fn sphere_weighted_log_step(
     let mut step = Array1::<f64>::zeros(base.len());
     for row in 0..values.nrows() {
         let mut dot_value = 0.0_f64;
+        let mut chord_sq = 0.0_f64;
         for col in 0..base.len() {
             dot_value += values[[row, col]] * base[col];
+            let d = values[[row, col]] - base[col];
+            chord_sq += d * d;
         }
         let dot_value = dot_value.clamp(-1.0, 1.0);
         if dot_value <= -1.0 + 1.0e-12 {
             return Err("spherical log map is undefined at antipodal points".to_string());
         }
-        let theta = dot_value.acos();
+        // Chord form theta = 2·arcsin(|v-base|/2) avoids the acos(p·q)
+        // cancellation for nearby points (see SphereManifold::log_map); the
+        // dot product is still used for the tangent projection below.
+        let theta = 2.0 * (0.5 * chord_sq.sqrt()).min(1.0).asin();
         if theta < 1.0e-12 {
             continue;
         }
@@ -430,12 +449,15 @@ fn sphere_frechet_objective(
 ) -> f64 {
     let mut obj = 0.0_f64;
     for row in 0..values.nrows() {
-        let mut dot_value = 0.0_f64;
+        // Chord form theta = 2·arcsin(|v-base|/2) avoids the acos(p·q)
+        // cancellation for nearby points, so the Fréchet objective stays
+        // accurate as the mean iteration converges (rows collapse onto base).
+        let mut chord_sq = 0.0_f64;
         for col in 0..base.len() {
-            dot_value += values[[row, col]] * base[col];
+            let d = values[[row, col]] - base[col];
+            chord_sq += d * d;
         }
-        let dot_value = dot_value.clamp(-1.0, 1.0);
-        let theta = dot_value.acos();
+        let theta = 2.0 * (0.5 * chord_sq.sqrt()).min(1.0).asin();
         obj += weights[row] * theta * theta;
     }
     obj
