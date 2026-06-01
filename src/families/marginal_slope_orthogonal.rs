@@ -424,17 +424,29 @@ pub(crate) const INFLUENCE_PROJECTION_RIDGE_FLOOR: f64 = 1.0e-12;
 ///     `Z̃ = Z_infl − M·(MᵀWM + εI)⁻¹·MᵀW·Z_infl`.
 ///
 /// Returns `Err` if the residualized columns are not all finite (e.g. a
-/// non-finite pilot logslope or row metric propagated through). The two families
-/// differ ONLY in how they install the returned `Z̃` (BMS widens `[M | Z̃]`;
-/// survival adds a dedicated additive η₁ channel), never in this math.
+/// non-finite pilot logslope or row metric propagated through) — the finite
+/// guard is baked in so neither call site repeats it. The two families differ
+/// ONLY in how they install the returned `Z̃` (BMS widens `[M | Z̃]`; survival
+/// adds a dedicated additive η₁ channel), never in this math.
+///
+/// `raw_jac` is the bare `n × p₁` score-influence Jacobian (`∂z/∂θ₁`) — i.e.
+/// the value carried by the spec's `score_influence_jacobian` field — and
+/// `oof_z` is the matching out-of-fold latent score; callers hold these two
+/// arrays directly, so this entry point pairs them into a `ScoreInfluenceJacobian`
+/// internally rather than asking every site to construct one.
 pub(crate) fn residualized_influence_block(
-    jac: &ScoreInfluenceJacobian,
+    raw_jac: &Array2<f64>,
+    oof_z: &Array1<f64>,
     pilot_beta0: &Array1<f64>,
     s_f: f64,
     marginal_design: ArrayView2<f64>,
     w_metric: &Array1<f64>,
 ) -> Result<Array2<f64>, String> {
-    let z_infl = influence_block_design(jac, pilot_beta0, s_f);
+    let jac = ScoreInfluenceJacobian {
+        columns: raw_jac.clone(),
+        z: oof_z.clone(),
+    };
+    let z_infl = influence_block_design(&jac, pilot_beta0, s_f);
 
     // Ridge scaled to the weighted marginal Gram's own magnitude. Only the
     // diagonal is needed to size it, so reuse the same MᵀWM the residualizer
@@ -443,7 +455,8 @@ pub(crate) fn residualized_influence_block(
     let p_m = marginal_design.ncols();
     let gram = fast_xt_diag_x(&marginal_design, w_metric);
     let gram_scale = (0..p_m).map(|i| gram[[i, i]]).fold(0.0_f64, f64::max);
-    let eps = (gram_scale * INFLUENCE_PROJECTION_RELATIVE_RIDGE).max(INFLUENCE_PROJECTION_RIDGE_FLOOR);
+    let eps =
+        (gram_scale * INFLUENCE_PROJECTION_RELATIVE_RIDGE).max(INFLUENCE_PROJECTION_RIDGE_FLOOR);
 
     let residualized = residualize_influence_columns(&z_infl, marginal_design, w_metric, eps);
     if residualized.iter().any(|v| !v.is_finite()) {
