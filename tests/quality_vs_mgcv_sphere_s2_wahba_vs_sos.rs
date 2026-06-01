@@ -29,10 +29,14 @@
 //! offer an integrated penalized-REML GAM). mgcv `bs="sos"` is the only mature,
 //! widely-trusted integrated comparator, hence its role as the accuracy baseline.
 //!
-//! Data: real geographic coordinates (Latitude/Longitude) from the HGDP+1kG
-//! panel, with the known smooth spherical signal plus fixed-seed Gaussian noise
-//! at a controlled SNR. The identical (lat, lon, y) triples are handed to both
-//! engines.
+//! Data: real geographic coordinates (lat/long) from the committed `quakes`
+//! panel (`bench/datasets/quakes.csv`, 1000 Fiji-region earthquakes), with the
+//! known smooth spherical signal plus fixed-seed Gaussian noise at a controlled
+//! SNR. The identical (lat, lon, y) triples are handed to both engines. Only the
+//! coordinates are taken from the data; the response is the known truth field, so
+//! any real lat/lon panel of distinct, well-spread sites serves the recovery
+//! claim — the quakes coordinates span ~28° of latitude and cross the ±180°
+//! seam (long up to 188°), exercising the seam-continuity property.
 
 use gam::matrix::LinearOperator;
 use gam::smooth::{build_term_collection_design, freeze_term_collection_from_design};
@@ -42,9 +46,9 @@ use ndarray::Array2;
 use std::io::Write as _;
 use std::path::Path;
 
-const HGDP_TSV: &str = concat!(
+const QUAKES_CSV: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/bench/datasets/hgdp_1kg_pc_data.tsv"
+    "/bench/datasets/quakes.csv"
 );
 
 /// Known smooth signal on the sphere, evaluated from degree-valued lat/lon.
@@ -60,19 +64,19 @@ fn signal(lat_deg: f64, lon_deg: f64) -> f64 {
 fn gam_sphere_matches_mgcv_sos_on_geographic_surface() {
     init_parallelism();
 
-    // ---- read real lat/lon from the HGDP+1kG TSV (tab-separated) -----------
-    let raw = std::fs::read_to_string(Path::new(HGDP_TSV)).expect("read hgdp tsv");
+    // ---- read real lat/lon from the committed quakes panel (comma-separated) -
+    let raw = std::fs::read_to_string(Path::new(QUAKES_CSV)).expect("read quakes csv");
     let mut lines = raw.lines();
-    let header = lines.next().expect("tsv header");
-    let cols: Vec<&str> = header.split('\t').collect();
+    let header = lines.next().expect("csv header");
+    let cols: Vec<&str> = header.split(',').collect();
     let lat_col = cols
         .iter()
-        .position(|c| *c == "Latitude")
-        .expect("Latitude column");
+        .position(|c| *c == "lat")
+        .expect("lat column");
     let lon_col = cols
         .iter()
-        .position(|c| *c == "Longitude")
-        .expect("Longitude column");
+        .position(|c| *c == "long")
+        .expect("long column");
 
     let mut lat_all: Vec<f64> = Vec::new();
     let mut lon_all: Vec<f64> = Vec::new();
@@ -80,7 +84,7 @@ fn gam_sphere_matches_mgcv_sos_on_geographic_surface() {
         if line.trim().is_empty() {
             continue;
         }
-        let fields: Vec<&str> = line.split('\t').collect();
+        let fields: Vec<&str> = line.split(',').collect();
         let (Ok(la), Ok(lo)) = (
             fields[lat_col].trim().parse::<f64>(),
             fields[lon_col].trim().parse::<f64>(),
@@ -99,19 +103,24 @@ fn gam_sphere_matches_mgcv_sos_on_geographic_surface() {
     );
 
     // ---- deterministic subsample to keep both REML fits fast ---------------
-    // The HGDP coordinates are heavily duplicated (many samples per population),
-    // which makes a sphere smooth degenerate; deduplicate to distinct sites and
-    // keep a fixed-stride subsample so the design is well-spread over S².
+    // Coincident epicentres are common in the quakes panel; deduplicate to
+    // distinct sites (a sphere smooth over coincident points is degenerate) and
+    // keep a fixed-stride subsample so the design stays well-spread over S² and
+    // both REML fits stay fast. Stride is chosen to land near ~250 distinct
+    // sites regardless of how many the dedup yields.
     let mut seen: std::collections::BTreeSet<(i64, i64)> = std::collections::BTreeSet::new();
-    let mut lat: Vec<f64> = Vec::new();
-    let mut lon: Vec<f64> = Vec::new();
+    let mut lat_dedup: Vec<f64> = Vec::new();
+    let mut lon_dedup: Vec<f64> = Vec::new();
     for (la, lo) in lat_all.iter().zip(&lon_all) {
         let key = ((la * 100.0).round() as i64, (lo * 100.0).round() as i64);
         if seen.insert(key) {
-            lat.push(*la);
-            lon.push(*lo);
+            lat_dedup.push(*la);
+            lon_dedup.push(*lo);
         }
     }
+    let stride = (lat_dedup.len() / 250).max(1);
+    let lat: Vec<f64> = lat_dedup.iter().copied().step_by(stride).collect();
+    let lon: Vec<f64> = lon_dedup.iter().copied().step_by(stride).collect();
     assert!(
         lat.len() >= 150,
         "need >=150 distinct geographic sites, got {}",

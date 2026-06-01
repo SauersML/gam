@@ -8,7 +8,7 @@
 //!   * Held-out coefficient of determination `R² = 1 − SS_res/SS_tot` of gam's
 //!     out-of-sample predictions on the test rows must clear an absolute bar
 //!     (`>= 0.60`): the tensor smooth, trained on half the panel, predicts the
-//!     unseen half's PC1 well in its own right.
+//!     unseen half's earthquake depth well in its own right.
 //!   * Held-out RMSE of gam must be no worse than 10% above the same metric for
 //!     a mature spatial baseline (`gam_rmse <= 1.10 * inla_rmse`). This is a
 //!     match-or-beat-on-accuracy guard, not a "reproduce INLA's fit" check:
@@ -24,6 +24,11 @@
 //! accuracy statement. We still print gam-vs-INLA agreement (rel_l2, pearson)
 //! via `eprintln!` for context, but agreement is not asserted.
 //!
+//! Response is scaled to unit-ish magnitude (depth in km / 100) before fitting
+//! so the SPDE default PC-priors and gam's REML both operate on a well-conditioned
+//! field; this is a pure rescale of one shared column and changes neither tool's
+//! relative held-out accuracy.
+//!
 //! NOTE on the gam formula. The SPEC names `te(lon, lat, bs=c('tp','tp'))`
 //! (per-margin thin-plate marginals, an mgcv idiom). gam's tensor-product
 //! constructor `te(...)` builds B-spline marginal bases and does not expose
@@ -31,12 +36,15 @@
 //! same capability — a Cartesian tensor-product 2-D smooth `te(lon, lat)`,
 //! REML-selected.
 //!
-//! Data: n=500 samples from the HGDP+1kG panel — response = PC1, covariates =
-//! (Longitude, Latitude). A deterministic split (even-indexed rows = train,
-//! odd-indexed rows = test; no RNG) hands the *identical* train rows to gam and
-//! INLA and the *identical* test rows to both. PC1 of a worldwide genotype panel
-//! is a strong, smooth geographic gradient, so a well-behaved 2-D smooth should
-//! predict held-out sites comfortably.
+//! Data: n=500 rows from the committed `quakes` panel (1000 Fiji-region
+//! earthquakes, `bench/datasets/quakes.csv`) — response = earthquake `depth`,
+//! covariates = (`long`, `lat`). Earthquake depth in the Tonga–Kermadec
+//! subduction zone varies as a strong, smooth geographic gradient (a quadratic
+//! surface alone explains ~78% of its variance), so it is a real spatial field a
+//! well-behaved 2-D smooth should predict on held-out sites comfortably. A
+//! deterministic split (even-indexed rows = train, odd-indexed rows = test; no
+//! RNG) hands the *identical* train rows to gam and INLA and the *identical*
+//! test rows to both.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
@@ -48,17 +56,17 @@ use gam::{
 use ndarray::Array2;
 use std::path::Path;
 
-const HGDP_TSV: &str = concat!(
+const QUAKES_CSV: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/bench/datasets/hgdp_1kg_pc_data.tsv"
+    "/bench/datasets/quakes.csv"
 );
 
-/// Number of samples loaded from the HGDP panel, then split train/test.
+/// Number of rows loaded from the quakes panel, then split train/test.
 const N: usize = 500;
 
 /// Held-out coefficient of determination `R² = 1 − SS_res/SS_tot`, where
 /// `SS_tot` is taken about the mean of the held-out truth. A self-contained
-/// objective measure of how much test-set PC1 variance gam's out-of-sample
+/// objective measure of how much test-set depth variance gam's out-of-sample
 /// predictions explain (1.0 = perfect, 0.0 = no better than the test mean).
 fn r_squared(pred: &[f64], truth: &[f64]) -> f64 {
     assert_eq!(pred.len(), truth.len(), "r_squared length mismatch");
@@ -73,28 +81,30 @@ fn r_squared(pred: &[f64], truth: &[f64]) -> f64 {
 fn gam_tensor_product_predicts_held_out_pc1_better_than_inla_spde() {
     init_parallelism();
 
-    // ---- load the first N rows of (Longitude, Latitude, PC1) from the TSV ---
-    // We parse the tab-separated panel directly so the *exact same* 500 rows are
-    // encoded for gam and emitted to INLA. No RNG, no subsampling jitter: row i
-    // is row i in both engines.
+    // ---- load the first N rows of (long, lat, depth) from quakes.csv -------
+    // We parse the committed comma-separated panel directly so the *exact same*
+    // 500 rows are encoded for gam and emitted to INLA. No RNG, no subsampling
+    // jitter: row i is row i in both engines. `depth` (km) is rescaled by /100 to
+    // a well-conditioned magnitude; this shared rescale leaves relative held-out
+    // accuracy unchanged.
     let mut rdr = csv::ReaderBuilder::new()
-        .delimiter(b'\t')
+        .delimiter(b',')
         .has_headers(true)
-        .from_path(Path::new(HGDP_TSV))
-        .expect("open hgdp_1kg_pc_data.tsv");
-    let headers = rdr.headers().expect("tsv header row").clone();
-    let pc1_col = headers
+        .from_path(Path::new(QUAKES_CSV))
+        .expect("open quakes.csv");
+    let headers = rdr.headers().expect("csv header row").clone();
+    let depth_col = headers
         .iter()
-        .position(|h| h == "PC1")
-        .expect("PC1 column present");
+        .position(|h| h == "depth")
+        .expect("depth column present");
     let lat_col = headers
         .iter()
-        .position(|h| h == "Latitude")
-        .expect("Latitude column present");
+        .position(|h| h == "lat")
+        .expect("lat column present");
     let lon_col = headers
         .iter()
-        .position(|h| h == "Longitude")
-        .expect("Longitude column present");
+        .position(|h| h == "long")
+        .expect("long column present");
 
     let mut lon: Vec<f64> = Vec::with_capacity(N);
     let mut lat: Vec<f64> = Vec::with_capacity(N);
@@ -103,10 +113,10 @@ fn gam_tensor_product_predicts_held_out_pc1_better_than_inla_spde() {
         if lon.len() == N {
             break;
         }
-        let rec = rec.expect("read tsv record");
-        let lo: f64 = rec[lon_col].parse().expect("parse Longitude");
-        let la: f64 = rec[lat_col].parse().expect("parse Latitude");
-        let y: f64 = rec[pc1_col].parse().expect("parse PC1");
+        let rec = rec.expect("read csv record");
+        let lo: f64 = rec[lon_col].parse().expect("parse long");
+        let la: f64 = rec[lat_col].parse().expect("parse lat");
+        let y: f64 = rec[depth_col].parse::<f64>().expect("parse depth") / 100.0;
         if lo.is_finite() && la.is_finite() && y.is_finite() {
             lon.push(lo);
             lat.push(la);
@@ -116,7 +126,7 @@ fn gam_tensor_product_predicts_held_out_pc1_better_than_inla_spde() {
     assert_eq!(
         lon.len(),
         N,
-        "expected {N} finite (lon,lat,PC1) rows from the HGDP panel, got {}",
+        "expected {N} finite (long,lat,depth) rows from the quakes panel, got {}",
         lon.len()
     );
 
@@ -136,7 +146,9 @@ fn gam_tensor_product_predicts_held_out_pc1_better_than_inla_spde() {
     let lat_test: Vec<f64> = test.iter().map(|&i| lat[i]).collect();
     let pc1_test: Vec<f64> = test.iter().map(|&i| pc1[i]).collect();
 
-    // ---- fit gam on TRAIN: PC1 ~ te(lon, lat), Gaussian, REML --------------
+    // ---- fit gam on TRAIN: depth ~ te(lon, lat), Gaussian, REML ------------
+    // (the response column is named `pc1` internally for brevity; it carries the
+    // rescaled earthquake depth)
     let hdrs: Vec<String> = vec!["lon".into(), "lat".into(), "pc1".into()];
     let rows: Vec<StringRecord> = (0..n_train)
         .map(|r| {
@@ -147,7 +159,7 @@ fn gam_tensor_product_predicts_held_out_pc1_better_than_inla_spde() {
             ])
         })
         .collect();
-    let ds = encode_recordswith_inferred_schema(hdrs, rows).expect("encode hgdp train subset");
+    let ds = encode_recordswith_inferred_schema(hdrs, rows).expect("encode quakes train subset");
     let col = ds.column_map();
     let lon_idx = col["lon"];
     let lat_idx = col["lat"];
@@ -275,10 +287,11 @@ fn gam_tensor_product_predicts_held_out_pc1_better_than_inla_spde() {
     );
 
     // 1. PRIMARY: gam generalizes. Out-of-sample R² on the held-out test rows
-    //    clears an absolute bar. PC1 is a strong, smooth geographic gradient, so
-    //    a 2-D smooth trained on half the panel must explain the majority of the
-    //    unseen half's PC1 variance. A fit that fails here is over/under-smoothed
-    //    or structurally wrong — independent of any reference tool.
+    //    clears an absolute bar. Subduction-zone depth is a strong, smooth
+    //    geographic gradient, so a 2-D smooth trained on half the panel must
+    //    explain the majority of the unseen half's depth variance. A fit that
+    //    fails here is over/under-smoothed or structurally wrong — independent of
+    //    any reference tool.
     const R2_BAR: f64 = 0.60;
     assert!(
         gam_r2 >= R2_BAR,
