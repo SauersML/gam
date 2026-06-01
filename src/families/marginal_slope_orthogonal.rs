@@ -397,24 +397,60 @@ pub(crate) fn residualize_influence_columns(
     z_infl - &projection
 }
 
-/// The full §3 absorbed-block projection from the raw score-influence Jacobian:
-/// build the realized leakage directions `Z_infl = diag(s_f·β̂₀)·J` and
-/// residualize them against the marginal/primary span in the rigid-pilot
-/// `W`-metric — `Z̃ = residualize(diag(s_f·β̂₀)·J)`.
+/// Relative magnitude (vs. the largest weighted marginal-Gram diagonal) of the
+/// ridge added to `MᵀWM` in the §3 projection solve. Tiny — it only regularizes
+/// a rank-deficient marginal design at the pilot (a dropped/aliased spatial
+/// column leaves a zero pivot) and never perturbs a well-conditioned projection.
+pub(crate) const INFLUENCE_PROJECTION_RELATIVE_RIDGE: f64 = 1.0e-10;
+/// Absolute floor on the §3 projection ridge, so a degenerate (all-zero)
+/// weighted marginal Gram still yields an invertible system.
+pub(crate) const INFLUENCE_PROJECTION_RIDGE_FLOOR: f64 = 1.0e-12;
+
+/// The full §3 absorbed-block projection from the raw score-influence Jacobian —
+/// the single shared entry point for both families.
 ///
-/// This composes [`influence_block_design`] and [`residualize_influence_columns`]
-/// so neither family inlines the two-step composition: BMS (widened marginal
-/// design) and survival (dedicated η₁ channel) both obtain their absorbed
-/// columns from this single entry point. Arguments are the union of the two
-/// steps; see those functions for the per-argument contract.
+/// Performs the entire sequence, so neither BMS (widened marginal design) nor
+/// survival (dedicated η₁ channel) inlines any of it and both get byte-identical
+/// numerics:
+///
+///  1. build the realized leakage directions `Z_infl = diag(s_f·β̂₀)·J`
+///     ([`influence_block_design`]),
+///  2. derive the projection ridge from the weighted marginal Gram's own
+///     magnitude — `eps = max(diag(MᵀWM))·INFLUENCE_PROJECTION_RELATIVE_RIDGE`
+///     floored at `INFLUENCE_PROJECTION_RIDGE_FLOOR` — so it scales with the
+///     design rather than being a fixed absolute the caller must guess,
+///  3. residualize against the marginal/primary span in the rigid-pilot
+///     `W`-metric ([`residualize_influence_columns`]):
+///     `Z̃ = Z_infl − M·(MᵀWM + εI)⁻¹·MᵀW·Z_infl`.
+///
+/// Returns `Err` if the residualized columns are not all finite (e.g. a
+/// non-finite pilot logslope or row metric propagated through). The two families
+/// differ ONLY in how they install the returned `Z̃` (BMS widens `[M | Z̃]`;
+/// survival adds a dedicated additive η₁ channel), never in this math.
 pub(crate) fn residualized_influence_block(
     jac: &ScoreInfluenceJacobian,
     pilot_beta0: &Array1<f64>,
     s_f: f64,
     marginal_design: ArrayView2<f64>,
     w_metric: &Array1<f64>,
-    eps: f64,
-) -> Array2<f64> {
+) -> Result<Array2<f64>, String> {
     let z_infl = influence_block_design(jac, pilot_beta0, s_f);
-    residualize_influence_columns(&z_infl, marginal_design, w_metric, eps)
+
+    // Ridge scaled to the weighted marginal Gram's own magnitude. Only the
+    // diagonal is needed to size it, so reuse the same MᵀWM the residualizer
+    // forms internally (the cost is one extra weighted Gram; kept here so the
+    // ε logic lives with the projection it regularizes).
+    let p_m = marginal_design.ncols();
+    let gram = fast_xt_diag_x(&marginal_design, w_metric);
+    let gram_scale = (0..p_m).map(|i| gram[[i, i]]).fold(0.0_f64, f64::max);
+    let eps = (gram_scale * INFLUENCE_PROJECTION_RELATIVE_RIDGE).max(INFLUENCE_PROJECTION_RIDGE_FLOOR);
+
+    let residualized = residualize_influence_columns(&z_infl, marginal_design, w_metric, eps);
+    if residualized.iter().any(|v| !v.is_finite()) {
+        return Err(
+            "residualized_influence_block: residualized influence columns contain non-finite entries"
+                .to_string(),
+        );
+    }
+    Ok(residualized)
 }
