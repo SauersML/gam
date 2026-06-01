@@ -56,10 +56,7 @@ use gam::{
 use ndarray::Array2;
 use std::path::Path;
 
-const QUAKES_CSV: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/bench/datasets/quakes.csv"
-);
+const QUAKES_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/quakes.csv");
 
 /// Number of rows loaded from the quakes panel, then split train/test.
 const N: usize = 500;

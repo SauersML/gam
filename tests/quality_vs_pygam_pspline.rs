@@ -290,7 +290,9 @@ fn gam_pspline_held_out_accuracy_beats_pygam_on_lidar_on_real_data() {
     // reconstruct the identical split inside Python (see the first arm). numpy
     // boolean indexing preserves row order, so the predicted gap rows come back
     // in the same ascending-`range` order as gam's `te_range`.
-    let is_test: Vec<f64> = (0..n).map(|i| if i >= lo && i < hi { 1.0 } else { 0.0 }).collect();
+    let is_test: Vec<f64> = (0..n)
+        .map(|i| if i >= lo && i < hi { 1.0 } else { 0.0 })
+        .collect();
     let py = run_python(
         &[
             Column::new("range", &range),

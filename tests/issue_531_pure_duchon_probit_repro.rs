@@ -103,7 +103,9 @@ fn matern_pc3(name: &str) -> SmoothTermSpec {
     }
 }
 
-fn build_problem(nuisance: impl Fn(&str) -> SmoothTermSpec) -> (Array2<f64>, BernoulliMarginalSlopeTermSpec) {
+fn build_problem(
+    nuisance: impl Fn(&str) -> SmoothTermSpec,
+) -> (Array2<f64>, BernoulliMarginalSlopeTermSpec) {
     let mut rng = StdRng::seed_from_u64(SEED);
     let normal = Normal::new(0.0, 1.0).unwrap();
     // columns: 0=sex, 1..4=PC1..PC3

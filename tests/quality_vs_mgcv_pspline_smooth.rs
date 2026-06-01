@@ -151,7 +151,9 @@ fn gam_pspline_generalizes_on_lidar() {
     // internally: train where is_test==0, predict where is_test==1. This keeps
     // the train/test partition bit-identical to gam's while satisfying the
     // equal-length-columns contract.
-    let is_test: Vec<f64> = (0..n).map(|i| if test_mask[i] { 1.0 } else { 0.0 }).collect();
+    let is_test: Vec<f64> = (0..n)
+        .map(|i| if test_mask[i] { 1.0 } else { 0.0 })
+        .collect();
     let r = run_r(
         &[
             Column::new("range", &range),
@@ -325,7 +327,9 @@ fn gam_pspline_generalizes_on_lidar_on_real_data() {
     // ---- fit the SAME model with mgcv on the SAME train rows --------------
     // Equal-length-columns contract: pass the FULL dataset plus an `is_test`
     // mask and reconstruct the identical split inside R (see the first arm).
-    let is_test: Vec<f64> = (0..n).map(|i| if test_mask[i] { 1.0 } else { 0.0 }).collect();
+    let is_test: Vec<f64> = (0..n)
+        .map(|i| if test_mask[i] { 1.0 } else { 0.0 })
+        .collect();
     let r = run_r(
         &[
             Column::new("range", &range),

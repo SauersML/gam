@@ -28305,8 +28305,11 @@ fn periodic_bspline_derivative_dense(
         0 => periodic_bspline_basis_dense_via_spec(t, domain, degree, num_basis),
         1 => {
             let coords = column_array(t);
-            let jet = periodic_bspline_first_derivative_nd(coords.view(), domain, degree, num_basis)
-                .map_err(|err| format!("failed to evaluate periodic B-spline derivative: {err}"))?;
+            let jet =
+                periodic_bspline_first_derivative_nd(coords.view(), domain, degree, num_basis)
+                    .map_err(|err| {
+                        format!("failed to evaluate periodic B-spline derivative: {err}")
+                    })?;
             Ok(jet.index_axis_move(Axis(2), 0))
         }
         _ => Err(format!(
