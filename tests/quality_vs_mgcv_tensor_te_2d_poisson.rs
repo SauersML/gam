@@ -284,7 +284,11 @@ fn gam_tensor_te_2d_poisson_matches_mgcv_on_real_data() {
         ],
         r#"
         suppressPackageStartupMessages(library(mgcv))
-        m <- gam(numvisit ~ te(age, badh, k = 5), data = df,
+        # badh is binary {0,1}, so its cubic-regression margin can hold at most
+        # k=2 knots; age is continuous (41 distinct values) and takes k=5. Per-
+        # margin k avoids mgcv's place.knots failing on the 2-value badh margin
+        # while keeping the same effective basis gam builds (tiny basis on badh).
+        m <- gam(numvisit ~ te(age, badh, k = c(5, 2)), data = df,
                  family = poisson(link = "log"), method = "REML")
         k <- df$test_n[1]
         newd <- data.frame(age = df$test_age[1:k], badh = df$test_badh[1:k])
