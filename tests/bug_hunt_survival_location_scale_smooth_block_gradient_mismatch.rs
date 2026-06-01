@@ -1,28 +1,19 @@
-//! Regression for the specific error in #512: when no `noise_formula` is
-//! supplied, `materialize_survival` used to fall through to
-//! `log_sigmaspec = termspec.clone()` for the survival location-scale mode,
-//! duplicating every threshold term onto the log-σ block. For a smooth
-//! `s(x)` on the mean that was structurally fatal — the canonical-gauge
-//! identifiability audit attributed/dropped every log-σ column (per the
-//! descending priorities time=200 > threshold=150 > log_sigma=120, #366),
-//! leaving the solver's `ParameterBlockSpec` design at width 0 while the
-//! family kept the un-audited `x_log_sigma` at the smooth's width.
-//! `SurvivalLocationScaleFamily::exact_newton_joint_gradient_evaluation`
-//! then errored "joint gradient length mismatch for block 2: got <smooth
-//! width>, expected 0" on every REML startup seed and refused the fit.
+//! Regression for #512: default survival location-scale fits used to route
+//! `Surv(entry, exit, event) ~ s(x)`'s smooth columns into the log-σ block when
+//! no `noise_formula` was supplied. The solver's canonical-gauge audit then
+//! reduced that duplicated scale block to width zero, while
+//! `SurvivalLocationScaleFamily` still emitted a width-`s(x)` scale gradient.
+//! REML startup aborted with
+//! "SurvivalLocationScaleFamily joint gradient length mismatch for block 2".
 //!
-//! The fix routes the no-`noise_formula` default through the same empty
-//! `TermCollectionSpec` every other survival mode uses, so the
-//! `infer_non_intercept_start_design`/`design_column_tail` contract yields a
-//! zero-column `x_log_sigma` that matches the spec by construction. This
-//! test pins the regression: `Surv(entry, exit, event) ~ s(x)` with the
-//! default location-scale likelihood must NOT produce the
-//! "joint gradient length mismatch" error. (A second, unrelated
-//! inner-Newton convergence defect that surfaces after this fix on the
-//! same input is tracked separately; this test scopes to #512.)
+//! The same deterministic right-censored data and smooth formula already fit
+//! through the transformation and Weibull survival modes, so this pins the
+//! default location-scale wiring against the same ordinary penalized-smooth
+//! workload: all three modes must fit and return finite, non-degenerate
+//! coefficients.
 
 use csv::StringRecord;
-use gam::{FitConfig, encode_recordswith_inferred_schema, fit_from_formula};
+use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula};
 
 fn build_dataset(n: usize) -> gam::inference::data::EncodedDataset {
     let headers = ["entry", "exit", "event", "x"]
@@ -55,28 +46,76 @@ fn build_dataset(n: usize) -> gam::inference::data::EncodedDataset {
     encode_recordswith_inferred_schema(headers, rows).expect("encode dataset")
 }
 
-#[test]
-fn surv_smooth_location_scale_default_does_not_trip_log_sigma_block_gradient_mismatch() {
+fn assert_finite_non_degenerate_coefficients(label: &str, fit: &FitResult) {
+    let blocks = match fit {
+        FitResult::SurvivalLocationScale(result) => &result.fit.fit.blocks,
+        FitResult::SurvivalTransformation(result) => &result.fit.blocks,
+        other => panic!(
+            "{label}: unexpected fit result variant: {}",
+            fit_result_kind(other)
+        ),
+    };
+
+    let coefficient_count = blocks.iter().map(|block| block.beta.len()).sum::<usize>();
+    assert!(
+        coefficient_count > 0,
+        "{label}: fit returned no coefficients"
+    );
+
+    let finite_count = blocks
+        .iter()
+        .flat_map(|block| block.beta.iter())
+        .filter(|value| value.is_finite())
+        .count();
+    assert_eq!(
+        finite_count, coefficient_count,
+        "{label}: fit returned non-finite coefficients"
+    );
+
+    let max_abs = blocks
+        .iter()
+        .flat_map(|block| block.beta.iter())
+        .map(|value| value.abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        max_abs > 1e-10,
+        "{label}: fit returned degenerate all-zero coefficients"
+    );
+}
+
+fn fit_result_kind(fit: &FitResult) -> &'static str {
+    match fit {
+        FitResult::Standard(_) => "Standard",
+        FitResult::GaussianLocationScale(_) => "GaussianLocationScale",
+        FitResult::BinomialLocationScale(_) => "BinomialLocationScale",
+        FitResult::SurvivalLocationScale(_) => "SurvivalLocationScale",
+        FitResult::SurvivalTransformation(_) => "SurvivalTransformation",
+        FitResult::BernoulliMarginalSlope(_) => "BernoulliMarginalSlope",
+        FitResult::SurvivalMarginalSlope(_) => "SurvivalMarginalSlope",
+        FitResult::LatentSurvival(_) => "LatentSurvival",
+        FitResult::LatentBinary(_) => "LatentBinary",
+        FitResult::TransformationNormal(_) => "TransformationNormal",
+    }
+}
+
+fn fit_survival_smooth(label: &str, survival_likelihood: &str) -> FitResult {
     let data = build_dataset(600);
     let config = FitConfig {
-        survival_likelihood: "location-scale".to_string(),
-        // Crucially, leave `noise_formula = None` — this is the documented
-        // default mode the issue tracks (`gamfit.fit(df, "Surv(...) ~
-        // s(x)")`). The pre-fix code path defaulted to
-        // `log_sigmaspec = termspec.clone()` here, which produced the
-        // structural mismatch the regression test below pins against.
+        survival_likelihood: survival_likelihood.to_string(),
         ..FitConfig::default()
     };
-    let outcome = fit_from_formula("Surv(entry, exit, event) ~ s(x, k=10)", &data, &config);
-    if let Err(err) = outcome {
-        let message = err.to_string();
-        assert!(
-            !message.contains("joint gradient length mismatch"),
-            "the #512 regression surfaced: {message}"
-        );
-        assert!(
-            !message.contains("SurvivalLocationScaleFamily joint gradient"),
-            "the #512 regression surfaced (legacy phrasing): {message}"
-        );
+    fit_from_formula("Surv(entry, exit, event) ~ s(x, k=10)", &data, &config)
+        .unwrap_or_else(|err| panic!("{label}: fit failed: {err}"))
+}
+
+#[test]
+fn surv_smooth_fits_in_transformation_weibull_and_default_location_scale_modes() {
+    for (label, survival_likelihood) in [
+        ("transformation reference", "transformation"),
+        ("weibull reference", "weibull"),
+        ("default location-scale", "location-scale"),
+    ] {
+        let fit = fit_survival_smooth(label, survival_likelihood);
+        assert_finite_non_degenerate_coefficients(label, &fit);
     }
 }
