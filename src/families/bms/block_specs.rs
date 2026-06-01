@@ -1115,6 +1115,23 @@ pub fn fit_bernoulli_marginal_slope_terms(
                        logslope_design: &TermCollectionDesign,
                        sigma: Option<f64>|
      -> BernoulliMarginalSlopeFamily {
+        // The kernel reads the marginal index from a matched (self.marginal_
+        // design, β_m) pair. When the Stage-1 influence absorber is active the
+        // marginal β is widened to [β_m; γ], so the family's marginal design
+        // MUST be the widened [M | Z̃] for every per-row projection to slice
+        // correctly (#461). With no absorber it is the raw design unchanged.
+        let kernel_marginal_design = match influence_columns.as_ref() {
+            Some(z_infl) => {
+                let raw = marginal_design
+                    .design
+                    .try_to_dense_arc("make_family::widened-marginal")
+                    .expect("dense marginal design for influence widening");
+                let widened = widen_marginal_dense_with_influence(&raw, Some(z_infl))
+                    .expect("widen marginal design with influence columns");
+                DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from((*widened).clone()))
+            }
+            None => marginal_design.design.clone(),
+        };
         BernoulliMarginalSlopeFamily {
             y: Arc::clone(&y),
             weights: Arc::clone(&weights),
@@ -1122,7 +1139,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             latent_measure: latent_measure.clone(),
             gaussian_frailty_sd: sigma,
             base_link: spec.base_link.clone(),
-            marginal_design: marginal_design.design.clone(),
+            marginal_design: kernel_marginal_design,
             logslope_design: logslope_design.design.clone(),
             score_warp: score_warp_runtime.clone(),
             link_dev: link_dev_runtime.clone(),
@@ -1423,6 +1440,18 @@ pub fn fit_bernoulli_marginal_slope_terms(
         LatentMeasureCalibration::None => None,
         LatentMeasureCalibration::RankInverseNormal(cal) => Some(cal),
     };
+    // #461: PREDICT SEAM — when the Stage-1 influence absorber is active
+    // (spec.score_influence_jacobian.is_some()), `fit.block_states[0].beta` is
+    // the WIDENED marginal coefficient `[β_m; γ]` (length p_m + p₁), but
+    // `marginal_design` below is the RAW term-collection design (p_m columns):
+    // the absorbed influence columns Z̃_infl are a TRAINING-only leakage
+    // absorber and do NOT exist at predict rows (no Stage-1 fold there). The
+    // orthogonalized β̂_m is a property of the training fit, so prediction must
+    // use ONLY the first p_m entries of block_states[0].beta against this raw
+    // marginal_design and DROP the trailing γ. The model-payload / predict
+    // builder (src/main.rs run_fit_bernoulli_marginal_slope → inference) owns
+    // that truncation; it must record p_m (= marginal_design.design.ncols())
+    // and slice the persisted marginal β to it. Survival mirrors this seam.
     Ok(BernoulliMarginalSlopeFitResult {
         fit: solved.fit,
         marginalspec_resolved: resolved_specs.remove(0),
