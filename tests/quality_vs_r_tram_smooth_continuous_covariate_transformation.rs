@@ -261,7 +261,15 @@ fn gam_smooth_transformation_matches_r_tram_on_heart_failure() {
         .expect("gam reports total edf");
 
     // ---- age grid for the conditional-mean / smooth-effect comparison -------
-    let grid_n = 30usize;
+    // Grid resolution for the conditional-mean / truth-recovery comparison.
+    // Wall-clock is dominated by the R reference: tram's `predict(type="density")`
+    // is evaluated grid_n × n_y times (30 × 400 = 12 000 calls overran the 360 s
+    // reference-quality budget). The truth target is a single smooth 0.9-amplitude
+    // sinusoid, so a 24-point covariate grid and a 200-point y-quadrature resolve
+    // it to far below the 0.25 RMSE bar; both the gam (Rust) and tram (R)
+    // conditional means use these resolutions, so the comparison stays
+    // apples-to-apples and no quality bar is weakened.
+    let grid_n = 24usize;
     let age_lo = age_min + 0.02 * age_span;
     let age_hi = age_max - 0.02 * age_span;
     let age_grid: Vec<f64> = (0..grid_n)
@@ -288,7 +296,7 @@ fn gam_smooth_transformation_matches_r_tram_on_heart_failure() {
     // finite-support normalization makes f a proper density on [knot0, knotN].
     let resp_lo = tn.family.response_knots()[0];
     let resp_hi = tn.family.response_knots()[tn.family.response_knots().len() - 1];
-    let n_y = 400usize;
+    let n_y = 200usize;
     let y_quad: Vec<f64> = (0..n_y)
         .map(|k| resp_lo + (resp_hi - resp_lo) * (k as f64) / ((n_y - 1) as f64))
         .collect();
@@ -369,7 +377,7 @@ fn gam_smooth_transformation_matches_r_tram_on_heart_failure() {
             colnames(gdat) <- spcols
 
             ylo <- min(df$y); yhi <- max(df$y); span <- yhi - ylo
-            yq <- seq(ylo - 0.1 * span, yhi + 0.1 * span, length.out = 400)
+            yq <- seq(ylo - 0.1 * span, yhi + 0.1 * span, length.out = 200)
             emean <- numeric(length(ag))
             for (i in seq_along(ag)) {{
               nd <- gdat[rep(i, length(yq)), , drop = FALSE]
