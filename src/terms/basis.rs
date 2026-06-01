@@ -1949,7 +1949,19 @@ pub const fn default_spatial_center_strategy(num_centers: usize, d: usize) -> Ce
 }
 
 pub fn auto_spatial_center_strategy(num_centers: usize, d: usize) -> CenterStrategy {
-    CenterStrategy::Auto(Box::new(default_spatial_center_strategy(num_centers, d)))
+    let strategy = if d == 1 {
+        // In one dimension, farthest-point selection is the deterministic
+        // maximin grid over the observed domain. Equal-mass midpoints leave the
+        // low-frequency Duchon radial block slightly under-resolved at the
+        // boundaries, and REML then compensates with an over-smooth λ on
+        // low-noise signals (#504). The maximin grid matches the native
+        // reproducing-kernel interpolation geometry while keeping the existing
+        // equal-mass defaults for genuinely multivariate smooths.
+        CenterStrategy::FarthestPoint { num_centers }
+    } else {
+        default_spatial_center_strategy(num_centers, d)
+    };
+    CenterStrategy::Auto(Box::new(strategy))
 }
 
 pub const fn center_strategy_is_auto(strategy: &CenterStrategy) -> bool {

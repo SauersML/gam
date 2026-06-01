@@ -8,9 +8,10 @@
 //!   * mgcv `bs="ds", m=c(2,0)` — the mature Duchon (`r²·log r`) baseline
 //!
 //! This is a COMPARISON bench: it prints a table (run with `--nocapture`) and
-//! asserts only that every gam fit genuinely recovers the signal (beats the
-//! trivial mean predictor). Which kernel wins on a given truth is reported, not
-//! asserted — that's the data we want to read off.
+//! asserts that every gam fit genuinely recovers the signal (beats the trivial
+//! mean predictor). The low-noise 1D easy case is also an explicit regression
+//! gate for issue #504: gam must match mgcv's truth-recovery sharpness instead
+//! of selecting an over-smooth REML solution.
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
@@ -48,7 +49,14 @@ fn rms(v: &[f64]) -> f64 {
 /// "recovering, not blown up / collapsed" floor. The per-variant asserts here
 /// are the substance of each bench `#[test]`: the tests delegate their checks
 /// to this helper rather than duplicating the floor logic at every call site.
-fn report_and_check(label: &str, rmse_r3: f64, rmse_r2logr: f64, rmse_mgcv: f64, rms_truth: f64) {
+fn report_and_check(
+    label: &str,
+    rmse_r3: f64,
+    rmse_r2logr: f64,
+    rmse_mgcv: f64,
+    rms_truth: f64,
+    mgcv_match_factor: Option<f64>,
+) {
     let winner = if rmse_r3 <= rmse_r2logr && rmse_r3 <= rmse_mgcv {
         "gam r³"
     } else if rmse_r2logr <= rmse_r3 && rmse_r2logr <= rmse_mgcv {
@@ -69,6 +77,17 @@ fn report_and_check(label: &str, rmse_r3: f64, rmse_r2logr: f64, rmse_mgcv: f64,
         rmse_r2logr < floor,
         "{label}: gam r²·log r did not recover (rmse {rmse_r2logr:.4} ≥ {floor:.4})"
     );
+    if let Some(factor) = mgcv_match_factor {
+        let limit = factor * rmse_mgcv;
+        assert!(
+            rmse_r3 <= limit,
+            "{label}: gam r³ should match-or-beat mgcv sharpness (rmse {rmse_r3:.4} > {limit:.4}; mgcv {rmse_mgcv:.4})"
+        );
+        assert!(
+            rmse_r2logr <= limit,
+            "{label}: gam r²·log r should match-or-beat mgcv sharpness (rmse {rmse_r2logr:.4} > {limit:.4}; mgcv {rmse_mgcv:.4})"
+        );
+    }
 }
 
 #[test]
@@ -138,12 +157,22 @@ fn bench_duchon_kernel_accuracy_1d() {
         );
         let mgcv = r.vector("fitted");
 
+        let mgcv_match_factor = if label == "sin 4-cycle σ.05 k20" {
+            // Issue #504: the easy, low-noise case used to over-smooth at
+            // ≈0.034 RMSE while mgcv was ≈0.014. The new center geometry must
+            // keep gam on mgcv's truth-recovery scale without weakening the
+            // hard-case recovery checks below.
+            Some(1.10)
+        } else {
+            None
+        };
         report_and_check(
             label,
             rmse(&r3, &y_truth),
             rmse(&r2logr, &y_truth),
             rmse(mgcv, &y_truth),
             rms(&y_truth),
+            mgcv_match_factor,
         );
     }
 }
@@ -240,6 +269,7 @@ fn bench_duchon_kernel_accuracy_2d() {
             rmse(&r2logr, &y_truth),
             rmse(mgcv, &y_truth),
             rms(&y_truth),
+            None,
         );
     }
 }
