@@ -5236,7 +5236,13 @@ where
 /// Prediction with coefficient uncertainty propagation.
 ///
 /// The linear predictor variance uses:
-/// Var(η_i) = x_i^T Var(β) x_i
+/// Var(η_i) = x_i^T Var(β) x_i. With the default
+/// [`InferenceCovarianceMode::ConditionalPlusSmoothingPreferred`], `Var(β)` is
+/// the smoothing-parameter-marginalized `Vp` when the fit exposes it, i.e. the
+/// Kass--Steffey / Wood--Pya--Säfken first-order correction
+/// `Vb + (∂β/∂ρ) V_ρ (∂β/∂ρ)^T`. Therefore the analytic SE path reports
+/// `x_i^T Vb x_i + (∂f_i/∂ρ) V_ρ (∂f_i/∂ρ)^T` without recomputing or
+/// duplicating the IFT algebra at prediction time.
 ///
 /// Mean-scale SEs are delta-method approximations:
 /// Var(μ_i) ≈ (dμ/dη)^2 Var(η_i)

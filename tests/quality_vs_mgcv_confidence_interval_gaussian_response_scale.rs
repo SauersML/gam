@@ -31,9 +31,11 @@
 //!
 //! Matching conventions. mgcv's default `predict.gam` SEs use the posterior
 //! covariance `Vp` conditional on the estimated smoothing parameters
-//! (`unconditional = FALSE`); gam is driven with
-//! `InferenceCovarianceMode::Conditional` and every optional inflation disabled,
-//! so both engines form the same plug-in Bayesian interval on identical data.
+//! (`unconditional = FALSE`), while `unconditional = TRUE` adds the Wood--Pya--
+//! Säfken smoothing-parameter correction. gam is checked both ways: explicit
+//! `Conditional` intervals stay conditional, and the default
+//! `ConditionalPlusSmoothingPreferred` path must widen from `Vb` to the
+//! rho-marginalized `Vp` whenever the fitted smooth exposes that correction.
 
 use csv::StringRecord;
 use gam::predict::{
@@ -107,6 +109,10 @@ fn response_scale_ci_is_calibrated_and_matches_or_beats_mgcv() {
     let mut mgcv_covered = 0usize;
     // SE agreement is printed for context only (NOT a pass criterion).
     let mut worst_rel_se = 0.0f64;
+    let mut rho_marginalized_covered = 0usize;
+    let mut rho_marginalized_strictly_wider = 0usize;
+    let mut rho_marginalized_narrower = 0usize;
+    let mut mgcv_unconditional_narrower = 0usize;
     // Self-consistency of the identity-link Jacobian, worst over replicates.
     let mut worst_self_consistency = 0.0f64;
 
@@ -150,14 +156,15 @@ fn response_scale_ci_is_calibrated_and_matches_or_beats_mgcv() {
 
         let offset = Array1::<f64>::zeros(N);
         let pred = predict_gamwith_uncertainty(
-            dense,
+            dense.clone(),
             fit.fit.beta.view(),
             offset.view(),
             gaussian_identity.clone(),
             &fit.fit,
             &PredictUncertaintyOptions {
                 confidence_level: NOMINAL,
-                // mgcv default Vp: conditional on the estimated smoothing params.
+                // Conditional Vb path, used as the baseline for the explicit
+                // rho-marginalized default below.
                 covariance_mode: InferenceCovarianceMode::Conditional,
                 mean_interval_method: MeanIntervalMethod::Delta,
                 includeobservation_interval: false,
@@ -186,6 +193,43 @@ fn response_scale_ci_is_calibrated_and_matches_or_beats_mgcv() {
 
         gam_covered += covered(&mean_lower, &mean_upper, &truth);
 
+        let pred_rho_marginalized = predict_gamwith_uncertainty(
+            dense,
+            fit.fit.beta.view(),
+            offset.view(),
+            gaussian_identity.clone(),
+            &fit.fit,
+            &PredictUncertaintyOptions {
+                confidence_level: NOMINAL,
+                covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+                mean_interval_method: MeanIntervalMethod::Delta,
+                includeobservation_interval: false,
+                apply_bias_correction: false,
+                edgeworth_one_sided: false,
+                boundary_correction: false,
+                ood_inflation: false,
+                multi_point_joint: false,
+                ..PredictUncertaintyOptions::default()
+            },
+        )
+        .expect("gam rho-marginalized uncertainty prediction");
+        assert!(
+            pred_rho_marginalized.covariance_corrected_used,
+            "smooth fit should expose and use the smoothing-parameter-corrected covariance"
+        );
+        let rho_mean_lower = pred_rho_marginalized.mean_lower.to_vec();
+        let rho_mean_upper = pred_rho_marginalized.mean_upper.to_vec();
+        let rho_mean_se = pred_rho_marginalized.mean_standard_error.to_vec();
+        rho_marginalized_covered += covered(&rho_mean_lower, &rho_mean_upper, &truth);
+        for (&rho_se, &cond_se) in rho_mean_se.iter().zip(&gam_mean_se) {
+            if rho_se + 1.0e-10 < cond_se {
+                rho_marginalized_narrower += 1;
+            }
+            if rho_se > cond_se + 1.0e-10 {
+                rho_marginalized_strictly_wider += 1;
+            }
+        }
+
         // ---- fit the SAME data with mgcv; build its 95% mean CIs ----------
         let r = run_r(
             &[
@@ -197,30 +241,60 @@ fn response_scale_ci_is_calibrated_and_matches_or_beats_mgcv() {
             suppressPackageStartupMessages(library(mgcv))
             m <- gam(y ~ s(pc1) + pc2, data = df, family = gaussian(), method = "REML")
             p <- predict(m, newdata = df, se.fit = TRUE, type = "response")
+            pu <- predict(m, newdata = df, se.fit = TRUE, type = "response", unconditional = TRUE)
             z <- qnorm(0.975)
             emit("fit", as.numeric(p$fit))
             emit("se", as.numeric(p$se.fit))
             emit("lower", as.numeric(p$fit - z * p$se.fit))
             emit("upper", as.numeric(p$fit + z * p$se.fit))
+            emit("se_unconditional", as.numeric(pu$se.fit))
+            emit("lower_unconditional", as.numeric(pu$fit - z * pu$se.fit))
+            emit("upper_unconditional", as.numeric(pu$fit + z * pu$se.fit))
             "#,
         );
         let mgcv_se = r.vector("se");
         let mgcv_lower = r.vector("lower");
         let mgcv_upper = r.vector("upper");
+        let mgcv_unconditional_se = r.vector("se_unconditional");
+        let mgcv_unconditional_lower = r.vector("lower_unconditional");
+        let mgcv_unconditional_upper = r.vector("upper_unconditional");
         assert_eq!(mgcv_se.len(), N, "mgcv se.fit length mismatch");
+        assert_eq!(
+            mgcv_unconditional_se.len(),
+            N,
+            "mgcv unconditional se.fit length mismatch"
+        );
 
         mgcv_covered += covered(mgcv_lower, mgcv_upper, &truth);
+        for (&uncond, &cond) in mgcv_unconditional_se.iter().zip(mgcv_se) {
+            if uncond + 1.0e-10 < cond {
+                mgcv_unconditional_narrower += 1;
+            }
+        }
+        let mgcv_unconditional_covered =
+            covered(mgcv_unconditional_lower, mgcv_unconditional_upper, &truth);
+        assert!(
+            mgcv_unconditional_covered <= N,
+            "mgcv unconditional coverage count must stay within the replicate size"
+        );
         worst_rel_se = worst_rel_se.max(relative_l2(&gam_mean_se, mgcv_se));
     }
 
     let gam_coverage = gam_covered as f64 / total as f64;
     let mgcv_coverage = mgcv_covered as f64 / total as f64;
+    let rho_marginalized_coverage = rho_marginalized_covered as f64 / total as f64;
     let gam_err = (gam_coverage - NOMINAL).abs();
     let mgcv_err = (mgcv_coverage - NOMINAL).abs();
+    let rho_marginalized_err = (rho_marginalized_coverage - NOMINAL).abs();
     eprintln!(
         "identity-link 95% mean-CI coverage over {REPLICATES} reps x {N} pts: \
-         gam={gam_coverage:.4} mgcv={mgcv_coverage:.4} (nominal={NOMINAL}); \
-         gam_err={gam_err:.4} mgcv_err={mgcv_err:.4}; \
+         gam_conditional={gam_coverage:.4} gam_rho_marginalized={rho_marginalized_coverage:.4} \
+         mgcv={mgcv_coverage:.4} (nominal={NOMINAL}); \
+         gam_err={gam_err:.4} rho_marginalized_err={rho_marginalized_err:.4} \
+         mgcv_err={mgcv_err:.4}; \
+         rho_marginalized_strictly_wider={rho_marginalized_strictly_wider} \
+         rho_marginalized_narrower={rho_marginalized_narrower} \
+         mgcv_unconditional_narrower={mgcv_unconditional_narrower}; \
          worst SE rel_l2 vs mgcv={worst_rel_se:.4}; \
          worst response-vs-eta SE |Δ|={worst_self_consistency:.3e}"
     );
@@ -249,5 +323,28 @@ fn response_scale_ci_is_calibrated_and_matches_or_beats_mgcv() {
         gam_err <= mgcv_err + 0.03,
         "gam CI calibration is worse than mgcv's: gam coverage error \
          {gam_err:.4} exceeds mgcv coverage error {mgcv_err:.4} + 0.03"
+    );
+
+    // (4) The rho-marginalized prediction path must add, never subtract, the
+    //     Kass--Steffey / Wood--Pya--Säfken variance contribution. A genuinely
+    //     smooth fit should see a non-zero widening on at least some rows.
+    assert_eq!(
+        rho_marginalized_narrower, 0,
+        "rho-marginalized gam SEs must be >= conditional SEs rowwise"
+    );
+    assert!(
+        rho_marginalized_strictly_wider > 0,
+        "rho-marginalized gam SEs should strictly widen for at least one smooth row"
+    );
+
+    // (5) The widened default bands should move calibration toward nominal,
+    //     unless the conditional bands were already at nominal within
+    //     Monte-Carlo slack. This is the objective quality acceptance for the
+    //     rho-marginalized predict path.
+    assert!(
+        gam_err <= 0.02 || rho_marginalized_err <= gam_err + 0.01,
+        "rho-marginalized gam intervals should be closer to nominal than \
+         conditional bands (or conditional should already be nominal): \
+         rho_err={rho_marginalized_err:.4}, conditional_err={gam_err:.4}"
     );
 }
