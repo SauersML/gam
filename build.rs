@@ -1,5 +1,6 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 
@@ -40,6 +41,8 @@ fn main() {
     let needle: &str = concat!("TO", "DO");
     let mut todo_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
     scan_for_banned_marker(&manifest_dir, &manifest_dir, needle, &mut todo_offenders);
+    let mut todo_history_violations: Vec<(PathBuf, usize, String, String)> = Vec::new();
+    run_todo_marker_history_audit(&manifest_dir, needle, &mut todo_history_violations);
 
     // `#[allow(...)]` / `#![allow(...)]` / `#[expect(...)]` /
     // `#![expect(...)]` ban — any lint, anywhere. Every file-level allow
@@ -537,6 +540,22 @@ fn main() {
                 .iter()
                 .map(|(file, line, sig, reason)| {
                     (file.clone(), *line, Some(reason.clone()), sig.clone())
+                })
+                .collect(),
+        });
+    }
+
+    if !todo_history_violations.is_empty() {
+        sections.push(Section {
+            title: format!(
+                "{} comment/marker removed without corresponding code change \
+                 (history audit — todo_history.txt plus git HEAD)",
+                needle
+            ),
+            rows: todo_history_violations
+                .iter()
+                .map(|(file, line, reason, site)| {
+                    (file.clone(), *line, Some(reason.clone()), site.clone())
                 })
                 .collect(),
         });
@@ -2346,24 +2365,14 @@ fn scan_for_banned_marker(
     offenders: &mut Vec<(PathBuf, usize, String)>,
 ) {
     visit_files(root, dir, &mut |rel, content| {
+        if rel.to_string_lossy().replace('\\', "/") == "build.rs" {
+            return;
+        }
         if !content.contains(needle) {
             return;
         }
-        // For .rs files, strip multi-line string contents so error-message
-        // strings that mention the marker by name don't false-fire. Non-.rs
-        // files (toml, yaml, shell, etc.) fall through to the raw scan.
-        let use_strip = rel.extension().and_then(OsStr::to_str) == Some("rs");
-        let stripped_lines = if use_strip {
-            Some(strip_file_lines(content))
-        } else {
-            None
-        };
         for (idx, line) in content.lines().enumerate() {
-            let probe: &str = match &stripped_lines {
-                Some(v) => v.get(idx).map(String::as_str).unwrap_or(line),
-                None => line,
-            };
-            if probe.contains(needle) {
+            if line.contains(needle) {
                 offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
             }
         }
@@ -3353,6 +3362,42 @@ const HISTORY_BODY_REJECT_MACROS: &[&str] = &[
 /// should be deleted instead of leaving a stub.
 const HISTORY_MIN_SUBSTANTIVE_BODY_LINES: usize = 2;
 
+fn collect_git_history_marker_functions(
+    manifest_dir: &Path,
+) -> std::collections::BTreeMap<(String, String), Vec<String>> {
+    let mut out: std::collections::BTreeMap<(String, String), Vec<String>> =
+        std::collections::BTreeMap::new();
+    let git_contents = git_head_files_containing(manifest_dir, HISTORY_MARKERS);
+    for (rel_str, content) in git_contents {
+        if rel_str == "build.rs" || !rel_str.ends_with(".rs") {
+            continue;
+        }
+        let rel = Path::new(&rel_str);
+        let lines: Vec<&str> = content.lines().collect();
+        let mask = compute_test_mask(&content, rel);
+        for (idx, line) in lines.iter().enumerate() {
+            if mask.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
+            let stripped = strip_strings_and_comments(line);
+            for &marker in HISTORY_MARKERS {
+                if !stripped.contains(marker) {
+                    continue;
+                }
+                if let Some((sig, _)) = find_enclosing_fn(&lines, idx) {
+                    let kind = marker.trim_end_matches('(').to_string();
+                    let entry = out.entry((rel_str.clone(), sig)).or_default();
+                    if !entry.contains(&kind) {
+                        entry.push(kind);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 fn run_unimplemented_history_audit(
     manifest_dir: &Path,
     violations: &mut Vec<(PathBuf, usize, String, String)>,
@@ -3403,8 +3448,15 @@ fn run_unimplemented_history_audit(
         }
     });
 
-    // Step 2: load the previous ledger (empty on first run).
-    let previous = load_history_ledger(&ledger_path);
+    // Step 2: load the previous ledger (empty on first run) and augment it
+    // with marker-bearing functions from git HEAD. The on-disk ledger catches
+    // sites seen by prior local builds; git catches sites that existed in the
+    // committed tree even if the ledger was stale or a marker was deleted
+    // before build.rs had a chance to record it.
+    let mut previous = load_history_ledger(&ledger_path);
+    for (key, kinds) in collect_git_history_marker_functions(manifest_dir) {
+        previous.entry(key).or_insert(kinds);
+    }
 
     // Step 3: build the next ledger from the current scan. Legitimately-
     // removed entries are simply absent from the next ledger; flagged
@@ -3772,6 +3824,401 @@ fn collect_called_idents(stripped: &str, out: &mut Vec<String>) {
         }
         i += 1;
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared git-backed history helpers.
+
+fn git_head_files_containing(
+    manifest_dir: &Path,
+    needles: &[&str],
+) -> std::collections::BTreeMap<String, String> {
+    if needles.is_empty() {
+        return std::collections::BTreeMap::new();
+    }
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(manifest_dir)
+        .arg("grep")
+        .arg("-z")
+        .arg("-l");
+    for needle in needles {
+        cmd.arg("-e").arg(needle);
+    }
+    cmd.arg("HEAD").arg("--");
+
+    let output = match cmd.output() {
+        Ok(output) => output,
+        Err(_) => return std::collections::BTreeMap::new(),
+    };
+    if !output.status.success() {
+        return std::collections::BTreeMap::new();
+    }
+
+    let mut out = std::collections::BTreeMap::new();
+    for raw in output.stdout.split(|b| *b == 0) {
+        if raw.is_empty() {
+            continue;
+        }
+        let spec = match String::from_utf8(raw.to_vec()) {
+            Ok(spec) => spec,
+            Err(_) => continue,
+        };
+        let Some(rel) = spec.strip_prefix("HEAD:") else {
+            continue;
+        };
+        let rel_path = Path::new(rel);
+        if rel_path_is_skipped_for_scans(rel_path) || !rel_path_is_scannable(rel_path) {
+            continue;
+        }
+        if let Some(content) = git_show_head_file(manifest_dir, rel) {
+            out.insert(rel.to_string(), content);
+        }
+    }
+    out
+}
+
+fn git_show_head_file(manifest_dir: &Path, rel: &str) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(manifest_dir)
+        .arg("show")
+        .arg(format!("HEAD:{rel}"))
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+fn rel_path_is_skipped_for_scans(rel: &Path) -> bool {
+    if rel.starts_with("bench/runtime/pydeps") {
+        return true;
+    }
+    for component in rel.components() {
+        let name = component.as_os_str().to_string_lossy();
+        if name.starts_with('.')
+            || name == "target"
+            || name.starts_with("target-")
+            || name == "node_modules"
+            || name == "__pycache__"
+            || name == "pydeps"
+            || name == "site-packages"
+            || name == "venv"
+            || name == "dist"
+            || name == "build"
+            || name == "site"
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn rel_path_is_scannable(rel: &Path) -> bool {
+    let ext = rel.extension().and_then(OsStr::to_str).unwrap_or("");
+    let basename = rel.file_name().and_then(OsStr::to_str).unwrap_or("");
+    matches!(
+        ext,
+        "rs" | "py" | "toml" | "yml" | "yaml" | "sh" | "bash" | "json"
+    ) || basename == "build.rs"
+        || basename == "Makefile"
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Persistent TO-DO marker/comment removal audit.
+
+const TO_DO_HISTORY_LEDGER_FILENAME: &str = "todo_history.txt";
+const FN_ANCHOR_PREFIX: &str = "fn ";
+const FILE_ANCHOR: &str = "file";
+
+#[derive(Clone)]
+struct ToDoHistorySite {
+    file: String,
+    anchor: String,
+    site: String,
+    line_no: usize,
+}
+
+fn run_todo_marker_history_audit(
+    manifest_dir: &Path,
+    needle: &str,
+    violations: &mut Vec<(PathBuf, usize, String, String)>,
+) {
+    let ledger_path = manifest_dir.join(TO_DO_HISTORY_LEDGER_FILENAME);
+    println!("cargo:rerun-if-changed={}", ledger_path.display());
+
+    let current = collect_current_todo_history_sites(manifest_dir, needle);
+    let mut next_ledger: std::collections::BTreeMap<(String, String, String), ToDoHistorySite> =
+        std::collections::BTreeMap::new();
+    for site in current.values() {
+        next_ledger.insert(
+            (site.file.clone(), site.anchor.clone(), site.site.clone()),
+            site.clone(),
+        );
+    }
+
+    let git_contents = git_head_files_containing(manifest_dir, &[needle]);
+    let mut previous = load_todo_history_ledger(&ledger_path);
+    for (rel, content) in &git_contents {
+        let rel_path = Path::new(rel);
+        for site in collect_todo_history_sites_from_content(rel_path, content, needle).into_values()
+        {
+            previous
+                .entry((site.file.clone(), site.anchor.clone(), site.site.clone()))
+                .or_insert(site);
+        }
+    }
+
+    let mut current_contents: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    visit_files(manifest_dir, manifest_dir, &mut |rel, content| {
+        current_contents.insert(rel.to_string_lossy().replace('\\', "/"), content.to_string());
+    });
+
+    for (key, previous_site) in &previous {
+        if current.contains_key(key) {
+            continue;
+        }
+        let Some(current_content) = current_contents.get(&previous_site.file) else {
+            continue;
+        };
+        let git_content = git_contents.get(&previous_site.file).map(String::as_str);
+        if let Some((line_no, reason)) =
+            removed_todo_site_violation(current_content, git_content, previous_site)
+        {
+            violations.push((
+                PathBuf::from(&previous_site.file),
+                line_no,
+                reason,
+                previous_site.site.clone(),
+            ));
+            next_ledger.insert(key.clone(), previous_site.clone());
+        }
+    }
+
+    save_todo_history_ledger(&ledger_path, &next_ledger);
+}
+
+fn collect_current_todo_history_sites(
+    manifest_dir: &Path,
+    needle: &str,
+) -> std::collections::BTreeMap<(String, String, String), ToDoHistorySite> {
+    let mut out = std::collections::BTreeMap::new();
+    visit_files(manifest_dir, manifest_dir, &mut |rel, content| {
+        for site in collect_todo_history_sites_from_content(rel, content, needle).into_values() {
+            out.insert((site.file.clone(), site.anchor.clone(), site.site.clone()), site);
+        }
+    });
+    out
+}
+
+fn collect_todo_history_sites_from_content(
+    rel: &Path,
+    content: &str,
+    needle: &str,
+) -> std::collections::BTreeMap<(String, String, String), ToDoHistorySite> {
+    let mut out = std::collections::BTreeMap::new();
+    let rel_str = rel.to_string_lossy().replace('\\', "/");
+    if rel_str == "build.rs" {
+        return out;
+    }
+    if !content.contains(needle) {
+        return out;
+    }
+    let is_rust = rel.extension().and_then(OsStr::to_str) == Some("rs");
+    let lines: Vec<&str> = content.lines().collect();
+    for (idx, line) in lines.iter().enumerate() {
+        if !line.contains(needle) {
+            continue;
+        }
+        let anchor = if is_rust {
+            find_enclosing_fn(&lines, idx)
+                .map(|(sig, _)| format!("{FN_ANCHOR_PREFIX}{sig}"))
+                .unwrap_or_else(|| FILE_ANCHOR.to_string())
+        } else {
+            FILE_ANCHOR.to_string()
+        };
+        let site = normalize_history_site_line(line);
+        let entry = ToDoHistorySite {
+            file: rel_str.clone(),
+            anchor,
+            site,
+            line_no: idx + 1,
+        };
+        out.insert(
+            (entry.file.clone(), entry.anchor.clone(), entry.site.clone()),
+            entry,
+        );
+    }
+    out
+}
+
+fn normalize_history_site_line(line: &str) -> String {
+    line.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace('\t', " ")
+        .chars()
+        .take(240)
+        .collect()
+}
+
+fn removed_todo_site_violation(
+    current_content: &str,
+    git_content: Option<&str>,
+    previous_site: &ToDoHistorySite,
+) -> Option<(usize, String)> {
+    if let Some(sig) = previous_site.anchor.strip_prefix(FN_ANCHOR_PREFIX) {
+        if let Some(git_content) = git_content {
+            if normalized_fn_body_code_without_comments(current_content, sig)
+                == normalized_fn_body_code_without_comments(git_content, sig)
+            {
+                return Some((
+                    line_for_history_anchor(current_content, &previous_site.anchor),
+                    "marker removed but the enclosing function's code is unchanged from git HEAD"
+                        .to_string(),
+                ));
+            }
+        }
+        return match body_state_for_signature(current_content, sig) {
+            HistoryBodyState::FnAbsent | HistoryBodyState::Substantive => None,
+            HistoryBodyState::Trivial {
+                fn_open_line,
+                snippet,
+            } => Some((
+                fn_open_line + 1,
+                format!("marker removed but enclosing function is still trivial: {snippet}"),
+            )),
+        };
+    }
+
+    if let Some(git_content) = git_content
+        && normalized_file_code_without_comments(current_content)
+            == normalized_file_code_without_comments(git_content)
+    {
+        return Some((
+            previous_site.line_no,
+            "marker removed but file code is unchanged from git HEAD".to_string(),
+        ));
+    }
+    None
+}
+
+fn line_for_history_anchor(content: &str, anchor: &str) -> usize {
+    let Some(sig) = anchor.strip_prefix(FN_ANCHOR_PREFIX) else {
+        return 1;
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    let mut idx = 0usize;
+    while idx < lines.len() {
+        let stripped = strip_strings_and_comments(lines[idx]);
+        if line_has_keyword(&stripped, "fn")
+            && let Some((found_sig, (open, _close))) = find_fn_body_at(&lines, idx)
+            && found_sig == sig
+        {
+            return open + 1;
+        }
+        idx += 1;
+    }
+    1
+}
+
+fn normalized_fn_body_code_without_comments(content: &str, target_sig: &str) -> Option<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let stripped_lines = strip_file_lines(content);
+    let mut idx = 0usize;
+    while idx < lines.len() {
+        let stripped = stripped_lines
+            .get(idx)
+            .map(String::as_str)
+            .unwrap_or(lines[idx]);
+        if line_has_keyword(stripped, "fn")
+            && let Some((sig, (open, close))) = find_fn_body_at(&lines, idx)
+        {
+            if sig == target_sig {
+                let mut body = String::new();
+                for line in stripped_lines.iter().take(close + 1).skip(open) {
+                    body.push_str(line);
+                    body.push('\n');
+                }
+                return Some(normalize_code_text(&body));
+            }
+            idx = close + 1;
+            continue;
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn normalized_file_code_without_comments(content: &str) -> String {
+    normalize_code_text(&strip_file_lines(content).join("\n"))
+}
+
+fn normalize_code_text(content: &str) -> String {
+    content.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn load_todo_history_ledger(
+    path: &Path,
+) -> std::collections::BTreeMap<(String, String, String), ToDoHistorySite> {
+    let mut out = std::collections::BTreeMap::new();
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return out,
+    };
+    for line in content.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = trimmed.splitn(4, '\t').collect();
+        if parts.len() != 4 {
+            continue;
+        }
+        let line_no = parts[3].parse::<usize>().unwrap_or(1);
+        let site = ToDoHistorySite {
+            file: parts[0].to_string(),
+            anchor: parts[1].to_string(),
+            site: parts[2].to_string(),
+            line_no,
+        };
+        out.insert((site.file.clone(), site.anchor.clone(), site.site.clone()), site);
+    }
+    out
+}
+
+fn save_todo_history_ledger(
+    path: &Path,
+    ledger: &std::collections::BTreeMap<(String, String, String), ToDoHistorySite>,
+) {
+    let mut out = String::new();
+    out.push_str(
+        "# Persistent audit of TO-DO comment/marker sites.\n\
+         # Auto-managed by build.rs — do NOT hand-edit. Each non-comment\n\
+         # line is tab-separated:\n\
+         #   <relative_path>\\t<anchor>\\t<normalized_marker_line>\\t<line_no>\n\
+         # When an entry disappears from the source tree, build.rs inspects\n\
+         # the enclosing function or file and also compares against git HEAD.\n\
+         # Deleting the marker while leaving code unchanged keeps failing.\n",
+    );
+    for site in ledger.values() {
+        out.push_str(&site.file);
+        out.push('\t');
+        out.push_str(&site.anchor);
+        out.push('\t');
+        out.push_str(&site.site.replace('\t', " "));
+        out.push('\t');
+        out.push_str(&site.line_no.to_string());
+        out.push('\n');
+    }
+    match fs::read_to_string(path) {
+        Ok(existing) if existing == out => return,
+        _ => {}
+    }
+    let _ = fs::write(path, out);
 }
 
 /// True when the function body spanning `open..=close` (brace lines) reaches an

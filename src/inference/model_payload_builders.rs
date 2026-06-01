@@ -600,6 +600,11 @@ pub struct SurvivalMarginalSlopeInputs<'a> {
     pub baseline_logslope: f64,
     pub score_warp_runtime: Option<&'a DeviationRuntime>,
     pub link_dev_runtime: Option<&'a DeviationRuntime>,
+    /// Width `p₁` of the absorbed Stage-1 influence block (#461) when the fit
+    /// hosted a dedicated additive absorber. Predict drops the absorber's `γ`;
+    /// this is persisted only so the predictor accounts for the extra trailing
+    /// block in the saved block count.
+    pub influence_absorber_width: Option<usize>,
 }
 
 /// Assemble the canonical survival marginal-slope payload — single source of
@@ -658,6 +663,7 @@ pub fn assemble_survival_marginal_slope_payload(
     payload.link_deviation_runtime = inputs
         .link_dev_runtime
         .map(serialize_anchored_deviation_runtime);
+    payload.influence_absorber_width = inputs.influence_absorber_width;
     source.apply_to(&mut payload);
     payload
 }
