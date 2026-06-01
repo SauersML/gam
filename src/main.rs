@@ -1869,6 +1869,11 @@ fn run_fit_bernoulli_marginal_slope(
                 score_warp: routed_score_warp,
                 link_dev: routed_link_dev,
                 latent_z_policy: LatentZPolicy::default(),
+                // This CLI path fits the marginal-slope model directly from a raw
+                // `--z-column`; there is no in-process CTN Stage-1 chain to
+                // cross-fit, so the score-influence projection is inactive and
+                // the free-warp `score_warp` is the fallback basis (#461 §5).
+                score_influence_jacobian: None,
             },
             options,
             kappa_options: kappa_options.clone(),
@@ -4945,6 +4950,10 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             score_warp: routed_score_warp.clone(),
             link_dev: routed_link_dev.clone(),
             latent_z_policy: LatentZPolicy::default(),
+            // CLI survival marginal-slope fits directly from a raw `--z-column`
+            // with no in-process CTN Stage-1 chain to cross-fit, so the
+            // score-influence projection is inactive (#461 §5).
+            score_influence_jacobian: None,
         }
         };
         if baseline_cfg.target != SurvivalBaselineTarget::Linear {
