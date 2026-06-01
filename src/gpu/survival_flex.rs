@@ -5790,8 +5790,14 @@ mod survival_flex_gpu_tests {
     /// the absolute magnitude can be tiny relative to the inputs.
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "requires CUDA device (V100) — run in the GPU verification pass"]
     fn flex_primary_gpu_matches_cpu_oracle_v100() {
+        // GPU parity test: skip cleanly when no CUDA device is present (the
+        // codebase bans `#[ignore]`; the convention is a runtime early-return,
+        // so the V100 verification pass runs it on the box while CPU-only hosts
+        // pass trivially). Same gate as the pirls_gpu parity tests.
+        if crate::gpu::runtime::GpuRuntime::global().is_none() {
+            return;
+        }
         // Cover r=1 (scalar bank), r=4 (rigid-equivalent width), and a
         // wider r=7 so the r×r loop and the diagonal perturbation
         // branches all run on the device.
