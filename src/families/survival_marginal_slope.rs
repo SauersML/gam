@@ -6935,7 +6935,11 @@ impl SurvivalMarginalSlopeFamily {
         let z_obs = self.observed_score_projection(row);
         let u_obs = a + b * z_obs;
         let obs = self.observed_denested_cell_partials(row, a, b, beta_h, beta_w)?;
-        let eta = eval_coeff4_at(&obs.coeff, z_obs);
+        // Absorbed-influence offset: observed-η shift only (see
+        // `compute_survival_timepoint_exact`). `eta += o_infl`, and the trailing
+        // `infl` channel carries the direct partial `∂η₁/∂o_infl = 1` via
+        // `rho[infl]`; calibration-side `a_u`/`chi`/`chi_u`/`d_u` are untouched.
+        let eta = eval_coeff4_at(&obs.coeff, z_obs) + o_infl;
         let chi = eval_coeff4_at(&obs.dc_da, z_obs);
         let eta_aa = eval_coeff4_at(&obs.dc_daa, z_obs);
 
@@ -6944,6 +6948,9 @@ impl SurvivalMarginalSlopeFamily {
         let scale = self.probit_frailty_scale();
         rho[primary.g] = eval_coeff4_at(&obs.dc_db, z_obs);
         tau[primary.g] = eval_coeff4_at(&obs.dc_dab, z_obs);
+        if let Some(infl) = primary.infl {
+            rho[infl] = 1.0;
+        }
 
         if let Some(h_range) = primary.h.as_ref().filter(|_| self.score_warp.is_some()) {
             for local_idx in 0..h_range.len() {
@@ -7414,8 +7421,9 @@ impl SurvivalMarginalSlopeFamily {
         let g = block_states[2].eta[row];
         let beta_h = self.flex_score_beta(block_states)?;
         let beta_w = self.flex_link_beta(block_states)?;
+        let o_infl = self.influence_index_offset(row, block_states)?;
         self.compute_row_flex_primary_gradient_from_parts(
-            row, q_geom.q0, q_geom.q1, q_geom.qd1, g, beta_h, beta_w, primary,
+            row, q_geom.q0, q_geom.q1, q_geom.qd1, g, beta_h, beta_w, o_infl, primary,
         )
     }
 
@@ -7428,6 +7436,7 @@ impl SurvivalMarginalSlopeFamily {
         g: f64,
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
+        o_infl: f64,
         primary: &FlexPrimarySlices,
     ) -> Result<(f64, Array1<f64>), String> {
         if survival_derivative_guard_violated(qd1, self.derivative_guard) {
@@ -7455,10 +7464,10 @@ impl SurvivalMarginalSlopeFamily {
             Some((row, SurvivalInterceptSlotKind::Exit)),
         )?;
         let entry = self.compute_survival_timepoint_first_order_exact(
-            row, primary, q0, primary.q0, a0, g, d0, beta_h, beta_w,
+            row, primary, q0, primary.q0, a0, g, d0, beta_h, beta_w, o_infl,
         )?;
         let exit = self.compute_survival_timepoint_first_order_exact(
-            row, primary, q1, primary.q1, a1, g, d1, beta_h, beta_w,
+            row, primary, q1, primary.q1, a1, g, d1, beta_h, beta_w, o_infl,
         )?;
 
         if !exit.chi.is_finite() || exit.chi <= 0.0 {
@@ -11233,10 +11242,10 @@ impl SurvivalMarginalSlopeFamily {
         )?;
 
         let entry_base = self.compute_survival_timepoint_exact(
-            row, &primary, q0, primary.q0, a0, g, d0, beta_h, beta_w, false,
+            row, &primary, q0, primary.q0, a0, g, d0, beta_h, beta_w, o_infl, false,
         )?;
         let exit_base = self.compute_survival_timepoint_exact(
-            row, &primary, q1, primary.q1, a1, g, d1, beta_h, beta_w, true,
+            row, &primary, q1, primary.q1, a1, g, d1, beta_h, beta_w, o_infl, true,
         )?;
 
         if !exit_base.chi.is_finite() || exit_base.chi <= 0.0 {
@@ -27398,10 +27407,10 @@ mod tests {
         )?;
 
         let entry_base = family.compute_survival_timepoint_exact(
-            row, &primary, q0, primary.q0, a0, g, d0, beta_h, beta_w, false,
+            row, &primary, q0, primary.q0, a0, g, d0, beta_h, beta_w, 0.0, false,
         )?;
         let exit_base = family.compute_survival_timepoint_exact(
-            row, &primary, q1, primary.q1, a1, g, d1, beta_h, beta_w, true,
+            row, &primary, q1, primary.q1, a1, g, d1, beta_h, beta_w, 0.0, true,
         )?;
 
         let entry_ext1 = family.compute_survival_timepoint_directional_exact(
@@ -27646,10 +27655,10 @@ mod tests {
             let (a1, d1) = family
                 .solve_row_survival_intercept_with_slot(q_geom.q1, g, beta_h, beta_w, None)?;
             let entry_tp = family.compute_survival_timepoint_exact(
-                row, &primary, q_geom.q0, primary.q0, a0, g, d0, beta_h, beta_w, false,
+                row, &primary, q_geom.q0, primary.q0, a0, g, d0, beta_h, beta_w, 0.0, false,
             )?;
             let exit_tp = family.compute_survival_timepoint_exact(
-                row, &primary, q_geom.q1, primary.q1, a1, g, d1, beta_h, beta_w, false,
+                row, &primary, q_geom.q1, primary.q1, a1, g, d1, beta_h, beta_w, 0.0, false,
             )?;
 
             for u in 0..p {
@@ -27815,12 +27824,12 @@ mod tests {
                     .unwrap();
                 let entry = family_ref
                     .compute_survival_timepoint_exact(
-                        row, &primary, qg.q0, primary.q0, a0, g, d0, beta_h, beta_w, false,
+                        row, &primary, qg.q0, primary.q0, a0, g, d0, beta_h, beta_w, 0.0, false,
                     )
                     .unwrap();
                 let exit = family_ref
                     .compute_survival_timepoint_exact(
-                        row, &primary, qg.q1, primary.q1, a1, g, d1, beta_h, beta_w, false,
+                        row, &primary, qg.q1, primary.q1, a1, g, d1, beta_h, beta_w, 0.0, false,
                     )
                     .unwrap();
                 out[row] = entry.eta;
@@ -27890,12 +27899,12 @@ mod tests {
                     .unwrap();
                 let entry = family_ref
                     .compute_survival_timepoint_exact(
-                        row, &primary, qg.q0, primary.q0, a0, g, d0, beta_h, beta_w, false,
+                        row, &primary, qg.q0, primary.q0, a0, g, d0, beta_h, beta_w, 0.0, false,
                     )
                     .unwrap();
                 let exit = family_ref
                     .compute_survival_timepoint_exact(
-                        row, &primary, qg.q1, primary.q1, a1, g, d1, beta_h, beta_w, false,
+                        row, &primary, qg.q1, primary.q1, a1, g, d1, beta_h, beta_w, 0.0, false,
                     )
                     .unwrap();
                 out[row] = entry.eta;
