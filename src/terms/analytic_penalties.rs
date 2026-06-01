@@ -299,50 +299,36 @@ pub trait AnalyticPenalty: Send + Sync {
         }
     }
 
-    /// Hessian-vector product `H v = (∂²P/∂target²) v`. Default implementation
-    /// uses `hessian_diag` when available; otherwise penalties must override.
+    /// Hessian-vector product `H v = (∂²P/∂target²) v`, in closed form.
+    ///
+    /// The default covers every penalty whose Hessian is diagonal: it reads the
+    /// analytic [`Self::hessian_diag`] and forms `diag ⊙ v`. Penalties with a
+    /// dense (non-diagonal) Hessian — e.g. `IsometryPenalty`,
+    /// `SheafConsistencyPenalty`, the orthogonality / nuclear-norm family —
+    /// return `None` from `hessian_diag` and supply their own analytic `hvp`
+    /// override (Laplacian/Gram-vector products). There is no finite-difference
+    /// path: a penalty that reaches the default without a closed-form diagonal
+    /// is a programming error and panics rather than silently differencing its
+    /// own gradient (SPEC: finite differences are never used outside tests).
     fn hvp(
         &self,
         target: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        if let Some(diag) = self.hessian_diag(target, rho) {
-            assert_eq!(diag.len(), v.len(), "hvp dimension mismatch");
-            let mut out = Array1::<f64>::zeros(v.len());
-            for i in 0..v.len() {
-                out[i] = diag[i] * v[i];
-            }
-            return out;
-        }
-        // Principled generic default: central finite-difference of `grad_target`
-        // along direction `v`. The directional derivative of the gradient *is*
-        // the Hessian-vector product, so this is exact up to FD truncation /
-        // round-off and requires no closed-form Hessian. Cost is two extra
-        // `grad_target` evaluations per call — the price of a derivative-free,
-        // dense-Hessian-agnostic column extractor.
-        let n = v.len();
-        let mut v_inf: f64 = 0.0;
-        for i in 0..n {
-            let a = v[i].abs();
-            if a > v_inf {
-                v_inf = a;
-            }
-        }
-        if v_inf == 0.0 {
-            return Array1::<f64>::zeros(n);
-        }
-        let eps: f64 = 1e-7_f64.max(v_inf * 1e-7);
-        let mut t_plus = target.to_owned();
-        t_plus.scaled_add(eps, &v);
-        let mut t_minus = target.to_owned();
-        t_minus.scaled_add(-eps, &v);
-        let g_plus = self.grad_target(t_plus.view(), rho);
-        let g_minus = self.grad_target(t_minus.view(), rho);
-        let mut out = Array1::<f64>::zeros(n);
-        let inv_two_eps = 1.0 / (2.0 * eps);
-        for i in 0..n {
-            out[i] = (g_plus[i] - g_minus[i]) * inv_two_eps;
+        let diag = self.hessian_diag(target, rho).unwrap_or_else(|| {
+            panic!(
+                "AnalyticPenalty::hvp default reached for `{}`, whose Hessian is \
+                 not diagonal (hessian_diag returned None). Such a penalty must \
+                 override `hvp` with its closed-form Hessian-vector product; the \
+                 default never finite-differences.",
+                self.name()
+            )
+        });
+        assert_eq!(diag.len(), v.len(), "hvp dimension mismatch");
+        let mut out = Array1::<f64>::zeros(v.len());
+        for i in 0..v.len() {
+            out[i] = diag[i] * v[i];
         }
         out
     }
