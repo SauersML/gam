@@ -1845,7 +1845,14 @@ pub fn build_smooth_basis(
             } else {
                 None
             };
-            let operator_penalties = DuchonOperatorPenaltySpec::default();
+            // Magic default = native reproducing-norm roughness Gram only. The
+            // analytic magnitude (mass) penalty — a closed-form ridge that shrinks
+            // the smooth's amplitude toward zero — is opt-in via `magnitude=true`.
+            let operator_penalties = if option_bool(options, "magnitude").unwrap_or(false) {
+                DuchonOperatorPenaltySpec::magnitude_only()
+            } else {
+                DuchonOperatorPenaltySpec::default()
+            };
             Ok(SmoothBasisSpec::Duchon {
                 feature_cols: cols.to_vec(),
                 spec: DuchonBasisSpec {
