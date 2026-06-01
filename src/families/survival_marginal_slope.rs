@@ -205,6 +205,19 @@ pub struct SurvivalMarginalSlopeTermSpec {
     pub logslope_offset: Array1<f64>,
     pub score_warp: Option<DeviationBlockConfig>,
     pub link_dev: Option<DeviationBlockConfig>,
+    /// Out-of-fold Stage-1 score-influence Jacobian `J = ∂z/∂θ₁` (n × p₁) for a
+    /// CTN → marginal-slope chain (issue #461, §3 of
+    /// `marginal_slope_orthogonal_design.md`). When `Some`, the score-warp build
+    /// site installs the absorbed influence block
+    /// `Z_infl = diag(s_f · β̂₀(x_i)) · J` instead of the free-spline score-warp:
+    /// the realized x-dependent Stage-1 leakage directions in η-space are
+    /// appended as a null-penalized absorbed block (gauge priority 80,
+    /// orthogonalized against marginal ⊕ logslope), making the β estimating
+    /// equation Neyman-orthogonal to `span(Z_infl)`. When `None` (raw `z` with
+    /// no Stage-1 model), the free-warp `score_warp` path is used unchanged.
+    /// Populated out-of-fold by `crossfit_score_calibration` in
+    /// `solver/workflow.rs`; mirrors the BMS spec field of the same name.
+    pub score_influence_jacobian: Option<ndarray::Array2<f64>>,
     pub latent_z_policy: LatentZPolicy,
 }
 
@@ -22287,6 +22300,7 @@ mod tests {
             logslope_offset: Array1::zeros(2),
             score_warp: None,
             link_dev: None,
+            score_influence_jacobian: None,
             latent_z_policy: LatentZPolicy::default(),
         };
 
@@ -22317,6 +22331,7 @@ mod tests {
             logslope_offset: Array1::zeros(2),
             score_warp: None,
             link_dev: None,
+            score_influence_jacobian: None,
             latent_z_policy: LatentZPolicy::default(),
         };
 
