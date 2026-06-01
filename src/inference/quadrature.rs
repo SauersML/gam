@@ -1535,11 +1535,78 @@ fn cloglog_small_sigma_taylor(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
 }
 
 #[inline]
-fn cloglog_posterior_meanwith_deriv_ghq(
-    ctx: &QuadratureContext,
-    mu: f64,
-    sigma: f64,
-) -> IntegratedMeanDerivative {
+/// Panelized adaptive-Simpson refinement with Richardson extrapolation on a
+/// single panel `[a, b]`. `whole` is the one-panel Simpson estimate; the panel
+/// is bisected until the two-panel estimate agrees to `tol` (or `depth` is
+/// exhausted), then the extrapolated value is returned.
+fn adaptive_simpson_refine(
+    g: &impl Fn(f64) -> f64,
+    a: f64,
+    b: f64,
+    fa: f64,
+    fb: f64,
+    fm: f64,
+    whole: f64,
+    tol: f64,
+    depth: i32,
+) -> f64 {
+    let m = 0.5 * (a + b);
+    let lm = 0.5 * (a + m);
+    let rm = 0.5 * (m + b);
+    let flm = g(lm);
+    let frm = g(rm);
+    let left = (m - a) / 6.0 * (fa + 4.0 * flm + fm);
+    let right = (b - m) / 6.0 * (fm + 4.0 * frm + fb);
+    let est = left + right;
+    if depth <= 0 || (est - whole).abs() <= 15.0 * tol {
+        return est + (est - whole) / 15.0;
+    }
+    adaptive_simpson_refine(g, a, m, fa, fm, flm, left, 0.5 * tol, depth - 1)
+        + adaptive_simpson_refine(g, m, b, fm, fb, frm, right, 0.5 * tol, depth - 1)
+}
+
+/// Accurate Gaussian expectation `E[f(mu + sigma·Z)]`, `Z ~ N(0,1)`, via
+/// panelized adaptive Simpson over the standardized window `u ∈ [-K, K]`.
+///
+/// This is the trusted fallback when the controlled special-function backends
+/// decline. Fixed Gauss-Hermite quadrature undersamples integrands whose
+/// features are narrow in standardized coordinates — the cloglog transition
+/// `1 − exp(−exp(η))` has width `~1/sigma` in `u`, so once `sigma` is large it
+/// collapses below the GHQ node spacing and most of the fixed nodes scatter
+/// into the flat dead zone, leaving only a handful to resolve the transition
+/// (the ~1e-3 mean / ~3.5e-3 derivative error observed at `sigma = 4`).
+/// Adaptive Simpson instead refines panels only where the integrand curves,
+/// resolving the transition to tolerance regardless of `sigma`. The
+/// standard-normal density kills the tails (`φ(15) ~ 1e-49`), so the finite
+/// window `K = 15` captures the whole integral with no analytic tail term.
+fn integrate_normal_adaptive(mu: f64, sigma: f64, f: impl Fn(f64) -> f64) -> f64 {
+    if !(sigma.is_finite()) || sigma < 1e-10 {
+        return f(mu);
+    }
+    const K: f64 = 15.0;
+    const INITIAL_PANELS: usize = 24;
+    const TOL: f64 = 1e-12;
+    const MAX_DEPTH: i32 = 40;
+    let inv_sqrt_2pi = 1.0 / (2.0 * std::f64::consts::PI).sqrt();
+    // Integrand in standardized coordinates: f(mu + sigma·u) · φ(u). A coarse
+    // initial panel grid guarantees the transition cannot fall entirely
+    // between sampled points before adaptive refinement engages.
+    let g = |u: f64| f(mu + sigma * u) * inv_sqrt_2pi * (-0.5 * u * u).exp();
+    let panel = 2.0 * K / INITIAL_PANELS as f64;
+    let mut total = 0.0;
+    for p in 0..INITIAL_PANELS {
+        let a = -K + p as f64 * panel;
+        let b = a + panel;
+        let fa = g(a);
+        let fb = g(b);
+        let fm = g(0.5 * (a + b));
+        let whole = (b - a) / 6.0 * (fa + 4.0 * fm + fb);
+        total += adaptive_simpson_refine(&g, a, b, fa, fb, fm, whole, TOL, MAX_DEPTH);
+    }
+    total
+}
+
+fn cloglog_posterior_meanwith_deriv_quadrature(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
     if sigma < 1e-10 {
         return IntegratedMeanDerivative {
             mean: cloglog_mean_exact(mu),
@@ -1547,8 +1614,8 @@ fn cloglog_posterior_meanwith_deriv_ghq(
             mode: IntegratedExpectationMode::ExactClosedForm,
         };
     }
-    let mean = cloglog_mean_from_survival(survival_posterior_mean_ghq(ctx, mu, sigma));
-    let dmean_dmu = integrate_normal_ghq_adaptive(ctx, mu, sigma, cloglog_mean_d1_exact).max(0.0);
+    let mean = cloglog_mean_from_survival(survival_posterior_mean_quadrature(mu, sigma));
+    let dmean_dmu = integrate_normal_adaptive(mu, sigma, cloglog_mean_d1_exact).max(0.0);
     IntegratedMeanDerivative {
         mean,
         dmean_dmu,
@@ -1557,8 +1624,8 @@ fn cloglog_posterior_meanwith_deriv_ghq(
 }
 
 #[inline]
-fn survival_posterior_mean_ghq(ctx: &QuadratureContext, eta: f64, se_eta: f64) -> f64 {
-    integrate_normal_ghq_adaptive(ctx, eta, se_eta, gumbel_survival).clamp(0.0, 1.0)
+fn survival_posterior_mean_quadrature(eta: f64, se_eta: f64) -> f64 {
+    integrate_normal_adaptive(eta, se_eta, gumbel_survival).clamp(0.0, 1.0)
 }
 
 fn cloglog_survival_term_controlled(
@@ -1641,7 +1708,7 @@ fn cloglog_survival_term_controlled(
         );
     }
     (
-        survival_posterior_mean_ghq(ctx, mu, sigma),
+        survival_posterior_mean_quadrature(mu, sigma),
         IntegratedExpectationMode::QuadratureFallback,
     )
 }
@@ -2372,7 +2439,7 @@ pub(crate) fn cloglog_posterior_meanwith_deriv_controlled(
         if matches!(mode, IntegratedExpectationMode::QuadratureFallback)
             || matches!(shifted_mode, IntegratedExpectationMode::QuadratureFallback)
         {
-            return cloglog_posterior_meanwith_deriv_ghq(ctx, mu, sigma);
+            return cloglog_posterior_meanwith_deriv_quadrature(mu, sigma);
         }
         let mean = cloglog_mean_from_survival(survival);
         let dmean = cloglog_shift_identity_derivative(mu, sigma, shifted_survival);
@@ -2403,7 +2470,7 @@ pub(crate) fn cloglog_posterior_meanwith_deriv_controlled(
     {
         return candidate;
     }
-    let ghq = cloglog_posterior_meanwith_deriv_ghq(ctx, mu, sigma);
+    let ghq = cloglog_posterior_meanwith_deriv_quadrature(mu, sigma);
     // Drift tolerances tightened on the derivative absolute floor: the
     // Taylor truncation diverges in the positive-saturation band
     // (e.g. mu ~ 3, sigma ~ 0.24) because f^(n) grow near the saturation
