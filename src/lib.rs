@@ -126,7 +126,7 @@ pub use solver::workflow::{
     SurvivalLocationScaleFitRequest, SurvivalLocationScaleFitResult, SurvivalMarginalSlopeFitRequest,
     SurvivalTransformationFitRequest, SurvivalTransformationFitResult,
     SurvivalTransformationTermSpec, TransformationNormalFitRequest, WorkflowError,
-    fit_calibrated_marginal_slope, fit_from_formula, fit_model, is_binary_response, materialize,
-    prepare_calibrated_marginal_slope_stage2, prepare_survival_time_stack, resolve_family,
-    resolve_offset_column, resolve_weight_column,
+    fit_calibrated_marginal_slope, fit_from_formula, fit_marginal_slope_from_ctn, fit_model,
+    is_binary_response, materialize, prepare_calibrated_marginal_slope_stage2,
+    prepare_survival_time_stack, resolve_family, resolve_offset_column, resolve_weight_column,
 };
