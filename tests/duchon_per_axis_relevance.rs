@@ -78,13 +78,18 @@ fn scale_dims_emits_one_relevance_penalty_per_axis() {
 
     // The isotropic gradient penalty is REPLACED, not duplicated.
     assert!(
-        !srcs.iter().any(|s| matches!(s, PenaltySource::OperatorTension)),
+        !srcs
+            .iter()
+            .any(|s| matches!(s, PenaltySource::OperatorTension)),
         "isotropic OperatorTension must be replaced by per-axis relevance, got {srcs:?}"
     );
 
     // Curvature, amplitude, and the affine trend stay single / isotropic.
     assert!(srcs.iter().any(|s| matches!(s, PenaltySource::Primary)));
-    assert!(srcs.iter().any(|s| matches!(s, PenaltySource::OperatorMass)));
+    assert!(
+        srcs.iter()
+            .any(|s| matches!(s, PenaltySource::OperatorMass))
+    );
     assert!(
         srcs.iter()
             .any(|s| matches!(s, PenaltySource::DoublePenaltyNullspace))
@@ -97,7 +102,8 @@ fn without_scale_dims_the_gradient_penalty_stays_isotropic() {
     let srcs = sources(&duchon_2d_spec(20, false), &data);
 
     assert!(
-        srcs.iter().any(|s| matches!(s, PenaltySource::OperatorTension)),
+        srcs.iter()
+            .any(|s| matches!(s, PenaltySource::OperatorTension)),
         "isotropic default must emit a single OperatorTension, got {srcs:?}"
     );
     assert!(

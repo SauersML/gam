@@ -89,9 +89,7 @@ use faer::Side;
 use ndarray::{Array1, Array2};
 
 use crate::families::custom_family::{FamilyLinearizationState, ParameterBlockSpec};
-use crate::linalg::faer_ndarray::{
-    FaerEigh, default_rrqr_rank_alpha, rrqr_with_permutation,
-};
+use crate::linalg::faer_ndarray::{FaerEigh, default_rrqr_rank_alpha, rrqr_with_permutation};
 use crate::solver::estimate::EstimationError;
 
 /// Per-block accounting record. `original_dim` is the spec's column
@@ -644,7 +642,10 @@ fn audit_identifiability_impl(
     let n_penalty_rows: usize = block_penalties
         .iter()
         .enumerate()
-        .map(|(idx, s)| s.as_ref().map_or(0, |_| col_offsets[idx + 1] - col_offsets[idx]))
+        .map(|(idx, s)| {
+            s.as_ref()
+                .map_or(0, |_| col_offsets[idx + 1] - col_offsets[idx])
+        })
         .sum();
     let x_joint_rank_input: Array2<f64> = if n_penalty_rows == 0 {
         x_joint.clone()
@@ -657,7 +658,8 @@ fn audit_identifiability_impl(
             let end = col_offsets[idx + 1];
             if let Some(s) = s_opt {
                 let h = end - start;
-                aug.slice_mut(ndarray::s![row..row + h, start..end]).assign(s);
+                aug.slice_mut(ndarray::s![row..row + h, start..end])
+                    .assign(s);
                 row += h;
             }
         }

@@ -2866,8 +2866,12 @@ pub enum PenaltySource {
     /// shrinks an axis's contribution toward flat only when it does not earn
     /// its keep — penalty-based ARD / variable relevance, the replacement for
     /// brittle kernel-η optimization. Emitted when `scale_dims` is on.
-    OperatorRelevance { axis: usize },
-    TensorMarginal { dim: usize },
+    OperatorRelevance {
+        axis: usize,
+    },
+    TensorMarginal {
+        dim: usize,
+    },
     TensorGlobalRidge,
     Other(String),
 }

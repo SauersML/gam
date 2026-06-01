@@ -8333,7 +8333,6 @@ impl SurvivalMarginalSlopeFamily {
         Ok(())
     }
 
-
     fn accumulate_dynamic_q_core_hessian(
         &self,
         row: usize,

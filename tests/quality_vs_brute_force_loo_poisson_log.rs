@@ -194,8 +194,7 @@ fn alo_loo_recovers_truth_and_matches_exact_brute_force_poisson_log() {
     // structure of eta_true. A larger default basis (20x20=400 cols) would exceed
     // n and leave the fit under-determined; it would also make the O(n*p^2)
     // brute-force LOO needlessly heavy.
-    let result =
-        fit_from_formula("y ~ te(x1, x2, k=8)", &ds, &cfg).expect("gam poisson te fit");
+    let result = fit_from_formula("y ~ te(x1, x2, k=8)", &ds, &cfg).expect("gam poisson te fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for Poisson te(x1, x2)");
     };
