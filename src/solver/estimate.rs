@@ -3644,10 +3644,19 @@ where
 
     // Persist residual-based scale for Gaussian identity models.
     // Contract: residual standard deviation sigma, not variance.
+    //
+    // Gaussian REML scale: σ̂² = RSS / (n − edf_total), matching mgcv's gam.scale.
+    // Using the null-space dim (mp = p − rank(Σ_k S_k)) here was wrong: mp is the
+    // minimum possible edf (all smooths fully penalized to their null space), so
+    // n − mp ≥ n − edf_total, and σ̂² was systematically biased low whenever any
+    // smooth/random-effect spent real edf. edf_total ∈ [mp, p_dim] is the effective
+    // df computed just above from tr(λ_k · H⁻¹ S_k), and is exactly the residual
+    // df mgcv uses. When inference is off, edf_total is unavailable, so the MLE
+    // RSS/n is returned instead.
     let standard_deviation = match &pirls_res.likelihood.spec.response {
         ResponseFamily::Gaussian => {
             let denom = if opts.compute_inference {
-                (n - mp).max(1.0)
+                (n - edf_total).max(1.0)
             } else {
                 n.max(1.0)
             };
