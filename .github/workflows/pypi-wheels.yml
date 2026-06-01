@@ -22,7 +22,7 @@ name: Publish to PyPI
 on:
   push:
     branches:
-      - main         # only runs when crates/gam-pyffi/Cargo.toml `version` changed
+      - main         # only runs when pyproject.toml `[project].version` changed
     tags:
       - 'v*'        # builds + publishes
   workflow_dispatch:
@@ -82,7 +82,13 @@ jobs:
             echo "should_run=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          manifest=crates/gam-pyffi/Cargo.toml
+          # Gate on the file that DRIVES the published wheel: maturin reads the
+          # version from `[project].version` in pyproject.toml. The internal
+          # crates/gam-pyffi/Cargo.toml version (publish = false) does NOT change
+          # the artifact, so diffing it let a pyproject-only bump slip through as
+          # should_run=false (issue #570). `^version[[:space:]]*=` matches exactly
+          # the single `[project].version` line in pyproject.toml.
+          manifest=pyproject.toml
           new_ver=$(grep -E '^version[[:space:]]*=' "$manifest" | head -n1)
           old_ver=$(git show "${GITHUB_EVENT_BEFORE:-HEAD^}:$manifest" 2>/dev/null | grep -E '^version[[:space:]]*=' | head -n1 || true)
           echo "old: $old_ver"
