@@ -8373,6 +8373,62 @@ impl CharbonnierScalarBlockState {
         (weight, invweight)
     }
 
+    fn surrogateweights_posterior_snr(
+        &self,
+        variance: &Array1<f64>,
+        weight_floor: f64,
+        weight_ceiling: f64,
+    ) -> (Array1<f64>, Array1<f64>) {
+        // Posterior-SNR (credible-magnitude) reweighting of the scalar MM
+        // majorizer.
+        //
+        // The magnitude-only surrogate weight uses the *point-estimate* radius
+        //
+        //   r_k^mag = sqrt( t_k^2 + eps^2 ),   t_k = (D0 beta_hat)_k,
+        //   w_k     = 1 / r_k^mag.
+        //
+        // The weight multiplies the local quadratic surrogate penalty
+        // w_k (D0 beta)^2, so a *small* w_k leaves the response un-penalized
+        // (treated as a genuine feature) and a *large* w_k pulls it toward zero
+        // (enforces flatness). The failure of the point-estimate radius is that
+        // a response t_k which is large only because it is poorly determined
+        // gets a tiny weight and is left un-penalized — the weight chases noise
+        // in low-information regions.
+        //
+        // Resolution via the posterior second moment under the working-Laplace
+        // posterior beta ~ N(beta_hat, Sigma_beta), Sigma_beta = H^{-1}: the
+        // variance of the response is
+        //
+        //   Var( (D0 beta)_k ) = (D0 Sigma_beta D0^T)_kk >= 0,
+        //
+        // and the *credible* (noise-floor-corrected) squared magnitude is
+        //
+        //   t_k^credible^2 = max( t_k^2 - Var(...)_k , 0 ),
+        //   r_k^snr        = sqrt( t_k^credible^2 + eps^2 ),
+        //   w_k            = 1 / r_k^snr.
+        //
+        // This realizes the intended behavior exactly: a derivative is left
+        // un-penalized (small w) only when its magnitude is *credibly* large
+        // (t_k^2 >> Var, real feature); the penalty pulls hardest toward zero
+        // (large w) where the derivative is credibly near zero — small estimate
+        // AND small variance, OR a large-but-poorly-determined estimate whose
+        // signal is swamped by its variance. (Note: the additive `+Var` radius
+        // sketched in the design notes points the *opposite* way — it would
+        // un-penalize noisy responses even harder — so we use the variance-
+        // *corrected* second moment, which is the direction that actually
+        // suppresses noise while preserving credible edges.) With
+        // `variance == 0` everywhere this degrades exactly to `surrogateweights`,
+        // so any covariance-unavailable path is unchanged.
+        let eps2 = self.epsilon * self.epsilon;
+        let weight = Array1::from_iter(self.signal.iter().zip(variance.iter()).map(|(&t, &v)| {
+            let credible_sq = (t * t - v.max(0.0)).max(0.0);
+            let r = (credible_sq + eps2).sqrt();
+            (1.0 / r).clamp(weight_floor, weight_ceiling)
+        }));
+        let invweight = weight.mapv(|u| 1.0 / u);
+        (weight, invweight)
+    }
+
     fn directionalhessian_diag(&self, direction_signal: &Array1<f64>) -> Array1<f64> {
         // Scalar-image directional third derivative:
         //
@@ -8571,6 +8627,50 @@ impl CharbonnierGroupedBlockState {
         let weight = self
             .radius
             .mapv(|r| (1.0 / r).clamp(weight_floor, weight_ceiling));
+        let invweight = weight.mapv(|u| 1.0 / u);
+        (weight, invweight)
+    }
+
+    fn surrogateweights_posterior_snr(
+        &self,
+        variance: &Array1<f64>,
+        weight_floor: f64,
+        weight_ceiling: f64,
+    ) -> (Array1<f64>, Array1<f64>) {
+        // Grouped posterior-SNR (credible-magnitude) reweighting.
+        //
+        // The magnitude-only grouped surrogate weight uses the point-estimate
+        // block norm
+        //
+        //   g_k     = ||v_k||_2,   v_k = G_k beta_hat,
+        //   r_k^mag = sqrt( g_k^2 + eps^2 ),
+        //   w_k     = 1 / r_k^mag.
+        //
+        // The posterior covariance of the *block* response v_k = G_k beta under
+        // beta ~ N(beta_hat, Sigma_beta), Sigma_beta = H^{-1}, has total trace
+        //
+        //   Cov(v_k)     = G_k Sigma_beta G_k^T   (a block_dim x block_dim block),
+        //   variance[k]  = tr(Cov(v_k)) = sum_axis ( G_k[axis] Sigma_beta G_k[axis]^T ),
+        //
+        // i.e. the variance aggregated over the axis-block in the same way
+        // `norm` aggregates ||v_k||^2. As for the scalar block, we deflate the
+        // squared block norm by this noise floor to obtain the credible squared
+        // magnitude and shrink poorly-determined responses toward zero:
+        //
+        //   g_k^credible^2 = max( g_k^2 - tr(Cov(v_k)) , 0 ),
+        //   r_k^snr        = sqrt( g_k^credible^2 + eps^2 ),   w_k = 1 / r_k^snr.
+        //
+        // A block whose norm is credibly large (g_k^2 >> tr Cov) keeps a small
+        // weight (real feature, left un-penalized); a block whose norm is
+        // dominated by posterior variance is pulled toward zero by a large
+        // weight (noise suppressed). With `variance == 0` this recovers
+        // `surrogateweights` exactly.
+        let eps2 = self.epsilon * self.epsilon;
+        let weight = Array1::from_iter(self.norm.iter().zip(variance.iter()).map(|(&g, &v)| {
+            let credible_sq = (g * g - v.max(0.0)).max(0.0);
+            let r = (credible_sq + eps2).sqrt();
+            (1.0 / r).clamp(weight_floor, weight_ceiling)
+        }));
         let invweight = weight.mapv(|u| 1.0 / u);
         (weight, invweight)
     }
@@ -9116,6 +9216,62 @@ fn extract_spatial_operator_runtime_caches(
     Ok(out)
 }
 
+/// Posterior variance of a scalar collocation operator response under the
+/// working-Laplace posterior `beta ~ N(beta_hat, Sigma_local)`.
+///
+/// For operator row `D_k` (one row of `D0`) acting on the term-local coefficient
+/// block, `Var((D beta)_k) = D_k Sigma_local D_k^T = (D Sigma_local D^T)_kk`.
+/// We compute it without forming `D Sigma D^T` densely: for each row we evaluate
+/// `s_k = Sigma_local D_k^T` (one matrix-vector product) and then `D_k . s_k`.
+/// `Sigma_local` is the sub-block of the global conditional covariance
+/// `Sigma_beta = H^{-1}` indexed by the term's `coeff_global_range`, i.e. the
+/// covariance proxy is the already-materialized inner working-Laplace inverse;
+/// no second factorization is formed.
+fn scalar_operator_response_variance(
+    operator: &Array2<f64>,
+    cov_local: &Array2<f64>,
+) -> Array1<f64> {
+    Array1::from_iter(operator.rows().into_iter().map(|row| {
+        let s = cov_local.dot(&row);
+        row.dot(&s).max(0.0)
+    }))
+}
+
+/// Posterior second-moment variance aggregated over each grouped collocation
+/// block (gradient/curvature). The grouped operator is stored row-stacked with
+/// `block_dim` rows per collocation point (`d` axes for the gradient, `d*d` for
+/// the Hessian). For block `k`,
+///
+///   v_k = G_k beta,   Cov(v_k) = G_k Sigma_local G_k^T   (block_dim x block_dim),
+///   variance_k = tr(Cov(v_k)) = sum_axis ( G_k[axis] Sigma_local G_k[axis]^T ),
+///
+/// which matches how `CharbonnierGroupedBlockState::norm` aggregates
+/// `||v_k||^2 = sum_axis (G_k[axis] beta)^2` across the axis-block.
+fn grouped_operator_response_variance(
+    operator: &Array2<f64>,
+    block_dim: usize,
+    cov_local: &Array2<f64>,
+) -> Result<Array1<f64>, EstimationError> {
+    if block_dim == 0 || !operator.nrows().is_multiple_of(block_dim) {
+        crate::bail_invalid_estim!(
+            "grouped variance row layout invalid: rows={}, block_dim={block_dim}",
+            operator.nrows()
+        );
+    }
+    let p = operator.nrows() / block_dim;
+    let mut out = Array1::<f64>::zeros(p);
+    for k in 0..p {
+        let mut acc = 0.0;
+        for axis in 0..block_dim {
+            let row = operator.row(k * block_dim + axis);
+            let s = cov_local.dot(&row);
+            acc += row.dot(&s);
+        }
+        out[k] = acc.max(0.0);
+    }
+    Ok(out)
+}
+
 fn compute_spatial_adaptiveweights_for_beta(
     beta: &Array1<f64>,
     caches: &[SpatialOperatorRuntimeCache],
@@ -9124,6 +9280,7 @@ fn compute_spatial_adaptiveweights_for_beta(
     epsilon_c: f64,
     weight_floor: f64,
     weight_ceiling: f64,
+    beta_covariance: Option<&Array2<f64>>,
 ) -> Result<Vec<SpatialAdaptiveWeights>, EstimationError> {
     // Charbonnier / pseudo-Huber MM derivation (per collocation scalar t):
     //   psi(t; eps) = sqrt(t^2 + eps^2) - eps
@@ -9143,6 +9300,17 @@ fn compute_spatial_adaptiveweights_for_beta(
     //   K2 = D2_con^T W_c D2_con,  W_c = diag(w_c) \otimes I_(d*d).
     //
     // We clamp w directly, then derive inv_w=1/w for diagnostics and row scaling.
+    //
+    // Posterior-SNR reweighting (magic by default): when the inner working-Laplace
+    // conditional covariance `Sigma_beta = H^{-1}` is available we replace the
+    // squared point-estimate radius `t_k^2 + eps^2` by the posterior *second
+    // moment* `t_k^2 + Var((D beta)_k) + eps^2`, with `Var = (D Sigma_beta D^T)_kk`.
+    // This stops the weight from chasing derivatives that are large only because
+    // they are poorly determined. `Sigma_beta` here is the already-formed inner
+    // Hessian inverse from the final exact-family solve — no second factorization
+    // is built; we only reuse the materialized covariance. When the covariance is
+    // unavailable (`None`) the variance is zero and this degrades *exactly* to the
+    // old magnitude-only radius.
     caches
         .iter()
         .map(|cache| {
@@ -9152,15 +9320,39 @@ fn compute_spatial_adaptiveweights_for_beta(
                 cache,
                 [epsilon_0, epsilon_g, epsilon_c],
             )?;
-            let (_, inv_0) = exact
-                .magnitude
-                .surrogateweights(weight_floor, weight_ceiling);
-            let (_, inv_g) = exact
-                .gradient
-                .surrogateweights(weight_floor, weight_ceiling);
-            let (_, inv_c) = exact
-                .curvature
-                .surrogateweights(weight_floor, weight_ceiling);
+            let cov_local = beta_covariance.map(|cov| {
+                cov.slice(s![
+                    cache.coeff_global_range.clone(),
+                    cache.coeff_global_range.clone()
+                ])
+                .to_owned()
+            });
+            let dim = cache.dimension;
+            let (var_0, var_g, var_c) = match cov_local.as_ref() {
+                Some(cov) => (
+                    scalar_operator_response_variance(&cache.d0, cov),
+                    grouped_operator_response_variance(&cache.d1, dim, cov)?,
+                    grouped_operator_response_variance(&cache.d2, dim * dim, cov)?,
+                ),
+                None => (
+                    Array1::<f64>::zeros(exact.magnitude.signal.len()),
+                    Array1::<f64>::zeros(exact.gradient.norm.len()),
+                    Array1::<f64>::zeros(exact.curvature.norm.len()),
+                ),
+            };
+            let (_, inv_0) =
+                exact
+                    .magnitude
+                    .surrogateweights_posterior_snr(&var_0, weight_floor, weight_ceiling);
+            let (_, inv_g) =
+                exact
+                    .gradient
+                    .surrogateweights_posterior_snr(&var_g, weight_floor, weight_ceiling);
+            let (_, inv_c) = exact.curvature.surrogateweights_posterior_snr(
+                &var_c,
+                weight_floor,
+                weight_ceiling,
+            );
             Ok(SpatialAdaptiveWeights {
                 inv_magweight: inv_0,
                 invgradweight: inv_g,
@@ -10044,6 +10236,10 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         eps_star[2],
         adaptive_opts.weight_floor,
         adaptive_opts.weight_ceiling,
+        // Working-Laplace conditional covariance Sigma_beta = H^{-1} from the
+        // final exact-family solve, reused here as the posterior-SNR variance
+        // source (no second factorization is formed).
+        beta_covariance.as_ref(),
     )?
     .into_iter()
     .zip(runtime_caches.iter())
@@ -25839,9 +26035,17 @@ mod tests {
             dimension: 2,
         };
         let beta = array![0.0, 0.0];
-        let out =
-            compute_spatial_adaptiveweights_for_beta(&beta, &[cache], 1e-8, 1e-8, 1e-8, 1e-8, 1e2)
-                .expect("adaptive weights");
+        let out = compute_spatial_adaptiveweights_for_beta(
+            &beta,
+            &[cache],
+            1e-8,
+            1e-8,
+            1e-8,
+            1e-8,
+            1e2,
+            None,
+        )
+        .expect("adaptive weights");
         assert_eq!(out.len(), 1);
         // Raw u would be 1/eps = 1e8, so clamping to 1e2 yields diagnostics 1/u.
         assert!((out[0].inv_magweight[0] - 1e-2).abs() < 1e-12);
@@ -25885,6 +26089,7 @@ mod tests {
             1e-6,
             1e-12,
             1e12,
+            None,
         )
         .expect("adaptive weights");
         assert_eq!(out.len(), 1);
@@ -25924,6 +26129,7 @@ mod tests {
             1e-8,
             1e-12,
             1e12,
+            None,
         )
         .expect("small adaptive weights");
         let large = compute_spatial_adaptiveweights_for_beta(
@@ -25934,6 +26140,7 @@ mod tests {
             1e-8,
             1e-12,
             1e12,
+            None,
         )
         .expect("large adaptive weights");
         assert!(small[0].inv_magweight[0] < large[0].inv_magweight[0]);

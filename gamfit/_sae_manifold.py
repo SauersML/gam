@@ -5,11 +5,15 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Mapping
+from typing import Any, Mapping
 
 import numpy as np
 
 from ._binding import rust_module
+from ._penalty_bridge import (
+    GumbelTemperatureSchedule,
+    validate_gumbel_schedule_fields as _validate_gumbel_schedule_fields,
+)
 
 
 # Canonical assignment-kind aliases. Both `assignment=` and `assignment_prior=`
@@ -390,52 +394,6 @@ class ManifoldSAE:
     @classmethod
     def load(cls, path: str | Path) -> "ManifoldSAE":
         return cls.from_dict(json.loads(Path(path).read_text()))
-
-
-@dataclass(frozen=True, init=False, slots=True)
-class GumbelTemperatureSchedule:
-    tau_start: float
-    tau_min: float
-    decay: Literal["geometric", "exponential", "linear", "reciprocal_iter"]
-    rate: float | None = None
-    steps: int | None = None
-    iter_count: int = 0
-
-    def __init__(self, tau_start: float, tau_min: float | None = None, decay: str = "geometric",
-                 rate: float | None = None, steps: int | None = None, iter_count: int = 0,
-                 *, tau_end: float | None = None) -> None:
-        if tau_min is None:
-            if tau_end is None:
-                raise TypeError("GumbelTemperatureSchedule requires tau_min or tau_end")
-            tau_min = tau_end
-        if tau_end is not None and float(tau_end) != float(tau_min):
-            raise ValueError("GumbelTemperatureSchedule tau_min and tau_end disagree")
-        name = str(decay).lower().replace("-", "_")
-        if name == "exponential":
-            name = "geometric"
-        _validate_gumbel_schedule_fields(
-            tau_start=float(tau_start), tau_min=float(tau_min), decay=name,
-            rate=rate, steps=steps, iter_count=int(iter_count),
-        )
-        object.__setattr__(self, "tau_start", float(tau_start))
-        object.__setattr__(self, "tau_min", float(tau_min))
-        object.__setattr__(self, "decay", name)
-        object.__setattr__(self, "rate", 0.9 if rate is None and name == "geometric" else rate)
-        object.__setattr__(self, "steps", steps)
-        object.__setattr__(self, "iter_count", int(iter_count))
-
-    def to_rust_descriptor(self) -> dict[str, Any]:
-        out: dict[str, Any] = {"tau_start": self.tau_start, "tau_min": self.tau_min, "decay": self.decay, "iter_count": self.iter_count}
-        if self.rate is not None:
-            out["rate"] = float(self.rate)
-        if self.steps is not None:
-            out["steps"] = int(self.steps)
-        return out
-
-    def current_tau(self, iter_count: int) -> float:
-        """Temperature at ``iter_count``, evaluated by the Rust
-        ``GumbelTemperatureSchedule`` so the decay arithmetic has one home."""
-        return float(rust_module().gumbel_schedule_tau(self.to_rust_descriptor(), int(iter_count)))
 
 
 def gumbel_geometric_schedule(tau_start: float, tau_min: float, rate: float, iter_count: int = 0) -> GumbelTemperatureSchedule:
@@ -835,28 +793,6 @@ def _topology_for_bases(bases: list[str]) -> str:
     Mixed-topology fits keep the first atom's topology — basis_specs remains
     the per-atom source of truth."""
     return _BASIS_TO_TOPOLOGY.get(bases[0], bases[0])
-
-
-def _validate_gumbel_schedule_fields(
-    *, tau_start: float, tau_min: float, decay: str,
-    rate: float | None, steps: int | None, iter_count: int,
-) -> None:
-    if not (np.isfinite(tau_start) and tau_start > 0.0):
-        raise ValueError(f"GumbelTemperatureSchedule: tau_start must be finite and positive; got {tau_start}")
-    if not (np.isfinite(tau_min) and tau_min > 0.0):
-        raise ValueError(f"GumbelTemperatureSchedule: tau_min must be finite and positive; got {tau_min}")
-    if tau_min > tau_start:
-        raise ValueError(
-            f"GumbelTemperatureSchedule: tau_min ({tau_min}) cannot exceed tau_start ({tau_start})"
-        )
-    if decay not in {"geometric", "linear", "reciprocal_iter"}:
-        raise ValueError(f"GumbelTemperatureSchedule: unknown decay {decay!r}")
-    if rate is not None and (not np.isfinite(rate) or rate <= 0.0 or rate >= 1.0):
-        raise ValueError(f"GumbelTemperatureSchedule: rate must be in (0, 1); got {rate}")
-    if steps is not None and int(steps) < 1:
-        raise ValueError(f"GumbelTemperatureSchedule: steps must be >= 1; got {steps}")
-    if int(iter_count) < 0:
-        raise ValueError(f"GumbelTemperatureSchedule: iter_count must be >= 0; got {iter_count}")
 
 
 def _schedule_payload(schedule: Any) -> dict[str, Any] | None:

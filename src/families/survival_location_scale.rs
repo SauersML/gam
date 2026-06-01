@@ -1719,33 +1719,22 @@ impl SurvivalLocationScaleFamily {
             }
             .into());
         };
-        if beta.len() != constraints.a.ncols() || delta.len() != constraints.a.ncols() {
-            return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
-                "survival location-scale time-step constraint dimension mismatch: beta={}, delta={}, constraints={}",
-                beta.len(),
-                delta.len(),
-                constraints.a.ncols()
-            ) }.into());
-        }
-        let mut alpha = 1.0f64;
-        for row in 0..constraints.a.nrows() {
-            let a_row = constraints.a.row(row);
-            let slack = a_row.dot(beta) - constraints.b[row];
-            if slack < -1e-10 {
-                return Err(SurvivalLocationScaleError::ConstraintViolation { reason: format!(
+        crate::families::marginal_slope_shared::feasible_step_fraction(
+            constraints,
+            beta,
+            delta,
+            |beta_len, delta_len, expected| {
+                SurvivalLocationScaleError::DimensionMismatch { reason: format!(
+                    "survival location-scale time-step constraint dimension mismatch: beta={beta_len}, delta={delta_len}, constraints={expected}"
+                ) }.into()
+            },
+            |row, slack| {
+                SurvivalLocationScaleError::ConstraintViolation { reason: format!(
                     "survival location-scale current time block violates linear constraint at row {row}: slack={slack:.3e}"
-                ) }.into());
-            }
-            let drift = a_row.dot(delta);
-            if drift < 0.0 {
-                alpha = alpha.min((slack / -drift).clamp(0.0, 1.0));
-            }
-        }
-        if alpha >= 1.0 {
-            Ok(Some(1.0))
-        } else {
-            Ok(Some((0.995 * alpha).clamp(0.0, 1.0)))
-        }
+                ) }.into()
+            },
+        )
+        .map(Some)
     }
 
     fn max_feasible_link_wiggle_step(

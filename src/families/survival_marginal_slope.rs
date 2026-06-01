@@ -5955,39 +5955,28 @@ impl SurvivalMarginalSlopeFamily {
         let Some(constraints) = self.effective_time_linear_constraints()? else {
             return Ok(None);
         };
-        if beta.len() != constraints.a.ncols() || delta.len() != constraints.a.ncols() {
-            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
-                reason: format!(
-                    "survival marginal-slope time-step dimension mismatch: beta={}, delta={}, expected {}",
-                    beta.len(),
-                    delta.len(),
-                    constraints.a.ncols()
-                ),
-            }
-            .into());
-        }
-        let mut alpha = 1.0f64;
-        for row in 0..constraints.a.nrows() {
-            let a_row = constraints.a.row(row);
-            let slack = a_row.dot(beta) - constraints.b[row];
-            if slack < -1e-10 {
-                return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+        crate::families::marginal_slope_shared::feasible_step_fraction(
+            &constraints,
+            beta,
+            delta,
+            |beta_len, delta_len, expected| {
+                SurvivalMarginalSlopeError::IncompatibleDimensions {
+                    reason: format!(
+                        "survival marginal-slope time-step dimension mismatch: beta={beta_len}, delta={delta_len}, expected {expected}"
+                    ),
+                }
+                .into()
+            },
+            |row, slack| {
+                SurvivalMarginalSlopeError::MonotonicityViolation {
                     reason: format!(
                         "survival marginal-slope current time block violates derivative guard at row {row}: slack={slack:.3e}"
                     ),
                 }
-                .into());
-            }
-            let drift = a_row.dot(delta);
-            if drift < 0.0 {
-                alpha = alpha.min((slack / -drift).clamp(0.0, 1.0));
-            }
-        }
-        if alpha >= 1.0 {
-            Ok(Some(1.0))
-        } else {
-            Ok(Some((0.995 * alpha).clamp(0.0, 1.0)))
-        }
+                .into()
+            },
+        )
+        .map(Some)
     }
 
     fn effective_time_linear_constraints(
@@ -13447,21 +13436,26 @@ impl SurvivalMarginalSlopePsiWorkspace {
     }
 }
 
-impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
-    fn first_order_terms(
+impl crate::families::marginal_slope_shared::MarginalSlopePsiFamily
+    for SurvivalMarginalSlopePsiWorkspace
+{
+    fn is_sigma_aux(&self, psi_index: usize) -> bool {
+        self.family
+            .is_sigma_aux_index(&self.derivative_blocks, psi_index)
+    }
+
+    fn sigma_first_order_terms(&self) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        self.family.sigma_exact_joint_psi_terms_with_options(
+            &self.block_states,
+            &self.specs,
+            &self.options,
+        )
+    }
+
+    fn psi_first_order_terms(
         &self,
         psi_index: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        if self
-            .family
-            .is_sigma_aux_index(&self.derivative_blocks, psi_index)
-        {
-            return self.family.sigma_exact_joint_psi_terms_with_options(
-                &self.block_states,
-                &self.specs,
-                &self.options,
-            );
-        }
         self.family.psi_terms_inner_with_options(
             &self.block_states,
             &self.derivative_blocks,
@@ -13471,7 +13465,9 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
         )
     }
 
-    fn first_order_terms_all(&self) -> Result<Option<Vec<ExactNewtonJointPsiTerms>>, String> {
+    fn psi_first_order_terms_all(
+        &self,
+    ) -> Result<Option<Vec<ExactNewtonJointPsiTerms>>, String> {
         let total: usize = self.derivative_blocks.iter().map(Vec::len).sum();
         if total == 0 {
             return Ok(Some(Vec::new()));
@@ -13486,28 +13482,28 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
         )
     }
 
-    fn second_order_terms(
+    fn both_sigma_aux_second_order(&self, psi_i: usize, psi_j: usize) -> bool {
+        psi_i == psi_j
+    }
+
+    fn sigma_second_order_terms(
+        &self,
+    ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+        self.family
+            .sigma_exact_joint_psisecond_order_terms_with_options(&self.block_states, &self.options)
+    }
+
+    fn mixed_sigma_aux_second_order(
+        &self,
+    ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+        Ok(None)
+    }
+
+    fn psi_second_order_terms(
         &self,
         psi_i: usize,
         psi_j: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
-        if self
-            .family
-            .is_sigma_aux_index(&self.derivative_blocks, psi_i)
-            || self
-                .family
-                .is_sigma_aux_index(&self.derivative_blocks, psi_j)
-        {
-            if psi_i == psi_j {
-                return self
-                    .family
-                    .sigma_exact_joint_psisecond_order_terms_with_options(
-                        &self.block_states,
-                        &self.options,
-                    );
-            }
-            return Ok(None);
-        }
         self.family.psi_second_order_terms_inner_with_options(
             &self.block_states,
             &self.derivative_blocks,
@@ -13518,28 +13514,23 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
         )
     }
 
-    fn hessian_directional_derivative(
+    fn sigma_hessian_directional_derivative(
+        &self,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.family
+            .sigma_exact_joint_psihessian_directional_derivative_with_options(
+                &self.block_states,
+                d_beta_flat,
+                &self.options,
+            )
+    }
+
+    fn psi_hessian_directional_derivative(
         &self,
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<crate::solver::estimate::reml::unified::DriftDerivResult>, String> {
-        if self
-            .family
-            .is_sigma_aux_index(&self.derivative_blocks, psi_index)
-        {
-            return self
-                .family
-                .sigma_exact_joint_psihessian_directional_derivative_with_options(
-                    &self.block_states,
-                    d_beta_flat,
-                    &self.options,
-                )
-                .map(|result| {
-                    result.map(|matrix| {
-                        crate::solver::estimate::reml::unified::DriftDerivResult::Dense(matrix)
-                    })
-                });
-        }
+    ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
         self.family
             .psi_hessian_directional_derivative_operator_with_options(
                 &self.block_states,
@@ -13548,9 +13539,6 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
                 d_beta_flat,
                 &self.options,
             )
-            .map(|result| {
-                result.map(crate::solver::estimate::reml::unified::DriftDerivResult::Operator)
-            })
     }
 }
 
@@ -16919,13 +16907,17 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         if self.per_z_logslope_active() {
             return Ok(None);
         }
-        Ok(Some(Arc::new(SurvivalMarginalSlopePsiWorkspace::new(
-            self.clone(),
-            block_states.to_vec(),
-            specs.to_vec(),
-            derivative_blocks.to_vec(),
-            BlockwiseFitOptions::default(),
-        )?)))
+        Ok(Some(Arc::new(
+            crate::families::marginal_slope_shared::MarginalSlopeExactNewtonPsiWorkspace::new(
+                SurvivalMarginalSlopePsiWorkspace::new(
+                    self.clone(),
+                    block_states.to_vec(),
+                    specs.to_vec(),
+                    derivative_blocks.to_vec(),
+                    BlockwiseFitOptions::default(),
+                )?,
+            ),
+        )))
     }
 
     fn exact_newton_joint_psi_workspace_with_options(
@@ -16944,13 +16936,17 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             }
             None => options,
         };
-        Ok(Some(Arc::new(SurvivalMarginalSlopePsiWorkspace::new(
-            self.clone(),
-            block_states.to_vec(),
-            specs.to_vec(),
-            derivative_blocks.to_vec(),
-            options.clone(),
-        )?)))
+        Ok(Some(Arc::new(
+            crate::families::marginal_slope_shared::MarginalSlopeExactNewtonPsiWorkspace::new(
+                SurvivalMarginalSlopePsiWorkspace::new(
+                    self.clone(),
+                    block_states.to_vec(),
+                    specs.to_vec(),
+                    derivative_blocks.to_vec(),
+                    options.clone(),
+                )?,
+            ),
+        )))
     }
 
     fn block_linear_constraints(
