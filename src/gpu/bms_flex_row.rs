@@ -1778,6 +1778,24 @@ impl HvpKernelBackend {
 ///
 /// `marginal_design_row_major` and `logslope_design_row_major` must be
 /// row-major `[n, p_m]` and `[n, p_g]` contiguous slices.
+///
+/// #461 absorber (additive Stage-1 influence block): the orthogonalization is
+/// realized as **A2 — the marginal design widened to `[M | Z̃_infl]`** (see
+/// `src/families/bms/block_specs.rs::widen_marginal_dense_with_influence`), NOT
+/// a dedicated 5th primary coordinate. The absorber `+Z̃_infl·γ` is plain
+/// additive into the marginal index `α(x)`, so γ lives inside `β_m` of the
+/// widened block and `p_m` already counts the `p₁` influence columns. The row
+/// kernel reads the marginal index from `block_states[0].eta` (which carries
+/// `Z̃_infl·γ`) and pulls back through this same widened `marginal_design`, so
+/// the absorber rides the existing primary-coordinate `u = 0` chain with **no
+/// kernel-source change**: η, gradient, and Hessian match the CPU kernel
+/// bit-for-bit precisely because `marginal_design` and `β_m` are the matched
+/// (design, coefficient) pair the CPU path uses. The validation below pins
+/// `marginal_design.len() == n·p_m` (with `p_m` widened), so a stale narrow
+/// design against a widened `block.p_m` is rejected cleanly (CPU fallback)
+/// rather than silently computing the wrong η. The absorber is dropped at
+/// predict, where the marginal design is rebuilt without the influence columns,
+/// so the predict-time `p_m` is narrow and this path is correct there too.
 #[cfg(target_os = "linux")]
 pub(crate) fn launch_bms_flex_row_kernel_device_resident(
     inputs: BmsFlexRowKernelInputs<'_>,
