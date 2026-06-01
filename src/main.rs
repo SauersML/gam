@@ -307,6 +307,17 @@ fn classify_cli_error(message: String) -> CliError {
             ),
             None => "Matrix conditioning issue detected. Check for collinear/constant predictors and overly complex smooth bases.".to_string(),
         })
+    } else if lower.contains("duchon") && lower.contains("2*(p+s)") {
+        // A Duchon spline whose power is too low for the radial-kernel
+        // derivative a given path needs (e.g. the exact two-block spatial /
+        // transformation-normal joint, which differentiates the kernel at the
+        // origin). The basis-layer message already states the minimum
+        // admissible power; surface that as the actionable advice rather than
+        // mistaking the literal "dimension=N" for a data-shape mismatch.
+        Some(
+            "Duchon smooth is not smooth enough for this fit path. Raise its `power=...` to the minimum stated in the error above, or reduce the joint smooth's dimension."
+                .to_string(),
+        )
     } else if lower.contains("mismatch")
         || lower.contains("dimension")
         || lower.contains("shape mismatch")
