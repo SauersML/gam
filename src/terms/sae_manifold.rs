@@ -57,6 +57,46 @@ use faer::Side;
 const SAE_MANIFOLD_ARMIJO_C1: f64 = 1.0e-4;
 const SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS: usize = 12;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SaeStreamingPlan {
+    pub streaming: bool,
+    pub chunk_size: usize,
+    pub estimated_full_batch_bytes: usize,
+    pub in_core_budget_bytes: usize,
+}
+
+fn sae_streaming_plan_from_budget(
+    n_obs: usize,
+    total_basis: usize,
+    k_atoms: usize,
+    d_max: usize,
+    in_core_budget_bytes: usize,
+    chunk_window_bytes: usize,
+) -> SaeStreamingPlan {
+    const BYTES_PER_F64: usize = 8;
+    const MIN_CHUNK_ROWS: usize = 256;
+    let per_row_words = total_basis
+        .saturating_mul(1 + d_max)
+        .saturating_add(k_atoms)
+        .max(1);
+    let per_row_bytes = per_row_words.saturating_mul(BYTES_PER_F64);
+    let full_batch_bytes = n_obs.saturating_mul(per_row_bytes);
+    if full_batch_bytes <= in_core_budget_bytes {
+        return SaeStreamingPlan {
+            streaming: false,
+            chunk_size: n_obs.max(1),
+            estimated_full_batch_bytes: full_batch_bytes,
+            in_core_budget_bytes,
+        };
+    }
+    let rows_per_chunk = (chunk_window_bytes / per_row_bytes).max(MIN_CHUNK_ROWS);
+    SaeStreamingPlan {
+        streaming: true,
+        chunk_size: rows_per_chunk.min(n_obs).max(1),
+        estimated_full_batch_bytes: full_batch_bytes,
+        in_core_budget_bytes,
+    }
+}
 
 /// Decay law for deterministic Gumbel/concrete assignment temperature.
 #[derive(Debug, Clone)]
@@ -2480,6 +2520,44 @@ impl SaeManifoldTerm {
         self.atoms.len()
     }
 
+    /// Auto-derived in-core vs streaming plan for SAE Arrow-Schur work.
+    ///
+    /// This is intentionally not user-configurable: the route follows the
+    /// retained full-batch working-set estimate and the currently selected GPU
+    /// memory budget when CUDA is usable, otherwise a conservative host budget.
+    pub fn streaming_plan(&self) -> SaeStreamingPlan {
+        const HOST_IN_CORE_BYTES: usize = 2 * 1024 * 1024 * 1024;
+        const CPU_L2_CACHE_BYTES: usize = 1024 * 1024;
+        const CHUNK_CACHE_MULTIPLE: usize = 8;
+        let n_obs = self.n_obs();
+        let total_basis: usize = self.atoms.iter().map(|atom| atom.basis_size()).sum();
+        let d_max = self
+            .atoms
+            .iter()
+            .map(|atom| atom.latent_dim)
+            .max()
+            .unwrap_or(0);
+        let (budget, chunk_window) = match crate::gpu::runtime::GpuRuntime::global() {
+            Some(rt) => {
+                let device_budget = rt.memory_budget_bytes;
+                let window = (device_budget / 16).max(CPU_L2_CACHE_BYTES * CHUNK_CACHE_MULTIPLE);
+                (device_budget / 4, window)
+            }
+            None => (
+                HOST_IN_CORE_BYTES,
+                CPU_L2_CACHE_BYTES * CHUNK_CACHE_MULTIPLE,
+            ),
+        };
+        sae_streaming_plan_from_budget(
+            n_obs,
+            total_basis,
+            self.k_atoms(),
+            d_max,
+            budget,
+            chunk_window,
+        )
+    }
+
     /// Construction-time validation: every Psi-tier analytic penalty in the
     /// registry must be dispatchable into the SAE arrow-Schur row layout.
     ///
@@ -3207,8 +3285,7 @@ impl SaeManifoldTerm {
             } else {
                 for free_idx in 0..assignment_dim {
                     block.gt[free_idx] += assignment_grad[assignment_base + free_idx];
-                    block.htt[[free_idx, free_idx]] +=
-                        assignment_hdiag[assignment_base + free_idx];
+                    block.htt[[free_idx, free_idx]] += assignment_hdiag[assignment_base + free_idx];
                 }
             }
 
@@ -3647,16 +3724,28 @@ impl SaeManifoldTerm {
         ridge_ext_coord: f64,
         ridge_beta: f64,
     ) -> Result<(f64, SaeManifoldLoss), String> {
-        let (v, loss, _cache) = self.reml_criterion_with_cache(
-            target,
-            rho,
-            registry,
-            inner_max_iter,
-            learning_rate,
-            ridge_ext_coord,
-            ridge_beta,
-        )?;
-        Ok((v, loss))
+        if self.streaming_plan().streaming {
+            self.reml_criterion_streaming_exact(
+                target,
+                rho,
+                registry,
+                inner_max_iter,
+                learning_rate,
+                ridge_ext_coord,
+                ridge_beta,
+            )
+        } else {
+            let (v, loss, _cache) = self.reml_criterion_with_cache(
+                target,
+                rho,
+                registry,
+                inner_max_iter,
+                learning_rate,
+                ridge_ext_coord,
+                ridge_beta,
+            )?;
+            Ok((v, loss))
+        }
     }
 
     /// As [`Self::reml_criterion`], but also returns the converged undamped
@@ -3744,6 +3833,94 @@ impl SaeManifoldTerm {
 
         let v = loss.total() + 0.5 * log_det - occam;
         Ok((v, loss, cache))
+    }
+
+    fn reml_occam_term(&self, rho: &SaeManifoldRho) -> Result<f64, String> {
+        let p_out = self.output_dim() as f64;
+        let mut smooth_rank_total = 0usize;
+        for atom in &self.atoms {
+            smooth_rank_total += Self::symmetric_rank(&atom.smooth_penalty)?;
+        }
+        Ok(0.5 * p_out * (smooth_rank_total as f64) * rho.log_lambda_smooth)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn reml_criterion_streaming_exact(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        registry: Option<&AnalyticPenaltyRegistry>,
+        inner_max_iter: usize,
+        learning_rate: f64,
+        ridge_ext_coord: f64,
+        ridge_beta: f64,
+    ) -> Result<(f64, SaeManifoldLoss), String> {
+        let mut rho_fixed = rho.clone();
+        let loss = self.run_joint_fit_arrow_schur(
+            target,
+            &mut rho_fixed,
+            registry,
+            inner_max_iter,
+            learning_rate,
+            ridge_ext_coord,
+            ridge_beta,
+        )?;
+        let log_det = self.streaming_exact_arrow_log_det(target, rho, registry)?;
+        let occam = self.reml_occam_term(rho)?;
+        Ok((loss.total() + 0.5 * log_det - occam, loss))
+    }
+
+    pub fn streaming_exact_arrow_log_det(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        registry: Option<&AnalyticPenaltyRegistry>,
+    ) -> Result<f64, String> {
+        if target.dim() != (self.n_obs(), self.output_dim()) {
+            return Err(format!(
+                "SaeManifoldTerm::streaming_exact_arrow_log_det: target must be ({}, {}); got {:?}",
+                self.n_obs(),
+                self.output_dim(),
+                target.dim()
+            ));
+        }
+        let n_total = self.n_obs();
+        let chunk_size = self.streaming_plan().chunk_size.min(n_total.max(1));
+        let beta_dim = self.beta_dim();
+        let mut schur_acc = Array2::<f64>::zeros((beta_dim, beta_dim));
+        let mut log_det_tt = 0.0_f64;
+        let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+        let mut start = 0usize;
+        while start < n_total {
+            let end = (start + chunk_size).min(n_total);
+            let penalty_scale = (end - start) as f64 / n_total as f64;
+            let chunk_logits = self.assignment.logits.slice(s![start..end, ..]).to_owned();
+            let chunk_coords: Vec<Array2<f64>> = self
+                .assignment
+                .coords
+                .iter()
+                .map(|coord| coord.as_matrix().slice(s![start..end, ..]).to_owned())
+                .collect();
+            let mut chunk = self.materialize_chunk(chunk_logits, chunk_coords)?;
+            let z_chunk = target.slice(s![start..end, ..]);
+            let sys = chunk
+                .assemble_arrow_schur_scaled(z_chunk, rho, registry, penalty_scale)
+                .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?;
+            let mut streaming = StreamingArrowSchur::from_system(&sys, sys.rows.len().max(1));
+            let (chunk_log_det_tt, chunk_schur) = streaming
+                .reduced_schur_and_log_det_tt(0.0, 0.0, &options)
+                .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?;
+            log_det_tt += chunk_log_det_tt;
+            for row in 0..beta_dim {
+                for col in 0..beta_dim {
+                    schur_acc[[row, col]] += chunk_schur[[row, col]];
+                }
+            }
+            start = end;
+        }
+        let log_det_schur = StreamingArrowSchur::reduced_schur_log_det(&schur_acc, &options)
+            .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?;
+        Ok(log_det_tt + log_det_schur)
     }
 
     /// Per-atom, per-axis coordinate sum-of-squares `‖t_kj‖² = Σ_i t_{i,k,j}²`.
@@ -6378,6 +6555,143 @@ mod tests {
         assert!(term.assignment.assignments().iter().all(|v| v.is_finite()));
         let basis_delta = (&term.atoms[0].basis_values - &basis0).mapv(f64::abs).sum();
         assert!(basis_delta > 1.0e-10);
+    }
+
+    fn small_two_atom_periodic_term() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+        let coords0 = array![[0.05], [0.20], [0.55], [0.80], [0.35]];
+        let coords1 = array![[0.15], [0.30], [0.65], [0.90], [0.45]];
+        let (phi0, jet0) = periodic_basis(&coords0);
+        let (phi1, jet1) = periodic_basis(&coords1);
+        let atom0 = SaeManifoldAtom::new(
+            "periodic0",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi0,
+            jet0,
+            array![[0.25], [-0.35], [0.15]],
+            Array2::<f64>::eye(3),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+        let atom1 = SaeManifoldAtom::new(
+            "periodic1",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi1,
+            jet1,
+            array![[-0.10], [0.20], [0.30]],
+            Array2::<f64>::eye(3),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+        let logits = array![
+            [0.7, -0.2],
+            [0.1, 0.4],
+            [-0.3, 0.5],
+            [0.6, -0.1],
+            [0.2, 0.3]
+        ];
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            logits,
+            vec![coords0, coords1],
+            vec![
+                LatentManifold::Circle { period: 1.0 },
+                LatentManifold::Circle { period: 1.0 },
+            ],
+            AssignmentMode::softmax(0.8),
+        )
+        .unwrap();
+        let term = SaeManifoldTerm::new(vec![atom0, atom1], assignment).unwrap();
+        let target = array![[0.12], [-0.03], [0.08], [0.20], [-0.11]];
+        let rho = SaeManifoldRho::new(
+            (-0.3_f64).exp().ln(),
+            0.7_f64.ln(),
+            vec![array![0.9_f64.ln()], array![1.1_f64.ln()]],
+        );
+        (term, target, rho)
+    }
+
+    #[test]
+    fn streaming_exact_reml_matches_full_batch_reml_small_sae() {
+        let (term0, target, rho) = small_two_atom_periodic_term();
+        let mut full = term0.clone();
+        let mut streaming = term0;
+        let (full_cost, full_loss, _cache) = full
+            .reml_criterion_with_cache(target.view(), &rho, None, 2, 0.25, 1.0e-4, 1.0e-4)
+            .unwrap();
+        let (stream_cost, stream_loss) = streaming
+            .reml_criterion_streaming_exact(target.view(), &rho, None, 2, 0.25, 1.0e-4, 1.0e-4)
+            .unwrap();
+        assert_abs_diff_eq!(stream_cost, full_cost, epsilon = 1.0e-8);
+        assert_abs_diff_eq!(stream_loss.total(), full_loss.total(), epsilon = 1.0e-8);
+    }
+
+    #[test]
+    fn streaming_plan_routes_by_memory_budget_with_identical_logdet() {
+        let (term0, target, rho) = small_two_atom_periodic_term();
+        let total_basis: usize = term0.atoms.iter().map(|atom| atom.basis_size()).sum();
+        let d_max = term0
+            .atoms
+            .iter()
+            .map(|atom| atom.latent_dim)
+            .max()
+            .unwrap();
+        let dense_plan = sae_streaming_plan_from_budget(
+            term0.n_obs(),
+            total_basis,
+            term0.k_atoms(),
+            d_max,
+            usize::MAX / 4,
+            1024 * 1024,
+        );
+        assert!(!dense_plan.streaming);
+        let streaming_plan = sae_streaming_plan_from_budget(
+            term0.n_obs(),
+            total_basis,
+            term0.k_atoms(),
+            d_max,
+            1,
+            512,
+        );
+        assert!(streaming_plan.streaming);
+
+        let mut full = term0.clone();
+        let sys = full
+            .assemble_arrow_schur(target.view(), &rho, None)
+            .unwrap();
+        let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+        let factor_result = solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options).unwrap();
+        let full_logdet = arrow_log_det_from_cache(&factor_result.2).unwrap();
+        let mut streaming = StreamingArrowSchur::from_system(&sys, streaming_plan.chunk_size);
+        let streaming_logdet = streaming.exact_arrow_log_det(0.0, 0.0, &options).unwrap();
+        assert_abs_diff_eq!(streaming_logdet, full_logdet, epsilon = 1.0e-8);
+    }
+
+    #[test]
+    fn sparse_active_layout_work_scales_with_active_atoms_not_total_k() {
+        let n = 3;
+        let k_atoms = 100_000;
+        let mut active_rows = Vec::with_capacity(n);
+        for row in 0..n {
+            active_rows.push(vec![row, 10_000 + row, 90_000 + row]);
+        }
+        let coord_dims = vec![1usize; k_atoms];
+        let coord_offsets_full: Vec<usize> = (0..k_atoms).map(|k| k_atoms + k).collect();
+        let layout = SaeRowLayout::from_active_atoms(active_rows, coord_dims, coord_offsets_full);
+        for row in 0..n {
+            assert_eq!(layout.active_atoms[row].len(), 3);
+            assert_eq!(layout.row_q_active(row), 6);
+        }
+        let compact_work: usize = (0..n)
+            .map(|row| {
+                let q = layout.row_q_active(row);
+                q * q
+            })
+            .sum();
+        let dense_q = 2 * k_atoms;
+        let dense_work = n * dense_q * dense_q;
+        assert!(compact_work < dense_work / 1_000_000_000);
+        assert_eq!(compact_work, n * 36);
     }
 
     /// Regression test for https://github.com/SauersML/gam/issues/163.
