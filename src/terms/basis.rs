@@ -18811,14 +18811,19 @@ fn duchon_phi_even_derivative_collision(
     let required = k_dim + 2 * j;
 
     if smoothness_order <= required {
+        // Smallest integer power admitting phi^{(2j)}(0): 2(p+s) > k_dim+2j.
+        let min_power = (required / 2 + 1).saturating_sub(p_order);
         crate::bail_invalid_basis!(
-            "Duchon collision derivative phi^({}) requires 2*(p+s) > dimension+{}; got 2*(p+s)={}, dimension={}, p={}, s={}",
+            "Duchon collision derivative phi^({}) requires 2*(p+s) > dimension+{}; got 2*(p+s)={}, dimension={}, p={}, s={}. \
+             This path needs the {}-order radial-kernel derivative at the origin, which is finite only for a smoother spline: raise power to >= {} (or reduce the joint smooth's dimension).",
             2 * j,
             2 * j,
             smoothness_order,
             k_dim,
             p_order,
-            s_order
+            s_order,
+            2 * j,
+            min_power
         );
     }
 
@@ -18881,14 +18886,18 @@ fn duchon_phi_even_derivative_collision_psi_triplet(
     let required = k_dim + 2 * j;
 
     if smoothness_order <= required {
+        // Smallest integer power admitting the phi^{(2j)} psi triplet: 2(p+s) > k_dim+2j.
+        let min_power = (required / 2 + 1).saturating_sub(p_order);
         crate::bail_invalid_basis!(
-            "Duchon collision derivative phi^({}) psi triplet requires 2*(p+s) > dimension+{}; got 2*(p+s)={}, dimension={}, p={}, s={}",
+            "Duchon collision derivative phi^({}) psi triplet requires 2*(p+s) > dimension+{}; got 2*(p+s)={}, dimension={}, p={}, s={}. \
+             The exact two-block / transformation-normal path needs analytic length-scale derivatives of the kernel, which are finite only for a smoother spline: raise power to >= {} (or reduce the joint smooth's dimension).",
             2 * j,
             2 * j,
             smoothness_order,
             k_dim,
             p_order,
-            s_order
+            s_order,
+            min_power
         );
     }
 
