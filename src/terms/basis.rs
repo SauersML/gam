@@ -2451,12 +2451,26 @@ pub enum OperatorPenaltySpec {
 
 impl Default for DuchonOperatorPenaltySpec {
     fn default() -> Self {
-        // OFF by default. The non-periodic Euclidean Duchon penalty is the native
-        // reproducing-norm Gram (`Primary`) + null-space ridge; the analytic
-        // magnitude / slope / curvature operator dials are OPT-IN (the magic
-        // default smoother does not include them). The Matérn collocation overlay
-        // constructs its own all-active spec explicitly via `all_active()`.
-        Self::all_disabled()
+        // ALL ON. The Duchon penalty is a Hilbert scale: curvature is the
+        // always-on exact RKHS `Primary` Gram and the trend ridge is always on;
+        // the lower orders — mass (amplitude `Σ(f−f̄)²`) and tension (first-order
+        // roughness `Σ‖∇f‖²`) — are active here, collocated on a density-blind
+        // data-support sample. REML deselects any the data don't support (SPEC:
+        // recover the null by default, opt INTO overfitting). Stiffness (`D2`)
+        // stays off — `Primary` is the exact, superior curvature. (The Matérn
+        // collocation overlay builds its own `all_active()`; SAE atoms, which
+        // ship only `Primary`, use `all_disabled()`.)
+        Self {
+            mass: OperatorPenaltySpec::Active {
+                initial_log_lambda: 0.0,
+                prior: None,
+            },
+            tension: OperatorPenaltySpec::Active {
+                initial_log_lambda: 0.0,
+                prior: None,
+            },
+            stiffness: OperatorPenaltySpec::Disabled,
+        }
     }
 }
 
@@ -2479,20 +2493,6 @@ impl DuchonOperatorPenaltySpec {
             mass: active(),
             tension: active(),
             stiffness: active(),
-        }
-    }
-
-    /// The analytic magnitude (mass) dial only — a closed-form L2 ridge on the
-    /// smooth's coefficients (amplitude shrinkage toward zero), no quadrature.
-    /// Opt-in via `duchon(..., magnitude=true)`; slope/curvature stay off.
-    pub fn magnitude_only() -> Self {
-        Self {
-            mass: OperatorPenaltySpec::Active {
-                initial_log_lambda: 0.0,
-                prior: None,
-            },
-            tension: OperatorPenaltySpec::Disabled,
-            stiffness: OperatorPenaltySpec::Disabled,
         }
     }
 }
@@ -23294,7 +23294,6 @@ fn duchon_native_penalty_candidates(
     kernel_transform: &Array2<f64>,
     outer_identifiability: Option<&Array2<f64>>,
     poly_cols: usize,
-    emit_magnitude: bool,
 ) -> Result<Vec<PenaltyCandidate>, BasisError> {
     let dim = centers.ncols();
     if dim == 0 {
@@ -23381,24 +23380,77 @@ fn duchon_native_penalty_candidates(
             PenaltySource::DoublePenaltyNullspace,
         ));
     }
-    if emit_magnitude {
-        // Analytic MAGNITUDE (mass) penalty — opt-in. A closed-form L2 ridge on
-        // the kernel-block coefficients (identity on `[..n_kernel]`, mapped
-        // through the same outer identifiability `T`): it shrinks the smooth's
-        // amplitude toward zero with its own REML λ, the integer-order "mass"
-        // dial restored analytically (no quadrature, no sparse-center collocation
-        // — `op = None`, so it is a plain extra penalty, not a Charbonnier
-        // operator overlay). The polynomial null space carries no mass here; the
-        // affine trend is already controlled by the null-space ridge above.
-        let mut mass_pre = Array2::<f64>::zeros((n_pre, n_pre));
-        for i in 0..n_kernel {
-            mass_pre[[i, i]] = 1.0;
-        }
-        let mass = symmetrize(&project_penalty_matrix(&mass_pre, outer_identifiability));
+    Ok(out)
+}
+
+/// Farthest-point collocation points per basis center for the lower-order
+/// (mass / tension) operator penalties. The sample is space-filling over the
+/// data SUPPORT (density-blind — sparse and dense regions weighted alike, which
+/// is the regularization you want), `m = OVERSAMPLE·k` capped at `n`: dense
+/// enough to resolve the `k`-bump basis, independent of `n`.
+const DUCHON_COLLOCATION_OVERSAMPLE: usize = 3;
+
+/// The lower two rungs of the Hilbert scale for a Duchon smooth, as FUNCTION
+/// penalties collocated on a density-blind `O(k)` farthest-point sample of the
+/// data support:
+///   * `mass    = Σ(f−f̄)²` — centered value-design Gram (amplitude / distance
+///     from the mean; kernel block only — the affine trend's slope is governed
+///     by the null-space ridge, so only the global mean stays free).
+///   * `tension = Σ‖∇f‖²`  — gradient-design Gram (first-order roughness).
+///
+/// Curvature is intentionally NOT here: it is the EXACT RKHS reproducing-norm
+/// `Primary` Gram (`duchon_native_penalty_candidates`). These two orders have no
+/// convergent continuous integral for the growing polyharmonic kernel, so the
+/// data-support quadrature *is* their definition — and it is `O(k)`-in-`n` (the
+/// sample size does not grow with the data). Each is a plain penalty (`op = None`)
+/// with its own REML λ; REML drives an unhelpful one to zero. Stiffness (`D2`) is
+/// absent on purpose — `Primary` is the exact, superior curvature.
+fn duchon_collocation_operator_candidates(
+    data: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    operator_penalties: &DuchonOperatorPenaltySpec,
+    length_scale: Option<f64>,
+    power: f64,
+    nullspace_order: DuchonNullspaceOrder,
+    aniso_log_scales: Option<&[f64]>,
+    identifiability_transform: Option<&Array2<f64>>,
+    workspace: &mut BasisWorkspace,
+) -> Result<Vec<PenaltyCandidate>, BasisError> {
+    let want_mass = matches!(operator_penalties.mass, OperatorPenaltySpec::Active { .. });
+    let want_tension = matches!(operator_penalties.tension, OperatorPenaltySpec::Active { .. });
+    if !want_mass && !want_tension {
+        return Ok(Vec::new());
+    }
+    let n_basis = centers.nrows();
+    let n = data.nrows();
+    let m = (DUCHON_COLLOCATION_OVERSAMPLE * n_basis).min(n);
+    let sample = select_thin_plate_knots(data, m)?;
+    // `max_op = 1`: value (D0) + gradient (D1) only; curvature is `Primary`.
+    let ops = build_duchon_collocation_operator_matriceswithworkspace(
+        centers,
+        sample.view(),
+        None,
+        length_scale,
+        power,
+        nullspace_order,
+        aniso_log_scales,
+        identifiability_transform.map(|t| t.view()),
+        1,
+        workspace,
+    )?;
+    let mut out = Vec::new();
+    if want_mass {
         out.push(normalize_penalty_candidate(
-            mass,
+            symmetrize(&centered_design_gram(&ops.d0)),
             0,
             PenaltySource::OperatorMass,
+        ));
+    }
+    if want_tension {
+        out.push(normalize_penalty_candidate(
+            symmetrize(&fast_ata(&ops.d1)),
+            0,
+            PenaltySource::OperatorTension,
         ));
     }
     Ok(out)
@@ -23599,27 +23651,16 @@ pub fn build_duchon_basiswithworkspace(
         };
         (design, identifiability_transform)
     };
-    // Structural data-jet penalty triplet. Rather than the closed-form Lebesgue
-    // / collocation operator Grams, the three penalties are amplitude / slope /
-    // curvature Grams of the *actual design* `B = [K(·,C)·Z | P]` evaluated and
-    // differentiated at the centers (used as quadrature points):
-    //   * mass      = centered design Gram `(B − 1μ')ᵀ(B − 1μ')` — only the
-    //                 global mean is free; no `∫f²` reversion length leaks in
-    //                 because the spring acts on deviations from the row-mean.
-    //   * tension   = `Σ_i Jᵢᵀ Jᵢ`, the slope Gram (J includes the affine
-    //                 polynomial columns' own slopes — the linear trend gets a
-    //                 dedicated slope dial, not a zero pad).
-    //   * stiffness = `Σ_i Hᵢᵀ Hᵢ`, the curvature Gram.
-    // The kernel block reuses the exact radial jet the forward design
-    // evaluates, so the penalty differentiates the same kernel column-for-
-    // column. This applies to BOTH the pure scale-free (`length_scale = None`,
-    // structural cubic `r³`) and the hybrid Matérn-blended (`length_scale =
-    // Some`) branches — the radial jet picks the matching kernel internally.
-    let emit_magnitude = matches!(
-        spec.operator_penalties.mass,
-        OperatorPenaltySpec::Active { .. }
-    );
-    let candidates = duchon_native_penalty_candidates(
+    // The Duchon penalty is a HILBERT SCALE of pure function-penalties, each a
+    // plain block with its own REML λ (REML deselects what the data don't need):
+    //   * curvature = the EXACT RKHS reproducing-norm Gram (`Primary`), `n`-free;
+    //   * trend     = the affine null-space slope ridge (`DoublePenaltyNullspace`);
+    //   * tension `Σ‖∇f‖²` + mass `Σ(f−f̄)²` = collocated on a density-blind `O(k)`
+    //     farthest-point sample of the data support (their continuous integrals
+    //     diverge for the polyharmonic kernel, so the support quadrature *is* the
+    //     penalty — `O(k)`-in-`n`, not the old sparse-center collocation that
+    //     under-resolved the basis and exploded).
+    let mut candidates = duchon_native_penalty_candidates(
         centers.view(),
         spec.length_scale,
         spec.power,
@@ -23628,8 +23669,18 @@ pub fn build_duchon_basiswithworkspace(
         &kernel_transform,
         identifiability_transform.as_ref(),
         poly_cols,
-        emit_magnitude,
     )?;
+    candidates.extend(duchon_collocation_operator_candidates(
+        data,
+        centers.view(),
+        &spec.operator_penalties,
+        spec.length_scale,
+        spec.power,
+        effective_nullspace_order,
+        aniso.as_deref(),
+        identifiability_transform.as_ref(),
+        workspace,
+    )?);
     let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
         filter_active_penalty_candidates_with_ops(candidates)?;
     Ok(BasisBuildResult {
