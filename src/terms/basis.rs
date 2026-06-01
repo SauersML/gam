@@ -13808,6 +13808,12 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
                     (0..dim).map(|axis| collocation_points[[i, axis]] - centers[[j, axis]]),
                 )
             };
+            // Floor coincident collocation/center pairs off the kernel's origin
+            // singularity: a farthest-point sample can land exactly on a center.
+            // The gradient/Hessian limits at r→0 are the zeros the `r > R_EPS`
+            // guards below already produce, so flooring only avoids the log-case
+            // `r²·log r` second-derivative blow-up at exact r=0.
+            let r = r.max(R_EPS);
             let (phi, q, t) = if let (Some(length_scale), Some(coeffs)) =
                 (length_scale, coeffs.as_ref())
             {
