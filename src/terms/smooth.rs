@@ -1342,14 +1342,22 @@ impl KroneckerPenaltySystem {
         let mut grad = Array1::<f64>::zeros(n_pen);
         let mut hess = Array2::<f64>::zeros((n_pen, n_pen));
         let tol = 1e-12;
+        let structural_zero_tol = 1e-12;
         let mut multi_idx = vec![0usize; d];
         loop {
-            let mut sigma = ridge;
+            let mut sigma = 0.0;
+            let mut structural_sigma = 0.0;
             for k in 0..d {
-                sigma += lambdas[k] * self.marginal_eigensystems[k].0[multi_idx[k]];
+                let marginal_eigenvalue = self.marginal_eigensystems[k].0[multi_idx[k]];
+                structural_sigma += marginal_eigenvalue;
+                sigma += lambdas[k] * marginal_eigenvalue;
             }
             if self.has_double_penalty {
+                structural_sigma += 1.0;
                 sigma += lambdas[d];
+            }
+            if structural_sigma > structural_zero_tol {
+                sigma += ridge;
             }
 
             if sigma > tol {

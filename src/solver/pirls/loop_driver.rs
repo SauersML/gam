@@ -512,15 +512,23 @@ pub(super) fn build_diagonal_penalty_from_kronecker(
     let mut diag = Array1::<f64>::zeros(p);
     let mut positive_indices = Vec::new();
 
+    const KRONECKER_STRUCTURAL_ZERO_TOL: f64 = 1e-12;
     let mut multi_idx = vec![0usize; d];
     let mut flat = 0usize;
     loop {
-        let mut sigma = kron_result.penalty_shrinkage_ridge;
+        let mut sigma = 0.0;
+        let mut structural_sigma = 0.0;
         for k in 0..d {
-            sigma += lambdas[k] * kron_result.marginal_eigenvalues[k][multi_idx[k]];
+            let marginal_eigenvalue = kron_result.marginal_eigenvalues[k][multi_idx[k]];
+            structural_sigma += marginal_eigenvalue;
+            sigma += lambdas[k] * marginal_eigenvalue;
         }
         if kron_result.has_double_penalty && lambdas.len() > d {
+            structural_sigma += 1.0;
             sigma += lambdas[d];
+        }
+        if structural_sigma > KRONECKER_STRUCTURAL_ZERO_TOL {
+            sigma += kron_result.penalty_shrinkage_ridge;
         }
         diag[flat] = sigma;
         if sigma > 0.0 {
