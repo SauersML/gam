@@ -172,7 +172,7 @@ jobs:
           set +e -u -o pipefail
           mapfile -t files < <(ls tests/quality_vs_*.rs 2>/dev/null | xargs -n1 basename | sed 's/\.rs$//')
           N=${#files[@]}; i=0
-          pass=0; diverge=0; refmiss=0; tmo=0; bf=0
+          pass=0; metricoff=0; gamerr=0; referr=0; testerr=0; tmo=0; bf=0
           # EVERYTHING the run produced lands under one directory that is uploaded
           # wholesale: the full per-test stdout+stderr logs (no tail truncation),
           # a rich un-truncated TSV, and a JSONL stream. The job-summary table and
@@ -192,10 +192,22 @@ jobs:
             echo "Each row is one test BINARY — often several sub-tests (a synthetic"
             echo "arm plus an \`_on_real_data\` arm); \`sub\` is passed/failed WITHIN the"
             echo "binary, and a single failing sub-test keeps the whole binary out of"
-            echo "PASS. \`cause\` separates a genuine gam-vs-reference divergence"
-            echo "(\`gam_diverge\`) from a missing/broken reference tool"
-            echo "(\`ref_unavail\`) and a timeout. Full per-test logs + an un-truncated"
-            echo "metric TSV + a JSONL stream are in the \`quality-results\` artifact."
+            echo "PASS. The \`outcome\` says exactly WHAT happened — it never collapses"
+            echo "distinct situations into one vague word:"
+            echo ""
+            echo "- \`PASS\` — met the quality bar."
+            echo "- \`METRIC_OFF\` — gam ran and produced output, but a quality metric"
+            echo "  missed its bound (an honest accuracy/calibration finding, NOT an error)."
+            echo "- \`GAM_ERROR\` — gam itself errored: the fit crashed, refused, or"
+            echo "  failed to converge (no usable output)."
+            echo "- \`REF_ERROR\` — the mature reference tool failed or is missing"
+            echo "  (R/Python package, system lib, namespace, or its script) — not gam."
+            echo "- \`TEST_ERROR\` — the test/harness setup is wrong (bad data, missing"
+            echo "  fixture, mismatched column lengths) — fix the test, not gam."
+            echo "- \`TIMEOUT\` — exceeded the 360s per-test wall-clock cap."
+            echo ""
+            echo "Full per-test logs + an un-truncated metric TSV + a JSONL stream are"
+            echo "in the \`quality-results\` artifact."
             echo ""
             echo "| # | test | outcome | cause | sub p/f | dur | metrics | reason |"
             echo "|---|---|---|---|---|---|---|---|"
@@ -229,10 +241,13 @@ jobs:
             # full log keeps everything regardless; this column is the structured,
             # greppable distillation of every metric the test printed.
             metric=$(grep -hoaE '(R2|r2|rmse|mae|rel_l2|l2|auc|deviance|nll|loglik|crps|acc|accuracy|logloss|concordance|c_index|seam|edf|pearson|spearman|coverage|width|bias|frechet|distance|geodesic|rho|ess|rhat|kl|wasserstein|calibration|brier|ci_|se_)[^ ,;)]*[=: ]+-?[0-9][0-9.eE+-]*' "$log" 2>/dev/null | tr '\n' ' ')
-            # Why it ended where it did: a missing/broken reference tool (R/Python
-            # package, system lib, namespace) vs a genuine divergence assertion.
-            refmarker=$(grep -aE 'there is no package called|could not find function|Error in library\(|package or namespace load failed|unable to load shared object|cannot open shared object|No module named|ModuleNotFoundError|reference .* body failed' "$log" | head -1)
+            # A reference tool failing/missing (R/Python package, system lib,
+            # namespace, broken generated script) — this is NOT a gam result.
+            refmarker=$(grep -aE 'there is no package called|could not find function|Error in library\(|package or namespace load failed|unable to load shared object|cannot open shared object|No module named|ModuleNotFoundError|IndentationError|reference .* body failed' "$log" | head -1)
+            # First panic: "<thread> panicked at <file:line>:" then the message.
             panicmsg=$(awk '/panicked at/{loc=$0; getline; print loc " :: " $0; exit}' "$log")
+            # gam-side fit errors (the fit crashed/refused/failed to converge).
+            gamfit_re='IntegrationFailed|InvalidConfig|IdentifiabilityFailure|Invalid input|could not broadcast|Newton step|transformation fit failed|workflow survival baseline failed|RemlOptimizationFailed|REML smoothing optimization'
             if [ "$outcome" = BUILDFAIL ]; then
               cause=build; reason=$(head -1 "$log"); bf=$((bf+1))
             elif [ "$rc" -eq 0 ]; then
@@ -240,10 +255,16 @@ jobs:
             elif [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
               outcome=TIMEOUT; cause=timeout; reason="exceeded 360s wall-clock"; tmo=$((tmo+1))
             elif [ -n "$refmarker" ]; then
-              # Reference tool missing/broken on the runner — NOT a gam result.
-              outcome=DIVERGE; cause=ref_unavail; reason="$refmarker"; refmiss=$((refmiss+1))
+              outcome=REF_ERROR; cause=reference_tool; reason="$refmarker"; referr=$((referr+1))
+            elif printf '%s' "$panicmsg" | grep -qaE 'src/test_support/reference\.rs|No such file or directory|rows, expected|reference column'; then
+              # Test/harness setup defect (bad data, missing fixture, length mismatch).
+              outcome=TEST_ERROR; cause=test_setup; reason="$panicmsg"; testerr=$((testerr+1))
+            elif printf '%s' "$panicmsg" | grep -qaE "$gamfit_re" || printf '%s' "$panicmsg" | grep -qaE 'panicked at src/'; then
+              outcome=GAM_ERROR; cause=gam_fit_failed; reason="$panicmsg"; gamerr=$((gamerr+1))
             else
-              outcome=DIVERGE; cause=gam_diverge; reason="${panicmsg:-nonzero exit $rc}"; diverge=$((diverge+1))
+              # gam produced output; a quality metric missed its bound. Honest
+              # accuracy/calibration finding — not an error.
+              outcome=METRIC_OFF; cause=quality_metric; reason="${panicmsg:-nonzero exit $rc}"; metricoff=$((metricoff+1))
             fi
             # Sanitize to single-line cells for the TSV / markdown table; the full
             # untouched text always remains in the per-test log artifact.
@@ -268,16 +289,18 @@ jobs:
             echo ""
             echo "### Totals"
             echo ""
-            echo "| outcome | count |"
-            echo "|---|---|"
-            echo "| PASS | $pass |"
-            echo "| DIVERGE — gam vs reference | $diverge |"
-            echo "| DIVERGE — reference tool unavailable | $refmiss |"
-            echo "| TIMEOUT | $tmo |"
-            echo "| BUILDFAIL | $bf |"
-            echo "| **total** | **$N** |"
+            echo "| outcome | count | meaning |"
+            echo "|---|---|---|"
+            echo "| PASS | $pass | met the quality bar |"
+            echo "| METRIC_OFF | $metricoff | gam ran; a quality metric missed its bound |"
+            echo "| GAM_ERROR | $gamerr | gam fit crashed / refused / failed to converge |"
+            echo "| REF_ERROR | $referr | reference tool failed or missing |"
+            echo "| TEST_ERROR | $testerr | test/harness setup defect |"
+            echo "| TIMEOUT | $tmo | exceeded 360s |"
+            echo "| BUILDFAIL | $bf | did not compile |"
+            echo "| **total** | **$N** | |"
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "pass=$pass gam_diverge=$diverge ref_unavail=$refmiss timeout=$tmo build_fail=$bf (of $N)"
+          echo "pass=$pass metric_off=$metricoff gam_error=$gamerr ref_error=$referr test_error=$testerr timeout=$tmo build_fail=$bf (of $N)"
           # Informational dashboard: divergences/timeouts are honest findings, not
           # pipeline failures.
           exit 0
