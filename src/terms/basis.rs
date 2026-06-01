@@ -32798,6 +32798,19 @@ mod tests {
         }
     }
 
+    fn assert_matrix_close(lhs: &Array2<f64>, rhs: &Array2<f64>, tol: f64) {
+        assert_eq!(lhs.dim(), rhs.dim(), "matrix shape mismatch");
+        let max_abs = lhs
+            .iter()
+            .zip(rhs.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_abs <= tol,
+            "matrix mismatch: max_abs={max_abs:.3e}, tol={tol:.3e}"
+        );
+    }
+
     #[test]
     fn test_hybrid_duchon_candidate_factory_admits_log_riesz_closed_form() {
         // (d=4, m=1, s=2, q=1) is an even-dimensional log-Riesz case:
