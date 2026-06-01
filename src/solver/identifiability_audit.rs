@@ -568,6 +568,44 @@ fn audit_identifiability_impl(
     }
     let p_total = *col_offsets.last().expect("col_offsets non-empty");
 
+    // Permanent layout diagnostic: name every block with its gauge priority,
+    // global column span, raw column count, and within-block range rank. A
+    // block whose `range_rank < original_dim` carries a redundancy that
+    // survived within-smooth nullspace absorption — i.e. an INTRA-block alias
+    // (e.g. a smooth's polynomial-nullspace constant colliding with the
+    // parametric intercept). Intra-block deficiencies cannot be resolved by
+    // cross-block gauge_priority ordering, so surfacing them here turns an
+    // opaque "first attributed drop: block X local column N" into an immediate
+    // "block X is internally rank-deficient" signal.
+    {
+        let layout: Vec<String> = blocks
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                let deficient = if b.design_range_rank < b.original_dim {
+                    "  ⚠WITHIN-BLOCK-DEFICIENT"
+                } else {
+                    ""
+                };
+                format!(
+                    "{}(prio={}, cols[{}..{}], dim={}, range_rank={}{})",
+                    b.block_name,
+                    specs[i].gauge_priority,
+                    col_offsets[i],
+                    col_offsets[i + 1],
+                    b.original_dim,
+                    b.design_range_rank,
+                    deficient,
+                )
+            })
+            .collect();
+        log::info!(
+            "[STAGE] identifiability audit: block layout p_total={} | {}",
+            p_total,
+            layout.join(" | "),
+        );
+    }
+
     if p_total == 0 {
         return Ok(IdentifiabilityAudit {
             blocks,
@@ -1063,12 +1101,58 @@ fn audit_identifiability_impl(
             // it indicates a >2-way structural alias that the pairwise
             // scan didn't catch and is the hardest case to fix.
             let attribution = if let Some(first_drop) = dropped_columns.first() {
+                // Name the columns the dropped column is collinear WITH (its
+                // alias partners), so the verdict reveals the actual redundancy
+                // — e.g. "collinear with 'marginal_surface' local column 0"
+                // (the intercept) — instead of only the demoted column's
+                // address. Also flag when the redundancy is INTRA-block, since
+                // that is precisely the case cross-block gauge_priority cannot
+                // resolve.
+                let partners: Vec<String> = aliased_pairs
+                    .iter()
+                    .filter_map(|p| {
+                        if p.block_a == first_drop.block && p.direction_a == first_drop.column {
+                            Some(format!(
+                                "'{}' local column {} (overlap={:.4})",
+                                p.block_b, p.direction_b, p.overlap
+                            ))
+                        } else if p.block_b == first_drop.block
+                            && p.direction_b == first_drop.column
+                        {
+                            Some(format!(
+                                "'{}' local column {} (overlap={:.4})",
+                                p.block_a, p.direction_a, p.overlap
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let alias_note = if partners.is_empty() {
+                    String::new()
+                } else {
+                    format!("; collinear with {}", partners.join(", "))
+                };
+                let within_block_note = blocks
+                    .iter()
+                    .find(|b| b.block_name == first_drop.block)
+                    .filter(|b| b.design_range_rank < b.original_dim)
+                    .map(|b| {
+                        format!(
+                            "; block '{}' is INTRA-BLOCK rank-deficient \
+                             (range_rank {}/{}) — NOT resolvable by cross-block \
+                             gauge_priority; the redundant column must be removed \
+                             or centered within the block",
+                            first_drop.block, b.design_range_rank, b.original_dim
+                        )
+                    })
+                    .unwrap_or_default();
                 format!(
-                    "first attributed drop: block '{}' local column {} \
+                    "first attributed drop: block '{}' local column {}{}{} \
                      (reparam: replace this column with a sum-to-zero or \
                      orthogonal-complement projection against earlier blocks, \
                      or remove the redundant term entirely)",
-                    first_drop.block, first_drop.column,
+                    first_drop.block, first_drop.column, alias_note, within_block_note,
                 )
             } else {
                 "no per-column attribution (>2-way structural alias); \
@@ -1437,12 +1521,58 @@ pub fn audit_identifiability_channel_aware(
         let mut parts: Vec<String> = Vec::new();
         if joint_rank_deficient && !gauge_resolves_rank_deficiency_ca {
             let attribution = if let Some(first_drop) = dropped_columns.first() {
+                // Name the columns the dropped column is collinear WITH (its
+                // alias partners), so the verdict reveals the actual redundancy
+                // — e.g. "collinear with 'marginal_surface' local column 0"
+                // (the intercept) — instead of only the demoted column's
+                // address. Also flag when the redundancy is INTRA-block, since
+                // that is precisely the case cross-block gauge_priority cannot
+                // resolve.
+                let partners: Vec<String> = aliased_pairs
+                    .iter()
+                    .filter_map(|p| {
+                        if p.block_a == first_drop.block && p.direction_a == first_drop.column {
+                            Some(format!(
+                                "'{}' local column {} (overlap={:.4})",
+                                p.block_b, p.direction_b, p.overlap
+                            ))
+                        } else if p.block_b == first_drop.block
+                            && p.direction_b == first_drop.column
+                        {
+                            Some(format!(
+                                "'{}' local column {} (overlap={:.4})",
+                                p.block_a, p.direction_a, p.overlap
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let alias_note = if partners.is_empty() {
+                    String::new()
+                } else {
+                    format!("; collinear with {}", partners.join(", "))
+                };
+                let within_block_note = blocks
+                    .iter()
+                    .find(|b| b.block_name == first_drop.block)
+                    .filter(|b| b.design_range_rank < b.original_dim)
+                    .map(|b| {
+                        format!(
+                            "; block '{}' is INTRA-BLOCK rank-deficient \
+                             (range_rank {}/{}) — NOT resolvable by cross-block \
+                             gauge_priority; the redundant column must be removed \
+                             or centered within the block",
+                            first_drop.block, b.design_range_rank, b.original_dim
+                        )
+                    })
+                    .unwrap_or_default();
                 format!(
-                    "first attributed drop: block '{}' local column {} \
+                    "first attributed drop: block '{}' local column {}{}{} \
                      (reparam: replace this column with a sum-to-zero or \
                      orthogonal-complement projection against earlier blocks, \
                      or remove the redundant term entirely)",
-                    first_drop.block, first_drop.column,
+                    first_drop.block, first_drop.column, alias_note, within_block_note,
                 )
             } else {
                 "no per-column attribution (>2-way structural alias in the \

@@ -5129,6 +5129,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     baseline_logslope: fit.baseline_slope,
                     score_warp_runtime: fit.score_warp_runtime.as_ref(),
                     link_dev_runtime: fit.link_dev_runtime.as_ref(),
+                    influence_absorber_width: fit.influence_absorber_width,
                 },
                 SavedModelSourceMetadata {
                     training_headers: ds.headers.clone(),
