@@ -2741,13 +2741,21 @@ pub struct CrossFitScoreCalibration {
 pub struct CtnStage1Recipe {
     /// Stage-1 response column name (the `y` the CTN transforms).
     pub response_column: String,
-    /// Stage-1 covariate-side formula RHS, parsed and built into the CTN
-    /// covariate `TermCollectionSpec` exactly as
-    /// `materialize_transformation_normal` does, so the refit covariate geometry
-    /// matches the original Stage-1 fit.
-    pub covariate_formula_rhs: String,
+    /// FIXED Stage-1 covariate basis spec — the *resolved* (frozen)
+    /// [`TermCollectionSpec`] from the original Stage-1 CTN fit
+    /// (`TransformationNormalFitResult::covariate_spec_resolved`), with spatial
+    /// centers / knots already pinned. Every fold refits the CTN against this
+    /// same spec, so the rebuilt covariate design has an identical column
+    /// geometry across folds and identical to the original Stage-1 fit — which
+    /// is what keeps `J`'s `p₁ = p_resp · p_cov` columns aligned (design §3).
+    /// Carrying the frozen spec (rather than re-parsing the formula and
+    /// re-freezing on the Stage-2 frame) also makes the geometry independent of
+    /// the Stage-2 data ordering / filtering.
+    pub covariate_spec: TermCollectionSpec,
     /// Stage-1 CTN config (response basis degree / knot count / penalties),
-    /// cloned from the original Stage-1 fit so per-fold refits reproduce it.
+    /// cloned from the original Stage-1 fit. Its `response_num_internal_knots`
+    /// is the FIXED response-basis size; the cross-fit pins it across folds so
+    /// `p_resp` (and hence `p₁`) is fold-invariant (design §3).
     pub config: TransformationNormalConfig,
     /// Optional Stage-1 weight column name.
     pub weight_column: Option<String>,
@@ -2820,19 +2828,19 @@ fn crossfit_select_rows_1d(source: &Array1<f64>, indices: &[usize]) -> Array1<f6
 /// the caller then leaves the Stage-2 spec's `score_influence_jacobian` field
 /// `None` and Stage-2 uses the supplied raw `z` with the free-warp fallback.
 ///
-/// When a recipe is present, the covariate basis is frozen once on the full
-/// data and the response-basis knot count is pre-resolved at the *smallest*
-/// fold complement size, so every fold refits the CTN at an identical
-/// `(p_resp, p_cov)` and therefore an identical `p₁ = p_resp · p_cov` column
-/// layout — the per-fold `J` blocks concatenate into a coherent `n × p₁` matrix
-/// (design §3). For each fold `f` the CTN is refit on the complement rows, then
-/// `marginal_slope_orthogonal::score_influence_jacobian` evaluates the held-out
-/// `z` and `J` on fold `f`'s rows; results are scattered back into full-n order.
+/// When a recipe is present, every fold refits the CTN against the recipe's
+/// FIXED frozen covariate spec, and the response-basis knot count is pre-resolved
+/// at the *smallest* fold complement size, so every fold refits the CTN at an
+/// identical `(p_resp, p_cov)` and therefore an identical `p₁ = p_resp · p_cov`
+/// column layout — the per-fold `J` blocks concatenate into a coherent `n × p₁`
+/// matrix (design §3). For each fold `f` the CTN is refit on the complement rows,
+/// then `marginal_slope_orthogonal::score_influence_jacobian` evaluates the
+/// held-out `z` and `J` on fold `f`'s rows; results scatter back into full-n
+/// order.
 fn crossfit_score_calibration(
     data: &Dataset,
     col_map: &HashMap<String, usize>,
     recipe: Option<&CtnStage1Recipe>,
-    policy: &crate::resource::ResourcePolicy,
 ) -> Result<Option<CrossFitScoreCalibration>, String> {
     let Some(recipe) = recipe else {
         return Ok(None);
@@ -2852,29 +2860,14 @@ fn crossfit_score_calibration(
     let offset_full = resolve_offset_column(data, col_map, recipe.offset_column.as_deref())
         .map_err(|e| e.to_string())?;
 
-    // Build + freeze the covariate basis ONCE on full data so every fold refit
-    // reuses identical spatial centers / knots ⇒ identical p_cov (design §3).
-    let parsed_cov = parse_formula(&format!(
-        "{} ~ {}",
-        recipe.response_column, recipe.covariate_formula_rhs
-    ))
-    .map_err(|e| e.to_string())?;
-    let mut frozen_notes = Vec::new();
-    let covariate_spec_raw = build_termspec_with_geometry_and_overrides(
-        &parsed_cov.terms,
-        data,
-        col_map,
-        &mut frozen_notes,
-        false,
-        policy,
-        None,
-    )
-    .map_err(|e| e.to_string())?;
-    let full_cov_design = build_term_collection_design(data.values.view(), &covariate_spec_raw)
+    // The covariate basis is the FIXED, already-frozen Stage-1 spec carried on
+    // the recipe (spatial centers / knots pinned at the original Stage-1 fit).
+    // Every fold refits the CTN against this same spec, so the rebuilt design
+    // has identical column geometry across folds ⇒ identical p_cov (design §3).
+    // Build the design once on full data only to read p_cov.
+    let frozen_cov_spec = recipe.covariate_spec.clone();
+    let full_cov_design = build_term_collection_design(data.values.view(), &frozen_cov_spec)
         .map_err(|e| e.to_string())?;
-    let frozen_cov_spec =
-        crate::smooth::freeze_term_collection_from_design(&covariate_spec_raw, &full_cov_design)
-            .map_err(|e| e.to_string())?;
     let p_cov = full_cov_design.design.ncols();
 
     let k = crossfit_fold_count(n);
@@ -5299,7 +5292,7 @@ fn materialize_bernoulli_marginal_slope<'a>(
     // leakage-projection block. With no CTN Stage-1 recipe, `z` stays raw and
     // the free-warp `score_warp` is the fallback basis.
     let (z, score_influence_jacobian) =
-        match crossfit_score_calibration(data, col_map, config.ctn_stage1.as_ref(), &policy)
+        match crossfit_score_calibration(data, col_map, config.ctn_stage1.as_ref())
             .map_err(|reason| WorkflowError::IntegrationFailed { reason })?
         {
             Some(calibration) => (calibration.z_oof, Some(calibration.jac_oof)),
@@ -5732,7 +5725,7 @@ fn materialize_survival<'a>(
     // Jacobian `J` for Stage-2's leakage-projection block. With no CTN Stage-1
     // recipe, the raw z surfaces stand and `score_warp` is the fallback basis.
     let crossfit_calibration = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
-        crossfit_score_calibration(data, col_map, config.ctn_stage1.as_ref(), &policy)
+        crossfit_score_calibration(data, col_map, config.ctn_stage1.as_ref())
             .map_err(|reason| WorkflowError::IntegrationFailed { reason })?
     } else {
         None
