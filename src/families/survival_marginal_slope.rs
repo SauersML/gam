@@ -22897,9 +22897,9 @@ mod tests {
 
     #[test]
     fn block_to_dense_matches_hand_scatter_bit_exact() {
-        for (pt, pm, pg, ph, pw) in PARITY_LAYOUTS {
-            let sl = parity_make_slices(pt, pm, pg, ph, pw);
-            let acc = parity_filled_accumulator(pt, pm, pg, ph, pw);
+        for (pt, pm, pg, ph, pw, pi) in PARITY_LAYOUTS {
+            let sl = parity_make_slices(pt, pm, pg, ph, pw, pi);
+            let acc = parity_filled_accumulator(pt, pm, pg, ph, pw, pi);
             let got = acc.to_dense(&sl);
             let want = parity_reference_dense(&acc, &sl);
             assert_eq!(
@@ -22913,9 +22913,9 @@ mod tests {
 
     #[test]
     fn block_diagonal_matches_dense_diagonal_bit_exact() {
-        for (pt, pm, pg, ph, pw) in PARITY_LAYOUTS {
-            let sl = parity_make_slices(pt, pm, pg, ph, pw);
-            let acc = parity_filled_accumulator(pt, pm, pg, ph, pw);
+        for (pt, pm, pg, ph, pw, pi) in PARITY_LAYOUTS {
+            let sl = parity_make_slices(pt, pm, pg, ph, pw, pi);
+            let acc = parity_filled_accumulator(pt, pm, pg, ph, pw, pi);
             let got = acc.diagonal(&sl);
             let want = parity_reference_dense(&acc, &sl).diag().to_owned();
             assert_eq!(
@@ -22929,9 +22929,9 @@ mod tests {
 
     #[test]
     fn block_operator_matvec_matches_dense_gemv() {
-        for (pt, pm, pg, ph, pw) in PARITY_LAYOUTS {
-            let sl = parity_make_slices(pt, pm, pg, ph, pw);
-            let acc = parity_filled_accumulator(pt, pm, pg, ph, pw);
+        for (pt, pm, pg, ph, pw, pi) in PARITY_LAYOUTS {
+            let sl = parity_make_slices(pt, pm, pg, ph, pw, pi);
+            let acc = parity_filled_accumulator(pt, pm, pg, ph, pw, pi);
             let dense = parity_reference_dense(&acc, &sl);
             let v = Array1::from_shape_fn(sl.total, |i| (i as f64 * 0.37).sin());
             let op = acc.into_operator(sl.clone());
@@ -22948,9 +22948,9 @@ mod tests {
 
     #[test]
     fn block_operator_bilinear_matches_dense_quadratic_form() {
-        for (pt, pm, pg, ph, pw) in PARITY_LAYOUTS {
-            let sl = parity_make_slices(pt, pm, pg, ph, pw);
-            let acc = parity_filled_accumulator(pt, pm, pg, ph, pw);
+        for (pt, pm, pg, ph, pw, pi) in PARITY_LAYOUTS {
+            let sl = parity_make_slices(pt, pm, pg, ph, pw, pi);
+            let acc = parity_filled_accumulator(pt, pm, pg, ph, pw, pi);
             let dense = parity_reference_dense(&acc, &sl);
             let v = Array1::from_shape_fn(sl.total, |i| (i as f64 * 0.37).sin());
             let u = Array1::from_shape_fn(sl.total, |i| (i as f64 * 0.53).cos());
@@ -22963,9 +22963,9 @@ mod tests {
 
     #[test]
     fn block_operator_dense_matches_accumulator_dense_bit_exact() {
-        for (pt, pm, pg, ph, pw) in PARITY_LAYOUTS {
-            let sl = parity_make_slices(pt, pm, pg, ph, pw);
-            let acc = parity_filled_accumulator(pt, pm, pg, ph, pw);
+        for (pt, pm, pg, ph, pw, pi) in PARITY_LAYOUTS {
+            let sl = parity_make_slices(pt, pm, pg, ph, pw, pi);
+            let acc = parity_filled_accumulator(pt, pm, pg, ph, pw, pi);
             let direct = acc.to_dense(&sl);
             let op = acc.into_operator(sl.clone());
             let via_op = op.to_dense();
@@ -22980,9 +22980,9 @@ mod tests {
 
     #[test]
     fn block_view_is_transpose_symmetric_across_present_pairs() {
-        for (pt, pm, pg, ph, pw) in PARITY_LAYOUTS {
-            let sl = parity_make_slices(pt, pm, pg, ph, pw);
-            let acc = parity_filled_accumulator(pt, pm, pg, ph, pw);
+        for (pt, pm, pg, ph, pw, pi) in PARITY_LAYOUTS {
+            let sl = parity_make_slices(pt, pm, pg, ph, pw, pi);
+            let acc = parity_filled_accumulator(pt, pm, pg, ph, pw, pi);
             for a in HessBlock::ALL {
                 if sl.range_of(a).is_none() {
                     continue;
