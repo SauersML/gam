@@ -5,6 +5,7 @@
 - Penalties must always be on the final function itself, never on the model coefficients. Exception: when it can be proven that penalizing model coefficients is precisely equivalent to the function value approach.
 - Fitting and inference must be fast on all scales of data, but especially large-scale data where it matters the most (with seamless transitions between strategies).
 - Never vendor external software.
+- Python should be a thin wrapper over Rust, and should avoid containing math or much logic. The Python library generally be in feature and behavior parity with the Rust library and CLI. Exception to both: if Python logic is necessary for interaction with external software, e.g., PyTorch.
 - The program must never run out of memory on reasonably-resourced computers.
 - REML (or LAML) always used, never GCV.
 - Penalties (prior towards no effect) should usually be applied, except when obvious (e.g., an intercept generally should not have a penalty).
