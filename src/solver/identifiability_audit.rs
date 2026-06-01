@@ -70,8 +70,8 @@
 //
 // # Algorithm (flat path)
 //
-// 1. Densify each block once (n × p_block). Record per-block pivoted-QR
-//    diagonal as `design_range_singular_values`.
+// 1. Densify each block once (n × p_block). Record per-block
+//    penalty-aware numerical rank as `design_range_rank`.
 // 2. Stack horizontally into `X_joint ∈ ℝ^{n×p_total}`. Sort columns by
 //    descending `gauge_priority` before RRQR so higher-priority blocks own
 //    shared directions (canonical-gauge ownership contract).
@@ -106,15 +106,12 @@ pub struct BlockIdentity {
     pub original_dim: usize,
     pub effective_dim: usize,
     /// Numerical rank of the block's column space at the n training
-    /// rows, computed by column-pivoted QR on the block in isolation
-    /// with the unified rank tolerance. Equal to `original_dim` for
-    /// any well-posed block; smaller values flag a within-block
-    /// rank deficiency that escaped within-smooth nullspace absorption.
+    /// rows, computed by penalty-aware column-pivoted RRQR on `[J; S]`
+    /// (so penalty-covered design-null directions count as identified).
+    /// Equal to `original_dim` for any well-posed block; smaller values
+    /// flag a within-block rank deficiency that escaped within-smooth
+    /// nullspace absorption.
     pub design_range_rank: usize,
-    /// Pivoted-QR diagonal magnitudes for the block, sorted descending.
-    /// Length = `original_dim`. Stored for diagnostics; the audit's
-    /// drop decisions use the joint pivot, not these per-block values.
-    pub design_range_singular_values: Vec<f64>,
 }
 
 /// A pair `(block_a.column → block_b.column)` whose normalised
@@ -445,8 +442,8 @@ fn signed_cosine(dot: f64, norm_a: f64, norm_b: f64) -> f64 {
 /// The algorithm:
 ///   1. Densify each block once (chunked, n × p_block; biobank n,
 ///      small p_block — total joint width is the GAM smooth budget,
-///      not n). Each block's pivoted-QR diagonal becomes its
-///      `design_range_singular_values`.
+///      not n). Each block's penalty-aware numerical rank is recorded
+///      as `design_range_rank`.
 ///   2. Stack horizontally into `X_joint ∈ ℝ^{n×p_total}` in spec
 ///      order; column-pivoted QR identifies columns linearly
 ///      dependent on earlier (pivot-rank-truncated) columns.
@@ -551,7 +548,6 @@ fn audit_identifiability_impl(
             original_dim: p_block,
             effective_dim: p_block,
             design_range_rank: block_rank,
-            design_range_singular_values: Vec::new(),
         });
         let next_offset = col_offsets[col_offsets.len() - 1] + p_block;
         col_offsets.push(next_offset);
@@ -1420,12 +1416,10 @@ pub fn audit_identifiability_channel_aware(
             block_name: spec.name.clone(),
             original_dim: p_block,
             effective_dim: kept,
-            // The channel-aware path does not produce per-block
-            // singular values in the flat-X sense; report an empty
-            // vector and rely on `effective_dim` < `original_dim`
-            // as the structural-rank signal.
+            // The channel-aware path does not produce a separate
+            // per-block penalty-aware rank; rely on `effective_dim`
+            // < `original_dim` as the structural-rank signal.
             design_range_rank: kept,
-            design_range_singular_values: Vec::new(),
         });
         let next = col_offsets[col_offsets.len() - 1] + p_block;
         col_offsets.push(next);
