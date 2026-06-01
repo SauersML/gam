@@ -119,7 +119,9 @@ mod cuda {
     /// that pairing consistent — the device pointer passed in is typed `*mut
     /// Self` / `*const Self`, so a mismatched symbol would hand cuSOLVER a
     /// wrongly-typed buffer.
-    trait CholScalar: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Copy {
+    pub(crate) trait CholScalar:
+        cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Copy
+    {
         /// cuSOLVER `*potrf_bufferSize`: `(handle, uplo, n, A, lda, *lwork)`.
         ///
         /// `a` is a live `n*n` column-major device buffer of type `Self`,
@@ -296,7 +298,13 @@ mod cuda {
     /// Factor a p×p SPD device buffer in-place (lower-triangular Cholesky) at
     /// precision `T`, querying and allocating its own workspace. Returns `Err`
     /// if the matrix is singular/indefinite at precision `T`.
-    fn potrf_in_place_generic<T: CholScalar>(
+    ///
+    /// This is the single-matrix POTRF core shared across the GPU layer:
+    /// `solver.rs`'s `potrf_in_place`/`spotrf_in_place` and `linalg.rs`'s
+    /// `potrf_lower_in_place` all route through it (the latter mapping the
+    /// `Result` to its `Option` contract at the boundary). The batched POTRF
+    /// (`cusolverDnDpotrfBatched`) in `linalg.rs` is intentionally separate.
+    pub(crate) fn potrf_in_place_generic<T: CholScalar>(
         solver: &DnHandle,
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
         p: usize,
@@ -840,8 +848,8 @@ mod cuda {
 #[cfg(target_os = "linux")]
 pub(crate) use cuda::{
     check_deferred_potrf_info, check_deferred_potrs_info, cholesky_logdet_from_col_major,
-    context_and_stream, pinned_htod, potrf_in_place, potrf_in_place_reuse, potrf_query_lwork,
-    potrs_in_place, potrs_in_place_reuse,
+    context_and_stream, pinned_htod, potrf_in_place, potrf_in_place_generic, potrf_in_place_reuse,
+    potrf_query_lwork, potrs_in_place, potrs_in_place_reuse,
 };
 
 /// Solve `A x = b` with fp32 Cholesky factorization + fp64-residual iterative
