@@ -8794,7 +8794,15 @@ impl<'a> RemlState<'a> {
                     for idx in 0..alo_gradient.len() {
                         gradient[idx] += alo_gradient[idx];
                     }
-                    result.hessian = HessianResult::Unavailable;
+                    // Retain the base REML analytic Hessian as the second-order
+                    // model. ARC's adaptive cubic regularization drives
+                    // convergence on the exact augmented cost+gradient via the
+                    // ratio test; an approximate Hessian only changes step
+                    // quality, not correctness. Dropping it forces the outer
+                    // route (planned as HessianSource::Analytic for the dense
+                    // Gaussian-identity path) to fail the runtime invariant
+                    // "outer plan declared Analytic but runtime returned
+                    // Unavailable" the instant the ALO gate fires.
                 }
                 _ => {
                     log::warn!(
