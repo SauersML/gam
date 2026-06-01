@@ -253,6 +253,12 @@ pub struct SurvivalMarginalSlopeFitResult {
     pub time_block_penalties_len: usize,
     pub score_warp_runtime: Option<DeviationRuntime>,
     pub link_dev_runtime: Option<DeviationRuntime>,
+    /// Width `p₁` of the absorbed Stage-1 influence block (#461) when the fit
+    /// hosted a dedicated additive absorber (the trailing block). `None` when no
+    /// CTN Stage-1 chain produced an influence Jacobian. The predictor drops the
+    /// absorber's `γ`; this width lets it account for the extra trailing block
+    /// and slice `γ` out of the joint covariance.
+    pub influence_absorber_width: Option<usize>,
 }
 
 // ── Family struct ─────────────────────────────────────────────────────
@@ -22274,6 +22280,9 @@ pub fn fit_survival_marginal_slope_terms(
         time_block_penalties_len: time_penalties_len,
         score_warp_runtime,
         link_dev_runtime,
+        influence_absorber_width: influence_absorber_residualized
+            .as_ref()
+            .map(|z_tilde| z_tilde.ncols()),
     })
 }
 
