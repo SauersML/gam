@@ -1,7 +1,6 @@
 use crate::cache::Fingerprinter;
 use crate::faer_ndarray::FaerEigh;
 use crate::faer_ndarray::{FaerCholesky, fast_atb, fast_av};
-use crate::linalg::utils::StableSolver;
 use crate::matrix::{
     DesignMatrix, EmbeddedColumnBlock, EmbeddedSquareBlock, LinearOperator, SignedWeightsView,
     SymmetricMatrix, dense_rowwise_kronecker,
@@ -8161,35 +8160,6 @@ fn weighted_normal_equations(
     Ok((xtwx, xtwy))
 }
 
-fn solve_spd_systemwith_policy(
-    lhs: &Array2<f64>,
-    rhs: &Array1<f64>,
-    ridge_floor: f64,
-    ridge_policy: RidgePolicy,
-) -> Result<Array1<f64>, String> {
-    let p = lhs.nrows();
-    if lhs.ncols() != p || rhs.len() != p {
-        return Err(CustomFamilyError::DimensionMismatch {
-            reason: "exact-newton system dimension mismatch".to_string(),
-        }
-        .into());
-    }
-    let baseridge = if ridge_policy.include_laplacehessian {
-        effective_solverridge(ridge_floor)
-    } else {
-        0.0
-    };
-    let solver = StableSolver::new("custom-family SPD block solve");
-    solver
-        .solvevectorwithridge_retries(lhs, rhs, baseridge)
-        .or_else(|| {
-            pinv_positive_part(lhs, effective_solverridge(ridge_floor))
-                .ok()
-                .map(|pinv| pinv.dot(rhs))
-        })
-        .ok_or_else(|| "exact-newton block solve failed after ridge retries".to_string())
-}
-
 fn exact_newton_stabilizing_shift(lhs_dense: &Array2<f64>, ridge_floor: f64) -> Option<f64> {
     let floor = effective_solverridge(ridge_floor);
     match FaerEigh::eigh(lhs_dense, Side::Lower) {
@@ -8922,24 +8892,49 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
                 }
                 step
             } else {
-                solve_spd_systemwith_policy(
-                    &lhs_dense,
-                    &rhs_step,
-                    ctx.options.ridge_floor,
-                    ctx.options.ridge_policy,
-                )
-                .or_else(|_: String| -> Result<Array1<f64>, String> {
-                    // Diagonal fallback: steepest descent scaled by the
-                    // diagonal of the Hessian. This always produces a
-                    // finite step when the gradient is finite.
-                    let diag_step: Array1<f64> = (0..lhs_dense.nrows())
+                // Non-strict (RidgedQuadraticReml) families share the strict
+                // path's LM δ-ridge continuation. For a nonconvex block whose
+                // likelihood Hessian H_β is INDEFINITE away from the optimum —
+                // e.g. the squared-coefficient SCOP transformation-normal tensor
+                // over a smooth covariate, where the I(y)⊗b(x) columns are
+                // strongly collinear — the previous `solve_spd_systemwith_policy`
+                // (ridge-retry + pinv-positive-part) returns a valid but
+                // poorly-scaled descent step that crawls and hits the inner
+                // cycle cap. The eigenvalue-floored LM continuation produces a
+                // well-scaled Newton step on exactly those indefinite /
+                // ill-conditioned systems. It is a STRICT SUPERSET of the plain
+                // solve: when H_β + S is SPD and well-conditioned it reduces to
+                // the same Cholesky step (zero escalations), only escalating the
+                // floor when the system is genuinely indefinite — so
+                // well-behaved families see no behaviour change. Internal to the
+                // solve; β is recovered in the raw basis, so dimensionality /
+                // identifiability are untouched.
+                let step = match strict_solve_spd_with_lm_continuation(&lhs_dense, &rhs_step) {
+                    Ok((step, lm_stats)) => {
+                        if lm_stats.escalations > 0 {
+                            log::debug!(
+                                "[joint-Newton/lm] block={} ({}): non-strict δ-ridge continuation \
+                                 succeeded after {} escalation(s) at δ={:.3e}",
+                                ctx.block_idx,
+                                ctx.spec.name,
+                                lm_stats.escalations,
+                                lm_stats.delta_used,
+                            );
+                        }
+                        step
+                    }
+                    // Final guard: only if the LM continuation itself fails to
+                    // produce a finite step do we fall back to the diagonal-
+                    // scaled steepest-descent direction (always finite when the
+                    // gradient is finite).
+                    Err(_) => (0..lhs_dense.nrows())
                         .map(|i| {
                             let d = lhs_dense[[i, i]].abs().max(1e-8);
                             rhs_step[i] / d
                         })
-                        .collect();
-                    Ok(diag_step)
-                })?
+                        .collect(),
+                };
+                step
             };
             let beta = &ctx.states[ctx.block_idx].beta + &delta;
             Ok(BlockUpdateResult {
