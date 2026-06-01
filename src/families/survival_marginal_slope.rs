@@ -14094,6 +14094,15 @@ impl SurvivalMarginalSlopeFamily {
         if self.score_dim() != 1 {
             return Ok(None);
         }
+        // The absorbed Stage-1 influence channel (#461) adds a per-row index
+        // offset `o_infl = Z̃_infl[row,:]·γ` to η₁ that the GPU flex kernel does
+        // not yet carry (the on-device kernel emits a fixed 4-primary jet). Until
+        // the survival flex GPU kernel grows the `o_infl` primary coordinate,
+        // force CPU for absorber-active fits so the device path can never silently
+        // drop the channel; the CPU path is the source of truth.
+        if self.influence_absorber.is_some() {
+            return Ok(None);
+        }
         let n = self.n;
         let g_eta: &Array1<f64> = &block_states[2].eta;
         if g_eta.len() != n {
