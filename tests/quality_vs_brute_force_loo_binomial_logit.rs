@@ -139,16 +139,45 @@ fn alo_eta_tilde_matches_exact_loo_binomial_logit() {
     init_parallelism();
 
     // ---- load identical real data once ------------------------------------
-    let ds = load_csvwith_inferred_schema(Path::new(HEART_CSV))
+    let full_ds = load_csvwith_inferred_schema(Path::new(HEART_CSV))
         .expect("load heart_failure_clinical_records_dataset.csv");
+    {
+        let n_full = full_ds.values.nrows();
+        assert_eq!(
+            n_full, 299,
+            "heart failure dataset should have 299 rows, got {n_full}"
+        );
+    }
+
+    // The exact-LOO oracle below refits the GAM once per held-out row, an
+    // O(n) sequence of full PIRLS+REML fits (so the whole test is O(n^2) in
+    // fit cost). The ground-truth correctness claim (ALO == exact n-fold refit
+    // to round-off) and the predictive-honesty bars hold for *any* n, so we
+    // deterministically subsample the 299 real patients down to a smaller cohort
+    // — keeping a genuine real-data binomial/logit signal while bounding the
+    // refit count. A fixed stride preserves the spread of ejection_fraction
+    // across its 17 distinct values (no RNG, fully reproducible).
+    const TARGET_ROWS: usize = 120;
+    let stride = full_ds.values.nrows().div_ceil(TARGET_ROWS);
+    let keep_rows: Vec<usize> = (0..full_ds.values.nrows()).step_by(stride).collect();
+    let p_cols = full_ds.headers.len();
+    let mut sub_values = Array2::<f64>::zeros((keep_rows.len(), p_cols));
+    for (out_row, &src_row) in keep_rows.iter().enumerate() {
+        sub_values
+            .row_mut(out_row)
+            .assign(&full_ds.values.row(src_row));
+    }
+    let mut ds = full_ds.clone();
+    ds.values = sub_values;
+
     let col = ds.column_map();
     let pred_idx = col["ejection_fraction"];
     let n_headers = ds.headers.len();
     let x: Vec<f64> = ds.values.column(pred_idx).to_vec();
     let n = x.len();
-    assert_eq!(
-        n, 299,
-        "heart failure dataset should have 299 rows, got {n}"
+    assert!(
+        (90..=160).contains(&n),
+        "subsampled heart cohort should be ~120 rows, got {n}"
     );
 
     // ---- full fit + ALO ----------------------------------------------------
