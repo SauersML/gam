@@ -154,6 +154,7 @@ fn build_problem(
             score_warp: None,
             link_dev: None,
             latent_z_policy: LatentZPolicy::exploratory_fit_weighted(),
+            score_influence_jacobian: None,
         },
     )
 }

@@ -162,6 +162,7 @@ fn build_problem(
         score_warp,
         link_dev,
         latent_z_policy: LatentZPolicy::exploratory_fit_weighted(),
+        score_influence_jacobian: None,
     };
     (data, spec)
 }
