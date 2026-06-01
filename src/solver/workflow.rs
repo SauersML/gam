@@ -2750,11 +2750,12 @@ pub struct CtnStage1Recipe {
     /// keeping `J`'s `p₁ = p_resp · p_cov` columns aligned (design §3).
     ///
     /// The recipe carries the formula RHS (a primitive string) rather than a
-    /// resolved [`TermCollectionSpec`] because this struct is populated both by
-    /// the in-process entry point ([`fit_marginal_slope_from_ctn`]) and by the
-    /// gamfit FFI marshaller (`gamfit/_calibrated_slope.py`), which
-    /// can only serialize primitives over the JSON boundary — a `TermCollectionSpec`
-    /// is not serializable. Freezing on the full Stage-2 data is equivalent to
+    /// resolved [`TermCollectionSpec`] because this struct is populated both via
+    /// [`CtnStage1Recipe::new`] (set on [`FitConfig::ctn_stage1`], then
+    /// [`fit_from_formula`]) and by the gamfit FFI marshaller
+    /// (`gamfit/_calibrated_slope.py`), which can only serialize primitives over
+    /// the JSON boundary — a `TermCollectionSpec` is not serializable. Freezing on
+    /// the full Stage-2 data is equivalent to
     /// freezing on the Stage-1 data whenever the two stages share a frame (the
     /// calibrated-chain contract), so the column geometry still matches Stage-1.
     pub covariate_formula_rhs: String,
