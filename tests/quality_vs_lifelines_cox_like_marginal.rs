@@ -40,7 +40,8 @@
 //!
 //! ## Data — real, identical rows to both engines
 //!
-//! `heart_failure_clinical_records_dataset.csv` (n=299, ~32% censored). Event is
+//! `heart_failure_clinical_records_dataset.csv` (n=299: 96 deaths, 203 censored,
+//! i.e. a ~32% event rate / ~68% right-censoring rate). Event is
 //! `DEATH_EVENT`, follow-up is `time` (days). Right-censored shorthand
 //! `Surv(time, DEATH_EVENT)`. Covariates: `ejection_fraction` is the modeled
 //! smooth covariate (gam's latent score `z`; Cox's continuous covariate), `sex`
@@ -183,9 +184,14 @@ fn gam_marginal_slope_heldout_concordance_matches_or_beats_lifelines_coxph() {
     assert_eq!(n, 299, "heart-failure dataset should have n=299, got {n}");
     let n_events: usize = event.iter().filter(|&&e| e == 1.0).count();
     let cens_frac = 1.0 - n_events as f64 / n as f64;
+    // The UCI heart-failure dataset has 96 deaths (DEATH_EVENT=1) and 203
+    // survivors (right-censored) out of n=299: a ~32% EVENT rate, i.e. a ~68%
+    // censoring rate — a realistic, moderate-to-heavy right-censoring level for a
+    // clinical Cox-like marginal-slope comparison. This is a sanity check on the
+    // fixed real data, not a gam quality metric.
     assert!(
-        (0.25..0.40).contains(&cens_frac),
-        "expected ~32% censoring, got {cens_frac:.3}"
+        (0.60..0.75).contains(&cens_frac),
+        "expected ~68% censoring (~32% event rate) for the heart-failure dataset, got {cens_frac:.3}"
     );
 
     // ---- deterministic train/test split (fixed, reproducible, no RNG) -----
