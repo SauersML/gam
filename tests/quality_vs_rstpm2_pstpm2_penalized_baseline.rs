@@ -287,6 +287,7 @@ fn gam_penalized_baseline_predicts_heldout_survival_on_cirrhosis() {
         ],
         &format!(
             r#"
+            suppressPackageStartupMessages(library(mgcv))
             suppressPackageStartupMessages(library(rstpm2))
             ta <- c({test_ages})
             # Penalized generalized survival model: thin-plate penalized spline on
