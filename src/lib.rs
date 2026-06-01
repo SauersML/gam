@@ -119,8 +119,9 @@ pub use solver::protocol::{
     LatentScoreSemantics, MarginalSlopeCalibrationProtocol, SurvivalMarginalSlopeProtocol,
 };
 pub use solver::workflow::{
-    BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, CrossFitScoreCalibration,
-    CtnStage1Recipe, FitConfig, FitRequest, FitResult, GaussianLocationScaleFitRequest,
+    CALIBRATED_SLOPE_Z_COLUMN, BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest,
+    CrossFitScoreCalibration, CtnStage1Recipe, FitConfig, FitRequest, FitResult,
+    GaussianLocationScaleFitRequest,
     LatentBinaryFitRequest, LatentSurvivalFitRequest, LinkWiggleConfig, MaterializedModel,
     PreparedSurvivalTimeStack, StandardBinomialWiggleConfig, StandardFitRequest, StandardFitResult,
     SurvivalLocationScaleFitRequest, SurvivalLocationScaleFitResult, SurvivalMarginalSlopeFitRequest,

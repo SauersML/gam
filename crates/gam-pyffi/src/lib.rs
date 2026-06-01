@@ -24343,8 +24343,43 @@ fn validate_formula_json_impl(
     formula: String,
     config_json: Option<&str>,
 ) -> Result<String, String> {
-    let dataset = dataset_with_inferred_schema(headers, rows)?;
-    let fit_config = parse_fit_config(config_json)?;
+    let mut dataset = dataset_with_inferred_schema(headers, rows)?;
+    let mut fit_config = parse_fit_config(config_json)?;
+    // Calibrated marginal-slope chain (#461): validation must NOT fit Stage-1
+    // (it is purely structural and should stay cheap). When a CTN Stage-1 recipe
+    // is present the real fit synthesizes the latent-score column; here we
+    // synthesize a PLACEHOLDER zero-valued score column under the same reserved
+    // name and point z_column at it, so the Stage-2 materializer validates the
+    // marginal-slope structure without a Stage-1 fit. Strip ctn_stage1 first so
+    // the structural materialize does not attempt cross-fitting.
+    if fit_config.ctn_stage1.is_some() {
+        let reserved_z = gam::CALIBRATED_SLOPE_Z_COLUMN;
+        fit_config.ctn_stage1 = None;
+        if dataset.headers.iter().any(|name| name == reserved_z) {
+            return Err(format!(
+                "reserved calibrated-slope score column '{reserved_z}' already exists in the \
+                 input data; rename it before validating the calibrated chain"
+            ));
+        }
+        let n = dataset.values.nrows();
+        let old_cols = dataset.values.ncols();
+        let mut values = Array2::<f64>::zeros((n, old_cols + 1));
+        values.slice_mut(s![.., ..old_cols]).assign(&dataset.values);
+        dataset.values = values;
+        dataset.headers.push(reserved_z.to_string());
+        dataset
+            .column_kinds
+            .push(gam::inference::model::ColumnKindTag::Continuous);
+        dataset
+            .schema
+            .columns
+            .push(gam::inference::model::SchemaColumn {
+                name: reserved_z.to_string(),
+                kind: gam::inference::model::ColumnKindTag::Continuous,
+                levels: Vec::new(),
+            });
+        fit_config.z_column = Some(reserved_z.to_string());
+    }
     let materialized = materialize(&formula, &dataset, &fit_config)?;
     let (family_name, model_class, supported_by_python) = request_metadata(&materialized.request);
     let response_column = response_column_name(&formula);
