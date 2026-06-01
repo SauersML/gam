@@ -32,14 +32,28 @@
 //! `k = 0` is the unconstrained location block `b(x)`; rows `k ≥ 1` are the
 //! squared SCOP shape blocks for `γ_k(x)`.
 
-use crate::faer_ndarray::fast_abt;
+use crate::faer_ndarray::{
+    FaerArrayView, factorize_symmetricwith_fallback, fast_ab, fast_abt, fast_xt_diag_x,
+    fast_xt_diag_y,
+};
 use crate::families::transformation_normal::{
     TRANSFORMATION_MONOTONICITY_EPS, TransformationNormalFitResult, transformation_normal_pit_score,
 };
 use crate::inference::model::TRANSFORMATION_SCORE_PIT_CLIP_EPS;
+use crate::matrix::FactorizedSystem;
 use crate::probability::{normal_cdf, normal_pdf, standard_normal_quantile};
 use crate::smooth::build_term_collection_design;
+use faer::Side;
 use ndarray::{Array1, Array2, ArrayView2};
+
+/// Fixed (NOT REML-learned) log-λ for the influence-absorber block's ridge.
+///
+/// The §3 absorbed block `+Z_infl·γ` carries a small fixed ridge `½·ρ·‖γ‖²`
+/// (`ρ = exp(log_λ)`) so the joint solve soaks the `span(Z_infl)` component of
+/// the η-residual into `γ` without that block being treated as a smooth/REML
+/// surface. `log_λ = 0` ⇒ `ρ = 1`: enough to keep `γ` finite and bounded while
+/// the much larger marginal/logslope likelihood curvature dominates the fit.
+pub(crate) const INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA: f64 = 0.0;
 
 /// Per-row, per-θ₁ score-influence Jacobian `∂z/∂θ₁` for a fitted CTN, plus the
 /// latent score `z` itself on the same rows.
@@ -321,4 +335,64 @@ pub fn influence_block_design(
         row.mapv_inplace(|v| v * scale);
     }
     out
+}
+
+/// Residualize the influence columns `Z_infl` against the **marginal** design
+/// span in the rigid-pilot row metric `W`, retaining the logslope overlap
+/// (#461, design §3 — single source of truth for the BMS and survival absorbed
+/// blocks):
+///
+///   Z̃ = Z − M·(MᵀWM + εI)⁻¹·MᵀW·Z.
+///
+/// Residualizing against **marginal only** deliberately keeps the
+/// logslope-aligned component, so the absorber soaks the leakage direction that
+/// would otherwise manufacture spurious `β(x)` heterogeneity. `W` is the PIRLS
+/// row inner product at the rigid pilot, so the resulting orthogonality
+/// `MᵀW Z̃ ≈ 0` holds in the same metric the penalized joint solve sees, not
+/// merely in the Euclidean sense. `eps` is the (caller-scaled) ridge added to
+/// the weighted marginal Gram diagonal so the projection solve stays stable when
+/// the marginal design is rank-deficient at the pilot.
+///
+/// `z_infl` must already be the `influence_block_design` output (`n × p₁`).
+/// When the marginal design has zero columns the raw `z_infl` is returned (no
+/// span to project out).
+pub(crate) fn residualize_influence_columns(
+    z_infl: &Array2<f64>,
+    marginal_design: ArrayView2<f64>,
+    w_metric: &Array1<f64>,
+    eps: f64,
+) -> Array2<f64> {
+    let n = marginal_design.nrows();
+    debug_assert_eq!(
+        z_infl.nrows(),
+        n,
+        "residualize_influence_columns: Z_infl rows must equal marginal design rows"
+    );
+    debug_assert_eq!(
+        w_metric.len(),
+        n,
+        "residualize_influence_columns: row metric length must equal marginal design rows"
+    );
+    let p_m = marginal_design.ncols();
+    if p_m == 0 {
+        // No marginal span to residualize against; the raw directions are the
+        // absorbed columns.
+        return z_infl.clone();
+    }
+    // Weighted Gram MᵀWM and cross term MᵀW Z in the pilot row metric.
+    let mut gram = fast_xt_diag_x(&marginal_design, w_metric);
+    for i in 0..p_m {
+        gram[[i, i]] += eps;
+    }
+    let cross = fast_xt_diag_y(&marginal_design, w_metric, z_infl);
+    let gram_view = FaerArrayView::new(&gram);
+    let factor = factorize_symmetricwith_fallback(gram_view.as_ref(), Side::Lower)
+        .expect("residualize_influence_columns: weighted marginal Gram factorization failed");
+    // coeffs = (MᵀWM + εI)⁻¹ MᵀW Z   (p_m × p₁)
+    let coeffs = factor
+        .solvemulti(&cross)
+        .expect("residualize_influence_columns: marginal projection solve failed");
+    // Z̃ = Z − M·coeffs.
+    let projection = fast_ab(&marginal_design, &coeffs);
+    z_infl - &projection
 }
