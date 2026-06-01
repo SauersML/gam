@@ -90,7 +90,7 @@ use ndarray::{Array1, Array2};
 
 use crate::families::custom_family::{FamilyLinearizationState, ParameterBlockSpec};
 use crate::linalg::faer_ndarray::{
-    FaerEigh, FaerQr, default_rrqr_rank_alpha, rrqr_with_permutation,
+    FaerEigh, default_rrqr_rank_alpha, rrqr_with_permutation,
 };
 use crate::solver::estimate::EstimationError;
 
@@ -541,19 +541,17 @@ fn audit_identifiability_impl(
         // invariant could be checked against the audit-visible rows.
         let dense = &dense_blocks[idx];
         let p_block = dense.ncols();
-        // Penalty-aware: rank of `[J; S]`, so penalty-covered (design-null but
-        // regularized) directions count as identified. `count_rank`'s `n`
-        // argument scales the tolerance; pass the augmented row count.
-        let aug_rows = n + block_penalties[idx].as_ref().map_or(0, |_| p_block);
-        let block_singular =
-            block_penalty_aware_qr_diagonal(dense, block_penalties[idx].as_ref())?;
-        let block_rank = count_rank(&block_singular, aug_rows, p_block);
+        // Penalty-aware, rank-revealing: rank of `[J; S]`, so penalty-covered
+        // (design-null but regularized) directions count as identified. RRQR is
+        // rank-revealing (the prior plain-QR diagonal was not), so the reported
+        // range_rank is now an honest numerical rank.
+        let block_rank = block_penalty_aware_rank(dense, block_penalties[idx].as_ref())?;
         blocks.push(BlockIdentity {
             block_name: spec.name.clone(),
             original_dim: p_block,
             effective_dim: p_block,
             design_range_rank: block_rank,
-            design_range_singular_values: block_singular,
+            design_range_singular_values: Vec::new(),
         });
         let next_offset = col_offsets[col_offsets.len() - 1] + p_block;
         col_offsets.push(next_offset);
@@ -2083,38 +2081,42 @@ fn block_structural_penalty_dense(spec: &ParameterBlockSpec) -> Option<Array2<f6
     any.then_some(s)
 }
 
-/// Penalty-aware rank-revealing pivots for a block: the QR-pivot diagonal of the
-/// design `J` AUGMENTED with the block's structural penalty rows `[J; S]`. When
-/// the block has no penalty this is exactly `block_pivoted_qr_diagonal(J)`.
-fn block_penalty_aware_qr_diagonal(
+/// Penalty-aware **rank-revealing** column rank of a block: the numerical rank
+/// of the design `J` AUGMENTED with the block's structural penalty rows `[J; S]`
+/// (column count unchanged at `p_block`; null space = `ker(J) ∩ ker(S)`). When
+/// the block has no penalty this is the rank of `J` itself.
+///
+/// Uses column-pivoted RRQR (`rrqr_with_permutation`), which IS rank-revealing,
+/// rather than a plain (non-pivoted) QR whose R diagonal can scatter a near-zero
+/// pivot early and under/over-count the rank of a deficient matrix. Tolerance
+/// matches the joint RRQR.
+fn block_penalty_aware_rank(
     block: &Array2<f64>,
     structural_penalty: Option<&Array2<f64>>,
-) -> Result<Vec<f64>, EstimationError> {
-    match structural_penalty {
-        None => block_pivoted_qr_diagonal(block),
+) -> Result<usize, EstimationError> {
+    let augmented_owned;
+    let target: &Array2<f64> = match structural_penalty {
+        None => block,
         Some(s) => {
             let n = block.nrows();
             let p = block.ncols();
             let mut augmented = Array2::<f64>::zeros((n + p, p));
             augmented.slice_mut(ndarray::s![..n, ..]).assign(block);
             augmented.slice_mut(ndarray::s![n.., ..]).assign(s);
-            block_pivoted_qr_diagonal(&augmented)
+            augmented_owned = augmented;
+            &augmented_owned
         }
+    };
+    if target.ncols() == 0 {
+        return Ok(0);
     }
-}
-
-pub(crate) fn block_pivoted_qr_diagonal(block: &Array2<f64>) -> Result<Vec<f64>, EstimationError> {
-    if block.ncols() == 0 {
-        return Ok(Vec::new());
-    }
-    let (_q, r) = block
-        .qr()
-        .map_err(EstimationError::EigendecompositionFailed)?;
-    let diag_len = r.nrows().min(r.ncols());
-    let mut out: Vec<f64> = (0..diag_len).map(|i| r[[i, i]].abs()).collect();
-    out.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    out.resize(block.ncols(), 0.0);
-    Ok(out)
+    rrqr_with_permutation(target, default_rrqr_rank_alpha())
+        .map(|r| r.rank)
+        .map_err(|e| {
+            EstimationError::LayoutError(format!(
+                "identifiability audit per-block RRQR failed: {e:?}"
+            ))
+        })
 }
 
 pub(crate) fn count_rank(singular_values: &[f64], n: usize, p: usize) -> usize {
