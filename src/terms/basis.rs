@@ -2451,19 +2451,48 @@ pub enum OperatorPenaltySpec {
 
 impl Default for DuchonOperatorPenaltySpec {
     fn default() -> Self {
+        // OFF by default. The non-periodic Euclidean Duchon penalty is the native
+        // reproducing-norm Gram (`Primary`) + null-space ridge; the analytic
+        // magnitude / slope / curvature operator dials are OPT-IN (the magic
+        // default smoother does not include them). The Matérn collocation overlay
+        // constructs its own all-active spec explicitly via `all_active()`.
+        Self::all_disabled()
+    }
+}
+
+impl DuchonOperatorPenaltySpec {
+    pub fn all_disabled() -> Self {
+        Self {
+            mass: OperatorPenaltySpec::Disabled,
+            tension: OperatorPenaltySpec::Disabled,
+            stiffness: OperatorPenaltySpec::Disabled,
+        }
+    }
+
+    /// All three operator dials active — used by the Matérn collocation overlay.
+    pub fn all_active() -> Self {
+        let active = || OperatorPenaltySpec::Active {
+            initial_log_lambda: 0.0,
+            prior: None,
+        };
+        Self {
+            mass: active(),
+            tension: active(),
+            stiffness: active(),
+        }
+    }
+
+    /// The analytic magnitude (mass) dial only — a closed-form L2 ridge on the
+    /// smooth's coefficients (amplitude shrinkage toward zero), no quadrature.
+    /// Opt-in via `duchon(..., magnitude=true)`; slope/curvature stay off.
+    pub fn magnitude_only() -> Self {
         Self {
             mass: OperatorPenaltySpec::Active {
                 initial_log_lambda: 0.0,
                 prior: None,
             },
-            tension: OperatorPenaltySpec::Active {
-                initial_log_lambda: 0.0,
-                prior: None,
-            },
-            stiffness: OperatorPenaltySpec::Active {
-                initial_log_lambda: 0.0,
-                prior: None,
-            },
+            tension: OperatorPenaltySpec::Disabled,
+            stiffness: OperatorPenaltySpec::Disabled,
         }
     }
 }
@@ -15552,7 +15581,7 @@ fn build_matern_operator_penalty_candidates(
         z_opt.map(|z| z.view()),
         aniso_log_scales,
     )?;
-    let matern_spec = DuchonOperatorPenaltySpec::default();
+    let matern_spec = DuchonOperatorPenaltySpec::all_active();
     Ok(operator_penalty_candidates_from_collocation(
         &ops.d0,
         &ops.d1,
@@ -23249,6 +23278,7 @@ fn duchon_native_penalty_candidates(
     kernel_transform: &Array2<f64>,
     outer_identifiability: Option<&Array2<f64>>,
     poly_cols: usize,
+    emit_magnitude: bool,
 ) -> Result<Vec<PenaltyCandidate>, BasisError> {
     let dim = centers.ncols();
     if dim == 0 {
@@ -23333,6 +23363,26 @@ fn duchon_native_penalty_candidates(
             shrink.sym_penalty,
             0,
             PenaltySource::DoublePenaltyNullspace,
+        ));
+    }
+    if emit_magnitude {
+        // Analytic MAGNITUDE (mass) penalty — opt-in. A closed-form L2 ridge on
+        // the kernel-block coefficients (identity on `[..n_kernel]`, mapped
+        // through the same outer identifiability `T`): it shrinks the smooth's
+        // amplitude toward zero with its own REML λ, the integer-order "mass"
+        // dial restored analytically (no quadrature, no sparse-center collocation
+        // — `op = None`, so it is a plain extra penalty, not a Charbonnier
+        // operator overlay). The polynomial null space carries no mass here; the
+        // affine trend is already controlled by the null-space ridge above.
+        let mut mass_pre = Array2::<f64>::zeros((n_pre, n_pre));
+        for i in 0..n_kernel {
+            mass_pre[[i, i]] = 1.0;
+        }
+        let mass = symmetrize(&project_penalty_matrix(&mass_pre, outer_identifiability));
+        out.push(normalize_penalty_candidate(
+            mass,
+            0,
+            PenaltySource::OperatorMass,
         ));
     }
     Ok(out)
@@ -23549,6 +23599,10 @@ pub fn build_duchon_basiswithworkspace(
     // column. This applies to BOTH the pure scale-free (`length_scale = None`,
     // structural cubic `r³`) and the hybrid Matérn-blended (`length_scale =
     // Some`) branches — the radial jet picks the matching kernel internally.
+    let emit_magnitude = matches!(
+        spec.operator_penalties.mass,
+        OperatorPenaltySpec::Active { .. }
+    );
     let candidates = duchon_native_penalty_candidates(
         centers.view(),
         spec.length_scale,
@@ -23558,6 +23612,7 @@ pub fn build_duchon_basiswithworkspace(
         &kernel_transform,
         identifiability_transform.as_ref(),
         poly_cols,
+        emit_magnitude,
     )?;
     let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
         filter_active_penalty_candidates_with_ops(candidates)?;
