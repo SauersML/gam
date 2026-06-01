@@ -476,15 +476,6 @@ fn locscale_joint_psi_direction_parts(
     Ok(None)
 }
 
-/// Per-block dispatch for the second-derivative ψ design map used by every
-/// location-scale family's `exact_newton_joint_psisecond_design_drifts`
-/// method. The two large `match psi_a.block_idx` arms in those methods
-/// (mu/threshold and log-σ) are identical bar the per-axis dimension `p`
-/// and the diagnostic `label`; this helper captures both bits in one
-/// shape. Returns `(action, dense_matrix)` — at most one is `Some`, both
-/// are `None` for the `Zero` variant, and the `First` variant produces an
-/// error (`_psi_psi_map` should never return `First` here).
-
 /// Shared second-derivative design drift assembly for two-axis location-scale
 /// joint-ψ paths. The family-specific methods differ only by block constants,
 /// labels, and field names; the ψψ map lookup and `X_{ab} β` action are the

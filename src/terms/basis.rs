@@ -17943,16 +17943,6 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
     Ok(result)
 }
 
-/// Build per-axis ψ_a design-matrix derivatives for anisotropic Duchon terms.
-///
-/// Exactly parallels [`build_matern_design_psi_aniso_derivatives`] but uses
-/// [`duchon_radial_jets`] to obtain the radial scalars (φ, q, t).
-///
-/// The per-axis chain rule is identical:
-///   ∂φ/∂ψ_a         = q · s_a
-///   ∂²φ/(∂ψ_a²)     = 2q · s_a + t · s_a²
-///   ∂²φ/(∂ψ_a ∂ψ_b) = t · s_a · s_b   (a ≠ b)
-
 fn duchon_coeff_exponents(p_order: usize, s_order: usize, m_or_n: usize) -> f64 {
     // In the partial fractions
     //   1 / (z^p (z + kappa^2)^s)
