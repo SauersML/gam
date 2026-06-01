@@ -15095,13 +15095,9 @@ fn bspline_position_derivative_impl(
             "periodic B-spline derivative supports order=1; got order={order}"
         ));
     }
-    periodic_position_domain(knots, period)?;
+    let (left, right, num_basis) = periodic_position_domain(knots, period)?;
     validate_vector("t", t)?;
-    Err(
-        "periodic B-spline first-derivative as a dense (N, K) matrix is no longer exposed; \
-         use periodic_bspline_input_location_first_derivative for the (N, K, 1) jet"
-            .to_string(),
-    )
+    periodic_bspline_dense_first_derivative(t, (left, right), degree, num_basis)
 }
 
 fn periodic_position_domain(
@@ -28335,6 +28331,19 @@ fn periodic_bspline_basis_dense_via_spec(
         .map_err(|err| format!("failed to evaluate periodic B-spline basis: {err}"))
 }
 
+fn periodic_bspline_dense_first_derivative(
+    t: ArrayView1<'_, f64>,
+    domain: (f64, f64),
+    degree: usize,
+    num_basis: usize,
+) -> Result<Array2<f64>, String> {
+    let (left, right) = domain;
+    let t_mat = column_array(t);
+    let jet = periodic_bspline_first_derivative_nd(t_mat.view(), (left, right), degree, num_basis)
+        .map_err(|err| format!("failed to evaluate periodic B-spline derivative: {err}"))?;
+    Ok(jet.index_axis(Axis(2), 0).to_owned())
+}
+
 fn bspline_basis_impl(
     t: ArrayView1<'_, f64>,
     knots: ArrayView1<'_, f64>,
@@ -28368,11 +28377,13 @@ fn bspline_basis_derivative_impl(
     validate_vector("t", t)?;
     validate_vector("knots", knots)?;
     if periodic {
-        return Err(
-            "periodic B-spline first-derivative as a dense (N, K) matrix is no longer exposed; \
-             use periodic_bspline_input_location_first_derivative for the (N, K, 1) jet"
-                .to_string(),
-        );
+        if order != 1 {
+            return Err(format!(
+                "periodic B-spline derivative supports order=1; got order={order}"
+            ));
+        }
+        let (left, right, num_basis) = periodic_knot_domain(knots)?;
+        return periodic_bspline_dense_first_derivative(t, (left, right), degree, num_basis);
     }
     let options = match order {
         0 => BasisOptions::value(),

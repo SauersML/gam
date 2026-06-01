@@ -84,11 +84,8 @@ class _BsplineJetFn(torch.autograd.Function):
 
     Forward dispatches to the correct Rust derivative API:
 
-    * ``periodic=False`` → ``bspline_basis_derivative(order=1, periodic=False)``;
-    * ``periodic=True``  →
-      ``periodic_bspline_input_location_first_derivative`` (the dense
-      ``order=1`` API is intentionally not exposed for periodic bases —
-      issue #233).
+    Both open and periodic bases call ``bspline_basis_derivative(order=1)``
+    so the dense NumPy and Torch APIs share the same Rust entry point.
 
     Backward returns the input-location Hessian contraction. For the open
     case it calls ``bspline_basis_derivative(order=2)``; the periodic case
@@ -102,21 +99,9 @@ class _BsplineJetFn(torch.autograd.Function):
     ) -> torch.Tensor:
         t_np = to_numpy_f64(t)
         knots_np = to_numpy_f64(knots)
-        if periodic:
-            from .._binding import rust_module
-
-            left = float(knots_np[0])
-            right = float(knots_np[-1])
-            num_basis = int(knots_np.shape[0] - 1)
-            jet_3d = rust_module().periodic_bspline_input_location_first_derivative(
-                t_np.reshape(-1, 1), left, right, int(degree), num_basis,
-            )
-            # Rust returns (N, K, 1); reduce the trailing intrinsic-dim axis.
-            jet_np = jet_3d.reshape(jet_3d.shape[0], jet_3d.shape[1])
-        else:
-            jet_np = _api.bspline_basis_derivative(
-                t_np, knots_np, degree=int(degree), order=1, periodic=False,
-            )
+        jet_np = _api.bspline_basis_derivative(
+            t_np, knots_np, degree=int(degree), order=1, periodic=bool(periodic),
+        )
         ctx.save_for_backward(t, knots)
         ctx.degree = int(degree)
         ctx.periodic = bool(periodic)
