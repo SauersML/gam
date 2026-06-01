@@ -72,6 +72,81 @@ const ACTIVE_CONSTRAINT_SLACK_TOL: f64 = 1e-8;
 // because we are comparing squared-norm residuals after subtraction.
 const ORTHONORM_DROP_TOL: f64 = 1e-10;
 
+#[derive(Debug, Clone)]
+struct AloStabilizationEval {
+    cost: f64,
+    gradient: Option<Array1<f64>>,
+    k_hat: Option<f64>,
+    max_leverage: f64,
+    min_denominator: f64,
+}
+
+// --- ALO-stabilization constants (conservative stabilization choices) ---
+//
+// Every constant below is a deliberately conservative gate or weight whose only
+// job is to keep the REML objective from being driven by a handful of
+// near-singular leave-one-out denominators on a high-leverage Gaussian design.
+// None of them are tunable (the repo bans CLI flags / env vars); they are fixed
+// at values that leave well-conditioned fits bit-identical and only activate on
+// genuine instability.
+//
+// Below this sample size the leave-one-out leverage estimate is too noisy to
+// distinguish a genuinely influential point from sampling jitter, so the
+// stabilization stays off entirely.
+const ALO_STABILIZATION_MIN_N: usize = 20;
+// Activation gate on the leave-one-out denominator (1 - h). 0.20 means we only
+// engage once some observation's LOO predictor is amplified by >5×; below that
+// the correction is negligible and we preserve the unstabilized objective.
+const ALO_DENOM_INSTABILITY_THRESHOLD: f64 = 0.20;
+// Activation gate on raw leverage. 0.80 is the standard "very high leverage"
+// rule-of-thumb cut (well above the 2p/n and 3p/n flags); only points past it
+// can trip the stabilizer.
+const ALO_MAX_LEVERAGE_THRESHOLD: f64 = 0.80;
+// Weight on the smooth leverage barrier 0.5·τ·Σ(h - 0.80)₊². τ = 0.5 keeps the
+// barrier a soft nudge that grows quadratically past the threshold rather than
+// a hard wall, so the augmented objective stays smooth and differentiable.
+const ALO_TAU: f64 = 0.5;
+// Weight on the PSIS-reweighted Gaussian ALO deviance term. γ = 0.5 matches τ
+// so the leverage barrier and the predictive-deviance term enter on equal
+// conservative footing; neither dominates.
+const ALO_GAMMA: f64 = 0.5;
+// Cap on n·p work for the analytic first-order gradient. Above this the dense
+// H⁻¹Xᵀ solve is too expensive to justify per outer evaluation, so the
+// stabilizer falls back to value-only augmentation (still bit-preserving the
+// gate-off path).
+const ALO_GRADIENT_MAX_WORK: usize = 4_000_000;
+
+fn alo_leverage_barrier(h: f64) -> f64 {
+    let excess = (h - ALO_MAX_LEVERAGE_THRESHOLD).max(0.0);
+    excess * excess
+}
+
+fn alo_leverage_barrier_derivative(h: f64) -> f64 {
+    if h > ALO_MAX_LEVERAGE_THRESHOLD {
+        2.0 * (h - ALO_MAX_LEVERAGE_THRESHOLD)
+    } else {
+        0.0
+    }
+}
+
+fn gaussian_alo_deviance(y: f64, eta_loo: f64, prior_weight: f64, phi: f64) -> f64 {
+    let residual = y - eta_loo;
+    prior_weight * residual * residual / phi.max(f64::MIN_POSITIVE)
+}
+
+fn transformed_penalty_matvec(
+    penalty: &crate::construction::CanonicalPenalty,
+    beta: &Array1<f64>,
+) -> Array1<f64> {
+    let mut out = Array1::<f64>::zeros(beta.len());
+    let beta_block = beta.slice(ndarray::s![penalty.col_range.clone()]);
+    let centered = &beta_block - &penalty.prior_mean;
+    let local = penalty.local.dot(&centered);
+    out.slice_mut(ndarray::s![penalty.col_range.clone()])
+        .assign(&local);
+    out
+}
+
 static OUTER_IFT_RESIDUAL_ENERGY: OnceLock<Mutex<HashMap<Vec<u64>, (f64, u64)>>> = OnceLock::new();
 static OUTER_IFT_RESIDUAL_ENERGY_ITER: AtomicU64 = AtomicU64::new(0);
 
@@ -8694,6 +8769,227 @@ impl<'a> RemlState<'a> {
         }
     }
 
+    /// Augment a freshly-evaluated REML/LAML result with the ALO stabilization
+    /// term, when the activation gate fires. The objective is bit-preserved
+    /// (no `cost`/`gradient`/`hessian` mutation) whenever the gate is off, so
+    /// every standard dense-Gaussian-identity caller — BFGS/Newton via
+    /// `assemble_and_evaluate` and EFS via `assemble_and_evaluate_efs` — flows
+    /// through this single shared augmentation and therefore optimizes the
+    /// identical objective.
+    fn apply_alo_stabilization_to_result(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+        mode: super::unified::EvalMode,
+        mut result: super::unified::RemlLamlResult,
+    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
+        let want_gradient = mode != super::unified::EvalMode::ValueOnly;
+        let Some(alo_eval) = self.alo_stabilization_eval(rho, bundle, want_gradient)? else {
+            return Ok(result);
+        };
+        result.cost += alo_eval.cost;
+        if want_gradient {
+            match (result.gradient.as_mut(), alo_eval.gradient.as_ref()) {
+                (Some(gradient), Some(alo_gradient)) if gradient.len() >= alo_gradient.len() => {
+                    for idx in 0..alo_gradient.len() {
+                        gradient[idx] += alo_gradient[idx];
+                    }
+                    result.hessian = HessianResult::Unavailable;
+                }
+                _ => {
+                    log::warn!(
+                        "[ALO-STABILIZED-REML] unstable ALO detected but analytic gradient \
+                         augmentation was unavailable; retaining REML gradient and adding \
+                         value term only (n={} max_h={:.3} min_denom={:.3})",
+                        self.y.len(),
+                        alo_eval.max_leverage,
+                        alo_eval.min_denominator,
+                    );
+                }
+            }
+        }
+        log::info!(
+            "[ALO-STABILIZED-REML] active cost_add={:.6e} max_h={:.3} min_denom={:.3} k_hat={:?}",
+            alo_eval.cost,
+            alo_eval.max_leverage,
+            alo_eval.min_denominator,
+            alo_eval.k_hat,
+        );
+        Ok(result)
+    }
+
+    fn alo_stabilization_eval(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+        want_gradient: bool,
+    ) -> Result<Option<AloStabilizationEval>, EstimationError> {
+        if self.config.firth_bias_reduction
+            || !matches!(
+                self.config.likelihood.spec.response,
+                ResponseFamily::Gaussian
+            )
+            || !matches!(self.config.link_function(), LinkFunction::Identity)
+            || !matches!(
+                bundle.pirls_result.coordinate_frame,
+                pirls::PirlsCoordinateFrame::TransformedQs
+            )
+            || bundle.backend_kind() == GeometryBackendKind::SparseExactSpd
+        {
+            return Ok(None);
+        }
+        let n = self.y.len();
+        if n < ALO_STABILIZATION_MIN_N {
+            return Ok(None);
+        }
+        let alo = crate::inference::alo::compute_alo_diagnostics_from_pirls(
+            bundle.pirls_result.as_ref(),
+            self.y,
+            self.config.link_function(),
+        )?;
+        let max_leverage = alo
+            .leverage
+            .iter()
+            .copied()
+            .fold(0.0_f64, |acc, h| acc.max(h));
+        let min_denominator = alo
+            .leverage
+            .iter()
+            .copied()
+            .map(|h| 1.0 - h)
+            .fold(f64::INFINITY, |acc, d| acc.min(d));
+        if max_leverage < ALO_MAX_LEVERAGE_THRESHOLD
+            && min_denominator > ALO_DENOM_INSTABILITY_THRESHOLD
+        {
+            return Ok(None);
+        }
+
+        let raw_influence: Vec<f64> = alo
+            .leverage
+            .iter()
+            .copied()
+            .map(|h| h.max(0.0) / (1.0 - h).max(1e-12))
+            .collect();
+        let psis = crate::inference::psis::pareto_smooth_weights(&raw_influence);
+        let smoothed_influence = psis
+            .as_ref()
+            .map(|p| p.smoothed.as_slice())
+            .unwrap_or(raw_influence.as_slice());
+        let mean_influence =
+            smoothed_influence.iter().sum::<f64>() / smoothed_influence.len() as f64;
+        // Clamp the per-observation reweight to [0.25, 4.0]. This conservative
+        // 4× band bounds how far a single PSIS-smoothed influence weight can
+        // pull the deviance term, guaranteeing no point can dominate the
+        // augmented objective even if the tail fit is imperfect.
+        let influence_scale: Vec<f64> = smoothed_influence
+            .iter()
+            .map(|w| (*w / mean_influence.max(f64::MIN_POSITIVE)).clamp(0.25, 4.0))
+            .collect();
+        let phi = match self.config.likelihood.scale.fixed_phi() {
+            Some(phi) if phi.is_finite() && phi > 0.0 => phi,
+            Some(_) => 1.0,
+            None => {
+                let dp = bundle.pirls_result.deviance + bundle.pirls_result.stable_penalty_term;
+                let denom = (n as f64 - bundle.pirls_result.edf).max(1.0);
+                (dp / denom).max(f64::MIN_POSITIVE)
+            }
+        };
+        let mut cost = 0.0_f64;
+        for i in 0..n {
+            cost += ALO_TAU * alo_leverage_barrier(alo.leverage[i]);
+            cost += ALO_GAMMA
+                * influence_scale[i]
+                * gaussian_alo_deviance(self.y[i], alo.eta_tilde[i], self.weights[i], phi);
+        }
+        if !(cost.is_finite() && cost >= 0.0) {
+            return Ok(None);
+        }
+        let gradient = if want_gradient
+            && rho.len()
+                == bundle
+                    .pirls_result
+                    .reparam_result
+                    .canonical_transformed
+                    .len()
+            && n.saturating_mul(bundle.pirls_result.beta_transformed.as_ref().len())
+                <= ALO_GRADIENT_MAX_WORK
+        {
+            self.alo_stabilization_gradient(rho, bundle, &alo, &influence_scale, phi)?
+        } else {
+            None
+        };
+        Ok(Some(AloStabilizationEval {
+            cost,
+            gradient,
+            k_hat: psis.as_ref().map(|p| p.k_hat),
+            max_leverage,
+            min_denominator,
+        }))
+    }
+
+    fn alo_stabilization_gradient(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+        alo: &crate::inference::alo::AloDiagnostics,
+        influence_scale: &[f64],
+        phi: f64,
+    ) -> Result<Option<Array1<f64>>, EstimationError> {
+        let x = bundle.pirls_result.x_transformed.to_dense();
+        let h = bundle
+            .pirls_result
+            .dense_stabilizedhessian_transformed("ALO-stabilized REML gradient")?;
+        let chol = match h.cholesky(Side::Lower) {
+            Ok(chol) => chol,
+            Err(_) => return Ok(None),
+        };
+        let mut h_inv_xt = x.t().to_owned();
+        chol.solve_mat_in_place(&mut h_inv_xt);
+        let beta = bundle.pirls_result.beta_transformed.as_ref();
+        let k = rho.len();
+        let mut grad = Array1::<f64>::zeros(k);
+        for penalty_idx in 0..k {
+            let lambda = rho[penalty_idx].exp();
+            let sbeta = transformed_penalty_matvec(
+                &bundle.pirls_result.reparam_result.canonical_transformed[penalty_idx],
+                beta,
+            )
+            .mapv(|v| lambda * v);
+            let mut mode_deriv = chol.solvevec(&sbeta);
+            mode_deriv.mapv_inplace(|v| -v);
+            let eta_deriv = x.dot(&mode_deriv);
+
+            let mut leverage_deriv = Array1::<f64>::zeros(x.nrows());
+            for i in 0..x.nrows() {
+                let m_i = h_inv_xt.column(i);
+                let penalty_m = transformed_penalty_matvec(
+                    &bundle.pirls_result.reparam_result.canonical_transformed[penalty_idx],
+                    &m_i.to_owned(),
+                );
+                leverage_deriv[i] = -self.weights[i] * lambda * m_i.dot(&penalty_m);
+            }
+
+            let mut gk = 0.0_f64;
+            for i in 0..x.nrows() {
+                let h_i = alo.leverage[i];
+                let denom = (1.0 - h_i).max(1e-12);
+                let residual = self.y[i] - bundle.pirls_result.final_eta[i];
+                let deta_loo =
+                    eta_deriv[i] / denom - residual * leverage_deriv[i] / (denom * denom);
+                let dev_eta_grad = -2.0 * self.weights[i] * (self.y[i] - alo.eta_tilde[i])
+                    / phi.max(f64::MIN_POSITIVE);
+                gk += ALO_TAU * alo_leverage_barrier_derivative(h_i) * leverage_deriv[i];
+                gk += ALO_GAMMA * influence_scale[i] * dev_eta_grad * deta_loo;
+            }
+            grad[penalty_idx] = gk;
+        }
+        if grad.iter().all(|g| g.is_finite()) {
+            Ok(Some(grad))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Build the soft prior tuple for the given mode.
     fn build_prior(
         &self,
@@ -8748,6 +9044,7 @@ impl<'a> RemlState<'a> {
         )
         .map_err(EstimationError::InvalidInput)?;
         let result = self.apply_tk_to_result(result, tk_terms)?;
+        let result = self.apply_alo_stabilization_to_result(rho, bundle, mode, result)?;
         self.store_ift_mode_response_cache_from_result(rho, bundle, &result);
         if let Some(polish_step) = result.inner_polish_step.as_ref() {
             self.apply_inner_polish_step_to_warm_start(bundle, &solution_beta, polish_step);
@@ -8789,6 +9086,14 @@ impl<'a> RemlState<'a> {
         )
         .map_err(EstimationError::InvalidInput)?;
         let cost_result = self.apply_tk_to_result(cost_result, tk_terms)?;
+        // Augment with the ALO stabilization term BEFORE the gradient is read,
+        // so the EFS step (which is driven by `cost_result.gradient` and
+        // `cost_result.cost`) targets the same stabilized stationarity equation
+        // that BFGS/Newton optimize via `assemble_and_evaluate`. Without this
+        // the two outer strategies would optimize different objectives on a
+        // high-leverage Gaussian-identity fit. `eval_mode` here is always
+        // `ValueAndGradient`, so the augmented gradient term flows through.
+        let cost_result = self.apply_alo_stabilization_to_result(rho, bundle, eval_mode, cost_result)?;
         self.store_ift_mode_response_cache_from_result(rho, bundle, &cost_result);
         let gradient =
             cost_result

@@ -92,8 +92,8 @@ pub use geometry::{
 };
 pub use gpu::GpuPolicy;
 pub use inference::{
-    alo, conformal, data, generative, hmc, polya_gamma, predict, probability, quadrature, sample,
-    smooth_test,
+    alo, conformal, data, generative, hmc, polya_gamma, predict, probability, psis, quadrature,
+    sample, smooth_test,
 };
 pub use linalg::{faer_ndarray, matrix, utils};
 pub use resource::{

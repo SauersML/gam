@@ -15,6 +15,7 @@ pub mod posterior;
 pub mod posterior_bands;
 pub mod predict;
 pub mod probability;
+pub mod psis;
 pub mod quadrature;
 pub mod sample;
 pub mod smooth_test;
