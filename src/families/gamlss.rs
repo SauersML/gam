@@ -968,8 +968,19 @@ pub(crate) struct SelectedWiggleBasis {
     pub block: ParameterBlockInput,
 }
 
+const DEFAULT_GAUGE_PRIORITY: u8 = 100;
+const LINK_WIGGLE_GAUGE_PRIORITY: u8 = 80;
+
 impl ParameterBlockInput {
     pub fn intospec(self, name: &str) -> Result<ParameterBlockSpec, String> {
+        self.intospec_with_gauge_priority(name, DEFAULT_GAUGE_PRIORITY)
+    }
+
+    pub fn intospec_with_gauge_priority(
+        self,
+        name: &str,
+        gauge_priority: u8,
+    ) -> Result<ParameterBlockSpec, String> {
         let p = self.design.ncols();
         let n = self.design.nrows();
         if self.offset.len() != n {
@@ -1062,7 +1073,7 @@ impl ParameterBlockInput {
             nullspace_dims: self.nullspace_dims,
             initial_log_lambdas,
             initial_beta: self.initial_beta,
-            gauge_priority: 100,
+            gauge_priority,
             jacobian_callback: None,
             stacked_design: None,
             stacked_offset: None,
@@ -2382,7 +2393,19 @@ fn fit_binomial_mean_wiggle(
         policy: crate::resource::ResourcePolicy::default_library(),
     };
     let blocks = vec![
-        spec.eta_block.intospec("eta")?,
+        // The wiggle block is a DYNAMIC monotone I-spline basis that the
+        // family regenerates at full (raw) width every inner iteration
+        // (`block_geometry_is_dynamic` + the `x.ncols() == spec.design.ncols()`
+        // assertion in `block_geometry`), so it cannot tolerate a physical
+        // column drop. The level/intercept direction that the I-spline shares
+        // with the eta block must therefore be yielded by the *eta* block,
+        // whose static term-collection design is safely column-reducible (and
+        // lifted back via the canonical per-block transform `T`). Give the eta
+        // block the lower gauge priority so the canonical-gauge RRQR routes the
+        // shared-level alias drop onto eta and leaves the dynamic wiggle basis
+        // full-width.
+        spec.eta_block
+            .intospec_with_gauge_priority("eta", LINK_WIGGLE_GAUGE_PRIORITY)?,
         spec.wiggle_block.intospec("wiggle")?,
     ];
     fit_custom_family(&family, &blocks, options).map_err(|e| e.to_string())
@@ -4020,7 +4043,10 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 nullspace_dims: vec![],
                 initial_log_lambdas: theta.slice(s![0..eta_penalty_count]).to_owned(),
                 initial_beta: Some(pilot_beta.clone()),
-                gauge_priority: 100,
+                // Lower gauge priority on the static eta design: it yields the
+                // shared level/intercept direction to the dynamic full-width
+                // wiggle I-spline block (see fit_binomial_mean_wiggle).
+                gauge_priority: LINK_WIGGLE_GAUGE_PRIORITY,
                 jacobian_callback: None,
                 stacked_design: None,
                 stacked_offset: None,
@@ -4054,7 +4080,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 nullspace_dims: vec![],
                 initial_log_lambdas: theta.slice(s![eta_penalty_count..rho_dim]).to_owned(),
                 initial_beta: wiggle_initial_beta.clone(),
-                gauge_priority: 100,
+                gauge_priority: DEFAULT_GAUGE_PRIORITY,
                 jacobian_callback: None,
                 stacked_design: None,
                 stacked_offset: None,

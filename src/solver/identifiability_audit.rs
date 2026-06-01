@@ -92,6 +92,8 @@ use crate::families::custom_family::{FamilyLinearizationState, ParameterBlockSpe
 use crate::linalg::faer_ndarray::{FaerEigh, default_rrqr_rank_alpha, rrqr_with_permutation};
 use crate::solver::estimate::EstimationError;
 
+const DEFAULT_GAUGE_PRIORITY: u8 = 100;
+
 /// Per-block accounting record. `original_dim` is the spec's column
 /// count at audit entry (post `joint_null_rotation` absorption — the
 /// audit is contractually run on the rotated specs). `effective_dim`
@@ -930,45 +932,106 @@ fn audit_identifiability_impl(
         aliased_pairs.len(),
     );
 
-    // Attribute each demoted joint column back to its (block, local_col)
-    // origin using the col_offsets table built above. The earliest
-    // block whose range absorbs the demoted column is, by construction,
-    // the block at lower index containing the largest projection norm
-    // — but RRQR's column-pivoting selects the column most aligned
-    // with the *trailing* (demoted) space, so we attribute the alias
-    // to "the demoted column itself was selected as redundant; the
-    // earlier blocks (in spec order) reconstruct it". The reason
-    // string names the joint-column index and the joint rank tolerance
-    // so callers can correlate with the structural log.
+    // Attribute each demoted joint column back to its canonical gauge owner.
+    // RRQR is priority-ordered, but column pivoting can still name the
+    // higher-priority representative of a two-block alias. The model-space
+    // redundancy is resolved by dropping the lower-priority participant, so
+    // distinct-priority aliases are re-attributed to that side; same-priority
+    // aliases remain attributed to the raw demoted column and are fatal below.
+    let block_priority_for_attribution: std::collections::HashMap<&str, u8> = specs
+        .iter()
+        .map(|s| (s.name.as_str(), s.gauge_priority))
+        .collect();
     let mut dropped_columns: Vec<DroppedColumn> = Vec::new();
     for &joint_col in &demoted_joint_cols {
         let (block_idx, local_col) = locate_block_column(&col_offsets, joint_col)?;
-        let block_name = specs[block_idx].name.clone();
-        let reason = format!(
-            "joint-design column {joint_col} (block '{block_name}' local column \
-             {local_col}) demoted past joint RRQR rank tolerance {tol:.3e}; earlier \
-             blocks' column span absorbs this direction",
-            tol = joint_rank_tol,
-        );
+        let raw_block_name = specs[block_idx].name.clone();
+        let best_pair = aliased_pairs
+            .iter()
+            .filter(|pair| {
+                (pair.block_a == raw_block_name && pair.direction_a == local_col)
+                    || (pair.block_b == raw_block_name && pair.direction_b == local_col)
+            })
+            .filter(|pair| {
+                let pa = block_priority_for_attribution
+                    .get(pair.block_a.as_str())
+                    .copied()
+                    .unwrap_or(DEFAULT_GAUGE_PRIORITY);
+                let pb = block_priority_for_attribution
+                    .get(pair.block_b.as_str())
+                    .copied()
+                    .unwrap_or(DEFAULT_GAUGE_PRIORITY);
+                pa != pb
+            })
+            .max_by(|a, b| {
+                a.overlap
+                    .partial_cmp(&b.overlap)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        let (block_name, drop_local_col, reason) = if let Some(pair) = best_pair {
+            let pa = block_priority_for_attribution
+                .get(pair.block_a.as_str())
+                .copied()
+                .unwrap_or(DEFAULT_GAUGE_PRIORITY);
+            let pb = block_priority_for_attribution
+                .get(pair.block_b.as_str())
+                .copied()
+                .unwrap_or(DEFAULT_GAUGE_PRIORITY);
+            let (lower_block, lower_col, lower_prio, higher_block, higher_col, higher_prio) =
+                if pa < pb {
+                    (
+                        pair.block_a.clone(),
+                        pair.direction_a,
+                        pa,
+                        pair.block_b.clone(),
+                        pair.direction_b,
+                        pb,
+                    )
+                } else {
+                    (
+                        pair.block_b.clone(),
+                        pair.direction_b,
+                        pb,
+                        pair.block_a.clone(),
+                        pair.direction_a,
+                        pa,
+                    )
+                };
+            (
+                lower_block.clone(),
+                lower_col,
+                format!(
+                    "joint-design column {joint_col} (raw RRQR block '{raw_block_name}' local column {local_col}) demoted past joint RRQR rank tolerance {tol:.3e}; canonical gauge re-attributed the shared direction to lower-priority block '{lower_block}' local column {lower_col} (priority {lower_prio} < '{higher_block}' local column {higher_col}, priority {higher_prio}; overlap={overlap:.4})",
+                    tol = joint_rank_tol,
+                    overlap = pair.overlap,
+                ),
+            )
+        } else {
+            (
+                raw_block_name.clone(),
+                local_col,
+                format!(
+                    "joint-design column {joint_col} (block '{raw_block_name}' local column {local_col}) demoted past joint RRQR rank tolerance {tol:.3e}; earlier blocks' column span absorbs this direction",
+                    tol = joint_rank_tol,
+                ),
+            )
+        };
         dropped_columns.push(DroppedColumn {
             block: block_name,
-            column: local_col,
+            column: drop_local_col,
             reason,
         });
     }
 
-    // Reflect the dropped-column attribution into `BlockIdentity::
-    // effective_dim`: each block's effective dimension is its original
-    // dim minus the count of its columns appearing in
-    // `demoted_joint_cols`. The per-block `design_range_rank` (from
-    // the in-isolation per-block QR) still flags any within-block
-    // rank deficiency that escaped within-smooth absorption.
+    // Reflect canonical dropped-column attribution into `BlockIdentity::
+    // effective_dim`: each block's effective dimension is its original dim
+    // minus the count of its attributed dropped columns (post re-attribution
+    // to the lower-priority participant, not the raw RRQR-selected column).
     for (block_idx, block) in blocks.iter_mut().enumerate() {
-        let lo = col_offsets[block_idx];
-        let hi = col_offsets[block_idx + 1];
-        let dropped_here = demoted_joint_cols
+        let block_name = specs[block_idx].name.as_str();
+        let dropped_here = dropped_columns
             .iter()
-            .filter(|&&j| j >= lo && j < hi)
+            .filter(|drop| drop.block == block_name)
             .count();
         block.effective_dim = block.original_dim.saturating_sub(dropped_here);
     }
