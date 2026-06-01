@@ -20396,28 +20396,24 @@ pub fn fit_survival_marginal_slope_terms(
     {
         // A zero-column Jacobian carries no leakage directions ⇒ no absorber.
         use crate::families::marginal_slope_orthogonal::{
-            ScoreInfluenceJacobian, influence_block_design, residualize_influence_columns,
+            ScoreInfluenceJacobian, residualized_influence_block,
         };
         let marginal_dense = marginal_design
             .design
             .try_to_dense_by_chunks("survival marginal-slope influence-absorber marginal span")?;
-        // Realized leakage directions `Z_infl = diag(s_f·β̂₀)·J` via the core
-        // builder; `β̂₀(x_i)` is the rigid-pilot logslope and `s_f =
-        // probit_scale`. `influence_block_design` reads only `columns`; the
-        // latent score `z_primary` is the genuine `z` on these rows.
+        // `β̂₀(x_i)` is the rigid-pilot logslope; `s_f = probit_scale`. The latent
+        // score `z_primary` is the genuine `z` on these rows (the combined core
+        // builder reads only `columns`, but `ScoreInfluenceJacobian` carries `z`).
         let jacobian = ScoreInfluenceJacobian {
             columns: jac.clone(),
             z: z_primary.clone(),
         };
         let rigid_logslope_at_rows = &spec.logslope_offset + baseline_slope;
-        let z_infl = influence_block_design(&jacobian, &rigid_logslope_at_rows, probit_scale);
-        // Marginal-Gram ridge scaled to the weighted Gram's own magnitude so
-        // the projection solve stays stable when the marginal design is
-        // rank-deficient at the pilot, without perturbing a well-conditioned
-        // projection. Identical scaling to the BMS absorber site (single
-        // source of truth for the residualization math is
-        // `residualize_influence_columns`; only this caller-side ridge scale
-        // is shared by value).
+        // Marginal-Gram ridge scaled to the weighted Gram's own magnitude so the
+        // projection solve stays stable when the marginal design is rank-deficient
+        // at the pilot, without perturbing a well-conditioned projection. Matches
+        // the BMS absorber site's caller-side ridge by value (the residualization
+        // math itself is single-source in `residualized_influence_block`).
         let gram_scale = (0..marginal_dense.ncols())
             .map(|j| {
                 (0..marginal_dense.nrows())
@@ -20428,8 +20424,12 @@ pub fn fit_survival_marginal_slope_terms(
             })
             .fold(0.0_f64, f64::max);
         let eps = (gram_scale * 1e-10).max(1e-12);
-        let residualized = residualize_influence_columns(
-            &z_infl,
+        // Z̃_infl = residualize(diag(s_f·β̂₀)·J, marginal, W, ε) — the combined core
+        // builder (single source of truth shared with the BMS absorber site).
+        let residualized = residualized_influence_block(
+            &jacobian,
+            &rigid_logslope_at_rows,
+            probit_scale,
             marginal_dense.view(),
             &cross_block_pilot_w,
             eps,
