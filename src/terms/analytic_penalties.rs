@@ -317,6 +317,12 @@ pub trait AnalyticPenalty: Send + Sync {
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
         let diag = self.hessian_diag(target, rho).unwrap_or_else(|| {
+            // SAFETY: programming-error invariant, never a runtime/data condition.
+            // A penalty whose Hessian is non-diagonal MUST override `hvp` with its
+            // closed-form Hessian-vector product; reaching this default means the
+            // impl is missing that override. SPEC forbids a finite-difference
+            // fallback outside tests, so there is no recoverable path — failing
+            // loud here is the contract.
             panic!(
                 "AnalyticPenalty::hvp default reached for `{}`, whose Hessian is \
                  not diagonal (hessian_diag returned None). Such a penalty must \
