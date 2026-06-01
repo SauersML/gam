@@ -92,8 +92,8 @@ pub use geometry::{
 };
 pub use gpu::GpuPolicy;
 pub use inference::{
-    alo, conformal, data, generative, hmc, polya_gamma, predict, probability, quadrature, sample,
-    smooth_test,
+    alo, conformal, data, generative, hmc, polya_gamma, predict, probability, psis, quadrature,
+    sample, smooth_test,
 };
 pub use linalg::{faer_ndarray, matrix, utils};
 pub use resource::{
@@ -123,9 +123,10 @@ pub use solver::workflow::{
     CtnStage1Recipe, FitConfig, FitRequest, FitResult, GaussianLocationScaleFitRequest,
     LatentBinaryFitRequest, LatentSurvivalFitRequest, LinkWiggleConfig, MaterializedModel,
     PreparedSurvivalTimeStack, StandardBinomialWiggleConfig, StandardFitRequest, StandardFitResult,
-    SurvivalLocationScaleFitRequest, SurvivalLocationScaleFitResult, SurvivalMarginalSlopeFitRequest,
-    SurvivalTransformationFitRequest, SurvivalTransformationFitResult,
-    SurvivalTransformationTermSpec, TransformationNormalFitRequest, WorkflowError, fit_from_formula,
-    fit_model, is_binary_response, materialize, prepare_survival_time_stack, resolve_family,
-    resolve_offset_column, resolve_weight_column,
+    SurvivalLocationScaleFitRequest, SurvivalLocationScaleFitResult,
+    SurvivalMarginalSlopeFitRequest, SurvivalTransformationFitRequest,
+    SurvivalTransformationFitResult, SurvivalTransformationTermSpec,
+    TransformationNormalFitRequest, WorkflowError, fit_from_formula, fit_model, is_binary_response,
+    materialize, prepare_survival_time_stack, resolve_family, resolve_offset_column,
+    resolve_weight_column,
 };

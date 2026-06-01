@@ -120,9 +120,7 @@ pub fn score_influence_jacobian(
         .fit
         .block_states
         .first()
-        .ok_or_else(|| {
-            "score_influence_jacobian: fitted CTN has no block states".to_string()
-        })?
+        .ok_or_else(|| "score_influence_jacobian: fitted CTN has no block states".to_string())?
         .beta;
     if beta.len() != p1 {
         return Err(format!(
@@ -157,10 +155,9 @@ pub fn score_influence_jacobian(
             cov_design.design.ncols()
         ));
     }
-    let x_cov = cov_design
-        .design
-        .try_row_chunk(0..n)
-        .map_err(|e| format!("score_influence_jacobian: covariate design materialization failed: {e}"))?;
+    let x_cov = cov_design.design.try_row_chunk(0..n).map_err(|e| {
+        format!("score_influence_jacobian: covariate design materialization failed: {e}")
+    })?;
 
     // γ_k(x_i) = Σ_j Xᶜᵒᵛ_{i,j}·Γ[k,j]  ⇒  gamma = Xᶜᵒᵛ · Γᵀ  (n × p_resp).
     let gamma = fast_abt(&x_cov, &beta_mat);
@@ -283,17 +280,15 @@ pub fn score_influence_jacobian(
                 let dl = dl_scalar * xij;
                 let du = du_scalar * xij;
                 // ∂u = [φ(h)∂h − u·(φ(U)∂U − φ(L)∂L) − φ(L)∂L] / (Φ(U)−Φ(L))
-                let du_pit = (pdf_h * dh - u_pit * (pdf_u * du - pdf_l * dl) - pdf_l * dl)
-                    / denom_mass;
+                let du_pit =
+                    (pdf_h * dh - u_pit * (pdf_u * du - pdf_l * dl) - pdf_l * dl) / denom_mass;
                 row[base + j] = du_pit / pdf_z;
             }
         }
     }
 
     if columns.iter().any(|v| !v.is_finite()) {
-        return Err(
-            "score_influence_jacobian: produced non-finite Jacobian entries".to_string(),
-        );
+        return Err("score_influence_jacobian: produced non-finite Jacobian entries".to_string());
     }
     if z_scores.iter().any(|v| !v.is_finite()) {
         return Err("score_influence_jacobian: produced non-finite z scores".to_string());
@@ -324,7 +319,7 @@ pub fn influence_block_design(
     s_f: f64,
 ) -> Array2<f64> {
     let n = jac.columns.nrows();
-    debug_assert_eq!(
+    assert_eq!(
         pilot_beta0.len(),
         n,
         "influence_block_design: pilot_beta0 length must equal Jacobian rows"
@@ -363,12 +358,12 @@ pub(crate) fn residualize_influence_columns(
     eps: f64,
 ) -> Array2<f64> {
     let n = marginal_design.nrows();
-    debug_assert_eq!(
+    assert_eq!(
         z_infl.nrows(),
         n,
         "residualize_influence_columns: Z_infl rows must equal marginal design rows"
     );
-    debug_assert_eq!(
+    assert_eq!(
         w_metric.len(),
         n,
         "residualize_influence_columns: row metric length must equal marginal design rows"
@@ -443,7 +438,8 @@ pub(crate) fn residualized_influence_block(
     let p_m = marginal_design.ncols();
     let gram = fast_xt_diag_x(&marginal_design, w_metric);
     let gram_scale = (0..p_m).map(|i| gram[[i, i]]).fold(0.0_f64, f64::max);
-    let eps = (gram_scale * INFLUENCE_PROJECTION_RELATIVE_RIDGE).max(INFLUENCE_PROJECTION_RIDGE_FLOOR);
+    let eps =
+        (gram_scale * INFLUENCE_PROJECTION_RELATIVE_RIDGE).max(INFLUENCE_PROJECTION_RIDGE_FLOOR);
 
     let residualized = residualize_influence_columns(&z_infl, marginal_design, w_metric, eps);
     if residualized.iter().any(|v| !v.is_finite()) {
