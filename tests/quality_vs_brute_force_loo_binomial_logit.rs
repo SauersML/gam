@@ -157,7 +157,16 @@ fn alo_eta_tilde_matches_exact_loo_binomial_logit() {
     // — keeping a genuine real-data binomial/logit signal while bounding the
     // refit count. A fixed stride preserves the spread of ejection_fraction
     // across its 17 distinct values (no RNG, fully reproducible).
-    const TARGET_ROWS: usize = 120;
+    //
+    // The brute-force oracle does a *full* PIRLS+REML refit per held-out row
+    // (unlike the Poisson sibling, which downdates gam's converged geometry with
+    // cheap dense solves), so wall-clock is ~`TARGET_ROWS` sequential fits. At 120
+    // rows that overran the 360 s reference-quality budget; 70 rows keeps a
+    // genuine real-data binomial/logit signal and the spread of ejection_fraction
+    // while ~halving the refit count. The ALO-vs-exact-LOO agreement and the
+    // predictive-honesty bars below hold for any n, so the cohort size is purely a
+    // cost knob, not a quality lever.
+    const TARGET_ROWS: usize = 70;
     let stride = full_ds.values.nrows().div_ceil(TARGET_ROWS);
     let keep_rows: Vec<usize> = (0..full_ds.values.nrows()).step_by(stride).collect();
     let p_cols = full_ds.headers.len();
@@ -176,8 +185,8 @@ fn alo_eta_tilde_matches_exact_loo_binomial_logit() {
     let x: Vec<f64> = ds.values.column(pred_idx).to_vec();
     let n = x.len();
     assert!(
-        (90..=160).contains(&n),
-        "subsampled heart cohort should be ~120 rows, got {n}"
+        (55..=95).contains(&n),
+        "subsampled heart cohort should be ~70 rows, got {n}"
     );
 
     // ---- full fit + ALO ----------------------------------------------------
