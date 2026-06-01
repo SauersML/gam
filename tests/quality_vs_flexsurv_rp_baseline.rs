@@ -35,8 +35,8 @@
 //! engines therefore fit the same PH-on-log-Λ structure and produce a comparable
 //! relative-risk score for concordance.
 //!
-//! Matched wiggliness via one interior knot (`k = 1`, flexsurv's `df = 2`): a cubic
-//! (degree-3) time basis with a single interior knot for both engines.
+//! Matched wiggliness via two interior knots (`k = 2`, flexsurv's `df = 3`): a cubic
+//! (degree-3) time basis with two interior knots for both engines.
 //!
 //! Data: `bone.csv` — 23 bone-marrow-transplant subjects (allo/auto graft),
 //! `t` = days to relapse/last-follow-up, `d` = relapse indicator (1 = event,
@@ -61,10 +61,19 @@ use std::path::Path;
 
 const BONE_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/bone.csv");
 
-// One interior knot (k = 1) plus the two boundary knots flexsurv always places
-// (flexsurv's own `df = k + 1`, i.e. df = 2). gam's cubic (degree-3) I-spline gets
-// the same single interior knot so the baselines have matched flexibility.
-const N_INTERNAL_KNOTS: usize = 1;
+// Two interior knots (k = 2) plus the two boundary knots flexsurv always places
+// (flexsurv's own `df = k + 1`, i.e. df = 3). gam's cubic (degree-3) I-spline gets
+// the same two interior knots so the baselines have matched flexibility.
+//
+// Why 2 and not 1: a gam degree-3 I-spline is the integral of a degree-4 M-spline,
+// and its knot validation runs at degree-5 (the I-spline raises the underlying
+// B-spline degree once for the M-spline and once more for the antiderivative).
+// A well-posed open knot vector at validation degree 5 needs 2*(5+1) = 12 knots;
+// the automatic placement emits `2*(4+1) + k = 10 + k` knots, so k must be >= 2.
+// k = 1 yields only 11 knots and the fit is rejected as under-knotted. k = 2 is the
+// minimum admissible interior-knot count for this cubic monotone baseline, and the
+// flexsurv comparator below reads the same constant so the two stay matched.
+const N_INTERNAL_KNOTS: usize = 2;
 const TIME_DEGREE: usize = 3;
 
 /// Parse `bone.csv` into `(t, event, trt)` rows: `t` = days, `event` = relapse
@@ -322,8 +331,8 @@ fn gam_rp_baseline_holdout_concordance_matches_or_beats_flexsurvspline_on_bone()
     let gam_beta_x = cov_eta(0.0, 1.0) - cov_eta(0.0, 0.0);
 
     // ---- fit the SAME model with flexsurv on the SAME TRAIN rows, score TEST --
-    // flexsurvspline(scale="hazard") is the textbook Royston-Parmar model; k = 1
-    // matches gam's single-interior-knot baseline. We fit on the train subset and
+    // flexsurvspline(scale="hazard") is the textbook Royston-Parmar model; k = 2
+    // matches gam's two-interior-knot baseline. We fit on the train subset and
     // emit, for each held-out test subject, the log-cumulative-hazard at a fixed
     // reference time as its PH relative-risk score (under PH the ordering of log Λ
     // across subjects is the ordering of the linear predictor, at any fixed t).
