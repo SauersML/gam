@@ -6,7 +6,7 @@ use crate::basis::{
     KnotSource, KroneckerFactoredBasis, MaternBasisSpec, MaternIdentifiability,
     OneDimensionalBoundary, PenaltyCandidate, PenaltyInfo, PenaltySource, SpatialIdentifiability,
     SphericalSplineBasisSpec, ThinPlateBasisSpec, apply_sum_to_zero_constraint,
-    build_bspline_basis_1d, build_duchon_basis, build_duchon_basis_log_kappa_aniso_derivatives,
+    build_bspline_basis_1d, build_duchon_basis,
     build_duchon_basis_log_kappa_derivatives, build_duchon_basiswithworkspace, build_matern_basis,
     build_matern_basis_log_kappa_aniso_derivatives, build_matern_basis_log_kappa_derivatives,
     build_matern_basiswithworkspace, build_matern_collocation_operator_matrices,
@@ -2205,17 +2205,6 @@ impl SpatialLogKappaCoords {
         let mut vals = Vec::new();
         let mut dims = Vec::new();
         for &term_idx in term_indices {
-            if is_pure_duchon_aniso_term(spec, term_idx) {
-                let d = get_spatial_feature_dim(spec, term_idx).unwrap_or(1);
-                let eta = center_aniso_log_scales(
-                    &get_spatial_aniso_log_scales(spec, term_idx).unwrap_or_else(|| vec![0.0; d]),
-                );
-                for eta_a in eta.into_iter().take(d.saturating_sub(1)) {
-                    vals.push(eta_a);
-                }
-                dims.push(d.saturating_sub(1).max(1));
-                continue;
-            }
             let length_scale = get_spatial_length_scale(spec, term_idx)
                 .unwrap_or(options.min_length_scale)
                 .clamp(options.min_length_scale, options.max_length_scale);
@@ -2351,23 +2340,17 @@ impl SpatialLogKappaCoords {
         assert_eq!(term_indices.len(), dims_per_term.len());
         let total: usize = dims_per_term.iter().sum();
         let mut values = Array1::<f64>::zeros(total);
-        let options_psi = match end {
-            AnisoBoundEnd::Lower => -options.max_length_scale.ln(),
-            AnisoBoundEnd::Upper => -options.min_length_scale.ln(),
-        };
         let mut cursor = 0;
         for (slot, &term_idx) in term_indices.iter().enumerate() {
             let d = dims_per_term[slot];
-            let psi_bound = if is_pure_duchon_aniso_term(spec, term_idx) {
-                options_psi
-            } else {
+            let psi_bound = {
                 let (lo, hi) = spatial_term_psi_bounds(data, spec, term_idx, options);
                 match end {
                     AnisoBoundEnd::Lower => lo,
                     AnisoBoundEnd::Upper => hi,
                 }
             };
-            let axis_offsets = if is_pure_duchon_aniso_term(spec, term_idx) || d <= 1 {
+            let axis_offsets = if d <= 1 {
                 vec![0.0; d]
             } else {
                 get_spatial_aniso_log_scales(spec, term_idx)
@@ -2409,12 +2392,6 @@ impl SpatialLogKappaCoords {
                 cursor += d;
                 continue;
             };
-            if is_pure_duchon_aniso_term(spec, term_idx) {
-                // Pure Duchon stores d-1 free η_a directly; there is no ψ̄
-                // component to reseed (only axial anisotropy).
-                cursor += d;
-                continue;
-            }
             if d == 0 {
                 continue;
             }
@@ -2554,7 +2531,7 @@ impl SpatialLogKappaCoords {
             let psi = self.term_slice(slot);
             let d = self.dims_per_term[slot];
             let (next_length_scale, next_aniso) =
-                spatial_term_psi_to_length_scale_and_aniso(spec, term_idx, psi);
+                spatial_term_psi_to_length_scale_and_aniso(psi);
             if (d == 1 || next_length_scale.is_some())
                 && let Some(length_scale) = next_length_scale
             {
@@ -2583,24 +2560,6 @@ fn center_aniso_log_scales(eta: &[f64]) -> Vec<f64> {
             }
         })
         .collect()
-}
-
-fn is_pure_duchon_aniso_term(spec: &TermCollectionSpec, term_idx: usize) -> bool {
-    spec.smooth_terms
-        .get(term_idx)
-        .is_some_and(|term| match &term.basis {
-            SmoothBasisSpec::Duchon {
-                feature_cols, spec, ..
-            } => {
-                spec.length_scale.is_none()
-                    && feature_cols.len() > 1
-                    && spec
-                        .aniso_log_scales
-                        .as_ref()
-                        .is_some_and(|eta| eta.len() == feature_cols.len())
-            }
-            _ => false,
-        })
 }
 
 fn spatial_term_supports_hyper_optimization(spec: &TermCollectionSpec, term_idx: usize) -> bool {
@@ -2730,23 +2689,7 @@ fn spatial_term_psi_seed(
     Some(0.5 * (psi_lo + psi_hi))
 }
 
-fn spatial_term_psi_to_length_scale_and_aniso(
-    spec: &TermCollectionSpec,
-    term_idx: usize,
-    psi: &[f64],
-) -> (Option<f64>, Option<Vec<f64>>) {
-    if is_pure_duchon_aniso_term(spec, term_idx) {
-        let d = get_spatial_feature_dim(spec, term_idx).unwrap_or(psi.len());
-        let free = d.saturating_sub(1);
-        let mut eta = vec![0.0; d];
-        for (axis, &value) in psi.iter().take(free).enumerate() {
-            eta[axis] = value;
-        }
-        if d > 1 {
-            eta[d - 1] = -eta[..d - 1].iter().sum::<f64>();
-        }
-        return (None, Some(eta));
-    }
+fn spatial_term_psi_to_length_scale_and_aniso(psi: &[f64]) -> (Option<f64>, Option<Vec<f64>>) {
     if psi.len() <= 1 {
         (Some((-psi.first().copied().unwrap_or(0.0)).exp()), None)
     } else {
@@ -13264,18 +13207,6 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
             build_matern_basis_log_kappa_aniso_derivatives(x.view(), spec)
                 .map_err(EstimationError::from)?
         }
-        SmoothBasisSpec::Duchon {
-            feature_cols,
-            spec,
-            input_scales,
-        } => {
-            let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
-            if let Some(s) = input_scales {
-                apply_input_standardization(&mut x, s);
-            }
-            build_duchon_basis_log_kappa_aniso_derivatives(x.view(), spec)
-                .map_err(EstimationError::from)?
-        }
         _ => return Ok(None),
     };
     // Get number of axes from the shared operator when available; otherwise
@@ -14365,9 +14296,6 @@ pub(crate) fn spatial_dims_per_term(
         .iter()
         .map(|&term_idx| {
             let d = get_spatial_feature_dim(resolvedspec, term_idx).unwrap_or(1);
-            if is_pure_duchon_aniso_term(resolvedspec, term_idx) {
-                return d.saturating_sub(1).max(1);
-            }
             let has_aniso = get_spatial_aniso_log_scales(resolvedspec, term_idx).is_some();
             if has_aniso && d > 1 { d } else { 1 }
         })
@@ -16870,7 +16798,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         let current_length_scale = get_spatial_length_scale(&self.spec, term_idx);
         let current_aniso = get_spatial_aniso_log_scales(&self.spec, term_idx);
         let (next_length_scale, next_aniso) =
-            spatial_term_psi_to_length_scale_and_aniso(&self.spec, term_idx, psi);
+            spatial_term_psi_to_length_scale_and_aniso(psi);
         let same_length = spatial_length_scale_matches(current_length_scale, next_length_scale);
         let same_aniso = spatial_aniso_matches(current_aniso.as_deref(), next_aniso.as_deref());
         if same_length && same_aniso {
