@@ -257,6 +257,7 @@ pub(crate) const INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA: f64 = 0.0;
 /// than merely in the Euclidean sense.
 fn build_residualized_influence_columns(
     score_influence_jacobian: &Array2<f64>,
+    oof_z: &Array1<f64>,
     marginal_dense: &Array2<f64>,
     rigid_logslope_at_rows: &Array1<f64>,
     pilot_row_metric_w: &Array1<f64>,
@@ -275,16 +276,20 @@ fn build_residualized_influence_columns(
             score_influence_jacobian.nrows()
         ));
     }
-    if rigid_logslope_at_rows.len() != n || pilot_row_metric_w.len() != n {
+    if rigid_logslope_at_rows.len() != n || pilot_row_metric_w.len() != n || oof_z.len() != n {
         return Err(format!(
-            "influence block: pilot logslope ({}) / row metric ({}) length != {n}",
+            "influence block: pilot logslope ({}) / row metric ({}) / oof z ({}) length != {n}",
             rigid_logslope_at_rows.len(),
-            pilot_row_metric_w.len()
+            pilot_row_metric_w.len(),
+            oof_z.len()
         ));
     }
     // Z_infl = diag(s_f·β̂₀)·J via the core builder (single source of truth).
+    // `influence_block_design` reads only `.columns`; the co-indexed OOF `z`
+    // completes the core struct contract (it pairs with these J rows).
     let jac = crate::families::marginal_slope_orthogonal::ScoreInfluenceJacobian {
         columns: score_influence_jacobian.clone(),
+        z: oof_z.clone(),
     };
     let z_infl = crate::families::marginal_slope_orthogonal::influence_block_design(
         &jac,
@@ -817,6 +822,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         let rigid_logslope_at_rows = &spec.logslope_offset + baseline.1;
         let residualized = build_residualized_influence_columns(
             jac,
+            z_train,
             marginal_dense_for_proj.as_ref(),
             &rigid_logslope_at_rows,
             &cross_block_pilot_w_score_warp,
