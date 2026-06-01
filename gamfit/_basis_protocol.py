@@ -142,91 +142,34 @@ def _normalize_backend(backend: str | None, coords: Sequence[Any]) -> str:
 # ---------------------------------------------------------------------------
 # Per-backend coordinate coercion
 # ---------------------------------------------------------------------------
+#
+# The 1-D / equal-length validation and the per-backend stack live once, in
+# the frame adapters (``gamfit._frame_<frame>``). The protocol just routes the
+# already-normalized backend to the matching adapter.
 
 
-def _as_tensor(x: Any, ref: Any | None = None) -> Any:
-    """Coerce a 1D numpy-or-torch input to a float64 torch tensor."""
-    torch = _torch()
-    if isinstance(x, torch.Tensor):
-        out = x
-    else:
-        out = torch.as_tensor(x)
-    if not torch.is_floating_point(out):
-        out = out.to(dtype=torch.float64)
-    return out
+def _stack_coords_torch(coords: Sequence[Any]) -> Any:
+    """Stack 1D torch coordinates into a (B, d) float64 tensor."""
+    from ._frame_torch import stack_coords
+
+    return stack_coords(coords)
 
 
-def _stack_coords(coords: Sequence[Any]) -> Any:
-    """Stack 1D coordinates into a (B, d) tensor with shared dtype/device."""
-    torch = _torch()
-    if len(coords) == 0:
-        raise ValueError("evaluate() requires at least one coordinate tensor")
-    tensors = [_as_tensor(c) for c in coords]
-    ref = tensors[0]
-    aligned = []
-    for t in tensors:
-        if t.dim() != 1:
-            raise ValueError(
-                f"each coordinate must be 1D, got shape {tuple(t.shape)}"
-            )
-        if t.numel() != ref.numel():
-            raise ValueError(
-                "coordinate tensors must share length B; got "
-                f"{ref.numel()} and {t.numel()}"
-            )
-        aligned.append(t.to(dtype=ref.dtype, device=ref.device))
-    return torch.stack(aligned, dim=1)
+def _stack_coords_for(backend: str, coords: Sequence[Any]) -> Any:
+    """Stack ``coords`` via the frame adapter for ``backend``.
 
+    ``backend`` is already normalized to one of ``"torch"``/``"numpy"``/
+    ``"jax"`` by :func:`_normalize_backend`.
+    """
+    if backend == "torch":
+        return _stack_coords_torch(coords)
+    if backend == "numpy":
+        from ._frame_numpy import stack_coords_f64
 
-def _stack_coords_numpy(coords: Sequence[Any]) -> Any:
-    """Stack 1D coordinates into a (B, d) float64 numpy array."""
-    import numpy as np
+        return stack_coords_f64(coords)
+    from ._frame_jax import stack_coords
 
-    if len(coords) == 0:
-        raise ValueError("evaluate() requires at least one coordinate array")
-    arrays = []
-    ref_len: int | None = None
-    for idx, c in enumerate(coords):
-        a = np.asarray(c, dtype=np.float64)
-        if a.ndim != 1:
-            raise ValueError(
-                f"each coordinate must be 1D, got shape {tuple(a.shape)}"
-            )
-        if ref_len is None:
-            ref_len = int(a.shape[0])
-        elif int(a.shape[0]) != ref_len:
-            raise ValueError(
-                "coordinate arrays must share length B; got "
-                f"{ref_len} and {a.shape[0]} at position {idx}"
-            )
-        arrays.append(a)
-    return np.stack(arrays, axis=1)
-
-
-def _stack_coords_jax(coords: Sequence[Any]) -> Any:
-    """Stack 1D jax-array coordinates into a (B, d) jax.numpy float64 array."""
-    _, jnp = _jax()
-    if len(coords) == 0:
-        raise ValueError("evaluate() requires at least one coordinate array")
-    arrays = []
-    ref_len: int | None = None
-    for idx, c in enumerate(coords):
-        a = jnp.asarray(c)
-        if not jnp.issubdtype(a.dtype, jnp.floating):
-            a = a.astype(jnp.float64)
-        if a.ndim != 1:
-            raise ValueError(
-                f"each coordinate must be 1D, got shape {tuple(a.shape)}"
-            )
-        if ref_len is None:
-            ref_len = int(a.shape[0])
-        elif int(a.shape[0]) != ref_len:
-            raise ValueError(
-                "coordinate arrays must share length B; got "
-                f"{ref_len} and {a.shape[0]} at position {idx}"
-            )
-        arrays.append(a)
-    return jnp.stack(arrays, axis=1)
+    return stack_coords(coords)
 
 
 # ---------------------------------------------------------------------------
@@ -391,13 +334,13 @@ class BasisDescriptor:
                 f"supported backends: {sorted(self.SUPPORTED_BACKENDS)}"
             )
         if chosen == "torch":
-            stacked = _stack_coords(coords)
+            stacked = _stack_coords_torch(coords)
             return self._evaluate_torch(stacked)
         if chosen == "numpy":
-            stacked = _stack_coords_numpy(coords)
+            stacked = _stack_coords_for("numpy", coords)
             return self._evaluate_numpy(stacked)
         # jax
-        stacked = _stack_coords_jax(coords)
+        stacked = _stack_coords_for("jax", coords)
         return self._evaluate_jax(stacked)
 
     # -------------------------------------------------------------- jacobian
@@ -415,7 +358,7 @@ class BasisDescriptor:
                 f"{type(self).__name__}.jacobian expected "
                 f"{self.intrinsic_dim} coordinate argument(s), got {len(coords)}"
             )
-        stacked = _stack_coords(coords).detach().requires_grad_(True)
+        stacked = _stack_coords_torch(coords).detach().requires_grad_(True)
         # Per-row jacobian: differentiate evaluate w.r.t. coords; rows are
         # independent across B so the cross-batch Jacobian block is zero.
         out = self._evaluate_torch(stacked)
@@ -446,7 +389,7 @@ class BasisDescriptor:
                 f"{type(self).__name__}.hessian expected "
                 f"{self.intrinsic_dim} coordinate argument(s), got {len(coords)}"
             )
-        stacked = _stack_coords(coords).detach().requires_grad_(True)
+        stacked = _stack_coords_torch(coords).detach().requires_grad_(True)
         out = self._evaluate_torch(stacked)
         B, M = int(out.shape[0]), int(out.shape[1])
         d = self.intrinsic_dim

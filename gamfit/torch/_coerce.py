@@ -14,7 +14,8 @@ from typing import Any
 import numpy as np
 import torch
 
-from . import _torch_compat as _tc
+from .._frame_torch import from_numpy_like as _frame_from_numpy_like
+from .._frame_torch import to_numpy_f64 as _frame_to_numpy_f64
 
 
 def to_numpy_f64(value: torch.Tensor) -> Any:
@@ -23,24 +24,11 @@ def to_numpy_f64(value: torch.Tensor) -> Any:
     The autograd graph is *not* preserved — callers wanting differentiable
     paths must use the autograd ``Function`` wrappers, which call this helper
     inside their forward pass.
+
+    Delegates to :func:`gamfit._frame_torch.to_numpy_f64`, the single source
+    of truth for the detach → CPU → float64 → contiguous → numpy dance.
     """
-    if not isinstance(value, torch.Tensor):
-        raise TypeError(f"expected torch.Tensor, got {type(value).__name__}")
-    tensor = value.detach()
-    # Move host first, *then* cast dtype. A fused ``.to(device="cpu",
-    # dtype=float64)`` makes PyTorch satisfy the float64 cast on the source
-    # device, and MPS has no float64 — so it raises instead of just moving to
-    # CPU and casting there. Splitting the ops keeps every accelerator working.
-    if tensor.device.type != "cpu":
-        tensor = tensor.to(device="cpu")
-    if tensor.dtype != _tc.float64:
-        tensor = tensor.to(dtype=_tc.float64)
-    if not tensor.is_contiguous():
-        tensor = tensor.contiguous()
-    arr = tensor.numpy()
-    if arr.dtype == np.float64 and arr.flags.c_contiguous:
-        return arr
-    return np.ascontiguousarray(arr, dtype=np.float64)
+    return _frame_to_numpy_f64(value)
 
 
 def to_numpy_uintp(value: torch.Tensor) -> Any:
@@ -60,11 +48,11 @@ def from_numpy_like(array: Any, ref: torch.Tensor) -> torch.Tensor:
 
     The result is detached from any prior graph so callers can hand it to
     autograd without aliasing the originating buffer.
+
+    The torch bridge always passes a concrete ``torch.Tensor`` reference, so
+    this variant rejects a missing reference up front; the device/dtype-match
+    body itself lives once in :func:`gamfit._frame_torch.from_numpy_like`.
     """
     if not isinstance(ref, torch.Tensor):
         raise TypeError("from_numpy_like requires a torch tensor as reference")
-    array = np.asarray(array, dtype=np.float64, order="C")
-    tensor = _tc.as_tensor(array, dtype=_tc.float64, device="cpu")
-    if ref.device.type == "cpu" and ref.dtype == _tc.float64:
-        return tensor
-    return tensor.to(device=ref.device, dtype=ref.dtype)
+    return _frame_from_numpy_like(array, ref)

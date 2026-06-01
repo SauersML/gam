@@ -16,6 +16,9 @@ from typing import Any, Callable
 
 import numpy as np
 
+from ._frame_numpy import to_numpy_f64 as _to_numpy_f64
+from ._frame_shared import stack_coords_generic
+
 
 def _jax() -> tuple[Any, Any]:
     from ._frame import import_jax
@@ -30,10 +33,7 @@ def to_numpy_f64(value: Any) -> np.ndarray:
     differentiable path must wrap the Rust call in a
     :class:`jax.custom_vjp` (see :func:`wrap_value_grad`).
     """
-    arr = np.asarray(value, dtype=np.float64)
-    if not arr.flags.c_contiguous:
-        arr = np.ascontiguousarray(arr)
-    return arr
+    return _to_numpy_f64(value)
 
 
 def from_numpy_like(array: Any, ref: Any | None) -> Any:
@@ -56,27 +56,22 @@ def from_numpy_like(array: Any, ref: Any | None) -> Any:
 def stack_coords(coords: list[Any] | tuple[Any, ...]) -> Any:
     """Stack 1D jax coordinates into a (B, d) jax array."""
     _, jnp = _jax()
-    if len(coords) == 0:
-        raise ValueError("stack_coords requires at least one coordinate")
-    arrays: list[Any] = []
-    ref_len: int | None = None
-    for idx, c in enumerate(coords):
+
+    def _coerce(idx: int, c: Any, _ref_len: int | None) -> tuple[Any, int]:
         a = jnp.asarray(c)
         if a.ndim != 1:
             raise ValueError(
                 f"coord {idx}: expected 1D array, got shape {tuple(a.shape)}"
             )
-        if ref_len is None:
-            ref_len = int(a.shape[0])
-        elif int(a.shape[0]) != ref_len:
-            raise ValueError(
-                f"coord {idx}: length {a.shape[0]} does not match reference "
-                f"length {ref_len}"
-            )
         if not jnp.issubdtype(a.dtype, jnp.floating):
             a = a.astype(jnp.float64)
-        arrays.append(a)
-    return jnp.stack(arrays, axis=1)
+        return a, int(a.shape[0])
+
+    return stack_coords_generic(
+        coords,
+        coerce=_coerce,
+        stack=lambda arrays: jnp.stack(arrays, axis=1),
+    )
 
 
 def wrap_value_grad(
