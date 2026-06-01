@@ -5717,17 +5717,24 @@ mod survival_flex_gpu_tests {
         let euv0 = [0.0_f64; 9];
         let eu1 = [0.1, 0.2];
         let euv1 = [0.0_f64; 4];
-        let mk = |eu: &[f64], euv: &[f64]| SurvivalFlexPrimaryTimepointRow {
-            eta: 0.0,
-            chi: 1.0,
-            d: 1.0,
-            eta_u: eu,
-            eta_uv: euv,
-            chi_u: eu,
-            chi_uv: euv,
-            d_u: eu,
-            d_uv: euv,
-        };
+        // Closures can't carry HRTBs, so the lifetime inferred for the two
+        // `&[f64]` args is unrelated to the lifetime of the returned struct,
+        // which binds eta_u/eta_uv/chi_u/... to one and the same `'a`.
+        // A nested fn with an explicit lifetime tying both args + return type
+        // is the canonical fix.
+        fn mk<'a>(eu: &'a [f64], euv: &'a [f64]) -> SurvivalFlexPrimaryTimepointRow<'a> {
+            SurvivalFlexPrimaryTimepointRow {
+                eta: 0.0,
+                chi: 1.0,
+                d: 1.0,
+                eta_u: eu,
+                eta_uv: euv,
+                chi_u: eu,
+                chi_uv: euv,
+                d_u: eu,
+                d_uv: euv,
+            }
+        }
         let row0 = SurvivalFlexPrimaryRow {
             entry: mk(&eu0, &euv0),
             exit: mk(&eu0, &euv0),
