@@ -4852,6 +4852,18 @@ pub struct PredictUncertaintyOptions {
     /// OOD inflation strength γ (multiplier on the squared per-axis
     /// overshoot fraction). Default 1.0.
     pub ood_gamma: f64,
+    /// Opt-in distribution-free conformal calibration of the response-scale
+    /// interval. When `Some(level)` with `level ∈ (0, 1)`, the model-based
+    /// `mean_lower` / `mean_upper` bounds are REPLACED by a split-conformal /
+    /// conformalized-scale-regression interval `μ̂(x) ± q̂·s(x)` whose finite-
+    /// sample marginal coverage is `≥ level` regardless of model
+    /// misspecification (see [`crate::inference::conformal`]). The multiplier
+    /// `q̂` is calibrated at miscoverage `α = 1 − level` from the model's own
+    /// approximate-leave-one-out held-out residuals. This is applied by
+    /// [`predict_full_uncertainty_conformal`], which is the only path that
+    /// reads this field; `None` (the default) leaves the model-based interval
+    /// untouched. There is no CLI flag — conformal is a library-API opt-in.
+    pub conformal_level: Option<f64>,
 }
 
 impl Default for PredictUncertaintyOptions {
@@ -4873,6 +4885,7 @@ impl Default for PredictUncertaintyOptions {
             boundary_alpha: 0.25,
             boundary_band_fraction: 0.05,
             ood_gamma: 1.0,
+            conformal_level: None,
         }
     }
 }
@@ -5658,6 +5671,75 @@ where
         covariance_mode_requested: requested_mode,
         covariance_corrected_used,
     })
+}
+
+/// Training data needed to calibrate a conformal predictor: the in-sample
+/// design, fitted linear predictor `Xβ̂ + offset`, offset, response, and the
+/// dispersion `phi`. These are exactly the quantities
+/// [`crate::inference::alo::compute_alo_diagnostics_from_unified`] requires;
+/// the caller already holds them at fit time.
+pub struct ConformalTrainingData<'a> {
+    /// Dense training design matrix (n × p).
+    pub design: &'a Array2<f64>,
+    /// Fitted in-sample linear predictor `Xβ̂ + offset` (length n).
+    pub eta: &'a Array1<f64>,
+    /// Training offset (length n).
+    pub offset: &'a Array1<f64>,
+    /// Training response (length n).
+    pub y: ArrayView1<'a, f64>,
+    /// Dispersion `phi` used to scale the conditional posterior SE.
+    pub phi: f64,
+}
+
+/// Full-uncertainty prediction with opt-in distribution-free conformal
+/// calibration of the response-scale interval.
+///
+/// This is the real predict-path caller of [`crate::inference::conformal`].
+/// It always runs the model's own [`PredictableModel::predict_full_uncertainty`]
+/// (so the point predictions, η/mean SEs, observation interval, and provenance
+/// are exactly the model-based ones). Then, when `options.conformal_level` is
+/// `Some(level)`, it builds a [`ConformalCalibrator`] from `train` + `fit` at
+/// miscoverage `α = 1 − level` and OVERWRITES the response-scale
+/// `mean_lower` / `mean_upper` with the conformal interval `μ̂(x) ± q̂·s(x)`,
+/// using the result's own response-scale SE as the per-point scale `s(x)` —
+/// the same scale source the calibration residuals were normalized by. When
+/// `conformal_level` is `None` the model-based interval is returned unchanged.
+///
+/// The conformal interval carries finite-sample marginal coverage `≥ level`
+/// regardless of model misspecification; see the module docs of
+/// [`crate::inference::conformal`] for the response-scale decision and the
+/// exact order-statistic multiplier.
+pub fn predict_full_uncertainty_conformal<M: PredictableModel + ?Sized>(
+    model: &M,
+    input: &PredictInput,
+    fit: &UnifiedFitResult,
+    family: &LikelihoodSpec,
+    options: &PredictUncertaintyOptions,
+    train: &ConformalTrainingData<'_>,
+) -> Result<PredictUncertaintyResult, EstimationError> {
+    let mut result = model.predict_full_uncertainty(input, fit, options)?;
+    let Some(level) = options.conformal_level else {
+        return Ok(result);
+    };
+    if !(level.is_finite() && level > 0.0 && level < 1.0) {
+        return Err(EstimationError::InvalidInput(format!(
+            "conformal_level must be in (0,1), got {level}"
+        )));
+    }
+    let alpha = 1.0 - level;
+    let calibrator = crate::inference::conformal::ConformalCalibrator::from_fit(
+        fit,
+        family,
+        train.design,
+        train.eta,
+        train.offset,
+        train.y,
+        train.phi,
+        alpha,
+    )?;
+    let bounds = ResponseBounds::for_family(&family.response);
+    calibrator.apply_to_uncertainty_result(&mut result, bounds)?;
+    Ok(result)
 }
 
 /// Coefficient-level uncertainty and confidence intervals.
