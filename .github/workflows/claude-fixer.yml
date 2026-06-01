@@ -47,11 +47,13 @@ jobs:
             echo "::warning::gamfit source build failed — agent can still use the gam CLI, or fix the build as part of its work"
 
       - name: Run Claude fixer agent
+        id: claude
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          # Stream the full agent transcript to the Actions log in real time.
-          show_full_output: true
+          # Suppress the raw stream-json dump; a readable transcript of just
+          # Claude's messages is rendered from execution_file after the run.
+          show_full_output: false
           claude_args: >-
             --model claude-opus-4-8
             --dangerously-skip-permissions
@@ -217,3 +219,7 @@ jobs:
             applicable) and either tested or documented why each is handled.
 
             Have fun. Take your time. Get it perfect.
+
+      - name: Print Claude transcript
+        if: always()
+        run: bash .github/scripts/print-claude-transcript.sh '${{ steps.claude.outputs.execution_file }}'

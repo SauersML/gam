@@ -73,16 +73,16 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Run Claude merger agent
+        id: claude
         uses: anthropics/claude-code-action@v1
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          # Stream the full agent transcript to the Actions log in real time.
-          # (Public repo: GitHub masks registered secrets; this step also holds
-          # CARGO/PYPI publish tokens, which stay masked as ${{ secrets.* }}.)
-          show_full_output: true
+          # Suppress the raw stream-json dump; a readable transcript of just
+          # Claude's messages is rendered from execution_file after the run.
+          show_full_output: false
           claude_args: >-
             --model claude-opus-4-8
             --dangerously-skip-permissions
@@ -189,3 +189,7 @@ jobs:
             it ships. Removing publish blockers is part of the job.
 
             Have fun. Take your time. Get it perfect.
+
+      - name: Print Claude transcript
+        if: always()
+        run: bash .github/scripts/print-claude-transcript.sh '${{ steps.claude.outputs.execution_file }}'
