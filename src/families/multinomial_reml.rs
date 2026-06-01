@@ -12,12 +12,20 @@
 //! ```
 //!
 //! Each block shares the same design matrix `X ∈ ℝ^{N×P}` and the same
-//! smoothing penalty `S ∈ ℝ^{P×P}`. The full block-replicated penalty
-//! is `I_{K-1} ⊗ S`, naturally realised by handing each
-//! [`ParameterBlockSpec`] an independent clone of `S` — every block carries
-//! one penalty matrix scaled by its own `λ_a = exp(ρ_a)`. This is the
-//! Kronecker form referenced by [`crate::solver::arrow_schur::KroneckerPenaltyOp`]
-//! when the outer solve later switches to matrix-free penalty application.
+//! list of per-smooth-term penalty components `S_t ∈ ℝ^{P×P}` (one `S_t` per
+//! smooth term `t`, each embedded at the term's `col_range` within the shared
+//! `P`-column coefficient space). Every active class block receives the FULL
+//! list, and the outer REML/LAML loop selects an **independent** smoothing
+//! parameter `λ_{a,t} = exp(ρ_{a,t})` per `(class a, term t)` — matching
+//! mgcv/VGAM per-term smoothing. The full per-class penalty is therefore
+//! `Σ_t λ_{a,t} S_t`, and the block-replicated penalty is
+//! `I_{K-1} ⊗ (Σ_t λ_{a,t} S_t)`. Pre-summing the terms into one fused `S`
+//! scaled by a single `λ_a` per class is exactly the multi-term fusion that
+//! over-smooths a rough term while under-smoothing a smooth one (#561), so the
+//! per-term list is carried through verbatim. The single-term case (`n_terms =
+//! 1`) degenerates to the classic `I_{K-1} ⊗ (λ_a S)` Kronecker form referenced
+//! by [`crate::solver::arrow_schur::KroneckerPenaltyOp`] when the outer solve
+//! later switches to matrix-free penalty application.
 //!
 //! # Likelihood
 //!
@@ -80,7 +88,8 @@ use std::sync::Arc;
 /// * `y_one_hot.dim() == (N, K)`, with `K = total_classes ≥ 2`.
 /// * `weights.len() == N`, finite and non-negative.
 /// * `design.nrows() == N`, `design.ncols() == P`.
-/// * `penalty.dim() == (P, P)` (symmetric, PSD).
+/// * every penalty in `penalties` has shape `(P, P)` (symmetric, PSD), and
+///   `penalty_nullspace_dims.len() == penalties.len()`.
 ///
 /// All four are validated by [`MultinomialFamily::new`].
 #[derive(Clone, Debug)]
@@ -101,13 +110,23 @@ pub struct MultinomialFamily {
     /// classes. Carried as `Arc<Array2<f64>>` so the per-block specs and the
     /// family share storage with zero copies.
     pub design: Arc<Array2<f64>>,
-    /// Shared smoothing penalty `S ∈ ℝ^{P × P}`. Replicated as one
-    /// `PenaltyMatrix` per active block (the `I_{K-1} ⊗ S` Kronecker form).
-    pub penalty: Arc<Array2<f64>>,
-    /// Structural nullspace dimension of `S` (passed through to each block's
-    /// `nullspace_dims`). Defaults to `0` when the caller has no analytic
-    /// rank information.
-    pub penalty_nullspace_dim: usize,
+    /// Per-smooth-term penalty components, each a `P × P` operator expressed in
+    /// block-local form (`PenaltyMatrix::Blockwise` embedding the term's local
+    /// `S_t` at its `col_range` within the shared `P`-column coefficient
+    /// space). **Every active class block receives this entire list**, so the
+    /// outer REML/LAML loop selects an *independent* smoothing parameter per
+    /// `(class, term)` — matching mgcv/VGAM per-term smoothing. The full
+    /// block-replicated penalty is `I_{K-1} ⊗ (Σ_t λ_{a,t} S_t)`; pre-summing
+    /// the terms (one fused λ per class) is exactly the multi-term fusion that
+    /// over-smooths one term while under-smoothing another (#561). Carried as
+    /// `Arc<Vec<…>>` so per-block specs share storage with zero copies.
+    pub penalties: Arc<Vec<PenaltyMatrix>>,
+    /// Structural nullspace dimension of each penalty component in `penalties`,
+    /// parallel to it (one entry per term). Passed through to each block's
+    /// `nullspace_dims` so the exact penalized log-determinant partitions every
+    /// term's eigenspace correctly. Entries default to `0` when the caller has
+    /// no analytic rank information for a term.
+    pub penalty_nullspace_dims: Arc<Vec<usize>>,
     /// Cached likelihood evaluator. Constructed once with the same row
     /// weights as `weights` and reused across every `evaluate` call.
     likelihood: MultinomialLogitLikelihood,
@@ -155,8 +174,8 @@ impl MultinomialFamily {
         weights: Array1<f64>,
         total_classes: usize,
         design: Arc<Array2<f64>>,
-        penalty: Arc<Array2<f64>>,
-        penalty_nullspace_dim: usize,
+        penalties: Arc<Vec<PenaltyMatrix>>,
+        penalty_nullspace_dims: Arc<Vec<usize>>,
     ) -> Result<Self, String> {
         if total_classes < 2 {
             return Err(format!(
@@ -189,11 +208,27 @@ impl MultinomialFamily {
             ));
         }
         let p = design.ncols();
-        if penalty.dim() != (p, p) {
+        if penalty_nullspace_dims.len() != penalties.len() {
             return Err(format!(
-                "MultinomialFamily: penalty shape {:?} != (P, P) = ({p}, {p})",
-                penalty.dim()
+                "MultinomialFamily: penalty_nullspace_dims length {} != penalties length {}",
+                penalty_nullspace_dims.len(),
+                penalties.len()
             ));
+        }
+        for (t, penalty) in penalties.iter().enumerate() {
+            if penalty.shape() != (p, p) {
+                return Err(format!(
+                    "MultinomialFamily: penalties[{t}] shape {:?} != (P, P) = ({p}, {p})",
+                    penalty.shape()
+                ));
+            }
+            for ((i, j), &v) in penalty.to_dense().indexed_iter() {
+                if !v.is_finite() {
+                    return Err(format!(
+                        "MultinomialFamily: penalties[{t}][{i},{j}] must be finite (got {v})"
+                    ));
+                }
+            }
         }
         validate_multinomial_simplex(y_one_hot.view(), "MultinomialFamily")
             .map_err(|e| e.to_string())?;
@@ -201,13 +236,6 @@ impl MultinomialFamily {
             if !v.is_finite() {
                 return Err(format!(
                     "MultinomialFamily: design[{i},{j}] must be finite (got {v})"
-                ));
-            }
-        }
-        for ((i, j), &v) in penalty.indexed_iter() {
-            if !v.is_finite() {
-                return Err(format!(
-                    "MultinomialFamily: penalty[{i},{j}] must be finite (got {v})"
                 ));
             }
         }
@@ -224,8 +252,8 @@ impl MultinomialFamily {
             weights,
             total_classes,
             design,
-            penalty,
-            penalty_nullspace_dim,
+            penalties,
+            penalty_nullspace_dims,
             likelihood,
         })
     }
@@ -242,12 +270,13 @@ impl MultinomialFamily {
     /// `M − 1` is the least likely. This matches the task's
     /// "descending priorities" gauge convention.
     ///
-    /// `initial_log_lambdas` is initialised to zeros (one entry per block:
-    /// each block carries one `λ`). Callers that want a custom warm start
-    /// override per-block before passing to `fit_custom_family_with_rho_prior`.
+    /// `initial_log_lambdas` is initialised to zeros (one entry per penalty
+    /// term per block: each block carries one `λ_{a,t}` per smooth term `t`).
+    /// Callers that want a custom warm start override per-block before passing
+    /// to `fit_custom_family_with_rho_prior`.
     pub fn build_block_specs(&self) -> Vec<ParameterBlockSpec> {
-        let nullspace_dims = vec![self.penalty_nullspace_dim];
         let m = self.active_classes();
+        let n_terms = self.penalties.len();
         (0..m)
             .map(|a| {
                 let priority = 100u8.saturating_add(u8::try_from(m - a).unwrap_or(u8::MAX));
@@ -262,13 +291,20 @@ impl MultinomialFamily {
                 // assembles `[X | X | … | X]` over the same N rows, mistakes the
                 // repeated columns for aliases, and strips every block past
                 // `class_0` to width 0 — the failure in #363.
+                //
+                // Each block carries the FULL per-term penalty list, so the
+                // outer loop selects an independent λ_{a,t} per (class, term).
+                // The terms default to distinct precision labels (the engine's
+                // `__block_{b}_penalty_{t}`), so no two are fused — recovering a
+                // multi-term class-probability surface where one term is rough
+                // and another smooth (#561).
                 let mut spec = ParameterBlockSpec {
                     name: format!("class_{a}"),
                     design: DesignMatrix::Dense(DenseDesignMatrix::from(self.design.clone())),
                     offset: Array1::<f64>::zeros(self.design.nrows()),
-                    penalties: vec![PenaltyMatrix::Dense((*self.penalty).clone())],
-                    nullspace_dims: nullspace_dims.clone(),
-                    initial_log_lambdas: Array1::<f64>::zeros(1),
+                    penalties: (*self.penalties).clone(),
+                    nullspace_dims: (*self.penalty_nullspace_dims).clone(),
+                    initial_log_lambdas: Array1::<f64>::zeros(n_terms),
                     initial_beta: None,
                     gauge_priority: priority,
                     jacobian_callback: None,
@@ -920,10 +956,11 @@ mod tests {
         let design = Arc::new(Array2::<f64>::from_shape_fn((n_obs, p), |(i, j)| {
             ((i + j + 1) as f64).sin()
         }));
-        let penalty = Arc::new(Array2::<f64>::from_shape_fn((p, p), |(i, j)| {
-            if i == j { 1.0 } else { 0.0 }
-        }));
-        MultinomialFamily::new(y, weights, k, design, penalty, 0)
+        let penalties = Arc::new(vec![crate::custom_family::PenaltyMatrix::Dense(
+            Array2::<f64>::from_shape_fn((p, p), |(i, j)| if i == j { 1.0 } else { 0.0 }),
+        )]);
+        let nullspace_dims = Arc::new(vec![0usize]);
+        MultinomialFamily::new(y, weights, k, design, penalties, nullspace_dims)
             .expect("toy MultinomialFamily must construct")
     }
 
@@ -965,12 +1002,72 @@ mod tests {
     }
 
     #[test]
-    fn each_block_carries_exactly_one_penalty_for_kronecker_form() {
-        let family = toy_family(6, 4, 3);
-        let specs = family.build_block_specs();
-        for spec in &specs {
+    fn each_block_carries_the_full_per_term_penalty_list() {
+        // Single-term family: every block carries exactly one penalty and one λ
+        // (the classic Kronecker form I_{K-1} ⊗ (λ_a S)).
+        let single = toy_family(6, 4, 3);
+        for spec in &single.build_block_specs() {
             assert_eq!(spec.penalties.len(), 1);
             assert_eq!(spec.initial_log_lambdas.len(), 1);
+            assert_eq!(spec.nullspace_dims.len(), 1);
+        }
+
+        // Multi-term family (#561): every active-class block must receive the
+        // FULL list of per-term penalties, with one entry of `initial_log_lambdas`
+        // (and `nullspace_dims`) per term — so the outer REML loop selects an
+        // INDEPENDENT λ_{a,t} per (class, term). A fused single-penalty driver
+        // would collapse this back to one penalty / one λ and silently
+        // over-smooth one term while under-smoothing another.
+        let p = 5;
+        let k = 4;
+        let n_terms = 3;
+        let n_obs = 9;
+        let y = {
+            let mut y = Array2::<f64>::zeros((n_obs, k));
+            for i in 0..n_obs {
+                y[[i, i % k]] = 1.0;
+            }
+            y
+        };
+        let weights = Array1::<f64>::ones(n_obs);
+        let design = Arc::new(Array2::<f64>::from_shape_fn((n_obs, p), |(i, j)| {
+            ((i + j + 1) as f64).cos()
+        }));
+        // Distinct per-term penalties (each PSD) so the terms are genuinely
+        // different operators, not aliases of one matrix.
+        let penalties = Arc::new(
+            (0..n_terms)
+                .map(|t| {
+                    crate::custom_family::PenaltyMatrix::Dense(Array2::<f64>::from_shape_fn(
+                        (p, p),
+                        |(i, j)| {
+                            if i == j {
+                                (t + 1) as f64
+                            } else {
+                                0.0
+                            }
+                        },
+                    ))
+                })
+                .collect::<Vec<_>>(),
+        );
+        let nullspace_dims = Arc::new(vec![0usize; n_terms]);
+        let multi = MultinomialFamily::new(y, weights, k, design, penalties, nullspace_dims)
+            .expect("multi-term MultinomialFamily must construct");
+        let specs = multi.build_block_specs();
+        assert_eq!(specs.len(), k - 1, "one block per active class");
+        for spec in &specs {
+            assert_eq!(
+                spec.penalties.len(),
+                n_terms,
+                "each block must carry the full per-term penalty list (#561)"
+            );
+            assert_eq!(
+                spec.initial_log_lambdas.len(),
+                n_terms,
+                "each block must carry one independent λ per smooth term (#561)"
+            );
+            assert_eq!(spec.nullspace_dims.len(), n_terms);
         }
     }
 
@@ -1120,8 +1217,11 @@ mod tests {
         let y = array![[1.0], [1.0], [1.0]];
         let w = Array1::<f64>::ones(n);
         let x = Arc::new(Array2::<f64>::ones((n, 1)));
-        let s = Arc::new(Array2::<f64>::zeros((1, 1)));
-        let err = MultinomialFamily::new(y, w, 1, x, s, 0).expect_err("K = 1 must be rejected");
+        let s = Arc::new(vec![crate::custom_family::PenaltyMatrix::Dense(
+            Array2::<f64>::zeros((1, 1)),
+        )]);
+        let nd = Arc::new(vec![0usize]);
+        let err = MultinomialFamily::new(y, w, 1, x, s, nd).expect_err("K = 1 must be rejected");
         assert!(err.contains("K"));
     }
 
@@ -1157,10 +1257,11 @@ mod tests {
         let design = Arc::new(Array2::<f64>::from_shape_fn((n_obs, p), |(i, j)| {
             0.7 * ((i as f64 + 1.0) * 0.31 + (j as f64) * 0.53).sin() - 0.2 * (j as f64)
         }));
-        let penalty = Arc::new(Array2::<f64>::from_shape_fn((p, p), |(i, j)| {
-            if i == j { 1.0 } else { 0.0 }
-        }));
-        MultinomialFamily::new(y, weights, k, design, penalty, 0)
+        let penalties = Arc::new(vec![crate::custom_family::PenaltyMatrix::Dense(
+            Array2::<f64>::from_shape_fn((p, p), |(i, j)| if i == j { 1.0 } else { 0.0 }),
+        )]);
+        let nullspace_dims = Arc::new(vec![0usize]);
+        MultinomialFamily::new(y, weights, k, design, penalties, nullspace_dims)
             .expect("family_with_weights must construct")
     }
 

@@ -42,9 +42,17 @@
 //! [`VectorLikelihood::hess_block`], or a caller override) and the residual
 //! `r_{n,a} = −∂ log L / ∂η_a` (`−`[`VectorLikelihood::grad_eta`]). The step
 //! `δ = − H^{-1} g` is solved through faer's symmetric-PD-with-fallback
-//! factorisation, then accepted by a backtracking line search on `F` (full
-//! step first, halve up to 8 times). Convergence is the relative coefficient
-//! step `‖δ‖ / (1 + ‖β‖) ≤ tol`.
+//! factorisation under an adaptive Levenberg–Marquardt ridge: when a
+//! rank-deficient block (collinear / quasi-separated columns under a small
+//! per-output λ) makes the Bunch–Kaufman fallback back-substitute through
+//! near-zero pivots into a non-finite δ, a diagonal ridge `τ·I` — scaled by the
+//! Hessian's largest diagonal so it is curvature-scale invariant — is added and
+//! the system re-solved, escalating τ geometrically until δ is finite. The
+//! step is then accepted by a backtracking line search on `F` (full step first,
+//! halve up to 8 times). Because the line search validates against the
+//! *unridged* objective `F`, the ridge never biases the converged β̂ (at the
+//! optimum the gradient vanishes and δ → 0 for any τ). Convergence is the
+//! relative coefficient step `‖δ‖ / (1 + ‖β‖) ≤ tol`.
 //!
 //! # Fisher-block override
 //!
@@ -314,29 +322,91 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
             }
         }
 
-        // δ = − H^{-1} · grad.
-        let factor =
-            factorize_symmetricwith_fallback(FaerArrayView::new(&hessian).as_ref(), Side::Lower)
-                .map_err(|err| {
-                    EstimationError::InvalidInput(format!(
-                        "{context}: Hessian factorization failed at iter {iter}: {err}"
-                    ))
-                })?;
-        let mut rhs = Array2::<f64>::zeros((beta_flat_dim, 1));
-        for i in 0..beta_flat_dim {
-            rhs[[i, 0]] = -grad_flat[i];
-        }
-        {
-            let rhs_view = array2_to_matmut(&mut rhs);
-            factor.solve_in_place(rhs_view);
-        }
+        // δ = − H^{-1} · grad, solved through an adaptive Levenberg–Marquardt
+        // ridge. The penalized Hessian `H = block(XᵀWX) + diag_a(λ_a S)` can be
+        // rank-deficient — a multinomial class block with quasi-separated /
+        // collinear columns and a small per-class λ leaves `XᵀW_aX + λ_a S`
+        // singular. faer's symmetric fallback chain ends at Bunch–Kaufman
+        // (LBLᵀ), which factorizes indefinite/singular matrices "successfully"
+        // and then back-substitutes through near-zero pivots, yielding a
+        // non-finite δ. Rather than aborting the whole fit on one bad block, we
+        // add a small ridge `τ·I` (Levenberg style) to the diagonal and
+        // re-factorize, escalating τ geometrically until the step is finite.
+        //
+        // The base ridge is scaled by the Hessian's largest diagonal entry so
+        // it is invariant to the problem's overall curvature scale: a tiny
+        // nudge relative to the dominant curvature, large enough to lift the
+        // null directions off zero. A finite δ from the ridged system is a
+        // descent direction for the *unridged* penalized objective `F`
+        // (ridging only shrinks the step toward the gradient direction), and
+        // the backtracking line search below validates it against `F` itself,
+        // so the ridge never biases the converged β̂ — at the optimum the
+        // gradient vanishes and the step → 0 regardless of τ.
+        let max_diag = (0..beta_flat_dim).fold(0.0_f64, |acc, idx| acc.max(hessian[[idx, idx]].abs()));
+        let base_ridge = if max_diag.is_finite() && max_diag > 0.0 {
+            max_diag * 1.0e-10
+        } else {
+            1.0e-10
+        };
+        // 30 doublings span ~9 orders of magnitude over the base ridge, which
+        // covers any conditioning a finite-curvature softmax/binomial block can
+        // present; the loop almost always exits at ridge = 0 (well-posed H).
+        const MAX_RIDGE_ESCALATIONS: usize = 30;
         let mut delta = Array1::<f64>::zeros(beta_flat_dim);
-        for i in 0..beta_flat_dim {
-            delta[i] = rhs[[i, 0]];
+        let mut ridge = 0.0_f64;
+        let mut solved = false;
+        for attempt in 0..=MAX_RIDGE_ESCALATIONS {
+            let mut ridged = hessian.clone();
+            if ridge > 0.0 {
+                for idx in 0..beta_flat_dim {
+                    ridged[[idx, idx]] += ridge;
+                }
+            }
+            let factor = match factorize_symmetricwith_fallback(
+                FaerArrayView::new(&ridged).as_ref(),
+                Side::Lower,
+            ) {
+                Ok(factor) => factor,
+                Err(err) => {
+                    // A genuine factorization failure (not just a singular
+                    // pivot) — escalate the ridge and retry; only give up after
+                    // exhausting the escalation budget.
+                    if attempt == MAX_RIDGE_ESCALATIONS {
+                        return Err(EstimationError::InvalidInput(format!(
+                            "{context}: Hessian factorization failed at iter {iter} \
+                             even with ridge {ridge:.3e}: {err}"
+                        )));
+                    }
+                    ridge = if ridge > 0.0 { ridge * 2.0 } else { base_ridge };
+                    continue;
+                }
+            };
+            let mut rhs = Array2::<f64>::zeros((beta_flat_dim, 1));
+            for i in 0..beta_flat_dim {
+                rhs[[i, 0]] = -grad_flat[i];
+            }
+            {
+                let rhs_view = array2_to_matmut(&mut rhs);
+                factor.solve_in_place(rhs_view);
+            }
+            if (0..beta_flat_dim).all(|i| rhs[[i, 0]].is_finite()) {
+                for i in 0..beta_flat_dim {
+                    delta[i] = rhs[[i, 0]];
+                }
+                solved = true;
+                break;
+            }
+            // Singular pivots back-substituted to ±inf/NaN: escalate the ridge.
+            ridge = if ridge > 0.0 { ridge * 2.0 } else { base_ridge };
         }
-        if delta.iter().any(|v| !v.is_finite()) {
-            crate::bail_invalid_estim!("{context}: Newton step is non-finite at iter {iter}");
-        }
+        assert!(
+            solved,
+            "{context}: Newton step remained non-finite at iter {iter} after {} ridge \
+             escalations up to {ridge:.3e}; the penalized Hessian is pathologically \
+             rank-deficient (grad_norm={:.3e}, max_diag={max_diag:.3e})",
+            MAX_RIDGE_ESCALATIONS,
+            grad_flat.iter().map(|v| v * v).sum::<f64>().sqrt(),
+        );
 
         // Damped acceptance: full step first, halve up to 8 times if the
         // penalized negative log-likelihood fails to decrease. The first
@@ -762,6 +832,92 @@ mod parity_tests {
         assert!(
             (fit.deviance - (-2.0 * log_lik)).abs() < 1.0e-9,
             "deviance must equal −2 log L"
+        );
+    }
+
+    #[test]
+    fn multinomial_rank_deficient_block_recovers_via_ridge_not_crash() {
+        // Issue #557: a rank-deficient class block under a tiny per-class λ used
+        // to make faer's Bunch–Kaufman fallback back-substitute through near-zero
+        // pivots into a non-finite Newton step δ, and the solver aborted with
+        // "Newton step is non-finite". The adaptive Levenberg–Marquardt ridge
+        // must instead lift the null direction off zero, keep δ finite, and let
+        // the backtracking line search converge to the penalized optimum.
+        //
+        // Construct an exactly rank-deficient design: column 2 is a perfect
+        // duplicate of column 1, so XᵀWX is singular along (e₁ − e₂) for every
+        // class, and we drive the corresponding λ to a tiny value so the penalty
+        // cannot regularize that null direction. A non-robust solver crashes
+        // here; the ridge path must produce a finite, self-consistent fit.
+        let n = 50;
+        let p = 4;
+        let k = 4;
+        let design = Array2::<f64>::from_shape_fn((n, p), |(i, j)| match j {
+            0 => 1.0,
+            1 => ((i + 1) as f64 * 0.23).sin(),
+            2 => ((i + 1) as f64 * 0.23).sin(), // exact duplicate of column 1
+            _ => ((i + 1) as f64 * 0.19).cos(),
+        });
+        let mut y = Array2::<f64>::zeros((n, k));
+        for i in 0..n {
+            y[[i, (i * 5 + 2) % k]] = 1.0;
+        }
+        // Penalty touches only the smooth-ish columns 1..p; columns 0/1/2 share
+        // the collinearity, and a near-zero λ leaves the (e₁ − e₂) null direction
+        // unregularized — exactly the rank-deficient regime that triggered #557.
+        let mut penalty = Array2::<f64>::zeros((p, p));
+        penalty[[3, 3]] = 1.0;
+        let lambdas = Array1::from(vec![1.0e-10_f64, 1.0e-10, 1.0e-10]);
+
+        let fit = fit_penalized_multinomial(MultinomialFitInputs {
+            design: design.view(),
+            y_one_hot: y.view(),
+            penalty: penalty.view(),
+            lambdas: lambdas.view(),
+            row_weights: None,
+            fisher_w_override: None,
+            max_iter: 200,
+            tol: 1.0e-10,
+        })
+        .expect("rank-deficient multinomial fit must NOT crash (#557): the ridge path recovers it");
+
+        // Every coefficient and fitted probability must be finite (no inf/NaN
+        // leaked from the near-singular solve).
+        for &c in fit.coefficients_active.iter() {
+            assert!(c.is_finite(), "coefficient must be finite, got {c}");
+        }
+        for &pr in fit.fitted_probabilities.iter() {
+            assert!(
+                pr.is_finite() && (-1.0e-9..=1.0 + 1.0e-9).contains(&pr),
+                "fitted probability must be a finite simplex entry, got {pr}"
+            );
+        }
+        // Rows must remain on the simplex.
+        let (nn, kk) = fit.fitted_probabilities.dim();
+        for row in 0..nn {
+            let s: f64 = (0..kk).map(|c| fit.fitted_probabilities[[row, c]]).sum();
+            assert!(
+                (s - 1.0).abs() < 1.0e-9,
+                "row {row} probabilities must sum to 1, got {s}"
+            );
+        }
+
+        // The recovered fit must satisfy first-order optimality of the penalized
+        // objective along every NON-NULL coordinate. The (e₁ − e₂) null
+        // direction is unidentified (the ridge picks the minimum-norm split
+        // between the duplicate columns), so the gradient is exactly zero along
+        // every identified direction; a central finite difference of F over the
+        // full coefficient matrix is dominated by the identified part and must be
+        // small. We assert the penalized objective gradient is near-zero — the
+        // ridge biases the step but never the optimum (at β̂ the unridged
+        // gradient vanishes for any τ).
+        let g = fd_grad(&fit.coefficients_active, |b| {
+            multinomial_objective(&design, &y, &penalty, &lambdas, b)
+        });
+        assert!(
+            g < 1.0e-4,
+            "penalized objective gradient at the ridge-recovered β̂ must (near-)vanish \
+             along identified directions (max |∂F| = {g})"
         );
     }
 }
