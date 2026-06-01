@@ -15073,18 +15073,9 @@ fn bspline_position_derivative_impl(
         validate_position_period("B-spline", knots, periodic, period)?;
         return bspline_basis_derivative_impl(t, knots, degree, order, false);
     }
-    if order != 1 {
-        return Err(format!(
-            "periodic B-spline derivative supports order=1; got order={order}"
-        ));
-    }
-    periodic_position_domain(knots, period)?;
+    let (left, right, num_basis) = periodic_position_domain(knots, period)?;
     validate_vector("t", t)?;
-    Err(
-        "periodic B-spline first-derivative as a dense (N, K) matrix is no longer exposed; \
-         use periodic_bspline_input_location_first_derivative for the (N, K, 1) jet"
-            .to_string(),
-    )
+    periodic_bspline_derivative_dense(t, (left, right), degree, num_basis, order)
 }
 
 fn periodic_position_domain(
@@ -28291,6 +28282,41 @@ fn periodic_bspline_basis_dense_via_spec(
         .map_err(|err| format!("failed to evaluate periodic B-spline basis: {err}"))
 }
 
+/// Dense `(N, K)` periodic cyclic B-spline derivative of the requested
+/// `order`, on the closed parameter circle `domain = (left, right)` with
+/// `num_basis` cyclic control points.
+///
+/// `order == 0` returns the periodic value basis (the partition of unity);
+/// `order == 1` returns the exact closed-form first derivative by squeezing
+/// the `(N, K, 1)` jet from `periodic_bspline_first_derivative_nd` — the same
+/// jet `basis_with_jet` and `PeriodicSplineCurve::evaluate_derivative` rely
+/// on, so the dense matrix and the modelling path agree to machine precision.
+/// Because the value basis is a partition of unity, each derivative row sums
+/// to ~0. Orders ≥ 2 have no exposed periodic jet and are rejected with a
+/// precise message rather than the old blanket "no longer exposed" error.
+fn periodic_bspline_derivative_dense(
+    t: ArrayView1<'_, f64>,
+    domain: (f64, f64),
+    degree: usize,
+    num_basis: usize,
+    order: usize,
+) -> Result<Array2<f64>, String> {
+    match order {
+        0 => periodic_bspline_basis_dense_via_spec(t, domain, degree, num_basis),
+        1 => {
+            let coords = column_array(t);
+            let jet = periodic_bspline_first_derivative_nd(coords.view(), domain, degree, num_basis)
+                .map_err(|err| format!("failed to evaluate periodic B-spline derivative: {err}"))?;
+            Ok(jet.index_axis_move(Axis(2), 0))
+        }
+        _ => Err(format!(
+            "periodic B-spline derivative is available in closed form for order 0 (value) \
+             and order 1 (first derivative); order={order} (second and higher derivatives) \
+             is not exposed for the periodic cyclic basis"
+        )),
+    }
+}
+
 fn bspline_basis_impl(
     t: ArrayView1<'_, f64>,
     knots: ArrayView1<'_, f64>,
@@ -28324,11 +28350,8 @@ fn bspline_basis_derivative_impl(
     validate_vector("t", t)?;
     validate_vector("knots", knots)?;
     if periodic {
-        return Err(
-            "periodic B-spline first-derivative as a dense (N, K) matrix is no longer exposed; \
-             use periodic_bspline_input_location_first_derivative for the (N, K, 1) jet"
-                .to_string(),
-        );
+        let (left, right, num_basis) = periodic_knot_domain(knots)?;
+        return periodic_bspline_derivative_dense(t, (left, right), degree, num_basis, order);
     }
     let options = match order {
         0 => BasisOptions::value(),
