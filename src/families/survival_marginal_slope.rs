@@ -1760,49 +1760,68 @@ struct BlockHessianAccumulator {
     h_gg: Array2<f64>,
     h_hh: Array2<f64>,
     h_ww: Array2<f64>,
+    /// Absorbed-influence diagonal block (#461), `p_i × p_i` (`p_i = Z̃.ncols()`).
+    h_ii: Array2<f64>,
     h_tm: Array2<f64>,
     h_tg: Array2<f64>,
     h_th: Array2<f64>,
     h_tw: Array2<f64>,
+    /// time × influence cross-block.
+    h_ti: Array2<f64>,
     h_mg: Array2<f64>,
     h_mh: Array2<f64>,
     h_mw: Array2<f64>,
+    /// marginal × influence cross-block.
+    h_mi: Array2<f64>,
     h_gh: Array2<f64>,
     h_gw: Array2<f64>,
+    /// logslope × influence cross-block.
+    h_gi: Array2<f64>,
     h_hw: Array2<f64>,
+    /// score_warp × influence cross-block.
+    h_hi: Array2<f64>,
+    /// link_dev × influence cross-block.
+    h_wi: Array2<f64>,
 }
 
 const PULLBACK_PARALLEL_MIN_CELLS: usize = 16_384;
 const PULLBACK_PARALLEL_TARGET_CELLS: usize = 65_536;
 
 impl BlockHessianAccumulator {
-    fn new(p_t: usize, p_m: usize, p_g: usize, p_h: usize, p_w: usize) -> Self {
+    fn new(p_t: usize, p_m: usize, p_g: usize, p_h: usize, p_w: usize, p_i: usize) -> Self {
         Self {
             h_tt: Array2::zeros((p_t, p_t)),
             h_mm: Array2::zeros((p_m, p_m)),
             h_gg: Array2::zeros((p_g, p_g)),
             h_hh: Array2::zeros((p_h, p_h)),
             h_ww: Array2::zeros((p_w, p_w)),
+            h_ii: Array2::zeros((p_i, p_i)),
             h_tm: Array2::zeros((p_t, p_m)),
             h_tg: Array2::zeros((p_t, p_g)),
             h_th: Array2::zeros((p_t, p_h)),
             h_tw: Array2::zeros((p_t, p_w)),
+            h_ti: Array2::zeros((p_t, p_i)),
             h_mg: Array2::zeros((p_m, p_g)),
             h_mh: Array2::zeros((p_m, p_h)),
             h_mw: Array2::zeros((p_m, p_w)),
+            h_mi: Array2::zeros((p_m, p_i)),
             h_gh: Array2::zeros((p_g, p_h)),
             h_gw: Array2::zeros((p_g, p_w)),
+            h_gi: Array2::zeros((p_g, p_i)),
             h_hw: Array2::zeros((p_h, p_w)),
+            h_hi: Array2::zeros((p_h, p_i)),
+            h_wi: Array2::zeros((p_w, p_i)),
         }
     }
 
-    fn block_dims(&self) -> (usize, usize, usize, usize, usize) {
+    fn block_dims(&self) -> (usize, usize, usize, usize, usize, usize) {
         (
             self.h_tt.nrows(),
             self.h_mm.nrows(),
             self.h_gg.nrows(),
             self.h_hh.nrows(),
             self.h_ww.nrows(),
+            self.h_ii.nrows(),
         )
     }
 
@@ -1846,7 +1865,7 @@ impl BlockHessianAccumulator {
             &family.design_exit,
             &family.design_derivative_exit,
         ];
-        let (p_t, _, _, _, _) = self.block_dims();
+        let (p_t, _, _, _, _, _) = self.block_dims();
         let tt_chunks = Self::deterministic_lhs_chunks(p_t, p_t);
         if tt_chunks.len() == 1 {
             for a in 0..3 {
