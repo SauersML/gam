@@ -389,7 +389,7 @@ fn fit_stage2(
         score_warp: None,
         link_dev: None,
         latent_z_policy: LatentZPolicy::exploratory_fit_weighted(),
-        score_influence_jacobian: influence,
+        score_influence_jacobian: jacobian,
     };
 
     gam::families::bernoulli_marginal_slope::fit_bernoulli_marginal_slope_terms(
@@ -562,8 +562,7 @@ fn sim_a_false_heterogeneity_is_controlled_by_orthogonalization() {
     let cf = crossfit_score_z_jacobian(&x, &score, 5);
 
     let naive = fit_stage2(&x, &cf.z_oof, &y, x_range, None);
-    let influence = influence_block_design_for(&naive, &cf.jac_oof, &x);
-    let ortho = fit_stage2(&x, &cf.z_oof, &y, x_range, Some(influence));
+    let ortho = fit_stage2(&x, &cf.z_oof, &y, x_range, Some(cf.jac_oof.clone()));
 
     // Evaluation grid spanning the domain.
     let grid: Vec<f64> = (0..41).map(|k| k as f64 / 40.0).collect();
@@ -641,8 +640,7 @@ fn sim_b_orthogonalization_preserves_real_heterogeneity_signal() {
     let cf = crossfit_score_z_jacobian(&x, &score, 5);
 
     let naive = fit_stage2(&x, &cf.z_oof, &y, x_range, None);
-    let influence = influence_block_design_for(&naive, &cf.jac_oof, &x);
-    let ortho = fit_stage2(&x, &cf.z_oof, &y, x_range, Some(influence));
+    let ortho = fit_stage2(&x, &cf.z_oof, &y, x_range, Some(cf.jac_oof.clone()));
 
     let grid: Vec<f64> = (0..41).map(|k| k as f64 / 40.0).collect();
     let truth: Vec<f64> = grid.iter().map(|&g| beta_fn(g)).collect();
@@ -750,8 +748,7 @@ fn sim_c_scalar_target_matches_dml_reference_under_miscalibration() {
     let theta_pair = |cf: &CrossFitScoreZJac| -> (f64, f64) {
         let naive = fit_stage2(&x, &cf.z_oof, &y, x_range, None);
         let theta_naive = mean(&beta_of_x(&naive, &grid));
-        let influence = influence_block_design_for(&naive, &cf.jac_oof, &x);
-        let ortho = fit_stage2(&x, &cf.z_oof, &y, x_range, Some(influence));
+        let ortho = fit_stage2(&x, &cf.z_oof, &y, x_range, Some(cf.jac_oof.clone()));
         let theta_ortho = mean(&beta_of_x(&ortho, &grid));
         (theta_naive, theta_ortho)
     };
@@ -843,19 +840,40 @@ fn rmse_after_affine_align(a: &[f64], b: &[f64]) -> f64 {
     rmse(&aligned, b)
 }
 
-/// Build the absorbed influence block `Z_infl = diag(s_f·β̂₀(x))·J` for Stage 2
-/// from a rigid pilot fit (design §3), via the public `influence_block_design`
-/// API (design §6). The pilot `β̂₀(x)` is read from the naive Stage-2 fit (its
-/// logslope surface evaluated at the training x); `s_f` is the family's probit
-/// scale, taken as 1.0 on the standardized-z probit parameterization used here.
-fn influence_block_design_for(
-    pilot: &BernoulliMarginalSlopeFitResult,
-    jac_oof: &Array2<f64>,
-    x: &[f64],
-) -> Array2<f64> {
-    let pilot_beta0 = Array1::from_vec(beta_of_x(pilot, x));
+// ===========================================================================
+// §6 helper contract — `influence_block_design`.
+// ===========================================================================
+//
+// The orthogonalized Stage-2 arm above passes the RAW out-of-fold `J` through
+// the spec field and lets the family form `Z_infl = diag(s_f·β̂₀)·J` internally.
+// This focused test pins the public `influence_block_design` helper (design §6)
+// against its documented closed form (design §3): row `i`, column `k` of the
+// absorbed block must equal `s_f · β̂₀(x_i) · J[i,k]`. This is exact math, not a
+// tool comparison — it validates the building block the workflow's internal
+// path is expected to reproduce.
+#[test]
+fn influence_block_design_is_diag_scaled_jacobian() {
+    let n = 6;
+    let p1 = 3;
+    let jac_cols = Array2::from_shape_fn((n, p1), |(i, k)| (i as f64 + 1.0) * 0.1 - (k as f64) * 0.07);
+    let pilot_beta0 = Array1::from_shape_fn(n, |i| 0.3 + 0.2 * (i as f64) - 0.05 * (i * i) as f64);
+    let s_f = 1.7_f64;
+
     let jac = gam::families::marginal_slope_orthogonal::ScoreInfluenceJacobian {
-        columns: jac_oof.clone(),
+        columns: jac_cols.clone(),
     };
-    influence_block_design(&jac, &pilot_beta0, 1.0)
+    let block = influence_block_design(&jac, &pilot_beta0, s_f);
+
+    assert_eq!(block.nrows(), n, "influence block must have one row per observation");
+    assert_eq!(block.ncols(), p1, "influence block must have one column per Stage-1 parameter");
+    for i in 0..n {
+        for k in 0..p1 {
+            let expected = s_f * pilot_beta0[i] * jac_cols[[i, k]];
+            assert!(
+                (block[[i, k]] - expected).abs() <= 1e-12 * (1.0 + expected.abs()),
+                "Z_infl[{i},{k}] = {got} != s_f·β̂₀·J = {expected} (design §3 closed form)",
+                got = block[[i, k]],
+            );
+        }
+    }
 }
