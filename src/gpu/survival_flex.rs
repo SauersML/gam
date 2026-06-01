@@ -39,6 +39,21 @@
 //! the rigid kernel from Step 1 is exposed for direct parity testing and
 //! reused by the higher-level steps once they wire the host orchestration
 //! around it.
+//!
+//! #461 absorber (additive Stage-1 influence block): no kernel change is
+//! required on this path. These kernels work purely in **primary-coordinate
+//! space** `(q_0, q_1, q̇_1, g[, score-warp, link-dev])`, consuming per-row
+//! location scalars `q_0`/`q_1` (and `g`) that the host has already evaluated
+//! from the location/marginal index — which carries `+Z̃_infl·γ` when the fit
+//! chains a CTN Stage-1 (`survival_marginal_slope.rs`, mirror of bms A2: the
+//! location design is widened with the residualised influence columns). The
+//! design→joint-β chain-rule pullback (`Jᵀ G_i`, `Jᵀ H_i J`) that maps these
+//! primary outputs onto the widened `β` lives host-side (Step 5/6), where the
+//! widened location design is the matched (design, coefficient) pair. The
+//! absorber therefore rides the existing location-index chain transparently:
+//! the GPU kernel never sees the design matrix, so widening it is invisible
+//! here and GPU/CPU stay bit-for-bit identical. The block is dropped at
+//! predict (host rebuilds the location design without influence columns).
 
 use std::sync::OnceLock;
 
