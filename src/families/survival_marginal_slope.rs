@@ -20409,39 +20409,20 @@ pub fn fit_survival_marginal_slope_terms(
             z: z_primary.clone(),
         };
         let rigid_logslope_at_rows = &spec.logslope_offset + baseline_slope;
-        // Marginal-Gram ridge scaled to the weighted Gram's own magnitude so the
-        // projection solve stays stable when the marginal design is rank-deficient
-        // at the pilot, without perturbing a well-conditioned projection. Matches
-        // the BMS absorber site's caller-side ridge by value (the residualization
-        // math itself is single-source in `residualized_influence_block`).
-        let gram_scale = (0..marginal_dense.ncols())
-            .map(|j| {
-                (0..marginal_dense.nrows())
-                    .map(|i| {
-                        cross_block_pilot_w[i] * marginal_dense[[i, j]] * marginal_dense[[i, j]]
-                    })
-                    .sum::<f64>()
-            })
-            .fold(0.0_f64, f64::max);
-        let eps = (gram_scale * 1e-10).max(1e-12);
-        // Z̃_infl = residualize(diag(s_f·β̂₀)·J, marginal, W, ε) — the combined core
-        // builder (single source of truth shared with the BMS absorber site).
+        // Z̃_infl = residualize(diag(s_f·β̂₀)·J, marginal, W) — the combined core
+        // builder (single source of truth shared with the BMS absorber site). It
+        // encapsulates the full §3 sequence: build Z_infl, derive the weighted
+        // marginal-Gram ridge internally (max diag·1e-10, floored 1e-12), residualize,
+        // and finite-check (Err on non-finite), so this caller passes no ε and
+        // propagates the error.
         let residualized = residualized_influence_block(
             &jacobian,
             &rigid_logslope_at_rows,
             probit_scale,
             marginal_dense.view(),
             &cross_block_pilot_w,
-            eps,
-        );
-        if residualized.iter().any(|v| !v.is_finite()) {
-            return Err(SurvivalMarginalSlopeError::NumericalFailure {
-                reason:
-                    "survival influence-absorber residualized columns contain non-finite entries"
-                        .to_string(),
-            }
-            .into());
-        }
+        )
+        .map_err(|reason| SurvivalMarginalSlopeError::NumericalFailure { reason })?;
         Some(residualized)
     } else {
         None
