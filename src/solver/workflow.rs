@@ -3037,6 +3037,74 @@ pub fn fit_calibrated_marginal_slope(
     fit_from_formula(stage2_formula, &augmented, &stage2_config)
 }
 
+/// Production entry point for the calibrated marginal-slope chain that BUILDS the
+/// Stage-1 recipe from the supplied parameters and sets it on the config — the
+/// caller does not pre-populate `config.ctn_stage1`.
+///
+/// This is the single magic-by-default call that closes #461 end-to-end: given
+/// the Stage-1 CTN description (`stage1_response` column, `stage1_covariates`
+/// formula RHS, `stage1_config`) and the Stage-2 marginal-slope `config`
+/// (family / `logslope_formula` / link / …), it assembles a [`CtnStage1Recipe`],
+/// installs it on a clone of `config`, and runs [`fit_calibrated_marginal_slope`].
+/// The Stage-2 materializer then cross-fits the CTN, replaces the in-sample score
+/// with the out-of-fold one, and installs the leakage-projection block (design
+/// §4-§5).
+///
+/// `config.ctn_stage1` MUST be `None` on entry: the recipe is built here from the
+/// explicit parameters, so a pre-set field would be ambiguous. Use this entry for
+/// the orthogonalized path; for the naive / free-warp control, leave
+/// `ctn_stage1` unset and call [`fit_from_formula`] with a raw `z_column`.
+pub fn fit_marginal_slope_from_ctn(
+    stage2_formula: &str,
+    data: &Dataset,
+    config: &FitConfig,
+    stage1_response: &str,
+    stage1_covariates: &str,
+    stage1_config: TransformationNormalConfig,
+    stage1_weight_column: Option<&str>,
+    stage1_offset_column: Option<&str>,
+) -> Result<FitResult, WorkflowError> {
+    if config.ctn_stage1.is_some() {
+        return Err(WorkflowError::InvalidConfig {
+            reason: "fit_marginal_slope_from_ctn builds the Stage-1 recipe from its explicit \
+                     parameters; config.ctn_stage1 must be None on entry (use \
+                     fit_calibrated_marginal_slope if you already hold a CtnStage1Recipe)"
+                .to_string(),
+        });
+    }
+    let response_column = stage1_response.trim().to_string();
+    if response_column.is_empty() {
+        return Err(WorkflowError::InvalidConfig {
+            reason: "fit_marginal_slope_from_ctn requires a non-empty Stage-1 response column"
+                .to_string(),
+        });
+    }
+    let covariate_formula_rhs = stage1_covariates.trim().to_string();
+    if covariate_formula_rhs.is_empty() {
+        return Err(WorkflowError::InvalidConfig {
+            reason: "fit_marginal_slope_from_ctn requires a non-empty Stage-1 covariate formula RHS"
+                .to_string(),
+        });
+    }
+    if covariate_formula_rhs.contains('~') {
+        return Err(WorkflowError::InvalidConfig {
+            reason: "Stage-1 covariates is a right-hand side only; pass 's(pc1) + s(pc2)', \
+                     not 'score ~ s(pc1) + s(pc2)'"
+                .to_string(),
+        });
+    }
+
+    let mut stage2_config = config.clone();
+    stage2_config.ctn_stage1 = Some(CtnStage1Recipe {
+        response_column,
+        covariate_formula_rhs,
+        config: stage1_config,
+        weight_column: stage1_weight_column.map(str::to_string),
+        offset_column: stage1_offset_column.map(str::to_string),
+    });
+    fit_calibrated_marginal_slope(stage2_formula, data, &stage2_config)
+}
+
 /// Stage-1 preparation for the calibrated marginal-slope chain, shared by the
 /// in-process [`fit_calibrated_marginal_slope`] entry point and the FFI
 /// (`gam-pyffi::fit_dataset_impl`) so both produce an identical Stage-2 setup.
