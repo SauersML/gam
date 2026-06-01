@@ -131,6 +131,15 @@ pub struct BernoulliMarginalSlopeTermSpec {
     pub score_warp: Option<DeviationBlockConfig>,
     pub link_dev: Option<DeviationBlockConfig>,
     pub latent_z_policy: LatentZPolicy,
+    /// Out-of-fold Stage-1 score-influence Jacobian `J = ∂z/∂θ₁` (n × p₁)
+    /// from cross-fitting a CTN transformation-normal Stage-1 model (#461).
+    /// When `Some`, the realized leakage directions `Z_infl = diag(s_f·β̂₀)·J`
+    /// are absorbed as a null-penalized block so the joint solve makes the
+    /// β estimating equation orthogonal to `span(Z_infl)` — the x-dependent
+    /// realization of `ψ − Π_η[ψ]`. `None` ⇒ raw `--z-column` with no CTN
+    /// Stage-1, in which case the free 1-D `score_warp` spline is the
+    /// fallback basis (it spans only the x-free leakage column).
+    pub score_influence_jacobian: Option<Array2<f64>>,
 }
 
 pub struct BernoulliMarginalSlopeFitResult {
