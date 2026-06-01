@@ -17,8 +17,8 @@ use faer::Side;
 use faer::sparse::{SparseColMat, Triplet};
 use ndarray::parallel::prelude::*;
 use ndarray::{
-    Array, Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2,
-    Axis, s,
+    Array, Array1, Array2, Array3, Array4, Array5, ArrayView1, ArrayView2, ArrayViewMut1,
+    ArrayViewMut2, Axis, s,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -21591,6 +21591,157 @@ pub fn duchon_sae_atom_second_jet(
                         }
                     }
                     out[[row, n_kernel + col, a, c]] = value;
+                }
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+/// Third input-location jet of the scale-free Duchon SAE atom (the analytic
+/// `∂³Φ / ∂t_a ∂t_c ∂t_e`), consistent with
+/// [`duchon_sae_atom_basis_with_jet`] and [`duchon_sae_atom_second_jet`]
+/// column-for-column and `α`-for-`α`.
+///
+/// The kernel block uses the standard radial third-derivative decomposition
+///
+/// ```text
+/// ∂³φ/∂t_a∂t_c∂t_e = a_coef·u_a u_c u_e
+///                  + b_coef·(δ_ac u_e + δ_ae u_c + δ_ce u_a),
+/// a_coef = φ'''(r) − 3·b_coef,   b_coef = (φ''(r) − φ'(r)/r)/r,   u = (t−c)/r,
+/// ```
+///
+/// projected through `Z` and scaled by `α` (emitted directly by the shared
+/// [`radial_basis_cartesian_derivative`] engine at order 3); the polynomial
+/// block carries the monomial third derivative. At a coincident point `r = 0`
+/// the kernel third jet vanishes (odd-order radial derivative of an even kernel
+/// in the collision limit), which the engine encodes by skipping `r == 0`.
+/// Output shape `(n_rows, n_kernel + n_poly, dim, dim, dim)`. Symmetric in its
+/// three trailing axes by construction.
+pub fn duchon_sae_atom_third_jet(
+    t: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    nullspace_order: DuchonNullspaceOrder,
+) -> Result<Array5<f64>, BasisError> {
+    let dim = centers.ncols();
+    if dim == 0 {
+        crate::bail_invalid_basis!(
+            "duchon_sae_atom_third_jet: centers must have at least one column"
+        );
+    }
+    if t.ncols() != dim {
+        crate::bail_dim_basis!(
+            "duchon_sae_atom_third_jet: t has {} cols but centers have {dim}",
+            t.ncols()
+        );
+    }
+    let effective_order = duchon_effective_nullspace_order(centers, nullspace_order);
+    let p_order = duchon_p_from_nullspace_order(effective_order);
+    let s_order: f64 = 0.0;
+
+    let poly_block_centers = polynomial_block_from_order(centers, effective_order);
+    let z = kernel_constraint_nullspace_from_matrix(poly_block_centers.view())?;
+    let n_kernel = z.ncols();
+
+    let pure_poly_coeff =
+        PolyharmonicBlockCoeff::new(pure_duchon_block_order(p_order, s_order), dim);
+    let kernel_amp = duchon_kernel_amplification(
+        centers,
+        None,
+        p_order,
+        duchon_power_to_usize(s_order),
+        dim,
+        None,
+        None,
+        Some(&pure_poly_coeff),
+    );
+
+    let n_rows = t.nrows();
+    let poly_block_t_cols = polynomial_block_from_order(t, effective_order).ncols();
+
+    // Kernel-block Cartesian third jet `∂³Φ/∂t_a∂t_c∂t_e`, projected through `Z`
+    // and scaled by `α`, via the shared radial→Cartesian engine. Folding `α`
+    // into the per-center coefficient matrix (`coeffs = α·Z`, shape
+    // `(n_centers, n_kernel)`) makes the helper emit the already-amplified,
+    // already-projected kernel third jet directly: its flat
+    // `(n_rows, n_kernel·d³)` output places output `i`, multi-index `(a,c,e)` at
+    // column `i·d³ + ((a·d + c)·d + e)`.
+    let coeffs = &z * kernel_amp;
+    let flat =
+        radial_basis_cartesian_derivative(3, t, centers, coeffs.view(), None, effective_order, 0)?;
+
+    let d_pow = dim * dim * dim;
+    let mut out = Array5::<f64>::zeros((n_rows, n_kernel + poly_block_t_cols, dim, dim, dim));
+    for n in 0..n_rows {
+        for i in 0..n_kernel {
+            for a in 0..dim {
+                for c in 0..dim {
+                    for e in 0..dim {
+                        out[[n, i, a, c, e]] = flat[[n, i * d_pow + ((a * dim) + c) * dim + e]];
+                    }
+                }
+            }
+        }
+    }
+
+    // Polynomial third-derivative block: `∂³(Π t_i^{α_i}) / ∂t_a ∂t_c ∂t_e`.
+    // Differentiating axis `j` a total of `k_j` times (its multiplicity in
+    // `{a, c, e}`) contracts that factor to `falling(α_j, k_j)·t_j^{α_j − k_j}`,
+    // with `falling(α, k) = α(α−1)…(α−k+1)`; the term vanishes when `α_j < k_j`.
+    let exponents = monomial_exponents(
+        dim,
+        match effective_order {
+            DuchonNullspaceOrder::Zero => 0,
+            DuchonNullspaceOrder::Linear => 1,
+            DuchonNullspaceOrder::Degree(k) => k,
+        },
+    );
+    if exponents.len() != poly_block_t_cols {
+        crate::bail_dim_basis!(
+            "duchon_sae_atom_third_jet: monomial count {} != polynomial block columns {poly_block_t_cols}",
+            exponents.len()
+        );
+    }
+    let falling = |alpha: usize, k: usize| -> f64 {
+        let mut acc = 1.0_f64;
+        for j in 0..k {
+            acc *= (alpha as f64) - (j as f64);
+        }
+        acc
+    };
+    for (col, alpha) in exponents.iter().enumerate() {
+        for a in 0..dim {
+            if alpha[a] == 0 {
+                continue;
+            }
+            for c in 0..dim {
+                for e in 0..dim {
+                    // Per-axis differentiation order in this (a, c, e) cell.
+                    let mut order = vec![0usize; dim];
+                    order[a] += 1;
+                    order[c] += 1;
+                    order[e] += 1;
+                    if (0..dim).any(|axis| order[axis] > alpha[axis]) {
+                        continue;
+                    }
+                    let mut lead = 1.0_f64;
+                    for axis in 0..dim {
+                        lead *= falling(alpha[axis], order[axis]);
+                    }
+                    if lead == 0.0 {
+                        continue;
+                    }
+                    for row in 0..n_rows {
+                        let mut value = lead;
+                        for axis in 0..dim {
+                            let exp = alpha[axis] - order[axis];
+                            if exp != 0 {
+                                value *= t[[row, axis]].powi(exp as i32);
+                            }
+                        }
+                        out[[row, n_kernel + col, a, c, e]] = value;
+                    }
                 }
             }
         }
