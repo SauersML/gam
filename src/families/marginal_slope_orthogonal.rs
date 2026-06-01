@@ -41,13 +41,20 @@ use crate::probability::{normal_cdf, normal_pdf, standard_normal_quantile};
 use crate::smooth::build_term_collection_design;
 use ndarray::{Array1, Array2, ArrayView2};
 
-/// Per-row, per-θ₁ score-influence Jacobian `∂z/∂θ₁` for a fitted CTN.
+/// Per-row, per-θ₁ score-influence Jacobian `∂z/∂θ₁` for a fitted CTN, plus the
+/// latent score `z` itself on the same rows.
 ///
 /// `columns` is `n × p₁` with `p₁ = p_resp · p_cov`; see the module-level
-/// "Column ordering of `J`" note for the layout of the second axis.
+/// "Column ordering of `J`" note for the layout of the second axis. Computing
+/// `J` already evaluates `h/L/U` and the finite-support PIT, so `z = Φ⁻¹(PIT)`
+/// comes for free — exposing it here is the single source of truth for the
+/// cross-fit fold loop, which needs the out-of-fold `z` alongside `J` and must
+/// not re-run the PIT path to get it.
 pub struct ScoreInfluenceJacobian {
     /// `n × p₁` matrix of `∂z_i/∂θ₁`.
     pub columns: Array2<f64>,
+    /// `n` latent scores `z_i = Φ⁻¹(PIT_i)` at the same rows `J` was evaluated.
+    pub z: Array1<f64>,
 }
 
 /// Compute `J = ∂z/∂θ₁` from a fitted CTN at the given `(x, y)` rows.
@@ -168,6 +175,7 @@ pub fn score_influence_jacobian(
     );
 
     let mut columns = Array2::<f64>::zeros((n, p1));
+    let mut z_scores = Array1::<f64>::zeros(n);
 
     for i in 0..n {
         let gamma_row = gamma.row(i);
@@ -220,6 +228,7 @@ pub fn score_influence_jacobian(
         );
         let z = standard_normal_quantile(u_pit)
             .map_err(|e| format!("score_influence_jacobian: quantile failed at row {i}: {e}"))?;
+        z_scores[i] = z;
 
         // φ at h/L/U and at z. The chain ∂u/∂θ uses φ at the *unclamped* h when
         // h is inside [L,U]; at the boundary (h clamped) φ(h)·∂h is the limiting
@@ -266,8 +275,14 @@ pub fn score_influence_jacobian(
             "score_influence_jacobian: produced non-finite Jacobian entries".to_string(),
         );
     }
+    if z_scores.iter().any(|v| !v.is_finite()) {
+        return Err("score_influence_jacobian: produced non-finite z scores".to_string());
+    }
 
-    Ok(ScoreInfluenceJacobian { columns })
+    Ok(ScoreInfluenceJacobian {
+        columns,
+        z: z_scores,
+    })
 }
 
 /// Build the absorbed influence block `Z_infl = diag(s_f·β̂₀)·J` for Stage 2
@@ -275,8 +290,14 @@ pub fn score_influence_jacobian(
 /// where `pilot_beta0` is the rigid-pilot logslope `β̂₀(x_i)` (length `n`).
 ///
 /// The returned `n × p₁` matrix spans the realized η-space leakage directions
-/// at the rigid pilot; Stage 2 appends it as a null-penalized absorbed block,
-/// orthogonalized against the marginal ⊕ logslope surfaces.
+/// at the rigid pilot. Stage 2 appends it as a **plain additive** absorbed
+/// parameter block `+Z_infl·γ` carrying a fixed small ridge `½·ρ·‖γ‖²` (γ is a
+/// training-time leakage absorber, not a smooth/REML-learned block). This is
+/// NOT routed through the multiplicative `score_warp` / `DeviationRuntime`
+/// path — that path evaluates a scalar 1-D cubic in η and cannot carry the
+/// arbitrary x-dependent `n × p₁` matrix. The absorber is orthogonalized
+/// against the marginal block but deliberately overlaps logslope, with gauge
+/// priority above logslope, and is dropped at predict time.
 pub fn influence_block_design(
     jac: &ScoreInfluenceJacobian,
     pilot_beta0: &Array1<f64>,
