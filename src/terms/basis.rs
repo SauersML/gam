@@ -22433,18 +22433,40 @@ fn duchon_operator_penalty_candidates(
     workspace: &mut BasisWorkspace,
 ) -> Result<Vec<PenaltyCandidate>, BasisError> {
     let want_mass = matches!(operator_penalties.mass, OperatorPenaltySpec::Active { .. });
-    let want_tension = matches!(
+    let mut want_tension = matches!(
         operator_penalties.tension,
         OperatorPenaltySpec::Active { .. }
     );
-    let want_stiffness = matches!(
+    let mut want_stiffness = matches!(
         operator_penalties.stiffness,
         OperatorPenaltySpec::Active { .. }
     );
+    // Collocation validity: the gradient (D1) and Hessian (D2) operator
+    // quadratures are defined only when `2(p+s) > d+1` / `> d+2` respectively
+    // (mass/D0 needs only kernel existence, `2(p+s) > d`, guaranteed upstream).
+    // Outside that regime the operator's radial limit is undefined, so the
+    // order is SKIPPED — the higher Hilbert rungs (Primary curvature, mass,
+    // trend) still regularize — rather than failing the whole basis build. E.g.
+    // order=0, d=3, s=1 gives `2(p+s)=4`, so tension and stiffness drop out
+    // cleanly and the smooth is curvature + mass + trend.
+    let effective_order = duchon_effective_nullspace_order(centers, nullspace_order);
+    let p_order = duchon_p_from_nullspace_order(effective_order);
+    let dim = centers.ncols();
+    let two_pps = 2.0 * (p_order as f64 + power);
+    want_tension = want_tension && two_pps > dim as f64 + 1.0;
+    want_stiffness = want_stiffness && two_pps > dim as f64 + 2.0;
     if !want_mass && !want_tension && !want_stiffness {
         return Ok(Vec::new());
     }
-    let max_op = duchon_max_active_operator_derivative_order(operator_penalties);
+    // Effective spec carrying only the collocation-valid active orders.
+    let mut effective_spec = operator_penalties.clone();
+    if !want_tension {
+        effective_spec.tension = OperatorPenaltySpec::Disabled;
+    }
+    if !want_stiffness {
+        effective_spec.stiffness = OperatorPenaltySpec::Disabled;
+    }
+    let max_op = duchon_max_active_operator_derivative_order(&effective_spec);
     let n_basis = centers.nrows();
     let n = data.nrows();
     let m = (DUCHON_COLLOCATION_OVERSAMPLE * n_basis).min(n);
@@ -22461,26 +22483,24 @@ fn duchon_operator_penalty_candidates(
         max_op,
         workspace,
     )?;
-    let effective = duchon_effective_nullspace_order(centers, nullspace_order);
-    let p_order = duchon_p_from_nullspace_order(effective);
     let kernel_nullspace = ops.kernel_nullspace_transform.as_ref();
     let poly_cols = ops.polynomial_block_cols;
-    // When per-axis relevance is requested (`scale_dims`), the single isotropic
-    // gradient penalty `Σ‖∇f‖²` is REPLACED by `dim` per-axis penalties
-    // `Σ(∂f/∂x_a)²`, each its own REML λ_a (ARD: REML shrinks an axis's
-    // nonlinear contribution toward flat only when it does not earn its keep).
-    // The isotropic-order penalties (mass, stiffness) still route through the
-    // shared factory; tension is removed from its spec here and re-emitted
-    // per-axis below. The affine slopes stay in the global trend ridge, so a
-    // smooth, linearly-useful axis keeps its slope while its nonlinear λ_a may
-    // grow.
+    // When per-axis relevance is requested (`scale_dims`) and tension is a
+    // collocation-valid active order, the single isotropic gradient penalty
+    // `Σ‖∇f‖²` is REPLACED by `dim` per-axis penalties `Σ(∂f/∂x_a)²`, each its
+    // own REML λ_a (ARD: REML shrinks an axis's nonlinear contribution toward
+    // flat only when it does not earn its keep). The isotropic-order penalties
+    // (mass, stiffness) still route through the shared factory; tension is
+    // removed from its spec here and re-emitted per-axis below. The affine
+    // slopes stay in the global trend ridge, so a smooth, linearly-useful axis
+    // keeps its slope while its nonlinear λ_a may grow.
     let split_tension = per_axis_relevance && want_tension;
     let factory_spec = if split_tension {
-        let mut spec = operator_penalties.clone();
+        let mut spec = effective_spec.clone();
         spec.tension = OperatorPenaltySpec::Disabled;
         spec
     } else {
-        operator_penalties.clone()
+        effective_spec
     };
     // The collocation `D_q` already carry the kernel CPD nullspace `Z`, the
     // polynomial padding, and the identifiability transform (final β-basis), so
@@ -22524,7 +22544,6 @@ fn duchon_operator_penalty_candidates(
         // is the density-blind support quadrature of `∫(∂f/∂x_a)²` in the final
         // β-basis (the poly null space is zeroed in `D1`, so this is the
         // NONLINEAR gradient energy; the affine slope is the trend ridge's job).
-        let dim = centers.ncols();
         for axis in 0..dim {
             let d1_axis = ops.d1.slice(s![axis..; dim, ..]).to_owned();
             candidates.push(normalize_penalty_candidate(
