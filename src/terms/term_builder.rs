@@ -1747,7 +1747,6 @@ pub fn build_smooth_basis(
                     "period_start",
                     "period_end",
                     "scale_dims",
-                    "magnitude",
                     "double_penalty",
                     "by",
                     "id",
@@ -1846,14 +1845,9 @@ pub fn build_smooth_basis(
             } else {
                 None
             };
-            // Magic default = native reproducing-norm roughness Gram only. The
-            // analytic magnitude (mass) penalty — a closed-form ridge that shrinks
-            // the smooth's amplitude toward zero — is opt-in via `magnitude=true`.
-            let operator_penalties = if option_bool(options, "magnitude").unwrap_or(false) {
-                DuchonOperatorPenaltySpec::magnitude_only()
-            } else {
-                DuchonOperatorPenaltySpec::default()
-            };
+            // The default is the full Hilbert scale (curvature `Primary` + trend
+            // ridge + mass + tension); REML deselects what the data don't support.
+            let operator_penalties = DuchonOperatorPenaltySpec::default();
             Ok(SmoothBasisSpec::Duchon {
                 feature_cols: cols.to_vec(),
                 spec: DuchonBasisSpec {
