@@ -39,6 +39,7 @@ from importlib import metadata as _metadata
 from pathlib import Path
 
 from ._api import (
+    CtnStage1,
     SharedPrecisionGroup,
     bspline_basis,
     bspline_basis_derivative,

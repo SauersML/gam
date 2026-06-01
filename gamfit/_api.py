@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, NamedTuple, overload
 
 from ._binding import RustExtensionUnavailableError, extension_status, rust_module
+from ._calibrated_slope import CtnStage1, normalize_ctn_stage1
 from ._cuda import cuda_diagnostics as _cuda_diagnostics
 from ._cuda import cuda_subprocess_env as _cuda_subprocess_env
 from ._cuda import cuda_subprocess_library_dirs as _cuda_subprocess_library_dirs
@@ -220,6 +221,7 @@ def _build_fit_payload(
     offset: str | None,
     weights: str | None,
     transformation_normal: bool | None,
+    transformation_normal_stage1: Any | None = None,
     survival_likelihood: str | None,
     baseline_target: str | None,
     baseline_scale: float | None,
@@ -247,8 +249,10 @@ def _build_fit_payload(
         "offset": offset,
         "weights": weights,
     }
+    ctn_stage1_recipe = normalize_ctn_stage1(transformation_normal_stage1)
     kwarg_items: dict[str, Any] = {
         "transformation_normal": transformation_normal,
+        "ctn_stage1": ctn_stage1_recipe.to_rust_recipe() if ctn_stage1_recipe else None,
         "survival_likelihood": survival_likelihood,
         "baseline_target": baseline_target,
         "baseline_scale": baseline_scale,
@@ -745,6 +749,7 @@ def fit(
     offset: str | None = ...,
     weights: str | None = ...,
     transformation_normal: bool | None = ...,
+    transformation_normal_stage1: CtnStage1 | Mapping[str, Any] | None = ...,
     survival_likelihood: str | None = ...,
     baseline_target: str | None = ...,
     baseline_scale: float | None = ...,
@@ -783,6 +788,7 @@ def fit(
     offset: str | None = ...,
     weights: str | None = ...,
     transformation_normal: bool | None = ...,
+    transformation_normal_stage1: CtnStage1 | Mapping[str, Any] | None = ...,
     survival_likelihood: str | None = ...,
     baseline_target: str | None = ...,
     baseline_scale: float | None = ...,
@@ -820,6 +826,7 @@ def fit(
     offset: str | None = None,
     weights: str | None = None,
     transformation_normal: bool | None = None,
+    transformation_normal_stage1: CtnStage1 | Mapping[str, Any] | None = None,
     survival_likelihood: str | None = None,
     baseline_target: str | None = None,
     baseline_scale: float | None = None,
@@ -866,6 +873,21 @@ def fit(
     transformation_normal:
         Fit a conditional transformation-normal model (``h(Y|x) ~ N(0,1))``).
         Corresponds to ``--transformation-normal``.
+    transformation_normal_stage1:
+        Stage-1 CTN recipe for a *calibrated* marginal-slope chain
+        (:class:`gamfit.CtnStage1`, or a mapping of its fields). Supply it on a
+        marginal-slope model (``family="bernoulli-marginal-slope"`` or a
+        survival ``survival_likelihood="marginal-slope"``) to auto-enable the
+        cross-fitted, Neyman-orthogonal score calibration of #461: the Rust core
+        fits the CTN ``h(Y|x) ~ N(0,1)`` per fold, derives an out-of-fold latent
+        score ``z`` that replaces the in-sample one, and absorbs the Stage-1
+        score-influence directions so the fitted slope surface ``β(x)`` is
+        insensitive to Stage-1 calibration error. There is no boolean to toggle
+        orthogonalization — supplying this recipe *is* the request (magic by
+        default). Omit it (and pass a raw ``z_column`` instead) for the legacy
+        free-warp ``score_warp`` fallback. All numerics stay in Rust; this only
+        marshals the recipe. The Stage-1 ``response`` column must exist in
+        ``data`` alongside the Stage-2 response and covariates.
     survival_likelihood:
         Survival likelihood formulation. One of ``"transformation"``,
         ``"weibull"``, ``"location-scale"``, ``"marginal-slope"``,
@@ -1130,6 +1152,7 @@ def fit(
         offset=offset,
         weights=weights,
         transformation_normal=transformation_normal,
+        transformation_normal_stage1=transformation_normal_stage1,
         survival_likelihood=survival_likelihood,
         baseline_target=baseline_target,
         baseline_scale=baseline_scale,
@@ -1169,6 +1192,7 @@ def fit_array(
     offset: str | None = None,
     weights: str | None = None,
     transformation_normal: bool | None = None,
+    transformation_normal_stage1: CtnStage1 | Mapping[str, Any] | None = None,
     survival_likelihood: str | None = None,
     baseline_target: str | None = None,
     baseline_scale: float | None = None,
@@ -1215,6 +1239,7 @@ def fit_array(
         offset=offset,
         weights=weights,
         transformation_normal=transformation_normal,
+        transformation_normal_stage1=transformation_normal_stage1,
         survival_likelihood=survival_likelihood,
         baseline_target=baseline_target,
         baseline_scale=baseline_scale,
@@ -1339,6 +1364,7 @@ def validate_formula(
     offset: str | None = None,
     weights: str | None = None,
     transformation_normal: bool | None = None,
+    transformation_normal_stage1: CtnStage1 | Mapping[str, Any] | None = None,
     survival_likelihood: str | None = None,
     baseline_target: str | None = None,
     baseline_scale: float | None = None,
@@ -1375,6 +1401,7 @@ def validate_formula(
         offset=offset,
         weights=weights,
         transformation_normal=transformation_normal,
+        transformation_normal_stage1=transformation_normal_stage1,
         survival_likelihood=survival_likelihood,
         baseline_target=baseline_target,
         baseline_scale=baseline_scale,
