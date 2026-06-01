@@ -52,20 +52,33 @@
 //! vector becomes `[q₀, q₁, q̇₁, g, h…, w…, o_infl]` and `r = primary.total`
 //! grows by 1 when the absorber is active. Per row `o_infl = Z̃_infl[row,:]·γ`
 //! (the `n×p₁` design `Z̃_infl` projects `p₁` coeffs → the scalar), and it is
-//! added to **both** `η₀` and `η₁` (`∂η₀/∂o_infl = ∂η₁/∂o_infl = 1`, zero
-//! higher self-derivs; `o_infl` is independent of the calibration intercept
-//! `a`, so `χ₁ = ∂η₁/∂a` is unchanged). The absorber is **flex-only** (active
-//! only under `FlexActivation::On`).
+//! added to **both** `η₀` and `η₁`. It is a pure additive shift of the
+//! OBSERVED index: it does NOT enter the de-nesting calibration integral, so
+//! `∂a/∂o_infl = 0` and `χ₁ = ∂η₁/∂a`, `d`, and the cell coefficients are all
+//! unchanged. The absorber is **flex-only** (active only under
+//! `FlexActivation::On`). Block-Hessian order is
+//! `[Time, Marginal, Logslope, ScoreWarp, LinkDev, Influence]` (Influence
+//! LAST); the host `ParameterBlockSpec` carries gauge 130 + a fixed ridge
+//! (`INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA = 0.0`, not REML) — both host-side
+//! concerns, not GPU. Authoritative CPU reference: `add_pullback` in
+//! `survival_marginal_slope.rs` (commit `36f373be7`).
 //!
-//! When the flex GPU kernels land, they must carry this `o_infl` channel: a
-//! per-row `o_infl[i]` input, `eta0 += o_infl`, `eta1 += o_infl`, a grad slot
-//! `g_oinfl = u1_eta0 + u1_eta1`, and Hessian cross terms `H(o,o)=u2_eta0+
-//! u2_eta1`, `H(o,q₀)=u2_eta0·c`, `H(o,q₁)=u2_eta1·c`,
-//! `H(o,g)=u2_eta0·∂η₀/∂g + u2_eta1·∂η₁/∂g` (∂²η/∂o_infl² = 0). The RIGID GPU
-//! kernel below stays a fixed 4-primary `(q₀,q₁,q̇₁,g)` kernel — it is the
-//! `flex=false` path and never sees an absorber. Until the flex GPU kernels
-//! carry `o_infl`, the host `build_survival_flex_gpu_row_batch` must fall back
-//! to CPU (`Ok(None)`) whenever the absorber is active, so the 4-primary batch
+//! When the flex GPU kernels land, they must carry the `infl` primary coord in
+//! the per-row jet exactly as the CPU does: in flex-jet terms set `rho[infl] =
+//! 1` so `eta_u[infl] = chi·a_u[infl] + rho[infl] = 1` at BOTH timepoints, and
+//! ZERO everything else for the coord — `eta_uv[infl,·] = 0`, `chi_u[infl] =
+//! chi_uv[infl,·] = 0`, `d_u[infl] = d_uv[infl,·] = 0`, and the cell-coeff
+//! partials `coeff_u[infl] = 0` (`o_infl` never enters cells). The block-Hessian
+//! pullback then projects the `infl` primary through the `Z̃_infl` design
+//! (`n×p₁`) EXACTLY like the scalar `g` primary projects through
+//! `logslope_design`: `H(infl,infl) = primary_hessian[infl,infl]·Z̃[row]⊗Z̃[row]`,
+//! and cross `H(blk,infl) = primary_hessian[blk_primary, infl]·design_blk[row]
+//! ⊗ Z̃[row]` (time uses primaries {0,1,2}, marginal {0,1}, logslope {3},
+//! score_warp/link_dev their ranges). The RIGID GPU kernel below stays a fixed
+//! 4-primary `(q₀,q₁,q̇₁,g)` kernel — it is the `flex=false` path and never
+//! sees an absorber. Until the flex GPU kernels carry `infl`, the host
+//! `build_survival_flex_gpu_row_batch` must fall back to CPU (`Ok(None)`)
+//! whenever the absorber is active, so the 4-primary batch
 //! never silently drops `o_infl`. The block is dropped at predict (the
 //! absorber is training-only).
 
