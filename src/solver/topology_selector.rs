@@ -1,4 +1,16 @@
 //! Auto-selection helpers for latent-coordinate topology candidates.
+//!
+//! This module deliberately returns a single selected topology rather than a
+//! stacked predictive-distribution mixture. The selector is an evidence
+//! comparator: its inputs are one scalar REML/LAML evidence summary per fitted
+//! topology plus null-space normalizers. It does not receive a per-observation
+//! held-out log predictive density table, nor does the saved-model prediction
+//! path retain the alternative candidate fits required to evaluate a mixture at
+//! new rows. A pseudo-BMA softmax over the scalar TK scores would therefore be
+//! model-probability averaging of incomparable topology objects, not stacking of
+//! predictive distributions. Until a real per-point LOO/ALO density consumer is
+//! introduced alongside retained candidate predictors, the principled live path
+//! is winner-take-all with deterministic score ordering.
 
 use crate::solver::evidence::TopologyScoreScale;
 use serde_json::Value as JsonValue;
