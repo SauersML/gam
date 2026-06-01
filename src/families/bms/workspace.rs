@@ -3605,15 +3605,21 @@ impl BernoulliMarginalSlopeFamily {
                 max_degree: crate::gpu::bms_flex_row::MOMENT_STRIDE - 1,
                 residency: CubicCellMomentResidency::Device,
             };
-            match try_build_cubic_cell_derivative_moments(view)
-                .map_err(|err| format!("bms_flex_row device-moment build: {err}"))?
-            {
-                Some(CubicCellDerivativeMomentOutput::Device {
+            // The GPU device-moment build is an OPTIONAL acceleration. On any
+            // GPU failure — NVRTC compile error, PTX-version load rejection
+            // (driver older than the toolkit's NVRTC), or kernel-launch
+            // failure — and on the substrate's own host-residency downgrade or
+            // an empty device buffer, fall back to filling the host moments
+            // from the CPU LRU cache so the fit ALWAYS completes. GPU
+            // re-engages automatically once the driver/toolkit can load the
+            // kernel; this mirrors the bms_flex row-kernel CPU fallback above.
+            match try_build_cubic_cell_derivative_moments(view) {
+                Ok(Some(CubicCellDerivativeMomentOutput::Device {
                     d_moments,
                     status,
                     stride,
                     n_cells,
-                }) => {
+                })) => {
                     if stride != crate::gpu::bms_flex_row::MOMENT_STRIDE
                         || n_cells != total_cells_us
                     {
@@ -3646,15 +3652,24 @@ impl BernoulliMarginalSlopeFamily {
                     drop(status);
                     Some(d_moments)
                 }
-                Some(CubicCellDerivativeMomentOutput::Host { .. }) => {
-                    // The substrate degraded to host residency (runtime
-                    // probe failed mid-flight). Fall back to filling the
-                    // host moments path here so the launcher still has a
-                    // valid bundle. We need to do the work the per-row
-                    // loop skipped: re-fill `cell_moments` from the
-                    // existing CPU LRU cache entries.
+                degraded => {
+                    match &degraded {
+                        // Expected mid-flight downgrade to host residency — not
+                        // a failure, so no warning.
+                        Ok(Some(CubicCellDerivativeMomentOutput::Host { .. })) => {}
+                        Ok(_) => log::info!(
+                            "[BMS row-primary-hessian-cache] device-moment build returned no \
+                             device buffer; falling back to host moments"
+                        ),
+                        Err(err) => log::info!(
+                            "[BMS row-primary-hessian-cache] device-moment build failed: {err}; \
+                             falling back to host moments (GPU re-engages once the kernel loads)"
+                        ),
+                    }
+                    // Do the work the per-row loop skipped: re-fill
+                    // `cell_moments` from the existing CPU LRU cache entries.
                     cell_moments = vec![0.0_f64; total_cells_us * moment_stride];
-                    for (row_idx, _) in (0..n).enumerate() {
+                    for row_idx in 0..n {
                         let start = cell_offsets[row_idx] as usize;
                         let row_cells = bundle
                             .row(row_idx, 9)
@@ -3670,12 +3685,6 @@ impl BernoulliMarginalSlopeFamily {
                         }
                     }
                     None
-                }
-                None => {
-                    return Err(
-                        "bms_flex_row device-moment substrate returned Ok(None) on non-empty input"
-                            .to_string(),
-                    );
                 }
             }
         } else {
