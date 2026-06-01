@@ -6,8 +6,8 @@ use crate::basis::{
     KnotSource, KroneckerFactoredBasis, MaternBasisSpec, MaternIdentifiability,
     OneDimensionalBoundary, PenaltyCandidate, PenaltyInfo, PenaltySource, SpatialIdentifiability,
     SphericalSplineBasisSpec, ThinPlateBasisSpec, apply_sum_to_zero_constraint,
-    build_bspline_basis_1d, build_duchon_basis,
-    build_duchon_basis_log_kappa_derivatives, build_duchon_basiswithworkspace, build_matern_basis,
+    build_bspline_basis_1d, build_duchon_basis, build_duchon_basis_log_kappa_derivatives,
+    build_duchon_basiswithworkspace, build_matern_basis,
     build_matern_basis_log_kappa_aniso_derivatives, build_matern_basis_log_kappa_derivatives,
     build_matern_basiswithworkspace, build_matern_collocation_operator_matrices,
     build_spherical_spline_basis, build_thin_plate_basis,
@@ -2530,8 +2530,7 @@ impl SpatialLogKappaCoords {
         for (slot, &term_idx) in term_indices.iter().enumerate() {
             let psi = self.term_slice(slot);
             let d = self.dims_per_term[slot];
-            let (next_length_scale, next_aniso) =
-                spatial_term_psi_to_length_scale_and_aniso(psi);
+            let (next_length_scale, next_aniso) = spatial_term_psi_to_length_scale_and_aniso(psi);
             if (d == 1 || next_length_scale.is_some())
                 && let Some(length_scale) = next_length_scale
             {
@@ -7748,15 +7747,20 @@ fn smooth_requires_parametric_orthogonality(termspec: &SmoothTermSpec) -> bool {
             })
         }
         SmoothBasisSpec::ThinPlate { spec, .. } => {
-            matches!(spec.identifiability, SpatialIdentifiability::OrthogonalToParametric)
+            matches!(
+                spec.identifiability,
+                SpatialIdentifiability::OrthogonalToParametric
+            )
         }
         SmoothBasisSpec::Duchon { spec, .. } => {
-            matches!(spec.identifiability, SpatialIdentifiability::OrthogonalToParametric)
+            matches!(
+                spec.identifiability,
+                SpatialIdentifiability::OrthogonalToParametric
+            )
         }
         SmoothBasisSpec::Matern { spec, .. } => matches!(
             spec.identifiability,
-            MaternIdentifiability::CenterSumToZero
-                | MaternIdentifiability::CenterLinearOrthogonal
+            MaternIdentifiability::CenterSumToZero | MaternIdentifiability::CenterLinearOrthogonal
         ),
         SmoothBasisSpec::BSpline1D { .. }
         | SmoothBasisSpec::TensorBSpline { .. }
@@ -16873,8 +16877,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         }
         let current_length_scale = get_spatial_length_scale(&self.spec, term_idx);
         let current_aniso = get_spatial_aniso_log_scales(&self.spec, term_idx);
-        let (next_length_scale, next_aniso) =
-            spatial_term_psi_to_length_scale_and_aniso(psi);
+        let (next_length_scale, next_aniso) = spatial_term_psi_to_length_scale_and_aniso(psi);
         let same_length = spatial_length_scale_matches(current_length_scale, next_length_scale);
         let same_aniso = spatial_aniso_matches(current_aniso.as_deref(), next_aniso.as_deref());
         if same_length && same_aniso {
