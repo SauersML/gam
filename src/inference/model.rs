@@ -326,6 +326,12 @@ pub struct FittedModelPayload {
     pub score_warp_runtime: Option<SavedCompiledFlexBlock>,
     #[serde(default)]
     pub link_deviation_runtime: Option<SavedCompiledFlexBlock>,
+    /// Width `p₁` of the survival marginal-slope absorbed Stage-1 influence block
+    /// (#461) when present (the dedicated trailing absorber block). Predict drops
+    /// its `γ`; this records the column count so the predictor can account for
+    /// the extra block and slice `γ` out of the joint covariance.
+    #[serde(default)]
+    pub influence_absorber_width: Option<usize>,
     #[serde(default)]
     pub survival_entry: Option<String>,
     #[serde(default)]
@@ -636,6 +642,7 @@ impl FittedModelPayload {
             logslope_baselines: None,
             score_warp_runtime: None,
             link_deviation_runtime: None,
+            influence_absorber_width: None,
             survival_entry: None,
             survival_exit: None,
             survival_event: None,
@@ -888,6 +895,16 @@ pub struct SavedPredictionRuntime {
     /// `None` for non-BMS models and for BMS fits whose latent measure
     /// did not require rank-INT calibration.
     pub latent_z_rank_int_calibration: Option<LatentZRankIntCalibration>,
+    /// Width `p₁` of the absorbed Stage-1 influence block (#461) when the
+    /// survival marginal-slope fit hosted a dedicated additive absorber (the
+    /// trailing block). `None` when no CTN Stage-1 chain produced an influence
+    /// Jacobian. At predict the absorber's `γ` is DROPPED (the orthogonalized
+    /// β̂ is a training-fit property), so the predictor uses this width only to
+    /// (a) account for the extra trailing block in the saved block count and
+    /// (b) slice `γ`'s rows/cols out of the joint covariance. Survival hosts the
+    /// absorber as its own block (unlike the BMS A2 widened-marginal design),
+    /// so it never widens any persisted prediction design.
+    pub influence_absorber_width: Option<usize>,
 }
 
 fn gaussian_location_scale_mean_beta(fit: &UnifiedFitResult) -> Option<Array1<f64>> {
@@ -2527,6 +2544,7 @@ impl FittedModel {
             score_warp: self.payload().score_warp_runtime.clone(),
             link_deviation: self.payload().link_deviation_runtime.clone(),
             latent_z_rank_int_calibration: self.payload().latent_z_rank_int_calibration.clone(),
+            influence_absorber_width: self.payload().influence_absorber_width,
         };
         if matches!(
             runtime.model_class,

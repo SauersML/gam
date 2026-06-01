@@ -2355,13 +2355,20 @@ pub fn build_saved_survival_marginal_slope_predictor(
 
     let saved_score_runtime = saved_runtime.score_warp;
     let saved_link_runtime = saved_runtime.link_deviation;
+    // #461: the absorbed Stage-1 influence block (when present) is the trailing
+    // block. Its `γ` is DROPPED at predict (the orthogonalized β̂ is a
+    // training-fit property), so it is NOT read below — but it IS persisted, so
+    // the saved block count includes it.
+    let influence_absorber_width = saved_runtime.influence_absorber_width;
     let blocks = &fit_saved.blocks;
-    let expected_blocks =
-        3 + usize::from(saved_score_runtime.is_some()) + usize::from(saved_link_runtime.is_some());
+    let expected_blocks = 3
+        + usize::from(saved_score_runtime.is_some())
+        + usize::from(saved_link_runtime.is_some())
+        + usize::from(influence_absorber_width.is_some());
     if blocks.len() != expected_blocks {
         return Err(SurvivalPredictError::IncompatibleSchema {
             reason: format!(
-                "saved survival marginal-slope model requires {} blocks [time, marginal, slope{}{}], got {}",
+                "saved survival marginal-slope model requires {} blocks [time, marginal, slope{}{}{}], got {}",
                 expected_blocks,
                 if saved_score_runtime.is_some() {
                     ", score-warp"
@@ -2370,6 +2377,11 @@ pub fn build_saved_survival_marginal_slope_predictor(
                 },
                 if saved_link_runtime.is_some() {
                     ", link-deviation"
+                } else {
+                    ""
+                },
+                if influence_absorber_width.is_some() {
+                    ", influence-absorber(dropped)"
                 } else {
                     ""
                 },
