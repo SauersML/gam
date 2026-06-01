@@ -86,7 +86,6 @@ fn gam_pspline_generalizes_on_lidar() {
     );
 
     let range_train: Vec<f64> = train_rows.iter().map(|&i| range[i]).collect();
-    let logratio_train: Vec<f64> = train_rows.iter().map(|&i| logratio[i]).collect();
     let range_test: Vec<f64> = test_rows.iter().map(|&i| range[i]).collect();
     let logratio_test: Vec<f64> = test_rows.iter().map(|&i| logratio[i]).collect();
 
@@ -278,7 +277,6 @@ fn gam_pspline_generalizes_on_lidar_on_real_data() {
     );
 
     let range_train: Vec<f64> = train_rows.iter().map(|&i| range[i]).collect();
-    let logratio_train: Vec<f64> = train_rows.iter().map(|&i| logratio[i]).collect();
     let range_test: Vec<f64> = test_rows.iter().map(|&i| range[i]).collect();
     let logratio_test: Vec<f64> = test_rows.iter().map(|&i| logratio[i]).collect();
 
