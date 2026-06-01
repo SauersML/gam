@@ -7277,10 +7277,7 @@ fn apply_global_smooth_identifiability(
         let needs_parametric_block = !skip_global_transform
             && (smooth_has_overlapping_linear_terms(linear_terms, termspec)
                 || !smooth_intrinsic_parametric_feature_cols(linear_terms, termspec).is_empty()
-                || matches!(
-                    spatial_identifiability_policy(termspec),
-                    Some(SpatialIdentifiability::OrthogonalToParametric)
-                ));
+                || smooth_requires_parametric_orthogonality(termspec));
         let parametric_block = if !needs_parametric_block {
             None
         } else {
@@ -7687,6 +7684,74 @@ fn spatial_identifiability_policy(termspec: &SmoothTermSpec) -> Option<&SpatialI
         SmoothBasisSpec::ThinPlate { spec, .. } => Some(&spec.identifiability),
         SmoothBasisSpec::Duchon { spec, .. } => Some(&spec.identifiability),
         _ => None,
+    }
+}
+
+/// Whether this smooth's *realized* design (the basis evaluated at the n data
+/// rows) must be residualized against the model's parametric block (intercept +
+/// any overlapping linear columns) by `apply_global_smooth_identifiability`.
+///
+/// This is the universal identifiability invariant for **kernel / radial**
+/// spatial smooths (#531): their realized column span contains the constant
+/// (and, at `Linear` null-space order, the linear monomials), so without this
+/// step the smooth and the parametric intercept fight over the same direction —
+/// a structural rank-1 collision. The collision is invisible to the kernels'
+/// *own* identifiability constraints because those act in **coefficient space at
+/// the K centers**, not on the realized design rows:
+///   - Matérn `CenterSumToZero` enforces `1ᵀα = 0` over the centers, so
+///     `Kα` evaluated at the data rows still spans the constant.
+///   - Duchon / TPS `OrthogonalToParametric` *defers* its centering to this very
+///     step, which is why it is listed here too.
+///
+/// Tensor-product and B-spline bases instead apply a realized-design sum-to-zero
+/// at basis-build time (`apply_sum_to_zero_constraint`), so they already satisfy
+/// the invariant and must NOT be double-constrained — they return `false`.
+///
+/// Sphere / PCA kernels share the invariant in principle, but their
+/// `BasisMetadata` arms in `with_identifiability_transform` cannot yet carry a
+/// composed centering transform through freeze → reload, so wiring them here
+/// would silently lose the constraint on a reloaded model. They are deliberately
+/// excluded until that plumbing exists.
+///
+/// `FrozenTransform` bases are excluded: a transform frozen by *this* pipeline
+/// already has the parametric orthogonalization composed in (see
+/// `with_identifiability_transform`), and they are gated out upstream by
+/// `skip_global_transform` regardless.
+fn smooth_requires_parametric_orthogonality(termspec: &SmoothTermSpec) -> bool {
+    match &termspec.basis {
+        SmoothBasisSpec::ByVariable { inner, .. }
+        | SmoothBasisSpec::FactorSumToZero { inner, .. } => {
+            smooth_requires_parametric_orthogonality(&SmoothTermSpec {
+                name: termspec.name.clone(),
+                basis: (**inner).clone(),
+                shape: termspec.shape,
+                joint_null_rotation: None,
+            })
+        }
+        SmoothBasisSpec::BySmooth { smooth, .. } => {
+            smooth_requires_parametric_orthogonality(&SmoothTermSpec {
+                name: termspec.name.clone(),
+                basis: (**smooth).clone(),
+                shape: termspec.shape,
+                joint_null_rotation: None,
+            })
+        }
+        SmoothBasisSpec::ThinPlate { spec, .. } => {
+            matches!(spec.identifiability, SpatialIdentifiability::OrthogonalToParametric)
+        }
+        SmoothBasisSpec::Duchon { spec, .. } => {
+            matches!(spec.identifiability, SpatialIdentifiability::OrthogonalToParametric)
+        }
+        SmoothBasisSpec::Matern { spec, .. } => matches!(
+            spec.identifiability,
+            MaternIdentifiability::CenterSumToZero
+                | MaternIdentifiability::CenterLinearOrthogonal
+        ),
+        SmoothBasisSpec::BSpline1D { .. }
+        | SmoothBasisSpec::TensorBSpline { .. }
+        | SmoothBasisSpec::Sphere { .. }
+        | SmoothBasisSpec::Pca { .. }
+        | SmoothBasisSpec::FactorSmooth { .. } => false,
     }
 }
 
