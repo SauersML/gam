@@ -227,6 +227,108 @@ impl BlockEffectiveJacobian for BmsLogslopeJacobian {
     }
 }
 
+/// Fixed (non-REML-learned) ridge `log λ` pinned on the absorbed Stage-1
+/// influence sub-block (#461). The influence columns `Z̃_infl` exist only to
+/// soak the `span(Z_infl)` component of the η-residual at training time, so
+/// their smoothing parameter is held at a fixed small ridge rather than
+/// optimised: too small and `γ` could eat genuine signal aliased into the
+/// leakage geometry; too large and `γ` cannot absorb the realized leakage. The
+/// slot's outer bounds are pinned to this value (degenerate box) so the joint
+/// ρ-optimiser never moves it. `ln(1.0) = 0.0` is the shared constant the
+/// survival marginal-slope mirror also uses (single source of truth).
+pub(crate) const INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA: f64 = 0.0;
+
+/// Build the absorbed Stage-1 influence columns `Z̃_infl` for the additive
+/// marginal-index block (#461, design §3).
+///
+/// Starts from the raw realized leakage directions `Z_infl = diag(s_f·β̂₀)·J`
+/// (built by `marginal_slope_orthogonal::influence_block_design`) and
+/// residualises them against the **marginal** design span in the PIRLS row
+/// metric `W` evaluated at the rigid pilot:
+///
+///   Z̃_infl = Z_infl − M·(MᵀWM + ε_gram·I)⁻¹·MᵀW·Z_infl.
+///
+/// The residualisation is against marginal **only** — the logslope-aligned
+/// component is deliberately retained so the absorber soaks the leakage
+/// direction that would otherwise manufacture spurious β(x) heterogeneity. The
+/// `W` metric matches the joint Hessian's row inner product (`pilot_irls_
+/// hessian_row_metric_at_eta` at the rigid pilot), so the orthogonality
+/// `M̃ᵀW Z̃_infl ≈ 0` holds in the same metric the penalised solve sees rather
+/// than merely in the Euclidean sense.
+fn build_residualized_influence_columns(
+    score_influence_jacobian: &Array2<f64>,
+    marginal_dense: &Array2<f64>,
+    rigid_logslope_at_rows: &Array1<f64>,
+    pilot_row_metric_w: &Array1<f64>,
+    probit_scale: f64,
+) -> Result<Array2<f64>, String> {
+    use crate::faer_ndarray::{
+        factorize_symmetricwith_fallback, fast_ab, fast_xt_diag_x, fast_xt_diag_y, FaerMatBridge,
+    };
+    use crate::matrix::FactorizedSystem;
+
+    let n = marginal_dense.nrows();
+    if score_influence_jacobian.nrows() != n {
+        return Err(format!(
+            "influence block: Jacobian has {} rows, marginal design has {n}",
+            score_influence_jacobian.nrows()
+        ));
+    }
+    if rigid_logslope_at_rows.len() != n || pilot_row_metric_w.len() != n {
+        return Err(format!(
+            "influence block: pilot logslope ({}) / row metric ({}) length != {n}",
+            rigid_logslope_at_rows.len(),
+            pilot_row_metric_w.len()
+        ));
+    }
+    // Z_infl = diag(s_f·β̂₀)·J via the core builder (single source of truth).
+    let jac = crate::families::marginal_slope_orthogonal::ScoreInfluenceJacobian {
+        columns: score_influence_jacobian.clone(),
+    };
+    let z_infl = crate::families::marginal_slope_orthogonal::influence_block_design(
+        &jac,
+        rigid_logslope_at_rows,
+        probit_scale,
+    );
+
+    let p_m = marginal_dense.ncols();
+    if p_m == 0 {
+        // No marginal span to residualise against; the raw directions are the
+        // absorbed columns.
+        return Ok(z_infl);
+    }
+    // Weighted Gram MᵀWM and cross term MᵀW Z_infl in the pilot row metric.
+    let mut gram = fast_xt_diag_x(marginal_dense, pilot_row_metric_w);
+    // Symmetric ridge so the weighted Gram is invertible even when the marginal
+    // design is rank-deficient at the pilot (a dropped/aliased spatial column
+    // leaves a zero pivot); scaled to the Gram's own magnitude so it never
+    // perturbs a well-conditioned projection.
+    let gram_scale = (0..p_m).map(|i| gram[[i, i]]).fold(0.0_f64, f64::max);
+    let ridge = (gram_scale * 1e-10).max(1e-12);
+    for i in 0..p_m {
+        gram[[i, i]] += ridge;
+    }
+    let cross = fast_xt_diag_y(marginal_dense, pilot_row_metric_w, &z_infl);
+    let factor = factorize_symmetricwith_fallback(
+        FaerMatBridge::new(&gram).as_ref(),
+        faer::Side::Lower,
+    )
+    .map_err(|e| format!("influence block: weighted marginal Gram factorisation failed: {e}"))?;
+    // coeffs = (MᵀWM + εI)⁻¹ MᵀW Z_infl   (p_m × p₁)
+    let coeffs = factor
+        .solvemulti(&cross)
+        .map_err(|e| format!("influence block: marginal projection solve failed: {e}"))?;
+    // Z̃_infl = Z_infl − M·coeffs.
+    let projection = fast_ab(marginal_dense, &coeffs);
+    let residualized = &z_infl - &projection;
+    if residualized.iter().any(|v| !v.is_finite()) {
+        return Err(
+            "influence block: residualised influence columns contain non-finite entries".to_string(),
+        );
+    }
+    Ok(residualized)
+}
+
 fn build_marginal_blockspec_bms(
     design: &TermCollectionDesign,
     baseline: f64,
