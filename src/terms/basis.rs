@@ -34846,6 +34846,7 @@ mod tests {
         let ls_minus = 1.0 / (-eps).exp();
         let ops_plus = build_duchon_collocation_operator_matriceswithworkspace(
             centers.view(),
+            centers.view(),
             None,
             Some(ls_plus),
             power,
@@ -34857,6 +34858,7 @@ mod tests {
         )
         .expect("plus ops");
         let ops_minus = build_duchon_collocation_operator_matriceswithworkspace(
+            centers.view(),
             centers.view(),
             None,
             Some(ls_minus),
@@ -34950,6 +34952,7 @@ mod tests {
         let mut workspace = BasisWorkspace::default();
         let ops_base = build_duchon_collocation_operator_matriceswithworkspace(
             centers.view(),
+            centers.view(),
             None,
             Some(length_scale),
             power,
@@ -34965,6 +34968,7 @@ mod tests {
         let ls_minus = 1.0 / (1.0 * (-eps).exp());
         let ops_plus = build_duchon_collocation_operator_matriceswithworkspace(
             centers.view(),
+            centers.view(),
             None,
             Some(ls_plus),
             power,
@@ -34976,6 +34980,7 @@ mod tests {
         )
         .expect("plus ops");
         let ops_minus = build_duchon_collocation_operator_matriceswithworkspace(
+            centers.view(),
             centers.view(),
             None,
             Some(ls_minus),

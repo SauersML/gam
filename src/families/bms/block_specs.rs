@@ -713,10 +713,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let influence_columns = if let Some(jac) =
         spec.score_influence_jacobian.as_ref().filter(|j| j.ncols() > 0)
     {
-        use crate::faer_ndarray::fast_xt_diag_x;
-        use crate::families::marginal_slope_orthogonal::{
-            influence_block_design, residualize_influence_columns, ScoreInfluenceJacobian,
-        };
         let marginal_dense_for_proj = marginal_design
             .design
             .try_to_dense_arc("bernoulli marginal-slope influence-block marginal projection")?;
@@ -728,42 +724,21 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 marginal_dense.nrows()
             ));
         }
-        // Z_infl = diag(s_f·β̂₀)·J at the rigid pilot (β̂₀ = baseline logslope at
-        // rows; s_f = probit_scale), then residualised against the marginal span
-        // in the rigid-pilot W-metric — both via the SHARED core helpers (single
-        // source of truth across bms + survival).
+        // Z̃ = residualize(diag(s_f·β̂₀)·J) against the marginal span in the
+        // rigid-pilot W-metric, via the SHARED core entry point (single source
+        // of truth across bms + survival; the two families differ ONLY in how
+        // they install the returned Z̃ — bms widens [M | Z̃], survival adds a
+        // dedicated η₁ channel). β̂₀(x_i) = baseline.1 + logslope_offset[i];
+        // s_f = probit_scale; W = the rigid-pilot PIRLS row metric.
         let rigid_logslope_at_rows = &spec.logslope_offset + baseline.1;
-        let score_jac = ScoreInfluenceJacobian {
-            columns: (*jac).clone(),
-            z: z_train.clone(),
-        };
-        let z_infl = influence_block_design(&score_jac, &rigid_logslope_at_rows, probit_scale);
-        // Magnitude-scaled ridge for the weighted-Gram projection solve so a
-        // rank-deficient marginal design at the pilot stays solvable without
-        // perturbing a well-conditioned projection. Core's residualiser is
-        // infallible (the ridge guarantees invertibility); guard the final
-        // columns for finiteness here.
-        let p_m = marginal_dense.ncols();
-        let residualized = if p_m == 0 {
-            z_infl
-        } else {
-            let gram_diag = fast_xt_diag_x(marginal_dense, &cross_block_pilot_w_score_warp);
-            let gram_scale = (0..p_m).map(|i| gram_diag[[i, i]]).fold(0.0_f64, f64::max);
-            let eps = (gram_scale * 1e-10).max(1e-12);
-            let out = residualize_influence_columns(
-                &z_infl,
-                marginal_dense.view(),
-                &cross_block_pilot_w_score_warp,
-                eps,
-            );
-            if out.iter().any(|v| !v.is_finite()) {
-                return Err(
-                    "influence block: residualised influence columns contain non-finite entries"
-                        .to_string(),
-                );
-            }
-            out
-        };
+        let residualized = crate::families::marginal_slope_orthogonal::residualized_influence_block(
+            jac,
+            z_train,
+            &rigid_logslope_at_rows,
+            probit_scale,
+            marginal_dense.view(),
+            &cross_block_pilot_w_score_warp,
+        )?;
         Some(residualized)
     } else {
         None
