@@ -8453,6 +8453,164 @@ mod tests {
         );
     }
 
+    /// #457 root-cause regression: for every **non-Duchon** SAE basis the
+    /// isometry penalty's *exact* `hvp` returns the zero vector (no third jet
+    /// `K` cache outside the radial-Duchon source), so the Arrow-Schur coord
+    /// curvature block — which routes through `psd_majorizer_hvp` — would carry
+    /// **no isometry contribution at all**, and the pole fit diverges. The fix
+    /// is the PSD Gauss-Newton majorizer override, which needs only the first
+    /// and second decoder jets that `refresh_isometry_caches_from_atom`
+    /// installs for any basis with an analytic second jet.
+    ///
+    /// This drives the real cache-refresh path with the sphere / circle /
+    /// torus evaluators against the **Euclidean** reference (so the residual
+    /// `g − I` is genuinely nonzero — the live production condition, unlike the
+    /// zero-residual collapse test), then asserts the curvature operator the
+    /// inner solve actually consumes is:
+    ///   * genuinely **nonzero** (the bug was a silent zero block),
+    ///   * **symmetric**, and
+    ///   * **positive-semidefinite** (`vᵀB v ≥ 0`),
+    /// pinning the exact seam #457 is about, end-to-end from the evaluator.
+    fn assert_isometry_psd_majorizer_live_after_atom_refresh(
+        evaluator: Arc<dyn SaeBasisSecondJet>,
+        kind: SaeAtomBasisKind,
+        coords: Array2<f64>,
+        p_out: usize,
+        probes: &[Array2<f64>],
+    ) {
+        let (atom, penalty, target_flat) =
+            build_isometry_atom_for_evaluator(evaluator, kind, &coords, p_out, 0.53);
+        let rho = array![0.0_f64];
+
+        // Before any refresh the safe default is the zero block: confirm the
+        // precondition so the post-refresh contrast is the genuine fix, not a
+        // coincidence of a probe direction.
+        let n = target_flat.len();
+        let unit0 = {
+            let mut e = Array1::<f64>::zeros(n);
+            e[0] = 1.0;
+            e
+        };
+        let pre = penalty.psd_majorizer_hvp(target_flat.view(), rho.view(), unit0.view());
+        assert!(
+            pre.iter().all(|x| *x == 0.0),
+            "psd_majorizer_hvp without a cache must be the zero block; got {pre:?}"
+        );
+
+        let installed =
+            refresh_isometry_caches_from_atom(&penalty, &atom, coords.view()).unwrap();
+        assert!(
+            installed,
+            "second-jet cache must install for the PSD-majorizer liveness test"
+        );
+
+        // The Euclidean reference makes g − I nonzero on this non-orthonormal
+        // decoder; verify the residual is real so the curvature seam is the
+        // production one (and not vacuously the zero-residual case).
+        let d = coords.ncols();
+        let g = penalty
+            .pullback_metric(d)
+            .expect("pullback metric available after refresh");
+        let mut residual_mass = 0.0_f64;
+        for row in 0..g.nrows() {
+            for a in 0..d {
+                for b in 0..d {
+                    // Euclidean reference is the identity metric I_d.
+                    let g_ref = if a == b { 1.0 } else { 0.0 };
+                    residual_mass += (g[[row, a * d + b]] - g_ref).abs();
+                }
+            }
+        }
+        assert!(
+            residual_mass > 1.0e-3,
+            "Euclidean-reference residual must be nonzero for a real curvature test; \
+             got residual mass {residual_mass:.3e}"
+        );
+
+        // Assemble the dense majorizer column-by-column via unit probes.
+        let mut bmat = Array2::<f64>::zeros((n, n));
+        for k in 0..n {
+            let mut e = Array1::<f64>::zeros(n);
+            e[k] = 1.0;
+            let col = penalty.psd_majorizer_hvp(target_flat.view(), rho.view(), e.view());
+            for r in 0..n {
+                bmat[[r, k]] = col[r];
+            }
+        }
+
+        // Nonzero: the bug was a silent all-zero curvature block.
+        let max_abs = bmat.iter().fold(0.0_f64, |acc, x| acc.max(x.abs()));
+        assert!(
+            max_abs > 1.0e-6,
+            "isometry GN majorizer must be nonzero for a non-Duchon basis after refresh; \
+             max |B| = {max_abs:.3e}"
+        );
+
+        // Symmetry: B = Σ_n (∂g/∂t)ᵀ(∂g/∂t) is symmetric by construction.
+        for r in 0..n {
+            for c in 0..n {
+                assert_abs_diff_eq!(bmat[[r, c]], bmat[[c, r]], epsilon = 1.0e-10);
+            }
+        }
+
+        // PSD: vᵀ B v ≥ 0 over a spread of probe directions.
+        for probe in probes {
+            let v: Array1<f64> = probe.iter().copied().collect();
+            assert_eq!(v.len(), n, "probe must match the flattened target length");
+            let bv = penalty.psd_majorizer_hvp(target_flat.view(), rho.view(), v.view());
+            let quad = v.dot(&bv);
+            assert!(
+                quad >= -1.0e-9,
+                "isometry GN majorizer must be PSD; got vᵀBv = {quad:.3e}"
+            );
+        }
+    }
+
+    #[test]
+    fn isometry_psd_majorizer_live_after_sphere_refresh() {
+        assert_isometry_psd_majorizer_live_after_atom_refresh(
+            Arc::new(SphereChartEvaluator),
+            SaeAtomBasisKind::Sphere,
+            array![[-0.61, 0.23], [-0.18, -1.07], [0.42, 0.81]],
+            4,
+            &[
+                array![[0.31, -0.27], [-0.18, 0.22], [0.14, 0.19]],
+                array![[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]],
+                array![[-2.3, 0.6], [-0.1, 1.4], [0.8, -1.7]],
+            ],
+        );
+    }
+
+    #[test]
+    fn isometry_psd_majorizer_live_after_circle_refresh() {
+        assert_isometry_psd_majorizer_live_after_atom_refresh(
+            Arc::new(PeriodicHarmonicEvaluator::new(5).unwrap()),
+            SaeAtomBasisKind::Periodic,
+            array![[0.12], [0.37], [0.58], [0.81]],
+            3,
+            &[
+                array![[0.4], [-1.1], [0.7], [0.3]],
+                array![[1.0], [1.0], [1.0], [1.0]],
+                array![[-2.3], [0.6], [-0.1], [1.4]],
+            ],
+        );
+    }
+
+    #[test]
+    fn isometry_psd_majorizer_live_after_torus_refresh() {
+        assert_isometry_psd_majorizer_live_after_atom_refresh(
+            Arc::new(TorusHarmonicEvaluator::new(2, 2).unwrap()),
+            SaeAtomBasisKind::Torus,
+            array![[0.13, 0.42], [0.66, 0.19], [0.88, 0.55]],
+            3,
+            &[
+                array![[0.21, -0.16], [-0.24, 0.18], [0.13, 0.27]],
+                array![[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]],
+                array![[-1.2, 0.5], [0.3, -0.9], [0.7, 0.2]],
+            ],
+        );
+    }
+
     /// Multi-atom isometry pairing regression.
     ///
     /// Two SAE atoms share the same `(latent_dim, p_out)` signature but live
