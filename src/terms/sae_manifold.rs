@@ -304,77 +304,18 @@ pub trait SaeBasisEvaluator: Send + Sync + std::fmt::Debug {
     /// that exact Hessian silently drops the residual and collapses to
     /// Gauss-Newton (issue #458).
     ///
-    /// The default recovers `T` numerically by central-differencing the
-    /// analytic second jet [`Self::second_jet_dyn`] — so *any* basis that
-    /// exposes a closed-form Hessian also exposes a (numerically exact) third
-    /// jet, and the exact isometry Hessian is never silently wrong. Bases with
-    /// a closed-form third jet ([`SaeBasisThirdJet`]) override this for the
-    /// exact, allocation-light fast path. Returns `None` only when the basis
-    /// has no analytic second jet either (so there is nothing to differentiate).
+    /// Default returns `None`, meaning "this evaluator has no analytic third
+    /// jet". Every evaluator that supplies a closed-form Hessian
+    /// ([`SaeBasisSecondJet`]) also supplies a closed-form third jet
+    /// ([`SaeBasisThirdJet`]) and overrides this to wrap the typed call in
+    /// `Some(...)`, so the exact path is always taken — there is no
+    /// finite-difference fallback. (Mirrors [`Self::second_jet_dyn`]; the
+    /// `coords.dim()` touch keeps the otherwise-unused grid parameter
+    /// lint-clean under the source-hygiene gate, matching that default.)
     fn third_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array5<f64>, String>> {
-        third_jet_central_difference(self, coords)
+        coords.dim();
+        None
     }
-}
-
-/// Numerically-exact basis third jet from a central difference of the analytic
-/// second jet. Used as the [`SaeBasisEvaluator::third_jet_dyn`] default for
-/// bases that supply `H` but not a closed-form `K`. Returns `None` when the
-/// basis exposes no analytic second jet.
-///
-/// `T[n, m, a, c, e] ≈ (H(t + h e_e)[n,m,a,c] − H(t − h e_e)[n,m,a,c]) / (2h)`,
-/// symmetrized over the trailing axis pair so the result inherits the exact
-/// `(a, c)` symmetry of `H` regardless of finite-difference noise.
-fn third_jet_central_difference(
-    evaluator: &(impl SaeBasisEvaluator + ?Sized),
-    coords: ArrayView2<'_, f64>,
-) -> Option<Result<Array5<f64>, String>> {
-    let base = match evaluator.second_jet_dyn(coords)? {
-        Ok(h) => h,
-        Err(err) => return Some(Err(err)),
-    };
-    let (n, m, d, d2) = base.dim();
-    if d != d2 {
-        return Some(Err(format!(
-            "third_jet_central_difference: second jet trailing dims disagree ({d} vs {d2})"
-        )));
-    }
-    let mut t3 = Array5::<f64>::zeros((n, m, d, d, d));
-    // Step scaled to the coordinate magnitude so the central difference keeps
-    // ~10 significant digits across the latent range without underflowing on
-    // coords near the origin.
-    for e in 0..d {
-        let mut plus = coords.to_owned();
-        let mut minus = coords.to_owned();
-        let mut max_abs = 0.0_f64;
-        for row in 0..n {
-            max_abs = max_abs.max(coords[[row, e]].abs());
-        }
-        let step = 1e-5 * (1.0 + max_abs);
-        for row in 0..n {
-            plus[[row, e]] += step;
-            minus[[row, e]] -= step;
-        }
-        let h_plus = match evaluator.second_jet_dyn(plus.view())? {
-            Ok(h) => h,
-            Err(err) => return Some(Err(err)),
-        };
-        let h_minus = match evaluator.second_jet_dyn(minus.view())? {
-            Ok(h) => h,
-            Err(err) => return Some(Err(err)),
-        };
-        let inv = 0.5 / step;
-        for row in 0..n {
-            for col in 0..m {
-                for a in 0..d {
-                    for c in 0..d {
-                        let deriv = (h_plus[[row, col, a, c]] - h_minus[[row, col, a, c]]) * inv;
-                        t3[[row, col, a, c, e]] = deriv;
-                    }
-                }
-            }
-        }
-    }
-    Some(Ok(t3))
 }
 
 /// Bases that expose an analytic second jet
@@ -402,11 +343,12 @@ pub trait SaeBasisSecondJet: SaeBasisEvaluator {
 /// `B_{ab,cd} = K_{a,cd}ᵀ W J_b + H_{a,c}ᵀ W H_{b,d} + H_{a,d}ᵀ W H_{b,c}
 /// + J_aᵀ W K_{b,cd}`. Bases that supply a closed-form `H` (the
 /// [`SaeBasisSecondJet`] super-bound) but not `K` leave that exact Hessian
-/// silently dropping the residual term; this trait closes that gap for the
-/// curved analytic bases (sphere chart, periodic harmonic, torus harmonic,
-/// Euclidean monomial) and the trivially-zero affine basis. The Duchon basis
-/// keeps its existing radial-source lazy `K` path and does not implement this
-/// trait. The full third jet is symmetric in its three trailing axes.
+/// silently dropping the residual term; this trait closes that gap for every
+/// analytic basis: the curved bases (sphere chart, periodic harmonic, torus
+/// harmonic), the Euclidean monomial patch, the trivially-zero affine basis,
+/// and the Duchon basis (radial third-derivative kernel block + monomial
+/// nullspace block, both in closed form). The full third jet is symmetric in
+/// its three trailing axes.
 pub trait SaeBasisThirdJet: SaeBasisSecondJet {
     fn third_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array5<f64>, String>;
 }
@@ -1291,6 +1233,10 @@ impl SaeBasisEvaluator for DuchonCoordinateEvaluator {
         Some(<Self as SaeBasisSecondJet>::second_jet(self, coords))
     }
 
+    fn third_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array5<f64>, String>> {
+        Some(<Self as SaeBasisThirdJet>::third_jet(self, coords))
+    }
+
     fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
         if coords.ncols() != self.centers.ncols() {
             return Err(format!(
@@ -1314,6 +1260,20 @@ impl SaeBasisSecondJet for DuchonCoordinateEvaluator {
             ));
         }
         crate::basis::duchon_sae_atom_second_jet(coords, self.centers.view(), self.order)
+            .map_err(|err| err.to_string())
+    }
+}
+
+impl SaeBasisThirdJet for DuchonCoordinateEvaluator {
+    fn third_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array5<f64>, String> {
+        if coords.ncols() != self.centers.ncols() {
+            return Err(format!(
+                "DuchonCoordinateEvaluator::third_jet: expected latent_dim {}, got {}",
+                self.centers.ncols(),
+                coords.ncols()
+            ));
+        }
+        crate::basis::duchon_sae_atom_third_jet(coords, self.centers.view(), self.order)
             .map_err(|err| err.to_string())
     }
 }
@@ -6125,8 +6085,9 @@ pub fn refresh_isometry_caches_from_atom(
     //   B_{ab,cd} = K_{a,cd}^T W J_b + H_{a,c}^T W H_{b,d}
     //             + H_{a,d}^T W H_{b,c} + J_a^T W K_{b,cd}.
     // Sourced from the base evaluator's object-safe `third_jet_dyn` forwarder
-    // (analytic override for sphere/circle/torus/affine/euclidean, otherwise a
-    // central difference of the second jet). Installed only when the penalty
+    // (closed-form analytic override for every basis with an analytic Hessian:
+    // sphere/circle/torus/affine/euclidean/duchon; `None` otherwise — no
+    // finite-difference fallback). Installed only when the penalty
     // has no `duchon_radial_source` — a Duchon penalty already carries its own
     // analytic third source and `jacobian_third` would shadow it with this
     // cache. Always written (Some or None) so a stale K from a prior outer step
@@ -7182,6 +7143,26 @@ mod tests {
         let evaluator = DuchonCoordinateEvaluator::new(centers, 2).unwrap();
         let coords = array![[-0.5, 0.2], [0.05, -0.35], [0.45, 0.75], [1.3, 0.1]];
         assert_second_jet_matches_central_difference(&evaluator, coords, 1.0e-4)?;
+        Ok(())
+    }
+
+    /// The Duchon evaluator's closed-form analytic third jet (radial
+    /// third-derivative kernel block + monomial nullspace block) must match the
+    /// FD of its (FD-validated) second jet, validating the closed form that
+    /// replaced the forbidden finite-difference `third_jet_dyn` default.
+    #[test]
+    fn duchon_coordinate_evaluator_third_jet_matches_fd() -> Result<(), String> {
+        let centers = array![
+            [-1.0, -0.8],
+            [-0.3, 0.4],
+            [0.2, -0.5],
+            [0.7, 0.9],
+            [1.1, -0.2],
+            [1.6, 0.6],
+        ];
+        let evaluator = DuchonCoordinateEvaluator::new(centers, 2).unwrap();
+        let coords = array![[-0.5, 0.2], [0.05, -0.35], [0.45, 0.75], [1.3, 0.1]];
+        assert_third_jet_matches_central_difference(&evaluator, coords, 1.0e-4, 1.0e-4)?;
         Ok(())
     }
 
