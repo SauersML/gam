@@ -2998,262 +2998,6 @@ fn crossfit_score_calibration(
     Ok(Some(CrossFitScoreCalibration { z_oof, jac_oof }))
 }
 
-/// Synthetic column name carrying the Stage-1 latent score into the Stage-2
-/// marginal-slope materializer for the calibrated chain. Reserved (the leading
-/// `__gam` prefix is not a valid user formula symbol), so it cannot collide with
-/// a real covariate; [`prepare_calibrated_marginal_slope_stage2`] rejects the
-/// pathological case where it already exists in the data. Public so the FFI
-/// (`gam-pyffi`) can reuse the exact reserved name (single source of truth) when
-/// it synthesizes a placeholder score column for structural formula validation.
-pub const CALIBRATED_SLOPE_Z_COLUMN: &str = "__gam_ctn_stage1_z";
-
-/// The SINGLE production entry point for the calibrated (Neyman-orthogonal,
-/// cross-fitted) marginal-slope chain — the magic-by-default path that closes
-/// #461 end-to-end. There is no parallel "calibrated" entry: every orthogonalized
-/// marginal-slope fit (CLI, lib, gamfit) routes through this function or, at the
-/// FFI boundary, through the shared [`prepare_calibrated_marginal_slope_stage2`]
-/// it delegates to.
-///
-/// Given the Stage-1 CTN description (`stage1_response` column,
-/// `stage1_covariates` formula RHS, `stage1_config`) and the Stage-2
-/// marginal-slope `config` (family / `logslope_formula` / link / …), it:
-///
-/// 1. assembles a [`CtnStage1Recipe`] from the explicit Stage-1 parameters and
-///    installs it on a clone of `config`;
-/// 2. fits the Stage-1 CTN once on the full data, reads its in-sample latent
-///    score, appends it as the reserved [`CALIBRATED_SLOPE_Z_COLUMN`], and points
-///    `z_column` at it (via [`prepare_calibrated_marginal_slope_stage2`]);
-/// 3. runs the Stage-2 marginal-slope fit via [`fit_from_formula`].
-///
-/// The Stage-2 materializer (Bernoulli or survival) then detects the populated
-/// `ctn_stage1`, CROSS-FITS the CTN (refitting per fold on the complement),
-/// OVERRIDES the in-sample score with the out-of-fold `z_oof`, and installs the
-/// realized leakage-projection block — so the fitted slope surface `β(x)` is
-/// insensitive to Stage-1 calibration error (design §4-§5).
-///
-/// There is no flag to "turn on" orthogonalization and no way to chain Stage-1
-/// without it: supplying the Stage-1 recipe *is* the request. For the naive /
-/// free-warp control, do NOT use this entry — call [`fit_from_formula`] with a
-/// raw `z_column` and no recipe (the primitive standalone marginal-slope family).
-///
-/// `config.ctn_stage1` MUST be `None` on entry: the recipe is built here from the
-/// explicit parameters, so a pre-set field would be ambiguous.
-pub fn fit_marginal_slope_from_ctn(
-    stage2_formula: &str,
-    data: &Dataset,
-    config: &FitConfig,
-    stage1_response: &str,
-    stage1_covariates: &str,
-    stage1_config: TransformationNormalConfig,
-    stage1_weight_column: Option<&str>,
-    stage1_offset_column: Option<&str>,
-) -> Result<FitResult, WorkflowError> {
-    if config.ctn_stage1.is_some() {
-        return Err(WorkflowError::InvalidConfig {
-            reason: "fit_marginal_slope_from_ctn builds the Stage-1 recipe from its explicit \
-                     parameters; config.ctn_stage1 must be None on entry"
-                .to_string(),
-        });
-    }
-    let response_column = stage1_response.trim().to_string();
-    if response_column.is_empty() {
-        return Err(WorkflowError::InvalidConfig {
-            reason: "fit_marginal_slope_from_ctn requires a non-empty Stage-1 response column"
-                .to_string(),
-        });
-    }
-    let covariate_formula_rhs = stage1_covariates.trim().to_string();
-    if covariate_formula_rhs.is_empty() {
-        return Err(WorkflowError::InvalidConfig {
-            reason: "fit_marginal_slope_from_ctn requires a non-empty Stage-1 covariate formula RHS"
-                .to_string(),
-        });
-    }
-    if covariate_formula_rhs.contains('~') {
-        return Err(WorkflowError::InvalidConfig {
-            reason: "Stage-1 covariates is a right-hand side only; pass 's(pc1) + s(pc2)', \
-                     not 'score ~ s(pc1) + s(pc2)'"
-                .to_string(),
-        });
-    }
-
-    let mut stage2_config = config.clone();
-    stage2_config.ctn_stage1 = Some(CtnStage1Recipe {
-        response_column,
-        covariate_formula_rhs,
-        config: stage1_config,
-        weight_column: stage1_weight_column.map(str::to_string),
-        offset_column: stage1_offset_column.map(str::to_string),
-    });
-    let (augmented, stage2_config) =
-        prepare_calibrated_marginal_slope_stage2(data, &stage2_config)?;
-    fit_from_formula(stage2_formula, &augmented, &stage2_config)
-}
-
-/// Stage-1 preparation for the calibrated marginal-slope chain, shared by the
-/// in-process [`fit_marginal_slope_from_ctn`] entry point and the FFI
-/// (`gam-pyffi::fit_dataset_impl`) so both produce an identical Stage-2 setup.
-///
-/// Requires `config.ctn_stage1` to be set (the auto-enable signal). Fits the
-/// Stage-1 CTN once on the full data from that recipe, reads its in-sample latent
-/// score, returns a copy of `data` with that score appended as the reserved
-/// [`CALIBRATED_SLOPE_Z_COLUMN`], plus a Stage-2 config that points `z_column` at
-/// it (and keeps `ctn_stage1` so the materializer cross-fits and replaces the
-/// in-sample score with the out-of-fold one). The caller then runs the ordinary
-/// marginal-slope materialize → fit path against the returned dataset + config.
-pub fn prepare_calibrated_marginal_slope_stage2(
-    data: &Dataset,
-    config: &FitConfig,
-) -> Result<(Dataset, FitConfig), WorkflowError> {
-    let recipe = config
-        .ctn_stage1
-        .as_ref()
-        .ok_or_else(|| WorkflowError::InvalidConfig {
-            reason: "calibrated marginal-slope chain requires config.ctn_stage1 to be set; \
-                     for a raw z-column (no Stage-1 chain) call fit_from_formula directly"
-                .to_string(),
-        })?;
-
-    if config.transformation_normal {
-        return Err(WorkflowError::InvalidConfig {
-            reason: "calibrated marginal-slope chain expects a Stage-2 marginal-slope config; \
-                     `transformation_normal` describes Stage-1 and must be carried on \
-                     config.ctn_stage1, not set on the Stage-2 config"
-                .to_string(),
-        });
-    }
-
-    let col_map = data.column_map();
-    if col_map.contains_key(CALIBRATED_SLOPE_Z_COLUMN) {
-        return Err(WorkflowError::InvalidConfig {
-            reason: format!(
-                "reserved calibrated-slope score column '{CALIBRATED_SLOPE_Z_COLUMN}' already \
-                 exists in the input data; rename it before fitting the calibrated chain"
-            ),
-        });
-    }
-
-    // Stage 1: fit the CTN once on the full data from the recipe and read its
-    // in-sample latent score. Mirrors `materialize_transformation_normal`'s
-    // covariate-spec construction so the column the materializer reads is a
-    // genuine CTN score (it is then replaced by the cross-fitted OOF score).
-    let stage1_z = fit_ctn_stage1_in_sample_score(data, &col_map, recipe)?;
-
-    // Append the Stage-1 score as the reserved synthetic z column.
-    let augmented = append_continuous_column(data, CALIBRATED_SLOPE_Z_COLUMN, stage1_z);
-
-    // Stage 2: point z_column at the synthetic score and keep ctn_stage1 so the
-    // materializer cross-fits and overrides z with the OOF score.
-    let mut stage2_config = config.clone();
-    stage2_config.z_column = Some(CALIBRATED_SLOPE_Z_COLUMN.to_string());
-
-    Ok((augmented, stage2_config))
-}
-
-/// Fit the Stage-1 CTN on the full data from a [`CtnStage1Recipe`] and return its
-/// in-sample latent score `z` (length n). The covariate basis is built from the
-/// recipe's formula RHS exactly as `materialize_transformation_normal` does.
-fn fit_ctn_stage1_in_sample_score(
-    data: &Dataset,
-    col_map: &HashMap<String, usize>,
-    recipe: &CtnStage1Recipe,
-) -> Result<Array1<f64>, WorkflowError> {
-    let y_col = resolve_role_col(col_map, &recipe.response_column, "response")?;
-    let response = data.values.column(y_col).to_owned();
-    let weights = resolve_weight_column(data, col_map, recipe.weight_column.as_deref())?;
-    let offset = resolve_offset_column(data, col_map, recipe.offset_column.as_deref())?;
-
-    // Stage-1 CTN covariate construction uses the marginal-slope biobank-active
-    // policy (operator-only at scale), matching `materialize_transformation_normal`'s
-    // strict mode for a CTN feeding a marginal-slope chain.
-    let policy = crate::resource::ResourcePolicy::for_problem(
-        data.values.nrows(),
-        0,
-        crate::resource::ProblemHints {
-            marginal_slope_biobank_active: true,
-        },
-    );
-    let parsed = parse_formula(&format!(
-        "{} ~ {}",
-        recipe.response_column, recipe.covariate_formula_rhs
-    ))?;
-    let mut notes = Vec::new();
-    let covariate_spec = build_termspec_with_geometry_and_overrides(
-        &parsed.terms,
-        data,
-        col_map,
-        &mut notes,
-        false,
-        &policy,
-        None,
-    )?;
-
-    let fit = fit_transformation_normal(
-        &response,
-        &weights,
-        &offset,
-        data.values.view(),
-        &covariate_spec,
-        &recipe.config,
-        &BlockwiseFitOptions::default(),
-        &SpatialLengthScaleOptimizationOptions::default(),
-        None,
-    )
-    .map_err(|reason| WorkflowError::IntegrationFailed { reason })?;
-
-    let z = fit
-        .fit
-        .block_states
-        .first()
-        .map(|state| state.eta.clone())
-        .ok_or_else(|| WorkflowError::IntegrationFailed {
-            reason: "Stage-1 CTN fit produced no block state to read the latent score from"
-                .to_string(),
-        })?;
-    if z.len() != data.values.nrows() {
-        return Err(WorkflowError::IntegrationFailed {
-            reason: format!(
-                "Stage-1 CTN latent score length {} != row count {}",
-                z.len(),
-                data.values.nrows()
-            ),
-        });
-    }
-    Ok(z)
-}
-
-/// Return a copy of `data` with one extra continuous column `name` holding
-/// `values` (length must equal the row count). Used to carry the Stage-1 score
-/// into the Stage-2 materializer without mutating the caller's dataset.
-fn append_continuous_column(data: &Dataset, name: &str, values: Array1<f64>) -> Dataset {
-    let n = data.values.nrows();
-    debug_assert_eq!(values.len(), n, "appended column length must equal row count");
-    let p = data.values.ncols();
-    let mut augmented_values = Array2::<f64>::zeros((n, p + 1));
-    augmented_values.slice_mut(s![.., ..p]).assign(&data.values);
-    augmented_values.column_mut(p).assign(&values);
-
-    let mut headers = data.headers.clone();
-    headers.push(name.to_string());
-
-    let mut column_kinds = data.column_kinds.clone();
-    column_kinds.push(ColumnKindTag::Continuous);
-
-    let mut schema = data.schema.clone();
-    schema.columns.push(SchemaColumn {
-        name: name.to_string(),
-        kind: ColumnKindTag::Continuous,
-        levels: Vec::new(),
-    });
-
-    Dataset {
-        headers,
-        values: augmented_values,
-        schema,
-        column_kinds,
-    }
-}
-
 pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, WorkflowError> {
     // Single warm-start chokepoint: open a persistent cache session
     // keyed on the FitRequest's exact family-shape fingerprint, and
@@ -5504,10 +5248,19 @@ fn materialize_bernoulli_marginal_slope<'a>(
         .logslope_formula
         .as_deref()
         .ok_or_else(|| "Bernoulli marginal-slope requires logslope_formula".to_string())?;
-    let z_column = config
-        .z_column
-        .as_deref()
-        .ok_or_else(|| "Bernoulli marginal-slope requires z_column".to_string())?;
+    // `z_column` is OPTIONAL when a CTN Stage-1 recipe is present: the calibrated
+    // chain produces `z` out-of-fold from the cross-fitted CTN, so there is no
+    // raw dose column to read (and no throwaway pre-fit column — that round-trip
+    // is what the no-slop cutover removes, #461). Without a recipe, the primitive
+    // standalone marginal-slope still requires a raw `z_column` dose.
+    let z_column = config.z_column.as_deref();
+    if z_column.is_none() && config.ctn_stage1.is_none() {
+        return Err(WorkflowError::InvalidConfig {
+            reason: "Bernoulli marginal-slope requires z_column (or a CTN Stage-1 recipe via \
+                     ctn_stage1, which produces z by cross-fitting)"
+                .to_string(),
+        });
+    }
 
     let (_, parsed_logslope) =
         parse_matching_auxiliary_formula(logslope_formula, &parsed.response, "logslope_formula")?;
@@ -5517,13 +5270,15 @@ fn materialize_bernoulli_marginal_slope<'a>(
         }
         .into());
     }
-    validate_marginal_slope_z_column_exclusion(
-        parsed,
-        &parsed_logslope,
-        z_column,
-        "Bernoulli marginal-slope",
-        "logslope_formula",
-    )?;
+    if let Some(z_column) = z_column {
+        validate_marginal_slope_z_column_exclusion(
+            parsed,
+            &parsed_logslope,
+            z_column,
+            "Bernoulli marginal-slope",
+            "logslope_formula",
+        )?;
+    }
 
     let mut inference_notes = Vec::new();
     // Bernoulli marginal-slope: structurally operator-only at biobank scale, so
@@ -5535,7 +5290,13 @@ fn materialize_bernoulli_marginal_slope<'a>(
             marginal_slope_biobank_active: true,
         },
     );
-    let aliased_col_map = column_map_with_alias(col_map, "z", z_column);
+    // Alias `z` to the dose column only when a raw z_column is supplied; with a
+    // CTN Stage-1 chain there is no dose column and the formulas reference only
+    // the x covariates.
+    let aliased_col_map = match z_column {
+        Some(z_column) => column_map_with_alias(col_map, "z", z_column),
+        None => col_map.clone(),
+    };
     let marginalspec = build_termspec_with_geometry_and_overrides(
         &parsed.terms,
         data,
@@ -5554,8 +5315,6 @@ fn materialize_bernoulli_marginal_slope<'a>(
         &policy,
         config.smooth_overrides.as_ref(),
     )?;
-    let z_idx = resolve_role_col(col_map, z_column, "z")?;
-    let raw_z = data.values.column(z_idx).to_owned();
     let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
     let marginal_offset = resolve_offset_column(data, col_map, config.offset_column.as_deref())?;
     let logslope_offset =
@@ -5565,18 +5324,23 @@ fn materialize_bernoulli_marginal_slope<'a>(
         parsed_logslope.linkwiggle.as_ref(),
     )?;
 
-    // Auto-enable Neyman-orthogonal, cross-fitted score calibration when the `z`
-    // column was generated by a CTN Stage-1 fit (design §5). Cross-fitting
-    // yields out-of-fold `z` (replacing the raw, in-sample-overfit column) and
-    // the score-influence Jacobian `J`, absorbed by Stage-2 as the realized
-    // leakage-projection block. With no CTN Stage-1 recipe, `z` stays raw and
-    // the free-warp `score_warp` is the fallback basis.
+    // Auto-enable Neyman-orthogonal, cross-fitted score calibration when a CTN
+    // Stage-1 recipe is present (design §5). Cross-fitting yields out-of-fold `z`
+    // (the calibrated dose, with no raw column read) and the score-influence
+    // Jacobian `J`, absorbed by Stage-2 as the realized leakage-projection block.
+    // With no CTN Stage-1 recipe, `z` is the raw dose column and the free-warp
+    // `score_warp` is the fallback basis.
     let (z, score_influence_jacobian) =
         match crossfit_score_calibration(data, col_map, config.ctn_stage1.as_ref(), &policy)
             .map_err(|reason| WorkflowError::IntegrationFailed { reason })?
         {
             Some(calibration) => (calibration.z_oof, Some(calibration.jac_oof)),
-            None => (raw_z, None),
+            None => {
+                // No recipe ⇒ a raw z_column is required (guarded above) and read here.
+                let z_column = z_column.expect("z_column presence checked when ctn_stage1 is None");
+                let z_idx = resolve_role_col(col_map, z_column, "z")?;
+                (data.values.column(z_idx).to_owned(), None)
+            }
         };
 
     let spec = BernoulliMarginalSlopeTermSpec {
