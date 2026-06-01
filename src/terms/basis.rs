@@ -13786,9 +13786,15 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
     // (`n_basis`). Gradients/Hessians are taken w.r.t. the EVALUATION point
     // (the collocation row), so `delta = collocation - center`. No symmetry: the
     // two point sets differ in general.
+    // Skip the costly higher-derivative designs the caller doesn't need: mass
+    // (D0) + tension (D1) build with `max_op = 1`, so the `O(d²)`-row Hessian
+    // (D2) is never allocated or filled — decisive in high `d`.
+    let build_d1 = max_operator_derivative_order >= 1;
+    let build_d2 = max_operator_derivative_order >= 2;
     let mut d0_raw = Array2::<f64>::zeros((p_colloc, n_basis));
-    let mut d1_raw = Array2::<f64>::zeros((p_colloc * dim, n_basis));
-    let mut d2_raw = Array2::<f64>::zeros((p_colloc * dim * dim, n_basis));
+    let mut d1_raw = Array2::<f64>::zeros((if build_d1 { p_colloc * dim } else { 0 }, n_basis));
+    let mut d2_raw =
+        Array2::<f64>::zeros((if build_d2 { p_colloc * dim * dim } else { 0 }, n_basis));
     const R_EPS: f64 = 1e-10;
     for i in 0..p_colloc {
         let scale_i = row_scales[i];
@@ -13831,30 +13837,32 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
                 );
             }
             d0_raw[[i, j]] = scale_i * phi;
-            for axis_a in 0..dim {
-                let h_a = collocation_points[[i, axis_a]] - centers[[j, axis_a]];
-                let w_a = metric_weights
-                    .as_ref()
-                    .map(|weights| weights[axis_a])
-                    .unwrap_or(1.0);
-                for axis_b in 0..dim {
-                    let h_b = collocation_points[[i, axis_b]] - centers[[j, axis_b]];
-                    let w_b = metric_weights
+            if build_d2 {
+                for axis_a in 0..dim {
+                    let h_a = collocation_points[[i, axis_a]] - centers[[j, axis_a]];
+                    let w_a = metric_weights
                         .as_ref()
-                        .map(|weights| weights[axis_b])
+                        .map(|weights| weights[axis_a])
                         .unwrap_or(1.0);
-                    let diagonal = if axis_a == axis_b { q * w_a } else { 0.0 };
-                    let mixed = if r > R_EPS {
-                        t * w_a * h_a * w_b * h_b
-                    } else {
-                        0.0
-                    };
-                    let value = diagonal + mixed;
-                    let row_i = (i * dim + axis_a) * dim + axis_b;
-                    d2_raw[[row_i, j]] = scale_i * value;
+                    for axis_b in 0..dim {
+                        let h_b = collocation_points[[i, axis_b]] - centers[[j, axis_b]];
+                        let w_b = metric_weights
+                            .as_ref()
+                            .map(|weights| weights[axis_b])
+                            .unwrap_or(1.0);
+                        let diagonal = if axis_a == axis_b { q * w_a } else { 0.0 };
+                        let mixed = if r > R_EPS {
+                            t * w_a * h_a * w_b * h_b
+                        } else {
+                            0.0
+                        };
+                        let value = diagonal + mixed;
+                        let row_i = (i * dim + axis_a) * dim + axis_b;
+                        d2_raw[[row_i, j]] = scale_i * value;
+                    }
                 }
             }
-            if r > R_EPS {
+            if build_d1 && r > R_EPS {
                 for axis in 0..dim {
                     let delta = collocation_points[[i, axis]] - centers[[j, axis]];
                     let axis_scale = metric_weights
@@ -13867,22 +13875,26 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
         }
     }
     let d0_kernel = fast_ab(&d0_raw, &z);
-    let d1_kernel = fast_ab(&d1_raw, &z);
-    let d2_kernel = fast_ab(&d2_raw, &z);
     let poly = polynomial_block_from_order(centers, nullspace_order);
     let kernel_cols = d0_kernel.ncols();
     let poly_cols = poly.ncols();
     let total_cols = kernel_cols + poly_cols;
+    // The polynomial block is the unpenalized Duchon null space, left zero before
+    // the outer identifiability transform (these operators feed only penalty
+    // construction). Orders the caller skipped stay empty (0 rows).
     let mut d0 = Array2::<f64>::zeros((p_colloc, total_cols));
     d0.slice_mut(s![.., 0..kernel_cols]).assign(&d0_kernel);
-    let mut d1 = Array2::<f64>::zeros((p_colloc * dim, total_cols));
-    d1.slice_mut(s![.., 0..kernel_cols]).assign(&d1_kernel);
-    let mut d2 = Array2::<f64>::zeros((p_colloc * dim * dim, total_cols));
-    d2.slice_mut(s![.., 0..kernel_cols]).assign(&d2_kernel);
-    // The polynomial block is the unpenalized Duchon nullspace. These
-    // collocation operators feed only penalty construction, so the polynomial
-    // columns intentionally remain zero before the outer identifiability
-    // transform is applied.
+    let mut d1 = Array2::<f64>::zeros((if build_d1 { p_colloc * dim } else { 0 }, total_cols));
+    if build_d1 {
+        d1.slice_mut(s![.., 0..kernel_cols])
+            .assign(&fast_ab(&d1_raw, &z));
+    }
+    let mut d2 =
+        Array2::<f64>::zeros((if build_d2 { p_colloc * dim * dim } else { 0 }, total_cols));
+    if build_d2 {
+        d2.slice_mut(s![.., 0..kernel_cols])
+            .assign(&fast_ab(&d2_raw, &z));
+    }
     if let Some(z) = identifiability_transform {
         let z = z.to_owned();
         d0 = fast_ab(&d0, &z);
