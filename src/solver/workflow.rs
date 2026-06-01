@@ -5014,6 +5014,7 @@ fn materialize_bernoulli_marginal_slope<'a>(
         score_warp: routing.score_warp,
         link_dev: routing.link_dev,
         latent_z_policy: Default::default(),
+        score_influence_jacobian: None,
     };
 
     Ok(MaterializedModel {
@@ -5625,6 +5626,7 @@ fn materialize_survival<'a>(
                     score_warp: marginal_slope_score_warp.clone(),
                     link_dev: marginal_slope_link_dev.clone(),
                     latent_z_policy: Default::default(),
+                    score_influence_jacobian: None,
                 },
                 options: BlockwiseFitOptions {
                     compute_covariance: false,
