@@ -1308,6 +1308,40 @@ impl TransformationNormalFamily {
         self.x_val_kron.nrows()
     }
 
+    /// Number of response-direction basis columns `p_resp` (`[1, I_1, …, I_K]`).
+    pub(crate) fn p_resp(&self) -> usize {
+        self.response_val_basis.ncols()
+    }
+
+    /// Number of covariate-side design columns `p_cov`.
+    pub(crate) fn p_cov(&self) -> usize {
+        self.covariate_design.ncols()
+    }
+
+    /// Response value basis evaluated at the finite lower support endpoint
+    /// (row-independent; `[1, I_1(y_min), …, I_K(y_min)]`).
+    pub(crate) fn response_lower_basis(&self) -> &Array1<f64> {
+        &self.response_lower_basis
+    }
+
+    /// Response value basis evaluated at the finite upper support endpoint
+    /// (row-independent; `[1, I_1(y_max), …, I_K(y_max)]`).
+    pub(crate) fn response_upper_basis(&self) -> &Array1<f64> {
+        &self.response_upper_basis
+    }
+
+    /// Monotonicity floor offset applied to the lower-endpoint score
+    /// `ε·(y_min − median_y)`.
+    pub(crate) fn response_lower_floor_offset(&self) -> f64 {
+        self.response_lower_floor_offset
+    }
+
+    /// Monotonicity floor offset applied to the upper-endpoint score
+    /// `ε·(y_max − median_y)`.
+    pub(crate) fn response_upper_floor_offset(&self) -> f64 {
+        self.response_upper_floor_offset
+    }
+
     /// Per-row weight array used by every row-streaming SCOP assembly site.
     ///
     /// Returns the masked HT weights when an outer-score subsample is active
@@ -1326,6 +1360,56 @@ impl TransformationNormalFamily {
             Some(w) => w.as_ref(),
             None => self.weights.as_ref(),
         }
+    }
+
+    /// Evaluate the response value basis `[1, I_1(y), …, I_K(y)]` (n × p_resp)
+    /// at arbitrary response values using the *fitted* clamped knots and degree.
+    ///
+    /// This is the out-of-sample analogue of the in-sample `response_val_basis`:
+    /// it reuses the exact I-spline kernel and stored knot vector so that the
+    /// score-influence Jacobian (and any other predict-time geometry) evaluates
+    /// `I_k(y)` consistently with how `h` was built during the fit. Knots are
+    /// taken from the family (not re-derived from `response`), so the basis is
+    /// identical to training whenever the response values coincide.
+    pub(crate) fn evaluate_response_value_basis(
+        &self,
+        response: ArrayView1<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
+        let n = response.len();
+        for (i, &v) in response.iter().enumerate() {
+            if !v.is_finite() {
+                return Err(TransformationNormalError::NonFinite {
+                    reason: format!(
+                        "evaluate_response_value_basis: response[{i}] is not finite: {v}"
+                    ),
+                }
+                .into());
+            }
+        }
+        let (i_val_basis, _) = create_basis::<Dense>(
+            response,
+            KnotSource::Provided(self.response_knots.view()),
+            self.response_degree,
+            BasisOptions::i_spline(),
+        )
+        .map_err(|e| format!("evaluate_response_value_basis: I-spline build failed: {e}"))?;
+        let shape_val = i_val_basis.as_ref();
+        let p_shape = shape_val.ncols();
+        let p_resp = self.response_val_basis.ncols();
+        if p_shape + 1 != p_resp {
+            return Err(TransformationNormalError::InvalidInput {
+                reason: format!(
+                    "evaluate_response_value_basis: rebuilt shape columns {p_shape} imply p_resp {}, \
+                     but fitted basis has {p_resp} columns",
+                    p_shape + 1
+                ),
+            }
+            .into());
+        }
+        let mut resp_val = Array2::<f64>::zeros((n, p_resp));
+        resp_val.column_mut(0).fill(1.0);
+        resp_val.slice_mut(s![.., 1..]).assign(shape_val);
+        Ok(resp_val)
     }
 
     /// Clone the family with an outer-score Horvitz-Thompson mask installed.
