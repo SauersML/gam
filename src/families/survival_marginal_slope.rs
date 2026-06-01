@@ -705,10 +705,6 @@ struct BlockSlices {
     logslope: std::ops::Range<usize>,
     score_warp: Option<std::ops::Range<usize>>,
     link_dev: Option<std::ops::Range<usize>>,
-    /// Absorbed Stage-1 influence block (#461), trailing the flex blocks. Its
-    /// width is `p₁` (the Stage-1 coefficient count), `None` when no CTN Stage-1
-    /// chain produced an influence Jacobian.
-    influence: Option<std::ops::Range<usize>>,
     total: usize,
 }
 
@@ -731,24 +727,18 @@ enum HessBlock {
     Logslope,
     ScoreWarp,
     LinkDev,
-    /// Absorbed Stage-1 influence block (#461). Placed LAST in the canonical
-    /// layout so the existing `score_warp` (index 3) / `link_dev` (index 4)
-    /// block-state positions are undisturbed; the absorber's coordinate range
-    /// trails them and its β is dropped at predict.
-    Influence,
 }
 
 impl HessBlock {
     /// Blocks in canonical coordinate-layout order. Iterating this array is how
     /// every assembler visits blocks; the order fixes floating-point
     /// accumulation order in the matvec / bilinear paths.
-    const ALL: [HessBlock; 6] = [
+    const ALL: [HessBlock; 5] = [
         HessBlock::Time,
         HessBlock::Marginal,
         HessBlock::Logslope,
         HessBlock::ScoreWarp,
         HessBlock::LinkDev,
-        HessBlock::Influence,
     ];
 }
 
@@ -763,7 +753,6 @@ impl BlockSlices {
             HessBlock::Logslope => Some(self.logslope.clone()),
             HessBlock::ScoreWarp => self.score_warp.clone(),
             HessBlock::LinkDev => self.link_dev.clone(),
-            HessBlock::Influence => self.influence.clone(),
         }
     }
 }
@@ -799,12 +788,12 @@ fn block_slices(
         range
     });
     // Absorbed influence block trails the flex blocks: its width is the
-    // Stage-1 coefficient count `p₁` (= `Z̃_infl.ncols()`).
-    let influence = family.influence_absorber.as_ref().map(|z_tilde| {
-        let range = cursor..cursor + z_tilde.ncols();
-        cursor = range.end;
-        range
-    });
+    // Stage-1 coefficient count `p₁` (= `Z̃_infl.ncols()`). It is installed as
+    // plain row-design columns outside BlockHessianAccumulator, so only the
+    // total coordinate cursor needs to include it here.
+    if let Some(z_tilde) = family.influence_absorber.as_ref() {
+        cursor += z_tilde.ncols();
+    }
     let total = cursor;
     BlockSlices {
         time,
@@ -812,7 +801,6 @@ fn block_slices(
         logslope,
         score_warp,
         link_dev,
-        influence,
         total,
     }
 }
@@ -5768,8 +5756,7 @@ impl SurvivalMarginalSlopeFamily {
         if self.influence_absorber.is_none() {
             return Ok(None);
         }
-        let idx =
-            3 + usize::from(self.score_warp.is_some()) + usize::from(self.link_dev.is_some());
+        let idx = 3 + usize::from(self.score_warp.is_some()) + usize::from(self.link_dev.is_some());
         block_states
             .get(idx)
             .map(|state| Some(&state.beta))
@@ -5784,9 +5771,10 @@ impl SurvivalMarginalSlopeFamily {
         row: usize,
         block_states: &[ParameterBlockState],
     ) -> Result<f64, String> {
-        let (Some(z_tilde), Some(gamma)) =
-            (self.influence_absorber.as_ref(), self.flex_influence_beta(block_states)?)
-        else {
+        let (Some(z_tilde), Some(gamma)) = (
+            self.influence_absorber.as_ref(),
+            self.flex_influence_beta(block_states)?,
+        ) else {
             return Ok(0.0);
         };
         if gamma.len() != z_tilde.ncols() {
@@ -13604,9 +13592,7 @@ impl crate::families::marginal_slope_shared::MarginalSlopePsiFamily
         )
     }
 
-    fn psi_first_order_terms_all(
-        &self,
-    ) -> Result<Option<Vec<ExactNewtonJointPsiTerms>>, String> {
+    fn psi_first_order_terms_all(&self) -> Result<Option<Vec<ExactNewtonJointPsiTerms>>, String> {
         let total: usize = self.derivative_blocks.iter().map(Vec::len).sum();
         if total == 0 {
             return Ok(Some(Vec::new()));
@@ -20058,11 +20044,11 @@ pub fn fit_survival_marginal_slope_terms(
     let influence_absorber_residualized: Option<Array2<f64>> =
         if let Some(jac) = spec.score_influence_jacobian.as_ref() {
             use crate::families::marginal_slope_orthogonal::{
-                influence_block_design, residualize_influence_columns, ScoreInfluenceJacobian,
+                ScoreInfluenceJacobian, residualized_influence_block,
             };
-            let marginal_dense = marginal_design
-                .design
-                .try_to_dense_by_chunks("survival marginal-slope influence-absorber marginal span")?;
+            let marginal_dense = marginal_design.design.try_to_dense_by_chunks(
+                "survival marginal-slope influence-absorber marginal span",
+            )?;
             // Realized leakage directions `Z_infl = diag(s_f·β̂₀)·J` via the core
             // builder; `β̂₀(x_i)` is the rigid-pilot logslope and `s_f =
             // probit_scale`. `influence_block_design` reads only `columns`; the
@@ -20072,37 +20058,16 @@ pub fn fit_survival_marginal_slope_terms(
                 z: z_primary.clone(),
             };
             let rigid_logslope_at_rows = &spec.logslope_offset + baseline_slope;
-            let z_infl =
-                influence_block_design(&jacobian, &rigid_logslope_at_rows, probit_scale);
-            // Marginal-Gram ridge scaled to the weighted Gram's own magnitude so
-            // the projection solve stays stable when the marginal design is
-            // rank-deficient at the pilot, without perturbing a well-conditioned
-            // projection. Identical scaling to the BMS absorber site (single
-            // source of truth for the residualization math is
-            // `residualize_influence_columns`; only this caller-side ridge scale
-            // is shared by value).
-            let gram_scale = (0..marginal_dense.ncols())
-                .map(|j| {
-                    (0..marginal_dense.nrows())
-                        .map(|i| {
-                            cross_block_pilot_w[i] * marginal_dense[[i, j]] * marginal_dense[[i, j]]
-                        })
-                        .sum::<f64>()
-                })
-                .fold(0.0_f64, f64::max);
-            let eps = (gram_scale * 1e-10).max(1e-12);
-            let residualized = residualize_influence_columns(
-                &z_infl,
+            let residualized = residualized_influence_block(
+                &jacobian,
+                &rigid_logslope_at_rows,
+                probit_scale,
                 marginal_dense.view(),
                 &cross_block_pilot_w,
-                eps,
-            );
-            if residualized.iter().any(|v| !v.is_finite()) {
-                return Err(SurvivalMarginalSlopeError::NumericalFailure {
-                    reason: "survival influence-absorber residualized columns contain non-finite entries".to_string(),
-                }
-                .into());
-            }
+            )
+            .map_err(|err| SurvivalMarginalSlopeError::NumericalFailure {
+                reason: format!("survival influence-absorber {err}"),
+            })?;
             Some(residualized)
         } else {
             None
@@ -22607,7 +22572,6 @@ mod tests {
             logslope,
             score_warp,
             link_dev,
-            influence: None,
             total,
         }
     }
@@ -28071,7 +28035,6 @@ mod tests {
             logslope,
             score_warp: Some(score_warp),
             link_dev: Some(link_dev),
-            influence: None,
             total,
         }
     }

@@ -2103,7 +2103,16 @@ pub fn enable_scale_dimensions(spec: &mut TermCollectionSpec) {
 // ---------------------------------------------------------------------------
 
 pub fn spatial_center_strategy_for_dimension(num_centers: usize, d: usize) -> CenterStrategy {
-    default_spatial_center_strategy(num_centers, d)
+    if d == 1 {
+        // In one dimension, an explicit `k` is a resolution request rather than
+        // a request for quantile-midpoint centers. Use the same maximin geometry
+        // as the automatic 1D path so Duchon REML sees a well-resolved native
+        // kernel block instead of compensating for endpoint under-resolution by
+        // over-smoothing easy low-noise signals (#504).
+        CenterStrategy::FarthestPoint { num_centers }
+    } else {
+        default_spatial_center_strategy(num_centers, d)
+    }
 }
 
 pub fn col_minmax(col: ArrayView1<'_, f64>) -> Result<(f64, f64), String> {
