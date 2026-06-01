@@ -289,6 +289,16 @@ struct SurvivalMarginalSlopeFamily {
     logslope_surface_ranges: Vec<std::ops::Range<usize>>,
     score_warp: Option<DeviationRuntime>,
     link_dev: Option<DeviationRuntime>,
+    /// Absorbed Stage-1 influence columns `Z̃_infl` at the training rows
+    /// (`n × p₁`), residualized against the marginal location span in the
+    /// rigid-pilot row metric (#461, design §3). When `Some`, the family hosts a
+    /// dedicated additive absorber block whose coefficient `γ` shifts the
+    /// de-nested observed index `η₁` by `+Z̃_infl[row,:]·γ` (sibling of the
+    /// per-row calibration intercept — un-`c(g)`-scaled, unlike the marginal
+    /// block which enters the time-quantile location through `q·c(g)`). The
+    /// block carries a fixed small ridge and is dropped at predict. `None` ⇒ raw
+    /// `z` with no CTN Stage-1; the free-warp `score_warp` is the fallback basis.
+    influence_absorber: Option<Array2<f64>>,
     time_linear_constraints: Option<LinearInequalityConstraints>,
     time_wiggle_knots: Option<Array1<f64>>,
     time_wiggle_degree: Option<usize>,
@@ -19913,6 +19923,39 @@ pub fn fit_survival_marginal_slope_terms(
         &spec.event_target,
     )
     .map_err(|e| format!("survival cross-block W metric construction: {e}"))?;
+    // Absorbed Stage-1 influence columns `Z̃_infl` (#461, design §3). When the
+    // workflow chained a CTN Stage-1 into this marginal-slope fit,
+    // `spec.score_influence_jacobian` carries the out-of-fold `J = ∂z/∂θ₁`. The
+    // realized leakage directions `Z_infl = diag(s_f·β̂₀)·J` are residualized
+    // against the marginal location span in the rigid-pilot row metric
+    // (`cross_block_pilot_w`) — keeping the logslope-aligned component — and
+    // hosted as a dedicated additive absorber block whose coefficient `γ` shifts
+    // the de-nested observed index `η₁` by `+Z̃_infl·γ`. β̂₀(x_i) is the
+    // rigid-pilot logslope `baseline_slope + logslope_offset[i]`; `s_f =
+    // probit_scale`. The math (residualize-vs-marginal/retain-logslope +
+    // fixed-ridge absorber) is the single source of truth shared with the BMS
+    // family via `marginal_slope_orthogonal`; survival differs only in the host
+    // structure — a dedicated `η₁` channel rather than BMS's widened marginal
+    // index, because the survival marginal block feeds the time-quantile
+    // location `q·c(g)` (scaled), not a flat additive index. `None` ⇒ raw `z`,
+    // and the free `score_warp` spline below is the x-free-column fallback.
+    let influence_absorber_residualized: Option<Array2<f64>> =
+        if let Some(jac) = spec.score_influence_jacobian.as_ref() {
+            let marginal_dense = marginal_design
+                .design
+                .try_to_dense_by_chunks("survival marginal-slope influence-absorber marginal span")?;
+            let rigid_logslope_at_rows = &spec.logslope_offset + baseline_slope;
+            let residualized = crate::families::marginal_slope_orthogonal::build_residualized_influence_columns(
+                jac,
+                &marginal_dense,
+                &rigid_logslope_at_rows,
+                &cross_block_pilot_w,
+                probit_scale,
+            )?;
+            Some(residualized)
+        } else {
+            None
+        };
     // `location_anchor_design` was built above (alongside the non-rigid
     // pilot η) and is reused here for the cross-block residualisation
     // calls. Keeping the construction at one site means the
@@ -20719,6 +20762,14 @@ pub fn fit_survival_marginal_slope_terms(
             FlexActivation::OffForRigidPilot => (None, None),
             FlexActivation::On => (score_warp_runtime.clone(), link_dev_runtime.clone()),
         };
+        // The absorber is suppressed during the rigid-pilot pass: its pilot
+        // logslope β̂₀ and the residualization W metric are *derived from* that
+        // pilot, so it can only enter the full (non-rigid) fit (mirror of the
+        // score_warp/link_dev `FlexActivation` gating above).
+        let influence_absorber_active = match flex {
+            FlexActivation::OffForRigidPilot => None,
+            FlexActivation::On => influence_absorber_residualized.clone(),
+        };
         SurvivalMarginalSlopeFamily {
             n,
             event: Arc::clone(&event),
@@ -20738,6 +20789,7 @@ pub fn fit_survival_marginal_slope_terms(
             logslope_surface_ranges: logslope_surface_ranges.clone(),
             score_warp: score_warp_active,
             link_dev: link_dev_active,
+            influence_absorber: influence_absorber_active,
             time_linear_constraints: time_linear_constraints.clone(),
             time_wiggle_knots: spec.timewiggle_block.as_ref().map(|w| w.knots.clone()),
             time_wiggle_degree: spec.timewiggle_block.as_ref().map(|w| w.degree),
