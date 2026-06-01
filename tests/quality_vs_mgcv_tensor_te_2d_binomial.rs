@@ -24,13 +24,20 @@
 //! is NOT the claim — both engines are scored against the analytic truth, and
 //! gam must recover it at least as accurately as the mature reference.
 //!
-//! Both engines fit the SAME model by REML on the SAME integer counts:
+//! Both engines fit the SAME underlying data by REML. gam's `binomial` family
+//! is Bernoulli (it requires y in {0,1}), so the binomial trials are handed to
+//! gam EXPANDED: one row per individual Bernoulli draw carrying the binary
+//! outcome y in {0,1} at that row's (x, z). mgcv fits the mathematically
+//! identical likelihood from the AGGREGATED integer counts at each design point
+//! (`cbind(successes, failures)` at the N unique (x, z) points). For a binomial
+//! GLM the aggregated-count fit and the expanded-Bernoulli fit are the same MLE
+//! / penalized fit, so there is no data-encoding skew between the engines:
 //!   * mgcv : `gam(cbind(success_count, failure_count) ~ te(x, z, k = 6),
-//!            family = binomial(link = "logit"), method = "REML")`
-//!   * gam  : `prop ~ te(x, z, k = 6)`, family `binomial`, link `logit`, with
-//!            a per-row trial-count `weight_column` — the standard GLM encoding
-//!            of `cbind(successes, failures)` as (proportion, prior weight =
-//!            trials).
+//!            family = binomial(link = "logit"), method = "REML")` on N rows
+//!   * gam  : `y ~ te(x, z, k = 6)`, family `binomial`, link `logit`, on the
+//!            N * N_TRIALS expanded binary rows.
+//! Both engines are then evaluated on the SAME N unique design points and scored
+//! against the SAME analytic logit-scale truth at those points.
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
@@ -54,37 +61,50 @@ fn invlogit(eta: f64) -> f64 {
 fn gam_tensor_te_2d_binomial_logit_matches_mgcv() {
     init_parallelism();
 
-    // ---- synthetic aggregated-binomial data (seed=20260530) ---------------
+    // ---- synthetic binomial data (seed=20260530) --------------------------
     // x, z ~ U[0,1]^2; true logit-scale surface is a separable tensor signal
-    // pi/4 * (sin(2*pi*x) + cos(2*pi*z)). For each row, n_trials=20 Bernoulli
-    // trials are summed into success_count (the exact integer counts handed to
-    // BOTH engines, so there is zero data-encoding skew between them).
+    // pi/4 * (sin(2*pi*x) + cos(2*pi*z)). For each of N design points, n_trials
+    // = 20 independent Bernoulli(p) draws are taken. The AGGREGATED success
+    // counts go to mgcv via cbind(); the SAME individual binary outcomes go to
+    // gam as one expanded row per trial (gam's binomial family is Bernoulli and
+    // requires y in {0,1}). The two encodings yield the identical binomial
+    // likelihood, so there is no data skew between the engines.
     const N: usize = 250;
     const N_TRIALS: u32 = 20;
     let mut rng = StdRng::seed_from_u64(20260530);
     let u01 = Uniform::new(0.0_f64, 1.0).expect("uniform [0,1]");
 
+    // Per-design-point arrays (length N): used for mgcv's aggregated fit and for
+    // the truth-recovery metric, which is scored at the N unique design points.
     let mut x = Vec::with_capacity(N);
     let mut z = Vec::with_capacity(N);
     let mut success_count = Vec::with_capacity(N);
     let mut failure_count = Vec::with_capacity(N);
-    let mut prop = Vec::with_capacity(N);
-    let mut trials = Vec::with_capacity(N);
     // The known logit-scale truth at each design point — the quantity gam must
     // recover. Stored exactly as generated so the recovery metric is honest.
     let mut f_true = Vec::with_capacity(N);
+
+    // Expanded per-trial arrays (length N * N_TRIALS): the binary data gam
+    // consumes — one Bernoulli outcome y in {0,1} per row at that point's (x,z).
+    let n_expanded = N * N_TRIALS as usize;
+    let mut x_exp = Vec::with_capacity(n_expanded);
+    let mut z_exp = Vec::with_capacity(n_expanded);
+    let mut y_exp = Vec::with_capacity(n_expanded);
 
     for _ in 0..N {
         let xi = u01.sample(&mut rng);
         let zi = u01.sample(&mut rng);
         let surface = (PI / 4.0) * ((TAU * xi).sin() + (TAU * zi).cos());
         let p = invlogit(surface);
-        // Sum N_TRIALS independent Bernoulli(p) draws into an integer count.
+        // Draw N_TRIALS independent Bernoulli(p) outcomes; record each binary
+        // outcome (for gam) and accumulate the integer success count (for mgcv).
         let mut s: u32 = 0;
         for _ in 0..N_TRIALS {
-            if u01.sample(&mut rng) < p {
-                s += 1;
-            }
+            let yi = if u01.sample(&mut rng) < p { 1.0 } else { 0.0 };
+            s += yi as u32;
+            x_exp.push(xi);
+            z_exp.push(zi);
+            y_exp.push(yi);
         }
         let succ = s as f64;
         let fail = (N_TRIALS - s) as f64;
@@ -92,25 +112,19 @@ fn gam_tensor_te_2d_binomial_logit_matches_mgcv() {
         z.push(zi);
         success_count.push(succ);
         failure_count.push(fail);
-        prop.push(succ / N_TRIALS as f64);
-        trials.push(N_TRIALS as f64);
         f_true.push(surface);
     }
 
-    // ---- fit with gam: prop ~ te(x, z, k=6), binomial/logit, REML ---------
-    // gam encodes the binomial counts as proportion response + trial weights,
-    // the standard GLM `cbind(successes, failures)` representation.
-    let headers: Vec<String> = ["x", "z", "prop", "trials"]
-        .into_iter()
-        .map(String::from)
-        .collect();
-    let mut rows = Vec::with_capacity(N);
-    for i in 0..N {
+    // ---- fit with gam: y ~ te(x, z, k=6), binomial/logit, REML ------------
+    // gam's binomial family is Bernoulli, so it receives the EXPANDED binary
+    // outcomes (one row per Bernoulli trial), not aggregated proportions.
+    let headers: Vec<String> = ["x", "z", "y"].into_iter().map(String::from).collect();
+    let mut rows = Vec::with_capacity(n_expanded);
+    for i in 0..n_expanded {
         rows.push(csv::StringRecord::from(vec![
-            x[i].to_string(),
-            z[i].to_string(),
-            prop[i].to_string(),
-            trials[i].to_string(),
+            x_exp[i].to_string(),
+            z_exp[i].to_string(),
+            y_exp[i].to_string(),
         ]));
     }
     let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode binomial dataset");
@@ -121,10 +135,9 @@ fn gam_tensor_te_2d_binomial_logit_matches_mgcv() {
     let cfg = FitConfig {
         family: Some("binomial".to_string()),
         link: Some("logit".to_string()),
-        weight_column: Some("trials".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("prop ~ te(x, z, k=6)", &ds, &cfg).expect("gam binomial te fit");
+    let result = fit_from_formula("y ~ te(x, z, k=6)", &ds, &cfg).expect("gam binomial te fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for binomial/logit te(x,z)");
     };
