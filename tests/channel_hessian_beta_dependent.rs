@@ -161,7 +161,6 @@ fn fake_audit(effective_dims: &[usize], original_dims: &[usize]) -> Identifiabil
             original_dim: orig,
             effective_dim: eff,
             design_range_rank: eff,
-            design_range_singular_values: Vec::new(),
         })
         .collect();
     // Pilot drops: any column where effective < original.
