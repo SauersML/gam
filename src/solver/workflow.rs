@@ -3002,8 +3002,10 @@ fn crossfit_score_calibration(
 /// marginal-slope materializer for the calibrated chain. Reserved (the leading
 /// `__gam` prefix is not a valid user formula symbol), so it cannot collide with
 /// a real covariate; [`fit_calibrated_marginal_slope`] rejects the pathological
-/// case where it already exists in the data.
-const CALIBRATED_SLOPE_Z_COLUMN: &str = "__gam_ctn_stage1_z";
+/// case where it already exists in the data. Public so the FFI
+/// (`gam-pyffi`) can reuse the exact reserved name (single source of truth) when
+/// it synthesizes a placeholder score column for structural formula validation.
+pub const CALIBRATED_SLOPE_Z_COLUMN: &str = "__gam_ctn_stage1_z";
 
 /// Fit the calibrated (Neyman-orthogonal, cross-fitted) marginal-slope chain in
 /// one in-process call — the magic-by-default production path for #461.
