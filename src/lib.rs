@@ -119,13 +119,13 @@ pub use solver::protocol::{
     LatentScoreSemantics, MarginalSlopeCalibrationProtocol, SurvivalMarginalSlopeProtocol,
 };
 pub use solver::workflow::{
-    BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, FitConfig, FitRequest,
-    FitResult, GaussianLocationScaleFitRequest, LatentBinaryFitRequest, LatentSurvivalFitRequest,
-    LinkWiggleConfig, MaterializedModel, PreparedSurvivalTimeStack, StandardBinomialWiggleConfig,
-    StandardFitRequest, StandardFitResult, SurvivalLocationScaleFitRequest,
-    SurvivalLocationScaleFitResult, SurvivalMarginalSlopeFitRequest,
+    BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, CrossFitScoreCalibration,
+    CtnStage1Recipe, FitConfig, FitRequest, FitResult, GaussianLocationScaleFitRequest,
+    LatentBinaryFitRequest, LatentSurvivalFitRequest, LinkWiggleConfig, MaterializedModel,
+    PreparedSurvivalTimeStack, StandardBinomialWiggleConfig, StandardFitRequest, StandardFitResult,
+    SurvivalLocationScaleFitRequest, SurvivalLocationScaleFitResult, SurvivalMarginalSlopeFitRequest,
     SurvivalTransformationFitRequest, SurvivalTransformationFitResult,
     SurvivalTransformationTermSpec, TransformationNormalFitRequest, WorkflowError,
-    fit_from_formula, fit_model, is_binary_response, materialize, prepare_survival_time_stack,
-    resolve_family, resolve_offset_column, resolve_weight_column,
+    fit_calibrated_marginal_slope, fit_from_formula, fit_model, is_binary_response, materialize,
+    prepare_survival_time_stack, resolve_family, resolve_offset_column, resolve_weight_column,
 };
