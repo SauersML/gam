@@ -268,9 +268,10 @@ fn gam_pointwise_ci_covers_truth_and_matches_mgcv_on_gaussian_smooth() {
     // ---- PRIMARY objective assertion: gam's pointwise CI is calibrated -----
     // Across-the-function Bayesian coverage should land near nominal. The band
     // is ±0.04 around 0.95 (i.e. empirical coverage in [0.91, 0.99]): wide
-    // enough to absorb Monte-Carlo error at 240×200 ≈ 48k interval checks and
-    // the mild representation bias of the basis, tight enough that an SE that is
-    // grossly mis-scaled (variance off by a constant factor) breaks it.
+    // enough to absorb Monte-Carlo error at 60×200 = 12 000 interval checks (MC
+    // SE ≈ 0.002, see the `reps` comment) and the mild representation bias of the
+    // basis, tight enough that an SE that is grossly mis-scaled (variance off by a
+    // constant factor) breaks it.
     assert!(
         gam_coverage >= 0.91 && gam_coverage <= 0.99,
         "gam's nominal-95% pointwise CI is mis-calibrated: empirical coverage \
