@@ -153,6 +153,20 @@ fn gam_multinomial_smooth_by_factor_recovers_truth() {
         family: Some("multinomial".to_string()),
         ..FitConfig::default()
     };
+    // PERF GATE (#569): the smooth-by-factor model carries a large per-class
+    // smoothing-parameter vector — one λ for the global `s(x)` plus one per
+    // group level, per active class (here D = (K−1)·n_terms = 2·4 = 8). The
+    // native multinomial driver must NOT pay the O(D²) exact-dense-outer-Hessian
+    // assembly per outer iteration on this regime (that blew past the 360 s
+    // harness budget); it auto-routes to the exact-gradient quasi-Newton outer
+    // when D is large. We time the fit and assert it completes well inside a
+    // strict budget so a regression that reinstates the O(D²) path (or otherwise
+    // re-introduces the wall-clock blow-up) fails loudly here rather than only
+    // tripping the outer harness timeout. VGAM fits the analogous model in
+    // seconds; a faithful gam path is comfortably within tens of seconds even on
+    // a slow CI runner, so 120 s is a safe, un-weakened ceiling that still
+    // catches the pathological-slowness regression (which exceeded 360 s).
+    let fit_started = std::time::Instant::now();
     let model = fit_penalized_multinomial_formula(
         &ds,
         "y ~ s(x, bs='tp') + s(x, by=group, bs='tp')",
@@ -162,8 +176,28 @@ fn gam_multinomial_smooth_by_factor_recovers_truth() {
         1e-8, // inner tolerance
     )
     .expect("gam multinomial fit");
+    let fit_elapsed = fit_started.elapsed();
+    const FIT_WALL_CLOCK_BUDGET_SECS: f64 = 120.0;
+    assert!(
+        fit_elapsed.as_secs_f64() <= FIT_WALL_CLOCK_BUDGET_SECS,
+        "gam multinomial smooth-by-factor fit took {:.1}s > {FIT_WALL_CLOCK_BUDGET_SECS}s budget \
+         (#569 perf regression: the large per-class λ vector must route through the \
+         exact-gradient quasi-Newton outer, not the O(D²) exact-dense-outer-Hessian path)",
+        fit_elapsed.as_secs_f64(),
+    );
     assert_eq!(model.class_levels.len(), K, "expected K=3 classes");
     assert_eq!(model.n_active_classes, K - 1, "K-1 = 2 active class blocks");
+    // The per-class smoothing-parameter vector must NOT be fused (#561): with one
+    // global smooth + one smooth per group level, each active class carries
+    // n_terms = 4 independent λ. A fused single-λ-per-class driver would report
+    // only K-1 = 2 total λ; the per-term driver reports (K-1)·n_terms.
+    assert!(
+        model.lambdas.len() >= (K - 1) * 2,
+        "smooth-by-factor must select an independent λ per (class, term), not one \
+         fused λ per class: got {} total λ for {} active classes",
+        model.lambdas.len(),
+        K - 1,
+    );
 
     // gam's level order is order-of-first-appearance; the reference class is the
     // LAST level (η = 0). Map each "c{code}" label back to its integer code so

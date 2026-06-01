@@ -8936,6 +8936,7 @@ fn multinomial_model_metadata_pyfunc<'py>(
     out.set_item("n_active_classes", envelope.saved.n_active_classes)?;
     out.set_item("training_headers", envelope.saved.training_headers.clone())?;
     out.set_item("lambdas", envelope.saved.lambdas.clone())?;
+    out.set_item("lambdas_per_block", envelope.saved.lambdas_per_block.clone())?;
     out.set_item("iterations", envelope.saved.iterations)?;
     out.set_item("converged", envelope.saved.converged)?;
     out.set_item(

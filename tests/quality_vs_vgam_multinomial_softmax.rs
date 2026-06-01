@@ -260,6 +260,64 @@ fn gam_multinomial_softmax_recovers_true_simplex() {
         "gam is less accurate than VGAM against the truth: \
          gam_RMSE={gam_err:.5} vgam_RMSE={vg_err:.5} (allowed gam <= 1.10*vgam)"
     );
+
+    // ---- #561: independent smoothing parameter per (smooth term, class) -----
+    // The formula `y ~ s(x1) + s(x2) + x3` has TWO penalized smooth terms
+    // (`s(x1)`, `s(x2)`; `x3` is an unpenalized linear term). The native
+    // multinomial driver must select a SEPARATE λ for each smooth term within
+    // each active class — the truth's cubic-in-x1 and sigmoid-in-x2 have very
+    // different roughness, so a single fused λ per class would have to
+    // over-smooth one term while under-smoothing the other, biasing the surface
+    // (the original RMSE=0.13 failure). With per-term penalties each of the
+    // K-1=2 active classes carries n_smooth_terms=2 independent λ, so the total
+    // count is (K-1)·2 = 4. A fused single-λ-per-class driver would report only
+    // K-1 = 2. We assert the per-term structure survived into the saved model,
+    // AND that the two terms within a class actually resolved to DISTINCT λ (the
+    // whole point — fusion would force them equal). `lambdas_per_block` segments
+    // the flat λ vector by class.
+    assert_eq!(
+        model.lambdas_per_block.len(),
+        K - 1,
+        "expected one λ segment per active class (K-1={})",
+        K - 1
+    );
+    for (a, &n_lam) in model.lambdas_per_block.iter().enumerate() {
+        assert_eq!(
+            n_lam, 2,
+            "class {a} must carry one independent λ per smooth term (s(x1), s(x2)); \
+             a fused single-λ-per-class driver would report 1"
+        );
+    }
+    assert_eq!(
+        model.lambdas.len(),
+        (K - 1) * 2,
+        "per-term smoothing must yield (K-1)·n_smooth_terms = {} λ total, not a \
+         single fused λ per class; got {:?}",
+        (K - 1) * 2,
+        model.lambdas
+    );
+    // The two smooth terms within at least one class must resolve to materially
+    // different λ — direct evidence the terms are smoothed independently rather
+    // than fused. (If the truth happened to need identical smoothing for both
+    // terms this could be vacuous, but the cubic/sigmoid roughness mismatch
+    // guarantees a separation here.)
+    let mut max_within_class_log_ratio = 0.0_f64;
+    let mut offset = 0usize;
+    for &n_lam in &model.lambdas_per_block {
+        let seg = &model.lambdas[offset..offset + n_lam];
+        let lo = seg.iter().cloned().fold(f64::INFINITY, f64::min);
+        let hi = seg.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        if lo > 0.0 && hi.is_finite() {
+            max_within_class_log_ratio = max_within_class_log_ratio.max((hi / lo).ln().abs());
+        }
+        offset += n_lam;
+    }
+    assert!(
+        max_within_class_log_ratio > 0.1,
+        "the per-term λ within every class are nearly identical \
+         (max within-class |log λ ratio|={max_within_class_log_ratio:.3}) — the smooth \
+         terms appear fused rather than independently smoothed (#561)"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

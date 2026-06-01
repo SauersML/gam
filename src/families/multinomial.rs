@@ -75,7 +75,6 @@ use crate::solver::workflow::{
 };
 use crate::terms::smooth::{
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
-    weighted_blockwise_penalty_sum,
 };
 use crate::terms::term_builder::resolve_role_col;
 use crate::types::ResponseColumnKind;
@@ -306,12 +305,21 @@ pub struct MultinomialSavedModel {
     /// predict time so the FFI can align a fresh `Dataset` to the training
     /// schema before evaluating the basis.
     pub training_headers: Vec<String>,
-    /// Per-active-class REML/LAML-selected smoothing parameter, length
-    /// `K - 1` (one entry per active class block; the shared-penalty
-    /// architecture means each class owns exactly one λ). When the outer
-    /// REML loop is bypassed (legacy fixed-λ path), every entry is the
-    /// caller-supplied initial value.
+    /// REML/LAML-selected smoothing parameters, one per `(active class, smooth
+    /// term)`, flattened in block-major order: all of class 0's per-term λ,
+    /// then class 1's, and so on. Per-term penalties (#561) mean each active
+    /// class block selects an *independent* λ for every smooth term, so this
+    /// vector has length `Σ_a (#terms in class a)` = `(K − 1) · #terms`. Use
+    /// [`MultinomialSavedModel::lambdas_per_block`] to segment it by class. An
+    /// unpenalized model (no smooth terms) yields an empty vector.
     pub lambdas: Vec<f64>,
+    /// Number of smoothing parameters (smooth terms) in each active class
+    /// block, parallel to `class_levels[0..K-1]`. Segments the flat `lambdas`
+    /// vector: class `a`'s λ are `lambdas[Σ_{b<a} lambdas_per_block[b] ..][..
+    /// lambdas_per_block[a]]`. Every entry is identical in the shared-design
+    /// architecture (all classes share the same term structure), but it is
+    /// stored explicitly so consumers never have to assume that.
+    pub lambdas_per_block: Vec<usize>,
     /// Newton iterations executed; recorded for the summary report.
     pub iterations: usize,
     /// `true` if the inner Newton solver hit the relative-step tolerance.
@@ -522,29 +530,36 @@ pub fn fit_penalized_multinomial_formula(
         .design
         .try_to_dense_by_chunks("multinomial fit design")
         .map_err(EstimationError::InvalidInput)?;
-    let p_total = x_dense.ncols();
-    // Sum the penalty blocks at uniform λ = 1 (the per-class λ_a is folded
-    // back through the REML driver below, so the assembled `S` here is the
-    // unweighted Σ_k S_k that every active class shares).
-    let lambdas_block = vec![1.0_f64; design.penalties.len()];
-    let s_total = weighted_blockwise_penalty_sum(&design.penalties, &lambdas_block, p_total);
+    // Preserve the per-smooth-term penalty block structure (#561): each smooth
+    // term `t` contributes its own `P × P` penalty component (`Blockwise` with
+    // `total_dim = P`, the term's local `S_t` embedded at its `col_range`), and
+    // every active class block receives the FULL list. The outer REML/LAML loop
+    // then selects an independent smoothing parameter λ_{a,t} per (class, term),
+    // matching mgcv/VGAM. Pre-summing the terms into one fused `S` (the prior
+    // behaviour) forced a single λ per class that scales `Σ_t S_t`, so one
+    // shared λ had to over-smooth a rough term while under-smoothing a smooth
+    // one — biasing any multi-term class-probability surface.
+    let per_term_penalties = design.penalties_as_penalty_matrix();
+    let per_term_nullspace_dims = design.nullspace_dims.clone();
     let k = y_one_hot.ncols();
     let m = k - 1;
     let n_obs = y_one_hot.nrows();
 
     // ── Custom-family driven REML/LAML path ───────────────────────────────
-    // Each active class becomes one ParameterBlockSpec, all sharing X and S.
-    // `initial_log_lambdas` is seeded from the caller's `init_lambda`.
+    // Each active class becomes one ParameterBlockSpec, all sharing X and the
+    // per-term penalty list. `initial_log_lambdas` is seeded from the caller's
+    // `init_lambda` (one entry per term).
     let design_arc = Arc::new(x_dense);
-    let penalty_arc = Arc::new(s_total);
+    let penalties_arc = Arc::new(per_term_penalties);
+    let nullspace_dims_arc = Arc::new(per_term_nullspace_dims);
     let weights = Array1::<f64>::ones(n_obs);
     let family = MultinomialFamily::new(
         y_one_hot.clone(),
         weights,
         k,
         design_arc.clone(),
-        penalty_arc.clone(),
-        0,
+        penalties_arc.clone(),
+        nullspace_dims_arc.clone(),
     )
     .map_err(EstimationError::InvalidInput)?;
     let mut blocks = family.build_block_specs();
@@ -555,9 +570,48 @@ pub fn fit_penalized_multinomial_formula(
         }
     }
 
+    // ── Outer-derivative policy: auto-derived from the smoothing dimension ──
+    // The total smoothing-parameter dimension is `D = (K−1) · n_terms` (one
+    // independent λ_{a,t} per active class `a` and smooth term `t`, the per-term
+    // structure that fixes #561). The generic outer optimizer can run on the
+    // exact REML/LAML *gradient* alone (quasi-Newton/BFGS) or on the exact
+    // gradient *and* an exact dense outer Hessian. The multinomial family's
+    // exact outer Hessian is assembled by the engine's pairwise enumeration:
+    // O(D²) second-directional-derivative evaluations, each forming a
+    // `second_directional_fisher_jet` (O(N·(K−1)²)) and a `dense_block_xtwx` of
+    // dimension `(K−1)·P` (O(N·(K−1)²·P²)) — i.e. the outer-Hessian assembly
+    // cost grows quadratically in `D`. For a small `D` (a single global smooth,
+    // `D = K−1`) that quadratic is trivial and the exact Hessian buys quadratic
+    // outer convergence, so it is worth paying. But a smooth-by-factor model
+    // (`s(x) + s(x, by=group)` ⇒ one global + one-per-group smooth) drives `D`
+    // up multiplicatively (#569): with K=3 classes and 3 groups, D = 2·4 = 8,
+    // and the O(D²) = 64 dense directional-Hessian assemblies *per outer
+    // iteration* dominate the wall clock — the fit times out even though
+    // N·P is small. Above the crossover the exact-gradient BFGS outer converges
+    // in far fewer total FLOPs (O(D) gradient work per step), matching VGAM's
+    // seconds-scale fit. The crossover is governed purely by `D`, so the route
+    // is auto-selected here with no caller flag ("magic by default"): use the
+    // exact outer Hessian only while `D ≤ MULTINOMIAL_EXACT_OUTER_HESSIAN_MAX_DIM`,
+    // and fall back to the exact-gradient quasi-Newton outer otherwise. Both
+    // routes optimize the identical REML/LAML objective to the same `outer_tol`
+    // optimum — the choice trades quadratic-but-O(D²)-per-step convergence for
+    // linear-but-O(D)-per-step convergence, which is the correct trade as `D`
+    // grows.
+    let total_rho_dim = m.saturating_mul(penalties_arc.len());
+    // Largest smoothing-parameter dimension at which the exact dense outer
+    // Hessian's O(D²)-per-iteration assembly is still cheaper than the extra
+    // quasi-Newton outer iterations it would save. At D = 3 the exact path pays
+    // ≤ 9 directional-Hessian assemblies per outer step; by D = 4 the
+    // 16-assembly cost already exceeds the BFGS/EFS trade for these dense softmax
+    // systems, so the smooth-by-factor and multi-term-per-class models route
+    // through the exact-gradient quasi-Newton (Fellner–Schall / BFGS) outer.
+    const MULTINOMIAL_EXACT_OUTER_HESSIAN_MAX_DIM: usize = 3;
+    let use_outer_hessian = total_rho_dim <= MULTINOMIAL_EXACT_OUTER_HESSIAN_MAX_DIM;
+
     let options = BlockwiseFitOptions {
         inner_max_cycles: max_iter,
         inner_tol: tol,
+        use_outer_hessian,
         ..BlockwiseFitOptions::default()
     };
     let fit =
@@ -584,10 +638,16 @@ pub fn fit_penalized_multinomial_formula(
             coefficients_active[[i, a]] = block.beta[i];
         }
     }
-    let lambdas_per_class: Vec<f64> = fit
+    // Flatten every (class, term) smoothing parameter in block-major order
+    // (class 0's terms, then class 1's, …). With per-term penalties each block
+    // now carries one λ per smooth term, so a single λ per class would discard
+    // the independent per-term selection that fixes #561. `lambdas_per_block`
+    // segments the flat vector by class so callers can recover per-term λ.
+    let lambdas_per_block: Vec<usize> = fit.blocks.iter().map(|b| b.lambdas.len()).collect();
+    let lambdas_flat: Vec<f64> = fit
         .blocks
         .iter()
-        .map(|b| b.lambdas.iter().copied().next().unwrap_or(init_lambda))
+        .flat_map(|b| b.lambdas.iter().copied())
         .collect();
     let edf_per_class = fit.inference.as_ref().map(|info| info.edf_by_block.clone());
     let coefficients_flat: Vec<f64> = coefficients_active.iter().copied().collect();
@@ -610,7 +670,8 @@ pub fn fit_penalized_multinomial_formula(
         p_per_class,
         n_active_classes: m,
         training_headers: data.headers.clone(),
-        lambdas: lambdas_per_class,
+        lambdas: lambdas_flat,
+        lambdas_per_block,
         iterations: fit.inner_cycles,
         converged: fit.outer_converged,
         penalized_neg_log_likelihood: -fit.log_likelihood + 0.5 * fit.stable_penalty_term,
