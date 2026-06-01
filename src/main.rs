@@ -12561,6 +12561,9 @@ mod tests {
                 None,
                 saved_fit_summary_fixture(),
             ),
+            // Single marginal coefficient, no influence absorber → truncation
+            // is a no-op (p_marginal == block-0 width).
+            1,
             0.0,
             0.0,
             SavedLatentZNormalization { mean: 0.2, sd: 1.3 },
@@ -12775,6 +12778,9 @@ mod tests {
             empty_termspec(),
             empty_termspec(),
             fit_result,
+            // Block-0 ("Mean") has a single coefficient — no influence absorber
+            // is present in the fixture, so p_marginal == block-0 width = 1.
+            1,
             0.0,
             1.0,
             SavedLatentZNormalization { mean: 1.0, sd: 2.0 },
@@ -12831,6 +12837,9 @@ mod tests {
                 None,
                 saved_fit_summary_fixture(),
             ),
+            // Single marginal coefficient, no influence absorber → truncation
+            // is a no-op (p_marginal == block-0 width).
+            1,
             0.0,
             0.0,
             SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
