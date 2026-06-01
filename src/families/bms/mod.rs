@@ -3,7 +3,7 @@ use crate::custom_family::{
     CustomFamily, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation,
     ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
     ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, FamilyEvaluation,
-    FamilyLinearizationState, ParameterBlockSpec, ParameterBlockState,
+    FamilyLinearizationState, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
     build_block_spatial_psi_derivatives, custom_family_outer_derivatives,
     evaluate_custom_family_joint_hyper_efs_shared, evaluate_custom_family_joint_hyper_shared,
     fit_custom_family, joint_hyper_options_for_outer_tolerance,
