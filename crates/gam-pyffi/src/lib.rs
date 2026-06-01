@@ -176,6 +176,10 @@ struct PyFitConfig {
     // Marginal-slope.
     z_column: Option<String>,
     logslope_formula: Option<String>,
+    /// Calibrated marginal-slope chain (#461): the Stage-1 CTN recipe whose
+    /// presence auto-enables cross-fitted, Neyman-orthogonal score calibration.
+    /// Mirrors `gamfit._calibrated_slope.CtnStage1.to_rust_recipe()` exactly.
+    ctn_stage1: Option<PyCtnStage1>,
 
     // Link / flexibility.
     link: Option<String>,
@@ -221,6 +225,90 @@ struct PyFitConfig {
     // copied verbatim into `FittedModelPayload.training_table_kind` so that the
     // predict-time output-container fallback survives `save`/`load`.
     training_table_kind: Option<String>,
+}
+
+/// Wire form of the Stage-1 CTN recipe for the calibrated marginal-slope chain
+/// (#461). One-to-one with `gamfit._calibrated_slope.CtnStage1.to_rust_recipe()`
+/// and with the core `gam::CtnStage1Recipe` struct; `config` overrides are
+/// applied on top of a `TransformationNormalConfig::default()`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PyCtnStage1 {
+    response_column: String,
+    covariate_formula_rhs: String,
+    #[serde(default)]
+    config: Option<PyCtnStage1Config>,
+    #[serde(default)]
+    weight_column: Option<String>,
+    #[serde(default)]
+    offset_column: Option<String>,
+}
+
+/// Optional overrides for the Stage-1 CTN response-direction basis / penalty.
+/// Any omitted field keeps the `TransformationNormalConfig::default()` value.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PyCtnStage1Config {
+    #[serde(default)]
+    response_degree: Option<usize>,
+    #[serde(default)]
+    response_num_internal_knots: Option<usize>,
+    #[serde(default)]
+    response_penalty_order: Option<usize>,
+    #[serde(default)]
+    response_extra_penalty_orders: Option<Vec<usize>>,
+    #[serde(default)]
+    double_penalty: Option<bool>,
+}
+
+impl PyCtnStage1 {
+    /// Convert the wire form to the core `gam::CtnStage1Recipe`, validating the
+    /// required string fields and folding any config overrides onto the default.
+    fn into_recipe(self) -> Result<gam::CtnStage1Recipe, String> {
+        let response_column = self.response_column.trim().to_string();
+        if response_column.is_empty() {
+            return Err("ctn_stage1.response_column must be a non-empty column name".to_string());
+        }
+        let covariate_formula_rhs = self.covariate_formula_rhs.trim().to_string();
+        if covariate_formula_rhs.is_empty() {
+            return Err(
+                "ctn_stage1.covariate_formula_rhs must be a non-empty covariate formula RHS"
+                    .to_string(),
+            );
+        }
+        if covariate_formula_rhs.contains('~') {
+            return Err(
+                "ctn_stage1.covariate_formula_rhs is a right-hand side only; pass 's(pc1) + s(pc2)', \
+                 not 'score ~ s(pc1) + s(pc2)'"
+                    .to_string(),
+            );
+        }
+        let mut config = gam::transformation_normal::TransformationNormalConfig::default();
+        if let Some(overrides) = self.config {
+            if let Some(value) = overrides.response_degree {
+                config.response_degree = value;
+            }
+            if let Some(value) = overrides.response_num_internal_knots {
+                config.response_num_internal_knots = value;
+            }
+            if let Some(value) = overrides.response_penalty_order {
+                config.response_penalty_order = value;
+            }
+            if let Some(value) = overrides.response_extra_penalty_orders {
+                config.response_extra_penalty_orders = value;
+            }
+            if let Some(value) = overrides.double_penalty {
+                config.double_penalty = value;
+            }
+        }
+        Ok(gam::CtnStage1Recipe {
+            response_column,
+            covariate_formula_rhs,
+            config,
+            weight_column: self.weight_column.filter(|s| !s.trim().is_empty()),
+            offset_column: self.offset_column.filter(|s| !s.trim().is_empty()),
+        })
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -23575,6 +23663,20 @@ fn fit_dataset_impl(
     if let Some(w) = fisher_rao_w {
         inject_scalar_fisher_rao_weight(&mut dataset, &mut fit_config, w)?;
     }
+    // Calibrated marginal-slope chain (#461): when a CTN Stage-1 recipe is
+    // present, fit Stage-1 once, synthesize the latent-score column, and point
+    // z_column at it before materializing. The ordinary marginal-slope
+    // materialize/fit path below then detects the populated `ctn_stage1`,
+    // cross-fits the CTN, overrides the in-sample score with the out-of-fold one,
+    // and installs the leakage-projection block — all in Rust core. The payload
+    // builders see the augmented dataset (with the synthetic score column) and a
+    // Stage-2 config whose `z_column` points at it.
+    if fit_config.ctn_stage1.is_some() {
+        let (augmented, stage2_config) =
+            gam::prepare_calibrated_marginal_slope_stage2(&dataset, &fit_config)?;
+        dataset = augmented;
+        fit_config = stage2_config;
+    }
     let materialized = materialize(&formula, &dataset, &fit_config)?;
     let request = materialized.request;
 
@@ -27309,6 +27411,9 @@ fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
     }
     if let Some(formula) = py_config.logslope_formula {
         fit_config.logslope_formula = Some(formula);
+    }
+    if let Some(stage1) = py_config.ctn_stage1 {
+        fit_config.ctn_stage1 = Some(stage1.into_recipe()?);
     }
     if let Some(link) = py_config.link {
         let trimmed = link.trim();
