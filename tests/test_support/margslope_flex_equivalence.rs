@@ -180,6 +180,7 @@ pub fn build_biobank_shape_problem(n: usize) -> BiobankShapeProblem {
             score_warp: Some(dev_cfg.clone()),
             link_dev: Some(dev_cfg),
             latent_z_policy: LatentZPolicy::exploratory_fit_weighted(),
+            score_influence_jacobian: None,
         },
     }
 }

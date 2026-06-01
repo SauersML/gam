@@ -192,6 +192,7 @@ fn build_problem(n: usize) -> BiobankProblem {
             score_warp: Some(linkwiggle8()),
             link_dev: Some(linkwiggle8()),
             latent_z_policy: LatentZPolicy::exploratory_fit_weighted(),
+            score_influence_jacobian: None,
         },
     }
 }

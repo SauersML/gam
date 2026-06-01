@@ -163,6 +163,7 @@ fn build_problem(n: usize, flex: bool) -> Problem {
         score_warp,
         link_dev,
         latent_z_policy: LatentZPolicy::exploratory_fit_weighted(),
+        score_influence_jacobian: None,
     };
     Problem { data, spec }
 }
