@@ -1,5 +1,4 @@
 pub mod alo;
-pub mod conformal;
 pub mod data;
 pub mod diagnostics;
 pub mod dispersion_cov;
@@ -16,8 +15,5 @@ pub mod posterior_bands;
 pub mod predict;
 pub mod probability;
 pub mod quadrature;
-pub mod rho_marginalized;
 pub mod sample;
 pub mod smooth_test;
-pub mod stacking;
-pub mod stochastic_trace;
