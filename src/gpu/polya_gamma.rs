@@ -421,43 +421,43 @@ pub fn pg_saddlepoint_cpu_oracle(state: &mut XorwowState, b: u32, tilt: f64) -> 
 ///   κ_3(PG(1, c)) = (1/(4c^5)) · [sinh(c) · (c² − 6) + 6c − c · (c²+6)·tanh(c/2)/c·...]
 ///
 /// rather than derive in closed form (sign-sensitive, easy to bug), we
-/// compute κ_3(PG(1, c)) once per (c) by Newton-Cotes integration against the
-/// PG density's CGF: `κ_3 = K'''(0)` with K(t) = log cosh(c/2) − log cosh(√(c²−2t)/2).
-/// Symbolic K'''(0) reduces to:
+/// compute κ_3(PG(1, c)) once per (c) as the analytic third cumulant
+/// `κ_3 = K'''(0)` of the PG CGF K(t) = log cosh(c/2) − log cosh(√(c²−2t)/2).
 ///
-///   K'''(0) = (1/(2c)) · sech²(c/2) · [sech²(c/2) − tanh(c/2)/c · (3 − tanh²(c/2))] · b
-///
-/// (Derivation: differentiate K(t) = −b·log cosh(u(t)) with u(t) = √(c²−2t)/2,
-/// du/dt = −1/(4u), then iterate; evaluate at t=0 where u=c/2.)
+/// Closed form (derived below, no finite differences):
+///   K'''(0) = (b / (64 u⁵)) · [ 3·tanh u − 3u·sech²u − 2u²·tanh u·sech²u ],  u = c/2.
+/// Symmetric (c → 0) limit: K'''(0) → b/60 (the intrinsic positive skew of a
+/// sum of b PG(1) atoms; only the *tilt-induced* asymmetry vanishes as c → 0).
 #[inline]
 fn pg_third_cumulant(b: f64, c: f64) -> f64 {
-    // K(t) = b·[log cosh(c/2) − log cosh(u)] with u = sqrt(c² − 2t)/2.
-    // At t=0: u = c/2.
-    // du/dt = −1/(4u).
-    // K' = b · tanh(u) · (1/(4u))   (from chain rule on −log cosh)... wait sign.
-    // d/dt[−log cosh u] = −tanh(u) · du/dt = −tanh(u) · (−1/(4u)) = tanh(u)/(4u).
-    // So K'(t) = b · tanh(u)/(4u).
-    // At t=0: K'(0) = b · tanh(c/2)/(2c) ✓ matches pg_mean.
+    // CGF: K(t) = b·[log cosh(c/2) − log cosh(u)], u = sqrt(c² − 2t)/2, du/dt = −1/(4u).
+    // Let g(u) = −log cosh u, g'(u) = −tanh u. With du/dt = −1/(4u):
     //
-    // Differentiating once more for K''(t), and again for K'''(0), the
-    // closed form below was verified by SymPy against the PG(1, c=1.0)
-    // empirical third cumulant from 1e6 draws (relative error 1.2 %).
-    let cb = c.abs().max(1e-8);
-    // Practical route: central-difference K''(t) at t = ±ε to get K'''(0).
-    // The closed form is sign-sensitive (involves 4th-order chain rule on
-    // log cosh ∘ sqrt); finite-difference of K'' is numerically stable
-    // and validated by the KS gates below.
-    let eps = 1e-3 * cb * cb;
-    let kpp = |t: f64| -> f64 {
-        // K''(t) = b · d/dt [tanh(u)/(4u)] with u = sqrt(c²−2t)/2, du/dt = −1/(4u).
-        // = b · (−1/(4u)) · [sech²(u)/(4u) − tanh(u)/(4u²)]
-        let u = (cb * cb - 2.0 * t).max(1e-12).sqrt() * 0.5;
-        let thu = u.tanh();
-        let sech2u = 1.0 - thu * thu;
-        let inner = sech2u / (4.0 * u) - thu / (4.0 * u * u);
-        b * (-1.0 / (4.0 * u)) * inner
-    };
-    (kpp(eps) - kpp(-eps)) / (2.0 * eps)
+    //   K'(t)  = b·g'(u)·du/dt = b·tanh(u)/(4u)
+    //            ⇒ K'(0) = b·tanh(c/2)/(2c)                       ✓ matches pg_mean
+    //
+    //   F(u)   = tanh(u)/(4u),  F'(u) = sech²u/(4u) − tanh u/(4u²)
+    //   K''(t) = b·F'(u)·du/dt = b·(−1/(4u))·F'(u)
+    //          = b·[ −sech²u/(16u²) + tanh u/(16u³) ]
+    //            ⇒ K''(0) = b·(sinh c − c)/(2c³(1+cosh c))        ✓ matches pg_variance
+    //
+    //   H(u)   = −sech²u/(16u²) + tanh u/(16u³)  (so K'' = b·H(u))
+    //   With T=tanh u, S=sech²u, T'=S, S'=−2TS:
+    //   H'(u)  = (2TS)/(16u²) + (3S)/(16u³) − (3T)/(16u⁴)
+    //   K'''(t)= b·H'(u)·du/dt = b·(−1/(4u))·H'(u)
+    //          = (b/(64u⁵))·[ 3T − 3uS − 2u²TS ].
+    //
+    // Small-u Taylor of the bracket is (16/15)u⁵ + O(u⁷), giving the clean
+    // c → 0 limit K'''(0) = (b/(64u⁵))·(16/15)u⁵ = b/60.
+    let c_abs = c.abs();
+    if c_abs < 1e-6 {
+        return b / 60.0;
+    }
+    let u = 0.5 * c_abs;
+    let t = u.tanh();
+    let s = 1.0 - t * t; // sech²u
+    let bracket = 3.0 * t - 3.0 * u * s - 2.0 * u * u * t * s;
+    b * bracket / (64.0 * u.powi(5))
 }
 
 /// Cornish-Fisher draw: `X ≈ μ + σ·[Z + (γ_1/6)·(Z² − 1)]` with
