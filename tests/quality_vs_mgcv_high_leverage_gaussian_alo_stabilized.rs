@@ -61,7 +61,10 @@ struct Lcg(u64);
 impl Lcg {
     fn next_unit(&mut self) -> f64 {
         // Numerical Recipes LCG constants.
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((self.0 >> 11) as f64) / ((1u64 << 53) as f64) - 0.5
     }
 }
@@ -381,7 +384,11 @@ fn alo_stabilized_reml_is_bit_preserving_on_low_leverage_gaussian() {
 /// column of the reference data.frame. Only the first `v.len()` entries are read
 /// back inside the R body.
 fn pad_to(v: &[f64], len: usize) -> Vec<f64> {
-    assert!(v.len() <= len, "pad target {len} shorter than source {}", v.len());
+    assert!(
+        v.len() <= len,
+        "pad target {len} shorter than source {}",
+        v.len()
+    );
     let fill = v.last().copied().unwrap_or(0.0);
     let mut out = v.to_vec();
     out.resize(len, fill);

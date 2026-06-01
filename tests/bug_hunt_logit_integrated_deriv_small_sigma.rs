@@ -12,9 +12,7 @@
 //! Reference: dense composite-Simpson quadrature over +/-18 sigma, independently
 //! validated by finite-differencing the mean (matches to < 1e-6).
 
-use gam::inference::quadrature::{
-    integrated_inverse_link_mean_and_derivative, QuadratureContext,
-};
+use gam::inference::quadrature::{QuadratureContext, integrated_inverse_link_mean_and_derivative};
 use gam::types::LinkFunction;
 
 fn sigmoid(x: f64) -> f64 {
@@ -49,13 +47,8 @@ fn logit_integrated_derivative_matches_expected_integrand() {
     let mut worst = 0.0f64;
     let mut worst_at = (0.0, 0.0, 0.0, 0.0);
     for (mu, sigma) in cases {
-        let got = integrated_inverse_link_mean_and_derivative(
-            &ctx,
-            LinkFunction::Logit,
-            mu,
-            sigma,
-        )
-        .unwrap();
+        let got = integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::Logit, mu, sigma)
+            .unwrap();
         // E[sigmoid'(eta)] = d/dmu E[sigmoid(eta)].
         let want = gaussian_expectation(|x| sigmoid(x) * (1.0 - sigmoid(x)), mu, sigma);
         let err = (got.dmean_dmu - want).abs();
@@ -68,6 +61,9 @@ fn logit_integrated_derivative_matches_expected_integrand() {
         worst < tol,
         "Logit integrated d/dmu off by {worst:.3e} (tol {tol:.0e}) at \
          (mu={}, sigma={}): got {}, want {}",
-        worst_at.0, worst_at.1, worst_at.2, worst_at.3
+        worst_at.0,
+        worst_at.1,
+        worst_at.2,
+        worst_at.3
     );
 }

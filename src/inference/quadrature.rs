@@ -1199,7 +1199,8 @@ fn tail_bound_exceeds_accuracy(mu: f64, sigma: f64, n_terms: usize, target_accur
 #[inline]
 fn logit_posterior_meanwith_deriv_quadrature(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
     let mean = integrate_normal_adaptive(mu, sigma, |x| stable_sigmoidwith_derivative(x).0);
-    let dmean_dmu = integrate_normal_adaptive(mu, sigma, |x| stable_sigmoidwith_derivative(x).1).max(0.0);
+    let dmean_dmu =
+        integrate_normal_adaptive(mu, sigma, |x| stable_sigmoidwith_derivative(x).1).max(0.0);
     IntegratedMeanDerivative {
         mean,
         dmean_dmu,
@@ -1230,8 +1231,9 @@ fn logit_posterior_meanwith_deriv_controlled(
         IntegratedExpectationMode::ExactSpecialFunction
         | IntegratedExpectationMode::ControlledAsymptotic => {
             let reference = logit_posterior_meanwith_deriv_quadrature(mu, sigma);
-            if integrated_mean_derivative_drift_exceeds(&candidate, &reference, 1e-6, 1e-4, 1e-7, 1e-3)
-            {
+            if integrated_mean_derivative_drift_exceeds(
+                &candidate, &reference, 1e-6, 1e-4, 1e-7, 1e-3,
+            ) {
                 Ok(reference)
             } else {
                 Ok(candidate)
@@ -4927,8 +4929,7 @@ mod tests {
         // contract; that is what we validate here, against an independent
         // high-resolution Simpson reference for BOTH the mean and its
         // μ-derivative (d/dμ E[sigmoid] = E[sigmoid']).
-        let out =
-            logit_posterior_meanwith_deriv_controlled(1.1, 0.8).expect("controlled logit");
+        let out = logit_posterior_meanwith_deriv_controlled(1.1, 0.8).expect("controlled logit");
         let (ref_mean, ref_d1, _, _) = logit_reference_jet_highres_simpson(1.1, 0.8);
         assert_relative_eq!(out.mean, ref_mean, epsilon = 1e-11, max_relative = 1e-10);
         assert!(out.dmean_dmu > 0.0);
@@ -5310,8 +5311,7 @@ mod tests {
         // implementation detail. We assert value accuracy against an
         // independent high-resolution Simpson reference, and document the
         // acceptable modes.
-        let out =
-            logit_posterior_meanwith_deriv_controlled(1.1, 0.8).expect("logit controlled");
+        let out = logit_posterior_meanwith_deriv_controlled(1.1, 0.8).expect("logit controlled");
         assert!(matches!(
             out.mode,
             IntegratedExpectationMode::ExactSpecialFunction

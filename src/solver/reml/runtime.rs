@@ -9093,7 +9093,8 @@ impl<'a> RemlState<'a> {
         // the two outer strategies would optimize different objectives on a
         // high-leverage Gaussian-identity fit. `eval_mode` here is always
         // `ValueAndGradient`, so the augmented gradient term flows through.
-        let cost_result = self.apply_alo_stabilization_to_result(rho, bundle, eval_mode, cost_result)?;
+        let cost_result =
+            self.apply_alo_stabilization_to_result(rho, bundle, eval_mode, cost_result)?;
         self.store_ift_mode_response_cache_from_result(rho, bundle, &cost_result);
         let gradient =
             cost_result
