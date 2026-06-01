@@ -324,7 +324,7 @@ pub fn influence_block_design(
     s_f: f64,
 ) -> Array2<f64> {
     let n = jac.columns.nrows();
-    debug_assert_eq!(
+    assert_eq!(
         pilot_beta0.len(),
         n,
         "influence_block_design: pilot_beta0 length must equal Jacobian rows"
@@ -363,12 +363,12 @@ pub(crate) fn residualize_influence_columns(
     eps: f64,
 ) -> Array2<f64> {
     let n = marginal_design.nrows();
-    debug_assert_eq!(
+    assert_eq!(
         z_infl.nrows(),
         n,
         "residualize_influence_columns: Z_infl rows must equal marginal design rows"
     );
-    debug_assert_eq!(
+    assert_eq!(
         w_metric.len(),
         n,
         "residualize_influence_columns: row metric length must equal marginal design rows"
