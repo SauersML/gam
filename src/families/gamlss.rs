@@ -880,8 +880,19 @@ pub(crate) struct SelectedWiggleBasis {
     pub block: ParameterBlockInput,
 }
 
+const DEFAULT_GAUGE_PRIORITY: u8 = 100;
+const LINK_WIGGLE_GAUGE_PRIORITY: u8 = 80;
+
 impl ParameterBlockInput {
     pub fn intospec(self, name: &str) -> Result<ParameterBlockSpec, String> {
+        self.intospec_with_gauge_priority(name, DEFAULT_GAUGE_PRIORITY)
+    }
+
+    pub fn intospec_with_gauge_priority(
+        self,
+        name: &str,
+        gauge_priority: u8,
+    ) -> Result<ParameterBlockSpec, String> {
         let p = self.design.ncols();
         let n = self.design.nrows();
         if self.offset.len() != n {
@@ -974,7 +985,7 @@ impl ParameterBlockInput {
             nullspace_dims: self.nullspace_dims,
             initial_log_lambdas,
             initial_beta: self.initial_beta,
-            gauge_priority: 100,
+            gauge_priority,
             jacobian_callback: None,
             stacked_design: None,
             stacked_offset: None,
@@ -2295,7 +2306,8 @@ fn fit_binomial_mean_wiggle(
     };
     let blocks = vec![
         spec.eta_block.intospec("eta")?,
-        spec.wiggle_block.intospec("wiggle")?,
+        spec.wiggle_block
+            .intospec_with_gauge_priority("wiggle", LINK_WIGGLE_GAUGE_PRIORITY)?,
     ];
     fit_custom_family(&family, &blocks, options).map_err(|e| e.to_string())
 }
@@ -3966,7 +3978,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 nullspace_dims: vec![],
                 initial_log_lambdas: theta.slice(s![eta_penalty_count..rho_dim]).to_owned(),
                 initial_beta: wiggle_initial_beta.clone(),
-                gauge_priority: 100,
+                gauge_priority: LINK_WIGGLE_GAUGE_PRIORITY,
                 jacobian_callback: None,
                 stacked_design: None,
                 stacked_offset: None,

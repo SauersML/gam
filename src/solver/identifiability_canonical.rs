@@ -527,6 +527,19 @@ pub fn canonicalize_for_identifiability(
         return Err(CustomFamilyError::IdentifiabilityFailure { audit });
     }
 
+    if !audit.dropped_columns.is_empty() {
+        let per_block_transform = specs
+            .iter()
+            .map(|spec| Array2::<f64>::eye(spec.design.ncols()))
+            .collect();
+        return Ok(CanonicalSpecs {
+            reduced_specs: specs.to_vec(),
+            per_block_transform,
+            audit,
+            used_channel_aware_audit: use_channel_aware,
+        });
+    }
+
     let mut per_block_transform: Vec<Array2<f64>> = Vec::with_capacity(specs.len());
     let mut reduced_specs: Vec<ParameterBlockSpec> = Vec::with_capacity(specs.len());
 
