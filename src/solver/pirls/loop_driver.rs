@@ -958,7 +958,25 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         return result;
     }
 
-    if matches!(link_function, LinkFunction::Identity) {
+    if matches!(link_function, LinkFunction::Identity) && linear_constraints.is_none() {
+        // Gaussian-Identity zero-iteration exact solve. The unconstrained
+        // penalized least-squares system is linear, so for an identity link a
+        // single solve is the exact minimizer and no PIRLS iteration is needed.
+        //
+        // This shortcut is only valid in the *unconstrained* convex program.
+        // When shape/box/linear inequality constraints are present (e.g. a
+        // `shape=monotone_increasing` smooth, whose cumulative-sum box-reparam
+        // bounds `γ_j ≥ 0` are folded into `linear_constraints` above), the
+        // minimizer is the solution of an inequality-constrained QP, not the
+        // plain normal-equations solve. Taking this branch then returns the
+        // unconstrained β, which generically violates the constraints and is
+        // rejected by the REML startup KKT gate (`enforce_constraint_kkt`),
+        // aborting the whole fit. Gating on `linear_constraints.is_none()`
+        // routes every constrained Identity fit to the iterative loop below,
+        // which builds a feasible initial point and solves the exact QP via
+        // the active-set solver — mirroring the gate already enforced on the
+        // GPU Gaussian-PLS path in `try_gaussian_pls_gpu`.
+        //
         // Apply the Gaussian-Identity fixed-data cache only when every
         // precondition for the short-circuit's exact reuse holds: the family
         // really is Gaussian (z = y), there is no Firth bias-reduction term,
