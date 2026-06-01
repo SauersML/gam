@@ -21424,8 +21424,10 @@ pub fn fit_survival_marginal_slope_terms(
         // discrete realization of `ψ − Π_η[ψ]`. Dropped at predict.
         if let Some(z_tilde) = influence_active {
             let p_i = z_tilde.ncols();
+            // The absorber's single fixed-ridge penalty is the trailing rho slot.
+            // It is the last block, so `cursor` is not advanced past it (nothing
+            // downstream consumes a further slice).
             let rho_i = rho.slice(s![cursor..cursor + 1]).to_owned();
-            cursor += 1;
             let beta_i = hints
                 .influence_beta
                 .clone()
