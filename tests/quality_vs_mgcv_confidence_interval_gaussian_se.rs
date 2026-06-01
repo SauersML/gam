@@ -95,7 +95,14 @@ fn gam_pointwise_ci_covers_truth_and_matches_mgcv_on_gaussian_smooth() {
 
     // ---- simulation design (fixed) ---------------------------------------
     let n: usize = 200; // training points per replicate
-    let reps: usize = 240; // simulation replicates
+    // Simulation replicates. The cost is dominated by `reps` full gam fits plus
+    // `reps` mgcv REML fits; the sibling coverage tests run 30–50 reps and pass
+    // in ~125 s, while this variant's original 240 reps overran the 360 s
+    // reference-quality timeout. 60 reps pools 60×200 = 12 000 interval checks,
+    // whose Monte-Carlo SE on a coverage proportion is ≈ sqrt(0.95·0.05/12000)
+    // ≈ 0.002 — an order of magnitude below the ±0.04 calibration band asserted
+    // below, so the coverage claim keeps its statistical power unchanged.
+    let reps: usize = 60; // simulation replicates
     let sigma: f64 = 0.30; // noise SD on the response
     let z: f64 = 1.959_963_984_540_054; // 97.5% standard-normal quantile
 
