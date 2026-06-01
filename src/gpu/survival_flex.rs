@@ -40,20 +40,21 @@
 //! reused by the higher-level steps once they wire the host orchestration
 //! around it.
 //!
-//! #461 absorber (additive Stage-1 influence block): no kernel change is
-//! required on this path. These kernels work purely in **primary-coordinate
-//! space** `(q_0, q_1, q̇_1, g[, score-warp, link-dev])`, consuming per-row
-//! location scalars `q_0`/`q_1` (and `g`) that the host has already evaluated
-//! from the location/marginal index — which carries `+Z̃_infl·γ` when the fit
-//! chains a CTN Stage-1 (`survival_marginal_slope.rs`, mirror of bms A2: the
-//! location design is widened with the residualised influence columns). The
-//! design→joint-β chain-rule pullback (`Jᵀ G_i`, `Jᵀ H_i J`) that maps these
-//! primary outputs onto the widened `β` lives host-side (Step 5/6), where the
-//! widened location design is the matched (design, coefficient) pair. The
-//! absorber therefore rides the existing location-index chain transparently:
-//! the GPU kernel never sees the design matrix, so widening it is invisible
-//! here and GPU/CPU stay bit-for-bit identical. The block is dropped at
-//! predict (host rebuilds the location design without influence columns).
+//! #461 absorber (additive Stage-1 influence block) — survival path differs
+//! from the BMS A2 (widened-marginal) realization. The survival linear
+//! predictor is `η₀ = q₀·c(g) + s_f·g·z`, `η₁ = q₁·c(g) + s_f·g·z`: the
+//! marginal/location index enters through the time-quantiles `q₀`/`q₁`, each
+//! **scaled by `c(g)`**. A plain-additive absorber `+Z̃_infl·γ` (chain factor
+//! `∂η/∂γ = 1`, NOT `×c`) therefore cannot be folded into `q₀`/`q₁`; survival
+//! realizes it as a **dedicated additive η channel** (sibling of the existing
+//! primaries), not a widened q-design. Because these kernels currently emit a
+//! fixed 4-primary `(q₀, q₁, q̇₁, g)` grad/Hessian and compute η on-device, the
+//! GPU mirror of that channel (a per-row channel input added to η, its grad
+//! slot, and its η-space Hessian cross terms) is **pending the survival CPU
+//! realization in `row_primary_closed_form`** — the GPU kernel mirrors that
+//! reference term-for-term, so it must not be implemented ahead of it. Until
+//! the channel lands here, absorber survival fits run on CPU. The block is
+//! dropped at predict (the absorber is training-only).
 
 use std::sync::OnceLock;
 
