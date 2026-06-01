@@ -705,6 +705,10 @@ struct BlockSlices {
     logslope: std::ops::Range<usize>,
     score_warp: Option<std::ops::Range<usize>>,
     link_dev: Option<std::ops::Range<usize>>,
+    /// Absorbed Stage-1 influence block (#461), trailing the flex blocks. Its
+    /// width is `p₁` (the Stage-1 coefficient count), `None` when no CTN Stage-1
+    /// chain produced an influence Jacobian.
+    influence: Option<std::ops::Range<usize>>,
     total: usize,
 }
 
@@ -727,18 +731,24 @@ enum HessBlock {
     Logslope,
     ScoreWarp,
     LinkDev,
+    /// Absorbed Stage-1 influence block (#461). Placed LAST in the canonical
+    /// layout so the existing `score_warp` (index 3) / `link_dev` (index 4)
+    /// block-state positions are undisturbed; the absorber's coordinate range
+    /// trails them and its β is dropped at predict.
+    Influence,
 }
 
 impl HessBlock {
     /// Blocks in canonical coordinate-layout order. Iterating this array is how
     /// every assembler visits blocks; the order fixes floating-point
     /// accumulation order in the matvec / bilinear paths.
-    const ALL: [HessBlock; 5] = [
+    const ALL: [HessBlock; 6] = [
         HessBlock::Time,
         HessBlock::Marginal,
         HessBlock::Logslope,
         HessBlock::ScoreWarp,
         HessBlock::LinkDev,
+        HessBlock::Influence,
     ];
 }
 
@@ -753,6 +763,7 @@ impl BlockSlices {
             HessBlock::Logslope => Some(self.logslope.clone()),
             HessBlock::ScoreWarp => self.score_warp.clone(),
             HessBlock::LinkDev => self.link_dev.clone(),
+            HessBlock::Influence => self.influence.clone(),
         }
     }
 }
@@ -762,8 +773,10 @@ fn block_slices(
     block_states: &[ParameterBlockState],
 ) -> BlockSlices {
     if !block_states.is_empty() {
-        let expected_blocks =
-            3 + usize::from(family.score_warp.is_some()) + usize::from(family.link_dev.is_some());
+        let expected_blocks = 3
+            + usize::from(family.score_warp.is_some())
+            + usize::from(family.link_dev.is_some())
+            + usize::from(family.influence_absorber.is_some());
         assert_eq!(
             block_states.len(),
             expected_blocks,
@@ -785,6 +798,13 @@ fn block_slices(
         cursor = range.end;
         range
     });
+    // Absorbed influence block trails the flex blocks: its width is the
+    // Stage-1 coefficient count `p₁` (= `Z̃_infl.ncols()`).
+    let influence = family.influence_absorber.as_ref().map(|z_tilde| {
+        let range = cursor..cursor + z_tilde.ncols();
+        cursor = range.end;
+        range
+    });
     let total = cursor;
     BlockSlices {
         time,
@@ -792,6 +812,7 @@ fn block_slices(
         logslope,
         score_warp,
         link_dev,
+        influence,
         total,
     }
 }
@@ -5719,6 +5740,47 @@ impl SurvivalMarginalSlopeFamily {
             .get(idx)
             .map(|state| Some(&state.beta))
             .ok_or_else(|| "missing survival link-deviation block state".to_string())
+    }
+
+    /// Coefficient `γ` of the absorbed Stage-1 influence block (#461). The
+    /// absorber is the trailing block, so its index is `3 + score_warp? +
+    /// link_dev?`. `None` when no influence Jacobian was installed.
+    fn flex_influence_beta<'a>(
+        &self,
+        block_states: &'a [ParameterBlockState],
+    ) -> Result<Option<&'a Array1<f64>>, String> {
+        if self.influence_absorber.is_none() {
+            return Ok(None);
+        }
+        let idx =
+            3 + usize::from(self.score_warp.is_some()) + usize::from(self.link_dev.is_some());
+        block_states
+            .get(idx)
+            .map(|state| Some(&state.beta))
+            .ok_or_else(|| "missing survival influence-absorber block state".to_string())
+    }
+
+    /// Per-row absorbed-influence index offset `o_infl[row] = Z̃_infl[row,:]·γ`.
+    /// Returns `0.0` when no absorber is installed (the additive shift vanishes),
+    /// so callers can fold it unconditionally into the de-nested observed `η₁`.
+    fn influence_index_offset(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+    ) -> Result<f64, String> {
+        let (Some(z_tilde), Some(gamma)) =
+            (self.influence_absorber.as_ref(), self.flex_influence_beta(block_states)?)
+        else {
+            return Ok(0.0);
+        };
+        if gamma.len() != z_tilde.ncols() {
+            return Err(format!(
+                "survival influence-absorber β length {} != Z̃_infl columns {}",
+                gamma.len(),
+                z_tilde.ncols()
+            ));
+        }
+        Ok(z_tilde.row(row).dot(gamma))
     }
 
     fn denested_partition_cells(

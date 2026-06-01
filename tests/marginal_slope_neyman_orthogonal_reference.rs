@@ -17,64 +17,59 @@
 //! `β(x)` is flat. The orthogonalized estimator absorbs the realized Stage-1
 //! influence directions `Z_infl = diag(s_f·β̂₀(x))·J`, `J = ∂z/∂θ₁`, computed
 //! out-of-fold (cross-fitting), making the `β` estimating equation orthogonal
-//! to `span(Z_infl)`. That is the discrete realization of `ψ − Π_η[ψ]`.
+//! to `span(Z_infl)` — the discrete realization of `ψ − Π_η[ψ]`.
 //!
 //! # How the two arms are constructed (read this before the assertions)
 //!
-//! Both arms fit Stage 2 through the *same* public terms entry point,
-//! [`fit_bernoulli_marginal_slope_terms`] — the function `fit_model` ultimately
-//! dispatches to for a `z_column` + `logslope_formula` config. They differ only
-//! in the `score_influence_jacobian` field of the spec:
+//! Both arms are driven through the **same shipped public entry points**, so
+//! these tests verify exactly what the CLI / gamfit run — not a parallel
+//! test-only path:
 //!
-//!   * **naive arm** — `score_influence_jacobian: None`. The Stage-1 `z` is
-//!     fed in as a fixed, precomputed regressor with no influence projection.
-//!     This is exactly the behavior of a raw `z_column` fit (no CTN chain in
-//!     the workflow), and reproduces #461's failure mode.
-//!   * **orthogonalized arm** — `score_influence_jacobian: Some(J_oof)`, the
-//!     out-of-fold Stage-1 score-influence Jacobian from cross-fitting the CTN.
-//!     This is the auto-enabled, magic-by-default path the workflow selects
-//!     whenever a CTN Stage-1 produces the z-column (design §5).
+//!   * **orthogonalized arm** — [`fit_calibrated_marginal_slope`]. It fits the
+//!     Stage-1 CTN once from the [`CtnStage1Recipe`] carried on
+//!     `FitConfig::ctn_stage1`, synthesizes the in-sample `z` as a reserved
+//!     column, then routes through [`fit_from_formula`] keeping `ctn_stage1`
+//!     set — so the materializer auto-cross-fits, **overrides** `z` with the
+//!     out-of-fold score, and installs the A2 leakage-projection block
+//!     (the marginal design is widened to `[M | Z̃_infl]`). This is the
+//!     magic-by-default path the design auto-enables whenever a CTN Stage-1
+//!     generates the z-column (design §5).
+//!   * **naive arm (control)** — [`fit_from_formula`] with `ctn_stage1: None`
+//!     on a **precomputed** `z` column (a single full-data CTN score). No
+//!     cross-fit, no influence block ⇒ today's leaky free-warp behavior. This
+//!     is the un-orthogonalized baseline #461 is about.
 //!
-//! `J_oof` and the out-of-fold `z` are produced by [`crossfit_score_z_jacobian`]
-//! below, which fits the CTN on each fold's complement, evaluates `z` and
-//! `J = ∂z/∂θ₁` on the held-out fold via the public
-//! `marginal_slope_orthogonal::score_influence_jacobian` API (design §6), and
-//! concatenates. The `z` used by the naive arm is the *same* cross-fitted `z`,
-//! so the two arms see identical regressors and differ *only* by the influence
-//! projection — isolating the effect under test.
+//! Both arms share the identical `(x, y)` and the same Stage-1 *recipe* /
+//! response basis, so they differ only by the orthogonalization — isolating the
+//! effect under test. β̂(x) and its posterior covariance are read off the
+//! returned [`BernoulliMarginalSlopeFitResult`] (block 1 = logslope; the joint
+//! covariance offset to the logslope block is the marginal block's *actual*
+//! widened coefficient count `blocks[0].beta.len()`, which the A2 absorber
+//! grows by `p₁` on the orthogonalized arm).
 //!
-//! # Why these may fail before the implementation lands
+//! # Why these may fail before the implementation is correct
 //!
 //! Per the repo contract, quality tests assert OBJECTIVE quality metrics
 //! (false-positive control, truth-recovery RMSE, bias/coverage), never
 //! `gam ≈ reference output`. The DML library is a match-or-beat baseline, not
-//! ground truth. The `marginal_slope_orthogonal` module and the
-//! `score_influence_jacobian` spec wiring are part of #461; until they exist
-//! and are correct, the orthogonalized assertions legitimately fail. That is
-//! honest, and no tolerance here may be weakened to make code pass.
+//! ground truth. No tolerance here may be weakened to make code pass.
 
-use gam::families::bernoulli_marginal_slope::{
-    BernoulliMarginalSlopeFitResult, BernoulliMarginalSlopeTermSpec, LatentZPolicy,
-};
-use gam::families::custom_family::BlockwiseFitOptions;
-use gam::families::lognormal_kernel::FrailtySpec;
+use gam::families::bernoulli_marginal_slope::BernoulliMarginalSlopeFitResult;
 use gam::families::marginal_slope_orthogonal::{influence_block_design, score_influence_jacobian};
-use gam::resource::ResourcePolicy;
-use gam::terms::basis::{
-    BSplineBasisSpec, BSplineBoundaryConditions, BSplineKnotSpec, OneDimensionalBoundary,
-};
-use gam::terms::smooth::{
-    build_term_collection_design, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
-    SpatialLengthScaleOptimizationOptions, TermCollectionSpec,
-};
+use gam::terms::smooth::build_term_collection_design;
 use gam::test_support::reference::{dml_partial_linear_reference, rmse, Column};
-use gam::transformation_normal::TransformationNormalFitResult;
-use gam::types::{InverseLink, StandardLink};
+use gam::transformation_normal::{TransformationNormalConfig, TransformationNormalFitResult};
 use gam::{
-    encode_recordswith_inferred_schema, fit_model, init_parallelism, materialize, FitConfig,
-    FitRequest, FitResult,
+    encode_recordswith_inferred_schema, fit_calibrated_marginal_slope, fit_from_formula,
+    init_parallelism, materialize, CtnStage1Recipe, FitConfig, FitRequest, FitResult,
 };
 use ndarray::{Array1, Array2};
+
+// Stage-1 CTN covariate RHS and Stage-2 marginal/logslope formulas. Kept in one
+// place so the orthogonalized recipe and the naive control fit identical bases.
+const COVARIATE_RHS: &str = "s(x, k=8)";
+const STAGE2_FORMULA: &str = "y ~ s(x, k=8)";
+const LOGSLOPE_FORMULA: &str = "s(x, k=8)";
 
 // ---------------------------------------------------------------------------
 // Deterministic RNG — SplitMix64, so every platform draws the identical data
@@ -116,17 +111,104 @@ fn normal_cdf(x: f64) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
-// Stage-1 (CTN) fitting + cross-fitted z / influence-Jacobian.
+// Dataset plumbing + the two shipped fit arms.
 // ---------------------------------------------------------------------------
 
-/// Fit a conditional transformation-normal model of a continuous score `score`
-/// on a single covariate `x` over the supplied row subset, via the public
-/// formula path (`materialize` → `fit_model`). The covariate side is a single
-/// penalized B-spline `s(x, k=8)`; the response basis complexity is pinned so
-/// the fit is reproducible. Returns the fitted CTN result.
-fn fit_ctn_stage1(x: &[f64], score: &[f64]) -> TransformationNormalFitResult {
+/// Build an in-memory `EncodedDataset` with columns `x`, `y`, `score` (and,
+/// when `z` is `Some`, a `z` column for the naive control). The orthogonalized
+/// arm needs `x`, `y`, `score` and must NOT carry a `z` column — the calibrated
+/// entry synthesizes its own reserved score column and refuses if a clashing
+/// one is present.
+fn build_dataset(x: &[f64], y: &[f64], score: &[f64], z: Option<&[f64]>) -> gam::data::EncodedDataset {
     let n = x.len();
+    assert_eq!(y.len(), n, "x/y length mismatch");
     assert_eq!(score.len(), n, "x/score length mismatch");
+    let mut headers = vec!["x".to_string(), "y".to_string(), "score".to_string()];
+    if z.is_some() {
+        headers.push("z".to_string());
+    }
+    let records: Vec<csv::StringRecord> = (0..n)
+        .map(|i| {
+            let mut cols = vec![
+                format!("{:.17e}", x[i]),
+                format!("{:.17e}", y[i]),
+                format!("{:.17e}", score[i]),
+            ];
+            if let Some(zc) = z {
+                cols.push(format!("{:.17e}", zc[i]));
+            }
+            csv::StringRecord::from(cols)
+        })
+        .collect();
+    encode_recordswith_inferred_schema(headers, records).expect("encode dataset")
+}
+
+/// The Stage-1 recipe shared by the orthogonalized arm: CTN of `score` on
+/// `s(x)` with a pinned response-basis size so `p_resp` (and hence `p₁`) is
+/// fold-invariant. `TransformationNormalConfig::default()` is the base; we pin
+/// `response_num_internal_knots` so the cross-fit refits at a fixed `(p_resp,
+/// p_cov)` (the cross-fitter freezes the covariate basis itself).
+fn stage1_recipe() -> CtnStage1Recipe {
+    let mut config = TransformationNormalConfig::default();
+    config.response_num_internal_knots = 6;
+    config.response_degree = 3;
+    CtnStage1Recipe {
+        response_column: "score".to_string(),
+        covariate_formula_rhs: COVARIATE_RHS.to_string(),
+        config,
+        weight_column: None,
+        offset_column: None,
+    }
+}
+
+/// Stage-2 marginal-slope `FitConfig` (binomial probit base; logslope surface
+/// `s(x)`). The orthogonalized arm additionally sets `ctn_stage1`.
+fn stage2_config(ctn_stage1: Option<CtnStage1Recipe>) -> FitConfig {
+    FitConfig {
+        family: Some("bernoulli-marginal-slope".to_string()),
+        logslope_formula: Some(LOGSLOPE_FORMULA.to_string()),
+        ctn_stage1,
+        ..FitConfig::default()
+    }
+}
+
+fn expect_bms(result: FitResult) -> BernoulliMarginalSlopeFitResult {
+    match result {
+        FitResult::BernoulliMarginalSlope(fit) => fit,
+        _ => panic!("expected a FitResult::BernoulliMarginalSlope from the marginal-slope chain"),
+    }
+}
+
+/// ORTHOGONALIZED arm — the shipped calibrated chain. Fits Stage-1 CTN from the
+/// recipe, cross-fits, installs the A2 absorber, returns the Stage-2 fit.
+fn fit_ortho(x: &[f64], y: &[f64], score: &[f64]) -> BernoulliMarginalSlopeFitResult {
+    let data = build_dataset(x, y, score, None);
+    let config = stage2_config(Some(stage1_recipe()));
+    let result = fit_calibrated_marginal_slope(STAGE2_FORMULA, &data, &config)
+        .expect("orthogonalized calibrated marginal-slope fit");
+    expect_bms(result)
+}
+
+/// NAIVE arm (control) — plain Stage-2 on a precomputed `z` column with no
+/// Stage-1 recipe ⇒ free-warp, no orthogonalization. `z` is the single
+/// full-data CTN score computed by [`full_data_ctn_z`].
+fn fit_naive(x: &[f64], y: &[f64], score: &[f64], z: &[f64]) -> BernoulliMarginalSlopeFitResult {
+    let data = build_dataset(x, y, score, Some(z));
+    let mut config = stage2_config(None);
+    config.z_column = Some("z".to_string());
+    let result =
+        fit_from_formula(STAGE2_FORMULA, &data, &config).expect("naive marginal-slope fit");
+    expect_bms(result)
+}
+
+/// The naive control's precomputed `z`: a single full-data CTN fit's in-sample
+/// latent score. We fit the CTN through the public formula path and read `z`
+/// from the §6 `score_influence_jacobian` API (computing `J` already runs the
+/// finite-support PIT, so `jac.z` is the single source of truth for `z` — no
+/// separate PIT reconstruction). This mirrors exactly what a user does when
+/// they hand a raw CTN score to Stage-2 without the calibrated chain.
+fn full_data_ctn_z(x: &[f64], score: &[f64]) -> Array1<f64> {
+    let n = x.len();
     let headers = vec!["x".to_string(), "score".to_string()];
     let records: Vec<csv::StringRecord> = (0..n)
         .map(|i| {
@@ -142,195 +224,43 @@ fn fit_ctn_stage1(x: &[f64], score: &[f64]) -> TransformationNormalFitResult {
         transformation_normal: true,
         ..FitConfig::default()
     };
-    let mut materialized =
-        materialize("score ~ s(x, k=8)", &ds, &cfg).expect("materialize CTN Stage-1");
+    let mut materialized = materialize(&format!("score ~ {COVARIATE_RHS}"), &ds, &cfg)
+        .expect("materialize CTN Stage-1");
     let FitRequest::TransformationNormal(ref mut req) = materialized.request else {
         panic!("expected a TransformationNormal fit request");
     };
     req.config.response_degree = 3;
     req.config.response_num_internal_knots = 6;
-
-    let result = fit_model(materialized.request).expect("fit CTN Stage-1");
+    let result =
+        gam::fit_model(materialized.request).expect("fit full-data CTN Stage-1");
     let FitResult::TransformationNormal(tn) = result else {
         panic!("expected a TransformationNormal fit result");
     };
-    tn
-}
 
-/// Build the covariate-design rows for a fitted CTN at the supplied `x`, using
-/// the FROZEN training-resolved covariate spec (so knots/centers match the fit
-/// exactly — this is the genuine out-of-sample evaluation basis).
-fn ctn_covariate_rows(tn: &TransformationNormalFitResult, x: &[f64]) -> Array2<f64> {
-    let n = x.len();
-    // Layout mirrors the [x, score] training columns; only column 0 (x) is read
-    // by `s(x)`, column 1 keeps the matrix width consistent for the design.
+    // Covariate design rows at the training x via the FROZEN resolved spec, so
+    // the geometry matches the fit exactly.
     let mut data = Array2::<f64>::zeros((n, 2));
     for i in 0..n {
         data[[i, 0]] = x[i];
     }
     let design = build_term_collection_design(data.view(), &tn.covariate_spec_resolved)
         .expect("build CTN covariate design from frozen spec");
-    design.design.to_dense()
-}
-
-/// Cross-fitted out-of-fold latent `z` and score-influence Jacobian
-/// `J = ∂z/∂θ₁` for a CTN Stage-1 → marginal-slope Stage-2 chain (design §4).
-///
-/// `k_folds` folds; for fold `f` the CTN is fit on the complement and `z`/`J`
-/// are evaluated on `f`, then scattered back into the original row order. The
-/// per-fold `J` is produced by the public `score_influence_jacobian` API
-/// (design §6); `z` is read from the same CTN via the documented finite-support
-/// PIT map. Returns `(z_oof, jac_oof)` with `z_oof.len() == n` and
-/// `jac_oof.nrows() == n`. (Per-fold `J` may differ in column count if the
-/// frozen Stage-1 dimensionality differs across folds; the chain here uses a
-/// fixed spec so `p₁` is constant.)
-struct CrossFitScoreZJac {
-    z_oof: Array1<f64>,
-    jac_oof: Array2<f64>,
-}
-
-fn crossfit_score_z_jacobian(x: &[f64], score: &[f64], k_folds: usize) -> CrossFitScoreZJac {
-    let n = x.len();
-    assert!(k_folds >= 2, "cross-fitting needs at least 2 folds");
-    let mut z_oof = Array1::<f64>::from_elem(n, f64::NAN);
-    // Discover p₁ from the first fold to size the J accumulator; deterministic
-    // because every fold uses the same frozen Stage-1 spec.
-    let mut jac_oof: Option<Array2<f64>> = None;
-
-    for f in 0..k_folds {
-        let mut train_x = Vec::new();
-        let mut train_score = Vec::new();
-        let mut test_idx = Vec::new();
-        for i in 0..n {
-            if i % k_folds == f {
-                test_idx.push(i);
-            } else {
-                train_x.push(x[i]);
-                train_score.push(score[i]);
-            }
-        }
-        let tn = fit_ctn_stage1(&train_x, &train_score);
-
-        let test_x: Vec<f64> = test_idx.iter().map(|&i| x[i]).collect();
-        let test_score = Array1::from_shape_fn(test_idx.len(), |row| score[test_idx[row]]);
-        let cov_rows = ctn_covariate_rows(&tn, &test_x);
-
-        // J = ∂z/∂θ₁ AND the latent z on the held-out fold come back together
-        // from the §6 API — computing J already runs the finite-support PIT, so
-        // `jac.z` is the single source of truth for the out-of-fold z (no
-        // separate PIT reconstruction, which would risk drifting from the
-        // exact transform the Jacobian differentiates).
-        let jac = score_influence_jacobian(&tn, &test_score, cov_rows.view())
-            .expect("Stage-1 score-influence Jacobian");
-        let p1 = jac.columns.ncols();
-        let acc = jac_oof.get_or_insert_with(|| Array2::<f64>::zeros((n, p1)));
-        assert_eq!(
-            acc.ncols(),
-            p1,
-            "cross-fit folds disagree on Stage-1 parameter dimension p₁"
-        );
-        for (row, &i) in test_idx.iter().enumerate() {
-            z_oof[i] = jac.z[row];
-            for c in 0..p1 {
-                acc[[i, c]] = jac.columns[[row, c]];
-            }
-        }
-    }
-
-    let jac_oof = jac_oof.expect("at least one fold produced a Jacobian");
-    assert!(
-        z_oof.iter().all(|v| v.is_finite()),
-        "cross-fit left an out-of-fold z unfilled"
-    );
-    CrossFitScoreZJac { z_oof, jac_oof }
+    let cov_rows = design.design.to_dense();
+    let score_arr = Array1::from_vec(score.to_vec());
+    let jac = score_influence_jacobian(&tn, &score_arr, cov_rows.view())
+        .expect("full-data Stage-1 score-influence Jacobian (for z)");
+    jac.z
 }
 
 // ---------------------------------------------------------------------------
-// Stage-2 (Bernoulli marginal-slope) — both arms, and β̂(x) readout.
+// β̂(x) and pointwise-variance readouts off the Stage-2 fit.
 // ---------------------------------------------------------------------------
 
-/// Build a `TermCollectionSpec` with a single penalized B-spline `s(x)`.
-fn xspline_spec(num_internal_knots: usize, data_range: (f64, f64)) -> TermCollectionSpec {
-    TermCollectionSpec {
-        linear_terms: vec![],
-        random_effect_terms: vec![],
-        smooth_terms: vec![SmoothTermSpec {
-            name: "f_x".to_string(),
-            basis: SmoothBasisSpec::BSpline1D {
-                feature_col: 0,
-                spec: BSplineBasisSpec {
-                    degree: 3,
-                    penalty_order: 2,
-                    knotspec: BSplineKnotSpec::Generate {
-                        data_range,
-                        num_internal_knots,
-                    },
-                    double_penalty: false,
-                    identifiability: Default::default(),
-                    boundary: OneDimensionalBoundary::Open,
-                    boundary_conditions: BSplineBoundaryConditions::default(),
-                },
-            },
-            shape: ShapeConstraint::None,
-            joint_null_rotation: None,
-        }],
-    }
-}
-
-/// Fit Stage 2. When `jacobian` is `Some(J)`, the out-of-fold Stage-1 score-
-/// influence Jacobian is wired into the spec's `score_influence_jacobian` field
-/// (the field takes the RAW `J`; the family forms the absorbed block
-/// `Z_infl = diag(s_f·β̂₀)·J` internally at its own rigid pilot, design §3) —
-/// the orthogonalized arm. When `None`, this is the naive arm. Both arms share
-/// the identical `z`, `x`, `y`, and term specs, so they differ ONLY by the
-/// projection — that isolation is the whole point of the control.
-fn fit_stage2(
-    x: &[f64],
-    z: &Array1<f64>,
-    y: &[f64],
-    x_range: (f64, f64),
-    jacobian: Option<Array2<f64>>,
-) -> BernoulliMarginalSlopeFitResult {
-    let n = x.len();
-    let mut data = Array2::<f64>::zeros((n, 1));
-    for i in 0..n {
-        data[[i, 0]] = x[i];
-    }
-    let y_arr = Array1::from_vec(y.to_vec());
-
-    let spec = BernoulliMarginalSlopeTermSpec {
-        y: y_arr,
-        weights: Array1::ones(n),
-        z: z.clone(),
-        base_link: InverseLink::Standard(StandardLink::Probit),
-        marginalspec: xspline_spec(8, x_range),
-        logslopespec: xspline_spec(8, x_range),
-        marginal_offset: Array1::zeros(n),
-        logslope_offset: Array1::zeros(n),
-        frailty: FrailtySpec::None,
-        score_warp: None,
-        link_dev: None,
-        latent_z_policy: LatentZPolicy::exploratory_fit_weighted(),
-        score_influence_jacobian: jacobian,
-    };
-
-    gam::families::bernoulli_marginal_slope::fit_bernoulli_marginal_slope_terms(
-        data.view(),
-        spec,
-        &BlockwiseFitOptions {
-            compute_covariance: true,
-            ..Default::default()
-        },
-        &SpatialLengthScaleOptimizationOptions::default(),
-        &ResourcePolicy::default_library(),
-    )
-    .expect("fit Bernoulli marginal-slope Stage 2")
-}
-
-/// Evaluate the fitted logslope surface `β̂(x)` at a fresh grid of covariate
-/// values. Reconstructed exactly as the family does (block 1 = logslope, see
-/// `bms/block_specs.rs`): `β̂(x_i) = baseline_logslope + logslope_offset_i +
-/// design(x_i)·β_logslope`, with the offset zero in these sims.
+/// Evaluate the fitted logslope surface `β̂(x)` at a fresh grid. Reconstructed
+/// exactly as the family does (block 1 = logslope, see `bms/block_specs.rs`):
+/// `β̂(x_i) = baseline_logslope + design(x_i)·β_logslope` (offset zero here).
+/// The A2 absorber columns ride the *marginal* block and are dropped at predict,
+/// so they never touch this logslope readout — valid for both arms.
 fn beta_of_x(fit: &BernoulliMarginalSlopeFitResult, x_grid: &[f64]) -> Vec<f64> {
     let n = x_grid.len();
     let mut data = Array2::<f64>::zeros((n, 1));
@@ -366,10 +296,10 @@ fn beta_of_x(fit: &BernoulliMarginalSlopeFitResult, x_grid: &[f64]) -> Vec<f64> 
 /// Interpretation: under a truly flat `β(x) ≡ const`, `β̂(x)` should vary across
 /// `x` only by sampling noise, so this ratio sits near its null band; an
 /// x-structured Stage-1 leakage inflates `Var_x(β̂(x))` well above that band —
-/// the false positive #461 is about. `σ̂_β²` is taken as the median across the
-/// grid of the per-point posterior variance of `β̂(x)`, propagated from the
-/// joint covariance through the logslope design (the same linear map used to
-/// evaluate `β̂(x)`), so the statistic is dimensionless and self-calibrating.
+/// the false positive #461 is about. `σ̂_β²` is the median across the grid of
+/// the per-point posterior variance of `β̂(x)`, propagated from the joint
+/// covariance through the logslope design, so the statistic is dimensionless
+/// and self-calibrating.
 fn spatial_heterogeneity_ratio(fit: &BernoulliMarginalSlopeFitResult, x_grid: &[f64]) -> f64 {
     let beta = beta_of_x(fit, x_grid);
     let m = beta.len() as f64;
@@ -382,8 +312,7 @@ fn spatial_heterogeneity_ratio(fit: &BernoulliMarginalSlopeFitResult, x_grid: &[
 
 /// Median over the grid of the pointwise posterior variance of `β̂(x)`:
 /// `r(x)ᵀ Σ_ℓℓ r(x)`, where `r(x)` is the logslope design row at `x` and `Σ_ℓℓ`
-/// is the logslope-block sub-covariance of the joint posterior. This is the
-/// natural sampling-noise scale for the spatial-variance numerator.
+/// is the logslope-block sub-covariance of the joint posterior.
 fn median_pointwise_beta_variance(fit: &BernoulliMarginalSlopeFitResult, x_grid: &[f64]) -> f64 {
     let n = x_grid.len();
     let mut data = Array2::<f64>::zeros((n, 1));
@@ -405,13 +334,13 @@ fn median_pointwise_beta_variance(fit: &BernoulliMarginalSlopeFitResult, x_grid:
     // width; using the widened count keeps the offset correct for both arms.
     let p_marginal = fit.fit.blocks[0].beta.len();
     // Vb (conditional posterior covariance Var(β | λ) = H⁻¹·φ̂) is the natural
-    // pointwise sampling-noise scale here; `compute_covariance: true` populates
-    // it on the Stage-2 fit.
+    // pointwise sampling-noise scale here; `compute_covariance: true` (set by
+    // the materializer) populates it on the Stage-2 fit.
     let cov = fit
         .fit
         .covariance_conditional
         .as_ref()
-        .expect("Stage-2 fit must carry a conditional covariance (compute_covariance: true)");
+        .expect("Stage-2 fit must carry a conditional covariance");
     assert!(
         cov.nrows() >= p_marginal + p_logslope,
         "joint covariance {}x{} too small for marginal({p_marginal})+logslope({p_logslope})",
@@ -443,8 +372,7 @@ fn median_pointwise_beta_variance(fit: &BernoulliMarginalSlopeFitResult, x_grid:
 //
 // TRUE β(x) ≡ constant, but Stage-1 is given an x-DEPENDENT miscalibration: the
 // continuous score's conditional SCALE is inflated for x in the right half of
-// the domain. The CTN, fit on the mis-scaled score, produces a z whose error
-// has x-structure. The naive Stage-2 projects that structured error onto β and
+// the domain. The naive arm projects that structured Stage-1 error onto β and
 // reports spurious spatial heterogeneity; the orthogonalized arm absorbs it.
 //
 // ASSERTION: the spatial-heterogeneity ratio of the NAIVE β̂(x) exceeds its null
@@ -486,11 +414,9 @@ fn sim_a_false_heterogeneity_is_controlled_by_orthogonalization() {
         y[i] = if rng_y.next_unit() < p { 1.0 } else { 0.0 };
     }
 
-    let x_range = (0.0, 1.0);
-    let cf = crossfit_score_z_jacobian(&x, &score, 5);
-
-    let naive = fit_stage2(&x, &cf.z_oof, &y, x_range, None);
-    let ortho = fit_stage2(&x, &cf.z_oof, &y, x_range, Some(cf.jac_oof.clone()));
+    let z_naive = full_data_ctn_z(&x, &score);
+    let naive = fit_naive(&x, &y, &score, z_naive.as_slice().expect("contiguous z"));
+    let ortho = fit_ortho(&x, &y, &score);
 
     // Evaluation grid spanning the domain.
     let grid: Vec<f64> = (0..41).map(|k| k as f64 / 40.0).collect();
@@ -532,8 +458,6 @@ fn sim_a_false_heterogeneity_is_controlled_by_orthogonalization() {
 // dependent miscalibration). The orthogonalized projection must not eat the
 // real signal: its RMSE to the true β(x) must be within a tight tolerance of
 // the naive arm's RMSE.
-//
-// ASSERTION: |RMSE_ortho − RMSE_naive| small AND RMSE_ortho ≤ (1 + ε)·RMSE_naive.
 // ===========================================================================
 #[test]
 fn sim_b_orthogonalization_preserves_real_heterogeneity_signal() {
@@ -550,10 +474,9 @@ fn sim_b_orthogonalization_preserves_real_heterogeneity_signal() {
         let xi = rng.next_unit();
         let wi = rng.next_normal();
         // Well-calibrated Stage-1: constant unit conditional scale.
-        let score_i = 3.0 + 2.0 * xi + wi;
         x[i] = xi;
         w[i] = wi;
-        score[i] = score_i;
+        score[i] = 3.0 + 2.0 * xi + wi;
     }
     let mut rng_y = SplitMix64::new(0xB0B0_2026_0461_0002);
     let mut y = vec![0.0; N];
@@ -564,26 +487,20 @@ fn sim_b_orthogonalization_preserves_real_heterogeneity_signal() {
         y[i] = if rng_y.next_unit() < p { 1.0 } else { 0.0 };
     }
 
-    let x_range = (0.0, 1.0);
-    let cf = crossfit_score_z_jacobian(&x, &score, 5);
-
-    let naive = fit_stage2(&x, &cf.z_oof, &y, x_range, None);
-    let ortho = fit_stage2(&x, &cf.z_oof, &y, x_range, Some(cf.jac_oof.clone()));
+    let z_naive = full_data_ctn_z(&x, &score);
+    let naive = fit_naive(&x, &y, &score, z_naive.as_slice().expect("contiguous z"));
+    let ortho = fit_ortho(&x, &y, &score);
 
     let grid: Vec<f64> = (0..41).map(|k| k as f64 / 40.0).collect();
     let truth: Vec<f64> = grid.iter().map(|&g| beta_fn(g)).collect();
 
-    // The latent z is on a standardized scale (CTN gaussianizes the score to
-    // N(0,1)); the fitted β̂(x) recovers the slope up to the constant rescaling
-    // between the standardized z and the unit-variance driver w. Both arms
-    // share the same z, so the rescaling is identical and cancels in the
-    // RMSE COMPARISON — which is what Sim B asserts (ortho vs naive), not the
-    // absolute slope value.
+    // The latent z is on a standardized scale (CTN gaussianizes the score);
+    // β̂(x) recovers the slope up to a constant rescaling between standardized z
+    // and the unit-variance driver w. Align each arm to the truth by its own
+    // best least-squares scale+shift so the RMSE measures SHAPE recovery on a
+    // common footing — Sim B asserts ortho-vs-naive, not the absolute slope.
     let beta_naive = beta_of_x(&naive, &grid);
     let beta_ortho = beta_of_x(&ortho, &grid);
-
-    // Align each arm to the truth by its own best least-squares scale+shift, so
-    // the RMSE measures SHAPE recovery on a common footing for both arms.
     let rmse_naive = rmse_after_affine_align(&beta_naive, &truth);
     let rmse_ortho = rmse_after_affine_align(&beta_ortho, &truth);
 
@@ -612,26 +529,21 @@ fn sim_b_orthogonalization_preserves_real_heterogeneity_signal() {
 //
 // True β(x) ≡ const (so θ = E_x[β(x)] = β_true is a clean scalar target). We
 // build TWO Stage-1 score representations on the same outcome/covariate data:
-//   * a CALIBRATED z — Stage 1 fit on a correctly-scaled score (oracle), and
-//   * a MISCALIBRATED OOF z — Stage 1 fit on the x-dependently mis-scaled score
-//     (the Sim-A leakage).
+//   * a CALIBRATED score — correctly scaled (oracle), and
+//   * a MISCALIBRATED score — x-dependently mis-scaled (the Sim-A leakage).
 // A Neyman-orthogonal estimator's scalar target must be STABLE across these two
 // (first-order insensitive to first-stage error); a non-orthogonal one shifts.
 //
 // To stay SCALE-CORRECT (gam's θ̂ is on the probit-index scale; DoubleML's PLR
-// θ̂ is on the linear-probability scale — they are different estimands and must
-// never be compared as point values), each estimator is judged on ITS OWN
-// scale by its *miscalibration-induced relative shift*
-//     Δ = |θ̂_miscal − θ̂_calib| / |θ̂_calib|.
-// The DML library supplies the reference orthogonal Δ_dml. The assertions:
+// θ̂ is on the linear-probability scale — different estimands, never compared as
+// point values), each estimator is judged on ITS OWN scale by its
+// *miscalibration-induced relative shift* Δ = |θ̂_miscal − θ̂_calib| / |θ̂_calib|.
+// The DML library supplies the reference orthogonal Δ_dml. Assertions:
 //   * gam ORTHOGONALIZED Δ_ortho ≲ Δ_dml (match-or-beat the mature orthogonal
 //     baseline's robustness to first-stage error), and
-//   * gam NAIVE Δ_naive ≫ Δ_ortho (the naive target really is biased by the
-//     x-structured leakage).
+//   * gam NAIVE Δ_naive ≫ Δ_ortho (the naive target really is biased).
 //
-// Skips with a clear message when no DML backend is importable (heavier
-// optional dependency); the gam-side naive-vs-ortho contrast still runs
-// unconditionally in Sim A.
+// Skips with a clear message when no DML backend is importable.
 // ===========================================================================
 #[test]
 fn sim_c_scalar_target_matches_dml_reference_under_miscalibration() {
@@ -665,42 +577,43 @@ fn sim_c_scalar_target_matches_dml_reference_under_miscalibration() {
         y[i] = if rng_y.next_unit() < p { 1.0 } else { 0.0 };
     }
 
-    let x_range = (0.0, 1.0);
     let grid: Vec<f64> = (0..101).map(|k| k as f64 / 100.0).collect();
 
-    // Cross-fit each Stage-1 score representation ONCE, then read off both the
-    // naive and orthogonalized scalar targets θ̂ = E_x[β̂(x)] from the shared z/J.
-    let cf_calib = crossfit_score_z_jacobian(&x, &score_calib, 5);
-    let cf_miscal = crossfit_score_z_jacobian(&x, &score_miscal, 5);
-
-    let theta_pair = |cf: &CrossFitScoreZJac| -> (f64, f64) {
-        let naive = fit_stage2(&x, &cf.z_oof, &y, x_range, None);
-        let theta_naive = mean(&beta_of_x(&naive, &grid));
-        let ortho = fit_stage2(&x, &cf.z_oof, &y, x_range, Some(cf.jac_oof.clone()));
-        let theta_ortho = mean(&beta_of_x(&ortho, &grid));
-        (theta_naive, theta_ortho)
+    // θ̂ = E_x[β̂(x)] for each (score representation, arm).
+    let theta_naive_for = |score: &[f64]| -> f64 {
+        let z = full_data_ctn_z(&x, score);
+        let fit = fit_naive(&x, &y, score, z.as_slice().expect("contiguous z"));
+        mean(&beta_of_x(&fit, &grid))
+    };
+    let theta_ortho_for = |score: &[f64]| -> f64 {
+        let fit = fit_ortho(&x, &y, score);
+        mean(&beta_of_x(&fit, &grid))
     };
 
-    let (theta_naive_calib, theta_ortho_calib) = theta_pair(&cf_calib);
-    let (theta_naive_miscal, theta_ortho_miscal) = theta_pair(&cf_miscal);
+    let theta_naive_calib = theta_naive_for(&score_calib);
+    let theta_naive_miscal = theta_naive_for(&score_miscal);
+    let theta_ortho_calib = theta_ortho_for(&score_calib);
+    let theta_ortho_miscal = theta_ortho_for(&score_miscal);
 
     let rel_shift =
         |miscal: f64, calib: f64| -> f64 { (miscal - calib).abs() / calib.abs().max(1e-9) };
     let delta_naive = rel_shift(theta_naive_miscal, theta_naive_calib);
     let delta_ortho = rel_shift(theta_ortho_miscal, theta_ortho_calib);
 
-    // DML reference: the cross-fitted z is the treatment D, x the confounder.
-    // Run it on BOTH the calibrated and miscalibrated z to read off the mature
+    // DML reference: the full-data CTN score is the treatment D, x the
+    // confounder. Run it on BOTH score representations to read off the mature
     // orthogonal estimator's own relative shift Δ_dml.
+    let z_calib = full_data_ctn_z(&x, &score_calib);
+    let z_miscal = full_data_ctn_z(&x, &score_miscal);
     let dml_calib = dml_partial_linear_reference(
         &y,
-        cf_calib.z_oof.as_slice().expect("contiguous calibrated z"),
+        z_calib.as_slice().expect("contiguous calibrated z"),
         &[Column::new("x", &x)],
         5,
     );
     let dml_miscal = dml_partial_linear_reference(
         &y,
-        cf_miscal.z_oof.as_slice().expect("contiguous miscalibrated z"),
+        z_miscal.as_slice().expect("contiguous miscalibrated z"),
         &[Column::new("x", &x)],
         5,
     );
@@ -717,8 +630,8 @@ fn sim_c_scalar_target_matches_dml_reference_under_miscalibration() {
     let delta_dml = rel_shift(dml_miscal.theta, dml_calib.theta);
 
     // (1) gam's orthogonalized target must match-or-beat the mature DML
-    // estimator's robustness to first-stage error (a small slack accounts for
-    // Monte-Carlo noise in the two independent reference fits).
+    // estimator's robustness to first-stage error (small slack for Monte-Carlo
+    // noise across the two independent reference fits).
     assert!(
         delta_ortho <= delta_dml + 0.05,
         "Sim C ({backend}): orthogonalized θ̂ shifted by Δ_ortho={delta_ortho:.4} under \
@@ -730,8 +643,7 @@ fn sim_c_scalar_target_matches_dml_reference_under_miscalibration() {
         tm = theta_ortho_miscal,
     );
     // (2) The naive target really is biased by the leakage: its relative shift
-    // is much larger than the orthogonalized arm's. This is the gam-side bias
-    // witness that makes the orthogonality non-trivial.
+    // is much larger than the orthogonalized arm's.
     assert!(
         delta_naive > 2.0 * delta_ortho + 0.02,
         "Sim C: naive θ̂ should be visibly biased by the x-structured Stage-1 \
@@ -772,18 +684,17 @@ fn rmse_after_affine_align(a: &[f64], b: &[f64]) -> f64 {
 // §6 helper contract — `influence_block_design`.
 // ===========================================================================
 //
-// The orthogonalized Stage-2 arm above passes the RAW out-of-fold `J` through
-// the spec field and lets the family form `Z_infl = diag(s_f·β̂₀)·J` internally.
-// This focused test pins the public `influence_block_design` helper (design §6)
-// against its documented closed form (design §3): row `i`, column `k` of the
-// absorbed block must equal `s_f · β̂₀(x_i) · J[i,k]`. This is exact math, not a
-// tool comparison — it validates the building block the workflow's internal
-// path is expected to reproduce.
+// The orthogonalized arm above absorbs the Stage-1 influence directions
+// internally; this focused test pins the public `influence_block_design` helper
+// (design §6) against its documented closed form (design §3): row `i`, column
+// `k` of the absorbed block must equal `s_f · β̂₀(x_i) · J[i,k]`. Exact math, not
+// a tool comparison — it validates the building block the A2 absorber uses.
 #[test]
 fn influence_block_design_is_diag_scaled_jacobian() {
     let n = 6;
     let p1 = 3;
-    let jac_cols = Array2::from_shape_fn((n, p1), |(i, k)| (i as f64 + 1.0) * 0.1 - (k as f64) * 0.07);
+    let jac_cols =
+        Array2::from_shape_fn((n, p1), |(i, k)| (i as f64 + 1.0) * 0.1 - (k as f64) * 0.07);
     let pilot_beta0 = Array1::from_shape_fn(n, |i| 0.3 + 0.2 * (i as f64) - 0.05 * (i * i) as f64);
     let s_f = 1.7_f64;
 

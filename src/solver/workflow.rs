@@ -3033,15 +3033,37 @@ pub fn fit_calibrated_marginal_slope(
     data: &Dataset,
     config: &FitConfig,
 ) -> Result<FitResult, WorkflowError> {
-    let recipe = config.ctn_stage1.as_ref().ok_or_else(|| WorkflowError::InvalidConfig {
-        reason: "fit_calibrated_marginal_slope requires config.ctn_stage1 to be set; \
-                 for a raw z-column (no Stage-1 chain) call fit_from_formula directly"
-            .to_string(),
-    })?;
+    let (augmented, stage2_config) = prepare_calibrated_marginal_slope_stage2(data, config)?;
+    fit_from_formula(stage2_formula, &augmented, &stage2_config)
+}
+
+/// Stage-1 preparation for the calibrated marginal-slope chain, shared by the
+/// in-process [`fit_calibrated_marginal_slope`] entry point and the FFI
+/// (`gam-pyffi::fit_dataset_impl`) so both produce an identical Stage-2 setup.
+///
+/// Requires `config.ctn_stage1` to be set (the auto-enable signal). Fits the
+/// Stage-1 CTN once on the full data from that recipe, reads its in-sample latent
+/// score, returns a copy of `data` with that score appended as the reserved
+/// [`CALIBRATED_SLOPE_Z_COLUMN`], plus a Stage-2 config that points `z_column` at
+/// it (and keeps `ctn_stage1` so the materializer cross-fits and replaces the
+/// in-sample score with the out-of-fold one). The caller then runs the ordinary
+/// marginal-slope materialize → fit path against the returned dataset + config.
+pub fn prepare_calibrated_marginal_slope_stage2(
+    data: &Dataset,
+    config: &FitConfig,
+) -> Result<(Dataset, FitConfig), WorkflowError> {
+    let recipe = config
+        .ctn_stage1
+        .as_ref()
+        .ok_or_else(|| WorkflowError::InvalidConfig {
+            reason: "calibrated marginal-slope chain requires config.ctn_stage1 to be set; \
+                     for a raw z-column (no Stage-1 chain) call fit_from_formula directly"
+                .to_string(),
+        })?;
 
     if config.transformation_normal {
         return Err(WorkflowError::InvalidConfig {
-            reason: "fit_calibrated_marginal_slope expects a Stage-2 marginal-slope config; \
+            reason: "calibrated marginal-slope chain expects a Stage-2 marginal-slope config; \
                      `transformation_normal` describes Stage-1 and must be carried on \
                      config.ctn_stage1, not set on the Stage-2 config"
                 .to_string(),
@@ -3072,7 +3094,7 @@ pub fn fit_calibrated_marginal_slope(
     let mut stage2_config = config.clone();
     stage2_config.z_column = Some(CALIBRATED_SLOPE_Z_COLUMN.to_string());
 
-    fit_from_formula(stage2_formula, &augmented, &stage2_config)
+    Ok((augmented, stage2_config))
 }
 
 /// Fit the Stage-1 CTN on the full data from a [`CtnStage1Recipe`] and return its
