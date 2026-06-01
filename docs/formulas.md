@@ -201,21 +201,36 @@ zero, which makes the operator-collocation penalty non-invertible.
 
 ### Duchon (`duchon`)
 
-Radial basis with triple-operator regularization (mass + tension +
-stiffness). Scale-free unless `length_scale` is given.
+Radial basis (cubic `r³` polyharmonic by default) with a **Hilbert-scale
+penalty** — a stack of pure *function* penalties, each its own REML smoothing
+parameter:
+
+- **curvature** — the exact RKHS reproducing-norm Gram (the `bs="ds"` penalty),
+  centers-space, independent of `n`;
+- **trend** — a global-slope ridge on the affine null space (so only the global
+  mean stays free);
+- **mass** `Σ(f−f̄)²` (amplitude) and **tension** `Σ‖∇f‖²` (first-order
+  roughness) — collocated on a density-blind, space-filling `O(k)` sample of the
+  *data support* (these orders have no convergent continuous integral for the
+  polyharmonic kernel, so the support quadrature *is* the penalty; cost is `O(k)`
+  in `n`, not the sparse-center collocation that under-resolves the basis).
+
+All four are **on by default**; REML drives any the data don't support toward
+zero (recover the null by default; opt into overfitting). Scale-free unless
+`length_scale` is given.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `order` | `0`, auto-escalated when required | Polynomial nullspace order `p`. Polynomial block has `C(d + p, d)` columns (`p=0` → constant only, `p=1` (Linear) → `d+1` columns, `p=2` → `(d+1)(d+2)/2`). |
-| `power` | auto | Riesz fractional smoothness `s`. Auto-resolved against `d` and the active operator penalties. |
+| `order` | `1` (Linear, affine null space) | Polynomial nullspace order `p`. Polynomial block has `C(d + p, d)` columns (`p=0` → constant only, `p=1` (Linear) → `d+1` columns, `p=2` → `(d+1)(d+2)/2`). |
+| `power` | cubic default `s = (d−1)/2` | Riesz fractional smoothness `s`. The default gives `φ(r)=r³` in every dimension; an explicit value (e.g. `power=0` → `r²·log r` thin-plate in even `d`) is honored verbatim. |
 | `centers` (`k`, `basis_dim`) | auto | Number of centres. |
 | `length_scale` | none (scale-free) | Optional global scale. Without it, the kernel is pure polyharmonic; with it, the kernel is the hybrid Duchon-Matérn (κ = 1/length_scale). |
-| `scale_dims` | `false` | Per-axis contrasts. |
+| `scale_dims` | `false` | Per-axis anisotropy contrasts (ARD). |
 | `periodic`, `period`, `period_start`, `period_end` | — | 1-D cyclic Duchon (see below). |
 
-`duchon()` rejects `double_penalty`; the three operator penalties
-(mass, tension, stiffness) each get their own smoothing parameter
-under REML.
+`duchon()` rejects `double_penalty` — the Hilbert-scale penalty (curvature +
+trend + mass + tension) is built in, each block with its own REML smoothing
+parameter, and REML deselects unhelpful ones.
 
 ### Sphere (`sphere`, `sos`, `spherical`) {#intrinsic-s2-sphere-smooth}
 
