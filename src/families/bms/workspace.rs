@@ -11543,7 +11543,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         // O(n · (p_marginal + p_logslope + p_flex)) per call. Only fall back
         // to the dense `n · (Σ p_b)²` build when `use_joint_matrix_free_path`
         // declines the operator path.
-        crate::families::coefficient_cost::joint_coupled_operator_aware_hessian_cost(
+        crate::families::location_scale_engine::location_scale_coefficient_hessian_cost(
             self.y.len() as u64,
             specs,
         )

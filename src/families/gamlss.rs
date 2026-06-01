@@ -484,13 +484,101 @@ fn locscale_joint_psi_direction_parts(
 /// shape. Returns `(action, dense_matrix)` — at most one is `Some`, both
 /// are `None` for the `Zero` variant, and the `First` variant produces an
 /// error (`_psi_psi_map` should never return `First` here).
+
+/// Shared second-derivative design drift assembly for two-axis location-scale
+/// joint-ψ paths. The family-specific methods differ only by block constants,
+/// labels, and field names; the ψψ map lookup and `X_{ab} β` action are the
+/// same for Gaussian/Binomial and wiggle/non-wiggle variants.
+struct LocScalePsiDriftConfig<'a> {
+    n: usize,
+    p_primary: usize,
+    p_log_sigma: usize,
+    primary_block_idx: usize,
+    log_sigma_block_idx: usize,
+    family_name: &'a str,
+    primary_label: &'a str,
+    policy: &'a crate::resource::ResourcePolicy,
+}
+
+fn locscale_joint_psisecond_design_drifts(
+    block_states: &[ParameterBlockState],
+    derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+    psi_a: &LocationScaleJointPsiDirection,
+    psi_b: &LocationScaleJointPsiDirection,
+    cfg: LocScalePsiDriftConfig<'_>,
+) -> Result<LocationScaleJointPsiSecondDrifts, String> {
+    let beta_primary = &block_states[cfg.primary_block_idx].beta;
+    let beta_log_sigma = &block_states[cfg.log_sigma_block_idx].beta;
+    let mut primary_ab_action = None;
+    let mut log_sigma_ab_action = None;
+    let mut primary_ab = None;
+    let mut log_sigma_ab = None;
+
+    // Smooth ψ second derivatives are block-local. Cross-block ψ_a/ψ_b
+    // design second derivatives are therefore zero unless the derivative
+    // payload itself supplies them for the same moving block.
+    if psi_a.block_idx == psi_b.block_idx {
+        let deriv = &derivative_blocks[psi_a.block_idx][psi_a.local_idx];
+        let deriv_b = &derivative_blocks[psi_b.block_idx][psi_b.local_idx];
+        if psi_a.block_idx == cfg.primary_block_idx {
+            let (action, matrix) = psi_psi_map_to_drift_slots(
+                deriv,
+                deriv_b,
+                psi_b.local_idx,
+                cfg.n,
+                cfg.p_primary,
+                &format!("{} {}", cfg.family_name, cfg.primary_label),
+                cfg.policy,
+            )?;
+            primary_ab_action = action;
+            primary_ab = matrix;
+        } else if psi_a.block_idx == cfg.log_sigma_block_idx {
+            let (action, matrix) = psi_psi_map_to_drift_slots(
+                deriv,
+                deriv_b,
+                psi_b.local_idx,
+                cfg.n,
+                cfg.p_log_sigma,
+                &format!("{} log-sigma", cfg.family_name),
+                cfg.policy,
+            )?;
+            log_sigma_ab_action = action;
+            log_sigma_ab = matrix;
+        }
+    }
+
+    let z_primary_ab = second_psi_linear_map(
+        primary_ab_action.as_ref(),
+        primary_ab.as_ref(),
+        cfg.n,
+        cfg.p_primary,
+    )
+    .forward_mul(beta_primary.view());
+    let z_ls_ab = second_psi_linear_map(
+        log_sigma_ab_action.as_ref(),
+        log_sigma_ab.as_ref(),
+        cfg.n,
+        cfg.p_log_sigma,
+    )
+    .forward_mul(beta_log_sigma.view());
+
+    Ok(LocationScaleJointPsiSecondDrifts {
+        x_primary_ab_action: primary_ab_action,
+        x_ls_ab_action: log_sigma_ab_action,
+        x_primary_ab: primary_ab,
+        x_ls_ab: log_sigma_ab,
+        z_primary_ab,
+        z_ls_ab,
+    })
+}
+
 fn psi_psi_map_to_drift_slots(
     deriv: &crate::custom_family::CustomFamilyBlockPsiDerivative,
     deriv_b: &crate::custom_family::CustomFamilyBlockPsiDerivative,
     local_idx_b: usize,
     n: usize,
     p: usize,
-    label: &'static str,
+    label: &str,
     policy: &crate::resource::ResourcePolicy,
 ) -> Result<
     (
@@ -5543,21 +5631,21 @@ impl Clone for GaussianLocationScaleFamily {
     }
 }
 
-struct GaussianLocationScaleJointPsiDirection {
+struct LocationScaleJointPsiDirection {
     block_idx: usize,
     local_idx: usize,
-    xmu_psi: PsiDesignMap,
+    x_primary_psi: PsiDesignMap,
     x_ls_psi: PsiDesignMap,
-    zmu_psi: Array1<f64>,
+    z_primary_psi: Array1<f64>,
     z_ls_psi: Array1<f64>,
 }
 
-struct GaussianLocationScaleJointPsiSecondDrifts {
-    xmu_ab_action: Option<CustomFamilyPsiSecondDesignAction>,
+struct LocationScaleJointPsiSecondDrifts {
+    x_primary_ab_action: Option<CustomFamilyPsiSecondDesignAction>,
     x_ls_ab_action: Option<CustomFamilyPsiSecondDesignAction>,
-    xmu_ab: Option<Array2<f64>>,
+    x_primary_ab: Option<Array2<f64>>,
     x_ls_ab: Option<Array2<f64>>,
-    zmu_ab: Array1<f64>,
+    z_primary_ab: Array1<f64>,
     z_ls_ab: Array1<f64>,
 }
 
@@ -5623,7 +5711,7 @@ trait LocationScaleJointPsiFamily: Clone + Send + Sync + 'static {
 }
 
 impl LocationScaleJointPsiFamily for GaussianLocationScaleFamily {
-    type Direction = GaussianLocationScaleJointPsiDirection;
+    type Direction = LocationScaleJointPsiDirection;
     const LABEL: &'static str = "GaussianLocationScaleFamily";
 
     fn ws_policy(&self) -> &crate::resource::ResourcePolicy {
@@ -5645,7 +5733,7 @@ impl LocationScaleJointPsiFamily for GaussianLocationScaleFamily {
         design_loc: &Array2<f64>,
         design_scale: &Array2<f64>,
         policy: &crate::resource::ResourcePolicy,
-    ) -> Result<Option<GaussianLocationScaleJointPsiDirection>, String> {
+    ) -> Result<Option<LocationScaleJointPsiDirection>, String> {
         self.exact_newton_joint_psi_direction(
             block_states,
             derivative_blocks,
@@ -5660,8 +5748,8 @@ impl LocationScaleJointPsiFamily for GaussianLocationScaleFamily {
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
-        psi_a: &GaussianLocationScaleJointPsiDirection,
-        psi_b: &GaussianLocationScaleJointPsiDirection,
+        psi_a: &LocationScaleJointPsiDirection,
+        psi_b: &LocationScaleJointPsiDirection,
         design_loc: &Array2<f64>,
         design_scale: &Array2<f64>,
         subsample: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
@@ -5680,7 +5768,7 @@ impl LocationScaleJointPsiFamily for GaussianLocationScaleFamily {
     fn ws_psi_hessian_directional_from_parts(
         &self,
         block_states: &[ParameterBlockState],
-        psi_dir: &GaussianLocationScaleJointPsiDirection,
+        psi_dir: &LocationScaleJointPsiDirection,
         d_beta_flat: &Array1<f64>,
         design_loc: &Array2<f64>,
         design_scale: &Array2<f64>,
@@ -5698,7 +5786,7 @@ impl LocationScaleJointPsiFamily for GaussianLocationScaleFamily {
 }
 
 impl LocationScaleJointPsiFamily for GaussianLocationScaleWiggleFamily {
-    type Direction = GaussianLocationScaleJointPsiDirection;
+    type Direction = LocationScaleJointPsiDirection;
     const LABEL: &'static str = "GaussianLocationScaleWiggleFamily";
 
     fn ws_policy(&self) -> &crate::resource::ResourcePolicy {
@@ -5720,7 +5808,7 @@ impl LocationScaleJointPsiFamily for GaussianLocationScaleWiggleFamily {
         design_loc: &Array2<f64>,
         design_scale: &Array2<f64>,
         policy: &crate::resource::ResourcePolicy,
-    ) -> Result<Option<GaussianLocationScaleJointPsiDirection>, String> {
+    ) -> Result<Option<LocationScaleJointPsiDirection>, String> {
         self.exact_newton_joint_psi_direction(
             block_states,
             derivative_blocks,
@@ -5735,8 +5823,8 @@ impl LocationScaleJointPsiFamily for GaussianLocationScaleWiggleFamily {
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
-        psi_a: &GaussianLocationScaleJointPsiDirection,
-        psi_b: &GaussianLocationScaleJointPsiDirection,
+        psi_a: &LocationScaleJointPsiDirection,
+        psi_b: &LocationScaleJointPsiDirection,
         design_loc: &Array2<f64>,
         design_scale: &Array2<f64>,
         outer_rows: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
@@ -5774,7 +5862,7 @@ impl LocationScaleJointPsiFamily for GaussianLocationScaleWiggleFamily {
     fn ws_psi_hessian_directional_from_parts(
         &self,
         block_states: &[ParameterBlockState],
-        psi_dir: &GaussianLocationScaleJointPsiDirection,
+        psi_dir: &LocationScaleJointPsiDirection,
         d_beta_flat: &Array1<f64>,
         design_loc: &Array2<f64>,
         design_scale: &Array2<f64>,
@@ -5877,7 +5965,9 @@ impl<F: LocationScaleJointPsiFamily> LocationScaleJointPsiWorkspace<F> {
         })
     }
 
-    fn subsample_rows(&self) -> Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]> {
+    fn subsample_rows(
+        &self,
+    ) -> Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]> {
         self.outer_score_subsample
             .as_ref()
             .map(|s| s.rows.as_ref().as_slice())
@@ -7267,7 +7357,7 @@ impl GaussianLocationScaleFamily {
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
         policy: &crate::resource::ResourcePolicy,
-    ) -> Result<Option<GaussianLocationScaleJointPsiDirection>, String> {
+    ) -> Result<Option<LocationScaleJointPsiDirection>, String> {
         let Some(parts) = locscale_joint_psi_direction_parts(
             block_states,
             derivative_blocks,
@@ -7285,12 +7375,12 @@ impl GaussianLocationScaleFamily {
         else {
             return Ok(None);
         };
-        Ok(Some(GaussianLocationScaleJointPsiDirection {
+        Ok(Some(LocationScaleJointPsiDirection {
             block_idx: parts.block_idx,
             local_idx: parts.local_idx,
-            zmu_psi: parts.primary_z,
+            z_primary_psi: parts.primary_z,
             z_ls_psi: parts.log_sigma_z,
-            xmu_psi: parts.primary_psi,
+            x_primary_psi: parts.primary_psi,
             x_ls_psi: parts.log_sigma_psi,
         }))
     }
@@ -7299,65 +7389,27 @@ impl GaussianLocationScaleFamily {
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
-        psi_a: &GaussianLocationScaleJointPsiDirection,
-        psi_b: &GaussianLocationScaleJointPsiDirection,
+        psi_a: &LocationScaleJointPsiDirection,
+        psi_b: &LocationScaleJointPsiDirection,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
-    ) -> Result<GaussianLocationScaleJointPsiSecondDrifts, String> {
-        let n = self.y.len();
-        let pmu = xmu.ncols();
-        let p_ls = x_ls.ncols();
-        let betamu = &block_states[Self::BLOCK_MU].beta;
-        let beta_ls = &block_states[Self::BLOCK_LOG_SIGMA].beta;
-        let mut xmu_ab = None;
-        let mut x_ls_ab = None;
-        let mut xmu_ab_action = None;
-        let mut x_ls_ab_action = None;
-        if psi_a.block_idx == psi_b.block_idx {
-            let deriv = &derivative_blocks[psi_a.block_idx][psi_a.local_idx];
-            let deriv_b = &derivative_blocks[psi_b.block_idx][psi_b.local_idx];
-            match psi_a.block_idx {
-                Self::BLOCK_MU => {
-                    let (action, matrix) = psi_psi_map_to_drift_slots(
-                        deriv,
-                        deriv_b,
-                        psi_b.local_idx,
-                        n,
-                        pmu,
-                        "GaussianLocationScaleFamily mu",
-                        &self.policy,
-                    )?;
-                    xmu_ab_action = action;
-                    xmu_ab = matrix;
-                }
-                Self::BLOCK_LOG_SIGMA => {
-                    let (action, matrix) = psi_psi_map_to_drift_slots(
-                        deriv,
-                        deriv_b,
-                        psi_b.local_idx,
-                        n,
-                        p_ls,
-                        "GaussianLocationScaleFamily log-sigma",
-                        &self.policy,
-                    )?;
-                    x_ls_ab_action = action;
-                    x_ls_ab = matrix;
-                }
-                _ => {}
-            }
-        }
-        let zmu_ab = second_psi_linear_map(xmu_ab_action.as_ref(), xmu_ab.as_ref(), n, pmu)
-            .forward_mul(betamu.view());
-        let z_ls_ab = second_psi_linear_map(x_ls_ab_action.as_ref(), x_ls_ab.as_ref(), n, p_ls)
-            .forward_mul(beta_ls.view());
-        Ok(GaussianLocationScaleJointPsiSecondDrifts {
-            xmu_ab_action,
-            x_ls_ab_action,
-            xmu_ab,
-            x_ls_ab,
-            zmu_ab,
-            z_ls_ab,
-        })
+    ) -> Result<LocationScaleJointPsiSecondDrifts, String> {
+        locscale_joint_psisecond_design_drifts(
+            block_states,
+            derivative_blocks,
+            psi_a,
+            psi_b,
+            LocScalePsiDriftConfig {
+                n: self.y.len(),
+                p_primary: xmu.ncols(),
+                p_log_sigma: x_ls.ncols(),
+                primary_block_idx: Self::BLOCK_MU,
+                log_sigma_block_idx: Self::BLOCK_LOG_SIGMA,
+                family_name: "GaussianLocationScaleFamily",
+                primary_label: "mu",
+                policy: &self.policy,
+            },
+        )
     }
 
     fn exact_newton_joint_psi_terms_from_designs(
@@ -7430,9 +7482,10 @@ impl GaussianLocationScaleFamily {
         let etamu = &block_states[Self::BLOCK_MU].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         let rows = self.get_or_compute_row_scalars(etamu, eta_ls)?;
-        let weights_a = gaussian_joint_psi_firstweights(&rows, &dir_a.zmu_psi, &dir_a.z_ls_psi);
+        let weights_a =
+            gaussian_joint_psi_firstweights(&rows, &dir_a.z_primary_psi, &dir_a.z_ls_psi);
         let objective_psi = weights_a.objective_psirow.sum();
-        let xmu_map = dir_a.xmu_psi.as_linear_map_ref();
+        let xmu_map = dir_a.x_primary_psi.as_linear_map_ref();
         let x_ls_map = dir_a.x_ls_psi.as_linear_map_ref();
         let score_mu =
             xmu_map.transpose_mul(weights_a.scoremu.view()) + fast_atv(xmu, &weights_a.dscoremu);
@@ -7440,7 +7493,7 @@ impl GaussianLocationScaleFamily {
             + fast_atv(x_ls, &weights_a.dscore_ls);
         let score_psi = gaussian_pack_joint_score(&score_mu, &score_ls);
         let hessian_psi_operator = build_two_block_custom_family_joint_psi_operator_from_actions(
-            dir_a.xmu_psi.cloned_first_action(),
+            dir_a.x_primary_psi.cloned_first_action(),
             dir_a.x_ls_psi.cloned_first_action(),
             0..xmu.ncols(),
             xmu.ncols()..xmu.ncols() + x_ls.ncols(),
@@ -7515,8 +7568,8 @@ impl GaussianLocationScaleFamily {
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
-        dir_i: &GaussianLocationScaleJointPsiDirection,
-        dir_j: &GaussianLocationScaleJointPsiDirection,
+        dir_i: &LocationScaleJointPsiDirection,
+        dir_j: &LocationScaleJointPsiDirection,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
         subsample: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
@@ -7530,13 +7583,13 @@ impl GaussianLocationScaleFamily {
             x_ls,
         )?;
         let n = self.y.len();
-        let xmu_i_map = dir_i.xmu_psi.as_linear_map_ref();
+        let xmu_i_map = dir_i.x_primary_psi.as_linear_map_ref();
         let x_ls_i_map = dir_i.x_ls_psi.as_linear_map_ref();
-        let xmu_j_map = dir_j.xmu_psi.as_linear_map_ref();
+        let xmu_j_map = dir_j.x_primary_psi.as_linear_map_ref();
         let x_ls_j_map = dir_j.x_ls_psi.as_linear_map_ref();
         let xmu_ab_map = second_psi_linear_map(
-            second_drifts.xmu_ab_action.as_ref(),
-            second_drifts.xmu_ab.as_ref(),
+            second_drifts.x_primary_ab_action.as_ref(),
+            second_drifts.x_primary_ab.as_ref(),
             n,
             xmu.ncols(),
         );
@@ -7572,15 +7625,17 @@ impl GaussianLocationScaleFamily {
         let etamu = &block_states[Self::BLOCK_MU].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         let rows = self.get_or_compute_row_scalars(etamu, eta_ls)?;
-        let mut weights_i = gaussian_joint_psi_firstweights(&rows, &dir_i.zmu_psi, &dir_i.z_ls_psi);
-        let mut weights_j = gaussian_joint_psi_firstweights(&rows, &dir_j.zmu_psi, &dir_j.z_ls_psi);
+        let mut weights_i =
+            gaussian_joint_psi_firstweights(&rows, &dir_i.z_primary_psi, &dir_i.z_ls_psi);
+        let mut weights_j =
+            gaussian_joint_psi_firstweights(&rows, &dir_j.z_primary_psi, &dir_j.z_ls_psi);
         let mut secondweights = gaussian_joint_psisecondweights(
             &rows,
-            &dir_i.zmu_psi,
+            &dir_i.z_primary_psi,
             &dir_i.z_ls_psi,
-            &dir_j.zmu_psi,
+            &dir_j.z_primary_psi,
             &dir_j.z_ls_psi,
-            &second_drifts.zmu_ab,
+            &second_drifts.z_primary_ab,
             &second_drifts.z_ls_ab,
         );
         if let Some(sub_rows) = subsample {
@@ -7662,7 +7717,7 @@ impl GaussianLocationScaleFamily {
     fn exact_newton_joint_psihessian_directional_derivative_from_parts(
         &self,
         block_states: &[ParameterBlockState],
-        dir_a: &GaussianLocationScaleJointPsiDirection,
+        dir_a: &LocationScaleJointPsiDirection,
         d_beta_flat: &Array1<f64>,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
@@ -7672,7 +7727,7 @@ impl GaussianLocationScaleFamily {
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         let pmu = xmu.ncols();
         let p_ls = x_ls.ncols();
-        let xmu_map = dir_a.xmu_psi.as_linear_map_ref();
+        let xmu_map = dir_a.x_primary_psi.as_linear_map_ref();
         let x_ls_map = dir_a.x_ls_psi.as_linear_map_ref();
         let total = pmu + p_ls;
         if d_beta_flat.len() != total {
@@ -7734,7 +7789,7 @@ impl GaussianLocationScaleFamily {
             &rows,
             &ximu,
             &xi_ls,
-            &dir_a.zmu_psi,
+            &dir_a.z_primary_psi,
             &dir_a.z_ls_psi,
             &uzamu,
             &uza_ls,
@@ -7965,7 +8020,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
         // matrix. Report the operator work model so diagnostics and
         // first-order-only policies reflect the representation that actually
         // runs.
-        crate::families::coefficient_cost::joint_coupled_operator_aware_hessian_cost(
+        crate::families::location_scale_engine::location_scale_coefficient_hessian_cost(
             self.y.len() as u64,
             specs,
         )
@@ -10071,7 +10126,7 @@ impl GaussianLocationScaleWiggleFamily {
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
         policy: &crate::resource::ResourcePolicy,
-    ) -> Result<Option<GaussianLocationScaleJointPsiDirection>, String> {
+    ) -> Result<Option<LocationScaleJointPsiDirection>, String> {
         let Some(parts) = locscale_joint_psi_direction_parts(
             block_states,
             derivative_blocks,
@@ -10089,12 +10144,12 @@ impl GaussianLocationScaleWiggleFamily {
         else {
             return Ok(None);
         };
-        Ok(Some(GaussianLocationScaleJointPsiDirection {
+        Ok(Some(LocationScaleJointPsiDirection {
             block_idx: parts.block_idx,
             local_idx: parts.local_idx,
-            zmu_psi: parts.primary_z,
+            z_primary_psi: parts.primary_z,
             z_ls_psi: parts.log_sigma_z,
-            xmu_psi: parts.primary_psi,
+            x_primary_psi: parts.primary_psi,
             x_ls_psi: parts.log_sigma_psi,
         }))
     }
@@ -10103,65 +10158,27 @@ impl GaussianLocationScaleWiggleFamily {
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
-        psi_a: &GaussianLocationScaleJointPsiDirection,
-        psi_b: &GaussianLocationScaleJointPsiDirection,
+        psi_a: &LocationScaleJointPsiDirection,
+        psi_b: &LocationScaleJointPsiDirection,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
-    ) -> Result<GaussianLocationScaleJointPsiSecondDrifts, String> {
-        let n = self.y.len();
-        let pmu = xmu.ncols();
-        let p_ls = x_ls.ncols();
-        let betamu = &block_states[Self::BLOCK_MU].beta;
-        let beta_ls = &block_states[Self::BLOCK_LOG_SIGMA].beta;
-        let mut xmu_ab = None;
-        let mut x_ls_ab = None;
-        let mut xmu_ab_action = None;
-        let mut x_ls_ab_action = None;
-        if psi_a.block_idx == psi_b.block_idx {
-            let deriv = &derivative_blocks[psi_a.block_idx][psi_a.local_idx];
-            let deriv_b = &derivative_blocks[psi_b.block_idx][psi_b.local_idx];
-            match psi_a.block_idx {
-                Self::BLOCK_MU => {
-                    let (action, matrix) = psi_psi_map_to_drift_slots(
-                        deriv,
-                        deriv_b,
-                        psi_b.local_idx,
-                        n,
-                        pmu,
-                        "GaussianLocationScaleWiggleFamily mu",
-                        &self.policy,
-                    )?;
-                    xmu_ab_action = action;
-                    xmu_ab = matrix;
-                }
-                Self::BLOCK_LOG_SIGMA => {
-                    let (action, matrix) = psi_psi_map_to_drift_slots(
-                        deriv,
-                        deriv_b,
-                        psi_b.local_idx,
-                        n,
-                        p_ls,
-                        "GaussianLocationScaleWiggleFamily log-sigma",
-                        &self.policy,
-                    )?;
-                    x_ls_ab_action = action;
-                    x_ls_ab = matrix;
-                }
-                _ => {}
-            }
-        }
-        let zmu_ab = second_psi_linear_map(xmu_ab_action.as_ref(), xmu_ab.as_ref(), n, pmu)
-            .forward_mul(betamu.view());
-        let z_ls_ab = second_psi_linear_map(x_ls_ab_action.as_ref(), x_ls_ab.as_ref(), n, p_ls)
-            .forward_mul(beta_ls.view());
-        Ok(GaussianLocationScaleJointPsiSecondDrifts {
-            xmu_ab_action,
-            x_ls_ab_action,
-            xmu_ab,
-            x_ls_ab,
-            zmu_ab,
-            z_ls_ab,
-        })
+    ) -> Result<LocationScaleJointPsiSecondDrifts, String> {
+        locscale_joint_psisecond_design_drifts(
+            block_states,
+            derivative_blocks,
+            psi_a,
+            psi_b,
+            LocScalePsiDriftConfig {
+                n: self.y.len(),
+                p_primary: xmu.ncols(),
+                p_log_sigma: x_ls.ncols(),
+                primary_block_idx: Self::BLOCK_MU,
+                log_sigma_block_idx: Self::BLOCK_LOG_SIGMA,
+                family_name: "GaussianLocationScaleWiggleFamily",
+                primary_label: "mu",
+                policy: &self.policy,
+            },
+        )
     }
 
     /// Compute the rowwise Hessian pieces shared by the dense path and the
@@ -10807,14 +10824,14 @@ impl GaussianLocationScaleWiggleFamily {
         let q = q0 + etaw;
         let geom = self.wiggle_geometry(q0.view(), betaw.view())?;
         let rows = self.get_or_compute_row_scalars(&q, eta_ls)?;
-        let xmu_map = dir_a.xmu_psi.as_linear_map_ref();
+        let xmu_map = dir_a.x_primary_psi.as_linear_map_ref();
         let x_ls_map = dir_a.x_ls_psi.as_linear_map_ref();
 
-        let q_a = &geom.dq_dq0 * &dir_a.zmu_psi;
-        let s1_a = &geom.d2q_dq02 * &dir_a.zmu_psi;
-        let g2_a = &geom.d3q_dq03 * &dir_a.zmu_psi;
-        let basis_a = scale_matrix_rows(&geom.basis_d1, &dir_a.zmu_psi)?;
-        let basis1_a = scale_matrix_rows(&geom.basis_d2, &dir_a.zmu_psi)?;
+        let q_a = &geom.dq_dq0 * &dir_a.z_primary_psi;
+        let s1_a = &geom.d2q_dq02 * &dir_a.z_primary_psi;
+        let g2_a = &geom.d3q_dq03 * &dir_a.z_primary_psi;
+        let basis_a = scale_matrix_rows(&geom.basis_d1, &dir_a.z_primary_psi)?;
+        let basis1_a = scale_matrix_rows(&geom.basis_d2, &dir_a.z_primary_psi)?;
         // logb κ-chain on η_ls; e_a = ∂η_ls/∂ψ_a row-direction.
         let e_a = &dir_a.z_ls_psi;
         let amn = &rows.obs_weight - &rows.n;
@@ -10955,8 +10972,8 @@ impl GaussianLocationScaleWiggleFamily {
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
-        dir_a: &GaussianLocationScaleJointPsiDirection,
-        dir_b: &GaussianLocationScaleJointPsiDirection,
+        dir_a: &LocationScaleJointPsiDirection,
+        dir_b: &LocationScaleJointPsiDirection,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
     ) -> Result<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms, String> {
@@ -10969,13 +10986,13 @@ impl GaussianLocationScaleWiggleFamily {
             x_ls,
         )?;
         let n = self.y.len();
-        let xmu_a_map = dir_a.xmu_psi.as_linear_map_ref();
+        let xmu_a_map = dir_a.x_primary_psi.as_linear_map_ref();
         let x_ls_a_map = dir_a.x_ls_psi.as_linear_map_ref();
-        let xmu_b_map = dir_b.xmu_psi.as_linear_map_ref();
+        let xmu_b_map = dir_b.x_primary_psi.as_linear_map_ref();
         let x_ls_b_map = dir_b.x_ls_psi.as_linear_map_ref();
         let xmu_ab_map = second_psi_linear_map(
-            second_drifts.xmu_ab_action.as_ref(),
-            second_drifts.xmu_ab.as_ref(),
+            second_drifts.x_primary_ab_action.as_ref(),
+            second_drifts.x_primary_ab.as_ref(),
             n,
             xmu.ncols(),
         );
@@ -10993,26 +11010,32 @@ impl GaussianLocationScaleWiggleFamily {
         let geom = self.wiggle_geometry(q0.view(), betaw.view())?;
         let rows = self.get_or_compute_row_scalars(&q, eta_ls)?;
 
-        let q_a = &geom.dq_dq0 * &dir_a.zmu_psi;
-        let q_b = &geom.dq_dq0 * &dir_b.zmu_psi;
-        let q_ab = &(&geom.dq_dq0 * &second_drifts.zmu_ab)
-            + &(&geom.d2q_dq02 * &(&dir_a.zmu_psi * &dir_b.zmu_psi));
-        let s1_a = &geom.d2q_dq02 * &dir_a.zmu_psi;
-        let s1_b = &geom.d2q_dq02 * &dir_b.zmu_psi;
-        let s1_ab = &(&geom.d3q_dq03 * &(&dir_a.zmu_psi * &dir_b.zmu_psi))
-            + &(&geom.d2q_dq02 * &second_drifts.zmu_ab);
-        let g2_a = &geom.d3q_dq03 * &dir_a.zmu_psi;
-        let g2_b = &geom.d3q_dq03 * &dir_b.zmu_psi;
-        let g2_ab = &(&geom.d4q_dq04 * &(&dir_a.zmu_psi * &dir_b.zmu_psi))
-            + &(&geom.d3q_dq03 * &second_drifts.zmu_ab);
-        let basis_a = scale_matrix_rows(&geom.basis_d1, &dir_a.zmu_psi)?;
-        let basis_b = scale_matrix_rows(&geom.basis_d1, &dir_b.zmu_psi)?;
-        let basis_ab = scale_matrix_rows(&geom.basis_d1, &second_drifts.zmu_ab)?
-            + &scale_matrix_rows(&geom.basis_d2, &(&dir_a.zmu_psi * &dir_b.zmu_psi))?;
-        let basis1_a = scale_matrix_rows(&geom.basis_d2, &dir_a.zmu_psi)?;
-        let basis1_b = scale_matrix_rows(&geom.basis_d2, &dir_b.zmu_psi)?;
-        let basis1_ab = scale_matrix_rows(&geom.basis_d2, &second_drifts.zmu_ab)?
-            + &scale_matrix_rows(&geom.basis_d3, &(&dir_a.zmu_psi * &dir_b.zmu_psi))?;
+        let q_a = &geom.dq_dq0 * &dir_a.z_primary_psi;
+        let q_b = &geom.dq_dq0 * &dir_b.z_primary_psi;
+        let q_ab = &(&geom.dq_dq0 * &second_drifts.z_primary_ab)
+            + &(&geom.d2q_dq02 * &(&dir_a.z_primary_psi * &dir_b.z_primary_psi));
+        let s1_a = &geom.d2q_dq02 * &dir_a.z_primary_psi;
+        let s1_b = &geom.d2q_dq02 * &dir_b.z_primary_psi;
+        let s1_ab = &(&geom.d3q_dq03 * &(&dir_a.z_primary_psi * &dir_b.z_primary_psi))
+            + &(&geom.d2q_dq02 * &second_drifts.z_primary_ab);
+        let g2_a = &geom.d3q_dq03 * &dir_a.z_primary_psi;
+        let g2_b = &geom.d3q_dq03 * &dir_b.z_primary_psi;
+        let g2_ab = &(&geom.d4q_dq04 * &(&dir_a.z_primary_psi * &dir_b.z_primary_psi))
+            + &(&geom.d3q_dq03 * &second_drifts.z_primary_ab);
+        let basis_a = scale_matrix_rows(&geom.basis_d1, &dir_a.z_primary_psi)?;
+        let basis_b = scale_matrix_rows(&geom.basis_d1, &dir_b.z_primary_psi)?;
+        let basis_ab = scale_matrix_rows(&geom.basis_d1, &second_drifts.z_primary_ab)?
+            + &scale_matrix_rows(
+                &geom.basis_d2,
+                &(&dir_a.z_primary_psi * &dir_b.z_primary_psi),
+            )?;
+        let basis1_a = scale_matrix_rows(&geom.basis_d2, &dir_a.z_primary_psi)?;
+        let basis1_b = scale_matrix_rows(&geom.basis_d2, &dir_b.z_primary_psi)?;
+        let basis1_ab = scale_matrix_rows(&geom.basis_d2, &second_drifts.z_primary_ab)?
+            + &scale_matrix_rows(
+                &geom.basis_d3,
+                &(&dir_a.z_primary_psi * &dir_b.z_primary_psi),
+            )?;
 
         // logb κ-chain on η_ls; κ' = κ(1−κ), κ'' = κ(1−κ)(1−2κ),
         // κ''' = κ''(1−2κ) − 2(κ')².
@@ -11385,14 +11408,14 @@ impl GaussianLocationScaleWiggleFamily {
     fn exact_newton_joint_psihessian_directional_derivative_from_parts(
         &self,
         block_states: &[ParameterBlockState],
-        dir_a: &GaussianLocationScaleJointPsiDirection,
+        dir_a: &LocationScaleJointPsiDirection,
         d_beta_flat: &Array1<f64>,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
     ) -> Result<Array2<f64>, String> {
         let pmu = xmu.ncols();
         let p_ls = x_ls.ncols();
-        let xmu_map = dir_a.xmu_psi.as_linear_map_ref();
+        let xmu_map = dir_a.x_primary_psi.as_linear_map_ref();
         let x_ls_map = dir_a.x_ls_psi.as_linear_map_ref();
         let q0 = &block_states[Self::BLOCK_MU].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
@@ -11420,20 +11443,20 @@ impl GaussianLocationScaleWiggleFamily {
         let g2_u = &(&geom.d3q_dq03 * &xi) + &b2u;
         let g3_u = &(&geom.d4q_dq04 * &xi) + &b3u;
 
-        let q_a = &geom.dq_dq0 * &dir_a.zmu_psi;
-        let s1_a = &geom.d2q_dq02 * &dir_a.zmu_psi;
-        let g2_a = &geom.d3q_dq03 * &dir_a.zmu_psi;
-        let q_a_u = &(&s1_u * &dir_a.zmu_psi) + &(&geom.dq_dq0 * &zmu_a_u);
-        let s1_a_u = &(&g2_u * &dir_a.zmu_psi) + &(&geom.d2q_dq02 * &zmu_a_u);
-        let g2_a_u = &(&g3_u * &dir_a.zmu_psi) + &(&geom.d3q_dq03 * &zmu_a_u);
+        let q_a = &geom.dq_dq0 * &dir_a.z_primary_psi;
+        let s1_a = &geom.d2q_dq02 * &dir_a.z_primary_psi;
+        let g2_a = &geom.d3q_dq03 * &dir_a.z_primary_psi;
+        let q_a_u = &(&s1_u * &dir_a.z_primary_psi) + &(&geom.dq_dq0 * &zmu_a_u);
+        let s1_a_u = &(&g2_u * &dir_a.z_primary_psi) + &(&geom.d2q_dq02 * &zmu_a_u);
+        let g2_a_u = &(&g3_u * &dir_a.z_primary_psi) + &(&geom.d3q_dq03 * &zmu_a_u);
 
         let basis_u = scale_matrix_rows(&geom.basis_d1, &xi)?;
         let basis1_u = scale_matrix_rows(&geom.basis_d2, &xi)?;
-        let basis_a = scale_matrix_rows(&geom.basis_d1, &dir_a.zmu_psi)?;
-        let basis1_a = scale_matrix_rows(&geom.basis_d2, &dir_a.zmu_psi)?;
-        let basis_a_u = scale_matrix_rows(&geom.basis_d2, &(&xi * &dir_a.zmu_psi))?
+        let basis_a = scale_matrix_rows(&geom.basis_d1, &dir_a.z_primary_psi)?;
+        let basis1_a = scale_matrix_rows(&geom.basis_d2, &dir_a.z_primary_psi)?;
+        let basis_a_u = scale_matrix_rows(&geom.basis_d2, &(&xi * &dir_a.z_primary_psi))?
             + &scale_matrix_rows(&geom.basis_d1, &zmu_a_u)?;
-        let basis1_a_u = scale_matrix_rows(&geom.basis_d3, &(&xi * &dir_a.zmu_psi))?
+        let basis1_a_u = scale_matrix_rows(&geom.basis_d3, &(&xi * &dir_a.z_primary_psi))?
             + &scale_matrix_rows(&geom.basis_d2, &zmu_a_u)?;
 
         // logb κ-chain on η_ls; e_a = ψ_a's η_ls direction, ζ = β-direction.
@@ -11669,7 +11692,7 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         // `use_joint_matrix_free_path` selects the workspace operator, joint
         // Hv apply is O(n · (p_t + p_ℓ + p_w)) — the row-streaming RowCoeffOperator
         // never materializes the dense (p_t + p_ℓ + p_w)² matrix.
-        crate::families::coefficient_cost::joint_coupled_operator_aware_hessian_cost(
+        crate::families::location_scale_engine::location_scale_coefficient_hessian_cost(
             self.y.len() as u64,
             specs,
         )
@@ -14536,24 +14559,6 @@ pub struct BinomialLocationScaleFamily {
     pub policy: crate::resource::ResourcePolicy,
 }
 
-struct BinomialLocationScaleJointPsiDirection {
-    block_idx: usize,
-    local_idx: usize,
-    x_t_psi: PsiDesignMap,
-    x_ls_psi: PsiDesignMap,
-    z_t_psi: Array1<f64>,
-    z_ls_psi: Array1<f64>,
-}
-
-struct BinomialLocationScaleJointPsiSecondDrifts {
-    x_t_ab_action: Option<CustomFamilyPsiSecondDesignAction>,
-    x_ls_ab_action: Option<CustomFamilyPsiSecondDesignAction>,
-    x_t_ab: Option<Array2<f64>>,
-    x_ls_ab: Option<Array2<f64>>,
-    z_t_ab: Array1<f64>,
-    z_ls_ab: Array1<f64>,
-}
-
 /// Both Binomial location-scale families plug into the unified
 /// [`LocationScaleJointPsiFamily`] trait with byte-identical thin delegations
 /// to inherent methods, differing only in the implementing type and its
@@ -14563,7 +14568,7 @@ struct BinomialLocationScaleJointPsiSecondDrifts {
 macro_rules! impl_binomial_location_scale_joint_psi_family {
     ($family:ty, $label:literal) => {
         impl LocationScaleJointPsiFamily for $family {
-            type Direction = BinomialLocationScaleJointPsiDirection;
+            type Direction = LocationScaleJointPsiDirection;
             const LABEL: &'static str = $label;
 
             fn ws_policy(&self) -> &crate::resource::ResourcePolicy {
@@ -14585,7 +14590,7 @@ macro_rules! impl_binomial_location_scale_joint_psi_family {
                 design_loc: &Array2<f64>,
                 design_scale: &Array2<f64>,
                 policy: &crate::resource::ResourcePolicy,
-            ) -> Result<Option<BinomialLocationScaleJointPsiDirection>, String> {
+            ) -> Result<Option<LocationScaleJointPsiDirection>, String> {
                 self.exact_newton_joint_psi_direction(
                     block_states,
                     derivative_blocks,
@@ -14600,8 +14605,8 @@ macro_rules! impl_binomial_location_scale_joint_psi_family {
                 &self,
                 block_states: &[ParameterBlockState],
                 derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
-                psi_a: &BinomialLocationScaleJointPsiDirection,
-                psi_b: &BinomialLocationScaleJointPsiDirection,
+                psi_a: &LocationScaleJointPsiDirection,
+                psi_b: &LocationScaleJointPsiDirection,
                 design_loc: &Array2<f64>,
                 design_scale: &Array2<f64>,
                 subsample: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
@@ -14620,7 +14625,7 @@ macro_rules! impl_binomial_location_scale_joint_psi_family {
             fn ws_psi_hessian_directional_from_parts(
                 &self,
                 block_states: &[ParameterBlockState],
-                psi_dir: &BinomialLocationScaleJointPsiDirection,
+                psi_dir: &LocationScaleJointPsiDirection,
                 d_beta_flat: &Array1<f64>,
                 design_loc: &Array2<f64>,
                 design_scale: &Array2<f64>,
@@ -15417,7 +15422,7 @@ impl BinomialLocationScaleFamily {
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
         policy: &crate::resource::ResourcePolicy,
-    ) -> Result<Option<BinomialLocationScaleJointPsiDirection>, String> {
+    ) -> Result<Option<LocationScaleJointPsiDirection>, String> {
         let Some(parts) = locscale_joint_psi_direction_parts(
             block_states,
             derivative_blocks,
@@ -15435,12 +15440,12 @@ impl BinomialLocationScaleFamily {
         else {
             return Ok(None);
         };
-        Ok(Some(BinomialLocationScaleJointPsiDirection {
+        Ok(Some(LocationScaleJointPsiDirection {
             block_idx: parts.block_idx,
             local_idx: parts.local_idx,
-            x_t_psi: parts.primary_psi,
+            x_primary_psi: parts.primary_psi,
             x_ls_psi: parts.log_sigma_psi,
-            z_t_psi: parts.primary_z,
+            z_primary_psi: parts.primary_z,
             z_ls_psi: parts.log_sigma_z,
         }))
     }
@@ -15449,72 +15454,27 @@ impl BinomialLocationScaleFamily {
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
-        psi_a: &BinomialLocationScaleJointPsiDirection,
-        psi_b: &BinomialLocationScaleJointPsiDirection,
+        psi_a: &LocationScaleJointPsiDirection,
+        psi_b: &LocationScaleJointPsiDirection,
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
-    ) -> Result<BinomialLocationScaleJointPsiSecondDrifts, String> {
-        let n = self.y.len();
-        let pt = x_t.ncols();
-        let pls = x_ls.ncols();
-        let beta_t = &block_states[Self::BLOCK_T].beta;
-        let beta_ls = &block_states[Self::BLOCK_LOG_SIGMA].beta;
-        let mut x_t_ab_action = None;
-        let mut x_ls_ab_action = None;
-        let mut x_t_ab = None;
-        let mut x_ls_ab = None;
-
-        // The smooth layer stores second derivatives block-locally. For a pair
-        // of global psi coordinates (a, b), the only potentially nonzero
-        // X_{psi_a psi_b} lives in the derivative payload of the block whose
-        // basis actually moves under that pair. Cross-block mixed second
-        // design derivatives are therefore zero unless explicitly provided.
-        if psi_a.block_idx == psi_b.block_idx {
-            let deriv = &derivative_blocks[psi_a.block_idx][psi_a.local_idx];
-            let deriv_b = &derivative_blocks[psi_b.block_idx][psi_b.local_idx];
-            match psi_a.block_idx {
-                Self::BLOCK_T => {
-                    let (action, matrix) = psi_psi_map_to_drift_slots(
-                        deriv,
-                        deriv_b,
-                        psi_b.local_idx,
-                        n,
-                        pt,
-                        "BinomialLocationScaleFamily threshold",
-                        &self.policy,
-                    )?;
-                    x_t_ab_action = action;
-                    x_t_ab = matrix;
-                }
-                Self::BLOCK_LOG_SIGMA => {
-                    let (action, matrix) = psi_psi_map_to_drift_slots(
-                        deriv,
-                        deriv_b,
-                        psi_b.local_idx,
-                        n,
-                        pls,
-                        "BinomialLocationScaleFamily log-sigma",
-                        &self.policy,
-                    )?;
-                    x_ls_ab_action = action;
-                    x_ls_ab = matrix;
-                }
-                _ => {}
-            }
-        }
-
-        let z_t_ab = second_psi_linear_map(x_t_ab_action.as_ref(), x_t_ab.as_ref(), n, pt)
-            .forward_mul(beta_t.view());
-        let z_ls_ab = second_psi_linear_map(x_ls_ab_action.as_ref(), x_ls_ab.as_ref(), n, pls)
-            .forward_mul(beta_ls.view());
-        Ok(BinomialLocationScaleJointPsiSecondDrifts {
-            x_t_ab_action,
-            x_ls_ab_action,
-            x_t_ab,
-            x_ls_ab,
-            z_t_ab,
-            z_ls_ab,
-        })
+    ) -> Result<LocationScaleJointPsiSecondDrifts, String> {
+        locscale_joint_psisecond_design_drifts(
+            block_states,
+            derivative_blocks,
+            psi_a,
+            psi_b,
+            LocScalePsiDriftConfig {
+                n: self.y.len(),
+                p_primary: x_t.ncols(),
+                p_log_sigma: x_ls.ncols(),
+                primary_block_idx: Self::BLOCK_T,
+                log_sigma_block_idx: Self::BLOCK_LOG_SIGMA,
+                family_name: "BinomialLocationScaleFamily",
+                primary_label: "threshold",
+                policy: &self.policy,
+            },
+        )
     }
 
     fn exact_newton_joint_psi_terms_from_designs(
@@ -15669,7 +15629,7 @@ impl BinomialLocationScaleFamily {
         else {
             return Ok(None);
         };
-        let (z_t, z_ls) = (&dir_a.z_t_psi, &dir_a.z_ls_psi);
+        let (z_t, z_ls) = (&dir_a.z_primary_psi, &dir_a.z_ls_psi);
 
         // Per-row scalars assembled in parallel. The probit/inverse-link
         // derivatives are O(n) at biobank scale and are called O(K) times per
@@ -15770,7 +15730,7 @@ impl BinomialLocationScaleFamily {
         }
 
         let hessian_psi_operator = build_two_block_custom_family_joint_psi_operator_from_actions(
-            dir_a.x_t_psi.cloned_first_action(),
+            dir_a.x_primary_psi.cloned_first_action(),
             dir_a.x_ls_psi.cloned_first_action(),
             0..pt,
             pt..pt + pls,
@@ -15783,7 +15743,7 @@ impl BinomialLocationScaleFamily {
             &dh_tl,
             &dh_ll,
         )?;
-        let x_t_map = dir_a.x_t_psi.as_linear_map_ref();
+        let x_t_map = dir_a.x_primary_psi.as_linear_map_ref();
         let x_ls_map = dir_a.x_ls_psi.as_linear_map_ref();
         let score_t = x_t_map.transpose_mul(r_t.view()) + fast_atv(x_t, &dr_t);
         let score_ls = x_ls_map.transpose_mul(r_ls.view()) + fast_atv(x_ls, &dr_ls);
@@ -15888,8 +15848,8 @@ impl BinomialLocationScaleFamily {
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
-        dir_i: &BinomialLocationScaleJointPsiDirection,
-        dir_j: &BinomialLocationScaleJointPsiDirection,
+        dir_i: &LocationScaleJointPsiDirection,
+        dir_j: &LocationScaleJointPsiDirection,
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
     ) -> Result<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms, String> {
@@ -15915,13 +15875,13 @@ impl BinomialLocationScaleFamily {
         let pt = x_t.ncols();
         let pls = x_ls.ncols();
         let total = pt + pls;
-        let x_t_i_map = dir_i.x_t_psi.as_linear_map_ref();
-        let x_t_j_map = dir_j.x_t_psi.as_linear_map_ref();
+        let x_t_i_map = dir_i.x_primary_psi.as_linear_map_ref();
+        let x_t_j_map = dir_j.x_primary_psi.as_linear_map_ref();
         let x_ls_i_map = dir_i.x_ls_psi.as_linear_map_ref();
         let x_ls_j_map = dir_j.x_ls_psi.as_linear_map_ref();
         let x_t_ab_map = second_psi_linear_map(
-            second_drifts.x_t_ab_action.as_ref(),
-            second_drifts.x_t_ab.as_ref(),
+            second_drifts.x_primary_ab_action.as_ref(),
+            second_drifts.x_primary_ab.as_ref(),
             n,
             pt,
         );
@@ -16104,11 +16064,11 @@ impl BinomialLocationScaleFamily {
             .as_slice()
             .expect("d3mu_dq3 must be contiguous");
         let z_t_i = dir_i
-            .z_t_psi
+            .z_primary_psi
             .as_slice()
             .expect("z_t_psi_i must be contiguous");
         let z_t_j = dir_j
-            .z_t_psi
+            .z_primary_psi
             .as_slice()
             .expect("z_t_psi_j must be contiguous");
         let z_ls_i = dir_i
@@ -16120,7 +16080,7 @@ impl BinomialLocationScaleFamily {
             .as_slice()
             .expect("z_ls_psi_j must be contiguous");
         let z_t_ab = second_drifts
-            .z_t_ab
+            .z_primary_ab
             .as_slice()
             .expect("z_t_ab must be contiguous");
         let z_ls_ab = second_drifts
@@ -16386,7 +16346,7 @@ impl BinomialLocationScaleFamily {
     fn exact_newton_joint_psihessian_directional_derivative_from_parts(
         &self,
         block_states: &[ParameterBlockState],
-        dir_a: &BinomialLocationScaleJointPsiDirection,
+        dir_a: &LocationScaleJointPsiDirection,
         d_beta_flat: &Array1<f64>,
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
@@ -16414,7 +16374,7 @@ impl BinomialLocationScaleFamily {
         }
         let xi_t = fast_av(x_t, &d_beta_flat.slice(s![0..pt]));
         let xi_ls = fast_av(x_ls, &d_beta_flat.slice(s![pt..pt + pls]));
-        let x_t_map = dir_a.x_t_psi.as_linear_map_ref();
+        let x_t_map = dir_a.x_primary_psi.as_linear_map_ref();
         let x_ls_map = dir_a.x_ls_psi.as_linear_map_ref();
 
         // Mixed contraction T_a[u] = D_beta H_{psi_a}[u].
@@ -16480,8 +16440,8 @@ impl BinomialLocationScaleFamily {
             let xi_ls_s = s * xi_ls[row];
             let z_ls_psi_s = s * dir_a.z_ls_psi[row];
             let du = -r * xi_t[row] - q * xi_ls_s;
-            let q_a = -r * dir_a.z_t_psi[row] - q * z_ls_psi_s;
-            let q_au = r * dir_a.z_t_psi[row] * xi_ls_s - du * z_ls_psi_s;
+            let q_a = -r * dir_a.z_primary_psi[row] - q * z_ls_psi_s;
+            let q_au = r * dir_a.z_primary_psi[row] * xi_ls_s - du * z_ls_psi_s;
             let (a, b, c) = binomial_neglog_q_derivatives_dispatch(
                 self.y[row],
                 self.weights[row],
@@ -16585,7 +16545,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
         // Operator-aware: matrix-free workspace applies joint Hv at
         // O(n · (p_t + p_ℓ)); only fall back to the dense build cost when
         // `use_joint_matrix_free_path` declines the operator path.
-        crate::families::coefficient_cost::joint_coupled_operator_aware_hessian_cost(
+        crate::families::location_scale_engine::location_scale_coefficient_hessian_cost(
             self.y.len() as u64,
             specs,
         )
@@ -18259,7 +18219,7 @@ impl BinomialLocationScaleWiggleFamily {
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
         policy: &crate::resource::ResourcePolicy,
-    ) -> Result<Option<BinomialLocationScaleJointPsiDirection>, String> {
+    ) -> Result<Option<LocationScaleJointPsiDirection>, String> {
         let Some(parts) = locscale_joint_psi_direction_parts(
             block_states,
             derivative_blocks,
@@ -18277,12 +18237,12 @@ impl BinomialLocationScaleWiggleFamily {
         else {
             return Ok(None);
         };
-        Ok(Some(BinomialLocationScaleJointPsiDirection {
+        Ok(Some(LocationScaleJointPsiDirection {
             block_idx: parts.block_idx,
             local_idx: parts.local_idx,
-            z_t_psi: parts.primary_z,
+            z_primary_psi: parts.primary_z,
             z_ls_psi: parts.log_sigma_z,
-            x_t_psi: parts.primary_psi,
+            x_primary_psi: parts.primary_psi,
             x_ls_psi: parts.log_sigma_psi,
         }))
     }
@@ -18291,65 +18251,27 @@ impl BinomialLocationScaleWiggleFamily {
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
-        psi_a: &BinomialLocationScaleJointPsiDirection,
-        psi_b: &BinomialLocationScaleJointPsiDirection,
+        psi_a: &LocationScaleJointPsiDirection,
+        psi_b: &LocationScaleJointPsiDirection,
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
-    ) -> Result<BinomialLocationScaleJointPsiSecondDrifts, String> {
-        let n = self.y.len();
-        let pt = x_t.ncols();
-        let pls = x_ls.ncols();
-        let beta_t = &block_states[Self::BLOCK_T].beta;
-        let beta_ls = &block_states[Self::BLOCK_LOG_SIGMA].beta;
-        let mut x_t_ab_action = None;
-        let mut x_ls_ab_action = None;
-        let mut x_t_ab = None;
-        let mut x_ls_ab = None;
-        if psi_a.block_idx == psi_b.block_idx {
-            let deriv = &derivative_blocks[psi_a.block_idx][psi_a.local_idx];
-            let deriv_b = &derivative_blocks[psi_b.block_idx][psi_b.local_idx];
-            match psi_a.block_idx {
-                Self::BLOCK_T => {
-                    let (action, matrix) = psi_psi_map_to_drift_slots(
-                        deriv,
-                        deriv_b,
-                        psi_b.local_idx,
-                        n,
-                        pt,
-                        "BinomialLocationScaleWiggleFamily threshold",
-                        &self.policy,
-                    )?;
-                    x_t_ab_action = action;
-                    x_t_ab = matrix;
-                }
-                Self::BLOCK_LOG_SIGMA => {
-                    let (action, matrix) = psi_psi_map_to_drift_slots(
-                        deriv,
-                        deriv_b,
-                        psi_b.local_idx,
-                        n,
-                        pls,
-                        "BinomialLocationScaleWiggleFamily log-sigma",
-                        &self.policy,
-                    )?;
-                    x_ls_ab_action = action;
-                    x_ls_ab = matrix;
-                }
-                _ => {}
-            }
-        }
-        let z_t_ab = second_psi_linear_map(x_t_ab_action.as_ref(), x_t_ab.as_ref(), n, pt)
-            .forward_mul(beta_t.view());
-        let z_ls_ab = second_psi_linear_map(x_ls_ab_action.as_ref(), x_ls_ab.as_ref(), n, pls)
-            .forward_mul(beta_ls.view());
-        Ok(BinomialLocationScaleJointPsiSecondDrifts {
-            x_t_ab_action,
-            x_ls_ab_action,
-            x_t_ab,
-            x_ls_ab,
-            z_t_ab,
-            z_ls_ab,
-        })
+    ) -> Result<LocationScaleJointPsiSecondDrifts, String> {
+        locscale_joint_psisecond_design_drifts(
+            block_states,
+            derivative_blocks,
+            psi_a,
+            psi_b,
+            LocScalePsiDriftConfig {
+                n: self.y.len(),
+                p_primary: x_t.ncols(),
+                p_log_sigma: x_ls.ncols(),
+                primary_block_idx: Self::BLOCK_T,
+                log_sigma_block_idx: Self::BLOCK_LOG_SIGMA,
+                family_name: "BinomialLocationScaleWiggleFamily",
+                primary_label: "threshold",
+                policy: &self.policy,
+            },
+        )
     }
 
     fn exact_newton_joint_psi_terms_from_designs(
@@ -18420,7 +18342,7 @@ impl BinomialLocationScaleWiggleFamily {
         else {
             return Ok(None);
         };
-        let (z_t_psi, z_ls_psi) = (&dir_a.z_t_psi, &dir_a.z_ls_psi);
+        let (z_t_psi, z_ls_psi) = (&dir_a.z_primary_psi, &dir_a.z_ls_psi);
         let mut objective_psi = 0.0;
 
         let mut score_t_xa = Array1::<f64>::zeros(n);
@@ -18569,7 +18491,7 @@ impl BinomialLocationScaleWiggleFamily {
             coeff_ww_bb[row] = loss_3 * alpha;
             coeff_ww_db[row] = loss_2 * q0_a;
         }
-        let x_t_map = dir_a.x_t_psi.as_linear_map_ref();
+        let x_t_map = dir_a.x_primary_psi.as_linear_map_ref();
         let x_ls_map = dir_a.x_ls_psi.as_linear_map_ref();
         let score_t = x_t_map.transpose_mul(score_t_xa.view()) + fast_atv(x_t, &score_t_x);
         let score_ls = x_ls_map.transpose_mul(score_ls_xa.view()) + fast_atv(x_ls, &score_ls_x);
@@ -18579,7 +18501,7 @@ impl BinomialLocationScaleWiggleFamily {
         score_psi.slice_mut(s![pt..pt + pls]).assign(&score_ls);
         score_psi.slice_mut(s![pt + pls..total]).assign(&score_w);
 
-        let x_t_action_opt = dir_a.x_t_psi.cloned_first_action();
+        let x_t_action_opt = dir_a.x_primary_psi.cloned_first_action();
         let x_ls_action_opt = dir_a.x_ls_psi.cloned_first_action();
         if x_t_action_opt.is_some() || x_ls_action_opt.is_some() {
             let basis_arc = Arc::new(b0.clone());
@@ -18869,8 +18791,8 @@ impl BinomialLocationScaleWiggleFamily {
         &self,
         block_states: &[ParameterBlockState],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
-        dir_a: &BinomialLocationScaleJointPsiDirection,
-        dir_b: &BinomialLocationScaleJointPsiDirection,
+        dir_a: &LocationScaleJointPsiDirection,
+        dir_b: &LocationScaleJointPsiDirection,
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
     ) -> Result<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms, String> {
@@ -18935,13 +18857,13 @@ impl BinomialLocationScaleWiggleFamily {
         let pls = x_ls.ncols();
         let pw = b0.ncols();
         let total = pt + pls + pw;
-        let x_t_a_map = dir_a.x_t_psi.as_linear_map_ref();
-        let x_t_b_map = dir_b.x_t_psi.as_linear_map_ref();
+        let x_t_a_map = dir_a.x_primary_psi.as_linear_map_ref();
+        let x_t_b_map = dir_b.x_primary_psi.as_linear_map_ref();
         let x_ls_a_map = dir_a.x_ls_psi.as_linear_map_ref();
         let x_ls_b_map = dir_b.x_ls_psi.as_linear_map_ref();
         let x_t_ab_map = second_psi_linear_map(
-            second_drifts.x_t_ab_action.as_ref(),
-            second_drifts.x_t_ab.as_ref(),
+            second_drifts.x_primary_ab_action.as_ref(),
+            second_drifts.x_primary_ab.as_ref(),
             n,
             pt,
         );
@@ -19035,29 +18957,31 @@ impl BinomialLocationScaleWiggleFamily {
                 d3s[row] / s2 - 6.0 * ds[row] * d2s[row] / s3 + 6.0 * ds[row].powi(3) / s4;
             let r_sigma = 1.0 / s_safe;
 
-            let q0_a = -r_sigma * dir_a.z_t_psi[row] - q0 * dir_a.z_ls_psi[row];
-            let q0_b = -r_sigma * dir_b.z_t_psi[row] - q0 * dir_b.z_ls_psi[row];
-            let q0_ab = -r_sigma * second_drifts.z_t_ab[row]
+            let q0_a = -r_sigma * dir_a.z_primary_psi[row] - q0 * dir_a.z_ls_psi[row];
+            let q0_b = -r_sigma * dir_b.z_primary_psi[row] - q0 * dir_b.z_ls_psi[row];
+            let q0_ab = -r_sigma * second_drifts.z_primary_ab[row]
                 + r_sigma
-                    * (dir_a.z_t_psi[row] * dir_b.z_ls_psi[row]
-                        + dir_b.z_t_psi[row] * dir_a.z_ls_psi[row])
+                    * (dir_a.z_primary_psi[row] * dir_b.z_ls_psi[row]
+                        + dir_b.z_primary_psi[row] * dir_a.z_ls_psi[row])
                 + q0 * (dir_a.z_ls_psi[row] * dir_b.z_ls_psi[row] - second_drifts.z_ls_ab[row]);
 
             let q0_t_a = q0_geom.q_tl * dir_a.z_ls_psi[row];
             let q0_t_b = q0_geom.q_tl * dir_b.z_ls_psi[row];
             let q0_t_ab = q0_geom.q_tl_ls * dir_a.z_ls_psi[row] * dir_b.z_ls_psi[row]
                 + q0_geom.q_tl * second_drifts.z_ls_ab[row];
-            let q0_ls_a = q0_geom.q_tl * dir_a.z_t_psi[row] + q0_geom.q_ll * dir_a.z_ls_psi[row];
-            let q0_ls_b = q0_geom.q_tl * dir_b.z_t_psi[row] + q0_geom.q_ll * dir_b.z_ls_psi[row];
+            let q0_ls_a =
+                q0_geom.q_tl * dir_a.z_primary_psi[row] + q0_geom.q_ll * dir_a.z_ls_psi[row];
+            let q0_ls_b =
+                q0_geom.q_tl * dir_b.z_primary_psi[row] + q0_geom.q_ll * dir_b.z_ls_psi[row];
             let q0_ls_ab = -q0_ab;
             let q0_tl_a = q0_geom.q_tl_ls * dir_a.z_ls_psi[row];
             let q0_tl_b = q0_geom.q_tl_ls * dir_b.z_ls_psi[row];
             let q0_tl_ab = q0_tl_ls_ls * dir_a.z_ls_psi[row] * dir_b.z_ls_psi[row]
                 + q0_geom.q_tl_ls * second_drifts.z_ls_ab[row];
             let q0_ll_a =
-                q0_geom.q_tl_ls * dir_a.z_t_psi[row] + q0_geom.q_ll_ls * dir_a.z_ls_psi[row];
+                q0_geom.q_tl_ls * dir_a.z_primary_psi[row] + q0_geom.q_ll_ls * dir_a.z_ls_psi[row];
             let q0_ll_b =
-                q0_geom.q_tl_ls * dir_b.z_t_psi[row] + q0_geom.q_ll_ls * dir_b.z_ls_psi[row];
+                q0_geom.q_tl_ls * dir_b.z_primary_psi[row] + q0_geom.q_ll_ls * dir_b.z_ls_psi[row];
             let q0_ll_ab = q0_ab;
 
             let m_a = g2[row] * q0_a;
@@ -19632,7 +19556,7 @@ impl BinomialLocationScaleWiggleFamily {
     fn exact_newton_joint_psihessian_directional_derivative_from_parts(
         &self,
         block_states: &[ParameterBlockState],
-        dir_a: &BinomialLocationScaleJointPsiDirection,
+        dir_a: &LocationScaleJointPsiDirection,
         d_beta_flat: &Array1<f64>,
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
@@ -19688,7 +19612,7 @@ impl BinomialLocationScaleWiggleFamily {
         }
         let xi_t = x_t.dot(&u_t);
         let xi_ls = x_ls.dot(&u_ls);
-        let x_t_map = dir_a.x_t_psi.as_linear_map_ref();
+        let x_t_map = dir_a.x_primary_psi.as_linear_map_ref();
         let x_ls_map = dir_a.x_ls_psi.as_linear_map_ref();
         let m = d0.dot(betaw) + 1.0;
         let g2 = dd0.dot(betaw);
@@ -19784,16 +19708,18 @@ impl BinomialLocationScaleWiggleFamily {
             let dq0_tl_ls_u = q0_tl_ls_ls * xi_ls_i;
             let dq0_ll_ls_u = q0_tl_ls_ls * xi_t_i + q0_ll_ls_ls * xi_ls_i;
 
-            let q0_a = -q0.q_t * dir_a.z_t_psi[row] - q0.q_ls * dir_a.z_ls_psi[row];
+            let q0_a = -q0.q_t * dir_a.z_primary_psi[row] - q0.q_ls * dir_a.z_ls_psi[row];
             let q0_t_a = q0.q_tl_ls * dir_a.z_ls_psi[row];
-            let q0_ls_a = q0.q_tl_ls * dir_a.z_t_psi[row] + q0.q_ll_ls * dir_a.z_ls_psi[row];
+            let q0_ls_a = q0.q_tl_ls * dir_a.z_primary_psi[row] + q0.q_ll_ls * dir_a.z_ls_psi[row];
             let q0_tl_a = q0.q_tl_ls * dir_a.z_ls_psi[row];
-            let q0_ll_a = q0.q_tl_ls * dir_a.z_t_psi[row] + q0.q_ll_ls * dir_a.z_ls_psi[row];
+            let q0_ll_a = q0.q_tl_ls * dir_a.z_primary_psi[row] + q0.q_ll_ls * dir_a.z_ls_psi[row];
             let dq0_a_u = q0_t_a * xi_t_i + q0_ls_a * xi_ls_i;
             let dq0_t_a_u = dq0_tl_ls_u * dir_a.z_ls_psi[row];
-            let dq0_ls_a_u = dq0_tl_ls_u * dir_a.z_t_psi[row] + dq0_ll_ls_u * dir_a.z_ls_psi[row];
+            let dq0_ls_a_u =
+                dq0_tl_ls_u * dir_a.z_primary_psi[row] + dq0_ll_ls_u * dir_a.z_ls_psi[row];
             let dq0_tl_a_u = dq0_tl_ls_u * dir_a.z_ls_psi[row];
-            let dq0_ll_a_u = dq0_tl_ls_u * dir_a.z_t_psi[row] + dq0_ll_ls_u * dir_a.z_ls_psi[row];
+            let dq0_ll_a_u =
+                dq0_tl_ls_u * dir_a.z_primary_psi[row] + dq0_ll_ls_u * dir_a.z_ls_psi[row];
 
             let q_t = m[row] * q0.q_t;
             let q_ls = m[row] * q0.q_ls;
@@ -20533,7 +20459,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         // Operator-aware: matrix-free workspace applies joint Hv at
         // O(n · (p_t + p_ℓ + p_w)); only fall back to the dense build cost when
         // `use_joint_matrix_free_path` declines the operator path.
-        crate::families::coefficient_cost::joint_coupled_operator_aware_hessian_cost(
+        crate::families::location_scale_engine::location_scale_coefficient_hessian_cost(
             self.y.len() as u64,
             specs,
         )
