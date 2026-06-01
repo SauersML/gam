@@ -396,8 +396,14 @@ fn median_pointwise_beta_variance(fit: &BernoulliMarginalSlopeFitResult, x_grid:
     let p_logslope = dense.ncols();
 
     // Locate the logslope block's coefficient slice in the joint covariance:
-    // block 0 = marginal, block 1 = logslope (bms/block_specs.rs).
-    let p_marginal = fit.marginal_design.design.ncols();
+    // block 0 = marginal, block 1 = logslope (bms/block_specs.rs). The joint
+    // covariance is over the concatenated per-block β in block order, so the
+    // logslope slice starts at the marginal block's ACTUAL coefficient count —
+    // `blocks[0].beta.len()`, NOT `marginal_design.design.ncols()`. Under the
+    // #461 orthogonalized arm the marginal block is widened to `[M | Z̃_infl]`
+    // (its β grows by p₁), while `marginal_design` still reports the raw `M`
+    // width; using the widened count keeps the offset correct for both arms.
+    let p_marginal = fit.fit.blocks[0].beta.len();
     // Vb (conditional posterior covariance Var(β | λ) = H⁻¹·φ̂) is the natural
     // pointwise sampling-noise scale here; `compute_covariance: true` populates
     // it on the Stage-2 fit.
