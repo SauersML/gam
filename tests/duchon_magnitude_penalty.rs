@@ -64,7 +64,10 @@ fn penalty_sources(spec: &DuchonBasisSpec, data: &Array2<f64>) -> Vec<PenaltySou
 fn magnitude_penalty_is_emitted_only_when_opted_in() {
     let data = synthetic_data(200, 2, 7);
 
-    let default_sources = penalty_sources(&duchon_spec(20, DuchonOperatorPenaltySpec::default()), &data);
+    let default_sources = penalty_sources(
+        &duchon_spec(20, DuchonOperatorPenaltySpec::default()),
+        &data,
+    );
     assert!(
         default_sources
             .iter()
@@ -78,8 +81,10 @@ fn magnitude_penalty_is_emitted_only_when_opted_in() {
         "default Duchon must NOT include a magnitude (OperatorMass) penalty; got {default_sources:?}"
     );
 
-    let mag_sources =
-        penalty_sources(&duchon_spec(20, DuchonOperatorPenaltySpec::magnitude_only()), &data);
+    let mag_sources = penalty_sources(
+        &duchon_spec(20, DuchonOperatorPenaltySpec::magnitude_only()),
+        &data,
+    );
     assert!(
         mag_sources
             .iter()
