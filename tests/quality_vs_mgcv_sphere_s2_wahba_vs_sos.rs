@@ -46,10 +46,7 @@ use ndarray::Array2;
 use std::io::Write as _;
 use std::path::Path;
 
-const QUAKES_CSV: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/bench/datasets/quakes.csv"
-);
+const QUAKES_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/quakes.csv");
 
 /// Known smooth signal on the sphere, evaluated from degree-valued lat/lon.
 /// f = a·sin(lat)·cos(lon) is a real, infinitely-smooth, low-frequency field on
@@ -69,14 +66,8 @@ fn gam_sphere_matches_mgcv_sos_on_geographic_surface() {
     let mut lines = raw.lines();
     let header = lines.next().expect("csv header");
     let cols: Vec<&str> = header.split(',').collect();
-    let lat_col = cols
-        .iter()
-        .position(|c| *c == "lat")
-        .expect("lat column");
-    let lon_col = cols
-        .iter()
-        .position(|c| *c == "long")
-        .expect("long column");
+    let lat_col = cols.iter().position(|c| *c == "lat").expect("lat column");
+    let lon_col = cols.iter().position(|c| *c == "long").expect("long column");
 
     let mut lat_all: Vec<f64> = Vec::new();
     let mut lon_all: Vec<f64> = Vec::new();

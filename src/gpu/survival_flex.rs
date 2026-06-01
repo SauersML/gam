@@ -1384,12 +1384,11 @@ impl SurvivalFlexGpuBackend {
         let d_q1_index = mk_htod_i32(&flat.q1_index, "q1_index")?;
         let d_qd1_index = mk_htod_i32(&flat.qd1_index, "qd1_index")?;
 
-        let mut d_nll =
-            stream
-                .alloc_zeros::<f64>(n)
-                .map_err(|err| GpuError::DriverCallFailed {
-                    reason: format!("survival_flex primary alloc_zeros nll: {err}"),
-                })?;
+        let mut d_nll = stream
+            .alloc_zeros::<f64>(n)
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("survival_flex primary alloc_zeros nll: {err}"),
+            })?;
         let mut d_grad =
             stream
                 .alloc_zeros::<f64>(n * r)
@@ -1576,7 +1575,8 @@ pub fn cpu_oracle_flex_primary_rows(
         let log_phi_eta1 = -0.5 * (exit_eta * exit_eta + ln_tau);
         let log_phi_q1 = -0.5 * (q1 * q1 + ln_tau);
         nll[i] = wi
-            * (row.log_surv0 - (1.0 - di) * row.log_surv1
+            * (row.log_surv0
+                - (1.0 - di) * row.log_surv1
                 - di * log_phi_eta1
                 - di * exit_chi.ln()
                 - di * log_phi_q1
@@ -1621,8 +1621,7 @@ pub fn cpu_oracle_flex_primary_rows(
                     + exit_surv_u1 * row.exit.eta_uv[off_uv];
                 val += wi
                     * di
-                    * (row.exit.eta_u[u] * row.exit.eta_u[v]
-                        + exit_eta * row.exit.eta_uv[off_uv]);
+                    * (row.exit.eta_u[u] * row.exit.eta_u[v] + exit_eta * row.exit.eta_uv[off_uv]);
                 // − d·log χ₁ — FLAGGED catastrophic-cancellation ratio.
                 val -= wi
                     * di
@@ -1634,8 +1633,7 @@ pub fn cpu_oracle_flex_primary_rows(
                 // + d·log d — same cancellation-prone structure.
                 val += wi
                     * di
-                    * (row.exit.d_uv[off_uv] / exit_d
-                        - (row.exit.d_u[u] * row.exit.d_u[v]) / d_sq);
+                    * (row.exit.d_uv[off_uv] / exit_d - (row.exit.d_u[u] * row.exit.d_u[v]) / d_sq);
                 if (u as i32) == qd1_index && (v as i32) == qd1_index {
                     val += wi * di / (qd1 * qd1);
                 }

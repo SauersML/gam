@@ -26,12 +26,7 @@ fn std_dev(v: &[f64]) -> f64 {
 
 fn rmse(a: &[f64], b: &[f64]) -> f64 {
     let n = a.len() as f64;
-    (a.iter()
-        .zip(b)
-        .map(|(x, y)| (x - y).powi(2))
-        .sum::<f64>()
-        / n)
-        .sqrt()
+    (a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum::<f64>() / n).sqrt()
 }
 
 #[test]
@@ -55,11 +50,7 @@ fn scale_dims_shrinks_an_irrelevant_axis() {
     let headers = ["x1", "x2", "y"].into_iter().map(String::from).collect();
     let rows = (0..n)
         .map(|i| {
-            csv::StringRecord::from(vec![
-                x1[i].to_string(),
-                x2[i].to_string(),
-                y[i].to_string(),
-            ])
+            csv::StringRecord::from(vec![x1[i].to_string(), x2[i].to_string(), y[i].to_string()])
         })
         .collect();
     let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode dataset");
