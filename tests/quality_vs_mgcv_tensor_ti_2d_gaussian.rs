@@ -16,7 +16,10 @@
 //!      sum-to-zero centering before the tensor product must purge all main
 //!      effects. We assert this directly on gam's own fitted surface — its
 //!      x-marginal means and z-marginal means over the regular grid must each
-//!      vanish (max |marginal mean| <= 1e-6 · range) — and that the smooth block
+//!      vanish *once the model intercept (grand mean) is removed* — a leaked
+//!      main effect is a margin-index-dependent mean, whereas the intercept
+//!      merely shifts every margin equally and is legitimate (max
+//!      |grand-mean-removed marginal mean| <= 1e-6 · range) — and that the smooth block
 //!      carries exactly `(k-1)^2` coefficients (the Kronecker null-space
 //!      dimension `Z₀ ⊗ Z₁`). A non-zero marginal mean or a wrong coefficient
 //!      count is direct proof the `ti` contract is broken (it would have leaked
@@ -83,16 +86,24 @@ fn anova_interaction(v: &[f64], rows: usize, cols: usize) -> Vec<f64> {
 }
 
 /// Max absolute x-marginal (row) mean and z-marginal (column) mean of a
-/// row-major `rows x cols` grid. For a genuine interaction-only surface both
-/// must be ~0 at every margin index.
+/// row-major `rows x cols` grid, AFTER removing the overall (grand) mean. A
+/// leaked main effect shows up as a margin-index-dependent mean — i.e. a
+/// systematic row-to-row or column-to-column variation. The model INTERCEPT,
+/// by contrast, shifts every marginal mean by the same constant and is NOT a
+/// main-effect leak, so it must be subtracted out before the check (otherwise
+/// the metric measures the grand mean of the surface, not an interaction
+/// contract violation). For a genuine interaction-only surface every
+/// grand-mean-removed marginal mean must be ~0 at every margin index.
 fn max_marginal_mean(v: &[f64], rows: usize, cols: usize) -> f64 {
+    let n = (rows * cols) as f64;
+    let grand: f64 = v.iter().sum::<f64>() / n;
     let mut worst = 0.0_f64;
     for i in 0..rows {
-        let m: f64 = (0..cols).map(|j| v[i * cols + j]).sum::<f64>() / cols as f64;
+        let m: f64 = (0..cols).map(|j| v[i * cols + j]).sum::<f64>() / cols as f64 - grand;
         worst = worst.max(m.abs());
     }
     for j in 0..cols {
-        let m: f64 = (0..rows).map(|i| v[i * cols + j]).sum::<f64>() / rows as f64;
+        let m: f64 = (0..rows).map(|i| v[i * cols + j]).sum::<f64>() / rows as f64 - grand;
         worst = worst.max(m.abs());
     }
     worst
@@ -240,8 +251,12 @@ fn gam_ti_2d_interaction_recovers_truth() {
     );
 
     // (2) STRUCTURE: the fitted ti surface is genuinely interaction-only — every
-    //     x-marginal mean and z-marginal mean must vanish. This is the load-
-    //     bearing `ti` contract, asserted directly on gam's own output.
+    //     x-marginal mean and z-marginal mean must vanish ONCE the model
+    //     intercept (grand mean) is removed. A leaked main effect is a
+    //     margin-index-dependent mean; the intercept shifts every marginal mean
+    //     by the same constant and is legitimate, so `max_marginal_mean`
+    //     subtracts the grand mean first. This is the load-bearing `ti`
+    //     contract, asserted directly on gam's own output.
     assert!(
         gam_marginal <= 1e-6 * truth_int_range.max(1.0),
         "gam ti surface leaks a main effect: max |marginal mean| = {gam_marginal:.3e} \
