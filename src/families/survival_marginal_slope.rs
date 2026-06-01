@@ -876,6 +876,12 @@ struct FlexPrimarySlices {
     g: usize,
     h: Option<std::ops::Range<usize>>,
     w: Option<std::ops::Range<usize>>,
+    /// Single trailing primary index for the absorbed Stage-1 influence offset
+    /// `o_infl` (#461). Unlike `g`/`h`/`w`, `o_infl` does NOT enter the de-nested
+    /// calibration cells — it is a pure additive shift of the OBSERVED index η₁,
+    /// so its only non-zero primary partial is `∂η₁/∂o_infl = 1` injected at the
+    /// observed-timepoint reconstruction (cell-coefficient partials stay zero).
+    infl: Option<usize>,
     total: usize,
 }
 
@@ -936,6 +942,15 @@ fn flex_primary_slices(family: &SurvivalMarginalSlopeFamily) -> FlexPrimarySlice
         cursor = range.end;
         range
     });
+    // The absorber contributes a single primary scalar `o_infl` (trailing all
+    // flex bases). Its full coefficient block lives in the `Influence`
+    // ParameterBlockSpec; here it is one primary channel whose row-design is
+    // `Z̃_infl[row,:]`, projected by `add_pullback`.
+    let infl = family.influence_absorber.as_ref().map(|_| {
+        let idx = cursor;
+        cursor += 1;
+        idx
+    });
     FlexPrimarySlices {
         q0,
         q1,
@@ -943,6 +958,7 @@ fn flex_primary_slices(family: &SurvivalMarginalSlopeFamily) -> FlexPrimarySlice
         g,
         h,
         w,
+        infl,
         total: cursor,
     }
 }
@@ -6821,6 +6837,7 @@ impl SurvivalMarginalSlopeFamily {
         d_calibration: f64,
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
+        o_infl: f64,
     ) -> Result<SurvivalFlexTimepointFirstOrderExact, String> {
         let p = primary.total;
         let cached =
@@ -6985,6 +7002,7 @@ impl SurvivalMarginalSlopeFamily {
         d_calibration: f64,
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
+        o_infl: f64,
         need_d_uv: bool,
     ) -> Result<SurvivalFlexTimepointExact, String> {
         let p = primary.total;
@@ -7154,7 +7172,13 @@ impl SurvivalMarginalSlopeFamily {
         let z_obs = self.observed_score_projection(row);
         let u_obs = a + b * z_obs;
         let obs = self.observed_denested_cell_partials(row, a, b, beta_h, beta_w)?;
-        let eta = eval_coeff4_at(&obs.coeff, z_obs);
+        // The absorbed-influence offset shifts the OBSERVED index η₁ additively
+        // (#461). It is independent of the calibration intercept `a`, so it
+        // touches only `eta` itself and the trailing `infl` primary partial
+        // `∂η₁/∂o_infl = 1` (set via `rho[infl]` below); every calibration-side
+        // quantity (`a_u`, `chi`, `chi_u`, `d_u`, all second partials) is
+        // untouched because `o_infl` never enters the de-nested cells.
+        let eta = eval_coeff4_at(&obs.coeff, z_obs) + o_infl;
         let chi = eval_coeff4_at(&obs.dc_da, z_obs);
         let eta_aa = eval_coeff4_at(&obs.dc_daa, z_obs);
         let eta_aaa = eval_coeff4_at(&obs.dc_daaa, z_obs);
@@ -7164,6 +7188,12 @@ impl SurvivalMarginalSlopeFamily {
         let mut tau_a = Array1::<f64>::zeros(p);
         let scale = self.probit_frailty_scale();
         rho[primary.g] = eval_coeff4_at(&obs.dc_db, z_obs);
+        // Direct observed partial of the absorber channel: `∂η₁/∂o_infl = 1`
+        // (and `a_u[infl] = 0`), so `eta_u[infl] = chi·0 + rho[infl] = 1`. All
+        // other `infl` entries (tau, tau_a, second partials) stay zero.
+        if let Some(infl) = primary.infl {
+            rho[infl] = 1.0;
+        }
         tau[primary.g] = eval_coeff4_at(&obs.dc_dab, z_obs);
         tau_a[primary.g] = eval_coeff4_at(&obs.dc_daab, z_obs);
 
@@ -7367,8 +7397,9 @@ impl SurvivalMarginalSlopeFamily {
         let g = block_states[2].eta[row];
         let beta_h = self.flex_score_beta(block_states)?;
         let beta_w = self.flex_link_beta(block_states)?;
+        let o_infl = self.influence_index_offset(row, block_states)?;
         self.compute_row_flex_primary_gradient_hessian_from_parts(
-            row, q_geom.q0, q_geom.q1, q_geom.qd1, g, beta_h, beta_w, primary,
+            row, q_geom.q0, q_geom.q1, q_geom.qd1, g, beta_h, beta_w, o_infl, primary,
         )
     }
 
@@ -7489,6 +7520,7 @@ impl SurvivalMarginalSlopeFamily {
         g: f64,
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
+        o_infl: f64,
         primary: &FlexPrimarySlices,
     ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
         if survival_derivative_guard_violated(qd1, self.derivative_guard) {
@@ -7516,10 +7548,10 @@ impl SurvivalMarginalSlopeFamily {
             Some((row, SurvivalInterceptSlotKind::Exit)),
         )?;
         let entry = self.compute_survival_timepoint_exact(
-            row, primary, q0, primary.q0, a0, g, d0, beta_h, beta_w, false,
+            row, primary, q0, primary.q0, a0, g, d0, beta_h, beta_w, o_infl, false,
         )?;
         let exit = self.compute_survival_timepoint_exact(
-            row, primary, q1, primary.q1, a1, g, d1, beta_h, beta_w, true,
+            row, primary, q1, primary.q1, a1, g, d1, beta_h, beta_w, o_infl, true,
         )?;
 
         if !exit.chi.is_finite() || exit.chi <= 0.0 {
@@ -11063,6 +11095,7 @@ impl SurvivalMarginalSlopeFamily {
         let g = block_states[2].eta[row];
         let beta_h = self.flex_score_beta(block_states)?;
         let beta_w = self.flex_link_beta(block_states)?;
+        let o_infl = self.influence_index_offset(row, block_states)?;
 
         if survival_derivative_guard_violated(qd1, self.derivative_guard) {
             return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
@@ -11089,10 +11122,10 @@ impl SurvivalMarginalSlopeFamily {
         )?;
 
         let entry = self.compute_survival_timepoint_exact(
-            row, &primary, q0, primary.q0, a0, g, d0, beta_h, beta_w, false,
+            row, &primary, q0, primary.q0, a0, g, d0, beta_h, beta_w, o_infl, false,
         )?;
         let exit = self.compute_survival_timepoint_exact(
-            row, &primary, q1, primary.q1, a1, g, d1, beta_h, beta_w, true,
+            row, &primary, q1, primary.q1, a1, g, d1, beta_h, beta_w, o_infl, true,
         )?;
 
         if !exit.chi.is_finite() || exit.chi <= 0.0 {
@@ -11173,6 +11206,7 @@ impl SurvivalMarginalSlopeFamily {
         let g = block_states[2].eta[row];
         let beta_h = self.flex_score_beta(block_states)?;
         let beta_w = self.flex_link_beta(block_states)?;
+        let o_infl = self.influence_index_offset(row, block_states)?;
 
         if survival_derivative_guard_violated(qd1, self.derivative_guard) {
             return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
