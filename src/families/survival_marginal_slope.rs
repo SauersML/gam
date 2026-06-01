@@ -20014,17 +20014,52 @@ pub fn fit_survival_marginal_slope_terms(
     // and the free `score_warp` spline below is the x-free-column fallback.
     let influence_absorber_residualized: Option<Array2<f64>> =
         if let Some(jac) = spec.score_influence_jacobian.as_ref() {
+            use crate::families::marginal_slope_orthogonal::{
+                influence_block_design, residualize_influence_columns, ScoreInfluenceJacobian,
+            };
             let marginal_dense = marginal_design
                 .design
                 .try_to_dense_by_chunks("survival marginal-slope influence-absorber marginal span")?;
+            // Realized leakage directions `Z_infl = diag(s_f·β̂₀)·J` via the core
+            // builder; `β̂₀(x_i)` is the rigid-pilot logslope and `s_f =
+            // probit_scale`. `influence_block_design` reads only `columns`; the
+            // latent score `z_primary` is the genuine `z` on these rows.
+            let jacobian = ScoreInfluenceJacobian {
+                columns: jac.clone(),
+                z: z_primary.clone(),
+            };
             let rigid_logslope_at_rows = &spec.logslope_offset + baseline_slope;
-            let residualized = crate::families::marginal_slope_orthogonal::build_residualized_influence_columns(
-                jac,
-                &marginal_dense,
-                &rigid_logslope_at_rows,
+            let z_infl =
+                influence_block_design(&jacobian, &rigid_logslope_at_rows, probit_scale);
+            // Marginal-Gram ridge scaled to the weighted Gram's own magnitude so
+            // the projection solve stays stable when the marginal design is
+            // rank-deficient at the pilot, without perturbing a well-conditioned
+            // projection. Identical scaling to the BMS absorber site (single
+            // source of truth for the residualization math is
+            // `residualize_influence_columns`; only this caller-side ridge scale
+            // is shared by value).
+            let gram_scale = (0..marginal_dense.ncols())
+                .map(|j| {
+                    (0..marginal_dense.nrows())
+                        .map(|i| {
+                            cross_block_pilot_w[i] * marginal_dense[[i, j]] * marginal_dense[[i, j]]
+                        })
+                        .sum::<f64>()
+                })
+                .fold(0.0_f64, f64::max);
+            let eps = (gram_scale * 1e-10).max(1e-12);
+            let residualized = residualize_influence_columns(
+                &z_infl,
+                marginal_dense.view(),
                 &cross_block_pilot_w,
-                probit_scale,
-            )?;
+                eps,
+            );
+            if residualized.iter().any(|v| !v.is_finite()) {
+                return Err(SurvivalMarginalSlopeError::NumericalFailure {
+                    reason: "survival influence-absorber residualized columns contain non-finite entries".to_string(),
+                }
+                .into());
+            }
             Some(residualized)
         } else {
             None
