@@ -225,7 +225,7 @@ zero (recover the null by default; opt into overfitting). Scale-free unless
 | `power` | cubic default `s = (d−1)/2` | Riesz fractional smoothness `s`. The default gives `φ(r)=r³` in every dimension; an explicit value (e.g. `power=0` → `r²·log r` thin-plate in even `d`) is honored verbatim. |
 | `centers` (`k`, `basis_dim`) | auto | Number of centres. |
 | `length_scale` | none (scale-free) | Optional global scale. Without it, the kernel is pure polyharmonic; with it, the kernel is the hybrid Duchon-Matérn (κ = 1/length_scale). |
-| `scale_dims` | `false` | Per-axis anisotropy contrasts (ARD). |
+| `scale_dims` | `false` | Per-axis **relevance** (ARD by shrinkage): one gradient penalty `Σ(∂f/∂x_a)²` per input axis, each its own REML `λ_a`. REML flattens the surface along axes that don't earn their keep — automatic variable relevance via plain penalties. The kernel metric is held fixed at its knot-geometry init (not separately optimized). |
 | `periodic`, `period`, `period_start`, `period_end` | — | 1-D cyclic Duchon (see below). |
 
 `duchon()` rejects `double_penalty` — the Hilbert-scale penalty (curvature +
@@ -307,10 +307,19 @@ enables it globally across compatible spatial smooths.
 gamfit.fit(df, "y ~ matern(pc1, pc2, pc3, pc4)", scale_dimensions=True)
 ```
 
-- Matérn and hybrid Duchon (with `length_scale`): a global scale plus
-  centered per-axis contrasts.
-- Pure Duchon (no `length_scale`): centered per-axis contrasts only;
-  remains scale-free.
+There are two distinct mechanisms, matched to the kernel:
+
+- **Duchon** (pure or hybrid): per-axis **relevance penalties** — one gradient
+  penalty `Σ(∂f/∂x_a)²` per axis, each with its own REML `λ_a`. REML shrinks an
+  axis's contribution toward flat only when the data don't support it
+  (variable relevance / ARD by shrinkage). The kernel metric stays fixed at its
+  knot-geometry init — well-conditioned and analytic (the per-axis penalty's
+  derivative is just `λ_a S_a`), and it scales: the penalty blocks are
+  centers-space (`O(k)`, `n`-free) and add nothing to the GPU data Hessian.
+  A hybrid Duchon (with `length_scale`) still learns its single global scale.
+- **Matérn**: kernel-metric ARD — learns per-axis log-scales (length scales) in
+  the covariance kernel itself. This is the natural, well-conditioned ARD for a
+  length-scale kernel, so Matérn keeps it.
 - Thin-plate: inputs are automatically standardized; `scale_dims` is
   not a learned anisotropy knob for this family.
 - Tensor-product formula terms are parsed but not currently built.
