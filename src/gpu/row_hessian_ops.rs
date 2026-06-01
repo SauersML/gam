@@ -448,6 +448,10 @@ pub(crate) fn cpu_row_hessian_diag(inputs: &RowHessianDiagInputs<'_>) -> Vec<f64
 
 #[cfg(test)]
 mod tests {
+    // All items below are `#[cfg(target_os = "linux")]` (GPU parity), so the
+    // glob import is only live on Linux; gate it to avoid an unused-import
+    // error when compiling the lib tests on other platforms.
+    #[cfg(target_os = "linux")]
     use super::*;
 
     /// Deterministic non-trivial Hessian fixture. Generates per-row
