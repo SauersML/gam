@@ -1402,8 +1402,12 @@ fn compute_smoothing_correction(
     let beta_trans = final_fit.beta_transformed.as_ref();
     let ct = &final_fit.reparam_result.canonical_transformed;
 
-    // Build Jacobian matrix J where column k is dβ/dρ_k
-    let mut jacobian_trans = Array2::<f64>::zeros((n_coeffs_trans, n_rho));
+    // Build the stationarity-gradient derivative matrix G_ρ where column k is
+    // ∂g(β,ρ)/∂ρ_k = λ_k S_k(β - μ_k), then delegate the IFT solve
+    // dβ/dρ = -H⁻¹G_ρ to the canonical evidence helper. This keeps the
+    // coefficient-space prediction correction and the joint-evidence
+    // Arrow-Schur path on the same hand-derived IFT identity.
+    let mut dg_drho_trans = Array2::<f64>::zeros((n_coeffs_trans, n_rho));
     for k in 0..n_rho {
         if k >= ct.len() {
             continue;
@@ -1417,19 +1421,28 @@ fn compute_smoothing_correction(
         let beta_block = beta_trans.slice(s![r.start..r.end]);
         let centered = &beta_block - &cp.prior_mean;
         let r_beta = cp.root.dot(&centered);
-        let mut s_k_beta = Array1::<f64>::zeros(n_coeffs_trans);
         for a in 0..cp.block_dim() {
-            s_k_beta[r.start + a] = (0..cp.rank())
-                .map(|row| cp.root[[row, a]] * r_beta[row])
-                .sum::<f64>();
+            dg_drho_trans[[r.start + a, k]] = lambdas[k]
+                * (0..cp.rank())
+                    .map(|row| cp.root[[row, a]] * r_beta[row])
+                    .sum::<f64>();
         }
-
-        // dβ/dρ_k = -H^{-1}(λ_k S_k(β - μ))
-        let rhs = s_k_beta.mapv(|v| -lambdas[k] * v);
-        let delta = h_chol.solvevec(&rhs);
-
-        jacobian_trans.column_mut(k).assign(&delta);
     }
+    let jacobian_trans = match crate::solver::evidence::ift_dbeta_drho_from_solver(
+        n_coeffs_trans,
+        dg_drho_trans.view(),
+        |rhs| h_chol.solvevec(rhs),
+    ) {
+        Some(jacobian) => jacobian,
+        None => {
+            log::warn!("IFT beta-rho sensitivity solve failed for smoothing correction; skipping.");
+            return SmoothingCorrectionComputation {
+                correction: None,
+                hessian_rho: None,
+                active_rank: None,
+            };
+        }
+    };
 
     // Step 2: Build V_rho by inverting the LAML Hessian in rho-space.
     // The authoritative inner-strategy path chooses the rho-space Hessian

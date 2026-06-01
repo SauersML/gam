@@ -633,6 +633,32 @@ pub fn ift_du_dbeta(cache: &ArrowFactorCache) -> Array2<f64> {
 /// Returns `None` if the Schur factor is unavailable (PCG mode) or was
 /// built from a damped operator; callers must not silently substitute an
 /// approximation.
+pub(crate) fn ift_dbeta_drho_from_solver(
+    beta_dim: usize,
+    dg_drho: ArrayView2<'_, f64>,
+    mut solve_beta_hessian: impl FnMut(&Array1<f64>) -> Array1<f64>,
+) -> Option<Array2<f64>> {
+    let r = dg_drho.ncols();
+    if dg_drho.nrows() != beta_dim {
+        return None;
+    }
+    let mut out = Array2::<f64>::zeros((beta_dim, r));
+    let mut rhs = Array1::<f64>::zeros(beta_dim);
+    for a in 0..r {
+        for row in 0..beta_dim {
+            rhs[row] = dg_drho[[row, a]];
+        }
+        let solved = solve_beta_hessian(&rhs);
+        if solved.len() != beta_dim || solved.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+        for row in 0..beta_dim {
+            out[[row, a]] = -solved[row];
+        }
+    }
+    Some(out)
+}
+
 pub fn ift_dbeta_drho(
     cache: &ArrowFactorCache,
     dg_red_drho: ArrayView2<'_, f64>,
@@ -641,23 +667,9 @@ pub fn ift_dbeta_drho(
         return None;
     }
     let schur = cache.schur_factor.as_ref()?;
-    let k = cache.k;
-    let r = dg_red_drho.ncols();
-    if dg_red_drho.nrows() != k {
-        return None;
-    }
-    let mut out = Array2::<f64>::zeros((k, r));
-    let mut rhs = Array1::<f64>::zeros(k);
-    for a in 0..r {
-        for row in 0..k {
-            rhs[row] = dg_red_drho[[row, a]];
-        }
-        let x = cholesky_solve_vector(schur, &rhs);
-        for row in 0..k {
-            out[[row, a]] = -x[row];
-        }
-    }
-    Some(out)
+    ift_dbeta_drho_from_solver(cache.k, dg_red_drho, |rhs| {
+        cholesky_solve_vector(schur, rhs)
+    })
 }
 
 /// Tier-3 IFT sensitivity `∂u*/∂ρ` (proposal §2.6 / §7).
