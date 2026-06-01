@@ -138,27 +138,12 @@ jobs:
           mapfile -t files < <(ls tests/quality_vs_*.rs 2>/dev/null | xargs -n1 basename | sed 's/\.rs$//')
           echo "building ${#files[@]} quality test target(s) in ONE invocation (parallel codegen)"
           # A single multi---test invocation links all binaries in one cargo run.
-          # CRITICAL: emit the test->binary map (message-format=json) so the run
-          # step can EXECUTE the built binaries DIRECTLY — invoking `cargo test`
-          # per target re-does freshness/link work 141× and blew the timeout.
+          # The run step then EXECUTES each built binary DIRECTLY (globbed from
+          # target/debug/deps) — invoking `cargo test` per target re-did
+          # freshness/link work 141× and blew the timeout (the all-TIMEOUT bug).
           args=(); for t in "${files[@]}"; do args+=(--test "$t"); done
-          cargo test --no-run --message-format=json "${args[@]}" > /tmp/cargo_build.json 2>/tmp/cargo_build.err \
+          cargo test --no-run "${args[@]}" 2>&1 | tail -120 \
             || echo "build reported errors; missing binaries are flagged BUILDFAIL in the run step"
-          tail -40 /tmp/cargo_build.err || true
-          python3 - <<'PY'
-import json
-m = {}
-for line in open("/tmp/cargo_build.json"):
-    try: o = json.loads(line)
-    except Exception: continue
-    if o.get("reason") == "compiler-artifact" and o.get("executable") \
-       and "test" in (o.get("target", {}).get("kind") or []):
-        m[o["target"]["name"]] = o["executable"]
-with open("/tmp/testbins.tsv", "w") as f:
-    for k, v in sorted(m.items()):
-        f.write(f"{k}\t{v}\n")
-print(f"mapped {len(m)} test binaries -> /tmp/testbins.tsv")
-PY
 
       - name: Run quality suite (resilient + streaming; failures tolerated)
         shell: bash
@@ -169,11 +154,6 @@ PY
           # the expected, tolerated outcome here; we classify and stream them.
           set +e -u -o pipefail
           mapfile -t files < <(ls tests/quality_vs_*.rs 2>/dev/null | xargs -n1 basename | sed 's/\.rs$//')
-          # Load the test->binary map from the build step.
-          declare -A BIN
-          if [ -f /tmp/testbins.tsv ]; then
-            while IFS=$'\t' read -r name path; do BIN["$name"]="$path"; done < /tmp/testbins.tsv
-          fi
           N=${#files[@]}; i=0; pass=0; fail=0; bf=0; tmo=0
           RES=/tmp/quality_results.tsv; : > "$RES"
           {
@@ -185,7 +165,9 @@ PY
           for t in "${files[@]}"; do
             i=$((i+1))
             echo "::group::[$i/$N] $t"
-            bin="${BIN[$t]:-}"
+            # Newest executable binary for this test in target/debug/deps
+            # (exclude .d/.rlib/etc.); built once by the build step above.
+            bin=$(find target/debug/deps -maxdepth 1 -type f -perm -u+x -name "${t}-*" ! -name '*.*' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
             if [ -z "$bin" ] || [ ! -x "$bin" ]; then
               # No binary => the build step couldn't compile this test.
               outcome=BUILDFAIL; bf=$((bf+1)); metric=""
