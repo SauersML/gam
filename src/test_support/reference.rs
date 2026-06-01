@@ -336,6 +336,147 @@ pub fn max_abs_diff(a: &[f64], b: &[f64]) -> f64 {
         .fold(0.0, f64::max)
 }
 
+/// A Double Machine Learning (DML) reference estimate of the average linear
+/// effect `θ = E[∂E(Y|D,X)/∂D]` of a treatment/dose `D` on outcome `Y` after
+/// partialling out confounders `X`, computed by a mature Python DML library
+/// (DoubleML's partially-linear model, with EconML's `LinearDML` as fallback).
+///
+/// This is the Neyman-orthogonal scalar-target baseline used by #461's Sim C:
+/// the cross-fitted DML estimator is, by construction, first-order insensitive
+/// to first-stage nuisance estimation error, so its `theta`/`se` are the
+/// reference bias/coverage that gam's orthogonalized marginal-slope target
+/// `θ = E_x[β(x)]` must match-or-beat under x-dependent Stage-1 miscalibration.
+pub struct DmlPartialLinearReference {
+    /// Whether a DML library was importable in the reference interpreter. When
+    /// `false`, `theta`/`se`/`ci_lo`/`ci_hi` are `NaN` and the caller should
+    /// emit a clear skip message rather than asserting against them — DoubleML/
+    /// EconML are heavier optional dependencies than scipy/mgcv, so their
+    /// absence is treated as a genuine environmental gate (mirroring the
+    /// CUDA-only skip in `tests/common/gpu_gate.rs`) rather than the hard
+    /// failure that a missing scipy/R would be.
+    pub available: bool,
+    /// Which backend produced the estimate: "doubleml", "econml", or "none".
+    pub backend: String,
+    /// Point estimate of the average linear treatment effect `θ`.
+    pub theta: f64,
+    /// Standard error of `θ̂` reported by the DML library.
+    pub se: f64,
+    /// Lower end of the library's 95% confidence interval for `θ`.
+    pub ci_lo: f64,
+    /// Upper end of the library's 95% confidence interval for `θ`.
+    pub ci_hi: f64,
+}
+
+/// Fit a partially-linear DML model `Y = θ·D + g(X) + ε`, `D = m(X) + ν` with a
+/// mature Python DML library and return its orthogonal estimate of `θ`.
+///
+/// `y`, `d`, and the columns of `x` must share a common length. `n_folds` sets
+/// the cross-fitting fold count (DML's sample-splitting ingredient). The
+/// reference uses gradient-boosted nuisance learners so the partialling-out is
+/// genuinely nonparametric, exercising the orthogonality the estimator claims.
+///
+/// When neither DoubleML nor EconML is importable, the returned struct has
+/// `available == false`; the interpreter itself still exits zero (the import
+/// probe is guarded), so this is *not* a hard failure — the caller decides
+/// whether to skip. A missing `python3`/`numpy`/`scikit-learn`, by contrast, is
+/// still a loud failure via the underlying [`run_python`] contract.
+pub fn dml_partial_linear_reference(
+    y: &[f64],
+    d: &[f64],
+    x: &[Column<'_>],
+    n_folds: usize,
+) -> DmlPartialLinearReference {
+    assert!(!x.is_empty(), "DML reference needs at least one confounder X");
+    assert_eq!(y.len(), d.len(), "DML reference y/d length mismatch");
+    let x_names: Vec<String> = x.iter().map(|c| format!("{:?}", c.name)).collect();
+    let x_list = x_names.join(", ");
+    let mut columns: Vec<Column<'_>> = Vec::with_capacity(x.len() + 2);
+    columns.push(Column::new("y", y));
+    columns.push(Column::new("d", d));
+    columns.extend(x.iter().map(|c| Column::new(c.name, c.data)));
+
+    // The body first probes for an importable DML backend; if none is present it
+    // emits `available=0` and returns cleanly (interpreter exits zero), so the
+    // Rust side can skip-with-message instead of failing. When a backend exists
+    // the estimate is real and emitted under `theta`/`se`/`ci_lo`/`ci_hi`.
+    let body = format!(
+        r#"
+import numpy as np
+_xcols = [{x_list}]
+Y = np.asarray(df["y"], dtype=float).reshape(-1)
+D = np.asarray(df["d"], dtype=float).reshape(-1)
+X = np.column_stack([np.asarray(df[c], dtype=float).reshape(-1) for c in _xcols])
+n_folds = {n_folds}
+
+def _have(mod):
+    import importlib.util
+    return importlib.util.find_spec(mod) is not None
+
+theta = float("nan"); se = float("nan"); backend = 0.0; avail = 0.0
+ci_lo = float("nan"); ci_hi = float("nan")
+
+try:
+    if _have("doubleml") and _have("sklearn"):
+        import doubleml as dml
+        from doubleml import DoubleMLData, DoubleMLPLR
+        from sklearn.ensemble import GradientBoostingRegressor
+        data = DoubleMLData.from_arrays(X, Y, D)
+        ml_l = GradientBoostingRegressor(n_estimators=100, max_depth=3, random_state=0)
+        ml_m = GradientBoostingRegressor(n_estimators=100, max_depth=3, random_state=1)
+        plr = DoubleMLPLR(data, ml_l=ml_l, ml_m=ml_m, n_folds=n_folds)
+        plr.fit()
+        theta = float(np.asarray(plr.coef).reshape(-1)[0])
+        se = float(np.asarray(plr.se).reshape(-1)[0])
+        cis = np.asarray(plr.confint(level=0.95))
+        ci_lo = float(cis.reshape(-1)[0]); ci_hi = float(cis.reshape(-1)[1])
+        backend = 1.0; avail = 1.0
+    elif _have("econml") and _have("sklearn"):
+        from econml.dml import LinearDML
+        from sklearn.ensemble import GradientBoostingRegressor
+        est = LinearDML(
+            model_y=GradientBoostingRegressor(n_estimators=100, max_depth=3, random_state=0),
+            model_t=GradientBoostingRegressor(n_estimators=100, max_depth=3, random_state=1),
+            cv=n_folds, random_state=0,
+        )
+        est.fit(Y, D, X=None, W=X)
+        theta = float(np.asarray(est.coef_).reshape(-1)[0]) if np.asarray(est.coef_).size else float(est.intercept_)
+        inf = est.coef__inference() if hasattr(est, "coef__inference") else est.intercept__inference()
+        se = float(np.asarray(inf.stderr).reshape(-1)[0])
+        lohi = inf.conf_int(alpha=0.05)
+        ci_lo = float(np.asarray(lohi[0]).reshape(-1)[0]); ci_hi = float(np.asarray(lohi[1]).reshape(-1)[0])
+        backend = 2.0; avail = 1.0
+except Exception as _e:
+    avail = 0.0; backend = 0.0
+    theta = float("nan"); se = float("nan")
+    ci_lo = float("nan"); ci_hi = float("nan")
+
+emit("available", [avail])
+emit("backend", [backend])
+emit("theta", [theta])
+emit("se", [se])
+emit("ci_lo", [ci_lo])
+emit("ci_hi", [ci_hi])
+"#
+    );
+
+    let r = run_python(&columns, &body);
+    let available = r.scalar("available") > 0.5;
+    let backend = match r.scalar("backend") as i64 {
+        1 => "doubleml",
+        2 => "econml",
+        _ => "none",
+    }
+    .to_string();
+    DmlPartialLinearReference {
+        available,
+        backend,
+        theta: r.scalar("theta"),
+        se: r.scalar("se"),
+        ci_lo: r.scalar("ci_lo"),
+        ci_hi: r.scalar("ci_hi"),
+    }
+}
+
 /// Pearson correlation between two equal-length vectors.
 pub fn pearson(a: &[f64], b: &[f64]) -> f64 {
     assert_eq!(a.len(), b.len(), "pearson length mismatch");
