@@ -1,5 +1,5 @@
 - Autodiff is never used outside of tests as hand-derived derivatives enable performance optimizations. Exception: not-our-code not-our-problem, e.g., obviously autodiff will be used internally by PyTorch.
-- Finite differences is never used outside of tests. Only exception: differentiating observed data, where there is no function to differentiate. FD as a derivative/Hessian fallback is slop — derive the closed form. "FD is more stable" is not an excuse. (Exact difference *operators* like P-spline `S=DᵀD` are not FD.)
+- Finite differences is never used outside of tests. Only exception: differentiating observed data, where it is provably impossible to use a function.
 - Posterior mean must always be the default (never MAP).
 - Analytic, closed-forms should be supported in general for all model types.
 - Penalties must always be on the final function itself, never on the model coefficients. Exception: when it can be proven that penalizing model coefficients is precisely equivalent to the function value approach.
