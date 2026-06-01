@@ -3,6 +3,7 @@ use super::gradient_paths::*;
 use super::hessian_paths::{new_cell_moment_cache_stats, new_cell_moment_lru_cache};
 use super::install_flex::validate_spec;
 use super::*;
+use crate::families::marginal_slope_orthogonal::INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA;
 
 // ── BlockEffectiveJacobian impls for BMS ─────────────────────────────────────
 //
@@ -226,17 +227,6 @@ impl BlockEffectiveJacobian for BmsLogslopeJacobian {
         1
     }
 }
-
-/// Fixed (non-REML-learned) ridge `log λ` pinned on the absorbed Stage-1
-/// influence sub-block (#461). The influence columns `Z̃_infl` exist only to
-/// soak the `span(Z_infl)` component of the η-residual at training time, so
-/// their smoothing parameter is held at a fixed small ridge rather than
-/// optimised: too small and `γ` could eat genuine signal aliased into the
-/// leakage geometry; too large and `γ` cannot absorb the realized leakage. The
-/// slot's outer bounds are pinned to this value (degenerate box) so the joint
-/// ρ-optimiser never moves it. `ln(1.0) = 0.0` is the shared constant the
-/// survival marginal-slope mirror also uses (single source of truth).
-pub(crate) const INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA: f64 = 0.0;
 
 /// Build the absorbed Stage-1 influence columns `Z̃_infl` for the additive
 /// marginal-index block (#461, design §3).
