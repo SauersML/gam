@@ -1075,7 +1075,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             .to_owned();
         cursor += logslope_design.penalties.len();
         let p_m = marginal_design.design.ncols()
-            + influence_columns.map(|z| z.ncols()).unwrap_or(0);
+            + influence_columns.as_ref().map(|z| z.ncols()).unwrap_or(0);
         let mut blocks = vec![
             build_marginal_blockspec_bms(
                 marginal_design,
