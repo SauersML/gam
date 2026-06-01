@@ -73,6 +73,22 @@ jobs:
           cache-all-crates: true
           shared-key: reference-quality
 
+      - name: Install system libraries for reference tools
+        shell: bash
+        run: |
+          set -uo pipefail
+          # Several reference packages link system libs that are NOT on the bare
+          # runner, so they fail to load at test time and the test reports a
+          # spurious "reference unavailable" divergence instead of a real metric:
+          #   libudunits2  -> units/sf (spatial, manifold refs)
+          #   libGLU/mesa  -> rgl (loaded transitively by some geometry refs)
+          #   gsl          -> INLA and gsl-based refs
+          #   gdal/geos/proj -> sf spatial stack
+          sudo apt-get update -y || true
+          sudo apt-get install -y --no-install-recommends \
+            libudunits2-dev libglu1-mesa-dev libgsl-dev \
+            libgdal-dev libgeos-dev libproj-dev || true
+
       - name: Set up R
         uses: ./.github/actions/setup-bench-r
 
@@ -88,7 +104,8 @@ jobs:
                       "scam","splines2","cmprsk","lme4","nlme","fields","gss","GpGp",
                       "quantreg","mlt","tram","basefun","loo","jsonlite",
                       "spheresmooth","Directional","nprotreg","compositions",
-                      "robCompositions","scoringrules","gamboostLSS","mboost","bamlss")
+                      "robCompositions","scoringrules","gamboostLSS","mboost","bamlss",
+                      "gamlss.add")
             for (p in pkgs) if (!requireNamespace(p, quietly=TRUE))
               try(install.packages(p), silent=TRUE)
             cat("installed R packages:\n")
@@ -145,7 +162,7 @@ jobs:
           cargo test --no-run "${args[@]}" 2>&1 | tail -120 \
             || echo "build reported errors; missing binaries are flagged BUILDFAIL in the run step"
 
-      - name: Run quality suite (resilient + streaming; failures tolerated)
+      - name: Run quality suite (resilient + streaming; full per-test capture)
         shell: bash
         run: |
           # GitHub's `shell: bash` runs with `-e`, which would abort this step at
@@ -154,50 +171,123 @@ jobs:
           # the expected, tolerated outcome here; we classify and stream them.
           set +e -u -o pipefail
           mapfile -t files < <(ls tests/quality_vs_*.rs 2>/dev/null | xargs -n1 basename | sed 's/\.rs$//')
-          N=${#files[@]}; i=0; pass=0; fail=0; bf=0; tmo=0
-          RES=/tmp/quality_results.tsv; : > "$RES"
+          N=${#files[@]}; i=0
+          pass=0; diverge=0; refmiss=0; tmo=0; bf=0
+          # EVERYTHING the run produced lands under one directory that is uploaded
+          # wholesale: the full per-test stdout+stderr logs (no tail truncation),
+          # a rich un-truncated TSV, and a JSONL stream. The job-summary table and
+          # the totals are a VIEW on top of this complete captured data, never a
+          # lossy replacement for it.
+          OUT=/tmp/quality-report
+          rm -rf "$OUT"; mkdir -p "$OUT/logs"
+          RES="$OUT/quality_results.tsv"
+          JSONL="$OUT/quality_results.jsonl"
+          # Tab-separated, one header row, FULL (un-truncated) metric column so
+          # every captured quality figure for every test is preserved verbatim.
+          printf 'idx\toutcome\tcause\ttest\trc\tdur_s\tsub_passed\tsub_failed\tmetric\treason\n' > "$RES"
+          : > "$JSONL"
           {
-            echo "## Reference quality suite (streaming)"
+            echo "## Reference quality suite"
             echo ""
-            echo "| # | test | outcome | metric |"
-            echo "|---|---|---|---|"
+            echo "Each row is one test BINARY — often several sub-tests (a synthetic"
+            echo "arm plus an \`_on_real_data\` arm); \`sub\` is passed/failed WITHIN the"
+            echo "binary, and a single failing sub-test keeps the whole binary out of"
+            echo "PASS. \`cause\` separates a genuine gam-vs-reference divergence"
+            echo "(\`gam_diverge\`) from a missing/broken reference tool"
+            echo "(\`ref_unavail\`) and a timeout. Full per-test logs + an un-truncated"
+            echo "metric TSV + a JSONL stream are in the \`quality-results\` artifact."
+            echo ""
+            echo "| # | test | outcome | cause | sub p/f | dur | metrics | reason |"
+            echo "|---|---|---|---|---|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
           for t in "${files[@]}"; do
             i=$((i+1))
+            outcome=""; cause=""; reason=""; rc=0
             echo "::group::[$i/$N] $t"
+            log="$OUT/logs/$t.log"
             # Newest executable binary for this test in target/debug/deps
             # (exclude .d/.rlib/etc.); built once by the build step above.
             bin=$(find target/debug/deps -maxdepth 1 -type f -perm -u+x -name "${t}-*" ! -name '*.*' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+            start=$SECONDS
             if [ -z "$bin" ] || [ ! -x "$bin" ]; then
               # No binary => the build step couldn't compile this test.
-              outcome=BUILDFAIL; bf=$((bf+1)); metric=""
+              outcome=BUILDFAIL; rc=-1
+              echo "no executable binary found for $t — the build step could not compile it" > "$log"
             else
               # EXECUTE the pre-built binary directly — no cargo, no rebuild.
               # Per-test wall-clock cap bounds a hung fit/R/Python subprocess.
               # 124 = timed out, 137 = SIGKILL after.
-              timeout --kill-after=30 360 "$bin" --nocapture --test-threads=1 > "/tmp/$t.log" 2>&1
+              timeout --kill-after=30 360 "$bin" --nocapture --test-threads=1 > "$log" 2>&1
               rc=$?
-              metric=$(grep -hoaE '(R2|rmse|rel_l2|auc|deviance|nll|crps|acc|logloss|concordance|seam|edf|pearson|coverage|frechet|distance)[^ ,]*[=: ]-?[0-9.eE+]+' "/tmp/$t.log" 2>/dev/null | tr '\n' ' ' | head -c 110)
-              if [ "$rc" -eq 0 ]; then outcome=PASS; pass=$((pass+1))
-              elif [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then outcome=TIMEOUT; tmo=$((tmo+1))
-              else outcome=DIVERGE; fail=$((fail+1)); fi
             fi
-            printf '%s\t%s\t%s\n' "$outcome" "$t" "$metric" >> "$RES"
-            printf '| %d | %s | %s | %s |\n' "$i" "$t" "$outcome" "$metric" >> "$GITHUB_STEP_SUMMARY"
-            echo "[$i/$N] $outcome  $t  $metric"
-            [ -f "/tmp/$t.log" ] && tail -20 "/tmp/$t.log"
+            dur=$((SECONDS-start))
+            # Sub-test tallies from the libtest summary line in this binary's log.
+            res_line=$(grep -aE '^test result:' "$log" | tail -1)
+            sub_passed=$(printf '%s' "$res_line" | grep -oaE '[0-9]+ passed' | grep -oaE '[0-9]+' | head -1); sub_passed=${sub_passed:-0}
+            sub_failed=$(printf '%s' "$res_line" | grep -oaE '[0-9]+ failed' | grep -oaE '[0-9]+' | head -1); sub_failed=${sub_failed:-0}
+            # ALL numeric quality figures emitted by the test, un-truncated. The
+            # full log keeps everything regardless; this column is the structured,
+            # greppable distillation of every metric the test printed.
+            metric=$(grep -hoaE '(R2|r2|rmse|mae|rel_l2|l2|auc|deviance|nll|loglik|crps|acc|accuracy|logloss|concordance|c_index|seam|edf|pearson|spearman|coverage|width|bias|frechet|distance|geodesic|rho|ess|rhat|kl|wasserstein|calibration|brier|ci_|se_)[^ ,;)]*[=: ]+-?[0-9][0-9.eE+-]*' "$log" 2>/dev/null | tr '\n' ' ')
+            # Why it ended where it did: a missing/broken reference tool (R/Python
+            # package, system lib, namespace) vs a genuine divergence assertion.
+            refmarker=$(grep -aE 'there is no package called|could not find function|Error in library\(|package or namespace load failed|unable to load shared object|cannot open shared object|No module named|ModuleNotFoundError|reference .* body failed' "$log" | head -1)
+            panicmsg=$(awk '/panicked at/{loc=$0; getline; print loc " :: " $0; exit}' "$log")
+            if [ "$outcome" = BUILDFAIL ]; then
+              cause=build; reason=$(head -1 "$log"); bf=$((bf+1))
+            elif [ "$rc" -eq 0 ]; then
+              outcome=PASS; cause=ok; reason=""; pass=$((pass+1))
+            elif [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+              outcome=TIMEOUT; cause=timeout; reason="exceeded 360s wall-clock"; tmo=$((tmo+1))
+            elif [ -n "$refmarker" ]; then
+              # Reference tool missing/broken on the runner — NOT a gam result.
+              outcome=DIVERGE; cause=ref_unavail; reason="$refmarker"; refmiss=$((refmiss+1))
+            else
+              outcome=DIVERGE; cause=gam_diverge; reason="${panicmsg:-nonzero exit $rc}"; diverge=$((diverge+1))
+            fi
+            # Sanitize to single-line cells for the TSV / markdown table; the full
+            # untouched text always remains in the per-test log artifact.
+            metric_clean=$(printf '%s' "$metric" | tr '\t|' '  ' | tr -s ' ')
+            reason_clean=$(printf '%s' "$reason" | tr '\t\n|' '   ' | tr -s ' ' | cut -c1-400)
+            printf '%d\t%s\t%s\t%s\t%d\t%d\t%s\t%s\t%s\t%s\n' \
+              "$i" "$outcome" "$cause" "$t" "$rc" "$dur" "$sub_passed" "$sub_failed" "$metric_clean" "$reason_clean" >> "$RES"
+            printf '{"idx":%d,"outcome":"%s","cause":"%s","test":"%s","rc":%d,"dur_s":%d,"sub_passed":%s,"sub_failed":%s}\n' \
+              "$i" "$outcome" "$cause" "$t" "$rc" "$dur" "$sub_passed" "$sub_failed" >> "$JSONL"
+            printf '| %d | %s | %s | %s | %s/%s | %ss | %s | %s |\n' \
+              "$i" "$t" "$outcome" "$cause" "$sub_passed" "$sub_failed" "$dur" "$metric_clean" "${reason_clean:0:200}" >> "$GITHUB_STEP_SUMMARY"
+            echo "[$i/$N] $outcome/$cause  $t  rc=$rc dur=${dur}s sub=${sub_passed}p/${sub_failed}f"
+            [ -n "$metric_clean" ] && echo "  metrics: $metric_clean"
+            [ -n "$reason_clean" ] && echo "  reason:  $reason_clean"
+            # Echo the FULL per-test log into the (collapsible) job-log group too —
+            # no 20-line tail. The artifact is the canonical complete copy in case
+            # GitHub caps the job log.
+            echo "----- full log: $t -----"; cat "$log"; echo "----- end log: $t -----"
             echo "::endgroup::"
           done
-          { echo ""; echo "### Totals"; echo "pass=$pass diverged=$fail timeout=$tmo build_fail=$bf (of $N)"; } >> "$GITHUB_STEP_SUMMARY"
-          echo "pass=$pass diverged=$fail timeout=$tmo build_fail=$bf"
+          {
+            echo ""
+            echo "### Totals"
+            echo ""
+            echo "| outcome | count |"
+            echo "|---|---|"
+            echo "| PASS | $pass |"
+            echo "| DIVERGE — gam vs reference | $diverge |"
+            echo "| DIVERGE — reference tool unavailable | $refmiss |"
+            echo "| TIMEOUT | $tmo |"
+            echo "| BUILDFAIL | $bf |"
+            echo "| **total** | **$N** |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "pass=$pass gam_diverge=$diverge ref_unavail=$refmiss timeout=$tmo build_fail=$bf (of $N)"
           # Informational dashboard: divergences/timeouts are honest findings, not
           # pipeline failures.
           exit 0
 
-      - name: Upload streaming quality results (always — survives timeout/cancel)
+      - name: Upload full quality report (always — survives timeout/cancel)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: quality-results
-          path: /tmp/quality_results.tsv
+          # The WHOLE report dir: rich un-truncated TSV + JSONL + every per-test
+          # stdout/stderr log. "Everything that happened", not just the headlines.
+          path: /tmp/quality-report
           if-no-files-found: ignore
