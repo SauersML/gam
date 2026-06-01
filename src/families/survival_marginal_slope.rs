@@ -1007,16 +1007,6 @@ struct DynamicQBlockwiseAccumulator {
     hess_influence: Option<Array2<f64>>,
 }
 
-#[derive(Clone)]
-struct DynamicQCoreHessianBlocks {
-    hess_time: Array2<f64>,
-    hess_marginal: Array2<f64>,
-    hess_logslope: Array2<f64>,
-    hess_time_marginal: Array2<f64>,
-    hess_time_logslope: Array2<f64>,
-    hess_marginal_logslope: Array2<f64>,
-}
-
 impl DynamicQBlockwiseAccumulator {
     fn new(slices: &BlockSlices) -> Self {
         Self {
@@ -5627,20 +5617,22 @@ impl SurvivalMarginalSlopeFamily {
                 .design_derivative_exit
                 .try_row_chunk(row..row + 1)
                 .map_err(|e| format!("row_dynamic_q_geometry design_derivative_exit: {e}"))?;
-            let time_row_entry = time_entry_chunk.row(0).to_owned();
-            let time_row_exit = time_exit_chunk.row(0).to_owned();
-            let time_row_deriv = time_deriv_chunk.row(0).to_owned();
-            out.dq0_time.assign(&time_row_entry.view());
-            out.dq1_time.assign(&time_row_exit.view());
-            out.dqd1_time.assign(&time_row_deriv.view());
+            // Perf (#biobank): assign the design rows directly from the chunk
+            // views into the reused `out` buffers. The previous `.to_owned()`
+            // round-trip allocated three fresh `Array1<f64>` per row only to
+            // immediately copy them in — removing it drops O(n·p_time) heap
+            // traffic with bit-identical values.
+            out.dq0_time.assign(&time_entry_chunk.row(0));
+            out.dq1_time.assign(&time_exit_chunk.row(0));
+            out.dqd1_time.assign(&time_deriv_chunk.row(0));
             if p_marginal > 0 {
                 let marginal_chunk = self
                     .marginal_design
                     .try_row_chunk(row..row + 1)
                     .map_err(|e| format!("row_dynamic_q_geometry marginal_design: {e}"))?;
-                let marginal_row = marginal_chunk.row(0).to_owned();
-                out.dq0_marginal.assign(&marginal_row.view());
-                out.dq1_marginal.assign(&marginal_row.view());
+                let marginal_row = marginal_chunk.row(0);
+                out.dq0_marginal.assign(&marginal_row);
+                out.dq1_marginal.assign(&marginal_row);
             }
             return Ok(());
         }
@@ -5661,18 +5653,27 @@ impl SurvivalMarginalSlopeFamily {
             .design_derivative_exit
             .try_row_chunk(row..row + 1)
             .map_err(|e| format!("row_dynamic_q_geometry design_derivative_exit: {e}"))?;
-        let x_entry_base = entry_chunk.row(0).slice(s![..p_base]).to_owned();
-        let x_exit_base = exit_chunk.row(0).slice(s![..p_base]).to_owned();
-        let x_deriv_base = deriv_chunk.row(0).slice(s![..p_base]).to_owned();
-        let marginal_row = if p_marginal > 0 {
-            let marginal_chunk = self
-                .marginal_design
-                .try_row_chunk(row..row + 1)
-                .map_err(|e| format!("row_dynamic_q_geometry marginal_design: {e}"))?;
-            Some(marginal_chunk.row(0).to_owned())
+        // Perf (#biobank): hold the base/marginal design rows as borrowed views
+        // into the chunk storage rather than `.to_owned()` copies. Every use
+        // below is either a `.dot(...)` or scalar indexing, both of which work
+        // directly on `ArrayView1`, so this is bit-identical while removing the
+        // per-row Array1 allocations.
+        let entry_row_view = entry_chunk.row(0);
+        let exit_row_view = exit_chunk.row(0);
+        let deriv_row_view = deriv_chunk.row(0);
+        let x_entry_base = entry_row_view.slice(s![..p_base]);
+        let x_exit_base = exit_row_view.slice(s![..p_base]);
+        let x_deriv_base = deriv_row_view.slice(s![..p_base]);
+        let marginal_chunk = if p_marginal > 0 {
+            Some(
+                self.marginal_design
+                    .try_row_chunk(row..row + 1)
+                    .map_err(|e| format!("row_dynamic_q_geometry marginal_design: {e}"))?,
+            )
         } else {
             None
         };
+        let marginal_row = marginal_chunk.as_ref().map(|chunk| chunk.row(0));
 
         let base_marginal = block_states[1].eta[row];
         let h0 = x_entry_base.dot(&beta_time_base) + self.offset_entry[row] + base_marginal;
@@ -8463,16 +8464,27 @@ impl SurvivalMarginalSlopeFamily {
         })
     }
 
-    fn dynamic_q_core_diagonal_hessian_blocks(
+    fn accumulate_dynamic_q_core_hessian(
         &self,
         row: usize,
-        p_t: usize,
-        p_m: usize,
-        p_g: usize,
+        slices: &BlockSlices,
         q_geom: &SurvivalMarginalSlopeDynamicRow,
         primary_gradient: ndarray::ArrayView1<'_, f64>,
         primary_hessian: ArrayView2<'_, f64>,
-    ) -> Result<(Array2<f64>, Array2<f64>, Array2<f64>), String> {
+        joint_hessian: &mut Array2<f64>,
+    ) -> Result<(), String> {
+        // Perf (#biobank): scatter each core block-Hessian contribution
+        // directly into `joint_hessian` as it is computed, instead of building
+        // six fresh `Array2` per row in `dynamic_q_core_hessian_blocks` and
+        // then copying them in. This removes the per-row heap traffic (6×p²
+        // allocations + zero-fills + the logslope-row `to_owned`) and the
+        // extra read/write pass over the temporaries. Each cell receives the
+        // identical `value` it did before (the temporaries were written with
+        // `=` then added here), so the accumulated result is bit-identical.
+        let p_t = slices.time.len();
+        let p_m = slices.marginal.len();
+        let p_g = slices.logslope.len();
+
         let dq_time = [&q_geom.dq0_time, &q_geom.dq1_time, &q_geom.dqd1_time];
         let dq_marginal = [
             &q_geom.dq0_marginal,
@@ -8489,17 +8501,22 @@ impl SurvivalMarginalSlopeFamily {
             &q_geom.d2q1_marginal_marginal,
             &q_geom.d2qd1_marginal_marginal,
         ];
+        let d2q_time_marginal = [
+            &q_geom.d2q0_time_marginal,
+            &q_geom.d2q1_time_marginal,
+            &q_geom.d2qd1_time_marginal,
+        ];
         let logslope_chunk = self
             .logslope_design
             .try_row_chunk(row..row + 1)
-            .map_err(|e| {
-                format!("dynamic_q_core_diagonal_hessian_blocks logslope try_row_chunk: {e}")
-            })?;
-        let logslope_row = logslope_chunk.row(0).to_owned();
+            .map_err(|e| format!("accumulate_dynamic_q_core_hessian logslope: {e}"))?;
+        let logslope_row = logslope_chunk.row(0);
 
-        // Outer caller is `(0..n).into_par_iter()` — inner rayon::join here
-        // would oversubscribe a saturated pool for ≤9k-FMA blocks. Sequential.
-        let mut hess_time = Array2::<f64>::zeros((p_t, p_t));
+        let t0 = slices.time.start;
+        let m0 = slices.marginal.start;
+        let g0 = slices.logslope.start;
+
+        // time × time
         for a in 0..p_t {
             for b in 0..p_t {
                 let mut value = 0.0;
@@ -8509,10 +8526,10 @@ impl SurvivalMarginalSlopeFamily {
                     }
                     value += primary_gradient[q_u] * d2q_time_time[q_u][[a, b]];
                 }
-                hess_time[[a, b]] = value;
+                joint_hessian[[t0 + a, t0 + b]] += value;
             }
         }
-        let mut hess_marginal = Array2::<f64>::zeros((p_m, p_m));
+        // marginal × marginal
         for a in 0..p_m {
             for b in 0..p_m {
                 let mut value = 0.0;
@@ -8523,10 +8540,11 @@ impl SurvivalMarginalSlopeFamily {
                     }
                     value += primary_gradient[q_u] * d2q_marginal_marginal[q_u][[a, b]];
                 }
-                hess_marginal[[a, b]] = value;
+                joint_hessian[[m0 + a, m0 + b]] += value;
             }
         }
-        let mut hess_logslope = Array2::<f64>::zeros((p_g, p_g));
+        // logslope × logslope (rank-1: h_gg · xxᵀ); zero cells skipped exactly
+        // as the prior `Array2::zeros`-backed block left them zero.
         let h_gg_scale = primary_hessian[[3, 3]];
         if h_gg_scale != 0.0 {
             for a in 0..p_g {
@@ -8536,72 +8554,51 @@ impl SurvivalMarginalSlopeFamily {
                 }
                 let row_scale = h_gg_scale * xa;
                 for b in 0..p_g {
-                    hess_logslope[[a, b]] = row_scale * logslope_row[b];
+                    joint_hessian[[g0 + a, g0 + b]] += row_scale * logslope_row[b];
                 }
             }
         }
-        Ok((hess_time, hess_marginal, hess_logslope))
-    }
-
-    fn accumulate_dynamic_q_core_hessian(
-        &self,
-        row: usize,
-        slices: &BlockSlices,
-        q_geom: &SurvivalMarginalSlopeDynamicRow,
-        primary_gradient: ndarray::ArrayView1<'_, f64>,
-        primary_hessian: ArrayView2<'_, f64>,
-        joint_hessian: &mut Array2<f64>,
-    ) -> Result<(), String> {
-        let p_t = slices.time.len();
-        let p_m = slices.marginal.len();
-        let p_g = slices.logslope.len();
-        let blocks = self.dynamic_q_core_hessian_blocks(
-            row,
-            p_t,
-            p_m,
-            p_g,
-            q_geom,
-            primary_gradient,
-            primary_hessian,
-        )?;
-
-        for a in 0..p_t {
-            for b in 0..p_t {
-                joint_hessian[[slices.time.start + a, slices.time.start + b]] +=
-                    blocks.hess_time[[a, b]];
-            }
-        }
-        for a in 0..p_m {
-            for b in 0..p_m {
-                joint_hessian[[slices.marginal.start + a, slices.marginal.start + b]] +=
-                    blocks.hess_marginal[[a, b]];
-            }
-        }
-        for a in 0..p_g {
-            for b in 0..p_g {
-                joint_hessian[[slices.logslope.start + a, slices.logslope.start + b]] +=
-                    blocks.hess_logslope[[a, b]];
-            }
-        }
+        // time × marginal (symmetric scatter)
         for a in 0..p_t {
             for b in 0..p_m {
-                let value = blocks.hess_time_marginal[[a, b]];
-                joint_hessian[[slices.time.start + a, slices.marginal.start + b]] += value;
-                joint_hessian[[slices.marginal.start + b, slices.time.start + a]] += value;
+                let mut value = 0.0;
+                for q_u in 0..3 {
+                    for q_v in 0..3 {
+                        value +=
+                            primary_hessian[[q_u, q_v]] * dq_time[q_u][a] * dq_marginal[q_v][b];
+                    }
+                    value += primary_gradient[q_u] * d2q_time_marginal[q_u][[a, b]];
+                }
+                joint_hessian[[t0 + a, m0 + b]] += value;
+                joint_hessian[[m0 + b, t0 + a]] += value;
             }
         }
+        // time × logslope (symmetric scatter)
         for a in 0..p_t {
-            for b in 0..p_g {
-                let value = blocks.hess_time_logslope[[a, b]];
-                joint_hessian[[slices.time.start + a, slices.logslope.start + b]] += value;
-                joint_hessian[[slices.logslope.start + b, slices.time.start + a]] += value;
+            let mut weight = 0.0;
+            for q_u in 0..3 {
+                weight += primary_hessian[[q_u, 3]] * dq_time[q_u][a];
+            }
+            if weight != 0.0 {
+                for b in 0..p_g {
+                    let value = weight * logslope_row[b];
+                    joint_hessian[[t0 + a, g0 + b]] += value;
+                    joint_hessian[[g0 + b, t0 + a]] += value;
+                }
             }
         }
+        // marginal × logslope (symmetric scatter)
         for a in 0..p_m {
-            for b in 0..p_g {
-                let value = blocks.hess_marginal_logslope[[a, b]];
-                joint_hessian[[slices.marginal.start + a, slices.logslope.start + b]] += value;
-                joint_hessian[[slices.logslope.start + b, slices.marginal.start + a]] += value;
+            let mut weight = 0.0;
+            for q_u in 0..3 {
+                weight += primary_hessian[[q_u, 3]] * dq_marginal[q_u][a];
+            }
+            if weight != 0.0 {
+                for b in 0..p_g {
+                    let value = weight * logslope_row[b];
+                    joint_hessian[[m0 + a, g0 + b]] += value;
+                    joint_hessian[[g0 + b, m0 + a]] += value;
+                }
             }
         }
         Ok(())
@@ -8650,20 +8647,80 @@ impl SurvivalMarginalSlopeFamily {
         hess_marginal: &mut Array2<f64>,
         hess_logslope: &mut Array2<f64>,
     ) -> Result<(), String> {
-        let (local_time, local_marginal, local_logslope) = self
-            .dynamic_q_core_diagonal_hessian_blocks(
-                row,
-                hess_time.nrows(),
-                hess_marginal.nrows(),
-                hess_logslope.nrows(),
-                q_geom,
-                primary_gradient,
-                primary_hessian,
-            )?;
+        // Perf (#biobank): accumulate the three diagonal block-Hessian
+        // contributions directly into the caller's per-thread workspace
+        // buffers with `+=`, rather than allocating three fresh
+        // `Array2::zeros` per row (`dynamic_q_core_diagonal_hessian_blocks`)
+        // and then folding them in with `*hess += &local`. This removes
+        // O(n·p²) heap allocation + zero-fill + a redundant add pass. The
+        // arithmetic per cell is identical: the old path wrote `value` into a
+        // zeroed local then added it here, so accumulating `value` directly is
+        // bit-identical. The logslope block skips zero cells exactly as before
+        // (adding the implicit zeros was a no-op).
+        let p_t = hess_time.nrows();
+        let p_m = hess_marginal.nrows();
+        let p_g = hess_logslope.nrows();
 
-        *hess_time += &local_time;
-        *hess_marginal += &local_marginal;
-        *hess_logslope += &local_logslope;
+        let dq_time = [&q_geom.dq0_time, &q_geom.dq1_time, &q_geom.dqd1_time];
+        let dq_marginal = [
+            &q_geom.dq0_marginal,
+            &q_geom.dq1_marginal,
+            &q_geom.dqd1_marginal,
+        ];
+        let d2q_time_time = [
+            &q_geom.d2q0_time_time,
+            &q_geom.d2q1_time_time,
+            &q_geom.d2qd1_time_time,
+        ];
+        let d2q_marginal_marginal = [
+            &q_geom.d2q0_marginal_marginal,
+            &q_geom.d2q1_marginal_marginal,
+            &q_geom.d2qd1_marginal_marginal,
+        ];
+        let logslope_chunk = self
+            .logslope_design
+            .try_row_chunk(row..row + 1)
+            .map_err(|e| format!("accumulate_dynamic_q_core_block_hessians logslope: {e}"))?;
+        let logslope_row = logslope_chunk.row(0);
+
+        for a in 0..p_t {
+            for b in 0..p_t {
+                let mut value = 0.0;
+                for q_u in 0..3 {
+                    for q_v in 0..3 {
+                        value += primary_hessian[[q_u, q_v]] * dq_time[q_u][a] * dq_time[q_v][b];
+                    }
+                    value += primary_gradient[q_u] * d2q_time_time[q_u][[a, b]];
+                }
+                hess_time[[a, b]] += value;
+            }
+        }
+        for a in 0..p_m {
+            for b in 0..p_m {
+                let mut value = 0.0;
+                for q_u in 0..3 {
+                    for q_v in 0..3 {
+                        value +=
+                            primary_hessian[[q_u, q_v]] * dq_marginal[q_u][a] * dq_marginal[q_v][b];
+                    }
+                    value += primary_gradient[q_u] * d2q_marginal_marginal[q_u][[a, b]];
+                }
+                hess_marginal[[a, b]] += value;
+            }
+        }
+        let h_gg_scale = primary_hessian[[3, 3]];
+        if h_gg_scale != 0.0 {
+            for a in 0..p_g {
+                let xa = logslope_row[a];
+                if xa == 0.0 {
+                    continue;
+                }
+                let row_scale = h_gg_scale * xa;
+                for b in 0..p_g {
+                    hess_logslope[[a, b]] += row_scale * logslope_row[b];
+                }
+            }
+        }
         Ok(())
     }
 
@@ -8787,6 +8844,79 @@ impl SurvivalMarginalSlopeFamily {
         let logslope_row = logslope_chunk.row(0);
         let logslope_weight = core_hessian_column[3];
         if logslope_weight != 0.0 {
+            for coeff_idx in 0..slices.logslope.len() {
+                let value = logslope_weight * logslope_row[coeff_idx];
+                joint_hessian[[slices.logslope.start + coeff_idx, joint_idx]] += value;
+                joint_hessian[[joint_idx, slices.logslope.start + coeff_idx]] += value;
+            }
+        }
+        Ok(())
+    }
+
+    /// Perf (#biobank): pre-scaled variant of
+    /// [`Self::accumulate_identity_primary_cross_hessian`]. The influence
+    /// absorber needs the `o_infl` core-Hessian column scaled by the per-row
+    /// per-coefficient factor `Z̃[row, i]`. The previous call site materialised
+    /// `&core_col.to_owned() * z_i` — two fresh `Array1` allocations per (row,
+    /// influence-coefficient) pair — purely to pass a scaled view in. Here the
+    /// scale is folded `core_hessian_column[q] * scale` *before* multiplying by
+    /// the Jacobian, exactly matching the original operand grouping
+    /// `(core_col[q] * z_i) * dq`, so every accumulated cell is bit-identical
+    /// while the per-row heap traffic in the influence-active path is removed.
+    fn accumulate_identity_primary_cross_hessian_scaled(
+        &self,
+        row: usize,
+        slices: &BlockSlices,
+        q_geom: &SurvivalMarginalSlopeDynamicRow,
+        core_hessian_column: ndarray::ArrayView1<'_, f64>,
+        scale: f64,
+        joint_block: &std::ops::Range<usize>,
+        joint_local: usize,
+        joint_hessian: &mut Array2<f64>,
+    ) -> Result<(), String> {
+        let joint_idx = joint_block.start + joint_local;
+        let dq_time = [&q_geom.dq0_time, &q_geom.dq1_time, &q_geom.dqd1_time];
+        let dq_marginal = [
+            &q_geom.dq0_marginal,
+            &q_geom.dq1_marginal,
+            &q_geom.dqd1_marginal,
+        ];
+        // Fold the scale into the three primary-q weights up front so the
+        // per-coefficient inner product reads `(core[q] * scale) * dq[q]`,
+        // matching the pre-scaled-column arithmetic exactly.
+        let scaled_core = [
+            core_hessian_column[0] * scale,
+            core_hessian_column[1] * scale,
+            core_hessian_column[2] * scale,
+        ];
+
+        for coeff_idx in 0..slices.time.len() {
+            let mut value = 0.0;
+            for q_idx in 0..3 {
+                value += scaled_core[q_idx] * dq_time[q_idx][coeff_idx];
+            }
+            joint_hessian[[slices.time.start + coeff_idx, joint_idx]] += value;
+            joint_hessian[[joint_idx, slices.time.start + coeff_idx]] += value;
+        }
+        for coeff_idx in 0..slices.marginal.len() {
+            let mut value = 0.0;
+            for q_idx in 0..3 {
+                value += scaled_core[q_idx] * dq_marginal[q_idx][coeff_idx];
+            }
+            joint_hessian[[slices.marginal.start + coeff_idx, joint_idx]] += value;
+            joint_hessian[[joint_idx, slices.marginal.start + coeff_idx]] += value;
+        }
+        let logslope_weight = core_hessian_column[3] * scale;
+        if logslope_weight != 0.0 {
+            let logslope_chunk = self
+                .logslope_design
+                .try_row_chunk(row..row + 1)
+                .map_err(|e| {
+                    format!(
+                        "accumulate_identity_primary_cross_hessian_scaled logslope try_row_chunk: {e}"
+                    )
+                })?;
+            let logslope_row = logslope_chunk.row(0);
             for coeff_idx in 0..slices.logslope.len() {
                 let value = logslope_weight * logslope_row[coeff_idx];
                 joint_hessian[[slices.logslope.start + coeff_idx, joint_idx]] += value;
@@ -8921,12 +9051,17 @@ impl SurvivalMarginalSlopeFamily {
                 let z_i = z_row[i];
                 joint_gradient[infl_joint.start + i] -= primary_gradient[infl_primary] * z_i;
                 if z_i != 0.0 {
-                    let scaled_core_col = &core_col.to_owned() * z_i;
-                    self.accumulate_identity_primary_cross_hessian(
+                    // Perf (#biobank): pass the unscaled `o_infl` core-Hessian
+                    // column plus `z_i` to the pre-scaled cross-Hessian helper,
+                    // which folds the scale in `(core[q] * z_i) * dq` form —
+                    // bit-identical to the previous `&core_col.to_owned() * z_i`
+                    // path but without the two per-(row,coeff) Array1 allocations.
+                    self.accumulate_identity_primary_cross_hessian_scaled(
                         row,
                         slices,
                         q_geom,
-                        scaled_core_col.view(),
+                        core_col,
+                        z_i,
                         infl_joint,
                         i,
                         joint_hessian,
