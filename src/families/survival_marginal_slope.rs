@@ -472,6 +472,7 @@ struct ThetaHints {
     logslope_beta: Option<Array1<f64>>,
     score_warp_beta: Option<Array1<f64>>,
     link_dev_beta: Option<Array1<f64>>,
+    influence_beta: Option<Array1<f64>>,
 }
 
 #[derive(Clone)]
@@ -2126,6 +2127,87 @@ impl BlockHessianAccumulator {
             }
         }
 
+        if let (Some(infl_idx), Some(z_tilde)) = (primary.infl, family.influence_absorber.as_ref())
+        {
+            let z_row = z_tilde.row(row);
+            for (des_idx, des) in time_designs.iter().enumerate() {
+                let alpha = primary_hessian[[des_idx, infl_idx]];
+                if alpha == 0.0 {
+                    continue;
+                }
+                let t_chunk = des.try_row_chunk(row..row + 1).map_err(|e| {
+                    format!("add_pullback influence time design try_row_chunk: {e}")
+                })?;
+                let t_row = t_chunk.row(0);
+                for a in 0..t_row.len() {
+                    for b in 0..z_row.len() {
+                        self.h_ti[[a, b]] += alpha * t_row[a] * z_row[b];
+                    }
+                }
+            }
+
+            let mi_weight = primary_hessian[[0, infl_idx]] + primary_hessian[[1, infl_idx]];
+            if mi_weight != 0.0 {
+                let m_chunk = family
+                    .marginal_design
+                    .try_row_chunk(row..row + 1)
+                    .map_err(|e| {
+                        format!("add_pullback influence marginal_design try_row_chunk: {e}")
+                    })?;
+                let m_row = m_chunk.row(0);
+                for a in 0..m_row.len() {
+                    for b in 0..z_row.len() {
+                        self.h_mi[[a, b]] += mi_weight * m_row[a] * z_row[b];
+                    }
+                }
+            }
+
+            let gi_weight = primary_hessian[[3, infl_idx]];
+            if gi_weight != 0.0 {
+                let g_chunk = family
+                    .logslope_design
+                    .try_row_chunk(row..row + 1)
+                    .map_err(|e| {
+                        format!("add_pullback influence logslope_design try_row_chunk: {e}")
+                    })?;
+                let g_row = g_chunk.row(0);
+                for a in 0..g_row.len() {
+                    for b in 0..z_row.len() {
+                        self.h_gi[[a, b]] += gi_weight * g_row[a] * z_row[b];
+                    }
+                }
+            }
+
+            if let Some(h_range) = primary.h.as_ref() {
+                for h_local in 0..h_range.len() {
+                    let alpha = primary_hessian[[h_range.start + h_local, infl_idx]];
+                    if alpha != 0.0 {
+                        for b in 0..z_row.len() {
+                            self.h_hi[[h_local, b]] += alpha * z_row[b];
+                        }
+                    }
+                }
+            }
+            if let Some(w_range) = primary.w.as_ref() {
+                for w_local in 0..w_range.len() {
+                    let alpha = primary_hessian[[w_range.start + w_local, infl_idx]];
+                    if alpha != 0.0 {
+                        for b in 0..z_row.len() {
+                            self.h_wi[[w_local, b]] += alpha * z_row[b];
+                        }
+                    }
+                }
+            }
+            let ii_weight = primary_hessian[[infl_idx, infl_idx]];
+            if ii_weight != 0.0 {
+                for a in 0..z_row.len() {
+                    for b in 0..z_row.len() {
+                        self.h_ii[[a, b]] += ii_weight * z_row[a] * z_row[b];
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -2312,6 +2394,32 @@ impl BlockHessianAccumulator {
                 }
             }
         }
+
+        if let (Some(infl_idx), Some(z_tilde)) = (primary.infl, family.influence_absorber.as_ref())
+        {
+            let alpha = right_primary[infl_idx];
+            if alpha != 0.0 {
+                let z_row = z_tilde.row(row);
+                match psi_block_idx {
+                    1 => {
+                        for a in 0..psi_row.len() {
+                            for b in 0..z_row.len() {
+                                self.h_mi[[a, b]] += alpha * psi_row[a] * z_row[b];
+                            }
+                        }
+                    }
+                    2 => {
+                        for a in 0..psi_row.len() {
+                            for b in 0..z_row.len() {
+                                self.h_gi[[a, b]] += alpha * psi_row[a] * z_row[b];
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -2364,6 +2472,7 @@ impl BlockHessianAccumulator {
             (Logslope, Logslope) => self.h_gg.view(),
             (ScoreWarp, ScoreWarp) => self.h_hh.view(),
             (LinkDev, LinkDev) => self.h_ww.view(),
+            (Influence, Influence) => self.h_ii.view(),
 
             (Time, Marginal) => self.h_tm.view(),
             (Marginal, Time) => self.h_tm.t(),
@@ -2373,6 +2482,8 @@ impl BlockHessianAccumulator {
             (ScoreWarp, Time) => self.h_th.t(),
             (Time, LinkDev) => self.h_tw.view(),
             (LinkDev, Time) => self.h_tw.t(),
+            (Time, Influence) => self.h_ti.view(),
+            (Influence, Time) => self.h_ti.t(),
 
             (Marginal, Logslope) => self.h_mg.view(),
             (Logslope, Marginal) => self.h_mg.t(),
@@ -2380,14 +2491,22 @@ impl BlockHessianAccumulator {
             (ScoreWarp, Marginal) => self.h_mh.t(),
             (Marginal, LinkDev) => self.h_mw.view(),
             (LinkDev, Marginal) => self.h_mw.t(),
+            (Marginal, Influence) => self.h_mi.view(),
+            (Influence, Marginal) => self.h_mi.t(),
 
             (Logslope, ScoreWarp) => self.h_gh.view(),
             (ScoreWarp, Logslope) => self.h_gh.t(),
             (Logslope, LinkDev) => self.h_gw.view(),
             (LinkDev, Logslope) => self.h_gw.t(),
+            (Logslope, Influence) => self.h_gi.view(),
+            (Influence, Logslope) => self.h_gi.t(),
 
             (ScoreWarp, LinkDev) => self.h_hw.view(),
             (LinkDev, ScoreWarp) => self.h_hw.t(),
+            (ScoreWarp, Influence) => self.h_hi.view(),
+            (Influence, ScoreWarp) => self.h_hi.t(),
+            (LinkDev, Influence) => self.h_wi.view(),
+            (Influence, LinkDev) => self.h_wi.t(),
         }
     }
 
@@ -2446,16 +2565,22 @@ impl BlockHessianAccumulator {
         self.h_gg += &other.h_gg;
         self.h_hh += &other.h_hh;
         self.h_ww += &other.h_ww;
+        self.h_ii += &other.h_ii;
         self.h_tm += &other.h_tm;
         self.h_tg += &other.h_tg;
         self.h_th += &other.h_th;
         self.h_tw += &other.h_tw;
+        self.h_ti += &other.h_ti;
         self.h_mg += &other.h_mg;
         self.h_mh += &other.h_mh;
         self.h_mw += &other.h_mw;
+        self.h_mi += &other.h_mi;
         self.h_gh += &other.h_gh;
         self.h_gw += &other.h_gw;
+        self.h_gi += &other.h_gi;
         self.h_hw += &other.h_hw;
+        self.h_hi += &other.h_hi;
+        self.h_wi += &other.h_wi;
     }
 
     fn diagonal(&self, slices: &BlockSlices) -> Array1<f64> {
@@ -2648,6 +2773,68 @@ impl BlockHessianAccumulator {
             for hl in 0..hr.len() {
                 for wl in 0..wr.len() {
                     self.h_hw[[hl, wl]] += ph[[hr.start + hl, wr.start + wl]];
+                }
+            }
+        }
+
+        if let (Some(infl_idx), Some(z_tilde)) = (pl.infl, family.influence_absorber.as_ref()) {
+            let z_row = z_tilde.row(row);
+            for a in 0..pt {
+                let mut w = 0.0;
+                for u in 0..3 {
+                    w += ph[[u, infl_idx]] * jt[u][a];
+                }
+                if w != 0.0 {
+                    for b in 0..z_row.len() {
+                        self.h_ti[[a, b]] += w * z_row[b];
+                    }
+                }
+            }
+            for a in 0..pm {
+                let mut w = 0.0;
+                for u in 0..3 {
+                    w += ph[[u, infl_idx]] * jm[u][a];
+                }
+                if w != 0.0 {
+                    for b in 0..z_row.len() {
+                        self.h_mi[[a, b]] += w * z_row[b];
+                    }
+                }
+            }
+            let gi = ph[[3, infl_idx]];
+            if gi != 0.0 {
+                for a in 0..gr.len() {
+                    for b in 0..z_row.len() {
+                        self.h_gi[[a, b]] += gi * gr[a] * z_row[b];
+                    }
+                }
+            }
+            if let Some(hr) = pl.h.as_ref() {
+                for h_local in 0..hr.len() {
+                    let w = ph[[hr.start + h_local, infl_idx]];
+                    if w != 0.0 {
+                        for b in 0..z_row.len() {
+                            self.h_hi[[h_local, b]] += w * z_row[b];
+                        }
+                    }
+                }
+            }
+            if let Some(wr) = pl.w.as_ref() {
+                for w_local in 0..wr.len() {
+                    let w = ph[[wr.start + w_local, infl_idx]];
+                    if w != 0.0 {
+                        for b in 0..z_row.len() {
+                            self.h_wi[[w_local, b]] += w * z_row[b];
+                        }
+                    }
+                }
+            }
+            let ii = ph[[infl_idx, infl_idx]];
+            if ii != 0.0 {
+                for a in 0..z_row.len() {
+                    for b in 0..z_row.len() {
+                        self.h_ii[[a, b]] += ii * z_row[a] * z_row[b];
+                    }
                 }
             }
         }
@@ -3079,6 +3266,29 @@ impl BlockHessianAccumulator {
                     2 => {
                         for b in 0..psi_row.len() {
                             self.h_gw[[b, li]] += ww * psi_row[b];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let (Some(infl_idx), Some(z_tilde)) = (pl.infl, family.influence_absorber.as_ref()) {
+            let iw = rp[infl_idx];
+            if iw != 0.0 {
+                let z_row = z_tilde.row(row);
+                match psi_block {
+                    1 => {
+                        for a in 0..psi_row.len() {
+                            for b in 0..z_row.len() {
+                                self.h_mi[[a, b]] += iw * psi_row[a] * z_row[b];
+                            }
+                        }
+                    }
+                    2 => {
+                        for a in 0..psi_row.len() {
+                            for b in 0..z_row.len() {
+                                self.h_gi[[a, b]] += iw * psi_row[a] * z_row[b];
+                            }
                         }
                     }
                     _ => {}
@@ -4871,6 +5081,7 @@ impl SurvivalMarginalSlopeFamily {
         let p_g = slices.logslope.len();
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
+        let p_i = slices.influence.as_ref().map_or(0, |range| range.len());
         let row_iter = outer_row_indices(options, self.n).to_vec();
         let row_weights = outer_row_weights_by_index(options, self.n);
         // Bit-deterministic reduction: see `chunked_row_reduction`.
@@ -4885,7 +5096,7 @@ impl SurvivalMarginalSlopeFamily {
                         Array1::zeros(p_g),
                         Array1::zeros(p_h),
                         Array1::zeros(p_w),
-                        BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                        BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w, p_i),
                     )
                 },
                 |row, a| -> Result<(), String> {
@@ -4968,6 +5179,7 @@ impl SurvivalMarginalSlopeFamily {
         let p_g = slices.logslope.len();
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
+        let p_i = slices.influence.as_ref().map_or(0, |range| range.len());
         let row_iter = outer_row_indices(options, self.n).to_vec();
         let row_weights = outer_row_weights_by_index(options, self.n);
         // Bit-deterministic reduction: see `chunked_row_reduction`.
@@ -4982,7 +5194,7 @@ impl SurvivalMarginalSlopeFamily {
                         Array1::zeros(p_g),
                         Array1::zeros(p_h),
                         Array1::zeros(p_w),
-                        BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                        BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w, p_i),
                     )
                 },
                 |row, a| -> Result<(), String> {
@@ -5069,6 +5281,7 @@ impl SurvivalMarginalSlopeFamily {
         let p_g = slices.logslope.len();
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
+        let p_i = slices.influence.as_ref().map_or(0, |range| range.len());
         let primary_dim = N_PRIMARY;
         let row_iter = outer_row_indices(options, self.n).to_vec();
         let row_weights = outer_row_weights_by_index(options, self.n);
@@ -5085,7 +5298,7 @@ impl SurvivalMarginalSlopeFamily {
         // Bit-deterministic reduction: see `chunked_row_reduction`.
         let acc = chunked_row_reduction(
             row_iter.as_slice(),
-            || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+            || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w, p_i),
             |row, acc| -> Result<(), String> {
                 let row_dir = self.row_primary_direction_from_flat_dynamic(
                     row,
@@ -5787,8 +6000,7 @@ impl SurvivalMarginalSlopeFamily {
         if self.influence_absorber.is_none() {
             return Ok(None);
         }
-        let idx =
-            3 + usize::from(self.score_warp.is_some()) + usize::from(self.link_dev.is_some());
+        let idx = 3 + usize::from(self.score_warp.is_some()) + usize::from(self.link_dev.is_some());
         block_states
             .get(idx)
             .map(|state| Some(&state.beta))
@@ -5803,9 +6015,10 @@ impl SurvivalMarginalSlopeFamily {
         row: usize,
         block_states: &[ParameterBlockState],
     ) -> Result<f64, String> {
-        let (Some(z_tilde), Some(gamma)) =
-            (self.influence_absorber.as_ref(), self.flex_influence_beta(block_states)?)
-        else {
+        let (Some(z_tilde), Some(gamma)) = (
+            self.influence_absorber.as_ref(),
+            self.flex_influence_beta(block_states)?,
+        ) else {
             return Ok(0.0);
         };
         if gamma.len() != z_tilde.ncols() {
@@ -11856,6 +12069,7 @@ impl SurvivalMarginalSlopeFamily {
         let p_g = slices.logslope.len();
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
+        let p_i = slices.influence.as_ref().map_or(0, |range| range.len());
 
         // Build the psi design map once; rowwise loop does direct row_vector(row)
         // calls via the PsiDesignMap API.
@@ -11887,7 +12101,7 @@ impl SurvivalMarginalSlopeFamily {
                 Array1::zeros(p_g),
                 Array1::zeros(p_h),
                 Array1::zeros(p_w),
-                BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w, p_i),
             )
         };
 
@@ -12138,6 +12352,7 @@ impl SurvivalMarginalSlopeFamily {
         let p_g = slices.logslope.len();
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
+        let p_i = slices.influence.as_ref().map_or(0, |range| range.len());
 
         struct BatchedPsiAxisAcc {
             objective_psi: f64,
@@ -12157,7 +12372,7 @@ impl SurvivalMarginalSlopeFamily {
                     score_g: Array1::zeros(p_g),
                     score_h: Array1::zeros(p_h),
                     score_w: Array1::zeros(p_w),
-                    hessian: BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                    hessian: BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w, p_i),
                 })
                 .collect()
         };
@@ -12367,6 +12582,7 @@ impl SurvivalMarginalSlopeFamily {
         let p_g = slices.logslope.len();
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
+        let p_i = slices.influence.as_ref().map_or(0, |range| range.len());
         let same_block = block_idx_i == block_idx_j;
 
         // Build psi design maps once outside the row loop; rowwise calls use
@@ -12422,7 +12638,7 @@ impl SurvivalMarginalSlopeFamily {
                 score_g: Array1::zeros(p_g),
                 score_h: Array1::zeros(p_h),
                 score_w: Array1::zeros(p_w),
-                hessian: BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                hessian: BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w, p_i),
             }
         };
 
@@ -12852,6 +13068,7 @@ impl SurvivalMarginalSlopeFamily {
         let p_g = slices.logslope.len();
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
+        let p_i = slices.influence.as_ref().map_or(0, |range| range.len());
 
         // Build the psi design map once; rowwise calls use direct row_vector(row).
         let policy = crate::resource::ResourcePolicy::default_library();
@@ -12870,7 +13087,7 @@ impl SurvivalMarginalSlopeFamily {
         // accumulators in row-chunk order for deterministic timewiggle assembly.
         let acc = chunked_row_reduction(
             row_iter.as_slice(),
-            || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+            || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w, p_i),
             |row, acc| -> Result<(), String> {
                 let psi_row = psi_map
                     .row_vector(row)
@@ -13069,8 +13286,9 @@ impl SurvivalMarginalSlopeFamily {
         let p_g = slices.logslope.len();
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
+        let p_i = slices.influence.as_ref().map_or(0, |range| range.len());
         let p_total = slices.total;
-        let make_acc = || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w);
+        let make_acc = || BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w, p_i);
 
         // Phase 2d: the same per-row work that yields the block-Hessian pullback
         // also yields the row negative-log-likelihood and the joint gradient.
@@ -13155,6 +13373,21 @@ impl SurvivalMarginalSlopeFamily {
                         grad_acc[joint_range.start + local] -= g[primary_range.start + local];
                     }
                 }
+                if let (Some(primary), Some(infl_range), Some(z_tilde)) = (
+                    primary.as_ref(),
+                    slices.influence.as_ref(),
+                    self.influence_absorber.as_ref(),
+                ) {
+                    if let Some(infl_idx) = primary.infl {
+                        let alpha = g[infl_idx];
+                        if alpha != 0.0 {
+                            let z_row = z_tilde.row(row);
+                            for local in 0..infl_range.len() {
+                                grad_acc[infl_range.start + local] -= alpha * z_row[local];
+                            }
+                        }
+                    }
+                }
                 // Block-Hessian pullback (unchanged).
                 state.add_pullback_with_q_geometry(self, row, q_geom, &g, &h)?;
                 Ok(acc)
@@ -13203,11 +13436,12 @@ impl SurvivalMarginalSlopeFamily {
         let p_g = slices.logslope.len();
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
+        let p_i = slices.influence.as_ref().map_or(0, |range| range.len());
         let row_iter = outer_row_indices(options, self.n).to_vec();
         let row_weights = outer_row_weights_by_index(options, self.n);
         let make_acc_ws = || {
             (
-                BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w, p_i),
                 SurvivalMarginalSlopeDynamicRow::empty_workspace(),
             )
         };
@@ -13269,11 +13503,12 @@ impl SurvivalMarginalSlopeFamily {
         let p_g = slices.logslope.len();
         let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
         let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
+        let p_i = slices.influence.as_ref().map_or(0, |range| range.len());
         let row_iter = outer_row_indices(options, self.n).to_vec();
         let row_weights = outer_row_weights_by_index(options, self.n);
         let make_acc_ws = || {
             (
-                BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w),
+                BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w, p_i),
                 SurvivalMarginalSlopeDynamicRow::empty_workspace(),
             )
         };
@@ -13623,9 +13858,7 @@ impl crate::families::marginal_slope_shared::MarginalSlopePsiFamily
         )
     }
 
-    fn psi_first_order_terms_all(
-        &self,
-    ) -> Result<Option<Vec<ExactNewtonJointPsiTerms>>, String> {
+    fn psi_first_order_terms_all(&self) -> Result<Option<Vec<ExactNewtonJointPsiTerms>>, String> {
         let total: usize = self.derivative_blocks.iter().map(Vec::len).sum();
         if total == 0 {
             return Ok(Some(Vec::new()));
@@ -18948,6 +19181,7 @@ fn joint_setup(
     extra_rho0: &[f64],
     initial_sigma: Option<f64>,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
+    pinned_rho_slots: &[(usize, f64)],
 ) -> ExactJointHyperSetup {
     let marginal_terms = spatial_length_scale_term_indices(marginalspec);
     let logslope_terms = spatial_length_scale_term_indices(logslopespec);
@@ -18968,8 +19202,17 @@ fn joint_setup(
             rho0vec[start + idx] = value;
         }
     }
-    let rho_lower = Array1::<f64>::from_elem(rho_dim, -12.0);
-    let rho_upper = Array1::<f64>::from_elem(rho_dim, 12.0);
+    let mut rho_lower = Array1::<f64>::from_elem(rho_dim, -12.0);
+    let mut rho_upper = Array1::<f64>::from_elem(rho_dim, 12.0);
+    for &(slot, value) in pinned_rho_slots {
+        assert!(
+            slot < rho_dim,
+            "pinned survival marginal-slope rho slot {slot} out of range {rho_dim}"
+        );
+        rho0vec[slot] = value;
+        rho_lower[slot] = value;
+        rho_upper[slot] = value;
+    }
     // Time block has no spatial length scales (pure B-spline on time)
     let empty_kappa = SpatialLogKappaCoords::new_with_dims(Array1::zeros(0), vec![]);
     let marginal_kappa = SpatialLogKappaCoords::from_length_scales_aniso(
@@ -20077,51 +20320,28 @@ pub fn fit_survival_marginal_slope_terms(
     let influence_absorber_residualized: Option<Array2<f64>> =
         if let Some(jac) = spec.score_influence_jacobian.as_ref() {
             use crate::families::marginal_slope_orthogonal::{
-                influence_block_design, residualize_influence_columns, ScoreInfluenceJacobian,
+                ScoreInfluenceJacobian, residualized_influence_block,
             };
-            let marginal_dense = marginal_design
-                .design
-                .try_to_dense_by_chunks("survival marginal-slope influence-absorber marginal span")?;
-            // Realized leakage directions `Z_infl = diag(s_f·β̂₀)·J` via the core
-            // builder; `β̂₀(x_i)` is the rigid-pilot logslope and `s_f =
-            // probit_scale`. `influence_block_design` reads only `columns`; the
+            let marginal_dense = marginal_design.design.try_to_dense_by_chunks(
+                "survival marginal-slope influence-absorber marginal span",
+            )?;
+            // Realized leakage directions `Z_infl = diag(s_f·β̂₀)·J`, the
+            // magnitude-scaled projection ridge, and the residualization against
+            // the marginal span all run through the shared core helper. The
             // latent score `z_primary` is the genuine `z` on these rows.
             let jacobian = ScoreInfluenceJacobian {
                 columns: jac.clone(),
                 z: z_primary.clone(),
             };
             let rigid_logslope_at_rows = &spec.logslope_offset + baseline_slope;
-            let z_infl =
-                influence_block_design(&jacobian, &rigid_logslope_at_rows, probit_scale);
-            // Marginal-Gram ridge scaled to the weighted Gram's own magnitude so
-            // the projection solve stays stable when the marginal design is
-            // rank-deficient at the pilot, without perturbing a well-conditioned
-            // projection. Identical scaling to the BMS absorber site (single
-            // source of truth for the residualization math is
-            // `residualize_influence_columns`; only this caller-side ridge scale
-            // is shared by value).
-            let gram_scale = (0..marginal_dense.ncols())
-                .map(|j| {
-                    (0..marginal_dense.nrows())
-                        .map(|i| {
-                            cross_block_pilot_w[i] * marginal_dense[[i, j]] * marginal_dense[[i, j]]
-                        })
-                        .sum::<f64>()
-                })
-                .fold(0.0_f64, f64::max);
-            let eps = (gram_scale * 1e-10).max(1e-12);
-            let residualized = residualize_influence_columns(
-                &z_infl,
+            let residualized = residualized_influence_block(
+                &jacobian,
+                &rigid_logslope_at_rows,
+                probit_scale,
                 marginal_dense.view(),
                 &cross_block_pilot_w,
-                eps,
-            );
-            if residualized.iter().any(|v| !v.is_finite()) {
-                return Err(SurvivalMarginalSlopeError::NumericalFailure {
-                    reason: "survival influence-absorber residualized columns contain non-finite entries".to_string(),
-                }
-                .into());
-            }
+            )
+            .map_err(|e| SurvivalMarginalSlopeError::NumericalFailure { reason: e })?;
             Some(residualized)
         } else {
             None
@@ -20434,9 +20654,19 @@ pub fn fit_survival_marginal_slope_terms(
         }
         out
     };
+    let influence_ridge_slots = usize::from(influence_absorber_residualized.is_some());
+    let marginal_penalty_count = marginal_design.penalties.len() + influence_ridge_slots;
+    let pinned_rho_slots: Vec<(usize, f64)> = if influence_absorber_residualized.is_some() {
+        vec![(
+            time_penalties_len + marginal_design.penalties.len(),
+            crate::families::marginal_slope_orthogonal::INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA,
+        )]
+    } else {
+        Vec::new()
+    };
     let core_rho0_seed: Vec<f64> = {
         let mut seeds = Vec::with_capacity(
-            time_penalties_len + marginal_design.penalties.len() + logslope_design.penalties.len(),
+            time_penalties_len + marginal_penalty_count + logslope_design.penalties.len(),
         );
         seeds.extend(block_log_lambda_seeds(
             &spec.time_block.design_exit,
@@ -20446,6 +20676,11 @@ pub fn fit_survival_marginal_slope_terms(
             &marginal_design.design,
             marginal_design.penalties.iter().map(|bp| &bp.local),
         ));
+        if influence_absorber_residualized.is_some() {
+            seeds.push(
+                crate::families::marginal_slope_orthogonal::INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA,
+            );
+        }
         seeds.extend(block_log_lambda_seeds(
             &logslope_design.design,
             logslope_design.penalties.iter().map(|bp| &bp.local),
@@ -20456,13 +20691,14 @@ pub fn fit_survival_marginal_slope_terms(
         data,
         time_penalties_len,
         &marginalspec_boot,
-        marginal_design.penalties.len(),
+        marginal_penalty_count,
         &logslopespec_boot,
         logslope_design.penalties.len(),
         &core_rho0_seed,
         &extra_rho0,
         initial_sigma,
         kappa_options,
+        &pinned_rho_slots,
     );
 
     let hints = RefCell::new(ThetaHints::default());
@@ -20984,7 +21220,9 @@ pub fn fit_survival_marginal_slope_terms(
         let rho_marginal = rho
             .slice(s![cursor..cursor + marginal_design.penalties.len()])
             .to_owned();
-        cursor += marginal_design.penalties.len();
+        let influence_ridge_active =
+            matches!(flex, FlexActivation::On) && influence_absorber_residualized.is_some();
+        cursor += marginal_design.penalties.len() + usize::from(influence_ridge_active);
         let rho_logslope = rho
             .slice(s![cursor..cursor + logslope_design.penalties.len()])
             .to_owned();
@@ -21091,6 +21329,33 @@ pub fn fit_survival_marginal_slope_terms(
             None,
             hints.link_dev_beta.clone(),
         )?;
+        if let (FlexActivation::On, Some(z_tilde)) =
+            (flex, influence_absorber_residualized.as_ref())
+        {
+            let p_i = z_tilde.ncols();
+            let influence_design = DesignMatrix::Dense(Arc::new(z_tilde.clone()).into());
+            let initial_beta = hints
+                .influence_beta
+                .as_ref()
+                .filter(|beta| beta.len() == p_i)
+                .cloned()
+                .unwrap_or_else(|| Array1::zeros(p_i));
+            blocks.push(ParameterBlockSpec {
+                name: "stage1_influence_absorber".to_string(),
+                design: influence_design,
+                offset: Array1::zeros(n),
+                penalties: vec![PenaltyMatrix::Dense(Array2::<f64>::eye(p_i))],
+                nullspace_dims: vec![0],
+                initial_log_lambdas: Array1::from_vec(vec![
+                    crate::families::marginal_slope_orthogonal::INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA,
+                ]),
+                initial_beta: Some(initial_beta),
+                gauge_priority: 80,
+                jacobian_callback: None,
+                stacked_design: None,
+                stacked_offset: None,
+            });
+        }
         // When timewiggle is active, replace the rigid time and marginal
         // Jacobians with the timewiggle-aware versions.  These compute
         // the full (∂q_r/∂β_t, ∂q_r/∂β_m) chain-rule corrections from
@@ -22484,6 +22749,7 @@ mod tests {
             logslope_surface_ranges: empty_logslope_surface_ranges(),
             score_warp,
             link_dev,
+            influence_absorber: None,
             time_linear_constraints: None,
             time_wiggle_knots: None,
             time_wiggle_degree: None,
@@ -22607,7 +22873,14 @@ mod tests {
     /// Build contiguous block slices for the given per-block widths. A flex
     /// block with width 0 is absent (`None`) and consumes no coordinates,
     /// exactly mirroring how `block_slices` lays out optional deviation blocks.
-    fn parity_make_slices(pt: usize, pm: usize, pg: usize, ph: usize, pw: usize) -> BlockSlices {
+    fn parity_make_slices(
+        pt: usize,
+        pm: usize,
+        pg: usize,
+        ph: usize,
+        pw: usize,
+        pi: usize,
+    ) -> BlockSlices {
         let mut cursor = 0usize;
         let mut take = |n: usize| {
             let r = cursor..cursor + n;
@@ -22619,6 +22892,7 @@ mod tests {
         let logslope = take(pg);
         let score_warp = (ph > 0).then(|| take(ph));
         let link_dev = (pw > 0).then(|| take(pw));
+        let influence = (pi > 0).then(|| take(pi));
         let total = cursor;
         BlockSlices {
             time,
@@ -22626,7 +22900,7 @@ mod tests {
             logslope,
             score_warp,
             link_dev,
-            influence: None,
+            influence,
             total,
         }
     }
@@ -22654,6 +22928,7 @@ mod tests {
         pg: usize,
         ph: usize,
         pw: usize,
+        pi: usize,
     ) -> BlockHessianAccumulator {
         BlockHessianAccumulator {
             h_tt: parity_sym(pt, 1.0),
@@ -22661,16 +22936,22 @@ mod tests {
             h_gg: parity_sym(pg, 3.0),
             h_hh: parity_sym(ph, 4.0),
             h_ww: parity_sym(pw, 5.0),
+            h_ii: parity_sym(pi, 6.0),
             h_tm: parity_gen(pt, pm, 10.0),
             h_tg: parity_gen(pt, pg, 11.0),
             h_th: parity_gen(pt, ph, 12.0),
             h_tw: parity_gen(pt, pw, 13.0),
+            h_ti: parity_gen(pt, pi, 13.5),
             h_mg: parity_gen(pm, pg, 14.0),
             h_mh: parity_gen(pm, ph, 15.0),
             h_mw: parity_gen(pm, pw, 16.0),
+            h_mi: parity_gen(pm, pi, 16.5),
             h_gh: parity_gen(pg, ph, 17.0),
             h_gw: parity_gen(pg, pw, 18.0),
+            h_gi: parity_gen(pg, pi, 18.5),
             h_hw: parity_gen(ph, pw, 19.0),
+            h_hi: parity_gen(ph, pi, 19.5),
+            h_wi: parity_gen(pw, pi, 20.0),
         }
     }
 
@@ -22691,6 +22972,9 @@ mod tests {
         }
         if let Some(w) = &sl.link_dev {
             out.slice_mut(s![w.clone(), w.clone()]).assign(&acc.h_ww);
+        }
+        if let Some(i) = &sl.influence {
+            out.slice_mut(s![i.clone(), i.clone()]).assign(&acc.h_ii);
         }
         let mut place =
             |r: std::ops::Range<usize>, c: std::ops::Range<usize>, m: ArrayView2<'_, f64>| {
@@ -22713,53 +22997,65 @@ mod tests {
         if let (Some(h), Some(w)) = (&sl.score_warp, &sl.link_dev) {
             place(h.clone(), w.clone(), acc.h_hw.view());
         }
+        if let Some(i) = &sl.influence {
+            place(sl.time.clone(), i.clone(), acc.h_ti.view());
+            place(sl.marginal.clone(), i.clone(), acc.h_mi.view());
+            place(sl.logslope.clone(), i.clone(), acc.h_gi.view());
+            if let Some(h) = &sl.score_warp {
+                place(h.clone(), i.clone(), acc.h_hi.view());
+            }
+            if let Some(w) = &sl.link_dev {
+                place(w.clone(), i.clone(), acc.h_wi.view());
+            }
+        }
         out
     }
 
-    const PARITY_LAYOUTS: [(usize, usize, usize, usize, usize); 4] = [
-        (2, 3, 2, 4, 3), // full: both flex blocks present
-        (2, 3, 2, 0, 0), // rigid: no flex blocks
-        (2, 3, 2, 4, 0), // score-warp only
-        (2, 3, 2, 0, 3), // link-deviation only
+    const PARITY_LAYOUTS: [(usize, usize, usize, usize, usize, usize); 5] = [
+        (2, 3, 2, 4, 3, 2), // full: both flex blocks plus influence absorber
+        (2, 3, 2, 0, 0, 0), // rigid: no optional blocks
+        (2, 3, 2, 4, 0, 2), // score-warp plus influence
+        (2, 3, 2, 0, 3, 2), // link-deviation plus influence
+        (2, 3, 2, 0, 0, 2), // influence-only absorber
     ];
 
     #[test]
     fn block_to_dense_matches_hand_scatter_bit_exact() {
-        for (pt, pm, pg, ph, pw) in PARITY_LAYOUTS {
-            let sl = parity_make_slices(pt, pm, pg, ph, pw);
-            let acc = parity_filled_accumulator(pt, pm, pg, ph, pw);
+        for (pt, pm, pg, ph, pw, pi) in PARITY_LAYOUTS {
+            let sl = parity_make_slices(pt, pm, pg, ph, pw, pi);
+            let acc = parity_filled_accumulator(pt, pm, pg, ph, pw, pi);
             let got = acc.to_dense(&sl);
             let want = parity_reference_dense(&acc, &sl);
             assert_eq!(
                 got,
                 want,
                 "to_dense diverged from hand scatter for layout {:?}",
-                (pt, pm, pg, ph, pw)
+                (pt, pm, pg, ph, pw, pi)
             );
         }
     }
 
     #[test]
     fn block_diagonal_matches_dense_diagonal_bit_exact() {
-        for (pt, pm, pg, ph, pw) in PARITY_LAYOUTS {
-            let sl = parity_make_slices(pt, pm, pg, ph, pw);
-            let acc = parity_filled_accumulator(pt, pm, pg, ph, pw);
+        for (pt, pm, pg, ph, pw, pi) in PARITY_LAYOUTS {
+            let sl = parity_make_slices(pt, pm, pg, ph, pw, pi);
+            let acc = parity_filled_accumulator(pt, pm, pg, ph, pw, pi);
             let got = acc.diagonal(&sl);
             let want = parity_reference_dense(&acc, &sl).diag().to_owned();
             assert_eq!(
                 got,
                 want,
                 "diagonal diverged from dense diagonal for layout {:?}",
-                (pt, pm, pg, ph, pw)
+                (pt, pm, pg, ph, pw, pi)
             );
         }
     }
 
     #[test]
     fn block_operator_matvec_matches_dense_gemv() {
-        for (pt, pm, pg, ph, pw) in PARITY_LAYOUTS {
-            let sl = parity_make_slices(pt, pm, pg, ph, pw);
-            let acc = parity_filled_accumulator(pt, pm, pg, ph, pw);
+        for (pt, pm, pg, ph, pw, pi) in PARITY_LAYOUTS {
+            let sl = parity_make_slices(pt, pm, pg, ph, pw, pi);
+            let acc = parity_filled_accumulator(pt, pm, pg, ph, pw, pi);
             let dense = parity_reference_dense(&acc, &sl);
             let v = Array1::from_shape_fn(sl.total, |i| (i as f64 * 0.37).sin());
             let op = acc.into_operator(sl.clone());
@@ -22776,9 +23072,9 @@ mod tests {
 
     #[test]
     fn block_operator_bilinear_matches_dense_quadratic_form() {
-        for (pt, pm, pg, ph, pw) in PARITY_LAYOUTS {
-            let sl = parity_make_slices(pt, pm, pg, ph, pw);
-            let acc = parity_filled_accumulator(pt, pm, pg, ph, pw);
+        for (pt, pm, pg, ph, pw, pi) in PARITY_LAYOUTS {
+            let sl = parity_make_slices(pt, pm, pg, ph, pw, pi);
+            let acc = parity_filled_accumulator(pt, pm, pg, ph, pw, pi);
             let dense = parity_reference_dense(&acc, &sl);
             let v = Array1::from_shape_fn(sl.total, |i| (i as f64 * 0.37).sin());
             let u = Array1::from_shape_fn(sl.total, |i| (i as f64 * 0.53).cos());
@@ -22791,9 +23087,9 @@ mod tests {
 
     #[test]
     fn block_operator_dense_matches_accumulator_dense_bit_exact() {
-        for (pt, pm, pg, ph, pw) in PARITY_LAYOUTS {
-            let sl = parity_make_slices(pt, pm, pg, ph, pw);
-            let acc = parity_filled_accumulator(pt, pm, pg, ph, pw);
+        for (pt, pm, pg, ph, pw, pi) in PARITY_LAYOUTS {
+            let sl = parity_make_slices(pt, pm, pg, ph, pw, pi);
+            let acc = parity_filled_accumulator(pt, pm, pg, ph, pw, pi);
             let direct = acc.to_dense(&sl);
             let op = acc.into_operator(sl.clone());
             let via_op = op.to_dense();
@@ -22801,16 +23097,16 @@ mod tests {
                 direct,
                 via_op,
                 "operator to_dense diverged from accumulator to_dense for layout {:?}",
-                (pt, pm, pg, ph, pw)
+                (pt, pm, pg, ph, pw, pi)
             );
         }
     }
 
     #[test]
     fn block_view_is_transpose_symmetric_across_present_pairs() {
-        for (pt, pm, pg, ph, pw) in PARITY_LAYOUTS {
-            let sl = parity_make_slices(pt, pm, pg, ph, pw);
-            let acc = parity_filled_accumulator(pt, pm, pg, ph, pw);
+        for (pt, pm, pg, ph, pw, pi) in PARITY_LAYOUTS {
+            let sl = parity_make_slices(pt, pm, pg, ph, pw, pi);
+            let acc = parity_filled_accumulator(pt, pm, pg, ph, pw, pi);
             for a in HessBlock::ALL {
                 if sl.range_of(a).is_none() {
                     continue;
@@ -23115,6 +23411,7 @@ mod tests {
             logslope_surface_ranges: empty_logslope_surface_ranges(),
             score_warp: Some(score_runtime.clone()),
             link_dev: Some(link_runtime.clone()),
+            influence_absorber: None,
             time_linear_constraints: None,
             time_wiggle_knots: None,
             time_wiggle_degree: None,
@@ -23201,6 +23498,7 @@ mod tests {
             logslope_surface_ranges: empty_logslope_surface_ranges(),
             score_warp: Some(score_runtime.clone()),
             link_dev: Some(link_runtime.clone()),
+            influence_absorber: None,
             time_linear_constraints: None,
             time_wiggle_knots: None,
             time_wiggle_degree: None,
@@ -23245,6 +23543,7 @@ mod tests {
             logslope_surface_ranges: empty_logslope_surface_ranges(),
             score_warp: Some(score_runtime.clone()),
             link_dev: None,
+            influence_absorber: None,
             time_linear_constraints: None,
             time_wiggle_knots: Some(time_wiggle_knots),
             time_wiggle_degree: Some(time_wiggle_degree),
@@ -23377,6 +23676,7 @@ mod tests {
             logslope_surface_ranges: empty_logslope_surface_ranges(),
             score_warp: None,
             link_dev: Some(link_runtime.clone()),
+            influence_absorber: None,
             time_linear_constraints: None,
             time_wiggle_knots: Some(time_wiggle_knots),
             time_wiggle_degree: Some(time_wiggle_degree),
@@ -23422,6 +23722,7 @@ mod tests {
             logslope_surface_ranges: empty_logslope_surface_ranges(),
             score_warp: Some(score_runtime.clone()),
             link_dev: None,
+            influence_absorber: None,
             time_linear_constraints: None,
             time_wiggle_knots: Some(time_wiggle_knots),
             time_wiggle_degree: Some(time_wiggle_degree),
@@ -23493,6 +23794,7 @@ mod tests {
             logslope_surface_ranges: empty_logslope_surface_ranges(),
             score_warp: Some(score_runtime.clone()),
             link_dev: None,
+            influence_absorber: None,
             time_linear_constraints: None,
             time_wiggle_knots: Some(time_wiggle_knots),
             time_wiggle_degree: Some(time_wiggle_degree),
@@ -23570,6 +23872,7 @@ mod tests {
             logslope_surface_ranges: empty_logslope_surface_ranges(),
             score_warp: Some(score_runtime.clone()),
             link_dev: Some(link_runtime.clone()),
+            influence_absorber: None,
             time_linear_constraints: None,
             time_wiggle_knots: None,
             time_wiggle_degree: None,
@@ -23673,6 +23976,7 @@ mod tests {
             logslope_surface_ranges: empty_logslope_surface_ranges(),
             score_warp: Some(score_runtime.clone()),
             link_dev: Some(link_runtime.clone()),
+            influence_absorber: None,
             time_linear_constraints: None,
             time_wiggle_knots: None,
             time_wiggle_degree: None,
@@ -23735,6 +24039,7 @@ mod tests {
             logslope_surface_ranges: empty_logslope_surface_ranges(),
             score_warp: Some(score_runtime.clone()),
             link_dev: Some(link_runtime.clone()),
+            influence_absorber: None,
             time_linear_constraints: None,
             time_wiggle_knots: None,
             time_wiggle_degree: None,
@@ -23817,6 +24122,7 @@ mod tests {
             logslope_surface_ranges: empty_logslope_surface_ranges(),
             score_warp: Some(score_runtime.clone()),
             link_dev: Some(link_runtime.clone()),
+            influence_absorber: None,
             time_linear_constraints: None,
             time_wiggle_knots: None,
             time_wiggle_degree: None,
@@ -23906,6 +24212,7 @@ mod tests {
             logslope_surface_ranges: empty_logslope_surface_ranges(),
             score_warp: Some(score_runtime.clone()),
             link_dev: Some(link_runtime.clone()),
+            influence_absorber: None,
             time_linear_constraints: None,
             time_wiggle_knots: None,
             time_wiggle_degree: None,
@@ -23996,6 +24303,7 @@ mod tests {
             logslope_surface_ranges: empty_logslope_surface_ranges(),
             score_warp: Some(score_runtime.clone()),
             link_dev: None,
+            influence_absorber: None,
             time_linear_constraints: None,
             time_wiggle_knots: Some(time_wiggle_knots),
             time_wiggle_degree: Some(time_wiggle_degree),
@@ -24084,6 +24392,7 @@ mod tests {
             logslope_surface_ranges: empty_logslope_surface_ranges(),
             score_warp: Some(score_runtime.clone()),
             link_dev: None,
+            influence_absorber: None,
             time_linear_constraints: None,
             time_wiggle_knots: Some(time_wiggle_knots),
             time_wiggle_degree: Some(time_wiggle_degree),
@@ -24143,6 +24452,7 @@ mod tests {
             logslope_surface_ranges: empty_logslope_surface_ranges(),
             score_warp: Some(score_runtime.clone()),
             link_dev: Some(link_runtime.clone()),
+            influence_absorber: None,
             time_linear_constraints: None,
             time_wiggle_knots: Some(time_wiggle_knots),
             time_wiggle_degree: Some(time_wiggle_degree),
@@ -24238,6 +24548,7 @@ mod tests {
             logslope_surface_ranges: empty_logslope_surface_ranges(),
             score_warp: Some(score_runtime.clone()),
             link_dev: Some(link_runtime.clone()),
+            influence_absorber: None,
             time_linear_constraints: None,
             time_wiggle_knots: Some(time_wiggle_knots),
             time_wiggle_degree: Some(time_wiggle_degree),
@@ -24418,6 +24729,7 @@ mod tests {
             logslope_surface_ranges: empty_logslope_surface_ranges(),
             score_warp: Some(score_runtime.clone()),
             link_dev: Some(link_runtime.clone()),
+            influence_absorber: None,
             time_linear_constraints: None,
             time_wiggle_knots: Some(time_wiggle_knots),
             time_wiggle_degree: Some(time_wiggle_degree),
@@ -24493,6 +24805,7 @@ mod tests {
             logslope_surface_ranges: empty_logslope_surface_ranges(),
             score_warp: Some(score_runtime.clone()),
             link_dev: None,
+            influence_absorber: None,
             time_linear_constraints: None,
             time_wiggle_knots: Some(time_wiggle_knots),
             time_wiggle_degree: Some(time_wiggle_degree),
@@ -24579,6 +24892,7 @@ mod tests {
             logslope_surface_ranges: empty_logslope_surface_ranges(),
             score_warp: Some(score_runtime.clone()),
             link_dev: None,
+            influence_absorber: None,
             time_linear_constraints: None,
             time_wiggle_knots: Some(time_wiggle_knots),
             time_wiggle_degree: Some(time_wiggle_degree),
@@ -25097,6 +25411,7 @@ mod tests {
             .expect("time derivative guard constraints"),
             score_warp: None,
             link_dev: None,
+            influence_absorber: None,
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
@@ -25293,6 +25608,7 @@ mod tests {
             time_linear_constraints: Some(constraints),
             score_warp: None,
             link_dev: None,
+            influence_absorber: None,
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
@@ -25366,6 +25682,7 @@ mod tests {
             time_linear_constraints: Some(constraints),
             score_warp: None,
             link_dev: None,
+            influence_absorber: None,
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 1,
@@ -25428,6 +25745,7 @@ mod tests {
             .expect("combined time constraints"),
             score_warp: None,
             link_dev: None,
+            influence_absorber: None,
             time_wiggle_knots: None,
             time_wiggle_degree: None,
             time_wiggle_ncols: 1,
@@ -25651,6 +25969,7 @@ mod tests {
             logslope_surface_ranges: empty_logslope_surface_ranges(),
             score_warp: None,
             link_dev: None,
+            influence_absorber: None,
             time_linear_constraints: time_derivative_guard_constraints(
                 &DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0, 0.0]])),
                 &array![0.2],
@@ -26931,6 +27250,7 @@ mod tests {
             logslope_surface_ranges: empty_logslope_surface_ranges(),
             score_warp: Some(score_runtime),
             link_dev: None,
+            influence_absorber: None,
             time_linear_constraints: None,
             time_wiggle_knots: None,
             time_wiggle_degree: None,
@@ -27119,6 +27439,7 @@ mod tests {
             logslope_surface_ranges: empty_logslope_surface_ranges(),
             score_warp: Some(score_runtime.clone()),
             link_dev: Some(link_runtime.clone()),
+            influence_absorber: None,
             time_linear_constraints: None,
             time_wiggle_knots: Some(time_wiggle_knots),
             time_wiggle_degree: Some(time_wiggle_degree),
@@ -27283,6 +27604,7 @@ mod tests {
             logslope_surface_ranges: empty_logslope_surface_ranges(),
             score_warp: Some(score_runtime.clone()),
             link_dev: Some(link_runtime.clone()),
+            influence_absorber: None,
             time_linear_constraints: None,
             time_wiggle_knots: None,
             time_wiggle_degree: None,
@@ -28032,8 +28354,9 @@ mod tests {
         p_g: usize,
         p_h: usize,
         p_w: usize,
+        p_i: usize,
     ) -> BlockHessianAccumulator {
-        let mut acc = BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w);
+        let mut acc = BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w, p_i);
         // Per-pair base offsets keep the diagonal blocks symmetric (required
         // for a valid Hessian) while making the off-diagonal blocks distinct
         // and asymmetric, so `to_dense` must place each transpose correctly.
@@ -28050,6 +28373,7 @@ mod tests {
         sym(&mut acc.h_gg, 3.0);
         sym(&mut acc.h_hh, 4.0);
         sym(&mut acc.h_ww, 5.0);
+        sym(&mut acc.h_ii, 6.0);
         let rect = |m: &mut Array2<f64>, base: f64| {
             let (r, c) = m.dim();
             for i in 0..r {
@@ -28062,12 +28386,17 @@ mod tests {
         rect(&mut acc.h_tg, 20.0);
         rect(&mut acc.h_th, 30.0);
         rect(&mut acc.h_tw, 40.0);
+        rect(&mut acc.h_ti, 45.0);
         rect(&mut acc.h_mg, 50.0);
         rect(&mut acc.h_mh, 60.0);
         rect(&mut acc.h_mw, 70.0);
+        rect(&mut acc.h_mi, 75.0);
         rect(&mut acc.h_gh, 80.0);
         rect(&mut acc.h_gw, 90.0);
+        rect(&mut acc.h_gi, 95.0);
         rect(&mut acc.h_hw, 100.0);
+        rect(&mut acc.h_hi, 110.0);
+        rect(&mut acc.h_wi, 120.0);
         acc
     }
 
@@ -28077,20 +28406,22 @@ mod tests {
         p_g: usize,
         p_h: usize,
         p_w: usize,
+        p_i: usize,
     ) -> BlockSlices {
         let time = 0..p_t;
         let marginal = time.end..time.end + p_m;
         let logslope = marginal.end..marginal.end + p_g;
         let score_warp = logslope.end..logslope.end + p_h;
         let link_dev = score_warp.end..score_warp.end + p_w;
-        let total = link_dev.end;
+        let influence = link_dev.end..link_dev.end + p_i;
+        let total = influence.end;
         BlockSlices {
             time,
             marginal,
             logslope,
             score_warp: Some(score_warp),
             link_dev: Some(link_dev),
-            influence: None,
+            influence: Some(influence),
             total,
         }
     }
@@ -28105,9 +28436,9 @@ mod tests {
     /// layout would break this test.
     #[test]
     fn block_hessian_dense_operator_parity_all_five_blocks() {
-        let (p_t, p_m, p_g, p_h, p_w) = (3usize, 2, 2, 3, 2);
-        let slices = full_block_slices(p_t, p_m, p_g, p_h, p_w);
-        let acc = fill_block_hessian_accumulator(p_t, p_m, p_g, p_h, p_w);
+        let (p_t, p_m, p_g, p_h, p_w, p_i) = (3usize, 2, 2, 3, 2, 2);
+        let slices = full_block_slices(p_t, p_m, p_g, p_h, p_w, p_i);
+        let acc = fill_block_hessian_accumulator(p_t, p_m, p_g, p_h, p_w, p_i);
 
         // The dense reference scatter (single source of truth).
         let dense = acc.to_dense(&slices);
