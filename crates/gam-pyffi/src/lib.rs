@@ -22353,7 +22353,7 @@ fn sindy_library_array<'py>(
     use gam::solver::sindy::{SindyLibraryTerm, sindy_library};
     let mut terms: Vec<SindyLibraryTerm> = Vec::with_capacity(spec.len());
     for entry in spec.iter() {
-        let tuple = entry.downcast::<PyTuple>().map_err(|_| {
+        let tuple = entry.cast::<PyTuple>().map_err(|_| {
             py_value_error(
                 "sindy_library_array: each spec entry must be a (token, column, name) tuple"
                     .to_string(),
@@ -23658,8 +23658,10 @@ fn fit_dataset_impl(
     let mut progress = gam::visualizer::VisualizerSession::new(true);
     progress.set_stage("fit", "optimizing penalized likelihood");
     progress.start_workflow_open_ended("Fit");
-    let training_table_kind = fit_config_training_table_kind(config_json)?;
-    let mut fit_config = parse_fit_config(config_json)?;
+    let ParsedFitConfig {
+        mut fit_config,
+        training_table_kind,
+    } = parse_fit_config_with_provenance(config_json)?;
     if let Some(w) = fisher_rao_w {
         inject_scalar_fisher_rao_weight(&mut dataset, &mut fit_config, w)?;
     }
@@ -27318,36 +27320,23 @@ fn periodic_harmonic_basis_derivative<'py>(
     Ok(out.into_pyarray(py).unbind())
 }
 
-/// Extract the Python-only `training_table_kind` provenance tag from the fit
-/// config JSON, if present. This is intentionally separate from
-/// [`parse_fit_config`]: the value never enters the core solver
-/// [`gam::FitConfig`] (which carries math/solver state only) — it is persisted
-/// straight onto [`FittedModelPayload::training_table_kind`] so the predict-time
-/// output-container fallback survives `save`/`load`. A blank or absent config,
-/// or a config that omits the key, yields `None`. The key, when present, must be
-/// a JSON string.
-fn fit_config_training_table_kind(config_json: Option<&str>) -> Result<Option<String>, String> {
-    let raw = match config_json {
-        Some(raw) if !raw.trim().is_empty() => raw,
-        _ => return Ok(None),
-    };
-    let value: serde_json::Value =
-        serde_json::from_str(raw).map_err(|err| format!("invalid fit config json: {err}"))?;
-    match value.get("training_table_kind") {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(serde_json::Value::String(kind)) => Ok(Some(kind.clone())),
-        Some(other) => Err(format!(
-            "training_table_kind must be a JSON string, got {other}"
-        )),
-    }
+struct ParsedFitConfig {
+    fit_config: FitConfig,
+    /// Python presentation provenance for the input container used at fit time.
+    /// This intentionally stays out of core [`FitConfig`] because it has no
+    /// mathematical effect; it is persisted directly to
+    /// [`FittedModelPayload::training_table_kind`] so predict-time output
+    /// container fallback survives save/load round trips.
+    training_table_kind: Option<String>,
 }
 
-fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
+fn parse_fit_config_with_provenance(config_json: Option<&str>) -> Result<ParsedFitConfig, String> {
     let py_config = match config_json {
         Some(raw) if !raw.trim().is_empty() => serde_json::from_str::<PyFitConfig>(raw)
             .map_err(|err| format!("invalid fit config json: {err}"))?,
         _ => PyFitConfig::default(),
     };
+    let training_table_kind = py_config.training_table_kind.clone();
     let mut fit_config = FitConfig::default();
     fit_config.group_metadata = parse_group_metadata(py_config.group_metadata, py_config.groups)?;
     fit_config.penalty_block_gamma_priors = parse_precision_hyperpriors(
@@ -27517,7 +27506,14 @@ fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
             "frailty_kind is required when frailty_sd or hazard_loading is provided".to_string(),
         );
     }
-    Ok(fit_config)
+    Ok(ParsedFitConfig {
+        fit_config,
+        training_table_kind,
+    })
+}
+
+fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
+    parse_fit_config_with_provenance(config_json).map(|parsed| parsed.fit_config)
 }
 
 fn parse_group_metadata(
@@ -30432,6 +30428,17 @@ mod tests {
     #[test]
     fn model_version_matches_canonical_payload_version() {
         assert_eq!(MODEL_VERSION, MODEL_PAYLOAD_VERSION);
+    }
+
+    #[test]
+    fn parse_fit_config_preserves_training_table_kind_provenance() {
+        let parsed = parse_fit_config_with_provenance(Some(
+            r#"{"family":"gaussian","training_table_kind":"pandas"}"#,
+        ))
+        .expect("fit config with training table provenance must parse");
+
+        assert_eq!(parsed.fit_config.family.as_deref(), Some("gaussian"));
+        assert_eq!(parsed.training_table_kind.as_deref(), Some("pandas"));
     }
 
     /// Builds a deterministic formula-table dataset for the shared-tangent

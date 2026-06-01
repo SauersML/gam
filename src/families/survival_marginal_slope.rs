@@ -2353,6 +2353,15 @@ impl BlockHessianAccumulator {
 
             (ScoreWarp, LinkDev) => self.h_hw.view(),
             (LinkDev, ScoreWarp) => self.h_hw.t(),
+
+            (Influence, _) | (_, Influence) => {
+                // SAFETY: `Influence` participates in `HessBlock::ALL` only when
+                // `BlockSlices::influence` is present. The Hessian accumulator has
+                // not grown storage for those off-diagonal blocks yet, so reaching
+                // this arm is a layout-construction bug rather than recoverable
+                // model input.
+                panic!("survival marginal-slope influence Hessian block storage is not initialized")
+            }
         }
     }
 
@@ -5752,8 +5761,7 @@ impl SurvivalMarginalSlopeFamily {
         if self.influence_absorber.is_none() {
             return Ok(None);
         }
-        let idx =
-            3 + usize::from(self.score_warp.is_some()) + usize::from(self.link_dev.is_some());
+        let idx = 3 + usize::from(self.score_warp.is_some()) + usize::from(self.link_dev.is_some());
         block_states
             .get(idx)
             .map(|state| Some(&state.beta))
@@ -5768,9 +5776,10 @@ impl SurvivalMarginalSlopeFamily {
         row: usize,
         block_states: &[ParameterBlockState],
     ) -> Result<f64, String> {
-        let (Some(z_tilde), Some(gamma)) =
-            (self.influence_absorber.as_ref(), self.flex_influence_beta(block_states)?)
-        else {
+        let (Some(z_tilde), Some(gamma)) = (
+            self.influence_absorber.as_ref(),
+            self.flex_influence_beta(block_states)?,
+        ) else {
             return Ok(0.0);
         };
         if gamma.len() != z_tilde.ncols() {
@@ -13561,9 +13570,7 @@ impl crate::families::marginal_slope_shared::MarginalSlopePsiFamily
         )
     }
 
-    fn psi_first_order_terms_all(
-        &self,
-    ) -> Result<Option<Vec<ExactNewtonJointPsiTerms>>, String> {
+    fn psi_first_order_terms_all(&self) -> Result<Option<Vec<ExactNewtonJointPsiTerms>>, String> {
         let total: usize = self.derivative_blocks.iter().map(Vec::len).sum();
         if total == 0 {
             return Ok(Some(Vec::new()));
@@ -20014,17 +20021,18 @@ pub fn fit_survival_marginal_slope_terms(
     // and the free `score_warp` spline below is the x-free-column fallback.
     let influence_absorber_residualized: Option<Array2<f64>> =
         if let Some(jac) = spec.score_influence_jacobian.as_ref() {
-            let marginal_dense = marginal_design
-                .design
-                .try_to_dense_by_chunks("survival marginal-slope influence-absorber marginal span")?;
-            let rigid_logslope_at_rows = &spec.logslope_offset + baseline_slope;
-            let residualized = crate::families::marginal_slope_orthogonal::build_residualized_influence_columns(
-                jac,
-                &marginal_dense,
-                &rigid_logslope_at_rows,
-                &cross_block_pilot_w,
-                probit_scale,
+            let marginal_dense = marginal_design.design.try_to_dense_by_chunks(
+                "survival marginal-slope influence-absorber marginal span",
             )?;
+            let rigid_logslope_at_rows = &spec.logslope_offset + baseline_slope;
+            let residualized =
+                crate::families::marginal_slope_orthogonal::build_residualized_influence_columns(
+                    jac,
+                    &marginal_dense,
+                    &rigid_logslope_at_rows,
+                    &cross_block_pilot_w,
+                    probit_scale,
+                )?;
             Some(residualized)
         } else {
             None
