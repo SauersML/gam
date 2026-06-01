@@ -212,14 +212,15 @@ fn crossfit_score_z_jacobian(x: &[f64], score: &[f64], k_folds: usize) -> CrossF
         let tn = fit_ctn_stage1(&train_x, &train_score);
 
         let test_x: Vec<f64> = test_idx.iter().map(|&i| x[i]).collect();
-        let test_score: Vec<f64> = test_idx.iter().map(|&i| score[i]).collect();
+        let test_score = Array1::from_shape_fn(test_idx.len(), |row| score[test_idx[row]]);
         let cov_rows = ctn_covariate_rows(&tn, &test_x);
 
-        // z on the held-out fold via the documented finite-support PIT map.
-        let z_fold = ctn_latent_z(&tn, &cov_rows, &test_score);
-        // J = ∂z/∂θ₁ on the held-out fold (design §6 public API).
-        let test_score_arr = Array1::from_vec(test_score.clone());
-        let jac = score_influence_jacobian(&tn, &test_score_arr, cov_rows.view())
+        // J = ∂z/∂θ₁ AND the latent z on the held-out fold come back together
+        // from the §6 API — computing J already runs the finite-support PIT, so
+        // `jac.z` is the single source of truth for the out-of-fold z (no
+        // separate PIT reconstruction, which would risk drifting from the
+        // exact transform the Jacobian differentiates).
+        let jac = score_influence_jacobian(&tn, &test_score, cov_rows.view())
             .expect("Stage-1 score-influence Jacobian");
         let p1 = jac.columns.ncols();
         let acc = jac_oof.get_or_insert_with(|| Array2::<f64>::zeros((n, p1)));
@@ -229,7 +230,7 @@ fn crossfit_score_z_jacobian(x: &[f64], score: &[f64], k_folds: usize) -> CrossF
             "cross-fit folds disagree on Stage-1 parameter dimension p₁"
         );
         for (row, &i) in test_idx.iter().enumerate() {
-            z_oof[i] = z_fold[row];
+            z_oof[i] = jac.z[row];
             for c in 0..p1 {
                 acc[[i, c]] = jac.columns[[row, c]];
             }
@@ -242,85 +243,6 @@ fn crossfit_score_z_jacobian(x: &[f64], score: &[f64], k_folds: usize) -> CrossF
         "cross-fit left an out-of-fold z unfilled"
     );
     CrossFitScoreZJac { z_oof, jac_oof }
-}
-
-/// Reconstruct the latent score `z_i = Φ⁻¹(u_i)` for a fitted CTN at covariate-
-/// design rows `cov_rows` and response values `y`, with
-/// `u_i = (Φ(h_i) − Φ(L_i)) / (Φ(U_i) − Φ(L_i))` (finite-support PIT). This is
-/// the documented Stage-1 → Stage-2 hand-off (design §1) and reproduces the
-/// exact transform the predict path applies; it is the math ground truth for
-/// `z`, not a tool comparison.
-fn ctn_latent_z(tn: &TransformationNormalFitResult, cov_rows: &Array2<f64>, y: &[f64]) -> Vec<f64> {
-    use gam::terms::basis::{create_basis, BasisOptions, Dense, KnotSource};
-
-    let family = &tn.family;
-    let resp_knots = family.response_knots().clone();
-    let resp_transform = family.response_transform();
-    let degree = family.response_degree();
-    let median = family.response_median();
-    let eps = gam::transformation_normal::TRANSFORMATION_MONOTONICITY_EPS;
-
-    let n = y.len();
-    let p_cov = cov_rows.ncols();
-    assert_eq!(cov_rows.nrows(), n, "cov_rows / y length mismatch");
-
-    let beta = &tn.fit.blocks[0].beta;
-    let p_shape = resp_transform.ncols();
-    let p_resp = 1 + p_shape;
-    assert_eq!(
-        beta.len(),
-        p_resp * p_cov,
-        "beta length {} != p_resp({p_resp}) * p_cov({p_cov})",
-        beta.len()
-    );
-    let gamma = beta
-        .view()
-        .into_shape_with_order((p_resp, p_cov))
-        .expect("reshape CTN beta into (p_resp, p_cov)");
-
-    let y_arr = Array1::from_vec(y.to_vec());
-    let (raw_val_arc, _) = create_basis::<Dense>(
-        y_arr.view(),
-        KnotSource::Provided(resp_knots.view()),
-        degree,
-        BasisOptions::i_spline(),
-    )
-    .expect("I-spline value basis at response points");
-    let shape_val = raw_val_arc.as_ref().dot(resp_transform);
-
-    let mut upper_shape = vec![0.0; p_shape];
-    for c in 0..p_shape {
-        upper_shape[c] = resp_transform.column(c).sum();
-    }
-    let lower_floor = eps * (resp_knots[0] - median);
-    let upper_floor = eps * (resp_knots[resp_knots.len() - 1] - median);
-
-    let mut z = vec![0.0; n];
-    for i in 0..n {
-        let cov_row = cov_rows.row(i);
-        let gamma0 = gamma.row(0).dot(&cov_row);
-        let mut val = gamma0;
-        let mut up = gamma0;
-        for r in 1..p_resp {
-            let g = gamma.row(r).dot(&cov_row);
-            let g2 = g * g;
-            val += shape_val[[i, r - 1]] * g2;
-            up += upper_shape[r - 1] * g2;
-        }
-        let h = val + eps * (y[i] - median);
-        let lower = gamma0 + lower_floor;
-        let upper = up + upper_floor;
-        let h_in = h.clamp(lower, upper);
-        let u = if upper <= lower {
-            0.5
-        } else {
-            ((normal_cdf(h_in) - normal_cdf(lower)) / (normal_cdf(upper) - normal_cdf(lower)))
-                .clamp(1e-9, 1.0 - 1e-9)
-        };
-        // Φ⁻¹(u) via the erfinv route (statrs supplies erf_inv).
-        z[i] = std::f64::consts::SQRT_2 * statrs::function::erf::erf_inv(2.0 * u - 1.0);
-    }
-    z
 }
 
 // ---------------------------------------------------------------------------
@@ -859,8 +781,12 @@ fn influence_block_design_is_diag_scaled_jacobian() {
     let pilot_beta0 = Array1::from_shape_fn(n, |i| 0.3 + 0.2 * (i as f64) - 0.05 * (i * i) as f64);
     let s_f = 1.7_f64;
 
+    // `influence_block_design` consumes only `columns` (× s_f·β̂₀); the co-located
+    // `z` is carried for the cross-fit fold loop and is irrelevant here, so a
+    // length-matched placeholder is fine for this closed-form check.
     let jac = gam::families::marginal_slope_orthogonal::ScoreInfluenceJacobian {
         columns: jac_cols.clone(),
+        z: Array1::zeros(n),
     };
     let block = influence_block_design(&jac, &pilot_beta0, s_f);
 
