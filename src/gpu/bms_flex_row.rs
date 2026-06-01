@@ -824,11 +824,13 @@ impl RowKernelBackend {
                             reason: format!("bms_flex_row NVRTC compile failed: {err}"),
                         }
                     })?;
-                    let module = parts.ctx.load_module(ptx).map_err(|err| {
-                        GpuError::DriverCallFailed {
-                            reason: format!("bms_flex_row module load failed: {err}"),
-                        }
-                    })?;
+                    let module =
+                        parts
+                            .ctx
+                            .load_module(ptx)
+                            .map_err(|err| GpuError::DriverCallFailed {
+                                reason: format!("bms_flex_row module load failed: {err}"),
+                            })?;
                     Ok(RowKernelBackend {
                         stream: parts.stream.clone(),
                         module,
@@ -1755,11 +1757,13 @@ impl HvpKernelBackend {
                             reason: format!("bms_flex_row hvp NVRTC compile failed: {err}"),
                         }
                     })?;
-                    let module = parts.ctx.load_module(ptx).map_err(|err| {
-                        GpuError::DriverCallFailed {
-                            reason: format!("bms_flex_row hvp module load failed: {err}"),
-                        }
-                    })?;
+                    let module =
+                        parts
+                            .ctx
+                            .load_module(ptx)
+                            .map_err(|err| GpuError::DriverCallFailed {
+                                reason: format!("bms_flex_row hvp module load failed: {err}"),
+                            })?;
                     Ok(HvpKernelBackend {
                         stream: parts.stream.clone(),
                         module,
@@ -3410,14 +3414,10 @@ mod tests {
             let inputs_gpu = parity_inputs(&buffers);
             let gpu_out = match launch_bms_flex_row_kernel(inputs_gpu) {
                 Ok(out) => out,
-                Err(err) => {
-                    eprintln!(
-                        "[bms_flex_row parity] launch failed on CUDA host: \
-                         {err}; skipping parity (treat as CI infra outage, \
-                         not a parity regression)"
-                    );
-                    return;
-                }
+                Err(err) => panic!(
+                    "[bms_flex_row parity] launch failed on CUDA-selected host; \
+                     device/oracle parity must fail loudly on GPU CI: {err}"
+                ),
             };
 
             let n = inputs_cpu.n_rows;
