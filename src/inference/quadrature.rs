@@ -790,7 +790,7 @@ fn wilkinson_shift(a: f64, c: f64, b: f64) -> f64 {
 /// When `se_eta` is zero or very small, this reduces to `sigmoid(eta)`.
 #[inline]
 pub fn logit_posterior_mean(ctx: &QuadratureContext, eta: f64, se_eta: f64) -> f64 {
-    match logit_posterior_meanwith_deriv_controlled(ctx, eta, se_eta) {
+    match logit_posterior_meanwith_deriv_controlled(eta, se_eta) {
         Ok(out) => out.mean,
         Err(_) => integrate_normal_ghq_adaptive(ctx, eta, se_eta, sigmoid),
     }
@@ -805,7 +805,6 @@ pub fn logit_posterior_mean(ctx: &QuadratureContext, eta: f64, se_eta: f64) -> f
 /// Returns: (μ, dμ/dm)
 #[inline]
 pub fn logit_posterior_meanwith_deriv(
-    ctx: &QuadratureContext,
     eta: f64,
     se_eta: f64,
 ) -> Result<(f64, f64), EstimationError> {
@@ -819,7 +818,7 @@ pub fn logit_posterior_meanwith_deriv(
     // - tail and large-sigma controlled asymptotics
     // - GHQ only as the terminal numerical fallback if every analytic branch
     //   reports a non-finite or non-converged result.
-    let out = logit_posterior_meanwith_deriv_controlled(ctx, eta, se_eta)?;
+    let out = logit_posterior_meanwith_deriv_controlled(eta, se_eta)?;
     Ok((out.mean, out.dmean_dmu))
 }
 
@@ -1193,39 +1192,52 @@ fn tail_bound_exceeds_accuracy(mu: f64, sigma: f64, n_terms: usize, target_accur
     coeff / ((n + 1.0) * (n + 1.0)) > target_accuracy
 }
 
+/// Accurate logistic-normal mean and location-derivative via adaptive Simpson.
+/// `sigmoid` and `sigmoid' = sigmoid·(1−sigmoid)` are smooth and bounded, so
+/// `integrate_normal_adaptive` resolves both to ~1e-12 at every sigma — the
+/// trusted reference / fallback when the closed-form ladder is out of regime.
 #[inline]
-fn logit_posterior_meanwith_deriv_ghq(
-    ctx: &QuadratureContext,
-    mu: f64,
-    sigma: f64,
-) -> IntegratedMeanDerivative {
-    let (mean, dmean_dmu) = integrate_normal_ghq_adaptive(ctx, mu, sigma, |x| {
-        let (p, d1, _, _) = component_point_jet(LinkComponent::Logit, x);
-        (p, d1)
-    });
+fn logit_posterior_meanwith_deriv_quadrature(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
+    let mean = integrate_normal_adaptive(mu, sigma, |x| stable_sigmoidwith_derivative(x).0);
+    let dmean_dmu = integrate_normal_adaptive(mu, sigma, |x| stable_sigmoidwith_derivative(x).1).max(0.0);
     IntegratedMeanDerivative {
         mean,
-        dmean_dmu: dmean_dmu.max(0.0),
-        mode: if sigma <= LOGIT_SIGMA_DEGENERATE {
-            IntegratedExpectationMode::ExactClosedForm
-        } else {
-            IntegratedExpectationMode::QuadratureFallback
-        },
+        dmean_dmu,
+        mode: IntegratedExpectationMode::QuadratureFallback,
     }
 }
 
 #[inline]
 fn logit_posterior_meanwith_deriv_controlled(
-    ctx: &QuadratureContext,
     mu: f64,
     sigma: f64,
 ) -> Result<IntegratedMeanDerivative, EstimationError> {
     if !(mu.is_finite() && sigma.is_finite()) {
         crate::bail_invalid_estim!("logit integrated moments require finite mu and sigma");
     }
-    match logit_posterior_meanwith_deriv_exact(mu, sigma) {
-        Ok(out) => Ok(out),
-        Err(_) => Ok(logit_posterior_meanwith_deriv_ghq(ctx, mu, sigma)),
+    let candidate = match logit_posterior_meanwith_deriv_exact(mu, sigma) {
+        Ok(out) => out,
+        Err(_) => return Ok(logit_posterior_meanwith_deriv_quadrature(mu, sigma)),
+    };
+    // The erfcx-series derivative is truncated for the *mean*'s alternating
+    // tail and converges too slowly for the derivative at small sigma (it
+    // returns ~2x the true value on the erfcx branch); the sigma>=3
+    // Monahan–Stefanski probit mean is only ~1e-1 accurate. Both are caught by
+    // an accurate adaptive-Simpson reference — the exact point-mass / tail /
+    // Taylor regimes carry their own certificates and are trusted directly, so
+    // the common fast paths pay no quadrature cost.
+    match candidate.mode {
+        IntegratedExpectationMode::ExactSpecialFunction
+        | IntegratedExpectationMode::ControlledAsymptotic => {
+            let reference = logit_posterior_meanwith_deriv_quadrature(mu, sigma);
+            if integrated_mean_derivative_drift_exceeds(&candidate, &reference, 1e-6, 1e-4, 1e-7, 1e-3)
+            {
+                Ok(reference)
+            } else {
+                Ok(candidate)
+            }
+        }
+        _ => Ok(candidate),
     }
 }
 
@@ -2532,7 +2544,7 @@ pub fn integrated_inverse_link_mean_and_derivative(
             })
         }
         LinkFunction::Probit => Ok(probit_posterior_meanwith_deriv_exact(mu, sigma)),
-        LinkFunction::Logit => logit_posterior_meanwith_deriv_controlled(quadctx, mu, sigma),
+        LinkFunction::Logit => logit_posterior_meanwith_deriv_controlled(mu, sigma),
         LinkFunction::CLogLog => Ok(cloglog_posterior_meanwith_deriv_controlled(quadctx, mu, sigma)),
         LinkFunction::Sas => Err(EstimationError::InvalidInput(
             "state-less integrated SAS moments are unsupported; use SAS-aware prediction APIs with explicit (epsilon, log_delta)".to_string(),
@@ -2585,7 +2597,7 @@ pub fn integrated_inverse_link_jet(
                 // Mirror the scalar controlled-path mode when it accepts the
                 // exact erfcx backend; otherwise the node-sum above is a
                 // quadrature fallback.
-                match logit_posterior_meanwith_deriv_controlled(quadctx, mu, sigma) {
+                match logit_posterior_meanwith_deriv_controlled(mu, sigma) {
                     Ok(scalar) => scalar.mode,
                     Err(_) => IntegratedExpectationMode::QuadratureFallback,
                 }
@@ -2643,7 +2655,7 @@ pub fn integrated_logit_inverse_link_jet_pirls(
     let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive(quadctx, mu, sigma, |x| {
         component_point_jet(LinkComponent::Logit, x)
     });
-    let mode = match logit_posterior_meanwith_deriv_controlled(quadctx, mu, sigma) {
+    let mode = match logit_posterior_meanwith_deriv_controlled(mu, sigma) {
         Ok(scalar) => scalar.mode,
         Err(_) => IntegratedExpectationMode::QuadratureFallback,
     };
@@ -4597,10 +4609,9 @@ mod tests {
 
     #[test]
     fn test_logit_posterior_derivative_remains_positive_in_positive_tail() {
-        let ctx = QuadratureContext::new();
         let eta = 20.0;
         let se = 0.0;
-        let (_, dmu) = logit_posterior_meanwith_deriv(&ctx, eta, se)
+        let (_, dmu) = logit_posterior_meanwith_deriv(eta, se)
             .expect("logit posterior mean derivative should evaluate");
         assert!(dmu > 0.0);
         assert!(
@@ -4616,7 +4627,7 @@ mod tests {
         let se = 0.9;
         let h = 1e-5;
 
-        let (_, dmu) = logit_posterior_meanwith_deriv(&ctx, eta, se)
+        let (_, dmu) = logit_posterior_meanwith_deriv(eta, se)
             .expect("logit posterior mean derivative should evaluate");
         let mu_plus = logit_posterior_mean(&ctx, eta + h, se);
         let mu_minus = logit_posterior_mean(&ctx, eta - h, se);
@@ -4916,9 +4927,8 @@ mod tests {
         // contract; that is what we validate here, against an independent
         // high-resolution Simpson reference for BOTH the mean and its
         // μ-derivative (d/dμ E[sigmoid] = E[sigmoid']).
-        let ctx = QuadratureContext::new();
         let out =
-            logit_posterior_meanwith_deriv_controlled(&ctx, 1.1, 0.8).expect("controlled logit");
+            logit_posterior_meanwith_deriv_controlled(1.1, 0.8).expect("controlled logit");
         let (ref_mean, ref_d1, _, _) = logit_reference_jet_highres_simpson(1.1, 0.8);
         assert_relative_eq!(out.mean, ref_mean, epsilon = 1e-11, max_relative = 1e-10);
         assert!(out.dmean_dmu > 0.0);
@@ -5300,9 +5310,8 @@ mod tests {
         // implementation detail. We assert value accuracy against an
         // independent high-resolution Simpson reference, and document the
         // acceptable modes.
-        let ctx = QuadratureContext::new();
         let out =
-            logit_posterior_meanwith_deriv_controlled(&ctx, 1.1, 0.8).expect("logit controlled");
+            logit_posterior_meanwith_deriv_controlled(1.1, 0.8).expect("logit controlled");
         assert!(matches!(
             out.mode,
             IntegratedExpectationMode::ExactSpecialFunction
