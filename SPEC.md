@@ -1,5 +1,5 @@
-- Autodiff is never used outside of tests as hand-derived derivatives enable performance optimizations.
-- Finite differences is never used outside of tests.
+- Autodiff is never used outside of tests as hand-derived derivatives enable performance optimizations. Exception: not-our-code not-our-problem, e.g., obviously autodiff will be used internally by PyTorch.
+- Finite differences is never used outside of tests to approximate the derivative of a function we can write in closed form (use the analytic derivative). Exceptions: (a) differentiating observed data/iterates where no analytic function exists (e.g. SINDy `dz/dt`, optimizer-history sensitivities); (b) exact difference *operators* that define the model, not approximations (e.g. P-spline `S=DᵀD`, shape-constraint rows). "An analytic form exists but FD is more stable" is not an exception — derive and route the closed form.
 - Posterior mean must always be the default (never MAP).
 - Analytic, closed-forms should be supported in general for all model types.
 - Penalties must always be on the final function itself, never on the model coefficients. Exception: when it can be proven that penalizing model coefficients is precisely equivalent to the function value approach.
