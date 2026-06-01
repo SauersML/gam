@@ -65,9 +65,10 @@ use gam::predict::{
 use gam::probability::{normal_cdf, standard_normal_quantile};
 use gam::report;
 use gam::smooth::{
-    BoundedCoefficientPriorSpec, ByVarKind, LinearCoefficientGeometry, LinearTermSpec,
-    SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions, TermCollectionSpec,
-    build_term_collection_design, freeze_term_collection_from_design,
+    BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec,
+    SmoothBasisSpec, SmoothStructureAnalysis, SmoothTermSpec,
+    SpatialLengthScaleOptimizationOptions, TermCollectionSpec, analyze_smooth_ownership,
+    build_term_collection_design, freeze_term_collection_from_design, smooth_term_feature_cols,
 };
 use gam::smooth_test::SmoothTestScale;
 use gam::survival::{
@@ -7709,54 +7710,6 @@ fn collect_spatial_smooth_usagewarnings(
         .collect()
 }
 
-fn smooth_term_feature_cols(term: &SmoothTermSpec) -> Vec<usize> {
-    match &term.basis {
-        SmoothBasisSpec::ByVariable { inner, by_col, .. }
-        | SmoothBasisSpec::FactorSumToZero { inner, by_col, .. } => {
-            let mut cols = smooth_term_feature_cols(&SmoothTermSpec {
-                name: term.name.clone(),
-                basis: (**inner).clone(),
-                shape: term.shape,
-                joint_null_rotation: None,
-            });
-            cols.push(*by_col);
-            cols.sort_unstable();
-            cols.dedup();
-            cols
-        }
-        SmoothBasisSpec::BSpline1D { feature_col, .. } => vec![*feature_col],
-        SmoothBasisSpec::ThinPlate { feature_cols, .. }
-        | SmoothBasisSpec::Sphere { feature_cols, .. }
-        | SmoothBasisSpec::Matern { feature_cols, .. }
-        | SmoothBasisSpec::Duchon { feature_cols, .. }
-        | SmoothBasisSpec::Pca { feature_cols, .. }
-        | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => feature_cols.clone(),
-        SmoothBasisSpec::BySmooth { smooth, by_kind } => {
-            let mut cols = smooth_term_feature_cols(&SmoothTermSpec {
-                name: term.name.clone(),
-                basis: (**smooth).clone(),
-                shape: term.shape,
-                joint_null_rotation: None,
-            });
-            match by_kind {
-                ByVarKind::Numeric { feature_col } | ByVarKind::Factor { feature_col, .. } => {
-                    cols.push(*feature_col)
-                }
-            }
-            cols.sort_unstable();
-            cols.dedup();
-            cols
-        }
-        SmoothBasisSpec::FactorSmooth { spec } => {
-            let mut cols = spec.continuous_cols.clone();
-            cols.push(spec.group_col);
-            cols.sort_unstable();
-            cols.dedup();
-            cols
-        }
-    }
-}
-
 fn collect_linear_smooth_overlapwarnings(
     spec: &TermCollectionSpec,
     headers: &[String],
@@ -7802,111 +7755,55 @@ fn collect_linear_smooth_overlapwarnings(
     warnings
 }
 
-fn smooth_basiswarning_family_rank(term: &SmoothTermSpec) -> u8 {
-    match &term.basis {
-        SmoothBasisSpec::ByVariable { inner, .. }
-        | SmoothBasisSpec::FactorSumToZero { inner, .. } => {
-            smooth_basiswarning_family_rank(&SmoothTermSpec {
-                name: term.name.clone(),
-                basis: (**inner).clone(),
-                shape: term.shape,
-                joint_null_rotation: None,
-            })
-        }
-        SmoothBasisSpec::BSpline1D { .. } => 0,
-        SmoothBasisSpec::TensorBSpline { .. } => 1,
-        SmoothBasisSpec::ThinPlate { .. } => 2,
-        SmoothBasisSpec::Sphere { .. } => 3,
-        SmoothBasisSpec::Matern { .. } => 4,
-        SmoothBasisSpec::Duchon { .. } => 5,
-        SmoothBasisSpec::Pca { .. } => 6,
-        SmoothBasisSpec::BySmooth { smooth, .. } => {
-            smooth_basiswarning_family_rank(&SmoothTermSpec {
-                name: term.name.clone(),
-                basis: (**smooth).clone(),
-                shape: term.shape,
-                joint_null_rotation: None,
-            })
-        }
-        SmoothBasisSpec::FactorSmooth { .. } => 7,
-    }
-}
-
-fn compare_smooth_warning_priority(
-    lhs_idx: usize,
-    lhs: &SmoothTermSpec,
-    rhs_idx: usize,
-    rhs: &SmoothTermSpec,
-) -> std::cmp::Ordering {
-    let lhs_cols = smooth_term_feature_cols(lhs);
-    let rhs_cols = smooth_term_feature_cols(rhs);
-    lhs_cols
-        .len()
-        .cmp(&rhs_cols.len())
-        .then_with(|| lhs_cols.cmp(&rhs_cols))
-        .then_with(|| {
-            smooth_basiswarning_family_rank(lhs).cmp(&smooth_basiswarning_family_rank(rhs))
-        })
-        .then_with(|| lhs.name.cmp(&rhs.name))
-        .then(lhs_idx.cmp(&rhs_idx))
-}
-
 fn collect_hierarchical_smooth_overlapwarnings(
     spec: &TermCollectionSpec,
     headers: &[String],
     label: &str,
 ) -> Vec<String> {
-    let mut ownership_order: Vec<usize> = (0..spec.smooth_terms.len()).collect();
-    ownership_order.sort_by(|&lhs, &rhs| {
-        compare_smooth_warning_priority(lhs, &spec.smooth_terms[lhs], rhs, &spec.smooth_terms[rhs])
-    });
+    let feature_label = |col: usize| {
+        headers
+            .get(col)
+            .cloned()
+            .unwrap_or_else(|| format!("#{col}"))
+    };
+    let join_feature_labels = |cols: &[usize]| {
+        cols.iter()
+            .map(|&col| feature_label(col))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    let SmoothStructureAnalysis {
+        ownership_order,
+        term_feature_cols,
+        term_owners,
+        ..
+    } = analyze_smooth_ownership(&spec.smooth_terms);
 
     let mut warnings = Vec::new();
-    for (pos, &target_idx) in ownership_order.iter().enumerate() {
-        let target = &spec.smooth_terms[target_idx];
-        let target_cols = smooth_term_feature_cols(target);
-        let target_features = target_cols
-            .iter()
-            .map(|&col| {
-                headers
-                    .get(col)
-                    .cloned()
-                    .unwrap_or_else(|| format!("#{col}"))
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        let target_set = target_cols.into_iter().collect::<BTreeSet<_>>();
-
-        let owners = ownership_order[..pos]
-            .iter()
-            .filter_map(|&owner_idx| {
-                let owner = &spec.smooth_terms[owner_idx];
-                let owner_cols = smooth_term_feature_cols(owner);
-                let owner_set = owner_cols.iter().copied().collect::<BTreeSet<_>>();
-                if !owner_set.is_subset(&target_set) {
-                    return None;
-                }
-                let owner_features = owner_cols
-                    .iter()
-                    .map(|&col| {
-                        headers
-                            .get(col)
-                            .cloned()
-                            .unwrap_or_else(|| format!("#{col}"))
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                Some(format!("`{}` over [{}]", owner.name, owner_features))
-            })
-            .collect::<Vec<_>>();
+    for &target_idx in &ownership_order {
+        let owners = &term_owners[target_idx];
         if owners.is_empty() {
             continue;
         }
+        let target = &spec.smooth_terms[target_idx];
+        let target_features = join_feature_labels(&term_feature_cols[target_idx]);
+        let owner_descriptions = owners
+            .iter()
+            .map(|&owner_idx| {
+                format!(
+                    "`{}` over [{}]",
+                    spec.smooth_terms[owner_idx].name,
+                    join_feature_labels(&term_feature_cols[owner_idx]),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
 
         warnings.push(format!(
             "{label}: smooth term `{}` over [{target_features}] overlaps nested or duplicate smooth term(s) {}. The fit uses automatic hierarchical ownership: those higher-priority smooth term(s) keep any shared realized subspace, and `{}` is residualized against that overlap before fitting.",
             target.name,
-            owners.join(", "),
+            owner_descriptions,
             target.name,
         ));
     }
