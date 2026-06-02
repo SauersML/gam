@@ -243,11 +243,42 @@ jobs:
           cp target/release/gam bench/runtime/gam
           chmod +x bench/runtime/gam
           # Build the gamfit._rust PyO3 extension that bench/run_suite.py
-          # loads via filesystem glob from `gamfit/_rust*.so`. Without this
-          # step every shard fails with "gamfit Rust extension is not built"
-          # the moment it asks for CV folds.
+          # loads. We use `maturin build` rather than `maturin develop`
+          # because maturin 1.x's develop subcommand requires an active
+          # virtualenv (the GHA hosted runner's system python is not
+          # inside one), which fails the whole bootstrap step with
+          # "Couldn't find a virtualenv or conda environment". `build`
+          # has no such requirement; we then crack open the produced
+          # wheel and drop the compiled extension into the source-tree
+          # `gamfit/` so each shard ships through the same shared
+          # runtime artifact as before.
           python3 -m pip install --upgrade 'maturin>=1.7,<2'
-          maturin develop --release
+          rm -rf dist
+          maturin build --release -i python3 -o dist
+          python3 - <<'PY'
+          import glob
+          import pathlib
+          import shutil
+          import sys
+          import zipfile
+
+          wheels = sorted(glob.glob("dist/*.whl"))
+          if not wheels:
+              sys.exit("maturin produced no wheel under dist/")
+          wheel = wheels[-1]
+          with zipfile.ZipFile(wheel) as zf:
+              matches = [
+                  m for m in zf.namelist()
+                  if m.startswith("gamfit/_rust") and (m.endswith(".so") or m.endswith(".pyd"))
+              ]
+              if not matches:
+                  sys.exit(f"no _rust*.so found inside {wheel}")
+              for member in matches:
+                  target = pathlib.Path("gamfit") / pathlib.Path(member).name
+                  with zf.open(member) as src, target.open("wb") as dst:
+                      shutil.copyfileobj(src, dst)
+                  print(f"extracted {target}")
+          PY
           # Ship the freshly-built extension through the shared runtime
           # artifact so each shard does not have to recompile it.
           cp gamfit/_rust*.so bench/runtime/
