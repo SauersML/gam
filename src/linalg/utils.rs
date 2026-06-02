@@ -1,8 +1,10 @@
 use crate::construction::calculate_condition_number;
-use crate::faer_ndarray::FaerEigh;
+use crate::estimate::EstimationError;
+use crate::faer_ndarray::{FaerCholesky, FaerEigh};
 use crate::faer_ndarray::{
     FaerArrayView, FaerLinalgError, array2_to_matmut, factorize_symmetricwith_fallback,
 };
+use crate::matrix::symmetrize_in_place;
 use faer::Side;
 use ndarray::{
     Array1, Array2, Array3, ArrayBase, ArrayView1, ArrayView2, ArrayView3, Data, Dimension, Zip, s,
@@ -1294,6 +1296,127 @@ pub fn gaussian_weighted_ridge_batch(
         }
     }
     Ok((coefficients, fitted))
+}
+
+/// Rank and Moore–Penrose pseudoinverse of a symmetric PSD penalty matrix via
+/// its eigendecomposition, keeping eigenpairs whose eigenvalue exceeds a
+/// relative tolerance. Returns `(rank, pinv)`.
+pub fn block_penalty_rank_and_pinv(
+    penalty: &Array2<f64>,
+) -> Result<(usize, Array2<f64>), EstimationError> {
+    let (eigs, vecs) = penalty.to_owned().eigh(Side::Lower).map_err(|_| {
+        EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        }
+    })?;
+    let max_abs = eigs.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
+    let tol = (1.0e-10 * max_abs).max(1.0e-14);
+    let mut rank = 0_usize;
+    let mut scaled = Array2::<f64>::zeros(vecs.dim());
+    for col in 0..eigs.len() {
+        if eigs[col] > tol {
+            rank += 1;
+            for row in 0..vecs.nrows() {
+                scaled[[row, col]] = vecs[[row, col]] / eigs[col];
+            }
+        }
+    }
+    Ok((rank, scaled.dot(&vecs.t())))
+}
+
+/// Invert a symmetric positive-definite matrix, escalating a relative diagonal
+/// ridge until the Cholesky factorization succeeds (robust SPD inverse).
+pub fn invert_spd_with_ridge(
+    matrix: &Array2<f64>,
+    ridge_rel: f64,
+) -> Result<Array2<f64>, EstimationError> {
+    let n = matrix.nrows();
+    let eye = Array2::<f64>::eye(n);
+    let scale = (0..n).map(|i| matrix[[i, i]].abs()).fold(1.0_f64, f64::max);
+    let ridges = [0.0, ridge_rel, 1.0e-10, 1.0e-8, 1.0e-6, 1.0e-4];
+    for rel in ridges {
+        let mut candidate = matrix.clone();
+        if rel > 0.0 {
+            for i in 0..n {
+                candidate[[i, i]] += rel * scale;
+            }
+        }
+        if let Ok(chol) = candidate.cholesky(Side::Lower) {
+            return Ok(chol.solve_mat(&eye));
+        }
+    }
+    Err(EstimationError::ModelIsIllConditioned {
+        condition_number: f64::INFINITY,
+    })
+}
+
+/// Solve a symmetric (possibly indefinite/ill-conditioned) linear system via
+/// eigendecomposition with a spectral floor: eigenvalues below the floor are
+/// clamped (preserving sign) before inversion, stabilizing the solve.
+pub fn solve_symmetric_vector_with_floor(
+    matrix: &Array2<f64>,
+    rhs: &Array1<f64>,
+    ridge_rel: f64,
+) -> Result<Array1<f64>, EstimationError> {
+    let n = matrix.nrows();
+    let mut sym = matrix.clone();
+    symmetrize_in_place(&mut sym);
+    let (eigs, vecs) =
+        sym.eigh(Side::Lower)
+            .map_err(|_| EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            })?;
+    let max_eig = eigs.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
+    let floor = (ridge_rel * max_eig.max(1.0)).max(1.0e-12);
+    let projected = vecs.t().dot(rhs);
+    let mut scaled = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let denom = if eigs[i].abs() >= floor {
+            eigs[i]
+        } else if eigs[i].is_sign_negative() {
+            -floor
+        } else {
+            floor
+        };
+        scaled[i] = projected[i] / denom;
+    }
+    let out = vecs.dot(&scaled);
+    if out.iter().all(|value| value.is_finite()) {
+        Ok(out)
+    } else {
+        Err(EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        })
+    }
+}
+
+/// Solve a symmetric dense block system `H x = rhs` (single right-hand side)
+/// via the Cholesky-with-fallback factorization, returning the solution vector.
+/// `context` labels errors.
+pub fn solve_dense_block_system(
+    hessian: &Array2<f64>,
+    rhs: &Array1<f64>,
+    context: &str,
+) -> Result<Array1<f64>, String> {
+    let mut rhs2 = Array2::<f64>::zeros((rhs.len(), 1));
+    for i in 0..rhs.len() {
+        rhs2[[i, 0]] = rhs[i];
+    }
+    let factor =
+        factorize_symmetricwith_fallback(FaerArrayView::new(hessian).as_ref(), Side::Lower)
+            .map_err(|err| format!("{context} factorization failed: {err}"))?;
+    {
+        let mut rhs_view = array2_to_matmut(&mut rhs2);
+        factor.solve_in_place(rhs_view.as_mut());
+    }
+    let mut out = Array1::<f64>::zeros(rhs.len());
+    for i in 0..rhs.len() {
+        out[i] = rhs2[[i, 0]];
+    }
+    if out.iter().any(|v| !v.is_finite()) {
+        return Err(format!("{context} solve produced non-finite coefficients"));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
