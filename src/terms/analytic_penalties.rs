@@ -6911,7 +6911,7 @@ impl AnalyticPenaltyOp {
 ///   3. Build a Hessian-block descriptor for `RemlState` cache-key invalidation.
 macro_rules! define_analytic_penalty_kind {
     ($(register!($variant:ident, $ty:ty);)*) => {
-        #[derive(Clone)]
+        #[derive(Clone, Debug)]
         pub enum AnalyticPenaltyKind {
             $($variant(Arc<$ty>),)*
         }

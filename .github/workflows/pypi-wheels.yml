@@ -8,7 +8,7 @@ name: Publish to PyPI
 # (it's always release). Every wheel job was failing at that line, but
 # `continue-on-error: true` swallowed the error so only the sdist made it
 # to PyPI — leaving downstream consumers (`uv sync` / `pip install`) to
-# fall back to the source build path. That's the "Building gamfit==0.1.17"
+# fall back to the source build path. That's the "Building gamfit from sdist"
 # 5× in parallel symptom.
 #
 # `command: build` does NOT trigger the `--release` injection, so the

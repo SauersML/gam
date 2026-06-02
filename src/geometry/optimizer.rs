@@ -564,9 +564,10 @@ mod tests {
         }
         fn hessian_vector_product(
             &mut self,
-            _point: ArrayView1<'_, f64>,
+            point: ArrayView1<'_, f64>,
             tangent: ArrayView1<'_, f64>,
         ) -> GeometryResult<Option<Array1<f64>>> {
+            assert!(point.iter().all(|value| value.is_finite()));
             Ok(Some(&tangent.to_owned() * 2.0))
         }
     }
@@ -602,9 +603,10 @@ mod tests {
         }
         fn hessian_vector_product(
             &mut self,
-            _point: ArrayView1<'_, f64>,
+            point: ArrayView1<'_, f64>,
             tangent: ArrayView1<'_, f64>,
         ) -> GeometryResult<Option<Array1<f64>>> {
+            assert!(point.iter().all(|value| value.is_finite()));
             Ok(Some(self.a.dot(&tangent.to_owned())))
         }
     }

@@ -2,8 +2,8 @@
 //!
 //! On a CPU-only host (no `libcuda.{dylib,so,dll}` reachable via the platform
 //! loader), a saved-and-then-loaded model must be predictable without
-//! triggering `cudarc::panic_no_lib_found`. The original report on
-//! `gamfit 0.1.123` showed `Model.predict(df)` panicking inside the Rust
+//! triggering `cudarc::panic_no_lib_found`. The original report showed
+//! `Model.predict(df)` panicking inside the Rust
 //! boundary on macOS because the dispatch decision reached into cudarc
 //! (via `fallback-dynamic-loading`) without first checking for the CUDA
 //! driver library outside cudarc.

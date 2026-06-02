@@ -11,7 +11,7 @@ truly lives on a 1-D circle, so:
 
 is the load-bearing claim of the whole machinery. This test pins that.
 
-Currently FAILS on gamfit 0.1.121:
+Before the periodic manifold fit was fixed:
     curved K=1, d=2, periodic, ibp_map  →  R^2 ≈ 0.18
     linear K=10, d=1, duchon, softmax   →  R^2 ≈ 0.83
 The curved atom collapses; the bug is somewhere between the periodic
@@ -67,7 +67,7 @@ def test_curved_atom_beats_linear_shards_on_one_harmonic():
         n_atoms=1,
         atom_basis="periodic",
         atom_dim=2,
-        assignment_prior="ibp_map",
+        assignment="ibp_map",
         max_iter=50,
         learning_rate=0.04,
         random_state=0,
@@ -77,7 +77,7 @@ def test_curved_atom_beats_linear_shards_on_one_harmonic():
         n_atoms=10,
         atom_basis="duchon",
         atom_dim=1,
-        assignment_prior="softmax",
+        assignment="softmax",
         max_iter=50,
         learning_rate=0.04,
         random_state=0,
