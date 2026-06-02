@@ -6379,7 +6379,6 @@ fn gaussian_joint_psi_firstweights(
         let ni = scalars.n[i];
         let ki = scalars.kappa[i];
         let kpi = scalars.kappa_prime[i];
-        let kdpi = scalars.kappa_dprime[i];
         let ai = scalars.obs_weight[i];
         let ma = mu_a[i];
         let ea = eta_a[i];
