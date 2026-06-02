@@ -24594,6 +24594,15 @@ fn predict_columns(
     let fit = fit_result_from_saved_model_for_prediction(model)?;
 
     let mut columns = BTreeMap::<String, Vec<f64>>::new();
+    // SPEC: the posterior mean `E[g⁻¹(Xβ)]` is *always* the default point
+    // estimate (never the plug-in mode `g⁻¹(Xβ̂)`). The integral is only
+    // observably distinct from the plug-in when the inverse link is curved
+    // over the posterior's support, so `FittedModel::prediction_uses_posterior_mean`
+    // — the single predicate shared with the CLI's `gam predict` — selects the
+    // posterior-mean path for exactly those models and keeps the cheaper,
+    // exact plug-in for effectively-linear ones (identity-link Gaussian, …).
+    // Reported point estimates therefore match the CLI default row-for-row.
+    let uses_posterior_mean = model.prediction_uses_posterior_mean();
     // Issue #342 — single uncertainty knob: `interval` is the only switch.
     // `Some(level)` means "quantify uncertainty at this coverage and return
     // SE + CI bounds"; `None` means "point predictions only". The earlier
@@ -24602,63 +24611,92 @@ fn predict_columns(
     // SE + bounds), and supporting both forced callers to learn two
     // partially-redundant flags. Migration: `with_uncertainty=True` →
     // `interval=0.95`.
-    if let Some(confidence_level) = options.interval {
-        let uncertainty_options = gam::predict::PredictUncertaintyOptions {
-            confidence_level,
-            covariance_mode:
-                gam::predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
-            mean_interval_method: gam::predict::MeanIntervalMethod::TransformEta,
-            includeobservation_interval: false,
-            // Issue #398: the point prediction must be a property of the model and
-            // the inputs, never of whether an interval was requested. The plain
-            // branch below (`predict_plugin_response`) reports the plug-in
-            // linear predictor η = Xβ̂ (+offset). With `apply_bias_correction:
-            // true` the uncertainty branch instead recentred η by the
-            // smoothing-shrinkage correction X·H⁻¹Sβ̂, so `mean` and
-            // `linear_predictor` silently shifted the moment a caller asked for
-            // an interval — contradicting the documented contract that
-            // `interval` only *adds* std_error/mean_lower/mean_upper columns.
-            // The recentred estimate is also empirically worse against truth
-            // (it trades bias for variance and overshoots at the domain
-            // boundary), and it is internally inconsistent with the link-wiggle
-            // uncertainty path, which never bias-corrects. Bias-aware *coverage*
-            // is already supplied by the smoothing-corrected covariance
-            // (`ConditionalPlusSmoothingPreferred`); recentring the point
-            // estimate is neither standard (mgcv reports the plug-in mean) nor
-            // wanted here. Disabling it makes this branch report the same
-            // plug-in point estimate as the plain path while still widening the
-            // interval for smoothing uncertainty.
-            apply_bias_correction: false,
-            ..gam::predict::PredictUncertaintyOptions::default()
-        };
-        let prediction = predictor
-            .predict_full_uncertainty(&predict_input, &fit, &uncertainty_options)
-            .map_err(|err| format!("prediction with uncertainty failed: {err}"))?;
-        // User-facing column names. Issue #310: the engine's internal labels
-        // ("eta", "effective_se", "effective_variance") leaked through the FFI
-        // as the public prediction-table schema. Rename at the Python boundary
-        // to names a user would actually look up:
-        //   eta                 -> linear_predictor (standard GLM terminology)
-        //   effective_se        -> std_error        (standard statistical term)
-        //   effective_variance  -> dropped (== std_error ** 2; trivial for the
-        //                          caller to compute and not worth a separate
-        //                          column they have to learn about).
-        // Internal Rust fields (``prediction.eta`` / ``eta_standard_error``)
-        // keep their theoretic names because they describe the math object.
-        columns.insert("linear_predictor".to_string(), prediction.eta.to_vec());
-        columns.insert("mean".to_string(), prediction.mean.to_vec());
-        columns.insert(
-            "std_error".to_string(),
-            prediction.eta_standard_error.to_vec(),
-        );
-        columns.insert("mean_lower".to_string(), prediction.mean_lower.to_vec());
-        columns.insert("mean_upper".to_string(), prediction.mean_upper.to_vec());
-    } else {
-        let prediction = predictor
-            .predict_plugin_response(&predict_input)
-            .map_err(|err| format!("prediction failed: {err}"))?;
-        columns.insert("linear_predictor".to_string(), prediction.eta.to_vec());
-        columns.insert("mean".to_string(), prediction.mean.to_vec());
+    //
+    // Issue #398: the point prediction is a property of the model and the
+    // inputs, never of whether an interval was requested — `interval` only
+    // *adds* std_error/mean_lower/mean_upper columns and never shifts `mean`
+    // or `linear_predictor`. That invariant holds on both axes here: the
+    // posterior-mean vs plug-in choice is driven solely by the model
+    // (`uses_posterior_mean`), and within each axis the interval and
+    // no-interval branches report the identical point.
+    //
+    // User-facing column names follow issue #310: the engine's internal labels
+    // ("eta", "effective_se", "effective_variance") are renamed at the FFI
+    // boundary to linear_predictor / std_error, and effective_variance is
+    // dropped (== std_error ** 2). The internal Rust fields keep their
+    // theoretic names because they describe the math object.
+    match (options.interval, uses_posterior_mean) {
+        (Some(confidence_level), true) => {
+            // Curved inverse link + interval: the canonical posterior-mean path
+            // returns the η-scale SE and the inverse-link-transformed credible
+            // bounds in one pass — the exact computation the CLI runs for these
+            // families — so `interval` just surfaces those extra columns on top
+            // of the same posterior-mean point as the no-interval branch.
+            let prediction = predictor
+                .predict_posterior_mean(&predict_input, &fit, Some(confidence_level))
+                .map_err(|err| {
+                    format!("posterior-mean prediction with uncertainty failed: {err}")
+                })?;
+            let (mean_lower, mean_upper) = prediction
+                .mean_lower
+                .zip(prediction.mean_upper)
+                .ok_or_else(|| {
+                    "posterior-mean prediction did not return confidence bounds".to_string()
+                })?;
+            columns.insert("linear_predictor".to_string(), prediction.eta.to_vec());
+            columns.insert("mean".to_string(), prediction.mean.to_vec());
+            columns.insert(
+                "std_error".to_string(),
+                prediction.eta_standard_error.to_vec(),
+            );
+            columns.insert("mean_lower".to_string(), mean_lower.to_vec());
+            columns.insert("mean_upper".to_string(), mean_upper.to_vec());
+        }
+        (Some(confidence_level), false) => {
+            // Effectively-linear model + interval: plug-in == posterior mean, so
+            // the delta-method full-uncertainty path reports that same point and
+            // only widens the interval for smoothing uncertainty.
+            // `apply_bias_correction: false` keeps the point equal to the plain
+            // plug-in branch: recentring η by X·H⁻¹Sβ̂ would silently shift `mean`
+            // the moment an interval was requested (violating issue #398), is
+            // empirically worse against truth, and is inconsistent with the
+            // link-wiggle path that never bias-corrects; bias-aware coverage is
+            // already supplied by the smoothing-corrected covariance.
+            let uncertainty_options = gam::predict::PredictUncertaintyOptions {
+                confidence_level,
+                covariance_mode:
+                    gam::predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+                mean_interval_method: gam::predict::MeanIntervalMethod::TransformEta,
+                includeobservation_interval: false,
+                apply_bias_correction: false,
+                ..gam::predict::PredictUncertaintyOptions::default()
+            };
+            let prediction = predictor
+                .predict_full_uncertainty(&predict_input, &fit, &uncertainty_options)
+                .map_err(|err| format!("prediction with uncertainty failed: {err}"))?;
+            columns.insert("linear_predictor".to_string(), prediction.eta.to_vec());
+            columns.insert("mean".to_string(), prediction.mean.to_vec());
+            columns.insert(
+                "std_error".to_string(),
+                prediction.eta_standard_error.to_vec(),
+            );
+            columns.insert("mean_lower".to_string(), prediction.mean_lower.to_vec());
+            columns.insert("mean_upper".to_string(), prediction.mean_upper.to_vec());
+        }
+        (None, true) => {
+            let prediction = predictor
+                .predict_posterior_mean(&predict_input, &fit, None)
+                .map_err(|err| format!("posterior-mean prediction failed: {err}"))?;
+            columns.insert("linear_predictor".to_string(), prediction.eta.to_vec());
+            columns.insert("mean".to_string(), prediction.mean.to_vec());
+        }
+        (None, false) => {
+            let prediction = predictor
+                .predict_plugin_response(&predict_input)
+                .map_err(|err| format!("prediction failed: {err}"))?;
+            columns.insert("linear_predictor".to_string(), prediction.eta.to_vec());
+            columns.insert("mean".to_string(), prediction.mean.to_vec());
+        }
     }
 
     // Issue #365 (secondary defect): location-scale / GAMLSS families fit a
