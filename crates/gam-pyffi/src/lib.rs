@@ -39,7 +39,6 @@ use gam::geometry::poincare::{
     to_lorentz as poincare_to_lorentz_impl,
 };
 use gam::geometry::simplex::{closure as simplex_closure, simplex_frechet_mean};
-use gam::geometry::sphere::normalize_sphere_matrix;
 use gam::hmc::{NutsConfig, NutsResult};
 use gam::inference::data::{
     EncodedDataset, UnseenCategoryPolicy, encode_recordswith_inferred_schema,
