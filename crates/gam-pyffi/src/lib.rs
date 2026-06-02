@@ -10058,6 +10058,119 @@ fn sae_streaming_plan(
 /// and a data-fit push to balance against.
 ///
 /// Returns the padded `(K, M_max, p_out)` decoder array directly.
+///
+/// Build a data-driven asymmetric assignment-logit seed for a cold start
+/// (issue #629). A uniform logit seed (`Array2::zeros`) is an exact symmetric
+/// saddle of the joint objective whenever the atoms are exchangeable under the
+/// assignment forward map: every atom carries identical responsibility, the
+/// LSQ decoder init projects the same target onto every atom, and the
+/// assignment update has no gradient to break the tie, so the fit never routes.
+/// The tiny `random_state` jitter is too weak to escape on conditioned data.
+///
+/// This helper runs one EM-style M-then-E step on the seed geometry: it fits
+/// each atom's decoder independently against the *full* response (each atom's
+/// own seed coordinates already give it a distinct `Phi_k`), measures the
+/// per-row reconstruction residual under that fit, and emits logits that prefer
+/// the atom which best explains each row. Rows that every atom explains equally
+/// well receive near-equal logits (the residual ties cancel), so the existing
+/// jitter still breaks those rare ties; rows with a clear best atom get a
+/// decisive — but bounded, hence escapable by the Newton refinement — head
+/// start. The result is a proper responsibility seed rather than a saddle.
+fn sae_residual_seed_logits(
+    basis_values: ArrayView3<'_, f64>,
+    basis_sizes: &[usize],
+    z: ArrayView2<'_, f64>,
+    gain: f64,
+) -> Result<Array2<f64>, String> {
+    let k_atoms = basis_sizes.len();
+    let (n_obs, p_out) = z.dim();
+    let mut logits = Array2::<f64>::zeros((n_obs, k_atoms));
+    if n_obs == 0 || p_out == 0 || k_atoms <= 1 {
+        return Ok(logits);
+    }
+    if basis_values.shape()[0] != k_atoms || basis_values.shape()[1] != n_obs {
+        return Err(format!(
+            "sae_residual_seed_logits: basis_values must start with (K, N)=({k_atoms}, {n_obs}); got {:?}",
+            basis_values.shape()
+        ));
+    }
+    let z_owned = z.to_owned();
+    // Per-row residual energy after fitting each atom independently.
+    let mut resid = Array2::<f64>::zeros((n_obs, k_atoms));
+    for atom_idx in 0..k_atoms {
+        let m_k = basis_sizes[atom_idx];
+        if m_k == 0 {
+            // No basis columns: the atom predicts zero, so its residual is the
+            // full row energy. Leave `resid` column at that value below.
+            for row in 0..n_obs {
+                let mut e = 0.0_f64;
+                for col in 0..p_out {
+                    e += z[[row, col]] * z[[row, col]];
+                }
+                resid[[row, atom_idx]] = e;
+            }
+            continue;
+        }
+        // Phi_k = basis_values[atom_idx, :, :m_k]  (N, m_k).
+        let mut phi = Array2::<f64>::zeros((n_obs, m_k));
+        for row in 0..n_obs {
+            for c in 0..m_k {
+                phi[[row, c]] = basis_values[[atom_idx, row, c]];
+            }
+        }
+        let mut gram = fast_ata(&phi);
+        let mut trace = 0.0_f64;
+        for i in 0..m_k {
+            trace += gram[[i, i]];
+        }
+        let jitter = (trace / m_k as f64).max(1.0).max(1.0e-12) * 1.0e-8;
+        for i in 0..m_k {
+            gram[[i, i]] += jitter;
+        }
+        let rhs = fast_atb(&phi, &z_owned);
+        let factor = gram
+            .cholesky(Side::Lower)
+            .map_err(|err| format!("sae_residual_seed_logits: Cholesky failed: {err:?}"))?;
+        let b_k = factor.solve_mat(&rhs); // (m_k, p_out)
+        if !b_k.iter().all(|v| v.is_finite()) {
+            return Err("sae_residual_seed_logits: non-finite LSQ solution".to_string());
+        }
+        let fitted = phi.dot(&b_k); // (N, p_out)
+        for row in 0..n_obs {
+            let mut e = 0.0_f64;
+            for col in 0..p_out {
+                let d = z[[row, col]] - fitted[[row, col]];
+                e += d * d;
+            }
+            resid[[row, atom_idx]] = e;
+        }
+    }
+    // Convert per-row residuals to logits relative to each row's own scale so
+    // the head start is dimensionless. The best atom (lowest residual) gets the
+    // highest logit; ties cancel. Normalise by the row's mean residual across
+    // atoms (with a floor relative to the dataset to keep near-zero-energy rows
+    // well posed) so the spread is O(gain) regardless of output magnitude.
+    let mut global_mean = 0.0_f64;
+    for row in 0..n_obs {
+        for k in 0..k_atoms {
+            global_mean += resid[[row, k]];
+        }
+    }
+    global_mean /= (n_obs * k_atoms) as f64;
+    let floor = (global_mean * 1.0e-6).max(1.0e-12);
+    for row in 0..n_obs {
+        let mut row_mean = 0.0_f64;
+        for k in 0..k_atoms {
+            row_mean += resid[[row, k]];
+        }
+        row_mean = (row_mean / k_atoms as f64).max(floor);
+        for k in 0..k_atoms {
+            logits[[row, k]] = -gain * resid[[row, k]] / row_mean;
+        }
+    }
+    Ok(logits)
+}
+
 fn sae_decoder_lsq_init(
     basis_values: ArrayView3<'_, f64>,
     basis_sizes: &[usize],
@@ -11071,6 +11184,25 @@ fn sae_manifold_fit_minimal<'py>(
         }
         None => Array2::<f64>::zeros((n_obs, k_atoms)),
     };
+    // Data-driven asymmetric cold-start seed (issue #629). A uniform logit
+    // init is an exact symmetric saddle for K>=2 exchangeable atoms under
+    // softmax / IBP-MAP, so the fit never routes and the decoder overfits
+    // through the frozen uniform mixture. Replace the saddle with one EM-style
+    // M-then-E step on the seed geometry: prefer the atom that best
+    // reconstructs each row. JumpReLU keeps its margin-above-threshold seed
+    // (its degeneracy is a closed gate, not a routing tie), and warm-started
+    // logits are left exactly as supplied.
+    if logits_are_cold && k_atoms > 1 && matches!(assignment_kind.as_str(), "softmax" | "ibp_map") {
+        const SAE_RESIDUAL_SEED_GAIN: f64 = 4.0;
+        let residual_logits = sae_residual_seed_logits(
+            basis_values.view(),
+            &basis_sizes,
+            z_view,
+            SAE_RESIDUAL_SEED_GAIN,
+        )
+        .map_err(py_value_error)?;
+        initial_logits = residual_logits;
+    }
     // Wire `random_state` into the optimizer init: jitter the initial
     // assignment logits with a tiny, seed-keyed deterministic perturbation
     // so different seeds explore different Newton trajectories (issue #178).
@@ -31543,6 +31675,101 @@ mod tests {
         assert!(
             r2 > 0.5,
             "LSQ-seeded iter-0 reconstruction R² = {r2:.4} should explain most of the signal"
+        );
+    }
+
+    /// Regression test for issue #629: the cold-start residual seed must break
+    /// the symmetric saddle of a uniform logit init by preferring, per row, the
+    /// atom whose seed geometry best reconstructs that row. Planted: two
+    /// periodic atoms with distinct seed phases driving disjoint output blocks
+    /// with known one-hot routing. The seed logits must (a) not be uniform and
+    /// (b) argmax-route most rows to their generating atom.
+    #[test]
+    fn sae_residual_seed_logits_breaks_symmetry_and_routes() {
+        use ndarray::Array3;
+        let n = 64usize;
+        let p = 4usize;
+        let k = 2usize;
+        let m = 3usize;
+        let two_pi = std::f64::consts::TAU;
+        // Distinct seed phase per atom — mimics the PCA seed handing each
+        // periodic atom a different coordinate frame.
+        let phase = [0.0_f64, 0.3_f64];
+        // Deterministic pseudo-random latent + balanced shuffled routing.
+        let mut t = vec![0.0_f64; n];
+        let mut assign = vec![0usize; n];
+        let mut state = 0x1234_5678_9abc_def0_u64;
+        for i in 0..n {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            t[i] = ((state >> 11) as f64) * f64::from_bits(0x3CA0000000000000);
+            assign[i] = if i < n / 2 { 0 } else { 1 };
+        }
+        for i in (1..n).rev() {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let j = (state >> 33) as usize % (i + 1);
+            assign.swap(i, j);
+        }
+        // Per-atom seed basis (N, m) padded into (K, N, m).
+        let mut basis = Array3::<f64>::zeros((k, n, m));
+        for atom_idx in 0..k {
+            for i in 0..n {
+                let a = two_pi * (t[i] + phase[atom_idx]);
+                basis[[atom_idx, i, 0]] = 1.0;
+                basis[[atom_idx, i, 1]] = a.sin();
+                basis[[atom_idx, i, 2]] = a.cos();
+            }
+        }
+        // Disjoint decoder blocks: atom 0 -> cols [0,1], atom 1 -> cols [2,3].
+        let mut blocks = vec![Array2::<f64>::zeros((m, p)); k];
+        blocks[0][[1, 0]] = 1.5;
+        blocks[0][[2, 1]] = -1.2;
+        blocks[1][[1, 2]] = 1.3;
+        blocks[1][[2, 3]] = 0.9;
+        let mut z = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            let kk = assign[i];
+            for j in 0..p {
+                let mut acc = 0.0;
+                for col in 0..m {
+                    acc += basis[[kk, i, col]] * blocks[kk][[col, j]];
+                }
+                z[[i, j]] = acc;
+            }
+        }
+        let basis_sizes = vec![m; k];
+        let logits = sae_residual_seed_logits(basis.view(), &basis_sizes, z.view(), 4.0)
+            .expect("residual seed must succeed");
+        assert_eq!(logits.shape(), &[n, k]);
+        assert!(logits.iter().all(|v| v.is_finite()));
+
+        // (a) Symmetry must be broken: at least one row has a non-trivial gap.
+        let max_gap = (0..n)
+            .map(|i| (logits[[i, 0]] - logits[[i, 1]]).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_gap > 0.3,
+            "residual seed left a near-symmetric logit field (max gap {max_gap:.4}); \
+             the uniform saddle would not be escaped"
+        );
+
+        // (b) The seed must route most rows to their generating atom, up to
+        // the trivial atom-label permutation.
+        let mut acc_direct = 0usize;
+        for i in 0..n {
+            let winner = if logits[[i, 0]] >= logits[[i, 1]] { 0 } else { 1 };
+            if winner == assign[i] {
+                acc_direct += 1;
+            }
+        }
+        let acc = (acc_direct.max(n - acc_direct)) as f64 / n as f64;
+        assert!(
+            acc >= 0.9,
+            "residual seed routing accuracy {acc:.3} (up to permutation) is too low; \
+             the E-step seed should recover the planted one-hot assignment"
         );
     }
 }
