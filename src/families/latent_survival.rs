@@ -690,19 +690,33 @@ fn build_time_blockspec(
     prepared: &PreparedLatentTimeBlock,
     input: &TimeBlockInput,
 ) -> ParameterBlockSpec {
+    // The solver produces a `3·n`-long time `eta` (the `[entry; exit; deriv]`
+    // channel stack that `split_time_eta` slices). That stacked operator is
+    // the eta-producing matrix and so belongs in `stacked_design`, paired with
+    // the matching `3·n`-row stacked offset. The audit / shape-policy invariant
+    // `design.nrows() == n_obs` is satisfied by exposing the single-channel
+    // n-row exit design as `design`; the audit never inspects `stacked_design`.
+    //
+    // This mirrors the survival location-scale fix for the same #326 class
+    // (`survival_location_scale.rs`): the previous code put the `3·n`-row
+    // stack in `design`, which tripped the flat identifiability audit's
+    // row-equality invariant (`block 1 (mean) has n rows, expected 3n`).
     let stacked_design = stack_rows(&[
         &prepared.design_entry,
         &prepared.design_exit,
         &prepared.design_derivative_exit,
     ]);
+    let stacked_offset = crate::linalg::utils::stack_offsets(&[
+        &input.offset_entry,
+        &input.offset_exit,
+        &input.derivative_offset_exit,
+    ]);
     ParameterBlockSpec {
         name: "time_transform".to_string(),
-        design: DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(stacked_design))),
-        offset: crate::linalg::utils::stack_offsets(&[
-            &input.offset_entry,
-            &input.offset_exit,
-            &input.derivative_offset_exit,
-        ]),
+        design: DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(
+            prepared.design_exit.clone(),
+        ))),
+        offset: input.offset_exit.clone(),
         penalties: prepared
             .penalties
             .iter()
@@ -715,10 +729,17 @@ fn build_time_blockspec(
             .clone()
             .unwrap_or_else(|| Array1::zeros(prepared.penalties.len())),
         initial_beta: prepared.initial_beta.clone(),
-        gauge_priority: 100,
+        // Canonical-gauge ownership for the latent-survival joint design: the
+        // time-transform block carries the structural monotone baseline that
+        // anchors the parameterisation, so it owns any shared constant
+        // direction (strictly higher than `mean`/`log_sigma` at 100). This
+        // matches the survival location-scale gauge contract (time highest).
+        gauge_priority: 200,
         jacobian_callback: None,
-        stacked_design: None,
-        stacked_offset: None,
+        stacked_design: Some(DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(
+            stacked_design,
+        )))),
+        stacked_offset: Some(stacked_offset),
     }
 }
 
@@ -731,7 +752,12 @@ fn build_mean_blockspec(design: &TermCollectionDesign, offset: Array1<f64>) -> P
         nullspace_dims: design.nullspace_dims.clone(),
         initial_log_lambdas: Array1::zeros(design.penalties.len()),
         initial_beta: None,
-        gauge_priority: 100,
+        // Strictly below `time_transform` (200) so any constant direction
+        // shared between the monotone time baseline and the mean intercept is
+        // deterministically attributable to the lower-priority `mean` block by
+        // the canonical-gauge RRQR (the descending-priority contract used by
+        // survival location-scale; #366/#556 gauge story).
+        gauge_priority: 150,
         jacobian_callback: None,
         stacked_design: None,
         stacked_offset: None,
@@ -753,7 +779,9 @@ fn build_log_sigma_blockspec(initial_sigma: f64) -> ParameterBlockSpec {
             1,
             exp_sigma_eta_for_sigma_scalar(initial_sigma),
         )),
-        gauge_priority: 100,
+        // Lowest of the three (time=200, mean=150): the learnable-scale channel
+        // yields any shared constant to the location blocks.
+        gauge_priority: 120,
         jacobian_callback: None,
         stacked_design: None,
         stacked_offset: None,

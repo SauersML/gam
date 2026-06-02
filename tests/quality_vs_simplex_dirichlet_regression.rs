@@ -205,6 +205,16 @@ struct DirichletCommonFamily {
 }
 
 impl CustomFamily for DirichletCommonFamily {
+    /// Each of the K simplex parts drives its own independent linear predictor
+    /// `η_k = X β_k`; block k → output channel k. Declaring this routes the
+    /// pre-fit identifiability audit through its channel-aware path, so the K
+    /// blocks' shared `[1 | B]` basis is recognised as the block-diagonal
+    /// Jacobian `blkdiag(X, …, X)` (full rank K·p) rather than mistaken for
+    /// cross-block intercept aliases (#558).
+    fn output_channel_assignment(&self, specs: &[ParameterBlockSpec]) -> Option<Vec<usize>> {
+        Some((0..specs.len()).collect())
+    }
+
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != K {
             return Err(format!(

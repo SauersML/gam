@@ -130,6 +130,15 @@ struct BetaLogitCustomFamily {
 }
 
 impl CustomFamily for BetaLogitCustomFamily {
+    /// Two independent shape predictors: block 0 → α channel, block 1 → β
+    /// channel (`a = softplus(η₁)`, `b = softplus(η₂)`). Declaring the channel
+    /// topology routes the identifiability audit channel-aware, so the two
+    /// blocks' shared intercept-bearing design is treated as block-diagonal
+    /// rather than a cross-block intercept alias (#558).
+    fn output_channel_assignment(&self, specs: &[ParameterBlockSpec]) -> Option<Vec<usize>> {
+        Some((0..specs.len()).collect())
+    }
+
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 2 {
             return Err(format!(
