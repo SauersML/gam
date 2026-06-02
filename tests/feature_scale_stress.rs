@@ -227,6 +227,7 @@ fn sphere_harmonic_basis_scales_and_keeps_diag_penalty_at_100k() {
             method: SphereMethod::Harmonic,
             max_degree: Some(l),
             wahba_kernel: Default::default(),
+            identifiability: Default::default(),
         };
         let built = time_label(
             &format!("sphere_harmonic_basis N={n} L={l} p={}", l * (l + 2)),
@@ -353,6 +354,7 @@ fn sphere_harmonic_design_rows_are_finite_at_poles_and_seam() {
         method: SphereMethod::Harmonic,
         max_degree: Some(6),
         wahba_kernel: Default::default(),
+        identifiability: Default::default(),
     };
     let built = build_spherical_spline_basis(data.view(), &spec).expect("pole+seam build");
     let design = built.design.to_dense();

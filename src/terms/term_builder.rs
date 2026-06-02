@@ -14,7 +14,8 @@ use crate::basis::{
     BSplineIdentifiability, BSplineKnotSpec, CenterCountRequest, CenterStrategy, DuchonBasisSpec,
     DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec, MaternIdentifiability,
     MaternNu, OneDimensionalBoundary, SpatialIdentifiability, SphereMethod, SphereWahbaKernel,
-    SphericalSplineBasisSpec, ThinPlateBasisSpec, auto_spatial_center_strategy,
+    SphericalSplineBasisSpec, SphericalSplineIdentifiability, ThinPlateBasisSpec,
+    auto_spatial_center_strategy,
     default_num_centers, default_spatial_center_strategy, default_spherical_harmonic_degree,
     plan_spatial_basis,
 };
@@ -760,9 +761,21 @@ fn parse_periodic_axes_option(
 
 fn parse_option_list(raw: &str) -> Vec<String> {
     let trimmed = raw.trim();
+    // Accept both the Python/JSON list form `[a, b]` and mgcv's R vector form
+    // `c(a, b)` (and a bare `(a, b)`) as the bracketed wrapper around a
+    // comma-separated option list. mgcv writes per-margin options as
+    // `bs=c('tp','tp')` / `m=c(2,2)`, so the `c(...)` form must round-trip
+    // through the same splitter the `[...]` form uses.
     let inner = trimmed
         .strip_prefix('[')
         .and_then(|v| v.strip_suffix(']'))
+        .or_else(|| {
+            trimmed
+                .strip_prefix("c(")
+                .or_else(|| trimmed.strip_prefix("C("))
+                .or_else(|| trimmed.strip_prefix('('))
+                .and_then(|v| v.strip_suffix(')'))
+        })
         .unwrap_or(trimmed);
     inner
         .split(',')
@@ -1081,6 +1094,23 @@ pub(crate) fn canonicalize_smooth_type(raw: &str) -> &str {
     }
 }
 
+/// Is `margin_bs` a per-margin basis name that the tensor builder realizes as a
+/// penalized 1-D B-spline margin?
+///
+/// gam's tensor product is built from penalized B-spline marginals. mgcv's
+/// thin-plate (`tp`/`tps`), P-spline (`ps`), B-spline (`bs`), cubic-regression
+/// (`cr`/`cs`), and cyclic (`cc`/`cp`/`cyclic`) marginals are all penalized
+/// splines spanning the same per-axis smoothing space, so a B-spline margin
+/// reproduces the same tensor smoothing class. Margin kinds with fundamentally
+/// different structure (adaptive, random-effect, sphere) are NOT accepted as
+/// tensor margins.
+pub(crate) fn tensor_margin_bs_is_supported(margin_bs: &str) -> bool {
+    matches!(
+        canonicalize_smooth_type(margin_bs),
+        "tps" | "ps" | "bs" | "bspline" | "cr" | "cs" | "cc" | "cp" | "cyclic"
+    )
+}
+
 /// Does the smooth request a periodic/cyclic axis via its options?
 ///
 /// Mirrors the boundary-condition reading used by the periodic-aware dispatch
@@ -1107,14 +1137,39 @@ pub(crate) fn smooth_options_declare_periodic(options: &BTreeMap<String, String>
 /// This is the single source of truth for the dispatch in
 /// [`build_smooth_basis`]; other call sites (e.g. predictor-specific basis
 /// policy) use it so the classification never drifts from the dispatch.
+/// Is the raw `bs=`/`type=` selector a vector literal (`c('tp','tp')`,
+/// `['tp','tp']`, `(tp, tp)`) rather than a scalar smooth-type name?
+///
+/// mgcv's tensor smooths take a *per-margin* basis vector
+/// (`te(x1, x2, bs=c('tp','tp'))`). Such a value is not a scalar canonical
+/// type and must not be fed through [`canonicalize_smooth_type`] — it has to be
+/// recognized as a tensor request and split into per-margin types. A scalar
+/// selector (`bs="tp"`) is left untouched.
+pub(crate) fn bs_selector_is_vector(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    let bracketed = (trimmed.starts_with('[') && trimmed.ends_with(']'))
+        || (trimmed.starts_with("c(") || trimmed.starts_with("C(")) && trimmed.ends_with(')')
+        || (trimmed.starts_with('(') && trimmed.ends_with(')'));
+    bracketed && !parse_option_list(trimmed).is_empty()
+}
+
 pub(crate) fn resolve_smooth_type_name(
     kind: SmoothKind,
     n_cols: usize,
     options: &BTreeMap<String, String>,
 ) -> String {
-    options
-        .get("type")
-        .or_else(|| options.get("bs"))
+    let selector = options.get("type").or_else(|| options.get("bs"));
+    // A per-margin basis vector is a tensor request, never a scalar type. Route
+    // it to the tensor builder, which reads the per-margin types out of the
+    // same `bs=` option. (A vector on a non-tensor smooth is ill-formed and
+    // falls through to the scalar path below so the existing diagnostic fires.)
+    if let Some(raw) = selector
+        && bs_selector_is_vector(raw)
+        && matches!(kind, SmoothKind::Te | SmoothKind::Ti)
+    {
+        return "tensor".to_string();
+    }
+    selector
         .map(|s| canonicalize_smooth_type(&s.to_ascii_lowercase()).to_string())
         .unwrap_or_else(|| match kind {
             SmoothKind::Te | SmoothKind::Ti => "tensor".to_string(),
@@ -1652,6 +1707,7 @@ pub fn build_smooth_basis(
                     method,
                     max_degree,
                     wahba_kernel,
+                    identifiability: SphericalSplineIdentifiability::CenterSumToZero,
                 },
             })
         }
@@ -1936,6 +1992,36 @@ pub fn build_smooth_basis(
                 .to_string());
             }
             let dim = cols.len();
+            // Per-margin basis vector (`bs=c('tp','tp')` / `bs=['ps','cr']`):
+            // validate each requested margin is a penalized-spline basis that
+            // the tensor product realizes as a 1-D B-spline margin. mgcv's
+            // `tp`/`ps`/`cr`/`bs`/`cc` margins are all penalized splines over
+            // the same per-axis function space, so a B-spline margin recovers
+            // the same tensor smoothing space; genuinely different margin kinds
+            // (e.g. adaptive `ad`, random `re`) are rejected loudly rather than
+            // silently substituted.
+            if let Some(raw) = options.get("bs").or_else(|| options.get("type"))
+                && bs_selector_is_vector(raw)
+            {
+                let per_margin = parse_option_list(raw);
+                if per_margin.len() != dim {
+                    return Err(TermBuilderError::invalid_option(format!(
+                        "tensor smooth per-margin bs vector has {} entries but the smooth has {} margins",
+                        per_margin.len(),
+                        dim
+                    ))
+                    .to_string());
+                }
+                for (axis, margin_bs) in per_margin.iter().enumerate() {
+                    if !tensor_margin_bs_is_supported(margin_bs) {
+                        return Err(TermBuilderError::unsupported_feature(format!(
+                            "tensor smooth margin {axis} basis '{margin_bs}' is not a supported penalized-spline margin; \
+                             tensor margins accept tp/tps/ps/bs/cr/cc"
+                        ))
+                        .to_string());
+                    }
+                }
+            }
             let periodic_axes = parse_tensor_periodic_axes(options, dim)?;
             let periods_opt = parse_periods(options, &periodic_axes)?;
             let origins_opt = parse_period_origins(options, &periodic_axes)?;

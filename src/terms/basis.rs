@@ -2263,6 +2263,35 @@ pub struct SphericalSplineBasisSpec {
     /// supported — they must be re-fit with the current encoding.
     #[serde(default)]
     pub wahba_kernel: SphereWahbaKernel,
+    /// Realized-design identifiability policy for the Wahba sphere (#532).
+    ///
+    /// The Wahba kernel design `K(data, centers) · z` spans the constant on the
+    /// data rows even after the center-space area-weighted sum-to-zero `z`
+    /// (`z` constrains `1ᵀ W α = 0` over the *centers*, not the realized rows).
+    /// In any model with a parametric intercept this collides with the global
+    /// intercept — the #531 constant-vs-intercept rank-1 collision class. The
+    /// fix (mirroring `MaternIdentifiability::FrozenTransform`) lets the global
+    /// identifiability pipeline compose a parametric-orthogonalization onto `z`
+    /// and freeze the composed transform here, so the predict-time rebuild
+    /// reuses the exact fit-time realized transform instead of recomputing `z`
+    /// from the centers (which would silently drop the orthogonalization).
+    #[serde(default)]
+    pub identifiability: SphericalSplineIdentifiability,
+}
+
+/// Realized-design identifiability policy for the Wahba spherical spline (#532).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub enum SphericalSplineIdentifiability {
+    /// Fit-time default: build the area-weighted center sum-to-zero transform
+    /// `z` from the realized centers, then let the global identifiability
+    /// pipeline residualize the realized design against the parametric block.
+    #[default]
+    CenterSumToZero,
+    /// Predict-time replay: use this frozen realized-design transform directly
+    /// (the composed `z · z_parametric` captured at fit time) instead of
+    /// recomputing `z` from the centers. `transform.nrows()` equals the number
+    /// of centers; `transform.ncols()` is the constrained smooth dimension.
+    FrozenTransform { transform: Array2<f64> },
 }
 
 impl Default for SphericalSplineBasisSpec {
@@ -2275,6 +2304,7 @@ impl Default for SphericalSplineBasisSpec {
             method: SphereMethod::Wahba,
             max_degree: None,
             wahba_kernel: SphereWahbaKernel::Sobolev,
+            identifiability: SphericalSplineIdentifiability::CenterSumToZero,
         }
     }
 }
@@ -9348,7 +9378,7 @@ fn validated_kronecker_factors(
 }
 
 /// Build the double-penalty ridge from the structural null space of a PSD penalty.
-fn build_nullspace_shrinkage_penalty(
+pub(crate) fn build_nullspace_shrinkage_penalty(
     penalty: &Array2<f64>,
 ) -> Result<Option<CanonicalPenaltyBlock>, BasisError> {
     if penalty.nrows() != penalty.ncols() {
@@ -15675,8 +15705,30 @@ pub fn build_spherical_spline_basis(
         spec.radians,
         spec.wahba_kernel,
     )?;
-    let weights = sphere_area_weights(centers.view(), spec.radians);
-    let z = weighted_coefficient_sum_to_zero_transform(weights.view())?;
+    // Realized-design constraint transform. At fit time this is the
+    // area-weighted center sum-to-zero `z` (the global identifiability pipeline
+    // then composes the parametric-orthogonalization onto it and freezes the
+    // result). At predict time the frozen composed transform `z · z_parametric`
+    // is replayed verbatim so the realized design reproduces the fit-time
+    // basis exactly (#532) — recomputing `z` from the centers would drop the
+    // parametric orthogonalization and resurrect the constant-vs-intercept
+    // collision.
+    let z = match &spec.identifiability {
+        SphericalSplineIdentifiability::FrozenTransform { transform } => {
+            if transform.nrows() != centers.nrows() {
+                crate::bail_dim_basis!(
+                    "frozen spherical identifiability transform mismatch: {} centers but transform has {} rows",
+                    centers.nrows(),
+                    transform.nrows()
+                );
+            }
+            transform.clone()
+        }
+        SphericalSplineIdentifiability::CenterSumToZero => {
+            let weights = sphere_area_weights(centers.view(), spec.radians);
+            weighted_coefficient_sum_to_zero_transform(weights.view())?
+        }
+    };
     let penalty = z.t().dot(&raw_penalty).dot(&z);
     // Prefer the device truncated-spectral kernel whenever
     // `sphere_kernel_decision` reports the (n, m, lmax) workload is

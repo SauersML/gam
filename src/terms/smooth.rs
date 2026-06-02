@@ -5,7 +5,8 @@ use crate::basis::{
     CenterStrategyKind, Dense, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
     KnotSource, KroneckerFactoredBasis, MaternBasisSpec, MaternIdentifiability,
     OneDimensionalBoundary, PenaltyCandidate, PenaltyInfo, PenaltySource, SpatialIdentifiability,
-    SphericalSplineBasisSpec, ThinPlateBasisSpec, apply_sum_to_zero_constraint,
+    SphericalSplineBasisSpec, SphericalSplineIdentifiability, ThinPlateBasisSpec,
+    apply_sum_to_zero_constraint,
     build_bspline_basis_1d, build_duchon_basis, build_duchon_basis_log_kappa_derivatives,
     build_duchon_basiswithworkspace, build_matern_basis,
     build_matern_basis_log_kappa_aniso_derivatives, build_matern_basis_log_kappa_derivatives,
@@ -5674,6 +5675,288 @@ fn ensure_by_variable_specs_match(
     }
 }
 
+/// Build a factor-smooth interaction basis (`bs="fs"`/`"sz"`/`"re"`).
+///
+/// A factor smooth replicates a shared marginal smooth in the continuous
+/// covariate(s) once per level of a grouping factor, coupling all level blocks
+/// through a *single* set of smoothing parameters (one per marginal penalty).
+/// This is mgcv's `smooth.construct.fs.smooth.spec` realization and the
+/// random-effect interpretation of a smooth: the per-level deviations are an
+/// exchangeable family whose joint wiggliness/shrinkage is governed by the
+/// shared λ, so the construction scales to many levels with a fixed parameter
+/// count.
+///
+/// Flavours:
+/// * `Fs` — full random factor-smooth. The marginal carries its wiggliness
+///   penalty *and* a null-space ridge (double penalty), so the replicated
+///   design is a proper full-rank random effect: each level's curve is shrunk
+///   toward zero (intercept + linear trend included), recovering the mgcv
+///   `bs="fs"` penalty structure `I_L ⊗ S_j` for every marginal penalty `S_j`.
+/// * `Sz` — sum-to-zero factor smooth. Delegates to the existing
+///   [`SmoothBasisSpec::FactorSumToZero`] construction (`L-1` deviation blocks,
+///   coefficient-wise zero sum across levels).
+/// * `Re` — pure random effect / random slope (`bs="re"`). A degree-1 marginal
+///   gives the per-level `[1, x]` span; the penalty is the identity over each
+///   level block (iid Gaussian coefficients), matching mgcv's `bs="re"` ridge.
+///
+/// The grouping levels are resolved once at fit time (sorted unique bit
+/// patterns of the factor column) and frozen into the returned metadata so the
+/// predict-time rebuild evaluates every row against its own level's block.
+fn build_factor_smooth(
+    data: ArrayView2<'_, f64>,
+    spec: &FactorSmoothSpec,
+    term_name: &str,
+    workspace: &mut crate::basis::BasisWorkspace,
+) -> Result<LocalSmoothTermBuild, BasisError> {
+    if spec.continuous_cols.len() != 1 {
+        crate::bail_invalid_basis!(
+            "factor smooth term '{}' currently supports exactly one continuous covariate; found {}",
+            term_name,
+            spec.continuous_cols.len()
+        );
+    }
+    let feature_col = spec.continuous_cols[0];
+    let group_col = spec.group_col;
+    if feature_col >= data.ncols() || group_col >= data.ncols() {
+        crate::bail_dim_basis!(
+            "factor smooth term '{}' references columns ({}, {}) out of bounds for {} columns",
+            term_name,
+            feature_col,
+            group_col,
+            data.ncols()
+        );
+    }
+
+    // `Sz` is exactly the existing sum-to-zero factor smooth: reuse it verbatim
+    // so there is a single source of truth for the zero-sum construction.
+    if matches!(spec.flavour, FactorSmoothFlavour::Sz) {
+        let levels = resolve_factor_smooth_levels(data, group_col, spec, term_name)?;
+        let inner = SmoothBasisSpec::BSpline1D {
+            feature_col,
+            spec: factor_smooth_marginal_for_replay(&spec.marginal),
+        };
+        let sz_term = SmoothTermSpec {
+            name: term_name.to_string(),
+            basis: SmoothBasisSpec::FactorSumToZero {
+                inner: Box::new(inner),
+                by_col: group_col,
+                levels,
+            },
+            shape: ShapeConstraint::None,
+            joint_null_rotation: None,
+        };
+        return build_single_local_smooth_term(data, &sz_term, workspace);
+    }
+
+    let levels = resolve_factor_smooth_levels(data, group_col, spec, term_name)?;
+    let n_levels = levels.len();
+    if n_levels < 2 {
+        crate::bail_invalid_basis!(
+            "factor smooth term '{}' requires at least two grouping levels; found {}",
+            term_name,
+            n_levels
+        );
+    }
+
+    // Build the shared marginal design + penalties from the 1-D B-spline.
+    // `Re` forces a degree-1 marginal (linear span) and replaces the marginal
+    // wiggliness with an identity ridge below; `Fs` keeps the user's marginal
+    // (cubic by default) with its double penalty so the null space is shrunk.
+    let marginal_spec = factor_smooth_marginal_for_replay(&spec.marginal);
+    let inner_term = SmoothTermSpec {
+        name: format!("{term_name}::marginal"),
+        basis: SmoothBasisSpec::BSpline1D {
+            feature_col,
+            spec: marginal_spec,
+        },
+        shape: ShapeConstraint::None,
+        joint_null_rotation: None,
+    };
+    let inner = build_single_local_smooth_term(data, &inner_term, workspace)?;
+    let base = inner
+        .design
+        .try_to_dense_by_chunks("factor smooth marginal")
+        .map_err(BasisError::InvalidInput)?;
+    let n = base.nrows();
+    let p = base.ncols();
+    let q = p * n_levels;
+
+    // Block-diagonal replicated design: row i contributes its marginal row to
+    // the column block owned by its grouping level, zeros elsewhere.
+    let mut dense = Array2::<f64>::zeros((n, q));
+    for i in 0..n {
+        let bits = data[[i, group_col]].to_bits();
+        let level_idx = levels.iter().position(|b| *b == bits).ok_or_else(|| {
+            BasisError::InvalidInput(format!(
+                "factor smooth term '{term_name}' saw an unseen grouping level at row {}",
+                i + 1
+            ))
+        })?;
+        let start = level_idx * p;
+        dense.slice_mut(s![i, start..start + p]).assign(&base.row(i));
+    }
+
+    // Penalties: replicate each marginal penalty into a block-diagonal
+    // `I_L ⊗ S_j` so every level shares the same smoothing parameter λ_j (one
+    // λ per marginal penalty), the defining feature of a factor smooth. For
+    // `Re` the marginal penalty is replaced by an identity ridge so each
+    // per-level coefficient is an iid Gaussian random effect.
+    let marginal_penalties: Vec<Array2<f64>> = if matches!(spec.flavour, FactorSmoothFlavour::Re) {
+        vec![Array2::<f64>::eye(p)]
+    } else {
+        inner.penalties.clone()
+    };
+    let marginal_penaltyinfo: Vec<PenaltyInfo> = if matches!(spec.flavour, FactorSmoothFlavour::Re)
+    {
+        vec![PenaltyInfo {
+            source: PenaltySource::Primary,
+            original_index: 0,
+            active: true,
+            effective_rank: p,
+            dropped_reason: None,
+            nullspace_dim_hint: 0,
+            normalization_scale: 1.0,
+            kronecker_factors: None,
+        }]
+    } else {
+        inner.penaltyinfo.clone()
+    };
+    if marginal_penalties.len() != marginal_penaltyinfo.len() {
+        crate::bail_invalid_basis!(
+            "internal factor-smooth penalty metadata mismatch for term '{}': penalties={}, infos={}",
+            term_name,
+            marginal_penalties.len(),
+            marginal_penaltyinfo.len()
+        );
+    }
+
+    let mut penalties = Vec::<Array2<f64>>::with_capacity(marginal_penalties.len());
+    let mut penaltyinfo = Vec::<PenaltyInfo>::with_capacity(marginal_penalties.len());
+    for (penalty_pos, s_inner) in marginal_penalties.iter().enumerate() {
+        let mut s_big = Array2::<f64>::zeros((q, q));
+        for level in 0..n_levels {
+            let start = level * p;
+            s_big
+                .slice_mut(s![start..start + p, start..start + p])
+                .assign(s_inner);
+        }
+        let (s_big, factor_smooth_scale) = normalize_penalty_in_constrained_space(&s_big);
+        let mut info = marginal_penaltyinfo[penalty_pos].clone();
+        info.original_index = penalty_pos;
+        info.normalization_scale *= factor_smooth_scale;
+        info.nullspace_dim_hint = info.nullspace_dim_hint.saturating_mul(n_levels);
+        info.kronecker_factors = None;
+        penalties.push(s_big);
+        penaltyinfo.push(info);
+    }
+
+    let nullspaces: Vec<usize> = if matches!(spec.flavour, FactorSmoothFlavour::Re) {
+        vec![0]
+    } else {
+        inner
+            .nullspaces
+            .iter()
+            .map(|ns| ns.saturating_mul(n_levels))
+            .collect()
+    };
+    let null_eigenvectors = crate::terms::basis::recompute_null_eigenvectors(&penalties)?;
+    let joint_null_rotation = crate::terms::basis::compute_joint_null_rotation(&penalties)?;
+
+    // Metadata: carry the marginal knot geometry + frozen levels so prediction
+    // reconstructs an identical replicated design.
+    let (knots, degree, periodic) = match &inner.metadata {
+        BasisMetadata::BSpline1D {
+            knots,
+            periodic,
+            degree,
+            ..
+        } => (
+            knots.clone(),
+            degree.unwrap_or(spec.marginal.degree),
+            *periodic,
+        ),
+        other => {
+            crate::bail_invalid_basis!(
+                "factor smooth term '{}' produced an unexpected marginal metadata variant {:?}",
+                term_name,
+                other
+            );
+        }
+    };
+    let flavour_tag = match &spec.flavour {
+        FactorSmoothFlavour::Fs { .. } => "fs",
+        FactorSmoothFlavour::Sz => "sz",
+        FactorSmoothFlavour::Re => "re",
+    }
+    .to_string();
+    let metadata = BasisMetadata::FactorSmooth {
+        continuous_cols: spec.continuous_cols.clone(),
+        group_col,
+        knots,
+        degree,
+        periodic,
+        group_levels: levels,
+        flavour: flavour_tag,
+    };
+
+    let ops = vec![None; penalties.len()];
+    Ok(LocalSmoothTermBuild {
+        dim: q,
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(dense)),
+        penalties,
+        ops,
+        nullspaces,
+        null_eigenvectors,
+        joint_null_rotation,
+        penaltyinfo,
+        pre_dropped_penaltyinfo: Vec::new(),
+        metadata,
+        linear_constraints: None,
+        box_reparam: false,
+        kronecker_factored: None,
+    })
+}
+
+/// Resolve the grouping levels for a factor smooth: replay the frozen level
+/// list when present (predict path), otherwise discover the sorted unique bit
+/// patterns of the factor column (fit path).
+fn resolve_factor_smooth_levels(
+    data: ArrayView2<'_, f64>,
+    group_col: usize,
+    spec: &FactorSmoothSpec,
+    term_name: &str,
+) -> Result<Vec<u64>, BasisError> {
+    if let Some(frozen) = &spec.group_frozen_levels {
+        if frozen.is_empty() {
+            crate::bail_invalid_basis!(
+                "factor smooth term '{}' has an empty frozen level list",
+                term_name
+            );
+        }
+        return Ok(frozen.clone());
+    }
+    let mut bits: Vec<u64> = data.column(group_col).iter().map(|v| v.to_bits()).collect();
+    bits.sort_by(|a, b| {
+        f64::from_bits(*a)
+            .partial_cmp(&f64::from_bits(*b))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    bits.dedup();
+    Ok(bits)
+}
+
+/// Marginal B-spline spec for a factor-smooth block. The marginal always builds
+/// without an identifiability constraint (the per-level replication, not a
+/// sum-to-zero side constraint, provides identifiability against the parametric
+/// block). At predict time the marginal's knot geometry has already been pinned
+/// into `marginal.knotspec` by the metadata replay, so the spec is used
+/// verbatim aside from clearing the identifiability transform.
+fn factor_smooth_marginal_for_replay(marginal: &BSplineBasisSpec) -> BSplineBasisSpec {
+    let mut m = marginal.clone();
+    m.identifiability = BSplineIdentifiability::None;
+    m
+}
+
 fn build_single_local_smooth_term(
     data: ArrayView2<'_, f64>,
     term: &SmoothTermSpec,
@@ -6089,11 +6372,15 @@ fn build_single_local_smooth_term(
             crate::bail_invalid_basis!("internal: BySmooth smooths must be lowered to ByVariable before inner basis dispatch"
                     .to_string(),);
         }
-        SmoothBasisSpec::FactorSmooth { .. } => {
-            crate::bail_invalid_basis!(
-                "internal: FactorSmooth smooths must be expanded before inner basis dispatch"
-                    .to_string(),
-            );
+        SmoothBasisSpec::FactorSmooth { spec } => {
+            if term.shape != ShapeConstraint::None {
+                crate::bail_invalid_basis!(
+                    "ShapeConstraint::{:?} is unsupported for factor smooth term '{}'",
+                    term.shape,
+                    term.name
+                );
+            }
+            return build_factor_smooth(data, spec, &term.name, workspace);
         }
     };
 
@@ -6161,16 +6448,58 @@ fn build_single_local_smooth_term(
         let coeff_op = crate::matrix::CoefficientTransformOperator::new(inner_dense, t.clone())
             .map_err(|e| BasisError::InvalidInput(format!("CoefficientTransformOperator: {e}")))?;
         design_t = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(coeff_op)));
-        penalties_t = penalties_t
-            .into_iter()
-            .map(|s_local| {
-                // Congruence transform preserves PSD:
-                //   S_new = T^T S T.
-                let tt_s = fast_atb(&t, &s_local);
+        if penalties_t.len() != active_penaltyinfo_t.len() {
+            crate::bail_invalid_basis!(
+                "internal box-reparam penalty/info mismatch for term '{}': penalties={}, infos={}",
+                term.name,
+                penalties_t.len(),
+                active_penaltyinfo_t.len()
+            );
+        }
+        // Wiggliness penalties undergo the exact congruence `S → TᵀST` (PSD
+        // preserving). The double-penalty *nullspace shrinkage* ridge must NOT:
+        // it is a unit-eigenvalue projector `ZZᵀ` onto null(S_wiggle) in the
+        // β (B-spline coefficient) coordinates, and the congruence
+        // `Tᵀ(ZZᵀ)T = (TᵀZ)(TᵀZ)ᵀ` is no longer a projector — its eigenvalues
+        // blow up by the conditioning of the cumulative-sum `T` (cond(T) grows
+        // with the basis dim), concentrating an enormous penalty on the leading
+        // γ₀ "level" coordinate. REML then drives the shared λ to its ceiling
+        // and the smooth collapses to a flat constant (#509, the over-smoothing
+        // face). The principled fix keeps mgcv's double-penalty semantics in the
+        // *reparametrized* space: rebuild the ridge as the unit-eigenvalue
+        // nullspace projector of the transformed wiggliness penalty `TᵀST`, so
+        // the double penalty shrinks exactly the unpenalized polynomial
+        // directions of the γ-space smooth with eigenvalue 1, identical in
+        // conditioning to the unconstrained fit.
+        let transformed_wiggliness = penalties_t
+            .iter()
+            .zip(active_penaltyinfo_t.iter())
+            .find(|(_, info)| !matches!(info.source, PenaltySource::DoublePenaltyNullspace))
+            .map(|(s_local, _)| {
+                let tt_s = fast_atb(&t, s_local);
                 fast_ab(&tt_s, &t)
-            })
-            .collect();
-        // T^T S T invalidates op-form bit-equivalence; drop ops here.
+            });
+        let mut rebuilt = Vec::with_capacity(penalties_t.len());
+        for (s_local, info) in penalties_t.iter().zip(active_penaltyinfo_t.iter()) {
+            if matches!(info.source, PenaltySource::DoublePenaltyNullspace) {
+                let s_wiggle_t = transformed_wiggliness.as_ref().ok_or_else(|| {
+                    BasisError::InvalidInput(format!(
+                        "box-reparam term '{}' has a double-penalty ridge but no primary wiggliness penalty to derive its nullspace from",
+                        term.name
+                    ))
+                })?;
+                let ridge = crate::terms::basis::build_nullspace_shrinkage_penalty(s_wiggle_t)?
+                    .map(|shrink| shrink.sym_penalty)
+                    .unwrap_or_else(|| Array2::<f64>::zeros((p_local, p_local)));
+                rebuilt.push(ridge);
+            } else {
+                let tt_s = fast_atb(&t, s_local);
+                rebuilt.push(fast_ab(&tt_s, &t));
+            }
+        }
+        penalties_t = rebuilt;
+        // T^T S T (and the rebuilt γ-space ridge) invalidate op-form
+        // bit-equivalence; drop ops here.
         ops_t = vec![None; penalties_t.len()];
     }
     if penalties_t.len() != active_penaltyinfo_t.len() {
@@ -7049,6 +7378,10 @@ fn smooth_has_frozen_identifiability(term: &SmoothTermSpec) -> bool {
         ),
         SmoothBasisSpec::Sphere { spec, .. } => {
             matches!(spec.center_strategy, CenterStrategy::UserProvided(_))
+                || matches!(
+                    spec.identifiability,
+                    SphericalSplineIdentifiability::FrozenTransform { .. }
+                )
         }
         SmoothBasisSpec::Matern { spec, .. } => matches!(
             spec.identifiability,
@@ -7783,14 +8116,14 @@ fn spatial_identifiability_policy(termspec: &SmoothTermSpec) -> Option<&SpatialI
 ///   - **Sphere, Harmonic method**: the real-spherical-harmonic basis starts at
 ///     degree `l = 1` (`build_spherical_harmonic_basis`), so it never spans the
 ///     degree-0 constant — no centering is needed.
-///   - **Sphere, Wahba method**: shares the invariant (its
+///   - **Sphere, Wahba method**: INCLUDED (#532). Its
 ///     `weighted_coefficient_sum_to_zero_transform` is a *center*-space
 ///     constraint, so the realized design still spans the constant — same class
-///     as Matérn). It is excluded only because `SphericalSplineBasisSpec` has no
-///     frozen-transform field: `build_spherical_spline_basis` recomputes its
-///     transform from the centers on every rebuild, so a parametric transform
-///     composed in here would be silently dropped at predict time. Fixing it
-///     needs a frozen-transform field on the sphere spec (tracked separately).
+///     as Matérn `CenterSumToZero`. The composed parametric transform is frozen
+///     onto `SphericalSplineBasisSpec::identifiability`
+///     (`SphericalSplineIdentifiability::FrozenTransform`) and replayed by
+///     `build_spherical_spline_basis` at predict time, so the orthogonalization
+///     survives save → reload exactly as it does for Matérn.
 ///   - **PCA**: its `with_identifiability_transform` arm rejects a post-hoc
 ///     transform (the constraint lives inside the orthonormal loadings), and its
 ///     constant content is governed by the `centered` flag, not a residualizable
@@ -7835,9 +8168,21 @@ fn smooth_requires_parametric_orthogonality(termspec: &SmoothTermSpec) -> bool {
             spec.identifiability,
             MaternIdentifiability::CenterSumToZero | MaternIdentifiability::CenterLinearOrthogonal
         ),
+        // Wahba sphere (`bs="sos"`, method=Wahba): the area-weighted center
+        // sum-to-zero `z` is a *coefficient*-space constraint, so the realized
+        // `K·z` design still spans the constant — the same #531 collision class
+        // as Matérn `CenterSumToZero`. It requires the global parametric
+        // orthogonalization (#532). The Harmonic method starts at degree l=1
+        // and never spans the constant, so it is excluded.
+        SmoothBasisSpec::Sphere { spec, .. } => {
+            matches!(spec.method, crate::basis::SphereMethod::Wahba)
+                && matches!(
+                    spec.identifiability,
+                    SphericalSplineIdentifiability::CenterSumToZero
+                )
+        }
         SmoothBasisSpec::BSpline1D { .. }
         | SmoothBasisSpec::TensorBSpline { .. }
-        | SmoothBasisSpec::Sphere { .. }
         | SmoothBasisSpec::Pca { .. }
         | SmoothBasisSpec::FactorSmooth { .. } => false,
     }
@@ -16078,7 +16423,7 @@ pub fn freeze_term_collection_from_design(
                     method,
                     max_degree,
                     wahba_kernel,
-                    ..
+                    constraint_transform,
                 },
             ) => {
                 s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
@@ -16086,6 +16431,18 @@ pub fn freeze_term_collection_from_design(
                 s.method = *method;
                 s.max_degree = *max_degree;
                 s.wahba_kernel = *wahba_kernel;
+                // #532: freeze the realized-design transform (the composed
+                // `z · z_parametric` captured at fit time) so the predict-time
+                // rebuild reuses it verbatim instead of recomputing the
+                // center-space `z`, which would drop the parametric
+                // orthogonalization and resurrect the intercept collision. The
+                // Harmonic method never carries a constraint transform.
+                s.identifiability = match constraint_transform {
+                    Some(z) => SphericalSplineIdentifiability::FrozenTransform {
+                        transform: z.clone(),
+                    },
+                    None => SphericalSplineIdentifiability::CenterSumToZero,
+                };
             }
             (
                 SmoothBasisSpec::Matern {
@@ -16217,6 +16574,7 @@ pub fn freeze_term_collection_from_design(
                 SmoothBasisSpec::FactorSmooth { spec: s },
                 BasisMetadata::FactorSmooth {
                     knots,
+                    degree,
                     periodic,
                     group_levels,
                     ..
@@ -16230,6 +16588,15 @@ pub fn freeze_term_collection_from_design(
                         },
                     )
                     .unwrap_or_else(|| BSplineKnotSpec::Provided(knots.clone()));
+                // Restore the FROZEN marginal degree (#555 predict-replay). With
+                // a `Provided(knots)` knotspec the per-margin basis count is
+                // `knots.len() - (degree + 1)`, so if fit-time auto-shrink
+                // lowered the marginal degree (small per-group n: cubic →
+                // quadratic/linear), rebuilding with the original spec degree
+                // would yield a different per-level `p` and corrupt the
+                // block-diagonal replay. Mirror the sibling BySmooth arm, which
+                // restores `inner.degree = *degree` for exactly this reason.
+                s.marginal.degree = *degree;
                 s.group_frozen_levels = Some(group_levels.clone());
             }
             (
