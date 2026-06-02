@@ -21610,6 +21610,381 @@ pub fn sphere_first_derivative_nd(
     Ok(out)
 }
 
+/// Unified `dK/d(cos γ)` for any [`SphereWahbaKernel`] kind — the analytic
+/// derivative of [`wahba_sphere_kernel_from_cos_kind`]. Sobolev and pseudo use
+/// their dedicated closed forms; the truncated-spectral kinds differentiate
+/// the Legendre series term-by-term via the same
+/// `(1 − x²) P_ℓ'(x) = ℓ (P_{ℓ−1}(x) − x P_ℓ(x))` identity used by the
+/// Sobolev spectral derivative.
+#[inline]
+fn wahba_sphere_kernel_derivative_dcos_kind(
+    cos_gamma: f64,
+    penalty_order: usize,
+    kernel: SphereWahbaKernel,
+) -> f64 {
+    match kernel {
+        SphereWahbaKernel::Sobolev => {
+            wahba_sphere_kernel_sobolev_derivative_dcos(cos_gamma, penalty_order)
+        }
+        SphereWahbaKernel::Pseudo => {
+            wahba_sphere_kernel_pseudo_derivative_dcos(cos_gamma, penalty_order)
+        }
+        SphereWahbaKernel::SobolevTruncated { lmax } => {
+            let coeffs = sobolev_s2_truncated_coefficients(lmax as usize, penalty_order);
+            sphere_truncated_spectral_derivative_eval(cos_gamma, &coeffs)
+        }
+        SphereWahbaKernel::PseudoTruncated { lmax } => {
+            let coeffs = pseudo_s2_truncated_coefficients(lmax as usize, penalty_order);
+            sphere_truncated_spectral_derivative_eval(cos_gamma, &coeffs)
+        }
+    }
+}
+
+/// `d/d(cos γ) Σ_ℓ c_ℓ P_ℓ(cos γ)` for a truncated Legendre-coefficient array,
+/// the exact derivative of [`sphere_truncated_spectral_eval`]. Uses
+/// `(1 − x²) P_ℓ'(x) = ℓ (P_{ℓ−1}(x) − x P_ℓ(x))`, with the analytic pole
+/// limits `P_ℓ'(±1) = ±(±1)^ℓ · ℓ(ℓ+1)/2` near `|x| = 1`.
+#[inline]
+fn sphere_truncated_spectral_derivative_eval(cos_gamma: f64, coeffs: &[f64]) -> f64 {
+    const POLE_LIMIT_THRESHOLD: f64 = 1.0e-10;
+    let x = cos_gamma.clamp(-1.0, 1.0);
+    let lmax = coeffs.len().saturating_sub(1);
+    if lmax == 0 {
+        return 0.0;
+    }
+    if x.abs() > 1.0 - POLE_LIMIT_THRESHOLD {
+        let pole_neg = x.is_sign_negative();
+        let mut acc = 0.0_f64;
+        for ell in 1..=lmax {
+            let lf = ell as f64;
+            let sign = if pole_neg && ell % 2 == 0 { -1.0 } else { 1.0 };
+            let p_prime = 0.5 * lf * (lf + 1.0) * sign;
+            acc += coeffs[ell] * p_prime;
+        }
+        return acc;
+    }
+    let one_minus_x2 = (1.0 - x * x).max(f64::EPSILON);
+    // P_0 = 1, P_1 = x; advance P_ℓ while computing P_ℓ' from P_{ℓ-1}, P_ℓ.
+    let mut p_prev = 1.0_f64; // P_{ℓ-1}
+    let mut p_curr = x; // P_ℓ (ℓ starts at 1)
+    let mut acc = 0.0_f64;
+    let mut ell = 1usize;
+    loop {
+        let lf = ell as f64;
+        let p_prime = lf * (p_prev - x * p_curr) / one_minus_x2;
+        acc += coeffs[ell] * p_prime;
+        if ell >= lmax {
+            break;
+        }
+        let p_next = ((2.0 * lf + 1.0) * x * p_curr - lf * p_prev) / (lf + 1.0);
+        p_prev = p_curr;
+        p_curr = p_next;
+        ell += 1;
+    }
+    acc
+}
+
+/// Raw (pre-identifiability) Wahba sphere DESIGN jet `∂Φ_raw/∂(lat, lon)`.
+///
+/// `data` is `(N, 2)` lat/lon, `centers` is `(K, 2)` lat/lon, both in the same
+/// angular convention selected by `radians`. Returns `(N, K, 2)` where the
+/// last axis is `(∂col/∂lat, ∂col/∂lon)` in the SAME angular units as the
+/// input — i.e. the radian-space derivative scaled by `deg = radians ? 1 :
+/// π/180`.
+///
+/// With `cos γ = sinφ sinφc + cosφ cosφc cos(ψ − ψc)` (φ, ψ in radians):
+///   ∂cosγ/∂φ = cosφ sinφc − sinφ cosφc cos(ψ − ψc),
+///   ∂cosγ/∂ψ = −cosφ cosφc sin(ψ − ψc),
+/// and ∂Φ/∂φ = K'(cosγ)·∂cosγ/∂φ, ∂Φ/∂ψ = K'(cosγ)·∂cosγ/∂ψ. The raw-radian
+/// derivatives are multiplied by `deg` to express them per raw input unit.
+fn spherical_wahba_kernel_jet_with_kind(
+    data: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    penalty_order: usize,
+    radians: bool,
+    kernel: SphereWahbaKernel,
+) -> Result<Array3<f64>, BasisError> {
+    validate_lat_lon_matrix(data, "spherical spline jet data", radians)?;
+    validate_lat_lon_matrix(centers, "spherical spline jet centers", radians)?;
+    if !(1..=4).contains(&penalty_order) {
+        crate::bail_invalid_basis!(
+            "spherical spline jet penalty_order must be one of 1, 2, 3, 4; got {penalty_order}"
+        );
+    }
+    let n = data.nrows();
+    let k = centers.nrows();
+    let deg = if radians {
+        1.0
+    } else {
+        std::f64::consts::PI / 180.0
+    };
+    let mut sin_lat_c = Vec::<f64>::with_capacity(k);
+    let mut cos_lat_c = Vec::<f64>::with_capacity(k);
+    let mut sin_lon_c = Vec::<f64>::with_capacity(k);
+    let mut cos_lon_c = Vec::<f64>::with_capacity(k);
+    for c in centers.outer_iter() {
+        let (s_lat, c_lat) = (c[0] * deg).sin_cos();
+        let (s_lon, c_lon) = (c[1] * deg).sin_cos();
+        sin_lat_c.push(s_lat);
+        cos_lat_c.push(c_lat);
+        sin_lon_c.push(s_lon);
+        cos_lon_c.push(c_lon);
+    }
+    let mut out = Array3::<f64>::zeros((n, k, 2));
+    let err_flag = std::sync::atomic::AtomicBool::new(false);
+    out.axis_chunks_iter_mut(ndarray::Axis(0), 256)
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(chunk_idx, mut block)| {
+            let row_offset = chunk_idx * 256;
+            for (local_i, mut out_row) in block.outer_iter_mut().enumerate() {
+                let i = row_offset + local_i;
+                let (sin_lat, cos_lat) = (data[(i, 0)] * deg).sin_cos();
+                let (sin_lon, cos_lon) = (data[(i, 1)] * deg).sin_cos();
+                for j in 0..k {
+                    // cos(ψ − ψc) and sin(ψ − ψc) via angle-subtraction.
+                    let dlon_cos = cos_lon * cos_lon_c[j] + sin_lon * sin_lon_c[j];
+                    let dlon_sin = sin_lon * cos_lon_c[j] - cos_lon * sin_lon_c[j];
+                    let cos_gamma = sin_lat * sin_lat_c[j] + cos_lat * cos_lat_c[j] * dlon_cos;
+                    let dk =
+                        wahba_sphere_kernel_derivative_dcos_kind(cos_gamma, penalty_order, kernel);
+                    // ∂cosγ/∂φ and ∂cosγ/∂ψ (radian space).
+                    let dcos_dphi = cos_lat * sin_lat_c[j] - sin_lat * cos_lat_c[j] * dlon_cos;
+                    let dcos_dpsi = -cos_lat * cos_lat_c[j] * dlon_sin;
+                    let dphi = dk * dcos_dphi * deg;
+                    let dpsi = dk * dcos_dpsi * deg;
+                    if !dphi.is_finite() || !dpsi.is_finite() {
+                        err_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    }
+                    out_row[[j, 0]] = dphi;
+                    out_row[[j, 1]] = dpsi;
+                }
+            }
+        });
+    if err_flag.load(std::sync::atomic::Ordering::Relaxed) {
+        crate::bail_invalid_basis!("spherical spline kernel jet produced a non-finite value");
+    }
+    Ok(out)
+}
+
+/// Apply the `(K × K')` identifiability transform `z` to a raw Wahba jet
+/// `(N, K, 2)`, producing the realized-design jet `(N, K', 2)` whose column
+/// `c` aligns with column `c` of `raw_design.dot(z)`. The transform is linear
+/// in the kernel columns, so `∂(Φ_raw z)/∂t = (∂Φ_raw/∂t) z` axis-by-axis.
+fn apply_identifiability_to_jet(raw_jet: &Array3<f64>, z: &Array2<f64>) -> Array3<f64> {
+    let n = raw_jet.shape()[0];
+    let k = raw_jet.shape()[1];
+    let kp = z.ncols();
+    debug_assert_eq!(z.nrows(), k);
+    let mut out = Array3::<f64>::zeros((n, kp, 2));
+    for axis in 0..2 {
+        // raw_axis: (N, K); out_axis = raw_axis · z → (N, K').
+        let raw_axis = raw_jet.slice(ndarray::s![.., .., axis]);
+        let projected = raw_axis.dot(z);
+        out.slice_mut(ndarray::s![.., .., axis]).assign(&projected);
+    }
+    out
+}
+
+/// Real-spherical-harmonic DESIGN jet `∂Φ/∂(lat, lon)`, shape `(N, p, 2)` with
+/// `p = L(L+2)` and column order matching [`fill_real_spherical_harmonics_row`].
+///
+/// With `x = sinφ`, column `= N_{lm}·T_m(ψ)·P_{lm}(x)` where `T_m` is
+/// `sin(mψ)`, `1`, or `cos(mψ)`:
+///   ∂col/∂φ = N_{lm}·T_m(ψ)·P'_{lm}(x)·cosφ   (dx/dφ = cosφ),
+///   ∂col/∂ψ = N_{lm}·T'_m(ψ)·P_{lm}(x)         (T' = m cos(mψ), 0, −m sin(mψ)).
+/// `P'_{lm}(x)` from `(1 − x²) P'_{lm}(x) = −l x P_{lm}(x) + (l+m) P_{l−1,m}(x)`,
+/// with the forward's latitude clamp and `somx2` floor reused for the poles.
+/// The radian-space derivatives are scaled by `deg` to per-raw-unit values.
+fn spherical_harmonic_jet(
+    data: ArrayView2<'_, f64>,
+    max_degree: usize,
+    radians: bool,
+) -> Result<Array3<f64>, BasisError> {
+    validate_lat_lon_matrix(data, "spherical-harmonic jet", radians)?;
+    if max_degree < 1 {
+        crate::bail_invalid_basis!("spherical-harmonic jet max_degree must be >= 1");
+    }
+    if max_degree > 32 {
+        crate::bail_invalid_basis!("spherical-harmonic jet max_degree {max_degree} too large; cap is 32");
+    }
+    let n = data.nrows();
+    let p = max_degree * (max_degree + 2);
+    let deg = if radians {
+        1.0
+    } else {
+        std::f64::consts::PI / 180.0
+    };
+    let norms = precompute_harmonic_norms(max_degree);
+    let l_cap = max_degree + 1;
+    let mut out = Array3::<f64>::zeros((n, p, 2));
+    let idx = |l: usize, m: usize| l * l_cap + m;
+    {
+        let mut row_blocks = out
+            .axis_chunks_iter_mut(ndarray::Axis(0), 1024)
+            .collect::<Vec<_>>();
+        let chunk_size = 1024usize;
+        row_blocks
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(chunk_idx, block)| {
+                let mut p_buf = vec![0.0_f64; l_cap * l_cap];
+                let row_offset = chunk_idx * chunk_size;
+                for (local_i, mut out_row) in block.outer_iter_mut().enumerate() {
+                    let i = row_offset + local_i;
+                    let lat_raw = data[(i, 0)] * deg;
+                    let lat = lat_raw
+                        .clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
+                    let lon = data[(i, 1)] * deg;
+                    let cos_lat = lat.cos();
+                    let x = lat.sin();
+                    let somx2 = (1.0 - x * x).max(0.0).sqrt();
+                    let one_minus_x2 = (1.0 - x * x).max(f64::EPSILON);
+                    // Associated Legendre P_{l,m}(x) — identical recurrence to
+                    // `fill_real_spherical_harmonics_row`.
+                    for slot in p_buf.iter_mut() {
+                        *slot = 0.0;
+                    }
+                    p_buf[idx(0, 0)] = 1.0;
+                    for m in 1..=max_degree {
+                        p_buf[idx(m, m)] =
+                            -((2 * m - 1) as f64) * somx2 * p_buf[idx(m - 1, m - 1)];
+                    }
+                    for m in 0..max_degree {
+                        p_buf[idx(m + 1, m)] = ((2 * m + 1) as f64) * x * p_buf[idx(m, m)];
+                    }
+                    for m in 0..=max_degree {
+                        for l in (m + 2)..=max_degree {
+                            p_buf[idx(l, m)] = (((2 * l - 1) as f64) * x * p_buf[idx(l - 1, m)]
+                                - ((l + m - 1) as f64) * p_buf[idx(l - 2, m)])
+                                / ((l - m) as f64);
+                        }
+                    }
+                    // P'_{l,m}(x) via (1 − x²) P'_{l,m} = −l x P_{l,m} + (l+m) P_{l−1,m}.
+                    let dp = |l: usize, m: usize| -> f64 {
+                        let p_lm1 = if l >= 1 { p_buf[idx(l - 1, m)] } else { 0.0 };
+                        (-(l as f64) * x * p_buf[idx(l, m)] + ((l + m) as f64) * p_lm1)
+                            / one_minus_x2
+                    };
+                    // sin(mψ), cos(mψ) via Chebyshev recurrence (mirror forward).
+                    let (sin1, cos1) = lon.sin_cos();
+                    let mut sin_buf = [0.0_f64; 33];
+                    let mut cos_buf = [0.0_f64; 33];
+                    sin_buf[0] = 0.0;
+                    cos_buf[0] = 1.0;
+                    if max_degree >= 1 {
+                        sin_buf[1] = sin1;
+                        cos_buf[1] = cos1;
+                    }
+                    let two_cos1 = 2.0 * cos1;
+                    for m in 2..=max_degree {
+                        sin_buf[m] = two_cos1 * sin_buf[m - 1] - sin_buf[m - 2];
+                        cos_buf[m] = two_cos1 * cos_buf[m - 1] - cos_buf[m - 2];
+                    }
+                    let mut col = 0usize;
+                    for l in 1..=max_degree {
+                        // sin(mψ) columns for m = l, l-1, ..., 1.
+                        for m_pos in (1..=l).rev() {
+                            let nlm = norms[idx(l, m_pos)];
+                            let mf = m_pos as f64;
+                            // ∂/∂φ = N·sin(mψ)·P'·cosφ ; ∂/∂ψ = N·m cos(mψ)·P.
+                            out_row[[col, 0]] =
+                                nlm * sin_buf[m_pos] * dp(l, m_pos) * cos_lat * deg;
+                            out_row[[col, 1]] =
+                                nlm * mf * cos_buf[m_pos] * p_buf[idx(l, m_pos)] * deg;
+                            col += 1;
+                        }
+                        // m = 0: no trig factor → ∂/∂ψ = 0.
+                        let nl0 = norms[idx(l, 0)];
+                        out_row[[col, 0]] = nl0 * dp(l, 0) * cos_lat * deg;
+                        out_row[[col, 1]] = 0.0;
+                        col += 1;
+                        // cos(mψ) columns for m = 1, ..., l.
+                        for m in 1..=l {
+                            let nlm = norms[idx(l, m)];
+                            let mf = m as f64;
+                            // ∂/∂φ = N·cos(mψ)·P'·cosφ ; ∂/∂ψ = −N·m sin(mψ)·P.
+                            out_row[[col, 0]] = nlm * cos_buf[m] * dp(l, m) * cos_lat * deg;
+                            out_row[[col, 1]] = -nlm * mf * sin_buf[m] * p_buf[idx(l, m)] * deg;
+                            col += 1;
+                        }
+                    }
+                }
+            });
+    }
+    if out.iter().any(|v| !v.is_finite()) {
+        crate::bail_invalid_basis!("spherical-harmonic jet produced a non-finite value");
+    }
+    Ok(out)
+}
+
+/// Realized-design DESIGN jet `∂Φ/∂(lat, lon)` for the spherical-spline basis,
+/// matching the column layout of [`build_spherical_spline_basis`] with the
+/// given `spec`. Returns `(N, K, 2)` where `K` equals the forward design's
+/// column count and the last axis is `(∂col/∂lat, ∂col/∂lon)` in the same
+/// angular units as the raw input.
+///
+/// - **Harmonic** (`spec.method == Harmonic`): `K = L(L+2)`, no transform.
+/// - **Wahba** (Sobolev/Pseudo/truncated): centers are resolved exactly as the
+///   forward does, the raw `(N, K_c, 2)` kernel jet is built, then contracted
+///   with the same area-weighted sum-to-zero (or frozen) transform `z` so the
+///   result aligns column-for-column with `raw_design · z`.
+pub fn spherical_spline_design_jet(
+    data: ArrayView2<'_, f64>,
+    spec: &SphericalSplineBasisSpec,
+) -> Result<Array3<f64>, BasisError> {
+    if matches!(spec.method, SphereMethod::Harmonic) {
+        let l_max = spec
+            .max_degree
+            .unwrap_or_else(|| default_spherical_harmonic_degree(data.nrows()));
+        if !(1..=4).contains(&spec.penalty_order) {
+            crate::bail_invalid_basis!(
+                "spherical-harmonic jet penalty_order must be one of 1, 2, 3, 4; got {}",
+                spec.penalty_order
+            );
+        }
+        return spherical_harmonic_jet(data, l_max, spec.radians);
+    }
+    validate_lat_lon_matrix(data, "spherical spline jet", spec.radians)?;
+    let centers = match realized_center_strategy(&spec.center_strategy) {
+        CenterStrategy::FarthestPoint { num_centers } => {
+            select_spherical_farthest_point_centers(data, *num_centers, spec.radians)?
+        }
+        _ => select_centers_by_strategy(data, &spec.center_strategy)?,
+    };
+    validate_lat_lon_matrix(centers.view(), "spherical spline jet centers", spec.radians)?;
+    if centers.nrows() < 2 {
+        return Err(BasisError::InsufficientColumnsForConstraint {
+            found: centers.nrows(),
+        });
+    }
+    let z = match &spec.identifiability {
+        SphericalSplineIdentifiability::FrozenTransform { transform } => {
+            if transform.nrows() != centers.nrows() {
+                crate::bail_dim_basis!(
+                    "frozen spherical identifiability transform mismatch: {} centers but transform has {} rows",
+                    centers.nrows(),
+                    transform.nrows()
+                );
+            }
+            transform.clone()
+        }
+        SphericalSplineIdentifiability::CenterSumToZero => {
+            let weights = sphere_area_weights(centers.view(), spec.radians);
+            weighted_coefficient_sum_to_zero_transform(weights.view())?
+        }
+    };
+    let raw_jet = spherical_wahba_kernel_jet_with_kind(
+        data,
+        centers.view(),
+        spec.penalty_order,
+        spec.radians,
+        spec.wahba_kernel,
+    )?;
+    Ok(apply_identifiability_to_jet(&raw_jet, &z))
+}
+
 /// N-D periodic-cyclic-B-spline first-derivative jet `∂Φ̃/∂t` per row.
 ///
 /// One-dimensional periodic B-spline basis (one latent axis). `t` is the
