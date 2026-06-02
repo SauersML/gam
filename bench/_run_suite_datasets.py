@@ -35,12 +35,25 @@ _GAMFIT_RUST_MODULE: typing.Any | None = None
 
 
 def _gamfit_rust() -> typing.Any:
+    # See `bench/run_suite.py::_gamfit_rust` for the find_spec rationale —
+    # this helper mirrors that loader so the dataset builders find the
+    # Rust extension whether it lives in the source tree (after
+    # `maturin develop`) or under site-packages (after CI's
+    # `pip install <wheel>`).
     global _GAMFIT_RUST_MODULE
     if _GAMFIT_RUST_MODULE is not None:
         return _GAMFIT_RUST_MODULE
-    rust_candidates = sorted((ROOT / "gamfit").glob("_rust*.so"))
-    if not rust_candidates:
-        rust_candidates = sorted((ROOT / "gamfit").glob("_rust*.pyd"))
+    search_dirs: list[Path] = []
+    pkg_spec = importlib.util.find_spec("gamfit")
+    if pkg_spec is not None and pkg_spec.submodule_search_locations:
+        search_dirs.extend(Path(d) for d in pkg_spec.submodule_search_locations)
+    source_tree = ROOT / "gamfit"
+    if source_tree not in search_dirs:
+        search_dirs.append(source_tree)
+    rust_candidates: list[Path] = []
+    for d in search_dirs:
+        rust_candidates.extend(sorted(d.glob("_rust*.so")))
+        rust_candidates.extend(sorted(d.glob("_rust*.pyd")))
     if not rust_candidates:
         raise RuntimeError("gamfit Rust extension is not built")
     spec = importlib.util.spec_from_file_location("_rust", rust_candidates[0])

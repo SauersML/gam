@@ -164,12 +164,26 @@ def _rust() -> Any:
     # `gamfit/__init__.py` → `_penalties.py` at module-load time and abort
     # the whole runner before `prepare` / `matrix` (neither of which needs
     # the Rust extension) ever runs. Mirrors `bench/_run_suite_datasets.py`.
+    #
+    # `find_spec` locates the package without executing `__init__.py`, so
+    # we still skip the heavy facade import but pick up the extension in
+    # whichever `gamfit/` Python's import system would resolve — source
+    # tree (after `maturin develop`) or site-packages (after the wheel
+    # `pip install` that CI runs).
     global _RUST
     if _RUST is not None:
         return _RUST
-    candidates = sorted((ROOT / "gamfit").glob("_rust*.so"))
-    if not candidates:
-        candidates = sorted((ROOT / "gamfit").glob("_rust*.pyd"))
+    search_dirs: list[Path] = []
+    pkg_spec = importlib.util.find_spec("gamfit")
+    if pkg_spec is not None and pkg_spec.submodule_search_locations:
+        search_dirs.extend(Path(d) for d in pkg_spec.submodule_search_locations)
+    source_tree = ROOT / "gamfit"
+    if source_tree not in search_dirs:
+        search_dirs.append(source_tree)
+    candidates: list[Path] = []
+    for d in search_dirs:
+        candidates.extend(sorted(d.glob("_rust*.so")))
+        candidates.extend(sorted(d.glob("_rust*.pyd")))
     if not candidates:
         raise RuntimeError("gamfit Rust extension is not built")
     spec = importlib.util.spec_from_file_location("_rust", candidates[0])
