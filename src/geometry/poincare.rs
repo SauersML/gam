@@ -387,7 +387,9 @@ pub fn tangent_decode_forward(
     check_atoms_shape(atoms, gates)?;
     let sqrt_negc = require_negative_curvature(curvature)?;
     let (projected, tangents, proj_scale) = project_and_log(atoms, curvature)?;
-    let v = gates.dot(&tangents);
+    // V = gates · tangents (batch×F · F×d): the dominant decode GEMM over the
+    // whole observation batch, GPU-dispatched via fast_ab.
+    let v = crate::linalg::faer_ndarray::fast_ab(&gates, &tangents);
     let (batch, d) = v.dim();
     let mut x_hat = Array2::<f64>::zeros((batch, d));
     for b in 0..batch {
@@ -486,9 +488,12 @@ pub fn tangent_decode_backward(
         }
     }
 
-    // Step 2: grad_gates = grad_v @ tangents^T; grad_tangents = gates^T @ grad_v.
-    let grad_gates = grad_v.dot(&cache.tangents.t());
-    let grad_tangents = cache.gates.t().dot(&grad_v);
+    // Step 2: grad_gates = grad_v @ tangentsᵀ (batch×d · d×F); grad_tangents =
+    // gatesᵀ @ grad_v (F×batch · batch×d). Both are full-batch GEMMs,
+    // GPU-dispatched via fast_abt / fast_atb.
+    use crate::linalg::faer_ndarray::{fast_abt, fast_atb};
+    let grad_gates = fast_abt(&grad_v, &cache.tangents);
+    let grad_tangents = fast_atb(&cache.gates, &grad_v);
 
     // Step 3: pull grad_tangents back through psi(|sqrt(k) a|) * a.
     // Let y = sqrt(k) a, t = |y| = sqrt(k) |a|. Then
@@ -726,8 +731,9 @@ pub fn lorentz_decode_forward(
         }
     }
 
-    // Aggregate in tangent space, exp back, then project hyperboloid -> ball.
-    let v = gates.dot(&tangents);
+    // Aggregate in tangent space (batch×F · F×d GEMM over the whole batch,
+    // GPU-dispatched via fast_ab), exp back, then project hyperboloid -> ball.
+    let v = crate::linalg::faer_ndarray::fast_ab(&gates, &tangents);
     let mut out = Array2::<f64>::zeros((batch, d));
     for b in 0..batch {
         let v_row: Array1<f64> = v.row(b).to_owned();
