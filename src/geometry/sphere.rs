@@ -1,8 +1,8 @@
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::geometry::manifold::{
     GEOMETRY_EPS, GeometryError, GeometryResult, RiemannianManifold, check_len, dot, identity,
-    norm, zero_christoffel,
+    norm,
 };
 use crate::geometry::normalize_weights;
 
@@ -12,6 +12,9 @@ pub struct SphereManifold {
 }
 
 impl SphereManifold {
+    /// Tolerance on `‖p‖² − 1` for accepting a point as on the unit sphere.
+    const UNIT_TOL: f64 = 1.0e-6;
+
     pub const fn new(intrinsic_dim: usize) -> Self {
         Self { intrinsic_dim }
     }
@@ -24,6 +27,22 @@ impl SphereManifold {
             ));
         }
         Ok(x / nrm)
+    }
+
+    /// Reject base points that are not on the unit sphere. Every closed-form
+    /// here (`exp`, `log`, projection, transport) assumes `‖p‖ = 1`; for a
+    /// non-unit `p` the projection `v − p(pᵀv)` is not even tangent and
+    /// `exp` leaves the sphere. The tolerance is loose enough to absorb the
+    /// float drift of on-manifold iterates (retraction renormalizes to
+    /// ~1e-15) yet still rejects genuinely off-manifold inputs.
+    fn require_unit(&self, point: ArrayView1<'_, f64>) -> GeometryResult<()> {
+        let n2 = dot(point, point);
+        if !n2.is_finite() || (n2 - 1.0).abs() > Self::UNIT_TOL {
+            return Err(GeometryError::InvalidPoint(
+                "sphere operation requires a unit-norm base point",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -39,6 +58,7 @@ impl RiemannianManifold for SphereManifold {
     fn tangent_basis(&self, point: ArrayView1<'_, f64>) -> GeometryResult<Array2<f64>> {
         let m = self.ambient_dim();
         check_len("Sphere point", point.len(), m)?;
+        self.require_unit(point)?;
         let mut anchor = 0usize;
         let mut max_abs = 0.0;
         for i in 0..m {
@@ -86,6 +106,7 @@ impl RiemannianManifold for SphereManifold {
         let m = self.ambient_dim();
         check_len("Sphere point", point.len(), m)?;
         check_len("Sphere tangent", tangent_vec.len(), m)?;
+        self.require_unit(point)?;
         let xi = self.project_tangent(point, tangent_vec)?;
         let theta = norm(xi.view());
         if theta < 1.0e-10 {
@@ -102,6 +123,8 @@ impl RiemannianManifold for SphereManifold {
         let m = self.ambient_dim();
         check_len("Sphere source", p_from.len(), m)?;
         check_len("Sphere target", p_to.len(), m)?;
+        self.require_unit(p_from)?;
+        self.require_unit(p_to)?;
         let c = dot(p_from, p_to).clamp(-1.0, 1.0);
         // Geodesic length via the chord/haversine form theta = 2·arcsin(|p-q|/2)
         // rather than acos(p·q). For nearby unit vectors p·q = 1 − |p-q|²/2
@@ -123,8 +146,15 @@ impl RiemannianManifold for SphereManifold {
         let mut u = &p_to - &(p_from.to_owned() * c);
         let u_nrm = norm(u.view());
         if u_nrm < 1.0e-10 {
-            let basis = self.tangent_basis(p_from)?;
-            return Ok(basis.slice(s![.., 0]).to_owned() * theta);
+            // theta ≈ π with a vanishing tangent direction means p_to is the
+            // antipode of p_from. The logarithm there is multivalued — every
+            // unit u ⟂ p_from satisfies Exp_{p_from}(πu) = −p_from — so there
+            // is no single correct answer to return. Surface it rather than
+            // fabricating an arbitrary basis direction (which was also
+            // discontinuous across the cut locus).
+            return Err(GeometryError::Singular(
+                "sphere log map is undefined at the antipode (cut locus)",
+            ));
         }
         u *= theta / u_nrm;
         Ok(u)
@@ -143,9 +173,19 @@ impl RiemannianManifold for SphereManifold {
         }
         let from = point_along.row(0);
         let to = point_along.row(point_along.nrows() - 1);
+        self.require_unit(from)?;
+        self.require_unit(to)?;
         let denom = 1.0 + dot(from, to);
         if denom.abs() < 1.0e-10 {
-            return self.project_tangent(to, vec);
+            // from ≈ −to: parallel transport across the cut locus depends on
+            // which geodesic is chosen (transporting along the great circle
+            // through e₂ versus e₃ gives different results), so with only the
+            // endpoints there is no well-defined answer. The previous fallback
+            // merely projected `vec` into T_to S, which is not parallel
+            // transport. Require the caller to supply an actual path instead.
+            return Err(GeometryError::Singular(
+                "sphere parallel transport across antipodal endpoints is path-dependent",
+            ));
         }
         let scale = dot(vec, to) / denom;
         Ok(vec.to_owned() - &(from.to_owned() + to.to_owned()) * scale)
@@ -153,12 +193,21 @@ impl RiemannianManifold for SphereManifold {
 
     fn metric_tensor(&self, point: ArrayView1<'_, f64>) -> GeometryResult<Array2<f64>> {
         check_len("Sphere metric point", point.len(), self.ambient_dim())?;
+        self.require_unit(point)?;
         Ok(identity(self.ambient_dim()))
     }
 
     fn christoffel_symbols(&self, point: ArrayView1<'_, f64>) -> GeometryResult<Vec<Array2<f64>>> {
         check_len("Sphere Christoffel point", point.len(), self.ambient_dim())?;
-        Ok(zero_christoffel(self.ambient_dim()))
+        self.require_unit(point)?;
+        // The sphere is curved: a zero Christoffel tensor would assert that
+        // geodesics satisfy x''=0 in ambient coordinates, contradicting the
+        // great-circle geodesic x''=−x. There is no flat global chart, and the
+        // embedded connection ∇_ξη = P_p(Dη[ξ]) is not a coordinate Christoffel
+        // tensor, so we refuse rather than hand back false (zero) symbols.
+        Err(GeometryError::Unsupported(
+            "Christoffel symbols of the embedded sphere require a local chart",
+        ))
     }
 
     fn sectional_curvature(
@@ -187,6 +236,7 @@ impl RiemannianManifold for SphereManifold {
     ) -> GeometryResult<Array1<f64>> {
         check_len("Sphere projection point", point.len(), self.ambient_dim())?;
         check_len("Sphere projection vector", vec.len(), self.ambient_dim())?;
+        self.require_unit(point)?;
         Ok(vec.to_owned() - &(point.to_owned() * dot(point, vec)))
     }
 
@@ -200,6 +250,7 @@ impl RiemannianManifold for SphereManifold {
         check_len("Sphere exp_map_vjp point", point.len(), m)?;
         check_len("Sphere exp_map_vjp tangent", tangent_vec.len(), m)?;
         check_len("Sphere exp_map_vjp grad", grad_output.len(), m)?;
+        self.require_unit(point)?;
 
         // Forward map: with `xi = (I - p p^T) v`, `theta = |xi|`,
         //   y = cos(theta) p + (sin(theta)/theta) xi.
