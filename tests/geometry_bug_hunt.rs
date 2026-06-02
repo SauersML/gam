@@ -198,6 +198,7 @@ fn trust_region_step_should_never_exceed_radius() {
     };
     let opt = RiemannianTrustRegion {
         radius: 0.05,
+        max_radius: 0.05,
         max_iter: 1,
         grad_tol: 0.0,
     };

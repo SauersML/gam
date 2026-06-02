@@ -568,6 +568,7 @@ mod tests {
             tangent: ArrayView1<'_, f64>,
         ) -> GeometryResult<Option<Array1<f64>>> {
             assert!(point.iter().all(|value| value.is_finite()));
+            check_len("hessian_vector_product tangent", tangent.len(), point.len())?;
             Ok(Some(&tangent.to_owned() * 2.0))
         }
     }
@@ -607,6 +608,7 @@ mod tests {
             tangent: ArrayView1<'_, f64>,
         ) -> GeometryResult<Option<Array1<f64>>> {
             assert!(point.iter().all(|value| value.is_finite()));
+            check_len("hessian_vector_product tangent", tangent.len(), point.len())?;
             Ok(Some(self.a.dot(&tangent.to_owned())))
         }
     }

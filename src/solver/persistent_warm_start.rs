@@ -292,9 +292,7 @@ pub(crate) fn open_outer_session(key: &str) -> Option<std::sync::Arc<crate::cach
 // ---------------------------------------------------------------------------
 // Piece 3 — IFT warm-starting of the latent field
 //
-// See `proposals/latent_coord.md` §2 / §4 and
-// `proposals/composition_engine.md` §6 (the ψ-machinery mapping). The
-// existing β-IFT predictor lives in
+// The existing β-IFT predictor lives in
 // `crate::solver::reml::runtime::predict_warm_start_beta_ift_with_outcome`
 // and operates on the dense `H_pen` Cholesky factor cached after the
 // inner solve. The latent IFT predictor below is the row-local analogue

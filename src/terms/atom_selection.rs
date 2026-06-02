@@ -1,7 +1,7 @@
 //! # Atom selection for multi-manifold / overlapping atoms (Piece 6).
 //!
 //! This module is the structural sibling of [`crate::terms::latent_coord`] for
-//! the **multi-atom** regime described in `proposals/sae_manifold.md` §3.
+//! the **multi-atom** regime.
 //! Where the single-atom case stores one per-row latent `t_n ∈ ℝ^d`, here we
 //! maintain:
 //!

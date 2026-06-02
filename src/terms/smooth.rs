@@ -593,7 +593,6 @@ pub enum ByVariableSpec {
 /// `marginalspecs[i]` is the 1D B-spline setup for `feature_cols[i]`.
 /// The final penalty set is one Kronecker penalty per margin:
 /// `S_i = I ⊗ ... ⊗ S_marginal_i ⊗ ... ⊗ I`, plus optional global ridge.
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TensorMarginalSpec {
     BSpline(BSplineBasisSpec),

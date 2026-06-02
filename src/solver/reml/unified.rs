@@ -1036,6 +1036,21 @@ impl HessianDerivativeProvider for GaussianDerivatives {
 /// where c is the first eta-derivative of the working curvature W(η),
 /// and vₖ = H⁻¹(Aₖβ̂) is the mode response.
 ///
+/// When the link is not canonical — probit, cloglog, SAS, mixture, or
+/// beta-logistic — `c_array` and `d_array` store the **observed-information**
+/// weight derivatives (c_obs, d_obs) that include residual-dependent
+/// corrections:
+///
+///   c_obs = c_F + h'·B − (y−μ)·B_η
+///   d_obs = d_F + h''·B + 2h'·B_η − (y−μ)·B_ηη
+///
+/// where B = (h''V − h'²V') / (φV²).  For canonical links (logit for
+/// binomial, log for Poisson), B = 0 so observed = Fisher and the arrays
+/// are populated with the Fisher values unchanged. These arrays are carried
+/// out of PIRLS as the accepted Hessian-side curvature surface and passed
+/// through `RemlState::hessian_cd_arrays` at the construction sites in
+/// `runtime.rs`.
+///
 /// The link-parameter ext_coord path (build_sas_link_ext_coords /
 /// build_mixture_link_ext_coords) independently uses observed weight
 /// derivatives computed inline.

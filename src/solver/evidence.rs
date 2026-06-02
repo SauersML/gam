@@ -4,9 +4,7 @@
 //!
 //!   1. Laplace evidence `V(ρ, T) = F + (1/2) log|H| - (1/2) log|S(ρ)|+
 //!      - ((dim(H)-rank(S))/2) log(2π)`
-//!      evaluated at the arrow-Schur inner-loop fixed point, per
-//!      `proposals/arrow_schur_evidence.md` §3 (3.1 and the formula sheet
-//!      in §7).
+//!      evaluated at the arrow-Schur inner-loop fixed point.
 //!   2. The full IFT cascade `∂u*/∂β → ∂β*/∂ρ → ∂u*/∂ρ` through the three
 //!      continuous tiers `(u, β, ρ)`, per §2.2 / §2.4 / §2.6.
 //!   3. The per-`ρ` evidence gradient `∂V/∂ρ` via the arrow trace formula,
@@ -87,10 +85,9 @@ pub enum EvidenceLogDetSource<'a> {
 
 /// Discrete topology choice for the latent coordinate domain.
 ///
-/// Maps directly to the requested set `{periodic, flat, sphere, torus}`
-/// from `proposals/arrow_schur_evidence.md` §4.1. No additional variants
-/// — the proposal §6.12 explicitly forbids carrying unused candidate
-/// variants alongside the four-way selector.
+/// Maps directly to the set `{periodic, flat, sphere, torus}`. No additional
+/// variants — unused candidate variants are deliberately not carried
+/// alongside the four-way selector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TopologyKind {
     /// `S¹` or periodic interval (cyclic B-spline / periodic Duchon).

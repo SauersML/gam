@@ -1,11 +1,9 @@
 //! Joint `(t, β)` inner Newton driver for [`crate::terms::latent_coord::LatentCoordValues`]
 //! blocks.
 //!
-//! See `proposals/latent_coord.md` (full design, gauge story) and
-//! `proposals/composition_engine.md` §7 (audit-revised arrow-Schur
-//! complexity story: inner step is `O(N d³ + K³)`; the REML outer
+//! The arrow-Schur inner step is `O(N d³ + K³)`; the REML outer
 //! gradient w.r.t. `t` carries a shared `Schur⁻¹` factor and is handled
-//! at the REML driver level, not here).
+//! at the REML driver level, not here.
 //!
 //! ## Scope
 //!

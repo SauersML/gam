@@ -18,12 +18,10 @@
 //!   Bundle Adjustment", ECCV 2020: batched point-block solves and Schur
 //!   reductions as GPU kernels.
 //!
-//! See `proposals/latent_coord.md` §4 (the plumbing change) and
-//! `proposals/composition_engine.md` §7 (audit-revised complexity claim:
-//! "cost is arrow-shaped, but the REML log|H| gradient carries a shared
+//! The cost is arrow-shaped, but the REML log|H| gradient carries a shared
 //! Schur⁻¹ factor handled as one-time-per-outer-iteration setup plus N
-//! rank-≤d per-row traces"). The math-audit revisions in those proposals
-//! are the source of the explicit precondition story below.
+//! rank-≤d per-row traces; that is the source of the explicit precondition
+//! story below.
 //!
 //! ## What this module does
 //!
@@ -90,8 +88,7 @@
 //! Future maintainers: this is BA. Solver improvements should first look
 //! at Ceres/g2o/MegBA/Square-Root BA literature, not bespoke algebra. If you
 //! find yourself extending `ArrowSchurSystem` with an outer-REML gradient
-//! hook, please re-read the audit revisions in `proposals/latent_coord.md`
-//! §7 and `proposals/composition_engine.md` §7 first.
+//! hook, re-read the inner/outer cost split documented above first.
 
 use ndarray::{Array1, Array2, ArrayView1};
 use std::ops::Range;
@@ -1956,7 +1953,7 @@ pub struct ArrowSchurSystem {
 /// matrix-free full-system solve without re-deriving the ρ layout. The penalty
 /// itself is an `Arc`-backed clone (cheap), so capturing it does not copy the
 /// penalty payload.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CrossRowLatentPenalty {
     /// The non-row-block-diagonal Psi penalty (e.g. `TotalVariationPenalty`).
     pub penalty: AnalyticPenaltyKind,
@@ -3605,9 +3602,8 @@ impl ArrowFactorCache {
     /// the flat `Δt` of total length `row_offsets[N]`.
     ///
     /// IFT first-order predictor for the latent field under a
-    /// shape-coefficient perturbation `Δβ`. See
-    /// `proposals/latent_coord.md` §2.2. BA analogue: back-substitution after
-    /// reduced-camera-system solve.
+    /// shape-coefficient perturbation `Δβ`. BA analogue: back-substitution
+    /// after the reduced-camera-system solve.
     pub fn predict_delta_t_from_delta_beta(&self, delta_beta: ArrayView1<'_, f64>) -> Array1<f64> {
         let n = self.undamped_factor_count();
         let total_len = self.delta_t_len();
@@ -3637,8 +3633,8 @@ impl ArrowFactorCache {
     /// Apply the *combined* IFT predictor
     /// `Δt_i = -(H_tt^(i))⁻¹ · (H_tβ^(i) Δβ + δg_t^(i))` per row.
     ///
-    /// This is the canonical single-pass form of the IFT formula from
-    /// `proposals/per_point_hessian.md` §4. Compared to the legacy split
+    /// This is the canonical single-pass form of the IFT formula. Compared to
+    /// the legacy split
     /// path (`predict_delta_t_from_delta_beta` + `predict_delta_t_from_delta_gt`),
     /// this routine performs *one* per-row Cholesky back-substitution
     /// instead of two — halving the IFT predictor cost for callers that

@@ -4004,7 +4004,6 @@ pub(crate) struct FirthTauBetaPartialKernel {
 /// for the same `rho` vector, which can happen during the line search.
 /// `RefCell` allows us to mutate the cache through a `&self` reference,
 /// making this optimization possible while adhering to the optimizer's API.
-
 #[derive(Clone)]
 pub(crate) struct EvalShared {
     key: Option<Vec<u64>>,
