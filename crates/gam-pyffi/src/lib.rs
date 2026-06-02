@@ -83,7 +83,8 @@ use gam::terms::basis::{
     BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder,
     DuchonOperatorPenaltySpec, MaternBasisSpec, MaternIdentifiability, MaternNu,
     OneDimensionalBoundary, OperatorPenaltySpec, PeriodicBSplineBasisSpec, SpatialIdentifiability,
-    SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec, SplineScratch,
+    SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec, SphericalSplineIdentifiability,
+    SplineScratch,
     auto_centers_1d_equal_mass, auto_knot_vector_1d_quantile, bspline_tensor_first_derivative,
     build_duchon_basis, build_duchon_basis_mixed_periodicity_auto,
     build_duchon_operator_penalty_matrices, build_matern_basis, build_periodic_bspline_basis_1d,
@@ -4174,6 +4175,7 @@ fn sphere_basis<'py>(
         method,
         max_degree,
         wahba_kernel,
+        identifiability: SphericalSplineIdentifiability::CenterSumToZero,
     };
     let built =
         build_spherical_spline_basis(pts, &spec).map_err(|err| py_value_error(err.to_string()))?;
@@ -4277,6 +4279,7 @@ fn sphere_basis_with_centers<'py>(
         method,
         max_degree,
         wahba_kernel,
+        identifiability: SphericalSplineIdentifiability::CenterSumToZero,
     };
     let built =
         build_spherical_spline_basis(pts, &spec).map_err(|err| py_value_error(err.to_string()))?;
@@ -7786,6 +7789,7 @@ fn build_latent_forward_design(
                 method: SphereMethod::Wahba,
                 max_degree: None,
                 wahba_kernel: SphereWahbaKernel::Sobolev,
+                identifiability: SphericalSplineIdentifiability::CenterSumToZero,
             };
             let built = build_spherical_spline_basis(t_mat.view(), &spec)
                 .map_err(|err| format!("failed to evaluate sphere latent basis: {err}"))?;
