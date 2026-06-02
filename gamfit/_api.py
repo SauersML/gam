@@ -2638,7 +2638,15 @@ def gaussian_reml_fit_latent(
     tensor_knot_offsets: Sequence[int] | None = None,
     tensor_degrees: Sequence[int] | None = None,
 ) -> dict[str, Any]:
-    """Fit a Gaussian decoder with per-row latent coordinates.
+    """Fit a Gaussian decoder at a *fixed* per-row latent coordinate.
+
+    This is the differentiable inner solve: it builds ``Φ(t)`` at the ``t`` you
+    pass and solves ``β`` / ``λ`` by REML. It does **not** move ``t`` — the
+    returned ``t`` equals the input, so the fit quality is whatever the input
+    coordinate already encodes. To *estimate* the latent coordinate from a poor
+    init (recovering ``t`` itself), use
+    :func:`gaussian_reml_optimize_latent`, which wraps this solve in a
+    spectral-seeded outer optimization over ``t``.
 
     This is the low-level array API behind :class:`gamfit.LatentCoord`: each
     row has a latent coordinate ``t_n ∈ R^d`` and the fitted mean is
