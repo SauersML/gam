@@ -4,7 +4,8 @@ use crate::faer_ndarray::{
 };
 use faer::Side;
 use ndarray::{
-    Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Axis, s,
+    Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, ArrayViewMut1, ArrayViewMut2, Axis,
+    s,
 };
 use rayon::prelude::*;
 use std::sync::Once;
@@ -4339,5 +4340,109 @@ pub fn gaussian_reml_fit_blocks_backward_analytic(
         grad_penalties,
         grad_y,
         grad_weights,
+    })
+}
+
+/// Fixed-λ multi-output Gaussian fit under a per-row dense Fisher–Rao precision
+/// metric: coefficients, fitted values, per-output residual scale, and the
+/// penalized Fisher-weighted objective.
+pub struct DenseFisherGaussianFit {
+    pub coefficients: Array2<f64>,
+    pub fitted: Array2<f64>,
+    pub sigma2: Array1<f64>,
+    pub objective: f64,
+}
+
+/// Add a block-diagonal `λ·S` penalty (one `S` block per output) into a stacked
+/// `(k·n_outputs)` Hessian in place, symmetrizing `S`.
+pub fn add_block_diagonal_penalty(
+    hessian: &mut Array2<f64>,
+    penalty: ArrayView2<'_, f64>,
+    lambda: f64,
+    n_outputs: usize,
+) -> Result<(), EstimationError> {
+    let k = penalty.ncols();
+    if penalty.nrows() != k {
+        return Err(EstimationError::InvalidInput(format!(
+            "penalty must be square for dense Fisher fit; got {}x{}",
+            penalty.nrows(),
+            penalty.ncols()
+        )));
+    }
+    if hessian.dim() != (k * n_outputs, k * n_outputs) {
+        return Err(EstimationError::InvalidInput(
+            "dense Fisher Hessian shape mismatch while adding penalty".to_string(),
+        ));
+    }
+    for output in 0..n_outputs {
+        let offset = output * k;
+        for row in 0..k {
+            for col in 0..k {
+                let s_sym = 0.5 * (penalty[[row, col]] + penalty[[col, row]]);
+                hessian[[offset + row, offset + col]] += lambda * s_sym;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Closed-form fixed-λ multi-output Gaussian fit with a per-row dense Fisher–Rao
+/// precision metric. Assembles the block `XᵀWX` (+ block-diagonal `λS`) and
+/// `XᵀWY` via the dense Fisher block kernels, solves, then forms fitted values,
+/// per-output residual scale `sigma2`, and the penalized Fisher-weighted
+/// objective seeded by `latent_prior_score`. `row_weights` are the (already
+/// resolved) per-observation likelihood weights.
+#[allow(clippy::too_many_arguments)]
+pub fn dense_fisher_gaussian_fit(
+    design: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    row_weights: ArrayView1<'_, f64>,
+    fisher_w: ArrayView3<'_, f64>,
+    lambda: f64,
+    latent_prior_score: f64,
+) -> Result<DenseFisherGaussianFit, EstimationError> {
+    let n_obs = design.nrows();
+    let k = design.ncols();
+    let n_outputs = y.ncols();
+    let mut hessian = crate::pirls::dense_block_xtwx(design, fisher_w, Some(row_weights))?;
+    add_block_diagonal_penalty(&mut hessian, penalty, lambda, n_outputs)?;
+    let rhs = crate::pirls::dense_block_xtwy(design, fisher_w, y, Some(row_weights))?;
+    let beta_vec =
+        crate::linalg::utils::solve_dense_block_system(&hessian, &rhs, "dense Fisher Gaussian")
+            .map_err(EstimationError::InvalidInput)?;
+    let mut coefficients = Array2::<f64>::zeros((k, n_outputs));
+    for output in 0..n_outputs {
+        for col in 0..k {
+            coefficients[[col, output]] = beta_vec[output * k + col];
+        }
+    }
+    let fitted = design.dot(&coefficients);
+    let mut sigma2 = Array1::<f64>::zeros(n_outputs);
+    let mut objective = latent_prior_score;
+    for row in 0..n_obs {
+        for a in 0..n_outputs {
+            let ra = y[[row, a]] - fitted[[row, a]];
+            sigma2[a] += row_weights[row] * ra * ra;
+            for b in 0..n_outputs {
+                objective += 0.5
+                    * row_weights[row]
+                    * ra
+                    * fisher_w[[row, a, b]]
+                    * (y[[row, b]] - fitted[[row, b]]);
+            }
+        }
+    }
+    for output in 0..n_outputs {
+        sigma2[output] /= (n_obs.saturating_sub(k).max(1)) as f64;
+        let beta_col = coefficients.column(output);
+        let s_beta = penalty.dot(&beta_col);
+        objective += 0.5 * lambda * beta_col.dot(&s_beta);
+    }
+    Ok(DenseFisherGaussianFit {
+        coefficients,
+        fitted,
+        sigma2,
+        objective,
     })
 }
