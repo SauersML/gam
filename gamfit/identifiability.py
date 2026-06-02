@@ -95,6 +95,25 @@ _RANDPROJ_ACTIVATION_VAR_CEILING = 1.0e6
 # ceiling as a hard fail and variances above 1e3 as a warn.
 _RANDPROJ_ACTIVATION_VAR_WARN = 1.0e3
 
+_IVAE_AUX_SCALE_LOG_AMPLITUDE = 0.4
+# Khemakhem 2107.10098 Thm. 1 identifies the latent up to a component-wise
+# transform iff the conditional prior `p(t | u)` spans a 2k-dimensional set
+# of natural parameters. For the diagonal Gaussian iVAE prior the natural
+# parameters are `(η_1, η_2) = (μ(u) / σ(u)², −1 / (2 σ(u)²))`, which the
+# constructor in ``src/identifiability.rs`` checks via the column rank of the
+# stacked signature ``[μ(u) ‖ log σ(u)]`` (an invertible reparameterisation).
+# A *constant* scale collapses the ``log σ`` half of that signature to zero,
+# leaving rank ≤ k < 2k — that is exactly the supervised-path failure mode of
+# issue #576. The conditional scale must therefore be a genuine function of
+# the auxiliary. A purely *linear* `log σ = a + b·u` would lie in the span of
+# ``{1, μ}`` and still not lift the rank; the lift requires `log σ(u)` to be
+# *nonlinear* in `u` (Khemakhem §3, and the SVD argument in
+# ``ivae_precondition_pair``). We use a bounded, column-distinct nonlinear map
+# of the standardised auxiliary — ``log σ_j(u) = A · tanh((j+1)·z_j)`` — whose
+# amplitude ``A`` is small enough to keep `σ` well-conditioned (σ ∈ [e^−A, e^A])
+# yet large enough that the ``tanh`` curvature gives `log σ` an SVD direction
+# genuinely independent of the affine `μ` columns.
+
 
 @dataclass(slots=True)
 class IdentifiabilityTheoremResult:
@@ -544,6 +563,46 @@ def _resolve_weight(
     return w, False
 
 
+def _derive_aux_scale(aux_np: np.ndarray) -> np.ndarray:
+    """Derive the iVAE conditional scale ``σ(u)`` from the auxiliary.
+
+    The Gaussian iVAE prior is ``p(t_i | u) = N(μ_i(u), σ_i(u)²)``. The mean
+    is supplied directly by the auxiliary (``μ(u) = u``); this returns the
+    matching conditional scale ``σ(u)`` so that the stacked natural-parameter
+    signature ``[μ(u) ‖ log σ(u)]`` spans the full ``2k`` dimensions required
+    by Khemakhem 2107.10098 Theorem 1 (the rank check in
+    ``ConditionalPriorIvae::new``).
+
+    For each auxiliary column we standardise to ``z_j`` (zero mean, unit
+    spread over the rows) and set
+    ``log σ_j(u) = A · tanh((j + 1) · z_j)`` with ``A =
+    _IVAE_AUX_SCALE_LOG_AMPLITUDE``. The per-column frequency ``(j + 1)``
+    pushes each ``log σ`` column into its own subspace (mirroring the
+    distinct-frequency construction in ``ivae_precondition_pair``), and the
+    ``tanh`` nonlinearity makes ``log σ_j`` linearly independent of the affine
+    ``μ_j = u_j`` column — so for ``N ≥ 2k + 1`` rows of a genuinely varying
+    auxiliary the signature reaches numerical rank ``2k``.
+
+    A degenerate (constant) auxiliary column yields ``z_j ≡ 0`` and hence
+    ``σ_j ≡ 1``; the resulting signature is then correctly rank-deficient and
+    the Rust precondition reports the iVAE theorem as violated rather than
+    silently fabricating identifiability. ``σ`` is always finite and strictly
+    positive (``σ ∈ [e^−A, e^A]``).
+    """
+
+    aux2d = np.ascontiguousarray(np.asarray(aux_np, dtype=float))
+    col_mean = aux2d.mean(axis=0, keepdims=True)
+    col_std = aux2d.std(axis=0, keepdims=True)
+    # A constant column has zero spread; standardising it to 0 keeps σ = 1
+    # there so the (now provably) rank-deficient signature is surfaced by the
+    # Rust theorem check instead of being masked.
+    safe_std = np.where(col_std > 0.0, col_std, 1.0)
+    z = (aux2d - col_mean) / safe_std
+    freq = np.arange(1, aux2d.shape[1] + 1, dtype=float).reshape(1, -1)
+    log_sigma = _IVAE_AUX_SCALE_LOG_AMPLITUDE * np.tanh(freq * z)
+    return np.ascontiguousarray(np.exp(log_sigma))
+
+
 def _one_fit(
     x_t: Any,
     aux_t: Any,
@@ -603,8 +662,24 @@ def _one_fit(
         feature_groups, float(mech_w), float(max(1, n_obs))
     )
 
-    aux_np = aux_t.detach().cpu().numpy()
-    aux_scale = np.ones_like(aux_np)
+    aux_np = np.ascontiguousarray(aux_t.detach().cpu().numpy())
+    # Conditional scale σ(u) of the Gaussian iVAE prior, derived from the
+    # auxiliary so that the natural-parameter signature [μ(u) ‖ log σ(u)]
+    # spans the full 2k dimensions of Khemakhem 2107.10098 Thm. 1 (fixing
+    # issue #576, where the hardcoded σ ≡ 1 made that signature rank-deficient
+    # and every supervised fit raise). ``aux_prior_active`` records whether
+    # the Khemakhem precondition is satisfiable for *this* auxiliary: when the
+    # auxiliary is genuinely degenerate the conditional prior is mathematically
+    # non-identifiable, so the Rust constructor raises — we then leave the
+    # prior contribution at zero and let :func:`check` report iVAE = fail,
+    # honouring the recipe contract that the fit always completes.
+    aux_scale = _derive_aux_scale(aux_np)
+    zero_sup = np.zeros((n_obs, n_supervised), dtype=np.float64)
+    try:
+        rust.conditional_prior_ivae(float(aux_w), zero_sup, aux_np, aux_scale)
+        aux_prior_active = True
+    except ValueError:
+        aux_prior_active = False
 
     rss = 0.0
     total_pen = 0.0
@@ -617,16 +692,20 @@ def _one_fit(
         recon = ((x_hat - x_t) ** 2).sum()
 
         # Aux conditional prior (Gaussian iVAE prior on T_sup given aux).
-        t_sup_np = np.ascontiguousarray(t_sup.detach().cpu().numpy())
-        aux_val, aux_grad = rust.conditional_prior_ivae(
-            float(aux_w), t_sup_np, aux_np, aux_scale
-        )
-        aux_grad_t = torch.as_tensor(
-            np.asarray(aux_grad), dtype=t.dtype, device=t.device
-        )
-        # Inject the analytic Rust gradient into autograd via a surrogate loss
-        # whose backward equals the precomputed gradient.
-        aux_surrogate = (t_sup * aux_grad_t).sum()
+        if aux_prior_active:
+            t_sup_np = np.ascontiguousarray(t_sup.detach().cpu().numpy())
+            aux_val, aux_grad = rust.conditional_prior_ivae(
+                float(aux_w), t_sup_np, aux_np, aux_scale
+            )
+            aux_grad_t = torch.as_tensor(
+                np.asarray(aux_grad), dtype=t.dtype, device=t.device
+            )
+            # Inject the analytic Rust gradient into autograd via a surrogate
+            # loss whose backward equals the precomputed gradient.
+            aux_surrogate = (t_sup * aux_grad_t).sum()
+        else:
+            aux_val = 0.0
+            aux_surrogate = t_sup.sum() * 0.0
 
         # Mechanism sparsity on the free-latent rows of the decoder
         # (decoder.weight is shape (P, latent_dim); transpose to
@@ -662,12 +741,15 @@ def _one_fit(
         t_sup = t[:, :n_supervised]
         x_hat = decoder(t)
         rss = float(((x_hat - x_t) ** 2).sum().item())
-        aux_val, _ = rust.conditional_prior_ivae(
-            float(aux_w),
-            np.ascontiguousarray(t_sup.detach().cpu().numpy()),
-            aux_np,
-            aux_scale,
-        )
+        if aux_prior_active:
+            aux_val, _ = rust.conditional_prior_ivae(
+                float(aux_w),
+                np.ascontiguousarray(t_sup.detach().cpu().numpy()),
+                aux_np,
+                aux_scale,
+            )
+        else:
+            aux_val = 0.0
         w_full = decoder.weight.t()
         w_free = w_full[n_supervised : n_supervised + n_free, :]
         mech_val, _ = mech_pen.value_grad(
