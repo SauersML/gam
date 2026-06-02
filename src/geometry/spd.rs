@@ -11,12 +11,35 @@ pub struct SpdManifold {
 }
 
 impl SpdManifold {
+    /// Relative tolerance on the asymmetry `max|P_ij − P_ji|` for accepting a
+    /// flattened matrix as a symmetric SPD point.
+    const SYM_REL_TOL: f64 = 1.0e-9;
+
     pub const fn new(n: usize) -> Self {
         Self { n }
     }
 
     fn matrix(&self, point: ArrayView1<'_, f64>) -> GeometryResult<Array2<f64>> {
-        let p = sym(&from_flat(point, self.n, self.n)?);
+        let raw = from_flat(point, self.n, self.n)?;
+        // An SPD point must be symmetric. Reject a non-symmetric input rather
+        // than silently replacing it with (P+Pᵀ)/2 — that would accept an
+        // off-manifold matrix as a *different* valid point and quietly move the
+        // base of exp/log. Only residual float asymmetry (within tolerance) is
+        // then cleaned by `sym` before the positive-definiteness check.
+        let mut max_abs = 0.0_f64;
+        let mut max_asym = 0.0_f64;
+        for i in 0..self.n {
+            for j in 0..self.n {
+                max_abs = max_abs.max(raw[[i, j]].abs());
+                max_asym = max_asym.max((raw[[i, j]] - raw[[j, i]]).abs());
+            }
+        }
+        if !max_asym.is_finite() || max_asym > Self::SYM_REL_TOL * max_abs.max(1.0) {
+            return Err(GeometryError::InvalidPoint(
+                "SPD point must be a symmetric matrix",
+            ));
+        }
+        let p = sym(&raw);
         cholesky_spd(&p)?;
         Ok(p)
     }
@@ -48,13 +71,21 @@ impl RiemannianManifold for SpdManifold {
 
     fn tangent_basis(&self, point: ArrayView1<'_, f64>) -> GeometryResult<Array2<f64>> {
         check_len("SPD point", point.len(), self.ambient_dim())?;
+        // Frobenius-orthonormal basis of the symmetric tangent space. The
+        // diagonal generators E_ii already have ‖E_ii‖_F = 1; the off-diagonal
+        // generators place 1/√2 at both (i,j) and (j,i) so ‖E_ij‖²_F = ½ + ½ = 1
+        // (a single 1.0 at each entry would give ‖·‖_F = √2, a non-orthonormal
+        // basis).
+        let off = std::f64::consts::FRAC_1_SQRT_2;
         let mut out = Array2::<f64>::zeros((self.ambient_dim(), self.dim()));
         let mut col = 0usize;
         for i in 0..self.n {
             for j in i..self.n {
-                out[[i * self.n + j, col]] = 1.0;
-                if i != j {
-                    out[[j * self.n + i, col]] = 1.0;
+                if i == j {
+                    out[[i * self.n + j, col]] = 1.0;
+                } else {
+                    out[[i * self.n + j, col]] = off;
+                    out[[j * self.n + i, col]] = off;
                 }
                 col += 1;
             }
