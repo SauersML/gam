@@ -6410,7 +6410,9 @@ fn batched_smooth_sb(
         // `tile_results` are released; write the results back into `out`.
         match ok {
             Some(()) => {
-                let sink = tile_results.into_inner().expect("tile_results mutex poisoned");
+                let sink = tile_results
+                    .into_inner()
+                    .expect("tile_results mutex poisoned");
                 for (idx, mat) in sink {
                     out[idx] = Some(mat);
                 }

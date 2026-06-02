@@ -502,7 +502,12 @@ pub struct FamilyLinearizationState<'a> {
 pub trait BlockEffectiveJacobian: Send + Sync {
     /// Stacked multi-output Jacobian at the current β.
     ///
-    /// Shape: `(n_rows * n_outputs, p_block)`.
+    /// Shape: `(n_rows * n_outputs, p_block)`, **channel-major**: rows
+    /// `r * n_rows .. (r + 1) * n_rows` carry output channel `r`'s row
+    /// Jacobian, so `stacked[r * n_rows + i, j]` is observation `i`'s row at
+    /// output `r` and coefficient column `j`.  Every consumer that destacks
+    /// this matrix (audit, canonicaliser, fit) relies on this layout — see
+    /// `BlockJacobianAsRowOp::from_callback` for the destacking transpose.
     /// For `n_outputs = 1` this is identical to the `(n_rows, p_block)` effective
     /// design used by the flat identifiability audit.
     fn effective_jacobian_at(

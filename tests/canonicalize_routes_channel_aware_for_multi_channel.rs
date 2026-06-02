@@ -292,6 +292,77 @@ fn channel_aware_audit_flags_fatal_for_same_channel_alias() {
     }
 }
 
+// ── Regression: K=2 location-scale orthogonal channels must remain full rank ────
+//
+// AdditiveBlockJacobian emits channel-major (n_outputs * n, p) rows:
+// `[output_0_rows; output_1_rows; …]`. The pre-fit audit's
+// `BlockJacobianAsRowOp::from_callback` destacks that into `(n, p, k)`. When
+// the destacker reads with the wrong layout, each block's design rows are
+// scattered into the wrong channels (and the wrong observations), the joint
+// W collapses to roughly half rank, and the channel-aware audit refuses the
+// fit with "0 dropped column(s) … no per-column attribution". This
+// regression test exercises the K=2 case (location-scale GAMLSS) directly:
+// two blocks with the same Duchon design, each owning one of the two
+// channels. Under the correct destacking, the channel-aware audit must keep
+// every column (joint rank = 2·p) — under the buggy interleaved destacking,
+// it would see joint rank ≈ p and FATAL.
+#[test]
+fn k2_orthogonal_channel_blocks_keep_all_columns() {
+    let x = linspace(N);
+    let p = 5;
+    let m = duchon_basis(&x, p);
+    const K2: usize = 2;
+    let specs = [
+        spec_with_callback("location", m.clone(), 0, K2),
+        spec_with_callback("scale", m.clone(), 1, K2),
+    ];
+    let canon = canonicalize_for_identifiability(&specs)
+        .expect("K=2 orthogonal-channel case must succeed (full rank)");
+    assert!(
+        canon.used_channel_aware_audit,
+        "must use channel-aware audit for K=2 multi-output blocks",
+    );
+    assert!(
+        !canon.audit.fatal,
+        "K=2 orthogonal-channel case must NOT be fatal; summary: {}",
+        canon.audit.summary,
+    );
+    assert!(
+        canon.audit.dropped_columns.is_empty(),
+        "no columns should be dropped for K=2 orthogonal-channel blocks; dropped: {:?}",
+        canon.audit.dropped_columns,
+    );
+    let total_kept: usize = canon.audit.blocks.iter().map(|b| b.effective_dim).sum();
+    assert_eq!(
+        total_kept,
+        2 * p,
+        "K=2 orthogonal-channel case must retain 2*p={} columns; got {total_kept}",
+        2 * p,
+    );
+}
+
+// ── Regression: K=2 same-channel alias must still be detected after destacking fix
+#[test]
+fn k2_same_channel_alias_is_fatal() {
+    // Two blocks contributing to the same channel (own_output = 0) with the
+    // same design must be flagged as a fatal alias by the channel-aware
+    // audit. This guards against the destacking fix accidentally hiding
+    // real aliases.
+    let x = linspace(N);
+    let p = 3;
+    let m = duchon_basis(&x, p);
+    const K2: usize = 2;
+    let specs = [
+        spec_with_callback("a", m.clone(), 0, K2),
+        spec_with_callback("b", m.clone(), 0, K2),
+    ];
+    let result = canonicalize_for_identifiability(&specs);
+    assert!(
+        result.is_err(),
+        "K=2 same-channel alias must be refused by the channel-aware audit",
+    );
+}
+
 // ── Instrumentation smoke test: both audits comparable, log discrepancy visible ─
 
 #[test]

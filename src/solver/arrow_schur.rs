@@ -1200,7 +1200,8 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
         // CPU loop: a barely-PD but ill-conditioned block forces the whole batch
         // back onto the per-row path so its ridge can lift, never silently using
         // a contaminated factor.
-        if let Some(batched) = try_factor_blocks_batched(rows, ridge_t, d, tolerate_ill_conditioning)
+        if let Some(batched) =
+            try_factor_blocks_batched(rows, ridge_t, d, tolerate_ill_conditioning)
         {
             return Ok(batched);
         }
@@ -4963,14 +4964,8 @@ fn tile_schur_partial<B: BatchedBlockSolver>(
     let mut factors: Vec<(Array2<f64>, Array2<f64>)> = Vec::with_capacity(range.len());
     let mut total_d = 0usize;
     for i in range.clone() {
-        let (left, right) = row_schur_contribution_factors(
-            sys,
-            i,
-            &sys.rows[i],
-            &htt_factors[i],
-            backend,
-            kind,
-        );
+        let (left, right) =
+            row_schur_contribution_factors(sys, i, &sys.rows[i], &htt_factors[i], backend, kind);
         total_d += left.nrows();
         factors.push((left, right));
     }
@@ -4984,15 +4979,17 @@ fn tile_schur_partial<B: BatchedBlockSolver>(
         let mut base = 0usize;
         for (left, right) in &factors {
             let di = left.nrows();
-            left_stack.slice_mut(ndarray::s![base..base + di, ..]).assign(left);
-            right_stack.slice_mut(ndarray::s![base..base + di, ..]).assign(right);
+            left_stack
+                .slice_mut(ndarray::s![base..base + di, ..])
+                .assign(left);
+            right_stack
+                .slice_mut(ndarray::s![base..base + di, ..])
+                .assign(right);
             base += di;
         }
-        if let Some(product) = crate::gpu::try_fast_atb_on_ordinal(
-            ordinal,
-            left_stack.view(),
-            right_stack.view(),
-        ) {
+        if let Some(product) =
+            crate::gpu::try_fast_atb_on_ordinal(ordinal, left_stack.view(), right_stack.view())
+        {
             return product.mapv(|v| -v);
         }
     }
@@ -5003,29 +5000,6 @@ fn tile_schur_partial<B: BatchedBlockSolver>(
         backend.block_gemm_subtract(&mut partial, left, right);
     }
     partial
-}
-
-/// Bind the given device ordinal's CUDA context to the current worker thread so
-/// the per-row GPU GEMM shims issued from it offload to that device. A missing
-/// context or bind failure leaves the shims to no-op to CPU — the math is
-/// unchanged — so the result is intentionally consumed without escalation. On
-/// non-Linux builds there are no CUDA contexts; the ordinal is accepted so the
-/// multi-device fan-out compiles identically across platforms.
-#[cfg(target_os = "linux")]
-fn bind_tile_device(ordinal: usize) {
-    if let Some(ctx) = crate::gpu::runtime::cuda_context_for(ordinal) {
-        if ctx.bind_to_thread().is_err() {
-            // Fall through: this tile reduces on the CPU.
-        }
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn bind_tile_device(ordinal: usize) {
-    // No CUDA contexts off Linux; the ordinal must still be a real pool
-    // ordinal, which `usize` always satisfies — asserting it keeps the
-    // parameter live so the cross-platform signature carries no dead binding.
-    assert!(ordinal < usize::MAX);
 }
 
 /// Reduce the per-row Schur contributions `Σ_i H_tβ^(i)ᵀ (H_tt^(i))⁻¹ H_tβ^(i)`
@@ -5063,15 +5037,7 @@ fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
     let Some(tiles) = tiles else {
         // Single-device / CPU: reduce serially in place (original order).
         for (i, row) in sys.rows.iter().enumerate() {
-            subtract_row_schur_contribution(
-                sys,
-                i,
-                row,
-                &htt_factors[i],
-                backend,
-                kind,
-                schur,
-            );
+            subtract_row_schur_contribution(sys, i, row, &htt_factors[i], backend, kind, schur);
         }
         return;
     };
@@ -5089,7 +5055,21 @@ fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
                 let ordinal = *ordinal;
                 let range = range.clone();
                 scope.spawn(move || {
-                    bind_tile_device(ordinal);
+                    // Bind this ordinal's CUDA context on this worker thread so
+                    // the per-row GPU GEMM shims issued from `tile_schur_partial`
+                    // offload to that device. A missing context or bind failure
+                    // is intentionally consumed without escalation — the shims
+                    // no-op back to CPU and the math is unchanged. Off Linux
+                    // `GpuRuntime::global()` is always `None`, so this branch
+                    // is unreachable and the bind is omitted entirely.
+                    #[cfg(target_os = "linux")]
+                    {
+                        if let Some(ctx) = crate::gpu::runtime::cuda_context_for(ordinal) {
+                            if ctx.bind_to_thread().is_err() {
+                                // Fall through: this tile reduces on the CPU.
+                            }
+                        }
+                    }
                     tile_schur_partial(sys, htt_factors, backend, kind, ordinal, range)
                 })
             })
