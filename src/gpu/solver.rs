@@ -617,6 +617,29 @@ mod cuda {
         })
     }
 
+    /// Bind a specific device ordinal's cached context on the calling thread and
+    /// open a fresh stream on it. This is the per-ordinal entry point used by
+    /// multi-GPU fan-out (`crate::gpu::pool::scatter_batched` workers) so a
+    /// Cholesky / TRSM can target the device the worker thread owns. The
+    /// primary-device convenience wrapper [`context_and_stream`] calls this with
+    /// the probe-selected ordinal.
+    pub(crate) fn context_and_stream_for(
+        ordinal: usize,
+    ) -> Result<
+        (
+            std::sync::Arc<CudaContext>,
+            std::sync::Arc<cudarc::driver::CudaStream>,
+        ),
+        String,
+    > {
+        let ctx = super::super::runtime::cuda_context_for(ordinal)
+            .ok_or_else(|| format!("cuda context for ordinal {ordinal} unavailable"))?;
+        ctx.bind_to_thread()
+            .map_err(|e| format!("cuda context bind_to_thread: {e}"))?;
+        let stream = ctx.new_stream().map_err(|e| format!("cuda stream: {e}"))?;
+        Ok((ctx, stream))
+    }
+
     pub(crate) fn context_and_stream() -> Result<
         (
             std::sync::Arc<CudaContext>,
@@ -632,13 +655,7 @@ mod cuda {
         // ordinal 0 even when the runtime probe chose a different device.
         let runtime = super::super::runtime::GpuRuntime::global()
             .ok_or_else(|| "cuda runtime unavailable".to_string())?;
-        let ordinal = runtime.selected_device().ordinal;
-        let ctx = super::super::runtime::cuda_context_for(ordinal)
-            .ok_or_else(|| format!("cuda context for ordinal {ordinal} unavailable"))?;
-        ctx.bind_to_thread()
-            .map_err(|e| format!("cuda context bind_to_thread: {e}"))?;
-        let stream = ctx.new_stream().map_err(|e| format!("cuda stream: {e}"))?;
-        Ok((ctx, stream))
+        context_and_stream_for(runtime.selected_device().ordinal)
     }
 
     pub(crate) fn pinned_htod<
