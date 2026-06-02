@@ -457,6 +457,23 @@ struct SummaryCoefficientRow {
     std_error: Option<f64>,
 }
 
+/// Per-smooth significance row for the FFI summary — the canonical mgcv
+/// `summary.gam` smooth-term table (`edf`, reference d.f., test statistic, and
+/// p-value). Random-effect smooths report only `edf` (their boundary
+/// variance-component test is not a Wald χ²); penalized smooth terms carry the
+/// Wood (2013) rank-truncated Wald `chi_sq` / `p_value`. The shape mirrors the
+/// CLI's `SmoothTermSummary`.
+#[derive(Serialize)]
+struct SummarySmoothTermRow {
+    name: String,
+    edf: f64,
+    ref_df: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chi_sq: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    p_value: Option<f64>,
+}
+
 #[derive(Serialize)]
 struct SummaryPayload {
     formula: String,
@@ -476,6 +493,12 @@ struct SummaryPayload {
     edf_total: Option<f64>,
     lambdas: Vec<f64>,
     coefficients: Vec<SummaryCoefficientRow>,
+    /// Per-smooth significance table (mgcv-style). Empty when the model has no
+    /// smooth/random-effect terms or when the design could not be reconstructed
+    /// to recover the per-term coefficient blocks (e.g. a model saved without
+    /// `resolved_termspec` / training feature ranges).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    smooth_terms: Vec<SummarySmoothTermRow>,
     covariance_kind: Option<String>,
     covariance_n: Option<usize>,
     covariance_flat: Option<Vec<f64>>,
@@ -1275,6 +1298,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "torch_from_fitted",
             "predict",
             "predict_array",
+            "predict_conformal",
             "build_predict_payload_json",
             "interpolate_survival_surface",
             "survival_chunk_iter_collect",
@@ -3041,6 +3065,38 @@ fn predict_table(
 ) -> PyResult<String> {
     detach_py_result(py, "predict_table", move || {
         predict_table_impl(&model_bytes, headers, rows, options_json.as_deref())
+    })
+}
+
+/// Distribution-free conformal prediction intervals (issue #310 family path).
+///
+/// Runs the standard model-based predictor on `(headers, rows)`, then replaces
+/// the response-scale `mean_lower` / `mean_upper` with the split-conformal
+/// interval `μ̂(x) ± q̂·s(x)` calibrated at `conformal_level` from the held-out
+/// `(calibration_headers, calibration_rows)` fold — which must contain the
+/// response column. The returned interval carries finite-sample marginal
+/// coverage `≥ conformal_level` regardless of model misspecification.
+#[pyfunction(signature = (model_bytes, headers, rows, calibration_headers, calibration_rows, conformal_level, options_json=None))]
+fn predict_table_conformal(
+    py: Python<'_>,
+    model_bytes: Vec<u8>,
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    calibration_headers: Vec<String>,
+    calibration_rows: Vec<Vec<String>>,
+    conformal_level: f64,
+    options_json: Option<String>,
+) -> PyResult<String> {
+    detach_py_result(py, "predict_table_conformal", move || {
+        predict_table_conformal_impl(
+            &model_bytes,
+            headers,
+            rows,
+            calibration_headers,
+            calibration_rows,
+            conformal_level,
+            options_json.as_deref(),
+        )
     })
 }
 
@@ -22618,6 +22674,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(build_predict_payload_json, module)?)?;
     module.add_function(wrap_pyfunction!(build_model_predict_payload_json, module)?)?;
     module.add_function(wrap_pyfunction!(predict_table, module)?)?;
+    module.add_function(wrap_pyfunction!(predict_table_conformal, module)?)?;
     module.add_function(wrap_pyfunction!(predict_array, module)?)?;
     module.add_function(wrap_pyfunction!(competing_risks_cif, module)?)?;
     module.add_function(wrap_pyfunction!(
@@ -24651,6 +24708,185 @@ fn predict_columns(
     Ok(columns)
 }
 
+/// Residual dispersion `φ̂` for the conformal calibration scale, mirroring the
+/// CLI/summary convention: Gaussian → σ̂², Gamma → fixed φ (else 1/σ̂ as the
+/// reciprocal-dispersion proxy), every other family → 1.0 (φ fixed at 1).
+fn conformal_dispersion_phi(fit: &UnifiedFitResult, family: &LikelihoodSpec) -> f64 {
+    match family.response {
+        ResponseFamily::Gaussian => fit.standard_deviation * fit.standard_deviation,
+        ResponseFamily::Gamma => fit.likelihood_scale.fixed_phi().unwrap_or_else(|| {
+            if fit.standard_deviation.is_finite() && fit.standard_deviation > 0.0 {
+                1.0 / fit.standard_deviation
+            } else {
+                1.0
+            }
+        }),
+        _ => 1.0,
+    }
+}
+
+/// Build the held-out calibration data needed by the conformal calibrator: the
+/// calibration design `X_cal`, its linear predictor `η_cal = X_cal·β̂ + offset`,
+/// the offset, and the calibration response `y_cal`. The response column is
+/// resolved from the saved formula and must be present in the calibration
+/// dataset (calibration is *labeled* held-out data, unlike a predict batch).
+fn conformal_calibration_arrays(
+    model: &FittedModel,
+    fit: &UnifiedFitResult,
+    calibration: EncodedDataset,
+) -> Result<(Array2<f64>, Array1<f64>, Array1<f64>, Array1<f64>), String> {
+    if !matches!(model.predict_model_class(), PredictModelClass::Standard) {
+        return Err(format!(
+            "conformal calibration currently supports only standard GAM models; got '{}'",
+            prediction_model_class_label(model)
+        ));
+    }
+    let col_map = calibration.column_map();
+    let offset = resolve_offset_column(&calibration, &col_map, model.offset_column.as_deref())?;
+    let response_name = response_column_name(&model.payload().formula).ok_or_else(|| {
+        "conformal calibration: could not resolve the response column from the saved formula"
+            .to_string()
+    })?;
+    let response_col = *col_map.get(&response_name).ok_or_else(|| {
+        format!(
+            "conformal calibration data must contain the response column '{response_name}' \
+             (calibration is held-out labeled data)"
+        )
+    })?;
+    let y = calibration.values.column(response_col).to_owned();
+    // Design and β̂ define the (on the calibration fold) linear predictor
+    // η = X·β̂ + offset, which `from_fit` maps through ALO into genuine
+    // held-out predictors for the nonconformity scores.
+    let design = design_matrix_dense(model, calibration)?;
+    if design.ncols() != fit.beta.len() {
+        return Err(format!(
+            "conformal calibration design has {} columns but the fit has {} coefficients",
+            design.ncols(),
+            fit.beta.len()
+        ));
+    }
+    let eta = design.dot(&fit.beta) + &offset;
+    Ok((design, eta, offset, y))
+}
+
+/// Conformal-calibrated prediction columns. Runs the model-based full-
+/// uncertainty predictor on the test `dataset` (honouring `covariance_mode` /
+/// `observation_interval`), then replaces the response-scale `mean_lower` /
+/// `mean_upper` with the split-conformal interval calibrated from the supplied
+/// held-out `calibration` fold at the level in `options.conformal_level`.
+fn predict_columns_conformal(
+    model: &FittedModel,
+    dataset: EncodedDataset,
+    calibration: EncodedDataset,
+    options: &PyPredictOptions,
+) -> Result<BTreeMap<String, Vec<f64>>, String> {
+    let Some(level) = options.conformal_level else {
+        return Err("conformal prediction requires conformal_level in (0, 1)".to_string());
+    };
+    if !matches!(model.predict_model_class(), PredictModelClass::Standard) {
+        return Err(format!(
+            "conformal prediction currently supports only standard GAM models; got '{}'",
+            prediction_model_class_label(model)
+        ));
+    }
+    let col_map = dataset.column_map();
+    let offset = resolve_offset_column(&dataset, &col_map, model.offset_column.as_deref())?;
+    let offset_noise =
+        resolve_offset_column(&dataset, &col_map, model.noise_offset_column.as_deref())?;
+    let predict_input = build_predict_input_for_model(
+        model,
+        dataset.values.view(),
+        &col_map,
+        model.training_headers.as_ref(),
+        &offset,
+        &offset_noise,
+        false,
+    )?;
+    let predictor = model
+        .predictor()
+        .ok_or_else(|| "saved model could not construct a predictor".to_string())?;
+    let fit = fit_result_from_saved_model_for_prediction(model)?;
+    let family = model_likelihood_spec(model);
+
+    let covariance_mode = parse_covariance_mode(options.covariance_mode.as_deref())?
+        .unwrap_or(gam::predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred);
+    let uncertainty_options = gam::predict::PredictUncertaintyOptions {
+        confidence_level: level,
+        covariance_mode,
+        mean_interval_method: gam::predict::MeanIntervalMethod::TransformEta,
+        includeobservation_interval: options.observation_interval.unwrap_or(false),
+        apply_bias_correction: false,
+        conformal_level: Some(level),
+        ..gam::predict::PredictUncertaintyOptions::default()
+    };
+
+    let (cal_design, cal_eta, cal_offset, cal_y) =
+        conformal_calibration_arrays(model, &fit, calibration)?;
+    let phi = conformal_dispersion_phi(&fit, &family);
+    let train = gam::predict::ConformalTrainingData {
+        design: &cal_design,
+        eta: &cal_eta,
+        offset: &cal_offset,
+        y: cal_y.view(),
+        phi,
+    };
+    let prediction = gam::predict::predict_full_uncertainty_conformal(
+        predictor.as_ref(),
+        &predict_input,
+        &fit,
+        &family,
+        &uncertainty_options,
+        &train,
+    )
+    .map_err(|err| format!("conformal prediction failed: {err}"))?;
+
+    let mut columns = BTreeMap::<String, Vec<f64>>::new();
+    columns.insert("linear_predictor".to_string(), prediction.eta.to_vec());
+    columns.insert("mean".to_string(), prediction.mean.to_vec());
+    columns.insert(
+        "std_error".to_string(),
+        prediction.eta_standard_error.to_vec(),
+    );
+    // mean_lower / mean_upper now carry the distribution-free conformal bounds.
+    columns.insert("mean_lower".to_string(), prediction.mean_lower.to_vec());
+    columns.insert("mean_upper".to_string(), prediction.mean_upper.to_vec());
+    if let (Some(obs_lower), Some(obs_upper)) =
+        (prediction.observation_lower, prediction.observation_upper)
+    {
+        columns.insert("observation_lower".to_string(), obs_lower.to_vec());
+        columns.insert("observation_upper".to_string(), obs_upper.to_vec());
+    }
+    Ok(columns)
+}
+
+fn predict_table_conformal_impl(
+    model_bytes: &[u8],
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    calibration_headers: Vec<String>,
+    calibration_rows: Vec<Vec<String>>,
+    conformal_level: f64,
+    options_json: Option<&str>,
+) -> Result<String, String> {
+    let model = load_model_impl(model_bytes)?;
+    let mut options = parse_predict_options(options_json)?;
+    if !(conformal_level.is_finite() && conformal_level > 0.0 && conformal_level < 1.0) {
+        return Err(format!(
+            "conformal_level must be in (0, 1), got {conformal_level}"
+        ));
+    }
+    options.conformal_level = Some(conformal_level);
+    let dataset = dataset_with_model_schema(&model, &headers, &rows)?;
+    drop(rows);
+    drop(headers);
+    let calibration = dataset_with_model_schema(&model, &calibration_headers, &calibration_rows)?;
+    drop(calibration_rows);
+    drop(calibration_headers);
+    let columns = predict_columns_conformal(&model, dataset, calibration, &options)?;
+    serde_json::to_string(&PredictionPayload { columns })
+        .map_err(|err| format!("failed to serialize conformal prediction payload: {err}"))
+}
+
 fn columns_to_array(columns: BTreeMap<String, Vec<f64>>) -> Result<Array2<f64>, String> {
     let ordered = ordered_prediction_column_values(&columns);
     let n_cols = ordered.len();
@@ -26463,9 +26699,154 @@ fn cross_fit_shared_precision_groups_json_impl(request_json: &str) -> Result<Str
         .map_err(|err| format!("failed to serialize shared precision result: {err}"))
 }
 
+/// Synthesize a small representative data matrix from saved per-axis training
+/// ranges, used only to rebuild the design *structure* (per-term coefficient
+/// ranges, nullspace dimensions, penalty counts) for the summary smooth-term
+/// table. The basis layout these fields describe is fixed by the frozen
+/// `resolved_termspec`, not by the data values, so axis-spanning midpoints
+/// reproduce the training-time block layout deterministically while remaining
+/// inside the training bounding box (no extrapolation artefacts).
+fn representative_data_from_ranges(ranges: &[(f64, f64)]) -> Array2<f64> {
+    const REP_ROWS: usize = 16;
+    let n_cols = ranges.len();
+    let mut data = Array2::<f64>::zeros((REP_ROWS, n_cols));
+    for (col, &(lo, hi)) in ranges.iter().enumerate() {
+        let (lo, hi) = if lo.is_finite() && hi.is_finite() && hi >= lo {
+            (lo, hi)
+        } else {
+            (0.0, 1.0)
+        };
+        for row in 0..REP_ROWS {
+            let frac = if REP_ROWS > 1 {
+                row as f64 / (REP_ROWS - 1) as f64
+            } else {
+                0.5
+            };
+            data[[row, col]] = lo + frac * (hi - lo);
+        }
+    }
+    data
+}
+
+/// Build the mgcv-style per-smooth significance table for the FFI summary.
+///
+/// Mirrors `main.rs::build_model_summary`'s smooth-term loop: random-effect
+/// smooths report `edf` only (their boundary variance-component test is not a
+/// Wald χ²); penalized smooth terms get the Wood (2013) rank-truncated Wald
+/// statistic and p-value from [`gam::inference::smooth_test::wood_smooth_test`].
+///
+/// Returns an empty vector (rather than erroring) when the design cannot be
+/// rebuilt — e.g. a model saved without `resolved_termspec` or training feature
+/// ranges — so `summary()` always succeeds and simply omits the table when the
+/// information needed to compute it honestly is not available.
+fn summary_smooth_terms(model: &FittedModel, fit: &UnifiedFitResult) -> Vec<SummarySmoothTermRow> {
+    use gam::inference::smooth_test::{SmoothTestInput, SmoothTestScale, wood_smooth_test};
+    use gam::smooth::ShapeConstraint;
+
+    let payload = model.payload();
+    let Some(spec) = payload.resolved_termspec.as_ref() else {
+        return Vec::new();
+    };
+    if spec.validate_frozen("resolved_termspec").is_err() {
+        return Vec::new();
+    }
+    let Some(ranges) = payload.training_feature_ranges.as_ref() else {
+        return Vec::new();
+    };
+    let Some(headers) = payload.training_headers.as_ref() else {
+        return Vec::new();
+    };
+    if ranges.len() != headers.len() {
+        return Vec::new();
+    }
+    let data = representative_data_from_ranges(ranges);
+    let Ok(design) = gam::smooth::build_term_collection_design(data.view(), spec) else {
+        return Vec::new();
+    };
+
+    let cov_forwald = fit.beta_covariance_corrected().or_else(|| fit.beta_covariance());
+    let family = model.likelihood();
+    let scale_is_estimated = matches!(
+        family.response,
+        ResponseFamily::Gaussian | ResponseFamily::Gamma
+    );
+    // n (for the F-distribution denominator) comes from the saved working-set
+    // geometry when present; the Wald χ² (Known-scale) branch never reads it.
+    let n_obs = fit
+        .geometry
+        .as_ref()
+        .map(|geom| geom.working_response.len() as f64);
+    let residual_df = n_obs
+        .map(|n| (n - fit.edf_total().unwrap_or(fit.beta.len() as f64)).max(1.0))
+        .unwrap_or(f64::NAN);
+    let dispersion_phi = conformal_dispersion_phi(fit, &family);
+    let scale = if scale_is_estimated {
+        SmoothTestScale::Estimated
+    } else {
+        SmoothTestScale::Known
+    };
+
+    let mut out = Vec::<SummarySmoothTermRow>::new();
+    let mut penalty_cursor = 0usize;
+    for (name, _range) in &design.random_effect_ranges {
+        let edf = fit.edf_by_block().get(penalty_cursor).copied().unwrap_or(0.0);
+        penalty_cursor += 1;
+        // Random-effect smooths are boundary variance-component tests; a naive
+        // coefficient Wald χ² is anti-conservative, so only EDF is reported.
+        out.push(SummarySmoothTermRow {
+            name: name.clone(),
+            edf,
+            ref_df: edf.max(0.0),
+            chi_sq: None,
+            p_value: None,
+        });
+    }
+    for term in &design.smooth.terms {
+        let k = term.penalties_local.len();
+        let edf = fit
+            .edf_by_block()
+            .get(penalty_cursor..penalty_cursor + k)
+            .map(|block| block.iter().sum::<f64>())
+            .unwrap_or(0.0);
+        penalty_cursor += k;
+        let smooth_test = if term.shape == ShapeConstraint::None {
+            cov_forwald.and_then(|cov| {
+                wood_smooth_test(SmoothTestInput {
+                    beta: fit.beta.view(),
+                    covariance: cov,
+                    influence_matrix: fit.coefficient_influence(),
+                    coeff_range: term.coeff_range.clone(),
+                    edf,
+                    nullspace_dim: term.nullspace_dims.iter().copied().sum::<usize>(),
+                    dispersion: dispersion_phi,
+                    residual_df,
+                    scale,
+                })
+            })
+        } else {
+            None
+        };
+        let chi_sq = smooth_test.as_ref().map(|test| test.statistic);
+        let ref_df = smooth_test
+            .as_ref()
+            .map(|test| test.ref_df)
+            .unwrap_or(edf.max(0.0));
+        let p_value = smooth_test.as_ref().map(|test| test.p_value);
+        out.push(SummarySmoothTermRow {
+            name: term.name.clone(),
+            edf,
+            ref_df,
+            chi_sq,
+            p_value,
+        });
+    }
+    out
+}
+
 fn summary_json_impl(model_bytes: &[u8]) -> Result<String, String> {
     let model = load_model_impl(model_bytes)?;
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
+    let smooth_terms = summary_smooth_terms(&model, &fit);
     let standard_errors = fit
         .beta_standard_errors_corrected()
         .or_else(|| fit.beta_standard_errors());
@@ -26500,6 +26881,7 @@ fn summary_json_impl(model_bytes: &[u8]) -> Result<String, String> {
         edf_total: fit.edf_total(),
         lambdas: fit.lambdas.to_vec(),
         coefficients,
+        smooth_terms,
         covariance_kind: covariance.as_ref().map(|(kind, _)| kind.clone()),
         covariance_n: covariance.as_ref().map(|(_, cov)| cov.nrows()),
         covariance_flat: covariance.map(|(_, cov)| cov.iter().copied().collect()),

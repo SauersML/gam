@@ -46,6 +46,8 @@ class Model:
         data: Any,
         *,
         interval: float | None = None,
+        covariance_mode: str | None = None,
+        observation_interval: bool = False,
         return_type: str | None = None,
         id_column: str | None = None,
     ) -> Any:
@@ -68,6 +70,23 @@ class Model:
             collapsed the previous overlapping ``with_uncertainty`` boolean
             into this single flag (use ``interval=0.95`` for the SE-only
             case).
+        covariance_mode : {"conditional", "smoothing", "required"}, optional
+            Posterior covariance source for the interval (CLI<->Python parity
+            with ``gam predict --covariance-mode``). ``"conditional"`` uses the
+            conditional posterior ``H^{-1}`` only; ``"smoothing"`` (the
+            default when ``None``) prefers the first-order smoothing-corrected
+            covariance ``H^{-1} + J Var(rho_hat) J^T`` and falls back to
+            conditional when it is unavailable; ``"required"`` demands the
+            smoothing correction and errors if it cannot be formed. Only read
+            when ``interval`` is set on an effectively-linear model (the
+            delta-method interval path).
+        observation_interval : bool, default False
+            When ``True`` (and ``interval`` is set), the output also gains
+            ``observation_lower`` / ``observation_upper`` columns — the
+            response-scale *prediction* interval
+            ``Var(y_new|x) = Var(mu_hat) + Var(Y|mu)`` — for families that
+            support it. The credible ``mean_lower`` / ``mean_upper`` are left
+            untouched.
         return_type : {"dict", "pandas", "numpy", "polars", "pyarrow", "list"}, optional
             Force a specific output container. ``None`` (default) mirrors the
             shape of ``data`` (and the training table where unambiguous).
@@ -123,7 +142,12 @@ class Model:
         headers, rows, table_kind = normalize_table(data)
         row_ids = extract_row_ids(headers, rows, id_column)
         opts_json = rust_module().build_model_predict_payload_json(
-            self._model_bytes, headers, rows, interval
+            self._model_bytes,
+            headers,
+            rows,
+            interval,
+            covariance_mode,
+            observation_interval,
         )
         try:
             raw = rust_module().predict_table(
@@ -151,6 +175,8 @@ class Model:
         X: Any,
         *,
         interval: float | None = None,
+        covariance_mode: str | None = None,
+        observation_interval: bool = False,
     ) -> Any:
         """Predict directly from a numeric NumPy-compatible feature matrix.
 
@@ -164,17 +190,110 @@ class Model:
         would misorder swapped columns and produce wrong predictions.
 
         ``interval`` is the single uncertainty knob (issue #342); see
-        :meth:`predict` for its semantics.
+        :meth:`predict` for its semantics. ``covariance_mode`` and
+        ``observation_interval`` mirror :meth:`predict` (CLI<->Python parity
+        with ``gam predict --covariance-mode``).
         """
+        options: dict[str, Any] = {"interval": interval}
+        if covariance_mode is not None:
+            options["covariance_mode"] = covariance_mode
+        if observation_interval:
+            options["observation_interval"] = observation_interval
         try:
             rust = rust_module()
             return rust.predict_array(
                 self._model_bytes,
                 rust.numeric_matrix_f64(X, "X"),
-                json.dumps({"interval": interval}),
+                json.dumps(options),
             )
         except Exception as exc:
             raise map_exception(exc) from exc
+
+    def predict_conformal(
+        self,
+        data: Any,
+        *,
+        calibration: Any,
+        conformal_level: float,
+        covariance_mode: str | None = None,
+        observation_interval: bool = False,
+        return_type: str | None = None,
+        id_column: str | None = None,
+    ) -> Any:
+        """Predict with distribution-free conformal prediction intervals.
+
+        Runs the standard predictor on ``data``, then REPLACES the
+        response-scale ``mean_lower`` / ``mean_upper`` columns with the
+        split-conformal interval ``mu_hat(x) +/- q_hat * s(x)`` calibrated at
+        ``conformal_level`` from the held-out ``calibration`` fold. The
+        resulting interval carries finite-sample marginal coverage
+        ``>= conformal_level`` regardless of model misspecification.
+
+        Parameters
+        ----------
+        data : table-like
+            Test inputs to predict, in any format accepted by
+            :meth:`predict`. Must cover every predictor in the formula.
+        calibration : table-like
+            Held-out *labeled* calibration fold (not used in fitting). Must
+            contain the response column in addition to the predictors; the
+            conformal multiplier ``q_hat`` is computed from this fold's
+            approximate-leave-one-out residuals.
+        conformal_level : float
+            Target marginal coverage in ``(0, 1)`` (e.g. ``0.9``).
+        covariance_mode : {"conditional", "smoothing", "required"}, optional
+            Covariance source for the per-point scale ``s(x)``; see
+            :meth:`predict`.
+        observation_interval : bool, default False
+            Also emit ``observation_lower`` / ``observation_upper`` columns;
+            see :meth:`predict`.
+        return_type, id_column
+            As in :meth:`predict`.
+
+        Returns
+        -------
+        table
+            A table with ``linear_predictor``, ``mean``, ``std_error``, and
+            the conformal ``mean_lower`` / ``mean_upper`` columns. Currently
+            supported for standard GAM models only.
+        """
+        headers, rows, table_kind = normalize_table(data)
+        cal_headers, cal_rows, _ = normalize_table(calibration)
+        row_ids = extract_row_ids(headers, rows, id_column)
+        opts_json = rust_module().build_model_predict_payload_json(
+            self._model_bytes,
+            headers,
+            rows,
+            conformal_level,
+            covariance_mode,
+            observation_interval,
+        )
+        try:
+            raw = rust_module().predict_table_conformal(
+                self._model_bytes,
+                headers,
+                rows,
+                cal_headers,
+                cal_rows,
+                conformal_level,
+                opts_json,
+            )
+        except Exception as exc:
+            raise map_exception(exc) from exc
+        return shape_predict_response(
+            raw,
+            headers=headers,
+            rows=rows,
+            table_kind=table_kind,
+            training_table_kind=self._training_table_kind,
+            fallback_model_class=self._model_class_from_payload(),
+            fallback_family=self._family_from_payload(),
+            interval=conformal_level,
+            return_type=return_type,
+            id_column=id_column,
+            row_ids=row_ids,
+            restore=restore_output_table,
+        )
 
     def summary(self) -> Summary:
         """Return the model summary (coefficients, family, deviance, REML score)."""
