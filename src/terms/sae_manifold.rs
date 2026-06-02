@@ -6164,7 +6164,6 @@ fn batched_smooth_sb(
         // atom indices; `scatter_batched` slices it per device ordinal.
         let mut items: Vec<usize> = members.clone();
         let s_ref = &s_mats;
-        let out_ptr = &mut out;
         // Collect per-tile results into a side channel keyed by atom index, then
         // splice them in after scatter completes (scatter's closure borrows
         // `items` immutably-per-tile and must stay `Sync`).
@@ -6200,17 +6199,19 @@ fn batched_smooth_sb(
             }
             Some(())
         });
+        // The scatter closure has returned, so all borrows of `items`/`s_mats`/
+        // `tile_results` are released; write the results back into `out`.
         match ok {
             Some(()) => {
                 let sink = tile_results.into_inner().expect("tile_results mutex poisoned");
                 for (idx, mat) in sink {
-                    out_ptr[idx] = Some(mat);
+                    out[idx] = Some(mat);
                 }
                 // Any member a tile silently skipped (cannot happen with the
                 // contract, but keep the result total) falls back to CPU.
                 for &idx in &members {
-                    if out_ptr[idx].is_none() {
-                        out_ptr[idx] = Some(cpu_one(idx));
+                    if out[idx].is_none() {
+                        out[idx] = Some(cpu_one(idx));
                     }
                 }
             }
