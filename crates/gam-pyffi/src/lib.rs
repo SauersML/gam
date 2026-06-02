@@ -6016,7 +6016,6 @@ fn gaussian_reml_fit_blocks_orthogonal_forward<'py>(
     Ok(out.unbind())
 }
 
-
 /// Analytic backward for the multi-block per-smooth-λ Gaussian REML forward.
 ///
 /// Computes VJPs of (coefficients, fitted, lambdas, log_lambdas, reml_score,
@@ -6442,11 +6441,14 @@ fn gaussian_reml_fit_with_constraints_forward<'py>(
 ///   closed-form Gaussian REML backward. This case delegates to
 ///   `gaussian_reml_multi_closed_form_backward` and produces gradients
 ///   identical to `gaussian_reml_fit_backward` (round-off agreement).
-/// - **Active cert (non-empty active set):** STOPPED per task instructions
-///   (the existing closed-form backward stack is hard-coded to the
-///   unconstrained `GaussianRemlEigenCache`/`reml_hess_rho` and cannot
-///   accept a tangent-wrapped operator without a substantial refactor —
-///   see report). Returns `NotImplementedError`.
+/// - **Active cert (non-empty active set):** reparametrise `β = Z γ` with
+///   `Z = null(A_act)` and run the interior closed-form backward on the
+///   reduced operators `X_Z = X Z`, `S_Z = Zᵀ S Z`, pulling upstream
+///   cotangents through `Z` and lifting the returned gradients back to full
+///   p-space (`grad_X = grad_X_Z · Zᵀ`, `grad_S = Z · grad_S_Z · Zᵀ`). Since
+///   `Z` depends only on the non-differentiable active-constraint geometry,
+///   this is the exact analytic adjoint. Delegates to
+///   `constrained_active_backward`.
 #[pyfunction(signature = (
     x,
     y,
@@ -9700,15 +9702,12 @@ fn sae_manifold_fit_inner<'py>(
     let init_rho = SaeManifoldRho::new(sparsity_strength.ln(), smoothness.ln(), log_ard);
     let init_rho_flat = init_rho.to_flat();
     let n_params = init_rho_flat.len();
-    // Default: route every problem size through the full-batch objective on the
-    // owned `target`. LLM-scale fits (hundreds of millions of rows) would
-    // benefit from a minibatch REML objective so the `(N × M_total)` basis /
-    // `(N × M_total × d)` jacobian / `(N × K)` logit buffers never materialize
-    // in full, but the chunked accumulator that lets `SaeManifoldOuterObjective`
-    // own its rows incrementally is not a drop-in for the full-batch path the
-    // inner Arrow-Schur fit expects. Until that accumulator exists,
-    // `sae_streaming_plan` stays as a standalone diagnostic pyfunction and the
-    // outer-cascade entry point owns the full target verbatim.
+    // Route every problem size through the full-batch objective on the owned
+    // `target`: the inner Arrow-Schur fit materializes the `(N × M_total)`
+    // basis, `(N × M_total × d)` jacobian, and `(N × K)` logit buffers in full,
+    // so the outer-cascade entry point owns the full target verbatim.
+    // `sae_streaming_plan` is exposed separately as a standalone diagnostic
+    // pyfunction.
     let mut objective = gam::terms::sae_manifold::SaeManifoldOuterObjective::new(
         base_term,
         z_view.to_owned(),
@@ -10997,7 +10996,8 @@ fn sae_manifold_fit_minimal<'py>(
         .map(|kind| sae_atom_basis_kind_from_str(kind))
         .collect();
     let seed_coords =
-        gam::terms::sae_manifold::sae_pca_seed_initial_coords(z_view, &basis_kinds, &atom_dim).map_err(py_value_error)?;
+        gam::terms::sae_manifold::sae_pca_seed_initial_coords(z_view, &basis_kinds, &atom_dim)
+            .map_err(py_value_error)?;
     let plans = sae_build_atom_plans(
         z_view,
         &atom_basis,
@@ -11295,7 +11295,8 @@ fn sae_manifold_predict_oos<'py>(
         .map(|kind| sae_atom_basis_kind_from_str(kind))
         .collect();
     let seed_coords =
-        gam::terms::sae_manifold::sae_pca_seed_initial_coords(x_view, &basis_kinds, &atom_dim).map_err(py_value_error)?;
+        gam::terms::sae_manifold::sae_pca_seed_initial_coords(x_view, &basis_kinds, &atom_dim)
+            .map_err(py_value_error)?;
     let mut plans: Vec<SaeAtomBuildPlan> = Vec::with_capacity(k_atoms);
     for atom_idx in 0..k_atoms {
         let kind = basis_kinds[atom_idx].clone();
@@ -25867,7 +25868,9 @@ fn summary_smooth_terms(model: &FittedModel, fit: &UnifiedFitResult) -> Vec<Summ
         return Vec::new();
     };
 
-    let cov_forwald = fit.beta_covariance_corrected().or_else(|| fit.beta_covariance());
+    let cov_forwald = fit
+        .beta_covariance_corrected()
+        .or_else(|| fit.beta_covariance());
     let family = model.likelihood();
     let scale_is_estimated = matches!(
         family.response,
@@ -25892,7 +25895,11 @@ fn summary_smooth_terms(model: &FittedModel, fit: &UnifiedFitResult) -> Vec<Summ
     let mut out = Vec::<SummarySmoothTermRow>::new();
     let mut penalty_cursor = 0usize;
     for (name, _range) in &design.random_effect_ranges {
-        let edf = fit.edf_by_block().get(penalty_cursor).copied().unwrap_or(0.0);
+        let edf = fit
+            .edf_by_block()
+            .get(penalty_cursor)
+            .copied()
+            .unwrap_or(0.0);
         penalty_cursor += 1;
         // Random-effect smooths are boundary variance-component tests; a naive
         // coefficient Wald χ² is anti-conservative, so only EDF is reported.

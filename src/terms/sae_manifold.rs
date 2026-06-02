@@ -7368,12 +7368,12 @@ mod tests {
     fn sphere_chart_jet_matches_fd_at_clamp_boundary() {
         // Latitudes spanning interior, exactly the former boundary, and beyond.
         let coords = array![
-            [std::f64::consts::FRAC_PI_2, 0.4],   // exactly +π/2 (former gate flip)
+            [std::f64::consts::FRAC_PI_2, 0.4], // exactly +π/2 (former gate flip)
             [-std::f64::consts::FRAC_PI_2, -1.1], // exactly -π/2
-            [1.45, 2.0],                          // just below +π/2
-            [1.69, -0.3],                         // just above +π/2
-            [2.3, 0.7],                           // well beyond +π/2
-            [0.35, 0.9],                          // interior control
+            [1.45, 2.0],                        // just below +π/2
+            [1.69, -0.3],                       // just above +π/2
+            [2.3, 0.7],                         // well beyond +π/2
+            [0.35, 0.9],                        // interior control
         ];
 
         let (_, jet) = sphere_chart_basis_jet(coords.view()).unwrap();

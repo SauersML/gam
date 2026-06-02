@@ -1867,7 +1867,7 @@ pub struct ArrowSchurSystem {
 /// matrix-free full-system solve without re-deriving the ρ layout. The penalty
 /// itself is an `Arc`-backed clone (cheap), so capturing it does not copy the
 /// penalty payload.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CrossRowLatentPenalty {
     /// The non-row-block-diagonal Psi penalty (e.g. `TotalVariationPenalty`).
     pub penalty: AnalyticPenaltyKind,
