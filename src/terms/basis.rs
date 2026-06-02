@@ -21776,7 +21776,13 @@ fn apply_identifiability_to_jet(raw_jet: &Array3<f64>, z: &Array2<f64>) -> Array
     let n = raw_jet.shape()[0];
     let k = raw_jet.shape()[1];
     let kp = z.ncols();
-    debug_assert_eq!(z.nrows(), k);
+    assert_eq!(
+        z.nrows(),
+        k,
+        "apply_identifiability_to_jet: identifiability transform rows ({}) must match raw jet basis dim ({})",
+        z.nrows(),
+        k
+    );
     let mut out = Array3::<f64>::zeros((n, kp, 2));
     for axis in 0..2 {
         // raw_axis: (N, K); out_axis = raw_axis · z → (N, K').
