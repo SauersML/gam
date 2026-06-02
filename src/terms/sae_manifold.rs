@@ -6521,6 +6521,60 @@ mod tests {
         assert_eq!(strategy.sweep_values(), Some([0.1, 1.0, 10.0].as_slice()));
     }
 
+    /// `try_assignments_row` may only pin the K==1 assignment to `1.0` for
+    /// Softmax, whose single simplex coordinate is genuinely fixed. For the
+    /// independent gate modes (IBP-MAP, JumpReLU) the lone logit must drive the
+    /// gate; otherwise the reconstruction ignores a free parameter that the
+    /// prior still penalizes (an invalid objective). Regression for the
+    /// audit's K==1 special-case bug.
+    #[test]
+    fn k1_gate_modes_do_not_pin_assignment_to_one() {
+        // IBP-MAP, K=1: σ(0/τ)·π_0 = 0.5·1 = 0.5 (not 1.0).
+        let ibp = SaeAssignment::from_blocks_with_mode(
+            array![[0.0]],
+            vec![array![[0.0]]],
+            AssignmentMode::ibp_map(1.0, 1.0, false),
+        )
+        .unwrap();
+        assert_abs_diff_eq!(ibp.try_assignments_row(0).unwrap()[0], 0.5, epsilon = 1e-9);
+
+        // JumpReLU, K=1, logit below threshold: hard-gated off (not 1.0).
+        let jr = SaeAssignment::from_blocks_with_mode(
+            array![[-1.0]],
+            vec![array![[0.0]]],
+            AssignmentMode::jumprelu(1.0, 0.0),
+        )
+        .unwrap();
+        assert_abs_diff_eq!(jr.try_assignments_row(0).unwrap()[0], 0.0, epsilon = 1e-12);
+
+        // Softmax, K=1: still pinned to 1.0 (no free simplex coordinate).
+        let sm = SaeAssignment::from_blocks_with_mode(
+            Array2::<f64>::zeros((1, 0)),
+            vec![array![[0.0]]],
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
+        assert_abs_diff_eq!(sm.try_assignments_row(0).unwrap()[0], 1.0, epsilon = 1e-12);
+    }
+
+    /// The JumpReLU surrogate is centered at the threshold: just above the
+    /// threshold the gate is ≈ σ(0) = 0.5, not the uncentered σ(threshold/τ).
+    /// Below the threshold the hard gate keeps the value at exactly zero.
+    /// Regression for the audit's miscentered-threshold bug.
+    #[test]
+    fn jumprelu_surrogate_is_centered_at_threshold() {
+        let threshold = 2.0;
+        let temperature = 1.0;
+        let logits = array![2.0 + 1e-6, 1.0];
+        let gates = jumprelu_row(logits.view(), temperature, threshold);
+        // Just above threshold the centered surrogate is ≈ 0.5; the old
+        // uncentered surrogate would have been σ(2.0) ≈ 0.88.
+        assert_abs_diff_eq!(gates[0], 0.5, epsilon = 1e-3);
+        assert!(gates[0] < 0.6, "surrogate not centered at threshold: {}", gates[0]);
+        // Strictly below the threshold the gate is hard-zero.
+        assert_abs_diff_eq!(gates[1], 0.0, epsilon = 1e-12);
+    }
+
     fn periodic_basis(coords: &Array2<f64>) -> (Array2<f64>, Array3<f64>) {
         let n = coords.nrows();
         let mut phi = Array2::<f64>::zeros((n, 3));
