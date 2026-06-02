@@ -76,6 +76,13 @@ const ORTHONORM_DROP_TOL: f64 = 1e-10;
 struct AloStabilizationEval {
     cost: f64,
     gradient: Option<Array1<f64>>,
+    /// Gauss-Newton (PSD by construction) Hessian of the ALO augmentation in
+    /// ρ-space, paired 1:1 with `gradient`. Present exactly when `gradient` is
+    /// present. Added to the base REML/LAML analytic Hessian so the
+    /// ARC outer route keeps a consistent, exact-route second-order model of
+    /// the *augmented* objective instead of being handed an Unavailable Hessian
+    /// (which the analytic route treats as fatal).
+    hessian: Option<Array2<f64>>,
     k_hat: Option<f64>,
     max_leverage: f64,
     min_denominator: f64,
@@ -8912,7 +8919,7 @@ impl<'a> RemlState<'a> {
         if !(cost.is_finite() && cost >= 0.0) {
             return Ok(None);
         }
-        let gradient = if want_gradient
+        let (gradient, hessian) = if want_gradient
             && rho.len()
                 == bundle
                     .pirls_result
@@ -8922,31 +8929,52 @@ impl<'a> RemlState<'a> {
             && n.saturating_mul(bundle.pirls_result.beta_transformed.as_ref().len())
                 <= ALO_GRADIENT_MAX_WORK
         {
-            self.alo_stabilization_gradient(rho, bundle, &alo, &influence_scale, phi)?
+            match self.alo_stabilization_derivatives(rho, bundle, &alo, &influence_scale, phi)? {
+                Some((g, h)) => (Some(g), Some(h)),
+                None => (None, None),
+            }
         } else {
-            None
+            (None, None)
         };
         Ok(Some(AloStabilizationEval {
             cost,
             gradient,
+            hessian,
             k_hat: psis.as_ref().map(|p| p.k_hat),
             max_leverage,
             min_denominator,
         }))
     }
 
-    fn alo_stabilization_gradient(
+    /// Analytic ρ-gradient and a Gauss-Newton (PSD) ρ-Hessian of the ALO
+    /// augmentation, returned as a consistent pair.
+    ///
+    /// The augmentation is `C(ρ) = Σ_i [ τ·b(h_i(ρ)) + γ·s_i·w_i·(y_i −
+    /// η̃_i(ρ))²/φ ]`, with `b(h) = (h − 0.80)₊²` the leverage barrier and
+    /// `η̃_i` the leave-one-out predictor. Writing `u_i,k = ∂η̃_i/∂ρ_k` and
+    /// `v_i,k = ∂h_i/∂ρ_k`, the exact gradient is
+    ///   `g_k = Σ_i [ τ·b'(h_i)·v_i,k − 2γ·s_i·w_i·(y_i − η̃_i)/φ · u_i,k ]`.
+    /// The Gauss-Newton Hessian drops the curvature of `η̃_i`/`h_i` w.r.t. ρ
+    /// (the terms multiplied by the residual `y_i − η̃_i`, which vanish in
+    /// expectation at the stationary point) and keeps the manifestly PSD outer
+    /// products:
+    ///   `H_kl = Σ_i [ τ·b''(h_i)·v_i,k·v_i,l + 2γ·s_i·w_i/φ · u_i,k·u_i,l ]`,
+    /// with `b''(h) = 2` past the threshold and `0` otherwise. This is exactly
+    /// the curvature model ARC needs to keep its exact-Hessian (analytic) route
+    /// active on the *augmented* objective; its adaptive cubic regularization
+    /// absorbs the dropped (indefinite) residual-curvature terms.
+    fn alo_stabilization_derivatives(
         &self,
         rho: &Array1<f64>,
         bundle: &EvalShared,
         alo: &crate::inference::alo::AloDiagnostics,
         influence_scale: &[f64],
         phi: f64,
-    ) -> Result<Option<Array1<f64>>, EstimationError> {
+    ) -> Result<Option<(Array1<f64>, Array2<f64>)>, EstimationError> {
         let x = bundle.pirls_result.x_transformed.to_dense();
         let h = bundle
             .pirls_result
-            .dense_stabilizedhessian_transformed("ALO-stabilized REML gradient")?;
+            .dense_stabilizedhessian_transformed("ALO-stabilized REML derivatives")?;
         let chol = match h.cholesky(Side::Lower) {
             Ok(chol) => chol,
             Err(_) => return Ok(None),
@@ -8955,7 +8983,11 @@ impl<'a> RemlState<'a> {
         chol.solve_mat_in_place(&mut h_inv_xt);
         let beta = bundle.pirls_result.beta_transformed.as_ref();
         let k = rho.len();
-        let mut grad = Array1::<f64>::zeros(k);
+        let nrows = x.nrows();
+        let phi_safe = phi.max(f64::MIN_POSITIVE);
+        // Per-observation sensitivities of η̃_i and h_i to each ρ_k.
+        let mut deta_loo = Array2::<f64>::zeros((nrows, k));
+        let mut lev_deriv = Array2::<f64>::zeros((nrows, k));
         for penalty_idx in 0..k {
             let lambda = rho[penalty_idx].exp();
             let sbeta = transformed_penalty_matvec(
@@ -8967,32 +8999,54 @@ impl<'a> RemlState<'a> {
             mode_deriv.mapv_inplace(|v| -v);
             let eta_deriv = x.dot(&mode_deriv);
 
-            let mut leverage_deriv = Array1::<f64>::zeros(x.nrows());
-            for i in 0..x.nrows() {
+            for i in 0..nrows {
                 let m_i = h_inv_xt.column(i);
                 let penalty_m = transformed_penalty_matvec(
                     &bundle.pirls_result.reparam_result.canonical_transformed[penalty_idx],
                     &m_i.to_owned(),
                 );
-                leverage_deriv[i] = -self.weights[i] * lambda * m_i.dot(&penalty_m);
-            }
-
-            let mut gk = 0.0_f64;
-            for i in 0..x.nrows() {
                 let h_i = alo.leverage[i];
                 let denom = (1.0 - h_i).max(1e-12);
                 let residual = self.y[i] - bundle.pirls_result.final_eta[i];
-                let deta_loo =
-                    eta_deriv[i] / denom - residual * leverage_deriv[i] / (denom * denom);
-                let dev_eta_grad = -2.0 * self.weights[i] * (self.y[i] - alo.eta_tilde[i])
-                    / phi.max(f64::MIN_POSITIVE);
-                gk += ALO_TAU * alo_leverage_barrier_derivative(h_i) * leverage_deriv[i];
-                gk += ALO_GAMMA * influence_scale[i] * dev_eta_grad * deta_loo;
+                let v_ik = -self.weights[i] * lambda * m_i.dot(&penalty_m);
+                lev_deriv[[i, penalty_idx]] = v_ik;
+                deta_loo[[i, penalty_idx]] =
+                    eta_deriv[i] / denom - residual * v_ik / (denom * denom);
             }
-            grad[penalty_idx] = gk;
         }
-        if grad.iter().all(|g| g.is_finite()) {
-            Ok(Some(grad))
+
+        let mut grad = Array1::<f64>::zeros(k);
+        let mut hess = Array2::<f64>::zeros((k, k));
+        for i in 0..nrows {
+            let h_i = alo.leverage[i];
+            let dev_eta_grad =
+                -2.0 * self.weights[i] * (self.y[i] - alo.eta_tilde[i]) / phi_safe;
+            let b_prime = alo_leverage_barrier_derivative(h_i);
+            // Gauss-Newton curvature weights (both ≥ 0 ⇒ PSD outer products).
+            let dev_curv = 2.0 * ALO_GAMMA * influence_scale[i] * self.weights[i] / phi_safe;
+            let bar_curv = if h_i > ALO_MAX_LEVERAGE_THRESHOLD {
+                2.0 * ALO_TAU
+            } else {
+                0.0
+            };
+            for kk in 0..k {
+                let u_ik = deta_loo[[i, kk]];
+                let v_ik = lev_deriv[[i, kk]];
+                grad[kk] +=
+                    ALO_TAU * b_prime * v_ik + ALO_GAMMA * influence_scale[i] * dev_eta_grad * u_ik;
+                for ll in kk..k {
+                    let u_il = deta_loo[[i, ll]];
+                    let v_il = lev_deriv[[i, ll]];
+                    let contrib = dev_curv * u_ik * u_il + bar_curv * v_ik * v_il;
+                    hess[[kk, ll]] += contrib;
+                    if ll != kk {
+                        hess[[ll, kk]] += contrib;
+                    }
+                }
+            }
+        }
+        if grad.iter().all(|g| g.is_finite()) && hess.iter().all(|v| v.is_finite()) {
+            Ok(Some((grad, hess)))
         } else {
             Ok(None)
         }
