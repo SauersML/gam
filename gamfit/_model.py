@@ -99,10 +99,22 @@ class Model:
 
         Notes
         -----
+        The response-scale ``mean`` is the **posterior mean** point estimate,
+        never the plug-in mode: for a curved inverse link it is the
+        coefficient-uncertainty-integrated ``E[link^{-1}(X·beta)]`` (the value
+        the ``gam predict`` CLI reports by default), not ``link^{-1}(X·beta_hat)``.
+        The choice is a property of the model alone, so it is the same whether
+        or not ``interval`` is requested. For effectively-linear models
+        (identity-link Gaussian, …) the integral collapses to the plug-in, so
+        the two coincide exactly.
+
         For Gaussian / identity-link GLMs, ``linear_predictor`` and ``mean``
         are numerically identical (linear-predictor scale == response scale).
-        For non-identity links (logit, log, ...) ``mean = link^{-1}(linear_predictor)``
-        and the two columns carry distinct information. Issues #310, #313, #342
+        For non-identity links (logit, log, ...) ``linear_predictor`` is the
+        plug-in linear predictor ``X·beta_hat`` while ``mean`` is the
+        response-scale posterior mean, so the two carry distinct information and
+        — under the posterior-mean integration above — ``mean`` is not simply
+        ``link^{-1}(linear_predictor)``. Issues #310, #313, #342
         renamed the columns from the engine-internal ``eta`` /
         ``effective_se`` / ``effective_variance`` labels to the standard
         statistical names; ``effective_variance`` was dropped (it was always
