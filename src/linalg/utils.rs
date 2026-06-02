@@ -4,7 +4,9 @@ use crate::faer_ndarray::{
     FaerArrayView, FaerLinalgError, array2_to_matmut, factorize_symmetricwith_fallback,
 };
 use faer::Side;
-use ndarray::{Array1, Array2, ArrayBase, ArrayView1, Data, Dimension, Zip};
+use ndarray::{
+    Array1, Array2, Array3, ArrayBase, ArrayView1, ArrayView2, ArrayView3, Data, Dimension, Zip, s,
+};
 
 /// SplitMix64: deterministic 64-bit hash / streaming RNG step.
 ///
@@ -1091,6 +1093,267 @@ impl RidgePlanner {
 
     pub(crate) fn attempts(&self) -> usize {
         self.attempts
+    }
+}
+
+/// Weighted ridge (penalized least-squares) solve for a multi-output Gaussian
+/// response. Forms the weighted normal equations `XᵀWX (+ λ·penalty) β = XᵀWY`
+/// (row weights `W = diag(weights)`), factorizes the symmetric system via the
+/// Cholesky-with-fallback path, solves for the coefficients `(p, d)`, and
+/// returns `(coefficients, fitted = Xβ)`. Single source of truth shared by the
+/// `gaussian_weighted_ridge` FFI shim and any core consumer.
+pub fn gaussian_weighted_ridge(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    ridge_lambda: f64,
+) -> Result<(Array2<f64>, Array2<f64>), String> {
+    let n = x.nrows();
+    let p = x.ncols();
+    if n == 0 || p == 0 {
+        return Err("X cannot be empty".to_string());
+    }
+    if y.nrows() != n {
+        return Err(format!(
+            "X/Y row mismatch: X has {n} rows but Y has {} rows",
+            y.nrows()
+        ));
+    }
+    if y.ncols() == 0 {
+        return Err("Y must have at least one column".to_string());
+    }
+    if weights.len() != n {
+        return Err(format!(
+            "weights length mismatch: expected {n}, got {}",
+            weights.len()
+        ));
+    }
+    if penalty.nrows() != p || penalty.ncols() != p {
+        return Err(format!(
+            "penalty shape mismatch: expected {p}x{p}, got {}x{}",
+            penalty.nrows(),
+            penalty.ncols()
+        ));
+    }
+    if !ridge_lambda.is_finite() || ridge_lambda < 0.0 {
+        return Err(format!(
+            "ridge_lambda must be finite and non-negative; got {ridge_lambda}"
+        ));
+    }
+    if x.iter()
+        .chain(y.iter())
+        .chain(penalty.iter())
+        .chain(weights.iter())
+        .any(|value| !value.is_finite())
+    {
+        return Err("weighted ridge inputs must be finite".to_string());
+    }
+    if weights.iter().any(|value| *value < 0.0) {
+        return Err("weights must be non-negative likelihood row weights".to_string());
+    }
+
+    let mut wx = x.to_owned();
+    let mut wy = y.to_owned();
+    for i in 0..n {
+        let wi = weights[i];
+        wx.row_mut(i).iter_mut().for_each(|value| *value *= wi);
+        wy.row_mut(i).iter_mut().for_each(|value| *value *= wi);
+    }
+    let mut system = x.t().dot(&wx);
+    if ridge_lambda > 0.0 {
+        system += &(penalty.to_owned() * ridge_lambda);
+    }
+    let rhs = x.t().dot(&wy);
+    let factor =
+        factorize_symmetricwith_fallback(FaerArrayView::new(&system).as_ref(), Side::Lower)
+            .map_err(|err| format!("weighted ridge factorization failed: {err}"))?;
+    let mut coefficients = rhs;
+    let mut coefficients_view = array2_to_matmut(&mut coefficients);
+    factor.solve_in_place(coefficients_view.as_mut());
+    if coefficients.iter().any(|value| !value.is_finite()) {
+        return Err("weighted ridge solve produced non-finite coefficients".to_string());
+    }
+    let fitted = x.dot(&coefficients);
+    Ok((coefficients, fitted))
+}
+
+/// Batched [`gaussian_weighted_ridge`]: solve one independent weighted-ridge fit
+/// per leading-axis slice of the padded `(K, N_max, p)` design / `(K, N_max, d)`
+/// response, honoring optional per-batch active `row_counts`. Runs the
+/// per-batch solves in parallel and scatters results back into dense
+/// `(K, p, d)` coefficients and `(K, N_max, d)` fitted arrays (padding rows
+/// left zero).
+pub fn gaussian_weighted_ridge_batch(
+    x: ArrayView3<'_, f64>,
+    y: ArrayView3<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    weights: ArrayView2<'_, f64>,
+    ridge_lambda: f64,
+    row_counts: Option<ArrayView1<'_, usize>>,
+) -> Result<(Array3<f64>, Array3<f64>), String> {
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+    let (batch, n_max, p) = x.dim();
+    let (y_batch, y_n_max, d) = y.dim();
+    if batch == 0 || n_max == 0 || p == 0 {
+        return Err("batched X must have non-empty K, N, and coefficient dimensions".to_string());
+    }
+    if y_batch != batch || y_n_max != n_max {
+        return Err(format!(
+            "batched X/Y shape mismatch: X is ({batch}, {n_max}, {p}) but Y is ({y_batch}, {y_n_max}, {d})"
+        ));
+    }
+    if d == 0 {
+        return Err("batched Y must have at least one output column".to_string());
+    }
+    if weights.nrows() != batch || weights.ncols() != n_max {
+        return Err(format!(
+            "batched weights shape mismatch: expected ({batch}, {n_max}), got ({}, {})",
+            weights.nrows(),
+            weights.ncols()
+        ));
+    }
+    if penalty.nrows() != p || penalty.ncols() != p {
+        return Err(format!(
+            "penalty shape mismatch: expected {p}x{p}, got {}x{}",
+            penalty.nrows(),
+            penalty.ncols()
+        ));
+    }
+    if !ridge_lambda.is_finite() || ridge_lambda < 0.0 {
+        return Err(format!(
+            "ridge_lambda must be finite and non-negative; got {ridge_lambda}"
+        ));
+    }
+    if x.iter()
+        .chain(y.iter())
+        .chain(penalty.iter())
+        .chain(weights.iter())
+        .any(|value| !value.is_finite())
+    {
+        return Err("batched weighted ridge inputs must be finite".to_string());
+    }
+    if weights.iter().any(|value| *value < 0.0) {
+        return Err("batched weights must be non-negative likelihood row weights".to_string());
+    }
+
+    let active_rows: Vec<usize> = match row_counts {
+        Some(counts) => {
+            if counts.len() != batch {
+                return Err(format!(
+                    "row_counts length mismatch: expected {batch}, got {}",
+                    counts.len()
+                ));
+            }
+            counts.to_vec()
+        }
+        None => vec![n_max; batch],
+    };
+    for (b, &n_rows) in active_rows.iter().enumerate() {
+        if n_rows > n_max {
+            return Err(format!(
+                "row_counts[{b}]={n_rows} exceeds padded row count {n_max}"
+            ));
+        }
+    }
+
+    let results: Vec<Result<(usize, Array2<f64>, Array2<f64>), String>> = (0..batch)
+        .into_par_iter()
+        .map(|b| {
+            let n_rows = active_rows[b];
+            if n_rows == 0 {
+                return Ok((
+                    b,
+                    Array2::<f64>::zeros((p, d)),
+                    Array2::<f64>::zeros((0, d)),
+                ));
+            }
+            gaussian_weighted_ridge(
+                x.slice(s![b, 0..n_rows, ..]),
+                y.slice(s![b, 0..n_rows, ..]),
+                penalty,
+                weights.slice(s![b, 0..n_rows]),
+                ridge_lambda,
+            )
+            .map(|(coefficients, fitted)| (b, coefficients, fitted))
+            .map_err(|err| format!("batched weighted ridge fit {b} failed: {err}"))
+        })
+        .collect();
+
+    let mut coefficients = Array3::<f64>::zeros((batch, p, d));
+    let mut fitted = Array3::<f64>::zeros((batch, n_max, d));
+    for result in results {
+        let (b, fit_coefficients, fit_fitted) = result?;
+        coefficients
+            .slice_mut(s![b, .., ..])
+            .assign(&fit_coefficients);
+        let n_rows = fit_fitted.nrows();
+        if n_rows > 0 {
+            fitted.slice_mut(s![b, 0..n_rows, ..]).assign(&fit_fitted);
+        }
+    }
+    Ok((coefficients, fitted))
+}
+
+#[cfg(test)]
+mod ridge_tests {
+    use super::{gaussian_weighted_ridge, gaussian_weighted_ridge_batch};
+    use ndarray::{Array2, Array3, ArrayView2, array, s};
+
+    fn assert_close(lhs: ArrayView2<'_, f64>, rhs: ArrayView2<'_, f64>, tol: f64) {
+        assert_eq!(lhs.dim(), rhs.dim());
+        for ((i, j), value) in lhs.indexed_iter() {
+            let diff = (*value - rhs[[i, j]]).abs();
+            assert!(
+                diff <= tol,
+                "matrix mismatch at ({i}, {j}): lhs={}, rhs={}, diff={diff}",
+                value,
+                rhs[[i, j]]
+            );
+        }
+    }
+
+    #[test]
+    fn weighted_ridge_batch_matches_single_fit_on_active_rows() {
+        let x = Array3::from_shape_vec(
+            (2, 3, 2),
+            vec![1.0, 0.0, 1.0, 1.0, 0.5, 1.0, 2.0, 1.0, 0.0, 1.0, 9.0, 9.0],
+        )
+        .unwrap();
+        let y = Array3::from_shape_vec((2, 3, 1), vec![1.0, 2.0, 1.5, 2.5, -0.5, 99.0]).unwrap();
+        let weights = array![[1.0, 0.5, 2.0], [1.0, 3.0, 0.0]];
+        let penalty = Array2::eye(2);
+        let row_counts = array![3_usize, 2_usize];
+
+        let (coefficients, fitted) = gaussian_weighted_ridge_batch(
+            x.view(),
+            y.view(),
+            penalty.view(),
+            weights.view(),
+            0.25,
+            Some(row_counts.view()),
+        )
+        .unwrap();
+
+        for b in 0..2 {
+            let n = row_counts[b];
+            let (expected_coefficients, expected_fitted) = gaussian_weighted_ridge(
+                x.slice(s![b, 0..n, ..]),
+                y.slice(s![b, 0..n, ..]),
+                penalty.view(),
+                weights.slice(s![b, 0..n]),
+                0.25,
+            )
+            .unwrap();
+            assert_close(
+                coefficients.slice(s![b, .., ..]),
+                expected_coefficients.view(),
+                1.0e-10,
+            );
+            assert_close(fitted.slice(s![b, 0..n, ..]), expected_fitted.view(), 1.0e-10);
+        }
+        assert_eq!(fitted[[1, 2, 0]], 0.0);
     }
 }
 
