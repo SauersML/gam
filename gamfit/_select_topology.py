@@ -55,7 +55,7 @@ class _TopologyRustModule(Protocol):
 
 
 BasisSpec: TypeAlias = Smooth
-ScoreKind: TypeAlias = Literal["reml", "laml", "bic", "tk"]
+ScoreKind: TypeAlias = Literal["reml", "laml", "tk"]
 ScoreScale: TypeAlias = Literal["per_observation", "per_effective_dim", "raw"]
 TopologyName: TypeAlias = Literal[
     "euclidean", "circle", "sphere", "torus", "cylinder"
@@ -498,8 +498,8 @@ def _infer_candidate_name(topo: Smooth) -> str | None:
 
 def _normalize_score_kind(score: str) -> ScoreKind:
     normalized = str(score).strip().lower()
-    if normalized not in {"reml", "laml", "bic", "tk"}:
-        raise ValueError("score must be one of: 'reml', 'laml', 'bic', 'tk'")
+    if normalized not in {"reml", "laml", "tk"}:
+        raise ValueError("score must be one of: 'reml', 'laml', 'tk'")
     return normalized  # type: ignore[return-value]
 
 
@@ -516,8 +516,6 @@ def _normalize_score_scale(score_scale: str) -> ScoreScale:
 def _score_for_kind(
     fit_obj: Any,
     score_kind: ScoreKind,
-    n_obs: int,
-    basis_size: int,
     null_dim: float = 0.0,
 ) -> float:
     if score_kind == "tk":
@@ -530,11 +528,8 @@ def _score_for_kind(
         # null-space gauge-invariance caveat in `select_topology` applies to
         # that normalizer alone, so `reml` deliberately returns the raw score.
         return _extract_reml_score_raw(fit_obj)
-    if score_kind == "laml":
-        return _extract_laml_score(
-            fit_obj
-        ) + _tk_normalizer_for_fit(fit_obj, null_dim)
-    return _bic_value(fit_obj, n_obs, basis_size)
+    # laml: Laplace marginal likelihood plus the Tierney-Kadane normalizer.
+    return _extract_laml_score(fit_obj) + _tk_normalizer_for_fit(fit_obj, null_dim)
 
 
 def _tk_normalizer_for_fit(fit_obj: Any, null_dim: float) -> float:
@@ -632,15 +627,6 @@ def _extract_laml_score(fit_obj: Any) -> float:
         "score='laml' requires a real 'laml' field on the fitted result; "
         "REML/evidence must be requested with score='reml'"
     )
-
-
-def _bic_value(fit_obj: Any, n_obs: int, basis_size: int) -> float:
-    if n_obs <= 1:
-        raise ValueError("BIC scoring requires at least two observations")
-    deviance = _extract_float_field(fit_obj, ("deviance",))
-    if deviance is None:
-        raise ValueError("BIC scoring requires fit.summary()['deviance']")
-    return float(deviance) + math.log(float(n_obs)) * float(basis_size)
 
 
 def _basis_size(fit_obj: Any) -> int:
