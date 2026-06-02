@@ -2,6 +2,7 @@ pub mod circle;
 pub mod euclidean;
 pub mod grassmann;
 pub mod integrator;
+pub mod lie_so;
 pub mod manifold;
 pub mod optimizer;
 pub mod poincare;
