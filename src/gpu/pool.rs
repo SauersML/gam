@@ -139,7 +139,7 @@ pub fn balanced_partition(rt: &GpuRuntime, n_units: usize) -> Vec<(usize, std::o
         tiles.push((device.ordinal, start..end));
         start = end;
     }
-    debug_assert_eq!(start, n_units, "balanced_partition tiles must cover 0..n");
+    assert_eq!(start, n_units, "balanced_partition tiles must cover 0..n");
     tiles
 }
 
@@ -208,17 +208,12 @@ pub fn scatter_batched<T: Send>(
     })
 }
 
-/// Non-linux builds expose the same symbol but have no contexts to bind, so
-/// device fan-out is unavailable and the caller must use its CPU path.
-#[cfg(not(target_os = "linux"))]
-#[must_use]
-pub fn scatter_batched<T: Send>(
-    _rt: &GpuRuntime,
-    _items: &mut [T],
-    _f: impl Fn(usize, &mut [T]) -> Option<()> + Sync,
-) -> Option<()> {
-    None
-}
+// Non-linux builds have no CUDA contexts to bind and therefore expose no
+// `scatter_batched`. Every caller is already gated to `#[cfg(target_os =
+// "linux")]` (the only `cuda_context_for` and the only `GpuRuntime` capable of
+// returning `Some` live there), so the previous non-linux stub returning `None`
+// was never reached and only existed to satisfy a cross-platform `pub use`.
+// `crate::gpu` now re-exports `scatter_batched` only on linux.
 
 #[cfg(test)]
 mod tests {
