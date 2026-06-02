@@ -7,6 +7,7 @@ finite evidence score.
 """
 from __future__ import annotations
 
+import itertools
 import math
 
 import numpy as np
@@ -14,6 +15,31 @@ import pytest
 
 gamfit = pytest.importorskip("gamfit")
 pytest.importorskip("torch")
+
+
+def _best_permutation_min_abscorr(a: np.ndarray, b: np.ndarray) -> float:
+    """Largest achievable *min* |corr| over column permutations of ``a`` vs ``b``.
+
+    Khemakhem 2107.10098 Thm. 1 identifies the supervised latent only up to a
+    component-wise invertible transform (here: permutation + signed scaling),
+    so genuine recovery means *some* permutation pairs every true axis with a
+    learned axis at high absolute correlation. Returns the best (over
+    permutations) of the worst-paired |corr| — a permutation/sign/scale
+    -invariant recovery score in [0, 1].
+    """
+
+    k = a.shape[1]
+    corr = np.zeros((k, k))
+    for i in range(k):
+        for j in range(k):
+            c = abs(np.corrcoef(a[:, i], b[:, j])[0, 1])
+            # A degenerate (constant-variance) column makes corrcoef NaN; that
+            # is a recovery of zero, not an undefined comparison.
+            corr[i, j] = c if math.isfinite(c) else 0.0
+    best = 0.0
+    for perm in itertools.permutations(range(k)):
+        best = max(best, min(corr[i, perm[i]] for i in range(k)))
+    return float(best)
 
 
 def _toy_dataset(seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
@@ -39,7 +65,7 @@ def test_identifiable_factor_fit_smoke() -> None:
         mech_sparsity_weight=1.0,
         aux_prior_weight=1.0,
         encoder="mlp[32, 32]",
-        max_iter=20,
+        max_iter=600,
         learning_rate=5e-3,
         random_state=1,
     )
@@ -53,6 +79,30 @@ def test_identifiable_factor_fit_smoke() -> None:
     # for this configuration (aux varies, decoder is full-rank generically,
     # sparsity weight is positive, encoder has 3 Linear layers).
     assert result.warnings == []
+    # The fit completing at all is the regression guard for #576: the
+    # supervised iVAE prior previously raised because its conditional scale
+    # σ(u) was hardcoded to ones, collapsing the Khemakhem natural-parameter
+    # signature [μ(u) ‖ log σ(u)] to rank k < 2k. The derived varying scale
+    # genuinely satisfies the 2k rank condition, so the iVAE theorem is the
+    # *passing* reason this fit succeeds.
+    by_name = {t.theorem_name: t for t in result.report.theorems}
+    assert by_name["iVAE"].status == "pass"
+
+    # Real recovery: the supervised latent must recover the auxiliary up to
+    # the permutation + signed scaling that Khemakhem Thm. 1 allows, AND must
+    # do so far better than the free block (which is unsupervised). t_sup was
+    # generated as aux + small noise, so a converged supervised block aligns
+    # with aux per-axis.
+    sup_recovery = _best_permutation_min_abscorr(aux, result.T_supervised)
+    free_recovery = _best_permutation_min_abscorr(aux, result.T_free)
+    assert sup_recovery > 0.85, (
+        f"supervised block failed to recover the auxiliary: "
+        f"min paired |corr| = {sup_recovery:.3f}"
+    )
+    assert sup_recovery > free_recovery + 0.2, (
+        f"auxiliary information leaked into the free block: "
+        f"sup={sup_recovery:.3f} free={free_recovery:.3f}"
+    )
 
 
 def test_identifiable_factor_fit_warns_on_constant_aux() -> None:
