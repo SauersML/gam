@@ -280,8 +280,10 @@ impl SaeAtomBasisKind {
             // chart evaluator already enforces sphere geometry through its
             // cos/sin terms (in radians, multiplying lat/lon directly into
             // `sin`/`cos`), so the latent optimiser sees a 2-D product
-            // manifold: lat is a bounded interval `[-π/2, π/2]` (clamped by
-            // the chart) and lon is an `S^1` angle wrapped modulo `2π`.
+            // manifold: lat is a bounded interval `[-π/2, π/2]` (enforced here
+            // by the `Interval` retraction — its clamp + active-bound tangent
+            // projection — NOT by truncating the chart jet) and lon is an `S^1`
+            // angle wrapped modulo `2π`.
             // Treating it as `LatentManifold::Sphere { dim: 2 }` would
             // require ambient unit-vectors of length 2 (impossible for S^2).
             Self::Sphere => LatentManifold::Product(vec![
@@ -591,15 +593,24 @@ pub const SPHERE_CHART_PENALTY_DIAGONAL: [f64; 7] = [1e-8, 1.0, 1.0, 1.0, 4.0, 4
 /// `z = sin(lat)`; the returned `jet` has shape `(N, 7, 2)` with the last axis
 /// indexing `[∂/∂lat, ∂/∂lon]`.
 ///
-/// Latitude is clamped to `[-π/2, π/2]`. The clamp truncates derivatives w.r.t.
-/// the raw input coordinate outside the interior `(-π/2, π/2)`: in the
-/// saturated region the `phi` entries are constant in `coords[[row, 0]]`, so the
-/// chain rule contributes a zero factor on the `∂/∂lat` axis. Failing to apply
-/// this `chain_lat` gating leaks a non-zero analytic gradient where finite
-/// differences correctly report zero, sending Newton steps in lat in a
-/// direction the loss does not actually decrease along. Both the core path
-/// ([`SphereChartEvaluator`]) and the PyFFI helper route through this function,
-/// so the saturated-latitude gating is identical everywhere.
+/// The map and its jet are everywhere `C^∞` in `(lat, lon)`: every column is a
+/// polynomial in `cos`/`sin` of the two coordinates, and `cos`/`sin` are entire,
+/// so the exact analytic derivatives `∂x/∂lat = -sin(lat)cos(lon)`, … are
+/// globally smooth. Latitude is therefore **not** clamped and the latitude
+/// derivatives are **not** gated here.
+///
+/// The physical `lat ∈ [-π/2, π/2]` box that pins a canonical latitude range is
+/// enforced where it belongs — in the latent retraction / tangent projection
+/// ([`crate::terms::latent_coord::LatentManifold::Interval`]), which clamps the
+/// coordinate after each step and zeroes only the *outward-normal* component of
+/// the tangent velocity at an active bound (a correct KKT projection). The old
+/// binary `chain_lat` gate instead zeroed the *entire* latitude jet at the
+/// boundary, making the basis nonsmooth there: an atom whose latitude reached
+/// `±π/2` saw a zero latitude gradient and froze, even for the tangential
+/// (in-box) direction along which the loss does decrease. Computing the exact
+/// jet here and letting the retraction handle the bound restores a smooth
+/// objective and the correct boundary behaviour. Both the core path
+/// ([`SphereChartEvaluator`]) and the PyFFI helper route through this function.
 pub fn sphere_chart_basis_jet(
     coords: ArrayView2<'_, f64>,
 ) -> Result<(Array2<f64>, Array3<f64>), String> {
@@ -613,11 +624,7 @@ pub fn sphere_chart_basis_jet(
     let mut phi = Array2::<f64>::zeros((n, 7));
     let mut jet = Array3::<f64>::zeros((n, 7, 2));
     for row in 0..n {
-        let raw_lat = coords[[row, 0]];
-        let lat = raw_lat.clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
-        let lat_active =
-            raw_lat > -std::f64::consts::FRAC_PI_2 && raw_lat < std::f64::consts::FRAC_PI_2;
-        let chain_lat = if lat_active { 1.0 } else { 0.0 };
+        let lat = coords[[row, 0]];
         let lon = coords[[row, 1]];
         let clat = lat.cos();
         let slat = lat.sin();
@@ -634,11 +641,11 @@ pub fn sphere_chart_basis_jet(
         phi[[row, 5]] = y * z;
         phi[[row, 6]] = x * z;
 
-        let dx_dlat = -slat * clon * chain_lat;
+        let dx_dlat = -slat * clon;
         let dx_dlon = -clat * slon;
-        let dy_dlat = -slat * slon * chain_lat;
+        let dy_dlat = -slat * slon;
         let dy_dlon = clat * clon;
-        let dz_dlat = clat * chain_lat;
+        let dz_dlat = clat;
         jet[[row, 1, 0]] = dx_dlat;
         jet[[row, 1, 1]] = dx_dlon;
         jet[[row, 2, 0]] = dy_dlat;
@@ -676,20 +683,19 @@ impl SaeBasisSecondJet for SphereChartEvaluator {
     /// Analytic Hessian of the 7-column lat/lon sphere chart basis.
     ///
     /// With `x = cos(lat) cos(lon)`, `y = cos(lat) sin(lon)`, `z = sin(lat)`
-    /// and `a = 1{lat ∈ (−π/2, π/2)}` (the clamp's chain factor; outside the
-    /// interior every lat-partial is zero, including in the Hessian), the
-    /// non-trivial second derivatives are
+    /// the non-trivial second derivatives are
     ///
     /// ```text
-    /// x_{lat,lat} = -x · a,     x_{lon,lon} = -x,     x_{lat,lon} = sin(lat)·sin(lon)·a
-    /// y_{lat,lat} = -y · a,     y_{lon,lon} = -y,     y_{lat,lon} = -sin(lat)·cos(lon)·a
-    /// z_{lat,lat} = -z · a,     z_{lon,lon} =  0,     z_{lat,lon} =  0
+    /// x_{lat,lat} = -x,     x_{lon,lon} = -x,     x_{lat,lon} = sin(lat)·sin(lon)
+    /// y_{lat,lat} = -y,     y_{lon,lon} = -y,     y_{lat,lon} = -sin(lat)·cos(lon)
+    /// z_{lat,lat} = -z,     z_{lon,lon} =  0,     z_{lat,lon} =  0
     /// ```
     ///
     /// Bilinear basis entries `xy, yz, xz` follow the product rule
-    /// `(fg)_{αβ} = f_{αβ} g + f_α g_β + f_β g_α + f g_{αβ}`. The boundary
-    /// chain factor `a` is idempotent (`a² = a`), so reapplying it on a
-    /// double-lat derivative is a no-op.
+    /// `(fg)_{αβ} = f_{αβ} g + f_α g_β + f_β g_α + f g_{αβ}`. The map is `C^∞`
+    /// in `(lat, lon)`, so the Hessian is the exact analytic one with no clamp
+    /// or boundary gating; the `lat ∈ [-π/2, π/2]` box is enforced by the
+    /// retraction, not by truncating derivatives (see [`sphere_chart_basis_jet`]).
     fn second_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array4<f64>, String> {
         if coords.ncols() != 2 {
             return Err(format!(
@@ -700,11 +706,7 @@ impl SaeBasisSecondJet for SphereChartEvaluator {
         let n = coords.nrows();
         let mut h = Array4::<f64>::zeros((n, 7, 2, 2));
         for row in 0..n {
-            let raw_lat = coords[[row, 0]];
-            let lat = raw_lat.clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
-            let lat_active =
-                raw_lat > -std::f64::consts::FRAC_PI_2 && raw_lat < std::f64::consts::FRAC_PI_2;
-            let a = if lat_active { 1.0 } else { 0.0 };
+            let lat = coords[[row, 0]];
             let lon = coords[[row, 1]];
             let clat = lat.cos();
             let slat = lat.sin();
@@ -713,12 +715,12 @@ impl SaeBasisSecondJet for SphereChartEvaluator {
             let x = clat * clon;
             let y = clat * slon;
             let z = slat;
-            let dx = [-slat * clon * a, -clat * slon];
-            let dy = [-slat * slon * a, clat * clon];
-            let dz = [clat * a, 0.0];
-            let hx = [[-x * a, slat * slon * a], [slat * slon * a, -x]];
-            let hy = [[-y * a, -slat * clon * a], [-slat * clon * a, -y]];
-            let hz = [[-z * a, 0.0], [0.0, 0.0]];
+            let dx = [-slat * clon, -clat * slon];
+            let dy = [-slat * slon, clat * clon];
+            let dz = [clat, 0.0];
+            let hx = [[-x, slat * slon], [slat * slon, -x]];
+            let hy = [[-y, -slat * clon], [-slat * clon, -y]];
+            let hz = [[-z, 0.0], [0.0, 0.0]];
             for axis_a in 0..2 {
                 for axis_b in 0..2 {
                     h[[row, 1, axis_a, axis_b]] = hx[axis_a][axis_b];
@@ -767,11 +769,10 @@ impl SaeBasisThirdJet for SphereChartEvaluator {
     /// `x = cos(lat) cos(lon)`, `y = cos(lat) sin(lon)`, `z = sin(lat)·1`. A
     /// separable coordinate's mixed derivative is the product of the per-axis
     /// derivative of the right order, so it is fully described by two
-    /// length-4 derivative tables (orders 0..3) — one per axis. The lat table
-    /// carries the clamp chain factor `a = 1{lat ∈ (−π/2, π/2)}` on every
-    /// order ≥ 1; `a` is idempotent (`a² = a`), so products of lat-derivatives
-    /// keep it correctly. Outside the interior `a = 0` zeroes every term that
-    /// touches a lat-derivative, matching the constant-in-raw-lat clamp.
+    /// length-4 derivative tables (orders 0..3) — one per axis. The map is
+    /// `C^∞` in `(lat, lon)`; the tables are the exact analytic derivatives
+    /// with no clamp or boundary gating (the `lat ∈ [-π/2, π/2]` box is
+    /// enforced by the retraction, see [`sphere_chart_basis_jet`]).
     ///
     /// The bilinear columns `xy, yz, xz` are products of two separable
     /// coordinates; their third derivative is the symmetric triple-Leibniz sum
@@ -820,20 +821,15 @@ impl SaeBasisThirdJet for SphereChartEvaluator {
             acc
         };
         for row in 0..n {
-            let raw_lat = coords[[row, 0]];
-            let lat = raw_lat.clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
-            let lat_active =
-                raw_lat > -std::f64::consts::FRAC_PI_2 && raw_lat < std::f64::consts::FRAC_PI_2;
-            let a = if lat_active { 1.0 } else { 0.0 };
+            let lat = coords[[row, 0]];
             let lon = coords[[row, 1]];
             let clat = lat.cos();
             let slat = lat.sin();
             let clon = lon.cos();
             let slon = lon.sin();
-            // Per-axis derivative tables, orders 0..3. Lat tables carry the
-            // clamp chain factor on every order ≥ 1.
-            let cos_lat = [clat, -slat * a, -clat * a, slat * a];
-            let sin_lat = [slat, clat * a, -slat * a, -clat * a];
+            // Per-axis derivative tables, orders 0..3 (exact analytic, no clamp).
+            let cos_lat = [clat, -slat, -clat, slat];
+            let sin_lat = [slat, clat, -slat, -clat];
             let cos_lon = [clon, -slon, -clon, slon];
             let sin_lon = [slon, clon, -slon, -clon];
             let const_lon = [1.0, 0.0, 0.0, 0.0];
@@ -7282,21 +7278,23 @@ mod tests {
     /// Parity guard for the sphere chart: the shared engine
     /// [`sphere_chart_basis_jet`] is the single source of derivative truth used
     /// by both the core SAE path ([`SphereChartEvaluator::evaluate`]) and the
-    /// PyFFI `sphere_chart_basis_with_jet` helper, which now routes through the
-    /// exact same function. This pins the behavior that previously drifted —
-    /// the saturated-latitude `chain_lat` gating — at both saturated and
-    /// non-saturated latitudes, so a future divergence would fail here.
+    /// PyFFI `sphere_chart_basis_with_jet` helper, which route through the exact
+    /// same function. The basis and its jet are now the *exact* analytic ones —
+    /// `C^∞` in `(lat, lon)` with no clamp and no binary `chain_lat` gate — so
+    /// this pins that the jet equals the closed-form analytic derivative at
+    /// interior, boundary (`|lat| = π/2`), and beyond-`π/2` latitudes alike.
     #[test]
     fn sphere_chart_basis_jet_is_single_source_of_truth() {
-        // A mix of interior and clamp-saturated (|lat| >= π/2) latitudes,
-        // including the exact boundary, which the gate treats as saturated.
+        // A mix of interior and former clamp-boundary / beyond-π/2 latitudes;
+        // the embedding and its jet are smooth everywhere, so all rows must hit
+        // the same exact analytic formulas.
         let coords = array![
             [-1.2, -2.4],                         // interior
             [0.35, 0.9],                          // interior
-            [std::f64::consts::FRAC_PI_2, 0.4],   // upper boundary (saturated)
-            [-std::f64::consts::FRAC_PI_2, -1.1], // lower boundary (saturated)
-            [2.3, 0.7],                           // beyond upper clamp (saturated)
-            [-3.0, 1.9],                          // beyond lower clamp (saturated)
+            [std::f64::consts::FRAC_PI_2, 0.4],   // upper boundary (former gate)
+            [-std::f64::consts::FRAC_PI_2, -1.1], // lower boundary (former gate)
+            [2.3, 0.7],                           // beyond +π/2
+            [-3.0, 1.9],                          // beyond -π/2
         ];
 
         // The core evaluator adapter must be bit-identical to the shared engine
@@ -7308,12 +7306,9 @@ mod tests {
         assert_eq!(engine_jet, adapter_jet);
 
         for row in 0..coords.nrows() {
-            let raw_lat = coords[[row, 0]];
+            // No clamp: the basis uses the raw latitude directly.
+            let lat = coords[[row, 0]];
             let lon = coords[[row, 1]];
-            let saturated =
-                !(raw_lat > -std::f64::consts::FRAC_PI_2 && raw_lat < std::f64::consts::FRAC_PI_2);
-
-            let lat = raw_lat.clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
             let clat = lat.cos();
             let slat = lat.sin();
             let clon = lon.cos();
@@ -7322,7 +7317,7 @@ mod tests {
             let y = clat * slon;
             let z = slat;
 
-            // Basis is always the clamped embedding, gating or not.
+            // Basis is the unit-sphere embedding evaluated at the raw latitude.
             assert!((engine_phi[[row, 0]] - 1.0).abs() <= 1.0e-12);
             assert!((engine_phi[[row, 1]] - x).abs() <= 1.0e-12);
             assert!((engine_phi[[row, 2]] - y).abs() <= 1.0e-12);
@@ -7331,7 +7326,7 @@ mod tests {
             assert!((engine_phi[[row, 5]] - y * z).abs() <= 1.0e-12);
             assert!((engine_phi[[row, 6]] - x * z).abs() <= 1.0e-12);
 
-            // Longitude derivatives never depend on the latitude clamp.
+            // Longitude derivatives.
             let dx_dlon = -clat * slon;
             let dy_dlon = clat * clon;
             assert!((engine_jet[[row, 1, 1]] - dx_dlon).abs() <= 1.0e-12);
@@ -7341,21 +7336,14 @@ mod tests {
             assert!((engine_jet[[row, 5, 1]] - dy_dlon * z).abs() <= 1.0e-12);
             assert!((engine_jet[[row, 6, 1]] - dx_dlon * z).abs() <= 1.0e-12);
 
-            // Latitude derivatives are gated to exactly zero in the saturated
-            // region (where finite differences also report zero) and equal the
-            // ungated analytic values in the interior.
-            let chain_lat = if saturated { 0.0 } else { 1.0 };
-            let dx_dlat = -slat * clon * chain_lat;
-            let dy_dlat = -slat * slon * chain_lat;
-            let dz_dlat = clat * chain_lat;
-            if saturated {
-                assert_eq!(engine_jet[[row, 1, 0]], 0.0);
-                assert_eq!(engine_jet[[row, 2, 0]], 0.0);
-                assert_eq!(engine_jet[[row, 3, 0]], 0.0);
-                assert_eq!(engine_jet[[row, 4, 0]], 0.0);
-                assert_eq!(engine_jet[[row, 5, 0]], 0.0);
-                assert_eq!(engine_jet[[row, 6, 0]], 0.0);
-            }
+            // Latitude derivatives are the exact analytic values at EVERY row,
+            // including the former clamp boundary — no gating to zero. At the
+            // upper boundary lat = +π/2 the analytic dz/dlat = cos(π/2) = 0
+            // naturally (no discontinuous override), while dx/dlat, dy/dlat are
+            // nonzero whenever cos(lon)/sin(lon) are.
+            let dx_dlat = -slat * clon;
+            let dy_dlat = -slat * slon;
+            let dz_dlat = clat;
             assert!((engine_jet[[row, 1, 0]] - dx_dlat).abs() <= 1.0e-12);
             assert!((engine_jet[[row, 2, 0]] - dy_dlat).abs() <= 1.0e-12);
             assert!((engine_jet[[row, 3, 0]] - dz_dlat).abs() <= 1.0e-12);
@@ -7369,6 +7357,62 @@ mod tests {
             SPHERE_CHART_PENALTY_DIAGONAL,
             [1e-8, 1.0, 1.0, 1.0, 4.0, 4.0, 4.0]
         );
+    }
+
+    /// Regression for #619 / #618-sphere: the lat/lon sphere chart jet must
+    /// equal a central finite difference of the basis to ~1e-7 *at and beyond*
+    /// the former clamp boundary `lat = ±π/2`, where the old binary `chain_lat`
+    /// gate discontinuously zeroed the entire latitude jet and froze the atom.
+    /// Also pins continuity of the basis across `lat = π/2`.
+    #[test]
+    fn sphere_chart_jet_matches_fd_at_clamp_boundary() {
+        // Latitudes spanning interior, exactly the former boundary, and beyond.
+        let coords = array![
+            [std::f64::consts::FRAC_PI_2, 0.4],   // exactly +π/2 (former gate flip)
+            [-std::f64::consts::FRAC_PI_2, -1.1], // exactly -π/2
+            [1.45, 2.0],                          // just below +π/2
+            [1.69, -0.3],                         // just above +π/2
+            [2.3, 0.7],                           // well beyond +π/2
+            [0.35, 0.9],                          // interior control
+        ];
+
+        let (_, jet) = sphere_chart_basis_jet(coords.view()).unwrap();
+        let h = 1.0e-6;
+        for row in 0..coords.nrows() {
+            for axis in 0..2 {
+                let mut plus = coords.clone();
+                let mut minus = coords.clone();
+                plus[[row, axis]] += h;
+                minus[[row, axis]] -= h;
+                let (phi_p, _) = sphere_chart_basis_jet(plus.view()).unwrap();
+                let (phi_m, _) = sphere_chart_basis_jet(minus.view()).unwrap();
+                for col in 0..7 {
+                    let fd = (phi_p[[row, col]] - phi_m[[row, col]]) / (2.0 * h);
+                    let an = jet[[row, col, axis]];
+                    assert!(
+                        (fd - an).abs() <= 1.0e-7,
+                        "row {row} col {col} axis {axis}: analytic {an} vs FD {fd}"
+                    );
+                }
+            }
+        }
+
+        // Continuity of the basis across lat = π/2: the embedding does not jump.
+        let eps = 1.0e-8;
+        let lon = 0.4;
+        let below = array![[std::f64::consts::FRAC_PI_2 - eps, lon]];
+        let above = array![[std::f64::consts::FRAC_PI_2 + eps, lon]];
+        let (phi_below, _) = sphere_chart_basis_jet(below.view()).unwrap();
+        let (phi_above, _) = sphere_chart_basis_jet(above.view()).unwrap();
+        for col in 0..7 {
+            assert!(
+                (phi_below[[0, col]] - phi_above[[0, col]]).abs() <= 1.0e-6,
+                "basis discontinuous across lat = π/2 at col {col}: \
+                 {} vs {}",
+                phi_below[[0, col]],
+                phi_above[[0, col]]
+            );
+        }
     }
 
     /// Central-difference oracle for `second_jet`: differentiate the analytic

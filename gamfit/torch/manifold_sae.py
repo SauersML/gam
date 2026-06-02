@@ -733,6 +733,18 @@ class ManifoldSAE(nn.Module):
         self._snapshot: dict[str, Any] = {}
         self._snapshot_locked: bool = False
         self._last_fit: _ClosedFormManifoldSAE | None = None
+        # Serialized closed-form fit. After ``.fit()`` the full solved state
+        # (decoder blocks, basis centers, anchors/coords, training data, fitted
+        # reconstruction, and every scalar the frozen-decoder OOS solve needs)
+        # is JSON-encoded via ``fit.to_dict()`` and stored here as a uint8 byte
+        # buffer so ``state_dict()`` carries it. An empty buffer means "no
+        # closed-form solve" (the gradient-trained path). The variable-length
+        # blob is reloaded by the overridden ``_load_from_state_dict`` below,
+        # which rebuilds ``self._last_fit`` so a reloaded module reproduces both
+        # in-sample and out-of-sample predictions.
+        self.register_buffer(
+            "_fit_blob", torch.zeros(0, dtype=torch.uint8), persistent=True
+        )
         self.reset_parameters()
         self.to(dtype=cfg.dtype)
 
@@ -812,27 +824,27 @@ class ManifoldSAE(nn.Module):
 
     def _forward_from_closed_form(self, x: torch.Tensor) -> ManifoldSAEOutput:
         # When .fit() has been called, the closed-form Rust solve is the source
-        # of truth: forward must reproduce fit.fitted exactly for in-sample x.
-        # The random encoder/anchors play no role because the closed-form solver
-        # does not produce an encoder to copy back into module parameters.
+        # of truth: forward must reproduce the fit exactly for in-sample x AND
+        # reconstruct genuinely-unseen rows out of sample.
+        #
+        # Both cases go through ``fit.converged_latents(x)``: it returns the
+        # stored training latents bit-exactly when x matches the training batch,
+        # and otherwise runs the frozen-decoder out-of-sample Newton solve
+        # (``sae_manifold_predict_oos``) — the SAME per-row latent inner problem
+        # the joint fit solved — holding the fitted decoder blocks / basis /
+        # anchors fixed, then applies the decoder to get x_hat. The random
+        # encoder/anchors play no role because the closed-form solver carries
+        # its own decoder; OOS reconstruction is the transductive encode-by-
+        # inner-solve, not an amortized encoder pass.
         fit = self._last_fit
         assert fit is not None
         F = int(self.cfg.n_atoms)
         d = int(self.cfg.intrinsic_rank)
         x_np = x.detach().cpu().numpy()
-        is_in_sample = (
-            fit.training_data.shape == x_np.shape
-            and np.allclose(x_np, fit.training_data)
-        )
-        if not is_in_sample:
-            raise NotImplementedError(
-                "ManifoldSAE.forward(x) after .fit() requires x to be the same "
-                "data .fit() was called on; for out-of-sample reconstruction "
-                "call fit.reconstruct(x) / fit.predict(x) on the returned fit."
-            )
-        fitted_np = np.asarray(fit.fitted, dtype=np.float64)
-        assignments_np = np.asarray(fit.assignments, dtype=np.float64)
-        coords_per_atom = [np.asarray(c, dtype=np.float64) for c in fit.coords[:F]]
+        latents = fit.converged_latents(x_np)
+        fitted_np = np.asarray(latents["fitted"], dtype=np.float64)
+        assignments_np = np.asarray(latents["assignments"], dtype=np.float64)
+        coords_per_atom = [np.asarray(c, dtype=np.float64) for c in latents["coords"][:F]]
         positions_np = np.stack(
             [c.reshape(c.shape[0], d) for c in coords_per_atom], axis=1
         )
@@ -882,37 +894,34 @@ class ManifoldSAE(nn.Module):
         returned fit (also cached as ``self._last_fit``) is the source of truth.
         :meth:`forward` is rerouted through :meth:`_forward_from_closed_form`,
         which reconstructs ``x_hat`` / ``positions`` / ``assignments`` /
-        ``reml_score`` directly from the fit and ignores the module's
-        ``encoder`` and ``atom_raw_anchor`` parameters entirely. The solved
-        ``decoder_blocks`` and (when the solve used common-width Duchon centers)
-        the ``duchon_centers`` buffer are copied back into the module; the
-        ``encoder`` and ``atom_raw_anchor`` remain at their pre-fit values and
-        carry no learned information.
+        ``reml_score`` from the fit and ignores the module's ``encoder`` /
+        ``atom_raw_anchor`` parameters: the closed-form solver carries its own
+        decoder and per-atom anchors, so there is no amortized encoder to copy
+        back. The solved ``decoder_blocks`` and (when the solve used a common
+        Duchon center set) the ``duchon_centers`` buffer are folded into the
+        module, and the full solved state is captured in the ``_fit_blob``
+        buffer for serialization.
 
-        .. warning::
+        A solved module is genuinely usable:
 
-           A solved module is a **hybrid object**, not a fully-trained
-           ``nn.Module``. The training-batch forward path reads the solved
-           latents from the live ``self._last_fit`` Python object — *not* from
-           parameters/buffers — so a ``state_dict`` round-trip loses them and a
-           reloaded module cannot reproduce the training-batch path (see the
-           :meth:`_copy_fit_into_params` TODO). Do not treat ``.fit()`` as a
-           drop-in replacement for gradient training.
+        * **Out-of-sample forward.** ``module(x_new)`` for unseen rows works:
+          :meth:`_forward_from_closed_form` re-encodes new rows by solving the
+          per-row latent inner problem against the *fitted* decoder / basis /
+          anchors (the frozen-decoder Newton solve, ``sae_manifold_predict_oos``)
+          and applies the decoder — the transductive encode step. In-sample ``x``
+          still returns the exact closed-form reconstruction bit-for-bit.
+        * **Serialization.** ``state_dict()`` captures the full solved state in
+          the ``_fit_blob`` byte buffer (decoder blocks, per-atom basis centers /
+          anchors, fitted scalars, training data, and fitted reconstruction), so
+          ``load_state_dict(module.state_dict())`` into a fresh module rebuilds
+          ``self._last_fit`` and reproduces both in-sample and out-of-sample
+          predictions. (``fit.to_dict()`` / ``fit.save(...)`` remains available
+          to persist the fit object directly.)
 
-        Consequently a *solved* module must NOT be used for:
-
-        * gradient training / fine-tuning (the encoder and anchor are stale, so
-          their gradients are meaningless and would corrupt the fit);
-        * serialization of the learned model (``state_dict`` captures only the
-          solved decoder blocks and basis centers, not the solved per-token
-          latents or fitted reconstruction — persist the returned fit, e.g. via
-          ``fit.to_dict()`` / ``fit.save(...)``, instead);
-        * out-of-sample :meth:`forward` (the closed-form path requires the
-          in-sample ``x`` and raises ``NotImplementedError`` otherwise; use
-          ``fit.reconstruct(x)`` / ``fit.predict(x)`` for OOS inputs).
-
-        The supported use is calling :meth:`forward` on the same in-sample ``x``
-        to obtain the closed-form outputs.
+        A solved module must still NOT be used for gradient training /
+        fine-tuning: the encoder and anchor are stale relative to the
+        closed-form decoder, so their gradients are meaningless and would
+        corrupt the fit. Build a fresh, unfitted module for gradient training.
         """
         if not isinstance(x, torch.Tensor):
             raise TypeError("ManifoldSAE.fit expects a torch.Tensor")
@@ -976,26 +985,30 @@ class ManifoldSAE(nn.Module):
 
     @torch.no_grad()
     def _copy_fit_into_params(self, fit: _ClosedFormManifoldSAE) -> None:
-        """Copy the solved decoder blocks and basis centers back into params.
+        """Fold the full solved state into params/buffers for serialization.
 
-        This makes ``state_dict()`` carry the closed-form solution's
-        *reconstruction* pieces (decoder blocks + Duchon centers), so a saved
-        module reloads a basis consistent with the solve. The solved *latents*
-        (per-token assignments / on-manifold coordinates / fitted ``x_hat``) and
-        the encoder are intentionally not folded in: the closed-form solver
-        produces no encoder, and the training-batch forward path still reads
-        them from the live ``self._last_fit`` object.
+        The solve's *reconstruction* pieces (decoder blocks + a common Duchon
+        center set, when the solve used one) are copied into the matching
+        ``decoder_blocks`` parameter and ``duchon_centers`` buffer so a reloaded
+        module's eager-path basis is consistent with the solve. The encoder and
+        ``atom_raw_anchor`` are intentionally **not** overwritten: the
+        closed-form solver carries its own decoder and anchors (per-atom
+        coordinates), so there is no encoder to fold in — out-of-sample forward
+        re-encodes by the frozen-decoder inner solve instead of an amortized
+        encoder pass.
 
-        TODO(serialization): for a fully self-contained training-batch path,
-        register buffers for ``fit.fitted`` / ``fit.assignments`` /
-        ``fit.training_data`` and have :meth:`_forward_from_closed_form` fall
-        back to them when ``self._last_fit is None`` (e.g. after a
-        ``load_state_dict``). Per-atom Duchon centers also need per-atom storage
-        (the shared ``duchon_centers`` buffer below only captures them when every
-        atom shares identical centers). Out-of-sample encoding stays out of
-        scope — that requires training an amortized encoder against
-        ``fit.converged_latents`` and is not a serialization concern.
+        The authoritative, fully self-contained state — decoder blocks AND
+        per-atom basis centers/anchors AND every fitted scalar (alpha, tau,
+        sparsity_strength, smoothness, learning_rate, max_iter, random_state)
+        AND the training data + fitted reconstruction — is captured by
+        JSON-encoding ``fit.to_dict()`` into the ``_fit_blob`` byte buffer. That
+        buffer round-trips through ``state_dict()`` and is decoded back into a
+        live ``self._last_fit`` by :meth:`_load_from_state_dict`, so a reloaded
+        module reproduces both in-sample and out-of-sample predictions without
+        needing the original Python fit object.
         """
+        blob = json.dumps(fit.to_dict()).encode("utf-8")
+        self._fit_blob = torch.frombuffer(bytearray(blob), dtype=torch.uint8).clone()
         F = int(self.cfg.n_atoms)
         K = int(self.cfg.n_basis_per_atom)
         D = int(self.cfg.input_dim)
@@ -1010,11 +1023,12 @@ class ManifoldSAE(nn.Module):
                 arr[:m_i, :d_i], dtype=new_blocks.dtype
             )
         self.decoder_blocks.copy_(new_blocks)
-        # Fold the solved Duchon centers into the shared buffer when the solve
-        # used a single common center set of width K, so a serialized module's
-        # basis matches the solve. Heterogeneous per-atom centers cannot be
-        # represented by the shared (K,) buffer (see TODO above) and are left to
-        # the live fit.
+        # Fold the solved Duchon centers into the shared eager-path buffer when
+        # the solve used a single common center set of width K, so a reloaded
+        # module's eager basis matches the solve. Heterogeneous per-atom centers
+        # cannot be represented by the shared (K,) buffer, but they are still
+        # serialized in full (per atom) inside ``_fit_blob`` and used by the
+        # closed-form forward path, so nothing is lost.
         if self.cfg.atom_basis == "duchon":
             centers = [c for c in fit._duchon_centers[:F] if c is not None]
             if len(centers) == F:
@@ -1025,6 +1039,61 @@ class ManifoldSAE(nn.Module):
                     self.duchon_centers.copy_(
                         torch.as_tensor(stacked[0], dtype=self.duchon_centers.dtype)
                     )
+
+    def _load_from_state_dict(
+        self,
+        state_dict: Mapping[str, Any],
+        prefix: str,
+        local_metadata: Mapping[str, Any],
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        """Reload a serialized closed-form fit from the ``_fit_blob`` buffer.
+
+        ``_fit_blob`` is a variable-length byte tensor, so the default
+        ``load_state_dict`` (which ``copy_``-s into a fixed-shape buffer) would
+        raise on a size mismatch. We intercept it here: pop the blob, resize our
+        own buffer to match, copy the bytes, and decode it back into a live
+        :class:`gamfit._sae_manifold.ManifoldSAE` so the reloaded module's
+        :meth:`forward` again routes through :meth:`_forward_from_closed_form`
+        and reproduces in-sample and out-of-sample predictions. An empty blob
+        means the source module had no closed-form solve, so ``self._last_fit``
+        is cleared and the eager (gradient-trained) path is used.
+        """
+        blob_key = prefix + "_fit_blob"
+        blob_tensor: torch.Tensor | None = None
+        if blob_key in state_dict:
+            incoming = state_dict[blob_key]
+            blob_tensor = torch.as_tensor(incoming, dtype=torch.uint8).reshape(-1)
+            # The blob is variable length, so resize our registered buffer to
+            # match before the default loader runs. Substitute the cloned tensor
+            # back into the dict so the default machinery's shape-checked copy_
+            # is a same-shape no-op (and the key is not flagged missing).
+            self._fit_blob = blob_tensor.clone()
+            state_dict = dict(state_dict)
+            state_dict[blob_key] = self._fit_blob
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        if blob_tensor is not None:
+            self._rebuild_fit_from_blob(blob_tensor)
+
+    def _rebuild_fit_from_blob(self, blob: torch.Tensor) -> None:
+        """Decode ``blob`` into ``self._last_fit`` (or clear it when empty)."""
+        if blob.numel() == 0:
+            self._last_fit = None
+            return
+        raw = blob.detach().cpu().numpy().tobytes()
+        payload = json.loads(raw.decode("utf-8"))
+        self._last_fit = _ClosedFormManifoldSAE.from_dict(payload)
 
     @torch.no_grad()
     def lock_snapshot(self) -> None:
