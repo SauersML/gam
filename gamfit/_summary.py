@@ -32,6 +32,7 @@ _SUMMARY_FIELDS: tuple[str, ...] = (
     "edf_total",
     "lambdas",
     "coefficients",
+    "smooth_terms",
     "covariance_kind",
     "covariance_n",
     "covariance_flat",
@@ -77,6 +78,13 @@ class Summary:
     coefficients : list of dict
         One record per fitted coefficient with keys ``index``, ``estimate``,
         and ``std_error`` (when available).
+    smooth_terms : list of dict
+        The mgcv-style per-smooth significance table: one record per
+        smooth / random-effect term with keys ``name``, ``edf``, ``ref_df``,
+        and — for penalized smooths — ``chi_sq`` (Wood 2013 rank-truncated
+        Wald statistic) and ``p_value``. Random-effect smooths report ``edf``
+        only. Empty when the model has no smooth terms or when the design
+        could not be reconstructed to recover per-term coefficient blocks.
     covariance_kind : str or None
         ``"corrected"`` or ``"conditional"`` depending on which posterior
         covariance variant was returned.
@@ -114,6 +122,7 @@ class Summary:
     edf_total: float | None = None
     lambdas: list[float] = field(default_factory=list)
     coefficients: list[dict[str, Any]] = field(default_factory=list)
+    smooth_terms: list[dict[str, Any]] = field(default_factory=list)
     covariance_kind: str | None = None
     covariance_n: int | None = None
     covariance_flat: list[float] | None = None
@@ -189,6 +198,19 @@ class Summary:
         import pandas as pd
 
         return pd.DataFrame(self.coefficients)
+
+    def smooth_terms_frame(self) -> Any:
+        """Return :attr:`smooth_terms` as a :class:`pandas.DataFrame`.
+
+        This is the canonical mgcv ``summary.gam`` per-smooth significance
+        table: columns ``name``, ``edf``, ``ref_df``, ``chi_sq``, ``p_value``
+        (``chi_sq`` / ``p_value`` are absent for random-effect smooths and any
+        shape-constrained term, matching the engine, which only computes the
+        Wood Wald test for ordinary penalized smooths).
+        """
+        import pandas as pd
+
+        return pd.DataFrame(self.smooth_terms)
 
     # -- presentation -----------------------------------------------------------
 
