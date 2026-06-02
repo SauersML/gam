@@ -479,7 +479,7 @@ pub enum PartialSupervisionSupMethod {
     Procrustes,
     /// Affine least-squares pinned to `anchor_idx`.
     Anchor,
-    /// Ridge map `A_λ = (TᵀT + λI)⁻¹ Tᵀaux` with GCV-selected λ.
+    /// Ridge map `A_λ = (TᵀT + λI)⁻¹ Tᵀaux` with REML-selected λ.
     SoftL2,
 }
 
@@ -651,15 +651,32 @@ pub fn partial_supervision_solve(
                 .map_err(|e| format!("partial_supervision_solve: eigh on Gram failed: {e}"))?;
             let rhs = t_sup.t().dot(&aux);
             let ut_aux = eigvecs.t().dot(&rhs);
+            // Per-eigenvector signal energy m_r = ‖row_r(Vᵀ Tᵀaux)‖²; the
+            // multi-response RSS at weight λ is then
+            //   S(λ) = ‖aux‖_F² − Σ_r m_r/(γ_r+λ)
+            // with γ_r the eigenvalues of G = TᵀT (`eigvals`).
+            let m_row: Array1<f64> = Array1::from_vec(
+                (0..d_sup)
+                    .map(|r| (0..d_sup).map(|c| ut_aux[[r, c]] * ut_aux[[r, c]]).sum())
+                    .collect(),
+            );
             let lam_max = eigvals.iter().cloned().fold(0.0_f64, f64::max);
             let floor = (lam_max * 1.0e-10).max(1.0e-12);
             let top = (lam_max * 1.0e3).max(floor * 1.0e6);
             let grid_n: usize = 64;
             let log_floor = floor.ln();
             let log_top = top.ln();
+            // Select λ by REML, never GCV. The ridge map is the linear mixed
+            // model aux_j = T β_j + ε with β_j ~ N(0, σ²/λ I), ε ~ N(0, σ² I)
+            // applied to each of the d columns sharing λ. The map carries no
+            // unpenalized fixed effect, so REML coincides with the marginal
+            // likelihood, whose profile (σ² concentrated out) criterion to
+            // MINIMIZE is
+            //   reml(λ) = n·log S(λ) + Σ_r log(1 + γ_r/λ),
+            // the exact analogue of the smoothing-parameter REML used
+            // everywhere else in gam.
             let mut best_score = f64::INFINITY;
             let mut best_lam = floor;
-            let mut best_a = Array2::<f64>::zeros((d_sup, d_sup));
             for k in 0..grid_n {
                 let frac = if grid_n == 1 {
                     0.0
@@ -667,35 +684,38 @@ pub fn partial_supervision_solve(
                     (k as f64) / ((grid_n - 1) as f64)
                 };
                 let lam = (log_floor + frac * (log_top - log_floor)).exp();
-                let denom: Array1<f64> = eigvals.mapv(|v| v + lam);
-                let mut a_eig = Array2::<f64>::zeros((d_sup, d_sup));
+                let mut shrunk = 0.0_f64; // Σ_r m_r/(γ_r+λ)
+                let mut logdet = 0.0_f64; // Σ_r log(1 + γ_r/λ)
                 for r in 0..d_sup {
-                    for c in 0..d_sup {
-                        a_eig[[r, c]] = ut_aux[[r, c]] / denom[r];
-                    }
+                    let g = eigvals[r].max(0.0);
+                    shrunk += m_row[r] / (g + lam);
+                    logdet += (1.0 + g / lam).ln();
                 }
-                let a_lam = eigvecs.dot(&a_eig);
-                let fitted = t_sup.dot(&a_lam);
-                let resid = &fitted - &aux;
-                let rss: f64 = resid.iter().map(|x| x * x).sum();
-                let trace_h: f64 = (0..d_sup).map(|r| eigvals[r] / denom[r]).sum();
-                let gcv_denom = (n as f64) - trace_h;
-                if gcv_denom <= 0.0 || !rss.is_finite() {
+                let s = aux_norm_sq - shrunk;
+                if !(s.is_finite() && s > 0.0) {
                     continue;
                 }
-                let score = rss / (gcv_denom * gcv_denom);
+                let score = (n as f64) * s.ln() + logdet;
                 if score < best_score {
                     best_score = score;
                     best_lam = lam;
-                    best_a = a_lam;
                 }
             }
             if !best_score.is_finite() {
                 return Err(
-                    "partial_supervision_solve: GCV grid did not find a finite-score weight"
+                    "partial_supervision_solve: REML grid did not find a finite-score weight"
                         .to_string(),
                 );
             }
+            // Build the ridge map A_λ = (G + λI)⁻¹ Tᵀaux at the REML weight.
+            let denom: Array1<f64> = eigvals.mapv(|v| v + best_lam);
+            let mut a_eig = Array2::<f64>::zeros((d_sup, d_sup));
+            for r in 0..d_sup {
+                for c in 0..d_sup {
+                    a_eig[[r, c]] = ut_aux[[r, c]] / denom[r];
+                }
+            }
+            let best_a = eigvecs.dot(&a_eig);
             t_sup_aligned = t_sup.dot(&best_a);
             map_a = Some(best_a);
             selected_weight = Some(best_lam);

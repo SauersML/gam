@@ -23190,7 +23190,7 @@ fn identifiable_factor_select_weights_array<'py>(
 /// `gamfit.recipes.partial_supervision` (and reusable from the CLI / R /
 /// Julia bindings). All linear-algebra work — orthogonal Procrustes via
 /// SVD, anchor least-squares via SVD pseudo-inverse, soft-L2 ridge map via
-/// symmetric eigendecomposition with a GCV grid, and the orthogonal-
+/// symmetric eigendecomposition with a REML grid, and the orthogonal-
 /// complement projection via thin QR — runs in Rust through the faer
 /// bridge.
 ///

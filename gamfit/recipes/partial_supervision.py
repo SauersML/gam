@@ -45,7 +45,7 @@ class PartialSupervisionFit:
     free_constraint : str | None
         Echoes the ``free_constraint`` argument used.
     selected_weight : float | None
-        REML/GCV-selected soft-L2 weight (only set for ``soft_l2``).
+        REML-selected soft-L2 weight (only set for ``soft_l2``).
     map_R : (d_supervised, d_supervised) ndarray | None
         Procrustes rotation. ``None`` for the other methods.
     map_A : ndarray | None
