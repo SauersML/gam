@@ -277,7 +277,7 @@ class AdaptiveTopK(nn.Module):
         self._last_k_pred_mean_graph = k_pred_mean
         with torch.no_grad():
             self._last_k_pred_mean = k_pred_mean.detach()
-        # TODO(adaptive-k STE): reconstruction gradient still does not reach
+        # Known limitation (adaptive-k STE): reconstruction gradient still does not reach
         # ``k_pred`` -- the straight-through ``z_active = z_active_soft + (z*hard -
         # z_active_soft).detach()`` (see ``_AdaptiveTopKSTE.forward``) routes the
         # recon gradient only through the soft mask wrt ``z``, while
