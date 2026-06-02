@@ -8808,7 +8808,6 @@ impl<'a> RemlState<'a> {
                     for idx in 0..alo_gradient.len() {
                         gradient[idx] += alo_gradient[idx];
                     }
-<<<<<<< HEAD
                     // The ALO augmentation contributes only a cost and gradient
                     // term; its Gauss-Newton curvature term was dropped as dead
                     // (see "drop dead ALO-stabilization Hessian computation"), so
@@ -8817,17 +8816,6 @@ impl<'a> RemlState<'a> {
                     // augmented cost+gradient via its ratio test, and keeping the
                     // base Hessian preserves the `HessianSource::Analytic` invariant
                     // the outer plan relies on.
-=======
-                    // The augmented objective is `V(ρ) + C(ρ)`. The ALO
-                    // stabilization no longer produces a separate ρ-Hessian for
-                    // `C(ρ)` (dropped as dead computation); the base-REML analytic
-                    // Hessian in `result.hessian` is retained as the curvature
-                    // model. ARC's adaptive cubic regularization still converges on
-                    // the exact augmented cost+gradient via its ratio test, so a
-                    // slightly inexact curvature model only changes step quality,
-                    // not correctness, and the `HessianSource::Analytic` invariant
-                    // still holds.
->>>>>>> b015ecc12 (fix(reml): complete response-scale-equivariant Vp + effective-n REML (#582, #584))
                 }
                 _ => {
                     log::warn!(
