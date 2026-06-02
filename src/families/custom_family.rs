@@ -23428,8 +23428,8 @@ mod tests {
     // itself does *not* show divergence between project_hessian_logdet=true
     // and =false at biobank-scale ρ: the dominant term ½ λ β'Sβ grows
     // linearly in λ regardless of projection, and the trace pair cancels
-    // in both routes at this fixture's geometry.  The biobank failure on
-    // gamfit 0.1.92 lives in the custom survival-marginal-slope outer-
+    // in both routes at this fixture's geometry.  The biobank failure lives
+    // in the custom survival-marginal-slope outer-
     // gradient assembler (which has its own unprojected formula and has
     // not been retrofitted to use joint_outer_evaluate's projected
     // kernel).

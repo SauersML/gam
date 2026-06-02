@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Benchmark `gamfit.torch.fit` across (F, D, mode) combinations.
 
-Run after a fresh `pip install gamfit>=0.1.110` (or local maturin
+Run after a fresh `pip install gamfit>=0.1.147` (or local maturin
 develop) to characterize the joint-vs-independent dispatch on the
 machine you'll deploy on. Emits a markdown summary to stdout plus a
 JSON file with the raw measurements.
@@ -166,7 +166,7 @@ def main() -> int:
         import gamfit
         ver = gamfit.__version__
     except ImportError:
-        print("gamfit.torch unavailable — install gamfit>=0.1.110", file=sys.stderr)
+        print("gamfit.torch unavailable — install gamfit>=0.1.147", file=sys.stderr)
         return 1
 
     F_values = [int(x) for x in args.F_values.split(",")]
