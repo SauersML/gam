@@ -216,6 +216,15 @@ codegen-units = 1
 [profile.test]
 debug = "line-tables-only"
 
+# Dev/`maturin develop` profile — same rationale as [profile.test]. Cargo's
+# default dev profile emits full DWARF (`debug = 2`), which is what lets
+# `target/` balloon to ~30 GB (the dep + crate object files carry the bulk of
+# it). `line-tables-only` keeps backtraces resolvable to file:line and panic
+# locations while cutting the bulk of the debuginfo, so the dev target stays
+# a few GB instead of tens.
+[profile.dev]
+debug = "line-tables-only"
+
 # Iteration profile — drops `lto=thin` and uses 16 codegen units to cut
 # rebuild time from ~5 min to ~90 s while keeping `opt-level = 3`. Use via
 # `cargo build --profile release-dev --bin gam`. Runtime perf is typically
