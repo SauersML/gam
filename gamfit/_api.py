@@ -504,120 +504,6 @@ def _normalize_precision_pair(value: Any, label: str) -> list[float]:
     return [shape_f, rate_f]
 
 
-_SHAPE_CONSTRAINT_NORMAL = {
-    "none": "none",
-    "monotone_increasing": "monotone_increasing",
-    "increasing": "monotone_increasing",
-    "mpi": "monotone_increasing",
-    "monotone_decreasing": "monotone_decreasing",
-    "decreasing": "monotone_decreasing",
-    "mpd": "monotone_decreasing",
-    "convex": "convex",
-    "cvx": "convex",
-    "concave": "concave",
-    "ccv": "concave",
-}
-
-
-def _normalize_shape_constraint(value: Any) -> str:
-    if value is None:
-        return "none"
-    key = str(value).strip().lower().replace("-", "_")
-    if key not in _SHAPE_CONSTRAINT_NORMAL:
-        raise ValueError(
-            f"unknown shape_constraint {value!r}; expected one of "
-            "monotone_increasing, monotone_decreasing, convex, concave, none"
-        )
-    return _SHAPE_CONSTRAINT_NORMAL[key]
-
-
-_SMOOTH_HEAD_RE = re.compile(
-    r"\b(s|smooth|te|tensor|thinplate|tps|duchon|matern|sphere|bs|bspline)\s*\("
-)
-
-
-def _apply_shape_constraints_to_formula(
-    formula: str, constraints: Mapping[str, Any]
-) -> str:
-    """Rewrite smooth-term calls in ``formula`` so each named smooth carries
-    a ``shape=<kind>`` option understood by the Rust formula DSL.
-
-    The mapping is keyed by the smooth-term text as it appears in the
-    formula (e.g. ``"s(x)"`` or ``"s(x, type=duchon, centers=8)"``).
-    Comparison is exact after whitespace normalization.
-    """
-    if not constraints:
-        return formula
-    normalized: dict[str, str] = {}
-    for key, value in constraints.items():
-        kind = _normalize_shape_constraint(value)
-        if kind == "none":
-            continue
-        # Whitespace-collapsed key for matching against scanner output.
-        normalized[re.sub(r"\s+", "", str(key))] = kind
-    if not normalized:
-        return formula
-
-    out: list[str] = []
-    i = 0
-    matched: set[str] = set()
-    while i < len(formula):
-        m = _SMOOTH_HEAD_RE.search(formula, i)
-        if not m:
-            out.append(formula[i:])
-            break
-        out.append(formula[i : m.start()])
-        # Find the matching closing paren respecting nesting and string literals.
-        head_start = m.start()
-        paren_open = m.end() - 1
-        depth = 1
-        j = m.end()
-        in_str: str | None = None
-        while j < len(formula) and depth > 0:
-            ch = formula[j]
-            if in_str is not None:
-                if ch == in_str:
-                    in_str = None
-            elif ch in ("'", '"'):
-                in_str = ch
-            elif ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-                if depth == 0:
-                    break
-            j += 1
-        if depth != 0:
-            # Unbalanced — bail out and emit the remainder verbatim. The
-            # Rust parser will produce the canonical error.
-            out.append(formula[head_start:])
-            break
-        term_text = formula[head_start : j + 1]
-        key_normalized = re.sub(r"\s+", "", term_text)
-        kind = normalized.get(key_normalized)
-        if kind is None:
-            out.append(term_text)
-        else:
-            inside = formula[m.end() : j].strip()
-            if inside:
-                new_term = f"{formula[head_start:m.end()]}{inside}, shape={kind})"
-            else:
-                new_term = f"{formula[head_start:m.end()]}shape={kind})"
-            out.append(new_term)
-            matched.add(key_normalized)
-        i = j + 1
-    rewritten = "".join(out)
-    missing = set(normalized.keys()) - matched
-    if missing:
-        original_keys = {re.sub(r"\s+", "", str(k)): str(k) for k in constraints}
-        labels = sorted(original_keys.get(k, k) for k in missing)
-        raise ValueError(
-            "shape constraints referenced smooth term(s) not found in formula: "
-            + ", ".join(labels)
-        )
-    return rewritten
-
-
 def _group_terms_from_formula(formula: str) -> list[str]:
     return [m.group(1).strip() for m in re.finditer(r"\bgroup\s*\(\s*([^)]+?)\s*\)", formula)]
 
@@ -1051,7 +937,15 @@ def fit(
         helpers.
     """
     if constraints:
-        formula = _apply_shape_constraints_to_formula(formula, constraints)
+        # Alias normalization, smooth-term scanning, and the `shape=` rewrite all
+        # live in Rust (`gam::terms::smooth::apply_shape_constraints_to_formula`);
+        # Python only marshals the mapping across the FFI.
+        try:
+            formula = rust_module().apply_shape_constraints_to_formula(
+                formula, [(str(k), str(v)) for k, v in constraints.items()]
+            )
+        except Exception as exc:
+            raise map_exception(exc) from exc
     if config:
         if response_geometry is None and config.get("response_geometry") is not None:
             response_geometry = str(config["response_geometry"])

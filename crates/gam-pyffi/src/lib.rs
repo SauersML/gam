@@ -2865,6 +2865,21 @@ fn extend_model_with_group(
     Ok(PyBytes::new(py, &out).unbind())
 }
 
+/// Rewrite smooth-term calls in `formula` so each named smooth carries a
+/// `shape=<kind>` DSL option, given a `constraints` mapping serialized as a list
+/// of `(term_text, kind)` pairs. All alias normalization, smooth-term scanning,
+/// and paren-matching live in
+/// [`gam::terms::smooth::apply_shape_constraints_to_formula`]; the Python
+/// wrapper only marshals the dict across the FFI.
+#[pyfunction]
+fn apply_shape_constraints_to_formula(
+    formula: String,
+    constraints: Vec<(String, String)>,
+) -> PyResult<String> {
+    gam::terms::smooth::apply_shape_constraints_to_formula(&formula, &constraints)
+        .map_err(py_value_error)
+}
+
 #[pyfunction]
 fn validate_formula_json(
     py: Python<'_>,
@@ -22700,6 +22715,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(build_extend_group_payload_json, module)?)?;
     module.add_function(wrap_pyfunction!(extend_model_with_group, module)?)?;
     module.add_function(wrap_pyfunction!(validate_formula_json, module)?)?;
+    module.add_function(wrap_pyfunction!(apply_shape_constraints_to_formula, module)?)?;
     module.add_function(wrap_pyfunction!(
         formula_validation_supported_by_python_json,
         module

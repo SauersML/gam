@@ -220,6 +220,176 @@ pub fn parse_shape_constraint(raw: &str) -> Result<ShapeConstraint, String> {
     }
 }
 
+impl ShapeConstraint {
+    /// Canonical formula-DSL spelling, i.e. the text emitted into
+    /// `s(x, shape=...)`. Round-trips through [`parse_shape_constraint`].
+    pub fn dsl_str(&self) -> &'static str {
+        match self {
+            ShapeConstraint::None => "none",
+            ShapeConstraint::MonotoneIncreasing => "monotone_increasing",
+            ShapeConstraint::MonotoneDecreasing => "monotone_decreasing",
+            ShapeConstraint::Convex => "convex",
+            ShapeConstraint::Concave => "concave",
+        }
+    }
+}
+
+/// Smooth-term head keywords recognised by the formula DSL. A `shape=` option
+/// may be attached to any term whose head is one of these.
+const SMOOTH_HEAD_KEYWORDS: [&str; 11] = [
+    "s", "smooth", "te", "tensor", "thinplate", "tps", "duchon", "matern", "sphere", "bs",
+    "bspline",
+];
+
+/// Rewrite smooth-term calls in `formula` so each named smooth carries a
+/// `shape=<kind>` option understood by the formula DSL.
+///
+/// `constraints` pairs the smooth-term text as it appears in the formula
+/// (e.g. `"s(x)"` or `"s(x, type=duchon, centers=8)"`) with a shape-constraint
+/// spelling accepted by [`parse_shape_constraint`]; comparison is exact after
+/// whitespace removal. A `"none"` constraint is a no-op. Referencing a term not
+/// present in the formula is an error.
+///
+/// This is the single source of truth for the `gamfit.fit(..., constraints=…)`
+/// rewrite — the Python wrapper only marshals the mapping across the FFI and
+/// holds no formula-parsing or alias-normalization logic of its own.
+pub fn apply_shape_constraints_to_formula(
+    formula: &str,
+    constraints: &[(String, String)],
+) -> Result<String, String> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    if constraints.is_empty() {
+        return Ok(formula.to_string());
+    }
+    let strip_ws = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+
+    // Whitespace-stripped term text -> canonical shape spelling.
+    let mut wanted: BTreeMap<String, &'static str> = BTreeMap::new();
+    // Whitespace-stripped term text -> original key (for error labels).
+    let mut originals: BTreeMap<String, String> = BTreeMap::new();
+    for (key, kind_raw) in constraints {
+        let kind = parse_shape_constraint(kind_raw)?;
+        let nk = strip_ws(key);
+        originals.entry(nk.clone()).or_insert_with(|| key.clone());
+        if kind != ShapeConstraint::None {
+            wanted.insert(nk, kind.dsl_str());
+        }
+    }
+    if wanted.is_empty() {
+        return Ok(formula.to_string());
+    }
+
+    let chars: Vec<char> = formula.chars().collect();
+    let n = chars.len();
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+
+    let mut out = String::with_capacity(formula.len() + 32);
+    let mut matched: BTreeSet<String> = BTreeSet::new();
+    let mut i = 0usize;
+    while i < n {
+        // Locate the next smooth-term head (`<keyword> \s* (`) at or after `i`,
+        // respecting word boundaries so `abs(` never matches the `s(` head.
+        let mut head: Option<(usize, usize)> = None; // (head_start, paren_index)
+        let mut p = i;
+        while p < n {
+            let boundary = p == 0 || !is_ident(chars[p - 1]);
+            if boundary {
+                for kw in SMOOTH_HEAD_KEYWORDS.iter() {
+                    let klen = kw.chars().count();
+                    if p + klen > n || chars[p..p + klen].iter().collect::<String>() != **kw {
+                        continue;
+                    }
+                    let mut q = p + klen;
+                    while q < n && chars[q].is_whitespace() {
+                        q += 1;
+                    }
+                    if q < n && chars[q] == '(' {
+                        head = Some((p, q));
+                        break;
+                    }
+                }
+            }
+            if head.is_some() {
+                break;
+            }
+            p += 1;
+        }
+        let (head_start, paren_open) = match head {
+            Some(h) => h,
+            None => {
+                out.extend(chars[i..].iter());
+                break;
+            }
+        };
+        out.extend(chars[i..head_start].iter());
+
+        // Find the matching close paren, honoring nesting and string literals.
+        let body_start = paren_open + 1;
+        let mut depth = 1i32;
+        let mut j = body_start;
+        let mut in_str: Option<char> = None;
+        let mut closed = false;
+        while j < n {
+            let ch = chars[j];
+            if let Some(quote) = in_str {
+                if ch == quote {
+                    in_str = None;
+                }
+            } else if ch == '\'' || ch == '"' {
+                in_str = Some(ch);
+            } else if ch == '(' {
+                depth += 1;
+            } else if ch == ')' {
+                depth -= 1;
+                if depth == 0 {
+                    closed = true;
+                    break;
+                }
+            }
+            j += 1;
+        }
+        if !closed {
+            // Unbalanced — emit the remainder verbatim; the DSL parser will
+            // produce the canonical error.
+            out.extend(chars[head_start..].iter());
+            break;
+        }
+
+        let term_text: String = chars[head_start..=j].iter().collect();
+        let key_norm = strip_ws(&term_text);
+        match wanted.get(&key_norm) {
+            None => out.extend(chars[head_start..=j].iter()),
+            Some(kind) => {
+                let head_paren: String = chars[head_start..body_start].iter().collect();
+                let inside: String = chars[body_start..j].iter().collect();
+                let inside = inside.trim();
+                if inside.is_empty() {
+                    out.push_str(&format!("{head_paren}shape={kind})"));
+                } else {
+                    out.push_str(&format!("{head_paren}{inside}, shape={kind})"));
+                }
+                matched.insert(key_norm);
+            }
+        }
+        i = j + 1;
+    }
+
+    let mut missing: Vec<String> = wanted
+        .keys()
+        .filter(|k| !matched.contains(*k))
+        .map(|k| originals.get(k).cloned().unwrap_or_else(|| k.clone()))
+        .collect();
+    if !missing.is_empty() {
+        missing.sort();
+        return Err(format!(
+            "shape constraints referenced smooth term(s) not found in formula: {}",
+            missing.join(", ")
+        ));
+    }
+    Ok(out)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BySmoothKind {
     Numeric,
