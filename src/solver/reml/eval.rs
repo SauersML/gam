@@ -2110,6 +2110,203 @@ mod smoothing_correction_outcome_tests {
         assert!(after > before);
     }
 
+    /// #582 — the SIGMA-CUBATURE smoothing-correction path must be
+    /// response-scale equivariant: under `y → c·y` the returned correction (and
+    /// hence `Vp = Vb + correction`) must scale by exactly `c²`, never `c⁴`.
+    ///
+    /// This is the DETERMINISTIC companion to the first-order integration test
+    /// `corrected_covariance_is_response_scale_equivariant`. A full `fit_gam`
+    /// will not reliably drive ρ̂ into `AUTO_CUBATURE_BOUNDARY_MARGIN` of the
+    /// box edge, so instead of hoping a fit lands there, this test calls
+    /// [`RemlState::compute_smoothing_correction_auto`] directly with a
+    /// `final_rho` FORCED to `RHO_BOUND − 1` (inside the 2.0 margin): the
+    /// `near_boundary` gate is then unconditionally `true` and the cubature
+    /// branch fires (asserted via the `SMOOTHING_CORRECTION_CUBATURE_COUNT`
+    /// delta). Running the same construction at response scales `1` and `c`
+    /// then exercises the per-sigma φ̂ curvature scaling on the cubature path
+    /// and asserts the `c²` (not `c⁴`) equivariance of the correction itself.
+    ///
+    /// For a Gaussian identity GAM `H = XᵀWX + λS` is dispersion-free, so the
+    /// base covariance `H⁻¹` is IDENTICAL at both scales; β̂ → c·β̂ and the
+    /// deviance (RSS) → c²·deviance, so φ̂ → c²·φ̂. The cubature correction
+    ///   φ̂·(E_ρ[H⁻¹] − H_opt⁻¹) + Cov_ρ[β̂]
+    /// then scales by exactly c² when (and only when) the curvature block
+    /// carries exactly one φ̂ — the fix under test.
+    #[test]
+    fn cubature_smoothing_correction_is_response_scale_equivariant() {
+        use crate::estimate::PenaltySpec;
+        use crate::types::{
+            GlmLikelihoodSpec, InverseLink, LikelihoodSpec, ResponseFamily, StandardLink,
+        };
+
+        // Deterministic small Gaussian identity design (n=24, p=4: intercept +
+        // 3 penalized columns). Smooth, well-conditioned; the near-boundary ρ
+        // is FORCED below, not discovered, so the data need only yield a valid
+        // converged inner fit and an invertible ρ-Hessian.
+        fn design(scale: f64) -> (Array2<f64>, Array1<f64>) {
+            let n = 24usize;
+            let p = 4usize;
+            let mut x = Array2::<f64>::zeros((n, p));
+            let mut y = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let t = (i as f64) / ((n - 1) as f64);
+                let tau = std::f64::consts::TAU;
+                x[[i, 0]] = 1.0;
+                x[[i, 1]] = t;
+                x[[i, 2]] = (tau * t).sin();
+                x[[i, 3]] = (tau * t).cos();
+                let base = 0.7 + 0.9 * t + 0.5 * (tau * t).sin()
+                    + 0.05 * ((i as f64) * 2.399_963).sin();
+                y[i] = scale * base;
+            }
+            (x, y)
+        }
+
+        // Ridge on the 3 non-intercept columns; nullspace dim 1 (the intercept).
+        let p = 4usize;
+        let mut s = Array2::<f64>::zeros((p, p));
+        for j in 1..p {
+            s[[j, j]] = 1.0;
+        }
+
+        // Force the near-boundary gate: ρ = RHO_BOUND − 1 is within
+        // AUTO_CUBATURE_BOUNDARY_MARGIN (= 2.0) of RHO_BOUND, so
+        // `near_boundary` is true regardless of where any optimizer would land.
+        let final_rho = Array1::from_vec(vec![RHO_BOUND - 1.0]);
+
+        // Run the full cubature path at one response scale; return the returned
+        // correction matrix plus the cubature-counter delta observed for THIS
+        // call (proves the cubature branch — not the first-order fallback — ran).
+        let run = |scale: f64| -> (Array2<f64>, u64) {
+            let (x, y) = design(scale);
+            let n = x.nrows();
+            let w = Array1::<f64>::ones(n);
+            let offset = Array1::<f64>::zeros(n);
+
+            let spec = PenaltySpec::Dense(s.clone());
+            let canonical =
+                crate::construction::canonicalize_penalty_specs(&[spec], &[1], p, "test")
+                    .map(|(canonical, _)| canonical)
+                    .expect("canonicalize penalty");
+            let cfg = RemlConfig::external(
+                GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                    ResponseFamily::Gaussian,
+                    InverseLink::Standard(StandardLink::Identity),
+                )),
+                1e-12,
+                false,
+            );
+            let state = RemlState::newwith_offset(
+                y.view(),
+                x.clone(),
+                w.view(),
+                offset.view(),
+                canonical,
+                p,
+                &cfg,
+                Some(vec![1]),
+                None,
+                None,
+            )
+            .expect("build RemlState");
+
+            // Converged inner fit at the forced near-boundary ρ — this is the
+            // `final_fit` the cubature path differentiates around, and its
+            // Qs-mapped H⁻¹ is the dispersion-free base covariance the
+            // correction upgrades.
+            let final_fit = state
+                .execute_pirls_stateless_for_cubature(&final_rho)
+                .expect("inner PIRLS at near-boundary rho");
+            let h_orig = map_hessian_to_original_basis(final_fit.as_ref())
+                .expect("map Hessian to original basis");
+            let base_cov = matrix_inversewith_regularization(&h_orig, "test base cov")
+                .expect("invert base Hessian");
+
+            // Profiled Gaussian dispersion φ̂ = deviance / (n − p). Deviance (RSS)
+            // scales as c², the denominator is scale-invariant, so φ̂ scales as c².
+            let dispersion_phi = final_fit.deviance / ((n as f64) - (p as f64)).max(1.0);
+
+            // Real outer-gradient norm at the forced ρ (finite, for the gate's
+            // highgrad arm); near_boundary already guarantees cubature entry.
+            let finalgrad_norm = state
+                .compute_gradient(&final_rho)
+                .map(|g| g.dot(&g).sqrt())
+                .unwrap_or(0.0);
+
+            let before = SMOOTHING_CORRECTION_CUBATURE_COUNT.load(Ordering::SeqCst);
+            let outcome = state.compute_smoothing_correction_auto(
+                &final_rho,
+                final_fit.as_ref(),
+                Some(&base_cov),
+                dispersion_phi,
+                finalgrad_norm,
+            );
+            let after = SMOOTHING_CORRECTION_CUBATURE_COUNT.load(Ordering::SeqCst);
+
+            let correction = outcome
+                .into_correction()
+                .expect("cubature/first-order outcome carries a correction matrix");
+            (correction, after.saturating_sub(before))
+        };
+
+        let c = 1000.0_f64;
+        let c2 = c * c;
+
+        let (corr1, fired1) = run(1.0);
+        let (corrc, firedc) = run(c);
+
+        // The cubature branch must have fired at BOTH scales — otherwise this
+        // test would silently fall back to the first-order path and NOT cover
+        // the eval.rs per-sigma φ̂ curvature scaling (#582).
+        assert!(
+            fired1 > 0,
+            "sigma-cubature branch did not fire at scale 1 (delta {fired1}); \
+             the near-boundary gate should have forced it"
+        );
+        assert!(
+            firedc > 0,
+            "sigma-cubature branch did not fire at scale {c} (delta {firedc})"
+        );
+
+        // The correction must be materially non-zero (so the equivariance check
+        // is not vacuous) and finite.
+        let frob1 = corr1.iter().map(|v| v * v).sum::<f64>().sqrt();
+        assert!(
+            frob1.is_finite() && frob1 > 0.0,
+            "scale-1 cubature correction must be finite and non-zero (‖corr‖={frob1:.3e})"
+        );
+        assert_eq!(corr1.dim(), corrc.dim(), "correction shape mismatch across scales");
+
+        // Property under test: every entry scales by exactly c² (never c⁴).
+        let mut worst_rel = 0.0_f64;
+        let (mut wi, mut wj) = (0usize, 0usize);
+        for i in 0..p {
+            for j in 0..p {
+                let expected = c2 * corr1[[i, j]];
+                let got = corrc[[i, j]];
+                let denom = expected.abs().max(c2 * frob1 * 1e-12).max(1e-300);
+                let rel = (got - expected).abs() / denom;
+                if rel > worst_rel {
+                    worst_rel = rel;
+                    wi = i;
+                    wj = j;
+                }
+            }
+        }
+        assert!(
+            worst_rel < 1e-6,
+            "cubature smoothing correction is not response-scale equivariant: \
+             corr[{wi},{wj}] scales by {factor:.3e}·c² instead of c² \
+             (corr@1={a:.6e}, corr@{c}={b:.6e}, expected {e:.6e}, rel {worst_rel:.3e}). \
+             A `c⁴` here is the per-sigma curvature term carrying φ̂ twice; a `c⁰` \
+             factor is the curvature term missing its φ̂ (#582).",
+            factor = corrc[[wi, wj]] / (c2 * corr1[[wi, wj]]).abs().max(1e-300),
+            a = corr1[[wi, wj]],
+            b = corrc[[wi, wj]],
+            e = c2 * corr1[[wi, wj]],
+        );
+    }
+
     #[test]
     fn classification_reason_strings_are_nonempty_and_distinct() {
         let reasons = [
