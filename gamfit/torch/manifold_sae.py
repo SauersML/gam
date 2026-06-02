@@ -445,9 +445,11 @@ class _SparsityLayer(nn.Module):
 
     For IBP-Gumbel and JumpReLU the penalty term used in the loss routes
     through :mod:`gamfit.torch.penalties`, which themselves call
-    ``analytic_penalty_value_grad`` in Rust. For softmax-topk the activation
-    is a pointwise autograd primitive and the closed-form ``.fit()`` path
-    drives the Rust selector; no separate Rust penalty descriptor exists.
+    ``analytic_penalty_value_grad`` in Rust. The ``softmax_topk`` arm is a
+    top-k SAE gate (per-atom independent non-negative activation, hard top-k
+    forward with a straight-through estimator); its loss penalty is an L1
+    sparsity pressure on that gate, the differentiable analogue of the
+    closed-form ``.fit()`` path's entropy-toward-one-hot assignment sparsity.
     """
 
     def __init__(self, cfg: ManifoldSAEConfig) -> None:
@@ -503,17 +505,58 @@ class _SparsityLayer(nn.Module):
             assignments = ibp_map(logits, tau, self._init_alpha)
             return assignments, logits
         if self.kind == "softmax_topk":
-            tau = float(self.tau.item())
-            probs = torch.softmax(logits / max(tau, 1e-6), dim=-1)
-            _, top_idx = torch.topk(probs, k=self.target_k, dim=-1)
-            mask = torch.zeros_like(probs)
-            mask.scatter_(-1, top_idx, 1.0)
-            hard = probs * mask
-            assignments = probs + (hard - probs).detach()
-            return assignments, logits
+            return self._topk_gate(logits), logits
         # JumpReLU activation: hard threshold forward, Rust-STE backward.
         assignments = self._jumprelu.gate(logits)
         return assignments, logits
+
+    def _topk_gate(self, logits: torch.Tensor) -> torch.Tensor:
+        """Top-k SAE gate: per-atom **independent** non-negative activation.
+
+        The previous implementation applied a row-wise ``softmax`` over the atom
+        axis before the top-k mask. A softmax is a *competitive simplex*: its
+        per-row mass is normalized to one, so it can only express which atom wins
+        the competition for a row, never whether a feature is *present at all*.
+        When a planted feature is absent the encoder cannot turn every atom off —
+        the simplex always redistributes ~1.0 of assignment mass — so the gate
+        is structurally unable to correlate with feature presence and routing
+        collapses into distributed/entangled atoms (issue #583).
+
+        The correct construction for one-atom-per-feature routing is the standard
+        top-k SAE encoder: a non-negative activation computed *independently per
+        atom*, with the top-k largest kept and the rest zeroed. Independence lets
+        every atom sit near zero when its feature is absent and rise on its own
+        when present, so the activation tracks features; the top-k constraint
+        supplies the sparsity that disentangles atoms. A temperature-scaled
+        softplus gives a smooth, strictly-non-negative activation whose hardness
+        anneals through the shared ``tau`` schedule (``tau → 0`` ⇒ ReLU). The
+        hard top-k mask is applied with a straight-through estimator so gradients
+        reach the selected atoms' pre-activations.
+        """
+        tau = max(float(self.tau.item()), 1e-6)
+        act = tau * F_torch.softplus(logits / tau)
+        k = min(self.target_k, act.shape[-1])
+        _, top_idx = torch.topk(act, k=k, dim=-1)
+        mask = torch.zeros_like(act)
+        mask.scatter_(-1, top_idx, 1.0)
+        hard = act * mask
+        # Straight-through: hard top-k value forward, dense activation backward.
+        return act + (hard - act).detach()
+
+    def compose_code(self, assignments: torch.Tensor, amp: torch.Tensor) -> torch.Tensor:
+        """Per-atom latent code ``z`` from gate ``assignments`` and ``amp``.
+
+        The factorization depends on the gate's range. The IBP-Gumbel gate is a
+        dimensionless activation probability in ``[0, 1]``, so the code is the
+        gate scaled by the separate non-negative magnitude ``amp`` (``z = gate ·
+        amp``). The JumpReLU and top-k gates are *magnitude-carrying*
+        activations — the gate already equals the SAE code — so multiplying by
+        ``amp`` again would square the magnitude and distort the
+        reconstruction gradient; the gate is returned as the code directly.
+        """
+        if self.kind == "ibp_gumbel":
+            return assignments * amp
+        return assignments
 
     def penalty(self, logits: torch.Tensor) -> torch.Tensor:
         """Rust-backed scalar penalty value at ``logits``."""
@@ -521,7 +564,15 @@ class _SparsityLayer(nn.Module):
             return self._ibp(logits)
         if self.kind == "jumprelu":
             return self._jumprelu(logits)
-        return logits.new_zeros(())
+        # Top-k SAE: an L1 pressure on the (non-negative, top-k-masked)
+        # activations. Top-k alone caps the number of active atoms but does not
+        # push an *unneeded* selected atom's activation toward zero, so without
+        # this term a row can keep ``target_k`` atoms weakly co-active and stay
+        # entangled. The L1 on the gate is the convex sparsity prior that drives
+        # absent-feature activations to zero, the differentiable analogue of the
+        # closed-form softmax path's entropy-toward-one-hot sparsity.
+        gate = self._topk_gate(logits)
+        return gate.abs().mean()
 
 
 # ---------------------------------------------------------------------------
@@ -642,7 +693,6 @@ class ManifoldSAE(nn.Module):
             )
         if self._last_fit is not None:
             return self._forward_from_closed_form(x)
-        F = int(self.cfg.n_atoms)
         raw_positions, amp_logits = self._encode(x)
         raw_with_anchor = raw_positions + self.atom_raw_anchor.unsqueeze(0)
         positions = _project_to_manifold(
@@ -655,7 +705,7 @@ class ManifoldSAE(nn.Module):
         )
         amp = F_torch.softplus(amp_logits)
         assignments, gate_pre = self.sparsity(amp_logits)
-        z = assignments * amp
+        z = self.sparsity.compose_code(assignments, amp)
         per_atom_recon = torch.einsum("nfk,fkd->nfd", curves, self.decoder_blocks)
         x_hat = (z.unsqueeze(-1) * per_atom_recon).sum(dim=1)
 
