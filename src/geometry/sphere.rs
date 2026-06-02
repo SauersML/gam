@@ -366,12 +366,17 @@ pub fn response_sphere_log_map(
     if d != b_mat.ncols() {
         return Err("spherical values and base point have different dimensions".to_string());
     }
+    // The per-row geodesic angle needs the inner product `pᵢ·base` for every
+    // one of the n rows. Collected together this is a single matrix–vector
+    // product `Y · base` (n×d · d → n), so it routes through the auto-dispatch
+    // `fast_av` shim and offloads to the GPU for large response batches; the
+    // remaining per-row scalar work (atan2 angle, tangent scaling) is identical
+    // to the elementwise form. f64 throughout.
+    let base_vec = b_mat.row(0).to_owned();
+    let dots = crate::linalg::faer_ndarray::fast_av(&y, &base_vec);
     let mut out = Array2::<f64>::zeros((n, d));
     for row in 0..n {
-        let mut dot = 0.0_f64;
-        for col in 0..d {
-            dot += y[[row, col]] * b_mat[[0, col]];
-        }
+        let mut dot = dots[row];
         dot = dot.clamp(-1.0, 1.0);
         if dot <= -1.0 + 1.0e-12 {
             return Err("spherical log map is undefined at antipodal points".to_string());
@@ -419,12 +424,15 @@ pub fn response_sphere_exp_map(
     if !tangent.iter().all(|v| v.is_finite()) {
         return Err("spherical tangent must contain only finite values".to_string());
     }
+    // The radial component `tangentᵢ·base` for every row collected together is
+    // the matrix–vector product `T · base` (n×d · d → n); route it through the
+    // GPU-dispatched `fast_av` shim, then finish each row's geodesic step with
+    // the identical scalar math. f64 throughout.
+    let base_vec = b_mat.row(0).to_owned();
+    let radials = crate::linalg::faer_ndarray::fast_av(&tangent, &base_vec);
     let mut out = Array2::<f64>::zeros((n, d));
     for row in 0..n {
-        let mut radial = 0.0_f64;
-        for col in 0..d {
-            radial += tangent[[row, col]] * b_mat[[0, col]];
-        }
+        let radial = radials[row];
         let mut z = vec![0.0_f64; d];
         let mut r_sq = 0.0_f64;
         for col in 0..d {
