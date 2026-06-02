@@ -8961,5 +8961,4 @@ mod tests {
         .expect_err("non-strictly-increasing prefixes must error");
         assert!(err.contains("strictly increasing"), "got: {err}");
     }
-
 }

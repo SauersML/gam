@@ -83,7 +83,7 @@ class Model:
 
             * Standard GAM, no interval / id_column / return_type: a 1-D
               ``ndarray`` of point predictions on the response scale (the
-              fitted mean).
+              posterior-mean fitted value).
             * Standard GAM with ``interval`` / ``id_column`` / ``return_type``:
               a table (dict / DataFrame / ...) with columns
               ``linear_predictor`` (linear-predictor scale; equals ``mean``
