@@ -57,6 +57,29 @@ use faer::Side;
 const SAE_MANIFOLD_ARMIJO_C1: f64 = 1.0e-4;
 const SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS: usize = 12;
 
+/// Reactivation band width (in units of the JumpReLU temperature `τ`) below the
+/// hard gate threshold. The forward gate value is hard-zero strictly below
+/// `threshold`, but an atom whose logit lies within `threshold − MARGIN·τ` is
+/// still admitted to the compact Newton active set and granted logit gradient,
+/// so a gated-off atom near the boundary keeps the surrogate-sigmoid slope it
+/// needs to climb back across the threshold and reactivate. Below the band the
+/// shifted-sigmoid derivative `σ'((l−θ)/τ)` is vanishingly small, so the band
+/// captures essentially all of the gradient mass that could drive reactivation
+/// (at `MARGIN = 4`, `σ((l−θ)/τ) < σ(−4) ≈ 0.018` at the band edge). Without the
+/// band the gate is an absorbing pruning rule, not a learnable gate.
+const JUMPRELU_REACTIVATION_MARGIN: f64 = 4.0;
+
+/// Shared band predicate for JumpReLU optimization inclusion. An atom is kept
+/// optimizable (compact-layout inclusion, logit-JVP support, prior-gradient
+/// support) when its logit is above the reactivation band's lower edge
+/// `threshold − MARGIN·τ`. This is strictly weaker than the hard forward gate
+/// `logit > threshold`, which still governs the gate *value*. All inclusion /
+/// gradient-support sites route through this one predicate so they cannot drift.
+#[inline]
+fn jumprelu_in_optimization_band(logit: f64, threshold: f64, temperature: f64) -> bool {
+    logit > threshold - JUMPRELU_REACTIVATION_MARGIN * temperature
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SaeStreamingPlan {
     pub streaming: bool,
@@ -1696,7 +1719,14 @@ pub enum AssignmentMode {
         alpha: f64,
         learnable_alpha: bool,
     },
-    /// Independent sigmoid activations with a hard JumpReLU active gate.
+    /// Hard-thresholded bounded gate: each atom is off (gate = 0) when its logit
+    /// is at or below `threshold`, and on with a threshold-centered shifted
+    /// sigmoid `σ((logit − threshold) / temperature) ∈ [0.5, 1)` above it. This
+    /// is NOT literal JumpReLU `z·1[z>θ]` — the gate carries no magnitude; it is
+    /// a member of the gate family (softmax simplex / IBP sigmoid / this hard
+    /// gate) and stays bounded in [0, 1]. Reconstruction magnitude lives entirely
+    /// in the decoder curve `g_k(t) = φ(t)ᵀ B_k`. The discontinuity at `threshold`
+    /// (0 → 0.5) is the intended "jump".
     JumpReLU { temperature: f64, threshold: f64 },
 }
 
@@ -1912,7 +1942,12 @@ impl SaeAssignment {
 
     pub fn try_assignments_row(&self, row: usize) -> Result<Array1<f64>, String> {
         validate_finite_logits(self.logits.row(row), row)?;
-        if self.k_atoms() == 1 {
+        // Only Softmax collapses to a fixed assignment at K==1: its
+        // assignment_coord_dim is K-1 = 0, so there is no free logit. IBPMap and
+        // JumpReLU keep a free per-atom gate logit even at K==1
+        // (assignment_coord_dim = K = 1), so they must fall through to their real
+        // row functions or the logit would move the prior but not the gate.
+        if self.k_atoms() == 1 && matches!(self.mode, AssignmentMode::Softmax { .. }) {
             return Ok(Array1::from_vec(vec![1.0]));
         }
         match self.mode {
@@ -2301,11 +2336,19 @@ pub struct SaeRowLayout {
 }
 
 impl SaeRowLayout {
-    /// JumpReLU structural active set: atoms with `logit > threshold`.
+    /// JumpReLU optimization active set: atoms within the reactivation band
+    /// `logit > threshold − MARGIN·τ` (see [`jumprelu_in_optimization_band`]).
+    /// This is intentionally wider than the hard forward gate `logit > threshold`
+    /// so that gated-off atoms near the boundary remain in the Newton system and
+    /// keep logit gradient — their forward reconstruction contribution is still
+    /// hard-zero (`a_k = 0` below threshold), but their logit-JVP row carries the
+    /// surrogate-sigmoid slope needed to cross back. Including only
+    /// `logit > threshold` would make the gate an absorbing pruning rule.
     fn from_jumprelu(
         n: usize,
         k_atoms: usize,
         threshold: f64,
+        temperature: f64,
         logits: &Array2<f64>,
         coord_dims: Vec<usize>,
         coord_offsets_full: Vec<usize>,
@@ -2314,7 +2357,7 @@ impl SaeRowLayout {
         for row in 0..n {
             let row_logits = logits.row(row);
             let active: Vec<usize> = (0..k_atoms)
-                .filter(|&k| row_logits[k] > threshold)
+                .filter(|&k| jumprelu_in_optimization_band(row_logits[k], threshold, temperature))
                 .collect();
             per_row.push(active);
         }
@@ -3027,9 +3070,13 @@ impl SaeManifoldTerm {
         }
 
         // Per-row active-set layout. Engaged for two regimes:
-        //   * JumpReLU — structural gate (`logit > threshold`); the compact
-        //     solve is bit-identical to the dense one (gated atoms carry zero
-        //     assignment mass).
+        //   * JumpReLU — structural gate plus a reactivation band: atoms with
+        //     `logit > threshold − MARGIN·τ` enter the compact solve
+        //     ([`jumprelu_in_optimization_band`]). Strictly gated-off atoms
+        //     (logit ≤ threshold) carry zero assignment mass so their data-fit
+        //     reconstruction contribution is zero, but band atoms keep a
+        //     logit-JVP row + prior gradient so a gated-off atom near the
+        //     boundary can climb back across the threshold and reactivate.
         //   * IBP-MAP at large `K` — the dense `(m_total · p)²` data
         //     Gram is infeasible, so each row is truncated to its
         //     top-`k_active` atoms above a relative magnitude cutoff
@@ -3044,10 +3091,14 @@ impl SaeManifoldTerm {
             .map(|c| c.latent_dim())
             .collect();
         let row_layout: Option<SaeRowLayout> = match self.assignment.mode {
-            AssignmentMode::JumpReLU { threshold, .. } => Some(SaeRowLayout::from_jumprelu(
+            AssignmentMode::JumpReLU {
+                threshold,
+                temperature,
+            } => Some(SaeRowLayout::from_jumprelu(
                 n,
                 k_atoms,
                 threshold,
+                temperature,
                 &self.assignment.logits,
                 coord_dims.clone(),
                 self.assignment.coord_offsets(),
@@ -3186,7 +3237,8 @@ impl SaeManifoldTerm {
             }
 
             // Determine whether this row uses the compact active-set layout.
-            //   * JumpReLU: only gated atoms (logit > threshold) enter.
+            //   * JumpReLU: gated atoms plus the reactivation band
+            //     (logit > threshold − MARGIN·τ) enter.
             //   * IBP-MAP at large K: only the top-`k_active` atoms.
             //   * Otherwise (small K): the dense uniform-q layout.
             let (q_row, local_jac_row) = if let Some(ref layout) = row_layout {
@@ -4589,7 +4641,7 @@ impl SaeManifoldTerm {
                 for row in 0..n {
                     let row_base = row * q + coord_offsets[atom_idx];
                     for axis in 0..d {
-                        delta_coord[row * d + axis] = full_delta[row_base + axis];
+                        delta_coord[row * d + axis] = step_size * full_delta[row_base + axis];
                     }
                 }
                 self.assignment.coords[atom_idx].retract_flat_delta(delta_coord.view());
@@ -5744,10 +5796,16 @@ fn canonicalize_softmax_logits(logits: &mut Array2<f64>) {
     }
 }
 
-/// Truncated-IBP stick-breaking prior weights `π_k = (α/(α+1))^k` for
-/// k = 0, .., K-1. Under a Beta(α, 1) stick-breaking construction these are
-/// the prior means of the active-set probabilities, so IBP-MAP assignment
-/// mass should decay geometrically in `k` even when logits are tied.
+/// Deterministic ordered geometric-shrinkage MAP weights
+/// `π_k = (α/(α+1))^k` for k = 0, .., K-1, with the first atom intentionally
+/// left unshrunk (`π_0 = 1`, the always-available base atom). This is NOT a
+/// sampled or variational Indian-Buffet-Process posterior: it is a fixed,
+/// deterministic per-atom shrinkage schedule that biases assignment mass to
+/// decay geometrically with atom index even when logits are tied. `α` is a
+/// shrinkage rate (larger `α` ⇒ slower decay), not an IBP concentration in the
+/// sampling sense. The geometric form coincides with the prior means of a
+/// Beta(α, 1) stick-breaking construction, which is the motivation for the
+/// schedule, but no sticks are drawn here.
 fn ibp_stick_breaking_prior(k_atoms: usize, alpha: f64) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(k_atoms);
     let ratio = alpha / (alpha + 1.0);
@@ -5802,8 +5860,13 @@ pub fn ibp_map_row_value_grad(
 fn jumprelu_row(logits: ArrayView1<'_, f64>, temperature: f64, threshold: f64) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(logits.len());
     for i in 0..logits.len() {
+        // Hard gate: strictly zero below threshold (the intended "jump"). Above
+        // threshold the surrogate is centered at the threshold so the gate is
+        // most informative exactly at the boundary it switches on:
+        // σ((l−θ)/τ) ∈ [0.5, 1). Magnitude lives in the decoder, so the gate
+        // stays bounded in [0, 1] by design.
         if logits[i] > threshold {
-            out[i] = crate::linalg::utils::stable_logistic(logits[i] / temperature);
+            out[i] = crate::linalg::utils::stable_logistic((logits[i] - threshold) / temperature);
         }
     }
     out
@@ -5856,12 +5919,15 @@ fn fill_active_atom_logit_jvp(
             temperature,
             threshold,
         } => {
-            // Hard-gate STE: sigmoid derivative, only above threshold.
-            if logit_k <= threshold {
+            // Hard-gate STE: derivative of the threshold-centered surrogate
+            // σ((l−θ)/τ). Gradient support extends through the reactivation band
+            // (logit > θ − MARGIN·τ), not just above the hard gate, so a
+            // gated-off atom near the boundary can still climb back across it.
+            if !jumprelu_in_optimization_band(logit_k, threshold, temperature) {
                 return;
             }
             let inv_tau = 1.0 / temperature;
-            let activation = crate::linalg::utils::stable_logistic(logit_k * inv_tau);
+            let activation = crate::linalg::utils::stable_logistic((logit_k - threshold) * inv_tau);
             let da = activation * (1.0 - activation) * inv_tau;
             for out_col in 0..p {
                 jac_compact[[j, out_col]] = da * decoded_k[out_col];
@@ -5918,14 +5984,18 @@ fn fill_assignment_logit_jvp_rows(
             temperature,
             threshold,
         } => {
-            // Standard STE for the hard gate: the sigmoid derivative
-            // contributes only on logits above the JumpReLU threshold.
+            // STE for the hard gate: derivative of the threshold-centered
+            // surrogate σ((l−θ)/τ). Gradient support extends through the
+            // reactivation band (logit > θ − MARGIN·τ), matching the compact
+            // layout's inclusion predicate so optimization support and Newton
+            // support never drift.
             let inv_tau = 1.0 / temperature;
             for logit_col in 0..assignments.len() {
-                if logits[logit_col] <= threshold {
+                if !jumprelu_in_optimization_band(logits[logit_col], threshold, temperature) {
                     continue;
                 }
-                let activation = crate::linalg::utils::stable_logistic(logits[logit_col] * inv_tau);
+                let activation =
+                    crate::linalg::utils::stable_logistic((logits[logit_col] - threshold) * inv_tau);
                 let da = activation * (1.0 - activation) * inv_tau;
                 for out_col in 0..fitted.len() {
                     local_jac[[logit_col, out_col]] = da * decoded[[logit_col, out_col]];
@@ -5986,11 +6056,14 @@ fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifoldRho) -> f
             temperature,
             threshold,
         } => {
+            // Sparsity penalty on the gate value; matches the forward gate
+            // exactly — hard-zero below threshold, threshold-centered surrogate
+            // σ((l−θ)/τ) above.
             let sparsity_strength = rho.log_lambda_sparse.exp();
             let mut acc = 0.0;
             for &logit in target.iter() {
                 if logit > threshold {
-                    acc += crate::linalg::utils::stable_logistic(logit / temperature);
+                    acc += crate::linalg::utils::stable_logistic((logit - threshold) / temperature);
                 }
             }
             sparsity_strength * acc
@@ -6050,6 +6123,12 @@ fn assignment_prior_grad_hdiag(
             temperature,
             threshold,
         } => {
+            // Gradient of the threshold-centered surrogate σ((l−θ)/τ). Gradient
+            // support extends through the reactivation band (logit > θ − MARGIN·τ)
+            // so a gated-off atom near the boundary keeps prior gradient and the
+            // prior-gradient support tracks the layout-inclusion and JVP-support
+            // predicates exactly. The forward gate value above stays hard-zero
+            // strictly below threshold.
             let sparsity_strength = rho.log_lambda_sparse.exp();
             let inv_tau = 1.0 / temperature;
             let inv_tau2 = inv_tau * inv_tau;
@@ -6057,10 +6136,10 @@ fn assignment_prior_grad_hdiag(
             let mut d = Array1::<f64>::zeros(target.len());
             for idx in 0..target.len() {
                 let logit = target[idx];
-                if logit <= threshold {
+                if !jumprelu_in_optimization_band(logit, threshold, temperature) {
                     continue;
                 }
-                let activation = crate::linalg::utils::stable_logistic(logit * inv_tau);
+                let activation = crate::linalg::utils::stable_logistic((logit - threshold) * inv_tau);
                 let slope = activation * (1.0 - activation);
                 g[idx] = sparsity_strength * slope * inv_tau;
                 d[idx] = sparsity_strength * slope * slope * inv_tau2;
@@ -7872,11 +7951,13 @@ mod tests {
         assert_eq!(diag.len(), n * k);
         for (idx, &entry) in diag.iter().enumerate() {
             let logit = logits[[idx / k, idx % k]];
-            // Expected = JumpReLU gated majorizer. Softmax identifiability is
-            // handled by its reference-logit chart, not by adding curvature to
-            // gate logits.
-            let sparsity = if logit > threshold {
-                let activation = crate::linalg::utils::stable_logistic(logit * inv_tau);
+            // Expected = JumpReLU gated majorizer with the threshold-centered
+            // surrogate σ((l−θ)/τ), supported through the reactivation band
+            // (logit > θ − MARGIN·τ) so gated-off atoms near the boundary keep
+            // prior gradient. Softmax identifiability is handled by its
+            // reference-logit chart, not by adding curvature to gate logits.
+            let sparsity = if jumprelu_in_optimization_band(logit, threshold, temperature) {
+                let activation = crate::linalg::utils::stable_logistic((logit - threshold) * inv_tau);
                 let slope = activation * (1.0 - activation);
                 sparsity_strength * slope * slope * inv_tau2
             } else {
