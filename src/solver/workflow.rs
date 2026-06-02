@@ -1822,7 +1822,7 @@ fn survival_unified_fit_result(
     // `try_from_parts` invariant requires.
     let (edf_total, edf_by_block, penalized_hessian) =
         survival_transformation_edf(state, penalty_blocks)?;
-    debug_assert_eq!(edf_by_block.len(), lambdas.len());
+    assert_eq!(edf_by_block.len(), lambdas.len());
 
     let inference = crate::estimate::FitInference {
         edf_by_block: edf_by_block.clone(),

@@ -1334,13 +1334,55 @@ fn factor_one_row(
         .max(1.0);
     let ridge_cap = ridge_t.max(1.0e-12 * diag_scale) * 1.0e12;
     let mut ridge_eff = ridge_t;
+    // Escalate the per-row ridge until the block is BOTH positive-definite AND
+    // well-conditioned. Previously the escalation only fired on a *failed*
+    // Cholesky (indefinite block); a barely-PD but ill-conditioned block
+    // (pivots ~ε·trace — e.g. a rank-deficient / over-parameterized decoder
+    // atom) factored successfully and was then rejected outright as
+    // `PerRowFactorIllConditioned`, so the ridge the SAE audit advertises
+    // ("the Arrow-Schur ridge will regularise the deficient directions") never
+    // got the chance to. Folding the κ proxy into the loop lets the ridge lift
+    // just enough to regularise the deficient directions, as advertised,
+    // instead of aborting the whole fit (gam#578). A genuinely PD,
+    // well-conditioned block factors at the base ridge with zero escalation and
+    // is bit-for-bit unchanged; only a block that cannot be conditioned even at
+    // `ridge_cap` (1e12 × base) still surfaces an error for the outer loop.
     let factor = loop {
         let mut block = row.htt.clone();
         for a in 0..d {
             block[[a, a]] += ridge_eff;
         }
         match cholesky_lower(&block) {
-            Ok(factor) => break factor,
+            Ok(factor) => {
+                // Evidence/log-det-only callers tolerate ill-conditioning: the
+                // factor is genuinely PD, so its diagonal gives an exact log|S|
+                // and an inaccurate Δβ would be discarded anyway.
+                if tolerate_ill_conditioning {
+                    break factor;
+                }
+                // Diagonal-ratio condition-number proxy κ(LLᵀ) ≈
+                // (max L_ii / min L_ii)², vs the dimension-scaled Higham
+                // near-singularity ceiling. A barely-PD inverse plugged into
+                //   S = H_ββ + ridge_β·I − Σ_i H_tβ^(i)ᵀ (H_tt^(i))⁻¹ H_tβ^(i)
+                // contaminates S by spectral terms scaled by κ_i, so an
+                // over-threshold block is regularised further rather than used.
+                let kappa_est = cholesky_factor_kappa_estimate(&factor);
+                if kappa_est.is_finite() && kappa_est <= safe_spd_kappa_max(d) {
+                    break factor;
+                }
+                let next = if ridge_eff > 0.0 {
+                    ridge_eff * 10.0
+                } else {
+                    1.0e-10 * diag_scale
+                };
+                if !next.is_finite() || next > ridge_cap {
+                    return Err(ArrowSchurError::PerRowFactorIllConditioned {
+                        row: row_idx,
+                        kappa_estimate: kappa_est,
+                    });
+                }
+                ridge_eff = next;
+            }
             Err(e) => {
                 let next = if ridge_eff > 0.0 {
                     ridge_eff * 10.0
@@ -1360,31 +1402,6 @@ fn factor_one_row(
             }
         }
     };
-    // Cholesky succeeded, but barely-PD H_tt^(i) (pivots on the order of
-    // ε·trace) yield an inverse with condition number ~1/ε. Plugging that
-    // inverse into the Schur reduction
-    //     S = H_ββ + ridge_β·I − Σ_i H_tβ^(i)ᵀ (H_tt^(i))⁻¹ H_tβ^(i)
-    // contaminates S by spectral terms scaled by κ_i, while still letting
-    // the outer Cholesky on S succeed. Treat that case as functionally
-    // equivalent to a PSD failure so LM escalation lifts ridge_t.
-    //
-    // Diagonal-ratio condition-number proxy κ(L Lᵀ) ≈ (max L_ii / min L_ii)²,
-    // compared against the dimension-scaled Higham near-singularity ceiling.
-    // See `cholesky_factor_kappa_estimate` / `safe_spd_kappa_max`.
-    //
-    // Evidence/log-det-only callers set `tolerate_ill_conditioning` to skip
-    // this *rejection* (the factor itself is still genuinely PD — Cholesky
-    // above would have errored otherwise — so its diagonal gives an exact
-    // log-determinant and the selected-inverse traces remain well-defined).
-    if !tolerate_ill_conditioning {
-        let kappa_est = cholesky_factor_kappa_estimate(&factor);
-        if !kappa_est.is_finite() || kappa_est > safe_spd_kappa_max(d) {
-            return Err(ArrowSchurError::PerRowFactorIllConditioned {
-                row: row_idx,
-                kappa_estimate: kappa_est,
-            });
-        }
-    }
     Ok(factor)
 }
 
