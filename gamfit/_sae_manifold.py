@@ -64,7 +64,9 @@ class SaeManifoldFitResult:
 class ManifoldSAE:
     atoms: list[SaeManifoldAtomFit]
     atom_topology: str
+    atom_topologies: list[str]
     assignment: str
+    assignment_label: str
     primitive_names: list[str]
     fitted: np.ndarray
     assignments: np.ndarray
@@ -102,7 +104,7 @@ class ManifoldSAE:
         )
 
     @classmethod
-    def from_payload(cls, x: np.ndarray, payload: Mapping[str, Any], topology: str, assignment: str, penalties: list[str], alpha: float = 1.0, learnable_alpha: bool = False, *, tau: float = 0.5, sparsity_strength: float = 1.0, smoothness: float = 1.0, learning_rate: float = 0.04, max_iter: int = 50, random_state: int = 0) -> "ManifoldSAE":
+    def from_payload(cls, x: np.ndarray, payload: Mapping[str, Any], topology: str, assignment: str, penalties: list[str], alpha: float = 1.0, learnable_alpha: bool = False, *, assignment_label: str | None = None, tau: float = 0.5, sparsity_strength: float = 1.0, smoothness: float = 1.0, learning_rate: float = 0.04, max_iter: int = 50, random_state: int = 0) -> "ManifoldSAE":
         plans = list(payload.get("atom_plans", []))
         atoms = [SaeManifoldAtomFit(
             basis=str(atom.get("basis_kind", "")),
@@ -124,8 +126,12 @@ class ManifoldSAE:
         sizes = [int(p.get("basis_size", 0)) for p in plans] if plans else [int(a.decoder_coefficients.shape[0]) for a in atoms]
         nharm = [int(p.get("n_harmonics", 0)) for p in plans] if plans else [0 for _ in atoms]
         centers: list[np.ndarray | None] = [(None if p.get("duchon_centers") is None else np.asarray(p["duchon_centers"], dtype=float)) for p in plans] if plans else [None for _ in atoms]
+        canonical = _canonical_assignment(assignment, "assignment")
         return cls(
-            atoms=atoms, atom_topology=str(topology), assignment=str(assignment),
+            atoms=atoms, atom_topology=str(topology),
+            atom_topologies=_topologies_for_bases(kinds),
+            assignment=canonical,
+            assignment_label=str(assignment if assignment_label is None else assignment_label),
             primitive_names=["rust_module.sae_manifold_fit_minimal", *penalties],
             fitted=fitted, assignments=assigns, coords=coords,
             decoder_blocks=[a.decoder_coefficients.copy() for a in atoms],
@@ -266,7 +272,18 @@ class ManifoldSAE:
         return [c.copy() for c in self.coords]
 
     def summary(self) -> dict[str, Any]:
-        threshold = 0.5 if self.assignment == "ibp" else 1.0 / max(1, len(self.atoms))
+        # `self.assignment` is the canonical kind. Active-atom detection is
+        # mode-specific:
+        #   softmax   -> active if its share exceeds the uniform mass 1/K;
+        #   ibp_map   -> active if its posterior gate exceeds the 0.5 threshold;
+        #   jumprelu  -> active if the (hard) gate is nonzero (> 0).
+        kind = _canonical_assignment(self.assignment, "assignment")
+        if kind == "softmax":
+            threshold = 1.0 / max(1, len(self.atoms))
+        elif kind == "jumprelu":
+            threshold = 0.0
+        else:  # ibp_map
+            threshold = 0.5
         avg_active, mean_mass = rust_module().sae_manifold_assignment_summary(self.assignments, threshold)
         return {
             "K": len(self.atoms),
@@ -289,7 +306,9 @@ class ManifoldSAE:
         return {
             "schema": "gamfit.ManifoldSAE/v1",
             "atom_topology": self.atom_topology,
+            "atom_topologies": list(self.atom_topologies),
             "assignment": self.assignment,
+            "assignment_label": self.assignment_label,
             "alpha": float(self.alpha),
             "learnable_alpha": bool(self.learnable_alpha),
             "tau": float(self.tau),
@@ -360,10 +379,13 @@ class ManifoldSAE:
         centers: list[np.ndarray | None] = [
             None if c is None else np.asarray(c, dtype=float) for c in payload["duchon_centers"]
         ]
+        raw_assignment = str(payload["assignment"])
+        canonical_assignment = _canonical_assignment(raw_assignment, "assignment")
         return cls(
             atoms=atoms,
             atom_topology=str(payload["atom_topology"]),
-            assignment=str(payload["assignment"]),
+            assignment=canonical_assignment,
+            assignment_label=str(payload.get("assignment_label", raw_assignment)),
             primitive_names=list(payload["primitive_names"]),
             fitted=fitted,
             assignments=assigns,
@@ -447,6 +469,11 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     :meth:`ManifoldSAE.converged_latents`, :meth:`ManifoldSAE.encode`, and the
     standalone per-atom :meth:`ManifoldSAE.project`.
     """
+    if X is not None and Z is not None:
+        xa = np.asarray(X, dtype=float)
+        za = np.asarray(Z, dtype=float)
+        if xa.shape != za.shape or not np.allclose(xa, za):
+            raise ValueError("X and Z are aliases; pass only one or pass identical arrays.")
     src = Z if Z is not None else X
     if src is None:
         raise TypeError("sae_manifold_fit requires Z= (or X=) input array")
@@ -579,7 +606,22 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     # projects the final assignments onto a per-row top-k support and
     # recomputes `fitted` from the projected distribution. The Rust kernel
     # owns the hard top-k contract end to end — there is no Python-side mask.
-    top_k_arg = int(top_k) if (top_k is not None and int(top_k) > 0) else None
+    # Any value outside the disabled sentinel and `[1, k_atoms]` (negatives,
+    # or a `top_k` exceeding the number of atoms it would gate) is a caller
+    # error rather than a silent clamp/no-op.
+    if top_k is None:
+        top_k_arg = None
+    else:
+        top_k_int = int(top_k)
+        if top_k_int == 0:
+            top_k_arg = None
+        elif top_k_int < 1 or top_k_int > k_atoms:
+            raise ValueError(
+                f"top_k must be in [1, K={k_atoms}] (or 0/None to disable); "
+                f"got {top_k_int}"
+            )
+        else:
+            top_k_arg = top_k_int
     # Warm starts (issue #357): `a_init` (N, K) seeds the assignment logits and
     # `t_init` (K, N, D_max) seeds the per-atom on-manifold coordinates, so an
     # amortized encoder can predict `(a_init, t_init)` and have the joint solver
@@ -628,7 +670,8 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     )
     payload_dict = dict(payload)
     return ManifoldSAE.from_payload(
-        x, payload_dict, resolved_topology, assignment, penalties,
+        x, payload_dict, resolved_topology, kind, penalties,
+        assignment_label=str(assignment),
         alpha=float(alpha_value), learnable_alpha=bool(alpha == "auto"),
         tau=float(tau), sparsity_strength=float(sparsity), smoothness=float(smoothness),
         learning_rate=float(effective_lr), max_iter=int(max_iter_total),
@@ -687,7 +730,11 @@ def _build_analytic_penalties_payload(
         items.append({"kind": "ard", "target": "t"})
     if isometry_weight is not None and float(isometry_weight) > 0.0:
         _require_sae_row_block_penalty("isometry", "isometry_weight")
-        items.append({"kind": "isometry", "target": "t"})
+        items.append({
+            "kind": "isometry",
+            "target": "t",
+            "weight": float(isometry_weight),
+        })
     if (
         block_orthogonality_weight is not None
         and float(block_orthogonality_weight) > 0.0
@@ -788,11 +835,21 @@ def _bases(k_atoms: int, atom_basis: Any, atom_topology: str) -> list[str]:
     return [str(v) for v in raw]
 
 
+def _topologies_for_bases(bases: list[str]) -> list[str]:
+    """Per-atom topology labels for a resolved bases list (``basis_specs`` order)."""
+    return [_BASIS_TO_TOPOLOGY.get(b, b) for b in bases]
+
+
 def _topology_for_bases(bases: list[str]) -> str:
     """Collapse a resolved bases list to a single topology label for metadata.
-    Mixed-topology fits keep the first atom's topology — basis_specs remains
-    the per-atom source of truth."""
-    return _BASIS_TO_TOPOLOGY.get(bases[0], bases[0])
+
+    When all atoms share one topology that common label is returned; when the
+    atoms span more than one topology the honest scalar is ``"mixed"`` and the
+    per-atom truth is exposed via ``atom_topologies`` (``basis_specs`` remains
+    the per-atom source of truth)."""
+    per_atom = _topologies_for_bases(bases)
+    first = per_atom[0]
+    return first if all(t == first for t in per_atom) else "mixed"
 
 
 def _schedule_payload(schedule: Any) -> dict[str, Any] | None:

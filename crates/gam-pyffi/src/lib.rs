@@ -9948,6 +9948,7 @@ fn build_sae_basis_evaluators(
     gumbel_schedule = None,
     analytic_penalties = None,
     top_k = None,
+    jumprelu_threshold = 0.0,
 ))]
 fn sae_manifold_fit<'py>(
     py: Python<'py>,
@@ -9974,6 +9975,7 @@ fn sae_manifold_fit<'py>(
     gumbel_schedule: Option<&Bound<'py, PyDict>>,
     analytic_penalties: Option<String>,
     top_k: Option<usize>,
+    jumprelu_threshold: f64,
 ) -> PyResult<Py<PyDict>> {
     // The precomputed-basis entry point carries no Duchon centers / kernel
     // metadata, so any basis kind whose refresh needs them cannot re-evaluate
@@ -10008,6 +10010,7 @@ fn sae_manifold_fit<'py>(
         gumbel_schedule,
         analytic_penalties,
         top_k,
+        jumprelu_threshold,
     )
 }
 
@@ -10037,6 +10040,7 @@ fn sae_manifold_fit_inner<'py>(
     gumbel_schedule: Option<&Bound<'py, PyDict>>,
     analytic_penalties: Option<String>,
     top_k: Option<usize>,
+    jumprelu_threshold: f64,
 ) -> PyResult<Py<PyDict>> {
     let analytic_penalties: Option<serde_json::Value> = match analytic_penalties {
         Some(s) => Some(serde_json::from_str(&s).map_err(|e| py_value_error(e.to_string()))?),
@@ -10214,14 +10218,16 @@ fn sae_manifold_fit_inner<'py>(
     let mode = match assignment_kind.as_str() {
         "softmax" => AssignmentMode::softmax(tau),
         "ibp_map" => AssignmentMode::ibp_map(tau, alpha, learnable_alpha),
-        // JumpReLU threshold lives in raw-logit space; coupling it to `tau`
-        // (a temperature on the same logits) is unprincipled and creates a
-        // dead-on-arrival fit when the initial logits sit at or below `tau`,
-        // because both the data-fit JVP and the sparsity prior gradient gate
-        // through `logit > threshold`. A fixed zero threshold preserves the
-        // documented JumpReLU semantics (only logits above zero activate)
-        // while letting positive initial logits seed gradient flow.
-        "jumprelu" => AssignmentMode::jumprelu(tau, 0.0),
+        // The JumpReLU gate is a hard-thresholded bounded sigmoid: an atom is
+        // active when its raw logit clears `jumprelu_threshold`, and the gate
+        // value is the sigmoid (in [0, 1]) — the reconstruction *magnitude*
+        // lives in the decoder, not the gate. `tau` is the sigmoid temperature
+        // on the same logits; the threshold is the activation cut. The
+        // threshold is caller-configurable (default 0.0); the cold-start seed
+        // (see `sae_manifold_fit_minimal`) starts every logit above it so the
+        // data-fit JVP, the sparsity prior gradient, and the assignment-weighted
+        // decoder gradient are all non-zero at step 0.
+        "jumprelu" => AssignmentMode::jumprelu(tau, jumprelu_threshold),
         _ => {
             return Err(py_value_error(format!(
                 "assignment_kind must be one of 'softmax', 'ibp_map', or 'jumprelu'; got {assignment_kind}"
@@ -10515,6 +10521,8 @@ fn sae_manifold_fit_ibp<'py>(
         gumbel_schedule,
         analytic_penalties,
         None,
+        // IBP-MAP never reaches the JumpReLU dispatch; threshold is inert here.
+        0.0,
     )
 }
 
@@ -11701,6 +11709,7 @@ fn sae_build_atom_plans(
     top_k = None,
     initial_logits = None,
     initial_coords = None,
+    jumprelu_threshold = 0.0,
 ))]
 fn sae_manifold_fit_minimal<'py>(
     py: Python<'py>,
@@ -11723,6 +11732,7 @@ fn sae_manifold_fit_minimal<'py>(
     top_k: Option<usize>,
     initial_logits: Option<PyReadonlyArray2<'py, f64>>,
     initial_coords: Option<PyReadonlyArray3<'py, f64>>,
+    jumprelu_threshold: f64,
 ) -> PyResult<Py<PyDict>> {
     let z_view = z.as_array();
     let (n_obs, _p_out) = z_view.dim();
@@ -11809,15 +11819,17 @@ fn sae_manifold_fit_minimal<'py>(
     let (basis_values, basis_jacobian, smooth_penalties, basis_sizes, _coord_blocks) =
         sae_build_padded_basis_stacks(&plans, start_coords.view(), n_obs)
             .map_err(py_value_error)?;
-    // JumpReLU gates strictly on `logit > threshold` (threshold = 0.0 in the
-    // production inner driver). Zero-initialised logits would leave every
-    // gate closed at step 0, making the data-fit Jacobian, the sparsity
-    // prior gradient, and the assignment-weighted decoder gradient all zero
-    // simultaneously — the fit cannot escape that fixed point. Seed JumpReLU
-    // runs with a small positive constant so every atom starts active and
-    // the fit can learn which atoms to prune. Softmax (translation-invariant)
-    // and IBP-MAP (uses sigmoid prior with stick-breaking) are unaffected by
-    // a uniform logit shift, so zero remains the natural init for those.
+    // The JumpReLU gate activates only when a logit clears
+    // `jumprelu_threshold` (caller-configurable, default 0.0). Seeding the
+    // logits at or below the threshold would leave every gate closed at step
+    // 0, making the data-fit Jacobian, the sparsity prior gradient, and the
+    // assignment-weighted decoder gradient all zero simultaneously — the fit
+    // cannot escape that fixed point. Seed JumpReLU runs a fixed margin
+    // ABOVE the configured threshold so every atom starts active relative to
+    // its cut and the fit can learn which atoms to prune. Softmax
+    // (translation-invariant) and IBP-MAP (uses sigmoid prior with
+    // stick-breaking) are unaffected by a uniform logit shift, so zero
+    // remains the natural init for those.
     // Warm-start logits (issue #357): a caller-supplied `(N, K)` assignment
     // logit seed (from an amortized encoder) replaces the cold-start init.
     // When absent we fall back to the documented zero / JumpReLU-positive init
@@ -11843,7 +11855,14 @@ fn sae_manifold_fit_minimal<'py>(
     let logits_are_cold = warm_logits.is_none();
     let mut initial_logits = match warm_logits {
         Some(logits) => logits,
-        None if assignment_kind == "jumprelu" => Array2::<f64>::from_elem((n_obs, k_atoms), 1.0),
+        None if assignment_kind == "jumprelu" => {
+            // Start every atom one full margin above its activation threshold.
+            const SAE_JUMPRELU_SEED_MARGIN: f64 = 1.0;
+            Array2::<f64>::from_elem(
+                (n_obs, k_atoms),
+                jumprelu_threshold + SAE_JUMPRELU_SEED_MARGIN,
+            )
+        }
         None => Array2::<f64>::zeros((n_obs, k_atoms)),
     };
     // Wire `random_state` into the optimizer init: jitter the initial
@@ -11923,6 +11942,7 @@ fn sae_manifold_fit_minimal<'py>(
         gumbel_schedule,
         analytic_penalties,
         top_k,
+        jumprelu_threshold,
     )?;
     // Attach per-atom build plans so OOS predict can rebuild design without Python.
     let plans_py = PyList::empty(py);
@@ -11988,6 +12008,7 @@ fn sae_manifold_fit_minimal<'py>(
     ridge_beta = 1.0e-6,
     initial_logits = None,
     initial_coords = None,
+    jumprelu_threshold = 0.0,
 ))]
 fn sae_manifold_predict_oos<'py>(
     py: Python<'py>,
@@ -12008,6 +12029,7 @@ fn sae_manifold_predict_oos<'py>(
     ridge_beta: f64,
     initial_logits: Option<PyReadonlyArray2<'py, f64>>,
     initial_coords: Option<PyReadonlyArray3<'py, f64>>,
+    jumprelu_threshold: f64,
 ) -> PyResult<Py<PyDict>> {
     let x_view = x_new.as_array();
     let (n_obs, p_out) = x_view.dim();
@@ -12249,6 +12271,7 @@ fn sae_manifold_predict_oos<'py>(
         None,
         None,
         None,
+        jumprelu_threshold,
     )
 }
 
