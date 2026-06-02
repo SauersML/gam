@@ -2627,20 +2627,12 @@ fn run_predict_unified(
 ) -> Result<(), String> {
     let fit_for_predict = fit_result_from_saved_model_for_prediction(model)?;
     let model_class = model.predict_model_class();
-    let family = model.likelihood();
-    // Binomial with any standard (Logit/Probit/CLogLog/Sas/BetaLogistic)
-    // link uses a nonlinear inverse-link — prediction needs the nonlinear
-    // path. State-carrying links (Sas(state), BetaLogistic(state),
-    // Mixture, LatentCLogLog) likewise nonlinear; covered below.
-    let nonlinear = matches!(
-        (&family.response, &family.link),
-        (ResponseFamily::Binomial, InverseLink::Standard(_))
-            | (ResponseFamily::Binomial, InverseLink::Sas(_))
-            | (ResponseFamily::Binomial, InverseLink::BetaLogistic(_))
-            | (ResponseFamily::Binomial, InverseLink::Mixture(_))
-            | (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_))
-    ) || model.has_link_wiggle()
-        || model.has_baseline_time_wiggle();
+    // Binomial standard/SAS/BetaLogistic/Mixture/LatentCLogLog links and any
+    // link/baseline-time wiggle have a curved inverse link, so the default
+    // point prediction must be the posterior mean rather than the plug-in.
+    // The predicate is owned by `FittedModel` so the CLI and the Python FFI
+    // path share one definition (SPEC: posterior mean is always the default).
+    let nonlinear = model.prediction_uses_posterior_mean();
     let sigma_opt = if model_class == PredictModelClass::GaussianLocationScale {
         predictor
             .predict_noise_scale(pred_input)

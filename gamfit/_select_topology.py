@@ -158,21 +158,17 @@ def select_topology(
         if candidate.name in fits
     }
     raw_scores = {
-        name: _score_for_kind(
-            fit_obj,
-            score_kind,
-            n_obs,
-            basis_sizes[name],
-            null_dims[name],
-        )
+        name: _score_for_kind(fit_obj, score_kind, null_dims[name])
         for name, fit_obj in fits.items()
     }
     selected_scores = {
         name: _scale_score(raw_scores[name], score_scale_kind, n_obs, effective_dim[name])
         for name in fits
     }
+    # All remaining score kinds (reml/laml/tk) are REML-family evidence where
+    # higher is better; `compare_models` ranks `reml_score` descending.
     comparison_scores = {
-        name: _comparison_score(value, score_kind)
+        name: float(value)
         for name, value in selected_scores.items()
     }
     compared = compare_models(
@@ -188,7 +184,6 @@ def select_topology(
     warnings_out = _score_disagreement_warnings(
         fits,
         n_obs,
-        basis_sizes,
         effective_dim,
         null_dims,
         score_scale_kind,
@@ -589,10 +584,6 @@ def _coefficients_metadata(fit_obj: Any) -> Any | None:
     return getattr(fit_obj, "coefficients", None)
 
 
-def _comparison_score(score: float, score_kind: ScoreKind) -> float:
-    return -float(score) if score_kind == "bic" else float(score)
-
-
 def _scale_score(
     score: float,
     score_scale: ScoreScale,
@@ -748,23 +739,16 @@ def _summary_payload(fit_obj: Any) -> Mapping[str, Any] | None:
 def _score_disagreement_warnings(
     fits: Mapping[str, Any],
     n_obs: int,
-    basis_sizes: Mapping[str, int],
     effective_dim: Mapping[str, float],
     null_dims: Mapping[str, float],
     score_scale: ScoreScale,
 ) -> list[str]:
     orders: dict[str, tuple[str, ...]] = {}
-    for kind in ("reml", "laml", "bic"):
+    for kind in ("reml", "laml"):
         try:
             scores = {
                 name: _scale_score(
-                    _score_for_kind(
-                        fit_obj,
-                        kind,
-                        n_obs,
-                        basis_sizes[name],
-                        null_dims[name],
-                    ),
+                    _score_for_kind(fit_obj, kind, null_dims[name]),
                     score_scale,
                     n_obs,
                     effective_dim[name],
@@ -772,12 +756,11 @@ def _score_disagreement_warnings(
                 for name, fit_obj in fits.items()
             }
         except (NotImplementedError, ValueError):
-            if kind in {"reml", "laml"}:
-                continue
-            raise
+            # `laml` requires a real `laml` field; skip the cross-check when a
+            # candidate cannot supply it rather than failing the whole select.
+            continue
         comparison = compare_models(
-            [{"reml_score": _comparison_score(scores[name], kind)}
-             for name in fits],
+            [{"reml_score": float(scores[name])} for name in fits],
             names=list(fits),
         )
         orders[kind] = tuple(name for name, *_ in comparison["ranking"])
@@ -790,15 +773,15 @@ def _score_disagreement_warnings(
     )
     if score_scale != "raw":
         return [
-            "Scaled topology score rankings still differ across score kinds "
-            f"under score_scale={score_scale!r} ({detail}). Treat BIC as a "
-            "secondary diagnostic; the Tierney-Kadane Laplace normalizer "
-            "handles the known cross-basis evidence scale issue."
+            "Scaled topology score rankings still differ between REML and LAML "
+            f"under score_scale={score_scale!r} ({detail}). The Tierney-Kadane "
+            "Laplace normalizer handles the known cross-basis evidence scale "
+            "issue; prefer score='tk' when candidate basis sizes differ."
         ]
     return [
-        "Topology score rankings differ across score kinds "
-        f"({detail}). BIC and REML can disagree when candidate basis sizes "
-        "differ wildly."
+        "Topology score rankings differ between REML and LAML "
+        f"({detail}). The two evidences can disagree when candidate basis "
+        "sizes differ wildly; prefer score='tk'."
     ]
 
 
