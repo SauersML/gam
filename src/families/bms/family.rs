@@ -78,7 +78,6 @@ pub(super) struct BernoulliMarginalSlopeFamily {
 /// L-BFGS rate of one decade per ~5 iterations on a noisy gradient,
 /// stalling at the noise floor) before switching to exact Phase-2
 /// polish.
-
 #[derive(Clone)]
 pub(super) struct BernoulliInterceptPredictorWarmStart {
     pub(super) intercept: f64,
