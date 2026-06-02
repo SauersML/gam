@@ -2301,6 +2301,47 @@ impl SaeManifoldLoss {
     }
 }
 
+/// Cap on the number of coordinates at which a per-atom shape band is
+/// materialized. The full per-atom decoder covariance is exact and exposed
+/// regardless; this only bounds the cost of the convenience band, which is
+/// evaluated at an evenly-strided subset of the atom's own on-atom coordinates.
+pub const SHAPE_BAND_MAX_POINTS: usize = 512;
+
+/// Posterior uncertainty of one fitted atom's manifold shape.
+///
+/// Produced by [`SaeManifoldTerm::assemble_shape_uncertainty`]. The covariance
+/// is the φ-scaled β-block of the joint inverse Hessian (coordinates
+/// marginalized out); the band is its closed-form push-forward through the
+/// linear basis→ambient map `m_k(t) = Φ_k(t)·B_k`.
+#[derive(Debug, Clone)]
+pub struct SaeAtomShapeUncertainty {
+    /// φ-scaled posterior covariance of this atom's decoder coefficients,
+    /// `Cov(β_k) = φ·S_β⁻¹[block_k]`, shape `(M_k·p, M_k·p)` in the decoder's
+    /// row-major `(basis, channel)` flat layout (flat index `b·p + c`).
+    pub decoder_covariance: Array2<f64>,
+    /// Coordinates at which the band is evaluated, shape `(G, d_k)`.
+    pub band_coords: Array2<f64>,
+    /// Fitted ambient point `m_k(t) = Φ_k(t)·B_k` at each band coordinate,
+    /// shape `(G, p)`.
+    pub band_mean: Array2<f64>,
+    /// Posterior standard deviation of each ambient channel at each band
+    /// coordinate, `sqrt(Var_c(t))` with
+    /// `Var_c(t) = Σ_{b1,b2} Φ[b1] Φ[b2] Cov(β_k)[(b1,c),(b2,c)]`, shape
+    /// `(G, p)`.
+    pub band_sd: Array2<f64>,
+}
+
+/// Posterior shape uncertainty for a whole SAE-manifold fit: one band per atom
+/// plus the shared Gaussian reconstruction dispersion `φ̂` used to scale every
+/// covariance. See [`SaeManifoldTerm::assemble_shape_uncertainty`].
+#[derive(Debug, Clone)]
+pub struct SaeShapeUncertainty {
+    /// Gaussian reconstruction scale `φ̂ = RSS / residual-dof`.
+    pub dispersion: f64,
+    /// One entry per atom, in atom order.
+    pub atoms: Vec<SaeAtomShapeUncertainty>,
+}
+
 /// Per-row active-set layout for sparse SAE assignment (any mode).
 ///
 /// When the assignment is sparse — structurally (JumpReLU gate) or
@@ -4210,6 +4251,145 @@ impl SaeManifoldTerm {
         Ok(trace)
     }
 
+    /// Gaussian reconstruction dispersion `φ̂`, the scale that turns the
+    /// unscaled inverse-Hessian β-block `S_β⁻¹` into a posterior covariance
+    /// `Cov(β) = φ̂·S_β⁻¹` — the same `Vb = φ·H⁻¹` convention the main GAM
+    /// inference path uses.
+    ///
+    /// `RSS = Σ_{i,c} (z_{ic} − ẑ_{ic})² = 2·data_fit` (the loss stores the
+    /// half-sum `½Σr²`). The residual degrees of freedom subtract the effective
+    /// parameter count from the `N·p` scalar observations:
+    ///   * decoder β: `beta_dim − tr(λ_smooth · S_β⁻¹ · ⊕_k S_k⊗I_p)`, the
+    ///     smoothness effective-dof already assembled for the Fellner-Schall
+    ///     step (penalty-shrunk directions do not cost a full parameter);
+    ///   * latent coordinates: the assignment-weighted dimension budget
+    ///     `Σ_i Σ_k a_{ik}·d_k` — each token spends `d_k` of its `p` observed
+    ///     channels locating itself on the atom it is (softly) assigned to.
+    ///
+    /// The coordinate term is an effective-dof approximation (the per-token
+    /// coordinates are latent variables shrunk by their ARD prior, so this is a
+    /// mild over-count and `φ̂` is correspondingly, conservatively, a touch
+    /// wide). In the SAE regime `N·p ≫ edf` the correction is small. The
+    /// residual dof is floored at 1 so `φ̂` stays finite and positive.
+    fn reconstruction_dispersion(
+        &self,
+        loss: &SaeManifoldLoss,
+        cache: &ArrowFactorCache,
+        lambda_smooth: f64,
+    ) -> Result<f64, String> {
+        let n = self.n_obs();
+        let p = self.output_dim();
+        let n_scalar = (n * p) as f64;
+        let rss = 2.0 * loss.data_fit;
+        let smooth_edf = self
+            .decoder_smoothness_effective_dof(cache, lambda_smooth)
+            .map_err(|e| format!("reconstruction_dispersion: smooth edf: {e}"))?;
+        let beta_edf = (self.beta_dim() as f64 - smooth_edf).max(0.0);
+        let assignments = self.assignment.assignments();
+        let mut coord_edf = 0.0_f64;
+        for (k, atom) in self.atoms.iter().enumerate() {
+            let d_k = atom.latent_dim as f64;
+            let mut mass = 0.0_f64;
+            for row in 0..n {
+                mass += assignments[[row, k]];
+            }
+            coord_edf += mass * d_k;
+        }
+        let resid_dof = (n_scalar - beta_edf - coord_edf).max(1.0);
+        let phi = rss / resid_dof;
+        if !phi.is_finite() || phi < 0.0 {
+            return Err(format!(
+                "reconstruction_dispersion: non-finite/negative φ̂={phi} \
+                 (RSS={rss}, resid_dof={resid_dof}, beta_edf={beta_edf}, coord_edf={coord_edf})"
+            ));
+        }
+        Ok(phi.max(f64::MIN_POSITIVE))
+    }
+
+    /// Posterior covariance and ambient shape band for every atom — the
+    /// user-facing uncertainty of the fitted manifold shapes.
+    ///
+    /// For atom `k` with decoder-block range `r_k` (see
+    /// [`Self::beta_block_offsets`]), `Cov(β_k) = φ·S_β⁻¹[r_k, r_k]` is the
+    /// φ-scaled posterior covariance of its decoder coefficients with the
+    /// latent coordinates marginalized out. The ambient point at a coordinate
+    /// `t` is `m_k(t) = Φ_k(t)·B_k`, *linear* in `β_k`, so its per-channel
+    /// posterior variance is the closed form
+    /// `Var_c(t) = Σ_{b1,b2} Φ_k(t)[b1] Φ_k(t)[b2] · Cov(β_k)[(b1,c),(b2,c)]`
+    /// — no sampling. The band is evaluated at up to [`SHAPE_BAND_MAX_POINTS`]
+    /// evenly-strided of the atom's own on-atom coordinates, reusing the basis
+    /// values already stored on the atom, so it reports uncertainty exactly
+    /// where the data lives and needs no basis-kind-specific grid.
+    ///
+    /// A near-degenerate atom has a near-singular Schur block, so `Cov(β_k)` —
+    /// and the band — fans out automatically: the band width is a
+    /// per-coordinate visual of how well each atom is identified.
+    pub fn assemble_shape_uncertainty(
+        &self,
+        cache: &ArrowFactorCache,
+        dispersion: f64,
+    ) -> Result<SaeShapeUncertainty, String> {
+        let p = self.output_dim();
+        let blocks = self.beta_block_offsets();
+        let mut atoms = Vec::with_capacity(self.k_atoms());
+        for (k, atom) in self.atoms.iter().enumerate() {
+            let mut cov = cache
+                .schur_inverse_block(blocks[k].clone())
+                .map_err(|e| format!("assemble_shape_uncertainty: atom {k}: {e}"))?;
+            cov.mapv_inplace(|v| v * dispersion);
+
+            let m = atom.basis_size();
+            let n_rows = atom.n_obs();
+            let d = atom.latent_dim;
+            // Evenly-strided evaluation rows bound the band cost; the full
+            // covariance above is exact and lets callers evaluate any grid.
+            let stride = n_rows.div_ceil(SHAPE_BAND_MAX_POINTS).max(1);
+            let eval_rows: Vec<usize> = (0..n_rows).step_by(stride).collect();
+            let g = eval_rows.len();
+            let coords_mat = self.assignment.coords[k].as_matrix();
+            let mut band_coords = Array2::<f64>::zeros((g, d));
+            let mut band_mean = Array2::<f64>::zeros((g, p));
+            let mut band_sd = Array2::<f64>::zeros((g, p));
+            let mut decoded = vec![0.0_f64; p];
+            for (gi, &row) in eval_rows.iter().enumerate() {
+                for axis in 0..d {
+                    band_coords[[gi, axis]] = coords_mat[[row, axis]];
+                }
+                atom.fill_decoded_row(row, &mut decoded);
+                for c in 0..p {
+                    band_mean[[gi, c]] = decoded[c];
+                }
+                // Var_c = Σ_{b1,b2} Φ[b1]Φ[b2] Cov[(b1,c),(b2,c)]; the flat
+                // decoder index is basis·p + channel (row-major (M_k, p)).
+                for c in 0..p {
+                    let mut var = 0.0_f64;
+                    for b1 in 0..m {
+                        let phi1 = atom.basis_values[[row, b1]];
+                        if phi1 == 0.0 {
+                            continue;
+                        }
+                        let i1 = b1 * p + c;
+                        for b2 in 0..m {
+                            let phi2 = atom.basis_values[[row, b2]];
+                            if phi2 == 0.0 {
+                                continue;
+                            }
+                            var += phi1 * phi2 * cov[[i1, b2 * p + c]];
+                        }
+                    }
+                    band_sd[[gi, c]] = var.max(0.0).sqrt();
+                }
+            }
+            atoms.push(SaeAtomShapeUncertainty {
+                decoder_covariance: cov,
+                band_coords,
+                band_mean,
+                band_sd,
+            });
+        }
+        Ok(SaeShapeUncertainty { dispersion, atoms })
+    }
+
     /// Returns `true` when a Beta-tier analytic penalty was accumulated into
     /// the dense `sys.hbb` block (so the caller knows to wrap it in a
     /// `DensePenaltyOp`); `false` leaves `sys.hbb` all-zero and lets the
@@ -5844,6 +6024,33 @@ impl SaeManifoldOuterObjective {
             ard: 0.0,
         });
         (self.term, self.current_rho, loss)
+    }
+
+    /// Posterior shape uncertainty of the fitted atoms — per-atom decoder
+    /// covariance and ambient bands (see
+    /// [`SaeManifoldTerm::assemble_shape_uncertainty`]).
+    ///
+    /// Recomputes the converged joint-Hessian Laplace factor at the settled ρ
+    /// — the same undamped Direct factor the REML criterion forms at the inner
+    /// optimum — and reads the per-atom covariance and bands off its cached
+    /// Schur factor, scaling by the Gaussian reconstruction dispersion `φ̂`.
+    /// The term is already at the optimum after the outer fit, so the inner
+    /// re-solve converges immediately. Call before [`Self::into_fitted`].
+    pub fn decoder_shape_uncertainty(&mut self) -> Result<SaeShapeUncertainty, String> {
+        let rho = self.current_rho.clone();
+        let (_cost, loss, cache) = self.term.reml_criterion_with_cache(
+            self.target.view(),
+            &rho,
+            self.registry.as_ref(),
+            self.inner_max_iter,
+            self.learning_rate,
+            self.ridge_ext_coord,
+            self.ridge_beta,
+        )?;
+        let dispersion = self
+            .term
+            .reconstruction_dispersion(&loss, &cache, rho.lambda_smooth())?;
+        self.term.assemble_shape_uncertainty(&cache, dispersion)
     }
 
     /// Shared cost path: evaluate the REML criterion at `rho_flat`, updating
