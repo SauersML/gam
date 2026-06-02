@@ -8,8 +8,8 @@ use gam::estimate::{
     saved_mixture_state_from_fit, saved_sas_state_from_fit,
 };
 use gam::faer_ndarray::{
-    FaerCholesky, FaerEigh, FaerSvd, array2_to_matmut, factorize_symmetricwith_fallback, fast_ata,
-    fast_atb, fast_xt_diag_x,
+    FaerCholesky, FaerSvd, array2_to_matmut, factorize_symmetricwith_fallback, fast_ata, fast_atb,
+    fast_xt_diag_x,
 };
 use gam::families::inverse_link::apply_inverse_link_vec;
 use gam::families::scale_design::{build_scale_deviation_transform, infer_non_intercept_start};
@@ -5974,103 +5974,6 @@ struct GaussianRemlBlocksBackwardAnalytic {
     grad_weights: Array1<f64>,
 }
 
-fn identity_matrix(n: usize) -> Array2<f64> {
-    let mut eye = Array2::<f64>::zeros((n, n));
-    for i in 0..n {
-        eye[[i, i]] = 1.0;
-    }
-    eye
-}
-
-fn symmetrized_matrix(input: &Array2<f64>) -> Array2<f64> {
-    let mut out = input.clone();
-    gam::matrix::symmetrize_in_place(&mut out);
-    out
-}
-
-fn block_penalty_rank_and_pinv(
-    penalty: &Array2<f64>,
-) -> Result<(usize, Array2<f64>), EstimationError> {
-    let (eigs, vecs) = penalty.to_owned().eigh(Side::Lower).map_err(|_| {
-        EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
-        }
-    })?;
-    let max_abs = eigs.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
-    let tol = (1.0e-10 * max_abs).max(1.0e-14);
-    let mut rank = 0_usize;
-    let mut scaled = Array2::<f64>::zeros(vecs.dim());
-    for col in 0..eigs.len() {
-        if eigs[col] > tol {
-            rank += 1;
-            for row in 0..vecs.nrows() {
-                scaled[[row, col]] = vecs[[row, col]] / eigs[col];
-            }
-        }
-    }
-    Ok((rank, scaled.dot(&vecs.t())))
-}
-
-fn invert_spd_with_ridge(
-    matrix: &Array2<f64>,
-    ridge_rel: f64,
-) -> Result<Array2<f64>, EstimationError> {
-    let n = matrix.nrows();
-    let eye = identity_matrix(n);
-    let scale = (0..n).map(|i| matrix[[i, i]].abs()).fold(1.0_f64, f64::max);
-    let ridges = [0.0, ridge_rel, 1.0e-10, 1.0e-8, 1.0e-6, 1.0e-4];
-    for rel in ridges {
-        let mut candidate = matrix.clone();
-        if rel > 0.0 {
-            for i in 0..n {
-                candidate[[i, i]] += rel * scale;
-            }
-        }
-        if let Ok(chol) = candidate.cholesky(Side::Lower) {
-            return Ok(chol.solve_mat(&eye));
-        }
-    }
-    Err(EstimationError::ModelIsIllConditioned {
-        condition_number: f64::INFINITY,
-    })
-}
-
-fn solve_symmetric_vector_with_floor(
-    matrix: &Array2<f64>,
-    rhs: &Array1<f64>,
-    ridge_rel: f64,
-) -> Result<Array1<f64>, EstimationError> {
-    let n = matrix.nrows();
-    let sym = symmetrized_matrix(matrix);
-    let (eigs, vecs) =
-        sym.eigh(Side::Lower)
-            .map_err(|_| EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
-            })?;
-    let max_eig = eigs.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
-    let floor = (ridge_rel * max_eig.max(1.0)).max(1.0e-12);
-    let projected = vecs.t().dot(rhs);
-    let mut scaled = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let denom = if eigs[i].abs() >= floor {
-            eigs[i]
-        } else if eigs[i].is_sign_negative() {
-            -floor
-        } else {
-            floor
-        };
-        scaled[i] = projected[i] / denom;
-    }
-    let out = vecs.dot(&scaled);
-    if out.iter().all(|value| value.is_finite()) {
-        Ok(out)
-    } else {
-        Err(EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
-        })
-    }
-}
-
 fn trace_product(left: ArrayView2<'_, f64>, right: ArrayView2<'_, f64>) -> f64 {
     let mut value = 0.0;
     for i in 0..left.nrows() {
@@ -6288,11 +6191,18 @@ fn gaussian_reml_fit_blocks_backward_analytic(
             .assign(&designs[k]);
     }
 
-    let penalties: Vec<Array2<f64>> = penalties_raw.iter().map(symmetrized_matrix).collect();
+    let penalties: Vec<Array2<f64>> = penalties_raw
+        .iter()
+        .map(|p| {
+            let mut out = p.clone();
+            gam::matrix::symmetrize_in_place(&mut out);
+            out
+        })
+        .collect();
     let mut ranks = Vec::with_capacity(f_blocks);
     let mut pinvs = Vec::with_capacity(f_blocks);
     for penalty in &penalties {
-        let (rank, pinv) = block_penalty_rank_and_pinv(penalty)?;
+        let (rank, pinv) = gam::linalg::utils::block_penalty_rank_and_pinv(penalty)?;
         ranks.push(rank);
         pinvs.push(pinv);
     }
@@ -6318,7 +6228,7 @@ fn gaussian_reml_fit_blocks_backward_analytic(
             }
         }
     }
-    let r = invert_spd_with_ridge(&k_matrix, 0.0)?;
+    let r = gam::linalg::utils::invert_spd_with_ridge(&k_matrix, 0.0)?;
 
     let mut xtwy = Array1::<f64>::zeros(p_total);
     for row in 0..n {
@@ -6520,7 +6430,7 @@ fn gaussian_reml_fit_blocks_backward_analytic(
                 "outer rho curvature entry ({row},{col}) is non-finite: {value}"
             )));
         }
-        let rho_adj = solve_symmetric_vector_with_floor(&outer_h, &alpha, 1.0e-10)?;
+        let rho_adj = gam::linalg::utils::solve_symmetric_vector_with_floor(&outer_h, &alpha, 1.0e-10)?;
         if let Some((block, value)) = rho_adj
             .iter()
             .enumerate()
@@ -8634,34 +8544,6 @@ fn add_block_diagonal_penalty(
     Ok(())
 }
 
-fn solve_dense_block_system(
-    hessian: &Array2<f64>,
-    rhs: &Array1<f64>,
-    context: &str,
-) -> Result<Array1<f64>, String> {
-    let mut rhs2 = Array2::<f64>::zeros((rhs.len(), 1));
-    for i in 0..rhs.len() {
-        rhs2[[i, 0]] = rhs[i];
-    }
-    let factor = factorize_symmetricwith_fallback(
-        gam::faer_ndarray::FaerArrayView::new(hessian).as_ref(),
-        Side::Lower,
-    )
-    .map_err(|err| format!("{context} factorization failed: {err}"))?;
-    {
-        let mut rhs_view = array2_to_matmut(&mut rhs2);
-        factor.solve_in_place(rhs_view.as_mut());
-    }
-    let mut out = Array1::<f64>::zeros(rhs.len());
-    for i in 0..rhs.len() {
-        out[i] = rhs2[[i, 0]];
-    }
-    if out.iter().any(|v| !v.is_finite()) {
-        return Err(format!("{context} solve produced non-finite coefficients"));
-    }
-    Ok(out)
-}
-
 #[derive(Clone, Copy, Debug)]
 struct LatentAuxStrengthState {
     log_mu: f64,
@@ -8831,7 +8713,8 @@ fn dense_fisher_gaussian_fit_to_pydict<'py>(
     add_block_diagonal_penalty(&mut hessian, penalty, lambda, n_outputs).map_err(py_value_error)?;
     let rhs = gam::pirls::dense_block_xtwy(design, fisher_w, y, Some(row_weights.view()))
         .map_err(|err| py_value_error(err.to_string()))?;
-    let beta_vec = solve_dense_block_system(&hessian, &rhs, "dense Fisher Gaussian")
+    let beta_vec =
+        gam::linalg::utils::solve_dense_block_system(&hessian, &rhs, "dense Fisher Gaussian")
         .map_err(py_value_error)?;
     let mut coefficients = Array2::<f64>::zeros((k, n_outputs));
     for output in 0..n_outputs {
@@ -30609,7 +30492,7 @@ mod tests {
     fn symmetric_curvature_solve_preserves_negative_modes() {
         let matrix = array![[2.0, 0.0, 0.0], [0.0, -4.0, 0.0], [0.0, 0.0, -1.0e-15]];
         let rhs = array![8.0, -8.0, 1.0];
-        let solved = solve_symmetric_vector_with_floor(&matrix, &rhs, 1.0e-3)
+        let solved = gam::linalg::utils::solve_symmetric_vector_with_floor(&matrix, &rhs, 1.0e-3)
             .expect("indefinite symmetric curvature solve");
 
         assert!((solved[0] - 4.0).abs() <= 1.0e-12);
