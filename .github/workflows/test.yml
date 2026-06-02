@@ -100,6 +100,23 @@ jobs:
 
       - name: Run tests
         shell: bash
+        env:
+          # ubuntu-latest is a 4-vCPU / 16-GB runner. By default cargo would
+          # link up to 4 integration-test binaries in parallel, and each link
+          # of a `gam` test binary pulls in the full dependency closure
+          # (faer, burn, bevy_reflect, ndarray, nalgebra, arrow, parquet,
+          # criterion, ad_trait, autodiff, num-dual, statrs, …). rust-lld
+          # plus collect2 routinely peak above 4 GB *per link*, so four
+          # concurrent links overflow the runner's RAM and lld dies with
+          # `collect2: fatal error: ld terminated with signal 7 [Bus error]`
+          # — the exact failure that has been killing the nightly Test job.
+          # Capping to two parallel link/compile jobs keeps simultaneous
+          # peak memory in the 8–10 GB band and leaves headroom for the
+          # rest of the test harness, while only modestly stretching wall
+          # time (one extra link wave). It is set as an env var rather
+          # than `--jobs` on the cargo line so rust-cache, criterion etc.
+          # also see the cap.
+          CARGO_BUILD_JOBS: "2"
         run: |
           set -uo pipefail
           # cargo test captures stdout/stderr by default and only re-prints
