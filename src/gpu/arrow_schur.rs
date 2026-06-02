@@ -111,6 +111,32 @@ pub fn solve_arrow_newton_step(
 
     #[cfg(target_os = "linux")]
     {
+        // Multi-GPU: the arrow-Schur solve is row-block separable in its forward
+        // (per-row factor / whiten / partial-Schur) and backward (per-row
+        // back-sub) phases — only the small shared K×K reduce+factor+δβ is
+        // central. When more than one device is usable, split the WHOLE solve at
+        // row-block granularity across all GPUs. The POTRF stays fused with its
+        // dependent TRSM+GEMM on each tile's own stream, so no on-stream solve is
+        // orphaned. On `Unavailable` (one device, shape below policy, transient)
+        // fall through to the single-device fused / Layer-A paths below.
+        if crate::gpu::runtime::GpuRuntime::global()
+            .map(crate::gpu::runtime::GpuRuntime::device_count)
+            .unwrap_or(0)
+            > 1
+        {
+            match cuda::solve_multi_gpu(sys, ridge_t, ridge_beta) {
+                Ok(sol) => return Ok(sol),
+                Err(ArrowSchurGpuFailure::RidgeBumpRequired { row, bump }) => {
+                    return Err(ArrowSchurGpuFailure::RidgeBumpRequired { row, bump });
+                }
+                Err(ArrowSchurGpuFailure::SchurFactorFailed { reason }) => {
+                    return Err(ArrowSchurGpuFailure::SchurFactorFailed { reason });
+                }
+                // Unavailable / GpuRequiresDenseSystem: fall through to the
+                // single-device paths (already shape-validated above).
+                Err(_) => {}
+            }
+        }
         // Layer D admission: when the system shape passes the
         // (Σ p³ ≥ 1e5 OR R ≥ 16) heuristic and `p ≤ MAX_FUSED_P`, the fused
         // NVRTC kernel replaces the cuSOLVER/cuBLAS Layer A+B+C path with a
@@ -515,7 +541,7 @@ pub fn solve_arrow_newton_step_dense_reference(
 
 #[cfg(target_os = "linux")]
 mod cuda {
-    use super::{ArrowSchurGpuFailure, ArrowSchurGpuSolution, pack_host};
+    use super::{ArrowSchurGpuFailure, ArrowSchurGpuSolution, pack_block, pack_host};
     use crate::gpu::driver::to_i32;
     use crate::gpu::linalg::{DispatchOp, route_through_gpu};
     use crate::solver::arrow_schur::ArrowSchurSystem;
@@ -527,6 +553,362 @@ mod cuda {
     use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
     use ndarray::Array1;
     use std::sync::Arc;
+
+    /// Per-row work slot for the row-block-granular multi-GPU solve. Inputs are
+    /// the packed single-row buffers (`d×d` D block + ρ_t ridge, `d×k` B block,
+    /// `d` g vector); the forward pass fills the whitened factors `l/u/y` and the
+    /// per-tile reduction lands in the tile's leading slot.
+    struct RowSlot {
+        // Inputs (packed once on the host, column-major).
+        d_block: Vec<f64>, // d*d
+        b_block: Vec<f64>, // d*k
+        g_vec: Vec<f64>,   // d
+        diag_scale: f64,   // |diag(H_tt)| scale for the ridge-bump diagnostic
+        // Forward outputs, kept on the host for the back-sub pass.
+        l_block: Vec<f64>, // d*d lower factor, column-major
+        u_vec: Vec<f64>,   // d   (= L^{-1} g)
+        y_block: Vec<f64>, // d*k (= L^{-1} B), column-major
+        log_det_local: f64,
+        // Set on a non-PD pivot so the orchestrator can raise RidgeBumpRequired
+        // for the offending global row instead of silently falling back.
+        bump: Option<f64>,
+        // Tile-level reduction, written into the tile's first slot only.
+        tile_partial_schur: Option<Vec<f64>>, // k*k col-major, = Σ Y_iᵀY_i
+        tile_partial_rhs: Option<Vec<f64>>,    // k, = Σ Y_iᵀu_i
+        // Back-sub output for this row.
+        delta_t_block: Vec<f64>, // d
+    }
+
+    /// Row-block-granular multi-GPU Arrow-Schur Newton solve.
+    ///
+    /// The solve is separable across row blocks in both phases:
+    ///   * forward — each row's local Cholesky `L_i`, whitening
+    ///     `u_i = L_i⁻¹g_i`, `Y_i = L_i⁻¹B_i`, and partial Schur
+    ///     `(Σ Y_iᵀY_i, Σ Y_iᵀu_i)` are independent;
+    ///   * backward — `δt_i = -L_iᵀ⁻¹(u_i + Y_iδβ)` is independent.
+    /// Only the small shared `K×K` reduce + factor + `δβ` solve is central.
+    ///
+    /// `crate::gpu::pool::scatter_batched` hands each device a contiguous row
+    /// tile on its own bound context/stream; the per-tile forward keeps the
+    /// POTRF fused with its dependent TRSM + Schur GEMM on that one stream, so no
+    /// on-stream solve is orphaned. Tile partials and per-tile `log|L|` are
+    /// reduced on the host (in tile/row order), `S_β` is factored on the primary
+    /// device, and the back-sub is scattered back across the same tiles.
+    ///
+    /// Returns `Unavailable` (caller uses a single-device path) when the system
+    /// carries matrix-free operators, the shared block is not dense `K×K`, the
+    /// pool is single-device, or any tile's device work declines. A non-PD tip
+    /// block surfaces as `RidgeBumpRequired` for the precise global row.
+    pub(super) fn solve_multi_gpu(
+        sys: &ArrowSchurSystem,
+        ridge_t: f64,
+        ridge_beta: f64,
+    ) -> Result<ArrowSchurGpuSolution, ArrowSchurGpuFailure> {
+        let n = sys.rows.len();
+        let d = sys.d;
+        let k = sys.k;
+        if n == 0 || d == 0 || k == 0 {
+            return Err(ArrowSchurGpuFailure::Unavailable);
+        }
+        // Dense shared block + materialised per-row slabs are required; the
+        // public entry already rejected matrix-free operators, but re-check so
+        // this routine is safe in isolation.
+        if sys.hbb_matvec.is_some() || sys.htbeta_matvec.is_some() || sys.hbb.dim() != (k, k) {
+            return Err(ArrowSchurGpuFailure::Unavailable);
+        }
+
+        let runtime =
+            crate::gpu::runtime::GpuRuntime::global().ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        if runtime.device_count() < 2 {
+            return Err(ArrowSchurGpuFailure::Unavailable);
+        }
+
+        // Pack one slot per row (column-major), folding ρ_t into each D block.
+        let mut slots: Vec<RowSlot> = Vec::with_capacity(n);
+        for row in &sys.rows {
+            if row.htt.dim() != (d, d) || row.htbeta.dim() != (d, k) || row.gt.len() != d {
+                return Err(ArrowSchurGpuFailure::Unavailable);
+            }
+            let mut d_block = Vec::with_capacity(d * d);
+            let mut b_block = Vec::with_capacity(d * k);
+            let mut g_vec = Vec::with_capacity(d);
+            pack_block(row, ridge_t, d, k, &mut d_block, &mut b_block, &mut g_vec);
+            let diag_scale = row
+                .htt
+                .diag()
+                .iter()
+                .map(|v| v.abs())
+                .fold(0.0_f64, f64::max)
+                .max(1.0);
+            slots.push(RowSlot {
+                d_block,
+                b_block,
+                g_vec,
+                diag_scale,
+                l_block: Vec::new(),
+                u_vec: Vec::new(),
+                y_block: Vec::new(),
+                log_det_local: 0.0,
+                bump: None,
+                tile_partial_schur: None,
+                tile_partial_rhs: None,
+                delta_t_block: vec![0.0; d],
+            });
+        }
+
+        // ---- Forward pass: per-device row tile, fused on its own stream ----
+        let forward_ok = crate::gpu::pool::scatter_batched(runtime, &mut slots, |ordinal, tile| {
+            forward_tile(ordinal, d, k, tile)
+        });
+        if forward_ok.is_none() {
+            return Err(ArrowSchurGpuFailure::Unavailable);
+        }
+
+        // Surface a non-PD tip block as a precise per-row ridge bump.
+        let row_base_of_tile = crate::gpu::pool::balanced_partition(runtime, n);
+        if let Some((row, bump)) = slots
+            .iter()
+            .enumerate()
+            .find_map(|(i, slot)| slot.bump.map(|b| (i, b)))
+        {
+            return Err(ArrowSchurGpuFailure::RidgeBumpRequired { row, bump });
+        }
+
+        // ---- Central: reduce tile partials → S_β, r_β; factor; solve δβ ----
+        // Seed S_β with H_ββ + ρ_β I (column-major) and r_β with -g_β, then fold
+        // in the per-tile partials in tile order so the reduction order tracks
+        // the single-device accumulation (up to inter-tile reassociation).
+        let mut schur_host = vec![0.0_f64; k * k];
+        for col in 0..k {
+            for row in 0..k {
+                let mut v = sys.hbb[[row, col]];
+                if row == col {
+                    v += ridge_beta;
+                }
+                schur_host[col * k + row] = v;
+            }
+        }
+        let mut rhs_host: Vec<f64> = sys.gb.iter().map(|v| -v).collect();
+        let mut log_det = 0.0_f64;
+        for start in tile_starts(&row_base_of_tile) {
+            let slot = &slots[start];
+            let partial_schur = slot
+                .tile_partial_schur
+                .as_ref()
+                .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+            let partial_rhs = slot
+                .tile_partial_rhs
+                .as_ref()
+                .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+            // `accumulate_schur` writes `partial_schur = -Σ_tile Y_iᵀY_i` (GEMM
+            // α=-1, β=1 into a zero seed) and `partial_rhs = +Σ_tile Y_iᵀu_i`.
+            // The reduced Schur is `S = (H_ββ+ρI) − Σ_all Y_iᵀY_i`, so adding the
+            // (already-negated) partials reproduces the single-device sign.
+            for idx in 0..k * k {
+                schur_host[idx] += partial_schur[idx];
+            }
+            for a in 0..k {
+                rhs_host[a] += partial_rhs[a];
+            }
+        }
+        for slot in &slots {
+            log_det += slot.log_det_local;
+        }
+
+        // Factor S_β and solve δβ on the primary device (small K×K leaf). The
+        // stream carries the primary context (same pattern as `solve()`); no
+        // thread bind is needed for the cuSOLVER/cuBLAS handles created from it.
+        let primary = runtime.selected_device().ordinal;
+        let stream = crate::gpu::runtime::cuda_context_for(primary)
+            .and_then(|ctx| ctx.new_stream().ok())
+            .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let solver =
+            DnHandle::new(stream.clone()).map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let blas = CudaBlas::new(stream.clone()).map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let mut schur_dev = stream
+            .clone_htod(&schur_host)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let mut rhs_dev = stream
+            .clone_htod(&rhs_host)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let info = potrf_single(&solver, &stream, k, &mut schur_dev)?;
+        if info != 0 {
+            return Err(ArrowSchurGpuFailure::SchurFactorFailed {
+                reason: format!("multi-GPU Schur Cholesky failed at pivot {info}"),
+            });
+        }
+        trsm_single(&blas, &stream, k, &schur_dev, &mut rhs_dev, false, false)?;
+        trsm_single(&blas, &stream, k, &schur_dev, &mut rhs_dev, false, true)?;
+        let delta_beta_host = stream
+            .clone_dtoh(&rhs_dev)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let delta_beta = Array1::from_vec(delta_beta_host.clone());
+        let l_schur_host = stream
+            .clone_dtoh(&schur_dev)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        for j in 0..k {
+            log_det += l_schur_host[j * k + j].ln();
+        }
+        log_det *= 2.0;
+
+        // ---- Backward pass: δt_i = -L_iᵀ⁻¹(u_i + Y_iδβ), per-device tile ----
+        let delta_beta_ref = &delta_beta_host;
+        let back_ok = crate::gpu::pool::scatter_batched(runtime, &mut slots, |ordinal, tile| {
+            back_sub_tile(ordinal, d, k, delta_beta_ref, tile)
+        });
+        if back_ok.is_none() {
+            return Err(ArrowSchurGpuFailure::Unavailable);
+        }
+
+        // Stitch per-row δt into the stacked (n*d) result.
+        let mut delta_t = Array1::<f64>::zeros(n * d);
+        for (i, slot) in slots.iter().enumerate() {
+            let base = i * d;
+            for r in 0..d {
+                delta_t[base + r] = slot.delta_t_block[r];
+            }
+        }
+
+        Ok(ArrowSchurGpuSolution {
+            delta_t,
+            delta_beta,
+            log_det_hessian: log_det,
+        })
+    }
+
+    /// Tile starts: the leading global row index of each device tile (where the
+    /// tile-level partial reduction was written by the forward pass).
+    fn tile_starts(
+        tiles: &[(usize, std::ops::Range<usize>)],
+    ) -> impl Iterator<Item = usize> + '_ {
+        tiles.iter().map(|(_, range)| range.start)
+    }
+
+    /// Forward pass for one device row tile, running on `ordinal`'s bound stream.
+    /// Factors each row block, whitens `u`/`Y`, accumulates the tile's partial
+    /// Schur `(Σ Y_iᵀY_i, Σ Y_iᵀu_i)` into the tile's leading slot, keeps the
+    /// per-row `L`/`u`/`Y` on the host for back-sub, and records the per-row
+    /// `Σ_j log L_jj`. A non-PD pivot is recorded in `slot.bump` (the tile still
+    /// returns `Some(())` so the orchestrator raises a precise `RidgeBumpRequired`
+    /// rather than collapsing the whole batch to CPU).
+    fn forward_tile(ordinal: usize, d: usize, k: usize, tile: &mut [RowSlot]) -> Option<()> {
+        if tile.is_empty() {
+            return Some(());
+        }
+        // `scatter_batched` has already bound this ordinal's context on this
+        // worker thread; the stream below targets that same device.
+        let stream = crate::gpu::runtime::cuda_context_for(ordinal)
+            .and_then(|ctx| ctx.new_stream().ok())?;
+        let solver = DnHandle::new(stream.clone()).ok()?;
+        let blas = CudaBlas::new(stream.clone()).ok()?;
+        let m = tile.len();
+
+        // Stack the tile's D, B, g into contiguous device buffers (same layout
+        // the single-device path packs for `m` rows).
+        let mut d_host = Vec::with_capacity(m * d * d);
+        let mut b_host = Vec::with_capacity(m * d * k);
+        let mut g_host = Vec::with_capacity(m * d);
+        for slot in tile.iter() {
+            d_host.extend_from_slice(&slot.d_block);
+            b_host.extend_from_slice(&slot.b_block);
+            g_host.extend_from_slice(&slot.g_vec);
+        }
+        let mut d_dev = stream.clone_htod(&d_host).ok()?;
+        let mut b_dev = stream.clone_htod(&b_host).ok()?;
+        let mut g_dev = stream.clone_htod(&g_host).ok()?;
+
+        // Batched POTRF; a non-PD block records its bump and stops the tile.
+        let info_host = potrf_batched(&solver, &stream, d, m, &mut d_dev).ok()?;
+        if let Some(local) = info_host.iter().position(|info| *info != 0) {
+            let pivot = info_host[local];
+            tile[local].bump = Some(
+                tile[local].diag_scale
+                    * (f64::from(pivot).abs()).max(1.0)
+                    * f64::EPSILON.sqrt()
+                    * 1024.0,
+            );
+            return Some(());
+        }
+
+        // Whiten: u = L⁻¹ g, Y = L⁻¹ B.
+        trsm_batched_lower_inplace(&blas, &stream, d, m, 1, &d_dev, &mut g_dev).ok()?;
+        trsm_batched_lower_inplace(&blas, &stream, d, m, k, &d_dev, &mut b_dev).ok()?;
+
+        // Tile partial Schur: zero-seeded so the host adds the H_ββ seed once.
+        let mut schur_dev = stream.alloc_zeros::<f64>(k * k).ok()?;
+        let mut rhs_dev = stream.alloc_zeros::<f64>(k).ok()?;
+        accumulate_schur(&blas, d, k, m, &b_dev, &g_dev, &mut schur_dev, &mut rhs_dev).ok()?;
+
+        // Download L, u, Y, and the tile partials.
+        let l_host = stream.clone_dtoh(&d_dev).ok()?;
+        let u_host = stream.clone_dtoh(&g_dev).ok()?;
+        let y_host = stream.clone_dtoh(&b_dev).ok()?;
+        let partial_schur = stream.clone_dtoh(&schur_dev).ok()?;
+        let partial_rhs = stream.clone_dtoh(&rhs_dev).ok()?;
+
+        for (local, slot) in tile.iter_mut().enumerate() {
+            let l_base = local * d * d;
+            let u_base = local * d;
+            let y_base = local * d * k;
+            slot.l_block = l_host[l_base..l_base + d * d].to_vec();
+            slot.u_vec = u_host[u_base..u_base + d].to_vec();
+            slot.y_block = y_host[y_base..y_base + d * k].to_vec();
+            let mut log_det_local = 0.0_f64;
+            for j in 0..d {
+                log_det_local += l_host[l_base + j * d + j].ln();
+            }
+            slot.log_det_local = log_det_local;
+        }
+        tile[0].tile_partial_schur = Some(partial_schur);
+        tile[0].tile_partial_rhs = Some(partial_rhs);
+        Some(())
+    }
+
+    /// Back-substitution for one device row tile: `δt_i = -L_iᵀ⁻¹(u_i + Y_iδβ)`.
+    /// Re-uploads the tile's kept `L`/`u`/`Y` to `ordinal`, applies the GEMV
+    /// accumulate + transposed TRSM, and writes each row's `δt` into its slot.
+    fn back_sub_tile(
+        ordinal: usize,
+        d: usize,
+        k: usize,
+        delta_beta: &[f64],
+        tile: &mut [RowSlot],
+    ) -> Option<()> {
+        if tile.is_empty() {
+            return Some(());
+        }
+        // `scatter_batched` has already bound this ordinal's context on this
+        // worker thread; the stream below targets that same device.
+        let stream = crate::gpu::runtime::cuda_context_for(ordinal)
+            .and_then(|ctx| ctx.new_stream().ok())?;
+        let blas = CudaBlas::new(stream.clone()).ok()?;
+        let m = tile.len();
+
+        let mut l_host = Vec::with_capacity(m * d * d);
+        let mut u_host = Vec::with_capacity(m * d);
+        let mut y_host = Vec::with_capacity(m * d * k);
+        for slot in tile.iter() {
+            l_host.extend_from_slice(&slot.l_block);
+            u_host.extend_from_slice(&slot.u_vec);
+            y_host.extend_from_slice(&slot.y_block);
+        }
+        let d_dev = stream.clone_htod(&l_host).ok()?;
+        let mut g_dev = stream.clone_htod(&u_host).ok()?;
+        let b_dev = stream.clone_htod(&y_host).ok()?;
+        let rhs_dev = stream.clone_htod(&delta_beta.to_vec()).ok()?;
+
+        // g ← u + Y·δβ, then x = L⁻ᵀ g; δt = -x.
+        accumulate_back_sub_rhs(&blas, d, k, m, &b_dev, &rhs_dev, &mut g_dev).ok()?;
+        trsm_batched_lower_inplace_transposed(&blas, &stream, d, m, 1, &d_dev, &mut g_dev).ok()?;
+        let x_host = stream.clone_dtoh(&g_dev).ok()?;
+        for (local, slot) in tile.iter_mut().enumerate() {
+            let base = local * d;
+            for r in 0..d {
+                slot.delta_t_block[r] = -x_host[base + r];
+            }
+        }
+        Some(())
+    }
 
     pub(super) fn solve(
         sys: &ArrowSchurSystem,
@@ -558,36 +940,27 @@ mod cuda {
             .clone_htod(&g_host)
             .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
 
-        // ----- Layer A: batched lower Cholesky of D -----
-        // The n tip blocks `D_i = H_tt^(i) + ρ_t·I` are independent SPD systems —
-        // the canonical multi-GPU axis. With more than one usable device, factor
-        // the whole batch across ALL GPUs via the pool-tiled host batched
-        // Cholesky and upload the stacked factors back into `d_dev`; the
-        // remaining single-stream pipeline (trsm / Schur / back-sub) then runs on
-        // the primary device unchanged. With a single device the in-place
-        // on-device `potrf_batched` is kept verbatim (the existing fast path).
-        if crate::gpu::runtime::GpuRuntime::global()
-            .map(crate::gpu::runtime::GpuRuntime::device_count)
-            .unwrap_or(0)
-            > 1
-        {
-            match potrf_batched_pool(&d_host, d, n) {
-                Ok(factored_col) => {
-                    d_dev = stream
-                        .clone_htod(&factored_col)
-                        .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
-                }
-                Err(ArrowSchurGpuFailure::Unavailable) => {
-                    // Pool path declined (mixed shapes, transient): fall back to
-                    // the single-device on-device batched POTRF.
-                    let info_host = potrf_batched(&solver, &stream, d, n, &mut d_dev)?;
-                    bump_on_potrf_info(sys, &info_host)?;
-                }
-                Err(other) => return Err(other),
-            }
-        } else {
-            let info_host = potrf_batched(&solver, &stream, d, n, &mut d_dev)?;
-            bump_on_potrf_info(sys, &info_host)?;
+        // ----- Layer A: batched lower Cholesky of D in place -----
+        // This POTRF is fused with the downstream TRSM + Schur GEMM + back-sub
+        // on this one stream, so splitting only the POTRF across devices would
+        // orphan the dependent on-stream solves. Multi-GPU here is the
+        // whole-solve row-block split in `solve_arrow_newton_step` (see
+        // `solve_multi_gpu`), not a per-layer split — this device-resident path
+        // is the single-device leaf the split dispatches per tile.
+        let info_host = potrf_batched(&solver, &stream, d, n, &mut d_dev)?;
+        if let Some(idx) = info_host.iter().position(|info| *info != 0) {
+            let pivot = info_host[idx];
+            let scale = sys.rows[idx]
+                .htt
+                .diag()
+                .iter()
+                .map(|v| v.abs())
+                .fold(0.0_f64, f64::max)
+                .max(1.0);
+            return Err(ArrowSchurGpuFailure::RidgeBumpRequired {
+                row: idx,
+                bump: scale * (pivot.abs() as f64).max(1.0) * f64::EPSILON.sqrt() * 1024.0,
+            });
         }
 
         // ----- Layer B (1/2): in-place triangular solves -----
@@ -695,82 +1068,6 @@ mod cuda {
             delta_beta,
             log_det_hessian: log_det,
         })
-    }
-
-    /// Translate a batched-POTRF info vector into the `RidgeBumpRequired`
-    /// diagnostic the outer LM escalation consumes: the first non-zero `info`
-    /// marks a non-PD tip block, and the bump is scaled by that block's
-    /// diagonal magnitude. Returns `Ok(())` when every block factored.
-    fn bump_on_potrf_info(
-        sys: &ArrowSchurSystem,
-        info_host: &[i32],
-    ) -> Result<(), ArrowSchurGpuFailure> {
-        if let Some(idx) = info_host.iter().position(|info| *info != 0) {
-            let pivot = info_host[idx];
-            let scale = sys.rows[idx]
-                .htt
-                .diag()
-                .iter()
-                .map(|v| v.abs())
-                .fold(0.0_f64, f64::max)
-                .max(1.0);
-            return Err(ArrowSchurGpuFailure::RidgeBumpRequired {
-                row: idx,
-                bump: scale * (pivot.abs() as f64).max(1.0) * f64::EPSILON.sqrt() * 1024.0,
-            });
-        }
-        Ok(())
-    }
-
-    /// Factor the `n` tip blocks `D_i = H_tt^(i) + ρ_t·I` across ALL usable GPUs
-    /// via the pool-tiled batched Cholesky, returning the stacked column-major
-    /// lower factors ready to upload as `d_dev`.
-    ///
-    /// `d_host` is the stacked column-major `n·d·d` buffer `pack_host` already
-    /// built (each `d×d` block contiguous, with the per-block ρ_t ridge folded
-    /// in). The blocks are rehydrated into host `Array2`s and handed to
-    /// `crate::gpu::try_cholesky_batched_lower_inplace`, which spreads the
-    /// batched POTRF over the device pool. On any decline — including a non-PD
-    /// block (the pool path reports a whole-batch `None` without the offending
-    /// row) — this returns `Unavailable` so the caller re-runs the single-device
-    /// `potrf_batched`, which surfaces the precise `RidgeBumpRequired` row.
-    fn potrf_batched_pool(
-        d_host: &[f64],
-        d: usize,
-        n: usize,
-    ) -> Result<Vec<f64>, ArrowSchurGpuFailure> {
-        let block_len = d.checked_mul(d).ok_or(ArrowSchurGpuFailure::Unavailable)?;
-        if d_host.len() != n.checked_mul(block_len).ok_or(ArrowSchurGpuFailure::Unavailable)? {
-            return Err(ArrowSchurGpuFailure::Unavailable);
-        }
-        // Rehydrate column-major d×d blocks into row-major host Array2 (ndarray
-        // is row-major; index [r, c] = column-major[c*d + r]).
-        let mut blocks: Vec<ndarray::Array2<f64>> = Vec::with_capacity(n);
-        for i in 0..n {
-            let base = i * block_len;
-            let mut block = ndarray::Array2::<f64>::zeros((d, d));
-            for c in 0..d {
-                for r in 0..d {
-                    block[[r, c]] = d_host[base + c * d + r];
-                }
-            }
-            blocks.push(block);
-        }
-        // Multi-GPU batched lower Cholesky. `None` ⇒ decline / non-PD block.
-        crate::gpu::try_cholesky_batched_lower_inplace(&mut blocks)
-            .ok_or(ArrowSchurGpuFailure::Unavailable)?;
-        // Re-pack the lower factors to the stacked column-major layout `d_dev`
-        // expects (strict upper already zeroed by the batched kernel).
-        let mut factored_col = vec![0.0_f64; n * block_len];
-        for (i, block) in blocks.iter().enumerate() {
-            let base = i * block_len;
-            for c in 0..d {
-                for r in 0..d {
-                    factored_col[base + c * d + r] = block[[r, c]];
-                }
-            }
-        }
-        Ok(factored_col)
     }
 
     fn potrf_batched(
