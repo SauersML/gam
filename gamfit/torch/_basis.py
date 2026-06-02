@@ -418,6 +418,91 @@ class _DuchonBasisFn(torch.autograd.Function):
         return grad_pts, None, None, None, None
 
 
+class _SphereBasisFn(torch.autograd.Function):
+    """Autograd Function for the spherical-spline (S²) design with grad wrt points.
+
+    Forward returns ONLY the design ``(N, K)`` (the penalty is structural and
+    independent of ``points``, so it carries no gradient and is returned
+    detached by the public wrapper). Backward contracts the upstream cotangent
+    with the Rust input-location jet ``∂design/∂(lat, lon)`` of shape
+    ``(N, K, 2)``: ``grad_points[n, j] = Σ_k grad_design[n, k] · jet[n, k, j]``.
+    The jet is in the same units as the passed ``points`` (it includes the
+    deg→rad factor when ``radians=False``).
+    """
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        points: torch.Tensor,
+        n_centers: int,
+        penalty_order: int,
+        kernel: str,
+        radians: bool,
+        centers: Any,
+    ) -> torch.Tensor:
+        import numpy as np
+
+        pts_np = to_numpy_f64(points)
+        if centers is None:
+            design_np, _penalty_np = _api.sphere_basis(
+                pts_np,
+                int(n_centers),
+                penalty_order=int(penalty_order),
+                kernel=str(kernel),
+                radians=bool(radians),
+            )
+        else:
+            ctrs_np = np.ascontiguousarray(np.asarray(centers, dtype=np.float64))
+            design_np, _penalty_np = _api.rust_module().sphere_basis_with_centers(
+                pts_np,
+                ctrs_np,
+                int(penalty_order),
+                str(kernel),
+                bool(radians),
+            )
+        ctx.save_for_backward(points)
+        ctx.n_centers = int(n_centers)
+        ctx.penalty_order = int(penalty_order)
+        ctx.kernel = str(kernel)
+        ctx.radians = bool(radians)
+        ctx.centers = centers
+        return from_numpy_like(design_np, points)
+
+    @staticmethod
+    def backward(
+        ctx: Any, *grad_outputs: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None, None, None, None]:
+        import numpy as np
+
+        (grad_design,) = grad_outputs  # (N, K)
+        (points,) = ctx.saved_tensors
+        pts_np = to_numpy_f64(points)
+        if ctx.centers is None:
+            jet_np = _api.sphere_basis_jet(
+                pts_np,
+                ctx.n_centers,
+                penalty_order=ctx.penalty_order,
+                kernel=ctx.kernel,
+                radians=ctx.radians,
+            )
+        else:
+            ctrs_np = np.ascontiguousarray(
+                np.asarray(ctx.centers, dtype=np.float64)
+            )
+            jet_np = _api.rust_module().sphere_basis_jet_with_centers(
+                pts_np,
+                ctrs_np,
+                ctx.penalty_order,
+                ctx.kernel,
+                ctx.radians,
+            )
+        jet = from_numpy_like(np.asarray(jet_np, dtype=float), points)  # (N, K, 2)
+        grad_points = torch.einsum(
+            "nk,nkj->nj", grad_design.to(dtype=jet.dtype), jet
+        )
+        return grad_points, None, None, None, None, None
+
+
 def bspline_basis(
     t: torch.Tensor,
     knots: Any = None,
@@ -571,8 +656,12 @@ def sphere_basis(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build the spherical-spline (S²) design and penalty matrices.
 
-    Forward-only: there is no analytic VJP through ``points``. The
-    returned tensors are detached float64 copies on ``points``' device.
+    The returned ``design`` carries an exact analytic backward to ``points``:
+    its input-location jet ``∂design/∂(lat, lon)`` comes from the Rust
+    ``sphere_basis_jet`` kernel (in the same units as ``points``), and the
+    backward contracts it with the upstream cotangent. The ``penalty`` is
+    structural — independent of ``points`` — so it is returned detached and
+    carries no gradient.
 
     When ``centers`` is supplied (the descriptor path), the basis
     dimension is fixed by ``centers.shape[0]`` and is independent of the
@@ -596,7 +685,7 @@ def sphere_basis(
 
     pts_np = to_numpy_f64(points)
     if centers is None:
-        design_np, penalty_np = _api.sphere_basis(
+        _design_np, penalty_np = _api.sphere_basis(
             pts_np,
             int(n_centers),
             penalty_order=int(penalty_order),
@@ -607,14 +696,22 @@ def sphere_basis(
         ctrs_np = np.ascontiguousarray(
             np.asarray(centers, dtype=np.float64)
         )
-        design_np, penalty_np = _api.rust_module().sphere_basis_with_centers(
+        _design_np, penalty_np = _api.rust_module().sphere_basis_with_centers(
             pts_np,
             ctrs_np,
             int(penalty_order),
             str(kernel),
             bool(radians),
         )
-    design = from_numpy_like(design_np, points).to(torch.float64)
+    apply = cast(Callable[..., torch.Tensor], _SphereBasisFn.apply)
+    design = apply(
+        points,
+        int(n_centers),
+        int(penalty_order),
+        str(kernel),
+        bool(radians),
+        centers,
+    ).to(torch.float64)
     penalty = from_numpy_like(penalty_np, points).to(torch.float64)
     return design, penalty
 
