@@ -237,6 +237,9 @@ def _build_fit_payload(
     scale_dimensions: bool | None,
     adaptive_regularization: bool | None,
     firth: bool | None,
+    noise_formula: str | None,
+    noise_offset: str | None,
+    flexible_link: bool | None,
     precision_hyperpriors: Any | None,
     latents: Mapping[str, Any] | None,
     penalties: Sequence[Any] | None,
@@ -268,6 +271,9 @@ def _build_fit_payload(
         "scale_dimensions": scale_dimensions,
         "adaptive_regularization": adaptive_regularization,
         "firth": firth,
+        "noise_formula": noise_formula,
+        "noise_offset": noise_offset,
+        "flexible_link": flexible_link,
         "precision_hyperpriors": precision_hyperpriors,
         "latents": normalized_latents,
         "penalties": _normalize_penalties(penalties, normalized_latents),
@@ -765,6 +771,9 @@ def fit(
     scale_dimensions: bool | None = ...,
     adaptive_regularization: bool | None = ...,
     firth: bool | None = ...,
+    noise_formula: str | None = ...,
+    noise_offset: str | None = ...,
+    flexible_link: bool | None = ...,
     precision_hyperpriors: Any | None = ...,
     constraints: Mapping[str, Any] | None = ...,
     response_geometry: None = ...,
@@ -804,6 +813,9 @@ def fit(
     scale_dimensions: bool | None = ...,
     adaptive_regularization: bool | None = ...,
     firth: bool | None = ...,
+    noise_formula: str | None = ...,
+    noise_offset: str | None = ...,
+    flexible_link: bool | None = ...,
     precision_hyperpriors: Any | None = ...,
     constraints: Mapping[str, Any] | None = ...,
     response_geometry: str,
@@ -842,6 +854,9 @@ def fit(
     scale_dimensions: bool | None = None,
     adaptive_regularization: bool | None = None,
     firth: bool | None = None,
+    noise_formula: str | None = None,
+    noise_offset: str | None = None,
+    flexible_link: bool | None = None,
     precision_hyperpriors: Any | None = None,
     constraints: Mapping[str, Any] | None = None,
     response_geometry: str | None = None,
@@ -955,6 +970,23 @@ def fit(
         it off unless explicitly requested.
     firth:
         Enable Firth bias-reduced estimation. Corresponds to ``--firth``.
+    noise_formula:
+        Wilkinson-style formula for the log-scale (dispersion) component,
+        turning the fit into a location-scale GAMLSS where both the mean and
+        the residual spread vary smoothly with the covariates (e.g.
+        ``"s(x)"``). Passing this is the request to estimate a non-constant
+        scale. Corresponds to the ``--predict-noise`` CLI path
+        (``FitConfig.noise_formula``).
+    noise_offset:
+        Name of a column supplying a fixed additive offset on the log-scale
+        (dispersion) predictor of the location-scale model, analogous to
+        ``offset`` for the mean. Corresponds to
+        ``FitConfig.noise_offset_column``.
+    flexible_link:
+        Estimate a flexible (wiggly) link function rather than holding the
+        link fixed at its canonical/parametric form, letting the data shape
+        the response transformation. Corresponds to the CLI flexible-link path
+        (``FitConfig.flexible_link``).
     constraints:
         Optional mapping of smooth-term text to a shape-constraint kind.
         Keys are the literal smooth term as it appears in ``formula`` (e.g.
@@ -1168,6 +1200,9 @@ def fit(
         scale_dimensions=scale_dimensions,
         adaptive_regularization=adaptive_regularization,
         firth=firth,
+        noise_formula=noise_formula,
+        noise_offset=noise_offset,
+        flexible_link=flexible_link,
         precision_hyperpriors=resolved_precision_hyperpriors,
         latents=latents,
         penalties=penalties,
@@ -1208,6 +1243,9 @@ def fit_array(
     scale_dimensions: bool | None = None,
     adaptive_regularization: bool | None = None,
     firth: bool | None = None,
+    noise_formula: str | None = None,
+    noise_offset: str | None = None,
+    flexible_link: bool | None = None,
     precision_hyperpriors: Any | None = None,
     latents: Mapping[str, Any] | None = None,
     penalties: Sequence[Any] | None = None,
@@ -1255,6 +1293,9 @@ def fit_array(
         scale_dimensions=scale_dimensions,
         adaptive_regularization=adaptive_regularization,
         firth=firth,
+        noise_formula=noise_formula,
+        noise_offset=noise_offset,
+        flexible_link=flexible_link,
         precision_hyperpriors=resolved_precision_hyperpriors,
         latents=latents,
         penalties=penalties,
@@ -1380,6 +1421,9 @@ def validate_formula(
     scale_dimensions: bool | None = None,
     adaptive_regularization: bool | None = None,
     firth: bool | None = None,
+    noise_formula: str | None = None,
+    noise_offset: str | None = None,
+    flexible_link: bool | None = None,
     config: dict[str, Any] | None = None,
 ) -> FormulaValidation:
     """Validate a formula against a dataset without fitting.
@@ -1417,6 +1461,9 @@ def validate_formula(
         scale_dimensions=scale_dimensions,
         adaptive_regularization=adaptive_regularization,
         firth=firth,
+        noise_formula=noise_formula,
+        noise_offset=noise_offset,
+        flexible_link=flexible_link,
         precision_hyperpriors=None,
         latents=None,
         penalties=None,
