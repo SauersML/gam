@@ -22409,6 +22409,21 @@ fn sindy_finite_difference_array<'py>(
     Ok(dz.into_pyarray(py).unbind())
 }
 
+/// Render human-readable SINDy ODEs from a fitted coefficient matrix. `theta`
+/// is the public `(state_dim, n_terms)` layout; number formatting, zero-drop,
+/// and sign/term assembly live entirely in
+/// [`gam::solver::sindy::sindy_render_equations`] so Python holds no formatting
+/// logic.
+#[pyfunction]
+fn sindy_render_equations_array<'py>(
+    theta: PyReadonlyArray2<'py, f64>,
+    term_names: Vec<String>,
+    state_names: Vec<String>,
+) -> PyResult<Vec<String>> {
+    use gam::solver::sindy::sindy_render_equations;
+    sindy_render_equations(theta.as_array(), &term_names, &state_names).map_err(py_value_error)
+}
+
 /// Identifiability theorem precondition checks (Principle (f)).
 ///
 /// Caller serialises a `gam::inference::identifiability::FitSummary` as
@@ -22992,6 +23007,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sindy_stlsq_solve_array, module)?)?;
     module.add_function(wrap_pyfunction!(sindy_library_array, module)?)?;
     module.add_function(wrap_pyfunction!(sindy_finite_difference_array, module)?)?;
+    module.add_function(wrap_pyfunction!(sindy_render_equations_array, module)?)?;
     Ok(())
 }
 
