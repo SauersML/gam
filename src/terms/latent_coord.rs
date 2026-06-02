@@ -219,6 +219,10 @@ impl LatentManifold {
             }
             Self::Interval { lo, hi } => {
                 let scale = hi - lo;
+                assert!(
+                    scale.is_finite() && scale > 0.0,
+                    "LatentManifold::Interval requires finite lo < hi; got lo={lo}, hi={hi}"
+                );
                 vec![1.0 / (scale * scale)]
             }
             Self::Product(parts) => {
