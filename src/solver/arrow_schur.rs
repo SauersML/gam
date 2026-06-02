@@ -4833,6 +4833,34 @@ enum SchurReductionKind {
     SqrtBa,
 }
 
+/// Form one row block's `(left, right)` Schur contribution factors so that the
+/// contribution is `leftᵀ · right` (`k×k`). `Direct` solves the full block,
+/// `SqrtBa` uses only the lower-triangular whitening; both give the same
+/// `H_tβᵀ (H_tt)⁻¹ H_tβ` because `H_tt = L Lᵀ`.
+#[inline]
+fn row_schur_contribution_factors<B: BatchedBlockSolver>(
+    sys: &ArrowSchurSystem,
+    row_idx: usize,
+    row: &ArrowRowBlock,
+    htt_factor: &Array2<f64>,
+    backend: &B,
+    kind: SchurReductionKind,
+) -> (Array2<f64>, Array2<f64>) {
+    // Materialize the (d, k) cross-block, probing via the matvec when the
+    // dense slab is absent.
+    let htbeta = sys_htbeta_materialize_row(sys, row_idx, row);
+    match kind {
+        SchurReductionKind::Direct => {
+            let solved = backend.solve_block_matrix(htt_factor, &htbeta);
+            (htbeta, solved)
+        }
+        SchurReductionKind::SqrtBa => {
+            let whitened = backend.sqrt_solve_block_matrix(htt_factor, &htbeta);
+            (whitened.clone(), whitened)
+        }
+    }
+}
+
 /// Subtract one row block's Schur contribution from `schur` using the selected
 /// reduction kind. Identical algebra to the inline loop bodies the dense
 /// builders used; factored out so the serial and multi-GPU partition paths
@@ -4847,20 +4875,77 @@ fn subtract_row_schur_contribution<B: BatchedBlockSolver>(
     kind: SchurReductionKind,
     schur: &mut Array2<f64>,
 ) {
-    // Materialize the (d, k) cross-block, probing via the matvec when the
-    // dense slab is absent.
-    let htbeta = sys_htbeta_materialize_row(sys, row_idx, row);
-    match kind {
-        SchurReductionKind::Direct => {
-            let solved = backend.solve_block_matrix(htt_factor, &htbeta);
-            backend.block_gemm_subtract(schur, &htbeta, &solved);
+    let (left, right) =
+        row_schur_contribution_factors(sys, row_idx, row, htt_factor, backend, kind);
+    backend.block_gemm_subtract(schur, &left, &right);
+}
+
+/// Reduce one contiguous device tile's rows into a private `-Σ leftᵀ·right`
+/// partial (`k×k`).
+///
+/// The tile stacks its per-row `left_i` / `right_i` factors (each `d×k`) into
+/// two `(Σ_i d_i × k)` matrices and tries a single per-ordinal `AᵀB` device
+/// GEMM (`crate::gpu::try_fast_atb_on_ordinal`), which runs on the device this
+/// worker thread already bound — one big GPU GEMM per tile rather than `n` small
+/// CPU ones. When the device primitive declines (no GPU, shape below policy,
+/// transient failure) the tile reduces with the exact CPU `block_gemm_subtract`
+/// loop, so the result is unchanged. The partial is negated so the caller's
+/// `schur += partial` reproduces the serial `schur -= Σ contribution`.
+fn tile_schur_partial<B: BatchedBlockSolver>(
+    sys: &ArrowSchurSystem,
+    htt_factors: &[Array2<f64>],
+    backend: &B,
+    kind: SchurReductionKind,
+    ordinal: usize,
+    range: Range<usize>,
+) -> Array2<f64> {
+    let k = sys.k;
+
+    // Build the per-row contribution factors once; both the GPU stacked-GEMM
+    // and the CPU fallback consume them.
+    let mut factors: Vec<(Array2<f64>, Array2<f64>)> = Vec::with_capacity(range.len());
+    let mut total_d = 0usize;
+    for i in range.clone() {
+        let (left, right) = row_schur_contribution_factors(
+            sys,
+            i,
+            &sys.rows[i],
+            &htt_factors[i],
+            backend,
+            kind,
+        );
+        total_d += left.nrows();
+        factors.push((left, right));
+    }
+
+    // Stack into (total_d × k) left/right matrices for one device AᵀB GEMM on
+    // this tile's bound ordinal. `try_fast_atb_on_ordinal` returns leftᵀ·right
+    // (k×k); negate into the partial.
+    if total_d > 0 && k > 0 {
+        let mut left_stack = Array2::<f64>::zeros((total_d, k));
+        let mut right_stack = Array2::<f64>::zeros((total_d, k));
+        let mut base = 0usize;
+        for (left, right) in &factors {
+            let di = left.nrows();
+            left_stack.slice_mut(ndarray::s![base..base + di, ..]).assign(left);
+            right_stack.slice_mut(ndarray::s![base..base + di, ..]).assign(right);
+            base += di;
         }
-        SchurReductionKind::SqrtBa => {
-            // H_tβᵀ H_tt⁻¹ H_tβ = (L⁻¹ H_tβ)ᵀ (L⁻¹ H_tβ), H_tt = L Lᵀ.
-            let whitened = backend.sqrt_solve_block_matrix(htt_factor, &htbeta);
-            backend.block_gemm_subtract(schur, &whitened, &whitened);
+        if let Some(product) = crate::gpu::try_fast_atb_on_ordinal(
+            ordinal,
+            left_stack.view(),
+            right_stack.view(),
+        ) {
+            return product.mapv(|v| -v);
         }
     }
+
+    // CPU fallback: exact per-row block_gemm_subtract into a zero-seeded partial.
+    let mut partial = Array2::<f64>::zeros((k, k));
+    for (left, right) in &factors {
+        backend.block_gemm_subtract(&mut partial, left, right);
+    }
+    partial
 }
 
 /// Bind the given device ordinal's CUDA context to the current worker thread so
@@ -4934,11 +5019,12 @@ fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
         return;
     };
 
-    // Multi-GPU: one private k×k partial per contiguous device tile, each
-    // reduced on a worker thread that binds its ordinal's context so the
-    // per-row block GEMM offloads to that device. Partials are zero-seeded so
-    // their sum is exactly the reduction term; subtracting that sum from the
-    // H_ββ-seeded `schur` reproduces the serial accumulation.
+    // Multi-GPU: one private `-Σ leftᵀ·right` partial per contiguous device
+    // tile. Each tile runs on its own scoped worker thread that binds its
+    // ordinal's context and issues a single stacked AᵀB GEMM on that device, so
+    // the tiles' GEMMs overlap across the pool. Folding the partials back into
+    // the H_ββ-seeded `schur` reproduces the serial reduction (up to inter-tile
+    // reassociation).
     let partials: Vec<Array2<f64>> = std::thread::scope(|scope| {
         let handles: Vec<_> = tiles
             .iter()
@@ -4947,19 +5033,7 @@ fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
                 let range = range.clone();
                 scope.spawn(move || {
                     bind_tile_device(ordinal);
-                    let mut partial = Array2::<f64>::zeros((k, k));
-                    for i in range.clone() {
-                        subtract_row_schur_contribution(
-                            sys,
-                            i,
-                            &sys.rows[i],
-                            &htt_factors[i],
-                            backend,
-                            kind,
-                            &mut partial,
-                        );
-                    }
-                    partial
+                    tile_schur_partial(sys, htt_factors, backend, kind, ordinal, range)
                 })
             })
             .collect();
