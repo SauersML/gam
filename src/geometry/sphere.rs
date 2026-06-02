@@ -350,6 +350,117 @@ pub fn normalize_sphere_matrix(values: ArrayView2<'_, f64>) -> Result<Array2<f64
     Ok(out)
 }
 
+/// Batched Riemannian log map of each row of `values` at a single `base`, in
+/// ambient tangent coordinates. Inputs are normalized onto the unit sphere
+/// first (unlike the strict [`SphereManifold::log_map`] trait method, which
+/// requires unit inputs); the geodesic angle uses the numerically stable
+/// `atan2(|u|, p·q)` form. Errors at antipodal points. This is the
+/// response-geometry companion to the trait method.
+pub fn response_sphere_log_map(
+    values: ArrayView2<'_, f64>,
+    base: ArrayView1<'_, f64>,
+) -> Result<Array2<f64>, String> {
+    let y = normalize_sphere_matrix(values)?;
+    let base2 = Array2::from_shape_fn((1, base.len()), |(_, j)| base[j]);
+    let b_mat = normalize_sphere_matrix(base2.view())?;
+    let (n, d) = y.dim();
+    if d != b_mat.ncols() {
+        return Err("spherical values and base point have different dimensions".to_string());
+    }
+    let mut out = Array2::<f64>::zeros((n, d));
+    for row in 0..n {
+        let mut dot = 0.0_f64;
+        for col in 0..d {
+            dot += y[[row, col]] * b_mat[[0, col]];
+        }
+        dot = dot.clamp(-1.0, 1.0);
+        if dot <= -1.0 + 1.0e-12 {
+            return Err("spherical log map is undefined at antipodal points".to_string());
+        }
+        // Geodesic angle via theta = atan2(|u|, p·q) with u = q − (p·q)p, the
+        // component of q orthogonal to p (|u| = sin theta). For nearby points
+        // p·q rounds to exactly 1.0 in f64 and acos(p·q) collapses a genuine
+        // ~1e-9 distance to 0; |u| is formed straight from the coordinates with
+        // no near-1 subtraction, so atan2(|u|, p·q) ≈ |u| stays accurate and
+        // the tangent norm equals the geodesic distance as documented.
+        let mut s_sq = 0.0_f64;
+        for col in 0..d {
+            let uc = y[[row, col]] - dot * b_mat[[0, col]];
+            s_sq += uc * uc;
+        }
+        let s = s_sq.sqrt();
+        if s < 1.0e-12 {
+            for col in 0..d {
+                out[[row, col]] = 0.0;
+            }
+        } else {
+            let scale = s.atan2(dot) / s;
+            for col in 0..d {
+                out[[row, col]] = (y[[row, col]] - dot * b_mat[[0, col]]) * scale;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Batched Riemannian exp map of each tangent row at a single `base`, returning
+/// points on the unit sphere. The base is normalized first; the orthogonal
+/// component of the tangent drives the geodesic step `cos(r)·p + (sin r / r)·z`.
+/// This is the response-geometry companion to [`SphereManifold::exp_map`].
+pub fn response_sphere_exp_map(
+    tangent: ArrayView2<'_, f64>,
+    base: ArrayView1<'_, f64>,
+) -> Result<Array2<f64>, String> {
+    let base2 = Array2::from_shape_fn((1, base.len()), |(_, j)| base[j]);
+    let b_mat = normalize_sphere_matrix(base2.view())?;
+    let (n, d) = tangent.dim();
+    if d != b_mat.ncols() {
+        return Err("spherical tangent and base point have different dimensions".to_string());
+    }
+    if !tangent.iter().all(|v| v.is_finite()) {
+        return Err("spherical tangent must contain only finite values".to_string());
+    }
+    let mut out = Array2::<f64>::zeros((n, d));
+    for row in 0..n {
+        let mut radial = 0.0_f64;
+        for col in 0..d {
+            radial += tangent[[row, col]] * b_mat[[0, col]];
+        }
+        let mut z = vec![0.0_f64; d];
+        let mut r_sq = 0.0_f64;
+        for col in 0..d {
+            let v = tangent[[row, col]] - radial * b_mat[[0, col]];
+            z[col] = v;
+            r_sq += v * v;
+        }
+        let r = r_sq.sqrt();
+        let mut norm_sq = 0.0_f64;
+        if r < 1.0e-12 {
+            for col in 0..d {
+                let v = b_mat[[0, col]] + z[col];
+                out[[row, col]] = v;
+                norm_sq += v * v;
+            }
+        } else {
+            let cos_r = r.cos();
+            let sin_scale = r.sin() / r;
+            for col in 0..d {
+                let v = cos_r * b_mat[[0, col]] + sin_scale * z[col];
+                out[[row, col]] = v;
+                norm_sq += v * v;
+            }
+        }
+        let norm = norm_sq.sqrt();
+        if !norm.is_finite() || norm <= 0.0 {
+            return Err("spherical exponential map produced a non-finite point".to_string());
+        }
+        for col in 0..d {
+            out[[row, col]] /= norm;
+        }
+    }
+    Ok(out)
+}
+
 fn sphere_orthogonal_unit(vector: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
     let mut min_index = 0;
     let mut min_abs = vector[0].abs();
