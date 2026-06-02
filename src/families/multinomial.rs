@@ -26,24 +26,24 @@
 //! softmax gauge is fixed at the η level and no additional sum-to-zero
 //! projection is required.
 //!
-//! # What this module deliberately does *not* do
+//! # Layering
 //!
-//! * **REML / LAML smoothing-parameter selection.** `λ` is supplied by the
-//!   caller. Selecting `λ` via the outer REML loop is a separate slice — it
-//!   requires implementing the full [`CustomFamily`] surface (joint Hessian
-//!   in (β across all classes), directional derivatives in ρ, the
-//!   joint-coupled coefficient-Hessian cost model, and integration with
-//!   [`crate::families::custom_family::fit_custom_family_with_rho_prior`]).
-//!   That follow-up sits cleanly on top of this driver: the multinomial
-//!   `CustomFamily` impl would call the math here as its inner solve at each
-//!   ρ trial and supply the same dense per-row Hessian block for the outer
-//!   trace terms.
+//! * **Fixed-λ inner solve** — [`fit_penalized_multinomial`] is the canonical
+//!   coefficient-space Newton solver at *given* smoothing parameters `λ`,
+//!   built on the shared [`crate::families::penalized_vector_glm`] engine.
 //!
-//! * **Formula → design integration.** Callers build `X` (and `S`) from the
-//!   GAM formula via the existing scalar plumbing; this driver is the
-//!   coefficient-space solver only. The forthcoming `gamfit.fit_multinomial`
-//!   Python entry will wire the formula machinery to this driver in a
-//!   dedicated FFI shim.
+//! * **REML / LAML smoothing-parameter selection** — [`fit_penalized_multinomial_formula`]
+//!   routes through [`crate::families::custom_family::fit_custom_family_with_rho_prior`]
+//!   so the per-active-class `λ_a` are selected by the outer REML/LAML loop;
+//!   the caller's `init_lambda` is only a warm-start seed. The multinomial
+//!   [`crate::families::multinomial_reml::MultinomialFamily`] `CustomFamily`
+//!   impl calls the fixed-λ math above as its inner solve at each ρ trial and
+//!   supplies the dense per-row Hessian block for the outer trace terms.
+//!
+//! * **Formula → design integration** — `build_formula_design_for_multinomial`
+//!   parses the Wilkinson formula and assembles `X` and the per-term `S`
+//!   blocks; the `fit_multinomial_formula_pyfunc` FFI shim wires the Python
+//!   `gamfit.fit(..., family='multinomial')` entry straight to this path.
 //!
 //! # Convergence
 //!
@@ -260,12 +260,13 @@ pub fn fit_penalized_multinomial(
 // a parsed `EncodedDataset`, a Wilkinson-style formula, and a uniform initial
 // smoothing parameter, then runs the full
 //
-//     parse → termspec → design (X, S blocks) → one-hot Y → Newton solve
+//     parse → termspec → design (X, S blocks) → one-hot Y → REML λ-selection
 //
-// pipeline. REML / LAML λ-selection is the next slice; until that lands the
-// caller pins `init_lambda` (default 1.0) and the same value is used for every
-// penalty block and every active class. The reference class is the last level
-// of the categorical response column as recorded in the dataset schema.
+// pipeline. `fit_penalized_multinomial_formula` drives the outer REML/LAML
+// loop (via the custom-family path) to select an independent λ per (class,
+// term); `init_lambda` (default 1.0) is only the warm-start seed for every
+// block. The reference class is the last level of the categorical response
+// column as recorded in the dataset schema.
 
 /// Saved-model payload for a multinomial fit driven by a Wilkinson formula.
 ///
