@@ -4495,7 +4495,10 @@ impl<'a, B: BatchedBlockSolver> ArrowBlockDiagInverse<'a, B> {
         ridge_beta: f64,
         tolerate_ill_conditioning: bool,
         backend: &'a B,
-    ) -> Result<Self, ArrowSchurError> {
+    ) -> Result<Self, ArrowSchurError>
+    where
+        B: Sync,
+    {
         let htt_factors =
             backend.factor_blocks(&sys.rows, ridge_t, sys.d, tolerate_ill_conditioning)?;
         let schur = build_dense_schur_direct(sys, &htt_factors, ridge_beta, backend)?;
@@ -4820,7 +4823,166 @@ fn reduced_rhs_beta<B: BatchedBlockSolver>(
     rhs_beta
 }
 
-fn build_dense_schur_direct<B: BatchedBlockSolver>(
+/// Which Square-Root / direct factorization the per-row Schur contribution
+/// uses. `Direct` forms `H_tβᵀ (H_tt)⁻¹ H_tβ` via a full block solve; `SqrtBa`
+/// forms the equivalent `(L⁻¹ H_tβ)ᵀ (L⁻¹ H_tβ)` from the lower triangular
+/// solve only. The reduction `Σ_i contribution_i` is identical in both axes.
+#[derive(Clone, Copy)]
+enum SchurReductionKind {
+    Direct,
+    SqrtBa,
+}
+
+/// Subtract one row block's Schur contribution from `schur` using the selected
+/// reduction kind. Identical algebra to the inline loop bodies the dense
+/// builders used; factored out so the serial and multi-GPU partition paths
+/// share one definition.
+#[inline]
+fn subtract_row_schur_contribution<B: BatchedBlockSolver>(
+    sys: &ArrowSchurSystem,
+    row_idx: usize,
+    row: &ArrowRowBlock,
+    htt_factor: &Array2<f64>,
+    backend: &B,
+    kind: SchurReductionKind,
+    schur: &mut Array2<f64>,
+) {
+    // Materialize the (d, k) cross-block, probing via the matvec when the
+    // dense slab is absent.
+    let htbeta = sys_htbeta_materialize_row(sys, row_idx, row);
+    match kind {
+        SchurReductionKind::Direct => {
+            let solved = backend.solve_block_matrix(htt_factor, &htbeta);
+            backend.block_gemm_subtract(schur, &htbeta, &solved);
+        }
+        SchurReductionKind::SqrtBa => {
+            // H_tβᵀ H_tt⁻¹ H_tβ = (L⁻¹ H_tβ)ᵀ (L⁻¹ H_tβ), H_tt = L Lᵀ.
+            let whitened = backend.sqrt_solve_block_matrix(htt_factor, &htbeta);
+            backend.block_gemm_subtract(schur, &whitened, &whitened);
+        }
+    }
+}
+
+/// Bind the given device ordinal's CUDA context to the current worker thread so
+/// the per-row GPU GEMM shims issued from it offload to that device. A missing
+/// context or bind failure leaves the shims to no-op to CPU — the math is
+/// unchanged — so the result is intentionally consumed without escalation. On
+/// non-Linux builds there are no CUDA contexts; the ordinal is accepted so the
+/// multi-device fan-out compiles identically across platforms.
+#[cfg(target_os = "linux")]
+fn bind_tile_device(ordinal: usize) {
+    if let Some(ctx) = crate::gpu::runtime::cuda_context_for(ordinal) {
+        if ctx.bind_to_thread().is_err() {
+            // Fall through: this tile reduces on the CPU.
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bind_tile_device(ordinal: usize) {
+    // No CUDA contexts off Linux; the ordinal must still be a real pool
+    // ordinal, which `usize` always satisfies — asserting it keeps the
+    // parameter live so the cross-platform signature carries no dead binding.
+    debug_assert!(ordinal < usize::MAX);
+}
+
+/// Reduce the per-row Schur contributions `Σ_i H_tβ^(i)ᵀ (H_tt^(i))⁻¹ H_tβ^(i)`
+/// out of `schur` (seeded with `H_ββ + ρ_β·I`).
+///
+/// The per-row contributions are independent — exactly the "sum over independent
+/// arrow-tip blocks" axis the device pool partitions. When more than one GPU is
+/// usable, [`crate::gpu::pool::balanced_partition`] splits the `0..n` rows into
+/// per-device contiguous tiles; each tile is reduced on its own scoped thread
+/// (binding that ordinal's context so the per-row GEMM-subtract offloads to its
+/// device) into a private `k×k` partial, and the partials are summed back into
+/// `schur` in tile order. The tiles are contiguous, ordered to cover `0..n`, and
+/// folded back in that same order, so within each tile the per-row accumulation
+/// order is preserved and the only departure from the serial loop is the
+/// inter-tile reassociation of the reduction sum — the established
+/// reduction-order equivalence the device pool already operates under, well
+/// inside the Newton solve's tolerance.
+///
+/// With a single device (or no GPU) the row loop runs serially in place, which
+/// is bit-for-bit the original behaviour.
+fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
+    sys: &ArrowSchurSystem,
+    htt_factors: &[Array2<f64>],
+    backend: &B,
+    kind: SchurReductionKind,
+    schur: &mut Array2<f64>,
+) {
+    let n = sys.rows.len();
+    let k = sys.k;
+
+    let tiles = crate::gpu::runtime::GpuRuntime::global()
+        .map(|rt| crate::gpu::pool::balanced_partition(rt, n))
+        .filter(|tiles| tiles.len() > 1);
+
+    let Some(tiles) = tiles else {
+        // Single-device / CPU: reduce serially in place (original order).
+        for (i, row) in sys.rows.iter().enumerate() {
+            subtract_row_schur_contribution(
+                sys,
+                i,
+                row,
+                &htt_factors[i],
+                backend,
+                kind,
+                schur,
+            );
+        }
+        return;
+    };
+
+    // Multi-GPU: one private k×k partial per contiguous device tile, each
+    // reduced on a worker thread that binds its ordinal's context so the
+    // per-row block GEMM offloads to that device. Partials are zero-seeded so
+    // their sum is exactly the reduction term; subtracting that sum from the
+    // H_ββ-seeded `schur` reproduces the serial accumulation.
+    let partials: Vec<Array2<f64>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = tiles
+            .iter()
+            .map(|(ordinal, range)| {
+                let ordinal = *ordinal;
+                let range = range.clone();
+                scope.spawn(move || {
+                    bind_tile_device(ordinal);
+                    let mut partial = Array2::<f64>::zeros((k, k));
+                    for i in range.clone() {
+                        subtract_row_schur_contribution(
+                            sys,
+                            i,
+                            &sys.rows[i],
+                            &htt_factors[i],
+                            backend,
+                            kind,
+                            &mut partial,
+                        );
+                    }
+                    partial
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("schur-reduction tile thread panicked"))
+            .collect()
+    });
+
+    // Fold partials into `schur` in tile order (contiguous, covering 0..n) so
+    // the per-tile and inter-tile accumulation order is the row order; each
+    // partial holds `-Σ contribution` over its rows, so `schur += partial`
+    // reproduces `schur -= Σ contribution`.
+    for partial in &partials {
+        for a in 0..k {
+            for b in 0..k {
+                schur[[a, b]] += partial[[a, b]];
+            }
+        }
+    }
+}
+
+fn build_dense_schur_direct<B: BatchedBlockSolver + Sync>(
     sys: &ArrowSchurSystem,
     htt_factors: &[Array2<f64>],
     ridge_beta: f64,
@@ -4839,18 +5001,18 @@ fn build_dense_schur_direct<B: BatchedBlockSolver>(
     for j in 0..k {
         schur[[j, j]] += ridge_beta;
     }
-    for (i, row) in sys.rows.iter().enumerate() {
-        // Materialize the (d, k) cross-block, probing via the matvec when
-        // the dense slab is absent.
-        let htbeta = sys_htbeta_materialize_row(sys, i, row);
-        let solved = backend.solve_block_matrix(&htt_factors[i], &htbeta);
-        backend.block_gemm_subtract(&mut schur, &htbeta, &solved);
-    }
+    reduce_row_schur_contributions(
+        sys,
+        htt_factors,
+        backend,
+        SchurReductionKind::Direct,
+        &mut schur,
+    );
     symmetrize_upper_from_lower(&mut schur);
     Ok(schur)
 }
 
-fn build_dense_schur_sqrt_ba<B: BatchedBlockSolver>(
+fn build_dense_schur_sqrt_ba<B: BatchedBlockSolver + Sync>(
     sys: &ArrowSchurSystem,
     htt_factors: &[Array2<f64>],
     ridge_beta: f64,
@@ -4869,15 +5031,13 @@ fn build_dense_schur_sqrt_ba<B: BatchedBlockSolver>(
     for j in 0..k {
         schur[[j, j]] += ridge_beta;
     }
-    for (i, row) in sys.rows.iter().enumerate() {
-        // Square-Root BA: H_tβ^T H_tt^-1 H_tβ =
-        // (L^-1 H_tβ)^T (L^-1 H_tβ), where H_tt = L L^T.
-        // Materialize the (d, k) cross-block, probing via the matvec when
-        // the dense slab is absent.
-        let htbeta = sys_htbeta_materialize_row(sys, i, row);
-        let whitened = backend.sqrt_solve_block_matrix(&htt_factors[i], &htbeta);
-        backend.block_gemm_subtract(&mut schur, &whitened, &whitened);
-    }
+    reduce_row_schur_contributions(
+        sys,
+        htt_factors,
+        backend,
+        SchurReductionKind::SqrtBa,
+        &mut schur,
+    );
     symmetrize_upper_from_lower(&mut schur);
     Ok(schur)
 }
