@@ -1036,9 +1036,10 @@ impl HessianDerivativeProvider for GaussianDerivatives {
 /// where c is the first eta-derivative of the working curvature W(η),
 /// and vₖ = H⁻¹(Aₖβ̂) is the mode response.
 ///
-/// For non-canonical links (probit, cloglog, SAS, mixture, beta-logistic),
-/// `c_array` and `d_array` store the **observed-information** weight
-/// derivatives (c_obs, d_obs) that include residual-dependent corrections:
+/// When the link is not canonical — probit, cloglog, SAS, mixture, or
+/// beta-logistic — `c_array` and `d_array` store the **observed-information**
+/// weight derivatives (c_obs, d_obs) that include residual-dependent
+/// corrections:
 ///
 ///   c_obs = c_F + h'·B − (y−μ)·B_η
 ///   d_obs = d_F + h''·B + 2h'·B_η − (y−μ)·B_ηη

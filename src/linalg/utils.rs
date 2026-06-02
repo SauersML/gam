@@ -1,9 +1,9 @@
 use crate::construction::calculate_condition_number;
 use crate::estimate::EstimationError;
-use crate::faer_ndarray::{FaerCholesky, FaerEigh};
 use crate::faer_ndarray::{
     FaerArrayView, FaerLinalgError, array2_to_matmut, factorize_symmetricwith_fallback,
 };
+use crate::faer_ndarray::{FaerCholesky, FaerEigh};
 use crate::matrix::symmetrize_in_place;
 use faer::Side;
 use ndarray::{
@@ -1474,7 +1474,11 @@ mod ridge_tests {
                 expected_coefficients.view(),
                 1.0e-10,
             );
-            assert_close(fitted.slice(s![b, 0..n, ..]), expected_fitted.view(), 1.0e-10);
+            assert_close(
+                fitted.slice(s![b, 0..n, ..]),
+                expected_fitted.view(),
+                1.0e-10,
+            );
         }
         assert_eq!(fitted[[1, 2, 0]], 0.0);
     }
