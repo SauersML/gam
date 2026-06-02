@@ -332,12 +332,24 @@ def fit_response_geometry(
     kwargs["frailty_kind"] = None
     kwargs["frailty_sd"] = None
     kwargs["hazard_loading"] = None
+    np = _np()
+    fisher_source = fisher_rao_w
+    if fisher_source is None and resolved_coordinates.lower() == "alr":
+        # ALR is a valid chart but NOT isometric to Aitchison geometry: in ALR
+        # coordinates the Aitchison inner product is ⟨u, v⟩ = uᵀ G v with the
+        # Gram G = I_{D-1} − (1/D)·11ᵀ (for D = 3 it is [[2/3,-1/3],[-1/3,2/3]]
+        # ≠ I). Fitting a plain Gaussian/Euclidean model in ALR therefore
+        # minimizes the wrong (non-Aitchison) residual norm. Attach G as the
+        # per-observation residual weight so the Gaussian objective rᵀ G r and
+        # its gradient XᵀG(y−Xβ) are Aitchison-correct. (ILR/CLR have G = I and
+        # need no weighting; that is why the default coordinate is isometric.)
+        n_parts = int(y.shape[1])
+        fisher_source = _aitchison_metric_blocks(np, int(tangent.shape[0]), n_parts)
     fisher_w = None
-    if fisher_rao_w is not None:
-        np = _np()
+    if fisher_source is not None:
         fisher_w = _ffi(
             "response_geometry_normalize_fisher_rao",
-            np.asarray(fisher_rao_w, dtype=float),
+            np.asarray(fisher_source, dtype=float),
             int(tangent.shape[0]),
             int(tangent.shape[1]),
         )
@@ -366,6 +378,25 @@ def fit_response_geometry(
             fit=shared_fit,
         ),
     )
+
+
+def _aitchison_metric_blocks(np: Any, n_obs: int, n_parts: int) -> Any:
+    """Aitchison Gram ``G = I_{D-1} − (1/D)·11ᵀ`` for ALR coordinates.
+
+    ALR maps a ``D``-part composition to ``D-1`` log-ratio coordinates, but the
+    Aitchison inner product in those coordinates is ``⟨u, v⟩ = uᵀ G v`` with this
+    ``(D-1)×(D-1)`` Gram (for ``D = 3`` it is ``[[2/3,-1/3],[-1/3,2/3]]`` ≠ I).
+    Returned as a single 2-D block; the FFI broadcasts it across all ``n_obs``
+    observations so the Gaussian residual weighting ``rᵀ G r`` is constant and
+    Aitchison-correct. ``n_obs`` is accepted to document the broadcast intent.
+    """
+    if n_parts < 2:
+        raise ValueError("Aitchison metric requires at least two compositional parts")
+    if n_obs <= 0:
+        raise ValueError("Aitchison metric requires at least one observation")
+    dim = n_parts - 1
+    gram = np.eye(dim, dtype=float) - (1.0 / float(n_parts))
+    return gram
 
 
 def _formula_rhs(formula: str) -> str:
