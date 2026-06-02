@@ -3820,3 +3820,524 @@ mod tests {
         }
     }
 }
+
+/// Vector–Jacobian products of the multi-block per-smooth-λ Gaussian REML
+/// forward fit ([`gaussian_reml_blocks_orthogonal_shared_scale`]), back to the
+/// design blocks, penalty blocks, response, and weights.
+pub struct GaussianRemlBlocksBackwardAnalytic {
+    pub grad_designs: Vec<Array2<f64>>,
+    pub grad_penalties: Vec<Array2<f64>>,
+    pub grad_y: Array2<f64>,
+    pub grad_weights: Array1<f64>,
+}
+
+/// Analytic backward for the multi-block per-smooth-λ Gaussian REML forward.
+///
+/// Computes VJPs of (coefficients, fitted, lambdas, log_lambdas, reml_score,
+/// edf) back to (design_blocks, penalty_blocks, y, weights). The VJP is
+/// assembled at the converged log-λ vector: fixed-ρ β/fitted/profiled-REML/EDF
+/// terms are accumulated first, then the smoothing-parameter sensitivity is
+/// routed through the F×F profiled REML score Hessian from the implicit optimum.
+/// Pairs with the forward [`gaussian_reml_blocks_orthogonal_shared_scale`].
+#[allow(clippy::too_many_arguments)]
+pub fn gaussian_reml_fit_blocks_backward_analytic(
+    designs: &[Array2<f64>],
+    penalties_raw: &[Array2<f64>],
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    rhos: &[f64],
+    grad_coefficients: Option<ArrayView2<'_, f64>>,
+    grad_fitted: Option<ArrayView2<'_, f64>>,
+    grad_lambdas: Option<ArrayView1<'_, f64>>,
+    grad_log_lambdas: Option<ArrayView1<'_, f64>>,
+    grad_reml_score: f64,
+    grad_edf: Option<ArrayView1<'_, f64>>,
+) -> Result<GaussianRemlBlocksBackwardAnalytic, EstimationError> {
+    let n = y.len();
+    let f_blocks = designs.len();
+    let mut offsets = Vec::with_capacity(f_blocks + 1);
+    offsets.push(0_usize);
+    for design in designs {
+        offsets.push(offsets.last().copied().unwrap() + design.ncols());
+    }
+    let p_total = *offsets.last().unwrap();
+    if n == 0 || p_total == 0 {
+        return Err(EstimationError::InvalidInput(
+            "gaussian_reml_fit_blocks_backward requires non-empty rows and at least one coefficient column"
+                .to_string(),
+        ));
+    }
+
+    if rhos.len() != f_blocks {
+        return Err(EstimationError::InvalidInput(format!(
+            "log_lambdas length mismatch: expected {f_blocks}, got {}",
+            rhos.len()
+        )));
+    }
+    if let Some(gc) = grad_coefficients {
+        if gc.dim() != (p_total, 1) {
+            return Err(EstimationError::InvalidInput(format!(
+                "grad_coefficients shape mismatch: expected {}x1, got {}x{}",
+                p_total,
+                gc.nrows(),
+                gc.ncols()
+            )));
+        }
+    }
+    if let Some(gf) = grad_fitted {
+        if gf.dim() != (n, 1) {
+            return Err(EstimationError::InvalidInput(format!(
+                "grad_fitted shape mismatch: expected {}x1, got {}x{}",
+                n,
+                gf.nrows(),
+                gf.ncols()
+            )));
+        }
+    }
+    if !grad_reml_score.is_finite() {
+        return Err(EstimationError::InvalidInput(format!(
+            "grad_reml_score must be finite; got {grad_reml_score}"
+        )));
+    }
+    if let Some(vec) = grad_lambdas {
+        if vec.len() != f_blocks {
+            return Err(EstimationError::InvalidInput(format!(
+                "grad_lambdas length mismatch: expected {f_blocks}, got {}",
+                vec.len()
+            )));
+        }
+    }
+    if let Some(vec) = grad_log_lambdas {
+        if vec.len() != f_blocks {
+            return Err(EstimationError::InvalidInput(format!(
+                "grad_log_lambdas length mismatch: expected {f_blocks}, got {}",
+                vec.len()
+            )));
+        }
+    }
+    if let Some(vec) = grad_edf {
+        if vec.len() != f_blocks {
+            return Err(EstimationError::InvalidInput(format!(
+                "grad_edf length mismatch: expected {f_blocks}, got {}",
+                vec.len()
+            )));
+        }
+    }
+    if let Some(gc) = grad_coefficients {
+        if let Some(((row, col), value)) = gc.indexed_iter().find(|(_, value)| !value.is_finite()) {
+            return Err(EstimationError::InvalidInput(format!(
+                "grad_coefficients[{row},{col}] must be finite; got {value}"
+            )));
+        }
+    }
+    if let Some(gf) = grad_fitted {
+        if let Some(((row, col), value)) = gf.indexed_iter().find(|(_, value)| !value.is_finite()) {
+            return Err(EstimationError::InvalidInput(format!(
+                "grad_fitted[{row},{col}] must be finite; got {value}"
+            )));
+        }
+    }
+    if let Some(vec) = grad_lambdas {
+        if let Some((block, value)) = vec.iter().enumerate().find(|(_, value)| !value.is_finite()) {
+            return Err(EstimationError::InvalidInput(format!(
+                "grad_lambdas[{block}] must be finite; got {value}"
+            )));
+        }
+    }
+    if let Some(vec) = grad_log_lambdas {
+        if let Some((block, value)) = vec.iter().enumerate().find(|(_, value)| !value.is_finite()) {
+            return Err(EstimationError::InvalidInput(format!(
+                "grad_log_lambdas[{block}] must be finite; got {value}"
+            )));
+        }
+    }
+    if let Some(vec) = grad_edf {
+        if let Some((block, value)) = vec.iter().enumerate().find(|(_, value)| !value.is_finite()) {
+            return Err(EstimationError::InvalidInput(format!(
+                "grad_edf[{block}] must be finite; got {value}"
+            )));
+        }
+    }
+    for (block, design) in designs.iter().enumerate() {
+        if let Some(((row, col), value)) =
+            design.indexed_iter().find(|(_, value)| !value.is_finite())
+        {
+            return Err(EstimationError::InvalidInput(format!(
+                "designs[{block}][{row},{col}] must be finite; got {value}"
+            )));
+        }
+    }
+    for (block, penalty) in penalties_raw.iter().enumerate() {
+        if let Some(((row, col), value)) =
+            penalty.indexed_iter().find(|(_, value)| !value.is_finite())
+        {
+            return Err(EstimationError::InvalidInput(format!(
+                "penalties[{block}][{row},{col}] must be finite; got {value}"
+            )));
+        }
+    }
+    if let Some((row, value)) = y.iter().enumerate().find(|(_, value)| !value.is_finite()) {
+        return Err(EstimationError::InvalidInput(format!(
+            "y[{row}] must be finite; got {value}"
+        )));
+    }
+    if let Some((row, value)) = weights
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite() || **value < 0.0)
+    {
+        return Err(EstimationError::InvalidInput(format!(
+            "weights[{row}] must be finite and non-negative; got {value}"
+        )));
+    }
+
+    let mut z = Array2::<f64>::zeros((n, p_total));
+    for k in 0..f_blocks {
+        z.slice_mut(s![.., offsets[k]..offsets[k + 1]])
+            .assign(&designs[k]);
+    }
+
+    let penalties: Vec<Array2<f64>> = penalties_raw
+        .iter()
+        .map(|p| {
+            let mut out = p.clone();
+            crate::matrix::symmetrize_in_place(&mut out);
+            out
+        })
+        .collect();
+    let mut ranks = Vec::with_capacity(f_blocks);
+    let mut pinvs = Vec::with_capacity(f_blocks);
+    for penalty in &penalties {
+        let (rank, pinv) = crate::linalg::utils::block_penalty_rank_and_pinv(penalty)?;
+        ranks.push(rank);
+        pinvs.push(pinv);
+    }
+
+    let lambdas = Array1::from_iter(rhos.iter().map(|rho| rho.exp()));
+    if let Some((block, lambda)) = lambdas
+        .iter()
+        .enumerate()
+        .find(|(_, lambda)| !lambda.is_finite() || **lambda <= 0.0)
+    {
+        return Err(EstimationError::InvalidInput(format!(
+            "exp(log_lambdas[{block}]) must be finite and positive; got {lambda}"
+        )));
+    }
+    let mut k_matrix = fast_xt_diag_x(&z.view(), &weights);
+    for block in 0..f_blocks {
+        let lambda = lambdas[block];
+        for local_i in 0..penalties[block].nrows() {
+            let global_i = offsets[block] + local_i;
+            for local_j in 0..penalties[block].ncols() {
+                let global_j = offsets[block] + local_j;
+                k_matrix[[global_i, global_j]] += lambda * penalties[block][[local_i, local_j]];
+            }
+        }
+    }
+    let r = crate::linalg::utils::invert_spd_with_ridge(&k_matrix, 0.0)?;
+
+    let mut xtwy = Array1::<f64>::zeros(p_total);
+    for row in 0..n {
+        let wy = weights[row] * y[row];
+        for col in 0..p_total {
+            xtwy[col] += z[[row, col]] * wy;
+        }
+    }
+    let beta = r.dot(&xtwy);
+    let fitted = z.dot(&beta);
+    if let Some((col, value)) = beta
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(EstimationError::InvalidInput(format!(
+            "solved coefficient {col} is non-finite: {value}"
+        )));
+    }
+    let residual = &y.to_owned() - &fitted;
+    let weighted_residual = &residual * &weights.to_owned();
+    let ywy = y
+        .iter()
+        .zip(weights.iter())
+        .map(|(&yi, &wi)| wi * yi * yi)
+        .sum::<f64>();
+    let q_raw = ywy - xtwy.dot(&beta);
+    if !q_raw.is_finite() {
+        return Err(EstimationError::InvalidInput(format!(
+            "Gaussian REML residual quadratic form must be finite; got {q_raw}"
+        )));
+    }
+    let q = q_raw.max(1.0e-300);
+    let nullity = penalties
+        .iter()
+        .zip(ranks.iter())
+        .map(|(penalty, rank)| penalty.nrows().saturating_sub(*rank))
+        .sum::<usize>();
+    let nu = n as f64 - nullity as f64;
+    if !(nu.is_finite() && nu > 0.0) {
+        return Err(EstimationError::InvalidInput(format!(
+            "Gaussian REML residual degrees of freedom must be positive; got {nu}"
+        )));
+    }
+    let tau = nu / q;
+    let tau_q = -nu / (q * q);
+    if !(tau.is_finite() && tau_q.is_finite()) {
+        return Err(EstimationError::InvalidInput(format!(
+            "Gaussian REML scale derivatives are non-finite: tau={tau}, tau_q={tau_q}"
+        )));
+    }
+
+    let mut grad_z = Array2::<f64>::zeros((n, p_total));
+    let mut g_kernel = Array2::<f64>::zeros((p_total, p_total));
+    let mut h_kernel = Array1::<f64>::zeros(p_total);
+    let mut q_kernel = 0.0_f64;
+    let mut j_blocks: Vec<Array2<f64>> = penalties
+        .iter()
+        .map(|p| Array2::<f64>::zeros(p.dim()))
+        .collect();
+
+    let mut beta_tilde = Array1::<f64>::zeros(p_total);
+    if let Some(gc) = grad_coefficients {
+        beta_tilde += &gc.column(0).to_owned();
+    }
+    if let Some(gf) = grad_fitted {
+        let gf_col = gf.column(0).to_owned();
+        beta_tilde += &z.t().dot(&gf_col);
+        for row in 0..n {
+            for col in 0..p_total {
+                grad_z[[row, col]] += gf_col[row] * beta[col];
+            }
+        }
+    }
+
+    // Generic downstream losses that explicitly seed beta_hat or fitted
+    // values cannot use the REML envelope shortcut. Route those seeds through
+    // the fixed-rho KKT adjoint K u = beta_tilde before differentiating
+    // designs, penalties, y, weights, and rho.
+    let u = r.dot(&beta_tilde);
+    h_kernel += &u;
+    for i in 0..p_total {
+        for j in 0..p_total {
+            g_kernel[[i, j]] -= 0.5 * (beta[i] * u[j] + u[i] * beta[j]);
+        }
+    }
+
+    let mut alpha = Array1::<f64>::zeros(f_blocks);
+    if let Some(gl) = grad_lambdas {
+        for block in 0..f_blocks {
+            alpha[block] += gl[block] * lambdas[block];
+        }
+    }
+    if let Some(grho) = grad_log_lambdas {
+        alpha += &grho.to_owned();
+    }
+
+    let mut p_betas = Vec::with_capacity(f_blocks);
+    let mut m_vectors = Vec::with_capacity(f_blocks);
+    let mut rp_matrices = Vec::with_capacity(f_blocks);
+    let mut rpr_matrices = Vec::with_capacity(f_blocks);
+    let mut b_values = Array1::<f64>::zeros(f_blocks);
+    let mut t_values = Array1::<f64>::zeros(f_blocks);
+
+    for block in 0..f_blocks {
+        let start = offsets[block];
+        let end = offsets[block + 1];
+        let beta_k = beta.slice(s![start..end]).to_owned();
+        let s_beta = penalties[block].dot(&beta_k);
+        let lambda = lambdas[block];
+        let lambda_s_beta = s_beta.mapv(|value| lambda * value);
+        let mut p_beta = Array1::<f64>::zeros(p_total);
+        for local_i in 0..(end - start) {
+            p_beta[start + local_i] = lambda_s_beta[local_i];
+        }
+        let weighted_penalty = penalties[block].mapv(|value| lambda * value);
+        let rp_block = r.slice(s![.., start..end]).dot(&weighted_penalty);
+        let mut rp = Array2::<f64>::zeros((p_total, p_total));
+        rp.slice_mut(s![.., start..end]).assign(&rp_block);
+        let rpr = rp_block.dot(&r.slice(s![start..end, ..]));
+        let m = r.slice(s![.., start..end]).dot(&lambda_s_beta);
+        b_values[block] = beta.dot(&p_beta);
+        t_values[block] = (0..(end - start))
+            .map(|local_i| rp_block[[start + local_i, local_i]])
+            .sum::<f64>();
+        alpha[block] -= u.dot(&p_beta);
+        p_betas.push(p_beta);
+        m_vectors.push(m);
+        rp_matrices.push(rp);
+        rpr_matrices.push(rpr);
+    }
+
+    if grad_reml_score != 0.0 {
+        q_kernel += 0.5 * grad_reml_score * tau;
+        g_kernel += &(r.clone() * (0.5 * grad_reml_score));
+        for block in 0..f_blocks {
+            j_blocks[block] -= &(pinvs[block].clone() * (0.5 * grad_reml_score / lambdas[block]));
+        }
+    }
+
+    let mut trace_pairs = Array2::<f64>::zeros((f_blocks, f_blocks));
+    for i in 0..f_blocks {
+        for j in 0..f_blocks {
+            trace_pairs[[i, j]] = trace_product_dense(rp_matrices[i].view(), rp_matrices[j].view());
+        }
+    }
+
+    if let Some(ge) = grad_edf {
+        for edf_block in 0..f_blocks {
+            let scale = ge[edf_block];
+            if scale == 0.0 {
+                continue;
+            }
+            let start = offsets[edf_block];
+            let end = offsets[edf_block + 1];
+            g_kernel += &(rpr_matrices[edf_block].clone() * scale);
+            j_blocks[edf_block] -= &(r.slice(s![start..end, start..end]).to_owned() * scale);
+            for rho_block in 0..f_blocks {
+                alpha[rho_block] += scale * trace_pairs[[edf_block, rho_block]];
+                if rho_block == edf_block {
+                    alpha[rho_block] -= scale * t_values[edf_block];
+                }
+            }
+        }
+    }
+
+    if let Some((block, value)) = alpha
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(EstimationError::InvalidInput(format!(
+            "rho adjoint seed for block {block} is non-finite: {value}"
+        )));
+    }
+
+    if alpha.iter().any(|value| *value != 0.0) {
+        let mut outer_h = Array2::<f64>::zeros((f_blocks, f_blocks));
+        for k in 0..f_blocks {
+            for j in 0..f_blocks {
+                let beta_pk_r_pj_beta = p_betas[k].dot(&m_vectors[j]);
+                outer_h[[k, j]] = 0.5 * trace_pairs[[k, j]] + tau * beta_pk_r_pj_beta
+                    - if k == j {
+                        0.5 * (t_values[k] + tau * b_values[k])
+                    } else {
+                        0.0
+                    }
+                    - 0.5 * tau_q * b_values[k] * b_values[j];
+            }
+        }
+        // `outer_h` is the Jacobian of the negative profiled REML estimating
+        // equation. Preserve signed curvature directions while flooring
+        // near-zero modes; flipping negative eigenvalues would change the VJP.
+        crate::linalg::utils::enforce_symmetry(&mut outer_h);
+        if let Some(((row, col), value)) =
+            outer_h.indexed_iter().find(|(_, value)| !value.is_finite())
+        {
+            return Err(EstimationError::InvalidInput(format!(
+                "outer rho curvature entry ({row},{col}) is non-finite: {value}"
+            )));
+        }
+        let rho_adj =
+            crate::linalg::utils::solve_symmetric_vector_with_floor(&outer_h, &alpha, 1.0e-10)?;
+        if let Some((block, value)) = rho_adj
+            .iter()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(EstimationError::InvalidInput(format!(
+                "outer rho adjoint for block {block} is non-finite: {value}"
+            )));
+        }
+        let weighted_b_sum = rho_adj
+            .iter()
+            .zip(b_values.iter())
+            .map(|(&zk, &bk)| zk * bk)
+            .sum::<f64>();
+        q_kernel += 0.5 * tau_q * weighted_b_sum;
+        for block in 0..f_blocks {
+            let zk = rho_adj[block];
+            if zk == 0.0 {
+                continue;
+            }
+            g_kernel -= &(rpr_matrices[block].clone() * (0.5 * zk));
+            let m = &m_vectors[block];
+            for i in 0..p_total {
+                h_kernel[i] += tau * zk * m[i];
+                for j in 0..p_total {
+                    g_kernel[[i, j]] -= 0.5 * tau * zk * (beta[i] * m[j] + m[i] * beta[j]);
+                }
+            }
+            let start = offsets[block];
+            let end = offsets[block + 1];
+            j_blocks[block] += &(r.slice(s![start..end, start..end]).to_owned() * (0.5 * zk));
+            for i in 0..(end - start) {
+                for j in 0..(end - start) {
+                    j_blocks[block][[i, j]] += 0.5 * tau * zk * beta[start + i] * beta[start + j];
+                }
+            }
+        }
+    }
+
+    for row in 0..n {
+        for col in 0..p_total {
+            grad_z[[row, col]] += -2.0 * q_kernel * weighted_residual[row] * beta[col];
+        }
+    }
+    let zg = z.dot(&g_kernel);
+    for row in 0..n {
+        for col in 0..p_total {
+            grad_z[[row, col]] += 2.0 * weights[row] * zg[[row, col]];
+        }
+    }
+    let wy = y.to_owned() * &weights.to_owned();
+    for row in 0..n {
+        for col in 0..p_total {
+            grad_z[[row, col]] += wy[row] * h_kernel[col];
+        }
+    }
+
+    let mut grad_y = Array2::<f64>::zeros((n, 1));
+    let zh = z.dot(&h_kernel);
+    for row in 0..n {
+        grad_y[[row, 0]] = 2.0 * q_kernel * weighted_residual[row] + weights[row] * zh[row];
+    }
+
+    let mut grad_weights = Array1::<f64>::zeros(n);
+    for row in 0..n {
+        let diag_zgz = (0..p_total)
+            .map(|col| z[[row, col]] * zg[[row, col]])
+            .sum::<f64>();
+        grad_weights[row] = q_kernel * residual[row] * residual[row] + diag_zgz + y[row] * zh[row];
+    }
+
+    let mut grad_penalties = Vec::with_capacity(f_blocks);
+    for block in 0..f_blocks {
+        let start = offsets[block];
+        let end = offsets[block + 1];
+        let mut local = g_kernel.slice(s![start..end, start..end]).to_owned();
+        for i in 0..(end - start) {
+            for j in 0..(end - start) {
+                local[[i, j]] += q_kernel * beta[start + i] * beta[start + j];
+            }
+        }
+        local += &j_blocks[block];
+        local *= lambdas[block];
+        crate::linalg::utils::enforce_symmetry(&mut local);
+        grad_penalties.push(local);
+    }
+
+    let mut grad_designs = Vec::with_capacity(f_blocks);
+    for block in 0..f_blocks {
+        grad_designs.push(
+            grad_z
+                .slice(s![.., offsets[block]..offsets[block + 1]])
+                .to_owned(),
+        );
+    }
+
+    Ok(GaussianRemlBlocksBackwardAnalytic {
+        grad_designs,
+        grad_penalties,
+        grad_y,
+        grad_weights,
+    })
+}
