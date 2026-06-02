@@ -213,6 +213,74 @@ pub(crate) fn dot(a: ArrayView1<'_, f64>, b: ArrayView1<'_, f64>) -> f64 {
     out
 }
 
+/// Multi-GPU row-tiled matrix product `A·B`, fanned across **all** usable
+/// devices.
+///
+/// `A` is `m×k` and `B` is `k×n`; the result is `m×n`. The single-device
+/// `fast_ab` shim already offloads this GEMM, but it pins the launch to the
+/// primary device. For a tall `A` (many independent output rows — the common
+/// case when a manifold operation is applied to a large batch of points/atoms),
+/// the rows split cleanly across the pool: we reshape `A` into a
+/// `tiles × rows_per_tile × k` batch and call the broadcast-`B` strided-batched
+/// GEMM, which [`crate::gpu::pool::scatter_batched`]es one cuBLAS call per device
+/// on its own bound context (`b` is shared across every tile). The output tiles
+/// are stitched back into the `m×n` result. Any leftover rows that don't fill a
+/// whole tile, and the entire batch when the pool has one device / the workload
+/// is below the multi-GPU floor / the runtime is unavailable, fall through to the
+/// auto-dispatch `fast_ab` (single-device GPU or faer). f64 throughout, so the
+/// result is identical regardless of which path produced it.
+///
+/// Choosing the tiling: we target as many equal tiles as there are output rows
+/// can support while keeping each tile a non-trivial GEMM, so the batch axis is
+/// long enough to cross `crate::gpu::linalg`'s multi-GPU batch floor and spread
+/// across every device.
+pub(crate) fn fast_ab_rows_multi_gpu(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Array2<f64> {
+    use crate::linalg::faer_ndarray::fast_ab;
+    let (m, k) = a.dim();
+    let (kb, n) = b.dim();
+    assert_eq!(k, kb, "fast_ab_rows_multi_gpu inner dimension mismatch");
+
+    // Only worth the reshape/stitch overhead when the pool actually has more than
+    // one device and there are enough rows to tile across it; otherwise the plain
+    // single-device shim is strictly better.
+    let multi_gpu = crate::gpu::runtime::GpuRuntime::global()
+        .is_some_and(|rt| rt.device_count() > 1);
+    // The batch axis must clear the multi-GPU floor used inside the dispatch
+    // layer (64) for the split to engage, so we need at least that many tiles.
+    const MIN_TILES: usize = 64;
+    const MIN_TILE_ROWS: usize = 4;
+    if multi_gpu && m >= MIN_TILES * MIN_TILE_ROWS && n > 0 {
+        let rows_per_tile = (m / MIN_TILES).max(MIN_TILE_ROWS);
+        let tiles = m / rows_per_tile;
+        let covered = tiles * rows_per_tile;
+        // Reshape the first `covered` rows into a tiles×rows_per_tile×k batch
+        // (row-major reshape is exactly the row-block tiling we want).
+        let a3 = a
+            .slice(ndarray::s![0..covered, ..])
+            .to_owned()
+            .into_shape_with_order((tiles, rows_per_tile, k));
+        if let Ok(a3) = a3 {
+            if let Some(result3) = crate::gpu::try_fast_ab_broadcast_b_batched(a3.view(), b.view()) {
+                let mut out = Array2::<f64>::zeros((m, n));
+                for t in 0..tiles {
+                    let block = result3.index_axis(ndarray::Axis(0), t);
+                    out.slice_mut(ndarray::s![t * rows_per_tile..(t + 1) * rows_per_tile, ..])
+                        .assign(&block);
+                }
+                // Tail rows that didn't fill a whole tile finish on the
+                // single-device shim; the result is bit-identical f64.
+                if covered < m {
+                    let tail = fast_ab(&a.slice(ndarray::s![covered..m, ..]), &b);
+                    out.slice_mut(ndarray::s![covered..m, ..]).assign(&tail);
+                }
+                return out;
+            }
+        }
+    }
+    // Single device / small batch / no runtime: plain auto-dispatch GEMM.
+    fast_ab(&a, &b)
+}
+
 pub(crate) fn norm(a: ArrayView1<'_, f64>) -> f64 {
     dot(a, a).sqrt()
 }

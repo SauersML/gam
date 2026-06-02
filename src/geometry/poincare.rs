@@ -388,8 +388,10 @@ pub fn tangent_decode_forward(
     let sqrt_negc = require_negative_curvature(curvature)?;
     let (projected, tangents, proj_scale) = project_and_log(atoms, curvature)?;
     // V = gates · tangents (batch×F · F×d): the dominant decode GEMM over the
-    // whole observation batch, GPU-dispatched via fast_ab.
-    let v = crate::linalg::faer_ndarray::fast_ab(&gates, &tangents);
+    // whole observation batch. Row-tile gates across ALL GPUs (each device runs
+    // one cuBLAS call over its batch-row tile with tangents broadcast); single
+    // device / small batch falls back to the auto-dispatch shim.
+    let v = crate::geometry::manifold::fast_ab_rows_multi_gpu(gates, tangents.view());
     let (batch, d) = v.dim();
     let mut x_hat = Array2::<f64>::zeros((batch, d));
     for b in 0..batch {
@@ -732,8 +734,8 @@ pub fn lorentz_decode_forward(
     }
 
     // Aggregate in tangent space (batch×F · F×d GEMM over the whole batch,
-    // GPU-dispatched via fast_ab), exp back, then project hyperboloid -> ball.
-    let v = crate::linalg::faer_ndarray::fast_ab(&gates, &tangents);
+    // row-tiled across ALL GPUs), exp back, then project hyperboloid -> ball.
+    let v = crate::geometry::manifold::fast_ab_rows_multi_gpu(gates, tangents.view());
     let mut out = Array2::<f64>::zeros((batch, d));
     for b in 0..batch {
         let v_row: Array1<f64> = v.row(b).to_owned();

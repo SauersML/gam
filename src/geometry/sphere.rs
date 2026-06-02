@@ -366,14 +366,16 @@ pub fn response_sphere_log_map(
     if d != b_mat.ncols() {
         return Err("spherical values and base point have different dimensions".to_string());
     }
-    // The per-row geodesic angle needs the inner product `pᵢ·base` for every
-    // one of the n rows. Collected together this is a single matrix–vector
-    // product `Y · base` (n×d · d → n), so it routes through the auto-dispatch
-    // `fast_av` shim and offloads to the GPU for large response batches; the
-    // remaining per-row scalar work (atan2 angle, tangent scaling) is identical
-    // to the elementwise form. f64 throughout.
-    let base_vec = b_mat.row(0).to_owned();
-    let dots = crate::linalg::faer_ndarray::fast_av(&y, &base_vec);
+    // The per-row geodesic angle needs the inner product `pᵢ·base` for every one
+    // of the n rows. Collected together this is `Y · base` (n×d · d → n); cast as
+    // the n×d · d×1 product it row-tiles across ALL GPUs (each device handles its
+    // observation-row tile with `base` broadcast), falling back to the
+    // single-device shim for small batches. The remaining per-row scalar work
+    // (atan2 angle, tangent scaling) is identical to the elementwise form.
+    // f64 throughout.
+    let base_col = b_mat.slice(ndarray::s![0..1, ..]).t().to_owned();
+    let dots_mat = crate::geometry::manifold::fast_ab_rows_multi_gpu(y.view(), base_col.view());
+    let dots = dots_mat.column(0).to_owned();
     let mut out = Array2::<f64>::zeros((n, d));
     for row in 0..n {
         let mut dot = dots[row];
@@ -424,12 +426,14 @@ pub fn response_sphere_exp_map(
     if !tangent.iter().all(|v| v.is_finite()) {
         return Err("spherical tangent must contain only finite values".to_string());
     }
-    // The radial component `tangentᵢ·base` for every row collected together is
-    // the matrix–vector product `T · base` (n×d · d → n); route it through the
-    // GPU-dispatched `fast_av` shim, then finish each row's geodesic step with
-    // the identical scalar math. f64 throughout.
-    let base_vec = b_mat.row(0).to_owned();
-    let radials = crate::linalg::faer_ndarray::fast_av(&tangent, &base_vec);
+    // The radial component `tangentᵢ·base` for every row is `T · base`
+    // (n×d · d → n); cast as the n×d · d×1 product it row-tiles across ALL GPUs
+    // (per-observation-row tiles, `base` broadcast), with a single-device
+    // fallback. The per-row geodesic step that follows is identical scalar math.
+    // f64 throughout.
+    let base_col = b_mat.slice(ndarray::s![0..1, ..]).t().to_owned();
+    let radials_mat = crate::geometry::manifold::fast_ab_rows_multi_gpu(tangent, base_col.view());
+    let radials = radials_mat.column(0).to_owned();
     let mut out = Array2::<f64>::zeros((n, d));
     for row in 0..n {
         let radial = radials[row];
