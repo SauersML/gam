@@ -431,16 +431,53 @@ pub fn build_termspec(
                     bs_name.as_deref(),
                     Some("sz") | Some("sum-to-zero") | Some("sum_to_zero")
                 );
-                if is_sz {
+                // For a sum-to-zero factor smooth, identify the categorical
+                // factor AMONG the supplied variables rather than assuming a
+                // fixed position. mgcv's `s(x, fac, bs="sz")` is
+                // continuous-first (the factor acts like a `by=` producing
+                // sum-to-zero per-level deviations), exactly like `bs="fs"`,
+                // whose builder already detects the factor by column kind. We
+                // mirror that here so `s(x, g, bs="sz")` and `s(g, x, ...)` both
+                // resolve `g` as the factor — one consistent convention across
+                // factor-smooth families.
+                let sz_factor_var: Option<String> = if is_sz {
                     if vars.len() < 2 {
                         return Err(format!(
-                            "bs=sz smooth '{}' expects a factor followed by one or more smooth variables",
+                            "bs=sz smooth '{}' expects a categorical factor and one or more smooth variables",
                             label
                         )
                         .into());
                     }
-                    smooth_vars = vars[1..].to_vec();
-                }
+                    let mut factor_positions = vars.iter().enumerate().filter(|(_, v)| {
+                        resolve_col(col_map, v).is_ok_and(|c| {
+                            matches!(ds.column_kinds.get(c), Some(ColumnKindTag::Categorical))
+                        })
+                    });
+                    let factor_pos = factor_positions.next().map(|(idx, _)| idx);
+                    if factor_positions.next().is_some() {
+                        return Err(format!(
+                            "bs=sz smooth '{}' expects exactly one categorical factor among its variables; found more than one",
+                            label
+                        )
+                        .into());
+                    }
+                    let Some(factor_pos) = factor_pos else {
+                        return Err(format!(
+                            "bs=sz smooth '{}' requires one categorical factor variable; none of its variables is categorical",
+                            label
+                        )
+                        .into());
+                    };
+                    smooth_vars = vars
+                        .iter()
+                        .enumerate()
+                        .filter(|(idx, _)| *idx != factor_pos)
+                        .map(|(_, v)| v.clone())
+                        .collect();
+                    Some(vars[factor_pos].clone())
+                } else {
+                    None
+                };
                 let cols = smooth_vars
                     .iter()
                     .map(|v| resolve_col(col_map, v))
@@ -471,18 +508,10 @@ pub fn build_termspec(
                     policy,
                     smooth_coordinate_count,
                 )?;
-                if is_sz {
-                    let by_col = resolve_col(col_map, &vars[0])?;
-                    if !matches!(
-                        ds.column_kinds.get(by_col),
-                        Some(ColumnKindTag::Categorical)
-                    ) {
-                        return Err(format!(
-                            "bs=sz smooth '{}' requires categorical factor '{}'; got numeric column",
-                            label, vars[0]
-                        )
-                        .into());
-                    }
+                if let Some(factor_var) = sz_factor_var {
+                    // `factor_var` was already confirmed categorical when it was
+                    // selected above; resolve its column for the level scan.
+                    let by_col = resolve_col(col_map, &factor_var)?;
                     let mut levels: Vec<u64> = ds
                         .values
                         .column(by_col)

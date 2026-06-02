@@ -2578,6 +2578,27 @@ fn spatial_term_supports_hyper_optimization(spec: &TermCollectionSpec, term_idx:
     // contributes no outer optimization axis even when `scale_dims` is on —
     // "standardize the geometry, then learn the smoothness." Only an explicit
     // kernel length scale κ (the Matérn / hybrid path) is optimized here.
+    //
+    // ISOTROPIC Matérn (#519): the *default* `matern(x1, x2)` is isotropic
+    // (`scale_dims=false` → `aniso_log_scales = None`), so the only candidate
+    // hyper axis is the scalar κ. That single-axis "isotropic analytic"
+    // κ-search runs into the boundary valley described in #519 and diverges
+    // (final_grad_norm ~ 3e2 after 80 iters) on perfectly ordinary 2-D data.
+    // The kernel scale is already seeded from data geometry
+    // (`default_matern_length_scale`, intersected with the safe κ window), and
+    // for an isotropic kernel REML can recover all the needed smoothness
+    // through the penalty weight ρ alone. So we anchor κ at the data-derived
+    // seed and contribute NO κ axis: REML optimizes only ρ, which converges.
+    //
+    // ANISOTROPIC Matérn (`scale_dims=true` → `aniso_log_scales = Some`) keeps
+    // its per-axis kernel-η ARD: the d-dimensional ψ search is the *point* of
+    // the anisotropic request ("Matérn keeps its kernel-η ARD"), and it has
+    // more than the single brittle scalar axis to move along, so it is healthy.
+    if let Some(term) = spec.smooth_terms.get(term_idx)
+        && let SmoothBasisSpec::Matern { spec: matern, .. } = &term.basis
+    {
+        return matern.aniso_log_scales.is_some();
+    }
     get_spatial_length_scale(spec, term_idx).is_some()
 }
 
@@ -22176,6 +22197,12 @@ mod tests {
             data[[i, 1]] = x1;
         }
 
+        // ANISOTROPIC Matérn (`aniso_log_scales = Some`): the joint κ/η outer
+        // optimizer only engages for anisotropic spatial terms (#519 —
+        // isotropic Matérn anchors its data-seeded κ and learns smoothness
+        // through ρ alone, so it contributes no κ axis). This test exercises
+        // the joint-optimizer center-freezing path, so it must carry per-axis
+        // anisotropy scales to produce the κ/η hyper axes it is asserting on.
         let matern_term = |name: &str, length_scale: f64| SmoothTermSpec {
             name: name.to_string(),
             basis: SmoothBasisSpec::Matern {
@@ -22188,7 +22215,7 @@ mod tests {
                     include_intercept: false,
                     double_penalty: true,
                     identifiability: MaternIdentifiability::CenterSumToZero,
-                    aniso_log_scales: None,
+                    aniso_log_scales: Some(vec![0.0, 0.0]),
                 },
                 input_scales: None,
             },
@@ -24087,6 +24114,11 @@ mod tests {
             data[[i, 1]] = x1;
         }
 
+        // ANISOTROPIC Matérn (`aniso_log_scales = Some`): the two-block
+        // exact-joint design cache memoizes per-block κ/η axes, which (#519)
+        // only exist for anisotropic spatial terms — isotropic Matérn anchors
+        // its data-seeded κ and contributes no κ axis. Per-axis scales give
+        // each block the log-κ/η hyper axes this cache test drives.
         let matern_term = |name: &str, length_scale: f64| SmoothTermSpec {
             name: name.to_string(),
             basis: SmoothBasisSpec::Matern {
@@ -24099,7 +24131,7 @@ mod tests {
                     include_intercept: false,
                     double_penalty: true,
                     identifiability: MaternIdentifiability::CenterSumToZero,
-                    aniso_log_scales: None,
+                    aniso_log_scales: Some(vec![0.0, 0.0]),
                 },
                 input_scales: None,
             },
@@ -24219,22 +24251,30 @@ mod tests {
             data[[i, 1]] = x1;
         }
 
+        // Hybrid Duchon term with an explicit scalar `length_scale`: this is
+        // the canonical single-log-κ-axis spatial term (`dims_per_term == [1]`)
+        // that the single-block exact-joint design cache is built to memoize.
+        // (#519 — isotropic Matérn no longer contributes a κ axis; it anchors
+        // its data-seeded κ and learns smoothness through ρ alone, so it is the
+        // wrong fixture for a single-κ-axis cache test. Hybrid Duchon keeps the
+        // scalar κ axis without any of the brittle isotropic-Matérn κ-search.)
         let spec = TermCollectionSpec {
             linear_terms: vec![],
             random_effect_terms: vec![],
             smooth_terms: vec![SmoothTermSpec {
-                name: "matern".to_string(),
-                basis: SmoothBasisSpec::Matern {
+                name: "duchon_hybrid".to_string(),
+                basis: SmoothBasisSpec::Duchon {
                     feature_cols: vec![0, 1],
-                    spec: MaternBasisSpec {
+                    spec: DuchonBasisSpec {
                         periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
-                        length_scale: 0.9,
-                        nu: MaternNu::FiveHalves,
-                        include_intercept: false,
-                        double_penalty: true,
-                        identifiability: MaternIdentifiability::CenterSumToZero,
+                        length_scale: Some(0.9),
+                        power: 1.0,
+                        nullspace_order: DuchonNullspaceOrder::Linear,
+                        identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
+                        operator_penalties: DuchonOperatorPenaltySpec::default(),
+                        boundary: OneDimensionalBoundary::Open,
                     },
                     input_scales: None,
                 },
