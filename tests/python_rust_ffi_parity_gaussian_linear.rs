@@ -76,5 +76,11 @@ print(json.dumps(out))
         (reml_rust - reml_py).abs() <= 1e-9,
         "reml rust={reml_rust} py={reml_py}"
     );
-    let _ = ll_rust;
+    // The Python summary emits deviance (not the log-likelihood), so there is no
+    // direct parity counterpart for `ll_rust`; assert the fitted Gaussian
+    // log-likelihood is at least finite rather than silently discarding it.
+    assert!(
+        ll_rust.is_finite(),
+        "rust gaussian log-likelihood must be finite: {ll_rust}"
+    );
 }

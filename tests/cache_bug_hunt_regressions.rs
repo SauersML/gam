@@ -101,7 +101,7 @@ fn eviction_prefers_recently_hit_entries_under_budget_pressure() {
         .save(&b, &payload, Some(2.0), None, EntryKind::Checkpoint)
         .expect("save b");
 
-    let _ = store.lookup(&a).expect("lookup a");
+    store.lookup(&a).expect("lookup a");
 
     thread::sleep(Duration::from_millis(5));
     store

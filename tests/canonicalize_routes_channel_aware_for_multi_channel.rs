@@ -284,11 +284,10 @@ fn channel_aware_audit_flags_fatal_for_same_channel_alias() {
                 audit.summary,
             );
         }
-        other => {
+        _ => {
             // DimensionMismatch is also acceptable when the channel-aware
             // audit fails to construct operators — but the invariant is that
             // the fit must NOT succeed silently.
-            let _ = other;
         }
     }
 }
