@@ -34,7 +34,17 @@
 //!   * 100 replicate response vectors `y_r = eta + noise_r` are generated once in
 //!     Rust with a deterministic splitmix64 + Box–Muller stream and handed,
 //!     column for column, to BOTH gam and mgcv. No engine sees different data.
-//!   * Each replicate is fit `y ~ s(x, k = 10)` by REML in both engines.
+//!   * Each replicate is fit `y ~ s(x, k = 25)` by REML in both engines. The
+//!     basis dimension MUST resolve the truth: `sin(6*pi*x)` is three full
+//!     cycles on [0,1], and a penalized cubic spline needs roughly four knots
+//!     per cycle (k >= ~20) to represent it without a residual `O(lambda*f'')`
+//!     smoothing bias at every crest/trough. At the previously-used k=10 the
+//!     truth is intrinsically under-resolved: the penalized bias dwarfs the
+//!     (correctly scaled) pointwise SE, so NO honest band — gam's OR mgcv's —
+//!     can cover the true mean, and pooled coverage collapses to ~0.15/0.48 for
+//!     BOTH engines (run 26753200374). That is the Nychka pointwise-bias dip on
+//!     an un-representable truth, not an SE-scaling fault; the calibration claim
+//!     below is only meaningful once the truth lives in the span of the basis.
 //!   * Pointwise 90% CIs are evaluated on a fixed *interior* grid
 //!     (`seq(0.05, 0.95, length.out = 50)`, regenerated bit-identically on both
 //!     sides) so the measurement isolates the conditional/penalized covariance
@@ -187,7 +197,7 @@ fn ci_coverage_near_nominal_on_gaussian_truth_90pct() {
         let col = ds.column_map();
         let x_idx = col["x"];
 
-        let result = fit_from_formula("y ~ s(x, k=10)", &ds, &cfg).expect("gam fit");
+        let result = fit_from_formula("y ~ s(x, k=25)", &ds, &cfg).expect("gam fit");
         let FitResult::Standard(fit) = result else {
             panic!("expected a standard GAM fit for a Gaussian smooth");
         };
@@ -260,7 +270,7 @@ fn ci_coverage_near_nominal_on_gaussian_truth_90pct() {
         for (r in 0:(nrep - 1L)) {
             yname <- paste0("y", r)
             dat <- data.frame(x = df$x, y = df[[yname]])
-            m <- gam(y ~ s(x, k = 10), data = dat, method = "REML")
+            m <- gam(y ~ s(x, k = 25), data = dat, method = "REML")
             pr <- predict(m, newdata = newd, se.fit = TRUE)
             lo <- pr$fit - z90 * pr$se.fit
             hi <- pr$fit + z90 * pr$se.fit

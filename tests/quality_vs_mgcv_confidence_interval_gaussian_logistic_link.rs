@@ -130,14 +130,21 @@ fn confidence_intervals_cover_truth_under_logistic_link() {
     let x_idx = col["x"];
 
     // ---- fit gam: y ~ s(x), Binomial(logit), REML --------------------------
-    // k=10 matches mgcv's default thin-plate basis dimension so the two smooths
-    // target as close to the same penalized model as their bases allow.
+    // The truth `eta(x) = x + sin(2*pi*x)` over x in [-3, 3] carries SIX full
+    // cycles of the sinusoid (argument spans -6*pi..6*pi). A penalized cubic
+    // smooth needs roughly four knots per cycle to represent that without a
+    // residual `O(lambda*f'')` bias at every crest/trough, so k must be >= ~28.
+    // At the previously-used k=10 the truth is intrinsically under-resolved and
+    // the penalized bias dominates the honest SE: BOTH gam and mgcv collapse
+    // below nominal (gam=0.46, mgcv=0.375 in run 26753200374). k=30 puts the
+    // truth in the span of the basis so the across-the-function coverage claim
+    // is well-posed; both engines use the same k for an apples-to-apples band.
     let cfg = FitConfig {
         family: Some("binomial".to_string()),
         link: Some("logit".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ s(x, k=10)", &ds, &cfg).expect("gam binomial(logit) fit");
+    let result = fit_from_formula("y ~ s(x, k=30)", &ds, &cfg).expect("gam binomial(logit) fit");
     let FitResult::Standard(fit) = result else {
         panic!("binomial(logit) smooth should be a Standard fit");
     };
@@ -158,12 +165,16 @@ fn confidence_intervals_cover_truth_under_logistic_link() {
     assert_eq!(gam_eta_check.len(), n, "design eta length mismatch");
     let offset = Array1::<f64>::zeros(n);
 
-    // Bias correction OFF and all coverage corrections OFF so the reported SEs
-    // are the bare delta-method / link-scale SEs that mgcv also reports — an
-    // apples-to-apples comparison of the inverse-link Jacobian, nothing else.
+    // Bias correction OFF, boundary/OOD inflation OFF. The covariance is the
+    // smoothing-parameter-corrected Bayesian Vp (Marra & Wood 2012), which is
+    // exactly what mgcv's `predict(se.fit=TRUE)` reports by default — the band
+    // whose ACROSS-THE-FUNCTION coverage tracks the nominal level. Using the
+    // conditional Vb here would compare gam's narrower-than-mgcv band against
+    // mgcv's Vp band (not apples-to-apples) and systematically under-cover; the
+    // statistically correct whole-function coverage object is Vp.
     let options = PredictUncertaintyOptions {
         confidence_level: 0.95,
-        covariance_mode: InferenceCovarianceMode::Conditional,
+        covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
         mean_interval_method: MeanIntervalMethod::Delta,
         includeobservation_interval: false,
         apply_bias_correction: false,
@@ -206,7 +217,7 @@ fn confidence_intervals_cover_truth_under_logistic_link() {
         &[Column::new("x", &x), Column::new("y", &y)],
         r#"
         suppressPackageStartupMessages(library(mgcv))
-        m <- gam(y ~ s(x, k=10), data = df, family = binomial(link="logit"),
+        m <- gam(y ~ s(x, k=30), data = df, family = binomial(link="logit"),
                  method = "REML")
         pl <- predict(m, type = "link", se.fit = TRUE)
         pr <- predict(m, type = "response", se.fit = TRUE)

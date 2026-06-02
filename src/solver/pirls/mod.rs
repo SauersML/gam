@@ -159,6 +159,55 @@ fn estimate_gamma_shape_from_eta(
     0.5 * (lo + hi)
 }
 
+/// Method-of-moments estimate of the Beta-regression precision `phi` from the
+/// current linear predictor `eta` (logit link).
+///
+/// For a Beta GLM `Var(y_i) = mu_i(1-mu_i)/(1+phi)`, so the standardized Pearson
+/// residual `s_i = (y_i - mu_i)^2 / (mu_i(1-mu_i))` has `E[s_i] = 1/(1+phi)`.
+/// Equating the prior-weighted average of `s_i` to its expectation gives
+/// `1 + phi = Σ w_i / Σ w_i s_i`, i.e. `phi = (Σ w_i / Σ w_i s_i) - 1`. This is
+/// the standard moment estimator betareg uses to initialize / cross-check the
+/// joint MLE; iterating mean-fit → phi-estimate → refit across the outer
+/// smoothing-parameter loop drives it to the joint optimum. The estimate is
+/// clamped to a wide, strictly-positive admissible band so a transient
+/// near-degenerate residual sum cannot push `phi` non-positive or to infinity.
+fn estimate_beta_phi_from_eta(
+    y: ArrayView1<'_, f64>,
+    eta: &Array1<f64>,
+    priorweights: ArrayView1<'_, f64>,
+) -> f64 {
+    const PHI_MIN: f64 = 1e-3;
+    const PHI_MAX: f64 = 1e6;
+    const MU_EPS: f64 = 1e-9;
+
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    let (weighted_pearson, total_weight) = (0..eta.len())
+        .into_par_iter()
+        .map(|i| {
+            let wi = priorweights[i].max(0.0);
+            if wi == 0.0 {
+                return (0.0_f64, 0.0_f64);
+            }
+            // Logit inverse link with a small guard so the variance denominator
+            // mu(1-mu) stays strictly positive at the boundaries.
+            let mui = (1.0 / (1.0 + (-eta[i].clamp(-ETA_CLAMP, ETA_CLAMP)).exp()))
+                .clamp(MU_EPS, 1.0 - MU_EPS);
+            let var_unit = mui * (1.0 - mui);
+            let resid = y[i] - mui;
+            (wi * resid * resid / var_unit, wi)
+        })
+        .reduce(
+            || (0.0_f64, 0.0_f64),
+            |(p1, w1), (p2, w2)| (p1 + p2, w1 + w2),
+        );
+
+    if total_weight <= 0.0 || weighted_pearson <= 0.0 {
+        return 1.0;
+    }
+    let one_plus_phi = (total_weight / weighted_pearson).max(1.0 + PHI_MIN);
+    (one_plus_phi - 1.0).clamp(PHI_MIN, PHI_MAX)
+}
+
 #[derive(Clone, Debug)]
 pub struct SparsePirlsDecision {
     pub path: PirlsLinearSolvePath,
@@ -1271,6 +1320,14 @@ pub(super) struct GamWorkingModel<'a> {
     /// iterations because a fresh `GamWorkingModel` is built per inner solve.
     /// See issue #511 (regression of #359).
     gamma_shape_locked: bool,
+    /// Whether the Beta-regression precision `phi` has been estimated and frozen
+    /// for the duration of this inner P-IRLS solve. Like the Gamma shape, `phi`
+    /// is a nuisance scale entering the working weight `w ∝ (1+phi)` and the
+    /// variance `Var(y)=mu(1-mu)/(1+phi)`; re-estimating it per Newton/LM iterate
+    /// moves the penalized argmin, so it is estimated once from the warm-start η
+    /// and held fixed within the inner solve, refreshing across outer iterations
+    /// (a fresh working model is built per inner solve). Issue #567.
+    beta_phi_locked: bool,
     quadctx: crate::quadrature::QuadratureContext,
 }
 
@@ -1359,6 +1416,7 @@ impl<'a> GamWorkingModel<'a> {
             x_original_csr,
             covariate_se: None,
             gamma_shape_locked: false,
+            beta_phi_locked: false,
             quadctx,
         }
     }
@@ -1792,6 +1850,20 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                 estimate_gamma_shape_from_eta(self.y, &self.workspace.eta_buf, self.priorweights);
             self.likelihood = self.likelihood.clone().with_gamma_shape(shape);
             self.gamma_shape_locked = true;
+        }
+
+        // Estimate the Beta precision φ once from the warm-start η and freeze it
+        // for this inner solve (issue #567). φ enters the IRLS weights and the
+        // variance `Var(y)=mu(1-mu)/(1+φ)`; holding it fixed within the inner
+        // solve keeps the penalized argmin β̂ stationary (mirroring the Gamma
+        // shape lock above), and it refreshes across outer iterations as a fresh
+        // working model is built per inner solve. With φ pinned at the seed of 1
+        // the mean smooth was over-penalized / under-fit on precise data.
+        if self.likelihood.scale.beta_phi_is_estimated() && !self.beta_phi_locked {
+            let phi =
+                estimate_beta_phi_from_eta(self.y, &self.workspace.eta_buf, self.priorweights);
+            self.likelihood = self.likelihood.clone().with_beta_phi(phi);
+            self.beta_phi_locked = true;
         }
 
         // Use integrated (GHQ) likelihood if per-observation SE is available.

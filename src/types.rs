@@ -1201,7 +1201,10 @@ impl LikelihoodSpec {
             | ResponseFamily::NegativeBinomial { .. } => {
                 LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 }
             }
-            ResponseFamily::Beta { phi } => LikelihoodScaleMetadata::FixedDispersion { phi: *phi },
+            // Beta precision is estimated jointly with the mean by default
+            // (magic-by-default, issue #567): the family-variant `phi` is the
+            // seed, refined from the working residuals during fitting.
+            ResponseFamily::Beta { phi } => LikelihoodScaleMetadata::EstimatedBetaPhi { phi: *phi },
             ResponseFamily::RoystonParmar => LikelihoodScaleMetadata::Unspecified,
         }
     }
@@ -1347,6 +1350,11 @@ pub enum LikelihoodScaleMetadata {
     FixedGammaShape { shape: f64 },
     /// Gamma shape `k` estimated jointly with the mean model.
     EstimatedGammaShape { shape: f64 },
+    /// Beta-regression precision `phi` estimated jointly with the mean model.
+    /// `Var(y) = mu(1-mu)/(1+phi)`; larger `phi` means less noise. Estimated
+    /// from the working residuals after each mean fit and refreshed across outer
+    /// iterations, exactly like the Gamma shape (issue #567).
+    EstimatedBetaPhi { phi: f64 },
     /// The engine does not expose fixed-scale semantics for this family.
     Unspecified,
 }
@@ -1355,12 +1363,18 @@ impl LikelihoodScaleMetadata {
     #[inline]
     pub const fn fixed_phi(self) -> Option<f64> {
         match self {
-            Self::FixedDispersion { phi } => Some(phi),
+            Self::FixedDispersion { phi } | Self::EstimatedBetaPhi { phi } => Some(phi),
             Self::FixedGammaShape { shape } | Self::EstimatedGammaShape { shape } => {
                 Some(1.0 / shape)
             }
             Self::ProfiledGaussian | Self::Unspecified => None,
         }
+    }
+
+    /// Whether the Beta-regression precision `phi` is estimated from data.
+    #[inline]
+    pub const fn beta_phi_is_estimated(self) -> bool {
+        matches!(self, Self::EstimatedBetaPhi { .. })
     }
 
     #[inline]
@@ -1441,6 +1455,28 @@ impl GlmLikelihoodSpec {
                 _ => other,
             },
         };
+        self
+    }
+
+    /// Whether the Beta-regression precision `phi` is estimated from data.
+    #[inline]
+    pub fn beta_phi_is_estimated(&self) -> bool {
+        self.scale.beta_phi_is_estimated()
+    }
+
+    /// Mutate the Beta precision `phi` in place, on BOTH the family variant
+    /// (where every PIRLS weight / deviance / log-likelihood expression reads it
+    /// via `ResponseFamily::Beta { phi }`) and the scale metadata (the
+    /// estimated-vs-fixed contract). No-op for non-Beta families. The inner
+    /// solver calls this once per inner solve after a moment estimate of `phi`
+    /// from the working residuals, so the IRLS weights `Var(y)=mu(1-mu)/(1+phi)`
+    /// reflect the true precision rather than the `phi=1` seed (issue #567).
+    #[inline]
+    pub fn with_beta_phi(mut self, phi: f64) -> Self {
+        if let ResponseFamily::Beta { phi: family_phi } = &mut self.spec.response {
+            *family_phi = phi;
+            self.scale = LikelihoodScaleMetadata::EstimatedBetaPhi { phi };
+        }
         self
     }
 }
