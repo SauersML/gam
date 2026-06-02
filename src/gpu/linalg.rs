@@ -363,6 +363,39 @@ pub fn try_fast_atb(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Option<Ar
     }
 }
 
+/// `Aᵀ·B` on a specific device ordinal, for pool-tiled callers that already own
+/// the ordinal (the worker thread has bound that ordinal's context). Semantics
+/// are identical to [`try_fast_atb`] — `a` is `m×k`, `b` is `m×n`, output is the
+/// `k×n` product `aᵀ·b` — but the kernel is pinned to `ordinal` instead of the
+/// probe-selected primary device. Returns `None` when CUDA is unavailable, the
+/// shape is below policy threshold, or the backend reports a transient failure,
+/// so the caller runs its CPU fallback. f64 only.
+#[inline]
+#[must_use]
+pub fn try_fast_atb_on_ordinal(
+    ordinal: usize,
+    a: ArrayView2<'_, f64>,
+    b: ArrayView2<'_, f64>,
+) -> Option<Array2<f64>> {
+    let (n_a, p) = a.dim();
+    let (n_b, q) = b.dim();
+    if n_a != n_b || p == 0 || q == 0 {
+        return None;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // The size/policy gate is identical to `try_fast_atb`; only the target
+        // device differs. We still consult `route_through_gpu` so a below-floor
+        // shape declines to the caller's CPU path rather than paying PCIe cost.
+        route_through_gpu(DispatchOp::Gemm { m: p, n: q, k: n_a })?;
+        cuda_backend::gemm_on_ordinal(ordinal, a, b, true, false)
+    }
+}
+
 #[inline]
 #[must_use]
 pub fn try_fast_av(a: ArrayView2<'_, f64>, v: ArrayView1<'_, f64>) -> Option<Array1<f64>> {
@@ -610,6 +643,17 @@ mod cuda_backend {
         trans_b: bool,
     ) -> Option<Array2<f64>> {
         super::super::blas::gemm_cuda(runtime, a, b, trans_a, trans_b)
+    }
+
+    #[inline]
+    pub(super) fn gemm_on_ordinal(
+        ordinal: usize,
+        a: ArrayView2<'_, f64>,
+        b: ArrayView2<'_, f64>,
+        trans_a: bool,
+        trans_b: bool,
+    ) -> Option<Array2<f64>> {
+        super::super::blas::gemm_on_ordinal_cuda(ordinal, a, b, trans_a, trans_b)
     }
 
     #[inline]

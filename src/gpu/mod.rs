@@ -290,6 +290,14 @@ pub fn try_fast_ab(
     linalg::try_fast_ab(a, b)
 }
 #[inline]
+pub fn try_fast_atb_on_ordinal(
+    ordinal: usize,
+    a: ndarray::ArrayView2<'_, f64>,
+    b: ndarray::ArrayView2<'_, f64>,
+) -> Option<ndarray::Array2<f64>> {
+    linalg::try_fast_atb_on_ordinal(ordinal, a, b)
+}
+#[inline]
 pub fn try_fast_av(
     a: ndarray::ArrayView2<'_, f64>,
     v: ndarray::ArrayView1<'_, f64>,
