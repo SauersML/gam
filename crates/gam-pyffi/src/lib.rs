@@ -9084,6 +9084,7 @@ fn gaussian_reml_fit_latent<'py>(
     }
     let analytic_penalties_for_thread = analytic_penalties.clone();
     let latent_payload_for_thread = latent_payload.clone();
+    let t_for_echo = t_values.clone();
     let (fit, _design, aux_strength_state) =
         detach_py_result(py, "gaussian_reml_fit_latent", move || {
             let registry = build_analytic_penalty_registry_from_json(
@@ -9119,6 +9120,14 @@ fn gaussian_reml_fit_latent<'py>(
     let out = PyDict::new(py);
     set_ok_gaussian_reml_items(py, &out, fit)?;
     set_aux_strength_items(py, &out, aux_strength_state)?;
+    // Echo the latent this fit was evaluated at. The forward primitive solves a
+    // single `β | t`; it does not move `t`, so the returned `t` equals the input.
+    // Callers driving the outer loop (or `gaussian_reml_optimize_latent`) read
+    // it back rather than having to thread the input through themselves.
+    let t_matrix = t_for_echo
+        .into_shape_with_order((n_obs, latent_dim))
+        .map_err(|err| py_value_error(err.to_string()))?;
+    out.set_item("t", t_matrix.into_pyarray(py))?;
     Ok(out.unbind())
 }
 
@@ -12019,6 +12028,450 @@ fn gaussian_reml_fit_latent_backward<'py>(
     } else {
         out.set_item("grad_dim_selection_log_precision", py.None())?;
     }
+    Ok(out.unbind())
+}
+
+/// Owned inputs for the latent outer-optimization objective.
+///
+/// Bundles the data the value/gradient evaluation needs so a single struct can
+/// be reused across trust-region iterations and restarts without re-copying
+/// from Python.
+struct LatentOuterProblem {
+    y: Array2<f64>,
+    centers: Array2<f64>,
+    penalty: Array2<f64>,
+    weights: Option<Array1<f64>>,
+    aux_u: Option<Array2<f64>>,
+    dim_selection: Option<Array1<f64>>,
+    family: AuxPriorFamily,
+    aux_strength: Option<f64>,
+    init_lambda: Option<f64>,
+    sigma_eff_mode: SigmaEffMode,
+    n_obs: usize,
+    latent_dim: usize,
+    m: usize,
+    basis_kind: String,
+    tensor_knots: Option<Array1<f64>>,
+    tensor_knot_offsets: Option<Vec<usize>>,
+    tensor_degrees: Option<Vec<usize>>,
+}
+
+impl LatentOuterProblem {
+    /// REML score (inner Gaussian REML plus aux/dim identifiability priors) and,
+    /// when `want_grad`, the outer latent gradient `∂(reml_score)/∂t`.
+    ///
+    /// The value reproduces [`gaussian_reml_fit_latent`]'s `reml_score` and the
+    /// gradient reproduces [`gaussian_reml_fit_latent_backward`]'s `grad_t` at
+    /// `grad_reml_score = 1`, so the optimizer descends exactly the quantity the
+    /// forward primitive reports. A non-finite or unsolvable configuration maps
+    /// to `+∞` with no gradient, which the trust region rejects rather than
+    /// propagating a NaN into the inner adjoint.
+    fn value_and_grad(
+        &self,
+        t_flat: ArrayView1<'_, f64>,
+        want_grad: bool,
+    ) -> (f64, Option<Array1<f64>>) {
+        match self.try_value_and_grad(t_flat, want_grad) {
+            Ok(pair) => pair,
+            Err(_) => (f64::INFINITY, None),
+        }
+    }
+
+    fn try_value_and_grad(
+        &self,
+        t_flat: ArrayView1<'_, f64>,
+        want_grad: bool,
+    ) -> Result<(f64, Option<Array1<f64>>), String> {
+        let (design, t_mat, jet) = build_latent_forward_design(
+            &self.basis_kind,
+            t_flat,
+            self.n_obs,
+            self.latent_dim,
+            self.centers.view(),
+            self.m,
+            self.tensor_knots.as_ref().map(|a| a.view()),
+            self.tensor_knot_offsets.as_deref(),
+            self.tensor_degrees.as_deref(),
+        )?;
+        let weights_view = self.weights.as_ref().map(|w| w.view());
+        let fit = gaussian_reml_multi_closed_form_with_cache(
+            design.view(),
+            self.y.view(),
+            self.penalty.view(),
+            weights_view,
+            self.init_lambda,
+            None,
+        )
+        .map_err(|err| err.to_string())?;
+        let (prior_score, _aux_state) = latent_prior_score_and_aux_state_for_t(
+            t_mat.view(),
+            self.aux_u.as_ref().map(|a| a.view()),
+            self.family,
+            self.aux_strength,
+            self.dim_selection.as_ref().map(|a| a.view()),
+        )?;
+        let value = fit.reml_score + prior_score;
+        if !value.is_finite() {
+            return Ok((f64::INFINITY, None));
+        }
+        if !want_grad {
+            return Ok((value, None));
+        }
+        let mut grad_t = Array1::<f64>::zeros(self.n_obs * self.latent_dim);
+        add_latent_outer_reml_score_gradient(
+            &mut grad_t,
+            1.0,
+            design.view(),
+            self.y.view(),
+            t_mat.view(),
+            &jet,
+            self.penalty.view(),
+            weights_view,
+            &fit,
+            self.sigma_eff_mode,
+        )?;
+        // Identifiability-prior contributions, identical to the backward path's
+        // grad_t assembly at `grad_reml_score = 1`.
+        if let Some(u_arr) = self.aux_u.as_ref() {
+            let u_view = u_arr.view();
+            let stats =
+                latent_aux_prior_stats(t_mat.view(), u_view, self.family, self.aux_strength)?;
+            let residual = &t_mat - &stats.targets;
+            let projected_residual = aux_prior_targets(residual.view(), u_view, self.family)?;
+            let grad_base = residual - projected_residual;
+            for n in 0..self.n_obs {
+                for a in 0..self.latent_dim {
+                    grad_t[n * self.latent_dim + a] += stats.strength.mu * grad_base[[n, a]];
+                }
+            }
+        }
+        if let Some(log_prec) = self.dim_selection.as_ref() {
+            for n in 0..self.n_obs {
+                for a in 0..self.latent_dim {
+                    let prec = log_prec[a].exp();
+                    grad_t[n * self.latent_dim + a] += prec * t_mat[[n, a]];
+                }
+            }
+        }
+        if !grad_t.iter().all(|value| value.is_finite()) {
+            return Ok((f64::INFINITY, None));
+        }
+        Ok((value, Some(grad_t)))
+    }
+}
+
+/// Adapter exposing [`LatentOuterProblem`] to the Riemannian trust region.
+struct LatentOuterObjective<'a> {
+    problem: &'a LatentOuterProblem,
+}
+
+impl gam::geometry::RiemannianObjective for LatentOuterObjective<'_> {
+    fn value_gradient(
+        &mut self,
+        point: ArrayView1<'_, f64>,
+    ) -> gam::geometry::GeometryResult<(f64, Array1<f64>)> {
+        // A degenerate point yields `+∞` and a zero gradient: the trust region
+        // reads a zero gradient at the start as "stationary" (it stops at the
+        // finite init) and a `+∞` trial value as a rejected step (it shrinks).
+        match self.problem.value_and_grad(point, true) {
+            (value, Some(grad)) => Ok((value, grad)),
+            (_, None) => Ok((f64::INFINITY, Array1::<f64>::zeros(point.len()))),
+        }
+    }
+}
+
+/// Build the manifold the outer optimizer walks `t` on. `manifold` names the
+/// per-observation geometry; the full latent lives on the `n_obs`-fold product.
+fn build_latent_outer_manifold(
+    manifold: &str,
+    n_obs: usize,
+    latent_dim: usize,
+) -> Result<Box<dyn gam::geometry::RiemannianManifold>, String> {
+    let per_point = match manifold.to_ascii_lowercase().replace('-', "_").as_str() {
+        "euclidean" | "rn" => {
+            // One flat Euclidean block over the whole latent is equivalent to
+            // the product and avoids the per-observation slicing overhead.
+            return Ok(Box::new(gam::geometry::EuclideanManifold::new(
+                n_obs * latent_dim,
+            )));
+        }
+        "circle" | "s1" => {
+            if latent_dim != 1 {
+                return Err(format!(
+                    "circle latent manifold requires latent_dim == 1; got {latent_dim}"
+                ));
+            }
+            gam::geometry::ManifoldSpec::Circle
+        }
+        "sphere" => {
+            if latent_dim < 2 {
+                return Err(format!(
+                    "sphere latent manifold requires latent_dim >= 2 (S^{{d-1}} embeds in R^d); got {latent_dim}"
+                ));
+            }
+            gam::geometry::ManifoldSpec::Sphere {
+                intrinsic_dim: latent_dim - 1,
+            }
+        }
+        "torus" => gam::geometry::ManifoldSpec::Torus { dim: latent_dim },
+        other => {
+            return Err(format!(
+                "unknown latent manifold {other:?}; expected one of euclidean|circle|sphere|torus"
+            ));
+        }
+    };
+    let parts = std::iter::repeat_with(|| per_point.clone())
+        .take(n_obs)
+        .collect();
+    gam::geometry::ManifoldSpec::Product(parts)
+        .build()
+        .map_err(|err| err.to_string())
+}
+
+/// Optimize the latent coordinate `t` against the Gaussian-REML objective.
+///
+/// Unlike [`gaussian_reml_fit_latent`], which performs a single `β | t` inner
+/// solve at a fixed `t`, this routine runs the *outer* latent optimization: it
+/// minimizes the REML score over `t` with a Riemannian trust region driven by
+/// the analytic `∂(reml_score)/∂t` (the same gradient
+/// [`gaussian_reml_fit_latent_backward`] returns), retracting each accepted
+/// step onto `manifold`. It returns the full REML fit dictionary *at the
+/// converged latent* plus the optimized `t`/`latent` arrays.
+///
+/// The latent REML objective is non-convex (a GP-LVM-style coordinate problem),
+/// so a single cold random start may settle in a poor local optimum. Pass
+/// `n_restarts > 1` to optimize from `n_restarts` perturbed starts (seeded by
+/// `seed`) and keep the lowest-score result, or warm-start `t` near a good
+/// configuration.
+#[pyfunction(signature = (
+    t,
+    y,
+    n_obs,
+    latent_dim,
+    centers,
+    penalty,
+    m = 2,
+    weights = None,
+    fisher_w = None,
+    init_lambda = None,
+    aux_u = None,
+    aux_family = "ridge".to_string(),
+    aux_strength = None,
+    dim_selection_log_precision = None,
+    basis_kind = "duchon".to_string(),
+    tensor_knots_concat = None,
+    tensor_knot_offsets = None,
+    tensor_degrees = None,
+    manifold = "euclidean".to_string(),
+    sigma_eff_mode = "profiled".to_string(),
+    max_iter = 200,
+    grad_tol = 1.0e-8,
+    trust_radius = 1.0,
+    max_radius = 1.0e6,
+    n_restarts = 1,
+    restart_scale = 0.25,
+    seed = 0,
+))]
+fn gaussian_reml_optimize_latent<'py>(
+    py: Python<'py>,
+    t: PyReadonlyArray1<'py, f64>,
+    y: PyReadonlyArray2<'py, f64>,
+    n_obs: usize,
+    latent_dim: usize,
+    centers: PyReadonlyArray2<'py, f64>,
+    penalty: PyReadonlyArray2<'py, f64>,
+    m: usize,
+    weights: Option<PyReadonlyArray1<'py, f64>>,
+    fisher_w: Option<PyReadonlyArray3<'py, f64>>,
+    init_lambda: Option<f64>,
+    aux_u: Option<PyReadonlyArray2<'py, f64>>,
+    aux_family: String,
+    aux_strength: Option<f64>,
+    dim_selection_log_precision: Option<PyReadonlyArray1<'py, f64>>,
+    basis_kind: String,
+    tensor_knots_concat: Option<PyReadonlyArray1<'py, f64>>,
+    tensor_knot_offsets: Option<Vec<usize>>,
+    tensor_degrees: Option<Vec<usize>>,
+    manifold: String,
+    sigma_eff_mode: String,
+    max_iter: usize,
+    grad_tol: f64,
+    trust_radius: f64,
+    max_radius: f64,
+    n_restarts: usize,
+    restart_scale: f64,
+    seed: u64,
+) -> PyResult<Py<PyDict>> {
+    use rand::SeedableRng;
+    use rand_distr::Distribution;
+
+    let family = match aux_family.to_ascii_lowercase().as_str() {
+        "ridge" => AuxPriorFamily::Ridge,
+        "linear" => AuxPriorFamily::Linear,
+        other => {
+            return Err(py_value_error(format!(
+                "aux_family must be 'ridge' or 'linear'; got {other:?}"
+            )));
+        }
+    };
+    let sigma_eff_mode = SigmaEffMode::parse(&sigma_eff_mode).map_err(py_value_error)?;
+    if n_restarts == 0 {
+        return Err(py_value_error("n_restarts must be at least 1".to_string()));
+    }
+    let expected = n_obs.checked_mul(latent_dim).ok_or_else(|| {
+        py_value_error("n_obs * latent_dim overflows usize".to_string())
+    })?;
+    let t_values = t.as_array().to_owned();
+    if t_values.len() != expected {
+        return Err(py_value_error(format!(
+            "t length {} must equal n_obs * latent_dim = {expected}",
+            t_values.len()
+        )));
+    }
+    let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
+    let fisher_values = fisher_w.as_ref().map(|w| w.as_array().to_owned());
+    let effective_weights = latent_scalar_weights_with_fisher(
+        n_obs,
+        weight_values.as_ref().map(|w| w.view()),
+        fisher_values.as_ref().map(|w| w.view()),
+    )
+    .map_err(py_value_error)?;
+    let dim_selection_values = dim_selection_log_precision
+        .as_ref()
+        .map(|a| a.as_array().to_owned());
+    let tensor_knots_values = tensor_knots_concat.as_ref().map(|a| a.as_array().to_owned());
+
+    let problem = LatentOuterProblem {
+        y: y.as_array().to_owned(),
+        centers: centers.as_array().to_owned(),
+        penalty: penalty.as_array().to_owned(),
+        weights: effective_weights,
+        aux_u: aux_u.as_ref().map(|a| a.as_array().to_owned()),
+        dim_selection: dim_selection_values,
+        family,
+        aux_strength,
+        init_lambda,
+        sigma_eff_mode,
+        n_obs,
+        latent_dim,
+        m,
+        basis_kind,
+        tensor_knots: tensor_knots_values,
+        tensor_knot_offsets,
+        tensor_degrees,
+    };
+
+    let manifold_box =
+        build_latent_outer_manifold(&manifold, n_obs, latent_dim).map_err(py_value_error)?;
+    let trust_region = gam::geometry::RiemannianTrustRegion {
+        radius: trust_radius,
+        max_radius,
+        max_iter,
+        grad_tol,
+    };
+
+    // Restart 0 always starts from the caller's `t`; further restarts perturb it
+    // in the tangent space and retract back onto the manifold, then we keep the
+    // lowest-score converged latent.
+    let (best_t, best_value) = py
+        .detach(|| -> Result<(Array1<f64>, f64), String> {
+            let manifold_ref: &dyn gam::geometry::RiemannianManifold = manifold_box.as_ref();
+            let normal = rand_distr::Normal::new(0.0, restart_scale.abs().max(f64::MIN_POSITIVE))
+                .map_err(|err| err.to_string())?;
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let mut best: Option<(Array1<f64>, f64)> = None;
+            for restart in 0..n_restarts {
+                let start = if restart == 0 {
+                    t_values.clone()
+                } else {
+                    let noise = Array1::from_shape_fn(t_values.len(), |_| normal.sample(&mut rng));
+                    let tangent = manifold_ref
+                        .project_tangent(t_values.view(), noise.view())
+                        .map_err(|err| err.to_string())?;
+                    manifold_ref
+                        .retract(t_values.view(), tangent.view())
+                        .map_err(|err| err.to_string())?
+                };
+                let mut objective = LatentOuterObjective { problem: &problem };
+                let optimized = trust_region
+                    .minimize(manifold_ref, &mut objective, start.view())
+                    .map_err(|err| err.to_string())?;
+                let (value, _) = problem.value_and_grad(optimized.view(), false);
+                let improved = best.as_ref().map(|(_, b)| value < *b).unwrap_or(true);
+                if improved {
+                    best = Some((optimized, value));
+                }
+            }
+            best.ok_or_else(|| "no restart produced a latent".to_string())
+        })
+        .map_err(py_value_error)?;
+
+    // Final gradient norm at the chosen latent, as a convergence diagnostic.
+    let (_, final_grad) = problem.value_and_grad(best_t.view(), true);
+    let grad_t_norm = final_grad
+        .as_ref()
+        .map(|g| g.iter().map(|v| v * v).sum::<f64>().sqrt())
+        .unwrap_or(f64::INFINITY);
+
+    // Rebuild the full fit dictionary at the converged latent so callers get the
+    // identical schema [`gaussian_reml_fit_latent`] returns, then echo `t`. The
+    // detached fit closure must be `'static`, so move owned copies in (the
+    // problem's array buffers are no longer needed on this thread afterwards).
+    let latent_payload =
+        serde_json::json!({"t": {"name": "t", "n": n_obs, "d": latent_dim}});
+    let LatentOuterProblem {
+        y,
+        centers,
+        penalty,
+        weights,
+        aux_u,
+        dim_selection,
+        basis_kind,
+        tensor_knots,
+        tensor_knot_offsets,
+        tensor_degrees,
+        ..
+    } = problem;
+    let best_t_for_fit = best_t.clone();
+    let (fit, _design, aux_strength_state) =
+        detach_py_result(py, "gaussian_reml_optimize_latent", move || {
+            let registry = build_analytic_penalty_registry_from_json(Some(&latent_payload), None)?;
+            gaussian_reml_fit_latent_impl(
+                best_t_for_fit.view(),
+                y.view(),
+                n_obs,
+                latent_dim,
+                centers.view(),
+                m,
+                &basis_kind,
+                tensor_knots.as_ref().map(|a| a.view()),
+                tensor_knot_offsets.as_deref(),
+                tensor_degrees.as_deref(),
+                penalty.view(),
+                weights.as_ref().map(|w| w.view()),
+                init_lambda,
+                aux_u.as_ref().map(|a| a.view()),
+                family,
+                aux_strength,
+                dim_selection.as_ref().map(|a| a.view()),
+                Some(&registry),
+            )
+        })?;
+
+    let out = PyDict::new(py);
+    set_ok_gaussian_reml_items(py, &out, fit)?;
+    set_aux_strength_items(py, &out, aux_strength_state)?;
+    let t_matrix = best_t
+        .clone()
+        .into_shape_with_order((n_obs, latent_dim))
+        .map_err(|err| py_value_error(err.to_string()))?;
+    out.set_item("t", t_matrix.clone().into_pyarray(py))?;
+    out.set_item("latent", t_matrix.into_pyarray(py))?;
+    out.set_item("t_flat", best_t.into_pyarray(py))?;
+    out.set_item("grad_t_norm", grad_t_norm)?;
+    out.set_item("converged", grad_t_norm <= grad_tol)?;
+    out.set_item("objective_value", best_value)?;
+    out.set_item("n_restarts", n_restarts)?;
     Ok(out.unbind())
 }
 
@@ -21877,6 +22330,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_latent, module)?)?;
+    module.add_function(wrap_pyfunction!(gaussian_reml_optimize_latent, module)?)?;
     module.add_function(wrap_pyfunction!(register_analytic_penalties, module)?)?;
     module.add_function(wrap_pyfunction!(analytic_penalty_value_grad, module)?)?;
     module.add_function(wrap_pyfunction!(analytic_penalty_hvp, module)?)?;
