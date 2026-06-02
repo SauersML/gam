@@ -7524,7 +7524,11 @@ fn family_noise_parameter(fit: &UnifiedFitResult, family: LikelihoodSpec) -> Opt
     match family.response {
         ResponseFamily::Tweedie { p } => Some(p),
         ResponseFamily::NegativeBinomial { theta } => Some(theta),
-        ResponseFamily::Beta { phi } => Some(phi),
+        // Beta precision φ is estimated jointly with the mean (issue #567), so
+        // the authoritative value is the fit's scale metadata, not the seed φ on
+        // the original family spec. Fall back to the spec φ only if the fit did
+        // not record an estimated/fixed dispersion.
+        ResponseFamily::Beta { phi } => fit.likelihood_scale.fixed_phi().or(Some(phi)),
         ResponseFamily::Gamma => fit
             .likelihood_scale
             .gamma_shape()

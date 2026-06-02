@@ -4469,7 +4469,8 @@ fn validate_likelihood_scale_estimation(
 ) -> Result<(), EstimationError> {
     match scale {
         LikelihoodScaleMetadata::ProfiledGaussian | LikelihoodScaleMetadata::Unspecified => Ok(()),
-        LikelihoodScaleMetadata::FixedDispersion { phi } => {
+        LikelihoodScaleMetadata::FixedDispersion { phi }
+        | LikelihoodScaleMetadata::EstimatedBetaPhi { phi } => {
             ensure_finite_scalar_estimation("fit_result.likelihood_scale.phi", phi)?;
             if phi > 0.0 {
                 Ok(())

@@ -1690,6 +1690,32 @@ impl WorkingModelSurvival {
     /// Monotonicity is enforced through linear inequality constraints on the
     /// derivative design; enabling this records how many leading time columns
     /// belong to that constrained block.
+    /// Overwrite the per-block smoothing parameters `λ_k` in place.
+    ///
+    /// Used by the REML smoothing-parameter selection for transformation
+    /// survival fits (issue #563): the outer optimizer proposes a `ρ = log λ`
+    /// vector, sets the smoothing blocks' `λ_k` here, and re-runs the inner
+    /// constrained PIRLS, so the monotone I-spline baseline can adapt its
+    /// wiggliness instead of being pinned at a fixed seed. `lambdas` must have
+    /// one entry per penalty block. The fixed stabilization ridge keeps its
+    /// caller-set value (the optimizer never proposes a new one for it).
+    pub fn set_penalty_lambdas(&mut self, lambdas: &[f64]) -> Result<(), EstimationError> {
+        if lambdas.len() != self.penalties.blocks.len() {
+            crate::bail_invalid_estim!(
+                "set_penalty_lambdas expects {} lambdas, got {}",
+                self.penalties.blocks.len(),
+                lambdas.len()
+            );
+        }
+        for (block, &lambda) in self.penalties.blocks.iter_mut().zip(lambdas.iter()) {
+            if !lambda.is_finite() || lambda < 0.0 {
+                crate::bail_invalid_estim!("penalty lambda must be finite and >= 0, got {lambda}");
+            }
+            block.lambda = lambda;
+        }
+        Ok(())
+    }
+
     pub fn set_structural_monotonicity(
         &mut self,
         enabled: bool,

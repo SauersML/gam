@@ -8794,15 +8794,38 @@ impl<'a> RemlState<'a> {
                     for idx in 0..alo_gradient.len() {
                         gradient[idx] += alo_gradient[idx];
                     }
-                    // Retain the base REML analytic Hessian as the second-order
-                    // model. ARC's adaptive cubic regularization drives
-                    // convergence on the exact augmented cost+gradient via the
-                    // ratio test; an approximate Hessian only changes step
-                    // quality, not correctness. Dropping it forces the outer
-                    // route (planned as HessianSource::Analytic for the dense
-                    // Gaussian-identity path) to fail the runtime invariant
-                    // "outer plan declared Analytic but runtime returned
-                    // Unavailable" the instant the ALO gate fires.
+                    // The augmented objective is `V(ρ) + C(ρ)`, so the second-order
+                    // model handed to the ARC analytic route must be the SUM of the
+                    // base-REML analytic Hessian and the ALO augmentation's Hessian
+                    // — exactly consistent with the augmented gradient above.
+                    // `alo_stabilization_derivatives` returns a Gauss-Newton (PSD)
+                    // ρ-Hessian of `C(ρ)` paired 1:1 with the augmentation gradient;
+                    // adding it keeps the route analytic and the curvature model
+                    // faithful. When the GN Hessian was not produced (work-budget
+                    // skip or a Cholesky failure in the sensitivity solve) we retain
+                    // the base-REML analytic Hessian: ARC's adaptive cubic
+                    // regularization still converges on the exact augmented
+                    // cost+gradient via its ratio test, and a slightly inexact
+                    // curvature model only changes step quality, not correctness.
+                    // Either branch keeps `result.hessian` analytic so the outer
+                    // plan's `HessianSource::Analytic` invariant holds and the fit
+                    // never aborts with "runtime returned Unavailable".
+                    if let (HessianResult::Analytic(base), Some(alo_hessian)) =
+                        (&mut result.hessian, alo_eval.hessian.as_ref())
+                    {
+                        if base.nrows() == alo_hessian.nrows()
+                            && base.ncols() == alo_hessian.ncols()
+                        {
+                            *base += alo_hessian;
+                        } else {
+                            log::warn!(
+                                "[ALO-STABILIZED-REML] augmentation Hessian shape {:?} did not \
+                                 match base REML Hessian shape {:?}; retaining base curvature",
+                                alo_hessian.dim(),
+                                base.dim(),
+                            );
+                        }
+                    }
                 }
                 _ => {
                     log::warn!(

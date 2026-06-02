@@ -1555,11 +1555,255 @@ fn fitted_weibull_baseline_from_linear_time_beta(
     )
 }
 
+/// Penalized effective degrees of freedom for a survival transformation fit.
+///
+/// Uses exactly the mgcv definition `edf_total = p − Σ_k λ_k·tr(H⁻¹ S_k)`, where
+/// `H` is the converged penalized Hessian `X'W_HX + S(λ) + ridge·I` (held in
+/// `state.hessian`) and `S_k` is the penalty matrix of block `k` (without its
+/// `λ_k` factor, which is applied here). The per-block edf is
+/// `edf_k = block_cols_k − λ_k·tr(H⁻¹ S_k)`, clamped to `[0, block_cols_k]`.
+///
+/// Returned alongside the dense penalized Hessian so the caller can populate the
+/// inference block (`edf_total`, `edf_by_block`, `penalized_hessian`). This is the
+/// same trace formula `estimate.rs` uses for the standard GAM path; the survival
+/// path runs its own `runworking_model_pirls` optimizer and therefore never
+/// reached that block, leaving edf uncomputed (issue #565).
+fn survival_transformation_edf(
+    state: &crate::pirls::WorkingState,
+    penalty_blocks: &[PenaltyBlock],
+) -> Result<(f64, Vec<f64>, Array2<f64>), String> {
+    let h_dense = state.hessian.to_dense();
+    let p = h_dense.nrows();
+    let h_sym = crate::linalg::matrix::SymmetricMatrix::Dense(h_dense.clone());
+    // Sparse-aware factorization with ridge retry (mirrors estimate.rs) so a
+    // marginally indefinite Hessian at a boundary-constrained optimum still
+    // yields a usable trace rather than aborting the whole fit.
+    let factor = {
+        let scale = h_sym.max_abs_diag();
+        let min_step = scale * 1e-10;
+        let mut ridge = 0.0_f64;
+        let mut attempts = 0_usize;
+        loop {
+            let candidate = if ridge > 0.0 {
+                h_sym.addridge(ridge).unwrap_or_else(|_| h_sym.clone())
+            } else {
+                h_sym.clone()
+            };
+            if let Ok(f) = candidate.factorize() {
+                break f;
+            }
+            attempts += 1;
+            if attempts >= 8 {
+                return Err(
+                    "survival edf: penalized Hessian could not be factorized".to_string()
+                );
+            }
+            ridge = if ridge <= 0.0 { min_step } else { ridge * 10.0 };
+        }
+    };
+    let mut edf_by_block = vec![0.0_f64; penalty_blocks.len()];
+    let mut total_trace = 0.0_f64;
+    for (kk, block) in penalty_blocks.iter().enumerate() {
+        let block_cols = block.range.end - block.range.start;
+        if block.lambda <= 0.0 || block_cols == 0 {
+            edf_by_block[kk] = block_cols as f64;
+            continue;
+        }
+        // RHS = S_k embedded into the full p×block_cols layout: column j holds
+        // column j of S_k placed in the block rows. Solving H Z = RHS gives the
+        // block columns of H⁻¹ S_full, whose block-diagonal entries sum to
+        // tr(H⁻¹ S_k).
+        let mut rhs = Array2::<f64>::zeros((p, block_cols));
+        for c in 0..block_cols {
+            for r in 0..block_cols {
+                rhs[[block.range.start + r, c]] = block.matrix[[r, c]];
+            }
+        }
+        let sol = factor
+            .solvemulti(&rhs)
+            .map_err(|e| format!("survival edf trace solve failed: {e}"))?;
+        let mut trace = 0.0_f64;
+        for j in 0..block_cols {
+            trace += sol[[block.range.start + j, j]];
+        }
+        let lam_trace = block.lambda * trace;
+        total_trace += lam_trace;
+        edf_by_block[kk] = (block_cols as f64 - lam_trace).clamp(0.0, block_cols as f64);
+    }
+    let edf_total = (p as f64 - total_trace).clamp(0.0, p as f64);
+    if !edf_total.is_finite() || edf_by_block.iter().any(|v| !v.is_finite()) {
+        return Err("survival edf: non-finite effective degrees of freedom".to_string());
+    }
+    Ok((edf_total, edf_by_block, h_dense))
+}
+
+/// REML/LAML smoothing-parameter selection for the single-cause transformation
+/// survival baseline (issue #563).
+///
+/// The transformation path solves a constrained PIRLS (`γ ≥ 0` I-spline box) at
+/// a fixed time-penalty `λ`, which oversmooths: with `λ` pinned at its seed the
+/// monotone baseline collapses toward an affine log-cumulative-hazard and cannot
+/// recover real curvature (e.g. Gompertz convexity). This routine wraps that
+/// inner solve in a proper outer LAML optimization over `ρ = log λ` for the
+/// `num_smoothing` time-penalty blocks (the trailing stabilization ridge is held
+/// fixed), exactly as the standard GAM path and mgcv/scam do. The inner solve
+/// still honors the structural box at every candidate `λ`, so the constrained
+/// optimum stays valid; only the outer `λ` becomes data-adaptive.
+///
+/// `model` is the working model at the seed `λ`; it is cloned per candidate so
+/// the proposal never corrupts the warm model. The returned vector has one
+/// `λ_k` per penalty block (smoothing blocks at REML-selected values, the ridge
+/// at its fixed seed). Returns `None` when there are no smoothing blocks to
+/// select (e.g. the Weibull linear-time path), so the caller keeps the seed.
+fn optimize_survival_transformation_smoothing(
+    model: &crate::families::survival::WorkingModelSurvival,
+    penalty_blocks: &[PenaltyBlock],
+    num_smoothing: usize,
+    beta0: &Array1<f64>,
+    structural_lower_bounds: Option<&Array1<f64>>,
+) -> Result<Option<Vec<f64>>, String> {
+    use crate::solver::outer_strategy::{
+        Derivative, HessianResult, OuterEval, OuterProblem, SolverClass,
+    };
+    if num_smoothing == 0 {
+        return Ok(None);
+    }
+    // Full λ vector (smoothing blocks + fixed ridge), used to rebuild each
+    // candidate model. The ridge entries (indices >= num_smoothing) are frozen.
+    let seed_lambdas: Vec<f64> = penalty_blocks.iter().map(|b| b.lambda).collect();
+    let seed_rho = Array1::from_iter(
+        seed_lambdas
+            .iter()
+            .take(num_smoothing)
+            .map(|&l| l.max(1e-12).ln()),
+    );
+
+    // Evaluate the LAML objective and ρ-gradient at a smoothing-ρ proposal:
+    // set the smoothing λ, re-run the constrained inner PIRLS, evaluate the
+    // unified survival LAML, and project the gradient onto the smoothing
+    // coordinates (the trailing ridge gradient component is discarded since the
+    // ridge is fixed).
+    let eval_at = |rho_smooth: &Array1<f64>| -> Result<(f64, Array1<f64>), String> {
+        let mut candidate = model.clone();
+        let mut lambdas = seed_lambdas.clone();
+        for k in 0..num_smoothing {
+            lambdas[k] = rho_smooth[k].exp();
+        }
+        candidate.set_penalty_lambdas(&lambdas).map_err(|e| e.to_string())?;
+        let opts = crate::pirls::WorkingModelPirlsOptions {
+            max_iterations: 400,
+            convergence_tolerance: 1e-6,
+            adaptive_kkt_tolerance: None,
+            max_step_halving: 40,
+            min_step_size: 1e-12,
+            firth_bias_reduction: false,
+            coefficient_lower_bounds: structural_lower_bounds.cloned(),
+            linear_constraints: None,
+            initial_lm_lambda: None,
+            geodesic_acceleration: false,
+            arrow_schur: None,
+        };
+        let summary = crate::pirls::runworking_model_pirls(
+            &mut candidate,
+            crate::types::Coefficients::new(beta0.clone()),
+            &opts,
+            |_| {},
+        )
+        .map_err(|err| format!("survival smoothing PIRLS failed: {err}"))?;
+        let beta = summary.beta.as_ref().to_owned();
+        let state = candidate
+            .update_state(&beta)
+            .map_err(|err| format!("survival smoothing state eval failed: {err}"))?;
+        // Active-penalty ρ over ALL active blocks (smoothing + fixed ridge), in
+        // block order, as the unified survival LAML evaluator requires. The
+        // candidate's λ are exactly `lambdas` (smoothing entries from the
+        // proposal, ridge entries frozen), so build ρ from that vector directly.
+        let full_rho =
+            Array1::from_iter(lambdas.iter().filter(|&&l| l > 0.0).map(|&l| l.ln()));
+        let (cost, grad_full) = candidate
+            .unified_lamlobjective_and_rhogradient(&beta, &state, &full_rho)
+            .map_err(|err| format!("survival LAML evaluation failed: {err}"))?;
+        // Project onto the smoothing coordinates. The active-block enumeration
+        // lists the smoothing blocks first (they are constructed first and the
+        // ridge is appended last), so the leading `num_smoothing` gradient
+        // entries are exactly ∂LAML/∂ρ_smooth with the ridge held fixed.
+        if grad_full.len() < num_smoothing || !cost.is_finite() {
+            return Err("survival LAML returned an inconsistent gradient/cost".to_string());
+        }
+        let grad = grad_full.slice(s![..num_smoothing]).to_owned();
+        if grad.iter().any(|g| !g.is_finite()) {
+            return Err("survival LAML gradient is non-finite".to_string());
+        }
+        Ok((cost, grad))
+    };
+
+    let lower = seed_rho.mapv(|v| v - 12.0);
+    let upper = seed_rho.mapv(|v| v + 12.0);
+    let problem = OuterProblem::new(num_smoothing)
+        .with_solver_class(SolverClass::Primary)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(crate::solver::outer_strategy::DeclaredHessianForm::Unavailable)
+        .with_tolerance(1e-4)
+        .with_max_iter(120)
+        .with_bounds(lower, upper)
+        .with_initial_rho(seed_rho.clone())
+        .with_seed_config(crate::seeding::SeedConfig {
+            max_seeds: 1,
+            seed_budget: 1,
+            ..Default::default()
+        });
+    let context = format!(
+        "survival transformation smoothing-parameter selection (dim={num_smoothing})"
+    );
+    let mut obj = problem.build_objective(
+        (),
+        |_: &mut (), rho: &Array1<f64>| {
+            eval_at(rho)
+                .map(|(c, _)| c)
+                .map_err(crate::estimate::EstimationError::InvalidInput)
+        },
+        |_: &mut (), rho: &Array1<f64>| {
+            let (cost, gradient) =
+                eval_at(rho).map_err(crate::estimate::EstimationError::InvalidInput)?;
+            Ok(OuterEval {
+                cost,
+                gradient,
+                hessian: HessianResult::Unavailable,
+                inner_beta_hint: None,
+            })
+        },
+        None::<fn(&mut ())>,
+        None::<
+            fn(
+                &mut (),
+                &Array1<f64>,
+            )
+                -> Result<crate::solver::outer_strategy::EfsEval, crate::estimate::EstimationError>,
+        >,
+    );
+    let result = problem
+        .run(&mut obj, &context)
+        .map_err(|err| format!("{context} failed: {err}"))?;
+    // The selector improves the fit; if the outer loop does not certify
+    // convergence (rare flat-LAML plateau), fall back to the best ρ it reached
+    // rather than failing the whole fit — the seed is already a valid model.
+    let selected_rho = result.rho;
+    let mut lambdas = seed_lambdas;
+    for k in 0..num_smoothing.min(selected_rho.len()) {
+        let lam = selected_rho[k].exp();
+        if lam.is_finite() && lam > 0.0 {
+            lambdas[k] = lam;
+        }
+    }
+    Ok(Some(lambdas))
+}
+
 fn survival_unified_fit_result(
     beta: Array1<f64>,
     lambdas: Array1<f64>,
     summary: &crate::pirls::WorkingModelPirlsResult,
     state: &crate::pirls::WorkingState,
+    penalty_blocks: &[PenaltyBlock],
 ) -> Result<UnifiedFitResult, String> {
     let log_lambdas = lambdas.mapv(|v| v.max(1e-300).ln());
     let reml_score = survival_working_reml_score(state);
@@ -1572,11 +1816,37 @@ fn survival_unified_fit_result(
     crate::estimate::ensure_finite_scalar("survival fit gradient_norm", summary.lastgradient_norm)?;
     crate::estimate::ensure_finite_scalar("survival fit max_abs_eta", summary.max_abs_eta)?;
 
+    // Penalized effective degrees of freedom from the converged penalized
+    // Hessian and penalty roots (issue #565). `lambdas` is built one entry per
+    // penalty block, so `edf_by_block` aligns 1:1 with `lambdas` as the
+    // `try_from_parts` invariant requires.
+    let (edf_total, edf_by_block, penalized_hessian) =
+        survival_transformation_edf(state, penalty_blocks)?;
+    debug_assert_eq!(edf_by_block.len(), lambdas.len());
+
+    let inference = crate::estimate::FitInference {
+        edf_by_block: edf_by_block.clone(),
+        edf_total,
+        smoothing_correction: None,
+        penalized_hessian: penalized_hessian.into(),
+        working_weights: Array1::zeros(0),
+        working_response: Array1::zeros(0),
+        reparam_qs: None,
+        dispersion: crate::estimate::Dispersion::Known(1.0),
+        beta_covariance: None,
+        beta_standard_errors: None,
+        beta_covariance_corrected: None,
+        beta_standard_errors_corrected: None,
+        beta_covariance_frequentist: None,
+        coefficient_influence: None,
+        bias_correction_beta: None,
+    };
+
     UnifiedFitResult::try_from_parts(crate::estimate::UnifiedFitResultParts {
         blocks: vec![crate::estimate::FittedBlock {
             beta: beta.clone(),
             role: crate::estimate::BlockRole::Mean,
-            edf: 0.0,
+            edf: edf_total,
             lambdas: lambdas.clone(),
         }],
         log_lambdas,
@@ -1595,7 +1865,7 @@ fn survival_unified_fit_result(
         standard_deviation: 1.0,
         covariance_conditional: None,
         covariance_corrected: None,
-        inference: None,
+        inference: Some(inference),
         fitted_link: FittedLinkState::Standard(None),
         geometry: None,
         block_states: Vec::new(),
@@ -2123,6 +2393,42 @@ fn fit_survival_transformation_model(
                     });
                 }
             }
+            // Covariate-smooth penalties (e.g. `s(x)`, `s(group, bs="re")`
+            // frailty) live in the covariate term-collection design; the survival
+            // transformation fit stacks the covariate columns at
+            // `p_time_total..p`, so each covariate penalty's local block maps to
+            // the joint range `p_time_total + col_range`. Penalizing them here
+            // (rather than leaving them to the tiny stabilization ridge) is what
+            // lets the frailty / covariate smooths shrink — and they are added
+            // BEFORE the ridge so they too become REML-selected smoothing blocks
+            // (issues #563/#565). Only zero-prior-mean blocks are admissible as a
+            // plain quadratic `λ βᵀSβ`; a non-zero centering would need an offset
+            // the survival PenaltyBlock does not model, so such blocks are left to
+            // the ridge rather than mis-applied.
+            for cov_penalty in &covariate_design.penalties {
+                let cr = &cov_penalty.col_range;
+                let block_dim = cr.end - cr.start;
+                let matches_dims = cov_penalty.local.nrows() == block_dim
+                    && cov_penalty.local.ncols() == block_dim;
+                let zero_prior = matches!(
+                    cov_penalty.prior_mean,
+                    crate::estimate::CoefficientPriorMean::Zero
+                );
+                if block_dim > 0 && matches_dims && zero_prior && cr.end <= p_cov {
+                    penalty_blocks.push(PenaltyBlock {
+                        matrix: cov_penalty.local.clone(),
+                        lambda: 1e-2,
+                        range: (p_time_total + cr.start)..(p_time_total + cr.end),
+                        nullspace_dim: 0,
+                    });
+                }
+            }
+            // The smoothing blocks are exactly those pushed above (time +
+            // covariate penalties); any ridge appended below is a FIXED
+            // stabilization, not a REML-selected smoothing parameter, so the
+            // count of smoothing blocks is recorded before the ridge is added
+            // (issue #563).
+            let num_smoothing_blocks = penalty_blocks.len();
             let ridge_range_start = if spec.likelihood_mode == SurvivalLikelihoodMode::Weibull
                 && spec.time_build.basisname == "linear"
                 && spec.timewiggle.is_none()
@@ -2216,6 +2522,7 @@ fn fit_survival_transformation_model(
                 beta0,
                 structural_lower_bounds,
                 model,
+                num_smoothing_blocks,
             ))
         };
 
@@ -2224,7 +2531,7 @@ fn fit_survival_transformation_model(
             &baseline_cfg,
             "workflow survival transformation baseline",
             |candidate| {
-                let (_, _, beta0, structural_lower_bounds, mut model) =
+                let (_, _, beta0, structural_lower_bounds, mut model, _) =
                     build_working_model(candidate)?;
                 let opts = crate::pirls::WorkingModelPirlsOptions {
                     max_iterations: 400,
@@ -2255,7 +2562,7 @@ fn fit_survival_transformation_model(
         )?;
     }
 
-    let (prepared, penalty_blocks, beta0, structural_lower_bounds, mut model) =
+    let (prepared, mut penalty_blocks, beta0, structural_lower_bounds, mut model, num_smoothing_blocks) =
         build_working_model(&baseline_cfg)?;
     if cause_count > 1 || !spec.penalty_block_gamma_priors.is_empty() {
         let beta0_flat = replicate_pooled_baseline_seed_per_cause(beta0.view(), cause_count);
@@ -2270,6 +2577,28 @@ fn fit_survival_transformation_model(
             exact_derivative_guard,
             &spec.penalty_block_gamma_priors,
         );
+    }
+    // REML/LAML-select the time-smoothing λ (issue #563). With λ pinned at its
+    // seed the monotone I-spline baseline oversmooths toward an affine
+    // log-cumulative-hazard; selecting λ from the survival LAML lets it recover
+    // real curvature. The inner solve keeps the structural γ ≥ 0 box at every
+    // candidate, so the constrained optimum stays valid; the fixed stabilization
+    // ridge is held at its seed. The selected λ is written back into both the
+    // working model and `penalty_blocks` so the final fit, edf, and warm-start
+    // cache all use the data-adaptive value.
+    if let Some(selected_lambdas) = optimize_survival_transformation_smoothing(
+        &model,
+        &penalty_blocks,
+        num_smoothing_blocks,
+        &beta0,
+        structural_lower_bounds.as_ref(),
+    )? {
+        model
+            .set_penalty_lambdas(&selected_lambdas)
+            .map_err(|e| e.to_string())?;
+        for (block, &lam) in penalty_blocks.iter_mut().zip(selected_lambdas.iter()) {
+            block.lambda = lam;
+        }
     }
     let opts = crate::pirls::WorkingModelPirlsOptions {
         max_iterations: 400,
@@ -2352,7 +2681,7 @@ fn fit_survival_transformation_model(
         } else {
             baseline_cfg
         };
-    let fit = survival_unified_fit_result(beta, lambdas, &summary, &state)?;
+    let fit = survival_unified_fit_result(beta, lambdas, &summary, &state, &penalty_blocks)?;
 
     let time_base_ncols = spec.time_build.x_exit_time.ncols();
     let time_basis = crate::families::survival_construction::SavedSurvivalTimeBasis::from_build(
