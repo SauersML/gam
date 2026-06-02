@@ -28,7 +28,6 @@ use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
 use csv::StringRecord;
-use ndarray::Array2;
 
 /// Build a dataset with `n_groups` groups and only `per_group` rows each — small
 /// enough to force the cubic-default B-spline marginal to auto-shrink its degree.
