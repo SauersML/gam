@@ -73,8 +73,7 @@ fn build_system(n: usize, d: usize, k: usize) -> ArrowSchurSystem {
         // H_tβ^(i): dense cross-block.
         for a in 0..d {
             for c in 0..k {
-                row.htbeta[[a, c]] = 0.1 * ((i + 1) as f64) * ((a + 1) as f64)
-                    / (1.0 + c as f64)
+                row.htbeta[[a, c]] = 0.1 * ((i + 1) as f64) * ((a + 1) as f64) / (1.0 + c as f64)
                     - 0.05 * (a as f64 - c as f64);
             }
         }
@@ -166,7 +165,8 @@ fn cross_row_total_variation_solve_satisfies_full_newton_equations() {
     let mut target_t = Array1::<f64>::zeros(nt);
     for i in 0..n {
         for a in 0..d {
-            target_t[i * d + a] = 0.5 * (i as f64) - 0.3 * (a as f64) + 0.2 * ((i * d + a) as f64).sin();
+            target_t[i * d + a] =
+                0.5 * (i as f64) - 0.3 * (a as f64) + 0.2 * ((i * d + a) as f64).sin();
         }
     }
     let target_beta = Array1::<f64>::from(vec![0.1, -0.2, 0.05]);
@@ -175,11 +175,11 @@ fn cross_row_total_variation_solve_satisfies_full_newton_equations() {
     // differences) — its Hessian Dᵀ diag(φ''(D t)) D couples adjacent rows, so
     // it is NOT row-block-diagonal and exercises the cross-row solver path.
     let tv = TotalVariationPenalty::new(
-        0.8,                          // weight
-        n,                            // n_eff = number of rows
+        0.8, // weight
+        n,   // n_eff = number of rows
         DifferenceOpKind::ForwardDiff1D,
-        1e-2,                         // smoothing_eps
-        false,                        // fixed weight (no learnable rho axis)
+        1e-2,  // smoothing_eps
+        false, // fixed weight (no learnable rho axis)
     )
     .expect("TV penalty constructs");
     assert!(

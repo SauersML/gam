@@ -4463,7 +4463,9 @@ impl<'a, B: BatchedBlockSolver> ArrowBlockDiagInverse<'a, B> {
             for c in 0..di {
                 rhs_i[c] = r_t[base + c] - slab[c];
             }
-            let xi = self.backend.solve_block_vector(&self.htt_factors[i], &rhs_i);
+            let xi = self
+                .backend
+                .solve_block_vector(&self.htt_factors[i], &rhs_i);
             for c in 0..di {
                 x_t[base + c] = xi[c];
             }
@@ -4599,7 +4601,8 @@ fn solve_arrow_newton_step_cross_row(
     let mut iters = 0usize;
     let mut converged = b_norm == 0.0;
     while iters < max_iter && !converged {
-        let (ap_t, ap_beta) = arrow_cross_row_matvec(sys, ridge_t, ridge_beta, p_t.view(), p_beta.view());
+        let (ap_t, ap_beta) =
+            arrow_cross_row_matvec(sys, ridge_t, ridge_beta, p_t.view(), p_beta.view());
         let pap = dot2(&p_t, &p_beta, &ap_t, &ap_beta);
         if !(pap.is_finite() && pap > 0.0) {
             return Err(ArrowSchurError::PcgFailed {

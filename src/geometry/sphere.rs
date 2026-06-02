@@ -1,8 +1,7 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::geometry::manifold::{
-    GEOMETRY_EPS, GeometryError, GeometryResult, RiemannianManifold, check_len, dot, identity,
-    norm,
+    GEOMETRY_EPS, GeometryError, GeometryResult, RiemannianManifold, check_len, dot, identity, norm,
 };
 use crate::geometry::normalize_weights;
 
@@ -535,10 +534,7 @@ fn sphere_mean_candidates(
 }
 
 /// Build the weighted second-moment matrix `M = Σ wᵢ pᵢ pᵢᵀ`.
-fn sphere_second_moment(
-    values: ArrayView2<'_, f64>,
-    weights: ArrayView1<'_, f64>,
-) -> Array2<f64> {
+fn sphere_second_moment(values: ArrayView2<'_, f64>, weights: ArrayView1<'_, f64>) -> Array2<f64> {
     let (n, d) = values.dim();
     let mut moment = Array2::<f64>::zeros((d, d));
     for row in 0..n {
@@ -826,10 +822,16 @@ mod tests {
 
         // It is a unit vector.
         let nrm = (mean[0] * mean[0] + mean[1] * mean[1] + mean[2] * mean[2]).sqrt();
-        assert!((nrm - 1.0).abs() < 1e-9, "mean must be a unit vector, got {nrm}");
+        assert!(
+            (nrm - 1.0).abs() < 1e-9,
+            "mean must be a unit vector, got {nrm}"
+        );
 
         // It lies on the equator orthogonal to the antipodal axis e1.
-        assert!(mean[0].abs() < 1e-9, "mean must be orthogonal to e1, got {mean:?}");
+        assert!(
+            mean[0].abs() < 1e-9,
+            "mean must be orthogonal to e1, got {mean:?}"
+        );
 
         // The dominant data axis is e1 (col 0); the least-aligned coordinate axis
         // is e2 (col 1, lowest index among the zero-moment axes). The projection of
@@ -877,11 +879,7 @@ mod tests {
     fn non_degenerate_mean_unchanged() {
         // A clearly identifiable cluster must still converge to the ordinary
         // Karcher mean, not the equatorial fallback.
-        let values = array![
-            [1.0, 0.0, 0.0],
-            [0.9, 0.1, 0.0],
-            [0.9, 0.0, 0.1]
-        ];
+        let values = array![[1.0, 0.0, 0.0], [0.9, 0.1, 0.0], [0.9, 0.0, 0.1]];
         let mean = sphere_frechet_mean(values.view(), None, 1.0e-12, 256).unwrap();
         // Mean should be close to e1 (dominant direction), not on the equator.
         assert!(mean[0] > 0.9, "expected near-e1 mean, got {mean:?}");

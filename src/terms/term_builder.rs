@@ -2501,10 +2501,7 @@ fn knots_option_is_list(options: &BTreeMap<String, String>) -> bool {
         .get("knots")
         .map(|raw| {
             let t = raw.trim();
-            t.starts_with('[')
-                || t.starts_with("c(")
-                || t.starts_with("C(")
-                || t.starts_with('(')
+            t.starts_with('[') || t.starts_with("c(") || t.starts_with("C(") || t.starts_with('(')
         })
         .unwrap_or(false)
 }
@@ -2568,7 +2565,13 @@ fn parse_knot_placement(
         .or_else(|| options.get("knotplacement"))
     {
         None => Ok(BSplineKnotPlacement::Uniform),
-        Some(raw) => match raw.trim().trim_matches('"').trim_matches('\'').to_ascii_lowercase().as_str() {
+        Some(raw) => match raw
+            .trim()
+            .trim_matches('"')
+            .trim_matches('\'')
+            .to_ascii_lowercase()
+            .as_str()
+        {
             "uniform" | "even" | "equal" => Ok(BSplineKnotPlacement::Uniform),
             "quantile" | "quantiles" | "data" | "empirical" => Ok(BSplineKnotPlacement::Quantile),
             other => Err(TermBuilderError::invalid_option(format!(

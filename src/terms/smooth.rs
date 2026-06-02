@@ -237,7 +237,16 @@ impl ShapeConstraint {
 /// Smooth-term head keywords recognised by the formula DSL. A `shape=` option
 /// may be attached to any term whose head is one of these.
 const SMOOTH_HEAD_KEYWORDS: [&str; 11] = [
-    "s", "smooth", "te", "tensor", "thinplate", "tps", "duchon", "matern", "sphere", "bs",
+    "s",
+    "smooth",
+    "te",
+    "tensor",
+    "thinplate",
+    "tps",
+    "duchon",
+    "matern",
+    "sphere",
+    "bs",
     "bspline",
 ];
 

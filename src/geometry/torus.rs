@@ -151,6 +151,9 @@ mod tests {
         let k = m
             .sectional_curvature(point.view(), (u.view(), v.view()))
             .expect("flat torus has defined curvature on a nondegenerate plane");
-        assert!(k.abs() <= 1.0e-12, "flat torus sectional curvature must be 0, got {k}");
+        assert!(
+            k.abs() <= 1.0e-12,
+            "flat torus sectional curvature must be 0, got {k}"
+        );
     }
 }

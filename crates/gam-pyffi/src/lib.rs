@@ -130,8 +130,7 @@ use gam::{
     FitConfig, FitRequest, FitResult, WorkflowError, fit_model, materialize, resolve_offset_column,
 };
 use ndarray::{
-    Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayView3, ArrayView4, Axis, IxDyn,
-    s,
+    Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayView3, ArrayView4, Axis, IxDyn, s,
 };
 use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyArray3, PyArray4, PyArrayDyn, PyArrayMethods,
@@ -7262,7 +7261,10 @@ fn constrained_active_backward<'py>(
         let out = PyDict::new(py);
         out.set_item("grad_x", Array2::<f64>::zeros(x.dim()).into_pyarray(py))?;
         out.set_item("grad_y", Array2::<f64>::zeros(y.dim()).into_pyarray(py))?;
-        out.set_item("grad_penalty", Array2::<f64>::zeros((p, p)).into_pyarray(py))?;
+        out.set_item(
+            "grad_penalty",
+            Array2::<f64>::zeros((p, p)).into_pyarray(py),
+        )?;
         out.set_item(
             "grad_weights",
             Array1::<f64>::zeros(x.nrows()).into_pyarray(py),
@@ -7277,8 +7279,7 @@ fn constrained_active_backward<'py>(
     // Pull upstream cotangents back through Z. The coefficient output is
     // β̂ = Z γ̂, so its cotangent maps as `grad_γ = Zᵀ grad_β` (k × d). The
     // fitted output (X_Z γ̂ = X β̂) and the outer scalars are unchanged.
-    let grad_coefficients_z: Option<Array2<f64>> =
-        grad_coefficients.map(|g| z.t().dot(&g));
+    let grad_coefficients_z: Option<Array2<f64>> = grad_coefficients.map(|g| z.t().dot(&g));
 
     // Chain `grad_log_lambda` onto `grad_lambda` via dlog λ/dλ = 1/λ, mirroring
     // the interior branch (λ and log λ pull the same scalar).
@@ -18197,7 +18198,9 @@ fn rg_resolve_simplex_coord_label(kind: &str, coordinates: Option<&str>) -> Stri
 }
 
 fn rg_unknown_geometry(other: &str) -> String {
-    format!("response_geometry must be one of 'spherical', 'simplex', 'clr', or 'alr'; got {other:?}")
+    format!(
+        "response_geometry must be one of 'spherical', 'simplex', 'clr', or 'alr'; got {other:?}"
+    )
 }
 
 /// Consolidated response-geometry log map: pick the base point (intrinsic
@@ -22602,7 +22605,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(build_extend_group_payload_json, module)?)?;
     module.add_function(wrap_pyfunction!(extend_model_with_group, module)?)?;
     module.add_function(wrap_pyfunction!(validate_formula_json, module)?)?;
-    module.add_function(wrap_pyfunction!(apply_shape_constraints_to_formula, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        apply_shape_constraints_to_formula,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         formula_validation_supported_by_python_json,
         module
@@ -24575,7 +24581,9 @@ fn predict_columns(
             // user-selectable, mirroring `gam predict --covariance-mode` and the
             // engine's `includeobservation_interval` switch.
             let covariance_mode = parse_covariance_mode(options.covariance_mode.as_deref())?
-                .unwrap_or(gam::predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred);
+                .unwrap_or(
+                    gam::predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+                );
             let includeobservation_interval = options.observation_interval.unwrap_or(false);
             let uncertainty_options = gam::predict::PredictUncertaintyOptions {
                 confidence_level,
@@ -31696,5 +31704,4 @@ mod tests {
             "LSQ-seeded iter-0 reconstruction R² = {r2:.4} should explain most of the signal"
         );
     }
-
 }

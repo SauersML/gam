@@ -123,9 +123,7 @@ fn gam_tensor_te_2d_gamma_matches_mgcv() {
     // ---- fit with gam: y ~ te(x, z, k=7), Gamma / log link, REML ------------
     let headers = ["x", "z", "y"].into_iter().map(String::from).collect();
     let rows: Vec<StringRecord> = (0..n)
-        .map(|i| {
-            StringRecord::from(vec![x[i].to_string(), z[i].to_string(), y[i].to_string()])
-        })
+        .map(|i| StringRecord::from(vec![x[i].to_string(), z[i].to_string(), y[i].to_string()]))
         .collect();
     let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode gamma dataset");
     let col = ds.column_map();

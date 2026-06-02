@@ -4286,7 +4286,8 @@ fn removed_todo_site_violation(
     // resolve the owed work, so it costs exactly what the marker did. Checked
     // first and independent of git HEAD, so committing the relabel away cannot
     // escape it.
-    if let Some(line_no) = reworded_marker_remnant_survives(current_content, previous_site, needle) {
+    if let Some(line_no) = reworded_marker_remnant_survives(current_content, previous_site, needle)
+    {
         return Some((
             line_no,
             "marker removed but its description survives reworded under a different \

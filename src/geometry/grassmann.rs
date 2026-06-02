@@ -176,9 +176,7 @@ impl RiemannianManifold for GrassmannManifold {
             // the same for ±q, so negating the endpoint representative is the
             // correct lift.
             let last = point_along.nrows().saturating_sub(1);
-            if point_along.nrows() >= 2
-                && dot(point_along.row(0), point_along.row(last)) < 0.0
-            {
+            if point_along.nrows() >= 2 && dot(point_along.row(0), point_along.row(last)) < 0.0 {
                 let mut aligned = point_along.to_owned();
                 aligned.row_mut(last).mapv_inplace(|x| -x);
                 return sphere.parallel_transport(aligned.view(), vec);

@@ -97,12 +97,7 @@ fn explicit_knot_list_populates_provided_knotspec_with_those_positions() {
                 "Provided vector should wrap 3 interior knots in clamped boundaries"
             );
             // Interior block carries the supplied positions verbatim and sorted.
-            let interior: Vec<f64> = knots
-                .iter()
-                .copied()
-                .skip(degree + 1)
-                .take(3)
-                .collect();
+            let interior: Vec<f64> = knots.iter().copied().skip(degree + 1).take(3).collect();
             let expected = [0.2_f64, 0.5, 0.8];
             for (got, want) in interior.iter().zip(expected.iter()) {
                 assert!(
@@ -111,8 +106,19 @@ fn explicit_knot_list_populates_provided_knotspec_with_those_positions() {
                 );
             }
             // Boundary repeats clamp to the observed data range [0, 1].
-            assert!(knots.iter().take(degree + 1).all(|&k| (k - 0.0).abs() < 1e-12));
-            assert!(knots.iter().rev().take(degree + 1).all(|&k| (k - 1.0).abs() < 1e-12));
+            assert!(
+                knots
+                    .iter()
+                    .take(degree + 1)
+                    .all(|&k| (k - 0.0).abs() < 1e-12)
+            );
+            assert!(
+                knots
+                    .iter()
+                    .rev()
+                    .take(degree + 1)
+                    .all(|&k| (k - 1.0).abs() < 1e-12)
+            );
         }
         other => panic!("expected Provided knotspec from knots=[...], got {other:?}"),
     }
@@ -180,7 +186,9 @@ fn tensor_margins_honor_quantile_placement() {
                     BSplineKnotSpec::Automatic { placement, .. } => {
                         assert_eq!(*placement, BSplineKnotPlacement::Quantile);
                     }
-                    other => panic!("tensor margin should use Automatic{{Quantile}}, got {other:?}"),
+                    other => {
+                        panic!("tensor margin should use Automatic{{Quantile}}, got {other:?}")
+                    }
                 }
             }
         }
