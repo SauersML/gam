@@ -634,11 +634,11 @@ class _GaussianRemlFitWithConstraintsFn(torch.autograd.Function):
       with the unconstrained one and the VJP is the closed-form Gaussian
       REML backward in full p-space.
     * **Active cert (non-empty active set):** the math identity is
-      ``H⁻¹ → Z(ZᵀHZ)⁻¹Zᵀ``, ``S⁺ → Z(ZᵀSZ)⁺Zᵀ`` with ``Z = null(A_act)``,
-      but the Rust closed-form backward stack is not yet refactored to
-      consume these projected operators. The Rust binding raises
-      ``NotImplementedError`` in that branch and the error propagates
-      verbatim.
+      ``H⁻¹ → Z(ZᵀHZ)⁻¹Zᵀ``, ``S⁺ → Z(ZᵀSZ)⁺Zᵀ`` with ``Z = null(A_act)``.
+      The constrained problem is reduced to the ``Z`` subspace, the same
+      closed-form backward runs on the reduced operators, and the gradients
+      are lifted back to p-space. Both certs return exact gradients;
+      ``.backward()`` no longer raises ``NotImplementedError``.
     """
 
     @staticmethod
@@ -800,12 +800,14 @@ def gaussian_reml_fit_with_constraints(
     a_inequality: torch.Tensor | None = None,
     b_inequality: torch.Tensor | None = None,
 ) -> ConstrainedRemlOutput:
-    """Forward-only constrained Gaussian REML fit.
+    """Constrained Gaussian REML fit, fully differentiable.
 
     Routes a single-block design ``x``/penalty ``penalty`` with an optional
     linear inequality system ``A·β ≥ b`` through the same Rust active-set
     + REML driver used by the formula-API shape constraints. ``.backward()``
-    on any returned tensor raises :class:`NotImplementedError`.
+    returns exact analytic gradients w.r.t. ``x``, ``y``, ``penalty`` and
+    ``weights`` in both the interior cert (envelope theorem in full p-space)
+    and the active cert (tangent-projected ``Z = null(A_act)`` reduction).
     """
     apply = cast(
         Callable[

@@ -3280,8 +3280,12 @@ def gaussian_reml_fit_with_constraints_forward(
     """Constrained Gaussian REML forward fit (single penalty block).
 
     Wraps the active-set + REML driver with an optional linear inequality
-    system ``A·β ≤ b``. Forward-only; no analytic VJP is provided through
-    this path.
+    system ``A·β ≤ b``. This path has an exact analytic VJP, provided by
+    :func:`gaussian_reml_fit_with_constraints_backward`: at an interior cert
+    (empty active set) it is the envelope-theorem backward in full p-space;
+    at an active cert it is the tangent-projected backward in the
+    ``Z = null(A_act)`` reduction (``H⁻¹ → Z(ZᵀHZ)⁻¹Zᵀ``,
+    ``S⁺ → Z(ZᵀSZ)⁺Zᵀ``).
     """
     import numpy as np
 
@@ -3338,16 +3342,20 @@ def gaussian_reml_fit_with_constraints_backward(
 ) -> dict[str, Any]:
     """Analytic VJP for ``gaussian_reml_fit_with_constraints_forward``.
 
-    At an interior cert (``active_indices`` is empty), the envelope theorem
-    applies in full p-space and this delegates to the closed-form Gaussian
-    REML backward (``H`` unprojected). At an active cert (non-empty active
-    set), the tangent-projected variant is not yet implemented and the call
-    raises ``NotImplementedError``.
+    Both certs are supported and return exact analytic gradients. At an
+    interior cert (``active_indices`` is empty), the envelope theorem applies
+    in full p-space and this delegates to the closed-form Gaussian REML
+    backward (``H`` unprojected). At an active cert (non-empty active set),
+    the tangent-projected variant reduces the problem to the
+    ``Z = null(A_act)`` subspace, runs the same closed-form backward on the
+    reduced operators, and lifts the gradients back to p-space.
 
     Math identity: at the constrained cert, the backward through the joint
     REML is the unconstrained backward formula applied to the tangent-
     projected operator — ``H⁻¹ → Z(ZᵀHZ)⁻¹Zᵀ``, ``S⁺ → Z(ZᵀSZ)⁺Zᵀ``, with
-    ``Z = null(A_act)``.
+    ``Z = null(A_act)``. Gradients flow to ``x``, ``y``, ``penalty`` and
+    ``weights``; the constraint geometry (``a_inequality``, ``b_inequality``)
+    and ``init_log_lambda`` are non-differentiable.
     """
     import numpy as np
 
