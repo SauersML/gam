@@ -20,8 +20,8 @@ use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec};
 use crate::smooth::{AdaptiveRegularizationDiagnostics, TermCollectionSpec};
 use crate::span::span_index_for_breakpoints;
 use crate::types::{
-    InverseLink, LatentCLogLogState, LikelihoodSpec, MixtureLinkState, SasLinkSpec, SasLinkState,
-    StandardLink,
+    InverseLink, LatentCLogLogState, LikelihoodSpec, MixtureLinkState, ResponseFamily, SasLinkSpec,
+    SasLinkState, StandardLink,
 };
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
@@ -2512,6 +2512,35 @@ impl FittedModel {
         self.saved_baseline_time_wiggle()
             .map(|runtime| runtime.is_some())
             .unwrap_or(false)
+    }
+
+    /// Whether the default point prediction must integrate the inverse link
+    /// over the coefficient posterior — reporting the posterior mean
+    /// `E[g⁻¹(Xβ)]` — rather than plugging in the posterior mode `g⁻¹(Xβ̂)`.
+    ///
+    /// SPEC: the posterior mean is *always* the default point estimate (never
+    /// MAP). It is only observably distinct from the plug-in when the inverse
+    /// link is curved over the posterior's support: Binomial standard / SAS /
+    /// BetaLogistic / Mixture / LatentCLogLog links, or any model carrying a
+    /// link wiggle or baseline-time wiggle. For effectively-linear cases
+    /// (identity-link Gaussian, …) the integral collapses to the plug-in, so
+    /// the cheaper plug-in path is exact and is taken instead.
+    ///
+    /// This is the single source of truth shared by the CLI (`gam predict`)
+    /// and the Python FFI prediction path so the two can never drift on which
+    /// models receive the posterior-mean correction.
+    #[inline]
+    pub fn prediction_uses_posterior_mean(&self) -> bool {
+        let family = self.likelihood();
+        matches!(
+            (&family.response, &family.link),
+            (ResponseFamily::Binomial, InverseLink::Standard(_))
+                | (ResponseFamily::Binomial, InverseLink::Sas(_))
+                | (ResponseFamily::Binomial, InverseLink::BetaLogistic(_))
+                | (ResponseFamily::Binomial, InverseLink::Mixture(_))
+                | (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_))
+        ) || self.has_link_wiggle()
+            || self.has_baseline_time_wiggle()
     }
 
     pub fn saved_prediction_runtime(&self) -> Result<SavedPredictionRuntime, FittedModelError> {
